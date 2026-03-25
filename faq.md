@@ -869,4 +869,119 @@
 
 简单来说：**bke-manifests是"材料库"，openfuyao-system-controller是"安装工"**。
         
+# bke-manifests | openfuyao-system-controller
+根据代码分析，两个仓库中的YAML清单有以下关键差异：
 
+## 核心差异对比
+
+| 维度 | bke-manifests | openfuyao-system-controller |
+|------|---------------|----------------------------|
+| **部署目标** | 工作负载集群 | 管理集群 |
+| **镜像地址** | Go模板参数化 `{{ .repo }}image:tag` | 硬编码 `cr.openfuyao.cn/openfuyao/...` |
+| **组件类型** | 集群基础组件 + 应用组件 | 管理面基础设施组件 |
+| **版本管理** | 多版本并存 (v1.21, v1.23, v1.25...) | 单一版本 |
+| **使用方式** | 被cluster-api-provider-bke读取渲染 | 被install.sh脚本直接kubectl apply |
+
+## 详细对比
+
+### 1. 镜像地址处理方式
+
+**bke-manifests** - 使用Go模板参数化：
+```yaml
+# bke-manifests/kubernetes/vpa/0.10.0/vpa.yaml
+image: {{ .repo }}vpa-updater:0.10.0
+
+# bke-manifests/kubernetes/redis/6.2.12/redis-all.yaml
+image: {{ .repo }}redis:6.2.12
+```
+- 运行时由cluster-api-provider-bke渲染替换
+- 支持不同镜像仓库地址
+
+**openfuyao-system-controller** - 硬编码镜像地址：
+```yaml
+# openfuyao-system-controller/resource/kube-prometheus/prometheus-prometheus.yaml
+image: cr.openfuyao.cn/openfuyao/prometheus/prometheus:v2.52.0
+
+# openfuyao-system-controller/resource/ingress-nginx/ingress-nginx.yaml
+image: cr.openfuyao.cn/openfuyao/ingress-nginx/controller:v1.9.4
+```
+- 固定使用 `cr.openfuyao.cn` 仓库
+- 安装脚本通过sed替换镜像仓库地址
+
+### 2. 组件清单对比
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                            bke-manifests                                    │
+│                      (部署到工作负载集群)                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  集群基础组件:                                                               │
+│   ├── calico/          (网络插件)                                            │
+│   ├── coredns/         (DNS服务)                                             │
+│   ├── kube-proxy/      (网络代理) v1.21~v1.34 多版本                          │
+│   ├── nodelocaldns/    (节点本地DNS)                                         │
+│   └── metrics-server/  (指标服务)                                            │
+│                                                                             │
+│  应用组件:                                                                   │
+│   ├── prometheus/      (监控) v2.11.0, v2.32.1                               │
+│   ├── jenkins/         (CI/CD)                                              │
+│   ├── mysql/           (数据库)                                              │
+│   ├── redis/           (缓存)                                               │
+│   ├── minio/           (对象存储)                                            │
+│   ├── gpu-manager/     (GPU管理)                                            │
+│   ├── volcano/         (批调度)                                             │
+│   ├── katib/           (超参调优)                                            │
+│   ├── kserve/          (模型服务)                                            │
+│   ├── kubevirt/        (虚拟化)                                             │
+│   └── ...                                                                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                       openfuyao-system-controller                           │
+│                         (部署到管理集群)                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  管理面基础设施:                                                              │
+│   ├── ingress-nginx/        (Ingress控制器)                                  │
+│   ├── metrics-server/       (指标服务)                                       │
+│   ├── kube-prometheus/      (监控栈)                                         │
+│   │   ├── prometheus-operator                                              │
+│   │   ├── prometheus                                                        │
+│   │   ├── alertmanager                                                      │
+│   │   ├── node-exporter                                                     │
+│   │   └── kube-state-metrics                                               │
+│   ├── oauth-webhook/        (认证Webhook)                                   │
+│   ├── helm-chart-repository/ (Harbor配置)                                   │
+│   └── user-manager/         (用户管理)                                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 3. 部署流程差异
+
+**bke-manifests**:
+```
+cluster-api-provider-bke 读取 → Go模板渲染 → kubectl apply 到工作负载集群
+```
+
+**openfuyao-system-controller**:
+```
+install.sh → sed替换镜像地址 → kubectl apply 到管理集群
+```
+
+### 4. 相同组件的差异 (以Prometheus为例)
+
+| 项目 | bke-manifests | openfuyao-system-controller |
+|------|---------------|----------------------------|
+| 版本 | v2.11.0, v2.32.1 | v2.52.0 |
+| 资源类型 | 原生Deployment | Prometheus CRD |
+| 镜像 | `{{ .repo }}prometheus:v2.x` | `cr.openfuyao.cn/.../prometheus:v2.52.0` |
+| 配置方式 | ConfigMap | ServiceMonitor CRD |
+
+## 总结
+
+| 仓库 | 本质 | 用途 |
+|------|------|------|
+| **bke-manifests** | **模板库** | 为工作负载集群提供可参数化的组件清单，支持多版本、多镜像仓库 |
+| **openfuyao-system-controller** | **安装包** | 为管理集群提供固定的管理面组件，通过脚本直接部署 |
+
+简单来说：**bke-manifests是"可配置的组件库"，openfuyao-system-controller是"固定的安装包"**。
+        
