@@ -1590,3 +1590,991 @@ func DefaultRetryPolicy() *RetryPolicy {
 | **状态** | 内存状态 | 持久化 + 断点续传 |
 | **错误** | 简单重试 | 错误码 + 回滚 |
 | **可观测** | 日志分散 | 统一可观测性 |
+
+
+# openFuyao 安装部署方案分析报告
+cluster-api-provider-bke 
+
+bke-console-service
+
+installer-service
+
+bke-manifests
+
+bkeadm
+
+openfuyao-system-controller
+
+installer-website
+
+bke-console-website
+
+==》上面为openFuyao安装部署的解决方案同，对比openfuyao installer安装部署方案，分析openFuyao安装部署缺陷并给出优化与重构建议（重构目标为支持UPI/IPI场景，支持不同操作系统，支持核心组件自动化升级，可扩展的架构）​
+
+现在我对openFuyao的整体架构有了全面了解。让我生成详细的分析报告和优化建议：
+## 一、当前架构概览
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         openFuyao 整体架构                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐    │
+│  │ bke-console-    │    │ installer-      │    │ openfuyao-      │    │
+│  │ website         │───▶│ website         │───▶│ system-         │    │
+│  │ (前端UI)        │    │ (安装前端)       │    │ controller      │    │
+│  └────────┬────────┘    └────────┬────────┘    └────────┬────────┘    │
+│           │                      │                      │              │
+│           ▼                      ▼                      ▼              │
+│  ┌─────────────────────────────────────────────────────────────────┐  │
+│  │                    installer-service                             │  │
+│  │  • REST API服务                                                  │  │
+│  │  • 集群生命周期管理                                               │  │
+│  │  • WebSocket日志推送                                             │  │
+│  │  • 自动升级管理                                                   │  │
+│  └────────────────────────────┬────────────────────────────────────┘  │
+│                               │                                        │
+│                               ▼                                        │
+│  ┌─────────────────────────────────────────────────────────────────┐  │
+│  │                 cluster-api-provider-bke                         │  │
+│  │  • BKECluster/BKEMachine/BKENode CRD                            │  │
+│  │  • Cluster API Controller                                       │  │
+│  │  • BKEAgent (节点代理)                                           │  │
+│  │  • Command执行框架                                               │  │
+│  └────────────────────────────┬────────────────────────────────────┘  │
+│                               │                                        │
+│                               ▼                                        │
+│  ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐    │
+│  │ bkeadm          │    │ bke-manifests   │    │ 引导节点        │    │
+│  │ (CLI工具)       │    │ (清单仓库)       │    │ • Registry      │    │
+│  │ • 初始化        │    │ • 组件YAML      │    │ • NTP Server    │    │
+│  │ • 离线安装      │    │ • 镜像构建       │    │ • Yum Repo      │    │
+│  └─────────────────┘    └─────────────────┘    └─────────────────┘    │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+## 二、与OpenShift Installer对比分析
+
+### 2.1 架构对比
+
+| 维度 | OpenShift Installer | openFuyao |
+|------|---------------------|-----------|
+| **安装模式** | IPI/UPI统一架构 | 仅IPI模式 |
+| **Asset管理** | 完整的Asset依赖图 | 无Asset概念 |
+| **配置系统** | Ignition配置 | SSH + Command执行 |
+| **升级机制** | CVO (Cluster Version Operator) | 脚本式升级 |
+| **多OS支持** | 通过MachineConfig | 硬编码支持 |
+| **基础设施抽象** | InfrastructureProvider接口 | 部分抽象 |
+
+### 2.2 当前架构缺陷
+
+#### 缺陷1: 缺乏UPI场景支持
+
+```go
+// 当前实现：仅支持IPI模式
+// installer-service/pkg/installer/cluster.go
+func (c *installerClient) CreateCluster(object string) error {
+    // 直接创建BKECluster CR，假设节点已准备好
+    // 缺少用户自提供基础设施的场景处理
+}
+```
+
+**问题**：
+- 用户无法使用已有基础设施（如已有LB、DNS）
+- 无法适配裸金属场景的预配置要求
+- 缺少用户自提供节点的验证机制
+
+#### 缺陷2: 升级机制不完善
+
+```go
+// 当前实现：脚本式升级
+// installer-service/pkg/installer/auto_upgrade.go
+const bkeUpgradeScriptSyncImages = `
+echo "--- 3. Sync images to bootstrap node's image registry service ---"
+bke registry patch --source "${ABSOLUTE_PATCH_DIR}" --target "${REGISTRY_TARGET}"
+`
+```
+
+**问题**：
+- 无声明式升级状态管理
+- 缺少版本兼容性检查
+- 无回滚机制
+- 升级过程不可观测
+
+#### 缺陷3: 多OS支持硬编码
+
+```go
+// 当前实现：硬编码OS支持
+// bkeadm/pkg/infrastructure/containerd/containerd.go
+func Install(domain, imageRepoPort, runtimeStorage, containerdFile, caFile string) error {
+    // 直接执行安装脚本，无OS适配层
+}
+```
+
+**问题**：
+- 新增OS需要修改代码
+- 缺少OS特性抽象
+- 配置文件路径硬编码
+
+#### 缺陷4: 缺乏Asset依赖管理
+
+```
+OpenShift Installer Asset依赖图:
+InstallConfig → Master Machines → Cluster
+                    ↓
+              Ignition Configs
+                    ↓
+              TLS Assets
+                    ↓
+              Kubeconfig
+
+openFuyao: 无Asset概念，直接创建CR
+```
+
+**问题**：
+- 无法追踪安装进度
+- 缺少失败重试机制
+- 无法增量生成配置
+
+#### 缺陷5: 节点配置方式受限
+
+```go
+// 当前实现：SSH + Command
+// cluster-api-provider-bke/pkg/command/bootstrap.go
+commandSpec.Commands = []agentv1beta1.ExecCommand{
+    {
+        ID: "bootstrap",
+        Command: []string{
+            "Kubeadm",
+            phase,
+            bkeConfig,
+        },
+    },
+}
+```
+
+**问题**：
+- 依赖SSH访问，安全风险
+- 无法使用Ignition等声明式配置
+- 节点初始化过程不透明
+
+## 三、优化重构方案
+
+### 3.1 整体重构架构
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                      重构后的openFuyao架构                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │                      API Layer                                    │  │
+│  │  ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌────────────┐ │  │
+│  │  │ Console    │  │ Installer  │  │ CLI        │  │ GitOps     │ │  │
+│  │  │ Website    │  │ Website    │  │ (bkeadm)   │  │ Operator   │ │  │
+│  │  └─────┬──────┘  └─────┬──────┘  └─────┬──────┘  └─────┬──────┘ │  │
+│  └────────┼───────────────┼───────────────┼───────────────┼─────────┘  │
+│           │               │               │               │            │
+│           ▼               ▼               ▼               ▼            │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │                   Asset Management Layer                          │  │
+│  │  ┌─────────────────────────────────────────────────────────────┐ │  │
+│  │  │                    Asset Registry                            │ │  │
+│  │  │  • Asset依赖图 (DAG)                                        │ │  │
+│  │  │  • 状态追踪                                                  │ │  │
+│  │  │  • 增量生成                                                  │ │  │
+│  │  │  • 失败重试                                                  │ │  │
+│  │  └─────────────────────────────────────────────────────────────┘ │  │
+│  └────────────────────────────┬─────────────────────────────────────┘  │
+│                               │                                        │
+│                               ▼                                        │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │                 Cluster API Provider Layer                        │  │
+│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐              │  │
+│  │  │ Infra       │  │ Bootstrap   │  │ ControlPlane│              │  │
+│  │  │ Provider    │  │ Provider    │  │ Provider    │              │  │
+│  │  │             │  │             │  │             │              │  │
+│  │  │ • BareMetal │  │ • Ignition  │  │ • Kubeadm   │              │  │
+│  │  │ • vSphere   │  │ • CloudInit │  │ • K3s       │              │  │
+│  │  │ • OpenStack │  │ • SSH       │  │ • RKE2      │              │  │
+│  │  └─────────────┘  └─────────────┘  └─────────────┘              │  │
+│  └────────────────────────────┬─────────────────────────────────────┘  │
+│                               │                                        │
+│                               ▼                                        │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │                    OS Provider Layer                              │  │
+│  │  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌────────┐ │  │
+│  │  │ CentOS  │  │ Ubuntu  │  │ openEuler│ │ Kylin   │  │ Rocky  │ │  │
+│  │  │ Provider│  │ Provider│  │ Provider │ │ Provider│  │ Linux  │ │  │
+│  │  └─────────┘  └─────────┘  └─────────┘  └─────────┘  └────────┘ │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+│                               │                                        │
+│                               ▼                                        │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │                    CVO Layer (升级管理)                           │  │
+│  │  ┌─────────────────────────────────────────────────────────────┐ │  │
+│  │  │  ClusterVersion Operator                                     │ │  │
+│  │  │  • 版本协调                                                  │ │  │
+│  │  │  • 组件升级                                                  │ │  │
+│  │  │  • 状态报告                                                  │ │  │
+│  │  │  • 回滚机制                                                  │ │  │
+│  │  └─────────────────────────────────────────────────────────────┘ │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 3.2 UPI/IPI场景支持设计
+
+#### 3.2.1 安装模式抽象
+
+```go
+// pkg/provider/interfaces.go
+
+// InstallMode 安装模式
+type InstallMode string
+
+const (
+    // InstallModeIPI Installer-Provisioned Infrastructure
+    InstallModeIPI InstallMode = "IPI"
+    // InstallModeUPI User-Provisioned Infrastructure  
+    InstallModeUPI InstallMode = "UPI"
+)
+
+// InfrastructureProvider 基础设施提供者接口
+type InfrastructureProvider interface {
+    // Name 返回提供者名称
+    Name() string
+    
+    // SupportedModes 返回支持的安装模式
+    SupportedModes() []InstallMode
+    
+    // Validate 验证基础设施配置
+    Validate(ctx context.Context, spec *InfrastructureSpec) error
+    
+    // Provision 预配基础设施 (IPI模式)
+    Provision(ctx context.Context, spec *InfrastructureSpec) (*InfrastructureStatus, error)
+    
+    // Deprovision 回收基础设施 (IPI模式)
+    Deprovision(ctx context.Context, status *InfrastructureStatus) error
+    
+    // Discover 发现已有基础设施 (UPI模式)
+    Discover(ctx context.Context, spec *InfrastructureSpec) (*InfrastructureStatus, error)
+}
+
+// InfrastructureSpec 基础设施规格
+type InfrastructureSpec struct {
+    // Mode 安装模式
+    Mode InstallMode `json:"mode"`
+    
+    // ControlPlaneEndpoint 控制平面端点
+    ControlPlaneEndpoint *APIEndpoint `json:"controlPlaneEndpoint"`
+    
+    // UserProvided 用户提供的资源 (UPI模式)
+    UserProvided *UserProvidedInfrastructure `json:"userProvided,omitempty"`
+    
+    // ToProvision 需要预配的资源 (IPI模式)
+    ToProvision *ProvisionSpec `json:"toProvision,omitempty"`
+}
+
+// UserProvidedInfrastructure 用户提供的基础设施
+type UserProvidedInfrastructure struct {
+    // LoadBalancer 用户提供的负载均衡器
+    LoadBalancer *LoadBalancerSpec `json:"loadBalancer,omitempty"`
+    
+    // DNS 用户提供的DNS
+    DNS *DNSSpec `json:"dns,omitempty"`
+    
+    // Nodes 用户提供的节点
+    Nodes []NodeSpec `json:"nodes"`
+    
+    // Network 用户提供的网络配置
+    Network *NetworkSpec `json:"network,omitempty"`
+}
+```
+
+#### 3.2.2 UPI场景控制器实现
+
+```go
+// controllers/upi_controller.go
+
+// UPIReconciler UPI场景协调器
+type UPIReconciler struct {
+    client.Client
+    Scheme   *runtime.Scheme
+    Recorder record.EventRecorder
+    
+    providers map[string]InfrastructureProvider
+}
+
+func (r *UPIReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    log := ctrl.LoggerFrom(ctx)
+    
+    // 1. 获取BKECluster
+    bkeCluster := &bkev1beta1.BKECluster{}
+    if err := r.Get(ctx, req.NamespacedName, bkeCluster); err != nil {
+        return ctrl.Result{}, client.IgnoreNotFound(err)
+    }
+    
+    // 2. 检查是否为UPI模式
+    if bkeCluster.Spec.InfrastructureMode != string(provider.InstallModeUPI) {
+        return ctrl.Result{}, nil
+    }
+    
+    // 3. 获取对应的Provider
+    infraProvider, ok := r.providers[bkeCluster.Spec.InfrastructureProvider]
+    if !ok {
+        return ctrl.Result{}, fmt.Errorf("infrastructure provider %s not found", 
+            bkeCluster.Spec.InfrastructureProvider)
+    }
+    
+    // 4. 处理删除
+    if !bkeCluster.DeletionTimestamp.IsZero() {
+        return r.reconcileDelete(ctx, bkeCluster, infraProvider)
+    }
+    
+    // 5. 发现已有基础设施
+    infraStatus, err := infraProvider.Discover(ctx, &bkeCluster.Spec.InfrastructureSpec)
+    if err != nil {
+        log.Error(err, "failed to discover infrastructure")
+        return ctrl.Result{}, err
+    }
+    
+    // 6. 验证基础设施
+    if err := infraProvider.Validate(ctx, &bkeCluster.Spec.InfrastructureSpec); err != nil {
+        r.Recorder.Eventf(bkeCluster, corev1.EventTypeWarning, "ValidationFailed", 
+            "Infrastructure validation failed: %v", err)
+        return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+    }
+    
+    // 7. 更新状态
+    bkeCluster.Status.InfrastructureStatus = infraStatus
+    if err := r.Status().Update(ctx, bkeCluster); err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    return ctrl.Result{}, nil
+}
+```
+
+### 3.3 多OS支持设计
+
+#### 3.3.1 OS Provider接口
+
+```go
+// pkg/osprovider/interfaces.go
+
+// OSProvider 操作系统提供者接口
+type OSProvider interface {
+    // Name 返回OS名称
+    Name() string
+    
+    // Detect 检测节点OS
+    Detect(ctx context.Context, executor Executor) (bool, error)
+    
+    // Prepare 准备OS环境
+    Prepare(ctx context.Context, spec *PrepareSpec) error
+    
+    // InstallRuntime 安装容器运行时
+    InstallRuntime(ctx context.Context, spec *RuntimeSpec) error
+    
+    // InstallKubelet 安装kubelet
+    InstallKubelet(ctx context.Context, spec *KubeletSpec) error
+    
+    // ConfigureNetwork 配置网络
+    ConfigureNetwork(ctx context.Context, spec *NetworkSpec) error
+    
+    // GenerateIgnition 生成Ignition配置
+    GenerateIgnition(ctx context.Context, spec *IgnitionSpec) ([]byte, error)
+}
+
+// ProviderRegistry 提供者注册表
+type ProviderRegistry struct {
+    mu       sync.RWMutex
+    providers map[string]OSProvider
+}
+
+func NewProviderRegistry() *ProviderRegistry {
+    registry := &ProviderRegistry{
+        providers: make(map[string]OSProvider),
+    }
+    
+    // 注册内置Provider
+    registry.Register(NewCentOSProvider())
+    registry.Register(NewUbuntuProvider())
+    registry.Register(NewOpenEulerProvider())
+    registry.Register(NewKylinProvider())
+    
+    return registry
+}
+
+func (r *ProviderRegistry) Register(provider OSProvider) {
+    r.mu.Lock()
+    defer r.mu.Unlock()
+    r.providers[provider.Name()] = provider
+}
+
+func (r *ProviderRegistry) Get(name string) (OSProvider, bool) {
+    r.mu.RLock()
+    defer r.mu.RUnlock()
+    p, ok := r.providers[name]
+    return p, ok
+}
+
+func (r *ProviderRegistry) Detect(ctx context.Context, executor Executor) (OSProvider, error) {
+    r.mu.RLock()
+    defer r.mu.RUnlock()
+    
+    for _, provider := range r.providers {
+        if ok, _ := provider.Detect(ctx, executor); ok {
+            return provider, nil
+        }
+    }
+    
+    return nil, fmt.Errorf("unsupported operating system")
+}
+```
+
+#### 3.3.2 CentOS Provider示例
+
+```go
+// pkg/osprovider/centos/centos.go
+
+type CentOSProvider struct {
+    version string
+}
+
+func NewCentOSProvider() *CentOSProvider {
+    return &CentOSProvider{}
+}
+
+func (p *CentOSProvider) Name() string {
+    return "centos"
+}
+
+func (p *CentOSProvider) Detect(ctx context.Context, executor Executor) (bool, error) {
+    output, err := executor.Execute(ctx, "cat /etc/os-release")
+    if err != nil {
+        return false, err
+    }
+    
+    return strings.Contains(output, "CentOS") || strings.Contains(output, "Red Hat"), nil
+}
+
+func (p *CentOSProvider) Prepare(ctx context.Context, spec *PrepareSpec) error {
+    commands := []string{
+        "yum install -y conntrack ipvsadm ipset jq sysstat curl wget",
+        "systemctl disable --now firewalld || true",
+        "setenforce 0 || true",
+        "sed -i 's/^SELINUX=enforcing$/SELINUX=permissive/' /etc/selinux/config",
+    }
+    
+    for _, cmd := range commands {
+        if _, err := spec.Executor.Execute(ctx, cmd); err != nil {
+            return fmt.Errorf("failed to execute %s: %w", cmd, err)
+        }
+    }
+    
+    return nil
+}
+
+func (p *CentOSProvider) InstallRuntime(ctx context.Context, spec *RuntimeSpec) error {
+    switch spec.Type {
+    case "containerd":
+        return p.installContainerd(ctx, spec)
+    case "docker":
+        return p.installDocker(ctx, spec)
+    default:
+        return fmt.Errorf("unsupported runtime type: %s", spec.Type)
+    }
+}
+
+func (p *CentOSProvider) installContainerd(ctx context.Context, spec *RuntimeSpec) error {
+    if spec.OfflinePackage != "" {
+        return p.installFromOfflinePackage(ctx, spec)
+    }
+    
+    commands := []string{
+        fmt.Sprintf("yum install -y containerd.io-%s", spec.Version),
+        "mkdir -p /etc/containerd",
+        "containerd config default > /etc/containerd/config.toml",
+        "systemctl enable --now containerd",
+    }
+    
+    for _, cmd := range commands {
+        if _, err := spec.Executor.Execute(ctx, cmd); err != nil {
+            return fmt.Errorf("failed to execute %s: %w", cmd, err)
+        }
+    }
+    
+    return nil
+}
+```
+
+### 3.4 CVO升级机制设计
+
+#### 3.4.1 ClusterVersion CRD定义
+
+```go
+// api/v1alpha1/clusterversion_types.go
+
+// ClusterVersion 定义集群版本
+type ClusterVersion struct {
+    metav1.TypeMeta   `json:",inline"`
+    metav1.ObjectMeta `json:"metadata,omitempty"`
+    
+    Spec   ClusterVersionSpec   `json:"spec,omitempty"`
+    Status ClusterVersionStatus `json:"status,omitempty"`
+}
+
+type ClusterVersionSpec struct {
+    // DesiredVersion 期望版本
+    DesiredVersion string `json:"desiredVersion"`
+    
+    // Channel 更新通道
+    Channel string `json:"channel"`
+    
+    // Upstream 上游版本源
+    Upstream string `json:"upstream,omitempty"`
+    
+    // ClusterID 集群ID
+    ClusterID string `json:"clusterID"`
+}
+
+type ClusterVersionStatus struct {
+    // CurrentVersion 当前版本
+    CurrentVersion string `json:"currentVersion"`
+    
+    // History 版本历史
+    History []UpdateHistory `json:"history,omitempty"`
+    
+    // Conditions 状态条件
+    Conditions []metav1.Condition `json:"conditions,omitempty"`
+    
+    // AvailableUpdates 可用更新
+    AvailableUpdates []Update `json:"availableUpdates,omitempty"`
+}
+
+type UpdateHistory struct {
+    State    string `json:"state"`
+    Version  string `json:"version"`
+    Image    string `json:"image"`
+    Started  string `json:"started"`
+    Finished string `json:"finished,omitempty"`
+}
+
+type Update struct {
+    Version string `json:"version"`
+    Image   string `json:"image"`
+    Channel string `json:"channel"`
+}
+```
+
+#### 3.4.2 CVO控制器实现
+
+```go
+// controllers/clusterversion_controller.go
+
+type ClusterVersionReconciler struct {
+    client.Client
+    Scheme   *runtime.Scheme
+    Recorder record.EventRecorder
+    
+    upgradeOrchestrator *UpgradeOrchestrator
+}
+
+func (r *ClusterVersionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    log := ctrl.LoggerFrom(ctx)
+    
+    cv := &clusterversionv1alpha1.ClusterVersion{}
+    if err := r.Get(ctx, req.NamespacedName, cv); err != nil {
+        return ctrl.Result{}, client.IgnoreNotFound(err)
+    }
+    
+    // 1. 检查是否需要升级
+    if cv.Status.CurrentVersion == cv.Spec.DesiredVersion {
+        return ctrl.Result{}, nil
+    }
+    
+    // 2. 验证目标版本
+    if err := r.validateTargetVersion(ctx, cv); err != nil {
+        r.Recorder.Eventf(cv, corev1.EventTypeWarning, "InvalidVersion", 
+            "Target version validation failed: %v", err)
+        return ctrl.Result{RequeueAfter: time.Minute}, nil
+    }
+    
+    // 3. 执行升级
+    result, err := r.upgradeOrchestrator.Upgrade(ctx, cv)
+    if err != nil {
+        log.Error(err, "upgrade failed")
+        return ctrl.Result{}, err
+    }
+    
+    // 4. 更新状态
+    cv.Status = *result
+    if err := r.Status().Update(ctx, cv); err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+}
+
+// UpgradeOrchestrator 升级编排器
+type UpgradeOrchestrator struct {
+    client.Client
+    
+    components []ComponentUpgrader
+}
+
+type ComponentUpgrader interface {
+    Name() string
+    Order() int
+    CanUpgrade(ctx context.Context, cv *clusterversionv1alpha1.ClusterVersion) (bool, error)
+    Upgrade(ctx context.Context, cv *clusterversionv1alpha1.ClusterVersion) error
+    Rollback(ctx context.Context, cv *clusterversionv1alpha1.ClusterVersion) error
+}
+
+func (o *UpgradeOrchestrator) Upgrade(ctx context.Context, cv *clusterversionv1alpha1.ClusterVersion) (*clusterversionv1alpha1.ClusterVersionStatus, error) {
+    // 按顺序排序组件
+    sort.Slice(o.components, func(i, j int) bool {
+        return o.components[i].Order() < o.components[j].Order()
+    })
+    
+    status := cv.Status.DeepCopy()
+    
+    // 按顺序升级组件
+    for _, component := range o.components {
+        canUpgrade, err := component.CanUpgrade(ctx, cv)
+        if err != nil {
+            return nil, fmt.Errorf("failed to check %s upgrade: %w", component.Name(), err)
+        }
+        
+        if !canUpgrade {
+            continue
+        }
+        
+        if err := component.Upgrade(ctx, cv); err != nil {
+            // 升级失败，尝试回滚
+            if rbErr := component.Rollback(ctx, cv); rbErr != nil {
+                return nil, fmt.Errorf("upgrade failed: %w, rollback also failed: %v", err, rbErr)
+            }
+            return nil, fmt.Errorf("upgrade failed, rolled back: %w", err)
+        }
+        
+        status.History = append(status.History, clusterversionv1alpha1.UpdateHistory{
+            State:   "Completed",
+            Version: cv.Spec.DesiredVersion,
+            Image:   fmt.Sprintf("%s/%s:%s", cv.Spec.Upstream, component.Name(), cv.Spec.DesiredVersion),
+            Started: time.Now().Format(time.RFC3339),
+            Finished: time.Now().Format(time.RFC3339),
+        })
+    }
+    
+    status.CurrentVersion = cv.Spec.DesiredVersion
+    return status, nil
+}
+```
+
+### 3.5 Asset管理系统设计
+
+#### 3.5.1 Asset接口定义
+
+```go
+// pkg/asset/interfaces.go
+
+// Asset 资产接口
+type Asset interface {
+    // Name 返回资产名称
+    Name() string
+    
+    // Dependencies 返回依赖的资产
+    Dependencies() []Asset
+    
+    // Generate 生成资产
+    Generate(ctx context.Context, deps map[string]interface{}) (interface{}, error)
+    
+    // Load 加载已存在的资产
+    Load(ctx context.Context) (interface{}, error)
+    
+    // Persist 持久化资产
+    Persist(ctx context.Context, data interface{}) error
+}
+
+// AssetRegistry 资产注册表
+type AssetRegistry struct {
+    mu     sync.RWMutex
+    assets map[string]Asset
+    graph  *dag.DAG
+}
+
+func NewAssetRegistry() *AssetRegistry {
+    registry := &AssetRegistry{
+        assets: make(map[string]Asset),
+        graph:  dag.NewDAG(),
+    }
+    
+    // 注册核心资产
+    registry.RegisterDefaultAssets()
+    
+    return registry
+}
+
+func (r *AssetRegistry) Register(asset Asset) error {
+    r.mu.Lock()
+    defer r.mu.Unlock()
+    
+    name := asset.Name()
+    r.assets[name] = asset
+    
+    // 添加到DAG
+    vertex := dag.NewVertex(name, asset)
+    if err := r.graph.AddVertex(vertex); err != nil {
+        return fmt.Errorf("failed to add vertex: %w", err)
+    }
+    
+    // 添加依赖边
+    for _, dep := range asset.Dependencies() {
+        if err := r.graph.AddEdge(dep.Name(), name); err != nil {
+            return fmt.Errorf("failed to add edge: %w", err)
+        }
+    }
+    
+    return nil
+}
+
+// GenerateAll 按依赖顺序生成所有资产
+func (r *AssetRegistry) GenerateAll(ctx context.Context) (map[string]interface{}, error) {
+    r.mu.RLock()
+    defer r.mu.RUnlock()
+    
+    // 获取拓扑排序
+    order, err := r.graph.TopologicalOrder()
+    if err != nil {
+        return nil, fmt.Errorf("failed to get topological order: %w", err)
+    }
+    
+    results := make(map[string]interface{})
+    
+    // 按顺序生成
+    for _, name := range order {
+        asset := r.assets[name]
+        
+        // 收集依赖结果
+        deps := make(map[string]interface{})
+        for _, dep := range asset.Dependencies() {
+            deps[dep.Name()] = results[dep.Name()]
+        }
+        
+        // 生成资产
+        data, err := asset.Generate(ctx, deps)
+        if err != nil {
+            return nil, fmt.Errorf("failed to generate asset %s: %w", name, err)
+        }
+        
+        results[name] = data
+        
+        // 持久化
+        if err := asset.Persist(ctx, data); err != nil {
+            return nil, fmt.Errorf("failed to persist asset %s: %w", name, err)
+        }
+    }
+    
+    return results, nil
+}
+```
+
+#### 3.5.2 核心Asset实现
+
+```go
+// pkg/asset/installconfig/installconfig.go
+
+type InstallConfigAsset struct {
+    File string
+}
+
+func (a *InstallConfigAsset) Name() string {
+    return "InstallConfig"
+}
+
+func (a *InstallConfigAsset) Dependencies() []Asset {
+    return nil
+}
+
+func (a *InstallConfigAsset) Generate(ctx context.Context, deps map[string]interface{}) (interface{}, error) {
+    // 解析安装配置文件
+    data, err := os.ReadFile(a.File)
+    if err != nil {
+        return nil, fmt.Errorf("failed to read install config: %w", err)
+    }
+    
+    config := &InstallConfig{}
+    if err := yaml.Unmarshal(data, config); err != nil {
+        return nil, fmt.Errorf("failed to parse install config: %w", err)
+    }
+    
+    // 验证配置
+    if err := config.Validate(); err != nil {
+        return nil, fmt.Errorf("invalid install config: %w", err)
+    }
+    
+    return config, nil
+}
+
+// pkg/asset/tls/tls.go
+
+type TLSAsset struct {
+    Name       string
+    DependsOn  []Asset
+    OutputDir  string
+}
+
+func (a *TLSAsset) Name() string {
+    return a.Name
+}
+
+func (a *TLSAsset) Dependencies() []Asset {
+    return a.DependsOn
+}
+
+func (a *TLSAsset) Generate(ctx context.Context, deps map[string]interface{}) (interface{}, error) {
+    installConfig, ok := deps["InstallConfig"].(*InstallConfig)
+    if !ok {
+        return nil, fmt.Errorf("InstallConfig dependency not found")
+    }
+    
+    // 生成CA证书
+    ca, err := certutil.NewPrivateKey(certutil.DefaultKeySize)
+    if err != nil {
+        return nil, fmt.Errorf("failed to generate CA key: %w", err)
+    }
+    
+    caCert, err := certutil.NewSelfSignedCACert(certutil.Config{
+        CommonName: fmt.Sprintf("%s-ca", a.Name),
+    }, ca)
+    if err != nil {
+        return nil, fmt.Errorf("failed to generate CA cert: %w", err)
+    }
+    
+    return &TLSCert{
+        CAKey:  ca,
+        CACert: caCert,
+    }, nil
+}
+```
+
+### 3.6 Ignition配置支持
+
+```go
+// pkg/ignition/generator.go
+
+type IgnitionGenerator struct {
+    osProvider osprovider.OSProvider
+}
+
+func (g *IgnitionGenerator) Generate(ctx context.Context, spec *IgnitionSpec) ([]byte, error) {
+    config := ignitionv3.Config{
+        Ignition: ignitionv3.Ignition{
+            Version: "3.3.0",
+        },
+    }
+    
+    // 添加文件
+    for _, file := range spec.Files {
+        config.Storage.Files = append(config.Storage.Files, ignitionv3.File{
+            Path: file.Path,
+            Mode: &file.Mode,
+            Contents: ignitionv3.FileContents{
+                Source: dataurl.EncodeBytes(file.Contents),
+            },
+        })
+    }
+    
+    // 添加Systemd单元
+    for _, unit := range spec.SystemdUnits {
+        config.Systemd.Units = append(config.Systemd.Units, ignitionv3.Unit{
+            Name:     unit.Name,
+            Enabled:  &unit.Enabled,
+            Contents: &unit.Contents,
+        })
+    }
+    
+    // 添加用户
+    for _, user := range spec.Users {
+        config.Passwd.Users = append(config.Passwd.Users, ignitionv3.PasswdUser{
+            Name:              user.Name,
+            SSHAuthorizedKeys: user.SSHKeys,
+        })
+    }
+    
+    return json.Marshal(config)
+}
+
+// IgnitionSpec Ignition配置规格
+type IgnitionSpec struct {
+    Files        []FileSpec        `json:"files"`
+    SystemdUnits []SystemdUnitSpec `json:"systemdUnits"`
+    Users        []UserSpec        `json:"users"`
+}
+
+type FileSpec struct {
+    Path     string      `json:"path"`
+    Mode     int         `json:"mode"`
+    Contents []byte      `json:"contents"`
+}
+
+type SystemdUnitSpec struct {
+    Name     string `json:"name"`
+    Enabled  bool   `json:"enabled"`
+    Contents string `json:"contents"`
+}
+
+type UserSpec struct {
+    Name    string   `json:"name"`
+    SSHKeys []string `json:"sshKeys"`
+}
+```
+
+## 四、迁移路径
+
+### 4.1 阶段一：基础设施抽象（1-2个月）
+
+1. 实现Provider接口
+2. 重构现有代码为Provider实现
+3. 添加UPI场景支持
+
+### 4.2 阶段二：多OS支持（1个月）
+
+1. 实现OS Provider接口
+2. 迁移现有OS适配代码
+3. 添加新OS支持
+
+### 4.3 阶段三：CVO集成（1-2个月）
+
+1. 实现ClusterVersion CRD
+2. 实现升级编排器
+3. 迁移现有升级逻辑
+
+### 4.4 阶段四：Asset管理（1个月）
+
+1. 实现Asset框架
+2. 迁移现有配置生成
+3. 添加增量生成支持
+
+### 4.5 阶段五：Ignition支持（1个月）
+
+1. 实现Ignition生成器
+2. 集成到Bootstrap Provider
+3. 添加验证机制
+
+## 五、总结
+
+通过以上重构，openFuyao将获得：
+
+1. **UPI/IPI双模式支持**：适配更多基础设施场景
+2. **可扩展的OS支持**：轻松添加新操作系统
+3. **声明式升级管理**：CVO提供可靠的升级机制
+4. **Asset依赖管理**：清晰的状态追踪和失败恢复
+5. **Ignition配置支持**：更安全、声明式的节点配置
+
+这些改进将使openFuyao具备与OpenShift Installer相当的企业级能力，同时保持其轻量级和易用性。
+        
