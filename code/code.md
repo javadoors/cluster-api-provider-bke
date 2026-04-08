@@ -925,149 +925,9 @@ func (k *KubeadmPlugin) waitComponentReady(component string) error {
 **建议的核心思路**：从"完全重写"转向"复用 + 扩展"，复用 kubeadm 的成熟能力，专注于 BKE 特有的扩展需求。
 
 
-
-
-          
-我来帮你详细解析 cluster-api-provider-bke 项目的代码结构。让我先探索整体项目结构。
-        
-            
-toolName: view_folder
-            
-status: success
-          
-d:\code\github\cluster-api-provider-bke
-          
-
-        
-            
-toolName: view_files
-            
-status: success
-          
-            
-filePath: d:\code\github\cluster-api-provider-bke\README.md
-          
-
-        
-            
-toolName: file_search
-            
-status: success
-          
-          
-
-        
-            
-toolName: view_files
-            
-status: success
-          
-            
-filePath: d:\code\github\cluster-api-provider-bke\design.md
-          
-
-        
-            
-toolName: view_files
-            
-status: success
-          
-            
-filePath: d:\code\github\cluster-api-provider-bke\cmd\capbke\main.go
-          
-
-        
-            
-toolName: view_files
-            
-status: success
-          
-            
-filePath: d:\code\github\cluster-api-provider-bke\cmd\bkeagent\main.go
-          
-
-        
-            
-toolName: view_folder
-            
-status: success
-          
-d:\code\github\cluster-api-provider-bke\pkg
-          
-
-        
-            
-toolName: view_files
-            
-status: success
-          
-            
-filePath: d:\code\github\cluster-api-provider-bke\controllers\capbke\bkecluster_controller.go
-          
-
-        
-            
-toolName: view_files
-            
-status: success
-          
-            
-filePath: d:\code\github\cluster-api-provider-bke\controllers\capbke\bkemachine_controller.go
-          
-
-        
-            
-toolName: view_files
-            
-status: success
-          
-            
-filePath: d:\code\github\cluster-api-provider-bke\pkg\phaseframe\interface.go
-          
-
-        
-            
-toolName: view_folder
-            
-status: success
-          
-d:\code\github\cluster-api-provider-bke\api
-          
-
-        
-            
-toolName: view_files
-            
-status: success
-          
-            
-filePath: d:\code\github\cluster-api-provider-bke\api\capbke\v1beta1\bkecluster_types.go
-          
-
-        
-            
-toolName: view_files
-            
-status: success
-          
-            
-filePath: d:\code\github\cluster-api-provider-bke\pkg\job\job.go
-          
-
-        
-            
-toolName: view_folder
-            
-status: success
-          
-d:\code\github\cluster-api-provider-bke\pkg\job\builtin
-          
 # Cluster API Provider BKE 代码详细解析思路
-
 ## 一、项目整体架构
-
 ### 1.1 架构分层
-
 ```
 ┌─────────────────────────────────────────────────────────┐
 │           Management Cluster (管理集群)                   │
@@ -1087,17 +947,12 @@ d:\code\github\cluster-api-provider-bke\pkg\job\builtin
 │  └──────────┘  └──────────┘  └──────────┘              │
 └─────────────────────────────────────────────────────────┘
 ```
-
 ### 1.2 核心组件
-
 **两个主要二进制程序：**
 1. **capbke**：运行在管理集群，实现 Cluster API Provider
 2. **bkeagent**：运行在工作负载集群节点，执行具体操作
-
 ## 二、解析思路与步骤
-
 ### 步骤 1：理解入口点
-
 **capbke 入口** ([cmd/capbke/main.go](file:///d:\code\github\cluster-api-provider-bke\cmd\capbke\main.go))
 - 初始化 Manager 和 Scheme
 - 注册 BKECluster 和 BKEMachine 控制器
@@ -1109,9 +964,7 @@ d:\code\github\cluster-api-provider-bke\pkg\job\builtin
 - 初始化 Command Controller
 - 启动健康检查服务
 - 创建 Job 执行器
-
 ### 步骤 2：分析数据模型
-
 **核心 CRD 定义**：
 
 | CRD | 文件位置 | 作用 |
