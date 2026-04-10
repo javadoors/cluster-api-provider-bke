@@ -4370,3 +4370,448 @@ Watches(&agentv1beta1.Command{}, handler.EnqueueRequestForOwner(...),
 | **BKEMachine Controller** | 节点生命周期的执行者，负责将物理节点引导加入集群并管理节点状态 |
 
 两者通过 Cluster API 的 InfrastructureRef 机制协作，BKECluster Controller 负责整体编排，BKEMachine Controller 负责具体节点的引导和状态管理。
+
+       
+# BKECluster控制器触发事件详解
+根据代码分析，BKECluster控制器的调谐由以下事件触发：
+## 一、触发事件总览
+```
+┌─────────────────────────────────────────────────────────────┐
+│              BKECluster Controller 触发事件                  │
+├─────────────────────────────────────────────────────────────┤
+│  1. BKECluster资源变更                                       │
+│     ├─ Spec变更                             │
+│     └─ 特定Annotation变更                                    │
+│                                                              │
+│  2. Cluster资源变更                                          │
+│     └─ Cluster取消暂停                                       │
+│                                                              │
+│  3. BKENode资源变更                                          │
+│     ├─ BKENode创建                                           │
+│     ├─ BKENode Spec变更                                      │
+│     └─ BKENode删除                                           │
+│                                                              │
+│  4. 目标集群Node状态变更                                      │
+│     └─ Node Ready状态变化                                    │
+└─────────────────────────────────────────────────────────────┘
+```
+## 二、详细触发条件
+### 2.1 BKECluster资源变更
+#### 触发条件1：Spec变更
+**Predicate**: [bkecluster.go:87](file:///D:\code\github\cluster-api-provider-bke\utils\capbke\predicates\bkecluster.go#L87)
+
+**触发场景**：
+
+| 事件类型 | 触发条件 | 说明 |
+|---------|---------|------|
+| **Create** | BKECluster创建时 | 新建集群触发首次调谐 |
+| **Update** | Generation变化 | Spec内容发生变更 |
+| **Update** | DeletionTimestamp变化 | 集群正在删除 |
+| **Update** | Pause状态变化 | 暂停/恢复集群 |
+
+**过滤条件**（不触发调谐）：
+- 集群状态为`Deploying`时，所有Spec更新不入队
+- 内部修改Spec（标记`InternalSpecChangeCondition`）时跳过
+
+**代码逻辑**：
+```go
+func BKEClusterSpecChange() predicate.Funcs {
+    return predicate.Funcs{
+        UpdateFunc: func(e event.UpdateEvent) bool {
+            newObj := e.ObjectNew.(*bkev1beta1.BKECluster)
+            oldObj := e.ObjectOld.(*bkev1beta1.BKECluster)
+            
+            // Generation变化表示Spec变更
+            if newObj.Generation != oldObj.Generation {
+                // 集群正在删除
+                if !newObj.DeletionTimestamp.IsZero() || !oldObj.DeletionTimestamp.IsZero() {
+                    return true
+                }
+                
+                // 暂停状态变更
+                if oldObj.Spec.Pause != newObj.Spec.Pause {
+                    return true
+                }
+                
+                // 内部修改跳过
+                if config.EnableInternalUpdate {
+                    if _, ok := condition.HasCondition(bkev1beta1.InternalSpecChangeCondition, newObj); ok {
+                        return false
+                    }
+                }
+                
+                // Deploying状态跳过
+                if newObj.Status.ClusterHealthState == bkev1beta1.Deploying {
+                    return false
+                }
+                
+                return true
+            }
+            return false
+        },
+        CreateFunc: func(e event.CreateEvent) bool {
+            return e.Object.(*bkev1beta1.BKECluster) != nil
+        },
+    }
+}
+```
+#### 触发条件2：特定Annotation变更
+**Predicate**: [bkecluster.go:149](file:///D:\code\github\cluster-api-provider-bke\utils\capbke\predicates\bkecluster.go#L149)
+
+**监听的Annotation**：
+
+| Annotation Key | 用途 |
+|---------------|------|
+| `AppointmentDeletedNodesAnnotationKey` | 预约删除节点 |
+| `AppointmentAddNodesAnnotationKey` | 预约添加节点 |
+| `RetryAnnotationKey` | 重试操作 |
+| `ClusterTrackerHealthyCheckFailedAnnotationKey` | 集群健康检查失败标记 |
+
+**代码逻辑**：
+```go
+func BKEClusterAnnotationsChange() predicate.Funcs {
+    return predicate.Funcs{
+        UpdateFunc: func(e event.UpdateEvent) bool {
+            newObj := e.ObjectNew.(*bkev1beta1.BKECluster)
+            oldObj := e.ObjectOld.(*bkev1beta1.BKECluster)
+            
+            allowChangeAnnotations := []string{
+                annotation.AppointmentDeletedNodesAnnotationKey,
+                annotation.AppointmentAddNodesAnnotationKey,
+                annotation.RetryAnnotationKey,
+                annotation.ClusterTrackerHealthyCheckFailedAnnotationKey,
+            }
+            
+            for _, key := range allowChangeAnnotations {
+                newV, newFound := annotation.HasAnnotation(newObj, key)
+                oldV, oldFound := annotation.HasAnnotation(oldObj, key)
+                if (newV != oldV) || (newFound && !oldFound) {
+                    return true
+                }
+            }
+            return false
+        },
+    }
+}
+```
+### 2.2 Cluster资源变更
+#### 触发条件：Cluster取消暂停
+
+**Predicate**: [cluster.go:21](file:///D:\code\github\cluster-api-provider-bke\utils\capbke\predicates\cluster.go#L21)
+
+**映射函数**: [bkecluster_controller.go:274](file:///D:\code\github\cluster-api-provider-bke\controllers\capbke\bkecluster_controller.go#L274) `clusterToBKEClusterMapFunc`
+
+**触发场景**：
+
+| 事件类型 | 触发条件 | 说明 |
+|---------|---------|------|
+| **Create** | Cluster创建且`Spec.Paused=false` | 新建集群且未暂停 |
+| **Update** | Cluster更新且`Spec.Paused=false` | 集群未暂停状态下的更新 |
+
+**映射逻辑**：
+- 从Cluster的`InfrastructureRef`获取对应的BKECluster
+- 仅当`InfrastructureRef.GroupVersionKind`匹配BKECluster时才触发
+
+**代码逻辑**：
+```go
+func ClusterUnPause() predicate.Funcs {
+    return predicate.Funcs{
+        UpdateFunc: func(e event.UpdateEvent) bool {
+            newObj := e.ObjectNew.(*clusterv1.Cluster)
+            return !newObj.Spec.Paused
+        },
+        CreateFunc: func(e event.CreateEvent) bool {
+            obj := e.Object.(*clusterv1.Cluster)
+            return !obj.Spec.Paused
+        },
+    }
+}
+
+func clusterToBKEClusterMapFunc(...) handler.MapFunc {
+    return func(ctx context.Context, o client.Object) []reconcile.Request {
+        cluster := o.(*clusterv1.Cluster)
+        
+        // 跳过正在删除的Cluster
+        if !cluster.DeletionTimestamp.IsZero() {
+            return nil
+        }
+        
+        // InfrastructureRef必须存在
+        if cluster.Spec.InfrastructureRef == nil {
+            return nil
+        }
+        
+        // GroupKind必须匹配
+        gk := gvk.GroupKind()
+        infraGK := cluster.Spec.InfrastructureRef.GroupVersionKind().GroupKind()
+        if gk != infraGK {
+            return nil
+        }
+        
+        return []reconcile.Request{{
+            NamespacedName: client.ObjectKey{
+                Namespace: cluster.Spec.InfrastructureRef.Namespace,
+                Name:      cluster.Spec.InfrastructureRef.Name,
+            },
+        }}
+    }
+}
+```
+### 2.3 BKENode资源变更
+#### 触发条件：BKENode生命周期事件
+**Predicate**: [bkecluster.go:193](file:///D:\code\github\cluster-api-provider-bke\utils\capbke\predicates\bkecluster.go#L193) `BKENodeChange()`
+
+**映射函数**: [bkecluster_controller.go:261](file:///D:\code\github\cluster-api-provider-bke\controllers\capbke\bkecluster_controller.go#L261) `bkeNodeToBKEClusterMapFunc`
+
+**触发场景**：
+
+| 事件类型 | 触发条件 | 说明 |
+|---------|---------|------|
+| **Create** | BKENode创建 | 新节点加入集群 |
+| **Update** | BKENode Generation变化 | 节点Spec变更 |
+| **Delete** | BKENode删除 | 节点从集群移除 |
+
+**映射逻辑**：
+- 从BKENode的Label中获取`ClusterNameLabel`
+- 映射到对应的BKECluster
+
+**代码逻辑**：
+```go
+func BKENodeChange() predicate.Funcs {
+    return predicate.Funcs{
+        CreateFunc: func(e event.CreateEvent) bool {
+            obj := e.Object.(*confv1beta1.BKENode)
+            log.Infof("BKENode 创建，触发调谐")
+            return true
+        },
+        UpdateFunc: func(e event.UpdateEvent) bool {
+            newObj := e.ObjectNew.(*confv1beta1.BKENode)
+            oldObj := e.ObjectOld.(*confv1beta1.BKENode)
+            
+            if newObj.Generation != oldObj.Generation {
+                log.Infof("BKENode Spec 变更，触发调谐")
+                return true
+            }
+            return false
+        },
+        DeleteFunc: func(e event.DeleteEvent) bool {
+            log.Infof("BKENode 删除，触发调谐")
+            return true
+        },
+    }
+}
+
+func (r *BKEClusterReconciler) bkeNodeToBKEClusterMapFunc() handler.MapFunc {
+    return func(ctx context.Context, obj client.Object) []reconcile.Request {
+        bkeNode := obj.(*confv1beta1.BKENode)
+        
+        // 从Label获取集群名称
+        clusterName := bkeNode.Labels[nodeutil.ClusterNameLabel]
+        if clusterName == "" {
+            return nil
+        }
+        
+        return []reconcile.Request{{
+            NamespacedName: types.NamespacedName{
+                Name:      clusterName,
+                Namespace: bkeNode.Namespace,
+            },
+        }}
+    }
+}
+```
+### 2.4 目标集群Node状态变更
+#### 触发条件：Node Ready状态变化
+**Predicate**: [node.go:21](file:///D:\code\github\cluster-api-provider-bke\utils\capbke\predicates\node.go#L21) `NodeNotReadyPredicate()`
+
+**映射函数**: [bkecluster_controller.go:299](file:///D:\code\github\cluster-api-provider-bke\controllers\capbke\bkecluster_controller.go#L299) `nodeToBKEClusterMapFunc`
+
+**触发场景**：
+
+| 事件类型 | 触发条件 | 说明 |
+|---------|---------|------|
+| **Create** | Node创建且Ready=False | 新节点未就绪 |
+| **Update** | Node Ready状态变化 | 节点状态变更 |
+
+**映射逻辑**：
+- 从Node的Annotation获取`ClusterNameAnnotation`和`ClusterNamespaceAnnotation`
+- 通过Cluster的`InfrastructureRef`映射到BKECluster
+
+**代码逻辑**：
+```go
+func NodeNotReadyPredicate() predicate.Funcs {
+    return predicate.Funcs{
+        UpdateFunc: func(e event.UpdateEvent) bool {
+            oldObj := e.ObjectOld.(*corev1.Node)
+            newObj := e.ObjectNew.(*corev1.Node)
+            
+            oldCondition := getNodeCondition(oldObj, corev1.NodeReady)
+            newCondition := getNodeCondition(newObj, corev1.NodeReady)
+            
+            // Ready状态变化才触发
+            if oldCondition.Status != newCondition.Status {
+                return true
+            }
+            return false
+        },
+        CreateFunc: func(e event.CreateEvent) bool {
+            obj := e.Object.(*corev1.Node)
+            condition := getNodeCondition(obj, corev1.NodeReady)
+            // 创建时Ready=False才触发
+            if condition.Status == corev1.ConditionFalse {
+                return true
+            }
+            return false
+        },
+    }
+}
+
+func nodeToBKEClusterMapFunc(ctx context.Context, c client.Client) handler.MapFunc {
+    return func(ctx context.Context, o client.Object) []reconcile.Request {
+        node := o.(*corev1.Node)
+        
+        // 从Annotation获取集群信息
+        clusterName, ok := annotation.HasAnnotation(node, clusterv1.ClusterNameAnnotation)
+        if !ok {
+            return nil
+        }
+        clusterNamespace, ok := annotation.HasAnnotation(node, clusterv1.ClusterNamespaceAnnotation)
+        if !ok {
+            return nil
+        }
+        
+        // 获取Cluster资源
+        cluster := &clusterv1.Cluster{}
+        if err := c.Get(ctx, types.NamespacedName{
+            Namespace: clusterNamespace, 
+            Name: clusterName,
+        }, cluster); err != nil {
+            return nil
+        }
+        
+        // 通过InfrastructureRef映射到BKECluster
+        if cluster.Spec.InfrastructureRef == nil {
+            return nil
+        }
+        
+        return []reconcile.Request{{
+            NamespacedName: client.ObjectKey{
+                Namespace: cluster.Spec.InfrastructureRef.Namespace,
+                Name:      cluster.Spec.InfrastructureRef.Name,
+            },
+        }}
+    }
+}
+```
+## 三、触发流程图
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    事件源                                   │
+└─────────────────────────────────────────────────────────────┘
+                            │
+        ┌───────────────────┼───────────────────┬─────────────┐
+        ▼                   ▼                   ▼             ▼
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│ BKECluster   │    │   Cluster    │    │   BKENode    │    │  Node (目标) │
+│   资源变更   │    │   资源变更   │    │   资源变更   │    │   状态变更   │
+└──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘
+        │                   │                   │                   │
+        ▼                   ▼                   ▼                   ▼
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│  Predicate   │    │  Predicate   │    │  Predicate   │    │  Predicate   │
+│  过滤条件    │    │  过滤条件    │    │  过滤条件    │    │  过滤条件    │
+├──────────────┤    ├──────────────┤    ├──────────────┤    ├──────────────┤
+│ • Spec变更   │    │ • 未暂停     │    │ • 创建       │    │ • Ready状态  │
+│ • Annotation │    │              │    │ • Spec变更   │    │   变化       │
+│   变更       │    │              │    │ • 删除       │    │              │
+└──────────────┘    └──────────────┘    └──────────────┘    └──────────────┘
+        │                   │                   │                   │
+        │                   ▼                   ▼                   ▼
+        │           ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+        │           │  MapFunc     │    │  MapFunc     │    │  MapFunc     │
+        │           │  映射到      │    │  映射到      │    │  映射到      │
+        │           │  BKECluster  │    │  BKECluster  │    │  BKECluster  │
+        │           └──────────────┘    └──────────────┘    └──────────────┘
+        │                   │                   │                   │
+        └───────────────────┴───────────────────┴───────────────────┘
+                            │
+                            ▼
+                ┌──────────────────────┐
+                │   Reconcile Loop     │
+                │   调谐循环           │
+                └──────────────────────┘
+                            │
+                            ▼
+                ┌──────────────────────┐
+                │   执行阶段流程        │
+                │   • 部署             │
+                │   • 升级             │
+                │   • 删除             │
+                │   • 纳管             │
+                └──────────────────────┘
+```
+## 四、典型场景示例
+### 场景1：创建集群
+```
+用户创建Cluster资源
+        │
+        ├─ Cluster创建事件
+        │   └─ ClusterUnPause() 检查：Spec.Paused=false ✓
+        │       └─ clusterToBKEClusterMapFunc() 映射到BKECluster
+        │
+        ├─ BKECluster创建事件
+        │   └─ BKEClusterSpecChange() 检查：Create事件 ✓
+        │
+        └─ 触发Reconcile
+            └─ 执行部署阶段流程
+```
+### 场景2：添加节点
+```
+用户修改BKECluster.Spec.Nodes添加新节点
+        │
+        ├─ BKECluster Update事件
+        │   └─ BKEClusterSpecChange() 检查：
+        │       ├─ Generation变化 ✓
+        │       ├─ 集群未删除 ✓
+        │       ├─ 集群状态非Deploying ✓
+        │       └─ 触发Reconcile
+        │
+        └─ 执行扩容阶段流程
+```
+### 场景3：节点状态变化
+```
+目标集群Node状态从Ready变为NotReady
+        │
+        ├─ Node Update事件（目标集群）
+        │   └─ NodeNotReadyPredicate() 检查：
+        │       └─ Ready状态变化 ✓
+        │           └─ nodeToBKEClusterMapFunc() 映射到BKECluster
+        │
+        └─ 触发Reconcile
+            └─ 执行健康检查阶段流程
+```
+### 场景4：重试失败操作
+```
+用户添加RetryAnnotation到BKECluster
+        │
+        ├─ BKECluster Update事件
+        │   └─ BKEClusterAnnotationsChange() 检查：
+        │       └─ RetryAnnotationKey变更 ✓
+        │
+        └─ 触发Reconcile
+            └─ 执行重试阶段流程
+```
+## 五、总结
+### 触发事件分类
+| 类别 | 触发源 | 触发条件 | 目的 |
+|------|--------|---------|------|
+| **主资源变更** | BKECluster | Spec/Annotation变更 | 响应用户配置变更 |
+| **关联资源变更** | Cluster | 取消暂停 | 响应Cluster API生命周期 |
+| **节点资源变更** | BKENode | 创建/更新/删除 | 响应节点生命周期 |
+| **运行时状态** | Node（目标集群） | Ready状态变化 | 响应集群健康状态变化 |
+### 设计亮点
+1. **精细过滤**：通过Predicate过滤不必要的事件，减少无效调谐
+2. **多层映射**：通过MapFunc将关联资源事件映射到主资源
+3. **状态驱动**：基于资源状态而非时间触发调谐
+4. **跨集群监听**：通过remote.Watch监听目标集群状态
+
