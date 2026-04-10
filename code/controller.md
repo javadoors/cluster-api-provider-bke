@@ -4062,3 +4062,311 @@ func (p *PhaseFlow) executePhases(phases confv1beta1.BKEClusterPhases) (ctrl.Res
 | P2 | StatusManager 缓存管理 | 所有操作 | 引入高性能缓存库 |
 | P2 | 缺乏可观测性 | 所有操作 | 添加指标和追踪 |
         
+# Controller 功能总结
+## BKECluster Controller 与 BKEMachine Controller 功能总结
+### 一、整体架构关系
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           Cluster API 生态                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   Cluster (cluster.x-k8s.io)                                                │
+│       │                                                                     │
+│       ├── InfrastructureRef ──────────────► BKECluster                     │
+│       │                                    (基础设施提供者)                   │
+│       │                                                                     │
+│       └── ControlPlaneRef                                                  │
+│              │                                                              │
+│              └── KubeadmControlPlane                                        │
+│                     │                                                       │
+│                     └── MachineTemplate                                     │
+│                            │                                                │
+│                            └── Machines[]                                   │
+│                                   │                                         │
+│                                   └── InfrastructureRef ──► BKEMachine      │
+│                                                          (机器基础设施提供者)  │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+### 二、BKECluster Controller 功能说明
+#### 1. 核心职责
+BKECluster Controller 是 **集群级别** 的基础设施控制器，负责 Kubernetes 集群的完整生命周期管理。
+#### 2. 主要功能模块
+| 模块 | 功能描述 |
+|------|----------|
+| **集群创建** | 从零开始部署完整的 Kubernetes 集群 |
+| **集群升级** | 支持 Kubernetes 版本升级、组件升级 |
+| **集群扩缩容** | Master/Worker 节点的增加和删除 |
+| **集群删除** | 安全清理集群所有资源 |
+| **集群纳管** | 纳管现有 Kubernetes 集群 |
+| **状态管理** | 集群健康状态监控和上报 |
+#### 3. Phase 阶段流程
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           集群创建流程                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   CommonPhases (通用阶段)                                                    │
+│   ├── EnsureFinalizer      → 添加 Finalizer                                 │
+│   ├── EnsurePaused         → 处理暂停状态                                    │
+│   ├── EnsureClusterManage  → 纳管现有集群                                    │
+│   ├── EnsureDeleteOrReset  → 删除/重置集群                                   │
+│   └── EnsureDryRun         → DryRun 模式                                    │
+│                                                                             │
+│   DeployPhases (部署阶段)                                                    │
+│   ├── EnsureBKEAgent       → 推送 Agent 到节点                              │
+│   ├── EnsureNodesEnv       → 节点环境准备                                    │
+│   ├── EnsureClusterAPIObj  → 创建 Cluster API 对象                          │
+│   ├── EnsureCerts          → 生成集群证书                                    │
+│   ├── EnsureLoadBalance    → 配置负载均衡                                    │
+│   ├── EnsureMasterInit     → 初始化第一个 Master                            │
+│   ├── EnsureMasterJoin     → 其他 Master 加入                               │
+│   ├── EnsureWorkerJoin     → Worker 节点加入                                │
+│   ├── EnsureAddonDeploy    → 部署集群组件                                    │
+│   ├── EnsureNodesPostProcess → 后置脚本处理                                 │
+│   └── EnsureAgentSwitch    → Agent 监听切换                                 │
+│                                                                             │
+│   PostDeployPhases (部署后阶段)                                              │
+│   ├── EnsureProviderSelfUpgrade → Provider 自升级                          │
+│   ├── EnsureAgentUpgrade    → Agent 升级                                   │
+│   ├── EnsureContainerdUpgrade → Containerd 升级                            │
+│   ├── EnsureEtcdUpgrade     → Etcd 升级                                    │
+│   ├── EnsureWorkerUpgrade   → Worker 升级                                  │
+│   ├── EnsureMasterUpgrade   → Master 升级                                  │
+│   ├── EnsureComponentUpgrade → 核心组件升级                                 │
+│   └── EnsureCluster         → 集群健康检查                                  │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+#### 4. 核心协调流程
+```go
+func (r *BKEClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    // 1. 获取并验证集群资源
+    bkeCluster, err := r.getAndValidateCluster(ctx, req)
+    
+    // 2. 注册指标
+    r.registerMetrics(bkeCluster)
+    
+    // 3. 获取旧版本配置（用于变更检测）
+    oldBkeCluster, err := r.getOldBKECluster(bkeCluster)
+    
+    // 4. 处理 Agent 和节点状态
+    r.handleClusterStatus(ctx, bkeCluster, bkeLogger)
+    
+    // 5. 执行 Phase 流程
+    phaseResult, err := r.executePhaseFlow(ctx, bkeCluster, oldBkeCluster, bkeLogger)
+    
+    // 6. 设置集群监控
+    r.setupClusterWatching(ctx, bkeCluster, bkeLogger)
+    
+    // 7. 返回结果
+    return r.getFinalResult(phaseResult, bkeCluster)
+}
+```
+#### 5. 状态管理机制
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    StatusManager                                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   BKEClusterStatusMap                                           │
+│   ├── 记录集群失败状态计数                                        │
+│   ├── 控制重试次数 (默认 10 次)                                   │
+│   └── 超过阈值后停止重试                                          │
+│                                                                 │
+│   BKENodesStatusMap                                             │
+│   ├── 记录节点级别状态                                            │
+│   └── 支持单节点重试控制                                          │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+### 三、BKEMachine Controller 功能说明
+#### 1. 核心职责
+BKEMachine Controller 是 **节点级别** 的基础设施控制器，负责单个节点的引导和生命周期管理。
+#### 2. 主要功能模块
+| 模块 | 功能描述 |
+|------|----------|
+| **节点引导** | 将物理/虚拟节点引导加入 Kubernetes 集群 |
+| **命令管理** | 创建和监控 Agent 执行命令 |
+| **节点删除** | 安全清理节点资源 |
+| **状态同步** | 同步节点状态到 BKEMachine |
+| **ProviderID 管理** | 设置节点 ProviderID |
+#### 3. 节点引导流程
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           节点引导流程                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   1. 等待前置条件                                                            │
+│      ├── Worker 节点等待控制平面初始化完成                                    │
+│      └── Master 节点同步 KubeadmConfig                                       │
+│                                                                             │
+│   2. 节点分配                                                                │
+│      ├── 根据角色筛选可用节点                                    │
+│      ├── 检查内存缓存防止重复分配                                             │
+│      └── 检查 BKEMachine Label 防止持久化重复                                 │
+│                                                                             │
+│   3. 引导执行                                                                │
+│      ├── 完全控制集群: 创建 Bootstrap Command                                │
+│      │   ├── InitControlPlane  → 初始化控制平面                              │
+│      │   ├── JoinControlPlane  → 加入控制平面                                │
+│      │   └── JoinNode          → Worker 加入                                │
+│      └── 纳管集群: 直接设置 ProviderID                                       │
+│                                                                             │
+│   4. 命令监控                                                                │
+│      ├── Watch Command 状态变化                                              │
+│      ├── 处理成功: 连接目标集群，设置节点配置                                  │
+│      └── 处理失败: 记录错误，清理状态                                         │
+│                                                                             │
+│   5. 状态更新                                                                │
+│      ├── 设置 BKEMachine.Status.Bootstrapped = true                        │
+│      ├── 设置 ProviderID                                                    │
+│      ├── 设置 NodeRef                                                       │
+│      └── 更新集群引导状态                                                     │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+#### 4. 核心协调流程
+```go
+func (r *BKEMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    // 1. 获取必要对象
+    objects, err := r.fetchRequiredObjects(ctx, req, log)
+    
+    // 2. 处理暂停检查
+    if annotations.IsPaused(objects.Cluster, objects.BKEMachine) {
+        return ctrl.Result{}, nil
+    }
+    
+    // 3. 添加 Finalizer
+    if !controllerutil.ContainsFinalizer(objects.BKEMachine, bkev1beta1.BKEMachineFinalizer) {
+        controllerutil.AddFinalizer(objects.BKEMachine, bkev1beta1.BKEMachineFinalizer)
+        patchBKEMachine(ctx, patchHelper, objects.BKEMachine)
+    }
+    
+    // 4. 处理删除或正常协调
+    if !objects.BKEMachine.ObjectMeta.DeletionTimestamp.IsZero() {
+        return r.reconcileDelete(params)
+    }
+    return r.reconcile(params)
+}
+
+func (r *BKEMachineReconciler) reconcile(params BootstrapReconcileParams) (ctrl.Result, error) {
+    // 1. 处理命令状态
+    commandResult, err := r.reconcileCommand(params)
+    
+    // 2. 处理引导
+    bootstrapResult, err := r.reconcileBootstrap(params)
+    
+    return util.LowestNonZeroResult(commandResult, bootstrapResult), nil
+}
+```
+#### 5. 节点删除流程
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    节点删除流程                                  │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   1. 检查删除条件                                                │
+│      ├── Agent 未监听 → 直接删除                                │
+│      ├── 集群删除中 + 忽略目标集群 → 直接删除                    │
+│      └── Agent 从未部署 → 直接删除                              │
+│                                                                 │
+│   2. 执行 Reset 命令                                             │
+│      ├── 创建 Reset Command                                     │
+│      ├── 等待命令完成                                            │
+│      └── 处理失败: 直接删除 Finalizer                           │
+│                                                                 │
+│   3. 关闭 Agent                                                  │
+│      └── 发送 Shutdown 命令                                     │
+│                                                                 │
+│   4. 清理资源                                                    │
+│      ├── 删除 BKENode CRD                                       │
+│      ├── 清理内存缓存                                            │
+│      └── 移除 Finalizer                                         │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+### 四、两个控制器协作关系
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        控制器协作流程                                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   BKECluster Controller                    BKEMachine Controller            │
+│   ────────────────────                     ─────────────────────            │
+│                                                                             │
+│   1. 创建 BKECluster                                                        │
+│      │                                                                      │
+│      ▼                                                                      │
+│   2. 执行 EnsureBKEAgent                                                    │
+│      └── 推送 Agent 到所有节点                                              │
+│      │                                                                      │
+│      ▼                                                                      │
+│   3. 执行 EnsureClusterAPIObj                                               │
+│      └── 创建 Cluster/Machine/BKEMachine                                   │
+│      │                        │                                             │
+│      │                        ▼                                             │
+│      │                    4. BKEMachine Controller 被触发                   │
+│      │                       ├── 分配节点                                   │
+│      │                       ├── 创建 Bootstrap Command                    │
+│      │                       └── 等待引导完成                               │
+│      │                        │                                             │
+│      │                        ▼                                             │
+│      │                    5. 更新 Machine.Status                            │
+│      │                       └── Cluster API 感知节点就绪                   │
+│      │                        │                                             │
+│      ▼                        │                                             │
+│   6. 继续后续 Phase ◄─────────┘                                             │
+│      ├── EnsureMasterInit (已被 BKEMachine 完成)                            │
+│      ├── EnsureMasterJoin                                                  │
+│      ├── EnsureWorkerJoin                                                  │
+│      └── EnsureAddonDeploy                                                 │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+### 五、关键差异对比
+
+| 维度 | BKECluster Controller | BKEMachine Controller |
+|------|----------------------|----------------------|
+| **管理粒度** | 集群级别 | 节点级别 |
+| **主要资源** | BKECluster | BKEMachine |
+| **生命周期** | 集群创建→升级→删除 | 节点引导→维护→删除 |
+| **触发方式** | Cluster InfrastructureRef | Machine InfrastructureRef |
+| **Phase 数量** | 20+ 个阶段 | 3 种引导阶段 |
+| **状态管理** | StatusManager 全局管理 | 简单条件标记 |
+| **并发控制** | Phase 串行执行 | 节点并行引导 |
+| **错误处理** | 失败重试 + 状态回滚 | 失败标记 + 节点重分配 |
+### 六、核心设计模式
+#### 1. Phase 模式
+```go
+type Phase interface {
+    Name() confv1beta1.BKEClusterPhase
+    NeedExecute(old, new *bkev1beta1.BKECluster) bool
+    Execute() (ctrl.Result, error)
+    RegisterPreHooks(hooks ...PreHook)
+    RegisterPostHooks(hooks ...PostHook)
+}
+```
+**优点**: 可扩展、可测试、状态清晰
+#### 2. Command 模式
+```go
+type Command interface {
+    New() error
+    Wait() (error, []string, []string)
+    Remove() error
+}
+```
+**优点**: 异步执行、状态可追踪、支持超时
+#### 3. Watch 模式
+```go
+Watches(&agentv1beta1.Command{}, handler.EnqueueRequestForOwner(...),
+    builder.WithPredicates(predicates.CommandUpdateCompleted()))
+```
+**优点**: 事件驱动、减少轮询、响应及时
+### 七、总结
+| 控制器 | 一句话描述 |
+|--------|-----------|
+| **BKECluster Controller** | 集群生命周期的总指挥，通过 Phase 编排实现集群的创建、升级、扩缩容、删除等操作 |
+| **BKEMachine Controller** | 节点生命周期的执行者，负责将物理节点引导加入集群并管理节点状态 |
+
+两者通过 Cluster API 的 InfrastructureRef 机制协作，BKECluster Controller 负责整体编排，BKEMachine Controller 负责具体节点的引导和状态管理。
