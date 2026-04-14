@@ -2838,4 +2838,946 @@ dp.Execute(command)
 
 **核心依赖**: 所有下载都依赖 `BkeConfig.Cluster.HTTPRepo` 配置（默认 `http.bocloud.k8s:40080`），这是一个**内部 HTTP 文件服务器**，存放了预编译的二进制文件。
 
+# 基于 kubeadm SDK 重构的详细设计方案
+## 基于 kubeadm SDK 重构的详细设计方案
+### 一、重构总体架构
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        BKE Kubeadm Plugin (重构后)                       │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │                   Phase Orchestrator (编排层)                    │    │
+│  │  • initControlPlane / joinControlPlane / joinWorker             │    │
+│  │  • upgradeControlPlane / upgradeWorker / upgradeEtcd            │    │
+│  │  • 保留现有流程编排逻辑，调用下层 Phase 实现                       │    │
+│  └────────────────────────┬────────────────────────────────────────┘    │
+│                           │                                             │
+│  ┌────────────────────────┼────────────────────────────────────────┐    │
+│  │                   Phase Implementation (实现层)                   │    │
+│  │                        │                                         │    │
+│  │  ┌─────────────────────┼──────────────────────────┐             │    │
+│  │  │  kubeadm SDK Phase  │   BKE 自研 Phase          │             │    │
+│  │  │  (标准 K8s 能力)    │   (差异化能力)             │             │    │
+│  │  │                     │                            │             │    │
+│  │  │  • CertsPhase       │   • EtcdStaticPodPhase     │             │    │
+│  │  │  • KubeConfigPhase  │   • HAProxyPhase           │             │    │
+│  │  │  • ControlPlanePhase│   • KeepalivedPhase        │             │    │
+│  │  │  • KubeletPhase     │   • EnvInitPhase           │             │    │
+│  │  │                     │   • PreProcessPhase        │             │    │
+│  │  │                     │   • PostProcessPhase       │             │    │
+│  │  │                     │   • AgentUpdatePhase       │             │    │
+│  │  │                     │   • ResetPhase             │             │    │
+│  │  └─────────────────────┴──────────────────────────┘             │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │                   Config Adapter (配置适配层)                     │    │
+│  │  BkeConfig ──► kubeadmapi.InitConfiguration                     │    │
+│  │  BkeConfig ──► kubeadmapi.ClusterConfiguration                  │    │
+│  │  BkeConfig ──► kubeadmapi.JoinConfiguration                     │    │
+│  │  BootScope ──► kubeadmapi.NodeRegistrationOptions               │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │                   Feature Gate (特性开关层)                       │    │
+│  │  • UseKubeadmCerts=true/false      (证书生成)                    │    │
+│  │  • UseKubeadmKubeConfig=true/false (KubeConfig 生成)            │    │
+│  │  • UseKubeadmControlPlane=true/false (Static Pod 渲染)          │    │
+│  │  • UseKubeadmKubelet=true/false    (Kubelet 配置生成)           │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+### 二、核心模块详细设计
+#### 2.1 Config Adapter — 配置适配层
+**目标**：将 BKE 自有的 `BKEConfig` / `BootScope` 转换为 kubeadm SDK 所需的标准类型。
+
+**新文件**：`pkg/job/builtin/kubeadm/adapter/config.go`
+```go
+package adapter
+
+import (
+    kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
+    kubeadmscheme "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/scheme"
+    bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
+    bkeinit "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/initialize"
+    "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/mfutil"
+)
+
+type ConfigAdapter struct {
+    BkeConfig *bkev1beta1.BKEConfig
+    BootScope *mfutil.BootScope
+}
+
+func NewConfigAdapter(cfg *bkev1beta1.BKEConfig, scope *mfutil.BootScope) *ConfigAdapter {
+    return &ConfigAdapter{BkeConfig: cfg, BootScope: scope}
+}
+
+// ToInitConfiguration 将 BkeConfig 转换为 kubeadm InitConfiguration
+// 用于 initControlPlane 阶段
+func (a *ConfigAdapter) ToInitConfiguration() (*kubeadmapi.InitConfiguration, error) {
+    cfg := bkeinit.BkeConfig(*a.BkeConfig)
+    initCfg := &kubeadmapi.InitConfiguration{
+        TypeMeta: metav1.TypeMeta{
+            APIVersion: "kubeadm.k8s.io/v1beta3",
+            Kind:       "InitConfiguration",
+        },
+        NodeRegistration: kubeadmapi.NodeRegistrationOptions{
+            Name:             a.BootScope.HostName,
+            CRISocket:        a.detectCRISocket(),
+            KubeletExtraArgs: a.parseKubeletExtraArgs(),
+        },
+        LocalAPIEndpoint: kubeadmapi.APIEndpoint{
+            AdvertiseAddress: a.BootScope.HostIP,
+            BindPort:         int32(cfg.Cluster.APIServer.Port),
+        },
+    }
+
+    return initCfg, nil
+}
+
+// ToClusterConfiguration 将 BkeConfig 转换为 kubeadm ClusterConfiguration
+// 用于证书生成、Static Pod 渲染等阶段
+func (a *ConfigAdapter) ToClusterConfiguration() (*kubeadmapi.ClusterConfiguration, error) {
+    cfg := bkeinit.BkeConfig(*a.BkeConfig)
+    clusterCfg := &kubeadmapi.ClusterConfiguration{
+        TypeMeta: metav1.TypeMeta{
+            APIVersion: "kubeadm.k8s.io/v1beta3",
+            Kind:       "ClusterConfiguration",
+        },
+        Networking: kubeadmapi.Networking{
+            ServiceSubnet: cfg.Cluster.Networking.ServiceSubnet,
+            PodSubnet:     cfg.Cluster.Networking.PodSubnet,
+            DNSDomain:     cfg.Cluster.Networking.DNSDomain,
+        },
+        KubernetesVersion: cfg.Cluster.KubernetesVersion,
+        ControlPlaneEndpoint: cfg.Cluster.ControlPlaneEndpoint,
+        APIServer: kubeadmapi.APIServer{
+            ControlPlaneComponent: kubeadmapi.ControlPlaneComponent{
+                ExtraArgs: a.buildAPIServerExtraArgs(),
+                ExtraVolumes: a.buildAPIServerExtraVolumes(),
+            },
+            CertSANs: a.buildAPIServerSANs(),
+        },
+        ControllerManager: kubeadmapi.ControlPlaneComponent{
+            ExtraArgs:    a.buildControllerExtraArgs(),
+            ExtraVolumes: a.buildControllerExtraVolumes(),
+        },
+        Scheduler: kubeadmapi.ControlPlaneComponent{
+            ExtraArgs:    a.buildSchedulerExtraArgs(),
+            ExtraVolumes: a.buildSchedulerExtraVolumes(),
+        },
+        Etcd: kubeadmapi.Etcd{
+            Local: &kubeadmapi.LocalEtcd{
+                DataDir:       cfg.Cluster.Etcd.DataDir,
+                ExtraArgs:     a.buildEtcdExtraArgs(),
+                ServerCertSANs: a.buildEtcdSANs(),
+                PeerCertSANs:   a.buildEtcdSANs(),
+            },
+        },
+        CertificatesDir: cfg.Cluster.CertificatesDir,
+        ImageRepository: cfg.ImageFuyaoRepo(),
+    }
+
+    return clusterCfg, nil
+}
+
+// ToJoinConfiguration 将 BkeConfig 转换为 kubeadm JoinConfiguration
+// 用于 joinControlPlane / joinWorker 阶段
+func (a *ConfigAdapter) ToJoinConfiguration(controlPlane bool) (*kubeadmapi.JoinConfiguration, error) {
+    cfg := bkeinit.BkeConfig(*a.BkeConfig)
+    joinCfg := &kubeadmapi.JoinConfiguration{
+        TypeMeta: metav1.TypeMeta{
+            APIVersion: "kubeadm.k8s.io/v1beta3",
+            Kind:       "JoinConfiguration",
+        },
+        NodeRegistration: kubeadmapi.NodeRegistrationOptions{
+            Name:             a.BootScope.HostName,
+            CRISocket:        a.detectCRISocket(),
+            KubeletExtraArgs: a.parseKubeletExtraArgs(),
+        },
+        Discovery: kubeadmapi.Discovery{
+            BootstrapToken: &kubeadmapi.BootstrapTokenDiscovery{
+                APIServerEndpoint: a.getControlPlaneEndpoint(),
+            },
+        },
+    }
+
+    if controlPlane {
+        joinCfg.ControlPlane = &kubeadmapi.JoinControlPlane{
+            LocalAPIEndpoint: kubeadmapi.APIEndpoint{
+                AdvertiseAddress: a.BootScope.HostIP,
+                BindPort:         int32(cfg.Cluster.APIServer.Port),
+            },
+        }
+    }
+
+    return joinCfg, nil
+}
+```
+**关键设计决策**：
+
+| 转换项 | BKE 自有 | kubeadm 标准 | 适配策略 |
+|--------|---------|-------------|---------|
+| 证书目录 | `cfg.Cluster.CertificatesDir` | `ClusterConfiguration.CertificatesDir` | 直接映射 |
+| 镜像仓库 | `cfg.ImageFuyaoRepo()` | `ClusterConfiguration.ImageRepository` | 直接映射 |
+| etcd 配置 | 外部 Static Pod | `ClusterConfiguration.Etcd.Local` | BKE 使用外部 etcd，但仍映射为 Local（因为 Static Pod 部署方式与 kubeadm stacked etcd 的证书结构一致） |
+| APIServer SAN | 自研 `BKECertAPIServer().Config.AltNames` | `ClusterConfiguration.APIServer.CertSANs` | 合并自研 SAN + kubeadm 标准 SAN |
+| Kubelet ExtraArgs | 字符串 `"key=value;key=value"` | `map[string]string` | 解析转换 |
+#### 2.2 CertsPhase — 证书生成重构
+**目标**：使用 kubeadm SDK 的 `phases/certs` 替代自研 `pkiutil`，同时保留 BKE 特有的证书（如 `tls-server`、`tls-client`、Global CA）。
+
+**新文件**：`pkg/job/builtin/kubeadm/phase/certs.go`
+```go
+package phase
+
+import (
+    "k8s.io/kubernetes/cmd/kubeadm/app/phases/certs"
+    kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
+    kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
+    "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job/builtin/kubeadm/adapter"
+    "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/pkiutil"
+)
+
+type CertsPhase struct {
+    adapter    *adapter.ConfigAdapter
+    pkiDir     string
+    featureGates map[string]bool
+}
+
+func NewCertsPhase(adapter *adapter.ConfigAdapter, pkiDir string) *CertsPhase {
+    return &CertsPhase{
+        adapter: adapter,
+        pkiDir:  pkiDir,
+        featureGates: map[string]bool{
+            "UseKubeadmCerts": true,
+        },
+    }
+}
+
+// Execute 执行证书生成
+// 如果 UseKubeadmCerts=true，使用 kubeadm SDK 生成标准证书
+// 如果 UseKubeadmCerts=false，回退到自研 pkiutil
+func (p *CertsPhase) Execute() error {
+    if p.featureGates["UseKubeadmCerts"] {
+        return p.executeWithKubeadmSDK()
+    }
+    return p.executeWithBKE()
+}
+
+func (p *CertsPhase) executeWithKubeadmSDK() error {
+    // Step 1: 转换配置
+    initCfg, err := p.adapter.ToInitConfiguration()
+    if err != nil {
+        return err
+    }
+    clusterCfg, err := p.adapter.ToClusterConfiguration()
+    if err != nil {
+        return err
+    }
+
+    // Step 2: 使用 kubeadm SDK 生成标准证书
+    // certs.CreatePKIAssets 会生成以下证书：
+    //   - ca.crt/ca.key (Root CA)
+    //   - apiserver.crt/apiserver.key (API Server serving cert)
+    //   - apiserver-kubelet-client.crt/key (API Server -> Kubelet client cert)
+    //   - front-proxy-ca.crt/key (Front Proxy CA)
+    //   - front-proxy-client.crt/key (Front Proxy Client cert)
+    //   - etcd/ca.crt/key (Etcd CA)
+    //   - etcd/server.crt/key (Etcd Server cert)
+    //   - etcd/peer.crt/key (Etcd Peer cert)
+    //   - etcd/healthcheck-client.crt/key (Etcd Healthcheck cert)
+    //   - apiserver-etcd-client.crt/key (API Server -> Etcd client cert)
+    //   - sa.key/sa.pub (Service Account key pair)
+    cfg := &kubeadmapi.InitConfiguration{
+        ClusterConfiguration: *clusterCfg,
+    }
+    cfg.CertificatesDir = p.pkiDir
+
+    if err := certs.CreatePKIAssets(cfg, ""); err != nil {
+        return err
+    }
+
+    // Step 3: 生成 BKE 特有的证书（kubeadm 不生成的）
+    // - tls-server.crt/key (controller-manager/scheduler 的 TLS 证书)
+    // - tls-client.crt/key (TLS 客户端证书)
+    // - ca-chain.crt (CA 证书链)
+    if err := p.generateBKEExtraCerts(); err != nil {
+        return err
+    }
+
+    return nil
+}
+
+func (p *CertsPhase) executeWithBKE() error {
+    // 回退到原有 pkiutil 逻辑
+    certList := pkiutil.GetDefaultCertList()
+    certList.SetPkiPath(p.pkiDir)
+
+    for _, cert := range certList {
+        if cert.CAName == "" {
+            if err := pkiutil.GenerateCACert(cert); err != nil {
+                return err
+            }
+        } else {
+            caCert := certList.ByName(cert.CAName)
+            if caCert == nil {
+                return fmt.Errorf("CA cert %q not found", cert.CAName)
+            }
+            if err := pkiutil.GenerateCertWithCA(cert, caCert); err != nil {
+                return err
+            }
+        }
+    }
+    return nil
+}
+
+// generateBKEExtraCerts 生成 BKE 特有的证书
+func (p *CertsPhase) generateBKEExtraCerts() error {
+    // tls-server 证书：controller-manager 和 scheduler 的 TLS 证书
+    // 这是 BKE 特有的，kubeadm 不生成
+    tlsServerCert := pkiutil.BKETlsServerConfig()
+    tlsServerCert.PkiPath = p.pkiDir
+    caCert := pkiutil.BKECertRootCA()
+    caCert.PkiPath = p.pkiDir
+    if err := pkiutil.GenerateCertWithCA(tlsServerCert, caCert); err != nil {
+        return err
+    }
+
+    // tls-client 证书
+    tlsClientCert := pkiutil.BKETlsClientConfig()
+    tlsClientCert.PkiPath = p.pkiDir
+    if err := pkiutil.GenerateCertWithCA(tlsClientCert, caCert); err != nil {
+        return err
+    }
+
+    // CA 证书链
+    if err := p.generateCertChain(); err != nil {
+        return err
+    }
+
+    return nil
+}
+```
+**kubeadm SDK 证书生成 vs 自研对比**：
+
+| 证书 | kubeadm SDK | 自研 pkiutil | 差异 |
+|------|------------|-------------|------|
+| ca.crt/key | ✅ 自动生成 | ✅ 手动实现 | SAN 一致性由 SDK 保证 |
+| apiserver.crt/key | ✅ 自动生成，含标准 SAN | ✅ 手动实现，SAN 硬编码 | SDK 自动添加 `kubernetes.default.svc.{domain}` |
+| apiserver-kubelet-client | ✅ | ✅ | 一致 |
+| front-proxy-ca/client | ✅ | ✅ | 一致 |
+| etcd 全套 | ✅ | ✅ | SDK 自动根据节点 IP 生成 SAN |
+| sa.key/sa.pub | ✅ | ✅ | 一致 |
+| tls-server | ❌ kubeadm 不生成 | ✅ | BKE 特有，需自研补充 |
+| tls-client | ❌ | ✅ | BKE 特有，需自研补充 |
+| ca-chain.crt | ❌ | ✅ | BKE 特有，需自研补充 |
+#### 2.3 KubeConfigPhase — KubeConfig 生成重构
+**目标**：使用 kubeadm SDK 的 `kubeconfig` Phase 替代自研的 kubeconfig 生成逻辑。
+
+**新文件**：`pkg/job/builtin/kubeadm/phase/kubeconfig.go`
+```go
+package phase
+
+import (
+    kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
+    kubeadmutil "k8s.io/kubernetes/cmd/kubeadm/app/util/kubeconfig"
+    "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job/builtin/kubeadm/adapter"
+)
+
+type KubeConfigPhase struct {
+    adapter      *adapter.ConfigAdapter
+    pkiDir       string
+    kubernetesDir string
+}
+
+func NewKubeConfigPhase(adapter *adapter.ConfigAdapter, pkiDir, kubernetesDir string) *KubeConfigPhase {
+    return &KubeConfigPhase{
+        adapter:       adapter,
+        pkiDir:        pkiDir,
+        kubernetesDir: kubernetesDir,
+    }
+}
+
+// Execute 生成所有标准 kubeconfig 文件
+// kubeadm SDK 会生成以下 kubeconfig：
+//   - admin.conf
+//   - kubelet.conf
+//   - controller-manager.conf
+//   - scheduler.conf
+func (p *KubeConfigPhase) Execute() error {
+    initCfg, err := p.adapter.ToInitConfiguration()
+    if err != nil {
+        return err
+    }
+    clusterCfg, err := p.adapter.ToClusterConfiguration()
+    if err != nil {
+        return err
+    }
+
+    cfg := &kubeadmapi.InitConfiguration{
+        ClusterConfiguration: *clusterCfg,
+    }
+    cfg.CertificatesDir = p.pkiDir
+
+    // 使用 kubeadm SDK 生成 admin.conf
+    // 内部会读取 CA 证书和密钥，生成正确的 kubeconfig
+    if err := kubeadmutil.CreateKubeconfigFile(
+        kubeadmconstants.AdminKubeConfigFileName,
+        p.kubernetesDir,
+        cfg,
+    ); err != nil {
+        return err
+    }
+
+    // 生成 controller-manager.conf
+    if err := kubeadmutil.CreateKubeconfigFile(
+        kubeadmconstants.ControllerManagerKubeConfigFileName,
+        p.kubernetesDir,
+        cfg,
+    ); err != nil {
+        return err
+    }
+
+    // 生成 scheduler.conf
+    if err := kubeadmutil.CreateKubeconfigFile(
+        kubeadmconstants.SchedulerKubeConfigFileName,
+        p.kubernetesDir,
+        cfg,
+    ); err != nil {
+        return err
+    }
+
+    // 生成 kubelet.conf
+    if err := kubeadmutil.CreateKubeconfigFile(
+        kubeadmconstants.KubeletKubeConfigFileName,
+        p.kubernetesDir,
+        cfg,
+    ); err != nil {
+        return err
+    }
+
+    return nil
+}
+```
+**对比当前实现**：
+
+当前 [certs.go:handleGenerateKubeConfig](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/kubeadm/certs/certs.go) 中的 kubeconfig 生成逻辑：
+- 自行构建 `clientcmdapi.Config` 对象
+- 手动设置 Cluster、Context、AuthInfo
+- 需要手动处理 Worker 节点和 Master 节点的 server 地址差异
+
+重构后：
+- 直接调用 `kubeadmutil.CreateKubeconfigFile`，自动处理所有细节
+- Worker 节点的 server 地址差异在 `ConfigAdapter.ToClusterConfiguration` 中处理
+#### 2.4 ControlPlanePhase — Static Pod 渲染重构
+**目标**：使用 kubeadm SDK 的 `controlplane` Phase 替代自研的 Go 模板渲染。
+
+**新文件**：`pkg/job/builtin/kubeadm/phase/controlplane.go`
+```go
+package phase
+
+import (
+    "k8s.io/kubernetes/cmd/kubeadm/app/phases/controlplane"
+    kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
+    kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
+    "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job/builtin/kubeadm/adapter"
+)
+
+type ControlPlanePhase struct {
+    adapter     *adapter.ConfigAdapter
+    manifestsDir string
+}
+
+func NewControlPlanePhase(adapter *adapter.ConfigAdapter, manifestsDir string) *ControlPlanePhase {
+    return &ControlPlanePhase{
+        adapter:      adapter,
+        manifestsDir: manifestsDir,
+    }
+}
+
+// Execute 渲染控制平面 Static Pod YAML
+// kubeadm SDK 会生成以下 Static Pod：
+//   - kube-apiserver.yaml
+//   - kube-controller-manager.yaml
+//   - kube-scheduler.yaml
+func (p *ControlPlanePhase) Execute() error {
+    initCfg, err := p.adapter.ToInitConfiguration()
+    if err != nil {
+        return err
+    }
+    clusterCfg, err := p.adapter.ToClusterConfiguration()
+    if err != nil {
+        return err
+    }
+
+    cfg := &kubeadmapi.InitConfiguration{
+        ClusterConfiguration: *clusterCfg,
+    }
+    cfg.CertificatesDir = p.adapter.BkeConfig.Cluster.CertificatesDir
+
+    // 使用 kubeadm SDK 渲染 API Server Static Pod
+    if err := controlplane.CreateAPIServerStaticPodManifest(
+        p.manifestsDir,
+        cfg,
+        false, // 不等待
+    ); err != nil {
+        return err
+    }
+
+    // 渲染 Controller Manager Static Pod
+    if err := controlplane.CreateControllerManagerStaticPodManifest(
+        p.manifestsDir,
+        cfg,
+        false,
+    ); err != nil {
+        return err
+    }
+
+    // 渲染 Scheduler Static Pod
+    if err := controlplane.CreateSchedulerStaticPodManifest(
+        p.manifestsDir,
+        cfg,
+        false,
+    ); err != nil {
+        return err
+    }
+
+    return nil
+}
+```
+**关键差异处理**：
+
+当前自研模板与 kubeadm SDK 的差异点及适配策略：
+
+| 差异点 | 当前自研模板 | kubeadm SDK | 适配策略 |
+|--------|-----------|------------|---------|
+| APIServer 审计日志 | 硬编码 `--audit-log-path=/var/log/openFuyao/apiserver/` | 不包含审计参数 | 在 `ExtraArgs` 中添加审计参数 |
+| APIServer profiling | `--profiling=false` | 默认不设置 | 在 `ExtraArgs` 中添加 |
+| APIServer TLS Cipher | 硬编码 `--tls-cipher-suites=...` | 使用默认值 | 在 `ExtraArgs` 中添加 |
+| APIServer Webhook | 条件添加 `--authentication-token-webhook-config-file` | 不包含 | 在 `ExtraArgs` 中条件添加 |
+| Controller Manager bind-address | `--bind-address={{ .HostIP }}` | 默认 `0.0.0.0` | 在 `ExtraArgs` 中覆盖 |
+| Controller Manager TLS | 使用 `tls-server.crt/key` | 使用组件专用证书 | **需要保留自研 TLS 证书逻辑** |
+| Scheduler GPU 策略 | 条件添加 `--policy-config-file` | 不包含 | 在 `ExtraArgs` 中条件添加 |
+| 日志目录 | `/var/log/openFuyao/` | `/var/log/` | 通过 ExtraVolumes 挂载 |
+
+**BKE 自定义 Static Pod 后处理**：
+```go
+// PostProcessStaticPod 对 kubeadm 生成的 Static Pod 进行 BKE 自定义修改
+func (p *ControlPlanePhase) PostProcessStaticPod(component string) error {
+    manifestPath := filepath.Join(p.manifestsDir, component+".yaml")
+
+    // 读取 kubeadm 生成的 YAML
+    pod, err := readStaticPodManifest(manifestPath)
+    if err != nil {
+        return err
+    }
+
+    // BKE 自定义修改
+    switch component {
+    case kubeadmconstants.KubeAPIServer:
+        // 1. 添加审计策略文件挂载
+        addAuditVolumeAndMount(pod)
+        // 2. 添加 Webhook 配置挂载（条件）
+        if p.adapter.BootScope.HasOpenFuyaoAddon() {
+            addWebhookVolumeAndMount(pod)
+        }
+        // 3. 替换日志目录
+        replaceLogVolume(pod, "/var/log/openFuyao/apiserver")
+
+    case kubeadmconstants.KubeControllerManager:
+        // 1. 替换 TLS 证书为 BKE 的 tls-server.crt/key
+        replaceTLSCertVolumes(pod, p.adapter.BkeConfig.Cluster.CertificatesDir)
+
+    case kubeadmconstants.KubeScheduler:
+        // 1. 替换 TLS 证书
+        replaceTLSCertVolumes(pod, p.adapter.BkeConfig.Cluster.CertificatesDir)
+        // 2. 添加 GPU 策略配置挂载（条件）
+        if p.adapter.BootScope.Extra["gpuEnable"] == "true" {
+            addGPUPolicyVolumeAndMount(pod)
+        }
+    }
+
+    // 写回文件
+    return writeStaticPodManifest(manifestPath, pod)
+}
+```
+#### 2.5 EtcdStaticPodPhase — Etcd Static Pod 渲染（保留自研）
+**目标**：BKE 使用外部 etcd Static Pod，与 kubeadm 的 stacked etcd 模型不同，必须保留自研逻辑。
+
+**新文件**：`pkg/job/builtin/kubeadm/phase/etcd.go`
+```go
+package phase
+
+import (
+    "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/mfutil"
+    "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job/builtin/kubeadm/adapter"
+)
+
+type EtcdStaticPodPhase struct {
+    adapter      *adapter.ConfigAdapter
+    manifestsDir string
+}
+
+func NewEtcdStaticPodPhase(adapter *adapter.ConfigAdapter, manifestsDir string) *EtcdStaticPodPhase {
+    return &EtcdStaticPodPhase{
+        adapter:      adapter,
+        manifestsDir: manifestsDir,
+    }
+}
+
+// Execute 渲染 etcd Static Pod YAML
+// BKE 使用外部 etcd Static Pod，不能使用 kubeadm 的 etcd Phase
+func (p *EtcdStaticPodPhase) Execute() error {
+    // 保留现有 mfutil.RenderEtcd 逻辑
+    // 但使用 adapter 提供的配置，而非直接读取 BootScope
+    component := &mfutil.BKEComponent{
+        Name: mfutil.Etcd,
+        Path: p.manifestsDir,
+    }
+    return mfutil.RenderEtcd(component, p.adapter.BootScope)
+}
+```
+**保留原因**：
+- kubeadm 的 etcd Phase 假设 etcd 运行在 Stacked 模式（与 API Server 同一 Pod 网络）
+- BKE 的 etcd 使用独立 Static Pod，数据目录为 `/var/lib/openFuyao/etcd`（而非 `/var/lib/etcd`）
+- BKE 需要自定义 etcd 集群成员管理（`handleEtcdMembership`）
+- BKE 需要自定义 etcd 监听端口和指标端口
+#### 2.6 KubeletPhase — Kubelet 配置生成重构
+**目标**：使用 kubeadm SDK 的 kubelet Phase 替代自研的 `kubelet.conf.tmpl` 和 `kubelet.service.tmpl`。
+
+**新文件**：`pkg/job/builtin/kubeadm/phase/kubelet.go`
+```go
+package phase
+
+import (
+    "k8s.io/kubernetes/cmd/kubeadm/app/phases/kubelet"
+    kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
+    "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job/builtin/kubeadm/adapter"
+)
+
+type KubeletPhase struct {
+    adapter      *adapter.ConfigAdapter
+    pkiDir       string
+    manifestsDir string
+}
+
+func NewKubeletPhase(adapter *adapter.ConfigAdapter, pkiDir, manifestsDir string) *KubeletPhase {
+    return &KubeletPhase{
+        adapter:      adapter,
+        pkiDir:       pkiDir,
+        manifestsDir: manifestsDir,
+    }
+}
+
+// Execute 生成 Kubelet 配置并写入文件
+func (p *KubeletPhase) Execute() error {
+    initCfg, err := p.adapter.ToInitConfiguration()
+    if err != nil {
+        return err
+    }
+    clusterCfg, err := p.adapter.ToClusterConfiguration()
+    if err != nil {
+        return err
+    }
+
+    cfg := &kubeadmapi.InitConfiguration{
+        ClusterConfiguration: *clusterCfg,
+    }
+    cfg.CertificatesDir = p.pkiDir
+    cfg.NodeRegistration.Name = p.adapter.BootScope.HostName
+
+    // 使用 kubeadm SDK 生成 Kubelet 配置
+    // 内部会：
+    //   1. 生成 /var/lib/kubelet/config.yaml (KubeletConfiguration)
+    //   2. 自动设置 clusterDNS、clusterDomain、cgroupDriver 等
+    //   3. 自动处理 rotateCertificates: true
+    if err := kubelet.WriteKubeletConfigFiles(
+        p.manifestsDir,
+        cfg,
+    ); err != nil {
+        return err
+    }
+
+    // 生成 kubelet.service（kubeadm SDK 不生成 systemd service 文件）
+    if err := p.writeKubeletService(); err != nil {
+        return err
+    }
+
+    return nil
+}
+
+// writeKubeletService 生成 kubelet systemd service 文件
+// kubeadm SDK 不提供此功能，需要自研
+func (p *KubeletPhase) writeKubeletService() error {
+    // 保留现有的 kubelet.service.tmpl 渲染逻辑
+    // 但参数来源从 string map 改为结构体
+    cfg := bkeinit.BkeConfig(*p.adapter.BkeConfig)
+    param := map[string]string{
+        "kubeletConfig":         utils.GetKubeletConfPath(),
+        "hostIP":                p.adapter.BootScope.HostIP,
+        "hostName":              p.adapter.BootScope.HostName,
+        "podInfraContainerImage": fmt.Sprintf("%s/kubernetes/pause:%s",
+            strings.TrimRight(cfg.ImageFuyaoRepo(), "/"), bkeinit.DefaultPauseImageTag),
+        "runtimeEndpoint": p.detectRuntimeEndpoint(),
+    }
+    // ... 保留现有模板渲染逻辑
+}
+```
+**关键差异**：
+
+| 项目 | 当前自研 | kubeadm SDK | 适配策略 |
+|------|---------|------------|---------|
+| KubeletConfiguration | Go 模板 `kubelet.conf.tmpl` | `kubelet.WriteKubeletConfigFiles` | 使用 SDK，自动处理版本差异 |
+| kubelet.service | Go 模板 `kubelet.service.tmpl` | 不提供 | 保留自研 |
+| providerID | 追加写入 conf.yaml | 通过 NodeRegistration 设置 | 在 ConfigAdapter 中处理 |
+| KubeletConfig CR | 自研 `readConfigFromKubeletConfigCR` | 不支持 | 保留自研，作为后处理步骤 |
+| VariableSubstitutor | `${EXPR\|command\|END}` | 不支持 | **移除**，改用预定义变量映射 |
+#### 2.7 Feature Gate — 特性开关层
+**新文件**：`pkg/job/builtin/kubeadm/featuregate/featuregate.go`
+```go
+package featuregate
+
+type FeatureGate string
+
+const (
+    UseKubeadmCerts       FeatureGate = "UseKubeadmCerts"
+    UseKubeadmKubeConfig  FeatureGate = "UseKubeadmKubeConfig"
+    UseKubeadmControlPlane FeatureGate = "UseKubeadmControlPlane"
+    UseKubeadmKubelet     FeatureGate = "UseKubeadmKubelet"
+)
+
+var defaultGates = map[FeatureGate]bool{
+    UseKubeadmCerts:        false,  // Phase 1: 默认关闭
+    UseKubeadmKubeConfig:   false,  // Phase 1: 默认关闭
+    UseKubeadmControlPlane: false,  // Phase 2: 默认关闭
+    UseKubeadmKubelet:      false,  // Phase 3: 默认关闭
+}
+
+type FeatureGates struct {
+    gates map[FeatureGate]bool
+}
+
+func NewFeatureGates() *FeatureGates {
+    fg := &FeatureGates{gates: make(map[FeatureGate]bool)}
+    for k, v := range defaultGates {
+        fg.gates[k] = v
+    }
+    return fg
+}
+
+func (fg *FeatureGates) Enabled(gate FeatureGate) bool {
+    if v, ok := fg.gates[gate]; ok {
+        return v
+    }
+    return false
+}
+
+func (fg *FeatureGates) Set(gate FeatureGate, enabled bool) {
+    fg.gates[gate] = enabled
+}
+
+// FromConfigMap 从管理集群的 ConfigMap 加载 Feature Gate 配置
+func FromConfigMap(namespace, name string) (*FeatureGates, error) {
+    // 从管理集群读取 Feature Gate 配置
+    // 允许运行时动态切换，无需重新编译
+}
+```
+### 三、KubeadmPlugin 重构后的流程
+#### 3.1 initControlPlane 重构后流程
+```
+initControlPlane()
+  │
+  ├─ 1. installKubectlCommand()          [保留不变]
+  │
+  ├─ 2. CertsPhase.Execute()             [重构]
+  │     ├─ if UseKubeadmCerts:
+  │     │   ├─ adapter.ToInitConfiguration()
+  │     │   ├─ adapter.ToClusterConfiguration()
+  │     │   ├─ certs.CreatePKIAssets()    ← kubeadm SDK
+  │     │   └─ generateBKEExtraCerts()   ← 自研补充
+  │     └─ else:
+  │         └─ pkiutil.GenerateCACert/GenerateCertWithCA  ← 原有逻辑
+  │
+  ├─ 3. KubeConfigPhase.Execute()        [重构]
+  │     ├─ if UseKubeadmKubeConfig:
+  │     │   └─ kubeadmutil.CreateKubeconfigFile()  ← kubeadm SDK
+  │     └─ else:
+  │         └─ 原有 handleGenerateKubeConfig 逻辑
+  │
+  ├─ 4. ControlPlanePhase.Execute()      [重构]
+  │     ├─ if UseKubeadmControlPlane:
+  │     │   ├─ controlplane.CreateAPIServerStaticPodManifest()  ← kubeadm SDK
+  │     │   ├─ controlplane.CreateControllerManagerStaticPodManifest()
+  │     │   ├─ controlplane.CreateSchedulerStaticPodManifest()
+  │     │   └─ PostProcessStaticPod()    ← BKE 自定义后处理
+  │     └─ else:
+  │         └─ mfutil.RenderAPIServer/Controller/Scheduler  ← 原有逻辑
+  │
+  ├─ 5. EtcdStaticPodPhase.Execute()     [保留自研]
+  │     └─ mfutil.RenderEtcd()
+  │
+  ├─ 6. installKubeletCommand()          [重构]
+  │     ├─ if UseKubeadmKubelet:
+  │     │   ├─ kubelet.WriteKubeletConfigFiles()  ← kubeadm SDK
+  │     │   └─ writeKubeletService()     ← 自研
+  │     └─ else:
+  │         └─ 原有 kubeletPlugin.Execute()
+  │
+  ├─ 7. uploadTargetClusterKubeletConfig()  [保留不变]
+  │
+  └─ 8. uploadUserCustomConfigAndGlobalCA() [保留不变]
+```
+#### 3.2 joinControlPlane 重构后流程
+```
+joinControlPlane()
+  │
+  ├─ 1. installKubectlCommand()          [保留不变]
+  │
+  ├─ 2. CertPlugin (证书下载)             [保留不变]
+  │     └─ 从管理集群 Secret 下载证书到本地
+  │
+  ├─ 3. KubeConfigPhase.Execute()        [重构]
+  │     └─ 生成 controller-manager.conf / scheduler.conf / kubelet.conf
+  │
+  ├─ 4. installKubeletCommand()          [重构]
+  │
+  ├─ 5. ControlPlanePhase.Execute()      [重构]
+  │     └─ 渲染 Static Pod + 后处理
+  │
+  ├─ 6. EtcdStaticPodPhase.Execute()     [保留自研]
+  │     └─ 渲染 etcd.yaml + 添加到已有集群
+  │
+  └─ 7. uploadUserCustomConfigAndGlobalCA() [保留不变]
+```
+#### 3.3 upgradeControlPlane 重构后流程
+```
+upgradeControlPlane()
+  │
+  ├─ 1. prepareUpgrade()                 [保留不变]
+  │     ├─ backupEtcd()
+  │     ├─ backupClusterEtc()
+  │     ├─ upgradePrePullImageCommand()
+  │     └─ getBeforeUpgradeComponentPodHash()
+  │
+  ├─ 2. for each component:              [重构]
+  │     ├─ ControlPlanePhase.Execute(component)  ← kubeadm SDK
+  │     ├─ PostProcessStaticPod(component)       ← BKE 后处理
+  │     └─ waitComponentReady(component)
+  │
+  ├─ 3. installKubeletCommand()          [重构]
+  │
+  └─ 4. installKubectlCommand()          [保留不变]
+```
+### 四、依赖管理重构
+#### 4.1 go.mod 变更
+```diff
+ require (
+-    k8s.io/kubernetes v1.26.4
++    k8s.io/kubernetes v1.28.0
+ )
+
+ replace (
+-    k8s.io/kubernetes => k8s.io/kubernetes v1.27.0-alpha.2
++    k8s.io/kubernetes => k8s.io/kubernetes v1.28.0
+ )
+```
+**理由**：
+- 当前使用 `v1.27.0-alpha.2` 是 alpha 版本，极不稳定
+- 升级到 `v1.28.0` 可以使用 `kubeadm.k8s.io/v1beta3` API（v1beta3 从 1.22 开始支持，到 1.28 仍是最新）
+- kubeadm 的 Phase API 在 `v1.28` 中相对稳定
+#### 4.2 新增依赖
+```go
+import (
+    // 证书生成 Phase
+    "k8s.io/kubernetes/cmd/kubeadm/app/phases/certs"
+
+    // KubeConfig 生成
+    kubeadmutil "k8s.io/kubernetes/cmd/kubeadm/app/util/kubeconfig"
+
+    // Static Pod 渲染 Phase
+    "k8s.io/kubernetes/cmd/kubeadm/app/phases/controlplane"
+
+    // Kubelet 配置生成 Phase
+    "k8s.io/kubernetes/cmd/kubeadm/app/phases/kubelet"
+
+    // kubeadm API 类型（已在使用）
+    kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
+
+    // kubeadm 常量
+    kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
+
+    // etcd 工具（已在使用）
+    "k8s.io/kubernetes/cmd/kubeadm/app/util/etcd"
+)
+```
+### 五、文件变更清单
+| 操作 | 文件路径 | 说明 |
+|------|---------|------|
+| **新增** | `pkg/job/builtin/kubeadm/adapter/config.go` | Config Adapter，BkeConfig → kubeadm 类型转换 |
+| **新增** | `pkg/job/builtin/kubeadm/adapter/config_test.go` | Config Adapter 单元测试 |
+| **新增** | `pkg/job/builtin/kubeadm/phase/certs.go` | 证书生成 Phase，封装 kubeadm SDK |
+| **新增** | `pkg/job/builtin/kubeadm/phase/kubeconfig.go` | KubeConfig 生成 Phase |
+| **新增** | `pkg/job/builtin/kubeadm/phase/controlplane.go` | Static Pod 渲染 Phase |
+| **新增** | `pkg/job/builtin/kubeadm/phase/etcd.go` | Etcd Static Pod Phase（保留自研） |
+| **新增** | `pkg/job/builtin/kubeadm/phase/kubelet.go` | Kubelet 配置生成 Phase |
+| **新增** | `pkg/job/builtin/kubeadm/phase/postprocess.go` | Static Pod 后处理（BKE 自定义修改） |
+| **新增** | `pkg/job/builtin/kubeadm/featuregate/featuregate.go` | Feature Gate 管理 |
+| **修改** | `pkg/job/builtin/kubeadm/kubeadm.go` | 重构各 Phase 调用，集成 Feature Gate |
+| **修改** | `pkg/job/builtin/kubeadm/command.go` | 调用新的 Phase 实现 |
+| **修改** | `go.mod` | 升级 k8s.io/kubernetes 版本 |
+| **保留** | `utils/bkeagent/pkiutil/` | 保留作为 fallback 和 BKE 特有证书生成 |
+| **保留** | `utils/bkeagent/mfutil/tmpl/k8s/` | 保留作为 fallback 模板 |
+| **保留** | `pkg/job/builtin/kubeadm/kubelet/tmpl/` | 保留 kubelet.service.tmpl（SDK 不生成） |
+| **保留** | `pkg/job/builtin/kubeadm/certs/certs.go` | 保留证书下载/上传逻辑（非生成逻辑） |
+| **保留** | `pkg/job/builtin/kubeadm/manifests/manifests.go` | 保留作为 Manifests Phase 的入口 |
+### 六、渐进式实施计划
+#### Phase 1（2-3 周）— 低风险：KubeConfig 生成
+- 实现 `ConfigAdapter`
+- 实现 `KubeConfigPhase`
+- Feature Gate: `UseKubeadmKubeConfig`
+- **回退路径**：关闭 Feature Gate 即可回退到原有逻辑
+- **验证**：对比生成的 admin.conf / controller-manager.conf / scheduler.conf / kubelet.conf 内容
+#### Phase 2（3-4 周）— 中风险：证书生成
+- 实现 `CertsPhase`
+- Feature Gate: `UseKubeadmCerts`
+- **回退路径**：关闭 Feature Gate 即可回退到原有 pkiutil
+- **验证**：
+  - 对比 kubeadm SDK 生成的证书 SAN 与自研 pkiutil 生成的 SAN
+  - 验证 BKE 特有证书（tls-server/tls-client/ca-chain）仍能正确生成
+  - 验证证书轮换功能
+#### Phase 3（4-6 周）— 高风险：Static Pod 渲染
+- 实现 `ControlPlanePhase` + `PostProcessStaticPod`
+- Feature Gate: `UseKubeadmControlPlane`
+- **回退路径**：关闭 Feature Gate 即可回退到原有模板渲染
+- **验证**：
+  - 对比 kubeadm SDK 生成的 Static Pod YAML 与自研模板的 YAML
+  - 验证 BKE 自定义修改（审计日志、Webhook、TLS 证书替换）正确应用
+  - 端到端测试：init → join → upgrade
+#### Phase 4（2-3 周）— 中风险：Kubelet 配置
+- 实现 `KubeletPhase`
+- Feature Gate: `UseKubeadmKubelet`
+- **回退路径**：关闭 Feature Gate 即可回退到原有 kubelet 插件
+- **验证**：
+  - 对比 KubeletConfiguration 内容
+  - 验证 kubelet.service 正确生成
+  - 验证 KubeletConfig CR 功能仍正常
+#### Phase 5（持续）— 长期：依赖解耦
+- 逐步将 `k8s.io/kubernetes` 的引用限制在 `kubeadm/app/apis/kubeadm` 和 `kubeadm/app/phases`
+- 评估是否可以将 `k8s.io/kubernetes` 替换为独立的 kubeadm 库（如果社区未来发布）
+- 将 etcd 工具从 `k8s.io/kubernetes/cmd/kubeadm/app/util/etcd` 迁移到自研实现
+### 七、风险与缓解措施
+| 风险 | 影响 | 缓解措施 |
+|------|------|---------|
+| kubeadm Phase API 不稳定 | 升级 K8s 版本时可能 Breaking Change | Feature Gate 快速回退；锁定 k8s.io/kubernetes 版本 |
+| kubeadm SDK 生成的 Static Pod 不满足 BKE 需求 | 缺少审计日志/Webhook 等自定义配置 | PostProcessStaticPod 后处理机制 |
+| kubeadm SDK 不支持外部 etcd | etcd Phase 无法使用 | 保留自研 EtcdStaticPodPhase |
+| ConfigAdapter 转换不完整 | 丢失 BKE 特有配置 | 完善单元测试，对比转换前后的完整配置 |
+| 并存两套实现增加维护成本 | 代码量增加 | Phase 5 最终移除自研 fallback |
+### 八、总结
+本重构方案的核心思路是**选择性引入 kubeadm SDK 的 Phase API**，而非完全替换：
+1. **引入 kubeadm SDK 的部分**：证书生成、KubeConfig 生成、Static Pod 渲染、Kubelet 配置生成——这些是 Kubernetes 标准化能力，kubeadm SDK 能自动适配版本变化
+2. **保留自研的部分**：etcd Static Pod 管理、HAProxy/Keepalived、环境初始化、预处理/后处理脚本、Agent 自更新、Reset 清理——这些是 BKE 差异化能力，kubeadm 不提供
+3. **新增适配层**：Config Adapter 将 BKE 自有配置转换为 kubeadm 标准类型，PostProcessStaticPod 对 kubeadm 输出进行 BKE 自定义修改
+4. **Feature Gate 保障**：每个 Phase 都有独立的 Feature Gate，可以逐个启用/关闭，确保生产环境安全
 
