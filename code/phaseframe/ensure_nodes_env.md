@@ -2124,3 +2124,718 @@ Command: ["K8sEnvInit", "init=true", "check=true",
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
+# 整理出完整的 pluginRegistry 各插件的命令及节点类型执行流程
+## pluginRegistry 各插件执行的命令及节点类型执行流程
+### 一、插件注册表总览
+在 [builtin.go](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/builtin.go) 中，`pluginRegistry` 是一个 `map[string]plugin.Plugin`，以插件名称（小写）为 key，插件实例为 value。命令路由机制为：`execCommands[0]` 作为插件名称，从 `pluginRegistry` 中查找对应插件并调用其 `Execute(execCommands)` 方法。
+### 二、各插件详细信息
+| # | 注册名(Name) | 插件类型 | 源文件路径 |
+|---|---|---|---|
+| 1 | `containerd` | ContainerdPlugin | containerruntime/containerd/containerd.go |
+| 2 | `k8senvinit` | EnvPlugin | kubeadm/env/env.go |
+| 3 | `switchcluster` | SwitchClusterPlugin | switchcluster/switch.go |
+| 4 | `cert` | CertPlugin | kubeadm/certs/certs.go |
+| 5 | `runkubelet` | kubeletPlugin | kubeadm/kubelet/run.go |
+| 6 | `kubeadm` | KubeadmPlugin | kubeadm/kubeadm.go |
+| 7 | `ha` | HA | ha/ha.go |
+| 8 | `downloader` | DownloaderPlugin | downloader/downloader.go |
+| 9 | `reset` | ResetPlugin | reset/reset.go |
+| 10 | `ping` | Ping | ping/main.go |
+| 11 | `backup` | BackupPlugin | backup/backup.go |
+| 12 | `installdocker` | DockerPlugin | containerruntime/docker/docker.go |
+| 13 | `collect` | CollectPlugin | collect/collect.go |
+| 14 | `manifests` | ManifestPlugin | kubeadm/manifests/manifests.go |
+| 15 | `shutdown` | ShutDown | shutdown/shutdown.go |
+| 16 | `selfupdate` | UpdatePlugin | selfupdate/selfupdate.go |
+| 17 | `installcridocker` | CRIDockerPlugin | containerruntime/cridocker/cri_docker.go |
+| 18 | `preprocess` | PreprocessPlugin | preprocess/preprocess.go |
+| 19 | `postprocess` | PostprocessPlugin | postprocess/postprocess.go |
+### 三、各插件执行的命令及目标节点类型
+#### 1. **K8sEnvInit** (注册名: `k8senvinit`)
+**核心功能**：K8s 环境初始化与检查
+
+**参数**：
+- `check`: 是否检查环境
+- `init`: 是否初始化环境
+- `scope`: 操作范围 (`kernel,firewall,selinux,swap,time,hosts,ports,image,node,httpRepo,iptables,runtime,registry,extra,cert,manifests,container,kubelet,containerRuntime`)
+- `bkeConfig`: 集群配置引用 (`ns:name`)
+- `extraHosts`: 额外 hosts 映射
+
+**在 Phase 中的调用场景**：
+
+| 调用场景 | 命令组装位置 | 目标节点类型 | scope 内容 |
+|---|---|---|---|
+| **EnsureNodesEnv** (环境初始化) | [env.go](file:///d:/code/github/cluster-api-provider-bke/pkg/command/env.go) `ENV.New()` | **所有节点** (Master + Worker) | ① `scope=node` (硬件检查) → ② `Reset` (重置) → ③ `scope=time,hosts,dns,kernel,firewall,selinux,swap,httpRepo,runtime,iptables,registry,extra` |
+| **Bootstrap** (节点引导) | [bootstrap.go](file:///d:/code/github/cluster-api-provider-bke/pkg/command/bootstrap.go) `Bootstrap.New()` | **Master 或 Worker** (取决于 Phase) | `scope=runtime` (仅检查容器运行时) |
+| **Hosts 更新** | [hosts.go](file:///d:/code/github/cluster-api-provider-bke/pkg/command/hosts.go) `Hosts.New()` | **所有节点** | `scope=hosts` |
+| **Containerd 重部署** | [env.go](file:///d:/code/github/cluster-api-provider-bke/pkg/command/env.go) `ENV.NewConatinerdRedeploy()` | **指定节点** | `scope=runtime` |
+
+**命令执行流程** (EnsureNodesEnv 场景)：
+```
+Step 1: K8sEnvInit init=true check=true scope=node     → 硬件资源检查
+Step 2: Reset bkeConfig=ns:name scope=cert,manifests,...  → 重置旧环境
+Step 3: K8sEnvInit init=true check=true scope=time,hosts,... → 初始化K8s环境
+```
+#### 2. **Kubeadm** (注册名: `kubeadm`)
+**核心功能**：Kubeadm 引导操作（init/join/upgrade）
+
+**参数**：
+- `phase`: 操作阶段 (`InitControlPlane` / `JoinControlPlane` / `JoinWorker`)
+- `bkeConfig`: 集群配置引用
+- `clusterType`: 集群类型
+- `backUpEtcd`: 是否备份 etcd
+
+**在 Phase 中的调用场景**：
+
+| 调用场景 | 命令组装位置 | 目标节点类型 | phase 值 |
+|---|---|---|---|
+| **EnsureMasterInit** | [bootstrap.go](file:///d:/code/github/cluster-api-provider-bke/pkg/command/bootstrap.go) | **首个 Master 节点** | `InitControlPlane` |
+| **EnsureMasterJoin** | [bootstrap.go](file:///d:/code/github/cluster-api-provider-bke/pkg/command/bootstrap.go) | **新增 Master 节点** | `JoinControlPlane` |
+| **EnsureWorkerJoin** | [bootstrap.go](file:///d:/code/github/cluster-api-provider-bke/pkg/command/bootstrap.go) | **Worker 节点** | `JoinWorker` |
+| **EnsureMasterUpgrade** | [upgrade.go](file:///d:/code/github/cluster-api-provider-bke/pkg/command/upgrade.go) | **Master 节点** | `UpgradeControlPlane` |
+| **EnsureWorkerUpgrade** | [upgrade.go](file:///d:/code/github/cluster-api-provider-bke/pkg/command/upgrade.go) | **Worker 节点** | `UpgradeWorker` |
+
+**Bootstrap 命令执行流程**：
+```
+Step 1: K8sEnvInit init=false check=true scope=runtime → 检查容器运行时
+Step 2: Kubeadm phase=<phase> bkeConfig=ns:name       → 执行 kubeadm init/join
+```
+#### 3. **HA** (注册名: `ha`)
+**核心功能**：高可用负载均衡配置（HAProxy + Keepalived）
+
+**参数**：
+- `haNodes`: HA 节点列表 (`hostname1:ip1,hostname2:ip2`)
+- `controlPlaneEndpointPort`: 控制面端口
+- `controlPlaneEndpointVIP`: 控制面 VIP
+- `ingressVIP`: Ingress VIP
+- `virtualRouterId`: VRRP 虚拟路由 ID
+- `thirdImageRepo` / `fuyaoImageRepo`: 镜像仓库地址
+- `manifestsDir`: 静态 Pod 清单目录
+- `wait`: 是否等待 VIP 就绪
+
+**在 Phase 中的调用场景**：
+
+| 调用场景 | 命令组装位置 | 目标节点类型 | HA 类型 |
+|---|---|---|---|
+| **EnsureLoadBalance** | [loadbalance.go](file:///d:/code/github/cluster-api-provider-bke/pkg/command/loadbalance.go) | **Master 节点** | Master HA (HAProxy + Keepalived) |
+| **EnsureLoadBalance** | [loadbalance.go](file:///d:/code/github/cluster-api-provider-bke/pkg/command/loadbalance.go) | **Ingress 节点** | Ingress HA |
+
+**命令执行流程**：
+```
+Master HA: HA haNodes=... controlPlaneEndpointPort=6443 controlPlaneEndpointVIP=x.x.x.x virtualRouterId=...
+Ingress HA: HA haNodes=... ingressVIP=x.x.x.x virtualRouterId=...
+```
+#### 4. **Reset** (注册名: `reset`)
+**核心功能**：节点重置/清理
+
+**参数**：
+- `bkeConfig`: 集群配置引用
+- `scope`: 重置范围 (`cert,manifests,kubelet,container,containerRuntime,source,extra,global-cert,containerd-cfg`)
+- `extra`: 额外清理项
+
+**在 Phase 中的调用场景**：
+
+| 调用场景 | 命令组装位置 | 目标节点类型 | scope 内容 |
+|---|---|---|---|
+| **EnsureNodesEnv** (环境初始化时先重置) | [env.go](file:///d:/code/github/cluster-api-provider-bke/pkg/command/env.go) | **所有节点** | `cert,manifests,container,kubelet,extra` (普通) / `cert,manifests,container,kubelet,containerRuntime,extra` (深度) |
+| **EnsureDeleteOrReset** (节点删除) | [cleannode.go](file:///d:/code/github/cluster-api-provider-bke/pkg/command/cleannode.go) | **指定节点** (Master/Worker) | `cert,manifests,kubelet,container,containerRuntime,source,extra,global-cert` |
+| **Containerd 重置** | [env.go](file:///d:/code/github/cluster-api-provider-bke/pkg/command/env.go) `NewConatinerdReset()` | **指定节点** | `containerd-cfg` |
+#### 5. **Cert** (注册名: `cert`)
+**核心功能**：节点级证书分发
+
+**参数**：
+- `bkeConfig`: 集群配置引用
+- `nodeRole`: 节点角色
+
+**目标节点类型**：**Master 节点** 和 **Worker 节点**（根据节点角色分发不同证书）
+#### 6. **RunKubelet** (注册名: `runkubelet`)
+**核心功能**：Kubelet 服务配置与启动
+
+**参数**：
+- `url`: 下载 URL
+- `perm`: 文件权限
+- `rename`: 重命名
+
+**目标节点类型**：**所有节点** (Master + Worker)
+#### 7. **Manifests** (注册名: `manifests`)
+**核心功能**：静态 Pod 清单管理
+
+**参数**：
+- `bkeConfig`: 集群配置引用
+
+**目标节点类型**：**Master 节点**（etcd/kube-apiserver/kube-controller/scheduler 静态 Pod）
+#### 8. **SwitchCluster** (注册名: `switchcluster`)
+**核心功能**：切换 Agent 监听的集群
+
+**参数**：
+- `kubeconfig`: 目标集群 kubeconfig 路径
+- `clusterName`: 集群名称
+
+**在 Phase 中的调用场景**：
+
+| 调用场景 | 命令组装位置 | 目标节点类型 |
+|---|---|---|
+| **EnsureAgentSwitch** | [switchcluster.go](file:///d:/code/github/cluster-api-provider-bke/pkg/command/switchcluster.go) | **所有节点** |
+#### 9. **Ping** (注册名: `ping`)
+**核心功能**：Agent 心跳检测
+
+**在 Phase 中的调用场景**：
+
+| 调用场景 | 命令组装位置 | 目标节点类型 |
+|---|---|---|
+| **EnsureBKEAgent** | [ping.go](file:///d:/code/github/cluster-api-provider-bke/pkg/command/ping.go) | **所有新推送 Agent 的节点** |
+#### 10. **Collect** (注册名: `collect`)
+**核心功能**：证书收集
+
+**参数**：
+- `clusterName`: 集群名称
+- `namespace`: 命名空间
+- `k8sCertDir`: K8s 证书目录
+- `etcdCertDir`: Etcd 证书目录
+
+**在 Phase 中的调用场景**：
+
+| 调用场景 | 命令组装位置 | 目标节点类型 |
+|---|---|---|
+| **EnsureCerts** (证书收集) | [collect.go](file:///d:/code/github/cluster-api-provider-bke/pkg/command/collect.go) | **Master 节点** (首个控制面节点) |
+#### 11. **Backup** (注册名: `backup`)
+**核心功能**：文件/目录备份
+
+**参数**：
+- `backupDirs`: 需要备份的目录列表
+
+**目标节点类型**：**所有节点**（在环境初始化前备份关键文件）
+#### 12. **Containerd** (注册名: `containerd`)
+**核心功能**：Containerd 容器运行时安装与配置
+
+**目标节点类型**：**所有节点** (Master + Worker)
+#### 13. **InstallDocker** (注册名: `installdocker`)
+**核心功能**：Docker 容器运行时安装
+
+**目标节点类型**：**所有节点** (Master + Worker)
+#### 14. **InstallCRIDocker** (注册名: `installcridocker`)
+**核心功能**：CRI-Dockerd 安装
+
+**目标节点类型**：**所有节点** (Master + Worker)
+#### 15. **Downloader** (注册名: `downloader`)
+**核心功能**：文件下载器
+
+**目标节点类型**：**所有节点**
+#### 16. **Shutdown** (注册名: `shutdown`)
+**核心功能**：Agent 关闭
+
+**在 Phase 中的调用场景**：
+
+| 调用场景 | 目标节点类型 |
+|---|---|
+| **EnsureDeleteOrReset** | **所有节点** (集群删除时) |
+#### 17. **SelfUpdate** (注册名: `selfupdate`)
+**核心功能**：Agent 自更新
+
+**参数**：
+- `agentUrl`: Agent 下载 URL
+
+**在 Phase 中的调用场景**：
+
+| 调用场景 | 目标节点类型 |
+|---|---|
+| **EnsureProviderSelfUpgrade** | **所有节点** |
+#### 18. **Preprocess** (注册名: `preprocess`)
+**核心功能**：前置处理脚本执行
+
+**目标节点类型**：**所有节点**（在环境初始化前执行自定义预处理脚本）
+#### 19. **Postprocess** (注册名: `postprocess`)
+**核心功能**：后置处理脚本执行
+
+**在 Phase 中的调用场景**：
+
+| 调用场景 | 命令组装位置 | 目标节点类型 |
+|---|---|---|
+| **EnsureNodesPostProcess** | [ensure_nodes_postprocess.go](file:///d:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_nodes_postprocess.go) | **所有节点** (已完成引导的节点) |
+### 四、Phase 与插件命令的完整执行流程图
+```
+集群创建流程 (Phase 执行顺序):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. EnsureCerts          → [控制面] 生成/查找证书
+                          → [Master节点] Collect: 收集证书信息
+
+2. EnsureClusterAPIObj  → [管理集群] 创建 CAPI 资源 (Cluster, KCP, MD 等)
+
+3. EnsureBKEAgent       → [所有节点] SSH 推送 Agent
+                          → [所有节点] Ping: 检测 Agent 心跳
+
+4. EnsureNodesEnv       → [所有节点] K8sEnvInit(scope=node): 硬件检查
+                          → [所有节点] Reset: 重置旧环境
+                          → [所有节点] K8sEnvInit(scope=full): 环境初始化
+
+5. EnsureLoadBalance    → [Master节点] HA: 部署 HAProxy+Keepalived
+
+6. EnsureMasterInit     → [首个Master] K8sEnvInit(scope=runtime): 运行时检查
+                          → [首个Master] Kubeadm(phase=InitControlPlane): 初始化控制面
+
+7. EnsureMasterJoin     → [新增Master] Kubeadm(phase=JoinControlPlane): 加入控制面
+
+8. EnsureWorkerJoin     → [Worker节点] K8sEnvInit(scope=runtime): 运行时检查
+                          → [Worker节点] Kubeadm(phase=JoinWorker): 加入工作节点
+
+9. EnsureNodesPostProcess → [所有节点] Postprocess: 执行后置脚本
+
+10. EnsureAddonDeploy   → [管理集群] 部署 Addon
+
+集群删除流程:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+EnsureDeleteOrReset     → [指定节点] Reset: 清理节点
+                        → [所有节点] Shutdown: 关闭 Agent
+```
+### 五、命令分发与节点选择机制
+命令通过 Kubernetes CRD (`agentv1beta1.Command`) 分发到目标节点。节点选择机制在 [command.go:537](file:///d:/code/github/cluster-api-provider-bke/pkg/command/command.go#L537) 中实现：
+```go
+func getNodeSelector(nodes bkenode.Nodes) *metav1.LabelSelector {
+    nodeSelector := &metav1.LabelSelector{}
+    for _, node := range nodes {
+        metav1.AddLabelToSelector(nodeSelector, node.IP, node.IP)
+    }
+    return nodeSelector
+}
+```
+每个节点的 IP 作为 Label Selector 的键值对，Agent 通过匹配自身 IP 的 Label 来决定是否执行该命令。命令还有两种标签区分作用域：
+- `bke.bocloud.com/cluster-command`: 集群级命令
+- `bke.bocloud.com/machine-command`: 机器级命令（含更细粒度的 `master-init`、`master-join`、`worker-join`）
+
+# pluginRegistry 各插件安装业务流及执行的安装命令
+## pluginRegistry 各插件安装业务流及执行的安装命令
+### 1. K8sEnvInit 插件（环境初始化）
+**注册名**: `k8senvinit` | **适用节点**: 所有节点（Master + Worker）
+
+**命令格式**:
+```
+["K8sEnvInit", "init=true", "check=true", "sudo=true", "scope=kernel,firewall,selinux,swap,time,hosts,ports,image,node,httpRepo,iptables", "backup=true", "extraHosts=hostname1:ip1", "hostPort=10259,10257,10250", "bkeConfig=ns:name"]
+```
+
+**业务流（按 scope 顺序执行）**:
+
+| Scope | 执行的命令/操作 | 说明 |
+|-------|----------------|------|
+| `kernel` | `modprobe ip_vs/ip_vs_wrr/ip_vs_rr/ip_vs_sh/fuse/rbd/br_netfilter`<br>写入 `/etc/sysctl.d/k8s.conf`<br>写入 `/etc/sysctl.d/k8s-swap.conf`<br>`sysctl -p /etc/sysctl.d/k8s.conf`<br>`sysctl -p /etc/sysctl.d/k8s-swap.conf`<br>Ubuntu: `echo "module" >> /etc/modules`<br>CentOS/Kylin: 写入 `/etc/sysconfig/modules/ip_vs.modules`<br>设置 ulimit: `echo '* hard nofile 65536' >> /etc/security/limits.conf`<br>CentOS7+Containerd: `fs.may_detach_mounts=1`<br>IPVS模式: `modprobe nf_conntrack` | 内核参数初始化 |
+| `swap` | `sudo sed -ri 's/.*swap.*/#&/' /etc/fstab`<br>`sudo swapoff -a`<br>写入 `vm.swappiness=0` 到 `/etc/sysctl.d/k8s-swap.conf` | 关闭交换分区 |
+| `firewall` | `systemctl stop firewalld`<br>`systemctl disable firewalld`<br>`systemctl stop ufw`<br>`systemctl disable ufw` | 关闭防火墙 |
+| `selinux` | `sudo setenforce 0`<br>替换 `/etc/selinux/config` 中 `SELINUX=disabled` | 关闭 SELinux |
+| `time` | `sudo ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime` | 时间同步 |
+| `hosts` | `sudo hostnamectl set-hostname <name>`<br>写入 `/etc/hosts`（集群节点映射+镜像仓库域名映射） | 配置 hosts 文件 |
+| `runtime` | Docker: 调用 `InstallDocker` 插件<br>Containerd: 调用 `InstallContainerd` 插件<br>CRIDocker: 调用 `InstallCRIDocker` 插件 | 安装容器运行时 |
+| `image` | Docker: `docker pull <image>`<br>Containerd: `ctr -n k8s.io image pull <image>` | 拉取所需镜像 |
+| `dns` | 创建 `/etc/resolv.conf`<br>CentOS: 配置 NetworkManager 不覆盖 resolv.conf | DNS 配置 |
+| `httpRepo` | `yum update` / `apt update`（设置 HTTP 软件源） | 配置软件源 |
+| `iptables` | `iptables -P INPUT ACCEPT`<br>`iptables -P OUTPUT ACCEPT`<br>`iptables -P FORWARD ACCEPT`<br>Kylin ARM: `iptables -I INPUT 1 -p vrrp -j ACCEPT` | 配置 iptables |
+| `registry` | 读取镜像仓库端口配置 | 镜像仓库配置 |
+| `node` | 检查节点资源（CPU/内存/磁盘） | 节点资源检查 |
+| `ports` | 检查端口 10259/10257/10250/2379/2380/2381/10248 是否可用 | 端口检查 |
+
+**Check 阶段**（init 后自动执行或单独执行）: 逐项验证上述配置是否生效。
+### 2. InstallContainerd 插件（Containerd 安装）
+**注册名**: `installcontainerd` | **适用节点**: 所有节点（当 CRI=containerd 时）
+
+**命令格式**:
+```
+["InstallContainerd", "url=http://repo:40080/containerd-1.6.x-linux-amd64.tar.gz", "repo=cr.openfuyao.cn:443", "sandbox=cr.openfuyao.cn:443/kubernetes/pause:3.9", "runtime=runc", "dataRoot=/var/lib/containerd", "directory=/", "insecureRegistries=xxx", "containerdConfig=ns:name"]
+```
+
+**业务流**:
+
+| 步骤 | 执行的命令/操作 |
+|------|----------------|
+| 1. 下载 | HTTP 下载 containerd tar.gz 到 `/tmp/containerd-<id>.tar.gz` |
+| 2. 解压 | `tar -xzf <file> -C /` |
+| 3. 配置（Legacy） | 写入 `/etc/containerd/config.toml`（sandbox/dataRoot/runtime等）<br>创建 `/etc/containerd/certs.d/<repo>/hosts.toml` |
+| 3. 配置（CR模式） | 从 ContainerdConfig CR 读取配置：<br>- Script: 执行自定义脚本<br>- Service: 生成 containerd.service override<br>- Main: 渲染 config.toml<br>- Registry: 生成 hosts.toml |
+| 4. 启动 | `systemctl enable containerd`<br>`systemctl restart containerd` |
+| 5. 等待就绪 | 等待 containerd socket 可用 |
+### 3. InstallDocker 插件（Docker 安装）
+**注册名**: `installdocker` | **适用节点**: 所有节点（当 CRI=docker 时）
+
+**命令格式**:
+```
+["InstallDocker", "runtime=runc", "dataRoot=/var/lib/docker", "cgroupDriver=systemd", "insecureRegistries=xxx", "enableDockerTls=false", "tlsHost=192.168.1.1", "runtimeUrl="]
+```
+
+**业务流**:
+
+| 步骤 | 执行的命令/操作 |
+|------|----------------|
+| 1. 停止旧服务 | `systemctl stop docker`<br>`systemctl stop docker.socket` |
+| 2. 下载 richrunc（可选） | 调用 Downloader 插件下载到 `/usr/local/beyondvm/runc` |
+| 3. 安装 Docker | `yum install docker-ce` 或 `apt install docker-ce`<br>（若 docker-ce 不可用则安装 docker） |
+| 4. 配置 daemon | 写入 `/etc/docker/daemon.json`（cgroupDriver/runtime/dataRoot/insecureRegistries/TLS） |
+| 5. 启动 | `systemctl enable docker`<br>`systemctl restart docker` |
+| 6. 等待就绪 | 等待 Docker daemon 可用 |
+### 4. InstallCRIDocker 插件（cri-dockerd 安装）
+**注册名**: `installcridocker` | **适用节点**: 所有节点（当 CRI=docker 且 K8s ≥ 1.24 时）
+
+**命令格式**:
+```
+["InstallCRIDocker", "criDockerdUrl=http://repo:40080/cri-dockerd-0.3.9-amd64", "sandbox=cr.openfuyao.cn:443/kubernetes/pause:3.8"]
+```
+
+**业务流**:
+
+| 步骤 | 执行的命令/操作 |
+|------|----------------|
+| 1. 停止旧服务 | `systemctl stop cri-dockerd`<br>`systemctl stop cri-dockerd.socket` |
+| 2. 下载 | 调用 Downloader 插件下载 cri-dockerd 到 `/usr/bin/cri-dockerd` |
+| 3. 配置 | 写入 `/etc/systemd/system/cri-dockerd.service`<br>写入 `/etc/systemd/system/cri-dockerd.socket` |
+| 4. 安装依赖 | `yum install socat` / `apt install socat` |
+| 5. 启动 | `systemctl daemon-reload`<br>`systemctl enable cri-dockerd`<br>`systemctl restart cri-dockerd` |
+### 5. Cert 插件（证书管理）
+**注册名**: `cert` | **适用节点**: 所有节点
+
+**命令格式**:
+```
+["Cert", "generate=true", "loadCACert=true", "caCertNames=ca,sa,etcd,proxy", "altDNSNames=kubernetes.default", "altIPs=127.0.0.1,10.96.0.1", "certificatesDir=/etc/kubernetes/pki", "namespace=ns", "clusterName=name", "uploadCerts=true", "generateKubeConfig=true", "localKubeConfigScope=kubeconfig,controller-manager,scheduler,kubelet,kube-proxy", "loadTargetClusterCert=false", "loadAdminKubeconfig=false", "isManagerCluster=false", "tlsScope="]
+```
+
+**业务流**:
+
+| 步骤 | 操作 |
+|------|------|
+| 1. 加载 CA 证书 | 从管理集群 Secret 加载 CA/SA/Etcd/Proxy CA 证书到本地 `/etc/kubernetes/pki/` |
+| 2. 加载 Admin Kubeconfig | 从管理集群 Secret 加载 admin kubeconfig |
+| 3. 处理证书链和全局 CA | 加载 trust-chain.crt / global-ca.crt 到 `/etc/openFuyao/certs/` |
+| 4. 加载目标集群证书 | 从管理集群 Secret 加载所有已生成的证书 |
+| 5. 生成证书 | 使用 CA 签发所有 K8s 所需证书（apiserver/apiserver-kubelet-client/etcd-server/...） |
+| 6. 生成 KubeConfig | 生成 kubeconfig/controller-manager.conf/scheduler.conf/kubelet.conf/kube-proxy.conf |
+| 7. 生成 TLS 证书 | 根据 tlsScope 生成自定义 TLS 证书 |
+| 8. 上传证书 | 将生成的证书上传到管理集群 Secret |
+### 6. Kubeadm 插件（集群引导）
+**注册名**: `kubeadm` | **适用节点**: Master + Worker
+
+**命令格式**:
+```
+["Kubeadm", "phase=initControlPlane|joinControlPlane|joinWorker|upgradeControlPlane|upgradeWorker|upgradeEtcd", "bkeConfig=ns:name", "backUpEtcd=false", "clusterType=bke", "etcdVersion=3.6.4"]
+```
+**业务流（按 phase）**:
+#### initControlPlane（首个 Master 初始化）
+| 步骤 | 操作 |
+|------|------|
+| 1 | 安装 kubectl 二进制文件 |
+| 2 | 调用 Cert 插件生成/加载证书 |
+| 3 | 调用 Manifests 插件生成静态 Pod YAML（apiserver/controller-manager/scheduler/etcd） |
+| 4 | 调用 RunKubelet 插件安装并启动 kubelet |
+| 5 | 上传 kubelet 配置到管理集群 ConfigMap |
+| 6 | 上传用户自定义配置和全局 CA（如果是管理集群） |
+#### joinControlPlane（Master 加入）
+| 步骤 | 操作 |
+|------|------|
+| 1 | 安装 kubectl |
+| 2 | 从管理集群加载证书 |
+| 3 | 启动 kubelet |
+| 4 | 生成静态 Pod YAML |
+| 5 | 上传全局 CA（如果是管理集群） |
+#### joinWorker（Worker 加入）
+| 步骤 | 操作 |
+|------|------|
+| 1 | 从管理集群加载证书 |
+| 2 | 启动 kubelet |
+| 3 | 安装 kubectl |
+
+#### upgradeControlPlane（Master 升级）
+| 步骤 | 操作 |
+|------|------|
+| 1 | 备份 etcd（可选） |
+| 2 | 备份集群配置 |
+| 3 | 预拉取镜像 |
+| 4 | 逐个升级组件：生成新静态 Pod YAML → 等待 Pod 就绪 |
+| 5 | 升级 kubelet |
+| 6 | 升级 kubectl |
+#### upgradeWorker（Worker 升级）
+| 步骤 | 操作 |
+|------|------|
+| 1 | 升级 kubelet |
+| 2 | 升级 kubectl |
+
+#### upgradeEtcd（Etcd 升级）
+| 步骤 | 操作 |
+|------|------|
+| 1 | 备份 etcd（可选） |
+| 2 | 生成新的 etcd 静态 Pod YAML |
+| 3 | 等待 etcd Pod 就绪 |
+### 7. RunKubelet 插件（Kubelet 安装与启动）
+**注册名**: `runkubelet` | **适用节点**: 所有节点
+
+**命令格式**:
+```
+["RunKubelet", "url=http://repo:40080/kubelet", "containerName=kubelet", "phase=initControlPlane", "certificatesDir=/etc/kubernetes/pki", "manifestDir=/etc/kubernetes/manifests", "imageRepo=cr.openfuyao.cn:443", "kubernetesVersion=v1.28.0", "clusterDNSDomain=cluster.local", "clusterDNSIP=10.96.0.10", "providerID=xxx", "dataRootDir=/var/lib/kubelet", "cgroupDriver=systemd", "extraArgs=key=value;key=value", "extraVolumes=hostpath:mountpath;hostpath:mountpath", "generateKubeletConfig=true", "useDeliveredConfig=false", "kubeletConfigName=xxx", "kubeletConfigNamespace=bke-system"]
+```
+**业务流**:
+
+| 步骤 | 执行的命令/操作 |
+|------|----------------|
+| 1. 下载二进制 | 下载 kubelet 二进制文件到 `/usr/bin/kubelet` |
+| 2. 生成配置（默认） | 渲染 `kubelet.conf` → `/etc/kubernetes/kubelet.conf`<br>渲染 `kubelet.service` → `/etc/systemd/system/kubelet.service` |
+| 2. 生成配置（CR模式） | 从管理集群 KubeletConfig CR 读取配置 |
+| 3. 拉取镜像 | 拉取 kubelet 容器镜像（pause 镜像等） |
+| 4. 启动 | `systemctl daemon-reload`<br>`systemctl enable kubelet`<br>`systemctl restart kubelet` |
+| 5. 等待就绪 | 检查 kubelet 服务 active 状态 |
+### 8. Manifests 插件（静态 Pod 清单生成）
+**注册名**: `manifests` | **适用节点**: Master 节点
+
+**命令格式**:
+```
+["Manifests", "bkeConfig=ns:name", "scope=kube-apiserver,kube-controller-manager,kube-scheduler,etcd", "manifestDir=/etc/kubernetes/manifests", "etcdDataDir=/var/lib/etcd", "gpuEnable=false"]
+```
+
+**业务流**:
+
+| 步骤 | 执行的命令/操作 |
+|------|----------------|
+| 1. 创建 etcd 环境 | `mkdir -p -m 700 /var/lib/etcd`<br>`useradd -r -c "etcd user" -s /sbin/nologin etcd`<br>`chown -R etcd:etcd /var/lib/etcd` |
+| 2. 渲染清单 | 根据 scope 渲染静态 Pod YAML 到 `/etc/kubernetes/manifests/` |
+| 3. 重启 kubelet | `systemctl restart kubelet`（使静态 Pod 生效） |
+### 9. HA 插件（高可用配置）
+**注册名**: `ha` | **适用节点**: Master 节点（配置 HAProxy + Keepalived）
+
+**命令格式**:
+```
+["HA", "haNodes=master1:192.168.1.1,master2:192.168.1.2", "controlPlaneEndpointVIP=192.168.1.100", "controlPlaneEndpointPort=6443", "ingressVIP=192.168.1.200", "haproxyImageName=haproxy", "haproxyImageTag=2.1.4", "keepAlivedImageName=keepalived/keepalived", "keepAlivedImageTag=1.3.5", "thirdImageRepo=xxx", "fuyaoImageRepo=xxx", "manifestsDir=/etc/kubernetes/manifests", "virtualRouterId=51", "wait=false"]
+```
+**业务流**:
+
+| 步骤 | 执行的命令/操作 |
+|------|----------------|
+| 1. 加载 IPVS | `modprobe ip_vs` |
+| 2. 查找网卡 | 根据节点 IP 找到 VIP 所在网卡接口 |
+| 3. 渲染清单 | Master HA: 生成 HAProxy + Keepalived 静态 Pod YAML<br>Ingress HA: 仅生成 Keepalived 静态 Pod YAML |
+| 4. 等待 VIP 就绪（可选） | 轮询等待 VIP 可达 |
+### 10. Reset 插件（节点重置）
+**注册名**: `reset` | **适用节点**: 所有节点
+
+**命令格式**:
+```
+["Reset", "bkeConfig=ns:name", "scope=cert,manifests,containerd-cfg,container,kubelet,containerRuntime,source,extra", "extra=/path/to/clean,192.168.1.100"]
+```
+**业务流（按 CleanPhase 顺序）**:
+
+| Phase | 执行的命令/操作 |
+|-------|----------------|
+| `kubelet` | `systemctl stop kubelet`<br>`systemctl disable kubelet`<br>删除 kubelet 服务文件和数据目录 |
+| `containerd-cfg` | 删除 `/etc/containerd/config.toml`<br>删除 `/etc/containerd/certs.d/` |
+| `container` | 停止所有容器：`crictl stopp $(crictl pods -q)`<br>删除所有容器和镜像 |
+| `containerRuntime` | `systemctl stop containerd` 或 `systemctl stop docker`<br>删除运行时数据目录 |
+| `cert` | 删除 `/etc/kubernetes/pki/` 目录 |
+| `manifests` | 删除 `/etc/kubernetes/manifests/` 目录 |
+| `source` | 清理 HTTP 软件源配置 |
+| `extra` | 删除额外指定的文件/目录/IP 地址<br>`ip addr del <ip> dev <interface>` |
+| `globalCert` | 删除 `/etc/openFuyao/certs/` 目录 |
+### 11. Downloader 插件（文件下载）
+**注册名**: `downloader` | **适用节点**: 所有节点
+
+**命令格式**:
+```
+["Downloader", "url=http://repo:40080/file", "chmod=755", "rename=kubelet", "saveto=/usr/bin"]
+```
+
+**业务流**: 下载 URL 文件 → 保存到指定目录 → 重命名 → 设置权限
+### 12. SwitchCluster 插件（集群切换）
+**注册名**: `switchcluster` | **适用节点**: Agent 节点
+
+**命令格式**:
+```
+["SwitchCluster", "kubeconfig=ns/secret", "nodeName=node1", "clusterName=cluster1"]
+```
+**业务流**: 从管理集群 Secret 读取 kubeconfig → 写入本地配置文件 → 切换 Agent 连接的目标集群
+### 13. Ping 插件（心跳检测）
+**注册名**: `ping` | **适用节点**: 所有节点
+
+**命令格式**: `["Ping"]`
+
+**业务流**: 返回 `["pong", "<hostname>"]`
+### 14. Backup 插件（备份）
+**注册名**: `backup` | **适用节点**: Master 节点
+
+**命令格式**:
+```
+["Backup", "backupDirs=/etc/kubernetes,/var/lib/etcd", "backupFiles=/etc/hosts", "saveTo=/opt/bke/backup"]
+```
+**业务流**: 备份指定目录和文件到目标路径
+### 15. Collect 插件（证书收集）
+**注册名**: `collect` | **适用节点**: Master 节点
+
+**命令格式**:
+```
+["Collect", "clusterName=cluster1", "namespace=default", "k8sCertDir=/etc/kubernetes/pki", "etcdCertDir=/etc/kubernetes/pki/etcd"]
+```
+**业务流**: 收集本地 K8s/etcd 证书 → 上传到管理集群 Secret
+### 16. Preprocess 插件（前置处理脚本）
+**注册名**: `preprocess` | **适用节点**: 所有节点
+
+**命令格式**: `["Preprocess"]` 或 `["Preprocess", "nodeIP=192.168.1.10"]`
+
+**业务流**: 获取节点 IP → 读取配置（全局/批次/节点，互斥）→ 按优先级排序执行脚本
+### 17. Postprocess 插件（后置处理脚本）
+**注册名**: `postprocess` | **适用节点**: 所有节点
+
+**命令格式**: `["Postprocess"]` 或 `["Postprocess", "nodeIP=192.168.1.10"]`
+
+**业务流**: 与 Preprocess 相同机制，在集群操作完成后执行
+### 18. SelfUpdate 插件（Agent 自更新）
+**注册名**: `selfupdate` | **适用节点**: 所有节点
+
+**命令格式**:
+```
+["SelfUpdate", "agentUrl=http://repo:40080/bkeagent-latest-linux-amd64"]
+```
+
+**业务流**: 检查版本号 → 下载新版本 → 执行 `nohup update.sh /path/to/bkeagent &` 后台替换并重启
+### 19. Shutdown 插件（Agent 关闭）
+**注册名**: `shutdown` | **适用节点**: 所有节点
+
+**命令格式**: `["Shutdown"]`
+
+**业务流**: 调用 `os.Exit(0)` 退出 Agent 进程
+### 整体安装流程（按集群部署阶段）
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    BKECluster 部署完整流程                           │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  Phase 1: ensure_certs (控制面)                                     │
+│    └─ Cert 插件 → 生成/加载所有证书和 KubeConfig                     │
+│                                                                     │
+│  Phase 2: ensure_nodes_env (所有节点)                                │
+│    └─ K8sEnvInit 插件                                               │
+│        ├─ kernel: 内核参数 + 模块加载                                │
+│        ├─ swap: 关闭交换分区                                         │
+│        ├─ firewall: 关闭防火墙                                       │
+│        ├─ selinux: 关闭 SELinux                                      │
+│        ├─ time: 时间同步                                             │
+│        ├─ hosts: 配置 /etc/hosts                                     │
+│        ├─ runtime: → InstallContainerd / InstallDocker / InstallCRIDocker │
+│        ├─ image: 拉取镜像                                            │
+│        ├─ httpRepo: 配置软件源                                       │
+│        ├─ iptables: 配置 iptables                                    │
+│        └─ check: 验证所有配置                                        │
+│                                                                     │
+│  Phase 3: ensure_load_balance (Master 节点)                         │
+│    └─ HA 插件 → HAProxy + Keepalived 静态 Pod                       │
+│                                                                     │
+│  Phase 4: ensure_master_init (首个 Master)                          │
+│    └─ Kubeadm(phase=initControlPlane)                               │
+│        ├─ Cert → 加载/生成证书                                       │
+│        ├─ Manifests → 生成静态 Pod YAML                              │
+│        ├─ RunKubelet → 安装并启动 kubelet                            │
+│        └─ 上传配置到管理集群                                          │
+│                                                                     │
+│  Phase 5: ensure_master_join (其他 Master)                          │
+│    └─ Kubeadm(phase=joinControlPlane)                               │
+│        ├─ Cert → 加载证书                                            │
+│        ├─ RunKubelet → 启动 kubelet                                  │
+│        └─ Manifests → 生成静态 Pod YAML                              │
+│                                                                     │
+│  Phase 6: ensure_worker_join (Worker 节点)                          │
+│    └─ Kubeadm(phase=joinWorker)                                     │
+│        ├─ Cert → 加载证书                                            │
+│        ├─ RunKubelet → 启动 kubelet                                  │
+│        └─ 安装 kubectl                                               │
+│                                                                     │
+│  Phase 7: ensure_bke_agent (所有节点)                                │
+│    └─ SelfUpdate → 更新 Agent 版本                                   │
+│                                                                     │
+│  Phase 8: ensure_delete_or_reset (删除/重置节点)                     │
+│    └─ Reset 插件 → 逐 Phase 清理节点                                 │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+# Kubelet 和 Kubectl 的下载来源
+## Kubelet 和 Kubectl 的下载来源
+### 1. Kubelet 下载来源
+**入口**: [command.go:installKubeletCommand](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/kubeadm/command.go) → [run.go:downloadAndInstallKubeletBinary](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/kubeadm/kubelet/run.go)
+
+**URL 构建链路**:
+```
+BkeConfig.YumRepo()
+  → "http://{HTTPRepo.Domain}:{HTTPRepo.Port}"     // 例如: http://http.bocloud.k8s:40080
+
+GetCustomDownloadPath(yumRepo)
+  → yumRepo + "/files"                               // 例如: http://http.bocloud.k8s:40080/files
+
+最终 URL:
+  → "{baseUrl}/kubelet-{k8sVersion}-{arch}"          // 例如: http://http.bocloud.k8s:40080/files/kubelet-v1.28.0-amd64
+```
+
+**关键代码** ([command.go:133-139](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/kubeadm/command.go)):
+```go
+kubeletUrl := bkesource.GetCustomDownloadPath(cfg.YumRepo())
+kubelet := fmt.Sprintf("kubelet-%s-%s", k8sVersion, hostArch)
+kubeletUrl = fmt.Sprintf("%s/%s", kubeletUrl, kubelet)
+```
+
+**下载执行** ([run.go:571-590](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/kubeadm/kubelet/run.go)):
+
+```go
+func (kp *kubeletPlugin) downloadAndInstallKubeletBinary(commandMap map[string]string) error {
+    url := commandMap["url"]       // http://http.bocloud.k8s:40080/files/kubelet-v1.28.0-amd64
+    rename := commandMap["rename"] // "kubelet"
+    saveto := commandMap["saveto"] // "/usr/bin"
+    chmod := commandMap["chmod"]   // "755"
+
+    // 先停止旧的 kubelet 服务
+    kp.exec.ExecuteCommandWithCombinedOutput("sh", "-c", "systemctl stop kubelet")
+    // 删除旧的二进制
+    kp.exec.ExecuteCommandWithCombinedOutput("sh", "-c", "rm -rf /usr/bin/kubelet")
+    // 通过 HTTP 下载新二进制
+    return download.ExecDownload(url, saveto, rename, chmod)
+}
+```
+**download.ExecDownload** 使用 `http.Get(url)` 直接通过 HTTP GET 下载文件，保存到 `/usr/bin/kubelet`，权限设为 `755`。
+### 2. Kubectl 下载来源
+**入口**: [command.go:installKubectlCommand](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/kubeadm/command.go)
+
+**URL 构建链路**（与 kubelet 完全相同的模式）:
+```
+BkeConfig.YumRepo()
+  → "http://{HTTPRepo.Domain}:{HTTPRepo.Port}"
+
+GetCustomDownloadPath(yumRepo)
+  → yumRepo + "/files"
+
+最终 URL:
+  → "{baseUrl}/kubectl-{k8sVersion}-{arch}"
+```
+
+**关键代码** ([command.go:198-204](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/kubeadm/command.go)):
+```go
+kubectlUrl := bkesource.GetCustomDownloadPath(cfg.YumRepo())
+kubectl := fmt.Sprintf("kubectl-%s-%s", k8sVersion, hostArch)
+kubectlUrl = fmt.Sprintf("%s/%s", kubectlUrl, kubectl)
+```
+
+**下载执行**（直接调用 Downloader 插件）:
+```go
+command := []string{
+    "Downloader",
+    fmt.Sprintf("url=%s", kubectlUrl),  // http://http.bocloud.k8s:40080/files/kubectl-v1.28.0-amd64
+    "rename=kubectl",
+    "saveto=/usr/bin",
+    "chmod=755",
+}
+dp := downloadPlugin.New()
+dp.Execute(command)
+```
+### 3. 关于 kubeadm 二进制
+**重要发现**: 在整个 Kubeadm 插件中，**并没有下载 kubeadm 二进制文件**。Kubeadm 插件并不使用 `kubeadm` CLI 工具，而是**直接在代码中实现了 kubeadm 的功能**：
+- 证书生成：调用 Cert 插件（基于 Go crypto 库）
+- 静态 Pod YAML 生成：调用 Manifests 插件（基于 Go template 渲染）
+- Kubelet 启动：调用 RunKubelet 插件
+- KubeConfig 生成：直接用 Go 代码生成
+
+这与传统 `kubeadm init/join` 的方式不同——BKE **不依赖 kubeadm CLI**，而是用自己的插件体系重新实现了 kubeadm 的核心功能。
+### 4. 下载来源汇总
+| 二进制 | URL 模板 | 示例 | 下载方式 |
+|--------|----------|------|----------|
+| **kubelet** | `http://{HTTPRepo.Domain}:{HTTPRepo.Port}/files/kubelet-{version}-{arch}` | `http://http.bocloud.k8s:40080/files/kubelet-v1.28.0-amd64` | `download.ExecDownload` (HTTP GET) |
+| **kubectl** | `http://{HTTPRepo.Domain}:{HTTPRepo.Port}/files/kubectl-{version}-{arch}` | `http://http.bocloud.k8s:40080/files/kubectl-v1.28.0-amd64` | Downloader 插件 (HTTP GET) |
+| **kubeadm** | ❌ 不下载 | — | 功能由插件代码直接实现，无需 CLI |
+
+**核心依赖**: 所有下载都依赖 `BkeConfig.Cluster.HTTPRepo` 配置（默认 `http.bocloud.k8s:40080`），这是一个**内部 HTTP 文件服务器**，存放了预编译的二进制文件。
+
+
