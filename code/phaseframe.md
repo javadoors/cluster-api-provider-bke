@@ -1,3 +1,216 @@
+
+# BKECluster 安装部署组件及命令梳理
+基于对 [bkecluster_controller.go](file:///D:/code/github/cluster-api-provider-bke/controllers/capbke/bkecluster_controller.go) 及其关联的阶段实现代码的分析，整个安装部署流程通过 **PhaseFrame 阶段框架** 顺序执行，分为三大阶段组：**CommonPhases** → **DeployPhases** → **PostDeployPhases**。
+## 一、阶段执行顺序总览
+| 序号 | 阶段名称 | 中文名 | 阶段组 | 安装节点类型 |
+|------|---------|--------|--------|------------|
+| 1 | EnsureFinalizer | 部署任务创建 | Common | 管理集群（Controller） |
+| 2 | EnsurePaused | 集群管理暂停 | Common | 管理集群（Controller） |
+| 3 | EnsureClusterManage | 纳管现有集群 | Common | 目标集群所有节点 |
+| 4 | EnsureDeleteOrReset | 集群删除 | Common | 目标集群所有节点 |
+| 5 | EnsureDryRun | DryRun部署 | Common | 目标集群所有节点 |
+| 6 | **EnsureBKEAgent** | 推送Agent | Deploy | **所有Master+Worker节点** |
+| 7 | **EnsureNodesEnv** | 节点环境准备 | Deploy | **所有Master+Worker节点** |
+| 8 | **EnsureClusterAPIObj** | ClusterAPI对接 | Deploy | 管理集群 |
+| 9 | **EnsureCerts** | 集群证书创建 | Deploy | 管理集群（Secret存储） |
+| 10 | **EnsureLoadBalance** | 集群入口配置 | Deploy | **所有Master节点** |
+| 11 | **EnsureMasterInit** | Master初始化 | Deploy | **首个Master节点** |
+| 12 | **EnsureMasterJoin** | Master加入 | Deploy | **其余Master节点** |
+| 13 | **EnsureWorkerJoin** | Worker加入 | Deploy | **所有Worker节点** |
+| 14 | **EnsureAddonDeploy** | 集群组件部署 | Deploy | **目标集群** |
+| 15 | **EnsureNodesPostProcess** | 后置脚本处理 | Deploy | **所有节点** |
+| 16 | **EnsureAgentSwitch** | Agent监听切换 | Deploy | **所有节点** |
+| 17 | EnsureProviderSelfUpgrade | provider自升级 | PostDeploy | 管理集群 |
+| 18 | EnsureAgentUpgrade | Agent升级 | PostDeploy | 所有节点 |
+| 19 | EnsureContainerdUpgrade | Containerd升级 | PostDeploy | 所有节点 |
+| 20 | EnsureEtcdUpgrade | Etcd升级 | PostDeploy | Master节点 |
+| 21 | EnsureWorkerUpgrade | Worker升级 | PostDeploy | Worker节点 |
+| 22 | EnsureMasterUpgrade | Master升级 | PostDeploy | Master节点 |
+| 23 | EnsureWorkerDelete | Worker删除 | PostDeploy | Worker节点 |
+| 24 | EnsureMasterDelete | Master删除 | PostDeploy | Master节点 |
+| 25 | EnsureComponentUpgrade | openFuyao核心组件升级 | PostDeploy | 目标集群 |
+| 26 | EnsureCluster | 集群健康检查 | PostDeploy | — |
+## 二、各阶段安装的组件及命令详情
+### 1. EnsureBKEAgent（推送Agent）— 所有节点
+**安装组件**：`bkeagent` 二进制 + systemd service
+
+**安装命令**（通过SSH推送到远程节点执行）：
+```bash
+# 前置命令
+chmod 777 /usr/local/bin/
+chmod 777 /etc/systemd/system/
+systemctl stop bkeagent 2>&1 >/dev/null || true
+systemctl disable bkeagent 2>&1 >/dev/null || true
+systemctl daemon-reload 2>&1 >/dev/null || true
+rm -rf /usr/local/bin/bkeagent* 2>&1 >/dev/null || true
+rm -f /etc/systemd/system/bkeagent.service 2>&1 >/dev/null || true
+rm -rf /etc/openFuyao/bkeagent 2>&1 >/dev/null || true
+
+# 上传文件列表：
+# - bkeagent 二进制 → /usr/local/bin/
+# - bkeagent.service → /etc/systemd/system/
+# - trust-chain.crt → /etc/openFuyao/certs/
+# - GlobalCA证书（如有cluster-api addon）→ /etc/openFuyao/certs/
+# - CSR配置文件 → /etc/openFuyao/certs/cert_config/
+
+# 启动命令
+mkdir -p -m 755 /etc/openFuyao/certs
+mv -f /usr/local/bin/bkeagent_* /usr/local/bin/bkeagent
+mkdir -p -m 777 /etc/openFuyao/bkeagent
+chmod +x /usr/local/bin/bkeagent
+echo -e '<kubeconfig>' > /etc/openFuyao/bkeagent/config
+systemctl daemon-reload
+systemctl enable bkeagent
+systemctl restart bkeagent
+
+# 后置命令
+chmod 755 /usr/local/bin/
+chmod 755 /etc/systemd/system/
+```
+**节点类型**：所有Master + Worker节点
+### 2. EnsureNodesEnv（节点环境准备）— 所有节点
+**安装组件**：K8s运行环境（containerd/docker、kubelet等）+ 自定义脚本
+
+**安装命令**（通过BKEAgent Command机制下发）：
+
+- **基础环境初始化**：通过 `command.ENV` 类型的Command下发，包含：
+  - 容器运行时安装（containerd/docker）
+  - kubelet、kubeadm、kubectl 安装
+  - 系统参数配置（内核参数、swap关闭等）
+  - NTP时间同步配置
+  - hosts映射配置（VIP → master.bocloud.com）
+
+- **通用脚本**（common scripts）：
+  - `file-downloader.sh` — 文件下载器
+  - `package-downloader.sh` — 包下载器
+
+- **自定义脚本**（defaultEnvExtraExecScripts）：
+  - `install-lxcfs.sh` — LXCFS安装
+  - `install-nfsutils.sh` — NFS工具安装
+  - `install-etcdctl.sh` — etcdctl安装
+  - `install-helm.sh` — Helm安装
+  - `install-calicoctl.sh` — calicoctl安装
+  - `update-runc.sh` — runc更新（仅docker场景）
+  - `clean-docker-images.py` — Docker镜像清理（仅docker场景）
+
+- **节点前置处理脚本**：从ConfigMap读取配置，通过 `command.Custom` 下发
+
+**节点类型**：所有Master + Worker节点
+### 3. EnsureClusterAPIObj（ClusterAPI对接）— 管理集群
+**安装组件**：Cluster API 对象（Cluster、KubeadmControlPlane、MachineDeployment等）
+
+**安装命令**：
+```bash
+# 生成ClusterAPI配置YAML
+cfg.GenerateClusterAPIConfigFile(bkeCluster.Name, bkeCluster.Namespace, externalEtcd)
+# 通过kube client apply到管理集群
+localClient.ApplyYaml(task)
+```
+**节点类型**：管理集群（Controller所在集群）
+### 4. EnsureCerts（集群证书创建）— 管理集群
+**安装组件**：Kubernetes 集群证书体系
+
+**安装命令**：
+```go
+certsGenerator.LookUpOrGenerate()
+```
+生成以下证书（存储在管理集群Secret中）：
+- CA证书（cluster-ca、front-proxy-ca、etcd-ca）
+- API Server证书及客户端证书
+- etcd证书（server、peer、healthcheck、client）
+- kubelet证书
+- admin/kube-proxy/controller-manager/scheduler kubeconfig
+
+**节点类型**：管理集群（Secret存储），证书文件在EnsureBKEAgent阶段已推送到目标节点
+### 5. EnsureLoadBalance（集群入口配置）— Master节点
+**安装组件**：Keepalived（HA负载均衡器）
+
+**安装命令**（通过 `command.HA` 下发到Master节点）：
+- Keepalived Pod以static manifest方式部署在Master节点
+- 配置VIP、virtual_router_id等参数
+- 通过BKEAgent Command机制执行
+
+**节点类型**：所有Master节点（仅当ControlPlaneEndpoint是外部VIP时才配置）
+### 6. EnsureMasterInit（Master初始化）— 首个Master节点
+**安装组件**：Kubernetes 控制平面（kube-apiserver、kube-controller-manager、kube-scheduler、etcd）
+
+**安装命令**（通过Cluster API的KubeadmControlPlane引导）：
+```bash
+# kubeadm init（由KubeadmControlPlane Controller自动执行）
+kubeadm init --config <kubeadm-config.yaml>
+```
+**节点类型**：首个Master节点
+### 7. EnsureMasterJoin（Master加入）— 其余Master节点
+**安装组件**：Kubernetes 控制平面组件（高可用模式）
+
+**安装命令**：
+```bash
+# 通过调整KubeadmControlPlane replicas实现
+# kubeadm join（由KubeadmControlPlane Controller自动执行）
+kubeadm join --config <kubeadm-join-config.yaml>
+```
+**节点类型**：其余Master节点（扩容场景）
+### 8. EnsureWorkerJoin（Worker加入）— 所有Worker节点
+**安装组件**：Kubernetes Worker节点组件（kubelet、kube-proxy）
+
+**安装命令**：
+```bash
+# 通过调整MachineDeployment replicas实现
+# kubeadm join（由MachineDeployment Controller自动执行）
+kubeadm join --config <kubeadm-join-config.yaml>
+```
+
+**节点类型**：所有Worker节点
+### 9. EnsureAddonDeploy（集群组件部署）— 目标集群
+**安装组件**：集群Addon组件（通过Helm Chart或YAML部署）
+
+**安装命令**：
+```go
+targetClusterClient.InstallAddon(bkeCluster, addonT, addonRecorder, client, nodes)
+```
+**特殊Addon前置处理**：
+
+| Addon名称 | 前置操作 |
+|-----------|---------|
+| `etcdbackup` | 创建备份目录、创建etcd证书Secret |
+| `beyondELB` | 创建VIP、标签ELB节点 |
+| `cluster-api` | 创建localKubeConfig Secret、leastPrivilegeKubeConfig Secret、标记AgentSwitchPending、创建bkeconfig ConfigMap、创建patchconfig ConfigMap、同步Chart仓库认证信息 |
+| `openFuyao-system-controller` | 特殊处理 |
+| `gpu-manager` | GPU管理器特殊处理 |
+
+**节点类型**：目标集群（Addon以Pod形式运行在目标集群中）
+### 10. EnsureNodesPostProcess（后置脚本处理）— 所有节点
+**安装组件**：用户自定义后置处理脚本
+
+**安装命令**（通过 `command.Custom` 下发）：
+```bash
+# BKEAgent内置命令
+Postprocess
+```
+配置来源（ConfigMap）：
+- `postprocess-all-config`（全局配置）
+- `postprocess-node-batch-mapping` + `postprocess-config-batch-{id}`（批次配置）
+- `postprocess-config-node-{ip}`（单节点配置）
+
+**节点类型**：所有节点
+### 11. EnsureAgentSwitch（Agent监听切换）— 所有节点
+**安装组件**：BKEAgent监听目标切换
+
+**安装命令**（通过 `command.Switch` 下发）：
+```go
+// 将BKEAgent从监听管理集群切换到监听目标集群
+switchCommand.New()
+```
+**节点类型**：所有节点
+## 三、安装命令执行方式总结
+| 执行方式 | 适用阶段 | 说明 |
+|---------|---------|------|
+| **SSH推送** | EnsureBKEAgent | 通过 `bkessh.MultiCli` 并发SSH到节点执行命令 |
+| **BKEAgent Command** | EnsureNodesEnv、EnsureLoadBalance、EnsureNodesPostProcess、EnsureAgentSwitch | 创建 `Command` CRD，由节点上的BKEAgent拉取执行 |
+| **Cluster API** | EnsureMasterInit、EnsureMasterJoin、EnsureWorkerJoin | 通过调整KubeadmControlPlane/MachineDeployment replicas，由CAPI Controller执行kubeadm init/join |
+| **Helm/YAML Apply** | EnsureClusterAPIObj、EnsureAddonDeploy | 通过kube client直接apply到管理集群或目标集群 |
+| **证书生成** | EnsureCerts | 通过certsGenerator在管理集群生成Secret |
+        
 # 详细解析 `cluster-api-provider-bke/pkg/phaseframe` 目录的设计和实现
 ## phaseframe 包详细解析
 `phaseframe` 是 cluster-api-provider-bke 中用于管理集群生命周期各阶段的核心框架。它采用**状态机模式**和**责任链模式**，实现了声明式的集群部署流程。
