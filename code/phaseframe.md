@@ -3012,3 +3012,598 @@ func (r *CommandReconciler) nodeMatchNodeSelector(s *metav1.LabelSelector) bool 
 
 **本质上，BKEAgent 是一个"边车"模式（sidecar-like）的 Agent**：它运行在目标节点上，但通过管理集群的 kubeconfig 与管理集群通信，形成一个**中心化控制 + 分布式执行**的架构。节点不需要被任何 K8s 集群纳管，只需要能访问管理集群的 API Server 即可接收和执行命令。
 
+# EnsureBKEAgent 业务流程梳理
+> 梳理D:\code\github\cluster-api-provider-bke\pkg\phaseframe\phases\ensure_bke_agent.go的业务流程​
+## 一、总体流程概览
+```
+Execute()
+  │
+  ├── 1. loadLocalKubeConfig()        — 加载管理集群 KubeConfig
+  │
+  ├── 2. getNeedPushNodes()           — 获取需要推送 Agent 的节点列表
+  │
+  ├── 3. pushAgent()                  — SSH 推送并启动 BKEAgent
+  │     ├── prepareServiceFile()      — 准备 systemd service 文件
+  │     ├── performAgentPush()        — 执行 SSH 推送
+  │     │     └── sshPushAgent()
+  │     │           ├── RegisterHosts()        — 注册 SSH 连接
+  │     │           ├── RegisterHostsInfo()    — 获取目标机器架构
+  │     │           ├── executePreCommand()    — 前置清理命令
+  │     │           ├── executeStartCommand()  — 上传文件+启动服务
+  │     │           └── PostCommand            — 后置权限恢复
+  │     └── handlePushResults()       — 处理推送结果
+  │
+  └── 4. pingAgent()                  — 验证 Agent 可达性并收集节点信息
+        ├── PingBKEAgent()            — 下发 Ping Command
+        ├── updateNodeStatus()        — 更新节点状态标记
+        ├── validateAndHandleNodesField() — 校验节点字段（hostname唯一性等）
+        └── checkAllOrPushedAgentsFailed() — 检查是否全部失败
+```
+## 二、阶段入口判断：NeedExecute
+```go
+func (e *EnsureBKEAgent) NeedExecute(old, new *bkev1beta1.BKECluster) bool
+```
+**判断逻辑**：
+1. 先调用 `BasePhase.DefaultNeedExecute()` 检查基础条件
+2. 通过 `NodeFetcher` 获取集群关联的所有 `BKENode` CRD
+3. 调用 `phaseutil.HasNodesNeedingPhase(bkeNodes, NodeAgentPushedFlag)` 检查是否存在**尚未标记 `NodeAgentPushedFlag`** 的节点
+4. 如果存在需要推送的节点，设置状态为 `PhaseWaiting` 并返回 `true`
+## 三、步骤 1：loadLocalKubeConfig — 加载管理集群 KubeConfig
+**代码位置**：[ensure_bke_agent.go:119-167](file:///D:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_bke_agent.go#L119-L167)
+
+**业务逻辑**：
+```
+是否配置了 cluster-api addon？
+  │
+  ├── 否（没有 cluster-api）
+  │     ├── 尝试 GetLeastPrivilegeKubeConfig()  — 获取最小权限 kubeconfig
+  │     │     ├── 成功 → 创建 RBAC 资源（ServiceAccount/ClusterRole/ClusterRoleBinding）
+  │     │     └── 失败 → 回退到 GetLocalKubeConfig()（使用管理集群 admin kubeconfig）
+  │     └── 最终使用最小权限或管理集群 kubeconfig
+  │
+  └── 是（有 cluster-api）
+        └── 直接使用 GetLocalKubeConfig() — 管理集群 admin kubeconfig
+```
+**关键点**：
+- KubeConfig 指向的是**管理集群**，不是目标集群
+- 没有 cluster-api addon 时优先使用最小权限，减少安全风险
+- 有 cluster-api addon 时直接用管理集群 admin 权限（后续 Agent 切换阶段会处理）
+## 四、步骤 2：getNeedPushNodes — 获取需要推送的节点
+**代码位置**：[ensure_bke_agent.go:170-195](file:///D:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_bke_agent.go#L170-L195)
+
+**业务逻辑**：
+```
+1. 通过 NodeFetcher 获取集群关联的所有 BKENode CRD
+2. 调用 GetNeedPushAgentNodesWithBKENodes() 过滤：
+   - 排除已标记 NodeAgentPushedFlag 的节点
+   - 排除预约节点（AppointmentNodes）
+3. 为每个需要推送的节点设置状态：NodeInitializing + "Pushing bkeagent"
+4. 同步状态到管理集群
+5. 缓存到 e.needPushNodes
+```
+**过滤条件**（[util.go:245-253](file:///D:/code/github/cluster-api-provider-bke/pkg/phaseframe/phaseutil/util.go#L245-L253)）：
+```go
+// 节点未标记 NodeAgentPushedFlag → 需要推送
+return !GetNodeStateFlag(bn, ip, bkev1beta1.NodeAgentPushedFlag)
+```
+## 五、步骤 3：pushAgent — SSH 推送并启动 BKEAgent
+**代码位置**：[ensure_bke_agent.go:197-278](file:///D:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_bke_agent.go#L197-L278)
+### 5.1 prepareServiceFile — 准备 systemd service 文件
+**代码位置**：[ensure_bke_agent.go:281-312](file:///D:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_bke_agent.go#L281-L312)
+```
+1. 创建临时目录
+2. 读取 /bkeagent.service.tmpl 模板文件
+3. 替换模板中的参数：
+   - --ntpserver=  → 替换为 BKECluster.Spec.ClusterConfig.Cluster.NTPServer
+   - --health-port= → 替换为 BKECluster.Spec.ClusterConfig.Cluster.AgentHealthPort
+4. 写入临时文件 servicePath
+5. 返回 servicePath（defer 清理临时目录）
+```
+### 5.2 performAgentPush → sshPushAgent — 执行 SSH 推送
+**代码位置**：[ensure_bke_agent.go:420-499](file:///D:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_bke_agent.go#L420-L499)
+
+**完整 SSH 推送流程**：
+```
+sshPushAgent()
+  │
+  ├── 1. 创建 MultiCli（并发 SSH 客户端）
+  │
+  ├── 2. RegisterHosts(hosts)           — 建立 SSH 连接
+  │     └── 失败的节点记录到 pushAgentErrs
+  │
+  ├── 3. RegisterHostsInfo()            — 获取目标机器系统架构（amd64/arm64）
+  │     └── 无法识别架构的节点记录到 pushAgentErrs
+  │
+  ├── 4. executePreCommand()            — 前置清理命令
+  │     │  并发执行以下命令：
+  │     │  ├── chmod 777 /usr/local/bin/
+  │     │  ├── chmod 777 /etc/systemd/system/
+  │     │  ├── systemctl stop bkeagent      (忽略错误)
+  │     │  ├── systemctl disable bkeagent   (忽略错误)
+  │     │  ├── systemctl daemon-reload      (忽略错误)
+  │     │  ├── rm -rf /usr/local/bin/bkeagent*
+  │     │  ├── rm -f /etc/systemd/system/bkeagent.service
+  │     │  └── rm -rf /etc/openFuyao/bkeagent
+  │     └── 失败节点从可用列表移除
+  │
+  ├── 5. executeStartCommand()          — 上传文件+启动服务
+  │     │
+  │     ├── 5a. prepareFileUploadList() — 准备上传文件列表
+  │     │     ├── bkeagent.service      → /etc/systemd/system/
+  │     │     ├── trust-chain.crt       → /etc/openFuyao/certs/
+  │     │     ├── GlobalCA证书+密钥     → /etc/openFuyao/certs/  (仅 cluster-api addon)
+  │     │     └── CSR配置文件(17个)     → /etc/openFuyao/certs/cert_config/
+  │     │
+  │     ├── 5b. 执行启动命令：
+  │     │     ├── mkdir -p -m 755 /etc/openFuyao/certs
+  │     │     ├── mv -f /usr/local/bin/bkeagent_* /usr/local/bin/bkeagent
+  │     │     ├── mkdir -p -m 777 /etc/openFuyao/bkeagent
+  │     │     ├── chmod +x /usr/local/bin/bkeagent
+  │     │     ├── echo -e <kubeconfig> > /etc/openFuyao/bkeagent/config
+  │     │     ├── systemctl daemon-reload
+  │     │     ├── systemctl enable bkeagent
+  │     │     └── systemctl restart bkeagent
+  │     │
+  │     └── 5c. 过滤 stderr：
+  │           ├── "Created symlink" → 忽略（正常）
+  │           └── "Failed to execute operation: File exists" → 忽略（正常）
+  │
+  └── 6. PostCommand — 后置权限恢复
+        ├── chmod 755 /usr/local/bin/
+        └── chmod 755 /etc/systemd/system/
+```
+**上传文件清单**：
+
+| 文件 | 目标路径 | 条件 |
+|------|---------|------|
+| `bkeagent.service` | `/etc/systemd/system/` | 始终 |
+| `trust-chain.crt` | `/etc/openFuyao/certs/` | 文件存在时 |
+| `GlobalCA cert + key` | `/etc/openFuyao/certs/` | 仅 cluster-api addon |
+| 17个 CSR 配置文件 | `/etc/openFuyao/certs/cert_config/` | 文件存在时 |
+
+CSR 配置文件列表：
+```
+cluster-ca-policy.json, cluster-ca-csr.json, sign-policy.json,
+api-server-csr.json, api-server-etcd-client-csr.json,
+front-proxy-client-csr.json, api-server-kubelet-client-csr.json,
+front-proxy-ca-csr.json, etcd-ca-csr.json, etcd-server-csr.json,
+etcd-healthcheck-client-csr.json, etcd-peer-csr.json,
+admin-kubeconfig-csr.json, kubelet-kubeconfig-csr.json,
+controller-manager-csr.json, scheduler-csr.json, kube-proxy-csr.json
+```
+### 5.3 handlePushResults — 处理推送结果
+**代码位置**：[ensure_bke_agent.go:315-358](file:///D:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_bke_agent.go#L315-L358)
+```
+handlePushResults()
+  │
+  ├── 全部失败？
+  │     └── 是 → 同步状态 + 返回错误 "Failed to push agent to nodes"
+  │
+  ├── 部分成功：
+  │     ├── 成功节点 → 标记 NodeAgentPushedFlag（避免重复推送）
+  │     ├── 同步状态到管理集群
+  │     └── Master 节点失败？
+  │           ├── 是 → 返回错误 "Push agent to master node failed"
+  │           └── 否 → 记录日志，继续（Worker 失败可容忍）
+  │
+  └── 全部成功 → 返回 nil
+```
+**关键容错策略**：
+- **Master 节点失败**：直接报错，终止流程
+- **Worker 节点失败**：仅记录日志，继续后续流程（标记为 NeedSkip）
+## 六、步骤 4：pingAgent — 验证 Agent 可达性
+**代码位置**：[ensure_bke_agent.go:549-597](file:///D:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_bke_agent.go#L549-L597)
+### 6.1 PingBKEAgent — 下发 Ping Command
+**代码位置**：[agent.go:40-82](file:///D:/code/github/cluster-api-provider-bke/pkg/phaseframe/phaseutil/agent.go#L40-L82)
+```
+1. 获取所有已标记 NodeAgentPushedFlag 的节点（即推送成功的节点）
+2. 计算超时时间：节点数 × 5秒/节点
+3. 创建 command.Ping 对象：
+   - Command 类型：BuiltIn
+   - Command 内容：["Ping"]
+   - BackoffDelay：3秒（重试间隔）
+   - RemoveAfterWait：true（执行完自动删除）
+4. 下发 Ping Command 到管理集群
+5. 等待所有节点响应
+6. 从 Command Status 的 StdOut 中提取节点主机名信息
+7. 更新未设置 hostname 的 BKENode 的 Spec.Hostname
+```
+**Ping Command 的工作机制**：
+- 在管理集群创建 `Command` CRD，NodeSelector 包含目标节点 IP
+- 目标节点上的 BKEAgent Watch 到该 Command，执行内置 `Ping` 命令
+- Ping 命令返回节点的主机名和 IP 信息（格式：`hostname/ip`）
+- Controller 从 Command.Status 的 StdOut 中解析主机名
+### 6.2 updateNodeStatus — 更新节点状态
+**代码位置**：[ensure_bke_agent.go:599-628](file:///D:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_bke_agent.go#L599-L628)
+```
+失败节点：
+  ├── 设置状态：NodeInitFailed + "Failed ping bkeagent"
+  ├── 取消标记：NodeAgentPushedFlag（下次重新推送）
+  └── 设置 NeedSkip：true（跳过后续阶段）
+
+成功节点：
+  ├── 设置状态消息："BKEAgent is ready"
+  ├── 标记：NodeAgentPushedFlag
+  └── 标记：NodeAgentReadyFlag
+```
+### 6.3 validateAndHandleNodesField — 校验节点字段
+**代码位置**：[ensure_bke_agent.go:630-649](file:///D:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_bke_agent.go#L630-L649)
+```
+1. 获取所有节点信息
+2. 根据 BKECluster 类型选择校验规则：
+   ├── BKECluster → ValidateNodesFields()（标准校验）
+   └── BocloudCluster → ValidateNonStandardNodesFields()（非标准校验）
+3. 校验失败 → handleValidationFailure()
+   ├── 设置 BKEConfigCondition = False
+   ├── hostname 不唯一？
+   │     ├── 设置 HostNameNotUniqueReason 条件
+   │     ├── 取消所有 needPushNodes 的 AgentPushed/AgentReady 标记
+   │     └── 设置节点状态为 NodeInitFailed
+   └── 同步状态并返回错误
+```
+### 6.4 checkAllOrPushedAgentsFailed — 最终检查
+**代码位置**：[ensure_bke_agent.go:681-705](file:///D:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_bke_agent.go#L681-L705)
+```
+1. 所有节点 ping 都失败 → 返回错误
+2. 本次需要推送的节点全部 ping 失败 → 返回错误
+3. 部分成功 → 返回 nil（容忍部分 Worker 失败）
+```
+## 七、节点状态变迁图
+```
+初始状态
+  │
+  ▼
+[NeedExecute 检测到未标记 NodeAgentPushedFlag 的节点]
+  │
+  ▼
+NodeInitializing + "Pushing bkeagent"     ← getNeedPushNodes()
+  │
+  ▼
+┌─────────────── SSH 推送 ───────────────┐
+  │                                       │
+  │ 推送成功                               │ 推送失败
+  ▼                                       ▼
+NodeAgentPushedFlag ✓              NodeInitFailed + NeedSkip ✓
+  │                                （下次 NeedExecute 时跳过）
+  ▼
+┌─────────────── Ping 验证 ──────────────┐
+  │                                       │
+  │ Ping 成功                              │ Ping 失败
+  ▼                                       ▼
+NodeAgentReadyFlag ✓               NodeInitFailed
+"BKEAgent is ready"                NodeAgentPushedFlag ✗（取消标记）
+                                   NeedSkip ✓
+  │
+  ▼
+[进入下一阶段 EnsureNodesEnv]
+```
+## 八、容错与重试机制总结
+| 场景 | 处理策略 |
+|------|---------|
+| SSH 连接失败 | 节点标记为 `NodeInitFailed` + `NeedSkip`，从可用列表移除 |
+| 架构识别失败 | 节点标记为 `NodeInitFailed`，从可用列表移除 |
+| 前置命令失败 | 节点从可用列表移除，不参与后续推送 |
+| Agent 启动失败 | 节点标记为 `NodeInitFailed` + `NeedSkip` |
+| Master 推送失败 | **直接报错终止**，整个阶段返回 error |
+| Worker 推送失败 | **容忍**，记录日志继续后续流程 |
+| Ping 全部失败 | 返回错误，触发 Reconcile 重试 |
+| Ping 部分失败（Worker） | 容忍，标记 `NeedSkip`，继续 |
+| Hostname 不唯一 | 取消所有推送节点的标记，返回错误 |
+| systemctl enable 输出 "Created symlink" | 忽略，视为正常 |
+| 下次 Reconcile | `NeedSkip` 的节点被 `GetNeedPushAgentNodesWithBKENodes` 过滤掉，不再重复推送 |
+
+
+# EnsureNodesEnv 业务流程梳理
+## 一、总体流程概览
+```
+Execute()
+  │
+  └── CheckOrInitNodesEnv()
+        │
+        ├── 1. getNodesToInitEnv()              — 获取需要初始化环境的节点
+        │
+        ├── 2. setupClusterConditionAndSync()   — 设置集群条件状态
+        │
+        ├── 3. buildEnvCommand()                — 构建环境初始化 Command
+        │     ├── getExtraAndExtraHosts()       — 计算 extra/extraHosts 参数
+        │     ├── shouldUseDeepRestore()        — 判断是否深度重置
+        │     └── command.ENV.New()             — 创建 Command CRD
+        │
+        ├── 4. executeEnvCommand()              — 等待 Command 执行完成
+        │
+        ├── 5. handleSuccessNodes()             — 处理成功节点
+        │
+        ├── 6. handleFailedNodes()              — 处理失败节点
+        │
+        └── 7. finalDecisionAndCleanup()        — 最终决策与清理
+              │
+              ├── initClusterExtra()            — 安装自定义脚本
+              │     ├── installCommonScripts()  — 安装基础脚本
+              │     └── installOtherCustomScripts() — 安装其他自定义脚本
+              │
+              └── executeNodePreprocessScripts() — 执行前置处理脚本
+                    ├── checkPreprocessConfigExists() — 检查配置是否存在
+                    └── createPreprocessCommand()     — 创建前置处理 Command
+```
+## 二、阶段入口判断：NeedExecute
+```go
+func (e *EnsureNodesEnv) NeedExecute(old, new *bkev1beta1.BKECluster) bool
+```
+**判断逻辑**：
+1. 调用 `BasePhase.DefaultNeedExecute()` 检查基础条件
+2. 通过 `NodeFetcher` 获取集群关联的所有 `BKENode` CRD
+3. 调用 `phaseutil.HasNodesNeedingPhase(bkeNodes, NodeEnvFlag)` 检查是否存在**尚未标记 `NodeEnvFlag`** 的节点
+4. 如果存在，设置状态为 `PhaseWaiting` 并返回 `true`
+## 三、步骤 1：getNodesToInitEnv — 获取需要初始化环境的节点
+**代码位置**：[ensure_nodes_env.go:92-120](file:///D:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_nodes_env.go#L92-L120)
+
+**过滤逻辑**（逐条检查每个 BKENode）：
+
+| 过滤条件 | 说明 | 动作 |
+|---------|------|------|
+| `NodeFailedFlag ≠ 0` | 节点已失败 | 跳过 |
+| `NodeDeletingFlag ≠ 0` | 节点正在删除 | 跳过 |
+| `NeedSkip = true` | 节点被标记跳过 | 跳过 |
+| `NodeEnvFlag ≠ 0` | 环境已初始化 | 跳过 |
+| `NodeAgentReadyFlag = 0` | Agent 未就绪 | 跳过 |
+| 以上均不满足 | 需要初始化环境 | 加入列表 |
+
+对通过过滤的节点，设置状态为 `NodeInitializing` + "Initializing node env"。
+
+**关键前置条件**：节点必须已标记 `NodeAgentReadyFlag`（即 EnsureBKEAgent 阶段已完成）。
+## 四、步骤 2：setupClusterConditionAndSync — 设置集群条件状态
+**代码位置**：[ensure_nodes_env.go:122-129](file:///D:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_nodes_env.go#L122-L129)
+```
+1. 设置 BKECluster 条件：NodesEnvCondition = False, NodesEnvNotReadyReason
+2. 同步状态到管理集群（SyncStatusUntilComplete）
+```
+## 五、步骤 3：buildEnvCommand — 构建环境初始化 Command
+**代码位置**：[ensure_nodes_env.go:168-198](file:///D:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_nodes_env.go#L168-L198)
+### 5.1 getExtraAndExtraHosts — 计算额外参数
+**代码位置**：[ensure_nodes_env.go:206-237](file:///D:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_nodes_env.go#L206-L237)
+```
+extra（额外 IP 列表）：
+  ├── ControlPlaneEndpoint 是外部 VIP（非节点 IP）？
+  │     └── 是 → 添加 VIP IP 到 extra
+  └── IngressVIP 存在且 ≠ ControlPlaneEndpoint.Host？
+        └── 是 → 添加 IngressVIP 到 extra
+
+extraHosts（额外 hosts 映射）：
+  └── ControlPlaneEndpoint 有效？
+        ├── HA 集群（VIP）→ master.bocloud.com → VIP
+        └── 单 Master    → master.bocloud.com → Master[0].IP
+```
+**用途**：这些参数传递给 BKEAgent 的 `K8sEnvInit` 内置命令，用于：
+- `extra`：配置证书的 SAN（Subject Alternative Name），确保 VIP 和 Ingress IP 包含在 API Server 证书中
+- `extraHosts`：写入节点 `/etc/hosts`，将 `master.bocloud.com` 映射到 VIP 或 Master IP
+### 5.2 shouldUseDeepRestore — 判断是否深度重置
+**代码位置**：[ensure_nodes_env.go:200-203](file:///D:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_nodes_env.go#L200-L203)
+```
+检查 BKECluster Annotation: annotation.DeepRestoreNodeAnnotationKey
+  ├── 注解值 = "true"  → deepRestore = true
+  ├── 注解值 = "false" → deepRestore = false
+  └── 注解不存在       → deepRestore = true（默认深度重置）
+```
+**影响**：决定 `Reset` 命令的 scope 范围：
+- `deepRestore = true`：`scope=cert,manifests,container,kubelet,containerRuntime,extra`
+- `deepRestore = false`：`scope=cert,manifests,container,kubelet,extra`（不重置 containerRuntime）
+### 5.3 command.ENV 创建的 Command 内容
+**代码位置**：[env.go:89-109](file:///D:/code/github/cluster-api-provider-bke/pkg/command/env.go#L89-L109)
+
+创建的 Command CRD 包含三条顺序执行的内置命令：
+```
+Command: k8s-env-init-{timestamp}
+NodeSelector: {nodeIP1: nodeIP1, nodeIP2: nodeIP2, ...}
+Unique: true（同集群仅保留一个）
+RemoveAfterWait: true（执行完自动删除）
+WaitTimeout: GetBootTimeOut(bkeCluster)
+
+Commands（顺序执行）：
+  ┌──────────────────────────────────────────────────────────────┐
+  │ 1. K8sEnvInit (ID: "node hardware resources check")         │
+  │    参数: init=true, check=true, scope=node, bkeConfig=ns:name│
+  │    功能: 检查节点硬件资源是否满足 K8s 运行要求                  │
+  │    重试: 不忽略失败                                            │
+  ├──────────────────────────────────────────────────────────────┤
+  │ 2. Reset (ID: "reset")                                       │
+  │    参数: bkeConfig=ns:name, scope=cert,manifests,container,  │
+  │          kubelet[,containerRuntime],extra                     │
+  │    功能: 重置节点环境（清理旧配置）                              │
+  │    重试: 忽略失败（BackoffIgnore=true）                        │
+  ├──────────────────────────────────────────────────────────────┤
+  │ 3. K8sEnvInit (ID: "init and check node env")                │
+  │    参数: init=true, check=true,                               │
+  │          scope=time,hosts,dns,kernel,firewall,selinux,swap,  │
+  │                httpRepo,runtime,iptables,registry,extra       │
+  │          bkeConfig=ns:name, extraHosts=master.bocloud.com:IP │
+  │    功能: 初始化并检查节点环境                                   │
+  │    重试: 延迟5秒重试，不忽略失败                                │
+  └──────────────────────────────────────────────────────────────┘
+```
+**额外：预拉取镜像命令**（`PrePullImage = true` 时，仅首次部署）：
+```
+Command: k8s-image-pre-pull-{timestamp}
+NodeSelector: 排除首个 Master 节点
+Commands:
+  └── K8sEnvInit (ID: "pre pull images")
+      参数: init=true, check=true, scope=image, bkeConfig=ns:name
+      重试: 延迟15秒，忽略失败
+```
+## 六、步骤 4：executeEnvCommand — 等待 Command 执行
+**代码位置**：[ensure_nodes_env.go:239-242](file:///D:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_nodes_env.go#L239-L242)
+```
+1. 调用 envCmd.Wait() 轮询管理集群上的 Command 状态
+2. 等待所有目标节点执行完成或超时
+3. 返回 (error, successNodes, failedNodes)
+```
+## 七、步骤 5：handleSuccessNodes — 处理成功节点
+**代码位置**：[ensure_nodes_env.go:244-262](file:///D:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_nodes_env.go#L244-L262)
+```
+对每个成功节点：
+  1. 从 Command WaitResult 中提取节点 IP
+  2. 标记 NodeEnvFlag（表示环境初始化完成）
+  3. 设置状态消息："Nodes env is ready"
+  4. 从 allNodes 中找到该节点，加入 e.nodes 缓存（供后续脚本安装使用）
+```
+## 八、步骤 6：handleFailedNodes — 处理失败节点
+**代码位置**：[ensure_nodes_env.go:264-281](file:///D:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_nodes_env.go#L264-L281)
+```
+对每个失败节点：
+  1. 设置状态：NodeInitFailed + "Failed to check k8s env"
+  2. 调用 SetSkipNodeErrorForWorker()：
+     - Worker 节点 → 标记 NeedSkip=true（跳过后续阶段）
+     - Master 节点 → 不跳过（后续阶段会重试）
+  3. 记录 Command 执行错误日志
+  4. 标记节点错误状态到 BKENode
+```
+## 九、步骤 7：finalDecisionAndCleanup — 最终决策与清理
+**代码位置**：[ensure_nodes_env.go:283-316](file:///D:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_nodes_env.go#L283-L316)
+```
+1. 同步状态到管理集群
+2. 全部节点失败？→ 返回错误
+3. 部分成功 → 继续执行：
+   ├── initClusterExtra()           — 安装自定义脚本
+   └── executeNodePreprocessScripts() — 执行前置处理脚本
+4. Deploying 状态下有失败节点？
+   └── 检查不可跳过的失败节点数 > 0？→ 返回错误重试
+5. 全部通过 → 设置 NodesEnvCondition = True
+```
+## 十、initClusterExtra — 安装自定义脚本
+**代码位置**：[ensure_nodes_env.go:318-352](file:///D:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_nodes_env.go#L318-L352)
+### 10.1 installCommonScripts — 安装基础脚本
+**代码位置**：[ensure_nodes_env.go:374-403](file:///D:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_nodes_env.go#L374-L403)
+
+**基础脚本列表**（必须全部存在，任一缺失则中止）：
+
+| 脚本 | 安装节点 | 参数 |
+|------|---------|------|
+| `file-downloader.sh` | 所有节点 | nodesIps=全部IP |
+| `package-downloader.sh` | 所有节点 | nodesIps=全部IP |
+
+**执行方式**：通过 `LocalClient.InstallAddon()` 以 `clusterextra` addon 的形式部署到目标集群。
+
+**关键特性**：基础脚本是**串行阻塞**的，任一脚本缺失或安装失败，整个基础脚本安装中止（`return` 而非 `continue`）。
+### 10.2 installOtherCustomScripts — 安装其他自定义脚本
+**代码位置**：[ensure_nodes_env.go:405-451](file:///D:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_nodes_env.go#L405-L451)
+
+**默认自定义脚本列表**：
+
+| 脚本 | 安装节点 | 特殊逻辑 | 参数 |
+|------|---------|---------|------|
+| `install-lxcfs.sh` | 所有节点 | — | nodesIps |
+| `install-nfsutils.sh` | — | 需要 `pipelineServer` 配置 | pipelineServer IP |
+| `install-etcdctl.sh` | Etcd 节点 | — | etcdNodesIps |
+| `install-helm.sh` | Master 节点 | — | masterNodesIps |
+| `install-calicoctl.sh` | Master 节点 | — | masterNodesIps |
+| `update-runc.sh` | 所有节点（排除 host 节点） | 仅 Docker 场景；block=true | nodesIps, httpRepo |
+| `clean-docker-images.py` | — | 需要 `pipelineServer` + `pipelineServerEnableCleanImages=true` | pipelineServer IP |
+
+**自定义脚本来源**：
+- 默认使用 `defaultEnvExtraExecScripts` 列表
+- 如果 `BKECluster.Spec.ClusterConfig.CustomExtra["envExtraExecScripts"]` 有配置，则使用用户自定义的脚本列表
+
+**容错策略**：与基础脚本不同，自定义脚本是**非阻塞**的，单个脚本缺失或失败仅记录警告，继续执行下一个（`continue`）。
+
+**特殊处理**：
+- `update-runc.sh`：当 CRI 为 containerd 时跳过（仅 Docker 需要）；如果 `CustomExtra["host"]` 有值，排除该 IP 节点
+- `clean-docker-images.py`：需要同时配置 `pipelineServer` 和 `pipelineServerEnableCleanImages=true`
+- `install-nfsutils.sh`：需要配置 `pipelineServer`
+## 十一、executeNodePreprocessScripts — 执行前置处理脚本
+**代码位置**：[ensure_nodes_env.go:453-505](file:///D:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_nodes_env.go#L453-L505)
+### 11.1 checkPreprocessConfigExists — 检查前置处理配置
+**代码位置**：[ensure_nodes_env.go:538-600](file:///D:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_nodes_env.go#L538-L600)
+
+按优先级检查三种 ConfigMap（命名空间均为 `user-system`）：
+```
+优先级 1：全局配置
+  └── ConfigMap: preprocess-all-config
+        存在 → 所有节点都需要执行前置处理
+
+优先级 2：批次配置
+  └── ConfigMap: preprocess-node-batch-mapping
+        └── Data["mapping.json"] → {nodeIP: batchId}
+              └── ConfigMap: preprocess-config-batch-{batchId}
+                    存在 → 该节点需要执行前置处理
+
+优先级 3：节点配置
+  └── ConfigMap: preprocess-config-node-{nodeIP}
+        存在 → 该节点需要执行前置处理
+```
+### 11.2 createPreprocessCommand — 创建前置处理 Command
+**代码位置**：[ensure_nodes_env.go:507-536](file:///D:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_nodes_env.go#L507-L536)
+```
+Command: preprocess-all-nodes-{timestamp}
+NodeSelector: 所有有配置的节点 IP
+WaitTimeout: 30 分钟
+RemoveAfterWait: true
+
+Commands:
+  └── BuiltIn: "Preprocess"
+      ID: execute-preprocess-scripts
+      BackoffIgnore: false
+```
+**执行逻辑**：BKEAgent 收到 `Preprocess` 内置命令后，自动获取当前节点 IP，查找对应的 ConfigMap 配置，执行前置处理脚本。
+## 十二、节点状态变迁图
+```
+初始状态（EnsureBKEAgent 阶段已完成）
+  │
+  ▼ NodeAgentReadyFlag ✓, NodeEnvFlag ✗
+  │
+  ▼ NeedExecute 检测到未标记 NodeEnvFlag 的节点
+  │
+  ▼
+NodeInitializing + "Initializing node env"    ← getNodesToInitEnv()
+  │
+  ▼
+NodesEnvCondition = False                     ← setupClusterConditionAndSync()
+  │
+  ▼
+┌────────── Command 执行 ─────────┐
+│                                 │
+│ 成功                            │ 失败
+▼                                 ▼
+NodeEnvFlag ✓                      NodeInitFailed
+"Nodes env is ready"               Worker → NeedSkip ✓
+                                   Master → 不跳过（可重试）
+  │
+  ▼
+  ┌────────── 自定义脚本安装 ─────────┐
+  │                                   │
+  │ 基础脚本（阻塞）                  │ 自定义脚本（非阻塞）
+  │ file-downloader.sh                │ install-lxcfs.sh
+  │ package-downloader.sh             │ install-nfsutils.sh
+  │                                   │ install-etcdctl.sh
+  │                                   │ install-helm.sh
+  │                                   │ install-calicoctl.sh
+  │                                   │ update-runc.sh (仅Docker)
+  │                                   │ clean-docker-images.py
+  │
+  ▼
+  ┌────────── 前置处理脚本 ──────────┐
+  │ 检查 ConfigMap 配置              │
+  │ 全局 > 批次 > 节点               │
+  │ 有配置 → 创建 Preprocess Command │
+  │ 无配置 → 跳过                    │
+  │
+  ▼
+NodesEnvCondition = True
+[进入下一阶段 EnsureClusterAPIObj]
+```
+## 十三、容错与重试机制总结
+| 场景 | 处理策略 |
+|------|---------|
+| 节点 Agent 未就绪 | 跳过该节点（`NodeAgentReadyFlag = 0`） |
+| 节点已失败/删除/跳过 | 跳过该节点 |
+| 全部节点 ENV 初始化失败 | 返回错误，触发 Reconcile 重试 |
+| Worker 节点 ENV 失败 | 标记 `NeedSkip`，继续后续流程 |
+| Master 节点 ENV 失败 | 不标记跳过，后续阶段可重试 |
+| Deploying 状态下有不可跳过的失败节点 | 返回错误重试 |
+| 基础脚本缺失/失败 | **中止**整个脚本安装（`return`） |
+| 自定义脚本缺失/失败 | **跳过**该脚本继续（`continue`） |
+| 前置处理无 ConfigMap 配置 | 跳过，不创建 Command |
+| 前置处理执行失败 | 返回错误（包含成功/失败节点信息） |
+| DeepRestore 注解不存在 | 默认启用深度重置（包含 containerRuntime） |
+| `update-runc.sh` + containerd | 跳过（仅 Docker 场景需要） |
+| Command 超时 | `GetBootTimeOut` 控制超时时间 |
+| ENV Command Unique=true | 同集群仅保留一个 env init 命令，避免重复执行 |
+
