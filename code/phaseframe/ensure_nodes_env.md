@@ -4127,5 +4127,511 @@ KubeadmPlugin
 - 管理集群作为状态存储: 证书、kubeconfig 等关键数据存储在管理集群的 Secret/ConfigMap 中，实现跨节点共享
 - 升级策略: 逐组件替换静态 Pod YAML，通过 Pod hash 变化检测升级完成，确保滚动升级的可靠性
 
+# BKE etcd Static Pod 管理完整业务流程分析
+## 一、整体架构概览
+BKE 的 etcd Static Pod 管理采用 **自研 Go 代码 + 模板渲染** 的方式，不依赖 kubeadm 二进制，而是通过以下核心组件协作完成：
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                     Controller 侧 (Manager Cluster)              │
+│  EnsureCerts → EnsureMasterInit → EnsureMasterJoin → EnsureDelete│
+└──────────────┬───────────────────────────────────────────────────┘
+               │ 下发 Command (Agent 执行)
+               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     Agent 侧 (Target Node)                      │
+│  KubeadmPlugin → CertPlugin → ManifestPlugin → RunKubeletPlugin │
+└─────────────────────────────────────────────────────────────────┘
+```
+## 二、完整业务流程（按生命周期阶段）
+### 阶段 1：证书生成（EnsureCerts → CertPlugin）
+**入口**: [ensure_certs.go](file:///d:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_certs.go) → [certs.go](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/kubeadm/certs/certs.go)
 
-  
+etcd 相关证书共 **5 组**，均由 `etcd-ca` 签发，定义在 [bkecertlist.go](file:///d:/code/github/cluster-api-provider-bke/utils/bkeagent/pkiutil/bkecertlist.go)：
+
+| 证书名称 | BaseName | 用途 | CA 签发者 |
+|---------|----------|------|----------|
+| etcd CA | `etcd/ca` | etcd 自签名 CA | 自身（IsCA=true） |
+| etcd-server | `etcd/server` | etcd 服务端证书 | etcd-ca |
+| etcd-peer | `etcd/peer` | etcd 节点间通信证书 | etcd-ca |
+| etcd-healthcheck-client | `etcd/healthcheck-client` | 健康检查客户端证书 | etcd-ca |
+| apiserver-etcd-client | `apiserver-etcd-client` | API Server 访问 etcd 的客户端证书 | etcd-ca |
+
+**etcd 证书 SAN 生成**（[altname.go](file:///d:/code/github/cluster-api-provider-bke/utils/bkeagent/pkiutil/altname.go#L86-L130)）：
+- 从节点数据中获取所有 etcd 节点的 IP 和 Hostname
+- 追加 `BKEConfig.Cluster.Etcd.ServerCertSANs` / `PeerCertSANs`
+- 默认包含 `localhost`、`127.0.0.1`、`::1`
+
+**证书存储路径**: `/etc/kubernetes/pki/etcd/`
+```
+/etc/kubernetes/pki/etcd/
+├── ca.crt          # etcd CA 证书
+├── ca.key          # etcd CA 私钥
+├── server.crt      # etcd 服务端证书
+├── server.key      # etcd 服务端私钥
+├── peer.crt        # etcd peer 证书
+├── peer.key        # etcd peer 私钥
+├── healthcheck-client.crt  # 健康检查客户端证书
+├── healthcheck-client.key  # 健康检查客户端私钥
+└── ../apiserver-etcd-client.crt  # API Server etcd 客户端证书（在 pki 根目录）
+    ../apiserver-etcd-client.key
+```
+### 阶段 2：首个 Master 初始化（InitControlPlane）
+**入口**: [kubeadm.go#initControlPlane()](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/kubeadm/kubeadm.go#L170)
+```
+initControlPlane() 执行顺序：
+  ① installKubectlCommand()          → 安装 kubectl
+  ② initControlPlaneCertCommand()    → 生成/加载证书
+  ③ initControlPlaneManifestCommand()→ 生成 Static Pod YAML ← 核心
+  ④ installKubeletCommand()          → 安装并启动 Kubelet
+  ⑤ uploadTargetClusterKubeletConfig() → 上传 kubelet 配置
+  ⑥ uploadUserCustomConfigAndGlobalCA() → 上传自定义配置
+```
+**关键步骤 ③ — Manifest 渲染**：
+
+调用链：`initControlPlaneManifestCommand()` → `runControlPlaneManifestCommand()` → `ManifestPlugin.Execute()`
+
+在 [manifests.go#Execute()](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/kubeadm/manifests/manifests.go) 中：
+```go
+// 1. 解析 scope 参数，筛选要渲染的组件
+scope := strings.Split(parseCommands["scope"], ",")
+components := mfutil.Components{}
+for _, component := range mfutil.GetDefaultComponentList() {
+    if utils.ContainsString(scope, component.Name) {
+        components = append(components, component)
+    }
+    // 对 etcd 组件额外执行环境准备
+    if component.Name == mfutil.Etcd {
+        mp.setupEtcdEnvironment(parseCommands["etcdDataDir"])
+    }
+}
+
+// 2. 渲染所有组件的 Static Pod YAML
+mfutil.GenerateManifestYaml(components, mp.bootScope)
+
+// 3. 重启 kubelet 使 Static Pod 生效
+systemctl restart kubelet
+```
+**setupEtcdEnvironment** — etcd 环境准备（[manifests.go#L104-L133](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/kubeadm/manifests/manifests.go#L104)）：
+```bash
+# 1. 创建 etcd 数据目录（权限 700）
+mkdir -p -m 700 /var/lib/openFuyao/etcd
+
+# 2. 创建 etcd 系统用户（如果不存在）
+useradd -r -c "etcd user" -s /sbin/nologin etcd -d /var/lib/openFuyao/etcd
+
+# 3. 设置数据目录属主
+chown -R etcd:etcd /var/lib/openFuyao/etcd
+```
+### 阶段 3：etcd 集群成员管理（核心逻辑）
+**入口**: [render.go#renderEtcd()](file:///d:/code/github/cluster-api-provider-bke/utils/bkeagent/mfutil/render.go)
+```
+renderEtcd(c, cfg)
+  ├── handleEtcdMembership(cfg)    ← 处理集群成员关系
+  │   ├── Init=true  → 新集群初始化
+  │   │   └── 设置 EtcdInitialCluster = [{Name: HostName, PeerURL: https://IP:2380}]
+  │   └── Init=false → 加入已有集群
+  │       └── addNodeToExistingEtcdCluster(cfg, etcdPeerAddress)
+  │           ├── 通过 mccs 获取 K8s Client
+  │           ├── etcd.NewFromCluster() 创建 etcd 客户端
+  │           ├── ListMembers() 列出现有成员
+  │           ├── 检查成员是否已存在
+  │           │   ├── 已存在 → 直接使用现有成员列表
+  │           │   └── 不存在 → AddMember() 添加新成员
+  │           └── 设置 EtcdInitialCluster 到 cfg.Extra
+  └── renderEtcdYaml(c, cfg)       ← 渲染 etcd YAML
+      ├── 读取 tmpl/k8s/etcd.yaml.tmpl 模板
+      ├── 设置 EtcdAdvertiseUrls
+      └── 使用 etcdFuncMap() 渲染模板并写入文件
+```
+**初始化模式（Init=true）**：
+- 仅设置当前节点为唯一的 `EtcdInitialCluster` 成员
+- etcd 以 `--initial-cluster-state=new` 启动（模板中省略该参数，默认 new）
+
+**加入模式（Init=false）**：
+- 通过 `clientutil.ClientSetFromManagerClusterSecret()` 获取管理集群的 K8s Client
+- 使用 `etcd.NewFromCluster()` 创建 etcd 客户端（复用 kubeadm 的 etcd 工具包）
+- 调用 `ListMembers()` 获取当前集群成员列表
+- **幂等性保证**：先检查成员是否已存在，避免重复添加
+- 调用 `AddMember()` 向现有集群添加新成员
+- 模板中设置 `--initial-cluster-state=existing`
+### 阶段 4：etcd Static Pod YAML 模板渲染
+**模板文件**: [etcd.yaml.tmpl](file:///d:/code/github/cluster-api-provider-bke/utils/bkeagent/mfutil/tmpl/k8s/etcd.yaml.tmpl)
+
+生成的 Pod 关键配置：
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  annotations:
+    kubeadm.kubernetes.io/etcd.advertise-client-urls: {{ . | etcdAdvertiseUrls }}
+  labels:
+    component: etcd
+    tier: control-plane
+  name: etcd
+spec:
+  containers:
+  - command:
+    - etcd
+    - --advertise-client-urls=https://{{ .HostIP }}:2379
+    - --cert-file={{ .BkeConfig.Cluster.CertificatesDir }}/etcd/server.crt
+    - --client-cert-auth=true
+    - --data-dir=/var/lib/openFuyao/etcd
+    - --initial-advertise-peer-urls=https://{{ .HostIP }}:2380
+    - --initial-cluster={{ .Extra.EtcdInitialCluster | initialCluster }}
+    {{- if not .Extra.Init }}
+    - --initial-cluster-state=existing    ← 加入已有集群时设置
+    {{- end }}
+    - --key-file=.../etcd/server.key
+    - --listen-client-urls=https://127.0.0.1:2379,https://{{ .HostIP }}:2379
+    - --listen-metrics-urls=http://{{ .HostIP }}:2381
+    - --listen-peer-urls=https://{{ .HostIP }}:2380
+    - --name={{ .HostName }}
+    - --peer-cert-file=.../etcd/peer.crt
+    - --peer-client-cert-auth=true
+    - --peer-key-file=.../etcd/peer.key
+    - --peer-trusted-ca-file=.../etcd/ca.crt
+    - --trusted-ca-file=.../etcd/ca.crt
+    - --auto-compaction-retention=1
+    image: {{ imageRepo }}/etcd:{{ etcdVersion }}
+    livenessProbe:
+      httpGet:
+        path: /health
+        port: 2381
+        scheme: HTTP
+  hostNetwork: true
+  priorityClassName: system-cluster-critical
+  volumes:
+  - hostPath: {path: /etc/kubernetes/pki/etcd, type: DirectoryOrCreate}
+  - hostPath: {path: /var/lib/openFuyao/etcd, type: DirectoryOrCreate}
+```
+**etcdFuncMap 模板函数**（[render.go#etcdFuncMap()](file:///d:/code/github/cluster-api-provider-bke/utils/bkeagent/mfutil/render.go)）：
+
+| 函数名 | 功能 |
+|--------|------|
+| `initialCluster` | 将 `[]etcd.Member` 格式化为 `name=peerURL,name2=peerURL2` |
+| `imageInfo` | 生成 etcd 镜像标签（优先使用 `BkeConfig.Cluster.EtcdVersion`，否则用默认值） |
+| `dataDir` | 获取 etcd 数据目录（节点级 > 集群级 > 默认值） |
+| `etcdAdvertiseUrls` | 获取 etcd 广播 URL |
+| `extraArgs` | 获取 etcd 额外参数（节点级 > 集群级） |
+
+**输出路径**: `/etc/kubernetes/manifests/etcd.yaml`
+### 阶段 5：Master Join 流程
+**入口**: [kubeadm.go#joinControlPlane()](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/kubeadm/kubeadm.go#L198)
+```
+joinControlPlane() 执行顺序：
+  ① installKubectlCommand()
+  ② joinControlPlaneCertCommand()     → 加载目标集群所有证书
+  ③ installKubeletCommand()           → 安装并启动 Kubelet
+  ④ joinControlPlaneManifestCommand() → 生成 Static Pod YAML ← 核心
+  ⑤ uploadUserCustomConfigAndGlobalCA()
+```
+
+**与 Init 的关键区别**：
+- `Init=false`：触发 `addNodeToExistingEtcdCluster()` 逻辑
+- 证书通过 `loadTargetClusterCert=true` 从管理集群 Secret 加载
+- 先启动 Kubelet（步骤③），再渲染 Manifest（步骤④）
+### 阶段 6：etcd 升级流程
+**入口**: [kubeadm.go#upgradeEtcd()](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/kubeadm/kubeadm.go#L353)
+```
+upgradeEtcd() 执行顺序：
+  ① prepareUpgrade()
+  │   ├── backupEtcd()           → etcd 数据备份
+  │   ├── backupClusterEtc()     → 备份 /etc/kubernetes
+  │   ├── upgradePrePullImageCommand() → 预拉取镜像
+  │   └── getBeforeUpgradeComponentPodHash() → 获取升级前 Pod Hash
+  ② needUpgradeEtcd()           → 检查是否需要升级（对比镜像 tag）
+  ③ upgradeControlPlaneManifestCommand("etcd") → 重新渲染 etcd YAML
+  ④ waitComponentReady("etcd")  → 等待 etcd Pod 就绪
+```
+**etcd 备份实现**（[command.go#backupEtcd()](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/kubeadm/command.go)）：
+```go
+func (k *KubeadmPlugin) backupEtcd() error {
+    // 1. 从 admin.conf 创建 K8s Client
+    client, _ := kubeadmutil.ClientSetFromFile(pkiutil.GetDefaultKubeConfigPath())
+    
+    // 2. 创建 etcd 客户端
+    etcdClient, _ := etcd.NewFromCluster(client, certDir)
+    
+    // 3. 生成备份文件路径
+    backupName := fmt.Sprintf("backup-%s.db", time.Now().Format("0601021504"))
+    backupPath := filepath.Join(utils.Workspace, "etcd-backup", backupName)
+    
+    // 4. 调用 bkeetcd.Save() 执行快照
+    return bkeetcd.Save(etcdClient, backupPath)
+}
+```
+**etcd 快照实现**（[etcd.go#Save()](file:///d:/code/github/cluster-api-provider-bke/utils/bkeagent/etcd/etcd.go)）：
+- 使用 `go.etcd.io/etcd/client/v3/snapshot` 包
+- 4 分钟超时
+- 通过 TLS 安全连接
+
+**升级等待机制**（`waitComponentReady`）：
+1. 轮询等待 Static Pod Hash 变化（说明新 Pod 已创建）
+2. 轮询等待 Pod 状态变为 `Running`
+### 阶段 7：Control Plane 升级（含 etcd）
+**入口**: [kubeadm.go#upgradeControlPlane()](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/kubeadm/kubeadm.go#L276)
+
+升级顺序为逐个组件升级（不含 etcd）：
+```
+kube-apiserver → kube-controller-manager → kube-scheduler → kubelet → kubectl
+```
+注意：`upgradeControlPlane` 默认不升级 etcd，etcd 升级需要单独调用 `upgradeEtcd` 阶段。
+### 阶段 8：节点重置/清理
+**入口**: [reset.go](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/reset/reset.go) → [clean.go](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/reset/clean.go)
+
+etcd 相关的清理分布在两个 Phase 中：
+
+**ManifestsClean** — 清理 Static Pod YAML：
+```go
+extra.AddDirToClean(mfutil.HAProxyConfPath)
+extra.AddDirToClean(mfutil.KeepAlivedConfPath)
+extra.AddDirToClean(cfg.Cluster.Kubelet.ManifestsDir)  // /etc/kubernetes/manifests
+```
+
+**ExtraToClean** — 清理 etcd 数据：
+```go
+extra.AddDirToClean("/etc/kubernetes")
+extra.AddDirToClean(cfg.Cluster.Etcd.DataDir)  // /var/lib/openFuyao/etcd
+```
+**注意**：BKE 的 Reset 流程中 **没有 etcd 成员移除操作**（`RemoveMember`），这是一个设计缺陷——节点被移除后，etcd 集群中仍保留该成员记录。
+## 三、关键数据流
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                    etcd Static Pod 数据流                                │
+│                                                                          │
+│  BKECluster CR                                                           │
+│      │                                                                   │
+│      ▼                                                                   │
+│  BKEConfig (ConfigMap)                                                   │
+│      │  包含: EtcdVersion, Etcd.DataDir, Etcd.ExtraArgs,                 │
+│      │        Etcd.ServerCertSANs, Etcd.PeerCertSANs,                    │
+│      │        CertificatesDir, ImageRepo, KubernetesVersion              │
+│      ▼                                                                   │
+│  BootScope (运行时上下文)                                                │
+│      │  包含: HostIP, HostName, CurrentNode, Extra[Init],                │
+│      │        Extra[mccs], Extra[EtcdInitialCluster],                    │
+│      │        Extra[EtcdAdvertiseUrls]                                   │
+│      ▼                                                                   │
+│  handleEtcdMembership()                                                  │
+│      │  Init=true:  EtcdInitialCluster = [{self}]                        │
+│      │  Init=false: EtcdInitialCluster = ListMembers() + AddMember()     │
+│      ▼                                                                   │
+│  renderEtcdYaml()                                                        │
+│      │  模板: tmpl/k8s/etcd.yaml.tmpl                                    │
+│      │  函数: initialCluster, imageInfo, dataDir, etcdAdvertiseUrls      │
+│      ▼                                                                   │
+│  /etc/kubernetes/manifests/etcd.yaml                                     │
+│      │                                                                   │
+│      ▼                                                                   │
+│  Kubelet 监听 → 创建 Static Pod → etcd 容器运行                          │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+## 四、关键配置参数
+| 参数 | 默认值 | 来源 |
+|------|--------|------|
+| etcd 数据目录 | `/var/lib/openFuyao/etcd` | [consts.go](file:///d:/code/github/cluster-api-provider-bke/utils/bkeagent/mfutil/consts.go) |
+| etcd 客户端端口 | `2379` | [etcd/consts.go](file:///d:/code/github/cluster-api-provider-bke/utils/bkeagent/etcd/consts.go) |
+| etcd Peer 端口 | `2380` | [etcd/consts.go](file:///d:/code/github/cluster-api-provider-bke/utils/bkeagent/etcd/consts.go) |
+| etcd Metrics 端口 | `2381` | 模板硬编码 |
+| etcd 证书目录 | `/etc/kubernetes/pki/etcd` | [consts.go](file:///d:/code/github/cluster-api-provider-bke/utils/bkeagent/pkiutil/consts.go) |
+| Manifest 输出目录 | `/etc/kubernetes/manifests` | [consts.go](file:///d:/code/github/cluster-api-provider-bke/utils/bkeagent/mfutil/consts.go) |
+## 五、与 kubeadm 的复用关系
+BKE 虽然不依赖 kubeadm 二进制，但复用了 kubeadm 的以下 SDK 组件：
+
+| 复用组件 | 包路径 | 用途 |
+|---------|--------|------|
+| `k8setcd.Client` | `k8s.io/kubernetes/cmd/kubeadm/app/util/etcd` | etcd 集群操作（ListMembers, AddMember, NewFromCluster） |
+| `etcd.GetPeerURL()` | 同上 | 生成 Peer URL |
+| `etcd.GetClientURLByIP()` | 同上 | 生成 Client URL |
+| `etcd.Member` | 同上 | 成员数据结构 |
+| `kubeadmapi.APIEndpoint` | `k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm` | API 端点结构 |
+| `snapshot.Save()` | `go.etcd.io/etcd/client/v3/snapshot` | etcd 快照（通过 kubeadm Client 间接使用） |
+## 六、流程总结图
+```
+                    ┌─────────────────────────────────────┐
+                    │         Controller 侧               │
+                    │                                     │
+                    │  EnsureCerts                        │
+                    │    └→ 生成 etcd CA + 5 组证书        │
+                    │       上传到 Manager Cluster Secret  │
+                    │                                     │
+                    │  EnsureMasterInit                   │
+                    │    └→ 下发 Bootstrap Command         │
+                    │       phase=initControlPlane         │
+                    │                                     │
+                    │  EnsureMasterJoin                   │
+                    │    └→ 下发 Bootstrap Command         │
+                    │       phase=joinControlPlane         │
+                    └──────────────┬──────────────────────┘
+                                   │
+                    ┌──────────────▼──────────────────────┐
+                    │         Agent 侧                    │
+                    │                                     │
+                    │  Init 流程:                          │
+                    │  Cert → Manifest → Kubelet           │
+                    │    │       │                         │
+                    │    │       ├→ setupEtcdEnvironment   │
+                    │    │       │  (mkdir, useradd, chown)│
+                    │    │       │                         │
+                    │    │       ├→ handleEtcdMembership   │
+                    │    │       │  Init=true: 单节点初始化 │
+                    │    │       │                         │
+                    │    │       └→ renderEtcdYaml         │
+                    │    │          --initial-cluster-state│
+                    │    │          = new (默认)            │
+                    │    │                                 │
+                    │  Join 流程:                          │
+                    │  Cert → Kubelet → Manifest           │
+                    │                  │                   │
+                    │                  ├→ setupEtcdEnvironment              │
+                    │                  ├→ handleEtcdMembership              │
+                    │                  │  Init=false:                       │
+                    │                  │  ListMembers → AddMember           │
+                    │                  │                                    │
+                    │                  └→ renderEtcdYaml                    │
+                    │                     --initial-cluster-state=existing │
+                    │                                                     │
+                    │  Upgrade 流程:                                       │
+                    │  backupEtcd → prePull → needUpgrade → render → wait │
+                    │                                                     │
+                    │  Reset 流程:                                         │
+                    │  清理 manifests/ + etcd data dir                     │
+                    │  ⚠️ 无 RemoveMember 操作                             │
+                    └─────────────────────────────────────────────────────┘
+```
+## 七、设计特点与缺陷
+### 设计特点
+1. **模板驱动**：使用 Go embed + text/template 渲染 etcd YAML，灵活可控
+2. **幂等性**：加入集群时先检查成员是否已存在，避免重复添加
+3. **节点级配置覆盖**：etcd DataDir、ExtraArgs 支持节点级 > 集群级优先级
+4. **安全运行**：以 etcd 系统用户运行，数据目录权限 700
+5. **复用 kubeadm SDK**：etcd 客户端操作复用 kubeadm 的 `util/etcd` 包
+### 已识别缺陷
+1. **无 etcd 成员移除**：Reset 流程只清理数据目录和 Manifest，不移除 etcd 集群成员
+2. **无 etcd 健康检查等待**：Init/Join 后不等待 etcd 真正就绪就继续后续步骤
+3. **etcd 数据目录硬编码**：模板中 `/var/lib/openFuyao/etcd` 硬编码，与 `dataDir` 函数不一致
+4. **无 etcd 证书轮换**：没有证书自动轮换机制
+5. **升级无滚动策略**：etcd 升级是单节点操作，无多节点滚动升级编排
+
+# BKE 的 etcd 节点部署策略分析
+## 结论：etcd 不是固定部署在所有 master 节点上，而是由用户通过节点 Role 配置灵活指定
+BKE 的 etcd 部署采用 **基于节点 Role 的灵活指定策略**，而非固定绑定到 master 节点。
+## 一、节点 Role 体系
+BKE 定义了 4 种节点角色（[node.go](file:///d:/code/github/cluster-api-provider-bke/common/cluster/node/node.go#L29-L33)）：
+```go
+WorkerNodeRole       = "node"           // Worker 节点
+MasterNodeRole       = "master"         // Master 节点
+EtcdNodeRole         = "etcd"           // Etcd 节点
+MasterWorkerNodeRole = "master/node"    // Master+Worker 混合节点
+```
+一个节点可以拥有 **多个 Role**，etcd 的部署完全取决于节点是否被分配了 `etcd` 角色。
+## 二、默认配置：etcd 与 Master 共存
+从默认节点配置（[export.go](file:///d:/code/github/cluster-api-provider-bke/common/cluster/initialize/export.go#L116-L118)）可以看到：
+```go
+newNode(defaultMaster1IP, "master-1", []string{node.MasterNodeRole, node.EtcdNodeRole}),
+newNode(defaultMaster2IP, "master-2", []string{node.MasterNodeRole, node.EtcdNodeRole}),
+newNode(defaultMaster3IP, "master-3", []string{node.MasterNodeRole, node.EtcdNodeRole}),
+```
+**默认情况下**，etcd 部署在所有 master 节点上（每个 master 同时拥有 `master` + `etcd` 角色），这是最常见的拓扑模式。
+## 三、验证规则：etcd 节点数必须 ≥ 1
+[validation.go](file:///d:/code/github/cluster-api-provider-bke/common/cluster/validation/validation.go#L207-L218) 中的校验逻辑：
+```go
+func validateRequiredNodes(nodes node.Nodes) error {
+    // 1. Master 节点数必须为奇数
+    masterNodes := nodes.Master()
+    if masterNodes.Length()%2 == 0 {
+        return MasterNodeOddError()
+    }
+    // 2. Etcd 节点数必须 ≥ 1
+    etcdNodes := nodes.Etcd()
+    if etcdNodes.Length() == 0 {
+        return NoEtcdNodeError()
+    }
+    return nil
+}
+```
+关键约束：
+- **Master 节点数必须为奇数**（1, 3, 5...）
+- **Etcd 节点数只需 ≥ 1**（没有奇数约束！）
+- Worker 节点 **不能** 同时拥有 `etcd` 角色（互斥校验）
+## 四、Role 互斥规则
+[validation.go](file:///d:/code/github/cluster-api-provider-bke/common/cluster/validation/validation.go#L192-L196) 中的互斥校验：
+
+| Role 组合 | 是否允许 | 说明 |
+|-----------|---------|------|
+| `master` + `etcd` | ✅ 允许 | 默认模式 |
+| `master/node` + `etcd` | ✅ 允许 | MasterWorker + Etcd |
+| `node` + `etcd` | ❌ 禁止 | Worker 不能同时是 Etcd |
+| `master` + `etcd` + `master/node` | ❌ 禁止 | 三者不能同时存在 |
+
+**这意味着 etcd 只能部署在 master 类节点上，不能部署在纯 worker 节点上。**
+## 五、运行时判断：按 Role 过滤
+在 Manifest 渲染阶段（[manifest.go#L65-L71](file:///d:/code/github/cluster-api-provider-bke/utils/bkeagent/mfutil/manifest.go#L65)），BKE 通过 Role 过滤决定是否在当前节点渲染 etcd Static Pod：
+```go
+// 判断当前节点是否是 etcd 节点
+flag := nodes.Filter(bkenode.FilterOptions{
+    "Role": bkenode.EtcdNodeRole, 
+    "IP": boot.HostIP,
+}).Length() == 1
+
+for _, component := range components {
+    // 如果当前节点不是 etcd 节点，跳过 etcd YAML 渲染
+    if component.Name == Etcd && !flag {
+        log.Infof("the node %q is not an etcd node, skip generate etcd static pod yaml", hostName)
+        continue
+    }
+    component.RenderFunc(component, boot)
+}
+```
+## 六、自动发现：Collector 自动标记 etcd 角色
+[collector.go](file:///d:/code/github/cluster-api-provider-bke/pkg/kube/collector.go#L174-L181) 中，BKE 还会通过检测节点上是否存在 etcd Pod 来自动标记 etcd 角色：
+```go
+func (c *Collector) checkEtcdRole(bkeNode confv1beta1.Node) confv1beta1.Node {
+    _, err := c.client.GetPod(metav1.NamespaceSystem, StaticPodName(mfutil.Etcd, bkeNode.Hostname))
+    if err == nil {
+        bkeNode.Role = append(bkeNode.Role, bkenode.EtcdNodeRole)
+    }
+    return bkeNode
+}
+```
+## 七、支持的拓扑模式
+根据以上分析，BKE 支持以下 etcd 部署拓扑：
+### 模式 1：Stacked etcd（默认，推荐）
+```
+master-1: [master, etcd]  ← etcd 与控制平面共存
+master-2: [master, etcd]
+master-3: [master, etcd]
+worker-1: [node]
+worker-2: [node]
+```
+- etcd 节点数 = master 节点数（奇数）
+- 默认 3 节点 etcd 集群
+### 模式 2：部分 Master 部署 etcd
+```
+master-1: [master, etcd]  ← 仅部分 master 运行 etcd
+master-2: [master, etcd]
+master-3: [master]         ← 此 master 不运行 etcd
+worker-1: [node]
+```
+- 理论上支持（etcd 节点数只需 ≥ 1），但实际不推荐
+- etcd 节点数应保持奇数以保证仲裁
+### 不支持的模式：External etcd
+```
+etcd-1:   [etcd]           ← ❌ 纯 etcd 节点不被支持
+etcd-2:   [etcd]           ← 因为 etcd 不能独立于 master 存在
+etcd-3:   [etcd]           ← Worker+Etcd 互斥，纯 Etcd 角色无 master 功能
+master-1: [master]
+```
+- BKE **不支持** 独立的外部 etcd 集群拓扑
+- 因为 `etcd` 角色必须与 `master` 或 `master/node` 组合使用
+## 八、总结
+| 问题 | 答案 |
+|------|------|
+| etcd 部署几个节点？ | 由用户通过节点 Role 配置决定，默认 3 个 |
+| 在所有 master 上都安装吗？ | 默认是，但不是强制的——可以只在部分 master 上部署 |
+| 还是指定安装的节点个数？ | 通过给节点分配 `etcd` Role 来指定，不是直接指定个数 |
+| etcd 节点数有奇数约束吗？ | Master 节点数必须奇数，但 etcd 节点数本身只要求 ≥ 1 |
+| 支持外部 etcd 吗？ | 不支持，etcd 必须与 master 角色共存 |
+
+**核心设计理念**：BKE 采用 **Stacked etcd** 拓扑（etcd 与控制平面共存），通过节点 Role 灵活控制 etcd 的部署位置，而非硬编码节点数量。
+
