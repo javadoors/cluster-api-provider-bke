@@ -4975,3 +4975,1061 @@ Status: {
 | **状态隔离** | Status 以 `NodeName/NodeIP` 为 key，多节点各自回写互不冲突 |
 | **冲突处理** | `syncStatusUntilComplete` 先 Get 最新版本再 Patch，遇到 Conflict 重试 |
 
+# 全面掌握 `pkg/job` 的设计
+## `pkg/job` 的作用及设计思路
+### 一、核心作用
+`pkg/job` 是 **BKEAgent 端的命令执行引擎**，负责将 `Command` CRD 中声明的指令解析、路由并执行到具体操作。它是管理集群"声明式意图"与工作节点"命令式执行"之间的桥梁。
+```
+管理集群声明意图                Agent 端执行意图
+┌──────────────┐            ┌──────────────────┐
+│ Command CRD  │  ──Watch──►│   pkg/job        │
+│ spec.commands│            │   命令执行引擎    │
+│   [{Type,    │            │   解析→路由→执行  │
+│     Command}]│            └──────────────────┘
+└──────────────┘
+```
+### 二、分层架构
+```
+pkg/job/
+├── job.go                          ← 顶层入口：Job 聚合 + Task 生命周期
+├── builtin/                        ← BuiltIn 类型命令的执行层
+│   ├── builtin.go                  ← 插件注册表 + 路由分发
+│   ├── plugin/                     ← 插件框架（接口 + 参数解析 + 集群数据获取）
+│   │   └── interface.go
+│   ├── kubeadm/                    ← K8s 集群相关操作（最大子域）
+│   │   ├── env/                    ← 环境初始化/检查
+│   │   ├── certs/                  ← 证书管理
+│   │   ├── kubelet/                ← Kubelet 配置
+│   │   ├── kubeadm.go             ← Kubeadm 操作
+│   │   ├── manifests/              ← 静态 Pod 清单
+│   │   └── command.go             ← Kubeadm 命令拼接
+│   ├── containerruntime/           ← 容器运行时
+│   │   ├── containerd/             ← Containerd 安装配置
+│   │   ├── docker/                 ← Docker 安装配置
+│   │   └── cridocker/             ← cri-dockerd 安装
+│   ├── reset/                      ← 节点重置/清理
+│   ├── ha/                         ← HA 负载均衡（haproxy+keepalived）
+│   ├── switchcluster/              ← 集群切换
+│   ├── downloader/                 ← 文件下载
+│   ├── collect/                    ← 信息采集
+│   ├── backup/                     ← 备份
+│   ├── ping/                       ← 连通性检测
+│   ├── shutdown/                   ← 节点关机
+│   ├── selfupdate/                 ← Agent 自更新
+│   ├── preprocess/                 ← 前置处理脚本
+│   ├── postprocess/                ← 后置处理脚本
+│   └── scriptutil/                 ← 脚本工具（渲染、落盘）
+├── k8s/                            ← Kubernetes 类型命令的执行层
+│   └── k8s.go                      ← ConfigMap/Secret 读写执行
+└── shell/                          ← Shell 类型命令的执行层
+    └── shell.go                    ← /bin/sh -c 执行
+```
+### 三、核心设计思路
+#### 1. 三类执行器 — 按命令类型分治
+[job.go](file:///d:/code/github/cluster-api-provider-bke/pkg/job/job.go) 中 `Job` 聚合了三种执行器：
+```go
+type Job struct {
+    BuiltIn builtin.BuiltIn   // 内置插件执行器
+    K8s     k8s.K8s           // K8s 资源操作执行器
+    Shell   shell.Shell       // Shell 命令执行器
+    Task    map[string]*Task  // 运行中任务的生命周期管理
+}
+```
+三种执行器对应 `CommandSpec.Commands[].Type` 的三种值：
+
+| Type | 执行器 | 命令格式 | 典型场景 |
+|------|--------|----------|----------|
+| `BuiltIn` | `builtin.Task` | `[插件名, key=value, ...]` | 环境初始化、重置、HA部署 |
+| `Shell` | `shell.Task` | `[cmd, arg1, arg2, ...]` | 自定义Shell命令 |
+| `Kubernetes` | `k8s.Task` | `[type:ns/name:op:path]` | ConfigMap/Secret读写 |
+#### 2. 插件注册表 — 开放封闭原则
+[builtin.go](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/builtin.go) 的核心设计：
+```go
+var pluginRegistry = map[string]plugin.Plugin{}
+
+func New(exec exec.Executor, k8sClient client.Client) BuiltIn {
+    // 注册所有插件
+    pluginRegistry[strings.ToLower(env.New(exec,nil).Name())] = env.New(exec,nil)
+    pluginRegistry[strings.ToLower(reset.New().Name())] = reset.New()
+    pluginRegistry[strings.ToLower(ha.New(exec).Name())] = ha.New(exec)
+    // ... 共 18 个插件
+}
+
+func (t *Task) Execute(execCommands []string) ([]string, error) {
+    // Command[0] 作为路由 key
+    if v, ok := pluginRegistry[strings.ToLower(execCommands[0])]; ok {
+        return v.Execute(execCommands)
+    }
+    return nil, errors.Errorf("Instruction not found")
+}
+```
+**设计优势**：
+- **对扩展开放**：新增功能只需实现 `Plugin` 接口并在 `New()` 中注册一行
+- **对修改封闭**：路由逻辑不变，已有插件不受影响
+- **大小写不敏感**：`strings.ToLower` 确保命令名容错
+#### 3. Plugin 接口 — 统一契约
+[interface.go](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/plugin/interface.go) 定义了插件三要素：
+```go
+type Plugin interface {
+    Name() string                                    // 身份标识（路由key）
+    Param() map[string]PluginParam                   // 参数契约（自描述）
+    Execute(commands []string) ([]string, error)     // 执行入口
+}
+```
+**`Param()` 自描述机制**是关键设计——每个插件声明自己需要什么参数、哪些必填、默认值是什么。`ParseCommands` 统一做校验和填充：
+```go
+func ParseCommands(plugin Plugin, commands []string) (map[string]string, error) {
+    // 1. 解析 commands[1:] 为 key=value
+    // 2. 与 plugin.Param() 比对
+    //    - 有传入值 → 使用传入值
+    //    - 无传入值 + Required → 报错
+    //    - 无传入值 + 非Required → 使用 Default
+}
+```
+#### 4. 集群数据获取 — 按需加载
+插件通过 `bkeConfig=ns:name` 参数按需获取集群配置，而不是在初始化时全量注入：
+```go
+// 插件内部按需获取
+if envParamMap["bkeConfig"] != "" {
+    ep.bkeConfig = plugin.GetBkeConfig(envParamMap["bkeConfig"])
+    ep.nodes = plugin.GetClusterData(envParamMap["bkeConfig"]).Nodes
+    ep.currenNode = ep.nodes.CurrentNode()
+}
+```
+`plugin` 包提供了统一的集群数据获取工具：
+
+| 函数 | 作用 |
+|------|------|
+| `GetBkeConfig(ns:name)` | 获取 BKEConfig（集群配置） |
+| `GetClusterData(ns:name)` | 获取 ClusterData（集群+节点列表） |
+| `GetNodesData(ns:name)` | 获取节点列表 |
+| `GetContainerdConfig(ns:name)` | 获取 Containerd 配置 |
+
+这些函数通过 Agent 本地的 kubeconfig 连接管理集群的 API Server 获取数据。
+#### 5. Task 生命周期管理
+[job.go](file:///d:/code/github/cluster-api-provider-bke/pkg/job/job.go) 中的 `Task` 管理命令执行的生命周期：
+```go
+type Task struct {
+    StopChan                chan struct{}        // 停止信号（支持暂停/取消）
+    Phase                   v1beta1.CommandPhase // 当前阶段
+    ResourceVersion         string               // 版本控制（防止旧版本覆盖新版本）
+    Generation              int64                // 代次控制
+    TTLSecondsAfterFinished int                  // 完成后自动清理
+    HasAddTimer             bool                 // 是否已设置清理定时器
+    Once                    *sync.Once           // 确保 StopChan 只关闭一次
+}
+```
+**关键设计**：
+- `StopChan`：支持命令暂停和取消，`SafeClose` 用 `sync.Once` 防止重复关闭
+- `ResourceVersion + Generation`：版本控制，确保只执行最新版本的命令
+- `TTLSecondsAfterFinished`：命令完成后自动清理，避免资源残留
+#### 6. 插件可嵌套调用
+插件之间可以互相调用，形成组合能力。例如 `K8sEnvInit` 的 `initRuntime` 内部调用了 `containerd`、`docker`、`cri-docker` 等插件：
+```go
+func (ep *EnvPlugin) initRuntime() error {
+    // ...
+    // 直接调用 containerd 插件
+    cp := containerdPlugin.New(ep.exec)
+    cp.Execute([]string{"Containerd", "url=...", "sandbox=...", ...})
+
+    // 直接调用 docker 插件
+    dp := dockerPlugin.New(ep.exec)
+    dp.Execute([]string{"Docker", "runtime=...", "dataRoot=...", ...})
+
+    // 直接调用 cri-docker 插件
+    cdp := cridocker.New(ep.exec)
+    cdp.Execute([]string{"CriDocker", "sandbox=...", "criDockerdUrl=...", ...})
+}
+```
+这种设计让插件既能通过 `pluginRegistry` 被路由调用，也能被其他插件直接实例化调用。
+#### 7. Reset 的 Phase 模式
+[reset/cleanphases.go](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/reset/cleanphases.go) 采用了清理阶段模式：
+```go
+func DefaultCleanPhases() CleanPhases {
+    return CleanPhases{
+        CleanKubeletPhase(),          // 清理 Kubelet
+        CleanContainerdCfgPhase(),    // 清理 Containerd 配置
+        CleanContainerPhase(),        // 清理容器
+        CleanContainerRuntimePhase(), // 清理容器运行时
+        CleanCertPhase(),             // 清理证书
+        CleanManifestsPhase(),        // 清理静态 Pod
+        CleanSourcePhase(),           // 清理软件源
+        CleanExtraPhase(),            // 清理额外文件
+        CleanGlobalCertPhase(),       // 清理全局证书
+    }
+}
+```
+每个 `CleanPhase` 有 `Name`（与 `scope` 参数对应）和 `CleanFunc`，通过 `scope` 参数选择性执行，实现了清理操作的灵活组合。
+#### 8. Preprocess/Postprocess — 用户脚本扩展
+[preprocess](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/preprocess/preprocess.go) 和 [postprocess](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/postprocess/postprocess.go) 提供了用户自定义脚本的扩展能力：
+- 脚本存储在管理集群的 `ConfigMap` 中（`user-system` 命名空间）
+- 支持三级配置优先级：**全局 > 批次 > 节点**（互斥不合并）
+- 脚本支持参数模板渲染（`${NODE_IP}`, `${HTTP_REPO}` 等）
+- 参数白名单校验防止注入攻击
+- 脚本渲染后落盘再执行，确保可审计
+### 四、设计思路总结
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      pkg/job 设计思路                           │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  1. 分层分治：Job → 三类执行器 → 具体实现                       │
+│     按 CommandType 横向切分，每类有独立的解析和执行逻辑         │
+│                                                                 │
+│  2. 插件注册表：pluginRegistry 实现路由与实现解耦               │
+│     新增功能 = 实现 Plugin 接口 + 注册一行                      │
+│                                                                 │
+│  3. 自描述参数：Param() 声明参数契约                            │
+│     ParseCommands 统一校验+填充，插件无需关心参数解析           │
+│                                                                 │
+│  4. 按需加载：bkeConfig 参数驱动集群数据获取                    │
+│     插件按需从管理集群获取配置，而非初始化时全量注入            │
+│                                                                 │
+│  5. 可嵌套调用：插件间可直接实例化调用                          │
+│     K8sEnvInit 内部调用 Containerd/Docker/CriDocker 插件        │
+│                                                                 │
+│  6. 生命周期管理：Task + StopChan + Generation                  │
+│     支持暂停/取消/版本控制/自动清理                             │
+│                                                                 │
+│  7. Phase 模式：Reset 的 CleanPhases 按 scope 选择性执行        │
+│     灵活组合清理操作                                            │
+│                                                                 │
+│  8. 用户扩展：Preprocess/Postprocess 支持自定义脚本             │
+│     三级配置优先级 + 参数渲染 + 安全校验                        │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+# 全面掌握 `env.go` 及其关联文件的设计
+## `env.go` 的规格与设计思路
+### 一、文件定位
+[env.go](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/kubeadm/env/env.go) 是 `K8sEnvInit` 插件的**规格定义与入口文件**，它定义了插件的身份、参数契约、数据结构和执行入口，而将具体的初始化逻辑和检查逻辑分别委托给 [init.go](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/kubeadm/env/init.go) 和 [check.go](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/kubeadm/env/check.go)。
+
+整个 `env` 包的文件职责划分：
+
+| 文件 | 职责 |
+|------|------|
+| `env.go` | 插件规格定义（名称、参数、常量、结构体）+ 执行入口 |
+| `init.go` | `initK8sEnv()` — 各 scope 的初始化实现 |
+| `check.go` | `checkK8sEnv()` — 各 scope 的检查实现 |
+| `machine.go` | `Machine` 结构体 — 主机信息采集 |
+| `hostfile.go` | `HostsFile` 封装 — hosts 文件读写 |
+| `centos.go` | CentOS 专用逻辑 — NetworkManager 配置 |
+| `utils.go` | 通用工具函数 — 文件搜索/替换/备份/MD5 |
+### 二、插件规格
+#### 2.1 身份标识
+```go
+const Name = "K8sEnvInit"
+```
+在 `pluginRegistry` 中以 `"k8senvinit"`（小写）注册，是 `Command.Command[0]` 的路由 key。
+#### 2.2 参数契约
+```go
+func (ep *EnvPlugin) Param() map[string]plugin.PluginParam
+```
+
+| 参数 | 必填 | 默认值 | 说明 |
+|------|------|--------|------|
+| `init` | 否 | `"true"` | 是否执行初始化 |
+| `check` | 否 | `"true"` | 是否执行检查 |
+| `sudo` | 否 | `"true"` | 是否使用 sudo 执行命令 |
+| `scope` | 否 | `"kernel,firewall,selinux,swap,time,hosts,runtime,image,node,ports"` | 操作范围 |
+| `backup` | 否 | `"true"` | 修改文件前是否备份 |
+| `extraHosts` | 否 | `""` | 额外 hosts 配置，格式 `hostname1:ip1,hostname2:ip2` |
+| `hostPort` | 否 | `"10259,10257,10250,2379,2380,2381,10248"` | 需检查的端口 |
+| `bkeConfig` | 否 | `""` | BKE 配置引用，格式 `ns:name` |
+
+**设计要点**：
+- 所有参数都是可选的，有合理默认值，最简调用只需 `["K8sEnvInit"]`
+- `bkeConfig` 虽然非必填，但在实际部署场景中总是提供的（用于获取集群配置和节点信息）
+- `scope` 是核心控制参数，决定了初始化/检查的范围
+#### 2.3 scope 完整枚举
+| scope | init 方法 | check 方法 | 说明 |
+|-------|-----------|------------|------|
+| `kernel` | `initKernelParam()` | `checkKernelParam()` | 内核参数+模块 |
+| `swap` | `initSwap()` | `checkSwap()` | 关闭 Swap |
+| `firewall` | `initFirewall()` | `checkFirewall()` | 关闭防火墙 |
+| `selinux` | `initSelinux()` | `checkSelinux()` | 关闭 SELinux |
+| `time` | `initTime()` | `checkTime()` | 时间同步 |
+| `hosts` | `initHost()` | `checkHost()` | hosts 文件 |
+| `runtime` | `initRuntime()` | `checkRuntime()` | 容器运行时 |
+| `image` | `initImage()` | — | 拉取镜像（仅 init） |
+| `node` | — | `checkNodeInfo()` | 节点资源检查（仅 check） |
+| `ports` | — | `checkHostPort()` | 端口检查（仅 check） |
+| `dns` | `initDNS()` | `checkDNS()` | DNS 配置 |
+| `httpRepo` | `initHttpRepo()` | [skip] | 软件源配置 |
+| `iptables` | `initIptables()` | — | iptables 策略（仅 init） |
+| `registry` | `initRegistry()` | — | 镜像仓库（仅 init） |
+| `extra` | `umask 0022` | — | 额外设置（已废弃，仅 umask） |
+### 三、数据结构设计
+#### 3.1 EnvPlugin 结构体
+```go
+type EnvPlugin struct {
+    // 依赖注入
+    exec      exec.Executor       // 命令执行器（系统命令）
+    k8sClient client.Client       // K8s 客户端（未在 env.go 中使用）
+
+    // 集群上下文（按需加载）
+    bkeConfig   *bkev1beta1.BKEConfig  // 集群配置
+    bkeConfigNS string                  // 配置命名空间标识
+    currenNode  bkenode.Node            // 当前节点信息
+    nodes       bkenode.Nodes           // 集群所有节点
+
+    // 执行参数（从 Command 解析）
+    sudo   string    // 是否 sudo
+    scope  string    // 操作范围
+    backup string    // 是否备份
+
+    // Hosts 相关
+    extraHosts   string    // 额外 hosts
+    clusterHosts []string  // 集群内 hosts（从 bkeConfig 动态构建）
+    hostPort     []string  // 检查端口列表
+
+    // 主机信息
+    machine *Machine    // 主机元数据
+}
+```
+**设计思路**：
+1. **依赖注入**：`exec` 和 `k8sClient` 通过 `New()` 构造函数注入，便于测试时替换为 Mock
+2. **按需加载**：`bkeConfig`、`currenNode`、`nodes` 不是在 `New()` 时注入，而是在 `Execute()` 时根据 `bkeConfig` 参数动态加载。这有两个好处：
+   - 插件可以在无集群配置的情况下工作（如仅做 `scope=node` 的硬件检查）
+   - 确保每次执行都获取最新的集群数据
+3. **参数字段化**：`sudo`、`scope`、`backup` 等从 Command 解析后存为结构体字段，供 `init.go` 和 `check.go` 中的方法直接访问，避免参数在方法间传递
+#### 3.2 内核参数的三层结构
+```go
+// 第一层：IP 模式相关参数
+var kernelParam = map[string]map[string]string{
+    "ipv4": { "net.ipv4.conf.all.rp_filter": "0", ... },
+    "ipv6": { "net.bridge.bridge-nf-call-ip6tables": "1", ... },
+}
+
+// 第二层：通用默认参数
+var defaultKernelParam = map[string]string{
+    "net.ipv4.ip_forward": "1",
+    "vm.max_map_count":    "262144",
+    ...
+}
+
+// 第三层：实际执行参数（合并后）
+var execKernelParam = map[string]string{}
+```
+`init()` 函数在包加载时将三层参数合并到 `execKernelParam`：
+```go
+func init() {
+    // 合并 ipv4 参数
+    for k, v := range kernelParam[DefaultIpMode] { execKernelParam[k] = v }
+    // 合并通用参数
+    for k, v := range defaultKernelParam { execKernelParam[k] = v }
+    // 动态添加网卡 rp_filter
+    face, _ := netutil.GetV4Interface()
+    execKernelParam[fmt.Sprintf("net.ipv4.conf.%s.rp_filter", face)] = "0"
+}
+```
+**设计思路**：
+- **分层合并**：IP 模式参数 → 通用参数 → 动态参数，逐层覆盖
+- **全局可变**：`execKernelParam` 是全局变量，`initKernelParam()` 中还会根据运行时条件（如 CentOS7+containerd、IPVS 模式）动态添加参数
+- **默认 IPv4**：`DefaultIpMode = "ipv4"`，当前只支持 IPv4，IPv6 参数已定义但未启用
+#### 3.3 文件路径常量
+```go
+// Init 路径 = 写入路径
+InitKernelConfPath  = "/etc/sysctl.d/k8s.conf"
+InitSwapConfPath    = "/etc/sysctl.d/k8s-swap.conf"
+InitSelinuxConfPath = "/etc/selinux/config"
+InitHostConfPath    = "/etc/hosts"
+InitDNSConfPath     = "/etc/resolv.conf"
+...
+
+// Check 路径 = 读取路径（部分与 Init 不同）
+CheckSwapConfPath = "/proc/meminfo"       // Swap 检查读 /proc/meminfo
+CheckHostConfPath = InitHostConfPath      // Host 检查读 /etc/hosts
+CheckDNSConfPath  = InitDNSConfPath       // DNS 检查读 /etc/resolv.conf
+```
+**设计思路**：Init 和 Check 路径分开定义，因为检查的来源不一定与写入目标一致（如 Swap 写 fstab 但检查读 /proc/meminfo）。
+### 四、Execute 入口设计
+```go
+func (ep *EnvPlugin) Execute(commands []string) ([]string, error) {
+    // 1. 解析参数
+    envParamMap, err := plugin.ParseCommands(ep, commands)
+
+    // 2. 填充执行参数到结构体
+    ep.sudo = envParamMap["sudo"]
+    ep.scope = envParamMap["scope"]
+    ep.backup = envParamMap["backup"]
+    ep.extraHosts = envParamMap["extraHosts"]
+    ep.hostPort = strings.Split(envParamMap["hostPort"], ",")
+    ep.machine = NewMachine()
+
+    // 3. 按需加载集群上下文
+    if envParamMap["bkeConfig"] != "" {
+        ep.bkeConfig = plugin.GetBkeConfig(envParamMap["bkeConfig"])
+        clusterData := plugin.GetClusterData(envParamMap["bkeConfig"])
+        ep.nodes = clusterData.Nodes
+        ep.currenNode = ep.nodes.CurrentNode()
+    }
+
+    // 4. 先 init 后 check
+    if envParamMap["init"] == "true" {
+        ep.initK8sEnv()
+    }
+    if envParamMap["check"] == "true" || envParamMap["init"] == "true" {
+        ep.checkK8sEnv()
+    }
+}
+```
+**关键设计决策**：
+1. **init 隐含 check**：当 `init=true` 时，即使 `check=false`，也会执行 `checkK8sEnv()`。这确保初始化后的状态一定经过验证，是一种防御性设计。
+2. **参数填充而非传递**：解析后的参数直接赋值到 `EnvPlugin` 字段，后续方法通过 `ep.scope`、`ep.backup` 等访问，避免在 `initK8sEnv → processInitScope → initXxx` 调用链中逐层传参。
+3. **Machine 每次重建**：`ep.machine = NewMachine()` 在每次 `Execute` 时重新创建，确保获取最新的主机信息（CPU、内存等可能动态变化）。
+### 五、scope 驱动的执行模型
+`initK8sEnv` 和 `checkK8sEnv` 都采用 **scope 驱动** 的执行模型：
+```
+initK8sEnv()
+  └── 遍历 strings.Split(ep.scope, ",")
+        └── processInitScope(scope)
+              ├── "kernel"   → initKernelParam()    → 返回 (err, kernelChanged=true)
+              ├── "swap"     → initSwap()            → 返回 (err, kernelChanged=true)
+              ├── "firewall" → initFirewall()        → 返回 (err, kernelChanged=false)
+              ├── ...        → initXxx()             → 返回 (err, kernelChanged=false)
+              └── default    → Warn + skip
+
+  └── if kernelChanged → sysctl -p 重新加载
+```
+**设计要点**：
+1. **kernelChanged 标志**：`kernel` 和 `swap` 两个 scope 会修改内核参数文件，需要 `sysctl -p` 重新加载。`processInitScope` 返回 `(error, bool)` 第二个值标识是否触发了内核变更。
+2. **容错策略不一致**：
+   - `kernel` scope 失败时仅 Warn 不返回错误（`log.Warnf("(ignore)init kernel parameters failed")`）
+   - 其他 scope 失败时返回错误，中断执行
+   - 这是因为内核参数初始化在某些环境下可能不成功但不影响后续操作
+3. **processSimpleInitScope 模板方法**：对于不需要特殊处理的 scope（大多数），统一通过 `processSimpleInitScope` 执行，减少重复代码：
+```go
+func (ep *EnvPlugin) processSimpleInitScope(logMsg string, initFunc func() error) error {
+    log.Infof(logMsg)
+    return initFunc()
+}
+```
+### 六、调用方视角 — 命令构建映射
+从 [command/env.go](file:///d:/code/github/cluster-api-provider-bke/pkg/command/env.go) 的调用方视角，`K8sEnvInit` 有三种典型调用场景：
+#### 场景1：硬件资源检查（首次部署前）
+```go
+Command: ["K8sEnvInit", "init=true", "check=true", "scope=node", "bkeConfig=ns:name"]
+// 仅检查节点 CPU/内存是否满足要求
+```
+#### 场景2：完整环境初始化（首次部署）
+```go
+Command: ["K8sEnvInit", "init=true", "check=true",
+    "scope=time,hosts,dns,kernel,firewall,selinux,swap,httpRepo,runtime,iptables,registry,extra",
+    "bkeConfig=ns:name", "extraHosts=hostname1:ip1,hostname2:ip2"]
+// 全量初始化 + 全量检查
+```
+#### 场景3：Containerd 重置/重部署
+```go
+// NewConatinerdReset
+Command: ["K8sEnvInit", "init=true", "check=false",
+    "scope=runtime", "bkeConfig=ns:name"]
+// 仅重新初始化容器运行时
+
+// NewConatinerdRedeploy
+Command: ["K8sEnvInit", "init=true", "check=true",
+    "scope=runtime", "bkeConfig=ns:name"]
+// 重新初始化容器运行时 + 检查
+```
+### 七、设计思路总结
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                     env.go 设计思路                                  │
+├──────────────────────────────────────────────────────────────────────┤
+│                                                                      │
+│  1. 规格与实现分离                                                   │
+│     env.go 定义规格（名称、参数、结构体、入口）                      │
+│     init.go / check.go 实现具体逻辑                                  │
+│     职责清晰，避免单文件膨胀                                         │
+│                                                                      │
+│  2. scope 驱动执行                                                   │
+│     用逗号分隔的 scope 字符串控制操作范围                            │
+│     支持灵活组合：全量初始化、部分初始化、仅检查                     │
+│     新增 scope 只需在 processInitScope/processCheckScope 加 case     │
+│                                                                      │
+│  3. init 隐含 check                                                  │
+│     init=true 时自动触发 check，确保初始化结果经过验证               │
+│     防御性设计，避免"初始化了但状态不对"的情况                       │
+│                                                                      │
+│  4. 参数字段化                                                       │
+│     解析后的参数存为 EnvPlugin 字段，方法间通过 ep 访问              │
+│     避免在深层调用链中逐层传参                                       │
+│                                                                      │
+│  5. 按需加载集群上下文                                               │
+│     bkeConfig 参数驱动，无配置时也能工作（如 scope=node）            │
+│     每次执行获取最新数据，避免缓存过期                               │
+│                                                                      │
+│  6. 内核参数三层合并                                                 │
+│     IP模式参数 → 通用参数 → 运行时动态参数                           │
+│     全局可变 execKernelParam，支持运行时追加                         │
+│                                                                      │
+│  7. kernelChanged 标志                                               │
+│     跟踪内核参数变更，统一在 initK8sEnv 末尾 sysctl -p               │
+│     避免每个 scope 重复执行 sysctl -p                                │
+│                                                                      │
+│  8. 容错分级                                                         │
+│     kernel scope 失败仅 Warn（环境差异大）                           │
+│     其他 scope 失败返回错误（必须成功）                              │
+│     体现了不同操作的关键性差异                                       │
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+# `ensure_cluster_api_obj.go`详细业务流程梳理
+## EnsureClusterAPIObj 业务流程梳理
+### 一、整体定位
+[ensure_cluster_api_obj.go](file:///d:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_cluster_api_obj.go) 是 BKECluster 部署流程中的一个关键阶段，负责**创建并等待 Cluster API 对象就绪**。它通过生成 CAPI（Cluster API）标准资源 YAML 并 Apply 到管理集群，使 BKECluster 与 CAPI 体系对接，从而让 CAPI 控制器接管集群生命周期管理。
+### 二、阶段定义
+```
+阶段名称: EnsureClusterAPIObj
+超时时间: 5 分钟
+轮询间隔: 2 秒
+```
+### 三、核心流程（Execute 方法）
+```
+Execute()
+  │
+  ├── 1. 判断是否需要创建 CAPI 对象
+  │     └── if BKECluster.OwnerReferences == nil → 调用 reconcileCreateClusterAPIObj()
+  │
+  ├── 2. 轮询等待 CAPI 对象就绪（5分钟超时，2秒间隔）
+  │     └── wait.PollImmediateUntil → reconcileClusterAPIObj()
+  │
+  ├── 3. 检查集群是否被完全控制
+  │     └── if !FullyControlled → Requeue（等待下次调谐）
+  │
+  └── 4. 返回成功
+```
+### 四、详细子流程
+#### 4.1 reconcileCreateClusterAPIObj — 创建 CAPI 对象
+这是核心创建逻辑，流程如下：
+```
+reconcileCreateClusterAPIObj()
+  │
+  ├── 1. 检查 ClusterAPIObj 条件
+  │     └── 如果已存在 ClusterAPIObjCondition → 返回等待错误（防止重复创建）
+  │
+  ├── 2. 创建 BKE 配置
+  │     └── bkeinit.NewBkeConfigFromClusterConfig(bkeCluster.Spec.ClusterConfig)
+  │         将 BKECluster.Spec.ClusterConfig 转换为 BkeConfig 对象
+  │
+  ├── 3. 准备外部 etcd 配置（仅 Bocloud 类型集群）
+  │     └── prepareExternalEtcdConfig()
+  │         ├── 判断是否为 BocloudCluster（通过 annotation "bke.bocloud.com/cluster-from" == "bocloud"）
+  │         ├── 创建 ExternalEtcd 配置模板（etcdCAFile/CertFile/KeyFile 设为占位值 "fake*"）
+  │         ├── 获取所有节点，筛选 etcd 节点
+  │         └── 构建 etcd 端点列表：https://<nodeIP>:2379，逗号分隔
+  │
+  ├── 4. 创建 CAPI 对象
+  │     └── createClusterAPIObj()
+  │         ├── a. 生成 CAPI YAML 文件
+  │         │     └── cfg.GenerateClusterAPIConfigFIle(name, namespace, externalEtcd)
+  │         │         使用 Go embed 嵌入的 bke-cluster.tmpl 模板渲染
+  │         │
+  │         ├── b. 创建本地 K8s 客户端
+  │         │     └── kube.NewClientFromRestConfig() → 使用管理集群的 RestConfig
+  │         │
+  │         └── c. Apply YAML 到管理集群
+  │               └── localClient.ApplyYaml(task)
+  │                   task 设置: 操作=CreateAddon, 等待就绪=true
+  │
+  └── 5. 设置条件标记
+        └── ClusterAPIObjCondition = False (NotReady), "cluster api obj create success"
+        同时调用 mergecluster.SyncStatusUntilComplete() 同步状态
+```
+#### 4.2 生成的 CAPI YAML 包含的资源
+根据 [bke-cluster.tmpl](file:///d:/code/github/cluster-api-provider-bke/common/cluster/initialize/tmpl/bke-cluster.tmpl) 模板，生成的 YAML 包含 **5 个 CAPI 标准资源**：
+
+| 资源 | Kind | 用途 |
+|------|------|------|
+| Cluster | cluster.x-k8s.io/v1beta1 | CAPI 集群对象，关联 controlPlaneRef 和 infrastructureRef |
+| KubeadmControlPlane | controlplane.cluster.x-k8s.io/v1beta1 | 控制面管理，定义 master 副本数、kubeadm 配置 |
+| BKEMachineTemplate (controlplane) | bke.bocloud.com/v1beta1 | 控制面机器模板 |
+| MachineDeployment | cluster.x-k8s.io/v1beta1 | Worker 节点部署，定义 worker 副本数 |
+| BKEMachineTemplate (worker) | bke.bocloud.com/v1beta1 | Worker 机器模板 |
+
+**关键设计要点**：
+- `masterReplicas` 固定为 **1**，`workerReplicas` 固定为 **0**，避免安装过程中 CAPI 控制器干扰节点管理，由 BKE 自己的控制器去调整实际副本数
+- KubeadmControlPlane 上标注了 `skip-kube-proxy: "true"` 和 `skip-coredns: "true"`，跳过 CAPI 默认安装的 kube-proxy 和 coredns，由 BKE 的 Addon 机制自行管理
+- `controlPlaneEndpoint` 设为 `"fake"`，因为 BKE 使用自己的负载均衡机制
+- Worker 的 `dataSecretName` 设为 `"fake"`，因为 BKE 不使用 CAPI 的 bootstrap 机制
+#### 4.3 reconcileClusterAPIObj — 等待 CAPI 对象就绪
+```
+reconcileClusterAPIObj()
+  │
+  ├── 1. 获取合并后的 BKECluster
+  │     └── mergecluster.GetCombinedBKECluster() → 合并管理集群和工作集群的状态
+  │
+  ├── 2. 更新 ClusterAPIObj 条件
+  │     └── 如果当前条件为 False（刚创建完成）
+  │         → 标记为 True（Ready），同步状态
+  │
+  └── 3. 获取 OwnerCluster
+        └── 如果 BKECluster.OwnerReferences != nil（CAPI 控制器已设置）
+            ├── util.GetOwnerCluster() → 获取关联的 CAPI Cluster 对象
+            └── 设置 e.Ctx.Cluster = cluster（供后续阶段使用）
+```
+### 五、NeedExecute 判断逻辑
+```
+NeedExecute(old, new)
+  │
+  ├── 1. BasePhase.NormalNeedExecute() → 基础判断（状态变化等）
+  │     如果不需要执行 → return false
+  │
+  ├── 2. 如果 new.OwnerReferences != nil → return false
+  │     （已有 OwnerRef 说明 CAPI 对象已创建并被关联）
+  │
+  └── 3. 设置阶段状态为 "Waiting" → return true
+```
+### 六、FullyControlled 判断逻辑
+[clusterutil.FullyControlled()](file:///d:/code/github/cluster-api-provider-bke/utils/capbke/clusterutil/helper.go#L27-L39) 决定集群是否被完全控制：
+
+| 集群类型 | 判断条件 | 结果 |
+|----------|----------|------|
+| BKE 集群 | annotation `bke.bocloud.com/cluster-from` 未设置或为 "bke" | **true**（完全控制） |
+| Other 集群 | annotation 为其他值 | **false**（不完全控制） |
+| Bocloud 集群 | annotation 为 "bocloud" 且 `KONKFullManagementClusterAnnotationKey` == "true" | **true** |
+| Bocloud 集群 | annotation 为 "bocloud" 但上述 key 不为 "true" | **false** |
+### 七、整体流程图
+```
+┌─────────────────────────────────────────────────────┐
+│              EnsureClusterAPIObj.Execute()           │
+├─────────────────────────────────────────────────────┤
+│                                                     │
+│  OwnerReferences == nil?                            │
+│       │                                             │
+│      YES → reconcileCreateClusterAPIObj()           │
+│       │    ├── 检查条件（防重复创建）                 │
+│       │    ├── 创建 BkeConfig                       │
+│       │    ├── 准备外部 etcd 配置（Bocloud集群）      │
+│       │    ├── 生成 CAPI YAML（5个资源）             │
+│       │    ├── Apply 到管理集群                      │
+│       │    └── 标记 ClusterAPIObjCondition=False     │
+│       │                                             │
+│      NO  → 跳过创建                                 │
+│                                                     │
+│  轮询等待（5min超时，2s间隔）                         │
+│       │                                             │
+│       └── reconcileClusterAPIObj()                  │
+│            ├── 获取合并后的 BKECluster               │
+│            ├── 更新条件为 Ready                      │
+│            └── 获取 OwnerCluster                    │
+│                                                     │
+│  FullyControlled?                                   │
+│       │                                             │
+│      NO  → Requeue                                 │
+│      YES → 返回成功                                 │
+│                                                     │
+└─────────────────────────────────────────────────────┘
+```
+### 八、设计要点总结
+1. **与 CAPI 体系对接**：本阶段的核心目的是将 BKECluster 注册为 CAPI 的基础设施提供者（infrastructureRef），使 CAPI 控制器能够识别和管理该集群
+2. **防御性副本数设置**：初始创建时 master=1、worker=0，避免 CAPI 控制器在安装过程中干扰节点管理，BKE 通过自己的控制器逐步调整
+3. **跳过 CAPI 默认组件**：通过 annotation 跳过 kube-proxy 和 coredns，这些由 BKE 的 Addon 机制统一管理
+4. **外部 etcd 支持**：为 Bocloud 类型集群提供外部 etcd 配置能力，使用占位证书（fake*），后续由证书管理阶段替换
+5. **状态同步保障**：每次关键操作后都通过 `mergecluster.SyncStatusUntilComplete()` 确保状态被正确持久化
+
+# `EnvPlugin`详细设计分析
+## EnvPlugin 设计思路
+### 一、整体定位
+[EnvPlugin](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/kubeadm/env/env.go) 是 BKEAgent 内置插件 `K8sEnvInit` 的核心实现，负责在节点加入 Kubernetes 集群**之前**完成操作系统层面的环境初始化和检查。它运行在目标节点上，通过 BKEAgent 的 BuiltIn Command 机制触发执行。
+### 二、核心设计原则
+#### 1. 插件化契约 — 自描述参数
+EnvPlugin 严格遵循 `plugin.Plugin` 接口契约：
+```go
+type Plugin interface {
+    Name() string                                    // 插件身份
+    Param() map[string]PluginParam                   // 参数自描述
+    Execute(commands []string) ([]string, error)     // 执行入口
+}
+```
+**参数自描述**是核心设计：`Param()` 方法不仅定义了参数名，还声明了每个参数的取值范围、是否必填、默认值和描述信息。这使得：
+- 调用方无需查阅文档即可构造合法命令
+- `ParseCommands()` 可自动完成参数解析、校验和默认值填充
+- 参数契约与实现代码同源，避免文档与代码不一致
+#### 2. Scope 驱动 — 细粒度控制
+EnvPlugin 采用 **scope（作用域）** 机制控制初始化和检查的范围：
+```
+scope = "kernel,firewall,selinux,swap,time,hosts,runtime,image,node,ports"
+```
+每个 scope 对应一个独立的初始化/检查函数，用户可以：
+- 精确指定需要初始化的子系统
+- 跳过不需要的步骤（如离线环境跳过 image 拉取）
+- 在不同节点类型上执行不同的 scope 组合
+#### 3. Init + Check 双阶段模型
+EnvPlugin 将环境准备分为两个阶段：
+
+| 阶段 | 入口 | 作用 | 失败策略 |
+|------|------|------|----------|
+| **Init** | `initK8sEnv()` | 主动修改系统配置 | 关键错误中断，非关键错误忽略 |
+| **Check** | `checkK8sEnv()` | 验证环境是否满足要求 | 记录警告，不中断 |
+
+关键设计：**`init=true` 时自动触发 `check`**，确保初始化后立即验证结果。
+#### 4. 按需加载集群配置
+EnvPlugin 通过 `bkeConfig` 参数按需从管理集群获取配置：
+```go
+if envParamMap["bkeConfig"] != "" {
+    cfg, err := plugin.GetBkeConfig(envParamMap["bkeConfig"])    // 获取 BKEConfig
+    clusterData, err := plugin.GetClusterData(envParamMap["bkeConfig"])  // 获取集群节点数据
+    cNode, err := ep.nodes.CurrentNode()  // 定位当前节点
+}
+```
+这实现了**配置与执行解耦**：插件本身不持有集群状态，运行时动态获取，保证使用最新配置。
+### 三、架构分层
+```
+┌─────────────────────────────────────────────────┐
+│                  EnvPlugin                       │
+├─────────────────────────────────────────────────┤
+│  Execute() — 入口：参数解析 + 流程编排            │
+├──────────────┬──────────────────────────────────┤
+│  init.go     │  check.go — 初始化/检查实现       │
+├──────────────┴──────────────────────────────────┤
+│  machine.go  — 主机信息抽象                       │
+│  hostfile.go — /etc/hosts 文件操作封装            │
+│  utils.go    — 文件读写工具（catAndSearch/Replace）│
+│  centos.go   — CentOS 特有逻辑（NetworkManager）  │
+└─────────────────────────────────────────────────┘
+```
+### 四、参数规格
+| 参数 | 取值 | 必填 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `init` | true,false | 否 | true | 是否执行环境初始化 |
+| `check` | true,false | 否 | true | 是否执行环境检查（init=true 时自动执行） |
+| `sudo` | true,false | 否 | true | 是否使用 sudo 执行命令 |
+| `scope` | 逗号分隔的 scope 列表 | 否 | kernel,firewall,selinux,swap,time,hosts,runtime,image,node,ports | 初始化/检查范围 |
+| `backup` | true,false | 否 | true | 修改文件前是否备份 |
+| `extraHosts` | hostname1:ip1,hostname2:ip2 | 否 | 空 | 额外的 hosts 映射 |
+| `hostPort` | 逗号分隔的端口列表 | 否 | 10259,10257,10250,2379,2380,2381,10248 | 需要检查可用性的端口 |
+| `bkeConfig` | ns:name | 否 | 空 | BKEConfig 资源引用，用于动态加载集群配置 |
+### 五、Scope 详细说明
+#### 5.1 Init Scope（初始化作用域）
+| Scope | 函数 | 作用 | 关键操作 |
+|-------|------|------|----------|
+| `kernel` | `initKernelParam()` | 内核参数调优 | 写入 `/etc/sysctl.d/k8s.conf`，加载内核模块，设置 ulimit，配置 IPVS |
+| `firewall` | `initFirewall()` | 关闭防火墙 | 停止并禁用 firewalld/ufw |
+| `selinux` | `initSelinux()` | 关闭 SELinux | `setenforce 0`，修改 `/etc/selinux/config` |
+| `swap` | `initSwap()` | 关闭交换分区 | 注释 fstab 中的 swap 行，`swapoff -a`，设置 `vm.swappiness=0` |
+| `time` | `initTime()` | 时间同步 | 设置时区为 Asia/Shanghai，配置 NTP |
+| `hosts` | `initHost()` | 配置主机名和 hosts | 设置 hostname，写入集群节点和仓库的 hosts 映射 |
+| `image` | `initImage()` | 拉取容器镜像 | 通过 docker/containerd 客户端拉取所需镜像 |
+| `runtime` | `initRuntime()` | 初始化容器运行时 | 安装/配置 containerd 或 docker + cri-dockerd |
+| `dns` | `initDNS()` | 配置 DNS | 关闭 NetworkManager 自动覆盖 resolv.conf（CentOS） |
+| `httpRepo` | `initHttpRepo()` | 配置 YUM 源 | 设置离线仓库地址 |
+| `iptables` | `initIptables()` | 配置 iptables | 设置 INPUT/OUTPUT/FORWARD 为 ACCEPT |
+| `registry` | `initRegistry()` | 配置镜像仓库 | 记录仓库端口信息 |
+#### 5.2 Check Scope（检查作用域）
+| Scope | 函数 | 作用 |
+|-------|------|------|
+| `kernel` | `checkKernelParam()` | 验证内核参数是否正确 |
+| `firewall` | `checkFirewall()` | 验证防火墙已关闭 |
+| `selinux` | `checkSelinux()` | 验证 SELinux 已关闭 |
+| `swap` | `checkSwap()` | 验证 swap 已关闭 |
+| `time` | `checkTime()` | 验证时间同步 cron 正在运行 |
+| `hosts` | `checkHost()` | 验证 hosts 文件配置正确 |
+| `ports` | `checkHostPort()` | 验证关键端口可用 |
+| `node` | `checkNodeInfo()` | 验证节点资源（CPU≥2, 内存≥阈值） |
+| `runtime` | `checkRuntime()` | 验证容器运行时可用 |
+| `dns` | `checkDNS()` | 验证 DNS 可用 |
+| `httpRepo` | 跳过 | 初始化阶段已验证 |
+### 六、关键设计细节
+#### 6.1 Machine 抽象 — 操作系统感知
+[Machine](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/kubeadm/env/machine.go) 通过 `gopsutil` 库采集主机信息：
+```go
+type Machine struct {
+    Hostname string
+    hostArch string    // runtime.GOARCH
+    hostOS   string    // runtime.GOOS
+    platform string    // centos/ubuntu/kylin/...
+    version  string    // 7/8/...
+    kernel   string    // 内核版本
+    cpuNum   int
+    memSize  int       // GB
+}
+```
+EnvPlugin 大量使用 `platform` 和 `version` 进行**操作系统差异化处理**：
+- CentOS 7 + containerd → 设置 `fs.may_detach_mounts=1`
+- Ubuntu → 模块写入 `/etc/modules`
+- CentOS/Kylin → 模块写入 `/etc/sysconfig/modules/ip_vs.modules`
+- Kylin → 额外配置 `rc.local`
+- 不同平台安装不同的 lxcfs 包
+#### 6.2 内核参数动态构建
+内核参数在 `init()` 阶段动态构建，而非硬编码：
+```go
+func init() {
+    // 1. 根据 IP 模式（ipv4/ipv6）选择基础参数
+    for k, v := range kernelParam[DefaultIpMode] { ... }
+    // 2. 叠加通用参数
+    for k, v := range defaultKernelParam { ... }
+    // 3. 检测默认网卡，设置 rp_filter
+    face, _ := netutil.GetV4Interface()
+    execKernelParam[fmt.Sprintf("net.ipv4.conf.%s.rp_filter", face)] = "0"
+}
+```
+运行时还会根据配置动态追加：
+- `setupCentos7DetachMounts()` → CentOS 7 + containerd 追加 `fs.may_detach_mounts`
+- `setupIPVSConfig()` → proxyMode=ipvs 时追加 `net.ipv4.vs.conntrack` 和相关模块
+#### 6.3 容器运行时安装策略
+`initRuntime()` 实现了**智能运行时管理**：
+```
+当前运行时 vs 配置运行时
+    │
+    ├── 相同 → 仅修改配置文件并重启
+    ├── 不同 → 下载并安装指定运行时
+    │         ├── containerd → 调用 containerd 插件
+    │         └── docker → 调用 docker 插件 + cri-dockerd
+    └── 未指定 → 使用当前运行时，仅修改配置
+```
+#### 6.4 Hosts 文件管理
+`initHost()` 的 hosts 来源有三个：
+1. **extraHosts 参数**：用户显式指定的映射
+2. **clusterHosts**：从 bkeConfig 动态构建的集群节点映射
+3. **仓库域名**：镜像仓库和 HTTP 仓库的域名→IP 映射
+
+使用 [HostsFile](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/kubeadm/env/hostfile.go) 封装库操作，保证 hosts 文件格式正确。
+#### 6.5 错误处理策略
+EnvPlugin 采用了**分级错误处理**：
+
+| 场景 | 策略 | 示例 |
+|------|------|------|
+| 关键初始化失败 | 返回错误，中断流程 | swapoff 失败、hosts 写入失败 |
+| 非关键初始化失败 | 记录警告，继续执行 | 内核参数设置失败（`ignore`）、umask 设置失败 |
+| 检查失败 | 记录警告，不中断 | 内核参数检查、节点资源不足 |
+| 未知 scope | 记录警告，跳过 | 未知 scope 名称 |
+### 七、Execute 执行流程
+```
+Execute(commands)
+  │
+  ├── 1. plugin.ParseCommands(ep, commands)
+  │     解析命令参数 → 校验必填项 → 填充默认值
+  │
+  ├── 2. 加载运行时参数
+  │     sudo, scope, backup, extraHosts, hostPort
+  │
+  ├── 3. 按需加载集群配置（bkeConfig 参数）
+  │     ├── plugin.GetBkeConfig() → 获取 BKEConfig
+  │     ├── plugin.GetClusterData() → 获取节点列表
+  │     └── nodes.CurrentNode() → 定位当前节点
+  │
+  ├── 4. init=true → initK8sEnv()
+  │     遍历 scope 列表 → processInitScope()
+  │     ├── kernel:  写内核参数 + 加载模块 + 设置 ulimit
+  │     ├── swap:    关闭 swap
+  │     ├── firewall: 关闭防火墙
+  │     ├── selinux: 关闭 SELinux
+  │     ├── time:    配置时区和 NTP
+  │     ├── hosts:   设置 hostname + 写 hosts
+  │     ├── image:   拉取容器镜像
+  │     ├── runtime: 安装/配置容器运行时
+  │     ├── dns:     配置 DNS
+  │     ├── httpRepo: 配置 YUM 源
+  │     ├── iptables: 配置 iptables 规则
+  │     └── registry: 配置镜像仓库
+  │
+  └── 5. check=true 或 init=true → checkK8sEnv()
+        遍历 scope 列表 → processCheckScope()
+        验证各子系统状态
+```
+### 八、设计亮点总结
+1. **自描述参数契约**：参数定义与代码同源，自动解析校验，消除文档与实现的不一致
+2. **Scope 驱动**：细粒度控制初始化范围，支持灵活组合，适应不同部署场景
+3. **Init + Check 双阶段**：先修改后验证，init 自动触发 check 保证可靠性
+4. **操作系统感知**：通过 Machine 抽象自动适配 CentOS/Ubuntu/Kylin 等不同平台
+5. **按需配置加载**：通过 bkeConfig 参数动态获取集群配置，避免硬编码和状态过期
+6. **内核参数动态构建**：根据 IP 模式、网卡、运行时、代理模式动态组装内核参数
+7. **容器运行时智能管理**：自动检测当前运行时，按需安装/配置/切换
+8. **分级错误处理**：关键错误中断、非关键错误降级、检查失败仅告警
+
+# EnsureClusterAPIObj完整的 CAPI YAML 清单梳理
+## EnsureClusterAPIObj 部署的 CAPI YAML 清单
+[ensure_cluster_api_obj.go](file:///d:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_cluster_api_obj.go) 通过 [bke-cluster.tmpl](file:///d:/code/github/cluster-api-provider-bke/common/cluster/initialize/tmpl/bke-cluster.tmpl) 模板渲染，一次性 Apply **5 个 CAPI 资源**。以下逐一列出完整清单及模板变量来源。
+### 清单 1：Cluster（CAPI 集群对象）
+```yaml
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: Cluster
+metadata:
+  name: {{.name}}            # ← BKECluster.Name
+  namespace: {{.namespace}}   # ← BKECluster.Namespace
+spec:
+  clusterNetwork:
+    services:
+      cidrBlocks: [ "{{.servicesCIDR}}" ]    # ← BKEConfig.Networking.ServiceSubnet
+    pods:
+      cidrBlocks: [ "{{.podsCIDR}}" ]        # ← BKEConfig.Networking.PodSubnet
+    serviceDomain: "{{.serviceDomain}}"       # ← BKEConfig.Networking.DNSDomain
+  controlPlaneRef:
+    apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+    kind: KubeadmControlPlane
+    name: {{.name}}-controlplane
+    namespace: {{.namespace}}
+  infrastructureRef:
+    apiVersion: bke.bocloud.com/v1beta1
+    kind: BKECluster
+    name: {{.name}}
+    namespace: {{.namespace}}
+```
+**作用**：CAPI 的顶层集群对象，声明集群网络配置，引用控制面和基础设施提供者。
+
+**关键设计**：
+- `infrastructureRef` 指向 BKECluster 自身，使 BKECluster 成为 CAPI 的基础设施提供者
+- `controlPlaneRef` 指向下面的 KubeadmControlPlane
+### 清单 2：KubeadmControlPlane（控制面管理）
+```yaml
+apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+kind: KubeadmControlPlane
+metadata:
+  name: {{.name}}-controlplane
+  namespace: {{.namespace}}
+  annotations:
+    controlplane.cluster.x-k8s.io/skip-kube-proxy: "true"   # 跳过 CAPI 自动安装 kube-proxy
+    controlplane.cluster.x-k8s.io/skip-coredns: "true"       # 跳过 CAPI 自动安装 coredns
+spec:
+  replicas: {{.masterReplicas}}       # ← 固定为 1
+  version: {{.kubernetesVersion}}     # ← BKEConfig.Cluster.KubernetesVersion
+  machineTemplate:
+    infrastructureRef:
+      apiVersion: bke.bocloud.com/v1beta1
+      kind: BKEMachineTemplate
+      name: {{.name}}-machine-controlplane
+      namespace: {{.namespace}}
+  kubeadmConfigSpec:
+    clusterConfiguration:
+      clusterName: {{.name}}
+      controlPlaneEndpoint: "fake"    # ← 占位值，BKE 使用自己的负载均衡
+      networking:
+        dnsDomain: {{.serviceDomain}}
+        podSubnet: {{.podsCIDR}}
+        serviceSubnet: {{.servicesCIDR}}
+      kubernetesVersion: {{.kubernetesVersion}}
+      apiServer:
+        certSANs:
+          {{.SANS}}                   # ← 自动生成：127.0.0.1 + localhost + DNS IP + 用户配置的 SANs
+      imageRepository: {{.repo}}      # ← domain:port/prefix
+      {{- if eq .externalEtcd "true"}}
+      etcd:
+        external:
+          endpoints:                   # ← etcd 节点 https://<IP>:2379 列表
+            - https://<etcdIP1>:2379
+            - https://<etcdIP2>:2379
+          caFile: {{.etcdCAFile}}      # ← 占位值 "fakeCaCert"
+          certFile: {{.etcdCertFile}}  # ← 占位值 "fakeCertFile"
+          keyFile: {{.etcdKeyFile}}    # ← 占位值 "fakeKeyFile"
+      {{- end}}
+    initConfiguration:
+      nodeRegistration:
+        kubeletExtraArgs:
+          cgroup-driver: systemd
+    joinConfiguration:
+      nodeRegistration:
+        kubeletExtraArgs:
+          cgroup-driver: systemd
+```
+**作用**：定义控制面的 kubeadm 配置，CAPI 控制器据此初始化/加入 master 节点。
+
+**关键设计**：
+| 设计点 | 值 | 原因 |
+|--------|------|------|
+| `replicas` | **1** | 避免安装过程中 CAPI 干扰，由 BKE 控制器调整实际副本数 |
+| `controlPlaneEndpoint` | `"fake"` | BKE 使用自己的负载均衡机制，不使用 CAPI 默认端点 |
+| `skip-kube-proxy` | `"true"` | kube-proxy 由 BKE Addon 机制管理 |
+| `skip-coredns` | `"true"` | coredns 由 BKE Addon 机制管理 |
+| `cgroup-driver` | `systemd` | 统一使用 systemd cgroup 驱动 |
+| 外部 etcd 证书 | `"fake*"` | 占位值，后续由证书管理阶段替换 |
+### 清单 3：BKEMachineTemplate（控制面机器模板）
+```yaml
+apiVersion: bke.bocloud.com/v1beta1
+kind: BKEMachineTemplate
+metadata:
+  name: {{.name}}-machine-controlplane
+  namespace: {{.namespace}}
+spec:
+  template:
+    spec: { }    # ← 空规格，BKE 不通过 CAPI 管理机器
+```
+**作用**：KubeadmControlPlane 的 infrastructureRef 引用的机器模板。
+
+**关键设计**：`spec: { }` 为空，因为 BKE 不通过 CAPI 的 Machine 机制管理实际节点，节点生命周期由 BKE 自己的 BKENode/BKEAgent 体系管理。
+### 清单 4：MachineDeployment（Worker 节点部署）
+```yaml
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineDeployment
+metadata:
+  namespace: {{.namespace}}
+  name: {{.name}}-worker
+spec:
+  clusterName: {{.name}}
+  replicas: {{.workerReplicas}}     # ← 固定为 0
+  selector:
+    matchLabels:
+      cluster.x-k8s.io/cluster-name: {{.name}}
+  template:
+    spec:
+      version: {{.workerVersion}}   # ← BKEConfig.Cluster.KubernetesVersion
+      clusterName: {{.name}}
+      bootstrap:
+        dataSecretName: "fake"      # ← 占位值，BKE 不使用 CAPI bootstrap
+      infrastructureRef:
+        apiVersion: bke.bocloud.com/v1beta1
+        kind: BKEMachineTemplate
+        name: {{.name}}-machine-worker
+```
+**作用**：CAPI 的 Worker 节点部署对象。
+
+**关键设计**：
+| 设计点 | 值 | 原因 |
+|--------|------|------|
+| `replicas` | **0** | Worker 节点由 BKE 控制器管理，不通过 CAPI 扩缩 |
+| `dataSecretName` | `"fake"` | BKE 不使用 CAPI 的 bootstrap token 机制，节点通过 BKEAgent 加入 |
+### 清单 5：BKEMachineTemplate（Worker 机器模板）
+```yaml
+apiVersion: bke.bocloud.com/v1beta1
+kind: BKEMachineTemplate
+metadata:
+  name: {{.name}}-machine-worker
+  namespace: {{.namespace}}
+spec:
+  template:
+    spec: { }    # ← 空规格，同控制面模板
+```
+**作用**：MachineDeployment 的 infrastructureRef 引用的机器模板，同样为空规格。
+### 模板变量汇总
+
+| 变量 | 来源 | 默认值/说明 |
+|------|------|-------------|
+| `name` | BKECluster.Name | 集群名称 |
+| `namespace` | BKECluster.Namespace | 命名空间 |
+| `repo` | `ImageRepo.Domain:Port/Prefix` | 镜像仓库地址 |
+| `masterReplicas` | **硬编码 1** | 安装阶段固定为 1 |
+| `workerReplicas` | **硬编码 0** | 安装阶段固定为 0 |
+| `kubernetesVersion` | BKEConfig.Cluster.KubernetesVersion | K8s 版本 |
+| `workerVersion` | BKEConfig.Cluster.KubernetesVersion | 同 K8s 版本 |
+| `servicesCIDR` | BKEConfig.Networking.ServiceSubnet | Service 网段 |
+| `podsCIDR` | BKEConfig.Networking.PodSubnet | Pod 网段 |
+| `serviceDomain` | BKEConfig.Networking.DNSDomain | 集群 DNS 域名 |
+| `SANS` | 自动生成 | 127.0.0.1 + localhost + 10.96.0.10 + 用户配置的 CertSANs |
+| `externalEtcd` | `"false"` / `"true"` | 仅 Bocloud 类型集群为 true |
+| `etcdEndpoints` | etcd 节点 IP 列表 | `https://<IP>:2379` 逗号分隔 |
+| `etcdCAFile` | `"fakeCaCert"` | 占位值 |
+| `etcdCertFile` | `"fakeCertFile"` | 占位值 |
+| `etcdKeyFile` | `"fakeKeyFile"` | 占位值 |
+### 资源关系图
+```
+Cluster
+  ├── controlPlaneRef ──→ KubeadmControlPlane
+  │                         ├── machineTemplate.infrastructureRef ──→ BKEMachineTemplate (controlplane)
+  │                         └── kubeadmConfigSpec (集群配置)
+  └── infrastructureRef ──→ BKECluster (自身)
+
+MachineDeployment (worker)
+  ├── bootstrap.dataSecretName = "fake"
+  └── template.infrastructureRef ──→ BKEMachineTemplate (worker)
+```
+### 整体设计意图
+BKE 创建这些 CAPI 资源的核心目的是**与 CAPI 体系对接**，但通过多处"占位"和"最小化"设计，确保 CAPI 控制器不会干扰 BKE 自身的节点管理：
+1. **副本数最小化**：master=1, worker=0，避免 CAPI 自动扩缩节点
+2. **跳过默认组件**：kube-proxy 和 coredns 由 BKE Addon 管理
+3. **端点占位**：controlPlaneEndpoint="fake"，BKE 使用自己的负载均衡
+4. **Bootstrap 占位**：dataSecretName="fake"，BKE 使用 BKEAgent 加入节点
+5. **机器模板空规格**：spec: {}，BKE 不依赖 CAPI 管理机器生命周期
+6. **外部 etcd 证书占位**：fake* 证书，后续由 EnsureCerts 阶段替换
+
