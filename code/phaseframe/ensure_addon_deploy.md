@@ -311,4 +311,68 @@ helm uninstall <releaseName> --namespace <ns> --wait
 | 版本 | k8sVersion, version | K8s 和 BKE 版本 |
 | 命名空间 | namespace | 集群命名空间 |
 | 网络 | clusterNetworkMode | 网络模式(calico/fabric) |
+       
+# Addon的安装部署**不是**通过 ClusterAPI 进行的，而是直接连接**目标集群**进行部署
+## Addon 部署机制分析
+### 1. 连接方式：直接连接目标集群
+从 [ensure_addon_deploy.go](file:///d:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_addon_deploy.go) 的 `Execute` 方法可以看到：
+```go
+func (e *EnsureAddonDeploy) Execute() (ctrl.Result, error) {
+    // 直接通过 BKECluster 的凭据连接目标集群
+    targetClusterClient, err := kube.NewRemoteClientByBKECluster(e.Ctx.Context, e.Ctx.Client, e.Ctx.BKECluster)
+    // ...
+    e.remoteClient, e.remoteDynamicClient = targetClusterClient.KubeClient()
+    // ...
+    if err = e.reconcileAddon(); err != nil {
+        return ctrl.Result{}, err
+    }
+    return ctrl.Result{}, nil
+}
+```
+它通过 `kube.NewRemoteClientByBKECluster` 获取目标集群的 client，然后直接操作目标集群。
+### 2. 两种 Addon 部署方式
+从 [addon.go](file:///d:/code/github/cluster-api-provider-bke/pkg/kube/addon.go) 可以看到：
+```go
+func (c *Client) InstallAddon(bkeCluster *bkev1beta1.BKECluster, addonT *bkeaddon.AddonTransfer, ...) error {
+    if addon.Type == bkeaddon.ChartAddon {
+        // Chart类型：通过 Helm 直接安装到目标集群
+        return c.installChartAddon(addon, addonT.Operate, bkeCluster.Namespace, cfg, localClient)
+    }
+    // YAML类型：渲染模板后 kubectl apply 到目标集群
+    return c.installYamlAddon(addon, addonT, bkeCluster, cfg, addonRecorder, bkeNodes)
+}
+```
+| Addon类型 | 部署方式 | 目标 |
+|-----------|---------|------|
+| **YAML类型** | 渲染模板 → `kubectl apply` 直接应用到目标集群 | 目标集群 |
+| **Chart类型** | `helm install/upgrade` 直接安装到目标集群 | 目标集群 |
+### 3. 与 ClusterAPI 的关系
+ClusterAPI 在这个项目中的角色是**集群生命周期管理**（创建/删除 Machine、管理 Node 等），而 Addon 部署是**独立于 ClusterAPI** 的：
+- **ClusterAPI 负责**：Machine 部署、Node 注册、控制面初始化状态追踪
+- **Addon 部署负责**：在已创建的目标集群上安装附加组件（Calico、Metrics-Server、NodelocalDNS 等）
+
+它们的关系是**顺序依赖**而非调用关系：
+```
+ClusterAPI 初始化控制面 → 控制面就绪 → Addon 部署开始
+```
+在 [ensure_addon_deploy.go](file:///d:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_addon_deploy.go) 的 `NeedExecute` 中可以看到这个前置检查：
+```go
+func (e *EnsureAddonDeploy) NeedExecute(...) bool {
+    // ...
+    // 检查 ClusterAPI 的控制面是否已初始化
+    if e.Ctx.Cluster != nil && !phaseutil.AllowDeployAddonWithBKENodes(bkeNodes, e.Ctx.Cluster) {
+        return false
+    }
+    // ...
+}
+```
+### 总结
+| 维度 | 说明 |
+|------|------|
+| **部署方式** | 直接连接目标集群，非通过 ClusterAPI |
+| **YAML Addon** | 渲染模板 → kubectl apply 到目标集群 |
+| **Chart Addon** | helm install/upgrade 到目标集群 |
+| **与ClusterAPI关系** | ClusterAPI 是前置条件（控制面就绪后才能部署Addon），但Addon部署本身不经过ClusterAPI |
+| **连接凭据** | 通过 BKECluster 的 Secret 获取目标集群 kubeconfig |
+
 
