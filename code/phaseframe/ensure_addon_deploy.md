@@ -179,3 +179,136 @@ Create Addon 流程：
 | **前置条件** | 节点就绪 | 控制平面初始化 + 节点就绪 | 控制平面初始化 + Master Boot |
 | **自定义操作** | 无 | 无 | 前置/后置扩展点 |
         
+# Addon 安装的组件及安装命令
+## Addon 安装的组件及安装命令
+### 一、默认安装的 Addon 组件
+根据 [export.go](file:///d:/code/github/cluster-api-provider-bke/common/cluster/initialize/export.go) 中的 `defaultAddons()` 函数，BKE 默认安装以下 Addon：
+
+| 序号 | Addon 名称 | 默认版本 | 类型 | 说明 |
+|------|-----------|---------|------|------|
+| 1 | **kubeproxy** | 1.25.6 | YAML | Kubernetes 网络代理 |
+| 2 | **calico** | v3.4.1 | YAML | CNI 网络插件 |
+| 3 | **coredns** | v1.8.0 | YAML | 集群 DNS 服务 |
+| 4 | **nfs-csi** | v4.1.0 | YAML | NFS CSI 存储驱动 |
+| 5 | **bocoperator** | latest | YAML | BOC 运维管理平台 |
+| 6 | **cluster-api** | v1.3.2 | YAML | CAPI 管理组件 |
+### 二、bke-manifests 仓库中所有可用的 Addon 组件
+根据 [bke-manifests/kubernetes](file:///d:/code/github/bke-manifests/kubernetes/) 目录，所有可用的 YAML 类型 Addon 如下：
+
+| Addon 名称 | 可用版本 | 功能说明 |
+|-----------|---------|---------|
+| **kubeproxy** | v1.21.1, v1.21.14, v1.23.17, v1.25.6, v1.27.2, v1.28.8-of.1, v1.29.1, v1.33.1, v1.33.1-of.1, v1.33.1-of.2, v1.34.3-of.1 | Kube-Proxy 网络代理 |
+| **calico** | v3.25.0, v3.27.3, v3.31.3 | Calico CNI 网络插件 |
+| **coredns** | v1.8.0, v1.8.6, v1.9.3, v1.10.1, v1.12.2-of.1 | 集群 DNS |
+| **nfs-csi** | v4.1.0 | NFS CSI 存储 |
+| **bocoperator** | (不在 manifests 仓库) | BOC 运维管理平台 |
+| **cluster-api** | v1.1.4, v1.3.2, v1.4.3 | CAPI 管理组件 |
+| **nodelocaldns** | v1.26.4 | 节点本地 DNS 缓存 |
+| **etcdbackup** | 3.4.3 | etcd 定时备份 |
+| **beyondELB** | v2.1.5 | 负载均衡器 |
+| **cert-manager** | v1.11.0 | 证书管理 |
+| **gpu-manager** | 1.1.4 | GPU 管理器 |
+| **kube-gpu** | 1.0.0, 1.1.0, 1.2.0 | GPU 调度 |
+| **prometheus** | v2.11.0, v2.32.1 | 监控告警 |
+| **efk** | 7.13.1 | 日志收集 |
+| **logrotate** | 1.2 | 日志轮转 |
+| **kubectl** | v1.21, v1.23, v1.25 | kubectl 终端 |
+| **kubehelm** | 1.6.12, 1.6.13 | Helm 控制器 |
+| **kubevirt** | v1.0.0 | 虚拟化管理 |
+| **jenkins** | 2.278, 2.375.3-lts | CI/CD |
+| **minio** | 2023-04-20 | 对象存储 |
+| **mysql** | 5.7, katib-8.0.29 | 数据库 |
+| **postgres** | 16 | 数据库 |
+| **redis** | 6.2.12 | 缓存 |
+| **argo-workflow** | v3.4.3 | 工作流引擎 |
+| **katib** | v0.15.0 | 超参调优 |
+| **kserve** | v0.11.2 | 模型服务 |
+| **volcano** | release-1.7-bcc | 批调度 |
+| **vpa** | 0.10.0 | 垂直自动伸缩 |
+| **victoriametrics-controller** | 0.20.0, latest | 监控 |
+| **rdma-dev-plugin** | v1.5.0 | RDMA 设备插件 |
+| **numa-affinity-package** | v0.0.1, v0.0.2 | NUMA 亲和 |
+| **priorityclass** | latest | 优先级类 |
+| **openfuyao-system-controller** | latest, v1.0.1, v25.03, dev-aiaio | 开放扶摇系统 |
+| **bkeagent** | latest | BKE Agent |
+| **bkeagent-deployer** | latest, v1.0.1, v1.0.4 | BKE Agent 部署器 |
+| **bkeagent-update** | latest | BKE Agent 更新 |
+| **clusterextra** | latest + 各脚本 | 集群额外脚本 |
+| **fabric** | (不在 manifests 仓库) | 网络插件(另一种 CNI) |
+### 三、两种安装方式及安装命令
+#### 方式一：YAML 类型 Addon（默认类型）
+**安装流程**：
+1. **读取 YAML 文件**：从 `/manifests/kubernetes/<addon_name>/<version>/` 目录读取所有 `.yaml` 文件
+2. **模板渲染**：使用 Go `text/template` 引擎渲染 YAML，注入参数（镜像仓库、网络配置、节点信息等）
+3. **按序应用**：按文件名排序（安装时正序，卸载时逆序），逐个 Apply 到目标集群
+4. **等待就绪**：如果 `Block=true`，等待资源就绪
+
+**安装命令（等效）**：
+```bash
+# 等效于 kubectl apply -f，但使用 Go 的 dynamic client 实现 Server-Side Apply
+kubectl apply -f <rendered_yaml_file> --server-side --force-conflicts --field-manager=bke
+```
+**实际实现**（[yaml.go](file:///d:/code/github/cluster-api-provider-bke/pkg/kube/yaml.go)）：
+- 使用 `dynamic.ResourceInterface.Apply()` → Server-Side Apply
+- 更新操作：`dr.Patch(types.ApplyPatchType)` → Strategic Merge Patch
+- 删除操作：`dr.Delete()` → 直接删除
+- 升级操作：`dr.Apply()` → Server-Side Apply
+#### 方式二：Chart 类型 Addon
+**安装流程**：
+1. **获取 Chart 包**：从 Chart 仓库（支持 OCI 和 HTTP）拉取 Chart 包
+2. **获取 Values**：从 ConfigMap 读取 `values.yaml` 配置
+3. **Helm 安装**：使用 Helm SDK 执行安装/升级/卸载
+
+**安装命令（等效）**：
+```bash
+# 安装
+helm install <releaseName> <chartName> --version <version> --namespace <ns> --wait --wait-for-jobs
+# 升级
+helm upgrade <releaseName> <chartName> --version <version> --namespace <ns> --wait --wait-for-jobs
+# 卸载
+helm uninstall <releaseName> --namespace <ns> --wait
+```
+**实际实现**（[chart.go](file:///d:/code/github/cluster-api-provider-bke/pkg/kube/chart.go)）：
+- 使用 `helm.sh/helm/v3/pkg/action` SDK
+- `action.NewInstall` → 安装
+- `action.NewUpgrade` → 升级
+- `action.NewUninstall` → 卸载
+- 支持从 OCI Registry 和 HTTP Chart 仓库拉取
+### 四、特殊 Addon 的前置/后置操作
+某些 Addon 在安装前/后需要额外的操作（[ensure_addon_deploy.go](file:///d:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_addon_deploy.go)）：
+
+| Addon | 前置操作 (addonBeforeCreateCustomOperate) | 后置操作 (addonAfterCreateCustomOperate) |
+|-------|------------------------------------------|------------------------------------------|
+| **etcdbackup** | ① 在 etcd 节点创建备份目录 ② 在目标集群创建 etcd 证书 Secret | 无 |
+| **beyondELB** | ① 创建 VIP ② 为 LB 节点打标签 | 无 |
+| **cluster-api** | ① 创建 local kubeconfig Secret ② 创建最小权限 kubeconfig Secret ③ 标记 BKEAgent 切换 pending ④ 创建 bkeconfig ConfigMap ⑤ 创建 patchconfig ConfigMap ⑥ 将 Chart 引用写入 BKECluster | 无 |
+| **openfuyao-system-controller** | ① 为 Master 节点添加 control-plane 标签 ② 下发 patch ConfigMap | ① 创建默认用户名密码 ② 输出登录信息 |
+| **gpu-manager** | 重建 kube-scheduler Static Pod YAML | 无 |
+### 五、特殊参数增强
+在 [addon.go](file:///d:/code/github/cluster-api-provider-bke/pkg/kube/addon.go) 的 `enhanceCommonParamForSpecialAddons` 中，以下 Addon 会被注入额外参数：
+
+| Addon | 额外注入的参数 |
+|-------|--------------|
+| **bocoperator** | master SSH 信息、pipeline 服务器信息、portalClusterToken、数据库配置、master 服务器列表 |
+| **cluster-api** (manage=true) | clusterToken（门户集群 Token）、nodes（管理节点模板数据） |
+| **fabric** | 解析 fabric 专用参数覆盖 addon.Param |
+| **nodelocaldns** | domain（DNS 域名）、DNSserver/clusterDNS（根据 proxyMode 区分 iptables/ipvs 模式） |
+### 六、通用参数注入
+所有 Addon 都会通过 `getCommonParamFromBKECluster` 注入以下通用参数：
+
+| 参数类别 | 参数名 | 说明 |
+|---------|-------|------|
+| 镜像仓库 | imageRepo, imageRepoDomain, imageRepoPort, imageRepoIp, imageRepoPrefix | 镜像仓库地址 |
+| HTTP 仓库 | httpRepo, httpRepoDomain, httpRepoPort, httpRepoIp, httpRepoPrefix | RPM/DEB 包仓库 |
+| NTP | ntpServer | NTP 服务器 |
+| Agent | agentHealthPort | Agent 健康端口 |
+| NFS | nfsServer, nfsRootDir, nfsVersion | NFS 存储 |
+| 网络 | podSubnet, serviceSubnet, dnsDomain, apiServerSrcHost, apiServerSrcPort | 集群网络 |
+| etcd | etcdEndpoints, etcdIps | etcd 端点 |
+| 节点 | masterReplicas, workerReplicas, replicas | 节点副本数 |
+| DNS | dnsIP | 集群 DNS IP |
+| 存储 | kubeletDataRoot, dockerDataRoot | 数据目录 |
+| 版本 | k8sVersion, version | K8s 和 BKE 版本 |
+| 命名空间 | namespace | 集群命名空间 |
+| 网络 | clusterNetworkMode | 网络模式(calico/fabric) |
+
