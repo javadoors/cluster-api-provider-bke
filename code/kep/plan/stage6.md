@@ -3777,3 +3777,533 @@ func (r *AssetRegistry) matchVersionConstraints(
 
 **推荐方案**：VersionPackage 只保留 `Components` + `Images` + `Compatibility`，Asset 定义独立为 `AssetDefinition` CRD，通过 `VersionConstraints` 与 VersionPackage 松耦合关联，运行时由 `AssetRegistry` 动态解析匹配。
 
+# 组件与镜像的复杂关系
+## VersionPackageSpec 中 `images` 属性是否合理？
+### 一、从代码看组件与镜像的真实关系
+#### 1.1 当前代码中的映射关系
+从 [defaults.go](file:///d:/code/github/cluster-api-provider-bke/common/cluster/initialize/defaults.go#L68-L77) 和 [exporter.go](file:///d:/code/github/cluster-api-provider-bke/common/cluster/imagehelper/exporter.go#L124-L143) 中梳理出的完整映射：
+```
+组件 (Component)          镜像名 (Image Name)         版本来源
+───────────────────────────────────────────────────────────────
+kubernetes v1.25.6   →   kube-apiserver:v1.25.6      = K8s版本
+kubernetes v1.25.6   →   kube-controller-manager:v1.25.6  = K8s版本
+kubernetes v1.25.6   →   kube-scheduler:v1.25.6      = K8s版本
+kubernetes v1.25.6   →   kubelet:v1.25.6             = K8s版本
+
+etcd v3.5.21-of.1    →   etcd:3.5.21-of.1           ≠ 组件版本！
+                     →   etcd:3.5.6-0               (旧映射，K8s版本相关)
+
+pause                →   pause:3.9                   ≠ 任何组件版本！
+                     →   pause:3.8                   (旧映射，K8s版本相关)
+                     →   pause:3.6                   (旧映射，K8s版本相关)
+
+coredns              →   coredns/coredns:v1.8.0     ≠ 任何组件版本！
+
+bkeagent-deployer    →   bkeagent-deployer:v1.2.3    来自 addon status
+
+calico               →   calico 相关镜像              来自 chart values
+```
+**关键发现：组件版本 ≠ 镜像 Tag，这是核心矛盾。**
+#### 1.2 版本与 Tag 的不一致性
+| 组件 | 组件版本 | 镜像 Tag | 关系 |
+|------|---------|---------|------|
+| kubernetes | v1.25.6 | kube-apiserver:**v1.25.6** | ✅ 相等（去掉 v 前缀后） |
+| etcd | v3.5.21-of.1 | etcd:**3.5.21-of.1** | ⚠️ 去掉 v 前缀后相等 |
+| etcd (旧) | — | etcd:**3.5.6-0** | ❌ 与 K8s 版本隐式映射 |
+| pause | — | pause:**3.9** | ❌ 独立版本，与任何组件版本无关 |
+| coredns | — | coredns/coredns:**v1.8.0** | ❌ 独立版本 |
+#### 1.3 一个组件对应多个镜像
+Kubernetes 一个组件版本对应 **4 个镜像**：
+```go
+// exporter.go generateImageMap()
+k8sComponentImageMapWithoutRepo := map[string]string{
+    "kube-apiserver":          "kube-apiserver:v1.25.6",
+    "kube-controller-manager": "kube-controller-manager:v1.25.6",
+    "kube-scheduler":          "kube-scheduler:v1.25.6",
+    "etcd":                    "etcd:3.5.6-0",
+}
+```
+#### 1.4 镜像仓库是运行时上下文
+从 [config.go](file:///d:/code/github/cluster-api-provider-bke/common/cluster/initialize/config.go#L151-L158)：
+```go
+func (bc *BkeConfig) ImageFuyaoRepo() string {
+    // 镜像仓库地址来自 ClusterSpec，不是版本包
+    address := validation.GetImageRepoAddress(bc.Cluster.ImageRepo)
+    return fmt.Sprintf("%s/%s/", address, bc.Cluster.ImageRepo.Prefix)
+}
+```
+镜像仓库地址（`deploy.bocloud.k8s:40443/kubernetes/`）是**运行时从 ClusterSpec 获取**的，不属于版本包的范畴。
+### 二、`images` 放在 VersionPackage 中的问题
+#### 问题 1：组件版本 ≠ 镜像 Tag，无法从 components 推导
+假设 VersionPackage 只有 components：
+```yaml
+components:
+  - name: kubernetes
+    version: v1.25.6
+  - name: etcd
+    version: v3.5.21-of.1
+```
+**无法推导出：**
+- `pause:3.9` — pause 不是一个"组件"，它没有出现在 components 列表中
+- `etcd:3.5.6-0` — 旧版本的 etcd 镜像 tag 与组件版本不一致
+- `coredns/coredns:v1.8.0` — coredns 镜像名带仓库前缀，tag 与任何组件无关
+
+**如果尝试推导：**
+```go
+// 假设的推导逻辑
+func deriveImage(component ComponentVersion) string {
+    switch component.Name {
+    case "kubernetes":
+        // 一个组件 → 4 个镜像？哪个？
+        return "kube-apiserver:" + strings.TrimPrefix(component.Version, "v")
+    case "etcd":
+        // v3.5.21-of.1 → 3.5.21-of.1？还是 3.5.6-0？
+        return "etcd:" + strings.TrimPrefix(component.Version, "v")
+    case "pause":
+        // pause 根本不在 components 里！
+    }
+}
+```
+这种推导逻辑本质上是把 [defaults.go](file:///d:/code/github/cluster-api-provider-bke/common/cluster/initialize/defaults.go#L96-L114) 中的 `GetDefaultEtcdK8sVersionImageMap()` 和 `GetDefaultPauseK8sVersionImageMap()` **重新硬编码了一遍**，只是从 Go 代码搬到了推导逻辑中。
+#### 问题 2：一个组件对应多个镜像的 1:N 关系
+Kubernetes 组件对应 4 个镜像，Addon（如 calico）可能对应 5+ 个镜像。components 的结构是：
+```yaml
+components:
+  - name: kubernetes
+    version: v1.25.6
+```
+如果要从 components 推导 images，需要在 ComponentVersion 中嵌入镜像列表：
+```yaml
+components:
+  - name: kubernetes
+    version: v1.25.6
+    images:                          # ← 这不就是把 images 字段搬了个位置？
+      - name: kube-apiserver
+        tag: v1.25.6
+      - name: kube-controller-manager
+        tag: v1.25.6
+      - name: kube-scheduler
+        tag: v1.25.6
+      - name: kubelet
+        tag: v1.25.6
+```
+**这和单独的 images 列表没有本质区别，只是换了个嵌套位置。**
+#### 问题 3：镜像仓库地址不属于 VersionPackage
+完整镜像 = `仓库地址/镜像名:Tag`
+- `镜像名:Tag` → 版本相关，属于 VersionPackage
+- `仓库地址` → 运行时上下文，属于 ClusterSpec
+
+当前代码中，镜像仓库地址由 [config.go](file:///d:/code/github/cluster-api-provider-bke/common/cluster/initialize/config.go#L151) 的 `ImageFuyaoRepo()` 从 ClusterSpec.ImageRepo 动态计算。VersionPackage 中的 images 只能声明 `name:tag`，不能包含仓库地址。
+#### 问题 4：Addon 镜像的生命周期不同
+从 [ensure_addon_deploy.go](file:///d:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_addon_deploy.go) 和 [Product](file:///d:/code/github/cluster-api-provider-bke/api/bkecommon/v1beta1/bkecluster_spec.go#L280) 结构可以看到，Addon 是通过 Chart 部署的，其镜像定义在 Chart 的 values.yaml 中，不由 VersionPackage 控制。
+```
+Addon 镜像来源：
+  calico    → calico chart values.yaml → calico-node, calico-kube-controllers, ...
+  coredns   → coredns chart values.yaml → coredns/coredns:v1.8.0
+  bkeagent  → bkeagent chart values.yaml → bkeagent-deployer:v1.2.3
+```
+这些镜像不应该出现在 VersionPackage 的 images 列表中，因为它们由 Addon 自己管理。
+### 三、images 是否应该保留？——分类讨论
+将系统中的镜像按特征分类：
+
+| 镜像类别 | 示例 | 版本来源 | 1:N 关系 | 是否应入 VersionPackage |
+|---------|------|---------|---------|----------------------|
+| **K8s 核心镜像** | kube-apiserver, kube-controller-manager, kube-scheduler, kubelet | = K8s 组件版本 | 1:4 | ✅ 可以从组件推导 |
+| **K8s 依赖镜像** | etcd, pause | ≠ 任何组件版本，独立版本 | 1:1 | ❌ 无法从组件推导 |
+| **基础设施镜像** | coredns, haproxy, keepalived | 独立版本 | 1:1 | ❌ 无法从组件推导 |
+| **Addon 镜像** | calico-*, bkeagent-*, csi-* | 由 Chart 管理 | 1:N | ❌ 不属于版本包 |
+| **工具镜像** | etcdctl, kubeadm, crictl | 跟随组件版本 | 1:1 | ⚠️ 可选 |
+
+**结论：K8s 核心镜像可以从组件推导，但 etcd/pause/coredns 等依赖镜像无法从 components 推导。**
+### 四、推荐方案：保留 images，但重新定义语义
+#### 4.1 images 的正确定位
+images 不是 components 的冗余副本，而是**补充 components 无法覆盖的镜像信息**：
+```
+components: 描述"有什么组件，什么版本"    → 供给侧视角
+images:     描述"需要拉取什么镜像"         → 消费侧视角
+```
+两者的关系：
+```
+components                          images
+┌─────────────────────┐            ┌─────────────────────────────┐
+│ kubernetes v1.25.6  │────推导───→│ kube-apiserver:v1.25.6      │
+│                     │            │ kube-controller-manager:... │
+│                     │            │ kube-scheduler:...          │
+│                     │            │ kubelet:v1.25.6             │
+├─────────────────────┤            ├─────────────────────────────┤
+│ etcd v3.5.21-of.1   │────推导───→│ etcd:3.5.21-of.1            │
+│                     │            │                             │
+│ (无法推导 pause)    │            │ pause:3.9        ← 独立声明 │
+│ (无法推导 coredns)  │            │ coredns:v1.8.0   ← 独立声明 │
+└─────────────────────┘            └─────────────────────────────┘
+```
+#### 4.2 重构后的 ComponentVersion 和 ImageDefinition
+```go
+type ComponentVersion struct {
+    Name     string        `json:"name"`
+    Version  string        `json:"version"`
+    Type     ComponentType `json:"type,omitempty"`
+    Critical bool          `json:"critical,omitempty"`
+    
+    // Images: 该组件对应的镜像列表
+    // 对于 kubernetes 组件，这里列出 4 个核心镜像
+    // 对于 etcd 组件，这里列出 etcd 镜像
+    // 如果为空，则使用默认推导规则：imageName = componentName, tag = version
+    Images []ComponentImage `json:"images,omitempty"`
+}
+
+type ComponentImage struct {
+    // Name: 镜像名称，如 "kube-apiserver", "etcd"
+    Name string `json:"name"`
+    
+    // Tag: 镜像标签，如 "v1.25.6", "3.5.21-of.1"
+    // 如果为空，默认使用父级 ComponentVersion.Version
+    Tag string `json:"tag,omitempty"`
+}
+
+type ImageDefinition struct {
+    // Name: 镜像名称
+    Name string `json:"name"`
+    
+    // Tag: 镜像标签
+    Tag string `json:"tag"`
+    
+    // Component: 关联的组件名称（可选）
+    // 有此字段的镜像可以通过 components 查询
+    // 无此字段的镜像是独立镜像（如 pause, coredns）
+    Component string `json:"component,omitempty"`
+    
+    // Category: 镜像分类
+    // "core" = 核心组件镜像（可通过 components 推导）
+    // "dependency" = 依赖镜像（无法从 components 推导，如 pause, coredns）
+    // "tool" = 工具镜像（如 etcdctl, kubeadm）
+    Category ImageCategory `json:"category,omitempty"`
+    
+    // Archs: 支持的架构
+    Archs []string `json:"archs,omitempty"`
+    
+    // Digest: 镜像摘要
+    Digest string `json:"digest,omitempty"`
+}
+
+type ImageCategory string
+
+const (
+    ImageCategoryCore       ImageCategory = "core"
+    ImageCategoryDependency ImageCategory = "dependency"
+    ImageCategoryTool       ImageCategory = "tool"
+)
+```
+#### 4.3 VersionPackageSpec 最终设计
+```go
+type VersionPackageSpec struct {
+    Version       string              `json:"version"`
+    ReleaseDate   *metav1.Time        `json:"releaseDate,omitempty"`
+    Deprecated    bool                `json:"deprecated,omitempty"`
+    
+    // Components: 组件版本列表
+    // 每个组件可声明其对应的镜像（ComponentImage）
+    // K8s 核心镜像通过此字段推导
+    Components    []ComponentVersion  `json:"components"`
+    
+    // Images: 独立镜像列表
+    // 只包含无法从 Components 推导的镜像：
+    //   - dependency 类：pause, coredns, haproxy, keepalived
+    //   - tool 类：etcdctl, kubeadm
+    // 不包含 core 类镜像（已在 Components.Images 中声明）
+    Images        []ImageDefinition   `json:"images,omitempty"`
+    
+    // Compatibility: 兼容性矩阵
+    Compatibility CompatibilityMatrix `json:"compatibility"`
+    
+    // OSRequirements: OS 要求
+    OSRequirements []OSRequirement    `json:"osRequirements,omitempty"`
+}
+```
+#### 4.4 YAML 示例
+```yaml
+apiVersion: versionpackage.bke.bocloud.com/v1beta1
+kind: VersionPackage
+metadata:
+  name: v2.1.0
+spec:
+  version: v2.1.0
+  components:
+    - name: kubernetes
+      version: v1.27.0
+      type: core
+      critical: true
+      images:
+        - name: kube-apiserver
+        - name: kube-controller-manager
+        - name: kube-scheduler
+        - name: kubelet
+        # tag 为空，默认使用 kubernetes 的 version: v1.27.0
+    
+    - name: etcd
+      version: v3.5.8-0
+      type: core
+      critical: true
+      images:
+        - name: etcd
+          tag: "3.5.8-0"    # 显式声明，因为 tag ≠ version（无 v 前缀）
+    
+    - name: containerd
+      version: "1.6.24"
+      type: runtime
+      # 无 images：containerd 不是容器镜像
+
+  # 独立镜像：无法从 components 推导
+  images:
+    - name: pause
+      tag: "3.9"
+      category: dependency
+    
+    - name: coredns/coredns
+      tag: v1.9.3
+      category: dependency
+    
+    - name: haproxy
+      tag: "2.8.0"
+      category: dependency
+    
+    - name: keepalived
+      tag: "2.2.8"
+      category: dependency
+```
+#### 4.5 镜像查询 API
+```go
+// pkg/versionpackage/image_resolver.go
+
+type ImageResolver struct {
+    vp *VersionPackage
+}
+
+// ResolveAll 解析版本包中的所有镜像（components 镜像 + 独立镜像）
+func (r *ImageResolver) ResolveAll() []ResolvedImage {
+    var images []ResolvedImage
+    
+    // 1. 从 Components 推导镜像
+    for _, comp := range r.vp.Spec.Components {
+        for _, img := range comp.Images {
+            tag := img.Tag
+            if tag == "" {
+                tag = comp.Version
+            }
+            images = append(images, ResolvedImage{
+                Name:      img.Name,
+                Tag:       tag,
+                Component: comp.Name,
+                Category:  ImageCategoryCore,
+            })
+        }
+    }
+    
+    // 2. 加入独立镜像
+    for _, img := range r.vp.Spec.Images {
+        images = append(images, ResolvedImage{
+            Name:      img.Name,
+            Tag:       img.Tag,
+            Component: img.Component,
+            Category:  img.Category,
+        })
+    }
+    
+    return images
+}
+
+// ResolveByComponent 按组件查询镜像
+// 替代当前 exporter.go 的 generateImageMap()
+func (r *ImageResolver) ResolveByComponent(componentName string) []ResolvedImage {
+    var images []ResolvedImage
+    for _, comp := range r.vp.Spec.Components {
+        if comp.Name == componentName {
+            for _, img := range comp.Images {
+                tag := img.Tag
+                if tag == "" {
+                    tag = comp.Version
+                }
+                images = append(images, ResolvedImage{
+                    Name:      img.Name,
+                    Tag:       tag,
+                    Component: comp.Name,
+                })
+            }
+        }
+    }
+    return images
+}
+
+// ResolveByPhase 按部署阶段查询镜像
+// 替代当前 exporter.go 的 ExportImageMapWithBootStrapPhase()
+func (r *ImageResolver) ResolveByPhase(phase string) []ResolvedImage {
+    switch phase {
+    case "InitControlPlane", "JoinControlPlane", "UpgradeControlPlane":
+        return r.ResolveAll()
+    case "JoinWorker", "UpgradeWorker":
+        return r.ResolveByComponent("") | filter(pause)
+    default:
+        return nil
+    }
+}
+
+type ResolvedImage struct {
+    Name      string        `json:"name"`
+    Tag       string        `json:"tag"`
+    Component string        `json:"component,omitempty"`
+    Category  ImageCategory `json:"category,omitempty"`
+}
+
+// FullReference 返回完整镜像引用（需运行时注入仓库地址）
+func (i *ResolvedImage) FullReference(repo string) string {
+    return fmt.Sprintf("%s/%s:%s", repo, i.Name, i.Tag)
+}
+```
+### 五、对比总结
+| 方案 | 描述 | 优点 | 缺点 |
+|------|------|------|------|
+| **A: 删除 images，全部从 components 推导** | components 中嵌入 ComponentImage | 统一入口，无冗余 | pause/coredns 等独立镜像无处安放；需虚构"pause 组件" |
+| **B: 保留 images，与 components 完全独立** | components 管版本，images 管镜像 | 职责清晰 | K8s 核心镜像在两处重复声明（components 中有版本，images 中又有） |
+| **C: components 含 ComponentImage + images 只放独立镜像** ✅ | 核心镜像从组件推导，独立镜像单独声明 | 无冗余；覆盖所有场景；语义清晰 | components 结构稍复杂 |
+
+**方案 C 是最优解：**
+1. **K8s 核心镜像**（kube-apiserver 等）通过 `ComponentVersion.Images` 声明，tag 默认等于组件版本，避免冗余
+2. **独立镜像**（pause, coredns 等）通过 `VersionPackageSpec.Images` 声明，`category: dependency` 标识
+3. **镜像仓库地址**不在 VersionPackage 中，由运行时 `ImageResolver.FullReference(repo)` 注入
+4. **Addon 镜像**不在 VersionPackage 中，由 Addon Chart 自行管理
+
+**核心原则：images 不是 components 的冗余副本，而是 components 无法覆盖的补充。核心镜像归 components，独立镜像归 images。**
+
+    
+# CompatibilityMatrix Phase 6 的设计
+## Phase 6 设计回顾与总结
+根据之前的讨论，Phase 6 涉及四个核心 CRD 的设计，经过多轮分析，我们得出了以下关键结论：
+### 1. VersionPackage CRD — 版本包管理
+**核心定位**：声明式定义一个版本发布所包含的组件和镜像，是版本发布的"快照"。
+
+**关键设计决策**：
+
+| 属性 | 是否包含 | 理由 |
+|------|---------|------|
+| `components` | ✅ 包含 | 核心属性，定义版本包中的组件列表及其版本 |
+| `images` | ✅ 包含 | 虽然组件列表可推导镜像，但组件→镜像映射关系复杂（如 etcd 镜像 tag 与 K8s 版本非线性对应），显式声明可避免运行时计算错误，且便于镜像预拉取和离线部署 |
+| `asset` | ❌ 不包含 | Asset 是运行时产物（证书、manifest、配置），不属于版本包的静态声明范畴，应通过 AssetDefinition CRD 独立管理 |
+| `compatibility` | ❌ 不包含 | 兼容性信息需要在版本包发布后持续更新（如发现新的不兼容场景），应通过 CompatibilityMatrix CRD 独立演进 |
+
+**最终结构**：
+```go
+type VersionPackageSpec struct {
+    Version     string              `json:"version"`
+    ReleaseDate metav1.Time         `json:"releaseDate"`
+    Description string              `json:"description"`
+    Components  []ComponentVersion  `json:"components"`
+    Images      []ImageSpec         `json:"images"`
+}
+```
+### 2. ClusterUpgradePath CRD — 升级路径管理
+**核心定位**：独立于 VersionPackage 的升级路径定义，支持 DAG 并行执行。
+
+**关键设计决策**：
+
+| 设计点 | 决策 | 理由 |
+|--------|------|------|
+| 与 VersionPackage 分离 | ✅ 独立 CRD | 版本发布与升级路径发布独立演进，版本包发布后可逐步补充升级路径 |
+| 执行模型 | DAG 并行 | 替代原有 `UpgradeOrder []LayerUpgrade` 的顺序执行，支持无依赖步骤并行 |
+| 引用方式 | 通过 version label 关联 | `spec.fromVersion` / `spec.toVersion` 关联 VersionPackage |
+
+**DAG 并行设计**：
+```go
+type ClusterUpgradePathSpec struct {
+    FromVersion string           `json:"fromVersion"`
+    ToVersion   string           `json:"toVersion"`
+    Type        UpgradePathType  `json:"type"`
+    Tasks       []UpgradeTask    `json:"tasks"`
+    PreCheck    PreCheck         `json:"preCheck"`
+    Rollback    RollbackConfig   `json:"rollback"`
+}
+
+type UpgradeTask struct {
+    Name         string   `json:"name"`
+    Layer        string   `json:"layer"`
+    Component    string   `json:"component"`
+    DependsOn    []string `json:"dependsOn,omitempty"`
+    Action       string   `json:"action"`
+    Timeout      *metav1.Duration `json:"timeout,omitempty"`
+}
+```
+DAG 调度器根据 `DependsOn` 构建依赖图，拓扑排序后并行执行无依赖的 task。
+### 3. AssetDefinition CRD — 资产框架
+**核心定位**：定义集群运行时资产的生成逻辑和依赖关系。
+
+**关键设计决策**：
+
+| 设计点 | 决策 | 理由 |
+|--------|------|------|
+| Asset 不限于 Provisioning | ✅ | Asset 在 Provisioning 和 Upgrade 阶段都会使用（如证书轮换、manifest 更新） |
+| DAG 依赖管理 | ✅ | 资产间存在依赖（如 kubeconfig 依赖证书，manifest 依赖 kubeconfig） |
+| 独立于 VersionPackage | ✅ | 资产生成逻辑是运行时行为，不属于版本包的静态声明 |
+
+**Asset 使用场景**：
+- **Provisioning**：首次生成所有资产（证书、kubeconfig、manifest、配置文件）
+- **Upgrade**：部分资产需要重新生成（如 K8s 版本升级后 API Server manifest 变更）
+- **Maintenance**：证书轮换、配置更新
+### 4. CompatibilityMatrix CRD — 兼容性矩阵
+**核心定位**：独立于 VersionPackage 的兼容性信息管理，支持版本发布后持续更新。
+
+**关键设计决策**：
+
+| 设计点 | 决策 | 理由 |
+|--------|------|------|
+| 与 VersionPackage 分离 | ✅ 独立 CRD | 兼容性信息需要在版本包发布后持续补充（如发现新的不兼容场景、新增 OS 支持） |
+| 可独立演进 | ✅ | 修改兼容性信息不需要重新发布 VersionPackage |
+| 多维度兼容性 | ✅ | 包括 K8s 版本范围、组件兼容、OS 兼容、Addon 兼容 |
+
+**最终结构**：
+```go
+type CompatibilityMatrixSpec struct {
+    TargetVersion       string                    `json:"targetVersion"`
+    K8sVersionRange     VersionRange              `json:"k8sVersionRange"`
+    ComponentCompat     []ComponentCompatibility  `json:"componentCompat"`
+    OSCompatibility     []OSCompatibility         `json:"osCompatibility"`
+    AddonCompatibility  []AddonCompatibility      `json:"addonCompatibility,omitempty"`
+}
+
+type VersionRange struct {
+    MinVersion string `json:"minVersion"`
+    MaxVersion string `json:"maxVersion,omitempty"`
+}
+```
+### 5. 四个 CRD 的关系图
+```
+┌────────────────────┐        ┌────────────────────────┐
+│  VersionPackage    │        │  CompatibilityMatrix   │
+│  (版本快照)        │◄───────│  (兼容性约束)          │
+│  - components      │ 引用   │  - targetVersion       │
+│  - images          │        │  - k8sVersionRange     │
+└────────────────────┘        │  - componentCompat     │
+         │                    │  - osCompatibility     │
+         │ 引用               └────────────────────────┘
+         ▼
+┌────────────────────────┐    ┌────────────────────────┐
+│  ClusterUpgradePath    │    │  AssetDefinition       │
+│  (升级路径)            │    │  (资产生成逻辑)        │
+│  - fromVersion         │    │  - assetType           │
+│  - toVersion           │    │  - dependencies (DAG)  │
+│  - tasks (DAG)         │    │  - generator           │
+│  - dependsOn           │    │  - params              │
+└────────────────────────┘    └────────────────────────┘
+```
+
+**关联方式**：
+- `CompatibilityMatrix.targetVersion` → 引用 `VersionPackage.version`
+- `ClusterUpgradePath.fromVersion/toVersion` → 引用 `VersionPackage.version`
+- `AssetDefinition` 通过 Phase 框架在 Provisioning/Upgrade 阶段被调用
+### 6. 对现有代码的影响
+| 现有代码 | 变更 |
+|---------|------|
+| [defaults.go](file:///d:/code/github/cluster-api-provider-bke/common/cluster/initialize/defaults.go) 中的硬编码版本常量 | 迁移到 VersionPackage CRD |
+| [validation.go](file:///d:/code/github/cluster-api-provider-bke/common/cluster/validation/validation.go) 中的硬编码版本范围 | 迁移到 CompatibilityMatrix CRD |
+| [exporter.go](file:///d:/code/github/cluster-api-provider-bke/common/cluster/imagehelper/exporter.go) 中的镜像映射逻辑 | 迁移到 VersionPackage.images |
+| [refactor.md](file:///d:/code/github/cluster-api-provider-bke/code/refactor.md) 中的 `UpgradeOrder []LayerUpgrade` | 重构为 DAG-based `Tasks []UpgradeTask` |
+
+以上是 Phase 6 四个核心 CRD 的完整设计总结。每个 CRD 都遵循了**关注点分离**原则，确保各自可以独立演进。如果你需要进一步深入某个 CRD 的实现细节，或者想讨论其他阶段的设计，请告诉我。
