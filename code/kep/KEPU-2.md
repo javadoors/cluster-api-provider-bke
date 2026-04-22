@@ -1884,3 +1884,435 @@ spec:
 | EnsureClusterManage | → **clusterManage** ComponentVersion | 已补充 |
 
 > **总结**：原提案列出了 13 个 ComponentVersion YAML，缺少 **clusterManage**（纳管现有集群）、**nodeDelete**（节点删除/缩容）、**clusterHealth**（集群健康检查）3 个组件。补充后共 **16 个** ComponentVersion，完整覆盖所有 26 个 Phase。
+
+# etcd 逐节点升级的核心流程
+现在我已经完整理解了 etcd 升级的全部业务逻辑。让我分析关键问题：
+
+**etcd 逐节点升级的核心流程**：
+
+1. **Controller 端**（[ensure_etcd_upgrade.go](file:///d:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_etcd_upgrade.go)）：逐节点循环 → 对每个节点发送 Agent Command → 等待命令完成 → 健康检查（查 Pod 镜像版本）→ 下一个节点
+2. **Agent 端**（[kubeadm.go](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/kubeadm/kubeadm.go)）：收到 `UpgradeEtcd` 命令 → 备份 etcd → 备份 /etc/kubernetes → 预拉镜像 → 生成新 static pod manifest → 重启 kubelet → 等待 Pod Ready
+
+**核心难点**：逐节点升级涉及 Controller 端的**循环编排**（for each node → send command → wait → health check → next node），这不是单节点脚本能完成的，需要 Controller 端的编排逻辑。
+## 分析结论
+**纯脚本可以实现对 etcd 节点逐节点升级**，但需要在 ActionSpec 中引入新的编排类型。具体来说，当前 `ActionStrategy.ExecutionMode=Rolling` 只表达了"滚动执行"的意图，但没有表达**"逐节点：对每个节点执行完整步骤序列（备份→升级→健康检查），确认成功后再处理下一个节点"**这一编排语义。
+
+有两种解决方案：
+### 方案 A：增强 ActionSpec 的 Rolling 策略（推荐）
+在现有 `ActionSpec` 框架内，通过增强 `Rolling` 策略的语义，让 ActionEngine 理解"逐节点执行全部 steps + postCheck，成功后再处理下一个节点"。**不需要新增 ActionType**，只需让 ActionEngine 的 Rolling 执行器正确编排。
+### 方案 B：新增 `Pipeline` ActionType
+新增一种 `Pipeline` 类型，显式声明多阶段流水线，每个阶段可独立定义 nodeSelector 和 postCheck。
+
+**我推荐方案 A**，因为它与现有设计一致，且 etcd 逐节点升级本质上就是 Rolling 策略的语义增强。下面给出方案 A 的完整实现：
+### 修正后的 etcd ComponentVersion YAML
+```yaml
+apiVersion: nodecomponent.io/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: etcd-v3.5.12
+  namespace: cluster-system
+spec:
+  componentName: etcd
+  version: v3.5.12
+  scope: Node
+  dependencies: [nodesEnv]
+  nodeSelector:
+    roles: [master]
+
+  installAction:
+    steps:
+      - name: setup-etcd-environment
+        type: Script
+        script: |
+          #!/bin/bash
+          set -e
+          ETCD_DATA_DIR="{{.EtcdDataDir}}"
+          mkdir -p -m 700 ${ETCD_DATA_DIR}
+          id etcd || useradd -r -c "etcd user" -s /sbin/nologin etcd -d ${ETCD_DATA_DIR}
+          chown -R etcd:etcd ${ETCD_DATA_DIR}
+      - name: generate-etcd-manifest
+        type: Manifest
+        manifest: |
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: etcd-{{.NodeHostname}}
+            namespace: kube-system
+            annotations:
+              kubernetes.io/config.hash: ""
+          spec:
+            hostNetwork: true
+            securityContext:
+              runAsUser: 0
+            containers:
+            - name: etcd
+              image: {{.ImageRepo}}/etcd:{{.Version}}
+              command:
+              - /bin/sh
+              - -c
+              - |
+                exec etcd \
+                  --advertise-client-urls=https://{{.NodeIP}}:2379 \
+                  --cert-file=/etc/kubernetes/pki/etcd/server.crt \
+                  --client-cert-auth=true \
+                  --data-dir={{.EtcdDataDir}} \
+                  --experimental-initial-corrupt-check=true \
+                  --experimental-watch-progress-notify-interval=5s \
+                  --initial-advertise-peer-urls=https://{{.NodeIP}}:2380 \
+                  --initial-cluster={{.EtcdInitialCluster}} \
+                  --initial-cluster-state=new \
+                  --key-file=/etc/kubernetes/pki/etcd/server.key \
+                  --listen-client-urls=https://127.0.0.1:2379,https://{{.NodeIP}}:2379 \
+                  --listen-metrics-urls=http://127.0.0.1:2381 \
+                  --listen-peer-urls=https://{{.NodeIP}}:2380 \
+                  --name={{.NodeHostname}} \
+                  --peer-cert-file=/etc/kubernetes/pki/etcd/peer.crt \
+                  --peer-client-cert-auth=true \
+                  --peer-key-file=/etc/kubernetes/pki/etcd/peer.key \
+                  --peer-trusted-ca-file=/etc/kubernetes/pki/etcd/ca.crt \
+                  --snapshot-count=10000 \
+                  --trusted-ca-file=/etc/kubernetes/pki/etcd/ca.crt
+              livenessProbe:
+                httpGet:
+                  path: /health?exclude=NOSPACE
+                  port: 2381
+                  host: 127.0.0.1
+                initialDelaySeconds: 10
+                timeoutSeconds: 15
+              readinessProbe:
+                httpGet:
+                  path: /health
+                  port: 2381
+                  host: 127.0.0.1
+                initialDelaySeconds: 10
+                timeoutSeconds: 15
+              volumeMounts:
+              - name: etcd-data
+                mountPath: /var/lib/etcd
+              - name: etcd-certs
+                mountPath: /etc/kubernetes/pki/etcd
+                readOnly: true
+            volumes:
+            - name: etcd-data
+              hostPath:
+                path: {{.EtcdDataDir}}
+                type: DirectoryOrCreate
+            - name: etcd-certs
+              hostPath:
+                path: /etc/kubernetes/pki/etcd
+                type: DirectoryOrCreate
+      - name: restart-kubelet
+        type: Script
+        script: |
+          if [ -f /etc/systemd/system/kubelet.service ]; then
+            systemctl restart kubelet
+          fi
+    postCheck:
+      name: verify-etcd-pod-running
+      type: Script
+      script: |
+        #!/bin/bash
+        set -e
+        POD_NAME="etcd-{{.NodeHostname}}"
+        for i in $(seq 1 60); do
+          if kubectl get pod -n kube-system ${POD_NAME} -o jsonpath='{.status.phase}' 2>/dev/null | grep -q "Running"; then
+            if kubectl get pod -n kube-system ${POD_NAME} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null | grep -q "True"; then
+              echo "etcd pod is running and ready"
+              exit 0
+            fi
+          fi
+          sleep 2
+        done
+        echo "etcd pod not ready after 120s"
+        exit 1
+      timeout: 180s
+      interval: 5s
+
+  upgradeAction:
+    preCheck:
+      name: check-agent-ready
+      type: Script
+      script: |
+        #!/bin/bash
+        for i in $(seq 1 30); do
+          if systemctl is-active bke-agent >/dev/null 2>&1; then
+            echo "agent is ready"
+            exit 0
+          fi
+          sleep 2
+        done
+        echo "agent is not ready"
+        exit 1
+      timeout: 60s
+    steps:
+      - name: backup-etcd
+        type: Script
+        condition: "{{.IsFirstEtcdNode}} == true"
+        script: |
+          #!/bin/bash
+          set -e
+          BACKUP_DIR="/var/lib/bke/workspace/etcd-backup"
+          mkdir -p ${BACKUP_DIR}
+          BACKUP_NAME="backup-$(date +%Y%m%d%H%M).db"
+          ETCDCTL_API=3 etcdctl \
+            --endpoints=https://127.0.0.1:2379 \
+            --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+            --cert=/etc/kubernetes/pki/etcd/server.crt \
+            --key=/etc/kubernetes/pki/etcd/server.key \
+            snapshot save ${BACKUP_DIR}/${BACKUP_NAME}
+          echo "etcd backup saved to ${BACKUP_DIR}/${BACKUP_NAME}"
+      - name: backup-cluster-etc
+        type: Script
+        script: |
+          #!/bin/bash
+          set -e
+          BACKUP_DIR="/var/lib/bke/workspace/backup/etc/kubernetes"
+          mkdir -p ${BACKUP_DIR}
+          cp -rf /etc/kubernetes/* ${BACKUP_DIR}/
+      - name: pre-pull-image
+        type: Script
+        script: |
+          #!/bin/bash
+          set -e
+          ctr -n k8s.io images pull {{.ImageRepo}}/etcd:{{.Version}} || true
+      - name: check-need-upgrade
+        type: Script
+        script: |
+          #!/bin/bash
+          CURRENT_IMAGE=$(kubectl get pod -n kube-system etcd-{{.NodeHostname}} -o jsonpath='{.spec.containers[0].image}' 2>/dev/null)
+          if echo "${CURRENT_IMAGE}" | grep -q "{{.Version}}"; then
+            echo "SKIP: etcd already at version {{.Version}}"
+            exit 0
+          fi
+          echo "NEED_UPGRADE"
+      - name: generate-new-etcd-manifest
+        type: Manifest
+        condition: "{{.Steps.check-need-upgrade.stdout}} == NEED_UPGRADE"
+        manifest: |
+          # 同 installAction 中的 etcd static pod manifest，镜像 tag 更新为 {{.Version}}
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: etcd-{{.NodeHostname}}
+            namespace: kube-system
+          spec:
+            containers:
+            - name: etcd
+              image: {{.ImageRepo}}/etcd:{{.Version}}
+              command:
+              - /bin/sh
+              - -c
+              - |
+                exec etcd \
+                  --advertise-client-urls=https://{{.NodeIP}}:2379 \
+                  --cert-file=/etc/kubernetes/pki/etcd/server.crt \
+                  --client-cert-auth=true \
+                  --data-dir={{.EtcdDataDir}} \
+                  --experimental-initial-corrupt-check=true \
+                  --experimental-watch-progress-notify-interval=5s \
+                  --initial-advertise-peer-urls=https://{{.NodeIP}}:2380 \
+                  --initial-cluster={{.EtcdInitialCluster}} \
+                  --initial-cluster-state=new \
+                  --key-file=/etc/kubernetes/pki/etcd/server.key \
+                  --listen-client-urls=https://127.0.0.1:2379,https://{{.NodeIP}}:2379 \
+                  --listen-metrics-urls=http://127.0.0.1:2381 \
+                  --listen-peer-urls=https://{{.NodeIP}}:2380 \
+                  --name={{.NodeHostname}} \
+                  --peer-cert-file=/etc/kubernetes/pki/etcd/peer.crt \
+                  --peer-client-cert-auth=true \
+                  --peer-key-file=/etc/kubernetes/pki/etcd/peer.key \
+                  --peer-trusted-ca-file=/etc/kubernetes/pki/etcd/ca.crt \
+                  --snapshot-count=10000 \
+                  --trusted-ca-file=/etc/kubernetes/pki/etcd/ca.crt
+              volumeMounts:
+              - name: etcd-data
+                mountPath: /var/lib/etcd
+              - name: etcd-certs
+                mountPath: /etc/kubernetes/pki/etcd
+                readOnly: true
+            volumes:
+            - name: etcd-data
+              hostPath:
+                path: {{.EtcdDataDir}}
+                type: DirectoryOrCreate
+            - name: etcd-certs
+              hostPath:
+                path: /etc/kubernetes/pki/etcd
+                type: DirectoryOrCreate
+      - name: restart-kubelet
+        type: Script
+        condition: "{{.Steps.check-need-upgrade.stdout}} == NEED_UPGRADE"
+        script: |
+          if [ -f /etc/systemd/system/kubelet.service ]; then
+            systemctl restart kubelet
+          fi
+    postCheck:
+      name: verify-etcd-version-and-health
+      type: Script
+      script: |
+        #!/bin/bash
+        set -e
+        POD_NAME="etcd-{{.NodeHostname}}"
+        # 1. 等待 Pod hash 变化（表示 manifest 已更新）
+        OLD_HASH="{{.Steps.check-need-upgrade.podHash}}"
+        for i in $(seq 1 60); do
+          NEW_HASH=$(kubectl get pod -n kube-system ${POD_NAME} -o jsonpath='{.metadata.annotations.kubernetes\.io/config\.hash}' 2>/dev/null || echo "")
+          if [ -n "${NEW_HASH}" ] && [ "${NEW_HASH}" != "${OLD_HASH}" ]; then
+            break
+          fi
+          sleep 1
+        done
+        # 2. 等待 Pod Running + Ready
+        for i in $(seq 1 60); do
+          PHASE=$(kubectl get pod -n kube-system ${POD_NAME} -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+          READY=$(kubectl get pod -n kube-system ${POD_NAME} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
+          if [ "${PHASE}" = "Running" ] && [ "${READY}" = "True" ]; then
+            # 3. 验证镜像版本
+            IMAGE=$(kubectl get pod -n kube-system ${POD_NAME} -o jsonpath='{.spec.containers[0].image}' 2>/dev/null || echo "")
+            if echo "${IMAGE}" | grep -q "{{.Version}}"; then
+              # 4. 验证 etcd 健康状态
+              ETCDCTL_API=3 etcdctl \
+                --endpoints=https://127.0.0.1:2379 \
+                --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+                --cert=/etc/kubernetes/pki/etcd/server.crt \
+                --key=/etc/kubernetes/pki/etcd/server.key \
+                endpoint health 2>/dev/null | grep -q "is healthy"
+              if [ $? -eq 0 ]; then
+                echo "etcd upgrade success, version: {{.Version}}"
+                exit 0
+              fi
+            fi
+          fi
+          sleep 2
+        done
+        echo "etcd upgrade health check failed"
+        exit 1
+      timeout: 300s
+      interval: 5s
+    strategy:
+      executionMode: Rolling
+      batchSize: 1
+      batchInterval: 30s
+      # 关键：逐节点执行全部 steps + postCheck，成功后再处理下一个节点
+      waitForCompletion: true
+      failurePolicy: FailFast
+
+  uninstallAction:
+    steps:
+      - name: remove-etcd-manifest
+        type: Script
+        script: |
+          rm -f /etc/kubernetes/manifests/etcd.yaml
+      - name: clean-etcd-data
+        type: Script
+        script: |
+          rm -rf {{.EtcdDataDir}}
+          rm -rf /etc/kubernetes
+
+  healthCheck:
+    steps:
+      - name: etcd-endpoint-health
+        type: Script
+        script: |
+          ETCDCTL_API=3 etcdctl \
+            --endpoints=https://127.0.0.1:2379 \
+            --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+            --cert=/etc/kubernetes/pki/etcd/server.crt \
+            --key=/etc/kubernetes/pki/etcd/server.key \
+            endpoint health
+        expectedOutput: "is healthy"
+        timeout: 60s
+        interval: 10s
+      - name: etcd-pod-running
+        type: Script
+        script: |
+          kubectl get pod -n kube-system etcd-{{.NodeHostname}} -o jsonpath='{.status.phase}'
+        expectedOutput: "Running"
+        timeout: 30s
+```
+### ActionSpec 需要增强的字段
+为了支持 etcd 逐节点升级，需要对 `ActionStrategy` 增加以下字段：
+```go
+type ActionStrategy struct {
+    ExecutionMode    ExecutionMode     `json:"executionMode,omitempty"`
+    BatchSize        int               `json:"batchSize,omitempty"`
+    BatchInterval    *metav1.Duration  `json:"batchInterval,omitempty"`
+
+    // ===== 新增字段 =====
+
+    // WaitForCompletion 为 true 时，ActionEngine 对每个节点执行完 steps + postCheck 后，
+    // 确认成功才处理下一个节点；为 false 时，steps 对所有节点并行执行
+    WaitForCompletion bool             `json:"waitForCompletion,omitempty"`
+
+    // FailurePolicy 控制某个节点失败后的行为
+    // FailFast: 立即停止，不再处理后续节点
+    // Continue: 跳过失败节点，继续处理下一个
+    FailurePolicy     FailurePolicy    `json:"failurePolicy,omitempty"`
+}
+```
+### ActionEngine Rolling 执行器的核心逻辑
+```go
+func (e *ActionEngine) executeRolling(
+    ctx context.Context,
+    action *ActionSpec,
+    nodeConfigs []*v1alpha1.NodeConfig,
+    strategy ActionStrategy,
+) error {
+    batchSize := strategy.BatchSize
+    if batchSize <= 0 {
+        batchSize = 1
+    }
+
+    for i := 0; i < len(nodeConfigs); i += batchSize {
+        end := i + batchSize
+        if end > len(nodeConfigs) {
+            end = len(nodeConfigs)
+        }
+        batch := nodeConfigs[i:end]
+
+        // 对当前批次的每个节点，执行全部 steps
+        for _, nc := range batch {
+            templateCtx := e.templateCtx.ForNode(nc)
+
+            // 1. 执行 steps（逐步骤，支持 condition 和步骤间输出引用）
+            for _, step := range action.Steps {
+                if step.Condition != "" && !e.evaluateCondition(step.Condition, templateCtx) {
+                    continue
+                }
+                if err := e.executeStep(ctx, &step, nc, templateCtx); err != nil {
+                    if strategy.FailurePolicy == FailFast {
+                        return fmt.Errorf("node %s step %s failed: %w", nc.Name, step.Name, err)
+                    }
+                    continue
+                }
+            }
+
+            // 2. 执行 postCheck（等待健康检查通过）
+            if action.PostCheck != nil && strategy.WaitForCompletion {
+                if err := e.executeStepWithRetry(ctx, action.PostCheck, nc, templateCtx); err != nil {
+                    if strategy.FailurePolicy == FailFast {
+                        return fmt.Errorf("node %s postCheck failed: %w", nc.Name, err)
+                    }
+                    continue
+                }
+            }
+        }
+
+        // 3. 批次间隔
+        if strategy.BatchInterval != nil && i+batchSize < len(nodeConfigs) {
+            time.Sleep(strategy.BatchInterval.Duration)
+        }
+    }
+    return nil
+}
+```
+### 总结
+| 问题 | 结论 |
+|------|------|
+| 纯脚本能否实现 etcd 逐节点升级？ | **能**，但需要 ActionEngine 的 Rolling 执行器正确编排 |
+| 是否需要新增 ActionType？ | **不需要**，现有 Script + Manifest + Kubectl 类型足够 |
+| 需要增强什么？ | `ActionStrategy` 增加 `waitForCompletion` 和 `failurePolicy` 字段 |
+| 核心机制 | Rolling 策略 + `batchSize:1` + `waitForCompletion:true` = 逐节点执行 steps → postCheck → 下一节点 |
+| 步骤间输出引用 | `condition: "{{.Steps.check-need-upgrade.stdout}} == NEED_UPGRADE"` 实现条件跳过 |
+
+**关键设计点**：etcd 逐节点升级的本质不是"脚本复杂度"问题，而是"编排语义"问题——需要 ActionEngine 理解"对每个节点执行完整步骤序列并等待确认"这一语义。通过增强 Rolling 策略的 `waitForCompletion` 字段，可以在不引入新 ActionType 的前提下完整支持 etcd 逐节点升级。
