@@ -1496,5 +1496,391 @@ cluster-api-provider-bke/
 7. **模板验收**：模板变量正确渲染，条件表达式正确评估
 8. **兼容性验收**：Feature Gate 关闭时旧 PhaseFlow 正常运行
 
+# ComponentVersion YAML 完整性核查
+## ComponentVersion YAML 完整性核查
+### 一、Phase → ComponentVersion 映射核查
+#### 安装阶段（DeployPhases，11 个 Phase）
+| # | Phase | 提案中 ComponentVersion | 覆盖状态 |
+|---|-------|------------------------|---------|
+| 1 | EnsureBKEAgent | bkeAgent ✅ | 已列出 |
+| 2 | EnsureNodesEnv | nodesEnv ✅ | 已列出 |
+| 3 | EnsureClusterAPIObj | clusterAPI ✅ | 已列出 |
+| 4 | EnsureCerts | certs ✅ | 已列出 |
+| 5 | EnsureLoadBalance | loadBalancer ✅ | 已列出 |
+| 6 | EnsureMasterInit | kubernetes ✅ | 已列出（condition 分支） |
+| 7 | EnsureMasterJoin | kubernetes ✅ | 已列出（condition 分支） |
+| 8 | EnsureWorkerJoin | kubernetes ✅ | 已列出（condition 分支） |
+| 9 | EnsureAddonDeploy | addon ✅ | 已列出 |
+| 10 | EnsureNodesPostProcess | nodesPostProcess ✅ | 已列出 |
+| 11 | EnsureAgentSwitch | agentSwitch ✅ | 已列出 |
+#### 升级阶段（PostDeployPhases，10 个 Phase）
 
-        
+| # | Phase | 提案中 ComponentVersion | 覆盖状态 |
+|---|-------|------------------------|---------|
+| 1 | EnsureProviderSelfUpgrade | bkeProvider ✅ | 已列出 |
+| 2 | EnsureAgentUpgrade | bkeAgent ✅ | 已列出（upgradeAction） |
+| 3 | EnsureContainerdUpgrade | containerd ✅ | 已列出 |
+| 4 | EnsureEtcdUpgrade | etcd ✅ | 已列出 |
+| 5 | EnsureWorkerUpgrade | kubernetes ✅ | 已列出（condition 分支） |
+| 6 | EnsureMasterUpgrade | kubernetes ✅ | 已列出（condition 分支） |
+| 7 | EnsureWorkerDelete | ❌ **未列出** | **缺少** |
+| 8 | EnsureMasterDelete | ❌ **未列出** | **缺少** |
+| 9 | EnsureComponentUpgrade | openFuyao ✅ | 已列出 |
+| 10 | EnsureCluster | ❌ **未列出** | **缺少** |
+#### 控制阶段（CommonPhases，5 个 Phase）— 不映射为 ComponentVersion
+| # | Phase | 归属 | 说明 |
+|---|-------|------|------|
+| 1 | EnsureFinalizer | ClusterVersion Controller | 框架级逻辑，非组件 |
+| 2 | EnsurePaused | ClusterVersion Controller | 框架级逻辑，非组件 |
+| 3 | EnsureClusterManage | ❌ **未列出** | 纳管现有集群，独立场景 |
+| 4 | EnsureDeleteOrReset | ClusterVersion Controller | 框架级逻辑，非组件 |
+| 5 | EnsureDryRun | ClusterVersion Controller | 框架级逻辑，非组件 |
+### 二、缺少的 ComponentVersion YAML
+经过核查，**缺少 3 个组件的 YAML**：
+1. **clusterManage（纳管现有集群）**— EnsureClusterManage 的逻辑包含：收集集群基础信息 → 推送 Agent → 收集 Agent 信息 → 伪引导 → 兼容性补丁，这是一个独立于安装/升级的完整场景
+2. **nodeDelete（节点删除/缩容）**— EnsureWorkerDelete + EnsureMasterDelete 的逻辑包含：drain 节点 → 删除 Machine → 等待节点移除，缩容场景必需
+3. **clusterHealth（集群健康检查）**— EnsureCluster 的逻辑包含：检查所有 Node Ready → 检查组件健康 → 更新集群状态，升级后验证必需
+### 三、补充的 ComponentVersion YAML
+#### 3.1 clusterManage ComponentVersion YAML（纳管现有集群）
+```yaml
+apiVersion: nodecomponent.io/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: clustermanage-v1.0.0
+  namespace: cluster-system
+spec:
+  componentName: clusterManage
+  version: v1.0.0
+  scope: Cluster
+  dependencies: []
+
+  installAction:
+    preCheck:
+      name: check-not-bke-cluster
+      type: Script
+      script: |
+        #!/bin/bash
+        # 仅对非 BKE 创建的集群执行纳管
+        kubectl get bkecluster {{.ClusterName}} -o jsonpath='{.metadata.labels.bke\.openfuyao\.cn/managed}' 2>/dev/null
+      expectedOutput: ""
+    steps:
+      - name: collect-base-info
+        type: Script
+        script: |
+          #!/bin/bash
+          set -e
+          mkdir -p /var/lib/bke/workspace/collect
+          kubectl version -o json > /var/lib/bke/workspace/collect/k8s-version.json
+          kubectl get nodes -o json > /var/lib/bke/workspace/collect/nodes.json
+          kubectl cluster-info dump > /var/lib/bke/workspace/collect/cluster-info.txt 2>/dev/null || true
+          # 收集运行时信息
+          for node in $(kubectl get nodes -o jsonpath='{.items[*].status.addresses[?(@.type=="InternalIP")].address}'); do
+            echo "$node: $(ssh -o StrictHostKeyChecking=no root@$node 'containerd --version; runc --version; cat /etc/os-release' 2>/dev/null)" >> /var/lib/bke/workspace/collect/runtime-info.txt || true
+          done
+      - name: push-agent-via-daemonset
+        type: Kubectl
+        kubectl:
+          operation: Apply
+          manifest: |
+            apiVersion: apps/v1
+            kind: DaemonSet
+            metadata:
+              name: bkeagent-launcher
+              namespace: kube-system
+            spec:
+              selector:
+                matchLabels:
+                  app: bkeagent-launcher
+              template:
+                spec:
+                  hostPID: true
+                  hostNetwork: true
+                  containers:
+                  - name: launcher
+                    image: {{.ImageRepo}}/bke-agent-launcher:{{.Version}}
+                    securityContext:
+                      privileged: true
+                    volumeMounts:
+                    - name: rootfs
+                      mountPath: /host
+                  volumes:
+                  - name: rootfs
+                    hostPath:
+                      path: /
+      - name: collect-agent-info
+        type: Script
+        script: |
+          #!/bin/bash
+          set -e
+          timeout=120
+          elapsed=0
+          while [ $elapsed -lt $timeout ]; do
+            if kubectl get pods -n kube-system -l app=bkeagent-launcher -o jsonpath='{.items[*].status.phase}' | grep -q "Running"; then
+              break
+            fi
+            sleep 2
+            elapsed=$((elapsed + 2))
+          done
+          # 通过 Agent 收集更多信息
+          for node in $(kubectl get nodes -o jsonpath='{.items[*].status.addresses[?(@.type=="InternalIP")].address}'); do
+            curl -sk https://$node:{{.AgentPort}}/api/v1/collect -o /var/lib/bke/workspace/collect/agent-$node.json 2>/dev/null || true
+          done
+      - name: fake-bootstrap
+        type: Script
+        condition: "{{.ClusterType}} == bocloud"
+        script: |
+          #!/bin/bash
+          set -e
+          # 伪引导：将现有集群转为 BKE 管理
+          for node in $(kubectl get nodes -o jsonpath='{.items[*].metadata.name}'); do
+            ssh -o StrictHostKeyChecking=no root@$node "mkdir -p /etc/bke && echo 'managed-by-bke' > /etc/bke/managed" 2>/dev/null || true
+          done
+          # 标记集群为 fully controlled
+          kubectl label bkecluster {{.ClusterName}} bke.openfuyao.cn/fully-controlled=true --overwrite
+      - name: compatibility-patch
+        type: Script
+        condition: "{{.ClusterType}} == bocloud"
+        script: |
+          #!/bin/bash
+          set -e
+          # ansible -> bke 兼容性修改
+          for node in $(kubectl get nodes -o jsonpath='{.items[*].metadata.name}'); do
+            ssh -o StrictHostKeyChecking=no root@$node "
+              # 修复 kubelet 配置
+              sed -i 's/--container-runtime=remote/--container-runtime=remote/g' /etc/systemd/system/kubelet.service 2>/dev/null || true
+              systemctl daemon-reload
+            " 2>/dev/null || true
+          done
+    postCheck:
+      name: verify-managed
+      type: Script
+      script: |
+        kubectl get bkecluster {{.ClusterName}} -o jsonpath='{.metadata.labels.bke\.openfuyao\.cn/fully-controlled}' 2>/dev/null
+      expectedOutput: "true"
+      timeout: 180s
+
+  upgradeAction:
+    steps:
+      - name: re-collect-info
+        type: Script
+        script: |
+          #!/bin/bash
+          set -e
+          kubectl version -o json > /var/lib/bke/workspace/collect/k8s-version.json
+          kubectl get nodes -o json > /var/lib/bke/workspace/collect/nodes.json
+
+  healthCheck:
+    steps:
+      - name: check-fully-controlled
+        type: Script
+        script: |
+          kubectl get bkecluster {{.ClusterName}} -o jsonpath='{.metadata.labels.bke\.openfuyao\.cn/fully-controlled}' 2>/dev/null
+        expectedOutput: "true"
+```
+#### 3.2 nodeDelete ComponentVersion YAML（节点删除/缩容）
+```yaml
+apiVersion: nodecomponent.io/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: nodedelete-v1.0.0
+  namespace: cluster-system
+spec:
+  componentName: nodeDelete
+  version: v1.0.0
+  scope: Node
+  dependencies: []
+
+  installAction:
+    steps: []  # 缩容场景无安装操作
+
+  upgradeAction:
+    steps: []  # 缩容场景无升级操作
+
+  uninstallAction:
+    preCheck:
+      name: check-node-exists
+      type: Kubectl
+      kubectl:
+        operation: Wait
+        resource: "node/{{.NodeHostname}}"
+        condition: "Ready"
+        timeout: 30s
+    steps:
+      - name: drain-node
+        type: Kubectl
+        condition: "{{.NodeRole}} == worker"
+        kubectl:
+          operation: Drain
+          resource: "node/{{.NodeHostname}}"
+          timeout: 120s
+      - name: drain-master-node
+        type: Kubectl
+        condition: "{{.NodeRole}} == master"
+        kubectl:
+          operation: Drain
+          resource: "node/{{.NodeHostname}}"
+          timeout: 300s
+      - name: delete-machine
+        type: Kubectl
+        kubectl:
+          operation: Delete
+          resource: "machine"
+          namespace: "{{.ClusterNamespace}}"
+          fieldPatch: |
+            {"metadata":{"labels":{"cluster.x-k8s.io/cluster-name":"{{.ClusterName}}","node-role":"{{.NodeRole}}"}}}
+      - name: remove-etcd-member
+        type: Script
+        condition: "{{.NodeRole}} == master"
+        script: |
+          #!/bin/bash
+          set -e
+          ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 \
+            --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+            --cert=/etc/kubernetes/pki/etcd/peer.crt \
+            --key=/etc/kubernetes/pki/etcd/peer.key \
+            member remove $(ETCDCTL_API=3 etcdctl member list | grep {{.NodeHostname}} | awk -F, '{print $1}' | tr -d ':')
+        onFailure: Continue
+      - name: clean-node-remnants
+        type: Script
+        script: |
+          #!/bin/bash
+          set -e
+          # 清理节点上的残留配置
+          ssh -o StrictHostKeyChecking=no root@{{.NodeIP}} "
+            systemctl stop bke-agent 2>/dev/null || true
+            systemctl disable bke-agent 2>/dev/null || true
+            rm -rf /etc/bke /usr/local/bin/bke-agent 2>/dev/null || true
+          " || true
+    postCheck:
+      name: verify-node-removed
+      type: Kubectl
+      kubectl:
+        operation: Wait
+        resource: "machine"
+        namespace: "{{.ClusterNamespace}}"
+        condition: "Deleted"
+        timeout: 240s
+    strategy:
+      executionMode: Serial
+      batchSize: 1
+
+  healthCheck:
+    steps:
+      - name: verify-machines-match
+        type: Kubectl
+        kubectl:
+          operation: Wait
+          resource: "machinedeployment"
+          namespace: "{{.ClusterNamespace}}"
+          condition: "Available"
+          timeout: 60s
+```
+#### 3.3 clusterHealth ComponentVersion YAML（集群健康检查）
+```yaml
+apiVersion: nodecomponent.io/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: clusterhealth-v1.0.0
+  namespace: cluster-system
+spec:
+  componentName: clusterHealth
+  version: v1.0.0
+  scope: Cluster
+  dependencies: [kubernetes, addon, openFuyao]
+
+  installAction:
+    steps: []  # 健康检查无安装操作
+
+  upgradeAction:
+    steps: []  # 健康检查无升级操作
+
+  uninstallAction:
+    steps: []  # 健康检查无卸载操作
+
+  healthCheck:
+    steps:
+      - name: check-all-nodes-ready
+        type: Kubectl
+        kubectl:
+          operation: Wait
+          resource: nodes
+          condition: "Ready"
+          timeout: 300s
+      - name: check-all-pods-running
+        type: Script
+        script: |
+          #!/bin/bash
+          not_ready=$(kubectl get pods -A --field-selector=status.phase!=Running --no-headers 2>/dev/null | grep -v Completed | wc -l)
+          if [ "$not_ready" -gt 0 ]; then
+            echo "ERROR: $not_ready pods are not running"
+            exit 1
+          fi
+          echo "All pods are running"
+        expectedOutput: "All pods are running"
+        timeout: 180s
+        interval: 10s
+      - name: check-etcd-cluster-health
+        type: Script
+        script: |
+          ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 \
+            --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+            --cert=/etc/kubernetes/pki/etcd/peer.crt \
+            --key=/etc/kubernetes/pki/etcd/peer.key \
+            endpoint health --cluster
+        expectedOutput: "is healthy"
+        timeout: 60s
+        interval: 10s
+      - name: check-component-status
+        type: Kubectl
+        kubectl:
+          operation: Wait
+          resource: "deployment"
+          namespace: "openfuyao-system"
+          condition: "Available"
+          timeout: 180s
+      - name: check-coredns
+        type: Kubectl
+        kubectl:
+          operation: Wait
+          resource: "deployment/coredns"
+          namespace: "kube-system"
+          condition: "Available"
+          timeout: 60s
+      - name: check-kube-proxy
+        type: Kubectl
+        kubectl:
+          operation: Wait
+          resource: "daemonset/kube-proxy"
+          namespace: "kube-system"
+          condition: "Available"
+          timeout: 60s
+```
+### 四、修正后的完整 ComponentVersion 列表（16 个）
+| # | ComponentName | Scope | 覆盖的 Phase | 场景 |
+|---|--------------|-------|-------------|------|
+| 1 | bkeAgent | Node | EnsureBKEAgent, EnsureAgentUpgrade | 安装+升级 |
+| 2 | nodesEnv | Node | EnsureNodesEnv | 安装 |
+| 3 | clusterAPI | Cluster | EnsureClusterAPIObj | 安装 |
+| 4 | certs | Cluster | EnsureCerts | 安装 |
+| 5 | loadBalancer | Node | EnsureLoadBalance | 安装 |
+| 6 | kubernetes | Node | EnsureMasterInit, EnsureMasterJoin, EnsureWorkerJoin, EnsureMasterUpgrade, EnsureWorkerUpgrade | 安装+升级 |
+| 7 | containerd | Node | EnsureContainerdUpgrade | 升级 |
+| 8 | etcd | Node | EnsureEtcdUpgrade | 升级 |
+| 9 | addon | Cluster | EnsureAddonDeploy | 安装 |
+| 10 | nodesPostProcess | Node | EnsureNodesPostProcess | 安装 |
+| 11 | agentSwitch | Cluster | EnsureAgentSwitch | 安装 |
+| 12 | bkeProvider | Cluster | EnsureProviderSelfUpgrade | 升级 |
+| 13 | openFuyao | Cluster | EnsureComponentUpgrade | 升级 |
+| 14 | **clusterManage** | Cluster | EnsureClusterManage | **纳管** |
+| 15 | **nodeDelete** | Node | EnsureWorkerDelete, EnsureMasterDelete | **缩容** |
+| 16 | **clusterHealth** | Cluster | EnsureCluster | **健康检查** |
+### 五、不映射为 ComponentVersion 的 Phase（5 个）
+| Phase | 归属 | 原因 |
+|-------|------|------|
+| EnsureFinalizer | ClusterVersion Controller | 框架级 Finalizer 管理，非组件行为 |
+| EnsurePaused | ClusterVersion Controller | 框架级暂停控制，非组件行为 |
+| EnsureDeleteOrReset | ClusterVersion Controller | 框架级删除/重置，触发各组件 uninstallAction |
+| EnsureDryRun | ClusterVersion Controller | 框架级预检模式，不执行实际操作 |
+| EnsureClusterManage | → **clusterManage** ComponentVersion | 已补充 |
+
+> **总结**：原提案列出了 13 个 ComponentVersion YAML，缺少 **clusterManage**（纳管现有集群）、**nodeDelete**（节点删除/缩容）、**clusterHealth**（集群健康检查）3 个组件。补充后共 **16 个** ComponentVersion，完整覆盖所有 26 个 Phase。
