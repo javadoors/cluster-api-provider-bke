@@ -407,9 +407,12 @@ type UpgradeHistory struct {
 ```
 ### 7.3 ReleaseImage CRD
 ReleaseImage 定义发布版本清单，包含该版本的所有组件及其版本信息。**ReleaseImage 创建后不可修改**，确保版本清单一致性。
+
+**设计原则**：ReleaseImage 是纯粹的发布清单，不包含兼容性规则和升级路径，这些信息由 ComponentVersion 和 UpgradePath CRD 独立管理，可独立演进。
 ```go
 // api/cvo/v1beta1/releaseimage_types.go
 
+// ReleaseImage 仅定义该版本包含哪些组件及版本，不包含兼容性规则和升级路径
 type ReleaseImageSpec struct {
     Version       string               `json:"version"`
     DisplayName   string               `json:"displayName,omitempty"`
@@ -417,8 +420,6 @@ type ReleaseImageSpec struct {
     ReleaseTime   *metav1.Time         `json:"releaseTime,omitempty"`
     Components    []ReleaseComponent   `json:"components"`
     Images        []ImageManifest      `json:"images,omitempty"`
-    UpgradePaths  []UpgradePath        `json:"upgradePaths,omitempty"`
-    Compatibility CompatibilityMatrix  `json:"compatibility,omitempty"`
 }
 
 type ReleaseComponent struct {
@@ -437,63 +438,6 @@ type ImageManifest struct {
     Digest  string   `json:"digest,omitempty"`
     Arch    []string `json:"arch,omitempty"`
 }
-
-type UpgradePath struct {
-    FromVersion string `json:"fromVersion"`
-    ToVersion   string `json:"toVersion"`
-    PreCheck    *ActionSpec `json:"preCheck,omitempty"`
-}
-
-type CompatibilityMatrix struct {
-    // 核心基础设施兼容性（必须检查）
-    KubernetesVersions  []string `json:"kubernetesVersions,omitempty"`
-    EtcdVersions        []string `json:"etcdVersions,omitempty"`
-    ContainerdVersions  []string `json:"containerdVersions,omitempty"`
-
-    // 生态系统组件兼容性（应该检查）
-    CalicoVersions      []string `json:"calicoVersions,omitempty"`
-    CoreDNSVersions     []string `json:"coreDNSVersions,omitempty"`
-    KubeProxyVersions   []string `json:"kubeProxyVersions,omitempty"`
-
-    // 平台版本兼容性（应该检查）
-    OpenFuyaoVersion    string   `json:"openFuyaoVersion,omitempty"`
-    BKEProviderVersion  string   `json:"bkeProviderVersion,omitempty"`
-
-    // 运行环境兼容性（可选检查）
-    OSVersions          []OSCompatibility `json:"osVersions,omitempty"`
-    Architectures       []string          `json:"architectures,omitempty"`
-}
-
-type OSCompatibility struct {
-    Type    string   `json:"type"`    // e.g., "CentOS", "Ubuntu", "Kylin"
-    Versions []string `json:"versions"` // e.g., ["7.9", "8.0", "22.04"]
-}
-
-// ComponentCompatibility 定义组件间的版本兼容约束
-type ComponentCompatibility struct {
-    Component   ComponentName `json:"component"`
-    Version     string        `json:"version"`
-    Requires    []ComponentVersionConstraint `json:"requires,omitempty"`
-}
-
-type ComponentVersionConstraint struct {
-    Component   ComponentName `json:"component"`
-    MinVersion  string        `json:"minVersion,omitempty"`
-    MaxVersion  string        `json:"maxVersion,omitempty"`
-    Versions    []string      `json:"versions,omitempty"` // 精确版本列表
-}
-
-// 示例：Kubernetes 1.29 的兼容性约束
-// ComponentCompatibility{
-//     Component: "kubernetes",
-//     Version: "v1.29.0",
-//     Requires: []ComponentVersionConstraint{
-//         {Component: "etcd", MinVersion: "v3.5.10"},
-//         {Component: "containerd", MinVersion: "v1.7.0"},
-//         {Component: "calico", MinVersion: "v3.25.0"},
-//         {Component: "coredns", MinVersion: "v1.9.0"},
-//     },
-// }
 
 type ReleaseImageStatus struct {
     Phase              ReleaseImagePhase `json:"phase,omitempty"`
@@ -562,6 +506,31 @@ type ComponentVersionEntry struct {
     RollbackAction  *ActionSpec  `json:"rollbackAction,omitempty"`
     UninstallAction *ActionSpec  `json:"uninstallAction,omitempty"`
     HealthCheck     *HealthCheckSpec `json:"healthCheck,omitempty"`
+    // 兼容性约束：该版本对其他组件的版本要求
+    // 由组件自身声明，无需外部资源定义，可随组件独立演进
+    Compatibility *VersionCompatibility `json:"compatibility,omitempty"`
+}
+
+// VersionCompatibility 定义该组件版本对其他组件的版本兼容要求
+type VersionCompatibility struct {
+    // Requires 声明该版本运行所依赖的其他组件版本约束
+    Requires []ComponentVersionConstraint `json:"requires,omitempty"`
+    // SupportedOS 声明该版本支持的操作系统
+    SupportedOS []OSCompatibility `json:"supportedOS,omitempty"`
+    // SupportedArchitectures 声明该版本支持的 CPU 架构
+    SupportedArchitectures []string `json:"supportedArchitectures,omitempty"`
+}
+
+type ComponentVersionConstraint struct {
+    Component   ComponentName `json:"component"`
+    MinVersion  string        `json:"minVersion,omitempty"`
+    MaxVersion  string        `json:"maxVersion,omitempty"`
+    Versions    []string      `json:"versions,omitempty"`
+}
+
+type OSCompatibility struct {
+    Type     string   `json:"type"`
+    Versions []string `json:"versions"`
 }
 
 type UpgradeFromSpec struct {
@@ -790,12 +759,117 @@ const (
 
 type OperationResult string
 
-const (
+ const (
     OperationSuccess OperationResult = "Success"
     OperationFailed  OperationResult = "Failed"
 )
 ```
-### 7.6 NodeConfig CRD
+### 7.6 UpgradePath CRD
+UpgradePath 定义版本间的升级路径，包含前置检查和升级策略。
+
+**核心设计**：升级路径独立于 ReleaseImage，可随发现新问题而更新，无需重新发布 ReleaseImage。
+```go
+// api/cvo/v1beta1/upgradepath_types.go
+
+// UpgradePath 定义从一个版本到另一个版本的升级路径
+type UpgradePathSpec struct {
+    // FromRelease 源版本 ReleaseImage 引用
+    FromRelease ReleaseReference `json:"fromRelease"`
+    // ToRelease 目标版本 ReleaseImage 引用
+    ToRelease ReleaseReference `json:"toRelease"`
+    // PreCheck 升级前置检查（可选）
+    PreCheck *ActionSpec `json:"preCheck,omitempty"`
+    // PostCheck 升级后置检查（可选）
+    PostCheck *ActionSpec `json:"postCheck,omitempty"`
+    // Blocked 是否阻止此升级路径
+    Blocked bool `json:"blocked,omitempty"`
+    // BlockReason 阻止原因
+    BlockReason string `json:"blockReason,omitempty"`
+    // Deprecated 是否已废弃此升级路径
+    Deprecated bool `json:"deprecated,omitempty"`
+    // DeprecationMessage 废弃提示信息
+    DeprecationMessage string `json:"deprecationMessage,omitempty"`
+}
+
+type ReleaseReference struct {
+    Name    string `json:"name"`
+    Version string `json:"version,omitempty"`
+}
+
+type UpgradePathStatus struct {
+    Phase       UpgradePathPhase `json:"phase,omitempty"`
+    UsedCount   int              `json:"usedCount,omitempty"`
+    LastUsedAt  *metav1.Time     `json:"lastUsedAt,omitempty"`
+    Conditions  []metav1.Condition `json:"conditions,omitempty"`
+}
+
+type UpgradePathPhase string
+
+const (
+    UpgradePathActive     UpgradePathPhase = "Active"
+    UpgradePathBlocked    UpgradePathPhase = "Blocked"
+    UpgradePathDeprecated UpgradePathPhase = "Deprecated"
+)
+```
+**UpgradePath 独立演进示例**：
+```yaml
+# 原始升级路径：v2.5.0 → v2.6.0
+apiVersion: cvo.openfuyao.cn/v1beta1
+kind: UpgradePath
+metadata:
+  name: v2.5.0-to-v2.6.0
+spec:
+  fromRelease:
+    name: openfuyao-v2.5.0
+    version: v2.5.0
+  toRelease:
+    name: openfuyao-v2.6.0
+    version: v2.6.0
+---
+# 发现问题后添加前置检查（无需重新发布 ReleaseImage）
+apiVersion: cvo.openfuyao.cn/v1beta1
+kind: UpgradePath
+metadata:
+  name: v2.5.0-to-v2.6.0
+spec:
+  fromRelease:
+    name: openfuyao-v2.5.0
+  toRelease:
+    name: openfuyao-v2.6.0
+  preCheck:
+    steps:
+      - name: check-etcd-health
+        type: Script
+        script: |
+          # 检查 etcd 健康状态
+          etcdctl endpoint health --cluster
+      - name: check-disk-space
+        type: Script
+        script: |
+          # 检查磁盘空间
+          df -h /var/lib/etcd
+---
+# 发现严重问题后阻止升级路径
+apiVersion: cvo.openfuyao.cn/v1beta1
+kind: UpgradePath
+metadata:
+  name: v2.4.0-to-v2.6.0
+spec:
+  fromRelease:
+    name: openfuyao-v2.4.0
+  toRelease:
+    name: openfuyao-v2.6.0
+  blocked: true
+  blockReason: "发现 etcd 数据迁移问题，请先升级到 v2.5.0"
+```
+**兼容性检查和升级路径的职责分离**：
+
+| 职责 | 归属 | 演进频率 | 修改方式 |
+|------|------|---------|---------|
+| **组件版本兼容性** | ComponentVersion.spec.versions[].compatibility | 低（随组件版本发布） | 更新 ComponentVersion CR |
+| **版本间升级路径** | UpgradePath CRD | 中（发现问题后更新） | 创建/更新 UpgradePath CR |
+| **发布清单** | ReleaseImage CRD | 低（随版本发布） | 创建新 ReleaseImage CR（不可变） |
+### 7.7 NodeConfig CRD
 NodeConfig 定义节点组件清单及配置，描述节点上应安装哪些组件及其配置。
 ```go
 // api/cvo/v1beta1/nodeconfig_types.go
