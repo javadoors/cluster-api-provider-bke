@@ -9,13 +9,16 @@
 | **创建日期** | 2026-04-22 |
 | **依赖** | KEPU-1（整体架构重构） |
 ## 1. 摘要
-本提案设计基于四个 CRD（ClusterVersion、ReleaseImage、ComponentVersion、NodeConfig）的声明式集群版本管理方案。**核心变化**：各 Phase 的安装、升级、卸载逻辑全部通过 YAML 配置声明，由通用 ActionEngine 解释执行，**不再为每个组件编写 Go 代码实现**。
+本提案设计基于五个 CRD（ClusterVersion、ReleaseImage、ComponentVersion、ComponentVersionBinding、NodeConfig）的声明式集群版本管理方案。
+
+**核心变化**：各 Phase 的安装、升级、卸载逻辑全部通过 YAML 配置声明，由通用 ActionEngine 解释执行，**不再为每个组件编写 Go 代码实现**。
 
 **设计原则**：
 - **配置即代码**：组件生命周期（安装/升级/卸载/健康检查）全部声明在 ComponentVersion YAML 中
 - **通用引擎**：ActionEngine 是唯一的执行器，解释 YAML 中的 Action 定义并执行
 - **零组件代码**：不编写组件特定的 Go Executor，所有行为由 YAML 驱动
 - **模板化**：脚本和 manifest 支持模板变量（`{{.Version}}`、`{{.NodeIP}}` 等），运行时渲染
+- **关注点分离**：ComponentVersion 定义"能力"（能做什么），ComponentVersionBinding 表达"意图"（要做什么）
 ## 2. 动机
 ### 2.1 现有架构问题
 | 问题 | 现状 | 影响 |
@@ -48,13 +51,14 @@ ClusterVersion (集群版本)
 4. 我们需要支持升级时先卸载旧组件再安装新组件的流程
 ## 3. 目标
 ### 3.1 主要目标
-1. 定义 ClusterVersion、ReleaseImage、ComponentVersion、NodeConfig 四个 CRD 及其关联关系
-2. 实现 ClusterVersion 控制器：管理集群版本生命周期（安装→升级→回滚）
+1. 定义 ClusterVersion、ReleaseImage、ComponentVersion、ComponentVersionBinding、NodeConfig 五个 CRD 及其关联关系
+2. 实现 ClusterVersion 控制器：管理集群版本生命周期（安装→升级→回滚），编排 ComponentVersionBinding
 3. 实现 ReleaseImage 控制器：验证发布清单，生成 ComponentVersion 列表
-4. 实现 ComponentVersion 控制器：根据组件配置生成脚本/manifest/chart 并执行
-5. 实现 NodeConfig 控制器：管理节点组件的安装/升级/卸载
-6. 将现有 PhaseFrame 各 Phase 重构为 ComponentVersion 声明式架构
-7. 实现升级时先卸载旧组件再安装新组件的完整流程
+4. 实现 ComponentVersion 控制器：定义组件能力目录（installAction/upgradeAction/uninstallAction）
+5. 实现 ComponentVersionBinding 控制器：执行组件生命周期操作（安装/升级/卸载/健康检查）
+6. 实现 NodeConfig 控制器：管理节点组件的安装/升级/卸载，触发 ComponentVersionBinding 节点级操作
+7. 将现有 PhaseFrame 各 Phase 重构为 ComponentVersion 声明式架构
+8. 实现升级时先卸载旧组件再安装新组件的完整流程
 ### 3.2 非目标
 1. 不实现 OpenShift 式的 Release Image 容器镜像载体（使用 CRD 替代）
 2. 不实现多集群版本管理（仅单集群）
@@ -65,14 +69,14 @@ ClusterVersion (集群版本)
 ### 4.1 在范围内
 | 范围 | 说明 |
 |------|------|
-| CRD 定义与注册 | 四个核心 CRD 的 API 定义 |
-| 控制器实现 | 四个控制器的 Reconcile 逻辑 |
+| CRD 定义与注册 | 五个核心 CRD 的 API 定义 |
+| 控制器实现 | 五个控制器的 Reconcile 逻辑 |
 | ActionEngine | 通用执行引擎，解释执行 YAML 中的 Action 定义 |
 | Phase→ComponentVersion 迁移 | 20+ 个 Phase 到 ComponentVersion 的映射与迁移 |
 | DAG 调度 | 组件依赖图与调度算法 |
 | 版本升级流程 | PreCheck→UninstallOld→Upgrade→PostCheck→Rollback |
 | 扩缩容流程 | NodeConfig 增删触发组件安装/卸载 |
-| Feature Gate 渐进切换 | 新旧架构双轨运行 |
+| 关注点分离 | ComponentVersion（能力定义）与 ComponentVersionBinding（运行时意图）分离 |
 ### 4.2 不在范围内
 | 范围 | 原因 |
 |------|------|
@@ -217,7 +221,7 @@ ComponentVersionBinding 升级失败
                            ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │                      ClusterVersion                              │
-│  (集群版本，记录当前版本/目标版本/升级历史)                      │
+│  (集群版本，记录当前版本/目标版本/升级历史)                         │
 │                                                                  │
 │  spec.releaseRef ──────────┐                                     │
 │  spec.desiredVersion       │                                     │
@@ -228,24 +232,29 @@ ComponentVersionBinding 升级失败
                              ▼     │
 ┌────────────────────────────────────────────────────────────────┐
 │                       ReleaseImage                             │
-│  (发布版本清单，不可变，定义该版本包含哪些组件及版本)          │
+│  (发布版本清单，不可变，定义该版本包含哪些组件及版本)              │
 │                                                                │
 │  spec.components:                                              │
 │    - name: etcd        ────────┐                               │
 │      version: v3.5.12          │                               │
+│      componentVersionRef:      │                               │
+│        name: etcd-v3.5.12      │                               │
 │    - name: containerd  ────┐   │                               │
 │      version: v1.7.2       │   │                               │
 │    - name: kubernetes  ─┐  │   │                               │
 │      version: v1.29.0   │  │   │                               │
 └─────────────────────────┼──┼───┼───────────────────────────────┘
                           │  │   │
-                          │  │   │  N:1 (多个 ReleaseImage 可引用同一 ComponentVersion)
+                          │  │   │  引用组件版本
                           ▼  ▼   ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │                    ComponentVersion                              │
-│  (组件清单，含多个版本，定义安装/升级/回滚/卸载动作)                 │
+│  (组件能力目录，相对不可变，定义安装/升级/回滚/卸载动作)             │
+│  (可被多个集群共享)                                               │
 │                                                                  │
 │  spec.componentName: etcd                                        │
+│  spec.scope: Node                                                │
+│  spec.dependencies: [nodesEnv]                                   │
 │  spec.versions:                                                  │
 │    - version: v3.5.11                                            │
 │      installAction: {...}                                        │
@@ -253,12 +262,34 @@ ComponentVersionBinding 升级失败
 │    - version: v3.5.12                                            │
 │      installAction: {...}                                        │
 │      upgradeFrom:                                                │
-│        - version: v3.5.11                                        │
+│        - fromVersion: v3.5.11                                    │
 │          upgradeAction: {...}                                    │
+│      rollbackAction: {...}                                       │
 │      uninstallAction: {...}                                      │
-│  spec.scope: Node                                                │
+│  spec.healthCheck: {...}                                         │
 └──────────────────────────┬───────────────────────────────────────┘
-                           │ 1:N (ComponentVersion 被 NodeConfig 引用)
+                           │ 被引用
+                           ▼
+┌──────────────────────────────────────────────────────────────────┐
+│               ComponentVersionBinding                            │
+│  (运行时绑定，频繁可变，定义集群中组件的目标版本和运行状态)           │
+│  (每集群独立)                                                     │
+│                                                                  │
+│  spec.componentVersionRef:                                       │
+│    name: etcd-v3.5.12                                            │
+│  spec.desiredVersion: v3.5.12     ← 仅修改此字段触发升级           │
+│  spec.clusterRef:                                                │
+│    name: my-cluster                                              │
+│  spec.nodeSelector:                                              │
+│    roles: [master]                                               │
+│                                                                  │
+│  status.installedVersion: v3.5.11                                │
+│  status.phase: Upgrading                                         │
+│  status.nodeStatuses: {...}                                      │
+│  status.lastOperation: {...}                                     │
+│  status.conditions: [...]                                        │
+└──────────────────────────┬───────────────────────────────────────┘
+                           │ nodeSelector 匹配
                            ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │                       NodeConfig                                 │
@@ -281,7 +312,15 @@ ComponentVersionBinding 升级失败
 - **BKECluster → ClusterVersion**：1:1，一个集群对应一个版本资源
 - **ClusterVersion → ReleaseImage**：1:1（当前版本）+ 1:1（目标版本），通过 `status.currentReleaseRef` 和 `spec.releaseRef` 引用
 - **ReleaseImage → ComponentVersion**：1:N，一个发布清单包含多个组件引用
-- **NodeConfig → ComponentVersion**：N:N，多个节点引用多个组件
+- **ClusterVersion → ComponentVersionBinding**：1:N，ClusterVersion 为每个组件创建 Binding
+- **ComponentVersionBinding → ComponentVersion**：N:1，多个 Binding 可引用同一个 ComponentVersion（支持多集群共享）
+- **ComponentVersionBinding → NodeConfig**：1:N，Binding 的 nodeSelector 匹配多个 NodeConfig
+
+**关键设计原则**：
+| CRD | 职责 | 生命周期 | 修改频率 |
+|-----|------|---------|---------|
+| **ComponentVersion** | 组件能力目录（"能做什么"） | 随版本发布创建，相对不可变 | 低（新增版本时修改） |
+| **ComponentVersionBinding** | 运行时绑定（"要做什么"） | 随集群创建，频繁可变 | 高（升级/扩缩容时修改） |
 ### 7.2 ClusterVersion CRD
 借鉴 OpenShift `config.openshift.io/v1.ClusterVersion`，使用 ReleaseImage CRD 引用替代 Release Image 容器镜像。
 ```go
@@ -437,9 +476,11 @@ type ComponentValidation struct {
 }
 ```
 ### 7.4 ComponentVersion CRD
-ComponentVersion 定义组件清单，包含多个版本及其安装/升级/回滚/卸载动作。**核心变化**：所有行为通过 YAML 声明，不再编写组件特定的 Go 代码。
+ComponentVersion 定义组件能力目录，包含多个版本及其安装/升级/回滚/卸载动作。
+
+**核心设计**：ComponentVersion 只定义"能做什么"，不包含运行时状态，可被多个集群共享。
 ```go
-// api/nodecomponent/v1alpha1/componentversion_types.go
+// api/cvo/v1beta1/componentversion_types.go
 
 type ComponentVersionSpec struct {
     ComponentName ComponentName    `json:"componentName"`
@@ -614,13 +655,53 @@ type HealthCheckStep struct {
     Interval       *metav1.Duration  `json:"interval,omitempty"`
 }
 
+// ComponentVersionStatus 仅保留验证状态，运行时状态移到 ComponentVersionBinding
 type ComponentVersionStatus struct {
-    DesiredVersion    string                      `json:"desiredVersion,omitempty"`
-    InstalledVersion  string                      `json:"installedVersion,omitempty"`
-    Phase             ComponentPhase              `json:"phase,omitempty"`
-    NodeStatuses      map[string]NodeComponentStatus `json:"nodeStatuses,omitempty"`
-    LastOperation     *LastOperation              `json:"lastOperation,omitempty"`
-    Conditions        []metav1.Condition          `json:"conditions,omitempty"`
+    Phase      ComponentVersionPhase `json:"phase,omitempty"`
+    Conditions []metav1.Condition    `json:"conditions,omitempty"`
+}
+
+type ComponentVersionPhase string
+
+const (
+    ComponentVersionActive     ComponentVersionPhase = "Active"
+    ComponentVersionDeprecated ComponentVersionPhase = "Deprecated"
+)
+```
+### 7.5 ComponentVersionBinding CRD
+ComponentVersionBinding 定义运行时绑定，表达"要做什么"。
+
+**核心设计**：仅修改 `spec.desiredVersion` 触发升级，不触碰 ComponentVersion。
+```go
+// api/cvo/v1beta1/componentversionbinding_types.go
+
+type ComponentVersionBindingSpec struct {
+    ComponentVersionRef ComponentVersionReference `json:"componentVersionRef"`
+    DesiredVersion      string                    `json:"desiredVersion"`
+    ClusterRef          *ClusterReference         `json:"clusterRef,omitempty"`
+    NodeSelector        *NodeSelector             `json:"nodeSelector,omitempty"`
+    Pause               bool                      `json:"pause,omitempty"`
+}
+
+type ComponentVersionReference struct {
+    Name string `json:"name"`
+}
+
+type ClusterReference struct {
+    Name      string `json:"name"`
+    Namespace string `json:"namespace"`
+}
+
+type NodeSelector struct {
+    Roles []NodeRole `json:"roles,omitempty"`
+}
+
+type ComponentVersionBindingStatus struct {
+    InstalledVersion string                        `json:"installedVersion,omitempty"`
+    Phase            ComponentPhase                `json:"phase,omitempty"`
+    NodeStatuses     map[string]NodeComponentStatus `json:"nodeStatuses,omitempty"`
+    LastOperation    *LastOperation                `json:"lastOperation,omitempty"`
+    Conditions       []metav1.Condition            `json:"conditions,omitempty"`
 }
 
 type ComponentPhase string
@@ -653,8 +734,24 @@ type LastOperation struct {
     Result      OperationResult `json:"result,omitempty"`
     Message     string          `json:"message,omitempty"`
 }
+
+type OperationType string
+
+const (
+    OperationInstall   OperationType = "Install"
+    OperationUpgrade   OperationType = "Upgrade"
+    OperationRollback  OperationType = "Rollback"
+    OperationUninstall OperationType = "Uninstall"
+)
+
+type OperationResult string
+
+const (
+    OperationSuccess OperationResult = "Success"
+    OperationFailed  OperationResult = "Failed"
+)
 ```
-### 7.5 NodeConfig CRD
+### 7.6 NodeConfig CRD
 NodeConfig 定义节点组件清单及配置，描述节点上应安装哪些组件及其配置。
 ```go
 // api/cvo/v1beta1/nodeconfig_types.go
@@ -732,7 +829,7 @@ type NodeOSDetailInfo struct {
     Hostname string `json:"hostname,omitempty"`
 }
 ```
-### 7.6 模板变量系统
+### 7.7 模板变量系统
 ActionSpec 中的 Script、Manifest、Chart.Values 支持模板变量，运行时由 ActionEngine 渲染：
 ```go
 type TemplateContext struct {
@@ -771,7 +868,7 @@ type TemplateContext struct {
 {{.EtcdDataDir}}       → /var/lib/etcd
 {{.ControlPlaneEndpoint}} → 192.168.1.100:6443
 ```
-### 7.7 组件依赖 DAG
+### 7.8 组件依赖 DAG
 ```go
 var InstallDependencyGraph = map[ComponentName][]ComponentName{
     ComponentBKEAgent:      {},
@@ -800,7 +897,7 @@ var UpgradeDependencyGraph = map[ComponentName][]ComponentName{
     ComponentNodesPostProc: {ComponentAddon},
 }
 ```
-### 7.8 Phase→ComponentVersion 迁移映射表
+### 7.9 Phase→ComponentVersion 迁移映射表
 | Phase | ComponentName | Scope | ActionType | installAction | upgradeAction |
 |-------|---------------|-------|------------|---------------|---------------|
 | EnsureBKEAgent | bkeAgent | Node | Script | 推送 Agent 二进制 + 配置 kubeconfig + 启动服务 | 更新 Agent 二进制 + 重启服务 |
@@ -837,18 +934,19 @@ var UpgradeDependencyGraph = map[ComponentName][]ComponentName{
 ### 8.1 ClusterVersion Controller
 **核心职责**：
 1. **框架级逻辑**：处理 EnsureFinalizer、EnsurePaused、EnsureDeleteOrReset、EnsureDryRun
-2. **版本编排**：管理集群版本升级流程
-3. **DAG 调度**：按依赖关系调度 ComponentVersion 升级
+2. **版本编排**：管理集群版本升级流程，**仅修改 ComponentVersionBinding.spec.desiredVersion**
+3. **DAG 调度**：按依赖关系调度 ComponentVersionBinding 升级
 4. **历史管理**：维护版本历史，支持回滚
+5. **创建 Binding**：为 ReleaseImage 中的每个组件创建 ComponentVersionBinding
 
 **设计思路**：
 
 | 阶段 | 处理逻辑 |
 |------|---------|
-| **Finalizer 管理** | 在 Reconcile 开始时添加 Finalizer，删除时触发各组件 uninstallAction |
-| **Pause 控制** | 暂停时停止所有 ComponentVersion 的调谐 |
-| **Delete/Reset 编排** | 删除时按逆序调用各组件的 uninstallAction |
-| **升级编排** | 检测 desiredVersion 变化 → 解析 ReleaseImage → DAG 调度 → 逐组件升级 |
+| **Finalizer 管理** | 在 Reconcile 开始时添加 Finalizer，删除时触发各 ComponentVersionBinding 卸载 |
+| **Pause 控制** | 暂停时停止所有 ComponentVersionBinding 的调谐 |
+| **Delete/Reset 编排** | 删除时按逆序调用各 ComponentVersionBinding 的 uninstallAction |
+| **升级编排** | 检测 desiredVersion 变化 → 解析 ReleaseImage → DAG 调度 → **仅修改 Binding.spec.desiredVersion** |
 | **版本历史** | 记录每次升级的 fromVersion/toVersion/result，支持回滚 |
 
 **Reconcile 流程**：
@@ -857,19 +955,20 @@ Reconcile(ctx, req):
     1. 获取 ClusterVersion 实例
     2. 如果 spec.pause == true，返回
     3. 获取关联的 ReleaseImage
-    4. 对比 spec.desiredVersion 与 status.currentVersion
-    5. 如果版本相同且 phase=Healthy，返回
-    6. 如果版本不同：
+    4. 为每个组件创建/更新 ComponentVersionBinding（如果不存在）
+    5. 对比 spec.desiredVersion 与 status.currentVersion
+    6. 如果版本相同且 phase=Healthy，返回
+    7. 如果版本不同：
        a. 验证升级路径（从 ReleaseImage.spec.upgradePaths）
-       b. 计算需要变更的 ComponentVersion 列表
-       c. 按 DAG 顺序创建/更新 ComponentVersion
+       b. 计算需要变更的组件列表
+       c. 按 DAG 顺序更新 ComponentVersionBinding.spec.desiredVersion
        d. 更新 status.upgradeSteps
-       e. 监控各 ComponentVersion 状态
-    7. 如果所有 ComponentVersion 完成：
+       e. 监控各 ComponentVersionBinding 状态
+    8. 如果所有 ComponentVersionBinding 完成：
        a. 更新 status.currentVersion = spec.desiredVersion
        b. 更新 status.phase = Healthy
        c. 记录 upgradeHistory
-    8. 如果有 ComponentVersion 失败：
+    9. 如果有 ComponentVersionBinding 失败：
        a. 根据 upgradeStrategy.autoRollback 决定是否回滚
        b. 更新 status.phase = UpgradeFailed/RollingBack
 ```
@@ -891,13 +990,35 @@ Reconcile(ctx, req):
     6. 更新 status.validatedComponents
 ```
 ### 8.3 ComponentVersion Controller
+**核心职责**：组件能力目录的验证控制器，不执行运行时操作。
+
+**设计思路**：
+
+| 要点 | 设计 |
+|------|------|
+| **能力验证** | 验证 spec.versions[] 中各版本的 action 定义是否合法 |
+| **依赖验证** | 验证 spec.dependencies 中引用的组件是否存在 |
+| **健康检查模板验证** | 验证 healthCheck 中的模板变量是否有效 |
+| **状态** | 仅维护验证状态（Active/Deprecated），运行时状态由 ComponentVersionBinding 维护 |
+
+**Reconcile 流程**：
+```
+Reconcile(ctx, req):
+    1. 获取 ComponentVersion 实例
+    2. 验证所有版本的 action 定义
+    3. 验证依赖组件是否存在
+    4. 验证模板变量
+    5. 更新 status.phase = Active/Deprecated
+    6. 更新 status.conditions
+```
+### 8.4 ComponentVersionBinding Controller
 **核心职责**：组件生命周期的核心执行控制器，是最复杂的控制器。
 
 **设计思路**：
 
 | 要点 | 设计 |
 |------|------|
-| **版本变更检测** | resolveDesiredVersion() 从 ReleaseImage 获取目标版本，对比 status.installedVersion |
+| **版本变更检测** | 对比 spec.desiredVersion 与 status.installedVersion |
 | **依赖检查** | checkDependencies() 检查依赖组件 phase + 版本约束 |
 | **旧版本卸载** | findOldComponentVersion() 通过 ClusterVersion.currentReleaseRef → 旧 ReleaseImage → 旧 ComponentVersion → uninstallAction |
 | **安装/升级/回滚** | 状态机驱动：Pending→Installing→Healthy→Upgrading→Healthy/UpgradeFailed→RollingBack |
@@ -911,24 +1032,25 @@ Pending → Installing → Healthy ⇄ Upgrading → Healthy/UpgradeFailed → R
                          ↓
                       Degraded
 ```
-
 **Reconcile 流程**：
 ```
 Reconcile(ctx, req):
-    1. 获取 ComponentVersion 实例
-    2. 确定 desiredVersion（从 ReleaseImage 间接获取）
-    3. 对比 installedVersion 与 desiredVersion
+    1. 获取 ComponentVersionBinding 实例
+    2. 通过 spec.componentVersionRef 找到 ComponentVersion
+    3. 对比 status.installedVersion 与 spec.desiredVersion
     4. 如果需要安装：
        a. 执行 PreCheck Action
        b. 执行 InstallAction
        c. 执行 PostCheck Action
        d. 更新 status.phase 和 status.nodeStatuses
     5. 如果需要升级：
-       a. 查找匹配的 UpgradeAction（从 upgradeFrom 列表）
-       b. 执行 PreCheck Action
-       c. 执行 UpgradeAction
-       d. 执行 PostCheck Action
-       e. 更新 status.phase 和 status.nodeStatuses
+       a. 查找匹配的 UpgradeAction（从 ComponentVersion.spec.versions[].upgradeFrom 列表）
+       b. 查找旧版本 uninstallAction（通过 ClusterVersion.currentReleaseRef）
+       c. 执行旧版本 UninstallAction
+       d. 执行 PreCheck Action
+       e. 执行 UpgradeAction
+       f. 执行 PostCheck Action
+       g. 更新 status.phase 和 status.nodeStatuses
     6. 如果需要回滚：
        a. 执行 RollbackAction
        b. 更新 status.phase
@@ -938,7 +1060,7 @@ Reconcile(ctx, req):
     8. 执行健康检查
     9. 更新 status.conditions
 ```
-### 8.4 NodeConfig Controller
+### 8.5 NodeConfig Controller
 **核心职责**：节点级组件生命周期管理控制器，承担五大核心职责。
 
 **设计思路**：
@@ -946,41 +1068,46 @@ Reconcile(ctx, req):
 | 要点 | 设计 |
 |------|------|
 | **监听节点增删** | Watch NodeConfig CR 增删事件，新增时触发安装，删除时触发卸载 |
-| **触发组件安装** | triggerComponentInstallForNode() 更新 ComponentVersion.nodeStatuses[新节点]=Pending，委托 ComponentVersion Controller 执行 |
-| **触发组件卸载** | triggerComponentUninstallForNode() 按依赖逆序更新 nodeStatuses[节点]=Uninstalling，委托 ComponentVersion Controller 执行 |
-| **更新节点组件状态** | 从 ComponentVersion.nodeStatuses[本节点] 聚合到 NodeConfig.status.componentStatus |
+| **触发组件安装** | triggerComponentInstallForNode() 更新 ComponentVersionBinding.nodeStatuses[新节点]=Pending，委托 ComponentVersionBinding Controller 执行 |
+| **触发组件卸载** | triggerComponentUninstallForNode() 按依赖逆序更新 nodeStatuses[节点]=Uninstalling，委托 ComponentVersionBinding Controller 执行 |
+| **更新节点组件状态** | 从 ComponentVersionBinding.nodeStatuses[本节点] 聚合到 NodeConfig.status.componentStatus |
 | **触发 cluster-api 扩缩容** | triggerMachineCreation() 增加 replicas；triggerMachineDeletion() 减少 replicas + 删除 Machine |
 | **依赖逆序卸载** | sortComponentsByReverseDependency() 使用拓扑排序逆序，确保被依赖组件最后卸载 |
 | **Finalizer 保护** | 添加 Finalizer，删除时先卸载组件再删除 Machine，最后移除 Finalizer |
+| **组件自动填充** | populateComponentsFromRelease() 根据 ReleaseImage + 节点角色自动填充组件列表 |
 
 **Reconcile 流程**：
 ```
 Reconcile(ctx, req):
     1. 获取 NodeConfig 实例
-    2. 如果 phase=Deleting：
-       a. 通知所有关联的 ComponentVersion 卸载该节点组件
-       b. 删除 NodeConfig
-    3. 遍历 spec.components：
-       a. 查找关联的 ComponentVersion
-       b. 更新 ComponentVersion 的 nodeStatuses
+    2. 如果 Components 为空且 Phase=""：
+       a. 从 ReleaseImage 按 Role 填充 Components
+    3. 如果 phase=Deleting：
+       a. 通知所有关联的 ComponentVersionBinding 卸载该节点组件
+       b. 等待所有组件卸载完成
+       c. 触发 cluster-api 删除 Machine
+       d. 移除 Finalizer
+    4. 遍历 spec.components：
+       a. 查找关联的 ComponentVersionBinding
+       b. 更新 ComponentVersionBinding 的 nodeStatuses
        c. 如果组件版本不匹配，触发安装/升级
-    4. 更新 status.componentStatus
-    5. 更新 status.phase
+    5. 更新 status.componentStatus
+    6. 更新 status.phase
 ```
 ## 9. ActionEngine 设计思路
 ### 9.1 核心定位
 ActionEngine 是声明式集群管理的**唯一执行器**，其核心职责是：**解释 ComponentVersion YAML 中的 Action 定义，并按策略在目标节点上执行**。
 ```
-┌─────────────────────┐     ┌──────────────────────┐     ┌──────────────────────┐
-│  ComponentVersion   │     │    ActionEngine      │     │   Target Nodes       │
-│  (YAML 声明)        │────▶│                      │────▶│                      │
-│  installAction      │     │  1. 模板渲染         │     │  Agent / kubelet     │
-│  upgradeAction      │     │  2. 来源解析         │     │  执行脚本/应用清单   │
+┌─────────────────────┐     ┌─────────────────────┐     ┌──────────────────────┐
+│  ComponentVersion   │     │    ActionEngine     │     │   Target Nodes       │
+│  (YAML 声明)        │────▶│                     │───▶│                      │
+│  installAction      │     │  1. 模板渲染         │     │  Agent / kubelet    │
+│  upgradeAction      │     │  2. 来源解析         │     │  执行脚本/应用清单    │
 │  uninstallAction    │     │  3. 条件求值         │     │  安装 Chart          │
 │  healthCheck        │     │  4. 策略调度         │     │  kubectl 操作        │
 └─────────────────────┘     │  5. 步骤执行         │     └──────────────────────┘
                             │  6. 结果收集         │
-                            └──────────────────────┘
+                            └─────────────────────┘
 ```
 ### 9.2 设计原则
 | 原则 | 说明 |
@@ -994,7 +1121,7 @@ ActionEngine 是声明式集群管理的**唯一执行器**，其核心职责是
 ```
 ┌─────────────────────────────────────────────────────────┐
 │                  ComponentVersion Controller            │
-│  (编排层：决定何时执行哪个 Action，管理 DAG 依赖)       │
+│  (编排层：决定何时执行哪个 Action，管理 DAG 依赖)          │
 └──────────────────────────┬──────────────────────────────┘
                            │ 调用
                            ▼
@@ -1002,11 +1129,11 @@ ActionEngine 是声明式集群管理的**唯一执行器**，其核心职责是
 │                      ActionEngine                       │
 │  ┌───────────┐  ┌───────────┐  ┌───────────────────┐    │
 │  │ Renderer  │  │ Resolver  │  │   Executor        │    │
-│  │ 模板渲染  │  │ 来源解析  │  │   步骤执行        │    │
+│  │ 模板渲染   │  │ 来源解析  │  │   步骤执行         │    │
 │  └───────────┘  └───────────┘  └───────────────────┘    │
 │  ┌───────────┐  ┌───────────┐  ┌───────────────────┐    │
 │  │ Evaluator │  │ Scheduler │  │   Collector       │    │
-│  │ 条件求值  │  │ 策略调度  │  │   结果收集        │    │
+│  │ 条件求值   │  │ 策略调度  │  │   结果收集         │    │
 │  └───────────┘  └───────────┘  └───────────────────┘    │
 └─────────────────────────────────────────────────────────┘
                            │ 下发
