@@ -1215,21 +1215,22 @@ Step 6: 更新 ComponentVersion Status
 ```
 cluster-api-provider-bke/
 ├── api/
-│   ├── cvo/v1beta1/
-│   │   ├── clusterversion_types.go
-│   │   ├── releaseimage_types.go
-│   │   └── zz_generated.deepcopy.go
-│   └── nodecomponent/v1alpha1/
+│   └── cvo/v1beta1/
+│       ├── clusterversion_types.go
+│       ├── releaseimage_types.go
 │       ├── componentversion_types.go
+│       ├── componentversionbinding_types.go
 │       ├── nodeconfig_types.go
+│       ├── action_types.go
 │       └── zz_generated.deepcopy.go
 ├── controllers/
-│   ├── cvo/
-│   │   ├── clusterversion_controller.go
-│   │   └── releaseimage_controller.go
-│   └── nodecomponent/
+│   └── cvo/
+│       ├── clusterversion_controller.go
+│       ├── releaseimage_controller.go
 │       ├── componentversion_controller.go
-│       └── nodeconfig_controller.go
+│       ├── componentversionbinding_controller.go
+│       ├── nodeconfig_controller.go
+│       └── suite_test.go
 ├── pkg/
 │   ├── actionengine/
 │   │   ├── engine.go
@@ -1244,7 +1245,8 @@ cluster-api-provider-bke/
 │   │   ├── orchestrator.go
 │   │   ├── validator.go
 │   │   ├── rollback.go
-│   │   └── dag_scheduler.go
+│   │   ├── dag_scheduler.go
+│   │   └── binding_helper.go
 │   └── phaseframe/
 ├── config/
 │   └── components/
@@ -1268,12 +1270,12 @@ cluster-api-provider-bke/
 ## 12. 工作量评估
 | 步骤 | 内容 | 工作量 |
 |------|------|--------|
-| 第一步 | CRD 定义（4 个）+ ActionEngine（4 种 Executor）+ 模板渲染 | 12 人天 |
-| 第二步 | ComponentVersion Controller + NodeConfig Controller + ClusterVersion Controller | 10 人天 |
+| 第一步 | CRD 定义（5 个）+ ActionEngine（4 种 Executor）+ 模板渲染 | 14 人天 |
+| 第二步 | ComponentVersion Controller + ComponentVersionBinding Controller + NodeConfig Controller + ClusterVersion Controller | 12 人天 |
 | 第三步 | 16 个组件 YAML 声明 + DAGScheduler + 安装 E2E | 10 人天 |
 | 第四步 | 升级全链路 + 扩缩容 + 回滚 | 10 人天 |
 | 测试 | 单元测试 + 集成测试 + E2E + 新旧路径对比 | 8 人天 |
-| **总计** | | **50 人天** |
+| **总计** | | **54 人天** |
 ## 13. 风险评估
 | 风险 | 影响 | 缓解措施 |
 |------|------|---------|
