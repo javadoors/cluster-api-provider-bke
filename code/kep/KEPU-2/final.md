@@ -431,11 +431,6 @@ type ReleaseComponent struct {
     ComponentVersionRef *ComponentVersionReference `json:"componentVersionRef,omitempty"`
 }
 
-type ComponentVersionReference struct {
-    Name      string `json:"name"`
-    Namespace string `json:"namespace,omitempty"`
-}
-
 type ImageManifest struct {
     Name    string   `json:"name"`
     Image   string   `json:"image"`
@@ -475,6 +470,10 @@ type ComponentValidation struct {
     Message       string        `json:"message,omitempty"`
 }
 ```
+| 类型 | 含义 |
+|------|------|
+| `ComponentVersionReference` | 一个**引用结构体**，用于指向 ComponentVersion CR（类似 k8s 的 ObjectReference） |
+| `ComponentVersionBinding` | 一个**独立的 CRD**，包含完整的 spec/status，表达运行时意图 |
 ### 7.4 ComponentVersion CRD
 ComponentVersion 定义组件能力目录，包含多个版本及其安装/升级/回滚/卸载动作。
 
