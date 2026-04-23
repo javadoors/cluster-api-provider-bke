@@ -97,74 +97,121 @@ ClusterVersion (集群版本)
 ```
 用户创建 BKECluster
     → BKEClusterReconciler 创建 ClusterVersion（引用 ReleaseImage）
-        → ClusterVersion 控制器解析 ReleaseImage，创建 ComponentVersion 列表
-            → DAGScheduler 计算安装顺序
-                → ComponentVersion 控制器按序执行 installAction
-                    → NodeConfig 控制器在对应节点上执行组件安装
+        → ClusterVersion 控制器解析 ReleaseImage
+            → 为每个组件创建 ComponentVersionBinding（spec.desiredVersion = 组件版本）
+            → DAGScheduler 计算安装顺序，按序更新 Binding
+                → ComponentVersionBinding 控制器检测 desiredVersion != installedVersion
+                    → 通过 componentVersionRef 找到 ComponentVersion
+                    → 从 ComponentVersion.versions[] 中查找对应版本的 installAction
+                    → 执行 installAction（YAML 声明）
+                    → 健康检查（YAML 声明）
+                → Node 级组件：NodeConfig 控制器在对应节点上触发安装
+                → 全部组件完成 → ClusterVersion 更新 currentVersion
 ```
 ### 6.2 场景二：集群版本升级（含旧组件卸载）
 ```
-用户更新 ClusterVersion.Spec.DesiredVersion
-    → ClusterVersion 控制器检测版本变更
-        → 查找新 ReleaseImage → 解析新 ComponentVersion 列表
-            → 对比新旧 ReleaseImage 的 ComponentVersion 列表
-                → 标记需要升级的 ComponentVersion
-                    → DAGScheduler 计算升级顺序
-                        → ComponentVersion 控制器按序执行：
-                            1. 通过 ClusterVersion 找到旧 ReleaseImage
-                            2. 通过旧 ReleaseImage 找到旧 ComponentVersion
-                            3. 执行旧 ComponentVersion 的 uninstallAction
-                            4. 执行新 ComponentVersion 的 upgradeAction
-                            5. 执行健康检查
-                        → 升级完成后更新 ClusterVersion.Status
+用户修改 ClusterVersion.spec.desiredVersion = "v2.6.0"
+    │
+    ├── ClusterVersion Controller
+    │   ├── 查找新 ReleaseImage → 解析新组件版本列表
+    │   └── 按升级 DAG 逐步更新 ComponentVersionBinding.spec.desiredVersion
+    │       （仅修改 desiredVersion 字段，不触碰 ComponentVersion）
+    │
+    ├── ComponentVersionBinding Controller（监听 desiredVersion 变化）
+    │   ├── 检测 spec.desiredVersion != status.installedVersion
+    │   ├── 通过 spec.componentVersionRef 找到 ComponentVersion
+    │   ├── 从 ComponentVersion.spec.versions[] 中查找对应版本的 upgradeAction
+    │   ├── 查找旧版本：
+    │   │   └── ClusterVersion.status.currentReleaseRef
+    │   │       → 旧 ReleaseImage
+    │   │         → 旧 ComponentVersion
+    │   │           → 旧版本 uninstallAction
+    │   ├── 执行旧版本 uninstallAction（YAML 声明）
+    │   ├── 执行新版本 upgradeAction（YAML 声明）
+    │   └── 健康检查（YAML 声明）
+    │
+    └── 全部组件完成 → ClusterVersion 更新 currentVersion
 ```
-### 6.3 场景三：单组件独立升级 // TODO
+### 6.3 场景三：单组件独立升级
 ```
-用户更新 ComponentVersion.Spec.Versions 中的目标版本
-    → ComponentVersion 控制器检测版本变更
-        → 执行 PreCheck
-            → 执行 UpgradeAction
-                → 执行 PostCheck
-                    → 更新 ComponentVersion.Status
-                        → 更新 ClusterVersion.Status 中的组件版本
+用户修改 ComponentVersionBinding.spec.desiredVersion
+    → ComponentVersionBinding 控制器检测 desiredVersion != installedVersion
+        → 通过 componentVersionRef 找到 ComponentVersion
+        → 从 ComponentVersion.spec.versions[] 中查找目标版本的 upgradeAction
+        → 执行 PreCheck（YAML 声明）
+        → 查找旧版本 uninstallAction（通过 ClusterVersion.currentReleaseRef → 旧 ReleaseImage → 旧 ComponentVersion）
+        → 执行旧版本 uninstallAction（YAML 声明）
+        → 执行新版本 upgradeAction（YAML 声明）
+        → 执行 PostCheck / 健康检查（YAML 声明）
+        → 更新 ComponentVersionBinding.status.installedVersion
+            → ClusterVersion 控制器检测到 Binding 状态变更，更新 ClusterVersion.Status 中的组件版本
 ```
 ### 6.4 场景四：节点扩容
 ```
 用户在 BKECluster.Spec 中添加新节点
-    → BKEClusterReconciler 创建新 NodeConfig
-        → NodeConfig 控制器检测到新节点
-            → 根据 NodeConfig.Spec.Components 引用 ComponentVersion
-                → ComponentVersion 控制器在新节点上执行 installAction
+    → BKEClusterReconciler 创建最小化 NodeConfig（不含 Components）
+        → BKEClusterReconciler 触发 cluster-api 创建 Machine 资源
+            ├── Master 节点：增加 KubeadmControlPlane replicas
+            └── Worker 节点：增加 MachineDeployment replicas
+                → NodeConfig 控制器检测到新节点（Components 为空）
+                    → 从 ReleaseImage 按 Role 填充 NodeConfig.Spec.Components
+                        → NodeConfig 控制器更新各 ComponentVersionBinding.nodeStatuses[新节点] = Pending
+                            → ComponentVersionBinding 控制器检测到新节点状态
+                                → 通过 componentVersionRef 找到 ComponentVersion
+                                → 执行 installAction（YAML 声明）
+                                    → 所有组件安装完成 → NodeConfig Phase=Ready
 ```
 ### 6.5 场景五：节点缩容
 ```
 用户从 BKECluster.Spec 中删除节点
     → BKEClusterReconciler 标记 NodeConfig Phase=Deleting
-        → NodeConfig 控制器执行节点组件卸载（nodeDelete uninstallAction）
-            → 删除 NodeConfig 资源
+        → NodeConfig 控制器按依赖逆序更新各 ComponentVersionBinding.nodeStatuses[节点] = Uninstalling
+            → ComponentVersionBinding 控制器检测到节点卸载状态
+                → 通过 componentVersionRef 找到 ComponentVersion
+                → 执行 uninstallAction（YAML 声明）
+                    → 所有组件卸载完成后
+                        → NodeConfig 控制器触发 cluster-api 清理 Machine 资源
+                            ├── Master 节点：减少 KubeadmControlPlane replicas
+                            ├── Worker 节点：减少 MachineDeployment replicas
+                            └── 删除 Machine 对象
+                                → 移除 NodeConfig Finalizer
+                                    → NodeConfig CR 被垃圾回收
 ```
+**扩缩容对称性**：
+```
+扩容：创建 NodeConfig → 创建 Machine → 填充 Components → 安装组件 → Ready
+缩容：标记 Deleting → 卸载组件 → 删除 Machine → 移除 Finalizer → 回收
+```
+两者都包含 cluster-api Machine 资源的操作，且顺序正确：扩容先创建 Machine 再安装组件，缩容先卸载组件再删除 Machine。
 ### 6.6 场景六：升级回滚
 ```
-ComponentVersion 升级失败
-    → ComponentVersion 控制器标记 Phase=UpgradeFailed
+ComponentVersionBinding 升级失败
+    → ComponentVersionBinding 控制器标记 Phase=UpgradeFailed
         → ClusterVersion 控制器检测到失败
             → 根据 UpgradeStrategy.AutoRollback 决定是否自动回滚
-                → ComponentVersion 控制器执行 RollbackAction
-                    → 回滚到上一个已知良好版本
+                → ClusterVersion 控制器将 ComponentVersionBinding.spec.desiredVersion 回退到旧版本
+                    → ComponentVersionBinding 控制器检测 desiredVersion 变化
+                        → 通过 componentVersionRef 找到 ComponentVersion
+                        → 从 ComponentVersion.spec.versions[] 中查找 rollbackAction
+                        → 执行 rollbackAction（YAML 声明）
+                            → 回滚到上一个已知良好版本
 ```
 ### 6.7 场景七：纳管现有集群
 ```
 用户创建 BKECluster（spec.manageMode=Import）
-    → ClusterVersion 控制器创建 clusterManage ComponentVersion
-        → ComponentVersion 控制器执行 installAction
-            → 收集集群信息 → 推送 Agent → 伪引导 → 兼容性补丁
+    → ClusterVersion 控制器创建 clusterManage ComponentVersionBinding
+        → ComponentVersionBinding 控制器检测 desiredVersion != installedVersion
+            → 通过 componentVersionRef 找到 ComponentVersion
+            → 从 ComponentVersion.spec.versions[] 中查找 installAction
+            → 执行 installAction（YAML 声明）
+                → 收集集群信息 → 推送 Agent → 伪引导 → 兼容性补丁
 ```
 ## 7. 提案
 ### 7.1 资源关联关系
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        BKECluster                               │
-│  (集群实例，1:1 对应 ClusterVersion)                            │
+│  (集群实例，1:1 对应 ClusterVersion)                             │
 └──────────────────────────┬──────────────────────────────────────┘
                            │ 1:1
                            ▼
@@ -196,7 +243,7 @@ ComponentVersion 升级失败
                           ▼  ▼   ▼
 ┌──────────────────────────────────────────────────────────────────┐
 │                    ComponentVersion                              │
-│  (组件清单，含多个版本，定义安装/升级/回滚/卸载动作)             │
+│  (组件清单，含多个版本，定义安装/升级/回滚/卸载动作)                 │
 │                                                                  │
 │  spec.componentName: etcd                                        │
 │  spec.versions:                                                  │
