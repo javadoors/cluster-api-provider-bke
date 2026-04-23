@@ -445,10 +445,55 @@ type UpgradePath struct {
 }
 
 type CompatibilityMatrix struct {
-    KubernetesVersions []string `json:"kubernetesVersions,omitempty"`
-    EtcdVersions       []string `json:"etcdVersions,omitempty"`
-    ContainerdVersions []string `json:"containerdVersions,omitempty"`
+    // 核心基础设施兼容性（必须检查）
+    KubernetesVersions  []string `json:"kubernetesVersions,omitempty"`
+    EtcdVersions        []string `json:"etcdVersions,omitempty"`
+    ContainerdVersions  []string `json:"containerdVersions,omitempty"`
+
+    // 生态系统组件兼容性（应该检查）
+    CalicoVersions      []string `json:"calicoVersions,omitempty"`
+    CoreDNSVersions     []string `json:"coreDNSVersions,omitempty"`
+    KubeProxyVersions   []string `json:"kubeProxyVersions,omitempty"`
+
+    // 平台版本兼容性（应该检查）
+    OpenFuyaoVersion    string   `json:"openFuyaoVersion,omitempty"`
+    BKEProviderVersion  string   `json:"bkeProviderVersion,omitempty"`
+
+    // 运行环境兼容性（可选检查）
+    OSVersions          []OSCompatibility `json:"osVersions,omitempty"`
+    Architectures       []string          `json:"architectures,omitempty"`
 }
+
+type OSCompatibility struct {
+    Type    string   `json:"type"`    // e.g., "CentOS", "Ubuntu", "Kylin"
+    Versions []string `json:"versions"` // e.g., ["7.9", "8.0", "22.04"]
+}
+
+// ComponentCompatibility 定义组件间的版本兼容约束
+type ComponentCompatibility struct {
+    Component   ComponentName `json:"component"`
+    Version     string        `json:"version"`
+    Requires    []ComponentVersionConstraint `json:"requires,omitempty"`
+}
+
+type ComponentVersionConstraint struct {
+    Component   ComponentName `json:"component"`
+    MinVersion  string        `json:"minVersion,omitempty"`
+    MaxVersion  string        `json:"maxVersion,omitempty"`
+    Versions    []string      `json:"versions,omitempty"` // 精确版本列表
+}
+
+// 示例：Kubernetes 1.29 的兼容性约束
+// ComponentCompatibility{
+//     Component: "kubernetes",
+//     Version: "v1.29.0",
+//     Requires: []ComponentVersionConstraint{
+//         {Component: "etcd", MinVersion: "v3.5.10"},
+//         {Component: "containerd", MinVersion: "v1.7.0"},
+//         {Component: "calico", MinVersion: "v3.25.0"},
+//         {Component: "coredns", MinVersion: "v1.9.0"},
+//     },
+// }
 
 type ReleaseImageStatus struct {
     Phase              ReleaseImagePhase `json:"phase,omitempty"`
@@ -974,19 +1019,80 @@ Reconcile(ctx, req):
 ### 8.2 ReleaseImage Controller
 **核心职责**：
 1. 验证所有引用的 ComponentVersion 是否存在
-2. 验证组件版本兼容性
+2. 验证组件版本兼容性（三层检查）
 3. 验证升级路径合法性
 4. 更新 status.phase = Valid/Invalid
+
+**兼容性检查三层模型**：
+
+| 层次 | 检查内容 | 失败影响 | 检查时机 |
+|------|---------|---------|---------|
+| **第一层：核心基础设施** | Kubernetes ↔ Etcd ↔ Containerd 版本兼容 | 集群无法运行 | 安装 + 升级 |
+| **第二层：生态系统组件** | Kubernetes ↔ Calico/CoreDNS/kube-proxy 版本兼容 | 功能异常 | 安装 + 升级 |
+| **第三层：平台组件** | openFuyao ↔ BKEProvider ↔ BKEAgent 版本兼容 | 管理功能受限 | 安装 + 升级 |
+
+**兼容性范围界定原则**：
+
+| 原则 | 说明 |
+|------|------|
+| **核心组件必须检查** | Kubernetes/Etcd/Containerd 三者版本不兼容会导致集群无法运行 |
+| **生态组件应该检查** | Calico/CoreDNS/kube-proxy 与 Kubernetes 版本不兼容会导致网络/DNS/代理异常 |
+| **平台组件应该检查** | openFuyao/BKEProvider/BKEAgent 版本不兼容会导致管理面功能受限 |
+| **工具组件不检查** | nodesEnv/nodesPostProcess 等工具类组件与核心组件无强依赖，无需兼容性检查 |
+| **OS/架构可选检查** | 操作系统和 CPU 架构兼容性由部署前检查完成，ReleaseImage 仅声明支持范围 |
 
 **Reconcile 流程**：
 ```
 Reconcile(ctx, req):
     1. 获取 ReleaseImage 实例
     2. 验证所有引用的 ComponentVersion 是否存在
-    3. 验证组件版本兼容性
-    4. 验证升级路径合法性
+    3. 验证组件版本兼容性：
+       a. 第一层：检查 Kubernetes/Etcd/Containerd 版本兼容性
+          - Etcd 版本是否满足 Kubernetes 要求（如 K8s 1.29 要求 Etcd >= 3.5.10）
+          - Containerd 版本是否满足 Kubernetes 要求（如 K8s 1.29 要求 Containerd >= 1.7.0）
+       b. 第二层：检查 Calico/CoreDNS/kube-proxy 与 Kubernetes 版本兼容性
+          - Calico 版本是否支持当前 Kubernetes 版本
+          - CoreDNS 版本是否与 Kubernetes 版本匹配
+       c. 第三层：检查 openFuyao/BKEProvider/BKEAgent 版本兼容性
+          - openFuyao 版本是否与 Kubernetes 版本兼容
+          - BKEProvider 版本是否与 openFuyao 版本兼容
+    4. 验证升级路径合法性（从 spec.upgradePaths）
     5. 更新 status.phase = Valid/Invalid
     6. 更新 status.validatedComponents
+```
+#### 兼容性范围界定总结
+##### 完整组件兼容性矩阵
+| 组件 | 是否需要兼容性检查 | 检查层次 | 原因 |
+|------|:--:|:--:|------|
+| **Kubernetes** | ✅ | 第一层 | 核心基础设施，版本不兼容集群无法运行 |
+| **Etcd** | ✅ | 第一层 | Kubernetes 强依赖，版本不兼容数据丢失风险 |
+| **Containerd** | ✅ | 第一层 | Kubernetes 强依赖，版本不兼容容器运行异常 |
+| **Calico** (addon) | ✅ | 第二层 | 网络插件，与 K8s CRI 版本强相关 |
+| **CoreDNS** (addon) | ✅ | 第二层 | DNS 服务，与 K8s API 版本相关 |
+| **kube-proxy** (addon) | ✅ | 第二层 | 网络代理，与 K8s iptables/IPVS 版本相关 |
+| **openFuyao** | ✅ | 第三层 | 平台控制器，与 K8s API 兼容性相关 |
+| **BKEProvider** | ✅ | 第三层 | cluster-api provider，与 K8s API 兼容性相关 |
+| **BKEAgent** | ✅ | 第三层 | 节点代理，与 openFuyao 管理面版本相关 |
+| **loadBalancer** | ❌ | - | haproxy+keepalived，独立运行，无强依赖 |
+| **certs** | ❌ | - | 证书管理，kubeadm 内部处理 |
+| **clusterAPI** | ❌ | - | cluster-api 对象创建，与 K8s 版本无关 |
+| **nodesEnv** | ❌ | - | 工具安装（lxcfs/nfs-utils/etcdctl/helm），无强依赖 |
+| **nodesPostProcess** | ❌ | - | 后处理脚本，无版本依赖 |
+| **agentSwitch** | ❌ | - | kubeconfig 切换，无版本依赖 |
+| **clusterManage** | ❌ | - | 纳管流程，无版本依赖 |
+| **nodeDelete** | ❌ | - | 节点删除流程，无版本依赖 |
+| **clusterHealth** | ❌ | - | 健康检查，无版本依赖 |
+##### 范围界定原则
+```
+需要兼容性检查的组件特征：
+  1. 与 Kubernetes 有强版本依赖（API 变更、CRI 变更、etcd API 变更）
+  2. 组件间有版本约束关系（如 openFuyao 要求 BKEProvider >= 某版本）
+  3. 版本不兼容会导致集群不可用或功能严重异常
+
+不需要兼容性检查的组件特征：
+  1. 独立运行，无强版本依赖（如 haproxy、工具类组件）
+  2. 仅执行一次性操作（如证书生成、对象创建）
+  3. 版本不兼容仅影响非核心功能（如后处理脚本）
 ```
 ### 8.3 ComponentVersion Controller
 **核心职责**：组件能力目录的验证控制器，不执行运行时操作。
