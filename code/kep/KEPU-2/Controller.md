@@ -3454,3 +3454,1217 @@ Reconcile: phase=RollingBack
 | **事件通知** | Recorder.Eventf() 记录安装/升级/回滚/卸载的成功/失败事件 | 全局 |
 | **Watch 联动** | Watch ClusterVersion + NodeConfig 变更，触发关联 ComponentVersion Reconcile | §2.15 |
 
+# NodeConfig Controller 的详细设计
+## NodeConfig Controller 详细设计
+### 一、设计思路
+NodeConfig Controller 是节点级组件生命周期管理控制器，承担五大核心职责：监听节点增删、触发组件安装/卸载、更新节点组件状态、触发 cluster-api 扩缩容。它是 ComponentVersion Controller 的"节点侧代理"，负责将节点维度的变更转化为 ComponentVersion 的操作请求。
+#### 1.1 核心设计原则
+| 原则 | 说明 |
+|------|------|
+| **节点即状态** | NodeConfig 是节点在管理面的投影，其 Spec 变更代表节点期望状态变化 |
+| **委托执行** | NodeConfig Controller 不直接执行组件操作，而是通过更新 ComponentVersion 的 nodeStatuses 委托给 ComponentVersion Controller 执行 |
+| **扩缩容桥接** | NodeConfig 增删触发 cluster-api 的 Machine 增删，实现声明式扩缩容 |
+| **状态聚合** | 聚合节点上所有组件的状态，形成节点级健康视图 |
+| **有序卸载** | 删除节点时按依赖逆序卸载组件，确保集群稳定性 |
+#### 1.2 NodeConfig Controller 与 ComponentVersion Controller 的职责边界
+```
+┌─────────────────────────────────────────────────────────┐
+│  NodeConfig Controller                                  │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │ 职责：                                           │   │
+│  │ 1. 监听 NodeConfig CR 增删改                     │   │
+│  │ 2. 新增节点→触发ComponentVersion安装该节点组件   │   │
+│  │ 3. 删除节点→触发ComponentVersion 卸载该节点组件  │   │
+│  │ 4. 聚合节点组件状态 → 更新 NodeConfig.status     │   │
+│  │ 5. 新增/删除节点 → 触发 cluster-api Machine 增删 │   │
+│  └──────────────────────────────────────────────────┘   │
+│                         │ 委托                          │
+│                         ▼                               │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │ ComponentVersion Controller                      │   │
+│  │ 职责：                                           │   │
+│  │ 1. 实际执行installAction/upgradeAction/uninstall │   │
+│  │ 2. 管理组件版本状态                              │   │
+│  │ 3. 健康检查                                      │   │
+│  └──────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────┘
+```
+#### 1.3 状态机设计
+```
+                    ┌──────────┐
+                    │ Pending  │ ← 初始状态/等待组件安装
+                    └────┬─────┘
+                         │ 所有组件安装成功
+                         ▼
+                ┌──────────────┐
+                │   Ready      │ ← 正常运行
+                └──┬───┬───┬───┘
+                   │   │   │
+       组件版本变更│   │   │ 节点被标记删除
+                   │   │   │
+                   ▼   │   ▼
+          ┌──────────┐ │ ┌──────────┐
+          │ Upgrading│ │ │ Deleting │ ← 触发组件卸载+Machine 删除
+          └────┬─────┘ │ └────┬─────┘
+               │       │      │
+     ┌─────────┴──┐    │      │ 所有组件卸载完成
+     │            │    │      │
+成功 ▼      失败  ▼    │      ▼
+  ┌───────┐ ┌────────┐ │ ┌──────────┐
+  │ Ready │ │NotReady│ │ │ Deleted  │ → 移除 Finalizer
+  └───────┘ └────────┘ │ └──────────┘
+                       │
+        部分组件不健康 ▼
+                ┌──────────┐
+                │ NotReady │
+                └────┬─────┘
+                     │ 组件恢复
+                     ▼
+                ┌──────────┐
+                │   Ready  │
+                └──────────┘
+```
+#### 1.4 关键设计决策
+| 决策 | 选择 | 原因 |
+|------|------|------|
+| 组件安装触发方式 | NodeConfig 更新 ComponentVersion 的 nodeStatuses，ComponentVersion Controller 检测到新节点后执行安装 | 保持 ComponentVersion Controller 作为唯一执行器，NodeConfig Controller 只做状态触发 |
+| 节点删除流程 | NodeConfig phase=Deleting → 按依赖逆序通知 ComponentVersion 卸载 → 删除 Machine → 移除 Finalizer | 确保组件被正确卸载后再删除基础设施 |
+| 扩容触发 | 新增 NodeConfig CR → 创建 Machine → 等待 Machine Ready → 触发组件安装 | 与 cluster-api 标准流程对齐 |
+| 缩容触发 | NodeConfig phase=Deleting → 卸载组件 → 删除 Machine → 删除 NodeConfig | 先卸载再删除，避免资源泄漏 |
+| 组件状态聚合 | 遍历关联 ComponentVersion 的 nodeStatuses[本节点] | NodeConfig 不维护独立组件状态，从 ComponentVersion 聚合 |
+### 二、代码实现
+#### 2.1 控制器结构体定义
+```go
+// controllers/cvo/nodeconfig_controller.go
+
+type NodeConfigReconciler struct {
+    client.Client
+    Scheme   *runtime.Scheme
+    Recorder record.EventRecorder
+
+    RequeueInterval time.Duration
+}
+
+const (
+    nodeConfigFinalizer = "cvo.openfuyao.cn/nodeconfig-protection"
+
+    DefaultNodeConfigRequeueInterval = 5 * time.Second
+)
+```
+#### 2.2 Reconcile 主入口
+```go
+func (r *NodeConfigReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    logger := ctrl.LoggerFrom(ctx)
+
+    nc := &cvo.NodeConfig{}
+    if err := r.Get(ctx, req.NamespacedName, nc); err != nil {
+        return ctrl.Result{}, client.IgnoreNotFound(err)
+    }
+
+    if !nc.DeletionTimestamp.IsZero() {
+        return r.handleDeletion(ctx, nc)
+    }
+
+    if !controllerutil.ContainsFinalizer(nc, nodeConfigFinalizer) {
+        controllerutil.AddFinalizer(nc, nodeConfigFinalizer)
+        if err := r.Update(ctx, nc); err != nil {
+            return ctrl.Result{}, err
+        }
+    }
+
+    switch nc.Status.Phase {
+    case "", cvo.NodeConfigPending:
+        return r.handlePending(ctx, nc)
+    case cvo.NodeConfigInstalling:
+        return r.handleInstalling(ctx, nc)
+    case cvo.NodeConfigReady:
+        return r.handleReady(ctx, nc)
+    case cvo.NodeConfigUpgrading:
+        return r.handleUpgrading(ctx, nc)
+    case cvo.NodeConfigNotReady:
+        return r.handleNotReady(ctx, nc)
+    case cvo.NodeConfigDeleting:
+        return r.handleDeleting(ctx, nc)
+    default:
+        logger.Info("unknown phase, resetting to Pending", "phase", nc.Status.Phase)
+        nc.Status.Phase = cvo.NodeConfigPending
+        _ = r.Status().Update(ctx, nc)
+        return ctrl.Result{Requeue: true}, nil
+    }
+}
+```
+#### 2.3 监听节点增删：handlePending
+新增 NodeConfig CR 时触发，负责初始化节点组件状态并启动安装流程。
+```go
+func (r *NodeConfigReconciler) handlePending(
+    ctx context.Context,
+    nc *cvo.NodeConfig,
+) (ctrl.Result, error) {
+    logger := ctrl.LoggerFrom(ctx)
+
+    if len(nc.Spec.Components) == 0 {
+        logger.Info("no components defined, generating from ReleaseImage")
+        if err := r.populateComponentsFromRelease(ctx, nc); err != nil {
+            logger.Error(err, "failed to populate components from ReleaseImage")
+            return ctrl.Result{RequeueAfter: r.RequeueInterval}, nil
+        }
+    }
+
+    if nc.Status.ComponentStatus == nil {
+        nc.Status.ComponentStatus = make(map[string]cvo.NodeComponentDetailStatus)
+    }
+
+    for _, comp := range nc.Spec.Components {
+        if _, exists := nc.Status.ComponentStatus[string(comp.ComponentName)]; !exists {
+            nc.Status.ComponentStatus[string(comp.ComponentName)] = cvo.NodeComponentDetailStatus{
+                Phase: cvo.ComponentPending,
+            }
+        }
+    }
+
+    nc.Status.Phase = cvo.NodeConfigInstalling
+    nc.Status.LastOperation = &cvo.LastOperation{
+        Type:      cvo.OperationInstall,
+        StartedAt: &metav1.Time{Time: time.Now()},
+    }
+    _ = r.Status().Update(ctx, nc)
+
+    r.triggerComponentInstallForNode(ctx, nc)
+
+    return ctrl.Result{RequeueAfter: r.RequeueInterval}, nil
+}
+
+func (r *NodeConfigReconciler) populateComponentsFromRelease(
+    ctx context.Context,
+    nc *cvo.NodeConfig,
+) error {
+    clusterName, ok := nc.Labels["cluster.x-k8s.io/cluster-name"]
+    if !ok {
+        return fmt.Errorf("cluster label not found on NodeConfig")
+    }
+
+    clusterVersions := &cvo.ClusterVersionList{}
+    if err := r.List(ctx, clusterVersions,
+        client.InNamespace(nc.Namespace),
+        client.MatchingLabels{"cluster.x-k8s.io/cluster-name": clusterName},
+    ); err != nil {
+        return err
+    }
+
+    if len(clusterVersions.Items) == 0 {
+        return fmt.Errorf("ClusterVersion not found for cluster %s", clusterName)
+    }
+
+    releaseRef := clusterVersions.Items[0].Spec.ReleaseRef
+    release := &cvo.ReleaseImage{}
+    if err := r.Get(ctx, types.NamespacedName{
+        Name:      releaseRef.Name,
+        Namespace: nc.Namespace,
+    }, release); err != nil {
+        return err
+    }
+
+    var components []cvo.NodeComponent
+    for _, comp := range release.Spec.Components {
+        if r.componentMatchesNodeRole(comp, nc.Spec.Roles) {
+            components = append(components, cvo.NodeComponent{
+                ComponentName: comp.ComponentName,
+                Version:       comp.Version,
+                ComponentVersionRef: &cvo.ComponentVersionReference{
+                    Name:      comp.ComponentVersionRef.Name,
+                    Namespace: nc.Namespace,
+                },
+            })
+        }
+    }
+
+    nc.Spec.Components = components
+    return r.Update(ctx, nc)
+}
+
+func (r *NodeConfigReconciler) componentMatchesNodeRole(
+    comp cvo.ReleaseComponent,
+    roles []cvo.NodeRole,
+) bool {
+    if comp.Scope == cvo.ScopeCluster {
+        return false
+    }
+
+    if len(comp.NodeSelector.Roles) == 0 {
+        return true
+    }
+
+    for _, role := range roles {
+        for _, selectorRole := range comp.NodeSelector.Roles {
+            if role == selectorRole {
+                return true
+            }
+        }
+    }
+    return false
+}
+```
+#### 2.4 触发组件安装：triggerComponentInstallForNode
+```go
+func (r *NodeConfigReconciler) triggerComponentInstallForNode(
+    ctx context.Context,
+    nc *cvo.NodeConfig,
+) {
+    logger := ctrl.LoggerFrom(ctx)
+
+    for _, comp := range nc.Spec.Components {
+        cvName := r.resolveComponentVersionName(ctx, comp)
+        cv := &cvo.ComponentVersion{}
+        if err := r.Get(ctx, types.NamespacedName{
+            Name:      cvName,
+            Namespace: nc.Namespace,
+        }, cv); err != nil {
+            logger.Error(err, "failed to get ComponentVersion",
+                "componentName", comp.ComponentName, "cvName", cvName)
+            continue
+        }
+
+        if cv.Status.NodeStatuses == nil {
+            cv.Status.NodeStatuses = make(map[string]cvo.NodeComponentStatus)
+        }
+
+        if _, exists := cv.Status.NodeStatuses[nc.Spec.NodeName]; exists {
+            continue
+        }
+
+        cv.Status.NodeStatuses[nc.Spec.NodeName] = cvo.NodeComponentStatus{
+            Phase:   cvo.ComponentPending,
+            Version: comp.Version,
+            Message: "triggered by NodeConfig creation",
+        }
+
+        if err := r.Status().Update(ctx, cv); err != nil {
+            logger.Error(err, "failed to update ComponentVersion nodeStatuses",
+                "componentName", comp.ComponentName, "nodeName", nc.Spec.NodeName)
+            continue
+        }
+
+        r.Recorder.Eventf(cv, corev1.EventTypeNormal, "NodeAdded",
+            "Node %s added, triggering install for component %s",
+            nc.Spec.NodeName, comp.ComponentName)
+    }
+}
+
+func (r *NodeConfigReconciler) resolveComponentVersionName(
+    ctx context.Context,
+    comp cvo.NodeComponent,
+) string {
+    if comp.ComponentVersionRef != nil {
+        return comp.ComponentVersionRef.Name
+    }
+    return string(comp.ComponentName)
+}
+```
+#### 2.5 安装中状态处理：handleInstalling
+```go
+func (r *NodeConfigReconciler) handleInstalling(
+    ctx context.Context,
+    nc *cvo.NodeConfig,
+) (ctrl.Result, error) {
+    logger := ctrl.LoggerFrom(ctx)
+
+    allReady := true
+    anyFailed := false
+
+    for _, comp := range nc.Spec.Components {
+        cvName := r.resolveComponentVersionName(ctx, comp)
+        cv := &cvo.ComponentVersion{}
+        if err := r.Get(ctx, types.NamespacedName{
+            Name:      cvName,
+            Namespace: nc.Namespace,
+        }, cv); err != nil {
+            logger.Error(err, "failed to get ComponentVersion",
+                "componentName", comp.ComponentName)
+            allReady = false
+            continue
+        }
+
+        nodeStatus, exists := cv.Status.NodeStatuses[nc.Spec.NodeName]
+        if !exists {
+            allReady = false
+            continue
+        }
+
+        nc.Status.ComponentStatus[string(comp.ComponentName)] = cvo.NodeComponentDetailStatus{
+            Phase:   nodeStatus.Phase,
+            Version: nodeStatus.Version,
+            Message: nodeStatus.Message,
+        }
+
+        switch nodeStatus.Phase {
+        case cvo.ComponentHealthy, cvo.ComponentInstalled:
+            installedAt := metav1.Now()
+            nc.Status.ComponentStatus[string(comp.ComponentName)] = cvo.NodeComponentDetailStatus{
+                Phase:       nodeStatus.Phase,
+                Version:     nodeStatus.Version,
+                InstalledAt: &installedAt,
+            }
+        case cvo.ComponentDegraded, cvo.ComponentUpgradeFailed:
+            anyFailed = true
+            allReady = false
+        default:
+            allReady = false
+        }
+    }
+
+    if allReady {
+        nc.Status.Phase = cvo.NodeConfigReady
+        nc.Status.LastOperation.Result = cvo.OperationSucceeded
+        nc.Status.LastOperation.CompletedAt = &metav1.Time{Time: time.Now()}
+        conditions.Set(nc, &cvo.NodeConfigCondition{
+            Type:   cvo.NodeConfigAvailable,
+            Status: corev1.ConditionTrue,
+            Reason: "AllComponentsReady",
+        })
+        r.Recorder.Eventf(nc, corev1.EventTypeNormal, "InstallSucceeded",
+            "All components installed on node %s", nc.Spec.NodeName)
+        _ = r.Status().Update(ctx, nc)
+        return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+    }
+
+    if anyFailed {
+        nc.Status.Phase = cvo.NodeConfigNotReady
+        nc.Status.LastOperation.Result = cvo.OperationFailed
+        nc.Status.LastOperation.Message = "one or more components failed to install"
+        conditions.Set(nc, &cvo.NodeConfigCondition{
+            Type:    cvo.NodeConfigAvailable,
+            Status:  corev1.ConditionFalse,
+            Reason:  "ComponentInstallFailed",
+            Message: "one or more components failed to install",
+        })
+        _ = r.Status().Update(ctx, nc)
+        return ctrl.Result{RequeueAfter: r.RequeueInterval}, nil
+    }
+
+    _ = r.Status().Update(ctx, nc)
+    return ctrl.Result{RequeueAfter: r.RequeueInterval}, nil
+}
+```
+#### 2.6 Ready 状态处理：handleReady（周期性状态聚合 + 版本变更检测）
+```go
+func (r *NodeConfigReconciler) handleReady(
+    ctx context.Context,
+    nc *cvo.NodeConfig,
+) (ctrl.Result, error) {
+    logger := ctrl.LoggerFrom(ctx)
+
+    allHealthy := true
+    needsUpgrade := false
+    var upgradeComponents []string
+
+    for _, comp := range nc.Spec.Components {
+        cvName := r.resolveComponentVersionName(ctx, comp)
+        cv := &cvo.ComponentVersion{}
+        if err := r.Get(ctx, types.NamespacedName{
+            Name:      cvName,
+            Namespace: nc.Namespace,
+        }, cv); err != nil {
+            logger.Error(err, "failed to get ComponentVersion",
+                "componentName", comp.ComponentName)
+            allHealthy = false
+            continue
+        }
+
+        nodeStatus, exists := cv.Status.NodeStatuses[nc.Spec.NodeName]
+        if !exists {
+            allHealthy = false
+            continue
+        }
+
+        nc.Status.ComponentStatus[string(comp.ComponentName)] = cvo.NodeComponentDetailStatus{
+            Phase:   nodeStatus.Phase,
+            Version: nodeStatus.Version,
+            Message: nodeStatus.Message,
+        }
+
+        if nodeStatus.Phase != cvo.ComponentHealthy && nodeStatus.Phase != cvo.ComponentInstalled {
+            allHealthy = false
+        }
+
+        if comp.Version != nodeStatus.Version {
+            needsUpgrade = true
+            upgradeComponents = append(upgradeComponents, string(comp.ComponentName))
+        }
+    }
+
+    if !allHealthy {
+        nc.Status.Phase = cvo.NodeConfigNotReady
+        conditions.Set(nc, &cvo.NodeConfigCondition{
+            Type:    cvo.NodeConfigAvailable,
+            Status:  corev1.ConditionFalse,
+            Reason:  "ComponentNotHealthy",
+            Message: "one or more components are not healthy",
+        })
+        _ = r.Status().Update(ctx, nc)
+        return ctrl.Result{RequeueAfter: r.RequeueInterval}, nil
+    }
+
+    if needsUpgrade {
+        logger.Info("component version drift detected, triggering upgrade",
+            "nodeName", nc.Spec.NodeName,
+            "components", strings.Join(upgradeComponents, ","))
+
+        nc.Status.Phase = cvo.NodeConfigUpgrading
+        nc.Status.LastOperation = &cvo.LastOperation{
+            Type:      cvo.OperationUpgrade,
+            StartedAt: &metav1.Time{Time: time.Now()},
+            Message:   fmt.Sprintf("upgrading components: %s", strings.Join(upgradeComponents, ",")),
+        }
+        _ = r.Status().Update(ctx, nc)
+        return ctrl.Result{Requeue: true}, nil
+    }
+
+    _ = r.Status().Update(ctx, nc)
+    return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+}
+```
+#### 2.7 升级状态处理：handleUpgrading
+```go
+func (r *NodeConfigReconciler) handleUpgrading(
+    ctx context.Context,
+    nc *cvo.NodeConfig,
+) (ctrl.Result, error) {
+    logger := ctrl.LoggerFrom(ctx)
+
+    allReady := true
+    anyFailed := false
+
+    for _, comp := range nc.Spec.Components {
+        cvName := r.resolveComponentVersionName(ctx, comp)
+        cv := &cvo.ComponentVersion{}
+        if err := r.Get(ctx, types.NamespacedName{
+            Name:      cvName,
+            Namespace: nc.Namespace,
+        }, cv); err != nil {
+            allReady = false
+            continue
+        }
+
+        nodeStatus, exists := cv.Status.NodeStatuses[nc.Spec.NodeName]
+        if !exists {
+            allReady = false
+            continue
+        }
+
+        nc.Status.ComponentStatus[string(comp.ComponentName)] = cvo.NodeComponentDetailStatus{
+            Phase:   nodeStatus.Phase,
+            Version: nodeStatus.Version,
+            Message: nodeStatus.Message,
+        }
+
+        switch nodeStatus.Phase {
+        case cvo.ComponentHealthy, cvo.ComponentInstalled:
+            if comp.Version != nodeStatus.Version {
+                allReady = false
+            }
+        case cvo.ComponentUpgrading, cvo.ComponentInstalling, cvo.ComponentPending:
+            allReady = false
+        case cvo.ComponentDegraded, cvo.ComponentUpgradeFailed:
+            anyFailed = true
+            allReady = false
+        }
+    }
+
+    if allReady {
+        nc.Status.Phase = cvo.NodeConfigReady
+        nc.Status.LastOperation.Result = cvo.OperationSucceeded
+        nc.Status.LastOperation.CompletedAt = &metav1.Time{Time: time.Now()}
+        conditions.Set(nc, &cvo.NodeConfigCondition{
+            Type:   cvo.NodeConfigAvailable,
+            Status: corev1.ConditionTrue,
+            Reason: "UpgradeSucceeded",
+        })
+        r.Recorder.Eventf(nc, corev1.EventTypeNormal, "UpgradeSucceeded",
+            "All components upgraded on node %s", nc.Spec.NodeName)
+        _ = r.Status().Update(ctx, nc)
+        return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+    }
+
+    if anyFailed {
+        nc.Status.Phase = cvo.NodeConfigNotReady
+        nc.Status.LastOperation.Result = cvo.OperationFailed
+        nc.Status.LastOperation.Message = "one or more components failed to upgrade"
+        conditions.Set(nc, &cvo.NodeConfigCondition{
+            Type:    cvo.NodeConfigAvailable,
+            Status:  corev1.ConditionFalse,
+            Reason:  "ComponentUpgradeFailed",
+            Message: "one or more components failed to upgrade",
+        })
+        _ = r.Status().Update(ctx, nc)
+        return ctrl.Result{RequeueAfter: r.RequeueInterval}, nil
+    }
+
+    _ = r.Status().Update(ctx, nc)
+    return ctrl.Result{RequeueAfter: r.RequeueInterval}, nil
+}
+```
+#### 2.8 NotReady 状态处理：handleNotReady
+```go
+func (r *NodeConfigReconciler) handleNotReady(
+    ctx context.Context,
+    nc *cvo.NodeConfig,
+) (ctrl.Result, error) {
+    logger := ctrl.LoggerFrom(ctx)
+
+    allHealthy := true
+
+    for _, comp := range nc.Spec.Components {
+        cvName := r.resolveComponentVersionName(ctx, comp)
+        cv := &cvo.ComponentVersion{}
+        if err := r.Get(ctx, types.NamespacedName{
+            Name:      cvName,
+            Namespace: nc.Namespace,
+        }, cv); err != nil {
+            allHealthy = false
+            continue
+        }
+
+        nodeStatus, exists := cv.Status.NodeStatuses[nc.Spec.NodeName]
+        if !exists {
+            allHealthy = false
+            continue
+        }
+
+        nc.Status.ComponentStatus[string(comp.ComponentName)] = cvo.NodeComponentDetailStatus{
+            Phase:   nodeStatus.Phase,
+            Version: nodeStatus.Version,
+            Message: nodeStatus.Message,
+        }
+
+        if nodeStatus.Phase != cvo.ComponentHealthy && nodeStatus.Phase != cvo.ComponentInstalled {
+            allHealthy = false
+        }
+    }
+
+    if allHealthy {
+        logger.Info("all components recovered, transitioning to Ready",
+            "nodeName", nc.Spec.NodeName)
+        nc.Status.Phase = cvo.NodeConfigReady
+        nc.Status.Message = ""
+        conditions.Set(nc, &cvo.NodeConfigCondition{
+            Type:   cvo.NodeConfigAvailable,
+            Status: corev1.ConditionTrue,
+            Reason: "ComponentsRecovered",
+        })
+        _ = r.Status().Update(ctx, nc)
+        return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+    }
+
+    _ = r.Status().Update(ctx, nc)
+    return ctrl.Result{RequeueAfter: r.RequeueInterval}, nil
+}
+```
+#### 2.9 触发组件卸载 + 删除处理：handleDeletion / handleDeleting
+```go
+func (r *NodeConfigReconciler) handleDeletion(
+    ctx context.Context,
+    nc *cvo.NodeConfig,
+) (ctrl.Result, error) {
+    logger := ctrl.LoggerFrom(ctx)
+
+    if !controllerutil.ContainsFinalizer(nc, nodeConfigFinalizer) {
+        return ctrl.Result{}, nil
+    }
+
+    if nc.Status.Phase != cvo.NodeConfigDeleting {
+        logger.Info("node being deleted, starting component uninstall",
+            "nodeName", nc.Spec.NodeName)
+
+        nc.Status.Phase = cvo.NodeConfigDeleting
+        nc.Status.LastOperation = &cvo.LastOperation{
+            Type:      cvo.OperationUninstall,
+            StartedAt: &metav1.Time{Time: time.Now()},
+        }
+        _ = r.Status().Update(ctx, nc)
+
+        r.triggerComponentUninstallForNode(ctx, nc)
+
+        return ctrl.Result{RequeueAfter: r.RequeueInterval}, nil
+    }
+
+    return r.handleDeleting(ctx, nc)
+}
+
+func (r *NodeConfigReconciler) triggerComponentUninstallForNode(
+    ctx context.Context,
+    nc *cvo.NodeConfig,
+) {
+    logger := ctrl.LoggerFrom(ctx)
+
+    sortedComponents := r.sortComponentsByReverseDependency(ctx, nc)
+
+    for _, comp := range sortedComponents {
+        cvName := r.resolveComponentVersionName(ctx, comp)
+        cv := &cvo.ComponentVersion{}
+        if err := r.Get(ctx, types.NamespacedName{
+            Name:      cvName,
+            Namespace: nc.Namespace,
+        }, cv); err != nil {
+            logger.Error(err, "failed to get ComponentVersion for uninstall",
+                "componentName", comp.ComponentName)
+            continue
+        }
+
+        if cv.Status.NodeStatuses == nil {
+            continue
+        }
+
+        if _, exists := cv.Status.NodeStatuses[nc.Spec.NodeName]; !exists {
+            continue
+        }
+
+        cv.Status.NodeStatuses[nc.Spec.NodeName] = cvo.NodeComponentStatus{
+            Phase:   cvo.ComponentUninstalling,
+            Version: cv.Status.NodeStatuses[nc.Spec.NodeName].Version,
+            Message: "triggered by NodeConfig deletion",
+        }
+
+        if err := r.Status().Update(ctx, cv); err != nil {
+            logger.Error(err, "failed to update ComponentVersion for node uninstall",
+                "componentName", comp.ComponentName, "nodeName", nc.Spec.NodeName)
+            continue
+        }
+
+        r.Recorder.Eventf(cv, corev1.EventTypeNormal, "NodeRemoving",
+            "Node %s being removed, triggering uninstall for component %s",
+            nc.Spec.NodeName, comp.ComponentName)
+    }
+}
+
+func (r *NodeConfigReconciler) sortComponentsByReverseDependency(
+    ctx context.Context,
+    nc *cvo.NodeConfig,
+) []cvo.NodeComponent {
+    depGraph := cvo.UpgradeDependencyGraph
+
+    componentDeps := make(map[string][]string)
+    for _, comp := range nc.Spec.Components {
+        name := string(comp.ComponentName)
+        if deps, ok := depGraph[cvo.ComponentName(name)]; ok {
+            depNames := make([]string, 0, len(deps))
+            for _, d := range deps {
+                depNames = append(depNames, string(d))
+            }
+            componentDeps[name] = depNames
+        } else {
+            componentDeps[name] = nil
+        }
+    }
+
+    sorted, err := topoSortReverse(componentDeps)
+    if err != nil {
+        ctrl.LoggerFrom(ctx).Error(err, "topological sort failed, using original order")
+        return nc.Spec.Components
+    }
+
+    compMap := make(map[string]cvo.NodeComponent)
+    for _, comp := range nc.Spec.Components {
+        compMap[string(comp.ComponentName)] = comp
+    }
+
+    var result []cvo.NodeComponent
+    for _, name := range sorted {
+        if comp, ok := compMap[name]; ok {
+            result = append(result, comp)
+        }
+    }
+    return result
+}
+
+func topoSortReverse(deps map[string][]string) ([]string, error) {
+    inDegree := make(map[string]int)
+    for node := range deps {
+        if _, ok := inDegree[node]; !ok {
+            inDegree[node] = 0
+        }
+        for _, dep := range deps[node] {
+            inDegree[dep]++
+        }
+    }
+
+    var queue []string
+    for node, degree := range inDegree {
+        if degree == 0 {
+            queue = append(queue, node)
+        }
+    }
+
+    var sorted []string
+    for len(queue) > 0 {
+        node := queue[0]
+        queue = queue[1:]
+        sorted = append(sorted, node)
+        for _, dep := range deps[node] {
+            inDegree[dep]--
+            if inDegree[dep] == 0 {
+                queue = append(queue, dep)
+            }
+        }
+    }
+
+    if len(sorted) != len(deps) {
+        return nil, fmt.Errorf("cycle detected in dependency graph")
+    }
+
+    var reversed []string
+    for i := len(sorted) - 1; i >= 0; i-- {
+        reversed = append(reversed, sorted[i])
+    }
+    return reversed, nil
+}
+
+func (r *NodeConfigReconciler) handleDeleting(
+    ctx context.Context,
+    nc *cvo.NodeConfig,
+) (ctrl.Result, error) {
+    logger := ctrl.LoggerFrom(ctx)
+
+    allUninstalled := true
+
+    for _, comp := range nc.Spec.Components {
+        cvName := r.resolveComponentVersionName(ctx, comp)
+        cv := &cvo.ComponentVersion{}
+        if err := r.Get(ctx, types.NamespacedName{
+            Name:      cvName,
+            Namespace: nc.Namespace,
+        }, cv); err != nil {
+            if apierrors.IsNotFound(err) {
+                continue
+            }
+            allUninstalled = false
+            continue
+        }
+
+        nodeStatus, exists := cv.Status.NodeStatuses[nc.Spec.NodeName]
+        if !exists {
+            continue
+        }
+
+        nc.Status.ComponentStatus[string(comp.ComponentName)] = cvo.NodeComponentDetailStatus{
+            Phase:   nodeStatus.Phase,
+            Version: nodeStatus.Version,
+            Message: nodeStatus.Message,
+        }
+
+        if nodeStatus.Phase != cvo.ComponentUninstalled && nodeStatus.Phase != cvo.ComponentPending {
+            allUninstalled = false
+        }
+    }
+
+    if !allUninstalled {
+        _ = r.Status().Update(ctx, nc)
+        return ctrl.Result{RequeueAfter: r.RequeueInterval}, nil
+    }
+
+    if err := r.triggerMachineDeletion(ctx, nc); err != nil {
+        logger.Error(err, "failed to delete Machine",
+            "nodeName", nc.Spec.NodeName)
+        return ctrl.Result{}, err
+    }
+
+    controllerutil.RemoveFinalizer(nc, nodeConfigFinalizer)
+    if err := r.Update(ctx, nc); err != nil {
+        return ctrl.Result{}, err
+    }
+
+    logger.Info("node deleted and finalizer removed",
+        "nodeName", nc.Spec.NodeName)
+    return ctrl.Result{}, nil
+}
+```
+#### 2.10 触发 cluster-api 扩缩容
+```go
+func (r *NodeConfigReconciler) triggerMachineCreation(
+    ctx context.Context,
+    nc *cvo.NodeConfig,
+) error {
+    logger := ctrl.LoggerFrom(ctx)
+
+    clusterName, ok := nc.Labels["cluster.x-k8s.io/cluster-name"]
+    if !ok {
+        return fmt.Errorf("cluster label not found on NodeConfig")
+    }
+
+    existingMachine, err := r.findMachineForNode(ctx, nc)
+    if err != nil {
+        return err
+    }
+    if existingMachine != nil {
+        logger.Info("Machine already exists for node",
+            "nodeName", nc.Spec.NodeName,
+            "machineName", existingMachine.Name)
+        return nil
+    }
+
+    isMaster := r.isMasterNode(nc)
+
+    if isMaster {
+        return r.createControlPlaneMachine(ctx, nc, clusterName)
+    }
+    return r.createWorkerMachine(ctx, nc, clusterName)
+}
+
+func (r *NodeConfigReconciler) createControlPlaneMachine(
+    ctx context.Context,
+    nc *cvo.NodeConfig,
+    clusterName string,
+) error {
+    machineName := fmt.Sprintf("%s-%s", clusterName, nc.Spec.NodeName)
+
+    kcp := &capiv1.KubeadmControlPlane{}
+    if err := r.Get(ctx, types.NamespacedName{
+        Name:      clusterName,
+        Namespace: nc.Namespace,
+    }, kcp); err != nil {
+        return fmt.Errorf("get KubeadmControlPlane: %w", err)
+    }
+
+    desiredReplicas := int32(1)
+    if kcp.Spec.Replicas != nil {
+        desiredReplicas = *kcp.Spec.Replicas + 1
+    }
+    kcp.Spec.Replicas = &desiredReplicas
+
+    if err := r.Update(ctx, kcp); err != nil {
+        return fmt.Errorf("update KubeadmControlPlane replicas: %w", err)
+    }
+
+    r.Recorder.Eventf(nc, corev1.EventTypeNormal, "MachineScalingUp",
+        "Increased KubeadmControlPlane replicas to %d for node %s",
+        desiredReplicas, nc.Spec.NodeName)
+    return nil
+}
+
+func (r *NodeConfigReconciler) createWorkerMachine(
+    ctx context.Context,
+    nc *cvo.NodeConfig,
+    clusterName string,
+) error {
+    machineName := fmt.Sprintf("%s-%s", clusterName, nc.Spec.NodeName)
+
+    mdList := &capiv1.MachineDeploymentList{}
+    if err := r.List(ctx, mdList,
+        client.InNamespace(nc.Namespace),
+        client.MatchingLabels{"cluster.x-k8s.io/cluster-name": clusterName},
+    ); err != nil {
+        return fmt.Errorf("list MachineDeployments: %w", err)
+    }
+
+    if len(mdList.Items) == 0 {
+        return fmt.Errorf("no MachineDeployment found for cluster %s", clusterName)
+    }
+
+    md := mdList.Items[0]
+    desiredReplicas := int32(1)
+    if md.Spec.Replicas != nil {
+        desiredReplicas = *md.Spec.Replicas + 1
+    }
+    md.Spec.Replicas = &desiredReplicas
+
+    if err := r.Update(ctx, md); err != nil {
+        return fmt.Errorf("update MachineDeployment replicas: %w", err)
+    }
+
+    r.Recorder.Eventf(nc, corev1.EventTypeNormal, "MachineScalingUp",
+        "Increased MachineDeployment replicas to %d for node %s",
+        desiredReplicas, nc.Spec.NodeName)
+    return nil
+}
+
+func (r *NodeConfigReconciler) triggerMachineDeletion(
+    ctx context.Context,
+    nc *cvo.NodeConfig,
+) error {
+    logger := ctrl.LoggerFrom(ctx)
+    isMaster := r.isMasterNode(nc)
+
+    clusterName, ok := nc.Labels["cluster.x-k8s.io/cluster-name"]
+    if !ok {
+        return fmt.Errorf("cluster label not found on NodeConfig")
+    }
+
+    if isMaster {
+        kcp := &capiv1.KubeadmControlPlane{}
+        if err := r.Get(ctx, types.NamespacedName{
+            Name:      clusterName,
+            Namespace: nc.Namespace,
+        }, kcp); err != nil {
+            return fmt.Errorf("get KubeadmControlPlane: %w", err)
+        }
+
+        if kcp.Spec.Replicas != nil && *kcp.Spec.Replicas > 1 {
+            desiredReplicas := *kcp.Spec.Replicas - 1
+            kcp.Spec.Replicas = &desiredReplicas
+            if err := r.Update(ctx, kcp); err != nil {
+                return fmt.Errorf("decrease KubeadmControlPlane replicas: %w", err)
+            }
+            r.Recorder.Eventf(nc, corev1.EventTypeNormal, "MachineScalingDown",
+                "Decreased KubeadmControlPlane replicas to %d for node %s removal",
+                desiredReplicas, nc.Spec.NodeName)
+        }
+    } else {
+        mdList := &capiv1.MachineDeploymentList{}
+        if err := r.List(ctx, mdList,
+            client.InNamespace(nc.Namespace),
+            client.MatchingLabels{"cluster.x-k8s.io/cluster-name": clusterName},
+        ); err != nil {
+            return fmt.Errorf("list MachineDeployments: %w", err)
+        }
+
+        if len(mdList.Items) > 0 {
+            md := mdList.Items[0]
+            if md.Spec.Replicas != nil && *md.Spec.Replicas > 0 {
+                desiredReplicas := *md.Spec.Replicas - 1
+                md.Spec.Replicas = &desiredReplicas
+                if err := r.Update(ctx, md); err != nil {
+                    return fmt.Errorf("decrease MachineDeployment replicas: %w", err)
+                }
+                r.Recorder.Eventf(nc, corev1.EventTypeNormal, "MachineScalingDown",
+                    "Decreased MachineDeployment replicas to %d for node %s removal",
+                    desiredReplicas, nc.Spec.NodeName)
+            }
+        }
+    }
+
+    machine, err := r.findMachineForNode(ctx, nc)
+    if err != nil {
+        logger.Error(err, "failed to find Machine for node",
+            "nodeName", nc.Spec.NodeName)
+        return nil
+    }
+    if machine != nil {
+        if err := r.Delete(ctx, machine); err != nil && !apierrors.IsNotFound(err) {
+            return fmt.Errorf("delete Machine: %w", err)
+        }
+    }
+
+    return nil
+}
+
+func (r *NodeConfigReconciler) findMachineForNode(
+    ctx context.Context,
+    nc *cvo.NodeConfig,
+) (*capiv1.Machine, error) {
+    machineList := &capiv1.MachineList{}
+    if err := r.List(ctx, machineList,
+        client.InNamespace(nc.Namespace),
+        client.MatchingLabels{
+            "cluster.x-k8s.io/cluster-name": nc.Labels["cluster.x-k8s.io/cluster-name"],
+        },
+    ); err != nil {
+        return nil, err
+    }
+
+    for i := range machineList.Items {
+        m := &machineList.Items[i]
+        if m.Spec.InfrastructureRef.Name == nc.Spec.NodeName ||
+            strings.HasPrefix(m.Name, nc.Spec.NodeName) {
+            return m, nil
+        }
+    }
+    return nil, nil
+}
+
+func (r *NodeConfigReconciler) isMasterNode(nc *cvo.NodeConfig) bool {
+    for _, role := range nc.Spec.Roles {
+        if role == cvo.NodeRoleMaster {
+            return true
+        }
+    }
+    return false
+}
+```
+#### 2.11 Watch 联动：SetupWithManager
+```go
+func (r *NodeConfigReconciler) SetupWithManager(mgr ctrl.Manager) error {
+    return ctrl.NewControllerManagedBy(mgr).
+        For(&cvo.NodeConfig{}).
+        Watches(
+            &cvo.ComponentVersion{},
+            handler.EnqueueRequestsFromMapFunc(r.componentVersionToNodeConfigs),
+        ).
+        Watches(
+            &capiv1.Machine{},
+            handler.EnqueueRequestsFromMapFunc(r.machineToNodeConfig),
+        ).
+        WithEventFilter(predicate.GenerationChangedPredicate{}).
+        Complete(r)
+}
+
+func (r *NodeConfigReconciler) componentVersionToNodeConfigs(
+    ctx context.Context,
+    obj client.Object,
+) []reconcile.Request {
+    cv, ok := obj.(*cvo.ComponentVersion)
+    if !ok {
+        return nil
+    }
+
+    clusterName, ok := cv.Labels["cluster.x-k8s.io/cluster-name"]
+    if !ok {
+        return nil
+    }
+
+    ncList := &cvo.NodeConfigList{}
+    if err := r.List(ctx, ncList,
+        client.InNamespace(cv.Namespace),
+        client.MatchingLabels{"cluster.x-k8s.io/cluster-name": clusterName},
+    ); err != nil {
+        return nil
+    }
+
+    var requests []reconcile.Request
+    for _, nc := range ncList.Items {
+        if _, exists := cv.Status.NodeStatuses[nc.Spec.NodeName]; exists {
+            requests = append(requests, reconcile.Request{
+                NamespacedName: types.NamespacedName{
+                    Name:      nc.Name,
+                    Namespace: nc.Namespace,
+                },
+            })
+        }
+    }
+    return requests
+}
+
+func (r *NodeConfigReconciler) machineToNodeConfig(
+    ctx context.Context,
+    obj client.Object,
+) []reconcile.Request {
+    machine, ok := obj.(*capiv1.Machine)
+    if !ok {
+        return nil
+    }
+
+    clusterName, ok := machine.Labels["cluster.x-k8s.io/cluster-name"]
+    if !ok {
+        return nil
+    }
+
+    ncList := &cvo.NodeConfigList{}
+    if err := r.List(ctx, ncList,
+        client.InNamespace(machine.Namespace),
+        client.MatchingLabels{"cluster.x-k8s.io/cluster-name": clusterName},
+    ); err != nil {
+        return nil
+    }
+
+    for _, nc := range ncList.Items {
+        if nc.Spec.NodeName == machine.Spec.InfrastructureRef.Name ||
+            strings.HasPrefix(machine.Name, nc.Spec.NodeName) {
+            return []reconcile.Request{
+                {
+                    NamespacedName: types.NamespacedName{
+                        Name:      nc.Name,
+                        Namespace: nc.Namespace,
+                    },
+                },
+            }
+        }
+    }
+    return nil
+}
+```
+### 三、核心流程时序图
+#### 3.1 扩容流程（新增节点）
+```
+用户创建 NodeConfig CR
+    │
+    ▼
+NodeConfig Controller: Reconcile
+    │
+    ├── phase=Pending
+    │   ├── populateComponentsFromRelease() → 从 ReleaseImage 填充组件列表
+    │   ├── triggerMachineCreation() → 增加 MachineDeployment/ControlPlane replicas
+    │   ├── triggerComponentInstallForNode() → 更新 ComponentVersion.nodeStatuses[新节点]
+    │   └── phase=Installing
+    │
+    ▼
+ComponentVersion Controller 检测到 nodeStatuses 新增节点
+    │
+    ├── 对新节点执行 installAction（通过 ActionEngine）
+    ├── 更新 nodeStatuses[新节点].phase = Healthy
+    │
+    ▼
+NodeConfig Controller: Watch ComponentVersion 变更
+    │
+    ├── handleInstalling() → 聚合所有组件状态
+    │   ├── 所有组件 Healthy → phase=Ready
+    │   └── 有组件未就绪 → requeue
+    │
+    └── phase=Ready → 扩容完成
+```
+#### 3.2 缩容流程（删除节点）
+```
+用户删除 NodeConfig CR（或标记 phase=Deleting）
+    │
+    ▼
+NodeConfig Controller: handleDeletion
+    │
+    ├── phase=Deleting
+    ├── sortComponentsByReverseDependency() → 按依赖逆序排列
+    ├── triggerComponentUninstallForNode()
+    │   └── 逐组件更新 ComponentVersion.nodeStatuses[节点].phase = Uninstalling
+    │
+    ▼
+ComponentVersion Controller 检测到节点状态变更
+    │
+    ├── 对该节点执行 uninstallAction
+    ├── 更新 nodeStatuses[节点].phase = Uninstalled
+    │
+    ▼
+NodeConfig Controller: handleDeleting
+    │
+    ├── 检查所有组件 nodeStatuses[节点].phase == Uninstalled
+    │   ├── 未全部完成 → requeue
+    │   └── 全部完成 → 继续
+    │
+    ├── triggerMachineDeletion()
+    │   ├── Master: 减少 KubeadmControlPlane replicas
+    │   ├── Worker: 减少 MachineDeployment replicas
+    │   └── 删除 Machine 对象
+    │
+    ├── 移除 Finalizer
+    └── NodeConfig CR 被垃圾回收
+```
+#### 3.3 版本变更触发升级
+```
+ClusterVersion 更新 desiredVersion
+    │
+    ▼
+ClusterVersion Controller 更新 ComponentVersion.spec.version
+    │
+    ▼
+ComponentVersion Controller 执行升级
+    │
+    ▼
+NodeConfig Controller: Watch ComponentVersion 变更
+    │
+    ├── handleReady() 检测到版本漂移
+    │   └── phase=Upgrading
+    │
+    ├── handleUpgrading() 聚合组件升级状态
+    │   ├── 所有组件升级完成 → phase=Ready
+    │   ├── 有组件升级失败 → phase=NotReady
+    │   └── 有组件升级中 → requeue
+    │
+    └── phase=Ready → 升级完成
+```
+### 四、关键设计要点总结
+| 要点 | 设计 | 代码位置 |
+|------|------|---------|
+| **监听节点增删** | Watch NodeConfig CR 增删事件，新增时触发安装，删除时触发卸载 | §2.2, §2.3, §2.9 |
+| **触发组件安装** | triggerComponentInstallForNode() 更新 ComponentVersion.nodeStatuses[新节点]=Pending，委托 ComponentVersion Controller 执行 | §2.4 |
+| **触发组件卸载** | triggerComponentUninstallForNode() 按依赖逆序更新 nodeStatuses[节点]=Uninstalling，委托 ComponentVersion Controller 执行 | §2.9 |
+| **更新节点组件状态** | 从 ComponentVersion.nodeStatuses[本节点] 聚合到 NodeConfig.status.componentStatus | §2.5, §2.6, §2.7, §2.8 |
+| **触发 cluster-api 扩缩容** | triggerMachineCreation() 增加 replicas；triggerMachineDeletion() 减少 replicas + 删除 Machine | §2.10 |
+| **依赖逆序卸载** | sortComponentsByReverseDependency() 使用拓扑排序逆序，确保被依赖组件最后卸载 | §2.9 |
+| **Finalizer 保护** | 添加 Finalizer，删除时先卸载组件再删除 Machine，最后移除 Finalizer | §2.9 |
+| **Watch 联动** | Watch ComponentVersion + Machine 变更，触发关联 NodeConfig Reconcile | §2.11 |
+| **组件自动填充** | populateComponentsFromRelease() 根据 ReleaseImage + 节点角色自动填充组件列表 | §2.3 |
+| **状态聚合** | NodeConfig 不独立维护组件状态，从 ComponentVersion.nodeStatuses 聚合，确保单一数据源 | §2.5-2.8 |
