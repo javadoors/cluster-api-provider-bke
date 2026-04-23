@@ -330,6 +330,14 @@ func (r *ComponentVersionBindingReconciler) Reconcile(ctx context.Context, req c
 5. **代价可控**：仅增加 1 个 CRD + 1 个 Controller，复杂度增加有限
 
 # NodeConfig.Spec.Components 填充方案
+```
+用户在 BKECluster.Spec 中添加新节点
+    → BKEClusterReconciler 创建新 NodeConfig
+        → NodeConfig 控制器检测到新节点
+            → 根据 NodeConfig.Spec.Components 引用 ComponentVersion
+                → ComponentVersion 控制器在新节点上执行 installAction
+```
+==>问题：BKEClusterReconciler 创建新 NodeConfig，里面的NodeConfig.Spec.Components如何填充？请进行分析
 ## NodeConfig.Spec.Components 填充方案分析
 ### 一、问题本质
 ```
