@@ -1393,10 +1393,6 @@ Reconcile(ctx, req):
     7. 根据 spec.blocked/spec.deprecated 更新 status.phase
     8. 更新 status.conditions
 ```
-**升级路径发现算法**：ClusterVersion Controller 在升级时调用 findUpgradePath() 发现可用的升级路径：
-```go
-
-```
 **路径发现策略**：
 
 ClusterVersion Controller 在升级时通过 UpgradePathHelper 查找升级路径，采用两级查找策略：
@@ -1423,17 +1419,10 @@ FindUpgradePath(fromVersion, toVersion)
         ├── spec.deprecated=true → 记录警告，返回 (path, true, "")，允许升级
         └── 其他 → 返回 (path, true, "")，允许升级
 ```
-
-**与 ClusterVersion Controller 的集成**：
-ClusterVersion Controller 在 reconcileVersion 中集成 UpgradePath 验证，作为升级编排的第一步：
-    // 未找到显式升级路径
-    return nil, nil
-}
-```
 **与 ClusterVersion Controller 的集成**：
 ClusterVersion Controller 在 reconcileVersion 中集成 UpgradePath 验证，作为升级编排的第一步：
 ```
-ClusterVersion.reconcleaseVersion():
+ClusterVersion.reconcileVersion():
     │
     ├── 1. 检查是否需要升级
     │   └── currentVersion == desiredVersion && phase=Ready → 返回
@@ -1766,6 +1755,7 @@ cluster-api-provider-bke/
 │       ├── componentversion_types.go
 │       ├── componentversionbinding_types.go
 │       ├── nodeconfig_types.go
+│       ├── upgradepath_types.go
 │       ├── action_types.go
 │       └── zz_generated.deepcopy.go
 ├── controllers/
@@ -1775,6 +1765,7 @@ cluster-api-provider-bke/
 │       ├── componentversion_controller.go
 │       ├── componentversionbinding_controller.go
 │       ├── nodeconfig_controller.go
+│       ├── upgradepath_controller.go
 │       └── suite_test.go
 ├── pkg/
 │   ├── actionengine/
@@ -1791,7 +1782,8 @@ cluster-api-provider-bke/
 │   │   ├── validator.go
 │   │   ├── rollback.go
 │   │   ├── dag_scheduler.go
-│   │   └── binding_helper.go
+│   │   ├── binding_helper.go
+│   │   └── upgradepath_helper.go
 │   └── phaseframe/
 ├── config/
 │   └── components/
@@ -1815,12 +1807,12 @@ cluster-api-provider-bke/
 ## 12. 工作量评估
 | 步骤 | 内容 | 工作量 |
 |------|------|--------|
-| 第一步 | CRD 定义（5 个）+ ActionEngine（4 种 Executor）+ 模板渲染 | 14 人天 |
-| 第二步 | ComponentVersion Controller + ComponentVersionBinding Controller + NodeConfig Controller + ClusterVersion Controller | 12 人天 |
+| 第一步 | CRD 定义（5 个）+ ActionEngine（4 种 Executor）+ 模板渲染 | 15 人天 |
+| 第二步 | ComponentVersion Controller + ComponentVersionBinding Controller + NodeConfig Controller + UpgradePath Controller + ClusterVersion Controller | 14 人天 |
 | 第三步 | 16 个组件 YAML 声明 + DAGScheduler + 安装 E2E | 10 人天 |
 | 第四步 | 升级全链路 + 扩缩容 + 回滚 | 10 人天 |
 | 测试 | 单元测试 + 集成测试 + E2E + 新旧路径对比 | 8 人天 |
-| **总计** | | **54 人天** |
+| **总计** | | **58 人天** |
 ## 13. 风险评估
 | 风险 | 影响 | 缓解措施 |
 |------|------|---------|
