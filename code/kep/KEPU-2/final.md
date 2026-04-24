@@ -9,7 +9,7 @@
 | **创建日期** | 2026-04-22 |
 | **依赖** | KEPU-1（整体架构重构） |
 ## 1. 摘要
-本提案设计基于五个 CRD（ClusterVersion、ReleaseImage、ComponentVersion、ComponentVersionBinding、NodeConfig）的声明式集群版本管理方案。
+本提案设计基于六个 CRD（ClusterVersion、ReleaseImage、ComponentVersion、ComponentVersionBinding、UpgradePath、NodeConfig）的声明式集群版本管理方案。
 
 **核心变化**：各 Phase 的安装、升级、卸载逻辑全部通过 YAML 配置声明，由通用 ActionEngine 解释执行，**不再为每个组件编写 Go 代码实现**。
 
@@ -51,14 +51,15 @@ ClusterVersion (集群版本)
 4. 我们需要支持升级时先卸载旧组件再安装新组件的流程
 ## 3. 目标
 ### 3.1 主要目标
-1. 定义 ClusterVersion、ReleaseImage、ComponentVersion、ComponentVersionBinding、NodeConfig 五个 CRD 及其关联关系
-2. 实现 ClusterVersion 控制器：管理集群版本生命周期（安装→升级→回滚），编排 ComponentVersionBinding
+1. 定义 ClusterVersion、ReleaseImage、ComponentVersion、ComponentVersionBinding、UpgradePath、NodeConfig 六个 CRD 及其关联关系
+2. 实现 ClusterVersion 控制器：管理集群版本生命周期（安装→升级→回滚），编排 ComponentVersionBinding，集成 UpgradePath 验证
 3. 实现 ReleaseImage 控制器：验证发布清单，生成 ComponentVersion 列表
 4. 实现 ComponentVersion 控制器：定义组件能力目录（installAction/upgradeAction/uninstallAction）
 5. 实现 ComponentVersionBinding 控制器：执行组件生命周期操作（安装/升级/卸载/健康检查）
-6. 实现 NodeConfig 控制器：管理节点组件的安装/升级/卸载，触发 ComponentVersionBinding 节点级操作
-7. 将现有 PhaseFrame 各 Phase 重构为 ComponentVersion 声明式架构
-8. 实现升级时先卸载旧组件再安装新组件的完整流程
+6. 实现 UpgradePath 控制器：管理升级路径的生命周期（验证/阻止/废弃/发现）
+7. 实现 NodeConfig 控制器：管理节点组件的安装/升级/卸载，触发 ComponentVersionBinding 节点级操作
+8. 将现有 PhaseFrame 各 Phase 重构为 ComponentVersion 声明式架构
+9. 实现升级时先卸载旧组件再安装新组件的完整流程
 ### 3.2 非目标
 1. 不实现 OpenShift 式的 Release Image 容器镜像载体（使用 CRD 替代）
 2. 不实现多集群版本管理（仅单集群）
@@ -69,8 +70,8 @@ ClusterVersion (集群版本)
 ### 4.1 在范围内
 | 范围 | 说明 |
 |------|------|
-| CRD 定义与注册 | 五个核心 CRD 的 API 定义 |
-| 控制器实现 | 五个控制器的 Reconcile 逻辑 |
+| CRD 定义与注册 | 六个核心 CRD 的 API 定义 |
+| 控制器实现 | 六个控制器的 Reconcile 逻辑 |
 | ActionEngine | 通用执行引擎，解释执行 YAML 中的 Action 定义 |
 | Phase→ComponentVersion 迁移 | 20+ 个 Phase 到 ComponentVersion 的映射与迁移 |
 | DAG 调度 | 组件依赖图与调度算法 |
@@ -266,6 +267,7 @@ ComponentVersionBinding 升级失败
 │          upgradeAction: {...}                                    │
 │      rollbackAction: {...}                                       │
 │      uninstallAction: {...}                                      │
+│      compatibility: {...}                                        │
 │  spec.healthCheck: {...}                                         │
 └──────────────────────────┬───────────────────────────────────────┘
                            │ 被引用
@@ -307,6 +309,31 @@ ComponentVersionBinding 升级失败
 │      config:                                                     │
 │        dataDir: /var/lib/containerd                              │
 └──────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                       UpgradePath                                │
+│  (升级路径，独立于 ReleaseImage，可随发现问题而更新)               │
+│                                                                  │
+│  spec.fromRelease:                                               │
+│    name: openfuyao-v2.5.0                                        │
+│    version: v2.5.0                                               │
+│  spec.toRelease:                                                 │
+│    name: openfuyao-v2.6.0                                        │
+│    version: v2.6.0                                               │
+│  spec.preCheck: {...}                                            │
+│  spec.postCheck: {...}                                           │
+│  spec.blocked: false                                             │
+│  spec.deprecated: false                                          │
+│                                                                  │
+│  status.phase: Active                                            │
+│  status.usedCount: 5                                             │
+│  status.lastUsedAt: 2026-04-20                                   │
+└──────────────────────────────────────────────────────────────────┘
+         ↑ 被引用
+         │
+┌──────────────────────────────────────────────────────────────────┐
+│                    ClusterVersion                                │
+│  (升级时通过 UpgradePathHelper 查找并验证升级路径)                  │
+└──────────────────────────────────────────────────────────────────┘
 ```
 **关联关系总结**：
 - **BKECluster → ClusterVersion**：1:1，一个集群对应一个版本资源
@@ -315,12 +342,15 @@ ComponentVersionBinding 升级失败
 - **ClusterVersion → ComponentVersionBinding**：1:N，ClusterVersion 为每个组件创建 Binding
 - **ComponentVersionBinding → ComponentVersion**：N:1，多个 Binding 可引用同一个 ComponentVersion（支持多集群共享）
 - **ComponentVersionBinding → NodeConfig**：1:N，Binding 的 nodeSelector 匹配多个 NodeConfig
+- **ClusterVersion → UpgradePath**：N:1，升级时通过 UpgradePathHelper 查找并验证升级路径
+- **UpgradePath → ReleaseImage**：1:1（fromRelease）+ 1:1（toRelease），引用源版本和目标版本的 ReleaseImage
 
 **关键设计原则**：
 | CRD | 职责 | 生命周期 | 修改频率 |
 |-----|------|---------|---------|
 | **ComponentVersion** | 组件能力目录（"能做什么"） | 随版本发布创建，相对不可变 | 低（新增版本时修改） |
 | **ComponentVersionBinding** | 运行时绑定（"要做什么"） | 随集群创建，频繁可变 | 高（升级/扩缩容时修改） |
+
 ### 7.2 ClusterVersion CRD
 借鉴 OpenShift `config.openshift.io/v1.ClusterVersion`，使用 ReleaseImage CRD 引用替代 Release Image 容器镜像。
 ```go
@@ -1077,11 +1107,12 @@ Reconcile(ctx, req):
     5. 对比 spec.desiredVersion 与 status.currentVersion
     6. 如果版本相同且 phase=Healthy，返回
     7. 如果版本不同：
-       a. 验证升级路径（从 ReleaseImage.spec.upgradePaths）
-       b. 计算需要变更的组件列表
-       c. 按 DAG 顺序更新 ComponentVersionBinding.spec.desiredVersion
-       d. 更新 status.upgradeSteps
-       e. 监控各 ComponentVersionBinding 状态
+       a. 验证升级路径（从 UpgradePath CRD 查找并验证）
+       b. 执行升级路径前置检查（如有）
+       c. 计算需要变更的组件列表
+       d. 按 DAG 顺序更新 ComponentVersionBinding.spec.desiredVersion
+       e. 更新 status.upgradeSteps
+       f. 监控各 ComponentVersionBinding 状态
     8. 如果所有 ComponentVersionBinding 完成：
        a. 更新 status.currentVersion = spec.desiredVersion
        b. 更新 status.phase = Healthy
@@ -1130,7 +1161,10 @@ Reconcile(ctx, req):
        c. 第三层：检查 openFuyao/BKEProvider/BKEAgent 版本兼容性
           - openFuyao 版本是否与 Kubernetes 版本兼容
           - BKEProvider 版本是否与 openFuyao 版本兼容
-    4. 验证升级路径合法性（从 spec.upgradePaths）
+     4. 验证升级路径合法性（从 UpgradePath CRD 读取）：
+       a. 查找 fromRelease → toRelease 的 UpgradePath CR
+       b. 如果 UpgradePath.spec.blocked == true，标记为 Invalid
+       c. 如果 UpgradePath.spec.preCheck 存在，验证 ActionSpec 合法性
     5. 更新 status.phase = Valid/Invalid
     6. 更新 status.validatedComponents
 ```
@@ -1276,17 +1310,28 @@ Reconcile(ctx, req):
 ### 8.6 UpgradePath Controller
 **核心职责**：升级路径的生命周期管理控制器，负责升级路径的验证、发现和状态维护。
 
+**设计原则**：
+
+| 原则 | 说明 |
+|------|------|
+| **默认允许** | 未定义 UpgradePath CR 的升级路径默认允许，不强制要求为每个版本对创建 UpgradePath |
+| **显式阻止** | 仅当 UpgradePath.spec.blocked=true 时阻止升级，阻止时必须提供 blockReason |
+| **废弃不阻止** | UpgradePath.spec.deprecated=true 仅产生警告，不阻止升级，提供 deprecationMessage 引导用户 |
+| **独立演进** | UpgradePath 独立于 ReleaseImage，发现问题后可随时添加/修改升级路径，无需重新发布 ReleaseImage |
+| **使用可观测** | 记录 usedCount 和 lastUsedAt，供运维分析升级频率和路径使用情况 |
+
 **设计思路**：
 
 | 要点 | 设计 |
 |------|------|
-| **路径验证** | validatePath() 验证 fromRelease/toRelease 对应的 ReleaseImage 是否存在 |
-| **阻止检测** | checkBlocked() 检查路径是否被阻止，阻止时更新 status.phase=Blocked |
-| **废弃检测** | checkDeprecated() 检查路径是否已废弃，废弃时更新 status.phase=Deprecated |
-| **前置检查验证** | validatePreCheck() 验证 preCheck 中的 ActionSpec 是否合法 |
+| **路径验证** | 验证 fromRelease/toRelease 对应的 ReleaseImage 是否存在，不存在则标记 phase=Blocked |
+| **阻止检测** | 检查 spec.blocked，阻止时更新 status.phase=Blocked，ClusterVersion Controller 据此拒绝升级 |
+| **废弃检测** | 检查 spec.deprecated，废弃时更新 status.phase=Deprecated，ClusterVersion Controller 仅记录警告 |
+| **前置检查验证** | 验证 preCheck 中的 ActionSpec 是否合法（步骤类型、必填字段） |
+| **后置检查验证** | 验证 postCheck 中的 ActionSpec 是否合法 |
 | **使用统计** | 更新 status.usedCount 和 status.lastUsedAt，供运维分析升级频率 |
-| **路径发现** | 为 ClusterVersion Controller 提供 findUpgradePath() 方法 |
-| **Finalizer** | 删除时检查是否有正在进行的升级，防止删除正在使用的升级路径 |
+| **路径发现** | 为 ClusterVersion Controller 提供 FindUpgradePath() 方法，支持命名约定和标签选择器两种查找策略 |
+| **Finalizer 保护** | 删除时检查是否有 ClusterVersion 正在使用此路径，防止删除正在使用的升级路径 |
 
 **升级路径状态机**：
 ```
@@ -1314,6 +1359,17 @@ Reconcile(ctx, req):
              │ spec.blocked=false && spec.deprecated=false
              └──────────────────────▶ Active
 ```
+**状态转换规则**：
+
+| 当前状态 | 触发条件 | 目标状态 | 说明 |
+|---------|---------|---------|------|
+| Validating | fromRelease/toRelease 均存在 | Active/Blocked/Deprecated | 根据 spec 字段决定 |
+| Validating | fromRelease 或 toRelease 不存在 | Blocked | 缺少版本引用，阻止升级 |
+| Active | spec.blocked=true | Blocked | 运维手动阻止 |
+| Active | spec.deprecated=true | Deprecated | 运维标记废弃 |
+| Blocked | spec.blocked=false | Active/Deprecated | 解除阻止 |
+| Deprecated | spec.deprecated=false | Active/Blocked | 解除废弃 |
+
 **Reconcile 流程**：
 ```
 Reconcile(ctx, req):
@@ -1321,148 +1377,93 @@ Reconcile(ctx, req):
     2. 处理 Finalizer：
        a. 如果 DeletionTimestamp != nil：
           - 检查是否有 ClusterVersion 正在使用此路径
-          - 如果有，拒绝删除
+          - 如果有，拒绝删除，RequeueAfter=30s
           - 如果没有，移除 Finalizer
-    3. 验证 fromRelease 对应的 ReleaseImage 是否存在
-    4. 验证 toRelease 对应的 ReleaseImage 是否存在
-    5. 验证 preCheck/postCheck 的 ActionSpec 是否合法
-    6. 根据 spec.blocked/spec.deprecated 更新 status.phase
-    7. 更新 status.conditions
+    3. 确保 Finalizer 存在
+    4. 验证 fromRelease 对应的 ReleaseImage 是否存在
+       - 不存在：更新 condition UpgradePathFromReleaseExists=False，phase=Blocked
+       - 存在：更新 condition UpgradePathFromReleaseExists=True
+    5. 验证 toRelease 对应的 ReleaseImage 是否存在
+       - 不存在：更新 condition UpgradePathToReleaseExists=False，phase=Blocked
+       - 存在：更新 condition UpgradePathToReleaseExists=True
+    6. 验证 preCheck/postCheck 的 ActionSpec 是否合法
+       - 验证步骤类型是否合法（Script/Manifest/Chart/Kubectl）
+       - 验证必填字段（如 Script 类型必须有 script 或 scriptSource）
+       - 更新 condition UpgradePathPreCheckValid / UpgradePathPostCheckValid
+    7. 根据 spec.blocked/spec.deprecated 更新 status.phase
+    8. 更新 status.conditions
 ```
 **升级路径发现算法**：ClusterVersion Controller 在升级时调用 findUpgradePath() 发现可用的升级路径：
 ```go
-// FindUpgradePath 发现从当前版本到目标版本的升级路径
-// 返回：升级路径、是否允许升级、阻止原因
-func (r *UpgradePathHelper) FindUpgradePath(
-    ctx context.Context,
-    fromVersion string,
-    toVersion string,
-) (*cvov1beta1.UpgradePath, bool, string, error) {
-    // 1. 精确查找：fromVersion → toVersion
-    upgradePath, err := r.findExactPath(ctx, fromVersion, toVersion)
-    if err != nil {
-        return nil, false, "", err
-    }
 
-    // 2. 未找到升级路径：默认允许（无显式路径定义时允许升级）
-    if upgradePath == nil {
-        return nil, true, "", nil
-    }
+```
+**路径发现策略**：
 
-    // 3. 检查路径是否被阻止
-    if upgradePath.Spec.Blocked {
-        return upgradePath, false, upgradePath.Spec.BlockReason, nil
-    }
+ClusterVersion Controller 在升级时通过 UpgradePathHelper 查找升级路径，采用两级查找策略：
 
-    // 4. 检查路径是否已废弃（废弃不阻止，仅警告）
-    if upgradePath.Spec.Deprecated {
-        // 记录警告日志，但不阻止升级
-        logger.Info("upgrade path is deprecated",
-            "from", fromVersion, "to", toVersion,
-            "message", upgradePath.Spec.DeprecationMessage)
-    }
+| 策略 | 查找方式 | 优先级 | 说明 |
+|------|---------|:------:|------|
+| 命名约定 | `Get("{fromVersion}-to-{toVersion}")` | 1 | 按约定命名直接查找，最高效 |
+| 标签选择器 | `List(MatchingLabels{from-version, to-version})` | 2 | 按标签查找，支持非约定命名 |
+| 默认允许 | 未找到 UpgradePath CR | - | 无显式路径定义时允许升级 |
 
-    return upgradePath, true, "", nil
-}
+**路径发现决策流程**：
+```
+FindUpgradePath(fromVersion, toVersion)
+    │
+    ├── 1. 命名约定查找：Get("{from}-to-{to}")
+    │   └── 找到 → 进入步骤 3
+    │
+    ├── 2. 标签选择器查找：List(from-version + to-version labels)
+    │   └── 找到 → 进入步骤 3
+    │       └── 未找到 → 返回 (nil, true, "")，默认允许
+    │
+    └── 3. 检查路径状态
+        ├── spec.blocked=true → 返回 (path, false, blockReason)，阻止升级
+        ├── spec.deprecated=true → 记录警告，返回 (path, true, "")，允许升级
+        └── 其他 → 返回 (path, true, "")，允许升级
+```
 
-// findExactPath 精确查找升级路径
-func (r *UpgradePathHelper) findExactPath(
-    ctx context.Context,
-    fromVersion string,
-    toVersion string,
-) (*cvov1beta1.UpgradePath, error) {
-    // 策略1：按命名约定查找
-    pathName := fmt.Sprintf("%s-to-%s", fromVersion, toVersion)
-    upgradePath := &cvov1beta1.UpgradePath{}
-    if err := r.Get(ctx, types.NamespacedName{Name: pathName}, upgradePath); err == nil {
-        return upgradePath, nil
-    }
-
-    // 策略2：按标签选择器查找
-    pathList := &cvov1beta1.UpgradePathList{}
-    if err := r.List(ctx, pathList,
-        client.MatchingLabels{
-            "cvo.openfuyao.cn/from-version": fromVersion,
-            "cvo.openfuyao.cn/to-version":   toVersion,
-        },
-    ); err != nil {
-        return nil, err
-    }
-    if len(pathList.Items) > 0 {
-        return &pathList.Items[0], nil
-    }
-
+**与 ClusterVersion Controller 的集成**：
+ClusterVersion Controller 在 reconcileVersion 中集成 UpgradePath 验证，作为升级编排的第一步：
     // 未找到显式升级路径
     return nil, nil
 }
 ```
-**ClusterVersion Controller 集成升级路径**：
-```go
-// reconcileVersion 处理版本变更逻辑（修改后集成 UpgradePath）
-func (r *ClusterVersionReconciler) reconcileVersion(
-    ctx context.Context,
-    cv *cvov1beta1.ClusterVersion,
-) (ctrl.Result, error) {
-    logger := log.FromContext(ctx)
-
-    // 1. 检查是否需要升级
-    if cv.Status.CurrentVersion == cv.Spec.DesiredVersion &&
-        cv.Status.Phase == cvov1beta1.ClusterVersionPhaseReady {
-        return ctrl.Result{}, nil
-    }
-
-    // 2. 验证升级路径
-    upgradePath, allowed, blockReason, err := r.UpgradePathHelper.FindUpgradePath(
-        ctx, cv.Status.CurrentVersion, cv.Spec.DesiredVersion)
-    if err != nil {
-        return ctrl.Result{}, err
-    }
-    if !allowed {
-        cv.Status.Phase = cvov1beta1.ClusterVersionPhaseUpgradeBlocked
-        conditions.MarkFalse(cv, cvov1beta1.ClusterVersionUpgradePathValid,
-            "Blocked", "Upgrade path blocked: %s", blockReason)
-        return ctrl.Result{}, nil
-    }
-    conditions.MarkTrue(cv, cvov1beta1.ClusterVersionUpgradePathValid,
-        "Valid", "Upgrade path validated")
-
-    // 3. 执行升级路径前置检查
-    if upgradePath != nil && upgradePath.Spec.PreCheck != nil {
-        if err := r.executeUpgradePathPreCheck(ctx, cv, upgradePath); err != nil {
-            cv.Status.Phase = cvov1beta1.ClusterVersionPhasePreCheckFailed
-            conditions.MarkFalse(cv, cvov1beta1.ClusterVersionPreCheckPassed,
-                "Failed", "PreCheck failed: %v", err)
-            return ctrl.Result{}, err
-        }
-        conditions.MarkTrue(cv, cvov1beta1.ClusterVersionPreCheckPassed,
-            "Passed", "PreCheck passed")
-    }
-
-    // 4. 解析 ReleaseImage
-    releaseImage, err := r.resolveReleaseImage(ctx, cv)
-    if err != nil {
-        return ctrl.Result{}, err
-    }
-
-    // 5. 构建 DAG 并执行升级编排
-    // ...（与之前相同）
-
-    // 6. 升级完成后执行后置检查
-    if upgradePath != nil && upgradePath.Spec.PostCheck != nil {
-        if err := r.executeUpgradePathPostCheck(ctx, cv, upgradePath); err != nil {
-            logger.Error(err, "PostCheck failed, but upgrade completed")
-            // PostCheck 失败不回滚，仅记录警告
-        }
-    }
-
-    // 7. 更新 UpgradePath 使用统计
-    if upgradePath != nil {
-        r.updateUpgradePathUsage(ctx, upgradePath)
-    }
-
-    return ctrl.Result{}, nil
-}
+**与 ClusterVersion Controller 的集成**：
+ClusterVersion Controller 在 reconcileVersion 中集成 UpgradePath 验证，作为升级编排的第一步：
 ```
+ClusterVersion.reconcleaseVersion():
+    │
+    ├── 1. 检查是否需要升级
+    │   └── currentVersion == desiredVersion && phase=Ready → 返回
+    │
+    ├── 2. 验证升级路径（UpgradePathHelper.FindUpgradePath）
+    │   ├── 找到 UpgradePath CR → 检查 blocked/deprecated
+    │   │   ├── blocked=true → phase=UpgradeBlocked，拒绝升级
+    │   │   └── blocked=false → 继续
+    │   └── 未找到 → 默认允许
+    │
+    ├── 3. 执行升级路径前置检查（UpgradePath.Spec.PreCheck）
+    │   ├── preCheck 存在 → ActionEngine.Execute(preCheck)
+    │   │   ├── 成功 → 继续
+    │   │   └── 失败 → phase=PreCheckFailed，中止升级
+    │   └── preCheck 不存在 → 跳过
+    │
+    ├── 4. 解析 ReleaseImage → 构建 DAG → 更新 Binding.desiredVersion
+    │
+    ├── 5. 等待所有 ComponentVersionBinding 完成
+    │
+    ├── 6. 执行升级路径后置检查（UpgradePath.Spec.PostCheck）
+    │   ├── postCheck 存在 → ActionEngine.Execute(postCheck)
+    │   │   ├── 成功 → 继续
+    │   │   └── 失败 → 仅记录警告，不回滚（升级已完成）
+    │   └── postCheck 不存在 → 跳过
+    │
+    └── 7. 更新 UpgradePath 使用统计（UpgradePathHelper.RecordUsage）
+        └── usedCount++，lastUsedAt=now
+```
+
 **升级路径与组件兼容性检查的协作**：
 ```
 用户修改 ClusterVersion.spec.desiredVersion
@@ -1486,7 +1487,29 @@ func (r *ClusterVersionReconciler) reconcileVersion(
         ├── 执行新版本 upgradeAction
         └── 执行健康检查
 ```
-**UpgradePath YAML 示例（完整）**：
+**两者职责对比**：
+
+| 维度 | UpgradePath | ComponentVersion.compatibility |
+|------|-------------|-------------------------------|
+| **检查对象** | 版本间升级路径（fromVersion → toVersion） | 组件间版本兼容性（A 组件要求 B 组件版本） |
+| **检查粒度** | 集群级（整体升级路径） | 组件级（单个组件对其他组件的约束） |
+| **检查时机** | ClusterVersion Controller 升级编排前 | ReleaseImage Controller 验证清单时 |
+| **失败行为** | 阻止整个升级 | 标记 ReleaseImage Invalid |
+| **演进频率** | 中（发现问题后更新） | 低（随组件版本发布） |
+| **修改方式** | 创建/更新 UpgradePath CR | 更新 ComponentVersion CR |
+
+**UpgradePath 独立演进能力**：
+
+| 场景 | 操作 | 是否需要重新发布 ReleaseImage |
+|------|------|:--:|
+| 添加升级前置检查 | 更新 UpgradePath.spec.preCheck | ❌ |
+| 阻止有问题的升级路径 | 设置 UpgradePath.spec.blocked=true | ❌ |
+| 废弃旧升级路径 | 设置 UpgradePath.spec.deprecated=true | ❌ |
+| 添加新升级路径 | 创建新 UpgradePath CR | ❌ |
+| 添加升级后置检查 | 更新 UpgradePath.spec.postCheck | ❌ |
+| 修改升级路径的前置检查脚本 | 更新 UpgradePath.spec.preCheck.steps | ❌ |
+
+**UpgradePath YAML 示例**：
 ```yaml
 # 场景1：简单升级路径（无特殊检查）
 apiVersion: cvo.openfuyao.cn/v1beta1
@@ -1590,328 +1613,7 @@ spec:
   deprecated: true
   deprecationMessage: "此升级路径已废弃，建议先升级到 v2.4.0 再升级到 v2.5.0"
 ```
-**UpgradePath Controller 完整代码实现**：
-```go
-// controllers/cvo/upgradepath_controller.go
 
-const (
-    upgradePathFinalizer = "cvo.openfuyao.cn/upgradepath-protection"
-)
-
-type UpgradePathReconciler struct {
-    client.Client
-    Scheme *runtime.Scheme
-}
-
-func (r *UpgradePathReconciler) Reconcile(
-    ctx context.Context,
-    req ctrl.Request,
-) (ctrl.Result, error) {
-    logger := log.FromContext(ctx)
-
-    upgradePath := &cvov1beta1.UpgradePath{}
-    if err := r.Get(ctx, req.NamespacedName, upgradePath); err != nil {
-        return ctrl.Result{}, client.IgnoreNotFound(err)
-    }
-
-    // 处理删除
-    if !upgradePath.DeletionTimestamp.IsZero() {
-        return r.reconcileDelete(ctx, upgradePath)
-    }
-
-    // 确保 Finalizer
-    if !controllerutil.ContainsFinalizer(upgradePath, upgradePathFinalizer) {
-        controllerutil.AddFinalizer(upgradePath, upgradePathFinalizer)
-        if err := r.Update(ctx, upgradePath); err != nil {
-            return ctrl.Result{}, err
-        }
-    }
-
-    // 验证升级路径
-    return r.reconcileNormal(ctx, upgradePath)
-}
-
-func (r *UpgradePathReconciler) reconcileNormal(
-    ctx context.Context,
-    up *cvov1beta1.UpgradePath,
-) (ctrl.Result, error) {
-    logger := log.FromContext(ctx)
-    patchHelper, err := patch.NewHelper(up, r.Client)
-    if err != nil {
-        return ctrl.Result{}, err
-    }
-    defer func() {
-        if err := patchHelper.Patch(ctx, up); err != nil {
-            logger.Error(err, "failed to patch UpgradePath")
-        }
-    }()
-
-    // 1. 验证 fromRelease 对应的 ReleaseImage 是否存在
-    fromRelease := &cvov1beta1.ReleaseImage{}
-    if err := r.Get(ctx, types.NamespacedName{
-        Name: up.Spec.FromRelease.Name,
-    }, fromRelease); err != nil {
-        if apierrors.IsNotFound(err) {
-            conditions.MarkFalse(up, cvov1beta1.UpgradePathFromReleaseExists,
-                "NotFound", "Source ReleaseImage %s not found", up.Spec.FromRelease.Name)
-            up.Status.Phase = cvov1beta1.UpgradePathPhaseBlocked
-        }
-        return ctrl.Result{}, err
-    }
-    conditions.MarkTrue(up, cvov1beta1.UpgradePathFromReleaseExists,
-        "Found", "Source ReleaseImage exists")
-
-    // 2. 验证 toRelease 对应的 ReleaseImage 是否存在
-    toRelease := &cvov1beta1.ReleaseImage{}
-    if err := r.Get(ctx, types.NamespacedName{
-        Name: up.Spec.ToRelease.Name,
-    }, toRelease); err != nil {
-        if apierrors.IsNotFound(err) {
-            conditions.MarkFalse(up, cvov1beta1.UpgradePathToReleaseExists,
-                "NotFound", "Target ReleaseImage %s not found", up.Spec.ToRelease.Name)
-            up.Status.Phase = cvov1beta1.UpgradePathPhaseBlocked
-        }
-        return ctrl.Result{}, err
-    }
-    conditions.MarkTrue(up, cvov1beta1.UpgradePathToReleaseExists,
-        "Found", "Target ReleaseImage exists")
-
-    // 3. 验证 preCheck/postCheck 的 ActionSpec
-    if up.Spec.PreCheck != nil {
-        if err := r.validateActionSpec(up.Spec.PreCheck); err != nil {
-            conditions.MarkFalse(up, cvov1beta1.UpgradePathPreCheckValid,
-                "Invalid", "PreCheck validation failed: %v", err)
-        } else {
-            conditions.MarkTrue(up, cvov1beta1.UpgradePathPreCheckValid,
-                "Valid", "PreCheck validation passed")
-        }
-    }
-    if up.Spec.PostCheck != nil {
-        if err := r.validateActionSpec(up.Spec.PostCheck); err != nil {
-            conditions.MarkFalse(up, cvov1beta1.UpgradePathPostCheckValid,
-                "Invalid", "PostCheck validation failed: %v", err)
-        } else {
-            conditions.MarkTrue(up, cvov1beta1.UpgradePathPostCheckValid,
-                "Valid", "PostCheck validation passed")
-        }
-    }
-
-    // 4. 根据 spec.blocked/spec.deprecated 更新 status.phase
-    switch {
-    case up.Spec.Blocked:
-        up.Status.Phase = cvov1beta1.UpgradePathPhaseBlocked
-    case up.Spec.Deprecated:
-        up.Status.Phase = cvov1beta1.UpgradePathPhaseDeprecated
-    default:
-        up.Status.Phase = cvov1beta1.UpgradePathPhaseActive
-    }
-
-    return ctrl.Result{}, nil
-}
-
-func (r *UpgradePathReconciler) reconcileDelete(
-    ctx context.Context,
-    up *cvov1beta1.UpgradePath,
-) (ctrl.Result, error) {
-    logger := log.FromContext(ctx)
-
-    if !controllerutil.ContainsFinalizer(up, upgradePathFinalizer) {
-        return ctrl.Result{}, nil
-    }
-
-    // 检查是否有 ClusterVersion 正在使用此路径
-    cvList := &cvov1beta1.ClusterVersionList{}
-    if err := r.List(ctx, cvList); err != nil {
-        return ctrl.Result{}, err
-    }
-    for _, cv := range cvList.Items {
-        if cv.Status.Phase == cvov1beta1.ClusterVersionPhaseUpgrading &&
-            cv.Status.CurrentVersion == up.Spec.FromRelease.Version &&
-            cv.Spec.DesiredVersion == up.Spec.ToRelease.Version {
-            logger.Info("cannot delete UpgradePath: ClusterVersion is using it",
-                "clusterVersion", cv.Name)
-            return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-        }
-    }
-
-    controllerutil.RemoveFinalizer(up, upgradePathFinalizer)
-    if err := r.Update(ctx, up); err != nil {
-        return ctrl.Result{}, err
-    }
-
-    return ctrl.Result{}, nil
-}
-
-func (r *UpgradePathReconciler) validateActionSpec(spec *cvov1beta1.ActionSpec) error {
-    for _, step := range spec.Steps {
-        switch step.Type {
-        case cvov1beta1.ActionScript:
-            if step.Script == "" && step.ScriptSource == nil {
-                return fmt.Errorf("step %s: script or scriptSource must be specified", step.Name)
-            }
-        case cvov1beta1.ActionManifest:
-            if step.Manifest == "" && step.ManifestSource == nil {
-                return fmt.Errorf("step %s: manifest or manifestSource must be specified", step.Name)
-            }
-        case cvov1beta1.ActionChart:
-            if step.Chart == nil {
-                return fmt.Errorf("step %s: chart must be specified", step.Name)
-            }
-        case cvov1beta1.ActionKubectl:
-            if step.Kubectl == nil {
-                return fmt.Errorf("step %s: kubectl must be specified", step.Name)
-            }
-        default:
-            return fmt.Errorf("step %s: unknown action type %s", step.Name, step.Type)
-        }
-    }
-    return nil
-}
-
-func (r *UpgradePathReconciler) SetupWithManager(mgr ctrl.Manager) error {
-    return ctrl.NewControllerManagedBy(mgr).
-        For(&cvov1beta1.UpgradePath{}).
-        Complete(r)
-}
-```
-**UpgradePathHelper 辅助类**：
-```go
-// pkg/cvo/upgradepath_helper.go
-
-type UpgradePathHelper struct {
-    client.Client
-}
-
-func NewUpgradePathHelper(c client.Client) *UpgradePathHelper {
-    return &UpgradePathHelper{Client: c}
-}
-
-// FindUpgradePath 发现从当前版本到目标版本的升级路径
-func (h *UpgradePathHelper) FindUpgradePath(
-    ctx context.Context,
-    fromVersion string,
-    toVersion string,
-) (*cvov1beta1.UpgradePath, bool, string, error) {
-    logger := log.FromContext(ctx)
-
-    // 1. 精确查找
-    upgradePath, err := h.findExactPath(ctx, fromVersion, toVersion)
-    if err != nil {
-        return nil, false, "", err
-    }
-
-    // 2. 未找到：默认允许
-    if upgradePath == nil {
-        logger.Info("no explicit upgrade path found, allowing by default",
-            "from", fromVersion, "to", toVersion)
-        return nil, true, "", nil
-    }
-
-    // 3. 检查是否被阻止
-    if upgradePath.Spec.Blocked {
-        logger.Info("upgrade path is blocked",
-            "from", fromVersion, "to", toVersion,
-            "reason", upgradePath.Spec.BlockReason)
-        return upgradePath, false, upgradePath.Spec.BlockReason, nil
-    }
-
-    // 4. 检查是否已废弃（仅警告，不阻止）
-    if upgradePath.Spec.Deprecated {
-        logger.Info("upgrade path is deprecated",
-            "from", fromVersion, "to", toVersion,
-            "message", upgradePath.Spec.DeprecationMessage)
-    }
-
-    return upgradePath, true, "", nil
-}
-
-// FindRecommendedPath 查找推荐的升级路径（跳过被阻止和已废弃的）
-func (h *UpgradePathHelper) FindRecommendedPath(
-    ctx context.Context,
-    fromVersion string,
-    toVersion string,
-) (*cvov1beta1.UpgradePath, error) {
-    pathList := &cvov1beta1.UpgradePathList{}
-    if err := h.List(ctx, pathList,
-        client.MatchingLabels{
-            "cvo.openfuyao.cn/from-version": fromVersion,
-            "cvo.openfuyao.cn/to-version":   toVersion,
-        },
-    ); err != nil {
-        return nil, err
-    }
-
-    for i := range pathList.Items {
-        up := &pathList.Items[i]
-        if up.Status.Phase == cvov1beta1.UpgradePathPhaseActive {
-            return up, nil
-        }
-    }
-    return nil, nil
-}
-
-// GetAllBlockedPaths 获取所有被阻止的升级路径（供运维查看）
-func (h *UpgradePathHelper) GetAllBlockedPaths(
-    ctx context.Context,
-) ([]cvov1beta1.UpgradePath, error) {
-    pathList := &cvov1beta1.UpgradePathList{}
-    if err := h.List(ctx, pathList); err != nil {
-        return nil, err
-    }
-
-    var blocked []cvov1beta1.UpgradePath
-    for _, up := range pathList.Items {
-        if up.Spec.Blocked {
-            blocked = append(blocked, up)
-        }
-    }
-    return blocked, nil
-}
-
-// RecordUsage 记录升级路径使用情况
-func (h *UpgradePathHelper) RecordUsage(
-    ctx context.Context,
-    upgradePath *cvov1beta1.UpgradePath,
-) error {
-    patchHelper, err := patch.NewHelper(upgradePath, h.Client)
-    if err != nil {
-        return err
-    }
-
-    upgradePath.Status.UsedCount++
-    now := metav1.Now()
-    upgradePath.Status.LastUsedAt = &now
-
-    return patchHelper.Patch(ctx, upgradePath)
-}
-
-func (h *UpgradePathHelper) findExactPath(
-    ctx context.Context,
-    fromVersion string,
-    toVersion string,
-) (*cvov1beta1.UpgradePath, error) {
-    pathName := fmt.Sprintf("%s-to-%s", fromVersion, toVersion)
-    upgradePath := &cvov1beta1.UpgradePath{}
-    if err := h.Get(ctx, types.NamespacedName{Name: pathName}, upgradePath); err == nil {
-        return upgradePath, nil
-    }
-
-    pathList := &cvov1beta1.UpgradePathList{}
-    if err := h.List(ctx, pathList,
-        client.MatchingLabels{
-            "cvo.openfuyao.cn/from-version": fromVersion,
-            "cvo.openfuyao.cn/to-version":   toVersion,
-        },
-    ); err != nil {
-        return nil, err
-    }
-    if len(pathList.Items) > 0 {
-        return &pathList.Items[0], nil
-    }
-
-    return nil, nil
-}
-```
 **升级路径与各控制器的交互时序**：
 ```
 ┌────────────────────────────────────────────────────────────────────────────┐
