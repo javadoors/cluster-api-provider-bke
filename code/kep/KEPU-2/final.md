@@ -978,43 +978,204 @@ type NodeOSDetailInfo struct {
 }
 ```
 ### 7.7 模板变量系统
-ActionSpec 中的 Script、Manifest、Chart.Values 支持模板变量，运行时由 ActionEngine 渲染：
+ActionSpec 中的 Script、Manifest、Chart.Values 支持模板变量，运行时由 ActionEngine 渲染。
+
+**设计原则**：
+
+| 原则 | 说明 |
+|------|------|
+| **上下文隔离** | 不同作用域的变量相互隔离，避免命名冲突 |
+| **来源可追溯** | 每个变量的来源明确，便于调试和排错 |
+| **类型安全** | 变量有明确的类型定义，渲染时进行类型检查 |
+| **默认值机制** | 支持变量默认值，避免因变量缺失导致渲染失败 |
+| **延迟计算** | 部分变量在执行时动态计算，而非预渲染 |
+
+**变量分类**：
+
+| 分类 | 变量示例 | 来源 | 作用域 |
+|------|---------|------|--------|
+| **组件级** | ComponentName, Version | ComponentVersionBinding | 当前组件 |
+| **节点级** | NodeIP, NodeHostname, NodeRoles, NodeOS | NodeConfig | 当前节点 |
+| **集群级** | ClusterName, ClusterNamespace, CurrentVersion | ClusterVersion | 整个集群 |
+| **版本级** | EtcdVersion, KubernetesVersion, ContainerdVersion, OpenFuyaoVersion | ReleaseImage | 整个集群 |
+| **配置级** | ImageRepo, HTTPRepo, CertificatesDir, ControlPlaneEndpoint | BKECluster.Spec | 整个集群 |
+| **组件配置级** | ContainerdConfig, KubeletConfig, EtcdConfig, BKEAgentConfig | ComponentVersionBinding.Spec.Config | 当前组件 |
+
+**变量来源映射**：
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    TemplateContext 构建流程                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  1. 集群级变量（从 ClusterVersion 和 BKECluster 获取）                        │
+│     ├── ClusterName      ← ClusterVersion.Spec.ClusterRef.Name              │
+│     ├── ClusterNamespace ← ClusterVersion.Spec.ClusterRef.NS                │
+│     ├── CurrentVersion   ← ClusterVersion.Status.CurrentVersion             │
+│     ├── ImageRepo        ← BKECluster.Spec.ClusterConfig.ImageRepo          │
+│     ├── HTTPRepo         ← BKECluster.Spec.ClusterConfig.HTTPRepo           │
+│     ├── CertificatesDir  ← BKECluster.Spec.ClusterConfig.CertificatesDir    │
+│     └── ControlPlaneEndpoint ← BKECluster.Spec.ControlPlaneEndpoint         │
+│                                                                             │
+│  2. 版本级变量（从 ReleaseImage 获取）                                        │
+│     ├── EtcdVersion        ← ReleaseImage.getComponentVersion("etcd")       │
+│     ├── KubernetesVersion  ← ReleaseImage.getComponentVersion("kubernetes") │
+│     ├── ContainerdVersion  ← ReleaseImage.getComponentVersion("containerd") │
+│     └── OpenFuyaoVersion   ← ReleaseImage.getComponentVersion("openFuyao")  │
+│                                                                             │
+│  3. 组件级变量（从 ComponentVersionBinding 获取）                             │
+│     ├── ComponentName ← ComponentVersionBinding.Spec.ComponentVersionRef    │
+│     ├── Version       ← ComponentVersionBinding.Spec.DesiredVersion         │
+│     └── Config        ← ComponentVersionBinding.Spec.Config (组件特定配置)   │
+│                                                                             │
+│  4. 节点级变量（从 NodeConfig 获取，Scope=Node 时）                           │
+│     ├── NodeIP       ← NodeConfig.Spec.NodeIP                               │
+│     ├── NodeHostname ← NodeConfig.Status.OSInfo.Hostname                    │
+│     ├── NodeRoles    ← NodeConfig.Spec.Roles                                │
+│     └── NodeOS       ← NodeConfig.Spec.OS                                   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+**TemplateContext 结构定义**：
 ```go
 type TemplateContext struct {
+    // 组件级变量
     ComponentName string
     Version       string
-
+    // 节点级变量（Scope=Node 时填充）
     NodeIP        string
     NodeHostname  string
     NodeRoles     []string
     NodeOS        NodeOSInfo
-
+    // 集群级变量
     ClusterName      string
     ClusterNamespace string
     CurrentVersion   string
-
+    // 版本级变量
     EtcdVersion        string
     KubernetesVersion  string
     ContainerdVersion  string
     OpenFuyaoVersion   string
-    ImageRepo          string
-    HTTPRepo           string
-    CertificatesDir    string
+    // 配置级变量
+    ImageRepo            string
+    HTTPRepo             string
+    CertificatesDir      string
     ControlPlaneEndpoint string
-
+    // 组件配置级变量（按需填充）
     ContainerdConfig  *ContainerdComponentConfig
     KubeletConfig     *KubeletComponentConfig
     EtcdConfig        *EtcdComponentConfig
     BKEAgentConfig    *BKEAgentComponentConfig
 }
 ```
-**模板语法**：采用 Go 标准 `text/template`
+**渲染流程**：
 ```
-{{.Version}}           → v1.7.2
-{{.NodeIP}}            → 192.168.1.10
-{{.ImageRepo}}         → repo.openfuyao.cn
-{{.EtcdDataDir}}       → /var/lib/etcd
-{{.ControlPlaneEndpoint}} → 192.168.1.100:6443
+ActionEngine.Renderer.Render(actionStep, templateContext)
+    │
+    ├── 1. 变量校验
+    │   ├── 检查必填变量是否存在
+    │   ├── 检查变量类型是否正确
+    │   └── 检查变量值是否合法（如 IP 格式）
+    │
+    ├── 2. 模板解析
+    │   ├── 使用 Go text/template 解析模板字符串
+    │   ├── 支持条件判断：{{if .Version}}...{{end}}
+    │   ├── 支持循环遍历：{{range .NodeRoles}}...{{end}}
+    │   └── 支持管道操作：{{.NodeIP | printf "https://%s:6443"}}
+    │
+    ├── 3. 变量替换
+    │   ├── 替换 {{.Version}} 为实际版本号
+    │   ├── 替换 {{.NodeIP}} 为节点 IP
+    │   └── 替换 {{.ImageRepo}} 为镜像仓库地址
+    │
+    └── 4. 返回渲染结果
+        └── 渲染后的可执行内容
+```
+**模板语法**：采用 Go 标准 `text/template`
+
+| 语法 | 示例 | 渲染结果 |
+|------|------|---------|
+| 变量替换 | `{{.Version}}` | v1.7.2 |
+| 条件判断 | `{{if .EtcdConfig.TLSEnabled}}--tls{{end}}` | --tls |
+| 循环遍历 | `{{range .NodeRoles}}{{.}},{{end}}` | master,etcd, |
+| 管道操作 | `{{.NodeIP | printf "https://%s:6443"}}` | https://192.168.1.10:6443 |
+| 默认值 | `{{.EtcdDataDir | default "/var/lib/etcd"}}` | /var/lib/etcd |
+| 嵌套字段 | `{{.EtcdConfig.DataDir}}` | /var/lib/etcd |
+
+**变量校验规则**：
+
+| 变量 | 校验规则 | 失败处理 |
+|------|---------|---------|
+| NodeIP | 必须是有效 IP 地址 | 返回错误，中止渲染 |
+| Version | 必须符合语义化版本格式 | 返回错误，中止渲染 |
+| ImageRepo | 必须是有效的仓库地址（域名或 IP:Port） | 返回错误，中止渲染 |
+| ControlPlaneEndpoint | 必须是 host:port 格式 | 返回错误，中止渲染 |
+| CertificatesDir | 必须是有效的绝对路径 | 返回警告，使用默认值 |
+
+**扩展机制**：
+
+| 扩展方式 | 说明 | 示例 |
+|---------|------|------|
+| **组件配置扩展** | 通过 ComponentVersionBinding.Spec.Config 传递组件特定配置 | EtcdConfig.DataDir |
+| **自定义函数** | 在模板中注册自定义函数 | `{{.NodeIP | toCIDR "24"}}` |
+| **步骤间输出引用** | 前序步骤的输出可作为后续步骤的变量 | `{{.Steps.check-version.stdout}}` |
+| **环境变量注入** | 从节点环境变量获取值 | `{{.Env.HTTP_PROXY}}` |
+
+**组件配置级变量示例**：
+```yaml
+# ComponentVersionBinding 示例
+apiVersion: cvo.openfuyao.cn/v1beta1
+kind: ComponentVersionBinding
+metadata:
+  name: etcd-my-cluster
+spec:
+  componentVersionRef:
+    name: etcd-v3.5.12
+  desiredVersion: v3.5.12
+  config:
+    dataDir: /data/etcd
+    quotaBackendBytes: "8589934592"
+    autoCompactionRetention: "1h"
+    tlsEnabled: true
+```
+在 Action 中引用：
+```yaml
+# ComponentVersion 示例
+spec:
+  versions:
+    - version: v3.5.12
+      installAction:
+        steps:
+          - name: install-etcd
+            type: Script
+            script: |
+              # 使用模板变量
+              ETCD_DATA_DIR={{.EtcdConfig.DataDir}}
+              QUOTA={{.EtcdConfig.QuotaBackendBytes}}
+              
+              # 条件判断
+              {{if .EtcdConfig.TLSEnabled}}
+              ETCD_TLS_ENABLED=true
+              {{end}}
+```
+**步骤间输出引用**：
+```yaml
+installAction:
+  steps:
+    - name: check-current-version
+      type: Script
+      script: |
+        CURRENT=$(etcdctl version | head -1 | awk '{print $2}')
+        echo "RESULT=$CURRENT"
+      # 输出保存到 .Steps.check-current-version.stdout
+    
+    - name: conditional-upgrade
+      type: Script
+      script: |
+        # 引用前序步骤的输出
+        if [ "{{.Steps.check-current-version.stdout}}" == "v3.5.11" ]; then
+          echo "Upgrading from v3.5.11"
+        fi
+      condition: "{{.Steps.check-current-version.stdout}} != v3.5.12"
 ```
 ### 7.8 组件依赖 DAG
 ```go
