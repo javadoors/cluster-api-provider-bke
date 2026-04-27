@@ -1,0 +1,38 @@
+# Upgrade
+```go
+// PostDeployPhases post deploy phases
+	PostDeployPhases = []func(ctx *phaseframe.PhaseContext) phaseframe.Phase{
+		NewEnsureProviderSelfUpgrade, // bke-controller-manager 
+		NewEnsureAgentUpgrade, // bkeagent-deployer
+		NewEnsureContainerdUpgrade,
+		NewEnsureEtcdUpgrade,
+		NewEnsureWorkerUpgrade,
+		NewEnsureMasterUpgrade,
+		NewEnsureWorkerDelete,
+		NewEnsureMasterDelete,
+		NewEnsureComponentUpgrade,
+		NewEnsureCluster,
+	}
+```
+## 升级流程
+### NewEnsureProviderSelfUpgrade(管理集群:单实例)
+- bke-controller-manager 自升级：修改Deployment的yaml文件
+```go
+EnsureProviderSelfUpgradeName confv1beta1.BKEClusterPhase = "EnsureProviderSelfUpgrade"
+providerNamespace                                         = "cluster-system"
+providerDeploymentName                                    = "bke-controller-manager"
+providerContainerName                                     = "manager"
+providerImageName                                         = "cluster-api-provider-bke"
+```
+### NewEnsureAgentUpgrade(目标集群: 全节点滚动更新-K8s 原生)
+- 修改bkeagent-deployer的Daemonset的yaml文件
+### NewEnsureContainerdUpgrade(目标集群: 全节点并行)
+二进制安装
+- resetContainerd (保留数据目录，仅重置containerd配置)
+- redeployContainerd(安装二进制)
+### NewEnsureEtcdUpgrade(目标集群: etcd角色节点，逐节点串行滚动)
+etcd 集群的滚动升级:节点滚动，确保集群始终有法定人数（quorum）可用。静态Pod升级。
+- 备份首节点数据
+- 逐节点升级
+- 检查
+### NewEnsureWorkerUpgrade
