@@ -40,6 +40,7 @@ etcd 集群的滚动升级:节点滚动，确保集群始终有法定人数（qu
 - 升级kubelet
 - 升级kubectl
 ### NewEnsureMasterUpgrade（目标集群:master角色节点，串行逐节点）
+master节点也不drain节点
 - prepareUpgrade
   - 备份etcd数据（首节点）
   - 备份集群配置
@@ -47,5 +48,6 @@ etcd 集群的滚动升级:节点滚动，确保集群始终有法定人数（qu
 - 重新生成apiserver/controller-manager/scheduler的静态Pod yaml文件
 - 升级kubelet
 - 升级kubectl
-- drain节点？ // TODO:
+### NewEnsureWorkerDelete
+
 
