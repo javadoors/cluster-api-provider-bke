@@ -448,3 +448,86 @@ EtcdUpgrading ("Upgrading")
 
 **核心区别**：etcd 升级是所有 Phase 中最保守的——严格串行、备份、双重健康检查（Command 完成 + Pod 版本验证），因为 etcd 是有状态集群，任何节点不可用都可能影响 quorum。
         
+# Kubeadm 插件升级 etcd 的核心代码在以下文件中：
+
+## 主要文件
+
+### 1. **`d:\code\github\cluster-api-provider-bke\pkg\job\builtin\kubeadm\kubeadm.go`** - 核心执行代码
+
+这是 Kubeadm 插件的主要实现文件，其中包含 etcd 升级的完整逻辑：
+
+- **第 151-162 行**：`Execute` 函数中的 `case utils.UpgradeEtcd` - 处理 `upgradeEtcd` phase 的入口
+- **第 353-387 行**：`upgradeEtcd` 函数 - 执行 etcd 升级的核心逻辑
+
+### 2. 调用链流程
+
+```
+ensure_etcd_upgrade.go (协调层)
+    ↓
+upgrade.go (创建命令)
+    ↓
+kubeadm.go (实际执行)
+```
+
+## 详细说明
+
+### 第 1 步：协调层 (`ensure_etcd_upgrade.go`)
+
+- 第 370-410 行 `upgradeEtcd` 函数 - 创建升级命令
+- 第 412-433 行 `createUpgradeCommand` 函数 - 配置升级参数
+
+### 第 2 步：命令层 (`upgrade.go`)
+
+- 第 63 行 - 调用 `"Kubeadm"` 插件
+- 第 64 行 - 传入 `phase=UpgradeEtcd`
+
+### 第 3 步：核心执行层 (`kubeadm.go`)
+
+**第 353-387 行 `upgradeEtcd` 函数** - 这是 etcd 升级的核心代码：
+
+```go
+func (k *KubeadmPlugin) upgradeEtcd(backUpEtcd bool, clusterType string) error {
+    log.Info("upgrade etcd ")
+
+    // 执行升级前的准备工作：备份 etcd、预拉镜像等
+    beforeHash, err := k.prepareUpgrade(backUpEtcd, clusterType)
+    if err != nil {
+        return err
+    }
+
+    // 升级 etcd 组件
+    log.Infof("upgrade components")
+    component := mfutil.Etcd
+    need, err := k.needUpgradeEtcd()
+    if err != nil {
+        log.Errorf("failed to check need upgrade component, err: %v", err)
+        return err
+    }
+    if !need {
+        log.Infof("component %s already upgrade to %s, skip upgrade", component, k.boot.BkeConfig.Cluster.EtcdVersion)
+        return nil
+    }
+
+    // 生成新的 etcd 静态 pod yaml
+    if err := k.upgradeControlPlaneManifestCommand(component); err != nil {
+        return err
+    }
+    podHash := beforeHash[component]
+    // 等待组件就绪
+    if err := k.waitComponentReady(component, podHash); err != nil {
+        return err
+    }
+    log.Infof("component %s upgrade success", component)
+
+    return nil
+}
+```
+
+## 总结
+
+**Kubeadm 插件升级 etcd 的核心代码位于：**
+
+`d:\code\github\cluster-api-provider-bke\pkg\job\builtin\kubeadm\kubeadm.go:353-387`
+
+该函数实现了完整的 etcd 升级流程：备份 → 检查版本 → 生成新的静态 pod 配置 → 等待 etcd 就绪。
+        
