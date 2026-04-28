@@ -1,3 +1,224 @@
+# `ensure_master_delete.go` 业务流程梳理
+## 一、Phase 定位
+`EnsureMasterDelete` 是 **Master 节点缩容协调器**，负责从集群中安全删除 Master 节点。它会：
+- 暂停 KubeadmControlPlane
+- 标记 Machine 为待删除
+- 缩容副本数
+- 等待删除完成
+- 清理残留资源
+## 二、核心常量
+| 常量 | 值 | 说明 |
+|------|------|------|
+| `EnsureMasterDeleteName` | `"EnsureMasterDelete"` | Phase 名称标识 |
+| `WaitMasterDeleteTimeoutMinutes` | `4` | 等待删除超时 4 分钟 |
+| `WaitMasterDeletePollIntervalSeconds` | `2` | 轮询间隔 2 秒 |
+
+## 三、结构体设计
+```go
+type EnsureMasterDelete struct {
+    phaseframe.BasePhase
+    // 需要立即删除的机器和节点映射
+    machinesAndNodesToDelete     map[string]phaseutil.MachineAndNode
+    // 需要等待删除的机器和节点映射
+    machinesAndNodesToWaitDelete map[string]phaseutil.MachineAndNode
+}
+```
+## 四、完整业务流程
+```
+┌──────────────────────────────────────────────────────────────┐
+│                  NeedExecute() 判断                           │
+├──────────────────────────────────────────────────────────────┤
+│  1. DefaultNeedExecute → 检查是否有 spec 变更                 │
+│                                                               │
+│  2. 尝试 Legacy 模式：GetNeedDeleteMasterNodes()              │
+│     → 通过注解识别待删除节点                                   │
+│                                                               │
+│  3. 尝试 BKENode 模式：GetNeedDeleteMasterNodesWithTargetNodes()│
+│     → 通过 BKENode 删除检测                                   │
+│                                                               │
+│  4. 任一模式检测到需要删除 → 设置 PhaseWaiting，返回 true     │
+└──────────────────────┬───────────────────────────────────────┘
+                       │ 需要执行
+                       ▼
+┌──────────────────────────────────────────────────────────────┐
+│                   Execute() 入口                              │
+├──────────────────────────────────────────────────────────────┤
+│  1. reconcileMasterDelete() → 协调删除流程                    │
+│  2. waitMasterDelete() → 等待删除完成                        │
+└──────────────────────┬───────────────────────────────────────┘
+                       │
+                       ▼
+┌──────────────────────────────────────────────────────────────┐
+│            reconcileMasterDelete() 协调流程                   │
+├──────────────────────────────────────────────────────────────┤
+│                                                               │
+│  Step 1: 获取目标集群节点                                     │
+│    ├── getTargetClusterNodes()                                │
+│    └── 获取失败也继续，回退到 Legacy 模式                      │
+│                                                               │
+│  Step 2: 获取需要删除的 Master 节点                          │
+│    ├── GetNeedDeleteMasterNodes() (Legacy 模式优先)           │
+│    └── GetNeedDeleteMasterNodesWithTargetNodes() (备选)      │
+│                                                               │
+│  Step 3: 处理节点和机器的映射关系                             │
+│    ├── ProcessNodeMachineMapping()                           │
+│    ├── 结果：DeleteMap + WaitDeleteMap + NodesCount         │
+│    └── NodesCount == 0 → 无节点可删，直接返回                 │
+│                                                               │
+│  Step 4: 暂停并缩容控制平面                                   │
+│    ├── pauseAndScaleDownControlPlane() → 详见下方            │
+└──────────────────────┬───────────────────────────────────────┘
+                       │
+                       ▼
+┌──────────────────────────────────────────────────────────────┐
+│    pauseAndScaleDownControlPlane() 暂停并缩容控制平面         │
+├──────────────────────────────────────────────────────────────┤
+│                                                               │
+│  Step 1: 获取 Cluster API 关联对象                           │
+│    ├── GetClusterAPIAssociateObjs()                          │
+│    └── 获取 KubeadmControlPlane                              │
+│        → 失败则中止                                           │
+│                                                               │
+│  Step 2: 暂停 KubeadmControlPlane                            │
+│    ├── PauseClusterAPIObj() → 暂停 Reconcile Loop           │
+│    └── 目的：安全地设置删除注解                               │
+│                                                               │
+│  Step 3: 保存当前副本数 + 注册 defer 回滚                     │
+│    ├── currentReplicas = specCopy.Replicas                    │
+│    └── defer：如果后续出错，恢复副本数 + Resume               │
+│                                                               │
+│  Step 4: 标记需要删除的 Machine                               │
+│    ├── 遍历 deleteMap 中的每个 MachineAndNode                │
+│    ├── MarkMachineForDeletion() → 设置删除注解                │
+│    └── 标记失败 → 从 deleteMap 中移除                         │
+│                                                               │
+│  Step 5: 缩容 KubeadmControlPlane 副本数                      │
+│    ├── exceptReplicas = currentReplicas - len(deleteMap)      │
+│    ├── 最低不能小于 1（高可用保障）                          │
+│    └── 更新 spec.Replicas                                    │
+│                                                               │
+│  Step 6: Resume KubeadmControlPlane                          │
+│    ├── ResumeClusterAPIObj() → 恢复 Reconcile Loop           │
+│    └── 触发真正的缩容流程                                     │
+└──────────────────────┬───────────────────────────────────────┘
+                       │
+                       ▼
+┌──────────────────────────────────────────────────────────────┐
+│              waitMasterDelete() 等待删除完成                  │
+├──────────────────────────────────────────────────────────────┤
+│                                                               │
+│  Step 1: 准备待删除列表                                       │
+│    ├── prepareMachinesAndNodesToWaitDelete()                 │
+│    └── 合并 machinesAndNodesToDelete + machinesAndNodesToWaitDelete│
+│                                                               │
+│  Step 2: 等待 Machine 删除完成                                │
+│    ├── waitForMachinesDelete()                               │
+│    ├── 每 2 秒轮询，超时 4 分钟                               │
+│    ├── 检查每个 Machine 是否已不存在（IsNotFound）           │
+│    └── 返回 successDeletedNode 列表                           │
+│                                                               │
+│  Step 3: 清理已删除节点的 Pod                                 │
+│    ├── cleanupDeletedNodePods() → 详见下方                   │
+└───────────────────────────────────────────────────────────────┘
+                       │
+                       ▼
+┌──────────────────────────────────────────────────────────────┐
+│        cleanupDeletedNodePods() 清理残留资源                  │
+├──────────────────────────────────────────────────────────────┤
+│                                                               │
+│  遍历每个已删除成功的节点：                                   │
+│  ┌─────────────────────────────────────────────────────────┐ │
+│  │ 1. 从 BKECluster 中删除 BKENode                            │ │
+│  │    DeleteBKENodeForCluster()                               │ │
+│  └─────────────────────────────────────────────────────────┘ │
+│  ┌─────────────────────────────────────────────────────────┐ │
+│  │ 2. 从状态管理器中删除缓存                                  │ │
+│  │    RemoveSingleNodeStatusCache()                          │ │
+│  └─────────────────────────────────────────────────────────┘ │
+│  ┌─────────────────────────────────────────────────────────┐ │
+│  │ 3. 清理节点上的 Pod                                       │ │
+│  │    a. 连接到目标集群                                      │ │
+│  │    b. List 该节点上的所有 Pod                             │ │
+│  │    c. Force Delete 每个 Pod（GracePeriodSeconds: 0）      │ │
+│  └─────────────────────────────────────────────────────────┘ │
+│                                                               │
+│  最后：SyncStatusUntilComplete() 持久化状态                   │
+└───────────────────────────────────────────────────────────────┘
+```
+## 五、关键设计要点
+### 1. **双模式支持**
+```
+Legacy 模式（注解方式）优先
+    ↓ 无结果则使用
+BKENode 模式（通过 BKENode 删除检测）
+```
+### 2. **暂停-缩容-恢复模式**
+```
+Pause KubeadmControlPlane
+    ↓
+标记 Machine 为待删除
+    ↓
+调整 spec.Replicas
+    ↓
+Resume KubeadmControlPlane
+```
+**设计意图**：在调整配置时暂停，避免中间状态引发意外行为。
+### 3. **defer 回滚机制**
+```go
+defer func() {
+    if err != nil {
+        // 恢复副本数
+        scope.KubeadmControlPlane.Spec.Replicas = currentReplicas
+        // Resume
+        phaseutil.ResumeClusterAPIObj(...)
+    }
+}()
+```
+### 4. **高可用保障**
+```go
+exceptReplicas := *currentReplicas - int32(len(deleteMap))
+if exceptReplicas < 1 {
+    exceptReplicas = 1  // 最少保留 1 个副本
+}
+```
+### 5. **清理机制**
+- 删除 BKENode
+- 清理状态缓存
+- 强制删除残留 Pod
+## 六、状态流转
+```
+开始：检测到需要删除的 Master 节点
+    ↓
+PhaseWaiting → 开始处理
+    ↓
+暂停 KubeadmControlPlane
+    ↓
+标记 Machine 为待删除
+    ↓
+缩容副本数 + Resume
+    ↓
+等待 Machine 删除（最多 4 分钟）
+    ↓
+清理 BKENode、状态缓存、残留 Pod
+    ↓
+完成
+```
+## 七、代码注释中的 TODO
+**第 292 行**：
+```go
+// todo 这块代码与隔壁waitWorkerDelete几乎一样，单独抽出来作为一个函数调用
+```
+这说明 `waitMasterDelete` 和 `waitWorkerDelete` 有大量重复代码，建议重构抽离公共函数。
+## 总结
+`EnsureMasterDelete` 的核心流程是：
+1. **检测**：通过注解或 BKENode 检测待删除节点
+2. **暂停**：暂停 KubeadmControlPlane 以安全修改配置
+3. **标记**：标记 Machine 为待删除
+4. **缩容**：减少副本数
+5. **恢复**：Resume KubeadmControlPlane 触发实际删除
+6. **等待**：等待 Machine 删除完成
+7. **清理**：清理 BKENode、状态、残留 Pod
+        
 # `ensure_master_upgrade.go` 业务流程
 ## `ensure_master_upgrade.go` 业务流程梳理
 ### 一、Phase 定位
