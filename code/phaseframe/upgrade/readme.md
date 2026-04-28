@@ -58,8 +58,17 @@ master节点也不drain节点
 - finalizeDeletion
   - 缩容MachineDeployment的副本数：触发控制器执行删除
   - 恢复MachineDeployment的运行，删除注解cluster.x-k8s.io/paused
-### NewEnsureMasterDelete
 
+异常场景：
+- 恢复MachineDeployment原始复本数
+### NewEnsureMasterDelete
+- 暂停 KubeadmControlPlane的运行，KubeadmControlPlane添加注解cluster.x-k8s.io/paused
+- 对Machine添加cluster.x-k8s.io/delete-machine注解，标识删除
+- 缩容KubeadmControlPlane的副本数：触发控制器执行删除
+- 恢复MachineDeployment的运行，删除注解cluster.x-k8s.io/paused
+
+异常场景：
+- 恢复MachineDeployment原始复本数 
 ### NewEnsureComponentUpgrade
 
 ### NewEnsureCluster
