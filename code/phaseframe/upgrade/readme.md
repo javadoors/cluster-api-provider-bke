@@ -49,5 +49,18 @@ master节点也不drain节点
 - 升级kubelet
 - 升级kubectl
 ### NewEnsureWorkerDelete
+- initialSetup
+  - 暂停 MachineDeployment的运行，添加注解cluster.x-k8s.io/paused
+- 对Machine添加cluster.x-k8s.io/delete-machine注解，标识删除
+- processDrainAndMark
+  - 对节点进行驱逐
+  - 标识Machine为删除，添加cluster.x-k8s.io/delete-machine=""注解
+- finalizeDeletion
+  - 缩容MachineDeployment的副本数：触发控制器执行删除
+  - 恢复MachineDeployment的运行，删除注解cluster.x-k8s.io/paused
+### NewEnsureMasterDelete
 
+### NewEnsureComponentUpgrade
+
+### NewEnsureCluster
 
