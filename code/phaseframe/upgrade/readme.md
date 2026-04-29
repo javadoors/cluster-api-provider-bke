@@ -70,6 +70,7 @@ master节点也不drain节点
 异常场景：
 - 恢复MachineDeployment原始复本数 
 ### NewEnsureComponentUpgrade
-
+- 从补丁配置里的镜像更新到运行的Deployment/StatefulSet/DaemonSet/ReplicaSet中。
 ### NewEnsureCluster
-
+- 获取{Cluster.Name}-k8s-token的Secret token
+- 
