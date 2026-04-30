@@ -421,3 +421,386 @@ func UpgradeEtcdCluster(manifest PhaseManifest) error {
 - 先做 **最小可行实现**：实现 descriptor、Agent 执行器与 EnsureEtcdUpgrade 的逐节点脚本，在测试环境反复演练快照与回滚。  
 - 强制把 **快照与恢复** 做为升级前的必需步骤。  
 - 在生产推广前完成自动化测试矩阵与演练报告。  
+
+# etcd升级
+### 可行性评估
+将 etcd 升级实现为 **可自动化的逐节点滚动升级** 是可行的。关键保障点是 **强制快照备份、单节点滚动、健康门控、回滚点记录** 与 **兼容性校验**。下面交付两部分可直接落地的产物：  
+- **可执行 Bash 自动化脚本模板**（可在控制器节点或运维主机运行，通过 SSH 操作每个 etcd 节点）  
+- **Controller 与 Agent 的实现样例代码**（Go，包含核心流程、状态更新与回滚触发点）
+### Bash 自动化脚本模板 概览
+**用途**：在控制器/运维主机上运行，按 manifest 指定的节点顺序逐节点升级 etcd。脚本假定 `etcdctl` 可在控制器上使用并能访问集群端点，节点可通过 SSH 无密码登录，目标二进制已下发到每个节点的 `/tmp/etcd-v${NEW_VER}.tar.gz`。
+
+**主要特性**  
+- 全局兼容性检查和集群快照备份  
+- 按 follower-first、leader-last 顺序逐节点升级  
+- 每节点：cordon/drain → 备份本地二进制与配置 → 停止服务 → 替换二进制 → 启动并等待健康 → 集群级健康校验 → uncordon  
+- 自动回滚：单节点失败触发回滚；严重失败触发快照恢复流程（人工确认或自动）  
+- 可配置超时、重试次数与快照存储路径
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ====== Configuration ======
+# Controller environment must have etcdctl configured to talk to cluster
+ETCDCTL_BIN=${ETCDCTL_BIN:-/usr/local/bin/etcdctl}
+CA_CERT=${CA_CERT:-/etc/kubernetes/pki/etcd/ca.crt}
+CERT=${CERT:-/etc/kubernetes/pki/etcd/peer.crt}
+KEY=${KEY:-/etc/kubernetes/pki/etcd/peer.key}
+SNAPSHOT_DIR=${SNAPSHOT_DIR:-/var/backups/etcd}
+REMOTE_TMP=${REMOTE_TMP:-/tmp}
+SSH_USER=${SSH_USER:-root}
+SSH_OPTS=${SSH_OPTS:-"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"}
+DRY_RUN=${DRY_RUN:-false}
+RETRY_COUNT=${RETRY_COUNT:-3}
+HEALTH_WAIT_SECONDS=${HEALTH_WAIT_SECONDS:-300}
+NODE_DRAIN_CMD=${NODE_DRAIN_CMD:-"kubectl drain %s --ignore-daemonsets --delete-local-data --force"}
+NODE_UNCORDON_CMD=${NODE_UNCORDON_CMD:-"kubectl uncordon %s"}
+
+# ====== Helper functions ======
+log() { echo "$(date -Is) [INFO] $*"; }
+err() { echo "$(date -Is) [ERROR] $*" >&2; }
+run_ssh() { ssh ${SSH_OPTS} ${SSH_USER}@"$1" "$2"; }
+
+# ====== Pre-checks ======
+precheck() {
+  log "Running pre-checks"
+  if ! command -v "${ETCDCTL_BIN}" >/dev/null 2>&1; then
+    err "etcdctl not found at ${ETCDCTL_BIN}"
+    return 1
+  fi
+  # cluster health check
+  if ! ${ETCDCTL_BIN} --cacert="${CA_CERT}" --cert="${CERT}" --key="${KEY}" endpoint health >/dev/null 2>&1; then
+    err "Cluster health check failed"
+    return 1
+  fi
+  mkdir -p "${SNAPSHOT_DIR}"
+  return 0
+}
+
+# ====== Snapshot and upload ======
+take_snapshot() {
+  local snapfile="${SNAPSHOT_DIR}/etcd-snap-$(date +%s).db"
+  log "Taking snapshot to ${snapfile}"
+  ${ETCDCTL_BIN} snapshot save "${snapfile}" --cacert="${CA_CERT}" --cert="${CERT}" --key="${KEY}"
+  ${ETCDCTL_BIN} snapshot status "${snapfile}"
+  echo "${snapfile}"
+}
+
+# ====== Get member list and leader ======
+get_members() {
+  ${ETCDCTL_BIN} --cacert="${CA_CERT}" --cert="${CERT}" --key="${KEY}" member list -w json
+}
+
+get_endpoints() {
+  ${ETCDCTL_BIN} --cacert="${CA_CERT}" --cert="${CERT}" --key="${KEY}" endpoint status -w json
+}
+
+# ====== Node upgrade flow ======
+upgrade_node() {
+  local node_ip="$1"
+  local node_name="$2"
+  local new_tar="$3"  # path on node, e.g. /tmp/etcd-v3.5.9.tar.gz
+  local backup_dir="/var/backups/etcd/node-backup-$(date +%s)"
+  log "Upgrading node ${node_name} (${node_ip}) to ${new_tar}"
+
+  # 1. cordon and drain
+  log "Cordoning and draining node ${node_name}"
+  if [ "${DRY_RUN}" = "false" ]; then
+    printf "${NODE_DRAIN_CMD}" "${node_name}" | bash -e
+  fi
+
+  # 2. backup local binary and config
+  log "Backing up local etcd binary and config on ${node_ip}"
+  run_ssh "${node_ip}" "mkdir -p ${backup_dir} && cp -a /usr/local/bin/etcd /usr/local/bin/etcd.old || true && cp -a /etc/etcd ${backup_dir}/ || true"
+
+  # 3. stop etcd
+  log "Stopping etcd on ${node_ip}"
+  run_ssh "${node_ip}" "systemctl stop etcd || true; sleep 2"
+
+  # 4. replace binary
+  log "Replacing etcd binary on ${node_ip}"
+  run_ssh "${node_ip}" "tar xzf ${new_tar} -C ${REMOTE_TMP} && cp ${REMOTE_TMP}/etcd*/etcd /usr/local/bin/ && cp ${REMOTE_TMP}/etcd*/etcdctl /usr/local/bin/ && chmod +x /usr/local/bin/etcd*"
+
+  # 5. start etcd
+  log "Starting etcd on ${node_ip}"
+  run_ssh "${node_ip}" "systemctl daemon-reload || true; systemctl start etcd"
+
+  # 6. wait for local health
+  log "Waiting for local etcd health on ${node_ip}"
+  local elapsed=0
+  while [ "${elapsed}" -lt "${HEALTH_WAIT_SECONDS}" ]; do
+    if run_ssh "${node_ip}" "ETCDCTL_API=3 /usr/local/bin/etcdctl --endpoints=127.0.0.1:2379 --cacert=${CA_CERT} --cert=${CERT} --key=${KEY} endpoint health" >/dev/null 2>&1; then
+      log "Local etcd healthy on ${node_ip}"
+      break
+    fi
+    sleep 5
+    elapsed=$((elapsed+5))
+  done
+  if [ "${elapsed}" -ge "${HEALTH_WAIT_SECONDS}" ]; then
+    err "Local etcd did not become healthy on ${node_ip} within ${HEALTH_WAIT_SECONDS}s"
+    return 1
+  fi
+
+  # 7. cluster-level health check
+  log "Checking cluster health after upgrading ${node_ip}"
+  if ! ${ETCDCTL_BIN} --cacert="${CA_CERT}" --cert="${CERT}" --key="${KEY}" endpoint health >/dev/null 2>&1; then
+    err "Cluster health check failed after upgrading ${node_ip}"
+    return 1
+  fi
+
+  # 8. uncordon
+  log "Uncordoning node ${node_name}"
+  if [ "${DRY_RUN}" = "false" ]; then
+    printf "${NODE_UNCORDON_CMD}" "${node_name}" | bash -e
+  fi
+
+  log "Node ${node_name} upgraded successfully"
+  return 0
+}
+
+# ====== Rollback node ======
+rollback_node() {
+  local node_ip="$1"
+  log "Rolling back node ${node_ip}"
+  run_ssh "${node_ip}" "systemctl stop etcd || true; cp /usr/local/bin/etcd.old /usr/local/bin/etcd || true; systemctl start etcd || true"
+  # optional: restore config from backup if needed
+}
+
+# ====== Main orchestration ======
+main() {
+  if ! precheck; then
+    err "Precheck failed"
+    exit 1
+  fi
+
+  local snapshot
+  snapshot=$(take_snapshot)
+  log "Snapshot created at ${snapshot}"
+
+  # Example: members list must be provided or discovered
+  # members format: "ip1:name1 ip2:name2 ip3:name3"
+  # For production, parse etcd member list and map to node names
+  MEMBERS=${MEMBERS:-"10.0.0.11:master-1 10.0.0.12:master-2 10.0.0.13:master-3"}
+  NEW_TAR_PATH=${NEW_TAR_PATH:-/tmp/etcd-v3.5.9.tar.gz}
+
+  # Determine leader and order: followers first, leader last
+  # For simplicity assume provided order is safe; production should query member list and leader
+  for pair in ${MEMBERS}; do
+    node_ip="${pair%%:*}"
+    node_name="${pair##*:}"
+    log "Processing ${node_name} at ${node_ip}"
+    attempt=0
+    while [ $attempt -lt "${RETRY_COUNT}" ]; do
+      if upgrade_node "${node_ip}" "${node_name}" "${NEW_TAR_PATH}"; then
+        break
+      else
+        err "Upgrade attempt $((attempt+1)) failed for ${node_name}"
+        attempt=$((attempt+1))
+        sleep 5
+      fi
+    done
+    if [ $attempt -ge "${RETRY_COUNT}" ]; then
+      err "Exceeded retries for ${node_name}, initiating rollback"
+      rollback_node "${node_ip}"
+      err "Stopping upgrade process due to failure"
+      exit 2
+    fi
+  done
+
+  log "All nodes processed. Final cluster health check"
+  if ! ${ETCDCTL_BIN} --cacert="${CA_CERT}" --cert="${CERT}" --key="${KEY}" endpoint health; then
+    err "Cluster health check failed after full upgrade"
+    exit 3
+  fi
+
+  log "Etcd upgrade completed successfully"
+}
+
+main "$@"
+```
+**使用说明**  
+- 在运行前设置环境变量：`ETCDCTL_BIN`, `CA_CERT`, `CERT`, `KEY`, `SNAPSHOT_DIR`, `MEMBERS`, `NEW_TAR_PATH` 等。  
+- 生产环境应把 `MEMBERS` 自动从 `etcdctl member list` 解析并按 follower-first 排序。  
+- 强烈建议先在测试集群演练并将脚本纳入 CI。
+### Controller 实现样例 概览
+**目标**：在 Operator/Controller 层实现 `EtcdUpgradeController`，负责：下发 phase manifest、触发快照、按顺序调用节点升级、记录 CRD 状态、触发回滚。下面给出关键方法的 Go 伪实现（可直接在项目中改造）。
+#### 关键结构体与接口
+```go
+package controllers
+
+import (
+  "context"
+  "time"
+  "fmt"
+  "os/exec"
+  corev1 "k8s.io/api/core/v1"
+  metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+  "k8s.io/client-go/kubernetes"
+  "sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+type EtcdUpgradeController struct {
+  kubeClient kubernetes.Interface
+  ctrlClient client.Client
+  etcdctlPath string
+  caCert string
+  cert string
+  key string
+  snapshotStore string
+  sshUser string
+  sshOpts []string
+  logger Logger
+}
+```
+#### 核心方法伪代码
+```go
+func (c *EtcdUpgradeController) StartUpgrade(ctx context.Context, manifest PhaseManifest) error {
+  // 1. Compatibility check
+  if ok, reasons := c.checkCompatibility(manifest); !ok {
+    return fmt.Errorf("compatibility check failed: %v", reasons)
+  }
+
+  // 2. Take snapshot and record rollback point
+  snapPath, err := c.takeSnapshot(ctx)
+  if err != nil {
+    return fmt.Errorf("snapshot failed: %w", err)
+  }
+  // persist snapshot info to CRD
+  if err := c.recordRollbackPoint(ctx, manifest, snapPath); err != nil {
+    return err
+  }
+
+  // 3. Get etcd members and order them (followers first)
+  members, err := c.getEtcdMembers(ctx)
+  if err != nil { return err }
+  ordered := orderMembersFollowersFirst(members)
+
+  // 4. Iterate members
+  for _, m := range ordered {
+    if err := c.markMemberUpgrading(ctx, m); err != nil { return err }
+
+    // cordon and drain node
+    if err := c.cordonAndDrain(ctx, m.NodeName); err != nil {
+      c.triggerRollback(ctx, manifest, m, err)
+      return err
+    }
+
+    // backup node state
+    if err := c.backupNodeState(ctx, m); err != nil {
+      c.triggerRollback(ctx, manifest, m, err)
+      return err
+    }
+
+    // call agent to perform replace binary and restart
+    if err := c.callAgentUpgrade(ctx, m, manifest.Component.ArtifactURL); err != nil {
+      c.triggerRollback(ctx, manifest, m, err)
+      return err
+    }
+
+    // wait for local health
+    if err := c.waitLocalHealth(ctx, m, 5*time.Minute); err != nil {
+      c.triggerRollback(ctx, manifest, m, err)
+      return err
+    }
+
+    // cluster health check
+    if err := c.clusterHealthCheck(ctx); err != nil {
+      c.triggerRollback(ctx, manifest, m, err)
+      return err
+    }
+
+    // uncordon
+    if err := c.uncordon(ctx, m.NodeName); err != nil {
+      c.logger.Warn("uncordon failed", "node", m.NodeName, "err", err)
+    }
+
+    if err := c.markMemberSucceeded(ctx, m); err != nil { return err }
+  }
+
+  // final cluster health verification
+  if err := c.clusterHealthCheck(ctx); err != nil {
+    return fmt.Errorf("final cluster health check failed: %w", err)
+  }
+
+  return nil
+}
+```
+#### 辅助方法要点
+- **takeSnapshot**：在 controller 端执行 `etcdctl snapshot save`，并上传到 snapshotStore（S3/NFS）。返回 snapshot URL。  
+- **getEtcdMembers**：调用 `etcdctl member list -w json` 解析成员 IP 与 nodeName 映射（可通过 Node 标签或 CRD 关联）。  
+- **callAgentUpgrade**：通过 Agent 的 API（或 SSH fallback）触发节点上的升级操作。Agent 接口示例：`POST /v1/etcd/upgrade`，body 包含 artifact URL、version、rollbackPoint。Agent 在本地执行替换并返回结果。  
+- **waitLocalHealth**：轮询 Agent 提供的本地健康接口或直接通过 `etcdctl --endpoints=127.0.0.1:2379 endpoint health`（通过 SSH 或 Agent RPC）验证。  
+- **triggerRollback**：记录失败原因到 CRD，调用回滚流程（优先尝试二进制回滚，必要时触发 snapshot restore 并通知运维）。
+### Agent 实现样例 概览
+**目标**：Agent 在节点上提供本地执行能力，接收 Controller 下发的升级任务并执行替换、健康检查与回滚。Agent 需要有足够权限执行 systemd 操作与文件替换。
+#### Agent HTTP Handler 伪代码
+```go
+package agent
+
+import (
+  "net/http"
+  "os/exec"
+  "io"
+  "os"
+  "fmt"
+)
+
+type EtcdUpgradeRequest struct {
+  ArtifactURL string `json:"artifactUrl"`
+  Version string `json:"version"`
+  RollbackPoint string `json:"rollbackPoint"`
+}
+
+func (a *AgentServer) HandleEtcdUpgrade(w http.ResponseWriter, r *http.Request) {
+  var req EtcdUpgradeRequest
+  if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+    http.Error(w, "bad request", http.StatusBadRequest)
+    return
+  }
+
+  // 1. download artifact
+  tmp := "/tmp/etcd-upgrade.tar.gz"
+  if err := downloadFile(req.ArtifactURL, tmp); err != nil {
+    http.Error(w, "download failed", http.StatusInternalServerError)
+    return
+  }
+
+  // 2. backup binary
+  exec.Command("cp", "/usr/local/bin/etcd", "/usr/local/bin/etcd.old").Run()
+  exec.Command("systemctl", "stop", "etcd").Run()
+
+  // 3. extract and replace
+  exec.Command("tar", "xzf", tmp, "-C", "/tmp").Run()
+  exec.Command("cp", "/tmp/etcd*/etcd", "/usr/local/bin/").Run()
+  exec.Command("cp", "/tmp/etcd*/etcdctl", "/usr/local/bin/").Run()
+  exec.Command("chmod", "+x", "/usr/local/bin/etcd").Run()
+
+  // 4. start and health check
+  exec.Command("systemctl", "daemon-reload").Run()
+  exec.Command("systemctl", "start", "etcd").Run()
+
+  // wait for local health
+  // call etcdctl locally to check health
+  // respond success or failure
+  w.WriteHeader(http.StatusOK)
+  io.WriteString(w, `{"status":"ok"}`)
+}
+```
+#### Agent 本地回滚接口
+- 提供 `POST /v1/etcd/rollback`，执行 `cp /usr/local/bin/etcd.old /usr/local/bin/etcd && systemctl restart etcd` 并返回结果。
+### 测试与演练建议
+- **单节点演练**：在单节点 etcd 集群上反复演练升级与回滚脚本。  
+- **多节点演练**：在 3 节点测试集群上演练 follower-first、leader-last 升级路径。  
+- **故障注入**：模拟节点升级失败、网络分区、快照损坏，验证回滚与恢复流程。  
+- **CI 集成**：把脚本与 Controller/Agent 单元集成测试纳入 CI，自动运行关键演练。
+### 安全与运维注意事项
+- **证书与密钥管理**：`etcdctl` 使用的证书必须安全存储，Controller 与 Agent 访问权限受限。  
+- **SSH 与 Agent 权限**：优先使用 Agent RPC，SSH 作为回退。Agent 运行需最小权限但能管理 systemd 与文件。  
+- **审计与日志**：每次升级、回滚、快照都写事件到 Kubernetes Event 与 CRD 状态，便于审计。  
+- **人工中断点**：在生产首次升级时建议在 leader 升级前设置人工审批点。
+### 交付物与下一步
+我可以把上面的 Bash 模板扩展为：  
+- **完整可执行脚本**（参数化、日志、上传快照到 S3、自动解析 member 列表）  
+- **Controller 真实代码片段**（含 client-go 调用、CRD 更新、并发控制）  
+- **Agent 完整微服务示例**（HTTP API、任务队列、日志与回滚实现）
