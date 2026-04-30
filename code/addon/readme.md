@@ -123,3 +123,47 @@ sequenceDiagram
 3. 调用 InstallAddon 下发。  
 4. 节点执行脚本。  
 5. 状态回传并同步集群条件。  
+
+# **`pkg/kube/addon.go` 的设计
+核心是：为 BKE 集群提供一个统一的 Addon 安装与管理框架，支持 YAML/Chart 两种形式的插件，自动生成参数、执行任务、记录状态，并针对特殊插件（如 bocoperator、cluster-api、fabric、nodelocaldns）进行增强处理。**
+## 📑 设计要点
+### 1. Addon 安装入口
+- **InstallAddon** 方法是核心入口，接收 `AddonTransfer` 对象。  
+- 根据 Addon 类型（Chart 或 YAML）选择不同的安装路径：  
+  - `installChartAddon` → Helm Chart 安装。  
+  - `installYamlAddon` → 遍历 YAML 文件并应用。
+
+### 2. Task 抽象
+- 定义 `Task` 结构体，封装单个 YAML 文件的应用任务：  
+  - **属性**：名称、文件路径、参数、是否忽略错误、是否阻塞等待、超时、操作类型。  
+  - **方法**：`SetWaiter`、`AddRepo`、`SetOperate`、`RegisAddonRecorder`。  
+- **作用**：把每个 YAML 文件应用过程抽象为可配置任务，支持重试和超时控制。
+### 3. AddonRecorder
+- 用于记录 Addon 安装过程中生成的对象（名称、Kind、Namespace）。  
+- **作用**：便于后续状态查询和调试，保证安装过程可追溯。
+### 4. 参数生成与增强
+- **prepareAddonParameters**：根据集群配置和节点信息生成通用参数。  
+- **enhanceCommonParamForSpecialAddons**：针对特殊插件进行参数增强：  
+  - **bocoperator**：增加 pipeline server、portal token 等参数。  
+  - **cluster-api**：增加 clusterToken 和节点模板数据。  
+  - **fabric**：解析 `excludeIps` 参数，支持 IP 范围。  
+  - **nodelocaldns**：根据 proxyMode 设置 DNS 参数。  
+### 5. YAML 文件管理
+- **getAddonYamlFiles**：遍历 Addon 目录，收集所有 `.yaml` 文件。  
+- 根据操作类型（安装/删除）排序文件，保证执行顺序正确。  
+### 6. 错误处理
+- **handleApplyError**：针对不同操作类型和错误类型进行处理：  
+  - 删除操作失败 → 忽略错误。  
+  - 不匹配错误 → 打印详细日志。  
+  - 其他错误 → 警告并返回。  
+## 📊 设计优势与风险
+| 方面 | 优势 | 风险 |
+|------|------|------|
+| **模块化** | Task 抽象，Recorder 记录，参数生成，职责清晰 | 逻辑复杂，维护成本高 |
+| **灵活性** | 支持 YAML/Chart 两种形式，参数可扩展 | 特殊插件参数增强逻辑可能耦合过深 |
+| **可追溯性** | Recorder 记录对象，日志详细 | Recorder 数据量大时可能影响性能 |
+| **健壮性** | 错误处理区分安装/删除场景 | 错误忽略可能掩盖潜在问题 |
+## ✅ 总结
+- **addon.go** 提供了一个完整的 Addon 安装框架：入口方法、任务抽象、参数生成、状态记录、错误处理。  
+- 它既支持通用插件安装，又针对特殊插件做了增强，保证灵活性和可扩展性。  
+- 整体设计体现了 **声明式 + 可编排 + 可追溯** 的思想，是 BKE 集群插件管理的核心模块。  
