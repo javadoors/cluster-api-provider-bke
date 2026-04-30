@@ -302,3 +302,40 @@ graph TD
 - 工具类和核心插件之间存在并行关系，管理类则串联在核心插件之后。  
 
 要不要我再帮你扩展这个 DAG，把 **自定义 Addon（用户通过 ConfigMap 下发的脚本）**也加进去，展示它们如何插入到不同阶段？
+
+# 脚本型Addon
+在 `cluster-api-provider-bke` 项目里，**脚本型 Addon** 的代码实现主要分布在以下几个地方：
+## 📑 关键实现位置
+1. **`common/cluster/addon/consts.go`**  
+   - 定义了脚本型 Addon 的常量，例如：  
+     - `install-lxcfs.sh`  
+     - `install-nfsutils.sh`  
+     - `install-etcdctl.sh`  
+     - `file-downloader.sh`  
+     - `package-downloader.sh`  
+   - 这些常量作为 Addon 名称被统一管理，保证调用时一致性。
+2. **`common/cluster/addon/addon.go`**  
+   - 抽象了 Addon 对象，支持不同类型（YAML、Chart、Script）。  
+   - 脚本型 Addon 在这里被建模为一种特殊的 Addon 类型。  
+   - 提供了安装、卸载、比较等统一接口。
+3. **`pkg/phaseframe/phases/ensure_nodes_env.go`**  
+   - 在节点环境初始化阶段调用脚本型 Addon。  
+   - 通过生成 `AddonTransfer` 对象，把脚本路径和目标节点封装起来。  
+   - 调用 `InstallAddon` 下发脚本到节点执行。  
+   - 这里是脚本型 Addon 的实际执行入口。
+4. **`pkg/kube/addon.go`**  
+   - 定义了 `InstallAddon` 方法，负责处理不同类型的 Addon。  
+   - 对于脚本型 Addon，会走 **文件传输 + 节点执行** 的逻辑，而不是 YAML 应用或 Helm Chart。  
+   - 通过 `AddonRecorder` 记录执行结果，保证状态可追溯。
+## ⚙️ 执行流程（脚本型 Addon）
+1. 控制器生成 `Addon` 对象（类型为 Script）。  
+2. 封装为 `AddonTransfer`，指定脚本路径和目标节点。  
+3. 调用 `InstallAddon`，将脚本传输到节点。  
+4. 节点 Agent 执行脚本（如安装 lxcfs）。  
+5. 返回结果 → 更新节点状态（成功/失败）。  
+## ✅ 总结
+- **脚本型 Addon 的定义**：在 `common/cluster/addon/consts.go` 和 `addon.go`。  
+- **脚本型 Addon 的调用**：在 `ensure_nodes_env.go` 阶段生成 `AddonTransfer` 并调用。  
+- **脚本型 Addon 的执行**：在 `pkg/kube/addon.go` 的 `InstallAddon` 方法中实现，通过传输和节点执行完成。  
+
+换句话说，脚本型 Addon 是通过 **统一的 Addon 框架**来管理的，只是执行方式不同：它不是应用 YAML 或 Chart，而是直接在节点上运行脚本。  
