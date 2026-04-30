@@ -167,3 +167,138 @@ sequenceDiagram
 - **addon.go** 提供了一个完整的 Addon 安装框架：入口方法、任务抽象、参数生成、状态记录、错误处理。  
 - 它既支持通用插件安装，又针对特殊插件做了增强，保证灵活性和可扩展性。  
 - 整体设计体现了 **声明式 + 可编排 + 可追溯** 的思想，是 BKE 集群插件管理的核心模块。  
+
+# Addon组件
+**在 `cluster-api-provider-bke` 项目中，作为 Addon 的组件主要是一些集群运行所需的插件和工具，它们通过统一的 Addon 框架进行安装和管理，包括内置脚本、通用工具以及特定的 Kubernetes/集群插件。**
+## 📑 主要 Addon 组件类别
+### 1. **内置环境类 Addon**
+这些是节点环境初始化必备的工具，通常以脚本形式存在：
+- **install-lxcfs.sh** → 提供容器资源隔离（真实的 `/proc` 视图）。  
+- **install-nfsutils.sh** → 支持 NFS 存储挂载。  
+- **install-etcdctl.sh** → 提供 etcd 管理工具。  
+### 2. **通用工具类 Addon**
+这些是通用的辅助脚本，用于文件和软件包分发：
+- **file-downloader.sh** → 文件分发工具。  
+- **package-downloader.sh** → 软件包下载与安装工具。  
+### 3. **Kubernetes 核心插件 Addon**
+在 `pkg/kube/addon.go` 中定义的插件，直接影响集群功能：
+- **CoreDNS** → 集群 DNS 服务。  
+- **Kube-Proxy** → Service 网络代理。  
+- **CNI 插件** → 网络插件（如 Flannel、Calico）。  
+### 4. **特殊增强型 Addon**
+在 `addon.go` 中有针对性增强逻辑的插件：
+- **bocoperator** → 管理 pipeline server、portal token 等。  
+- **cluster-api** → 提供集群生命周期管理，支持 clusterToken 和节点模板。  
+- **fabric** → 网络相关插件，支持 IP 排除配置。  
+- **nodelocaldns** → 本地 DNS 缓存插件，优化 DNS 性能。  
+### 5. **监控与管理类 Addon**
+- **Monitoring Operator** → 集群监控。  
+- **Authentication Operator** → 集群认证。  
+- **Operator Lifecycle Manager (OLM)** → 管理 Operator 生命周期。  
+- **Cluster Version Operator (CVO)** → 管理集群版本升级。  
+## 📊 设计特点
+| 类别 | 代表组件 | 作用 |
+|------|----------|------|
+| 内置环境类 | lxcfs, nfsutils, etcdctl | 节点环境初始化 |
+| 通用工具类 | file-downloader, package-downloader | 文件/包分发 |
+| 核心插件类 | CoreDNS, Kube-Proxy, CNI | 集群网络与服务 |
+| 特殊增强型 | bocoperator, cluster-api, fabric, nodelocaldns | 特定功能增强 |
+| 管理类 | OLM, CVO, Auth, Monitor | 集群运维与管理 |
+## ✅ 总结
+在 `cluster-api-provider-bke` 中，**Addon 的范围涵盖了节点环境脚本、通用工具、Kubernetes 核心插件、特殊增强插件以及集群管理 Operator**。这些组件通过统一的 Addon 框架（`AddonTransfer` + `InstallAddon`）进行声明式安装和管理，保证了集群初始化和扩展的灵活性与一致性。  
+
+# Addon 分类清单表
+把 `cluster-api-provider-bke` 项目中涉及的脚本和插件按“环境类 / 工具类 / 核心插件 / 管理类”分组，方便快速查阅：
+## 📊 Addon 分类清单表
+| 类别 | 代表组件 / 脚本 | 作用 |
+|------|----------------|------|
+| **环境类 Addon** | `install-lxcfs.sh` | 提供容器资源隔离，真实的 `/proc` 视图 |
+| | `install-nfsutils.sh` | 支持 NFS 存储挂载 |
+| | `install-etcdctl.sh` | 提供 etcd 管理工具（快照、健康检查） |
+| **工具类 Addon** | `file-downloader.sh` | 文件分发工具，从远程源下载配置/证书/二进制包 |
+| | `package-downloader.sh` | 软件包下载与安装工具，支持不同 Linux 发行版 |
+| **核心插件 Addon** | **CoreDNS** | 集群 DNS 服务 |
+| | **Kube-Proxy** | Service 网络代理 |
+| | **CNI 插件**（Flannel、Calico 等） | Pod 网络插件 |
+| **管理类 Addon** | **bocoperator** | 管理 pipeline server、portal token 等 |
+| | **cluster-api** | 集群生命周期管理，支持 clusterToken 和节点模板 |
+| | **fabric** | 网络相关插件，支持 IP 排除配置 |
+| | **nodelocaldns** | 本地 DNS 缓存插件，优化 DNS 性能 |
+| | **Operator Lifecycle Manager (OLM)** | 管理 Operator 生命周期 |
+| | **Cluster Version Operator (CVO)** | 管理集群版本升级 |
+| | **Authentication Operator** | 集群认证 |
+| | **Monitoring Operator** | 集群监控 |
+## ✅ 总结
+- **环境类 Addon**：保证节点具备基础运行环境。  
+- **工具类 Addon**：提供文件和软件包分发能力。  
+- **核心插件 Addon**：保证 Kubernetes 集群的网络和服务功能。  
+- **管理类 Addon**：提供集群生命周期、认证、监控和 Operator 管理能力。  
+
+这些 Addon 通过统一的 **AddonTransfer + InstallAddon** 框架进行声明式安装和管理，形成了一个可编排、可扩展的插件体系。  
+
+# DAG 图
+把各类 Addon 按类别和依赖关系串联起来，直观展示安装顺序和并行关系：
+```mermaid
+graph TD
+
+    subgraph 环境类
+        LXCFS[install-lxcfs.sh]
+        NFS[install-nfsutils.sh]
+        ETCDCTL[install-etcdctl.sh]
+    end
+
+    subgraph 工具类
+        FileDownloader[file-downloader.sh]
+        PackageDownloader[package-downloader.sh]
+    end
+
+    subgraph 核心插件
+        CoreDNS[CoreDNS]
+        KubeProxy[Kube-Proxy]
+        CNI[CNI 插件]
+    end
+
+    subgraph 管理类
+        BocOperator[bocoperator]
+        ClusterAPI[cluster-api]
+        Fabric[fabric]
+        NodeLocalDNS[nodelocaldns]
+        OLM[Operator Lifecycle Manager]
+        CVO[Cluster Version Operator]
+        Auth[Authentication Operator]
+        Monitor[Monitoring Operator]
+    end
+
+    %% 环境类必须先完成
+    LXCFS --> FileDownloader
+    NFS --> FileDownloader
+    ETCDCTL --> PackageDownloader
+
+    %% 工具类支持核心插件安装
+    FileDownloader --> CoreDNS
+    FileDownloader --> KubeProxy
+    PackageDownloader --> CNI
+
+    %% 核心插件完成后进入管理类
+    CoreDNS --> BocOperator
+    KubeProxy --> ClusterAPI
+    CNI --> Fabric
+    CNI --> NodeLocalDNS
+
+    %% 管理类进一步串联
+    BocOperator --> OLM
+    ClusterAPI --> CVO
+    Fabric --> Auth
+    NodeLocalDNS --> Monitor
+```
+## 📑 图解说明
+- **环境类 Addon**（lxcfs, nfsutils, etcdctl）是最底层依赖，必须先安装。  
+- **工具类 Addon**（file-downloader, package-downloader）在环境准备好后执行，支持文件和包分发。  
+- **核心插件 Addon**（CoreDNS, Kube-Proxy, CNI）依赖工具类，完成集群网络与服务功能。  
+- **管理类 Addon**（bocoperator, cluster-api, fabric, nodelocaldns, OLM, CVO, Auth, Monitor）在核心插件完成后安装，负责集群生命周期、认证、监控和运维。  
+
+这样你就能直观地看到 **Addon 的安装顺序和并行关系**：  
+- 环境类 → 工具类 → 核心插件 → 管理类。  
+- 工具类和核心插件之间存在并行关系，管理类则串联在核心插件之后。  
+
+要不要我再帮你扩展这个 DAG，把 **自定义 Addon（用户通过 ConfigMap 下发的脚本）**也加进去，展示它们如何插入到不同阶段？
