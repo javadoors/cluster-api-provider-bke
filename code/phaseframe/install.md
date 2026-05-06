@@ -82,3 +82,10 @@ update-runc.sh"
 		},
 	}
 ```
+# EnsureClusterAPIObj
+
+# EnsureCerts
+- Secret:kube-system/global-ca
+- ConfigMap:kube-system/cluster-cert-config
+
+# EnsureLoadBalance
