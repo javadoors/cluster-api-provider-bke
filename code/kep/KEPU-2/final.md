@@ -99,7 +99,7 @@ ClusterVersion (集群版本)
 | **ActionEngine 唯一执行路径** | 不绕过引擎直接操作 |
 ## 6. 场景
 ### 6.1 场景一：全新集群安装
-```
+```txt
 用户创建 BKECluster
     → BKEClusterReconciler 创建 ClusterVersion（引用 ReleaseImage）
         → ClusterVersion 控制器解析 ReleaseImage
@@ -114,7 +114,7 @@ ClusterVersion (集群版本)
                 → 全部组件完成 → ClusterVersion 更新 currentVersion
 ```
 ### 6.2 场景二：集群版本升级（含旧组件卸载）
-```
+```txt
 用户修改 ClusterVersion.spec.desiredVersion = "v2.6.0"
     │
     ├── ClusterVersion Controller
@@ -138,7 +138,7 @@ ClusterVersion (集群版本)
     └── 全部组件完成 → ClusterVersion 更新 currentVersion
 ```
 ### 6.3 场景三：单组件独立升级
-```
+```txt
 用户修改 ComponentVersionBinding.spec.desiredVersion
     → ComponentVersionBinding 控制器检测 desiredVersion != installedVersion
         → 通过 componentVersionRef 找到 ComponentVersion
@@ -152,7 +152,7 @@ ClusterVersion (集群版本)
             → ClusterVersion 控制器检测到 Binding 状态变更，更新 ClusterVersion.Status 中的组件版本
 ```
 ### 6.4 场景四：节点扩容
-```
+```txt
 用户在 BKECluster.Spec 中添加新节点
     → BKEClusterReconciler 创建最小化 NodeConfig（不含 Components）
         → BKEClusterReconciler 触发 cluster-api 创建 Machine 资源
@@ -167,7 +167,7 @@ ClusterVersion (集群版本)
                                     → 所有组件安装完成 → NodeConfig Phase=Ready
 ```
 ### 6.5 场景五：节点缩容
-```
+```txt
 用户从 BKECluster.Spec 中删除节点
     → BKEClusterReconciler 标记 NodeConfig Phase=Deleting
         → NodeConfig 控制器按依赖逆序更新各 ComponentVersionBinding.nodeStatuses[节点] = Uninstalling
@@ -189,7 +189,7 @@ ClusterVersion (集群版本)
 ```
 两者都包含 cluster-api Machine 资源的操作，且顺序正确：扩容先创建 Machine 再安装组件，缩容先卸载组件再删除 Machine。
 ### 6.6 场景六：升级回滚
-```
+```txt
 ComponentVersionBinding 升级失败
     → ComponentVersionBinding 控制器标记 Phase=UpgradeFailed
         → ClusterVersion 控制器检测到失败
@@ -202,7 +202,7 @@ ComponentVersionBinding 升级失败
                             → 回滚到上一个已知良好版本
 ```
 ### 6.7 场景七：纳管现有集群
-```
+```txt
 用户创建 BKECluster（spec.manageMode=Import）
     → ClusterVersion 控制器创建 clusterManage ComponentVersionBinding
         → ComponentVersionBinding 控制器检测 desiredVersion != installedVersion
@@ -211,9 +211,44 @@ ComponentVersionBinding 升级失败
             → 执行 installAction（YAML 声明）
                 → 收集集群信息 → 推送 Agent → 伪引导 → 兼容性补丁
 ```
+### 6.8 时序图
+直观展示两者的执行顺序与依赖关系。这样可以清晰体现：安装与升级虽然依赖链一致，但执行策略不同。
+```mermaid
+sequenceDiagram
+    participant Installer as Installer
+    participant Etcd as etcd
+    participant APIServer as API Server
+    participant Controllers as Controller Manager/Scheduler
+    participant Nodes as Worker Nodes
+    participant Platform as OpenShift/BKE 平台组件
+    participant CVO as Cluster Version Operator-CVO
+
+    Note over Installer,CVO: 安装与升级的时序对比
+
+    Installer->>Etcd: 安装 etcd 集群
+    Etcd->>APIServer: 安装 API Server
+    APIServer->>Controllers: 安装控制器与调度器
+    Controllers->>Nodes: 安装节点服务-kubelet/CRI
+    Nodes->>Platform: 安装平台组件-路由器/监控/注册表
+    Platform->>Installer: 安装完成 → Installer退出
+
+    CVO->>Etcd: 升级 etcd-滚动/灰度
+    CVO->>APIServer: 升级 API Server
+    CVO->>Controllers: 升级控制器与调度器
+    CVO->>Nodes: 逐个升级节点-Pod 驱逐+调度
+    CVO->>Platform: 升级平台组件
+    CVO->>CVO: 常驻运行，保持目标版本
+```
+#### 🔑 图解说明
+- **安装流程**：严格依赖顺序，从 etcd → API Server → 控制器 → 节点 → 平台组件，完成后 Installer 退出。  
+- **升级流程**：依赖顺序相同，但执行策略不同，采用滚动升级、灰度替换，CVO 常驻运行，持续保持集群版本。  
+#### 📊 价值
+- **统一依赖链**：安装与升级都遵循相同的组件依赖关系。  
+- **策略差异**：安装是一次性拉起，升级是持续替换并保证不中断。  
+- **提案可视化**：时序图能帮助 KEPU-2 提案更直观地说明安装与升级的执行逻辑。  
 ## 7. 提案
 ### 7.1 资源关联关系
-```
+```txt
 ┌─────────────────────────────────────────────────────────────────┐
 │                        BKECluster                               │
 │  (集群实例，1:1 对应 ClusterVersion)                             │
