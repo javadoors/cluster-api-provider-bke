@@ -243,6 +243,68 @@ type MachineLifecycle interface {
 }
 ```
 ## 三、优化与重构建议
+架构图展示在 `controller-refactor.md` 中提出的重构：实现标准的 **Control Plane Provider** 与 **Bootstrap Provider**，它们在 Cluster API 架构中的关系。
+```mermaid
+flowchart TD
+
+    subgraph ClusterAPI["Cluster API Core"]
+        C1[Cluster Resource]
+        C2[Machine Resource]
+        C3[MachineDeployment]
+    end
+
+    subgraph BKEProvider["BKE Provider-重构后"]
+        CP[Control Plane Provider]
+        BP[Bootstrap Provider]
+        Infra[Infrastructure Provider-BKE Infra]
+    end
+
+    subgraph ControlPlaneProvider["Control Plane Provider"]
+        CP1[API Server Lifecycle]
+        CP2[Controller Manager Lifecycle]
+        CP3[Etcd Lifecycle]
+    end
+
+    subgraph BootstrapProvider["Bootstrap Provider"]
+        BP1[Cloud-init/UserData]
+        BP2[Join Scripts]
+        BP3[Certificates/Keys]
+    end
+
+    %% 连接关系
+    C1 --> CP
+    C2 --> BP
+    C2 --> Infra
+    C3 --> Infra
+
+    CP --> ControlPlaneProvider
+    BP --> BootstrapProvider
+
+    ControlPlaneProvider --> CP1
+    ControlPlaneProvider --> CP2
+    ControlPlaneProvider --> CP3
+
+    BootstrapProvider --> BP1
+    BootstrapProvider --> BP2
+    BootstrapProvider --> BP3
+```
+图解说明
+- **Cluster API Core**：定义集群、机器、部署等核心资源。  
+- **BKE Provider**：重构后包含三个标准 Provider：  
+  - **Control Plane Provider**：负责 API Server、Controller Manager、Etcd 的生命周期管理。  
+  - **Bootstrap Provider**：负责生成节点初始化脚本（cloud-init/userData）、证书分发、节点加入逻辑。  
+  - **Infrastructure Provider (BKE Infra)**：负责底层资源（VM、网络、存储）的创建与管理。  
+- **连接关系**：  
+  - Cluster → Control Plane Provider：由 Control Plane Provider 管理控制平面组件。  
+  - Machine → Bootstrap Provider：由 Bootstrap Provider 提供节点初始化逻辑。  
+  - Machine/MachineDeployment → Infrastructure Provider：由 Infra Provider 管理底层资源。  
+
+业务价值
+- **标准化**：符合 Cluster API 的 Provider 模型，便于与其他 Provider 生态对齐。  
+- **解耦**：控制平面、引导逻辑、基础设施分离，降低耦合度。  
+- **可扩展**：不同 Provider 可独立演进，支持多种 OS/Infra。  
+- **可维护**：清晰的职责划分，便于测试、升级与运维。
+-  
 ### 1. **实现标准的 Bootstrap Provider**
 **步骤一：定义 KubeadmConfig 资源**
 ```go
