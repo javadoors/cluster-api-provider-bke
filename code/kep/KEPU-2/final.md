@@ -2003,13 +2003,13 @@ cluster-api-provider-bke/
 ## 12. 工作量评估
 | 步骤 | 内容 | 工作量 |
 |------|------|--------|
-| 第一步 | CRD 定义（5 个）+ ActionEngine（4 种 Executor）+ 模板渲染 | 15 人天 |
-| 第二步 | ComponentVersion Controller + ComponentVersionBinding Controller + NodeConfig Controller + UpgradePath Controller + ClusterVersion Controller | 15 人天 |
-| 第三步 | 16 个组件 YAML 声明 + DAGScheduler + 安装 E2E | 20 人天 |
+| 第一步 | CRD 定义（5 个）+ ActionEngine（4 种 Executor）+ 模板渲染 | 25 人天 |
+| 第二步 | ComponentVersion Controller + ComponentVersionBinding Controller + NodeConfig Controller + UpgradePath Controller + ClusterVersion Controller | 50 人天 |
+| 第三步 | 16 个组件 YAML 声明 + DAGScheduler + 安装 E2E | 30 人天 |
 | 第四步 | 升级全链路 + 扩缩容 + 回滚 | 10 人天 |
 | 第五步 | 旧架构兼容升级到新架构 | 20 人天 |
 | 测试 | 单元测试 + 集成测试 + E2E + 新旧路径对比 | 10 人天 |
-| **总计** | | **90 人天** |
+| **总计** | | **150 人天** |
 ## 13. 风险评估
 | 风险 | 影响 | 缓解措施 |
 |------|------|---------|
