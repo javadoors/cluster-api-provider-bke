@@ -211,41 +211,6 @@ ComponentVersionBinding 升级失败
             → 执行 installAction（YAML 声明）
                 → 收集集群信息 → 推送 Agent → 伪引导 → 兼容性补丁
 ```
-### 6.8 时序图
-直观展示两者的执行顺序与依赖关系。这样可以清晰体现：安装与升级虽然依赖链一致，但执行策略不同。
-```mermaid
-sequenceDiagram
-    participant Installer as Installer
-    participant Etcd as etcd
-    participant APIServer as API Server
-    participant Controllers as Controller Manager/Scheduler
-    participant Nodes as Worker Nodes
-    participant Platform as OpenShift/BKE 平台组件
-    participant CVO as Cluster Version Operator-CVO
-
-    Note over Installer,CVO: 安装与升级的时序对比
-
-    Installer->>Etcd: 安装 etcd 集群
-    Etcd->>APIServer: 安装 API Server
-    APIServer->>Controllers: 安装控制器与调度器
-    Controllers->>Nodes: 安装节点服务-kubelet/CRI
-    Nodes->>Platform: 安装平台组件-路由器/监控/注册表
-    Platform->>Installer: 安装完成 → Installer退出
-
-    CVO->>Etcd: 升级 etcd-滚动/灰度
-    CVO->>APIServer: 升级 API Server
-    CVO->>Controllers: 升级控制器与调度器
-    CVO->>Nodes: 逐个升级节点-Pod 驱逐+调度
-    CVO->>Platform: 升级平台组件
-    CVO->>CVO: 常驻运行，保持目标版本
-```
-#### 🔑 图解说明
-- **安装流程**：严格依赖顺序，从 etcd → API Server → 控制器 → 节点 → 平台组件，完成后 Installer 退出。  
-- **升级流程**：依赖顺序相同，但执行策略不同，采用滚动升级、灰度替换，CVO 常驻运行，持续保持集群版本。  
-#### 📊 价值
-- **统一依赖链**：安装与升级都遵循相同的组件依赖关系。  
-- **策略差异**：安装是一次性拉起，升级是持续替换并保证不中断。  
-- **提案可视化**：时序图能帮助 KEPU-2 提案更直观地说明安装与升级的执行逻辑。  
 ## 7. 提案
 ### 7.1 资源关联关系
 ```txt
@@ -1317,6 +1282,41 @@ Reconcile(ctx, req):
        a. 根据 upgradeStrategy.autoRollback 决定是否回滚
        b. 更新 status.phase = UpgradeFailed/RollingBack
 ```
+#### 时序图
+直观展示两者的执行顺序与依赖关系。这样可以清晰体现：安装与升级虽然依赖链一致，但执行策略不同。
+```mermaid
+sequenceDiagram
+    participant Installer as Installer
+    participant Etcd as etcd
+    participant APIServer as API Server
+    participant Controllers as Controller Manager/Scheduler
+    participant Nodes as Worker Nodes
+    participant Platform as OpenShift/BKE 平台组件
+    participant CVO as Cluster Version Operator-CVO
+
+    Note over Installer,CVO: 安装与升级的时序对比
+
+    Installer->>Etcd: 安装 etcd 集群
+    Etcd->>APIServer: 安装 API Server
+    APIServer->>Controllers: 安装控制器与调度器
+    Controllers->>Nodes: 安装节点服务-kubelet/CRI
+    Nodes->>Platform: 安装平台组件-路由器/监控/注册表
+    Platform->>Installer: 安装完成 → Installer退出
+
+    CVO->>Etcd: 升级 etcd-滚动/灰度
+    CVO->>APIServer: 升级 API Server
+    CVO->>Controllers: 升级控制器与调度器
+    CVO->>Nodes: 逐个升级节点-Pod 驱逐+调度
+    CVO->>Platform: 升级平台组件
+    CVO->>CVO: 常驻运行，保持目标版本
+```
+##### 🔑 图解说明
+- **安装流程**：严格依赖顺序，从 etcd → API Server → 控制器 → 节点 → 平台组件，完成后 Installer 退出。  
+- **升级流程**：依赖顺序相同，但执行策略不同，采用滚动升级、灰度替换，CVO 常驻运行，持续保持集群版本。  
+##### 📊 价值
+- **统一依赖链**：安装与升级都遵循相同的组件依赖关系。  
+- **策略差异**：安装是一次性拉起，升级是持续替换并保证不中断。  
+- **提案可视化**：时序图能帮助 KEPU-2 提案更直观地说明安装与升级的执行逻辑。  
 ### 8.2 ReleaseImage Controller
 **核心职责**：
 1. 验证所有引用的 ComponentVersion 是否存在
