@@ -62,7 +62,7 @@ commandSpec.Commands = []agentv1beta1.ExecCommand{
 	}
 ```
 ```go
-update-runc.sh"
+update-runc.sh
 ```
 - finalDecisionAndCleanup
   - initClusterExtra
@@ -81,7 +81,7 @@ update-runc.sh"
 			BackoffIgnore: false,
 		},
 	}
-```
+    ```
 # EnsureClusterAPIObj
 
 # EnsureCerts
@@ -89,3 +89,19 @@ update-runc.sh"
 - ConfigMap:kube-system/cluster-cert-config
 
 # EnsureLoadBalance
+- apiserver-ha:haproxy/keepalive 采用静态Pod安装与升级
+- ingress-ha:keepalive 采用静态Pod安装与升级（Ingress Controller进行流量转发）
+
+# EnsureMasterInit
+
+# EnsureMasterJoin
+
+# EnsureWorkerJoin
+
+# EnsureAddonDeploy
+
+# EnsureNodesPostProcess
+
+# EnsureAgentSwitch
+
+
