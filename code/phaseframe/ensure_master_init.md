@@ -270,3 +270,22 @@ EnsureMasterInit 的前置条件：
 - EnsureLoadBalance 已完成（VIP 已配置，API Server 可通过 VIP 访问）
 - BKEMachine Controller 已创建 Bootstrap Command
         
+# Command 是如何由 BKEMachine Controller 创建的？
+根据 `ensure_master_init.md` 的内容，`Command` 的创建逻辑如下：
+## 1. 创建者与时机
+`Command` **不是**由 `EnsureMasterInit` Phase 创建的，而是由 **`BKEMachine Controller`** 负责创建。
+*   **触发条件**：当 `BKEMachine Controller` 检测到**首个 Master 节点**，且该节点处于 `InitControlPlane` 阶段时。
+## 2. 创建内容详情
+`BKEMachine Controller` 会创建一个 **Bootstrap Command**，具体包含：
+*   **标识 (Label)**：打上 `MasterInitCommandLabel` 标签，以便 `EnsureMasterInit` Phase 能够通过该标签查找到该 Command。
+*   **执行指令 (Commands)**：
+    1.  `"K8sEnvInit"`：用于检查容器运行时等环境状态。
+    2.  `"Kubeadm"`：指定 `phase=InitControlPlane`，用于执行控制平面的初始化操作。
+*   **目标节点 (NodeSelector)**：通过 `NodeSelector` 将命令指向**第一个 Master 节点**（即最早创建的 BKEMachine）。
+## 3. 与 Phase 的协作关系
+*   **BKEMachine Controller**：负责“生产”Command。
+*   **BKEAgent**：负责在节点上“执行”Command。
+*   **EnsureMasterInit Phase**：负责“监控”Command。它通过轮询查找带有 `MasterInitCommandLabel` 的 Command，检查其执行状态（是否完成、是否成功），并等待 `BKEMachine.Status.Bootstrapped` 变为 `true`。
+## 4. 失败重试机制
+如果 Command 执行失败，`EnsureMasterInit` 会移除 `BKEMachine` 的 Master Label。这一操作会触发 `BKEMachine Controller` 重新调和（Reconcile），进而**重新创建**一个新的 Bootstrap Command 进行重试。
+
