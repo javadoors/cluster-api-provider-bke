@@ -2001,15 +2001,70 @@ cluster-api-provider-bke/
 │       └── clusterhealth-v1.0.0.yaml
 ```
 ## 12. 工作量评估
-| 步骤 | 内容 | 工作量 |
-|------|------|--------|
-| 第一步 | CRD 定义（5 个）+ ActionEngine（4 种 Executor）+ 模板渲染 | 25 人天 |
-| 第二步 | ComponentVersion Controller + ComponentVersionBinding Controller + NodeConfig Controller + UpgradePath Controller + ClusterVersion Controller | 50 人天 |
-| 第三步 | 16 个组件 YAML 声明 + DAGScheduler + 安装 E2E | 30 人天 |
-| 第四步 | 升级全链路 + 扩缩容 + 回滚 | 10 人天 |
-| 第五步 | 旧架构兼容升级到新架构 | 20 人天 |
-| 测试 | 单元测试 + 集成测试 + E2E + 新旧路径对比 | 10 人天 |
-| **总计** | | **150 人天** |
+
+### 12.1 基础设施开发
+| 步骤 | 内容 | 工作量 | 说明 |
+|------|------|--------|------|
+| 1.1 | CRD 定义（6 个）+ deepcopy 生成 | 5 人天 | ClusterVersion/ReleaseImage/ComponentVersion/ComponentVersionBinding/NodeConfig/UpgradePath |
+| 1.2 | ActionEngine 核心框架 | 10 人天 | 引擎主流程 + 模板渲染 + 条件求值 + 策略调度 + 结果收集 |
+| 1.3 | 4 种 Executor 实现 | 15 人天 | Script/Manifest/Chart/Kubectl 执行器 |
+| 1.4 | 模板变量系统 | 5 人天 | TemplateContext 构建 + 变量校验 + 默认值机制 |
+| **小计** | | **35 人天** | |
+
+### 12.2 控制器开发
+| 步骤 | 内容 | 工作量 | 说明 |
+|------|------|--------|------|
+| 2.1 | ClusterVersion Controller | 10 人天 | 版本编排 + DAG 调度 + 历史管理 + Finalizer/Pause 框架逻辑 |
+| 2.2 | ComponentVersionBinding Controller | 6 人天 | 状态机驱动 + 版本变更检测 + 旧版本卸载 + 健康检查 + 节点状态跟踪 |
+| 2.3 | NodeConfig Controller | 4 人天 | 节点组件管理 + 自动填充 + 依赖逆序卸载 + cluster-api 扩缩容触发 |
+| 2.4 | ReleaseImage Controller | 2 人天 | 组件验证 + 三层兼容性检查 + 升级路径验证 |
+| 2.5 | ComponentVersion Controller | 1 人天 | 能力目录验证（相对简单） |
+| 2.6 | UpgradePath Controller | 2 人天 | 路径验证 + 阻止/废弃检测 + 使用统计 + 路径发现 |
+| **小计** | | **35 人天** | |
+
+### 12.3 Phase 迁移至 ComponentVersion（旧 Phase 整改）
+> **注**：因对旧有 Phase 实现细节不熟悉，需额外投入时间理解现有逻辑、提取行为、编写 YAML 声明
+
+| Phase 分类 | 涉及 Phase | 工作量 | 说明 |
+|------------|-----------|--------|------|
+| **节点级组件（安装）** | EnsureBKEAgent, EnsureNodesEnv, EnsureContainerdUpgrade | 10 人天 | 理解现有脚本逻辑 → 提取为 Action YAML → 模板化变量 |
+| **节点级组件（Kubernetes）** | EnsureMasterInit, EnsureMasterJoin, EnsureWorkerJoin, EnsureEtcdUpgrade | 10 人天 | kubeadm 流程复杂，需理解 init/join/upgrade 差异，逐节点升级逻辑 |
+| **集群级组件** | EnsureClusterAPIObj, EnsureCerts, EnsureAddonDeploy, EnsureAgentSwitch | 5 人天 | 证书生成/Addon 部署逻辑梳理，Chart 值模板化 |
+| **平台组件** | EnsureProviderSelfUpgrade, EnsureComponentUpgrade, EnsureClusterManage | 5 人天 | Provider 自升级/纳管流程理解，兼容性补丁逻辑 |
+| **节点后处理** | EnsureNodesPostProcess | 2 人天 | 后处理脚本提取，条件判断模板化 |
+| **负载均衡** | EnsureLoadBalance | 2 人天 | Static Pod Manifest 声明，ConfigMap 更新逻辑 |
+| **删除/健康检查** | EnsureWorkerDelete, EnsureMasterDelete, EnsureCluster | 4 人天 | Drain/清理残留/etcd 成员移除逻辑提取 |
+| **DAGScheduler 实现** | 依赖图构建 + 拓扑排序 + 并行调度 | 5 人天 | 安装/升级双依赖图，循环依赖检测 |
+| **Phase 对比验证** | 新旧路径输出对比 | 3 人天 | 确保 YAML 声明与原有 Go 代码行为一致 |
+| **小计** | | **46 人天** | 旧 Phase 理解成本高，YAML 化需反复验证 |
+
+### 12.4 升级/扩缩容/回滚全链路
+| 步骤 | 内容 | 工作量 | 说明 |
+|------|------|--------|------|
+| 4.1 | 升级全链路（含旧组件卸载） | 8 人天 | PreCheck→UninstallOld→Upgrade→PostCheck 完整流程 |
+| 4.2 | 扩缩容流程 | 5 人天 | NodeConfig 增删 → 组件安装/卸载 → Machine 资源操作 |
+| 4.3 | 回滚机制 | 3 人天 | 自动回滚决策 + rollbackAction 执行 + 状态恢复 |
+| 4.4 | 单组件独立升级 | 2 人天 | 绕过 ClusterVersion 直接修改 Binding 的场景 |
+| **小计** | | **18 人天** | |
+
+### 12.5 测试
+| 类型 | 内容 | 工作量 | 说明 |
+|------|------|--------|------|
+| 单元测试 | ActionEngine 各子模块 + 控制器 Reconcile 逻辑 | 6 人天 | 模板渲染/条件求值/状态机/DAG 调度 |
+| 集成测试 | 控制器间协作 + UpgradePath 验证 | 4 人天 | ClusterVersion→Binding→NodeConfig 联动 |
+| E2E 测试 | 安装/升级/扩缩容/回滚完整流程 | 6 人天 | 真实集群验证，新旧路径对比 |
+| 兼容性测试 | Feature Gate 开关 + 旧 PhaseFlow 共存 | 2 人天 | 迁移期平滑过渡验证 |
+| **小计** | | **18 人天** | |
+
+### 12.6 总计
+| 阶段 | 工作量 |
+|------|--------|
+| 基础设施开发 | 35 人天 |
+| 控制器开发 | 35 人天 |
+| Phase 迁移（旧 Phase 整改） | 46 人天 |
+| 升级/扩缩容/回滚全链路 | 18 人天 |
+| 测试 | 18 人天 |
+| **总计** | **152 人天** |
 ## 13. 风险评估
 | 风险 | 影响 | 缓解措施 |
 |------|------|---------|
