@@ -2000,6 +2000,293 @@ cluster-api-provider-bke/
 │       ├── nodedelete-v1.0.0.yaml
 │       └── clusterhealth-v1.0.0.yaml
 ```
+## 11. Phase 整改为 ClusterAPI 规范方案
+
+### 11.1 现状与 ClusterAPI 规范的差距
+
+| 维度 | 当前 PhaseFrame 实现 | ClusterAPI 规范 | 差距影响 |
+|------|---------------------|----------------|---------|
+| **架构模式** | 单一 BKEClusterReconciler 顺序执行 26 个 Phase | 多个独立控制器（Cluster/KCP/MD/Machine）并行 Reconcile | 无法并行、无法独立演进 |
+| **状态机** | 显式 PhaseWaiting→Running→Succeeded/Failed | 隐式通过 Conditions 表达状态 | 状态硬编码、扩展困难 |
+| **控制面管理** | EnsureMasterInit/Join/Upgrade 手动编排 | KubeadmControlPlane 控制器声明式管理 | 升级/扩缩容逻辑与业务耦合 |
+| **Worker 管理** | EnsureWorkerJoin/Delete 直接操作 MachineDeployment replicas | MachineDeployment 控制器声明式收敛 | 无法利用 CAPI 内置滚动更新 |
+| **Bootstrap** | SSH 推送二进制 + Command CRD | KubeadmBootstrap 生成 cloud-init/user-data | 依赖 SSH 连通性、无法离线 |
+| **节点发现** | 自定义 BKENode CRD + NodeFetcher | Machine.Status.NodeRef | 与 CAPI 生态不兼容 |
+| **错误恢复** | 手动重试注解 + Phase 状态重置 | 自动 Requeue + 条件驱动重试 | 恢复逻辑不透明 |
+| **并行性** | 严格顺序执行 | 独立控制器并行 Reconcile | 安装耗时长 |
+
+### 11.2 整改目标
+
+将现有 PhaseFrame 的 26 个 Phase 整改为符合 ClusterAPI 规范的架构，实现以下目标：
+
+1. **控制器拆分**：将单体 BKEClusterReconciler 拆分为多个独立控制器
+2. **声明式收敛**：用 Conditions 替代 PhaseStatus，用 Reconcile 循环替代顺序执行
+3. **CAPI 集成**：复用 KubeadmControlPlane/MachineDeployment 的标准能力
+4. **Bootstrap 标准化**：用 Bootstrap Provider 替代 SSH 推送
+5. **节点发现标准化**：用 Machine.Status.NodeRef 替代 BKENode CRD
+
+### 11.3 整改方案
+
+#### 11.3.1 控制器拆分映射表
+
+| 原 Phase | 目标控制器 | 整改方式 |
+|----------|-----------|---------|
+| EnsureFinalizer | BKECluster Controller | 保留，整合到标准 Controller Finalizer 模式 |
+| EnsurePaused | BKECluster Controller | 保留，使用 paused annotation 标准模式 |
+| EnsureClusterManage | BKECluster Controller（Import 模式） | 重构为独立 Reconcile 分支 |
+| EnsureDeleteOrReset | BKECluster Controller | 保留，使用 Finalizer 级联删除 |
+| EnsureDryRun | BKECluster Controller | 保留，使用 dry-run annotation |
+| EnsureBKEAgent | BKEBootstrap Provider | **重写**：从 SSH 推送改为 Bootstrap Provider 生成 user-data |
+| EnsureNodesEnv | BKEBootstrap Provider | **合并**：与 EnsureBKEAgent 合并为单一 Bootstrap 流程 |
+| EnsureClusterAPIObj | BKECluster Controller | **删除**：由 CAPI 标准控制器自动创建 Cluster/KCP/MD |
+| EnsureCerts | BKECluster Controller | **重构**：使用 CAPI 内置证书管理 + Secret 共享 |
+| EnsureLoadBalance | LoadBalancer Controller | **拆分**：独立控制器，监听 Cluster 对象创建 LB 资源 |
+| EnsureMasterInit | KubeadmControlPlane | **删除**：由 KCP 控制器自动处理 |
+| EnsureMasterJoin | KubeadmControlPlane | **删除**：由 KCP 控制器自动处理 |
+| EnsureWorkerJoin | MachineDeployment | **删除**：由 MD 控制器通过 replicas 自动处理 |
+| EnsureAddonDeploy | Addon Controller | **拆分**：独立控制器，使用 Cluster API Add-on Provider 模式 |
+| EnsureNodesPostProcess | NodePostProcess Controller | **拆分**：独立控制器，监听 Machine Ready 事件 |
+| EnsureAgentSwitch | BKECluster Controller | **合并**：整合到 BKECluster Controller 的 Post-Reconcile 逻辑 |
+| EnsureProviderSelfUpgrade | Provider Controller | **拆分**：独立控制器，监听 Provider Deployment 版本 |
+| EnsureAgentUpgrade | BKEAgent Controller | **拆分**：独立控制器，滚动更新节点 Agent |
+| EnsureContainerdUpgrade | NodeConfig Controller | **合并**：整合到 KEPU-2 的 NodeConfig 声明式升级 |
+| EnsureEtcdUpgrade | KubeadmControlPlane | **删除**：由 KCP 控制器自动处理 etcd 升级 |
+| EnsureWorkerUpgrade | MachineDeployment | **删除**：由 MD RollingUpdate 策略自动处理 |
+| EnsureMasterUpgrade | KubeadmControlPlane | **删除**：由 KCP RollingUpdate 策略自动处理 |
+| EnsureWorkerDelete | MachineDeployment | **删除**：由 MD 控制器自动处理 |
+| EnsureMasterDelete | KubeadmControlPlane | **删除**：由 KCP 控制器自动处理 |
+| EnsureComponentUpgrade | OpenFuyao Controller | **拆分**：独立控制器，管理 openFuyao 组件生命周期 |
+| EnsureCluster | BKECluster Controller | **合并**：整合为标准 Conditions 健康检查 |
+
+#### 11.3.2 整改后控制器架构
+```txt
+┌─────────────────────────────────────────────────────────────────┐
+│                     BKECluster Controller                       │
+│  - Finalizer / Pause / Delete / Reset / DryRun                  │
+│  - Import 模式（纳管现有集群）                                  │
+│  - 证书管理（CAPI Secret 共享）                                 │
+│  - Agent 切换（Post-Reconcile）                                 │
+│  - 健康检查（标准 Conditions）                                  │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+         ┌────────────────────┼────────────────────┐
+         ▼                    ▼                    ▼
+┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
+│ BKEBootstrap    │  │ LoadBalancer    │  │ Addon           │
+│ Provider        │  │ Controller      │  │ Controller      │
+│                 │  │                 │  │                 │
+│ - user-data生成 │  │ - haproxy/      │  │ - Calico        │
+│ - cloud-init    │  │   keepalived    │  │ - CoreDNS       │
+│ - 节点初始化    │  │ - VIP 管理      │  │ - kube-proxy    │
+└─────────────────┘  └─────────────────┘  └─────────────────┘
+         │                    │                    │
+         ▼                    ▼                    ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                  ClusterAPI 标准控制器                          │
+│  - Cluster Controller（集群元数据）                             │
+│  - KubeadmControlPlane（控制面 init/join/upgrade/delete）       │
+│  - MachineDeployment（Worker 扩缩容/升级）                      │
+│  - Machine Controller（节点生命周期）                           │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+         ┌────────────────────┼────────────────────┐
+         ▼                    ▼                    ▼
+┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
+│ BKEAgent        │  │ NodePostProcess │  │ OpenFuyao       │
+│ Controller      │  │ Controller      │  │ Controller      │
+│                 │  │                 │  │                 │
+│ - Agent滚动升级 │  │ - 后置脚本      │  │ - 组件部署      │
+│ - 版本管理      │  │ - 节点配置      │  │ - 版本升级      │
+└─────────────────┘  └─────────────────┘  └─────────────────┘
+```
+
+#### 11.3.3 关键整改点详解
+
+**（1）BKEBootstrap Provider 替代 SSH 推送**
+
+当前 `EnsureBKEAgent` 和 `EnsureNodesEnv` 通过 SSH 推送二进制和配置，整改为：
+
+```go
+// pkg/bootstrap/bke/bootstrap.go
+type BKEBootstrap struct {
+    client.Client
+}
+
+func (b *BKEBootstrap) GenerateBootstrapData(ctx context.Context, obj metav1.Object, cluster *clusterv1.Cluster, machine *clusterv1.Machine) ([]byte, error) {
+    // 生成 cloud-init user-data
+    // 包含：bkeagent 安装脚本 + 节点环境配置 + kubeconfig
+    template := &CloudInitTemplate{
+        AgentBinaryURL:    bkeCluster.Spec.AgentBinaryURL,
+        NodeEnvPackages:   []string{"lxcfs", "nfs-utils", "etcdctl", "helm"},
+        KubeConfig:        kubeconfigData,
+        ControlPlaneEndpoint: cluster.Spec.ControlPlaneEndpoint.Host,
+    }
+    return renderCloudInit(template)
+}
+```
+
+**（2）LoadBalancer 独立控制器**
+
+当前 `EnsureLoadBalance` 在 Phase 流程中同步执行，整改为：
+
+```go
+// controllers/loadbalancer/loadbalancer_controller.go
+func (r *LoadBalancerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    // 1. 监听 Cluster 对象
+    // 2. 当 Cluster 创建时，创建 haproxy/keepalived Static Pod 或 Deployment
+    // 3. 当 ControlPlaneEndpoint 变化时，更新 LB 配置
+    // 4. 设置 LoadBalancerReady Condition
+}
+```
+
+**（3）Addon 独立控制器（CAPI Add-on Provider 模式）**
+
+当前 `EnsureAddonDeploy` 在 Phase 流程中部署，整改为：
+
+```go
+// controllers/addon/addon_controller.go
+func (r *AddonReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    // 1. 监听 Cluster 对象 + Cluster 的 ControlPlaneInitialized Condition
+    // 2. 使用 Helm 或 Manifest 部署 Calico/CoreDNS/kube-proxy
+    // 3. 设置 AddonsReady Condition
+}
+```
+
+**（4）控制面/Worker 管理交给 CAPI 标准控制器**
+
+当前 `EnsureMasterInit/Join/Upgrade/Delete` 和 `EnsureWorkerJoin/Upgrade/Delete` 共 8 个 Phase，整改后全部由 CAPI 标准控制器接管：
+
+| 原 Phase | CAPI 替代方案 |
+|----------|-------------|
+| EnsureMasterInit | KCP 控制器检测 `ControlPlaneInitializedCondition` |
+| EnsureMasterJoin | KCP 控制器通过 `replicas` 自动 Join |
+| EnsureMasterUpgrade | KCP RollingUpdate 策略（`spec.rolloutStrategy`） |
+| EnsureMasterDelete | KCP 控制器减少 `replicas` + etcd 成员移除 |
+| EnsureWorkerJoin | MD 控制器通过 `replicas` 自动创建 Machine |
+| EnsureWorkerUpgrade | MD RollingUpdate 策略（`spec.strategy.rollingUpdate`） |
+| EnsureWorkerDelete | MD 控制器减少 `replicas` |
+| EnsureEtcdUpgrade | KCP 控制器自动处理 etcd 版本升级 |
+
+**（5）标准 Conditions 替代 PhaseStatus**
+
+当前使用自定义 `PhaseStatus []PhaseState`，整改为使用 CAPI 标准 Conditions：
+
+```go
+// 整改前
+BKECluster.Status.PhaseStatus = []PhaseState{
+    {Name: "EnsureBKEAgent", Status: "PhaseSucceeded"},
+    {Name: "EnsureMasterInit", Status: "PhaseRunning"},
+}
+
+// 整改后
+BKECluster.Status.Conditions = []clusterv1.Condition{
+    {Type: "InfrastructureReady", Status: "True"},
+    {Type: "ControlPlaneInitialized", Status: "True"},
+    {Type: "ControlPlaneReady", Status: "True"},
+    {Type: "WorkersReady", Status: "True"},
+    {Type: "AddonsReady", Status: "True"},
+    {Type: "Ready", Status: "True"},
+}
+```
+
+#### 11.3.4 Phase 整改分类汇总
+
+| 整改类别 | 涉及 Phase 数量 | 处理方式 |
+|---------|:-------------:|---------|
+| **删除**（由 CAPI 标准控制器替代） | 8 | EnsureMasterInit/Join/Upgrade/Delete, EnsureWorkerJoin/Upgrade/Delete, EnsureEtcdUpgrade |
+| **拆分**（独立控制器） | 4 | EnsureLoadBalance, EnsureAddonDeploy, EnsureNodesPostProcess, EnsureProviderSelfUpgrade |
+| **合并**（整合到现有/新控制器） | 5 | EnsureBKEAgent+EnsureNodesEnv→BKEBootstrap, EnsureAgentSwitch→BKECluster, EnsureContainerdUpgrade→NodeConfig, EnsureCluster→BKECluster, EnsureComponentUpgrade→OpenFuyao |
+| **保留**（框架级逻辑） | 5 | EnsureFinalizer, EnsurePaused, EnsureDeleteOrReset, EnsureDryRun, EnsureClusterManage |
+| **重写**（Bootstrap Provider） | 2 | EnsureBKEAgent, EnsureNodesEnv |
+| **拆分**（独立控制器） | 2 | EnsureAgentUpgrade, EnsureComponentUpgrade |
+
+### 11.4 Phase 整改工作量评估
+
+> **注**：因对旧有 Phase 实现细节不熟悉，需额外投入时间理解现有逻辑、梳理依赖关系、验证整改后行为一致性
+
+#### 11.4.1 删除类 Phase（由 CAPI 替代）
+
+| 原 Phase | 工作量 | 说明 |
+|----------|:------:|------|
+| EnsureMasterInit | 1 人天 | 验证 KCP 控制器可替代，删除 Phase 代码，更新测试 |
+| EnsureMasterJoin | 1 人天 | 验证 KCP 控制器可替代，删除 Phase 代码 |
+| EnsureMasterUpgrade | 1 人天 | 验证 KCP RollingUpdate 可替代，删除 Phase 代码 |
+| EnsureMasterDelete | 1 人天 | 验证 KCP 控制器可替代，删除 Phase 代码 |
+| EnsureWorkerJoin | 1 人天 | 验证 MD 控制器可替代，删除 Phase 代码 |
+| EnsureWorkerUpgrade | 1 人天 | 验证 MD RollingUpdate 可替代，删除 Phase 代码 |
+| EnsureWorkerDelete | 1 人天 | 验证 MD 控制器可替代，删除 Phase 代码 |
+| EnsureEtcdUpgrade | 1 人天 | 验证 KCP 控制器可替代，删除 Phase 代码 |
+| **小计** | **8 人天** | 主要为验证 + 删除 + 测试更新 |
+
+#### 11.4.2 拆分类 Phase（独立控制器）
+
+| 原 Phase | 目标控制器 | 工作量 | 说明 |
+|----------|-----------|:------:|------|
+| EnsureLoadBalance | LoadBalancer Controller | 4 人天 | 理解现有 LB 逻辑 → 创建独立控制器 → 监听 Cluster 事件 → 管理 haproxy/keepalived |
+| EnsureAddonDeploy | Addon Controller | 5 人天 | 理解现有 Addon 部署逻辑 → 创建独立控制器 → CAPI Add-on Provider 模式 → Helm/Manifest 支持 |
+| EnsureNodesPostProcess | NodePostProcess Controller | 3 人天 | 理解后处理脚本逻辑 → 创建独立控制器 → 监听 Machine Ready 事件 |
+| EnsureProviderSelfUpgrade | Provider Controller | 3 人天 | 理解 Provider 自升级逻辑 → 创建独立控制器 → 监听 Deployment 版本变化 |
+| EnsureAgentUpgrade | BKEAgent Controller | 4 人天 | 理解 Agent 升级逻辑 → 创建独立控制器 → 滚动更新策略 |
+| EnsureComponentUpgrade | OpenFuyao Controller | 4 人天 | 理解 openFuyao 组件升级逻辑 → 创建独立控制器 |
+| **小计** | | **23 人天** | 每个控制器需完整 Reconcile 循环 + Conditions + 测试 |
+
+#### 11.4.3 合并类 Phase（整合到其他控制器）
+
+| 原 Phase | 整合目标 | 工作量 | 说明 |
+|----------|---------|:------:|------|
+| EnsureBKEAgent + EnsureNodesEnv | BKEBootstrap Provider | 8 人天 | **核心整改**：从 SSH 推送改为 Bootstrap Provider → 生成 cloud-init → 测试各 OS 兼容性 |
+| EnsureAgentSwitch | BKECluster Controller | 2 人天 | 整合到 Post-Reconcile 逻辑 |
+| EnsureContainerdUpgrade | NodeConfig Controller（KEPU-2） | 3 人天 | 整合到声明式 NodeConfig 架构 |
+| EnsureCluster | BKECluster Controller | 3 人天 | 从 Phase 健康检查改为标准 Conditions |
+| EnsureComponentUpgrade | OpenFuyao Controller | 2 人天 | 与拆分类合并处理 |
+| **小计** | | **18 人天** | BKEBootstrap Provider 是最大工作量 |
+
+#### 11.4.4 保留类 Phase（框架级逻辑）
+
+| 原 Phase | 工作量 | 说明 |
+|----------|:------:|------|
+| EnsureFinalizer | 1 人天 | 从 Phase 模式改为标准 Controller Finalizer 模式 |
+| EnsurePaused | 1 人天 | 从 Phase 模式改为 annotation 监听模式 |
+| EnsureDeleteOrReset | 2 人天 | 从 Phase 模式改为 Finalizer 级联删除 |
+| EnsureDryRun | 1 人天 | 从 Phase 模式改为 dry-run annotation 模式 |
+| EnsureClusterManage | 3 人天 | 重构为 BKECluster Controller 的 Import 模式分支 |
+| EnsureCerts | 2 人天 | 从 Phase 模式改为 CAPI Secret 共享模式 |
+| EnsureClusterAPIObj | 2 人天 | 删除 Phase，验证 CAPI 自动创建 Cluster/KCP/MD |
+| **小计** | | **12 人天** | 框架级改造，需确保向后兼容 |
+
+#### 11.4.5 基础设施整改
+
+| 项目 | 工作量 | 说明 |
+|------|:------:|------|
+| PhaseFrame 框架重构 | 5 人天 | 简化 PhaseFrame 或替换为 Conditions 驱动模式 |
+| PhaseContext 重构 | 2 人天 | 从 PhaseContext 改为标准 Controller Context |
+| PhaseStatus → Conditions 迁移 | 3 人天 | 所有 Phase 状态迁移为 CAPI Conditions |
+| BKECluster Controller 重构 | 5 人天 | 从 PhaseFlow 执行改为多控制器协调 |
+| 集成测试框架更新 | 3 人天 | 更新测试以适配新控制器架构 |
+| 文档更新 | 2 人天 | 架构文档 + 迁移指南 |
+| **小计** | | **20 人天** | |
+
+#### 11.4.6 Phase 整改总计
+
+| 整改类别 | 工作量 |
+|---------|--------|
+| 删除类 Phase（CAPI 替代） | 8 人天 |
+| 拆分类 Phase（独立控制器） | 23 人天 |
+| 合并类 Phase（整合） | 18 人天 |
+| 保留类 Phase（框架级改造） | 12 人天 |
+| 基础设施整改 | 20 人天 |
+| **Phase 整改总计** | **81 人天** |
+
+### 11.5 Phase 整改风险评估
+
+| 风险 | 影响 | 缓解措施 |
+|------|------|---------|
+| CAPI 版本兼容性 | 高 | 锁定 CAPI 版本，在测试环境充分验证 KCP/MD 行为 |
+| Bootstrap Provider 兼容性 | 高 | 支持多种 OS 的 cloud-init 格式，提供回退机制 |
+| 删除 Phase 后行为不一致 | 中 | 保留 Phase 代码作为 fallback，Feature Gate 控制切换 |
+| 多控制器协调复杂度 | 中 | 使用 CAPI 标准 Conditions 作为协调信号，避免自定义状态 |
+| 迁移期数据一致性 | 高 | 提供迁移工具，将 PhaseStatus 转换为 Conditions |
+
 ## 12. 工作量评估
 
 ### 12.1 基础设施开发
@@ -2056,7 +2343,7 @@ cluster-api-provider-bke/
 | 兼容性测试 | Feature Gate 开关 + 旧 PhaseFlow 共存 | 2 人天 | 迁移期平滑过渡验证 |
 | **小计** | | **26 人天** | |
 
-### 12.6 总计
+### 12.6 总计（KEPU-2 声明式版本管理）
 | 阶段 | 工作量 |
 |------|--------|
 | 基础设施开发 | 35 人天 |
@@ -2064,7 +2351,14 @@ cluster-api-provider-bke/
 | Phase 迁移（旧 Phase 整改） | 46 人天 |
 | 升级/扩缩容/回滚全链路 | 18 人天 |
 | 测试 | 26 人天 |
-| **总计** | **160 人天** |
+| **KEPU-2 总计** | **160 人天** |
+
+### 12.7 总计（含 Phase 整改为 ClusterAPI 规范）
+| 阶段 | 工作量 |
+|------|--------|
+| KEPU-2 声明式版本管理 | 160 人天 |
+| Phase 整改为 ClusterAPI 规范（第 11 章） | 81 人天 |
+| **整体总计** | **241 人天** |
 ## 13. 风险评估
 | 风险 | 影响 | 缓解措施 |
 |------|------|---------|
