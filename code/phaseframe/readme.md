@@ -219,3 +219,62 @@ ClusterUnknown → ClusterInitializing → ClusterRunning
 - **YAML 类型**：从 `/manifests/kubernetes/` 读取 YAML 文件，使用 Server-Side Apply
 - **Chart 类型**：从 OCI 或 HTTP Chart 仓库拉取，使用 Helm SDK 安装
 
+# 分析phaseframe中哪些phase是通过判断image tag来进行升级的
+根据对 `phaseframe` 中各 Phase 代码的分析，通过判断 **image tag**（或镜像版本）来决定是否进行升级的 Phase 主要有以下几个：
+## 1. `EnsureProviderSelfUpgrade` (Provider 自升级)
+*   **判断逻辑**：在 `isProviderNeedUpgrade` 方法中，通过 `phaseutil.GetDeploymentImage` 获取当前 `bke-controller-manager` Deployment 的镜像，并与目标版本 `bke-manifests` 中解析出的 `targetImage` 进行对比。
+*   **关键代码**：
+    ```go
+    if currentImage == targetImage {
+        log.Info(..., "current image is already target image, skip self-upgrade, image: %s", currentImage)
+        return false
+    }
+    ```
+*   **触发条件**：仅当当前运行的 Provider 镜像与目标版本镜像不一致时触发。
+## 2. `EnsureAgentUpgrade` (Agent 升级)
+*   **判断逻辑**：在 `isBKEAgentDeployerNeedUpgrade` 方法中，调用 `GetDaemonsetImage` 获取当前 `bkeagent-deployer` DaemonSet 的镜像，并与 `PatchConfig` 中解析出的 `targetImage` 进行对比。
+*   **关键代码**：
+    ```go
+    if currentImage == targetImage {
+        log.Info(..., "this image is already target image，skip update, image: %s", currentImage)
+        return false
+    }
+    ```
+*   **触发条件**：当 `bkeagent-deployer` 的实际运行镜像与目标镜像不一致时触发。
+## 3. `EnsureComponentUpgrade` (核心组件升级)
+*   **判断逻辑**：虽然 `NeedExecute` 主要依赖 `isPatchVersion` 判断是否为补丁版本，但在执行阶段 `processImageUpdates` 中，会遍历 `PatchConfig` 中的镜像列表，通过 `updateSingleImage` 对比 Pod 当前镜像的 tag 与目标 tag。
+*   **关键代码**：
+    ```go
+    // updateSingleImage 中
+    tag := image.Tag[0]
+    // 后续通过 updatePodImageTag 查找匹配的 Pod 并替换 tag
+    ```
+*   **触发条件**：当检测到目标版本为补丁版本（Patch Version）且 `PatchConfig` 中包含镜像 tag 变更时触发。
+## 4. `EnsureEtcdUpgrade` (Etcd 升级)
+*   **判断逻辑**：在升级前会通过 `getEtcdImageVersion` 从 Etcd Pod 的镜像中提取当前版本 tag，并与 `BKECluster.Spec` 中的目标版本进行对比，决定是否跳过该节点的升级。
+*   **关键代码**：
+    ```go
+    version, err := e.getEtcdImageVersion(node)
+    if strings.Contains(bkeCluster.Spec.ClusterConfig.Cluster.EtcdVersion, version) {
+        return true, nil // skip
+    }
+    ```
+*   **触发条件**：节点上运行的 Etcd 镜像 tag 与期望版本不一致时触发。
+## 5. `EnsureContainerdUpgrade` (Containerd 升级)
+*   **判断逻辑**：虽然 `isContainerdNeedUpgrade` 主要对比 `Status.ContainerdVersion` 和 `Spec.ContainerdVersion` 的语义化版本，但其底层逻辑是基于组件版本的变更来触发重新部署（本质上是更新容器运行时镜像）。
+*   **关键代码**：
+    ```go
+    switch version.Compare(newv, oldv) {
+    case 1: // 目标版本大于当前版本
+        return true
+    }
+    ```
+## 总结
+| Phase 名称 | 对比对象 | 判断方式 |
+|:---|:---|:---|
+| **EnsureProviderSelfUpgrade** | `bke-controller-manager` Deployment 镜像 | 精确匹配完整镜像字符串 (`currentImage == targetImage`) |
+| **EnsureAgentUpgrade** | `bkeagent-deployer` DaemonSet 镜像 | 精确匹配完整镜像字符串 |
+| **EnsureComponentUpgrade** | 目标集群内各组件 Pod 镜像 | 匹配镜像名后缀并替换 Tag |
+| **EnsureEtcdUpgrade** | Etcd Static Pod 镜像 | 从镜像 URL 中提取 Tag 进行包含匹配 (`strings.Contains`) |
+
+这些 Phase 的共同点是：**不单纯依赖 BKECluster 的 Spec 字段变更，而是主动查询集群内实际运行的资源（Deployment/DaemonSet/Pod）的镜像状态，以此作为升级决策的最终依据**，确保了升级的幂等性和准确性。
