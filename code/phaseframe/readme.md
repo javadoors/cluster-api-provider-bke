@@ -278,3 +278,29 @@ ClusterUnknown → ClusterInitializing → ClusterRunning
 | **EnsureEtcdUpgrade** | Etcd Static Pod 镜像 | 从镜像 URL 中提取 Tag 进行包含匹配 (`strings.Contains`) |
 
 这些 Phase 的共同点是：**不单纯依赖 BKECluster 的 Spec 字段变更，而是主动查询集群内实际运行的资源（Deployment/DaemonSet/Pod）的镜像状态，以此作为升级决策的最终依据**，确保了升级的幂等性和准确性。
+
+# EnsureComponentUpgrade
+根据 `EnsureComponentUpgrade` 的代码逻辑，该 Phase 包含的组件**并不是硬编码在代码中的**，而是**动态**由版本补丁配置决定的。
+## 1. 核心结论
+**包含范围**：`EnsureComponentUpgrade` 负责升级 **openFuyao 平台核心组件**（非 Kubernetes 基础组件）。具体包含哪些组件，完全取决于管理集群中 `openfuyao-patch` 命名空间下的 `cm.<version>` ConfigMap 配置。
+## 2. 详细判定逻辑
+该 Phase 通过以下步骤确定要升级的组件：
+1.  **读取配置**：从 `openfuyao-patch` 命名空间获取对应版本的 ConfigMap (`cm.<version>`)。
+2.  **遍历镜像**：解析配置中的 `Repos` -> `SubImages` -> `Images` 列表。
+3.  **过滤 K8s 组件**：代码中显式排除了标记为 Kubernetes 的组件：
+    ```go
+    // ensure_component_upgrade.go:200
+    if repo.IsKubernetes {
+        return nil // k8s组件在其他流程升级
+    }
+    ```
+    这意味着 `kube-apiserver`, `kube-controller-manager`, `kube-scheduler`, `kubelet`, `kube-proxy` 等**不包含**在此 Phase 中（它们由 `EnsureMasterUpgrade` 处理）。
+4.  **匹配更新**：对于剩余的组件，根据其定义的 `UsedPodInfo`（包含 Namespace 和 PodPrefix）在目标集群中查找对应的 Pod，并更新其所属控制器（Deployment/StatefulSet/DaemonSet）的镜像 Tag。
+## 3. 典型包含的组件
+虽然列表是动态的，但在标准的 openFuyao 版本包中，通常包含以下类型的组件：
+*   **openfuyao-system-controller**：平台核心控制器。
+*   **openfuyao-web**：平台 UI 服务。
+*   **各类 Operator**：平台依赖的自定义控制器。
+*   **监控/日志组件**：如 Prometheus, Grafana 等（如果版本补丁涉及这些组件的镜像更新）。
+## 4. 总结
+`EnsureComponentUpgrade` 本质上是一个**通用的镜像更新器**，它负责处理**所有在补丁配置中声明且非 K8s 基础组件**的镜像 Tag 更新。
