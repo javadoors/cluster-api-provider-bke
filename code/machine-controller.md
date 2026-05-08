@@ -1067,4 +1067,28 @@ func (r *BKEMachineReconciler) logCommandFailed(...) string {
         
 4. **错误处理不完整**: 部分错误被忽略或只记录日志
 5. **缺乏重试限制**: 某些失败场景会无限重试
-        
+
+# BKEMachineReconciler监控哪些资源？
+根据 `bkemachine_controller.go` 中的 `SetupWithManager` 函数实现，`BKEMachineReconciler` 监控以下资源：
+## 1. 核心资源
+*   **`BKEMachine`**: 监控自身的创建、更新和删除事件。
+## 2. 关联资源 (Watches)
+*   **`Command`** (`agentv1beta1.Command`)
+    *   **触发条件**: 仅当 `Command` 是该 `BKEMachine` 所有（Controller Owner）且执行状态更新为完成（`CommandUpdateCompleted`）时触发。
+    *   **目的**: 用于处理节点引导（Bootstrap）逻辑。当 `Command` 执行完毕后，更新 `BKEMachine` 的 `Status.Bootstrapped` 状态。
+
+*   **`Machine`** (`clusterv1.Machine`)
+    *   **触发条件**: 当关联的 CAPI `Machine` 资源发生变化时。
+    *   **目的**: 同步 CAPI `Machine` 的状态到 `BKEMachine`。
+
+*   **`Cluster`** (`clusterv1.Cluster`)
+    *   **触发条件**: 仅当 CAPI `Cluster` 从**暂停状态恢复**（`ClusterUnPause`）时触发。
+    *   **目的**: 确保在集群恢复调和后，相关的 `BKEMachine` 也能继续执行。
+
+*   **`BKECluster`** (`bkev1beta1.BKECluster`)
+    *   **触发条件**: 当 `BKECluster` 满足以下任一条件时触发：
+        1.  **BKEAgent 就绪** (`BKEAgentReady`): 意味着节点上的 Agent 已准备好执行命令。
+        2.  **BKECluster 取消暂停** (`BKEClusterUnPause`): 集群恢复调和。
+    *   **目的**: 确保在基础设施就绪或集群恢复时，触发 `BKEMachine` 的调和以创建或执行 Bootstrap 命令。
+## 总结
+`BKEMachineReconciler` 不仅监控自身的 `BKEMachine` 资源，还深度依赖 `Command` 的执行结果以及 `Cluster`/`BKECluster` 的状态（特别是 Agent 就绪和暂停状态）来驱动节点的初始化和引导流程。
