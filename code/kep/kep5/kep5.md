@@ -106,29 +106,33 @@ kind: ComponentVersion
 metadata:
   name: kubernetes-v1.29.0
 spec:
-  name: kubernetes          # 新增：组件唯一标识
-  type: composite           # leaf | composite
-  version: v1.29.0          # 组件业务版本
-  inline:                   # 仅当为 inline 模式时存在
+  name: kubernetes
+  type: composite
+  version: v1.29.0
+  inline:
     handler: EnsureKubernetesUpgrade
     version: v1.0
-  subComponents:            # 组合组件包含的子组件元数据
+  subComponents:
     - name: kube-apiserver
       version: v1.29.0
-    - name: etcd
-      version: v3.5.12
   compatibility:
     constraints:
       - component: etcd
         rule: ">=3.5.10"
-  dependencies:             # 不再区分 install/upgrade，统一依赖列表
+  dependencies:
     - name: etcd
       phase: Upgrade
   upgradeStrategy:
     mode: Batch
     batchSize: 1
     timeout: "30m"
+    failurePolicy: FailFast  # FailFast | Continue | Rollback
 ```
+FailurePolicy 设计说明：
+- FailFast（默认）：当前组件升级失败，立即终止整个 DAG 执行，标记 UpgradeFailed。
+- Continue：跳过失败组件，记录 Warning，继续执行后续无依赖组件。适用于非核心组件。
+- Rollback：触发该组件的降级/卸载逻辑，恢复至上一稳定版本后继续 DAG。适用于核心组件。
+
 **Go 结构体定义**：
 ```go
 type ComponentVersionSpec struct {
@@ -277,6 +281,83 @@ Start
 └─────────────────────────────┘
 ```
 
+#### 4.5.1 SAT/CSP 兼容性求解设计
+**选型**：采用 `github.com/Masterminds/semver/v3` 进行语义化版本解析与约束匹配，结合轻量级 **CSP（约束满足问题）回溯算法**。K8s 生态中版本依赖本质是 CSP 而非布尔 SAT，回溯求解更贴合实际。
+**使用方法**：
+1. **变量定义**：每个组件为一个变量，定义域为其可用版本列表。
+2. **约束转换**：将 `rule: ">=3.5.10"` 转换为 `semver.Constraints` 对象。
+3. **拓扑排序**：按 `dependencies` 构建有向无环图，确定变量赋值顺序。
+4. **约束传播与回溯**：
+   - 按拓扑序依次为组件分配版本。
+   - 每次分配后，检查该组件的 `constraints` 是否与已分配的其他组件版本冲突。
+   - 若冲突，回溯至上一个组件尝试其他版本；若所有版本均冲突，返回 `Invalid` 并输出冲突路径。
+```go
+func SolveCompatibility(components []ComponentRef, store *ManifestStore) error {
+    vars := buildVariables(components, store)
+    constraints := buildConstraints(components, store)
+    order := topologicalSort(components)
+    
+    return backtrack(0, order, vars, constraints)
+}
+
+func backtrack(idx int, order []string, vars map[string]string, constraints map[string][]*semver.Constraints) error {
+    if idx == len(order) { return nil }
+    comp := order[idx]
+    for _, ver := range vars[comp].AvailableVersions {
+        if satisfiesConstraints(comp, ver, constraints, vars) {
+            vars[comp].Assigned = ver
+            if err := backtrack(idx+1, order, vars, constraints); err == nil {
+                return nil
+            }
+        }
+    }
+    return fmt.Errorf("no valid version for component %s", comp)
+}
+```
+
+#### 4.5.2 manifestStore 实现
+```go
+// pkg/manifest/store.go
+type ManifestStore struct {
+    cache   *sync.Map // key: "{name}@{version}" -> *ComponentVersion
+    ociClient *oci.Client
+}
+
+func (s *ManifestStore) Get(name, version string) (*ComponentVersion, error) {
+    key := fmt.Sprintf("%s@%s", name, version)
+    if val, ok := s.cache.Load(key); ok {
+        return val.(*ComponentVersion), nil
+    }
+    
+    // 1. 尝试从本地 bke-manifests 目录加载
+    localPath := fmt.Sprintf("/etc/bke/manifests/%s/%s/component.yaml", name, version)
+    if data, err := os.ReadFile(localPath); err == nil {
+        cv := &ComponentVersion{}
+        if yaml.Unmarshal(data, cv) == nil {
+            s.cache.Store(key, cv)
+            return cv, nil
+        }
+    }
+    
+    // 2. 降级：从 OCI 拉取对应层的 component.yaml
+    img, err := s.ociClient.Pull(fmt.Sprintf("registry/openfuyao-release:%s", version))
+    if err != nil { return nil, err }
+    
+    layer, err := img.GetLayerByPath(fmt.Sprintf("%s/%s/component.yaml", name, version))
+    if err != nil { return nil, err }
+    
+    cv := &ComponentVersion{}
+    if err := yaml.Unmarshal(layer.Content, cv); err != nil { return nil, err }
+    
+    s.cache.Store(key, cv)
+    return cv, nil
+}
+
+func (s *ManifestStore) GetReleaseImage(version string) (*ReleaseImage, error) {
+    // 类似逻辑，解析 OCI config.json 或 release.yaml
+    // ...
+}
+```
 ### 4.6 控制器架构与逻辑
 | 控制器 | 核心职责 | 协同方式 |
 |--------|---------|----------|
@@ -342,7 +423,7 @@ func (p *EnsureEtcdUpgrade) Version() string {
 }
 ```
 
-**Feature Gate 与 Context 实现**：
+#### 4.7.1 **Feature Gate 与 Context 实现**
 ```go
 // pkg/featuregate/features.go
 var featureGate = featuregate.NewFeatureGate()
@@ -370,6 +451,41 @@ func (p *BasePhase) GetVersionContext() *VersionContext {
     return p.Ctx.VersionContext
 }
 ```
+
+#### 4.7.2  VersionContext 数据结构与构建过程
+```go
+// pkg/upgrade/context.go
+type VersionContext struct {
+    mu      sync.RWMutex
+    Current map[string]string // 组件名 -> 当前运行版本
+    Target  map[string]string // 组件名 -> 目标期望版本
+}
+
+func NewVersionContext() *VersionContext {
+    return &VersionContext{
+        Current: make(map[string]string),
+        Target:  make(map[string]string),
+    }
+}
+
+func (vc *VersionContext) SetCurrent(name, ver string) {
+    vc.mu.Lock(); defer vc.mu.Unlock()
+    vc.Current[name] = ver
+}
+func (vc *VersionContext) SetTarget(name, ver string) {
+    vc.mu.Lock(); defer vc.mu.Unlock()
+    vc.Target[name] = ver
+}
+func (vc *VersionContext) GetTarget(name string) string {
+    vc.mu.RLock(); defer vc.mu.RUnlock()
+    return vc.Target[name]
+}
+```
+**构建过程**：
+1. `BKEClusterReconciler` 获取 `ClusterVersion.Spec.DesiredVersion`。
+2. 调用 `manifestStore.GetReleaseImage(desiredVer)` 获取目标 `ReleaseImage`，遍历 `spec.upgrade.components` 填充 `VersionContext.Target`。
+3. 获取 `ClusterVersion.Status.CurrentVersion`，调用 `manifestStore.GetReleaseImage(currentVer)` 获取当前 `ReleaseImage`，遍历填充 `VersionContext.Current`。
+4. 将构建好的 `VersionContext` 注入到 `BKECluster` 的 `PhaseContext` 中，供所有 Phase 调用 `GetVersionContext()` 使用。
 
 ## 5. 平滑升级方案（旧版到新版）
 ### 5.1 自动迁移方案
@@ -452,13 +568,14 @@ func CheckCompatibility(components []ComponentRef, manifestStore *ManifestStore)
 ## 8. 工作量评估（普通开发者）
 | 阶段 | 任务内容 | 工作量 (人天) | 说明 |
 |------|---------|:-------------:|------|
-| **1. CRD 与 API** | CV/RI/UP/ComponentVersion 定义、Webhook、DeepCopy | 7 | 熟悉 kubebuilder、验证规则、不可变约束 |
-| **2. OCI 解析层** | 镜像拉取、Config 解析、兼容性校验引擎、缓存机制 | 10 | 处理网络异常、鉴权、离线 fallback |
-| **3. 控制器开发** | CV/RI/UP 控制器逻辑、状态机、Annotation 协同机制 | 12 | controller-runtime 调谐循环与 Watch 配置 |
-| **4. DAG 引擎** | 依赖图构建、拓扑排序、安装/升级 DAG 分离、并发调度 | 10 | 需处理环检测、超时中断、批次策略 |
-| **5. Phase 适配** | 4 个 Phase YAML 化、`Version()` 接口实现、`NeedExecute` 改造、Factory 注册 | 8 | 调试上下文传递，保持原有逻辑兼容 |
-| **6. 迁移与测试** | 旧版平滑迁移逻辑、单元测试、集成测试、E2E、安全/性能压测 | 14 | 覆盖多场景、异常流、兼容性校验 |
-| **总计** | | **61 人天** | 含代码评审、联调缓冲与文档编写 |
+| **1. CRD 与 API** | CV/RI/UP/ComponentVersion 定义、Webhook、DeepCopy | 10 | 新手需学习 kubebuilder 脚手架、CRD 验证规则、不可变字段约束 |
+| **2. OCI 解析层** | `go-containerregistry` 集成、Config 解析、缓存机制 | 15 | 镜像分层拉取、鉴权配置、离线 fallback 调试耗时较长 |
+| **3. 控制器开发** | CV/RI/UP 控制器逻辑、状态机、Annotation 协同机制 | 18 | controller-runtime 调谐循环、Watch 过滤、Reconcile 幂等性设计 |
+| **4. DAG 引擎** | 依赖图构建、拓扑排序、FailurePolicy 分支、并发调度 | 14 | 图算法实现、环检测、并发安全与超时控制易出 Bug |
+| **5. Phase 适配** | 4 个 Phase YAML 化、`Version()` 接口、`NeedExecute` 改造、Factory 注册 | 10 | 上下文注入调试、旧逻辑兼容、单元测试覆盖 |
+| **6. CSP/SAT 求解** | 约束解析、回溯算法实现、兼容性校验集成 | 8 | 语义化版本库使用、约束冲突路径追踪、边界条件处理 |
+| **7. 迁移与测试** | 旧版平滑迁移、OCI 预构建流水线、E2E、压测、安全扫描 | 12 | 新手编写集成测试与 Mock 较慢，需反复联调 |
+| **总计** | | **87 人天** | 含代码评审、联调缓冲、文档编写 |
 
 ## 9. 架构图与流程图
 ### 9.1 控制器协同架构图
