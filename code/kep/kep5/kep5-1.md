@@ -105,6 +105,16 @@
 └──────────────────────────────────────────────────────────────────┘
 ```
 
+**Mermaid 格式**：
+
+```mermaid
+graph TD
+    BKECluster["BKECluster<br/>(集群实例，生命周期管理)"] -->|"1:1 OwnerReference"| CV["ClusterVersion<br/>spec.desiredVersion: v2.6.0<br/>status.currentVersion: v2.5.0<br/>status.currentReleaseImageRef: ri-v2.5.0"]
+    CV -->|"1:1 引用"| RI["ReleaseImage<br/>spec.version: v2.6.0<br/>spec.ociRef: registry/openfuyao-release:v2.6.0<br/>spec.install.components: [{name: k8s, ver: v1.29.0}, ...]<br/>spec.upgrade.components: [{name: provider, ver: v1.2.0}, ...]"]
+    RI -->|"按 name,version 定位"| Manifests["bke-manifests ComponentVersion 定义<br/>bke-manifests/kubernetes/v1.29.0/component.yaml<br/>bke-manifests/provider-upgrade/v1.0.0/component.yaml"]
+    UP["UpgradePath<br/>spec.ociRef: registry/openfuyao-upgradepath:latest<br/>paths: [{from: v2.5.0, to: v2.6.0, blocked: false}]"]
+```
+
 ### 4.2 ComponentVersion 数据结构设计
 
 ```yaml
@@ -281,38 +291,57 @@ spec:
 
 **监控机制**：
 
+```txt
+┌─────────────────────────────────────────────────────────┐
+│              UpgradePath Digest Monitor                 │
+├─────────────────────────────────────────────────────────┤
+│ 1. 定时轮询 (默认 5m)                                    │
+│    ├─ 调用 registry HEAD 请求获取当前 digest             │
+│    ├─ 对比缓存中的 lastKnownDigest                       │
+│    ├─ 相同 → 跳过                                       │
+│    └─ 不同 → 触发重新拉取与解析                          │
+│                                                         │
+│ 2. Digest 变更处理流程                                   │
+│    ├─ 拉取最新 latest 镜像                              │
+│    ├─ 解析 paths.yaml 为 UpgradePath CR                │
+│    ├─ 校验路径合法性 (环检测、版本格式)                  │
+│    ├─ 更新内存图索引 (UpgradePathGraph)                 │
+│    ├─ 同步至 Kubernetes CR (单 CR 更新)                 │
+│    └─ 更新 lastKnownDigest 与 lastCheckedAt             │
+│                                                         │
+│ 3. 异常处理                                             │
+│    ├─ 拉取失败 → 保留旧 digest，记录 Warning 事件        │
+│    ├─ 解析失败 → 标记 CR Status.Phase=Invalid           │
+│    └─ 连续 3 次失败 → 发送告警通知                       │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Mermaid 格式**：
+
 ```mermaid
 flowchart TD
-    subgraph Monitor["UpgradePath Digest Monitor"]
-        direction TB
-        A1["1. 定时轮询 (默认 5m)"]
-        A2["调用 registry HEAD 请求获取当前 digest"]
-        A3["对比缓存中的 lastKnownDigest"]
-        A4{相同?}
-        A5["跳过"]
-        A6["触发重新拉取与解析"]
-        
-        B1["2. Digest 变更处理流程"]
-        B2["拉取最新 latest 镜像"]
-        B3["解析 paths.yaml 为 UpgradePath CR"]
-        B4["校验路径合法性 (环检测、版本格式)"]
-        B5["更新内存图索引 (UpgradePathGraph)"]
-        B6["同步至 Kubernetes CR (单 CR 更新)"]
-        B7["更新 lastKnownDigest 与 lastCheckedAt"]
-        
-        C1["3. 异常处理"]
-        C2["拉取失败 → 保留旧 digest，记录 Warning 事件"]
-        C3["解析失败 → 标记 CR Status.Phase=Invalid"]
-        C4["连续 3 次失败 → 发送告警通知"]
-    end
-
-    A1 --> A2 --> A3 --> A4
-    A4 -->|是| A5
-    A4 -->|否| A6 --> B1 --> B2 --> B3 --> B4 --> B5 --> B6 --> B7
+    Start([开始]) --> Poll["定时轮询 默认5m"]
+    Poll --> HeadReq["调用 registry HEAD 请求获取当前 digest"]
+    HeadReq --> Compare{"对比 lastKnownDigest"}
+    Compare -->|"相同"| Skip["跳过"]
+    Compare -->|"不同"| Pull["拉取最新 latest 镜像"]
     
-    C1 --> C2
-    C1 --> C3
-    C1 --> C4
+    Pull --> Parse["解析 paths.yaml 为 UpgradePath CR"]
+    Parse --> Validate["校验路径合法性<br/>环检测、版本格式"]
+    Validate --> UpdateGraph["更新内存图索引 UpgradePathGraph"]
+    UpdateGraph --> SyncCR["同步至 Kubernetes CR 单 CR 更新"]
+    SyncCR --> UpdateDigest["更新 lastKnownDigest 与 lastCheckedAt"]
+    UpdateDigest --> End([结束])
+    
+    Skip --> End
+    
+    Pull -.->|"拉取失败"| RetainDigest["保留旧 digest<br/>记录 Warning 事件"]
+    Parse -.->|"解析失败"| MarkInvalid["标记 CR Status.Phase=Invalid"]
+    RetainDigest --> RetryCount{"连续失败次数"}
+    MarkInvalid --> RetryCount
+    RetryCount -->|">=3次"| Alert["发送告警通知"]
+    RetryCount -->|"<3次"| End
+    Alert --> End
 ```
 
 **代码实现**：
@@ -505,24 +534,50 @@ const (
 
 **兼容性算法流程图**：
 
+```txt
+Start
+  │
+  ▼
+┌─────────────────────────────┐
+│ 1. 扁平化 ReleaseImage      │
+│    展开所有 composite       │
+│    生成 FlatList            │
+└──────────────┬──────────────┘
+               │
+               ▼
+┌─────────────────────────────┐
+│ 2. 提取 Compatibility       │
+│    构建约束矩阵              │
+│    G = (V, E_constraints)   │
+└──────────────┬──────────────┘
+               │
+               ▼
+┌─────────────────────────────┐
+│ 3. SAT 求解引擎             │
+│    ├─ 语义化版本区间求交    │
+│    ├─ 约束冲突检测          │
+│    └─ 依赖环检测            │
+└──────────────┬──────────────┘
+               │
+               ▼
+┌─────────────────────────────┐
+│ 4. 结果判定                  │
+│    ├─ 无冲突 → Valid        │
+│    └─ 有冲突 → Invalid      │
+│       返回冲突路径与规则     │
+└─────────────────────────────┘
+```
+
+**Mermaid 格式**：
+
 ```mermaid
 flowchart TD
     Start([Start]) --> Step1["1. 扁平化 ReleaseImage<br/>展开所有 composite<br/>生成 FlatList"]
-    Step1 --> Step2["2. 提取 Compatibility<br/>构建约束矩阵<br/>G = (V, E_constraints)"]
-    Step2 --> Step3["3. SAT 求解引擎"]
-    
-    subgraph SAT["SAT Solver"]
-        direction TB
-        S1["语义化版本区间求交"]
-        S2["约束冲突检测"]
-        S3["依赖环检测"]
-    end
-    
-    Step3 --> SAT
-    SAT --> Step4["4. 结果判定"]
-    
-    Step4 -->|无冲突| Valid["Valid"]
-    Step4 -->|有冲突| Invalid["Invalid<br/>返回冲突路径与规则"]
+    Step1 --> Step2["2. 提取 Compatibility<br/>构建约束矩阵<br/>G = V, E_constraints"]
+    Step2 --> Step3["3. SAT 求解引擎<br/>语义化版本区间求交<br/>约束冲突检测<br/>依赖环检测"]
+    Step3 --> Step4{"4. 结果判定"}
+    Step4 -->|"无冲突"| Valid["Valid"]
+    Step4 -->|"有冲突"| Invalid["Invalid<br/>返回冲突路径与规则"]
 ```
 
 #### 4.5.1 SAT/CSP 兼容性求解设计
@@ -582,33 +637,71 @@ func CheckCompatibility(components []ComponentRef, manifestStore *ManifestStore)
 
 **架构设计**：
 
+```txt
+┌─────────────────────────────────────────────────────────┐
+│                    Caller (Reconciler)                  │
+└────────────────────────┬────────────────────────────────┘
+                         │ Get(name, version)
+                         ▼
+┌─────────────────────────────────────────────────────────┐
+│                   ManifestStore                         │
+│  ┌───────────────────────────────────────────────────┐  │
+│  │ 1. 检查内存缓存 (sync.Map)                         │  │
+│  │    ├─ Hit → 直接返回                              │  │
+│  │    └─ Miss → 继续                                 │  │
+│  └───────────────────────┬───────────────────────────┘  │
+│                          │                               │
+│  ┌───────────────────────▼───────────────────────────┐  │
+│  │ 2. 尝试本地文件系统                                │  │
+│  │    /etc/bke/manifests/{name}/{version}/           │  │
+│  │    ├─ 存在 → 解析 YAML → 写入缓存 → 返回           │  │
+│  │    └─ 不存在 → 继续                               │  │
+│  └───────────────────────┬───────────────────────────┘  │
+│                          │                               │
+│  ┌───────────────────────▼───────────────────────────┐  │
+│  │ 3. OCI 远程拉取                                   │  │
+│  │    registry/openfuyao-release:{version}           │  │
+│  │    ├─ 拉取镜像 → 提取 layer → 解析 YAML            │  │
+│  │    ├─ 写入缓存 → 返回                             │  │
+│  │    └─ 失败 → 返回错误                             │  │
+│  └───────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Mermaid 格式**：
+
 ```mermaid
 flowchart TD
-    Caller["Caller (Reconciler)"] -->|"Get(name, version)"| MS["ManifestStore"]
+    Caller["Caller Reconciler"] -->|"Get name, version "| MS["ManifestStore"]
     
-    subgraph MS["ManifestStore"]
-        direction TB
-        Step1["1. 检查内存缓存 (sync.Map)"]
-        Hit{"Hit?"}
-        Return1["直接返回"]
+    subgraph MS ["ManifestStore"]
+        CheckCache["1. 检查内存缓存 sync.Map"]
+        CacheHit{"Hit?"}
+        CacheReturn["直接返回"]
         
-        Step2["2. 尝试本地文件系统<br/>/etc/bke/manifests/{name}/{version}/"]
-        Exists{"存在?"}
-        ParseLocal["解析 YAML → 写入缓存 → 返回"]
+        CheckLocal["2. 尝试本地文件系统<br/>/etc/bke/manifests/name/version/"]
+        LocalExists{"存在?"}
+        ParseYaml["解析 YAML 写入缓存 返回"]
         
-        Step3["3. OCI 远程拉取<br/>registry/openfuyao-release:{version}"]
-        PullOCI["拉取镜像 → 提取 layer → 解析 YAML"]
-        CacheOCI["写入缓存 → 返回"]
-        Fail["返回错误"]
+        CheckOCI["3. OCI 远程拉取<br/>registry/openfuyao-release:version"]
+        PullOCI["拉取镜像 提取 layer 解析 YAML"]
+        OciSuccess{"成功?"}
+        OciReturn["写入缓存 返回"]
+        OciError["返回错误"]
     end
     
-    Caller --> MS
-    MS --> Step1 --> Hit
-    Hit -->|是| Return1
-    Hit -->|否| Step2 --> Exists
-    Exists -->|是| ParseLocal
-    Exists -->|否| Step3 --> PullOCI --> CacheOCI
-    PullOCI -->|失败| Fail
+    CheckCache --> CacheHit
+    CacheHit -->|"是"| CacheReturn
+    CacheHit -->|"否"| CheckLocal
+    
+    CheckLocal --> LocalExists
+    LocalExists -->|"是"| ParseYaml
+    LocalExists -->|"否"| CheckOCI
+    
+    CheckOCI --> PullOCI
+    PullOCI --> OciSuccess
+    OciSuccess -->|"是"| OciReturn
+    OciSuccess -->|"否"| OciError
 ```
 
 **代码实现**：
@@ -703,53 +796,89 @@ func (s *ManifestStore) GetReleaseImage(version string) (*ReleaseImage, error) {
 
 **图模型设计**：
 
+```txt
+                    UpgradePath Graph
+         ┌──────────────────────────────────┐
+         │                                  │
+    ┌────▼────┐      ┌────▼────┐      ┌────▼────┐
+    │ v2.4.0  │────▶│ v2.5.0  │─────▶│ v2.6.0  │
+    │         │  edge│         │  edge│         │
+    └─────────┘      └─────────┘      └─────────┘
+         │                                ▲
+         │                                │
+         │          ┌─────────────┐       │
+         └────────▶│  (blocked)  │───────┘
+                    └─────────────┘
+              v2.4.0 → v2.6.0 direct edge (blocked)
+```
+
+**Mermaid 格式**：
+
 ```mermaid
 graph TD
-    v240["v2.4.0"] -->|"edge"| v250["v2.5.0"]
-    v250 -->|"edge"| v260["v2.6.0"]
-    v240 -->|"blocked"| v260
-    
-    classDef blocked fill:#ffcccc,stroke:#ff0000;
-    class v260 blocked;
+    subgraph UpgradePathGraph["UpgradePath Graph"]
+        V240["v2.4.0"] -->|"edge"| V250["v2.5.0"]
+        V250 -->|"edge"| V260["v2.6.0"]
+        V240 -.->|"blocked"| Blocked["blocked"]
+        Blocked -.-> V260
+    end
+    style Blocked fill:#f99,stroke:#333
 ```
 
 **路径查找算法 (BFS 最短路径)**：
 
+```txt
+┌─────────────────────────────────────────────────────────┐
+│ FindUpgradePath(from, to)                               │
+├─────────────────────────────────────────────────────────┤
+│ 1. 初始化                                                │
+│    ├─ queue ← [(from, [from])]                          │
+│    ├─ visited ← {from}                                  │
+│    └─ parentMap ← map[string]string                     │
+│                                                         │
+│ 2. BFS 遍历                                              │
+│    while queue not empty:                               │
+│      ├─ curr, path ← dequeue(queue)                     │
+│      ├─ if curr == to: return path (找到最短路径)        │
+│      ├─ for each edge in graph.GetEdgesFrom(curr):      │
+│        ├─ if edge.Blocked: continue                     │
+│        ├─ nextVer := edge.To                            │
+│        ├─ if nextVer in visited: continue               │
+│        ├─ visited.Add(nextVer)                          │
+│        ├─ parentMap[nextVer] = curr                     │
+│        └─ enqueue(queue, (nextVer, path + [nextVer]))   │
+│                                                         │
+│ 3. 路径重建                                              │
+│    └─ 从 to 沿 parentMap 回溯到 from，反转得到完整路径   │
+│                                                         │
+│ 4. 未找到                                                │
+│    └─ return nil, "no valid upgrade path"               │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Mermaid 格式**：
+
 ```mermaid
 flowchart TD
-    Start(["FindUpgradePath(from, to)"]) --> Init["1. 初始化<br/>queue ← [(from, [from])]<br/>visited ← {from}<br/>parentMap ← map[string]string"]
+    Start([FindUpgradePath from, to]) --> Init["1. 初始化<br/>queue ← from, from<br/>visited ← from<br/>parentMap ← map"]
+    Init --> QueueCheck{"2. queue 为空?"}
+    QueueCheck -->|"是"| NotFound["4. 未找到<br/>return nil<br/>no valid upgrade path"]
+    QueueCheck -->|"否"| Dequeue["curr, path ← dequeue queue"]
+    Dequeue --> IsTarget{"curr == to?"}
+    IsTarget -->|"是"| Found["return path<br/>找到最短路径"]
+    IsTarget -->|"否"| GetEdges["获取 curr 的所有出边"]
+    GetEdges --> EdgeLoop{"遍历每条 edge"}
+    EdgeLoop -->|"edge.Blocked"| Continue["continue"]
+    EdgeLoop -->|"未 Blocked"| NextVer["nextVer := edge.To"]
+    NextVer --> VisitedCheck{"nextVer in visited?"}
+    VisitedCheck -->|"是"| Continue
+    VisitedCheck -->|"否"| AddVisited["visited.Add nextVer<br/>parentMap nextVer = curr<br/>enqueue nextVer, path+nextVer"]
+    AddVisited --> QueueCheck
+    Continue --> QueueCheck
     
-    Init --> BFS["2. BFS 遍历"]
-    
-    subgraph BFSLoop["BFS Loop"]
-        direction TB
-        CheckQueue{"queue not empty?"}
-        Dequeue["curr, path ← dequeue(queue)"]
-        CheckTarget{"curr == to?"}
-        ReturnPath["return path (找到最短路径)"]
-        GetEdges["for each edge in graph.GetEdgesFrom(curr)"]
-        CheckBlocked{"edge.Blocked?"}
-        Continue1["continue"]
-        NextVer["nextVer := edge.To"]
-        CheckVisited{"nextVer in visited?"}
-        Continue2["continue"]
-        AddVisited["visited.Add(nextVer)"]
-        SetParent["parentMap[nextVer] = curr"]
-        Enqueue["enqueue(queue, (nextVer, path + [nextVer]))"]
-    end
-    
-    BFS --> BFSLoop
-    CheckQueue -->|是| Dequeue --> CheckTarget
-    CheckTarget -->|是| ReturnPath
-    CheckTarget -->|否| GetEdges --> CheckBlocked
-    CheckBlocked -->|是| Continue1 --> CheckQueue
-    CheckBlocked -->|否| NextVer --> CheckVisited
-    CheckVisited -->|是| Continue2 --> CheckQueue
-    CheckVisited -->|否| AddVisited --> SetParent --> Enqueue --> CheckQueue
-    CheckQueue -->|否| NoPath["return nil, 'no valid upgrade path'"]
-    
-    ReturnPath --> End(["End"])
-    NoPath --> End
+    Found --> Rebuild["3. 路径重建<br/>从 to 沿 parentMap 回溯到 from<br/>反转得到完整路径"]
+    Rebuild --> End([结束])
+    NotFound --> End
 ```
 
 **代码实现**：
@@ -908,32 +1037,53 @@ func (g *UpgradePathGraph) DetectCycle() error {
 
 **调谐流程**：
 
+```txt
+┌─────────────────────────────────────────────────────────────┐
+│ ClusterVersionReconciler.Reconcile()                        │
+├─────────────────────────────────────────────────────────────┤
+│ 1. 获取 ClusterVersion 实例                                  │
+│ 2. 检查是否已关联 ReleaseImage                               │
+│    ├─ 未关联 → 调用 manifestStore.GetReleaseImage()         │
+│    │         → 创建/更新 ReleaseImage 引用                   │
+│    └─ 已关联 → 验证引用有效性                                │
+│ 3. 获取 UpgradePath (图查找)                                 │
+│    ├─ 调用 upgradePathGraph.FindPath(current, target)       │
+│    ├─ BFS 查找最短路径 → 返回路径边列表                      │
+│    └─ 检查路径中是否有 blocked 边 → 若拦截则标记 Blocked     │
+│ 4. 执行预检                                                  │
+│    ├─ 兼容性校验 (调用 ReleaseImageReconciler 的验证逻辑)    │
+│    └─ 失败 → 标记 Status.Phase=PreCheckFailed               │
+│ 5. 触发 BKECluster 调谐                                      │
+│    └─ 写入 Annotation: cvo.openfuyao.cn/upgrade-ready       │
+│ 6. 更新 Status                                               │
+│    └─ CurrentVersion, DesiredVersion, Phase                 │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Mermaid 格式**：
+
 ```mermaid
 flowchart TD
-    Start(["ClusterVersionReconciler.Reconcile()"]) --> Step1["1. 获取 ClusterVersion 实例"]
-    Step1 --> Step2["2. 检查是否已关联 ReleaseImage"]
+    Start([ClusterVersionReconciler.Reconcile]) --> Step1["1. 获取 ClusterVersion 实例"]
+    Step1 --> Step2{"2. 已关联 ReleaseImage?"}
+    Step2 -->|"未关联"| GetRI["调用 manifestStore.GetReleaseImage<br/>创建/更新 ReleaseImage 引用"]
+    Step2 -->|"已关联"| ValidateRI["验证引用有效性"]
+    GetRI --> Step3
+    ValidateRI --> Step3
     
-    Step2 -->|未关联| CreateRI["调用 manifestStore.GetReleaseImage()<br/>创建/更新 ReleaseImage 引用"]
-    Step2 -->|已关联| VerifyRI["验证引用有效性"]
+    Step3["3. 获取 UpgradePath 图查找<br/>调用 upgradePathGraph.FindPath current, target<br/>BFS 查找最短路径 返回路径边列表"] --> CheckBlocked{"检查路径中是否有 blocked 边?"}
+    CheckBlocked -->|"有 blocked"| MarkBlocked["标记 Blocked"]
+    CheckBlocked -->|"无 blocked"| Step4
     
-    CreateRI --> Step3
-    VerifyRI --> Step3["3. 获取 UpgradePath (图查找)"]
+    Step4["4. 执行预检<br/>兼容性校验<br/>调用 ReleaseImageReconciler 的验证逻辑"] --> PreCheckResult{"预检通过?"}
+    PreCheckResult -->|"失败"| MarkPreCheckFailed["标记 Status.Phase=PreCheckFailed"]
+    PreCheckResult -->|"通过"| Step5
     
-    Step3 --> FindPath["调用 upgradePathGraph.FindPath(current, target)<br/>BFS 查找最短路径 → 返回路径边列表"]
-    FindPath --> CheckBlocked["检查路径中是否有 blocked 边<br/>若拦截则标记 Blocked"]
+    Step5["5. 触发 BKECluster 调谐<br/>写入 Annotation<br/>cvo.openfuyao.cn/upgrade-ready"] --> Step6["6. 更新 Status<br/>CurrentVersion, DesiredVersion, Phase"]
     
-    CheckBlocked --> Step4["4. 执行预检"]
-    Step4 --> CompatCheck["兼容性校验 (调用 ReleaseImageReconciler 的验证逻辑)"]
-    CompatCheck -->|失败| Fail["标记 Status.Phase=PreCheckFailed"]
-    
-    CompatCheck -->|成功| Step5["5. 触发 BKECluster 调谐"]
-    Step5 --> WriteAnnotation["写入 Annotation: cvo.openfuyao.cn/upgrade-ready"]
-    
-    WriteAnnotation --> Step6["6. 更新 Status"]
-    Step6 --> UpdateStatus["CurrentVersion, DesiredVersion, Phase"]
-    
-    Fail --> End(["End"])
-    UpdateStatus --> End
+    MarkBlocked --> End([结束])
+    MarkPreCheckFailed --> End
+    Step6 --> End
 ```
 
 **核心代码**：
@@ -994,31 +1144,52 @@ func (r *ClusterVersionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 **调谐流程**：
 
+```txt
+┌─────────────────────────────────────────────────────────────┐
+│ ReleaseImageReconciler.Reconcile()                          │
+├─────────────────────────────────────────────────────────────┤
+│ 1. 获取 ReleaseImage 实例                                    │
+│ 2. 验证 OCI 镜像                                             │
+│    ├─ 拉取镜像 (若未缓存)                                    │
+│    ├─ 验证 Cosign 签名                                       │
+│    └─ 失败 → 标记 Status.Phase=Invalid                      │
+│ 3. 解析组件清单                                              │
+│    ├─ 遍历 spec.install.components 和 spec.upgrade.components│
+│    ├─ 调用 manifestStore.Get() 获取每个 ComponentVersion    │
+│    └─ 缺失 → 标记 Status.Phase=ManifestMissing              │
+│ 4. 兼容性校验                                                │
+│    ├─ 扁平化所有组件 (展开 composite)                        │
+│    ├─ 构建约束图                                             │
+│    ├─ 调用 CheckCompatibility() 执行 CSP 求解               │
+│    └─ 冲突 → 标记 Status.Phase=CompatibilityFailed          │
+│ 5. 更新 Status                                               │
+│    └─ Phase=Valid, ComponentCount, ValidatedAt              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Mermaid 格式**：
+
 ```mermaid
 flowchart TD
-    Start(["ReleaseImageReconciler.Reconcile()"]) --> Step1["1. 获取 ReleaseImage 实例"]
-    Step1 --> Step2["2. 验证 OCI 镜像"]
+    Start([ReleaseImageReconciler.Reconcile]) --> Step1["1. 获取 ReleaseImage 实例"]
+    Step1 --> Step2["2. 验证 OCI 镜像<br/>拉取镜像 若未缓存<br/>验证 Cosign 签名"]
+    Step2 --> OciValid{"OCI 验证通过?"}
+    OciValid -->|"失败"| MarkInvalid["标记 Status.Phase=Invalid"]
+    OciValid -->|"通过"| Step3
     
-    Step2 --> PullVerify["拉取镜像 (若未缓存)<br/>验证 Cosign 签名"]
-    PullVerify -->|失败| Invalid["标记 Status.Phase=Invalid"]
+    Step3["3. 解析组件清单<br/>遍历 spec.install.components<br/>和 spec.upgrade.components<br/>调用 manifestStore.Get 获取每个 ComponentVersion"] --> ManifestCheck{"组件清单完整?"}
+    ManifestCheck -->|"缺失"| MarkMissing["标记 Status.Phase=ManifestMissing"]
+    ManifestCheck -->|"完整"| Step4
     
-    PullVerify -->|成功| Step3["3. 解析组件清单"]
-    Step3 --> ParseComponents["遍历 spec.install.components 和 spec.upgrade.components<br/>调用 manifestStore.Get() 获取每个 ComponentVersion"]
-    ParseComponents -->|缺失| Missing["标记 Status.Phase=ManifestMissing"]
+    Step4["4. 兼容性校验<br/>扁平化所有组件 展开 composite<br/>构建约束图<br/>调用 CheckCompatibility 执行 CSP 求解"] --> CompatCheck{"兼容性通过?"}
+    CompatCheck -->|"冲突"| MarkCompatFailed["标记 Status.Phase=CompatibilityFailed"]
+    CompatCheck -->|"通过"| Step5
     
-    ParseComponents -->|成功| Step4["4. 兼容性校验"]
-    Step4 --> Flatten["扁平化所有组件 (展开 composite)"]
-    Flatten --> BuildGraph["构建约束图"]
-    BuildGraph --> CSP["调用 CheckCompatibility() 执行 CSP 求解"]
-    CSP -->|冲突| CompatFail["标记 Status.Phase=CompatibilityFailed"]
+    Step5["5. 更新 Status<br/>Phase=Valid, ComponentCount, ValidatedAt"] --> End([结束])
     
-    CSP -->|成功| Step5["5. 更新 Status"]
-    Step5 --> UpdateStatus["Phase=Valid, ComponentCount, ValidatedAt"]
-    
-    Invalid --> End(["End"])
-    Missing --> End
-    CompatFail --> End
-    UpdateStatus --> End
+    MarkInvalid --> End
+    MarkMissing --> End
+    MarkCompatFailed --> End
 ```
 
 **核心代码**：
@@ -1070,23 +1241,36 @@ func (r *ReleaseImageReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 **调谐流程**：
 
+```txt
+┌─────────────────────────────────────────────────────────────┐
+│ UpgradePathReconciler.Reconcile()                           │
+├─────────────────────────────────────────────────────────────┤
+│ 1. 获取 UpgradePath CR (单 CR)                               │
+│ 2. 验证路径规则                                              │
+│    ├─ 检查所有 edges 的 from/to 版本格式 (semver 合规)       │
+│    ├─ 构建临时图 → 执行环检测                                │
+│    └─ 失败 → 标记 Status.Phase=Invalid                      │
+│ 3. 更新路径图索引                                            │
+│    └─ graph.LoadFromEdges(cr.Spec.Paths, cr.Status.Digest)  │
+│ 4. 更新 Status                                              │
+│    └─ Phase=Active, PathCount, LastDigest                   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Mermaid 格式**：
+
 ```mermaid
 flowchart TD
-    Start(["UpgradePathReconciler.Reconcile()"]) --> Step1["1. 获取 UpgradePath CR (单 CR)"]
-    Step1 --> Step2["2. 验证路径规则"]
+    Start([UpgradePathReconciler.Reconcile]) --> Step1["1. 获取 UpgradePath CR 单 CR"]
+    Step1 --> Step2["2. 验证路径规则<br/>检查所有 edges 的 from/to 版本格式 semver 合规<br/>构建临时图 执行环检测"]
+    Step2 --> ValidCheck{"验证通过?"}
+    ValidCheck -->|"失败"| MarkInvalid["标记 Status.Phase=Invalid"]
+    ValidCheck -->|"通过"| Step3
     
-    Step2 --> ValidateVersion["检查所有 edges 的 from/to 版本格式 (semver 合规)"]
-    ValidateVersion --> CycleCheck["构建临时图 → 执行环检测"]
-    CycleCheck -->|失败| Invalid["标记 Status.Phase=Invalid"]
+    Step3["3. 更新路径图索引<br/>graph.LoadFromEdges cr.Spec.Paths, cr.Status.Digest"] --> Step4["4. 更新 Status<br/>Phase=Active, PathCount, LastDigest"]
+    Step4 --> End([结束])
     
-    CycleCheck -->|成功| Step3["3. 更新路径图索引"]
-    Step3 --> LoadGraph["graph.LoadFromEdges(cr.Spec.Paths, cr.Status.Digest)"]
-    
-    LoadGraph --> Step4["4. 更新 Status"]
-    Step4 --> UpdateStatus["Phase=Active, PathCount, LastDigest"]
-    
-    Invalid --> End(["End"])
-    UpdateStatus --> End
+    MarkInvalid --> End
 ```
 
 **核心代码**：
@@ -1256,7 +1440,7 @@ func (vc *VersionContext) GetTarget(name string) string {
 │ BKEClusterReconciler.buildVersionContext(bc)                │
 ├─────────────────────────────────────────────────────────────┤
 │ 1. 获取 ClusterVersion                                      │
-│    └─ cv := GetClusterVersionForBKECluster(bc)              │
+│    └─ cv := GetClusterVersionsForBKECluster(bc)              │
 │                                                             │
 │ 2. 构建 Target 版本映射                                      │
 │    ├─ desiredVer := cv.Spec.DesiredVersion                  │
@@ -1281,18 +1465,84 @@ func (vc *VersionContext) GetTarget(name string) string {
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**流程图**：
+**Mermaid 格式**：
 
 ```mermaid
 flowchart TD
-    Start([Start]) --> Step1["获取 ClusterVersion 实例<br/>(通过 OwnerReference 关联)"]
-    Step1 --> Step2["读取 DesiredVersion<br/>调用 manifestStore<br/>.GetReleaseImage(desired)"]
-    Step2 --> Step3["遍历 ReleaseImage<br/>.Spec.Install.Components<br/>.Spec.Upgrade.Components<br/>填充 VersionContext.Target"]
-    Step3 --> Step4["读取 CurrentVersion<br/>调用 manifestStore<br/>.GetReleaseImage(current)"]
-    Step4 --> Step5["遍历 ReleaseImage<br/>.Spec.Install.Components<br/>.Spec.Upgrade.Components<br/>填充 VersionContext.Current"]
-    Step5 --> Step6["将 VersionContext 注入到<br/>BKECluster.PhaseContext"]
-    Step6 --> Step7["返回 VersionContext<br/>供 DAG 调度器使用"]
-    Step7 --> End([End])
+    Start([BKEClusterReconciler.buildVersionContext]) --> Step1["1. 获取 ClusterVersion<br/>cv := GetClusterVersionsForBKECluster bc"]
+    Step1 --> Step2["2. 构建 Target 版本映射<br/>desiredVer := cv.Spec.DesiredVersion<br/>targetRI := manifestStore.GetReleaseImage desiredVer<br/>遍历 targetRI.Spec.Upgrade 和 Install<br/>vCtx.SetTarget component.Name, component.Version"]
+    Step2 --> Step3["3. 构建 Current 版本映射<br/>currentVer := cv.Status.CurrentVersion<br/>currentRI := manifestStore.GetReleaseImage currentVer<br/>遍历 currentRI.Spec.Upgrade 和 Install<br/>vCtx.SetCurrent component.Name, component.Version"]
+    Step3 --> Step4["4. 注入到 PhaseContext<br/>bc.PhaseContext.VersionContext = vCtx"]
+    Step4 --> Step5["5. 返回 VersionContext"]
+    Step5 --> End([结束])
+```
+
+**流程图**：
+
+```txt
+Start
+  │
+  ▼
+┌─────────────────────────────┐
+│ 获取 ClusterVersion 实例     │
+│ (通过 OwnerReference 关联)   │
+└──────────────┬──────────────┘
+               │
+               ▼
+┌─────────────────────────────┐
+│ 读取 DesiredVersion         │
+│ 调用 manifestStore          │
+│ .GetReleaseImage(desired)   │
+└──────────────┬──────────────┘
+               │
+               ▼
+┌─────────────────────────────┐
+│ 遍历 ReleaseImage           │
+│ .Spec.Install.Components    │
+│ .Spec.Upgrade.Components    │
+│ 填充 VersionContext.Target   │
+└──────────────┬──────────────┘
+               │
+               ▼
+┌─────────────────────────────┐
+│ 读取 CurrentVersion         │
+│ 调用 manifestStore          │
+│ .GetReleaseImage(current)   │
+└──────────────┬──────────────┘
+               │
+               ▼
+┌─────────────────────────────┐
+│ 遍历 ReleaseImage           │
+│ .Spec.Install.Components    │
+│ .Spec.Upgrade.Components    │
+│ 填充 VersionContext.Current │
+└──────────────┬──────────────┘
+               │
+               ▼
+┌─────────────────────────────┐
+│ 将 VersionContext 注入到     │
+│ BKECluster.PhaseContext     │
+└──────────────┬──────────────┘
+               │
+               ▼
+┌─────────────────────────────┐
+│ 返回 VersionContext         │
+│ 供 DAG 调度器使用            │
+└─────────────────────────────┘
+```
+
+**Mermaid 格式**：
+
+```mermaid
+flowchart TD
+    Start([Start]) --> GetCV["获取 ClusterVersion 实例<br/>通过 OwnerReference 关联"]
+    GetCV --> ReadDesired["读取 DesiredVersion<br/>调用 manifestStore.GetReleaseImage desired"]
+    ReadDesired --> FillTarget["遍历 ReleaseImage<br/>Spec.Install.Components<br/>Spec.Upgrade.Components<br/>填充 VersionContext.Target"]
+    FillTarget --> ReadCurrent["读取 CurrentVersion<br/>调用 manifestStore.GetReleaseImage current"]
+    ReadCurrent --> FillCurrent["遍历 ReleaseImage<br/>Spec.Install.Components<br/>Spec.Upgrade.Components<br/>填充 VersionContext.Current"]
+    FillCurrent --> Inject["将 VersionContext 注入到<br/>BKECluster.PhaseContext"]
+    Inject --> Return["返回 VersionContext<br/>供 DAG 调度器使用"]
+    Return --> End([结束])
 ```
 
 #### 4.7.3 升级前资源预创建扩展机制
@@ -1319,6 +1569,17 @@ flowchart TD
 │  DAG 执行顺序:                                           │
 │  pre-upgrade-resources → provider-upgrade → etcd-upgrade │
 └─────────────────────────────────────────────────────────┘
+```
+
+**Mermaid 格式**：
+
+```mermaid
+flowchart TD
+    subgraph RI["ReleaseImage 升级组件声明"]
+        direction TB
+        PreUpgrade["pre-upgrade-resources v1.0.0<br/>新增组件"] --> ProviderUpgrade["provider-upgrade v1.2.0"]
+        ProviderUpgrade --> EtcdUpgrade["etcd-upgrade v3.5.12"]
+    end
 ```
 
 **ComponentVersion 定义**：
@@ -1547,20 +1808,35 @@ upgrade:
 
 **在 DAG 中的执行流程**：
 
+```txt
+┌─────────────────────────────────────────────────────────┐
+│              升级 DAG 执行顺序                            │
+├─────────────────────────────────────────────────────────┤
+│                                                         │
+│  Batch 1:  pre-upgrade-resources                        │
+│            ├─ 创建 ConfigMap: bke-new-feature-config    │
+│            └─ 创建 Secret: bke-new-cert                 │
+│                 │                                       │
+│                 ▼                                       │
+│  Batch 2:  provider-upgrade                             │
+│            └─ 依赖 Batch 1 完成                          │
+│                 │                                       │
+│                 ▼                                       │
+│  Batch 3:  etcd-upgrade                                 │
+│            └─ 依赖 Batch 1 完成                          │
+│                                                         │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Mermaid 格式**：
+
 ```mermaid
 flowchart TD
     subgraph DAG["升级 DAG 执行顺序"]
         direction TB
-        Batch1["Batch 1: pre-upgrade-resources"]
-        CreateCM["创建 ConfigMap: bke-new-feature-config"]
-        CreateSecret["创建 Secret: bke-new-cert"]
-        
-        Batch2["Batch 2: provider-upgrade<br/>依赖 Batch 1 完成"]
-        
-        Batch3["Batch 3: etcd-upgrade<br/>依赖 Batch 1 完成"]
+        Batch1["Batch 1: pre-upgrade-resources<br/>创建 ConfigMap: bke-new-feature-config<br/>创建 Secret: bke-new-cert"] --> Batch2["Batch 2: provider-upgrade<br/>依赖 Batch 1 完成"]
+        Batch2 --> Batch3["Batch 3: etcd-upgrade<br/>依赖 Batch 1 完成"]
     end
-    
-    Batch1 --> CreateCM --> CreateSecret --> Batch2 --> Batch3
 ```
 
 **NeedExecute 触发逻辑**：
@@ -1678,59 +1954,64 @@ func (p *EnsurePreUpgradeResources) provisionResource(ctx context.Context, spec 
 
 ### 8.1 控制器协同架构图
 
-```mermaid
-flowchart TD
-    User["用户/CI"] -->|"ClusterVersion.Spec.DesiredVersion = 'v2.6.0'"| CV["ClusterVersionReconciler"]
-    
-    subgraph CVR["ClusterVersionReconciler"]
-        direction TB
-        CV1["拉取 ReleaseImage OCI 解析为 CR"]
-        CV2["通过 UpgradePathGraph.FindPath() 查找升级路径"]
-        CV3["校验 CompatibilityMatrix"]
-        CV4["写入 BKECluster Annotation: upgrade-ready=v2.6.0"]
-    end
-    
-    CV --> CV1 --> CV2 --> CV3 --> CV4
-    
-    CV4 -->|"触发调谐"| BC["BKEClusterReconciler (增强)"]
-    
-    subgraph BCR["BKEClusterReconciler (增强)"]
-        direction TB
-        BC1["捕获 Annotation 变更"]
-        BC2["判断 Install/Upgrade 场景"]
-        BC3["构建 VersionContext (Current vs Target Components)"]
-        BC4["执行 PreUpgradeResourcePhase (预创建 ConfigMap/Secret)"]
-        BC5["解析 ComponentVersion 依赖 → 构建独立 DAG"]
-        BC6["按拓扑顺序调用 Phase，注入 VersionContext"]
-    end
-    
-    BC --> BC1 --> BC2 --> BC3 --> BC4 --> BC5 --> BC6
-    
-    BC6 -->|"执行升级"| CF["ComponentFactory / PhaseFrame"]
-    
-    subgraph CFSub["ComponentFactory / PhaseFrame"]
-        direction TB
-        CF1["Resolve(name, ver) 获取 inline Handler"]
-        CF2["NeedExecute() 中比对版本"]
-        CF3["版本不同 → 执行原有逻辑"]
-        CF4["版本相同 → 跳过，标记 Succeeded"]
-    end
-    
-    CF --> CF1 --> CF2 --> CF3
-    CF2 --> CF4
+```txt
+用户/CI ──▶ ClusterVersion.Spec.DesiredVersion = "v2.6.0"
+               │
+               ▼
+┌─────────────────────────────────────────────────────────────┐
+│ ClusterVersionReconciler                                    │
+│  • 拉取 ReleaseImage OCI 解析为 CR                           │
+│  • 通过 UpgradePathGraph.FindPath() 查找升级路径             │
+│  • 校验 CompatibilityMatrix                                 │
+│  • 写入 BKECluster Annotation: upgrade-ready=v2.6.0         │
+└──────────────────────────┬──────────────────────────────────┘
+                           │ 触发调谐
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│ BKEClusterReconciler (增强)                                 │
+│  • 捕获 Annotation 变更                                     │
+│  • 判断 Install/Upgrade 场景                                │
+│  • 构建 VersionContext (Current vs Target Components)       │
+│  • 执行 PreUpgradeResourcePhase (预创建 ConfigMap/Secret)   │
+│  • 解析 ComponentVersion 依赖 → 构建独立 DAG                 │
+│  • 按拓扑顺序调用 Phase，注入 VersionContext                 │
+└──────────────────────────┬──────────────────────────────────┘
+                           │ 执行升级
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│ ComponentFactory / PhaseFrame                               │
+│  • Resolve(name, ver) 获取 inline Handler                   │
+│  • NeedExecute() 中比对版本                                  │
+│  • 版本不同 → 执行原有逻辑                                   │
+│  • 版本相同 → 跳过，标记 Succeeded                          │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│ UpgradePathReconciler + DigestMonitor                       │
+│  • 监控 OCI latest digest 变更 (5m 轮询)                    │
+│  • 解析 paths.yaml → 构建 UpgradePathGraph                  │
+│  • 环检测 + 路径校验                                        │
+│  • 单 CR 聚合所有升级路径                                   │
+└─────────────────────────────────────────────────────────────┘
 ```
+
+**Mermaid 格式**：
 
 ```mermaid
 flowchart TD
-    subgraph UPR["UpgradePathReconciler + DigestMonitor"]
-        direction TB
-        UP1["监控 OCI latest digest 变更 (5m 轮询)"]
-        UP2["解析 paths.yaml → 构建 UpgradePathGraph"]
-        UP3["环检测 + 路径校验"]
-        UP4["单 CR 聚合所有升级路径"]
-    end
+    User["用户/CI"] -->|"ClusterVersion.Spec.DesiredVersion = v2.6.0"| CVRec["ClusterVersionReconciler<br/>拉取 ReleaseImage OCI 解析为 CR<br/>通过 UpgradePathGraph.FindPath 查找升级路径<br/>校验 CompatibilityMatrix<br/>写入 BKECluster Annotation: upgrade-ready=v2.6.0"]
     
-    UP1 --> UP2 --> UP3 --> UP4
+    CVRec -->|"触发调谐"| BCRec["BKEClusterReconciler 增强<br/>捕获 Annotation 变更<br/>判断 Install/Upgrade 场景<br/>构建 VersionContext Current vs Target Components<br/>执行 PreUpgradeResourcePhase 预创建 ConfigMap/Secret<br/>解析 ComponentVersion 依赖 构建独立 DAG<br/>按拓扑顺序调用 Phase 注入 VersionContext"]
+    
+    BCRec -->|"执行升级"| Factory["ComponentFactory / PhaseFrame<br/>Resolve name, ver 获取 inline Handler<br/>NeedExecute 中比对版本<br/>版本不同 执行原有逻辑<br/>版本相同 跳过 标记 Succeeded"]
+    
+    UPRec["UpgradePathReconciler + DigestMonitor<br/>监控 OCI latest digest 变更 5m 轮询<br/>解析 paths.yaml 构建 UpgradePathGraph<br/>环检测 + 路径校验<br/>单 CR 聚合所有升级路径"] -.->|"提供路径查询"| CVRec
+    
+    style User fill:#e1f5e1
+    style CVRec fill:#fff3cd
+    style BCRec fill:#fff3cd
+    style Factory fill:#d1ecf1
+    style UPRec fill:#f8d7da
 ```
 
 ## 9. 测试计划与验收标准
