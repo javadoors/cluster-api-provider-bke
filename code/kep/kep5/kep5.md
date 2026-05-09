@@ -11,7 +11,7 @@
 | **依赖** | 现有 PhaseFrame 架构、bke-manifests 镜像构建流程 |
 
 ## 1. 摘要
-本提案引入 `ClusterVersion`、`ReleaseImage` 与 `UpgradePath` 三个核心 CRD，借鉴 OpenShift CVO 的声明式版本管理理念，结合 `bke-manifests` 作为组件清单物理载体，实现 openFuyao 集群的版本升级。方案保持现有 `BKEClusterReconciler` 的 Phase 编排逻辑不变，通过 OCI 镜像分发版本清单与升级路径，并在现有 Phase 的 `NeedExecute()` 接口中注入版本比对逻辑，实现“有变更则升级，无变更则跳过”的幂等执行。版本声明、清单校验、路径管控与执行编排解耦，支持组件独立演进与平滑迁移。
+本提案引入 `ClusterVersion`、`ReleaseImage` 与 `UpgradePath` 三个核心 CRD，借鉴 OpenShift CVO 的声明式版本管理理念，结合 OCI 镜像分发版本清单与升级路径，实现 openFuyao 集群的版本升级。方案保持现有 `BKEClusterReconciler` 的 Phase 编排逻辑不变，通过增强 Phase 的 `NeedExecute()` 接口注入版本比对逻辑，实现“有变更则升级，无变更则跳过”的幂等执行。版本声明、清单校验、路径管控与执行编排解耦，支持组件独立演进与平滑迁移。
 
 ## 2. 动机
 | 问题 | 现状 | 影响 |
@@ -289,16 +289,16 @@ Start
 └─────────────────────────────────────┘
 ```
 
-## 6. 工作量评估
+## 6. 工作量评估 (新手)
 | 阶段 | 任务内容 | 工作量 (人天) | 说明 |
 |------|---------|:-------------:|------|
-| **1. CRD 与基础框架** | `ClusterVersion`/`ReleaseImage`/`UpgradePath` 定义、Webhook、DeepCopy | 6 | 包含 API 规范、验证规则、不可变约束 |
-| **2. OCI 解析层** | 镜像拉取模块、Config 解析、Store 接口、缓存机制 | 6 | 兼容现有镜像目录结构 |
-| **3. 控制器开发** | CV/UP 控制器核心逻辑、状态机、事件协同机制 | 10 | 独立调谐，解耦设计 |
-| **4. BKECluster 增强** | 差异计算模块、依赖排序、Phase 桥接、升级历史记录 | 10 | 核心编排逻辑，保证幂等 |
-| **5. Phase 适配** | 4 个 Phase 改造 `NeedExecute`，注入版本比对逻辑 | 5 | 保持原有逻辑，仅替换入口决策 |
-| **6. 测试与验证** | 单元测试、集成测试、E2E 升级/回滚、Feature Gate 灰度 | 8 | 覆盖多场景与异常流 |
-| **总计** | | **45 人天** | 按 2 名高级开发并行估算 |
+| **1. CRD 与基础框架** | `ClusterVersion`/`ReleaseImage`/`UpgradePath` 定义、Webhook、DeepCopy | 8 | 新手需熟悉 kubebuilder、API 规范、验证规则 |
+| **2. OCI 解析层** | 镜像拉取模块、Config 解析、Store 接口、缓存机制 | 10 | 需学习 `go-containerregistry` 库，处理网络异常 |
+| **3. 控制器开发** | CV/UP 控制器核心逻辑、状态机、事件协同机制 | 18 | 需深入理解 controller-runtime、Watch 机制 |
+| **4. BKECluster 增强** | 差异计算模块、依赖排序、Phase 桥接、升级历史记录 | 15 | 需理解现有 BKECluster 逻辑，避免破坏原有流程 |
+| **5. Phase 适配** | 4 个 Phase 改造 `NeedExecute`，注入版本比对逻辑 | 10 | 需熟悉 PhaseFrame 架构，调试上下文注入 |
+| **6. 测试与验证** | 单元测试、集成测试、E2E 升级/回滚、Feature Gate 灰度 | 14 | 新手编写测试用例较慢，需覆盖多场景与异常流 |
+| **总计** | | **75 人天** | 按 1 名新手开发估算，含学习与调试时间 |
 
 ## 7. 风险与缓解
 | 风险 | 影响 | 缓解措施 |
