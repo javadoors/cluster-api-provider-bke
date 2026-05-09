@@ -45,7 +45,7 @@
 | CRD 定义与注册 | `ClusterVersion`、`ReleaseImage`、`UpgradePath` API 定义 |
 | `bke-manifests` 扩展 | 新增 `ComponentVersion` 元数据规范与目录结构 |
 | 控制器实现 | 版本声明器、清单验证器、DAG 调度器 |
-| 升级路径与兼容性 | 规则引擎、拦截机制、前置/后置检查、约束求解算法 |
+| 升级路径与兼容性 | 规则引擎、拦截机制、约束求解算法 |
 | Phase 适配 | `NeedExecute` 上下文注入、`inline` 映射、`Version()` 接口、ComponentFactory 注册 |
 | 生产级保障 | 异常恢复、性能优化、安全加固、水平扩展 |
 
@@ -89,13 +89,13 @@
 ┌──────────────────────────────────────────────────────────────────┐
 │              bke-manifests (ComponentVersion 定义)               │
 │  bke-manifests/kubernetes/v1.29.0/component.yaml                 │
-│  包含: type, version, inline, subComponents, compatibility...    │
+│  bke-manifests/provider-upgrade/v1.0.0/component.yaml            │
 └──────────────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────────────┐
 │                       UpgradePath                                │
 │  spec.ociRef: registry/openfuyao-upgradepath:latest              │
-│  paths: [{from: v2.5.0, to: v2.6.0, blocked: false, checks: ...}]│
+│  paths: [{from: v2.5.0, to: v2.6.0, blocked: false}]             │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -106,61 +106,45 @@ kind: ComponentVersion
 metadata:
   name: kubernetes-v1.29.0
 spec:
-  type: composite  # leaf | composite
-  version: v1.29.0  # 组件业务版本（新增，替代原 defaultVersion）
-  inline:           # 仅当为 inline 模式时存在，嵌入 handler 与代码版本
-    handler: EnsureKubernetesUpgrade  # 映射 Phase 注册标识
-    version: v1.0   # Phase 代码版本（新增）
-  # 组合组件包含的子组件元数据（用于兼容性检查）
-  subComponents:
+  name: kubernetes          # 新增：组件唯一标识
+  type: composite           # leaf | composite
+  version: v1.29.0          # 组件业务版本
+  inline:                   # 仅当为 inline 模式时存在
+    handler: EnsureKubernetesUpgrade
+    version: v1.0
+  subComponents:            # 组合组件包含的子组件元数据
     - name: kube-apiserver
-      version: v1.29.0
-    - name: kube-controller-manager
       version: v1.29.0
     - name: etcd
       version: v3.5.12
-  # 兼容性约束
   compatibility:
     constraints:
       - component: etcd
         rule: ">=3.5.10"
-      - component: containerd
-        rule: ">=1.7.0"
-  # 依赖约束（区分安装与升级）
-  dependencies:
-    install:
-      - name: containerd
-        phase: Install
-      - name: etcd
-        phase: Install
-    upgrade:
-      - name: etcd
-        phase: Upgrade
-  # 升级策略设计（仅设计，不在此阶段实现）
+  dependencies:             # 不再区分 install/upgrade，统一依赖列表
+    - name: etcd
+      phase: Upgrade
   upgradeStrategy:
-    mode: Batch  # Serial | Parallel | Batch
+    mode: Batch
     batchSize: 1
-    maxUnavailable: 0
-    preCheck: "etcdctl endpoint health --cluster"
-    postCheck: "kubectl get nodes --no-headers | grep -v Ready"
     timeout: "30m"
-    retryPolicy: ExponentialBackoff
 ```
 **Go 结构体定义**：
 ```go
 type ComponentVersionSpec struct {
+    Name            string              `json:"name"`
     Type            ComponentType       `json:"type"`
-    Version         string              `json:"version"`           // 组件业务版本
-    Inline          *InlineSpec         `json:"inline,omitempty"`  // inline 模式配置
+    Version         string              `json:"version"`
+    Inline          *InlineSpec         `json:"inline,omitempty"`
     SubComponents   []SubComponent      `json:"subComponents,omitempty"`
     Compatibility   CompatibilitySpec   `json:"compatibility,omitempty"`
-    Dependencies    DependencySpec      `json:"dependencies,omitempty"`
+    Dependencies    []Dependency        `json:"dependencies,omitempty"`
     UpgradeStrategy UpgradeStrategySpec `json:"upgradeStrategy,omitempty"`
 }
 
 type InlineSpec struct {
-    Handler string `json:"handler"` // Phase 注册标识
-    Version string `json:"version"` // Phase 代码版本
+    Handler string `json:"handler"`
+    Version string `json:"version"`
 }
 ```
 
@@ -175,21 +159,16 @@ type ComponentFactory struct {
 type ComponentInstance struct {
     Name    string
     Version string
-    Mode    ExecutionMode // inline | external
-    Handler PhaseExecutor // inline 模式下的 Go 实例
+    Handler PhaseExecutor // 注册的即为 inline 模式，无需 ExecutionMode
 }
 
-// 注册代码实现的 Phase
 func (f *ComponentFactory) Register(name, version string, handler PhaseExecutor) {
     f.mu.Lock()
     defer f.mu.Unlock()
     key := fmt.Sprintf("%s@%s", name, version)
-    f.registry[key] = ComponentInstance{
-        Name: name, Version: version, Mode: ModeInline, Handler: handler,
-    }
+    f.registry[key] = ComponentInstance{Name: name, Version: version, Handler: handler}
 }
 
-// 解析组件实例，支持 inline 模式匹配
 func (f *ComponentFactory) Resolve(name, version string, inline *InlineSpec) (*ComponentInstance, error) {
     if inline != nil {
         key := fmt.Sprintf("%s@%s", inline.Handler, inline.Version)
@@ -197,41 +176,38 @@ func (f *ComponentFactory) Resolve(name, version string, inline *InlineSpec) (*C
             return &inst, nil
         }
     }
-    // fallback 到外部 YAML 解析逻辑
     return nil, fmt.Errorf("component %s@%s not found", name, version)
 }
 ```
 **Phase 重构清单**：
-| Phase 名称 | 重构方式 | bke-manifests 映射 | Mode | 接口增强 |
-|-----------|---------|-------------------|------|----------|
-| `EnsureProviderSelfUpgrade` | 转为 YAML 清单 | `phases/provider-upgrade/v1.0.0/component.yaml` | `external` | 无 |
-| `EnsureAgentUpgrade` | 转为 YAML 清单 | `phases/bkeagent-upgrade/v1.0.0/component.yaml` | `external` | 无 |
-| `EnsureComponentUpgrade` | 转为 YAML 清单 | `phases/component-upgrade/v1.0.0/component.yaml` | `external` | 无 |
-| `EnsureEtcdUpgrade` | 转为 YAML 清单 | `phases/etcd-upgrade/v1.0.0/component.yaml` | `external` | 无 |
-| 其他代码 Phase | 增加 `Version()` 接口，注册至 Factory | 不生成 YAML，直接通过注册表映射 | `inline` | `Version() string`, `NeedExecute()` 增强 |
+| Phase 名称 | 重构方式 | bke-manifests 映射 | 接口增强 |
+|-----------|---------|-------------------|----------|
+| `EnsureProviderSelfUpgrade` | 转为 YAML 清单 | `provider-upgrade/v1.0.0/component.yaml` | 无 |
+| `EnsureAgentUpgrade` | 转为 YAML 清单 | `bkeagent-upgrade/v1.0.0/component.yaml` | 无 |
+| `EnsureComponentUpgrade` | 转为 YAML 清单 | `component-upgrade/v1.0.0/component.yaml` | 无 |
+| `EnsureEtcdUpgrade` | 转为 YAML 清单 | `etcd-upgrade/v1.0.0/component.yaml` | 无 |
+| 其他代码 Phase | 增加 `Version()` 接口，注册至 Factory | 不生成 YAML | `Version() string`, `NeedExecute()` 增强 |
 
 ### 4.4 bke-manifests 目录与 OCI 镜像设计
 #### 4.4.1 bke-manifests 目录规范
-取消原有硬编码目录，统一按 `(name, version)` 路由：
+取消 `phases` 层，统一放在第一层：
 ```
 bke-manifests/
 ├── kubernetes/
 │   ├── v1.28.0/
-│   │   └── component.yaml      # ComponentVersion 元数据
+│   │   └── component.yaml
 │   └── v1.29.0/
 │       └── component.yaml
 ├── etcd/
 │   └── v3.5.12/
 │       └── component.yaml
-└── phases/
-    └── provider-upgrade/
-        └── v1.0.0/
-            └── component.yaml  # type: composite, version: v1.0.0, inline: {handler: EnsureProviderSelfUpgrade, version: v1.0}
+└── provider-upgrade/
+    └── v1.0.0/
+        └── component.yaml
 ```
 
 #### 4.4.2 ReleaseImage OCI 样例 (YAML)
 ```yaml
-# registry/openfuyao-release:v2.6.0 (layer/release.yaml)
 version: "v2.6.0"
 ociRef: "registry/openfuyao-release:v2.6.0"
 install:
@@ -240,48 +216,66 @@ install:
       version: v1.29.0
     - name: etcd
       version: v3.5.12
-    - name: bkeagent
-      version: v2.6.0
 upgrade:
   components:
     - name: provider-upgrade
       version: v1.2.0
-    - name: component-upgrade
-      version: v1.1.0
-    - name: etcd-upgrade
-      version: v3.5.12
 ```
-**解析流程**：`ClusterVersionReconciler` 通过 `go-containerregistry` 拉取 OCI Config/Layer → 反序列化为 `ReleaseImageSpec` → 创建/更新 CR。每个版本独立镜像，支持离线 `skopeo copy` 到本地仓库。
 
 #### 4.4.3 UpgradePath OCI 样例 (YAML)
 ```yaml
-# registry/openfuyao-upgradepath:latest (layer/paths.yaml)
 paths:
   - from: "v2.5.0"
     to: "v2.6.0"
     blocked: false
-    preCheck:
-      type: script
-      command: "etcdctl endpoint health --cluster"
-    postCheck:
-      type: api
-      resource: nodes
-      condition: Ready
-  - from: "v2.4.0"
-    to: "v2.6.0"
-    blocked: true
-    reason: "跨大版本升级存在 etcd 数据迁移风险，请先升级至 v2.5.0"
 ```
-仅保留 `latest` 标签，控制器按需拉取并缓存至内存。路径规则可动态热更新，无需重建 ReleaseImage。
+*(注：preCheck/postCheck 暂不实现)*
 
 ### 4.5 升级路径与兼容性算法设计
 **组件扁平化与兼容性检查算法**：
 1. **收集与扁平化**：遍历 `ReleaseImage` 中所有组件，若为 `composite` 类型，递归展开 `subComponents` 至叶子组件列表 `FlatList`。
-2. **构建约束图**：为 `FlatList` 中每个组件解析 `compatibility.constraints`，构建有向约束图 `G=(V,E)`，边表示 `A requires B >= x.y.z`。
-3. **版本解析与冲突检测**：
-   - 使用语义化版本库（如 `semver`）对约束进行 SAT 求解。
-   - 若存在环或约束冲突（如 `etcd>=3.5.10` 但目标为 `3.4.9`），标记 `Invalid` 并返回冲突路径。
-4. **预检拦截**：在 `ReleaseImageReconciler` 中执行静态校验；在 `BKEClusterReconciler` DAG 执行前执行运行时校验（比对实际集群状态）。
+2. **构建约束图**：为 `FlatList` 中每个组件解析 `compatibility.constraints`，构建有向约束图 `G=(V,E)`。
+3. **SAT 求解具体过程**：
+   - **变量转换**：将每个组件版本转换为语义化版本约束集合。例如 `etcd: ">=3.5.10"` 转换为区间 `[3.5.10, ∞)`。
+   - **区间求交**：对同一组件的多个约束进行区间交集运算。若交集为空，则直接判定冲突。
+   - **依赖图遍历**：按拓扑顺序遍历组件，将已解析的版本代入后续组件的约束中。若出现 `A requires B>=x` 但 `B` 已锁定为 `<x` 的版本，则触发回溯或报错。
+   - **最终赋值**：若所有约束均满足且无环，返回 `Valid`；否则返回冲突组件对与具体规则。
+4. **预检拦截**：在 `ReleaseImageReconciler` 中执行静态校验；在 `BKEClusterReconciler` DAG 执行前执行运行时校验。
+
+**兼容性算法流程图**：
+```
+Start
+  │
+  ▼
+┌─────────────────────────────┐
+│ 1. 扁平化 ReleaseImage      │
+│    展开所有 composite       │
+│    生成 FlatList            │
+└──────────────┬──────────────┘
+               │
+               ▼
+┌─────────────────────────────┐
+│ 2. 提取 Compatibility       │
+│    构建约束矩阵             │
+│    G = (V, E_constraints)   │
+└──────────────┬──────────────┘
+               │
+               ▼
+┌─────────────────────────────┐
+│ 3. SAT 求解引擎             │
+│    ├─ 语义化版本区间求交    │
+│    ├─ 约束冲突检测          │
+│    └─ 依赖环检测            │
+└──────────────┬──────────────┘
+               │
+               ▼
+┌─────────────────────────────┐
+│ 4. 结果判定                 │
+│    ├─ 无冲突 → Valid        │
+│    └─ 有冲突 → Invalid      │
+│       返回冲突路径与规则    │
+└─────────────────────────────┘
+```
 
 ### 4.6 控制器架构与逻辑
 | 控制器 | 核心职责 | 协同方式 |
@@ -289,23 +283,29 @@ paths:
 | **ClusterVersionReconciler** | 版本声明管理、ReleaseImage/UpgradePath OCI 拉取与解析、触发 BKECluster 调谐 | 更新 BKECluster Annotation `cvo.openfuyao.cn/upgrade-ready` |
 | **ReleaseImageReconciler** | 清单校验、兼容性矩阵验证、bke-manifests 路径验证、状态标记 | 独立调谐，更新 `Status.Phase` |
 | **UpgradePathReconciler** | 路径规则验证、拦截/废弃状态维护、使用统计 | 提供 `FindUpgradePath()` 接口供 CV 调用 |
-| **BKEClusterReconciler** (增强) | 监听版本变更、构建 VersionContext、DAG 调度、Phase 桥接、状态回写 | 直接 Watch CV；调用 Phase 注入上下文；更新 CV Status |
+| **BKEClusterReconciler** (增强) | 监听版本变更、构建 VersionContext、DAG 调度、Phase 桥接、状态回写 | 直接 Watch CV；从 ComponentFactory 获取 Phase；更新 CV Status |
 
-**核心代码片段 (DAG 调度)**：
+**核心代码片段 (DAG 调度与 Factory 调用)**：
 ```go
 func (r *BKEClusterReconciler) executeDAG(ctx context.Context, bc *bkev1beta1.BKECluster, dag *topology.DAG, scenario string) error {
     vCtx := r.buildVersionContext(bc)
     for _, batch := range dag.TopologicalSort() {
         var errs []error
         for _, compName := range batch {
-            phase := r.phaseRegistry.Get(compName)
-            phase.SetVersionContext(vCtx)
-            if !phase.NeedExecute(nil, bc) {
+            // 从 ComponentFactory 获取 Phase 实例
+            compRef := dag.GetComponent(compName)
+            inst, err := r.componentFactory.Resolve(compName, compRef.Version, compRef.Inline)
+            if err != nil {
+                errs = append(errs, err)
                 continue
             }
-            if err := phase.Execute(); err != nil {
+            inst.Handler.SetVersionContext(vCtx)
+            if !inst.Handler.NeedExecute(nil, bc) {
+                continue
+            }
+            if err := inst.Handler.Execute(); err != nil {
                 errs = append(errs, fmt.Errorf("%s: %w", compName, err))
-                if comp.Strategy.FailurePolicy == "FailFast" { return kerrors.NewAggregate(errs) }
+                if compRef.Strategy.FailurePolicy == "FailFast" { return kerrors.NewAggregate(errs) }
             }
         }
         if len(errs) > 0 { return kerrors.NewAggregate(errs) }
@@ -317,13 +317,12 @@ func (r *BKEClusterReconciler) executeDAG(ctx context.Context, bc *bkev1beta1.BK
 ### 4.7 升级流程与 NeedExecute 复用设计
 **严格不新增 `ShouldUpgrade()` 接口**。改造现有 Phase 的 `NeedExecute(old, new)`：
 ```go
-// pkg/phaseframe/phases/ensure_etcd_upgrade.go
 func (p *EnsureEtcdUpgrade) NeedExecute(old, new *bkev1beta1.BKECluster) bool {
     if !p.BasePhase.DefaultNeedExecute(old, new) { return false }
 
     if featuregate.DeclarativeUpgradeEnabled(new) {
-        ctx := p.GetVersionContext(new)
-        if ctx == nil { return false } // 上下文未就绪，等待同步
+        ctx := p.GetVersionContext()
+        if ctx == nil { return false }
 
         cur := ctx.Current["etcd"]
         tgt := ctx.Target["etcd"]
@@ -334,32 +333,66 @@ func (p *EnsureEtcdUpgrade) NeedExecute(old, new *bkev1beta1.BKECluster) bool {
         p.Log.Info("Declarative Upgrade triggered: %s -> %s", cur, tgt)
         return true
     }
-    // 兼容旧逻辑
     return p.isEtcdNeedUpgrade(old, new)
 }
 
-// 非 YAML 化 Phase 的 Version() 接口实现
-func (p *EnsureEtcdUpgrade) CurrentVersion(c *bkev1beta1.BKECluster) string {
-    return c.Status.EtcdVersion
+// 接口修改：不传参，返回当前版本
+func (p *EnsureEtcdUpgrade) Version() string {
+    return p.Ctx.BKECluster.Status.EtcdVersion
 }
 ```
-`BKEClusterReconciler` 在执行前收集所有 Phase 的 `CurrentVersion()` 构建 `VersionContext`，注入到 Phase 上下文中。
+
+**Feature Gate 与 Context 实现**：
+```go
+// pkg/featuregate/features.go
+var featureGate = featuregate.NewFeatureGate()
+
+func init() {
+    featureGate.Add(map[featuregate.Feature]featuregate.FeatureSpec{
+        "DeclarativeUpgrade": {Default: false, PreRelease: featuregate.Alpha},
+    })
+}
+
+func DeclarativeUpgradeEnabled(obj metav1.Object) bool {
+    // 支持通过 Annotation 覆盖全局 FeatureGate
+    if obj != nil {
+        if v, ok := obj.GetAnnotations()["cvo.openfuyao.cn/declarative-upgrade"]; ok {
+            return v == "true"
+        }
+    }
+    return featureGate.Enabled("DeclarativeUpgrade")
+}
+
+// pkg/phaseframe/context.go
+func (p *BasePhase) GetVersionContext() *VersionContext {
+    // 从 PhaseContext 中获取注入的版本上下文
+    if p.Ctx == nil { return nil }
+    return p.Ctx.VersionContext
+}
+```
 
 ## 5. 平滑升级方案（旧版到新版）
-旧版本无 `ClusterVersion`、`ReleaseImage`、`UpgradePath` 及新增控制器。平滑升级分三步：
-1. **部署新 CRD 与控制器（FeatureGate 关闭）**：
-   - 部署 `cvo.openfuyao.cn` API 资源与控制器，但 `DeclarativeUpgrade=false`。
-   - `BKEClusterReconciler` 保持原有逻辑运行，集群状态不受影响。
-2. **自动迁移与状态同步**：
-   - `BKEClusterReconciler` 检测到旧版集群（无 CV 关联）时，自动创建 `ClusterVersion` 实例，`DesiredVersion` 与 `CurrentVersion` 均填充为当前 `BKECluster.Spec.OpenFuyaoVersion`。
-   - 根据当前版本自动生成 `ReleaseImage` CR，组件列表从 `BKECluster.Status` 推导。
-   - 建立 `OwnerReference` 关联，完成元数据映射。
-3. **开启 FeatureGate 切换**：
-   - 运维开启 `DeclarativeUpgrade=true`。
-   - 后续 `DesiredVersion` 变更将由新流程接管：CV 控制器拉取 OCI → 构建 DAG → Phase 比对版本执行升级。
-   - 若升级失败，可通过 `spec.allowDowngrade=true` 自动回退至迁移时记录的稳定版本。
+### 5.1 自动迁移方案
+1. **部署新 CRD 与控制器（FeatureGate 关闭）**：部署 API 与控制器，`DeclarativeUpgrade=false`，保持原有逻辑。
+2. **自动创建 ClusterVersion**：`BKEClusterReconciler` 检测到无 CV 关联时，自动创建 CV 实例，`DesiredVersion` 与 `CurrentVersion` 填充为当前 `BKECluster.Spec.OpenFuyaoVersion`。
+3. **开启 FeatureGate 切换**：运维开启开关，后续变更由新流程接管。
 
-## 6. 生产级保障设计（商业化标准）
+### 5.2 手工提前构建方案
+为支持更可控的灰度与预检，支持手工提前构建 `ReleaseImage` 与 `UpgradePath`：
+1. **手工构建 ReleaseImage**：
+   ```bash
+   kubectl apply -f ri-v2.6.0.yaml
+   ```
+   内容包含目标版本的所有组件清单。控制器解析后标记 `Status.Phase=Valid`。
+2. **手工构建 UpgradePath**：
+   ```bash
+   kubectl apply -f up-v2.5.0-to-v2.6.0.yaml
+   ```
+   定义从旧版本到新版本的升级规则（如 blocked、preCheck 占位）。
+3. **关联与触发**：
+   创建 `ClusterVersion` 时直接 `spec.releaseImageRef: ri-v2.6.0`，跳过 OCI 拉取阶段，直接使用本地已构建的清单进行升级。适用于离线环境或严格合规场景。
+
+## 6. 异常场景、性能、安全与可扩展性设计
 ### 6.1 异常场景处理
 | 异常 | 处理机制 |
 |------|----------|
@@ -385,7 +418,38 @@ func (p *EnsureEtcdUpgrade) CurrentVersion(c *bkev1beta1.BKECluster) string {
 - **插件化 Phase**：通过 `ComponentFactory` 注册机制，第三方组件可动态注入 YAML 或 Go 插件。
 - **多架构支持**：OCI 镜像支持 `linux/amd64`, `linux/arm64` 多架构清单，自动匹配节点架构。
 
-## 7. 工作量评估（普通开发者）
+## 7. 兼容性 Rule 检查设计
+### 7.1 规则语法
+支持语义化版本约束：`>=`, `<=`, `>`, `<`, `=`, `!=`, 区间 `>=1.0.0 <2.0.0`。
+### 7.2 代码实现
+```go
+func CheckCompatibility(components []ComponentRef, manifestStore *ManifestStore) error {
+    // 1. 解析所有组件的 constraints
+    constraints := make(map[string][]*semver.Constraints)
+    for _, comp := range components {
+        cv := manifestStore.Get(comp.Name, comp.Version)
+        for _, c := range cv.Spec.Compatibility.Constraints {
+            constraint, err := semver.NewConstraint(c.Rule)
+            if err != nil { return err }
+            constraints[c.Component] = append(constraints[c.Component], constraint)
+        }
+    }
+    // 2. 校验实际版本是否满足约束
+    for compName, consList := range constraints {
+        actualVer := getComponentVersion(compName) // 从集群状态获取
+        ver, err := semver.NewVersion(actualVer)
+        if err != nil { return err }
+        for _, c := range consList {
+            if !c.Check(ver) {
+                return fmt.Errorf("component %s version %s violates constraint %s", compName, actualVer, c.Original())
+            }
+        }
+    }
+    return nil
+}
+```
+
+## 8. 工作量评估（普通开发者）
 | 阶段 | 任务内容 | 工作量 (人天) | 说明 |
 |------|---------|:-------------:|------|
 | **1. CRD 与 API** | CV/RI/UP/ComponentVersion 定义、Webhook、DeepCopy | 7 | 熟悉 kubebuilder、验证规则、不可变约束 |
@@ -396,8 +460,8 @@ func (p *EnsureEtcdUpgrade) CurrentVersion(c *bkev1beta1.BKECluster) string {
 | **6. 迁移与测试** | 旧版平滑迁移逻辑、单元测试、集成测试、E2E、安全/性能压测 | 14 | 覆盖多场景、异常流、兼容性校验 |
 | **总计** | | **61 人天** | 含代码评审、联调缓冲与文档编写 |
 
-## 8. 架构图与流程图
-### 8.1 控制器协同架构图
+## 9. 架构图与流程图
+### 9.1 控制器协同架构图
 ```
 用户/CI ──▶ ClusterVersion.Spec.DesiredVersion = "v2.6.0"
                │
@@ -421,65 +485,15 @@ func (p *EnsureEtcdUpgrade) CurrentVersion(c *bkev1beta1.BKECluster) string {
                            │ 执行升级
                            ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ PhaseFrame (Provider/Agent/Etcd/Component/Inline)           │
+│ ComponentFactory / PhaseFrame                               │
+│  • Resolve(name, ver) 获取 inline Handler                   │
 │  • NeedExecute() 中比对版本                                  │
 │  • 版本不同 → 执行原有逻辑                                   │
 │  • 版本相同 → 跳过，标记 Succeeded                          │
-│  • 执行结果回写 ClusterVersion.Status.History               │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 8.2 DAG 驱动升级流程图
-```
-Start
-  │
-  ├─▶ ClusterVersion.DesiredVersion 变更? ──No──▶ Return
-  │
-  │ Yes
-  ▼
-┌─────────────────────────────────────┐
-│ 1. 拉取目标 ReleaseImage OCI        │
-│    解析为 CR，检查 Status == Valid  │
-└──────────────┬──────────────────────┘
-               │ Valid
-               ▼
-┌─────────────────────────────────────┐
-│ 2. 查找 UpgradePath (OCI latest)    │
-│    Blocked? → Abort, Event          │
-│    Valid  → Continue                │
-└──────────────┬──────────────────────┘
-               │
-               ▼
-┌─────────────────────────────────────┐
-│ 3. 场景判断: Install or Upgrade?    │
-│    选择对应 Dependency 边集          │
-└──────────────┬──────────────────────┘
-               │
-               ▼
-┌─────────────────────────────────────┐
-│ 4. 构建 DAG (拓扑排序+环检测)       │
-│    Provider → Agent → Etcd → Core   │
-└──────────────┬──────────────────────┘
-               │
-               ▼
-┌─────────────────────────────────────┐
-│ 5. 循环执行 DAG 批次                 │
-│    ├─ 注入 VersionContext           │
-│    ├─ NeedExecute() == false? Skip  │
-│    ├─ Execute()                     │
-│    └─ 失败? → 标记 Failed, 终止     │
-└──────────────┬──────────────────────┘
-               │ 全部成功
-               ▼
-┌─────────────────────────────────────┐
-│ 6. 更新状态                         │
-│    CurrentVersion = DesiredVersion  │
-│    Phase = Healthy                  │
-│    记录 History                     │
-└─────────────────────────────────────┘
-```
-
-## 9. 测试计划与验收标准
+## 10. 测试计划与验收标准
 | 测试类型 | 覆盖场景 |
 |----------|---------|
 | **单元测试** | DAG 拓扑排序、兼容性矩阵校验、`NeedExecute` 分支逻辑、OCI 解析 |
@@ -493,7 +507,7 @@ Start
 - **Beta**: 接管升级流程，与旧 Phase 并行运行，结果对比验证，E2E 通过率 >95%。
 - **GA**: 全量切换，移除旧版本硬编码调度逻辑，支持生产环境灰度发布。
 
-## 10. 风险与缓解
+## 11. 风险与缓解
 | 风险 | 影响 | 缓解措施 |
 |------|------|---------|
 | OCI 镜像拉取失败或解析错误 | 升级阻塞 | 指数退避重试；本地 ConfigMap fallback；`ReleaseImage` 提前标记 `Invalid` |
