@@ -89,7 +89,7 @@
 ┌──────────────────────────────────────────────────────────────────┐
 │              bke-manifests (ComponentVersion 定义)               │
 │  bke-manifests/kubernetes/v1.29.0/component.yaml                 │
-│  包含: type, mode, subComponents, compatibility, dependencies    │
+│  包含: type, version, inline, subComponents, compatibility...    │
 └──────────────────────────────────────────────────────────────────┘
 
 ┌──────────────────────────────────────────────────────────────────┐
@@ -107,9 +107,10 @@ metadata:
   name: kubernetes-v1.29.0
 spec:
   type: composite  # leaf | composite
-  mode: ""         # "" (YAML驱动) | inline (调用Go Phase代码)
-  handler: EnsureKubernetesUpgrade  # mode=inline 时必填，映射 Phase 标识
-  defaultVersion: v1.0  # inline 组件默认版本
+  version: v1.29.0  # 组件业务版本（新增，替代原 defaultVersion）
+  inline:           # 仅当为 inline 模式时存在，嵌入 handler 与代码版本
+    handler: EnsureKubernetesUpgrade  # 映射 Phase 注册标识
+    version: v1.0   # Phase 代码版本（新增）
   # 组合组件包含的子组件元数据（用于兼容性检查）
   subComponents:
     - name: kube-apiserver
@@ -145,12 +146,29 @@ spec:
     timeout: "30m"
     retryPolicy: ExponentialBackoff
 ```
+**Go 结构体定义**：
+```go
+type ComponentVersionSpec struct {
+    Type            ComponentType       `json:"type"`
+    Version         string              `json:"version"`           // 组件业务版本
+    Inline          *InlineSpec         `json:"inline,omitempty"`  // inline 模式配置
+    SubComponents   []SubComponent      `json:"subComponents,omitempty"`
+    Compatibility   CompatibilitySpec   `json:"compatibility,omitempty"`
+    Dependencies    DependencySpec      `json:"dependencies,omitempty"`
+    UpgradeStrategy UpgradeStrategySpec `json:"upgradeStrategy,omitempty"`
+}
+
+type InlineSpec struct {
+    Handler string `json:"handler"` // Phase 注册标识
+    Version string `json:"version"` // Phase 代码版本
+}
+```
 
 ### 4.3 ComponentFactory 与 Phase 重构设计
 **ComponentFactory 设计**：
 ```go
 type ComponentFactory struct {
-    mu      sync.RWMutex
+    mu       sync.RWMutex
     registry map[string]ComponentInstance // key: "{name}@{version}"
 }
 
@@ -161,25 +179,35 @@ type ComponentInstance struct {
     Handler PhaseExecutor // inline 模式下的 Go 实例
 }
 
-func (f *ComponentFactory) Register(name, version string, handler PhaseExecutor, mode ExecutionMode) {
+// 注册代码实现的 Phase
+func (f *ComponentFactory) Register(name, version string, handler PhaseExecutor) {
     f.mu.Lock()
     defer f.mu.Unlock()
     key := fmt.Sprintf("%s@%s", name, version)
-    f.registry[key] = ComponentInstance{Name: name, Version: version, Mode: mode, Handler: handler}
+    f.registry[key] = ComponentInstance{
+        Name: name, Version: version, Mode: ModeInline, Handler: handler,
+    }
 }
 
-func (f *ComponentFactory) Resolve(name, version string) (*ComponentInstance, error) {
-    // 支持版本约束解析（如 v1.x 匹配最新 v1.2.x）
-    // ...
+// 解析组件实例，支持 inline 模式匹配
+func (f *ComponentFactory) Resolve(name, version string, inline *InlineSpec) (*ComponentInstance, error) {
+    if inline != nil {
+        key := fmt.Sprintf("%s@%s", inline.Handler, inline.Version)
+        if inst, ok := f.registry[key]; ok {
+            return &inst, nil
+        }
+    }
+    // fallback 到外部 YAML 解析逻辑
+    return nil, fmt.Errorf("component %s@%s not found", name, version)
 }
 ```
 **Phase 重构清单**：
-| Phase 名称 | 重构方式 | bke-manifests 映射 | Model/Mode | 接口增强 |
-|-----------|---------|-------------------|------------|----------|
-| `EnsureProviderSelfUpgrade` | 转为 YAML 清单 | `phases/provider-upgrade/v1.0.0/component.yaml` | `""` (YAML) | 无 |
-| `EnsureAgentUpgrade` | 转为 YAML 清单 | `phases/bkeagent-upgrade/v1.0.0/component.yaml` | `""` (YAML) | 无 |
-| `EnsureComponentUpgrade` | 转为 YAML 清单 | `phases/component-upgrade/v1.0.0/component.yaml` | `""` (YAML) | 无 |
-| `EnsureEtcdUpgrade` | 转为 YAML 清单 | `phases/etcd-upgrade/v1.0.0/component.yaml` | `""` (YAML) | 无 |
+| Phase 名称 | 重构方式 | bke-manifests 映射 | Mode | 接口增强 |
+|-----------|---------|-------------------|------|----------|
+| `EnsureProviderSelfUpgrade` | 转为 YAML 清单 | `phases/provider-upgrade/v1.0.0/component.yaml` | `external` | 无 |
+| `EnsureAgentUpgrade` | 转为 YAML 清单 | `phases/bkeagent-upgrade/v1.0.0/component.yaml` | `external` | 无 |
+| `EnsureComponentUpgrade` | 转为 YAML 清单 | `phases/component-upgrade/v1.0.0/component.yaml` | `external` | 无 |
+| `EnsureEtcdUpgrade` | 转为 YAML 清单 | `phases/etcd-upgrade/v1.0.0/component.yaml` | `external` | 无 |
 | 其他代码 Phase | 增加 `Version()` 接口，注册至 Factory | 不生成 YAML，直接通过注册表映射 | `inline` | `Version() string`, `NeedExecute()` 增强 |
 
 ### 4.4 bke-manifests 目录与 OCI 镜像设计
@@ -198,7 +226,7 @@ bke-manifests/
 └── phases/
     └── provider-upgrade/
         └── v1.0.0/
-            └── component.yaml  # type: composite, mode: inline, handler: EnsureProviderSelfUpgrade
+            └── component.yaml  # type: composite, version: v1.0.0, inline: {handler: EnsureProviderSelfUpgrade, version: v1.0}
 ```
 
 #### 4.4.2 ReleaseImage OCI 样例 (YAML)
