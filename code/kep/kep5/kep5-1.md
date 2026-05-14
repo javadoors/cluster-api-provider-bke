@@ -630,10 +630,26 @@ func CheckCompatibility(components []ComponentRef, manifestStore *ManifestStore)
 
 **设计思路**：`ManifestStore` 作为版本清单的统一访问层，承担以下职责
 
-1. **抽象存储后端**：屏蔽本地文件系统与 OCI 远程仓库的差异，提供统一的 `Get(name, version)` 接口
+1. **抽象存储后端**：屏蔽本地文件系统与 OCI 远程仓库的差异，提供统一的组件清单获取接口
 2. **多级缓存策略**：采用 `sync.Map` 实现内存缓存，避免重复解析 YAML 和拉取 OCI 镜像
 3. **降级机制**：优先从本地 `/etc/bke/manifests` 加载，失败后降级至 OCI 拉取，支持离线环境运行
 4. **线程安全**：所有缓存操作使用原子操作，支持高并发 Reconcile 循环访问
+5. **多文件支持**：组件目录下包含 `component.yaml`（元数据）与多个资源清单文件（rbac.yaml、configmap.yaml、deployment.yaml 等）
+6. **模板渲染**：所有 YAML 文件支持 Go template 语法，加载时统一渲染
+
+**组件目录结构**：
+
+```txt
+bke-manifests/
+└── kubernetes/
+    └── v1.29.0/
+        ├── component.yaml          # 组件元数据（版本、依赖、策略）
+        ├── rbac.yaml               # RBAC 资源（ServiceAccount/Role/ClusterRoleBinding）
+        ├── configmap.yaml          # ConfigMap 配置
+        ├── secret.yaml             # Secret 资源（可选）
+        ├── deployment.yaml         # Deployment/StatefulSet/DaemonSet
+        └── crd.yaml                # CRD 定义（可选）
+```
 
 **架构设计**：
 
@@ -641,29 +657,40 @@ func CheckCompatibility(components []ComponentRef, manifestStore *ManifestStore)
 ┌─────────────────────────────────────────────────────────┐
 │                    Caller (Reconciler)                  │
 └────────────────────────┬────────────────────────────────┘
-                         │ Get(name, version)
+                         │ GetComponentManifests(name, version, ctx)
                          ▼
 ┌─────────────────────────────────────────────────────────┐
 │                   ManifestStore                         │
 │  ┌───────────────────────────────────────────────────┐  │
 │  │ 1. 检查内存缓存 (sync.Map)                         │  │
-│  │    ├─ Hit → 直接返回                              │  │
+│  │    ├─ Hit → 克隆副本                              │  │
 │  │    └─ Miss → 继续                                 │  │
 │  └───────────────────────┬───────────────────────────┘  │
 │                          │                               │
 │  ┌───────────────────────▼───────────────────────────┐  │
 │  │ 2. 尝试本地文件系统                                │  │
 │  │    /etc/bke/manifests/{name}/{version}/           │  │
-│  │    ├─ 存在 → 解析 YAML → 写入缓存 → 返回           │  │
-│  │    └─ 不存在 → 继续                               │  │
+│  │    ├─ 扫描目录下所有 *.yaml 文件                   │  │
+│  │    ├─ 解析 component.yaml 为元数据                 │  │
+│  │    ├─ 解析其余 YAML 为资源清单列表                 │  │
+│  │    └─ 写入缓存 → 继续                             │  │
 │  └───────────────────────┬───────────────────────────┘  │
 │                          │                               │
 │  ┌───────────────────────▼───────────────────────────┐  │
 │  │ 3. OCI 远程拉取                                   │  │
 │  │    registry/openfuyao-release:{version}           │  │
-│  │    ├─ 拉取镜像 → 提取 layer → 解析 YAML            │  │
-│  │    ├─ 写入缓存 → 返回                             │  │
+│  │    ├─ 拉取镜像 → 提取组件目录 layer                │  │
+│  │    ├─ 遍历目录下所有 *.yaml 文件                   │  │
+│  │    ├─ 写入缓存 → 继续                             │  │
 │  │    └─ 失败 → 返回错误                             │  │
+│  └───────────────────────┬───────────────────────────┘  │
+│                          │                               │
+│  ┌───────────────────────▼───────────────────────────┐  │
+│  │ 4. 模板渲染 (若传入 TemplateContext)               │  │
+│  │    ├─ 渲染 component.yaml 元数据                   │  │
+│  │    ├─ 按依赖顺序排序资源清单 (CRD→RBAC→CM→Deploy) │  │
+│  │    ├─ 逐个渲染 {{.xxx}} 占位符                     │  │
+│  │    └─ 返回渲染后的清单列表                         │  │
 │  └───────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────┘
 ```
@@ -708,68 +735,279 @@ flowchart TD
 
 ```go
 // pkg/manifest/store.go
+
+// ResourceManifest 表示单个渲染后的资源清单
+type ResourceManifest struct {
+    FileName string // 原始文件名 (rbac.yaml, deployment.yaml 等)
+    Content  []byte // 渲染后的 YAML 内容
+    Objects  []unstructured.Unstructured // 解析后的 K8s 对象列表
+}
+
+// ComponentPackage 组件完整包（元数据 + 资源清单列表）
+type ComponentPackage struct {
+    Metadata  *ComponentVersion   // component.yaml 元数据
+    Manifests []ResourceManifest  // 按依赖顺序排序的资源清单
+}
+
+// ManifestStore 清单存储
 type ManifestStore struct {
-    cache     *sync.Map // key: "{name}@{version}" -> *ComponentVersion
+    cache     *sync.Map // key: "{name}@{version}" -> *ComponentPackage
     ociClient *oci.Client
     localPath string    // 本地 manifest 根目录，默认 /etc/bke/manifests
 }
 
-func (s *ManifestStore) Get(name, version string) (*ComponentVersion, error) {
-    key := fmt.Sprintf("%s@%s", name, version)
-    if val, ok := s.cache.Load(key); ok {
-        return val.(*ComponentVersion), nil
-    }
-    
-    // 1. 尝试从本地 bke-manifests 目录加载
-    localPath := fmt.Sprintf("%s/%s/%s/component.yaml", s.localPath, name, version)
-    if data, err := os.ReadFile(localPath); err == nil {
-        cv := &ComponentVersion{}
-        if yaml.Unmarshal(data, cv) == nil {
-            s.cache.Store(key, cv)
-            return cv, nil
-        }
-    }
-    
-    // 2. 降级：从 OCI 拉取对应层的 component.yaml
-    img, err := s.ociClient.Pull(fmt.Sprintf("registry/openfuyao-release:%s", version))
-    if err != nil { return nil, err }
-    
-    layer, err := img.GetLayerByPath(fmt.Sprintf("%s/%s/component.yaml", name, version))
-    if err != nil { return nil, err }
-    
-    cv := &ComponentVersion{}
-    if err := yaml.Unmarshal(layer.Content, cv); err != nil { return nil, err }
-    
-    s.cache.Store(key, cv)
-    return cv, nil
-}
-
-// GetComponentPath 返回组件在镜像或本地文件系统中的路径
-func (s *ManifestStore) GetComponentPath(name, version string) string {
-    return fmt.Sprintf("%s/%s/component.yaml", name, version)
-}
-
-// GetComponent 带模板渲染的组件获取接口
-func (s *ManifestStore) GetComponent(name, version string, ctx *TemplateContext) (*ComponentVersion, error) {
+// GetComponentManifests 获取组件完整包（含元数据与所有资源清单）
+func (s *ManifestStore) GetComponentManifests(name, version string, ctx *TemplateContext) (*ComponentPackage, error) {
     key := fmt.Sprintf("%s@%s", name, version)
     
     // 1. 尝试从缓存加载
     if val, ok := s.cache.Load(key); ok {
-        cv := val.(*ComponentVersion)
+        pkg := val.(*ComponentPackage)
         if ctx != nil {
-            return s.renderTemplate(cv, ctx)
+            return s.renderPackage(pkg, ctx)
         }
-        return cv, nil
+        return pkg, nil
     }
     
     // 2. 尝试从本地 bke-manifests 目录加载
-    localPath := fmt.Sprintf("%s/%s/%s/component.yaml", s.localPath, name, version)
-    if data, err := os.ReadFile(localPath); err == nil {
-        cv := &ComponentVersion{}
-        if yaml.Unmarshal(data, cv) == nil {
-            s.cache.Store(key, cv)
+    compDir := fmt.Sprintf("%s/%s/%s", s.localPath, name, version)
+    if _, err := os.Stat(compDir); err == nil {
+        pkg, err := s.loadFromLocal(compDir)
+        if err == nil {
+            s.cache.Store(key, pkg)
             if ctx != nil {
-                return s.renderTemplate(cv, ctx)
+                return s.renderPackage(pkg, ctx)
+            }
+            return pkg, nil
+        }
+    }
+    
+    // 3. 降级：从 OCI 拉取组件目录
+    img, err := s.ociClient.Pull(fmt.Sprintf("registry/openfuyao-release:%s", version))
+    if err != nil { return nil, err }
+    
+    pkg, err := s.loadFromOCI(img, name, version)
+    if err != nil { return nil, err }
+    
+    s.cache.Store(key, pkg)
+    if ctx != nil {
+        return s.renderPackage(pkg, ctx)
+    }
+    return pkg, nil
+}
+
+// loadFromLocal 从本地目录加载组件包
+func (s *ManifestStore) loadFromLocal(compDir string) (*ComponentPackage, error) {
+    entries, err := os.ReadDir(compDir)
+    if err != nil { return nil, err }
+    
+    pkg := &ComponentPackage{}
+    var manifestFiles []string
+    
+    for _, entry := range entries {
+        if !strings.HasSuffix(entry.Name(), ".yaml") {
+            continue
+        }
+        
+        filePath := filepath.Join(compDir, entry.Name())
+        data, err := os.ReadFile(filePath)
+        if err != nil { continue }
+        
+        if entry.Name() == "component.yaml" {
+            cv := &ComponentVersion{}
+            if err := yaml.Unmarshal(data, cv); err == nil {
+                pkg.Metadata = cv
+            }
+        } else {
+            manifestFiles = append(manifestFiles, entry.Name())
+        }
+    }
+    
+    // 按依赖顺序排序清单
+    pkg.Manifests = s.sortManifests(manifestFiles, compDir)
+    return pkg, nil
+}
+
+// loadFromOCI 从 OCI 镜像加载组件包
+func (s *ManifestStore) loadFromOCI(img *oci.Image, name, version string) (*ComponentPackage, error) {
+    prefix := fmt.Sprintf("%s/%s/", name, version)
+    layers, err := img.GetLayersByPrefix(prefix)
+    if err != nil { return nil, err }
+    
+    pkg := &ComponentPackage{}
+    var manifestFiles []string
+    
+    for _, layer := range layers {
+        fileName := strings.TrimPrefix(layer.Path, prefix)
+        if !strings.HasSuffix(fileName, ".yaml") {
+            continue
+        }
+        
+        if fileName == "component.yaml" {
+            cv := &ComponentVersion{}
+            if err := yaml.Unmarshal(layer.Content, cv); err == nil {
+                pkg.Metadata = cv
+            }
+        } else {
+            manifestFiles = append(manifestFiles, fileName)
+        }
+    }
+    
+    pkg.Manifests = s.sortManifests(manifestFiles, "")
+    return pkg, nil
+}
+
+// sortManifests 按依赖顺序排序清单文件
+func (s *ManifestStore) sortManifests(files []string, baseDir string) []ResourceManifest {
+    kindPriority := map[string]int{
+        "crd.yaml":        0,
+        "rbac.yaml":       1,
+        "serviceaccount.yaml": 1,
+        "configmap.yaml":  2,
+        "secret.yaml":     3,
+        "deployment.yaml": 4,
+        "daemonset.yaml":  4,
+        "statefulset.yaml": 4,
+        "service.yaml":    5,
+        "ingress.yaml":    6,
+    }
+    
+    var manifests []ResourceManifest
+    for _, file := range files {
+        var data []byte
+        if baseDir != "" {
+            data, _ = os.ReadFile(filepath.Join(baseDir, file))
+        }
+        
+        objects, _ := parseYAMLObjects(data)
+        manifests = append(manifests, ResourceManifest{
+            FileName: file,
+            Content:  data,
+            Objects:  objects,
+        })
+    }
+    
+    sort.Slice(manifests, func(i, j int) bool {
+        pi := kindPriority[manifests[i].FileName]
+        pj := kindPriority[manifests[j].FileName]
+        return pi < pj
+    })
+    
+    return manifests
+}
+
+// renderPackage 渲染整个组件包
+func (s *ManifestStore) renderPackage(pkg *ComponentPackage, ctx *TemplateContext) (*ComponentPackage, error) {
+    rendered := &ComponentPackage{
+        Metadata:  pkg.Metadata,
+        Manifests: make([]ResourceManifest, len(pkg.Manifests)),
+    }
+    
+    if pkg.Metadata != nil {
+        rendered.Metadata, _ = s.renderTemplate(pkg.Metadata, ctx)
+    }
+    
+    for i, manifest := range pkg.Manifests {
+        renderedContent, err := s.renderYAMLContent(manifest.Content, ctx)
+        if err != nil {
+            return nil, fmt.Errorf("failed to render %s: %w", manifest.FileName, err)
+        }
+        
+        objects, _ := parseYAMLObjects(renderedContent)
+        rendered.Manifests[i] = ResourceManifest{
+            FileName: manifest.FileName,
+            Content:  renderedContent,
+            Objects:  objects,
+        }
+    }
+    
+    return rendered, nil
+}
+
+// parseYAMLObjects 解析 YAML 内容为 K8s 对象列表（支持多文档）
+func parseYAMLObjects(data []byte) ([]unstructured.Unstructured, error) {
+    var objects []unstructured.Unstructured
+    docs := bytes.Split(data, []byte("\n---\n"))
+    
+    for _, doc := range docs {
+        if len(bytes.TrimSpace(doc)) == 0 {
+            continue
+        }
+        
+        var obj unstructured.Unstructured
+        if err := yaml.Unmarshal(doc, &obj); err == nil && obj.GetKind() != "" {
+            objects = append(objects, obj)
+        }
+    }
+    
+    return objects, nil
+}
+```
+
+**ApplyManifests 应用接口**：
+
+```go
+// pkg/manifest/applier.go
+
+// ManifestApplier 清单应用器
+type ManifestApplier struct {
+    client client.Client
+    logger logr.Logger
+}
+
+// ApplyManifests 按顺序应用组件清单（等价于 kubectl apply）
+func (a *ManifestApplier) ApplyManifests(ctx context.Context, manifests []ResourceManifest) error {
+    for _, manifest := range manifests {
+        a.logger.Info("Applying manifest", "file", manifest.FileName)
+        
+        for _, obj := range manifest.Objects {
+            if err := a.applyObject(ctx, &obj); err != nil {
+                return fmt.Errorf("failed to apply %s/%s: %w", 
+                    obj.GetKind(), obj.GetName(), err)
+            }
+        }
+    }
+    return nil
+}
+
+// applyObject 应用单个对象（幂等操作）
+func (a *ManifestApplier) applyObject(ctx context.Context, obj *unstructured.Unstructured) error {
+    annotations := obj.GetAnnotations()
+    if annotations == nil {
+        annotations = make(map[string]string)
+    }
+    annotations["cvo.openfuyao.cn/managed-by"] = "manifest-store"
+    obj.SetAnnotations(annotations)
+    
+    existing := &unstructured.Unstructured{}
+    existing.SetGroupVersionKind(obj.GroupVersionKind())
+    err := a.client.Get(ctx, client.ObjectKey{
+        Namespace: obj.GetNamespace(),
+        Name:      obj.GetName(),
+    }, existing)
+    
+    if err != nil && apierrors.IsNotFound(err) {
+        return a.client.Create(ctx, obj)
+    }
+    
+    obj.SetResourceVersion(existing.GetResourceVersion())
+    obj.SetUID(existing.GetUID())
+    return a.client.Update(ctx, obj)
+}
+
+// DeleteManifests 删除组件清单（用于回滚或卸载）
+func (a *ManifestApplier) DeleteManifests(ctx context.Context, manifests []ResourceManifest) error {
+    for i := len(manifests) - 1; i >= 0; i-- {
+        manifest := manifests[i]
+        for _, obj := range manifest.Objects {
+            if err := a.client.Delete(ctx, &obj); err != nil && !apierrors.IsNotFound(err) {
+                return err
+            }
+        }
+    }
+    return nil
+}
+```
             }
             return cv, nil
         }
