@@ -942,6 +942,52 @@ func parseYAMLObjects(data []byte) ([]unstructured.Unstructured, error) {
     
     return objects, nil
 }
+
+// renderTemplate 渲染 ComponentVersion 元数据模板
+func (s *ManifestStore) renderTemplate(cv *ComponentVersion, ctx *TemplateContext) (*ComponentVersion, error) {
+    data, err := yaml.Marshal(cv)
+    if err != nil {
+        return nil, err
+    }
+    
+    renderedData, err := s.renderYAMLContent(data, ctx)
+    if err != nil {
+        return nil, err
+    }
+    
+    rendered := &ComponentVersion{}
+    if err := yaml.Unmarshal(renderedData, rendered); err != nil {
+        return nil, fmt.Errorf("failed to unmarshal rendered template: %w", err)
+    }
+    
+    return rendered, nil
+}
+
+// renderYAMLContent 渲染任意 YAML 内容模板（通用方法）
+func (s *ManifestStore) renderYAMLContent(data []byte, ctx *TemplateContext) ([]byte, error) {
+    if ctx == nil || len(data) == 0 {
+        return data, nil
+    }
+    
+    tmpl, err := template.New("manifest").Funcs(template.FuncMap{
+        "default": func(val, def string) string {
+            if val == "" { return def }
+            return val
+        },
+        "lower": strings.ToLower,
+        "upper": strings.ToUpper,
+    }).Parse(string(data))
+    if err != nil {
+        return nil, fmt.Errorf("failed to parse template: %w", err)
+    }
+    
+    var buf bytes.Buffer
+    if err := tmpl.Execute(&buf, ctx); err != nil {
+        return nil, fmt.Errorf("failed to render template: %w", err)
+    }
+    
+    return buf.Bytes(), nil
+}
 ```
 
 **ApplyManifests 应用接口**：
@@ -1135,7 +1181,7 @@ type TemplateContext struct {
     Custom               map[string]string `json:"custom,omitempty"`
 }
 
-// BuildFromBKECluster 从 BKECluster 实例构建 TemplateContext
+// BuildTemplateContext 从 BKECluster 实例构建 TemplateContext
 func BuildTemplateContext(bc *bkev1beta1.BKECluster) *TemplateContext {
     return &TemplateContext{
         ClusterName:          bc.Name,
@@ -1157,18 +1203,55 @@ func BuildTemplateContext(bc *bkev1beta1.BKECluster) *TemplateContext {
     }
 }
 
-// renderTemplate 渲染组件模板
+// extractCustomAnnotations 从 BKECluster 注解中提取自定义变量
+func extractCustomAnnotations(bc *bkev1beta1.BKECluster) map[string]string {
+    custom := make(map[string]string)
+    for k, v := range bc.Annotations {
+        if strings.HasPrefix(k, "cvo.openfuyao.cn/custom-") {
+            key := strings.TrimPrefix(k, "cvo.openfuyao.cn/custom-")
+            custom[key] = v
+        }
+    }
+    return custom
+}
+```
+
+**模板渲染核心方法实现**（位于 `pkg/manifest/store.go`）：
+
+```go
+// renderTemplate 渲染 ComponentVersion 元数据模板
 func (s *ManifestStore) renderTemplate(cv *ComponentVersion, ctx *TemplateContext) (*ComponentVersion, error) {
     data, err := yaml.Marshal(cv)
     if err != nil {
         return nil, err
     }
     
-    tmpl, err := template.New("component").Funcs(template.FuncMap{
+    renderedData, err := s.renderYAMLContent(data, ctx)
+    if err != nil {
+        return nil, err
+    }
+    
+    rendered := &ComponentVersion{}
+    if err := yaml.Unmarshal(renderedData, rendered); err != nil {
+        return nil, fmt.Errorf("failed to unmarshal rendered template: %w", err)
+    }
+    
+    return rendered, nil
+}
+
+// renderYAMLContent 渲染任意 YAML 内容模板（通用方法）
+func (s *ManifestStore) renderYAMLContent(data []byte, ctx *TemplateContext) ([]byte, error) {
+    if ctx == nil || len(data) == 0 {
+        return data, nil
+    }
+    
+    tmpl, err := template.New("manifest").Funcs(template.FuncMap{
         "default": func(val, def string) string {
             if val == "" { return def }
             return val
         },
+        "lower": strings.ToLower,
+        "upper": strings.ToUpper,
     }).Parse(string(data))
     if err != nil {
         return nil, fmt.Errorf("failed to parse template: %w", err)
@@ -1179,41 +1262,71 @@ func (s *ManifestStore) renderTemplate(cv *ComponentVersion, ctx *TemplateContex
         return nil, fmt.Errorf("failed to render template: %w", err)
     }
     
-    rendered := &ComponentVersion{}
-    if err := yaml.Unmarshal(buf.Bytes(), rendered); err != nil {
-        return nil, fmt.Errorf("failed to unmarshal rendered template: %w", err)
-    }
-    
-    return rendered, nil
+    return buf.Bytes(), nil
 }
+```
+
+**TemplateContext 在 BKECluster 控制器中的调用位置**：
+
+```txt
+┌─────────────────────────────────────────────────────────────────┐
+│ BKEClusterReconciler.Reconcile()                                │
+├─────────────────────────────────────────────────────────────────┤
+│ 1. 获取 BKECluster 实例                                          │
+│ 2. 检查 ClusterVersion Annotation (upgrade-ready)               │
+│    └─ 若无升级请求 → 返回                                        │
+│ 3. 构建 VersionContext (版本比对上下文)                          │
+│ 4. 构建 TemplateContext (模板渲染上下文) ◀──── 调用位置 1        │
+│    └─ tmplCtx := manifest.BuildTemplateContext(bc)               │
+│ 5. 判断 Install/Upgrade 场景                                     │
+│ 6. 解析 ReleaseImage 获取组件列表                                │
+│ 7. 构建 DAG (依赖图)                                            │
+│ 8. 执行 DAG ◀──────────────────────────────────────────────────┤
+│    └─ executeDAG(ctx, bc, dag, tmplCtx)                         │
+│       │                                                         │
+│       ├─ 遍历 DAG 拓扑批次                                       │
+│       ├─ 对每个组件:                                            │
+│       │   ├─ GetComponentManifests(name, ver, tmplCtx) ◀─ 调用位置 2 │
+│       │   │   └─ 内部调用 renderPackage(pkg, tmplCtx)           │
+│       │   │       └─ renderTemplate(cv, ctx)  ◀─ 渲染元数据     │
+│       │   │       └─ renderYAMLContent(data, ctx) ◀─ 渲染清单   │
+│       │   ├─ ApplyManifests(ctx, pkg.Manifests)                 │
+│       │   └─ Phase.Execute()                                    │
+│       └─ 返回执行结果                                           │
+│ 9. 更新 ClusterVersion Status                                   │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 **模板渲染在整体流程中的位置**：
 
 ```txt
 ┌─────────────────────────────────────────────────────────┐
-│              ManifestStore.GetComponent()               │
+│         ManifestStore.GetComponentManifests()           │
 ├─────────────────────────────────────────────────────────┤
 │ 1. 检查内存缓存 (sync.Map)                               │
-│    ├─ Hit → 克隆副本                                     │
+│    ├─ Hit → 克隆 ComponentPackage                        │
 │    └─ Miss → 继续                                       │
 │                                                         │
 │ 2. 尝试本地文件系统                                      │
-│    /etc/bke/manifests/{name}/{version}/component.yaml   │
-│    ├─ 存在 → 解析 YAML → 写入缓存                        │
-│    └─ 不存在 → 继续                                     │
+│    /etc/bke/manifests/{name}/{version}/                 │
+│    ├─ 扫描所有 *.yaml 文件                               │
+│    ├─ 解析 component.yaml → Metadata                     │
+│    ├─ 解析其余 YAML → Manifests 列表                     │
+│    └─ 写入缓存 → 继续                                   │
 │                                                         │
 │ 3. OCI 远程拉取                                         │
 │    registry/openfuyao-release:{version}                 │
-│    ├─ 拉取镜像 → 提取 layer → 解析 YAML                  │
+│    ├─ 拉取镜像 → 提取组件目录 layer                      │
+│    ├─ 遍历目录下所有 *.yaml 文件                         │
 │    ├─ 写入缓存 → 继续                                   │
 │    └─ 失败 → 返回错误                                   │
 │                                                         │
 │ 4. 模板渲染 (若传入 TemplateContext)                     │
-│    ├─ 序列化 ComponentVersion 为 YAML 字符串             │
-│    ├─ Go template 渲染 {{.xxx}} 占位符                   │
-│    ├─ 反序列化为 ComponentVersion 对象                   │
-│    └─ 返回渲染后的组件定义                               │
+│    ├─ renderPackage(pkg, ctx)                           │
+│    │   ├─ renderTemplate(cv, ctx) → 渲染元数据           │
+│    │   └─ 遍历 Manifests:                               │
+│    │       └─ renderYAMLContent(data, ctx) → 渲染清单   │
+│    └─ 返回渲染后的 ComponentPackage                      │
 └─────────────────────────────────────────────────────────┘
 ```
 
