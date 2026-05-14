@@ -584,31 +584,37 @@ func CheckCompatibility(components []ComponentRef, manifestStore *ManifestStore)
 
 ```mermaid
 flowchart TD
-    Caller["Caller (Reconciler)"] -->|"Get(name, version)"| MS["ManifestStore"]
+    Caller["Caller (Reconciler)"] -->|"GetComponent(name, version, ctx)"| MS["ManifestStore"]
     
     subgraph MS["ManifestStore"]
         direction TB
         Step1["1. 检查内存缓存 (sync.Map)"]
         Hit{"Hit?"}
-        Return1["直接返回"]
+        Clone["克隆副本"]
         
         Step2["2. 尝试本地文件系统<br/>/etc/bke/manifests/{name}/{version}/"]
         Exists{"存在?"}
-        ParseLocal["解析 YAML → 写入缓存 → 返回"]
+        ParseLocal["解析 YAML → 写入缓存"]
         
         Step3["3. OCI 远程拉取<br/>registry/openfuyao-release:{version}"]
         PullOCI["拉取镜像 → 提取 layer → 解析 YAML"]
-        CacheOCI["写入缓存 → 返回"]
+        CacheOCI["写入缓存"]
         Fail["返回错误"]
+        
+        Step4["4. 模板渲染 (若传入 ctx)"]
+        Render["Go template 渲染 {{.xxx}}"]
+        Unmarshal["反序列化为 ComponentVersion"]
     end
     
     Caller --> MS
     MS --> Step1 --> Hit
-    Hit -->|是| Return1
+    Hit -->|是| Clone --> Step4
     Hit -->|否| Step2 --> Exists
-    Exists -->|是| ParseLocal
-    Exists -->|否| Step3 --> PullOCI --> CacheOCI
+    Exists -->|是| ParseLocal --> Step4
+    Exists -->|否| Step3 --> PullOCI
     PullOCI -->|失败| Fail
+    PullOCI -->|成功| CacheOCI --> Step4
+    Step4 --> Render --> Unmarshal
 ```
 
 **代码实现**：
@@ -648,6 +654,54 @@ func (s *ManifestStore) Get(name, version string) (*ComponentVersion, error) {
     if err := yaml.Unmarshal(layer.Content, cv); err != nil { return nil, err }
     
     s.cache.Store(key, cv)
+    return cv, nil
+}
+
+// GetComponentPath 返回组件在镜像或本地文件系统中的路径
+func (s *ManifestStore) GetComponentPath(name, version string) string {
+    return fmt.Sprintf("%s/%s/component.yaml", name, version)
+}
+
+// GetComponent 带模板渲染的组件获取接口
+func (s *ManifestStore) GetComponent(name, version string, ctx *TemplateContext) (*ComponentVersion, error) {
+    key := fmt.Sprintf("%s@%s", name, version)
+    
+    // 1. 尝试从缓存加载
+    if val, ok := s.cache.Load(key); ok {
+        cv := val.(*ComponentVersion)
+        if ctx != nil {
+            return s.renderTemplate(cv, ctx)
+        }
+        return cv, nil
+    }
+    
+    // 2. 尝试从本地 bke-manifests 目录加载
+    localPath := fmt.Sprintf("%s/%s/%s/component.yaml", s.localPath, name, version)
+    if data, err := os.ReadFile(localPath); err == nil {
+        cv := &ComponentVersion{}
+        if yaml.Unmarshal(data, cv) == nil {
+            s.cache.Store(key, cv)
+            if ctx != nil {
+                return s.renderTemplate(cv, ctx)
+            }
+            return cv, nil
+        }
+    }
+    
+    // 3. 降级：从 OCI 拉取对应层的 component.yaml
+    img, err := s.ociClient.Pull(fmt.Sprintf("registry/openfuyao-release:%s", version))
+    if err != nil { return nil, err }
+    
+    layer, err := img.GetLayerByPath(fmt.Sprintf("%s/%s/component.yaml", name, version))
+    if err != nil { return nil, err }
+    
+    cv := &ComponentVersion{}
+    if err := yaml.Unmarshal(layer.Content, cv); err != nil { return nil, err }
+    
+    s.cache.Store(key, cv)
+    if ctx != nil {
+        return s.renderTemplate(cv, ctx)
+    }
     return cv, nil
 }
 
@@ -691,6 +745,143 @@ func (s *ManifestStore) GetReleaseImage(version string) (*ReleaseImage, error) {
     s.cache.Store(key, ri)
     return ri, nil
 }
+```
+
+#### 4.5.2.1 TemplateContext 模板渲染模块
+
+**设计思路**：组件 YAML 文件中可使用 Go template 语法声明变量占位符，在加载时由 `TemplateContext` 注入实际值。支持集群上下文、网络配置、节点信息等动态渲染。
+
+**支持的变量类别**：
+
+| 变量类别 | 示例变量 | 说明 |
+| -------- | -------- | ---- |
+| **集群上下文** | `{{.ClusterName}}`、`{{.Namespace}}`、`{{.ClusterUID}}` | 集群标识信息 |
+| **版本信息** | `{{.KubernetesVersion}}`、`{{.EtcdVersion}}`、`{{.ProviderVersion}}` | 目标组件版本 |
+| **网络配置** | `{{.PodCIDR}}`、`{{.ServiceCIDR}}`、`{{.DNSDomain}}` | 集群网络参数 |
+| **节点信息** | `{{.ControlPlaneReplicas}}`、`{{.WorkerNodeCount}}`、`{{.NodeArch}}` | 节点规模与架构 |
+| **环境配置** | `{{.Region}}`、`{{.AvailabilityZone}}`、`{{.Environment}}` | 部署环境信息 |
+| **自定义变量** | `{{.Custom.*}}` | 用户通过 Annotation 传入的自定义变量 |
+
+**ComponentVersion YAML 模板示例**：
+
+```yaml
+apiVersion: cvo.openfuyao.cn/v1beta1
+kind: ComponentVersion
+metadata:
+  name: kubernetes-{{.KubernetesVersion}}
+spec:
+  name: kubernetes
+  version: {{.KubernetesVersion}}
+  inline:
+    handler: EnsureKubernetesUpgrade
+    version: v1.0
+  resources:
+    - kind: ConfigMap
+      apiVersion: v1
+      namespace: {{.Namespace}}
+      name: k8s-config-{{.ClusterName}}
+      data:
+        cluster-uid: "{{.ClusterUID}}"
+        region: "{{.Region}}"
+        pod-cidr: "{{.PodCIDR}}"
+        service-cidr: "{{.ServiceCIDR}}"
+```
+
+**TemplateContext 数据结构**：
+
+```go
+// pkg/manifest/template.go
+type TemplateContext struct {
+    ClusterName          string            `json:"clusterName"`
+    Namespace            string            `json:"namespace"`
+    ClusterUID           string            `json:"clusterUID"`
+    KubernetesVersion    string            `json:"kubernetesVersion"`
+    EtcdVersion          string            `json:"etcdVersion"`
+    ProviderVersion      string            `json:"providerVersion"`
+    PodCIDR              string            `json:"podCIDR"`
+    ServiceCIDR          string            `json:"serviceCIDR"`
+    DNSDomain            string            `json:"dnsDomain"`
+    ControlPlaneReplicas int               `json:"controlPlaneReplicas"`
+    WorkerNodeCount      int               `json:"workerNodeCount"`
+    NodeArch             string            `json:"nodeArch"`
+    Region               string            `json:"region"`
+    AvailabilityZone     string            `json:"availabilityZone"`
+    Environment          string            `json:"environment"`
+    Custom               map[string]string `json:"custom,omitempty"`
+}
+
+// BuildFromBKECluster 从 BKECluster 实例构建 TemplateContext
+func BuildTemplateContext(bc *bkev1beta1.BKECluster) *TemplateContext {
+    return &TemplateContext{
+        ClusterName:          bc.Name,
+        Namespace:            bc.Namespace,
+        ClusterUID:           string(bc.UID),
+        KubernetesVersion:    bc.Spec.KubernetesVersion,
+        EtcdVersion:          bc.Spec.EtcdVersion,
+        ProviderVersion:      bc.Status.ProviderVersion,
+        PodCIDR:              bc.Spec.Networking.PodCIDR,
+        ServiceCIDR:          bc.Spec.Networking.ServiceCIDR,
+        DNSDomain:            bc.Spec.Networking.DNSDomain,
+        ControlPlaneReplicas: bc.Spec.ControlPlane.Replicas,
+        WorkerNodeCount:      bc.Spec.WorkerNodeCount,
+        NodeArch:             bc.Spec.NodeArchitecture,
+        Region:               bc.Spec.Region,
+        AvailabilityZone:     bc.Spec.AvailabilityZone,
+        Environment:          bc.Labels["environment"],
+        Custom:               extractCustomAnnotations(bc),
+    }
+}
+
+// renderTemplate 渲染组件模板
+func (s *ManifestStore) renderTemplate(cv *ComponentVersion, ctx *TemplateContext) (*ComponentVersion, error) {
+    data, err := yaml.Marshal(cv)
+    if err != nil {
+        return nil, err
+    }
+    
+    tmpl, err := template.New("component").Funcs(template.FuncMap{
+        "default": func(val, def string) string {
+            if val == "" { return def }
+            return val
+        },
+    }).Parse(string(data))
+    if err != nil {
+        return nil, fmt.Errorf("failed to parse template: %w", err)
+    }
+    
+    var buf bytes.Buffer
+    if err := tmpl.Execute(&buf, ctx); err != nil {
+        return nil, fmt.Errorf("failed to render template: %w", err)
+    }
+    
+    rendered := &ComponentVersion{}
+    if err := yaml.Unmarshal(buf.Bytes(), rendered); err != nil {
+        return nil, fmt.Errorf("failed to unmarshal rendered template: %w", err)
+    }
+    
+    return rendered, nil
+}
+```
+
+**模板渲染在整体流程中的位置**：
+
+```mermaid
+flowchart TD
+    A["Caller Reconciler"] -->|"GetComponent name, version, ctx "| B["ManifestStore"]
+    
+    subgraph B ["ManifestStore.GetComponent "]
+        B1["1. 检查内存缓存 sync.Map "] -->|"Hit"| B2["克隆副本返回"]
+        B1 -->|"Miss"| B3["2. 尝试本地文件系统"]
+        B3 -->|"存在"| B4["解析 YAML 写入缓存"]
+        B3 -->|"不存在"| B5["3. OCI 远程拉取"]
+        B5 -->|"成功"| B6["提取 layer 解析 YAML"]
+        B5 -->|"失败"| B7["返回错误"]
+        B4 --> B8["4. 模板渲染"]
+        B6 --> B8
+        B8 -->|"ctx != nil"| B9["Go template 渲染占位符"]
+        B8 -->|"ctx == nil"| B10["直接返回"]
+        B9 --> B11["反序列化为 ComponentVersion"]
+    end
 ```
 
 #### 4.5.3 UpgradePath 图模型与路径查找算法
@@ -1133,17 +1324,29 @@ func (r *UpgradePathReconciler) FindPath(from, to string) ([]cvoapi.UpgradePathE
 ```go
 func (r *BKEClusterReconciler) executeDAG(ctx context.Context, bc *bkev1beta1.BKECluster, dag *topology.DAG, scenario string) error {
     vCtx := r.buildVersionContext(bc)
+    tmplCtx := manifest.BuildTemplateContext(bc)
+    
     for _, batch := range dag.TopologicalSort() {
         var errs []error
         for _, compName := range batch {
-            // 从 ComponentFactory 获取 Phase 实例
             compRef := dag.GetComponent(compName)
+            
+            // 从 ManifestStore 获取渲染后的组件定义
+            cv, err := r.manifestStore.GetComponent(compName, compRef.Version, tmplCtx)
+            if err != nil {
+                errs = append(errs, err)
+                continue
+            }
+            
+            // 从 ComponentFactory 获取 Phase 实例
             inst, err := r.componentFactory.Resolve(compName, compRef.Version, compRef.Inline)
             if err != nil {
                 errs = append(errs, err)
                 continue
             }
+            
             inst.Handler.SetVersionContext(vCtx)
+            inst.Handler.SetComponentVersion(cv)
             if !inst.Handler.NeedExecute(nil, bc) {
                 continue
             }
