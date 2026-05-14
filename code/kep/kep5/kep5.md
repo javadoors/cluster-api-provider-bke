@@ -1607,7 +1607,8 @@ func (r *ClusterVersionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 │    └─ 失败 → 标记 Status.Phase=Invalid                      │
 │ 3. 解析组件清单                                              │
 │    ├─ 遍历 spec.install.components 和 spec.upgrade.components│
-│    ├─ 调用 manifestStore.Get() 获取每个 ComponentVersion    │
+│    ├─ 调用 manifestStore.GetComponentManifests() 获取组件包  │
+│    │   └─ 传入 ctx=nil，仅获取元数据与清单，不渲染模板        │
 │    └─ 缺失 → 标记 Status.Phase=ManifestMissing              │
 │ 4. 兼容性校验                                                │
 │    ├─ 扁平化所有组件 (展开 composite)                        │
@@ -1642,13 +1643,26 @@ func (r *ReleaseImageReconciler) Reconcile(ctx context.Context, req ctrl.Request
         components = append(components, ComponentRef{Name: comp.Name, Version: comp.Version})
     }
 
-    // 3. 扁平化 composite 组件
+    // 3. 获取组件包并验证清单完整性 (ctx=nil 不渲染模板)
+    for _, comp := range components {
+        pkg, err := r.manifestStore.GetComponentManifests(comp.Name, comp.Version, nil)
+        if err != nil {
+            return r.updateStatus(ctx, ri, cvoapi.PhaseManifestMissing, 
+                fmt.Sprintf("component %s@%s not found: %v", comp.Name, comp.Version, err))
+        }
+        if pkg.Metadata == nil {
+            return r.updateStatus(ctx, ri, cvoapi.PhaseManifestMissing,
+                fmt.Sprintf("component %s@%s missing component.yaml", comp.Name, comp.Version))
+        }
+    }
+
+    // 4. 扁平化 composite 组件
     flatList, err := r.flattenComponents(components)
     if err != nil {
         return r.updateStatus(ctx, ri, cvoapi.PhaseInvalid, err.Error())
     }
 
-    // 4. 兼容性校验
+    // 5. 兼容性校验
     if err := CheckCompatibility(flatList, r.manifestStore); err != nil {
         return r.updateStatus(ctx, ri, cvoapi.PhaseCompatibilityFailed, err.Error())
     }
@@ -1723,7 +1737,7 @@ func (r *UpgradePathReconciler) FindPath(from, to string) ([]cvoapi.UpgradePathE
 
 #### 4.6.5 BKEClusterReconciler 增强设计
 
-**核心代码片段 (DAG 调度与 Factory 调用)**：
+**核心代码片段 (DAG 调度与执行分支)**：
 
 ```go
 func (r *BKEClusterReconciler) executeDAG(ctx context.Context, bc *bkev1beta1.BKECluster, dag *topology.DAG, scenario string) error {
@@ -1742,29 +1756,36 @@ func (r *BKEClusterReconciler) executeDAG(ctx context.Context, bc *bkev1beta1.BK
                 continue
             }
             
-            // 应用资源清单（等价于 kubectl apply）
-            if err := r.manifestApplier.ApplyManifests(ctx, pkg.Manifests); err != nil {
-                errs = append(errs, fmt.Errorf("%s apply manifests: %w", compName, err))
-                if compRef.Strategy.FailurePolicy == "FailFast" { 
-                    return kerrors.NewAggregate(errs) 
+            // 执行分支判断：inline 组件走 Phase 逻辑，其余走清单 Apply 逻辑
+            if compRef.Inline != nil {
+                // Inline 组件：通过 ComponentFactory 获取 Phase 实例执行
+                inst, err := r.componentFactory.Resolve(compName, compRef.Version, compRef.Inline)
+                if err != nil {
+                    errs = append(errs, err)
+                    continue
                 }
-            }
-            
-            // 从 ComponentFactory 获取 Phase 实例
-            inst, err := r.componentFactory.Resolve(compName, compRef.Version, compRef.Inline)
-            if err != nil {
-                errs = append(errs, err)
-                continue
-            }
-            
-            inst.Handler.SetVersionContext(vCtx)
-            inst.Handler.SetComponentPackage(pkg)
-            if !inst.Handler.NeedExecute(nil, bc) {
-                continue
-            }
-            if err := inst.Handler.Execute(); err != nil {
-                errs = append(errs, fmt.Errorf("%s: %w", compName, err))
-                if compRef.Strategy.FailurePolicy == "FailFast" { return kerrors.NewAggregate(errs) }
+                
+                inst.Handler.SetVersionContext(vCtx)
+                inst.Handler.SetComponentPackage(pkg)
+                if !inst.Handler.NeedExecute(nil, bc) {
+                    continue
+                }
+                if err := inst.Handler.Execute(ctx); err != nil {
+                    errs = append(errs, fmt.Errorf("%s inline phase: %w", compName, err))
+                    if compRef.Strategy.FailurePolicy == "FailFast" { 
+                        return kerrors.NewAggregate(errs) 
+                    }
+                }
+            } else {
+                // 非 Inline 组件：通过 ManifestApplier 应用 YAML 清单
+                if len(pkg.Manifests) > 0 {
+                    if err := r.manifestApplier.ApplyManifests(ctx, pkg.Manifests); err != nil {
+                        errs = append(errs, fmt.Errorf("%s apply manifests: %w", compName, err))
+                        if compRef.Strategy.FailurePolicy == "FailFast" { 
+                            return kerrors.NewAggregate(errs) 
+                        }
+                    }
+                }
             }
         }
         if len(errs) > 0 { return kerrors.NewAggregate(errs) }
@@ -2438,3 +2459,334 @@ func (p *EnsurePreUpgradeResources) provisionResource(ctx context.Context, spec 
 | 依赖图存在环路 | DAG 构建死锁 | 拓扑排序前执行环检测算法；超时强制中断并记录 `CycleDetected` 事件 |
 | 兼容性校验误报/漏报 | 升级中断或集群不稳定 | 提供 `--skip-compatibility-check` 紧急开关；规则支持热更新；记录详细审计日志 |
 | Phase 上下文注入丢失 | 升级决策错误 | `NeedExecute` 增加 nil 保护；单元测试覆盖上下文生命周期；Feature Gate 灰度 |
+
+## 11. 安装与升级完整 CR 执行样例
+
+### 11.1 场景说明
+
+本样例展示从 **新建集群安装 v2.5.0** 到 **升级到 v2.6.0** 的完整 CR 流转过程。
+
+### 11.2 阶段一：新建集群安装 (v2.5.0)
+
+#### 步骤 1：创建 UpgradePath（全局升级路径定义）
+
+```yaml
+# upgradepath.yaml
+apiVersion: cvo.openfuyao.cn/v1beta1
+kind: UpgradePath
+metadata:
+  name: openfuyao-upgrade-paths
+spec:
+  ociRef: "registry/openfuyao-upgradepath:latest"
+  paths:
+    - from: "v2.4.0"
+      to: "v2.5.0"
+      blocked: false
+      deprecated: true
+    - from: "v2.5.0"
+      to: "v2.6.0"
+      blocked: false
+      deprecated: false
+    - from: "v2.4.0"
+      to: "v2.6.0"
+      blocked: true
+      notes: "Direct upgrade blocked, please upgrade via v2.5.0"
+status:
+  phase: Active
+  lastDigest: "sha256:abc123..."
+  pathCount: 3
+```
+
+#### 步骤 2：创建 ReleaseImage v2.5.0（安装清单）
+
+```yaml
+# releaseimage-v2.5.0.yaml
+apiVersion: cvo.openfuyao.cn/v1beta1
+kind: ReleaseImage
+metadata:
+  name: release-v2.5.0
+  annotations:
+    cvo.openfuyao.cn/oci-digest: "sha256:def456..."
+spec:
+  version: "v2.5.0"
+  ociRef: "registry/openfuyao-release:v2.5.0"
+  install:
+    components:
+      - name: kubernetes
+        version: v1.28.0
+      - name: etcd
+        version: v3.5.10
+      - name: bke-provider
+        version: v1.0.0
+  upgrade:
+    components:
+      - name: pre-upgrade-resources
+        version: v1.0.0
+      - name: provider-upgrade
+        version: v1.1.0
+      - name: etcd-upgrade
+        version: v3.5.10
+status:
+  phase: Valid
+  componentCount: 6
+  validatedAt: "2026-05-09T10:00:00Z"
+```
+
+#### 步骤 3：创建 BKECluster 与 ClusterVersion（触发安装）
+
+```yaml
+# bkecluster.yaml
+apiVersion: infra.openfuyao.cn/v1beta1
+kind: BKECluster
+metadata:
+  name: prod-cluster-01
+  namespace: default
+spec:
+  kubernetesVersion: v1.28.0
+  etcdVersion: v3.5.10
+  networking:
+    podCIDR: "10.244.0.0/16"
+    serviceCIDR: "10.96.0.0/12"
+    dnsDomain: "cluster.local"
+  controlPlane:
+    replicas: 3
+  region: cn-hangzhou
+  availabilityZone: cn-hangzhou-a
+---
+# clusterversion.yaml
+apiVersion: cvo.openfuyao.cn/v1beta1
+kind: ClusterVersion
+metadata:
+  name: prod-cluster-01-version
+  namespace: default
+  ownerReferences:
+    - apiVersion: infra.openfuyao.cn/v1beta1
+      kind: BKECluster
+      name: prod-cluster-01
+      uid: <bkecluster-uid>
+spec:
+  desiredVersion: v2.5.0
+  releaseImageRef: release-v2.5.0
+status:
+  currentVersion: ""
+  desiredVersion: v2.5.0
+  phase: Installing
+  installProgress:
+    currentComponent: kubernetes
+    completedComponents:
+      - etcd
+    totalComponents: 3
+```
+
+**安装执行流程**：
+
+```txt
+1. ClusterVersionReconciler 检测到 desiredVersion=v2.5.0，releaseImageRef 已设置
+2. 验证 ReleaseImage.Status.Phase=Valid，标记 upgrade-ready Annotation
+3. BKEClusterReconciler 检测到 Annotation，判断为 Install 场景
+4. 构建 VersionContext (Current 为空，Target 从 ReleaseImage 解析)
+5. 构建 TemplateContext (从 BKECluster 提取网络、区域等配置)
+6. 解析 ReleaseImage.Spec.Install.Components 构建安装 DAG
+7. 按拓扑顺序执行组件:
+   ├─ etcd (先执行，无依赖)
+   │   ├─ GetComponentManifests("etcd", "v3.5.10", tmplCtx)
+   │   ├─ ApplyManifests(01-crd.yaml, 02-rbac.yaml, 03-statefulset.yaml)
+   │   └─ 标记 Succeeded
+   ├─ kubernetes (依赖 etcd)
+   │   ├─ GetComponentManifests("kubernetes", "v1.28.0", tmplCtx)
+   │   ├─ ApplyManifests(01-crd.yaml, 02-rbac.yaml, 03-configmap.yaml, 04-deployment.yaml)
+   │   └─ 标记 Succeeded
+   └─ bke-provider (依赖 kubernetes)
+       ├─ GetComponentManifests("bke-provider", "v1.0.0", tmplCtx)
+       ├─ ApplyManifests(01-rbac.yaml, 02-deployment.yaml, 03-service.yaml)
+       └─ 标记 Succeeded
+8. 更新 ClusterVersion.Status:
+   ├─ currentVersion: v2.5.0
+   ├─ phase: Installed
+   └─ installProgress: completed
+```
+
+### 11.3 阶段二：升级到 v2.6.0
+
+#### 步骤 4：创建 ReleaseImage v2.6.0（目标版本清单）
+
+```yaml
+# releaseimage-v2.6.0.yaml
+apiVersion: cvo.openfuyao.cn/v1beta1
+kind: ReleaseImage
+metadata:
+  name: release-v2.6.0
+  annotations:
+    cvo.openfuyao.cn/oci-digest: "sha256:ghi789..."
+spec:
+  version: "v2.6.0"
+  ociRef: "registry/openfuyao-release:v2.6.0"
+  install:
+    components:
+      - name: kubernetes
+        version: v1.29.0
+      - name: etcd
+        version: v3.5.12
+      - name: bke-provider
+        version: v1.2.0
+  upgrade:
+    components:
+      - name: pre-upgrade-resources
+        version: v1.0.0
+        inline:
+          handler: EnsurePreUpgradeResources
+          version: v1.0
+      - name: provider-upgrade
+        version: v1.2.0
+        inline:
+          handler: EnsureProviderUpgrade
+          version: v1.0
+      - name: etcd-upgrade
+        version: v3.5.12
+        inline:
+          handler: EnsureEtcdUpgrade
+          version: v1.0
+status:
+  phase: Valid
+  componentCount: 6
+  validatedAt: "2026-05-10T08:00:00Z"
+```
+
+#### 步骤 5：更新 ClusterVersion 触发升级
+
+```yaml
+# 更新 clusterversion.yaml
+apiVersion: cvo.openfuyao.cn/v1beta1
+kind: ClusterVersion
+metadata:
+  name: prod-cluster-01-version
+  namespace: default
+spec:
+  desiredVersion: v2.6.0          # 从 v2.5.0 改为 v2.6.0
+  releaseImageRef: release-v2.6.0 # 指向新版本
+status:
+  currentVersion: v2.5.0          # 保持当前版本
+  desiredVersion: v2.6.0
+  phase: Upgrading
+  upgradeProgress:
+    currentComponent: pre-upgrade-resources
+    completedComponents: []
+    totalComponents: 3
+    path:
+      - from: v2.5.0
+        to: v2.6.0
+```
+
+**升级执行流程**：
+
+```txt
+1. ClusterVersionReconciler 检测到 desiredVersion 从 v2.5.0 变更为 v2.6.0
+2. 调用 UpgradePathGraph.FindPath("v2.5.0", "v2.6.0") 获取路径
+   ├─ 返回: [{from: v2.5.0, to: v2.6.0, blocked: false}]
+   └─ 路径合法，继续
+3. 验证 ReleaseImage v2.6.0.Status.Phase=Valid
+4. 执行兼容性校验 (CSP 求解器)
+   ├─ 检查 kubernetes v1.29.0 与 etcd v3.5.12 兼容性
+   └─ 通过
+5. 标记 BKECluster Annotation: cvo.openfuyao.cn/upgrade-ready=v2.6.0
+6. BKEClusterReconciler 检测到 Annotation，判断为 Upgrade 场景
+7. 构建 VersionContext:
+   ├─ Current: {kubernetes: v1.28.0, etcd: v3.5.10, bke-provider: v1.0.0}
+   └─ Target:  {kubernetes: v1.29.0, etcd: v3.5.12, bke-provider: v1.2.0}
+8. 构建 TemplateContext (复用 BKECluster 配置)
+9. 解析 ReleaseImage.Spec.Upgrade.Components 构建升级 DAG
+10. 按拓扑顺序执行组件:
+    ├─ pre-upgrade-resources (inline 组件，最先执行)
+    │   ├─ GetComponentManifests("pre-upgrade-resources", "v1.0.0", tmplCtx)
+    │   ├─ Inline 分支: compRef.Inline != nil
+    │   ├─ ComponentFactory.Resolve("EnsurePreUpgradeResources", "v1.0", inline)
+    │   ├─ NeedExecute() → true (targetVer != currentVer)
+    │   ├─ Execute():
+    │   │   ├─ 创建 ConfigMap: bke-new-feature-config
+    │   │   └─ 创建 Secret: bke-new-cert
+    │   └─ 标记 Succeeded
+    ├─ provider-upgrade (inline 组件)
+    │   ├─ GetComponentManifests("provider-upgrade", "v1.2.0", tmplCtx)
+    │   ├─ Inline 分支: compRef.Inline != nil
+    │   ├─ ComponentFactory.Resolve("EnsureProviderUpgrade", "v1.0", inline)
+    │   ├─ NeedExecute() → true (v1.0.0 → v1.2.0)
+    │   ├─ Execute():
+    │   │   ├─ 滚动更新 bke-provider Deployment
+    │   │   └─ 验证 Provider 健康状态
+    │   └─ 标记 Succeeded
+    └─ etcd-upgrade (inline 组件)
+        ├─ GetComponentManifests("etcd-upgrade", "v3.5.12", tmplCtx)
+        ├─ Inline 分支: compRef.Inline != nil
+        ├─ ComponentFactory.Resolve("EnsureEtcdUpgrade", "v1.0", inline)
+        ├─ NeedExecute() → true (v3.5.10 → v3.5.12)
+        ├─ Execute():
+        │   ├─ 执行 etcd 备份
+        │   ├─ 逐个滚动升级 etcd Pod
+        │   └─ 验证 etcd 集群健康
+        └─ 标记 Succeeded
+11. 更新 ClusterVersion.Status:
+    ├─ currentVersion: v2.6.0
+    ├─ currentReleaseImageRef: release-v2.6.0
+    ├─ phase: Upgraded
+    └─ upgradeProgress: completed
+12. 清除 BKECluster Annotation: cvo.openfuyao.cn/upgrade-ready
+```
+
+### 11.4 CR 关联关系图
+
+```txt
+┌─────────────────────────────────────────────────────────────────┐
+│                        BKECluster                               │
+│  name: prod-cluster-01                                          │
+│  spec.kubernetesVersion: v1.29.0 (升级后)                        │
+│  spec.etcdVersion: v3.5.12 (升级后)                              │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │ OwnerReference (1:1)
+                           ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                      ClusterVersion                              │
+│  name: prod-cluster-01-version                                   │
+│  spec.desiredVersion: v2.6.0                                     │
+│  spec.releaseImageRef: release-v2.6.0 ──────────────────────┐   │
+│  status.currentVersion: v2.6.0                              │   │
+│  status.phase: Upgraded                                     │   │
+└──────────────────────────────────────────────────────────────┼───┘
+                                                               │
+                                                               │ 引用
+                                                               ▼
+┌──────────────────────────────────────────────────────────────────┐
+│                       ReleaseImage                               │
+│  name: release-v2.6.0                                           │
+│  spec.version: v2.6.0                                           │
+│  spec.install.components: [{kubernetes: v1.29.0}, {etcd: v3.5.12}]│
+│  spec.upgrade.components: [{pre-upgrade-resources}, {provider},  │
+│                            {etcd-upgrade}]                       │
+└──────────────────────────────────────────────────────────────────┘
+       │                                                           
+       │ 按 (name, version) 定位                                   
+       ▼                                                           
+┌──────────────────────────────────────────────────────────────────┐
+│              bke-manifests (ComponentVersion)                    │
+│  kubernetes/v1.29.0/component.yaml                               │
+│  etcd/v3.5.12/component.yaml                                     │
+│  pre-upgrade-resources/v1.0.0/component.yaml                     │
+└──────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────┐
+│                       UpgradePath                                │
+│  name: openfuyao-upgrade-paths                                   │
+│  spec.paths: [{v2.5.0→v2.6.0, blocked: false}]                   │
+│  status.phase: Active                                            │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### 11.5 关键状态流转
+
+| 阶段 | ClusterVersion.Status.Phase | BKECluster.Annotation | 说明 |
+| ---- | --------------------------- | --------------------- | ---- |
+| 初始 | `""` | 无 | 新集群，未关联版本 |
+| 安装中 | `Installing` | 无 | 正在执行安装 DAG |
+| 安装完成 | `Installed` | 无 | 所有组件安装成功 |
+| 升级请求 | `Upgrading` | `upgrade-ready=v2.6.0` | 用户修改 desiredVersion |
+| 升级中 | `Upgrading` | `upgrade-ready=v2.6.0` | 正在执行升级 DAG |
+| 升级完成 | `Upgraded` | 无 (已清除) | 所有组件升级成功 |

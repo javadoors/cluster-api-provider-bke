@@ -1495,7 +1495,7 @@ flowchart TD
     PullVerify -->|失败| Invalid["标记 Status.Phase=Invalid"]
     
     PullVerify -->|成功| Step3["3. 解析组件清单"]
-    Step3 --> ParseComponents["遍历 spec.install.components 和 spec.upgrade.components<br/>调用 manifestStore.Get() 获取每个 ComponentVersion"]
+    Step3 --> ParseComponents["遍历 spec.install.components 和 spec.upgrade.components<br/>调用 manifestStore.GetComponentManifests() 获取组件包<br/>传入 ctx=nil，仅获取元数据与清单，不渲染模板"]
     ParseComponents -->|缺失| Missing["标记 Status.Phase=ManifestMissing"]
     
     ParseComponents -->|成功| Step4["4. 兼容性校验"]
@@ -1536,13 +1536,26 @@ func (r *ReleaseImageReconciler) Reconcile(ctx context.Context, req ctrl.Request
         components = append(components, ComponentRef{Name: comp.Name, Version: comp.Version})
     }
 
-    // 3. 扁平化 composite 组件
+    // 3. 获取组件包并验证清单完整性 (ctx=nil 不渲染模板)
+    for _, comp := range components {
+        pkg, err := r.manifestStore.GetComponentManifests(comp.Name, comp.Version, nil)
+        if err != nil {
+            return r.updateStatus(ctx, ri, cvoapi.PhaseManifestMissing, 
+                fmt.Sprintf("component %s@%s not found: %v", comp.Name, comp.Version, err))
+        }
+        if pkg.Metadata == nil {
+            return r.updateStatus(ctx, ri, cvoapi.PhaseManifestMissing,
+                fmt.Sprintf("component %s@%s missing component.yaml", comp.Name, comp.Version))
+        }
+    }
+
+    // 4. 扁平化 composite 组件
     flatList, err := r.flattenComponents(components)
     if err != nil {
         return r.updateStatus(ctx, ri, cvoapi.PhaseInvalid, err.Error())
     }
 
-    // 4. 兼容性校验
+    // 5. 兼容性校验
     if err := CheckCompatibility(flatList, r.manifestStore); err != nil {
         return r.updateStatus(ctx, ri, cvoapi.PhaseCompatibilityFailed, err.Error())
     }
@@ -1620,7 +1633,7 @@ func (r *UpgradePathReconciler) FindPath(from, to string) ([]cvoapi.UpgradePathE
 
 #### 4.6.5 BKEClusterReconciler 增强设计
 
-**核心代码片段 (DAG 调度与 Factory 调用)**：
+**核心代码片段 (DAG 调度与执行分支)**：
 
 ```go
 func (r *BKEClusterReconciler) executeDAG(ctx context.Context, bc *bkev1beta1.BKECluster, dag *topology.DAG, scenario string) error {
@@ -1632,28 +1645,43 @@ func (r *BKEClusterReconciler) executeDAG(ctx context.Context, bc *bkev1beta1.BK
         for _, compName := range batch {
             compRef := dag.GetComponent(compName)
             
-            // 从 ManifestStore 获取渲染后的组件定义
-            cv, err := r.manifestStore.GetComponent(compName, compRef.Version, tmplCtx)
+            // 从 ManifestStore 获取组件完整包（元数据 + 所有资源清单）
+            pkg, err := r.manifestStore.GetComponentManifests(compName, compRef.Version, tmplCtx)
             if err != nil {
                 errs = append(errs, err)
                 continue
             }
             
-            // 从 ComponentFactory 获取 Phase 实例
-            inst, err := r.componentFactory.Resolve(compName, compRef.Version, compRef.Inline)
-            if err != nil {
-                errs = append(errs, err)
-                continue
-            }
-            
-            inst.Handler.SetVersionContext(vCtx)
-            inst.Handler.SetComponentVersion(cv)
-            if !inst.Handler.NeedExecute(nil, bc) {
-                continue
-            }
-            if err := inst.Handler.Execute(); err != nil {
-                errs = append(errs, fmt.Errorf("%s: %w", compName, err))
-                if compRef.Strategy.FailurePolicy == "FailFast" { return kerrors.NewAggregate(errs) }
+            // 执行分支判断：inline 组件走 Phase 逻辑，其余走清单 Apply 逻辑
+            if compRef.Inline != nil {
+                // Inline 组件：通过 ComponentFactory 获取 Phase 实例执行
+                inst, err := r.componentFactory.Resolve(compName, compRef.Version, compRef.Inline)
+                if err != nil {
+                    errs = append(errs, err)
+                    continue
+                }
+                
+                inst.Handler.SetVersionContext(vCtx)
+                inst.Handler.SetComponentPackage(pkg)
+                if !inst.Handler.NeedExecute(nil, bc) {
+                    continue
+                }
+                if err := inst.Handler.Execute(ctx); err != nil {
+                    errs = append(errs, fmt.Errorf("%s inline phase: %w", compName, err))
+                    if compRef.Strategy.FailurePolicy == "FailFast" { 
+                        return kerrors.NewAggregate(errs) 
+                    }
+                }
+            } else {
+                // 非 Inline 组件：通过 ManifestApplier 应用 YAML 清单
+                if len(pkg.Manifests) > 0 {
+                    if err := r.manifestApplier.ApplyManifests(ctx, pkg.Manifests); err != nil {
+                        errs = append(errs, fmt.Errorf("%s apply manifests: %w", compName, err))
+                        if compRef.Strategy.FailurePolicy == "FailFast" { 
+                            return kerrors.NewAggregate(errs) 
+                        }
+                    }
+                }
             }
         }
         if len(errs) > 0 { return kerrors.NewAggregate(errs) }
