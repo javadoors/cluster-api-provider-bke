@@ -644,12 +644,31 @@ bke-manifests/
 └── kubernetes/
     └── v1.29.0/
         ├── component.yaml          # 组件元数据（版本、依赖、策略）
-        ├── rbac.yaml               # RBAC 资源（ServiceAccount/Role/ClusterRoleBinding）
-        ├── configmap.yaml          # ConfigMap 配置
-        ├── secret.yaml             # Secret 资源（可选）
-        ├── deployment.yaml         # Deployment/StatefulSet/DaemonSet
-        └── crd.yaml                # CRD 定义（可选）
+        ├── 01-crd.yaml             # CRD 定义（数字前缀控制顺序）
+        ├── 02-rbac.yaml            # RBAC 资源（ServiceAccount/Role/ClusterRoleBinding）
+        ├── 03-configmap.yaml       # ConfigMap 配置
+        ├── 04-secret.yaml          # Secret 资源（可选）
+        ├── 05-deployment.yaml      # Deployment/StatefulSet/DaemonSet
+        └── 06-service.yaml         # Service 资源
 ```
+
+**文件命名与排序规则**：
+
+清单文件按**文件名称自然序（字母顺序）**排序后依次应用。推荐使用**数字前缀**明确控制应用顺序，确保依赖关系正确：
+
+| 前缀 | 文件示例 | 说明 |
+| ---- | -------- | ---- |
+| `01-` | `01-crd.yaml` | CRD 优先创建，后续资源才能引用自定义资源类型 |
+| `02-` | `02-rbac.yaml` | RBAC 权限配置，为后续工作负载提供访问控制 |
+| `03-` | `03-configmap.yaml` | ConfigMap 配置，工作负载启动前需就绪 |
+| `04-` | `04-secret.yaml` | Secret 敏感数据，如证书、密钥 |
+| `05-` | `05-deployment.yaml` | Deployment/StatefulSet/DaemonSet 工作负载 |
+| `06-` | `06-service.yaml` | Service/Ingress 网络暴露 |
+
+**设计优势**：
+- **灵活性**：清单维护者可通过调整文件名前缀自由控制应用顺序，无需修改代码
+- **可读性**：文件名即文档，目录结构清晰展示资源创建顺序
+- **可扩展**：新增资源类型只需添加文件并分配合适前缀，无需更新硬编码优先级表
 
 **架构设计**：
 
@@ -857,21 +876,8 @@ func (s *ManifestStore) loadFromOCI(img *oci.Image, name, version string) (*Comp
     return pkg, nil
 }
 
-// sortManifests 按依赖顺序排序清单文件
+// sortManifests 按文件名称自然序排序清单文件
 func (s *ManifestStore) sortManifests(files []string, baseDir string) []ResourceManifest {
-    kindPriority := map[string]int{
-        "crd.yaml":        0,
-        "rbac.yaml":       1,
-        "serviceaccount.yaml": 1,
-        "configmap.yaml":  2,
-        "secret.yaml":     3,
-        "deployment.yaml": 4,
-        "daemonset.yaml":  4,
-        "statefulset.yaml": 4,
-        "service.yaml":    5,
-        "ingress.yaml":    6,
-    }
-    
     var manifests []ResourceManifest
     for _, file := range files {
         var data []byte
@@ -887,10 +893,10 @@ func (s *ManifestStore) sortManifests(files []string, baseDir string) []Resource
         })
     }
     
+    // 按文件名称自然序排序（字母顺序）
+    // 文件名建议使用前缀数字控制顺序，如 01-crd.yaml, 02-rbac.yaml
     sort.Slice(manifests, func(i, j int) bool {
-        pi := kindPriority[manifests[i].FileName]
-        pj := kindPriority[manifests[j].FileName]
-        return pi < pj
+        return manifests[i].FileName < manifests[j].FileName
     })
     
     return manifests
