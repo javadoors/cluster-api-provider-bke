@@ -915,6 +915,47 @@ func (s *ManifestStore) renderYAMLContent(data []byte, ctx *TemplateContext) ([]
     
     return buf.Bytes(), nil
 }
+
+func (s *ManifestStore) GetReleaseImage(version string) (*ReleaseImage, error) {
+    key := fmt.Sprintf("release-image@%s", version)
+    if val, ok := s.cache.Load(key); ok {
+        return val.(*ReleaseImage), nil
+    }
+    
+    // 1. 尝试从本地加载 release.yaml
+    localPath := fmt.Sprintf("%s/release-%s.yaml", s.localPath, version)
+    if data, err := os.ReadFile(localPath); err == nil {
+        ri := &ReleaseImage{}
+        if err := yaml.Unmarshal(data, ri); err == nil {
+            s.cache.Store(key, ri)
+            return ri, nil
+        }
+    }
+    
+    // 2. 降级：从 OCI 拉取
+    img, err := s.ociClient.Pull(fmt.Sprintf("registry/openfuyao-release:%s", version))
+    if err != nil { return nil, err }
+    
+    // 优先读取 release.yaml layer，否则解析 config
+    layer, err := img.GetLayerByPath("release.yaml")
+    if err != nil {
+        // fallback: 解析 OCI config 为 ReleaseImage
+        cfg, err := img.ConfigFile()
+        if err != nil { return nil, err }
+        ri := &ReleaseImage{}
+        if err := json.Unmarshal(cfg.Config.Labels["release-spec"], ri); err != nil {
+            return nil, err
+        }
+        s.cache.Store(key, ri)
+        return ri, nil
+    }
+    
+    ri := &ReleaseImage{}
+    if err := yaml.Unmarshal(layer.Content, ri); err != nil { return nil, err }
+    
+    s.cache.Store(key, ri)
+    return ri, nil
+}
 ```
 
 **ApplyManifests 应用接口**：
@@ -983,48 +1024,6 @@ func (a *ManifestApplier) DeleteManifests(ctx context.Context, manifests []Resou
         }
     }
     return nil
-}
-```
-
-func (s *ManifestStore) GetReleaseImage(version string) (*ReleaseImage, error) {
-    key := fmt.Sprintf("release-image@%s", version)
-    if val, ok := s.cache.Load(key); ok {
-        return val.(*ReleaseImage), nil
-    }
-    
-    // 1. 尝试从本地加载 release.yaml
-    localPath := fmt.Sprintf("%s/release-%s.yaml", s.localPath, version)
-    if data, err := os.ReadFile(localPath); err == nil {
-        ri := &ReleaseImage{}
-        if err := yaml.Unmarshal(data, ri); err == nil {
-            s.cache.Store(key, ri)
-            return ri, nil
-        }
-    }
-    
-    // 2. 降级：从 OCI 拉取
-    img, err := s.ociClient.Pull(fmt.Sprintf("registry/openfuyao-release:%s", version))
-    if err != nil { return nil, err }
-    
-    // 优先读取 release.yaml layer，否则解析 config
-    layer, err := img.GetLayerByPath("release.yaml")
-    if err != nil {
-        // fallback: 解析 OCI config 为 ReleaseImage
-        cfg, err := img.ConfigFile()
-        if err != nil { return nil, err }
-        ri := &ReleaseImage{}
-        if err := json.Unmarshal(cfg.Config.Labels["release-spec"], ri); err != nil {
-            return nil, err
-        }
-        s.cache.Store(key, ri)
-        return ri, nil
-    }
-    
-    ri := &ReleaseImage{}
-    if err := yaml.Unmarshal(layer.Content, ri); err != nil { return nil, err }
-    
-    s.cache.Store(key, ri)
-    return ri, nil
 }
 ```
 
