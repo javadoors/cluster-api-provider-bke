@@ -4091,3 +4091,266 @@ status:
 | 升级请求 | `Upgrading` | `upgrade-ready=v2.6.0` | 用户修改 desiredVersion |
 | 升级中 | `Upgrading` | `upgrade-ready=v2.6.0` | 正在执行升级 DAG |
 | 升级完成 | `Upgraded` | 无 (已清除) | 所有组件升级成功 |
+
+## 12. 附录：CRD 定义
+
+本节提供 `ClusterVersion`、`ReleaseImage`、`UpgradePath` 和 `ComponentVersion` 的完整 Kubernetes CRD (CustomResourceDefinition) YAML 定义。
+
+### 12.1 ClusterVersion CRD
+
+```yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: clusterversions.cvo.openfuyao.cn
+spec:
+  group: cvo.openfuyao.cn
+  names:
+    kind: ClusterVersion
+    listKind: ClusterVersionList
+    plural: clusterversions
+    singular: clusterversion
+    shortNames:
+      - cv
+  scope: Namespaced
+  versions:
+    - name: v1beta1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                desiredVersion:
+                  type: string
+                  description: "Target version for the cluster"
+                releaseImageRef:
+                  type: string
+                  description: "Reference to the ReleaseImage resource"
+            status:
+              type: object
+              properties:
+                currentVersion:
+                  type: string
+                  description: "Current version of the cluster"
+                phase:
+                  type: string
+                  enum: ["Pending", "Installing", "Installed", "Ready", "PreChecking", "Upgrading", "Upgraded", "Blocked", "PreCheckFailed", "Failed"]
+                upgradeHistory:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      from: { type: string }
+                      to: { type: string }
+                      startedAt: { type: string, format: date-time }
+                      completedAt: { type: string, format: date-time }
+                      status: { type: string, enum: ["Succeeded", "Failed", "RolledBack"] }
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type: { type: string }
+                      status: { type: string, enum: ["True", "False", "Unknown"] }
+                      reason: { type: string }
+                      message: { type: string }
+                      lastTransitionTime: { type: string, format: date-time }
+```
+
+### 12.2 ReleaseImage CRD
+
+```yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: releaseimages.cvo.openfuyao.cn
+spec:
+  group: cvo.openfuyao.cn
+  names:
+    kind: ReleaseImage
+    listKind: ReleaseImageList
+    plural: releaseimages
+    singular: releaseimage
+    shortNames:
+      - ri
+  scope: Namespaced
+  versions:
+    - name: v1beta1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                version: { type: string }
+                ociRef: { type: string }
+                install:
+                  type: object
+                  properties:
+                    components:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          name: { type: string }
+                          version: { type: string }
+                upgrade:
+                  type: object
+                  properties:
+                    components:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          name: { type: string }
+                          version: { type: string }
+                          inline:
+                            type: object
+                            properties:
+                              handler: { type: string }
+                              version: { type: string }
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  enum: ["Valid", "Invalid", "ManifestMissing", "CompatibilityFailed"]
+                componentCount: { type: integer }
+                validatedAt: { type: string, format: date-time }
+```
+
+### 12.3 UpgradePath CRD
+
+```yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: upgradepaths.cvo.openfuyao.cn
+spec:
+  group: cvo.openfuyao.cn
+  names:
+    kind: UpgradePath
+    listKind: UpgradePathList
+    plural: upgradepaths
+    singular: upgradepath
+    shortNames:
+      - up
+  scope: Cluster
+  versions:
+    - name: v1beta1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                ociRef: { type: string }
+                paths:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      from: { type: string }
+                      to: { type: string }
+                      blocked: { type: boolean }
+                      deprecated: { type: boolean }
+                      notes: { type: string }
+                      preCheck:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            name: { type: string }
+                            required: { type: boolean }
+            status:
+              type: object
+              properties:
+                phase: { type: string, enum: ["Active", "Invalid"] }
+                lastDigest: { type: string }
+                pathCount: { type: integer }
+                lastCheckedAt: { type: string, format: date-time }
+```
+
+### 12.4 ComponentVersion CRD
+
+```yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: componentversions.cvo.openfuyao.cn
+spec:
+  group: cvo.openfuyao.cn
+  names:
+    kind: ComponentVersion
+    listKind: ComponentVersionList
+    plural: componentversions
+    singular: componentversion
+    shortNames:
+      - cv
+  scope: Namespaced
+  versions:
+    - name: v1beta1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                name: { type: string }
+                type: { type: string, enum: ["yaml", "helm", "inline", "binary"] }
+                version: { type: string }
+                inline:
+                  type: object
+                  properties:
+                    handler: { type: string }
+                    version: { type: string }
+                subComponents:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      name: { type: string }
+                      version: { type: string }
+                compatibility:
+                  type: object
+                  properties:
+                    constraints:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          component: { type: string }
+                          rule: { type: string }
+                dependencies:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      name: { type: string }
+                      phase: { type: string }
+                upgradeStrategy:
+                  type: object
+                  properties:
+                    mode: { type: string }
+                    batchSize: { type: integer }
+                    timeout: { type: string }
+                    failurePolicy: { type: string, enum: ["FailFast", "Continue", "Rollback"] }
+                resources:
+                  type: array
+                  items:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+```
