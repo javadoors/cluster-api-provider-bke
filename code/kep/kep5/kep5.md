@@ -3715,23 +3715,37 @@ spec:
   ociRef: "registry/openfuyao-release:v2.5.0"
   install:
     components:
+      # YAML 类型组件
       - name: kubernetes
         version: v1.28.0
       - name: etcd
         version: v3.5.10
-      - name: bke-provider
+      # Helm 类型组件
+      - name: monitoring
+        version: v2.0.0
+      # Binary 类型组件
+      - name: containerd
+        version: v1.7.0
+      # Inline 类型组件
+      - name: pre-upgrade-resources
         version: v1.0.0
+        inline:
+          handler: EnsurePreUpgradeResources
+          version: v1.0
   upgrade:
     components:
       - name: pre-upgrade-resources
         version: v1.0.0
+        inline:
+          handler: EnsurePreUpgradeResources
+          version: v1.0
       - name: provider-upgrade
         version: v1.1.0
       - name: etcd-upgrade
         version: v3.5.10
 status:
   phase: Valid
-  componentCount: 6
+  componentCount: 5
   validatedAt: "2026-05-09T10:00:00Z"
 ```
 
@@ -3790,19 +3804,58 @@ status:
 4. 构建 VersionContext (Current 为空，Target 从 ReleaseImage 解析)
 5. 构建 TemplateContext (从 BKECluster 提取网络、区域等配置)
 6. 解析 ReleaseImage.Spec.Install.Components 构建安装 DAG
-7. 按拓扑顺序执行组件:
-   ├─ etcd (先执行，无依赖)
-   │   ├─ GetComponentManifests("etcd", "v3.5.10", tmplCtx)
-   │   ├─ ApplyManifests(01-crd.yaml, 02-rbac.yaml, 03-statefulset.yaml)
+7. 按拓扑顺序执行组件 (包含四种类型):
+   
+   ├─ [Inline] pre-upgrade-resources (最先执行，无依赖)
+   │   ├─ GetComponentManifests("pre-upgrade-resources", "v1.0.0", tmplCtx)
+   │   ├─ 识别 Type=inline，提取 InlineSpec
+   │   ├─ InstallerRegistry 路由到 InlineInstaller
+   │   ├─ ComponentFactory.Resolve("EnsurePreUpgradeResources", "v1.0")
+   │   ├─ handler.NeedExecute() → true
+   │   ├─ handler.Execute():
+   │   │   ├─ 创建 ConfigMap: bke-new-feature-config
+   │   │   └─ 创建 Secret: bke-new-cert
    │   └─ 标记 Succeeded
-   ├─ kubernetes (依赖 etcd)
+   │
+   ├─ [Binary] containerd (依赖 pre-upgrade-resources)
+   │   ├─ GetComponentManifests("containerd", "v1.7.0", tmplCtx)
+   │   ├─ 识别 Type=binary，加载 binary.yaml, install.sh, 压缩包
+   │   ├─ InstallerRegistry 路由到 BinaryInstaller
+   │   ├─ 校验二进制包 Checksum
+   │   ├─ 解压到临时目录
+   │   ├─ 渲染 install.sh 脚本 (注入 {{.Version}} 等变量)
+   │   └─ 通过 SSH/Agent 在目标节点执行脚本 → 标记 Succeeded
+   │
+   ├─ [YAML] etcd (依赖 containerd)
+   │   ├─ GetComponentManifests("etcd", "v3.5.10", tmplCtx)
+   │   ├─ 识别 Type=yaml，扫描 01-crd.yaml, 02-rbac.yaml, 03-statefulset.yaml
+   │   ├─ 渲染 YAML 中的模板变量 (如 {{.Namespace}}, {{.ControlPlaneReplicas}})
+   │   ├─ InstallerRegistry 路由到 YamlInstaller
+   │   ├─ ManifestApplier.ApplyManifests():
+   │   │   ├─ Apply 01-crd.yaml
+   │   │   ├─ Apply 02-rbac.yaml
+   │   │   └─ Apply 03-statefulset.yaml
+   │   └─ 标记 Succeeded
+   │
+   ├─ [YAML] kubernetes (依赖 etcd)
    │   ├─ GetComponentManifests("kubernetes", "v1.28.0", tmplCtx)
+   │   ├─ 识别 Type=yaml，扫描 YAML 文件
+   │   ├─ 渲染模板变量
+   │   ├─ InstallerRegistry 路由到 YamlInstaller
    │   ├─ ApplyManifests(01-crd.yaml, 02-rbac.yaml, 03-configmap.yaml, 04-deployment.yaml)
    │   └─ 标记 Succeeded
-   └─ bke-provider (依赖 kubernetes)
-       ├─ GetComponentManifests("bke-provider", "v1.0.0", tmplCtx)
-       ├─ ApplyManifests(01-rbac.yaml, 02-deployment.yaml, 03-service.yaml)
+   │
+   └─ [Helm] monitoring (依赖 kubernetes)
+       ├─ GetComponentManifests("monitoring", "v2.0.0", tmplCtx)
+       ├─ 识别 Type=helm，加载 Chart.yaml, values.yaml, templates/*
+       ├─ 渲染 values.yaml 中的模板变量
+       ├─ InstallerRegistry 路由到 HelmInstaller
+       ├─ Helm SDK action.NewInstall().Run():
+       │   ├─ 合并 pkg.Chart.Values 与 TemplateContext 生成的 Values
+       │   ├─ 渲染 templates 模板
+       │   └─ 创建 K8s 资源
        └─ 标记 Succeeded
+
 8. 更新 ClusterVersion.Status:
    ├─ currentVersion: v2.5.0
    ├─ phase: Installed
@@ -4178,12 +4231,228 @@ status:
 
 | 阶段 | ClusterVersion.Status.Phase | BKECluster.Annotation | 说明 |
 | ---- | --------------------------- | --------------------- | ---- |
-| 初始 | `""` | 无 | 新集群，未关联版本 |
+| 初始 | `Pending` | 无 | 新集群，未关联版本 |
 | 安装中 | `Installing` | 无 | 正在执行安装 DAG |
 | 安装完成 | `Installed` | 无 | 所有组件安装成功 |
-| 升级请求 | `Upgrading` | `upgrade-ready=v2.6.0` | 用户修改 desiredVersion |
-| 升级中 | `Upgrading` | `upgrade-ready=v2.6.0` | 正在执行升级 DAG |
-| 升级完成 | `Upgraded` | 无 (已清除) | 所有组件升级成功 |
+| 就绪 | `Ready` | 无 | `CurrentVersion` == `DesiredVersion`，等待升级 |
+| 预检中 | `PreChecking` | 无 | 校验升级路径与兼容性 |
+| 升级请求 | `PreChecking` | 无 | 用户修改 desiredVersion，开始预检 |
+| 预检拦截 | `Blocked` | 无 | 升级路径不存在或被拦截 |
+| 预检失败 | `PreCheckFailed` | 无 | 组件兼容性校验失败 |
+| 升级中 | `Upgrading` | `upgrade-ready=v2.6.0` | 预检通过，正在执行升级 DAG |
+| 升级完成 | `Upgraded` | 无 (已清除) | 升级 DAG 执行成功，即将转为 Ready |
+
+### 11.6 各类型组件安装样例
+
+本节详细展示四种组件类型（YAML、Helm、Binary、Inline）在 ManifestStore 中的目录结构、ComponentVersion 定义以及执行流程。
+
+#### 11.6.1 YAML 组件类型样例
+
+**场景**：安装 `etcd` 组件，使用标准 Kubernetes YAML 清单。
+
+**1. 目录结构**：
+
+```txt
+bke-manifests/
+└── etcd/
+    └── v3.5.12/
+        ├── component.yaml          # 组件元数据
+        ├── 01-crd.yaml             # CRD 定义
+        ├── 02-rbac.yaml            # RBAC 资源
+        └── 03-statefulset.yaml     # StatefulSet 工作负载
+```
+
+**2. ComponentVersion 定义**：
+
+```yaml
+# component.yaml
+apiVersion: cvo.openfuyao.cn/v1beta1
+kind: ComponentVersion
+metadata:
+  name: etcd-v3.5.12
+spec:
+  name: etcd
+  type: yaml                        # 声明为 yaml 类型
+  version: v3.5.12
+  upgradeStrategy:
+    mode: Batch
+    batchSize: 1
+    timeout: "30m"
+    failurePolicy: Rollback
+```
+
+**3. 执行流程**：
+
+```txt
+1. ManifestStore.GetComponentManifests("etcd", "v3.5.12", tmplCtx)
+   ├─ 读取 component.yaml，识别 Type=yaml
+   ├─ 扫描目录下 *.yaml 文件 (01-crd.yaml, 02-rbac.yaml, 03-statefulset.yaml)
+   ├─ 按文件名排序
+   └─ 若传入 tmplCtx，渲染 YAML 中的模板变量 (如 {{.Namespace}})
+2. InstallerRegistry.InstallComponent(ctx, pkg, vCtx)
+   ├─ 路由到 YamlInstaller
+   └─ 调用 ManifestApplier.ApplyManifests()
+       ├─ Apply 01-crd.yaml
+       ├─ Apply 02-rbac.yaml
+       └─ Apply 03-statefulset.yaml
+```
+
+#### 11.6.2 Helm 组件类型样例
+
+**场景**：安装 `monitoring` 组件，使用 Helm Chart 包。
+
+**1. 目录结构**：
+
+```txt
+bke-manifests/
+└── monitoring/
+    └── v2.0.0/
+        ├── component.yaml          # 组件元数据
+        ├── Chart.yaml              # Helm Chart 元数据
+        ├── values.yaml             # 默认 values
+        └── templates/
+            ├── deployment.yaml
+            └── service.yaml
+```
+
+**2. ComponentVersion 定义**：
+
+```yaml
+# component.yaml
+apiVersion: cvo.openfuyao.cn/v1beta1
+kind: ComponentVersion
+metadata:
+  name: monitoring-v2.0.0
+spec:
+  name: monitoring
+  type: helm                        # 声明为 helm 类型
+  version: v2.0.0
+  upgradeStrategy:
+    mode: Batch
+    batchSize: 1
+    timeout: "15m"
+    failurePolicy: Continue
+```
+
+**3. 执行流程**：
+
+```txt
+1. ManifestStore.GetComponentManifests("monitoring", "v2.0.0", tmplCtx)
+   ├─ 读取 component.yaml，识别 Type=helm
+   ├─ 加载 Chart.yaml, values.yaml, templates/* 到 pkg.Chart
+   └─ 渲染 values.yaml 中的模板变量
+2. InstallerRegistry.InstallComponent(ctx, pkg, vCtx)
+   ├─ 路由到 HelmInstaller
+   └─ 调用 Helm SDK:
+       ├─ 检查 Release 是否存在
+       ├─ 若不存在 → action.NewInstall().Run()
+       └─ 若存在 → action.NewUpgrade().Run()
+           └─ 合并 pkg.Chart.Values 与 TemplateContext 生成的 Values
+```
+
+#### 11.6.3 Binary 组件类型样例
+
+**场景**：安装 `containerd` 组件，使用二进制安装包。
+
+**1. 目录结构**：
+
+```txt
+bke-manifests/
+└── containerd/
+    └── v1.7.0/
+        ├── component.yaml          # 组件元数据
+        ├── binary.yaml             # 二进制包元数据
+        ├── containerd-1.7.0.tar.gz # 二进制压缩包
+        └── install.sh              # 安装脚本
+```
+
+**2. ComponentVersion 定义**：
+
+```yaml
+# component.yaml
+apiVersion: cvo.openfuyao.cn/v1beta1
+kind: ComponentVersion
+metadata:
+  name: containerd-v1.7.0
+spec:
+  name: containerd
+  type: binary                      # 声明为 binary 类型
+  version: v1.7.0
+  upgradeStrategy:
+    mode: Batch
+    batchSize: 1
+    timeout: "20m"
+    failurePolicy: FailFast
+```
+
+**3. 执行流程**：
+
+```txt
+1. ManifestStore.GetComponentManifests("containerd", "v1.7.0", tmplCtx)
+   ├─ 读取 component.yaml，识别 Type=binary
+   ├─ 解析 binary.yaml 获取 DownloadURL, Checksum
+   ├─ 加载 install.sh 到 pkg.Binary.InstallScript
+   └─ 缓存 containerd-1.7.0.tar.gz 到本地
+2. InstallerRegistry.InstallComponent(ctx, pkg, vCtx)
+   ├─ 路由到 BinaryInstaller
+   └─ 执行安装逻辑:
+       ├─ 校验二进制包 Checksum
+       ├─ 解压到临时目录
+       ├─ 渲染 install.sh 脚本 (注入 {{.Version}} 等变量)
+       └─ 通过 SSH/Agent 在目标节点执行脚本
+```
+
+#### 11.6.4 Inline 组件类型样例
+
+**场景**：执行 `pre-upgrade-resources` 预升级资源创建，使用内嵌 Go 代码。
+
+**1. 目录结构**：
+
+```txt
+bke-manifests/
+└── pre-upgrade-resources/
+    └── v1.0.0/
+        └── component.yaml          # 仅包含元数据，无其他文件
+```
+
+**2. ComponentVersion 定义**：
+
+```yaml
+# component.yaml
+apiVersion: cvo.openfuyao.cn/v1beta1
+kind: ComponentVersion
+metadata:
+  name: pre-upgrade-resources-v1.0.0
+spec:
+  name: pre-upgrade-resources
+  type: inline                      # 声明为 inline 类型
+  version: v1.0.0
+  inline:
+    handler: EnsurePreUpgradeResources  # 已注册的 Phase 处理器名称
+    version: v1.0
+  dependencies: []
+  upgradeStrategy:
+    mode: Batch
+    batchSize: 1
+    timeout: "10m"
+    failurePolicy: FailFast
+```
+
+**3. 执行流程**：
+
+```txt
+1. ManifestStore.GetComponentManifests("pre-upgrade-resources", "v1.0.0", tmplCtx)
+   ├─ 读取 component.yaml，识别 Type=inline
+   ├─ 提取 pkg.Inline = {Handler: "EnsurePreUpgradeResources", Version: "v1.0"}
+   └─ 无需加载额外文件
+2. InstallerRegistry.InstallComponent(ctx, pkg, vCtx)
+   ├─ 路由到 InlineInstaller
+   └─ 执行 Phase 逻辑:
+       ├─ ComponentFactory.Resolve("EnsurePreUpgradeResources", "v1.0")
+       ├─ 注入 VersionContext 和 ComponentPackage
+       ├─ 调用 handler.NeedExecute() 判断是否需要执行
+       └─ 调用 handler.Execute(ctx) 执行预创建逻辑
+```
 
 ## 12. 附录：CRD 定义
 
