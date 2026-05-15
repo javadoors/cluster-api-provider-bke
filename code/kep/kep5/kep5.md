@@ -2513,6 +2513,201 @@ func (r *ClusterVersionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 }
 ```
 
+#### 4.6.2.1 多跳升级路径调谐流程设计
+
+**场景说明**：当集群从 v2.4.0 升级到 v2.7.0 时，UpgradePath 图可能返回多跳路径：`v2.4.0 → v2.5.0 → v2.6.0 → v2.7.0`。ClusterVersionReconciler 需要逐跳执行升级，每跳完成后更新 `CurrentVersion` 并触发下一跳。
+
+**多跳升级策略**：
+
+| 策略 | 说明 | 适用场景 |
+| ---- | ---- | -------- |
+| **自动连续升级** | 一次性执行所有跳，中间不暂停 | 测试环境、小版本连续升级 |
+| **逐跳确认升级** | 每跳完成后暂停，等待用户确认或自动检查点通过 | 生产环境、跨大版本升级 |
+| **可回滚升级** | 每跳创建检查点，失败时回滚到上一跳起点 | 关键业务集群 |
+
+**调谐流程设计**：
+
+```txt
+┌─────────────────────────────────────────────────────────────────┐
+│ ClusterVersionReconciler 多跳升级调谐流程                        │
+├─────────────────────────────────────────────────────────────────┤
+│ 1. 获取 ClusterVersion 实例                                      │
+│ 2. 计算升级路径                                                  │
+│    ├─ pathEdges = upgradePathGraph.FindPath(current, target)    │
+│    └─ 例: [v2.4.0→v2.5.0, v2.5.0→v2.6.0, v2.6.0→v2.7.0]       │
+│ 3. 确定当前应执行的跳                                            │
+│    ├─ 读取 cv.Status.UpgradeProgress.CurrentHopIndex            │
+│    ├─ 若为 0 或未设置 → 从第一跳开始                             │
+│    └─ 若已完成 N 跳 → 从第 N+1 跳继续                            │
+│ 4. 执行当前跳升级                                                │
+│    ├─ currentHop = pathEdges[CurrentHopIndex]                   │
+│    ├─ hopTarget = currentHop.To                                 │
+│    ├─ 获取 hopTarget 对应的 ReleaseImage                        │
+│    ├─ 执行兼容性校验                                            │
+│    └─ 写入 BKECluster Annotation: upgrade-ready=hopTarget       │
+│ 5. 等待 BKECluster 完成当前跳升级                                │
+│    ├─ 监听 BKECluster.Status.Version = hopTarget                │
+│    ├─ 或监听 Annotation: upgrade-completed=hopTarget            │
+│    └─ 超时 → 标记当前跳失败，暂停升级                            │
+│ 6. 当前跳完成处理                                                │
+│    ├─ 更新 cv.Status.CurrentVersion = hopTarget                 │
+│    ├─ cv.Status.UpgradeProgress.CurrentHopIndex++               │
+│    ├─ 记录已完成跳到 cv.Status.UpgradeProgress.CompletedHops    │
+│    └─ 触发下一次 Reconcile (继续下一跳)                          │
+│ 7. 所有跳完成                                                    │
+│    ├─ cv.Status.Phase = Upgraded                                │
+│    ├─ cv.Status.UpgradeProgress.Completed = true                │
+│    └─ 清除 BKECluster upgrade-ready Annotation                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**核心数据结构**：
+
+```go
+// ClusterVersionStatus 升级进度追踪
+type UpgradeProgress struct {
+    CurrentHopIndex  int              `json:"currentHopIndex"`   // 当前应执行的跳索引 (0-based)
+    TotalHops        int              `json:"totalHops"`         // 总跳数
+    PathEdges        []UpgradePathEdge `json:"pathEdges"`        // 完整路径边列表
+    CompletedHops    []CompletedHop   `json:"completedHops"`     // 已完成的跳
+    StartedAt        *metav1.Time     `json:"startedAt"`
+    CompletedAt      *metav1.Time     `json:"completedAt,omitempty"`
+}
+
+type CompletedHop struct {
+    From        string         `json:"from"`
+    To          string         `json:"to"`
+    StartedAt   metav1.Time    `json:"startedAt"`
+    CompletedAt metav1.Time    `json:"completedAt"`
+    Status      HopStatus      `json:"status"` // Succeeded, Failed, RolledBack
+}
+
+type HopStatus string
+
+const (
+    HopSucceeded HopStatus = "Succeeded"
+    HopFailed    HopStatus = "Failed"
+    HopRolledBack HopStatus = "RolledBack"
+)
+```
+
+**核心代码实现**：
+
+```go
+func (r *ClusterVersionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    cv := &cvoapi.ClusterVersion{}
+    if err := r.Get(ctx, req.NamespacedName, cv); err != nil {
+        return ctrl.Result{}, client.IgnoreNotFound(err)
+    }
+
+    // 1. 解析 ReleaseImage
+    if cv.Spec.ReleaseImageRef == "" {
+        ri, err := r.manifestStore.GetReleaseImage(cv.Spec.DesiredVersion)
+        if err != nil {
+            return r.updateStatus(ctx, cv, cvoapi.PhaseFailed, err.Error())
+        }
+        cv.Spec.ReleaseImageRef = ri.Name
+    }
+
+    // 2. 计算升级路径
+    pathEdges, err := r.upgradePathGraph.FindPath(cv.Status.CurrentVersion, cv.Spec.DesiredVersion)
+    if err != nil {
+        return r.updateStatus(ctx, cv, cvoapi.PhaseBlocked, "no valid upgrade path")
+    }
+    
+    // 检查路径中是否有被拦截的边
+    for _, edge := range pathEdges {
+        if edge.Blocked {
+            return r.updateStatus(ctx, cv, cvoapi.PhaseBlocked, fmt.Sprintf("upgrade path blocked at %s", edge.From))
+        }
+    }
+
+    // 3. 多跳升级逻辑
+    if len(pathEdges) > 1 {
+        return r.reconcileMultiHop(ctx, cv, pathEdges)
+    }
+
+    // 4. 单跳升级（原有逻辑）
+    bc := &bkev1beta1.BKECluster{}
+    if err := r.Get(ctx, cv.OwnerRef, bc); err != nil {
+        return ctrl.Result{}, err
+    }
+    if bc.Annotations == nil {
+        bc.Annotations = make(map[string]string)
+    }
+    bc.Annotations["cvo.openfuyao.cn/upgrade-ready"] = cv.Spec.DesiredVersion
+    r.Update(ctx, bc)
+
+    return r.updateStatus(ctx, cv, cvoapi.PhaseReady, "")
+}
+
+// reconcileMultiHop 处理多跳升级
+func (r *ClusterVersionReconciler) reconcileMultiHop(ctx context.Context, cv *cvoapi.ClusterVersion, pathEdges []UpgradePathEdge) (ctrl.Result, error) {
+    // 初始化或获取升级进度
+    if cv.Status.UpgradeProgress == nil {
+        cv.Status.UpgradeProgress = &UpgradeProgress{
+            CurrentHopIndex: 0,
+            TotalHops:       len(pathEdges),
+            PathEdges:       pathEdges,
+            StartedAt:       &metav1.Time{Time: time.Now()},
+        }
+    }
+
+    progress := cv.Status.UpgradeProgress
+    
+    // 检查是否所有跳已完成
+    if progress.CurrentHopIndex >= progress.TotalHops {
+        cv.Status.Phase = cvoapi.PhaseUpgraded
+        cv.Status.UpgradeProgress.CompletedAt = &metav1.Time{Time: time.Now()}
+        // 清除 BKECluster Annotation
+        r.clearUpgradeAnnotation(ctx, cv)
+        return r.updateStatus(ctx, cv, cvoapi.PhaseUpgraded, "multi-hop upgrade completed")
+    }
+
+    // 获取当前应执行的跳
+    currentHop := pathEdges[progress.CurrentHopIndex]
+    hopTarget := currentHop.To
+
+    // 检查当前跳是否已完成（通过 BKECluster 状态判断）
+    bc := &bkev1beta1.BKECluster{}
+    if err := r.Get(ctx, cv.OwnerRef, bc); err != nil {
+        return ctrl.Result{}, err
+    }
+
+    if bc.Status.Version == hopTarget || bc.Annotations["cvo.openfuyao.cn/upgrade-completed"] == hopTarget {
+        // 当前跳已完成，更新进度并触发下一跳
+        progress.CompletedHops = append(progress.CompletedHops, CompletedHop{
+            From:        currentHop.From,
+            To:          hopTarget,
+            StartedAt:   metav1.Now(),
+            CompletedAt: metav1.Now(),
+            Status:      HopSucceeded,
+        })
+        progress.CurrentHopIndex++
+        cv.Status.CurrentVersion = hopTarget
+        
+        // 触发下一次 Reconcile 继续下一跳
+        return ctrl.Result{Requeue: true, RequeueAfter: time.Second * 5}, r.updateStatus(ctx, cv, cvoapi.PhaseUpgrading, fmt.Sprintf("completed hop %d/%d, continuing to %s", progress.CurrentHopIndex, progress.TotalHops, hopTarget))
+    }
+
+    // 检查当前跳是否正在执行
+    if bc.Annotations["cvo.openfuyao.cn/upgrade-ready"] == hopTarget {
+        // 正在执行中，等待完成
+        return ctrl.Result{Requeue: true, RequeueAfter: time.Second * 10}, nil
+    }
+
+    // 触发当前跳升级
+    if bc.Annotations == nil {
+        bc.Annotations = make(map[string]string)
+    }
+    bc.Annotations["cvo.openfuyao.cn/upgrade-ready"] = hopTarget
+    bc.Annotations["cvo.openfuyao.cn/upgrade-hop"] = fmt.Sprintf("%d/%d", progress.CurrentHopIndex+1, progress.TotalHops)
+    r.Update(ctx, bc)
+
+    return r.updateStatus(ctx, cv, cvoapi.PhaseUpgrading, fmt.Sprintf("executing hop %d/%d: %s → %s", progress.CurrentHopIndex+1, progress.TotalHops, currentHop.From, hopTarget))
+}
+```
+
 #### 4.6.3 ReleaseImageReconciler 详细设计
 
 **职责**：
@@ -3646,6 +3841,216 @@ status:
     └─ upgradeProgress: completed
 12. 清除 BKECluster Annotation: cvo.openfuyao.cn/upgrade-ready
 ```
+
+### 11.3.1 阶段三：多跳升级场景 (v2.4.0 → v2.7.0)
+
+#### 场景说明
+
+集群当前版本为 **v2.4.0**，目标升级到 **v2.7.0**。UpgradePath 图计算出的最短路径为：
+
+```
+v2.4.0 → v2.5.0 → v2.6.0 → v2.7.0
+```
+
+共 **3 跳**，需要逐跳执行升级。
+
+#### 步骤 1：UpgradePath 定义（包含多跳路径）
+
+```yaml
+# upgradepath.yaml
+apiVersion: cvo.openfuyao.cn/v1beta1
+kind: UpgradePath
+metadata:
+  name: openfuyao-upgrade-paths
+spec:
+  ociRef: "registry/openfuyao-upgradepath:latest"
+  paths:
+    - from: "v2.4.0"
+      to: "v2.5.0"
+      blocked: false
+      deprecated: true
+      notes: "Legacy path, use with caution"
+    - from: "v2.5.0"
+      to: "v2.6.0"
+      blocked: false
+      deprecated: false
+    - from: "v2.6.0"
+      to: "v2.7.0"
+      blocked: false
+      deprecated: false
+    - from: "v2.4.0"
+      to: "v2.6.0"
+      blocked: true
+      notes: "Direct upgrade blocked, missing intermediate components"
+    - from: "v2.5.0"
+      to: "v2.7.0"
+      blocked: true
+      notes: "Direct upgrade blocked, requires v2.6.0 as stepping stone"
+status:
+  phase: Active
+  lastDigest: "sha256:multi123..."
+  pathCount: 5
+```
+
+#### 步骤 2：创建 ReleaseImage v2.7.0（目标版本清单）
+
+```yaml
+# releaseimage-v2.7.0.yaml
+apiVersion: cvo.openfuyao.cn/v1beta1
+kind: ReleaseImage
+metadata:
+  name: release-v2.7.0
+  annotations:
+    cvo.openfuyao.cn/oci-digest: "sha256:xyz789..."
+spec:
+  version: "v2.7.0"
+  ociRef: "registry/openfuyao-release:v2.7.0"
+  install:
+    components:
+      - name: kubernetes
+        version: v1.31.0
+      - name: etcd
+        version: v3.5.15
+      - name: bke-provider
+        version: v1.4.0
+  upgrade:
+    components:
+      - name: pre-upgrade-resources
+        version: v1.0.0
+        inline:
+          handler: EnsurePreUpgradeResources
+          version: v1.0
+      - name: provider-upgrade
+        version: v1.4.0
+        inline:
+          handler: EnsureProviderUpgrade
+          version: v1.0
+      - name: etcd-upgrade
+        version: v3.5.15
+        inline:
+          handler: EnsureEtcdUpgrade
+          version: v1.0
+status:
+  phase: Valid
+  componentCount: 6
+  validatedAt: "2026-05-15T10:00:00Z"
+```
+
+#### 步骤 3：更新 ClusterVersion 触发多跳升级
+
+```yaml
+# clusterversion.yaml (更新后)
+apiVersion: cvo.openfuyao.cn/v1beta1
+kind: ClusterVersion
+metadata:
+  name: prod-cluster-01-version
+  namespace: default
+spec:
+  desiredVersion: v2.7.0          # 从 v2.4.0 改为 v2.7.0
+  releaseImageRef: release-v2.7.0
+status:
+  currentVersion: v2.4.0          # 当前版本
+  desiredVersion: v2.7.0
+  phase: Upgrading
+  upgradeProgress:
+    currentHopIndex: 0
+    totalHops: 3
+    pathEdges:
+      - from: v2.4.0
+        to: v2.5.0
+        blocked: false
+      - from: v2.5.0
+        to: v2.6.0
+        blocked: false
+      - from: v2.6.0
+        to: v2.7.0
+        blocked: false
+    completedHops: []
+    startedAt: "2026-05-15T12:00:00Z"
+```
+
+**多跳升级执行流程**：
+
+```txt
+【第 1 跳：v2.4.0 → v2.5.0】
+
+1. ClusterVersionReconciler 检测到 desiredVersion=v2.7.0, currentVersion=v2.4.0
+2. 调用 upgradePathGraph.FindPath("v2.4.0", "v2.7.0")
+   └─ 返回路径: [v2.4.0→v2.5.0, v2.5.0→v2.6.0, v2.6.0→v2.7.0] (3 跳)
+3. 初始化 UpgradeProgress:
+   ├─ CurrentHopIndex: 0
+   ├─ TotalHops: 3
+   └─ PathEdges: [v2.4.0→v2.5.0, v2.5.0→v2.6.0, v2.6.0→v2.7.0]
+4. 获取第 1 跳目标: hopTarget = v2.5.0
+5. 获取 ReleaseImage v2.5.0，执行兼容性校验 → 通过
+6. 写入 BKECluster Annotation:
+   ├─ cvo.openfuyao.cn/upgrade-ready=v2.5.0
+   └─ cvo.openfuyao.cn/upgrade-hop=1/3
+7. BKEClusterReconciler 执行 v2.5.0 升级 DAG:
+   ├─ pre-upgrade-resources (创建 v2.5.0 新资源)
+   ├─ provider-upgrade (v1.0.0 → v1.1.0)
+   └─ etcd-upgrade (v3.5.9 → v3.5.10)
+8. BKECluster 升级完成，更新 Status.Version=v2.5.0
+9. ClusterVersionReconciler 检测到完成，更新进度:
+   ├─ CurrentVersion: v2.5.0
+   ├─ CurrentHopIndex: 1
+   └─ CompletedHops: [{v2.4.0→v2.5.0, Succeeded}]
+10. 触发下一次 Reconcile (5 秒后)
+
+【第 2 跳：v2.5.0 → v2.6.0】
+
+11. ClusterVersionReconciler 继续执行，CurrentHopIndex=1
+12. 获取第 2 跳目标: hopTarget = v2.6.0
+13. 获取 ReleaseImage v2.6.0，执行兼容性校验 → 通过
+14. 写入 BKECluster Annotation:
+    ├─ cvo.openfuyao.cn/upgrade-ready=v2.6.0
+    └─ cvo.openfuyao.cn/upgrade-hop=2/3
+15. BKEClusterReconciler 执行 v2.6.0 升级 DAG:
+    ├─ pre-upgrade-resources (创建 v2.6.0 新资源)
+    ├─ provider-upgrade (v1.1.0 → v1.2.0)
+    └─ etcd-upgrade (v3.5.10 → v3.5.12)
+16. BKECluster 升级完成，更新 Status.Version=v2.6.0
+17. ClusterVersionReconciler 更新进度:
+    ├─ CurrentVersion: v2.6.0
+    ├─ CurrentHopIndex: 2
+    └─ CompletedHops: [{v2.4.0→v2.5.0}, {v2.5.0→v2.6.0}]
+18. 触发下一次 Reconcile (5 秒后)
+
+【第 3 跳：v2.6.0 → v2.7.0】
+
+19. ClusterVersionReconciler 继续执行，CurrentHopIndex=2
+20. 获取第 3 跳目标: hopTarget = v2.7.0
+21. 获取 ReleaseImage v2.7.0，执行兼容性校验 → 通过
+22. 写入 BKECluster Annotation:
+    ├─ cvo.openfuyao.cn/upgrade-ready=v2.7.0
+    └─ cvo.openfuyao.cn/upgrade-hop=3/3
+23. BKEClusterReconciler 执行 v2.7.0 升级 DAG:
+    ├─ pre-upgrade-resources (创建 v2.7.0 新资源)
+    ├─ provider-upgrade (v1.2.0 → v1.4.0)
+    └─ etcd-upgrade (v3.5.12 → v3.5.15)
+24. BKECluster 升级完成，更新 Status.Version=v2.7.0
+25. ClusterVersionReconciler 更新进度:
+    ├─ CurrentVersion: v2.7.0
+    ├─ CurrentHopIndex: 3 (等于 TotalHops)
+    └─ CompletedHops: [{v2.4.0→v2.5.0}, {v2.5.0→v2.6.0}, {v2.6.0→v2.7.0}]
+26. 所有跳完成，更新 ClusterVersion.Status:
+    ├─ phase: Upgraded
+    ├─ upgradeProgress.completed: true
+    └─ upgradeProgress.completedAt: "2026-05-15T14:30:00Z"
+27. 清除 BKECluster Annotation: cvo.openfuyao.cn/upgrade-ready
+```
+
+**多跳升级状态流转表**：
+
+| 时间 | CurrentVersion | DesiredVersion | Hop Index | BKECluster Annotation | 说明 |
+| ---- | -------------- | -------------- | --------- | --------------------- | ---- |
+| 12:00 | v2.4.0 | v2.7.0 | 0 | 无 | 升级请求发起 |
+| 12:01 | v2.4.0 | v2.7.0 | 0 | upgrade-ready=v2.5.0, upgrade-hop=1/3 | 第 1 跳开始 |
+| 12:15 | v2.5.0 | v2.7.0 | 1 | upgrade-ready=v2.5.0 (待清除) | 第 1 跳完成 |
+| 12:16 | v2.5.0 | v2.7.0 | 1 | upgrade-ready=v2.6.0, upgrade-hop=2/3 | 第 2 跳开始 |
+| 12:30 | v2.6.0 | v2.7.0 | 2 | upgrade-ready=v2.6.0 (待清除) | 第 2 跳完成 |
+| 12:31 | v2.6.0 | v2.7.0 | 2 | upgrade-ready=v2.7.0, upgrade-hop=3/3 | 第 3 跳开始 |
+| 12:45 | v2.7.0 | v2.7.0 | 3 | 无 | 所有跳完成 |
 
 ### 11.4 CR 关联关系图
 
