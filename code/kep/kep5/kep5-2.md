@@ -1055,7 +1055,147 @@ spec:
         service-cidr: "{{.ServiceCIDR}}"
 ```
 
-**TemplateContext 数据结构**：
+#### 4.5.2.1 多类型组件安装器架构
+
+**设计思路**：bke-manifests 中的组件可能为四种类型，需要统一的安装器接口支持扩展：
+
+| 类型 | 标识 | 说明 | 安装方式 |
+| ---- | ---- | ---- | -------- |
+| **YAML 清单** | `yaml` | 标准 Kubernetes 资源清单文件 | `kubectl apply` 等价操作 |
+| **Helm Chart** | `helm` | Helm 格式的 Chart 包 | Helm SDK 安装/升级/回滚 |
+| **Inline Phase** | `inline` | 内嵌 Go 代码 Phase 处理器 | ComponentFactory 注册调用 |
+| **二进制安装包** | `binary` | 预编译二进制或脚本 | 下载、解压、执行安装脚本 |
+
+**组件类型定义**：
+
+```go
+// pkg/manifest/types.go
+
+// ComponentType 组件安装类型
+type ComponentType string
+
+const (
+    ComponentTypeYAML    ComponentType = "yaml"    // k8s yaml清单
+    ComponentTypeHelm    ComponentType = "helm"    // helm chart
+    ComponentTypeInline  ComponentType = "inline"  // inline Phase
+    ComponentTypeBinary  ComponentType = "binary"  // 二进制安装包
+)
+
+// ComponentPackage 组件完整包（支持多类型）
+type ComponentPackage struct {
+    Metadata  *ComponentVersion   // component.yaml 元数据
+    Type      ComponentType       // 组件类型
+    
+    // YAML 类型字段
+    Manifests []ResourceManifest  // 资源清单列表
+    
+    // Helm 类型字段
+    Chart     *HelmChart          // Helm chart包
+    
+    // Binary 类型字段
+    Binary    *BinaryArtifact     // 二进制制品
+    
+    // Inline 类型字段
+    Inline    *InlineSpec         // Phase规范
+}
+
+// HelmChart Helm chart包
+type HelmChart struct {
+    Name       string                 // chart名称
+    Version    string                 // chart版本
+    Values     map[string]interface{} // 自定义values
+    Files      map[string][]byte      // chart文件内容
+    RepoURL    string                 // chart仓库URL（可选）
+}
+
+// BinaryArtifact 二进制安装包
+type BinaryArtifact struct {
+    Name          string            // 包名称
+    Version       string            // 版本
+    Checksum      string            // SHA256校验值
+    DownloadURL   string            // 下载URL
+    LocalPath     string            // 本地缓存路径
+    InstallScript string            // 安装脚本内容
+    Arch          string            // 目标架构 (amd64/arm64)
+    OS            string            // 目标操作系统 (linux)
+}
+```
+
+**统一安装器接口**：
+
+```go
+// pkg/manifest/installer.go
+
+// ComponentInstaller 组件安装器接口
+type ComponentInstaller interface {
+    Type() ComponentType
+    Install(ctx context.Context, pkg *ComponentPackage, vCtx *VersionContext) error
+    Uninstall(ctx context.Context, pkg *ComponentPackage) error
+    HealthCheck(ctx context.Context, pkg *ComponentPackage) error
+}
+
+// InstallerRegistry 安装器注册表
+type InstallerRegistry struct {
+    mu         sync.RWMutex
+    installers map[ComponentType]ComponentInstaller
+}
+
+func (r *InstallerRegistry) Register(installer ComponentInstaller) {
+    r.mu.Lock()
+    defer r.mu.Unlock()
+    r.installers[installer.Type()] = installer
+}
+
+func (r *InstallerRegistry) InstallComponent(ctx context.Context, pkg *ComponentPackage, vCtx *VersionContext) error {
+    installer, err := r.GetInstaller(pkg.Type)
+    if err != nil {
+        return err
+    }
+    return installer.Install(ctx, pkg, vCtx)
+}
+```
+
+**四种安装器实现**：
+
+**1. YAML 清单安装器**：调用 `ManifestApplier.ApplyManifests()` 应用K8s资源清单
+
+**2. Helm Chart 安装器**：使用 Helm SDK 执行 `Install/Upgrade/Rollback` 操作，支持 values 模板渲染
+
+**3. Inline Phase 安装器**：通过 `ComponentFactory.Resolve()` 获取 Phase 实例并执行 `NeedExecute/Execute`
+
+**4. 二进制安装包安装器**：下载、校验、解压二进制包，在目标节点执行安装脚本
+
+**架构设计图**：
+
+```mermaid
+flowchart TD
+    A["BKEClusterReconciler.executeDAG"] --> B["GetComponentManifests"]
+    B --> C["返回 ComponentPackage 含 Type 字段"]
+    C --> D["installerRegistry.InstallComponent"]
+    
+    subgraph D ["InstallerRegistry 路由"]
+        D1["根据 pkg.Type 路由"]
+    end
+    
+    D1 --> E1["yaml: YamlInstaller"]
+    D1 --> E2["helm: HelmInstaller"]
+    D1 --> E3["inline: InlineInstaller"]
+    D1 --> E4["binary: BinaryInstaller"]
+    
+    E1 --> F1["ManifestApplier.ApplyManifests"]
+    E2 --> F2["Helm SDK Install/Upgrade"]
+    E3 --> F3["ComponentFactory.Resolve + Execute"]
+    E4 --> F4["Download + Extract + Execute Script"]
+```
+
+**扩展性设计**：
+
+1. **插件化注册**：第三方组件类型可通过 `InstallerRegistry.Register()` 注册自定义安装器
+2. **类型发现**：`ComponentVersion.Spec.Type` 字段声明组件类型，ManifestStore 自动识别
+3. **降级策略**：若未找到对应安装器，返回明确错误并标记组件状态为 `InstallerNotFound`
+4. **统一生命周期**：所有安装器实现 `Install/Uninstall/HealthCheck` 三阶段接口
+
+#### 4.5.2.2 TemplateContext 模板渲染模块
 
 ```go
 // pkg/manifest/template.go
@@ -1633,7 +1773,7 @@ func (r *UpgradePathReconciler) FindPath(from, to string) ([]cvoapi.UpgradePathE
 
 #### 4.6.5 BKEClusterReconciler 增强设计
 
-**核心代码片段 (DAG 调度与执行分支)**：
+**核心代码片段 (DAG 调度与统一安装器调用)**：
 
 ```go
 func (r *BKEClusterReconciler) executeDAG(ctx context.Context, bc *bkev1beta1.BKECluster, dag *topology.DAG, scenario string) error {
@@ -1645,42 +1785,18 @@ func (r *BKEClusterReconciler) executeDAG(ctx context.Context, bc *bkev1beta1.BK
         for _, compName := range batch {
             compRef := dag.GetComponent(compName)
             
-            // 从 ManifestStore 获取组件完整包（元数据 + 所有资源清单）
+            // 从 ManifestStore 获取组件完整包（含 Type 字段标识组件类型）
             pkg, err := r.manifestStore.GetComponentManifests(compName, compRef.Version, tmplCtx)
             if err != nil {
                 errs = append(errs, err)
                 continue
             }
             
-            // 执行分支判断：inline 组件走 Phase 逻辑，其余走清单 Apply 逻辑
-            if compRef.Inline != nil {
-                // Inline 组件：通过 ComponentFactory 获取 Phase 实例执行
-                inst, err := r.componentFactory.Resolve(compName, compRef.Version, compRef.Inline)
-                if err != nil {
-                    errs = append(errs, err)
-                    continue
-                }
-                
-                inst.Handler.SetVersionContext(vCtx)
-                inst.Handler.SetComponentPackage(pkg)
-                if !inst.Handler.NeedExecute(nil, bc) {
-                    continue
-                }
-                if err := inst.Handler.Execute(ctx); err != nil {
-                    errs = append(errs, fmt.Errorf("%s inline phase: %w", compName, err))
-                    if compRef.Strategy.FailurePolicy == "FailFast" { 
-                        return kerrors.NewAggregate(errs) 
-                    }
-                }
-            } else {
-                // 非 Inline 组件：通过 ManifestApplier 应用 YAML 清单
-                if len(pkg.Manifests) > 0 {
-                    if err := r.manifestApplier.ApplyManifests(ctx, pkg.Manifests); err != nil {
-                        errs = append(errs, fmt.Errorf("%s apply manifests: %w", compName, err))
-                        if compRef.Strategy.FailurePolicy == "FailFast" { 
-                            return kerrors.NewAggregate(errs) 
-                        }
-                    }
+            // 通过 InstallerRegistry 统一安装（自动根据 pkg.Type 路由到对应安装器）
+            if err := r.installerRegistry.InstallComponent(ctx, pkg, vCtx); err != nil {
+                errs = append(errs, fmt.Errorf("%s install (%s): %w", compName, pkg.Type, err))
+                if compRef.Strategy.FailurePolicy == "FailFast" { 
+                    return kerrors.NewAggregate(errs) 
                 }
             }
         }
@@ -1689,6 +1805,16 @@ func (r *BKEClusterReconciler) executeDAG(ctx context.Context, bc *bkev1beta1.BK
     return nil
 }
 ```
+
+**执行流程说明**：
+
+1. `GetComponentManifests()` 返回的 `ComponentPackage` 包含 `Type` 字段，标识组件类型（yaml/helm/inline/binary）
+2. `InstallerRegistry.InstallComponent()` 根据 `pkg.Type` 自动路由到对应安装器：
+   - `yaml` → `YamlInstaller.Install()` → 调用 `ManifestApplier.ApplyManifests()`
+   - `helm` → `HelmInstaller.Install()` → 调用 Helm SDK 安装/升级
+   - `inline` → `InlineInstaller.Install()` → 调用 `ComponentFactory.Resolve()` 执行 Phase
+   - `binary` → `BinaryInstaller.Install()` → 下载、解压、执行安装脚本
+3. 所有安装器实现统一的 `Install/Uninstall/HealthCheck` 接口，支持扩展新类型
 
 ### 4.7 升级流程与 NeedExecute 复用设计
 

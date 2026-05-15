@@ -1027,7 +1027,504 @@ func (a *ManifestApplier) DeleteManifests(ctx context.Context, manifests []Resou
 }
 ```
 
-#### 4.5.2.1 TemplateContext 模板渲染模块
+#### 4.5.2.1 多类型组件安装器架构
+
+**设计思路**：bke-manifests 中的组件可能为四种类型，需要统一的安装器接口支持扩展：
+
+| 类型 | 标识 | 说明 | 安装方式 |
+| ---- | ---- | ---- | -------- |
+| **YAML 清单** | `yaml` | 标准 Kubernetes 资源清单文件 | `kubectl apply` 等价操作 |
+| **Helm Chart** | `helm` | Helm 格式的 Chart 包 | Helm SDK 安装/升级/回滚 |
+| **Inline Phase** | `inline` | 内嵌 Go 代码 Phase 处理器 | ComponentFactory 注册调用 |
+| **二进制安装包** | `binary` | 预编译二进制或脚本 | 下载、解压、执行安装脚本 |
+
+**组件类型定义**：
+
+```go
+// pkg/manifest/types.go
+
+// ComponentType 组件安装类型
+type ComponentType string
+
+const (
+    ComponentTypeYAML    ComponentType = "yaml"    // k8s yaml清单
+    ComponentTypeHelm    ComponentType = "helm"    // helm chart
+    ComponentTypeInline  ComponentType = "inline"  // inline Phase
+    ComponentTypeBinary  ComponentType = "binary"  // 二进制安装包
+)
+
+// ComponentPackage 组件完整包（支持多类型）
+type ComponentPackage struct {
+    Metadata  *ComponentVersion   // component.yaml 元数据
+    Type      ComponentType       // 组件类型
+    
+    // YAML 类型字段
+    Manifests []ResourceManifest  // 资源清单列表
+    
+    // Helm 类型字段
+    Chart     *HelmChart          // Helm chart包
+    
+    // Binary 类型字段
+    Binary    *BinaryArtifact     // 二进制制品
+    
+    // Inline 类型字段
+    Inline    *InlineSpec         // Phase规范
+}
+
+// HelmChart Helm chart包
+type HelmChart struct {
+    Name       string                 // chart名称
+    Version    string                 // chart版本
+    Values     map[string]interface{} // 自定义values
+    Files      map[string][]byte      // chart文件内容
+    RepoURL    string                 // chart仓库URL（可选）
+}
+
+// BinaryArtifact 二进制安装包
+type BinaryArtifact struct {
+    Name          string            // 包名称
+    Version       string            // 版本
+    Checksum      string            // SHA256校验值
+    DownloadURL   string            // 下载URL
+    LocalPath     string            // 本地缓存路径
+    InstallScript string            // 安装脚本内容
+    Arch          string            // 目标架构 (amd64/arm64)
+    OS            string            // 目标操作系统 (linux)
+}
+```
+
+**统一安装器接口**：
+
+```go
+// pkg/manifest/installer.go
+
+// ComponentInstaller 组件安装器接口
+type ComponentInstaller interface {
+    // Type 返回支持的组件类型
+    Type() ComponentType
+    
+    // Install 安装组件
+    Install(ctx context.Context, pkg *ComponentPackage, vCtx *VersionContext) error
+    
+    // Uninstall 卸载组件
+    Uninstall(ctx context.Context, pkg *ComponentPackage) error
+    
+    // HealthCheck 检查组件健康状态
+    HealthCheck(ctx context.Context, pkg *ComponentPackage) error
+}
+
+// InstallerRegistry 安装器注册表
+type InstallerRegistry struct {
+    mu         sync.RWMutex
+    installers map[ComponentType]ComponentInstaller
+}
+
+func NewInstallerRegistry() *InstallerRegistry {
+    return &InstallerRegistry{
+        installers: make(map[ComponentType]ComponentInstaller),
+    }
+}
+
+func (r *InstallerRegistry) Register(installer ComponentInstaller) {
+    r.mu.Lock()
+    defer r.mu.Unlock()
+    r.installers[installer.Type()] = installer
+}
+
+func (r *InstallerRegistry) GetInstaller(t ComponentType) (ComponentInstaller, error) {
+    r.mu.RLock()
+    defer r.mu.RUnlock()
+    installer, ok := r.installers[t]
+    if !ok {
+        return nil, fmt.Errorf("installer not found for type: %s", t)
+    }
+    return installer, nil
+}
+
+// InstallComponent 统一安装入口
+func (r *InstallerRegistry) InstallComponent(ctx context.Context, pkg *ComponentPackage, vCtx *VersionContext) error {
+    installer, err := r.GetInstaller(pkg.Type)
+    if err != nil {
+        return err
+    }
+    return installer.Install(ctx, pkg, vCtx)
+}
+```
+
+**四种安装器实现**：
+
+**1. YAML 清单安装器**：
+
+```go
+// pkg/manifest/yaml_installer.go
+
+type YamlInstaller struct {
+    client  client.Client
+    logger  logr.Logger
+    applier *ManifestApplier
+}
+
+func (i *YamlInstaller) Type() ComponentType {
+    return ComponentTypeYAML
+}
+
+func (i *YamlInstaller) Install(ctx context.Context, pkg *ComponentPackage, vCtx *VersionContext) error {
+    if len(pkg.Manifests) == 0 {
+        return fmt.Errorf("no manifests found in package %s", pkg.Metadata.Name)
+    }
+    
+    i.logger.Info("Installing YAML manifests", "component", pkg.Metadata.Name)
+    return i.applier.ApplyManifests(ctx, pkg.Manifests)
+}
+
+func (i *YamlInstaller) Uninstall(ctx context.Context, pkg *ComponentPackage) error {
+    return i.applier.DeleteManifests(ctx, pkg.Manifests)
+}
+
+func (i *YamlInstaller) HealthCheck(ctx context.Context, pkg *ComponentPackage) error {
+    // 检查所有资源是否处于Ready状态
+    for _, manifest := range pkg.Manifests {
+        for _, obj := range manifest.Objects {
+            if err := i.checkObjectReady(ctx, &obj); err != nil {
+                return err
+            }
+        }
+    }
+    return nil
+}
+```
+
+**2. Helm Chart 安装器**：
+
+```go
+// pkg/manifest/helm_installer.go
+
+type HelmInstaller struct {
+    cfg    *action.Configuration
+    logger logr.Logger
+}
+
+func (i *HelmInstaller) Type() ComponentType {
+    return ComponentTypeHelm
+}
+
+func (i *HelmInstaller) Install(ctx context.Context, pkg *ComponentPackage, vCtx *VersionContext) error {
+    if pkg.Chart == nil {
+        return fmt.Errorf("no chart found in package %s", pkg.Metadata.Name)
+    }
+    
+    i.logger.Info("Installing Helm chart", "chart", pkg.Chart.Name, "version", pkg.Chart.Version)
+    
+    // 构建 Helm values（合并 TemplateContext）
+    values := pkg.Chart.Values
+    if vCtx != nil {
+        values = mergeValues(values, vCtx.ToHelmValues())
+    }
+    
+    // 检查是否已安装，决定是 Install 还是 Upgrade
+    histClient := action.NewHistory(i.cfg)
+    _, err := histClient.Run(pkg.Chart.Name)
+    
+    var rel *release.Release
+    if err == driver.ErrReleaseNotFound {
+        // 首次安装
+        installClient := action.NewInstall(i.cfg)
+        installClient.ReleaseName = pkg.Chart.Name
+        installClient.Namespace = vCtx.Namespace
+        installClient.CreateNamespace = true
+        installClient.Wait = true
+        installClient.Timeout = pkg.Metadata.Spec.UpgradeStrategy.Timeout
+        
+        rel, err = installClient.Run(pkg.Chart, values)
+    } else {
+        // 升级
+        upgradeClient := action.NewUpgrade(i.cfg)
+        upgradeClient.Namespace = vCtx.Namespace
+        upgradeClient.Wait = true
+        upgradeClient.Timeout = pkg.Metadata.Spec.UpgradeStrategy.Timeout
+        
+        rel, err = upgradeClient.Run(pkg.Chart.Name, pkg.Chart, values)
+    }
+    
+    if err != nil {
+        return fmt.Errorf("helm install/upgrade failed: %w", err)
+    }
+    
+    i.logger.Info("Helm chart installed", "release", rel.Name, "version", rel.Version)
+    return nil
+}
+
+func (i *HelmInstaller) Uninstall(ctx context.Context, pkg *ComponentPackage) error {
+    uninstallClient := action.NewUninstall(i.cfg)
+    _, err := uninstallClient.Run(pkg.Chart.Name)
+    return err
+}
+
+func (i *HelmInstaller) HealthCheck(ctx context.Context, pkg *ComponentPackage) error {
+    statusClient := action.NewStatus(i.cfg)
+    rel, err := statusClient.Run(pkg.Chart.Name)
+    if err != nil {
+        return err
+    }
+    
+    if rel.Info.Status != release.StatusDeployed {
+        return fmt.Errorf("helm release status: %s", rel.Info.Status)
+    }
+    return nil
+}
+```
+
+**3. Inline Phase 安装器**：
+
+```go
+// pkg/manifest/inline_installer.go
+
+type InlineInstaller struct {
+    factory   *ComponentFactory
+    logger    logr.Logger
+}
+
+func (i *InlineInstaller) Type() ComponentType {
+    return ComponentTypeInline
+}
+
+func (i *InlineInstaller) Install(ctx context.Context, pkg *ComponentPackage, vCtx *VersionContext) error {
+    if pkg.Inline == nil {
+        return fmt.Errorf("no inline spec found in package %s", pkg.Metadata.Name)
+    }
+    
+    // 从 ComponentFactory 获取 Phase 实例
+    inst, err := i.factory.Resolve(
+        pkg.Metadata.Spec.Name,
+        pkg.Metadata.Spec.Version,
+        pkg.Inline,
+    )
+    if err != nil {
+        return fmt.Errorf("failed to resolve inline handler: %w", err)
+    }
+    
+    // 注入上下文
+    inst.Handler.SetVersionContext(vCtx)
+    inst.Handler.SetComponentPackage(pkg)
+    
+    // 执行 Phase
+    if !inst.Handler.NeedExecute(nil, nil) {
+        i.logger.Info("Inline phase skipped", "component", pkg.Metadata.Name)
+        return nil
+    }
+    
+    i.logger.Info("Executing inline phase", "component", pkg.Metadata.Name, "handler", pkg.Inline.Handler)
+    return inst.Handler.Execute(ctx)
+}
+
+func (i *InlineInstaller) Uninstall(ctx context.Context, pkg *ComponentPackage) error {
+    // Inline 组件通常不需要卸载，或调用自定义卸载逻辑
+    return nil
+}
+
+func (i *InlineInstaller) HealthCheck(ctx context.Context, pkg *ComponentPackage) error {
+    // 调用自定义健康检查逻辑
+    return nil
+}
+```
+
+**4. 二进制安装包安装器**：
+
+```go
+// pkg/manifest/binary_installer.go
+
+type BinaryInstaller struct {
+    client    client.Client
+    logger    logr.Logger
+    cacheDir  string // 本地缓存目录
+}
+
+func (i *BinaryInstaller) Type() ComponentType {
+    return ComponentTypeBinary
+}
+
+func (i *BinaryInstaller) Install(ctx context.Context, pkg *ComponentPackage, vCtx *VersionContext) error {
+    if pkg.Binary == nil {
+        return fmt.Errorf("no binary artifact found in package %s", pkg.Metadata.Name)
+    }
+    
+    i.logger.Info("Installing binary package", "component", pkg.Metadata.Name)
+    
+    // 1. 下载或从缓存获取
+    localPath, err := i.ensureBinaryCached(ctx, pkg.Binary)
+    if err != nil {
+        return fmt.Errorf("failed to cache binary: %w", err)
+    }
+    
+    // 2. 执行安装脚本
+    script := pkg.Binary.InstallScript
+    if script == "" {
+        script = defaultInstallScript
+    }
+    
+    // 渲染脚本模板（注入变量）
+    renderedScript, err := renderScriptTemplate(script, vCtx, localPath)
+    if err != nil {
+        return err
+    }
+    
+    // 3. 在目标节点执行安装
+    return i.executeInstallScript(ctx, renderedScript, vCtx)
+}
+
+func (i *BinaryInstaller) ensureBinaryCached(ctx context.Context, binary *BinaryArtifact) (string, error) {
+    targetPath := filepath.Join(i.cacheDir, binary.Name, binary.Version, binary.Arch)
+    
+    // 检查缓存
+    if _, err := os.Stat(targetPath); err == nil {
+        return targetPath, nil
+    }
+    
+    // 下载
+    i.logger.Info("Downloading binary", "url", binary.DownloadURL)
+    resp, err := http.Get(binary.DownloadURL)
+    if err != nil {
+        return "", err
+    }
+    defer resp.Body.Close()
+    
+    // 保存到临时文件
+    tmpFile, err := os.CreateTemp("", "binary-*")
+    if err != nil {
+        return "", err
+    }
+    defer os.Remove(tmpFile.Name())
+    
+    if _, err := io.Copy(tmpFile, resp.Body); err != nil {
+        return "", err
+    }
+    
+    // 校验 checksum
+    if err := verifyChecksum(tmpFile.Name(), binary.Checksum); err != nil {
+        return "", err
+    }
+    
+    // 解压（如果是压缩包）
+    if err := extractArchive(tmpFile.Name(), targetPath); err != nil {
+        return "", err
+    }
+    
+    return targetPath, nil
+}
+
+func (i *BinaryInstaller) executeInstallScript(ctx context.Context, script string, vCtx *VersionContext) error {
+    // 通过 SSH 或 Agent 在目标节点执行脚本
+    // 这里简化为本地执行，实际应通过节点代理执行
+    cmd := exec.CommandContext(ctx, "bash", "-c", script)
+    cmd.Env = append(os.Environ(), i.buildInstallEnv(vCtx)...)
+    
+    output, err := cmd.CombinedOutput()
+    if err != nil {
+        return fmt.Errorf("install script failed: %w, output: %s", err, string(output))
+    }
+    
+    i.logger.Info("Binary installation completed", "output", string(output))
+    return nil
+}
+
+func (i *BinaryInstaller) Uninstall(ctx context.Context, pkg *ComponentPackage) error {
+    // 执行卸载脚本
+    return nil
+}
+
+func (i *BinaryInstaller) HealthCheck(ctx context.Context, pkg *ComponentPackage) error {
+    // 检查二进制服务进程状态
+    return nil
+}
+```
+
+**安装器注册与初始化**：
+
+```go
+// cmd/manager/main.go
+
+func setupInstallers(mgr ctrl.Manager) *manifest.InstallerRegistry {
+    registry := manifest.NewInstallerRegistry()
+    
+    // 注册 YAML 安装器
+    registry.Register(&manifest.YamlInstaller{
+        Client:  mgr.GetClient(),
+        Logger:  ctrl.Log.WithName("yaml-installer"),
+        Applier: manifest.NewManifestApplier(mgr.GetClient()),
+    })
+    
+    // 注册 Helm 安装器
+    helmCfg := new(action.Configuration)
+    // 初始化 Helm configuration...
+    registry.Register(&manifest.HelmInstaller{
+        Cfg:    helmCfg,
+        Logger: ctrl.Log.WithName("helm-installer"),
+    })
+    
+    // 注册 Inline 安装器
+    registry.Register(&manifest.InlineInstaller{
+        Factory: componentFactory,
+        Logger:  ctrl.Log.WithName("inline-installer"),
+    })
+    
+    // 注册二进制安装器
+    registry.Register(&manifest.BinaryInstaller{
+        Client:   mgr.GetClient(),
+        Logger:   ctrl.Log.WithName("binary-installer"),
+        CacheDir: "/var/cache/bke/binaries",
+    })
+    
+    return registry
+}
+```
+
+**架构设计图**：
+
+```txt
+┌─────────────────────────────────────────────────────────────────┐
+│                    BKEClusterReconciler                         │
+│                                                                 │
+│  executeDAG()                                                   │
+│    │                                                            │
+│    ├─ GetComponentManifests(name, version, tmplCtx)             │
+│    │   └─ 返回 ComponentPackage (含 Type 字段)                  │
+│    │                                                            │
+│    └─ installerRegistry.InstallComponent(ctx, pkg, vCtx) ◀──────┤
+│        │                                                        │
+│        └─ 根据 pkg.Type 路由到对应安装器                        │
+└────────┬────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   InstallerRegistry                             │
+│                                                                 │
+│  installers: map[ComponentType]ComponentInstaller               │
+│    │                                                            │
+│    ├─ yaml    → YamlInstaller                                   │
+│    ├─ helm    → HelmInstaller                                   │
+│    ├─ inline  → InlineInstaller                                 │
+│    └─ binary  → BinaryInstaller                                 │
+└────────┬────────────────────────────────────────────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                   ComponentInstaller 接口                       │
+│                                                                 │
+│  + Type() ComponentType                                         │
+│  + Install(ctx, pkg, vCtx) error                                │
+│  + Uninstall(ctx, pkg) error                                    │
+│  + HealthCheck(ctx, pkg) error                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**扩展性设计**：
+
+1. **插件化注册**：第三方组件类型可通过 `InstallerRegistry.Register()` 注册自定义安装器
+2. **类型发现**：`ComponentVersion.Spec.Type` 字段声明组件类型，ManifestStore 自动识别
+3. **降级策略**：若未找到对应安装器，返回明确错误并标记组件状态为 `InstallerNotFound`
+4. **统一生命周期**：所有安装器实现 `Install/Uninstall/HealthCheck` 三阶段接口
+
+#### 4.5.2.2 TemplateContext 模板渲染模块
 
 **设计思路**：组件 YAML 文件中可使用 Go template 语法声明变量占位符，在加载时由 `TemplateContext` 注入实际值。支持集群上下文、网络配置、节点信息等动态渲染。
 
@@ -1737,7 +2234,7 @@ func (r *UpgradePathReconciler) FindPath(from, to string) ([]cvoapi.UpgradePathE
 
 #### 4.6.5 BKEClusterReconciler 增强设计
 
-**核心代码片段 (DAG 调度与执行分支)**：
+**核心代码片段 (DAG 调度与统一安装器调用)**：
 
 ```go
 func (r *BKEClusterReconciler) executeDAG(ctx context.Context, bc *bkev1beta1.BKECluster, dag *topology.DAG, scenario string) error {
@@ -1749,42 +2246,18 @@ func (r *BKEClusterReconciler) executeDAG(ctx context.Context, bc *bkev1beta1.BK
         for _, compName := range batch {
             compRef := dag.GetComponent(compName)
             
-            // 从 ManifestStore 获取组件完整包（元数据 + 所有资源清单）
+            // 从 ManifestStore 获取组件完整包（含 Type 字段标识组件类型）
             pkg, err := r.manifestStore.GetComponentManifests(compName, compRef.Version, tmplCtx)
             if err != nil {
                 errs = append(errs, err)
                 continue
             }
             
-            // 执行分支判断：inline 组件走 Phase 逻辑，其余走清单 Apply 逻辑
-            if compRef.Inline != nil {
-                // Inline 组件：通过 ComponentFactory 获取 Phase 实例执行
-                inst, err := r.componentFactory.Resolve(compName, compRef.Version, compRef.Inline)
-                if err != nil {
-                    errs = append(errs, err)
-                    continue
-                }
-                
-                inst.Handler.SetVersionContext(vCtx)
-                inst.Handler.SetComponentPackage(pkg)
-                if !inst.Handler.NeedExecute(nil, bc) {
-                    continue
-                }
-                if err := inst.Handler.Execute(ctx); err != nil {
-                    errs = append(errs, fmt.Errorf("%s inline phase: %w", compName, err))
-                    if compRef.Strategy.FailurePolicy == "FailFast" { 
-                        return kerrors.NewAggregate(errs) 
-                    }
-                }
-            } else {
-                // 非 Inline 组件：通过 ManifestApplier 应用 YAML 清单
-                if len(pkg.Manifests) > 0 {
-                    if err := r.manifestApplier.ApplyManifests(ctx, pkg.Manifests); err != nil {
-                        errs = append(errs, fmt.Errorf("%s apply manifests: %w", compName, err))
-                        if compRef.Strategy.FailurePolicy == "FailFast" { 
-                            return kerrors.NewAggregate(errs) 
-                        }
-                    }
+            // 通过 InstallerRegistry 统一安装（自动根据 pkg.Type 路由到对应安装器）
+            if err := r.installerRegistry.InstallComponent(ctx, pkg, vCtx); err != nil {
+                errs = append(errs, fmt.Errorf("%s install (%s): %w", compName, pkg.Type, err))
+                if compRef.Strategy.FailurePolicy == "FailFast" { 
+                    return kerrors.NewAggregate(errs) 
                 }
             }
         }
@@ -1793,6 +2266,16 @@ func (r *BKEClusterReconciler) executeDAG(ctx context.Context, bc *bkev1beta1.BK
     return nil
 }
 ```
+
+**执行流程说明**：
+
+1. `GetComponentManifests()` 返回的 `ComponentPackage` 包含 `Type` 字段，标识组件类型（yaml/helm/inline/binary）
+2. `InstallerRegistry.InstallComponent()` 根据 `pkg.Type` 自动路由到对应安装器：
+   - `yaml` → `YamlInstaller.Install()` → 调用 `ManifestApplier.ApplyManifests()`
+   - `helm` → `HelmInstaller.Install()` → 调用 Helm SDK 安装/升级
+   - `inline` → `InlineInstaller.Install()` → 调用 `ComponentFactory.Resolve()` 执行 Phase
+   - `binary` → `BinaryInstaller.Install()` → 下载、解压、执行安装脚本
+3. 所有安装器实现统一的 `Install/Uninstall/HealthCheck` 接口，支持扩展新类型
 
 ### 4.7 升级流程与 NeedExecute 复用设计
 
