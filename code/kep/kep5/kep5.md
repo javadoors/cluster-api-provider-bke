@@ -3842,17 +3842,17 @@ status:
 12. 清除 BKECluster Annotation: cvo.openfuyao.cn/upgrade-ready
 ```
 
-### 11.3.1 阶段三：多跳升级场景 (v2.4.0 → v2.7.0)
+### 11.3.1 阶段三：多跳升级场景 (v2.4.0 → v2.6.0)
 
 #### 场景说明
 
-集群当前版本为 **v2.4.0**，目标升级到 **v2.7.0**。UpgradePath 图计算出的最短路径为：
+集群当前版本为 **v2.4.0**，目标升级到 **v2.6.0**。UpgradePath 图计算出的最短路径为：
 
 ```
-v2.4.0 → v2.5.0 → v2.6.0 → v2.7.0
+v2.4.0 → v2.5.0 → v2.6.0
 ```
 
-共 **3 跳**，需要逐跳执行升级。
+共 **2 跳**，利用 Kubernetes 控制器自然调谐循环逐跳执行。
 
 #### 步骤 1：UpgradePath 定义（包含多跳路径）
 
@@ -3868,189 +3868,170 @@ spec:
     - from: "v2.4.0"
       to: "v2.5.0"
       blocked: false
-      deprecated: true
-      notes: "Legacy path, use with caution"
+      deprecated: false
     - from: "v2.5.0"
       to: "v2.6.0"
-      blocked: false
-      deprecated: false
-    - from: "v2.6.0"
-      to: "v2.7.0"
       blocked: false
       deprecated: false
     - from: "v2.4.0"
       to: "v2.6.0"
       blocked: true
-      notes: "Direct upgrade blocked, missing intermediate components"
-    - from: "v2.5.0"
-      to: "v2.7.0"
-      blocked: true
-      notes: "Direct upgrade blocked, requires v2.6.0 as stepping stone"
+      notes: "Direct upgrade blocked, requires v2.5.0 as stepping stone"
 status:
   phase: Active
   lastDigest: "sha256:multi123..."
-  pathCount: 5
+  pathCount: 3
 ```
 
-#### 步骤 2：创建 ReleaseImage v2.7.0（目标版本清单）
+#### 步骤 2：创建 ReleaseImage v2.5.0 和 v2.6.0
 
 ```yaml
-# releaseimage-v2.7.0.yaml
+# releaseimage-v2.5.0.yaml
 apiVersion: cvo.openfuyao.cn/v1beta1
 kind: ReleaseImage
 metadata:
-  name: release-v2.7.0
+  name: release-v2.5.0
   annotations:
-    cvo.openfuyao.cn/oci-digest: "sha256:xyz789..."
+    cvo.openfuyao.cn/oci-digest: "sha256:abc123..."
 spec:
-  version: "v2.7.0"
-  ociRef: "registry/openfuyao-release:v2.7.0"
+  version: "v2.5.0"
+  ociRef: "registry/openfuyao-release:v2.5.0"
   install:
     components:
       - name: kubernetes
-        version: v1.31.0
+        version: v1.28.0
       - name: etcd
-        version: v3.5.15
-      - name: bke-provider
-        version: v1.4.0
+        version: v3.5.10
   upgrade:
     components:
-      - name: pre-upgrade-resources
-        version: v1.0.0
-        inline:
-          handler: EnsurePreUpgradeResources
-          version: v1.0
       - name: provider-upgrade
-        version: v1.4.0
+        version: v1.1.0
         inline:
           handler: EnsureProviderUpgrade
           version: v1.0
       - name: etcd-upgrade
-        version: v3.5.15
+        version: v3.5.10
         inline:
           handler: EnsureEtcdUpgrade
           version: v1.0
 status:
   phase: Valid
-  componentCount: 6
-  validatedAt: "2026-05-15T10:00:00Z"
+---
+# releaseimage-v2.6.0.yaml
+apiVersion: cvo.openfuyao.cn/v1beta1
+kind: ReleaseImage
+metadata:
+  name: release-v2.6.0
+  annotations:
+    cvo.openfuyao.cn/oci-digest: "sha256:def456..."
+spec:
+  version: "v2.6.0"
+  ociRef: "registry/openfuyao-release:v2.6.0"
+  install:
+    components:
+      - name: kubernetes
+        version: v1.29.0
+      - name: etcd
+        version: v3.5.12
+  upgrade:
+    components:
+      - name: provider-upgrade
+        version: v1.2.0
+        inline:
+          handler: EnsureProviderUpgrade
+          version: v1.0
+      - name: etcd-upgrade
+        version: v3.5.12
+        inline:
+          handler: EnsureEtcdUpgrade
+          version: v1.0
+status:
+  phase: Valid
 ```
 
 #### 步骤 3：更新 ClusterVersion 触发多跳升级
 
 ```yaml
-# clusterversion.yaml (更新后)
+# clusterversion.yaml (初始状态)
 apiVersion: cvo.openfuyao.cn/v1beta1
 kind: ClusterVersion
 metadata:
   name: prod-cluster-01-version
   namespace: default
 spec:
-  desiredVersion: v2.7.0          # 从 v2.4.0 改为 v2.7.0
-  releaseImageRef: release-v2.7.0
+  desiredVersion: v2.6.0          # 目标版本
+  releaseImageRef: release-v2.6.0
 status:
   currentVersion: v2.4.0          # 当前版本
-  desiredVersion: v2.7.0
+  desiredVersion: v2.6.0
   phase: Upgrading
-  upgradeProgress:
-    currentHopIndex: 0
-    totalHops: 3
-    pathEdges:
-      - from: v2.4.0
-        to: v2.5.0
-        blocked: false
-      - from: v2.5.0
-        to: v2.6.0
-        blocked: false
-      - from: v2.6.0
-        to: v2.7.0
-        blocked: false
-    completedHops: []
-    startedAt: "2026-05-15T12:00:00Z"
+  upgradeHistory: []
 ```
 
-**多跳升级执行流程**：
+**多跳升级执行流程（基于自然调谐循环）**：
 
 ```txt
-【第 1 跳：v2.4.0 → v2.5.0】
+【第一次 Reconcile：执行第 1 跳 v2.4.0 → v2.5.0】
 
-1. ClusterVersionReconciler 检测到 desiredVersion=v2.7.0, currentVersion=v2.4.0
-2. 调用 upgradePathGraph.FindPath("v2.4.0", "v2.7.0")
-   └─ 返回路径: [v2.4.0→v2.5.0, v2.5.0→v2.6.0, v2.6.0→v2.7.0] (3 跳)
-3. 初始化 UpgradeProgress:
-   ├─ CurrentHopIndex: 0
-   ├─ TotalHops: 3
-   └─ PathEdges: [v2.4.0→v2.5.0, v2.5.0→v2.6.0, v2.6.0→v2.7.0]
-4. 获取第 1 跳目标: hopTarget = v2.5.0
-5. 获取 ReleaseImage v2.5.0，执行兼容性校验 → 通过
-6. 写入 BKECluster Annotation:
-   ├─ cvo.openfuyao.cn/upgrade-ready=v2.5.0
-   └─ cvo.openfuyao.cn/upgrade-hop=1/3
-7. BKEClusterReconciler 执行 v2.5.0 升级 DAG:
-   ├─ pre-upgrade-resources (创建 v2.5.0 新资源)
+1. ClusterVersionReconciler 检测到:
+   ├─ CurrentVersion: v2.4.0
+   └─ DesiredVersion: v2.6.0
+   └─ CurrentVersion != DesiredVersion → 继续
+2. 计算升级路径:
+   └─ FindPath("v2.4.0", "v2.6.0") → [v2.4.0→v2.5.0, v2.5.0→v2.6.0]
+3. 获取第一跳目标: hopTarget = v2.5.0
+4. 检查 BKECluster 状态:
+   ├─ 若 Version == v2.5.0 → 第 1 跳已完成，更新 CurrentVersion，触发下一次 Reconcile
+   └─ 若 Version != v2.5.0 → 继续
+5. 触发第 1 跳升级:
+   ├─ 写入 Annotation: upgrade-ready=v2.5.0
+   └─ 写入 Annotation: upgrade-hop=v2.4.0→v2.5.0
+6. BKEClusterReconciler 执行 v2.5.0 升级 DAG:
    ├─ provider-upgrade (v1.0.0 → v1.1.0)
    └─ etcd-upgrade (v3.5.9 → v3.5.10)
-8. BKECluster 升级完成，更新 Status.Version=v2.5.0
-9. ClusterVersionReconciler 检测到完成，更新进度:
-   ├─ CurrentVersion: v2.5.0
-   ├─ CurrentHopIndex: 1
-   └─ CompletedHops: [{v2.4.0→v2.5.0, Succeeded}]
-10. 触发下一次 Reconcile (5 秒后)
+7. BKECluster 升级完成，更新 Status.Version=v2.5.0
 
-【第 2 跳：v2.5.0 → v2.6.0】
+【第二次 Reconcile：执行第 2 跳 v2.5.0 → v2.6.0】
+(CurrentVersion 变更触发新的 Reconcile)
 
-11. ClusterVersionReconciler 继续执行，CurrentHopIndex=1
-12. 获取第 2 跳目标: hopTarget = v2.6.0
-13. 获取 ReleaseImage v2.6.0，执行兼容性校验 → 通过
-14. 写入 BKECluster Annotation:
-    ├─ cvo.openfuyao.cn/upgrade-ready=v2.6.0
-    └─ cvo.openfuyao.cn/upgrade-hop=2/3
-15. BKEClusterReconciler 执行 v2.6.0 升级 DAG:
-    ├─ pre-upgrade-resources (创建 v2.6.0 新资源)
+8. ClusterVersionReconciler 检测到:
+   ├─ CurrentVersion: v2.5.0 (已更新)
+   └─ DesiredVersion: v2.6.0
+   └─ CurrentVersion != DesiredVersion → 继续
+9. 重新计算升级路径:
+   └─ FindPath("v2.5.0", "v2.6.0") → [v2.5.0→v2.6.0]
+10. 获取第一跳目标: hopTarget = v2.6.0
+11. 检查 BKECluster 状态:
+    ├─ 若 Version == v2.6.0 → 第 2 跳已完成，更新 CurrentVersion，触发下一次 Reconcile
+    └─ 若 Version != v2.6.0 → 继续
+12. 触发第 2 跳升级:
+    ├─ 写入 Annotation: upgrade-ready=v2.6.0
+    └─ 写入 Annotation: upgrade-hop=v2.5.0→v2.6.0
+13. BKEClusterReconciler 执行 v2.6.0 升级 DAG:
     ├─ provider-upgrade (v1.1.0 → v1.2.0)
     └─ etcd-upgrade (v3.5.10 → v3.5.12)
-16. BKECluster 升级完成，更新 Status.Version=v2.6.0
-17. ClusterVersionReconciler 更新进度:
-    ├─ CurrentVersion: v2.6.0
-    ├─ CurrentHopIndex: 2
-    └─ CompletedHops: [{v2.4.0→v2.5.0}, {v2.5.0→v2.6.0}]
-18. 触发下一次 Reconcile (5 秒后)
+14. BKECluster 升级完成，更新 Status.Version=v2.6.0
 
-【第 3 跳：v2.6.0 → v2.7.0】
+【第三次 Reconcile：升级完成】
+(CurrentVersion 变更触发新的 Reconcile)
 
-19. ClusterVersionReconciler 继续执行，CurrentHopIndex=2
-20. 获取第 3 跳目标: hopTarget = v2.7.0
-21. 获取 ReleaseImage v2.7.0，执行兼容性校验 → 通过
-22. 写入 BKECluster Annotation:
-    ├─ cvo.openfuyao.cn/upgrade-ready=v2.7.0
-    └─ cvo.openfuyao.cn/upgrade-hop=3/3
-23. BKEClusterReconciler 执行 v2.7.0 升级 DAG:
-    ├─ pre-upgrade-resources (创建 v2.7.0 新资源)
-    ├─ provider-upgrade (v1.2.0 → v1.4.0)
-    └─ etcd-upgrade (v3.5.12 → v3.5.15)
-24. BKECluster 升级完成，更新 Status.Version=v2.7.0
-25. ClusterVersionReconciler 更新进度:
-    ├─ CurrentVersion: v2.7.0
-    ├─ CurrentHopIndex: 3 (等于 TotalHops)
-    └─ CompletedHops: [{v2.4.0→v2.5.0}, {v2.5.0→v2.6.0}, {v2.6.0→v2.7.0}]
-26. 所有跳完成，更新 ClusterVersion.Status:
+15. ClusterVersionReconciler 检测到:
+    ├─ CurrentVersion: v2.6.0 (已更新)
+    └─ DesiredVersion: v2.6.0
+    └─ CurrentVersion == DesiredVersion → 升级完成
+16. 更新 ClusterVersion.Status:
     ├─ phase: Upgraded
-    ├─ upgradeProgress.completed: true
-    └─ upgradeProgress.completedAt: "2026-05-15T14:30:00Z"
-27. 清除 BKECluster Annotation: cvo.openfuyao.cn/upgrade-ready
+    └─ upgradeHistory: [{v2.4.0→v2.5.0}, {v2.5.0→v2.6.0}]
+17. 清除 BKECluster Annotation: upgrade-ready, upgrade-hop
 ```
 
 **多跳升级状态流转表**：
 
-| 时间 | CurrentVersion | DesiredVersion | Hop Index | BKECluster Annotation | 说明 |
-| ---- | -------------- | -------------- | --------- | --------------------- | ---- |
-| 12:00 | v2.4.0 | v2.7.0 | 0 | 无 | 升级请求发起 |
-| 12:01 | v2.4.0 | v2.7.0 | 0 | upgrade-ready=v2.5.0, upgrade-hop=1/3 | 第 1 跳开始 |
-| 12:15 | v2.5.0 | v2.7.0 | 1 | upgrade-ready=v2.5.0 (待清除) | 第 1 跳完成 |
-| 12:16 | v2.5.0 | v2.7.0 | 1 | upgrade-ready=v2.6.0, upgrade-hop=2/3 | 第 2 跳开始 |
-| 12:30 | v2.6.0 | v2.7.0 | 2 | upgrade-ready=v2.6.0 (待清除) | 第 2 跳完成 |
-| 12:31 | v2.6.0 | v2.7.0 | 2 | upgrade-ready=v2.7.0, upgrade-hop=3/3 | 第 3 跳开始 |
-| 12:45 | v2.7.0 | v2.7.0 | 3 | 无 | 所有跳完成 |
+| Reconcile 次数 | CurrentVersion | DesiredVersion | 计算路径 | 执行跳 | BKECluster Annotation | 说明 |
+| -------------- | -------------- | -------------- | -------- | ------ | --------------------- | ---- |
+| 第 1 次 | v2.4.0 | v2.6.0 | v2.4.0→v2.5.0→v2.6.0 | v2.4.0→v2.5.0 | upgrade-ready=v2.5.0 | 执行第 1 跳 |
+| 第 2 次 | v2.5.0 | v2.6.0 | v2.5.0→v2.6.0 | v2.5.0→v2.6.0 | upgrade-ready=v2.6.0 | 执行第 2 跳 |
+| 第 3 次 | v2.6.0 | v2.6.0 | - | - | 无 | 升级完成 |
 
 ### 11.4 CR 关联关系图
 
@@ -4058,8 +4039,8 @@ status:
 ┌─────────────────────────────────────────────────────────────────┐
 │                        BKECluster                               │
 │  name: prod-cluster-01                                          │
-│  spec.kubernetesVersion: v1.29.0 (升级后)                        │
-│  spec.etcdVersion: v3.5.12 (升级后)                              │
+│  spec.kubernetesVersion: v1.29.0 (升级后)                       │
+│  spec.etcdVersion: v3.5.12 (升级后)                             │
 └──────────────────────────┬──────────────────────────────────────┘
                            │ OwnerReference (1:1)
                            ▼
