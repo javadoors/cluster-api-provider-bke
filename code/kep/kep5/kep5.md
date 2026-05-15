@@ -3879,32 +3879,42 @@ spec:
   ociRef: "registry/openfuyao-release:v2.6.0"
   install:
     components:
+      # YAML 类型组件
       - name: kubernetes
         version: v1.29.0
       - name: etcd
         version: v3.5.12
-      - name: bke-provider
-        version: v1.2.0
+      # Helm 类型组件
+      - name: monitoring
+        version: v2.1.0
+      # Binary 类型组件
+      - name: containerd
+        version: v1.7.1
   upgrade:
     components:
+      # Inline 类型：预升级资源创建
       - name: pre-upgrade-resources
         version: v1.0.0
         inline:
           handler: EnsurePreUpgradeResources
           version: v1.0
-      - name: provider-upgrade
-        version: v1.2.0
-        inline:
-          handler: EnsureProviderUpgrade
-          version: v1.0
+      # Binary 类型：Containerd 升级
+      - name: containerd-upgrade
+        version: v1.7.1
+        binary:
+          downloadURL: "https://.../containerd-1.7.1.tar.gz"
+          installScript: "upgrade-containerd.sh"
+      # YAML 类型：Etcd 升级 (滚动更新)
       - name: etcd-upgrade
         version: v3.5.12
-        inline:
-          handler: EnsureEtcdUpgrade
-          version: v1.0
+        type: yaml
+      # Helm 类型：Monitoring 升级
+      - name: monitoring-upgrade
+        version: v2.1.0
+        type: helm
 status:
   phase: Valid
-  componentCount: 6
+  componentCount: 8
   validatedAt: "2026-05-10T08:00:00Z"
 ```
 
@@ -3927,7 +3937,7 @@ status:
   upgradeProgress:
     currentComponent: pre-upgrade-resources
     completedComponents: []
-    totalComponents: 3
+    totalComponents: 4            # Inline, Binary, YAML, Helm 共 4 个组件
     path:
       - from: v2.5.0
         to: v2.6.0
@@ -3947,39 +3957,60 @@ status:
 5. 标记 BKECluster Annotation: cvo.openfuyao.cn/upgrade-ready=v2.6.0
 6. BKEClusterReconciler 检测到 Annotation，判断为 Upgrade 场景
 7. 构建 VersionContext:
-   ├─ Current: {kubernetes: v1.28.0, etcd: v3.5.10, bke-provider: v1.0.0}
-   └─ Target:  {kubernetes: v1.29.0, etcd: v3.5.12, bke-provider: v1.2.0}
+   ├─ Current: {kubernetes: v1.28.0, etcd: v3.5.10, containerd: v1.7.0, monitoring: v2.0.0}
+   └─ Target:  {kubernetes: v1.29.0, etcd: v3.5.12, containerd: v1.7.1, monitoring: v2.1.0}
 8. 构建 TemplateContext (复用 BKECluster 配置)
 9. 解析 ReleaseImage.Spec.Upgrade.Components 构建升级 DAG
-10. 按拓扑顺序执行组件:
-    ├─ pre-upgrade-resources (inline 组件，最先执行)
+10. 按拓扑顺序执行组件 (包含四种类型):
+
+    ├─ [Inline] pre-upgrade-resources (最先执行，无依赖)
     │   ├─ GetComponentManifests("pre-upgrade-resources", "v1.0.0", tmplCtx)
-    │   ├─ Inline 分支: compRef.Inline != nil
-    │   ├─ ComponentFactory.Resolve("EnsurePreUpgradeResources", "v1.0", inline)
+    │   ├─ 识别 Type=inline，提取 InlineSpec
+    │   ├─ InstallerRegistry 路由到 InlineInstaller
+    │   ├─ ComponentFactory.Resolve("EnsurePreUpgradeResources", "v1.0")
     │   ├─ NeedExecute() → true (targetVer != currentVer)
     │   ├─ Execute():
-    │   │   ├─ 创建 ConfigMap: bke-new-feature-config
-    │   │   └─ 创建 Secret: bke-new-cert
+    │   │   ├─ 创建新特性所需的 ConfigMap
+    │   │   └─ 创建新证书 Secret
     │   └─ 标记 Succeeded
-    ├─ provider-upgrade (inline 组件)
-    │   ├─ GetComponentManifests("provider-upgrade", "v1.2.0", tmplCtx)
-    │   ├─ Inline 分支: compRef.Inline != nil
-    │   ├─ ComponentFactory.Resolve("EnsureProviderUpgrade", "v1.0", inline)
-    │   ├─ NeedExecute() → true (v1.0.0 → v1.2.0)
-    │   ├─ Execute():
-    │   │   ├─ 滚动更新 bke-provider Deployment
-    │   │   └─ 验证 Provider 健康状态
+    │
+    ├─ [Binary] containerd-upgrade (依赖 pre-upgrade-resources)
+    │   ├─ GetComponentManifests("containerd-upgrade", "v1.7.1", tmplCtx)
+    │   ├─ 识别 Type=binary，加载 binary.yaml, upgrade-containerd.sh, 压缩包
+    │   ├─ InstallerRegistry 路由到 BinaryInstaller
+    │   ├─ 校验二进制包 Checksum
+    │   ├─ 解压到临时目录
+    │   ├─ 渲染 upgrade-containerd.sh 脚本 (注入 {{.Version}} 等变量)
+    │   ├─ 通过 SSH/Agent 在目标节点执行脚本:
+    │   │   ├─ 停止旧版 containerd
+    │   │   ├─ 替换二进制文件
+    │   │   └─ 重启服务并验证版本
     │   └─ 标记 Succeeded
-    └─ etcd-upgrade (inline 组件)
-        ├─ GetComponentManifests("etcd-upgrade", "v3.5.12", tmplCtx)
-        ├─ Inline 分支: compRef.Inline != nil
-        ├─ ComponentFactory.Resolve("EnsureEtcdUpgrade", "v1.0", inline)
-        ├─ NeedExecute() → true (v3.5.10 → v3.5.12)
-        ├─ Execute():
-        │   ├─ 执行 etcd 备份
-        │   ├─ 逐个滚动升级 etcd Pod
-        │   └─ 验证 etcd 集群健康
+    │
+    ├─ [YAML] etcd-upgrade (依赖 containerd-upgrade)
+    │   ├─ GetComponentManifests("etcd-upgrade", "v3.5.12", tmplCtx)
+    │   ├─ 识别 Type=yaml，扫描 01-statefulset-update.yaml 等
+    │   ├─ 渲染 YAML 中的模板变量 (如 {{.EtcdVersion}} -> v3.5.12)
+    │   ├─ InstallerRegistry 路由到 YamlInstaller
+    │   ├─ ManifestApplier.ApplyManifests():
+    │   │   ├─ Apply 01-statefulset-update.yaml (更新 image tag)
+    │   │   └─ K8s 自动执行滚动更新 (Rolling Update)
+    │   ├─ 等待 StatefulSet 所有 Pod Ready
+    │   └─ 标记 Succeeded
+    │
+    └─ [Helm] monitoring-upgrade (依赖 etcd-upgrade)
+        ├─ GetComponentManifests("monitoring-upgrade", "v2.1.0", tmplCtx)
+        ├─ 识别 Type=helm，加载 Chart.yaml, values.yaml, templates/*
+        ├─ 渲染 values.yaml 中的模板变量 (更新 image tags, 配置变更)
+        ├─ InstallerRegistry 路由到 HelmInstaller
+        ├─ Helm SDK action.NewUpgrade().Run():
+        │   ├─ 合并 pkg.Chart.Values 与 TemplateContext 生成的 Values
+        │   ├─ 渲染 templates 模板
+        │   ├─ 执行 Pre-upgrade Hooks (如有)
+        │   ├─ 更新 K8s 资源 (Deployment, ConfigMap 等)
+        │   └─ 执行 Post-upgrade Hooks (如有)
         └─ 标记 Succeeded
+
 11. 更新 ClusterVersion.Status:
     ├─ currentVersion: v2.6.0
     ├─ currentReleaseImageRef: release-v2.6.0
