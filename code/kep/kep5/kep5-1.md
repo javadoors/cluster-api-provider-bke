@@ -822,9 +822,33 @@ func (s *ManifestStore) loadFromLocal(compDir string) (*ComponentPackage, error)
     
     pkg := &ComponentPackage{}
     var manifestFiles []string
+    var chartFiles map[string][]byte
+    var binaryFiles map[string][]byte
     
+    // 第一遍扫描：加载 component.yaml 确定组件类型
     for _, entry := range entries {
-        if !strings.HasSuffix(entry.Name(), ".yaml") {
+        if entry.Name() == "component.yaml" {
+            filePath := filepath.Join(compDir, entry.Name())
+            data, err := os.ReadFile(filePath)
+            if err != nil { return nil, err }
+            
+            cv := &ComponentVersion{}
+            if err := yaml.Unmarshal(data, cv); err != nil {
+                return nil, fmt.Errorf("failed to parse component.yaml: %w", err)
+            }
+            pkg.Metadata = cv
+            pkg.Type = cv.Spec.Type // 从元数据中获取组件类型
+            break
+        }
+    }
+    
+    if pkg.Metadata == nil {
+        return nil, fmt.Errorf("component.yaml not found in %s", compDir)
+    }
+    
+    // 第二遍扫描：根据类型加载对应资源
+    for _, entry := range entries {
+        if entry.Name() == "component.yaml" {
             continue
         }
         
@@ -832,18 +856,38 @@ func (s *ManifestStore) loadFromLocal(compDir string) (*ComponentPackage, error)
         data, err := os.ReadFile(filePath)
         if err != nil { continue }
         
-        if entry.Name() == "component.yaml" {
-            cv := &ComponentVersion{}
-            if err := yaml.Unmarshal(data, cv); err == nil {
-                pkg.Metadata = cv
+        switch pkg.Type {
+        case ComponentTypeYAML:
+            if strings.HasSuffix(entry.Name(), ".yaml") {
+                manifestFiles = append(manifestFiles, entry.Name())
             }
-        } else {
-            manifestFiles = append(manifestFiles, entry.Name())
+        case ComponentTypeHelm:
+            if chartFiles == nil {
+                chartFiles = make(map[string][]byte)
+            }
+            chartFiles[entry.Name()] = data
+        case ComponentTypeBinary:
+            if binaryFiles == nil {
+                binaryFiles = make(map[string][]byte)
+            }
+            binaryFiles[entry.Name()] = data
+        case ComponentTypeInline:
+            // Inline 类型不需要额外文件，Phase 代码已注册
         }
     }
     
-    // 按依赖顺序排序清单
-    pkg.Manifests = s.sortManifests(manifestFiles, compDir)
+    // 根据类型构建 ComponentPackage
+    switch pkg.Type {
+    case ComponentTypeYAML:
+        pkg.Manifests = s.sortManifests(manifestFiles, compDir)
+    case ComponentTypeHelm:
+        pkg.Chart = s.parseHelmChart(chartFiles, pkg.Metadata)
+    case ComponentTypeBinary:
+        pkg.Binary = s.parseBinaryArtifact(binaryFiles, pkg.Metadata)
+    case ComponentTypeInline:
+        pkg.Inline = pkg.Metadata.Spec.Inline
+    }
+    
     return pkg, nil
 }
 
@@ -855,25 +899,127 @@ func (s *ManifestStore) loadFromOCI(img *oci.Image, name, version string) (*Comp
     
     pkg := &ComponentPackage{}
     var manifestFiles []string
+    var chartFiles map[string][]byte
+    var binaryFiles map[string][]byte
     
+    // 第一遍扫描：加载 component.yaml 确定组件类型
     for _, layer := range layers {
         fileName := strings.TrimPrefix(layer.Path, prefix)
-        if !strings.HasSuffix(fileName, ".yaml") {
-            continue
-        }
-        
         if fileName == "component.yaml" {
             cv := &ComponentVersion{}
-            if err := yaml.Unmarshal(layer.Content, cv); err == nil {
-                pkg.Metadata = cv
+            if err := yaml.Unmarshal(layer.Content, cv); err != nil {
+                return nil, fmt.Errorf("failed to parse component.yaml: %w", err)
             }
-        } else {
-            manifestFiles = append(manifestFiles, fileName)
+            pkg.Metadata = cv
+            pkg.Type = cv.Spec.Type // 从元数据中获取组件类型
+            break
         }
     }
     
-    pkg.Manifests = s.sortManifests(manifestFiles, "")
+    if pkg.Metadata == nil {
+        return nil, fmt.Errorf("component.yaml not found in OCI image")
+    }
+    
+    // 第二遍扫描：根据类型加载对应资源
+    for _, layer := range layers {
+        fileName := strings.TrimPrefix(layer.Path, prefix)
+        if fileName == "component.yaml" {
+            continue
+        }
+        
+        switch pkg.Type {
+        case ComponentTypeYAML:
+            if strings.HasSuffix(fileName, ".yaml") {
+                manifestFiles = append(manifestFiles, fileName)
+                s.cacheManifest(fmt.Sprintf("%s@%s:%s", name, version, fileName), layer.Content)
+            }
+        case ComponentTypeHelm:
+            if chartFiles == nil {
+                chartFiles = make(map[string][]byte)
+            }
+            chartFiles[fileName] = layer.Content
+        case ComponentTypeBinary:
+            if binaryFiles == nil {
+                binaryFiles = make(map[string][]byte)
+            }
+            binaryFiles[fileName] = layer.Content
+        case ComponentTypeInline:
+            // Inline 类型不需要额外文件
+        }
+    }
+    
+    // 根据类型构建 ComponentPackage
+    switch pkg.Type {
+    case ComponentTypeYAML:
+        pkg.Manifests = s.sortManifests(manifestFiles, "")
+    case ComponentTypeHelm:
+        pkg.Chart = s.parseHelmChart(chartFiles, pkg.Metadata)
+    case ComponentTypeBinary:
+        pkg.Binary = s.parseBinaryArtifact(binaryFiles, pkg.Metadata)
+    case ComponentTypeInline:
+        pkg.Inline = pkg.Metadata.Spec.Inline
+    }
+    
     return pkg, nil
+}
+
+// parseHelmChart 解析 Helm Chart 文件
+func (s *ManifestStore) parseHelmChart(files map[string][]byte, metadata *ComponentVersion) *HelmChart {
+    chart := &HelmChart{
+        Name:    metadata.Spec.Name,
+        Version: metadata.Spec.Version,
+        Files:   files,
+    }
+    
+    // 解析 values.yaml
+    if valuesData, ok := files["values.yaml"]; ok {
+        values := make(map[string]interface{})
+        if err := yaml.Unmarshal(valuesData, &values); err == nil {
+            chart.Values = values
+        }
+    }
+    
+    // 解析 Chart.yaml 获取仓库 URL
+    if chartData, ok := files["Chart.yaml"]; ok {
+        chartMeta := make(map[string]interface{})
+        if err := yaml.Unmarshal(chartData, &chartMeta); err == nil {
+            if repoURL, ok := chartMeta["repository"].(string); ok {
+                chart.RepoURL = repoURL
+            }
+        }
+    }
+    
+    return chart
+}
+
+// parseBinaryArtifact 解析二进制安装包
+func (s *ManifestStore) parseBinaryArtifact(files map[string][]byte, metadata *ComponentVersion) *BinaryArtifact {
+    binary := &BinaryArtifact{
+        Name:    metadata.Spec.Name,
+        Version: metadata.Spec.Version,
+    }
+    
+    // 解析 binary.yaml 元数据
+    if binaryData, ok := files["binary.yaml"]; ok {
+        if err := yaml.Unmarshal(binaryData, binary); err != nil {
+            // 使用默认值
+        }
+    }
+    
+    // 查找安装脚本
+    for name, content := range files {
+        if name == "install.sh" || name == "install" {
+            binary.InstallScript = string(content)
+        }
+        if strings.HasSuffix(name, ".tar.gz") || strings.HasSuffix(name, ".zip") {
+            // 二进制压缩包，保存到临时文件
+            tmpFile, _ := os.CreateTemp("", "binary-*")
+            tmpFile.Write(content)
+            binary.LocalPath = tmpFile.Name()
+        }
+    }
+    
+    return binary
 }
 
 // sortManifests 按文件名称自然序排序清单文件
@@ -1619,6 +1765,132 @@ func setupInstallers(mgr ctrl.Manager) *manifest.InstallerRegistry {
 2. **类型发现**：`ComponentVersion.Spec.Type` 字段声明组件类型，ManifestStore 自动识别
 3. **降级策略**：若未找到对应安装器，返回明确错误并标记组件状态为 `InstallerNotFound`
 4. **统一生命周期**：所有安装器实现 `Install/Uninstall/HealthCheck` 三阶段接口
+
+#### 4.5.2.1.1 各类型组件样例
+
+**类型 1：Inline Phase 组件**
+
+```txt
+bke-manifests/
+└── pre-upgrade-resources/
+    └── v1.0.0/
+        └── component.yaml          # 仅包含元数据，Phase 代码已注册
+```
+
+```yaml
+# component.yaml
+apiVersion: cvo.openfuyao.cn/v1beta1
+kind: ComponentVersion
+metadata:
+  name: pre-upgrade-resources-v1.0.0
+spec:
+  name: pre-upgrade-resources
+  type: inline                      # 声明为 inline 类型
+  version: v1.0.0
+  inline:
+    handler: EnsurePreUpgradeResources  # 已注册的 Phase 处理器名称
+    version: v1.0
+  dependencies: []                  # 无依赖，确保最先执行
+  upgradeStrategy:
+    mode: Batch
+    batchSize: 1
+    timeout: "10m"
+    failurePolicy: FailFast
+```
+
+**类型 2：K8s YAML 清单组件**
+
+```txt
+bke-manifests/
+└── etcd/
+    └── v3.5.12/
+        ├── component.yaml          # 元数据
+        ├── 01-crd.yaml             # CRD 定义
+        ├── 02-rbac.yaml            # RBAC 资源
+        ├── 03-configmap.yaml       # ConfigMap 配置
+        └── 04-statefulset.yaml     # StatefulSet 工作负载
+```
+
+```yaml
+# component.yaml
+apiVersion: cvo.openfuyao.cn/v1beta1
+kind: ComponentVersion
+metadata:
+  name: etcd-v3.5.12
+spec:
+  name: etcd
+  type: yaml                        # 声明为 yaml 类型
+  version: v3.5.12
+  dependencies: []
+  upgradeStrategy:
+    mode: Batch
+    batchSize: 1
+    timeout: "30m"
+    failurePolicy: Rollback
+```
+
+**类型 3：Helm Chart 组件**
+
+```txt
+bke-manifests/
+└── monitoring/
+    └── v2.0.0/
+        ├── component.yaml          # 元数据
+        ├── Chart.yaml              # Helm Chart 元数据
+        ├── values.yaml             # 默认 values
+        └── templates/
+            ├── deployment.yaml
+            ├── service.yaml
+            └── configmap.yaml
+```
+
+```yaml
+# component.yaml
+apiVersion: cvo.openfuyao.cn/v1beta1
+kind: ComponentVersion
+metadata:
+  name: monitoring-v2.0.0
+spec:
+  name: monitoring
+  type: helm                        # 声明为 helm 类型
+  version: v2.0.0
+  dependencies: []
+  upgradeStrategy:
+    mode: Batch
+    batchSize: 1
+    timeout: "15m"
+    failurePolicy: Continue
+```
+
+**类型 4：二进制安装包组件**
+
+```txt
+bke-manifests/
+└── containerd/
+    └── v1.7.0/
+        ├── component.yaml          # 元数据
+        ├── binary.yaml             # 二进制包元数据
+        ├── containerd-1.7.0-linux-amd64.tar.gz  # 二进制压缩包
+        └── install.sh              # 安装脚本
+```
+
+```yaml
+# component.yaml
+apiVersion: cvo.openfuyao.cn/v1beta1
+kind: ComponentVersion
+metadata:
+  name: containerd-v1.7.0
+spec:
+  name: containerd
+  type: binary                      # 声明为 binary 类型
+  version: v1.7.0
+  dependencies: []
+  upgradeStrategy:
+    mode: Batch
+    batchSize: 1
+    timeout: "20m"
+    failurePolicy: FailFast
+```
 
 #### 4.5.2.2 TemplateContext 模板渲染模块
 
