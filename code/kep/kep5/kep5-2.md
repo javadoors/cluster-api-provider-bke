@@ -1585,11 +1585,14 @@ flowchart TD
     
     subgraph H ["executeDAG 内部"]
         H1["遍历 DAG 拓扑批次"] --> H2["GetComponentManifests"]
-        H2 --> H3["renderPackage 内部渲染"]
-        H3 --> H4["renderTemplate 渲染元数据"]
-        H3 --> H5["renderYAMLContent 渲染清单"]
-        H2 --> H6["ApplyManifests 应用清单"]
-        H6 --> H7["Phase.Execute"]
+        H2 --> H3["根据 pkg.Type 加载对应资源"]
+        H3 --> H4["渲染模板 若传入 tmplCtx"]
+        H4 --> H5["installerRegistry.InstallComponent"]
+        H5 --> H6["根据 Type 路由到对应安装器"]
+        H6 --> H7["yaml: ApplyManifests"]
+        H6 --> H8["helm: Helm SDK Install"]
+        H6 --> H9["inline: Phase Execute"]
+        H6 --> H10["binary: Install Script"]
     end
 ```
 

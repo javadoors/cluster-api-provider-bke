@@ -2056,16 +2056,15 @@ func (s *ManifestStore) renderYAMLContent(data []byte, ctx *TemplateContext) ([]
 │ 6. 解析 ReleaseImage 获取组件列表                                │
 │ 7. 构建 DAG (依赖图)                                            │
 │ 8. 执行 DAG ◀──────────────────────────────────────────────────┤
-│    └─ executeDAG(ctx, bc, dag, tmplCtx)                         │
+│    └─ executeDAG(ctx, bc, dag, tmplCtx, vCtx)                   │
 │       │                                                         │
 │       ├─ 遍历 DAG 拓扑批次                                       │
 │       ├─ 对每个组件:                                            │
 │       │   ├─ GetComponentManifests(name, ver, tmplCtx) ◀─ 调用位置 2 │
-│       │   │   └─ 内部调用 renderPackage(pkg, tmplCtx)           │
-│       │   │       └─ renderTemplate(cv, ctx)  ◀─ 渲染元数据     │
-│       │   │       └─ renderYAMLContent(data, ctx) ◀─ 渲染清单   │
-│       │   ├─ ApplyManifests(ctx, pkg.Manifests)                 │
-│       │   └─ Phase.Execute()                                    │
+│       │   │   └─ 内部根据 pkg.Type 加载对应资源                  │
+│       │   │       └─ 渲染模板 (若传入 tmplCtx)                   │
+│       │   └─ installerRegistry.InstallComponent(ctx, pkg, vCtx) │
+│       │       └─ 根据 pkg.Type 路由到对应安装器                  │
 │       └─ 返回执行结果                                           │
 │ 9. 更新 ClusterVersion Status                                   │
 └─────────────────────────────────────────────────────────────────┘
@@ -2081,25 +2080,24 @@ func (s *ManifestStore) renderYAMLContent(data []byte, ctx *TemplateContext) ([]
 │    ├─ Hit → 克隆 ComponentPackage                        │
 │    └─ Miss → 继续                                       │
 │                                                         │
-│ 2. 尝试本地文件系统                                      │
-│    /etc/bke/manifests/{name}/{version}/                 │
-│    ├─ 扫描所有 *.yaml 文件                               │
-│    ├─ 解析 component.yaml → Metadata                     │
-│    ├─ 解析其余 YAML → Manifests 列表                     │
+│ 2. 尝试本地文件系统 / OCI 远程拉取                        │
+│    ├─ 第一遍扫描: 加载 component.yaml                    │
+│    │   └─ 获取 pkg.Type = cv.Spec.Type                  │
+│    ├─ 第二遍扫描: 根据 Type 加载对应资源                 │
+│    │   ├─ yaml    → 加载 *.yaml 文件 → Manifests        │
+│    │   ├─ helm    → 加载 Chart/* 文件 → HelmChart       │
+│    │   ├─ binary  → 加载 binary/* 文件 → BinaryArtifact │
+│    │   └─ inline  → 无需额外文件 → InlineSpec           │
 │    └─ 写入缓存 → 继续                                   │
 │                                                         │
-│ 3. OCI 远程拉取                                         │
-│    registry/openfuyao-release:{version}                 │
-│    ├─ 拉取镜像 → 提取组件目录 layer                      │
-│    ├─ 遍历目录下所有 *.yaml 文件                         │
-│    ├─ 写入缓存 → 继续                                   │
-│    └─ 失败 → 返回错误                                   │
-│                                                         │
-│ 4. 模板渲染 (若传入 TemplateContext)                     │
+│ 3. 模板渲染 (若传入 TemplateContext)                     │
 │    ├─ renderPackage(pkg, ctx)                           │
 │    │   ├─ renderTemplate(cv, ctx) → 渲染元数据           │
-│    │   └─ 遍历 Manifests:                               │
-│    │       └─ renderYAMLContent(data, ctx) → 渲染清单   │
+│    │   └─ 根据 Type 渲染对应资源:                        │
+│    │       ├─ yaml    → renderYAMLContent() 渲染清单    │
+│    │       ├─ helm    → 渲染 values.yaml 模板            │
+│    │       ├─ binary  → 渲染 install.sh 脚本模板         │
+│    │       └─ inline  → 无需渲染 (Phase 代码处理)        │
 │    └─ 返回渲染后的 ComponentPackage                      │
 └─────────────────────────────────────────────────────────┘
 ```
