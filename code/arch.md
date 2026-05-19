@@ -488,4 +488,54 @@ graph TB
 | **PPT 使用** | 推荐用 [Mermaid Live Editor](https://mermaid.live) 渲染后导出 SVG/PNG 插入 PPT |
 | **配色调整** | 修改 `classDef` 中的 `fill`/`stroke`/`color` 即可更换各层配色 |
 | **横版适配** | 将第一行 `graph TB` 改为 `graph LR` 即可切换为左右布局 |
-        
+
+# 下一代 Kubernetes 安装部署架构分层图
+
+```mermaid
+graph TD
+    A[声明式控制层<br/>Declarative Control Layer] --> B[安全与合规层<br/>Security & Compliance Layer]
+    B --> C[多云与边缘层<br/>Multi-Cloud & Edge Layer]
+    C --> D[AI / ML 支持层<br/>AI / ML Support Layer]
+    D --> E[可观测性层<br/>Observability Layer]
+
+    subgraph 声明式控制层
+        A1[Cluster API]
+        A2[ArgoCD + GitOps]
+        A1 --> A2
+    end
+
+    subgraph 安全与合规层
+        B1[Zero Trust Security]
+        B2[eBPF Policy]
+        B3[OPA / Gatekeeper]
+        B1 --> B2 --> B3
+    end
+
+    subgraph 多云与边缘层
+        C1[Hybrid / Multi-Cloud]
+        C2[K3s / MicroK8s]
+        C3[Edge Computing]
+        C1 --> C2 --> C3
+    end
+
+    subgraph AI / ML 支持层
+        D1[GPU Scheduling]
+        D2[Kueue AI Workloads]
+        D1 --> D2
+    end
+
+    subgraph 可观测性层
+        E1[Prometheus]
+        E2[Loki / Grafana]
+        E1 --> E2
+    end
+```
+
+这张图展示了下一代 Kubernetes 安装部署的五大层次：
+- **声明式控制层**：以 **Cluster API** 和 **GitOps** 为核心，实现自动化生命周期管理。  
+- **安全与合规层**：内置零信任、eBPF、OPA 策略控制。  
+- **多云与边缘层**：统一管理跨云与边缘集群。  
+- **AI/ML 支持层**：原生支持 GPU 调度与 AI 工作负载。  
+- **可观测性层**：通过 Prometheus、Loki、Grafana 实现全栈监控。
+
+要不要我帮你扩展这个 Mermaid 图，加上 **控制平面与节点交互流程**（例如 kube-apiserver、controller-manager、kubelet 的升级路径）？
