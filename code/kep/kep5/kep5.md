@@ -3496,6 +3496,123 @@ func (p *EnsurePreUpgradeResources) provisionResource(ctx context.Context, spec 
 }
 ```
 
+### 4.8 集群删除与资源清理设计
+
+本章节定义基于声明式架构的集群全生命周期终结流程。与安装/升级流程类似，删除流程同样依赖 DAG 调度与统一安装器，但执行逻辑为**逆拓扑排序**，以确保资源依赖关系的正确解除。
+
+#### 4.8.1 触发机制 (installer-service)
+
+`installer-service` 作为用户交互入口，将删除操作抽象为对 `BKECluster` 资源的声明式删除，而非直接执行清理脚本。
+
+**API 规格与行为**：
+- **接口**: `DELETE /rest/cluster/v1/clusters/{cluster-name}`
+- **逻辑**:
+  1. `installer-service` 接收删除请求。
+  2. 调用 Kubernetes Client 执行 `Delete` 操作删除 `BKECluster` 实例。
+  3. Kubernetes 为资源设置 `DeletionTimestamp`，集群进入 **Terminating** 状态。
+  4. **级联删除**: 由于 `ClusterVersion` 等资源通过 `OwnerReference` 关联到 `BKECluster`，K8s 垃圾回收机制 (GC) 会自动触发这些子资源的删除请求。
+  5. **异步响应**: API 立即返回成功（表示删除意图已接收），用户可通过查询接口监控集群状态直至资源彻底消失。
+
+**installer-service 侧实现**：
+```go
+// pkg/installer/cluster.go
+func (c *installerClient) DeleteCluster(clusterName string) (*httputil.ResponseJson, int) {
+    // 1. 触发删除：K8s 将设置 DeletionTimestamp，进入 Terminating 状态
+    err := c.dynamicClient.Resource(gvr).Namespace(clusterName).Delete(context.Background(), clusterName, metav1.DeleteOptions{})
+    if err != nil {
+        // 处理 404 等错误
+        return httputil.GetResponseJson(constant.ServerError, err.Error(), nil), http.StatusInternalServerError
+    }
+    
+    zlog.Infof("Triggered deletion for BKECluster %s", clusterName)
+    // 2. 返回成功，实际清理由 Controller 异步执行
+    return httputil.GetDefaultSuccessResponseJson(), http.StatusOK
+}
+```
+
+#### 4.8.2 卸载 DAG 构建 (Reverse Topology)
+
+当 `BKEClusterReconciler` 检测到 `BKECluster` 的 `DeletionTimestamp` 非空且包含 Finalizer 时，启动卸载调度引擎。
+
+**核心原则**：卸载顺序必须是安装顺序的**严格逆序** (Reverse Topological Sort)。
+
+**算法逻辑**：
+1.  **获取当前状态**: 读取 `ClusterVersion.Status.CurrentVersion`，获取对应的 `ReleaseImage`（明确当前集群安装了哪些组件）。
+2.  **构建反向图**: 基于 `ReleaseImage` 中定义的组件依赖关系 $G=(V, E)$，构建反向图 $G'=(V, E')$。
+    *   若安装依赖为 $A \to B$ (A 依赖 B，安装时先 B 后 A)。
+    *   则卸载依赖为 $B \to A$ (卸载时先 A 后 B)。
+3.  **拓扑排序**: 对 $G'$ 进行拓扑排序，生成卸载批次 (Uninstall Batches)。
+
+**示例**：
+| 阶段 | 执行顺序 (Batch) | 说明 |
+| :--- | :--- | :--- |
+| **安装** | `Etcd` $\to$ `K8s` $\to$ `Addons` | 依赖方向：Addons 依赖 K8s，K8s 依赖 Etcd |
+| **卸载** | `Addons` $\to$ `K8s` $\to$ `Etcd` | 逆序执行：先清理上层应用，再清理底层设施 |
+
+#### 4.8.3 资源清理执行 (InstallerRegistry Uninstall)
+
+卸载流程复用 `InstallerRegistry`，调用各组件安装器的 `Uninstall` 方法，实现多类型组件的统一清理。
+
+**统一卸载接口**：
+```go
+// pkg/manifest/installer.go
+type ComponentInstaller interface {
+    // ... Install methods ...
+    
+    // Uninstall 卸载组件
+    Uninstall(ctx context.Context, pkg *ComponentPackage) error
+}
+```
+
+**各类型卸载策略**：
+
+| 组件类型 | 卸载实现策略 | 示例 |
+| :--- | :--- | :--- |
+| **YAML** | 按文件**逆序**执行 `kubectl delete -f` | 先删 Deployment，再删 Service，最后删 CRD |
+| **Helm** | 调用 Helm SDK 执行 `helm uninstall` | 自动清理 Release 关联的 K8s 资源 |
+| **Inline** | 调用 Phase 的 `Delete()` 方法 | 清理外部资源 (如 LB DNS 记录、云盘快照) |
+| **Binary** | 执行卸载脚本 | 运行 `uninstall.sh` 清理二进制文件与服务 |
+
+#### 4.8.4 Finalizer 与状态机管理
+
+为防止资源泄漏，删除流程受 Finalizer 保护，并具备状态反馈机制。
+
+**Finalizer 机制**：
+1.  **注入**: 创建 `BKECluster` 时，注入 `bke.openfuyao.cn/cleanup` Finalizer。
+2.  **拦截**: 当用户调用删除 API 时，K8s 仅标记删除，只要 Finalizer 存在，资源对象就不会从 Etcd 中物理移除。
+3.  **释放**: `BKEClusterReconciler` 完成所有组件卸载后，移除该 Finalizer，K8s 完成最终清理。
+
+**异常处理与强制删除**：
+- **卸载失败**: 若某组件卸载失败 (如 `Uninstall` 返回 error)，Reconciler 暂停流程，更新 `BKECluster.Status` 为 `TerminatingFailed` 并记录错误日志。
+- **强制删除**: 提供 `--force` 选项 (通过 Annotation `bke.openfuyao.cn/force-delete: "true"`)，跳过失败的组件卸载步骤，直接移除 Finalizer (适用于节点已丢失等极端场景)。
+
+**删除流程图**：
+```text
+┌─────────────────────────────────────────────────────────────┐
+│  BKEClusterReconciler (Deletion Logic)                      │
+├─────────────────────────────────────────────────────────────┤
+│ 1. 检测 DeletionTimestamp != nil                            │
+│    └─ 若 Finalizer 不存在 → 结束                            │
+│                                                             │
+│ 2. 获取当前版本 ReleaseImage                                │
+│    └─ 若无法获取 (如 CV 已被删) → 使用默认卸载清单/强制清理  │
+│                                                             │
+│ 3. 构建卸载 DAG (Reverse Topology)                          │
+│    └─ Addons -> K8s -> Etcd -> Pre-reqs                    │
+│                                                             │
+│ 4. 执行卸载批次                                             │
+│    └─ InstallerRegistry.UninstallComponent()                │
+│       ├─ 成功 → 标记组件 Status=Deleted                     │
+│       └─ 失败 → 标记 Status=DeleteFailed, 暂停并报错        │
+│                                                             │
+│ 5. 清理关联资源                                             │
+│    └─ 清理 ClusterVersion (若 GC 未处理)                    │
+│                                                             │
+│ 6. 移除 Finalizer                                           │
+│    └─ K8s 物理删除 BKECluster 对象                          │
+└─────────────────────────────────────────────────────────────┘
+```
+
 ## 5. 平滑升级方案（旧版到新版）
 
 ### 5.1 自动迁移方案
