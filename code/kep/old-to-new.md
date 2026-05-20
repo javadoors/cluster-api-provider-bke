@@ -358,3 +358,567 @@ SIG-Installation 负责 openFuyao 发行版集群的**全生命周期管理**—
 
 **无论你是 Kubernetes 深度用户、调度系统专家、还是刚接触云原生的开发者，SIG-Installation 都有适合你的贡献方向。从引导集群的离线交付到管理集群的 DAG 调度引擎，从业务集群的 Agent 插件化到跨层的升级可观测性——每一层都在等待你的参与。**
         
+# 引导集群安装的全部组件：
+
+## 引导集群安装的组件
+
+`bkeadm init` 执行的初始化流程定义在 [initialize.go](file:///D:\code\github\bkeadm\pkg\initialize\initialize.go) 的 `Initialize()` 方法中，按顺序分为 **7 个阶段**：
+
+### 阶段 1：节点信息收集与校验
+
+| 步骤 | 说明 |
+|------|------|
+| `nodeInfo()` | 收集主机名、平台、内核、CPU、内存等信息 |
+| `Validate()` | 磁盘空间校验、端口占用检查（K8s/镜像仓库/Chart仓库/YUM仓库/NFS） |
+| `setTimezone()` | 设置时区 + NTP 服务器 |
+
+### 阶段 2：环境准备 (`prepareEnvironment`)
+
+| 组件 | 说明 |
+|------|------|
+| **系统源配置** | `configLocalSource()` — 配置本地 YUM 源或在线源 |
+| **Hosts 绑定** | `SetHosts()` — 绑定镜像仓库域名到引导节点 IP |
+| **私有仓库 CA** | `SetupCACertificate()` — 配置私有镜像仓库 TLS 证书 |
+| **仓库初始化** | `RepoInit()` + `DecompressionSystemSourceFile()` + `SourceInit()` — 解压系统包、初始化下载源 |
+| **系统兼容性** | `Compat()` + `SetSysctl()` — 系统参数校验与内核参数调优 |
+
+### 阶段 3：容器运行时安装 (`ensureContainerServer`)
+
+| 组件 | 说明 |
+|------|------|
+| **Containerd** | 安装 containerd + CNI 插件（默认运行时） |
+| **Docker** | 可选安装 Docker Engine（Kylin 场景） |
+
+### 阶段 4：仓库服务启动 (`ensureRepository`)
+
+| 服务 | 端口 | 说明 |
+|------|------|------|
+| **镜像仓库** | 443 | Harbor/Distribution 容器镜像仓库，存放所有平台镜像 |
+| **YUM 仓库** | 80 | RPM/DEB 系统包仓库，提供节点依赖包 |
+| **Chart 仓库** | 443 | OCI 格式 Helm Chart 仓库 |
+| **NFS 服务** | 2049 | 离线模式下提供文件共享（仅离线模式启动） |
+
+### 阶段 5：Cluster API 安装 (`ensureClusterAPI`) — 核心阶段
+
+这是引导集群最核心的阶段，在 K3s 轻量级 Kubernetes 上部署以下组件：
+
+| 组件 | Namespace | 说明 |
+|------|-----------|------|
+| **K3s** | — | 轻量级 Kubernetes 发行版，作为引导集群的控制面（容器化运行） |
+| **cert-manager** | `cluster-system` | 证书管理器，为 CAPI Webhook 签发证书 |
+| **CAPI Core** | `cluster-system` | Cluster API 核心控制器（Cluster/Machine/MachineDeployment Controller） |
+| **CAPI Webhook** | `cluster-system` | CAPI 资源校验与转换 Webhook |
+| **BKE Provider** | `cluster-system` | cluster-api-provider-bke 控制器（BKECluster/BKEMachine Controller） |
+| **BKE Agent CRD** | `cluster-system` | bkeagent Command CRD 定义 |
+| **BKE Webhook Secret** | `cluster-system` | Webhook TLS 证书 Secret |
+| **Containerd Config** | — | containerd 配置文件（镜像仓库地址注入） |
+| **Kubelet Config** | — | Kubelet 默认配置 |
+| **Patch ConfigMap** | `openfuyao-patch` | 版本补丁信息（`cm.<version>` 格式） |
+
+### 阶段 6：BKE Console 安装 (`ensureConsoleAll`) — 可选
+
+| 组件 | 说明 |
+|------|------|
+| **CoreDNS** | 为 Console 组件提供内部 DNS 解析 |
+| **bke-console-website** | 前端 Web 控制台 |
+| **bke-console-service** | 后端网关服务（OAuth2.0 认证、路由分发） |
+| **OAuth Webhook** | Kubernetes 认证 Webhook（对接 Console 用户体系） |
+| **User Manager** | 用户管理服务 |
+| **Ingress-Nginx** | 入口控制器 |
+
+安装后需要 **重启 K3s**（注入 OAuth Webhook 配置），然后部署 OAuth + User Management。
+
+### 阶段 7：配置生成与集群部署
+
+| 步骤 | 说明 |
+|------|------|
+| `generateClusterConfig()` | 生成 BKECluster 配置文件（含镜像仓库/HTTP仓库/Chart仓库地址） |
+| `deployCluster()` | 自动部署第一个管理集群 |
+
+## 组件汇总图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    引导集群 (Bootstrap Cluster) — bkeadm init                    │
+│                                                                                 │
+│  ┌───────────────────────────────────────────────────────────────────────────┐  │
+│  │  基础设施层 (宿主机)                                                       │  │
+│  │                                                                           │  │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  │  │
+│  │  │  Containerd  │  │  镜像仓库    │  │  YUM 仓库    │  │  Chart 仓库  │  │  │
+│  │  │  (容器运行时) │  │  :443       │  │  :80         │  │  :443       │  │  │
+│  │  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘  │  │
+│  │  ┌──────────────┐  ┌──────────────┐                                    │  │
+│  │  │  NFS 服务    │  │  NTP 服务    │  (仅离线模式)                       │  │
+│  │  │  :2049       │  │  :123        │                                    │  │
+│  │  └──────────────┘  └──────────────┘                                    │  │
+│  └───────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                 │
+│  ┌───────────────────────────────────────────────────────────────────────────┐  │
+│  │  K3s 集群 (容器化轻量 K8s)                                                 │  │
+│  │                                                                           │  │
+│  │  ┌─────────────────────────────────────────────────────────────────────┐  │  │
+│  │  │  Namespace: cluster-system                                          │  │  │
+│  │  │                                                                     │  │  │
+│  │  │  ┌────────────────┐  ┌────────────────┐  ┌────────────────────┐    │  │  │
+│  │  │  │  cert-manager  │  │  CAPI Core     │  │  BKE Provider      │    │  │  │
+│  │  │  │  (证书签发)    │  │  (集群/机器    │  │  (BKECluster/      │    │  │  │
+│  │  │  │                │  │   生命周期)    │  │   BKEMachine Ctrl) │    │  │  │
+│  │  │  └────────────────┘  └────────────────┘  └────────────────────┘    │  │  │
+│  │  │  ┌────────────────┐  ┌────────────────┐  ┌────────────────────┐    │  │  │
+│  │  │  │  CAPI Webhook  │  │  BKE Agent CRD │  │  Webhook Secret    │    │  │  │
+│  │  │  │  (资源校验)    │  │  (Command CRD) │  │  (TLS 证书)        │    │  │  │
+│  │  │  └────────────────┘  └────────────────┘  └────────────────────┘    │  │  │
+│  │  └─────────────────────────────────────────────────────────────────────┘  │  │
+│  │                                                                           │  │
+│  │  ┌─────────────────────────────────────────────────────────────────────┐  │  │
+│  │  │  Namespace: openfuyao-patch                                         │  │  │
+│  │  │  ┌──────────────────────────────────────────────────────────────┐   │  │  │
+│  │  │  │  ConfigMap: cm.<version>  (版本补丁信息 PatchVersionInfo)    │   │  │  │
+│  │  │  └──────────────────────────────────────────────────────────────┘   │  │  │
+│  │  └─────────────────────────────────────────────────────────────────────┘  │  │
+│  │                                                                           │  │
+│  │  ┌─────────────────────────────────────────────────────────────────────┐  │  │
+│  │  │  Console 组件 (可选, --installConsole=true)                          │  │  │
+│  │  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐      │  │  │
+│  │  │  │  Console     │  │  Console     │  │  Ingress-Nginx       │      │  │  │
+│  │  │  │  Website     │  │  Service     │  │  (入口控制器)        │      │  │  │
+│  │  │  └──────────────┘  └──────────────┘  └──────────────────────┘      │  │  │
+│  │  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐      │  │  │
+│  │  │  │  OAuth       │  │  User        │  │  CoreDNS             │      │  │  │
+│  │  │  │  Webhook     │  │  Manager     │  │  (内部 DNS)          │      │  │  │
+│  │  │  └──────────────┘  └──────────────┘  └──────────────────────┘      │  │  │
+│  │  └─────────────────────────────────────────────────────────────────────┘  │  │
+│  └───────────────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+## 关键说明
+
+1. **引导集群本质是 K3s**：通过 `nerdctl run` 启动一个容器化的 K3s 单节点集群，监听在用户指定的 `KubernetesPort`（默认 36443），所有 CAPI/BKE 组件运行在这个 K3s 上。
+
+2. **引导集群 → 管理集群的过渡**：`bkeadm init` 完成后会自动调用 `deployCluster()`，在引导集群上创建第一个 BKECluster CR，由 capbke 的 PhaseFrame 引擎驱动安装**管理集群**。管理集群就绪后，引导集群（K3s）上的工作负载可以迁移或销毁。
+
+3. **仓库服务是引导集群的基石**：镜像仓库、YUM 仓库、Chart 仓库都以容器方式运行在宿主机上（不在 K3s 内），为后续的管理集群和业务集群安装提供物料。
+
+4. **Console 是可选的**：通过 `--installConsole=true/false` 控制。不安装 Console 时，引导集群仅包含 CAPI + BKE Provider 核心组件，更轻量。
+
+# 管理集群的安装流程
+
+## 管理集群安装的组件
+
+管理集群的安装由 **PhaseFrame 引擎** 驱动，当 `bkeadm init` 完成引导集群初始化后，调用 `deployCluster()` 在引导集群上创建 BKECluster CR，触发 capbke 控制器按阶段执行安装。
+
+### 安装阶段与对应组件
+
+#### 阶段 1：EnsureFinalizer — 部署任务创建
+为 BKECluster 设置 Finalizer，确保删除时能执行清理逻辑。
+
+#### 阶段 2：EnsureCerts — 集群证书创建
+通过 `BKEKubernetesCertGenerator` 生成 Kubernetes 集群所需的全部证书：
+- CA 证书（etcd、k8s、front-proxy）
+- API Server 证书及密钥
+- etcd Server/Peer/Client 证书
+- Service Account 密钥
+- 证书以 Secret 形式存储在引导集群
+
+#### 阶段 3：EnsureClusterAPIObj — ClusterAPI 对接
+在引导集群创建 CAPI 资源映射：
+- 创建 `Cluster` 资源（CAPI 核心）
+- 创建 `BKECluster` → `Cluster` 的 OwnerReference
+- 等待 CAPI 资源就绪
+
+#### 阶段 4：EnsureBKEAgent — 推送 Agent
+通过 SSH 将 bkeagent 二进制推送到所有节点：
+- 下载 bkeagent 到每个节点
+- 启动 bkeagent 服务（systemd）
+- bkeagent 注册为 Command 执行器，监听引导集群的 Command CR
+
+#### 阶段 5：EnsureNodesEnv — 节点环境准备
+通过 bkeagent 在每个节点上执行环境初始化命令：
+- **系统参数调优**：sysctl、ulimit、内核模块加载
+- **容器运行时安装**：containerd + CNI 插件
+- **Kubernetes 组件安装**：kubeadm、kubelet、kubectl
+- **辅助工具安装**：lxcfs、nfs-utils、etcdctl、helm、calicoctl、runc
+- **Hosts 绑定**：master.bocloud.com → VIP/控制面 IP
+- **镜像仓库证书注入**：containerd 配置私有仓库信任
+
+#### 阶段 6：EnsureLoadBalance — 集群入口配置
+- **HA 集群**：配置 HAProxy + Keepalived（VIP 漂移）
+- **单 Master 集群**：跳过此阶段
+
+#### 阶段 7：EnsureMasterInit — Master 初始化
+在第一个 Master 节点上执行 `kubeadm init`：
+- 启动 kube-apiserver、kube-controller-manager、kube-scheduler 静态 Pod
+- 生成 kubeconfig 文件
+- 等待 API Server 就绪
+
+#### 阶段 8：EnsureMasterJoin — Master 加入
+其余 Master 节点执行 `kubeadm join`：
+- 加入 etcd 集群
+- 启动控制面静态 Pod
+
+#### 阶段 9：EnsureWorkerJoin — Worker 加入
+Worker 节点执行 `kubeadm join`：
+- 加入 Kubernetes 集群
+- 启动 kubelet
+
+#### 阶段 10：EnsureAddonDeploy — 集群组件部署 ⭐核心阶段
+
+这是管理集群组件最丰富的阶段，通过 Helm Chart 向目标集群安装以下组件：
+
+| Addon 名称 | Namespace | 说明 |
+|------------|-----------|------|
+| **kubeproxy** | `kube-system` | Kubernetes 网络代理 |
+| **calico** | `kube-system` | CNI 网络插件（支持 BGP/IPIP 模式） |
+| **coredns** | `kube-system` | 集群内 DNS 服务 |
+| **nfs-csi** | `kube-system` | NFS CSI 存储驱动 |
+| **bocoperator** | `kube-system` | BOC 运维操作器 |
+| **cluster-api** | `cluster-system` | CAPI 核心控制器 + BKE Provider（管理集群可嵌套管理子集群） |
+| **openfuyao-system-controller** | 多个命名空间 | openFuyao 平台核心组件（见下表） |
+| **etcdbackup** | `kube-system` | etcd 定期备份（可选） |
+| **beyondELB** | `kube-system` | 负载均衡器（可选） |
+| **gpu-manager** | `kube-system` | GPU 设备管理（可选） |
+
+**openfuyao-system-controller 展开的组件**（定义在 [health.go](file:///D:\code\github\cluster-api-provider-bke\pkg\kube\health.go)）：
+
+| Namespace | 组件 | 说明 |
+|-----------|------|------|
+| `kube-system` | metrics-server | 指标采集服务 |
+| `ingress-nginx` | ingress-nginx-controller | 入口控制器 |
+| `monitoring` | prometheus-operator | Prometheus Operator |
+| `monitoring` | prometheus-k8s | Prometheus 实例 |
+| `monitoring` | alertmanager-main | 告警管理器 |
+| `monitoring` | kube-state-metrics | 集群状态指标 |
+| `monitoring` | node-exporter | 节点指标导出 |
+| `monitoring` | blackbox-exporter | 黑盒探测 |
+| `openfuyao-system` | console-website | 前端 Web 控制台 |
+| `openfuyao-system` | console-service | 后端网关服务 |
+| `openfuyao-system` | oauth-server | OAuth2.0 认证服务 |
+| `openfuyao-system` | oauth-webhook | K8s 认证 Webhook |
+| `openfuyao-system` | user-management-operator | 用户管理服务 |
+| `openfuyao-system` | application-management-service | 应用管理服务 |
+| `openfuyao-system` | marketplace-service | 应用市场服务 |
+| `openfuyao-system` | monitoring-service | 监控服务 |
+| `openfuyao-system` | plugin-management-service | 插件管理服务 |
+| `openfuyao-system` | web-terminal-service | Web 终端服务 |
+| `openfuyao-system` | local-harbor | 本地镜像仓库 |
+| `openfuyao-system-controller` | openfuyao-system-controller | 平台控制器（管理集群特有） |
+
+安装 `openfuyao-system-controller` 前的预处理：
+- 为 Master 节点打 `control-plane` 标签
+- 分发 Patch ConfigMap 到目标集群 `openfuyao-system-controller` 命名空间
+
+安装后的后处理：
+- 生成默认管理员用户名和密码
+- 输出登录地址
+
+#### 阶段 11：EnsureNodesPostProcess — 后置脚本处理
+在所有节点上执行用户自定义后置脚本（通过 ConfigMap 配置）。
+
+#### 阶段 12：EnsureAgentSwitch — Agent 监听切换
+将 bkeagent 的监听目标从引导集群切换到管理集群自身：
+- bkeagent 开始监听管理集群的 Command CR
+- 管理集群实现自治管理
+
+## 管理集群组件汇总图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                        管理集群 (Management Cluster) — PhaseFrame 驱动安装                │
+│                                                                                         │
+│  ┌───────────────────────────────────────────────────────────────────────────────────┐  │
+│  │  Kubernetes 控制面 (kube-system) — EnsureMasterInit/Join                          │  │
+│  │  ┌──────────────┐  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────┐  │  │
+│  │  │ kube-apiserver│  │ kube-controller- │  │ kube-scheduler   │  │    etcd      │  │  │
+│  │  │   (静态Pod)  │  │ manager (静态Pod)│  │   (静态Pod)      │  │  (静态Pod)   │  │  │
+│  │  └──────────────┘  └──────────────────┘  └──────────────────┘  └──────────────┘  │  │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐  │  │
+│  │  │   kubelet    │  │  kubeproxy   │  │   calico     │  │   coredns            │  │  │
+│  │  │  (每节点)    │  │  (DaemonSet) │  │  (CNI 插件)  │  │  (Deployment ×2)     │  │  │
+│  │  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────────────┘  │  │
+│  └───────────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                         │
+│  ┌───────────────────────────────────────────────────────────────────────────────────┐  │
+│  │  存储与入口                                                                        │  │
+│  │  ┌──────────────┐  ┌──────────────────┐  ┌──────────────────────────────────┐    │  │
+│  │  │  nfs-csi     │  │ ingress-nginx    │  │ HAProxy + Keepalived (HA场景)    │    │  │
+│  │  │ (CSI 驱动)   │  │ (入口控制器)     │  │ (VIP 漂移, EnsureLoadBalance)    │    │  │
+│  │  └──────────────┘  └──────────────────┘  └──────────────────────────────────┘    │  │
+│  └───────────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                         │
+│  ┌───────────────────────────────────────────────────────────────────────────────────┐  │
+│  │  可观测性 (monitoring)                                                             │  │
+│  │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────────────────┐    │  │
+│  │  │ prometheus-k8s   │  │ alertmanager-main│  │ prometheus-operator          │    │  │
+│  │  │ (监控实例)       │  │ (告警管理)       │  │ (Operator)                   │    │  │
+│  │  └──────────────────┘  └──────────────────┘  └──────────────────────────────┘    │  │
+│  │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────────────────┐    │  │
+│  │  │ kube-state-metrics│ │ node-exporter    │  │ blackbox-exporter            │    │  │
+│  │  │ (集群指标)       │  │ (节点指标)       │  │ (黑盒探测)                   │    │  │
+│  │  └──────────────────┘  └──────────────────┘  └──────────────────────────────┘    │  │
+│  │  ┌──────────────────┐                                                             │  │
+│  │  │ metrics-server   │  (kube-system)                                              │  │
+│  │  │ (指标采集)       │                                                              │  │
+│  │  └──────────────────┘                                                             │  │
+│  └───────────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                         │
+│  ┌───────────────────────────────────────────────────────────────────────────────────┐  │
+│  │  openFuyao 平台服务 (openfuyao-system)                                            │  │
+│  │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────────────────┐    │  │
+│  │  │ console-website  │  │ console-service  │  │ oauth-server                 │    │  │
+│  │  │ (Web 控制台)     │  │ (后端网关)       │  │ (认证服务)                   │    │  │
+│  │  └──────────────────┘  └──────────────────┘  └──────────────────────────────┘    │  │
+│  │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────────────────┐    │  │
+│  │  │ oauth-webhook    │  │ user-management- │  │ application-management-      │    │  │
+│  │  │ (K8s认证)        │  │ operator (用户)   │  │ service (应用管理)           │    │  │
+│  │  └──────────────────┘  └──────────────────┘  └──────────────────────────────┘    │  │
+│  │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────────────────┐    │  │
+│  │  │ marketplace-     │  │ monitoring-      │  │ plugin-management-           │    │  │
+│  │  │ service (市场)   │  │ service (监控)   │  │ service (插件)               │    │  │
+│  │  └──────────────────┘  └──────────────────┘  └──────────────────────────────┘    │  │
+│  │  ┌──────────────────┐  ┌──────────────────┐                                    │  │
+│  │  │ web-terminal-    │  │ local-harbor     │                                    │  │
+│  │  │ service (终端)   │  │ (本地仓库)       │                                    │  │
+│  │  └──────────────────┘  └──────────────────┘                                    │  │
+│  └───────────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                         │
+│  ┌───────────────────────────────────────────────────────────────────────────────────┐  │
+│  │  集群管理 (cluster-system / openfuyao-system-controller)                           │  │
+│  │  ┌──────────────────────────┐  ┌──────────────────────────────────────────┐      │  │
+│  │  │ capi-controller-manager  │  │ bke-controller-manager                   │      │  │
+│  │  │ (CAPI 核心控制器)        │  │ (BKE Provider 控制器)                    │      │  │
+│  │  └──────────────────────────┘  └──────────────────────────────────────────┘      │  │
+│  │  ┌──────────────────────────┐  ┌──────────────────────────────────────────┐      │  │
+│  │  │ openfuyao-system-        │  │ patch-config (ConfigMap)                 │      │  │
+│  │  │ controller (平台控制器)  │  │ (版本补丁信息)                           │      │  │
+│  │  └──────────────────────────┘  └──────────────────────────────────────────┘      │  │
+│  └───────────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                         │
+│  ┌───────────────────────────────────────────────────────────────────────────────────┐  │
+│  │  节点代理 (每节点) — EnsureBKEAgent + EnsureAgentSwitch                           │  │
+│  │  ┌──────────────────────────┐  ┌──────────────────────────────────────────┐      │  │
+│  │  │ bkeagent (systemd 服务)  │  │ bkeagent-launcher (DaemonSet, 临时)      │      │  │
+│  │  │ (监听管理集群 Command CR)│  │ (推送/升级 agent 后自动删除)             │      │  │
+│  │  └──────────────────────────┘  └──────────────────────────────────────────┘      │  │
+│  └───────────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                         │
+│  ┌───────────────────────────────────────────────────────────────────────────────────┐  │
+│  │  可选组件                                                                          │  │
+│  │  ┌──────────────────┐  ┌──────────────────┐  ┌──────────────────────────────┐    │  │
+│  │  │ etcdbackup       │  │ beyondELB        │  │ gpu-manager                  │    │  │
+│  │  │ (etcd 定期备份)  │  │ (负载均衡器)     │  │ (GPU 设备管理)               │    │  │
+│  │  └──────────────────┘  └──────────────────┘  └──────────────────────────────┘    │  │
+│  └───────────────────────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+## 引导集群 vs 管理集群的关键区别
+
+| 维度 | 引导集群 (Bootstrap) | 管理集群 (Management) |
+|------|---------------------|----------------------|
+| **K8s 发行版** | K3s（容器化单节点） | 标准 Kubernetes（kubeadm 部署） |
+| **生命周期** | 临时，管理集群就绪后可销毁 | 持久，平台核心 |
+| **CAPI 组件** | ✅ cert-manager + CAPI + BKE Provider | ✅ CAPI + BKE Provider（嵌套管理） |
+| **openFuyao 平台** | ❌ 或仅 Console（轻量） | ✅ 完整平台服务（20+ 组件） |
+| **可观测性** | ❌ | ✅ Prometheus 全栈 |
+| **bkeagent** | ❌ 不安装 | ✅ 每节点安装，监听管理集群 |
+| **存储** | ❌ | ✅ NFS CSI |
+| **入口** | ❌ | ✅ Ingress-Nginx + HAProxy |
+| **核心职责** | 托管 CAPI 控制器，驱动管理集群安装 | 托管平台服务，管理业务集群 |
+
+管理集群安装完成后，bkeagent 通过 `EnsureAgentSwitch` 阶段将监听目标从引导集群切换到管理集群自身，实现**自治管理**——管理集群不再依赖引导集群，可以独立管理自身的节点和业务集群。
+
+# 业务集群安装流程
+
+## 业务集群安装的组件
+
+业务集群与管理集群共享同一套 PhaseFrame 安装引擎，但组件配置有显著差异。业务集群的 Addon 列表由用户在 BKECluster CR 的 `spec.clusterConfig.addons` 中声明，**不包含管理集群特有的平台服务组件**。
+
+### 集群类型区分
+
+系统通过 `bke.bocloud.com/cluster-from` 注解区分集群类型（定义在 [constants.go](file:///D:\code\github\cluster-api-provider-bke\common\constants.go)）：
+
+| 注解值 | 集群类型 | 说明 |
+|--------|----------|------|
+| `bke` 或空 | BKE 集群 | 由 BKE 全新创建的集群 |
+| `bocloud` | Bocloud 集群 | 已有集群被纳管 |
+| `other` | 其他集群 | 第三方集群导入 |
+
+### 安装阶段与组件
+
+业务集群的安装阶段与管理集群完全相同（PhaseFrame 驱动），但各阶段安装的具体组件不同：
+
+#### 阶段 1~3：EnsureFinalizer / EnsureCerts / EnsureClusterAPIObj
+与管理集群一致。
+
+#### 阶段 4：EnsureBKEAgent — 推送 Agent
+- 通过 SSH 推送 bkeagent 二进制到每个节点
+- 安装为 systemd 服务（`/etc/systemd/system/bkeagent.service`）
+- **关键差异**：业务集群的 bkeagent 携带**低权限 kubeconfig**（`GetLeastPrivilegeKubeConfig`），仅能操作 Command CR；而管理集群（含 cluster-api addon）使用完整 kubeconfig
+- 上传证书链到 `/etc/openFuyao/certs/`
+- 如果集群包含 `cluster-api` addon，额外上传全局 CA 证书
+
+#### 阶段 5：EnsureNodesEnv — 节点环境准备
+与管理集群一致：
+- containerd + CNI 插件
+- kubeadm + kubelet + kubectl
+- 辅助工具（lxcfs、nfs-utils、etcdctl、helm、calicoctl、runc）
+- 系统参数调优
+
+#### 阶段 6：EnsureLoadBalance — 集群入口配置
+与管理集群一致（HA 场景配置 HAProxy + Keepalived）。
+
+#### 阶段 7~9：EnsureMasterInit / EnsureMasterJoin / EnsureWorkerJoin
+与管理集群一致（kubeadm 初始化 Kubernetes 控制面）。
+
+#### 阶段 10：EnsureAddonDeploy — 集群组件部署 ⭐核心差异
+
+**业务集群的默认 Addon**（定义在 [export.go](file:///D:\code\github\cluster-api-provider-bke\common\cluster\initialize\export.go) 的 `defaultAddons()`）：
+
+| Addon | Namespace | 说明 | 业务集群 | 管理集群 |
+|-------|-----------|------|----------|----------|
+| **kubeproxy** | `kube-system` | 网络代理 | ✅ | ✅ |
+| **calico** | `kube-system` | CNI 插件 | ✅ | ✅ |
+| **coredns** | `kube-system` | DNS 服务 | ✅ | ✅ |
+| **nfs-csi** | `kube-system` | NFS CSI 驱动 | ✅ | ✅ |
+| **bocoperator** | `kube-system` | BOC 运维操作器 | ✅ | ✅ |
+| **cluster-api** | `cluster-system` | CAPI + BKE Provider | ❌ 默认不装 | ✅ |
+| **openfuyao-system-controller** | 多个 | 平台核心组件 | ❌ 不装 | ✅ |
+
+**业务集群不安装的平台组件**（仅管理集群有）：
+
+| Namespace | 组件 | 说明 |
+|-----------|------|------|
+| `openfuyao-system` | console-website | Web 控制台 |
+| `openfuyao-system` | console-service | 后端网关 |
+| `openfuyao-system` | oauth-server | OAuth2.0 认证 |
+| `openfuyao-system` | oauth-webhook | K8s 认证 Webhook |
+| `openfuyao-system` | user-management-operator | 用户管理 |
+| `openfuyao-system` | application-management-service | 应用管理 |
+| `openfuyao-system` | marketplace-service | 应用市场 |
+| `openfuyao-system` | monitoring-service | 监控服务 |
+| `openfuyao-system` | plugin-management-service | 插件管理 |
+| `openfuyao-system` | web-terminal-service | Web 终端 |
+| `openfuyao-system` | local-harbor | 本地镜像仓库 |
+| `openfuyao-system-controller` | openfuyao-system-controller | 平台控制器 |
+| `monitoring` | prometheus 全栈 | 可观测性 |
+| `ingress-nginx` | ingress-nginx-controller | 入口控制器 |
+| `kube-system` | metrics-server | 指标采集 |
+
+**业务集群可选安装的 Addon**（用户通过 BKECluster CR 自定义）：
+
+| Addon | 说明 | 触发条件 |
+|-------|------|----------|
+| **cluster-api** | CAPI + BKE Provider（嵌套管理子集群） | `addons` 列表中声明且 `param["manage"]="true"` |
+| **etcdbackup** | etcd 定期备份 | `addons` 列表中声明 |
+| **beyondELB** | 负载均衡器 | `addons` 列表中声明 |
+| **gpu-manager** | GPU 设备管理 | `addons` 列表中声明 |
+| **nodelocaldns** | 节点本地 DNS 缓存 | `addons` 列表中声明 |
+| **fabric** | 服务网格 | `addons` 列表中声明 |
+| **自定义 Chart Addon** | 任意 Helm Chart | `type: "chart"` + `valuesConfigMapRef` |
+
+#### 阶段 11~12：EnsureNodesPostProcess / EnsureAgentSwitch
+与管理集群一致。
+
+## 业务集群组件汇总图
+
+```
+┌───────────────────────────────────────────────────────────────────────────────────┐
+│                    业务集群 (Business Cluster) — PhaseFrame 驱动安装               │
+│                                                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐  │
+│  │  Kubernetes 控制面 (kube-system) — EnsureMasterInit/Join                    │  │
+│  │  ┌──────────────┐  ┌──────────────────┐  ┌──────────────────┐             │  │
+│  │  │ kube-apiserver│  │ kube-controller- │  │ kube-scheduler   │             │  │
+│  │  │   (静态Pod)  │  │ manager (静态Pod)│  │   (静态Pod)      │             │  │
+│  │  └──────────────┘  └──────────────────┘  └──────────────────┘             │  │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐                     │  │
+│  │  │    etcd      │  │   kubelet    │  │  kubeproxy   │                     │  │
+│  │  │  (静态Pod)   │  │  (每节点)    │  │  (DaemonSet) │                     │  │
+│  │  └──────────────┘  └──────────────┘  └──────────────┘                     │  │
+│  └─────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐  │
+│  │  网络与存储                                                                  │  │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────────────────┐  │  │
+│  │  │   calico     │  │   coredns    │  │  nfs-csi (CSI 驱动)              │  │  │
+│  │  │  (CNI 插件)  │  │ (Deployment) │  │                                  │  │  │
+│  │  └──────────────┘  └──────────────┘  └──────────────────────────────────┘  │  │
+│  └─────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐  │
+│  │  运维管理                                                                    │  │
+│  │  ┌──────────────┐  ┌──────────────────────────────────────────────────┐    │  │
+│  │  │ bocoperator  │  │ HAProxy + Keepalived (HA场景, EnsureLoadBalance) │    │  │
+│  │  │ (运维操作器)  │  │ (VIP 漂移)                                      │    │  │
+│  │  └──────────────┘  └──────────────────────────────────────────────────┘    │  │
+│  └─────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐  │
+│  │  节点代理 (每节点) — EnsureBKEAgent + EnsureAgentSwitch                     │  │
+│  │  ┌──────────────────────────────────────────────────────────────────────┐   │  │
+│  │  │ bkeagent (systemd 服务)                                              │   │  │
+│  │  │ • 监听管理集群 Command CR（低权限 kubeconfig）                        │   │  │
+│  │  │ • 执行节点命令（环境初始化/升级/脚本等）                               │   │  │
+│  │  │ • 健康检查端口（agentHealthPort）                                     │   │  │
+│  │  │ • NTP 同步                                                           │   │  │
+│  │  └──────────────────────────────────────────────────────────────────────┘   │  │
+│  └─────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐  │
+│  │  可选组件 (用户在 BKECluster CR 中声明)                                     │  │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────────────────┐  │  │
+│  │  │ cluster-api  │  │ etcdbackup   │  │ beyondELB (负载均衡器)           │  │  │
+│  │  │ (嵌套管理)   │  │ (etcd 备份)  │  │                                  │  │  │
+│  │  └──────────────┘  └──────────────┘  └──────────────────────────────────┘  │  │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────────────────┐  │  │
+│  │  │ gpu-manager  │  │ nodelocaldns │  │ fabric (服务网格)                │  │  │
+│  │  │ (GPU 管理)   │  │ (本地DNS缓存)│  │                                  │  │  │
+│  │  └──────────────┘  └──────────────┘  └──────────────────────────────────┘  │  │
+│  │  ┌──────────────────────────────────────────────────────────────────────┐   │  │
+│  │  │ 自定义 Chart Addon (type: chart + valuesConfigMapRef)                │   │  │
+│  │  └──────────────────────────────────────────────────────────────────────┘   │  │
+│  └─────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐  │
+│  │  ❌ 不安装的平台组件（仅管理集群有）                                         │  │
+│  │                                                                             │  │
+│  │  openfuyao-system: console / oauth / user-mgmt / app-mgmt / marketplace /  │  │
+│  │                    monitoring-svc / plugin-mgmt / web-terminal / harbor     │  │
+│  │  openfuyao-system-controller: platform controller                          │  │
+│  │  monitoring: prometheus 全栈                                                │  │
+│  │  ingress-nginx: 入口控制器                                                  │  │
+│  │  kube-system: metrics-server                                                │  │
+│  └─────────────────────────────────────────────────────────────────────────────┘  │
+└───────────────────────────────────────────────────────────────────────────────────┘
+```
+
+## 三层集群组件对比
+
+| 组件 | 引导集群 | 管理集群 | 业务集群 |
+|------|----------|----------|----------|
+| **K8s 发行版** | K3s（容器化） | 标准 K8s（kubeadm） | 标准 K8s（kubeadm） |
+| **K8s 控制面** | K3s 内置 | ✅ kube-apiserver 等 | ✅ kube-apiserver 等 |
+| **kubeproxy** | ❌ K3s 内置 | ✅ | ✅ |
+| **calico** | ❌ K3s 内置 | ✅ | ✅ |
+| **coredns** | ❌ K3s 内置 | ✅ | ✅ |
+| **nfs-csi** | ❌ | ✅ | ✅ |
+| **bocoperator** | ❌ | ✅ | ✅ |
+| **bkeagent** | ❌ | ✅（完整权限） | ✅（低权限） |
+| **HAProxy+Keepalived** | ❌ | ✅（HA场景） | ✅（HA场景） |
+| **ingress-nginx** | ❌ | ✅ | ❌ |
+| **metrics-server** | ❌ | ✅ | ❌ |
+| **Prometheus 全栈** | ❌ | ✅ | ❌ |
+| **openFuyao 平台服务** | ❌ 或轻量 Console | ✅ 完整（20+组件） | ❌ |
+| **openfuyao-system-controller** | ❌ | ✅ | ❌ |
+| **cluster-api (嵌套管理)** | ✅（CAPI+BKE Provider） | ✅（可选） | ❌（可选） |
+| **cert-manager** | ✅ | ❌ | ❌ |
+| **镜像/YUM/Chart 仓库** | ✅（宿主机容器） | ❌ | ❌ |
+| **NFS 服务** | ✅（离线模式） | ❌ | ❌ |
+| **自定义 Chart Addon** | ❌ | ✅ | ✅ |
+
+**核心差异**：业务集群是"纯工作负载集群"——只安装 K8s 核心 + 网络存储 + 运维操作器 + bkeagent，不承载平台管理面服务。bkeagent 使用低权限 kubeconfig 连接管理集群，接收并执行管理集群下发的命令。
+
+
+        
