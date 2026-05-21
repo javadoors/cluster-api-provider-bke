@@ -5076,3 +5076,216 @@ spec:
                     type: object
                     x-kubernetes-preserve-unknown-fields: true
 ```
+
+## 13. installer-service 重构方案
+
+本章节详述 `installer-service` 基于 KEP-5 架构的重构方案，旨在将系统从**命令式运维**转型为**声明式任务管理**，实现升级路径智能规划、兼容性自动预检及全链路状态可观测。
+
+### 13.1 重构背景与目标
+
+#### 13.1.1 现状痛点
+*   **命令式触发**：直接 Patch `BKECluster` 字段，缺乏对升级意图的高级抽象。
+*   **路径盲区**：升级路径硬编码，无法处理多跳升级或拦截非法路径。
+*   **缺乏预检**：无组件兼容性校验，易导致升级失败。
+*   **状态黑盒**：升级过程缺乏细粒度状态反馈，仅能知道成功或失败。
+
+#### 13.1.2 重构目标
+1.  **声明式 API**：通过创建/更新 `ClusterVersion` CR 触发升级，实现意图与执行解耦。
+2.  **智能路径规划**：基于 `UpgradePath` 图自动计算最短路径，支持多跳升级。
+3.  **安全预检**：集成 CSP 求解器，升级前拦截不兼容版本组合。
+4.  **全链路可观测**：提供任务 ID 和进度查询接口，支持异步状态跟踪。
+5.  **平滑迁移**：通过 Feature Gate 控制，支持新旧模式双轨运行，向后兼容。
+
+### 13.2 总体架构设计
+
+#### 13.2.1 逻辑分层
+
+```text
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                                    Client / Frontend                                │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+        │ HTTP Request (JSON)
+        ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                                API Layer (Handler)                                  │
+│  • /clusters/{name}/upgrade (POST)    • /clusters/{name}/upgrade-status (GET)       │
+│  • /clusters/{name}/upgrade/cancel (POST)  • /versions (GET)                        │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                              Service Layer (New)                                    │
+│  ┌──────────────────────┐  ┌──────────────────────┐  ┌──────────────────────────┐   │
+│  │   UpgradeService     │  │   VersionService     │  │   StatusService          │   │
+│  │ • SubmitUpgrade      │  │ • GetInstallableList │  │ • GetUpgradeProgress     │   │
+│  │ • CancelUpgrade      │  │ • GetUpgradePaths    │  │ • CancelTask             │   │
+│  └──────────┬───────────┘  └──────────┬───────────┘  └──────────────────────────┘   │
+└─────────────┼──────────────────────────┼────────────────────────────────────────────┘
+              │                          │
+              ▼                          ▼
+┌──────────────────────────┐  ┌──────────────────────────────────────────────────────┐
+│   PreCheck Engine        │  │            ClusterVersion Client                     │
+│  • Path Finder (BFS)     │  │  • Create/Update ClusterVersion CR                   │
+│  • Compatibility Solver  │  │  • Watch/Get Status                                  │
+│    (CSP)                 │  └──────────────────────────────────────────────────────┘
+└──────────────────────────┘
+```
+
+#### 13.2.2 核心交互流程
+1.  **提交升级**：用户调用 `/upgrade`，`UpgradeService` 解析目标版本。
+2.  **智能预检**：查询 `UpgradePath` 图计算路径，运行 CSP 求解器检查组件版本约束。
+3.  **任务创建**：预检通过后，创建 `ClusterVersion` CR，声明 `DesiredVersion`。
+4.  **异步执行**：`cluster-api-provider-bke` 控制器监听 CR 变更，执行 DAG 调度升级。
+5.  **状态反馈**：用户通过 `/upgrade-status` 查询 `ClusterVersion.Status` 获取实时进度。
+
+### 13.3 API 接口规范变更
+
+#### 13.3.1 升级集群 (核心变更)
+*   **接口**: `POST /rest/cluster/v1/clusters/{cluster-name}/upgrade`
+*   **现状**: 直接 Patch `BKECluster` 的 `openFuyaoVersion` 字段。
+*   **重构目标**: 创建/更新 `ClusterVersion` CR，触发声明式调和。
+*   **请求体扩展**:
+    ```json
+    {
+      "version": "v2.6.0",
+      "skipPreCheck": false,
+      "failurePolicy": "FailFast"
+    }
+    ```
+*   **响应体变更**:
+    ```json
+    {
+      "code": 200,
+      "message": "success",
+      "data": {
+        "taskID": "cv-prod-cluster-01-v2.6.0",
+        "currentVersion": "v2.5.0",
+        "targetVersion": "v2.6.0",
+        "hopCount": 1,
+        "path": ["v2.5.0", "v2.6.0"],
+        "preCheck": { "pathValid": true, "compatibilityOK": true }
+      }
+    }
+    ```
+
+#### 13.3.2 获取可升级版本 (逻辑替换)
+*   **接口**: `GET /rest/cluster/v1/clusters/{cluster-name}/upgrade-versions`
+*   **现状**: 基于硬编码 SemVer 规则过滤 ConfigMap/OBS 中的版本。
+*   **重构目标**: 基于 `UpgradePath` CR 的图算法计算合法路径。
+*   **逻辑变更**: 查询 `UpgradePath` 资源，从当前版本节点出发进行 BFS 搜索，过滤 `blocked` 边。
+*   **响应变更**: 返回的不仅是版本号，包含 `hopCount` (跳数) 和 `path` (路径详情)。
+
+#### 13.3.3 获取可安装版本 (数据源迁移)
+*   **接口**: `GET /rest/cluster/v1/versions`
+*   **现状**: 获取所有主版本，用于新建集群。
+*   **重构目标**: 从 `UpgradePath` CR 的 `spec.versions` 列表中获取。
+*   **逻辑变更**: 筛选 `spec.versions` 中 `installable: true` 且 `deprecated: false` 的版本。
+
+#### 13.3.4 查询升级状态 (新增)
+*   **接口**: `GET /rest/cluster/v1/clusters/{cluster-name}/upgrade-status`
+*   **功能**: 查询 `ClusterVersion` 的实时状态。
+*   **参数**: `taskID` (可选，默认为当前活跃的升级任务)。
+*   **响应示例**:
+    ```json
+    {
+      "code": 200,
+      "message": "success",
+      "data": {
+        "taskID": "cv-prod-cluster-01-v2.6.0",
+        "phase": "Upgrading",
+        "currentHop": 1,
+        "totalHops": 1,
+        "currentStep": "EnsureEtcdUpgrade",
+        "completedSteps": ["EnsureProviderSelfUpgrade"],
+        "startedAt": "2026-05-20T10:00:00Z",
+        "errorMessage": ""
+      }
+    }
+    ```
+
+#### 13.3.5 取消升级任务 (新增)
+*   **接口**: `POST /rest/cluster/v1/clusters/{cluster-name}/upgrade/cancel`
+*   **功能**: 中断正在进行的升级。
+*   **逻辑**: 给 `ClusterVersion` 添加取消 Annotation，控制器检测到后停止 DAG 执行并尝试回滚。
+
+#### 13.3.6 废弃与适配接口
+*   **上传补丁文件 (`POST /patches`)**: **建议废弃**。新版本通过 `ReleaseImage` CR 和 OCI 镜像管理版本清单。离线环境应提供导入 OCI 镜像或手动创建 `ReleaseImage` CR 的管理接口。
+*   **自动升级准备 (`POST /clusters/{name}/auto-upgrade`)**: **建议重构**。升级前的准备工作应作为 DAG 中的一个 Phase，由 Agent 执行。此接口可改为触发准备任务或完全移除。
+
+### 13.4 核心数据结构定义
+
+在 `pkg/installer/types.go` 中新增：
+
+```go
+type UpgradeRequest struct {
+    Version       string `json:"version"`
+    SkipPreCheck  bool   `json:"skipPreCheck,omitempty"`
+    FailurePolicy string `json:"failurePolicy,omitempty"` // FailFast, Continue, Rollback
+}
+
+type UpgradeResponse struct {
+    TaskID         string          `json:"taskID"`
+    CurrentVersion string         `json:"currentVersion"`
+    TargetVersion  string         `json:"targetVersion"`
+    HopCount       int            `json:"hopCount"`
+    Path           []string       `json:"path,omitempty"`
+    PreCheck       *PreCheckResult `json:"preCheck,omitempty"`
+}
+
+type PreCheckResult struct {
+    PathValid       bool   `json:"pathValid"`
+    CompatibilityOK bool   `json:"compatibilityOK"`
+    BlockedReason   string `json:"blockedReason,omitempty"`
+}
+
+type UpgradeStatusResponse struct {
+    TaskID         string   `json:"taskID"`
+    Phase          string   `json:"phase"`
+    CurrentHop     int      `json:"currentHop"`
+    TotalHops      int      `json:"totalHops"`
+    CurrentStep    string   `json:"currentStep"`
+    CompletedSteps []string `json:"completedSteps"`
+    StartedAt      string   `json:"startedAt"`
+    CompletedAt    string   `json:"completedAt,omitempty"`
+    ErrorMessage   string   `json:"errorMessage,omitempty"`
+}
+```
+
+### 13.5 平滑迁移策略
+
+#### 13.5.1 Feature Gate 控制
+```go
+// pkg/installer/featuregate.go
+var featureGate = featuregate.NewFeatureGate()
+
+func init() {
+    featureGate.Add(map[featuregate.Feature]featuregate.FeatureSpec{
+        "DeclarativeUpgrade": {Default: false, PreRelease: featuregate.Beta},
+    })
+}
+```
+
+#### 13.5.2 双模式运行
+在 `UpgradeOpenFuyao` 中根据 Feature Gate 状态分发请求：
+```go
+func (c *installerClient) UpgradeOpenFuyao(clusterName string, version string) error {
+    if DeclarativeUpgradeEnabled() {
+        return c.declarativeUpgrade(clusterName, version) // 新模式：创建 CV CR
+    }
+    return c.legacyUpgrade(clusterName, version) // 旧模式：Patch BKECluster
+}
+```
+
+#### 13.5.3 自动补全 ClusterVersion
+对于存量集群，`cluster-api-provider-bke` 控制器在检测到 `BKECluster` 无关联 `ClusterVersion` 时，自动创建对应的 `ClusterVersion` 实例，确保新旧逻辑无缝衔接。
+
+### 13.6 实施路线图
+
+| 阶段 | 任务内容 | 交付物 |
+| :--- | :--- | :--- |
+| **Phase 1** | 定义 `UpgradeService` 接口与数据模型 | `types.go`, `interface.go` 更新 |
+| **Phase 2** | 实现 `SubmitUpgrade` 核心逻辑 (创建 CV CR) | `upgrade_service.go` |
+| **Phase 3** | 集成预检引擎 (路径查找 + 兼容性校验) | `upgrade_precheck.go` |
+| **Phase 4** | 实现状态查询与取消接口 | `upgrade_status.go`, Handler 更新 |
+| **Phase 5** | Feature Gate 灰度与联调测试 | 测试报告，文档更新 |
+| **Phase 6** | 移除旧 Patch 逻辑，GA 发布 | 代码清理，版本发布 |
