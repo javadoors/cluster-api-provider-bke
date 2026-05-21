@@ -490,6 +490,8 @@ func (m *DigestMonitor) checkDigest(ctx context.Context) error {
 
 **单 CR 聚合设计**：所有升级路径定义在单个 `UpgradePath` CR 中，通过 `spec.paths` 数组存储多条路径边。
 
+**设计原则**：`UpgradePath` 不仅定义版本间的**流转关系**（图），还集中管理所有**可用版本清单**（节点列表）。这使得前端或 CLI 可以通过单一资源获取所有可安装和可升级的版本信息。
+
 **CRD 定义**：
 
 ```yaml
@@ -499,21 +501,33 @@ metadata:
   name: openfuyao-upgrade-paths
 spec:
   ociRef: "registry/openfuyao-upgradepath:latest"
+  
+  # [新增] 全局版本列表，用于支持 GET /versions 接口
+  versions:
+    - version: "v2.4.0"
+      installable: true        # 是否支持作为新集群的初始版本
+      deprecated: true         # 是否已废弃（不推荐新安装）
+      releaseImageRef: "release-v2.4.0"
+      notes: "Legacy version, please use v2.5.0+"
+    - version: "v2.5.0"
+      installable: true
+      deprecated: false
+      releaseImageRef: "release-v2.5.0"
+    - version: "v2.6.0"
+      installable: true        # 推荐版本
+      deprecated: false
+      releaseImageRef: "release-v2.6.0"
+
+  # 原有的路径边定义
   paths:
     - from: "v2.4.0"
       to: "v2.5.0"
       blocked: false
-      deprecated: false
+      deprecated: true
     - from: "v2.5.0"
       to: "v2.6.0"
       blocked: false
       deprecated: false
-      preCheck:
-        - name: "etcd-backup"
-          required: true
-      postCheck:
-        - name: "cluster-health"
-          required: true
     - from: "v2.4.0"
       to: "v2.6.0"
       blocked: true
@@ -530,7 +544,17 @@ status:
 ```go
 type UpgradePathSpec struct {
     OCIRef string              `json:"ociRef"`
+	Versions []VersionEntry    `json:"versions,omitempty"`
     Paths  []UpgradePathEdge   `json:"paths"`
+}
+
+// VersionEntry 定义单个版本的信息
+type VersionEntry struct {
+    Version         string `json:"version"`
+    Installable     bool   `json:"installable"`     // 是否可用于全新安装
+    Deprecated      bool   `json:"deprecated"`      // 是否已废弃
+    ReleaseImageRef string `json:"releaseImageRef"` // 关联的 ReleaseImage 名称
+    Notes           string `json:"notes,omitempty"` // 备注信息
 }
 
 // UpgradePathEdge 表示图中的一条边（单条升级路径）
@@ -573,6 +597,21 @@ const (
 - `Blocked` 标记该边是否被拦截
 - `Deprecated` 标记该路径是否已废弃（仍可用但不推荐）
 - `PreCheck/PostCheck` 定义升级前后的检查步骤
+
+**功能支持说明**：
+
+1.  **获取可安装列表 (`GET /versions`)**：
+    *   **逻辑**：查询 `UpgradePath` 资源，遍历 `spec.versions` 列表，筛选出 `installable == true` 的条目。
+    *   **优势**：版本列表与升级路径解耦，管理员可以在同一个资源中配置哪些版本允许新装，哪些版本仅允许升级。
+
+2.  **获取可升级版本 (`GET /upgrade-versions`)**：
+    *   **逻辑**：结合 `spec.versions` 和 `spec.paths`。
+    *   先找到当前版本在 `versions` 中的位置。
+    *   再从 `paths` 中查找 `from == currentVersion` 且 `blocked == false` 的所有 `to` 版本。
+    *   最后校验 `to` 版本是否在 `versions` 列表中且未被标记为 `deprecated`（除非允许）。
+
+3.  **OCI 镜像同步**：
+    *   `UpgradePath` 对应的 OCI 镜像中需包含 `paths.yaml`被 `UpgradePathReconciler` 解析并更新到 CR 中。
 
 ### 4.5 升级路径与兼容性算法设计
 
