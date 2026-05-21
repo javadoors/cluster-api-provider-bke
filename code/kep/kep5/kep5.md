@@ -435,54 +435,76 @@ func (m *DigestMonitor) Start(ctx context.Context) error {
     return nil
 }
 
-func (m *DigestMonitor) checkDigest(ctx context.Context) error {
-    currentDigest, err := m.ociClient.GetDigest(m.ociRef)
-    if err != nil {
-        return fmt.Errorf("failed to get digest: %w", err)
-    }
+// GetInstallableVersions 获取所有可安装的版本（安装场景）
+// 逻辑：返回图中所有的版本节点，这些版本均可通过 ReleaseImage 进行全新安装
+func (g *UpgradePathGraph) GetInstallableVersions() []string {
+    g.mu.RLock()
+    defer g.mu.RUnlock()
     
-    m.mu.RLock()
-    if currentDigest == m.lastKnownDigest {
-        m.mu.RUnlock()
-        return nil // digest 未变更
+    versions := make([]string, 0, len(g.adj))
+    for v := range g.adj {
+        versions = append(versions, v)
     }
-    m.mu.RUnlock()
+    return versions
+}
+
+// GetUpgradeableVersions 获取当前版本的可升级版本列表（升级场景）
+// 逻辑：查找当前版本出发的所有边，过滤掉 Blocked/Deprecated 的路径
+func (g *UpgradePathGraph) GetUpgradeableVersions(current string) []UpgradePathEdge {
+    g.mu.RLock()
+    defer g.mu.RUnlock()
     
-    // Digest 变更，拉取最新镜像
-    img, err := m.ociClient.Pull(m.ociRef)
-    if err != nil {
-        return err
-    }
-    
-    layer, err := img.GetLayerByPath("paths.yaml")
-    if err != nil {
-        return err
-    }
-    
-    var up cvoapi.UpgradePath
-    if err := yaml.Unmarshal(layer.Content, &up); err != nil {
-        return err
-    }
-    
-    // 解析路径边
-    edges := make([]UpgradePathEdge, len(up.Spec.Paths))
-    for i, p := range up.Spec.Paths {
-        edges[i] = UpgradePathEdge{From: p.From, To: p.To, Blocked: p.Blocked}
-    }
-    
-    // 触发回调更新图
-    if m.onDigestChange != nil {
-        if err := m.onDigestChange(currentDigest, edges); err != nil {
-            return err
+    var upgradeable []UpgradePathEdge
+    for _, edge := range g.adj[current] {
+        if !edge.Blocked && !edge.Deprecated {
+            upgradeable = append(upgradeable, edge)
         }
     }
+    return upgradeable
+}
+
+// GetAllPaths 获取从 from 到 to 的所有升级路径（校验场景）
+// 逻辑：使用 DFS 查找所有路径，返回所有可行方案供用户选择或进行复杂校验
+func (g *UpgradePathGraph) GetAllPaths(from, to string) ([][]UpgradePathEdge, error) {
+    g.mu.RLock()
+    defer g.mu.RUnlock()
     
-    m.mu.Lock()
-    m.lastKnownDigest = currentDigest
-    m.lastCheckedAt = time.Now()
-    m.mu.Unlock()
+    if from == to {
+        return nil, nil
+    }
     
-    return nil
+    var allPaths [][]UpgradePathEdge
+    var currentPath []UpgradePathEdge
+    visited := make(map[string]bool)
+    
+    var dfs func(curr string)
+    dfs = func(curr string) {
+        if curr == to {
+            // 找到一条完整路径，进行深拷贝保存
+            pathCopy := make([]UpgradePathEdge, len(currentPath))
+            copy(pathCopy, currentPath)
+            allPaths = append(allPaths, pathCopy)
+            return
+        }
+        
+        visited[curr] = true
+        for _, edge := range g.adj[curr] {
+            // 仅遍历未被访问、未被拦截且未废弃的节点
+            if !visited[edge.To] && !edge.Blocked && !edge.Deprecated {
+                currentPath = append(currentPath, edge)
+                dfs(edge.To)
+                currentPath = currentPath[:len(currentPath)-1] // Backtrack
+            }
+        }
+        visited[curr] = false
+    }
+    
+    dfs(from)
+    
+    if len(allPaths) == 0 {
+        return nil, fmt.Errorf("no valid upgrade paths from %s to %s", from, to)
+    }
+    return allPaths, nil
 }
 ```
 
