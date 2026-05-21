@@ -4777,6 +4777,7 @@ spec:
 
 ### 12.3 UpgradePath CRD
 
+
 ```yaml
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
@@ -4804,6 +4805,17 @@ spec:
               type: object
               properties:
                 ociRef: { type: string }
+                # [新增] 全局版本列表，用于支持获取可安装列表 (GET /versions)
+                versions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      version: { type: string }
+                      installable: { type: boolean, default: true }    # 是否可作为新集群初始版本
+                      deprecated: { type: boolean, default: false }    # 是否已废弃
+                      releaseImageRef: { type: string }               # 关联的 ReleaseImage 名称
+                      notes: { type: string }
                 paths:
                   type: array
                   items:
