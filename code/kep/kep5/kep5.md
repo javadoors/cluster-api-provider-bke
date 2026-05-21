@@ -2449,9 +2449,22 @@ func (r *BKEClusterReconciler) executeDAG(ctx context.Context, bc *bkev1beta1.BK
 
 // UpgradePathGraph 升级路径图
 type UpgradePathGraph struct {
-    mu      sync.RWMutex
-    adj     map[string][]UpgradePathEdge // 邻接表: version -> edges
-    digest  string                       // 当前 OCI digest
+    mu    sync.RWMutex
+    Nodes map[string]*VersionNode   // version -> 节点信息
+    Edges map[string][]*UpgradeEdge // fromVersion -> 出边列表（邻接表）
+}
+
+type VersionNode struct {
+    Version         string
+    Installable     bool   // 是否支持全新安装（由 ReleaseImage 元数据推导）
+    ReleaseImageRef string // 关联的 ReleaseImage OCI 引用
+    Deprecated      bool   // 版本是否已废弃
+}
+
+type UpgradeEdge struct {
+    Target     string
+    Blocked    bool   // 路径是否被硬拦截
+    Deprecated bool   // 路径是否已废弃（软警告，默认允许通行）
 }
 
 func NewUpgradePathGraph() *UpgradePathGraph {
@@ -2571,6 +2584,132 @@ func (g *UpgradePathGraph) DetectCycle() error {
                 return fmt.Errorf("cycle detected in upgrade path graph")
             }
         }
+    }
+    return nil
+}
+```
+
+
+#### 4.5.3.2 场景化查询接口设计
+为支撑安装、升级、校验三大核心业务场景，在 `UpgradePathGraph` 上定义标准化查询接口。接口仅负责读取，不修改图状态，与原有写入逻辑完全解耦。
+
+```go
+// pkg/upgrade/finder.go
+
+// UpgradePathFinder 升级路径查询标准接口
+type UpgradePathFinder interface {
+    // 场景1：安装场景 - 查找所有支持全新安装的版本
+    GetInstallableVersions() []string
+
+    // 场景2：升级场景 - 获取当前版本可直接升级的目标版本列表
+    GetUpgradeableVersions(currentVersion string) []string
+
+    // 场景3：校验场景 - 指定当前与目标版本，返回所有合法的升级路径序列
+    FindValidPaths(currentVersion, targetVersion string) ([][]string, error)
+}
+```
+
+#### 4.5.3.3 算法实现（挂载至 `UpgradePathGraph`）
+```go
+// 场景1：安装场景
+func (g *UpgradePathGraph) GetInstallableVersions() []string {
+    g.mu.RLock()
+    defer g.mu.RUnlock()
+
+    var versions []string
+    for v, n := range g.Nodes {
+        if n.Installable && !n.Deprecated {
+            versions = append(versions, v)
+        }
+    }
+    return versions
+}
+
+// 场景2：升级场景
+func (g *UpgradePathGraph) GetUpgradeableVersions(currentVersion string) []string {
+    g.mu.RLock()
+    defer g.mu.RUnlock()
+
+    edges := g.Edges[currentVersion]
+    var targets []string
+    for _, e := range edges {
+        if !e.Blocked { // 仅拦截 Blocked 路径，Deprecated 路径允许通行（可配合日志告警）
+            targets = append(targets, e.Target)
+        }
+    }
+    return targets
+}
+
+// 场景3：校验场景（DFS 回溯查找所有合法路径）
+func (g *UpgradePathGraph) FindValidPaths(currentVersion, targetVersion string) ([][]string, error) {
+    g.mu.RLock()
+    defer g.mu.RUnlock()
+
+    if _, ok := g.Nodes[currentVersion]; !ok {
+        return nil, fmt.Errorf("current version %s not found in upgrade graph", currentVersion)
+    }
+    if _, ok := g.Nodes[targetVersion]; !ok {
+        return nil, fmt.Errorf("target version %s not found in upgrade graph", targetVersion)
+    }
+    if currentVersion == targetVersion {
+        return [][]string{{currentVersion}}, nil
+    }
+
+    var allPaths [][]string
+    var dfs func(node string, path []string, visited map[string]bool)
+    dfs = func(node string, path []string, visited map[string]bool) {
+        if node == targetVersion {
+            p := make([]string, len(path))
+            copy(p, path)
+            allPaths = append(allPaths, p)
+            return
+        }
+
+        visited[node] = true
+        for _, edge := range g.Edges[node] {
+            if edge.Blocked || visited[edge.Target] {
+                continue // 拦截路径或防环直接跳过
+            }
+            dfs(edge.Target, append(path, edge.Target), visited)
+        }
+        visited[node] = false // 回溯
+    }
+
+    dfs(currentVersion, []string{currentVersion}, make(map[string]bool))
+    return allPaths, nil
+}
+```
+
+#### 4.5.3.4 算法说明与复杂度分析
+| 场景 | 算法策略 | 时间复杂度 | 空间复杂度 | 业务用途 |
+|------|----------|------------|------------|----------|
+| **安装场景** | 遍历节点过滤 `Installable=true` | `O(V)` | `O(1)` | 集群初始化、版本选择器渲染、离线安装引导 |
+| **升级场景** | 邻接表直接查询 + `Blocked` 过滤 | `O(E_out)` | `O(1)` | 升级向导展示、API 预检、灰度版本推荐 |
+| **校验场景** | DFS 回溯 + 路径收集 + 防环剪枝 | `O(P·V)` | `O(V)` | 目标版本合法性校验、审计日志记录、升级计划生成 |
+*(注：`V`=版本节点数，`E_out`=单节点出边数，`P`=合法路径总数。升级图通常为稀疏 DAG，实际查询耗时 `<1ms`)*
+
+#### 4.5.3.5 控制器集成示例
+```go
+// controllers/bkecluster/upgrade_resolver.go
+func (r *BKEClusterReconciler) ResolveUpgradeOptions(bc *bkev1beta1.BKECluster) error {
+    finder := r.upgradePathGraph // 已实现 UpgradePathFinder 接口
+
+    if bc.Status.CurrentVersion == "" {
+        // 场景1：安装场景
+        bc.Status.InstallableVersions = finder.GetInstallableVersions()
+        return nil
+    }
+
+    // 场景2：升级场景
+    bc.Status.UpgradeTargets = finder.GetUpgradeableVersions(bc.Status.CurrentVersion)
+
+    // 场景3：校验场景（用户指定目标版本后调用）
+    if bc.Spec.DesiredVersion != "" {
+        paths, err := finder.FindValidPaths(bc.Status.CurrentVersion, bc.Spec.DesiredVersion)
+        if err != nil || len(paths) == 0 {
+            return fmt.Errorf("no valid upgrade path from %s to %s", bc.Status.CurrentVersion, bc.Spec.DesiredVersion)
+        }
+        bc.Status.ValidUpgradePaths = paths
     }
     return nil
 }
