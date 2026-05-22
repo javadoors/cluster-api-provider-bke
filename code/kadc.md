@@ -118,3 +118,36 @@ mindmap
 
 👉 换句话说，这份表既能指导 **近期落地行动**，也能为 **长期战略共建**提供方向。  
 
+# Provider 扩展与一致性
+在 **Cluster API (CAPI)** 的生态中，**Provider 扩展与一致性** 是合作伙伴共建时必须重点讨论的议题。它既涉及技术契约，也关系到生态的长期可持续性。  
+## 🧩 Provider 扩展的核心点
+- **扩展 CRD**  
+  每个 Provider 可以定义自己的 CRD（如 AWSCluster、AzureMachine、BareMetalMachine），以支持特定平台的功能。  
+  但这些扩展必须通过 **ClusterClass / ClusterTopology** 与核心契约对接，避免破坏一致性。  
+
+- **控制器扩展**  
+  Provider 可以实现自己的控制器逻辑（如云资源创建、网络配置），但必须遵循 CAPI 的行为契约：  
+  - Cluster Controller → 管理集群生命周期。  
+  - Machine Controller → 管理节点生命周期。  
+  - MachineDeployment Controller → 管理节点组升级。  
+- **功能扩展**  
+  Provider 可以增加特定功能（如云安全组、负载均衡、存储卷），但必须通过契约定义的扩展点暴露，保证跨 Provider 的一致性。  
+## 🧩 一致性保障
+- **API 契约一致性**  
+  所有 Provider 必须实现核心 CRD 的字段和语义，保证用户在不同 Provider 间迁移时不会遇到语义差异。  
+
+- **版本契约一致性**  
+  Provider 必须声明支持的 Contract Version（如 v1beta1、v1beta2），并保证在契约范围内兼容。升级路径必须遵循契约演进规则。  
+
+- **行为契约一致性**  
+  不同 Provider 的控制器行为必须一致，避免出现“同样的 API 在不同 Provider 下表现不同”的情况。  
+
+- **安全与合规一致性**  
+  Provider 必须支持统一的安全策略（证书分发、密钥管理、审计日志），保证跨云环境下的合规性。  
+## 🔄 总结
+**Provider 扩展与一致性** 的核心在于：  
+1. **扩展** → Provider 可以增加平台特定功能。  
+2. **一致性** → 必须遵循 CAPI 契约，保证跨 Provider 的统一体验。  
+3. **安全合规** → 扩展必须嵌入统一的安全与治理框架。  
+
+👉 换句话说，**扩展是自由的，但一致性是必须的**。这也是合作伙伴在 KADC 大会上共建时的关键共识。  
