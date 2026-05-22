@@ -5144,6 +5144,8 @@ spec:
 *   **接口**: `POST /rest/cluster/v1/clusters/{cluster-name}/upgrade`
 *   **现状**: 直接 Patch `BKECluster` 的 `openFuyaoVersion` 字段。
 *   **重构目标**: 创建/更新 `ClusterVersion` CR，触发声明式调和。
+*   **设计约束**: 由于升级任务与集群实例是 1:1 强绑定关系，**集群名称 (`cluster-name`) 即为唯一的任务标识**。前端可直接通过路径中的集群名称进行状态轮询。
+
 *   **请求体扩展**:
     ```json
     {
@@ -5152,13 +5154,13 @@ spec:
       "failurePolicy": "FailFast"
     }
     ```
+
 *   **响应体变更**:
     ```json
     {
       "code": 200,
       "message": "success",
       "data": {
-        "taskID": "cv-prod-cluster-01-v2.6.0",
         "currentVersion": "v2.5.0",
         "targetVersion": "v2.6.0",
         "hopCount": 1,
@@ -5167,7 +5169,147 @@ spec:
       }
     }
     ```
+#### 13.3.1.1 设计思路与代码实现
 
+**设计思路：隐式任务标识**
+在声明式架构中，升级任务与集群实例是 1:1 强绑定关系。因此，设计上遵循以下原则：
+*   **集群即任务**：API 路径中的 `{cluster-name}` 即为唯一的任务标识。前端直接通过集群名称即可轮询状态。
+*   **资源映射**：后端通过内部约定（如 `ClusterVersion` 命名为 `{clusterName}`）将集群与版本控制资源关联，但对 API 调用者透明。
+*   **幂等性**：无论请求多少次，只要目标版本一致，操作结果一致，不会产生重复任务。
+
+**代码实现**
+
+**1. Service 层 (`pkg/installer/upgrade_service.go`)**
+
+核心逻辑实现，包含 CR 操作（不再返回 TaskID）。
+
+```go
+// SubmitUpgrade 提交升级请求
+func (s *upgradeServiceImpl) SubmitUpgrade(ctx context.Context, clusterName string, req UpgradeRequest) (*UpgradeResponse, error) {
+    // 1. 获取当前集群信息
+    bc := &bkev1beta1.BKECluster{}
+    if err := s.client.Get(ctx, types.NamespacedName{Name: clusterName, Namespace: clusterName}, bc); err != nil {
+        return nil, fmt.Errorf("failed to get BKECluster: %w", err)
+    }
+    currentVersion := bc.Spec.ClusterConfig.Cluster.OpenFuyaoVersion
+
+    // 2. 执行预检 (除非显式跳过)
+    var preCheckResult *PreCheckResult
+    if !req.SkipPreCheck {
+        res, err := s.preCheckEngine.Run(ctx, clusterName, currentVersion, req.Version)
+        if err != nil {
+            return nil, fmt.Errorf("pre-check failed: %w", err)
+        }
+        preCheckResult = res
+        // 如果预检不通过，直接返回错误，不创建任务
+        if !preCheckResult.PathValid || !preCheckResult.CompatibilityOK {
+            return &UpgradeResponse{
+                CurrentVersion: currentVersion,
+                TargetVersion:  req.Version,
+                PreCheck:       preCheckResult,
+            }, fmt.Errorf("upgrade blocked: %s", preCheckResult.BlockedReason)
+        }
+    }
+
+    // 3. 创建或更新 ClusterVersion CR (内部使用 clusterName 派生名称)
+    if err := s.ensureClusterVersion(ctx, clusterName, req, bc); err != nil {
+        return nil, fmt.Errorf("failed to submit upgrade task: %w", err)
+    }
+
+    // 4. 构造响应
+    hopCount := 1 
+    path := []string{currentVersion, req.Version}
+    if preCheckResult != nil && preCheckResult.Path != nil {
+        hopCount = len(preCheckResult.Path) - 1
+        path = preCheckResult.Path
+    }
+
+    return &UpgradeResponse{
+        CurrentVersion: currentVersion,
+        TargetVersion:  req.Version,
+        HopCount:       hopCount,
+        Path:           path,
+        PreCheck:       preCheckResult,
+    }, nil
+}
+
+// ensureClusterVersion 处理 ClusterVersion 的创建或更新
+func (s *upgradeServiceImpl) ensureClusterVersion(ctx context.Context, clusterName string, req UpgradeRequest, owner *bkev1beta1.BKECluster) error {
+    // 内部命名约定: {clusterName} (集群名称即任务标识)
+    cvName := fmt.Sprintf("%s", clusterName)
+    cv := &cvoapi.ClusterVersion{}
+    cvKey := types.NamespacedName{Name: cvName, Namespace: clusterName}
+
+    err := s.client.Get(ctx, cvKey, cv)
+    
+    mutateFn := func() error {
+        if err := controllerutil.SetControllerReference(owner, cv, s.client.Scheme()); err != nil {
+            return err
+        }
+        cv.Spec.DesiredVersion = req.Version
+        if cv.Annotations == nil {
+            cv.Annotations = make(map[string]string)
+        }
+        if req.FailurePolicy != "" {
+            cv.Annotations["cvo.openfuyao.cn/failure-policy"] = req.FailurePolicy
+        }
+        return nil
+    }
+
+    if apierrors.IsNotFound(err) {
+        cv.Name = cvName
+        cv.Namespace = clusterName
+        _, err := controllerutil.CreateOrUpdate(ctx, s.client, cv, mutateFn)
+        return err
+    } else if err != nil {
+        return err
+    }
+    
+    _, err = controllerutil.CreateOrUpdate(ctx, s.client, cv, mutateFn)
+    return err
+}
+```
+
+**2. Handler 层 (`pkg/api/clustermanage/handler.go`)**
+
+负责 HTTP 协议转换。
+
+```go
+// upgradeCluster 处理 POST /clusters/{cluster-name}/upgrade
+func (h *Handler) upgradeCluster(request *restful.Request, response *restful.Response) {
+    req := installer.UpgradeRequest{}
+    if err := request.ReadEntity(&req); err != nil {
+        zlog.Errorf("Read upgrade entity failed: %v", err)
+        response.WriteHeaderAndEntity(http.StatusBadRequest, httputil.GetParamsEmptyErrorResponseJson())
+        return
+    }
+
+    if req.Version == "" {
+        response.WriteHeaderAndEntity(http.StatusBadRequest, httputil.GetParamsEmptyErrorResponseJson())
+        return
+    }
+
+    clusterName := request.PathParameter("cluster-name")
+    zlog.Infof("Submitting upgrade for cluster: %s to version %s", clusterName, req.Version)
+
+    // 调用 Service 层
+    resp, err := h.upgradeService.SubmitUpgrade(request.Request.Context(), clusterName, req)
+    if err != nil {
+        if isPreCheckError(err) {
+            response.WriteHeaderAndEntity(http.StatusBadRequest, httputil.GetResponseJson(constant.PreCheckFailed, err.Error(), resp))
+        } else {
+            zlog.Errorf("upgrade cluster failed: %v", err)
+            response.WriteHeaderAndEntity(http.StatusInternalServerError, httputil.GetDefaultServerFailureResponseJson())
+        }
+        return
+    }
+
+    // 成功返回 (无 TaskID)
+    res := httputil.GetDefaultSuccessResponseJson()
+    res.Data = resp
+    response.WriteHeaderAndEntity(http.StatusOK, res)
+}
+```
 #### 13.3.2 获取可升级版本 (逻辑替换)
 *   **接口**: `GET /rest/cluster/v1/clusters/{cluster-name}/upgrade-versions`
 *   **现状**: 基于硬编码 SemVer 规则过滤 ConfigMap/OBS 中的版本。
@@ -5184,14 +5326,14 @@ spec:
 #### 13.3.4 查询升级状态 (新增)
 *   **接口**: `GET /rest/cluster/v1/clusters/{cluster-name}/upgrade-status`
 *   **功能**: 查询 `ClusterVersion` 的实时状态。
-*   **参数**: `taskID` (可选，默认为当前活跃的升级任务)。
+*   **设计约束**: 由于升级任务与集群实例是 1:1 强绑定关系，**集群名称 (`cluster-name`) 即为唯一的任务标识**。后端通过内部约定（`ClusterVersion` 命名为 `{clusterName}`）自动定位对应的版本控制资源。
 *   **响应示例**:
     ```json
     {
       "code": 200,
       "message": "success",
       "data": {
-        "taskID": "cv-prod-cluster-01-v2.6.0",
+        "clusterName": "prod-cluster-01",
         "phase": "Upgrading",
         "currentHop": 1,
         "totalHops": 1,
@@ -5225,18 +5367,17 @@ spec:
 // getUpgradeStatus 处理 GET /clusters/{cluster-name}/upgrade-status 请求
 func (h *Handler) getUpgradeStatus(request *restful.Request, response *restful.Response) {
     clusterName := request.PathParameter("cluster-name")
-    taskID := request.QueryParameter("taskID") // 可选参数
 
     if clusterName == "" {
         response.WriteHeaderAndEntity(http.StatusBadRequest, httputil.GetParamsEmptyErrorResponseJson())
         return
     }
 
-    // 调用 Service 层获取状态
-    status, err := h.upgradeService.GetUpgradeStatus(request.Request.Context(), clusterName, taskID)
+    // 调用 Service 层获取状态 (集群名称即任务标识，无需 taskID 参数)
+    status, err := h.upgradeService.GetUpgradeStatus(request.Request.Context(), clusterName)
     if err != nil {
         // 区分资源未找到与其他错误
-        if errors.Is(err, installer.ErrTaskNotFound) {
+        if errors.Is(err, installer.ErrClusterVersionNotFound) {
             response.WriteHeaderAndEntity(http.StatusNotFound, httputil.GetResponseJson(constant.ClientError, err.Error(), nil))
         } else {
             zlog.Errorf("failed to get upgrade status: %v", err)
@@ -5254,21 +5395,17 @@ func (h *Handler) getUpgradeStatus(request *restful.Request, response *restful.R
 #### 2. Service 层 (`pkg/installer/upgrade_service.go`)
 核心业务逻辑，负责与 K8s API 交互并聚合状态。
 ```go
-// GetUpgradeStatus 查询集群升级状态
-func (s *upgradeServiceImpl) GetUpgradeStatus(ctx context.Context, clusterName, taskID string) (*UpgradeStatusResponse, error) {
-    // 1. 确定要查询的 ClusterVersion 名称
-    cvName := taskID
-    if cvName == "" {
-        // 如果未指定 taskID，默认查找该集群关联的 CV (命名约定: {clusterName}-version)
-        cvName = fmt.Sprintf("%s-version", clusterName)
-    }
+// GetUpgradeStatus 查询集群升级状态 (集群名称即任务标识)
+func (s *upgradeServiceImpl) GetUpgradeStatus(ctx context.Context, clusterName string) (*UpgradeStatusResponse, error) {
+    // 1. 根据命名约定构造 ClusterVersion 名称: {clusterName}-version
+    cvName := fmt.Sprintf("%s-version", clusterName)
 
     // 2. 获取 ClusterVersion 资源
     cv := &cvoapi.ClusterVersion{}
     err := s.client.Get(ctx, types.NamespacedName{Name: cvName, Namespace: clusterName}, cv)
     if err != nil {
         if apierrors.IsNotFound(err) {
-            return nil, ErrTaskNotFound
+            return nil, ErrClusterVersionNotFound
         }
         return nil, fmt.Errorf("failed to get ClusterVersion: %w", err)
     }
@@ -5281,13 +5418,13 @@ func (s *upgradeServiceImpl) GetUpgradeStatus(ctx context.Context, clusterName, 
     }
 
     // 4. 聚合状态并构造响应
-    return s.buildStatusResponse(cv, bc), nil
+    return s.buildStatusResponse(clusterName, cv, bc), nil
 }
 
 // buildStatusResponse 将 K8s 资源状态转换为 API 响应结构
-func (s *upgradeServiceImpl) buildStatusResponse(cv *cvoapi.ClusterVersion, bc *bkev1beta1.BKECluster) *UpgradeStatusResponse {
+func (s *upgradeServiceImpl) buildStatusResponse(clusterName string, cv *cvoapi.ClusterVersion, bc *bkev1beta1.BKECluster) *UpgradeStatusResponse {
     resp := &UpgradeStatusResponse{
-        TaskID:      cv.Name,
+        ClusterName: clusterName,
         Phase:       string(cv.Status.Phase),
         StartedAt:   cv.CreationTimestamp.Format(time.RFC3339),
         CurrentStep: "Initializing", // 默认值
