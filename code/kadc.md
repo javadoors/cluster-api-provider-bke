@@ -35,11 +35,11 @@
 用分层结构直观展示各个讨论点，方便在大会上组织议题。  
 ```mermaid
 mindmap
-  root((KADC 大会安装部署架构议题))
+  root(KADC 大会安装部署架构议题)
     安装模式演进
       kubeadm 静态安装
       Operator 化
-      Cluster API (CAPI) 声明式安装
+      Cluster API-CAPI 声明式安装
     引导与生命周期管理
       临时引导节点作用
       引导节点销毁机制
