@@ -5202,7 +5202,156 @@ spec:
       }
     }
     ```
+### 13.3.4.1 设计思路
+查询升级状态的核心在于**聚合多源状态**并**映射为用户友好的进度信息**。
+1.  **数据源聚合**：
+    *   **ClusterVersion (CV)**：提供升级任务的全局状态（如 `Phase`）、多跳升级进度（`CurrentHop`, `TotalHops`）以及目标版本。
+    *   **BKECluster**：提供当前正在执行的具体步骤（通过 `Status.PhaseStatus` 中最后一个 `Running` 或 `Waiting` 的 Phase 获取）。
+    *   **UpgradePath**：在需要展示完整路径详情时，作为辅助数据源。
 
+2.  **状态映射逻辑**：
+    *   **Phase 映射**：将 CV 的内部状态（如 `PreChecking`, `Upgrading`, `Succeeded`）直接映射为 API 响应中的 `phase` 字段。
+    *   **多跳进度**：从 `cv.Status.UpgradeProgress` 提取 `CurrentHopIndex` 和 `TotalHops`。如果未设置（单跳升级），默认为 1/1。
+    *   **当前步骤 (CurrentStep)**：遍历 `BKECluster.Status.PhaseStatus` 列表，找到状态为 `Running` 或 `Waiting` 的最后一个条目，提取其 `Name`。
+    *   **已完成步骤 (CompletedSteps)**：收集 `PhaseStatus` 中状态为 `Succeeded` 的条目名称。
+
+3.  **异常处理**：
+    *   **未找到任务**：如果未找到关联的 `ClusterVersion` 或任务已过期，返回 404 或特定状态码。
+    *   **状态不一致**：如果 CV 显示 `Upgrading` 但 BKECluster 无运行中的 Phase，可能处于跳变间隙，默认显示 "Initializing" 或 "Waiting for next phase"。
+### 13.3.4.2 代码实现
+#### 1. Handler 层 (`pkg/api/clustermanage/handler.go`)
+负责解析 HTTP 请求参数，调用 Service 层，并构造标准的 JSON 响应。
+```go
+// getUpgradeStatus 处理 GET /clusters/{cluster-name}/upgrade-status 请求
+func (h *Handler) getUpgradeStatus(request *restful.Request, response *restful.Response) {
+    clusterName := request.PathParameter("cluster-name")
+    taskID := request.QueryParameter("taskID") // 可选参数
+
+    if clusterName == "" {
+        response.WriteHeaderAndEntity(http.StatusBadRequest, httputil.GetParamsEmptyErrorResponseJson())
+        return
+    }
+
+    // 调用 Service 层获取状态
+    status, err := h.upgradeService.GetUpgradeStatus(request.Request.Context(), clusterName, taskID)
+    if err != nil {
+        // 区分资源未找到与其他错误
+        if errors.Is(err, installer.ErrTaskNotFound) {
+            response.WriteHeaderAndEntity(http.StatusNotFound, httputil.GetResponseJson(constant.ClientError, err.Error(), nil))
+        } else {
+            zlog.Errorf("failed to get upgrade status: %v", err)
+            response.WriteHeaderAndEntity(http.StatusInternalServerError, httputil.GetDefaultServerFailureResponseJson())
+        }
+        return
+    }
+
+    // 构造成功响应
+    res := httputil.GetDefaultSuccessResponseJson()
+    res.Data = status
+    response.WriteHeaderAndEntity(http.StatusOK, res)
+}
+```
+#### 2. Service 层 (`pkg/installer/upgrade_service.go`)
+核心业务逻辑，负责与 K8s API 交互并聚合状态。
+```go
+// GetUpgradeStatus 查询集群升级状态
+func (s *upgradeServiceImpl) GetUpgradeStatus(ctx context.Context, clusterName, taskID string) (*UpgradeStatusResponse, error) {
+    // 1. 确定要查询的 ClusterVersion 名称
+    cvName := taskID
+    if cvName == "" {
+        // 如果未指定 taskID，默认查找该集群关联的 CV (命名约定: {clusterName}-version)
+        cvName = fmt.Sprintf("%s-version", clusterName)
+    }
+
+    // 2. 获取 ClusterVersion 资源
+    cv := &cvoapi.ClusterVersion{}
+    err := s.client.Get(ctx, types.NamespacedName{Name: cvName, Namespace: clusterName}, cv)
+    if err != nil {
+        if apierrors.IsNotFound(err) {
+            return nil, ErrTaskNotFound
+        }
+        return nil, fmt.Errorf("failed to get ClusterVersion: %w", err)
+    }
+
+    // 3. 获取 BKECluster 资源以获取当前执行步骤
+    bc := &bkev1beta1.BKECluster{}
+    if err := s.client.Get(ctx, types.NamespacedName{Name: clusterName, Namespace: clusterName}, bc); err != nil {
+        // BKECluster 不存在可能是集群已删除，记录警告但继续返回 CV 状态
+        zlog.Warnf("failed to get BKECluster for status aggregation: %v", err)
+    }
+
+    // 4. 聚合状态并构造响应
+    return s.buildStatusResponse(cv, bc), nil
+}
+
+// buildStatusResponse 将 K8s 资源状态转换为 API 响应结构
+func (s *upgradeServiceImpl) buildStatusResponse(cv *cvoapi.ClusterVersion, bc *bkev1beta1.BKECluster) *UpgradeStatusResponse {
+    resp := &UpgradeStatusResponse{
+        TaskID:      cv.Name,
+        Phase:       string(cv.Status.Phase),
+        StartedAt:   cv.CreationTimestamp.Format(time.RFC3339),
+        CurrentStep: "Initializing", // 默认值
+    }
+
+    // 处理多跳升级进度
+    if cv.Status.UpgradeProgress != nil {
+        resp.CurrentHop = cv.Status.UpgradeProgress.CurrentHopIndex + 1 // 转换为 1-based
+        resp.TotalHops = cv.Status.UpgradeProgress.TotalHops
+        
+        // 如果有完成时间，填充 CompletedAt
+        if cv.Status.UpgradeProgress.CompletedAt != nil {
+            resp.CompletedAt = cv.Status.UpgradeProgress.CompletedAt.Time.Format(time.RFC3339)
+        }
+    } else {
+        resp.CurrentHop = 1
+        resp.TotalHops = 1
+    }
+
+    // 从 BKECluster 提取当前执行的具体 Phase
+    if bc != nil && bc.Status.PhaseStatus != nil {
+        var completed []string
+        var currentStep string
+        
+        // 倒序遍历，找到最近的一个 Running/Waiting 状态
+        for i := len(bc.Status.PhaseStatus) - 1; i >= 0; i-- {
+            ps := bc.Status.PhaseStatus[i]
+            if ps.Status == bkev1beta1.PhaseRunning || ps.Status == bkev1beta1.PhaseWaiting {
+                currentStep = string(ps.Name)
+                break
+            }
+            if ps.Status == bkev1beta1.PhaseSucceeded {
+                completed = append(completed, string(ps.Name))
+            }
+        }
+        
+        if currentStep != "" {
+            resp.CurrentStep = currentStep
+        } else if cv.Status.Phase == cvoapi.PhaseUpgrading {
+            // 如果正在升级但没找到运行中的 Phase，可能是处于跳变间隙
+            resp.CurrentStep = "Transitioning"
+        }
+        
+        // 反转 completed 列表以保持时间顺序
+        for i, j := 0, len(completed)-1; i < j; i, j = i+1, j-1 {
+            completed[i], completed[j] = completed[j], completed[i]
+        }
+        resp.CompletedSteps = completed
+    }
+
+    // 处理错误信息
+    if cv.Status.Phase == cvoapi.PhaseFailed || cv.Status.Phase == cvoapi.PhaseBlocked {
+        // 假设错误信息存储在 Condition 中
+        for _, cond := range cv.Status.Conditions {
+            if cond.Status == metav1.ConditionFalse && cond.Reason == "UpgradeFailed" {
+                resp.ErrorMessage = cond.Message
+                break
+            }
+        }
+    }
+
+    return resp
+}
+```
 #### 13.3.5 取消升级任务 (新增)
 *   **接口**: `POST /rest/cluster/v1/clusters/{cluster-name}/upgrade/cancel`
 *   **功能**: 中断正在进行的升级。
@@ -5213,9 +5362,7 @@ spec:
 *   **自动升级准备 (`POST /clusters/{name}/auto-upgrade`)**: **建议重构**。升级前的准备工作应作为 DAG 中的一个 Phase，由 Agent 执行。此接口可改为触发准备任务或完全移除。
 
 ### 13.4 核心数据结构定义
-
 在 `pkg/installer/types.go` 中新增：
-
 ```go
 type UpgradeRequest struct {
     Version       string `json:"version"`
