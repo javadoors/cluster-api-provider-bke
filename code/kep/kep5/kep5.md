@@ -5573,3 +5573,84 @@ func (c *installerClient) UpgradeOpenFuyao(clusterName string, version string) e
 | **Phase 4** | 实现状态查询与取消接口 | `upgrade_status.go`, Handler 更新 |
 | **Phase 5** | Feature Gate 灰度与联调测试 | 测试报告，文档更新 |
 | **Phase 6** | 移除旧 Patch 逻辑，GA 发布 | 代码清理，版本发布 |
+
+## 14. Owner References 关系设计
+
+基于 KEP-5 的设计，各资源的 `ownerReferences` 关系严格遵循 **Kubernetes 级联删除（Cascading Deletion）** 与 **生命周期绑定** 原则。以下是完整的关系分析与实现规范：
+
+### 14.1 核心 Owner References 关系树
+```text
+BKECluster (集群根资源)
+  └── ownerReferences → ClusterVersion (1:1 强绑定)
+        └── ownerReferences → ReleaseImage (1:1 版本清单绑定)
+              └── (引用) ComponentVersion (外部 OCI/清单，非 K8s 资源)
+                    
+UpgradePath (全局独立资源，无 OwnerReference)
+```
+
+### 14.2 详细关系设计与代码实现
+
+| 父资源 (Owner) | 子资源 (Dependent) | 关系类型 | `ownerReferences` 配置 | 生命周期联动 |
+|:---|:---|:---|:---|:---|
+| `BKECluster` | `ClusterVersion` | **1:1 强绑定** | `controller: true`, `blockOwnerDeletion: true` | 删除集群时，自动清理对应版本声明对象 |
+| `ClusterVersion` | `ReleaseImage` | **1:1 清单绑定** | `controller: true`, `blockOwnerDeletion: true` | 版本声明删除时，自动清理已拉取的清单 CR |
+| `无` | `UpgradePath` | **全局独立** | 不设置 | 独立于集群生命周期，由运维或 CI/CD 管理 |
+| `无` | `ComponentVersion` | **外部引用** | 不设置 | 存在于 `bke-manifests` OCI/本地目录，非运行时 CR |
+
+#### 14.2.1 `BKECluster` → `ClusterVersion`
+**设计意图**：`ClusterVersion` 是 `BKECluster` 的版本声明扩展，必须随集群创建而创建，随集群删除而销毁。
+```go
+// controllers/bkecluster/bkecluster_controller.go
+func (r *BKEClusterReconciler) ensureClusterVersion(ctx context.Context, bc *bkev1beta1.BKECluster) error {
+    cv := &cvoapi.ClusterVersion{
+        ObjectMeta: metav1.ObjectMeta{
+            Name:      fmt.Sprintf("%s-version", bc.Name),
+            Namespace: bc.Namespace,
+        },
+    }
+    // 设置 OwnerReference
+    if err := controllerutil.SetControllerReference(bc, cv, r.Scheme); err != nil {
+        return err
+    }
+    return r.CreateOrUpdate(ctx, cv)
+}
+```
+
+#### 14.2.2 `ClusterVersion` → `ReleaseImage`
+**设计意图**：`ReleaseImage` 是 `ClusterVersion` 解析 OCI 后落地的不可变清单。1:1 绑定确保清单随版本声明生命周期同步，避免孤儿资源堆积。
+```go
+// controllers/clusterversion/clusterversion_controller.go
+func (r *ClusterVersionReconciler) ensureReleaseImage(ctx context.Context, cv *cvoapi.ClusterVersion, ociRef string) error {
+    ri := &cvoapi.ReleaseImage{
+        ObjectMeta: metav1.ObjectMeta{
+            Name:      fmt.Sprintf("ri-%s", strings.ReplaceAll(cv.Spec.DesiredVersion, ".", "-")),
+            Namespace: cv.Namespace,
+        },
+    }
+    // 设置 OwnerReference
+    if err := controllerutil.SetControllerReference(cv, ri, r.Scheme); err != nil {
+        return err
+    }
+    return r.CreateOrUpdate(ctx, ri)
+}
+```
+
+### 14.3 特殊资源说明（为何不设置 OwnerReference）
+
+| 资源 | 原因 | 管理方式 |
+|:---|:---|:---|
+| **`UpgradePath`** | 属于**全局策略资源**，多个集群/版本共享同一套升级路径规则。若绑定到单个 `ClusterVersion`，会导致其他集群无法读取或随单集群删除而丢失。 | 由 `UpgradePathReconciler` 独立调谐，通过 `latest` OCI 镜像热更新。 |
+| **`ComponentVersion`** | 属于**外部构建产物**（`bke-manifests` OCI 层或本地目录），并非通过 `kubectl apply` 创建的运行时 CR。`ReleaseImage` 仅通过 `(name, version)` 逻辑引用其元数据。 | 通过 `manifestStore` 按需加载至内存缓存，不参与 K8s GC。 |
+
+### 14.4 垃圾回收（GC）与级联删除策略
+Kubernetes 默认采用 `background` 级联删除。结合本设计：
+1. **删除 `BKECluster`** → 触发 `ClusterVersion` 删除 → 触发 `ReleaseImage` 删除。全程自动，无需人工清理。
+2. **强制保留历史清单**：若审计要求保留历史 `ReleaseImage`，可在创建时设置 `ownerReferences[0].blockOwnerDeletion: false`，或采用 `Finalizer` 拦截删除并归档。但按 KEP 1:1 设计，默认跟随删除。
+3. **孤儿资源防护**：所有子资源创建前必须校验父资源存在性（`GetOwnerReferences()` 非空），防止控制器异常重启导致孤立 CR。
+
+### 14.5 关系校验清单（验收标准）
+- [ ] `ClusterVersion` 的 `metadata.ownerReferences` 仅包含 1 个指向 `BKECluster` 的条目，且 `controller: true`。
+- [ ] `ReleaseImage` 的 `metadata.ownerReferences` 仅包含 1 个指向 `ClusterVersion` 的条目。
+- [ ] 删除 `BKECluster` 后，`kubectl get clusterversion,releaseimage -n <ns>` 返回空（GC 生效）。
+- [ ] `UpgradePath` 无 `ownerReferences`，集群删除后仍存在。
+- [ ] `ComponentVersion` 不出现在 `kubectl api-resources` 中，仅通过 `manifestStore` 读取。
