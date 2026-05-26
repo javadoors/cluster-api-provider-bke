@@ -604,3 +604,469 @@ ensure_delete_or_reset → ensure_finalizer
 
 **推荐**：对于本项目，功能特性 Owner 更适合，因为集群创建/升级/删除是高度独立的业务流程，团队通常按特性分工而非按层分工。Platform Foundation Owner 作为横切面兜底，确保全局一致性。
 
+# Cluster API 维度 Owner 机制划分
+
+## 一、CAPI 架构角色映射
+Cluster API 定义了标准 Provider 角色分工，本项目作为 Infrastructure Provider 实现了以下 CAPI 契约：
+```
+┌───────────────────────────────────────────────────────────────────────┐
+│                     Cluster API 标准架构                               │
+│                                                                       │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐             │
+│  │   Cluster    │    │   Machine    │    │  MachinePool │             │
+│  │  (CAPI Core) │    │  (CAPI Core) │    │  (CAPI Core) │             │
+│  └──────┬───────┘    └──────┬───────┘    └──────────────┘             │
+│         │                   │                                         │
+│  ┌──────▼───────┐    ┌──────▼───────┐    ┌──────────────┐             │
+│  │ BKECluster   │    │ BKEMachine   │    │   Command    │             │
+│  │ (Infra Prov) │    │ (Infra Prov) │    │ (Agent Exec) │             │
+│  └──────────────┘    └──────────────┘    └──────────────┘             │
+│                                                                       │
+│  本项目未独立拆分但内嵌实现:                                             │
+│  ┌──────────────┐    ┌──────────────┐                                  │
+│  │  Bootstrap   │    │ ControlPlane │                                  │
+│  │  (kubeadm)   │    │  (kubeadm)   │                                  │
+│  └──────────────┘    └──────────────┘                                  │
+└────────────────────────────────────────────────────────────────────────┘
+```
+**关键认知**：本项目不是标准的"纯 Infrastructure Provider"，而是将 Infrastructure + Bootstrap + ControlPlane + 自建 Agent 执行面 四合一的 **Full-Stack Provider**。因此 Owner 划分需从 CAPI 四个标准面 + 自建执行面出发。
+
+## 二、五大 CAPI 面 Owner 划分
+
+### 面 1：Cluster Infrastructure Provider Owner（集群基础设施面）
+**CAPI 契约**：实现 `BKECluster` CRD，负责集群级基础设施生命周期管理
+
+**核心职责**：
+- BKECluster CRD 的 Spec/Status 定义
+- BKEClusterReconciler 主循环
+- 集群级 Phase 编排（创建/升级/删除/纳管）
+- 集群级状态合并与同步
+- 与 CAPI Cluster 对象的对接（ClusterContract）
+
+| 维度 | 涉及代码 | 关键文件 |
+|------|---------|---------|
+| API | BKECluster/BKEClusterTemplate 类型、集群级 Spec/Status | [api/capbke/v1beta1/bkecluster_types.go](file:///d:/code/github/cluster-api-provider-bke/api/capbke/v1beta1/bkecluster_types.go)、[api/bkecommon/v1beta1/bkecluster_spec.go](file:///d:/code/github/cluster-api-provider-bke/api/bkecommon/v1beta1/bkecluster_spec.go) |
+| Controller | BKEClusterReconciler | [controllers/capbke/bkecluster_controller.go](file:///d:/code/github/cluster-api-provider-bke/controllers/capbke/bkecluster_controller.go) |
+| PhaseFlow | 集群级 Phase 编排引擎 | [pkg/phaseframe/phases/phase_flow.go](file:///d:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/phase_flow.go)、[list.go](file:///d:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/list.go) |
+| Cluster Phases | 集群级 Phase 实现 | `ensure_finalizer`、`ensure_paused`、`ensure_cluster_manage`、`ensure_cluster_api_obj`、`ensure_cluster`、`ensure_dry_run`、`ensure_delete_or_reset` |
+| MergeCluster | BKECluster 状态合并 | [pkg/mergecluster/](file:///d:/code/github/cluster-api-provider-bke/pkg/mergecluster/) |
+| StatusManage | 集群/节点状态管理 | [pkg/statusmanage/](file:///d:/code/github/cluster-api-provider-bke/pkg/statusmanage/) |
+| Webhook | BKECluster Defaulting/Validation | [webhooks/capbke/bkecluster.go](file:///d:/code/github/cluster-api-provider-bke/webhooks/capbke/bkecluster.go) |
+| PhaseUtil | 集群级工具函数 | [pkg/phaseframe/phaseutil/bkecluster.go](file:///d:/code/github/cluster-api-provider-bke/pkg/phaseframe/phaseutil/bkecluster.go)、[clusterapi.go](file:///d:/code/github/cluster-api-provider-bke/pkg/phaseframe/phaseutil/clusterapi.go) |
+| Utils | 集群级工具 | [utils/capbke/clusterutil/](file:///d:/code/github/cluster-api-provider-bke/utils/capbke/clusterutil/)、[clustertracker/](file:///d:/code/github/cluster-api-provider-bke/utils/capbke/clustertracker/)、[annotation/](file:///d:/code/github/cluster-api-provider-bke/utils/capbke/annotation/)、[condition/](file:///d:/code/github/cluster-api-provider-bke/utils/capbke/condition/)、[constant/](file:///d:/code/github/cluster-api-provider-bke/utils/capbke/constant/)、[config/](file:///d:/code/github/cluster-api-provider-bke/utils/capbke/config/)、[predicates/](file:///d:/code/github/cluster-api-provider-bke/utils/capbke/predicates/) |
+
+**CAPI 契约边界**：
+```
+输入: Cluster API Cluster 对象 → BKECluster
+输出: BKECluster.Status.Ready = true
+      BKECluster.Status.FailureDomains
+```
+
+**Owner 审查规则**：
+- BKECluster API 变更、Phase 编排顺序变更、状态合并逻辑修改 → Cluster Infra Owner APPROVE
+- PhaseFlow 框架核心变更 → Cluster Infra Owner + Platform Owner 共审
+- 与 CAPI Cluster 契约对接变更 → Cluster Infra Owner 主审
+
+### 面 2：Machine Infrastructure Provider Owner（机器基础设施面）
+**CAPI 契约**：实现 `BKEMachine` CRD，负责单机级基础设施生命周期管理
+
+**核心职责**：
+- BKEMachine CRD 的 Spec/Status 定义
+- BKEMachineReconciler 主循环
+- 节点 Bootstrap 流程（Init/Join/Upgrade/Delete）
+- ProviderID 分配、节点就绪判定
+- 与 CAPI Machine 对象的对接（MachineContract）
+
+| 维度 | 涉及代码 | 关键文件 |
+|------|---------|---------|
+| API | BKEMachine/BKEMachineTemplate 类型 | [api/capbke/v1beta1/bkemachine_types.go](file:///d:/code/github/cluster-api-provider-bke/api/capbke/v1beta1/bkemachine_types.go) |
+| Controller | BKEMachineReconciler、节点 Bootstrap Phases | [controllers/capbke/bkemachine_controller.go](file:///d:/code/github/cluster-api-provider-bke/controllers/capbke/bkemachine_controller.go)、[bkemachine_controller_phases.go](file:///d:/code/github/cluster-api-provider-bke/controllers/capbke/bkemachine_controller_phases.go) |
+| Machine Phases | 节点级 Phase 实现 | `ensure_master_init`、`ensure_master_join`、`ensure_worker_join`、`ensure_master_upgrade`、`ensure_worker_upgrade`、`ensure_master_delete`、`ensure_worker_delete`、`ensure_nodes_env`、`ensure_nodes_postprocess` |
+| PhaseUtil | 节点级工具函数 | [pkg/phaseframe/phaseutil/bkemachine.go](file:///d:/code/github/cluster-api-provider-bke/pkg/phaseframe/phaseutil/bkemachine.go)、[agent.go](file:///d:/code/github/cluster-api-provider-bke/pkg/phaseframe/phaseutil/agent.go)、[ssh.go](file:///d:/code/github/cluster-api-provider-bke/pkg/phaseframe/phaseutil/ssh.go) |
+| Command | 节点级命令封装 | [pkg/command/bootstrap.go](file:///d:/code/github/cluster-api-provider-bke/pkg/command/bootstrap.go)、[upgrade.go](file:///d:/code/github/cluster-api-provider-bke/pkg/command/upgrade.go)、[cleannode.go](file:///d:/code/github/cluster-api-provider-bke/pkg/command/cleannode.go) |
+| Remote | SSH/SFTP 远程操作 | [pkg/remote/](file:///d:/code/github/cluster-api-provider-bke/pkg/remote/) |
+| Utils | 节点级工具 | [utils/capbke/nodeutil/](file:///d:/code/github/cluster-api-provider-bke/utils/capbke/nodeutil/)、[label/](file:///d:/code/github/cluster-api-provider-bke/utils/capbke/label/)、[patchutil/](file:///d:/code/github/cluster-api-provider-bke/utils/capbke/patchutil/) |
+| Common | 节点比较、初始化默认值 | [common/cluster/node/](file:///d:/code/github/cluster-api-provider-bke/common/cluster/node/)、[common/cluster/initialize/](file:///d:/code/github/cluster-api-provider-bke/common/cluster/initialize/) |
+
+**CAPI 契约边界**：
+```
+输入: Cluster API Machine 对象 → BKEMachine
+输出: BKEMachine.Status.Ready = true
+      BKEMachine.Status.ProviderID
+      BKEMachine.Status.Addresses
+```
+
+**Owner 审查规则**：
+- BKEMachine API 变更、Bootstrap 流程修改、ProviderID 生成逻辑 → Machine Infra Owner APPROVE
+- 节点加入/删除/升级顺序变更 → Machine Infra Owner 主审
+- SSH 远程操作行为变更 → Machine Infra Owner + Agent Exec Owner 协审
+
+### 面 3：Bootstrap & Control Plane Provider Owner（引导与控制面）
+**CAPI 契约**：本项目未独立拆分 Bootstrap/ControlPlane Provider，而是将 kubeadm 引导逻辑内嵌实现
+
+**核心职责**：
+- kubeadm 初始化/加入/升级命令生成
+- 证书体系（CA、Server、Client 证书、Kubeconfig）
+- 控制面组件 Manifest 渲染（kube-apiserver、controller-manager、scheduler、etcd）
+- etcd 集群管理
+- Kubelet 配置与服务管理
+- 证书轮转与续期
+
+| 维度 | 涉及代码 | 关键文件 |
+|------|---------|---------|
+| Cert Phases | 证书 Phase | [pkg/phaseframe/phases/ensure_certs.go](file:///d:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_certs.go) |
+| Certs | 证书生成/轮转/获取 | [pkg/certs/](file:///d:/code/github/cluster-api-provider-bke/pkg/certs/) |
+| PKIUtil | 证书工具集 | [utils/bkeagent/pkiutil/](file:///d:/code/github/cluster-api-provider-bke/utils/bkeagent/pkiutil/) |
+| Kubeadm Jobs | kubeadm 命令生成 | [pkg/job/builtin/kubeadm/](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/kubeadm/) |
+| Cert Jobs | 证书操作 Job | [pkg/job/builtin/kubeadm/certs/](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/kubeadm/certs/) |
+| Kubelet Jobs | Kubelet 配置 | [pkg/job/builtin/kubeadm/kubelet/](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/kubeadm/kubelet/) |
+| Manifest Jobs | 控制面 Manifest | [pkg/job/builtin/kubeadm/manifests/](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/kubeadm/manifests/) |
+| Env Jobs | 节点环境准备 | [pkg/job/builtin/kubeadm/env/](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/kubeadm/env/) |
+| MFUtil | 组件 Manifest 渲染 | [utils/bkeagent/mfutil/](file:///d:/code/github/cluster-api-provider-bke/utils/bkeagent/mfutil/) |
+| Etcd | etcd 操作 | [utils/bkeagent/etcd/](file:///d:/code/github/cluster-api-provider-bke/utils/bkeagent/etcd/) |
+| Etcd Upgrade Phase | etcd 升级 | [pkg/phaseframe/phases/ensure_etcd_upgrade.go](file:///d:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_etcd_upgrade.go) |
+| Component Upgrade Phase | 组件升级 | [pkg/phaseframe/phases/ensure_component_upgrade.go](file:///d:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_component_upgrade.go) |
+| Containerd Upgrade Phase | 容器运行时升级 | [pkg/phaseframe/phases/ensure_containerd_upgrade.go](file:///d:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_containerd_upgrade.go) |
+| PhaseUtil | 升级/Provider 工具 | [pkg/phaseframe/phaseutil/upgrade.go](file:///d:/code/github/cluster-api-provider-bke/pkg/phaseframe/phaseutil/upgrade.go)、[provider.go](file:///d:/code/github/cluster-api-provider-bke/pkg/phaseframe/phaseutil/provider.go) |
+| API | 证书/版本相关字段 | [api/bkecommon/v1beta1/](file:///d:/code/github/cluster-api-provider-bke/api/bkecommon/v1beta1/) |
+| Security | 安全工具 | [common/security/](file:///d:/code/github/cluster-api-provider-bke/common/security/) |
+
+**CAPI 契约边界**（内嵌实现，无独立 CRD）：
+```
+输入: BKECluster.Spec（版本、证书配置）
+      BKEMachine.Spec（节点角色）
+输出: kubeadm 配置 → Command → Agent 执行
+      证书 → Secret
+      控制面 Manifest → 静态 Pod
+```
+
+**Owner 审查规则**：
+- kubeadm 参数变更、证书体系修改、控制面 Manifest 模板变更 → Bootstrap & CP Owner APPROVE
+- 版本兼容性矩阵更新 → Bootstrap & CP Owner 主审
+- etcd 操作逻辑修改 → Bootstrap & CP Owner 主审
+- 安全相关变更 → Bootstrap & CP Owner + 安全评审
+
+### 面 4：Agent Execution Provider Owner（Agent 执行面）
+**CAPI 契约**：本项目自建面，非 CAPI 标准。通过 Command CRD 实现管理面→数据面的异步执行
+
+**核心职责**：
+- Command CRD 定义与生命周期管理
+- CommandReconciler 主循环
+- Job 插件注册与执行框架
+- 节点级任务执行器（exec、containerd、docker）
+- Agent 部署、升级、切换
+- Agent Launcher 启动器
+- NTP 时间同步
+
+| 维度 | 涉及代码 | 关键文件 |
+|------|---------|---------|
+| API | Command CRD | [api/bkeagent/v1beta1/command_types.go](file:///d:/code/github/cluster-api-provider-bke/api/bkeagent/v1beta1/command_types.go) |
+| Controller | CommandReconciler | [controllers/bkeagent/command_controller.go](file:///d:/code/github/cluster-api-provider-bke/controllers/bkeagent/command_controller.go) |
+| Job Core | Job 接口、Task 生命周期 | [pkg/job/job.go](file:///d:/code/github/cluster-api-provider-bke/pkg/job/job.go) |
+| Builtin Jobs | 所有内置任务插件 | [pkg/job/builtin/](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/) |
+| K8s/Shell Jobs | K8s/Shell 任务 | [pkg/job/k8s/](file:///d:/code/github/cluster-api-provider-bke/pkg/job/k8s/)、[pkg/job/shell/](file:///d:/code/github/cluster-api-provider-bke/pkg/job/shell/) |
+| Executor | 命令/容器运行时执行器 | [pkg/executor/](file:///d:/code/github/cluster-api-provider-bke/pkg/executor/) |
+| Agent Phases | Agent 部署/切换/升级 | [pkg/phaseframe/phases/ensure_bke_agent.go](file:///d:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_bke_agent.go)、[ensure_agent_switch.go](file:///d:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_agent_switch.go)、[ensure_agent_upgrade.go](file:///d:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_agent_upgrade.go)、[ensure_provider_self_upgrade.go](file:///d:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_provider_self_upgrade.go) |
+| Command Lib | 命令创建/等待封装 | [pkg/command/](file:///d:/code/github/cluster-api-provider-bke/pkg/command/) |
+| Agent Launcher | Agent 启动器 | [cmd/bkeagent-launcher/](file:///d:/code/github/cluster-api-provider-bke/cmd/bkeagent-launcher/) |
+| Agent Entry | Agent 入口 | [cmd/bkeagent/](file:///d:/code/github/cluster-api-provider-bke/cmd/bkeagent/) |
+| Crontab | 定时任务 | [pkg/crontab/](file:///d:/code/github/cluster-api-provider-bke/pkg/crontab/) |
+| NTP | 时间同步 | [common/ntp/](file:///d:/code/github/cluster-api-provider-bke/common/ntp/) |
+| Utils | Agent 专用工具 | [utils/bkeagent/](file:///d:/code/github/cluster-api-provider-bke/utils/bkeagent/)（download、kubeclient、initsystem、httprepo、runtime、mutx、net、option、clientutil、cluster、resetutil、log） |
+
+**Agent 执行面契约边界**：
+```
+输入: Command CRD（由管理面创建）
+处理: CommandReconciler → Job.BuiltIn/K8s/Shell → Executor
+输出: Command.Status.Phase = Completed/Failed
+      Command.Status.Reason / Message
+```
+
+**Owner 审查规则**：
+- Command CRD 变更、Job 插件接口变更、Executor 行为修改 → Agent Exec Owner APPROVE
+- 新增 Builtin Job 插件 → Agent Exec Owner 主审，相关消费方 Owner 协审
+- Agent 部署/升级/切换逻辑变更 → Agent Exec Owner 主审
+- Agent Launcher 变更 → Agent Exec Owner 主审
+
+### 面 5：Platform & Addon Owner（平台与组件面）
+**CAPI 契约**：非 CAPI 标准面，属于平台增值层
+
+**核心职责**：
+- Addon（集群组件）生命周期管理
+- 远程 K8s 客户端与资源操作
+- 负载均衡配置
+- 镜像仓库管理
+- 集群校验规则
+- Metrics 指标体系
+- 构建与部署
+
+| 维度 | 涉及代码 | 关键文件 |
+|------|---------|---------|
+| Addon Phase | Addon 部署 Phase | [pkg/phaseframe/phases/ensure_addon_deploy.go](file:///d:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_addon_deploy.go) |
+| LB Phase | 负载均衡 Phase | [pkg/phaseframe/phases/ensure_load_balance.go](file:///d:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_load_balance.go) |
+| PhaseUtil | Addon/Provider/Bocloud 工具 | [pkg/phaseframe/phaseutil/addon.go](file:///d:/code/github/cluster-api-provider-bke/pkg/phaseframe/phaseutil/addon.go)、[provider.go](file:///d:/code/github/cluster-api-provider-bke/pkg/phaseframe/phaseutil/provider.go)、[bocloud.go](file:///d:/code/github/cluster-api-provider-bke/pkg/phaseframe/phaseutil/bocloud.go) |
+| Kube | 远程 K8s 客户端、Addon/Helm/YAML 部署 | [pkg/kube/](file:///d:/code/github/cluster-api-provider-bke/pkg/kube/) |
+| Command | 运维命令 | [pkg/command/switchcluster.go](file:///d:/code/github/cluster-api-provider-bke/pkg/command/switchcluster.go)、[loadbalance.go](file:///d:/code/github/cluster-api-provider-bke/pkg/command/loadbalance.go)、[custom.go](file:///d:/code/github/cluster-api-provider-bke/pkg/command/custom.go)、[collect.go](file:///d:/code/github/cluster-api-provider-bke/pkg/command/collect.go)、[ping.go](file:///d:/code/github/cluster-api-provider-bke/pkg/command/ping.go)、[hosts.go](file:///d:/code/github/cluster-api-provider-bke/pkg/command/hosts.go)、[env.go](file:///d:/code/github/cluster-api-provider-bke/pkg/command/env.go) |
+| HA Job | 高可用配置 | [pkg/job/builtin/ha/](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/ha/) |
+| Common | Addon 比较、Image Helper、初始化默认值、校验 | [common/cluster/addon/](file:///d:/code/github/cluster-api-provider-bke/common/cluster/addon/)、[imagehelper/](file:///d:/code/github/cluster-api-provider-bke/common/cluster/imagehelper/)、[initialize/](file:///d:/code/github/cluster-api-provider-bke/common/cluster/initialize/)、[validation/](file:///d:/code/github/cluster-api-provider-bke/common/cluster/validation/) |
+| Warehouse | 镜像仓库 | [common/warehouse/](file:///d:/code/github/cluster-api-provider-bke/common/warehouse/) |
+| Metrics | 指标体系 | [pkg/metrics/](file:///d:/code/github/cluster-api-provider-bke/pkg/metrics/) |
+| Utils | Addon 工具 | [utils/capbke/addonutil/](file:///d:/code/github/cluster-api-provider-bke/utils/capbke/addonutil/)、[scriptshelper/](file:///d:/code/github/cluster-api-provider-bke/utils/capbke/scriptshelper/) |
+| Webhook | BKENode Webhook | [webhooks/capbke/bkenode.go](file:///d:/code/github/cluster-api-provider-bke/webhooks/capbke/bkenode.go) |
+| Build | 构建与部署 | `cmd/capbke/`、`builder/`、`config/`、`Makefile*` |
+| Common Lib | 通用工具 | [common/template/](file:///d:/code/github/cluster-api-provider-bke/common/template/)、[common/source/](file:///d:/code/github/cluster-api-provider-bke/common/source/)、[common/utils/](file:///d:/code/github/cluster-api-provider-bke/common/utils/)、[common/versionutil/](file:///d:/code/github/cluster-api-provider-bke/common/versionutil/)、[common/constants.go](file:///d:/code/github/cluster-api-provider-bke/common/constants.go)、[testutils/](file:///d:/code/github/cluster-api-provider-bke/testutils/)、[version/](file:///d:/code/github/cluster-api-provider-bke/version/)、[utils/logger/](file:///d:/code/github/cluster-api-provider-bke/utils/logger/)、[utils/const.go](file:///d:/code/github/cluster-api-provider-bke/utils/const.go)、[utils/utils.go](file:///d:/code/github/cluster-api-provider-bke/utils/utils.go) |
+
+**Owner 审查规则**：
+- Addon 部署策略变更、Helm/YAML 部署逻辑修改 → Platform & Addon Owner APPROVE
+- 负载均衡配置修改 → Platform & Addon Owner 主审
+- 镜像仓库变更 → Platform & Addon Owner 主审
+- 构建流程变更 → Platform & Addon Owner 主审
+- Metrics 变更 → Platform & Addon Owner 主审
+
+## 三、CAPI 面间交互模型
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    CAPI Core (上游标准)                              │
+│         Cluster ─────────── Machine                                 │
+│            │                    │                                   │
+└────────────┼────────────────────┼───────────────────────────────────┘
+             │                    │
+             ▼                    ▼
+┌─────────────────────┐  ┌─────────────────────┐
+│  面1: Cluster Infra │  │  面2: Machine Infra │
+│  BKECluster         │  │  BKEMachine        │
+│  PhaseFlow 编排     │  │  Bootstrap 流程     │
+│  状态合并/管理       │  │  ProviderID/Ready  │
+└────────┬────────────┘  └───────┬────────────┘
+         │                       │
+         │    ┌──────────────────┤
+         │    │                  │
+         ▼    ▼                  ▼
+┌────────────────────┐  ┌────────────────────┐
+│  面3: Bootstrap &  │  │  面4: Agent Exec   │
+│  Control Plane     │  │  Command CRD       │
+│  kubeadm/证书/     │  │  Job 插件/执行器    │
+│  Manifest/etcd     │  │  Agent 部署升级     │
+└────────────────────┘  └────────────────────┘
+         │                       │
+         └───────────┬───────────┘
+                     ▼
+         ┌────────────────────┐
+         │  面5: Platform &   │
+         │  Addon             │
+         │  Addon/LB/仓库/    │
+         │  构建/指标/通用库   │
+         └────────────────────┘
+```
+**交互规则**：
+- **面1 → 面2**：Cluster Infra 编排 Machine Infra 的生命周期（通过 PhaseFlow 触发 BKEMachine 操作）
+- **面1/面2 → 面3**：Machine Infra 调用 Bootstrap & CP 生成 kubeadm 配置和证书
+- **面1/面2 → 面4**：Cluster/Machine Infra 通过 Command CRD 向 Agent Exec 面下发任务
+- **面3 → 面4**：Bootstrap & CP 的 kubeadm/证书操作通过 Job 在 Agent 上执行
+- **面1/面2/面3 → 面5**：所有面依赖 Platform & Addon 的通用能力
+
+## 四、跨面协作矩阵
+| 变更场景 | 主审面 | 协审面 | 原因 |
+|---------|--------|--------|------|
+| BKECluster API 字段变更 | 面1 Cluster Infra | 面2 Machine Infra | Machine 依赖 Cluster Spec |
+| Phase 编排顺序变更 | 面1 Cluster Infra | 面3 Bootstrap & CP、面4 Agent Exec | Phase 内部调用 Bootstrap/Agent |
+| BKEMachine Bootstrap 流程修改 | 面2 Machine Infra | 面3 Bootstrap & CP | Bootstrap 生成 kubeadm 配置 |
+| 新增 Command 类型 | 面4 Agent Exec | 面1/面2（消费方） | Command 由 Cluster/Machine 创建 |
+| kubeadm 参数变更 | 面3 Bootstrap & CP | 面4 Agent Exec | kubeadm 通过 Job 在 Agent 执行 |
+| 证书体系修改 | 面3 Bootstrap & CP | 面1 Cluster Infra | 证书由 Cluster Phase 触发 |
+| Addon 部署策略变更 | 面5 Platform & Addon | 面1 Cluster Infra | Addon 由 Cluster Phase 触发 |
+| Job 插件接口变更 | 面4 Agent Exec | 面3 Bootstrap & CP | Bootstrap Job 是最大消费方 |
+| Agent 部署/升级逻辑变更 | 面4 Agent Exec | 面1 Cluster Infra | Agent Phase 在 Cluster 编排中 |
+| PhaseFrame Core 接口变更 | 面1 Cluster Infra | **所有面** | 框架变更影响全局 |
+| 构建流程变更 | 面5 Platform & Addon | 面4 Agent Exec | Agent 有独立构建流程 |
+
+## 五、CAPI 面 Owner 与 CODEOWNERS 映射
+```
+# ===== 面1: Cluster Infrastructure Provider =====
+/api/capbke/v1beta1/bkecluster_types.go            @cluster-infra-owner
+/api/capbke/v1beta1/bkecluster_consts.go           @cluster-infra-owner
+/api/capbke/v1beta1/bkeclustertemplate_types.go     @cluster-infra-owner
+/api/bkecommon/v1beta1/bkecluster_spec.go           @cluster-infra-owner
+/api/bkecommon/v1beta1/bkecluster_status.go         @cluster-infra-owner
+/api/bkecommon/v1beta1/bkecluster_list.go           @cluster-infra-owner
+/controllers/capbke/bkecluster_controller.go        @cluster-infra-owner
+/pkg/phaseframe/interface.go                        @cluster-infra-owner
+/pkg/phaseframe/base.go                             @cluster-infra-owner
+/pkg/phaseframe/context.go                          @cluster-infra-owner
+/pkg/phaseframe/phases/phase_flow.go                @cluster-infra-owner
+/pkg/phaseframe/phases/list.go                      @cluster-infra-owner
+/pkg/phaseframe/phases/phase_helpers.go             @cluster-infra-owner
+/pkg/phaseframe/phases/template.go                  @cluster-infra-owner
+/pkg/phaseframe/phases/common.go                    @cluster-infra-owner
+/pkg/phaseframe/phases/ensure_finalizer.go          @cluster-infra-owner
+/pkg/phaseframe/phases/ensure_paused.go             @cluster-infra-owner
+/pkg/phaseframe/phases/ensure_cluster_manage.go     @cluster-infra-owner
+/pkg/phaseframe/phases/ensure_cluster_api_obj.go    @cluster-infra-owner
+/pkg/phaseframe/phases/ensure_cluster.go            @cluster-infra-owner
+/pkg/phaseframe/phases/ensure_dry_run.go            @cluster-infra-owner
+/pkg/phaseframe/phases/ensure_delete_or_reset.go    @cluster-infra-owner
+/pkg/mergecluster/                                  @cluster-infra-owner
+/pkg/statusmanage/                                  @cluster-infra-owner
+/webhooks/capbke/bkecluster.go                      @cluster-infra-owner
+/pkg/phaseframe/phaseutil/bkecluster.go             @cluster-infra-owner
+/pkg/phaseframe/phaseutil/clusterapi.go             @cluster-infra-owner
+/pkg/phaseframe/phaseutil/command.go                @cluster-infra-owner
+/pkg/phaseframe/phaseutil/k8stoken.go               @cluster-infra-owner
+/pkg/phaseframe/phaseutil/localkubeconfig.go        @cluster-infra-owner
+/pkg/phaseframe/phaseutil/oauth.go                  @cluster-infra-owner
+/pkg/phaseframe/phaseutil/util.go                   @cluster-infra-owner
+/utils/capbke/clusterutil/                          @cluster-infra-owner
+/utils/capbke/clustertracker/                       @cluster-infra-owner
+/utils/capbke/annotation/                           @cluster-infra-owner
+/utils/capbke/condition/                            @cluster-infra-owner
+/utils/capbke/constant/                             @cluster-infra-owner
+/utils/capbke/config/                               @cluster-infra-owner
+/utils/capbke/predicates/                           @cluster-infra-owner
+/utils/capbke/log/                                  @cluster-infra-owner
+
+# ===== 面2: Machine Infrastructure Provider =====
+/api/capbke/v1beta1/bkemachine_types.go             @machine-infra-owner
+/api/capbke/v1beta1/bkemachinetemplate_types.go     @machine-infra-owner
+/api/bkecommon/v1beta1/bkenode_types.go             @machine-infra-owner
+/controllers/capbke/bkemachine_controller.go        @machine-infra-owner
+/controllers/capbke/bkemachine_controller_phases.go @machine-infra-owner
+/pkg/phaseframe/phases/ensure_master_init.go        @machine-infra-owner
+/pkg/phaseframe/phases/ensure_master_join.go        @machine-infra-owner
+/pkg/phaseframe/phases/ensure_worker_join.go        @machine-infra-owner
+/pkg/phaseframe/phases/ensure_master_upgrade.go     @machine-infra-owner
+/pkg/phaseframe/phases/ensure_worker_upgrade.go     @machine-infra-owner
+/pkg/phaseframe/phases/ensure_master_delete.go      @machine-infra-owner
+/pkg/phaseframe/phases/ensure_worker_delete.go      @machine-infra-owner
+/pkg/phaseframe/phases/ensure_nodes_env.go          @machine-infra-owner
+/pkg/phaseframe/phases/ensure_nodes_postprocess.go  @machine-infra-owner
+/pkg/phaseframe/phaseutil/bkemachine.go             @machine-infra-owner
+/pkg/phaseframe/phaseutil/agent.go                  @machine-infra-owner
+/pkg/phaseframe/phaseutil/ssh.go                    @machine-infra-owner
+/pkg/command/bootstrap.go                           @machine-infra-owner
+/pkg/command/upgrade.go                             @machine-infra-owner
+/pkg/command/cleannode.go                           @machine-infra-owner
+/pkg/remote/                                        @machine-infra-owner
+/utils/capbke/nodeutil/                             @machine-infra-owner
+/utils/capbke/label/                                @machine-infra-owner
+/utils/capbke/patchutil/                            @machine-infra-owner
+/common/cluster/node/                               @machine-infra-owner
+/common/cluster/initialize/                         @machine-infra-owner
+
+# ===== 面3: Bootstrap & Control Plane Provider =====
+/pkg/phaseframe/phases/ensure_certs.go              @bootstrap-cp-owner
+/pkg/phaseframe/phases/ensure_etcd_upgrade.go       @bootstrap-cp-owner
+/pkg/phaseframe/phases/ensure_containerd_upgrade.go @bootstrap-cp-owner
+/pkg/phaseframe/phases/ensure_component_upgrade.go  @bootstrap-cp-owner
+/pkg/certs/                                         @bootstrap-cp-owner
+/utils/bkeagent/pkiutil/                            @bootstrap-cp-owner
+/utils/bkeagent/mfutil/                             @bootstrap-cp-owner
+/utils/bkeagent/etcd/                               @bootstrap-cp-owner
+/pkg/job/builtin/kubeadm/                           @bootstrap-cp-owner
+/pkg/job/builtin/kubeadm/certs/                     @bootstrap-cp-owner
+/pkg/job/builtin/kubeadm/kubelet/                   @bootstrap-cp-owner
+/pkg/job/builtin/kubeadm/manifests/                 @bootstrap-cp-owner
+/pkg/job/builtin/kubeadm/env/                       @bootstrap-cp-owner
+/pkg/job/builtin/containerruntime/                  @bootstrap-cp-owner
+/pkg/job/builtin/backup/                            @bootstrap-cp-owner
+/pkg/phaseframe/phaseutil/upgrade.go                @bootstrap-cp-owner
+/pkg/phaseframe/phaseutil/provider.go               @bootstrap-cp-owner
+/pkg/phaseframe/phaseutil/bocloud.go                @bootstrap-cp-owner
+/api/bkecommon/v1beta1/kubeletconfig_types.go       @bootstrap-cp-owner
+/api/bkecommon/v1beta1/containerdconfig_types.go    @bootstrap-cp-owner
+/api/capbke/v1beta1/containerdconfig_types.go       @bootstrap-cp-owner
+/api/capbke/v1beta1/bkenode_types.go                @bootstrap-cp-owner
+/common/security/                                   @bootstrap-cp-owner
+/common/versionutil/                                @bootstrap-cp-owner
+
+# ===== 面4: Agent Execution Provider =====
+/api/bkeagent/v1beta1/                              @agent-exec-owner
+/controllers/bkeagent/                              @agent-exec-owner
+/pkg/job/                                           @agent-exec-owner
+/pkg/executor/                                      @agent-exec-owner
+/pkg/phaseframe/phases/ensure_bke_agent.go          @agent-exec-owner
+/pkg/phaseframe/phases/ensure_agent_switch.go       @agent-exec-owner
+/pkg/phaseframe/phases/ensure_agent_upgrade.go      @agent-exec-owner
+/pkg/phaseframe/phases/ensure_provider_self_upgrade.go @agent-exec-owner
+/pkg/command/switchcluster.go                       @agent-exec-owner
+/pkg/command/loadbalance.go                         @agent-exec-owner
+/pkg/command/custom.go                              @agent-exec-owner
+/pkg/command/collect.go                             @agent-exec-owner
+/pkg/command/ping.go                                @agent-exec-owner
+/pkg/command/hosts.go                               @agent-exec-owner
+/pkg/command/env.go                                 @agent-exec-owner
+/pkg/command/command.go                             @agent-exec-owner
+/pkg/crontab/                                       @agent-exec-owner
+/cmd/bkeagent/                                      @agent-exec-owner
+/cmd/bkeagent-launcher/                             @agent-exec-owner
+/common/ntp/                                        @agent-exec-owner
+/utils/bkeagent/download/                           @agent-exec-owner
+/utils/bkeagent/kubeclient/                         @agent-exec-owner
+/utils/bkeagent/initsystem/                         @agent-exec-owner
+/utils/bkeagent/httprepo/                           @agent-exec-owner
+/utils/bkeagent/runtime/                            @agent-exec-owner
+/utils/bkeagent/mutx/                               @agent-exec-owner
+/utils/bkeagent/net/                                @agent-exec-owner
+/utils/bkeagent/option/                             @agent-exec-owner
+/utils/bkeagent/clientutil/                         @agent-exec-owner
+/utils/bkeagent/cluster/                            @agent-exec-owner
+/utils/bkeagent/resetutil/                          @agent-exec-owner
+/utils/bkeagent/log/                                @agent-exec-owner
+/pkg/job/builtin/reset/                             @agent-exec-owner
+/pkg/job/builtin/shutdown/                          @agent-exec-owner
+/pkg/job/builtin/selfupdate/                        @agent-exec-owner
+/pkg/job/builtin/downloader/                        @agent-exec-owner
+/pkg/job/builtin/ping/                              @agent-exec-owner
+/pkg/job/builtin/preprocess/                        @agent-exec-owner
+/pkg/job/builtin/postprocess/                       @agent-exec-owner
+/pkg/job/builtin/scriptutil/                        @agent-exec-owner
+/pkg/job/builtin/plugin/                            @agent-exec-owner
+/pkg/job/builtin/switchcluster/                     @agent-exec-owner
+/pkg/job/builtin/collect/                           @agent-exec-owner
+
+# ===== 面5: Platform & Addon =====
+/pkg/phaseframe/phases/ensure_addon_deploy.go       @platform-addon-owner
+/pkg/phaseframe/phases/ensure_load_balance.go       @platform-addon-owner
+/pkg/phaseframe/phaseutil/addon.go                  @platform-addon-owner
+/pkg/kube/                                          @platform-addon-owner
+/pkg/job/builtin/ha/                                @platform-addon-owner
+/common/cluster/addon/                              @platform-addon-owner
+/common/cluster/imagehelper/                        @platform-addon-owner
+/common/cluster/validation/                         @platform-addon-owner
+/common/warehouse/                                  @platform-addon-owner
+/utils/capbke/addonutil/                            @platform-addon-owner
+/utils/capbke/scriptshelper/                        @platform-addon-owner
+/webhooks/capbke/bkenode.go                         @platform-addon-owner
+/pkg/metrics/                                       @platform-addon-owner
+/common/template/                                   @platform-addon-owner
+/common/source/                                     @platform-addon-owner
+/common/utils/                                      @platform-addon-owner
+/common/constants.go                                @platform-addon-owner
+/testutils/                                         @platform-addon-owner
+/version/                                           @platform-addon-owner
+/utils/logger/                                      @platform-addon-owner
+/utils/const.go                                     @platform-addon-owner
+/utils/utils.go                                     @platform-addon-owner
+/cmd/capbke/                                        @platform-addon-owner
+/builder/                                           @platform-addon-owner
+/config/                                            @platform-addon-owner
+/Makefile*                                          @platform-addon-owner
+```
+
+## 六、三种划分维度对比
+| 维度 | 架构层划分 | 功能特性划分 | CAPI 面划分 |
+|------|-----------|-------------|------------|
+| 切分逻辑 | 水平分层（API→Controller→Business→Infra→Utils） | 垂直切功能（创建/升级/删除/证书/运维/执行/平台） | 按 CAPI Provider 角色（Cluster/Machine/Bootstrap/Agent/Platform） |
+| Owner 视角 | 我负责某一层 | 我负责某一特性全栈 | 我负责某一 CAPI 契约面 |
+| 变更影响范围 | 同层内扩散 | 同特性内扩散 | 同 CAPI 面内扩散 |
+| 适合团队结构 | 按技术栈分工（前端/后端/DBA） | 按业务线分工（创建组/升级组） | **按 Provider 契约分工（Cluster 组/Machine 组/Agent 组）** |
+| CAPI 上游兼容性 | 弱 | 中 | **强** |
+| 外部协作友好度 | 低 | 中 | **高**（与 CAPI 社区角色对齐） |
+
+**推荐**：对于本项目，**CAPI 面划分**最合适，原因：
+
+1. **与 CAPI 社区角色对齐**：Cluster Infra / Machine Infra / Bootstrap & CP 是 CAPI 标准角色，与上游社区协作时职责清晰
+2. **契约边界天然清晰**：每个面有明确的 CRD 契约（BKECluster/BKEMachine/Command），面间通过 CRD 状态交互，耦合度低
+3. **独立演进能力强**：面4 Agent Exec 完全独立部署（bkeagent 二进制），面1/面2 共部署但 Reconciler 独立，面3 无独立 CRD 但逻辑内聚
+4. **团队分工自然**：Cluster 组关注集群编排，Machine 组关注节点管理，Bootstrap 组关注 kubeadm/证书，Agent 组关注执行引擎
+
+
