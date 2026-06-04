@@ -42,7 +42,7 @@
 
 #### 问题1：控制面初始化未完全利用 CAPI
 
-**当前代码** ([ensure_master_init.go](file:///c:/Users/z00820145/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_master_init.go#L1)):
+**当前代码** ([ensure_master_init.go](file:///d://code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_master_init.go#L1)):
 
 ```go
 // EnsureMasterInit 通过 Agent Command 执行 kubeadm init
