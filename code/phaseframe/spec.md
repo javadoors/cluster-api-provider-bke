@@ -189,3 +189,86 @@ metadata:
 
 这是 Phase 框架中的**重要安全机制**，确保 Phase 只在合适的集群类型上执行，避免对不该管理的集群造成影响。
         
+# func (e *EnsureMasterInit) setupConditionAndRefresh(params SetupConditionAndRefreshParams)
+```go
+func (e *EnsureMasterInit) setupConditionAndRefresh(params SetupConditionAndRefreshParams) error {
+    // 1. 参数校验
+    if params.Ctx == nil {
+        return errors.New("params.Ctx cannot be nil")
+    }
+    if params.Ctx.BKECluster == nil {
+        return errors.New("params.Ctx.BKECluster cannot be nil")
+    }
+    
+    ctx := params.Ctx
+    clusterKey := utils.ClientObjNS(ctx.BKECluster)
+    
+    // 2. 设置 Condition（幂等性检查）
+    if !conditions.IsFalse(ctx.BKECluster, bkev1beta1.ControlPlaneInitializedCondition) {
+        condition.ConditionMark(ctx.BKECluster, bkev1beta1.ControlPlaneInitializedCondition, 
+            confv1beta1.ConditionFalse, constant.MasterNotInitReason, "Master still not init")
+    }
+    
+    // 3. 同步状态（带重试）
+    var lastErr error
+    for i := 0; i < 3; i++ {
+        if err := mergecluster.SyncStatusUntilComplete(ctx.Client, ctx.BKECluster); err != nil {
+            lastErr = err
+            // 错误分类处理
+            if apierrors.IsConflict(err) {
+                // 冲突错误，刷新后重试
+                if refreshErr := ctx.RefreshCtxBKECluster(); refreshErr != nil {
+                    log.Error(constant.MasterNotInitReason, 
+                        "failed to refresh cluster %s after conflict: %v", clusterKey, refreshErr)
+                    return errors.Wrap(refreshErr, "failed to refresh after conflict")
+                }
+                time.Sleep(time.Second * time.Duration(i+1))
+                continue
+            }
+            if apierrors.IsNotFound(err) {
+                // 资源不存在，不可恢复
+                log.Error(constant.MasterNotInitReason, 
+                    "cluster %s not found: %v", clusterKey, err)
+                return errors.Wrap(err, "cluster not found")
+            }
+            // 其他错误
+            log.Error(constant.MasterNotInitReason, 
+                "failed to sync cluster %s status (attempt %d/3): %v", clusterKey, i+1, err)
+            time.Sleep(time.Second * time.Duration(i+1))
+            continue
+        }
+        lastErr = nil
+        break
+    }
+    
+    if lastErr != nil {
+        log.Error(constant.MasterNotInitReason, 
+            "failed to sync cluster %s status after 3 attempts: %v", clusterKey, lastErr)
+        return errors.Wrap(lastErr, "failed to sync cluster status")
+    }
+    
+    // 4. 刷新集群状态
+    if err := ctx.RefreshCtxBKECluster(); err != nil {
+        log.Error(constant.MasterNotInitReason, 
+            "failed to refresh cluster %s: %v", clusterKey, err)
+        return errors.Wrap(err, "failed to refresh BKECluster")
+    }
+    
+    return nil
+}
+```
+总结setupConditionAndRefresh 函数在异常处理方面存在以下主要不足：
+- ❌ 错误被吞没：第一个错误只记录日志，不返回
+- ❌ 错误日志不完整：缺少具体错误信息和上下文
+- ❌ 缺少参数校验：没有检查 params.Ctx 是否为 nil
+- ❌ 错误处理不一致：两个操作的错误处理方式不同
+- ❌ 缺少重试机制：对临时性错误没有重试
+- ❌ 缺少错误分类：所有错误都一样处理
+- ❌ 缺少幂等性保证：可能产生不必要的更新
+- ❌ 缺少上下文信息：日志中缺少集群标识
+
+这些问题可能导致：
+- 状态不一致
+- 问题排查困难
+- 不必要的重试和性能开销
+- 潜在的 panic 风险
