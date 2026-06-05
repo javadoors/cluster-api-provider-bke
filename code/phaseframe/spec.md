@@ -364,3 +364,110 @@ func (b *BasePhase) DefaultPreHook() error {
 - 永久阻塞
 
 建议按照上述改进方案进行修复，提高代码的健壮性、可维护性和可观测性。
+
+# func (e *EnsureMasterInit) Execute() 
+```go
+defer func() {
+	// 1. Panic 恢复机制
+	if r := recover(); r != nil {
+		e.Ctx.Log.Error("panic in defer: %v", r)
+		err = errors.Errorf("panic in defer: %v", r)
+		return
+	}
+
+	// 2. 参数校验
+	if e == nil || e.Ctx == nil {
+		e.Ctx.Log.Error("invalid EnsureMasterInit or PhaseContext (nil)")
+		return
+	}
+
+	var deferErr error
+	clusterKey := utils.ClientObjNS(e.Ctx.BKECluster)
+
+	// 3. 先检查 Cluster 是否存在
+	if e.Ctx.Cluster == nil {
+		e.Ctx.Log.Warn(constant.MasterNotInitReason, "Cluster %s is nil, skip condition check", clusterKey)
+		return
+	}
+
+	// 4. 刷新 Cluster（带错误分类）
+	if derr := e.Ctx.RefreshCtxCluster(); derr != nil {
+		// 错误分类处理
+		if apierrors.IsNotFound(derr) {
+			e.Ctx.Log.Error(constant.MasterNotInitReason, 
+				"Cluster %s not found: %v", clusterKey, derr)
+			deferErr = derr
+			return
+		}
+		if apierrors.IsConflict(derr) {
+			e.Ctx.Log.Warn(constant.MasterNotInitReason, 
+				"Conflict while refreshing Cluster %s: %v", clusterKey, derr)
+		} else {
+			e.Ctx.Log.Error(constant.MasterNotInitReason, 
+				"Get ClusterAPI Cluster obj %s failed: %v", clusterKey, derr)
+		}
+		deferErr = derr
+		return
+	}
+
+	// 5. 检查条件并标记 Condition
+	if !conditions.IsTrue(e.Ctx.Cluster, clusterv1.ControlPlaneInitializedCondition) {
+		// 先同步状态（带重试）
+		var lastErr error
+		for i := 0; i < 3; i++ {
+			if derr := mergecluster.SyncStatusUntilComplete(e.Ctx.Client, e.Ctx.BKECluster); derr != nil {
+				lastErr = derr
+				e.Ctx.Log.Debug("failed to sync status for cluster %s (attempt %d/3): %v", 
+					clusterKey, i+1, derr)
+				time.Sleep(time.Second * time.Duration(i+1))
+				continue
+			}
+			lastErr = nil
+			break
+		}
+
+		if lastErr != nil {
+			e.Ctx.Log.Error(constant.MasterNotInitReason, 
+				"failed to sync status for cluster %s after 3 attempts: %v", 
+				clusterKey, lastErr)
+			deferErr = lastErr
+			return
+		}
+
+		// 状态同步成功后，再标记 Condition
+		condition.ConditionMark(e.Ctx.BKECluster, 
+			bkev1beta1.ControlPlaneInitializedCondition, 
+			confv1beta1.ConditionFalse, 
+			constant.MasterNotInitReason, 
+			"Master still not init")
+
+		e.Ctx.Log.Debug("Condition marked for cluster %s", clusterKey)
+	}
+
+	// 6. 错误传播：只在外层没有错误时，才使用 defer 中的错误
+	if err == nil && deferErr != nil {
+		err = deferErr
+	}
+}()
+```
+ 总结,这个 `defer` 函数在异常处理方面存在以下**严重不足**：
+1. ❌ **错误覆盖问题**：`err = derr` 会覆盖外层的原始错误
+2. ❌ **缺少参数校验**：没有检查 `e.Ctx` 是否为 `nil`，存在 Panic 风险
+3. ❌ **错误处理不一致**：`RefreshCtxCluster` 失败后仍然继续执行
+4. ❌ **缺少重试机制**：`SyncStatusUntilComplete` 失败后没有重试
+5. ❌ **缺少错误分类处理**：所有错误都一样处理
+6. ❌ **缺少上下文信息**：日志中缺少集群名称等关键信息
+7. ❌ **缺少 Panic 恢复机制**：defer 内部 panic 会导致 Controller 崩溃
+8. ❌ **逻辑顺序问题**：应该先检查 `Cluster != nil`，再调用 `RefreshCtxCluster`
+9. ❌ **缺少状态回滚机制**：Condition 已标记但同步失败，没有回滚
+10. ❌ **缺少错误聚合**：多个错误只保留最后一个
+
+这些问题可能导致：
+- **原始错误丢失**，排查困难
+- **Controller 崩溃**（Panic）
+- **状态不一致**
+- **错误优先级混乱**
+- **无法优雅处理异常**
+
+建议按照上述改进方案进行修复，提高代码的健壮性、可维护性和可观测性。特别是**错误覆盖问题**和**Panic 风险**，这两个问题可能导致严重的生产事故。
+        
