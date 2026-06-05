@@ -1875,4 +1875,1385 @@ func GetControlPlaneInitBKEMachine(ctx context.Context, c client.Client,
 - 通过 BKEMachineTemplate 定义控制平面节点的规格
 - 自动添加控制平面 Label 用于识别
 
+# 项目中KubeadmControlPlane的使用情况
+
+## 一、已使用的功能
+
+### 1. **MachineTemplate（机器模板）**
+- **用途**：用于创建控制平面节点的模板定义
+- **代码位置**：[bkemachine_controller_phases.go](file:////cluster-api-provider-bke/controllers/capbke/bkemachine_controller_phases.go)
+- **说明**：通过KCP的MachineTemplate创建Master节点
+
+### 2. **Version（Kubernetes版本）**
+- **用途**：指定控制平面节点的Kubernetes版本
+- **代码位置**：在升级场景中会读取和设置版本信息
+- **说明**：用于版本管理和升级流程
+
+### 3. **Replicas（副本数）**
+- **用途**：控制控制平面节点的数量
+- **代码位置**：[ensure_cluster_manage.go:452](file:////cluster-api-provider-bke/pkg/phaseframe/phases/ensure_cluster_manage.go#L452)
+```go
+kcp.Spec.Replicas = &replicas
+```
+- **说明**：用于扩缩容场景，更新Master节点数量
+
+### 4. **KubeadmConfigSpec（Kubeadm配置）**
+- **用途**：同步Kubeadm配置到每个节点的KubeadmConfig
+- **代码位置**：[bkemachine_controller_phases.go:295-297](file:////cluster-api-provider-bke/controllers/capbke/bkemachine_controller_phases.go#L295-L297)
+```go
+clusterConfiguration := kcp.Spec.KubeadmConfigSpec.ClusterConfiguration.DeepCopy()
+initConfiguration := kcp.Spec.KubeadmConfigSpec.InitConfiguration.DeepCopy()
+joinConfiguration := kcp.Spec.KubeadmConfigSpec.JoinConfiguration.DeepCopy()
+```
+- **说明**：将KCP中的配置同步到每个节点的KubeadmConfig，包括：
+  - ClusterConfiguration：集群级别配置
+  - InitConfiguration：初始化配置
+  - JoinConfiguration：加入集群配置
+
+### 5. **Pause/Resume（暂停/恢复）**
+- **用途**：在升级、扩缩容等操作时暂停KCP控制器
+- **代码位置**：[ensure_paused.go:144](file:////cluster-api-provider-bke/pkg/phaseframe/phases/ensure_paused.go#L144)
+```go
+if kcp != nil {
+    if err := phaseutil.PauseClusterAPIObj(params.Ctx, params.Client, kcp); err != nil {
+        return err
+    }
+}
+```
+- **说明**：通过设置paused annotation来暂停KCP控制器
+
+## 二、未使用的功能
+
+### 1. **RolloutStrategy/RollingUpdate（滚动升级策略）**
+- **功能**：KCP内置的声明式滚动升级能力
+- **标准做法**：只需修改`kcp.Spec.Version`，KCP控制器自动编排滚动升级
+```go
+// CAPI标准方式：只需修改Version字段
+kcp.Spec.Version = newVersion
+// KCP控制器自动处理：创建新Machine → 等待就绪 → 驱逐Pod → 删除旧Machine
+```
+- **项目现状**：自研了400+行的[ensure_master_upgrade.go](file:////cluster-api-provider-bke/pkg/phaseframe/phases/ensure_master_upgrade.go)，使用命令式方式手动编排升级
+
+### 2. **RemediationStrategy（自动修复策略）**
+- **功能**：节点故障时自动修复（重建/替换）
+- **项目现状**：未使用，项目有自己的节点管理机制
+
+### 3. **Status相关功能**
+- **功能**：如`kcp.Status.Version`、`kcp.Status.Replicas`、`kcp.Status.Ready`等
+- **项目现状**：未使用KCP的Status，而是使用BKECluster的Status来管理状态
+
+### 4. **RolloutAfter（延迟滚动升级）**
+- **功能**：指定在某个时间点后才开始滚动升级
+- **项目现状**：未使用
+
+### 5. **NodeDrainTimeout（节点排空超时）**
+- **功能**：控制节点排空Pod的超时时间
+- **项目现状**：未使用，项目有自己的节点排空逻辑
+
+## 三、不使用的原因
+
+### 1. **历史架构设计选择**
+项目采用了**命令式**而非声明式的升级方式：
+- **命令式**：通过Phase手动编排升级流程（PreCheck → EtcdBackup → MasterRollout → WorkerRollout → PostCheck）
+- **声明式**：只需修改Spec，控制器自动处理
+
+### 2. **更精细的控制需求**
+项目需要更精细的升级控制：
+- **Etcd备份**：升级前必须备份Etcd
+- **逐节点升级**：手动控制每个节点的升级顺序和状态
+- **错误处理**：单个节点失败时的特定处理逻辑
+- **状态追踪**：通过BKECluster.Status追踪升级进度
+
+### 3. **绕过CAPI声明式能力**
+从[ensure_paused.go](file:////cluster-api-provider-bke/pkg/phaseframe/phases/ensure_paused.go)可以看到：
+```go
+// 升级/扩缩容阶段不恢复CAPI对象，由自研Phase接管
+if params.BKECluster.Status.Phase == bkev1beta1.Scale || 
+   params.BKECluster.Status.Phase == bkev1beta1.UpgradeControlPlane || 
+   params.BKECluster.Status.Phase == bkev1beta1.UpgradeWorker {
+    return nil  // 不恢复，继续由自研Phase控制
+}
+```
+项目通过**暂停KCP**，然后使用自研Phase来接管控制权。
+
+### 4. **代码复杂度对比**
+根据[code/clusterapi/question.md](file:////github/cluster-api-provider-bke/code/clusterapi/question.md)的分析：
+
+| 功能 | BKE实现 | CAPI标准方式 | 差距 |
+|------|---------|-------------|------|
+| Master升级 | 400+行（ensure_master_upgrade.go） | **1行**（`kcp.Spec.Version = newVersion`） | 命令式 vs 声明式 |
+
+## 四、总结
+
+**核心原因**：项目选择了**命令式编排**而非**声明式自动化**的架构路线。
+
+**优点**：
+- 更精细的升级控制
+- 自定义的升级流程（如Etcd备份）
+- 特定的错误处理逻辑
+
+**缺点**：
+- 代码量大（400+行 vs 1行）
+- 维护成本高
+- 绕过了CAPI的标准能力
+- 与CAPI生态的集成度较低
+
+**建议**：可以考虑逐步迁移到使用KCP的RolloutStrategy，减少自研代码量，更好地利用CAPI生态能力。
+
+# 暂停KCP控制器的设计原因以及升级、扩缩容的实际流程
+
+## 一、暂停KCP控制器的设计原因
+
+### 1. **核心设计理念：命令式 vs 声明式**
+
+项目选择了**命令式编排**而非CAPI标准的**声明式自动化**：
+```go
+// ensure_paused.go:155-161
+// 升级/扩缩容阶段不恢复CAPI对象，由自研Phase接管
+if params.BKECluster.Status.Phase == bkev1beta1.Scale || 
+   params.BKECluster.Status.Phase == bkev1beta1.UpgradeControlPlane || 
+   params.BKECluster.Status.Phase == bkev1beta1.UpgradeWorker {
+    return nil  // 不恢复，继续由自研Phase控制
+}
+```
+
+### 2. **暂停的三个层次**
+
+从[ensure_paused.go](file:///cluster-api-provider-bke/pkg/phaseframe/phases/ensure_paused.go)可以看到，暂停操作分为三个层次：
+
+#### **层次1：BKECluster暂停状态同步**
+```go
+// syncBKEClusterPauseStatus - 同步BKECluster的暂停状态
+if params.BKECluster.Spec.Pause {
+    annotation.SetAnnotation(currentCombinedBKECluster, annotation.BKEClusterPauseAnnotationKey, "true")
+} else {
+    annotation.RemoveAnnotation(currentCombinedBKECluster, annotation.BKEClusterPauseAnnotationKey)
+}
+```
+
+#### **层次2：Command暂停**
+```go
+// pauseOrResumeCommands - 暂停或恢复集群中的命令
+for _, cmd := range commandLi.Items {
+    if cmd.Spec.Suspend != params.BKECluster.Spec.Pause {
+        cmd.Spec.Suspend = params.BKECluster.Spec.Pause
+        // 更新Command
+    }
+}
+```
+
+#### **层次3：CAPI对象暂停**
+```go
+// pauseOrResumeClusterAPIObjs - 暂停或恢复KCP和MachineDeployment
+if params.BKECluster.Spec.Pause {
+    // 暂停KCP
+    if kcp != nil {
+        phaseutil.PauseClusterAPIObj(params.Ctx, params.Client, kcp)
+    }
+    // 暂停MachineDeployment
+    if md != nil {
+        phaseutil.PauseClusterAPIObj(params.Ctx, params.Client, md)
+    }
+}
+```
+
+### 3. **为什么需要暂停KCP？**
+
+#### **原因1：避免控制权冲突**
+- **CAPI声明式**：修改`kcp.Spec.Version`后，KCP控制器自动创建新Machine、删除旧Machine
+- **BKE命令式**：需要手动控制每个节点的升级顺序、状态追踪、错误处理
+- **冲突点**：如果不暂停KCP，KCP控制器可能会在BKE Phase执行过程中创建/删除Machine，导致状态混乱
+
+#### **原因2：需要前置操作**
+从[ensure_master_upgrade.go:99-115](file:////cluster-api-provider-bke/pkg/phaseframe/phases/ensure_master_upgrade.go#L99-L115)可以看到：
+```go
+// 检查etcd配置
+specNodes, _ := e.Ctx.NodeFetcher().GetNodesForBKECluster(e.Ctx, bkeCluster)
+needBackupEtcd := false
+backEtcdNode := confv1beta1.Node{}
+etcdNodes := specNodes.Etcd()
+if etcdNodes.Length() != 0 {
+    needBackupEtcd = true
+    backEtcdNode = etcdNodes[0]
+    log.Info("backup etcd data to node %s", phaseutil.NodeInfo(backEtcdNode))
+}
+
+// 确保etcd advertise client urls annotation
+if err := e.ensureEtcdAdvertiseClientUrlsAnnotation(etcdNodes); err != nil {
+    return ctrl.Result{}, errors.Errorf("ensure etcd advertise client urls annotation failed, err: %v", err)
+}
+```
+**CAPI标准方式不支持**：
+- Etcd备份
+- 自定义前置检查
+- 特定的Annotation设置
+
+#### **原因3：精细的节点状态管理**
+从[ensure_master_upgrade.go:207-226](file:////cluster-api-provider-bke/pkg/phaseframe/phases/ensure_master_upgrade.go#L207-L226)可以看到：
+```go
+for _, node := range params.NeedUpgradeNodes {
+    // 标记节点为升级中
+    nodeFetcher.SetNodeStateWithMessageForCluster(params.Ctx, params.BKECluster, node.IP, bkev1beta1.NodeUpgrading, "Upgrading")
+    
+    if err := e.upgradeNode(...); err != nil {
+        // 标记节点升级失败
+        nodeFetcher.SetNodeStateWithMessageForCluster(params.Ctx, params.BKECluster, node.IP, bkev1beta1.NodeUpgradeFailed, err.Error())
+        return errors.Errorf("upgrade node %q failed: %v", phaseutil.NodeInfo(node), err)
+    }
+    
+    // 标记节点升级成功
+    nodeFetcher.SetNodeStateWithMessageForCluster(params.Ctx, params.BKECluster, node.IP, bkev1beta1.NodeNotReady, "Upgrading success")
+}
+```
+**BKE需要追踪每个节点的状态**：
+- NodeUpgrading：升级中
+- NodeUpgradeFailed：升级失败
+- NodeNotReady：升级成功但未就绪
+
+**CAPI标准方式**：只提供Cluster级别的状态，不提供节点级别的细粒度状态
+
+#### **原因4：错误处理策略不同**
+```go
+// BKE方式：单个节点失败，停止整个升级流程
+if err := e.upgradeNode(...); err != nil {
+    return errors.Errorf("upgrade node %q failed: %v", phaseutil.NodeInfo(node), err)
+}
+```
+**CAPI标准方式**：继续尝试升级其他节点，只标记失败的Machine
+
+## 二、升级流程
+
+### 1. **升级Phase流程图**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    升级流程触发                              │
+│  BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion    │
+│            != Status.KubernetesVersion                      │
+└────────────────────┬────────────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────────────┐
+│              EnsurePaused (暂停CAPI对象)                     │
+│  - 暂停KCP                                                   │
+│  - 暂停MachineDeployment                                     │
+│  - 暂停所有Command                                           │
+└────────────────────┬────────────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────────────┐
+│           EnsureMasterUpgrade (Master节点升级)                │
+│  1. 检查版本差异                                              │
+│  2. 获取需要升级的Master节点                                   │
+│  3. Etcd备份（如果需要）                                       │
+│  4. 逐节点升级                                                │
+│  5. 更新Status.KubernetesVersion                             │
+└────────────────────┬────────────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────────────┐
+│           EnsureWorkerUpgrade (Worker节点升级)                │
+│  1. 获取需要升级的Worker节点                                   │
+│  2. 逐节点升级                                                │
+└────────────────────┬────────────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────────────┐
+│              EnsurePaused (恢复CAPI对象)                      │
+│  - 恢复KCP                                                   │
+│  - 恢复MachineDeployment                                     │
+│  - 恢复所有Command                                           │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 2. **Master升级详细流程**
+
+从[list.go:59-65](file:////cluster-api-provider-bke/pkg/phaseframe/phases/list.go#L59-L65)和[ensure_master_upgrade.go](file:////cluster-api-provider-bke/pkg/phaseframe/phases/ensure_master_upgrade.go)可以看到：
+```go
+ClusterUpgradePhaseNames = []confv1beta1.BKEClusterPhase{
+    EnsureAgentUpgradeName,        // 1. BKEAgent升级
+    EnsureContainerdUpgradeName,   // 2. Containerd升级
+    EnsureMasterUpgradeName,       // 3. Master升级
+    EnsureWorkerUpgradeName,       // 4. Worker升级
+    EnsureComponentUpgradeName,    // 5. 组件升级
+}
+```
+
+#### **步骤1：版本检查**
+```go
+func (e *EnsureMasterUpgrade) reconcileMasterUpgrade() (ctrl.Result, error) {
+    if bkeCluster.Spec.ClusterConfig.Cluster.KubernetesVersion != bkeCluster.Status.KubernetesVersion {
+        return e.rolloutUpgrade()
+    }
+    // 版本相同，无需升级
+    return ctrl.Result{}, nil
+}
+```
+
+#### **步骤2：获取需要升级的节点**
+```go
+func (e *EnsureMasterUpgrade) getNeedUpgradeNodes(...) (bkenode.Nodes, error) {
+    // 从API server获取BKENodes
+    bkeNodes, err := e.Ctx.NodeFetcher().GetBKENodesWrapperForCluster(e.Ctx, bkeCluster)
+    
+    // 过滤出需要升级的Master节点
+    nodes := phaseutil.GetNeedUpgradeMasterNodesWithBKENodes(bkeCluster, bkeNodes)
+    
+    // 检查节点Agent是否就绪
+    for _, node := range nodes {
+        nodeState, _ := e.Ctx.NodeFetcher().GetNodeStateFlagForCluster(...)
+        if !nodeState {
+            continue  // Agent未就绪，跳过
+        }
+        needUpgradeNodes = append(needUpgradeNodes, node)
+    }
+    return needUpgradeNodes, nil
+}
+```
+
+#### **步骤3：Etcd备份**
+```go
+// 检查是否有独立的Etcd节点
+etcdNodes := specNodes.Etcd()
+if etcdNodes.Length() != 0 {
+    needBackupEtcd = true
+    backEtcdNode = etcdNodes[0]
+    // 备份Etcd数据
+}
+```
+
+#### **步骤4：逐节点升级**
+```go
+for _, node := range params.NeedUpgradeNodes {
+    // 1. 获取远程节点信息
+    remoteNode, err := phaseutil.GetRemoteNodeByBKENode(...)
+    
+    // 2. 检查是否已经是期望版本
+    if remoteNode.Status.NodeInfo.KubeletVersion == desiredVersion {
+        continue  // 已是期望版本，跳过
+    }
+    
+    // 3. 标记节点为升级中
+    nodeFetcher.SetNodeStateWithMessageForCluster(..., bkev1beta1.NodeUpgrading, "Upgrading")
+    
+    // 4. 执行升级
+    if err := e.upgradeNode(...); err != nil {
+        // 标记失败并返回
+        nodeFetcher.SetNodeStateWithMessageForCluster(..., bkev1beta1.NodeUpgradeFailed, err.Error())
+        return err
+    }
+    
+    // 5. 标记升级成功
+    nodeFetcher.SetNodeStateWithMessageForCluster(..., bkev1beta1.NodeNotReady, "Upgrading success")
+}
+```
+
+#### **步骤5：更新版本状态**
+```go
+// Master始终是最后更新完的，这时候更改Status的版本
+bkeCluster.Status.KubernetesVersion = bkeCluster.Spec.ClusterConfig.Cluster.KubernetesVersion
+```
+
+## 三、扩缩容流程
+
+### 1. **扩容流程**
+
+从[list.go:88-99](file:////cluster-api-provider-bke/pkg/phaseframe/phases/list.go#L88-L99)可以看到：
+```go
+// Master扩容
+ClusterScaleMasterUpPhaseNames = []confv1beta1.BKEClusterPhase{
+    EnsureMasterJoinName,  // Master节点加入集群
+}
+
+// Worker扩容
+ClusterScaleWorkerUpPhaseNames = []confv1beta1.BKEClusterPhase{
+    EnsureWorkerJoinName,  // Worker节点加入集群
+}
+```
+
+#### **Master扩容流程**
+```
+用户修改BKECluster.Spec.Master.Replicas
+           │
+           ▼
+    EnsurePaused (暂停KCP)
+           │
+           ▼
+  EnsureClusterManage (集群管理)
+   - 更新KCP Replicas
+   - 等待新Master节点创建
+           │
+           ▼
+  EnsureMasterJoin (Master加入)
+   - 选择节点
+   - 创建Bootstrap Command
+   - 等待节点就绪
+           │
+           ▼
+    EnsurePaused (恢复KCP)
+```
+从[ensure_cluster_manage.go:448-455](file:////cluster-api-provider-bke/pkg/phaseframe/phases/ensure_cluster_manage.go#L448-L455)：
+```go
+// updateKubeadmControlPlaneReplicas 更新KCP副本数
+func (e *EnsureClusterManage) updateKubeadmControlPlaneReplicas(ctx context.Context, c client.Client, replicas int32) error {
+    kcp, err := phaseutil.GetClusterAPIKubeadmControlPlane(ctx, c, e.Ctx.Cluster)
+    if err != nil {
+        return err
+    }
+    kcp.Spec.Replicas = &replicas  // 更新副本数
+    return phaseutil.ResumeClusterAPIObj(ctx, c, kcp)
+}
+```
+
+### 2. **缩容流程**
+
+从[list.go:72-86](file:////cluster-api-provider-bke/pkg/phaseframe/phases/list.go#L72-L86)：
+```go
+// Master缩容
+ClusterScaleMasterDownPhaseNames = []confv1beta1.BKEClusterPhase{
+    EnsureMasterDeleteName,  // Master节点删除
+}
+
+// Worker缩容
+ClusterScaleWorkerDownPhaseNames = []confv1beta1.BKEClusterPhase{
+    EnsureWorkerDeleteName,  // Worker节点删除
+}
+```
+
+#### **缩容流程**
+```
+用户减少BKECluster.Spec.Master.Replicas
+           │
+           ▼
+    EnsurePaused (暂停KCP)
+           │
+           ▼
+  EnsureMasterDelete (Master删除)
+   - 选择要删除的节点
+   - 驱逐节点上的Pod
+   - 删除节点
+   - 更新KCP Replicas
+           │
+           ▼
+    EnsurePaused (恢复KCP)
+```
+
+### 3. **状态管理**
+
+从[phase_flow.go:319-343](file:////cluster-api-provider-bke/pkg/phaseframe/phases/phase_flow.go#L319-L343)可以看到状态转换：
+```go
+case phaseName.In(ClusterScaleMasterUpPhaseNames):
+    handleClusterScaleMasterUpPhase(ctx, err)  // Master扩容状态
+case phaseName.In(ClusterScaleWorkerUpPhaseNames):
+    handleClusterScaleWorkerUpPhase(ctx, err)  // Worker扩容状态
+case phaseName.In(ClusterScaleMasterDownPhaseNames):
+    handleClusterScaleMasterDownPhase(ctx, err)  // Master缩容状态
+case phaseName.In(ClusterScaleWorkerDownPhaseNames):
+    handleClusterScaleWorkerDownPhase(ctx, err)  // Worker缩容状态
+```
+
+状态设置：
+```go
+func handleClusterScaleMasterUpPhase(ctx *phaseframe.PhaseContext, err error) {
+    if err != nil {
+        ctx.BKECluster.Status.ClusterStatus = bkev1beta1.ClusterScaleFailed
+    } else {
+        ctx.BKECluster.Status.ClusterStatus = bkev1beta1.ClusterMasterScalingUp
+    }
+}
+```
+
+## 四、总结
+
+### **暂停KCP的核心原因**
+
+1. **控制权接管**：BKE使用命令式编排，需要完全控制节点生命周期
+2. **前置操作**：需要执行Etcd备份、Annotation设置等CAPI不支持的操作
+3. **精细状态管理**：需要追踪每个节点的详细状态
+4. **错误处理策略**：单个节点失败时停止整个流程，而非继续尝试
+
+### **升级流程特点**
+- **命令式编排**：手动控制每个步骤
+- **前置检查**：Etcd备份、Agent就绪检查
+- **逐节点升级**：一个节点升级完成后才升级下一个
+- **状态追踪**：详细的节点级别状态
+
+### **扩缩容流程特点**
+- **暂停CAPI对象**：避免控制权冲突
+- **Phase接管**：使用自研Phase控制节点加入/删除
+- **状态管理**：详细的集群状态追踪
+
+这种设计虽然增加了代码复杂度，但提供了更精细的控制能力和更详细的错误处理机制。
+
+
+# 节点故障自动修复功能的禁用方式以及项目自己的节点管理机制
+
+## 一、CAPI自动修复功能的禁用方式
+
+### 1. **根本未创建MachineHealthCheck资源**
+
+CAPI的自动修复功能通过**MachineHealthCheck**资源实现，但项目中：
+```go
+// 搜索结果显示：项目中没有创建任何MachineHealthCheck资源
+// Grep "MachineHealthCheck" 结果：仅在文档中提及，代码中未使用
+```
+**禁用方式**：通过**不创建MachineHealthCheck CR**来完全禁用CAPI的自动修复功能。
+
+### 2. **CAPI标准自动修复机制**
+
+CAPI的MachineHealthCheck工作原理：
+```yaml
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineHealthCheck
+metadata:
+  name: worker-health-check
+spec:
+  clusterName: my-cluster
+  selector:
+    matchLabels:
+      node-role.kubernetes.io/worker: ""
+  unhealthyConditions:
+    - type: Ready
+      status: Unknown
+      timeout: 300s
+    - type: Ready
+      status: "False"
+      timeout: 300s
+  remediationStrategy:
+    maxUnhealthy: 40%  # 最多40%节点不健康时才修复
+```
+**功能**：
+- 监控Machine的健康状态
+- 当节点不健康超过timeout时，自动删除Machine
+- Machine Controller会创建新的Machine来替换
+
+**项目未使用的原因**：
+1. 需要更精细的控制（如Etcd备份）
+2. 需要自定义的修复逻辑
+3. 需要节点级别的状态追踪
+
+## 二、项目自己的节点管理机制
+
+### 1. **节点状态标记系统**
+
+从[bkecluster_consts.go:235-244](file:////cluster-api-provider-bke/api/capbke/v1beta1/bkecluster_consts.go#L235-L244)可以看到：
+```go
+const (
+    NodeAgentPushedFlag = 1 << iota  // 1 << 0 = 1
+    NodeAgentReadyFlag               // 1 << 1 = 2
+    NodeEnvFlag                      // 1 << 2 = 4
+    NodeBootFlag                     // 1 << 3 = 8
+    NodeHAFlag                       // 1 << 4 = 16
+    MasterInitFlag                   // 1 << 5 = 32
+    NodeDeletingFlag                 // 1 << 6 = 64
+    NodeFailedFlag                   // 1 << 7 = 128 (关键！)
+    NodeStateNeedRecord              // 1 << 8 = 256
+    NodePostProcessFlag              // 1 << 9 = 512
+)
+```
+**NodeFailedFlag的作用**：
+- 使用**位掩码**方式标记节点失败状态
+- 可以组合多个状态（如 `NodeFailedFlag | NodeBootFlag`）
+- 失败节点会被跳过后续操作
+
+### 2. **StatusManager状态管理器**
+
+从[statusmanager.go:1-80](file:////cluster-api-provider-bke/pkg/statusmanage/statusmanager.go#L1-L80)和[statusmanager.go:330-360](file:///c:/Users/z00820145/code/github/cluster-api-provider-bke/pkg/statusmanage/statusmanager.go#L330-L360)：
+```go
+// StatusManager 使用单例模式管理状态
+type StatusManager struct {
+    cmux sync.RWMutex
+    nmux sync.RWMutex
+    
+    BKEClusterStatusMap map[string]*StatusRecord
+    BKENodesStatusMap   map[string]map[string]*StatusRecord
+}
+
+// 失败处理逻辑
+if sr.AllowFailed() {
+    // 允许重试：恢复到上一个正常状态
+    bkeNodes.SetNodeState(nodeIP, confv1beta1.NodeState(sr.LatestNormalState))
+    sr.NeedRequeue = true
+    return
+} else {
+    // 超过重试次数：标记为永久失败
+    log.Infof("(node %s) The failedStatus %s occur more than %d times, not allow to retry", 
+        phaseutil.NodeInfo(bkeNode.ToNode()), sr.LatestFailedState, ReconcileAllowedFailedCount)
+    
+    sr.Reset()
+    sr.NeedRequeue = false
+    
+    // 标记失败，后续所有调谐跳过该节点
+    bkeNodes.SetNodeState(nodeIP, confv1beta1.NodeState(state))
+    bkeNodes.MarkNodeStateFlag(nodeIP, bkev1beta1.NodeFailedFlag)
+}
+```
+
+**关键参数**：
+```go
+const DefaultAllowedFailedCount = 10  // 默认允许失败10次
+
+// 可通过环境变量配置
+env, b := os.LookupEnv("ALLOWED_FAILED_COUNT")
+```
+
+**工作流程**：
+```
+节点操作失败
+    │
+    ▼
+检查失败次数 < AllowedFailedCount?
+    │
+    ├─ Yes → AllowFailed() = true
+    │         ├─ 恢复到上一个正常状态
+    │         ├─ NeedRequeue = true
+    │         └─ 控制器会重新调谐
+    │
+    └─ No → AllowFailed() = false
+             ├─ 标记 NodeFailedFlag
+             ├─ NeedRequeue = false
+             └─ 后续调谐跳过该节点
+```
+
+### 3. **失败节点的跳过逻辑**
+
+从[bkemachine_controller.go:239-243](file:////cluster-api-provider-bke/controllers/capbke/bkemachine_controller.go#L239-L243)：
+```go
+// 查询bkemachine关联的node，如果关联的节点目前状态被标记了失败状态码，则直接返回
+hostIp, found := labelhelper.CheckBKEMachineLabel(params.BKEMachine)
+if found {
+    hasFailedFlag, err := r.NodeFetcher.GetNodeStateFlagForCluster(params.Ctx, params.BKECluster, hostIp, bkev1beta1.NodeFailedFlag)
+    if err == nil && hasFailedFlag {
+        return ctrl.Result{}, nil  // 直接返回，跳过该节点
+    }
+}
+```
+**效果**：被标记为失败的节点会被所有Phase跳过，不再执行任何操作。
+
+### 4. **手动重试机制**
+
+从[bkecluster_controller.go:580-630](file:////cluster-api-provider-bke/controllers/capbke/bkecluster_controller.go#L580-L630)：
+```go
+// processAllNodesRetry 处理所有节点的重试逻辑
+func (r *BKEClusterReconciler) processAllNodesRetry(ctx context.Context, bkeCluster *bkev1beta1.BKECluster) {
+    nodeStates, err := r.NodeFetcher.GetNodeStatesForBKECluster(ctx, bkeCluster)
+    
+    // 清理所有节点的失败状态
+    for _, nodeState := range nodeStates {
+        hasFailedFlag, err := r.NodeFetcher.GetNodeStateFlagForCluster(ctx, bkeCluster, nodeState.Node.IP, bkev1beta1.NodeFailedFlag)
+        if hasFailedFlag {
+            // 移除失败标记
+            if err := r.NodeFetcher.UnmarkNodeStateFlagForCluster(ctx, bkeCluster, nodeState.Node.IP, bkev1beta1.NodeFailedFlag); err != nil {
+                log.Warnf("Failed to unmark node state flag for node %s: %v", nodeState.Node.IP, err)
+            }
+        }
+    }
+    
+    // 重置状态管理器
+    statusmanage.BKEClusterStatusManager.RemoveClusterStatusManagerCache(bkeCluster)
+}
+
+// processSpecificNodesRetry 处理指定节点的重试逻辑
+func (r *BKEClusterReconciler) processSpecificNodesRetry(ctx context.Context, bkeCluster *bkev1beta1.BKECluster, retryNodeIPs string) {
+    retryNodes := strings.Split(retryNodeIPs, ",")
+    
+    // 清理指定节点的失败状态
+    for _, nodeIP := range retryNodes {
+        hasFailedFlag, err := r.NodeFetcher.GetNodeStateFlagForCluster(ctx, bkeCluster, nodeIP, bkev1beta1.NodeFailedFlag)
+        if hasFailedFlag {
+            // 移除失败标记
+            r.NodeFetcher.UnmarkNodeStateFlagForCluster(ctx, bkeCluster, nodeIP, bkev1beta1.NodeFailedFlag)
+        }
+        // 移除节点状态缓存
+        statusmanage.BKEClusterStatusManager.RemoveSingleNodeStatusCache(bkeCluster, nodeIP)
+    }
+}
+```
+
+**触发方式**：通过Annotation触发
+```go
+// 检查重试annotation
+if annotation.HasAnnotation(bkeCluster, annotation.RetryAnnotationKey) {
+    retryValue := annotation.GetAnnotation(bkeCluster, annotation.RetryAnnotationKey)
+    
+    if retryValue == "all" {
+        // 重试所有节点
+        r.processAllNodesRetry(ctx, bkeCluster)
+    } else {
+        // 重试指定节点（IP列表）
+        r.processSpecificNodesRetry(ctx, bkeCluster, retryValue)
+    }
+    
+    // 移除retry annotation
+    annotation.RemoveAnnotation(cluster, annotation.RetryAnnotationKey)
+}
+```
+
+**使用方式**：
+```bash
+# 重试所有节点
+kubectl annotate bkecluster my-cluster retry=all
+
+# 重试指定节点
+kubectl annotate bkecluster my-cluster retry=192.168.1.10,192.168.1.11
+```
+
+### 5. **节点状态监听**
+
+从[node.go:21-50](file:////cluster-api-provider-bke/utils/capbke/predicates/node.go#L21-L50)：
+```go
+func NodeNotReadyPredicate() predicate.Funcs {
+    return predicate.Funcs{
+        UpdateFunc: func(e event.UpdateEvent) bool {
+            oldObj := e.ObjectOld.(*corev1.Node)
+            newObj := e.ObjectNew.(*corev1.Node)
+            
+            oldCondition := getNodeCondition(oldObj, corev1.NodeReady)
+            newCondition := getNodeCondition(newObj, corev1.NodeReady)
+            
+            // 只在Ready状态变化时触发
+            if oldCondition.Status == newCondition.Status {
+                return false
+            }
+            return true
+        },
+        
+        CreateFunc: func(e event.CreateEvent) bool {
+            obj := e.Object.(*corev1.Node)
+            condition := getNodeCondition(obj, corev1.NodeReady)
+            // 创建时如果是NotReady状态，触发调谐
+            return condition != nil && condition.Status == corev1.ConditionUnknown
+        },
+    }
+}
+```
+**用途**：监听目标集群节点状态变化，触发BKECluster Controller调谐。
+
+## 三、节点状态流转图
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    节点操作执行                              │
+│  (Bootstrap/Upgrade/Delete/etc)                             │
+└────────────────────┬────────────────────────────────────────┘
+                     │
+                     ▼
+            ┌────────────────┐
+            │  操作是否成功？  │
+            └────┬───────┬────┘
+                 │       │
+            成功 │       │ 失败
+                 │       │
+                 ▼       ▼
+    ┌──────────────┐  ┌──────────────────────┐
+    │ 设置正常状态  │  │  StatusManager记录    │
+    │ NodeReady    │  │  失败次数 + 1         │
+    └──────────────┘  └──────────┬───────────┘
+                                 │
+                                 ▼
+                    ┌────────────────────────┐
+                    │ 失败次数 < MaxAllowed?  │
+                    └────┬───────────┬───────┘
+                         │           │
+                    Yes  │           │ No
+                         │           │
+                         ▼           ▼
+            ┌──────────────────┐  ┌─────────────────────┐
+            │ AllowFailed=true │  │ AllowFailed=false   │
+            │ 恢复正常状态      │  │ 标记NodeFailedFlag  │
+            │ NeedRequeue=true │  │ NeedRequeue=false   │
+            └──────────────────┘  │ 跳过后续所有操作     │
+                                  └─────────────────────┘
+                                           │
+                                           ▼
+                                  ┌────────────────────┐
+                                  │ 等待手动重试        │
+                                  │ (retry annotation) │
+                                  └────────────────────┘
+```
+
+## 四、与CAPI自动修复的对比
+
+| 特性 | CAPI MachineHealthCheck | BKE节点管理机制 |
+|------|------------------------|----------------|
+| **触发方式** | 自动（节点不健康超过timeout） | 手动（通过annotation） |
+| **修复策略** | 删除Machine，创建新Machine | 清除失败标记，重新调谐 |
+| **状态追踪** | Machine级别 | 节点级别（IP + 状态码） |
+| **重试控制** | 无重试，直接替换 | 允许失败N次后标记永久失败 |
+| **自定义逻辑** | 有限（仅unhealthyConditions） | 完全自定义（Phase编排） |
+| **前置操作** | 无 | 支持（如Etcd备份） |
+| **状态持久化** | Machine.Status | BKENode.Status.StateCode |
+
+## 五、总结
+
+### **禁用CAPI自动修复的方式**
+- **不创建MachineHealthCheck资源**：完全绕过CAPI的自动修复机制
+- **使用自研的节点管理机制**：提供更精细的控制
+
+### **项目节点管理机制的核心特点**
+
+1. **失败标记系统**：
+   - 使用位掩码标记节点状态
+   - NodeFailedFlag标记永久失败节点
+   - 失败节点被所有Phase跳过
+2. **自动重试机制**：
+   - 允许失败N次（默认10次）
+   - 失败次数内自动恢复并重试
+   - 超过次数标记为永久失败
+3. **手动重试支持**：
+   - 通过annotation触发
+   - 支持重试所有节点或指定节点
+   - 清除失败标记和状态缓存
+4. **状态监听**：
+   - NodeNotReadyPredicate监听节点状态变化
+   - 触发控制器调谐处理异常
+
+这种设计提供了比CAPI更灵活的节点管理能力，但也增加了代码复杂度。
+
+# 说明扩缩容是否使用了KubeadmControlPlane的能力。
+
+## 一、扩缩容对CAPI能力的使用情况
+
+### **结论：部分使用，混合模式**
+
+扩缩容采用了**混合模式**：
+- ✅ **使用**：KCP/MachineDeployment的Replicas字段来触发扩缩容
+- ❌ **未使用**：CAPI控制器的自动管理能力（暂停后由自研Phase接管）
+
+## 二、Master扩容流程分析
+
+### 1. **使用KCP Replicas触发扩容**
+
+从[ensure_cluster_manage.go:447-452](file:////cluster-api-provider-bke/pkg/phaseframe/phases/ensure_cluster_manage.go#L447-L452)：
+```go
+// updateKubeadmControlPlaneReplicas 更新KubeadmControlPlane副本数
+func (e *EnsureClusterManage) updateKubeadmControlPlaneReplicas(ctx context.Context, c client.Client, replicas int32) error {
+    kcp, err := phaseutil.GetClusterAPIKubeadmControlPlane(ctx, c, e.Ctx.Cluster)
+    if err != nil {
+        return err
+    }
+    kcp.Spec.Replicas = &replicas  // ✅ 使用KCP的Replicas字段
+    return phaseutil.ResumeClusterAPIObj(ctx, c, kcp)
+}
+```
+
+### 2. **但暂停KCP后由自研Phase接管**
+
+从[ensure_master_join.go:1-100](file:////cluster-api-provider-bke/pkg/phaseframe/phases/ensure_master_join.go#L1-L100)：
+```go
+// EnsureMasterJoin Phase接管Master节点加入流程
+func (e *EnsureMasterJoin) Execute() (ctrl.Result, error) {
+    if err := e.reconcileMasterJoin(); err != nil {
+        return ctrl.Result{}, err
+    }
+    return ctrl.Result{}, nil
+}
+
+func (e *EnsureMasterJoin) NeedExecute(old *bkev1beta1.BKECluster, new *bkev1beta1.BKECluster) bool {
+    // 检查是否有需要加入的Master节点
+    nodes := phaseutil.GetNeedJoinMasterNodesWithBKENodes(new, bkeNodes)
+    
+    // 第一种情况：首次创建集群，此时masterInited为false,nodes=1,返回false
+    // 第二种情况：集群已经初始化，此时masterInited为true,nodes=0,返回false
+    // 第三种情况：master没有初始化，此时masterInited为false,nodes=0,返回false
+    
+    e.SetStatus(bkev1beta1.PhaseWaiting)
+    return true
+}
+```
+
+### 3. **Master扩容完整流程**
+
+```
+用户修改BKECluster.Spec.Master.Replicas
+           │
+           ▼
+    EnsurePaused (暂停KCP)
+           │
+           ▼
+  EnsureClusterManage
+   ├─ updateKubeadmControlPlaneReplicas
+   │   └─ kcp.Spec.Replicas = &replicas  ✅ 使用KCP能力
+   ├─ waitForClusterInfrastructureReady
+   └─ waitForMasterNodesBootstrap
+           │
+           ▼
+  EnsureMasterJoin (自研Phase接管)
+   ├─ 选择节点
+   ├─ 创建Bootstrap Command
+   ├─ 等待节点就绪
+   └─ 标记节点状态
+           │
+           ▼
+    EnsurePaused (恢复KCP)
+```
+**关键点**：
+- ✅ 使用了`kcp.Spec.Replicas`触发扩容
+- ❌ 但暂停了KCP控制器，由EnsureMasterJoin Phase控制节点加入流程
+- 这是因为需要自定义的节点选择、Bootstrap命令创建、状态追踪等逻辑
+
+## 三、Worker扩容流程分析
+
+### 1. **使用MachineDeployment Replicas触发扩容**
+
+从[ensure_worker_join.go:199-209](file:////cluster-api-provider-bke/pkg/phaseframe/phases/ensure_worker_join.go#L199-L209)：
+```go
+// scaleMachineDeployment 调整MachineDeployment副本数
+func (e *EnsureWorkerJoin) scaleMachineDeployment(params ScaleMachineDeploymentParams) error {
+    specCopy := params.Scope.MachineDeployment.Spec.DeepCopy()
+    currentReplicas := specCopy.Replicas
+    
+    exceptReplicas := *currentReplicas + int32(params.NodesCount)
+    // 无论如何不能超过bkecluster的worker数量
+    if exceptReplicas > int32(workerNodes.Length()) {
+        exceptReplicas = int32(workerNodes.Length())
+    }
+    
+    params.Scope.MachineDeployment.Spec.Replicas = &exceptReplicas  // ✅ 使用MD的Replicas字段
+    
+    log.Info(constant.WorkerJoiningReason, "Scale up MachineDeployment replicas %d to %d", *currentReplicas, exceptReplicas)
+    
+    // 如果节点加入过程中出现异常，需要将节点数量恢复到加入前的状态
+    var scaleErr error
+    defer func() {
+        if scaleErr != nil {
+            log.Info(constant.WorkerJoinFailedReason, "Scale down MachineDeployment replicas to %d.", *currentReplicas)
+            params.Scope.MachineDeployment.Spec.Replicas = currentReplicas  // 回滚
+            if err := phaseutil.ResumeClusterAPIObj(params.Ctx, params.Client, params.Scope.MachineDeployment); err != nil {
+                log.Error(constant.WorkerJoinFailedReason, "Rollback MachineDeployment replicas failed. err: %v", err)
+            }
+        }
+    }()
+    
+    if scaleErr = phaseutil.ResumeClusterAPIObj(params.Ctx, params.Client, params.Scope.MachineDeployment); scaleErr != nil {
+        return scaleErr
+    }
+    
+    // 等待worker节点加入
+    if scaleErr = e.waitWorkerJoin(); scaleErr != nil {
+        return scaleErr
+    }
+    
+    return nil
+}
+```
+
+### 2. **Worker扩容完整流程**
+
+```
+用户修改BKECluster.Spec.Worker.Replicas
+           │
+           ▼
+    EnsurePaused (暂停MachineDeployment)
+           │
+           ▼
+  EnsureWorkerJoin (自研Phase接管)
+   ├─ scaleMachineDeployment
+   │   └─ MachineDeployment.Spec.Replicas++  ✅ 使用MD能力
+   ├─ waitWorkerJoin
+   │   ├─ 选择节点
+   │   ├─ 创建Bootstrap Command
+   │   ├─ 等待节点就绪
+   │   └─ 标记节点状态
+   └─ 失败时回滚Replicas
+           │
+           ▼
+    EnsurePaused (恢复MachineDeployment)
+```
+**关键点**：
+- ✅ 使用了`MachineDeployment.Spec.Replicas`触发扩容
+- ❌ 但暂停了MachineDeployment控制器，由EnsureWorkerJoin Phase控制节点加入流程
+- 提供了失败回滚机制
+
+## 四、缩容流程分析
+
+### 1. **Master缩容**
+
+从[ensure_master_delete.go:1-80](file:////cluster-api-provider-bke/pkg/phaseframe/phases/ensure_master_delete.go#L1-L80)：
+```go
+// EnsureMasterDelete Phase处理Master节点删除
+func (e *EnsureMasterDelete) Execute() (ctrl.Result, error) {
+    if err := e.reconcileMasterDelete(); err != nil {
+        return ctrl.Result{}, err
+    }
+    return ctrl.Result{}, e.waitMasterDelete()
+}
+
+func (e *EnsureMasterDelete) NeedExecute(old *bkev1beta1.BKECluster, new *bkev1beta1.BKECluster) bool {
+    // 获取需要删除的Master节点
+    nodes := phaseutil.GetNeedDeleteMasterNodes(e.Ctx, e.Ctx.Client, new)
+    if nodes.Length() > 0 {
+        e.SetStatus(bkev1beta1.PhaseWaiting)
+        return true
+    }
+    return false
+}
+```
+**Master缩容特点**：
+- ❌ **未使用**KCP的Replicas字段
+- ✅ 完全由自研EnsureMasterDelete Phase处理
+- 原因：需要自定义的节点选择、驱逐、删除逻辑
+
+### 2. **Worker缩容**
+
+从[ensure_worker_delete.go:394-396](file:////cluster-api-provider-bke/pkg/phaseframe/phases/ensure_worker_delete.go#L394-L396)：
+```go
+// 缩容MachineDeployment的副本数，以便删除节点
+exceptReplicas := *params.CurrentReplicas - int32(len(params.MarkResult.FinalMachineToNodeDeleteMap))
+// 无论如何md的副本数都不能为负数
+if exceptReplicas < 0 {
+    exceptReplicas = 0
+}
+params.Scope.MachineDeployment.Spec.Replicas = &exceptReplicas  // ✅ 使用MD的Replicas字段
+
+params.Log.Info(constant.WorkerDeletingReason, "Scale down MachineDeployment replicas to %d.", exceptReplicas)
+
+// 重新启动并更新MachineDeployment副本数
+err := phaseutil.ResumeClusterAPIObj(params.Ctx, params.Client, params.Scope.MachineDeployment)
+```
+**Worker缩容特点**：
+- ✅ **使用**了MachineDeployment的Replicas字段
+- ❌ 但暂停了MachineDeployment控制器，由自研Phase控制删除流程
+- 提供了失败回滚机制
+
+## 五、对比总结
+
+| 操作 | 使用CAPI能力 | 具体使用方式 | 自研控制部分 |
+|------|-------------|-------------|-------------|
+| **Master扩容** | ✅ 部分 | `kcp.Spec.Replicas` | 节点选择、Bootstrap、状态追踪 |
+| **Master缩容** | ❌ 未使用 | 无 | 完全自研（节点选择、驱逐、删除） |
+| **Worker扩容** | ✅ 部分 | `MachineDeployment.Spec.Replicas` | 节点选择、Bootstrap、状态追踪 |
+| **Worker缩容** | ✅ 部分 | `MachineDeployment.Spec.Replicas` | 节点选择、驱逐、删除、回滚 |
+
+## 六、为什么采用混合模式？
+
+### 1. **使用CAPI Replicas的原因**
+- ✅ **声明式触发**：修改Replicas可以触发CAPI控制器创建/删除Machine
+- ✅ **标准化接口**：符合CAPI的标准操作方式
+- ✅ **简化逻辑**：不需要手动创建/删除Machine资源
+
+### 2. **暂停CAPI控制器的原因**
+- ❌ **需要自定义节点选择**：CAPI无法指定具体使用哪个节点
+- ❌ **需要自定义Bootstrap流程**：CAPI的Bootstrap流程无法满足需求
+- ❌ **需要精细的状态追踪**：需要追踪每个节点的详细状态
+- ❌ **需要前置/后置操作**：如节点环境初始化、状态标记等
+- ❌ **需要失败回滚**：CAPI不支持失败时自动回滚Replicas
+
+### 3. **混合模式的实现**
+
+```go
+// 暂停CAPI对象
+phaseutil.PauseClusterAPIObj(ctx, c, kcp)
+
+// 修改Replicas触发扩缩容
+kcp.Spec.Replicas = &replicas
+phaseutil.ResumeClusterAPIObj(ctx, c, kcp)  // 短暂恢复以触发操作
+
+// 立即暂停，由自研Phase接管
+phaseutil.PauseClusterAPIObj(ctx, c, kcp)
+
+// 自研Phase控制具体流程
+EnsureMasterJoin/EnsureWorkerJoin/...
+```
+
+## 七、总结
+
+**扩缩容对KubeadmControlPlane能力的使用情况**：
+1. **Master扩容**：
+   - ✅ 使用`kcp.Spec.Replicas`触发扩容
+   - ❌ 暂停KCP控制器，由EnsureMasterJoin Phase接管
+2. **Master缩容**：
+   - ❌ 完全未使用KCP能力
+   - ✅ 由EnsureMasterDelete Phase完全控制
+3. **Worker扩缩容**：
+   - ✅ 使用`MachineDeployment.Spec.Replicas`触发扩缩容
+   - ❌ 暂停MachineDeployment控制器，由自研Phase接管
+
+**核心设计理念**：使用CAPI的声明式能力作为触发机制，但用自研Phase控制具体执行流程，以获得更精细的控制能力。
+
+# 详细解释KCP暂停后如何使用Replicas触发扩容的机制。
+
+## 一、暂停机制的本质
+
+### 1. **暂停是通过Annotation实现的**
+
+从[clusterapi.go:128-145](file:////cluster-api-provider-bke/pkg/phaseframe/phaseutil/clusterapi.go#L128-L145)：
+```go
+// PauseClusterAPIObj add pause Annotations to cluster api obj
+func PauseClusterAPIObj(ctx context.Context, c client.Client, obj client.Object, extraAnnotations ...string) error {
+    annotations := obj.GetAnnotations()
+    if annotations == nil {
+        annotations = map[string]string{}
+    }
+    annotations[clusterv1beta1.PausedAnnotation] = ""  // 添加paused annotation
+    
+    obj.SetAnnotations(annotations)
+    if err := c.Update(ctx, obj); err != nil {
+        return errors.Errorf("pause cluster api obj failed...")
+    }
+    return nil
+}
+
+// ResumeClusterAPIObj remove pause Annotations from cluster api obj
+func ResumeClusterAPIObj(ctx context.Context, c client.Client, obj client.Object, extraAnnotations ...string) error {
+    annotations := obj.GetAnnotations()
+    delete(annotations, clusterv1beta1.PausedAnnotation)  // 移除paused annotation
+    
+    obj.SetAnnotations(annotations)
+    if err := c.Update(ctx, obj); err != nil {
+        return errors.Wrapf(err, "resume cluster api obj failed...")
+    }
+    return nil
+}
+```
+**关键点**：
+- `PausedAnnotation = "cluster.x-k8s.io/paused"`
+- 暂停 = 添加这个annotation
+- 恢复 = 移除这个annotation
+
+### 2. **CAPI控制器如何响应暂停**
+
+CAPI的KCP控制器会检查这个annotation：
+```go
+// CAPI KCP控制器伪代码
+func (r *KubeadmControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.Request) {
+    kcp := &KubeadmControlPlane{}
+    r.Get(ctx, req.NamespacedName, kcp)
+    
+    // 检查是否暂停
+    if annotations.HasPausedAnnotation(kcp) {
+        // 暂停状态，直接返回，不执行任何操作
+        return ctrl.Result{}, nil
+    }
+    
+    // 正常调谐逻辑
+    // ...
+}
+```
+
+## 二、Master扩容的完整流程
+
+### 1. **流程图**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  阶段1: EnsurePaused - 初始暂停                              │
+│  ├─ PauseClusterAPIObj(kcp)                                 │
+│  └─ 添加annotation: cluster.x-k8s.io/paused                 │
+└────────────────────┬────────────────────────────────────────┘
+                     │ KCP控制器停止工作
+                     ▼
+┌─────────────────────────────────────────────────────────────┐
+│  阶段2: EnsureClusterManage - 短暂恢复并修改Replicas         │
+│  ├─ updateKubeadmControlPlaneReplicas(replicas)             │
+│  │   ├─ kcp.Spec.Replicas = &replicas                       │
+│  │   └─ ResumeClusterAPIObj(kcp)  ← 移除paused annotation   │
+│  └─ waitForClusterInfrastructureReady()                     │
+└────────────────────┬────────────────────────────────────────┘
+                     │ KCP控制器恢复工作，检测到Replicas变化
+                     ▼
+┌─────────────────────────────────────────────────────────────┐
+│  阶段3: KCP控制器自动创建Machine                             │
+│  ├─ 检测到 kcp.Spec.Replicas 从 1 变为 2                    │
+│  ├─ 创建新的 Machine 对象                                    │
+│  └─ Machine Controller 创建 BKEMachine                       │
+└────────────────────┬────────────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────────────┐
+│  阶段4: EnsureMasterJoin - 自研Phase接管                     │
+│  ├─ scaleAndJoinMasterNodes()                               │
+│  │   ├─ kcp.Spec.Replicas++                                 │
+│  │   ├─ ResumeClusterAPIObj(kcp)  ← 再次短暂恢复             │
+│  │   ├─ waitMasterJoin()  ← 等待节点加入                     │
+│  │   └─ 失败时回滚Replicas                                   │
+│  └─ 选择节点、创建Bootstrap Command、标记状态                 │
+└────────────────────┬────────────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────────────┐
+│  阶段5: EnsurePaused - 最终恢复                              │
+│  └─ ResumeClusterAPIObj(kcp)  ← 移除paused annotation       │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 2. **关键代码分析**
+
+从[ensure_cluster_manage.go:447-453](file:////cluster-api-provider-bke/pkg/phaseframe/phases/ensure_cluster_manage.go#L447-L453)：
+```go
+// updateKubeadmControlPlaneReplicas 更新KubeadmControlPlane副本数
+func (e *EnsureClusterManage) updateKubeadmControlPlaneReplicas(ctx context.Context, c client.Client, replicas int32) error {
+    kcp, err := phaseutil.GetClusterAPIKubeadmControlPlane(ctx, c, e.Ctx.Cluster)
+    if err != nil {
+        return err
+    }
+    kcp.Spec.Replicas = &replicas  // 修改Replicas
+    return phaseutil.ResumeClusterAPIObj(ctx, c, kcp)  // ✅ 关键：恢复KCP
+}
+```
+
+从[ensure_master_join.go:222-241](file:////cluster-api-provider-bke/pkg/phaseframe/phases/ensure_master_join.go#L222-L241)：
+```go
+func (e *EnsureMasterJoin) scaleAndJoinMasterNodes(params MasterJoinScaleParams) error {
+    scope, err := phaseutil.GetClusterAPIAssociateObjs(params.Ctx, params.Client, e.Ctx.Cluster)
+    
+    // 失败时回滚
+    defer func() {
+        if err != nil {
+            scope.KubeadmControlPlane.Spec.Replicas = currentReplicas
+            phaseutil.ResumeClusterAPIObj(params.Ctx, params.Client, scope.KubeadmControlPlane)
+        }
+    }()
+    
+    exceptReplicas := *currentReplicas + int32(params.NodesCount)
+    scope.KubeadmControlPlane.Spec.Replicas = &exceptReplicas  // 修改Replicas
+    
+    // ✅ 关键：恢复KCP，让KCP控制器工作
+    if err = phaseutil.ResumeClusterAPIObj(params.Ctx, params.Client, scope.KubeadmControlPlane); err != nil {
+        return err
+    }
+    
+    // 等待节点加入
+    if err = e.waitMasterJoin(params.NodesCount); err != nil {
+        return err
+    }
+    
+    return nil
+}
+```
+
+## 三、"短暂恢复-修改-立即暂停"模式
+
+### 1. **时间线详解**
+
+```
+时间点    操作                          KCP状态      KCP控制器行为
+─────────────────────────────────────────────────────────────────
+T0       EnsurePaused暂停              Paused       停止调谐
+         ├─ 添加paused annotation
+         └─ KCP控制器检测到paused，停止工作
+
+T1       EnsureClusterManage           Paused       停止调谐
+         ├─ 获取KCP对象
+         └─ 准备修改Replicas
+
+T2       updateKCPReplicas             Not Paused   ✅ 恢复调谐！
+         ├─ kcp.Spec.Replicas = 2
+         ├─ ResumeClusterAPIObj()
+         │  └─ 移除paused annotation
+         └─ Update kcp到API Server
+
+T3       KCP控制器Reconcile            Not Paused   ✅ 正常工作
+         ├─ 检测到Replicas从1变为2
+         ├─ 创建新的Machine对象
+         └─ Machine Controller创建BKEMachine
+
+T4       EnsureMasterJoin              Not Paused   正常工作
+         ├─ 等待Machine创建完成
+         ├─ 选择节点
+         ├─ 创建Bootstrap Command
+         └─ 标记节点状态
+
+T5       EnsurePaused恢复              Not Paused   正常工作
+         └─ ResumeClusterAPIObj()
+            └─ 移除paused annotation（已经是移除状态）
+```
+
+### 2. **关键时序**
+
+```go
+// T2时刻：短暂恢复
+kcp.Spec.Replicas = &replicas
+phaseutil.ResumeClusterAPIObj(ctx, c, kcp)  // 移除paused annotation
+// ↑ 此时KCP控制器立即恢复工作，检测到Replicas变化
+
+// T3时刻：KCP控制器自动工作
+// KCP控制器在后台自动创建Machine，不需要BKE干预
+
+// T4时刻：自研Phase接管
+// 等待Machine创建完成，然后执行自定义逻辑
+```
+
+## 四、为什么这样设计？
+
+### 1. **利用CAPI的声明式能力**
+
+✅ **优点**：
+- 不需要手动创建Machine对象
+- 不需要手动管理Machine的生命周期
+- 符合CAPI的标准操作方式
+
+### 2. **保持自定义控制能力**
+
+✅ **优点**：
+- 可以在KCP创建Machine后，立即接管后续流程
+- 可以自定义节点选择逻辑
+- 可以自定义Bootstrap流程
+- 可以精细追踪节点状态
+
+### 3. **避免控制权冲突**
+
+❌ **问题**：如果KCP一直处于工作状态
+- KCP控制器可能修改Machine
+- BKE Phase也在修改Machine
+- 产生冲突
+
+✅ **解决**：短暂恢复模式
+- 只在需要时恢复KCP
+- KCP完成Machine创建后
+- BKE Phase立即接管后续流程
+
+## 五、Worker扩容的类似流程
+
+从[ensure_worker_join.go:199-216](file:////cluster-api-provider-bke/pkg/phaseframe/phases/ensure_worker_join.go#L199-L216)：
+```go
+func (e *EnsureWorkerJoin) scaleMachineDeployment(params ScaleMachineDeploymentParams) error {
+    currentReplicas := specCopy.Replicas
+    exceptReplicas := *currentReplicas + int32(params.NodesCount)
+    
+    params.Scope.MachineDeployment.Spec.Replicas = &exceptReplicas
+    
+    // ✅ 短暂恢复MachineDeployment
+    if scaleErr = phaseutil.ResumeClusterAPIObj(params.Ctx, params.Client, params.Scope.MachineDeployment); scaleErr != nil {
+        return scaleErr
+    }
+    
+    // MachineDeployment控制器自动创建新的Machine
+    // 等待worker节点加入
+    if scaleErr = e.waitWorkerJoin(); scaleErr != nil {
+        return scaleErr
+    }
+    
+    return nil
+}
+```
+
+## 六、总结
+
+### **核心机制：短暂恢复-修改-自动工作-接管**
+
+1. **暂停阶段**：
+   - 添加`cluster.x-k8s.io/paused` annotation
+   - KCP/MD控制器停止调谐
+2. **短暂恢复阶段**：
+   - 修改`Spec.Replicas`
+   - 调用`ResumeClusterAPIObj()`移除paused annotation
+   - KCP/MD控制器立即恢复工作
+3. **自动工作阶段**：
+   - KCP/MD控制器检测到Replicas变化
+   - 自动创建/删除Machine对象
+   - Machine Controller创建/删除BKEMachine
+4. **接管阶段**：
+   - 自研Phase等待Machine创建完成
+   - 执行自定义逻辑（节点选择、Bootstrap、状态追踪）
+   - 完成后再次暂停或保持恢复状态
+
+### **设计优势**
+- ✅ 利用CAPI声明式能力，不需要手动管理Machine
+- ✅ 保持自定义控制能力，可以精细控制流程
+- ✅ 避免控制权冲突，只在需要时恢复CAPI控制器
+- ✅ 提供失败回滚机制，修改Replicas失败时恢复原值
+
+这种设计巧妙地平衡了CAPI标准能力和自定义需求，是一个非常精妙的架构设计！
+
 # 
