@@ -272,3 +272,95 @@ func (e *EnsureMasterInit) setupConditionAndRefresh(params SetupConditionAndRefr
 - 问题排查困难
 - 不必要的重试和性能开销
 - 潜在的 panic 风险
+
+# func (b *BasePhase) DefaultPreHook() 
+```go
+func (b *BasePhase) DefaultPreHook() error {
+	// 1. 参数校验
+	if b == nil {
+		return errors.New("BasePhase cannot be nil")
+	}
+	if b.Ctx == nil {
+		return errors.New("PhaseContext cannot be nil")
+	}
+
+	b.Ctx.Log.Debug("executing PreHook for phase %s", b.Name())
+
+	// 2. refresh bkecluster with retry
+	var lastErr error
+	for i := 0; i < 3; i++ {
+		if err := b.Ctx.RefreshCtxBKECluster(); err != nil {
+			lastErr = err
+			b.Ctx.Log.Debug("failed to refresh BKECluster for phase %s (attempt %d/3): %v", 
+				b.Name(), i+1, err)
+			time.Sleep(time.Second * time.Duration(i+1))
+			continue
+		}
+		lastErr = nil
+		break
+	}
+	if lastErr != nil {
+		b.Ctx.Log.Error("failed to refresh BKECluster for phase %s after 3 attempts: %v", 
+			b.Name(), lastErr)
+		return errors.Wrapf(lastErr, "failed to refresh BKECluster for phase %s", b.Name())
+	}
+	b.Ctx.Log.Debug("BKECluster refreshed successfully for phase %s", b.Name())
+
+	// 3. refresh cluster (non-critical)
+	if err := b.Ctx.RefreshCtxCluster(); err != nil {
+		b.Ctx.Log.Debug("failed to refresh Cluster for phase %s (non-critical): %v", b.Name(), err)
+	}
+
+	// 4. run custom pre hook (before setting status)
+	if b.CustomPreHookFuncs != nil && len(b.CustomPreHookFuncs) > 0 {
+		b.Ctx.Log.Debug("running %d custom pre hooks for phase %s", 
+			len(b.CustomPreHookFuncs), b.Name())
+		for i, f := range b.CustomPreHookFuncs {
+			if err := f(b); err != nil {
+				b.Ctx.Log.Error("custom pre hook %d failed for phase %s: %v", i, b.Name(), err)
+				return errors.Wrapf(err, "custom pre hook %d failed for phase %s", i, b.Name())
+			}
+			b.Ctx.Log.Debug("custom pre hook %d executed successfully for phase %s", i, b.Name())
+		}
+	}
+
+	// 5. set status and start time (after all checks pass)
+	if b.GetStatus() != bkev1beta1.PhaseRunning {
+		b.SetStatus(bkev1beta1.PhaseRunning)
+		b.SetStartTime(metav1.Now())
+		b.Ctx.Log.Debug("phase %s status set to Running", b.Name())
+	}
+
+	// 6. report phase status
+	if err := b.Report("", false); err != nil {
+		// rollback status on failure
+		b.SetStatus(bkev1beta1.PhaseWaiting)
+		b.Ctx.Log.Error("failed to report phase status for %s, rolling back status: %v", 
+			b.Name(), err)
+		return errors.Wrapf(err, "failed to report phase status for %s", b.Name())
+	}
+
+	b.Ctx.Log.Debug("PreHook completed successfully for phase %s", b.Name())
+	return nil
+}
+```
+总结，`DefaultPreHook` 函数在异常处理方面存在以下**主要不足**：
+1. ❌ **错误被忽略**：`RefreshCtxCluster()` 的错误被显式忽略
+2. ❌ **缺少参数校验**：没有检查 `b.Ctx` 是否为 `nil`
+3. ❌ **缺少错误上下文**：返回的错误没有包装，缺少上下文信息
+4. ❌ **状态设置缺少保护**：在 `Report()` 之前就设置了状态
+5. ❌ **Custom Hook 错误处理不完善**：没有记录日志和上下文信息
+6. ❌ **缺少超时机制**：没有为刷新操作和 Custom Hook 设置超时
+7. ❌ **缺少幂等性检查**：没有检查 Phase 是否已经是 `Running` 状态
+8. ❌ **缺少日志记录**：整个函数缺少日志记录
+9. ❌ **Report() 失败后缺少状态回滚**：状态已经是 `Running`，但没有回滚
+10. ❌ **缺少重试机制**：对临时性错误没有重试
+
+这些问题可能导致：
+- 状态不一致
+- 问题排查困难
+- Panic 风险
+- 不必要的重试和性能开销
+- 永久阻塞
+
+建议按照上述改进方案进行修复，提高代码的健壮性、可维护性和可观测性。
