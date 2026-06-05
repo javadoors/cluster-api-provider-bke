@@ -550,3 +550,196 @@ MasterInit Command 执行流程
 - 集群配置已上传到管理集群
 - 可以通过 kubectl 访问集群
 
+#  BKEMachine.Status.Bootstrapped == true 是由哪个功能设置的？
+
+BKEMachine.Status.Bootstrapped = true 是由 BKEMachine Controller 在检测到 Bootstrap Command 执行成功后设置的
+
+## 设置流程
+
+### 完整调用链
+
+```
+BKEMachineReconciler.Reconcile()
+  ↓
+reconcileCommand()                                    // 监控 Command 状态
+  ↓
+processCommand()                                      // 处理单个 Command
+  ↓
+processBootstrapCommand()                             // 处理 Bootstrap Command
+  ↓
+processBootstrapSuccess()                             // 处理 Bootstrap 成功
+  ↓
+markBKEMachineBootstrapReady()                        // 标记 BKEMachine 为已引导
+  ↓
+bkeMachine.Status.Bootstrapped = true                 // 设置 Bootstrapped 标志
+```
+
+### 关键代码位置
+
+#### 1. 入口：reconcileCommand
+在 [bkemachine_controller_phases.go:480](file:///c:\Users\z00820145\code\github\cluster-api-provider-bke\controllers\capbke\bkemachine_controller_phases.go#L480) 中：
+```go
+func (r *BKEMachineReconciler) reconcileCommand(params BootstrapReconcileParams) (ctrl.Result, error) {
+    // 获取 BKEMachine 关联的所有 Command
+    commands, err := getBKEMachineAssociateCommands(params.Ctx, r.Client, params.BKECluster, params.BKEMachine)
+    
+    // 处理每个 Command
+    for _, cmd := range commands {
+        res, errs = r.processCommand(commandParams)
+    }
+}
+```
+
+#### 2. 处理 Bootstrap Command
+在 [bkemachine_controller_phases.go:620](file:///c:\Users\z00820145\code\github\cluster-api-provider-bke\controllers\capbke\bkemachine_controller_phases.go#L620) 中：
+
+```go
+func (r *BKEMachineReconciler) processBootstrapCommand(params ProcessBootstrapCommandParams) (ctrl.Result, []error) {
+    // 如果已经 Bootstrapped，直接返回
+    if params.BKEMachine.Status.Bootstrapped {
+        return params.Res, params.Errs
+    }
+    
+    // 检查 Command 执行状态
+    complete, successNodes, failedNodes := command.CheckCommandStatus(&params.Cmd)
+    
+    // 如果有失败的节点
+    if params.Complete && len(params.FailedNodes) > 0 {
+        return r.processBootstrapFailure(failureParams)
+    }
+    
+    // 如果成功（关键判断条件）
+    if params.Complete && len(params.FailedNodes) == 0 && len(params.SuccessNodes) == 1 {
+        return r.processBootstrapSuccess(successParams)
+    }
+}
+```
+
+#### 3. 处理成功情况
+在 [bkemachine_controller_phases.go:792](file:///c:\Users\z00820145\code\github\cluster-api-provider-bke\controllers\capbke\bkemachine_controller_phases.go#L792) 中：
+```go
+func (r *BKEMachineReconciler) processBootstrapSuccess(params ProcessBootstrapSuccessParams) (ctrl.Result, []error) {
+    // 尝试连接到目标集群节点
+    err := r.connectToTargetClusterNode(params)
+    if err != nil {
+        return r.handleBootstrapSuccessFailure(params, err)
+    }
+    
+    // 生成 ProviderID
+    providerID := phaseutil.GenerateProviderID(params.BKECluster, params.CurrentNode)
+    
+    // 标记 BKEMachine 为已引导（这里设置 Bootstrapped = true）
+    if err := r.markBKEMachineBootstrapReady(params.Ctx, params.BKECluster, params.BKEMachine, 
+        params.CurrentNode, providerID, params.Log); err != nil {
+        params.Errs = append(params.Errs, err)
+    }
+    
+    // 记录指标
+    metricrecord.NodeBootstrapSuccessCountRecord(params.BKECluster)
+    metricrecord.NodeBootstrapDurationRecord(params.BKECluster, params.CurrentNode, 
+        params.Cmd.CreationTimestamp.Time, "success")
+}
+```
+
+#### 4. 设置 Bootstrapped 标志
+在 [bkemachine_controller_phases.go:1258](file:///c:\Users\z00820145\code\github\cluster-api-provider-bke\controllers\capbke\bkemachine_controller_phases.go#L1258) 中：
+```go
+func (r *BKEMachineReconciler) markBKEMachineBootstrapReady(ctx context.Context, bkeCluster *bkev1beta1.BKECluster,
+    bkeMachine *bkev1beta1.BKEMachine, assocNode confv1beta1.Node, providerID string,
+    log *zap.SugaredLogger) error {
+    
+    // 设置 MachineAddress
+    setMachineAddress(bkeMachine, assocNode)
+    
+    // 设置 ProviderID
+    setProviderID(bkeMachine, providerID)
+    
+    // 设置 Ready 和 Bootstrapped 标志
+    bkeMachine.Status.Ready = true
+    bkeMachine.Status.Bootstrapped = true  // ← 这里设置为 true
+    
+    // 标记 BootstrapSucceededCondition 为 True
+    conditions.MarkTrue(bkeMachine, bkev1beta1.BootstrapSucceededCondition)
+    
+    // 记录日志和事件
+    r.logInfoAndEvent(log, bkeCluster, constant.TargetClusterBootingReason,
+        "node %q, role %v bootstrap succeeded", phaseutil.NodeInfo(assocNode), assocNode.Role)
+    
+    // 标记节点状态标志
+    if err := r.NodeFetcher.MarkNodeStateFlagForCluster(ctx, bkeCluster, assocNode.IP, bkev1beta1.NodeBootFlag); err != nil {
+        log.Warnf("Failed to mark node state flag: %v", err)
+    }
+    
+    // 设置节点状态为 NotReady（等待后续就绪）
+    if err := r.NodeFetcher.SetNodeStateWithMessageForCluster(ctx, bkeCluster, assocNode.IP, 
+        bkev1beta1.NodeNotReady, "Bootstrap Succeeded"); err != nil {
+        log.Warnf("Failed to set node state: %v", err)
+    }
+    
+    // 同步状态到 API Server
+    if err := mergecluster.SyncStatusUntilComplete(r.Client, bkeCluster); err != nil {
+        log.Errorf("failed to update bkeCluster Status, err: %s", err.Error())
+        return errors.Errorf("failed to update bkeCluster Status, err: %s", err.Error())
+    }
+    
+    return nil
+}
+```
+## 触发条件
+**BKEMachine.Status.Bootstrapped = true** 的触发条件：
+1. **Command 执行完成**：`params.Complete == true`
+2. **没有失败的节点**：`len(params.FailedNodes) == 0`
+3. **有成功的节点**：`len(params.SuccessNodes) == 1`
+4. **目标集群节点可连接**：`connectToTargetClusterNode()` 成功
+
+## 执行流程图
+```
+Bootstrap Command 执行流程
+│
+├─ BKEAgent 执行 Command
+│   ├─ K8sEnvInit (环境检查)
+│   └─ Kubeadm InitControlPlane (控制平面初始化)
+│
+├─ Command 执行完成
+│   └─ Command.Status.Complete = true
+│       └─ Command.Status.SuccessNodes = [nodeIP]
+│
+└─ BKEMachine Controller 监控到 Command 状态变化
+    │
+    ├─ reconcileCommand()
+    │   └─ 获取 Command 状态
+    │
+    ├─ processBootstrapCommand()
+    │   ├─ 检查 Complete == true
+    │   ├─ 检查 FailedNodes == 0
+    │   └─ 检查 SuccessNodes == 1
+    │
+    ├─ processBootstrapSuccess()
+    │   ├─ 连接目标集群节点
+    │   └─ markBKEMachineBootstrapReady()
+    │       │
+    │       ├─ 设置 MachineAddress
+    │       ├─ 设置 ProviderID
+    │       ├─ bkeMachine.Status.Ready = true
+    │       ├─ bkeMachine.Status.Bootstrapped = true ← 关键步骤
+    │       ├─ conditions.MarkTrue(BootstrapSucceededCondition)
+    │       ├─ 标记 NodeBootFlag
+    │       ├─ 设置节点状态为 NodeNotReady
+    │       └─ 同步状态到 API Server
+    │
+    └─ 记录成功指标
+```
+
+## 总结
+**BKEMachine.Status.Bootstrapped = true** 是由 **BKEMachine Controller** 在以下情况下设置的：
+1. **监控到 Bootstrap Command 执行成功**（Command.Status.Complete=true 且 SuccessNodes 不为空）
+2. **成功连接到目标集群节点**（验证节点确实在运行）
+3. **在 `markBKEMachineBootstrapReady()` 函数中**完成以下操作：
+   - 设置 `bkeMachine.Status.Bootstrapped = true`
+   - 设置 `bkeMachine.Status.Ready = true`
+   - 标记 `BootstrapSucceededCondition` 为 True
+   - 记录节点状态和指标
+
+这个标志表示节点已经成功完成 Bootstrap 流程，可以继续后续的集群加入操作。
+
+# 触发BKEMachine Controller执行的场景有哪些?​
