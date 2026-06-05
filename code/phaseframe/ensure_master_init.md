@@ -289,3 +289,109 @@ EnsureMasterInit 的前置条件：
 ## 4. 失败重试机制
 如果 Command 执行失败，`EnsureMasterInit` 会移除 `BKEMachine` 的 Master Label。这一操作会触发 `BKEMachine Controller` 重新调和（Reconcile），进而**重新创建**一个新的 Bootstrap Command 进行重试。
 
+# MasterInit Command 是由 BKEMachine Controller 创建的
+具体触发流程如下：
+
+## 触发执行流程
+
+### 1. **入口：BKEMachine Controller 的 Reconcile 循环**
+
+在 [bkemachine_controller_phases.go](file:///c:\Users\z00820145\code\github\cluster-api-provider-bke\controllers\capbke\bkemachine_controller_phases.go) 中：
+```
+reconcileBootstrap() 
+  ↓
+handleFirstTimeReconciliation()  // 处理首次协调的机器
+  ↓
+handleRealBootstrap()            // 处理真实引导流程
+  ↓
+bootstrapCommand.New()           // 创建 Bootstrap Command
+```
+
+### 2. **关键触发条件**
+在 [handleFirstTimeReconciliation](file:///c:\Users\z00820145\code\github\cluster-api-provider-bke\controllers\capbke\bkemachine_controller_phases.go#L207-L314) 函数中：
+- **Phase 判断**：通过 `getBootstrapPhase()` 获取当前 BKEMachine 的阶段
+- **节点选择**：通过 `filterAvailableNode()` 选择可用的节点
+- **标记节点**：如果 Phase 是 `InitControlPlane`，会标记 `MasterInitFlag`
+
+```go
+if phase == bkev1beta1.InitControlPlane {
+    if err := r.NodeFetcher.MarkNodeStateFlagForCluster(params.Ctx, params.BKECluster, node.IP, bkev1beta1.MasterInitFlag); err != nil {
+        params.Log.Warnf("Failed to mark node state flag: %v", err)
+    }
+}
+```
+
+### 3. **Command 创建逻辑**
+在 [handleRealBootstrap](file:///c:\Users\z00820145\code\github\cluster-api-provider-bke\controllers\capbke\bkemachine_controller_phases.go#L418-L468) 函数中：
+```go
+bootstrapCommand := command.Bootstrap{
+    BaseCommand: command.BaseCommand{
+        Ctx:             params.Ctx,
+        NameSpace:       params.BKEMachine.Namespace,
+        Client:          r.Client,
+        Scheme:          r.Scheme,
+        OwnerObj:        params.BKEMachine,
+        ClusterName:     params.BKECluster.Name,
+        Unique:          true,
+        RemoveAfterWait: false,
+    },
+    Node:      params.Node,
+    BKEConfig: params.BKECluster.Name,
+    Phase:     params.Phase,  // 这里传入的是 InitControlPlane
+}
+
+if err := bootstrapCommand.New(); err != nil {
+    // 错误处理
+}
+```
+
+### 4. **Label 设置逻辑**
+在 [bootstrap.go](file:///c:\Users\z00820145\code\github\cluster-api-provider-bke\pkg\command\bootstrap.go#L55-L64) 中：
+```go
+customLabel := ""
+switch b.Phase {
+case bkev1beta1.InitControlPlane:
+    customLabel = MasterInitCommandLabel  // "bke.bocloud.com/master-init-command"
+case bkev1beta1.JoinControlPlane:
+    customLabel = MasterJoinCommandLabel
+case bkev1beta1.JoinWorker:
+    customLabel = WorkerJoinCommandLabel
+}
+```
+
+### 5. **Command 内容**
+创建的 Command 包含两个执行步骤：
+```go
+commandSpec.Commands = []agentv1beta1.ExecCommand{
+    {
+        ID: "check container runtime",
+        Command: []string{
+            "K8sEnvInit",
+            "init=false",
+            "check=true",
+            "scope=runtime",
+            bkeConfig,
+        },
+    },
+    {
+        ID: "bootstrap",
+        Command: []string{
+            "Kubeadm",
+            phase,  // "phase=InitControlPlane"
+            bkeConfig,
+        },
+    },
+}
+```
+
+## 总结
+**MasterInit Command 的触发条件：**
+1. **BKEMachine 首次协调**（Status.Bootstrapped == false）
+2. **Phase 为 InitControlPlane**（表示这是第一个 Master 节点）
+3. **集群完全控制**（FullyControlled == true）
+4. **找到可用的节点**
+
+**职责分离：**
+- **BKEMachine Controller**：负责创建 MasterInit Command
+- **EnsureMasterInit Phase**：负责监控和等待 Command 执行完成
+- **BKEAgent**：负责在目标节点上执行 Command
