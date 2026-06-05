@@ -1,3 +1,3 @@
-# Command 生命周期状态机
+# Command生命周期状态机
 
-# 
+# Phase状态机
