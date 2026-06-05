@@ -395,3 +395,158 @@ commandSpec.Commands = []agentv1beta1.ExecCommand{
 - **BKEMachine Controller**：负责创建 MasterInit Command
 - **EnsureMasterInit Phase**：负责监控和等待 Command 执行完成
 - **BKEAgent**：负责在目标节点上执行 Command
+
+# MasterInit Command 
+包含两个主要执行步骤**，具体功能如下：
+
+## MasterInit Command 执行流程
+
+### 步骤 1: K8sEnvInit（环境检查）
+
+**命令参数**：
+```go
+{
+    ID: "check container runtime",
+    Command: []string{
+        "K8sEnvInit",
+        "init=false",      // 不执行初始化
+        "check=true",      // 只执行检查
+        "scope=runtime",   // 检查容器运行时
+        "bkeConfig=ns:name",
+    },
+}
+```
+**功能说明**：
+- **检查容器运行时状态**（Containerd 或 Docker）
+- 验证容器运行时是否正常运行
+- 确保节点环境满足 Kubernetes 运行要求
+
+**代码位置**：[env.go](file:///c:\Users\z00820145\code\github\cluster-api-provider-bke\pkg\job\builtin\kubeadm\env\env.go#L202-L255)
+
+### 步骤 2: Kubeadm InitControlPlane（控制平面初始化）
+**命令参数**：
+```go
+{
+    ID: "bootstrap",
+    Command: []string{
+        "Kubeadm",
+        "phase=InitControlPlane",
+        "bkeConfig=ns:name",
+    },
+}
+```
+**功能说明**：在 [kubeadm.go](file:///c:\Users\z00820145\code\github\cluster-api-provider-bke\pkg\job\builtin\kubeadm\kubeadm.go#L167-L196) 中实现，包含以下子步骤：
+
+#### 2.1 安装 kubectl 命令行工具
+```go
+k.installKubectlCommand()
+```
+- 下载 kubectl 二进制文件到 `/usr/bin/kubectl`
+- 设置执行权限 `chmod 755`
+
+#### 2.2 初始化控制平面证书
+```go
+k.initControlPlaneCertCommand()
+```
+- 从管理集群 Secret 加载 CA 证书
+- 生成以下证书：
+  - **API Server 证书**
+  - **Etcd 证书**（CA、Server、Peer、Healthcheck）
+  - **Kubelet 证书**
+  - **Front Proxy 证书**
+  - **Service Account 密钥**
+- 生成 kubeconfig 文件：
+  - `/etc/kubernetes/admin.conf`
+  - `/etc/kubernetes/controller-manager.conf`
+  - `/etc/kubernetes/scheduler.conf`
+  - `/etc/kubernetes/kubelet.conf`
+
+#### 2.3 生成静态 Pod YAML
+```go
+k.initControlPlaneManifestCommand()
+```
+- 渲染并生成以下静态 Pod Manifest：
+  - **kube-apiserver.yaml**
+  - **kube-controller-manager.yaml**
+  - **kube-scheduler.yaml**
+  - **etcd.yaml**
+- 创建 etcd 用户和目录
+- 配置 Pod 挂载卷和启动参数
+
+#### 2.4 安装并启动 kubelet
+```go
+k.installKubeletCommand()
+```
+- 下载 kubelet 二进制文件
+- 生成 kubelet systemd service 文件
+- 生成 kubelet 配置文件 `/var/lib/kubelet/config.yaml`
+- 启动 kubelet 服务：
+  ```bash
+  systemctl enable kubelet
+  systemctl restart kubelet
+  ```
+
+#### 2.5 上传 kubelet 配置到管理集群
+```go
+k.uploadTargetClusterKubeletConfig()
+```
+- 创建 ConfigMap 存储集群配置
+- 上传 kubeadm 配置到管理集群
+- 供其他节点加入集群时使用
+
+#### 2.6 上传全局 CA（仅管理集群）
+```go
+k.uploadUserCustomConfigAndGlobalCA()
+```
+- 如果是管理集群，上传全局 CA 证书
+- 上传用户自定义配置
+
+## 执行流程图
+```
+MasterInit Command 执行流程
+│
+├─ Step 1: K8sEnvInit (check container runtime)
+│   └─ 检查容器运行时状态
+│
+└─ Step 2: Kubeadm InitControlPlane
+    │
+    ├─ 2.1 installKubectlCommand
+    │   └─ 下载并安装 kubectl
+    │
+    ├─ 2.2 initControlPlaneCertCommand
+    │   ├─ 加载 CA 证书
+    │   ├─ 生成 TLS 证书
+    │   └─ 生成 kubeconfig
+    │
+    ├─ 2.3 initControlPlaneManifestCommand
+    │   ├─ 生成 kube-apiserver.yaml
+    │   ├─ 生成 kube-controller-manager.yaml
+    │   ├─ 生成 kube-scheduler.yaml
+    │   ├─ 生成 etcd.yaml
+    │   └─ 创建 etcd 用户/目录
+    │
+    ├─ 2.4 installKubeletCommand
+    │   ├─ 下载 kubelet
+    │   ├─ 生成 service 文件
+    │   ├─ 生成配置文件
+    │   └─ 启动 kubelet
+    │
+    ├─ 2.5 uploadTargetClusterKubeletConfig
+    │   └─ 上传配置到管理集群
+    │
+    └─ 2.6 uploadUserCustomConfigAndGlobalCA (可选)
+        └─ 上传全局 CA
+```
+## 关键特性
+1. **不依赖 kubeadm 二进制**：自己实现了证书管理、配置生成等逻辑
+2. **与 Cluster API 集成**：证书和配置存储在 Kubernetes CRD 中
+3. **使用 bke-manifests 模板**：静态 Pod YAML 从模板渲染
+4. **静态 Pod 方式**：控制平面组件以静态 Pod 形式运行，由 kubelet 管理
+
+## 执行结果
+执行成功后，第一个 Master 节点将：
+- 拥有完整的控制平面组件（API Server、Controller Manager、Scheduler、Etcd）
+- Kubelet 正常运行并管理静态 Pod
+- 集群配置已上传到管理集群
+- 可以通过 kubectl 访问集群
+
