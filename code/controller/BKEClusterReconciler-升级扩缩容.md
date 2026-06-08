@@ -1,0 +1,1646 @@
+# 详细说明升级/扩缩容的功能清单及代码入口
+
+## 升级/扩缩容功能清单及代码入口
+
+### 一、功能清单总览
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  PostDeployPhases（部署后阶段）                                   │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  升级功能（7个 Phase）：                                           │
+│    1. EnsureProviderSelfUpgrade  - Provider 自升级               │
+│    2. EnsureAgentUpgrade         - BKEAgent 升级                │
+│    3. EnsureContainerdUpgrade    - Containerd 升级              │
+│    4. EnsureEtcdUpgrade          - Etcd 滚动升级                │
+│    5. EnsureMasterUpgrade        - Master 节点升级              │
+│    6. EnsureWorkerUpgrade        - Worker 节点升级              │
+│    7. EnsureComponentUpgrade     - openFuyao 核心组件升级        │
+│                                                                │
+│  扩缩容功能（4个 Phase）：                                        │
+│    8. EnsureMasterJoin           - Master 扩容                  │
+│    9. EnsureWorkerJoin           - Worker 扩容                  │
+│   10. EnsureMasterDelete         - Master 缩容                  │
+│   11. EnsureWorkerDelete         - Worker 缩容                  │
+│                                                                │
+│  健康检查（1个 Phase）：                                          │
+│   12. EnsureCluster              - 集群健康检查                   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 二、代码入口
+
+#### 1. Phase 注册入口
+
+**文件**：[pkg/phaseframe/phases/list.go](file:////cluster-api-provider-bke/pkg/phaseframe/phases/list.go)
+```go
+// PostDeployPhases post deploy phases
+PostDeployPhases = []func(ctx *phaseframe.PhaseContext) phaseframe.Phase{
+    NewEnsureProviderSelfUpgrade,   // Provider 自升级
+    NewEnsureAgentUpgrade,          // Agent 升级
+    NewEnsureContainerdUpgrade,     // Containerd 升级
+    NewEnsureEtcdUpgrade,           // Etcd 升级
+    NewEnsureWorkerUpgrade,         // Worker 升级
+    NewEnsureMasterUpgrade,         // Master 升级
+    NewEnsureWorkerDelete,          // Worker 删除（缩容）
+    NewEnsureMasterDelete,          // Master 删除（缩容）
+    NewEnsureComponentUpgrade,      // 组件升级
+    NewEnsureCluster,               // 集群健康检查
+}
+```
+
+#### 2. Phase 执行入口
+
+**文件**：[pkg/phaseframe/phases/phase_flow.go](file:////cluster-api-provider-bke/pkg/phaseframe/phases/phase_flow.go)
+```go
+// CalculatePhase 计算需要执行的 Phase
+func (p *PhaseFlow) CalculatePhase(old *bkev1beta1.BKECluster, new *bkev1beta1.BKECluster) error {
+    phasesFuncs := p.determinePhasesFuncs()
+    p.calculateAndAddPhases(old, new, phasesFuncs)
+    return p.ReportPhaseStatus()
+}
+
+// determinePhasesFuncs 根据集群状态决定执行哪些 Phase
+func (p *PhaseFlow) determinePhasesFuncs() []func(ctx *phaseframe.PhaseContext) phaseframe.Phase {
+    if phaseutil.IsDeleteOrReset(p.ctx.BKECluster) {
+        return DeletePhases  // 删除阶段
+    }
+    return FullPhasesRegisFunc  // 全量 Phase（包含升级/扩缩容）
+}
+
+// calculateAndAddPhases 计算并添加需要执行的 Phase
+func (p *PhaseFlow) calculateAndAddPhases(old *bkev1beta1.BKECluster, new *bkev1beta1.BKECluster, 
+    phasesFuncs []func(ctx *phaseframe.PhaseContext) phaseframe.Phase) {    
+    for _, f := range phasesFuncs {
+        phase := f(p.ctx)
+        if phase.NeedExecute(old, new) {  // 关键：通过 NeedExecute 判断是否需要执行
+            p.BKEPhases = append(p.BKEPhases, phase)
+        }
+    }
+}
+```
+
+### 三、升级功能详细说明
+
+#### 1. EnsureProviderSelfUpgrade - Provider 自升级
+
+**文件**：[ensure_provider_self_upgrade.go](file:////cluster-api-provider-bke/pkg/phaseframe/phases/ensure_provider_self_upgrade.go)
+
+**功能**：升级 BKE Provider 自身（管理集群中的 Deployment）
+
+**触发条件**：
+```go
+func (e *EnsureProviderSelfUpgrade) NeedExecute(old, new) bool {
+    // Provider 版本变化
+    return old.Spec.ProviderVersion != new.Spec.ProviderVersion
+}
+```
+**执行逻辑**：
+- Patch Provider Deployment 的镜像版本
+- 等待 Deployment rollout 完成
+
+#### 2. EnsureAgentUpgrade - Agent 升级
+
+**文件**：[ensure_agent_upgrade.go](file:////cluster-api-provider-bke/pkg/phaseframe/phases/ensure_agent_upgrade.go)
+
+**功能**：升级业务集群中的 BKEAgent DaemonSet
+
+**触发条件**：
+```go
+func (e *EnsureAgentUpgrade) NeedExecute(old, new) bool {
+    // Agent 版本变化
+    return old.Spec.AgentVersion != new.Spec.AgentVersion
+}
+```
+**执行逻辑**：
+- Patch BKEAgent DaemonSet 的镜像版本
+- 等待所有 Pod 滚动升级完成
+
+#### 3. EnsureContainerdUpgrade - Containerd 升级
+
+**文件**：[ensure_containerd_upgrade.go](file:////cluster-api-provider-bke/pkg/phaseframe/phases/ensure_containerd_upgrade.go)
+
+**功能**：升级所有节点的 Containerd 运行时
+
+**触发条件**：
+```go
+func (e *EnsureContainerdUpgrade) NeedExecute(old, new) bool {
+    // Containerd 版本变化
+    return old.Spec.ContainerdVersion != new.Spec.ContainerdVersion
+}
+```
+**执行逻辑**：
+- 创建 `k8s-containerd-reset` Command（重置 Containerd）
+- 创建 `k8s-containerd-redeploy` Command（重新部署 Containerd）
+- 等待所有节点执行完成
+
+#### 4. EnsureEtcdUpgrade - Etcd 升级
+
+**文件**：[ensure_etcd_upgrade.go](file:////cluster-api-provider-bke/pkg/phaseframe/phases/ensure_etcd_upgrade.go)
+
+**功能**：滚动升级 Etcd 集群
+
+**触发条件**：
+```go
+func (e *EnsureEtcdUpgrade) NeedExecute(old, new) bool {
+    // Etcd 版本变化
+    return old.Spec.EtcdVersion != new.Spec.EtcdVersion
+}
+```
+**执行逻辑**：
+- 逐个升级 Etcd 成员（滚动升级）
+- 每个成员升级前进行健康检查
+- 升级后验证 Etcd 集群健康
+
+#### 5. EnsureMasterUpgrade - Master 升级
+
+**文件**：[ensure_master_upgrade.go](file:////cluster-api-provider-bke/pkg/phaseframe/phases/ensure_master_upgrade.go)
+
+**功能**：滚动升级 Master 节点
+
+**触发条件**：
+```go
+func (e *EnsureMasterUpgrade) NeedExecute(old, new) bool {
+    // Kubernetes 版本变化
+    if new.Spec.KubernetesVersion != new.Status.KubernetesVersion {
+        // 获取需要升级的 Master 节点
+        nodes := phaseutil.GetNeedUpgradeMasterNodesWithBKENodes(new, bkeNodes)
+        return nodes.Length() > 0
+    }
+    return false
+}
+```
+**执行逻辑**：
+```go
+func (e *EnsureMasterUpgrade) reconcileMasterUpgrade() (ctrl.Result, error) {
+    if bkeCluster.Spec.KubernetesVersion != bkeCluster.Status.KubernetesVersion {
+        return e.rolloutUpgrade()  // 滚动升级
+    }
+    return ctrl.Result{}, nil
+}
+
+func (e *EnsureMasterUpgrade) rolloutUpgrade() (ctrl.Result, error) {
+    // 1. 获取需要升级的 Master 节点
+    nodes := phaseutil.GetNeedUpgradeMasterNodesWithBKENodes(...)
+    
+    // 2. 逐个升级（滚动升级）
+    for _, node := range nodes {
+        // a. Cordon 节点（标记不可调度）
+        // b. Drain 节点（驱逐 Pod）
+        // c. 创建升级 Command
+        // d. 等待升级完成
+        // e. Uncordon 节点（恢复调度）
+    }
+    
+    // 3. 更新 Status.KubernetesVersion
+}
+```
+
+#### 6. EnsureWorkerUpgrade - Worker 升级
+
+**文件**：[ensure_worker_upgrade.go](file:////cluster-api-provider-bke/pkg/phaseframe/phases/ensure_worker_upgrade.go)
+
+**功能**：滚动升级 Worker 节点
+
+**触发条件**：
+```go
+func (e *EnsureWorkerUpgrade) NeedExecute(old, new) bool {
+    // Kubernetes 版本变化
+    if new.Spec.KubernetesVersion != new.Status.KubernetesVersion {
+        // 获取需要升级的 Worker 节点
+        nodes := phaseutil.GetNeedUpgradeWorkerNodesWithBKENodes(new, bkeNodes)
+        return nodes.Length() > 0
+    }
+    return false
+}
+```
+**执行逻辑**：
+```go
+func (e *EnsureWorkerUpgrade) Execute() (ctrl.Result, error) {
+    // 1. 获取需要升级的 Worker 节点
+    nodes := phaseutil.GetNeedUpgradeWorkerNodesWithBKENodes(...)
+    
+    // 2. 逐个升级（滚动升级）
+    for _, node := range nodes {
+        // a. Cordon 节点
+        // b. Drain 节点
+        // c. 创建升级 Command
+        upgradeCmd := createUpgradeCommand(CreateUpgradeCommandParams{
+            Node:  node,
+            Phase: "UpgradeWorker",
+        })
+        // d. 等待升级完成
+        // e. Uncordon 节点
+    }
+    
+    // 3. 更新 Status.KubernetesVersion
+}
+```
+
+#### 7. EnsureComponentUpgrade - 组件升级
+
+**文件**：[ensure_component_upgrade.go](file:////cluster-api-provider-bke/pkg/phaseframe/phases/ensure_component_upgrade.go)
+
+**功能**：升级 openFuyao 核心组件（如 CNI、CSI 等）
+
+**触发条件**：
+```go
+func (e *EnsureComponentUpgrade) NeedExecute(old, new) bool {
+    // 组件版本变化
+    return old.Spec.ComponentVersions != new.Spec.ComponentVersions
+}
+```
+**执行逻辑**：
+- Patch 组件 ConfigMap/Deployment 的镜像版本
+- 等待组件 rollout 完成
+
+### 四、扩缩容功能详细说明
+
+#### 1. EnsureMasterJoin - Master 扩容
+
+**文件**：[ensure_master_join.go](file:////cluster-api-provider-bke/pkg/phaseframe/phases/ensure_master_join.go)
+
+**功能**：添加新的 Master 节点
+
+**触发条件**：
+```go
+func (e *EnsureMasterJoin) NeedExecute(old, new) bool {
+    // Master 节点数量增加
+    oldMasterCount := len(old.Spec.Nodes.Master)
+    newMasterCount := len(new.Spec.Nodes.Master)
+    return newMasterCount > oldMasterCount
+}
+```
+**执行逻辑**：
+- 获取新增的 Master 节点
+- 为每个节点创建 Bootstrap Command
+- 等待节点加入集群
+
+#### 2. EnsureWorkerJoin - Worker 扩容
+
+**文件**：[ensure_worker_join.go](file:////cluster-api-provider-bke/pkg/phaseframe/phases/ensure_worker_join.go)
+
+**功能**：添加新的 Worker 节点
+
+**触发条件**：
+```go
+func (e *EnsureWorkerJoin) NeedExecute(old, new) bool {
+    // Worker 节点数量增加
+    oldWorkerCount := len(old.Spec.Nodes.Worker)
+    newWorkerCount := len(new.Spec.Nodes.Worker)
+    return newWorkerCount > oldWorkerCount
+}
+```
+**执行逻辑**：
+- 获取新增的 Worker 节点
+- 为每个节点创建 Bootstrap Command
+- 等待节点加入集群
+
+#### 3. EnsureMasterDelete - Master 缩容
+
+**文件**：[ensure_master_delete.go](file:////cluster-api-provider-bke/pkg/phaseframe/phases/ensure_master_delete.go)
+
+**功能**：删除 Master 节点
+
+**触发条件**：
+```go
+func (e *EnsureMasterDelete) NeedExecute(old, new) bool {
+    // Master 节点数量减少
+    oldMasterCount := len(old.Spec.Nodes.Master)
+    newMasterCount := len(new.Spec.Nodes.Master)
+    return newMasterCount < oldMasterCount
+}
+```
+**执行逻辑**：
+- 获取需要删除的 Master 节点
+- Drain 节点（驱逐 Pod）
+- 删除节点
+- 清理相关资源
+
+#### 4. EnsureWorkerDelete - Worker 缩容
+
+**文件**：[ensure_worker_delete.go](file:////cluster-api-provider-bke/pkg/phaseframe/phases/ensure_worker_delete.go)
+
+**功能**：删除 Worker 节点
+
+**触发条件**：
+```go
+func (e *EnsureWorkerDelete) NeedExecute(old, new) bool {
+    // Worker 节点数量减少
+    nodes := phaseutil.GetNeedDeleteWorkerNodes(e.Ctx, e.Ctx.Client, new)
+    return nodes.Length() > 0
+}
+```
+**执行逻辑**：
+```go
+func (e *EnsureWorkerDelete) Execute() (ctrl.Result, error) {
+    // 1. 获取需要删除的 Worker 节点
+    nodes := phaseutil.GetNeedDeleteWorkerNodes(...)
+    
+    // 2. 逐个删除
+    for _, node := range nodes {
+        // a. Cordon 节点
+        // b. Drain 节点
+        // c. 删除 Machine
+        // d. 删除 BKEMachine
+        // e. 清理节点资源
+    }
+    
+    // 3. 等待删除完成
+    return e.waitWorkerDelete()
+}
+```
+
+### 五、执行流程图
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  BKECluster Controller Reconcile                                    │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  PhaseFlow.CalculatePhase(old, new)                                 │
+│     └── 计算需要执行的 Phase                                          │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  determinePhasesFuncs()                                             │
+│     ├── 删除/重置？→ DeletePhases                                     │
+│     └── 否则 → FullPhasesRegisFunc                                   │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  calculateAndAddPhases(old, new, phasesFuncs)                       │
+│     └── 遍历所有 Phase，调用 NeedExecute() 判断                        │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                ┌───────────────┴───────────────┐
+                │                               │
+                ▼                               ▼
+┌──────────────────────────┐      ┌──────────────────────────┐
+│  升级场景                 │      │  扩缩容场景                │
+│                          │      │                          │
+│  NeedExecute() 检测：     │      │  NeedExecute() 检测：     │
+│  - K8s 版本变化           │      │  - 节点数量变化            │
+│  - Etcd 版本变化          │      │                          │
+│  - Containerd 版本变化    │      │                          │
+│  - Agent 版本变化         │      │                          │
+│  - 组件版本变化            │      │                          │
+└──────────────────────────┘      └──────────────────────────┘
+                │                               │
+                ▼                               ▼
+┌──────────────────────────┐      ┌──────────────────────────┐
+│  升级 Phase 执行顺序：     │      │  扩缩容 Phase 执行：        │
+│                          │      │                          │
+│  1. ProviderSelfUpgrade  │      │  Master 扩容：            │
+│  2. AgentUpgrade         │      │    EnsureMasterJoin      │
+│  3. ContainerdUpgrade    │      │                          │
+│  4. EtcdUpgrade          │      │  Worker 扩容：            │
+│  5. MasterUpgrade        │      │    EnsureWorkerJoin      │
+│  6. WorkerUpgrade        │      │                          │
+│  7. ComponentUpgrade     │      │  Master 缩容：            │
+│                          │      │    EnsureMasterDelete    │
+│                          │      │                          │
+│                          │      │  Worker 缩容：            │
+│                          │      │    EnsureWorkerDelete    │
+└──────────────────────────┘      └──────────────────────────┘
+                │                               │
+                └───────────────┬───────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  PhaseFlow.Execute()                                                │
+│     └── 按顺序执行所有待执行的 Phase                                    │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 六、关键判断函数
+
+#### 1. NeedExecute - 判断是否需要执行
+
+每个 Phase 都实现了 `NeedExecute(old, new)` 方法：
+```go
+// 基础实现
+func (b *BasePhase) DefaultNeedExecute(old, new) bool {
+    // 1. 检查是否已成功执行
+    if b.GetStatus() == bkev1beta1.PhaseSucceeded {
+        return false
+    }
+    
+    // 2. 检查是否正在执行
+    if b.GetStatus() == bkev1beta1.PhaseRunning {
+        return true
+    }
+    
+    return true
+}
+
+// 具体实现示例（Master 升级）
+func (e *EnsureMasterUpgrade) NeedExecute(old, new) bool {
+    if !e.BasePhase.DefaultNeedExecute(old, new) {
+        return false
+    }
+    
+    // 检查 K8s 版本是否变化
+    if new.Spec.KubernetesVersion == new.Status.KubernetesVersion {
+        return false
+    }
+    
+    // 检查是否有需要升级的节点
+    nodes := phaseutil.GetNeedUpgradeMasterNodesWithBKENodes(new, bkeNodes)
+    return nodes.Length() > 0
+}
+```
+
+#### 2. GetNeedUpgradeMasterNodes - 获取需要升级的 Master 节点
+
+```go
+func GetNeedUpgradeMasterNodesWithBKENodes(bkeCluster *bkev1beta1.BKECluster, bkeNodes []*bkev1beta1.BKENode) bkenode.Nodes {
+    var nodes bkenode.Nodes
+    
+    for _, bkeNode := range bkeNodes {
+        // 检查节点是否为 Master
+        if !bkeNode.Spec.IsMaster {
+            continue
+        }
+        
+        // 检查节点版本是否需要升级
+        if bkeNode.Status.KubernetesVersion != bkeCluster.Spec.KubernetesVersion {
+            nodes = append(nodes, bkeNode.ToNode())
+        }
+    }
+    
+    return nodes
+}
+```
+
+#### 3. GetNeedDeleteWorkerNodes - 获取需要删除的 Worker 节点
+
+```go
+func GetNeedDeleteWorkerNodes(ctx, client, bkeCluster) bkenode.Nodes {
+    // 1. 检查是否有预约删除的节点
+    if v, ok := annotation.HasAnnotation(bkeCluster, annotation.AppointmentDeletedNodesAnnotationKey); ok {
+        // 解析预约删除的节点列表
+        nodes := parseAppointmentNodes(v)
+        return nodes
+    }
+    
+    // 2. 比较 Spec 和 Status 中的节点数量
+    specWorkerCount := len(bkeCluster.Spec.Nodes.Worker)
+    statusWorkerCount := len(bkeCluster.Status.Nodes.Worker)
+    
+    if statusWorkerCount > specWorkerCount {
+        // 需要删除多余的节点
+        return getNodesToDelete(...)
+    }
+    
+    return nil
+}
+```
+
+### 七、Webhook 验证
+
+**文件**：[webhooks/capbke/bkecluster.go](file:////cluster-api-provider-bke/webhooks/capbke/bkecluster.go)
+
+#### 1. Kubernetes 版本升级验证
+
+```go
+func (webhook *BKECluster) validateKubernetesVersionUpgrade(newBKECluster, oldBKECluster) error {
+    // 1. 比较版本是否为升级
+    newVersion := semver.MustParse(newBKECluster.Spec.KubernetesVersion)
+    oldVersion := semver.MustParse(oldBKECluster.Status.KubernetesVersion)
+    
+    if !newVersion.GT(oldVersion) {
+        return fmt.Errorf("kubernetes version downgrade is not allowed")
+    }
+    
+    // 2. 检查是否为 'other' 类型集群
+    if newBKECluster.Spec.ClusterType == "other" {
+        return fmt.Errorf("'other' type cluster does not support kubernetes version upgrade")
+    }
+    
+    return nil
+}
+```
+
+#### 2. 集群可升级性验证
+
+```go
+func (webhook *BKECluster) validateCommonUpgradeability(ctx, newBKECluster, oldBKECluster) error {
+    // 1. 集群必须健康才能升级
+    if !conditions.IsTrue(newBKECluster, bkev1beta1.ReadyCondition) {
+        return fmt.Errorf("BKECluster is not in a ready state and cannot be upgraded")
+    }
+    
+    // 2. 所有节点的 Agent 必须存活
+    for _, node := range newBKECluster.Status.Nodes {
+        if !isAgentAlive(node) {
+            return fmt.Errorf("node %s BKEAgent is not alive, cannot be upgraded", node.IP)
+        }
+    }
+    
+    return nil
+}
+```
+
+### 八、总结
+
+**升级功能清单**：
+
+| Phase | 功能 | 触发条件 | 文件 |
+|-------|------|---------|------|
+| EnsureProviderSelfUpgrade | Provider 自升级 | ProviderVersion 变化 | ensure_provider_self_upgrade.go |
+| EnsureAgentUpgrade | Agent 升级 | AgentVersion 变化 | ensure_agent_upgrade.go |
+| EnsureContainerdUpgrade | Containerd 升级 | ContainerdVersion 变化 | ensure_containerd_upgrade.go |
+| EnsureEtcdUpgrade | Etcd 升级 | EtcdVersion 变化 | ensure_etcd_upgrade.go |
+| EnsureMasterUpgrade | Master 升级 | KubernetesVersion 变化 | ensure_master_upgrade.go |
+| EnsureWorkerUpgrade | Worker 升级 | KubernetesVersion 变化 | ensure_worker_upgrade.go |
+| EnsureComponentUpgrade | 组件升级 | ComponentVersions 变化 | ensure_component_upgrade.go |
+
+**扩缩容功能清单**：
+
+| Phase | 功能 | 触发条件 | 文件 |
+|-------|------|---------|------|
+| EnsureMasterJoin | Master 扩容 | Master 节点数量增加 | ensure_master_join.go |
+| EnsureWorkerJoin | Worker 扩容 | Worker 节点数量增加 | ensure_worker_join.go |
+| EnsureMasterDelete | Master 缩容 | Master 节点数量减少 | ensure_master_delete.go |
+| EnsureWorkerDelete | Worker 缩容 | Worker 节点数量减少 | ensure_worker_delete.go |
+
+**代码入口**：
+- **Phase 注册**：`pkg/phaseframe/phases/list.go`
+- **Phase 执行**：`pkg/phaseframe/phases/phase_flow.go`
+- **具体实现**：`pkg/phaseframe/phases/ensure_*_upgrade.go` 和 `ensure_*_delete.go`
+- **Webhook 验证**：`webhooks/capbke/bkecluster.go`
+
+**关键机制**：
+- ✅ 通过 `NeedExecute(old, new)` 动态判断是否需要执行
+- ✅ 升级采用滚动升级策略（逐个节点升级）
+- ✅ 扩缩容通过节点数量变化触发
+- ✅ Webhook 验证升级的合法性和集群的可升级性
+- ✅ 所有操作都通过 Command CRD 异步执行
+
+# 详细说明 BKEClusterReconciler 的触发执行条件和场景区分机制
+
+## BKEClusterReconciler 触发执行与场景区分
+
+### 一、触发执行条件
+
+#### 1. SetupWithManager 定义
+
+**文件**：[bkecluster_controller.go:248-279](file:////cluster-api-provider-bke/controllers/capbke/bkecluster_controller.go#L248-L279)
+```go
+func (r *BKEClusterReconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager, options controller.Options) error {
+    c, err := ctrl.NewControllerManagedBy(mgr).
+        // 1. Watch BKECluster 自身
+        For(&bkev1beta1.BKECluster{},
+            builder.WithPredicates(predicate.Or(
+                bkepredicates.BKEClusterAnnotationsChange(),  // Annotation 变化
+                bkepredicates.BKEClusterSpecChange(),         // Spec 变化
+            )),
+        ).
+        // 2. Watch Cluster API Cluster
+        Watches(
+            &clusterv1.Cluster{},
+            handler.EnqueueRequestsFromMapFunc(clusterToBKEClusterMapFunc(...)),
+            builder.WithPredicates(bkepredicates.ClusterUnPause()),
+        ).
+        // 3. Watch BKENode
+        Watches(
+            &confv1beta1.BKENode{},
+            handler.EnqueueRequestsFromMapFunc(r.bkeNodeToBKEClusterMapFunc()),
+            builder.WithPredicates(bkepredicates.BKENodeChange()),
+        ).
+        Build(r)
+}
+```
+
+#### 2. 触发源详细说明
+
+| 触发源 | Predicate | 触发条件 | 说明 |
+|--------|-----------|---------|------|
+| **BKECluster 创建** | `BKEClusterSpecChange` | 新建 BKECluster | 安装场景 |
+| **BKECluster Spec 变化** | `BKEClusterSpecChange` | Generation 变化 | 升级/扩缩容场景 |
+| **BKECluster Annotation 变化** | `BKEClusterAnnotationsChange` | 特定 annotation 变化 | 重试、节点预约等 |
+| **Cluster API Cluster 变化** | `ClusterUnPause` | Cluster.Spec.Paused=false | CAPI 状态同步 |
+| **BKENode 创建/更新/删除** | `BKENodeChange` | BKENode 状态变化 | 节点状态同步 |
+| **业务集群 Node 状态变化** | `NodeNotReadyPredicate` | Node NotReady | 健康检查触发 |
+
+### 二、Predicate 过滤器详解
+
+#### 1. BKEClusterSpecChange - Spec 变化触发
+
+```go
+func BKEClusterSpecChange() predicate.Funcs {
+    return predicate.Funcs{
+        UpdateFunc: func(e event.UpdateEvent) bool {
+            newObj := e.ObjectNew.(*bkev1beta1.BKECluster)
+            oldObj := e.ObjectOld.(*bkev1beta1.BKECluster)
+            
+            // 1. Generation 变化（Spec 变化）
+            if newObj.Generation != oldObj.Generation {
+                // 2. 删除中 → 触发
+                if !newObj.DeletionTimestamp.IsZero() {
+                    return true
+                }
+                
+                // 3. 暂停状态变更 → 触发
+                if oldObj.Spec.Pause != newObj.Spec.Pause {
+                    return true
+                }
+                
+                // 4. 内部修改 → 跳过
+                if condition.HasCondition(InternalSpecChangeCondition, newObj) {
+                    return false
+                }
+                
+                // 5. Deploying 状态 → 跳过
+                if newObj.Status.ClusterHealthState == Deploying {
+                    return false
+                }
+                
+                return true
+            }
+            return false
+        },
+        CreateFunc: func(e event.CreateEvent) bool {
+            return true  // 创建时始终触发
+        },
+    }
+}
+```
+**触发场景**：
+- ✅ 版本升级（KubernetesVersion、EtcdVersion 等变化）
+- ✅ 节点扩缩容（Nodes.Master/Worker 数量变化）
+- ✅ 配置变更（ClusterConfig 变化）
+- ✅ 暂停状态变更
+- ❌ 内部修改（Controller 自动修改的 Spec）
+- ❌ Deploying 状态下的更新
+
+#### 2. BKEClusterAnnotationsChange - Annotation 变化触发
+
+```go
+func BKEClusterAnnotationsChange() predicate.Funcs {
+    return predicate.Funcs{
+        UpdateFunc: func(e event.UpdateEvent) bool {
+            newObj := e.ObjectNew.(*bkev1beta1.BKECluster)
+            oldObj := e.ObjectOld.(*bkev1beta1.BKECluster)
+            
+            // 只监听特定的 annotation 变化
+            allowChangeAnnotations := []string{
+                annotation.AppointmentDeletedNodesAnnotationKey,    // 预约删除节点
+                annotation.AppointmentAddNodesAnnotationKey,        // 预约添加节点
+                annotation.RetryAnnotationKey,                      // 重试
+                annotation.ClusterTrackerHealthyCheckFailedAnnotationKey,  // 健康检查失败
+            }
+            
+            for _, key := range allowChangeAnnotations {
+                newV, newFound := annotation.HasAnnotation(newObj, key)
+                oldV, oldFound := annotation.HasAnnotation(oldObj, key)
+                if (newV != oldV) || (newFound && !oldFound) {
+                    return true
+                }
+            }
+            return false
+        },
+    }
+}
+```
+**触发场景**：
+- ✅ 预约删除节点（缩容）
+- ✅ 预约添加节点（扩容）
+- ✅ 重试操作
+- ✅ 健康检查失败标记
+
+#### 3. BKENodeChange - BKENode 状态变化触发
+
+```go
+func BKENodeChange() predicate.Funcs {
+    return predicate.Funcs{
+        CreateFunc: func(e event.CreateEvent) bool {
+            return true  // BKENode 创建时触发
+        },
+        UpdateFunc: func(e event.UpdateEvent) bool {
+            newObj := e.ObjectNew.(*confv1beta1.BKENode)
+            oldObj := e.ObjectOld.(*confv1beta1.BKENode)
+            
+            // 状态变化时触发
+            return newObj.Status != oldObj.Status
+        },
+        DeleteFunc: func(e event.DeleteEvent) bool {
+            return true  // BKENode 删除时触发
+        },
+    }
+}
+```
+**触发场景**：
+- ✅ 新节点加入（BKENode 创建）
+- ✅ 节点状态变化（Ready、Failed 等）
+- ✅ 节点删除（BKENode 删除）
+
+### 三、场景区分机制
+
+#### 1. Phase 执行流程
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  BKECluster Controller Reconcile                                    │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  1. executePhaseFlow()                                              │
+│     └── PhaseFlow.CalculatePhase(old, new)                          │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  2. determinePhasesFuncs()                                          │
+│     ├── 删除/重置？→ DeletePhases                                     │
+│     └── 否则 → FullPhasesRegisFunc                                   │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  3. calculateAndAddPhases(old, new, phasesFuncs)                    │
+│     └── 遍历所有 Phase，调用 NeedExecute() 判断                        │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  4. PhaseFlow.Execute()                                             │
+│     ├── determinePhases() → 获取待执行的 Phase 列表                    │
+│     └── executePhases() → 执行 Phase 并更新 ClusterStatus             │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 2. NeedExecute - 场景判断核心
+
+每个 Phase 通过 `NeedExecute(old, new)` 判断是否需要执行：
+
+**安装场景判断**：
+```go
+// EnsureMasterInit - Master 初始化
+func (e *EnsureMasterInit) NeedExecute(old, new) bool {
+    // 控制平面未初始化
+    return !conditions.IsTrue(new, ControlPlaneInitializedCondition)
+}
+
+// EnsureWorkerJoin - Worker 加入
+func (e *EnsureWorkerJoin) NeedExecute(old, new) bool {
+    // 有新的 Worker 节点需要加入
+    nodes := GetNeedJoinWorkerNodes(new)
+    return nodes.Length() > 0
+}
+```
+
+**升级场景判断**：
+```go
+// EnsureMasterUpgrade - Master 升级
+func (e *EnsureMasterUpgrade) NeedExecute(old, new) bool {
+    // Kubernetes 版本变化
+    if new.Spec.KubernetesVersion != new.Status.KubernetesVersion {
+        // 有需要升级的 Master 节点
+        nodes := GetNeedUpgradeMasterNodes(new)
+        return nodes.Length() > 0
+    }
+    return false
+}
+
+// EnsureEtcdUpgrade - Etcd 升级
+func (e *EnsureEtcdUpgrade) NeedExecute(old, new) bool {
+    // Etcd 版本变化
+    return new.Spec.EtcdVersion != new.Status.EtcdVersion
+}
+```
+
+**扩缩容场景判断**：
+```go
+// EnsureMasterJoin - Master 扩容
+func (e *EnsureMasterJoin) NeedExecute(old, new) bool {
+    // Master 节点数量增加
+    oldCount := len(old.Spec.Nodes.Master)
+    newCount := len(new.Spec.Nodes.Master)
+    return newCount > oldCount
+}
+
+// EnsureWorkerDelete - Worker 缩容
+func (e *EnsureWorkerDelete) NeedExecute(old, new) bool {
+    // 有需要删除的 Worker 节点
+    nodes := GetNeedDeleteWorkerNodes(new)
+    return nodes.Length() > 0
+}
+```
+
+#### 3. ClusterStatus 状态转换
+
+通过 `calculateClusterStatusByPhase()` 设置不同的 ClusterStatus：
+```go
+func calculateClusterStatusByPhase(phase phaseframe.Phase, err error) error {
+    phaseName := phase.Name()
+    
+    switch {
+    // 安装场景
+    case phaseName.In(ClusterInitPhaseNames):
+        handleClusterInitPhase(ctx, err)
+        // → ClusterInitializing / ClusterInitializationFailed
+    
+    // 升级场景
+    case phaseName.In(ClusterUpgradePhaseNames):
+        handleClusterUpgradePhase(ctx, err)
+        // → ClusterUpgrading / ClusterUpgradeFailed
+    
+    // Master 扩容场景
+    case phaseName.In(ClusterScaleMasterUpPhaseNames):
+        handleClusterScaleMasterUpPhase(ctx, err)
+        // → ClusterMasterScalingUp / ClusterScaleFailed
+    
+    // Worker 扩容场景
+    case phaseName.In(ClusterScaleWorkerUpPhaseNames):
+        handleClusterScaleWorkerUpPhase(ctx, err)
+        // → ClusterWorkerScalingUp / ClusterScaleFailed
+    
+    // Master 缩容场景
+    case phaseName.In(ClusterScaleMasterDownPhaseNames):
+        handleClusterScaleMasterDownPhase(ctx, err)
+        // → ClusterMasterScalingDown / ClusterScaleFailed
+    
+    // Worker 缩容场景
+    case phaseName.In(ClusterScaleWorkerDownPhaseNames):
+        handleClusterScaleWorkerDownPhase(ctx, err)
+        // → ClusterWorkerScalingDown / ClusterScaleFailed
+    
+    // 删除场景
+    case phaseName.In(ClusterDeletePhaseNames):
+        handleClusterDeletePhase(ctx, err)
+        // → ClusterDeleting / ClusterDeleteFailed
+    
+    // 暂停场景
+    case phaseName.In(ClusterPausedPhaseNames):
+        handleClusterPausedPhase(ctx, err)
+        // → ClusterPaused / ClusterPauseFailed
+    }
+}
+```
+
+### 四、场景区分流程图
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  BKECluster Reconcile 触发                                           │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                ┌───────────────┴───────────────┐
+                │                               │
+                ▼                               ▼
+┌──────────────────────────┐      ┌──────────────────────────┐
+│  BKECluster 创建          │      │  BKECluster Spec 变化    │
+│  (Generation 初始化)      │      │  (Generation 增加)        │
+└──────────────────────────┘      └──────────────────────────┘
+                │                               │
+                └───────────────┬───────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  PhaseFlow.CalculatePhase(old, new)                                 │
+│     └── 遍历所有 Phase，调用 NeedExecute()                            │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                ┌───────────────┼───────────────┬───────────────┐
+                │               │               │               │
+                ▼               ▼               ▼               ▼
+┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+│ 安装场景      │ │ 升级场景       │ │ 扩容场景      │ │ 缩容场景      │
+│              │ │              │ │              │ │              │
+│ NeedExecute: │ │ NeedExecute: │ │ NeedExecute: │ │ NeedExecute: │
+│ • 无旧集群    │ │ • 版本变化    │ │ • 节点增加     │ │ • 节点减少    │
+│ • Status 空  │ │ • Status≠Spec│ │              │ │              │
+└──────────────┘ └──────────────┘ └──────────────┘ └──────────────┘
+        │               │               │               │
+        ▼               ▼               ▼               ▼
+┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+│ ClusterInit  │ │ ClusterUpgrad│ │ ClusterScale │ │ ClusterScale │
+│ PhaseNames   │ │ PhaseNames   │ │ UpPhaseNames │ │ DownPhaseNames│
+│              │ │              │ │              │ │              │
+│ • EnsureCerts│ │ • EnsureEtcd │ │ • EnsureMaste│ │ • EnsureMaster│
+│ • EnsureAPI  │ │   Upgrade    │ │   rJoin      │ │   Delete      │
+│ • EnsureMast │ │ • EnsureMaste│ │ • EnsureWorke│ │ • EnsureWorker│
+│   erInit     │ │   rUpgrade   │ │   rJoin      │ │   Delete      │
+│ • EnsureWork │ │ • EnsureWorke│ │              │ │              │
+│   erJoin     │ │   rUpgrade   │ │              │ │              │
+└──────────────┘ └──────────────┘ └──────────────┘ └──────────────┘
+        │               │               │               │
+        ▼               ▼               ▼               ▼
+┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+│ClusterStatus │ │ClusterStatus │ │ClusterStatus │ │ClusterStatus │
+│              │ │              │ │              │ │              │
+│ Initializing │ │ Upgrading    │ │ Master/Worker│ │ Master/Worker│
+│              │ │              │ │ ScalingUp    │ │ ScalingDown  │
+└──────────────┘ └──────────────┘ └──────────────┘ └──────────────┘
+```
+
+### 五、场景判断示例
+
+#### 1. 安装场景
+
+```
+触发条件：
+  - BKECluster 首次创建
+  - Status.ClusterStatus == ""
+  - Status.KubernetesVersion == ""
+
+NeedExecute 判断：
+  - EnsureFinalizer: ✅ (始终执行)
+  - EnsureBKEAgent: ✅ (Agent 未部署)
+  - EnsureClusterAPIObj: ✅ (CAPI 对象不存在)
+  - EnsureCerts: ✅ (证书不存在)
+  - EnsureMasterInit: ✅ (ControlPlaneInitialized=False)
+  - EnsureMasterUpgrade: ❌ (版本相同)
+  - EnsureWorkerDelete: ❌ (无节点删除)
+
+ClusterStatus: ClusterInitializing → ClusterRunning
+```
+
+#### 2. 升级场景
+
+```
+触发条件：
+  - BKECluster.Spec.KubernetesVersion 变化
+  - BKECluster.Spec.EtcdVersion 变化
+  - Generation 增加
+
+NeedExecute 判断：
+  - EnsureFinalizer: ❌ (已执行)
+  - EnsureBKEAgent: ❌ (已部署)
+  - EnsureEtcdUpgrade: ✅ (EtcdVersion != Status.EtcdVersion)
+  - EnsureMasterUpgrade: ✅ (KubernetesVersion != Status.KubernetesVersion)
+  - EnsureWorkerUpgrade: ✅ (KubernetesVersion != Status.KubernetesVersion)
+  - EnsureMasterJoin: ❌ (节点数量未变)
+
+ClusterStatus: ClusterRunning → ClusterUpgrading → ClusterRunning
+```
+
+#### 3. 扩容场景
+
+```
+触发条件：
+  - BKECluster.Spec.Nodes.Master 数量增加
+  - 或 BKECluster.Spec.Nodes.Worker 数量增加
+  - Generation 增加
+
+NeedExecute 判断：
+  - EnsureFinalizer: ❌ (已执行)
+  - EnsureMasterJoin: ✅ (Master 数量增加)
+  - EnsureWorkerJoin: ✅ (Worker 数量增加)
+  - EnsureMasterUpgrade: ❌ (版本未变)
+  - EnsureWorkerDelete: ❌ (无节点删除)
+
+ClusterStatus: ClusterRunning → ClusterMasterScalingUp → ClusterRunning
+```
+
+#### 4. 缩容场景
+
+```
+触发条件：
+  - BKECluster.Spec.Nodes.Worker 数量减少
+  - 或设置 appointment-deleted-nodes annotation
+  - Generation 增加
+
+NeedExecute 判断：
+  - EnsureFinalizer: ❌ (已执行)
+  - EnsureWorkerDelete: ✅ (Worker 数量减少)
+  - EnsureMasterDelete: ✅ (Master 数量减少)
+  - EnsureMasterUpgrade: ❌ (版本未变)
+
+ClusterStatus: ClusterRunning → ClusterWorkerScalingDown → ClusterRunning
+```
+
+### 六、总结
+
+**触发执行条件**：
+
+| 触发源 | Predicate | 场景 |
+|--------|-----------|------|
+| BKECluster 创建 | `BKEClusterSpecChange` | 安装 |
+| BKECluster Spec 变化 | `BKEClusterSpecChange` | 升级/扩缩容 |
+| BKECluster Annotation 变化 | `BKEClusterAnnotationsChange` | 重试/预约操作 |
+| Cluster API Cluster 变化 | `ClusterUnPause` | CAPI 状态同步 |
+| BKENode 状态变化 | `BKENodeChange` | 节点状态同步 |
+| 业务集群 Node 状态变化 | `NodeNotReadyPredicate` | 健康检查 |
+
+**场景区分机制**：
+
+1. **Phase NeedExecute()**：判断是否需要执行该 Phase
+2. **ClusterStatus 状态转换**：通过 Phase 名称分组设置不同状态
+3. **Phase 名称分组**：
+   - `ClusterInitPhaseNames`：安装场景
+   - `ClusterUpgradePhaseNames`：升级场景
+   - `ClusterScaleMasterUpPhaseNames`：Master 扩容
+   - `ClusterScaleWorkerUpPhaseNames`：Worker 扩容
+   - `ClusterScaleMasterDownPhaseNames`：Master 缩容
+   - `ClusterScaleWorkerDownPhaseNames`：Worker 缩容
+
+**关键设计**：
+- ✅ 通过 Predicate 过滤不必要的触发
+- ✅ 通过 NeedExecute 动态判断场景
+- ✅ 通过 ClusterStatus 状态机管理生命周期
+- ✅ 通过 Phase 名称分组实现场景区分
+- ✅ 支持多种触发源（Spec、Annotation、外部资源）
+
+# 重构方案：根据场景组装不同的 Phase，而不是统一使用 NeedExecute
+
+## 重构方案：根据场景组装 Phase
+
+### 一、当前实现的问题
+
+```go
+// 当前实现：所有 Phase 都注册，通过 NeedExecute 过滤
+func (p *PhaseFlow) calculateAndAddPhases(old, new, phasesFuncs) {
+    for _, f := range phasesFuncs {
+        phase := f(p.ctx)
+        if phase.NeedExecute(old, new) {  // ❌ 每个 Phase 都要判断
+            p.BKEPhases = append(p.BKEPhases, phase)
+        }
+    }
+}
+
+// 问题：
+// 1. 所有 Phase 都会被创建（性能浪费）
+// 2. 场景判断逻辑分散在各个 Phase 中
+// 3. NeedExecute 逻辑复杂，难以维护
+// 4. 无法直观看出不同场景的执行路径
+```
+
+### 二、重构方案
+
+#### 方案 1：场景判断函数 + Phase 组装
+
+**文件**：`pkg/phaseframe/phases/phase_flow.go`
+```go
+// Scene 场景类型
+type Scene string
+
+const (
+    SceneInit           Scene = "Init"           // 安装
+    SceneUpgrade        Scene = "Upgrade"        // 升级
+    SceneScaleUp        Scene = "ScaleUp"        // 扩容
+    SceneScaleDown      Scene = "ScaleDown"      // 缩容
+    SceneDelete         Scene = "Delete"         // 删除
+    ScenePause          Scene = "Pause"          // 暂停
+    SceneDryRun         Scene = "DryRun"         // DryRun
+    SceneManage         Scene = "Manage"         // 纳管
+    SceneHealthCheck    Scene = "HealthCheck"    // 健康检查
+)
+
+// determineScene 根据集群状态判断场景
+func (p *PhaseFlow) determineScene(old, new *bkev1beta1.BKECluster) Scene {
+    // 1. 删除场景
+    if phaseutil.IsDeleteOrReset(new) {
+        return SceneDelete
+    }
+    
+    // 2. 暂停场景
+    if old.Spec.Pause != new.Spec.Pause && new.Spec.Pause {
+        return ScenePause
+    }
+    
+    // 3. DryRun 场景
+    if v, ok := annotation.HasAnnotation(new, annotation.BKEClusterDryRunAnnotationKey); ok && v == "true" {
+        return SceneDryRun
+    }
+    
+    // 4. 纳管场景
+    if new.Spec.ClusterType == "managed" && old.Status.ClusterStatus == "" {
+        return SceneManage
+    }
+    
+    // 5. 安装场景
+    if new.Status.ClusterStatus == "" || new.Status.ClusterStatus == bkev1beta1.ClusterUnknown {
+        return SceneInit
+    }
+    
+    // 6. 升级场景
+    if p.isUpgradeScene(old, new) {
+        return SceneUpgrade
+    }
+    
+    // 7. 扩容场景
+    if p.isScaleUpScene(old, new) {
+        return SceneScaleUp
+    }
+    
+    // 8. 缩容场景
+    if p.isScaleDownScene(old, new) {
+        return SceneScaleDown
+    }
+    
+    // 9. 默认：健康检查
+    return SceneHealthCheck
+}
+
+// isUpgradeScene 判断是否为升级场景
+func (p *PhaseFlow) isUpgradeScene(old, new *bkev1beta1.BKECluster) bool {
+    // 版本变化
+    if new.Spec.KubernetesVersion != old.Status.KubernetesVersion ||
+       new.Spec.EtcdVersion != old.Status.EtcdVersion ||
+       new.Spec.ContainerdVersion != old.Status.ContainerdVersion ||
+       new.Spec.AgentVersion != old.Status.AgentVersion ||
+       new.Spec.ProviderVersion != old.Status.ProviderVersion {
+        return true
+    }
+    
+    // 组件版本变化
+    if !reflect.DeepEqual(new.Spec.ComponentVersions, old.Status.ComponentVersions) {
+        return true
+    }
+    
+    return false
+}
+
+// isScaleUpScene 判断是否为扩容场景
+func (p *PhaseFlow) isScaleUpScene(old, new *bkev1beta1.BKECluster) bool {
+    // Master 扩容
+    if len(new.Spec.Nodes.Master) > len(old.Status.Nodes.Master) {
+        return true
+    }
+    
+    // Worker 扩容
+    if len(new.Spec.Nodes.Worker) > len(old.Status.Nodes.Worker) {
+        return true
+    }
+    
+    // 预约添加节点
+    if v, ok := annotation.HasAnnotation(new, annotation.AppointmentAddNodesAnnotationKey); ok && v != "" {
+        return true
+    }
+    
+    return false
+}
+
+// isScaleDownScene 判断是否为缩容场景
+func (p *PhaseFlow) isScaleDownScene(old, new *bkev1beta1.BKECluster) bool {
+    // Master 缩容
+    if len(new.Spec.Nodes.Master) < len(old.Status.Nodes.Master) {
+        return true
+    }
+    
+    // Worker 缩容
+    if len(new.Spec.Nodes.Worker) < len(old.Status.Nodes.Worker) {
+        return true
+    }
+    
+    // 预约删除节点
+    if v, ok := annotation.HasAnnotation(new, annotation.AppointmentDeletedNodesAnnotationKey); ok && v != "" {
+        return true
+    }
+    
+    return false
+}
+
+// assemblePhasesByScene 根据场景组装 Phase 列表
+func (p *PhaseFlow) assemblePhasesByScene(scene Scene) []func(ctx *phaseframe.PhaseContext) phaseframe.Phase {
+    switch scene {
+    case SceneInit:
+        return p.assembleInitPhases()
+    case SceneUpgrade:
+        return p.assembleUpgradePhases()
+    case SceneScaleUp:
+        return p.assembleScaleUpPhases()
+    case SceneScaleDown:
+        return p.assembleScaleDownPhases()
+    case SceneDelete:
+        return DeletePhases
+    case ScenePause:
+        return []func(ctx *phaseframe.PhaseContext) phaseframe.Phase{NewEnsurePaused}
+    case SceneDryRun:
+        return []func(ctx *phaseframe.PhaseContext) phaseframe.Phase{NewEnsureDryRun}
+    case SceneManage:
+        return []func(ctx *phaseframe.PhaseContext) phaseframe.Phase{NewEnsureClusterManage}
+    case SceneHealthCheck:
+        return []func(ctx *phaseframe.PhaseContext) phaseframe.Phase{NewEnsureCluster}
+    default:
+        return []func(ctx *phaseframe.PhaseContext) phaseframe.Phase{NewEnsureCluster}
+    }
+}
+
+// assembleInitPhases 组装安装场景的 Phase
+func (p *PhaseFlow) assembleInitPhases() []func(ctx *phaseframe.PhaseContext) phaseframe.Phase {
+    phases := make([]func(ctx *phaseframe.PhaseContext) phaseframe.Phase, 0)
+    
+    // 1. Common Phases
+    phases = append(phases, NewEnsureFinalizer)
+    
+    // 2. Deploy Phases
+    phases = append(phases,
+        NewEnsureBKEAgent,
+        NewEnsureNodesEnv,
+        NewEnsureClusterAPIObj,
+        NewEnsureCerts,
+        NewEnsureLoadBalance,
+        NewEnsureMasterInit,
+        NewEnsureMasterJoin,
+        NewEnsureWorkerJoin,
+        NewEnsureAddonDeploy,
+        NewEnsureNodesPostProcess,
+        NewEnsureAgentSwitch,
+    )
+    
+    // 3. 健康检查
+    phases = append(phases, NewEnsureCluster)
+    
+    return phases
+}
+
+// assembleUpgradePhases 组装升级场景的 Phase
+func (p *PhaseFlow) assembleUpgradePhases() []func(ctx *phaseframe.PhaseContext) phaseframe.Phase {
+    phases := make([]func(ctx *phaseframe.PhaseContext) phaseframe.Phase, 0)
+    old := p.oldBKECluster
+    new := p.newBKECluster
+    
+    // 1. Provider 自升级
+    if new.Spec.ProviderVersion != old.Status.ProviderVersion {
+        phases = append(phases, NewEnsureProviderSelfUpgrade)
+    }
+    
+    // 2. Agent 升级
+    if new.Spec.AgentVersion != old.Status.AgentVersion {
+        phases = append(phases, NewEnsureAgentUpgrade)
+    }
+    
+    // 3. Containerd 升级
+    if new.Spec.ContainerdVersion != old.Status.ContainerdVersion {
+        phases = append(phases, NewEnsureContainerdUpgrade)
+    }
+    
+    // 4. Etcd 升级
+    if new.Spec.EtcdVersion != old.Status.EtcdVersion {
+        phases = append(phases, NewEnsureEtcdUpgrade)
+    }
+    
+    // 5. K8s 升级
+    if new.Spec.KubernetesVersion != old.Status.KubernetesVersion {
+        phases = append(phases,
+            NewEnsureMasterUpgrade,
+            NewEnsureWorkerUpgrade,
+        )
+    }
+    
+    // 6. 组件升级
+    if !reflect.DeepEqual(new.Spec.ComponentVersions, old.Status.ComponentVersions) {
+        phases = append(phases, NewEnsureComponentUpgrade)
+    }
+    
+    // 7. 健康检查
+    phases = append(phases, NewEnsureCluster)
+    
+    return phases
+}
+
+// assembleScaleUpPhases 组装扩容场景的 Phase
+func (p *PhaseFlow) assembleScaleUpPhases() []func(ctx *phaseframe.PhaseContext) phaseframe.Phase {
+    phases := make([]func(ctx *phaseframe.PhaseContext) phaseframe.Phase, 0)
+    old := p.oldBKECluster
+    new := p.newBKECluster
+    
+    // Master 扩容
+    if len(new.Spec.Nodes.Master) > len(old.Status.Nodes.Master) {
+        phases = append(phases, NewEnsureMasterJoin)
+    }
+    
+    // Worker 扩容
+    if len(new.Spec.Nodes.Worker) > len(old.Status.Nodes.Worker) {
+        phases = append(phases, NewEnsureWorkerJoin)
+    }
+    
+    // 健康检查
+    phases = append(phases, NewEnsureCluster)
+    
+    return phases
+}
+
+// assembleScaleDownPhases 组装缩容场景的 Phase
+func (p *PhaseFlow) assembleScaleDownPhases() []func(ctx *phaseframe.PhaseContext) phaseframe.Phase {
+    phases := make([]func(ctx *phaseframe.PhaseContext) phaseframe.Phase, 0)
+    old := p.oldBKECluster
+    new := p.newBKECluster
+    
+    // Master 缩容
+    if len(new.Spec.Nodes.Master) < len(old.Status.Nodes.Master) {
+        phases = append(phases, NewEnsureMasterDelete)
+    }
+    
+    // Worker 缩容
+    if len(new.Spec.Nodes.Worker) < len(old.Status.Nodes.Worker) {
+        phases = append(phases, NewEnsureWorkerDelete)
+    }
+    
+    // 健康检查
+    phases = append(phases, NewEnsureCluster)
+    
+    return phases
+}
+
+// CalculatePhase 重构后的实现
+func (p *PhaseFlow) CalculatePhase(old, new *bkev1beta1.BKECluster) error {
+    // 1. 判断场景
+    scene := p.determineScene(old, new)
+    p.ctx.Log.Info("Determined scene: %s", scene)
+    
+    // 2. 根据场景组装 Phase
+    phasesFuncs := p.assemblePhasesByScene(scene)
+    
+    // 3. 创建 Phase 实例（无需 NeedExecute 判断）
+    for _, f := range phasesFuncs {
+        phase := f(p.ctx)
+        p.BKEPhases = append(p.BKEPhases, phase)
+    }
+    
+    // 4. 上报 Phase 状态
+    return p.ReportPhaseStatus()
+}
+```
+
+#### 方案 2：场景注册表模式
+
+**文件**：`pkg/phaseframe/phases/scene_registry.go`
+```go
+package phases
+
+import (
+    "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe"
+)
+
+// SceneHandler 场景处理器
+type SceneHandler struct {
+    // Determine 判断是否为该场景
+    Determine func(old, new *bkev1beta1.BKECluster) bool
+    // Assemble 组装该场景的 Phase
+    Assemble func(ctx *phaseframe.PhaseContext, old, new *bkev1beta1.BKECluster) []phaseframe.Phase
+}
+
+// SceneRegistry 场景注册表
+var SceneRegistry = []SceneHandler{
+    {Determine: isDeleteScene, Assemble: assembleDeletePhases},
+    {Determine: isPauseScene, Assemble: assemblePausePhases},
+    {Determine: isDryRunScene, Assemble: assembleDryRunPhases},
+    {Determine: isManageScene, Assemble: assembleManagePhases},
+    {Determine: isInitScene, Assemble: assembleInitPhases},
+    {Determine: isUpgradeScene, Assemble: assembleUpgradePhases},
+    {Determine: isScaleUpScene, Assemble: assembleScaleUpPhases},
+    {Determine: isScaleDownScene, Assemble: assembleScaleDownPhases},
+    {Determine: isHealthCheckScene, Assemble: assembleHealthCheckPhases},
+}
+
+// CalculatePhase 使用场景注册表
+func (p *PhaseFlow) CalculatePhase(old, new *bkev1beta1.BKECluster) error {
+    // 遍历场景注册表，找到第一个匹配的场景
+    for _, handler := range SceneRegistry {
+        if handler.Determine(old, new) {
+            phases := handler.Assemble(p.ctx, old, new)
+            p.BKEPhases = append(p.BKEPhases, phases...)
+            break
+        }
+    }
+    
+    return p.ReportPhaseStatus()
+}
+```
+
+### 三、重构后的优势
+
+#### 1. 性能提升
+
+```go
+// 重构前：创建所有 Phase，再过滤
+for _, f := range FullPhasesRegisFunc {  // 26 个 Phase
+    phase := f(p.ctx)  // 创建 26 个 Phase 实例
+    if phase.NeedExecute(old, new) {  // 判断 26 次
+        p.BKEPhases = append(p.BKEPhases, phase)
+    }
+}
+
+// 重构后：只创建需要的 Phase
+scene := p.determineScene(old, new)  // 判断 1 次
+phasesFuncs := p.assemblePhasesByScene(scene)  // 只组装需要的 Phase
+for _, f := range phasesFuncs {  // 例如升级场景只有 7 个 Phase
+    phase := f(p.ctx)  // 只创建 7 个 Phase 实例
+    p.BKEPhases = append(p.BKEPhases, phase)
+}
+```
+
+#### 2. 代码可读性提升
+
+```go
+// 重构前：场景判断分散在各个 Phase 中
+func (e *EnsureMasterUpgrade) NeedExecute(old, new) bool {
+    // 版本判断
+    if new.Spec.KubernetesVersion != new.Status.KubernetesVersion {
+        nodes := GetNeedUpgradeMasterNodes(new)
+        return nodes.Length() > 0
+    }
+    return false
+}
+
+// 重构后：场景判断集中在一处
+func (p *PhaseFlow) isUpgradeScene(old, new) bool {
+    return new.Spec.KubernetesVersion != old.Status.KubernetesVersion ||
+           new.Spec.EtcdVersion != old.Status.EtcdVersion ||
+           new.Spec.ContainerdVersion != old.Status.ContainerdVersion
+}
+
+func (p *PhaseFlow) assembleUpgradePhases() []PhaseFunc {
+    if new.Spec.KubernetesVersion != old.Status.KubernetesVersion {
+        phases = append(phases, NewEnsureMasterUpgrade, NewEnsureWorkerUpgrade)
+    }
+    // ...
+}
+```
+
+#### 3. 执行路径清晰
+
+```go
+// 重构前：无法直观看出执行路径
+FullPhasesRegisFunc = CommonPhases + DeployPhases + PostDeployPhases  // 26 个 Phase
+
+// 重构后：每个场景的执行路径一目了然
+SceneInit:      [EnsureFinalizer, EnsureBKEAgent, ..., EnsureCluster]  // 13 个 Phase
+SceneUpgrade:   [EnsureEtcdUpgrade, EnsureMasterUpgrade, ..., EnsureCluster]  // 7 个 Phase
+SceneScaleUp:   [EnsureMasterJoin, EnsureWorkerJoin, EnsureCluster]  // 3 个 Phase
+SceneScaleDown: [EnsureMasterDelete, EnsureWorkerDelete, EnsureCluster]  // 3 个 Phase
+```
+
+### 四、Phase NeedExecute 简化
+
+重构后，Phase 的 NeedExecute 可以大幅简化：
+```go
+// 重构前：复杂的场景判断
+func (e *EnsureMasterUpgrade) NeedExecute(old, new) bool {
+    if !e.BasePhase.DefaultNeedExecute(old, new) {
+        return false
+    }
+    
+    if new.Spec.KubernetesVersion != new.Status.KubernetesVersion {
+        nodes := GetNeedUpgradeMasterNodes(new)
+        return nodes.Length() > 0
+    }
+    return false
+}
+
+// 重构后：只需检查是否已完成
+func (e *EnsureMasterUpgrade) NeedExecute(old, new) bool {
+    // 只检查是否已成功执行
+    return e.GetStatus() != bkev1beta1.PhaseSucceeded
+}
+
+// 或者完全移除 NeedExecute，在 assemble 时已经确保需要执行
+```
+
+### 五、ClusterStatus 设置简化
+
+```go
+// 重构前：通过 Phase 名称分组判断
+func calculateClusterStatusByPhase(phase, err) {
+    switch {
+    case phase.Name().In(ClusterInitPhaseNames):
+        handleClusterInitPhase(ctx, err)
+    case phase.Name().In(ClusterUpgradePhaseNames):
+        handleClusterUpgradePhase(ctx, err)
+    // ...
+    }
+}
+
+// 重构后：直接根据场景设置
+func (p *PhaseFlow) setClusterStatusByScene(scene Scene, err error) {
+    statusMap := map[Scene]bkev1beta1.ClusterStatus{
+        SceneInit:        bkev1beta1.ClusterInitializing,
+        SceneUpgrade:     bkev1beta1.ClusterUpgrading,
+        SceneScaleUp:     bkev1beta1.ClusterMasterScalingUp,
+        SceneScaleDown:   bkev1beta1.ClusterWorkerScalingDown,
+        SceneDelete:      bkev1beta1.ClusterDeleting,
+        ScenePause:       bkev1beta1.ClusterPaused,
+        SceneHealthCheck: bkev1beta1.ClusterChecking,
+    }
+    
+    if err != nil {
+        p.ctx.BKECluster.Status.ClusterStatus = getFailedStatus(scene)
+    } else {
+        p.ctx.BKECluster.Status.ClusterStatus = statusMap[scene]
+    }
+}
+```
+
+### 六、完整重构示例
+
+**文件**：`pkg/phaseframe/phases/phase_flow_refactored.go`
+```go
+package phases
+
+import (
+    "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe"
+    bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
+)
+
+// PhaseFlow 重构后的 PhaseFlow
+type PhaseFlow struct {
+    BKEPhases      []phaseframe.Phase
+    ctx            *phaseframe.PhaseContext
+    oldBKECluster  *bkev1beta1.BKECluster
+    newBKECluster  *bkev1beta1.BKECluster
+    scene          Scene  // 当前场景
+}
+
+// CalculatePhase 根据场景组装 Phase
+func (p *PhaseFlow) CalculatePhase(old, new *bkev1beta1.BKECluster) error {
+    p.oldBKECluster = old
+    p.newBKECluster = new
+    
+    // 1. 判断场景
+    p.scene = p.determineScene(old, new)
+    p.ctx.Log.Info("Cluster scene: %s", p.scene)
+    
+    // 2. 设置 ClusterStatus
+    p.setClusterStatusByScene(p.scene, nil)
+    
+    // 3. 组装 Phase
+    phasesFuncs := p.assemblePhasesByScene(p.scene)
+    
+    // 4. 创建 Phase 实例
+    for _, f := range phasesFuncs {
+        phase := f(p.ctx)
+        p.BKEPhases = append(p.BKEPhases, phase)
+    }
+    
+    // 5. 上报 Phase 状态
+    return p.ReportPhaseStatus()
+}
+
+// Execute 执行 Phase
+func (p *PhaseFlow) Execute() (ctrl.Result, error) {
+    defer p.handlePanic()
+    
+    var errs []error
+    var res ctrl.Result
+    
+    for _, phase := range p.BKEPhases {
+        p.ctx.Log.Info("Executing phase: %s", phase.Name())
+        
+        // 执行前置 hook
+        if err := phase.ExecutePreHook(); err != nil {
+            return res, err
+        }
+        
+        // 执行 Phase
+        phaseResult, phaseErr := phase.Execute()
+        if phaseErr != nil {
+            errs = append(errs, phaseErr)
+        }
+        res = util.LowestNonZeroResult(res, phaseResult)
+        
+        // 执行后置 hook
+        if err := phase.ExecutePostHook(phaseErr); err != nil {
+            errs = append(errs, err)
+        }
+        
+        // 如果失败，设置失败状态
+        if phaseErr != nil {
+            p.setClusterStatusByScene(p.scene, phaseErr)
+            break
+        }
+    }
+    
+    if len(errs) > 0 {
+        return res, kerrors.NewAggregate(errs)
+    }
+    return res, nil
+}
+```
+
+### 七、总结
+
+**重构收益**：
+
+| 方面 | 重构前 | 重构后 |
+|------|--------|--------|
+| **Phase 创建数量** | 26 个（全部） | 按场景创建（3-13 个） |
+| **场景判断次数** | 26 次（每个 Phase） | 1 次（集中判断） |
+| **代码可读性** | 分散在各个 Phase | 集中在一处 |
+| **执行路径** | 不直观 | 一目了然 |
+| **维护成本** | 高（修改需改多个 Phase） | 低（修改只需改一处） |
+
+**重构步骤**：
+
+1. ✅ 定义场景类型
+2. ✅ 实现场景判断函数
+3. ✅ 实现各场景的 Phase 组装函数
+4. ✅ 重构 CalculatePhase 方法
+5. ✅ 简化 Phase 的 NeedExecute
+6. ✅ 简化 ClusterStatus 设置逻辑
+7. ✅ 添加单元测试验证各场景
+
+这种重构方式使代码更加清晰、高效、易维护，符合单一职责原则和开闭原则。
+
+
