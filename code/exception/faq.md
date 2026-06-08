@@ -6,6 +6,11 @@
 
 # BKEMachine 状态机
 
+# 暂停状态的判断逻辑
+cluster.Spec.Paused or BKEMachine.hasAnnotation(o, clusterv1.ManagedByAnnotation)
+
+> clusterv1.ManagedByAnnotation = "cluster.x-k8s.io/managed-by"
+
 # 节点状态
 标记系统
 从[bkecluster_consts.go:235-244](file:////cluster-api-provider-bke/api/capbke/v1beta1/bkecluster_consts.go#L235-L244)可以看到：
