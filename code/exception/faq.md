@@ -34,3 +34,5 @@ const (
     NodePostProcessFlag              // 1 << 9 = 512
 )
 ```
+# refactor
+## CheckBKEMachineLabel-> GetAssignedNodeIP
