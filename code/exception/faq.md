@@ -1,6 +1,12 @@
 # Command生命周期状态机
+## Command有多少类型
+# BKEAgent状态机
 
 # Phase状态机
+
+# Bootstrap的状态机
+
+# ResetCommand的状态机
 
 # BKECluster状态机
 
