@@ -1643,4 +1643,446 @@ func (p *PhaseFlow) Execute() (ctrl.Result, error) {
 
 这种重构方式使代码更加清晰、高效、易维护，符合单一职责原则和开闭原则。
 
+# 详细说明扩缩容场景如何由 KCP 移交到 Phase 的机制
+
+## 扩缩容场景：KCP → Phase 移交机制
+
+### 一、整体流程图
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  用户操作：修改 BKECluster.Spec.Nodes                                 │
+│  • 扩容：增加 Master/Worker 节点                                      │
+│  • 缩容：减少 Master/Worker 节点                                      │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  BKEClusterReconciler 触发                                           │
+│  └── BKEClusterSpecChange Predicate 检测到 Generation 变化            │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  PhaseFlow.CalculatePhase() 判断场景                                 │
+│  ├── 扩容：len(new.Spec.Nodes) > len(old.Status.Nodes)               │
+│  └── 缩容：len(new.Spec.Nodes) < len(old.Status.Nodes)               │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                ┌───────────────┴───────────────┐
+                │                               │
+                ▼                               ▼
+┌──────────────────────────┐      ┌────────────────────────────┐
+│  扩容场景                 │      │  缩容场景                    │
+│                          │      │                            │
+│  Master: EnsureMasterJoin│      │  Master: EnsureMasterDelete│
+│  Worker: EnsureWorkerJoin│      │  Worker: EnsureWorkerDelete│
+└──────────────────────────┘      └────────────────────────────┘
+                │                               │
+                └───────────────┬───────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Phase 操作 CAPI 对象                                                │
+│  ├── 暂停 CAPI 控制器                                                 │
+│  ├── 修改 Replicas（扩容 +N / 缩容 -N）                               │
+│  ├── 标记删除 Machine（缩容时）                                       │
+│  └── 恢复 CAPI 控制器                                                 │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  CAPI 控制器接管                                                      │
+│  ├── KCP Controller：根据 Replicas 创建/删除 Machine                   │
+│  └── MD Controller：根据 Replicas 创建/删除 Machine                    │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  BKEMachine Controller 处理 Machine 生命周期                          │
+│  ├── 创建：引导节点加入集群                                             │
+│  └── 删除：清理节点资源                                                │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 二、扩容流程详解
+
+#### 1. Master 扩容：EnsureMasterJoin
+
+**文件**：[ensure_master_join.go:200-253](file:////cluster-api-provider-bke/pkg/phaseframe/phases/ensure_master_join.go#L200-L253)
+```go
+func (e *EnsureMasterJoin) scaleAndJoinMasterNodes(params MasterJoinScaleParams) error {
+    // 1. 获取 KubeadmControlPlane
+    scope, err := phaseutil.GetClusterAPIAssociateObjs(params.Ctx, params.Client, e.Ctx.Cluster)
+    
+    // 2. 保存当前 Replicas（用于回滚）
+    specCopy := scope.KubeadmControlPlane.Spec.DeepCopy()
+    currentReplicas := specCopy.Replicas
+    
+    // 3. 计算期望 Replicas
+    exceptReplicas := *currentReplicas + int32(params.NodesCount)
+    // 不能超过 BKECluster 的 Master 数量
+    if exceptReplicas > int32(masterNodes.Length()) {
+        exceptReplicas = int32(masterNodes.Length())
+    }
+    
+    // 4. 更新 KCP Replicas
+    scope.KubeadmControlPlane.Spec.Replicas = &exceptReplicas
+    
+    // 5. 恢复 KCP（触发 CAPI 控制器创建 Machine）
+    if err = phaseutil.ResumeClusterAPIObj(params.Ctx, params.Client, scope.KubeadmControlPlane); err != nil {
+        return err
+    }
+    
+    // 6. 等待节点加入
+    if err = e.waitMasterJoin(params.NodesCount); err != nil {
+        return err
+    }
+    
+    return nil
+}
+```
+**关键步骤**：
+
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| 1 | 获取 KCP | 从 CAPI 获取 KubeadmControlPlane 对象 |
+| 2 | 保存 Replicas | 用于失败时回滚 |
+| 3 | 计算 Replicas | `currentReplicas + nodesCount` |
+| 4 | 更新 KCP | `KCP.Spec.Replicas = exceptReplicas` |
+| 5 | 恢复 KCP | 移除 paused annotation，触发 CAPI 控制器 |
+| 6 | 等待加入 | 等待 BKEMachine Controller 完成引导 |
+
+#### 2. Worker 扩容：EnsureWorkerJoin
+
+**文件**：[ensure_worker_join.go:190-230](file:////cluster-api-provider-bke/pkg/phaseframe/phases/ensure_worker_join.go#L190-L230)
+```go
+func (e *EnsureWorkerJoin) scaleMachineDeployment(params ScaleMachineDeploymentParams) error {
+    // 1. 获取 MachineDeployment
+    scope := params.Scope
+    
+    // 2. 保存当前 Replicas
+    specCopy := scope.MachineDeployment.Spec.DeepCopy()
+    currentReplicas := specCopy.Replicas
+    
+    // 3. 计算期望 Replicas
+    exceptReplicas := *currentReplicas + int32(params.NodesCount)
+    // 不能超过 BKECluster 的 Worker 数量
+    if exceptReplicas > int32(workerNodes.Length()) {
+        exceptReplicas = int32(workerNodes.Length())
+    }
+    
+    // 4. 更新 MD Replicas
+    scope.MachineDeployment.Spec.Replicas = &exceptReplicas
+    
+    // 5. 恢复 MD（触发 CAPI 控制器创建 Machine）
+    if scaleErr = phaseutil.ResumeClusterAPIObj(params.Ctx, params.Client, scope.MachineDeployment); scaleErr != nil {
+        return scaleErr
+    }
+    
+    // 6. 等待节点加入
+    if scaleErr = e.waitWorkerJoin(); scaleErr != nil {
+        return scaleErr
+    }
+    
+    return nil
+}
+```
+
+### 三、缩容流程详解
+
+#### 1. Master 缩容：EnsureMasterDelete
+
+**文件**：[ensure_master_delete.go:165-235](file:////cluster-api-provider-bke/pkg/phaseframe/phases/ensure_master_delete.go#L165-L235)
+```go
+func (e *EnsureMasterDelete) pauseAndScaleDownControlPlane(params PauseAndScaleDownControlPlaneParams) error {
+    // 1. 获取 KubeadmControlPlane
+    scope, err := phaseutil.GetClusterAPIAssociateObjs(ctx, c, e.Ctx.Cluster)
+    
+    // 2. 暂停 KCP（防止 CAPI 控制器干扰）
+    if err = phaseutil.PauseClusterAPIObj(ctx, c, scope.KubeadmControlPlane); err != nil {
+        return err
+    }
+    
+    // 3. 保存当前 Replicas（用于回滚）
+    specCopy := scope.KubeadmControlPlane.Spec.DeepCopy()
+    currentReplicas := specCopy.Replicas
+    
+    // 4. 标记需要删除的 Machine
+    for _, machineAndNode := range deleteMap {
+        machine := machineAndNode.Machine
+        if err = phaseutil.MarkMachineForDeletion(ctx, c, machine); err != nil {
+            // 标记失败，跳过该节点
+            delete(deleteMap, machine.Name)
+        }
+    }
+    
+    // 5. 计算 Replicas
+    exceptReplicas := *currentReplicas - int32(len(deleteMap))
+    // 副本数不能小于 1
+    if exceptReplicas < 1 {
+        exceptReplicas = 1
+    }
+    
+    // 6. 更新 KCP Replicas
+    scope.KubeadmControlPlane.Spec.Replicas = &exceptReplicas
+    
+    // 7. 恢复 KCP（触发 CAPI 控制器删除 Machine）
+    if err = phaseutil.ResumeClusterAPIObj(ctx, c, scope.KubeadmControlPlane); err != nil {
+        return err
+    }
+    
+    return nil
+}
+```
+
+**关键步骤**：
+
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| 1 | 获取 KCP | 从 CAPI 获取 KubeadmControlPlane 对象 |
+| 2 | **暂停 KCP** | 添加 paused annotation，停止 CAPI 控制器 |
+| 3 | 保存 Replicas | 用于失败时回滚 |
+| 4 | **标记删除** | 为特定 Machine 添加删除标记 |
+| 5 | 计算 Replicas | `currentReplicas - len(deleteMap)` |
+| 6 | 更新 KCP | `KCP.Spec.Replicas = exceptReplicas` |
+| 7 | 恢复 KCP | 移除 paused annotation，触发 CAPI 控制器 |
+
+### 四、Pause/Resume 机制
+
+#### 1. PauseClusterAPIObj
+
+**文件**：[clusterapi.go:129-147](file:////cluster-api-provider-bke/pkg/phaseframe/phaseutil/clusterapi.go#L129-L147)
+```go
+func PauseClusterAPIObj(ctx context.Context, c client.Client, obj client.Object, extraAnnotations ...string) error {
+    // 添加 paused annotation
+    annotations := obj.GetAnnotations()
+    if annotations == nil {
+        annotations = map[string]string{}
+    }
+    annotations[clusterv1beta1.PausedAnnotation] = ""  // "cluster.x-k8s.io/paused": ""
+    
+    obj.SetAnnotations(annotations)
+    return c.Update(ctx, obj)
+}
+```
+**效果**：
+- KCP Controller 检测到 paused annotation 后停止调谐
+- MD Controller 检测到 paused annotation 后停止调谐
+- Phase 可以安全修改 CAPI 对象而不被干扰
+
+#### 2. ResumeClusterAPIObj
+
+**文件**：[clusterapi.go:149-170](file:////cluster-api-provider-bke/pkg/phaseframe/phaseutil/clusterapi.go#L149-L170)
+```go
+func ResumeClusterAPIObj(ctx context.Context, c client.Client, obj client.Object, extraAnnotations ...string) error {
+    // 移除 paused annotation
+    annotations := obj.GetAnnotations()
+    delete(annotations, clusterv1beta1.PausedAnnotation)
+    
+    obj.SetAnnotations(annotations)
+    return c.Update(ctx, obj)
+}
+```
+**效果**：
+- KCP Controller 恢复调谐，根据 Replicas 创建/删除 Machine
+- MD Controller 恢复调谐，根据 Replicas 创建/删除 Machine
+
+### 五、CAPI 控制器接管
+
+#### 1. KCP Controller 行为
+
+```
+KCP Controller 检测到 Replicas 变化
+    │
+    ├── Replicas 增加
+    │   └── 创建新的 Machine 对象
+    │       ├── Machine.Spec.InfrastructureRef → BKEMachine
+    │       └── Machine.Spec.Bootstrap.ConfigRef → KubeadmConfig
+    │
+    └── Replicas 减少
+        └── 删除 Machine 对象（优先删除标记为删除的）
+            └── 触发 BKEMachine Controller 清理节点
+```
+
+#### 2. MD Controller 行为
+
+```
+MD Controller 检测到 Replicas 变化
+    │
+    ├── Replicas 增加
+    │   └── 创建新的 Machine 对象
+    │       ├── Machine.Spec.InfrastructureRef → BKEMachine
+    │       └── Machine.Spec.Bootstrap.ConfigRef → KubeadmConfig
+    │
+    └── Replicas 减少
+        └── 删除 Machine 对象
+            └── 触发 BKEMachine Controller 清理节点
+```
+
+### 六、BKEMachine Controller 处理
+
+```
+BKEMachine Controller 监听 Machine
+    │
+    ├── Machine 创建
+    │   ├── 获取关联的 BKENode
+    │   ├── 执行节点引导
+    │   │   ├── 安装 BKEAgent
+    │   │   ├── 准备节点环境
+    │   │   ├── 执行 kubeadm join
+    │   │   └── 后处理配置
+    │   └── 更新 BKEMachine.Status
+    │
+    └── Machine 删除
+        ├── Drain 节点
+        ├── 清理节点资源
+        └── 更新 BKEMachine.Status
+```
+
+### 七、完整扩容示例
+
+```
+用户操作：BKECluster.Spec.Nodes.Master 增加 2 个节点
+    │
+    ├── BKEClusterReconciler 触发
+    │   └── PhaseFlow 判断场景：ScaleUp
+    │
+    ├── EnsureMasterJoin.Execute()
+    │   ├── 获取需要加入的节点：[node1, node2]
+    │   ├── 获取 KCP：KCP.Spec.Replicas = 3
+    │   ├── 计算 Replicas：3 + 2 = 5
+    │   ├── 更新 KCP：KCP.Spec.Replicas = 5
+    │   └── 恢复 KCP：移除 paused annotation
+    │
+    ├── KCP Controller 接管
+    │   ├── 检测到 Replicas = 5
+    │   ├── 创建 Machine-4
+    │   │   └── Machine.Spec.InfrastructureRef → BKEMachine-4
+    │   └── 创建 Machine-5
+    │       └── Machine.Spec.InfrastructureRef → BKEMachine-5
+    │
+    ├── BKEMachine Controller 处理
+    │   ├── BKEMachine-4 引导
+    │   │   ├── 安装 BKEAgent
+    │   │   ├── 准备环境
+    │   │   ├── kubeadm join
+    │   │   └── 后处理
+    │   └── BKEMachine-5 引导
+    │       ├── 安装 BKEAgent
+    │       ├── 准备环境
+    │       ├── kubeadm join
+    │       └── 后处理
+    │
+    └── EnsureMasterJoin.waitMasterJoin()
+        └── 等待 2 个节点加入成功
+```
+
+### 八、完整缩容示例
+
+```
+用户操作：BKECluster.Spec.Nodes.Master 减少 2 个节点
+    │
+    ├── BKEClusterReconciler 触发
+    │   └── PhaseFlow 判断场景：ScaleDown
+    │
+    ├── EnsureMasterDelete.Execute()
+    │   ├── 获取需要删除的节点：[node3, node4]
+    │   ├── 获取 KCP：KCP.Spec.Replicas = 5
+    │   ├── 暂停 KCP：添加 paused annotation
+    │   ├── 标记删除：
+    │   │   ├── Machine-3：添加删除标记
+    │   │   └── Machine-4：添加删除标记
+    │   ├── 计算 Replicas：5 - 2 = 3
+    │   ├── 更新 KCP：KCP.Spec.Replicas = 3
+    │   └── 恢复 KCP：移除 paused annotation
+    │
+    ├── KCP Controller 接管
+    │   ├── 检测到 Replicas = 3
+    │   ├── 检测到删除标记
+    │   ├── 删除 Machine-3
+    │   └── 删除 Machine-4
+    │
+    └── BKEMachine Controller 处理
+        ├── BKEMachine-3 清理
+        │   ├── Drain 节点
+        │   └── 清理资源
+        └── BKEMachine-4 清理
+            ├── Drain 节点
+            └── 清理资源
+```
+
+### 九、关键设计点
+
+#### 1. 为什么需要 Pause/Resume？
+
+```go
+// ❌ 不暂停直接修改 Replicas
+KCP.Spec.Replicas = 5
+c.Update(ctx, KCP)
+// 问题：KCP Controller 可能立即调谐，与 Phase 产生竞争
+
+// ✅ 正确做法：暂停 → 修改 → 恢复
+PauseClusterAPIObj(ctx, c, KCP)    // 暂停 KCP Controller
+KCP.Spec.Replicas = 5              // 安全修改
+ResumeClusterAPIObj(ctx, c, KCP)   // 恢复 KCP Controller
+```
+
+#### 2. 为什么缩容需要标记删除？
+
+```go
+// ❌ 不标记删除，KCP Controller 可能删除错误的节点
+KCP.Spec.Replicas = 3  // 从 5 减少到 3
+// KCP Controller 可能删除 node1, node2（而不是 node3, node4）
+
+// ✅ 正确做法：标记要删除的节点
+MarkMachineForDeletion(ctx, c, Machine-3)
+MarkMachineForDeletion(ctx, c, Machine-4)
+KCP.Spec.Replicas = 3
+// KCP Controller 会优先删除标记的节点
+```
+
+#### 3. 为什么需要回滚机制？
+
+```go
+// 保存当前 Replicas
+currentReplicas := KCP.Spec.Replicas
+
+// 失败时回滚
+defer func() {
+    if err != nil {
+        KCP.Spec.Replicas = currentReplicas
+        ResumeClusterAPIObj(ctx, c, KCP)
+    }
+}()
+
+// 如果后续步骤失败，自动恢复到原始状态
+```
+
+### 十、总结
+
+**移交流程**：
+
+| 阶段 | 执行者 | 操作 |
+|------|--------|------|
+| **1. 触发** | BKEClusterReconciler | 检测 Spec.Nodes 变化 |
+| **2. 判断场景** | PhaseFlow | 判断扩容/缩容 |
+| **3. Phase 执行** | EnsureMasterJoin/Delete | 操作 CAPI 对象 |
+| **4. 暂停 CAPI** | Phase | PauseClusterAPIObj |
+| **5. 修改 Replicas** | Phase | KCP.Spec.Replicas ± N |
+| **6. 恢复 CAPI** | Phase | ResumeClusterAPIObj |
+| **7. CAPI 接管** | KCP/MD Controller | 创建/删除 Machine |
+| **8. 节点处理** | BKEMachine Controller | 引导/清理节点 |
+
+**关键机制**：
+- ✅ **Pause/Resume**：控制 CAPI 控制器的调谐时机
+- ✅ **Replicas**：触发 CAPI 控制器创建/删除 Machine
+- ✅ **MarkMachineForDeletion**：精确控制删除哪些节点
+- ✅ **回滚机制**：失败时恢复原始状态
+
+**设计问题**：
+- ❌ 绕过 CAPI 的声明式能力，自研命令式逻辑
+- ❌ Pause/Resume 增加复杂度，容易出错
+- ❌ 标记删除机制与 CAPI 标准做法不一致
+
 
