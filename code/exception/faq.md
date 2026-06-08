@@ -4,6 +4,8 @@
 
 # BKECluster状态机
 
+# BKEMachine 状态机
+
 # 节点状态
 标记系统
 从[bkecluster_consts.go:235-244](file:////cluster-api-provider-bke/api/capbke/v1beta1/bkecluster_consts.go#L235-L244)可以看到：
