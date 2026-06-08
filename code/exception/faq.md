@@ -36,3 +36,5 @@ const (
 ```
 # refactor
 ## CheckBKEMachineLabel-> GetAssignedNodeIP
+## 移除 `func (r *BKEMachineReconciler) syncKubeadmConfig()`
+##
