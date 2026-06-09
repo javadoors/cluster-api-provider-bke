@@ -2500,4 +2500,83 @@ c.Update(ctx, KCP)
 // CAPI Controller 自动处理，无需暂停
 ```
 
+# 扩容不需要 Pause，只有缩容需要！
+
+## 关键发现：扩容不需要 Pause，只有缩容需要！
+
+### 一、代码证据
+
+```bash
+# 扩容场景：没有 Pause
+ensure_master_join.go   - ❌ 没有调用 PauseClusterAPIObj
+ensure_worker_join.go   - ❌ 没有调用 PauseClusterAPIObj
+
+# 缩容场景：需要 Pause
+ensure_master_delete.go - ✅ 调用了 PauseClusterAPIObj (line 181)
+ensure_worker_delete.go - ✅ 调用了 PauseClusterAPIObj (line 287)
+```
+
+### 二、为什么扩容不需要 Pause？
+
+**扩容操作**：
+```go
+// EnsureMasterJoin.scaleAndJoinMasterNodes()
+func scaleAndJoinMasterNodes() error {
+    // 1. 获取 KCP
+    scope, _ := GetClusterAPIAssociateObjs(ctx, c, cluster)
+    
+    // 2. 计算 Replicas
+    exceptReplicas := *currentReplicas + nodesCount
+    
+    // 3. 直接更新 Replicas（没有 Pause）
+    scope.KubeadmControlPlane.Spec.Replicas = &exceptReplicas
+    c.Update(ctx, scope.KubeadmControlPlane)
+    
+    // 4. 等待节点加入
+    waitMasterJoin(nodesCount)
+}
+```
+
+**为什么不需要 Pause？**
+- ✅ 扩容只修改 `Replicas`（一个原子操作）
+- ✅ KCP Controller 检测到 `Replicas` 增加，创建新 Machine
+- ✅ 没有竞争：Phase 不关心 KCP Controller 创建哪些 Machine
+- ✅ 新 Machine 会自动关联到 BKENode（通过 BKEMachine Controller）
+
+### 三、为什么缩容需要 Pause？
+
+**缩容操作**：
+```go
+// EnsureMasterDelete.pauseAndScaleDownControlPlane()
+func pauseAndScaleDownControlPlane() error {
+    // 1. 暂停 KCP Controller
+    PauseClusterAPIObj(ctx, c, KCP)  // ✅ 需要 Pause
+    
+    // 2. 标记删除特定 Machine
+    MarkMachineForDeletion(Machine-3)
+    MarkMachineForDeletion(Machine-4)
+    
+    // 3. 更新 Replicas
+    KCP.Spec.Replicas = 3
+    c.Update(ctx, KCP)
+    
+    // 4. 恢复 KCP Controller
+    ResumeClusterAPIObj(ctx, c, KCP)
+}
+```
+**为什么需要 Pause？**
+- ❌ 缩容需要两步操作：
+  1. 标记删除特定 Machine（非原子）
+  2. 更新 Replicas（原子）
+- ❌ 如果不暂停，KCP Controller 可能在步骤 1 和 2 之间介入
+- ❌ KCP Controller 可能删除错误的 Machine（没有标记的）
+
+### 四、总结
+
+| 操作 | 是否需要 Pause | 原因 |
+|------|---------------|------|
+| **扩容** | ❌ 不需要 | 只修改 Replicas（原子操作），无竞争 |
+| **缩容** | ✅ 需要 | 需要标记删除 + 修改 Replicas（非原子操作），有竞争 |
+
+**您的观察完全正确**：扩容只修改 Replicas，确实没有冲突，所以不需要 Pause！
 
