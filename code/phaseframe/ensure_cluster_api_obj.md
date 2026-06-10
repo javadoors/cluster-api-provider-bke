@@ -555,3 +555,375 @@ BKE 创建这些 CAPI 资源的核心目的是**与 CAPI 体系对接**，但通
 4. **Bootstrap 占位**：dataSecretName="fake"，BKE 使用 BKEAgent 加入节点
 5. **机器模板空规格**：spec: {}，BKE 不依赖 CAPI 管理机器生命周期
 6. **外部 etcd 证书占位**：fake* 证书，后续由 EnsureCerts 阶段替换
+
+## ensure_cluster_api_obj.go 规格清单        
+## ensure_cluster_api_obj.go 规格清单与功能特性及流程
+
+### 一、Phase 基本信息
+
+| 属性 | 值 |
+|------|-----|
+| **Phase 名称** | `EnsureClusterAPIObj` |
+| **所属阶段** | 初始化阶段 |
+| **执行顺序** | 在 `EnsureNodesEnv` 之后，`EnsureMasterInit` 之前 |
+| **主要职责** | 创建并等待 CAPI 对象就绪 |
+| **超时时间** | 5 分钟 |
+| **轮询间隔** | 2 秒 |
+
+### 二、功能特性清单
+
+#### 1. 核心功能
+
+| 功能 ID | 功能名称 | 功能描述 | 优先级 |
+|---------|---------|---------|--------|
+| **F001** | 创建 CAPI 对象 | 生成并 Apply Cluster API 对象 YAML | P0 |
+| **F002** | 等待 CAPI 就绪 | 轮询等待 CAPI Controller 设置 OwnerRef | P0 |
+| **F003** | 获取 Cluster 对象 | 通过 OwnerRef 获取关联的 CAPI Cluster | P0 |
+| **F004** | 外部 etcd 配置 | 为 Bocloud 集群准备外部 etcd 配置 | P1 |
+| **F005** | 状态同步 | 同步 BKECluster 状态到 ConfigMap | P1 |
+
+#### 2. 触发条件
+
+```go
+func (e *EnsureClusterAPIObj) NeedExecute(old, new *BKECluster) bool {
+    // 条件 1：基础检查通过
+    if !e.BasePhase.NormalNeedExecute(old, new) {
+        return false
+    }
+    
+    // 条件 2：OwnerReferences 为空（未创建 CAPI 对象）
+    if new.OwnerReferences != nil {
+        return false
+    }
+    
+    return true
+}
+```
+**触发条件**：
+- ✅ BKECluster 首次创建（OwnerReferences == nil）
+- ✅ 基础检查通过（未暂停、未删除等）
+
+#### 3. 生成的 CAPI 对象
+
+| 对象类型 | 对象名称 | 作用 |
+|---------|---------|------|
+| **Cluster** | `<bkecluster-name>` | CAPI 集群对象 |
+| **KubeadmControlPlane** | `<bkecluster-name>` | 控制平面管理器 |
+| **KubeadmConfigTemplate** | `<bkecluster-name>-md-0` | Worker 节点配置模板 |
+| **MachineDeployment** | `<bkecluster-name>-md-0` | Worker 节点部署 |
+
+### 三、执行流程
+
+#### 1. 主流程
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Execute()                                                          │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Step 1: 检查 OwnerReferences                                        │
+│  if BKECluster.OwnerReferences == nil                               │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                    ┌───────────┴──────────────┐
+                    │ 为空                      │ 不为空
+                    ▼                          ▼
+        ┌───────────────────────────────┐    ┌──────────────────┐
+        │ Step 2: 创建 CAPI 对象         │    │ 跳过创建          │
+        │ reconcileCreateClusterAPIObj()│    └──────────────────┘
+        └───────────────────────────────┘            │
+                    │                                │
+                    └────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Step 3: 等待 CAPI 对象就绪                                           │
+│  wait.PollImmediateUntil(2s, reconcileClusterAPIObj)                │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Step 4: 检查完全控制                                                 │
+│  if !FullyControlled(BKECluster) → Requeue                          │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+                        ┌──────────────┐
+                        │  完成         │
+                        └──────────────┘
+```
+
+#### 2. 创建 CAPI 对象流程
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  reconcileCreateClusterAPIObj()                                     │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Step 1: 检查 Condition                                             │
+│  if HasCondition(ClusterAPIObjCondition) → 等待                     │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Step 2: 创建 BkeConfig                                              │
+│  cfg = NewBkeConfigFromClusterConfig(bkeCluster.Spec.ClusterConfig) │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Step 3: 准备外部 etcd 配置（Bocloud 集群）                             │
+│  externalEtcd = prepareExternalEtcdConfig(bkeCluster)               │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Step 4: 生成 CAPI 配置文件                                           │
+│  yamlPath = cfg.GenerateClusterAPIConfigFile(name, namespace)       │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Step 5: Apply YAML 到集群                                           │
+│  localClient.ApplyYaml(task)                                        │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Step 6: 设置 Condition                                              │
+│  ConditionMark(ClusterAPIObjCondition, False)                       │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Step 7: 同步状态到 ConfigMap                                         │
+│  mergecluster.SyncStatusUntilComplete()                             │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 3. 等待 CAPI 就绪流程
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  reconcileClusterAPIObj() (每 2 秒轮询)                              │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Step 1: 获取合并的 BKECluster                                        │
+│  bkeCluster = GetCombinedBKECluster(ctx, client, namespace, name)   │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Step 2: 检查并更新 Condition                                         │
+│  if ConditionStatus == False:                                       │
+│      ConditionMark(ClusterAPIObjCondition, True)                    │
+│      SyncStatusUntilComplete()                                      │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Step 3: 检查 OwnerReferences                                        │
+│  if OwnerReferences != nil:                                         │
+│      cluster = GetOwnerCluster(ctx, bkeCluster.ObjectMeta)          │
+│      e.Ctx.Cluster = cluster                                        │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                    ┌───────────┴───────────┐
+                    │ 找到 Cluster           │ 未找到
+                    ▼                       ▼
+            ┌──────────────┐        ┌──────────────┐
+            │ return nil   │        │ return error │
+            │ (继续轮询)    │        │ (等待下次)    │
+            └──────────────┘        └──────────────┘
+```
+
+### 四、外部 etcd 配置（Bocloud 集群）
+
+#### 1. 判断条件
+
+```go
+func (e *EnsureClusterAPIObj) prepareExternalEtcdConfig(bkeCluster) {
+    // 只为 Bocloud 集群准备外部 etcd
+    if !clusterutil.IsBocloudCluster(bkeCluster) {
+        return nil, nil
+    }
+    
+    externalEtcd := bkeinit.NewExternalEtcdConfig()
+    if externalEtcd == nil {
+        return nil, nil
+    }
+    
+    // 设置证书文件（假值，实际由 Bocloud 提供）
+    externalEtcd["etcdCAFile"] = "fakeCaCert"
+    externalEtcd["etcdCertFile"] = "fakeCertFile"
+    externalEtcd["etcdKeyFile"] = "fakeKeyFile"
+    
+    // 构建 etcd 端点
+    etcdEndpoints = buildEtcdEndpoints(etcdNodes)
+    externalEtcd["etcdEndpoints"] = etcdEndpoints
+    
+    return externalEtcd, nil
+}
+```
+
+#### 2. etcd 端点构建
+
+```go
+func buildEtcdEndpoints(etcdNodes) string {
+    // 格式：https://ip1:2379,https://ip2:2379,...
+    endpoints := []
+    for _, node := range etcdNodes {
+        endpoints.append(fmt.Sprintf("https://%s:2379", node.IP))
+    }
+    return strings.Join(endpoints, ",")
+}
+```
+
+### 五、关键数据结构
+
+#### 1. CreateClusterAPIObjParams
+
+```go
+type CreateClusterAPIObjParams struct {
+    Ctx          context.Context        // 上下文
+    Client       client.Client          // Kubernetes 客户端
+    BKECluster   *bkev1beta1.BKECluster // BKECluster 对象
+    Cfg          *bkeinit.BkeConfig     // BKE 配置
+    ExternalEtcd map[string]string      // 外部 etcd 配置
+    Log          *bkev1beta1.BKELogger  // 日志
+}
+```
+
+#### 2. Condition 状态转换
+
+```
+初始状态：无 Condition
+    ↓
+创建 CAPI 对象后：ClusterAPIObjCondition = False
+    ↓
+CAPI Controller 设置 OwnerRef 后：ClusterAPIObjCondition = True
+```
+
+### 六、错误处理
+
+| 错误场景 | 错误信息 | 处理方式 |
+|---------|---------|---------|
+| **生成配置失败** | `Failed to create bke config` | 返回错误，停止执行 |
+| **Apply YAML 失败** | `Failed to create cluster api obj` | 返回错误，停止执行 |
+| **Cluster 未找到** | `Cluster Obj not found` | 返回错误，继续轮询 |
+| **OwnerRef 未设置** | `Cluster Controller has not yet set OwnerRef` | 返回错误，继续轮询 |
+| **超时** | `Wait master init failed` | 返回错误，停止执行 |
+
+### 七、生成的 YAML 示例
+
+```yaml
+# Cluster 对象
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: Cluster
+metadata:
+  name: <bkecluster-name>
+  namespace: <namespace>
+spec:
+  controlPlaneRef:
+    apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+    kind: KubeadmControlPlane
+    name: <bkecluster-name>
+  infrastructureRef:
+    apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+    kind: BKECluster
+    name: <bkecluster-name>
+
+---
+# KubeadmControlPlane 对象
+apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+kind: KubeadmControlPlane
+metadata:
+  name: <bkecluster-name>
+  namespace: <namespace>
+spec:
+  replicas: <master-count>
+  version: <kubernetes-version>
+  machineTemplate:
+    infrastructureRef:
+      apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+      kind: BKEMachine
+      name: <bkemachine-template>
+  kubeadmConfigSpec:
+    # kubeadm 配置
+
+---
+# MachineDeployment 对象
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: MachineDeployment
+metadata:
+  name: <bkecluster-name>-md-0
+  namespace: <namespace>
+spec:
+  replicas: <worker-count>
+  template:
+    spec:
+      bootstrap:
+        configRef:
+          apiVersion: bootstrap.cluster.x-k8s.io/v1beta1
+          kind: KubeadmConfigTemplate
+          name: <bkecluster-name>-md-0
+      infrastructureRef:
+        apiVersion: infrastructure.cluster.x-k8s.io/v1beta1
+        kind: BKEMachine
+        name: <bkemachine-template>
+```
+
+### 八、与其他 Phase 的关系
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  EnsureNodesEnv                                                     │
+│  (准备节点环境)                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  EnsureClusterAPIObj  ← 当前 Phase                                  │
+│  (创建 CAPI 对象)                                                    │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  EnsureCerts                                                        │
+│  (生成证书)                                                          │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  EnsureMasterInit                                                   │
+│  (初始化 Master)                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 九、总结
+
+#### 1. 核心职责
+
+- ✅ **创建 CAPI 对象**：Cluster、KubeadmControlPlane、MachineDeployment
+- ✅ **等待就绪**：轮询等待 CAPI Controller 设置 OwnerRef
+- ✅ **获取 Cluster**：通过 OwnerRef 获取关联的 CAPI Cluster 对象
+- ✅ **外部 etcd 配置**：为 Bocloud 集群准备外部 etcd 配置
+
+#### 2. 关键设计点
+
+- ⚠️ **OwnerRef 判断**：通过 OwnerReferences 判断是否已创建 CAPI 对象
+- ⚠️ **轮询等待**：每 2 秒轮询，最长等待 5 分钟
+- ⚠️ **状态同步**：通过 mergecluster 同步状态到 ConfigMap
+- ⚠️ **完全控制检查**：非完全控制的集群需要 Requeue
+
+#### 3. 执行时机
+
+- ✅ BKECluster 首次创建时
+- ✅ OwnerReferences 为空时
+- ✅ 在节点环境准备完成后
