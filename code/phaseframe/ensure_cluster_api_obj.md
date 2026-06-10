@@ -927,3 +927,341 @@ spec:
 - ✅ BKECluster 首次创建时
 - ✅ OwnerReferences 为空时
 - ✅ 在节点环境准备完成后
+
+# `BKECluster.OwnerReferences == nil` 调用 `reconcileCreateClusterAPIObj()` 的业务逻辑
+        
+## `BKECluster.OwnerReferences == nil` 调用 `reconcileCreateClusterAPIObj()` 的业务逻辑
+
+### 一、核心业务逻辑
+
+#### 1. OwnerReferences == nil 的含义
+
+```
+BKECluster.OwnerReferences == nil
+        │
+        ├── 含义 1：CAPI Cluster 对象还未创建
+        │   └── BKECluster 是独立的，没有父对象
+        │
+        ├── 含义 2：CAPI Controller 还未介入
+        │   └── CAPI Cluster Controller 会自动设置 OwnerRef
+        │
+        └── 含义 3：需要创建 CAPI 对象
+            └── 这是 BKE 与 CAPI 集成的第一步
+```
+
+### 二、业务流程详解
+
+#### 1. 为什么需要这个判断？
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  CAPI 集成架构                                                       │
+└─────────────────────────────────────────────────────────────────────┘
+
+用户创建 BKECluster
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  BKECluster (独立对象)                                               │
+│  OwnerReferences: nil  ← 初始状态                                    │
+└─────────────────────────────────────────────────────────────────────┘
+        │
+        │ 需要创建 CAPI 对象
+        ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  EnsureClusterAPIObj Phase                                          │
+│  • 生成 Cluster YAML                                                 │
+│  • 生成 KubeadmControlPlane YAML                                     │
+│  • 生成 MachineDeployment YAML                                       │
+│  • Apply 到集群                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  CAPI Cluster 对象创建成功                                            │
+│  Cluster: <bkecluster-name>                                         │
+│    spec:                                                            │
+│      infrastructureRef: BKECluster                                  │
+└─────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  CAPI Cluster Controller 调谐                                       │
+│  • 检测到 Cluster.infrastructureRef = BKECluster                    │
+│  • 自动设置 BKECluster.OwnerReferences                               │
+│    ownerReferences:                                                 │
+│      - kind: Cluster                                                │
+│        name: <bkecluster-name>                                      │
+│        controller: true                                             │
+└─────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  BKECluster (被 CAPI 管理)                                           │
+│  OwnerReferences: [Cluster]  ← CAPI Controller 设置                  │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 2. reconcileCreateClusterAPIObj() 的业务逻辑
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  reconcileCreateClusterAPIObj()                                     │
+│  业务逻辑：创建 CAPI 对象，建立 BKE 与 CAPI 的集成                       │
+└─────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Step 1: 防重入检查                                                   │
+│  if HasCondition(ClusterAPIObjCondition):                           │
+│      return "Waiting cluster api obj reconciled"                    │
+│                                                                     │
+│  业务含义：                                                          │
+│  • 避免重复创建 CAPI 对象                                             │
+│  • 如果已经创建过，等待 CAPI Controller 处理                            │
+└─────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Step 2: 创建 BkeConfig                                             │
+│  cfg = NewBkeConfigFromClusterConfig(bkeCluster.Spec.ClusterConfig) │
+│                                                                     │
+│  业务含义：                                                          │
+│  • 将 BKECluster.Spec.ClusterConfig 转换为 BkeConfig                 │
+│  • BkeConfig 包含 Kubernetes 版本、网络配置、镜像仓库等                   │
+│  • 用于生成 CAPI 对象的 YAML                                          │
+└─────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Step 3: 准备外部 etcd 配置（Bocloud 集群）                            │
+│  if IsBocloudCluster(bkeCluster):                                   │
+│      externalEtcd = prepareExternalEtcdConfig()                     │
+│                                                                     │
+│  业务含义：                                                           │
+│  • Bocloud 托管集群使用外部 etcd                                       │
+│  • 需要配置 etcd 端点和证书                                            │
+│  • BKE 集群使用内置 etcd，不需要此配置                                  │
+└─────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Step 4: 生成 CAPI 配置文件                                           │
+│  yamlPath = cfg.GenerateClusterAPIConfigFile(name, namespace)       │
+│                                                                     │
+│  业务含义：                                                          │
+│  • 生成以下对象的 YAML：                                              │
+│    - Cluster (CAPI 集群对象)                                         │
+│    - KubeadmControlPlane (控制平面管理器)                             │
+│    - KubeadmConfigTemplate (配置模板)                                │
+│    - MachineDeployment (Worker 节点部署)                             │
+│  • YAML 文件保存到临时路径                                             │
+└─────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Step 5: Apply YAML 到集群                                          │
+│  localClient.ApplyYaml(task)                                        │
+│                                                                      │
+│  业务含义：                                                          │
+│  • 将生成的 YAML Apply 到管理集群                                    │
+│  • 创建 CAPI 对象                                                    │
+│  • CAPI Controller 开始接管后续管理                                  │
+└─────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Step 6: 设置 Condition 标记                                        │
+│  ConditionMark(ClusterAPIObjCondition, False)                       │
+│                                                                      │
+│  业务含义：                                                          │
+│  • 标记 CAPI 对象已创建                                              │
+│  • Condition = False 表示已创建但未就绪                              │
+│  • 后续轮询会检测 OwnerRef 设置后改为 True                           │
+└─────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Step 7: 同步状态到 ConfigMap                                       │
+│  mergecluster.SyncStatusUntilComplete()                             │
+│                                                                      │
+│  业务含义：                                                          │
+│  • 将 BKECluster 状态同步到 ConfigMap                               │
+│  • 用于跨 Namespace 的状态共享                                       │
+│  • 支持多控制器协同工作                                              │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 三、关键业务场景
+
+#### 场景 1：首次创建 BKECluster
+
+```
+T0: 用户创建 BKECluster
+    BKECluster.OwnerReferences = nil
+    BKECluster.Status.Conditions = []
+
+T1: EnsureClusterAPIObj.NeedExecute() = true
+    检测到 OwnerReferences == nil
+
+T2: reconcileCreateClusterAPIObj() 执行
+    • 生成 CAPI YAML
+    • Apply 到集群
+    • 创建 Cluster、KCP、MachineDeployment
+    • 设置 Condition = False
+
+T3: CAPI Cluster Controller 调谐
+    • 检测到 Cluster.infrastructureRef = BKECluster
+    • 设置 BKECluster.OwnerReferences = [Cluster]
+    • 设置 BKECluster.Spec.ControlPlaneEndpoint
+
+T4: reconcileClusterAPIObj() 检测到 OwnerRef
+    • 获取 Cluster 对象
+    • 设置 Condition = True
+    • 完成
+```
+
+#### 场景 2：已创建 CAPI 对象（重入保护）
+
+```
+T0: BKECluster 已创建 CAPI 对象
+    BKECluster.OwnerReferences = nil (还未被设置)
+    BKECluster.Status.Conditions = [ClusterAPIObjCondition=False]
+
+T1: reconcileCreateClusterAPIObj() 执行
+    检测到 HasCondition(ClusterAPIObjCondition)
+    return "Waiting cluster api obj reconciled"
+
+T2: 等待 CAPI Controller 设置 OwnerRef
+    • 不重复创建 CAPI 对象
+    • 等待 CAPI Controller 处理
+
+T3: CAPI Controller 设置 OwnerRef
+    BKECluster.OwnerReferences = [Cluster]
+
+T4: reconcileClusterAPIObj() 检测到 OwnerRef
+    • 获取 Cluster 对象
+    • 完成
+```
+
+### 四、与 CAPI 的集成关系
+
+#### 1. BKE 与 CAPI 的职责划分
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  BKE (BKECluster Controller)                                        │
+│  职责：基础设施管理                                                   │
+│  • 节点环境准备                                                      │
+│  • 证书生成                                                          │
+│  • 节点引导                                                          │
+│  • 集群生命周期管理                                                   │
+└─────────────────────────────────────────────────────────────────────┘
+        │
+        │ 通过 InfrastructureRef 关联
+        ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  CAPI (Cluster API)                                                 │
+│  职责：集群编排                                                       │
+│  • Machine 生命周期管理                                              │
+│  • 控制平面管理                                                      │
+│  • 滚动升级                                                          │
+│  • 节点扩缩容                                                        │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 2. 集成流程
+
+```
+Step 1: BKE 创建 BKECluster
+        ↓
+Step 2: BKE 创建 CAPI 对象
+        • Cluster.infrastructureRef = BKECluster
+        • KubeadmControlPlane
+        • MachineDeployment
+        ↓
+Step 3: CAPI Controller 接管
+        • 设置 OwnerRef (Cluster → BKECluster)
+        • 创建 Machine 对象
+        • 触发 BKEMachine Controller
+        ↓
+Step 4: BKE 处理基础设施
+        • BKEMachine Controller 引导节点
+        • 设置 Machine.Status.NodeRef
+        ↓
+Step 5: CAPI 完成编排
+        • 标记 ControlPlaneInitialized
+        • 集群就绪
+```
+
+### 五、OwnerRef 的业务意义
+
+#### 1. 标识父子关系
+
+```yaml
+BKECluster:
+  metadata:
+    ownerReferences:
+      - apiVersion: cluster.x-k8s.io/v1beta1
+        kind: Cluster
+        name: my-cluster
+        controller: true  # 标识 Cluster 是 BKECluster 的 Controller
+        blockOwnerDeletion: true  # 删除 Cluster 时阻塞，直到 BKECluster 删除完成
+```
+**业务含义**：
+- ✅ BKECluster 属于 Cluster
+- ✅ Cluster 是 BKECluster 的 Controller
+- ✅ 删除 Cluster 时级联删除 BKECluster
+
+#### 2. 触发控制器调谐
+
+```go
+// CAPI Cluster Controller 的 Watch
+Watches(
+    &BKECluster{},
+    handler.EnqueueRequestForOwner(..., &Cluster{}),
+)
+// BKECluster 变化时，触发关联的 Cluster 调谐
+```
+**业务含义**：
+- ✅ BKECluster 状态变化时，通知 CAPI Cluster Controller
+- ✅ 实现 BKE 与 CAPI 的联动
+
+#### 3. 判断集成状态
+
+```go
+if BKECluster.OwnerReferences == nil {
+    // 还未与 CAPI 集成
+    // 需要创建 CAPI 对象
+} else {
+    // 已与 CAPI 集成
+    // 可以获取关联的 Cluster 对象
+    cluster := GetOwnerCluster(BKECluster)
+}
+```
+**业务含义**：
+- ✅ OwnerRef 是 BKE 与 CAPI 集成的标志
+- ✅ 用于判断集成状态
+
+### 六、总结
+
+#### 1. 核心业务逻辑
+
+| 判断条件 | 业务含义 | 执行操作 |
+|---------|---------|---------|
+| `OwnerReferences == nil` | CAPI 对象未创建 | 创建 Cluster、KCP、MachineDeployment |
+| `OwnerReferences != nil` | CAPI 对象已创建 | 获取关联的 Cluster 对象 |
+
+#### 2. reconcileCreateClusterAPIObj() 的职责
+
+- ✅ **创建 CAPI 对象**：生成并 Apply Cluster、KCP、MachineDeployment YAML
+- ✅ **建立集成关系**：通过 InfrastructureRef 关联 BKECluster 与 Cluster
+- ✅ **防重入保护**：通过 Condition 避免重复创建
+- ✅ **状态同步**：同步状态到 ConfigMap，支持多控制器协同
+
+#### 3. 设计原理
+- ⚠️ **OwnerRef 作为集成标志**：判断是否已与 CAPI 集成
+- ⚠️ **CAPI Controller 自动设置**：Cluster Controller 会自动设置 OwnerRef
+- ⚠️ **职责分离**：BKE 负责基础设施，CAPI 负责编排
+- ⚠️ **级联管理**：通过 OwnerRef 实现级联删除和状态联动
+
