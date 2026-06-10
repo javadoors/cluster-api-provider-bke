@@ -1047,4 +1047,308 @@ BKECluster:
 - ⚠️ 需要通过 BKENode 管理节点
 - ⚠️ 不支持并发操作
 
+# 修改 BKECluster.Spec.Nodes.Master会触发那些资源的调谐      
+## 修改 `BKECluster.Spec.Nodes.Master` 触发的调谐链
+
+### 一、调谐链总览
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  用户修改 BKECluster.Spec.Nodes.Master                               │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  1. BKECluster Controller                                           │
+│     • BKEClusterSpecChange Predicate 检测到 Generation 变化           │
+│     • 触发 BKEClusterReconciler.Reconcile()                          │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  2. Phase 执行                                                       │
+│     • EnsureMasterJoin/EnsureMasterDelete                           │
+│     • 修改 KCP.Spec.Replicas                                        │
+│     • 标记删除 Machine（缩容时）                                       │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                ┌───────────────┴───────────────┐
+                │                               │
+                ▼                               ▼
+┌──────────────────────────┐      ┌──────────────────────────┐
+│  3. KCP Controller       │      │  4. BKEMachine Controller│
+│  (KubeadmControlPlane)   │      │  (通过 BKECluster Watch)  │
+│                          │      │                          │
+│  • 检测到 Replicas 变化    │      │  • BKECluster 变化触发    │
+│  • 创建/删除 Machine      │      │  • 处理新节点的引导         │
+└──────────────────────────┘      └──────────────────────────┘
+                │
+                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  5. Machine Controller (CAPI)                                       │
+│     • 管理 Machine 生命周期                                           │
+│     • 触发 BKEMachine Controller                                     │
+└─────────────────────────────────────────────────────────────────────┘
+                │
+                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  6. BKEMachine Controller                                           │
+│     • 执行节点引导                              │
+│     • 设置 Machine.Status.NodeRef                                   │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 二、详细触发流程
+
+#### 1. BKECluster Controller（直接触发）
+
+**触发条件**：`BKEClusterSpecChange` Predicate
+```go
+// bkecluster_controller.go:248-279
+For(&bkev1beta1.BKECluster{},
+    builder.WithPredicates(predicate.Or(
+        bkepredicates.BKEClusterAnnotationsChange(),
+        bkepredicates.BKEClusterSpecChange(),  // ✅ Spec 变化触发
+    )),
+)
+```
+**触发原因**：
+- `BKECluster.Spec.Nodes.Master` 变化
+- `Generation` 增加
+- Predicate 返回 `true`
+
+#### 2. Phase 执行
+
+**扩容场景**：
+```go
+// EnsureMasterJoin.Execute()
+// 修改 KCP.Spec.Replicas
+KCP.Spec.Replicas = currentReplicas + nodesCount
+c.Update(ctx, KCP)  // 触发 KCP Controller
+```
+
+**缩容场景**：
+```go
+// EnsureMasterDelete.Execute()
+// 标记删除
+MarkMachineForDeletion(Machine-3)
+MarkMachineForDeletion(Machine-4)
+// 修改 Replicas
+KCP.Spec.Replicas = currentReplicas - nodesCount
+c.Update(ctx, KCP)  // 触发 KCP Controller
+```
+
+#### 3. KCP Controller（KubeadmControlPlane）
+
+**触发条件**：检测到 `KCP.Spec.Replicas` 变化
+```go
+// CAPI KubeadmControlPlane Controller
+func (r *KubeadmControlPlaneReconciler) Reconcile(ctx, req) {
+    // 检测到 Replicas 变化
+    currentMachines := r.getCurrentMachines(ctx, kcp)
+    desiredMachines := *kcp.Spec.Replicas
+    
+    if len(currentMachines) < desiredMachines {
+        // 扩容：创建 Machine
+        r.createMachines(ctx, kcp, desiredMachines - len(currentMachines))
+    } else if len(currentMachines) > desiredMachines {
+        // 缩容：删除 Machine
+        r.deleteMachines(ctx, kcp, len(currentMachines) - desiredMachines)
+    }
+}
+```
+**触发结果**：
+- 扩容：创建新的 `Machine` 对象
+- 缩容：删除 `Machine` 对象
+
+#### 4. BKEMachine Controller（通过 BKECluster Watch）
+
+**触发条件**：`BKECluster` 变化
+```go
+// bkemachine_controller.go:537-616
+Watches(
+    &bkev1beta1.BKECluster{},
+    handler.EnqueueRequestsFromMapFunc(r.BKEClusterToBKEMachines),
+    builder.WithPredicates(
+        predicates.BKEAgentReady(),      // Agent Ready
+        predicates.BKEClusterUnPause(),  // BKECluster 未暂停
+    ),
+)
+```
+
+**触发逻辑**：
+```go
+// BKEClusterToBKEMachines: BKECluster → BKEMachines
+func (r *BKEMachineReconciler) BKEClusterToBKEMachines(ctx, o) []ctrl.Request {
+    // 1. 获取关联的 Cluster
+    cluster := util.GetOwnerCluster(ctx, r.Client, bkeCluster)
+    
+    // 2. 获取该集群的所有 Machine
+    machineList := r.Client.List(ctx, machineList, 
+        client.MatchingLabels{ClusterNameLabel: cluster.Name})
+    
+    // 3. 过滤：只返回未完成 Bootstrap 的 Machine
+    for _, m := range machineList.Items {
+        if m.Status.BootstrapReady {
+            continue  // 已完成，跳过
+        }
+        result = append(result, Request{NamespacedName: m.Spec.InfrastructureRef})
+    }
+    
+    return result
+}
+```
+**触发结果**：
+- 触发所有未完成 Bootstrap 的 `BKEMachine` 的调谐
+- 处理新节点的引导流程
+
+#### 5. Machine Controller（CAPI）
+
+**触发条件**：`Machine` 创建/删除
+```go
+// CAPI Machine Controller
+func (r *MachineReconciler) Reconcile(ctx, req) {
+    // Machine 创建
+    if machine.DeletionTimestamp.IsZero() {
+        // 触发 Infrastructure Controller (BKEMachine)
+        r.reconcileInfrastructure(ctx, machine)
+        // 触发 Bootstrap Controller (KubeadmConfig)
+        r.reconcileBootstrap(ctx, machine)
+    }
+    
+    // Machine 删除
+    if !machine.DeletionTimestamp.IsZero() {
+        // 清理资源
+        r.reconcileDelete(ctx, machine)
+    }
+}
+```
+**触发结果**：
+- 触发 `BKEMachine Controller` 处理基础设施
+- 触发 `KubeadmConfig Controller` 处理引导配置
+
+#### 6. BKEMachine Controller（最终执行）
+
+**触发条件**：
+- `Machine` 创建（通过 Machine Watch）
+- `BKECluster` 变化（通过 BKECluster Watch）
+- `Command` 完成（通过 Command Watch）
+
+```go
+// bkemachine_controller.go:537-616
+For(&bkev1beta1.BKEMachine{}).
+Watches(&agentv1beta1.Command{}, ...).  // Command 完成
+Watches(&clusterv1.Machine{}, ...).     // Machine 变化
+Watches(&clusterv1.Cluster{}, ...).     // Cluster 变化
+Watches(&bkev1beta1.BKECluster{}, ...)  // BKECluster 变化
+```
+
+**执行逻辑**：
+```go
+func (r *BKEMachineReconciler) Reconcile(ctx, req) {
+    // 1. 获取 BKEMachine
+    bkeMachine := r.getBKEMachine(ctx, req)
+    
+    // 2. 获取关联的 Machine
+    machine := r.getMachine(ctx, bkeMachine)
+    
+    // 3. 执行引导流程
+    if !machine.Status.BootstrapReady {
+        // 执行 kubeadm join
+        r.reconcileBootstrap(ctx, bkeMachine, machine)
+    }
+    
+    // 4. 设置 NodeRef
+    if nodeReady {
+        machine.Status.NodeRef = &ObjectReference{
+            Kind: "Node",
+            Name: nodeName,
+        }
+        r.Status().Update(ctx, machine)
+    }
+}
+```
+
+### 三、完整示例：扩容场景
+
+```
+用户修改 BKECluster.Spec.Nodes.Master: 1 → 3
+        │
+        ├── T1: BKECluster Controller 触发
+        │   └── BKEClusterSpecChange Predicate 检测到变化
+        │
+        ├── T2: Phase 执行
+        │   └── EnsureMasterJoin.Execute()
+        │       └── KCP.Spec.Replicas: 1 → 3
+        │
+        ├── T3: KCP Controller 触发
+        │   └── 检测到 Replicas = 3
+        │   └── 创建 Machine-2, Machine-3
+        │
+        ├── T4: Machine Controller 触发
+        │   └── 检测到 Machine-2, Machine-3 创建
+        │   └── 触发 BKEMachine Controller
+        │
+        ├── T5: BKEMachine Controller 触发（通过 Machine Watch）
+        │   └── 处理 Machine-2, Machine-3 的引导
+        │
+        ├── T6: BKEMachine Controller 触发（通过 BKECluster Watch）
+        │   └── BKEClusterToBKEMachines 返回未完成的 BKEMachine
+        │   └── 处理新节点的引导
+        │
+        └── T7: Command Controller 触发
+            └── 执行 kubeadm join 命令
+            └── 设置 Machine.Status.NodeRef
+```
+
+### 四、触发资源总结
+
+| 序号 | Controller | 触发方式 | 触发条件 | 执行操作 |
+|------|-----------|---------|---------|---------|
+| **1** | BKECluster Controller | 直接 | Spec.Nodes 变化 | Phase 执行 |
+| **2** | KCP Controller | 间接 | Replicas 变化 | 创建/删除 Machine |
+| **3** | Machine Controller | 间接 | Machine 创建/删除 | 触发 BKEMachine |
+| **4** | BKEMachine Controller | 多种 | Machine/BKECluster/Command | 节点引导 |
+| **5** | Command Controller | 间接 | Command 创建 | 执行命令 |
+
+### 五、关键设计点
+
+#### 1. 多层 Watch 机制
+
+```
+BKECluster
+    │
+    ├── Watch by BKECluster Controller (直接)
+    │
+    └── Watch by BKEMachine Controller (间接)
+        └── BKEClusterToBKEMachines 映射
+```
+
+#### 2. 级联触发
+
+```
+BKECluster → KCP → Machine → BKEMachine → Command
+```
+
+#### 3. Predicate 过滤
+
+- `BKEClusterSpecChange`：过滤非 Spec 变化
+- `BKEAgentReady`：过滤 Agent 未就绪
+- `BKEClusterUnPause`：过滤暂停状态
+
+### 六、总结
+
+**修改 `BKECluster.Spec.Nodes.Master` 触发的调谐链**：
+1. ✅ **BKECluster Controller**：直接触发，执行 Phase
+2. ✅ **KCP Controller**：间接触发，管理 Machine 数量
+3. ✅ **Machine Controller**：间接触发，管理 Machine 生命周期
+4. ✅ **BKEMachine Controller**：多种触发，执行节点引导
+5. ✅ **Command Controller**：间接触发，执行具体命令
+
+**设计优势**：
+- ✅ 多层 Watch 确保及时响应
+- ✅ Predicate 过滤避免无效触发
+- ✅ 级联触发实现自动化流程
+
+
 # 
