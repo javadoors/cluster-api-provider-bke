@@ -1265,3 +1265,304 @@ if BKECluster.OwnerReferences == nil {
 - ⚠️ **职责分离**：BKE 负责基础设施，CAPI 负责编排
 - ⚠️ **级联管理**：通过 OwnerRef 实现级联删除和状态联动
 
+# BkeConfig 与 BKEConfig 使用场景        
+## BkeConfig 与 BKEConfig 使用场景详解
+
+### 一、类型定义与关系
+
+#### 1. 类型定义
+
+```go
+// v1beta1.BKEConfig - API 层配置对象
+// 定义在 api/bkecommon/v1beta1/types.go
+type BKEConfig struct {
+    Cluster    Cluster    `json:"cluster,omitempty"`
+    Addons     []Addon    `json:"addons,omitempty"`
+    CustomExtra map[string]string `json:"customExtra,omitempty"`
+}
+
+// bkeinit.BkeConfig - 内部配置对象
+// 定义在 common/cluster/initialize/config.go
+type BkeConfig v1beta1.BKEConfig  // 类型别名
+```
+
+#### 2. 关系图
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  v1beta1.BKEConfig (API 层)                                         │
+│  • 用户提供的配置                                                     │
+│  • BKECluster.Spec.ClusterConfig                                    │
+│  • 不包含方法                                                        │
+└─────────────────────────────────────────────────────────────────────┘
+        │
+        │ NewBkeConfigFromClusterConfig()
+        │ 或 BkeConfig(*bkeConfig)
+        ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  bkeinit.BkeConfig (内部层)                                         │
+│  • 完整配置（含默认值）                                              │
+│  • 包含业务方法                                                      │
+│    - GenerateClusterAPIConfigFile()                                 │
+│    - YumRepo()                                                      │
+│    - ImageRepo()                                                    │
+│    - ImageFuyaoRepo()                                               │
+│    - ImageThirdRepo()                                               │
+│    - ChartRepo()                                                    │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 二、使用场景分类
+
+#### 1. 创建 CAPI 对象
+
+**文件**：[ensure_cluster_api_obj.go:117](file:////cluster-api-provider-bke/pkg/phaseframe/phases/ensure_cluster_api_obj.go#L117)
+```go
+func (e *EnsureClusterAPIObj) reconcileCreateClusterAPIObj() error {
+    // 从 BKECluster.Spec.ClusterConfig 创建 BkeConfig
+    cfg, err := bkeinit.NewBkeConfigFromClusterConfig(bkeCluster.Spec.ClusterConfig)
+    if err != nil {
+        return err
+    }
+    
+    // 使用 BkeConfig 生成 CAPI YAML
+    yamlPath, err := cfg.GenerateClusterAPIConfigFile(name, namespace, externalEtcd)
+    if err != nil {
+        return err
+    }
+    
+    // Apply YAML 到集群
+    localClient.ApplyYaml(task)
+}
+```
+**作用**：
+- ✅ 将用户配置转换为内部配置
+- ✅ 生成 Cluster、KubeadmControlPlane、MachineDeployment YAML
+
+#### 2. 生成 Manifest YAML（Static Pod）
+
+**文件**：[utils/bkeagent/mfutil/manifest.go:55](file:////cluster-api-provider-bke/utils/bkeagent/mfutil/manifest.go#L55)
+```go
+func GenerateManifestYaml(components Components, boot *BootScope) error {
+    // 转换为 BkeConfig
+    cfg := bkeinit.BkeConfig(*boot.BkeConfig)
+    
+    log.Infof("generate %q version cluster manifests", cfg.Cluster.KubernetesVersion)
+    log.Infof("use %q image repository", cfg.ImageFuyaoRepo())
+    log.Infof("use %q certificate", cfg.Cluster.CertificatesDir)
+    
+    // 渲染 Static Pod YAML
+    for _, component := range components {
+        component.RenderFunc(component, boot)
+    }
+}
+```
+**作用**：
+- ✅ 生成 etcd、kube-apiserver、kube-controller-manager、kube-scheduler 的 Static Pod YAML
+- ✅ 使用 BkeConfig 的方法获取镜像仓库地址
+
+#### 3. 安装 Containerd
+
+**文件**：[pkg/job/builtin/kubeadm/command.go:66](file:////cluster-api-provider-bke/pkg/job/builtin/kubeadm/command.go#L66)
+```go
+func (k *KubeadmPlugin) installContainerdCommand() error {
+    // 转换为 BkeConfig
+    cfg := bkeinit.BkeConfig(*k.boot.BkeConfig)
+    
+    // 使用 BkeConfig 方法获取配置
+    baseUrl := bkesource.GetCustomDownloadPath(cfg.YumRepo())
+    repo := cfg.ImageThirdRepo()
+    sandboxImage := fmt.Sprintf("%s/kubernetes/pause:%s", repo, tag)
+    
+    // 执行安装
+    cp := containerdPlugin.New(k.exec)
+    cp.Execute(command)
+}
+```
+**作用**：
+- ✅ 使用 `YumRepo()` 获取下载地址
+- ✅ 使用 `ImageThirdRepo()` 获取镜像仓库地址
+- ✅ 安装和配置 Containerd
+
+#### 4. 安装 Kubelet
+
+**文件**：[pkg/job/builtin/kubeadm/command.go:103](file:////cluster-api-provider-bke/pkg/job/builtin/kubeadm/command.go#L103)
+```go
+func (k *KubeadmPlugin) installKubeletCommand() error {
+    // 转换为 BkeConfig
+    cfg := bkeinit.BkeConfig(*k.boot.BkeConfig)
+    
+    // 使用 BkeConfig 获取配置
+    k8sVersion := cfg.Cluster.KubernetesVersion
+    kubeletUrl := bkesource.GetCustomDownloadPath(cfg.YumRepo())
+    
+    // 执行安装
+    kp := kubeletPlugin.New(k.k8sClient, k.exec)
+    kp.Execute(command)
+}
+```
+**作用**：
+- ✅ 使用 `YumRepo()` 获取下载地址
+- ✅ 获取 Kubernetes 版本
+- ✅ 安装 Kubelet
+
+#### 5. 设置 Addon 参数
+
+**文件**：[pkg/kube/addon.go:487-615](file:////cluster-api-provider-bke/pkg/kube/addon.go#L487)
+```go
+// 设置镜像仓库参数
+func setImageRepoParams(param *map[string]interface{}, bkeConfig bkeinit.BkeConfig) {
+    (*param)["imageRepo"] = fmt.Sprintf("%s:%s", 
+        bkeConfig.Cluster.ImageRepo.Domain, 
+        bkeConfig.Cluster.ImageRepo.Port)
+    (*param)["imageRepoDomain"] = bkeConfig.Cluster.ImageRepo.Domain
+    (*param)["imageRepoPort"] = bkeConfig.Cluster.ImageRepo.Port
+}
+
+// 设置 HTTP 仓库参数
+func setHTTPRepoParams(param *map[string]interface{}, bkeConfig bkeinit.BkeConfig) {
+    (*param)["httpRepo"] = bkeConfig.YumRepo()
+}
+
+// 设置网络参数
+func setNetworkParams(param *map[string]interface{}, bkeConfig bkeinit.BkeConfig, ...) {
+    (*param)["podSubnet"] = bkeConfig.Cluster.Networking.PodSubnet
+    (*param)["serviceSubnet"] = bkeConfig.Cluster.Networking.ServiceSubnet
+    (*param)["dnsDomain"] = bkeConfig.Cluster.Networking.DNSDomain
+}
+```
+**作用**：
+- ✅ 为 Helm Chart 设置参数
+- ✅ 使用 BkeConfig 的方法获取仓库地址
+- ✅ 设置网络、镜像、HTTP 仓库等参数
+
+#### 6. 渲染 Manifest 文件
+
+**文件**：[utils/bkeagent/mfutil/render.go:617](file:////cluster-api-provider-bke/utils/bkeagent/mfutil/render.go#L617)
+```go
+func renderTemplate(...) {
+    // 转换为 BkeConfig
+    bkeCfg := bkeinit.BkeConfig(*cfg.BkeConfig)
+    
+    // 使用 BkeConfig 渲染模板
+    // ...
+}
+```
+**作用**：
+- ✅ 渲染配置文件模板
+- ✅ 使用 BkeConfig 的配置填充模板变量
+
+### 三、使用方式总结
+
+#### 1. 创建方式对比
+
+| 创建方式 | 使用场景 | 是否设置默认值 |
+|---------|---------|---------------|
+| `NewBkeConfigFromClusterConfig()` | 创建 CAPI 对象 | ✅ 是 |
+| `BkeConfig(*bkeConfig)` | 其他场景 | ❌ 否 |
+
+**示例**：
+```go
+// 方式 1：设置默认值（用于创建 CAPI 对象）
+cfg, err := bkeinit.NewBkeConfigFromClusterConfig(bkeCluster.Spec.ClusterConfig)
+
+// 方式 2：不设置默认值（用于其他场景）
+cfg := bkeinit.BkeConfig(*boot.BkeConfig)
+```
+
+#### 2. 常用方法使用场景
+
+| 方法 | 返回值 | 使用场景 |
+|------|--------|---------|
+| `YumRepo()` | `http://yum.bocloud.com:80` | 下载 Kubelet、Containerd |
+| `ImageRepo()` | `cr.openfuyao.cn:443/kubernetes/` | Kubernetes 镜像 |
+| `ImageFuyaoRepo()` | `cr.openfuyao.cn:443/openfuyao/` | 自编译镜像 |
+| `ImageThirdRepo()` | `hub.oepkgs.net:443/openfuyao/` | 三方镜像 |
+| `ChartRepo()` | `chart.bocloud.com:8080/chart/` | Helm Chart |
+| `GenerateClusterAPIConfigFile()` | YAML 文件路径 | 创建 CAPI 对象 |
+
+### 四、完整使用流程示例
+
+#### 场景：创建集群
+
+```
+Step 1: 用户创建 BKECluster
+        BKECluster.Spec.ClusterConfig = v1beta1.BKEConfig
+
+Step 2: EnsureClusterAPIObj Phase
+        cfg := NewBkeConfigFromClusterConfig(bkeCluster.Spec.ClusterConfig)
+        ├── 设置默认值
+        ├── 生成 CAPI YAML
+        └── Apply 到集群
+
+Step 3: EnsureNodesEnv Phase
+        cfg := BkeConfig(*boot.BkeConfig)
+        ├── 生成 Manifest YAML
+        └── 使用 cfg.ImageFuyaoRepo()
+
+Step 4: 安装 Containerd
+        cfg := BkeConfig(*boot.BkeConfig)
+        ├── 使用 cfg.YumRepo() 获取下载地址
+        └── 使用 cfg.ImageThirdRepo() 获取镜像地址
+
+Step 5: 安装 Kubelet
+        cfg := BkeConfig(*boot.BkeConfig)
+        ├── 使用 cfg.YumRepo() 获取下载地址
+        └── 使用 cfg.Cluster.KubernetesVersion
+
+Step 6: 安装 Addon
+        cfg := BkeConfig(*boot.BkeConfig)
+        ├── setImageRepoParams(cfg)
+        ├── setHTTPRepoParams(cfg)
+        └── setNetworkParams(cfg)
+```
+
+### 五、设计原理
+
+#### 1. 为什么需要两个类型？
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  v1beta1.BKEConfig                                                  │
+│  • API 层定义                                                        │
+│  • 用户输入                                                          │
+│  • 不包含业务逻辑                                                     │
+│  • 可能不完整（部分字段为空）                                           │
+└─────────────────────────────────────────────────────────────────────┘
+        │
+        │ 分离关注点
+        ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  bkeinit.BkeConfig                                                  │
+│  • 内部使用                                                          │
+│  • 包含业务方法                                                      │
+│  • 可以设置默认值                                                     │
+│  • 提供便捷方法                                                       │
+└─────────────────────────────────────────────────────────────────────┘
+```
+**优势**：
+- ✅ **分离关注点**：API 定义与业务逻辑分离
+- ✅ **类型安全**：通过类型转换确保类型正确
+- ✅ **扩展性**：可以添加方法而不影响 API 定义
+- ✅ **默认值管理**：集中管理默认值
+
+### 六、总结
+
+#### 1. 使用场景总结
+
+| 场景 | 文件 | 使用方式 |
+|------|------|---------|
+| **创建 CAPI 对象** | ensure_cluster_api_obj.go | `NewBkeConfigFromClusterConfig()` |
+| **生成 Manifest** | mfutil/manifest.go | `BkeConfig(*boot.BkeConfig)` |
+| **安装 Containerd** | kubeadm/command.go | `BkeConfig(*boot.BkeConfig)` |
+| **安装 Kubelet** | kubeadm/command.go | `BkeConfig(*boot.BkeConfig)` |
+| **设置 Addon 参数** | kube/addon.go | `bkeinit.BkeConfig` 参数 |
+| **渲染模板** | mfutil/render.go | `BkeConfig(*cfg.BkeConfig)` |
+
+#### 2. 关键点
+- ⚠️ **API 层使用 v1beta1.BKEConfig**
+- ⚠️ **内部层使用 bkeinit.BkeConfig**
+- ⚠️ **通过类型转换连接两层**
+- ⚠️ **NewBkeConfigFromClusterConfig 设置默认值**
+- ⚠️ **BkeConfig(*bkeConfig) 不设置默认值**
+
