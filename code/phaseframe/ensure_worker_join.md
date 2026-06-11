@@ -206,3 +206,542 @@ Worker Join 比 Master Join 多了两层过滤：
 #### 5.4 并发状态检查
 使用 `sync.WaitGroup` + `sync.Map` 并发检查所有节点的加入状态，提高了大规模 Worker 节点加入时的检查效率。
         
+# `ensure_worker_join.go` 功能清单与流程
+          
+## `ensure_worker_join.go` 功能清单与流程详解
+
+### 一、核心作用
+
+#### 1. Worker 节点扩容
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  EnsureWorkerJoin Phase                                             │
+│  Worker 节点扩容（加入新的 Worker 节点）                                │
+└─────────────────────────────────────────────────────────────────────┘
+
+核心功能：
+• 确定需要加入的 Worker 节点
+• 检查控制平面是否已初始化
+• 处理博云集群的特殊配置
+• 扩容 MachineDeployment Replicas
+• 等待 Worker 节点加入完成
+• 处理失败节点
+```
+
+### 二、Phase 结构
+
+```go
+type EnsureWorkerJoin struct {
+    phaseframe.BasePhase
+    nodesToJoin bkenode.Nodes  // 待加入的节点列表
+}
+```
+
+### 三、执行条件判断
+
+```go
+func (e *EnsureWorkerJoin) NeedExecute(old, new *bkev1beta1.BKECluster) bool {
+    // 1. 基础判断
+    if !e.BasePhase.DefaultNeedExecute(old, new) {
+        return false
+    }
+
+    // 2. 检查控制平面是否已初始化
+    bkeNodes, ok := fetchBKENodesIfCPInitialized(e.Ctx, new)
+    if !ok {
+        return false
+    }
+
+    // 3. 获取需要加入的 Worker 节点
+    nodes := phaseutil.GetNeedJoinWorkerNodesWithBKENodes(new, bkeNodes)
+    if nodes.Length() == 0 {
+        return false
+    }
+
+    e.SetStatus(bkev1beta1.PhaseWaiting)
+    return true
+}
+```
+**执行条件**：
+
+| 条件 | 说明 |
+|------|------|
+| `DefaultNeedExecute` | 基础条件满足 |
+| `ControlPlaneInitialized` | 控制平面已初始化 |
+| `NeedJoinWorkerNodes > 0` | 有需要加入的 Worker 节点 |
+
+### 四、执行流程
+
+#### Execute 主流程
+
+```go
+func (e *EnsureWorkerJoin) Execute() (ctrl.Result, error) {
+    // 执行 Worker 加入协调
+    if err := e.reconcileWorkerJoin(); err != nil {
+        return ctrl.Result{}, err
+    }
+    return ctrl.Result{}, nil
+}
+```
+
+### 五、详细流程图
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Execute()                                                          │
+└─────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  1. reconcileWorkerJoin()                                           │
+│     • 检查控制平面是否已初始化                                          │
+│     • 获取需要加入的节点                                               │
+│     • 处理博云集群特殊配置                                             │
+│     • 扩容 MachineDeployment Replicas                               │
+│     • 等待 Worker 加入完成                                            │
+└─────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  2. waitWorkerJoin()                                                │
+│     • 轮询检查节点加入状态                                             │
+│     • 分类成功和失败节点                                              │
+│     • 更新节点状态                                                   │
+│     • 处理失败节点                                                   │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 六、核心功能详解
+
+#### 1. reconcileWorkerJoin() - Worker 加入协调
+
+```go
+func (e *EnsureWorkerJoin) reconcileWorkerJoin() error {
+    // 1. 检查控制平面是否已初始化
+    if conditions.IsFalse(e.Ctx.Cluster, clusterv1.ControlPlaneInitializedCondition) {
+        log.Warn("master is not initialized, skip join worker nodes process")
+        return nil
+    }
+
+    // 2. 获取需要加入的节点
+    exceptJoinNodes := e.getExceptJoinNodes()
+    if exceptJoinNodes.Length() == 0 {
+        return nil
+    }
+
+    // 3. 获取可加入的节点信息
+    nodesInfos, nodesCount, err := e.getJoinableNodesInfo(exceptJoinNodes)
+
+    // 4. 处理博云集群的特殊配置
+    if err = e.handleBocloudClusterConfig(bocloudParams); err != nil {
+        return err
+    }
+
+    // 5. 获取集群 API 关联对象
+    scope, err := phaseutil.GetClusterAPIAssociateObjs(ctx, c, e.Ctx.Cluster)
+
+    // 6. 调整 MachineDeployment 副本数
+    return e.scaleMachineDeployment(scaleParams)
+}
+```
+
+#### 2. getExceptJoinNodes() - 获取需要加入的节点
+
+```go
+func (e *EnsureWorkerJoin) getExceptJoinNodes() bkenode.Nodes {
+    // 1. 获取 BKENodes
+    bkeNodes, err := e.Ctx.NodeFetcher().GetBKENodesWrapperForCluster(e.Ctx, bkeCluster)
+
+    // 2. 获取需要加入的 Worker 节点
+    nodes := phaseutil.GetNeedJoinWorkerNodesWithBKENodes(bkeCluster, bkeNodes)
+
+    // 3. 过滤节点
+    exceptJoinNodes := bkenode.Nodes{}
+    for _, node := range nodes {
+        // 3.1 检查是否需要跳过
+        needSkip, _ := nodeFetcher.GetNodeStateNeedSkip(e.Ctx, bkeCluster.Namespace, bkeCluster.Name, node.IP)
+        if needSkip {
+            continue
+        }
+
+        // 3.2 检查环境是否就绪
+        envFlag, _ := nodeFetcher.GetNodeStateFlagForCluster(e.Ctx, bkeCluster, node.IP, bkev1beta1.NodeEnvFlag)
+        readyFlag, _ := nodeFetcher.GetNodeStateFlagForCluster(e.Ctx, bkeCluster, node.IP, bkev1beta1.NodeAgentReadyFlag)
+        if !envFlag || !readyFlag {
+            continue
+        }
+
+        exceptJoinNodes = append(exceptJoinNodes, node)
+    }
+
+    return exceptJoinNodes
+}
+```
+**过滤条件**：
+
+| 条件 | 说明 |
+|------|------|
+| `!NeedSkip` | 未标记为跳过 |
+| `EnvFlag` | 节点环境已就绪 |
+| `AgentReadyFlag` | Agent 已就绪 |
+
+#### 3. handleBocloudClusterConfig() - 处理博云集群特殊配置
+
+```go
+func (e *EnsureWorkerJoin) handleBocloudClusterConfig(params) error {
+    if clusterutil.IsBocloudCluster(params.BKECluster) {
+        // 分发 kube-proxy kubeconfig
+        if err := phaseutil.DistributeKubeProxyKubeConfig(params.Ctx, params.Client, 
+            params.BKECluster, e.nodesToJoin, params.Log); err != nil {
+            return err
+        }
+    }
+    return nil
+}
+```
+**博云集群特殊处理**：
+- ✅ 分发 kube-proxy kubeconfig
+- ✅ 确保 kube-proxy 正常工作
+
+#### 4. scaleMachineDeployment() - 扩容 MachineDeployment
+
+```go
+func (e *EnsureWorkerJoin) scaleMachineDeployment(params) error {
+    // 1. 获取当前 Worker 节点数
+    bkeNodes, _ := e.Ctx.NodeFetcher().GetNodesForBKECluster(params.Ctx, params.BKECluster)
+    workerNodes := bkeNodes.Worker()
+
+    // 2. 计算期望副本数
+    specCopy := params.Scope.MachineDeployment.Spec.DeepCopy()
+    currentReplicas := specCopy.Replicas
+    exceptReplicas := *currentReplicas + int32(params.NodesCount)
+
+    // 3. 不能超过 BKECluster 的 Worker 数量
+    if exceptReplicas > int32(workerNodes.Length()) {
+        exceptReplicas = int32(workerNodes.Length())
+    }
+
+    // 4. 设置回滚
+    var scaleErr error
+    defer func() {
+        if scaleErr != nil {
+            params.Scope.MachineDeployment.Spec.Replicas = currentReplicas
+            phaseutil.ResumeClusterAPIObj(params.Ctx, params.Client, params.Scope.MachineDeployment)
+        }
+    }()
+
+    // 5. 更新 MachineDeployment
+    params.Scope.MachineDeployment.Spec.Replicas = &exceptReplicas
+    if scaleErr = phaseutil.ResumeClusterAPIObj(params.Ctx, params.Client, 
+        params.Scope.MachineDeployment); scaleErr != nil {
+        return scaleErr
+    }
+
+    // 6. 等待 Worker 加入
+    if scaleErr = e.waitWorkerJoin(); scaleErr != nil {
+        return scaleErr
+    }
+
+    return nil
+}
+```
+
+**流程**：
+```
+计算期望副本数
+    ↓
+设置回滚机制
+    ↓
+更新 MachineDeployment.Replicas
+    ↓
+等待 Worker 加入
+```
+
+#### 5. waitWorkerJoin() - 等待 Worker 加入
+
+```go
+func (e *EnsureWorkerJoin) waitWorkerJoin() error {
+    // 1. 获取超时设置
+    timeOut, err := phaseutil.GetBootTimeOut(e.Ctx.BKECluster)
+
+    // 2. 设置超时上下文
+    ctxTimeout, cancel := context.WithTimeout(ctx, timeOut)
+    defer cancel()
+
+    // 3. 轮询检查节点加入状态
+    successJoinNode, err := e.pollWorkerJoinStatus(ctxTimeout)
+
+    // 4. 分类节点（成功和失败）
+    successNodes, failedNodes := e.categorizeJoinedNodes(successJoinNode)
+
+    // 5. 更新成功节点的状态
+    if err := e.updateSuccessNodesStatus(c, successNodes); err != nil {
+        return err
+    }
+
+    // 6. 处理失败节点
+    if len(failedNodes) > 0 {
+        e.handleFailedNodes(c, successNodes, failedNodes)
+    }
+
+    // 7. 判断是否可以继续部署
+    return e.determineDeploymentResult(successNodes, failedNodes, err)
+}
+```
+
+#### 6. pollWorkerJoinStatus() - 轮询检查节点加入状态
+
+```go
+func (e *EnsureWorkerJoin) pollWorkerJoinStatus(ctxTimeout context.Context) (*sync.Map, error) {
+    successJoinNode := sync.Map{}
+    failedJoinNode := sync.Map{}
+
+    err := wait.PollImmediateUntil(1*time.Second, func() (done bool, err error) {
+        // 1. 刷新 BKECluster 状态
+        if err := e.Ctx.RefreshCtxBKECluster(); err != nil {
+            log.Warn("Failed to refresh BKECluster: %v", err)
+        }
+
+        // 2. 并发检查所有节点的状态
+        e.checkAllNodesStatus(&successJoinNode, &failedJoinNode)
+
+        // 3. 检查是否所有节点都已处理完毕
+        if done, success, failed := e.isAllNodesProcessed(&successJoinNode, &failedJoinNode); done {
+            return true, nil
+        }
+
+        return false, nil
+    }, ctxTimeout.Done())
+
+    return &successJoinNode, err
+}
+```
+**特点**：
+- ✅ **并发检查**：使用 goroutine 并发检查多个节点
+- ✅ **轮询间隔**：1 秒
+- ✅ **超时控制**：使用 context.WithTimeout
+
+#### 7. checkSingleNodeStatus() - 检查单个节点状态
+
+```go
+func (e *EnsureWorkerJoin) checkSingleNodeStatus(index int, n confv1beta1.Node, 
+    successJoinNode, failedJoinNode *sync.Map) {
+
+    // 1. 已处理的节点直接跳过
+    if _, ok := successJoinNode.Load(index); ok {
+        return
+    }
+    if _, ok := failedJoinNode.Load(index); ok {
+        return
+    }
+
+    // 2. 检查节点是否被标记为失败
+    failedFlag, _ := nodeFetcher.GetNodeStateFlagForCluster(ctx, bkeCluster, n.IP, bkev1beta1.NodeFailedFlag)
+    if failedFlag {
+        nodeFetcher.SetNodeNeedSkip(ctx, bkeCluster.Namespace, bkeCluster.Name, n.IP, true)
+        failedJoinNode.Store(index, n)
+        return
+    }
+
+    // 3. 检查节点失败状态
+    nowNode, _ := nodeFetcher.GetNodeByIP(ctx, bkeCluster.Namespace, bkeCluster.Name, n.IP)
+    nodeState := nowNode.Status.State
+    if nodeState == bkev1beta1.NodeBootStrapFailed || nodeState == bkev1beta1.NodeInitFailed {
+        nodeFetcher.SetNodeNeedSkip(ctx, bkeCluster.Namespace, bkeCluster.Name, n.IP, true)
+        failedJoinNode.Store(index, n)
+        return
+    }
+
+    // 4. 检查节点是否成功加入
+    machine, err := phaseutil.NodeToMachine(ctx, c, bkeCluster, n)
+    if err != nil {
+        return
+    }
+    if machine.Status.NodeRef != nil {
+        successJoinNode.Store(index, n)
+    }
+}
+```
+**判断逻辑**：
+
+| 状态 | 判断条件 | 操作 |
+|------|---------|------|
+| **失败** | `NodeFailedFlag = true` | 标记为跳过，加入失败列表 |
+| **失败** | `NodeState = BootstrapFailed/InitFailed` | 标记为跳过，加入失败列表 |
+| **成功** | `Machine.Status.NodeRef != nil` | 加入成功列表 |
+
+#### 8. handleFailedNodes() - 处理失败节点
+
+```go
+func (e *EnsureWorkerJoin) handleFailedNodes(c client.Client, successNodes, failedNodes bkenode.Nodes) {
+    // 1. 记录失败节点概要
+    e.logFailedNodesSummary(log, successNodes, failedNodes)
+
+    // 2. 标记失败节点为跳过状态
+    e.markFailedNodesAsSkipped(log, failedNodes)
+
+    // 3. 记录失败节点处理指引
+    e.logFailedNodesGuidance(log)
+
+    // 4. 同步失败节点的状态
+    if err := mergecluster.SyncStatusUntilComplete(c, e.Ctx.BKECluster); err != nil {
+        log.Error("Failed to sync status for skipped nodes: %v", err)
+    }
+}
+```
+**处理方式**：
+```
+记录失败信息
+    ↓
+标记为 NeedSkip
+    ↓
+输出处理指引
+    ↓
+同步状态
+```
+
+#### 9. determineDeploymentResult() - 决定部署结果
+
+```go
+func (e *EnsureWorkerJoin) determineDeploymentResult(successNodes, failedNodes bkenode.Nodes, pollErr error) error {
+    // 1. 如果有成功加入的节点，则认为集群可以继续
+    if len(successNodes) > 0 {
+        e.logSuccessResult(log, successNodes, failedNodes)
+        return nil  // 返回 nil，继续部署
+    }
+
+    // 2. 如果所有节点都失败了，但不是超时错误，则返回错误
+    if len(failedNodes) > 0 && !errors.Is(pollErr, wait.ErrWaitTimeout) {
+        log.Error("All worker nodes failed to join, error: %v", pollErr)
+        return pollErr
+    }
+
+    // 3. 如果是超时错误且没有成功节点，记录警告但不返回错误（让集群继续）
+    if errors.Is(pollErr, wait.ErrWaitTimeout) && len(successNodes) == 0 && len(failedNodes) > 0 {
+        e.logTimeoutResult(log, failedNodes)
+        return nil  // 返回 nil，继续部署
+    }
+
+    return nil
+}
+```
+**决策逻辑**：
+
+| 情况 | 成功节点 | 失败节点 | 结果 |
+|------|---------|---------|------|
+| **部分成功** | > 0 | 任意 | 返回 nil（继续部署） |
+| **全部失败（非超时）** | 0 | > 0 | 返回错误 |
+| **全部失败（超时）** | 0 | > 0 | 返回 nil（继续部署） |
+
+### 七、错误处理与回滚
+
+#### 1. defer 回滚机制
+
+```go
+var scaleErr error
+defer func() {
+    if scaleErr != nil {
+        log.Info("Scale down MachineDeployment replicas to %d.", *currentReplicas)
+        params.Scope.MachineDeployment.Spec.Replicas = currentReplicas
+        if err := phaseutil.ResumeClusterAPIObj(params.Ctx, params.Client, 
+            params.Scope.MachineDeployment); err != nil {
+            log.Error("Rollback MachineDeployment replicas failed. err: %v", err)
+        }
+    }
+}()
+```
+**作用**：
+- ✅ 如果加入过程中出现错误，恢复 Replicas 到加入前的值
+- ✅ Resume MachineDeployment，使其继续正常工作
+
+### 八、约束与限制
+
+#### 1. 最大副本数限制
+
+```go
+exceptReplicas := *currentReplicas + int32(params.NodesCount)
+// 不能超过 BKECluster 的 Worker 数量
+if exceptReplicas > int32(workerNodes.Length()) {
+    exceptReplicas = int32(workerNodes.Length())
+}
+```
+**约束**：
+- ⚠️ **不能超过 BKECluster.Spec.Nodes.Worker 数量**
+
+#### 2. 控制平面依赖
+
+```go
+if conditions.IsFalse(e.Ctx.Cluster, clusterv1.ControlPlaneInitializedCondition) {
+    log.Warn("master is not initialized, skip join worker nodes process")
+    return nil
+}
+```
+**约束**：
+- ⚠️ **控制平面必须已初始化**：否则跳过 Worker 加入
+
+### 九、并发处理
+
+#### 1. 并发检查节点状态
+
+```go
+func (e *EnsureWorkerJoin) checkAllNodesStatus(successJoinNode, failedJoinNode *sync.Map) {
+    wg := sync.WaitGroup{}
+    for i, node := range e.nodesToJoin {
+        wg.Add(1)
+        go func(index int, n confv1beta1.Node) {
+            defer wg.Done()
+            e.checkSingleNodeStatus(index, n, successJoinNode, failedJoinNode)
+        }(i, node)
+    }
+    wg.Wait()
+}
+```
+**优势**：
+- ✅ **并发检查**：多个节点同时检查，提高效率
+- ✅ **线程安全**：使用 `sync.Map` 和 `sync.WaitGroup`
+
+### 十、总结
+
+#### 1. 功能清单
+
+| 功能 | 说明 |
+|------|------|
+| **确定加入节点** | 通过 BKENode 状态确定需要加入的节点 |
+| **检查控制平面** | 确保控制平面已初始化 |
+| **过滤节点** | 跳过标记为 Skip 或未就绪的节点 |
+| **博云集群处理** | 分发 kube-proxy kubeconfig |
+| **扩容 Replicas** | 增加 MachineDeployment 副本数 |
+| **等待加入** | 轮询检查节点加入状态 |
+| **处理失败节点** | 标记为 Skip，输出指引 |
+| **错误回滚** | 失败时恢复 Replicas |
+
+#### 2. 关键特性
+
+- ⚠️ **控制平面依赖**：必须等待控制平面初始化
+- ⚠️ **并发检查**：使用 goroutine 并发检查节点状态
+- ⚠️ **错误回滚**：失败时恢复 Replicas
+- ⚠️ **失败节点处理**：标记为 Skip，不影响集群继续部署
+- ⚠️ **部分成功机制**：只要有节点成功，就继续部署
+
+#### 3. 执行流程
+
+```
+NeedExecute 判断
+    ↓
+reconcileWorkerJoin
+    ├── 检查控制平面
+    ├── 获取待加入节点
+    ├── 过滤节点
+    ├── 博云集群处理
+    ├── 扩容 Replicas
+    └── 等待加入
+    ↓
+waitWorkerJoin
+    ├── 并发检查节点状态
+    ├── 分类成功/失败节点
+    ├── 更新成功节点状态
+    ├── 处理失败节点
+    └── 决定部署结果
+```
+
