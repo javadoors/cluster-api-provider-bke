@@ -1566,3 +1566,1046 @@ Step 6: 安装 Addon
 - ⚠️ **NewBkeConfigFromClusterConfig 设置默认值**
 - ⚠️ **BkeConfig(*bkeConfig) 不设置默认值**
 
+# `prepareExternalEtcdConfig` 函数作用
+          
+## `prepareExternalEtcdConfig` 函数作用详解
+
+### 一、函数签名与核心逻辑
+
+```go
+func (e *EnsureClusterAPIObj) prepareExternalEtcdConfig(bkeCluster *bkev1beta1.BKECluster) (map[string]string, error) {
+    // 1. 判断是否为 Bocloud 集群
+    if !clusterutil.IsBocloudCluster(bkeCluster) {
+        return nil, nil  // 非 Bocloud 集群，不需要外部 etcd
+    }
+
+    // 2. 创建外部 etcd 配置
+    externalEtcd := bkeinit.NewExternalEtcdConfig()
+    if externalEtcd == nil {
+        return nil, nil  // 配置为空，跳过
+    }
+
+    // 3. 设置证书文件（假值）
+    externalEtcd["etcdCAFile"] = "fakeCaCert"
+    externalEtcd["etcdCertFile"] = "fakeCertFile"
+    externalEtcd["etcdKeyFile"] = "fakeKeyFile"
+
+    // 4. 获取所有节点
+    allNodes, err := e.Ctx.GetNodes()
+    if err != nil {
+        return nil, fmt.Errorf("failed to get nodes: %v", err)
+    }
+
+    // 5. 构建 etcd 端点
+    etcdEndpoints := buildEtcdEndpoints(bkenode.Nodes(allNodes).Etcd())
+    externalEtcd["etcdEndpoints"] = etcdEndpoints
+    
+    return externalEtcd, nil
+}
+```
+
+### 二、核心作用
+
+#### 1. 为 Bocloud 托管集群准备外部 etcd 配置
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  集群类型判断                                                        │
+└─────────────────────────────────────────────────────────────────────┘
+        │
+        ├── BKE 自建集群 → return nil, nil
+        │   └── 使用内置 etcd（kubeadm 管理）
+        │
+        ├── Bocloud 托管集群 → 准备外部 etcd 配置
+        │   └── 使用外部 etcd（Bocloud 管理）
+        │
+        └── 其他类型集群 → return nil, nil
+```
+
+### 三、详细流程
+
+#### 1. 判断是否为 Bocloud 集群
+
+```go
+func IsBocloudCluster(bkeCluster client.Object) bool {
+    v, ok := annotation.HasAnnotation(bkeCluster, common.BKEClusterFromAnnotationKey)
+    return ok && v == common.BKEClusterFromAnnotationValueBocloud
+}
+```
+
+**判断逻辑**：
+```yaml
+# Bocloud 托管集群
+BKECluster:
+  metadata:
+    annotations:
+      bke.bocloud.com/cluster-from: "bocloud"  # ← 判断依据
+
+# BKE 自建集群
+BKECluster:
+  metadata:
+    annotations:
+      bke.bocloud.com/cluster-from: "bke"  # 或不存在
+
+# 其他类型集群
+BKECluster:
+  metadata:
+    annotations:
+      bke.bocloud.com/cluster-from: "other"
+```
+
+#### 2. 创建外部 etcd 配置模板
+
+```go
+func NewExternalEtcdConfig() map[string]string {
+    return map[string]string{
+        "etcdEndpoints": "",
+        "etcdCAFile":    "",
+        "etcdCertFile":  "",
+        "etcdKeyFile":   "",
+    }
+}
+```
+**配置项说明**：
+
+| 配置项 | 说明 | 最终值 |
+|-------|------|--------|
+| `etcdEndpoints` | etcd 端点列表 | `https://ip1:2379,https://ip2:2379,...` |
+| `etcdCAFile` | CA 证书文件 | `"fakeCaCert"` |
+| `etcdCertFile` | 客户端证书文件 | `"fakeCertFile"` |
+| `etcdKeyFile` | 客户端私钥文件 | `"fakeKeyFile"` |
+
+#### 3. 设置证书文件（假值）
+
+```go
+externalEtcd["etcdCAFile"] = "fakeCaCert"
+externalEtcd["etcdCertFile"] = "fakeCertFile"
+externalEtcd["etcdKeyFile"] = "fakeKeyFile"
+```
+**为什么使用假值？**
+- ⚠️ **证书由 Bocloud 平台管理**：真实的证书文件由 Bocloud 平台提供
+- ⚠️ **占位符作用**：在生成 CAPI YAML 时作为占位符
+- ⚠️ **后续替换**：Bocloud 平台会在部署时替换为真实证书
+
+#### 4. 构建 etcd 端点
+
+```go
+func buildEtcdEndpoints(etcdNodes bkenode.Nodes) string {
+    endpoints := make([]string, 0, len(etcdNodes))
+    for _, node := range etcdNodes {
+        endpoints = append(endpoints, fmt.Sprintf("https://%s:2379", node.IP))
+    }
+    return strings.Join(endpoints, ",")
+}
+```
+
+**示例**：
+```
+输入：etcdNodes = [
+    {IP: "192.168.1.10", Role: "etcd"},
+    {IP: "192.168.1.11", Role: "etcd"},
+    {IP: "192.168.1.12", Role: "etcd"}
+]
+
+处理：
+    endpoints = [
+        "https://192.168.1.10:2379",
+        "https://192.168.1.11:2379",
+        "https://192.168.1.12:2379"
+    ]
+
+输出：
+    "https://192.168.1.10:2379,https://192.168.1.11:2379,https://192.168.1.12:2379"
+```
+
+### 四、返回的配置示例
+
+#### Bocloud 托管集群
+
+```go
+externalEtcd = map[string]string{
+    "etcdEndpoints": "https://192.168.1.10:2379,https://192.168.1.11:2379,https://192.168.1.12:2379",
+    "etcdCAFile":    "fakeCaCert",
+    "etcdCertFile":  "fakeCertFile",
+    "etcdKeyFile":   "fakeKeyFile",
+}
+```
+
+#### BKE 自建集群
+
+```go
+externalEtcd = nil  // 使用内置 etcd
+```
+
+### 五、使用场景
+
+#### 1. 创建 CAPI 对象时使用
+
+```go
+// ensure_cluster_api_obj.go
+func (e *EnsureClusterAPIObj) reconcileCreateClusterAPIObj() error {
+    // 准备外部 etcd 配置
+    externalEtcd, err := e.prepareExternalEtcdConfig(bkeCluster)
+    if err != nil {
+        return err
+    }
+    
+    // 创建 CAPI 对象
+    params := CreateClusterAPIObjParams{
+        Ctx:          ctx,
+        Client:       c,
+        BKECluster:   bkeCluster,
+        Cfg:          cfg,
+        ExternalEtcd: externalEtcd,  // ← 传入外部 etcd 配置
+        Log:          log,
+    }
+    return e.createClusterAPIObj(params)
+}
+```
+
+#### 2. 生成 CAPI YAML 时使用
+
+```go
+// config.go
+func (bc *BkeConfig) GenerateClusterAPIConfigFile(name, namespace string, externalEtcd map[string]string) (string, error) {
+    // 构建模板数据
+    padding, err := bc.buildPadding(name, namespace, externalEtcd)
+    
+    // 渲染模板
+    tmpl.Execute(file, padding)
+}
+```
+
+#### 3. 模板数据构建
+
+```go
+func (bc *BkeConfig) buildPadding(name, namespace string, externalEtcd map[string]string) (map[string]string, error) {
+    padding := map[string]string{
+        "name":           name,
+        "namespace":      namespace,
+        "externalEtcd":   "false",  // 默认使用内置 etcd
+        // ...
+    }
+    
+    // 如果有外部 etcd 配置
+    if externalEtcd != nil {
+        padding["externalEtcd"] = "true"
+        for k, v := range externalEtcd {
+            padding[k] = v  // 添加 etcd 配置
+        }
+    }
+    
+    return padding, nil
+}
+```
+
+### 六、生成的 CAPI YAML 示例
+
+#### Bocloud 托管集群（使用外部 etcd）
+
+```yaml
+apiVersion: cluster.x-k8s.io/v1beta1
+kind: Cluster
+metadata:
+  name: my-cluster
+spec:
+  controlPlaneRef:
+    apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+    kind: KubeadmControlPlane
+    name: my-cluster
+---
+apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+kind: KubeadmControlPlane
+metadata:
+  name: my-cluster
+spec:
+  kubeadmConfigSpec:
+    clusterConfiguration:
+      etcd:
+        external:
+          endpoints:
+            - https://192.168.1.10:2379
+            - https://192.168.1.11:2379
+            - https://192.168.1.12:2379
+          caFile: fakeCaCert      # ← 假值，后续由 Bocloud 替换
+          certFile: fakeCertFile  # ← 假值
+          keyFile: fakeKeyFile    # ← 假值
+```
+
+#### BKE 自建集群（使用内置 etcd）
+
+```yaml
+apiVersion: controlplane.cluster.x-k8s.io/v1beta1
+kind: KubeadmControlPlane
+metadata:
+  name: my-cluster
+spec:
+  kubeadmConfigSpec:
+    clusterConfiguration:
+      etcd:
+        local:
+          dataDir: /var/lib/etcd  # ← 内置 etcd
+```
+
+### 七、业务场景对比
+
+| 集群类型 | etcd 类型 | 证书管理 | 配置来源 |
+|---------|----------|---------|---------|
+| **BKE 自建集群** | 内置 etcd | kubeadm 自动生成 | kubeadm 管理 |
+| **Bocloud 托管集群** | 外部 etcd | Bocloud 平台管理 | Bocloud 平台提供 |
+| **其他类型集群** | 不确定 | 不确定 | 不支持 |
+
+### 八、设计原理
+
+#### 1. 为什么需要外部 etcd 配置？
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Bocloud 托管集群架构                                                 │
+└─────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────┐    ┌──────────────────────┐
+│  Bocloud 平台         │    │  用户集群              │
+│                      │    │                      │
+│  • etcd 集群         │◄───│  • Master 节点        │
+│  • 证书管理           │    │  • Worker 节点       │
+│  • 高可用保障         │    │                      │
+└──────────────────────┘    └──────────────────────┘
+        │
+        │ 提供
+        ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  外部 etcd 配置                                                      │
+│  • etcdEndpoints: etcd 集群地址                                      │
+│  • etcdCAFile: CA 证书                                              │
+│  • etcdCertFile: 客户端证书                                          │
+│  • etcdKeyFile: 客户端私钥                                           │
+└─────────────────────────────────────────────────────────────────────┘
+```
+**优势**：
+- ✅ **etcd 独立管理**：由 Bocloud 平台统一管理，高可用保障
+- ✅ **证书统一管理**：证书由平台管理，自动轮换
+- ✅ **资源隔离**：etcd 与用户集群分离，资源隔离
+- ✅ **运维简化**：用户无需关心 etcd 运维
+
+#### 2. 为什么使用假值证书？
+
+- ⚠️ **证书敏感信息**：真实证书不应存储在 BKECluster 对象中
+- ⚠️ **平台注入**：Bocloud 平台在部署时会注入真实证书
+- ⚠️ **占位符作用**：确保 CAPI YAML 结构正确
+
+### 九、总结
+
+#### 1. 核心作用
+
+| 作用 | 说明 |
+|------|------|
+| **判断集群类型** | 只为 Bocloud 托管集群准备配置 |
+| **构建 etcd 端点** | 从节点列表构建 etcd 访问地址 |
+| **设置证书占位符** | 为证书文件设置假值占位符 |
+| **返回配置** | 用于生成 CAPI YAML |
+
+#### 2. 关键点
+
+- ⚠️ **只针对 Bocloud 集群**：BKE 自建集群使用内置 etcd
+- ⚠️ **证书为假值**：真实证书由 Bocloud 平台注入
+- ⚠️ **etcd 端点从节点获取**：从 BKENode 资源获取 etcd 节点 IP
+- ⚠️ **用于 CAPI YAML 生成**：配置会传递给 `GenerateClusterAPIConfigFile`
+
+#### 3. 使用流程
+
+```
+判断集群类型
+    ↓
+Bocloud 集群？
+    ↓ 是
+获取 etcd 节点
+    ↓
+构建端点列表
+    ↓
+设置证书占位符
+    ↓
+返回配置
+    ↓
+生成 CAPI YAML
+```
+
+# `condition.HasCondition` 函数作用
+          
+## `condition.HasCondition` 函数作用详解
+
+### 一、函数签名与实现
+
+```go
+func HasCondition(
+    conditionType confv1beta1.ClusterConditionType, 
+    bkeCluster *bkev1beta1.BKECluster
+) (*confv1beta1.ClusterCondition, bool) {
+    // 1. 检查 Conditions 是否为空
+    if bkeCluster.Status.Conditions == nil {
+        return nil, false
+    }
+
+    // 2. 遍历所有 Condition
+    for _, condition := range bkeCluster.Status.Conditions {
+        if condition.Type == conditionType {
+            // 3. 找到匹配的 Condition，返回
+            return &condition, true
+        }
+    }
+
+    // 4. 未找到，返回 nil, false
+    return nil, false
+}
+```
+
+### 二、核心作用
+
+#### 1. 检查 BKECluster 是否有指定类型的 Condition
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  BKECluster.Status.Conditions                                       │
+└─────────────────────────────────────────────────────────────────────┘
+        │
+        │ 遍历查找
+        ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  查找 conditionType == ClusterAPIObjCondition                       │
+└─────────────────────────────────────────────────────────────────────┘
+        │
+        ├── 找到 → return (condition, true)
+        │
+        └── 未找到 → return (nil, false)
+```
+
+### 三、参数与返回值
+
+#### 1. 参数说明
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `conditionType` | `confv1beta1.ClusterConditionType` | 要查找的 Condition 类型 |
+| `bkeCluster` | `*bkev1beta1.BKECluster` | BKECluster 对象 |
+
+#### 2. 返回值说明
+
+| 返回值 | 类型 | 说明 |
+|--------|------|------|
+| `*confv1beta1.ClusterCondition` | 指针 | 找到的 Condition 对象（未找到为 nil） |
+| `bool` | 布尔值 | 是否找到（true = 找到，false = 未找到） |
+
+### 四、在 ensure_cluster_api_obj.go 中的使用
+
+#### 1. 使用场景：防重入保护
+
+```go
+func (e *EnsureClusterAPIObj) reconcileCreateClusterAPIObj() error {
+    ctx, c, bkeCluster, _, log := e.Ctx.Untie()
+
+    // 检查是否已经有 ClusterAPIObjCondition
+    if _, ok := condition.HasCondition(bkev1beta1.ClusterAPIObjCondition, bkeCluster); ok {
+        log.Info(constant.ClusterAPIObjNotReadyReason, "Waiting cluster api obj reconciled")
+        return errors.New("Waiting cluster api obj reconciled")
+    }
+
+    // 如果没有 Condition，继续创建 CAPI 对象
+    log.Info(constant.ClusterAPIObjCreatingReason, "Start create cluster api obj")
+    // ...
+}
+```
+
+#### 2. 业务逻辑
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  reconcileCreateClusterAPIObj()                                     │
+└─────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  HasCondition(ClusterAPIObjCondition, bkeCluster)                   │
+└─────────────────────────────────────────────────────────────────────┘
+        │
+        ├── 找到 Condition (ok = true)
+        │   │
+        │   ├── 业务含义：CAPI 对象已创建过
+        │   │
+        │   └── 操作：返回错误，等待 CAPI Controller 处理
+        │       return "Waiting cluster api obj reconciled"
+        │
+        └── 未找到 Condition (ok = false)
+            │
+            ├── 业务含义：CAPI 对象未创建
+            │
+            └── 操作：继续创建 CAPI 对象
+                • 生成 YAML
+                • Apply 到集群
+                • 设置 Condition = False
+```
+
+### 五、Condition 生命周期
+
+#### 1. Condition 状态转换
+
+```
+初始状态：无 ClusterAPIObjCondition
+        │
+        │ reconcileCreateClusterAPIObj() 执行
+        ▼
+创建 CAPI 对象后：ClusterAPIObjCondition = False
+        │
+        │ CAPI Controller 设置 OwnerRef
+        ▼
+CAPI 就绪后：ClusterAPIObjCondition = True
+```
+
+#### 2. Condition 定义
+
+```go
+type ClusterCondition struct {
+    Type               ClusterConditionType   // "ClusterAPIObj"
+    Status             ConditionStatus        // "True", "False", "Unknown"
+    Reason             string                 // "ClusterAPIObjReady", "ClusterAPIObjNotReady"
+    Message            string                 // 详细信息
+    LastTransitionTime *metav1.Time           // 最后转换时间
+}
+```
+
+### 六、完整示例
+
+#### 示例 1：首次创建 CAPI 对象
+
+```yaml
+# 初始状态
+BKECluster:
+  status:
+    conditions: []  # 空，无 Condition
+
+# 执行 HasCondition
+condition.HasCondition(ClusterAPIObjCondition, bkeCluster)
+# 返回：(nil, false)
+
+# 结果：继续创建 CAPI 对象
+```
+
+#### 示例 2：已创建 CAPI 对象（等待就绪）
+
+```yaml
+# 当前状态
+BKECluster:
+  status:
+    conditions:
+      - type: ClusterAPIObj
+        status: "False"
+        reason: "ClusterAPIObjNotReady"
+        message: "cluster api obj create success"
+
+# 执行 HasCondition
+condition.HasCondition(ClusterAPIObjCondition, bkeCluster)
+# 返回：(condition, true)
+
+# 结果：返回错误，等待 CAPI Controller 处理
+# return "Waiting cluster api obj reconciled"
+```
+
+#### 示例 3：CAPI 对象已就绪
+
+```yaml
+# 当前状态
+BKECluster:
+  status:
+    conditions:
+      - type: ClusterAPIObj
+        status: "True"
+        reason: "ClusterAPIObjReady"
+        message: "cluster api obj ready"
+
+# 执行 HasCondition
+condition.HasCondition(ClusterAPIObjCondition, bkeCluster)
+# 返回：(condition, true)
+
+# 结果：返回错误，跳过创建
+```
+
+### 七、相关函数
+
+#### 1. HasConditionStatus
+
+```go
+func HasConditionStatus(
+    conditionType confv1beta1.ClusterConditionType, 
+    bkeCluster *bkev1beta1.BKECluster, 
+    conditionStatus confv1beta1.ConditionStatus
+) bool {
+    condition, ok := HasCondition(conditionType, bkeCluster)
+    if !ok {
+        return false
+    }
+    return condition.Status == conditionStatus
+}
+```
+
+**作用**：检查指定类型的 Condition 是否为指定状态
+
+**使用示例**：
+```go
+// 检查 ClusterAPIObjCondition 是否为 True
+if condition.HasConditionStatus(ClusterAPIObjCondition, bkeCluster, ConditionTrue) {
+    // CAPI 对象已就绪
+}
+```
+
+#### 2. RemoveCondition
+
+```go
+func RemoveCondition(
+    conditionType confv1beta1.ClusterConditionType, 
+    bkeCluster *bkev1beta1.BKECluster
+) {
+    conditions := bkeCluster.Status.Conditions
+    if conditions == nil {
+        return
+    }
+
+    indexToRemove := -1
+    for i, condition := range conditions {
+        if condition.Type == conditionType {
+            indexToRemove = i
+            break
+        }
+    }
+
+    if indexToRemove != -1 {
+        conditions = append(conditions[:indexToRemove], conditions[indexToRemove+1:]...)
+        bkeCluster.Status.Conditions = conditions
+    }
+}
+```
+**作用**：移除指定类型的 Condition
+
+### 八、设计原理
+
+#### 1. 为什么需要 HasCondition？
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  防重入保护                                                          │
+└─────────────────────────────────────────────────────────────────────┘
+
+场景：reconcileCreateClusterAPIObj() 可能被多次调用
+
+T1: 第一次调用
+    ├── HasCondition() → false
+    ├── 创建 CAPI 对象
+    └── 设置 Condition = False
+
+T2: 第二次调用（在 CAPI Controller 处理前）
+    ├── HasCondition() → true  ← 检测到已创建
+    └── return "Waiting cluster api obj reconciled"  ← 不重复创建
+
+T3: 第三次调用（CAPI Controller 处理后）
+    ├── HasCondition() → true
+    ├── Condition = True
+    └── 完成
+```
+**优势**：
+- ✅ **防止重复创建**：避免多次创建 CAPI 对象
+- ✅ **状态追踪**：通过 Condition 追踪 CAPI 对象状态
+- ✅ **幂等性**：确保操作幂等
+
+#### 2. Condition 设计模式
+
+```
+Condition 是 Kubernetes 标准的状态追踪机制
+
+┌─────────────────────────────────────────────────────────────────────┐
+│  Condition 结构                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+
+type ClusterCondition struct {
+    Type               ClusterConditionType   // 条件类型
+    Status             ConditionStatus        // 状态
+    Reason             string                 // 原因
+    Message            string                 // 详细信息
+    LastTransitionTime *metav1.Time           // 最后转换时间
+}
+
+常见 Condition 类型：
+• ClusterAPIObjCondition: CAPI 对象状态
+• NodesEnvCondition: 节点环境状态
+• MasterInitCondition: Master 初始化状态
+• AddonCondition: Addon 安装状态
+```
+
+### 九、总结
+
+#### 1. 核心作用
+
+| 作用 | 说明 |
+|------|------|
+| **检查 Condition 是否存在** | 判断指定类型的 Condition 是否存在 |
+| **防重入保护** | 避免重复创建 CAPI 对象 |
+| **状态追踪** | 追踪 CAPI 对象的创建和就绪状态 |
+| **返回 Condition 对象** | 可以获取 Condition 的详细信息 |
+
+#### 2. 关键点
+
+- ⚠️ **返回两个值**：Condition 对象和是否找到的标志
+- ⚠️ **幂等性保障**：确保操作幂等，避免重复执行
+- ⚠️ **状态机模式**：通过 Condition 实现状态机
+- ⚠️ **Kubernetes 标准**：遵循 Kubernetes Condition 设计模式
+
+#### 3. 使用场景
+
+- ✅ 检查 CAPI 对象是否已创建
+- ✅ 检查节点环境是否已准备
+- ✅ 检查 Master 是否已初始化
+- ✅ 检查 Addon 是否已安装
+
+# `ApplyYaml` 函数
+         
+## `ApplyYaml` 函数作用详解
+
+### 一、函数签名与核心逻辑
+
+```go
+func (c *Client) ApplyYaml(task *Task) error {
+    c.Log.Infof("*****start %s yaml file %s*****", task.Operate, task.FilePath)
+    defer c.Log.Infof("*****end %s yaml file %s*****", task.Operate, task.FilePath)
+
+    // 1. 渲染 YAML 文件为 Decoder
+    decoder, err := RenderYamlToDecoder(task)
+    
+    // 2. 获取 RESTMapper（用于发现 API 资源）
+    restMapper, err := c.getRestMapper()
+    
+    // 3. 从 Decoder 解析出 Unstructured 对象列表
+    unstructList, err := GetUnStructListFromDecoder(decoder)
+    
+    // 4. 处理 List 类型资源（展开）
+    finalUnstructuredList := c.processUnstructuredList(unstructList)
+    
+    // 5. 排序（安装/卸载顺序）
+    finalUnstructuredList = c.sortUnstructuredList(finalUnstructuredList, task)
+    
+    // 6. Apply 到集群
+    return c.applyUnstructuredList(finalUnstructuredList, restMapper, task)
+}
+```
+
+### 二、核心作用
+
+#### 1. 将 YAML 文件 Apply 到 Kubernetes 集群
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  YAML 文件                                                          │
+│  (Cluster, KCP, MachineDeployment, etc.)                           │
+└─────────────────────────────────────────────────────────────────────┘
+        │
+        │ ApplyYaml()
+        ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  处理流程                                                            │
+│  1. 渲染 YAML（变量替换）                                            │
+│  2. 解析为 Unstructured 对象                                         │
+│  3. 处理 List 类型                                                   │
+│  4. 排序（Namespace → CRD → 其他）                                   │
+│  5. Apply 到集群                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  Kubernetes 集群                                                    │
+│  • 创建/更新资源                                                     │
+│  • 等待资源就绪                                                      │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 三、Task 结构体
+
+```go
+type Task struct {
+    Name        string                         // 任务名称
+    FilePath    string                         // YAML 文件路径
+    Param       map[string]interface{}         // 模板参数
+    IgnoreError bool                           // 是否忽略错误
+    Block       bool                           // 是否阻塞等待
+    Timeout     time.Duration                  // 超时时间
+    Interval    time.Duration                  // 轮询间隔
+    Operate     bkeaddon.AddonOperate          // 操作类型
+    recorder    *AddonRecorder                 // 记录器
+}
+```
+
+#### 操作类型
+
+| 操作类型 | 说明 |
+|---------|------|
+| `CreateAddon` | 创建资源 |
+| `UpdateAddon` | 更新资源 |
+| `UpgradeAddon` | 升级资源 |
+| `RemoveAddon` | 删除资源 |
+
+### 四、详细流程
+
+#### 1. 渲染 YAML 文件
+
+```go
+decoder, err := RenderYamlToDecoder(task)
+```
+**作用**：
+- ✅ 读取 YAML 文件
+- ✅ 使用 `task.Param` 渲染模板变量
+- ✅ 返回 YAML Decoder
+
+#### 2. 获取 RESTMapper
+
+```go
+restMapper, err := c.getRestMapper()
+```
+**作用**：
+- ✅ 发现集群支持的 API 资源
+- ✅ 用于将 GVK 映射到 REST 资源
+
+#### 3. 解析 Unstructured 对象
+
+```go
+unstructList, err := GetUnStructListFromDecoder(decoder)
+```
+**作用**：
+- ✅ 从 YAML Decoder 解析出所有资源对象
+- ✅ 返回 `[]*unstructured.Unstructured` 列表
+
+#### 4. 处理 List 类型资源
+
+```go
+finalUnstructuredList := c.processUnstructuredList(unstructList)
+```
+**作用**：
+- ✅ 展开 List 类型资源（如 `ConfigMapList`、`SecretList`）
+- ✅ 将 List 中的每个元素转换为独立的 Unstructured 对象
+
+```go
+// 示例：展开 List
+输入：
+  ConfigMapList:
+    items:
+      - name: cm1
+      - name: cm2
+
+输出：
+  [ConfigMap/cm1, ConfigMap/cm2]
+```
+
+#### 5. 排序
+
+```go
+finalUnstructuredList = c.sortUnstructuredList(finalUnstructuredList, task)
+```
+**作用**：
+- ✅ 根据操作类型排序
+- ✅ 确保依赖关系正确（如 Namespace 先创建）
+
+**安装顺序**：
+```
+1. Namespace
+2. CustomResourceDefinition
+3. ServiceAccount
+4. Role/ClusterRole
+5. RoleBinding/ClusterRoleBinding
+6. ConfigMap/Secret
+7. Service
+8. Deployment/StatefulSet/DaemonSet
+9. 其他
+```
+**卸载顺序**（相反）：
+```
+1. Deployment/StatefulSet/DaemonSet
+2. Service
+3. ConfigMap/Secret
+4. RoleBinding/ClusterRoleBinding
+5. Role/ClusterRole
+6. ServiceAccount
+7. CustomResourceDefinition
+8. Namespace
+```
+
+#### 6. Apply 到集群
+
+```go
+return c.applyUnstructuredList(finalUnstructuredList, restMapper, task)
+```
+**作用**：
+- ✅ 遍历所有 Unstructured 对象
+- ✅ 根据操作类型执行相应操作
+- ✅ 等待资源就绪（如果 `task.Block = true`）
+
+### 五、操作处理
+
+#### 1. handleOperation
+
+```go
+func (c *Client) handleOperation(dr, unstruct, task, gvk) (*unstructured.Unstructured, error) {
+    switch task.Operate {
+    case bkeaddon.CreateAddon:
+        return c.handleCreateOperation(dr, unstruct, task)
+    case bkeaddon.UpdateAddon:
+        return c.handleUpdateOperation(dr, unstruct, task, gvk)
+    case bkeaddon.UpgradeAddon:
+        return c.handleUpgradeOperation(dr, unstruct, task)
+    case bkeaddon.RemoveAddon:
+        return nil, c.handleRemoveOperation(dr, unstruct, task)
+    }
+}
+```
+
+#### 2. CreateAddon（创建）
+
+```go
+func (c *Client) handleCreateOperation(dr, unstruct, task) (*unstructured.Unstructured, error) {
+    // 使用 Server-Side Apply
+    obj, err := dr.Apply(c.Ctx, unstruct.GetName(), &unstruct,
+        metav1.ApplyOptions{Force: true, FieldManager: "bke"})
+    
+    // 记录创建的对象
+    if task.recorder != nil {
+        task.recorder.Record(obj)
+    }
+    
+    return obj, nil
+}
+```
+**特点**：
+- ✅ 使用 Server-Side Apply（SSA）
+- ✅ `Force: true` 强制覆盖冲突
+- ✅ `FieldManager: "bke"` 标识管理者
+
+### 六、使用示例
+
+#### 示例 1：创建 CAPI 对象
+
+```go
+// ensure_cluster_api_obj.go
+func (e *EnsureClusterAPIObj) createClusterAPIObj(params) error {
+    // 生成 YAML 文件
+    yamlPath, err := params.Cfg.GenerateClusterAPIConfigFile(name, namespace, externalEtcd)
+    
+    // 创建 Kubernetes 客户端
+    localClient, err := kube.NewClientFromRestConfig(ctx, restConfig)
+    
+    // 创建 Task
+    task := kube.NewTask("cluster-api", yamlPath, nil).
+        SetOperate(bkeaddon.CreateAddon).  // 设置操作类型
+        SetWaiter(true, timeout, interval) // 设置等待参数
+    
+    // Apply YAML 到集群
+    if err := localClient.ApplyYaml(task); err != nil {
+        return err
+    }
+    
+    return nil
+}
+```
+
+#### 示例 2：安装 Addon
+
+```go
+// 安装 Helm Chart
+func installAddon(addon *Addon, bkeConfig BkeConfig) error {
+    // 渲染 Chart
+    yamlPath := renderChart(addon, bkeConfig)
+    
+    // 创建 Task
+    task := kube.NewTask(addon.Name, yamlPath, nil).
+        SetOperate(bkeaddon.CreateAddon).
+        SetWaiter(true, 5*time.Minute, 5*time.Second)
+    
+    // Apply
+    return client.ApplyYaml(task)
+}
+```
+
+### 七、错误处理
+
+#### 1. 资源不存在
+
+```go
+// 如果 API 资源不存在（如 ServiceMonitor），跳过
+if apierrors2.IsNoMatchError(err) && gvk.Kind == "ServiceMonitor" {
+    c.Log.Infof("addon obj Kind: %s, Name %s not support, skip", 
+        unstruct.GetKind(), unstruct.GetName())
+    return nil, nil
+}
+```
+
+#### 2. 忽略错误
+
+```go
+// 如果 task.IgnoreError = true，继续处理下一个资源
+if task.IgnoreError {
+    c.Log.Warnf("failed to apply %s, but ignore error", unstruct.GetName())
+    continue
+}
+```
+
+### 八、设计原理
+
+#### 1. 为什么使用 Unstructured？
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Unstructured.Unstructured                                          │
+│  • 通用资源表示                                                      │
+│  • 可以表示任意 Kubernetes 资源                                      │
+│  • 不需要预定义类型                                                   │
+│  • 适合处理动态资源（CRD）                                            │
+└─────────────────────────────────────────────────────────────────────┘
+```
+**优势**：
+- ✅ **通用性**：可以处理任意类型的资源
+- ✅ **灵活性**：不需要为每种资源定义 Go 类型
+- ✅ **扩展性**：支持 CRD 等自定义资源
+
+#### 2. 为什么使用 Server-Side Apply？
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Server-Side Apply (SSA)                                            │
+└─────────────────────────────────────────────────────────────────────┘
+
+优势：
+• 声明式管理：声明期望状态，由服务器计算差异
+• 字段级管理：不同控制器管理不同字段
+• 冲突解决：自动处理字段冲突
+• 幂等性：多次 Apply 结果相同
+```
+
+### 九、总结
+
+#### 1. 核心作用
+
+| 作用 | 说明 |
+|------|------|
+| **渲染 YAML** | 使用模板参数渲染 YAML 文件 |
+| **解析资源** | 将 YAML 解析为 Unstructured 对象 |
+| **排序处理** | 根据依赖关系排序 |
+| **Apply 到集群** | 使用 Server-Side Apply 创建/更新资源 |
+| **等待就绪** | 阻塞等待资源就绪 |
+
+#### 2. 关键特性
+
+- ⚠️ **Server-Side Apply**：使用 SSA 进行声明式管理
+- ⚠️ **通用性**：可以处理任意类型的资源
+- ⚠️ **排序**：确保依赖关系正确
+- ⚠️ **幂等性**：多次 Apply 结果相同
+- ⚠️ **错误处理**：支持忽略错误继续处理
+
+#### 3. 使用场景
+
+- ✅ 创建 CAPI 对象
+- ✅ 安装 Helm Chart
+- ✅ 部署 Addon
+- ✅ 升级资源
+- ✅ 删除资源
+
