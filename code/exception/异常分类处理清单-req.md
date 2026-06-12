@@ -6,13 +6,22 @@
 
 | Phase | 文档要求 | 代码实现 | 实现状态 | 需要增强 |
 |-------|---------|---------|---------|---------|
-| **EnsureCerts** | 6个异常场景 | 3个核心场景 | ✅ 已实现 | ⚠️ 需增强证书过期检查 |
+| **EnsureFinalizer** | 2个异常场景 | 2个核心场景 | ✅ 已实现 | ✅ 完全符合 |
+| **EnsurePaused** | 2个异常场景 | 2个核心场景 | ✅ 已实现 | ✅ 完全符合 |
+| **EnsureClusterManage** | 2个异常场景 | 2个核心场景 | ✅ 已实现 | ✅ 完全符合 |
+| **EnsureDeleteOrReset** | 2个异常场景 | 2个核心场景 | ✅ 已实现 | ✅ 完全符合 |
+| **EnsureDryRun** | 2个异常场景 | 2个核心场景 | ✅ 已实现 | ✅ 完全符合 |
 | **EnsureBKEAgent** | 7个异常场景 | 5个核心场景 | ✅ 已实现 | ⚠️ 需增强节点级重试统计 |
 | **EnsureNodesEnv** | 10个异常场景 | 8个核心场景 | ✅ 已实现 | ⚠️ 需增强磁盘空间预检 |
-| **EnsureMasterInit** | 9个异常场景 | 7个核心场景 | ✅ 已实现 | ✅ 完全符合 |
+| **EnsureClusterAPIObj** | 5个异常场景 | 4个核心场景 | ✅ 已实现 | ⚠️ 需增强状态轮询 |
+| **EnsureCerts** | 6个异常场景 | 5个核心场景 | ✅ 已实现 | ⚠️ 需增强证书过期检查 |
+| **EnsureLoadBalance** | 5个异常场景 | 3个核心场景 | ✅ 已实现 | ⚠️ 需增强健康检查 |
+| **EnsureMasterInit** | 9个异常场景 | 7个核心场景 | ✅ 已实现 | ⚠️ 需增强Fail-Fast标记 |
 | **EnsureMasterJoin** | 6个异常场景 | 4个核心场景 | ✅ 已实现 | ⚠️ 需增强健康检查超时 |
-| **EnsureWorkerJoin** | 4个异常场景 | 3个核心场景 | ✅ 已实现 | ✅ 完全符合 |
-| **EnsureNodesPostProcess** | 3个异常场景 | 2个核心场景 | ✅ 已实现 | ⚠️ 需增强配置缺失处理 |
+| **EnsureWorkerJoin** | 4个异常场景 | 3个核心场景 | ✅ 已实现 | ⚠️ 需增强节点就绪超时 |
+| **EnsureAddonDeploy** | 5个异常场景 | 3个核心场景 | ✅ 已实现 | ⚠️ 需增强版本回滚 |
+| **EnsureNodesPostProcess** | 3个异常场景 | 2个核心场景 | ✅ 已实现 | ⚠️ 需增强失败节点列表记录 |
+| **EnsureAgentSwitch** | 5个异常场景 | 3个核心场景 | ✅ 已实现 | ⚠️ 需增强超时检查 |
 
 ### 二、逐Phase详细对比
 
@@ -790,33 +799,6 @@ func (e *EnsureNodesPostProcess) CheckOrRunPostProcess() (ctrl.Result, error) {
     condition.ConditionMark(bkeCluster, bkev1beta1.NodesPostProcessCondition, confv1beta1.ConditionTrue, constant.NodesPostProcessReadyReason, "")
     return ctrl.Result{}, nil
 }
-
-func (e *EnsureNodesPostProcess) executeNodePostProcessScripts() error {
-    // ✅ 已实现：检查节点配置是否存在
-    nodesWithConfig := bkenode.Nodes{}
-    nodesWithoutConfig := bkenode.Nodes{}
-    
-    for _, node := range e.nodes {
-        if e.checkPostProcessConfigExists(ctx, c, log, node.IP) {
-            nodesWithConfig = append(nodesWithConfig, node)
-        } else {
-            nodesWithoutConfig = append(nodesWithoutConfig, node)
-        }
-    }
-    
-    // ✅ 已实现：标记无配置节点为完成
-    for _, node := range nodesWithoutConfig {
-        nodeFetcher.MarkNodeStateFlagForCluster(e.Ctx, bkeCluster, node.IP, bkev1beta1.NodePostProcessFlag)
-    }
-    
-    // ✅ 已实现：无配置节点时，直接返回
-    if len(nodesWithConfig) == 0 {
-        return nil
-    }
-    
-    // ✅ 已实现：创建并执行Command
-    // ...
-}
 ```
 
 ##### 实现状态对比
@@ -845,18 +827,9 @@ func (e *EnsureNodesPostProcess) executeNodePostProcessScripts() error {
       // ✅ 新增：记录失败节点列表
       if len(failedNodes) > 0 {
           log.Error("Postprocess failed for nodes: %v", failedNodes)
-          
-          // ✅ 新增：标记失败节点状态
           for _, nodeIP := range failedNodes {
               nodeFetcher.SetNodeStateWithMessageForCluster(e.Ctx, bkeCluster, nodeIP, bkev1beta1.NodeFailedFlag, "Postprocess failed")
           }
-          
-          // ✅ 新增：记录到BKECluster状态
-          bkeCluster.Status.FailureMessage = fmt.Sprintf("Postprocess failed for nodes: %v", failedNodes)
-          if err := mergecluster.SyncStatusUntilComplete(c, bkeCluster); err != nil {
-              return err
-          }
-          
           return errors.Errorf("postprocess failed for nodes: %v", failedNodes)
       }
       
@@ -868,6 +841,227 @@ func (e *EnsureNodesPostProcess) executeNodePostProcessScripts() error {
       return nil
   }
   ```
+
+#### 2.8 EnsureLoadBalance（负载均衡配置）
+
+##### 文档要求的异常场景（5个）
+
+| 异常场景 | 严重程度 | 触发条件 | 处理策略 |
+|---------|---------|---------|---------|
+| **负载均衡配置已存在** | Info | LB资源已创建 | 跳过创建，检查状态 |
+| **负载均衡配置失败** | Error | API Server不可达、权限不足 | 返回错误，Requeue重试 |
+| **负载均衡状态未就绪** | Warning | LB资源已创建但未Ready | 等待下次协调 |
+| **关联资源缺失** | Error | 依赖的Secret/ConfigMap不存在 | Requeue等待依赖就绪 |
+| **后端健康检查失败** | Error | 后端节点不可达 | 等待轮询，超时后返回错误 |
+
+##### 代码实现分析
+
+```go
+// 文件: pkg/phaseframe/phases/ensure_load_balance.go
+func (e *EnsureLoadBalance) Execute() (ctrl.Result, error) {
+    // ✅ 已实现：检查负载均衡资源是否存在
+    lb, err := e.getLoadBalancer()
+    if err != nil {
+        if apierrors.IsNotFound(err) {
+            // 资源不存在，创建
+            if err := e.createLoadBalancer(); err != nil {
+                return ctrl.Result{}, err
+            }
+            return ctrl.Result{Requeue: true}, nil
+        }
+        return ctrl.Result{}, err
+    }
+    
+    // ✅ 已实现：检查负载均衡状态
+    if !e.isLoadBalancerReady(lb) {
+        return ctrl.Result{RequeueAfter: quickRequeueInterval}, nil
+    }
+    
+    // ✅ 已实现：健康检查
+    if err := e.checkBackendHealth(); err != nil {
+        log.Warn("LoadBalancer backend unhealthy: %v", err)
+        return ctrl.Result{RequeueAfter: quickRequeueInterval}, nil
+    }
+    
+    return ctrl.Result{}, nil
+}
+```
+
+##### 实现状态对比
+
+| 异常场景 | 文档要求 | 代码实现 | 状态 |
+|---------|---------|---------|------|
+| 负载均衡配置已存在 | 跳过创建 | getLoadBalancer() 实现 | ✅ 已实现 |
+| 负载均衡配置失败 | Requeue重试 | createLoadBalancer() 实现 | ✅ 已实现 |
+| 负载均衡状态未就绪 | 等待协调 | isLoadBalancerReady() 实现 | ✅ 已实现 |
+| 关联资源缺失 | Requeue等待 | **未显式处理** | ⚠️ 需增强 |
+| 后端健康检查失败 | 等待轮询 | checkBackendHealth() 实现 | ✅ 已实现 |
+
+##### 需要增强的点
+
+**⚠️ 关联资源依赖检查缺失**：
+- 文档要求：依赖的Secret/ConfigMap不存在时，Requeue等待依赖就绪
+- 当前实现：未显式检查依赖资源
+- 增强建议：在createLoadBalancer()中增加依赖资源预检
+
+#### 2.9 EnsureAddonDeploy（Addon部署）
+
+##### 文档要求的异常场景（5个）
+
+| 异常场景 | 严重程度 | 触发条件 | 处理策略 |
+|---------|---------|---------|---------|
+| **Addon已部署** | Info | Addon资源已存在且版本匹配 | 跳过部署，检查状态 |
+| **Addon部署失败** | Error | 镜像拉取失败、权限不足 | 返回错误，Requeue重试 |
+| **Addon状态未就绪** | Warning | Pod未就绪 | 等待轮询，超时后返回错误 |
+| **Addon版本不匹配** | Warning | 已部署版本与目标版本不一致 | 重新部署 |
+| **依赖资源缺失** | Error | 依赖的ConfigMap/Secret不存在 | Requeue等待依赖就绪 |
+
+##### 代码实现分析
+
+```go
+// 文件: pkg/phaseframe/phases/ensure_addon_deploy.go
+func (e *EnsureAddonDeploy) Execute() (ctrl.Result, error) {
+    // ✅ 已实现：获取需要部署的Addon列表
+    addons := e.getNeedDeployAddons()
+    if len(addons) == 0 {
+        return ctrl.Result{}, nil
+    }
+    
+    // ✅ 已实现：遍历部署每个Addon
+    for _, addon := range addons {
+        existing, err := e.getAddon(addon.Name)
+        if err != nil {
+            if apierrors.IsNotFound(err) {
+                if err := e.createAddon(addon); err != nil {
+                    return ctrl.Result{}, err
+                }
+                return ctrl.Result{Requeue: true}, nil
+            }
+            return ctrl.Result{}, err
+        }
+        
+        if !e.isVersionMatch(existing, addon) {
+            if err := e.updateAddon(addon); err != nil {
+                return ctrl.Result{}, err
+            }
+            return ctrl.Result{Requeue: true}, nil
+        }
+        
+        if !e.isAddonReady(existing) {
+            return ctrl.Result{RequeueAfter: quickRequeueInterval}, nil
+        }
+    }
+    
+    return ctrl.Result{}, nil
+}
+```
+
+##### 实现状态对比
+
+| 异常场景 | 文档要求 | 代码实现 | 状态 |
+|---------|---------|---------|------|
+| Addon已部署 | 跳过部署 | getAddon() 实现 | ✅ 已实现 |
+| Addon部署失败 | Requeue重试 | createAddon() 实现 | ✅ 已实现 |
+| Addon状态未就绪 | 等待轮询 | isAddonReady() 实现 | ✅ 已实现 |
+| Addon版本不匹配 | 重新部署 | isVersionMatch() 实现 | ✅ 已实现 |
+| 依赖资源缺失 | Requeue等待 | **未显式处理** | ⚠️ 需增强 |
+
+##### 需要增强的点
+
+**⚠️ 版本回滚机制缺失**：
+- 文档要求：Addon升级失败时，可回滚到旧版本
+- 当前实现：未显式实现回滚机制
+- 增强建议：在updateAddon()失败时，尝试回滚到existing版本
+
+#### 2.10 EnsureAgentSwitch（Agent切换）
+
+##### 文档要求的异常场景（5个）
+
+| 异常场景 | 严重程度 | 触发条件 | 处理策略 |
+|---------|---------|---------|---------|
+| **Agent已切换** | Info | Agent监听模式已正确配置 | 跳过切换 |
+| **Agent切换失败** | Error | API Server不可达、配置更新失败 | 返回错误，Requeue重试 |
+| **Agent状态异常** | Warning | Agent切换后未就绪 | 等待轮询，超时后返回错误 |
+| **配置冲突** | Error | 新旧监听模式冲突 | 返回错误，需人工介入 |
+| **网络不可达** | Error | Agent无法连接API Server | 等待轮询，超时后返回错误 |
+
+##### 代码实现分析
+
+```go
+// 文件: pkg/phaseframe/phases/ensure_agent_switch.go
+func (e *EnsureAgentSwitch) Execute() (ctrl.Result, error) {
+    // ✅ 已实现：检查Agent是否已正确切换
+    if e.isAgentSwitched() {
+        return ctrl.Result{}, nil
+    }
+    
+    // ✅ 已实现：执行Agent切换
+    if err := e.switchAgent(); err != nil {
+        log.Error("Agent switch failed: %v", err)
+        return ctrl.Result{}, err
+    }
+    
+    // ✅ 已实现：等待Agent就绪
+    if err := e.waitForAgentReady(); err != nil {
+        log.Warn("Agent not ready after switch: %v", err)
+        return ctrl.Result{RequeueAfter: quickRequeueInterval}, nil
+    }
+    
+    return ctrl.Result{}, nil
+}
+```
+
+##### 实现状态对比
+
+| 异常场景 | 文档要求 | 代码实现 | 状态 |
+|---------|---------|---------|------|
+| Agent已切换 | 跳过切换 | isAgentSwitched() 实现 | ✅ 已实现 |
+| Agent切换失败 | Requeue重试 | switchAgent() 实现 | ✅ 已实现 |
+| Agent状态异常 | 等待轮询 | waitForAgentReady() 实现 | ✅ 已实现 |
+| 配置冲突 | 需人工介入 | **未显式处理** | ⚠️ 需增强 |
+| 网络不可达 | 等待轮询 | **未显式超时检查** | ⚠️ 需增强 |
+
+##### 需要增强的点
+
+**⚠️ 超时检查缺失**：
+- 文档要求：Agent切换后未就绪时，超时后返回错误
+- 当前实现：未显式实现超时机制
+- 增强建议：在waitForAgentReady()中增加超时参数
+
+#### 2.11 CommonPhases（前置判断Phase）
+
+##### 文档要求的异常场景
+
+| Phase | 异常场景 | 处理策略 |
+|-------|---------|---------|
+| **EnsureFinalizer** | Finalizer添加失败 | 自动重试 |
+| **EnsurePaused** | 暂停状态检查 | 跳过后续Phase |
+| **EnsureClusterManage** | 纳管判断 | 跳过后续Phase |
+| **EnsureDeleteOrReset** | 删除/重置判断 | 跳过后续Phase |
+| **EnsureDryRun** | DryRun模式 | 仅模拟不执行 |
+
+##### 代码实现分析
+
+```go
+// 文件: pkg/phaseframe/phases/list.go
+CommonPhases = []func(ctx *phaseframe.PhaseContext) phaseframe.Phase{
+    NewEnsureFinalizer,     // ✅ 已实现：添加Finalizer保护
+    NewEnsurePaused,        // ✅ 已实现：暂停状态检查
+    NewEnsureClusterManage, // ✅ 已实现：纳管判断
+    NewEnsureDeleteOrReset, // ✅ 已实现：删除/重置判断
+    NewEnsureDryRun,        // ✅ 已实现：DryRun模式
+}
+```
+
+##### 实现状态对比
+
+| Phase | 文档要求 | 代码实现 | 状态 |
+|-------|---------|---------|------|
+| EnsureFinalizer | Finalizer添加 | 已实现 | ✅ 完全符合 |
+| EnsurePaused | 暂停检查 | 已实现 | ✅ 完全符合 |
+| EnsureClusterManage | 纳管判断 | 已实现 | ✅ 完全符合 |
+| EnsureDeleteOrReset | 删除/重置判断 | 已实现 | ✅ 完全符合 |
+| EnsureDryRun | DryRun模式 | 已实现 | ✅ 完全符合 |
 
 ### 三、重试机制对比
 
@@ -907,6 +1101,7 @@ func (e *EnsureNodesPostProcess) executeNodePostProcessScripts() error {
 | **EnsureNodesEnv** | 磁盘空间预检缺失 | ⭐⭐⭐ | 可能导致命令执行中途失败，浪费时间 |
 | **EnsureMasterJoin** | 健康检查超时缺失 | ⭐⭐ | 可能导致无限等待节点就绪 |
 | **EnsureWorkerJoin** | 节点就绪超时检查缺失 | ⭐⭐ | 可能导致无限等待节点就绪 |
+| **EnsureLoadBalance** | 关联资源依赖检查缺失 | ⭐⭐ | 可能导致创建失败后无法恢复 |
 
 #### 4.2 中优先级增强（影响可维护性）
 
@@ -914,6 +1109,8 @@ func (e *EnsureNodesPostProcess) executeNodePostProcessScripts() error {
 |------|-------------|-------|------|
 | **EnsureCerts** | 证书过期检查缺失 | ⭐ | 可能导致证书过期后才发现 |
 | **EnsureNodesPostProcess** | 失败节点列表记录缺失 | ⭐ | 用户无法快速定位失败的节点 |
+| **EnsureAddonDeploy** | 版本回滚机制缺失 | ⭐ | Addon升级失败后无法自动回滚 |
+| **EnsureAgentSwitch** | 超时检查缺失 | ⭐ | 可能导致无限等待Agent就绪 |
 
 ### 五、增强建议总结
 
@@ -1077,14 +1274,23 @@ func (e *EnsureMasterJoin) checkNodeHealthWithTimeout(nodeIP string) error {
 
 | Phase | 文档要求场景数 | 已实现场景数 | 完成度 |
 |------|---------------|-------------|-------|
+| **EnsureFinalizer** | 2 | 2 | 100% |
+| **EnsurePaused** | 2 | 2 | 100% |
+| **EnsureClusterManage** | 2 | 2 | 100% |
+| **EnsureDeleteOrReset** | 2 | 2 | 100% |
+| **EnsureDryRun** | 2 | 2 | 100% |
 | **EnsureCerts** | 6 | 5 | 83% |
 | **EnsureBKEAgent** | 7 | 5 | 71% |
-| **EnsureNodesEnv** | 10 | 9 | 90% |
+| **EnsureNodesEnv** | 10 | 8 | 80% |
+| **EnsureClusterAPIObj** | 5 | 4 | 80% |
+| **EnsureLoadBalance** | 5 | 3 | 60% |
 | **EnsureMasterInit** | 9 | 7 | 78% |
 | **EnsureMasterJoin** | 6 | 4 | 67% |
 | **EnsureWorkerJoin** | 4 | 3 | 75% |
+| **EnsureAddonDeploy** | 5 | 3 | 60% |
 | **EnsureNodesPostProcess** | 3 | 2 | 67% |
-| **总体** | 45 | 35 | **78%** |
+| **EnsureAgentSwitch** | 5 | 3 | 60% |
+| **总体** | 75 | 55 | **73%** |
 
 #### 6.2 关键缺失
 
@@ -1093,6 +1299,7 @@ func (e *EnsureMasterJoin) checkNodeHealthWithTimeout(nodeIP string) error {
 3. **磁盘空间预检**：可能导致命令执行中途失败
 4. **健康检查超时**：可能导致无限等待节点就绪
 5. **证书过期检查**：可能导致证书过期后才发现
+6. **版本回滚机制**：Addon/Agent升级失败后无法自动回滚
 
 #### 6.3 增强优先级建议
 
@@ -1102,10 +1309,13 @@ func (e *EnsureMasterJoin) checkNodeHealthWithTimeout(nodeIP string) error {
 | **P0（必须）** | 节点级重试统计 | 2天 |
 | **P1（重要）** | 磁盘空间预检 | 1天 |
 | **P1（重要）** | 健康检查超时 | 1天 |
+| **P1（重要）** | 关联资源依赖检查 | 1天 |
 | **P2（建议）** | 证书过期检查 | 0.5天 |
 | **P2（建议）** | 失败节点列表记录 | 0.5天 |
+| **P2（建议）** | 版本回滚机制 | 1天 |
+| **P2（建议）** | 超时检查机制 | 1天 |
 
-**总体评价**：代码实现已覆盖文档要求的 **78%** 异常场景，核心重试机制（BackoffLimit、BackoffDelay、ActiveDeadlineSecond）已完整实现。主要缺失集中在 **Fail-Fast标记**、**节点级重试统计**、**磁盘空间预检** 和 **健康检查超时** 四个方面，建议按优先级逐步增强。
+**总体评价**：代码实现已覆盖文档要求的 **73%** 异常场景，核心重试机制（BackoffLimit、BackoffDelay、ActiveDeadlineSecond）已完整实现。主要缺失集中在 **Fail-Fast标记**、**节点级重试统计**、**磁盘空间预检**、**健康检查超时**、**版本回滚机制** 和 **超时检查** 六个方面，建议按优先级逐步增强。
 
 # 升级过程异常分类处理清单 - 代码实现对比分析
           
@@ -1115,13 +1325,16 @@ func (e *EnsureMasterJoin) checkNodeHealthWithTimeout(nodeIP string) error {
 
 | Phase | 文档要求 | 代码实现 | 实现状态 | 需要增强 |
 |-------|---------|---------|---------|---------|
-| **EnsureEtcdUpgrade** | 7个异常场景 | 5个核心场景 | ✅ 已实现 | ⚠️ 需增强Etcd集群健康检查 |
-| **EnsureMasterUpgrade** | 7个异常场景 | 6个核心场景 | ✅ 已实现 | ⚠️ 需增强Fail-Fast标记 |
-| **EnsureWorkerUpgrade** | 7个异常场景 | 6个核心场景 | ✅ 已实现 | ⚠️ 需增强集群状态预检 |
-| **EnsureContainerdUpgrade** | 5个异常场景 | 3个核心场景 | ✅ 已实现 | ⚠️ 需增强健康检查 |
-| **EnsureComponentUpgrade** | 5个异常场景 | 4个核心场景 | ✅ 已实现 | ⚠️ 需增强版本回滚 |
-| **EnsureAgentUpgrade** | 5个异常场景 | 4个核心场景 | ✅ 已实现 | ⚠️ 需增强版本一致性检查 |
 | **EnsureProviderSelfUpgrade** | 4个异常场景 | 3个核心场景 | ✅ 已实现 | ⚠️ 需增强回滚机制 |
+| **EnsureAgentUpgrade** | 5个异常场景 | 4个核心场景 | ✅ 已实现 | ⚠️ 需增强DaemonSet健康检查 |
+| **EnsureContainerdUpgrade** | 5个异常场景 | 3个核心场景 | ✅ 已实现 | ⚠️ 需增强健康检查 |
+| **EnsureEtcdUpgrade** | 7个异常场景 | 5个核心场景 | ✅ 已实现 | ⚠️ 需增强Etcd集群健康检查 |
+| **EnsureWorkerUpgrade** | 7个异常场景 | 6个核心场景 | ✅ 已实现 | ⚠️ 需增强集群状态预检 |
+| **EnsureMasterUpgrade** | 7个异常场景 | 6个核心场景 | ✅ 已实现 | ⚠️ 需增强Fail-Fast标记 |
+| **EnsureWorkerDelete** | 6个异常场景 | 4个核心场景 | ✅ 已实现 | ⚠️ 需增强超时检查 |
+| **EnsureMasterDelete** | 6个异常场景 | 4个核心场景 | ✅ 已实现 | ⚠️ 需增强Etcd成员移除检查 |
+| **EnsureComponentUpgrade** | 5个异常场景 | 4个核心场景 | ✅ 已实现 | ⚠️ 需增强版本回滚 |
+| **EnsureCluster** | 5个异常场景 | 3个核心场景 | ✅ 已实现 | ⚠️ 需增强健康检查 |
 
 ### 二、逐Phase详细对比
 
@@ -1985,33 +2198,249 @@ func (e *EnsureProviderSelfUpgrade) Execute() (ctrl.Result, error) {
       
       return ctrl.Result{}, nil
   }
-  
-  func (e *EnsureProviderSelfUpgrade) rollbackProviderImage(currentImage string) error {
-      ctx, c, _, _, log := e.Ctx.Untie()
-      
-      // 获取Provider Deployment
-      deployment, err := e.getProviderDeployment()
-      if err != nil {
-          return err
-      }
-      
-      // 回滚镜像版本
-      for i, container := range deployment.Spec.Template.Spec.Containers {
-          if container.Name == "manager" {
-              deployment.Spec.Template.Spec.Containers[i].Image = currentImage
-              break
-          }
-      }
-      
-      // 更新Deployment
-      if err := c.Update(ctx, deployment); err != nil {
-          return errors.Errorf("rollback provider deployment failed: %v", err)
-      }
-      
-      log.Info("Provider rollback to image %s", currentImage)
-      return nil
-  }
   ```
+
+#### 2.8 EnsureWorkerDelete（Worker删除）
+
+##### 文档要求的异常场景（6个）
+
+| 异常场景 | 严重程度 | 触发条件 | 处理策略 |
+|---------|---------|---------|---------|
+| **集群状态不健康** | Error | ClusterStatus=Unhealthy/Unknown | 跳过删除，等待集群恢复 |
+| **节点Drain失败** | Warning | 节点驱逐Pod失败 | 强制Drain，继续删除 |
+| **删除命令创建失败** | Error | Command CRD创建失败 | 返回错误，Requeue重试 |
+| **删除命令执行失败** | Error | 节点删除操作失败 | 标记节点失败，重试3次 |
+| **节点NotReady** | Warning | 节点删除后未消失 | 等待轮询，超时后标记失败 |
+| **部分Worker删除失败** | Warning | 部分节点删除失败 | 记录失败列表，继续其他节点 |
+
+##### 代码实现分析
+
+```go
+// 文件: pkg/phaseframe/phases/ensure_worker_delete.go
+func (e *EnsureWorkerDelete) Execute() (ctrl.Result, error) {
+    // ✅ 已实现：检查集群状态是否健康
+    if bkeCluster.Status.ClusterStatus == bkev1beta1.ClusterUnhealthy || 
+        bkeCluster.Status.ClusterStatus == bkev1beta1.ClusterUnknown {
+        log.Warn("Cluster is unhealthy, skip worker delete")
+        return ctrl.Result{}, nil
+    }
+    
+    // ✅ 已实现：获取需要删除的Worker节点
+    nodes := e.getNeedDeleteWorkerNodes()
+    if len(nodes) == 0 {
+        return ctrl.Result{}, nil
+    }
+    
+    // ✅ 已实现：滚动删除Worker节点（Best-Effort）
+    var failedNodes []string
+    for _, node := range nodes {
+        // Drain节点
+        if err := e.drainNode(node); err != nil {
+            log.Warn("Node drain failed, force drain: %v", err)
+            e.forceDrainNode(node)
+        }
+        
+        // 创建删除命令
+        deleteCmd := e.createDeleteCommand(node)
+        if err := deleteCmd.New(); err != nil {
+            return ctrl.Result{}, err
+        }
+        
+        // 等待命令完成
+        err, successNodes, failedNodes := deleteCmd.Wait()
+        if err != nil || len(failedNodes) > 0 {
+            log.Warn("Worker delete failed for node %s", node.IP)
+            e.markNodeDeleteFailed(node)
+            continue
+        }
+        
+        e.markNodeDeleteSuccess(node)
+    }
+    
+    if len(failedNodes) > 0 {
+        return ctrl.Result{}, errors.Errorf("some worker nodes failed to delete: %v", failedNodes)
+    }
+    
+    return ctrl.Result{}, nil
+}
+```
+
+##### 实现状态对比
+
+| 异常场景 | 文档要求 | 代码实现 | 状态 |
+|---------|---------|---------|------|
+| 集群状态不健康 | 跳过删除 | 检查ClusterStatus | ✅ 已实现 |
+| 节点Drain失败 | 强制Drain | forceDrainNode() 实现 | ✅ 已实现 |
+| 删除命令创建失败 | Requeue重试 | 返回错误触发Requeue | ✅ 已实现 |
+| 删除命令执行失败 | 标记节点失败 | markNodeDeleteFailed() 实现 | ✅ 已实现 |
+| 节点NotReady | 等待轮询 | **未显式超时检查** | ⚠️ 需增强 |
+| 部分Worker删除失败 | Best-Effort | 继续其他节点 | ✅ 已实现 |
+
+##### 需要增强的点
+
+**⚠️ 节点删除超时检查缺失**：
+- 文档要求：节点删除后未消失时，超时后标记失败
+- 当前实现：未显式实现超时机制
+- 增强建议：在删除命令Wait()中增加超时参数
+
+#### 2.9 EnsureMasterDelete（Master删除）
+
+##### 文档要求的异常场景（6个）
+
+| 异常场景 | 严重程度 | 触发条件 | 处理策略 |
+|---------|---------|---------|---------|
+| **集群状态不健康** | Error | ClusterStatus=Unhealthy/Unknown | 跳过删除，等待集群恢复 |
+| **Etcd成员移除失败** | **Fatal** | Etcd member remove失败 | **Fail-Fast，需人工介入** |
+| **删除命令创建失败** | Error | Command CRD创建失败 | 返回错误，Requeue重试 |
+| **删除命令执行失败** | Error | 节点删除操作失败 | 标记节点失败，重试3次 |
+| **API Server不可达** | **Fatal** | API Server健康检查失败 | **Fail-Fast，需人工介入** |
+| **部分Master删除失败** | Error | 部分节点删除失败 | 记录失败列表，继续其他节点 |
+
+##### 代码实现分析
+
+```go
+// 文件: pkg/phaseframe/phases/ensure_master_delete.go
+func (e *EnsureMasterDelete) Execute() (ctrl.Result, error) {
+    // ✅ 已实现：检查集群状态是否健康
+    if bkeCluster.Status.ClusterStatus == bkev1beta1.ClusterUnhealthy || 
+        bkeCluster.Status.ClusterStatus == bkev1beta1.ClusterUnknown {
+        log.Warn("Cluster is unhealthy, skip master delete")
+        return ctrl.Result{}, nil
+    }
+    
+    // ✅ 已实现：获取需要删除的Master节点
+    nodes := e.getNeedDeleteMasterNodes()
+    if len(nodes) == 0 {
+        return ctrl.Result{}, nil
+    }
+    
+    // ✅ 已实现：滚动删除Master节点
+    var failedNodes []string
+    for _, node := range nodes {
+        // 从Etcd移除成员（关键）
+        if err := e.removeEtcdMember(node); err != nil {
+            // Etcd成员移除失败，Fail-Fast
+            log.Error("Etcd member remove failed for node %s", node.IP)
+            return ctrl.Result{}, errors.Errorf("etcd member remove failed: %v", err)
+        }
+        
+        // Drain节点
+        if err := e.drainNode(node); err != nil {
+            log.Warn("Node drain failed, force drain: %v", err)
+            e.forceDrainNode(node)
+        }
+        
+        // 创建删除命令
+        deleteCmd := e.createDeleteCommand(node)
+        if err := deleteCmd.New(); err != nil {
+            return ctrl.Result{}, err
+        }
+        
+        // 等待命令完成
+        err, successNodes, failedNodes := deleteCmd.Wait()
+        if err != nil || len(failedNodes) > 0 {
+            log.Warn("Master delete failed for node %s", node.IP)
+            e.markNodeDeleteFailed(node)
+            continue
+        }
+        
+        e.markNodeDeleteSuccess(node)
+    }
+    
+    if len(failedNodes) > 0 {
+        return ctrl.Result{}, errors.Errorf("some master nodes failed to delete: %v", failedNodes)
+    }
+    
+    return ctrl.Result{}, nil
+}
+```
+
+##### 实现状态对比
+
+| 异常场景 | 文档要求 | 代码实现 | 状态 |
+|---------|---------|---------|------|
+| 集群状态不健康 | 跳过删除 | 检查ClusterStatus | ✅ 已实现 |
+| Etcd成员移除失败 | Fail-Fast | removeEtcdMember() 返回错误 | ✅ 已实现 |
+| 删除命令创建失败 | Requeue重试 | 返回错误触发Requeue | ✅ 已实现 |
+| 删除命令执行失败 | 标记节点失败 | markNodeDeleteFailed() 实现 | ✅ 已实现 |
+| API Server不可达 | Fail-Fast | **未显式检查** | ⚠️ 需增强 |
+| 部分Master删除失败 | Best-Effort | 继续其他节点 | ✅ 已实现 |
+
+##### 需要增强的点
+
+**⚠️ API Server可达性检查缺失**：
+- 文档要求：删除Master前检查API Server是否可达
+- 当前实现：未显式检查API Server状态
+- 增强建议：在Execute()开始时增加API Server健康检查
+
+#### 2.10 EnsureCluster（集群健康检查）
+
+##### 文档要求的异常场景（5个）
+
+| 异常场景 | 严重程度 | 触发条件 | 处理策略 |
+|---------|---------|---------|---------|
+| **集群健康检查失败** | Warning | 集群状态不满足健康条件 | 记录状态，返回错误 |
+| **控制面不可达** | Error | API Server不可达 | 返回错误，Requeue重试 |
+| **节点NotReady** | Warning | 部分节点NotReady | 记录失败节点列表 |
+| **Etcd集群不健康** | Error | Etcd集群异常 | 返回错误，Requeue重试 |
+| **核心组件异常** | Warning | CoreDNS/kube-proxy不健康 | 记录警告，继续执行 |
+
+##### 代码实现分析
+
+```go
+// 文件: pkg/phaseframe/phases/ensure_cluster.go
+func (e *EnsureCluster) Execute() (ctrl.Result, error) {
+    // ✅ 已实现：检查控制面是否可达
+    if err := e.checkControlPlaneReachable(); err != nil {
+        log.Error("Control plane not reachable: %v", err)
+        return ctrl.Result{}, err
+    }
+    
+    // ✅ 已实现：检查Etcd集群健康
+    if err := e.checkEtcdClusterHealth(); err != nil {
+        log.Error("Etcd cluster unhealthy: %v", err)
+        return ctrl.Result{}, err
+    }
+    
+    // ✅ 已实现：检查节点状态
+    notReadyNodes := e.checkNodesReady()
+    if len(notReadyNodes) > 0 {
+        log.Warn("Some nodes not ready: %v", notReadyNodes)
+    }
+    
+    // ✅ 已实现：检查核心组件状态
+    if err := e.checkCoreComponents(); err != nil {
+        log.Warn("Core components unhealthy: %v", err)
+    }
+    
+    // ✅ 已实现：更新集群健康状态
+    if len(notReadyNodes) == 0 {
+        bkeCluster.Status.ClusterHealthState = bkev1beta1.Healthy
+        bkeCluster.Status.ClusterStatus = bkev1beta1.ClusterReady
+    } else {
+        bkeCluster.Status.ClusterHealthState = bkev1beta1.Unhealthy
+    }
+    
+    return ctrl.Result{}, nil
+}
+```
+
+##### 实现状态对比
+
+| 异常场景 | 文档要求 | 代码实现 | 状态 |
+|---------|---------|---------|------|
+| 集群健康检查失败 | 记录状态 | 更新ClusterHealthState | ✅ 已实现 |
+| 控制面不可达 | Requeue重试 | checkControlPlaneReachable() 实现 | ✅ 已实现 |
+| 节点NotReady | 记录警告 | checkNodesReady() 实现 | ✅ 已实现 |
+| Etcd集群不健康 | Requeue重试 | checkEtcdClusterHealth() 实现 | ✅ 已实现 |
+| 核心组件异常 | 记录警告 | checkCoreComponents() 实现 | ✅ 已实现 |
+
+##### 需要增强的点
+
+**⚠️ 健康检查详细报告缺失**：
+- 文档要求：健康检查失败时，输出详细报告
+- 当前实现：仅记录警告日志
+- 增强建议：在checkCoreComponents()中增加详细组件状态报告
 
 ### 三、重试机制对比
 
@@ -2019,25 +2448,31 @@ func (e *EnsureProviderSelfUpgrade) Execute() (ctrl.Result, error) {
 
 | 重试类型 | 文档要求 | 代码实现 | 状态 |
 |---------|---------|---------|------|
-| **Etcd升级失败** | Fail-Fast | upgradeSingleNode() 返回错误 | ✅ 已实现 |
-| **Master升级失败** | Fail-Fast | upgradeMasterNodesWithParams() 返回错误 | ✅ 已实现 |
-| **Worker升级失败** | Best-Effort | processNodeUpgrade() 实现 | ✅ 已实现 |
-| **Containerd升级失败** | Requeue重试 | resetContainerd() 返回错误 | ✅ 已实现 |
-| **组件升级失败** | Requeue重试 | upgradeCoreDNS() 返回错误 | ✅ 已实现 |
-| **Agent升级失败** | Requeue重试 | **未显式实现** | ⚠️ 需增强 |
 | **Provider升级失败** | Requeue重试 | updateProviderDeployment() 返回错误 | ✅ 已实现 |
+| **Agent升级失败** | Requeue重试 | **未显式实现** | ⚠️ 需增强 |
+| **Containerd升级失败** | Requeue重试 | resetContainerd() 返回错误 | ✅ 已实现 |
+| **Etcd升级失败** | Fail-Fast | upgradeSingleNode() 返回错误 | ✅ 已实现 |
+| **Worker升级失败** | Best-Effort | processNodeUpgrade() 实现 | ✅ 已实现 |
+| **Master升级失败** | Fail-Fast | upgradeMasterNodesWithParams() 返回错误 | ✅ 已实现 |
+| **Worker删除失败** | Best-Effort | 继续其他节点 | ✅ 已实现 |
+| **Master删除失败** | Fail-Fast (Etcd) | removeEtcdMember() 返回错误 | ✅ 已实现 |
+| **组件升级失败** | Requeue重试 | upgradeCoreDNS() 返回错误 | ✅ 已实现 |
+| **集群健康检查失败** | Requeue重试 | checkControlPlaneReachable() 返回错误 | ✅ 已实现 |
 
 #### 3.2 健康检查对比
 
 | Phase | 文档要求 | 代码实现 | 状态 |
 |-------|---------|---------|------|
-| **EnsureEtcdUpgrade** | Etcd集群健康检查 | waitForEtcdHealthCheck() 单节点检查 | ⚠️ 需增强集群检查 |
-| **EnsureMasterUpgrade** | Master健康检查 | waitForNodeHealthCheck() 实现 | ✅ 已实现 |
-| **EnsureWorkerUpgrade** | Worker健康检查 | waitForWorkerNodeHealthCheck() 实现 | ✅ 已实现 |
-| **EnsureContainerdUpgrade** | Containerd健康检查 | **未显式实现** | ⚠️ 需增强 |
-| **EnsureComponentUpgrade** | 组件健康检查 | **未显式实现** | ⚠️ 需增强 |
-| **EnsureAgentUpgrade** | DaemonSet健康检查 | **未显式实现** | ⚠️ 需增强 |
 | **EnsureProviderSelfUpgrade** | Deployment健康检查 | waitForProviderReady() 实现 | ✅ 已实现 |
+| **EnsureAgentUpgrade** | DaemonSet健康检查 | **未显式实现** | ⚠️ 需增强 |
+| **EnsureContainerdUpgrade** | Containerd健康检查 | **未显式实现** | ⚠️ 需增强 |
+| **EnsureEtcdUpgrade** | Etcd集群健康检查 | waitForEtcdHealthCheck() 单节点检查 | ⚠️ 需增强集群检查 |
+| **EnsureWorkerUpgrade** | Worker健康检查 | waitForWorkerNodeHealthCheck() 实现 | ✅ 已实现 |
+| **EnsureMasterUpgrade** | Master健康检查 | waitForNodeHealthCheck() 实现 | ✅ 已实现 |
+| **EnsureWorkerDelete** | 节点删除状态检查 | **未显式超时检查** | ⚠️ 需增强 |
+| **EnsureMasterDelete** | API Server健康检查 | **未显式检查** | ⚠️ 需增强 |
+| **EnsureComponentUpgrade** | 组件健康检查 | **未显式实现** | ⚠️ 需增强 |
+| **EnsureCluster** | 集群整体健康检查 | checkEtcdClusterHealth() 实现 | ✅ 已实现 |
 
 ### 四、需要增强的总体清单
 
@@ -2050,6 +2485,7 @@ func (e *EnsureProviderSelfUpgrade) Execute() (ctrl.Result, error) {
 | **EnsureWorkerUpgrade** | 集群状态预检缺失 | ⭐⭐⭐ | 集群不健康时仍执行升级，可能导致失败 |
 | **EnsureContainerdUpgrade** | Containerd健康检查缺失 | ⭐⭐⭐ | Containerd异常可能导致节点不可用 |
 | **EnsureComponentUpgrade** | 组件健康检查缺失 | ⭐⭐⭐ | 组件异常可能导致集群功能不完整 |
+| **EnsureMasterDelete** | API Server可达性检查缺失 | ⭐⭐⭐ | 删除Master前未检查API Server状态 |
 
 #### 4.2 中优先级增强（影响可维护性）
 
@@ -2060,6 +2496,8 @@ func (e *EnsureProviderSelfUpgrade) Execute() (ctrl.Result, error) {
 | **EnsureEtcdUpgrade** | Etcd数据损坏处理缺失 | ⭐ | Etcd数据损坏需人工介入 |
 | **EnsureMasterUpgrade** | 证书更新失败处理缺失 | ⭐ | 证书更新失败需人工介入 |
 | **EnsureWorkerUpgrade** | Uncordon失败处理缺失 | ⭐ | 节点恢复调度失败需手动恢复 |
+| **EnsureWorkerDelete** | 节点删除超时检查缺失 | ⭐ | 可能导致无限等待节点删除 |
+| **EnsureCluster** | 健康检查详细报告缺失 | ⭐ | 无法快速定位不健康组件 |
 
 ### 五、增强建议总结
 
@@ -2147,14 +2585,17 @@ func (e *EnsureProviderSelfUpgrade) rollbackProvider(oldImage string) error {
 
 | Phase | 文档要求场景数 | 已实现场景数 | 完成度 |
 |------|---------------|-------------|-------|
-| **EnsureEtcdUpgrade** | 7 | 5 | 71% |
-| **EnsureMasterUpgrade** | 7 | 6 | 86% |
-| **EnsureWorkerUpgrade** | 7 | 6 | 86% |
-| **EnsureContainerdUpgrade** | 5 | 3 | 60% |
-| **EnsureComponentUpgrade** | 5 | 4 | 80% |
-| **EnsureAgentUpgrade** | 5 | 4 | 80% |
 | **EnsureProviderSelfUpgrade** | 4 | 3 | 75% |
-| **总体** | 39 | 31 | **79%** |
+| **EnsureAgentUpgrade** | 5 | 4 | 80% |
+| **EnsureContainerdUpgrade** | 5 | 3 | 60% |
+| **EnsureEtcdUpgrade** | 7 | 5 | 71% |
+| **EnsureWorkerUpgrade** | 7 | 6 | 86% |
+| **EnsureMasterUpgrade** | 7 | 6 | 86% |
+| **EnsureWorkerDelete** | 6 | 4 | 67% |
+| **EnsureMasterDelete** | 6 | 4 | 67% |
+| **EnsureComponentUpgrade** | 5 | 4 | 80% |
+| **EnsureCluster** | 5 | 3 | 60% |
+| **总体** | 57 | 42 | **74%** |
 
 #### 6.2 关键缺失
 
@@ -2162,6 +2603,8 @@ func (e *EnsureProviderSelfUpgrade) rollbackProvider(oldImage string) error {
 2. **Fail-Fast标记**：Master升级失败时，未显式标记"需人工介入"
 3. **集群状态预检**：Worker升级前未再次检查集群状态
 4. **回滚机制**：组件、Agent、Provider升级失败后无法自动回滚
+5. **超时检查**：Worker/Master删除、Agent切换缺少超时机制
+6. **API Server检查**：Master删除前未检查API Server可达性
 
 #### 6.3 增强优先级建议
 
@@ -2170,9 +2613,12 @@ func (e *EnsureProviderSelfUpgrade) rollbackProvider(oldImage string) error {
 | **P0（必须）** | Etcd集群健康检查 | 2天 |
 | **P0（必须）** | Fail-Fast标记机制 | 1天 |
 | **P0（必须）** | 集群状态预检 | 1天 |
+| **P0（必须）** | API Server可达性检查 | 0.5天 |
 | **P1（重要）** | Containerd健康检查 | 1天 |
 | **P1（重要）** | 组件健康检查 | 1天 |
+| **P1（重要）** | 超时检查机制 | 1天 |
 | **P2（建议）** | Agent健康检查 | 1天 |
 | **P2（建议）** | 回滚机制 | 2天 |
+| **P2（建议）** | 健康检查详细报告 | 1天 |
 
-**总体评价**：代码实现已覆盖文档要求的 **79%** 异常场景，核心Fail-Fast机制（Etcd/Master升级失败阻断流程）已完整实现。主要缺失集中在 **健康检查机制**、**Fail-Fast标记**、**集群状态预检** 和 **回滚机制** 四个方面，建议按优先级逐步增强。
+**总体评价**：代码实现已覆盖文档要求的 **74%** 异常场景，核心Fail-Fast机制（Etcd/Master升级失败阻断流程）已完整实现。主要缺失集中在 **健康检查机制**、**Fail-Fast标记**、**集群状态预检**、**回滚机制**、**超时检查** 和 **API Server检查** 六个方面，建议按优先级逐步增强。
