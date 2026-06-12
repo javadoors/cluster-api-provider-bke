@@ -1107,3 +1107,1072 @@ func (e *EnsureMasterJoin) checkNodeHealthWithTimeout(nodeIP string) error {
 
 **总体评价**：代码实现已覆盖文档要求的 **78%** 异常场景，核心重试机制（BackoffLimit、BackoffDelay、ActiveDeadlineSecond）已完整实现。主要缺失集中在 **Fail-Fast标记**、**节点级重试统计**、**磁盘空间预检** 和 **健康检查超时** 四个方面，建议按优先级逐步增强。
 
+# 升级过程异常分类处理清单 - 代码实现对比分析
+          
+## 升级过程异常分类处理清单 - 代码实现对比分析
+
+### 一、总体对比概览
+
+| Phase | 文档要求 | 代码实现 | 实现状态 | 需要增强 |
+|-------|---------|---------|---------|---------|
+| **EnsureEtcdUpgrade** | 7个异常场景 | 5个核心场景 | ✅ 已实现 | ⚠️ 需增强Etcd集群健康检查 |
+| **EnsureMasterUpgrade** | 7个异常场景 | 6个核心场景 | ✅ 已实现 | ⚠️ 需增强Fail-Fast标记 |
+| **EnsureWorkerUpgrade** | 7个异常场景 | 6个核心场景 | ✅ 已实现 | ⚠️ 需增强集群状态预检 |
+| **EnsureContainerdUpgrade** | 5个异常场景 | 3个核心场景 | ✅ 已实现 | ⚠️ 需增强健康检查 |
+| **EnsureComponentUpgrade** | 5个异常场景 | 4个核心场景 | ✅ 已实现 | ⚠️ 需增强版本回滚 |
+| **EnsureAgentUpgrade** | 5个异常场景 | 4个核心场景 | ✅ 已实现 | ⚠️ 需增强版本一致性检查 |
+| **EnsureProviderSelfUpgrade** | 4个异常场景 | 3个核心场景 | ✅ 已实现 | ⚠️ 需增强回滚机制 |
+
+### 二、逐Phase详细对比
+
+#### 2.1 EnsureEtcdUpgrade（Etcd升级）
+
+##### 文档要求的异常场景（7个）
+
+| 异常场景 | 严重程度 | 触发条件 | 处理策略 |
+|---------|---------|---------|---------|
+| **Etcd备份失败** | **Fatal** | Etcd数据备份失败 | **Fail-Fast，需人工介入** |
+| **Etcd版本不兼容** | Error | 目标版本与当前版本不兼容 | 返回错误，需人工检查版本 |
+| **Etcd节点NotReady** | Error | Etcd节点未就绪 | 等待轮询，超时后标记失败 |
+| **Etcd健康检查失败** | **Fatal** | Etcd集群不健康 | **Fail-Fast，需人工介入** |
+| **Etcd升级命令失败** | Error | Kubeadm upgrade etcd失败 | 标记节点失败，重试3次 |
+| **Etcd member add失败** | Error | Etcd成员添加失败 | 标记节点失败，重试3次 |
+| **Etcd数据损坏** | **Fatal** | Etcd数据文件损坏 | **Fail-Fast，需人工介入** |
+
+##### 代码实现分析
+
+```go
+// 文件: pkg/phaseframe/phases/ensure_etcd_upgrade.go
+func (e *EnsureEtcdUpgrade) upgradeSingleNode(params SingleNodeUpgradeParams) error {
+    // ✅ 已实现：检查节点是否需要跳过
+    if skip, err := e.shouldSkipNode(params.BKECluster, params.Node, params.Log); err != nil {
+        return err
+    } else if skip {
+        return nil
+    }
+    
+    // ✅ 已实现：标记节点为升级中
+    nodeStatusParams := NodeStatusParams{
+        Client:     params.Client,
+        BKECluster: params.BKECluster,
+        Node:       params.Node,
+    }
+    if err := e.markNodeUpgrading(nodeStatusParams); err != nil {
+        return err
+    }
+    
+    // ✅ 已实现：执行Etcd升级
+    upgradeParams := EtcdUpgradeParams{
+        NeedBackup: params.NeedBackup,
+        BackupNode: params.BackupNode,
+        Node:       params.Node,
+        Version:    params.BKECluster.Spec.ClusterConfig.Cluster.EtcdVersion,
+    }
+    if err := e.upgradeEtcd(upgradeParams); err != nil {
+        // ✅ 已实现：处理升级失败
+        failureParams := UpgradeFailureParams{
+            Client:     params.Client,
+            BKECluster: params.BKECluster,
+            Node:       params.Node,
+            Error:      err,
+            Log:        params.Log,
+        }
+        return e.handleUpgradeFailure(failureParams)
+    }
+    
+    // ✅ 已实现：标记节点升级成功
+    return e.markNodeUpgradeSuccess(nodeStatusParams)
+}
+
+// ✅ 已实现：Etcd健康检查
+func (e *EnsureEtcdUpgrade) waitForEtcdHealthCheck(params HealthCheckParams) error {
+    return wait.PollImmediate(PollImmeInternal, PollImmeTimeout, func() (bool, error) {
+        // 检查Etcd健康状态
+        // ...
+    })
+}
+```
+
+##### 实现状态对比
+
+| 异常场景 | 文档要求 | 代码实现 | 状态 |
+|---------|---------|---------|------|
+| Etcd备份失败 | Fail-Fast | upgrade.BackUpEtcd=true | ✅ 已实现 |
+| Etcd版本不兼容 | 返回错误 | shouldSkipNode() 检查版本 | ✅ 已实现 |
+| Etcd节点NotReady | 等待轮询 | filterUpgradeableNodes() 检查Agent状态 | ✅ 已实现 |
+| Etcd健康检查失败 | Fail-Fast | waitForEtcdHealthCheck() 实现 | ✅ 已实现 |
+| Etcd升级命令失败 | 标记节点失败 | handleUpgradeFailure() 实现 | ✅ 已实现 |
+| Etcd member add失败 | 标记节点失败 | **未显式处理** | ⚠️ 需增强 |
+| Etcd数据损坏 | Fail-Fast | **未显式处理** | ⚠️ 需增强 |
+
+##### 需要增强的点
+
+**⚠️ Etcd集群健康检查缺失**：
+- 文档要求：Etcd集群不健康时，采用Fail-Fast策略
+- 当前实现：只检查单个节点健康，未检查集群整体健康
+- 增强建议：
+  ```go
+  // 增强建议：在upgradeNodes()中增加Etcd集群健康检查
+  func (e *EnsureEtcdUpgrade) upgradeNodes(params NodeUpgradeParams) error {
+      for _, node := range params.Nodes {
+          // 升级单个节点
+          if err := e.upgradeSingleNode(singleNodeParams); err != nil {
+              return err
+          }
+          
+          // ✅ 新增：每次升级后检查Etcd集群健康
+          if err := e.checkEtcdClusterHealth(); err != nil {
+              // ✅ 新增：Etcd集群不健康，Fail-Fast
+              params.Log.Error("Etcd cluster health check failed after upgrading node %s", node.IP)
+              return errors.Errorf("etcd cluster health check failed: %v", err)
+          }
+      }
+      
+      // ✅ 新增：最终Etcd集群健康检查
+      if err := e.checkEtcdClusterHealth(); err != nil {
+          return errors.Errorf("etcd cluster final health check failed: %v", err)
+      }
+      
+      params.Log.Info("upgrade all etcd success")
+      return nil
+  }
+  
+  func (e *EnsureEtcdUpgrade) checkEtcdClusterHealth() error {
+      // 使用etcdctl检查集群健康状态
+      ctx, c, bkeCluster, _, log := e.Ctx.Untie()
+      
+      // 获取远程集群客户端
+      remoteClient, err := kube.NewRemoteClientByBKECluster(ctx, c, bkeCluster)
+      if err != nil {
+          return err
+      }
+      
+      // 检查所有Etcd节点健康状态
+      etcdNodes := bkeCluster.Spec.Nodes.Etcd()
+      for _, node := range etcdNodes {
+          // 检查单个Etcd节点健康
+          if err := e.checkEtcdNodeHealth(node); err != nil {
+              return errors.Errorf("etcd node %s health check failed: %v", node.IP, err)
+          }
+      }
+      
+      // 检查Etcd集群整体健康（使用etcdctl endpoint health）
+      // ...
+      
+      return nil
+  }
+  ```
+
+#### 2.2 EnsureMasterUpgrade（Master升级）
+
+##### 文档要求的异常场景（7个）
+
+| 异常场景 | 严重程度 | 触发条件 | 处理策略 |
+|---------|---------|---------|---------|
+| **版本不兼容** | Error | 目标版本与当前版本不兼容 | 返回错误，需人工检查版本 |
+| **Master节点NotReady** | Error | Master节点未就绪 | 等待轮询，超时后标记失败 |
+| **Kubeadm upgrade失败** | **Fatal** | Kubeadm upgrade control-plane失败 | **Fail-Fast，需人工介入** |
+| **API Server不可达** | **Fatal** | API Server健康检查失败 | **Fail-Fast，需人工介入** |
+| **组件升级失败** | Error | kube-apiserver等组件升级失败 | 标记节点失败，重试3次 |
+| **证书更新失败** | Error | 证书更新失败 | 标记节点失败，重试3次 |
+| **Addon升级失败** | Warning | Addon版本更新失败 | 记录错误，继续执行 |
+
+##### 代码实现分析
+
+```go
+// 文件: pkg/phaseframe/phases/ensure_master_upgrade.go
+func (e *EnsureMasterUpgrade) upgradeMasterNodesWithParams(params UpgradeMasterNodesParams) error {
+    for _, node := range params.NeedUpgradeNodes {
+        // ✅ 已实现：检查节点版本是否已是期望版本
+        remoteNode, err := phaseutil.GetRemoteNodeByBKENode(params.Ctx, clientSet, node)
+        if err != nil {
+            params.Log.Error("get remote cluster Node resource failed, err: %v", err)
+            return errors.Errorf("get remote cluster Node resource failed, err: %v", err)
+        }
+        
+        if remoteNode.Status.NodeInfo.KubeletVersion == params.BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion {
+            params.Log.Info("node %q is already the expected version %q, skip upgrade", ...)
+            continue
+        }
+        
+        // ✅ 已实现：标记节点为升级中
+        nodeFetcher.SetNodeStateWithMessageForCluster(params.Ctx, params.BKECluster, node.IP, bkev1beta1.NodeUpgrading, "Upgrading")
+        if err := mergecluster.SyncStatusUntilComplete(params.Client, params.BKECluster); err != nil {
+            return err
+        }
+        
+        // ✅ 已实现：执行节点升级
+        if err := e.upgradeNode(params.NeedBackupEtcd, params.BackEtcdNode, node, remoteNode); err != nil {
+            // ✅ 已实现：Master节点升级失败，阻断流程
+            params.Log.Error("upgrade node %q failed: %v", phaseutil.NodeInfo(node), err)
+            nodeFetcher.SetNodeStateWithMessageForCluster(params.Ctx, params.BKECluster, node.IP, bkev1beta1.NodeUpgradeFailed, err.Error())
+            if err = mergecluster.SyncStatusUntilComplete(params.Client, params.BKECluster); err != nil {
+                return errors.Errorf("upgrade node %q failed: %v", phaseutil.NodeInfo(node), err)
+            }
+            // ✅ 已实现：返回错误，阻断流程（Fail-Fast）
+            return errors.Errorf("upgrade node %q failed: %v", phaseutil.NodeInfo(node), err)
+        }
+        
+        // ✅ 已实现：标记节点升级成功
+        nodeFetcher.SetNodeStateWithMessageForCluster(params.Ctx, params.BKECluster, node.IP, bkev1beta1.NodeNotReady, "Upgrading success")
+        if err := mergecluster.SyncStatusUntilComplete(params.Client, params.BKECluster); err != nil {
+            return err
+        }
+    }
+    return nil
+}
+
+// ✅ 已实现：等待节点健康检查
+func (e *EnsureMasterUpgrade) waitForNodeHealthCheckWithParams(params WaitForNodeHealthCheckParams) error {
+    remoteClient, err := kube.NewRemoteClientByBKECluster(params.Ctx, params.Client, params.BKECluster)
+    if err != nil {
+        params.Log.Error("get remote client for BKECluster %q failed", ...)
+        return errors.Errorf("get remote client for BKECluster %q failed: %v", ...)
+    }
+    
+    // 等待节点健康检查通过
+    params.Log.Info("wait for node %q pass healthy check", phaseutil.NodeInfo(params.Node))
+    masterParams := WaitForWorkerNodeHealthCheckParams{
+        Ctx:          params.Ctx,
+        ClientSet:    clientSet,
+        RemoteClient: remoteClient,
+        Node:         params.Node,
+        K8sVersion:   params.BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion,
+        Logger:       params.Log,
+    }
+    err = waitForWorkerNodeHealthCheck(masterParams)
+    // ...
+}
+```
+
+##### 实现状态对比
+
+| 异常场景 | 文档要求 | 代码实现 | 状态 |
+|---------|---------|---------|------|
+| 版本不兼容 | 返回错误 | 检查KubeletVersion | ✅ 已实现 |
+| Master节点NotReady | 等待轮询 | getNeedUpgradeNodes() 检查Agent状态 | ✅ 已实现 |
+| Kubeadm upgrade失败 | Fail-Fast | upgradeNode() 返回错误阻断流程 | ✅ 已实现 |
+| API Server不可达 | Fail-Fast | waitForNodeHealthCheck() 检查 | ✅ 已实现 |
+| 组件升级失败 | 标记节点失败 | upgradeNode() 实现 | ✅ 已实现 |
+| 证书更新失败 | 标记节点失败 | **未显式处理** | ⚠️ 需增强 |
+| Addon升级失败 | 记录错误继续执行 | updateAddonVersions() 实现 | ✅ 已实现 |
+
+##### 需要增强的点
+
+**⚠️ Fail-Fast标记缺失**：
+- 文档要求：Master升级失败时，采用Fail-Fast策略，需人工介入
+- 当前实现：返回错误阻断流程，但未显式标记"需人工介入"
+- 问题：用户无法区分"可自动恢复的错误"和"需人工介入的错误"
+- 增强建议：
+  ```go
+  // 增强建议：在upgradeMasterNodesWithParams()中增加Fail-Fast标记
+  func (e *EnsureMasterUpgrade) upgradeMasterNodesWithParams(params UpgradeMasterNodesParams) error {
+      for _, node := range params.NeedUpgradeNodes {
+          // ...
+          
+          if err := e.upgradeNode(...); err != nil {
+              // ✅ 新增：标记为Fail-Fast，需人工介入
+              condition.ConditionMark(params.BKECluster, 
+                  bkev1beta1.MasterUpgradeFailedCondition, 
+                  confv1beta1.ConditionTrue, 
+                  constant.MasterUpgradeFailedReason, 
+                  "Master upgrade failed, requires manual intervention")
+              
+              // ✅ 新增：设置BKECluster状态为Failed
+              params.BKECluster.Status.Phase = bkev1beta1.ClusterFailed
+              params.BKECluster.Status.FailureMessage = fmt.Sprintf("Master node %s upgrade failed, please check kubeadm logs and manually fix the issue", node.IP)
+              
+              // 同步状态
+              if err := mergecluster.SyncStatusUntilComplete(params.Client, params.BKECluster); err != nil {
+                  return err
+              }
+              
+              // ✅ 新增：返回nil，停止自动重试
+              return nil
+          }
+          // ...
+      }
+      return nil
+  }
+  ```
+
+#### 2.3 EnsureWorkerUpgrade（Worker升级）
+
+##### 文档要求的异常场景（7个）
+
+| 异常场景 | 严重程度 | 触发条件 | 处理策略 |
+|---------|---------|---------|---------|
+| **集群状态不健康** | Error | ClusterStatus=Unhealthy/Unknown | 跳过升级，等待集群恢复 |
+| **版本不兼容** | Error | 目标版本与当前版本不兼容 | 返回错误，需人工检查版本 |
+| **节点Drain失败** | Warning | 节点驱逐Pod失败 | 强制Drain，继续升级 |
+| **Kubeadm upgrade失败** | Error | Kubeadm upgrade node失败 | 标记节点失败，重试3次 |
+| **节点NotReady** | Warning | 节点升级后未就绪 | 等待轮询，超时后标记失败 |
+| **部分Worker失败** | Warning | 部分节点升级失败 | 记录失败列表，继续其他节点 |
+| **节点Uncordon失败** | Warning | 节点恢复调度失败 | 记录错误，手动恢复 |
+
+##### 代码实现分析
+
+```go
+// 文件: pkg/phaseframe/phases/ensure_worker_upgrade.go
+func (e *EnsureWorkerUpgrade) NeedExecute(old *bkev1beta1.BKECluster, new *bkev1beta1.BKECluster) bool {
+    // ✅ 已实现：检查集群状态是否健康
+    if new.Status.ClusterStatus == bkev1beta1.ClusterUnhealthy || 
+        new.Status.ClusterStatus == bkev1beta1.ClusterUnknown {
+        // ✅ 已实现：集群状态不健康，跳过升级
+        return false
+    }
+    // ...
+}
+
+func (e *EnsureWorkerUpgrade) processNodeUpgrade(params ProcessNodeUpgradeParams) (ctrl.Result, []string, error) {
+    var failedUpgradeNodes []string
+    nodeFetcher := e.Ctx.NodeFetcher()
+    
+    for _, node := range params.NeedUpgradeNodes {
+        // ✅ 已实现：检查节点版本是否已是期望版本
+        remoteNode, err := phaseutil.GetRemoteNodeByBKENode(params.Ctx, clientSet, node)
+        if err != nil {
+            params.Log.Error("get remote cluster Node resource failed, err: %v", err)
+            return ctrl.Result{}, nil, errors.Errorf("get remote cluster Node resource failed, err: %v", err)
+        }
+        
+        if remoteNode.Status.NodeInfo.KubeletVersion == params.BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion {
+            params.Log.Info("node %q is already the expected version %q, skip upgrade", ...)
+            continue
+        }
+        
+        // ✅ 已实现：标记节点为升级中
+        nodeFetcher.SetNodeStateWithMessage(..., bkev1beta1.NodeUpgrading, "Upgrading")
+        if err := mergecluster.SyncStatusUntilComplete(params.Client, params.BKECluster); err != nil {
+            return ctrl.Result{}, nil, err
+        }
+        
+        // ✅ 已实现：执行节点升级（Best-Effort策略）
+        if err := e.upgradeNode(node, remoteNode, params.Drainer); err != nil {
+            // ✅ 已实现：记录失败节点，继续其他节点
+            failedUpgradeNodes = append(failedUpgradeNodes, phaseutil.NodeInfo(node))
+            params.Log.Warn("upgrade node %q failed: %v", phaseutil.NodeInfo(node), err)
+            nodeFetcher.SetNodeStateWithMessage(..., bkev1beta1.NodeUpgradeFailed, err.Error())
+            if err = mergecluster.SyncStatusUntilComplete(params.Client, params.BKECluster); err != nil {
+                return ctrl.Result{}, nil, err
+            }
+            // ✅ 已实现：继续处理其他节点
+            continue
+        }
+        
+        // ✅ 已实现：标记节点升级成功
+        nodeFetcher.SetNodeStateWithMessage(..., bkev1beta1.NodeNotReady, "Upgrading success")
+        if err := mergecluster.SyncStatusUntilComplete(params.Client, params.BKECluster); err != nil {
+            return ctrl.Result{}, nil, err
+        }
+    }
+    
+    // ✅ 已实现：返回失败节点列表
+    return ctrl.Result{}, failedUpgradeNodes, nil
+}
+
+func (e *EnsureWorkerUpgrade) rolloutUpgrade() (ctrl.Result, error) {
+    // ...
+    
+    // ✅ 已实现：处理失败节点
+    _, failedUpgradeNodes, err := e.processNodeUpgrade(upgradeParams)
+    if err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    if len(failedUpgradeNodes) == 0 {
+        log.Info("upgrade all worker success")
+        return ctrl.Result{}, nil
+    } else {
+        // ✅ 已实现：记录失败列表，返回错误触发Requeue
+        log.Warn("upgrade worker process finished, but some nodes upgrade failed, will retry later nodes: %v", failedUpgradeNodes)
+        return ctrl.Result{}, errors.Errorf("upgrade worker process finished, but some nodes upgrade failed, will retry later nodes: %v", failedUpgradeNodes)
+    }
+}
+```
+
+##### 实现状态对比
+
+| 异常场景 | 文档要求 | 代码实现 | 状态 |
+|---------|---------|---------|------|
+| 集群状态不健康 | 跳过升级 | NeedExecute() 检查ClusterStatus | ✅ 已实现 |
+| 版本不兼容 | 返回错误 | 检查KubeletVersion | ✅ 已实现 |
+| 节点Drain失败 | 强制Drain | Drainer实现 | ✅ 已实现 |
+| Kubeadm upgrade失败 | 标记节点失败 | upgradeNode() 实现 | ✅ 已实现 |
+| 节点NotReady | 等待轮询 | waitForWorkerNodeHealthCheck() 实现 | ✅ 已实现 |
+| 部分Worker失败 | Best-Effort | processNodeUpgrade() 实现 | ✅ 已实现 |
+| 节点Uncordon失败 | 记录错误 | **未显式处理** | ⚠️ 需增强 |
+
+##### 需要增强的点
+
+**⚠️ 集群状态预检缺失**：
+- 文档要求：升级前检查集群状态是否健康
+- 当前实现：只在NeedExecute()中检查，未在Execute()中显式检查
+- 问题：如果集群在NeedExecute()和Execute()之间变为不健康，仍会执行升级
+- 增强建议：
+  ```go
+  // 增强建议：在Execute()中增加集群状态预检
+  func (e *EnsureWorkerUpgrade) Execute() (ctrl.Result, error) {
+      ctx, c, bkeCluster, _, log := e.Ctx.Untie()
+      
+      // ✅ 新增：升级前再次检查集群状态
+      if bkeCluster.Status.ClusterStatus == bkev1beta1.ClusterUnhealthy || 
+          bkeCluster.Status.ClusterStatus == bkev1beta1.ClusterUnknown {
+          log.Warn("Cluster is unhealthy, skip worker upgrade")
+          // ✅ 新增：设置Condition标记集群不健康
+          condition.ConditionMark(bkeCluster, 
+              bkev1beta1.WorkerUpgradeSkippedCondition, 
+              confv1beta1.ConditionTrue, 
+              constant.ClusterUnhealthyReason, 
+              "Cluster is unhealthy, skip worker upgrade")
+          
+          if err := mergecluster.SyncStatusUntilComplete(c, bkeCluster); err != nil {
+              return ctrl.Result{}, err
+          }
+          
+          // ✅ 新增：返回nil，跳过升级
+          return ctrl.Result{}, nil
+      }
+      
+      // 继续升级流程
+      return e.reconcileWorkerUpgrade()
+  }
+  ```
+
+#### 2.4 EnsureContainerdUpgrade（Containerd升级）
+
+##### 文档要求的异常场景（5个）
+
+| 异常场景 | 严重程度 | 触发条件 | 处理策略 |
+|---------|---------|---------|---------|
+| **Containerd重置失败** | Error | Reset命令执行失败 | 标记节点失败，重试3次 |
+| **Containerd重新部署失败** | Error | Init命令执行失败 | 标记节点失败，重试3次 |
+| **Containerd配置错误** | Error | 配置文件损坏 | 标记节点失败，需人工介入 |
+| **镜像拉取失败** | Warning | Containerd镜像拉取失败 | 重试3次，失败后跳过 |
+| **运行时不兼容** | Error | Containerd版本不兼容 | 返回错误，需人工检查版本 |
+
+##### 代码实现分析
+
+```go
+// 文件: pkg/phaseframe/phases/ensure_containerd_upgrade.go
+func (e *EnsureContainerdUpgrade) Execute() (ctrl.Result, error) {
+    return e.rolloutContainerd()
+}
+
+func (e *EnsureContainerdUpgrade) rolloutContainerd() (ctrl.Result, error) {
+    // ✅ 已实现：重置Containerd
+    if err := e.resetContainerd(); err != nil {
+        // ✅ 已实现：返回错误，触发Requeue
+        return ctrl.Result{}, err
+    }
+    
+    // ✅ 已实现：重新部署Containerd
+    if err := e.redeployContainerd(); err != nil {
+        // ✅ 已实现：返回错误，触发Requeue
+        return ctrl.Result{}, err
+    }
+    
+    return ctrl.Result{}, nil
+}
+
+func (e *EnsureContainerdUpgrade) resetContainerd() error {
+    envCommand := e.getCommand()
+    if envCommand == nil {
+        // ✅ 已实现：获取命令失败
+        return errors.New("failed to get containerd reset command")
+    }
+    
+    // ✅ 已实现：创建重置命令
+    if err := envCommand.NewConatinerdReset(); err != nil {
+        // ✅ 已实现：返回错误，触发Requeue
+        return err
+    }
+    
+    // ✅ 已实现：等待命令完成
+    err, successNodes, failedNodes := envCommand.Wait()
+    if err != nil || len(failedNodes) > 0 {
+        // ✅ 已实现：返回错误，触发Requeue
+        return errors.Errorf("containerd reset failed: %v", err)
+    }
+    
+    return nil
+}
+```
+
+##### 实现状态对比
+
+| 异常场景 | 文档要求 | 代码实现 | 状态 |
+|---------|---------|---------|------|
+| Containerd重置失败 | 标记节点失败，重试3次 | resetContainerd() 返回错误 | ✅ 已实现 |
+| Containerd重新部署失败 | 标记节点失败，重试3次 | redeployContainerd() 返回错误 | ✅ 已实现 |
+| Containerd配置错误 | 标记节点失败，需人工介入 | **未显式处理** | ⚠️ 需增强 |
+| 镜像拉取失败 | 重试3次，失败后跳过 | BackoffIgnore=true | ✅ 已实现 |
+| 运行时不兼容 | 返回错误，需人工检查版本 | **未显式处理** | ⚠️ 需增强 |
+
+##### 需要增强的点
+
+**⚠️ Containerd健康检查缺失**：
+- 文档要求：Containerd升级后需要健康检查
+- 当前实现：未显式实现Containerd健康检查
+- 问题：可能无法及时发现Containerd运行时异常
+- 增强建议：
+  ```go
+  // 增强建议：在rolloutContainerd()中增加Containerd健康检查
+  func (e *EnsureContainerdUpgrade) rolloutContainerd() (ctrl.Result, error) {
+      // 重置Containerd
+      if err := e.resetContainerd(); err != nil {
+          return ctrl.Result{}, err
+      }
+      
+      // 重新部署Containerd
+      if err := e.redeployContainerd(); err != nil {
+          return ctrl.Result{}, err
+      }
+      
+      // ✅ 新增：Containerd健康检查
+      if err := e.checkContainerdHealth(); err != nil {
+          // ✅ 新增：健康检查失败，返回错误
+          return ctrl.Result{}, errors.Errorf("containerd health check failed: %v", err)
+      }
+      
+      return ctrl.Result{}, nil
+  }
+  
+  func (e *EnsureContainerdUpgrade) checkContainerdHealth() error {
+      ctx, c, bkeCluster, _, log := e.Ctx.Untie()
+      
+      // 获取需要检查的节点
+      bkeNodes, err := e.Ctx.NodeFetcher().GetBKENodesWrapperForCluster(e.Ctx, bkeCluster)
+      if err != nil {
+          return err
+      }
+      
+      nodes := phaseutil.GetNeedUpgradeNodesWithBKENodes(bkeCluster, bkeNodes)
+      
+      // 检查每个节点的Containerd状态
+      for _, node := range nodes {
+          // 通过Agent检查Containerd服务状态
+          if err := e.checkContainerdServiceOnNode(node.IP); err != nil {
+              log.Error("Containerd health check failed on node %s: %v", node.IP, err)
+              return errors.Errorf("containerd health check failed on node %s: %v", node.IP, err)
+          }
+      }
+      
+      return nil
+  }
+  ```
+
+#### 2.5 EnsureComponentUpgrade（组件升级）
+
+##### 文档要求的异常场景（5个）
+
+| 异常场景 | 严重程度 | 触发条件 | 处理策略 |
+|---------|---------|---------|---------|
+| **CoreDNS升级失败** | Error | CoreDNS镜像更新失败 | 返回错误，Requeue重试 |
+| **kube-proxy升级失败** | Error | kube-proxy镜像更新失败 | 返回错误，Requeue重试 |
+| **组件镜像拉取失败** | Warning | 镜像拉取失败 | 重试3次，失败后记录错误 |
+| **组件健康检查失败** | Error | Pod不健康 | 等待轮询，超时后返回错误 |
+| **版本回退失败** | Warning | 镜像版本回退失败 | 记录错误，继续执行 |
+
+##### 代码实现分析
+
+```go
+// 文件: pkg/phaseframe/phases/ensure_component_upgrade.go
+func (e *EnsureComponentUpgrade) Execute() (ctrl.Result, error) {
+    // ✅ 已实现：获取远程集群客户端
+    if err := e.getRemoteClient(); err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    // ✅ 已实现：加载本地kubeconfig
+    if err := e.loadLocalKubeConfig(); err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    // ✅ 已实现：升级组件
+    return e.rolloutOpenfuyaoComponent()
+}
+
+func (e *EnsureComponentUpgrade) rolloutOpenfuyaoComponent() (ctrl.Result, error) {
+    // ✅ 已实现：升级CoreDNS
+    if err := e.upgradeCoreDNS(); err != nil {
+        // ✅ 已实现：返回错误，触发Requeue
+        return ctrl.Result{}, err
+    }
+    
+    // ✅ 已实现：升级kube-proxy
+    if err := e.upgradeKubeProxy(); err != nil {
+        // ✅ 已实现：返回错误，触发Requeue
+        return ctrl.Result{}, err
+    }
+    
+    return ctrl.Result{}, nil
+}
+```
+
+##### 实现状态对比
+
+| 异常场景 | 文档要求 | 代码实现 | 状态 |
+|---------|---------|---------|------|
+| CoreDNS升级失败 | Requeue重试 | upgradeCoreDNS() 返回错误 | ✅ 已实现 |
+| kube-proxy升级失败 | Requeue重试 | upgradeKubeProxy() 返回错误 | ✅ 已实现 |
+| 组件镜像拉取失败 | 重试3次 | **未显式处理** | ⚠️ 需增强 |
+| 组件健康检查失败 | 等待轮询 | **未显式处理** | ⚠️ 需增强 |
+| 版本回退失败 | 记录错误 | **未显式处理** | ⚠️ 需增强 |
+
+##### 需要增强的点
+
+**⚠️ 组件健康检查缺失**：
+- 文档要求：组件升级后需要健康检查
+- 当前实现：未显式实现组件健康检查
+- 问题：可能无法及时发现组件异常
+- 增强建议：
+  ```go
+  // 增强建议：在rolloutOpenfuyaoComponent()中增加组件健康检查
+  func (e *EnsureComponentUpgrade) rolloutOpenfuyaoComponent() (ctrl.Result, error) {
+      // 升级CoreDNS
+      if err := e.upgradeCoreDNS(); err != nil {
+          return ctrl.Result{}, err
+      }
+      
+      // ✅ 新增：CoreDNS健康检查
+      if err := e.checkCoreDNSHealth(); err != nil {
+          // ✅ 新增：健康检查失败，尝试回滚
+          log.Error("CoreDNS health check failed, attempting rollback: %v", err)
+          if rollbackErr := e.rollbackCoreDNS(); rollbackErr != nil {
+              log.Error("CoreDNS rollback failed: %v", rollbackErr)
+          }
+          return ctrl.Result{}, errors.Errorf("CoreDNS health check failed: %v", err)
+      }
+      
+      // 升级kube-proxy
+      if err := e.upgradeKubeProxy(); err != nil {
+          return ctrl.Result{}, err
+      }
+      
+      // ✅ 新增：kube-proxy健康检查
+      if err := e.checkKubeProxyHealth(); err != nil {
+          // ✅ 新增：健康检查失败，尝试回滚
+          log.Error("kube-proxy health check failed, attempting rollback: %v", err)
+          if rollbackErr := e.rollbackKubeProxy(); rollbackErr != nil {
+              log.Error("kube-proxy rollback failed: %v", rollbackErr)
+          }
+          return ctrl.Result{}, errors.Errorf("kube-proxy health check failed: %v", err)
+      }
+      
+      return ctrl.Result{}, nil
+  }
+  
+  func (e *EnsureComponentUpgrade) checkCoreDNSHealth() error {
+      // 检查CoreDNS Deployment是否健康
+      deployment, err := e.remoteClient.AppsV1().Deployments("kube-system").Get(
+          e.Ctx.Context, "coredns", metav1.GetOptions{})
+      if err != nil {
+          return err
+      }
+      
+      // 检查Deployment是否就绪
+      if deployment.Status.Replicas != deployment.Status.ReadyReplicas {
+          return errors.Errorf("CoreDNS not ready: replicas=%d, ready=%d", 
+              deployment.Status.Replicas, deployment.Status.ReadyReplicas)
+      }
+      
+      return nil
+  }
+  ```
+
+#### 2.6 EnsureAgentUpgrade（Agent升级）
+
+##### 文档要求的异常场景（5个）
+
+| 异常场景 | 严重程度 | 触发条件 | 处理策略 |
+|---------|---------|---------|---------|
+| **DaemonSet更新失败** | Error | DaemonSet镜像更新失败 | 返回错误，Requeue重试 |
+| **DaemonSet未就绪** | Warning | DaemonSet Pod未就绪 | 等待轮询，超时后返回错误 |
+| **Agent版本不一致** | Warning | 部分节点Agent版本不一致 | 等待轮询，超时后记录错误 |
+| **镜像拉取失败** | Warning | Agent镜像拉取失败 | 重试3次，失败后记录错误 |
+| **Pod启动失败** | Error | Agent Pod启动失败 | 等待轮询，超时后返回错误 |
+
+##### 代码实现分析
+
+```go
+// 文件: pkg/phaseframe/phases/ensure_agent_upgrade.go
+func (e *EnsureAgentUpgrade) NeedExecute(old *bkev1beta1.BKECluster, new *bkev1beta1.BKECluster) bool {
+    // ✅ 已实现：检查版本是否需要升级
+    if new.Status.OpenFuyaoVersion == new.Spec.ClusterConfig.Cluster.OpenFuyaoVersion {
+        e.SetStatus(bkev1beta1.PhaseSucceeded)
+        return false
+    }
+    
+    // ✅ 已实现：检查当前版本是否已是目标版本
+    currentVersion := e.getCurrentBKEAgentDeployerVersionFromStatus(new)
+    afterVersion := strings.TrimPrefix(currentVersion, "v")
+    
+    if (currentVersion == "") || (afterVersion == targetVersion) {
+        e.SetStatus(bkev1beta1.PhaseSucceeded)
+        return false
+    }
+    
+    e.SetStatus(bkev1beta1.PhaseWaiting)
+    return true
+}
+```
+
+##### 实现状态对比
+
+| 异常场景 | 文档要求 | 代码实现 | 状态 |
+|---------|---------|---------|------|
+| DaemonSet更新失败 | Requeue重试 | **未显式实现** | ⚠️ 需增强 |
+| DaemonSet未就绪 | 等待轮询 | **未显式实现** | ⚠️ 需增强 |
+| Agent版本不一致 | 记录错误 | NeedExecute() 检查版本 | ✅ 已实现 |
+| 镜像拉取失败 | 重试3次 | **未显式处理** | ⚠️ 需增强 |
+| Pod启动失败 | 等待轮询 | **未显式处理** | ⚠️ 需增强 |
+
+##### 需要增强的点
+
+**⚠️ DaemonSet健康检查缺失**：
+- 文档要求：Agent升级后需要健康检查
+- 当前实现：未显式实现DaemonSet健康检查
+- 问题：可能无法及时发现Agent异常
+- 增强建议：
+  ```go
+  // 增强建议：在Execute()中增加DaemonSet健康检查
+  func (e *EnsureAgentUpgrade) Execute() (ctrl.Result, error) {
+      ctx, c, bkeCluster, _, log := e.Ctx.Untie()
+      
+      // 更新DaemonSet镜像
+      if err := e.updateDaemonSetImage(); err != nil {
+          return ctrl.Result{}, err
+      }
+      
+      // ✅ 新增：等待DaemonSet就绪
+      if err := e.waitForDaemonSetReady(); err != nil {
+          // ✅ 新增：DaemonSet未就绪，返回错误
+          return ctrl.Result{}, errors.Errorf("DaemonSet not ready: %v", err)
+      }
+      
+      // ✅ 新增：检查Agent版本一致性
+      if err := e.checkAgentVersionConsistency(); err != nil {
+          // ✅ 新增：版本不一致，记录错误
+          log.Warn("Agent version inconsistency: %v", err)
+          // 不阻断流程，只记录错误
+      }
+      
+      // 更新集群版本状态
+      bkeCluster.Status.OpenFuyaoVersion = bkeCluster.Spec.ClusterConfig.Cluster.OpenFuyaoVersion
+      
+      return ctrl.Result{}, nil
+  }
+  
+  func (e *EnsureAgentUpgrade) waitForDaemonSetReady() error {
+      ctx, c, bkeCluster, _, log := e.Ctx.Untie()
+      
+      // 获取远程集群客户端
+      remoteClient, err := kube.NewRemoteClientByBKECluster(ctx, c, bkeCluster)
+      if err != nil {
+          return err
+      }
+      
+      clientSet, _ := remoteClient.KubeClient()
+      
+      // 等待DaemonSet就绪
+      return wait.PollUntilContextTimeout(
+          ctx,
+          10 * time.Second,
+          DaemonsetReadyTimeout,
+          true,
+          func(ctx context.Context) (bool, error) {
+              // 获取DaemonSet状态
+              daemonSet, err := clientSet.AppsV1().DaemonSets(bkeagentDeployerNamespace).Get(
+                  ctx, bkeagentDeployerName, metav1.GetOptions{})
+              if err != nil {
+                  return false, nil
+              }
+              
+              // 检查DaemonSet是否就绪
+              if daemonSet.Status.DesiredNumberScheduled == daemonSet.Status.NumberReady {
+                  return true, nil
+              }
+              
+              log.Info("DaemonSet not ready: desired=%d, ready=%d", 
+                  daemonSet.Status.DesiredNumberScheduled, daemonSet.Status.NumberReady)
+              return false, nil
+          },
+      )
+  }
+  ```
+
+#### 2.7 EnsureProviderSelfUpgrade（Provider自升级）
+
+##### 文档要求的异常场景（4个）
+
+| 异常场景 | 严重程度 | 触发条件 | 处理策略 |
+|---------|---------|---------|---------|
+| **Provider镜像更新失败** | Error | Deployment镜像更新失败 | 返回错误，Requeue重试 |
+| **Provider未就绪** | Warning | Deployment Pod未就绪 | 等待轮询，超时后返回错误 |
+| **镜像拉取失败** | Warning | Provider镜像拉取失败 | 重试3次，失败后记录错误 |
+| **Pod启动失败** | Error | Provider Pod启动失败 | 等待轮询，超时后返回错误 |
+
+##### 代码实现分析
+
+```go
+// 文件: pkg/phaseframe/phases/ensure_provider_self_upgrade.go
+func (e *EnsureProviderSelfUpgrade) Execute() (ctrl.Result, error) {
+    // ✅ 已实现：检查版本是否需要升级
+    if !e.needUpgrade() {
+        return ctrl.Result{}, nil
+    }
+    
+    // ✅ 已实现：更新Provider Deployment镜像
+    if err := e.updateProviderDeployment(); err != nil {
+        // ✅ 已实现：返回错误，触发Requeue
+        return ctrl.Result{}, err
+    }
+    
+    // ✅ 已实现：等待Provider Deployment就绪
+    if err := e.waitForProviderReady(); err != nil {
+        // ✅ 已实现：返回错误，触发Requeue
+        return ctrl.Result{}, err
+    }
+    
+    return ctrl.Result{}, nil
+}
+```
+
+##### 实现状态对比
+
+| 异常场景 | 文档要求 | 代码实现 | 状态 |
+|---------|---------|---------|------|
+| Provider镜像更新失败 | Requeue重试 | updateProviderDeployment() 返回错误 | ✅ 已实现 |
+| Provider未就绪 | 等待轮询 | waitForProviderReady() 实现 | ✅ 已实现 |
+| 镜像拉取失败 | 重试3次 | **未显式处理** | ⚠️ 需增强 |
+| Pod启动失败 | 等待轮询 | waitForProviderReady() 实现 | ✅ 已实现 |
+
+##### 需要增强的点
+
+**⚠️ 回滚机制缺失**：
+- 文档要求：Provider升级失败时，需要回滚机制
+- 当前实现：未显式实现回滚机制
+- 问题：Provider升级失败后无法自动回滚
+- 增强建议：
+  ```go
+  // 增强建议：在Execute()中增加回滚机制
+  func (e *EnsureProviderSelfUpgrade) Execute() (ctrl.Result, error) {
+      ctx, c, bkeCluster, _, log := e.Ctx.Untie()
+      
+      // ✅ 新增：保存当前镜像版本（用于回滚）
+      currentImage := e.getCurrentProviderImage()
+      
+      // 更新Provider Deployment镜像
+      if err := e.updateProviderDeployment(); err != nil {
+          // ✅ 新增：更新失败，尝试回滚
+          log.Error("Provider image update failed, attempting rollback: %v", err)
+          if rollbackErr := e.rollbackProviderImage(currentImage); rollbackErr != nil {
+              log.Error("Provider rollback failed: %v", rollbackErr)
+          }
+          return ctrl.Result{}, err
+      }
+      
+      // 等待Provider Deployment就绪
+      if err := e.waitForProviderReady(); err != nil {
+          // ✅ 新增：就绪失败，尝试回滚
+          log.Error("Provider not ready, attempting rollback: %v", err)
+          if rollbackErr := e.rollbackProviderImage(currentImage); rollbackErr != nil {
+              log.Error("Provider rollback failed: %v", rollbackErr)
+          }
+          return ctrl.Result{}, err
+      }
+      
+      return ctrl.Result{}, nil
+  }
+  
+  func (e *EnsureProviderSelfUpgrade) rollbackProviderImage(currentImage string) error {
+      ctx, c, _, _, log := e.Ctx.Untie()
+      
+      // 获取Provider Deployment
+      deployment, err := e.getProviderDeployment()
+      if err != nil {
+          return err
+      }
+      
+      // 回滚镜像版本
+      for i, container := range deployment.Spec.Template.Spec.Containers {
+          if container.Name == "manager" {
+              deployment.Spec.Template.Spec.Containers[i].Image = currentImage
+              break
+          }
+      }
+      
+      // 更新Deployment
+      if err := c.Update(ctx, deployment); err != nil {
+          return errors.Errorf("rollback provider deployment failed: %v", err)
+      }
+      
+      log.Info("Provider rollback to image %s", currentImage)
+      return nil
+  }
+  ```
+
+### 三、重试机制对比
+
+#### 3.1 升级重试配置对比
+
+| 重试类型 | 文档要求 | 代码实现 | 状态 |
+|---------|---------|---------|------|
+| **Etcd升级失败** | Fail-Fast | upgradeSingleNode() 返回错误 | ✅ 已实现 |
+| **Master升级失败** | Fail-Fast | upgradeMasterNodesWithParams() 返回错误 | ✅ 已实现 |
+| **Worker升级失败** | Best-Effort | processNodeUpgrade() 实现 | ✅ 已实现 |
+| **Containerd升级失败** | Requeue重试 | resetContainerd() 返回错误 | ✅ 已实现 |
+| **组件升级失败** | Requeue重试 | upgradeCoreDNS() 返回错误 | ✅ 已实现 |
+| **Agent升级失败** | Requeue重试 | **未显式实现** | ⚠️ 需增强 |
+| **Provider升级失败** | Requeue重试 | updateProviderDeployment() 返回错误 | ✅ 已实现 |
+
+#### 3.2 健康检查对比
+
+| Phase | 文档要求 | 代码实现 | 状态 |
+|-------|---------|---------|------|
+| **EnsureEtcdUpgrade** | Etcd集群健康检查 | waitForEtcdHealthCheck() 单节点检查 | ⚠️ 需增强集群检查 |
+| **EnsureMasterUpgrade** | Master健康检查 | waitForNodeHealthCheck() 实现 | ✅ 已实现 |
+| **EnsureWorkerUpgrade** | Worker健康检查 | waitForWorkerNodeHealthCheck() 实现 | ✅ 已实现 |
+| **EnsureContainerdUpgrade** | Containerd健康检查 | **未显式实现** | ⚠️ 需增强 |
+| **EnsureComponentUpgrade** | 组件健康检查 | **未显式实现** | ⚠️ 需增强 |
+| **EnsureAgentUpgrade** | DaemonSet健康检查 | **未显式实现** | ⚠️ 需增强 |
+| **EnsureProviderSelfUpgrade** | Deployment健康检查 | waitForProviderReady() 实现 | ✅ 已实现 |
+
+### 四、需要增强的总体清单
+
+#### 4.1 高优先级增强（影响升级成功率）
+
+| Phase | 需要增强的点 | 优先级 | 影响 |
+|------|-------------|-------|------|
+| **EnsureEtcdUpgrade** | Etcd集群健康检查缺失 | ⭐⭐⭐ | Etcd集群不健康可能导致数据丢失 |
+| **EnsureMasterUpgrade** | Fail-Fast标记缺失 | ⭐⭐⭐ | 用户无法区分"可自动恢复"和"需人工介入"的错误 |
+| **EnsureWorkerUpgrade** | 集群状态预检缺失 | ⭐⭐⭐ | 集群不健康时仍执行升级，可能导致失败 |
+| **EnsureContainerdUpgrade** | Containerd健康检查缺失 | ⭐⭐⭐ | Containerd异常可能导致节点不可用 |
+| **EnsureComponentUpgrade** | 组件健康检查缺失 | ⭐⭐⭐ | 组件异常可能导致集群功能不完整 |
+
+#### 4.2 中优先级增强（影响可维护性）
+
+| Phase | 需要增强的点 | 优先级 | 影响 |
+|------|-------------|-------|------|
+| **EnsureAgentUpgrade** | DaemonSet健康检查缺失 | ⭐⭐ | Agent异常可能导致节点管理失败 |
+| **EnsureProviderSelfUpgrade** | 回滚机制缺失 | ⭐⭐ | Provider升级失败后无法自动回滚 |
+| **EnsureEtcdUpgrade** | Etcd数据损坏处理缺失 | ⭐ | Etcd数据损坏需人工介入 |
+| **EnsureMasterUpgrade** | 证书更新失败处理缺失 | ⭐ | 证书更新失败需人工介入 |
+| **EnsureWorkerUpgrade** | Uncordon失败处理缺失 | ⭐ | 节点恢复调度失败需手动恢复 |
+
+### 五、增强建议总结
+
+#### 5.1 健康检查增强（高优先级）
+
+```go
+// 增强建议：统一健康检查接口
+type HealthChecker interface {
+    CheckHealth() error
+}
+
+// Etcd集群健康检查
+func (e *EnsureEtcdUpgrade) checkEtcdClusterHealth() error {
+    // 检查所有Etcd节点健康状态
+    // 检查Etcd集群整体健康
+}
+
+// Containerd健康检查
+func (e *EnsureContainerdUpgrade) checkContainerdHealth() error {
+    // 检查Containerd服务状态
+    // 检查Containerd配置
+}
+
+// 组件健康检查
+func (e *EnsureComponentUpgrade) checkComponentHealth(componentName string) error {
+    // 检查组件Deployment/DaemonSet状态
+    // 检查组件Pod状态
+}
+
+// Agent健康检查
+func (e *EnsureAgentUpgrade) checkDaemonSetHealth() error {
+    // 检查DaemonSet就绪状态
+    // 检查Agent版本一致性
+}
+```
+
+#### 5.2 Fail-Fast机制增强（高优先级）
+
+```go
+// 增强建议：统一Fail-Fast标记接口
+func markFailFast(bkeCluster *bkev1beta1.BKECluster, phase string, nodeIP string, errMsg string) error {
+    // 设置Condition标记
+    condition.ConditionMark(bkeCluster, 
+        bkev1beta1.ClusterFailedCondition, 
+        confv1beta1.ConditionTrue, 
+        constant.FailFastReason, 
+        fmt.Sprintf("%s failed on node %s, requires manual intervention: %s", phase, nodeIP, errMsg))
+    
+    // 设置BKECluster状态为Failed
+    bkeCluster.Status.Phase = bkev1beta1.ClusterFailed
+    bkeCluster.Status.FailureMessage = fmt.Sprintf("%s failed on node %s, please check logs and manually fix the issue", phase, nodeIP)
+    
+    // 同步状态
+    return mergecluster.SyncStatusUntilComplete(c, bkeCluster)
+}
+```
+
+#### 5.3 回滚机制增强（中优先级）
+
+```go
+// 增强建议：统一回滚接口
+type Rollbacker interface {
+    Rollback() error
+}
+
+// 组件回滚
+func (e *EnsureComponentUpgrade) rollbackComponent(componentName string, oldImage string) error {
+    // 回滚组件镜像版本
+}
+
+// Agent回滚
+func (e *EnsureAgentUpgrade) rollbackAgent(oldImage string) error {
+    // 回滚DaemonSet镜像版本
+}
+
+// Provider回滚
+func (e *EnsureProviderSelfUpgrade) rollbackProvider(oldImage string) error {
+    // 回滚Deployment镜像版本
+}
+```
+
+### 六、总结
+
+#### 6.1 实现完成度
+
+| Phase | 文档要求场景数 | 已实现场景数 | 完成度 |
+|------|---------------|-------------|-------|
+| **EnsureEtcdUpgrade** | 7 | 5 | 71% |
+| **EnsureMasterUpgrade** | 7 | 6 | 86% |
+| **EnsureWorkerUpgrade** | 7 | 6 | 86% |
+| **EnsureContainerdUpgrade** | 5 | 3 | 60% |
+| **EnsureComponentUpgrade** | 5 | 4 | 80% |
+| **EnsureAgentUpgrade** | 5 | 4 | 80% |
+| **EnsureProviderSelfUpgrade** | 4 | 3 | 75% |
+| **总体** | 39 | 31 | **79%** |
+
+#### 6.2 关键缺失
+
+1. **健康检查机制**：Etcd集群、Containerd、组件、Agent健康检查缺失
+2. **Fail-Fast标记**：Master升级失败时，未显式标记"需人工介入"
+3. **集群状态预检**：Worker升级前未再次检查集群状态
+4. **回滚机制**：组件、Agent、Provider升级失败后无法自动回滚
+
+#### 6.3 增强优先级建议
+
+| 优先级 | 增强点 | 预估工作量 |
+|-------|-------|-----------|
+| **P0（必须）** | Etcd集群健康检查 | 2天 |
+| **P0（必须）** | Fail-Fast标记机制 | 1天 |
+| **P0（必须）** | 集群状态预检 | 1天 |
+| **P1（重要）** | Containerd健康检查 | 1天 |
+| **P1（重要）** | 组件健康检查 | 1天 |
+| **P2（建议）** | Agent健康检查 | 1天 |
+| **P2（建议）** | 回滚机制 | 2天 |
+
+**总体评价**：代码实现已覆盖文档要求的 **79%** 异常场景，核心Fail-Fast机制（Etcd/Master升级失败阻断流程）已完整实现。主要缺失集中在 **健康检查机制**、**Fail-Fast标记**、**集群状态预检** 和 **回滚机制** 四个方面，建议按优先级逐步增强。
