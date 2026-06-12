@@ -30,12 +30,11 @@ import (
 	"github.com/moby/sys/signal"
 	"github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/util/wait"
 	pb "k8s.io/cri-api/pkg/apis/runtime/v1"
 
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 // ContainerdClient is an interface for containerd operations
@@ -270,7 +269,7 @@ func getStopSignal(labels map[string]string) (syscall.Signal, error) {
 // resumeTask resumes the task if paused
 func resumeTask(task containerd.Task, container containerd.Container, ctx context.Context) error {
 	if err := task.Resume(ctx); err != nil {
-		logrus.Warnf("Cannot unpause container %s: %s", container.ID(), err)
+		log.Warnf("Cannot unpause container %s: %s", container.ID(), err)
 	} else {
 		// no need to do it again when send sigkill signal
 	}
@@ -552,7 +551,7 @@ func WaitContainerdReady() error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(ContainerdReadyTimeoutMinutes)*time.Minute)
 	defer cancel()
 	err := wait.PollImmediateUntil(time.Duration(ContainerdReadyPollIntervalSeconds)*time.Second, func() (bool, error) {
-		log.Infof("Waiting for containerd to be ready")
+		log.Debugf("Waiting for containerd to be ready")
 		_, err := NewContainedClient()
 		if err == nil {
 			return true, nil

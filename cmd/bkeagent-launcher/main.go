@@ -25,7 +25,7 @@ import (
 
 	"k8s.io/client-go/tools/clientcmd"
 
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 const (
@@ -206,6 +206,31 @@ func prepareNodeFile(nodeName string) error {
 	return copyFile(nodeSrc, nodeDst)
 }
 
+func trimNodeName(content string) string {
+	return strings.TrimSpace(content)
+}
+
+func readNodeNameFromHost(hostPath string) (string, error) {
+	out, err := executeCommand(fmt.Sprintf("cat %s", hostPath))
+	if err != nil {
+		return "", err
+	}
+	return trimNodeName(out), nil
+}
+
+func resolveNodeName() (string, error) {
+	nodeName, err := readNodeNameFromHost(nodeDst)
+	if err != nil {
+		return "", fmt.Errorf("read host node file %s: %w", nodeDst, err)
+	}
+	if nodeName != "" {
+		log.Infof("use node name from host %s: %s", nodeDst, nodeName)
+		return nodeName, nil
+	}
+
+	return "", fmt.Errorf("node name is empty, please set %s on the host before launcher starts", nodeDst)
+}
+
 // startPre 启动前准备工作
 func startPre() error {
 	_, err := executeCommand("systemctl stop bkeagent")
@@ -213,7 +238,7 @@ func startPre() error {
 		return err
 	}
 
-	nodeName, err := getHostname()
+	nodeName, err := resolveNodeName()
 	if err != nil {
 		return err
 	}

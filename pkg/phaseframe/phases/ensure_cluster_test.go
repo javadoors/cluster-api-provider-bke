@@ -259,9 +259,9 @@ func TestEnsureClusterDeletingState(t *testing.T) {
 func TestMergeLabels(t *testing.T) {
 	nodeLabels := []confv1beta1.Label{{Key: "node-key", Value: "node-val"}}
 	globalLabels := []confv1beta1.Label{{Key: "global-key", Value: "global-val"}, {Key: "node-key", Value: "override"}}
-	
+
 	result := mergeLabels(nodeLabels, globalLabels)
-	
+
 	if result["node-key"] != "node-val" {
 		t.Errorf("Expected node-key=node-val, got %s", result["node-key"])
 	}
@@ -283,7 +283,7 @@ func TestIsClusterInSpecialState(t *testing.T) {
 		{"Paused", v1beta1.ClusterPaused, true},
 		{"Upgrading", v1beta1.ClusterUpgrading, true},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cluster := &v1beta1.BKECluster{
@@ -301,12 +301,12 @@ func TestGetNodeLabels(t *testing.T) {
 		"node1": {"key1": "val1"},
 		"node2": {"key2": "val2"},
 	}
-	
+
 	labels, found := getNodeLabels("node1", labelMap)
 	if !found || labels["key1"] != "val1" {
 		t.Error("Failed to get node1 labels")
 	}
-	
+
 	_, found = getNodeLabels("node3", labelMap)
 	if found {
 		t.Error("Should not find node3")
@@ -327,10 +327,10 @@ func TestEnsureCluster_UpdateClusterVersionStatus(t *testing.T) {
 		},
 		Status: confv1beta1.BKEClusterStatus{},
 	}
-	
+
 	e := &EnsureCluster{}
 	e.updateClusterVersionStatus(cluster)
-	
+
 	if cluster.Status.KubernetesVersion != "v1.24.0" {
 		t.Errorf("Expected KubernetesVersion v1.24.0, got %s", cluster.Status.KubernetesVersion)
 	}
@@ -345,10 +345,10 @@ func TestEnsureCluster_BuildNodeLabelsMap(t *testing.T) {
 		{Hostname: "node1", Labels: []confv1beta1.Label{{Key: "node", Value: "val1"}}},
 		{Hostname: "node2", Labels: []confv1beta1.Label{}},
 	}
-	
+
 	e := &EnsureCluster{}
 	result := e.buildNodeLabelsMap(globalLabels, nodes)
-	
+
 	if len(result) != 2 {
 		t.Errorf("Expected 2 nodes in map, got %d", len(result))
 	}
@@ -400,7 +400,7 @@ func TestEnsureCluster_ApplyLabelsToNode(t *testing.T) {
 	labelMap := map[string]map[string]string{
 		"other-node": {"key": "val"},
 	}
-	
+
 	err := e.applyLabelsToNode(nil, node, labelMap)
 	if err != nil {
 		t.Errorf("applyLabelsToNode should not error for non-matching node: %v", err)
@@ -411,12 +411,12 @@ func TestEnsureCluster_ApplyNecessaryLabels(t *testing.T) {
 	e := &EnsureCluster{}
 	node := &corev1.Node{
 		ObjectMeta: v1.ObjectMeta{
-			Name: "test-node",
+			Name:   "test-node",
 			Labels: map[string]string{"existing": "value"},
 		},
 	}
 	labels := map[string]string{"existing": "value"}
-	
+
 	err := e.applyNecessaryLabels(nil, node, labels)
 	if err != nil {
 		t.Errorf("applyNecessaryLabels should not error when labels match: %v", err)

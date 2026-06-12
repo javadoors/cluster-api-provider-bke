@@ -24,11 +24,11 @@ import (
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
-	bkesource "gopkg.openfuyao.cn/cluster-api-provider-bke/common/source"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/crontab"
 
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
 	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
+	bkesource "gopkg.openfuyao.cn/cluster-api-provider-bke/common/source"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/crontab"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/executor/exec"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	runtimeutils "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/runtime"
@@ -710,11 +710,8 @@ func TestCheckHostHostnameMatch(t *testing.T) {
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
 
-	testHostname := "PC1SV6SV"
-
-	patches.ApplyFunc(os.Hostname, func() (string, error) {
-		return testHostname, nil
-	})
+	testHostname, err := os.Hostname()
+	assert.NoError(t, err)
 
 	patches.ApplyFunc(utils.HostName, func() string {
 		return testHostname
@@ -734,19 +731,19 @@ func TestCheckHostHostnameMatch(t *testing.T) {
 		extraHosts:   "",
 		clusterHosts: nil,
 	}
-	err := ep.checkHost()
+	err = ep.checkHost()
 	assert.NoError(t, err)
 }
 
-func TestCheckHostHostnameMismatch(t *testing.T) {
+func TestCheckHostBKENodeNameMismatch(t *testing.T) {
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
 
 	patches.ApplyFunc(os.Hostname, func() (string, error) {
-		return "actual-hostname", nil
+		return "os-hostname", nil
 	})
 	patches.ApplyFunc(utils.HostName, func() string {
-		return "expected-hostname"
+		return "bke-node-1"
 	})
 
 	ep := &EnvPlugin{
@@ -754,10 +751,40 @@ func TestCheckHostHostnameMismatch(t *testing.T) {
 		machine:      NewMachine(),
 		extraHosts:   "",
 		clusterHosts: nil,
+		currenNode: bkenode.Node{
+			Hostname: "bke-node-2",
+		},
 	}
 	err := ep.checkHost()
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "Hostname is not match")
+	assert.Contains(t, err.Error(), "BKE node name is not match")
+}
+
+func TestCheckHostOSHostnameDiffersAllowed(t *testing.T) {
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+
+	patches.ApplyFunc(os.Hostname, func() (string, error) {
+		return "os-hostname", nil
+	})
+	patches.ApplyFunc(utils.HostName, func() string {
+		return "bke-node-1"
+	})
+	patches.ApplyFunc(NewHostsFile, func(path string) (*HostsFile, error) {
+		return &HostsFile{}, nil
+	})
+
+	ep := &EnvPlugin{
+		scope:        "hosts",
+		machine:      NewMachine(),
+		extraHosts:   "",
+		clusterHosts: nil,
+		currenNode: bkenode.Node{
+			Hostname: "bke-node-1",
+		},
+	}
+	err := ep.checkHost()
+	assert.NoError(t, err)
 }
 
 func TestCheckHostHostnameError(t *testing.T) {

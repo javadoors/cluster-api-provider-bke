@@ -19,19 +19,28 @@ import (
 )
 
 var (
-	MetricsAddr           string
-	EnableLeaderElection  bool
-	ProbeAddr             string
-	ProbeScheme           string // "http" or "https", default "http"
-	ProbePort             int    // Port for HTTPS health probe, default 9444
-	WebhookCertDir        string
-	WebhookPort           int
-	WebhookHost           string
-	BkeClusterConcurrency int
-	BkeMachineConcurrency int
-	E2EMode               bool
-	EnableInternalUpdate  bool
+	MetricsAddr            string
+	EnableLeaderElection   bool
+	ProbeAddr              string
+	ProbeScheme            string // "http" or "https", default "http"
+	ProbePort              int    // Port for HTTPS health probe, default 9444
+	WebhookCertDir         string
+	WebhookPort            int
+	WebhookHost            string
+	BkeClusterConcurrency  int
+	BkeMachineConcurrency  int
+	E2EMode                bool
+	EnableInternalUpdate   bool
+	OCIDigestCheckInterval int
+	OCIRegistryUsername    string
+	OCIRegistryPassword    string
+	OCIRegistryInsecure    bool
+	EnableOCIDigestMonitor bool
+	DeclarativeUpgrade     bool
+	ReleaseCacheDir        string
 )
+
+const DefaultReleaseCacheDir = "/var/lib/bke/release-cache"
 
 func ConfigurationFlag() {
 	flag.BoolVar(&E2EMode, "e2e-mode", false, "Enable e2e mode")
@@ -49,4 +58,13 @@ func ConfigurationFlag() {
 	flag.IntVar(&BkeClusterConcurrency, "bke-cluster-concurrency", constant.DefaultConcurrency, "Number of BKECluster to process simultaneously")
 	flag.IntVar(&BkeMachineConcurrency, "bke-machine-concurrency", constant.DefaultConcurrency, "Number of BKEMachine to process simultaneously")
 	flag.BoolVar(&EnableInternalUpdate, "enable-internal-update", false, "Enable internal update")
+	flag.IntVar(&OCIDigestCheckInterval, "oci-digest-check-interval", 300, "OCI digest check interval in seconds for UpgradePath monitor. Default: 300 (5 minutes)")
+	flag.StringVar(&OCIRegistryUsername, "oci-registry-username", "", "Username for OCI registry authentication (used by UpgradePath digest monitor)")
+	flag.StringVar(&OCIRegistryPassword, "oci-registry-password", "", "Password for OCI registry authentication (used by UpgradePath digest monitor)")
+	flag.BoolVar(&OCIRegistryInsecure, "oci-registry-insecure-skip-verify", true, "Skip TLS cert verification when pulling OCI artifacts (INSECURE, use only in trusted env)")
+	flag.BoolVar(&EnableOCIDigestMonitor, "enable-oci-digest-monitor", true, "Enable OCI digest monitor for UpgradePath controller")
+	flag.BoolVar(&DeclarativeUpgrade, "declarative-upgrade", false,
+		"Enable declarative upgrade DAG driven by ReleaseImage and ComponentFactory")
+	flag.StringVar(&ReleaseCacheDir, "release-cache-dir", DefaultReleaseCacheDir,
+		"Directory for validated release image bundle disk cache (mount hostPath here in production)")
 }

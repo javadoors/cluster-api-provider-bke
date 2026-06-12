@@ -36,7 +36,7 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/clusterutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/condition"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/constant"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 const (
@@ -47,8 +47,6 @@ const (
 	deployCACrt = deployCertDir + "/trust-chain.crt"
 	// certConfigDir  is the certification config path for saving
 	certConfigDir = deployCertDir + "/cert_config"
-	// ServiceFilePermission is the file permission for service files
-	ServiceFilePermission = 0644
 )
 
 type EnsureBKEAgent struct {
@@ -135,30 +133,32 @@ func (e *EnsureBKEAgent) loadLocalKubeConfig() error {
 	if !hasClusterAPI {
 		localKubeConfig, err = phaseutil.GetLeastPrivilegeKubeConfig(ctx, c)
 		if err != nil {
-			log.Warn(constant.BKEAgentNotReadyReason, "Failed to get least privilege kubeconfig, fallback to local kubeconfig, err：%v", err)
+			log.Warn(constant.BKEAgentNotReadyReason,
+				"Failed to get least privilege kubeconfig, fallback to local kubeconfig, err: %v",
+				err)
 			// 回退到使用 localKubeConfig，不需要创建 RBAC
 			localKubeConfig, err = phaseutil.GetLocalKubeConfig(ctx, c)
 			if err != nil {
-				log.Error(constant.BKEAgentNotReadyReason, "Failed to get local kubeconfig after fallback, err：%v", err)
+				log.Error(constant.BKEAgentNotReadyReason, "Failed to get local kubeconfig after fallback, err: %v", err)
 				return errors.Wrap(err, "failed to get local kubeconfig after fallback")
 			}
 		} else {
 			// GetLeastPrivilegeKubeConfig 成功，需要创建 RBAC
 			localKubeConfigBytes, err := phaseutil.GetLocalKubeConfig(ctx, c)
 			if err != nil {
-				log.Error(constant.BKEAgentNotReadyReason, "Failed to get localkubeconfig for RBAC creation, err：%v", err)
+				log.Error(constant.BKEAgentNotReadyReason, "Failed to get localkubeconfig for RBAC creation, err: %v", err)
 				return errors.Wrap(err, "failed to get localkubeconfig for RBAC creation")
 			}
 
 			if err := phaseutil.CreateBKEAgentRBACWithLocalKubeConfig(ctx, localKubeConfigBytes, bkeCluster); err != nil {
-				log.Warn(constant.BKEAgentNotReadyReason, "Failed to create RBAC resources, err：%v", err)
+				log.Warn(constant.BKEAgentNotReadyReason, "Failed to create RBAC resources, err: %v", err)
 				return errors.Wrap(err, "failed to create RBAC resources")
 			}
 		}
 	} else {
 		localKubeConfig, err = phaseutil.GetLocalKubeConfig(ctx, c)
 		if err != nil {
-			log.Error(constant.BKEAgentNotReadyReason, "Failed to get local kubeconfig, err：%v", err)
+			log.Error(constant.BKEAgentNotReadyReason, "Failed to get local kubeconfig, err: %v", err)
 			return errors.Wrap(err, "failed to get local kubeconfig")
 		}
 	}
@@ -232,25 +232,13 @@ func (e *EnsureBKEAgent) logPushAgentStart() {
 
 // prepareServiceFile prepares the bkeagent service file
 func (e *EnsureBKEAgent) prepareServiceFile(bkeCluster *bkev1beta1.BKECluster) (string, error) {
-	// generate bkeagent.service
 	dirName, err := os.MkdirTemp(os.TempDir(), e.Ctx.BKECluster.Name)
 	if err != nil {
 		return "", errors.Errorf("Failed to create temp dir, err: %v", err)
 	}
 
-	file, err := os.ReadFile("/bkeagent.service.tmpl")
-	if err != nil {
-		if removeErr := os.RemoveAll(dirName); removeErr != nil {
-			e.Ctx.Log.Warn("Failed to remove temporary directory: %v", removeErr.Error())
-		}
-		return "", errors.Errorf("Failed to read /bkeagent.service.tmpl, err: %v", err)
-	}
-
-	ntpServer := strings.ReplaceAll(string(file), "--ntpserver=", fmt.Sprintf("--ntpserver=%s", bkeCluster.Spec.ClusterConfig.Cluster.NTPServer))
-	healthPort := strings.ReplaceAll(ntpServer, "--health-port=", fmt.Sprintf("--health-port=%s", bkeCluster.Spec.ClusterConfig.Cluster.AgentHealthPort))
-
 	servicePath := filepath.Join(dirName, "bkeagent.service")
-	if err = os.WriteFile(servicePath, []byte(healthPort), ServiceFilePermission); err != nil {
+	if err := phaseutil.RenderBKEAgentServiceFile(bkeCluster, servicePath); err != nil {
 		if removeErr := os.RemoveAll(dirName); removeErr != nil {
 			e.Ctx.Log.Warn("Failed to remove temporary directory: %v", removeErr.Error())
 		}
@@ -263,16 +251,20 @@ func (e *EnsureBKEAgent) prepareServiceFile(bkeCluster *bkev1beta1.BKECluster) (
 // performAgentPush performs the actual agent push operation
 func (e *EnsureBKEAgent) performAgentPush(ctx context.Context, c client.Client, bkeCluster *bkev1beta1.BKECluster, servicePath string) ([]string, error) {
 	hosts := phaseutil.NodeToRemoteHost(e.needPushNodes)
+	workerNodes := e.needPushNodes.Worker()
 
 	var failedNodeIPs []string
 	failedNodesWithErr, err := e.sshPushAgent(ctx, hosts, e.localKubeConfig, servicePath)
 	for nodeIP, errInfos := range failedNodesWithErr {
 		failedNodeIPs = append(failedNodeIPs, nodeIP)
-		if setErr := e.Ctx.SetNodeStateWithMessage(nodeIP, bkev1beta1.NodeInitFailed, fmt.Sprintf("Failed push bkeagent, err: %v", errInfos)); setErr != nil {
-			e.Ctx.Log.Warn("Failed to set node state for %s: %v", nodeIP, setErr)
-		}
-		if err := e.Ctx.NodeFetcher().SetNodeNeedSkip(ctx, bkeCluster.Namespace, bkeCluster.Name, nodeIP, true); err != nil {
-			e.Ctx.Log.Warn("Failed to set skip node error for %s: %v", nodeIP, err)
+		if err := e.Ctx.NodeFetcher().UpdateNodeStatusByIPForCluster(ctx, bkeCluster, nodeIP, func(status *confv1beta1.BKENodeStatus) {
+			status.State = bkev1beta1.NodeInitFailed
+			status.Message = fmt.Sprintf("Failed push bkeagent, err: %v", errInfos)
+			if workerNodes.Filter(bkenode.FilterOptions{"IP": nodeIP}).Length() > 0 {
+				status.NeedSkip = true
+			}
+		}); err != nil {
+			e.Ctx.Log.Warn(constant.InternalErrorReason, "Failed to update failed push status for %s: %v", nodeIP, err)
 		}
 		e.Ctx.Log.Error(constant.BKEAgentNotReadyReason, errInfos.Error())
 	}
@@ -345,7 +337,8 @@ func (e *EnsureBKEAgent) prepareFileUploadList(servicePath string) []bkessh.File
 func (e *EnsureBKEAgent) addGlobalCAFilesIfNeeded(fileUpList []bkessh.File) []bkessh.File {
 	_, _, bkeCluster, _, _ := e.Ctx.Untie()
 
-	if bkeCluster == nil || bkeCluster.Spec.ClusterConfig.Addons == nil || len(bkeCluster.Spec.ClusterConfig.Addons) == 0 {
+	if bkeCluster == nil || bkeCluster.Spec.ClusterConfig == nil ||
+		bkeCluster.Spec.ClusterConfig.Addons == nil || len(bkeCluster.Spec.ClusterConfig.Addons) == 0 {
 		return fileUpList
 	}
 
@@ -377,11 +370,11 @@ func (e *EnsureBKEAgent) addFilesToUploadList(fileUpList []bkessh.File, filePath
 				Src: filePath,
 				Dst: dstDir,
 			})
-			log.Infof("file %s exists，upload to %s", filePath, dstDir)
+			log.Infof("file %s exists, upload to %s", filePath, dstDir)
 		} else if os.IsNotExist(err) {
-			log.Infof("file %s not exists，not upload ", filePath)
+			log.Infof("file %s not exists, not upload ", filePath)
 		} else {
-			log.Warnf("check %s err：%v，not upload ", filePath, err)
+			log.Warnf("check %s err: %v, not upload ", filePath, err)
 		}
 	}
 	return fileUpList
@@ -511,7 +504,7 @@ func (e *EnsureBKEAgent) executeStartCommand(multiCli *bkessh.MultiCli, localKub
 
 	// push and start bkeagent
 	startCommand := bkessh.Command{
-		FileUp: fileUpList, // 动态列表：仅包含存在的文件
+		FileUp: fileUpList, // 动态列表: 仅包含存在的文件
 		Cmds: bkessh.Commands{
 			//在要推送的 节点上创建文件夹，且权限正确
 			fmt.Sprintf("mkdir -p -m 755 %s ", deployCertDir),
@@ -604,29 +597,33 @@ func (e *EnsureBKEAgent) updateNodeStatus(
 ) {
 	ctx := e.Ctx.Context
 	nf := e.Ctx.NodeFetcher()
+	nodes, err := nf.GetNodesForBKECluster(ctx, bkeCluster)
+	if err != nil {
+		e.Ctx.Log.Warn("Failed to get nodes for role check: %v", err.Error())
+	}
+	workerNodes := nodes.Worker()
 
 	for _, node := range failedNodesInfo {
 		nodeIP := phaseutil.GetNodeIPFromCommandWaitResult(node)
-		if err := e.Ctx.SetNodeStateWithMessage(nodeIP, bkev1beta1.NodeInitFailed, "Failed ping bkeagent"); err != nil {
-			e.Ctx.Log.Warn("Failed to set node state for %s: %v", nodeIP, err)
-		}
-		if err := nf.UnmarkNodeStateFlagForCluster(ctx, bkeCluster, nodeIP, bkev1beta1.NodeAgentPushedFlag); err != nil {
-			e.Ctx.Log.Warn("Failed to unmark node state flag for %s: %v", nodeIP, err)
-		}
-		if err := nf.SetNodeNeedSkip(ctx, bkeCluster.Namespace, bkeCluster.Name, nodeIP, true); err != nil {
-			e.Ctx.Log.Warn("Failed to set skip node error for %s: %v", nodeIP, err)
+		if err := nf.UpdateNodeStatusByIPForCluster(ctx, bkeCluster, nodeIP, func(status *confv1beta1.BKENodeStatus) {
+			status.State = bkev1beta1.NodeInitFailed
+			status.Message = "Failed ping bkeagent"
+			status.StateCode &= ^bkev1beta1.NodeAgentPushedFlag
+			if workerNodes.Filter(bkenode.FilterOptions{"IP": nodeIP}).Length() > 0 {
+				status.NeedSkip = true
+			}
+		}); err != nil {
+			e.Ctx.Log.Warn("Failed to update node status for %s: %v", nodeIP, err)
 		}
 	}
 
 	for _, node := range successNodesInfo {
 		nodeIP := phaseutil.GetNodeIPFromCommandWaitResult(node)
-		if err := e.Ctx.SetNodeStateMessage(nodeIP, "BKEAgent is ready"); err != nil {
-			e.Ctx.Log.Warn(constant.InternalErrorReason, "Failed to set node state message for %s: %v", nodeIP, err)
-		}
-		if err := nf.MarkNodeStateFlagForCluster(ctx, bkeCluster, nodeIP, bkev1beta1.NodeAgentPushedFlag); err != nil {
-			e.Ctx.Log.Warn(constant.InternalErrorReason, "Failed to mark node state flag for %s: %v", nodeIP, err)
-		}
-		if err := nf.MarkNodeStateFlagForCluster(ctx, bkeCluster, nodeIP, bkev1beta1.NodeAgentReadyFlag); err != nil {
+		if err := nf.UpdateNodeStatusByIPForCluster(ctx, bkeCluster, nodeIP, func(status *confv1beta1.BKENodeStatus) {
+			status.Message = "BKEAgent is ready"
+			status.StateCode |= bkev1beta1.NodeAgentPushedFlag
+			status.StateCode |= bkev1beta1.NodeAgentReadyFlag
+		}); err != nil {
 			e.Ctx.Log.Warn(constant.InternalErrorReason, "Failed to mark node state flag for %s: %v", nodeIP, err)
 		}
 	}
@@ -670,14 +667,13 @@ func (e *EnsureBKEAgent) handleValidationFailure(err error) error {
 
 		for _, node := range e.needPushNodes {
 			log.Error(constant.HostNameNotUniqueReason, "IP: %s Hostname: %s", node.IP, node.Hostname)
-			if err := nf.UnmarkNodeStateFlagForCluster(ctx, bkeCluster, node.IP, bkev1beta1.NodeAgentPushedFlag); err != nil {
-				log.Warn("Failed to unmark node state flag for %s: %v", node.IP, err)
-			}
-			if err := nf.UnmarkNodeStateFlagForCluster(ctx, bkeCluster, node.IP, bkev1beta1.NodeAgentReadyFlag); err != nil {
-				log.Warn("Failed to unmark node state flag for %s: %v", node.IP, err)
-			}
-			if err := e.Ctx.SetNodeStateWithMessage(node.IP, bkev1beta1.NodeInitFailed, detailedMsg); err != nil {
-				log.Warn("Failed to set node state for %s: %v", node.IP, err)
+			if err := nf.UpdateNodeStatusByIPForCluster(ctx, bkeCluster, node.IP, func(status *confv1beta1.BKENodeStatus) {
+				status.StateCode &= ^bkev1beta1.NodeAgentPushedFlag
+				status.StateCode &= ^bkev1beta1.NodeAgentReadyFlag
+				status.State = bkev1beta1.NodeInitFailed
+				status.Message = detailedMsg
+			}); err != nil {
+				log.Warn("Failed to update node state for %s: %v", node.IP, err)
 			}
 		}
 	}

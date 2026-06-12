@@ -31,9 +31,10 @@ import (
 	bkevalidate "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/validation"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/common/security"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/nodeutil"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
-var bkeNodeLog = log.Named("BKENode")
+var bkeNodeLog = log.With("name", "BKENode")
 
 // bkeNodeGR is the GroupResource for BKENode, derived from BKENodeGVK
 var bkeNodeGR = schema.GroupResource{Group: confv1beta1.BKENodeGVK.Group, Resource: "bkenodes"}

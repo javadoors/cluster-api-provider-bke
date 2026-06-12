@@ -35,10 +35,10 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/mergecluster"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/upgrade"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/mfutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/constant"
-	l "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/log"
 )
 
 const (
@@ -139,7 +139,6 @@ type EnsureEtcdUpgrade struct {
 // It initializes the phase with the provided context and sets up the logger
 // with the phase name.
 func NewEnsureEtcdUpgrade(ctx *phaseframe.PhaseContext) phaseframe.Phase {
-	ctx.Log.NormalLogger = l.Named(EnsureEtcdUpgradeName.String())
 	base := phaseframe.NewBasePhase(ctx, EnsureEtcdUpgradeName)
 	return &EnsureEtcdUpgrade{BasePhase: base}
 }
@@ -156,33 +155,44 @@ func (e *EnsureEtcdUpgrade) Execute() (ctrl.Result, error) {
 // It compares the old and new BKECluster configurations to check if the etcd version
 // has changed and requires an upgrade operation.
 // Returns true if upgrade is needed, false otherwise.
+// Version returns the current running etcd version.
+func (e *EnsureEtcdUpgrade) Version() string {
+	if e.Ctx == nil || e.Ctx.BKECluster == nil {
+		return ""
+	}
+	return e.Ctx.BKECluster.Status.EtcdVersion
+}
+
+func (e *EnsureEtcdUpgrade) isEtcdNeedUpgrade(_ *bkev1beta1.BKECluster, new *bkev1beta1.BKECluster) bool {
+	if new == nil || new.Spec.ClusterConfig == nil {
+		return false
+	}
+	target := e.resolveEtcdUpgradeVersion()
+	return target != new.Status.EtcdVersion &&
+		len(target) != 0 &&
+		len(new.Status.EtcdVersion) != 0
+}
+
 func (e *EnsureEtcdUpgrade) NeedExecute(old *bkev1beta1.BKECluster, new *bkev1beta1.BKECluster) bool {
 	if !e.BasePhase.DefaultNeedExecute(old, new) {
 		return false
 	}
-
-	if new.Spec.ClusterConfig.Cluster.EtcdVersion == new.Status.EtcdVersion ||
-		len(new.Spec.ClusterConfig.Cluster.EtcdVersion) == 0 ||
-		len(new.Status.EtcdVersion) == 0 {
+	if !e.NeedExecuteWithVersionContext(upgrade.ComponentEtcd, old, new, e.isEtcdNeedUpgrade) {
 		return false
 	}
-
 	e.SetStatus(bkev1beta1.PhaseWaiting)
 	return true
 }
 
 func (e *EnsureEtcdUpgrade) reconcileEtcdUpgrade() (ctrl.Result, error) {
-	_, _, bkeCluster, _, log := e.Ctx.Untie()
-	if bkeCluster.Spec.ClusterConfig.Cluster.EtcdVersion != bkeCluster.Status.EtcdVersion &&
-		len(bkeCluster.Spec.ClusterConfig.Cluster.EtcdVersion) != 0 &&
-		len(bkeCluster.Status.EtcdVersion) != 0 {
-		ret, err := e.rolloutUpgrade()
-		if err != nil {
-			return ret, err
-		}
+	_, _, _, _, log := e.Ctx.Untie()
+
+	ret, err := e.rolloutUpgrade()
+	if err != nil {
+		return ret, err
 	}
 
-	log.Info(constant.EtcdUpgradedReason, "etcd version same, not need to upgrade")
+	log.Info(constant.EtcdUpgradedReason, "upgrade etcd success")
 	return ctrl.Result{}, nil
 }
 
@@ -218,15 +228,18 @@ func (e *EnsureEtcdUpgrade) filterUpgradeableNodes(
 	log *bkev1beta1.BKELogger,
 ) (bkenode.Nodes, error) {
 	needUpgradeNodes := bkenode.Nodes{}
-	// Use NodeFetcher to get BKENodes from API server
-	bkeNodes, err := e.Ctx.NodeFetcher().GetBKENodesWrapperForCluster(e.Ctx, bkeCluster)
+	specNodes, err := e.Ctx.NodeFetcher().GetNodesForBKECluster(e.Ctx, bkeCluster)
 	if err != nil {
-		log.Warn(constant.EtcdUpgradingReason, "failed to get BKENodes: %v", err)
-		return nil, errors.Wrap(err, "failed to get BKENodes")
+		log.Warn(constant.EtcdUpgradingReason, "failed to get cluster nodes: %v", err)
+		return nil, errors.Wrap(err, "failed to get cluster nodes")
 	}
-	nodes := phaseutil.GetNeedUpgradeEtcdsWithBKENodes(bkeCluster, bkeNodes)
+	etcdNodes := specNodes.Etcd()
+	if etcdNodes.Length() == 0 {
+		log.Info(constant.EtcdUpgradingReason, "no etcd role nodes in cluster spec")
+		return nil, errors.New("no etcd role nodes in cluster spec")
+	}
 
-	for _, node := range nodes {
+	for _, node := range etcdNodes {
 		nodeState, _ := e.Ctx.NodeFetcher().GetNodeStateFlagForCluster(e.Ctx, bkeCluster, node.IP, bkev1beta1.NodeAgentReadyFlag)
 		if !nodeState {
 			log.Info(constant.EtcdUpgradingReason, "agent is not ready at node %s, skip upgrade", phaseutil.NodeInfo(node))
@@ -236,8 +249,8 @@ func (e *EnsureEtcdUpgrade) filterUpgradeableNodes(
 	}
 
 	if len(needUpgradeNodes) == 0 {
-		log.Info(constant.EtcdUpgradingReason, "all the master node BKEAgent is not ready")
-		return nil, errors.New("all the master node BKEAgent is not ready")
+		log.Info(constant.EtcdUpgradingReason, "all etcd nodes BKEAgent is not ready")
+		return nil, errors.New("all etcd nodes BKEAgent is not ready")
 	}
 
 	return needUpgradeNodes, nil
@@ -278,12 +291,6 @@ func (e *EnsureEtcdUpgrade) upgradeNodes(params NodeUpgradeParams) error {
 }
 
 func (e *EnsureEtcdUpgrade) upgradeSingleNode(params SingleNodeUpgradeParams) error {
-	if skip, err := e.shouldSkipNode(params.BKECluster, params.Node, params.Log); err != nil {
-		return err
-	} else if skip {
-		return nil
-	}
-
 	nodeStatusParams := NodeStatusParams{
 		Client:     params.Client,
 		BKECluster: params.BKECluster,
@@ -297,7 +304,7 @@ func (e *EnsureEtcdUpgrade) upgradeSingleNode(params SingleNodeUpgradeParams) er
 		NeedBackup: params.NeedBackup,
 		BackupNode: params.BackupNode,
 		Node:       params.Node,
-		Version:    params.BKECluster.Spec.ClusterConfig.Cluster.EtcdVersion,
+		Version:    e.resolveEtcdUpgradeVersion(),
 	}
 	if err := e.upgradeEtcd(upgradeParams); err != nil {
 		failureParams := UpgradeFailureParams{
@@ -324,9 +331,10 @@ func (e *EnsureEtcdUpgrade) shouldSkipNode(
 		return false, errors.Errorf("get remote cluster pod resource failed, err: %v", err)
 	}
 
-	if strings.Contains(bkeCluster.Spec.ClusterConfig.Cluster.EtcdVersion, version) {
+	targetVersion := e.resolveEtcdUpgradeVersion()
+	if targetVersion != "" && strings.Contains(targetVersion, version) {
 		log.Info(constant.EtcdUpgradeSuccess, "etcd %q is already the expected version %q,skip upgrade",
-			phaseutil.NodeInfo(node), bkeCluster.Spec.ClusterConfig.Cluster.EtcdVersion)
+			phaseutil.NodeInfo(node), targetVersion)
 		return true, nil
 	}
 
@@ -353,12 +361,28 @@ func (e *EnsureEtcdUpgrade) handleUpgradeFailure(params UpgradeFailureParams) er
 	return errors.Errorf("upgrade node %q failed: %v", phaseutil.NodeInfo(params.Node), params.Error)
 }
 
+func (e *EnsureEtcdUpgrade) resolveEtcdUpgradeVersion() string {
+	if e.Ctx == nil || e.Ctx.BKECluster == nil {
+		return ""
+	}
+	if vc := e.Ctx.VersionContext; vc != nil {
+		if v := vc.GetTarget(upgrade.ComponentEtcd); v != "" {
+			return v
+		}
+	}
+	if e.Ctx.BKECluster.Spec.ClusterConfig == nil {
+		return ""
+	}
+	return e.Ctx.BKECluster.Spec.ClusterConfig.Cluster.EtcdVersion
+}
+
 func (e *EnsureEtcdUpgrade) finalizeUpgrade(
 	c client.Client,
 	bkeCluster *bkev1beta1.BKECluster,
 	log *bkev1beta1.BKELogger,
 ) (ctrl.Result, error) {
-	bkeCluster.Status.EtcdVersion = bkeCluster.Spec.ClusterConfig.Cluster.EtcdVersion
+	targetVersion := e.resolveEtcdUpgradeVersion()
+	bkeCluster.Status.EtcdVersion = targetVersion
 	var patchFuncs []mergecluster.PatchFunc
 
 	if err := mergecluster.SyncStatusUntilComplete(c, bkeCluster, patchFuncs...); err != nil {
@@ -369,6 +393,9 @@ func (e *EnsureEtcdUpgrade) finalizeUpgrade(
 
 func (e *EnsureEtcdUpgrade) upgradeEtcd(params EtcdUpgradeParams) error {
 	ctx, c, bkeCluster, scheme, log := e.Ctx.Untie()
+	if err := e.Ctx.SyncUpgradeTargetsToClusterSpec(); err != nil {
+		return errors.Wrap(err, "sync etcd upgrade target to cluster spec")
+	}
 
 	cmdParams := UpgradeCommandParams{
 		Ctx:        ctx,
@@ -428,6 +455,7 @@ func (e *EnsureEtcdUpgrade) createUpgradeCommand(params UpgradeCommandParams) co
 	if params.NeedBackup && params.Node.IP == params.BackupNode.IP {
 		upgrade.BackUpEtcd = true
 	}
+	upgrade.EtcdVersion = e.resolveEtcdUpgradeVersion()
 
 	return upgrade
 }

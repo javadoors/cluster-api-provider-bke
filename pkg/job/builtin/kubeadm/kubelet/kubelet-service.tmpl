@@ -4,6 +4,14 @@ Documentation=https://github.com/kubernetes/kubernetes
 After=containerd.service
 
 [Service]
+{{- range .KubeletService.Environment }}
+Environment="{{ . }}"
+{{- end }}
+
+{{- range .KubeletService.EnvironmentFile }}
+EnvironmentFile={{ . }}
+{{- end }}
+
 {{- if .KubeletService.ExecStart }}
 ExecStart={{ .KubeletService.ExecStart }}
 {{- end }}
@@ -54,14 +62,6 @@ User={{ .KubeletService.User }}
 
 {{- if .KubeletService.Group }}
 Group={{ .KubeletService.Group }}
-{{- end }}
-
-{{- range .KubeletService.Environment }}
-Environment="{{ . }}"
-{{- end }}
-
-{{- range .KubeletService.EnvironmentFile }}
-EnvironmentFile={{ . }}
 {{- end }}
 
 {{- if .KubeletService.CustomExtra }}

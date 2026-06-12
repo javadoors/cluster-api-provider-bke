@@ -17,6 +17,8 @@ import (
 	"os/exec"
 
 	"github.com/beevik/ntp"
+
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 // Date 同步本地时间到指定 NTP 服务器的时间
@@ -34,6 +36,6 @@ func Date(ntpServer string) error {
 		return fmt.Errorf("failed to set system time: %s, err: %w", string(out), err)
 	}
 
-	fmt.Println(string(out))
+	log.Info(string(out))
 	return nil
 }

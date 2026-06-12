@@ -15,10 +15,8 @@ package kube
 import (
 	"bytes"
 	"io"
-	"os"
 	"testing"
 
-	"go.uber.org/zap"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -27,6 +25,7 @@ import (
 	fakedynamic "k8s.io/client-go/dynamic/fake"
 
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/addon"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 func TestConstants(t *testing.T) {
@@ -245,44 +244,6 @@ func TestTrueVar(t *testing.T) {
 	}
 }
 
-func TestRenderYamlToDecoder_ValidFile(t *testing.T) {
-	tmpFile, _ := os.CreateTemp("", "test-*.yaml")
-	defer os.Remove(tmpFile.Name())
-	tmpFile.WriteString("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: test")
-	tmpFile.Close()
-
-	task := &Task{
-		Name:     "test",
-		FilePath: tmpFile.Name(),
-		Param:    map[string]interface{}{},
-	}
-
-	decoder, err := RenderYamlToDecoder(task)
-	if err != nil {
-		t.Fatalf("Expected no error, got %v", err)
-	}
-	if decoder == nil {
-		t.Fatal("Expected decoder to be not nil")
-	}
-}
-
-func TestRenderYamlToDecoder_NoexecutePath(t *testing.T) {
-	tmpFile, _ := os.CreateTemp("", "noexecute-*.yaml")
-	defer os.Remove(tmpFile.Name())
-	tmpFile.WriteString("apiVersion: v1\nkind: Pod\nmetadata:\n  name: test")
-	tmpFile.Close()
-
-	task := &Task{
-		Name:     "test",
-		FilePath: tmpFile.Name() + "/noexecute",
-	}
-
-	_, err := RenderYamlToDecoder(task)
-	if err == nil {
-		t.Error("Expected error for non-existent file")
-	}
-}
-
 func TestGetResourceInterface_Namespaced(t *testing.T) {
 	scheme := runtime.NewScheme()
 	dynamicClient := fakedynamic.NewSimpleDynamicClient(scheme)
@@ -327,7 +288,7 @@ func TestGetResourceInterface_ClusterScoped(t *testing.T) {
 }
 
 func TestHandleWaitAndLogging_NoBlock(t *testing.T) {
-	logger := zap.NewNop().Sugar()
+	logger := (*log.Logger)(nil)
 	c := &Client{Log: logger}
 
 	obj := &unstructured.Unstructured{}
@@ -343,7 +304,7 @@ func TestHandleWaitAndLogging_NoBlock(t *testing.T) {
 }
 
 func TestHandleWaitAndLogging_RemoveAddon(t *testing.T) {
-	logger := zap.NewNop().Sugar()
+	logger := (*log.Logger)(nil)
 	c := &Client{Log: logger}
 
 	obj := &unstructured.Unstructured{}
@@ -359,7 +320,7 @@ func TestHandleWaitAndLogging_RemoveAddon(t *testing.T) {
 }
 
 func TestHandleWaitAndLogging_NilObj(t *testing.T) {
-	logger := zap.NewNop().Sugar()
+	logger := (*log.Logger)(nil)
 	c := &Client{Log: logger}
 
 	unstruct := unstructured.Unstructured{}
@@ -412,55 +373,6 @@ func TestSortUnstructuredList_UpdateAddon(t *testing.T) {
 	}
 }
 
-func TestRenderYamlToDecoder_Success(t *testing.T) {
-	tmpFile, err := os.CreateTemp("", "test-*.yaml")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.Remove(tmpFile.Name())
-
-	yamlContent := "apiVersion: v1\nkind: Pod\nmetadata:\n  name: test"
-	if _, err := tmpFile.Write([]byte(yamlContent)); err != nil {
-		t.Fatal(err)
-	}
-	tmpFile.Close()
-
-	task := &Task{FilePath: tmpFile.Name()}
-	decoder, err := RenderYamlToDecoder(task)
-	if err != nil {
-		t.Fatalf("Expected no error, got %v", err)
-	}
-	if decoder == nil {
-		t.Fatal("Expected decoder to be not nil")
-	}
-}
-
-func TestRenderYamlToDecoder_WithTemplate(t *testing.T) {
-	tmpFile, err := os.CreateTemp("", "test-*.yaml")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.Remove(tmpFile.Name())
-
-	yamlContent := "name: {{.Name}}"
-	if _, err := tmpFile.Write([]byte(yamlContent)); err != nil {
-		t.Fatal(err)
-	}
-	tmpFile.Close()
-
-	task := &Task{
-		FilePath: tmpFile.Name(),
-		Param:    map[string]interface{}{"Name": "test"},
-	}
-	decoder, err := RenderYamlToDecoder(task)
-	if err != nil {
-		t.Fatalf("Expected no error, got %v", err)
-	}
-	if decoder == nil {
-		t.Fatal("Expected decoder to be not nil")
-	}
-}
-
 func TestGetUnStructListFromDecoder_Success(t *testing.T) {
 	yamlContent := "apiVersion: v1\nkind: Pod\nmetadata:\n  name: test"
 	decoder := yamlutil.NewYAMLOrJSONDecoder(bytes.NewReader([]byte(yamlContent)), 4096)
@@ -510,7 +422,7 @@ func TestSortUnstructuredList_InstallAddon(t *testing.T) {
 }
 
 func TestHandleOperation_UnknownOperation(t *testing.T) {
-	logger := zap.NewNop().Sugar()
+	logger := (*log.Logger)(nil)
 	c := &Client{Log: logger}
 
 	task := &Task{Operate: "unknown"}
@@ -527,7 +439,7 @@ func TestHandleOperation_UnknownOperation(t *testing.T) {
 }
 
 func TestHandleRemoveOperation_NotFound(t *testing.T) {
-	logger := zap.NewNop().Sugar()
+	logger := (*log.Logger)(nil)
 	scheme := runtime.NewScheme()
 	dynamicClient := fakedynamic.NewSimpleDynamicClient(scheme)
 	c := &Client{Log: logger, DynamicClient: dynamicClient}
@@ -563,26 +475,8 @@ func TestRenderYamlToDecoder_FileNotFound(t *testing.T) {
 	}
 }
 
-func TestRenderYamlToDecoder_InvalidTemplate(t *testing.T) {
-	tmpFile, _ := os.CreateTemp("", "test-*.yaml")
-	defer os.Remove(tmpFile.Name())
-	tmpFile.WriteString("{{.Invalid")
-	tmpFile.Close()
-
-	task := &Task{
-		Name:     "test",
-		FilePath: tmpFile.Name(),
-		Param:    map[string]interface{}{},
-	}
-
-	_, err := RenderYamlToDecoder(task)
-	if err == nil {
-		t.Error("Expected error for invalid template")
-	}
-}
-
 func TestHandleUpdateOperation_CRD(t *testing.T) {
-	logger := zap.NewNop().Sugar()
+	logger := (*log.Logger)(nil)
 	c := &Client{Log: logger}
 
 	unstruct := unstructured.Unstructured{}

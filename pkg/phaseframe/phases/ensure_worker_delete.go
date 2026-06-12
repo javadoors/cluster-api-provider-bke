@@ -43,7 +43,6 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/statusmanage"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/constant"
-	l "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/log"
 )
 
 const (
@@ -60,7 +59,6 @@ type EnsureWorkerDelete struct {
 }
 
 func NewEnsureWorkerDelete(ctx *phaseframe.PhaseContext) phaseframe.Phase {
-	ctx.Log.NormalLogger = l.Named(EnsureWorkerDeleteName.String())
 	base := phaseframe.NewBasePhase(ctx, EnsureWorkerDeleteName)
 	return &EnsureWorkerDelete{
 		BasePhase:                    base,
@@ -418,7 +416,7 @@ func (e *EnsureWorkerDelete) reconcileWorkerDelete() (ctrl.Result, error) {
 	// Get target cluster nodes for BKENode deletion detection
 	targetNodes, targetErr := e.getTargetClusterNodes(bkeCluster)
 	if targetErr != nil {
-		log.Debug("scale-in", "Failed to get target cluster nodes: %v", targetErr)
+		log.Debug("scale-in: Failed to get target cluster nodes: %v", targetErr)
 		// Continue with nil targetNodes, will fall back to legacy mode
 	}
 
@@ -447,7 +445,9 @@ func (e *EnsureWorkerDelete) reconcileWorkerDelete() (ctrl.Result, error) {
 	err := error(nil)
 	defer func() {
 		if err != nil {
-			log.Debug(constant.WorkerDeleteFailedReason, "Rollback: scale up MachineDeployment replicas to %d.", *currentReplicas)
+			log.Debug(constant.WorkerDeleteFailedReason+
+				": Rollback: scale up MachineDeployment replicas to %d.",
+				*currentReplicas)
 			scope.MachineDeployment.Spec.Replicas = currentReplicas
 			if rollbackErr := phaseutil.ResumeClusterAPIObj(ctx, c, scope.MachineDeployment); rollbackErr != nil {
 				log.Error(constant.WorkerDeleteFailedReason, "Rollback MachineDeployment replicas failed. err: %v", rollbackErr)

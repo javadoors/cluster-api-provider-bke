@@ -14,25 +14,10 @@
 package testutils
 
 import (
-	"os"
-
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
-// NewLog util
-func NewLog() *zap.SugaredLogger {
-	// 1. 配置编码器（JSON格式，适合日志收集系统）
-	encoderConfig1 := zap.NewProductionEncoderConfig()
-	encoderConfig1.EncodeTime = zapcore.ISO8601TimeEncoder // 时间格式
-	// 2. 创建核心（输出到文件+控制台）
-	core := zapcore.NewCore(
-		zapcore.NewJSONEncoder(encoderConfig1),
-		zapcore.NewMultiWriteSyncer(
-			zapcore.AddSync(os.Stdout),
-		),
-		zap.InfoLevel, // 日志级别
-	)
-
-	return zap.New(core).Sugar()
+// NewLog returns a logger for testing.
+func NewLog() *log.Logger {
+	return log.With("test", "testutils")
 }

@@ -16,6 +16,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
 	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
 	bkessh "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/remote"
 )

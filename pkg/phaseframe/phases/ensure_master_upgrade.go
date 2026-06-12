@@ -14,9 +14,11 @@ package phases
 
 import (
 	"context"
+	"strings"
 
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	containerutil "sigs.k8s.io/cluster-api/util/container"
@@ -31,11 +33,11 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/mergecluster"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/upgrade"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/mfutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/annotation"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/constant"
-	l "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/log"
 )
 
 const (
@@ -51,7 +53,6 @@ type EnsureMasterUpgrade struct {
 }
 
 func NewEnsureMasterUpgrade(ctx *phaseframe.PhaseContext) phaseframe.Phase {
-	ctx.Log.NormalLogger = l.Named(EnsureMasterUpgradeName.String())
 	base := phaseframe.NewBasePhase(ctx, EnsureMasterUpgradeName)
 	return &EnsureMasterUpgrade{BasePhase: base}
 }
@@ -70,8 +71,105 @@ func (e *EnsureMasterUpgrade) Execute() (ctrl.Result, error) {
 	return e.reconcileMasterUpgrade()
 }
 
+// Version returns the current running Kubernetes version on the cluster.
+func (e *EnsureMasterUpgrade) Version() string {
+	if e.Ctx == nil || e.Ctx.BKECluster == nil {
+		return ""
+	}
+	return e.Ctx.BKECluster.Status.KubernetesVersion
+}
+
+func (e *EnsureMasterUpgrade) currentKubernetesVersion() string {
+	vc := e.GetVersionContext()
+	if vc != nil {
+		if current := strings.TrimSpace(vc.GetCurrent(upgrade.ComponentKubernetesMaster)); current != "" {
+			return current
+		}
+		if current := strings.TrimSpace(vc.GetCurrent(upgrade.ComponentKubernetesWorker)); current != "" {
+			return current
+		}
+		if current := strings.TrimSpace(vc.GetCurrent("kubernetes")); current != "" {
+			return current
+		}
+	}
+	if e.Ctx == nil || e.Ctx.BKECluster == nil {
+		return ""
+	}
+	return strings.TrimSpace(e.Ctx.BKECluster.Status.KubernetesVersion)
+}
+
+func (e *EnsureMasterUpgrade) desiredKubernetesVersion() string {
+	vc := e.GetVersionContext()
+	if vc != nil {
+		if target := strings.TrimSpace(vc.GetTarget(upgrade.ComponentKubernetesMaster)); target != "" {
+			return target
+		}
+		if target := strings.TrimSpace(vc.GetTarget(upgrade.ComponentKubernetesWorker)); target != "" {
+			return target
+		}
+		if target := strings.TrimSpace(vc.GetTarget("kubernetes")); target != "" {
+			return target
+		}
+	}
+	return e.deprecatedSpecKubernetesVersion()
+}
+
+// deprecatedSpecKubernetesVersion returns the legacy target source from BKECluster spec.
+// Deprecated: declarative upgrade should prefer VersionContext targets derived from ReleaseImage.
+func (e *EnsureMasterUpgrade) deprecatedSpecKubernetesVersion() string {
+	if e.Ctx == nil || e.Ctx.BKECluster == nil || e.Ctx.BKECluster.Spec.ClusterConfig == nil {
+		return ""
+	}
+	return strings.TrimSpace(e.Ctx.BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion)
+}
+
+func (e *EnsureMasterUpgrade) syncLegacyTargetKubernetesVersion(target string) error {
+	target = strings.TrimSpace(target)
+	if target == "" || e.Ctx == nil || e.Ctx.BKECluster == nil {
+		return nil
+	}
+	if e.Ctx.BKECluster.Spec.ClusterConfig == nil {
+		return errors.New("cluster config is nil")
+	}
+	if strings.TrimSpace(e.Ctx.BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion) == target {
+		return nil
+	}
+	e.Ctx.Log.Warn(constant.MasterUpgradingReason,
+		"sync deprecated spec kubernetesVersion from %q to %q for legacy master upgrade execution",
+		e.Ctx.BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion, target)
+	if err := mergecluster.SyncStatusUntilComplete(e.Ctx.Client, e.Ctx.BKECluster, func(bc *bkev1beta1.BKECluster) {
+		if bc.Spec.ClusterConfig != nil {
+			bc.Spec.ClusterConfig.Cluster.KubernetesVersion = target
+		}
+	}); err != nil {
+		return err
+	}
+	e.Ctx.BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion = target
+	return nil
+}
+
+// isKubernetesMasterNeedUpgrade reports whether the cluster kubernetes version differs from the upgrade target.
+func (e *EnsureMasterUpgrade) isKubernetesMasterNeedUpgrade(_ *bkev1beta1.BKECluster, new *bkev1beta1.BKECluster) bool {
+	if new == nil || new.Spec.ClusterConfig == nil {
+		return false
+	}
+	target := strings.TrimSpace(e.desiredKubernetesVersion())
+	current := strings.TrimSpace(e.currentKubernetesVersion())
+	return target != current &&
+		len(target) != 0 &&
+		len(current) != 0
+}
+
+// NeedExecute determines whether the master kubernetes upgrade phase needs to be executed.
 func (e *EnsureMasterUpgrade) NeedExecute(old *bkev1beta1.BKECluster, new *bkev1beta1.BKECluster) bool {
 	if !e.BasePhase.DefaultNeedExecute(old, new) {
+		return false
+	}
+	if new.Status.ClusterStatus == bkev1beta1.ClusterUnhealthy ||
+		new.Status.ClusterStatus == bkev1beta1.ClusterUnknown {
+		return false
+	}
+	if !e.NeedExecuteWithVersionContext(upgrade.ComponentKubernetesMaster, old, new, e.isKubernetesMasterNeedUpgrade) {
 		return false
 	}
 
@@ -89,8 +187,13 @@ func (e *EnsureMasterUpgrade) NeedExecute(old *bkev1beta1.BKECluster, new *bkev1
 }
 
 func (e *EnsureMasterUpgrade) reconcileMasterUpgrade() (ctrl.Result, error) {
-	_, _, bkeCluster, _, log := e.Ctx.Untie()
-	if bkeCluster.Spec.ClusterConfig.Cluster.KubernetesVersion != bkeCluster.Status.KubernetesVersion {
+	_, _, _, _, log := e.Ctx.Untie()
+	targetVersion := e.desiredKubernetesVersion()
+	currentVersion := e.currentKubernetesVersion()
+	if targetVersion != "" && targetVersion != currentVersion {
+		if err := e.syncLegacyTargetKubernetesVersion(targetVersion); err != nil {
+			return ctrl.Result{}, err
+		}
 		ret, err := e.rolloutUpgrade()
 		if err != nil {
 			return ret, err
@@ -140,7 +243,7 @@ func (e *EnsureMasterUpgrade) rolloutUpgrade() (ctrl.Result, error) {
 
 	log.Info(constant.MasterUpgradeSucceedReason, "upgrade all master success")
 	// master 始终是最后更新完的,这时候更改status的版本
-	bkeCluster.Status.KubernetesVersion = bkeCluster.Spec.ClusterConfig.Cluster.KubernetesVersion
+	bkeCluster.Status.KubernetesVersion = e.desiredKubernetesVersion()
 
 	// 更新addon版本
 	return e.updateAddonVersions(c, bkeCluster, log)
@@ -241,68 +344,150 @@ func (e *EnsureMasterUpgrade) upgradeMasterNodesWithParams(params UpgradeMasterN
 	return nil
 }
 
-// updateAddonVersions 更新addon版本
-func (e *EnsureMasterUpgrade) updateAddonVersions(c client.Client, bkeCluster *bkev1beta1.BKECluster, log *bkev1beta1.BKELogger) (ctrl.Result, error) {
-	// 更新addon version kubeproxy
-	kubeproxyNeedUpgrade := false
-	kubectlNeedUpgrade := false
-	for _, addon := range bkeCluster.Spec.ClusterConfig.Addons {
-		if addon.Name == "kubeproxy" && addon.Version != bkeCluster.Spec.ClusterConfig.Cluster.KubernetesVersion {
-			log.Info(constant.MasterUpgradingReason, "kubeproxy need upgrade")
-			kubeproxyNeedUpgrade = true
+// imageTagFromReference returns the tag segment of a container image reference (supports host:port/repo/name:tag).
+func imageTagFromReference(image string) string {
+	image = strings.TrimSpace(image)
+	if image == "" {
+		return ""
+	}
+	i := strings.LastIndex(image, "/")
+	short := image
+	if i >= 0 {
+		short = image[i+1:]
+	}
+	c := strings.LastIndex(short, ":")
+	if c < 0 {
+		return ""
+	}
+	return short[c+1:]
+}
+
+func normalizeKubeComponentVersion(s string) string {
+	return strings.TrimPrefix(strings.TrimSpace(s), "v")
+}
+
+func (e *EnsureMasterUpgrade) getKubeProxyImageTagFromCluster(c client.Client, bkeCluster *bkev1beta1.BKECluster) (string, error) {
+	ctx, _, _, _, _ := e.Ctx.Untie()
+	clientSet, _, err := kube.GetTargetClusterClient(ctx, c, bkeCluster)
+	if err != nil {
+		return "", err
+	}
+	ds, err := clientSet.AppsV1().DaemonSets(metav1.NamespaceSystem).Get(ctx, "kube-proxy", metav1.GetOptions{})
+	if err != nil {
+		return "", err
+	}
+	var img string
+	for _, co := range ds.Spec.Template.Spec.Containers {
+		if co.Name == "kube-proxy" {
+			img = co.Image
+			break
+		}
+	}
+	if img == "" && len(ds.Spec.Template.Spec.Containers) > 0 {
+		img = ds.Spec.Template.Spec.Containers[0].Image
+	}
+	if img == "" {
+		return "", errors.New("kube-proxy daemonset has no containers")
+	}
+	tag := imageTagFromReference(img)
+	if tag == "" {
+		return "", errors.Errorf("could not parse image tag from %q", img)
+	}
+	return tag, nil
+}
+
+func scanKubeproxyKubectlUpgradeFromAddons(addons []confv1beta1.Product, k8sVer string, log *bkev1beta1.BKELogger) (kubeproxyInSpec, kubeproxyNeedUpgrade, kubectlNeedUpgrade bool) {
+	for _, addon := range addons {
+		if addon.Name == "kubeproxy" {
+			kubeproxyInSpec = true
+			if addon.Version != k8sVer {
+				log.Info(constant.MasterUpgradingReason, "kubeproxy need upgrade")
+				kubeproxyNeedUpgrade = true
+			}
 		}
 		if addon.Name == "kubectl" && addon.Version != "v1.25" {
 			log.Info(constant.MasterUpgradingReason, "kubectl need upgrade")
 			kubectlNeedUpgrade = true
 		}
 	}
+	return kubeproxyInSpec, kubeproxyNeedUpgrade, kubectlNeedUpgrade
+}
+
+func (e *EnsureMasterUpgrade) logKubeProxyTagProbeFailure(log *bkev1beta1.BKELogger, err error) {
+	if apierrors.IsNotFound(err) {
+		log.Info(constant.MasterUpgradingReason, "no kubeproxy addon and kube-proxy daemonset not found, skip kube-proxy upgrade check")
+		return
+	}
+	log.Warn(constant.MasterUpgradingReason, "no kubeproxy addon, failed to read kube-proxy image tag: %v, skip kube-proxy upgrade", err)
+}
+
+func (e *EnsureMasterUpgrade) augmentKubeproxyUpgradeNeedFromDaemonSet(
+	c client.Client, bkeCluster *bkev1beta1.BKECluster, log *bkev1beta1.BKELogger,
+	kubeproxyInSpec, kubeproxyNeedUpgrade bool, k8sVer string,
+) bool {
+	if kubeproxyInSpec {
+		return kubeproxyNeedUpgrade
+	}
+	tag, err := e.getKubeProxyImageTagFromCluster(c, bkeCluster)
+	if err != nil {
+		e.logKubeProxyTagProbeFailure(log, err)
+		return kubeproxyNeedUpgrade
+	}
+	if normalizeKubeComponentVersion(tag) == normalizeKubeComponentVersion(k8sVer) {
+		return kubeproxyNeedUpgrade
+	}
+	log.Info(constant.MasterUpgradingReason, "kubeproxy need upgrade (daemonset image tag %q vs cluster kubernetesVersion %q)", tag, k8sVer)
+	return true
+}
+
+func patchKubeproxyAddonVersions(current *bkev1beta1.BKECluster) {
+	ver := current.Spec.ClusterConfig.Cluster.KubernetesVersion
+	for i, d := range current.Spec.ClusterConfig.Addons {
+		if d.Name == "kubeproxy" {
+			d.Version = ver
+			current.Spec.ClusterConfig.Addons[i] = d
+		}
+	}
+	for i, d := range current.Status.AddonStatus {
+		addon := d.DeepCopy()
+		if addon.Name == "kubeproxy" {
+			addon.Version = ver
+			current.Status.AddonStatus[i] = *addon
+		}
+	}
+}
+
+func patchKubectlAddonToV125(current *bkev1beta1.BKECluster) {
+	found := false
+	for i, d := range current.Spec.ClusterConfig.Addons {
+		if d.Name == "kubectl" {
+			found = true
+			d.Version = "v1.25"
+			current.Spec.ClusterConfig.Addons[i] = d
+		}
+	}
+	if !found {
+		current.Spec.ClusterConfig.Addons = append(current.Spec.ClusterConfig.Addons, confv1beta1.Product{
+			Name:    "kubectl",
+			Version: "v1.25",
+			Block:   false,
+		})
+	}
+}
+
+// updateAddonVersions 更新 addon 版本。
+// kube-proxy 升级由声明式 manifest 链路处理，此处仅保留 kubectl 版本同步。
+func (e *EnsureMasterUpgrade) updateAddonVersions(c client.Client, bkeCluster *bkev1beta1.BKECluster, log *bkev1beta1.BKELogger) (ctrl.Result, error) {
+	k8sVer := bkeCluster.Spec.ClusterConfig.Cluster.KubernetesVersion
+	_, _, kubectlNeed := scanKubeproxyKubectlUpgradeFromAddons(bkeCluster.Spec.ClusterConfig.Addons, k8sVer, log)
 
 	var patchFuncs []mergecluster.PatchFunc
-
-	if kubeproxyNeedUpgrade {
-		if err := e.upgradeKubeProxy(bkeCluster.Spec.ClusterConfig.Cluster.KubernetesVersion); err != nil {
-			log.Error(constant.MasterUpgradeFailedReason, "upgrade kubeproxy failed: %v", err)
-			return ctrl.Result{}, err
-		}
-		patchFunc := func(currentCombinedBkeCluster *bkev1beta1.BKECluster) {
-			for i, d := range currentCombinedBkeCluster.Spec.ClusterConfig.Addons {
-				if d.Name == "kubeproxy" {
-					d.Version = currentCombinedBkeCluster.Spec.ClusterConfig.Cluster.KubernetesVersion
-					currentCombinedBkeCluster.Spec.ClusterConfig.Addons[i] = d
-				}
-			}
-			for i, d := range currentCombinedBkeCluster.Status.AddonStatus {
-				addon := d.DeepCopy()
-				if addon.Name == "kubeproxy" {
-					addon.Version = currentCombinedBkeCluster.Spec.ClusterConfig.Cluster.KubernetesVersion
-					currentCombinedBkeCluster.Status.AddonStatus[i] = *addon
-				}
-			}
-		}
-		patchFuncs = append(patchFuncs, patchFunc)
+	if kubectlNeed {
+		patchFuncs = append(patchFuncs, patchKubectlAddonToV125)
 	}
-
-	if kubectlNeedUpgrade {
-		patchFunc := func(currentCombinedBkeCluster *bkev1beta1.BKECluster) {
-			found := false
-			for i, d := range currentCombinedBkeCluster.Spec.ClusterConfig.Addons {
-				if d.Name == "kubectl" {
-					found = true
-					d.Version = "v1.25"
-					currentCombinedBkeCluster.Spec.ClusterConfig.Addons[i] = d
-				}
-			}
-			if !found {
-				currentCombinedBkeCluster.Spec.ClusterConfig.Addons = append(currentCombinedBkeCluster.Spec.ClusterConfig.Addons, confv1beta1.Product{
-					Name:    "kubectl",
-					Version: "v1.25",
-					Block:   false,
-				})
-			}
-		}
-		patchFuncs = append(patchFuncs, patchFunc)
+	if len(patchFuncs) == 0 {
+		return ctrl.Result{}, nil
 	}
-
 	if err := mergecluster.SyncStatusUntilComplete(c, bkeCluster, patchFuncs...); err != nil {
 		return ctrl.Result{}, errors.Errorf("failed to upgrade addon version, err: %v", err)
 	}

@@ -75,9 +75,14 @@ func TestServiceGeneratorGenerateservicepartialconfig(t *testing.T) {
 	}
 	contentStr := string(content)
 
-	// 已配置字段应存在
+	// 已配置字段应存在（KCT 路径下未写 --hostname-override 时会通过 utils.HostName() 自动追加）
+	if !strings.Contains(contentStr, "ExecStart=/usr/bin/kubelet --config=/etc/kubernetes/kubelet.conf") {
+		t.Errorf("已配置字段缺失 ExecStart 前缀，内容：\n%s", contentStr)
+	}
+	if !strings.Contains(contentStr, "--hostname-override=") {
+		t.Errorf("期望自动追加 --hostname-override=，内容：\n%s", contentStr)
+	}
 	expectedPresent := []string{
-		"ExecStart=/usr/bin/kubelet --config=/etc/kubernetes/kubelet.conf",
 		"Restart=on-failure",
 		"User=root",
 		"WantedBy=multi-user.target",
@@ -121,9 +126,12 @@ func TestServiceGeneratorGenerateservicecontenttemplaterender(t *testing.T) {
 		t.Fatalf("generateServiceContent 失败：%v", err)
 	}
 
-	// 4. 验证渲染结果
+	// 4. 验证渲染结果（ExecStart 会带自动追加的 hostname-override）
+	if !strings.Contains(content, "ExecStart=/usr/bin/kubelet --node-ip=192.168.100.48") ||
+		!strings.Contains(content, "--hostname-override=") {
+		t.Errorf("渲染 ExecStart 不符合预期，完整内容：\n%s", content)
+	}
 	expectedLines := []string{
-		"ExecStart=/usr/bin/kubelet --node-ip=192.168.100.48",
 		`Environment="TEST_KEY=test_value"`,
 		"TestField=testValue",
 		"[Install]",
@@ -133,5 +141,27 @@ func TestServiceGeneratorGenerateservicecontenttemplaterender(t *testing.T) {
 		if !strings.Contains(content, line) {
 			t.Errorf("渲染内容缺失：%q，完整内容：\n%s", line, content)
 		}
+	}
+}
+
+func TestApplyDefaultHostnameOverrideSkippedWhenPresent(t *testing.T) {
+	tempDir := t.TempDir()
+	generator := NewServiceData(tempDir)
+	testConfig := &confv1beta1.KubeletService{
+		ExecStart: "/usr/bin/kubelet --hostname-override=custom --config=/etc/kubernetes/kubelet.conf",
+	}
+	if err := generator.GenerateService(testConfig, nil, nil); err != nil {
+		t.Fatalf("GenerateService: %v", err)
+	}
+	content, err := os.ReadFile(filepath.Join(tempDir, KubeletFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(content)
+	if strings.Count(s, "--hostname-override") != 1 {
+		t.Fatalf("should keep single --hostname-override, got:\n%s", s)
+	}
+	if !strings.Contains(s, "--hostname-override=custom") {
+		t.Fatalf("expected custom override, got:\n%s", s)
 	}
 }

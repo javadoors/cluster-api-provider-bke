@@ -18,10 +18,10 @@ import (
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
+
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/common/source"
 	bkenet "gopkg.openfuyao.cn/cluster-api-provider-bke/common/utils/net"
-
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/executor/exec"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job/builtin/plugin"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
@@ -605,7 +605,6 @@ func TestResetPluginExecuteWithGetInterfaceError(t *testing.T) {
 func TestResetPluginExecuteWithExtraFileInsteadOfDir(t *testing.T) {
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
-
 
 	patches.ApplyFunc(utils.ContainsString, func(_ []string, scope string) bool {
 		return scope == "extra"

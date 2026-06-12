@@ -451,8 +451,8 @@ func TestHABaseCommandValidation(t *testing.T) {
 			ha := &HA{
 				BaseCommand:              tt.baseCommand,
 				MasterNodes:              bkenode.Nodes{{IP: testNodeIP, Hostname: testHost}},
-				ThirdImageRepo:                testImageRepo,
-			FuyaoImageRepo:           testImageRepo,
+				ThirdImageRepo:           testImageRepo,
+				FuyaoImageRepo:           testImageRepo,
 				ManifestsDir:             testManifestsDir,
 				ControlPlaneEndpointPort: testControlPlanePort,
 				ControlPlaneEndpointVIP:  testControlPlaneVIP,

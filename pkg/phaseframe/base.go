@@ -13,6 +13,7 @@
 package phaseframe
 
 import (
+	"context"
 	"strings"
 	"time"
 
@@ -24,9 +25,8 @@ import (
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/mergecluster"
 	metricrecord "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/metrics/record"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/clusterutil"
-	l "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 // BasePhase is the base implementation of Phase, you can use it to implement your own phase
@@ -54,7 +54,13 @@ type BasePhase struct {
 
 // NewBasePhase returns a new BasePhase,you can use it to implement your own phase
 func NewBasePhase(ctx *PhaseContext, phaseName confv1beta1.BKEClusterPhase) BasePhase {
-	ctx.Log.NormalLogger = l.Named(phaseName.String()).With("bkecluster", utils.ClientObjNS(ctx.BKECluster))
+	if ctx == nil {
+		ctx = NewReconcilePhaseCtx(context.Background())
+	}
+	if ctx.Log == nil {
+		ctx.Log = bkev1beta1.NewBKELogger(nil, nil, ctx.BKECluster)
+	}
+	ctx.BindPhaseLogger(phaseName)
 	return BasePhase{
 		PhaseName:           phaseName,
 		Ctx:                 ctx,
@@ -65,8 +71,11 @@ func NewBasePhase(ctx *PhaseContext, phaseName confv1beta1.BKEClusterPhase) Base
 
 // DefaultPreHook is the default implementation of ExecutePreHook, use on demand
 func (b *BasePhase) DefaultPreHook() error {
+	b.Ctx.BindPhaseLogger(b.PhaseName)
+
 	// refresh bkecluster
 	if err := b.Ctx.RefreshCtxBKECluster(); err != nil {
+		log.Errorf("failed to refresh BKECluster in pre-hook for phase %q: %v", b.Name(), err)
 		return err
 	}
 	// refresh cluster, it's not necessary to refresh successfully
@@ -79,6 +88,7 @@ func (b *BasePhase) DefaultPreHook() error {
 	if b.CustomPreHookFuncs != nil && len(b.CustomPreHookFuncs) > 0 {
 		for _, f := range b.CustomPreHookFuncs {
 			if err := f(b); err != nil {
+				log.Errorf("custom pre-hook failed for phase %q: %v", b.Name(), err)
 				return err
 			}
 		}
@@ -111,6 +121,7 @@ func (b *BasePhase) DefaultPostHook(err error) error {
 	if b.CustomPostHookFuncs != nil && len(b.CustomPostHookFuncs) > 0 {
 		for _, f := range b.CustomPostHookFuncs {
 			if err := f(b, err); err != nil {
+				log.Errorf("custom post-hook failed for phase %q: %v", b.Name(), err)
 				return err
 			}
 		}

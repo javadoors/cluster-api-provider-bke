@@ -26,7 +26,6 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -35,6 +34,7 @@ import (
 
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/pkiutil"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 const (
@@ -76,16 +76,19 @@ type CertConfigData struct {
 type CertConfigLoader struct {
 	client     client.Client
 	ctx        context.Context
-	log        *zap.SugaredLogger
+	log        *log.Logger
 	bkeCluster *bkev1beta1.BKECluster
 }
 
 // NewCertConfigLoader creates a new certificate configuration loader
-func NewCertConfigLoader(ctx context.Context, client client.Client, bkeCluster *bkev1beta1.BKECluster, log *zap.SugaredLogger) *CertConfigLoader {
+func NewCertConfigLoader(
+	ctx context.Context, client client.Client,
+	bkeCluster *bkev1beta1.BKECluster, l *log.Logger,
+) *CertConfigLoader {
 	return &CertConfigLoader{
 		client:     client,
 		ctx:        ctx,
-		log:        log,
+		log:        l,
 		bkeCluster: bkeCluster,
 	}
 }
@@ -694,9 +697,16 @@ func (l *CertConfigLoader) createCertConfigMap(data map[string]string) error {
 	cm.Namespace = CertConfigMapNamespace
 	cm.Name = CertConfigMapName
 	cm.Data = data
+	// Only set owner reference when the BKECluster exists in the same namespace
+	// as the ConfigMap. Setting an ownerRef across namespaces causes
+	// OwnerRefInvalidNamespace and the ConfigMap may be garbage-collected.
 	if l.bkeCluster != nil {
-		controllerRef := metav1.NewControllerRef(l.bkeCluster, l.bkeCluster.GroupVersionKind())
-		cm.SetOwnerReferences([]metav1.OwnerReference{*controllerRef})
+		if l.bkeCluster.Namespace == CertConfigMapNamespace {
+			controllerRef := metav1.NewControllerRef(l.bkeCluster, l.bkeCluster.GroupVersionKind())
+			cm.SetOwnerReferences([]metav1.OwnerReference{*controllerRef})
+		} else {
+			l.log.Infof("Skipping ownerRef for ConfigMap %s/%s because BKECluster is in namespace %s", CertConfigMapNamespace, CertConfigMapName, l.bkeCluster.Namespace)
+		}
 	}
 	if err := l.client.Create(l.ctx, cm); err != nil {
 		return errors.Errorf("failed to create ConfigMap %s/%s: %v", CertConfigMapNamespace, CertConfigMapName, err)

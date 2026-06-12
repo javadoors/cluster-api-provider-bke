@@ -35,8 +35,8 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/executor/exec"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job/builtin/plugin"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/pkiutil"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 const (
@@ -202,7 +202,6 @@ func (cp *CertPlugin) handleLoadCACert(certParamMap map[string]string) error {
 	// get CA cert from cluster api secret
 	for _, secretName := range caCertNames {
 		if err := cp.getCertFromSecret(secretName, cp.pkiPath); err != nil {
-			log.Debug(err)
 			return errors.Wrapf(err, "failed to get CA cert from namespace %q secret %q", cp.namespace, secretName)
 		}
 	}
@@ -223,7 +222,6 @@ func (cp *CertPlugin) handleLoadAdminKubeconfig(certParamMap map[string]string) 
 	}
 	// get kubeconfig from cluster api secret，该kubeconfig是集群的入口
 	if err := cp.getCertFromSecret("kubeconfig", pkiutil.KubernetesDir); err != nil {
-		log.Debug(err)
 		return errors.Wrapf(err, "failed to get kubeConfig from namespace %q secret %q", cp.namespace, "kubeconfig")
 	}
 

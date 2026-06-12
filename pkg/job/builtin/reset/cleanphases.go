@@ -19,11 +19,11 @@ import (
 	bkenet "gopkg.openfuyao.cn/cluster-api-provider-bke/common/utils/net"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/executor/exec"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/mfutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/net"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/pkiutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/resetutil"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 // CleanInterface is the interface for clean phase

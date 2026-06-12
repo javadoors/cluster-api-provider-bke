@@ -97,9 +97,53 @@ spec:
                           type: boolean
                         name:
                           type: string
+                        namespace:
+                          description: |-
+                            Namespace defines the namespace of the chart
+                            If empty, use the default configuration of chart
+                          type: string
                         param:
                           additionalProperties:
                             type: string
+                          type: object
+                        releaseName:
+                          description: |-
+                            ReleaseName defines the release name of the chart
+                            If empty, defaults to the product name
+                          type: string
+                        timeout:
+                          description: |-
+                            Timeout defines the timeout for the Product to be deployed\removed\upgraded successfully
+                            If empty, defaults to 300 seconds
+                          type: integer
+                        type:
+                          description: |-
+                            Type defines the product type, such as "chart", "yaml"
+                            If empty, defaults to "yaml"
+                          enum:
+                          - yaml
+                          - chart
+                          type: string
+                        valuesConfigMapRef:
+                          description: |-
+                            ValuesConfigMapRef references a ConfigMap containing the values.yaml for the chart
+                            If empty, use the default configuration of chart
+                          properties:
+                            name:
+                              description: Name of the ValuesConfigMapRef resource
+                              type: string
+                            namespace:
+                              description: |-
+                                Namespace of the ValuesConfigMapRef resource
+                                If empty, defaults to the same namespace as the Cluster resource
+                              type: string
+                            valuesKey:
+                              description: |-
+                                ValuesKey is the key name that stores the values.yaml in the ConfigMap
+                                If empty, defaults to "values.yaml"
+                              type: string
+                          required:
+                          - name
                           type: object
                         version:
                           type: string
@@ -110,6 +154,9 @@ spec:
                   cluster:
                     description: Cluster defines the configuration of the target cluster
                     properties:
+                      agentHealthPort:
+                        description: AgentHealthPort defines the agent health port
+                        type: string
                       apiServer:
                         description: APIServer contains additional settings for the
                           API server component
@@ -169,6 +216,84 @@ spec:
                         description: CertificatesDir defines the directory path for
                           storing or locating all required certificates.
                         type: string
+                      chartRepo:
+                        description: ChartRepo defines the global chart repository
+                          of the deployment target cluster
+                        properties:
+                          authSecretRef:
+                            description: AuthSecretRef defines the secret name, namespace
+                              and other information for authentication
+                            properties:
+                              name:
+                                description: Name of the AuthSecretRef resource
+                                type: string
+                              namespace:
+                                description: |-
+                                  Namespace of the AuthSecretRef resource
+                                  If empty, defaults to the same namespace as the Cluster resource
+                                type: string
+                              passwordKey:
+                                description: |-
+                                  PasswordKey is the key name that stores the password in the secret
+                                  If empty, defaults to "password"
+                                type: string
+                              usernameKey:
+                                description: |-
+                                  UsernameKey is the key name that stores the username in the secret
+                                  If empty, defaults to "username"
+                                type: string
+                            required:
+                            - name
+                            type: object
+                          domain:
+                            description: Domain defines the Repo domain name
+                            type: string
+                          insecureSkipTLSVerify:
+                            description: |-
+                              InsecureSkipTLSVerify defines whether to skip TLS verification when connecting to the repo
+                              If empty, defaults to false
+                            type: boolean
+                          ip:
+                            description: Ip defines the Repo ip
+                            type: string
+                          port:
+                            description: Port defines the number of port to connect
+                              to the Repo
+                            type: string
+                          prefix:
+                            description: Prefix defines the kubernetes image address
+                            type: string
+                          tlsSecretRef:
+                            description: TlsSecretRef defines the secret name, namespace
+                              and other information for TLS certificates
+                            properties:
+                              caKey:
+                                description: |-
+                                  CaKey is the key name that stores the ca.crt in the secret
+                                  If empty, defaults to "ca.crt"
+                                type: string
+                              certKey:
+                                description: |-
+                                  CertKey is the key name that stores the cert.crt in the secret
+                                  If empty, defaults to "cert.crt"
+                                type: string
+                              keyKey:
+                                description: |-
+                                  KeyKey is the key name that stores the key.key in the secret
+                                  If empty, defaults to "key.key"
+                                type: string
+                              name:
+                                description: Name of the TlsSecretRef resource
+                                type: string
+                              namespace:
+                                description: |-
+                                  Namespace of the TlsSecretRef resource
+                                  If empty, defaults to the same namespace as the Cluster resource
+                                type: string
+                            required:
+                            - name
+                            type: object
+                        type: object
                       containerRuntime:
                         description: ContainerRuntime defines the container runtime
                           of the target cluster
@@ -317,9 +442,39 @@ spec:
                           HTTPRepo defines the HTTP repository to use when deploying
                           rpm / deb / http server
                         properties:
+                          authSecretRef:
+                            description: AuthSecretRef defines the secret name, namespace
+                              and other information for authentication
+                            properties:
+                              name:
+                                description: Name of the AuthSecretRef resource
+                                type: string
+                              namespace:
+                                description: |-
+                                  Namespace of the AuthSecretRef resource
+                                  If empty, defaults to the same namespace as the Cluster resource
+                                type: string
+                              passwordKey:
+                                description: |-
+                                  PasswordKey is the key name that stores the password in the secret
+                                  If empty, defaults to "password"
+                                type: string
+                              usernameKey:
+                                description: |-
+                                  UsernameKey is the key name that stores the username in the secret
+                                  If empty, defaults to "username"
+                                type: string
+                            required:
+                            - name
+                            type: object
                           domain:
                             description: Domain defines the Repo domain name
                             type: string
+                          insecureSkipTLSVerify:
+                            description: |-
+                              InsecureSkipTLSVerify defines whether to skip TLS verification when connecting to the repo
+                              If empty, defaults to false
+                            type: boolean
                           ip:
                             description: Ip defines the Repo ip
                             type: string
@@ -330,14 +485,74 @@ spec:
                           prefix:
                             description: Prefix defines the kubernetes image address
                             type: string
+                          tlsSecretRef:
+                            description: TlsSecretRef defines the secret name, namespace
+                              and other information for TLS certificates
+                            properties:
+                              caKey:
+                                description: |-
+                                  CaKey is the key name that stores the ca.crt in the secret
+                                  If empty, defaults to "ca.crt"
+                                type: string
+                              certKey:
+                                description: |-
+                                  CertKey is the key name that stores the cert.crt in the secret
+                                  If empty, defaults to "cert.crt"
+                                type: string
+                              keyKey:
+                                description: |-
+                                  KeyKey is the key name that stores the key.key in the secret
+                                  If empty, defaults to "key.key"
+                                type: string
+                              name:
+                                description: Name of the TlsSecretRef resource
+                                type: string
+                              namespace:
+                                description: |-
+                                  Namespace of the TlsSecretRef resource
+                                  If empty, defaults to the same namespace as the Cluster resource
+                                type: string
+                            required:
+                            - name
+                            type: object
                         type: object
                       imageRepo:
                         description: ImageRepo defines the global image repository
                           of the deployment target cluster
                         properties:
+                          authSecretRef:
+                            description: AuthSecretRef defines the secret name, namespace
+                              and other information for authentication
+                            properties:
+                              name:
+                                description: Name of the AuthSecretRef resource
+                                type: string
+                              namespace:
+                                description: |-
+                                  Namespace of the AuthSecretRef resource
+                                  If empty, defaults to the same namespace as the Cluster resource
+                                type: string
+                              passwordKey:
+                                description: |-
+                                  PasswordKey is the key name that stores the password in the secret
+                                  If empty, defaults to "password"
+                                type: string
+                              usernameKey:
+                                description: |-
+                                  UsernameKey is the key name that stores the username in the secret
+                                  If empty, defaults to "username"
+                                type: string
+                            required:
+                            - name
+                            type: object
                           domain:
                             description: Domain defines the Repo domain name
                             type: string
+                          insecureSkipTLSVerify:
+                            description: |-
+                              InsecureSkipTLSVerify defines whether to skip TLS verification when connecting to the repo
+                              If empty, defaults to false
+                            type: boolean
                           ip:
                             description: Ip defines the Repo ip
                             type: string
@@ -348,6 +563,36 @@ spec:
                           prefix:
                             description: Prefix defines the kubernetes image address
                             type: string
+                          tlsSecretRef:
+                            description: TlsSecretRef defines the secret name, namespace
+                              and other information for TLS certificates
+                            properties:
+                              caKey:
+                                description: |-
+                                  CaKey is the key name that stores the ca.crt in the secret
+                                  If empty, defaults to "ca.crt"
+                                type: string
+                              certKey:
+                                description: |-
+                                  CertKey is the key name that stores the cert.crt in the secret
+                                  If empty, defaults to "cert.crt"
+                                type: string
+                              keyKey:
+                                description: |-
+                                  KeyKey is the key name that stores the key.key in the secret
+                                  If empty, defaults to "key.key"
+                                type: string
+                              name:
+                                description: Name of the TlsSecretRef resource
+                                type: string
+                              namespace:
+                                description: |-
+                                  Namespace of the TlsSecretRef resource
+                                  If empty, defaults to the same namespace as the Cluster resource
+                                type: string
+                            required:
+                            - name
+                            type: object
                         type: object
                       kubelet:
                         description: Kubelet define kubelet configuration for all
@@ -524,9 +769,53 @@ spec:
                       type: boolean
                     name:
                       type: string
+                    namespace:
+                      description: |-
+                        Namespace defines the namespace of the chart
+                        If empty, use the default configuration of chart
+                      type: string
                     param:
                       additionalProperties:
                         type: string
+                      type: object
+                    releaseName:
+                      description: |-
+                        ReleaseName defines the release name of the chart
+                        If empty, defaults to the product name
+                      type: string
+                    timeout:
+                      description: |-
+                        Timeout defines the timeout for the Product to be deployed\removed\upgraded successfully
+                        If empty, defaults to 300 seconds
+                      type: integer
+                    type:
+                      description: |-
+                        Type defines the product type, such as "chart", "yaml"
+                        If empty, defaults to "yaml"
+                      enum:
+                      - yaml
+                      - chart
+                      type: string
+                    valuesConfigMapRef:
+                      description: |-
+                        ValuesConfigMapRef references a ConfigMap containing the values.yaml for the chart
+                        If empty, use the default configuration of chart
+                      properties:
+                        name:
+                          description: Name of the ValuesConfigMapRef resource
+                          type: string
+                        namespace:
+                          description: |-
+                            Namespace of the ValuesConfigMapRef resource
+                            If empty, defaults to the same namespace as the Cluster resource
+                          type: string
+                        valuesKey:
+                          description: |-
+                            ValuesKey is the key name that stores the values.yaml in the ConfigMap
+                            If empty, defaults to "values.yaml"
+                          type: string
+                      required:
+                      - name
                       type: object
                     version:
                       type: string
@@ -591,6 +880,79 @@ spec:
                 type: array
               containerdVersion:
                 type: string
+              declarativeUpgrade:
+                description: DeclarativeUpgrade holds progress for declarative DAG
+                  upgrades.
+                properties:
+                  completed:
+                    description: Completed holds component completion records for
+                      this TargetVersion.
+                    items:
+                      properties:
+                        completedAt:
+                          description: CompletedAt is the time the component finished
+                            successfully.
+                          format: date-time
+                          type: string
+                        name:
+                          description: Name is the declarative upgrade component name
+                            (DAG node name).
+                          type: string
+                        version:
+                          description: Version is the component version key used in
+                            the DAG node.
+                          type: string
+                      required:
+                      - completedAt
+                      - name
+                      type: object
+                    type: array
+                  finishedAt:
+                    description: FinishedAt marks when the upgrade plan completed
+                      successfully.
+                    format: date-time
+                    type: string
+                  lastFailure:
+                    description: |-
+                      LastFailure records the last failed component for this TargetVersion, for easier debugging.
+                      It must NOT be used for skip decisions.
+                    properties:
+                      attempt:
+                        description: Attempt is a best-effort counter for consecutive failures of the same component+version.
+                        format: int32
+                        type: integer
+                      error:
+                        description: Error is a short error message for the failure.
+                        type: string
+                      failedAt:
+                        description: FailedAt is the time the component execution failed.
+                        format: date-time
+                        type: string
+                      name:
+                        description: Name is the declarative upgrade component name (DAG node name).
+                        type: string
+                      version:
+                        description: Version is the component version key used in the DAG node.
+                        type: string
+                    required:
+                    - failedAt
+                    - name
+                    type: object
+                  lastError:
+                    description: LastError records the last observed error during
+                      DAG execution for this TargetVersion.
+                    type: string
+                  startedAt:
+                    description: StartedAt marks the first time we initialized progress
+                      for TargetVersion.
+                    format: date-time
+                    type: string
+                  targetVersion:
+                    description: |-
+                      TargetVersion is the desired ClusterVersion for this upgrade execution plan.
+                      When it changes, Completed should be reset.
+                    type: string
+                type: object
               etcdVersion:
                 type: string
               kubernetesVersion:

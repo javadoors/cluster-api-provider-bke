@@ -21,7 +21,7 @@ import (
 
 	"github.com/pkg/errors"
 
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 // LeastFieldNums unmount路径时最少的字段数

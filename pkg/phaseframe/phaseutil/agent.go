@@ -36,25 +36,90 @@ import (
 
 const expectedSplitParts = 2
 
-// PingBKEAgent ping bkeagent(send ping command) to check if it's ready
+// countAvailableAgentNodes counts cluster agent availability.
+// Nodes in pingNodes are judged only by this round's ping result (e.g. upgrade re-pings all nodes
+// that already carry NodeAgentReadyFlag). Nodes not pinged this round fall back to NodeAgentReadyFlag.
+func countAvailableAgentNodes(bkeNodes bkev1beta1.BKENodes, pingNodes bkenode.Nodes, pingSuccess []string) int {
+	pingedIPs := make(map[string]struct{}, pingNodes.Length())
+	for _, n := range pingNodes {
+		pingedIPs[n.IP] = struct{}{}
+	}
+	pingSuccessIPs := make(map[string]struct{}, len(pingSuccess))
+	for _, result := range pingSuccess {
+		pingSuccessIPs[GetNodeIPFromCommandWaitResult(result)] = struct{}{}
+	}
+
+	available := 0
+	for _, bn := range bkeNodes {
+		ip := bn.Spec.IP
+		if _, pinged := pingedIPs[ip]; pinged {
+			if _, ok := pingSuccessIPs[ip]; ok {
+				available++
+			}
+			continue
+		}
+		if bkeNodes.GetNodeStateFlag(ip, bkev1beta1.NodeAgentReadyFlag) {
+			available++
+		}
+	}
+	return available
+}
+
+// PingBKEAgent ping bkeagent(send ping command) to check if it's ready.
+// Only nodes with NodeAgentPushedFlag and without NodeAgentReadyFlag are checked (install / first push).
 func PingBKEAgent(ctx context.Context, c client.Client, scheme *runtime.Scheme, bkeCluster *bkev1beta1.BKECluster) (error, []string, []string) {
-	pingNodes := bkenode.Nodes{}
 	tmpBKENodes, err := nodeutil.GetBKENodesFromClient(ctx, c, bkeCluster.Namespace, bkeCluster.Name)
 	if err != nil {
 		return err, nil, nil
 	}
 
 	bkeNodes := bkev1beta1.BKENodes(tmpBKENodes)
-
+	pingNodes := bkenode.Nodes{}
 	for _, bkenode := range bkeNodes {
+		if bkeNodes.GetNodeStateFlag(bkenode.Spec.IP, bkev1beta1.NodeAgentReadyFlag) {
+			continue
+		}
 		if bkeNodes.GetNodeStateFlag(bkenode.Spec.IP, bkev1beta1.NodeAgentPushedFlag) {
 			pingNodes = append(pingNodes, bkenode.ToNode())
 		}
 	}
+	if pingNodes.Length() == 0 {
+		return nil, nil, nil
+	}
+	return pingBKEAgentOnNodes(ctx, c, scheme, bkeCluster, bkeNodes, pingNodes)
+}
+
+// PingBKEAgentOnNodes pings the given nodes (e.g. after bkeagent upgrade on all cluster nodes).
+func PingBKEAgentOnNodes(
+	ctx context.Context,
+	c client.Client,
+	scheme *runtime.Scheme,
+	bkeCluster *bkev1beta1.BKECluster,
+	nodes bkenode.Nodes,
+) (error, []string, []string) {
+	tmpBKENodes, err := nodeutil.GetBKENodesFromClient(ctx, c, bkeCluster.Namespace, bkeCluster.Name)
+	if err != nil {
+		return err, nil, nil
+	}
+	return pingBKEAgentOnNodes(ctx, c, scheme, bkeCluster, bkev1beta1.BKENodes(tmpBKENodes), nodes)
+}
+
+func pingBKEAgentOnNodes(
+	ctx context.Context,
+	c client.Client,
+	scheme *runtime.Scheme,
+	bkeCluster *bkev1beta1.BKECluster,
+	bkeNodes bkev1beta1.BKENodes,
+	pingNodes bkenode.Nodes,
+) (error, []string, []string) {
 	const nodePerTime = 5
 	waitInterval := 1 * time.Second
 
-	var allTime = pingNodes.Length() * nodePerTime
+	allTime := pingNodes.Length() * nodePerTime
+	waitTimeout := time.Duration(allTime) * time.Second
+	if waitTimeout < 5*time.Minute {
+		waitTimeout = 5 * time.Minute
+	}
 	pingCommand := command.Ping{
 		BaseCommand: command.BaseCommand{
 			Ctx:             ctx,
@@ -66,7 +131,7 @@ func PingBKEAgent(ctx context.Context, c client.Client, scheme *runtime.Scheme, 
 			RemoveAfterWait: true,
 			Unique:          false,
 			WaitInterval:    waitInterval,
-			WaitTimeout:     time.Duration(allTime) * time.Second,
+			WaitTimeout:     waitTimeout,
 		},
 		Nodes: pingNodes,
 	}
@@ -75,9 +140,7 @@ func PingBKEAgent(ctx context.Context, c client.Client, scheme *runtime.Scheme, 
 		return errors.Errorf("create ping Command failed: %v", err), nil, nil
 	}
 	err, successNodes, failedNodes := pingCommand.Wait()
-	GenerateBKEAgentStatus(successNodes, bkeCluster, bkeNodes.ToNodes())
-
-	// 处理命令输出和主机名设置
+	GenerateBKEAgentStatus(successNodes, bkeCluster, bkeNodes.ToNodes(), bkeNodes, pingNodes)
 	processCommandOutput(bkeNodes, pingCommand.Command, bkeCluster)
 
 	if err != nil && !errors.Is(err, wait.ErrWaitTimeout) {
@@ -178,6 +241,7 @@ func shouldUpdateHostname(bkeNodes bkev1beta1.BKENodes, params NodeHostnameUpdat
 		return false
 	}
 
+	// Do not overwrite hostname when it is already set in BKECluster; kubelet uses spec.hostname via /etc/bkeagent/node.
 	if isHostnameAlreadySet(bkeNodes, params.NodeIndex) {
 		return false
 	}

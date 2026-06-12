@@ -14,6 +14,7 @@ package phases
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/pkg/errors"
@@ -34,10 +35,10 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/mergecluster"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/upgrade"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/annotation"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/constant"
-	l "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/log"
 )
 
 const (
@@ -82,7 +83,6 @@ func createUpgradeCommand(params CreateUpgradeCommandParams) command.Upgrade {
 }
 
 func NewEnsureWorkerUpgrade(ctx *phaseframe.PhaseContext) phaseframe.Phase {
-	ctx.Log.NormalLogger = l.Named(EnsureWorkerUpgradeName.String())
 	base := phaseframe.NewBasePhase(ctx, EnsureWorkerUpgradeName)
 	return &EnsureWorkerUpgrade{BasePhase: base}
 }
@@ -105,13 +105,105 @@ func (e *EnsureWorkerUpgrade) Execute() (ctrl.Result, error) {
 	return e.reconcileWorkerUpgrade()
 }
 
+// Version returns the current running Kubernetes version on the cluster.
+func (e *EnsureWorkerUpgrade) Version() string {
+	if e.Ctx == nil || e.Ctx.BKECluster == nil {
+		return ""
+	}
+	return e.Ctx.BKECluster.Status.KubernetesVersion
+}
+
+func (e *EnsureWorkerUpgrade) currentKubernetesVersion() string {
+	vc := e.GetVersionContext()
+	if vc != nil {
+		if current := strings.TrimSpace(vc.GetCurrent(upgrade.ComponentKubernetesWorker)); current != "" {
+			return current
+		}
+		if current := strings.TrimSpace(vc.GetCurrent(upgrade.ComponentKubernetesMaster)); current != "" {
+			return current
+		}
+		if current := strings.TrimSpace(vc.GetCurrent("kubernetes")); current != "" {
+			return current
+		}
+	}
+	if e.Ctx == nil || e.Ctx.BKECluster == nil {
+		return ""
+	}
+	return strings.TrimSpace(e.Ctx.BKECluster.Status.KubernetesVersion)
+}
+
+func (e *EnsureWorkerUpgrade) desiredKubernetesVersion() string {
+	vc := e.GetVersionContext()
+	if vc != nil {
+		if target := strings.TrimSpace(vc.GetTarget(upgrade.ComponentKubernetesWorker)); target != "" {
+			return target
+		}
+		if target := strings.TrimSpace(vc.GetTarget(upgrade.ComponentKubernetesMaster)); target != "" {
+			return target
+		}
+		if target := strings.TrimSpace(vc.GetTarget("kubernetes")); target != "" {
+			return target
+		}
+	}
+	return e.deprecatedSpecKubernetesVersion()
+}
+
+// deprecatedSpecKubernetesVersion returns the legacy target source from BKECluster spec.
+// Deprecated: declarative upgrade should prefer VersionContext targets derived from ReleaseImage.
+func (e *EnsureWorkerUpgrade) deprecatedSpecKubernetesVersion() string {
+	if e.Ctx == nil || e.Ctx.BKECluster == nil || e.Ctx.BKECluster.Spec.ClusterConfig == nil {
+		return ""
+	}
+	return strings.TrimSpace(e.Ctx.BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion)
+}
+
+func (e *EnsureWorkerUpgrade) syncLegacyTargetKubernetesVersion(target string) error {
+	target = strings.TrimSpace(target)
+	if target == "" || e.Ctx == nil || e.Ctx.BKECluster == nil {
+		return nil
+	}
+	if e.Ctx.BKECluster.Spec.ClusterConfig == nil {
+		return errors.New("cluster config is nil")
+	}
+	if strings.TrimSpace(e.Ctx.BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion) == target {
+		return nil
+	}
+	e.Ctx.Log.Warn(constant.WorkerUpgradingReason,
+		"sync deprecated spec kubernetesVersion from %q to %q for legacy worker upgrade execution",
+		e.Ctx.BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion, target)
+	if err := mergecluster.SyncStatusUntilComplete(e.Ctx.Client, e.Ctx.BKECluster, func(bc *bkev1beta1.BKECluster) {
+		if bc.Spec.ClusterConfig != nil {
+			bc.Spec.ClusterConfig.Cluster.KubernetesVersion = target
+		}
+	}); err != nil {
+		return err
+	}
+	e.Ctx.BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion = target
+	return nil
+}
+
+// isKubernetesWorkerNeedUpgrade reports whether the cluster kubernetes version differs from the upgrade target.
+func (e *EnsureWorkerUpgrade) isKubernetesWorkerNeedUpgrade(_ *bkev1beta1.BKECluster, new *bkev1beta1.BKECluster) bool {
+	if new == nil || new.Spec.ClusterConfig == nil {
+		return false
+	}
+	target := strings.TrimSpace(e.desiredKubernetesVersion())
+	current := strings.TrimSpace(e.currentKubernetesVersion())
+	return target != current &&
+		len(target) != 0 &&
+		len(current) != 0
+}
+
+// NeedExecute determines whether the worker kubernetes upgrade phase needs to be executed.
 func (e *EnsureWorkerUpgrade) NeedExecute(old *bkev1beta1.BKECluster, new *bkev1beta1.BKECluster) bool {
 	if !e.BasePhase.DefaultNeedExecute(old, new) {
 		return false
 	}
-
 	// cluster状态不正常，不需要执行
 	if new.Status.ClusterStatus == bkev1beta1.ClusterUnhealthy || new.Status.ClusterStatus == bkev1beta1.ClusterUnknown {
+		return false
+	}
+	if !e.NeedExecuteWithVersionContext(upgrade.ComponentKubernetesWorker, old, new, e.isKubernetesWorkerNeedUpgrade) {
 		return false
 	}
 
@@ -129,8 +221,13 @@ func (e *EnsureWorkerUpgrade) NeedExecute(old *bkev1beta1.BKECluster, new *bkev1
 }
 
 func (e *EnsureWorkerUpgrade) reconcileWorkerUpgrade() (ctrl.Result, error) {
-	_, _, bkeCluster, _, log := e.Ctx.Untie()
-	if bkeCluster.Spec.ClusterConfig.Cluster.KubernetesVersion != bkeCluster.Status.KubernetesVersion {
+	_, _, _, _, log := e.Ctx.Untie()
+	targetVersion := e.desiredKubernetesVersion()
+	currentVersion := e.currentKubernetesVersion()
+	if targetVersion != "" && targetVersion != currentVersion {
+		if err := e.syncLegacyTargetKubernetesVersion(targetVersion); err != nil {
+			return ctrl.Result{}, err
+		}
 		ret, err := e.rolloutUpgrade()
 		if err != nil {
 			return ret, err
@@ -201,8 +298,9 @@ func (e *EnsureWorkerUpgrade) processNodeUpgrade(params ProcessNodeUpgradeParams
 			return ctrl.Result{}, nil, errors.Errorf("get remote cluster Node resource failed, err: %v", err)
 		}
 		// 已经是期望版本的节点不需要升级
-		if remoteNode.Status.NodeInfo.KubeletVersion == params.BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion {
-			params.Log.Info(constant.MasterUpgradeSucceedReason, "node %q is already the expected version %q, skip upgrade", phaseutil.NodeInfo(node), params.BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion)
+		targetVersion := e.desiredKubernetesVersion()
+		if remoteNode.Status.NodeInfo.KubeletVersion == targetVersion {
+			params.Log.Info(constant.MasterUpgradeSucceedReason, "node %q is already the expected version %q, skip upgrade", phaseutil.NodeInfo(node), targetVersion)
 			continue
 		}
 		// mark node as upgrading
@@ -366,7 +464,7 @@ func (e *EnsureWorkerUpgrade) waitForNodeHealth(params WaitForNodeHealthParams) 
 		ClientSet:    clientSet,
 		RemoteClient: remoteClient,
 		Node:         params.Node,
-		K8sVersion:   params.BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion,
+		K8sVersion:   e.desiredKubernetesVersion(),
 		Logger:       params.Log,
 	}
 	err = waitForWorkerNodeHealthCheck(healthParams)

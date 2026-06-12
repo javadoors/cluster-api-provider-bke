@@ -21,7 +21,6 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	"go.uber.org/zap/zaptest"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -169,8 +168,7 @@ func createTestBKECluster() *bkev1beta1.BKECluster {
 
 // createTestLoader creates a test loader with fake client (without loading config data)
 func createTestLoader(t *testing.T) *CertConfigLoader {
-	logger := zaptest.NewLogger(t)
-	defer logger.Sync()
+
 	ctx := context.Background()
 
 	bkeCluster := createTestBKECluster()
@@ -180,7 +178,7 @@ func createTestLoader(t *testing.T) *CertConfigLoader {
 		WithObjects(configMap).
 		Build()
 
-	return NewCertConfigLoader(ctx, client, bkeCluster, logger.Sugar())
+	return NewCertConfigLoader(ctx, client, bkeCluster, nil)
 }
 
 // TestLoadConfigMapData tests loading configuration from ConfigMap
@@ -676,15 +674,14 @@ func getKubeletKubeConfigCSRJSON() string {
 
 // TestLoadConfigMapData_ConfigMapNotFound tests LoadConfigMapData when ConfigMap does not exist
 func TestLoadConfigMapData_ConfigMapNotFound(t *testing.T) {
-	logger := zaptest.NewLogger(t)
-	defer logger.Sync()
+
 	ctx := context.Background()
 
 	bkeCluster := createTestBKECluster()
 	// Create client without ConfigMap to simulate NotFound error
 	client := fake.NewClientBuilder().Build()
 
-	loader := NewCertConfigLoader(ctx, client, bkeCluster, logger.Sugar())
+	loader := NewCertConfigLoader(ctx, client, bkeCluster, nil)
 
 	configData, err := loader.LoadConfigMapData()
 	assert.NoError(t, err)
@@ -695,15 +692,14 @@ func TestLoadConfigMapData_ConfigMapNotFound(t *testing.T) {
 
 // TestGetCertConfigMap_NotFoundError tests getCertConfigMap when ConfigMap is not found
 func TestGetCertConfigMap_NotFoundError(t *testing.T) {
-	logger := zaptest.NewLogger(t)
-	defer logger.Sync()
+
 	ctx := context.Background()
 
 	bkeCluster := createTestBKECluster()
 	// Create client without ConfigMap
 	client := fake.NewClientBuilder().Build()
 
-	loader := NewCertConfigLoader(ctx, client, bkeCluster, logger.Sugar())
+	loader := NewCertConfigLoader(ctx, client, bkeCluster, nil)
 
 	configMap, err := loader.getCertConfigMap()
 	assert.Error(t, err)
@@ -713,8 +709,7 @@ func TestGetCertConfigMap_NotFoundError(t *testing.T) {
 
 // TestGetCertConfigMap_OtherError tests getCertConfigMap when client returns non-NotFound error
 func TestGetCertConfigMap_OtherError(t *testing.T) {
-	logger := zaptest.NewLogger(t)
-	defer logger.Sync()
+
 	ctx := context.Background()
 
 	bkeCluster := createTestBKECluster()
@@ -723,7 +718,7 @@ func TestGetCertConfigMap_OtherError(t *testing.T) {
 		Client: fake.NewClientBuilder().Build(),
 	}
 
-	loader := NewCertConfigLoader(ctx, errorClient, bkeCluster, logger.Sugar())
+	loader := NewCertConfigLoader(ctx, errorClient, bkeCluster, nil)
 
 	configMap, err := loader.getCertConfigMap()
 	assert.Error(t, err)
@@ -743,10 +738,9 @@ func (c *errorClient) Get(ctx context.Context, key client.ObjectKey, obj client.
 
 // TestBuildConfigMapData tests the buildConfigMapData function
 func TestBuildConfigMapData(t *testing.T) {
-	logger := zaptest.NewLogger(t)
-	defer logger.Sync()
+
 	ctx := context.Background()
-	loader := NewCertConfigLoader(ctx, nil, createTestBKECluster(), logger.Sugar())
+	loader := NewCertConfigLoader(ctx, nil, createTestBKECluster(), nil)
 	tests := getBuildConfigMapDataTestCases()
 
 	for _, tt := range tests {
@@ -932,10 +926,9 @@ func assertValidJSON(t *testing.T, jsonStr string, msgAndArgs ...interface{}) {
 
 // TestLocalFileMappings tests the localFileMappings function
 func TestLocalFileMappings(t *testing.T) {
-	logger := zaptest.NewLogger(t)
-	defer logger.Sync()
+
 	ctx := context.Background()
-	loader := NewCertConfigLoader(ctx, nil, createTestBKECluster(), logger.Sugar())
+	loader := NewCertConfigLoader(ctx, nil, createTestBKECluster(), nil)
 	configData := createBaseConfigData()
 	mappings := loader.localFileMappings(configData)
 
@@ -1016,10 +1009,9 @@ func getExpectedPointerForKey(key string, configData *CertConfigData) interface{
 
 // TestLoadLocalConfigData tests loading configuration from local directory
 func TestLoadLocalConfigData(t *testing.T) {
-	logger := zaptest.NewLogger(t)
-	defer logger.Sync()
+
 	ctx := context.Background()
-	loader := NewCertConfigLoader(ctx, nil, createTestBKECluster(), logger.Sugar())
+	loader := NewCertConfigLoader(ctx, nil, createTestBKECluster(), nil)
 
 	configData, err := loader.LoadLocalConfigData()
 	assert.NoError(t, err)
@@ -1028,10 +1020,9 @@ func TestLoadLocalConfigData(t *testing.T) {
 
 // TestEnsureLocalConfigDir tests the ensureLocalConfigDir function
 func TestEnsureLocalConfigDir(t *testing.T) {
-	logger := zaptest.NewLogger(t)
-	defer logger.Sync()
+
 	ctx := context.Background()
-	loader := NewCertConfigLoader(ctx, nil, createTestBKECluster(), logger.Sugar())
+	loader := NewCertConfigLoader(ctx, nil, createTestBKECluster(), nil)
 
 	ok, err := loader.ensureLocalConfigDir()
 	assert.NoError(t, err)
@@ -1108,8 +1099,7 @@ func createConfigWithAvailableKeysTestCase(scheme *runtime.Scheme) saveConfigMap
 
 // runSaveConfigMapDataTest runs a single SaveConfigMapData test
 func runSaveConfigMapDataTest(t *testing.T, tt saveConfigMapDataTestCase) {
-	logger := zaptest.NewLogger(t)
-	defer logger.Sync()
+
 	ctx := context.Background()
 
 	var client client.Client
@@ -1117,7 +1107,7 @@ func runSaveConfigMapDataTest(t *testing.T, tt saveConfigMapDataTestCase) {
 		client = tt.setupClient()
 	}
 
-	loader := NewCertConfigLoader(ctx, client, createTestBKECluster(), logger.Sugar())
+	loader := NewCertConfigLoader(ctx, client, createTestBKECluster(), nil)
 
 	err := loader.SaveConfigMapData(tt.cfg)
 
@@ -1130,10 +1120,9 @@ func runSaveConfigMapDataTest(t *testing.T, tt saveConfigMapDataTestCase) {
 
 // TestBuildConfigMapData_EdgeCases tests edge cases for buildConfigMapData
 func TestBuildConfigMapData_EdgeCases(t *testing.T) {
-	logger := zaptest.NewLogger(t)
-	defer logger.Sync()
+
 	ctx := context.Background()
-	loader := NewCertConfigLoader(ctx, nil, createTestBKECluster(), logger.Sugar())
+	loader := NewCertConfigLoader(ctx, nil, createTestBKECluster(), nil)
 
 	tests := []struct {
 		name       string
@@ -1213,10 +1202,8 @@ func TestUpsertCertConfigMap(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			logger := zaptest.NewLogger(t)
-			defer logger.Sync()
 			ctx := context.Background()
-			loader := NewCertConfigLoader(ctx, tt.setupClient(), createTestBKECluster(), logger.Sugar())
+			loader := NewCertConfigLoader(ctx, tt.setupClient(), createTestBKECluster(), nil)
 
 			err := loader.upsertCertConfigMap(data)
 
@@ -1231,10 +1218,9 @@ func TestUpsertCertConfigMap(t *testing.T) {
 
 // TestApplyConfigToCerts_EmptyCerts tests ApplyConfigToCerts with empty certs
 func TestApplyConfigToCerts_EmptyCerts(t *testing.T) {
-	logger := zaptest.NewLogger(t)
-	defer logger.Sync()
+
 	ctx := context.Background()
-	loader := NewCertConfigLoader(ctx, nil, createTestBKECluster(), logger.Sugar())
+	loader := NewCertConfigLoader(ctx, nil, createTestBKECluster(), nil)
 
 	configData := &CertConfigData{AvailableKeys: make(map[string]bool)}
 	configData.AvailableKeys[ConfigKeyClusterCAPolicy] = true
@@ -1245,11 +1231,10 @@ func TestApplyConfigToCerts_EmptyCerts(t *testing.T) {
 
 // TestProcessTemplateString tests the processTemplateString function
 func TestProcessTemplateString(t *testing.T) {
-	logger := zaptest.NewLogger(t)
-	defer logger.Sync()
+
 	ctx := context.Background()
 	bkeCluster := createTestBKECluster()
-	loader := NewCertConfigLoader(ctx, nil, bkeCluster, logger.Sugar())
+	loader := NewCertConfigLoader(ctx, nil, bkeCluster, nil)
 
 	tests := []struct {
 		name         string
@@ -1293,8 +1278,7 @@ func TestProcessTemplateString(t *testing.T) {
 
 // TestGetTemplateData tests the getTemplateData function
 func TestGetTemplateData(t *testing.T) {
-	logger := zaptest.NewLogger(t)
-	defer logger.Sync()
+
 	ctx := context.Background()
 
 	tests := []struct {
@@ -1328,7 +1312,7 @@ func TestGetTemplateData(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			loader := NewCertConfigLoader(ctx, nil, tt.bkeCluster, logger.Sugar())
+			loader := NewCertConfigLoader(ctx, nil, tt.bkeCluster, nil)
 			data := loader.getTemplateData("test-cluster")
 			assert.Equal(t, tt.expectData["ClusterName"], data["ClusterName"])
 			if addr, ok := tt.expectData["AdvertiseAddress"]; ok {
@@ -1340,10 +1324,9 @@ func TestGetTemplateData(t *testing.T) {
 
 // TestParseDuration tests the parseDuration function
 func TestParseDuration(t *testing.T) {
-	logger := zaptest.NewLogger(t)
-	defer logger.Sync()
+
 	ctx := context.Background()
-	loader := NewCertConfigLoader(ctx, nil, createTestBKECluster(), logger.Sugar())
+	loader := NewCertConfigLoader(ctx, nil, createTestBKECluster(), nil)
 
 	tests := []struct {
 		name        string
@@ -1386,10 +1369,9 @@ func TestParseDuration(t *testing.T) {
 
 // TestIsIPAddress tests the isIPAddress function
 func TestIsIPAddress(t *testing.T) {
-	logger := zaptest.NewLogger(t)
-	defer logger.Sync()
+
 	ctx := context.Background()
-	loader := NewCertConfigLoader(ctx, nil, createTestBKECluster(), logger.Sugar())
+	loader := NewCertConfigLoader(ctx, nil, createTestBKECluster(), nil)
 
 	tests := []struct {
 		name   string
@@ -1433,10 +1415,9 @@ func TestIsIPAddress(t *testing.T) {
 
 // TestParseIPAddress tests the parseIPAddress function
 func TestParseIPAddress(t *testing.T) {
-	logger := zaptest.NewLogger(t)
-	defer logger.Sync()
+
 	ctx := context.Background()
-	loader := NewCertConfigLoader(ctx, nil, createTestBKECluster(), logger.Sugar())
+	loader := NewCertConfigLoader(ctx, nil, createTestBKECluster(), nil)
 
 	tests := []struct {
 		name   string
@@ -1480,10 +1461,9 @@ func TestParseIPAddress(t *testing.T) {
 
 // TestReadLocalJSON tests the readLocalJSON function
 func TestReadLocalJSON(t *testing.T) {
-	logger := zaptest.NewLogger(t)
-	defer logger.Sync()
+
 	ctx := context.Background()
-	loader := NewCertConfigLoader(ctx, nil, createTestBKECluster(), logger.Sugar())
+	loader := NewCertConfigLoader(ctx, nil, createTestBKECluster(), nil)
 
 	content, ok := loader.readLocalJSON(ConfigKeyClusterCAPolicy)
 	assert.False(t, ok)
@@ -1492,10 +1472,9 @@ func TestReadLocalJSON(t *testing.T) {
 
 // TestReadAndParseLocalFiles tests the readAndParseLocalFiles function
 func TestReadAndParseLocalFiles(t *testing.T) {
-	logger := zaptest.NewLogger(t)
-	defer logger.Sync()
+
 	ctx := context.Background()
-	loader := NewCertConfigLoader(ctx, nil, createTestBKECluster(), logger.Sugar())
+	loader := NewCertConfigLoader(ctx, nil, createTestBKECluster(), nil)
 
 	mappings := loader.localFileMappings(&CertConfigData{AvailableKeys: make(map[string]bool)})
 	hasData, count := loader.readAndParseLocalFiles(mappings, &CertConfigData{AvailableKeys: make(map[string]bool)})

@@ -16,6 +16,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -23,9 +24,24 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
-	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/common"
+	bkeinit "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/initialize"
+	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
 )
+
+func TestBuildYumRepoDownloadBaseURLFallbackToIP(t *testing.T) {
+	url := BuildYumRepoDownloadBaseURL(bkeinit.BkeConfig{
+		Cluster: confv1beta1.Cluster{
+			HTTPRepo: confv1beta1.Repo{
+				Domain: "unreachable.invalid",
+				Ip:     "10.0.0.1",
+				Port:   "40080",
+				Prefix: "files",
+			},
+		},
+	})
+	assert.Equal(t, "http://10.0.0.1:40080/files", url)
+}
 
 func TestAvailableLoadBalancerEndPoint(t *testing.T) {
 	tests := []struct {

@@ -32,9 +32,9 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job/builtin/plugin"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/clientutil"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/mfutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/pkiutil"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 const (
@@ -124,6 +124,7 @@ func (k *KubeadmPlugin) Execute(commands []string) ([]string, error) {
 		if err = k.getBKEConfig(v); err != nil {
 			return nil, err
 		}
+		k.applyCommandEtcdVersion(parseCommands)
 	}
 
 	switch parseCommands["phase"] {
@@ -167,7 +168,7 @@ func (k *KubeadmPlugin) Execute(commands []string) ([]string, error) {
 
 // initMaster init cluster master
 func (k *KubeadmPlugin) initControlPlane() error {
-	log.Info("Deploy k8s in init master node phase")
+	log.Info("Deploy k8s in init master node phase", "cluster", k.clusterName)
 	// install kubelet in control plane node
 	if err := k.installKubectlCommand(); err != nil {
 		return err
@@ -198,7 +199,7 @@ func (k *KubeadmPlugin) initControlPlane() error {
 }
 
 func (k *KubeadmPlugin) joinControlPlane() error {
-	log.Info("Deploy k8s in join master node phase")
+	log.Info("Deploy k8s in join master node phase", "cluster", k.clusterName)
 	// install kubelet in control plane node
 	if err := k.installKubectlCommand(); err != nil {
 		return err
@@ -225,7 +226,7 @@ func (k *KubeadmPlugin) joinControlPlane() error {
 }
 
 func (k *KubeadmPlugin) joinWorker() error {
-	log.Info("Deploy k8s in join worker node phase")
+	log.Info("Deploy k8s in join worker node phase", "cluster", k.clusterName)
 
 	// step 1 get CA certificates from cluster-api
 	if err := k.joinWorkerCertCommand(); err != nil {
@@ -246,7 +247,7 @@ func (k *KubeadmPlugin) joinWorker() error {
 // backup cluster config, pre-pull images, and get component pod hash values
 func (k *KubeadmPlugin) prepareUpgrade(backUpEtcd bool, clusterType string) (map[string]string, error) {
 	// step 1 backup etcd
-	log.Infof("backup etcd")
+	log.Infof("backup etcd for cluster %s", k.clusterName)
 	if backUpEtcd {
 		if err := k.backupEtcd(); err != nil {
 			return nil, err
@@ -254,7 +255,7 @@ func (k *KubeadmPlugin) prepareUpgrade(backUpEtcd bool, clusterType string) (map
 	}
 
 	// step 2 backup cluster etc
-	log.Infof("backup cluster etc")
+	log.Infof("backup cluster etc for cluster %s", k.clusterName)
 	if err := k.backupClusterEtc(clusterType); err != nil {
 		return nil, err
 	}
@@ -276,7 +277,7 @@ func (k *KubeadmPlugin) prepareUpgrade(backUpEtcd bool, clusterType string) (map
 }
 
 func (k *KubeadmPlugin) upgradeControlPlane(backUpEtcd bool, clusterType string) error {
-	log.Info("upgrade cluster in upgrade master node phase")
+	log.Info("upgrade cluster in upgrade master node phase", "cluster", k.clusterName)
 
 	if clusterType == "bocloud" {
 		// 对于bocloud集群，需要先替换证书（重新创建manifests），重启kubelet容器，再升级组件，最后再次重启kubelet容器
@@ -293,12 +294,13 @@ func (k *KubeadmPlugin) upgradeControlPlane(backUpEtcd bool, clusterType string)
 
 	// step 3.1 add new param to boot
 	if k.boot != nil {
-		log.Info("add new param to boot when upgrade control plane")
+		log.Debugf("add new param to boot when upgrade control plane for cluster %s", k.clusterName)
 		k.boot.Extra["upgradeWithOpenFuyao"] = k.boot.HasOpenFuyaoAddon()
 	}
 
 	// step 4 upgrade components one by one
-	log.Infof("upgrade components")
+	log.Debugf("upgrade components for cluster %s", k.clusterName)
+	var upgradedComponents []string
 	for _, component := range mfutil.GetControlPlaneComponents() {
 		// 判断是否需要升级该组件
 		need, err := k.needUpgradeComponent(component)
@@ -307,7 +309,7 @@ func (k *KubeadmPlugin) upgradeControlPlane(backUpEtcd bool, clusterType string)
 			return err
 		}
 		if !need {
-			log.Infof("component %s already upgrade to %s, skip upgrade", component, k.boot.BkeConfig.Cluster.KubernetesVersion)
+			log.Debugf("component %s already upgrade to %s, skip upgrade", component, k.boot.BkeConfig.Cluster.KubernetesVersion)
 			continue
 		}
 
@@ -320,15 +322,18 @@ func (k *KubeadmPlugin) upgradeControlPlane(backUpEtcd bool, clusterType string)
 		if err := k.waitComponentReady(component, podHash); err != nil {
 			return err
 		}
-		log.Infof("component %s upgrade success", component)
+		log.Debugf("component %s upgrade success", component)
+		upgradedComponents = append(upgradedComponents, component)
 	}
+	log.Infof("control plane components upgrade completed for cluster %s: total=%d, upgraded=%v",
+		k.clusterName, len(upgradedComponents), upgradedComponents)
 
 	// step 5 upgrade kubelet
-	log.Infof("upgrade kubelet")
+	log.Infof("upgrade kubelet for cluster %s", k.clusterName)
 	if err := k.installKubeletCommand(); err != nil {
 		return err
 	}
-	log.Infof("upgrade kubectl for control plane node")
+	log.Infof("upgrade kubectl for control plane node, cluster %s", k.clusterName)
 	// step 6 install new kubectl in control plane node
 	if err := k.installKubectlCommand(); err != nil {
 		return err
@@ -337,12 +342,12 @@ func (k *KubeadmPlugin) upgradeControlPlane(backUpEtcd bool, clusterType string)
 }
 
 func (k *KubeadmPlugin) upgradeWorker() error {
-	log.Info("upgrade cluster in upgrade worker node phase")
+	log.Info("upgrade cluster in upgrade worker node phase", "cluster", k.clusterName)
 	// step 1 upgrade kubelet
 	if err := k.installKubeletCommand(); err != nil {
 		return err
 	}
-	log.Infof("upgrade kubectl for worker node")
+	log.Infof("upgrade kubectl for worker node, cluster %s", k.clusterName)
 	// step 2 install new kubectl in worker node
 	if err := k.installKubectlCommand(); err != nil {
 		return err
@@ -351,7 +356,7 @@ func (k *KubeadmPlugin) upgradeWorker() error {
 }
 
 func (k *KubeadmPlugin) upgradeEtcd(backUpEtcd bool, clusterType string) error {
-	log.Info("upgrade etcd ")
+	log.Info("upgrade etcd", "cluster", k.clusterName)
 
 	// 执行升级前的准备工作
 	beforeHash, err := k.prepareUpgrade(backUpEtcd, clusterType)
@@ -360,7 +365,7 @@ func (k *KubeadmPlugin) upgradeEtcd(backUpEtcd bool, clusterType string) error {
 	}
 
 	// step 4 upgrade components one by one
-	log.Infof("upgrade components")
+	log.Infof("upgrade etcd components for cluster %s", k.clusterName)
 	component := mfutil.Etcd
 	need, err := k.needUpgradeEtcd()
 	if err != nil {
@@ -414,6 +419,20 @@ func (k *KubeadmPlugin) uploadTargetClusterKubeletConfig() error {
 	}
 
 	return nil
+}
+
+// applyCommandEtcdVersion overrides spec etcd version when the provider passes a
+// declarative upgrade target (VersionContext / release bundle).
+func (k *KubeadmPlugin) applyCommandEtcdVersion(parseCommands map[string]string) {
+	v, ok := parseCommands["etcdVersion"]
+	if !ok || v == "" || k.boot == nil || k.boot.BkeConfig == nil {
+		return
+	}
+	k.boot.BkeConfig.Cluster.EtcdVersion = v
+	if k.boot.Extra == nil {
+		k.boot.Extra = map[string]interface{}{}
+	}
+	k.boot.Extra["etcdVersion"] = v
 }
 
 func (k *KubeadmPlugin) getBKEConfig(bkeConfigNS string) error {

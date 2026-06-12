@@ -16,14 +16,12 @@ import (
 	"context"
 	"time"
 
+	"github.com/pkg/errors"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/client/v3/snapshot"
-
-	"github.com/pkg/errors"
+	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	k8setcd "k8s.io/kubernetes/cmd/kubeadm/app/util/etcd"
-
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
 )
 
 const etcdTimeout = 2 * time.Second
@@ -49,7 +47,13 @@ func Save(c *k8setcd.Client, dbPath string) error {
 		TLS: c.TLS,
 	}
 
-	if err := snapshot.Save(ctx, log.Desugar(), cfg, dbPath); err != nil {
+	snapshotLogger, err := zap.NewProduction()
+	if err != nil {
+		return errors.Errorf("failed to create etcd snapshot logger: %v", err)
+	}
+	defer func() { _ = snapshotLogger.Sync() }()
+
+	if err := snapshot.Save(ctx, snapshotLogger, cfg, dbPath); err != nil {
 		return errors.Errorf("failed to save etcd snapshot: %v", err)
 	}
 	return nil

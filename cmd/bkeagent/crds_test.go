@@ -24,9 +24,9 @@ import (
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/stretchr/testify/assert"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic"
@@ -171,13 +171,33 @@ func (m *mockResourceInterface) Create(ctx context.Context, obj *unstructured.Un
 	}
 	return &unstructured.Unstructured{}, nil
 }
-func (m *mockResourceInterface) Update(context.Context, *unstructured.Unstructured, metav1.UpdateOptions, ...string) (*unstructured.Unstructured, error) { return nil, nil }
-func (m *mockResourceInterface) UpdateStatus(context.Context, *unstructured.Unstructured, metav1.UpdateOptions) (*unstructured.Unstructured, error) { return nil, nil }
-func (m *mockResourceInterface) Delete(context.Context, string, metav1.DeleteOptions, ...string) error { return nil }
-func (m *mockResourceInterface) DeleteCollection(context.Context, metav1.DeleteOptions, metav1.ListOptions) error { return nil }
-func (m *mockResourceInterface) Get(context.Context, string, metav1.GetOptions, ...string) (*unstructured.Unstructured, error) { return nil, nil }
-func (m *mockResourceInterface) List(context.Context, metav1.ListOptions) (*unstructured.UnstructuredList, error) { return nil, nil }
-func (m *mockResourceInterface) Watch(context.Context, metav1.ListOptions) (watch.Interface, error) { return nil, nil }
-func (m *mockResourceInterface) Patch(context.Context, string, types.PatchType, []byte, metav1.PatchOptions, ...string) (*unstructured.Unstructured, error) { return nil, nil }
-func (m *mockResourceInterface) Apply(context.Context, string, *unstructured.Unstructured, metav1.ApplyOptions, ...string) (*unstructured.Unstructured, error) { return nil, nil }
-func (m *mockResourceInterface) ApplyStatus(context.Context, string, *unstructured.Unstructured, metav1.ApplyOptions) (*unstructured.Unstructured, error) { return nil, nil }
+func (m *mockResourceInterface) Update(context.Context, *unstructured.Unstructured, metav1.UpdateOptions, ...string) (*unstructured.Unstructured, error) {
+	return nil, nil
+}
+func (m *mockResourceInterface) UpdateStatus(context.Context, *unstructured.Unstructured, metav1.UpdateOptions) (*unstructured.Unstructured, error) {
+	return nil, nil
+}
+func (m *mockResourceInterface) Delete(context.Context, string, metav1.DeleteOptions, ...string) error {
+	return nil
+}
+func (m *mockResourceInterface) DeleteCollection(context.Context, metav1.DeleteOptions, metav1.ListOptions) error {
+	return nil
+}
+func (m *mockResourceInterface) Get(context.Context, string, metav1.GetOptions, ...string) (*unstructured.Unstructured, error) {
+	return nil, nil
+}
+func (m *mockResourceInterface) List(context.Context, metav1.ListOptions) (*unstructured.UnstructuredList, error) {
+	return nil, nil
+}
+func (m *mockResourceInterface) Watch(context.Context, metav1.ListOptions) (watch.Interface, error) {
+	return nil, nil
+}
+func (m *mockResourceInterface) Patch(context.Context, string, types.PatchType, []byte, metav1.PatchOptions, ...string) (*unstructured.Unstructured, error) {
+	return nil, nil
+}
+func (m *mockResourceInterface) Apply(context.Context, string, *unstructured.Unstructured, metav1.ApplyOptions, ...string) (*unstructured.Unstructured, error) {
+	return nil, nil
+}
+func (m *mockResourceInterface) ApplyStatus(context.Context, string, *unstructured.Unstructured, metav1.ApplyOptions) (*unstructured.Unstructured, error) {
+	return nil, nil
+}

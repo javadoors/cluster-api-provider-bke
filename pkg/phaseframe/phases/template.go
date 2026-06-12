@@ -20,7 +20,6 @@ import (
 	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe"
-	l "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/log"
 )
 
 // TODO: new BKEPhase steps
@@ -40,7 +39,6 @@ type XXX struct {
 }
 
 func NewXXX(ctx *phaseframe.PhaseContext) phaseframe.Phase {
-	ctx.Log.NormalLogger = l.Named(XXXName.String())
 	base := phaseframe.NewBasePhase(ctx, XXXName)
 	return &XXX{BasePhase: base}
 }

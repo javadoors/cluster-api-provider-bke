@@ -15,6 +15,7 @@ package phases
 import (
 	"fmt"
 
+	"github.com/pkg/errors"
 	"sigs.k8s.io/cluster-api/util/version"
 	ctrl "sigs.k8s.io/controller-runtime"
 
@@ -23,6 +24,7 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/command"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/upgrade"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/clusterutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/constant"
 )
@@ -47,7 +49,7 @@ func (e *EnsureContainerdUpgrade) Execute() (ctrl.Result, error) {
 
 func (e *EnsureContainerdUpgrade) getCommand() *command.ENV {
 	ctx, c, bkeCluster, scheme, log := e.Ctx.Untie()
-	log.Error(constant.ContainerdUpgradingReason, "cur bke cluster is : %v", bkeCluster)
+	targetVersion := e.resolveContainerdUpgradeVersion()
 	// Use NodeFetcher to get BKENodes from API server
 	bkeNodes, err := e.Ctx.NodeFetcher().GetBKENodesWrapperForCluster(e.Ctx, bkeCluster)
 	if err != nil {
@@ -74,15 +76,16 @@ func (e *EnsureContainerdUpgrade) getCommand() *command.ENV {
 	}
 
 	params := BuildCommonEnvCommandParams{
-		Ctx:            ctx,
-		Client:         c,
-		BKECluster:     bkeCluster,
-		Scheme:         scheme,
-		ExceptEnvNodes: exceptEnvNodes,
-		Extra:          extra,
-		ExtraHosts:     extraHosts,
-		DryRun:         bkeCluster.Spec.DryRun,
-		Log:            log,
+		Ctx:               ctx,
+		Client:            c,
+		BKECluster:        bkeCluster,
+		Scheme:            scheme,
+		ExceptEnvNodes:    exceptEnvNodes,
+		ContainerdVersion: targetVersion,
+		Extra:             extra,
+		ExtraHosts:        extraHosts,
+		DryRun:            bkeCluster.Spec.DryRun,
+		Log:               log,
 	}
 
 	envCmd, err := BuildCommonEnvCommand(params)
@@ -140,6 +143,10 @@ func (e *EnsureContainerdUpgrade) redeployContainerd() error {
 
 func (e *EnsureContainerdUpgrade) rolloutContainerd() (ctrl.Result, error) {
 	_, _, bkeCluster, _, log := e.Ctx.Untie()
+	if err := e.Ctx.SyncUpgradeTargetsToClusterSpec(); err != nil {
+		return ctrl.Result{}, errors.Wrap(err, "sync containerd upgrade target to cluster spec")
+	}
+	targetVersion := e.resolveContainerdUpgradeVersion()
 
 	err := e.resetContainerd()
 	if err != nil {
@@ -151,9 +158,24 @@ func (e *EnsureContainerdUpgrade) rolloutContainerd() (ctrl.Result, error) {
 	}
 
 	log.Info(constant.ContainerdUpgradeSuccess, "upgrade containerd success")
-	bkeCluster.Status.ContainerdVersion = bkeCluster.Spec.ClusterConfig.Cluster.ContainerdVersion
+	bkeCluster.Status.ContainerdVersion = targetVersion
 
 	return ctrl.Result{}, nil
+}
+
+func (e *EnsureContainerdUpgrade) resolveContainerdUpgradeVersion() string {
+	if e.Ctx == nil || e.Ctx.BKECluster == nil {
+		return ""
+	}
+	if vc := e.Ctx.VersionContext; vc != nil {
+		if v := vc.GetTarget(upgrade.ComponentContainerd); v != "" {
+			return v
+		}
+	}
+	if e.Ctx.BKECluster.Spec.ClusterConfig == nil {
+		return ""
+	}
+	return e.Ctx.BKECluster.Spec.ClusterConfig.Cluster.ContainerdVersion
 }
 
 func (e *EnsureContainerdUpgrade) isContainerdNeedUpgrade(old *bkev1beta1.BKECluster, new *bkev1beta1.BKECluster) bool {
@@ -195,12 +217,20 @@ func (e *EnsureContainerdUpgrade) isContainerdNeedUpgrade(old *bkev1beta1.BKEClu
 	return false
 }
 
+// Version returns the current running containerd version.
+func (e *EnsureContainerdUpgrade) Version() string {
+	if e.Ctx == nil || e.Ctx.BKECluster == nil {
+		return ""
+	}
+	return e.Ctx.BKECluster.Status.ContainerdVersion
+}
+
 // NeedExecute 这个阶段，只有在初始新建补丁版本时才需要执行，如何判断是初始新建补丁版本？old为空，new中openFuyao version带小版本
 func (e *EnsureContainerdUpgrade) NeedExecute(old *bkev1beta1.BKECluster, new *bkev1beta1.BKECluster) bool {
 	if !e.BasePhase.DefaultNeedExecute(old, new) {
 		return false
 	}
-	if !e.isContainerdNeedUpgrade(old, new) {
+	if !e.NeedExecuteWithVersionContext(upgrade.ComponentContainerd, old, new, e.isContainerdNeedUpgrade) {
 		return false
 	}
 	e.SetStatus(bkev1beta1.PhaseWaiting)

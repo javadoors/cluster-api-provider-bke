@@ -705,4 +705,3 @@ func TestPathsMatch(t *testing.T) {
 		})
 	}
 }
-

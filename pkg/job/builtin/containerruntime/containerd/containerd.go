@@ -32,7 +32,7 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/executor/exec"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job/builtin/plugin"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 const (
@@ -51,6 +51,7 @@ var (
 	defaultRuntime          = "runc"
 	defaultInstallDirectory = "/"
 	defaultDataRoot         = "/var/lib/containerd"
+	containerdCertsDir      = "/etc/containerd/certs.d"
 )
 
 type ContainerdPlugin struct {
@@ -98,7 +99,6 @@ func executeTemplateWithFile(tplContent, tplName string, data interface{}, file 
 func (cp *ContainerdPlugin) createHostsTOML(runtimeParam map[string]string) error {
 	repo := runtimeParam["repo"]
 	offline := runtimeParam["repoInsecure"]
-	certsDir := "/etc/containerd/certs.d"
 	registries := []string{repo}
 
 	if offline == "true" {
@@ -108,7 +108,7 @@ func (cp *ContainerdPlugin) createHostsTOML(runtimeParam map[string]string) erro
 	}
 
 	for _, registry := range registries {
-		registryDir := filepath.Join(certsDir, registry)
+		registryDir := filepath.Join(containerdCertsDir, registry)
 		if err := os.MkdirAll(registryDir, utils.RwxRxRx); err != nil {
 			return fmt.Errorf("create %s dir failed: %v", registry, err)
 		}
@@ -385,7 +385,7 @@ func (cp *ContainerdPlugin) startContainerdService() ([]string, error) {
 	out, err = cp.exec.ExecuteCommandWithCombinedOutput("sh", "-c", "systemctl restart containerd")
 	if err != nil {
 		errorMsg := fmt.Sprintf("start docker failed, err: %v, out: %s", err, out)
-		log.Errorf(errorMsg)
+		log.Error(errorMsg)
 		return []string{errorMsg}, fmt.Errorf("start docker failed, err: %v, out: %s", err, out)
 	}
 

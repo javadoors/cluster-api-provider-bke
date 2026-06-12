@@ -103,7 +103,7 @@ func (e *EnsureMasterDelete) reconcileMasterDelete() error {
 	// Get target cluster nodes for BKENode deletion detection
 	targetNodes, targetErr := e.getTargetClusterNodes(bkeCluster)
 	if targetErr != nil {
-		log.Debug("scale-in", "Failed to get target cluster nodes: %v", targetErr)
+		log.Debug("scale-in: Failed to get target cluster nodes: %v", targetErr)
 		// Continue with nil targetNodes, will fall back to legacy mode
 	}
 

@@ -588,6 +588,3 @@ func TestBasePhase_HandleCompletedStatus_Empty(t *testing.T) {
 		t.Error("handleCompletedStatus should add status")
 	}
 }
-
-
-

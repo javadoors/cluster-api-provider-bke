@@ -25,7 +25,7 @@ import (
 	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/cluster"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 type BootScope struct {

@@ -70,8 +70,8 @@ func (e *EnsureComponentUpgrade) loadLocalKubeConfig() error {
 			log.Error(constant.ComponentUpgradeFailed, "Local kubeconfig secret not found")
 			return fmt.Errorf("local kubeconfig secret not found")
 		}
-		log.Error(constant.ComponentUpgradeFailed, "Failed to get local kubeconfig secret, err：%v", err)
-		return fmt.Errorf("failed to get local kubeconfig secret, err：%v", err)
+		log.Error(constant.ComponentUpgradeFailed, "Failed to get local kubeconfig secret, err: %v", err)
+		return fmt.Errorf("failed to get local kubeconfig secret, err: %v", err)
 	}
 	e.localKubeConfig = localKubeConfig
 	return nil
@@ -432,12 +432,23 @@ func (e *EnsureComponentUpgrade) upgradeDeploymentImage(deployment *appsv1.Deplo
 				}
 			}
 		}
+		for i, initContainer := range deploymentCfg.Spec.Template.Spec.InitContainers {
+			log.Info(constant.ComponentUpgradingReason, "Updating Deployment initContainer image info %s: %s -> %s", initContainer.Image, update.ImageName, update.NewTag)
+			if e.isMatchingImage(initContainer.Image, update.ImageName) {
+				newImage := e.buildNewImage(initContainer.Image, update.NewTag)
+				if initContainer.Image != newImage {
+					deploymentCfg.Spec.Template.Spec.InitContainers[i].Image = newImage
+					needUpdated = true
+					log.Info(constant.ComponentUpgradingReason, "Updating Deployment initContainer %s: %s -> %s", deployment.Name, initContainer.Image, newImage)
+				}
+			}
+		}
 
 		if needUpdated {
 			_, err = e.remoteClient.AppsV1().Deployments(namespace).Update(ctx, deploymentCfg, metav1.UpdateOptions{})
 			return err
 		}
-		log.Info(constant.ComponentUpgradingReason, "No containers with image '%s' found in Deployment %s", update.ImageName, deployment.Name)
+		log.Info(constant.ComponentUpgradingReason, "No containers or initContainers with image '%s' found in Deployment %s", update.ImageName, deployment.Name)
 		return nil
 	})
 }
@@ -466,13 +477,24 @@ func (e *EnsureComponentUpgrade) upgradeStatefulSetImage(statefulSet *appsv1.Sta
 				}
 			}
 		}
+		for i, initContainer := range stsCfg.Spec.Template.Spec.InitContainers {
+			log.Info(constant.ComponentUpgradingReason, "Updating StatefulSet initContainer image info %s: %s -> %s", initContainer.Image, update.ImageName, update.NewTag)
+			if e.isMatchingImage(initContainer.Image, update.ImageName) {
+				newImage := e.buildNewImage(initContainer.Image, update.NewTag)
+				if initContainer.Image != newImage {
+					stsCfg.Spec.Template.Spec.InitContainers[i].Image = newImage
+					needUpdated = true
+					log.Info(constant.ComponentUpgradingReason, "Updating StatefulSet initContainer %s: %s -> %s", statefulSet.Name, initContainer.Image, newImage)
+				}
+			}
+		}
 
 		if needUpdated {
 			_, err = e.remoteClient.AppsV1().StatefulSets(namespace).Update(ctx, stsCfg, metav1.UpdateOptions{})
 			return err
 		}
 
-		log.Info(constant.ComponentUpgradingReason, "No containers with image '%s' found in StatefulSet %s", update.ImageName, statefulSet.Name)
+		log.Info(constant.ComponentUpgradingReason, "No containers or initContainers with image '%s' found in StatefulSet %s", update.ImageName, statefulSet.Name)
 		return nil
 	})
 }
@@ -501,13 +523,24 @@ func (e *EnsureComponentUpgrade) upgradeDaemonSetImage(daemonSet *appsv1.DaemonS
 				}
 			}
 		}
+		for i, initContainer := range dsCfg.Spec.Template.Spec.InitContainers {
+			log.Info(constant.ComponentUpgradingReason, "Updating DaemonSet initContainer image info %s: %s -> %s", initContainer.Image, update.ImageName, update.NewTag)
+			if e.isMatchingImage(initContainer.Image, update.ImageName) {
+				newImage := e.buildNewImage(initContainer.Image, update.NewTag)
+				if initContainer.Image != newImage {
+					dsCfg.Spec.Template.Spec.InitContainers[i].Image = newImage
+					dsUpdated = true
+					log.Info(constant.ComponentUpgradingReason, "Updating DaemonSet initContainer %s: %s -> %s", daemonSet.Name, initContainer.Image, newImage)
+				}
+			}
+		}
 
 		if dsUpdated {
 			_, err = e.remoteClient.AppsV1().DaemonSets(namespace).Update(ctx, dsCfg, metav1.UpdateOptions{})
 			return err
 		}
 
-		log.Info(constant.ComponentUpgradingReason, "No containers with image '%s' found in DaemonSet %s", update.ImageName, daemonSet.Name)
+		log.Info(constant.ComponentUpgradingReason, "No containers or initContainers with image '%s' found in DaemonSet %s", update.ImageName, daemonSet.Name)
 		return nil
 	})
 }
@@ -536,12 +569,23 @@ func (e *EnsureComponentUpgrade) upgradeReplicaSetImage(replicaSet *appsv1.Repli
 				}
 			}
 		}
+		for i, initContainer := range rsCfg.Spec.Template.Spec.InitContainers {
+			log.Info(constant.ComponentUpgradingReason, "Updating ReplicaSet initContainer image info %s: %s -> %s", initContainer.Image, update.ImageName, update.NewTag)
+			if e.isMatchingImage(initContainer.Image, update.ImageName) {
+				newImage := e.buildNewImage(initContainer.Image, update.NewTag)
+				if initContainer.Image != newImage {
+					rsCfg.Spec.Template.Spec.InitContainers[i].Image = newImage
+					rsUpdated = true
+					log.Info(constant.ComponentUpgradingReason, "Updating ReplicaSet initContainer %s: %s -> %s", replicaSet.Name, initContainer.Image, newImage)
+				}
+			}
+		}
 
 		if rsUpdated {
 			_, err = e.remoteClient.AppsV1().ReplicaSets(namespace).Update(ctx, rsCfg, metav1.UpdateOptions{})
 			return err
 		}
-		log.Info(constant.ComponentUpgradingReason, "No containers with image '%s' found in ReplicaSet %s", update.ImageName, replicaSet.Name)
+		log.Info(constant.ComponentUpgradingReason, "No containers or initContainers with image '%s' found in ReplicaSet %s", update.ImageName, replicaSet.Name)
 		return nil
 	})
 }

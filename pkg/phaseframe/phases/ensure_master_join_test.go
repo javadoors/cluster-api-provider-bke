@@ -57,7 +57,6 @@ func createTestEnsureMasterJoin() *EnsureMasterJoin {
 	}
 }
 
-
 func TestEnsureMasterJoinConstants(t *testing.T) {
 	assert.Equal(t, "EnsureMasterJoin", string(EnsureMasterJoinName))
 	assert.Equal(t, 10, LogOutputInterval)
@@ -106,5 +105,3 @@ func TestMasterJoinParams_Structure(t *testing.T) {
 	assert.NotNil(t, params.BKECluster)
 	assert.NotNil(t, params.Log)
 }
-
-

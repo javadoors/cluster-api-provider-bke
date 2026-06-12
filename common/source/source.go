@@ -15,6 +15,7 @@ package source
 import (
 	_ "embed"
 	"fmt"
+	"net/url"
 	"os"
 	"runtime"
 	"strings"
@@ -32,8 +33,15 @@ const (
 )
 
 var (
-	yumRepos = "/etc/yum.repos.d"
-	aptRepos = "/etc/apt/sources.list"
+	// yum: 直接在 /etc/yum.repos.d/ 下增加 bke.repo，不移动系统原有源
+	yumRepos    = "/etc/yum.repos.d"
+	bkeRepoFile = "bke.repo"
+
+	// apt: 写入 sources.list.d 目录和 preferences.d，不覆盖系统 sources.list
+	aptSourcesDir = "/etc/apt/sources.list.d"
+	aptPrefsDir   = "/etc/apt/preferences.d"
+	bkeListFile   = "bke.list"
+	bkePrefsFile  = "bke"
 
 	centos    = "CentOS"
 	kylin     = "Kylin"
@@ -42,16 +50,23 @@ var (
 	hopeos    = "HopeOS"
 	euleros   = "EulerOS"
 
-	yumSource = `
-[bke]
+	// priority=1 使 bke 源优先级高于默认源（需 yum-plugin-priorities 或 dnf 原生支持）
+	yumSource = `[bke]
+name = OpenFuyao Repository
 baseurl = {{.baseurl}}
 enabled = 1
 gpgcheck = 0
-name = repo
+priority = 1
 `
 
-	aptSource = `
-deb [trusted=yes] {{.baseurl}} ./
+	// 写入 sources.list.d，不覆盖系统源
+	aptSource = `deb [trusted=yes] {{.baseurl}} ./
+`
+
+	// Pin-Priority: 1001 高于 apt 默认优先级 500，使 bke 源包版本优先被选用
+	aptPrefs = `Package: *
+Pin: origin {{.origin}}
+Pin-Priority: 1001
 `
 )
 
@@ -102,142 +117,91 @@ func GetRPMDownloadPath(url string) (string, error) {
 	return baseurl, nil
 }
 
-func SetSource(url string) error {
-	baseurl, err := GetRPMDownloadPath(url)
+// SetSource 在系统中增加一个高优先级的 BKE 软件源。
+// 对 yum 系统：在 /etc/yum.repos.d/ 下新增 bke.repo（priority=1），不移动现有源文件。
+// 对 apt 系统：在 /etc/apt/sources.list.d/ 下新增 bke.list，并在 /etc/apt/preferences.d/
+// 下新增高优先级 pin 配置（Pin-Priority: 1001），不修改系统 sources.list。
+func SetSource(rawURL string) error {
+	baseurl, err := GetRPMDownloadPath(rawURL)
 	if err != nil {
 		return err
 	}
 
-	if strings.Contains(baseurl, "Ubuntu") {
-		err = backupAptSource()
-		if err != nil {
-			return err
-		}
-		err = writeAptSource(baseurl)
-		if err != nil {
-			return err
-		}
-		return nil
+	if strings.Contains(baseurl, "/"+ubuntu+"/") {
+		return writeAptSource(baseurl)
 	}
-
-	err = backupYumSource()
-	if err != nil {
-		return err
-	}
-	err = writeYumSource(baseurl)
-	if err != nil {
-		return err
-	}
-	return nil
+	return writeYumSource(baseurl)
 }
 
-func backupYumSource() error {
-	files, err := os.ReadDir(yumRepos)
-	if err != nil {
-		return err
-	}
-	bak := yumRepos + "/bak"
-	if !utils.Exists(bak) {
-		err = os.Mkdir(bak, warehouse.DirPerm)
-		if err != nil {
-			return err
-		}
-	}
-	for _, f := range files {
-		if f.Name() == "bak" {
-			continue
-		}
-		err = os.Rename(yumRepos+"/"+f.Name(), bak+"/"+f.Name())
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func backupAptSource() error {
-	return os.Rename(aptRepos, aptRepos+".bak")
-}
-
+// writeYumSource 在 /etc/yum.repos.d/bke.repo 写入高优先级 BKE 源，不影响系统已有 repo 文件。
 func writeYumSource(baseurl string) error {
 	newSource := strings.Replace(yumSource, "{{.baseurl}}", baseurl, -1)
-	return os.WriteFile(yumRepos+"/bke.repo", []byte(newSource), warehouse.FilePerm)
+	return os.WriteFile(yumRepos+"/"+bkeRepoFile, []byte(newSource), warehouse.FilePerm)
 }
 
+// writeAptSource 在 sources.list.d 下写入 bke.list，同时在 preferences.d 下写入
+// 高优先级 pin 配置，不覆盖系统 /etc/apt/sources.list。
 func writeAptSource(baseurl string) error {
 	newSource := strings.Replace(aptSource, "{{.baseurl}}", baseurl, -1)
-	return os.WriteFile(aptRepos, []byte(newSource), warehouse.FilePerm)
+	listPath := aptSourcesDir + "/" + bkeListFile
+	if err := os.WriteFile(listPath, []byte(newSource), warehouse.FilePerm); err != nil {
+		return err
+	}
+
+	origin := originFromURL(baseurl)
+	newPrefs := strings.Replace(aptPrefs, "{{.origin}}", origin, -1)
+	prefsPath := aptPrefsDir + "/" + bkePrefsFile
+	return os.WriteFile(prefsPath, []byte(newPrefs), warehouse.FilePerm)
 }
 
+// originFromURL 从 URL 中提取 hostname，用于 apt Pin: origin 指令。
+func originFromURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Hostname() == "" {
+		return rawURL
+	}
+	return u.Hostname()
+}
+
+// ResetSource 移除由 SetSource 添加的 BKE 源配置文件，恢复到注入前状态。
+// 系统原有源文件在整个过程中均未被修改，无需还原。
 func ResetSource() error {
 	h, err := host.Info()
 	if err != nil {
 		return err
 	}
 	switch strings.ToLower(h.Platform) {
-	case "centos":
-		return resetYumSource()
-	case "kylin":
+	case "centos", "kylin", "openeuler", "hopeos", "euleros":
 		return resetYumSource()
 	case "ubuntu":
 		return resetAptSource()
-	case "openeuler":
-		return resetYumSource()
 	default:
 		return errors.New(fmt.Sprintf("The operating system is not supported %s", h.Platform))
 	}
 }
 
+// resetYumSource 仅删除 bke.repo，系统原有 repo 文件未被动过，无需恢复。
 func resetYumSource() error {
-	bak := yumRepos + "/bak"
-	if !utils.Exists(bak) {
+	repoPath := yumRepos + "/" + bkeRepoFile
+	if !utils.Exists(repoPath) {
 		return nil
 	}
-	if !utils.Exists(yumRepos + "/bke.repo") {
-		return nil
-	}
-	err := os.Remove(yumRepos + "/bke.repo")
-	if err != nil {
-		return err
-	}
-	files, err := os.ReadDir(bak)
-	if err != nil {
-		return err
-	}
-	for _, f := range files {
-		if f.Name() == "bke.repo" {
-			continue
-		}
-		if f.IsDir() {
-			continue
-		}
-		err = os.Rename(bak+"/"+f.Name(), yumRepos+"/"+f.Name())
-		if err != nil {
+	return os.Remove(repoPath)
+}
+
+// resetAptSource 删除 bke.list 和 preferences.d/bke，系统 sources.list 未被修改，无需恢复。
+func resetAptSource() error {
+	listPath := aptSourcesDir + "/" + bkeListFile
+	if utils.Exists(listPath) {
+		if err := os.Remove(listPath); err != nil {
 			return err
 		}
 	}
-	err = os.RemoveAll(bak)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func resetAptSource() error {
-	if !utils.Exists(aptRepos + ".bak") {
-		return nil
-	}
-	err := os.Remove(aptRepos)
-	if err != nil {
-		return err
-	}
-	err = os.Rename(aptRepos+".bak", aptRepos)
-	if err != nil {
-		return err
-	}
-	err = os.Remove(aptRepos + ".bak")
-	if err != nil {
-		return err
+	prefsPath := aptPrefsDir + "/" + bkePrefsFile
+	if utils.Exists(prefsPath) {
+		if err := os.Remove(prefsPath); err != nil {
+			return err
+		}
 	}
 	return nil
 }

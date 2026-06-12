@@ -33,10 +33,10 @@ import (
 	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/cluster"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/annotation"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/clusterutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/nodeutil"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 // DefaultRightVersionFields defines the default number of fields in a normalized version string.
@@ -1069,18 +1069,19 @@ func GetNeedUpgradeEtcds(bkeCluster *bkev1beta1.BKECluster) bkenode.Nodes {
 		bkeCluster,
 		bkeCluster.Status.EtcdVersion,
 		bkeCluster.Spec.ClusterConfig.Cluster.EtcdVersion,
-	)
+	).Etcd()
 }
 
 // GetNeedUpgradeEtcdsWithBKENodes returns etcds that need to be upgraded using pre-fetched BKENodes.
 // Use this in controller context where local kubeconfig is not available.
 func GetNeedUpgradeEtcdsWithBKENodes(bkeCluster *bkev1beta1.BKECluster, bkeNodes bkev1beta1.BKENodes) bkenode.Nodes {
-	return compareVersionAndGetNodesWithBKENodes(
-		bkeCluster,
-		bkeCluster.Status.EtcdVersion,
-		bkeCluster.Spec.ClusterConfig.Cluster.EtcdVersion,
-		bkeNodes,
-	)
+	if bkeCluster.Spec.ClusterConfig == nil {
+		return nil
+	}
+	if !NeedUpgrade(bkeCluster.Status.EtcdVersion, bkeCluster.Spec.ClusterConfig.Cluster.EtcdVersion) {
+		return nil
+	}
+	return filterNonFailedNodes(GetBKENodesFromNodesStatusWithBKENodes(bkeNodes)).Etcd()
 }
 
 func filterNonFailedNodes(statusNodes bkev1beta1.BKENodes) bkenode.Nodes {
@@ -1115,9 +1116,6 @@ func compareVersionAndGetNodesWithBKENodes(
 	oldVersionStr, newVersionStr string,
 	bkeNodes bkev1beta1.BKENodes,
 ) bkenode.Nodes {
-	if !NeedUpgrade(oldVersionStr, newVersionStr) {
-		return nil
-	}
 	return filterNonFailedNodes(GetBKENodesFromNodesStatusWithBKENodes(bkeNodes))
 }
 

@@ -18,6 +18,7 @@ import (
 
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/stretchr/testify/assert"
+
 	econd "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/executor/containerd"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/executor/docker"
 )

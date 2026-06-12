@@ -29,7 +29,7 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/constant"
 	labelhelper "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/label"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 func isScriptFile(filename string) bool {

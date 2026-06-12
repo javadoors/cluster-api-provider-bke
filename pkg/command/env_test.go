@@ -173,6 +173,19 @@ func TestENVNewConatinerdRedeploy(t *testing.T) {
 	}
 }
 
+func TestENVNewConatinerdRedeploy_WithContainerdVersion(t *testing.T) {
+	env := createTestENV()
+	env.ContainerdVersion = "1.7.0"
+
+	err := env.NewConatinerdRedeploy()
+	assert.NoError(t, err)
+
+	cmd, getErr := env.GetCommand()
+	assert.NoError(t, getErr)
+	assert.Len(t, cmd.Spec.Commands, 1)
+	assert.Contains(t, cmd.Spec.Commands[0].Command, "containerdVersion=1.7.0")
+}
+
 func TestENVNew(t *testing.T) {
 	tests := []struct {
 		name    string

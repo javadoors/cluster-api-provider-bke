@@ -31,6 +31,9 @@ type Upgrade struct {
 	ClusterFrom string
 	Phase       confv1beta1.BKEClusterPhase
 	BackUpEtcd  bool
+	// EtcdVersion is the declarative upgrade target from VersionContext (release bundle).
+	// When set, the agent uses it for etcd static pod manifest rendering instead of BKECluster spec.
+	EtcdVersion string
 }
 
 func (u *Upgrade) Validate() error {
@@ -55,17 +58,21 @@ func (u *Upgrade) New() error {
 	phase := fmt.Sprintf("phase=%s", u.Phase)
 	backUpEtcd := fmt.Sprintf("backUpEtcd=%t", u.BackUpEtcd)
 	clusterType := fmt.Sprintf("clusterType=%s", u.ClusterFrom)
+	execCommand := []string{
+		"Kubeadm",
+		phase,
+		bkeConfig,
+		clusterType,
+		backUpEtcd,
+	}
+	if u.EtcdVersion != "" {
+		execCommand = append(execCommand, fmt.Sprintf("etcdVersion=%s", u.EtcdVersion))
+	}
 	commandSpec := GenerateDefaultCommandSpec()
 	commandSpec.Commands = []agentv1beta1.ExecCommand{
 		{
-			ID: "upgrade",
-			Command: []string{
-				"Kubeadm",
-				phase,
-				bkeConfig,
-				clusterType,
-				backUpEtcd,
-			},
+			ID:      "upgrade",
+			Command: execCommand,
 			Type:          agentv1beta1.CommandBuiltIn,
 			BackoffDelay:  3,
 			BackoffIgnore: false,

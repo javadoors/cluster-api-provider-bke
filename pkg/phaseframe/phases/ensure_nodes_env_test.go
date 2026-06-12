@@ -318,7 +318,6 @@ func TestEnsureNodesEnv_NeedExecute_NoNodesNeedEnv(t *testing.T) {
 	assert.False(t, result)
 }
 
-
 func TestEnsureNodesEnv_shouldUseDeepRestore_True(t *testing.T) {
 	InitinitPhaseContextFun()
 
@@ -383,7 +382,7 @@ func TestInstallScriptParams_Structure(t *testing.T) {
 	params := InstallScriptParams{
 		BKECluster: &bkev1beta1.BKECluster{},
 		Log:        createTestLogger(),
-		ScriptsLi:   []string{"script1", "script2"},
+		ScriptsLi:  []string{"script1", "script2"},
 	}
 	assert.NotNil(t, params.BKECluster)
 	assert.NotNil(t, params.Log)

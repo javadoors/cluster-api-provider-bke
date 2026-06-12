@@ -16,7 +16,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"io"
 	"os"
 	"path/filepath"
@@ -30,6 +29,8 @@ import (
 	dockerapi "github.com/docker/docker/client"
 	"github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/util/wait"
+
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 )
 
 const (
@@ -1380,4 +1381,3 @@ func TestApplyBaseConfigDefaults(t *testing.T) {
 		t.Error("Expected log-driver to be json-file")
 	}
 }
-

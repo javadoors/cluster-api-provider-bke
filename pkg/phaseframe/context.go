@@ -28,9 +28,13 @@ import (
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
 	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/mergecluster"
+	releasemanifest "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/release/manifest"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/upgrade"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/annotation"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/constant"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/nodeutil"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 type PhaseContext struct {
@@ -43,8 +47,13 @@ type PhaseContext struct {
 	RestConfig *rest.Config
 	cancelFunc context.CancelFunc
 
-	mux         sync.Mutex
-	nodeFetcher *nodeutil.NodeFetcher
+	mux            sync.Mutex
+	nodeFetcher    *nodeutil.NodeFetcher
+	VersionContext *upgrade.VersionContext
+
+	// DeclarativeDAGCompleted is set when the declarative upgrade DAG finished successfully
+	// in the same reconcile; PhaseFlow must not re-run inline upgrade phases from PostDeploy.
+	DeclarativeDAGCompleted bool
 }
 
 func NewReconcilePhaseCtx(ctx context.Context) *PhaseContext {
@@ -76,6 +85,15 @@ func (pc *PhaseContext) SetLogger(log *bkev1beta1.BKELogger) *PhaseContext {
 	return pc
 }
 
+// BindPhaseLogger attaches structured phase fields to the context logger.
+func (pc *PhaseContext) BindPhaseLogger(phaseName confv1beta1.BKEClusterPhase) {
+	if pc == nil || pc.Log == nil {
+		return
+	}
+	pc.Log.NormalLogger = log.With("phase", phaseName.String()).
+		With("bkecluster", utils.ClientObjNS(pc.BKECluster))
+}
+
 func (pc *PhaseContext) SetScheme(scheme *runtime.Scheme) *PhaseContext {
 	pc.Scheme = scheme
 	return pc
@@ -84,6 +102,44 @@ func (pc *PhaseContext) SetScheme(scheme *runtime.Scheme) *PhaseContext {
 func (pc *PhaseContext) SetRestConfig(restConfig *rest.Config) *PhaseContext {
 	pc.RestConfig = restConfig
 	return pc
+}
+
+// SetVersionContext attaches a version context for declarative upgrade decisions.
+func (pc *PhaseContext) SetVersionContext(vc *upgrade.VersionContext) *PhaseContext {
+	pc.VersionContext = vc
+	return pc
+}
+
+// BuildAndSetVersionContext builds VersionContext from BKECluster and attaches it.
+// Prefer BuildAndSetVersionContextFromBundle during declarative upgrade when a release bundle is available.
+func (pc *PhaseContext) BuildAndSetVersionContext() *PhaseContext {
+	if pc.VersionContext != nil {
+		return pc
+	}
+	if pc.BKECluster == nil {
+		return pc
+	}
+	pc.VersionContext = upgrade.BuildVersionContextFromBKECluster(pc.BKECluster)
+	return pc
+}
+
+// BuildAndSetVersionContextFromBundle builds VersionContext from ReleaseImage bundle(s) and attaches it.
+func (pc *PhaseContext) BuildAndSetVersionContextFromBundle(
+	targetBundle, currentBundle *releasemanifest.Bundle,
+) *PhaseContext {
+	pc.VersionContext = upgrade.BuildVersionContextForUpgrade(targetBundle, currentBundle, pc.BKECluster)
+	return pc
+}
+
+// FinishDeclarativeDAGForPhaseFlow clears stale VersionContext, refreshes BKECluster from the API,
+// and marks that PostDeploy must not repeat declarative inline upgrade phases this reconcile.
+func (pc *PhaseContext) FinishDeclarativeDAGForPhaseFlow() error {
+	if pc == nil {
+		return nil
+	}
+	pc.VersionContext = nil
+	pc.DeclarativeDAGCompleted = true
+	return pc.RefreshCtxBKECluster()
 }
 
 func (pc *PhaseContext) Untie() (context.Context, client.Client, *bkev1beta1.BKECluster, *runtime.Scheme, *bkev1beta1.BKELogger) {
@@ -117,6 +173,7 @@ func (pc *PhaseContext) RefreshCtxBKECluster(customCtx ...context.Context) error
 	}
 	newBKECluster, err := pc.GetNewestBKECluster(ctx)
 	if err != nil {
+		log.Errorf("failed to get newest BKECluster: %v", err)
 		return err
 	}
 	pc.BKECluster = newBKECluster
@@ -132,6 +189,7 @@ func (pc *PhaseContext) RefreshCtxCluster(customCtx ...context.Context) error {
 	}
 	err := pc.RefreshCtxBKECluster(refreshCtx)
 	if err != nil {
+		log.Errorf("failed to refresh BKECluster in RefreshCtxCluster: %v", err)
 		return err
 	}
 	cluster, err := util.GetOwnerCluster(refreshCtx, pc.Client, pc.BKECluster.ObjectMeta)
@@ -243,10 +301,5 @@ func (pc *PhaseContext) SetNodeStateWithMessage(ip string, state confv1beta1.Nod
 
 // SetNodeStateMessage 只设置节点消息（不改变状态）
 func (pc *PhaseContext) SetNodeStateMessage(ip string, message string) error {
-	bkeNode, err := pc.NodeFetcher().GetNodeByIP(pc.Context, pc.BKECluster.Namespace, pc.BKECluster.Name, ip)
-	if err != nil {
-		return err
-	}
-	bkeNode.Status.Message = message
-	return pc.NodeFetcher().UpdateNodeStatus(pc.Context, bkeNode)
+	return pc.NodeFetcher().SetBKENodeStateMessage(pc.Context, pc.BKECluster.Namespace, pc.BKECluster.Name, ip, message)
 }

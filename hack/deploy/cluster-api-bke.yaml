@@ -2092,6 +2092,159 @@ spec:
       subresources:
         status: {}
 ---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.0
+  labels:
+    cluster.x-k8s.io/provider: infrastructure-bke
+    cluster.x-k8s.io/v1beta1: v1beta1
+  name: upgradepaths.config.openfuyao.com
+spec:
+  group: config.openfuyao.com
+  names:
+    kind: UpgradePath
+    listKind: UpgradePathList
+    plural: upgradepaths
+    shortNames:
+      - up
+    singular: upgradepath
+  scope: Cluster
+  versions:
+    - additionalPrinterColumns:
+        - jsonPath: .status.phase
+          name: Phase
+          type: string
+        - jsonPath: .status.pathCount
+          name: Paths
+          type: integer
+      name: v1alpha1
+      schema:
+        openAPIV3Schema:
+          description: UpgradePath defines allowed version upgrade routes loaded from an OCI artifact.
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              description: UpgradePathSpec defines the desired upgrade path catalog.
+              properties:
+                paths:
+                  items:
+                    description: UpgradePathRule is one directed upgrade edge between versions.
+                    properties:
+                      blocked:
+                        type: boolean
+                      deprecated:
+                        type: boolean
+                      from:
+                        type: string
+                      notes:
+                        type: string
+                      postCheck:
+                        items:
+                          description: CheckStep describes a upgrade validation step.
+                          properties:
+                            name:
+                              type: string
+                            required:
+                              type: boolean
+                          type: object
+                        type: array
+                      preCheck:
+                        items:
+                          description: CheckStep describes a upgrade validation step.
+                          properties:
+                            name:
+                              type: string
+                            required:
+                              type: boolean
+                          type: object
+                        type: array
+                      to:
+                        type: string
+                    type: object
+                  type: array
+                versions:
+                  items:
+                    description: VersionEntry defines version info.
+                    properties:
+                      deprecated:
+                        type: boolean
+                      installable:
+                        type: boolean
+                      notes:
+                        type: string
+                      version:
+                        type: string
+                    type: object
+                  type: array
+              type: object
+            status:
+              description: UpgradePathStatus defines the observed upgrade path catalog state.
+              properties:
+                conditions:
+                  items:
+                    description: Condition contains details for one aspect of the current state of this API Resource.
+                    properties:
+                      lastTransitionTime:
+                        format: date-time
+                        type: string
+                      message:
+                        maxLength: 32768
+                        type: string
+                      observedGeneration:
+                        format: int64
+                        minimum: 0
+                        type: integer
+                      reason:
+                        maxLength: 1024
+                        minLength: 1
+                        pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                        type: string
+                      status:
+                        enum:
+                          - "True"
+                          - "False"
+                          - Unknown
+                        type: string
+                      type:
+                        maxLength: 316
+                        pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                        type: string
+                    required:
+                      - lastTransitionTime
+                      - message
+                      - reason
+                      - status
+                      - type
+                    type: object
+                  type: array
+                lastCheckedAt:
+                  format: date-time
+                  type: string
+                lastDigest:
+                  type: string
+                pathCount:
+                  type: integer
+                phase:
+                  description: UpgradePathPhase is the validation/lifecycle phase of an UpgradePath.
+                  enum:
+                    - Active
+                    - Blocked
+                    - Invalid
+                  type: string
+              type: object
+          type: object
+      served: true
+      storage: true
+      subresources:
+        status: {}
+---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -2188,6 +2341,26 @@ rules:
       - patch
       - update
       - watch
+  - apiGroups:
+      - config.openfuyao.com
+    resources:
+      - upgradepaths
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
+      - watch
+  - apiGroups:
+      - config.openfuyao.com
+    resources:
+      - upgradepaths/status
+    verbs:
+      - get
+      - patch
+      - update
   - apiGroups:
       - bootstrap.cluster.x-k8s.io
       - cluster.x-k8s.io
@@ -2360,6 +2533,8 @@ spec:
               name: localtime
             - mountPath: /manifests
               name: manifests
+            - mountPath: /var/lib/bke/release-cache
+              name: release-cache
       initContainers:
         - command:
             - /bin/sh
@@ -2387,6 +2562,10 @@ spec:
         - hostPath:
             path: /etc/localtime
           name: localtime
+        - hostPath:
+            path: /var/lib/bke/release-cache
+            type: DirectoryOrCreate
+          name: release-cache
         - emptyDir: {}
           name: manifests
 ---
@@ -2480,4 +2659,25 @@ webhooks:
           - UPDATE
         resources:
           - bkeclusters
+    sideEffects: None
+  - admissionReviewVersions:
+      - v1
+    clientConfig:
+      service:
+        name: bke-webhook-service
+        namespace: cluster-system
+        path: /validate-config-openfuyao-com-v1alpha1-upgradepath
+    failurePolicy: Fail
+    name: vupgradepath.kb.io
+    rules:
+      - apiGroups:
+          - config.openfuyao.com
+        apiVersions:
+          - v1alpha1
+        operations:
+          - CREATE
+          - UPDATE
+          - DELETE
+        resources:
+          - upgradepaths
     sideEffects: None

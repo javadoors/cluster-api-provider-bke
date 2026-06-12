@@ -40,7 +40,7 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job/builtin/selfupdate"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job/builtin/shutdown"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job/builtin/switchcluster"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 type BuiltIn interface {

@@ -31,7 +31,7 @@ import (
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
 	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 // KubeConfigOptions contains options for creating a KubeConfigGenerater

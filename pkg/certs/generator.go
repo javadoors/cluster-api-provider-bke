@@ -24,7 +24,6 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/wsva/lib_go/crypto"
-	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -41,7 +40,7 @@ import (
 	agentutils "gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/pkiutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/constant"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 const (
@@ -71,7 +70,7 @@ type BKEKubernetesCertGenerator struct {
 	bkeCerts              pkiutil.Certificates
 	caCertificatesContent map[string]map[string][]byte
 	certificatesContent   map[string]map[string][]byte
-	log                   *zap.SugaredLogger
+	log                   *log.Logger
 
 	kubeConfigEndpoint   string
 	needCreateKubeConfig bool
@@ -89,7 +88,7 @@ func NewKubernetesCertGenerator(ctx context.Context, client client.Client,
 		bkeCluster:           bkeCluster,
 		client:               client,
 		ctx:                  ctx,
-		log:                  log.Named("certsGenerator").Named(utils.ClientObjNS(bkeCluster)),
+		log:                  log.With("name", "certsGenerator").With("clientObjNS", utils.ClientObjNS(bkeCluster)),
 		needCreateKubeConfig: true,
 		kubeConfigEndpoint:   bkeCluster.Spec.ControlPlaneEndpoint.String(),
 	}
@@ -119,6 +118,12 @@ func (k *BKEKubernetesCertGenerator) LookUpOrGenerate() error {
 		return err
 	}
 
+	// Apply any loaded certificate configuration after cert definitions
+	// have been prepared. setupGlobalCA() only determines whether a user
+	// provided CA exists; applying configuration must happen after
+	// prepareBkeCerts so that k.bkeCerts is initialized.
+	k.LoadConfigForCerts()
+
 	needCreateSecret, err := k.generateCertificates()
 	if err != nil {
 		return err
@@ -143,10 +148,8 @@ func (k *BKEKubernetesCertGenerator) setupGlobalCA() error {
 			GlobalCASecretName, true)
 	}
 
-	if k.isUserCustomCA {
-		// Load custom configuration from ConfigMap if available
-		k.LoadConfigForCerts()
-	}
+	// Do not apply configuration here — cert definitions are not prepared yet.
+	// Applying configuration will be done after prepareBkeCerts in LookUpOrGenerate.
 	return nil
 }
 
@@ -375,7 +378,7 @@ func (k *BKEKubernetesCertGenerator) checkKubeConfigSecret(secretName string, at
 	}
 
 	// For HA cluster, check ha field
-	if IsHACluster(k.bkeCluster) && secret.Data["ha"] == nil {
+	if IsHACluster(k.bkeCluster, k.nodes) && secret.Data["ha"] == nil {
 		// Only retry if not the last attempt
 		if attempt < maxRetries {
 			return false, true
@@ -679,14 +682,14 @@ func (k *BKEKubernetesCertGenerator) VerifyCertificateSans() error {
 func (k *BKEKubernetesCertGenerator) GenerateKubeConfig(endpoint string) error {
 	k.log.Infof("GENERATE_KUBECONFIG: starting to generate kubeconfig for cluster %s", k.certClusterName)
 	k.log.Infof("GENERATE_KUBECONFIG: endpoint = %s", endpoint)
-	k.log.Infof("GENERATE_KUBECONFIG: IsHACluster = %v", IsHACluster(k.bkeCluster))
+	k.log.Infof("GENERATE_KUBECONFIG: IsHACluster = %v", IsHACluster(k.bkeCluster, k.nodes))
 
 	if err := k.createInitialKubeConfig(endpoint); err != nil {
 		return err
 	}
 
 	// 是ha集群在设置一个以域名为主机名的kubeconfig，非域名的供程序使用，域名的给节点使用，同时需要环境初始化配置域名解析
-	if IsHACluster(k.bkeCluster) {
+	if IsHACluster(k.bkeCluster, k.nodes) {
 		return k.handleHAKubeConfig()
 	}
 
@@ -798,19 +801,10 @@ func HasServerAuth(cert *x509.Certificate) bool {
 	return false
 }
 
-func IsHACluster(bkeCluster *bkev1beta1.BKECluster) bool {
-	// For backwards compatibility, this function returns false when nodes are not available.
-	// For accurate HA detection, use IsHAClusterWithNodes.
-	if bkeCluster.Spec.ControlPlaneEndpoint.IsValid() {
-		// If endpoint is valid but we can't check against nodes,
-		// assume it might be HA (conservative approach)
-		return true
+func IsHACluster(bkeCluster *bkev1beta1.BKECluster, nodes bkenode.Nodes) bool {
+	if bkeCluster == nil || len(nodes) == 0 {
+		return false
 	}
-	return false
-}
-
-// IsHAClusterWithNodes checks if the cluster is HA with the given nodes
-func IsHAClusterWithNodes(bkeCluster *bkev1beta1.BKECluster, nodes bkenode.Nodes) bool {
 	if bkeCluster.Spec.ControlPlaneEndpoint.IsValid() {
 		host := bkeCluster.Spec.ControlPlaneEndpoint.Host
 		if nodes.Filter(bkenode.FilterOptions{"IP": host}).Length() == 0 {
@@ -961,6 +955,16 @@ func (k *BKEKubernetesCertGenerator) LoadConfigForCerts() {
 	if !k.hasAnyConfig(cfg) {
 		cfg = k.loadFromLocalAndPersist(loader)
 	}
+	// Ensure cert definitions are prepared before applying configuration.
+	// LoadConfigForCerts may be invoked early (e.g., from setupGlobalCA()),
+	// before k.prepareBkeCerts has run. If certs are not prepared yet,
+	// ApplyConfigToCerts will be skipped due to canApplyConfig check.
+	if k.bkeCerts == nil {
+		if err := k.prepareBkeCerts(false); err != nil {
+			k.log.Warnf("Failed to prepare BKE certs before applying config: %v", err)
+		}
+	}
+
 	if !k.canApplyConfig(cfg) {
 		return
 	}
@@ -991,13 +995,6 @@ func (k *BKEKubernetesCertGenerator) loadFromLocalAndPersist(loader *CertConfigL
 	if localData == nil {
 		k.log.Infof("Local certificate configuration not found. Using default cert logic.")
 		return nil
-	}
-	k.log.Infof("Loaded certificate configuration from local files.")
-	if err := loader.SaveConfigMapData(localData); err != nil {
-		k.log.Warnf("Failed to save local certificate configuration into ConfigMap: %v", err)
-	} else {
-		k.log.Infof("Saved local certificate configuration into ConfigMap %s/%s",
-			CertConfigMapNamespace, CertConfigMapName)
 	}
 	return localData
 }

@@ -42,12 +42,12 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/annotation"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/clusterutil"
-	l "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/log"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/nodeutil"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 var (
-	log = l.Named("BKECluster Webhook")
+	logger = log.With("name", "BKECluster Webhook")
 
 	notAllowedPaths = [][]string{
 		{"metadata", "annotations", "bke.bocloud.com/cluster-from"},
@@ -115,7 +115,7 @@ func (webhook *BKECluster) Default(ctx context.Context, obj runtime.Object) erro
 	// 从 BKENode CRD 获取节点信息设置默认集群入口
 	nodes, err := webhook.getNodesForBKEClusterDirect(ctx, in)
 	if err != nil {
-		log.Warnf("Failed to get nodes for BKECluster %s: %v, skipping endpoint default", in.Name, err)
+		logger.Warnf("Failed to get nodes for BKECluster %s: %v, skipping endpoint default", in.Name, err)
 		nodes = bkenode.Nodes{}
 	}
 
@@ -415,7 +415,7 @@ func (webhook *BKECluster) ValidateBKEClustersNodesUnique(ctx context.Context, b
 		// 从 BKENode CRD 获取其他集群的节点
 		bcNodes, err := webhook.NodeFetcher.GetNodesForBKECluster(ctx, &bc)
 		if err != nil {
-			log.Warnf("failed to get nodes for BKECluster %s: %v", bc.Name, err)
+			logger.Warnf("failed to get nodes for BKECluster %s: %v", bc.Name, err)
 			continue
 		}
 		for i, node := range inNodes {
@@ -529,18 +529,6 @@ func (webhook *BKECluster) validateKubernetesVersionUpgrade(newBKECluster,
 				"new kubernetes version %q is lower than expect min kubernetes version %q, that is not allowed",
 				newBKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion,
 				bkev1beta1.ExpectMinK8sVersion,
-			),
-		)
-	}
-	// compare toVersion is higher than ExpectMaxK8sVersion
-	if toVersion.GTE(bkev1beta1.ExpectMaxK8sVersion) {
-		return field.Invalid(
-			versionPath,
-			newBKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion,
-			fmt.Sprintf(
-				"new kubernetes version %q is higher than expect max kubernetes version %q, that is not allowed",
-				newBKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion,
-				bkev1beta1.ExpectMaxK8sVersion,
 			),
 		)
 	}
@@ -858,7 +846,7 @@ func setBKEClusterDefaultConfig(ctx context.Context, c client.Client, bkeCluster
 		return
 	}
 
-	log := log.With("bkeCluster", utils.ClientObjNS(bkeCluster))
+	log := logger.With("bkeCluster", utils.ClientObjNS(bkeCluster))
 
 	data, err := clusterutil.GetBKEConfigCMData(ctx, c)
 	if err != nil {

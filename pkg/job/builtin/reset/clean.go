@@ -24,10 +24,10 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/common/source"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/httprepo"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/mfutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/resetutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/runtime"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 const (

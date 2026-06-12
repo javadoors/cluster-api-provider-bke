@@ -21,7 +21,6 @@ import (
 
 	"github.com/blang/semver"
 	"github.com/pkg/errors"
-	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -54,6 +53,7 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/condition"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/constant"
 	labelhelper "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/label"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 const (
@@ -65,7 +65,7 @@ const (
 // CommonContextParams holds common context parameters
 type CommonContextParams struct {
 	Ctx context.Context
-	Log *zap.SugaredLogger
+	Log *log.Logger
 }
 
 // CommonResourceParams holds common resource parameters
@@ -390,7 +390,7 @@ func (r *BKEMachineReconciler) handleFakeBootstrap(params FakeBootstrapParams) (
 
 // handleMasterMachineCertificates 处理主控机器证书
 func (r *BKEMachineReconciler) handleMasterMachineCertificates(ctx context.Context, machine *clusterv1.Machine,
-	bkeCluster *bkev1beta1.BKECluster, log *zap.SugaredLogger) error {
+	bkeCluster *bkev1beta1.BKECluster, log *log.Logger) error {
 	config, err := phaseutil.GetMachineAssociateKubeadmConfig(ctx, r.Client, machine)
 	if err != nil {
 		r.logWarningAndEvent(log, bkeCluster, constant.ReconcileErrorReason,
@@ -859,7 +859,7 @@ func (r *BKEMachineReconciler) processResetCommand(params ProcessResetCommandPar
 
 // reconcileBKEMachine used to reconcile all the BKEMachine Status
 func (r *BKEMachineReconciler) reconcileBKEMachine(ctx context.Context, bkeCluster *bkev1beta1.BKECluster,
-	bkemachine *bkev1beta1.BKEMachine, n confv1beta1.Node, log *zap.SugaredLogger) error {
+	bkemachine *bkev1beta1.BKEMachine, n confv1beta1.Node, log *log.Logger) error {
 
 	if condition.HasConditionStatus(bkev1beta1.TargetClusterBootCondition, bkeCluster, confv1beta1.ConditionTrue) {
 		return nil
@@ -968,7 +968,7 @@ func (r *BKEMachineReconciler) handleClusterState(params HandleClusterStateParam
 
 // handleAllNodesBootstrapped handles when all nodes are bootstrapped
 func (r *BKEMachineReconciler) handleAllNodesBootstrapped(ctx context.Context, bkeCluster *bkev1beta1.BKECluster,
-	log *zap.SugaredLogger) error {
+	log *log.Logger) error {
 
 	bkeCluster.Status.KubernetesVersion = bkeCluster.Spec.ClusterConfig.Cluster.KubernetesVersion
 	if err := mergecluster.SyncStatusUntilComplete(r.Client, bkeCluster); err != nil {
@@ -980,7 +980,7 @@ func (r *BKEMachineReconciler) handleAllNodesBootstrapped(ctx context.Context, b
 
 // handleBootstrapFailure handles bootstrap failure
 func (r *BKEMachineReconciler) handleBootstrapFailure(bkeCluster *bkev1beta1.BKECluster,
-	log *zap.SugaredLogger) error {
+	log *log.Logger) error {
 
 	condition.ConditionMark(bkeCluster, bkev1beta1.TargetClusterBootCondition,
 		confv1beta1.ConditionFalse, constant.NodeBootStrapFailedReason, "")
@@ -991,7 +991,7 @@ func (r *BKEMachineReconciler) handleBootstrapFailure(bkeCluster *bkev1beta1.BKE
 
 // handleClusterReady handles when cluster is ready
 func (r *BKEMachineReconciler) handleClusterReady(ctx context.Context, bkeCluster *bkev1beta1.BKECluster,
-	log *zap.SugaredLogger) error {
+	log *log.Logger) error {
 
 	condition.ConditionMark(bkeCluster, bkev1beta1.TargetClusterBootCondition,
 		confv1beta1.ConditionTrue, constant.TargetClusterBootReadyReason, "")
@@ -1011,7 +1011,7 @@ func (r *BKEMachineReconciler) handleClusterReady(ctx context.Context, bkeCluste
 
 // handleClusterBooting handles when cluster is booting
 func (r *BKEMachineReconciler) handleClusterBooting(ctx context.Context, bkeCluster *bkev1beta1.BKECluster,
-	n confv1beta1.Node, log *zap.SugaredLogger) error {
+	n confv1beta1.Node, log *log.Logger) error {
 
 	condition.ConditionMark(bkeCluster, bkev1beta1.TargetClusterBootCondition,
 		confv1beta1.ConditionFalse, constant.TargetClusterBootingReason,
@@ -1031,17 +1031,33 @@ func (r *BKEMachineReconciler) filterAvailableNode(ctx context.Context, roleNode
 	defer r.mux.Unlock()
 
 	if phase == bkev1beta1.InitControlPlane {
+		preferIP := ""
+		if bkeCluster != nil {
+			preferIP = bkeCluster.Spec.ControlPlaneEndpoint.Host
+		}
+		if preferIP != "" {
+			for i := range roleNodes {
+				if roleNodes[i].IP == preferIP {
+					r.nodesBootRecord[roleNodes[i].IP] = struct{}{}
+					return &roleNodes[i], nil
+				}
+			}
+		}
 		r.nodesBootRecord[roleNodes[0].IP] = struct{}{}
 		return &roleNodes[0], nil
 	}
 
 	bkeMachineList := &bkev1beta1.BKEMachineList{}
-	var availableNode *confv1beta1.Node
+	preferIP := ""
+	if bkeCluster != nil {
+		preferIP = bkeCluster.Spec.ControlPlaneEndpoint.Host
+	}
 
 	if err := r.Client.List(ctx, bkeMachineList, phaseutil.GetListFiltersByBKECluster(bkeCluster)...); err != nil {
 		return nil, err
 	}
 
+	availableNodes := make([]confv1beta1.Node, 0, len(roleNodes))
 	for _, node := range roleNodes {
 		// 此举用来在同时boot多个worker节点时，防止一个node被多个worker分配，因为BKEMachineLabel可能会来不及打上
 		if _, ok := r.nodesBootRecord[node.IP]; ok {
@@ -1058,17 +1074,27 @@ func (r *BKEMachineReconciler) filterAvailableNode(ctx context.Context, roleNode
 		}
 		// 如果没有被分配则返回该节点
 		if !nodeBind {
-			availableNode = &node
-			r.nodesBootRecord[node.IP] = struct{}{}
-			break
+			availableNodes = append(availableNodes, node)
 		}
 	}
 
-	if availableNode == nil {
+	if len(availableNodes) == 0 {
 		return nil, errors.New("no available node")
 	}
 
-	return availableNode, nil
+	// Prefer the node that matches ControlPlaneEndpoint.Host if it is among candidates.
+	if preferIP != "" {
+		for i := range availableNodes {
+			if availableNodes[i].IP == preferIP {
+				r.nodesBootRecord[availableNodes[i].IP] = struct{}{}
+				return &availableNodes[i], nil
+			}
+		}
+	}
+
+	// Otherwise pick the first available candidate.
+	r.nodesBootRecord[availableNodes[0].IP] = struct{}{}
+	return &availableNodes[0], nil
 }
 
 // checkTargetClusterNode use the remote client to check the target cluster node with provideID has been created
@@ -1080,7 +1106,7 @@ type TargetClusterNodeParams struct {
 	Cluster     *clusterv1.Cluster
 	Machine     *clusterv1.Machine
 	CurrentNode confv1beta1.Node
-	Log         *zap.SugaredLogger
+	Log         *log.Logger
 }
 
 // checkTargetClusterNode use the remote client to check the target cluster node with provideID has been created
@@ -1257,7 +1283,7 @@ func (r *BKEMachineReconciler) processMatchingNode(targetClusterClient client.Cl
 // add node info to BKECluster.Status.ClusterStatus.Nodes
 func (r *BKEMachineReconciler) markBKEMachineBootstrapReady(ctx context.Context, bkeCluster *bkev1beta1.BKECluster,
 	bkeMachine *bkev1beta1.BKEMachine, assocNode confv1beta1.Node, providerID string,
-	log *zap.SugaredLogger) error {
+	log *log.Logger) error {
 
 	// set MachineAddress
 	setMachineAddress(bkeMachine, assocNode)
@@ -1350,7 +1376,7 @@ func setProviderID(bkeMachine *bkev1beta1.BKEMachine, providerID string) {
 // recordBootstrapPhaseEvent records the bootstrap phase events for the BKEMachine
 func (r *BKEMachineReconciler) recordBootstrapPhaseEvent(cluster *clusterv1.Cluster,
 	bkeCluster *bkev1beta1.BKECluster, node *confv1beta1.Node,
-	phase confv1beta1.BKEClusterPhase, log *zap.SugaredLogger) error {
+	phase confv1beta1.BKEClusterPhase, log *log.Logger) error {
 
 	finalPhase := phase
 
@@ -1448,7 +1474,7 @@ func (r *BKEMachineReconciler) parseLockInfo(cmLock *corev1.ConfigMap) (*locker,
 
 // cordonMasterNode 对主节点进行cordon操作
 func (r *BKEMachineReconciler) cordonMasterNode(ctx context.Context, bkeCluster *bkev1beta1.BKECluster,
-	node *corev1.Node, log *zap.SugaredLogger) error {
+	node *corev1.Node, log *log.Logger) error {
 
 	remoteClient, err := kube.NewRemoteClientByBKECluster(ctx, r.Client, bkeCluster)
 	if err != nil {

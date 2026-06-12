@@ -13,7 +13,7 @@
 package patchutil
 
 import (
-	"github.com/evanphx/json-patch"
+	jsonpatch "github.com/evanphx/json-patch"
 	jsonpatchv2 "gomodules.xyz/jsonpatch/v2"
 	"k8s.io/apimachinery/pkg/util/json"
 )

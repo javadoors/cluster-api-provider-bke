@@ -27,7 +27,6 @@ import (
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
 	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
 	bkenetutil "gopkg.openfuyao.cn/cluster-api-provider-bke/common/utils/net"
-
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/executor/exec"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job/builtin/plugin"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"

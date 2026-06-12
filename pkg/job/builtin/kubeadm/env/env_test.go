@@ -77,6 +77,7 @@ func TestParamKeys(t *testing.T) {
 	assert.Contains(t, params, "extraHosts")
 	assert.Contains(t, params, "hostPort")
 	assert.Contains(t, params, "bkeConfig")
+	assert.Contains(t, params, "containerdVersion")
 }
 
 func TestNew(t *testing.T) {

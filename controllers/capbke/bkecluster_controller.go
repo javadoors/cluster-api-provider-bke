@@ -42,38 +42,48 @@ import (
 	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
 	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/manifest"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/mergecluster"
 	bkemetrics "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/metrics"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phases"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
+	releasemanifest "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/release/manifest"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/statusmanage"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/annotation"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/clustertracker"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/clusterutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/condition"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/config"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/constant"
-	l "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/log"
+	labelhelper "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/label"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/nodeutil"
 	bkepredicates "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/predicates"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 const (
 	nodeWatchRequeueInterval = 10 * time.Second
+	bootstrapReadyStateCode  = 527
+	bkeClusterControllerName = "bkecluster"
 )
+
+func bkeClusterLogger() *log.Logger {
+	return log.ControllerLogger(bkeClusterControllerName)
+}
 
 // BKEClusterReconciler reconciles a BKECluster object
 type BKEClusterReconciler struct {
 	client.Client
-	Scheme      *runtime.Scheme
-	Recorder    record.EventRecorder
-	RestConfig  *rest.Config
-	Tracker     *remote.ClusterCacheTracker
-	controller  controller.Controller
-	NodeFetcher *nodeutil.NodeFetcher
+	Scheme          *runtime.Scheme
+	Recorder        record.EventRecorder
+	RestConfig      *rest.Config
+	Tracker         *remote.ClusterCacheTracker
+	controller      controller.Controller
+	NodeFetcher     *nodeutil.NodeFetcher
+	ReleaseStore    *releasemanifest.Store
+	ManifestApplier manifest.Applier
 }
 
 // initNodeFetcher initializes the NodeFetcher if not already set
@@ -83,10 +93,12 @@ func (r *BKEClusterReconciler) initNodeFetcher() {
 	}
 }
 
-// +kubebuilder:rbac:groups=bke.bocloud.com,resources=*,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=cluster.x-k8s.io;controlplane.cluster.x-k8s.io;bootstrap.cluster.x-k8s.io,resources=*,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=events;secrets;configmaps;namespaces,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=bkeagent.bocloud.com,resources=commands,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=bke.bocloud.com,resources=*,verbs=get;list;watch;create;update;patch;delete;deletecollection
+// +kubebuilder:rbac:groups=cluster.x-k8s.io;controlplane.cluster.x-k8s.io;bootstrap.cluster.x-k8s.io,resources=*,verbs=get;list;watch;create;update;patch;delete;deletecollection
+// +kubebuilder:rbac:groups="",resources=events;secrets;configmaps;namespaces,verbs=get;list;watch;create;update;patch;delete;deletecollection
+// +kubebuilder:rbac:groups=bkeagent.bocloud.com,resources=commands,verbs=get;list;watch;create;update;patch;delete;deletecollection
+// +kubebuilder:rbac:groups=config.openfuyao.com,resources=clusterversions,verbs=get;list;watch;create;update;patch
+// +kubebuilder:rbac:groups=config.openfuyao.com,resources=clusterversions/status,verbs=get;update;patch
 // Reconcile is the main logic of bke cluster controller.
 func (r *BKEClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	// 获取并验证集群资源
@@ -107,6 +119,13 @@ func (r *BKEClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// 初始化日志记录器
 	bkeLogger := r.initializeLogger(bkeCluster)
 
+	// 安装阶段：确保存在与 BKECluster 关联的 ClusterVersion（设计：BC 创建 CV）
+	if cvResult, err := r.ensureClusterVersionOnInstall(ctx, bkeCluster, bkeLogger); err != nil {
+		return ctrl.Result{}, err
+	} else if cvResult.Requeue || cvResult.RequeueAfter > 0 {
+		return cvResult, nil
+	}
+
 	// 处理代理和节点状态
 	if err = r.handleClusterStatus(ctx, bkeCluster, bkeLogger); err != nil {
 		return ctrl.Result{}, err
@@ -115,6 +134,15 @@ func (r *BKEClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// 初始化阶段上下文并执行阶段流程
 	phaseResult, err := r.executePhaseFlow(ctx, bkeCluster, oldBkeCluster, bkeLogger)
 	if err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// 安装收尾：集群 Ready 后由 BC Patch ClusterVersion.status（设计）
+	bkeCluster, err = r.getAndValidateCluster(ctx, req)
+	if err != nil {
+		return r.handleClusterError(err)
+	}
+	if err := r.completeClusterVersionInstall(ctx, bkeCluster, bkeLogger); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -162,9 +190,9 @@ func (r *BKEClusterReconciler) getOldBKECluster(bkeCluster *bkev1beta1.BKECluste
 
 // initializeLogger 初始化日志记录器
 func (r *BKEClusterReconciler) initializeLogger(bkeCluster *bkev1beta1.BKECluster) *bkev1beta1.BKELogger {
-	log := l.Named("Reconcile").With("bkeCluster", bkeCluster.Name,
+	logger := bkeClusterLogger().With("bkeCluster", bkeCluster.Name,
 		"namespace", bkeCluster.Namespace)
-	return bkev1beta1.NewBKELogger(log, r.Recorder, bkeCluster)
+	return bkev1beta1.NewBKELogger(logger, r.Recorder, bkeCluster)
 }
 
 // handleClusterStatus 处理代理和节点状态
@@ -195,6 +223,21 @@ func (r *BKEClusterReconciler) executePhaseFlow(ctx context.Context,
 		SetBKECluster(bkeCluster)
 	defer phaseCtx.Cancel()
 
+	if r.shouldUseDeclarativeUpgrade(bkeCluster) {
+		bkeClusterLogger().Infof("running declarative upgrade DAG")
+		dagResult, dagErr := r.executeUpgradeDAG(ctx, phaseCtx, oldBkeCluster, bkeCluster, bkeLogger)
+		if dagErr != nil {
+			return dagResult, dagErr
+		}
+		if dagResult.Requeue || dagResult.RequeueAfter > 0 {
+			return dagResult, nil
+		}
+		if err := phaseCtx.FinishDeclarativeDAGForPhaseFlow(); err != nil {
+			return ctrl.Result{}, err
+		}
+		bkeLogger.Info(constant.ComponentUpgradingReason, "declarative upgrade DAG finished; skip duplicate PostDeploy inline upgrade phases")
+	}
+
 	flow := phases.NewPhaseFlow(phaseCtx)
 
 	err := flow.CalculatePhase(oldBkeCluster, bkeCluster)
@@ -204,7 +247,7 @@ func (r *BKEClusterReconciler) executePhaseFlow(ctx context.Context,
 
 	res, err := flow.Execute()
 	if err != nil {
-		log.Warnf("Reconcile bkeCluster %q failed: %v", utils.ClientObjNS(bkeCluster), err)
+		bkeClusterLogger().Warnf("Reconcile bkeCluster %q failed: %v", utils.ClientObjNS(bkeCluster), err)
 	}
 
 	return res, nil
@@ -328,18 +371,18 @@ func clusterToBKEClusterMapFunc(ctx context.Context,
 		}
 		providerCluster, ok := providerCluster.DeepCopyObject().(client.Object)
 		if !ok {
-			l.Errorf("Failed to cast providerCluster to client.Object")
+			bkeClusterLogger().Errorf("Failed to cast providerCluster to client.Object")
 			return nil
 		}
 		key := types.NamespacedName{Namespace: cluster.Namespace, Name: cluster.Spec.InfrastructureRef.Name}
 
 		if err := c.Get(ctx, key, providerCluster); err != nil {
-			l.Errorf("Failed to get %T err: %v", providerCluster, err)
+			bkeClusterLogger().Errorf("Failed to get %T err: %v", providerCluster, err)
 			return nil
 		}
 
 		if annotations.IsExternallyManaged(providerCluster) {
-			l.Errorf("%T is externally managed, skipping mapping", providerCluster)
+			bkeClusterLogger().Errorf("%T is externally managed, skipping mapping", providerCluster)
 			return nil
 		}
 
@@ -372,7 +415,7 @@ func nodeToBKEClusterMapFunc(ctx context.Context, c client.Client) handler.MapFu
 		cluster := &clusterv1.Cluster{}
 		if err := c.Get(ctx, types.NamespacedName{Namespace: clusterNamespace, Name: clusterName},
 			cluster); err != nil {
-			l.Errorf("Failed to get Cluster %s/%s err: %v", clusterNamespace, clusterName, err)
+			bkeClusterLogger().Errorf("Failed to get Cluster %s/%s err: %v", clusterNamespace, clusterName, err)
 			return nil
 		}
 
@@ -427,6 +470,10 @@ func (r *BKEClusterReconciler) computeAgentStatus(ctx context.Context, bkeCluste
 }
 
 func (r *BKEClusterReconciler) initNodeStatus(ctx context.Context, bkeCluster *bkev1beta1.BKECluster) error {
+	// 处理升级加入的节点
+	if r.handleNodeUpgrade(ctx, bkeCluster) {
+		return nil
+	}
 	// 处理节点变化 - now uses ctx to fetch BKENodes
 	nodeChangeFlag := r.handleNodeChanges(ctx, bkeCluster)
 
@@ -462,19 +509,78 @@ func (r *BKEClusterReconciler) initNodeStatus(ctx context.Context, bkeCluster *b
 	return r.syncNodeStatusIfNeeded(bkeCluster, params)
 }
 
+func (r *BKEClusterReconciler) handleNodeUpgrade(ctx context.Context, bkeCluster *bkev1beta1.BKECluster) bool {
+	// Fetch nodes from BKENode CRD
+	bkeNodes, err := r.NodeFetcher.GetNodesForBKECluster(ctx, bkeCluster)
+	if err != nil {
+		bkeClusterLogger().Warnf("Failed to fetch BKENodes for cluster %s: %v", bkeCluster.Name, err)
+		return false
+	}
+
+	// Fetch BKEMachine resources in this cluster and derive node IPs from machine labels.
+	bkeMachines := &bkev1beta1.BKEMachineList{}
+	if err := r.Client.List(ctx, bkeMachines,
+		client.InNamespace(bkeCluster.Namespace),
+		client.MatchingLabels{clusterv1.ClusterNameLabel: bkeCluster.Name}); err != nil {
+		bkeClusterLogger().Warnf("Failed to list BKEMachines for cluster %s: %v", bkeCluster.Name, err)
+		return false
+	}
+
+	nodeByIP := make(map[string]struct{}, len(bkeNodes))
+	for _, node := range bkeNodes {
+		nodeByIP[node.IP] = struct{}{}
+	}
+	machineNodeIPSet := map[string]struct{}{}
+	for _, bkeMachine := range bkeMachines.Items {
+		if ip, ok := labelhelper.CheckBKEMachineLabel(&bkeMachine); ok {
+			machineNodeIPSet[ip] = struct{}{}
+		}
+	}
+
+	updated := false
+	var failedNodes []string
+	for nodeIP := range machineNodeIPSet {
+		if _, exists := nodeByIP[nodeIP]; !exists {
+			continue
+		}
+
+		bkeNode, err := r.NodeFetcher.GetNodeByIP(ctx, bkeCluster.Namespace, bkeCluster.Name, nodeIP)
+		if err != nil {
+			bkeClusterLogger().Debugf("Failed to get BKENode by IP %s for cluster %s: %v", nodeIP, bkeCluster.Name, err)
+			failedNodes = append(failedNodes, nodeIP)
+			continue
+		}
+
+		bkeNode.Status.State = confv1beta1.NodeReady
+		bkeNode.Status.StateCode = bootstrapReadyStateCode
+		bkeNode.Status.Message = "node marked ready by bootstrap command"
+		if err := r.NodeFetcher.UpdateNodeStatus(ctx, bkeNode); err != nil {
+			bkeClusterLogger().Debugf("Failed to update BKENode status for IP %s in cluster %s: %v", nodeIP, bkeCluster.Name, err)
+			failedNodes = append(failedNodes, nodeIP)
+			continue
+		}
+		updated = true
+	}
+	if len(failedNodes) > 0 {
+		bkeClusterLogger().Warnf("Failed to process %d nodes in cluster %s: %v", len(failedNodes), bkeCluster.Name, failedNodes)
+	}
+
+	return updated
+}
+
 // handleNodeChanges 处理节点变化
 func (r *BKEClusterReconciler) handleNodeChanges(ctx context.Context, bkeCluster *bkev1beta1.BKECluster) bool {
 	// Fetch nodes from BKENode CRD
 	bkeNodes, err := r.NodeFetcher.GetNodesForBKECluster(ctx, bkeCluster)
 	if err != nil {
-		log.Warnf("Failed to fetch BKENodes for cluster %s: %v", bkeCluster.Name, err)
+		bkeClusterLogger().Warnf("Failed to fetch BKENodes for cluster %s: %v", bkeCluster.Name, err)
 		return false
 	}
 
 	// Get current node states from BKENode CRD
 	nodeStates, err := r.NodeFetcher.GetNodeStatesForBKECluster(ctx, bkeCluster)
 	if err != nil {
-		log.Warnf("Failed to get node states for cluster %s: %v", bkeCluster.Name, err)
+		bkeClusterLogger().Warnf("Failed to get node states for cluster %s: %v", bkeCluster.Name, err)
 		return false
 	}
 
@@ -491,18 +597,18 @@ func (r *BKEClusterReconciler) handleNodeChanges(ctx context.Context, bkeCluster
 			switch t.Operate {
 			case bkenode.CreateNode:
 				// New node - BKENode should already exist, just log
-				log.Debugf("新增节点 %s", phaseutil.NodeInfo(*t.Node))
+				bkeClusterLogger().Debugf("Adding node %s", phaseutil.NodeInfo(*t.Node))
 			case bkenode.RemoveNode:
 				// Mark node for deletion
 				if err := r.NodeFetcher.UpdateBKENodeState(ctx, bkeCluster.Namespace, bkeCluster.Name,
 					t.Node.IP, confv1beta1.NodeDeleting, "Node marked for deletion"); err != nil {
-					log.Warnf("Failed to update node state for deletion: %v", err)
+					bkeClusterLogger().Warnf("Failed to update node state for deletion: %v", err)
 				}
-				log.Debugf("准备删除节点 %s", phaseutil.NodeInfo(*t.Node))
+				bkeClusterLogger().Debugf("Preparing to delete node %s", phaseutil.NodeInfo(*t.Node))
 			case bkenode.UpdateNode:
-				log.Debugf("更新节点 %s", phaseutil.NodeInfo(*t.Node))
+				bkeClusterLogger().Debugf("Updating node %s", phaseutil.NodeInfo(*t.Node))
 			default:
-				log.Debugf("未知的节点操作类型: %v", t.Operate)
+				bkeClusterLogger().Debugf("Unknown node operation type: %v", t.Operate)
 			}
 		}
 	}
@@ -515,7 +621,7 @@ func (r *BKEClusterReconciler) getNodeFlags(ctx context.Context, bkeCluster *bke
 	// Get node count from BKENode CRD
 	nodeCount, err := r.NodeFetcher.GetNodeCountForCluster(ctx, bkeCluster)
 	if err != nil {
-		log.Warnf("Failed to get node count: %v", err)
+		bkeClusterLogger().Warnf("Failed to get node count: %v", err)
 		nodeCount = 0
 	}
 	// 是否是初次部署
@@ -524,7 +630,7 @@ func (r *BKEClusterReconciler) getNodeFlags(ctx context.Context, bkeCluster *bke
 	// 是否需要升级集群
 	bkeNodes, err := r.NodeFetcher.GetBKENodesWrapperForCluster(ctx, bkeCluster)
 	if err != nil {
-		log.Warnf("Failed to get BKENodes for upgrade check: %v", err)
+		bkeClusterLogger().Warnf("Failed to get BKENodes for upgrade check: %v", err)
 		bkeNodes = nil
 	}
 	upgradeFlag := phaseutil.GetNeedUpgradeNodesWithBKENodes(bkeCluster, bkeNodes).Length() > 0
@@ -580,26 +686,31 @@ func (r *BKEClusterReconciler) processRetryLogic(ctx context.Context, bkeCluster
 func (r *BKEClusterReconciler) processAllNodesRetry(ctx context.Context, bkeCluster *bkev1beta1.BKECluster) {
 	nodeStates, err := r.NodeFetcher.GetNodeStatesForBKECluster(ctx, bkeCluster)
 	if err != nil {
-		log.Warnf("Failed to get node states for cluster %s: %v", bkeCluster.Name, err)
+		bkeClusterLogger().Warnf("Failed to get node states for cluster %s: %v", bkeCluster.Name, err)
 		return
 	}
 
-	log.Debugf("重试标记存在，清理所有节点的失败状态码")
-	// 清理所有节点的失败状态
+	bkeClusterLogger().Debugf("Retry flag present, clearing failure status for all nodes")
+	var failedNodes []string
 	for _, nodeState := range nodeStates {
 		hasFailedFlag, err := r.NodeFetcher.GetNodeStateFlagForCluster(ctx, bkeCluster, nodeState.Node.IP, bkev1beta1.NodeFailedFlag)
 		if err != nil {
-			log.Warnf("Failed to get node state flag for node %s: %v", nodeState.Node.IP, err)
+			bkeClusterLogger().Debugf("Failed to get node state flag for node %s: %v", nodeState.Node.IP, err)
+			failedNodes = append(failedNodes, nodeState.Node.IP)
 			continue
 		}
 		if hasFailedFlag {
 			if err := r.NodeFetcher.UnmarkNodeStateFlagForCluster(ctx, bkeCluster, nodeState.Node.IP, bkev1beta1.NodeFailedFlag); err != nil {
-				log.Warnf("Failed to unmark node state flag for node %s: %v", nodeState.Node.IP, err)
+				bkeClusterLogger().Debugf("Failed to unmark node state flag for node %s: %v", nodeState.Node.IP, err)
+				failedNodes = append(failedNodes, nodeState.Node.IP)
 			}
 		}
 	}
+	if len(failedNodes) > 0 {
+		bkeClusterLogger().Warnf("Failed to process retry for %d nodes in cluster %s: %v", len(failedNodes), bkeCluster.Name, failedNodes)
+	}
 	// 重置状态管理器
-	log.Debugf("重置状态管理器")
+	bkeClusterLogger().Debugf("Resetting status manager")
 	statusmanage.BKEClusterStatusManager.RemoveClusterStatusManagerCache(bkeCluster)
 }
 
@@ -608,18 +719,18 @@ func (r *BKEClusterReconciler) processSpecificNodesRetry(ctx context.Context, bk
 	retryNodes := strings.Split(retryNodeIPs, ",")
 	// 清理指定节点的失败状态
 	for _, nodeIP := range retryNodes {
-		log.Debugf("重试标记存在，清理节点 %s 的失败状态码", nodeIP)
+		bkeClusterLogger().Debugf("Retry flag present, clearing failure status for node %s", nodeIP)
 		hasFailedFlag, err := r.NodeFetcher.GetNodeStateFlagForCluster(ctx, bkeCluster, nodeIP, bkev1beta1.NodeFailedFlag)
 		if err != nil {
-			log.Warnf("Failed to get node state flag for node %s: %v", nodeIP, err)
+			bkeClusterLogger().Warnf("Failed to get node state flag for node %s: %v", nodeIP, err)
 			continue
 		}
 		if hasFailedFlag {
 			if err := r.NodeFetcher.UnmarkNodeStateFlagForCluster(ctx, bkeCluster, nodeIP, bkev1beta1.NodeFailedFlag); err != nil {
-				log.Warnf("Failed to unmark node state flag for node %s: %v", nodeIP, err)
+				bkeClusterLogger().Warnf("Failed to unmark node state flag for node %s: %v", nodeIP, err)
 			}
 		}
-		log.Debugf("重试标记存在，移除节点 %s 的状态缓存", nodeIP)
+		bkeClusterLogger().Debugf("Retry flag present, removing status cache for node %s", nodeIP)
 		statusmanage.BKEClusterStatusManager.RemoveSingleNodeStatusCache(bkeCluster, nodeIP)
 	}
 }
@@ -692,7 +803,7 @@ func (r *BKEClusterReconciler) syncNodeStatusIfNeeded(bkeCluster *bkev1beta1.BKE
 }
 
 func markBKEClusterHealthyStatus(bkeCluster *bkev1beta1.BKECluster, status confv1beta1.ClusterHealthState) {
-	log.Debugf("标记集群 %s 状态为 %s", utils.ClientObjNS(bkeCluster), status)
+	bkeClusterLogger().Infof("Marking cluster %s status as %s", utils.ClientObjNS(bkeCluster), status)
 	bkeCluster.Status.ClusterHealthState = status
 	condition.ConditionMark(bkeCluster, bkev1beta1.ClusterHealthyStateCondition,
 		confv1beta1.ConditionTrue, string(status), "")

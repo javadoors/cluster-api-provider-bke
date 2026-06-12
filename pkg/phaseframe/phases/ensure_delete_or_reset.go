@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -46,6 +45,7 @@ import (
 	agentutils "gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/annotation"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/constant"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 const (
@@ -283,12 +283,33 @@ func (e *EnsureDeleteOrReset) deleteRelatedResources(ctx context.Context, c clie
 func (e *EnsureDeleteOrReset) cleanupClusterResources(ctx context.Context, c client.Client, bkeCluster *bkev1beta1.BKECluster, log *bkev1beta1.BKELogger) error {
 	// delete all associated BKENode resources
 	log.Debug("start delete associated BKENode resources")
-	if err := c.DeleteAllOf(ctx, &confv1beta1.BKENode{},
+	nodeDeleteFilters := []client.DeleteAllOfOption{
 		client.InNamespace(bkeCluster.Namespace),
 		client.MatchingLabels{"cluster.x-k8s.io/cluster-name": bkeCluster.Name},
-	); err != nil {
-		if !apierrors.IsNotFound(err) {
+	}
+	if err := c.DeleteAllOf(ctx, &confv1beta1.BKENode{}, nodeDeleteFilters...); err != nil {
+		if apierrors.IsForbidden(err) {
+			log.Warn(constant.ReconcileErrorReason, "deletecollection forbidden, fallback to delete BKENodes individually: %v", err)
+
+			bnList := &confv1beta1.BKENodeList{}
+			if listErr := c.List(ctx, bnList,
+				client.InNamespace(bkeCluster.Namespace),
+				client.MatchingLabels{"cluster.x-k8s.io/cluster-name": bkeCluster.Name},
+			); listErr != nil {
+				log.Warn(constant.ReconcileErrorReason, "failed to list BKENode resources for fallback delete: %v", listErr)
+				return listErr
+			}
+
+			for i := range bnList.Items {
+				bn := &bnList.Items[i]
+				if delErr := c.Delete(ctx, bn); delErr != nil && !apierrors.IsNotFound(delErr) {
+					log.Warn(constant.ReconcileErrorReason, "failed to delete BKENode %s/%s: %v", bn.Namespace, bn.Name, delErr)
+					return delErr
+				}
+			}
+		} else if !apierrors.IsNotFound(err) {
 			log.Warn(constant.ReconcileErrorReason, "failed to delete BKENode resources: %v", err)
+			return err
 		}
 	}
 
@@ -460,7 +481,7 @@ type ShutdownAgentOnSingleNodeParams struct {
 	BKECluster *bkev1beta1.BKECluster
 	Scheme     *runtime.Scheme
 	Node       confv1beta1.Node
-	Log        *zap.SugaredLogger
+	Log        *log.Logger
 }
 
 // ShutdownAgentOnSingleNode 在单个节点上关闭代理

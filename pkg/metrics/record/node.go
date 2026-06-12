@@ -22,7 +22,7 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/config"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 func NodeBootstrapFailedCountRecord(obj client.Object) {

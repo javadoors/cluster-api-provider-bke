@@ -17,11 +17,10 @@ import (
 	"sync"
 
 	"github.com/pkg/errors"
-	"go.uber.org/zap"
 	"golang.org/x/sync/semaphore"
 
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/config"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 const (
@@ -34,9 +33,10 @@ type MultiCli struct {
 	ctx         context.Context
 	cancleFunc  context.CancelFunc
 	concurrency int
-	log         *zap.SugaredLogger
+	log         *log.Logger
 }
 
+// NewMultiCli creates a new multi-client.
 func NewMultiCli(ctx context.Context) *MultiCli {
 	cancelCtx, cancelFunc := context.WithCancel(ctx)
 	return &MultiCli{
@@ -48,10 +48,12 @@ func NewMultiCli(ctx context.Context) *MultiCli {
 	}
 }
 
-func (c *MultiCli) SetLogger(log *zap.SugaredLogger) {
-	c.log = log
+// SetLogger sets the logger for the multi-client.
+func (c *MultiCli) SetLogger(l *log.Logger) {
+	c.log = l
 }
 
+// RegisterHosts registers hosts for the multi-client.
 func (c *MultiCli) RegisterHosts(hosts []Host) map[string]error {
 	if len(hosts) == 0 {
 		return map[string]error{}
@@ -59,23 +61,24 @@ func (c *MultiCli) RegisterHosts(hosts []Host) map[string]error {
 
 	errs := make(map[string]error)
 
-	for _, host := range hosts {
-		hostCopy := host
+	for i := range hosts {
+		// 直接使用hosts切片中的元素地址，避免range循环变量重用导致的指针问题
+		host := &hosts[i]
 
-		client, err := NewRemoteClient(&hostCopy)
+		client, err := NewRemoteClient(host)
 		if err != nil {
-			errs[hostCopy.Address] = err
+			errs[host.Address] = err
 			continue
 		}
 		client.SetLogger(c.log)
-		c.remotes[hostCopy.Address] = client
-
+		c.remotes[host.Address] = client
 	}
 
-	log.Infof("register %d hosts", len(c.remotes))
+	log.Infof("registered %d hosts, %d failed", len(c.remotes), len(errs))
 	return errs
 }
 
+// AvailableHosts returns the available hosts for the multi-client.
 func (c *MultiCli) AvailableHosts() []string {
 	var hosts []string
 	for k := range c.remotes {
@@ -84,30 +87,36 @@ func (c *MultiCli) AvailableHosts() []string {
 	return hosts
 }
 
+// RemoveHost removes a host from the multi-client.
 func (c *MultiCli) RemoveHost(hostIP string) {
 	delete(c.remotes, hostIP)
 }
 
+// RegisterCustomCmdFunc registers a custom command function for a host.
 func (c *MultiCli) RegisterCustomCmdFunc(hostIP string, f func(host *Host) Command) {
 	c.remotes[hostIP].host.ExtraCustomCmdFunc = f
 }
 
+// RegisterHostsCustomCmdFunc registers a custom command function for all hosts.
 func (c *MultiCli) RegisterHostsCustomCmdFunc(f func(host *Host) Command) {
 	for _, remote := range c.remotes {
 		remote.host.ExtraCustomCmdFunc = f
 	}
 }
 
+// RemoveCustomCmdFunc removes a custom command function for a host.
 func (c *MultiCli) RemoveCustomCmdFunc(hostIP string) {
 	c.remotes[hostIP].host.ExtraCustomCmdFunc = nil
 }
 
+// RemoveHostsCustomCmdFunc removes a custom command function for all hosts.
 func (c *MultiCli) RemoveHostsCustomCmdFunc() {
 	for _, remote := range c.remotes {
 		remote.host.ExtraCustomCmdFunc = nil
 	}
 }
 
+// Run runs a command on all hosts.
 func (c *MultiCli) Run(cmd Command) (stdErrs StdCombine, stdOuts StdCombine) {
 	stdErrs = NewStdCombine()
 	stdOuts = NewStdCombine()
@@ -141,8 +150,13 @@ func (c *MultiCli) Run(cmd Command) (stdErrs StdCombine, stdOuts StdCombine) {
 	sem := semaphore.NewWeighted(int64(c.concurrency))
 
 	for _, remoteCli := range c.remotes {
-		// 拷贝cmd
-		cmdBak := cmd
+		// 深拷贝cmd，避免多个goroutine共享同一个FileUp和Cmds切片
+		cmdBak := Command{
+			Cmds:   make(Commands, len(cmd.Cmds)),
+			FileUp: make([]File, len(cmd.FileUp)),
+		}
+		copy(cmdBak.Cmds, cmd.Cmds)
+		copy(cmdBak.FileUp, cmd.FileUp)
 		// 添加额外命令,针对单个节点自己的
 		if remoteCli.host.ExtraCustomCmdFunc != nil {
 			extraCmd := remoteCli.host.ExtraCustomCmdFunc(remoteCli.host)
@@ -170,6 +184,7 @@ func (c *MultiCli) Run(cmd Command) (stdErrs StdCombine, stdOuts StdCombine) {
 	return stdErrs, stdOuts
 }
 
+// RegisterHostsInfo registers hosts info for the multi-client.
 func (c *MultiCli) RegisterHostsInfo() map[string]error {
 	checkCommand := Command{
 		Cmds: Commands{
@@ -213,7 +228,21 @@ func (c *MultiCli) RegisterHostsInfo() map[string]error {
 	return errs
 }
 
+// NodeArchByAddress returns architecture per connected host after RegisterHostsInfo.
+func (c *MultiCli) NodeArchByAddress() map[string]string {
+	archs := make(map[string]string, len(c.remotes))
+	for addr, remote := range c.remotes {
+		if remote.host == nil {
+			continue
+		}
+		archs[addr] = remote.host.Extra["arch"]
+	}
+	return archs
+}
+
+// Close closes the multi-client.
 func (c *MultiCli) Close() {
+	log.Infof("closing multi-client with %d remotes", len(c.remotes))
 	c.cancleFunc()
 	for _, remote := range c.remotes {
 		_ = remote.CloseRemoteCli()

@@ -20,7 +20,7 @@ import (
 	bkemetrics "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/metrics"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/config"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 // PhaseDurationRecord record the phase run duration

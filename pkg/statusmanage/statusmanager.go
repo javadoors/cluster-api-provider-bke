@@ -18,7 +18,6 @@ import (
 	"strings"
 	"sync"
 
-	"go.uber.org/zap"
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
@@ -27,7 +26,7 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/annotation"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/condition"
-	l "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 const DefaultAllowedFailedCount = 10
@@ -35,7 +34,7 @@ const DefaultAllowedFailedCount = 10
 var (
 	ReconcileAllowedFailedCount int
 	BKEClusterStatusManager     = NewStatusManager()
-	statusLogger                = l.Named("statusManager")
+	statusLogger                = log.With("name", "statusManager")
 )
 
 // StatusManager is used to record the status
@@ -272,7 +271,10 @@ func (b *StatusManager) RemoveNodesStatusCache(bkeCluster *bkev1beta1.BKECluster
 	log.Infof("cluster %s nodes status aready removed from status manager cache", key)
 }
 
-func (b *StatusManager) recordSingleNodeState(bkeNode *confv1beta1.BKENode, nodesStatusMap map[string]*StatusRecord, bkeNodes bkev1beta1.BKENodes, log *zap.SugaredLogger) {
+func (b *StatusManager) recordSingleNodeState(
+	bkeNode *confv1beta1.BKENode, nodesStatusMap map[string]*StatusRecord,
+	bkeNodes bkev1beta1.BKENodes, log *log.Logger,
+) {
 	nodeIP := bkeNode.Spec.IP
 	if !bkeNodes.GetNodeStateFlag(nodeIP, bkev1beta1.NodeStateNeedRecord) {
 		return

@@ -37,9 +37,9 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/annotation"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/condition"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/config"
-	l "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/log"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/nodeutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/patchutil"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 const (
@@ -55,7 +55,7 @@ type bkeNodes struct {
 
 // SyncStatusUntilComplete sync bkecluster Status until complete
 func SyncStatusUntilComplete(c client.Client, bkeCluster *v1beta1.BKECluster, patchs ...PatchFunc) (err error) {
-	log := l.Named("syncer")
+	log := log.With("name", "syncer")
 	ctx, cancel := context.WithTimeout(context.Background(), SyncStatusTimeout)
 	defer cancel()
 	for {
@@ -141,7 +141,19 @@ func prepareClusterData(params PrepareClusterDataParams) (*v1beta1.BKECluster, e
 		p(params.CombinedCluster)
 	}
 
+	// The in-memory combined cluster can lag behind the API during declarative DAG execution.
+	// Always align declarative upgrade progress from the fresh GET before status is written back.
+	PreserveDeclarativeUpgradeFromFresh(currentCombinedBkeCluster, params.CombinedCluster)
+
 	return currentCombinedBkeCluster, nil
+}
+
+// PreserveDeclarativeUpgradeFromFresh copies DeclarativeUpgrade status from fresh into target.
+func PreserveDeclarativeUpgradeFromFresh(fresh, target *v1beta1.BKECluster) {
+	if fresh == nil || target == nil || fresh.Status.DeclarativeUpgrade == nil {
+		return
+	}
+	target.Status.DeclarativeUpgrade = fresh.Status.DeclarativeUpgrade.DeepCopy()
 }
 
 // handleExternalUpdates handles external updates to the cluster
@@ -424,7 +436,7 @@ func updateClusterAndConfigMapWithParams(params UpdateClusterAndConfigMapParams)
 
 	if err := updateModifiedBKENodes(params.Ctx, params.Client, bkeNodes); err != nil {
 		// Log warning but don't fail - node status update is not critical for cluster operation
-		l.Named("syncer").Warnf("Failed to update modified BKENodes: %v", err)
+		log.With("name", "syncer").Warnf("Failed to update modified BKENodes: %v", err)
 	}
 
 	params.CombinedCluster.Status.ClusterHealthState = newBKECuster.Status.ClusterHealthState

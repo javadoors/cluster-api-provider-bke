@@ -29,7 +29,7 @@ import (
 	bkevalidte "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/validation"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/clientutil"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 var (
@@ -65,7 +65,11 @@ type ClusterData struct {
 // ParseCommands get plugin param map from commands
 func ParseCommands(plugin Plugin, commands []string) (map[string]string, error) {
 	externalParam := map[string]string{}
-	for _, c := range commands[1:] {
+	args := commands
+	if len(args) > 0 {
+		args = args[1:]
+	}
+	for _, c := range args {
 		arg := strings.SplitN(c, "=", two)
 		if len(arg) != two {
 			continue

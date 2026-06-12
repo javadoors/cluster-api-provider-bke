@@ -279,12 +279,12 @@ func TestStatusManager_GetNodesResult(t *testing.T) {
 	cluster := &bkev1beta1.BKECluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
 	}
-	
+
 	result := sm.GetNodesResult(cluster, "192.168.1.1")
 	if !result {
 		t.Error("expected true for non-existent node")
 	}
-	
+
 	sm.BKENodesStatusMap["default/test"] = map[string]*StatusRecord{
 		"192.168.1.1": {NeedRequeue: false},
 	}

@@ -24,8 +24,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
-	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
 	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
+	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
 	bkeinit "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/initialize"
 	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/mfutil"
@@ -232,9 +232,9 @@ func TestGetNodeRole(t *testing.T) {
 	)
 
 	tests := []struct {
-		name   string
-		node   *corev1.Node
-		want   string
+		name string
+		node *corev1.Node
+		want string
 	}{
 		{
 			name: "masterWorkerNode",
@@ -630,44 +630,44 @@ func TestGetCertificatesDirFromCertPaths(t *testing.T) {
 
 func TestCollectorSetDefaults(t *testing.T) {
 	tests := []struct {
-		name               string
-		etcdCertDir        string
-		k8sCertDir         string
-		wantEtcdCertDir    string
-		wantK8sCertDir     string
-		wantWarningsCount  int
+		name              string
+		etcdCertDir       string
+		k8sCertDir        string
+		wantEtcdCertDir   string
+		wantK8sCertDir    string
+		wantWarningsCount int
 	}{
 		{
-			name:               "bothEmpty",
-			etcdCertDir:        "",
-			k8sCertDir:         "",
-			wantEtcdCertDir:    bocloudEtcdCertDefaultPath,
-			wantK8sCertDir:     bocloudPkiCertDefaultPath,
-			wantWarningsCount:  2,
+			name:              "bothEmpty",
+			etcdCertDir:       "",
+			k8sCertDir:        "",
+			wantEtcdCertDir:   bocloudEtcdCertDefaultPath,
+			wantK8sCertDir:    bocloudPkiCertDefaultPath,
+			wantWarningsCount: 2,
 		},
 		{
-			name:               "etcdEmpty",
-			etcdCertDir:        "",
-			k8sCertDir:         "/custom/pki",
-			wantEtcdCertDir:    bocloudEtcdCertDefaultPath,
-			wantK8sCertDir:     "/custom/pki",
-			wantWarningsCount:  1,
+			name:              "etcdEmpty",
+			etcdCertDir:       "",
+			k8sCertDir:        "/custom/pki",
+			wantEtcdCertDir:   bocloudEtcdCertDefaultPath,
+			wantK8sCertDir:    "/custom/pki",
+			wantWarningsCount: 1,
 		},
 		{
-			name:               "k8sEmpty",
-			etcdCertDir:        "/custom/etcd",
-			k8sCertDir:         "",
-			wantEtcdCertDir:    "/custom/etcd",
-			wantK8sCertDir:     bocloudPkiCertDefaultPath,
-			wantWarningsCount:  1,
+			name:              "k8sEmpty",
+			etcdCertDir:       "/custom/etcd",
+			k8sCertDir:        "",
+			wantEtcdCertDir:   "/custom/etcd",
+			wantK8sCertDir:    bocloudPkiCertDefaultPath,
+			wantWarningsCount: 1,
 		},
 		{
-			name:               "noneEmpty",
-			etcdCertDir:        "/custom/etcd",
-			k8sCertDir:         "/custom/pki",
-			wantEtcdCertDir:    "/custom/etcd",
-			wantK8sCertDir:     "/custom/pki",
-			wantWarningsCount:  0,
+			name:              "noneEmpty",
+			etcdCertDir:       "/custom/etcd",
+			k8sCertDir:        "/custom/pki",
+			wantEtcdCertDir:   "/custom/etcd",
+			wantK8sCertDir:    "/custom/pki",
+			wantWarningsCount: 0,
 		},
 	}
 
@@ -684,15 +684,15 @@ func TestCollectorSetDefaults(t *testing.T) {
 			collector.setDefaults()
 
 			if collector.result.EtcdCertificatesDir != tt.wantEtcdCertDir {
-				t.Errorf("EtcdCertificatesDir = %v, want %v", 
+				t.Errorf("EtcdCertificatesDir = %v, want %v",
 					collector.result.EtcdCertificatesDir, tt.wantEtcdCertDir)
 			}
 			if collector.result.K8sCertificatesDir != tt.wantK8sCertDir {
-				t.Errorf("K8sCertificatesDir = %v, want %v", 
+				t.Errorf("K8sCertificatesDir = %v, want %v",
 					collector.result.K8sCertificatesDir, tt.wantK8sCertDir)
 			}
 			if len(collector.warns) != tt.wantWarningsCount {
-				t.Errorf("warnings count = %v, want %v", 
+				t.Errorf("warnings count = %v, want %v",
 					len(collector.warns), tt.wantWarningsCount)
 			}
 		})
@@ -701,20 +701,20 @@ func TestCollectorSetDefaults(t *testing.T) {
 
 func TestCollectorCheckEtcdRole(t *testing.T) {
 	const testHostname = "test-node"
-	
+
 	tests := []struct {
-		name        string
-		getPodErr   error
+		name         string
+		getPodErr    error
 		wantEtcdRole bool
 	}{
 		{
-			name:        "etcdPodExists",
-			getPodErr:   nil,
+			name:         "etcdPodExists",
+			getPodErr:    nil,
 			wantEtcdRole: true,
 		},
 		{
-			name:        "etcdPodNotExists",
-			getPodErr:   errors.New("not found"),
+			name:         "etcdPodNotExists",
+			getPodErr:    errors.New("not found"),
 			wantEtcdRole: false,
 		},
 	}
@@ -723,8 +723,8 @@ func TestCollectorCheckEtcdRole(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			client := &Client{}
 			collector := &Collector{client: client}
-			
-			patches := gomonkey.ApplyMethod(client, "GetPod", 
+
+			patches := gomonkey.ApplyMethod(client, "GetPod",
 				func(_ *Client, _, _ string) (*corev1.Pod, error) {
 					return &corev1.Pod{}, tt.getPodErr
 				})
@@ -759,28 +759,28 @@ func TestCollectorSelectAvailableCollectNode(t *testing.T) {
 	)
 
 	tests := []struct {
-		name              string
-		nodeRole          []string
-		healthCheckErr    error
-		wantNodeSelected  bool
+		name             string
+		nodeRole         []string
+		healthCheckErr   error
+		wantNodeSelected bool
 	}{
 		{
-			name:              "healthyMasterNode",
-			nodeRole:          []string{bkenode.MasterNodeRole},
-			healthCheckErr:    nil,
-			wantNodeSelected:  true,
+			name:             "healthyMasterNode",
+			nodeRole:         []string{bkenode.MasterNodeRole},
+			healthCheckErr:   nil,
+			wantNodeSelected: true,
 		},
 		{
-			name:              "unhealthyMasterNode",
-			nodeRole:          []string{bkenode.MasterNodeRole},
-			healthCheckErr:    errors.New("unhealthy"),
-			wantNodeSelected:  false,
+			name:             "unhealthyMasterNode",
+			nodeRole:         []string{bkenode.MasterNodeRole},
+			healthCheckErr:   errors.New("unhealthy"),
+			wantNodeSelected: false,
 		},
 		{
-			name:              "workerNode",
-			nodeRole:          []string{bkenode.WorkerNodeRole},
-			healthCheckErr:    nil,
-			wantNodeSelected:  false,
+			name:             "workerNode",
+			nodeRole:         []string{bkenode.WorkerNodeRole},
+			healthCheckErr:   nil,
+			wantNodeSelected: false,
 		},
 	}
 
@@ -925,11 +925,11 @@ func TestCollectorCollectControlPlaneEndpoint(t *testing.T) {
 			}
 			if !tt.wantErr {
 				if collector.result.ControlPlaneEndpoint.Host != testHost {
-					t.Errorf("Host = %v, want %v", 
+					t.Errorf("Host = %v, want %v",
 						collector.result.ControlPlaneEndpoint.Host, testHost)
 				}
 				if collector.result.ControlPlaneEndpoint.Port != testPort {
-					t.Errorf("Port = %v, want %v", 
+					t.Errorf("Port = %v, want %v",
 						collector.result.ControlPlaneEndpoint.Port, testPort)
 				}
 			}
@@ -1016,7 +1016,7 @@ func TestCollectorCollectAPIServerInfo(t *testing.T) {
 				t.Error("expected error but got none")
 			}
 			if len(collector.warns) != tt.wantWarnings {
-				t.Errorf("warnings count = %v, want %v", 
+				t.Errorf("warnings count = %v, want %v",
 					len(collector.warns), tt.wantWarnings)
 			}
 		})

@@ -29,7 +29,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/uuid"
 	yamlutil "k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/restmapper"
@@ -173,7 +172,7 @@ func (c *Client) getMapping(
 		mapping, err = restMapper.RESTMapping(gvk.GroupKind(), gvk.Version)
 		if err != nil {
 			if apierrors2.IsNoMatchError(err) && gvk.Kind == "ServiceMonitor" {
-				c.Log.Infof("addon obj Kind： %s, Name %s, APIVersion %s, not support %s in target cluster skip",
+				c.Log.Infof("addon obj Kind: %s, Name %s, APIVersion %s, not support %s in target cluster skip",
 					unstruct.GetKind(), unstruct.GetName(), unstruct.GetAPIVersion(), task.Operate)
 				return nil, nil
 			}
@@ -227,7 +226,7 @@ func (c *Client) handleCreateOperation(
 	obj, err := dr.Apply(c.Ctx, unstruct.GetName(), &unstruct,
 		metav1.ApplyOptions{Force: true, FieldManager: "bke"})
 	if err != nil {
-		c.Log.Errorf("faild apply %v", unstruct.GroupVersionKind())
+		c.Log.Errorf("failed to apply %v, error: %v", unstruct.GroupVersionKind(), err)
 		return nil, err
 	}
 	if task.recorder != nil {
@@ -256,11 +255,11 @@ func (c *Client) handleUpdateOperation(
 		metav1.PatchOptions{Force: &trueVar, FieldManager: "bke"})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			c.Log.Warnf("addon obj Kind： %s, Name %s  not found, skip update",
+			c.Log.Warnf("addon obj Kind: %s, Name %s not found, skip update",
 				unstruct.GetKind(), unstruct.GetName())
 			return nil, nil
 		}
-		c.Log.Errorf("faild update %v", gvk)
+		c.Log.Errorf("failed to update %v, error: %v", gvk, err)
 		return nil, err
 	}
 
@@ -296,7 +295,7 @@ func (c *Client) handleRemoveOperation(
 	err := dr.Delete(c.Ctx, unstruct.GetName(), metav1.DeleteOptions{})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			c.Log.Warnf("addon obj Kind： %s, Name %s  not found, skip delete",
+			c.Log.Warnf("addon obj Kind: %s, Name %s not found, skip delete",
 				unstruct.GetKind(), unstruct.GetName())
 			return nil
 		}
@@ -317,9 +316,9 @@ func (c *Client) handleWaitAndLogging(
 		if obj == nil {
 			obj = &unstruct
 		}
-		c.Log.Infof("wait for addon obj Kind： %s, Name %s", obj.GetKind(), obj.GetName())
+		c.Log.Infof("wait for addon obj Kind: %s, Name %s", obj.GetKind(), obj.GetName())
 		if err := c.Wait(obj, task); err != nil {
-			c.Log.Errorf("addon obj Kind： %s, Name %s  wait failed, err: %v",
+			c.Log.Errorf("addon obj Kind: %s, Name %s  wait failed, err: %v",
 				obj.GetKind(), obj.GetName(), err)
 			return err
 		}
@@ -328,53 +327,68 @@ func (c *Client) handleWaitAndLogging(
 	if obj == nil {
 		obj = &unstruct
 	}
-	c.Log.Infof("addon obj Kind： %s, Name %s,APIVersion %s, %s success",
+	c.Log.Infof("addon obj Kind: %s, Name %s, APIVersion %s, %s success",
 		obj.GetKind(), obj.GetName(), obj.GetAPIVersion(), task.Operate)
 	return nil
 }
 
 // RenderYamlToDecoder render yaml and return decoder
 func RenderYamlToDecoder(task *Task) (*yamlutil.YAMLOrJSONDecoder, error) {
-	tmpFile := ""
-	if !strings.Contains(task.FilePath, "noexecute") {
-		b, err := os.ReadFile(task.FilePath)
-		if err != nil {
-			return nil, err
-		}
-		tmpl, err := template.New(task.Name).Funcs(templateutil.CommonFuncMap()).Parse(string(b))
-		if err != nil {
-			return nil, errors.Wrapf(err, "failed to parse addon %s template yaml file", task.Name)
-		}
-		tmpFile = fmt.Sprintf("%s/%s-%s.yaml", os.TempDir(), task.Name, uuid.NewUUID())
-		f, err := os.OpenFile(tmpFile, os.O_CREATE|os.O_RDWR, DefaultFilePermission)
-		if err != nil {
-			return nil, err
-		}
-		defer func() {
-			if closeErr := f.Close(); closeErr != nil {
-				// Log the error but don't return it since function has already returned
-				// This is a common pattern for closing resources in defer
-			}
-			if removeErr := os.Remove(tmpFile); removeErr != nil {
-				// Log the error but don't return it since function has already returned
-				// This is a common pattern for cleanup operations in defer
-			}
-		}()
-
-		if err := tmpl.Execute(f, task.Param); err != nil {
-			return nil, err
-		}
-	} else {
-		tmpFile = task.FilePath
-	}
-
-	readFile, err := os.ReadFile(tmpFile)
+	rendered, err := renderTaskYAML(task)
 	if err != nil {
 		return nil, err
 	}
-
-	decoder := yamlutil.NewYAMLOrJSONDecoder(bytes.NewReader(readFile), DefaultYamlDecoderBufferSize)
+	decoder := yamlutil.NewYAMLOrJSONDecoder(bytes.NewReader(rendered), DefaultYamlDecoderBufferSize)
 	return decoder, nil
+}
+
+// RenderManifest renders manifest bytes using the same template path as ApplyYaml.
+func RenderManifest(name string, content []byte, params map[string]interface{}) ([]byte, error) {
+	if len(content) == 0 {
+		return nil, nil
+	}
+	task := NewTask(name, "", params)
+	task.ManifestContent = content
+	return renderTaskYAML(task)
+}
+
+func renderTaskYAML(task *Task) ([]byte, error) {
+	if task == nil {
+		return nil, errors.New("task is nil")
+	}
+
+	var source []byte
+	var err error
+	switch {
+	case len(task.ManifestContent) > 0:
+		source = append([]byte(nil), task.ManifestContent...)
+	case task.FilePath == "":
+		return nil, errors.New("task has no manifest content or file path")
+	case strings.Contains(task.FilePath, "noexecute"):
+		source, err = os.ReadFile(task.FilePath)
+		if err != nil {
+			return nil, err
+		}
+	default:
+		source, err = os.ReadFile(task.FilePath)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if task.Param == nil || strings.Contains(task.FilePath, "noexecute") {
+		return source, nil
+	}
+
+	tmpl, err := template.New(task.Name).Funcs(templateutil.CommonFuncMap()).Parse(string(source))
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to parse manifest template %s", task.Name)
+	}
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, task.Param); err != nil {
+		return nil, errors.Wrapf(err, "failed to render manifest template %s", task.Name)
+	}
+	return buf.Bytes(), nil
 }
 
 func GetUnStructListFromDecoder(decoder *yamlutil.YAMLOrJSONDecoder) ([]*unstructured.Unstructured, error) {

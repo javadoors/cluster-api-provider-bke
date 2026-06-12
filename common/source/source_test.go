@@ -19,6 +19,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 const (
@@ -67,74 +68,51 @@ func TestWriteYumSource(t *testing.T) {
 	err := writeYumSource(testURL)
 	assert.NoError(t, err)
 
-	content, err := os.ReadFile(filepath.Join(yumRepos, "bke.repo"))
+	content, err := os.ReadFile(filepath.Join(yumRepos, bkeRepoFile))
 	assert.NoError(t, err)
 	assert.Contains(t, string(content), testURL)
+	assert.Contains(t, string(content), "priority = 1")
 }
 
 func TestWriteAptSource(t *testing.T) {
 	tempDir := t.TempDir()
-	originalAptRepos := aptRepos
-	aptRepos = filepath.Join(tempDir, "sources.list")
-	defer func() { aptRepos = originalAptRepos }()
+	originalAptSourcesDir := aptSourcesDir
+	originalAptPrefsDir := aptPrefsDir
+	aptSourcesDir = filepath.Join(tempDir, "sources.list.d")
+	aptPrefsDir = filepath.Join(tempDir, "preferences.d")
+	defer func() {
+		aptSourcesDir = originalAptSourcesDir
+		aptPrefsDir = originalAptPrefsDir
+	}()
+	require.NoError(t, os.MkdirAll(aptSourcesDir, testDirPermission))
+	require.NoError(t, os.MkdirAll(aptPrefsDir, testDirPermission))
 
 	testURL := "http://test.repo.com/ubuntu"
 	err := writeAptSource(testURL)
 	assert.NoError(t, err)
 
-	content, err := os.ReadFile(aptRepos)
+	content, err := os.ReadFile(filepath.Join(aptSourcesDir, bkeListFile))
 	assert.NoError(t, err)
 	assert.Contains(t, string(content), testURL)
-}
 
-func TestBackupAptSource(t *testing.T) {
-	tempDir := t.TempDir()
-	originalAptRepos := aptRepos
-	aptRepos = filepath.Join(tempDir, "sources.list")
-	defer func() { aptRepos = originalAptRepos }()
-
-	err := os.WriteFile(aptRepos, []byte("test"), testFilePermission)
+	prefsContent, err := os.ReadFile(filepath.Join(aptPrefsDir, bkePrefsFile))
 	assert.NoError(t, err)
-
-	err = backupAptSource()
-	assert.NoError(t, err)
-
-	_, err = os.Stat(aptRepos)
-	assert.True(t, os.IsNotExist(err))
-
-	_, err = os.Stat(aptRepos + ".bak")
-	assert.NoError(t, err)
+	assert.Contains(t, string(prefsContent), "Pin: origin test.repo.com")
+	assert.Contains(t, string(prefsContent), "Pin-Priority: 1001")
 }
 
 func TestResetAptSource_NoBackup(t *testing.T) {
 	tempDir := t.TempDir()
-	originalAptRepos := aptRepos
-	aptRepos = filepath.Join(tempDir, "sources.list")
-	defer func() { aptRepos = originalAptRepos }()
+	originalAptSourcesDir := aptSourcesDir
+	originalAptPrefsDir := aptPrefsDir
+	aptSourcesDir = filepath.Join(tempDir, "sources.list.d")
+	aptPrefsDir = filepath.Join(tempDir, "preferences.d")
+	defer func() {
+		aptSourcesDir = originalAptSourcesDir
+		aptPrefsDir = originalAptPrefsDir
+	}()
 
 	err := resetAptSource()
-	assert.NoError(t, err)
-}
-
-func TestBackupYumSource_Success(t *testing.T) {
-	tempDir := t.TempDir()
-	originalYumRepos := yumRepos
-	yumRepos = tempDir
-	defer func() { yumRepos = originalYumRepos }()
-
-	err := os.Mkdir(filepath.Join(tempDir, "bak"), testDirPermission)
-	assert.NoError(t, err)
-
-	err = os.WriteFile(filepath.Join(tempDir, "test.repo"), []byte("test"), testFilePermission)
-	assert.NoError(t, err)
-
-	err = backupYumSource()
-	assert.NoError(t, err)
-
-	_, err = os.Stat(filepath.Join(tempDir, "test.repo"))
-	assert.True(t, os.IsNotExist(err))
-
-	_, err = os.Stat(filepath.Join(tempDir, "bak", "test.repo"))
 	assert.NoError(t, err)
 }
 
@@ -144,27 +122,14 @@ func TestResetYumSource_Success(t *testing.T) {
 	yumRepos = tempDir
 	defer func() { yumRepos = originalYumRepos }()
 
-	bakDir := filepath.Join(tempDir, "bak")
-	err := os.Mkdir(bakDir, testDirPermission)
-	assert.NoError(t, err)
-
-	err = os.WriteFile(filepath.Join(tempDir, "bke.repo"), []byte("test"), testFilePermission)
-	assert.NoError(t, err)
-
-	err = os.WriteFile(filepath.Join(bakDir, "original.repo"), []byte("test"), testFilePermission)
+	err := os.WriteFile(filepath.Join(tempDir, bkeRepoFile), []byte("test"), testFilePermission)
 	assert.NoError(t, err)
 
 	err = resetYumSource()
 	assert.NoError(t, err)
 
-	_, err = os.Stat(filepath.Join(tempDir, "bke.repo"))
+	_, err = os.Stat(filepath.Join(tempDir, bkeRepoFile))
 	assert.True(t, os.IsNotExist(err))
-
-	_, err = os.Stat(bakDir)
-	assert.True(t, os.IsNotExist(err))
-
-	_, err = os.Stat(filepath.Join(tempDir, "original.repo"))
-	assert.NoError(t, err)
 }
 
 func TestResetYumSource_NoBakDir(t *testing.T) {
@@ -183,11 +148,7 @@ func TestResetYumSource_NoBkeRepo(t *testing.T) {
 	yumRepos = tempDir
 	defer func() { yumRepos = originalYumRepos }()
 
-	bakDir := filepath.Join(tempDir, "bak")
-	err := os.Mkdir(bakDir, testDirPermission)
-	assert.NoError(t, err)
-
-	err = resetYumSource()
+	err := resetYumSource()
 	assert.NoError(t, err)
 }
 
@@ -212,95 +173,54 @@ func TestResetSource(t *testing.T) {
 	}
 }
 
-func TestBackupYumSourceCreateBak(t *testing.T) {
-	tempDir := t.TempDir()
-	originalYumRepos := yumRepos
-	yumRepos = tempDir
-	defer func() { yumRepos = originalYumRepos }()
-
-	err := os.WriteFile(filepath.Join(tempDir, "test.repo"), []byte("test"), testFilePermission)
-	assert.NoError(t, err)
-
-	err = backupYumSource()
-	assert.NoError(t, err)
-}
-
-func TestResetYumSourceWithSubdir(t *testing.T) {
-	tempDir := t.TempDir()
-	originalYumRepos := yumRepos
-	yumRepos = tempDir
-	defer func() { yumRepos = originalYumRepos }()
-
-	bakDir := filepath.Join(tempDir, "bak")
-	err := os.Mkdir(bakDir, testDirPermission)
-	assert.NoError(t, err)
-
-	subDir := filepath.Join(bakDir, "subdir")
-	err = os.Mkdir(subDir, testDirPermission)
-	assert.NoError(t, err)
-
-	err = os.WriteFile(filepath.Join(tempDir, "bke.repo"), []byte("test"), testFilePermission)
-	assert.NoError(t, err)
-	err = os.WriteFile(filepath.Join(bakDir, "test.repo"), []byte("test"), testFilePermission)
-	assert.NoError(t, err)
-
-	err = resetYumSource()
-	assert.NoError(t, err)
-}
-
 func TestResetAptSourceWithBackup(t *testing.T) {
 	tempDir := t.TempDir()
-	originalAptRepos := aptRepos
-	aptRepos = filepath.Join(tempDir, "sources.list")
-	defer func() { aptRepos = originalAptRepos }()
+	originalAptSourcesDir := aptSourcesDir
+	originalAptPrefsDir := aptPrefsDir
+	aptSourcesDir = filepath.Join(tempDir, "sources.list.d")
+	aptPrefsDir = filepath.Join(tempDir, "preferences.d")
+	defer func() {
+		aptSourcesDir = originalAptSourcesDir
+		aptPrefsDir = originalAptPrefsDir
+	}()
+	require.NoError(t, os.MkdirAll(aptSourcesDir, testDirPermission))
+	require.NoError(t, os.MkdirAll(aptPrefsDir, testDirPermission))
 
-	err := os.WriteFile(aptRepos, []byte("test"), testFilePermission)
+	listPath := filepath.Join(aptSourcesDir, bkeListFile)
+	prefsPath := filepath.Join(aptPrefsDir, bkePrefsFile)
+	err := os.WriteFile(listPath, []byte("test"), testFilePermission)
 	assert.NoError(t, err)
-	err = os.WriteFile(aptRepos+".bak", []byte("backup"), testFilePermission)
+	err = os.WriteFile(prefsPath, []byte("backup"), testFilePermission)
 	assert.NoError(t, err)
 
 	err = resetAptSource()
-	if err != nil {
-		t.Logf("Expected error: %v", err)
-	}
+	assert.NoError(t, err)
+	_, err = os.Stat(listPath)
+	assert.True(t, os.IsNotExist(err))
+	_, err = os.Stat(prefsPath)
+	assert.True(t, os.IsNotExist(err))
 }
 
-func TestResetYumSourceSkipBkeRepo(t *testing.T) {
+func TestOriginFromURL(t *testing.T) {
+	assert.Equal(t, "test.repo.com", originFromURL("http://test.repo.com/ubuntu"))
+	assert.Equal(t, "raw-value", originFromURL("raw-value"))
+}
+
+func TestResetYumSourceKeepsOtherFiles(t *testing.T) {
 	tempDir := t.TempDir()
 	originalYumRepos := yumRepos
 	yumRepos = tempDir
 	defer func() { yumRepos = originalYumRepos }()
 
-	bakDir := filepath.Join(tempDir, "bak")
-	err := os.Mkdir(bakDir, testDirPermission)
+	err := os.WriteFile(filepath.Join(tempDir, bkeRepoFile), []byte("test"), testFilePermission)
 	assert.NoError(t, err)
-
-	err = os.WriteFile(filepath.Join(tempDir, "bke.repo"), []byte("test"), testFilePermission)
-	assert.NoError(t, err)
-	err = os.WriteFile(filepath.Join(bakDir, "bke.repo"), []byte("test"), testFilePermission)
+	err = os.WriteFile(filepath.Join(tempDir, "system.repo"), []byte("system"), testFilePermission)
 	assert.NoError(t, err)
 
 	err = resetYumSource()
 	assert.NoError(t, err)
-}
-
-func TestResetYumSourceMultipleFiles(t *testing.T) {
-	tempDir := t.TempDir()
-	originalYumRepos := yumRepos
-	yumRepos = tempDir
-	defer func() { yumRepos = originalYumRepos }()
-
-	bakDir := filepath.Join(tempDir, "bak")
-	err := os.Mkdir(bakDir, testDirPermission)
-	assert.NoError(t, err)
-
-	err = os.WriteFile(filepath.Join(tempDir, "bke.repo"), []byte("bke"), testFilePermission)
-	assert.NoError(t, err)
-	err = os.WriteFile(filepath.Join(bakDir, "test1.repo"), []byte("test1"), testFilePermission)
-	assert.NoError(t, err)
-	err = os.WriteFile(filepath.Join(bakDir, "test2.repo"), []byte("test2"), testFilePermission)
-	assert.NoError(t, err)
-
-	err = resetYumSource()
+	_, err = os.Stat(filepath.Join(tempDir, bkeRepoFile))
+	assert.True(t, os.IsNotExist(err))
+	_, err = os.Stat(filepath.Join(tempDir, "system.repo"))
 	assert.NoError(t, err)
 }

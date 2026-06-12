@@ -31,6 +31,15 @@ spec:
         - /manager
         args:
         - --leader-elect
+        env:
+        - name: OLOGGER_CONFIG
+          value: /etc/openFuyao/ologger/ologger.yaml
+        - name: OLOGGER_PATH
+          value: /var/log/openFuyao/$(POD_NAME).log
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
         image: controller:latest
         name: manager
         securityContext:
@@ -56,5 +65,13 @@ spec:
           requests:
             cpu: 10m
             memory: 64Mi
+        volumeMounts:
+        - name: ologger-config
+          mountPath: /etc/openFuyao/ologger
+          readOnly: true
       serviceAccountName: controller-manager
       terminationGracePeriodSeconds: 10
+      volumes:
+      - name: ologger-config
+        configMap:
+          name: ologger-config

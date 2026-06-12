@@ -48,7 +48,7 @@ func (s *Sftp) UploadFile(localFilePath string, remoteDirPath string) error {
 	localFile, err := os.Open(localFilePath)
 	defer localFile.Close()
 	if err != nil {
-		return errors.Wrap(err, "Failed to open local file")
+		return errors.Wrapf(err, "failed to open local file %s", localFilePath)
 	}
 
 	// 创建远程文件
@@ -60,39 +60,39 @@ func (s *Sftp) UploadFile(localFilePath string, remoteDirPath string) error {
 
 	// 递归创建上层目录（如果已经存在则无操作）
 	if err = s.sftpClient.MkdirAll(remoteDirPath); err != nil {
-		return errors.Wrapf(err, "Failed to create remote directory %s", remoteDirPath)
+		return errors.Wrapf(err, "failed to create remote directory %s", remoteDirPath)
 	}
 
 	remoteFile, err := s.sftpClient.Create(remoteFilePath)
 	if err != nil {
-		return errors.Wrap(err, "Failed to create remote file")
+		return errors.Wrapf(err, "failed to create remote file %s", remoteFilePath)
 	}
 	defer remoteFile.Close()
 
 	// 用io.Copy的方式上传文件，速度更快
 	_, err = io.Copy(remoteFile, localFile)
 	if err != nil {
-		return errors.Wrap(err, "Failed to copy local file to remote file")
+		return errors.Wrapf(err, "failed to copy local file to remote file %s", remoteFilePath)
 	}
 
 	statRemoteFile, err := remoteFile.Stat()
 	if err != nil {
-		return err
+		return errors.Wrapf(err, "failed to stat remote file %s", remoteFilePath)
 	}
 	statLocalFile, err := localFile.Stat()
 	if err != nil {
-		return err
+		return errors.Wrapf(err, "failed to stat local file %s", localFilePath)
 	}
 
 	if statRemoteFile.Size() != statLocalFile.Size() {
 		if err := s.sftpClient.Remove(path.Join(remoteDirPath, remoteFileName)); err != nil {
-			return errors.Wrap(err, "Failed to remove damaged file")
+			return errors.Wrapf(err, "failed to remove damaged remote file %s", remoteFilePath)
 		}
-		return errors.New("Failed to upload file, file size not match")
+		return errors.Errorf("file size mismatch after upload: local=%d, remote=%d, file=%s",
+			statLocalFile.Size(), statRemoteFile.Size(), remoteFilePath)
 	}
 
 	return nil
-
 }
 
 func (s *Sftp) Close() error {

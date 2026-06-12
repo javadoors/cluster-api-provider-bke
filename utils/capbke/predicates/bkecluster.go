@@ -23,7 +23,7 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/annotation"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/condition"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/config"
-	l "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 func BKEAgentReady() predicate.Funcs {
@@ -78,7 +78,7 @@ func BKEClusterSpecChange() predicate.Funcs {
 			if !ok {
 				return false
 			}
-			log := l.With("bkecluster", utils.ClientObjNS(newObj))
+			log := log.With("bkecluster", utils.ClientObjNS(newObj))
 
 			if newObj != nil && oldObj != nil {
 				if newObj.Generation != oldObj.Generation {
@@ -156,8 +156,9 @@ func BKEClusterAnnotationsChange() predicate.Funcs {
 				annotation.AppointmentAddNodesAnnotationKey,
 				annotation.RetryAnnotationKey,
 				annotation.ClusterTrackerHealthyCheckFailedAnnotationKey,
+				annotation.CVOUpgradeReadyAnnotationKey,
 			}
-			log := l.With("bkecluster", utils.ClientObjNS(newObj))
+			log := log.With("bkecluster", utils.ClientObjNS(newObj))
 			for _, key := range allowChangeAnnotations {
 				newV, newFound := annotation.HasAnnotation(newObj, key)
 				oldV, oldFound := annotation.HasAnnotation(oldObj, key)
@@ -185,7 +186,7 @@ func BKENodeChange() predicate.Funcs {
 			if !ok {
 				return false
 			}
-			log := l.With("bkenode", utils.ClientObjNS(obj))
+			log := log.With("bkenode", utils.ClientObjNS(obj))
 			log.Infof("BKENode 创建，触发调谐")
 			return true
 		},
@@ -198,7 +199,7 @@ func BKENodeChange() predicate.Funcs {
 			if !ok {
 				return false
 			}
-			log := l.With("bkenode", utils.ClientObjNS(newObj))
+			log := log.With("bkenode", utils.ClientObjNS(newObj))
 
 			// If generation changed, spec has changed
 			if newObj.Generation != oldObj.Generation {
@@ -212,7 +213,7 @@ func BKENodeChange() predicate.Funcs {
 			if !ok {
 				return false
 			}
-			log := l.With("bkenode", utils.ClientObjNS(obj))
+			log := log.With("bkenode", utils.ClientObjNS(obj))
 			log.Infof("BKENode 删除，触发调谐")
 			return true
 		},

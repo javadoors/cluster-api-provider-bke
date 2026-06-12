@@ -33,8 +33,8 @@ import (
 	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/cluster"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
 	netutil "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/net"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 // GenerateCACert  generate CA certificates and save to file

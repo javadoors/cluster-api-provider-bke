@@ -38,7 +38,7 @@ import (
 	agentv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkeagent/v1beta1"
 	bkenet "gopkg.openfuyao.cn/cluster-api-provider-bke/common/utils/net"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 // CommandReconciler reconciles a Command object
@@ -55,6 +55,8 @@ type CommandReconciler struct {
 const (
 	// commandFinalizerName 是 Command 资源的 finalizer 名称
 	commandFinalizerName = "command.bkeagent.bocloud.com/finalizers"
+
+	commandControllerName = "command"
 )
 
 const (
@@ -62,6 +64,10 @@ const (
 	defaultSlowDelay       = 60 * time.Second
 	defaultMaxFastAttempts = 5
 )
+
+func commandLogger() *log.Logger {
+	return log.ControllerLogger(commandControllerName)
+}
 
 // reconcileResult 封装 Reconcile 函数的返回结果
 type reconcileResult struct {
@@ -103,11 +109,11 @@ func (r *CommandReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	// 2. Commands 为空检查
 	if len(command.Spec.Commands) == 0 {
-		log.Warnf("command is not configured, %s/%s", command.Namespace, command.Name)
+		commandLogger().Warnf("command is not configured, %s/%s", command.Namespace, command.Name)
 		return ctrl.Result{}, nil
 	}
 
-	log.Infof("reconcile %s/%s resourceVersion: %s, generation: %d",
+	commandLogger().Infof("reconcile %s/%s resourceVersion: %s, generation: %d",
 		command.Namespace, command.Name, command.GetResourceVersion(), command.GetGeneration())
 
 	// 3. 初始化 Status
@@ -154,7 +160,7 @@ func (r *CommandReconciler) fetchCommand(ctx context.Context,
 		if apierr.IsNotFound(err) {
 			return nil, finishReconcile(ctrl.Result{}, nil)
 		}
-		log.Errorf("unable to fetch Command, %s", err.Error())
+		commandLogger().Errorf("unable to fetch Command, %s", err.Error())
 		return nil, finishReconcile(ctrl.Result{}, err)
 	}
 	return command, continueReconcile()
@@ -178,7 +184,7 @@ func (r *CommandReconciler) ensureStatusInitialized(command *agentv1beta1.Comman
 			Status:         metav1.ConditionUnknown,
 		}
 		if err := r.syncStatusUntilComplete(command); err != nil {
-			log.Errorf("unable to update command status resourceVersion: %s error: %s",
+			commandLogger().Errorf("unable to update command status resourceVersion: %s error: %s",
 				command.GetResourceVersion(), err.Error())
 			return finishReconcile(ctrl.Result{}, nil)
 		}
@@ -235,12 +241,12 @@ func (r *CommandReconciler) handleDeletion(ctx context.Context,
 
 	if err := r.Update(ctx, command); err != nil {
 		if apierr.IsConflict(err) {
-			log.Warnf("conflict when update command, %s", err.Error())
+			commandLogger().Warnf("conflict when update command, %s", err.Error())
 		}
 		return handleUpdateError(err)
 	}
 
-	log.Infof("The Finalizer is removed %s", gid)
+	commandLogger().Infof("The Finalizer is removed %s", gid)
 	return finishReconcile(ctrl.Result{}, nil)
 }
 
@@ -274,7 +280,7 @@ func (r *CommandReconciler) handleSuspend(command *agentv1beta1.Command,
 		return finishReconcile(ctrl.Result{}, nil)
 	}
 
-	log.Infof("%s has been suspended", gid)
+	commandLogger().Infof("%s has been suspended", gid)
 	if v, ok := r.Job.Task[gid]; ok {
 		v.SafeClose()
 		v.Phase = agentv1beta1.CommandSuspend
@@ -287,7 +293,7 @@ func (r *CommandReconciler) handleSuspend(command *agentv1beta1.Command,
 	currentStatus.Phase = agentv1beta1.CommandSuspend
 
 	if err := r.syncStatusUntilComplete(command); err != nil {
-		log.Errorf("unable to update command status resourceVersion: %s error: %s",
+		commandLogger().Errorf("unable to update command status resourceVersion: %s error: %s",
 			command.GetResourceVersion(), err.Error())
 		return finishReconcile(ctrl.Result{}, err)
 	}
@@ -302,7 +308,7 @@ func (r *CommandReconciler) shouldSkipOldTask(command *agentv1beta1.Command, gid
 	if v, ok := r.Job.Task[gid]; ok {
 		// This value is increased by a spec change
 		if command.GetGeneration() <= v.Generation {
-			log.Infof("A later version task is being executed, command:%s resourceVersion:%s-%s, generation:%d<=%d",
+			commandLogger().Infof("A later version task is being executed, command:%s resourceVersion:%s-%s, generation:%d<=%d",
 				gid, command.GetResourceVersion(), v.ResourceVersion, command.GetGeneration(), v.Generation)
 			return true
 		}
@@ -334,7 +340,7 @@ func (r *CommandReconciler) createAndStartTask(ctx context.Context, command *age
 	currentStatus.CompletionTime = nil
 
 	if err := r.syncStatusUntilComplete(command); err != nil {
-		log.Errorf("unable to update command status resourceVersion: %s error: %s",
+		commandLogger().Errorf("unable to update command status resourceVersion: %s error: %s",
 			command.GetResourceVersion(), err.Error())
 		return finishReconcile(ctrl.Result{}, nil)
 	}
@@ -365,7 +371,7 @@ func (r *CommandReconciler) shouldReconcileCommand(o *agentv1beta1.Command, even
 	if v, ok := r.Job.Task[gid]; ok {
 		// The value of this field will increase only if you update the spec
 		if o.Generation <= v.Generation || o.ResourceVersion <= v.ResourceVersion {
-			log.Debugf("%s: %d<=%d Only update status without Reconcile %s",
+			commandLogger().Debugf("%s: %d<=%d Only update status without Reconcile %s",
 				eventType, o.Generation, v.Generation, gid)
 			return false
 		}
@@ -445,7 +451,7 @@ func (r *CommandReconciler) executeByType(cmdType agentv1beta1.CommandType, comm
 	case agentv1beta1.CommandShell:
 		return r.Job.Shell.Execute(command)
 	default:
-		log.Errorf("Unsupported command type: %s", cmdType)
+		commandLogger().Errorf("Unsupported command type: %s", cmdType)
 		return nil, nil
 	}
 }
@@ -475,7 +481,7 @@ func (r *CommandReconciler) executeWithRetry(execCommand agentv1beta1.ExecComman
 			condition.Status = metav1.ConditionFalse
 			condition.Phase = agentv1beta1.CommandFailed
 			condition.StdErr = append(condition.StdErr, err.Error())
-			log.Errorf("Command exec failed: %s %s", condition.ID, err.Error())
+			commandLogger().Errorf("Command exec failed: %s %s", condition.ID, err.Error())
 			continue
 		}
 		condition.Status = metav1.ConditionTrue
@@ -550,7 +556,7 @@ func (r *CommandReconciler) startTask(ctx context.Context, stopChan chan struct{
 		// 检查是否收到停止信号
 		select {
 		case <-stopChan:
-			log.Warnf("Execution command terminated %s", gid)
+			commandLogger().Warnf("Execution command terminated %s", gid)
 			terminated = true
 		default:
 		}
@@ -567,7 +573,7 @@ func (r *CommandReconciler) startTask(ctx context.Context, stopChan chan struct{
 
 		result := r.processExecCommand(command, execCommand, currentStatus, stopTime)
 		if result.syncError != nil {
-			log.Errorf("unable to update command status resourceVersion: %s error: %s",
+			commandLogger().Errorf("unable to update command status resourceVersion: %s error: %s",
 				command.ResourceVersion, result.syncError.Error())
 			return
 		}
@@ -577,7 +583,7 @@ func (r *CommandReconciler) startTask(ctx context.Context, stopChan chan struct{
 	}
 
 	if err := r.finalizeTaskStatus(command, currentStatus, gid); err != nil {
-		log.Errorf("unable to update command status resourceVersion: %s error: %s",
+		commandLogger().Errorf("unable to update command status resourceVersion: %s error: %s",
 			command.ResourceVersion, err.Error())
 	}
 }
@@ -613,7 +619,7 @@ func (r *CommandReconciler) shouldProcessTask(value *job.Task) bool {
 func (r *CommandReconciler) isCommandReadyForDeletion(obj *agentv1beta1.Command, key string) bool {
 	for n, v := range obj.Status {
 		if v.Status != metav1.ConditionTrue {
-			log.Warnf("Instruction %s not completed on node %s, refused to delete", key, n)
+			commandLogger().Warnf("Instruction %s not completed on node %s, refused to delete", key, n)
 			return false
 		}
 	}
@@ -632,11 +638,11 @@ func (r *CommandReconciler) calculateTTL(ttlSeconds int, completionTime time.Tim
 
 // scheduleCommandDeletion schedules the deletion of a Command resource
 func (r *CommandReconciler) scheduleCommandDeletion(obj *agentv1beta1.Command, key string, ttl int) {
-	log.Infof("Command Resource %s will be deleted in %d seconds", key, ttl)
+	commandLogger().Infof("Command Resource %s will be deleted in %d seconds", key, ttl)
 	time.AfterFunc(time.Duration(ttl)*time.Second, func() {
-		log.Infof("Deleting the Command resource %s/%s", obj.Namespace, obj.Name)
+		commandLogger().Infof("Deleting the Command resource %s/%s", obj.Namespace, obj.Name)
 		if err := r.Delete(r.Ctx, obj); err != nil {
-			log.Warnf("Command resource %s/%s deletion failed. %s", obj.Namespace, obj.Name, err.Error())
+			commandLogger().Warnf("Command resource %s/%s deletion failed. %s", obj.Namespace, obj.Name, err.Error())
 		}
 	})
 }
@@ -652,7 +658,7 @@ func (r *CommandReconciler) processTTLTask(key string, value *job.Task) {
 		if apierr.IsNotFound(err) {
 			delete(r.Job.Task, key)
 		} else {
-			log.Warnf("unable fetch command %s", err.Error())
+			commandLogger().Warnf("unable fetch command %s", err.Error())
 		}
 		return
 	}
@@ -686,10 +692,10 @@ func (r *CommandReconciler) syncStatusUntilComplete(cmd *agentv1beta1.Command) (
 		err = r.APIReader.Get(r.Ctx, client.ObjectKey{Namespace: cmd.Namespace, Name: cmd.Name}, obj)
 		if err != nil {
 			if apierr.IsNotFound(err) {
-				log.Warnf("Command resource %s-%s not found, skip sync", cmd.Namespace, cmd.Name)
+				commandLogger().Warnf("Command resource %s-%s not found, skip sync", cmd.Namespace, cmd.Name)
 				return nil
 			}
-			log.Errorf("Get command resource failed %s-%s error: %v", cmd.Namespace, cmd.Name, err)
+			commandLogger().Errorf("Get command resource failed %s-%s error: %v", cmd.Namespace, cmd.Name, err)
 			continue
 		}
 		if obj.Status == nil {
@@ -700,7 +706,7 @@ func (r *CommandReconciler) syncStatusUntilComplete(cmd *agentv1beta1.Command) (
 		//patch status
 		err = r.Client.Status().Patch(r.Ctx, objCopy, client.MergeFrom(obj))
 		if err != nil {
-			log.Warnf("Update command resource failed %s-%s error: %v", cmd.Namespace, cmd.Name, err)
+			commandLogger().Warnf("Update command resource failed %s-%s error: %v", cmd.Namespace, cmd.Name, err)
 			continue
 		}
 		break

@@ -28,7 +28,7 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/command"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/annotation"
-	l "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 // IsPaused 判断bkecluster是否暂停
@@ -43,11 +43,23 @@ func IsDeleteOrReset(bkeCluster *bkev1beta1.BKECluster) bool {
 	return !bkeCluster.DeletionTimestamp.IsZero() || bkeCluster.Spec.Reset
 }
 
-func GenerateBKEAgentStatus(success []string, bkeCluster *bkev1beta1.BKECluster, nodes node.Nodes) {
-	bkeCluster.Status.AgentStatus.Replies = int32(len(nodes))
-	bkeCluster.Status.AgentStatus.UnavailableReplies = int32(len(nodes) - len(success))
-	// status is format 0/2
-	bkeCluster.Status.AgentStatus.Status = fmt.Sprintf("%d/%d", len(success), len(nodes))
+// GenerateBKEAgentStatus updates AgentStatus from ping results against all cluster nodes.
+// When bkeNodes is set, nodes not in pingNodes use NodeAgentReadyFlag; pinged nodes use ping results only.
+func GenerateBKEAgentStatus(
+	success []string,
+	bkeCluster *bkev1beta1.BKECluster,
+	nodes node.Nodes,
+	bkeNodes bkev1beta1.BKENodes,
+	pingNodes node.Nodes,
+) {
+	available := len(success)
+	if bkeNodes != nil {
+		available = countAvailableAgentNodes(bkeNodes, pingNodes, success)
+	}
+	total := len(nodes)
+	bkeCluster.Status.AgentStatus.Replies = int32(total)
+	bkeCluster.Status.AgentStatus.UnavailableReplies = int32(total - available)
+	bkeCluster.Status.AgentStatus.Status = fmt.Sprintf("%d/%d", available, total)
 }
 
 // GetBKEClusterAssociateMachines 获取bkecluster 关联的所有machine
@@ -119,7 +131,7 @@ func GetBKEClusterAssociateCommands(ctx context.Context, c client.Client, bkeClu
 			continue
 		}
 		if err := command.ValidateCommand(&cmd); err != nil {
-			l.Error(cmd.Name, err)
+			log.Error(cmd.Name, err)
 			continue
 		}
 		commands = append(commands, cmd)

@@ -274,9 +274,3 @@ func TestCleanupDeletedNodePodsParams_Structure(t *testing.T) {
 	assert.NotNil(t, params.BKECluster)
 	assert.NotNil(t, params.SuccessDeletedNode)
 }
-
-
-
-
-
-

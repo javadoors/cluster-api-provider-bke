@@ -9,6 +9,7 @@ spec:
     - backoffDelay: 3
       command:
         - SelfUpdate
+        - agentUrl=http://http.bocloud.k8s:40080/files/bkeagent-latest-linux-amd64
       id: update
       type: BuiltIn
   # 失败后最大重试次数

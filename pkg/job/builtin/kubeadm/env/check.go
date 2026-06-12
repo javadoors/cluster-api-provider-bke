@@ -27,8 +27,8 @@ import (
 	bkesource "gopkg.openfuyao.cn/cluster-api-provider-bke/common/source"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/crontab"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/runtime"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 const (
@@ -38,7 +38,7 @@ const (
 
 // processSimpleCheckScope processes simple check scopes that only call one function
 func (ep *EnvPlugin) processSimpleCheckScope(logMsg string, checkFunc func() error) error {
-	log.Infof(logMsg)
+	log.Info(logMsg)
 	return checkFunc()
 }
 
@@ -168,12 +168,17 @@ func (ep *EnvPlugin) checkUbuntuSysModules() []error {
 		return errs
 	}
 
-	log.Infof("%s found", CheckUbuntuSysModuleFilePath)
+	log.Debugf("%s found", CheckUbuntuSysModuleFilePath)
+	var missingModules []string
 	for _, m := range sysModule {
 		if found, err := catAndSearch(CheckUbuntuSysModuleFilePath, m, ""); err != nil || !found {
-			log.Warnf("%s not contains %s", CheckUbuntuSysModuleFilePath, m)
+			log.Debugf("%s not contains %s", CheckUbuntuSysModuleFilePath, m)
+			missingModules = append(missingModules, m)
 			errs = append(errs, errors.Errorf("%s not contains %s", CheckUbuntuSysModuleFilePath, m))
 		}
+	}
+	if len(missingModules) > 0 {
+		log.Warnf("%s missing modules: %v", CheckUbuntuSysModuleFilePath, missingModules)
 	}
 	return errs
 }
@@ -228,17 +233,23 @@ func (ep *EnvPlugin) checkKernelParam() error {
 	}
 
 	// Check all kernel parameters
+	var passedParams, failedParams int
 	for k, v := range execKernelParam {
 		pathEum := append([]string{procSysPath}, strings.Split(k, ".")...)
 		path := filepath.Join(pathEum...)
 		if _, err := catAndSearch(path, v, ""); err != nil {
 			checkErrs = append(checkErrs, errors.Wrapf(err, "kernel param %s=%s failed", k, v))
+			failedParams++
+		} else {
+			log.Debugf("Kernel param %s=%s passed", k, v)
+			passedParams++
 		}
-		log.Infof("Kernel param %s=%s passed", k, v)
 	}
 
 	if len(checkErrs) == 0 {
-		log.Infof("Kernel param check passed")
+		log.Infof("Kernel param check passed: total=%d, passed=%d", passedParams+failedParams, passedParams)
+	} else {
+		log.Infof("Kernel param check completed: total=%d, passed=%d, failed=%d", passedParams+failedParams, passedParams, failedParams)
 	}
 
 	checkErrs = append(checkErrs, ep.checkUbuntuSysModules()...)
@@ -280,7 +291,7 @@ func (ep *EnvPlugin) checkSelinux() error {
 	// todo 但是在init时如果 setenforce 0 执行成功,且配置文件修改成功，无论是否重启服务器selinux都是关闭的
 	// todo 如果 setenforce 0 执行失败则不会修改配置文件，此处便会判定失败
 	if _, err := catAndSearch(CheckSelinuxConfPath, "SELINUX=disabled", ""); err != nil {
-		log.Warnf("(ignore)Check seLinux config file %s failed, err: ", CheckSelinuxConfPath, err)
+		log.Warnf("(ignore)Check seLinux config file %s failed, err: %v", CheckSelinuxConfPath, err)
 	}
 	out, err := ep.exec.ExecuteCommandWithOutput("/bin/sh", "-c", "getenforce")
 	if err != nil && (out != "Disabled" && out != "Permissive") {
@@ -312,14 +323,21 @@ func (ep *EnvPlugin) checkTime() error {
 
 // checkHost check host
 func (ep *EnvPlugin) checkHost() error {
-	hostname, err := os.Hostname()
-	if err != nil {
-		return errors.Wrap(err, "Get hostname failed when init hostanme")
-	}
 	bkeNodeName := utils.HostName()
-	if hostname != bkeNodeName {
-		log.Errorf("Hostname is not match, current hostname is %s, except hostname is %s", hostname, bkeNodeName)
-		return errors.Errorf("Hostname is not match, current hostname is %s, except hostname is %s", hostname, bkeNodeName)
+	if bkeNodeName == "" {
+		return errors.New("BKE node name is empty, check /etc/bkeagent/node")
+	}
+
+	expectedName := ep.expectedBKENodeName()
+	if expectedName != "" && bkeNodeName != expectedName {
+		log.Errorf("BKE node name is not match, current is %s, except %s", bkeNodeName, expectedName)
+		return errors.Errorf("BKE node name is not match, current is %s, except %s", bkeNodeName, expectedName)
+	}
+
+	if osHostname, err := os.Hostname(); err != nil {
+		return errors.Wrap(err, "Get hostname failed when check host")
+	} else {
+		logOSHostnamePreserved(osHostname, bkeNodeName)
 	}
 
 	h, err := NewHostsFile(CheckHostConfPath)
@@ -327,7 +345,12 @@ func (ep *EnvPlugin) checkHost() error {
 		log.Errorf("Check hosts file failed, %s", err)
 		return errors.Wrap(err, "check hosts file failed, get hosts file failed")
 	}
-	extraHosts := strings.Split(ep.extraHosts, ",")
+	var extraHosts []string
+	for _, host := range strings.Split(ep.extraHosts, ",") {
+		if strings.TrimSpace(host) != "" {
+			extraHosts = append(extraHosts, host)
+		}
+	}
 	extraHosts = append(extraHosts, ep.clusterHosts...)
 	if len(extraHosts) == 0 {
 		return nil
@@ -336,7 +359,7 @@ func (ep *EnvPlugin) checkHost() error {
 	// one host is not in hosts file ,then flag is false
 	for _, host := range extraHosts {
 		flag := false
-		if host == "" {
+		if strings.TrimSpace(host) == "" {
 			continue
 		}
 		for _, record := range h.inner.Records() {

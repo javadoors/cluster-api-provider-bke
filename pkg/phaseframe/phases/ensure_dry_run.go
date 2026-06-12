@@ -227,7 +227,7 @@ func (e *EnsureDryRun) pushAgentWithParams(params PushAgentParams) error {
 			params.Log.Error(constant.DryRunReason, "Local kubeconfig secret not found")
 			return nil
 		}
-		params.Log.Error(constant.DryRunReason, "Failed to get local kubeconfig secret, err：%v", err)
+		params.Log.Error(constant.DryRunReason, "Failed to get local kubeconfig secret, err: %v", err)
 		return nil
 	}
 	localKubeConfig := localKubeConfigSecret.Data["config"]

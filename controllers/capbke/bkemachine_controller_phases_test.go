@@ -24,7 +24,6 @@ import (
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/blang/semver"
 	"github.com/stretchr/testify/assert"
-	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -47,6 +46,7 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/annotation"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/constant"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/nodeutil"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 const (
@@ -98,9 +98,8 @@ func newPhasesReconciler(objs ...client.Object) *BKEMachineReconciler {
 	}
 }
 
-func newTestLogger() *zap.SugaredLogger {
-	logger, _ := zap.NewDevelopment()
-	return logger.Sugar()
+func newTestLogger() *log.Logger {
+	return nil
 }
 
 // --- Pure function tests ---
@@ -929,6 +928,26 @@ func TestFilterAvailableNode(t *testing.T) {
 		assert.Equal(t, machinePhasesNodeIP, node.IP)
 	})
 
+	t.Run("InitControlPlane prefers ControlPlaneEndpoint host", func(t *testing.T) {
+		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+		r := &BKEMachineReconciler{
+			Client:          fakeClient,
+			nodesBootRecord: make(map[string]struct{}),
+		}
+
+		nodes := bkenode.Nodes{{IP: machinePhasesNodeIP}, {IP: machinePhasesNodeIP2}}
+		bkeCluster := &bkev1beta1.BKECluster{
+			ObjectMeta: metav1.ObjectMeta{Name: machinePhasesCluster, Namespace: machinePhasesNamespace},
+			Spec: confv1beta1.BKEClusterSpec{
+				ControlPlaneEndpoint: confv1beta1.APIEndpoint{Host: machinePhasesNodeIP2},
+			},
+		}
+
+		node, err := r.filterAvailableNode(context.Background(), nodes, bkeCluster, bkev1beta1.InitControlPlane)
+		assert.NoError(t, err)
+		assert.Equal(t, machinePhasesNodeIP2, node.IP)
+	})
+
 	t.Run("JoinWorker returns available node", func(t *testing.T) {
 		fakeClient := fake.NewClientBuilder().WithScheme(scheme).Build()
 		r := &BKEMachineReconciler{
@@ -1568,7 +1587,7 @@ func TestSyncKubeadmConfig(t *testing.T) {
 // --- processBootstrapFailure ---
 
 func TestProcessBootstrapFailure(t *testing.T) {
-	log := newTestLogger()
+	logger := newTestLogger()
 
 	t.Run("control plane not initialized", func(t *testing.T) {
 		r := newPhasesReconciler()
@@ -1577,7 +1596,7 @@ func TestProcessBootstrapFailure(t *testing.T) {
 		defer patches.Reset()
 		patches.ApplyFunc(metricrecord.NodeBootstrapDurationRecord, func(_ client.Object, _ confv1beta1.Node, _ time.Time, _ string) {})
 		patches.ApplyFunc(mergecluster.SyncStatusUntilComplete, func(_ client.Client, _ *bkev1beta1.BKECluster, _ ...mergecluster.PatchFunc) error { return nil })
-		patches.ApplyFunc((*BKEMachineReconciler).reconcileBKEMachine, func(_ *BKEMachineReconciler, _ context.Context, _ *bkev1beta1.BKECluster, _ *bkev1beta1.BKEMachine, _ confv1beta1.Node, _ *zap.SugaredLogger) error {
+		patches.ApplyFunc((*BKEMachineReconciler).reconcileBKEMachine, func(_ *BKEMachineReconciler, _ context.Context, _ *bkev1beta1.BKECluster, _ *bkev1beta1.BKEMachine, _ confv1beta1.Node, _ *log.Logger) error {
 			return nil
 		})
 
@@ -1590,7 +1609,7 @@ func TestProcessBootstrapFailure(t *testing.T) {
 		params := ProcessBootstrapFailureParams{
 			ProcessBootstrapCommonParams: ProcessBootstrapCommonParams{
 				CommonResourceParams: CommonResourceParams{
-					CommonContextParams: CommonContextParams{Ctx: context.Background(), Log: log},
+					CommonContextParams: CommonContextParams{Ctx: context.Background(), Log: logger},
 					Machine:             &clusterv1.Machine{},
 					Cluster:             cluster,
 					BKECluster:          &bkev1beta1.BKECluster{ObjectMeta: metav1.ObjectMeta{Name: machinePhasesCluster, Namespace: machinePhasesNamespace}},
@@ -1614,7 +1633,7 @@ func TestProcessBootstrapFailure(t *testing.T) {
 		defer patches.Reset()
 		patches.ApplyFunc(metricrecord.NodeBootstrapDurationRecord, func(_ client.Object, _ confv1beta1.Node, _ time.Time, _ string) {})
 		patches.ApplyFunc(mergecluster.SyncStatusUntilComplete, func(_ client.Client, _ *bkev1beta1.BKECluster, _ ...mergecluster.PatchFunc) error { return nil })
-		patches.ApplyFunc((*BKEMachineReconciler).reconcileBKEMachine, func(_ *BKEMachineReconciler, _ context.Context, _ *bkev1beta1.BKECluster, _ *bkev1beta1.BKEMachine, _ confv1beta1.Node, _ *zap.SugaredLogger) error {
+		patches.ApplyFunc((*BKEMachineReconciler).reconcileBKEMachine, func(_ *BKEMachineReconciler, _ context.Context, _ *bkev1beta1.BKECluster, _ *bkev1beta1.BKEMachine, _ confv1beta1.Node, _ *log.Logger) error {
 			return nil
 		})
 
@@ -1628,7 +1647,7 @@ func TestProcessBootstrapFailure(t *testing.T) {
 		params := ProcessBootstrapFailureParams{
 			ProcessBootstrapCommonParams: ProcessBootstrapCommonParams{
 				CommonResourceParams: CommonResourceParams{
-					CommonContextParams: CommonContextParams{Ctx: context.Background(), Log: log},
+					CommonContextParams: CommonContextParams{Ctx: context.Background(), Log: logger},
 					Machine:             &clusterv1.Machine{},
 					Cluster:             cluster,
 					BKECluster:          &bkev1beta1.BKECluster{ObjectMeta: metav1.ObjectMeta{Name: machinePhasesCluster, Namespace: machinePhasesNamespace}},
@@ -1823,7 +1842,7 @@ func TestReconcileCommand(t *testing.T) {
 // --- processBootstrapSuccess ---
 
 func TestProcessBootstrapSuccess(t *testing.T) {
-	log := newTestLogger()
+	logger := newTestLogger()
 
 	t.Run("cluster deleting after connect returns empty", func(t *testing.T) {
 		r := newPhasesReconciler()
@@ -1841,7 +1860,7 @@ func TestProcessBootstrapSuccess(t *testing.T) {
 		params := ProcessBootstrapSuccessParams{
 			ProcessBootstrapCommonParams: ProcessBootstrapCommonParams{
 				CommonResourceParams: CommonResourceParams{
-					CommonContextParams: CommonContextParams{Ctx: context.Background(), Log: log},
+					CommonContextParams: CommonContextParams{Ctx: context.Background(), Log: logger},
 					Machine:             &clusterv1.Machine{},
 					BKECluster:          bkeCluster,
 					BKEMachine:          &bkev1beta1.BKEMachine{},
@@ -1872,7 +1891,7 @@ func TestProcessBootstrapSuccess(t *testing.T) {
 		params := ProcessBootstrapSuccessParams{
 			ProcessBootstrapCommonParams: ProcessBootstrapCommonParams{
 				CommonResourceParams: CommonResourceParams{
-					CommonContextParams: CommonContextParams{Ctx: context.Background(), Log: log},
+					CommonContextParams: CommonContextParams{Ctx: context.Background(), Log: logger},
 					Machine:             &clusterv1.Machine{},
 					BKECluster:          &bkev1beta1.BKECluster{ObjectMeta: metav1.ObjectMeta{Name: machinePhasesCluster, Namespace: machinePhasesNamespace}},
 					BKEMachine:          &bkev1beta1.BKEMachine{},
@@ -1895,10 +1914,10 @@ func TestProcessBootstrapSuccess(t *testing.T) {
 		patches.ApplyFunc(mergecluster.SyncStatusUntilComplete, func(_ client.Client, _ *bkev1beta1.BKECluster, _ ...mergecluster.PatchFunc) error { return nil })
 		patches.ApplyFunc(metricrecord.NodeBootstrapSuccessCountRecord, func(_ client.Object) {})
 		patches.ApplyFunc(metricrecord.NodeBootstrapDurationRecord, func(_ client.Object, _ confv1beta1.Node, _ time.Time, _ string) {})
-		patches.ApplyFunc((*BKEMachineReconciler).reconcileBKEMachine, func(_ *BKEMachineReconciler, _ context.Context, _ *bkev1beta1.BKECluster, _ *bkev1beta1.BKEMachine, _ confv1beta1.Node, _ *zap.SugaredLogger) error {
+		patches.ApplyFunc((*BKEMachineReconciler).reconcileBKEMachine, func(_ *BKEMachineReconciler, _ context.Context, _ *bkev1beta1.BKECluster, _ *bkev1beta1.BKEMachine, _ confv1beta1.Node, _ *log.Logger) error {
 			return nil
 		})
-		patches.ApplyFunc((*BKEMachineReconciler).markBKEMachineBootstrapReady, func(_ *BKEMachineReconciler, _ context.Context, _ *bkev1beta1.BKECluster, _ *bkev1beta1.BKEMachine, _ confv1beta1.Node, _ string, _ *zap.SugaredLogger) error {
+		patches.ApplyFunc((*BKEMachineReconciler).markBKEMachineBootstrapReady, func(_ *BKEMachineReconciler, _ context.Context, _ *bkev1beta1.BKECluster, _ *bkev1beta1.BKEMachine, _ confv1beta1.Node, _ string, _ *log.Logger) error {
 			return nil
 		})
 
@@ -1910,7 +1929,7 @@ func TestProcessBootstrapSuccess(t *testing.T) {
 		params := ProcessBootstrapSuccessParams{
 			ProcessBootstrapCommonParams: ProcessBootstrapCommonParams{
 				CommonResourceParams: CommonResourceParams{
-					CommonContextParams: CommonContextParams{Ctx: context.Background(), Log: log},
+					CommonContextParams: CommonContextParams{Ctx: context.Background(), Log: logger},
 					Machine:             &clusterv1.Machine{},
 					BKECluster:          &bkev1beta1.BKECluster{ObjectMeta: metav1.ObjectMeta{Name: machinePhasesCluster, Namespace: machinePhasesNamespace}},
 					BKEMachine:          &bkev1beta1.BKEMachine{},
@@ -2050,7 +2069,7 @@ func TestCheckTargetClusterNode(t *testing.T) {
 }
 
 func TestProcessBootstrapSuccessFullFlow(t *testing.T) {
-	log := newTestLogger()
+	logger := newTestLogger()
 	r := newPhasesReconciler()
 
 	patches := gomonkey.ApplyFunc(
@@ -2060,10 +2079,10 @@ func TestProcessBootstrapSuccessFullFlow(t *testing.T) {
 	patches.ApplyFunc(mergecluster.SyncStatusUntilComplete, func(_ client.Client, _ *bkev1beta1.BKECluster, _ ...mergecluster.PatchFunc) error { return nil })
 	patches.ApplyFunc(metricrecord.NodeBootstrapSuccessCountRecord, func(_ client.Object) {})
 	patches.ApplyFunc(metricrecord.NodeBootstrapDurationRecord, func(_ client.Object, _ confv1beta1.Node, _ time.Time, _ string) {})
-	patches.ApplyFunc((*BKEMachineReconciler).reconcileBKEMachine, func(_ *BKEMachineReconciler, _ context.Context, _ *bkev1beta1.BKECluster, _ *bkev1beta1.BKEMachine, _ confv1beta1.Node, _ *zap.SugaredLogger) error {
+	patches.ApplyFunc((*BKEMachineReconciler).reconcileBKEMachine, func(_ *BKEMachineReconciler, _ context.Context, _ *bkev1beta1.BKECluster, _ *bkev1beta1.BKEMachine, _ confv1beta1.Node, _ *log.Logger) error {
 		return nil
 	})
-	patches.ApplyFunc((*BKEMachineReconciler).markBKEMachineBootstrapReady, func(_ *BKEMachineReconciler, _ context.Context, _ *bkev1beta1.BKECluster, _ *bkev1beta1.BKEMachine, _ confv1beta1.Node, _ string, _ *zap.SugaredLogger) error {
+	patches.ApplyFunc((*BKEMachineReconciler).markBKEMachineBootstrapReady, func(_ *BKEMachineReconciler, _ context.Context, _ *bkev1beta1.BKECluster, _ *bkev1beta1.BKEMachine, _ confv1beta1.Node, _ string, _ *log.Logger) error {
 		return nil
 	})
 
@@ -2081,7 +2100,7 @@ func TestProcessBootstrapSuccessFullFlow(t *testing.T) {
 	params := ProcessBootstrapSuccessParams{
 		ProcessBootstrapCommonParams: ProcessBootstrapCommonParams{
 			CommonResourceParams: CommonResourceParams{
-				CommonContextParams: CommonContextParams{Ctx: context.Background(), Log: log},
+				CommonContextParams: CommonContextParams{Ctx: context.Background(), Log: logger},
 				Machine:             &clusterv1.Machine{},
 				BKECluster:          bkeCluster,
 				BKEMachine:          &bkev1beta1.BKEMachine{},

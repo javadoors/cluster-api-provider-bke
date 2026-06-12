@@ -18,7 +18,6 @@ import (
 
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/stretchr/testify/assert"
-	"go.uber.org/zap"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/dynamic"
@@ -33,6 +32,7 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/mergecluster"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/statusmanage"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 type fakeClient struct {
@@ -64,7 +64,7 @@ func (f *fakeClient) List(ctx context.Context, list client.ObjectList, opts ...c
 }
 
 func createTestLogger() *bkev1beta1.BKELogger {
-	sugar := zap.NewNop().Sugar()
+	sugar := (*log.Logger)(nil)
 	bkeCluster := &bkev1beta1.BKECluster{
 		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
 	}
@@ -319,5 +319,3 @@ func TestGetTargetClusterNodes_GetClientError(t *testing.T) {
 	assert.Error(t, err)
 	assert.Nil(t, nodes)
 }
-
-

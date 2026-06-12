@@ -66,6 +66,10 @@ func TestExportDefaults(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 	}
+	err = os.Remove("bkeconfig-default.json")
+	if err != nil {
+		t.Error(err)
+	}
 }
 
 func TestGetDefaultEtcdK8sVersionImageMap(t *testing.T) {

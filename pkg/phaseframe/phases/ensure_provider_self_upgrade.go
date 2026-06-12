@@ -77,13 +77,13 @@ func (p *EnsureProviderSelfUpgrade) isProviderNeedUpgrade(old, new *bkev1beta1.B
 	// First installation (Status.OpenFuyaoVersion is empty)
 	if new.Status.OpenFuyaoVersion == "" {
 		if !p.isPatchVersion(new.Spec.ClusterConfig.Cluster.OpenFuyaoVersion) {
-			log.Debug(constant.ProviderSelfUpgradeReason, "first installation with non-patch version, skip self-upgrade")
+			log.Debug(constant.ProviderSelfUpgradeReason + ": first installation with non-patch version, skip self-upgrade")
 			return false
 		}
 	} else {
 		// Not first installation, skip if version unchanged
 		if new.Status.OpenFuyaoVersion == new.Spec.ClusterConfig.Cluster.OpenFuyaoVersion {
-			log.Debug(constant.ProviderSelfUpgradeReason, "provider-bke version unchanged")
+			log.Debug(constant.ProviderSelfUpgradeReason + ": provider-bke version unchanged")
 			return false
 		}
 	}

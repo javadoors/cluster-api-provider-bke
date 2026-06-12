@@ -33,6 +33,14 @@ spec:
           env:
             - name: container
               value: "true"
+            - name: OLOGGER_CONFIG
+              value: "/etc/openFuyao/ologger/ologger.yaml"
+            - name: OLOGGER_PATH
+              value: "/var/log/openFuyao/$(POD_NAME).log"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
           image: controller:latest
           name: manager
           securityContext:
@@ -65,6 +73,8 @@ spec:
               mountPath: /etc/localtime
             - mountPath: /manifests
               name: manifests
+            - name: ologger-config
+              mountPath: /etc/openFuyao/ologger
       serviceAccountName: controller-manager
       terminationGracePeriodSeconds: 10
       volumes:
@@ -77,4 +87,7 @@ spec:
             path: /etc/localtime
         - name: manifests
           emptyDir: {}
+        - name: ologger-config
+          configMap:
+            name: ologger-config
 

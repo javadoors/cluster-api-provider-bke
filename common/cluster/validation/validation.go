@@ -14,7 +14,6 @@ package validation
 
 import (
 	"fmt"
-	"log"
 	"net"
 	"reflect"
 	"regexp"
@@ -29,10 +28,7 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/common/utils"
 	bkenet "gopkg.openfuyao.cn/cluster-api-provider-bke/common/utils/net"
-)
-
-const (
-	defaultRepoRequestTimeoutSeconds = 10
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 var (
@@ -41,7 +37,6 @@ var (
 	MaxSupportedK8sVersion, _       = semver.ParseTolerant("v1.28.0")
 	masterNodeEvenDivisor           = 2
 	maxFieldLength                  = 255
-	repoRequestTimeout              = defaultRepoRequestTimeoutSeconds * time.Second
 )
 
 // ValidateBKENodes validates a list of BKENode resources
@@ -312,7 +307,7 @@ func ValidateCluster(bkeConfig v1beta1.BKEConfig) error {
 
 // IsContainChartAddon is check addons is contain chart addon.
 func IsContainChartAddon(addons addon.Addons) bool {
-	if addons == nil || len(addons) == 0 {
+	if len(addons) == 0 {
 		return false
 	}
 
@@ -361,7 +356,7 @@ func checkReachable(addr string) bool {
 	}
 	defer func() {
 		if err := conn.Close(); err != nil {
-			log.Printf("failed to close conn: %v, address: %s", err, addr)
+			log.Warnf("failed to close conn: %v, address: %s", err, addr)
 		}
 	}()
 	return true
@@ -382,6 +377,44 @@ func ResolveReachableRepoAddress(repo v1beta1.Repo) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("repo not reachable via domain or ip")
+}
+
+// BuildHTTPRepoBaseURL builds http://host:port for HTTP binary downloads.
+func BuildHTTPRepoBaseURL(host, port string) string {
+	if host == "" {
+		if port == "" {
+			return "http://"
+		}
+		return fmt.Sprintf("http://:%s", port)
+	}
+	if port == "" {
+		return fmt.Sprintf("http://%s", host)
+	}
+	return fmt.Sprintf("http://%s", net.JoinHostPort(host, port))
+}
+
+// ResolveReachableHTTPRepoHost picks HTTP repo host: prefer domain when reachable, else IP.
+func ResolveReachableHTTPRepoHost(repo v1beta1.Repo) string {
+	if repo.Domain != "" && repo.Ip != "" {
+		if checkReachable(net.JoinHostPort(repo.Domain, repo.Port)) {
+			return repo.Domain
+		}
+		log.Warnf("HTTP repo domain %q unreachable, fallback to IP %q", repo.Domain, repo.Ip)
+		return repo.Ip
+	}
+	if repo.Domain != "" && checkReachable(net.JoinHostPort(repo.Domain, repo.Port)) {
+		return repo.Domain
+	}
+	if repo.Ip != "" {
+		return repo.Ip
+	}
+	return repo.Domain
+}
+
+// ResolveReachableHTTPRepoBaseURL returns http://host:port for HTTP binary downloads.
+// When domain is not reachable (e.g. offline env without DNS), fallback to configured IP.
+func ResolveReachableHTTPRepoBaseURL(repo v1beta1.Repo) string {
+	return BuildHTTPRepoBaseURL(ResolveReachableHTTPRepoHost(repo), repo.Port)
 }
 
 func ValidateK8sVersion(version string) error {
@@ -526,7 +559,7 @@ func GetImageRepoAddress(repo v1beta1.Repo) string {
 }
 
 func ValidateCustomExtra(extra map[string]string) error {
-	if extra == nil || len(extra) == 0 {
+	if len(extra) == 0 {
 		return errors.New("must contain the required parameter containerd")
 	}
 	if _, ok := extra["containerd"]; !ok {
@@ -543,7 +576,7 @@ func ValidateCustomExtra(extra map[string]string) error {
 }
 
 func ValidateAddons(addons addon.Addons) error {
-	if addons == nil || len(addons) == 0 {
+	if len(addons) == 0 {
 		return nil
 	}
 	for _, ad := range addons {

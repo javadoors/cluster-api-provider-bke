@@ -17,6 +17,7 @@ import (
 	"text/template"
 
 	"github.com/stretchr/testify/assert"
+	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
 	"k8s.io/kubernetes/cmd/kubeadm/app/util/etcd"
 )
 
@@ -193,6 +194,27 @@ func TestEtcdFuncMapInitialClusterEmpty(t *testing.T) {
 	result := initialCluster(members)
 	assert.NotEmpty(t, result)
 	assert.Contains(t, result, "https://")
+}
+
+func TestEtcdImageTagFromBootScope(t *testing.T) {
+	t.Run("prefers extra etcdVersion", func(t *testing.T) {
+		cfg := &BootScope{
+			BkeConfig: &confv1beta1.BKEConfig{
+				Cluster: confv1beta1.Cluster{EtcdVersion: "v3.5.12-of.1"},
+			},
+			Extra: map[string]interface{}{"etcdVersion": "v3.5.21-of.1"},
+		}
+		assert.Equal(t, "3.5.21-of.1", etcdImageTagFromBootScope(cfg))
+	})
+
+	t.Run("falls back to cluster spec", func(t *testing.T) {
+		cfg := &BootScope{
+			BkeConfig: &confv1beta1.BKEConfig{
+				Cluster: confv1beta1.Cluster{EtcdVersion: "v3.5.12-of.1"},
+			},
+		}
+		assert.Equal(t, "3.5.12-of.1", etcdImageTagFromBootScope(cfg))
+	})
 }
 
 func TestEtcdFuncMapInitialClusterWithMembers(t *testing.T) {

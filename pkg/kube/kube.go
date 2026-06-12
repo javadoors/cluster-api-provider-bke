@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	apiextv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apiextv1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
@@ -40,7 +39,7 @@ import (
 	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 const (
@@ -65,7 +64,7 @@ type RemoteKubeClient interface {
 	// CheckClusterHealth check cluster health
 	CheckClusterHealth(cluster *bkev1beta1.BKECluster, version string, bkeNodes bkev1beta1.BKENodes) error
 	// NodeHealthCheck check single node health
-	NodeHealthCheck(node *corev1.Node, expectVersion string, log *zap.SugaredLogger) error
+	NodeHealthCheck(node *corev1.Node, expectVersion string, log *log.Logger) error
 	// CheckComponentHealth check components health
 	CheckComponentHealth(node *corev1.Node) error
 	// ListNodes list nodes
@@ -73,7 +72,7 @@ type RemoteKubeClient interface {
 	// GetPod get pod
 	GetPod(namespace, name string) (*corev1.Pod, error)
 	// SetLogger set logger
-	SetLogger(logger *zap.SugaredLogger)
+	SetLogger(logger *log.Logger)
 	// SetBKELogger set bke logger
 	SetBKELogger(bkeLog *bkev1beta1.BKELogger)
 }
@@ -82,7 +81,7 @@ type Client struct {
 	ClientSet     *kubernetes.Clientset
 	DynamicClient dynamic.Interface
 	RestConfig    *rest.Config
-	Log           *zap.SugaredLogger
+	Log           *log.Logger
 	BKELog        *bkev1beta1.BKELogger
 	Ctx           context.Context
 }
@@ -139,7 +138,7 @@ func NewClientFromRestConfig(ctx context.Context, config *rest.Config) (RemoteKu
 		ClientSet:     clientSet,
 		DynamicClient: dynamicClient,
 		RestConfig:    config,
-		Log:           log.BkeLogger,
+		Log:           log.With("module", "kube"),
 		Ctx:           ctx,
 	}, nil
 }
@@ -219,10 +218,12 @@ func (c *Client) KubeClient() (*kubernetes.Clientset, dynamic.Interface) {
 	return c.ClientSet, c.DynamicClient
 }
 
-func (c *Client) SetLogger(logger *zap.SugaredLogger) {
+// SetLogger sets the logger for the Kubernetes client.
+func (c *Client) SetLogger(logger *log.Logger) {
 	c.Log = logger
 }
 
+// SetBKELogger sets the BKE logger for the Kubernetes client.
 func (c *Client) SetBKELogger(bkeLog *bkev1beta1.BKELogger) {
 	c.BKELog = bkeLog
 }

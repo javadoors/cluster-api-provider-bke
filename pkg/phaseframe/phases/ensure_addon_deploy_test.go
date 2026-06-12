@@ -16,8 +16,6 @@ import (
 	"context"
 	"fmt"
 	"net/http/httptest"
-	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"testing"
 	"time"
 
@@ -34,6 +32,8 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/record"
 	v1beta12 "sigs.k8s.io/cluster-api/api/v1beta1"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	agentv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkeagent/v1beta1"
 	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
@@ -520,7 +520,6 @@ func TestProcessAddon_CreateAddon(t *testing.T) {
 	t.Skip("Skipping due to complex dependencies")
 }
 
-
 func TestUpdateAddonStatus_RemoveAddon(t *testing.T) {
 	t.Skip("Skipping due to complex dependencies")
 }
@@ -528,7 +527,6 @@ func TestUpdateAddonStatus_RemoveAddon(t *testing.T) {
 func TestUpdateAddonStatus_CreateAddon(t *testing.T) {
 	t.Skip("Skipping due to complex dependencies")
 }
-
 
 func TestHandleEtcdBackup_Error(t *testing.T) {
 	InitinitPhaseContextFun()
@@ -558,7 +556,6 @@ func TestHandleBeyondELB_EmptyConfig(t *testing.T) {
 func TestHandleClusterAPI_Error(t *testing.T) {
 	t.Skip("Skipping due to complex dependencies")
 }
-
 
 func TestCreateChartRefToBKECluster_NoChartAddons(t *testing.T) {
 	InitinitPhaseContextFun()
@@ -731,8 +728,6 @@ func TestDownloadCalicoCtl_Success(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-
-
 func TestPrepareDownloadCalicoCtlParams(t *testing.T) {
 	InitinitPhaseContextFun()
 	ppAny := NewEnsureAddonDeploy(initPhaseContext)
@@ -839,7 +834,6 @@ func TestGenerateCommandsForAddonObjects(t *testing.T) {
 	assert.NotNil(t, result)
 	assert.Empty(t, result.Commands)
 }
-
 
 func TestAddonBeforeCreateCustomOperate_EtcdBackup(t *testing.T) {
 	InitinitPhaseContextFun()
@@ -1139,7 +1133,6 @@ func TestValidateAndPrepare_WithAddons(t *testing.T) {
 	assert.True(t, result.Continue)
 	assert.NotEmpty(t, result.AddonsT)
 }
-
 
 func TestCreateEtcdBackupDir_WithValidDir(t *testing.T) {
 	t.Skip("Skipping due to complex dependencies")

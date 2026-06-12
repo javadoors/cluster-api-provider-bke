@@ -48,10 +48,10 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/clientutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/download"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/httprepo"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/mfutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/pkiutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/runtime"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 var (
@@ -158,7 +158,7 @@ func (kp *kubeletPlugin) Execute(commands []string) ([]string, error) {
 	}
 
 	if err := kp.ensureImages(config); err != nil {
-		return nil, errors.Wrap(err, "failed to ensure images before kubelet start")
+		log.Warnf("ensure images before kubelet start failed, err: %v", err)
 	}
 
 	// 启动kubelet,设置为开机自启动并启动
@@ -172,7 +172,7 @@ func (kp *kubeletPlugin) Execute(commands []string) ([]string, error) {
 	out, err = kp.exec.ExecuteCommandWithCombinedOutput("sh", "-c", "systemctl restart kubelet")
 	if err != nil {
 		errorMsg := fmt.Sprintf("start kubelet failed, err: %v, out: %s", err, out)
-		log.Errorf(errorMsg)
+		log.Error(errorMsg)
 		return []string{errorMsg}, fmt.Errorf("start kubelet failed, err: %v, out: %s", err, out)
 	}
 	// waite for kubelet start
@@ -181,6 +181,11 @@ func (kp *kubeletPlugin) Execute(commands []string) ([]string, error) {
 		return nil, err
 	}
 	log.Info("kubelet started successfully")
+
+	// ensure images again
+	if err := kp.ensureImages(config); err != nil {
+		return nil, errors.Wrap(err, "failed to ensure images after kubelet start")
+	}
 	return nil, nil
 }
 
@@ -578,13 +583,13 @@ func (kp *kubeletPlugin) downloadAndInstallKubeletBinary(commandMap map[string]s
 	out, err := kp.exec.ExecuteCommandWithCombinedOutput("sh", "-c", "systemctl stop kubelet")
 	if err != nil {
 		errorMsg := fmt.Sprintf("stop kubelet failed, err: %v, out: %s", err, out)
-		log.Warnf(errorMsg)
+		log.Warn(errorMsg)
 	}
 	cmd := fmt.Sprintf("rm -rf %s", filepath.Join(saveto, rename))
 	out, err = kp.exec.ExecuteCommandWithCombinedOutput("sh", "-c", cmd)
 	if err != nil {
 		errorMsg := fmt.Sprintf("rm kubelet failed, err: %v, out: %s", err, out)
-		log.Warnf(errorMsg)
+		log.Warn(errorMsg)
 	}
 
 	return download.ExecDownload(url, saveto, rename, chmod)
@@ -736,6 +741,11 @@ func (kp *kubeletPlugin) ensureImages(config map[string]string) error {
 		return errors.New("unknown container runtime type")
 	}
 
+	if config != nil {
+		config["pauseImage"] = imageMap[bkeinit.DefaultPauseImageName]
+		config["kubeletImage"] = imageMap[bkeinit.DefaultKubeletImageName]
+	}
+
 	for _, image := range imageMap {
 		if kp.containerd != nil {
 			if err := kp.containerd.EnsureImageExists(containerd.ImageRef{Image: image}); err != nil {
@@ -749,10 +759,6 @@ func (kp *kubeletPlugin) ensureImages(config map[string]string) error {
 		}
 	}
 
-	if config != nil {
-		config["pauseImage"] = imageMap[bkeinit.DefaultPauseImageName]
-		config["kubeletImage"] = imageMap[bkeinit.DefaultKubeletImageName]
-	}
 	return nil
 }
 

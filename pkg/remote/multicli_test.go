@@ -16,7 +16,7 @@ import (
 	"context"
 	"testing"
 
-	"go.uber.org/zap"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 func TestNewMultiCli(t *testing.T) {
@@ -36,7 +36,7 @@ func TestNewMultiCli(t *testing.T) {
 func TestMultiCli_SetLogger(t *testing.T) {
 	ctx := context.Background()
 	mc := NewMultiCli(ctx)
-	logger := zap.NewNop().Sugar()
+	var logger *log.Logger = nil
 	mc.SetLogger(logger)
 	if mc.log != logger {
 		t.Error("logger not set correctly")

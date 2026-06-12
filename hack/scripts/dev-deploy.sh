@@ -50,6 +50,7 @@ caBundle=$(kubectl get secret -n cluster-system bke-webhook-secret -o jsonpath='
 
 kubectl patch MutatingWebhookConfiguration bke-mutating-webhook-configuration --type='json' -p='[{"op": "replace", "path": "/webhooks/0/clientConfig/caBundle", "value": "'"$caBundle"'"}]'
 kubectl patch ValidatingWebhookConfiguration bke-validating-webhook-configuration --type='json' -p='[{"op": "replace", "path": "/webhooks/0/clientConfig/caBundle", "value": "'"$caBundle"'"}]'
+kubectl patch ValidatingWebhookConfiguration bke-validating-webhook-configuration --type='json' -p='[{"op": "replace", "path": "/webhooks/1/clientConfig/caBundle", "value": "'"$caBundle"'"}]'
 
 
 echo "stop bke"

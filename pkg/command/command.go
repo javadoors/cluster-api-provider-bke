@@ -33,9 +33,8 @@ import (
 	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	agentutils "gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/constant"
-	l "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 type BaseCommand struct {
@@ -269,6 +268,7 @@ func (b *BaseCommand) setOwnerReference(command *agentv1beta1.Command) error {
 func (b *BaseCommand) createCommand(command *agentv1beta1.Command) error {
 	if err := b.Client.Create(b.Ctx, command); err != nil {
 		if apierrors.IsAlreadyExists(err) {
+			log.Infof("command %s already exists, reusing existing one", command.Name)
 			_, err := b.GetCommand()
 			return err
 		}
@@ -361,7 +361,7 @@ func (b *BaseCommand) waitCommandCompleteWithStruct() WaitCommandResult {
 	// 如果需要等待后删除，则执行删除操作
 	if b.RemoveAfterWait {
 		if deleteErr := b.deleteCommand(); deleteErr != nil {
-			l.Warnf("delete command %s failed: %v", b.commandName, deleteErr)
+			log.Warnf("delete command %s failed: %v", b.commandName, deleteErr)
 		}
 	}
 
@@ -398,8 +398,8 @@ func (b *BaseCommand) handleTimeoutCase(originalComplete bool, originalSuccessNo
 	// 超时不返回错误
 	var err error
 	complete := originalComplete
-	successNodes := originalSuccessNodes
-	failedNodes := originalFailedNodes
+	successNodes := append([]string(nil), originalSuccessNodes...)
+	failedNodes := append([]string(nil), originalFailedNodes...)
 
 	command, cmdErr := b.GetCommand()
 	if cmdErr != nil {
@@ -411,33 +411,26 @@ func (b *BaseCommand) handleTimeoutCase(originalComplete bool, originalSuccessNo
 		}
 	}
 
-	// 复制成功节点列表以安全地进行操作
-	successNodesCopy := make([]string, len(successNodes))
-	copy(successNodesCopy, successNodes)
-
-	// 检查未完成的节点
-	for key := range command.Spec.NodeSelector.MatchLabels {
-		found := false
-		var newSuccessNodesCopy []string
-
-		// 检查当前键是否存在于成功节点中
-		for _, node := range successNodesCopy {
-			if strings.Contains(node, key) {
-				found = true
-				break
-			} else {
-				newSuccessNodesCopy = append(newSuccessNodesCopy, node)
-			}
-		}
-		successNodesCopy = newSuccessNodesCopy
-
-		// 如果未在成功节点中找到，添加到失败节点
-		if !found {
-			failedNodes = append(failedNodes, key)
-		}
+	successNodeSet := make(map[string]struct{}, len(successNodes))
+	for _, node := range successNodes {
+		successNodeSet[node] = struct{}{}
+	}
+	failedNodeSet := make(map[string]struct{}, len(failedNodes))
+	for _, node := range failedNodes {
+		failedNodeSet[node] = struct{}{}
 	}
 
-	successNodes = successNodesCopy
+	// 检查超时后仍未成功的目标节点，并追加到失败列表
+	for nodeName := range command.Spec.NodeSelector.MatchLabels {
+		if _, exists := successNodeSet[nodeName]; exists {
+			continue
+		}
+		if _, exists := failedNodeSet[nodeName]; exists {
+			continue
+		}
+		failedNodes = append(failedNodes, nodeName)
+		failedNodeSet[nodeName] = struct{}{}
+	}
 
 	return TimeoutCaseResult{
 		Err:          err,

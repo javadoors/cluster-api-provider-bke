@@ -213,7 +213,6 @@ func TestEnsureLoadBalance_ConfiguringLoadBalancer_NodeNotReady(t *testing.T) {
 	assert.Contains(t, err.Error(), "agent is not ready")
 }
 
-
 func TestEnsureLoadBalance_CreateLoadBalancerCommand_Success(t *testing.T) {
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
@@ -274,7 +273,6 @@ func TestEnsureLoadBalance_ExecuteAndHandleLoadBalancer_Success(t *testing.T) {
 	assert.True(t, e.Ctx.BKECluster.Status.Ready)
 }
 
-
 func TestEnsureLoadBalance_Execute_Success(t *testing.T) {
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
@@ -304,5 +302,3 @@ func TestEnsureLoadBalance_Execute_Error(t *testing.T) {
 	assert.Error(t, err)
 	assert.False(t, result.Requeue)
 }
-
-

@@ -15,7 +15,6 @@ package certs
 import (
 	"context"
 
-	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -23,7 +22,7 @@ import (
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/pkiutil"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 type BKEKubernetesCertGetter struct {
@@ -34,7 +33,7 @@ type BKEKubernetesCertGetter struct {
 	client     client.Client
 	ctx        context.Context
 
-	log *zap.SugaredLogger
+	log *log.Logger
 }
 
 type CertContent struct {
@@ -49,7 +48,7 @@ func NewBKEKubernetesCertGetter(ctx context.Context, client client.Client, bkeCl
 		bkeCluster:      bkeCluster,
 		client:          client,
 		ctx:             ctx,
-		log:             log.Named("certsGetter").Named(utils.ClientObjNS(bkeCluster)),
+		log:             log.With("name", "certsGetter").With("namespace", utils.ClientObjNS(bkeCluster)),
 	}
 }
 

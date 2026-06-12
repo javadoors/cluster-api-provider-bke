@@ -17,6 +17,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/pkg/errors"
@@ -309,8 +310,13 @@ func CreateBKEAgentRBACWithLocalKubeConfig(ctx context.Context, localKubeConfig 
 		return errors.Wrap(err, "failed to create ClusterRoles")
 	}
 
-	if err := createRoleBindingForNamespace(ctx, highPrivilegeClient, "cluster-system", "bkeagent-configmap-only"); err != nil {
-		return errors.Wrap(err, "failed to create RoleBinding for cluster-system")
+	// Grant read-only configmap permissions in namespaces where bkeagent needs to watch system/patch configmaps.
+	configMapOnlyNamespaces := []string{
+		"cluster-system",
+		"user-system",
+	}
+	if err := createRoleBindingsForNamespaces(ctx, highPrivilegeClient, configMapOnlyNamespaces, "bkeagent-configmap-only"); err != nil {
+		return errors.Wrap(err, "failed to create configmap-only RoleBindings")
 	}
 
 	if bkeCluster != nil {
@@ -326,6 +332,24 @@ func CreateBKEAgentRBACWithLocalKubeConfig(ctx context.Context, localKubeConfig 
 		return errors.Wrap(err, "failed to create cluster access ClusterRoleBinding")
 	}
 
+	return nil
+}
+
+func createRoleBindingsForNamespaces(ctx context.Context, c client.Client, namespaces []string, roleName string) error {
+	seen := make(map[string]struct{}, len(namespaces))
+	for _, namespace := range namespaces {
+		namespace = strings.TrimSpace(namespace)
+		if namespace == "" {
+			continue
+		}
+		if _, exists := seen[namespace]; exists {
+			continue
+		}
+		seen[namespace] = struct{}{}
+		if err := createRoleBindingForNamespace(ctx, c, namespace, roleName); err != nil {
+			return errors.Wrapf(err, "failed to create RoleBinding for namespace %s", namespace)
+		}
+	}
 	return nil
 }
 

@@ -18,7 +18,6 @@ import (
 	"sync"
 	"time"
 
-	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -50,9 +49,9 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/condition"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/constant"
 	labelhelper "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/label"
-	l "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/log"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/nodeutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/predicates"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 // BKEMachineReconciler reconciles a BKEMachine object
@@ -67,11 +66,11 @@ type BKEMachineReconciler struct {
 }
 
 const (
-	machineControllerName = "bke-machine-controller"
+	machineControllerName = "bkemachine"
 	shutdownAgentTimeout  = 10 * time.Second
 )
 
-// +kubebuilder:rbac:groups=bke.bocloud.com,resources=*,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=bke.bocloud.com,resources=*,verbs=get;list;watch;create;update;patch;delete;deletecollection
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
 // TODO(user): Modify the Reconcile function to compare the state specified by
@@ -82,7 +81,7 @@ const (
 // For more details, check Reconcile and its Result here:
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.10.0/pkg/reconcile
 func (r *BKEMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := l.With("controller", machineControllerName)
+	log := log.ControllerLogger(machineControllerName)
 
 	// Fetch required objects
 	objects, err := r.fetchRequiredObjects(ctx, req, log)
@@ -115,7 +114,7 @@ func (r *BKEMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			if apierrors.IsNotFound(err) {
 				return ctrl.Result{}, nil
 			}
-			log.Errorf("failed to patch bkeMachine after adding finalizer")
+			log.Errorf("failed to patch bkeMachine after adding finalizer: %v", err)
 			return ctrl.Result{}, err
 		}
 	}
@@ -154,7 +153,9 @@ type RequiredObjects struct {
 }
 
 // fetchRequiredObjects fetches all required objects for reconciliation
-func (r *BKEMachineReconciler) fetchRequiredObjects(ctx context.Context, req ctrl.Request, log *zap.SugaredLogger) (*RequiredObjects, error) {
+func (r *BKEMachineReconciler) fetchRequiredObjects(
+	ctx context.Context, req ctrl.Request, log *log.Logger,
+) (*RequiredObjects, error) {
 	// Fetch the BKEMachine instance
 	bkeMachine := &bkev1beta1.BKEMachine{}
 	if err := r.Client.Get(ctx, req.NamespacedName, bkeMachine); err != nil {
@@ -194,7 +195,7 @@ func (r *BKEMachineReconciler) fetchRequiredObjects(ctx context.Context, req ctr
 }
 
 // handlePauseAndFinalizer handles pause checks only
-func (r *BKEMachineReconciler) handlePauseAndFinalizer(objects *RequiredObjects, log *zap.SugaredLogger) (ctrl.Result, bool) {
+func (r *BKEMachineReconciler) handlePauseAndFinalizer(objects *RequiredObjects, log *log.Logger) (ctrl.Result, bool) {
 	// Return early if the object or Cluster is paused
 	if annotations.IsPaused(objects.Cluster, objects.BKEMachine) {
 		log.Info("Reconciliation is paused for this object")
@@ -218,7 +219,7 @@ func (r *BKEMachineReconciler) handleMainReconcile(params BootstrapReconcilePara
 			if apierrors.IsNotFound(err) {
 				return
 			}
-			params.Log.Errorf("failed to patch bkeMachine")
+			params.Log.Errorf("failed to patch bkeMachine: %v", err)
 		}
 	}()
 
@@ -279,7 +280,7 @@ func (r *BKEMachineReconciler) reconcile(params BootstrapReconcileParams) (ctrl.
 // reconcileDelete handles BKEMachine deletion.
 // reconcileDelete handles BKEMachine deletion.
 func (r *BKEMachineReconciler) reconcileDelete(params BootstrapReconcileParams) (ctrl.Result, error) {
-	params.Log = params.Log.Named("reconcileBKEMachineDelete").With("bkeMachine", params.BKEMachine.Name)
+	params.Log = params.Log.With("name", "reconcileBKEMachineDelete", "bkeMachine", params.BKEMachine.Name)
 
 	// Handle pre-deletion cleanup
 	defer r.handlePreDeletionCleanup(params)
@@ -422,7 +423,7 @@ func (r *BKEMachineReconciler) shouldSkipDeletion(params BootstrapReconcileParam
 	// 不删除目标集群，如果有注解，且注解值为true或没有注释时
 	if params.BKECluster.Status.ClusterStatus == bkev1beta1.ClusterDeleting {
 		if v, ok := annotation.HasAnnotation(params.BKECluster, annotation.DeleteIgnoreTargetClusterAnnotationKey); (ok && v == "true") || !ok {
-			params.Log.Info("ingore delete target cluster, delete BKEMachine directly")
+			params.Log.Info("ignore delete target cluster, delete BKEMachine directly")
 			return true
 		}
 	}
@@ -604,7 +605,10 @@ func (r *BKEMachineReconciler) BKEClusterToBKEMachines(ctx context.Context, o cl
 }
 
 // LogCommandFailed log command failed message
-func (r *BKEMachineReconciler) LogCommandFailed(cmd agentv1beta1.Command, bkeCluster *bkev1beta1.BKECluster, failedNods []string, log *zap.SugaredLogger, reson string) string {
+func (r *BKEMachineReconciler) LogCommandFailed(
+	cmd agentv1beta1.Command, bkeCluster *bkev1beta1.BKECluster,
+	failedNods []string, log *log.Logger, reson string,
+) string {
 	for _, node := range failedNods {
 		nodeStatus := cmd.Status[node]
 		if nodeStatus == nil {
@@ -621,7 +625,10 @@ func (r *BKEMachineReconciler) LogCommandFailed(cmd agentv1beta1.Command, bkeClu
 	return ""
 }
 
-func (r *BKEMachineReconciler) logInfoAndEvent(log *zap.SugaredLogger, bkeCluster *bkev1beta1.BKECluster, reason, msg string, args ...interface{}) {
+func (r *BKEMachineReconciler) logInfoAndEvent(
+	log *log.Logger, bkeCluster *bkev1beta1.BKECluster,
+	reason, msg string, args ...interface{},
+) {
 	tameStamp := time.Now().Unix()
 	msg = fmt.Sprintf("(%d) %s", tameStamp, msg)
 	r.Recorder.AnnotatedEventf(bkeCluster, annotation.BKENormalEventAnnotation(), corev1.EventTypeNormal, reason, msg, args...)
@@ -629,10 +636,13 @@ func (r *BKEMachineReconciler) logInfoAndEvent(log *zap.SugaredLogger, bkeCluste
 		log.Infof(msg, args...)
 		return
 	}
-	l.Infof(msg, args...)
+	log.Infof(msg, args...)
 }
 
-func (r *BKEMachineReconciler) logErrorAndEvent(log *zap.SugaredLogger, bkeCluster *bkev1beta1.BKECluster, reason, msg string, args ...interface{}) {
+func (r *BKEMachineReconciler) logErrorAndEvent(
+	log *log.Logger, bkeCluster *bkev1beta1.BKECluster,
+	reason, msg string, args ...interface{},
+) {
 	tameStamp := time.Now().Unix()
 	msg = fmt.Sprintf("(%d) %s", tameStamp, msg)
 	r.Recorder.AnnotatedEventf(bkeCluster, annotation.BKENormalEventAnnotation(), corev1.EventTypeWarning, reason, msg, args...)
@@ -640,10 +650,13 @@ func (r *BKEMachineReconciler) logErrorAndEvent(log *zap.SugaredLogger, bkeClust
 		log.Errorf(msg, args...)
 		return
 	}
-	l.Errorf(msg, args...)
+	log.Errorf(msg, args...)
 }
 
-func (r *BKEMachineReconciler) logWarningAndEvent(log *zap.SugaredLogger, bkeCluster *bkev1beta1.BKECluster, reason, msg string, args ...interface{}) {
+func (r *BKEMachineReconciler) logWarningAndEvent(
+	log *log.Logger, bkeCluster *bkev1beta1.BKECluster,
+	reason, msg string, args ...interface{},
+) {
 	tameStamp := time.Now().Unix()
 	msg = fmt.Sprintf("(%d) %s", tameStamp, msg)
 	r.Recorder.AnnotatedEventf(bkeCluster, annotation.BKENormalEventAnnotation(), corev1.EventTypeWarning, reason, msg, args...)
@@ -651,10 +664,13 @@ func (r *BKEMachineReconciler) logWarningAndEvent(log *zap.SugaredLogger, bkeClu
 		log.Warnf(msg, args...)
 		return
 	}
-	l.Warnf(msg, args...)
+	log.Warnf(msg, args...)
 }
 
-func (r *BKEMachineReconciler) logFinishAndEvent(log *zap.SugaredLogger, bkeCluster *bkev1beta1.BKECluster, reason, msg string, args ...interface{}) {
+func (r *BKEMachineReconciler) logFinishAndEvent(
+	log *log.Logger, bkeCluster *bkev1beta1.BKECluster,
+	reason, msg string, args ...interface{},
+) {
 	tameStamp := time.Now().Unix()
 	msg = fmt.Sprintf("(%d) %s", tameStamp, msg)
 	r.Recorder.AnnotatedEventf(bkeCluster, annotation.BKEFinishEventAnnotation(), corev1.EventTypeNormal, reason, msg, args...)
@@ -662,7 +678,7 @@ func (r *BKEMachineReconciler) logFinishAndEvent(log *zap.SugaredLogger, bkeClus
 		log.Infof(msg, args...)
 		return
 	}
-	l.Infof(msg, args...)
+	log.Infof(msg, args...)
 }
 
 // bkeMachineToNode convert bke machine to node
@@ -677,7 +693,7 @@ func bkeMachineToNode(bkeMachine *bkev1beta1.BKEMachine, bkeNodes bkenode.Nodes)
 	}
 	nodes := bkeNodes.Filter(bkenode.FilterOptions{"IP": hostIP})
 	if nodes.Length() == 0 {
-		l.Warnf("node %s is not found in BKECluster.Status.Nodes, maybe already deleted", hostIP)
+		log.Warnf("node %s is not found in BKECluster.Status.Nodes, maybe already deleted", hostIP)
 		// still try to create node
 		return &confv1beta1.Node{
 			IP: hostIP,
@@ -724,7 +740,7 @@ func getBKEMachineAssociateCommands(ctx context.Context, c client.Client, bkeClu
 			continue
 		}
 		if err := command.ValidateCommand(&cmdItem); err != nil {
-			l.Error(cmdItem.Name, err)
+			log.Error(cmdItem.Name, err)
 			continue
 		}
 		commands = append(commands, cmdItem)

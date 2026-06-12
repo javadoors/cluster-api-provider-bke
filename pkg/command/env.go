@@ -27,7 +27,8 @@ type ENV struct {
 
 	Nodes bkenode.Nodes
 
-	BkeConfigName string
+	BkeConfigName     string
+	ContainerdVersion string
 
 	Extra []string
 
@@ -97,6 +98,10 @@ func (e *ENV) NewConatinerdRedeploy() error {
 			BackoffIgnore: false,
 			BackoffDelay:  5,
 		},
+	}
+	if e.ContainerdVersion != "" {
+		commandSpec.Commands[0].Command = append(commandSpec.Commands[0].Command,
+			fmt.Sprintf("containerdVersion=%s", e.ContainerdVersion))
 	}
 	commandSpec.NodeSelector = getNodeSelector(e.Nodes)
 

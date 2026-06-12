@@ -20,7 +20,7 @@ import (
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/certs"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 const (

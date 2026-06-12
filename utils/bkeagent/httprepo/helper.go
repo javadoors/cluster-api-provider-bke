@@ -20,7 +20,7 @@ import (
 	"github.com/shirou/gopsutil/v3/host"
 
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/executor/exec"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 var (

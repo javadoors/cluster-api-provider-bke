@@ -21,6 +21,7 @@ import (
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
+
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/executor/exec"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 )
@@ -30,16 +31,24 @@ type mockSelfUpdateExecutor struct {
 	executeCommandCalled     bool
 	executeCommandWithOutput string
 	executeCommandError      error
+	executeCommandArgs       []string
 }
 
-func (m *mockSelfUpdateExecutor) ExecuteCommand(_ string, _ ...string) error {
+func (m *mockSelfUpdateExecutor) ExecuteCommand(_ string, args ...string) error {
 	m.executeCommandCalled = true
+	m.executeCommandArgs = append([]string(nil), args...)
 	return m.executeCommandError
 }
 
 func (m *mockSelfUpdateExecutor) ExecuteCommandWithCombinedOutput(_ string, _ ...string) (string, error) {
 	m.executeCommandCalled = true
 	return m.executeCommandWithOutput, m.executeCommandError
+}
+
+func patchDownloadAgentBinary(patches *gomonkey.Patches) {
+	patches.ApplyFunc(downloadAgentBinary, func(_ string) (string, error) {
+		return path.Join(utils.AgentBin, agentBinaryName), nil
+	})
 }
 
 func TestUpdatePluginName(t *testing.T) {
@@ -180,9 +189,68 @@ func TestNeedUpdateWhenBinExistsOutputHasMultipleLines(t *testing.T) {
 	assert.True(t, mockExec.executeCommandCalled)
 }
 
+func TestNeedUpdateWhenPrintVersionOutputSameCommit(t *testing.T) {
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+
+	patches.ApplyFunc(utils.Exists, func(_ string) bool {
+		return true
+	})
+
+	mockExec := &mockSelfUpdateExecutor{}
+	mockExec.executeCommandWithOutput = "🤯 Version: latest\n🤔 GitCommitId: dev \n👉 Architecture: unknown\n"
+	mockExec.executeCommandError = nil
+
+	pluginObj := &UpdatePlugin{exec: mockExec}
+
+	assert.False(t, pluginObj.NeedUpdate("/etc/bkeagent/bin/bkeagent"))
+}
+
+func TestNeedUpdateWhenPrintVersionOutputDifferentCommit(t *testing.T) {
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+
+	patches.ApplyFunc(utils.Exists, func(_ string) bool {
+		return true
+	})
+
+	mockExec := &mockSelfUpdateExecutor{}
+	mockExec.executeCommandWithOutput = "🤯 Version: latest\n🤔 GitCommitId: 3333333333 \n"
+	mockExec.executeCommandError = nil
+
+	pluginObj := &UpdatePlugin{exec: mockExec}
+
+	assert.True(t, pluginObj.NeedUpdate("/etc/bkeagent/bin/bkeagent"))
+}
+
+func TestGitCommitFromVersionOutput(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		want   string
+	}{
+		{
+			name: "print version",
+			output: "🤯 Version: latest\n" +
+				"🤔 GitCommitId: 3333333333 \n" +
+				"👉 Architecture: unknown\n",
+			want: "3333333333",
+		},
+		{"single line legacy", "dev", "dev"},
+		{"no commit line", "🤯 Version: latest\n", ""},
+		{"empty", "", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, gitCommitFromVersionOutput(tc.output))
+		})
+	}
+}
+
 func TestExecuteWhenNoUpdateNeeded(t *testing.T) {
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
+	patchDownloadAgentBinary(patches)
 
 	patches.ApplyFunc(utils.Exists, func(_ string) bool {
 		return true
@@ -193,7 +261,7 @@ func TestExecuteWhenNoUpdateNeeded(t *testing.T) {
 
 	pluginObj := &UpdatePlugin{exec: mockExec}
 
-	result, err := pluginObj.Execute([]string{})
+	result, err := pluginObj.Execute([]string{Name})
 
 	assert.NoError(t, err)
 	assert.Nil(t, result)
@@ -202,6 +270,7 @@ func TestExecuteWhenNoUpdateNeeded(t *testing.T) {
 func TestExecuteWhenScriptsDirNotExists(t *testing.T) {
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
+	patchDownloadAgentBinary(patches)
 
 	var mkdirCalled bool
 	var writeFileCalled bool
@@ -232,7 +301,7 @@ func TestExecuteWhenScriptsDirNotExists(t *testing.T) {
 
 	pluginObj := &UpdatePlugin{exec: mockExec}
 
-	result, err := pluginObj.Execute([]string{})
+	result, err := pluginObj.Execute([]string{Name})
 
 	assert.NoError(t, err)
 	assert.Nil(t, result)
@@ -244,6 +313,7 @@ func TestExecuteWhenScriptsDirNotExists(t *testing.T) {
 func TestExecuteWhenScriptsDirExists(t *testing.T) {
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
+	patchDownloadAgentBinary(patches)
 
 	var mkdirCalled bool
 	var writeFileCalled bool
@@ -274,7 +344,7 @@ func TestExecuteWhenScriptsDirExists(t *testing.T) {
 
 	pluginObj := &UpdatePlugin{exec: mockExec}
 
-	result, err := pluginObj.Execute([]string{})
+	result, err := pluginObj.Execute([]string{Name})
 
 	assert.NoError(t, err)
 	assert.Nil(t, result)
@@ -285,6 +355,7 @@ func TestExecuteWhenScriptsDirExists(t *testing.T) {
 func TestExecuteWhenScriptExists(t *testing.T) {
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
+	patchDownloadAgentBinary(patches)
 
 	var mkdirCalled bool
 	var writeFileCalled bool
@@ -315,7 +386,7 @@ func TestExecuteWhenScriptExists(t *testing.T) {
 
 	pluginObj := &UpdatePlugin{exec: mockExec}
 
-	result, err := pluginObj.Execute([]string{})
+	result, err := pluginObj.Execute([]string{Name})
 
 	assert.NoError(t, err)
 	assert.Nil(t, result)
@@ -326,6 +397,7 @@ func TestExecuteWhenScriptExists(t *testing.T) {
 func TestExecuteWithMkdirError(t *testing.T) {
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
+	patchDownloadAgentBinary(patches)
 
 	mkdirErr := errors.New("mkdir failed")
 
@@ -342,7 +414,7 @@ func TestExecuteWithMkdirError(t *testing.T) {
 
 	pluginObj := &UpdatePlugin{exec: mockExec}
 
-	result, err := pluginObj.Execute([]string{})
+	result, err := pluginObj.Execute([]string{Name})
 
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "mkdir failed")
@@ -352,6 +424,7 @@ func TestExecuteWithMkdirError(t *testing.T) {
 func TestExecuteWithWriteFileError(t *testing.T) {
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
+	patchDownloadAgentBinary(patches)
 
 	writeErr := errors.New("write file failed")
 
@@ -375,7 +448,7 @@ func TestExecuteWithWriteFileError(t *testing.T) {
 
 	pluginObj := &UpdatePlugin{exec: mockExec}
 
-	result, err := pluginObj.Execute([]string{})
+	result, err := pluginObj.Execute([]string{Name})
 
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "write file failed")
@@ -385,6 +458,7 @@ func TestExecuteWithWriteFileError(t *testing.T) {
 func TestExecuteWithExecuteCommandError(t *testing.T) {
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
+	patchDownloadAgentBinary(patches)
 
 	execErr := errors.New("execute command failed")
 
@@ -412,10 +486,26 @@ func TestExecuteWithExecuteCommandError(t *testing.T) {
 
 	pluginObj := &UpdatePlugin{exec: mockExec}
 
-	result, err := pluginObj.Execute([]string{})
+	result, err := pluginObj.Execute([]string{Name})
 
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "execute command failed")
+	assert.Nil(t, result)
+}
+
+func TestExecuteWithDownloadError(t *testing.T) {
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+
+	patches.ApplyFunc(downloadAgentBinary, func(_ string) (string, error) {
+		return "", errors.New("download failed")
+	})
+
+	pluginObj := &UpdatePlugin{exec: &mockSelfUpdateExecutor{}}
+	result, err := pluginObj.Execute([]string{Name, "agentUrl=http://test.com/bkeagent"})
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "download failed")
 	assert.Nil(t, result)
 }
 
@@ -424,6 +514,11 @@ func TestExecuteWithCustomAgentUrl(t *testing.T) {
 	defer patches.Reset()
 
 	customUrl := "http://custom.example.com/bkeagent-latest-linux-{.arch}"
+	var downloadedURL string
+	patches.ApplyFunc(downloadAgentBinary, func(url string) (string, error) {
+		downloadedURL = url
+		return path.Join(utils.AgentBin, agentBinaryName), nil
+	})
 
 	patches.ApplyFunc(utils.Exists, func(s string) bool {
 		if s == "/etc/bkeagent/scripts" {
@@ -453,6 +548,7 @@ func TestExecuteWithCustomAgentUrl(t *testing.T) {
 
 	assert.NoError(t, err)
 	assert.Nil(t, result)
+	assert.Equal(t, customUrl, downloadedURL)
 }
 
 func TestUpdatePluginDefaultAgentUrl(t *testing.T) {
@@ -476,22 +572,23 @@ func TestUpdatePluginRestartScriptPath(t *testing.T) {
 	assert.Equal(t, expectedPath, scriptPath)
 }
 
-func TestUpdatePluginNeedUpdateExtractsFirstLine(t *testing.T) {
-	patches := gomonkey.NewPatches()
-	defer patches.Reset()
-
+func TestUpdatePluginNeedUpdateVersionOutputCases(t *testing.T) {
 	testCases := []struct {
 		name           string
 		output         string
 		expectedResult bool
 	}{
-		{"single line", "abc123", true},
-		{"multiple lines", "abc123\nline2\nline3", true},
+		{"single line different commit", "abc123", true},
+		{"version banner same commit", "🤯 Version: latest\n🤔 GitCommitId: dev \n", false},
+		{"version banner different commit", "🤯 Version: latest\n🤔 GitCommitId: other \n", true},
 		{"empty output", "", true},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			patches := gomonkey.NewPatches()
+			defer patches.Reset()
+
 			patches.ApplyFunc(utils.Exists, func(_ string) bool {
 				return true
 			})
@@ -505,13 +602,13 @@ func TestUpdatePluginNeedUpdateExtractsFirstLine(t *testing.T) {
 
 			assert.Equal(t, tc.expectedResult, result)
 		})
-		patches.Reset()
 	}
 }
 
 func TestUpdatePluginExecuteParsesCommands(t *testing.T) {
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
+	patchDownloadAgentBinary(patches)
 
 	patches.ApplyFunc(utils.Exists, func(s string) bool {
 		if s == "/etc/bkeagent/scripts" {
@@ -536,7 +633,7 @@ func TestUpdatePluginExecuteParsesCommands(t *testing.T) {
 
 	pluginObj := &UpdatePlugin{exec: mockExec}
 
-	result, err := pluginObj.Execute([]string{Name, "agentUrl=http://test.com"})
+	result, err := pluginObj.Execute([]string{Name, "agentUrl=http://test.com/bkeagent"})
 
 	assert.NoError(t, err)
 	assert.Nil(t, result)
@@ -584,6 +681,7 @@ func TestUpdatePluginCommandsArrayParsing(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			patches := gomonkey.NewPatches()
 			defer patches.Reset()
+			patchDownloadAgentBinary(patches)
 
 			patches.ApplyFunc(utils.Exists, func(_ string) bool {
 				return true
@@ -594,7 +692,11 @@ func TestUpdatePluginCommandsArrayParsing(t *testing.T) {
 
 			pluginObj := &UpdatePlugin{exec: mockExec}
 
-			result, err := pluginObj.Execute(tc.commands)
+			commands := tc.commands
+			if len(commands) == 1 && commands[0] == Name {
+				commands = []string{Name, "agentUrl=http://test.com/bkeagent"}
+			}
+			result, err := pluginObj.Execute(commands)
 
 			if tc.expectError {
 				assert.Error(t, err)
@@ -604,6 +706,26 @@ func TestUpdatePluginCommandsArrayParsing(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestExecuteSchedulesDelayedRestartCommand(t *testing.T) {
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patchDownloadAgentBinary(patches)
+
+	patches.ApplyFunc(utils.Exists, func(_ string) bool { return true })
+
+	mockExec := &mockSelfUpdateExecutor{
+		executeCommandWithOutput: "different-version",
+	}
+	pluginObj := &UpdatePlugin{exec: mockExec}
+
+	result, err := pluginObj.Execute([]string{Name, "agentUrl=http://test.com/bkeagent"})
+
+	assert.NoError(t, err)
+	assert.Nil(t, result)
+	assert.True(t, mockExec.executeCommandCalled)
+	assert.Equal(t, []string{"-c", "nohup /bin/sh -c 'sleep 3; /etc/openFuyao/bkeagent/scripts/update.sh /etc/openFuyao/bkeagent/bin/bkeagent' >/dev/null 2>&1 &"}, mockExec.executeCommandArgs)
 }
 
 func TestUpdatePluginScriptsDirectoryConstant(t *testing.T) {
@@ -621,7 +743,7 @@ func TestUpdatePluginBinDirectoryConstant(t *testing.T) {
 func TestUpdatePluginUpdateScriptPermission(t *testing.T) {
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
-
+	patchDownloadAgentBinary(patches)
 
 	patches.ApplyFunc(utils.Exists, func(s string) bool {
 		if s == "/etc/bkeagent/scripts" {
@@ -638,6 +760,6 @@ func TestUpdatePluginUpdateScriptPermission(t *testing.T) {
 	mockExec.executeCommandWithOutput = "abc123"
 
 	pluginObj := &UpdatePlugin{exec: mockExec}
-	pluginObj.Execute([]string{})
+	pluginObj.Execute([]string{Name})
 
 }

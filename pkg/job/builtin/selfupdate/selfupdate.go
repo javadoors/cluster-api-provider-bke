@@ -22,13 +22,17 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/executor/exec"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job/builtin/plugin"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
+	agentdownload "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/download"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/version"
 )
 
 const (
 	Name            = "SelfUpdate"
+	agentBinaryName = "bkeagent"
 	DefaultAgentUrl = "http://http.bocloud.k8s:40080/files/bkeagent-latest-linux-{.arch}"
+	// restartDelaySeconds gives controller time to persist command status before service stop.
+	restartDelaySeconds = 3
 	// RwxRxRx is the permission of the directory
 	RwxRxRx = 0755
 )
@@ -65,8 +69,19 @@ func (u UpdatePlugin) Param() map[string]plugin.PluginParam {
 }
 
 func (u UpdatePlugin) Execute(commands []string) ([]string, error) {
-	agentName := "bkeagent"
-	binPath := path.Join(utils.AgentBin, agentName)
+	runtimeParam, err := plugin.ParseCommands(u, commands)
+	if err != nil {
+		return nil, err
+	}
+
+	agentURL := strings.TrimSpace(runtimeParam["agentUrl"])
+	if agentURL == "" {
+		return nil, fmt.Errorf("agentUrl is required")
+	}
+	binPath, err := downloadAgentBinary(agentURL)
+	if err != nil {
+		return nil, err
+	}
 
 	if !u.NeedUpdate(binPath) {
 		log.Infof("The agent is up to date, skip!")
@@ -82,29 +97,60 @@ func (u UpdatePlugin) Execute(commands []string) ([]string, error) {
 
 	if !utils.Exists(restartScript) {
 		if err := os.WriteFile(restartScript, []byte(updateScript), RwxRxRx); err != nil {
-			log.Errorf("Failed to create file %s, err:", restartScript, err)
+			log.Errorf("Failed to create file %s, err: %v", restartScript, err)
 			return nil, err
 		}
 	}
 
-	// 执行update.sh
-	if err := u.exec.ExecuteCommand("/bin/sh", "-c", fmt.Sprintf("nohup %s %s >/dev/null 2>&1 &", restartScript, binPath)); err != nil {
+	// Delay stop/restart a bit, so command status can be persisted before this process exits.
+	updateCmd := fmt.Sprintf("nohup /bin/sh -c 'sleep %d; %s %s' >/dev/null 2>&1 &",
+		restartDelaySeconds, restartScript, binPath)
+	if err := u.exec.ExecuteCommand("/bin/sh", "-c", updateCmd); err != nil {
 		return nil, err
 	}
 	return nil, nil
 }
 
 func (u UpdatePlugin) NeedUpdate(binPath string) bool {
-	// 获取当前编译版本
-	gitCommitID := version.GitCommitID
-	downloadGitCommitID := ""
-	if utils.Exists(binPath) {
-		out, err := u.exec.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", fmt.Sprintf("chmod +x %s && %s -v", binPath, binPath))
-		if err == nil && out != "" {
-			// 获取out第一行
-			downloadGitCommitID = strings.Split(out, "\n")[0]
+	if !utils.Exists(binPath) {
+		return true
+	}
+	out, err := u.exec.ExecuteCommandWithCombinedOutput("/bin/sh", "-c",
+		fmt.Sprintf("chmod +x %s && %s -v", binPath, binPath))
+	if err != nil || strings.TrimSpace(out) == "" {
+		return true
+	}
+	downloadGitCommitID := gitCommitFromVersionOutput(out)
+	if downloadGitCommitID == "" {
+		return true
+	}
+	return version.GitCommitID != downloadGitCommitID
+}
+
+// gitCommitFromVersionOutput parses GitCommitId from `bkeagent -v` (PrintVersion) output.
+// A single-line value without ":" is accepted for backward compatibility with legacy callers.
+func gitCommitFromVersionOutput(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		if idx := strings.Index(line, "GitCommitId:"); idx >= 0 {
+			return strings.TrimSpace(line[idx+len("GitCommitId:"):])
 		}
 	}
+	trimmed := strings.TrimSpace(out)
+	if trimmed != "" && !strings.Contains(trimmed, "\n") && !strings.Contains(trimmed, ":") {
+		return trimmed
+	}
+	return ""
+}
 
-	return gitCommitID != downloadGitCommitID
+// downloadAgentBinary downloads the agent from agentUrl into AgentBin and names it bkeagent.
+func downloadAgentBinary(agentURL string) (string, error) {
+	if err := agentdownload.ExecDownload(agentURL, utils.AgentBin, agentBinaryName, "0755"); err != nil {
+		return "", fmt.Errorf("download agent from %q: %w", agentURL, err)
+	}
+	binPath := path.Join(utils.AgentBin, agentBinaryName)
+	if err := os.Chmod(binPath, RwxRxRx); err != nil {
+		return "", fmt.Errorf("chmod %s: %w", binPath, err)
+	}
+	log.Infof("downloaded bkeagent binary to %s", binPath)
+	return binPath, nil
 }

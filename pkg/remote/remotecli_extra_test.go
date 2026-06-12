@@ -15,7 +15,7 @@ package remote
 import (
 	"testing"
 
-	"go.uber.org/zap"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 func TestNewRemoteClient_InvalidHost(t *testing.T) {
@@ -35,7 +35,7 @@ func TestHostRemoteClient_SetLogger(t *testing.T) {
 	client := &HostRemoteClient{
 		host: &Host{Address: "192.168.1.1"},
 	}
-	logger := zap.NewNop().Sugar()
+	var logger *log.Logger = log.With("test", "remotecli")
 	client.SetLogger(logger)
 	if client.log == nil {
 		t.Error("logger not set")

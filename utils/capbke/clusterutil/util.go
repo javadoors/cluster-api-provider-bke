@@ -14,6 +14,7 @@ package clusterutil
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -21,7 +22,10 @@ import (
 
 	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/common"
+	bkeinit "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/initialize"
 	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/validation"
+	bkesource "gopkg.openfuyao.cn/cluster-api-provider-bke/common/source"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 )
 
@@ -69,4 +73,16 @@ func GetBKEConfigCMData(ctx context.Context, c client.Client) (map[string]string
 		return nil, err
 	}
 	return config.Data, nil
+}
+
+// BuildYumRepoDownloadBaseURL builds download base URL by HTTP repo settings.
+// When domain is not reachable, fallback to HTTPRepo.Ip (offline env).
+// When HTTPRepo.Prefix is configured, keep prefix in the final URL directly.
+// Otherwise, fallback to legacy GetCustomDownloadPath behavior.
+func BuildYumRepoDownloadBaseURL(cfg bkeinit.BkeConfig) string {
+	baseURL := validation.ResolveReachableHTTPRepoBaseURL(cfg.Cluster.HTTPRepo)
+	if cfg.Cluster.HTTPRepo.Prefix != "" {
+		return fmt.Sprintf("%s/%s", baseURL, cfg.Cluster.HTTPRepo.Prefix)
+	}
+	return bkesource.GetCustomDownloadPath(baseURL)
 }

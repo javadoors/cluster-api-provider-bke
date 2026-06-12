@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
-	"go.uber.org/zap"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -27,6 +26,7 @@ import (
 	"k8s.io/client-go/rest"
 
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 func TestTimeoutConstant(t *testing.T) {
@@ -167,7 +167,7 @@ func TestWaiter_SetPoller(t *testing.T) {
 }
 
 func TestWaiter_SetChecker(t *testing.T) {
-	logger := zap.NewNop().Sugar()
+	var logger *log.Logger = nil
 	bkeLog := &bkev1beta1.BKELogger{}
 
 	c := &Client{
@@ -193,7 +193,7 @@ func TestWaiter_SetChecker(t *testing.T) {
 }
 
 func TestNewCheckerFromKubeClient(t *testing.T) {
-	logger := zap.NewNop().Sugar()
+	var logger *log.Logger = nil
 	bkeLog := &bkev1beta1.BKELogger{}
 
 	c := &Client{
@@ -232,7 +232,7 @@ func TestNewClient(t *testing.T) {
 }
 
 func TestClient_Wait(t *testing.T) {
-	logger := zap.NewNop().Sugar()
+	var logger *log.Logger = nil
 	c := &Client{
 		ClientSet:     &kubernetes.Clientset{},
 		DynamicClient: &dynamic.DynamicClient{},
@@ -272,4 +272,3 @@ func TestKubeFactory_ToRawKubeConfigLoader(t *testing.T) {
 	loader := factory.ToRawKubeConfigLoader()
 	assert.NotNil(t, loader)
 }
-

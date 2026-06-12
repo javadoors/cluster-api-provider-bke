@@ -185,6 +185,14 @@ func TestUpgradeWithBackUpEtcd(t *testing.T) {
 	assert.NotNil(t, upgrade)
 }
 
+func TestUpgradeWithEtcdVersion(t *testing.T) {
+	upgrade := createTestUpgrade()
+	upgrade.EtcdVersion = "v3.5.21-of.1"
+	err := upgrade.New()
+	assert.NoError(t, err)
+	assert.NotNil(t, upgrade)
+}
+
 func TestUpgradeWithDefaultClusterFrom(t *testing.T) {
 	upgrade := createTestUpgrade()
 	upgrade.ClusterFrom = ""

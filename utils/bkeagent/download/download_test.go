@@ -78,6 +78,34 @@ func TestExecDownloadWithRename(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+func TestDownloadBytes(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("[Service]\nExecStart=--health-port= --ntpserver=\n"))
+	}))
+	defer server.Close()
+
+	data, err := DownloadBytes(server.URL + "/bkeagent.service")
+	assert.NoError(t, err)
+	assert.Contains(t, string(data), "--ntpserver=")
+}
+
+func TestExecDownloadForArch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/bkeagent-linux-arm64", r.URL.Path)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("binary"))
+	}))
+	defer server.Close()
+
+	tmpDir := t.TempDir()
+	url := server.URL + "/bkeagent-linux-{.arch}"
+	err := ExecDownloadForArch(url, tmpDir, "bkeagent", "0755", "arm64")
+	assert.NoError(t, err)
+	_, err = os.Stat(filepath.Join(tmpDir, "bkeagent"))
+	assert.NoError(t, err)
+}
+
 func TestExecDownloadHTTPError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)

@@ -34,7 +34,6 @@ import (
 	bkeinit "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/initialize"
 	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
 	bkevalidte "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/validation"
-	bkesource "gopkg.openfuyao.cn/cluster-api-provider-bke/common/source"
 	backupPlugin "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job/builtin/backup"
 	containerdPlugin "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job/builtin/containerruntime/containerd"
 	downloadPlugin "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job/builtin/downloader"
@@ -45,9 +44,10 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/cluster"
 	bkeetcd "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/etcd"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/mfutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/pkiutil"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/clusterutil"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 const (
@@ -67,7 +67,7 @@ func (k *KubeadmPlugin) installContainerdCommand() error {
 	if err := bkevalidte.ValidateCustomExtra(cfg.CustomExtra); err != nil {
 		return err
 	}
-	baseUrl := bkesource.GetCustomDownloadPath(cfg.YumRepo())
+	baseUrl := clusterutil.BuildYumRepoDownloadBaseURL(cfg)
 	containerd := cfg.CustomExtra["containerd"]
 	containerd = strings.ReplaceAll(containerd, "{.arch}", hostArch)
 	url := fmt.Sprintf("%s/%s", baseUrl, containerd)
@@ -102,7 +102,7 @@ func (k *KubeadmPlugin) installContainerdCommand() error {
 func (k *KubeadmPlugin) installKubeletCommand() error {
 	cfg := bkeinit.BkeConfig(*k.boot.BkeConfig)
 	k8sVersion := cfg.Cluster.KubernetesVersion
-	kubeletUrl := bkesource.GetCustomDownloadPath(cfg.YumRepo())
+	kubeletUrl := clusterutil.BuildYumRepoDownloadBaseURL(cfg)
 	kubelet := fmt.Sprintf("kubelet-%s-%s", k8sVersion, hostArch)
 	kubeletUrl = fmt.Sprintf("%s/%s", kubeletUrl, kubelet)
 	log.Infof("kubelet download url: %s", kubeletUrl)
@@ -196,7 +196,7 @@ func (k *KubeadmPlugin) installKubectlCommand() error {
 	cfg := bkeinit.BkeConfig(*k.boot.BkeConfig)
 	k8sVersion := cfg.Cluster.KubernetesVersion
 
-	kubectlUrl := bkesource.GetCustomDownloadPath(cfg.YumRepo())
+	kubectlUrl := clusterutil.BuildYumRepoDownloadBaseURL(cfg)
 	kubectl := fmt.Sprintf("kubectl-%s-%s", k8sVersion, hostArch)
 	kubectlUrl = fmt.Sprintf("%s/%s", kubectlUrl, kubectl)
 	log.Infof("kubectl download url: %s", kubectlUrl)

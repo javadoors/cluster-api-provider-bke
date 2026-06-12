@@ -43,8 +43,9 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/httprepo"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/initsystem"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/runtime"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/clusterutil"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 //go:embed tmpl/system.modules
@@ -54,7 +55,7 @@ const MaxUint16 = 65535
 
 // processSimpleInitScope processes simple init scopes that only call one function
 func (ep *EnvPlugin) processSimpleInitScope(logMsg string, initFunc func() error) error {
-	log.Infof(logMsg)
+	log.Info(logMsg)
 	return initFunc()
 }
 
@@ -506,15 +507,11 @@ func (ep *EnvPlugin) initHost() error {
 		ep.clusterHosts = []string{}
 	}()
 
-	// 设置hostanme
-	hostname, err := os.Hostname()
-	if err != nil {
-		return errors.Wrap(err, "Get hostname failed when init hostanme")
-	}
-
 	bkeNodeName := utils.HostName()
-	if hostname != bkeNodeName {
-		ep.trySetHostName(bkeNodeName)
+	if osHostname, err := os.Hostname(); err != nil {
+		return errors.Wrap(err, "Get hostname failed when init hostanme")
+	} else {
+		logOSHostnamePreserved(osHostname, bkeNodeName)
 	}
 
 	h, err := NewHostsFile(InitHostConfPath)
@@ -693,6 +690,9 @@ func (ep *EnvPlugin) configAndRestartRuntime(cfg runtimeConfig, runtimeToUse str
 
 // initRuntime download container runtime
 func (ep *EnvPlugin) initRuntime() error {
+	if ep.bkeConfig == nil {
+		return nil
+	}
 	cfg := ep.loadRuntimeConfig()
 
 	//获取当前的containerRuntime
@@ -701,7 +701,7 @@ func (ep *EnvPlugin) initRuntime() error {
 	// download richrunc if docker and richrunc
 	if currentContainerRuntime == runtime.ContainerRuntimeDocker && cfg.lowLevelRuntime == "richrunc" {
 		bkeCfg := bkeinit.BkeConfig(*ep.bkeConfig)
-		url := bkesource.GetCustomDownloadPath(bkeCfg.YumRepo())
+		url := clusterutil.BuildYumRepoDownloadBaseURL(bkeCfg)
 		url = fmt.Sprintf("url=%s/richrunc-%s", url, goruntime.GOARCH)
 
 		commands := []string{
@@ -814,7 +814,7 @@ func (ep *EnvPlugin) downloadDocker(lowLevelRuntime string, enableDockerTls bool
 
 		runtimeUrl := ""
 		if lowLevelRuntime == "richrunc" {
-			baseDownloadUrl := bkesource.GetCustomDownloadPath(cfg.YumRepo())
+			baseDownloadUrl := clusterutil.BuildYumRepoDownloadBaseURL(cfg)
 			runtimeUrl = fmt.Sprintf("%s/richrunc-%s", baseDownloadUrl, goruntime.GOARCH)
 		}
 
@@ -850,7 +850,7 @@ func (ep *EnvPlugin) downloadContainerd(lowLevelRuntime string, insecureRegistri
 	// todo 适配ContainerRuntime配置
 	if ep.bkeConfig != nil {
 		cfg := bkeinit.BkeConfig(*ep.bkeConfig)
-		baseUrl := bkesource.GetCustomDownloadPath(cfg.YumRepo())
+		baseUrl := clusterutil.BuildYumRepoDownloadBaseURL(cfg)
 		repo := cfg.ImageThirdRepo()
 		sandboxImage := fmt.Sprintf("%s/pause:%s", strings.TrimRight(repo, "/"),
 			bkeinit.DefaultPauseImageTag)
@@ -909,7 +909,7 @@ func (ep *EnvPlugin) downloadCriDockerd() error {
 		exporter := imagehelper.NewImageExporter(repo, k8sVersion, "")
 		imageMap, _ := exporter.ExportImageMap()
 		sandboxImage = imageMap[bkeinit.DefaultPauseImageName]
-		baseDownloadUrl := bkesource.GetCustomDownloadPath(cfg.YumRepo())
+		baseDownloadUrl := clusterutil.BuildYumRepoDownloadBaseURL(cfg)
 		criDockerdUrl = fmt.Sprintf("%s/cri-dockerd-0.3.9-%s", baseDownloadUrl, goruntime.GOARCH)
 
 		command := []string{
@@ -964,8 +964,8 @@ func (ep *EnvPlugin) initHttpRepo() error {
 	}
 
 	cfg := bkeinit.BkeConfig(*ep.bkeConfig)
-	if cfg.Cluster.ImageRepo.Domain == "cr.openfuyao.cn" {
-		log.Errorf("online deploy, not need mod repo")
+	if cfg.Cluster.ImageRepo.Domain != bkeinit.DefaultImageRepo {
+		log.Infof("online deploy image repo domain %v, not need mod repo", cfg.Cluster.ImageRepo.Domain)
 		return nil
 	}
 

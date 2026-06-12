@@ -19,16 +19,15 @@ import (
 	"strings"
 
 	"github.com/pkg/errors"
-	"go.uber.org/zap"
 
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 type HostRemoteClient struct {
 	SshClient  *Ssh
 	SftpClient *Sftp
 	host       *Host
-	log        *zap.SugaredLogger
+	log        *log.Logger
 }
 
 // NewRemoteClient returns a new remote client with ssh and sftp client
@@ -60,10 +59,12 @@ func NewRemoteClient(h *Host) (*HostRemoteClient, error) {
 	return c, nil
 }
 
-func (c *HostRemoteClient) SetLogger(log *zap.SugaredLogger) {
-	c.log = log.With("host", c.host.Address)
+// SetLogger sets the logger for the remote client.
+func (c *HostRemoteClient) SetLogger(logger *log.Logger) {
+	c.log = logger
 }
 
+// Exec executes a command on the remote client.
 func (cli *HostRemoteClient) Exec(ctx context.Context, cmd Command, stdErrChan chan CombineOut, stdOutChan chan CombineOut) {
 
 	hostIp := cli.host.Address
@@ -91,11 +92,11 @@ func (cli *HostRemoteClient) Exec(ctx context.Context, cmd Command, stdErrChan c
 		cli.log.Infof("Upload file %q to %q %q", file.Src, hostIp, file.Dst)
 		if err := cli.SftpClient.UploadFile(file.Src, file.Dst); err != nil {
 			errInfo := fmt.Sprintf("Failed to upload file %q to %q %q, err: %s", file.Src, hostIp, file.Dst, err.Error())
-			cli.log.Debugf(errInfo)
+			cli.log.Debug(errInfo)
 			stdErrChan <- NewCombineOut(hostIp, "", errInfo)
 			continue
 		}
-		cli.log.Debugf("Upload file %q to %q %q, success", file.Src, hostIp, file.Dst)
+		cli.log.Debug(fmt.Sprintf("Upload file %q to %q %q, success", file.Src, hostIp, file.Dst))
 	}
 
 	for _, c := range cmd.List() {
@@ -103,16 +104,16 @@ func (cli *HostRemoteClient) Exec(ctx context.Context, cmd Command, stdErrChan c
 		stderr, stdout, err := cli.SshClient.Exec(c)
 		if len(stderr) != 0 {
 			errInfo := fmt.Sprintf("Failed to execute command %q on %q, stderr: %v", c, hostIp, stderr)
-			cli.log.Debugf(errInfo)
+			cli.log.Debug(errInfo)
 			stdErrChan <- NewCombineOut(hostIp, c, errInfo)
 		}
 		if err != nil {
 			errInfo := fmt.Sprintf("Failed to execute command %q on %q, err: %s", c, hostIp, err.Error())
-			cli.log.Debugf(errInfo)
+			cli.log.Debug(errInfo)
 			stdErrChan <- NewCombineOut(hostIp, c, errInfo)
 		}
 		if len(stdout) != 0 {
-			cli.log.Debugf("Execute command %q on %q, stdout: %s", c, hostIp, stdout)
+			cli.log.Debug(fmt.Sprintf("Execute command %q on %q, stdout: %s", c, hostIp, stdout))
 			stdOutChan <- NewCombineOut(hostIp, c, strings.Join(stdout, "\n"))
 		}
 		if len(stderr) == 0 && err == nil {
@@ -122,7 +123,7 @@ func (cli *HostRemoteClient) Exec(ctx context.Context, cmd Command, stdErrChan c
 
 }
 
-// CloseRemoteCli 关闭远程客户端
+// CloseRemoteCli closes the remote client.
 func (cli *HostRemoteClient) CloseRemoteCli() error {
 	var errs []string
 	if err := cli.SftpClient.Close(); err != nil && err != io.EOF {

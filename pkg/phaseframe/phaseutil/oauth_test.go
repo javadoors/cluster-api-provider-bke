@@ -21,7 +21,7 @@ import (
 
 func TestStructToUnstructured(t *testing.T) {
 	user := &User{
-		TypeMeta: v1.TypeMeta{Kind: "User", APIVersion: "v1"},
+		TypeMeta:   v1.TypeMeta{Kind: "User", APIVersion: "v1"},
 		ObjectMeta: v1.ObjectMeta{Name: "test"},
 	}
 	result, err := StructToUnstructured(user)

@@ -18,9 +18,9 @@ import (
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
+
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/common/source"
-
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/executor/exec"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/httprepo"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/resetutil"

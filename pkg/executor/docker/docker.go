@@ -36,7 +36,7 @@ import (
 
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/executor/exec"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 // DockerClient is an interface for Docker operations
@@ -1070,7 +1070,7 @@ func WaitDockerReady() error {
 	ctx, cancel := context.WithTimeout(context.Background(), DockerReadyTimeoutMinutes*time.Minute)
 	defer cancel()
 	err := wait.PollImmediateUntil(DockerReadyPollInterval, func() (bool, error) {
-		log.Infof("Waiting for Docker to be ready")
+		log.Debugf("Waiting for Docker to be ready")
 		_, err := NewDockerClient()
 		if err == nil {
 			return true, nil

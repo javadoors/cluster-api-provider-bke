@@ -248,8 +248,8 @@ func (e *EnsureClusterManage) pushAgent() error {
 			log.Error(constant.BKEAgentNotReadyReason, "Local kubeconfig secret not found")
 			return errors.Errorf("local kubeconfig secret not found")
 		}
-		log.Error(constant.BKEAgentNotReadyReason, "Failed to get local kubeconfig secret, err：%v", err)
-		return errors.Errorf("failed to get local kubeconfig secret, err：%v", err)
+		log.Error(constant.BKEAgentNotReadyReason, "Failed to get local kubeconfig secret, err: %v", err)
+		return errors.Errorf("failed to get local kubeconfig secret, err: %v", err)
 	}
 
 	// get bkeagent image from custom extra
@@ -282,7 +282,7 @@ func (e *EnsureClusterManage) pushAgent() error {
 
 	if err = e.remoteClient.InstallAddon(bkeCluster, launcherAddonT, nil, nil, nodes); err != nil {
 		condition.ConditionMark(bkeCluster, bkev1beta1.BKEAgentCondition, confv1beta1.ConditionFalse, constant.BKEAgentNotReadyReason, "failed create BKEAgent launcher ds")
-		log.Finish(constant.BKEAgentNotReadyReason, "Failed to push bke agent to cluster, err：%v", err)
+		log.Finish(constant.BKEAgentNotReadyReason, "Failed to push bke agent to cluster, err: %v", err)
 		return err
 	}
 
@@ -297,7 +297,7 @@ func (e *EnsureClusterManage) pushAgent() error {
 	// delete launcher daemonset
 	launcherAddonT.Operate = bkeaddon.RemoveAddon
 	if err := e.remoteClient.InstallAddon(bkeCluster, launcherAddonT, nil, nil, nodes); err != nil {
-		log.Warn(constant.ReconcileErrorReason, "(Ignore)Failed to delete bke agent launcher daemonset, err：%v", err)
+		log.Warn(constant.ReconcileErrorReason, "(Ignore)Failed to delete bke agent launcher daemonset, err: %v", err)
 	}
 
 	// mark node agent pushed flag
@@ -308,10 +308,18 @@ func (e *EnsureClusterManage) pushAgent() error {
 		}
 	}
 
+	// wait concurrently for pushed flag to be visible for each marked node before pinging
+	if err := e.waitAgentPushedFlagVisible(ctx, nf, bkeCluster, nodes, log); err != nil {
+		log.Error(constant.InternalErrorReason, "%v", err)
+		return err
+	}
+
 	// step 5 ping agent
 	err, successNodes, failedNodes := phaseutil.PingBKEAgent(ctx, c, scheme, bkeCluster)
 	if err != nil {
-		log.Warn(constant.BKEAgentNotReadyReason, "(Ignore)Failed to ping bke agent in the flow nodes: %v, err：%v", failedNodes, err)
+		log.Warn(constant.BKEAgentNotReadyReason,
+			"(Ignore)Failed to ping bke agent in the flow nodes: %v, err: %v",
+			failedNodes, err)
 	}
 
 	e.processAgentPingResults(ctx, bkeCluster, successNodes, failedNodes, log)
@@ -323,6 +331,30 @@ func (e *EnsureClusterManage) pushAgent() error {
 	condition.ConditionMark(bkeCluster, bkev1beta1.BKEAgentCondition, confv1beta1.ConditionTrue, constant.BKEAgentReadyReason, "")
 
 	return nil
+}
+
+func (e *EnsureClusterManage) waitAgentPushedFlagVisible(
+	ctx context.Context,
+	nf phaseutil.NodeStateFlagReader,
+	bkeCluster *bkev1beta1.BKECluster,
+	nodes bkenode.Nodes,
+	log *bkev1beta1.BKELogger,
+) error {
+	timeOut, err := phaseutil.GetBootTimeOut(bkeCluster)
+	if err != nil {
+		log.Warn(constant.InternalErrorReason, "Get boot timeout failed. err: %v", err)
+	}
+	return phaseutil.WaitNodesStateFlagVisible(
+		ctx,
+		nf,
+		bkeCluster,
+		nodes,
+		bkev1beta1.NodeAgentPushedFlag,
+		phaseutil.WaitNodesStateFlagVisibleOptions{
+			Timeout:  timeOut,
+			Interval: 1 * time.Second,
+		},
+	)
 }
 
 func (e *EnsureClusterManage) collectAgentInfo() error {
@@ -971,11 +1003,11 @@ func (e *EnsureClusterManage) initBocloudClusterEnv() error {
 	// 标记成功节点状态
 	for _, node := range success {
 		nodeIP := phaseutil.GetNodeIPFromCommandWaitResult(node)
-		if err := nf.MarkNodeStateFlagForCluster(ctx, bkeCluster, nodeIP, bkev1beta1.NodeEnvFlag); err != nil {
-			log.Warn(constant.InternalErrorReason, "Failed to mark node state flag for %s: %v", nodeIP, err)
-		}
-		if err := e.Ctx.SetNodeStateMessage(nodeIP, "Nodes env is ready"); err != nil {
-			log.Warn(constant.InternalErrorReason, "Failed to set node state message for %s: %v", nodeIP, err)
+		if err := nf.UpdateNodeStatusByIPForCluster(ctx, bkeCluster, nodeIP, func(status *confv1beta1.BKENodeStatus) {
+			status.StateCode |= bkev1beta1.NodeEnvFlag
+			status.Message = "Nodes env is ready"
+		}); err != nil {
+			log.Warn(constant.InternalErrorReason, "Failed to update env success status for %s: %v", nodeIP, err)
 		}
 	}
 
@@ -1216,11 +1248,12 @@ func executeCommandAndWait(params ExecuteCommandAndWaitParams) error {
 func (e *EnsureClusterManage) markNodesBootstrapSuccess(ctx context.Context, nodes map[int]confv1beta1.Node, log *bkev1beta1.BKELogger) {
 	nf := e.Ctx.NodeFetcher()
 	for _, node := range nodes {
-		if err := nf.MarkNodeStateFlagForCluster(ctx, e.Ctx.BKECluster, node.IP, bkev1beta1.NodeBootFlag); err != nil {
-			log.Warn(constant.InternalErrorReason, "Failed to mark node state flag for %s: %v", node.IP, err)
-		}
-		if err := e.Ctx.SetNodeStateWithMessage(node.IP, bkev1beta1.NodeNotReady, "Fake bootstrap success"); err != nil {
-			log.Warn(constant.InternalErrorReason, "Failed to set node state for %s: %v", node.IP, err)
+		if err := nf.UpdateNodeStatusByIPForCluster(ctx, e.Ctx.BKECluster, node.IP, func(status *confv1beta1.BKENodeStatus) {
+			status.StateCode |= bkev1beta1.NodeBootFlag
+			status.State = bkev1beta1.NodeNotReady
+			status.Message = "Fake bootstrap success"
+		}); err != nil {
+			log.Warn(constant.InternalErrorReason, "Failed to update fake bootstrap status for %s: %v", node.IP, err)
 		}
 	}
 }
@@ -1243,24 +1276,23 @@ func (e *EnsureClusterManage) processAgentPingResults(ctx context.Context, bkeCl
 
 	for _, node := range failedNodes {
 		nodeIP := phaseutil.GetNodeIPFromCommandWaitResult(node)
-		if err := e.Ctx.SetNodeStateWithMessage(nodeIP, bkev1beta1.NodeInitFailed, "Failed ping bkeagent"); err != nil {
-			log.Warn(constant.InternalErrorReason, "Failed to set node state for %s: %v", nodeIP, err)
-		}
-		if err := nf.UnmarkNodeStateFlagForCluster(ctx, bkeCluster, nodeIP, bkev1beta1.NodeAgentPushedFlag); err != nil {
-			log.Warn(constant.InternalErrorReason, "Failed to unmark node state flag for %s: %v", nodeIP, err)
+		if err := nf.UpdateNodeStatusByIPForCluster(ctx, bkeCluster, nodeIP, func(status *confv1beta1.BKENodeStatus) {
+			status.State = bkev1beta1.NodeInitFailed
+			status.Message = "Failed ping bkeagent"
+			status.StateCode &= ^bkev1beta1.NodeAgentPushedFlag
+		}); err != nil {
+			log.Warn(constant.InternalErrorReason, "Failed to update failed ping status for %s: %v", nodeIP, err)
 		}
 	}
 
 	for _, node := range successNodes {
 		nodeIP := phaseutil.GetNodeIPFromCommandWaitResult(node)
-		if err := e.Ctx.SetNodeStateMessage(nodeIP, "BKEAgent is ready"); err != nil {
-			log.Warn(constant.InternalErrorReason, "Failed to set node state message for %s: %v", nodeIP, err)
-		}
-		if err := nf.MarkNodeStateFlagForCluster(ctx, bkeCluster, nodeIP, bkev1beta1.NodeAgentPushedFlag); err != nil {
-			log.Warn(constant.InternalErrorReason, "Failed to mark node state flag for %s: %v", nodeIP, err)
-		}
-		if err := nf.MarkNodeStateFlagForCluster(ctx, bkeCluster, nodeIP, bkev1beta1.NodeAgentReadyFlag); err != nil {
-			log.Warn(constant.InternalErrorReason, "Failed to mark node state flag for %s: %v", nodeIP, err)
+		if err := nf.UpdateNodeStatusByIPForCluster(ctx, bkeCluster, nodeIP, func(status *confv1beta1.BKENodeStatus) {
+			status.Message = "BKEAgent is ready"
+			status.StateCode |= bkev1beta1.NodeAgentPushedFlag
+			status.StateCode |= bkev1beta1.NodeAgentReadyFlag
+		}); err != nil {
+			log.Warn(constant.InternalErrorReason, "Failed to update ping success status for %s: %v", nodeIP, err)
 		}
 	}
 }

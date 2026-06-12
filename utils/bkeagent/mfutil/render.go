@@ -38,8 +38,8 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/clientutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/cluster"
 	bkeetcd "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/etcd"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/pkiutil"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 //
@@ -463,7 +463,7 @@ func renderKeepalivedInstance(c *BKEHAComponent, cfg map[string]interface{}, isM
 		logMessage = logRenderIngressVIP
 	}
 
-	log.Infof(logMessage)
+	log.Info(logMessage)
 
 	t, err := template.New(templateName).Funcs(*keepalivedConfFuncMap()).ParseFS(f, "tmpl/keepalived/"+templateName)
 	if err != nil || t == nil {
@@ -696,6 +696,28 @@ func isUpgradeWithOpenFuyao(cfg *BootScope) bool {
 	return cfg.Extra["upgradeWithOpenFuyao"].(bool)
 }
 
+// etcdImageTagFromBootScope resolves the etcd image tag for manifest templates.
+// Declarative upgrade may inject target version via BootScope.Extra["etcdVersion"]
+// or override BkeConfig.Cluster.EtcdVersion on the agent before rendering.
+func etcdImageTagFromBootScope(cfg *BootScope) string {
+	if cfg == nil {
+		return strings.TrimPrefix(bkeinit.DefaultEtcdImageTag, "v")
+	}
+	var etcdVersion string
+	if cfg.Extra != nil {
+		if v, ok := cfg.Extra["etcdVersion"].(string); ok && v != "" {
+			etcdVersion = v
+		}
+	}
+	if etcdVersion == "" && cfg.BkeConfig != nil && cfg.BkeConfig.Cluster.EtcdVersion != "" {
+		etcdVersion = cfg.BkeConfig.Cluster.EtcdVersion
+	}
+	if etcdVersion == "" {
+		etcdVersion = bkeinit.DefaultEtcdImageTag
+	}
+	return strings.TrimPrefix(etcdVersion, "v")
+}
+
 func etcdFuncMap() *template.FuncMap {
 	return &template.FuncMap{
 		"initialCluster": func(members []etcd.Member) string {
@@ -711,13 +733,7 @@ func etcdFuncMap() *template.FuncMap {
 			return strings.Join(result, ",")
 		},
 		"imageInfo": func(cfg *BootScope) string {
-			var etcdVersion string
-			if cfg.BkeConfig.Cluster.EtcdVersion != "" {
-				etcdVersion = cfg.BkeConfig.Cluster.EtcdVersion
-			} else {
-				etcdVersion = bkeinit.DefaultEtcdImageTag
-			}
-			etcdVersion = strings.TrimPrefix(etcdVersion, "v") // 去掉前缀字符 v
+			etcdVersion := etcdImageTagFromBootScope(cfg)
 			return fmt.Sprintf("%s:%s", bkeinit.DefaultEtcdImageName, etcdVersion)
 		},
 		"dataDir": func(cfg *BootScope) string {

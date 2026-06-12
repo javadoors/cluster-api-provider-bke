@@ -615,13 +615,19 @@ func TestGetNeedUpgradeEtcdsWithBKENodes(t *testing.T) {
 	cluster := &bkev1beta1.BKECluster{
 		Spec: confv1beta1.BKEClusterSpec{
 			ClusterConfig: &confv1beta1.BKEConfig{
-				Cluster: confv1beta1.Cluster{EtcdVersion: "v3.5.0"},
+				Cluster: confv1beta1.Cluster{EtcdVersion: "v3.5.21-of.1"},
 			},
 		},
+		Status: confv1beta1.BKEClusterStatus{EtcdVersion: "v3.5.12-of.1"},
 	}
-	nodes := bkev1beta1.BKENodes{}
-	result := GetNeedUpgradeEtcdsWithBKENodes(cluster, nodes)
-	assert.Equal(t, 0, len(result))
+	bkeNodes := bkev1beta1.BKENodes{
+		{Spec: confv1beta1.BKENodeSpec{IP: "10.0.0.1", Role: []string{"master", "etcd"}}},
+		{Spec: confv1beta1.BKENodeSpec{IP: "10.0.0.2", Role: []string{"worker"}}},
+	}
+	result := GetNeedUpgradeEtcdsWithBKENodes(cluster, bkeNodes)
+	assert.Len(t, result, 1)
+	assert.Equal(t, "10.0.0.1", result[0].IP)
+	assert.Contains(t, result[0].Role, "etcd")
 }
 
 func TestGetNeedUpgradeMasterNodes(t *testing.T) {
@@ -766,4 +772,3 @@ func TestGetNodeStateFlag(t *testing.T) {
 	result = GetNodeStateFlag(node, "192.168.1.2", 4)
 	assert.False(t, result)
 }
-

@@ -28,6 +28,7 @@ import (
 
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/executor/exec"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 type K8s interface {
@@ -129,6 +130,7 @@ func (t *Task) getResourceObject(resourceType, namespace, name string) (client.O
 func writeResourceToFile(obj client.Object, filePath string) error {
 	f, err := os.OpenFile(filePath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, openfilePermission)
 	if err != nil {
+		log.Errorf("failed to open file %s for writing resource: %v", filePath, err)
 		return err
 	}
 	defer f.Close()
@@ -183,11 +185,13 @@ func (t *Task) handleReadOnly(resourceType, namespace, name, resourcePath string
 		return errors.Errorf("You need to enter an absolute path, %s", resourcePath)
 	}
 	if err := ensureDirExists(resourcePath); err != nil {
+		log.Errorf("failed to ensure directory exists for %s: %v", resourcePath, err)
 		return err
 	}
 
 	obj, err := t.getResourceObject(resourceType, namespace, name)
 	if err != nil {
+		log.Errorf("failed to get resource object %s/%s/%s: %v", resourceType, namespace, name, err)
 		return err
 	}
 	return writeResourceToFile(obj, resourcePath)
@@ -197,6 +201,7 @@ func (t *Task) handleReadOnly(resourceType, namespace, name, resourcePath string
 func (t *Task) handleExecute(resourceType, namespace, name, resourcePath string) ([]string, error) {
 	obj, err := t.getResourceObject(resourceType, namespace, name)
 	if err != nil {
+		log.Errorf("failed to get resource object for execute %s/%s/%s: %v", resourceType, namespace, name, err)
 		return nil, err
 	}
 
@@ -205,6 +210,7 @@ func (t *Task) handleExecute(resourceType, namespace, name, resourcePath string)
 	for _, s := range script {
 		r, err := t.Exec.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", s)
 		if err != nil {
+			log.Errorf("failed to execute script from %s/%s/%s: %v", resourceType, namespace, name, err)
 			return nil, err
 		}
 		result = append(result, r)
@@ -212,9 +218,11 @@ func (t *Task) handleExecute(resourceType, namespace, name, resourcePath string)
 
 	if path.IsAbs(resourcePath) {
 		if err := ensureDirExists(resourcePath); err != nil {
+			log.Errorf("failed to ensure directory exists for execute output %s: %v", resourcePath, err)
 			return nil, err
 		}
 		if err := ioutil.WriteFile(resourcePath, []byte(strings.Join(result, "\r\n")), RwRR); err != nil {
+			log.Errorf("failed to write execute output to %s: %v", resourcePath, err)
 			return nil, err
 		}
 	}
@@ -232,6 +240,7 @@ func (t *Task) handleReadWrite(resourceType, namespace, name, resourcePath strin
 
 	content, err := ioutil.ReadFile(resourcePath)
 	if err != nil {
+		log.Errorf("failed to read file %s for resource update: %v", resourcePath, err)
 		return err
 	}
 
@@ -264,6 +273,7 @@ func (t *Task) handleReadWrite(resourceType, namespace, name, resourcePath strin
 		if apierr.IsNotFound(err) {
 			return t.K8sClient.Create(context.Background(), obj)
 		}
+		log.Errorf("failed to update resource %s/%s/%s: %v", resourceType, namespace, name, err)
 		return err
 	}
 	return nil

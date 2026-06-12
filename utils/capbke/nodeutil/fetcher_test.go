@@ -583,14 +583,3 @@ func TestUpdateModifiedNodes(t *testing.T) {
 type mockStatusWriter struct {
 	client.StatusWriter
 }
-
-
-
-
-
-
-
-
-
-
-

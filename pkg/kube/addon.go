@@ -37,7 +37,7 @@ import (
 	metricrecord "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/metrics/record"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/constant"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 	v "gopkg.openfuyao.cn/cluster-api-provider-bke/version"
 )
 
@@ -50,7 +50,9 @@ const (
 type Task struct {
 	Name     string
 	FilePath string
-	Param    map[string]interface{}
+	// ManifestContent holds raw YAML when applying from an in-memory release bundle.
+	ManifestContent []byte
+	Param           map[string]interface{}
 	// IgnoreError: if true, continue to apply the remaining yaml ignoring errors
 	IgnoreError bool
 	// Block: if true, wait for the task to complete
@@ -149,6 +151,15 @@ func (c *Client) installYamlAddon(addon *confv1beta1.Product, addonT *bkeaddon.A
 		return err
 	}
 
+	// For cluster-api addon, 004-manage.yaml must be applied after postprocess.
+	// So we skip it here and defer it to a dedicated phase.
+	if addon != nil && addon.Name == "cluster-api" && addonT != nil && addonT.Operate == bkeaddon.CreateAddon {
+		files = filterOutClusterAPIManageYaml(files)
+		if len(files) == 0 {
+			return errors.Errorf("no yaml file found after filtering 004-manage.yaml in addon %q dir", addon.Name)
+		}
+	}
+
 	if addonT.Operate == bkeaddon.RemoveAddon {
 		sort.Sort(sort.Reverse(sort.StringSlice(files)))
 	} else {
@@ -171,6 +182,20 @@ func (c *Client) installYamlAddon(addon *confv1beta1.Product, addonT *bkeaddon.A
 	}
 
 	return c.applyAddonFiles(applyConfig)
+}
+
+func filterOutClusterAPIManageYaml(files []string) []string {
+	if len(files) == 0 {
+		return files
+	}
+	out := make([]string, 0, len(files))
+	for _, f := range files {
+		if strings.EqualFold(filepath.Base(f), "004-manage.yaml") {
+			continue
+		}
+		out = append(out, f)
+	}
+	return out
 }
 
 func (c *Client) getAddonYamlFiles(addon *confv1beta1.Product) ([]string, error) {
@@ -287,6 +312,45 @@ type addonApplyConfig struct {
 	param         map[string]map[string]interface{}
 	repo          string
 	addonRecorder *AddonRecorder
+}
+
+// PrepareRenderParamForAddonFile builds the same render parameters as addon installation,
+// but only for a single yaml file.
+//
+// It returns a param map that can be passed into kube.NewTask(..., param).
+// RenderParamsForCluster builds template parameters for release manifest YAML.
+func (c *Client) RenderParamsForCluster(
+	bkeCluster *bkev1beta1.BKECluster,
+	bkeNodes bkenode.Nodes,
+) (map[string]interface{}, error) {
+	return getCommonParamFromBKECluster(bkeCluster, bkeNodes)
+}
+
+func (c *Client) PrepareRenderParamForAddonFile(
+	bkeCluster *bkev1beta1.BKECluster,
+	addon *confv1beta1.Product,
+	filePath string,
+	repo string,
+	bkeNodes bkenode.Nodes,
+) (map[string]interface{}, error) {
+	if addon == nil {
+		return nil, errors.Errorf("addon is nil")
+	}
+	commonParam, err := getCommonParamFromBKECluster(bkeCluster, bkeNodes)
+	if err != nil {
+		return nil, err
+	}
+	commonParam, err = c.enhanceCommonParamForSpecialAddons(bkeCluster, addon, commonParam, bkeNodes)
+	if err != nil {
+		return nil, err
+	}
+	fileBase := strings.Split(filepath.Base(filePath), ".")[0]
+	param := prepareAddonParam(addon.Param, []string{fileBase}, repo)
+	if err := normalizeNodeSelector(param); err != nil {
+		return nil, err
+	}
+	param[fileBase] = mergeParam(commonParam, param[fileBase])
+	return param[fileBase], nil
 }
 
 func (c *Client) applyAddonFiles(config *addonApplyConfig) error {
@@ -455,6 +519,12 @@ func getCommonParamFromBKECluster(bkeCluster *bkev1beta1.BKECluster, bkeNodes bk
 	// 设置Kubernetes版本
 	setK8sVersion(&param, bkeConfig)
 
+	// 设置Etcd版本
+	setEtcdVersion(&param, bkeConfig)
+
+	// 设置Containerd版本
+	setContainerdVersion(&param, bkeConfig)
+
 	return param, nil
 }
 
@@ -615,6 +685,20 @@ func setDockerDataRoot(param *map[string]interface{}, bkeConfig bkeinit.BkeConfi
 func setK8sVersion(param *map[string]interface{}, bkeConfig bkeinit.BkeConfig) {
 	if bkeConfig.Cluster.KubernetesVersion != "" {
 		(*param)["k8sVersion"] = bkeConfig.Cluster.KubernetesVersion
+	}
+}
+
+// setEtcdVersion 设置Etcd版本
+func setEtcdVersion(param *map[string]interface{}, bkeConfig bkeinit.BkeConfig) {
+	if bkeConfig.Cluster.EtcdVersion != "" {
+		(*param)["etcdVersion"] = bkeConfig.Cluster.EtcdVersion
+	}
+}
+
+// setContainerdVersion 设置Containerd版本
+func setContainerdVersion(param *map[string]interface{}, bkeConfig bkeinit.BkeConfig) {
+	if bkeConfig.Cluster.ContainerdVersion != "" {
+		(*param)["containerdVersion"] = bkeConfig.Cluster.ContainerdVersion
 	}
 }
 

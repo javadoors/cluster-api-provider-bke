@@ -8,6 +8,10 @@ resources:
 - bases/bke.bocloud.com_bkeclusters.yaml
 - bases/bke.bocloud.com_bkeclustertemplates.yaml
 - bases/bke.bocloud.com_containerdconfigs.yaml
+- bases/config.openfuyao.com_clusterversions.yaml
+- bases/config.openfuyao.com_releaseimages.yaml
+- bases/config.openfuyao.com_upgradepaths.yaml
+- bases/config.openfuyao.com_componentversions.yaml
 #+kubebuilder:scaffold:crdkustomizeresource
 
 commonLabels:

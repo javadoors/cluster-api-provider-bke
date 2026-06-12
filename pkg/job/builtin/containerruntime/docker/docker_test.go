@@ -17,7 +17,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/agiledragon/gomonkey/v2"
 	"github.com/stretchr/testify/assert"
+
+	edocker "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/executor/docker"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/download"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/httprepo"
 )
 
 type mockExecutor struct {
@@ -55,6 +60,26 @@ func (m *mockExecutor) ExecuteCommandWithTimeout(timeout time.Duration, command 
 
 func (m *mockExecutor) ExecuteCommandResidentBinary(timeout time.Duration, command string, arg ...string) error {
 	return m.err
+}
+
+func patchDockerHostDeps(t *testing.T) {
+	patches := gomonkey.NewPatches()
+	t.Cleanup(patches.Reset)
+	patches.ApplyFunc(httprepo.RepoSearch, func(pkg string) error {
+		return nil
+	})
+	patches.ApplyFunc(httprepo.RepoInstall, func(pkg ...string) error {
+		return nil
+	})
+	patches.ApplyFunc(edocker.ConfigDockerDaemon, func(params edocker.DockerDaemonConfig) error {
+		return nil
+	})
+	patches.ApplyFunc(edocker.WaitDockerReady, func() error {
+		return nil
+	})
+	patches.ApplyFunc(download.ExecDownload, func(url, saveto, rename, chmod string) error {
+		return nil
+	})
 }
 
 func TestDockerPluginName(t *testing.T) {
@@ -130,24 +155,27 @@ func TestDockerPluginWithMockExecutor(t *testing.T) {
 }
 
 func TestDockerPluginExecuteWithDefaultParams(t *testing.T) {
+	patchDockerHostDeps(t)
 	mockExec := &mockExecutor{output: "", err: nil}
 	plugin := New(mockExec)
 	commands := []string{Name}
 	result, err := plugin.Execute(commands)
-	assert.Error(t, err)
+	assert.NoError(t, err)
 	assert.Nil(t, result)
 }
 
 func TestDockerPluginExecuteWithRichRunc(t *testing.T) {
+	patchDockerHostDeps(t)
 	mockExec := &mockExecutor{output: "", err: nil}
 	plugin := New(mockExec)
 	commands := []string{Name, "runtime=richrunc", "runtimeUrl=http://example.com/runc"}
 	result, err := plugin.Execute(commands)
-	assert.Error(t, err)
+	assert.NoError(t, err)
 	assert.Nil(t, result)
 }
 
 func TestDockerPluginExecuteWithAllParams(t *testing.T) {
+	patchDockerHostDeps(t)
 	mockExec := &mockExecutor{output: "", err: nil}
 	plugin := New(mockExec)
 	commands := []string{
@@ -161,11 +189,12 @@ func TestDockerPluginExecuteWithAllParams(t *testing.T) {
 		"tlsHost=",
 	}
 	result, err := plugin.Execute(commands)
-	assert.Error(t, err)
+	assert.NoError(t, err)
 	assert.Nil(t, result)
 }
 
 func TestDockerPluginExecuteWithEnableTls(t *testing.T) {
+	patchDockerHostDeps(t)
 	mockExec := &mockExecutor{output: "", err: nil}
 	plugin := New(mockExec)
 	commands := []string{
@@ -174,11 +203,12 @@ func TestDockerPluginExecuteWithEnableTls(t *testing.T) {
 		"tlsHost=192.168.1.1",
 	}
 	result, err := plugin.Execute(commands)
-	assert.Error(t, err)
+	assert.NoError(t, err)
 	assert.Nil(t, result)
 }
 
 func TestDockerPluginExecuteStartFailure(t *testing.T) {
+	patchDockerHostDeps(t)
 	mockExec := &mockExecutor{output: "failed to start", err: fmt.Errorf("start failed")}
 	plugin := New(mockExec)
 	commands := []string{Name}

@@ -16,6 +16,7 @@ import (
 	"context"
 
 	"github.com/pkg/errors"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
@@ -318,51 +319,58 @@ func (f *NodeFetcher) CompareNodes(ctx context.Context, namespace, clusterName s
 
 // UpdateBKENodeState updates the state of a BKENode by IP.
 func (f *NodeFetcher) UpdateBKENodeState(ctx context.Context, namespace, clusterName, ip string, state confv1beta1.NodeState, message string) error {
-	bkeNode, err := f.GetNodeByIP(ctx, namespace, clusterName, ip)
-	if err != nil {
-		return err
-	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		bkeNode, err := f.GetNodeByIP(ctx, namespace, clusterName, ip)
+		if err != nil {
+			return err
+		}
 
-	bkeNode.Status.State = state
-	bkeNode.Status.Message = message
+		bkeNode.Status.State = state
+		bkeNode.Status.Message = message
 
-	return f.UpdateNodeStatus(ctx, bkeNode)
+		return f.UpdateNodeStatus(ctx, bkeNode)
+	})
 }
 
 // SetNodeNeedSkip marks a node as needing to be skipped.
 func (f *NodeFetcher) SetNodeNeedSkip(ctx context.Context, namespace, clusterName, ip string, needSkip bool) error {
-	bkeNode, err := f.GetNodeByIP(ctx, namespace, clusterName, ip)
-	if err != nil {
-		return err
-	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		bkeNode, err := f.GetNodeByIP(ctx, namespace, clusterName, ip)
+		if err != nil {
+			return err
+		}
 
-	bkeNode.Status.NeedSkip = needSkip
-
-	return f.UpdateNodeStatus(ctx, bkeNode)
+		bkeNode.Status.NeedSkip = needSkip
+		return f.UpdateNodeStatus(ctx, bkeNode)
+	})
 }
 
 // MarkNodeStateFlag sets a flag on the node's StateCode.
 func (f *NodeFetcher) MarkNodeStateFlag(ctx context.Context, namespace, clusterName, ip string, flag int) error {
-	bkeNode, err := f.GetNodeByIP(ctx, namespace, clusterName, ip)
-	if err != nil {
-		return err
-	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		bkeNode, err := f.GetNodeByIP(ctx, namespace, clusterName, ip)
+		if err != nil {
+			return err
+		}
 
-	bkeNode.Status.StateCode |= flag
+		bkeNode.Status.StateCode |= flag
 
-	return f.UpdateNodeStatus(ctx, bkeNode)
+		return f.UpdateNodeStatus(ctx, bkeNode)
+	})
 }
 
 // UnmarkNodeStateFlag clears a flag from the node's StateCode.
 func (f *NodeFetcher) UnmarkNodeStateFlag(ctx context.Context, namespace, clusterName, ip string, flag int) error {
-	bkeNode, err := f.GetNodeByIP(ctx, namespace, clusterName, ip)
-	if err != nil {
-		return err
-	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		bkeNode, err := f.GetNodeByIP(ctx, namespace, clusterName, ip)
+		if err != nil {
+			return err
+		}
 
-	bkeNode.Status.StateCode &= ^flag
+		bkeNode.Status.StateCode &= ^flag
 
-	return f.UpdateNodeStatus(ctx, bkeNode)
+		return f.UpdateNodeStatus(ctx, bkeNode)
+	})
 }
 
 // GetNodeStateNeedSkip returns whether the node should be skipped.
@@ -444,6 +452,33 @@ func (f *NodeFetcher) SetNodeStateWithMessageForCluster(ctx context.Context, bke
 	return f.SetNodeStateWithMessage(ctx, bkeCluster.Namespace, bkeCluster.Name, ip, state, message)
 }
 
+// UpdateNodeStatusByIP atomically updates node status with conflict retry.
+// The updater can mutate multiple status fields in one API update.
+func (f *NodeFetcher) UpdateNodeStatusByIP(
+	ctx context.Context,
+	namespace, clusterName, ip string,
+	updater func(status *confv1beta1.BKENodeStatus),
+) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		bkeNode, err := f.GetNodeByIP(ctx, namespace, clusterName, ip)
+		if err != nil {
+			return err
+		}
+		updater(&bkeNode.Status)
+		return f.UpdateNodeStatus(ctx, bkeNode)
+	})
+}
+
+// UpdateNodeStatusByIPForCluster is a convenience method for UpdateNodeStatusByIP.
+func (f *NodeFetcher) UpdateNodeStatusByIPForCluster(
+	ctx context.Context,
+	bkeCluster *bkev1beta1.BKECluster,
+	ip string,
+	updater func(status *confv1beta1.BKENodeStatus),
+) error {
+	return f.UpdateNodeStatusByIP(ctx, bkeCluster.Namespace, bkeCluster.Name, ip, updater)
+}
+
 // MarkNodeStateFlagForCluster is a convenience method that takes a BKECluster object.
 func (f *NodeFetcher) MarkNodeStateFlagForCluster(ctx context.Context, bkeCluster *bkev1beta1.BKECluster, ip string, flag int) error {
 	return f.MarkNodeStateFlag(ctx, bkeCluster.Namespace, bkeCluster.Name, ip, flag)
@@ -470,24 +505,28 @@ func (f *NodeFetcher) GetNodeStateFlagForCluster(ctx context.Context, bkeCluster
 
 // SetBKENodeStateMessage updates the state message of a BKENode by IP.
 func (f *NodeFetcher) SetBKENodeStateMessage(ctx context.Context, namespace, clusterName, ip string, message string) error {
-	bkeNode, err := f.GetNodeByIP(ctx, namespace, clusterName, ip)
-	if err != nil {
-		return err
-	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		bkeNode, err := f.GetNodeByIP(ctx, namespace, clusterName, ip)
+		if err != nil {
+			return err
+		}
 
-	bkeNode.Status.Message = message
+		bkeNode.Status.Message = message
 
-	return f.UpdateNodeStatus(ctx, bkeNode)
+		return f.UpdateNodeStatus(ctx, bkeNode)
+	})
 }
 
 // SetSkipNodeErrorForWorker updates the needskip of a BKENode by IP if the node is a worker.
 func (f *NodeFetcher) SetSkipNodeErrorForWorker(ctx context.Context, namespace, clusterName, ip string) error {
-	bkeNode, err := f.GetNodeByIP(ctx, namespace, clusterName, ip)
-	if err != nil {
-		return err
-	}
-	if utils.ContainsString(bkeNode.Spec.Role, node.WorkerNodeRole) {
-		bkeNode.Status.NeedSkip = true
-	}
-	return f.UpdateNodeStatus(ctx, bkeNode)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		bkeNode, err := f.GetNodeByIP(ctx, namespace, clusterName, ip)
+		if err != nil {
+			return err
+		}
+		if utils.ContainsString(bkeNode.Spec.Role, node.WorkerNodeRole) {
+			bkeNode.Status.NeedSkip = true
+		}
+		return f.UpdateNodeStatus(ctx, bkeNode)
+	})
 }

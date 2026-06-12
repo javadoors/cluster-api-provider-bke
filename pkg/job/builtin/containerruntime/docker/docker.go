@@ -24,7 +24,7 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job/builtin/downloader"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job/builtin/plugin"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/httprepo"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 const Name = "InstallDocker"
@@ -77,7 +77,7 @@ func (dp DockerPlugin) Execute(commands []string) ([]string, error) {
 	out, err = dp.exec.ExecuteCommandWithCombinedOutput("sh", "-c", "systemctl restart docker")
 	if err != nil {
 		errorMsg := fmt.Sprintf("start docker failed, err: %v, out: %s", err, out)
-		log.Errorf(errorMsg)
+		log.Error(errorMsg)
 		return []string{errorMsg}, errors.New(errorMsg)
 	}
 	if err = edocker.WaitDockerReady(); err != nil {

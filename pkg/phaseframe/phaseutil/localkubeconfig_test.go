@@ -571,7 +571,6 @@ func TestGetManagementClusterCA(t *testing.T) {
 	}
 }
 
-
 func TestGenerateBKEAgentClientCert(t *testing.T) {
 	caData, err := generateTestCA()
 	require.NoError(t, err)

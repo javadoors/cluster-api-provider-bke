@@ -23,8 +23,8 @@ import (
 	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/executor/exec"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job/builtin/plugin"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
 	netutil "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/net"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 const Name = "K8sEnvInit"
@@ -189,14 +189,15 @@ func (ep *EnvPlugin) Name() string {
 
 func (ep *EnvPlugin) Param() map[string]plugin.PluginParam {
 	return map[string]plugin.PluginParam{
-		"check":      {Key: "check", Value: "true,false", Required: false, Default: defaultCheck, Description: "Check whether the machine conforms to the k8s operating environment"},
-		"init":       {Key: "init", Value: "true,false", Required: false, Default: defaultInit, Description: "init k8s environment,if enable init,check will be auto run after init"},
-		"sudo":       {Key: "sudo", Value: "true,false", Required: false, Default: defaultSudo, Description: "use sudo to execute commands"},
-		"scope":      {Key: "scope", Value: "kernel,firewall,selinux,swap,time,hosts,ports,image,node,httpRepo,iptables", Required: false, Default: defaultScope, Description: "scope of the k8s environment to check or init"},
-		"backup":     {Key: "backup", Value: "true,false", Required: false, Default: defaultBackup, Description: "make a backup before modifying files"},
-		"extraHosts": {Key: "extraHosts", Value: "hostname1:ip1,hostname2:ip2", Required: false, Default: "", Description: "use given host info to set node host file,required when scope contains hosts"},
-		"hostPort":   {Key: "hostPort", Value: "port1,port2", Required: false, Default: "10259,10257,10250,2379,2380,2381,10248", Description: "use given host info to set node host file,required when scope contains hosts"},
-		"bkeConfig":  {Key: "bkeConfig", Value: "", Required: false, Default: "", Description: "example ns:name"},
+		"check":             {Key: "check", Value: "true,false", Required: false, Default: defaultCheck, Description: "Check whether the machine conforms to the k8s operating environment"},
+		"init":              {Key: "init", Value: "true,false", Required: false, Default: defaultInit, Description: "init k8s environment,if enable init,check will be auto run after init"},
+		"sudo":              {Key: "sudo", Value: "true,false", Required: false, Default: defaultSudo, Description: "use sudo to execute commands"},
+		"scope":             {Key: "scope", Value: "kernel,firewall,selinux,swap,time,hosts,ports,image,node,httpRepo,iptables", Required: false, Default: defaultScope, Description: "scope of the k8s environment to check or init"},
+		"backup":            {Key: "backup", Value: "true,false", Required: false, Default: defaultBackup, Description: "make a backup before modifying files"},
+		"extraHosts":        {Key: "extraHosts", Value: "hostname1:ip1,hostname2:ip2", Required: false, Default: "", Description: "use given host info to set node host file,required when scope contains hosts"},
+		"hostPort":          {Key: "hostPort", Value: "port1,port2", Required: false, Default: "10259,10257,10250,2379,2380,2381,10248", Description: "use given host info to set node host file,required when scope contains hosts"},
+		"bkeConfig":         {Key: "bkeConfig", Value: "", Required: false, Default: "", Description: "example ns:name"},
+		"containerdVersion": {Key: "containerdVersion", Value: "", Required: false, Default: "", Description: "override containerd version when scope contains runtime"},
 	}
 }
 
@@ -228,6 +229,9 @@ func (ep *EnvPlugin) Execute(commands []string) ([]string, error) {
 			return nil, err
 		}
 		ep.bkeConfig = cfg
+		if envParamMap["containerdVersion"] != "" {
+			ep.bkeConfig.Cluster.ContainerdVersion = envParamMap["containerdVersion"]
+		}
 		clusterData, err := plugin.GetClusterData(envParamMap["bkeConfig"])
 		if err != nil {
 			return nil, err

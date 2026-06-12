@@ -26,6 +26,7 @@ import (
 	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/upgrade"
 )
 
 func TestEnsureContainerdUpgradeConstants(t *testing.T) {
@@ -384,6 +385,44 @@ func TestEnsureContainerdUpgrade_RolloutContainerd_Success(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, ctrl.Result{}, result)
 	assert.Equal(t, "1.6.0", bkeCluster.Status.ContainerdVersion)
+}
+
+func TestEnsureContainerdUpgrade_RolloutContainerd_UsesVersionContextTarget(t *testing.T) {
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+
+	bkeCluster := &bkev1beta1.BKECluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+		Spec: confv1beta1.BKEClusterSpec{
+			ClusterConfig: &confv1beta1.BKEConfig{
+				Cluster: confv1beta1.Cluster{ContainerdVersion: "1.6.0"},
+			},
+		},
+	}
+	ctx := &phaseframe.PhaseContext{
+		Context:        context.Background(),
+		BKECluster:     bkeCluster,
+		VersionContext: upgrade.NewVersionContext(),
+		Log:            bkev1beta1.NewBKELogger(nil, &fakeRecorder{}, bkeCluster),
+	}
+	ctx.VersionContext.SetTarget(upgrade.ComponentContainerd, "1.7.0")
+
+	e := &EnsureContainerdUpgrade{BasePhase: phaseframe.BasePhase{Ctx: ctx}}
+
+	patches.ApplyPrivateMethod(e, "resetContainerd", func(_ *EnsureContainerdUpgrade) error {
+		assert.Equal(t, "1.7.0", bkeCluster.Spec.ClusterConfig.Cluster.ContainerdVersion)
+		return nil
+	})
+	patches.ApplyPrivateMethod(e, "redeployContainerd", func(_ *EnsureContainerdUpgrade) error {
+		assert.Equal(t, "1.7.0", bkeCluster.Spec.ClusterConfig.Cluster.ContainerdVersion)
+		return nil
+	})
+
+	result, err := e.rolloutContainerd()
+	assert.NoError(t, err)
+	assert.Equal(t, ctrl.Result{}, result)
+	assert.Equal(t, "1.7.0", bkeCluster.Status.ContainerdVersion)
+	assert.Equal(t, "1.7.0", bkeCluster.Spec.ClusterConfig.Cluster.ContainerdVersion)
 }
 
 func TestEnsureContainerdUpgrade_IsContainerdNeedUpgrade_UpgradeNeeded(t *testing.T) {

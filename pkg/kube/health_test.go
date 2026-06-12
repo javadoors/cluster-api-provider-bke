@@ -18,7 +18,6 @@ import (
 
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/pkg/errors"
-	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -393,6 +392,9 @@ func TestFindAddonComponent(t *testing.T) {
 func TestVerifyComponentPods(t *testing.T) {
 	const testNamespace = "kube-system"
 
+	readyCondition := []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	notReadyCondition := []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionFalse}}
+
 	tests := []struct {
 		name    string
 		pods    []corev1.Pod
@@ -400,22 +402,55 @@ func TestVerifyComponentPods(t *testing.T) {
 		wantErr bool
 	}{
 		{
-			name: "allRunning",
+			name: "allHealthy",
 			pods: []corev1.Pod{
 				{
-					ObjectMeta: metav1.ObjectMeta{Name: "etcd-master"},
-					Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+					ObjectMeta: metav1.ObjectMeta{Name: "etcd-master", Namespace: testNamespace},
+					Status: corev1.PodStatus{
+						Phase:      corev1.PodRunning,
+						Conditions: readyCondition,
+						ContainerStatuses: []corev1.ContainerStatus{{
+							Name:  "etcd",
+							Ready: true,
+						}},
+					},
 				},
 			},
 			prefix:  "etcd",
 			wantErr: false,
 		},
 		{
-			name: "notRunning",
+			name: "runningButPodNotReady",
 			pods: []corev1.Pod{
 				{
-					ObjectMeta: metav1.ObjectMeta{Name: "etcd-master"},
-					Status:     corev1.PodStatus{Phase: corev1.PodPending},
+					ObjectMeta: metav1.ObjectMeta{Name: "etcd-master", Namespace: testNamespace},
+					Status: corev1.PodStatus{
+						Phase:      corev1.PodRunning,
+						Conditions: notReadyCondition,
+						ContainerStatuses: []corev1.ContainerStatus{{
+							Name:  "etcd",
+							Ready: false,
+						}},
+					},
+				},
+			},
+			prefix:  "etcd",
+			wantErr: true,
+		},
+		{
+			name: "runningButCrashLoopBackOff",
+			pods: []corev1.Pod{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "etcd-master", Namespace: testNamespace},
+					Status: corev1.PodStatus{
+						Phase:      corev1.PodRunning,
+						Conditions: readyCondition,
+						ContainerStatuses: []corev1.ContainerStatus{{
+							Name:  "etcd",
+							Ready: false,
+							State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
+						}},
+					},
 				},
 			},
 			prefix:  "etcd",
@@ -428,26 +463,48 @@ func TestVerifyComponentPods(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "corednsOneRunning",
+			name: "corednsAtLeastOneHealthy",
 			pods: []corev1.Pod{
 				{
-					ObjectMeta: metav1.ObjectMeta{Name: "coredns-1"},
-					Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+					ObjectMeta: metav1.ObjectMeta{Name: "coredns-1", Namespace: testNamespace},
+					Status: corev1.PodStatus{
+						Phase:      corev1.PodRunning,
+						Conditions: notReadyCondition,
+						ContainerStatuses: []corev1.ContainerStatus{{
+							Name:  "coredns",
+							Ready: false,
+						}},
+					},
 				},
 				{
-					ObjectMeta: metav1.ObjectMeta{Name: "coredns-2"},
-					Status:     corev1.PodStatus{Phase: corev1.PodPending},
+					ObjectMeta: metav1.ObjectMeta{Name: "coredns-2", Namespace: testNamespace},
+					Status: corev1.PodStatus{
+						Phase:      corev1.PodRunning,
+						Conditions: readyCondition,
+						ContainerStatuses: []corev1.ContainerStatus{{
+							Name:  "coredns",
+							Ready: true,
+						}},
+					},
 				},
 			},
 			prefix:  "coredns",
 			wantErr: false,
 		},
 		{
-			name: "corednsNoneRunning",
+			name: "corednsAllUnhealthy",
 			pods: []corev1.Pod{
 				{
-					ObjectMeta: metav1.ObjectMeta{Name: "coredns-1"},
-					Status:     corev1.PodStatus{Phase: corev1.PodPending},
+					ObjectMeta: metav1.ObjectMeta{Name: "coredns-1", Namespace: testNamespace},
+					Status: corev1.PodStatus{
+						Phase:      corev1.PodRunning,
+						Conditions: notReadyCondition,
+						ContainerStatuses: []corev1.ContainerStatus{{
+							Name:  "coredns",
+							Ready: false,
+							State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}},
+						}},
+					},
 				},
 			},
 			prefix:  "coredns",
@@ -512,7 +569,7 @@ func TestNodeHealthCheck(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			client := &Client{
-				Log: zap.NewNop().Sugar(),
+				Log: nil,
 			}
 
 			patches := gomonkey.ApplyMethod(client, "CheckComponentHealth",
@@ -627,7 +684,6 @@ func TestGetPodsError(t *testing.T) {
 	}
 }
 
-
 func TestProcessAddonComponentCheck(t *testing.T) {
 	client := &Client{}
 	err := client.processAddonComponentCheck("unknown-addon")
@@ -635,4 +691,3 @@ func TestProcessAddonComponentCheck(t *testing.T) {
 		t.Error("processAddonComponentCheck() expected error for unknown addon")
 	}
 }
-

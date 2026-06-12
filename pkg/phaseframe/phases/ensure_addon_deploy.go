@@ -37,7 +37,6 @@ import (
 	bkeaddon "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/addon"
 	bkeinit "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/initialize"
 	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
-	bkesource "gopkg.openfuyao.cn/cluster-api-provider-bke/common/source"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/certs"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/command"
 	downloadplugin "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job/builtin/downloader"
@@ -1055,12 +1054,16 @@ func (e *EnsureAddonDeploy) createClusterAPIBkeconfigCm() error {
 	ctx, c, bkeCluster, _, log := e.Ctx.Untie()
 	config, err := phaseutil.GetRemoteBKEConfigCM(ctx, e.remoteClient)
 	if err != nil {
-		log.Error(constant.InternalErrorReason, "failed to get BKECluster %q remote cluster bke-config cm, err: %v", utils.ClientObjNS(bkeCluster), err)
+		log.Error(constant.InternalErrorReason,
+			"failed to get BKECluster %q remote cluster bke-config cm, err: %v",
+			utils.ClientObjNS(bkeCluster), err)
 		return err
 	}
 	if config == nil {
 		if err = phaseutil.MigrateBKEConfigCM(ctx, c, e.remoteClient); err != nil {
-			log.Error(constant.InternalErrorReason, "failed to migrate BKECluster %q bke-config cm to remote cluster, err：%v", utils.ClientObjNS(bkeCluster), err)
+			log.Error(constant.InternalErrorReason,
+				"failed to migrate BKECluster %q bke-config cm to remote cluster, err: %v",
+				utils.ClientObjNS(bkeCluster), err)
 			return err
 		}
 	}
@@ -1072,7 +1075,9 @@ func (e *EnsureAddonDeploy) createClusterAPIPatchconfigCm() error {
 	ctx, c, bkeCluster, _, log := e.Ctx.Untie()
 
 	if err := phaseutil.MigratePatchConfigCM(ctx, c, e.remoteClient); err != nil {
-		log.Error(constant.InternalErrorReason, "failed to migrate BKECluster %q patch-config cm to remote cluster, err：%v", utils.ClientObjNS(bkeCluster), err)
+		log.Error(constant.InternalErrorReason,
+			"failed to migrate BKECluster %q patch-config cm to remote cluster, err: %v",
+			utils.ClientObjNS(bkeCluster), err)
 		return err
 	}
 
@@ -1185,7 +1190,7 @@ type PrepareDownloadCalicoCtlParamsResult struct {
 func (e *EnsureAddonDeploy) prepareDownloadCalicoCtlParams(version string) PrepareDownloadCalicoCtlParamsResult {
 	ctx, c, bkeCluster, scheme, log := e.Ctx.Untie()
 	cfg := bkeinit.BkeConfig(*bkeCluster.Spec.ClusterConfig)
-	baseUrl := bkesource.GetCustomDownloadPath(cfg.YumRepo())
+	baseUrl := clusterutil.BuildYumRepoDownloadBaseURL(cfg)
 	calicoCtlUrl := fmt.Sprintf("url=%s/calicoctl-%s-linux-{.arch}", baseUrl, version)
 	cfgString := "apiVersion: projectcalico.org/v3\nkind: CalicoAPIConfig\nmetadata:\nspec:\n  datastoreType: 'kubernetes'\n  kubeconfig: '/etc/kubernetes/admin.conf'"
 

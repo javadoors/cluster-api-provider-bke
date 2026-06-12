@@ -185,5 +185,3 @@ func TestCollectScriptFiles_EmptyDirectory(t *testing.T) {
 		t.Errorf("expected 0 scripts in empty directory, got %d", len(scripts))
 	}
 }
-
-

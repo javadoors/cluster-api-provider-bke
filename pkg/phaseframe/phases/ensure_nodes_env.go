@@ -31,7 +31,6 @@ import (
 	bkeaddon "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/addon"
 	bkeinit "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/initialize"
 	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
-	bkesource "gopkg.openfuyao.cn/cluster-api-provider-bke/common/source"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/command"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/kube"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/mergecluster"
@@ -147,16 +146,17 @@ func (e *EnsureNodesEnv) setupClusterConditionAndSync() error {
 
 // BuildCommonEnvCommandParams 包含 BuildCommonEnvCommand 函数的参数
 type BuildCommonEnvCommandParams struct {
-	Ctx            context.Context
-	Client         client.Client
-	BKECluster     *bkev1beta1.BKECluster
-	Scheme         *runtime.Scheme
-	ExceptEnvNodes bkenode.Nodes
-	Extra          []string
-	ExtraHosts     []string
-	DryRun         bool
-	DeepRestore    bool
-	Log            *bkev1beta1.BKELogger
+	Ctx               context.Context
+	Client            client.Client
+	BKECluster        *bkev1beta1.BKECluster
+	Scheme            *runtime.Scheme
+	ExceptEnvNodes    bkenode.Nodes
+	ContainerdVersion string
+	Extra             []string
+	ExtraHosts        []string
+	DryRun            bool
+	DeepRestore       bool
+	Log               *bkev1beta1.BKELogger
 }
 
 // BuildCommonEnvCommand creates a common ENV command structure
@@ -178,12 +178,13 @@ func BuildCommonEnvCommand(params BuildCommonEnvCommandParams) (*command.ENV, er
 			RemoveAfterWait: true,
 			WaitTimeout:     timeOut,
 		},
-		Nodes:         params.ExceptEnvNodes,
-		BkeConfigName: params.BKECluster.Name,
-		Extra:         params.Extra,
-		ExtraHosts:    params.ExtraHosts,
-		DryRun:        params.DryRun,
-		DeepRestore:   params.DeepRestore,
+		Nodes:             params.ExceptEnvNodes,
+		BkeConfigName:     params.BKECluster.Name,
+		ContainerdVersion: params.ContainerdVersion,
+		Extra:             params.Extra,
+		ExtraHosts:        params.ExtraHosts,
+		DryRun:            params.DryRun,
+		DeepRestore:       params.DeepRestore,
 	}
 
 	return envCmd, nil
@@ -237,20 +238,7 @@ func (e *EnsureNodesEnv) getExtraAndExtraHosts(bkeCluster *bkev1beta1.BKECluster
 	isHAVIP := clusterutil.AvailableLoadBalancerEndPoint(ep, nodes)
 	if isHAVIP {
 		extra = append(extra, ep.Host)
-	}
-
-	// Add master.bocloud.com hosts mapping for any valid ControlPlaneEndpoint
-	// This ensures consistency with kubeconfig generation which uses master.bocloud.com domain
-	// for HA clusters. The kubeconfig uses IsHACluster() check which only requires endpoint.IsValid().
-	if ep.IsValid() {
-		// For HA cluster with VIP, map master.bocloud.com to VIP
-		// For single master cluster with endpoint set, map master.bocloud.com to that IP
-		targetIP := ep.Host
-		if !isHAVIP && len(nodes.Master()) > 0 {
-			// If endpoint host is a node IP (not VIP), use it directly
-			targetIP = nodes.Master()[0].IP
-		}
-		extraHosts = append(extraHosts, fmt.Sprintf("%s:%s", constant.MasterHADomain, targetIP))
+		extraHosts = append(extraHosts, fmt.Sprintf("%s:%s", constant.MasterHADomain, ep.Host))
 	}
 
 	if ingressVip, _ := clusterutil.GetIngressConfig(bkeCluster.Spec.ClusterConfig.Addons); ingressVip != "" && ingressVip != ep.Host {
@@ -276,8 +264,12 @@ func (e *EnsureNodesEnv) handleSuccessNodes(successNodes []string) {
 	var newNodes bkenode.Nodes
 	for _, node := range successNodes {
 		nodeIP := phaseutil.GetNodeIPFromCommandWaitResult(node)
-		nodeFetcher.MarkNodeStateFlagForCluster(e.Ctx, bkeCluster, nodeIP, bkev1beta1.NodeEnvFlag)
-		nodeFetcher.SetBKENodeStateMessage(e.Ctx, bkeCluster.Namespace, bkeCluster.Name, nodeIP, "Nodes env is ready")
+		if err := nodeFetcher.UpdateNodeStatusByIPForCluster(e.Ctx, bkeCluster, nodeIP, func(status *confv1beta1.BKENodeStatus) {
+			status.StateCode |= bkev1beta1.NodeEnvFlag
+			status.Message = "Nodes env is ready"
+		}); err != nil {
+			log.Warn(constant.InternalErrorReason, "Failed to update node env status for %s: %v", nodeIP, err)
+		}
 
 		// Find and append the node from allNodes
 		filtered := allNodes.Filter(bkenode.FilterOptions{"IP": nodeIP})
@@ -293,10 +285,22 @@ func (e *EnsureNodesEnv) handleSuccessNodes(successNodes []string) {
 func (e *EnsureNodesEnv) handleFailedNodes(envCmd *command.ENV, failedNodes []string) error {
 	_, _, bkeCluster, _, log := e.Ctx.Untie()
 	nodeFetcher := e.Ctx.NodeFetcher()
+	nodes, err := nodeFetcher.GetNodesForBKECluster(e.Ctx, bkeCluster)
+	if err != nil {
+		log.Warn(constant.InternalErrorReason, "Failed to get nodes for role check: %v", err)
+	}
+	workerNodes := nodes.Worker()
 	for _, node := range failedNodes {
 		nodeIP := phaseutil.GetNodeIPFromCommandWaitResult(node)
-		nodeFetcher.SetNodeStateWithMessageForCluster(e.Ctx, bkeCluster, nodeIP, bkev1beta1.NodeInitFailed, "Failed to check k8s env")
-		nodeFetcher.SetSkipNodeErrorForWorker(e.Ctx, bkeCluster.Namespace, bkeCluster.Name, nodeIP)
+		if err := nodeFetcher.UpdateNodeStatusByIPForCluster(e.Ctx, bkeCluster, nodeIP, func(status *confv1beta1.BKENodeStatus) {
+			status.State = bkev1beta1.NodeInitFailed
+			status.Message = "Failed to check k8s env"
+			if workerNodes.Filter(bkenode.FilterOptions{"IP": nodeIP}).Length() > 0 {
+				status.NeedSkip = true
+			}
+		}); err != nil {
+			log.Warn(constant.InternalErrorReason, "Failed to update failed env node status for %s: %v", nodeIP, err)
+		}
 	}
 
 	commandErrs, err := phaseutil.LogCommandFailed(*envCmd.Command, failedNodes, log, constant.NodesEnvNotReadyReason)
@@ -388,13 +392,13 @@ func (e *EnsureNodesEnv) initClusterExtra() {
 
 	localClient, err := kube.NewClientFromRestConfig(ctx, e.Ctx.RestConfig)
 	if err != nil {
-		log.Warn(constant.EnvExtraExecScriptFailed, "获取k8s client 失败, 跳过自定义脚本执行, err: %v", err)
+		log.Warn(constant.EnvExtraExecScriptFailed, "failed to get k8s client, skipping custom script execution, err: %v", err)
 		return
 	}
 
 	scriptsLi, err := scriptshelper.ListScriptsConfigMaps(e.Ctx.Client)
 	if err != nil {
-		log.Warn(constant.InternalErrorReason, "获取环境初始化自定义脚本 configmaps 失败, 跳过自定义脚本执行, err: %v", err)
+		log.Warn(constant.InternalErrorReason, "failed to list custom script configmaps, skipping custom script execution, err: %v", err)
 		return
 	}
 	cfg := bkeinit.BkeConfig(*bkeCluster.Spec.ClusterConfig)
@@ -440,17 +444,17 @@ type InstallOtherScriptParams struct {
 func (e *EnsureNodesEnv) installCommonScripts(params InstallScriptParams) {
 	for _, script := range commonEnvExtraExecScripts {
 		if !utils.ContainsString(params.ScriptsLi, script) {
-			params.Log.Warn(constant.EnvExtraExecScriptFailed, "基础脚本 %q 不存在, 跳过自定义脚本执行", script)
+			params.Log.Warn(constant.EnvExtraExecScriptFailed, "common script %q not found in configmaps, skipping", script)
 			return
 		}
 
 		nodesIps, err := e.getNodesIpsByScript(script)
 		if err != nil {
-			params.Log.Warn(constant.EnvExtraExecScriptSkip, "获取安装基础脚本 %q 节点IP失败, 跳过自定义脚本执行, err: %v", script, err)
+			params.Log.Warn(constant.EnvExtraExecScriptSkip, "failed to get node IPs for common script %q, skipping, err: %v", script, err)
 			return
 		}
 		if len(nodesIps) == 0 {
-			params.Log.Warn(constant.EnvExtraExecScriptSkip, "获取安装基础脚本 %q 节点IP为空, 跳过自定义脚本执行", script)
+			params.Log.Warn(constant.EnvExtraExecScriptSkip, "node IPs empty for common script %q, skipping", script)
 			return
 		}
 
@@ -461,11 +465,11 @@ func (e *EnsureNodesEnv) installCommonScripts(params InstallScriptParams) {
 		addonT := e.createAddonTransfer(script, param, false)
 
 		if err := params.LocalClient.InstallAddon(params.BKECluster, addonT, nil, nil, e.nodes); err != nil {
-			params.Log.Warn(constant.EnvExtraExecScriptFailed, "安装基础脚本 %q 失败, 跳过自定义脚本执行, err: %v", script, err)
+			params.Log.Warn(constant.EnvExtraExecScriptFailed, "failed to install common script %q, skipping, err: %v", script, err)
 			return
 		}
 
-		params.Log.Info(constant.EnvExtraExecScriptSuccess, "额外安装基础脚本 %q 成功", script)
+		params.Log.Info(constant.EnvExtraExecScriptSuccess, "common script %q installed successfully", script)
 	}
 }
 
@@ -479,26 +483,26 @@ func (e *EnsureNodesEnv) installOtherCustomScripts(params InstallOtherScriptPara
 		otherCustomScripts = strings.Split(scriptsScope, ",")
 	}
 
-	httpRepo := bkesource.GetCustomDownloadPath(params.Cfg.YumRepo())
+	httpRepo := clusterutil.BuildYumRepoDownloadBaseURL(params.Cfg)
 
 	for _, script := range otherCustomScripts {
 		if !utils.ContainsString(params.ScriptsLi, script) {
-			params.Log.Warn(constant.EnvExtraExecScriptSkip, "自定义脚本 %q 不存在, 跳过自定义脚本执行", script)
+			params.Log.Warn(constant.EnvExtraExecScriptSkip, "custom script %q not found in configmaps, skipping", script)
 			continue
 		}
 
 		if script == "update-runc.sh" && params.Cfg.Cluster.ContainerRuntime.CRI == bkeinit.CRIContainerd {
-			params.Log.Info(constant.EnvExtraExecScriptSkip, "自定义脚本 %q 不支持 containerd, 跳过自定义脚本执行", script)
+			params.Log.Info(constant.EnvExtraExecScriptSkip, "custom script %q is not supported for containerd, skipping", script)
 			continue
 		}
 
 		nodesIps, err := e.getNodesIpsByScript(script)
 		if err != nil {
-			params.Log.Warn(constant.EnvExtraExecScriptSkip, "获取自定义脚本 %q 节点IP失败, 跳过自定义脚本执行, err: %v", script, err)
+			params.Log.Warn(constant.EnvExtraExecScriptSkip, "failed to get node IPs for custom script %q, skipping, err: %v", script, err)
 			continue
 		}
 		if len(nodesIps) == 0 {
-			params.Log.Warn(constant.EnvExtraExecScriptSkip, "获取自定义脚本 %q 节点IP为空, 跳过自定义脚本执行", script)
+			params.Log.Warn(constant.EnvExtraExecScriptSkip, "node IPs empty for custom script %q, skipping", script)
 			continue
 		}
 
@@ -511,66 +515,60 @@ func (e *EnsureNodesEnv) installOtherCustomScripts(params InstallOtherScriptPara
 		addonT := e.createAddonTransfer(script, param, block)
 
 		if err := params.LocalClient.InstallAddon(params.BKECluster, addonT, nil, nil, e.nodes); err != nil {
-			params.Log.Warn(constant.EnvExtraExecScriptFailed, "执行自定义脚本 %q 失败, 跳过自定义脚本执行, err: %v", script, err)
+			params.Log.Warn(constant.EnvExtraExecScriptFailed, "failed to execute custom script %q, skipping, err: %v", script, err)
 			continue
 		}
 
-		params.Log.Info(constant.EnvExtraExecScriptSuccess, "额外执行自定义脚本 %q 成功", script)
+		params.Log.Info(constant.EnvExtraExecScriptSuccess, "custom script %q executed successfully", script)
 	}
 }
 
-// executeNodePreprocessScripts 执行节点前置处理脚本
+// executeNodePreprocessScripts executes node preprocess scripts
 func (e *EnsureNodesEnv) executeNodePreprocessScripts() error {
 	ctx, c, bkeCluster, scheme, log := e.Ctx.Untie()
 
-	// 1. 获取所有业务节点
 	nodes := e.nodes
-	log.Info(constant.NodesEnvCheckingReason, "开始检查节点前置处理配置, 总节点数=%d", len(nodes))
+	log.Info(constant.NodesEnvCheckingReason, "starting node preprocess config check, totalNodes=%d", len(nodes))
 
-	// 2. 收集所有有配置的节点（用于创建单个Command并下发到所有目标节点）
 	var nodesWithConfig bkenode.Nodes
 	for _, node := range nodes {
-		// 节点IP为空时无法匹配配置与nodeSelector，直接跳过并打印日志
 		if node.IP == "" {
-			log.Warn(constant.NodesEnvCheckingReason, "节点IP为空，跳过前置处理配置检查")
+			log.Debug("node IP is empty, skipping preprocess config check")
 			continue
 		}
-		log.Info(constant.NodesEnvCheckingReason, "开始检查节点前置处理配置, nodeIP=%s", node.IP)
+		log.Debug("checking preprocess config for node, nodeIP=%s", node.IP)
 		hasConfig := e.checkPreprocessConfigExists(ctx, c, log, node.IP)
 		if !hasConfig {
-			log.Warn(constant.NodesEnvCheckingReason, "节点 %s 没有匹配的前置处理配置，跳过", node.IP)
+			log.Debug("node %s has no matching preprocess config, skipping", node.IP)
 			continue
 		}
 		nodesWithConfig = append(nodesWithConfig, node)
 	}
 
-	log.Info(constant.NodesEnvCheckingReason, "前置处理配置检查完成，总节点数=%d，命中配置节点数=%d", len(nodes), len(nodesWithConfig))
+	log.Info(constant.NodesEnvCheckingReason, "preprocess config check completed, totalNodes=%d, matchedNodes=%d", len(nodes), len(nodesWithConfig))
 
-	// 如果没有节点有配置，直接返回
 	if len(nodesWithConfig) == 0 {
-		log.Info(constant.NodesEnvCheckingReason, "没有节点需要执行前置处理，跳过")
+		log.Info(constant.NodesEnvCheckingReason, "no nodes need preprocess execution, skipping")
 		return nil
 	}
 
-	// 3. 创建一个Command资源，包含所有有配置的节点
-	log.Info(constant.NodesEnvCheckingReason, "开始创建前置处理Command资源, nodes=%d", len(nodesWithConfig))
+	log.Info(constant.NodesEnvCheckingReason, "creating preprocess Command resource, nodes=%d", len(nodesWithConfig))
 	cmd, err := e.createPreprocessCommand(
 		ctx, c, bkeCluster, scheme, nodesWithConfig,
 	)
 	if err != nil {
-		return errors.Wrapf(err, "创建前置处理Command资源失败")
+		return errors.Wrapf(err, "failed to create preprocess Command resource")
 	}
-	log.Info(constant.NodesEnvCheckingReason, "前置处理Command资源创建完成, command=%s", cmd.CommandName)
+	log.Info(constant.NodesEnvCheckingReason, "preprocess Command resource created, command=%s", cmd.CommandName)
 
-	// 4. 等待Command执行完成（所有节点）
-	log.Info(constant.NodesEnvCheckingReason, "开始等待前置处理Command执行完成, command=%s", cmd.CommandName)
+	log.Info(constant.NodesEnvCheckingReason, "waiting for preprocess Command to complete, command=%s", cmd.CommandName)
 	err, successNodes, failedNodes := cmd.Wait()
-	log.Info(constant.NodesEnvCheckingReason, "前置处理Command执行完成, command=%s, successNodes=%v, failedNodes=%v", cmd.CommandName, successNodes, failedNodes)
+	log.Info(constant.NodesEnvCheckingReason, "preprocess Command completed, command=%s, successNodes=%v, failedNodes=%v", cmd.CommandName, successNodes, failedNodes)
 	if cmd.Command != nil {
 		phaseutil.LogCommandInfo(*cmd.Command, log, constant.NodesEnvCheckingReason)
 	}
 	if err != nil || len(failedNodes) > 0 {
-		return errors.Errorf("前置处理执行失败，成功节点: %v, 失败节点: %v",
+		return errors.Errorf("preprocess execution failed, successNodes: %v, failedNodes: %v",
 			successNodes, failedNodes)
 	}
 
@@ -623,35 +621,31 @@ func (e *EnsureNodesEnv) createPreprocessCommand(
 	}
 
 	if err := customCmd.New(); err != nil {
-		return nil, errors.Wrapf(err, "创建Command资源失败")
+		return nil, errors.Wrapf(err, "failed to create Command resource")
 	}
 
 	return customCmd, nil
 }
 
-// checkPreprocessConfigExists 检查前置处理配置是否存在（按优先级：全局 > 批次 > 节点）
-// 增加详细日志，便于定位“找不到需要执行节点”的原因
+// checkPreprocessConfigExists checks if preprocess config exists (priority: global > batch > node)
 func (e *EnsureNodesEnv) checkPreprocessConfigExists(ctx context.Context, c client.Client, log *bkev1beta1.BKELogger, nodeIP string) bool {
-	// 1. 优先检查全局配置
 	globalConfigCM := &corev1.ConfigMap{}
 	globalConfigKey := client.ObjectKey{
 		Namespace: "user-system",
 		Name:      "preprocess-all-config",
 	}
 	if err := c.Get(ctx, globalConfigKey, globalConfigCM); err == nil {
-		log.Info(constant.NodesEnvCheckingReason, "命中全局配置 preprocess-all-config, nodeIP=%s", nodeIP)
-		return true // 全局配置存在，直接返回
+		log.Debug("matched global config preprocess-all-config, nodeIP=%s", nodeIP)
+		return true
 	}
-	log.Info(constant.NodesEnvCheckingReason, "未找到全局配置 preprocess-all-config, nodeIP=%s", nodeIP)
+	log.Debug("global config preprocess-all-config not found, nodeIP=%s", nodeIP)
 
-	// 2. 全局配置不存在，检查批次配置
 	batchMappingCM := &corev1.ConfigMap{}
 	batchMappingKey := client.ObjectKey{
 		Namespace: "user-system",
 		Name:      "preprocess-node-batch-mapping",
 	}
 	if err := c.Get(ctx, batchMappingKey, batchMappingCM); err == nil {
-		// 解析批次映射
 		mappingJSON := batchMappingCM.Data["mapping.json"]
 		var mapping map[string]string
 		if json.Unmarshal([]byte(mappingJSON), &mapping) == nil {
@@ -662,33 +656,32 @@ func (e *EnsureNodesEnv) checkPreprocessConfigExists(ctx context.Context, c clie
 					Name:      fmt.Sprintf("preprocess-config-batch-%s", batchId),
 				}
 				if err := c.Get(ctx, batchConfigKey, batchConfigCM); err == nil {
-					log.Info(constant.NodesEnvCheckingReason, "命中批次配置 %s, nodeIP=%s", batchConfigKey.Name, nodeIP)
-					return true // 批次配置存在，直接返回
+					log.Debug("matched batch config %s, nodeIP=%s", batchConfigKey.Name, nodeIP)
+					return true
 				}
-				log.Info(constant.NodesEnvCheckingReason, "未找到批次配置 %s, nodeIP=%s", batchConfigKey.Name, nodeIP)
+				log.Debug("batch config %s not found, nodeIP=%s", batchConfigKey.Name, nodeIP)
 			} else {
-				log.Info(constant.NodesEnvCheckingReason, "批次映射中未找到节点, nodeIP=%s", nodeIP)
+				log.Debug("node not found in batch mapping, nodeIP=%s", nodeIP)
 			}
 		} else {
-			log.Warn(constant.NodesEnvCheckingReason, "批次映射解析失败, nodeIP=%s", nodeIP)
+			log.Warn(constant.NodesEnvCheckingReason, "failed to parse batch mapping, nodeIP=%s", nodeIP)
 		}
 	} else {
-		log.Info(constant.NodesEnvCheckingReason, "未找到批次映射 preprocess-node-batch-mapping, nodeIP=%s", nodeIP)
+		log.Debug("batch mapping preprocess-node-batch-mapping not found, nodeIP=%s", nodeIP)
 	}
 
-	// 3. 全局和批次配置都不存在，检查节点配置
 	nodeConfigCM := &corev1.ConfigMap{}
 	nodeConfigKey := client.ObjectKey{
 		Namespace: "user-system",
 		Name:      fmt.Sprintf("preprocess-config-node-%s", nodeIP),
 	}
 	if err := c.Get(ctx, nodeConfigKey, nodeConfigCM); err == nil {
-		log.Info(constant.NodesEnvCheckingReason, "命中节点配置 %s", nodeConfigKey.Name)
-		return true // 节点配置存在
+		log.Debug("matched node config %s", nodeConfigKey.Name)
+		return true
 	}
-	log.Info(constant.NodesEnvCheckingReason, "未找到节点配置 %s", nodeConfigKey.Name)
+	log.Debug("node config %s not found", nodeConfigKey.Name)
 
-	return false // 三种配置都不存在
+	return false
 }
 
 // getNodesIpsByScript returns the node IPs based on the script name
@@ -763,7 +756,7 @@ func (e *EnsureNodesEnv) handleInstallNfsutilsScript() (string, error) {
 	if v, ok := e.Ctx.BKECluster.Spec.ClusterConfig.CustomExtra["pipelineServer"]; ok {
 		return v, nil
 	}
-	return "", errors.Errorf("没有在 Spec.ClusterConfig.CustomExtra 中配置 pipelineServer")
+	return "", errors.Errorf("pipelineServer not configured in Spec.ClusterConfig.CustomExtra")
 }
 
 // handleInstallEtcdctlScript handles the install-etcdctl.sh script
@@ -803,14 +796,14 @@ func (e *EnsureNodesEnv) handleCleanDockerImagesScript() (string, error) {
 	if v, ok := e.Ctx.BKECluster.Spec.ClusterConfig.CustomExtra["pipelineServer"]; ok {
 		nodes = v
 	} else {
-		return "", errors.Errorf("没有在 Spec.ClusterConfig.CustomExtra 中配置 pipelineServer")
+		return "", errors.Errorf("pipelineServer not configured in Spec.ClusterConfig.CustomExtra")
 	}
 
 	if v, ok := e.Ctx.BKECluster.Spec.ClusterConfig.CustomExtra["pipelineServerEnableCleanImages"]; ok && v == "true" {
 		return nodes, nil
 	}
 
-	return "", errors.Errorf("没有在 Spec.ClusterConfig.CustomExtra 中配置 pipelineServerEnableCleanImages")
+	return "", errors.Errorf("pipelineServerEnableCleanImages not configured in Spec.ClusterConfig.CustomExtra")
 }
 
 // handleDefaultScript handles any other scripts not specifically defined

@@ -4,6 +4,11 @@ resources:
 generatorOptions:
   disableNameSuffixHash: true
 
+configMapGenerator:
+- name: ologger-config
+  files:
+  - ../ologger/ologger.yaml
+
 #configMapGenerator:
 #- name: manager-config
 #  files:

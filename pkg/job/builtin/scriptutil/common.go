@@ -24,7 +24,7 @@ import (
 	"github.com/pkg/errors"
 
 	bkenet "gopkg.openfuyao.cn/cluster-api-provider-bke/common/utils/net"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 // ScriptConfig 脚本配置

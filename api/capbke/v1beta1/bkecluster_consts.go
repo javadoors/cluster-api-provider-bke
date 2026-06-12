@@ -16,7 +16,7 @@ import (
 	"fmt"
 	"time"
 
-	"go.uber.org/zap"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
@@ -24,7 +24,6 @@ import (
 
 	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/annotation"
-	log "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/log"
 )
 
 const (
@@ -34,20 +33,18 @@ const (
 var (
 	// ExpectMinK8sVersion is the minimum kubernetes version supported by the provider
 	ExpectMinK8sVersion, _ = version.ParseMajorMinorPatch("v1.27.0")
-	// ExpectMaxK8sVersion is the maximum kubernetes version supported by the provider
-	ExpectMaxK8sVersion, _ = version.ParseMajorMinorPatch("v1.34.2")
 )
 
 // BKELogger is a wrapper of zap.SugaredLogger and record.EventRecorder
 // +kubebuilder:object:generate:=false
 type BKELogger struct {
-	NormalLogger *zap.SugaredLogger
+	NormalLogger *log.Logger
 	Recorder     record.EventRecorder
 	EventBinder  runtime.Object
 }
 
 // NewBKELogger creates a new BKE logger with the specified parameters
-func NewBKELogger(log *zap.SugaredLogger, recorder record.EventRecorder, binder runtime.Object) *BKELogger {
+func NewBKELogger(log *log.Logger, recorder record.EventRecorder, binder runtime.Object) *BKELogger {
 	return &BKELogger{
 		NormalLogger: log,
 		Recorder:     recorder,
@@ -100,7 +97,11 @@ func (logger *BKELogger) Finish(reason, msg string, args ...interface{}) {
 }
 
 func (logger *BKELogger) Debug(msg string, args ...interface{}) {
-	logger.NormalLogger.Debugf(msg, args...)
+	if logger.NormalLogger != nil {
+		logger.NormalLogger.Debugf(msg, args...)
+		return
+	}
+	log.Debugf(msg, args...)
 }
 
 // condition type constants

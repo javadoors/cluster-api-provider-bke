@@ -32,6 +32,7 @@ import (
 
 	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/clusterversion"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/kube"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/mergecluster"
 	metricrecord "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/metrics/record"
@@ -135,7 +136,7 @@ func (e *EnsureCluster) Execute() (_ ctrl.Result, err error) {
 	return ctrl.Result{RequeueAfter: periodicCheckInterval}, kerrors.NewAggregate(errs)
 }
 
-// 校验函数：判断集群是否处于特殊状态
+// 校验函数: 判断集群是否处于特殊状态
 func isClusterInSpecialState(bkeCluster *bkev1beta1.BKECluster) bool {
 	// 将相关状态集中在一个数组中进行判断
 	specialStates := []confv1beta1.ClusterStatus{
@@ -214,7 +215,9 @@ func (e *EnsureCluster) setAlertLabel() (err error) {
 	labelhelper.SetLabel(availableNode, labelhelper.AlertLabelKey, labelhelper.AlertLabelValue)
 	_, err = clientSet.CoreV1().Nodes().Update(e.Ctx, availableNode, metav1.UpdateOptions{})
 	if err != nil {
-		e.Ctx.Log.Warn("SetAlertLabelFailed", "(ignore)failed to set alert label to node %s, err: %v：", availableNode.Name, err)
+		e.Ctx.Log.Warn("SetAlertLabelFailed",
+			"(ignore)failed to set alert label to node %s, err: %v: ",
+			availableNode.Name, err)
 		return errors.Errorf("failed to set alert label to node %s, err: %v", availableNode.Name, err)
 	}
 	return
@@ -231,7 +234,9 @@ func (e *EnsureCluster) setBareMetalLabel() error {
 		if !labelhelper.HasLabel(node, labelhelper.BareMetalLabelKey) {
 			labelhelper.SetLabel(node, labelhelper.BareMetalLabelKey, "true")
 			if _, err = clientSet.CoreV1().Nodes().Update(e.Ctx, node, metav1.UpdateOptions{}); err != nil {
-				e.Ctx.Log.Warn("SetBareMetalLabelFailed", "(ignore)failed to set baremetal label to node %s, err: %v：", node.Name, err)
+				e.Ctx.Log.Warn("SetBareMetalLabelFailed",
+					"(ignore)failed to set baremetal label to node %s, err: %v: ",
+					node.Name, err)
 				continue
 			}
 		}
@@ -290,12 +295,16 @@ func (e *EnsureCluster) ensureRemoteBKEConfigCM() error {
 	clientSet, _ := e.remoteClient.KubeClient()
 	config, err := phaseutil.GetRemoteBKEConfigCM(ctx, clientSet)
 	if err != nil {
-		log.Error(constant.InternalErrorReason, "failed to get BKECluster %q remote cluster bke-config cm, err: %v", utils.ClientObjNS(bkeCluster), err)
+		log.Error(constant.InternalErrorReason,
+			"failed to get BKECluster %q remote cluster bke-config cm, err: %v",
+			utils.ClientObjNS(bkeCluster), err)
 		return err
 	}
 	if config == nil {
 		if err = phaseutil.MigrateBKEConfigCM(ctx, c, clientSet); err != nil {
-			log.Error(constant.InternalErrorReason, "failed to migrate BKECluster %q bke-config cm to remote cluster, err：%v", utils.ClientObjNS(bkeCluster), err)
+			log.Error(constant.InternalErrorReason,
+				"failed to migrate BKECluster %q bke-config cm to remote cluster, err: %v",
+				utils.ClientObjNS(bkeCluster), err)
 			return err
 		}
 	}
@@ -377,6 +386,14 @@ func (e *EnsureCluster) performHealthCheck(ctx context.Context, c client.Client,
 	}
 
 	e.updateClusterVersionStatus(bkeCluster)
+	shouldSyncCV, err := clusterversion.ShouldSyncClusterVersionInstallStatus(ctx, c, bkeCluster)
+	if err != nil {
+		log.Warn(constant.InternalErrorReason, "check ClusterVersion install sync failed: %v", err)
+	} else if shouldSyncCV {
+		if err := clusterversion.SyncClusterVersionInstallStatus(ctx, c, bkeCluster); err != nil {
+			log.Warn(constant.InternalErrorReason, "sync ClusterVersion install status failed: %v", err)
+		}
+	}
 
 	bkeCluster.Status.ClusterStatus = bkev1beta1.ClusterReady
 	bkeCluster.Status.ClusterHealthState = bkev1beta1.Healthy

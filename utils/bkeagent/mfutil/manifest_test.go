@@ -75,8 +75,6 @@ func TestPathForHAManifestScript(t *testing.T) {
 	assert.True(t, info.IsDir())
 }
 
-
-
 func TestPathForHAManifestCreatesDirectory(t *testing.T) {
 	tmpDir := t.TempDir()
 	component := &BKEHAComponent{

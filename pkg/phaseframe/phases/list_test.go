@@ -30,7 +30,7 @@ func TestDeployPhases(t *testing.T) {
 
 func TestPostDeployPhases(t *testing.T) {
 	assert.NotNil(t, PostDeployPhases)
-	assert.Equal(t, 10, len(PostDeployPhases))
+	assert.Equal(t, 11, len(PostDeployPhases))
 }
 
 func TestDeletePhases(t *testing.T) {
@@ -50,6 +50,22 @@ func TestClusterUpgradePhaseNames(t *testing.T) {
 	assert.Equal(t, 5, len(ClusterUpgradePhaseNames))
 	assert.Contains(t, ClusterUpgradePhaseNames, EnsureMasterUpgradeName)
 	assert.Contains(t, ClusterUpgradePhaseNames, EnsureWorkerUpgradeName)
+}
+
+func TestDeclarativeClusterUpgradePhaseNames(t *testing.T) {
+	assert.NotNil(t, DeclarativeClusterUpgradePhaseNames)
+	assert.Equal(t, 6, len(DeclarativeClusterUpgradePhaseNames))
+	assert.Contains(t, DeclarativeClusterUpgradePhaseNames, EnsurePreUpgradeResourcesName)
+	assert.Contains(t, DeclarativeClusterUpgradePhaseNames, EnsureAgentUpgradeName)
+	assert.Contains(t, DeclarativeClusterUpgradePhaseNames, EnsureEtcdUpgradeName)
+	assert.Contains(t, DeclarativeClusterUpgradePhaseNames, EnsureContainerdUpgradeName)
+}
+
+func TestIsDeclarativeInlineUpgradePhase(t *testing.T) {
+	assert.True(t, IsDeclarativeInlineUpgradePhase(EnsureEtcdUpgradeName))
+	assert.True(t, IsDeclarativeInlineUpgradePhase(EnsureAgentUpgradeName))
+	assert.False(t, IsDeclarativeInlineUpgradePhase(EnsureClusterName))
+	assert.False(t, IsDeclarativeInlineUpgradePhase(EnsureAddonDeployName))
 }
 
 func TestClusterScaleMasterDownPhaseNames(t *testing.T) {
@@ -128,6 +144,7 @@ func TestPhaseNameCNMap(t *testing.T) {
 	assert.Equal(t, "集群删除", PhaseNameCNMap[EnsureDeleteOrResetName])
 	assert.Equal(t, "Master初始化", PhaseNameCNMap[EnsureMasterInitName])
 	assert.Equal(t, "Worker加入", PhaseNameCNMap[EnsureWorkerJoinName])
+	assert.Equal(t, "升级前资源预创建", PhaseNameCNMap[EnsurePreUpgradeResourcesName])
 }
 
 func TestConvertPhaseNameToCN_ExistingPhase(t *testing.T) {

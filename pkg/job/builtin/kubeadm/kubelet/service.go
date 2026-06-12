@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"text/template"
 
 	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
@@ -34,6 +35,26 @@ var (
 	//go:embed kubelet-service.tmpl
 	kubeletservice string
 )
+
+// applyDefaultHostnameOverrideIfMissing appends --hostname-override to ExecStart when KCT (KubeletConfig)
+// does not already specify it. The value comes from utils.HostName() (same as the non-KCT kubelet path).
+func applyDefaultHostnameOverrideIfMissing(s *confv1beta1.KubeletService) {
+	if s == nil {
+		return
+	}
+	execStart := strings.TrimSpace(s.ExecStart)
+	if execStart == "" {
+		return
+	}
+	if strings.Contains(execStart, "--hostname-override") {
+		return
+	}
+	name := utils.HostName()
+	if name == "" {
+		return
+	}
+	s.ExecStart = strings.TrimRight(execStart, " \t") + " --hostname-override=" + name
+}
 
 type ServiceData struct {
 	KubeletService *confv1beta1.KubeletService
@@ -90,6 +111,8 @@ func (s *ServiceGenerator) GenerateService(config *confv1beta1.KubeletService, c
 }
 
 func (s *ServiceGenerator) generateServiceContent(config *confv1beta1.KubeletService) (string, error) {
+	applyDefaultHostnameOverrideIfMissing(config)
+
 	tmplData := &ServiceData{
 		KubeletService: config,
 	}

@@ -54,7 +54,6 @@ func createTestEnsureMasterInit() *EnsureMasterInit {
 	}
 }
 
-
 func TestEnsureMasterInitConstants(t *testing.T) {
 	assert.Equal(t, "EnsureMasterInit", string(EnsureMasterInitName))
 	assert.Equal(t, 10, MasterInitLogIntervalCount)
@@ -113,7 +112,6 @@ func TestEnsureMasterInit_NeedExecute_NotReady(t *testing.T) {
 	assert.False(t, result)
 }
 
-
 func TestValidateMasterNodesParams_Structure(t *testing.T) {
 	e := createTestEnsureMasterInit()
 	params := ValidateMasterNodesParams{
@@ -129,4 +127,3 @@ func TestSetupConditionAndRefreshParams_Structure(t *testing.T) {
 	}
 	assert.NotNil(t, params.Ctx)
 }
-

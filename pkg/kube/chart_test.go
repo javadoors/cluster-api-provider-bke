@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"github.com/agiledragon/gomonkey/v2"
-	"go.uber.org/zap"
 	"helm.sh/helm/v3/pkg/chart"
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -29,6 +28,7 @@ import (
 	bkeaddon "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/addon"
 	bkeinit "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/initialize"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/constant"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 const (
@@ -45,19 +45,19 @@ func TestClientGetChartTimeout(t *testing.T) {
 	c := &Client{}
 
 	tests := []struct {
-		name    string
-		addon   *confv1beta1.Product
-		want    time.Duration
+		name  string
+		addon *confv1beta1.Product
+		want  time.Duration
 	}{
 		{
-			name:    "addon with timeout",
-			addon:   &confv1beta1.Product{Timeout: testChartTimeout},
-			want:    testChartTimeout * time.Minute,
+			name:  "addon with timeout",
+			addon: &confv1beta1.Product{Timeout: testChartTimeout},
+			want:  testChartTimeout * time.Minute,
 		},
 		{
-			name:    "addon without timeout",
-			addon:   &confv1beta1.Product{Timeout: 0},
-			want:    bkeinit.DefaultAddonTimeout,
+			name:  "addon without timeout",
+			addon: &confv1beta1.Product{Timeout: 0},
+			want:  bkeinit.DefaultAddonTimeout,
 		},
 	}
 
@@ -271,8 +271,7 @@ func (m *mockClient) Get(ctx context.Context, key client.ObjectKey, obj client.O
 }
 
 func TestClientGetDataFromCMByKey(t *testing.T) {
-	logger, _ := zap.NewDevelopment()
-	c := &Client{Log: logger.Sugar()}
+	c := &Client{Log: nil}
 
 	const (
 		testNamespace = "test-ns"
@@ -333,8 +332,7 @@ func TestClientGetDataFromCMByKey(t *testing.T) {
 }
 
 func TestClientGetDataFromSecretByKeys(t *testing.T) {
-	logger, _ := zap.NewDevelopment()
-	c := &Client{Log: logger.Sugar()}
+	c := &Client{Log: nil}
 
 	const (
 		testNamespace = "test-ns"
@@ -397,8 +395,7 @@ func TestClientGetDataFromSecretByKeys(t *testing.T) {
 }
 
 func TestClientGetChartValues(t *testing.T) {
-	logger, _ := zap.NewDevelopment()
-	c := &Client{Log: logger.Sugar()}
+	c := &Client{Log: nil}
 
 	const (
 		testNamespace = "test-ns"
@@ -465,8 +462,7 @@ func TestClientGetChartValues(t *testing.T) {
 }
 
 func TestClientGetChartRepoTLSCerts(t *testing.T) {
-	logger, _ := zap.NewDevelopment()
-	c := &Client{Log: logger.Sugar()}
+	c := &Client{Log: nil}
 
 	const (
 		testNamespace = "test-ns"
@@ -531,8 +527,7 @@ func TestClientGetChartRepoTLSCerts(t *testing.T) {
 }
 
 func TestClientGetChartRepoLoginInfo(t *testing.T) {
-	logger, _ := zap.NewDevelopment()
-	c := &Client{Log: logger.Sugar()}
+	c := &Client{Log: nil}
 
 	const (
 		testNamespace = "test-ns"
@@ -603,8 +598,7 @@ func TestClientGetChartRepoLoginInfo(t *testing.T) {
 }
 
 func TestClientInstallChartAddon(t *testing.T) {
-	logger, _ := zap.NewDevelopment()
-	c := &Client{Log: logger.Sugar()}
+	c := &Client{Log: nil}
 
 	const (
 		testNamespace = "test-ns"
@@ -696,7 +690,6 @@ func TestGetCertTmpPath(t *testing.T) {
 }
 
 func TestFetchChartUniversal(t *testing.T) {
-	logger, _ := zap.NewDevelopment()
 	auth := NewAuthConfig()
 
 	tests := []struct {
@@ -725,17 +718,17 @@ func TestFetchChartUniversal(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			patches := gomonkey.ApplyFunc(FetchChartOCI,
-				func(repoURL, chartName, version string, auth *AuthConfig, logger *zap.SugaredLogger) (*chart.Chart, error) {
+				func(repoURL, chartName, version string, auth *AuthConfig, logger *log.Logger) (*chart.Chart, error) {
 					return nil, errors.New("mock oci error")
 				})
 			defer patches.Reset()
 
 			patches.ApplyFunc(FetchChartTraditional,
-				func(repoURL, chartName, version string, auth *AuthConfig, logger *zap.SugaredLogger) (*chart.Chart, error) {
+				func(repoURL, chartName, version string, auth *AuthConfig, logger *log.Logger) (*chart.Chart, error) {
 					return nil, errors.New("mock traditional error")
 				})
 
-			_, err := FetchChartUniversal(tt.chartRepo, tt.chartName, tt.version, auth, logger.Sugar())
+			_, err := FetchChartUniversal(tt.chartRepo, tt.chartName, tt.version, auth, nil)
 			if err == nil {
 				t.Errorf("FetchChartUniversal() expected error, got nil")
 			}
@@ -757,8 +750,7 @@ func TestNewAuthConfig(t *testing.T) {
 }
 
 func TestFetchChartPackageError(t *testing.T) {
-	logger, _ := zap.NewDevelopment()
-	c := &Client{Log: logger.Sugar()}
+	c := &Client{Log: nil}
 
 	addon := &confv1beta1.Product{
 		Name:    "test-chart",
@@ -780,7 +772,7 @@ func TestFetchChartPackageError(t *testing.T) {
 	}
 
 	patches := gomonkey.ApplyFunc(FetchChartUniversal,
-		func(chartRepo, chartName, version string, auth *AuthConfig, logger *zap.SugaredLogger) (*chart.Chart, error) {
+		func(chartRepo, chartName, version string, auth *AuthConfig, logger *log.Logger) (*chart.Chart, error) {
 			return nil, errors.New("mock fetch error")
 		})
 	defer patches.Reset()
@@ -792,8 +784,7 @@ func TestFetchChartPackageError(t *testing.T) {
 }
 
 func TestGetChartValuesWithInvalidYaml(t *testing.T) {
-	logger, _ := zap.NewDevelopment()
-	c := &Client{Log: logger.Sugar()}
+	c := &Client{Log: nil}
 
 	const invalidYaml = "invalid: yaml: content: ["
 
@@ -820,8 +811,7 @@ func TestGetChartValuesWithInvalidYaml(t *testing.T) {
 }
 
 func TestGetChartValuesWithEmptyNamespace(t *testing.T) {
-	logger, _ := zap.NewDevelopment()
-	c := &Client{Log: logger.Sugar()}
+	c := &Client{Log: nil}
 
 	addon := &confv1beta1.Product{
 		Name: "test-addon",
@@ -846,8 +836,7 @@ func TestGetChartValuesWithEmptyNamespace(t *testing.T) {
 }
 
 func TestGetChartRepoTLSCertsWithCustomKeys(t *testing.T) {
-	logger, _ := zap.NewDevelopment()
-	c := &Client{Log: logger.Sugar()}
+	c := &Client{Log: nil}
 
 	const (
 		customCaKey   = "custom-ca"
@@ -895,8 +884,7 @@ func TestGetChartRepoTLSCertsWithCustomKeys(t *testing.T) {
 }
 
 func TestGetChartRepoLoginInfoWithCustomKeys(t *testing.T) {
-	logger, _ := zap.NewDevelopment()
-	c := &Client{Log: logger.Sugar()}
+	c := &Client{Log: nil}
 
 	const (
 		customUsernameKey = "custom-user"

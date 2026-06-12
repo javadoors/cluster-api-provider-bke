@@ -492,7 +492,6 @@ func TestEnsureComponentUpgrade_HandleDaemonSet_Success(t *testing.T) {
 	assert.NotNil(t, obj)
 }
 
-
 func TestNewEnsureComponentUpgrade_Creation(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = bkev1beta1.AddToScheme(scheme)
@@ -506,10 +505,10 @@ func TestNewEnsureComponentUpgrade_Creation(t *testing.T) {
 		Scheme:     scheme,
 		Log:        bkev1beta1.NewBKELogger(nil, &fakeRecorder{}, bkeCluster),
 	}
-	
+
 	phase := NewEnsureComponentUpgrade(ctx)
 	assert.NotNil(t, phase)
-	
+
 	e, ok := phase.(*EnsureComponentUpgrade)
 	assert.True(t, ok)
 	assert.Equal(t, EnsureComponentUpgradeName, e.PhaseName)
@@ -575,7 +574,7 @@ func TestEnsureComponentUpgrade_HandleOwnerReference_DaemonSet(t *testing.T) {
 
 func TestEnsureComponentUpgrade_GetNamespace_MultipleScenarios(t *testing.T) {
 	e := &EnsureComponentUpgrade{}
-	
+
 	tests := []struct {
 		name string
 		pod  corev1.Pod
@@ -584,7 +583,7 @@ func TestEnsureComponentUpgrade_GetNamespace_MultipleScenarios(t *testing.T) {
 		{"custom namespace", corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "custom"}}, "custom"},
 		{"kube-system namespace", corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "kube-system"}}, "kube-system"},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := e.getNamespace(tt.pod)
@@ -595,7 +594,7 @@ func TestEnsureComponentUpgrade_GetNamespace_MultipleScenarios(t *testing.T) {
 
 func TestEnsureComponentUpgrade_BuildNewImage_MultipleScenarios(t *testing.T) {
 	e := &EnsureComponentUpgrade{}
-	
+
 	tests := []struct {
 		name         string
 		currentImage string
@@ -605,7 +604,7 @@ func TestEnsureComponentUpgrade_BuildNewImage_MultipleScenarios(t *testing.T) {
 		{"simple image", "myimage:v1.0", "v2.0", "myimage:v2.0"},
 		{"image with path", "registry.io/path/myimage:v1.0", "v2.0", "registry.io/path/myimage:v2.0"},
 	}
-	
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := e.buildNewImage(tt.currentImage, tt.newTag)

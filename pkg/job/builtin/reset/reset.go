@@ -22,7 +22,7 @@ import (
 	bkenet "gopkg.openfuyao.cn/cluster-api-provider-bke/common/utils/net"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job/builtin/plugin"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 const (
@@ -151,7 +151,7 @@ func (r ResetPlugin) processExtraPhase(phase *CleanPhase, extraArgs string) erro
 			if ip := net.ParseIP(arg); ip != nil {
 				phase.AddIPToClean(arg)
 			} else {
-				log.Warnf("not a valid ip addr, skip remove", arg)
+				log.Warnf("not a valid ip addr %s, skip remove", arg)
 			}
 			continue
 		}

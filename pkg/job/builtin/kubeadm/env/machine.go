@@ -19,8 +19,8 @@ import (
 	"github.com/shirou/gopsutil/v3/host"
 	"github.com/shirou/gopsutil/v3/mem"
 
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/option"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 type Machine struct {

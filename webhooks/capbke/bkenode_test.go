@@ -194,4 +194,3 @@ func TestBKENode_DefaultInvalidType(t *testing.T) {
 	err := webhook.Default(context.Background(), &bkev1beta1.BKECluster{})
 	assert.Error(t, err)
 }
-

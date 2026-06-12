@@ -36,7 +36,7 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/condition"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/constant"
 	_ "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/label"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 // Constants for master initialization
@@ -124,7 +124,7 @@ type WaitForInitCommandCompleteParams struct {
 
 // waitForInitCommandComplete 等待初始化命令完成
 func (e *EnsureMasterInit) waitForInitCommandComplete(params WaitForInitCommandCompleteParams) (bool, error) {
-	_, c, bkeCluster, _, log := params.Ctx.Untie()
+	_, c, bkeCluster, _, _ := params.Ctx.Untie()
 
 	// 需要拿到init的command
 	initCommand, err := phaseutil.GetMasterInitCommand(params.Ctx.Context, c, bkeCluster)
@@ -194,7 +194,7 @@ type WaitForMachineBootstrapParams struct {
 
 // waitForMachineBootstrap 等待机器引导
 func (e *EnsureMasterInit) waitForMachineBootstrap(params WaitForMachineBootstrapParams) (bool, error) {
-	_, c, bkeCluster, _, log := params.Ctx.Untie()
+	_, c, bkeCluster, _, _ := params.Ctx.Untie()
 
 	bkeMachine, err := phaseutil.GetControlPlaneInitBKEMachine(params.Ctx.Context, c, bkeCluster)
 	if err != nil {
@@ -254,7 +254,7 @@ type MasterInitPollParams struct {
 
 // CheckClusterInitializedStep 检查集群是否已初始化
 func (e *EnsureMasterInit) checkClusterInitializedStep(params MasterInitPollParams, pollCount int) (bool, bool, error) {
-	_, _, _, _, log := params.Ctx.Untie()
+	params.Ctx.Untie()
 
 	if err := params.Ctx.RefreshCtxCluster(); err != nil {
 		log.Error(constant.InternalErrorReason, "Refresh ClusterAPI Cluster obj %q failed, err: %v", utils.ClientObjNS(params.Ctx.Cluster), err)
@@ -276,7 +276,7 @@ func (e *EnsureMasterInit) checkClusterInitializedStep(params MasterInitPollPara
 
 // GetInitCommandStep 获取初始化命令
 func (e *EnsureMasterInit) getInitCommandStep(params MasterInitPollParams, pollCount int) (*agentv1beta1.Command, bool, error) {
-	_, c, bkeCluster, _, log := params.Ctx.Untie()
+	_, c, bkeCluster, _, _ := params.Ctx.Untie()
 
 	if *params.CommandCompleteFlag {
 		return nil, false, nil // continue to next step
@@ -340,7 +340,7 @@ type ProcessCommandCompleteParams struct {
 
 // ProcessCommandComplete 处理命令完成情况
 func (e *EnsureMasterInit) processCommandComplete(params ProcessCommandCompleteParams) (bool, bool, error) {
-	_, c, _, _, log := params.MasterInitPollParams.Ctx.Untie()
+	_, c, _, _, _ := params.MasterInitPollParams.Ctx.Untie()
 
 	if params.Complete {
 		if len(params.FailedNodes) != 0 {
@@ -388,7 +388,7 @@ func (e *EnsureMasterInit) waitForCommandCompleteStep(params MasterInitPollParam
 
 // WaitForMachineBootstrapStep 等待bkeMachine被标记已经引导
 func (e *EnsureMasterInit) waitForMachineBootstrapStep(params MasterInitPollParams, pollCount int) (bool, bool, error) {
-	_, c, bkeCluster, _, log := params.Ctx.Untie()
+	_, c, bkeCluster, _, _ := params.Ctx.Untie()
 
 	if *params.MachineBootFlag {
 		return false, false, nil // continue to next step
@@ -411,7 +411,7 @@ func (e *EnsureMasterInit) waitForMachineBootstrapStep(params MasterInitPollPara
 
 // CheckClusterFinalStep 检查集群最终状态
 func (e *EnsureMasterInit) checkClusterFinalStep(params MasterInitPollParams, pollCount int) (bool, bool, error) {
-	_, _, _, _, log := params.Ctx.Untie()
+	params.Ctx.Untie()
 
 	if !conditions.IsTrue(params.Ctx.Cluster, clusterv1.ControlPlaneInitializedCondition) {
 		if pollCount%MasterInitLogIntervalCount == 0 {

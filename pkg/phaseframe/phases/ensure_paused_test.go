@@ -605,4 +605,3 @@ func TestEnsurePaused_ReconcilePause_ClusterAPIError(t *testing.T) {
 	// Skipping - requires mocking private methods
 	t.Skip("Skipping - requires mocking private methods")
 }
-

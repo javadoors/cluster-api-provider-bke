@@ -27,7 +27,7 @@ import (
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/stretchr/testify/assert"
 
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 const (
@@ -476,7 +476,7 @@ func TestLogFromReader(t *testing.T) {
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
 
-	patches.ApplyFunc(log.Debug, func(v ...interface{}) {})
+	patches.ApplyFunc(log.Debug, func(msg string, v ...interface{}) {})
 
 	reader := &mockReadCloser{reader: strings.NewReader("line1\nline2\nline3")}
 	logFromReader(reader)
@@ -663,7 +663,7 @@ func TestLogFromReaderEmpty(t *testing.T) {
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
 
-	patches.ApplyFunc(log.Debug, func(v ...interface{}) {})
+	patches.ApplyFunc(log.Debug, func(msg string, v ...interface{}) {})
 
 	reader := &mockReadCloser{reader: strings.NewReader("")}
 	logFromReader(reader)

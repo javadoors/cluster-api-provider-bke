@@ -24,9 +24,9 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/mergecluster"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/annotation"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/constant"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 type PhaseFlow struct {
@@ -75,10 +75,21 @@ func (p *PhaseFlow) calculateAndAddPhases(old *bkev1beta1.BKECluster, new *bkev1
 	// 计算需要执行的阶段，并添加到status中
 	for _, f := range phasesFuncs {
 		phase := f(p.ctx)
+		if p.skipPhaseAfterDeclarativeDAG(phase) {
+			continue
+		}
 		if phase.NeedExecute(old, new) {
 			p.BKEPhases = append(p.BKEPhases, phase)
 		}
 	}
+}
+
+// skipPhaseAfterDeclarativeDAG avoids re-running inline upgrade phases already executed by the DAG.
+func (p *PhaseFlow) skipPhaseAfterDeclarativeDAG(phase phaseframe.Phase) bool {
+	if p.ctx == nil || !p.ctx.DeclarativeDAGCompleted {
+		return false
+	}
+	return IsDeclarativeInlineUpgradePhase(phase.Name())
 }
 
 // ReportPhaseStatus is used to report the phase status
@@ -200,6 +211,7 @@ func (p *PhaseFlow) executePhases(phases confv1beta1.BKEClusterPhases) (ctrl.Res
 	defer p.cleanupUnexecutedPhases(&phases)
 
 	for _, phase := range p.BKEPhases {
+		p.ctx.BindPhaseLogger(phase.Name())
 		p.ctx.Log.NormalLogger.Debugf("waiting phases num: %d", len(phases))
 		p.ctx.Log.NormalLogger.Infof("current phase name: %s", phase.Name())
 
@@ -328,7 +340,7 @@ func calculateClusterStatusByPhase(phase phaseframe.Phase, err error) error {
 		handleClusterDryRunPhase(ctx, err)
 	case phaseName.In(ClusterAddonsPhaseNames):
 		handleClusterAddonsPhase(ctx, err)
-	case phaseName.In(ClusterUpgradePhaseNames):
+	case phaseName.In(ClusterUpgradePhaseNames) || phaseName.In(DeclarativeClusterUpgradePhaseNames):
 		handleClusterUpgradePhase(ctx, err)
 	case phaseName.In(ClusterScaleMasterDownPhaseNames):
 		handleClusterScaleMasterDownPhase(ctx, err)

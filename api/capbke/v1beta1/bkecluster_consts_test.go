@@ -17,7 +17,7 @@ package v1beta1
 import (
 	"testing"
 
-	"go.uber.org/zap"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 
@@ -32,14 +32,14 @@ const (
 func TestNewBKELogger(t *testing.T) {
 	tests := []struct {
 		name      string
-		logger    *zap.SugaredLogger
+		logger    *log.Logger
 		recorder  record.EventRecorder
 		binder    runtime.Object
 		expectNil bool
 	}{
 		{
 			name:      "All parameters provided",
-			logger:    zap.NewNop().Sugar(),
+			logger:    nil,
 			recorder:  &record.FakeRecorder{},
 			binder:    nil,
 			expectNil: false,
@@ -73,74 +73,72 @@ func TestNewBKELogger(t *testing.T) {
 
 func TestBKELoggerInfo(t *testing.T) {
 	recorder := &record.FakeRecorder{}
-	logger := NewBKELogger(zap.NewNop().Sugar(), recorder, nil)
+	logger := NewBKELogger(nil, recorder, nil)
 
 	logger.Info(testReason, testMsg)
 }
 
 func TestBKELoggerInfoWithArgs(t *testing.T) {
 	recorder := &record.FakeRecorder{}
-	logger := NewBKELogger(zap.NewNop().Sugar(), recorder, nil)
+	logger := NewBKELogger(nil, recorder, nil)
 
 	logger.Info(testReason, testMsg, "key", "value")
 }
 
 func TestBKELoggerError(t *testing.T) {
 	recorder := &record.FakeRecorder{}
-	logger := NewBKELogger(zap.NewNop().Sugar(), recorder, nil)
+	logger := NewBKELogger(nil, recorder, nil)
 
 	logger.Error(testReason, testMsg)
 }
 
 func TestBKELoggerErrorWithArgs(t *testing.T) {
 	recorder := &record.FakeRecorder{}
-	logger := NewBKELogger(zap.NewNop().Sugar(), recorder, nil)
+	logger := NewBKELogger(nil, recorder, nil)
 
 	logger.Error(testReason, testMsg, "key", "value")
 }
 
 func TestBKELoggerWarn(t *testing.T) {
 	recorder := &record.FakeRecorder{}
-	logger := NewBKELogger(zap.NewNop().Sugar(), recorder, nil)
+	logger := NewBKELogger(nil, recorder, nil)
 
 	logger.Warn(testReason, testMsg)
 }
 
 func TestBKELoggerWarnWithArgs(t *testing.T) {
 	recorder := &record.FakeRecorder{}
-	logger := NewBKELogger(zap.NewNop().Sugar(), recorder, nil)
+	logger := NewBKELogger(nil, recorder, nil)
 
 	logger.Warn(testReason, testMsg, "key", "value")
 }
 
 func TestBKELoggerFinish(t *testing.T) {
 	recorder := &record.FakeRecorder{}
-	logger := NewBKELogger(zap.NewNop().Sugar(), recorder, nil)
+	logger := NewBKELogger(nil, recorder, nil)
 
 	logger.Finish(testReason, testMsg)
 }
 
 func TestBKELoggerFinishWithArgs(t *testing.T) {
 	recorder := &record.FakeRecorder{}
-	logger := NewBKELogger(zap.NewNop().Sugar(), recorder, nil)
+	logger := NewBKELogger(nil, recorder, nil)
 
 	logger.Finish(testReason, testMsg, "key", "value")
 }
 
 func TestBKELoggerDebug(t *testing.T) {
 	recorder := &record.FakeRecorder{}
-	zapLogger := zap.NewNop()
-	logger := NewBKELogger(zapLogger.Sugar(), recorder, nil)
+	logger := NewBKELogger(nil, recorder, nil)
 
 	logger.Debug(testMsg)
 }
 
 func TestBKELoggerDebugWithArgs(t *testing.T) {
 	recorder := &record.FakeRecorder{}
-	zapLogger := zap.NewNop()
-	logger := NewBKELogger(zapLogger.Sugar(), recorder, nil)
+	logger := NewBKELogger(nil, recorder, nil)
 
-	logger.Debug(testMsg, "key", "value")
+	logger.Debug(testMsg + " key=value")
 }
 
 func TestClusterConditionConstants(t *testing.T) {
@@ -405,11 +403,5 @@ func TestClusterFinalizer(t *testing.T) {
 func TestExpectMinK8sVersion(t *testing.T) {
 	if ExpectMinK8sVersion.Major == numZero && ExpectMinK8sVersion.Minor == numZero {
 		t.Error("ExpectMinK8sVersion should have valid version")
-	}
-}
-
-func TestExpectMaxK8sVersion(t *testing.T) {
-	if ExpectMaxK8sVersion.Major == numZero && ExpectMaxK8sVersion.Minor == numZero {
-		t.Error("ExpectMaxK8sVersion should have valid version")
 	}
 }

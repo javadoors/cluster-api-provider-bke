@@ -19,7 +19,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/util/json"
 
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 const (

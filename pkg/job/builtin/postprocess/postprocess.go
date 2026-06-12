@@ -28,10 +28,11 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job/builtin/plugin"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job/builtin/scriptutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 const Name = "Postprocess"
+
 var scriptStoreDir = filepath.Join(utils.AgentScripts, "postprocess")
 
 // PostprocessPlugin 后置处理脚本执行器
@@ -325,7 +326,7 @@ func (p *PostprocessPlugin) isValidParamName(name string) bool {
 	pattern := `^[a-zA-Z_][a-zA-Z0-9_]*$`
 	matched, err := regexp.MatchString(pattern, name)
 	if err != nil {
-		log.Warnf("ERROR: 正则表达式匹配参数名失败，pattern: %s, paramName: %s, error: %v", pattern, name, err)
+		log.Warnf("Regex matching parameter name failed, pattern: %s, paramName: %s, error: %v", pattern, name, err)
 		return false
 	}
 	return matched

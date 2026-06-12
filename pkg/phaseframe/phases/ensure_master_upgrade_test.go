@@ -14,10 +14,12 @@ package phases
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -33,12 +35,21 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/mergecluster"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/upgrade"
 )
 
 func TestEnsureMasterUpgradeConstants(t *testing.T) {
 	assert.Equal(t, "EnsureMasterUpgrade", string(EnsureMasterUpgradeName))
 	assert.Equal(t, 2, MasterUpgradePollIntervalSeconds)
 	assert.Equal(t, 5, MasterUpgradeTimeoutMinutes)
+}
+
+// patchGetTargetClusterClientUnavailable mocks remote client lookup for unit tests that
+// call kubeproxy helper methods without a real CAPI Cluster owner.
+func patchGetTargetClusterClientUnavailable(patches *gomonkey.Patches) {
+	patches.ApplyFunc(kube.GetTargetClusterClient, func(ctx context.Context, cli client.Client, cluster *bkev1beta1.BKECluster) (*kubernetes.Clientset, interface{}, error) {
+		return nil, nil, errors.New("target cluster client unavailable in test")
+	})
 }
 
 func TestNewEnsureMasterUpgrade(t *testing.T) {
@@ -193,18 +204,9 @@ func TestEnsureMasterUpgrade_NeedExecute_UnknownCluster(t *testing.T) {
 }
 
 func TestEnsureMasterUpgrade_NeedExecute_NoUpgradeNodes(t *testing.T) {
-	patches := gomonkey.NewPatches()
-	defer patches.Reset()
-
 	scheme := runtime.NewScheme()
 	_ = bkev1beta1.AddToScheme(scheme)
-	bkeCluster := &bkev1beta1.BKECluster{
-		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
-		Spec: confv1beta1.BKEClusterSpec{
-			ClusterConfig: &confv1beta1.BKEConfig{},
-		},
-		Status: confv1beta1.BKEClusterStatus{},
-	}
+	bkeCluster := masterUpgradeTestCluster("v1.28.0", "v1.28.0")
 	c := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(bkeCluster).Build()
 	ctx := &phaseframe.PhaseContext{
 		Context:    context.Background(),
@@ -213,14 +215,6 @@ func TestEnsureMasterUpgrade_NeedExecute_NoUpgradeNodes(t *testing.T) {
 		Scheme:     scheme,
 		Log:        bkev1beta1.NewBKELogger(nil, &fakeRecorder{}, bkeCluster),
 	}
-
-	patches.ApplyFunc(fetchBKENodesIfCPInitialized, func(ctx *phaseframe.PhaseContext, cluster *bkev1beta1.BKECluster) (bkev1beta1.BKENodes, bool) {
-		return bkev1beta1.BKENodes{}, true
-	})
-
-	patches.ApplyFunc(phaseutil.GetNeedUpgradeMasterNodesWithBKENodes, func(cluster *bkev1beta1.BKECluster, nodes bkev1beta1.BKENodes) bkenode.Nodes {
-		return bkenode.Nodes{}
-	})
 
 	phase := NewEnsureMasterUpgrade(ctx)
 	e := phase.(*EnsureMasterUpgrade)
@@ -236,13 +230,7 @@ func TestEnsureMasterUpgrade_NeedExecute_WithUpgradeNodes(t *testing.T) {
 
 	scheme := runtime.NewScheme()
 	_ = bkev1beta1.AddToScheme(scheme)
-	bkeCluster := &bkev1beta1.BKECluster{
-		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
-		Spec: confv1beta1.BKEClusterSpec{
-			ClusterConfig: &confv1beta1.BKEConfig{},
-		},
-		Status: confv1beta1.BKEClusterStatus{},
-	}
+	bkeCluster := masterUpgradeTestCluster("v1.29.0", "v1.28.0")
 	c := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(bkeCluster).Build()
 	ctx := &phaseframe.PhaseContext{
 		Context:    context.Background(),
@@ -299,6 +287,93 @@ func TestEnsureMasterUpgrade_ReconcileMasterUpgrade_VersionSame(t *testing.T) {
 	result, err := e.reconcileMasterUpgrade()
 	assert.NoError(t, err)
 	assert.Equal(t, ctrl.Result{}, result)
+}
+
+func TestEnsureMasterUpgradeDesiredKubernetesVersion_PrefersVersionContext(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = bkev1beta1.AddToScheme(scheme)
+	bkeCluster := &bkev1beta1.BKECluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+		Spec: confv1beta1.BKEClusterSpec{
+			ClusterConfig: &confv1beta1.BKEConfig{
+				Cluster: confv1beta1.Cluster{KubernetesVersion: "v1.33.0"},
+			},
+		},
+		Status: confv1beta1.BKEClusterStatus{KubernetesVersion: "v1.33.0"},
+	}
+	vc := upgrade.NewVersionContext()
+	vc.SetCurrent(upgrade.ComponentKubernetesMaster, "v1.33.0")
+	vc.SetTarget(upgrade.ComponentKubernetesMaster, "v1.34.1")
+	ctx := &phaseframe.PhaseContext{
+		Context:        context.Background(),
+		BKECluster:     bkeCluster,
+		Scheme:         scheme,
+		Log:            bkev1beta1.NewBKELogger(nil, &fakeRecorder{}, bkeCluster),
+		VersionContext: vc,
+	}
+
+	e := NewEnsureMasterUpgrade(ctx).(*EnsureMasterUpgrade)
+	assert.Equal(t, "v1.34.1", e.desiredKubernetesVersion())
+	assert.Equal(t, "v1.33.0", e.currentKubernetesVersion())
+}
+
+func TestEnsureMasterUpgradeSyncLegacyTargetKubernetesVersion(t *testing.T) {
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+
+	scheme := runtime.NewScheme()
+	_ = bkev1beta1.AddToScheme(scheme)
+	bkeCluster := &bkev1beta1.BKECluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+		Spec: confv1beta1.BKEClusterSpec{
+			ClusterConfig: &confv1beta1.BKEConfig{
+				Cluster: confv1beta1.Cluster{KubernetesVersion: "v1.33.0"},
+			},
+		},
+	}
+	ctx := &phaseframe.PhaseContext{
+		Context:    context.Background(),
+		BKECluster: bkeCluster,
+		Client:     fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(bkeCluster).Build(),
+		Scheme:     scheme,
+		Log:        bkev1beta1.NewBKELogger(nil, &fakeRecorder{}, bkeCluster),
+	}
+
+	patches.ApplyFunc(mergecluster.SyncStatusUntilComplete, func(_ client.Client, bc *bkev1beta1.BKECluster, patchs ...mergecluster.PatchFunc) error {
+		for _, patch := range patchs {
+			patch(bc)
+		}
+		return nil
+	})
+
+	e := NewEnsureMasterUpgrade(ctx).(*EnsureMasterUpgrade)
+	require.NoError(t, e.syncLegacyTargetKubernetesVersion("v1.34.1"))
+	assert.Equal(t, "v1.34.1", bkeCluster.Spec.ClusterConfig.Cluster.KubernetesVersion)
+}
+
+func TestEnsureMasterUpgradeReconcileMasterUpgradeUsesVersionContext(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = bkev1beta1.AddToScheme(scheme)
+	bkeCluster := &bkev1beta1.BKECluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+		Status: confv1beta1.BKEClusterStatus{KubernetesVersion: "v1.33.0"},
+	}
+	vc := upgrade.NewVersionContext()
+	vc.SetCurrent(upgrade.ComponentKubernetesMaster, "v1.33.0")
+	vc.SetTarget(upgrade.ComponentKubernetesMaster, "v1.34.1")
+	ctx := &phaseframe.PhaseContext{
+		Context:        context.Background(),
+		BKECluster:     bkeCluster,
+		Client:         fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(bkeCluster).Build(),
+		Scheme:         scheme,
+		Log:            bkev1beta1.NewBKELogger(nil, &fakeRecorder{}, bkeCluster),
+		VersionContext: vc,
+	}
+
+	e := NewEnsureMasterUpgrade(ctx).(*EnsureMasterUpgrade)
+	_, err := e.reconcileMasterUpgrade()
+	require.Error(t, err)
+	assert.EqualError(t, err, "cluster config is nil")
 }
 
 func TestEnsureMasterUpgrade_Execute_WithAnnotation(t *testing.T) {
@@ -510,6 +585,10 @@ func TestEnsureMasterUpgrade_UpdateAddonVersions_NoUpgrade(t *testing.T) {
 				Cluster: confv1beta1.Cluster{
 					KubernetesVersion: "v1.28.0",
 				},
+				Addons: []confv1beta1.Product{
+					{Name: "kubeproxy", Version: "v1.28.0"},
+					{Name: "kubectl", Version: "v1.25"},
+				},
 			},
 		},
 	}
@@ -550,6 +629,7 @@ func TestEnsureMasterUpgrade_UpdateAddonVersions_KubectlNeedUpgrade(t *testing.T
 					KubernetesVersion: "v1.28.0",
 				},
 				Addons: []confv1beta1.Product{
+					{Name: "kubeproxy", Version: "v1.28.0"},
 					{Name: "kubectl", Version: "v1.24"},
 				},
 			},
@@ -591,7 +671,9 @@ func TestEnsureMasterUpgrade_UpdateAddonVersions_AddNewKubectl(t *testing.T) {
 				Cluster: confv1beta1.Cluster{
 					KubernetesVersion: "v1.28.0",
 				},
-				Addons: []confv1beta1.Product{},
+				Addons: []confv1beta1.Product{
+					{Name: "kubeproxy", Version: "v1.28.0"},
+				},
 			},
 		},
 	}
@@ -632,6 +714,7 @@ func TestEnsureMasterUpgrade_UpdateAddonVersions_SyncError(t *testing.T) {
 					KubernetesVersion: "v1.28.0",
 				},
 				Addons: []confv1beta1.Product{
+					{Name: "kubeproxy", Version: "v1.28.0"},
 					{Name: "kubectl", Version: "v1.24"},
 				},
 			},
@@ -1184,7 +1267,6 @@ func TestEnsureMasterUpgrade_UpgradeKubeProxy_GetClientError(t *testing.T) {
 	c := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(bkeCluster).Build()
 	log := bkev1beta1.NewBKELogger(nil, &fakeRecorder{}, bkeCluster)
 
-	// Mock GetTargetClusterClient to return error
 	patches.ApplyFunc(kube.GetTargetClusterClient, func(ctx context.Context, cli client.Client, cluster *bkev1beta1.BKECluster) (*kubernetes.Clientset, interface{}, error) {
 		return nil, nil, assert.AnError
 	})
@@ -1204,7 +1286,3 @@ func TestEnsureMasterUpgrade_UpgradeKubeProxy_GetClientError(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func TestEnsureMasterUpgrade_UpdateAddonVersions_KubeproxyAndKubectlBothNeedUpgrade(t *testing.T) {
-	// This test requires complex mocking of private methods which gomonkey cannot handle
-	t.Skip("Skipping test - gomonkey cannot mock private methods")
-}

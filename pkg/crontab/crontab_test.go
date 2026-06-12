@@ -21,14 +21,11 @@ import (
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/robfig/cron/v3"
 	"github.com/stretchr/testify/assert"
-	"go.uber.org/zap"
 
 	bkentp "gopkg.openfuyao.cn/cluster-api-provider-bke/common/ntp"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
 )
 
 func init() {
-	log.SetTestLogger(zap.NewNop().Sugar())
 }
 
 const (

@@ -25,18 +25,11 @@ import (
 
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/stretchr/testify/assert"
-	"go.uber.org/zap"
 	"k8s.io/client-go/tools/clientcmd"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
-
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/log"
 )
 
-func init() {
-	if log.BkeLogger == nil {
-		log.BkeLogger = zap.NewNop().Sugar()
-	}
-}
+func init() {}
 
 const (
 	numZero        = 0
@@ -303,7 +296,6 @@ func TestPrepareBkeagentServiceTemplateParseError(t *testing.T) {
 	bkeagentServiceSrc = originalSrc
 }
 
-
 func TestPrepareKubeconfigCopyFileError(t *testing.T) {
 	tmpDir := t.TempDir()
 	originalKubeconfigSrc := kubeconfigSrc
@@ -466,13 +458,16 @@ func TestPrepareBkeagentServiceSuccess(t *testing.T) {
 
 func TestPrepareBkeagentServiceOpenError(t *testing.T) {
 	originalSrc := bkeagentServiceSrc
-	bkeagentServiceSrc = "/nonexistent/path/bkeagent.service"
+	defer func() {
+		bkeagentServiceSrc = originalSrc
+	}()
+	notDir := filepath.Join(t.TempDir(), "not-dir")
+	assert.NoError(t, os.WriteFile(notDir, []byte("file"), 0644))
+	bkeagentServiceSrc = filepath.Join(notDir, "bkeagent.service")
 
 	err := prepareBkeagentService()
 
 	assert.Error(t, err)
-
-	bkeagentServiceSrc = originalSrc
 }
 
 func TestPrepareKubeconfigSuccess(t *testing.T) {
@@ -610,13 +605,16 @@ func TestPrepareNodeFileSuccess(t *testing.T) {
 
 func TestPrepareNodeFileWriteError(t *testing.T) {
 	originalNodeSrc := nodeSrc
-	nodeSrc = "/nonexistent/node"
+	defer func() {
+		nodeSrc = originalNodeSrc
+	}()
+	notDir := filepath.Join(t.TempDir(), "not-dir")
+	assert.NoError(t, os.WriteFile(notDir, []byte("file"), 0644))
+	nodeSrc = filepath.Join(notDir, "node")
 
 	err := prepareNodeFile(testHostname)
 
 	assert.Error(t, err)
-
-	nodeSrc = originalNodeSrc
 }
 
 func TestStartPreStopBkeagentError(t *testing.T) {
@@ -632,44 +630,39 @@ func TestStartPreStopBkeagentError(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func TestStartPreGetHostnameError(t *testing.T) {
-	callCount := 0
-	patches := gomonkey.ApplyFunc(
+func TestStartPreResolveNodeNameError(t *testing.T) {
+	patches := gomonkey.ApplyFuncReturn(
 		executeCommand,
-		func(cmdStr string) (string, error) {
-			callCount++
-			if callCount == numOne {
-				return "", nil
-			}
-			return "", errors.New("hostname error")
-		},
+		"",
+		nil,
 	)
 	defer patches.Reset()
 
 	patches.ApplyFunc(
-		os.Exit,
-		func(code int) {
+		resolveNodeName,
+		func() (string, error) {
+			return "", errors.New("node name error")
 		},
 	)
 
 	err := startPre()
-
 	assert.Error(t, err)
 }
 
 func TestStartPrePrepareBkeagentBinaryError(t *testing.T) {
-	callCount := 0
-	patches := gomonkey.ApplyFunc(
+	patches := gomonkey.ApplyFuncReturn(
 		executeCommand,
-		func(cmdStr string) (string, error) {
-			callCount++
-			if callCount <= numTwo {
-				return "", nil
-			}
-			return "", errors.New("binary error")
-		},
+		"",
+		nil,
 	)
 	defer patches.Reset()
+
+	patches.ApplyFunc(
+		resolveNodeName,
+		func() (string, error) {
+			return testHostname, nil
+		},
+	)
 
 	patches.ApplyFunc(
 		prepareBkeagentBinary,
@@ -684,15 +677,19 @@ func TestStartPrePrepareBkeagentBinaryError(t *testing.T) {
 }
 
 func TestStartPreSuccess(t *testing.T) {
-	callCount := 0
-	patches := gomonkey.ApplyFunc(
+	patches := gomonkey.ApplyFuncReturn(
 		executeCommand,
-		func(cmdStr string) (string, error) {
-			callCount++
-			return "", nil
-		},
+		"",
+		nil,
 	)
 	defer patches.Reset()
+
+	patches.ApplyFunc(
+		resolveNodeName,
+		func() (string, error) {
+			return testHostname, nil
+		},
+	)
 
 	patches.ApplyFunc(
 		prepareBkeagentBinary,

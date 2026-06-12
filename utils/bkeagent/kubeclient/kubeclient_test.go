@@ -108,4 +108,3 @@ func TestNewClient_Success(t *testing.T) {
 		assert.NotNil(t, client.DynamicClient)
 	}
 }
-

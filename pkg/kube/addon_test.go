@@ -17,16 +17,8 @@ import (
 	"testing"
 	"time"
 
-
-
-
-
-
-
-
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/pkg/errors"
-	"go.uber.org/zap"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
 	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
@@ -828,9 +820,9 @@ func TestExtractFileBaseNames(t *testing.T) {
 		"/path/to/file2.yaml",
 		"file3.yaml",
 	}
-	
+
 	result := c.extractFileBaseNames(files)
-	
+
 	if len(result) != 3 {
 		t.Errorf("Expected 3 basenames, got %d", len(result))
 	}
@@ -913,9 +905,9 @@ func TestSetNTPServer(t *testing.T) {
 			NTPServer: "ntp.example.com",
 		},
 	}
-	
+
 	setNTPServer(&param, bkeConfig)
-	
+
 	if param["ntpServer"] != "ntp.example.com" {
 		t.Errorf("Expected ntpServer='ntp.example.com', got %v", param["ntpServer"])
 	}
@@ -1010,11 +1002,101 @@ func TestSetK8sVersion(t *testing.T) {
 			KubernetesVersion: "v1.21.0",
 		},
 	}
-	
+
 	setK8sVersion(&param, bkeConfig)
-	
+
 	if param["k8sVersion"] != "v1.21.0" {
 		t.Errorf("Expected k8sVersion='v1.21.0', got %v", param["k8sVersion"])
+	}
+}
+
+func TestSetEtcdVersion(t *testing.T) {
+	tests := []struct {
+		name      string
+		bkeConfig bkeinit.BkeConfig
+		wantSet   bool
+		wantValue string
+	}{
+		{
+			name: "set etcd version when not empty",
+			bkeConfig: bkeinit.BkeConfig{
+				Cluster: confv1beta1.Cluster{
+					EtcdVersion: "v3.5.13",
+				},
+			},
+			wantSet:   true,
+			wantValue: "v3.5.13",
+		},
+		{
+			name: "do not set etcd version when empty",
+			bkeConfig: bkeinit.BkeConfig{
+				Cluster: confv1beta1.Cluster{
+					EtcdVersion: "",
+				},
+			},
+			wantSet: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			param := make(map[string]interface{})
+			setEtcdVersion(&param, tt.bkeConfig)
+
+			value, exists := param["etcdVersion"]
+			if exists != tt.wantSet {
+				t.Errorf("etcdVersion exists = %v, want %v", exists, tt.wantSet)
+				return
+			}
+			if tt.wantSet && value != tt.wantValue {
+				t.Errorf("Expected etcdVersion='%s', got %v", tt.wantValue, value)
+			}
+		})
+	}
+}
+
+func TestSetContainerdVersion(t *testing.T) {
+	tests := []struct {
+		name      string
+		bkeConfig bkeinit.BkeConfig
+		wantSet   bool
+		wantValue string
+	}{
+		{
+			name: "set containerd version when not empty",
+			bkeConfig: bkeinit.BkeConfig{
+				Cluster: confv1beta1.Cluster{
+					ContainerdVersion: "1.7.20",
+				},
+			},
+			wantSet:   true,
+			wantValue: "1.7.20",
+		},
+		{
+			name: "do not set containerd version when empty",
+			bkeConfig: bkeinit.BkeConfig{
+				Cluster: confv1beta1.Cluster{
+					ContainerdVersion: "",
+				},
+			},
+			wantSet: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			param := make(map[string]interface{})
+			setContainerdVersion(&param, tt.bkeConfig)
+
+			value, exists := param["containerdVersion"]
+			if exists != tt.wantSet {
+				t.Errorf("containerdVersion exists = %v, want %v", exists, tt.wantSet)
+				return
+			}
+			if tt.wantSet && value != tt.wantValue {
+				t.Errorf("Expected containerdVersion='%s', got %v", tt.wantValue, value)
+			}
+		})
 	}
 }
 
@@ -1090,9 +1172,9 @@ func TestSetDockerDataRoot(t *testing.T) {
 			},
 		},
 	}
-	
+
 	setDockerDataRoot(&param, bkeConfig)
-	
+
 	if param["dockerDataRoot"] != "/var/lib/docker" {
 		t.Errorf("Expected dockerDataRoot='/var/lib/docker', got %v", param["dockerDataRoot"])
 	}
@@ -1218,12 +1300,12 @@ func TestGetAddonYamlFiles(t *testing.T) {
 		Name:    "test-addon",
 		Version: "v1.0.0",
 	}
-	
+
 	patches := gomonkey.ApplyFunc(os.Stat, func(name string) (os.FileInfo, error) {
 		return nil, os.ErrNotExist
 	})
 	defer patches.Reset()
-	
+
 	_, err := c.getAddonYamlFiles(addon)
 	if err == nil {
 		t.Error("Expected error for non-existent addon dir")
@@ -1246,9 +1328,9 @@ func TestCreateAddonTask(t *testing.T) {
 		repo:          "test-repo",
 		addonRecorder: &AddonRecorder{},
 	}
-	
+
 	task := c.createAddonTask(config, "file1", "/path/to/file1.yaml")
-	
+
 	if task.Name != "test-addon" {
 		t.Errorf("Expected task name 'test-addon', got %s", task.Name)
 	}
@@ -1276,9 +1358,9 @@ func TestCreateAddonTaskBocOperator(t *testing.T) {
 		repo:          "test-repo",
 		addonRecorder: &AddonRecorder{},
 	}
-	
+
 	task := c.createAddonTask(config, "file1", "/path/to/file1.yaml")
-	
+
 	if task.Timeout != bocOperatorTimeoutMinutes*time.Minute {
 		t.Errorf("Expected timeout %v, got %v", bocOperatorTimeoutMinutes*time.Minute, task.Timeout)
 	}
@@ -1288,7 +1370,7 @@ func TestCreateAddonTaskBocOperator(t *testing.T) {
 }
 
 func TestHandleApplyErrorRemoveAddon(t *testing.T) {
-	c := &Client{Log: zap.NewNop().Sugar()}
+	c := &Client{Log: nil}
 	addon := &confv1beta1.Product{Name: "test", Version: "v1"}
 	err := c.handleApplyError(errors.New("test error"), addon, "/path/file.yaml", bkeaddon.RemoveAddon)
 	if err != nil {
@@ -1297,7 +1379,7 @@ func TestHandleApplyErrorRemoveAddon(t *testing.T) {
 }
 
 func TestHandleApplyErrorCreateAddon(t *testing.T) {
-	c := &Client{Log: zap.NewNop().Sugar()}
+	c := &Client{Log: nil}
 	addon := &confv1beta1.Product{Name: "test", Version: "v1"}
 	err := c.handleApplyError(errors.New("test error"), addon, "/path/file.yaml", bkeaddon.CreateAddon)
 	if err == nil {
@@ -1306,7 +1388,7 @@ func TestHandleApplyErrorCreateAddon(t *testing.T) {
 }
 
 func TestHandleApplyErrorNoMatchError(t *testing.T) {
-	c := &Client{Log: zap.NewNop().Sugar()}
+	c := &Client{Log: nil}
 	addon := &confv1beta1.Product{Name: "test", Version: "v1"}
 
 	patches := gomonkey.ApplyFunc(os.Stat, func(name string) (os.FileInfo, error) {
@@ -1337,7 +1419,7 @@ func TestGetPortalK8sToken(t *testing.T) {
 		return "test-token", nil
 	})
 	defer patches.Reset()
-	
+
 	token, err := c.getPortalK8sToken()
 	if err != nil {
 		t.Errorf("Expected no error, got %v", err)

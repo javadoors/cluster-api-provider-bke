@@ -70,4 +70,3 @@ func TestNewSFTPClient_Mock(t *testing.T) {
 		t.Error("expected client to be alive")
 	}
 }
-

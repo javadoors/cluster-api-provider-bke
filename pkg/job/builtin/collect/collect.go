@@ -23,9 +23,9 @@ import (
 	edocker "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/executor/docker"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/executor/exec"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job/builtin/plugin"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/pkiutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/runtime"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 const (
@@ -285,6 +285,10 @@ func extractRootDirFromArgs(output string) string {
 }
 
 func (c *CollectPlugin) collectKubeletDataRootDir() string {
+	if c.exec == nil {
+		log.Warnf("executor is nil, use default kubelet root dir")
+		return bkeinit.DefaultKubeletRootDir
+	}
 	switch c.controllerRuntime {
 	case runtime.ContainerRuntimeDocker:
 		cmd := fmt.Sprintf("docker inspect kubelet --format '{{.Args}}'")

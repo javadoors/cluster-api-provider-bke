@@ -15,7 +15,7 @@ package version
 import (
 	"fmt"
 
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 var (
@@ -26,11 +26,10 @@ var (
 )
 
 func PrintVersion() {
-	fmt.Println(GitCommitID)
-	fmt.Println(fmt.Sprintf("🤯 Version: %s", Version))
-	fmt.Println(fmt.Sprintf("🤔 GitCommitId: %s ", GitCommitID))
-	fmt.Println(fmt.Sprintf("👉 Architecture: %s", Architecture))
-	fmt.Println(fmt.Sprintf("⏲ BuildTime: %s", BuildTime))
+	fmt.Printf("🤯 Version: %s\n", Version)
+	fmt.Printf("🤔 GitCommitId: %s\n", GitCommitID)
+	fmt.Printf("👉 Architecture: %s\n", Architecture)
+	fmt.Printf("⏲ BuildTime: %s\n", BuildTime)
 }
 
 func LogPrintVersion() {

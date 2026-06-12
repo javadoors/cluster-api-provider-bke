@@ -41,7 +41,7 @@ func getDeleteTargetNodesIfDeployed(ctx *phaseframe.PhaseContext, bkeCluster *bk
 	}
 	targetNodes, err := GetTargetClusterNodes(ctx.Context, ctx.Client, bkeCluster)
 	if err != nil {
-		ctx.Log.Debug("scale-in check", "Failed to get target cluster nodes: %v", err)
+		ctx.Log.Debug("scale-in check: Failed to get target cluster nodes: %v", err)
 		return nil, false
 	}
 	return targetNodes, true

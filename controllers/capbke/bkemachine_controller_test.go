@@ -21,7 +21,6 @@ import (
 
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/stretchr/testify/assert"
-	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -40,6 +39,7 @@ import (
 	phaseframe "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phases"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/label"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/nodeutil"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 const (
@@ -87,10 +87,9 @@ func newMachineReconciler(objs ...client.Object) *BKEMachineReconciler {
 	}
 }
 
-// newMachineLogger creates a zap SugaredLogger for testing
-func newMachineLogger() *zap.SugaredLogger {
-	logger, _ := zap.NewDevelopment()
-	return logger.Sugar()
+// newMachineLogger creates a logger for testing
+func newMachineLogger() *log.Logger {
+	return nil
 }
 
 // --- isMarkDeletion ---

@@ -25,7 +25,6 @@ import (
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.uber.org/zap"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -33,12 +32,10 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/testutils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/option"
 )
 
 func init() {
-	log.SetTestLogger(zap.NewNop().Sugar())
 }
 
 func TestParseFlags(t *testing.T) {

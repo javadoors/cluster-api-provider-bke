@@ -82,6 +82,176 @@ type ClusterConditionType string
 
 type ConditionStatus string
 
+// DeclarativeUpgradeStatus persists declarative upgrade progress across controller restarts.
+type DeclarativeUpgradeStatus struct {
+	// TargetVersion is the desired ClusterVersion for this upgrade execution plan.
+	// When it changes, Completed should be reset.
+	// +optional
+	TargetVersion string `json:"targetVersion,omitempty"`
+
+	// StartedAt marks the first time we initialized progress for TargetVersion.
+	// +optional
+	StartedAt *metav1.Time `json:"startedAt,omitempty"`
+
+	// FinishedAt marks when the upgrade plan completed successfully.
+	// +optional
+	FinishedAt *metav1.Time `json:"finishedAt,omitempty"`
+
+	// LastError records the last observed error during DAG execution for this TargetVersion.
+	// +optional
+	LastError string `json:"lastError,omitempty"`
+
+	// LastFailure records the last failed component for this TargetVersion, for easier debugging.
+	// It must NOT be used for skip decisions.
+	// +optional
+	LastFailure *DeclarativeUpgradeFailureRecord `json:"lastFailure,omitempty"`
+
+	// Completed holds component completion records for this TargetVersion.
+	// +optional
+	Completed []DeclarativeUpgradeComponentRecord `json:"completed,omitempty"`
+}
+
+type DeclarativeUpgradeComponentRecord struct {
+	// Name is the declarative upgrade component name (DAG node name).
+	// +required
+	Name string `json:"name"`
+	// Version is the component version key used in the DAG node.
+	// +optional
+	Version string `json:"version,omitempty"`
+	// CompletedAt is the time the component finished successfully.
+	// +required
+	CompletedAt metav1.Time `json:"completedAt"`
+}
+
+// DeclarativeUpgradeFailureRecord records last failure info for a declarative upgrade component.
+type DeclarativeUpgradeFailureRecord struct {
+	// Name is the declarative upgrade component name (DAG node name).
+	// +required
+	Name string `json:"name"`
+	// Version is the component version key used in the DAG node.
+	// +optional
+	Version string `json:"version,omitempty"`
+	// FailedAt is the time the component execution failed.
+	// +required
+	FailedAt metav1.Time `json:"failedAt"`
+	// Error is a short error message for the failure.
+	// +optional
+	Error string `json:"error,omitempty"`
+	// Attempt is a best-effort counter for consecutive failures of the same component+version.
+	// +optional
+	Attempt int32 `json:"attempt,omitempty"`
+}
+
+// ResetForTarget resets upgrade progress when the target version changes.
+// It also clears FinishedAt and LastError.
+func (s *DeclarativeUpgradeStatus) ResetForTarget(targetVersion string, now metav1.Time) {
+	if s == nil {
+		return
+	}
+	s.TargetVersion = targetVersion
+	s.StartedAt = &now
+	s.FinishedAt = nil
+	s.LastError = ""
+	s.LastFailure = nil
+	s.Completed = nil
+}
+
+// EnsureInitialized ensures the declarative upgrade status is present and aligned to targetVersion.
+// It returns true when a reset was performed (i.e. target changed or status missing).
+func (s *DeclarativeUpgradeStatus) EnsureInitialized(targetVersion string, now metav1.Time) bool {
+	if s == nil {
+		return true
+	}
+	if s.TargetVersion != targetVersion {
+		s.ResetForTarget(targetVersion, now)
+		return true
+	}
+	if s.StartedAt == nil {
+		s.StartedAt = &now
+	}
+	// New execution of same target should clear FinishedAt.
+	if s.FinishedAt != nil {
+		s.FinishedAt = nil
+	}
+	return false
+}
+
+func normalizeUpgradeComponentVersion(version string) string {
+	if version == "" {
+		return defaultComponentVersion
+	}
+	return version
+}
+
+// NOTE: Keep this constant in sync with DAG executor default.
+const defaultComponentVersion = "v1.0.0"
+
+// IsCompleted returns true when a component+version has already completed for current TargetVersion.
+func (s *DeclarativeUpgradeStatus) IsCompleted(name, version string) bool {
+	if s == nil {
+		return false
+	}
+	version = normalizeUpgradeComponentVersion(version)
+	for i := range s.Completed {
+		rec := s.Completed[i]
+		if rec.Name != name {
+			continue
+		}
+		if normalizeUpgradeComponentVersion(rec.Version) == version {
+			return true
+		}
+	}
+	return false
+}
+
+// MarkCompleted records a completion for the component+version if not already present.
+func (s *DeclarativeUpgradeStatus) MarkCompleted(name, version string, now metav1.Time) {
+	if s == nil {
+		return
+	}
+	version = normalizeUpgradeComponentVersion(version)
+	if s.IsCompleted(name, version) {
+		return
+	}
+	s.Completed = append(s.Completed, DeclarativeUpgradeComponentRecord{
+		Name:        name,
+		Version:     version,
+		CompletedAt: now,
+	})
+}
+
+// MarkFailure updates LastFailure and LastError for debugging.
+// Attempt is increased only when the same component+version fails consecutively.
+func (s *DeclarativeUpgradeStatus) MarkFailure(name, version, errMsg string, now metav1.Time) {
+	if s == nil {
+		return
+	}
+	version = normalizeUpgradeComponentVersion(version)
+	var attempt int32 = 1
+	if s.LastFailure != nil &&
+		s.LastFailure.Name == name &&
+		normalizeUpgradeComponentVersion(s.LastFailure.Version) == version {
+		if s.LastFailure.Attempt > 0 {
+			attempt = s.LastFailure.Attempt + 1
+		}
+	}
+	s.LastFailure = &DeclarativeUpgradeFailureRecord{
+		Name:     name,
+		Version:  version,
+		FailedAt: now,
+		Error:    errMsg,
+		Attempt:  attempt,
+	}
+	s.LastError = errMsg
+}
+
+func (s *DeclarativeUpgradeStatus) ClearFailure() {
+	if s == nil {
+		return
+	}
+	s.LastFailure = nil
+}
+
 // BKEClusterStatus defines the observed state of BKECluster
 type BKEClusterStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
@@ -126,6 +296,10 @@ type BKEClusterStatus struct {
 	// +kubebuilder:object:generate:=true
 	// +optional
 	Conditions ClusterConditions `json:"conditions,omitempty"`
+
+	// DeclarativeUpgrade holds progress for declarative DAG upgrades.
+	// +optional
+	DeclarativeUpgrade *DeclarativeUpgradeStatus `json:"declarativeUpgrade,omitempty"`
 }
 
 // +kubebuilder:object:generate=true

@@ -31,7 +31,7 @@ import (
 	"syscall"
 	"time"
 
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 // Executor is the main interface for all the exec commands
@@ -364,7 +364,7 @@ func runCommandWithOutput(cmd *exec.Cmd, combinedOutput bool) (string, error) {
 }
 
 func logCommand(command string, arg ...string) {
-	log.Infof("Running command: %s %s", command, strings.Join(arg, " "))
+	log.Debugf("Running command: %s %s", command, strings.Join(arg, " "))
 }
 
 func assertErrorType(err error) string {

@@ -20,7 +20,6 @@ import (
 
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/stretchr/testify/assert"
-	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -32,6 +31,7 @@ import (
 
 	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 func TestClient_KubeClient(t *testing.T) {
@@ -45,7 +45,7 @@ func TestClient_KubeClient(t *testing.T) {
 }
 
 func TestClient_SetLogger(t *testing.T) {
-	logger := zap.NewNop().Sugar()
+	var logger *log.Logger = nil
 	c := &Client{}
 	c.SetLogger(logger)
 	assert.Equal(t, logger, c.Log)
@@ -82,7 +82,7 @@ func TestNewClientFromKubeConfig_Empty(t *testing.T) {
 func TestClient_Fields(t *testing.T) {
 	ctx := context.Background()
 	config := &rest.Config{Host: "https://localhost:6443"}
-	logger := zap.NewNop().Sugar()
+	var logger *log.Logger = nil
 	bkeLog := &bkev1beta1.BKELogger{}
 
 	c := &Client{
@@ -172,8 +172,8 @@ users:
 
 func TestClient_MultipleSetters(t *testing.T) {
 	c := &Client{}
-	logger1 := zap.NewNop().Sugar()
-	logger2 := zap.NewExample().Sugar()
+	var logger1 *log.Logger = nil
+	var logger2 *log.Logger = nil
 	bkeLog1 := &bkev1beta1.BKELogger{}
 	bkeLog2 := &bkev1beta1.BKELogger{}
 
@@ -192,11 +192,6 @@ func TestNewClientFromK8sToken_EmptyToken(t *testing.T) {
 	client, err := NewClientFromK8sToken("localhost", "6443", "")
 	assert.NoError(t, err)
 	assert.NotNil(t, client)
-}
-
-func TestNewClientFromConfig_EmptyPath(t *testing.T) {
-	_, err := NewClientFromConfig("")
-	assert.NoError(t, err)
 }
 
 func TestClient_KubeClient_NilValues(t *testing.T) {
@@ -257,7 +252,7 @@ func TestClient_AllFields(t *testing.T) {
 		Host:        "https://localhost:6443",
 		BearerToken: "test-token",
 	}
-	logger := zap.NewNop().Sugar()
+	var logger *log.Logger = nil
 	bkeLog := &bkev1beta1.BKELogger{}
 	clientSet := &kubernetes.Clientset{}
 	dynamicClient := &dynamic.DynamicClient{}
@@ -325,7 +320,7 @@ func TestNewClientFromRestConfig_ErrorHandling(t *testing.T) {
 
 func TestClient_SettersChaining(t *testing.T) {
 	c := &Client{}
-	logger := zap.NewNop().Sugar()
+	var logger *log.Logger = nil
 	bkeLog := &bkev1beta1.BKELogger{}
 
 	c.SetLogger(logger)

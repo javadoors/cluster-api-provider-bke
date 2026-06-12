@@ -19,7 +19,7 @@ import (
 	bkentp "gopkg.openfuyao.cn/cluster-api-provider-bke/common/ntp"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/crontab"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 // syncTime sync time with ntp, and set a coron job.

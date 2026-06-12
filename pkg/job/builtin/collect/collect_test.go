@@ -19,12 +19,13 @@ import (
 
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/stretchr/testify/assert"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/initialize"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/executor/containerd"
 	edocker "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/executor/docker"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/pkiutil"
 	rt "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 type mockExecutor struct {

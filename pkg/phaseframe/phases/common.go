@@ -32,8 +32,8 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/constant"
 	labelhelper "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/label"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/log"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/nodeutil"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 // ProcessNodeMachineMappingResult 包含节点机器映射处理的结果
@@ -62,7 +62,6 @@ func ProcessNodeMachineMapping(params ProcessNodeMachineMappingParams) (ProcessN
 	c := params.Client
 	bkeCluster := params.BKECluster
 	nodes := params.Nodes
-	log := params.Log
 	var nodesInfos []string
 	nodesCount := 0
 	// machineName -> machineAndNode
@@ -70,15 +69,17 @@ func ProcessNodeMachineMapping(params ProcessNodeMachineMappingParams) (ProcessN
 	machineToNodeWaitDeleteMap := make(map[string]phaseutil.MachineAndNode)
 
 	// 遍历所有需要删除的节点，如果节点已经被删除了，需要从status中删除
-	log.Debug("get associated machine for nodes, to avoid duplicate deletion")
+	params.Log.Debug("get associated machine for nodes, to avoid duplicate deletion")
 	for _, node := range nodes {
 		// 正常应该是能够找到machine的，如果找不到，说明节点已经被删除了，需要从status中删除
 		if machine, err := phaseutil.NodeToMachine(ctx, c, bkeCluster, node); err != nil {
-			log.Warn(params.NodeDeletedReason, "Node %s has not been associated with a Machine, skip delete it", phaseutil.NodeInfo(node))
+			params.Log.Warn(params.NodeDeletedReason,
+				"Node %s has not been associated with a Machine, skip delete it",
+				phaseutil.NodeInfo(node))
 			// 如果节点已经在status中，但是没有关联machine，需要从status中删除
 			if params.NodeFetcher != nil {
 				if err := params.NodeFetcher.DeleteBKENodeForCluster(ctx, bkeCluster, node.IP); err != nil {
-					log.Warn(params.NodeDeletedReason, "Delete BKENode for %s failed, err: %v", node.IP, err)
+					params.Log.Warn(params.NodeDeletedReason, "Delete BKENode for %s failed, err: %v", node.IP, err)
 				}
 			}
 			// 将节点从状态管理器中删除
@@ -88,17 +89,17 @@ func ProcessNodeMachineMapping(params ProcessNodeMachineMappingParams) (ProcessN
 				phaseutil.RemoveAppointmentDeletedNodes(cluster, node.IP)
 			}
 			if err = mergecluster.SyncStatusUntilComplete(c, bkeCluster, patchFunc); err != nil {
-				log.Error(params.NodeJoinedReason, "Sync status failed. err: %v", err)
+				params.Log.Error(params.NodeJoinedReason, "Sync status failed. err: %v", err)
 				return ProcessNodeMachineMappingResult{}, err
 			}
 		} else {
 			if machine.Status.Phase == string(clusterv1.MachinePhaseDeleting) {
-				log.Info(params.NodeDeletedReason, "node %s is in deleting phase, skip delete it", phaseutil.NodeInfo(node))
+				params.Log.Info(params.NodeDeletedReason, "node %s is in deleting phase, skip delete it", phaseutil.NodeInfo(node))
 				machineToNodeWaitDeleteMap[machine.Name] = phaseutil.MachineAndNode{Machine: machine, Node: node}
 				continue
 			}
 			if machine.Status.Phase == string(clusterv1.MachinePhaseDeleted) {
-				log.Info(params.NodeDeletedReason, "node %s is in deleted phase, skip delete it", phaseutil.NodeInfo(node))
+				params.Log.Info(params.NodeDeletedReason, "node %s is in deleted phase, skip delete it", phaseutil.NodeInfo(node))
 				continue
 			}
 			nodesInfos = append(nodesInfos, phaseutil.NodeInfo(node))

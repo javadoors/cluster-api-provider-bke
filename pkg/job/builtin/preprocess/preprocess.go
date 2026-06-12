@@ -27,7 +27,7 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job/builtin/plugin"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job/builtin/scriptutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 const Name = "Preprocess"
@@ -335,7 +335,7 @@ func (p *PreprocessPlugin) isValidParamName(name string) bool {
 	matched, err := regexp.MatchString(pattern, name)
 
 	if err != nil {
-		log.Warnf("ERROR: 正则表达式匹配参数名失败，pattern: %s, paramName: %s, error: %v", pattern, name, err)
+		log.Warnf("Regex matching parameter name failed, pattern: %s, paramName: %s, error: %v", pattern, name, err)
 		return false
 	}
 

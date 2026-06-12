@@ -21,7 +21,6 @@ import (
 	"github.com/agiledragon/gomonkey/v2"
 	gosftp "github.com/pkg/sftp"
 	gossh "golang.org/x/crypto/ssh"
-	"go.uber.org/zap"
 )
 
 func TestMultiCli_RegisterHosts_Mock(t *testing.T) {
@@ -30,7 +29,7 @@ func TestMultiCli_RegisterHosts_Mock(t *testing.T) {
 			host:       h,
 			SshClient:  &Ssh{sshClient: &gossh.Client{}, alive: true},
 			SftpClient: &Sftp{sftpClient: &gosftp.Client{}, alive: true},
-			log:        zap.NewNop().Sugar(),
+			log:        nil,
 		}, nil
 	})
 	defer patches.Reset()
@@ -50,4 +49,3 @@ func TestMultiCli_RegisterHosts_Mock(t *testing.T) {
 		t.Errorf("expected 1 remote, got %d", len(mc.remotes))
 	}
 }
-

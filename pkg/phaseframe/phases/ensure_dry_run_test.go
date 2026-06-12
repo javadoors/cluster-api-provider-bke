@@ -1,8 +1,8 @@
 /******************************************************************
- * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -38,18 +38,36 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/nodeutil"
 )
 
+// RFC 5737 documentation addresses and RFC 2606 reserved names for unit tests (SCA-safe fixtures).
+const (
+	testDryRunNodeIP1          = "203.0.113.10"
+	testDryRunNodeIP2          = "203.0.113.11"
+	testDryRunControlPlaneHost = "203.0.113.100"
+	testDryRunNTPServer        = "ntp.invalid"
+)
+
+func newDryRunClusterWithNTP() *bkev1beta1.BKECluster {
+	return &bkev1beta1.BKECluster{
+		Spec: confv1beta1.BKEClusterSpec{
+			ClusterConfig: &confv1beta1.BKEConfig{
+				Cluster: confv1beta1.Cluster{NTPServer: testDryRunNTPServer},
+			},
+		},
+	}
+}
+
 func createTestEnsureDryRun() *EnsureDryRun {
 	logger := createTestLogger()
 	bkeCluster := &bkev1beta1.BKECluster{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-cluster",
-			Namespace: "default",
+			Name:      testClusterName,
+			Namespace: testNamespace,
 		},
 		Spec: confv1beta1.BKEClusterSpec{
 			DryRun: true,
 			ClusterConfig: &confv1beta1.BKEConfig{
 				Cluster: confv1beta1.Cluster{
-					NTPServer: "ntp.example.com",
+					NTPServer: testDryRunNTPServer,
 				},
 			},
 		},
@@ -77,7 +95,7 @@ func TestNewEnsureDryRun(t *testing.T) {
 		Context: context.Background(),
 		Client:  &fakeClient{},
 		BKECluster: &bkev1beta1.BKECluster{
-			ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+			ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: testNamespace},
 		},
 		Scheme: runtime.NewScheme(),
 		Log:    logger,
@@ -153,7 +171,7 @@ func TestEnsureDryRun_HandleDryRunDisabled_WithAnnotation(t *testing.T) {
 	bkeCluster := &bkev1beta1.BKECluster{
 		ObjectMeta: metav1.ObjectMeta{
 			Annotations: map[string]string{
-				annotation.BKEClusterDryRunAnnotationKey: "192.168.1.1,",
+				annotation.BKEClusterDryRunAnnotationKey: testDryRunNodeIP1 + ",",
 			},
 		},
 	}
@@ -187,7 +205,7 @@ func TestEnsureDryRun_HandleDryRunDisabled_SyncError(t *testing.T) {
 	bkeCluster := &bkev1beta1.BKECluster{
 		ObjectMeta: metav1.ObjectMeta{
 			Annotations: map[string]string{
-				annotation.BKEClusterDryRunAnnotationKey: "192.168.1.1,",
+				annotation.BKEClusterDryRunAnnotationKey: testDryRunNodeIP1 + ",",
 			},
 		},
 	}
@@ -200,7 +218,6 @@ func TestEnsureDryRun_HandleDryRunDisabled_SyncError(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-
 func TestEnsureDryRun_GetDryRunNodes_NoAnnotation(t *testing.T) {
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
@@ -209,13 +226,13 @@ func TestEnsureDryRun_GetDryRunNodes_NoAnnotation(t *testing.T) {
 	bkeCluster := &bkev1beta1.BKECluster{}
 
 	testNodes := bkev1beta1.BKENodes{
-		{Spec: confv1beta1.BKENodeSpec{IP: "192.168.1.1"}},
-		{Spec: confv1beta1.BKENodeSpec{IP: "192.168.1.2"}},
+		{Spec: confv1beta1.BKENodeSpec{IP: testDryRunNodeIP1}},
+		{Spec: confv1beta1.BKENodeSpec{IP: testDryRunNodeIP2}},
 	}
 
 	expectedNodes := bkenode.Nodes{
-		{IP: "192.168.1.1"},
-		{IP: "192.168.1.2"},
+		{IP: testDryRunNodeIP1},
+		{IP: testDryRunNodeIP2},
 	}
 
 	patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapperForCluster, func(_ *nodeutil.NodeFetcher, ctx context.Context, cluster *bkev1beta1.BKECluster) (bkev1beta1.BKENodes, error) {
@@ -239,13 +256,13 @@ func TestEnsureDryRun_GetDryRunNodes_WithAnnotation(t *testing.T) {
 	bkeCluster := &bkev1beta1.BKECluster{}
 
 	testNodes := bkev1beta1.BKENodes{
-		{Spec: confv1beta1.BKENodeSpec{IP: "192.168.1.1"}},
-		{Spec: confv1beta1.BKENodeSpec{IP: "192.168.1.2"}},
+		{Spec: confv1beta1.BKENodeSpec{IP: testDryRunNodeIP1}},
+		{Spec: confv1beta1.BKENodeSpec{IP: testDryRunNodeIP2}},
 	}
 
 	expectedNodes := bkenode.Nodes{
-		{IP: "192.168.1.1"},
-		{IP: "192.168.1.2"},
+		{IP: testDryRunNodeIP1},
+		{IP: testDryRunNodeIP2},
 	}
 
 	patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapperForCluster, func(_ *nodeutil.NodeFetcher, ctx context.Context, cluster *bkev1beta1.BKECluster) (bkev1beta1.BKENodes, error) {
@@ -257,13 +274,13 @@ func TestEnsureDryRun_GetDryRunNodes_WithAnnotation(t *testing.T) {
 	})
 
 	annotations := map[string]string{
-		annotation.BKEClusterDryRunAnnotationKey: "192.168.1.1,",
+		annotation.BKEClusterDryRunAnnotationKey: testDryRunNodeIP1 + ",",
 	}
 
 	nodes, err := e.getDryRunNodes(bkeCluster, annotations, createTestLogger())
 	assert.NoError(t, err)
 	assert.Len(t, nodes, 1)
-	assert.Equal(t, "192.168.1.2", nodes[0].IP)
+	assert.Equal(t, testDryRunNodeIP2, nodes[0].IP)
 }
 
 func TestEnsureDryRun_UpdateDryRunAnnotation_Success(t *testing.T) {
@@ -273,8 +290,8 @@ func TestEnsureDryRun_UpdateDryRunAnnotation_Success(t *testing.T) {
 	e := createTestEnsureDryRun()
 	bkeCluster := &bkev1beta1.BKECluster{}
 	nodes := bkenode.Nodes{
-		{IP: "192.168.1.1"},
-		{IP: "192.168.1.2"},
+		{IP: testDryRunNodeIP1},
+		{IP: testDryRunNodeIP2},
 	}
 
 	patches.ApplyFunc(mergecluster.SyncStatusUntilComplete, func(c client.Client, bkeCluster *bkev1beta1.BKECluster, patchs ...mergecluster.PatchFunc) error {
@@ -291,7 +308,7 @@ func TestEnsureDryRun_UpdateDryRunAnnotation_SyncError(t *testing.T) {
 
 	e := createTestEnsureDryRun()
 	bkeCluster := &bkev1beta1.BKECluster{}
-	nodes := bkenode.Nodes{{IP: "192.168.1.1"}}
+	nodes := bkenode.Nodes{{IP: testDryRunNodeIP1}}
 
 	patches.ApplyFunc(mergecluster.SyncStatusUntilComplete, func(c client.Client, bkeCluster *bkev1beta1.BKECluster, patchs ...mergecluster.PatchFunc) error {
 		return assert.AnError
@@ -307,7 +324,7 @@ func TestEnsureDryRun_UpdateDryRunAnnotation_NilAnnotations(t *testing.T) {
 
 	e := createTestEnsureDryRun()
 	bkeCluster := &bkev1beta1.BKECluster{}
-	nodes := bkenode.Nodes{{IP: "192.168.1.1"}}
+	nodes := bkenode.Nodes{{IP: testDryRunNodeIP1}}
 
 	patches.ApplyFunc(mergecluster.SyncStatusUntilComplete, func(c client.Client, bkeCluster *bkev1beta1.BKECluster, patchs ...mergecluster.PatchFunc) error {
 		return nil
@@ -322,7 +339,7 @@ func TestEnsureDryRun_PushAgentWithParams_SecretNotFound(t *testing.T) {
 	defer patches.Reset()
 
 	e := createTestEnsureDryRun()
-	nodes := bkenode.Nodes{{IP: "192.168.1.1", Hostname: "node1"}}
+	nodes := bkenode.Nodes{{IP: testDryRunNodeIP1, Hostname: "node1"}}
 
 	patches.ApplyMethod(&fakeClient{}, "Get", func(_ *fakeClient, ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 		return apierrors.NewNotFound(schema.GroupResource{}, "secret")
@@ -345,7 +362,7 @@ func TestEnsureDryRun_PushAgentWithParams_GetSecretError(t *testing.T) {
 	defer patches.Reset()
 
 	e := createTestEnsureDryRun()
-	nodes := bkenode.Nodes{{IP: "192.168.1.1", Hostname: "node1"}}
+	nodes := bkenode.Nodes{{IP: testDryRunNodeIP1, Hostname: "node1"}}
 
 	patches.ApplyMethod(&fakeClient{}, "Get", func(_ *fakeClient, ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 		return assert.AnError
@@ -368,7 +385,7 @@ func TestEnsureDryRun_PushAgentWithParams_Success(t *testing.T) {
 	defer patches.Reset()
 
 	e := createTestEnsureDryRun()
-	nodes := bkenode.Nodes{{IP: "192.168.1.1", Hostname: "node1"}}
+	nodes := bkenode.Nodes{{IP: testDryRunNodeIP1, Hostname: "node1"}}
 
 	patches.ApplyMethod(&fakeClient{}, "Get", func(_ *fakeClient, ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 		if secret, ok := obj.(*corev1.Secret); ok {
@@ -378,7 +395,7 @@ func TestEnsureDryRun_PushAgentWithParams_Success(t *testing.T) {
 	})
 
 	patches.ApplyFunc(phaseutil.NodeToRemoteHost, func(nodes bkenode.Nodes) []remote.Host {
-		return []remote.Host{{Address: "192.168.1.1"}}
+		return []remote.Host{{Address: testDryRunNodeIP1}}
 	})
 
 	patches.ApplyFunc(phaseutil.PushAgent, func(hosts []remote.Host, kubeconfig []byte, ntpServer string) []string {
@@ -388,17 +405,9 @@ func TestEnsureDryRun_PushAgentWithParams_Success(t *testing.T) {
 	params := PushAgentParams{
 		Ctx:    context.Background(),
 		Client: &fakeClient{},
-		BKECluster: &bkev1beta1.BKECluster{
-			Spec: confv1beta1.BKEClusterSpec{
-				ClusterConfig: &confv1beta1.BKEConfig{
-					Cluster: confv1beta1.Cluster{
-						NTPServer: "ntp.example.com",
-					},
-				},
-			},
-		},
-		Nodes: nodes,
-		Log:   createTestLogger(),
+		BKECluster: newDryRunClusterWithNTP(),
+		Nodes:      nodes,
+		Log:        createTestLogger(),
 	}
 
 	err := e.pushAgentWithParams(params)
@@ -410,7 +419,7 @@ func TestEnsureDryRun_PushAgentWithParams_PushFailed(t *testing.T) {
 	defer patches.Reset()
 
 	e := createTestEnsureDryRun()
-	nodes := bkenode.Nodes{{IP: "192.168.1.1", Hostname: "node1"}}
+	nodes := bkenode.Nodes{{IP: testDryRunNodeIP1, Hostname: "node1"}}
 
 	patches.ApplyMethod(&fakeClient{}, "Get", func(_ *fakeClient, ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 		if secret, ok := obj.(*corev1.Secret); ok {
@@ -420,27 +429,19 @@ func TestEnsureDryRun_PushAgentWithParams_PushFailed(t *testing.T) {
 	})
 
 	patches.ApplyFunc(phaseutil.NodeToRemoteHost, func(nodes bkenode.Nodes) []remote.Host {
-		return []remote.Host{{Address: "192.168.1.1"}}
+		return []remote.Host{{Address: testDryRunNodeIP1}}
 	})
 
 	patches.ApplyFunc(phaseutil.PushAgent, func(hosts []remote.Host, kubeconfig []byte, ntpServer string) []string {
-		return []string{"192.168.1.1"}
+		return []string{testDryRunNodeIP1}
 	})
 
 	params := PushAgentParams{
-		Ctx:    context.Background(),
-		Client: &fakeClient{},
-		BKECluster: &bkev1beta1.BKECluster{
-			Spec: confv1beta1.BKEClusterSpec{
-				ClusterConfig: &confv1beta1.BKEConfig{
-					Cluster: confv1beta1.Cluster{
-						NTPServer: "ntp.example.com",
-					},
-				},
-			},
-		},
-		Nodes: nodes,
-		Log:   createTestLogger(),
+		Ctx:        context.Background(),
+		Client:     &fakeClient{},
+		BKECluster: newDryRunClusterWithNTP(),
+		Nodes:      nodes,
+		Log:        createTestLogger(),
 	}
 
 	err := e.pushAgentWithParams(params)
@@ -468,7 +469,7 @@ func TestEnsureDryRun_CheckBKEAgentStatus_FailedNodes(t *testing.T) {
 	e := createTestEnsureDryRun()
 
 	patches.ApplyFunc(phaseutil.PingBKEAgent, func(ctx context.Context, c client.Client, scheme *runtime.Scheme, bkeCluster *bkev1beta1.BKECluster) (error, []string, []string) {
-		return nil, []string{}, []string{"192.168.1.1"}
+		return nil, []string{}, []string{testDryRunNodeIP1}
 	})
 
 	err := e.checkBKEAgentStatus(createTestLogger())
@@ -482,7 +483,7 @@ func TestEnsureDryRun_CheckBKEAgentStatus_Success(t *testing.T) {
 	e := createTestEnsureDryRun()
 
 	patches.ApplyFunc(phaseutil.PingBKEAgent, func(ctx context.Context, c client.Client, scheme *runtime.Scheme, bkeCluster *bkev1beta1.BKECluster) (error, []string, []string) {
-		return nil, []string{"192.168.1.1"}, []string{}
+		return nil, []string{testDryRunNodeIP1}, []string{}
 	})
 
 	err := e.checkBKEAgentStatus(createTestLogger())
@@ -510,7 +511,7 @@ func TestEnsureDryRun_CheckNodeEnvironmentWithParams_NewCommandError(t *testing.
 	defer patches.Reset()
 
 	e := createTestEnsureDryRun()
-	nodes := bkenode.Nodes{{IP: "192.168.1.1"}}
+	nodes := bkenode.Nodes{{IP: testDryRunNodeIP1}}
 
 	patches.ApplyFunc((*nodeutil.NodeFetcher).GetNodesForBKECluster, func(_ *nodeutil.NodeFetcher, ctx context.Context, cluster *bkev1beta1.BKECluster) (bkenode.Nodes, error) {
 		return bkenode.Nodes{}, nil
@@ -542,7 +543,7 @@ func TestEnsureDryRun_CheckNodeEnvironmentWithParams_WaitError(t *testing.T) {
 	defer patches.Reset()
 
 	e := createTestEnsureDryRun()
-	nodes := bkenode.Nodes{{IP: "192.168.1.1"}}
+	nodes := bkenode.Nodes{{IP: testDryRunNodeIP1}}
 
 	patches.ApplyFunc((*nodeutil.NodeFetcher).GetNodesForBKECluster, func(_ *nodeutil.NodeFetcher, ctx context.Context, cluster *bkev1beta1.BKECluster) (bkenode.Nodes, error) {
 		return bkenode.Nodes{}, nil
@@ -574,7 +575,7 @@ func TestEnsureDryRun_CheckNodeEnvironmentWithParams_FailedNodes(t *testing.T) {
 	defer patches.Reset()
 
 	e := createTestEnsureDryRun()
-	nodes := bkenode.Nodes{{IP: "192.168.1.1"}}
+	nodes := bkenode.Nodes{{IP: testDryRunNodeIP1}}
 
 	patches.ApplyFunc((*nodeutil.NodeFetcher).GetNodesForBKECluster, func(_ *nodeutil.NodeFetcher, ctx context.Context, cluster *bkev1beta1.BKECluster) (bkenode.Nodes, error) {
 		return bkenode.Nodes{}, nil
@@ -585,7 +586,7 @@ func TestEnsureDryRun_CheckNodeEnvironmentWithParams_FailedNodes(t *testing.T) {
 	})
 
 	patches.ApplyMethod(&command.ENV{}, "Wait", func(_ *command.ENV) (error, []string, []string) {
-		return nil, []string{}, []string{"192.168.1.1"}
+		return nil, []string{}, []string{testDryRunNodeIP1}
 	})
 
 	params := CheckNodeEnvironmentParams{
@@ -606,10 +607,10 @@ func TestEnsureDryRun_CheckNodeEnvironmentWithParams_Success(t *testing.T) {
 	defer patches.Reset()
 
 	e := createTestEnsureDryRun()
-	nodes := bkenode.Nodes{{IP: "192.168.1.1"}}
+	nodes := bkenode.Nodes{{IP: testDryRunNodeIP1}}
 
 	patches.ApplyFunc((*nodeutil.NodeFetcher).GetNodesForBKECluster, func(_ *nodeutil.NodeFetcher, ctx context.Context, cluster *bkev1beta1.BKECluster) (bkenode.Nodes, error) {
-		return bkenode.Nodes{{IP: "192.168.1.1"}}, nil
+		return bkenode.Nodes{{IP: testDryRunNodeIP1}}, nil
 	})
 
 	patches.ApplyFunc(clusterutil.AvailableLoadBalancerEndPoint, func(endpoint confv1beta1.APIEndpoint, nodes []confv1beta1.Node) bool {
@@ -621,16 +622,16 @@ func TestEnsureDryRun_CheckNodeEnvironmentWithParams_Success(t *testing.T) {
 	})
 
 	patches.ApplyMethod(&command.ENV{}, "Wait", func(_ *command.ENV) (error, []string, []string) {
-		return nil, []string{"192.168.1.1"}, []string{}
+		return nil, []string{testDryRunNodeIP1}, []string{}
 	})
 
 	params := CheckNodeEnvironmentParams{
-		Ctx:        context.Background(),
-		Client:     &fakeClient{},
+		Ctx:    context.Background(),
+		Client: &fakeClient{},
 		BKECluster: &bkev1beta1.BKECluster{
 			Spec: confv1beta1.BKEClusterSpec{
 				ControlPlaneEndpoint: confv1beta1.APIEndpoint{
-					Host: "192.168.1.100",
+					Host: testDryRunControlPlaneHost,
 				},
 			},
 		},
@@ -642,7 +643,6 @@ func TestEnsureDryRun_CheckNodeEnvironmentWithParams_Success(t *testing.T) {
 	err := e.checkNodeEnvironmentWithParams(params)
 	assert.NoError(t, err)
 }
-
 
 func TestEnsureDryRun_ReconcileDryRun_DryRunDisabled(t *testing.T) {
 	patches := gomonkey.NewPatches()
@@ -658,7 +658,6 @@ func TestEnsureDryRun_ReconcileDryRun_DryRunDisabled(t *testing.T) {
 	err := e.reconcileDryRun()
 	assert.NoError(t, err)
 }
-
 
 func TestEnsureDryRun_ReconcileDryRun_NoNodes(t *testing.T) {
 	patches := gomonkey.NewPatches()
@@ -685,11 +684,11 @@ func TestEnsureDryRun_ReconcileDryRun_UpdateAnnotationError(t *testing.T) {
 	e := createTestEnsureDryRun()
 
 	patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapperForCluster, func(_ *nodeutil.NodeFetcher, ctx context.Context, cluster *bkev1beta1.BKECluster) (bkev1beta1.BKENodes, error) {
-		return bkev1beta1.BKENodes{{Spec: confv1beta1.BKENodeSpec{IP: "192.168.1.1"}}}, nil
+		return bkev1beta1.BKENodes{{Spec: confv1beta1.BKENodeSpec{IP: testDryRunNodeIP1}}}, nil
 	})
 
 	patches.ApplyFunc(phaseutil.GetNeedInitEnvNodesWithBKENodes, func(cluster *bkev1beta1.BKECluster, nodes bkev1beta1.BKENodes) bkenode.Nodes {
-		return bkenode.Nodes{{IP: "192.168.1.1"}}
+		return bkenode.Nodes{{IP: testDryRunNodeIP1}}
 	})
 
 	patches.ApplyFunc(mergecluster.SyncStatusUntilComplete, func(c client.Client, bkeCluster *bkev1beta1.BKECluster, patchs ...mergecluster.PatchFunc) error {
@@ -700,13 +699,12 @@ func TestEnsureDryRun_ReconcileDryRun_UpdateAnnotationError(t *testing.T) {
 	assert.Error(t, err)
 }
 
-
 func TestEnsureDryRun_PushAgent(t *testing.T) {
 	patches := gomonkey.NewPatches()
 	defer patches.Reset()
 
 	e := createTestEnsureDryRun()
-	nodes := bkenode.Nodes{{IP: "192.168.1.1"}}
+	nodes := bkenode.Nodes{{IP: testDryRunNodeIP1}}
 
 	patches.ApplyMethod(&fakeClient{}, "Get", func(_ *fakeClient, ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 		if secret, ok := obj.(*corev1.Secret); ok {
@@ -716,22 +714,14 @@ func TestEnsureDryRun_PushAgent(t *testing.T) {
 	})
 
 	patches.ApplyFunc(phaseutil.NodeToRemoteHost, func(nodes bkenode.Nodes) []remote.Host {
-		return []remote.Host{{Address: "192.168.1.1"}}
+		return []remote.Host{{Address: testDryRunNodeIP1}}
 	})
 
 	patches.ApplyFunc(phaseutil.PushAgent, func(hosts []remote.Host, kubeconfig []byte, ntpServer string) []string {
 		return []string{}
 	})
 
-	err := e.pushAgent(context.Background(), &fakeClient{}, &bkev1beta1.BKECluster{
-		Spec: confv1beta1.BKEClusterSpec{
-			ClusterConfig: &confv1beta1.BKEConfig{
-				Cluster: confv1beta1.Cluster{
-					NTPServer: "ntp.example.com",
-				},
-			},
-		},
-	}, nodes, createTestLogger())
+	err := e.pushAgent(context.Background(), &fakeClient{}, newDryRunClusterWithNTP(), nodes, createTestLogger())
 	assert.NoError(t, err)
 }
 
@@ -744,7 +734,7 @@ func TestPushAgentParams_Structure(t *testing.T) {
 		Ctx:        context.Background(),
 		Client:     &fakeClient{},
 		BKECluster: &bkev1beta1.BKECluster{},
-		Nodes:      bkenode.Nodes{{IP: "192.168.1.1"}},
+		Nodes:      bkenode.Nodes{{IP: testDryRunNodeIP1}},
 		Log:        createTestLogger(),
 	}
 
@@ -761,7 +751,7 @@ func TestCheckNodeEnvironmentParams_Structure(t *testing.T) {
 		Client:     &fakeClient{},
 		BKECluster: &bkev1beta1.BKECluster{},
 		Scheme:     runtime.NewScheme(),
-		Nodes:      bkenode.Nodes{{IP: "192.168.1.1"}},
+		Nodes:      bkenode.Nodes{{IP: testDryRunNodeIP1}},
 		Log:        createTestLogger(),
 	}
 

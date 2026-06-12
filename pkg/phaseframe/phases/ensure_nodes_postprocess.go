@@ -63,8 +63,12 @@ func (e *EnsureNodesPostProcess) NeedExecute(old *bkev1beta1.BKECluster, new *bk
 	if err != nil {
 		return false
 	}
-
 	needExecute := phaseutil.GetNeedPostProcessNodesWithBKENodes(new, bkeNodes).Length() > 0
+	// 初次部署场景：尚无节点完成 bootstrap，但存在待加入的节点，
+	// 预先加入执行计划，Execute 阶段会在前序 Phase 完成后重新获取节点状态
+	if !needExecute {
+		needExecute = phaseutil.GetNeedJoinNodesWithBKENodes(new, bkeNodes).Length() > 0
+	}
 	if needExecute {
 		e.SetStatus(bkev1beta1.PhaseWaiting)
 	}
@@ -121,8 +125,12 @@ func (e *EnsureNodesPostProcess) executeNodePostProcessScripts() error {
 
 	for _, node := range nodesWithoutConfig {
 		nodeFetcher := e.Ctx.NodeFetcher()
-		nodeFetcher.MarkNodeStateFlagForCluster(ctx, bkeCluster, node.IP, bkev1beta1.NodePostProcessFlag)
-		nodeFetcher.SetBKENodeStateMessage(ctx, bkeCluster.Namespace, bkeCluster.Name, node.IP, "Post process skipped (no config)")
+		if err := nodeFetcher.UpdateNodeStatusByIPForCluster(ctx, bkeCluster, node.IP, func(status *confv1beta1.BKENodeStatus) {
+			status.StateCode |= bkev1beta1.NodePostProcessFlag
+			status.Message = "Post process skipped (no config)"
+		}); err != nil {
+			log.Warn(constant.InternalErrorReason, "Failed to update postprocess skipped status for %s: %v", node.IP, err)
+		}
 	}
 
 	log.Info(constant.NodesPostProcessCheckingReason, "postprocess config check done, total=%d, hit=%d", len(nodes), len(nodesWithConfig))
@@ -157,8 +165,12 @@ func (e *EnsureNodesPostProcess) markPostProcessSuccess(successNodes []string) {
 	nodeFetcher := e.Ctx.NodeFetcher()
 	for _, node := range successNodes {
 		nodeIP := phaseutil.GetNodeIPFromCommandWaitResult(node)
-		nodeFetcher.MarkNodeStateFlagForCluster(ctx, bkeCluster, nodeIP, bkev1beta1.NodePostProcessFlag)
-		nodeFetcher.SetBKENodeStateMessage(ctx, bkeCluster.Namespace, bkeCluster.Name, nodeIP, "Post process scripts completed")
+		if err := nodeFetcher.UpdateNodeStatusByIPForCluster(ctx, bkeCluster, nodeIP, func(status *confv1beta1.BKENodeStatus) {
+			status.StateCode |= bkev1beta1.NodePostProcessFlag
+			status.Message = "Post process scripts completed"
+		}); err != nil {
+			log.Warn(constant.InternalErrorReason, "Failed to update postprocess success status for %s: %v", nodeIP, err)
+		}
 	}
 	log.Info(constant.NodesPostProcessReadyReason, "postprocess success nodes=%v", successNodes)
 }

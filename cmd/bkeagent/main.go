@@ -27,8 +27,6 @@ import (
 
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
-	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
-	// to ensure that exec-entrypoint and run can make use of them.
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/kubernetes"
@@ -43,16 +41,16 @@ import (
 	bkeagentctrl "gopkg.openfuyao.cn/cluster-api-provider-bke/controllers/bkeagent"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/option"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 	v "gopkg.openfuyao.cn/cluster-api-provider-bke/version"
-	//+kubebuilder:scaffold:imports
 )
 
-var (
-	scheme   = runtime.NewScheme()
-	setupLog = ctrl.Log.WithName("setup")
-)
+var scheme = runtime.NewScheme()
+
+func setupLogger() *log.Logger {
+	return log.With("component", "setup")
+}
 
 const (
 	// MinValidPort is the minimum valid port number
@@ -111,6 +109,7 @@ func newManager() (ctrl.Manager, error) {
 			Cache: &client.CacheOptions{
 				DisableFor: []client.Object{
 					&corev1.Secret{},
+					&corev1.ConfigMap{},
 				},
 			},
 		},
@@ -176,7 +175,7 @@ func validatePort(port int) error {
 		return fmt.Errorf("port %d is out of valid range [%d-%d]", port, MinValidPort, MaxValidPort)
 	}
 	if port < ReservedPortThreshold {
-		setupLog.Info("warning: port below 1024 may require root privileges", "port", port)
+		setupLogger().Info("warning: port below 1024 may require root privileges", "port", port)
 	}
 	return nil
 }
@@ -294,18 +293,18 @@ func startHealthServer(port int, hc *healthChecker) error {
 
 	// Start server in a goroutine
 	go func() {
-		setupLog.Info("starting health check server", "address", server.Addr)
+		setupLogger().Info("starting health check server", "address", server.Addr)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			setupLog.Error(err, "health check server error")
+			setupLogger().Errorf("health check server error: %v", err)
 		}
 	}()
 
 	// Graceful shutdown
 	go func() {
 		<-hc.ctx.Done()
-		setupLog.Info("shutting down health check server")
+		setupLogger().Info("shutting down health check server")
 		if err := server.Shutdown(context.Background()); err != nil {
-			setupLog.Error(err, "error shutting down health check server")
+			setupLogger().Errorf("error shutting down health check server: %v", err)
 		}
 	}()
 
@@ -328,18 +327,18 @@ func run(cfg config) {
 
 	// Start health check server if enabled
 	if cfg.healthPort == "" {
-		setupLog.Info("health check server disabled (no port specified)")
+		setupLogger().Info("health check server disabled (no port specified)")
 	} else {
 		port, err := strconv.Atoi(cfg.healthPort)
 		if err != nil {
-			setupLog.Error(err, "invalid health port", "port", cfg.healthPort)
+			setupLogger().Errorf("invalid health port: %v, port=%v", err, cfg.healthPort)
 			os.Exit(1)
 		}
 		if port == 0 {
-			setupLog.Info("health check server disabled (port is 0)")
+			setupLogger().Info("health check server disabled (port is 0)")
 		} else {
 			if err = startHealthServer(port, hc); err != nil {
-				setupLog.Error(err, "unable to start health check server", "port", port)
+				setupLogger().Errorf("unable to start health check server: %v, port=%v", err, port)
 				os.Exit(1)
 			}
 		}
@@ -347,7 +346,7 @@ func run(cfg config) {
 
 	mgr, err := newManager()
 	if err != nil {
-		setupLog.Error(err, "unable to start manager")
+		setupLogger().Errorf("unable to start manager: %v", err)
 		os.Exit(1)
 	}
 
@@ -360,23 +359,26 @@ func run(cfg config) {
 
 	j, err := job.NewJob(mgr.GetClient())
 	if err != nil {
-		log.Fatal(err)
+		log.Critical(err.Error())
+		os.Exit(1)
 	}
 
 	if err := setupController(mgr, j, ctx); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "Command")
+		setupLogger().Errorf("unable to create controller Command: %v", err)
 		os.Exit(1)
 	}
 	//+kubebuilder:scaffold:builder
 
-	setupLog.Info("starting manager")
+	setupLogger().Info("starting manager")
 	if err := mgr.Start(ctx); err != nil {
-		setupLog.Error(err, "problem running manager")
+		setupLogger().Errorf("problem running manager: %v", err)
 		os.Exit(1)
 	}
 }
 
 func main() {
+	log.InitForAgent(log.DefaultAgentConfig())
+
 	cfg := parseFlags()
 
 	if cfg.showVersion {
@@ -385,6 +387,7 @@ func main() {
 	}
 
 	v.LogPrintVersion()
+
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&cfg.zapOpts)))
 
 	run(cfg)

@@ -72,7 +72,7 @@ func TestGetK8sServerHttp(mapObjs map[string]interface{}) (*rest.Config, *httpte
 		var obj interface{}
 		var ok = false
 		if obj, ok = handlerMap[key]; !ok {
-			fmt.Println(fmt.Sprintf("[ info_k8s_http_server_request: %s not found ]", key))
+			fmt.Printf("[ info_k8s_http_server_request: %s not found ]\n", key)
 			w.WriteHeader(http.StatusNotFound)
 			if err := json.Unmarshal(
 				[]byte(`{"kind":"Status","apiVersion":"v1","status":"Failure","message":"not found"}`), &obj); err != nil {

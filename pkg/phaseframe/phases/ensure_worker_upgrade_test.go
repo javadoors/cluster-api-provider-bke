@@ -18,15 +18,19 @@ import (
 
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
 	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/mergecluster"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/upgrade"
 )
 
 func TestEnsureWorkerUpgradeConstants(t *testing.T) {
@@ -187,18 +191,9 @@ func TestEnsureWorkerUpgrade_NeedExecute_UnhealthyCluster(t *testing.T) {
 }
 
 func TestEnsureWorkerUpgrade_NeedExecute_NoUpgradeNodes(t *testing.T) {
-	patches := gomonkey.NewPatches()
-	defer patches.Reset()
-
 	scheme := runtime.NewScheme()
 	_ = bkev1beta1.AddToScheme(scheme)
-	bkeCluster := &bkev1beta1.BKECluster{
-		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
-		Spec: confv1beta1.BKEClusterSpec{
-			ClusterConfig: &confv1beta1.BKEConfig{},
-		},
-		Status: confv1beta1.BKEClusterStatus{},
-	}
+	bkeCluster := workerUpgradeTestCluster("v1.28.0", "v1.28.0")
 	c := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(bkeCluster).Build()
 	ctx := &phaseframe.PhaseContext{
 		Context:    context.Background(),
@@ -208,20 +203,84 @@ func TestEnsureWorkerUpgrade_NeedExecute_NoUpgradeNodes(t *testing.T) {
 		Log:        bkev1beta1.NewBKELogger(nil, &fakeRecorder{}, bkeCluster),
 	}
 
-	patches.ApplyFunc(fetchBKENodesIfCPInitialized, func(ctx *phaseframe.PhaseContext, cluster *bkev1beta1.BKECluster) (bkev1beta1.BKENodes, bool) {
-		return bkev1beta1.BKENodes{}, true
-	})
-
-	patches.ApplyFunc(phaseutil.GetNeedUpgradeWorkerNodesWithBKENodes, func(cluster *bkev1beta1.BKECluster, nodes bkev1beta1.BKENodes) bkenode.Nodes {
-		return bkenode.Nodes{}
-	})
-
 	phase := NewEnsureWorkerUpgrade(ctx)
 	e := phase.(*EnsureWorkerUpgrade)
 
 	old := &bkev1beta1.BKECluster{}
 	result := e.NeedExecute(old, bkeCluster)
 	assert.False(t, result)
+}
+
+func TestEnsureWorkerUpgradeDesiredKubernetesVersion_PrefersVersionContext(t *testing.T) {
+	bkeCluster := &bkev1beta1.BKECluster{
+		Spec: confv1beta1.BKEClusterSpec{
+			ClusterConfig: &confv1beta1.BKEConfig{
+				Cluster: confv1beta1.Cluster{KubernetesVersion: "v1.33.0"},
+			},
+		},
+		Status: confv1beta1.BKEClusterStatus{KubernetesVersion: "v1.33.0"},
+	}
+	vc := upgrade.NewVersionContext()
+	vc.SetCurrent(upgrade.ComponentKubernetesWorker, "v1.33.0")
+	vc.SetTarget(upgrade.ComponentKubernetesWorker, "v1.34.1")
+
+	e := &EnsureWorkerUpgrade{BasePhase: phaseframe.BasePhase{Ctx: &phaseframe.PhaseContext{
+		BKECluster:     bkeCluster,
+		VersionContext: vc,
+	}}}
+
+	assert.Equal(t, "v1.34.1", e.desiredKubernetesVersion())
+	assert.Equal(t, "v1.33.0", e.currentKubernetesVersion())
+}
+
+func TestEnsureWorkerUpgradeSyncLegacyTargetKubernetesVersion(t *testing.T) {
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+
+	bkeCluster := &bkev1beta1.BKECluster{
+		Spec: confv1beta1.BKEClusterSpec{
+			ClusterConfig: &confv1beta1.BKEConfig{
+				Cluster: confv1beta1.Cluster{KubernetesVersion: "v1.33.0"},
+			},
+		},
+	}
+	ctx := &phaseframe.PhaseContext{
+		BKECluster: bkeCluster,
+		Log:        bkev1beta1.NewBKELogger(nil, &fakeRecorder{}, bkeCluster),
+	}
+
+	patches.ApplyFunc(mergecluster.SyncStatusUntilComplete, func(_ client.Client, bc *bkev1beta1.BKECluster, patchs ...mergecluster.PatchFunc) error {
+		for _, patch := range patchs {
+			patch(bc)
+		}
+		return nil
+	})
+
+	e := NewEnsureWorkerUpgrade(ctx).(*EnsureWorkerUpgrade)
+	require.NoError(t, e.syncLegacyTargetKubernetesVersion("v1.34.1"))
+	assert.Equal(t, "v1.34.1", bkeCluster.Spec.ClusterConfig.Cluster.KubernetesVersion)
+}
+
+func TestEnsureWorkerUpgradeReconcileWorkerUpgradeUsesVersionContext(t *testing.T) {
+	bkeCluster := &bkev1beta1.BKECluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+		Status:     confv1beta1.BKEClusterStatus{KubernetesVersion: "v1.33.0"},
+	}
+	vc := upgrade.NewVersionContext()
+	vc.SetCurrent(upgrade.ComponentKubernetesWorker, "v1.33.0")
+	vc.SetTarget(upgrade.ComponentKubernetesWorker, "v1.34.1")
+
+	ctx := &phaseframe.PhaseContext{
+		Context:        context.Background(),
+		BKECluster:     bkeCluster,
+		Log:            bkev1beta1.NewBKELogger(nil, &fakeRecorder{}, bkeCluster),
+		VersionContext: vc,
+	}
+
+	e := NewEnsureWorkerUpgrade(ctx).(*EnsureWorkerUpgrade)
+	_, err := e.reconcileWorkerUpgrade()
+	require.Error(t, err)
+	assert.EqualError(t, err, "cluster config is nil")
 }
 
 func TestEnsureWorkerUpgrade_ExecutePreHook(t *testing.T) {
@@ -278,13 +337,7 @@ func TestEnsureWorkerUpgrade_NeedExecute_WithUpgradeNodes(t *testing.T) {
 
 	scheme := runtime.NewScheme()
 	_ = bkev1beta1.AddToScheme(scheme)
-	bkeCluster := &bkev1beta1.BKECluster{
-		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
-		Spec: confv1beta1.BKEClusterSpec{
-			ClusterConfig: &confv1beta1.BKEConfig{},
-		},
-		Status: confv1beta1.BKEClusterStatus{},
-	}
+	bkeCluster := workerUpgradeTestCluster("v1.29.0", "v1.28.0")
 	c := fakeclient.NewClientBuilder().WithScheme(scheme).WithObjects(bkeCluster).Build()
 	ctx := &phaseframe.PhaseContext{
 		Context:    context.Background(),

@@ -29,7 +29,7 @@ import (
 	"github.com/pkg/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 // Exists 判断所给路径文件/文件夹是否存在
@@ -104,7 +104,6 @@ func HostName() string {
 		log.Warnf("Failed to get host name %s", err.Error())
 		return ""
 	}
-	bkeNodeName := ""
 
 	nodeFilePath := filepath.Join(Workspace, "node")
 	if !Exists(nodeFilePath) {
@@ -117,25 +116,18 @@ func HostName() string {
 	b, err := os.ReadFile(nodeFilePath)
 	if err != nil {
 		log.Warnf("Failed to read file %s", err.Error())
-	} else if len(b) > MinimumClusterNameLength {
-		bkeNodeName = strings.Replace(string(b), "\n", "", -1)
-	} else {
+		return hostName
+	}
+
+	bkeNodeName := strings.TrimSpace(strings.Replace(string(b), "\n", "", -1))
+	if bkeNodeName == "" {
 		if err := os.WriteFile(nodeFilePath, []byte(hostName), RwRR); err != nil {
-			log.Warnf("node file not exit and failed to write node file %q err: %s", nodeFilePath, err.Error())
+			log.Warnf("node file is empty and failed to write node file %q err: %s", nodeFilePath, err.Error())
 		}
 		return hostName
 	}
 
-	switch {
-	case bkeNodeName == hostName:
-		return bkeNodeName
-	case bkeNodeName == "":
-		return hostName
-	case bkeNodeName != "" && hostName != "":
-		return bkeNodeName
-	default:
-		return hostName
-	}
+	return bkeNodeName
 }
 
 func SetNTPServerEnv(server string) error {

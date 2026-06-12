@@ -20,7 +20,6 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -33,12 +32,9 @@ import (
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
 	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/pkiutil"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/log"
 )
 
-func init() {
-	log.BkeLogger = zap.NewNop().Sugar()
-}
+func init() {}
 
 const (
 	testIPAddress1   = "127.0.0.1"
@@ -641,7 +637,7 @@ func TestIsHACluster(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := IsHACluster(tt.bkeCluster)
+			got := IsHACluster(tt.bkeCluster, tt.nodes)
 			if got != tt.want {
 				t.Errorf("IsHACluster() = %v, want %v", got, tt.want)
 			}
@@ -653,15 +649,17 @@ func TestIsHACluster(t *testing.T) {
 func getIsHAClusterTestCases() []struct {
 	name       string
 	bkeCluster *bkev1beta1.BKECluster
+	nodes      bkenode.Nodes
 	want       bool
 } {
 	return []struct {
 		name       string
 		bkeCluster *bkev1beta1.BKECluster
+		nodes      bkenode.Nodes
 		want       bool
 	}{
 		{
-			name: "HA cluster with domain endpoint",
+			name: "HA cluster with endpoint not in node IPs",
 			bkeCluster: &bkev1beta1.BKECluster{
 				Spec: confv1beta1.BKEClusterSpec{
 					ControlPlaneEndpoint: confv1beta1.APIEndpoint{
@@ -670,14 +668,50 @@ func getIsHAClusterTestCases() []struct {
 					},
 				},
 			},
+			nodes: bkenode.Nodes{
+				{IP: testIPAddress1},
+				{IP: "10.0.0.2"},
+			},
 			want: true,
+		},
+		{
+			name: "non-HA cluster with endpoint equal to node IP",
+			bkeCluster: &bkev1beta1.BKECluster{
+				Spec: confv1beta1.BKEClusterSpec{
+					ControlPlaneEndpoint: confv1beta1.APIEndpoint{
+						Host: testIPAddress1,
+						Port: testEndpointPort,
+					},
+				},
+			},
+			nodes: bkenode.Nodes{
+				{IP: testIPAddress1},
+				{IP: "10.0.0.2"},
+			},
+			want: false,
 		},
 		{
 			name: "cluster without endpoint",
 			bkeCluster: &bkev1beta1.BKECluster{
 				Spec: confv1beta1.BKEClusterSpec{},
 			},
+			nodes: bkenode.Nodes{
+				{IP: testIPAddress1},
+			},
 			want: false,
+		},
+		{
+			name: "cluster without nodes",
+			bkeCluster: &bkev1beta1.BKECluster{
+				Spec: confv1beta1.BKEClusterSpec{
+					ControlPlaneEndpoint: confv1beta1.APIEndpoint{
+						Host: testHADomain,
+						Port: testEndpointPort,
+					},
+				},
+			},
+			nodes: nil,
+			want:  false,
 		},
 	}
 }
@@ -1081,6 +1115,7 @@ func TestCheckKubeConfigSecret(t *testing.T) {
 		name        string
 		secret      *corev1.Secret
 		bkeCluster  *bkev1beta1.BKECluster
+		nodes       bkenode.Nodes
 		setupClient func(*corev1.Secret, *bkev1beta1.BKECluster) client.Client
 		attempt     int
 		maxRetries  int
@@ -1133,6 +1168,9 @@ func TestCheckKubeConfigSecret(t *testing.T) {
 					},
 				},
 			},
+			nodes: bkenode.Nodes{
+				{IP: testIPAddress1},
+			},
 			setupClient: func(s *corev1.Secret, c *bkev1beta1.BKECluster) client.Client {
 				return fake.NewClientBuilder().WithScheme(scheme).WithObjects(s).Build()
 			},
@@ -1153,6 +1191,7 @@ func TestCheckKubeConfigSecret(t *testing.T) {
 				ObjectMeta: metav1.ObjectMeta{Namespace: "default"},
 				Spec:       confv1beta1.BKEClusterSpec{},
 			},
+			nodes: nil,
 			setupClient: func(s *corev1.Secret, c *bkev1beta1.BKECluster) client.Client {
 				return fake.NewClientBuilder().WithScheme(scheme).WithObjects(s).Build()
 			},
@@ -1166,6 +1205,7 @@ func TestCheckKubeConfigSecret(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			generator := NewKubernetesCertGenerator(context.TODO(), tt.setupClient(tt.secret, tt.bkeCluster), tt.bkeCluster)
+			generator.SetNodes(tt.nodes)
 			found, shouldRetry := generator.checkKubeConfigSecret(tt.secret.ObjectMeta.Name, tt.attempt, tt.maxRetries)
 
 			assert.Equal(t, tt.expectFound, found)

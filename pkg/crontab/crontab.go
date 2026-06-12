@@ -19,7 +19,7 @@ import (
 	"github.com/robfig/cron/v3"
 
 	bkentp "gopkg.openfuyao.cn/cluster-api-provider-bke/common/ntp"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 var (

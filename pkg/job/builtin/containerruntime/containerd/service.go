@@ -24,14 +24,12 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 )
 
-const (
-	ServiceDropInDir = "/etc/systemd/system/containerd.service.d"
-	DropInFileName   = "10-override.conf"
-)
+const DropInFileName = "10-override.conf"
 
 var (
 	//go:embed service-dropin.tmpl
 	serviceDropInTemplate string
+	ServiceDropInDir      = "/etc/systemd/system/containerd.service.d"
 )
 
 type ServiceDropInGenerator struct {

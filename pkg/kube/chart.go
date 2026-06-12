@@ -16,7 +16,7 @@ import (
 	"context"
 	"fmt"
 	"io/ioutil"
-	"log"
+	stdlog "log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,7 +29,6 @@ import (
 	"helm.sh/helm/v3/pkg/cli"
 	"helm.sh/helm/v3/pkg/registry"
 
-	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -39,6 +38,7 @@ import (
 	bkeaddon "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/addon"
 	bkeinit "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/initialize"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/constant"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 const releaseNotFound = "release: not found"
@@ -439,7 +439,10 @@ func (a *AuthConfig) Cleanup() {
 }
 
 // FetchChartUniversal 拉取chart包，支持oci和传统格式
-func FetchChartUniversal(chartRepo, chartName, version string, auth *AuthConfig, logger *zap.SugaredLogger) (*chart.Chart, error) {
+func FetchChartUniversal(
+	chartRepo, chartName, version string,
+	auth *AuthConfig, logger *log.Logger,
+) (*chart.Chart, error) {
 	defer auth.Cleanup()
 
 	// 1. 拉取oci格式chart
@@ -518,9 +521,10 @@ func getCertTmpPath(auth *AuthConfig) (*AuthConfig, string, error) {
 	return auth, tmpDir, nil
 }
 
-func FetchChartOCI(repoURL, chartName, version string, auth *AuthConfig, logger *zap.SugaredLogger) (*chart.Chart, error) {
+// FetchChartOCI fetches a Helm chart from an OCI registry.
+func FetchChartOCI(repoURL, chartName, version string, auth *AuthConfig, logger *log.Logger) (*chart.Chart, error) {
 	settings := cli.New()
-	loggerDefault := log.Default()
+	loggerDefault := stdlog.Default()
 	actionConfig, err := initActionConfig(settings, loggerDefault)
 	if err != nil {
 		return nil, fmt.Errorf("failed to init action config: %w", err)
@@ -577,11 +581,11 @@ func FetchChartOCI(repoURL, chartName, version string, auth *AuthConfig, logger 
 	return loader.Load(filepath.Join(tmpDir, fmt.Sprintf("%s-%s.tgz", chartName, version)))
 }
 
-func initActionConfig(settings *cli.EnvSettings, logger *log.Logger) (*action.Configuration, error) {
+func initActionConfig(settings *cli.EnvSettings, logger *stdlog.Logger) (*action.Configuration, error) {
 	return initActionConfigList(settings, logger, false)
 }
 
-func initActionConfigList(settings *cli.EnvSettings, logger *log.Logger, allNamespaces bool) (*action.Configuration, error) {
+func initActionConfigList(settings *cli.EnvSettings, logger *stdlog.Logger, allNamespaces bool) (*action.Configuration, error) {
 	actionConfig := new(action.Configuration)
 
 	namespace := func() string {
@@ -620,7 +624,7 @@ func newRegistryClient(settings *cli.EnvSettings, plainHTTP bool) (*registry.Cli
 	return registryClient, nil
 }
 
-func newRegistryClientTLS(settings *cli.EnvSettings, logger *log.Logger, chartRef string, plainHTTP bool,
+func newRegistryClientTLS(settings *cli.EnvSettings, logger *stdlog.Logger, chartRef string, plainHTTP bool,
 	auth *AuthConfig) (*registry.Client, error) {
 	var err error
 	var registryClient *registry.Client
@@ -681,7 +685,10 @@ func extractRegistryHost(ociRef string) string {
 }
 
 // FetchChartTraditional 通过传统方式获取并加载Chart
-func FetchChartTraditional(repoURL, chartName, version string, auth *AuthConfig, logger *zap.SugaredLogger) (*chart.Chart, error) {
+func FetchChartTraditional(
+	repoURL, chartName, version string,
+	auth *AuthConfig, logger *log.Logger,
+) (*chart.Chart, error) {
 	var err error
 	var tmpDir string
 	auth, tmpDir, err = getCertTmpPath(auth)

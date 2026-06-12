@@ -21,6 +21,7 @@ import (
 
 	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/annotation"
 )
 
 func TestBKEAgentReady_Update(t *testing.T) {
@@ -81,10 +82,16 @@ func TestBKEClusterSpecChange_Update(t *testing.T) {
 func TestBKEClusterAnnotationsChange_Update(t *testing.T) {
 	pred := BKEClusterAnnotationsChange()
 	oldCluster := &bkev1beta1.BKECluster{}
-	newCluster := &bkev1beta1.BKECluster{}
+	newCluster := &bkev1beta1.BKECluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{
+				annotation.CVOUpgradeReadyAnnotationKey: "v2.5.0",
+			},
+		},
+	}
 	e := event.UpdateEvent{ObjectOld: oldCluster, ObjectNew: newCluster}
 	result := pred.Update(e)
-	assert.False(t, result)
+	assert.True(t, result)
 }
 
 func TestBKENodeChange_Create(t *testing.T) {

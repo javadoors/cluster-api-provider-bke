@@ -15,7 +15,6 @@ package containerd
 
 import (
 	"fmt"
-	"log"
 	"os"
 
 	"github.com/containerd/console"
@@ -29,6 +28,8 @@ import (
 	"github.com/containerd/containerd/snapshots"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
+
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 type ContainerSpec struct {
@@ -46,7 +47,7 @@ func (c *Client) Run(cs ContainerSpec) error {
 	if err != nil {
 		return err
 	}
-	log.Printf("[INFO] Running container %s", container.ID())
+	log.Infof("Running container %s", container.ID())
 	var con console.Console
 	var opts []containerd.NewTaskOpts
 	var ioOpts []cio.Opt

@@ -398,6 +398,64 @@ func TestPrepareClusterData(t *testing.T) {
 	assert.NotNil(t, result)
 }
 
+func TestPreserveDeclarativeUpgradeFromFresh(t *testing.T) {
+	now := metav1.Now()
+	fresh := createTestBKECluster("test", "default")
+	fresh.Status.DeclarativeUpgrade = &confv1beta1.DeclarativeUpgradeStatus{
+		TargetVersion: "v26.06",
+		Completed: []confv1beta1.DeclarativeUpgradeComponentRecord{
+			{Name: "bkeagent", Version: "v26.05", CompletedAt: now},
+			{Name: "containerd", Version: "v2.1.2", CompletedAt: now},
+		},
+	}
+
+	stale := createTestBKECluster("test", "default")
+	stale.Status.DeclarativeUpgrade = &confv1beta1.DeclarativeUpgradeStatus{
+		TargetVersion: "v26.06",
+		Completed: []confv1beta1.DeclarativeUpgradeComponentRecord{
+			{Name: "bkeagent", Version: "v26.05", CompletedAt: now},
+		},
+	}
+
+	PreserveDeclarativeUpgradeFromFresh(fresh, stale)
+
+	assert.Len(t, stale.Status.DeclarativeUpgrade.Completed, 2)
+	assert.Equal(t, "containerd", stale.Status.DeclarativeUpgrade.Completed[1].Name)
+}
+
+func TestPrepareClusterData_PreservesDeclarativeUpgradeFromAPI(t *testing.T) {
+	scheme := setupTestScheme()
+	now := metav1.Now()
+
+	stale := createTestBKECluster("test", "default")
+	stale.Status.DeclarativeUpgrade = &confv1beta1.DeclarativeUpgradeStatus{
+		TargetVersion: "v26.06",
+		Completed: []confv1beta1.DeclarativeUpgradeComponentRecord{
+			{Name: "bkeagent", Version: "v26.05", CompletedAt: now},
+		},
+	}
+
+	apiCluster := stale.DeepCopy()
+	apiCluster.Status.DeclarativeUpgrade = &confv1beta1.DeclarativeUpgradeStatus{
+		TargetVersion: "v26.06",
+		Completed: []confv1beta1.DeclarativeUpgradeComponentRecord{
+			{Name: "bkeagent", Version: "v26.05", CompletedAt: now},
+			{Name: "containerd", Version: "v2.1.2", CompletedAt: now},
+		},
+	}
+
+	cm := createTestConfigMap("test", "default")
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(apiCluster, cm).Build()
+
+	_, err := prepareClusterData(PrepareClusterDataParams{
+		Ctx:             context.Background(),
+		Client:          fakeClient,
+		CombinedCluster: stale,
+	})
+	assert.NoError(t, err)
+	assert.Len(t, stale.Status.DeclarativeUpgrade.Completed, 2)
+}
+
 func TestHandleExternalUpdates(t *testing.T) {
 	combined := createTestBKECluster("test", "default")
 	current := createTestBKECluster("test", "default")
@@ -547,4 +605,3 @@ func TestUpdateModifiedBKENodes_Empty(t *testing.T) {
 	err := UpdateModifiedBKENodes(context.Background(), fakeClient, v1beta1.BKENodes{})
 	assert.NoError(t, err)
 }
-

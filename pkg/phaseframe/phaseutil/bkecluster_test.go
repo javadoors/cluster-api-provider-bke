@@ -72,9 +72,67 @@ func TestGenerateBKEAgentStatus(t *testing.T) {
 	nodes := node.Nodes{{IP: "192.168.1.1"}, {IP: "192.168.1.2"}}
 	success := []string{"192.168.1.1"}
 
-	GenerateBKEAgentStatus(success, cluster, nodes)
+	GenerateBKEAgentStatus(success, cluster, nodes, nil, nil)
 	assert.Equal(t, int32(2), cluster.Status.AgentStatus.Replies)
 	assert.Equal(t, int32(1), cluster.Status.AgentStatus.UnavailableReplies)
+	assert.Equal(t, "1/2", cluster.Status.AgentStatus.Status)
+}
+
+func TestGenerateBKEAgentStatus_scaleOut(t *testing.T) {
+	cluster := &bkev1beta1.BKECluster{}
+	bkeNodes := bkev1beta1.BKENodes{
+		{Spec: confv1beta1.BKENodeSpec{IP: "10.0.0.1"}},
+		{Spec: confv1beta1.BKENodeSpec{IP: "10.0.0.2"}},
+		{Spec: confv1beta1.BKENodeSpec{IP: "10.0.0.3"}},
+		{Spec: confv1beta1.BKENodeSpec{IP: "10.0.0.4"}},
+	}
+	for _, ip := range []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"} {
+		bkeNodes.MarkNodeStateFlag(ip, bkev1beta1.NodeAgentReadyFlag)
+	}
+	bkeNodes.MarkNodeStateFlag("10.0.0.4", bkev1beta1.NodeAgentPushedFlag)
+
+	pingNodes := node.Nodes{{IP: "10.0.0.4"}}
+	GenerateBKEAgentStatus([]string{"10.0.0.4"}, cluster, bkeNodes.ToNodes(), bkeNodes, pingNodes)
+
+	assert.Equal(t, int32(4), cluster.Status.AgentStatus.Replies)
+	assert.Equal(t, int32(0), cluster.Status.AgentStatus.UnavailableReplies)
+	assert.Equal(t, "4/4", cluster.Status.AgentStatus.Status)
+}
+
+func TestGenerateBKEAgentStatus_upgradePing(t *testing.T) {
+	cluster := &bkev1beta1.BKECluster{}
+	bkeNodes := bkev1beta1.BKENodes{
+		{Spec: confv1beta1.BKENodeSpec{IP: "10.0.0.1"}},
+		{Spec: confv1beta1.BKENodeSpec{IP: "10.0.0.2"}},
+		{Spec: confv1beta1.BKENodeSpec{IP: "10.0.0.3"}},
+	}
+	for _, ip := range []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"} {
+		bkeNodes.MarkNodeStateFlag(ip, bkev1beta1.NodeAgentReadyFlag)
+	}
+	pingNodes := bkeNodes.ToNodes()
+
+	// Upgrade re-pings all nodes; stale ready flags must not mask a failed ping.
+	GenerateBKEAgentStatus([]string{"10.0.0.1", "10.0.0.2"}, cluster, pingNodes, bkeNodes, pingNodes)
+
+	assert.Equal(t, int32(3), cluster.Status.AgentStatus.Replies)
+	assert.Equal(t, int32(1), cluster.Status.AgentStatus.UnavailableReplies)
+	assert.Equal(t, "2/3", cluster.Status.AgentStatus.Status)
+}
+
+func TestCountAvailableAgentNodes_scaleOutPartial(t *testing.T) {
+	bkeNodes := bkev1beta1.BKENodes{
+		{Spec: confv1beta1.BKENodeSpec{IP: "10.0.0.1"}},
+		{Spec: confv1beta1.BKENodeSpec{IP: "10.0.0.2"}},
+		{Spec: confv1beta1.BKENodeSpec{IP: "10.0.0.3"}},
+		{Spec: confv1beta1.BKENodeSpec{IP: "10.0.0.4"}},
+	}
+	for _, ip := range []string{"10.0.0.1", "10.0.0.2", "10.0.0.3"} {
+		bkeNodes.MarkNodeStateFlag(ip, bkev1beta1.NodeAgentReadyFlag)
+	}
+	pingNodes := node.Nodes{{IP: "10.0.0.4"}}
+
+	assert.Equal(t, 3, countAvailableAgentNodes(bkeNodes, nil, nil))
+	assert.Equal(t, 4, countAvailableAgentNodes(bkeNodes, pingNodes, []string{"10.0.0.4"}))
 }
 
 func TestGetListFiltersByBKECluster(t *testing.T) {
@@ -133,7 +191,7 @@ func TestGetBKEClusterAssociateMasterMachines(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "test-machine", Namespace: "default",
 			Labels: map[string]string{
-				clusterv1.ClusterNameLabel:        "test",
+				clusterv1.ClusterNameLabel:         "test",
 				clusterv1.MachineControlPlaneLabel: "",
 			},
 		},

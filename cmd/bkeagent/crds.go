@@ -17,7 +17,6 @@ import (
 	"io"
 	"strings"
 
-	log "github.com/sirupsen/logrus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -30,6 +29,7 @@ import (
 
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkeagent/v1beta1"
 	crdembed "gopkg.openfuyao.cn/cluster-api-provider-bke/config"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 func enableCrdHasInstalled() error {

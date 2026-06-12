@@ -26,7 +26,7 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/executor/docker"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/httprepo"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 //go:embed tmpl/docker.tmpl

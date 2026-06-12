@@ -59,6 +59,13 @@ const (
 	AddonBootWaitTimeOutAnnotationKey = "bke.bocloud.com/addon-boot-wait-timeout"
 )
 
+// ClusterVersion orchestration annotations (written by ClusterVersion reconciler).
+const (
+	CVOUpgradeReadyAnnotationKey   = "cvo.openfuyao.cn/upgrade-ready"
+	CVOClusterVersionAnnotationKey = "cvo.openfuyao.cn/cluster-version"
+	CVOUpgradePathAnnotationKey    = "cvo.openfuyao.cn/upgrade-path"
+)
+
 func SetBKEClusterDefaultAnnotation(bkeCluster client.Object) {
 	if _, ok := HasAnnotation(bkeCluster, DeleteIgnoreTargetClusterAnnotationKey); !ok {
 		SetAnnotation(bkeCluster, DeleteIgnoreTargetClusterAnnotationKey, "true")

@@ -138,8 +138,8 @@ func TestEnsureClusterAPIObj_Execute_WithOwnerRef(t *testing.T) {
 
 	bkeCluster := &bkev1beta1.BKECluster{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test",
-			Namespace: "default",
+			Name:            "test",
+			Namespace:       "default",
 			OwnerReferences: []metav1.OwnerReference{{Name: "owner"}},
 		},
 	}
@@ -404,4 +404,3 @@ func TestEnsureClusterAPIObj_NeedExecute_WithOwnerRef(t *testing.T) {
 	result := e.NeedExecute(old, bkeCluster)
 	assert.False(t, result)
 }
-

@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/log"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 const defaultTimeout = 10 * time.Second
@@ -136,7 +136,7 @@ func TestMultiCli(t *testing.T) {
 	}
 	for _, outs := range stdOuts.Out() {
 		for _, line := range outs {
-			log.Info(line)
+			log.Info(line.String())
 		}
 	}
 
@@ -148,7 +148,7 @@ func TestMultiCli(t *testing.T) {
 	}
 	for _, outs := range stdOuts.Out() {
 		for _, line := range outs {
-			log.Info(line)
+			log.Info(line.String())
 		}
 	}
 }

@@ -172,5 +172,3 @@ func TestNewSSHClient_WithUserAndAddress(t *testing.T) {
 		t.Error("expected non-nil client")
 	}
 }
-
-

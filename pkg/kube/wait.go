@@ -18,7 +18,6 @@ import (
 
 	"helm.sh/helm/v3/pkg/kube"
 
-	"go.uber.org/zap"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -31,6 +30,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 // Timeout defines a 30-second duration for operation timeout
@@ -54,7 +54,7 @@ type waiter struct {
 type readyChecker struct {
 	client        *kubernetes.Clientset
 	dynamicClient dynamic.Interface
-	log           *zap.SugaredLogger
+	log           *log.Logger
 	bkeLog        *bkev1beta1.BKELogger
 	pausedAsReady bool
 	fullComplete  bool

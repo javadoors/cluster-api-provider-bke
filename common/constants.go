@@ -30,6 +30,10 @@ const (
 	BKEClusterFromAnnotationValueOther   = "other"
 
 	BKEClusterConfigFileName = "bke-config"
+
+	// ClusterAPIManagerAppliedAnnotationKey marks that cluster-api 004-manage.yaml
+	// has been applied (deferred to postprocess completion).
+	ClusterAPIManagerAppliedAnnotationKey = "bke.bocloud.com/cluster-api-manager-applied"
 )
 
 const (

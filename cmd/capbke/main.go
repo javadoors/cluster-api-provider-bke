@@ -44,13 +44,20 @@ import (
 
 	agentv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkeagent/v1beta1"
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
+	configv1alpha1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/v1alpha1"
 	commonutils "gopkg.openfuyao.cn/cluster-api-provider-bke/common/utils"
 	capbkecontrollers "gopkg.openfuyao.cn/cluster-api-provider-bke/controllers/capbke"
+	clusterversioncontrollers "gopkg.openfuyao.cn/cluster-api-provider-bke/controllers/clusterversion"
+	releaseimagecontrollers "gopkg.openfuyao.cn/cluster-api-provider-bke/controllers/releaseimage"
+	upgradepathcontrollers "gopkg.openfuyao.cn/cluster-api-provider-bke/controllers/upgradepath"
 	bkemetrics "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/metrics"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/oci"
+	releasemanifest "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/release/manifest"
+	pathstore "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/upgradepath"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/config"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/log"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/nodeutil"
 	scriptshelper "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/scriptshelper"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 	v "gopkg.openfuyao.cn/cluster-api-provider-bke/version"
 	capbkewebhooks "gopkg.openfuyao.cn/cluster-api-provider-bke/webhooks/capbke"
 )
@@ -73,17 +80,18 @@ const (
 	FastSlowRateLimiterRetryCount = 10
 )
 
-var (
-	scheme   = runtime.NewScheme()
-	setupLog = ctrl.Log.WithName("setup")
-)
+var scheme = runtime.NewScheme()
+
+func setupLogger() *log.Logger {
+	return log.With("component", "setup")
+}
 
 func init() {
 	//设置时区为上海
 	loc, err := time.LoadLocation("Asia/Shanghai")
 	if err == nil {
 		time.Local = loc
-		setupLog.Info("Set timezone to Asia/Shanghai")
+		setupLogger().Info("Set timezone to Asia/Shanghai")
 	}
 
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
@@ -94,13 +102,13 @@ func init() {
 	utilruntime.Must(bootstrapv1.AddToScheme(scheme))
 
 	utilruntime.Must(bkev1beta1.AddToScheme(scheme))
+	utilruntime.Must(configv1alpha1.AddToScheme(scheme))
 	//+kubebuilder:scaffold:scheme
 }
 
 func main() {
-	setupLog.Info("--------------Starting the BKE Cluster API Provider---------------")
+	setupLogger().Info("Starting the BKE Cluster API Provider")
 	printVersionInfo()
-	setupLog.Info("------------------------------------------------------------------")
 
 	printManifestsBuildInfo()
 
@@ -114,7 +122,7 @@ func main() {
 	if config.ProbeScheme == "https" {
 		// Start independent HTTPS health check server
 		if err := startHTTPSHealthServer(ctx, mgr); err != nil {
-			setupLog.Error(err, "unable to start HTTPS health check server")
+			setupLogger().Errorf("unable to start HTTPS health check server: %v", err)
 			os.Exit(1)
 		}
 	} else {
@@ -125,29 +133,29 @@ func main() {
 	registerMetric(mgr)
 	registerProfiler(mgr)
 
-	setupLog.Info("starting manager")
+	setupLogger().Info("starting manager")
 	if err := mgr.Start(ctx); err != nil {
-		setupLog.Error(err, "problem running manager")
+		setupLogger().Errorf("problem running manager: %v", err)
 		os.Exit(1)
 	}
 }
 
 // printVersionInfo prints version information
 func printVersionInfo() {
-	setupLog.Info(fmt.Sprintf("🤯 Version: %s", v.Version))
-	setupLog.Info(fmt.Sprintf("🤔 GitCommitId: %s ", v.GitCommitID))
-	setupLog.Info(fmt.Sprintf("👉 Architecture: %s", v.Architecture))
-	setupLog.Info(fmt.Sprintf("⏲ BuildTime: %s", v.BuildTime))
+	setupLogger().Infof("🤯 Version: %s", v.Version)
+	setupLogger().Infof("🤔 GitCommitId: %s", v.GitCommitID)
+	setupLogger().Infof("👉 Architecture: %s", v.Architecture)
+	setupLogger().Infof("⏲ BuildTime: %s", v.BuildTime)
 }
 
 // printManifestsBuildInfo prints manifests build information
 func printManifestsBuildInfo() {
 	if manifestInfo, err := commonutils.GetManifestsBuildInfo(); err == nil {
 		for _, v := range manifestInfo {
-			setupLog.Info(v)
+			setupLogger().Info(v)
 		}
 	} else {
-		setupLog.Info("(ignore)Failed to get manifests build info: %v", err)
+		setupLogger().Infof("(ignore) Failed to get manifests build info: %v", err)
 	}
 }
 
@@ -155,9 +163,12 @@ func printManifestsBuildInfo() {
 func createManager() (ctrl.Manager, *remote.ClusterCacheTracker) {
 	config.ConfigurationFlag()
 
+	// ologger initialization via OLOGGER_CONFIG env var (set in Pod spec by ConfigMap mount)
+	// Config path: /etc/openFuyao/ologger/ologger.yaml (default ologger path)
+	// Config values: see config/ologger/ologger.yaml in project root
+	// Use default console encoder since log.Encoder is no longer available
 	opts := zap.Options{
 		Development: os.Getenv("DEBUG") == "true",
-		Encoder:     log.Encoder,
 	}
 	opts.BindFlags(flag.CommandLine)
 
@@ -188,12 +199,12 @@ func createManager() (ctrl.Manager, *remote.ClusterCacheTracker) {
 		}),
 	})
 	if err != nil {
-		setupLog.Error(err, "unable to start manager")
+		setupLogger().Errorf("unable to start manager: %v", err)
 		os.Exit(1)
 	}
 
 	if err := scriptshelper.CreateScriptsConfigMaps(mgr.GetClient()); err != nil {
-		setupLog.Error(err, "unable to create scripts configmaps")
+		setupLogger().Errorf("unable to create scripts configmaps: %v", err)
 	}
 
 	tracker, err := remote.NewClusterCacheTracker(
@@ -203,7 +214,7 @@ func createManager() (ctrl.Manager, *remote.ClusterCacheTracker) {
 		},
 	)
 	if err != nil {
-		setupLog.Error(err, "unable to create cluster cache tracker")
+		setupLogger().Errorf("unable to create cluster cache tracker: %v", err)
 		os.Exit(1)
 	}
 
@@ -212,14 +223,22 @@ func createManager() (ctrl.Manager, *remote.ClusterCacheTracker) {
 
 // setupControllers sets up the controllers
 func setupControllers(ctx context.Context, mgr ctrl.Manager, tracker *remote.ClusterCacheTracker) {
+	ociClient := newOCIClient()
+	releaseStore := releasemanifest.NewStore(releasemanifest.ReleaseCacheDir(), releasemanifest.OCIPuller{Client: ociClient}, nil)
+	setupBKEControllers(ctx, mgr, tracker, releaseStore)
+	setupUpgradeControllers(mgr, ociClient, releaseStore)
+}
+
+func setupBKEControllers(ctx context.Context, mgr ctrl.Manager, tracker *remote.ClusterCacheTracker, releaseStore *releasemanifest.Store) {
 	if err := (&capbkecontrollers.BKEClusterReconciler{
-		Client:     mgr.GetClient(),
-		Scheme:     mgr.GetScheme(),
-		Recorder:   mgr.GetEventRecorderFor("bke-cluster"),
-		RestConfig: mgr.GetConfig(),
-		Tracker:    tracker,
+		Client:       mgr.GetClient(),
+		Scheme:       mgr.GetScheme(),
+		Recorder:     mgr.GetEventRecorderFor("bke-cluster"),
+		RestConfig:   mgr.GetConfig(),
+		Tracker:      tracker,
+		ReleaseStore: releaseStore,
 	}).SetupWithManager(ctx, mgr, concurrency(config.BkeClusterConcurrency)); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "BKECluster")
+		setupLogger().Errorf("unable to create controller BKECluster: %v", err)
 		os.Exit(1)
 	}
 	if err := (&capbkecontrollers.BKEMachineReconciler{
@@ -227,9 +246,69 @@ func setupControllers(ctx context.Context, mgr ctrl.Manager, tracker *remote.Clu
 		Scheme:   mgr.GetScheme(),
 		Recorder: mgr.GetEventRecorderFor("bke-machine"),
 	}).SetupWithManager(mgr, concurrency(config.BkeMachineConcurrency)); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "BKEMachine")
+		setupLogger().Errorf("unable to create controller BKEMachine: %v", err)
 		os.Exit(1)
 	}
+}
+
+func setupUpgradeControllers(mgr ctrl.Manager, ociClient *oci.Client, releaseStore *releasemanifest.Store) {
+	upgradePathService := pathstore.NewService()
+	if err := (&clusterversioncontrollers.ClusterVersionReconciler{
+		Client:      mgr.GetClient(),
+		Scheme:      mgr.GetScheme(),
+		Recorder:    mgr.GetEventRecorderFor("cluster-version"),
+		PathService: upgradePathService,
+		OCIClient:   ociClient,
+	}).SetupWithManager(mgr); err != nil {
+		setupLogger().Errorf("unable to create controller ClusterVersion: %v", err)
+		os.Exit(1)
+	}
+	if err := (&releaseimagecontrollers.ReleaseImageReconciler{
+
+		Client:    mgr.GetClient(),
+		Scheme:    mgr.GetScheme(),
+		OCIClient: ociClient,
+		Store:     releaseStore,
+	}).SetupWithManager(mgr); err != nil {
+		setupLogger().Errorf("unable to create controller ReleaseImage: %v", err)
+		os.Exit(1)
+	}
+
+	if config.EnableOCIDigestMonitor {
+		setupLogger().Info("OCI digest monitor enabled",
+			"checkIntervalSeconds", config.OCIDigestCheckInterval,
+			"ociRef", pathstore.DefaultUpgradePathOCIRef())
+		if err := mgr.Add(pathstore.NewDigestMonitorRunnable(
+			mgr.GetClient(),
+			ociClient,
+			time.Duration(config.OCIDigestCheckInterval)*time.Second,
+		)); err != nil {
+			setupLogger().Errorf("unable to add digest monitor runnable: %v", err)
+			os.Exit(1)
+		}
+	} else {
+		setupLogger().Info("OCI digest monitor disabled")
+	}
+	setupUpgradePathController(mgr, upgradePathService)
+}
+
+func setupUpgradePathController(mgr ctrl.Manager, service pathstore.Loader) {
+	if err := (&upgradepathcontrollers.UpgradePathReconciler{
+		Client:      mgr.GetClient(),
+		Scheme:      mgr.GetScheme(),
+		PathService: service,
+	}).SetupWithManager(mgr); err != nil {
+		setupLogger().Errorf("unable to create controller UpgradePath: %v", err)
+		os.Exit(1)
+	}
+}
+
+func newOCIClient() *oci.Client {
+	return oci.NewClientFromConfig(oci.ClientConfig{
+		InsecureSkipTLSVerify: config.OCIRegistryInsecure,
+		Username:              config.OCIRegistryUsername,
+		Password:              config.OCIRegistryPassword,
+	})
 }
 
 // setupWebhooks sets up the webhooks
@@ -239,7 +318,14 @@ func setupWebhooks(mgr ctrl.Manager) {
 		NodeFetcher: nodeutil.NewNodeFetcher(mgr.GetClient()),
 		APIReader:   mgr.GetAPIReader(),
 	}).SetupWebhookWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create webhook", "webhook", "BKECluster")
+		setupLogger().Errorf("unable to create webhook BKECluster: %v", err)
+		os.Exit(1)
+	}
+	if err := (&capbkewebhooks.UpgradePath{
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
+	}).SetupWebhookWithManager(mgr); err != nil {
+		setupLogger().Errorf("unable to create webhook UpgradePath: %v", err)
 		os.Exit(1)
 	}
 }
@@ -247,11 +333,11 @@ func setupWebhooks(mgr ctrl.Manager) {
 // setupHealthChecks sets up health and ready checks for HTTP probe
 func setupHealthChecks(mgr ctrl.Manager) {
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
-		setupLog.Error(err, "unable to set up health check")
+		setupLogger().Errorf("unable to set up health check: %v", err)
 		os.Exit(1)
 	}
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
-		setupLog.Error(err, "unable to set up ready check")
+		setupLogger().Errorf("unable to set up ready check: %v", err)
 		os.Exit(1)
 	}
 }
@@ -308,15 +394,15 @@ func setupHealthEndpoints(mux *http.ServeMux) {
 
 // startHTTPSListener starts the HTTPS server listener in a goroutine
 func startHTTPSListener(server *http.Server, tlsConfig *tls.Config, certPath, keyPath string) {
-	setupLog.Info("starting HTTPS health check server", "address", server.Addr, "cert", certPath, "key", keyPath)
+	setupLogger().Info("starting HTTPS health check server", "address", server.Addr, "cert", certPath, "key", keyPath)
 	ln, err := net.Listen("tcp", server.Addr)
 	if err != nil {
-		setupLog.Error(err, "failed to listen on HTTPS health check port")
+		setupLogger().Errorf("failed to listen on HTTPS health check port: %v", err)
 		return
 	}
 	tlsListener := tls.NewListener(ln, tlsConfig)
 	if err = server.Serve(tlsListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		setupLog.Error(err, "HTTPS health check server error")
+		setupLogger().Errorf("HTTPS health check server error: %v", err)
 	}
 }
 
@@ -324,11 +410,11 @@ func startHTTPSListener(server *http.Server, tlsConfig *tls.Config, certPath, ke
 func setupGracefulShutdown(ctx context.Context, server *http.Server) {
 	go func() {
 		<-ctx.Done()
-		setupLog.Info("shutting down HTTPS health check server")
+		setupLogger().Info("shutting down HTTPS health check server")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
-			setupLog.Error(err, "error shutting down HTTPS health check server")
+			setupLogger().Errorf("error shutting down HTTPS health check server: %v", err)
 		}
 	}()
 }
@@ -407,11 +493,11 @@ func registerMetric(mgr ctrl.Manager) {
 	}
 
 	if err := mgr.AddMetricsExtraHandler("/export", bkemetrics.MetricRegister.HttpExportFunc()); err != nil {
-		setupLog.Error(err, "unable to set up extra metrics handler")
+		setupLogger().Errorf("unable to set up extra metrics handler: %v", err)
 		os.Exit(1)
 	}
 	if err := mgr.AddMetricsExtraHandler("/cluster", bkemetrics.MetricRegister.HttpClusterFunc()); err != nil {
-		setupLog.Error(err, "unable to set up extra metrics handler")
+		setupLogger().Errorf("unable to set up extra metrics handler: %v", err)
 		os.Exit(1)
 	}
 }
@@ -432,7 +518,7 @@ func registerProfiler(m ctrl.Manager) {
 	for path, handler := range endpoints {
 		err := m.AddMetricsExtraHandler(path, handler)
 		if err != nil {
-			setupLog.Error(err, "unable to set up pprof handler")
+			setupLogger().Errorf("unable to set up pprof handler: %v", err)
 			os.Exit(1)
 		}
 	}

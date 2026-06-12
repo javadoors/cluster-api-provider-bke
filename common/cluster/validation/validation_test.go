@@ -13,8 +13,10 @@
 package validation
 
 import (
-	"bou.ke/monkey"
+	"strings"
 	"testing"
+
+	"bou.ke/monkey"
 
 	"github.com/stretchr/testify/assert"
 
@@ -76,6 +78,33 @@ func TestValidateChartRepo(t *testing.T) {
 	addons = addon.Addons{v1beta1.Product{Type: addon.ChartAddon}}
 	err = ValidateChartRepo(chartRepo, addons)
 	assert.Error(t, err)
+}
+
+func TestResolveReachableHTTPRepoBaseURL(t *testing.T) {
+	monkey.Patch(checkReachable, func(addr string) bool {
+		return strings.HasPrefix(addr, "http.bocloud.k8s:") || strings.HasPrefix(addr, "reachable.example.com:")
+	})
+	defer monkey.UnpatchAll()
+
+	url := ResolveReachableHTTPRepoBaseURL(v1beta1.Repo{
+		Domain: "http.bocloud.k8s",
+		Ip:     "192.168.1.10",
+		Port:   "40080",
+	})
+	assert.Equal(t, "http://http.bocloud.k8s:40080", url)
+
+	url = ResolveReachableHTTPRepoBaseURL(v1beta1.Repo{
+		Domain: "unreachable.example.com",
+		Ip:     "192.168.1.10",
+		Port:   "40080",
+	})
+	assert.Equal(t, "http://192.168.1.10:40080", url)
+
+	url = ResolveReachableHTTPRepoBaseURL(v1beta1.Repo{
+		Domain: "reachable.example.com",
+		Port:   "8080",
+	})
+	assert.Equal(t, "http://reachable.example.com:8080", url)
 }
 
 func TestResolveReachableRepoAddress(t *testing.T) {

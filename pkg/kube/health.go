@@ -17,7 +17,6 @@ import (
 	"strings"
 
 	"github.com/pkg/errors"
-	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
@@ -26,6 +25,7 @@ import (
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/mfutil"
 	labelhelper "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/label"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 func (c *Client) CheckClusterHealth(cluster *bkev1beta1.BKECluster, currentVersion string, bkeNodes bkev1beta1.BKENodes) error {
@@ -66,7 +66,7 @@ func (c *Client) CheckClusterHealth(cluster *bkev1beta1.BKECluster, currentVersi
 		return kerrors.NewAggregate(errs)
 	}
 
-	log.Infof("cluster %q health check pass", cluster.Name)
+	log.Infof("cluster %s/%s health check pass", cluster.Namespace, cluster.Name)
 	return nil
 }
 
@@ -158,6 +158,12 @@ var extraAddonComponents = []AddonCheck{
 				Namespace: "openfuyao-system-controller",
 				Prefixes:  []string{"openfuyao-system-controller-"},
 			},
+			{
+				Namespace: "cluster-system",
+				Prefixes: []string{
+					"bkeagent-deployer",
+				},
+			},
 		},
 	},
 }
@@ -189,7 +195,7 @@ func checkItemContains(checkItem string, neededAddons []string) bool {
 }
 
 // CheckAllComponentsHealth check all components health
-func (c *Client) CheckAllComponentsHealth(cluster *bkev1beta1.BKECluster, log *zap.SugaredLogger) error {
+func (c *Client) CheckAllComponentsHealth(cluster *bkev1beta1.BKECluster, log *log.Logger) error {
 	var errs []error
 	for _, check := range neededComponentChecks {
 		if err := c.processComponentCheck(check); err != nil {
@@ -277,21 +283,75 @@ func (c *Client) verifyComponentPods(pods []corev1.Pod, prefix string, namespace
 
 	// if coredns pod, one coredns pod is ok should be ok.
 	if prefix == "coredns" {
+		var errs []error
 		for _, pod := range matched {
-			if pod.Status.Phase == corev1.PodRunning {
-				return kerrors.NewAggregate(errs)
+			if err := isPodHealthy(pod); err == nil {
+				return nil
+			} else {
+				errs = append(errs, fmt.Errorf("pod %s/%s unhealthy: %v", pod.Namespace, pod.Name, err))
 			}
 		}
-		errs = append(errs, fmt.Errorf("pod %s/%s status: %s", matched[0].Namespace, matched[0].Name, matched[0].Status.Phase))
 		return kerrors.NewAggregate(errs)
 	}
 
 	for _, pod := range matched {
-		if pod.Status.Phase != corev1.PodRunning {
-			errs = append(errs, fmt.Errorf("pod %s/%s status: %s", pod.Namespace, pod.Name, pod.Status.Phase))
+		if err := isPodHealthy(pod); err != nil {
+			errs = append(errs, fmt.Errorf("pod %s/%s unhealthy: %v", pod.Namespace, pod.Name, err))
 		}
 	}
 	return kerrors.NewAggregate(errs)
+}
+
+func isPodHealthy(pod corev1.Pod) error {
+	if pod.Status.Phase != corev1.PodRunning {
+		return fmt.Errorf("status: %s", pod.Status.Phase)
+	}
+
+	if !isPodReadyConditionTrue(pod) {
+		return fmt.Errorf("pod condition Ready is not True")
+	}
+
+	for _, cs := range pod.Status.InitContainerStatuses {
+		// init container successfully completed: Terminated with ExitCode=0, skip
+		if cs.State.Terminated != nil && cs.State.Terminated.ExitCode == 0 {
+			continue
+		}
+		if !cs.Ready {
+			return fmt.Errorf("init container %s not ready", cs.Name)
+		}
+		if cs.State.Waiting != nil && isFatalWaitingReason(cs.State.Waiting.Reason) {
+			return fmt.Errorf("init container %s waiting reason: %s", cs.Name, cs.State.Waiting.Reason)
+		}
+	}
+
+	for _, cs := range pod.Status.ContainerStatuses {
+		if !cs.Ready {
+			return fmt.Errorf("container %s not ready", cs.Name)
+		}
+		if cs.State.Waiting != nil && isFatalWaitingReason(cs.State.Waiting.Reason) {
+			return fmt.Errorf("container %s waiting reason: %s", cs.Name, cs.State.Waiting.Reason)
+		}
+	}
+
+	return nil
+}
+
+func isPodReadyConditionTrue(pod corev1.Pod) bool {
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodReady {
+			return condition.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+func isFatalWaitingReason(reason string) bool {
+	switch reason {
+	case "CrashLoopBackOff", "ImagePullBackOff", "ErrImagePull", "CreateContainerConfigError", "CreateContainerError":
+		return true
+	default:
+		return false
+	}
 }
 
 func filterPodsWithPrefix(pods []corev1.Pod, prefix string) []corev1.Pod {
@@ -304,7 +364,8 @@ func filterPodsWithPrefix(pods []corev1.Pod, prefix string) []corev1.Pod {
 	return filtered
 }
 
-func (c *Client) NodeHealthCheck(node *corev1.Node, expectVersion string, log *zap.SugaredLogger) error {
+// NodeHealthCheck performs a health check on the given node.
+func (c *Client) NodeHealthCheck(node *corev1.Node, expectVersion string, log *log.Logger) error {
 	return c.nodeHealthCheck(node, expectVersion, log, c.CheckComponentHealth)
 }
 
@@ -312,7 +373,7 @@ func (c *Client) NodeHealthCheck(node *corev1.Node, expectVersion string, log *z
 func (c *Client) nodeHealthCheck(
 	node *corev1.Node,
 	expectVersion string,
-	log *zap.SugaredLogger,
+	log *log.Logger,
 	componentCheckFunc func(*corev1.Node) error,
 ) error {
 	// Step 1: 检查节点就绪状态
