@@ -449,3 +449,240 @@ Phase.Execute() → 升级 Etcd
 
 这种设计实现了**配置驱动**的升级流程：发布包定义升级组件 → Factory 注册执行器 → DAG 编排执行顺序 → Runner 执行具体操作。
 
+# 升级失败时的重试机制
+
+1. **Reconcile 循环机制**：Kubernetes Controller 的 Reconcile 函数会被自动重新调用，这是基本的重试机制。
+
+2. **executeUpgradeDAG 的错误处理**：
+   - 在 bkecluster_upgrade_dag.go:112-117，当 DAG 执行失败时：
+     ```go
+     if err := sched.ExecuteDAG(ctx, phaseCtx, oldCluster, newCluster, dag); err != nil {
+         _ = r.patchClusterStatus(newCluster, bkev1beta1.ClusterUpgradeFailed)
+         if res, requeue := dagexec.RequeueAwareError(err); requeue {
+             return res, err  // 返回重试结果
+         }
+         return ctrl.Result{}, err  // 返回空结果，但仍然会触发 Reconcile
+     }
+     ```
+
+3. **RequeueAwareError 函数**：
+   - 在 scheduler.go:403-409，这个函数总是返回 `(ctrl.Result{}, true)`，表示需要重试。
+   - 即使返回空 Result，Controller 也会重新触发 Reconcile。
+
+4. **Reconcile 函数的错误处理**：
+   - 在 bkecluster_controller.go:135-138：
+     ```go
+     phaseResult, err := r.executePhaseFlow(ctx, bkeCluster, oldBkeCluster, bkeLogger)
+     if err != nil {
+         return ctrl.Result{}, err  // 返回错误，触发 Reconcile 重试
+     }
+     ```
+
+5. **DAG 执行的批次处理**：
+   - 在 scheduler.go:125-132，如果某个批次失败，会停止后续批次的执行（failFastStop），但会返回聚合的错误。
+   - 在 scheduler.go:220-232，persistBatchResults 会标记失败的组件。
+
+6. **状态管理**：
+   - 升级失败时会设置 ClusterUpgradeFailed 状态。
+   - 但 annotation `cvo.openfuyao.cn/upgrade-ready` 可能仍然存在，导致下次 Reconcile 时继续尝试升级。
+
+总结：代码实现确实有重试机制，通过 Kubernetes Controller 的 Reconcile 循环自动重试。
+根据代码分析，升级失败时**确实会重试**，但重试机制存在一些需要注意的点。
+
+## **重试机制分析**
+
+### **1. Kubernetes Controller 自动重试**
+
+[bkecluster_controller.go:135-138](file:///cluster-api-provider-bke\controllers\capbke\bkecluster_controller.go#L135-L138)
+```go
+phaseResult, err := r.executePhaseFlow(ctx, bkeCluster, oldBkeCluster, bkeLogger)
+if err != nil {
+    return ctrl.Result{}, err  // 返回错误，触发 Controller 自动重试
+}
+```
+- **机制**：Controller Runtime 会自动重新触发 Reconcile
+- **时机**：立即重试（无延迟）
+
+### **2. DAG 执行失败处理**
+
+[bkecluster_upgrade_dag.go:112-117](file:///\cluster-api-provider-bke\controllers\capbke\bkecluster_upgrade_dag.go#L112-L117)
+```go
+if err := sched.ExecuteDAG(ctx, phaseCtx, oldCluster, newCluster, dag); err != nil {
+    _ = r.patchClusterStatus(newCluster, bkev1beta1.ClusterUpgradeFailed)
+    if res, requeue := dagexec.RequeueAwareError(err); requeue {
+        return res, err  // 返回重试结果
+    }
+    return ctrl.Result{}, err  // 返回空结果，但仍会触发 Reconcile
+}
+```
+
+### **3. RequeueAwareError 实现**
+
+[scheduler.go:403-409](file:///\cluster-api-provider-bke\pkg\dagexec\scheduler.go#L403-L409)
+```go
+func RequeueAwareError(err error) (ctrl.Result, bool) {
+    if err == nil {
+        return ctrl.Result{}, false
+    }
+    return ctrl.Result{}, true  // 总是返回 true，表示需要重试
+}
+```
+**关键点**：即使返回空 `ctrl.Result{}`，Controller 仍会重新触发 Reconcile。
+
+### **4. DAG 批次执行策略**
+
+[scheduler.go:125-132](file:///\cluster-api-provider-bke\pkg\dagexec\scheduler.go#L125-L132)
+```go
+for batchIdx, batch := range batches {
+    batchErrs, failFastStop := s.executeBatchParallel(...)
+    if len(batchErrs) > 0 {
+        agg = append(agg, batchErrs...)
+    }
+    if failFastStop {
+        return kerrors.NewAggregate(agg)  // FailFast：立即停止后续批次
+    }
+}
+return kerrors.NewAggregate(agg)  // 返回所有错误
+```
+**行为**：
+- **FailFast 策略**：某个组件失败时，停止后续批次执行
+- **错误聚合**：收集所有批次中的错误并返回
+
+### **5. 失败组件标记**
+
+[scheduler.go:220-232](file:///cluster-api-provider-bke\pkg\dagexec\scheduler.go#L220-L232)
+```go
+func (s *Scheduler) persistBatchResults(...) ([]error, bool) {
+    for _, r := range results {
+        if r.err != nil {
+            // 标记组件失败
+            if persistErr := s.markComponentFailed(phaseCtx, r.node, r.err); persistErr != nil {
+                batchErrs = append(batchErrs, ...)
+            }
+            batchErrs = append(batchErrs, fmt.Errorf("%s: %w", compName, r.err))
+            if r.node.FailurePolicy == topology.FailurePolicyFailFast {
+                failFastStop = true  // 触发 FailFast
+            }
+        }
+    }
+}
+```
+
+## **重试流程**
+
+### **失败后的 Reconcile 循环**
+
+```
+第一次 Reconcile:
+  ↓
+executeUpgradeDAG
+  ↓
+ExecuteDAG (执行批次)
+  ↓
+某个组件失败 (如 EtcdUpgrade)
+  ↓
+markComponentFailed (标记失败)
+  ↓
+返回错误
+  ↓
+Reconcile 返回 ctrl.Result{}, err
+  ↓
+Controller 自动重新触发 Reconcile (立即重试)
+
+第二次 Reconcile:
+  ↓
+检查 annotation: cvo.openfuyao.cn/upgrade-ready
+  ↓
+如果 annotation 存在 → 继续执行 executeUpgradeDAG
+  ↓
+重新执行 DAG (从头开始？还是从失败点？)
+```
+
+## **潜在问题**
+
+### **1. 缺少重试延迟**
+
+当前实现返回 `ctrl.Result{}, err`，这意味着：
+- **立即重试**，无延迟
+- 可能导致快速失败循环（如网络问题、资源不足）
+- **建议**：应该添加 `RequeueAfter` 延迟
+
+```go
+// 当前实现
+return ctrl.Result{}, err
+
+// 建议改进
+return ctrl.Result{RequeueAfter: 30 * time.Second}, err
+```
+
+### **2. Annotation 未清理**
+
+升级失败时：
+- 设置了 `ClusterUpgradeFailed` 状态
+- 但 `cvo.openfuyao.cn/upgrade-ready` annotation 可能仍然存在
+- 导致每次 Reconcile 都会尝试升级
+
+**问题**：可能陷入无限升级循环
+
+### **3. 缺少幂等性保护**
+
+DAG 执行是否支持：
+- 从失败点继续执行？
+- 还是每次都从头开始？
+
+查看 `shouldSkipComponent` 逻辑：
+[scheduler.go:145-150](file:///\cluster-api-provider-bke\pkg\dagexec\scheduler.go#L145-L150)
+```go
+func (s *Scheduler) shouldSkipComponent(phaseCtx *phaseframe.PhaseContext, node *topology.ComponentNode) bool {
+    // 检查组件是否已完成
+    if phaseCtx.BKECluster.Status.DeclarativeUpgrade != nil {
+        if phaseCtx.BKECluster.Status.DeclarativeUpgrade.IsComponentCompleted(node.Name) {
+            return true  // 跳过已完成的组件
+        }
+    }
+}
+```
+**好消息**：已完成的组件会被跳过，支持断点续传。
+
+### **4. 失败组件的重试**
+
+失败组件在下次 Reconcile 时：
+- 会重新尝试执行（因为未标记为 Completed）
+- 但可能缺少失败次数限制
+
+## **总结**
+
+✅ **有重试机制**：
+- Controller 自动重试（通过 Reconcile 循环）
+- DAG 支持断点续传（跳过已完成组件）
+- 失败组件会在下次 Reconcile 时重新尝试
+
+⚠️ **存在的问题**：
+1. **无重试延迟**：立即重试可能导致快速失败循环
+2. **缺少失败次数限制**：可能无限重试
+3. **Annotation 未清理**：升级失败后 annotation 可能仍存在
+4. **缺少退避策略**：没有指数退避机制
+
+## **改进建议**
+
+```go
+// 1. 添加重试延迟
+const upgradeFailureRequeueInterval = 30 * time.Second
+
+if err := sched.ExecuteDAG(...); err != nil {
+    _ = r.patchClusterStatus(newCluster, bkev1beta1.ClusterUpgradeFailed)
+    return ctrl.Result{RequeueAfter: upgradeFailureRequeueInterval}, err
+}
+
+// 2. 添加失败次数限制
+if bkeCluster.Status.DeclarativeUpgrade.FailureCount > 5 {
+    // 清理 annotation，停止升级
+    r.clearUpgradeReadyAnnotation(bkeCluster)
+    return ctrl.Result{}, nil
+}
+
+// 3. 添加指数退避
+requeueAfter := calculateBackoff(bkeCluster.Status.DeclarativeUpgrade.FailureCount)
+return ctrl.Result{RequeueAfter: requeueAfter}, err
+```
+总体来说，**代码有重试机制，但缺少完善的错误处理策略**，可能导致升级失败后的行为不够优雅。
