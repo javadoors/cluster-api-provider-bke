@@ -253,3 +253,199 @@ DeclarativeClusterUpgradePhaseNames = []confv1beta1.BKEClusterPhase{
 
 总体来说，**设计是合理的，不会重复执行核心升级 Phase**。防重复机制通过标志位和 Phase 名称判断实现，确保了升级流程的正确性。
 
+# `componentfactory.NewFactoryFromBundle(bundle)` 的功能
+
+现在我已经收集了足够的信息来解释 `componentfactory.NewFactoryFromBundle(bundle)` 的功能。让我整理一下：
+1. **主要功能**：从 Bundle 创建 ComponentFactory，注册 inline 升级 Phase
+2. **核心流程**：
+   - 创建空的 ComponentFactory
+   - 从 Bundle 中提取升级组件
+   - 注册 inline handler（如 EtcdUpgrade、MasterUpgrade 等）
+3. **关键组件**：
+   - ComponentFactory：Phase 工厂注册表
+   - PhaseRunner：执行 inline Phase
+   - Inline Handler：具体的升级 Phase
+
+根据代码分析，`componentfactory.NewFactoryFromBundle(bundle)` 的核心功能是**从发布包中构建组件工厂，用于声明式升级 DAG 的 inline handler 执行**。
+
+## **核心功能**
+
+[bundle_registry.go:25-32](file:///\cluster-api-provider-bke\pkg\componentfactory\bundle_registry.go#L25-L32)
+```go
+func NewFactoryFromBundle(bundle *releasemanifest.Bundle) (*ComponentFactory, error) {
+    f := NewComponentFactory()  // 创建空工厂
+    if err := RegisterInlinePhasesFromBundle(f, bundle); err != nil {
+        return nil, err  // 注册 inline Phase
+    }
+    return f, nil
+}
+```
+
+## **详细流程**
+
+### **1. 创建 ComponentFactory**
+
+[factory.go:33-43](file:///\cluster-api-provider-bke\pkg\componentfactory\factory.go#L33-L43)
+```go
+type ComponentFactory struct {
+    mu       sync.RWMutex
+    registry map[string]ComponentInstance  // key: "{name}@{version}"
+}
+
+type ComponentInstance struct {
+    Name    string
+    Version string
+    Factory PhaseFactory  // Phase 创建函数
+}
+```
+- **作用**：Phase 工厂注册表，按 `name@version` 存储 Phase 创建函数
+- **线程安全**：使用读写锁保护并发访问
+
+### **2. 注册 Inline Phases**
+
+[bundle_registry.go:35-62](file:///\cluster-api-provider-bke\pkg\componentfactory\bundle_registry.go#L35-L62)
+```go
+func RegisterInlinePhasesFromBundle(f *ComponentFactory, bundle *releasemanifest.Bundle) error {
+    // 从 Bundle 提取升级组件
+    components, err := upgrade.UpgradeComponentsFromBundle(bundle)
+    
+    // 遍历每个组件
+    for _, comp := range components {
+        if comp.Inline == nil || comp.Inline.Handler == "" {
+            continue  // 跳过非 inline 组件
+        }
+        
+        // 获取 ComponentVersion（如果存在）
+        var componentVersion *cvv1alpha1.ComponentVersion
+        if cv, ok := bundle.Components[releasemanifest.ComponentKey(comp.Name, comp.Version)]; ok {
+            componentVersion = cv.DeepCopy()
+        }
+        
+        // 注册 inline handler
+        registerInlineComponent(f, comp.Inline.Handler, version, componentVersion)
+    }
+}
+```
+
+### **3. Handler 映射**
+
+[registry.go:23-42](file:///\cluster-api-provider-bke\pkg\componentfactory\registry.go#L23-L42)
+```go
+func registerInlineHandler(f *ComponentFactory, handler, version string) error {
+    switch handler {
+    case upgrade.InlineHandlerEtcdUpgrade:
+        f.Register(handler, version, phases.NewEnsureEtcdUpgrade)
+    case upgrade.InlineHandlerMasterUpgrade:
+        f.Register(handler, version, phases.NewEnsureMasterUpgrade)
+    case upgrade.InlineHandlerWorkerUpgrade:
+        f.Register(handler, version, phases.NewEnsureWorkerUpgrade)
+    case upgrade.InlineHandlerContainerdUpgrade:
+        f.Register(handler, version, phases.NewEnsureContainerdUpgrade)
+    case upgrade.InlineHandlerAgentUpgrade:
+        f.Register(handler, version, phases.NewEnsureAgentUpgrade)
+    default:
+        return fmt.Errorf("unknown inline handler %q", handler)
+    }
+}
+```
+支持的 Inline Handler：
+
+[catalog.go:20-25](file:///\cluster-api-provider-bke\pkg\upgrade\catalog.go#L20-L25)
+```go
+InlineHandlerPreUpgradeResources = "EnsurePreUpgradeResources"
+InlineHandlerEtcdUpgrade         = "EnsureEtcdUpgrade"
+InlineHandlerMasterUpgrade       = "EnsureMasterUpgrade"
+InlineHandlerWorkerUpgrade       = "EnsureWorkerUpgrade"
+InlineHandlerContainerdUpgrade   = "EnsureContainerdUpgrade"
+InlineHandlerAgentUpgrade        = "EnsureAgentUpgrade"
+```
+
+## **使用场景**
+
+### **在 DAG 执行中**
+
+[bkecluster_upgrade_dag.go:100-107](file:///\cluster-api-provider-bke\controllers\capbke\bkecluster_upgrade_dag.go#L100-L107)
+```go
+factory, err := componentfactory.NewFactoryFromBundle(bundle)
+
+sched := dagexec.NewScheduler(dagexec.Config{
+    InlineRunner: &componentfactory.PhaseRunner{Factory: factory},  // 关键：作为 inline 执行器
+    ManifestStore: manifest.NewBundleStore(bundle),
+    ManifestApplier: r.buildManifestApplier(...),
+})
+
+sched.ExecuteDAG(ctx, phaseCtx, oldCluster, newCluster, dag)
+```
+
+### **PhaseRunner 执行**
+
+[runner.go:28-52](file:///\cluster-api-provider-bke\pkg\componentfactory\runner.go#L28-L52)
+```go
+func (r *PhaseRunner) Execute(phaseCtx, oldCluster, newCluster, handler, version) error {
+    // 1. 从 Factory 解析 Phase
+    phase, err := ResolveInlineUpgrade(r.Factory, handler, version, phaseCtx)
+    
+    // 2. 检查是否需要执行
+    if !phase.NeedExecute(oldCluster, newCluster) {
+        return nil
+    }
+    
+    // 3. 执行 Phase
+    phase.ExecutePreHook()
+    result, err := phase.Execute()
+    phase.ExecutePostHook(err)
+    
+    return err
+}
+```
+
+## **核心价值**
+
+### **1. 解耦设计**
+- **Bundle → Factory**：将发布包中的 inline handler 定义转换为可执行的 Phase 工厂
+- **Factory → Phase**：通过注册表动态创建 Phase 实例
+- **DAG → Runner**：DAG 调度器通过 PhaseRunner 执行 inline handler
+
+### **2. 动态注册**
+- 根据 Bundle 中的 `upgrade.components[].inline.handler` 动态注册 Phase
+- 支持不同版本的同一 handler（如 `EnsureEtcdUpgrade@v1.0.0` 和 `EnsureEtcdUpgrade@v1.1.0`）
+
+### **3. 版本上下文注入**
+- 通过 `ComponentVersion` 为 Phase 提供版本信息
+- 特殊处理 `EnsurePreUpgradeResources`（需要 ComponentVersion）
+
+## **执行流程示意**
+
+```
+Bundle (release.yaml)
+  ↓
+  upgrade.components:
+    - name: etcd
+      version: 3.5.0
+      inline:
+        handler: EnsureEtcdUpgrade
+        version: manifest
+  ↓
+NewFactoryFromBundle
+  ↓
+ComponentFactory.registry:
+  "EnsureEtcdUpgrade@manifest" → phases.NewEnsureEtcdUpgrade
+  ↓
+DAG Scheduler
+  ↓
+PhaseRunner.Execute("EnsureEtcdUpgrade", "manifest")
+  ↓
+Factory.Resolve → Phase 实例
+  ↓
+Phase.Execute() → 升级 Etcd
+```
+
+## **总结**
+
+`componentfactory.NewFactoryFromBundle(bundle)` 是声明式升级架构的**核心桥梁**：
+1. **解析 Bundle**：从发布包中提取 inline handler 定义
+2. **注册 Phase**：将 handler 名称映射到具体的 Phase 创建函数
+3. **提供执行器**：为 DAG 调度器提供 PhaseRunner，用于执行 inline 升级操作
+
+这种设计实现了**配置驱动**的升级流程：发布包定义升级组件 → Factory 注册执行器 → DAG 编排执行顺序 → Runner 执行具体操作。
+
