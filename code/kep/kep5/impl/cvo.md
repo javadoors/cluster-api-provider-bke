@@ -686,3 +686,269 @@ requeueAfter := calculateBackoff(bkeCluster.Status.DeclarativeUpgrade.FailureCou
 return ctrl.Result{RequeueAfter: requeueAfter}, err
 ```
 总体来说，**代码有重试机制，但缺少完善的错误处理策略**，可能导致升级失败后的行为不够优雅。
+
+# componentManifestPaths
+现在我已经收集了足够的信息来分析 `CollectComponentManifests` 函数的作用。让我整理一下：
+
+1. **函数签名和位置**：
+   - 位于 `pkg/release/manifest/component_files.go`
+   - 函数签名：`func CollectComponentManifests(bundle *Bundle, name, version string) [][]byte`
+2. **核心功能**（从代码注释和实现）：
+   - 从 Bundle 中收集指定组件的所有 YAML 清单文件
+   - 按顺序返回：先收集文件系统中的 YAML 文件，再添加 ComponentVersion.spec.resources[].manifest 中的内联清单
+3. **实现细节**：
+   - 从 `bundle.Files` 中查找 `components/<name>/<version>/` 目录下的 YAML 文件
+   - 排除 `component.yaml` 和 `release.yaml`
+   - 按文件名排序（确保依赖顺序）
+   - 从 `bundle.Components` 中查找 ComponentVersion，提取内联 manifest
+4. **使用场景**：
+   - 在 `pkg/manifest/bundle_store.go` 中被 `BundleStore.GetComponentManifests` 调用
+   - 用于声明式升级 DAG 中的 manifest 类型组件执行
+5. **测试案例**：
+   - 测试显示会收集 3 个清单：
+     - `01-cm.yaml` (ConfigMap)
+     - `02-rbac.yaml` (ClusterRole)
+     - ComponentVersion.spec.resources[].manifest (Service)
+
+根据代码分析，`CollectComponentManifests` 函数的核心作用是**从发布包中收集指定组件的所有 Kubernetes YAML 清单文件，用于声明式升级的 manifest 类型组件执行**。
+
+## **函数定义**
+
+[component_files.go:22-44](file:///\cluster-api-provider-bke\pkg\release\manifest\component_files.go#L22-L44)
+```go
+// CollectComponentManifests gathers apply-ready YAML documents for a component from a resolved bundle.
+// Sources (in order): numbered YAML files under components/<name>/<version>/ or components/<name>/,
+// then inline documents from ComponentVersion.spec.resources[].manifest.
+func CollectComponentManifests(bundle *Bundle, name, version string) [][]byte {
+    if bundle == nil {
+        return nil
+    }
+    
+    var out [][]byte
+    
+    // 1. 收集文件系统中的 YAML 文件
+    for _, path := range componentManifestPaths(bundle.Files, name, version) {
+        if data := bundle.Files[path]; len(data) > 0 {
+            out = append(out, data)
+        }
+    }
+    
+    // 2. 收集 ComponentVersion 中的内联 manifest
+    key := ComponentKey(name, version)
+    if cv, ok := bundle.Components[key]; ok {
+        for _, res := range cv.Spec.Resources {
+            if res.Manifest != "" {
+                out = append(out, []byte(res.Manifest))
+            }
+        }
+    }
+    
+    return out
+}
+```
+
+## **收集顺序**
+
+### **1. 文件系统中的 YAML 文件**
+
+[component_files.go:46-68](file:///\cluster-api-provider-bke\pkg\release\manifest\component_files.go#L46-L68)
+```go
+func componentManifestPaths(files map[string][]byte, name, version string) []string {
+    prefixes := componentDirPrefixes(name, version)
+    var paths []string
+    
+    for path := range files {
+        slashPath := filepath.ToSlash(path)
+        base := filepath.Base(slashPath)
+        
+        // 排除 component.yaml 和 release.yaml
+        if base == "component.yaml" || base == "release.yaml" {
+            continue
+        }
+        
+        // 只收集 YAML 文件
+        if !isYAMLFile(base) {
+            continue
+        }
+        
+        // 匹配组件目录前缀
+        if !matchesComponentPrefix(slashPath, prefixes) {
+            continue
+        }
+        
+        paths = append(paths, path)
+    }
+    
+    // 按文件名排序（确保依赖顺序）
+    sort.Strings(paths)
+    return paths
+}
+```
+**目录结构**：
+```
+components/
+  ├── provider/
+  │   ├── v1.0.0/
+  │   │   ├── component.yaml       # 排除
+  │   │   ├── 01-cm.yaml           # 收集（ConfigMap）
+  │   │   ├── 02-rbac.yaml         # 收集（ClusterRole）
+  │   │   └── 03-deployment.yaml   # 收集
+  │   └── v1.1.0/
+  │       └── ...
+  └── coredns/
+      └── v1.0.0/
+          └── ...
+```
+**关键规则**：
+- **排除**：`component.yaml`（元数据文件）、`release.yaml`（发布定义）
+- **包含**：所有 `.yaml` 或 `.yml` 文件
+- **排序**：按文件名排序，确保依赖顺序（如先创建 ConfigMap，再创建 Deployment）
+
+### **2. ComponentVersion 内联 Manifest**
+
+从 `ComponentVersion.spec.resources[].manifest` 中提取：
+```yaml
+apiVersion: v1alpha1
+kind: ComponentVersion
+metadata:
+  name: provider@v1.0.0
+spec:
+  name: provider
+  version: v1.0.0
+  resources:
+    - manifest: |
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: provider-service
+        spec:
+          ports:
+            - port: 8080
+```
+
+## **使用场景**
+
+### **在 DAG 执行中**
+
+[bundle_store.go:46-52](file:///\cluster-api-provider-bke\pkg\manifest\bundle_store.go#L46-L52)
+```go
+func (s *BundleStore) GetComponentManifests(name, version string) (*ComponentPackage, error) {
+    manifests := releasemanifest.CollectComponentManifests(s.bundle, name, version)
+    return &ComponentPackage{
+        Name:      name,
+        Version:   version,
+        Manifests: manifests,  // 所有 YAML 清单
+    }, nil
+}
+```
+
+### **在 Scheduler 中执行 Manifest**
+
+[scheduler.go:336](file:///\cluster-api-provider-bke\pkg\dagexec\scheduler.go#L336)
+```go
+func (s *Scheduler) executeComponent(...) error {
+    if node.Inline != nil {
+        return s.executeInline(...)  // inline 类型
+    }
+    return s.executeManifest(ctx, phaseCtx, node, tmpl)  // manifest 类型
+}
+```
+
+## **测试案例**
+
+[component_files_test.go:14-49](file:///\cluster-api-provider-bke\pkg\release\manifest\component_files_test.go#L14-L49)
+```go
+func TestCollectComponentManifests_FromBundleFiles(t *testing.T) {
+    bundle := &Bundle{
+        Files: map[string][]byte{
+            "release.yaml": []byte("kind: ReleaseImage"),
+            "components/provider/v1.0.0/component.yaml": []byte("kind: ComponentVersion"),
+            "components/provider/v1.0.0/02-rbac.yaml":   []byte("kind: ClusterRole"),
+            "components/provider/v1.0.0/01-cm.yaml":     []byte("kind: ConfigMap"),
+            "components/other/v1.0.0/01-cm.yaml":        []byte("kind: Secret"),
+        },
+        Components: map[string]apiv1.ComponentVersion{
+            ComponentKey("provider", "v1.0.0"): {
+                Spec: apiv1.ComponentVersionSpec{
+                    Resources: []apiv1.ResourceSpec{{
+                        Manifest: "kind: Service",  // 内联 manifest
+                    }},
+                },
+            },
+        },
+    }
+    
+    manifests := CollectComponentManifests(bundle, "provider", "v1.0.0")
+    
+    // 验证收集了 3 个清单（按顺序）
+    if len(manifests) != 3 {
+        t.Fatalf("got %d manifests, want 3", len(manifests))
+    }
+    
+    // 验证顺序：文件排序 + 内联 manifest
+    if string(manifests[0]) != "kind: ConfigMap" {  // 01-cm.yaml
+        t.Fatalf("first manifest order: %q", manifests[0])
+    }
+    if string(manifests[1]) != "kind: ClusterRole" {  // 02-rbac.yaml
+        t.Fatalf("second manifest: %q", manifests[1])
+    }
+    if string(manifests[2]) != "kind: Service" {  // ComponentVersion 内联
+        t.Fatalf("inline manifest: %q", manifests[2])
+    }
+}
+```
+
+## **核心价值**
+
+### **1. 组件资源收集**
+- 从 Bundle 中提取指定组件的所有 Kubernetes 资源定义
+- 支持两种来源：文件系统 YAML + ComponentVersion 内联
+
+### **2. 依赖顺序保证**
+- 按文件名排序（如 `01-xxx.yaml`、`02-xxx.yaml`）
+- 确保 Kubernetes 资源按正确顺序创建（如先创建 ConfigMap，再创建 Deployment）
+
+### **3. 声明式升级支持**
+- 为 DAG 执行器提供 manifest 类型组件的资源清单
+- 通过 `ClusterApplier.ApplyComponent` 应用到集群
+
+## **执行流程示意**
+
+```
+Bundle (OCI 制品)
+  ↓
+  Files:
+    components/provider/v1.0.0/01-cm.yaml
+    components/provider/v1.0.0/02-rbac.yaml
+  ↓
+  Components:
+    provider@v1.0.0:
+      spec.resources[].manifest: "kind: Service"
+  ↓
+CollectComponentManifests("provider", "v1.0.0")
+  ↓
+返回:
+  [
+    []byte("kind: ConfigMap"),      // 01-cm.yaml
+    []byte("kind: ClusterRole"),    // 02-rbac.yaml
+    []byte("kind: Service"),        // ComponentVersion 内联
+  ]
+  ↓
+ComponentPackage{Manifests: ...}
+  ↓
+ClusterApplier.ApplyComponent(pkg)
+  ↓
+应用到 Kubernetes 集群
+```
+
+## **总结**
+
+`CollectComponentManifests` 是声明式升级架构中的**资源收集器**：
+1. **统一来源**：整合文件系统 YAML 和 ComponentVersion 内联 manifest
+2. **顺序保证**：按文件名排序，确保资源创建顺序正确
+3. **灵活配置**：支持两种 manifest 定义方式（文件 + 内联）
+4. **DAG 支持**：为 manifest 类型组件提供可执行的 YAML 清单列表
+
+这种设计实现了**配置驱动的资源管理**：发布包定义组件资源 → CollectComponentManifests 收集清单 → DAG 编排执行顺序 → ClusterApplier 应用到集群。
+
+# 
