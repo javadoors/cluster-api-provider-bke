@@ -44,9 +44,9 @@
 | 范围 | 说明 |
 |------|------|
 | CRD 扩展 | ComponentVersion 新增 binary/helm 类型的完整字段定义 |
-| 核心安装器 | BinaryInstaller、HelmInstaller 的完整实现 |
+| 核心安装器 | BinaryInstaller、HelmInstaller、ManifestApplier 的完整实现 |
 | 渲染引擎 | TemplateRenderer、ConfigRenderer 的完整实现 |
-| DAG 集成 | BinaryComponentExecutor、HelmComponentExecutor |
+| DAG 集成 | BinaryComponentExecutor、HelmComponentExecutor、ManifestComponentExecutor |
 | 迁移策略 | Feature Gate、向后兼容、灰度发布 |
 
 ### 1.3 设计约束
@@ -2017,24 +2017,26 @@ func (r *ConfigRenderer) buildTemplateData(ctx context.Context, opts InstallOpti
                     └────────────────────┬─────────────────┘
                                          │
               ┌──────────────────────────┼──────────────────────────┐
-              │                          │                          │
-              ▼                          ▼                          ▼
-    ┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
-    │  ComponentType  │      │  ComponentType  │      │  ComponentType  │
-    │  Binary         │      │  Helm           │      │  Inline         │
-    │                 │      │                 │      │                 │
-    └────────┬────────┘      └────────┬────────┘      └────────┬────────┘
-             │                        │                        │
-             ▼                        ▼                        ▼
-    ┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
-    │  创建           │      │  创建           │      │  创建           │
-    │  BinaryComponent│      │  HelmComponent  │      │  InlineComponent│
-    │  Executor       │      │  Executor       │      │  Executor       │
-    └────────┬────────┘      └────────┬────────┘      └────────┬────────┘
-             │                        │                        │
-             └────────────────────────┼────────────────────────┘
-                                      │
-                                      ▼
+              │                          │                          │                          │
+              ▼                          ▼                          ▼                          ▼
+    ┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
+    │  ComponentType  │      │  ComponentType  │      │  ComponentType  │      │  ComponentType  │
+    │  Binary         │      │  Helm           │      │  Inline         │      │  YAML           │
+    │                 │      │                 │      │                 │      │                 │
+    └────────┬────────┘      └────────┬────────┘      └────────┬────────┘      └────────┬────────┘
+             │                        │                        │                        │
+             ▼                        ▼                        ▼                        ▼
+    ┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
+    │  创建           │      │  创建           │      │  创建           │      │  创建           │
+    │  BinaryComponent│      │  HelmComponent  │      │  InlineComponent│      │  ManifestCompo- │
+    │  Executor       │      │  Executor       │      │  Executor       │      │  nentExecutor   │
+    └────────┬────────┘      └────────┬────────┘      └────────┬────────┘      └────────┬────────┘
+             │                        │                        │                        │
+             └────────────────────────┼────────────────────────┼────────────────────────┘
+                                      │                        │
+                                      └────────────────────────┘
+                                       │
+                                       ▼
                     ┌──────────────────────────────────────┐
                     │  注册到 DAG                          │
                     │  dag.AddNode(name, executor,         │
@@ -2231,6 +2233,58 @@ func (e *HelmComponentExecutor) ExecuteComponent(ctx context.Context, node *Comp
     }
     
     return e.installer.Install(ctx, opts)
+}
+
+// ManifestComponentExecutor YAML/Manifest 组件执行器
+type ManifestComponentExecutor struct {
+    applier *manifest.Applier
+    store   *manifest.Store
+}
+
+// ExecuteComponent 执行 YAML/Manifest 组件
+func (e *ManifestComponentExecutor) ExecuteComponent(ctx context.Context, node *ComponentNode, phaseCtx *phaseframe.PhaseContext) error {
+    component := node.Component
+    
+    // 1. 获取 ComponentVersion
+    cv, err := e.store.GetComponentVersion(component.Name, component.Version)
+    if err != nil {
+        return fmt.Errorf("failed to get component version: %w", err)
+    }
+    
+    // 2. 确认是 YAML 类型
+    if cv.Spec.Type != configv1alpha1.ComponentTypeYAML {
+        return fmt.Errorf("component %s is not a yaml component", component.Name)
+    }
+    
+    // 3. 构建 ComponentPackage
+    pkg := &manifest.ComponentPackage{
+        Name:      component.Name,
+        Version:   component.Version,
+        Resources: cv.Spec.Resources,
+    }
+    
+    // 4. 应用 Manifest 到集群
+    return e.applier.ApplyComponent(ctx, pkg)
+}
+
+// InlineComponentExecutor Inline 组件执行器 (已有实现)
+type InlineComponentExecutor struct {
+    factory *componentfactory.ComponentFactory
+}
+
+// ExecuteComponent 执行 Inline 组件
+func (e *InlineComponentExecutor) ExecuteComponent(ctx context.Context, node *ComponentNode, phaseCtx *phaseframe.PhaseContext) error {
+    component := node.Component
+    
+    // 1. 从 ComponentFactory 获取 Phase
+    phase, err := e.factory.Resolve(component.Name, component.Version, phaseCtx)
+    if err != nil {
+        return fmt.Errorf("failed to resolve component %s: %w", component.Name, err)
+    }
+    
+    // 2. 执行 Phase
+    _, err = phase.Execute()
+    return err
 }
 ```
 
@@ -2730,6 +2784,7 @@ var defaultFeatureGates = map[string]bool{
 |------|------|
 | **BinaryInstaller** | 负责二进制组件下载、渲染、安装的安装器 |
 | **HelmInstaller** | 负责 Helm Chart 获取、渲染、部署的安装器 |
+| **ManifestApplier** | 负责 YAML/Manifest 类型组件的解析、渲染和应用到集群 |
 | **configTemplates** | 配置文件模板系统，支持 Go template/Secret/kubeconfig |
 | **installScript** | 安装脚本模板，支持 8 类 50+ 变量和条件渲染 |
 | **Artifact** | 二进制制品，包含 URL、Checksum、安装路径等信息 |
