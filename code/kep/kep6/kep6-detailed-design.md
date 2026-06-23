@@ -291,6 +291,9 @@ type ComponentVersionSpec struct {
     // Inline 类型配置 (type=inline 时必填)
     Inline *InlineSpec `json:"inline,omitempty"`
     
+    // 子组件引用列表
+    SubComponents []SubComponent `json:"subComponents,omitempty"`
+    
     // 兼容性约束
     Compatibility CompatibilitySpec `json:"compatibility,omitempty"`
     
@@ -299,6 +302,45 @@ type ComponentVersionSpec struct {
     
     // 升级策略
     UpgradeStrategy UpgradeStrategySpec `json:"upgradeStrategy,omitempty"`
+    
+    // Kubernetes 资源定义列表
+    Resources []ResourceSpec `json:"resources,omitempty"`
+}
+
+// SubComponent 定义子组件引用
+type SubComponent struct {
+    // 子组件名称
+    Name string `json:"name"`
+    
+    // 子组件版本
+    Version string `json:"version"`
+}
+
+// ResourceSpec 定义 Kubernetes 资源
+type ResourceSpec struct {
+    // 资源类型
+    Kind string `json:"kind"`
+    
+    // API 版本
+    APIVersion string `json:"apiVersion"`
+    
+    // 命名空间
+    Namespace string `json:"namespace,omitempty"`
+    
+    // 资源名称
+    Name string `json:"name"`
+    
+    // 标签选择器
+    Labels map[string]string `json:"labels,omitempty"`
+    
+    // Data 字段
+    Data map[string]string `json:"data,omitempty"`
+    
+    // StringData 字段
+    StringData map[string]string `json:"stringData,omitempty"`
+    
+    // 原始 Manifest 内容
+    Manifest string `json:"manifest,omitempty"`
 }
 
 // BinarySpec 定义二进制组件规格
