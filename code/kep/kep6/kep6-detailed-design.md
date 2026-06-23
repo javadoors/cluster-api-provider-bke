@@ -300,6 +300,12 @@ type ComponentVersionSpec struct {
     Inline *InlineSpec `json:"inline,omitempty"`
     
     // 子组件引用列表
+
+> **设计思路 - SubComponents 与 Dependencies 的区别**：两者语义不同——`SubComponents` 表示"组合关系"（父子包含），`Dependencies` 表示"执行顺序"（先后依赖）。
+> - **SubComponents**：如 Kubernetes 组件包含 kube-apiserver、kube-controller-manager 等子组件，它们共享同一版本、作为一个整体安装/升级。子组件无需指定 `type`，因为其类型由同名 `ComponentVersion` 资源决定。
+> - **Dependencies**：如 coredns 依赖 kube-apiserver 先就绪，这是 DAG 中的边，决定执行顺序而非包含关系。
+> 简言之：SubComponents 是"有什么"，Dependencies 是"先做什么"。
+
     SubComponents []SubComponent `json:"subComponents,omitempty"`
     
     // 兼容性约束
@@ -309,6 +315,8 @@ type ComponentVersionSpec struct {
     Dependencies []Dependency `json:"dependencies,omitempty"`
     
     // 升级策略
+
+> **设计思路 - Parallel vs Batch 的语义差异**：`Parallel` 模式在所有节点上同时执行升级，无并发控制，适用于低风险组件（如配置文件更新）。`Batch` 模式按 `BatchSize` 分批执行，每批成功后再执行下一批，适用于高风险组件（如 containerd 升级可能导致节点短暂不可用）。`BatchSize >= totalNodes` 等价于 `Parallel`，但 `Batch` 模式提供了逐批验证的语义——每批完成后检查节点健康状态，异常则暂停后续批次。
     UpgradeStrategy UpgradeStrategySpec `json:"upgradeStrategy,omitempty"`
     
     // Kubernetes 资源定义列表
@@ -325,6 +333,12 @@ type SubComponent struct {
 }
 
 // ResourceSpec 定义 Kubernetes 资源
+
+> **设计思路 - 两种资源定义方式**：`ResourceSpec` 同时支持声明式字段（Kind/APIVersion/Name/Data）和原始 `Manifest` 字符串。选择双模式的原因是：
+> 1. **声明式字段**适用于简单资源（如 ConfigMap、Secret），可直接在 CRD 中定义 key-value 数据，无需外部文件。优势是结构化、可校验、可被 kubectl 直接查看。
+> 2. **Manifest 字段**适用于复杂资源（如 Deployment、CRD），声明式字段无法表达完整的 Kubernetes 资源定义，使用原始 YAML 更灵活。
+> 3. **优先级**：当 `Manifest` 非空时，以 Manifest 为准（忽略 Kind/APIVersion 等字段），因为 Manifest 是完整定义，声明式字段仅是元数据摘要。
+> 4. **存储考量**：大型 Manifest 应通过 `YAMLSpec.Manifests` URL 引用外部文件，而非直接嵌入 CRD（会膨胀 etcd 存储）。`ResourceSpec.Manifest` 仅适用于小型内联资源。
 type ResourceSpec struct {
     // 资源类型
     Kind string `json:"kind"`
@@ -363,6 +377,11 @@ type YAMLSpec struct {
     ApplyStrategy string `json:"applyStrategy,omitempty"`
     
     // 是否启用裁剪 (按 label selector 删除不再需要的资源)
+
+> **设计思路 - 基于标签裁剪 vs ownerReference**：选择标签选择器（`PruneLabelSelector`）而非 ownerReference 进行资源裁剪，原因是：
+> 1. **ownerReference 的局限**：ownerReference 要求资源与属主在同一命名空间，且级联删除是全量的（删除属主则删除所有关联资源），无法实现"仅删除当前组件不再管理的资源"的精确裁剪。
+> 2. **标签裁剪的灵活性**：标签选择器可跨命名空间匹配，且裁剪逻辑是"保留当前清单中存在的资源、删除标签匹配但不在清单中的资源"，精确控制范围。
+> 3. **风险缓解**：标签裁剪确实存在误删风险（其他组件添加了相同标签的资源）。缓解措施：① 要求 `PruneLabelSelector` 必须包含组件专属标签（如 `app.kubernetes.io/managed-by: {{componentName}}`）；② 裁剪前 dry-run 预览；③ 裁剪操作记录审计日志。
     Prune bool `json:"prune,omitempty"`
     
     // 裁剪使用的标签选择器
@@ -379,6 +398,13 @@ type ManifestRef struct {
 }
 
 // BinarySpec 定义二进制组件规格
+
+> **设计思路 - 双模板变量系统**：系统中存在两套模板语法——URL/路径变量使用简单替换 `{{componentVersion}}`，安装脚本和配置模板使用 Go template `{{.componentVersion}}`。选择双系统的原因是：
+> 1. **URL 场景需要简单可靠**：制品 URL（如 `https://repo/example/{{componentVersion}}/binary-{{nodeArch}}.tar.gz`）是字符串拼接，不需要条件逻辑、循环等高级功能，`strings.ReplaceAll` 零依赖、无解析错误风险，适合在下载阶段早期执行。
+> 2. **脚本场景需要表达力**：安装/卸载脚本需要条件判断（`{{if eq .os "kylin"}}...{{end}}`）、循环（`{{range .artifacts}}...{{end}}`）等逻辑，Go template 是天然选择。
+> 3. **执行时机不同**：URL 变量在下载前解析（此时节点信息已知但集群上下文未构建），脚本变量在执行时解析（需要完整的集群/节点/制品上下文）。
+> 两套变量共享相同的变量名（如 `componentVersion`、`nodeArch`），但语法前缀不同（无 `.` vs 有 `.`），开发者需注意区分使用场景。
+
 type BinarySpec struct {
     // 自定义变量 (可覆盖默认值)
     Variables map[string]string `json:"variables,omitempty"`
@@ -402,6 +428,8 @@ type BinarySpec struct {
     SupportedOS []OSSpec `json:"supportedOS"`
     
     // 默认安装路径
+
+> **设计思路 - 五个独立路径字段**：不使用单一根路径（如 `DefaultRootDir`）派生子路径，是因为不同组件的目录布局差异很大——containerd 使用 `/usr/local/bin`（二进制）+ `/etc/containerd`（配置）+ `/var/lib/containerd`（数据），而 bkeagent 使用 `/opt/bke`（安装）+ `/etc/bke`（配置）+ `/var/log/bke`（日志）。五个路径字段提供了最大的灵活性，安装脚本中可通过 `{{.defaultInstallPath}}` 等变量引用。`DefaultInstallPath` 指组件的安装根目录，`DefaultBinPath` 指可执行文件的存放目录，两者可能不同。
     DefaultInstallPath string `json:"defaultInstallPath,omitempty"`
     
     // 默认配置路径
@@ -432,10 +460,17 @@ type ArtifactSpec struct {
     InstallPath string `json:"installPath"`
     
     // 可执行文件名
+
+> **设计思路 - Executable 与 InstallPath 的区别**：`InstallPath` 指制品在远程节点上的存放路径（如 `/usr/local/bin/containerd`），`Executable` 指制品解压后的可执行文件名（如 `containerd`）。当制品是压缩包时，`InstallPath` 是压缩包路径，`Executable` 是解压后需要 chmod +x 的二进制文件名。当制品是单个二进制文件时，`Executable` 可省略（直接使用 `InstallPath` 的 basename）。
     Executable string `json:"executable,omitempty"`
 }
 
 // ConfigTemplateSpec 定义配置文件模板规格
+
+> **设计思路 - 三模式平铺设计**：`Content`、`SecretRef`、`KubeconfigTemplate` 三个字段互斥——同一配置文件只能有一种内容来源。不使用 `Mode` 判别字段或 Go 接口的原因是：
+> 1. **CRD 兼容性**：Kubernetes CRD 的 OpenAPI v3 不支持 discriminated union（oneOf），使用互斥指针字段是 CRD 设计的惯用模式（类似 Kubernetes 本身的 `VolumeSource`）。
+> 2. **序列化简洁**：平铺结构在 YAML 中直观易读，无需额外的 mode 字段。优先级规则：`KubeconfigTemplate` > `SecretRef` > `Content`，即如果多个字段同时非 nil，按此优先级取第一个非 nil 字段。
+> 3. **验证补充**：在 Admission Webhook 中应添加校验，确保仅一个字段非 nil，避免歧义。
 type ConfigTemplateSpec struct {
     // 模板名称
     Name string `json:"name"`
@@ -523,6 +558,11 @@ type HelmSpec struct {
     Values map[string]interface{} `json:"values,omitempty"`
     
     // 自定义 Values 文件列表
+
+> **设计思路 - ValuesFiles 与 Values 的关系**：`ValuesFiles` 和 `Values` 是 Helm Values 的两种提供方式，合并优先级从低到高为：Chart 默认值 → ValuesFiles[0] → ValuesFiles[1] → ... → Values 内联字段。即 `Values` 内联字段优先级最高，可覆盖文件中的任何值。
+> - **ValuesFiles**：适用于按环境区分的大型配置（如 `values-linux.yaml`、`values-arm64.yaml`），文件路径支持模板变量渲染（如 `values-{{nodeOS}}.yaml`），实现动态选择。
+> - **Values 内联**：适用于少量覆盖值（如 `image.tag`），直接在 CRD 中定义，优先级最高。
+> 文件来源期望：控制器 Pod 的本地文件系统（通常通过 ConfigMap 挂载），后续可扩展支持 HTTP URL 和 ConfigMap 引用。
     ValuesFiles []string `json:"valuesFiles,omitempty"`
     
     // 安装策略
@@ -569,6 +609,11 @@ type OCIChartSpec struct {
 }
 
 // HelmStrategySpec 定义 Helm 安装策略
+
+> **设计思路 - 为什么 CRD 允许指定 Install/Upgrade/Rollback**：`Mode` 字段允许用户显式指定操作模式，而非完全由系统自动判定。原因是：
+> 1. **覆盖自动判定**：某些场景下自动判定不够准确，如 Helm Release 处于 failed 状态时，自动判定可能选择 Upgrade，但用户实际需要 Rollback。
+> 2. **强制重装**：`Mode: Install` 配合 `CleanupOnFail: true` 可实现强制重装，用于修复损坏的 Release。
+> 3. **默认行为**：当 `Mode` 为空时，系统自动判定——Release 不存在则 Install，已存在则 Upgrade，与 Helm 原生行为一致。
 type HelmStrategySpec struct {
     // 安装模式: Install / Upgrade / Rollback
     Mode string `json:"mode,omitempty"`
@@ -587,6 +632,11 @@ type HelmStrategySpec struct {
 }
 
 // HealthCheckSpec 定义健康检查规格
+
+> **设计思路 - 自定义健康检查 vs Helm 原生 --wait**：Helm 的 `--wait` 仅检查 Pod 是否 Ready，但很多组件的就绪条件更复杂（如 Service Endpoint 就绪、自定义健康检查接口返回 200）。自定义健康检查提供了：
+> 1. **多维度检查**：`PodReady` 检查 Pod 状态，`EndpointReady` 检查 Service Endpoints，`Custom` 支持任意条件。
+> 2. **最小就绪数**：`MinReady` 允许部分 Pod 就绪即认为组件健康（如 3 副本中 2 个就绪即可），Helm --wait 要求全部 Ready。
+> 3. **与 Helm --wait 的关系**：两者可叠加使用——Helm --wait 在 Release 安装完成后等待 Pod 调度，HealthCheck 在此基础上进一步验证业务逻辑就绪。
 type HealthCheckSpec struct {
     // 是否启用健康检查
     Enabled bool `json:"enabled"`
@@ -638,6 +688,11 @@ type UninstallSpec struct {
 }
 
 // HookSpec 定义钩子规格
+
+> **设计思路 - 仅支持 Job 类型**：当前 `HookSpec.Type` 仅支持 `"Job"` 类型，不使用 Helm 原生钩子注解（`helm.sh/hook`）。原因是：
+> 1. **控制权**：Helm 原生钩子由 Helm SDK 管理（创建、等待、删除），自定义钩子由 Installer 控制完整生命周期，可自定义超时、重试、清理策略。
+> 2. **扩展计划**：后续将支持更多类型——`"ConfigMap"`（安装前创建配置）、`"Exec"`（在已有 Pod 中执行命令），Type 字段为 string 而非 enum 就是为了预留扩展空间。
+> 3. **非 Job 类型当前处理**：暂时跳过（`if hook.Type != "Job" { continue }`），而非报错，是为了向前兼容——新增钩子类型后，旧版本控制器仅忽略不支持的类型，不会中断安装流程。
 type HookSpec struct {
     // 钩子名称
     Name string `json:"name,omitempty"`
@@ -1368,6 +1423,12 @@ type Artifact struct {
 }
 
 // ArtifactCache 管理二进制制品的本地文件缓存
+
+> **设计思路 - 双文件缓存设计（.meta + .data）**：每个缓存项使用两个文件——`<key>.meta`（JSON 元数据）和 `<key>.data`（原始二进制内容）。选择双文件而非数据库（如 boltdb）的原因是：
+> 1. **零依赖**：不需要引入额外的嵌入式数据库库，减少攻击面和依赖管理复杂度。
+> 2. **直接 SSH 上传**：`<key>.data` 文件可直接通过 `CopyFile` 上传到远程节点，无需从数据库中读取二进制内容再写入临时文件。
+> 3. **部分状态处理**：`Get` 方法在 meta 文件存在但 data 文件缺失时返回 nil（视为缓存未命中），data 文件存在但 meta 文件缺失时同样返回 nil，避免使用不完整的缓存数据。`Clean` 方法应同步清理孤立的 .data 文件（无对应 .meta）。
+> 4. **改进方向**：后续可考虑使用单一文件（元数据作为 xattr 扩展属性存储），减少文件数量和部分状态风险，但需考虑文件系统对 xattr 的支持差异。
 type ArtifactCache struct {
     // cacheDir 缓存根目录 (如 /var/cache/bke/artifacts)
     cacheDir string
@@ -1514,6 +1575,11 @@ type ArtifactData struct {
 }
 
 // BuildScriptData 从 InstallOptions 构建模板渲染数据
+
+> **设计思路 - BuildScriptData vs buildTemplateData 的不一致**：`BuildScriptData` 返回类型化的 `ScriptData` 结构体（用于 Go template 渲染，字段名大写如 `ClusterName`），`buildTemplateData` 返回 `map[string]interface{}`（用于 ConfigRenderer 渲染，key 小写如 `clusterName`）。两者存在的原因是：
+> 1. **调用方不同**：`BuildScriptData` 由 BinaryInstaller 调用，注入到 Go template 的 `.Field` 语法中，大写字段名符合 Go 导出规范。
+> 2. **ConfigRenderer 的灵活性**：`buildTemplateData` 生成的 map 直接用于模板变量替换，小写 key 与 Helm Values 风格一致（`{{.clusterName}}`）。
+> 3. **改进方向**：后续应统一为单一数据源——定义 `TemplateData` 结构体，同时提供 `.Field`（Go template）和 `ToMap()`（map 形式）两种访问方式，消除字段名不一致的混乱。
 func BuildScriptData(opts InstallOptions) ScriptData {
     component := opts.Component
     cluster := opts.Cluster
@@ -1586,6 +1652,8 @@ func BuildScriptData(opts InstallOptions) ScriptData {
 
 ```go
 // resolveTemplate 将 URL 中的 {{componentVersion}}/{{nodeArch}}/{{nodeOS}} 替换为实际值
+
+> **设计思路 - 简单替换 vs Go template**：URL/路径变量使用 `strings.ReplaceAll` 而非 Go template，原因见 3.1 节 BinarySpec 的"双模板变量系统"设计思路。核心权衡：URL 是纯字符串拼接场景，不需要条件/循环逻辑，简单替换无解析错误风险、零依赖，且在下载阶段早期执行时节点上下文有限，不适合引入完整模板引擎。
 func (i *BinaryInstaller) resolveTemplate(tmpl string, vars map[string]string) (string, error) {
     result := tmpl
     for key, value := range vars {
@@ -1604,6 +1672,8 @@ func (i *BinaryInstaller) resolveTemplate(tmpl string, vars map[string]string) (
 ```go
 // computeCacheKey 基于 URL 和 Checksum 生成缓存键
 // 格式: sha256(url + ":" + checksum) 的前 16 位
+
+> **设计思路 - 16字符截断**：截断到 16 个十六进制字符（64 bit）是为了生成文件系统友好的文件名——全 SHA256（64 字符）过长，且缓存键用于本地文件名而非安全场景，碰撞后果仅为缓存未命中（重新下载），不影响正确性。实际上 URL+Checksum 组合本身已足够唯一，SHA256 仅用于规范化（去除特殊字符）。
 func (i *BinaryInstaller) computeCacheKey(url, checksum string) string {
     h := sha256.New()
     h.Write([]byte(url + ":" + checksum))
@@ -1615,6 +1685,8 @@ func (i *BinaryInstaller) computeCacheKey(url, checksum string) string {
 
 ```go
 // downloadAndVerify 下载制品并校验 Checksum
+
+> **设计思路 - 500MB 硬编码限制**：`io.LimitReader(resp.Body, 500*1024*1024)` 防止异常响应耗尽内存。500MB 基于 BKE 组件制品的实际上限（containerd ~100MB、bkeagent ~50MB）预留了充足余量。当前为硬编码，后续应提升为 `BinaryInstaller` 的可配置参数。将整个制品读入内存而非流式写入磁盘，是因为后续需要 `sha256.Sum256(data)` 计算校验和，且制品需要缓存到本地文件供 SSH 上传使用。
 func (i *BinaryInstaller) downloadAndVerify(ctx context.Context, url, expectedChecksum string) ([]byte, error) {
     req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
     if err != nil {
@@ -1942,6 +2014,10 @@ func (i *HelmInstaller) Install(ctx context.Context, opts InstallOptions) error 
     }
     
     // 3. 加载自定义 Values 文件
+    // 设计思路 - 文件加载失败为警告而非错误：ValuesFiles 是可选的补充配置，文件可能按条件存在
+    // （如 values-{{nodeOS}}.yaml 在某些操作系统上不存在），缺失时使用内联 Values 即可。
+    // 如果文件路径不含模板变量且文件不存在，说明配置有误，应在日志中标记为 Warning 级别
+    // 便于运维排查，同时不中断安装流程。
     for _, vf := range helm.ValuesFiles {
         customValues, err := i.loadValuesFile(ctx, vf, opts)
         if err != nil {
@@ -2200,6 +2276,8 @@ func (i *HelmInstaller) getActionConfig(ctx context.Context, namespace string) (
 
 ```go
 // loadValuesFile 加载自定义 Values 文件
+
+> **设计思路 - 本地文件系统 vs ConfigMap/URL**：当前从控制器 Pod 的本地文件系统读取 Values 文件。在 Kubernetes 控制器场景下，文件通常通过 ConfigMap 或 Secret 挂载到 Pod 中。选择本地文件而非直接读取 ConfigMap API 的原因是：① Values 文件可能很大（超过 etcd 1MB 限制），ConfigMap 不适合存储大型 YAML；② 文件路径支持模板变量渲染，动态选择不同文件（如 `values-{{nodeOS}}.yaml`）。后续可扩展支持 HTTP URL 和 ConfigMap 引用作为 Values 来源。
 func (i *HelmInstaller) loadValuesFile(ctx context.Context, valuesFile string, opts InstallOptions) (map[string]interface{}, error) {
     // 渲染文件名中的模板变量
     renderedFile, err := i.renderTemplateString(valuesFile, opts)
@@ -2226,6 +2304,11 @@ func (i *HelmInstaller) loadValuesFile(ctx context.Context, valuesFile string, o
 ```go
 // mergeValues 合并两份 Values (dst 被 src 覆盖)
 // 策略: 递归合并 map，src 中的值覆盖 dst 中的同名键
+
+> **设计思路 - 列表整体替换**：递归合并 map 时，如果 `src` 和 `dst` 的同名字段一个是 map 一个不是，或都是非 map 类型（如 list/string/int），则 `src` 的值整体替换 `dst` 的值。这意味着列表（如 `container.args`、`env`）会被完全覆盖而非追加合并。选择此策略的原因是：
+> 1. **确定性**：追加合并会产生顺序依赖问题（哪个列表在前？去重逻辑？），整体替换行为确定、可预测。
+> 2. **Helm 价值观一致**：Helm 自身的 `--set` 和 `-f values.yaml` 合并行为也是相同策略（非 map 字段整体替换），与 Helm 生态保持一致。
+> 3. **使用建议**：如果需要追加列表项，应在最高优先级的 Values 中给出完整列表，而非依赖合并追加。
 func mergeValues(dst, src map[string]interface{}) map[string]interface{} {
     result := make(map[string]interface{})
     for k, v := range dst {
@@ -2272,6 +2355,12 @@ func (r *ConfigRenderer) renderString(tmpl string, opts InstallOptions) (string,
 
 
 ### 5.5 PreInstallHooks 执行引擎
+
+> **设计思路 - 自定义钩子 vs Helm 原生钩子**：不使用 Helm 原生钩子注解（`helm.sh/hook`）而自行实现钩子系统，原因是：
+> 1. **执行时机控制**：Helm 原生钩子在 `helm install/upgrade` 命令内部执行，无法在 Helm 操作之前独立运行前置检查。而我们的场景需要在 Helm Install 之前执行前置任务（如数据库迁移、证书准备），这些任务必须在 Helm 操作之前成功完成。
+> 2. **超时与重试**：Helm 钩子的超时由 Helm SDK 全局控制，自定义钩子可针对每个钩子配置独立的超时和重试策略。
+> 3. **清理策略**：Helm 钩子清理由 Helm 的 `hook-delete-policy` 注解控制，自定义钩子可在安装成功/失败后灵活决定是否保留 Job 资源。
+> 4. **与 Helm 钩子的关系**：自定义钩子不替代 Helm 钩子，而是补充。Helm Chart 内部的钩子（如 post-install 测试）仍由 Helm SDK 管理，`PreInstallHooks` 仅管理 ComponentVersion CRD 中声明的外部前置任务。
 
 #### 5.5.1 PreInstallHooks 执行引擎
 
@@ -2542,6 +2631,8 @@ const (
 )
 
 // YAMLManifestExecutor 定义 YAML 清单执行器接口
+
+> **设计思路 - DryRun 为独立方法而非选项字段**：`DryRun()` 是独立方法而非 `ExecuteOptions.DryRun bool` 字段，原因是返回类型不同——`Execute` 返回 `error`，`DryRun` 返回 `([]*unstructured.Unstructured, error)`（预览将要应用的资源列表）。独立方法让接口语义更清晰，调用方不会混淆"干运行模式"和"执行模式"。BinaryInstaller 和 HelmInstaller 未提供 DryRun 接口，因为它们的操作涉及远程节点，干运行难以模拟（SSH 命令、Helm template 渲染结果不等同于实际安装结果）。
 type YAMLManifestExecutor interface {
     // Execute 执行 YAML 清单组件的安装/升级
     Execute(ctx context.Context, spec *YAMLSpec, opts ExecuteOptions) error
@@ -2654,6 +2745,12 @@ func (e *yamlManifestExecutor) Execute(ctx context.Context, spec *YAMLSpec, opts
 
 // resolveManifests 解析并下载清单数据
 // 优先从 ManifestStore 获取，回退到从 YAMLSpec.Manifests URL 下载
+
+> **设计思路 - 双源获取与优先级**：`resolveManifests` 先尝试 ManifestStore，失败后回退到 YAMLSpec.Manifests URL 下载。双源设计的原因是：
+> 1. **兼容现有路径**：当前代码中 YAML 类型组件统一通过 `ManifestStore.GetComponentManifests()` 从 OCI 仓库/bke-manifests 获取清单，这是已有的稳定路径，必须保留为首选。
+> 2. **新场景支持**：`YAMLSpec.Manifests` URL 下载是新增能力，允许组件引用外部 HTTP 托管的清单文件，适用于不在 OCI 仓库中的第三方组件。
+> 3. **不冲突的保证**：两种来源不会同时生效——当前 DAG 构建时，如果 `ComponentVersion.Spec.Type == "yaml"` 且 `Spec.YAML.Manifests` 非空，会设置 `YAMLRef`，此时 ManifestStore 可能无此组件数据，自然走 URL 下载路径。如果组件通过 ManifestStore 管理，则 `YAMLSpec.Manifests` 为空，直接走 Store 路径。
+> 4. **改进方向**：后续可考虑在 `YAMLSpec` 中新增 `Source string` 字段（`"store" | "url"`）显式指定来源，避免隐式回退带来的歧义。
 func (e *yamlManifestExecutor) resolveManifests(
     ctx context.Context,
     spec *YAMLSpec,
@@ -2717,6 +2814,12 @@ func (e *yamlManifestExecutor) downloadManifest(ctx context.Context, ref Manifes
 }
 
 // resolveApplyStrategy 解析应用策略，默认为 ServerSideApply
+
+> **设计思路 - 默认 ServerSideApply**：选择 SSA 作为默认策略的原因是：
+> 1. **声明式管理**：SSA 使用 `fieldManager` 机制声明字段所有权，多个管理者可独立管理同一资源的不同字段，这与 ComponentVersion 的声明式设计理念一致——每个组件只管理自己关心的资源字段。
+> 2. **升级安全**：SSA 不会删除其他管理者设置的字段（如用户手动添加的 annotation），比 Replace（删除+重建）和 Update（整体覆盖）更安全。
+> 3. **兼容性**：SSA 从 Kubernetes 1.16 开始 beta、1.22 开始 GA，当前最低支持版本 v1.25.6 已完全支持。
+> 4. **降级方案**：如果目标集群不支持 SSA（极低版本），用户可显式设置 `applyStrategy: Replace` 作为降级策略。
 func (e *yamlManifestExecutor) resolveApplyStrategy(spec *YAMLSpec) ApplyStrategy {
     if spec == nil || spec.ApplyStrategy == "" {
         return ApplyStrategyServerSideApply
@@ -3728,6 +3831,11 @@ func (e *HelmComponentExecutor) ExecuteComponent(ctx context.Context, node *Comp
 
 当前 `topology.ComponentNode` 仅有 `Inline` 字段，需扩展以支持 Binary/Helm/YAML 类型：
 
+> **设计思路 - 四指针类型判别**：使用 `Inline *InlineRef`、`Binary *BinaryRef`、`Helm *HelmRef`、`YAML *YAMLRef` 四个互斥指针字段判别组件类型，而非 `Type ComponentType + Ref interface{}` 单字段方案。原因是：
+> 1. **类型安全**：每个 Ref 类型携带不同的专属字段（如 `HelmRef.Namespace/ReleaseName`、`YAMLRef.Namespace`），用 interface{} 需要运行时类型断言，四指针方案在编译期即可保证类型安全。
+> 2. **序列化友好**：`ComponentNode` 在 DAG 构建时创建、调度时消费，不经过 CRD 序列化，但互斥指针模式与 CRD 中的 `BinarySpec`/`HelmSpec`/`YAMLSpec` 设计保持一致。
+> 3. **默认 "yaml" 的考量**：`ComponentType()` 在所有 Ref 均为 nil 时返回 `"yaml"`，因为当前代码中 `executeComponent` 的默认路径就是 manifest 应用（即 YAML 执行路径），这保证了向后兼容——旧 DAG 中无 Ref 的组件节点仍走原有路径。但应在 DAG 构建时（`BuildInstallDAG`）确保每个节点都设置了正确的 Ref，避免依赖此兜底行为。
+
 ```go
 // pkg/topology/component.go 扩展
 
@@ -4034,6 +4142,11 @@ func (s *Scheduler) getTargetNodes(phaseCtx *phaseframe.PhaseContext, node *topo
 
     switch node.Name {
     case "containerd", "bkeagent":
+
+> **设计思路 - 硬编码组件名 vs 声明式目标节点**：当前 `getTargetNodes` 使用硬编码组件名决定目标节点范围，这与声明式设计哲学存在冲突。选择此方案的原因是：
+> 1. **过渡方案**：当前阶段 Binary 组件类型仅支持 containerd/bkeagent 等有限组件，硬编码是最快落地的路径。
+> 2. **声明式演进方向**：后续计划在 `BinarySpec` 中新增 `TargetNodeSelector map[string]string` 字段，通过标签选择器声明式指定目标节点（如 `role: master`），替代硬编码逻辑。
+> 3. **default 分支风险**：当前 default 分支默认选择所有节点，对于未知组件可能不正确。应在 `TargetNodeSelector` 实现后移除 default 分支，未指定选择器时返回错误而非默认全节点。
         // 二进制组件：所有节点
         for _, n := range cluster.Spec.Nodes {
             targets = append(targets, &BKENodeTarget{
@@ -4079,6 +4192,8 @@ func (s *Scheduler) getTargetNodes(phaseCtx *phaseframe.PhaseContext, node *topo
 }
 
 // BKENodeTarget 统一的节点信息结构 (从 BKECluster.Spec.Nodes 提取)
+
+> **设计思路 - BKENodeTarget vs BKENode**：引入 `BKENodeTarget` 而非直接使用 `BKENodeSpec`，是因为 `BKENodeTarget` 是 DAG 调度层的视图——仅包含安装执行所需的核心字段（IP/Hostname/Role/Arch/OS），过滤了 `BKENodeSpec` 中的集群管理字段（如 Labels/Annotations/Taints）。这种解耦使 BinaryInstaller 不依赖完整的 BKENodeSpec 定义，便于后续扩展节点来源（如从 Machine 对象获取节点信息）。
 type BKENodeTarget struct {
     IP           string
     Hostname     string
@@ -4242,6 +4357,11 @@ func (s *Scheduler) executeBinaryBatch(
 }
 
 // executeBinaryRollback 执行二进制组件回滚
+
+> **设计思路 - Rollback 使用 UninstallScript**：当前回滚逻辑使用卸载脚本执行，而非安装前一个版本。这是有意的简化设计：
+> 1. **版本状态不可靠**：当前 `PhaseContext` 不保存已安装版本的历史记录，无法确定"前一个版本"是什么，因此无法执行 `Install(previousVersion)`。
+> 2. **卸载脚本的设计意图**：`UninstallScript` 负责停止服务并清理当前版本文件，为重新安装旧版本腾出空间。完整的回滚流程应为：Uninstall(当前版本) → Install(目标版本)，当前仅实现了第一步。
+> 3. **改进方向**：在组件状态回写机制（9.7 节）完善后，`BKENode` 上将记录已安装版本，届时 `executeBinaryRollback` 应改为：获取前一个版本 → 执行 `Install(previousVersion)`，实现真正的版本回退。
 func (s *Scheduler) executeBinaryRollback(
     ctx context.Context,
     phaseCtx *phaseframe.PhaseContext,
@@ -4263,6 +4383,8 @@ func (s *Scheduler) executeBinaryRollback(
 }
 
 // parseDuration 解析超时字符串
+
+> **设计思路 - 默认 10 分钟**：空字符串或解析失败时默认 10 分钟，基于 BKE 组件安装的经验值——containerd 安装约 2-3 分钟，bkeagent 约 1 分钟，10 分钟覆盖了最慢场景并留有余量。不使用"无超时"（0 值）作为默认，是因为无限等待可能导致 reconcile 长期阻塞，影响其他组件的调度。格式错误的超时字符串静默回退到默认值而非报错，是为了兼容性——早期版本的 ComponentVersion 可能包含非标准格式。
 func parseDuration(s string) time.Duration {
     if s == "" {
         return 10 * time.Minute
@@ -4283,6 +4405,11 @@ func parseDuration(s string) time.Duration {
 // pkg/topology/build.go 扩展 (现有 BuildUpgradeDAG 基础上新增)
 
 // BuildInstallDAG 从 ReleaseImage 构建安装 DAG
+
+> **设计思路 - CommonPhases 硬编码**：`BuildInstallDAG` 中 finalizer/paused/manage/delete/dryrun 等 CommonPhases 是硬编码的，而非声明式定义。这是过渡设计：
+> 1. **当前约束**：这些 Phase 是现有的硬编码内联执行器（Inline Executor），已有成熟的实现和测试覆盖，声明式改造的 ROI 不高且风险大。
+> 2. **兼容性**：CommonPhases 的依赖链（finalizer → paused → manage → delete → dryrun）是固定顺序，声明式定义需要引入排序/优先级机制，增加复杂度。
+> 3. **演进方向**：后续可考虑将 CommonPhases 移入 `ReleaseImage` 的固定 section 中，与 DeployPhases 统一管理。但这需要所有组件都以 ComponentVersion 形式定义后才能实现，当前阶段硬编码是最安全的选择。
 func BuildInstallDAG(bundle *manifest.Bundle) (*UpgradeDAG, error) {
     dag := NewUpgradeDAG()
 
@@ -4440,6 +4567,8 @@ func (s *Scheduler) shouldExecuteBinary(phaseCtx *phaseframe.PhaseContext, node 
 
 // shouldExecuteHelm 判断 Helm 组件是否需要执行
 // 逻辑: 同 shouldExecuteBinary
+
+> **设计思路 - 两个相同函数**：当前 `shouldExecuteHelm` 直接调用 `shouldExecuteBinary`，逻辑完全相同。保留两个独立函数而非合并为 `shouldExecuteComponent`，是因为 Binary 和 Helm 组件的判定逻辑可能在未来分化——例如 Helm 组件需要额外检查 Release 是否已存在，Binary 组件需要检查节点上的已安装版本。当前阶段合并为统一函数是过早抽象，保留独立函数为后续差异化留出空间。
 func (s *Scheduler) shouldExecuteHelm(phaseCtx *phaseframe.PhaseContext, node *topology.ComponentNode) bool {
     return s.shouldExecuteBinary(phaseCtx, node)
 }
@@ -4855,6 +4984,12 @@ func recordBinaryNodeStatus(phaseCtx *phaseframe.PhaseContext, componentName str
 
 ### 12.2 Feature Gate 定义
 
+> **设计思路 - 环境变量 vs CRD 字段**：Feature Gate 通过环境变量（`BKE_BINARY_COMPONENT_SUPPORT`、`BKE_HELM_COMPONENT_SUPPORT`）控制，而非 BKECluster spec 字段或 FeatureGate CRD。选择环境变量的原因是：
+> 1. **渐进式发布**：Feature Gate 的目的是在功能未完全稳定前限制使用范围，环境变量需要运维显式设置，天然具备灰度效果。
+> 2. **安全性**：默认关闭新功能，环境变量需要重启控制器 Pod 才能生效，避免了运行时误开启导致的状态不一致。
+> 3. **实现简单**：不需要引入新的 CRD、API 版本、Admission Webhook，零侵入。
+> 4. **局限与改进方向**：环境变量不可审计、不可在集群状态中观察。当 Binary/Helm 组件功能稳定后（GA），Feature Gate 将被移除，功能永久开启，不需要迁移到 CRD 方案。
+
 ```go
 // pkg/featuregate/features.go
 
@@ -5021,6 +5156,11 @@ const (
 )
 
 // classifyError 对错误进行分类
+
+> **设计思路 - 字符串匹配 vs 类型化错误**：使用字符串子串匹配（如 `strings.Contains(err.Error(), "connection refused")`）而非类型化错误（如 `type RetryableError struct{ error }`）进行错误分类。原因是：
+> 1. **错误来源多样**：错误来自 SSH（bkessh）、Helm SDK、Kubernetes client、HTTP 下载等多个库，这些库的错误类型不统一，无法用统一的类型断言覆盖。
+> 2. **第三方库不可控**：Helm SDK 和 Kubernetes client 的错误类型可能随版本变化，字符串匹配虽然脆弱但更稳定——错误消息的语义通常保持一致。
+> 3. **脆弱性缓解**：① 维护关键错误模式的白名单，定期与依赖库版本对齐；② 未匹配的错误默认归类为 `NonRetryable`（安全侧），避免盲目重试导致雪崩；③ 后续可引入自定义错误类型包装器，在 Installer 层将第三方错误统一转换为类型化错误。
 func classifyError(err error) ErrorCategory {
     if err == nil {
         return ErrorCategoryRetryable
