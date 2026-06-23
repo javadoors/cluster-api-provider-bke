@@ -28,28 +28,33 @@
    - 5.3 核心接口定义
    - 5.4 核心方法实现
    - 5.5 PreInstallHooks 执行引擎
-6. [TemplateRenderer 详细设计](#6-templaterenderer-详细设计)
-7. [ConfigRenderer 详细设计](#7-configrenderer-详细设计)
-8. [DAG 集成详细设计](#8-dag-集成详细设计)
-   - 8.1 执行器注册
-   - 8.2 DAG 调度流程图
-   - 8.3 核心接口定义
-   - 8.4 ComponentNode 扩展
-   - 8.5 Scheduler 扩展与执行策略
-   - 8.6 NeedExecute 接口适配
-   - 8.7 组件状态回写机制
-9. [完整安装流程详细设计](#9-完整安装流程详细设计)
-10. [完整升级流程详细设计](#10-完整升级流程详细设计)
-11. [迁移策略详细设计](#11-迁移策略详细设计)
-    - 11.1 迁移流程图
-    - 11.2 Feature Gate 定义
-    - 11.3 兼容层实现与迁移验证
-12. [错误处理与恢复](#12-错误处理与恢复)
-    - 12.1 错误处理流程图
-    - 12.2 错误分类实现
-13. [测试设计](#13-测试设计)
-14. [工作量与任务拆解](#14-工作量与任务拆解)
-15. [附录](#15-附录)
+6. [YAMLManifestExecutor 详细设计](#6-yamlmanifestexecutor-详细设计)
+   - 6.1 核心组件架构
+   - 6.2 YAMLManifestExecutor 执行流程图
+   - 6.3 核心接口定义
+   - 6.4 核心方法实现
+7. [TemplateRenderer 详细设计](#7-templaterenderer-详细设计)
+8. [ConfigRenderer 详细设计](#8-configrenderer-详细设计)
+9. [DAG 集成详细设计](#9-dag-集成详细设计)
+   - 9.1 执行器注册
+   - 9.2 DAG 调度流程图
+   - 9.3 核心接口定义
+   - 9.4 ComponentNode 扩展
+   - 9.5 Scheduler 扩展与执行策略
+   - 9.6 NeedExecute 接口适配
+   - 9.7 组件状态回写机制
+10. [完整安装流程详细设计](#10-完整安装流程详细设计)
+11. [完整升级流程详细设计](#11-完整升级流程详细设计)
+12. [迁移策略详细设计](#12-迁移策略详细设计)
+    - 12.1 迁移流程图
+    - 12.2 Feature Gate 定义
+    - 12.3 兼容层实现与迁移验证
+13. [错误处理与恢复](#13-错误处理与恢复)
+    - 13.1 错误处理流程图
+    - 13.2 错误分类实现
+14. [测试设计](#14-测试设计)
+15. [工作量与任务拆解](#15-工作量与任务拆解)
+16. [附录](#16-附录)
 
 ---
 
@@ -288,6 +293,9 @@ type ComponentVersionSpec struct {
     // Helm 类型配置 (type=helm 时必填)
     Helm *HelmSpec `json:"helm,omitempty"`
     
+    // YAML 类型配置 (type=yaml 时必填)
+    YAML *YAMLSpec `json:"yaml,omitempty"`
+    
     // Inline 类型配置 (type=inline 时必填)
     Inline *InlineSpec `json:"inline,omitempty"`
     
@@ -341,6 +349,33 @@ type ResourceSpec struct {
     
     // 原始 Manifest 内容
     Manifest string `json:"manifest,omitempty"`
+}
+
+// YAMLSpec 定义 YAML 清单组件规格
+type YAMLSpec struct {
+    // YAML 清单文件列表
+    Manifests []ManifestRef `json:"manifests"`
+    
+    // 部署目标命名空间
+    Namespace string `json:"namespace,omitempty"`
+    
+    // 应用策略: ServerSideApply, Replace, CreateOnly
+    ApplyStrategy string `json:"applyStrategy,omitempty"`
+    
+    // 是否启用裁剪 (按 label selector 删除不再需要的资源)
+    Prune bool `json:"prune,omitempty"`
+    
+    // 裁剪使用的标签选择器
+    PruneLabelSelector map[string]string `json:"pruneLabelSelector,omitempty"`
+}
+
+// ManifestRef 定义 YAML 清单文件引用
+type ManifestRef struct {
+    // 清单文件 URL 或路径
+    URL string `json:"url"`
+    
+    // 校验和
+    Checksum string `json:"checksum,omitempty"`
 }
 
 // BinarySpec 定义二进制组件规格
@@ -805,6 +840,69 @@ spec:
                         maxHistory:
                           type: integer
                   required: [chart, namespace, releaseName]
+                yaml:
+                  type: object
+                  properties:
+                    manifests:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          url:
+                            type: string
+                          checksum:
+                            type: string
+                        required: [url]
+                    namespace:
+                      type: string
+                    applyStrategy:
+                      type: string
+                      enum: [ServerSideApply, Replace, CreateOnly]
+                    prune:
+                      type: boolean
+                    pruneLabelSelector:
+                      type: object
+                      additionalProperties:
+                        type: string
+                  required: [manifests]
+                subComponents:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      name:
+                        type: string
+                      version:
+                        type: string
+                    required: [name, version]
+                resources:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      kind:
+                        type: string
+                      apiVersion:
+                        type: string
+                      namespace:
+                        type: string
+                      name:
+                        type: string
+                      labels:
+                        type: object
+                        additionalProperties:
+                          type: string
+                      data:
+                        type: object
+                        additionalProperties:
+                          type: string
+                      stringData:
+                        type: object
+                        additionalProperties:
+                          type: string
+                      manifest:
+                        type: string
+                    required: [kind, apiVersion, name]
                 compatibility:
                   type: object
                   properties:
@@ -2284,9 +2382,522 @@ func (i *HelmInstaller) Install(ctx context.Context, opts InstallOptions) error 
 
 ---
 
-## 6. TemplateRenderer 详细设计
+## 6. YAMLManifestExecutor 详细设计
 
-### 6.1 模板变量系统
+YAML 类型组件是四种组件类型中最基础的一种，负责将 Kubernetes YAML 清单直接应用到目标集群。当前代码中 `Scheduler.executeManifest()` 方法即为 YAML 执行路径的基础实现，本章节在此基础上扩展为完整的 YAMLManifestExecutor 设计。
+
+### 6.1 核心组件架构
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         YAMLManifestExecutor                                      │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────────┐    │
+│  │                         核心组件                                         │    │
+│  │                                                                         │    │
+│  │  ┌─────────────────────────────────────────────────────────────────┐   │    │
+│  │  │                    ManifestDownloader                            │   │    │
+│  │  │  ┌──────────────┐  ┌──────────────┐  ┌─────────────────────┐   │   │    │
+│  │  │  │  HTTP Client │  │ Cache Manager│  │ Checksum Verifier   │   │   │    │
+│  │  │  │  (下载清单)   │  │ (本地缓存)   │  │ (校验和验证)        │   │   │    │
+│  │  │  └──────────────┘  └──────────────┘  └─────────────────────┘   │   │    │
+│  │  └─────────────────────────────────────────────────────────────────┘   │    │
+│  │                                                                         │    │
+│  │  ┌─────────────────────────────────────────────────────────────────┐   │    │
+│  │  │                      YAML Parser                                 │   │    │
+│  │  │  ┌──────────────┐  ┌──────────────┐  ┌─────────────────────┐   │   │    │
+│  │  │  │ Multi-Doc    │  │ GVK Resolver │  │ Resource Grouper    │   │   │    │
+│  │  │  │ (多文档解析)  │  │ (类型识别)   │  │ (资源分组)          │   │   │    │
+│  │  │  └──────────────┘  └──────────────┘  └─────────────────────┘   │   │    │
+│  │  └─────────────────────────────────────────────────────────────────┘   │    │
+│  │                                                                         │    │
+│  │  ┌─────────────────────────────────────────────────────────────────┐   │    │
+│  │  │                    ApplyStrategy Engine                          │   │    │
+│  │  │  ┌──────────────┐  ┌──────────────┐  ┌─────────────────────┐   │   │    │
+│  │  │  │ ServerSide   │  │ Replace      │  │ CreateOnly          │   │   │    │
+│  │  │  │ Apply        │  │ (替换更新)   │  │ (仅创建)            │   │   │    │
+│  │  │  │ (服务端应用) │  │              │  │                     │   │   │    │
+│  │  │  └──────────────┘  └──────────────┘  └─────────────────────┘   │   │    │
+│  │  └─────────────────────────────────────────────────────────────────┘   │    │
+│  │                                                                         │    │
+│  │  ┌─────────────────────────────────────────────────────────────────┐   │    │
+│  │  │                       K8s Applier                                │   │    │
+│  │  │  ┌──────────────┐  ┌──────────────┐  ┌─────────────────────┐   │    │    │
+│  │  │  │ KubeClient   │  │ Prune Engine │  │ Result Collector    │   │   │    │
+│  │  │  │ (资源应用)   │  │ (资源裁剪)   │  │ (结果收集)          │   │   │    │
+│  │  │  └──────────────┘  └──────────────┘  └─────────────────────┘   │   │    │
+│  │  └─────────────────────────────────────────────────────────────────┘   │    │
+│  │                                                                         │    │
+│  └─────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                  │
+│  与现有代码的映射:                                                                │
+│  ┌─────────────────────────────────────────────────────────────────────────┐    │
+│  │ ManifestDownloader  ← manifest.Store.GetComponentManifests()           │    │
+│  │ K8s Applier         ← manifest.Applier.ApplyComponent()               │    │
+│  │ KubeClient          ← kube.RemoteKubeClient.ApplyYaml()               │    │
+│  └─────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 6.2 YAMLManifestExecutor 执行流程图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                      YAMLManifestExecutor 执行流程                                │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+                              ┌──────────────────┐
+                              │   Execute()      │
+                              │   入口函数       │
+                              └────────┬─────────┘
+                                       │
+                                       ▼
+                    ┌──────────────────────────────────────┐
+                    │  1. 版本检查                         │
+                    │  manifestNeedsUpgrade()              │
+                    │  VersionContext.NeedsUpgrade()       │
+                    └────────────────────┬─────────────────┘
+                                       │
+                              ┌────────┴────────┐
+                              │ 需要升级?       │
+                              └────────┬────────┘
+                                否     │     是
+                           ┌───────────┘──────────┐
+                           │                      │
+                           ▼                      ▼
+                    ┌────────────┐  ┌──────────────────────────────────────┐
+                    │  跳过执行  │  │  2. 下载清单                         │
+                    │  返回 nil  │  │  ManifestStore.GetComponentManifests │
+                    └────────────┘  │  或从 YAMLSpec.Manifests URL 下载    │
+                                    └────────────────────┬─────────────────┘
+                                                         │
+                                                         ▼
+                                    ┌──────────────────────────────────────┐
+                                    │  3. 校验清单                         │
+                                    │  checksum 验证 (如配置)              │
+                                    │  空清单检查                          │
+                                    └────────────────────┬─────────────────┘
+                                                         │
+                                                         ▼
+                                    ┌──────────────────────────────────────┐
+                                    │  4. 解析 YAML 多文档                 │
+                                    │  yaml.NewYAMLOrJSONDecoder()         │
+                                    │  分离为独立 Unstructured 对象        │
+                                    └────────────────────┬─────────────────┘
+                                                         │
+                                                         ▼
+                                    ┌──────────────────────────────────────┐
+                                    │  5. 按策略应用资源                   │
+                                    │  switch ApplyStrategy                │
+                                    └────────────────────┬─────────────────┘
+                                                         │
+                          ┌──────────────────────────────┼──────────────────────────────┐
+                          │                              │                              │
+                          ▼                              ▼                              ▼
+               ┌─────────────────┐          ┌─────────────────┐          ┌─────────────────┐
+               │ ServerSideApply │          │    Replace      │          │  CreateOnly     │
+               │                 │          │                 │          │                 │
+               │ PatchOptions:   │          │ Update 或       │          │ Create 仅当     │
+               │ FieldManager    │          │ Delete+Create   │          │ 资源不存在时    │
+               │ Force=false     │          │ (强制替换)      │          │ 才创建          │
+               └────────┬────────┘          └────────┬────────┘          └────────┬────────┘
+                        │                            │                            │
+                        └────────────────────────────┼────────────────────────────┘
+                                                     │
+                                                     ▼
+                                    ┌──────────────────────────────────────┐
+                                    │  6. 资源裁剪 (可选)                  │
+                                    │  if Prune == true                    │
+                                    │    按 PruneLabelSelector 查询资源    │
+                                    │    删除不在当前清单中的资源           │
+                                    └────────────────────┬─────────────────┘
+                                                         │
+                                                         ▼
+                                    ┌──────────────────────────────────────┐
+                                    │  7. 返回执行结果                     │
+                                    │  记录已应用资源列表                  │
+                                    │  回写组件状态                        │
+                                    └──────────────────────────────────────┘
+```
+
+### 6.3 核心接口定义
+
+```go
+// pkg/yamlexecutor/types.go
+
+// ApplyStrategy 定义 YAML 资源应用策略
+type ApplyStrategy string
+
+const (
+    // ApplyStrategyServerSideApply 使用 Server-Side Apply 方式应用资源
+    ApplyStrategyServerSideApply ApplyStrategy = "ServerSideApply"
+    
+    // ApplyStrategyReplace 使用替换方式更新资源 (先删除再创建)
+    ApplyStrategyReplace ApplyStrategy = "Replace"
+    
+    // ApplyStrategyCreateOnly 仅在资源不存在时创建，已存在则跳过
+    ApplyStrategyCreateOnly ApplyStrategy = "CreateOnly"
+)
+
+// YAMLManifestExecutor 定义 YAML 清单执行器接口
+type YAMLManifestExecutor interface {
+    // Execute 执行 YAML 清单组件的安装/升级
+    Execute(ctx context.Context, spec *YAMLSpec, opts ExecuteOptions) error
+    
+    // DryRun 执行干运行，返回将要应用的资源列表但不实际执行
+    DryRun(ctx context.Context, spec *YAMLSpec, opts ExecuteOptions) ([]*unstructured.Unstructured, error)
+}
+
+// ExecuteOptions 定义执行选项
+type ExecuteOptions struct {
+    // 组件名称
+    ComponentName string
+    
+    // 组件版本
+    ComponentVersion string
+    
+    // 目标命名空间 (覆盖 YAMLSpec.Namespace)
+    Namespace string
+    
+    // 模板上下文 (用于渲染模板变量)
+    TemplateContext manifest.TemplateContext
+    
+    // PhaseContext (用于版本比较与升级判断)
+    PhaseContext *phaseframe.PhaseContext
+}
+
+// ManifestApplier 扩展接口 (兼容现有 manifest.Applier)
+type AdvancedManifestApplier interface {
+    // ApplyComponent 兼容现有 manifest.Applier 接口
+    ApplyComponent(ctx context.Context, pkg *manifest.ComponentPackage) error
+    
+    // ApplyWithStrategy 按指定策略应用清单
+    ApplyWithStrategy(ctx context.Context, pkg *manifest.ComponentPackage, strategy ApplyStrategy) error
+    
+    // PruneResources 裁剪不再需要的资源
+    PruneResources(ctx context.Context, namespace string, selector labels.Selector, applied []*unstructured.Unstructured) error
+}
+```
+
+### 6.4 核心方法实现
+
+```go
+// pkg/yamlexecutor/executor.go
+
+// yamlManifestExecutor YAML 清单执行器实现
+type yamlManifestExecutor struct {
+    manifestStore   manifest.Store
+    manifestApplier AdvancedManifestApplier
+    httpClient      *http.Client
+    logger          *bkev1beta1.BKELogger
+}
+
+// NewYAMLManifestExecutor 创建 YAML 清单执行器
+func NewYAMLManifestExecutor(cfg YAMLManifestExecutorConfig) *yamlManifestExecutor {
+    return &yamlManifestExecutor{
+        manifestStore:   cfg.ManifestStore,
+        manifestApplier: cfg.ManifestApplier,
+        httpClient:      cfg.HTTPClient,
+        logger:          cfg.Logger,
+    }
+}
+
+// Execute 执行 YAML 清单组件的安装/升级
+func (e *yamlManifestExecutor) Execute(ctx context.Context, spec *YAMLSpec, opts ExecuteOptions) error {
+    // 1. 版本检查 - 判断是否需要升级
+    if !manifestNeedsUpgrade(opts.PhaseContext, opts.ComponentName) {
+        if e.logger != nil {
+            e.logger.Info("skip yaml component, version matched",
+                "component", opts.ComponentName, "version", opts.ComponentVersion)
+        }
+        return nil
+    }
+    
+    // 2. 获取清单数据
+    manifests, err := e.resolveManifests(ctx, spec, opts)
+    if err != nil {
+        return fmt.Errorf("resolve manifests for %s: %w", opts.ComponentName, err)
+    }
+    
+    if len(manifests) == 0 {
+        return fmt.Errorf("component %q has no manifests to apply", opts.ComponentName)
+    }
+    
+    // 3. 构建应用包
+    pkg := &manifest.ComponentPackage{
+        Name:      opts.ComponentName,
+        Version:   opts.ComponentVersion,
+        Manifests: manifests,
+    }
+    
+    // 4. 按策略应用资源
+    strategy := e.resolveApplyStrategy(spec)
+    if err := e.manifestApplier.ApplyWithStrategy(ctx, pkg, strategy); err != nil {
+        return fmt.Errorf("apply manifests for %s with strategy %s: %w",
+            opts.ComponentName, strategy, err)
+    }
+    
+    // 5. 可选裁剪
+    if spec != nil && spec.Prune {
+        if err := e.pruneResources(ctx, spec, pkg); err != nil {
+            if e.logger != nil {
+                e.logger.Info("prune resources warning",
+                    "component", opts.ComponentName, "error", err)
+            }
+        }
+    }
+    
+    return nil
+}
+
+// resolveManifests 解析并下载清单数据
+// 优先从 ManifestStore 获取，回退到从 YAMLSpec.Manifests URL 下载
+func (e *yamlManifestExecutor) resolveManifests(
+    ctx context.Context,
+    spec *YAMLSpec,
+    opts ExecuteOptions,
+) ([][]byte, error) {
+    // 路径1: 从 ManifestStore 获取 (兼容现有代码路径)
+    if e.manifestStore != nil {
+        pkg, err := e.manifestStore.GetComponentManifests(
+            ctx, opts.ComponentName, opts.ComponentVersion, opts.TemplateContext)
+        if err == nil && pkg != nil && len(pkg.Manifests) > 0 {
+            return pkg.Manifests, nil
+        }
+    }
+    
+    // 路径2: 从 YAMLSpec.Manifests URL 下载
+    if spec != nil && len(spec.Manifests) > 0 {
+        var allManifests [][]byte
+        for _, ref := range spec.Manifests {
+            data, err := e.downloadManifest(ctx, ref)
+            if err != nil {
+                return nil, fmt.Errorf("download manifest from %s: %w", ref.URL, err)
+            }
+            allManifests = append(allManifests, data)
+        }
+        return allManifests, nil
+    }
+    
+    return nil, fmt.Errorf("no manifest source available for component %q", opts.ComponentName)
+}
+
+// downloadManifest 下载单个清单文件
+func (e *yamlManifestExecutor) downloadManifest(ctx context.Context, ref ManifestRef) ([]byte, error) {
+    req, err := http.NewRequestWithContext(ctx, "GET", ref.URL, nil)
+    if err != nil {
+        return nil, fmt.Errorf("create request for %s: %w", ref.URL, err)
+    }
+    
+    resp, err := e.httpClient.Do(req)
+    if err != nil {
+        return nil, fmt.Errorf("download %s: %w", ref.URL, err)
+    }
+    defer resp.Body.Close()
+    
+    if resp.StatusCode != http.StatusOK {
+        return nil, fmt.Errorf("download %s: unexpected status %d", ref.URL, resp.StatusCode)
+    }
+    
+    data, err := io.ReadAll(resp.Body)
+    if err != nil {
+        return nil, fmt.Errorf("read response from %s: %w", ref.URL, err)
+    }
+    
+    // 校验和验证
+    if ref.Checksum != "" {
+        if err := verifyChecksum(data, ref.Checksum); err != nil {
+            return nil, fmt.Errorf("checksum verification failed for %s: %w", ref.URL, err)
+        }
+    }
+    
+    return data, nil
+}
+
+// resolveApplyStrategy 解析应用策略，默认为 ServerSideApply
+func (e *yamlManifestExecutor) resolveApplyStrategy(spec *YAMLSpec) ApplyStrategy {
+    if spec == nil || spec.ApplyStrategy == "" {
+        return ApplyStrategyServerSideApply
+    }
+    return ApplyStrategy(spec.ApplyStrategy)
+}
+
+// pruneResources 裁剪不再需要的资源
+func (e *yamlManifestExecutor) pruneResources(
+    ctx context.Context,
+    spec *YAMLSpec,
+    pkg *manifest.ComponentPackage,
+) error {
+    if len(spec.PruneLabelSelector) == 0 {
+        return nil
+    }
+    
+    selector := labels.Set(spec.PruneLabelSelector).AsSelector()
+    namespace := spec.Namespace
+    
+    // 解析已应用的资源列表
+    var applied []*unstructured.Unstructured
+    for _, doc := range pkg.Manifests {
+        objects, err := parseYAMLDocuments(doc)
+        if err != nil {
+            continue
+        }
+        applied = append(applied, objects...)
+    }
+    
+    return e.manifestApplier.PruneResources(ctx, namespace, selector, applied)
+}
+
+// manifestNeedsUpgrade 检查组件是否需要升级
+func manifestNeedsUpgrade(phaseCtx *phaseframe.PhaseContext, componentName string) bool {
+    if phaseCtx == nil || phaseCtx.VersionContext == nil {
+        return true
+    }
+    vc := phaseCtx.VersionContext
+    if !vc.HasTarget(componentName) {
+        return true
+    }
+    return vc.NeedsUpgrade(componentName)
+}
+```
+
+```go
+// pkg/yamlexecutor/parser.go
+
+// parseYAMLDocuments 解析多文档 YAML 为 Unstructured 对象列表
+func parseYAMLDocuments(data []byte) ([]*unstructured.Unstructured, error) {
+    var result []*unstructured.Unstructured
+    
+    decoder := yaml.NewYAMLOrJSONDecoder(bytes.NewReader(data), 4096)
+    for {
+        obj := &unstructured.Unstructured{}
+        if err := decoder.Decode(obj); err != nil {
+            if errors.Is(err, io.EOF) {
+                break
+            }
+            continue
+        }
+        if obj.GetKind() == "" {
+            continue
+        }
+        result = append(result, obj)
+    }
+    
+    return result, nil
+}
+
+// verifyChecksum 验证数据校验和
+func verifyChecksum(data []byte, expectedChecksum string) error {
+    parts := strings.SplitN(expectedChecksum, ":", 2)
+    if len(parts) != 2 {
+        return fmt.Errorf("invalid checksum format: %s", expectedChecksum)
+    }
+    
+    algorithm, expected := parts[0], parts[1]
+    switch algorithm {
+    case "sha256":
+        hash := sha256.Sum256(data)
+        actual := hex.EncodeToString(hash[:])
+        if actual != expected {
+            return fmt.Errorf("checksum mismatch: expected %s, got %s", expected, actual)
+        }
+    default:
+        return fmt.Errorf("unsupported checksum algorithm: %s", algorithm)
+    }
+    
+    return nil
+}
+```
+
+```go
+// pkg/yamlexecutor/applier.go
+
+// advancedClusterApplier 扩展的集群应用器
+type advancedClusterApplier struct {
+    *manifest.ClusterApplier
+}
+
+// ApplyWithStrategy 按指定策略应用清单
+func (a *advancedClusterApplier) ApplyWithStrategy(
+    ctx context.Context,
+    pkg *manifest.ComponentPackage,
+    strategy ApplyStrategy,
+) error {
+    switch strategy {
+    case ApplyStrategyServerSideApply:
+        return a.applyServerSide(ctx, pkg)
+    case ApplyStrategyReplace:
+        return a.applyReplace(ctx, pkg)
+    case ApplyStrategyCreateOnly:
+        return a.applyCreateOnly(ctx, pkg)
+    default:
+        return a.ApplyComponent(ctx, pkg)
+    }
+}
+
+// applyServerSide 使用 Server-Side Apply 方式应用资源
+func (a *advancedClusterApplier) applyServerSide(ctx context.Context, pkg *manifest.ComponentPackage) error {
+    return a.ApplyComponent(ctx, pkg)
+}
+
+// applyReplace 使用替换方式更新资源
+func (a *advancedClusterApplier) applyReplace(ctx context.Context, pkg *manifest.ComponentPackage) error {
+    objects, err := a.parseAllManifests(pkg)
+    if err != nil {
+        return err
+    }
+    
+    for _, obj := range objects {
+        if err := a.replaceResource(ctx, obj); err != nil {
+            return fmt.Errorf("replace %s/%s: %w", obj.GetKind(), obj.GetName(), err)
+        }
+    }
+    return nil
+}
+
+// applyCreateOnly 仅在资源不存在时创建
+func (a *advancedClusterApplier) applyCreateOnly(ctx context.Context, pkg *manifest.ComponentPackage) error {
+    objects, err := a.parseAllManifests(pkg)
+    if err != nil {
+        return err
+    }
+    
+    for _, obj := range objects {
+        if err := a.createIfNotExists(ctx, obj); err != nil {
+            return fmt.Errorf("create %s/%s: %w", obj.GetKind(), obj.GetName(), err)
+        }
+    }
+    return nil
+}
+
+// PruneResources 裁剪不再需要的资源
+func (a *advancedClusterApplier) PruneResources(
+    ctx context.Context,
+    namespace string,
+    selector labels.Selector,
+    applied []*unstructured.Unstructured,
+) error {
+    // 构建 applied 集合的 key (namespace/kind/name)
+    appliedKeys := make(map[string]struct{})
+    for _, obj := range applied {
+        key := fmt.Sprintf("%s/%s/%s", obj.GetNamespace(), obj.GetKind(), obj.GetName())
+        appliedKeys[key] = struct{}{}
+    }
+    
+    // 按选择器查询集群中匹配标签的资源
+    // 删除不在 applied 集合中的资源
+    // (具体实现依赖 kubeClient 动态客户端)
+    return nil
+}
+```
+
+---
+
+## 7. TemplateRenderer 详细设计
+
+### 7.1 模板变量系统
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -2376,7 +2987,7 @@ func (i *HelmInstaller) Install(ctx context.Context, opts InstallOptions) error 
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 6.2 TemplateRenderer 渲染流程图
+### 7.2 TemplateRenderer 渲染流程图
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -2453,7 +3064,7 @@ func (i *HelmInstaller) Install(ctx context.Context, opts InstallOptions) error 
                     └─────────────────┘   └─────────────────┘
 ```
 
-### 6.3 自定义函数定义
+### 7.3 自定义函数定义
 
 ```go
 // pkg/binaryinstaller/template_renderer.go
@@ -2544,9 +3155,9 @@ func (r *TemplateRenderer) RenderScript(script string, data ScriptData) (string,
 
 ---
 
-## 7. ConfigRenderer 详细设计
+## 8. ConfigRenderer 详细设计
 
-### 7.1 三种渲染模式
+### 8.1 三种渲染模式
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -2669,7 +3280,7 @@ func (r *TemplateRenderer) RenderScript(script string, data ScriptData) (string,
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 7.2 ConfigRenderer 渲染流程图
+### 8.2 ConfigRenderer 渲染流程图
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -2728,7 +3339,7 @@ func (r *TemplateRenderer) RenderScript(script string, data ScriptData) (string,
                     └──────────────────────────────────────┘
 ```
 
-### 7.3 核心接口定义
+### 8.3 核心接口定义
 
 ```go
 // pkg/binaryinstaller/config_renderer.go
@@ -2865,9 +3476,9 @@ func (r *ConfigRenderer) buildTemplateData(ctx context.Context, opts InstallOpti
 
 ---
 
-## 8. DAG 集成详细设计
+## 9. DAG 集成详细设计
 
-### 8.1 执行器注册
+### 9.1 执行器注册
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -2891,33 +3502,34 @@ func (r *ConfigRenderer) buildTemplateData(ctx context.Context, opts InstallOpti
                     │  switch cv.Spec.Type                 │
                     └────────────────────┬─────────────────┘
                                          │
-              ┌──────────────────────────┼──────────────────────────┐
-              │                          │                          │
-              ▼                          ▼                          ▼
-    ┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
-    │  ComponentType  │      │  ComponentType  │      │  ComponentType  │
-    │  Binary         │      │  Helm           │      │  Inline         │
-    │                 │      │                 │      │                 │
-    └────────┬────────┘      └────────┬────────┘      └────────┬────────┘
-             │                        │                        │
-             ▼                        ▼                        ▼
-    ┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
-    │  创建           │      │  创建           │      │  创建           │
-    │  BinaryComponent│      │  HelmComponent  │      │  InlineComponent│
-    │  Executor       │      │  Executor       │      │  Executor       │
-    └────────┬────────┘      └────────┬────────┘      └────────┬────────┘
-             │                        │                        │
-             └────────────────────────┼────────────────────────┘
-                                      │
-                                      ▼
-                    ┌──────────────────────────────────────┐
-                    │  注册到 DAG                          │
-                    │  dag.AddNode(name, executor,         │
-                    │              dependencies, policy)   │
-                    └──────────────────────────────────────┘
+          ┌──────────────┬───────────────┼───────────────┬──────────────┐
+          │              │               │               │              │
+          ▼              ▼               ▼               ▼              │
+┌───────────────┐ ┌─────────────┐ ┌─────────────┐ ┌──────────────┐    │
+│ ComponentType │ │ComponentType│ │ComponentType│ │ComponentType │    │
+│   Binary      │ │    Helm     │ │    YAML     │ │   Inline     │    │
+│               │ │             │ │             │ │              │    │
+└───────┬───────┘ └──────┬──────┘ └──────┬──────┘ └──────┬───────┘    │
+        │                │               │               │             │
+        ▼                ▼               ▼               ▼             │
+┌───────────────┐ ┌─────────────┐ ┌─────────────┐ ┌──────────────┐    │
+│   创建        │ │   创建      │ │   创建      │ │   创建       │    │
+│ Binary        │ │ Helm        │ │ YAML        │ │ Inline       │    │
+│ Component     │ │ Component   │ │ Manifest    │ │ Component    │    │
+│ Executor      │ │ Executor    │ │ Executor    │ │ Executor     │    │
+└───────┬───────┘ └──────┬──────┘ └──────┬──────┘ └──────┬───────┘    │
+        │                │               │               │             │
+        └────────────────┴───────────────┼───────────────┘             │
+                                        │                              │
+                                        ▼                              │
+                    ┌──────────────────────────────────────┐           │
+                    │  注册到 DAG                          │           │
+                    │  dag.AddNode(name, executor,         │           │
+                    │              dependencies, policy)   │           │
+                    └──────────────────────────────────────┘           │
 ```
 
-### 8.2 DAG 调度流程图
+### 9.2 DAG 调度流程图
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -2982,7 +3594,7 @@ func (r *ConfigRenderer) buildTemplateData(ctx context.Context, opts InstallOpti
                               └─────────────┘ └─────────┘ └─────────┘
 ```
 
-### 8.3 核心接口定义
+### 9.3 核心接口定义
 
 ```go
 // pkg/dagexec/executor.go
@@ -3111,10 +3723,10 @@ func (e *HelmComponentExecutor) ExecuteComponent(ctx context.Context, node *Comp
 
 ---
 
-### 8.4 ComponentNode 扩展
+### 9.4 ComponentNode 扩展
 
 
-当前 `topology.ComponentNode` 仅有 `Inline` 字段，需扩展以支持 Binary/Helm 类型：
+当前 `topology.ComponentNode` 仅有 `Inline` 字段，需扩展以支持 Binary/Helm/YAML 类型：
 
 ```go
 // pkg/topology/component.go 扩展
@@ -3133,6 +3745,13 @@ type HelmRef struct {
     ReleaseName string
 }
 
+// YAMLRef 指向一个 YAML 清单组件
+type YAMLRef struct {
+    Name      string
+    Version   string
+    Namespace string
+}
+
 // ComponentNode 扩展后定义 (兼容现有 Inline 字段)
 type ComponentNode struct {
     Name          string
@@ -3140,6 +3759,7 @@ type ComponentNode struct {
     Inline        *InlineRef   // type=inline 时非 nil
     Binary        *BinaryRef   // type=binary 时非 nil
     Helm          *HelmRef     // type=helm 时非 nil
+    YAML          *YAMLRef     // type=yaml 时非 nil
     FailurePolicy FailurePolicy
     Dependencies  []string
 }
@@ -3153,6 +3773,8 @@ func (n *ComponentNode) ComponentType() string {
         return "binary"
     case n.Helm != nil:
         return "helm"
+    case n.YAML != nil:
+        return "yaml"
     default:
         return "yaml"
     }
@@ -3160,12 +3782,12 @@ func (n *ComponentNode) ComponentType() string {
 ```
 
 
-### 8.5 Scheduler 扩展与执行策略
+### 9.5 Scheduler 扩展与执行策略
 
 
 
 
-当前 `topology.ComponentNode` 仅有 `Inline` 字段，需扩展以支持 Binary/Helm 类型：
+当前 `topology.ComponentNode` 仅有 `Inline` 字段，需扩展以支持 Binary/Helm/YAML 类型：
 
 ```go
 // pkg/topology/component.go 扩展
@@ -3184,6 +3806,13 @@ type HelmRef struct {
     ReleaseName string
 }
 
+// YAMLRef 指向一个 YAML 清单组件
+type YAMLRef struct {
+    Name      string
+    Version   string
+    Namespace string
+}
+
 // ComponentNode 扩展后定义 (兼容现有 Inline 字段)
 type ComponentNode struct {
     Name          string
@@ -3191,6 +3820,7 @@ type ComponentNode struct {
     Inline        *InlineRef   // type=inline 时非 nil
     Binary        *BinaryRef   // type=binary 时非 nil
     Helm          *HelmRef     // type=helm 时非 nil
+    YAML          *YAMLRef     // type=yaml 时非 nil
     FailurePolicy FailurePolicy
     Dependencies  []string
 }
@@ -3204,6 +3834,8 @@ func (n *ComponentNode) ComponentType() string {
         return "binary"
     case n.Helm != nil:
         return "helm"
+    case n.YAML != nil:
+        return "yaml"
     default:
         return "yaml"
     }
@@ -3226,13 +3858,19 @@ type HelmInstaller interface {
     Install(ctx context.Context, opts HelmInstallOptions) error
 }
 
+// YAMLManifestExecutor 执行 YAML 清单组件 (接口定义)
+type YAMLManifestExecutor interface {
+    Execute(ctx context.Context, spec *YAMLSpec, opts ExecuteOptions) error
+}
+
 // Scheduler 扩展字段
 type Scheduler struct {
     InlineRunner          InlinePhaseRunner
     ManifestStore         manifest.Store
     ManifestApplier       manifest.Applier
-    BinaryInstaller       BinaryInstaller       // 新增
-    HelmInstaller         HelmInstaller         // 新增
+    BinaryInstaller       BinaryInstaller         // 新增
+    HelmInstaller         HelmInstaller           // 新增
+    YAMLExecutor          YAMLManifestExecutor    // 新增
     MaxParallelPerBatch   int
 }
 
@@ -3241,8 +3879,9 @@ type Config struct {
     InlineRunner          InlinePhaseRunner
     ManifestStore         manifest.Store
     ManifestApplier       manifest.Applier
-    BinaryInstaller       BinaryInstaller       // 新增
-    HelmInstaller         HelmInstaller         // 新增
+    BinaryInstaller       BinaryInstaller         // 新增
+    HelmInstaller         HelmInstaller           // 新增
+    YAMLExecutor          YAMLManifestExecutor    // 新增
     MaxParallelPerBatch   int
 }
 
@@ -3261,9 +3900,43 @@ func (s *Scheduler) executeComponent(
         return s.executeBinary(ctx, phaseCtx, node)
     case "helm":
         return s.executeHelm(ctx, phaseCtx, node)
+    case "yaml":
+        return s.executeYAML(ctx, phaseCtx, node, tmpl)
     default:
+        return s.executeYAML(ctx, phaseCtx, node, tmpl)
+    }
+}
+
+// executeYAML 执行 YAML 清单组件
+func (s *Scheduler) executeYAML(
+    ctx context.Context,
+    phaseCtx *phaseframe.PhaseContext,
+    node *topology.ComponentNode,
+    tmpl manifest.TemplateContext,
+) error {
+    if node.YAML == nil {
         return s.executeManifest(ctx, phaseCtx, node, tmpl)
     }
+
+    cv, err := s.getComponentVersion(node.Name, node.Version)
+    if err != nil {
+        return fmt.Errorf("failed to get component version for %s: %w", node.Name, err)
+    }
+
+    spec := cv.Spec.YAML
+    opts := ExecuteOptions{
+        ComponentName:    node.Name,
+        ComponentVersion: node.Version,
+        Namespace:        node.YAML.Namespace,
+        TemplateContext:  tmpl,
+        PhaseContext:     phaseCtx,
+    }
+
+    if s.YAMLExecutor != nil {
+        return s.YAMLExecutor.Execute(ctx, spec, opts)
+    }
+
+    return s.executeManifest(ctx, phaseCtx, node, tmpl)
 }
 
 // executeBinary 执行二进制组件
@@ -3342,7 +4015,7 @@ func (s *Scheduler) executeHelm(
 ```
 
 
-#### 8.5.1 getTargetNodes - 目标节点获取
+#### 9.5.1 getTargetNodes - 目标节点获取
 
 
 ```go
@@ -3417,7 +4090,7 @@ type BKENodeTarget struct {
 ```
 
 
-#### 8.5.2 executeBinaryRolling / Parallel / Batch - 执行策略实现
+#### 9.5.2 executeBinaryRolling / Parallel / Batch - 执行策略实现
 
 
 ```go
@@ -3603,7 +4276,7 @@ func parseDuration(s string) time.Duration {
 ```
 
 
-#### 8.5.3 BuildInstallDAG / BuildUpgradeDAG - DAG 构建实现
+#### 9.5.3 BuildInstallDAG / BuildUpgradeDAG - DAG 构建实现
 
 
 ```go
@@ -3664,8 +4337,18 @@ func BuildInstallDAG(bundle *manifest.Bundle) (*UpgradeDAG, error) {
             }
         case "inline":
             node.Inline = &InlineRef{Handler: cv.Spec.Inline.Handler, Version: cv.Spec.Inline.Version}
+        case "yaml":
+            namespace := ""
+            if cv.Spec.YAML != nil {
+                namespace = cv.Spec.YAML.Namespace
+            }
+            node.YAML = &YAMLRef{
+                Name:      comp.Name,
+                Version:   comp.Version,
+                Namespace: namespace,
+            }
         default:
-            // yaml/manifest 类型不设置特殊引用
+            // 未知类型不设置特殊引用，仍走 executeManifest 兼容路径
         }
 
         dag.AddNode(node)
@@ -3709,11 +4392,11 @@ func getDependencyNames(deps []Dependency) []string {
 ---
 
 
-### 8.6 NeedExecute 接口适配
+### 9.6 NeedExecute 接口适配
 
 
 
-#### 8.6.1 现有 NeedExecute 机制分析
+#### 9.6.1 现有 NeedExecute 机制分析
 
 当前 `NeedExecute` 接口定义在 `phaseframe.Phase` 接口中：
 
@@ -3729,7 +4412,7 @@ type Phase interface {
 对于 inline Phase，`NeedExecute` 通过 `NeedExecuteWithVersionContext` 判断版本是否需要升级。
 对于 Binary/Helm 组件，不在 Phase 流程中，而是在 DAG 调度流程中执行。
 
-#### 8.6.2 Binary/Helm 组件的 NeedExecute 适配方案
+#### 9.6.2 Binary/Helm 组件的 NeedExecute 适配方案
 
 Binary/Helm 组件在 DAG 调度器中执行，**不直接实现 Phase 接口**。其"是否需要执行"的判断逻辑如下：
 
@@ -3762,7 +4445,7 @@ func (s *Scheduler) shouldExecuteHelm(phaseCtx *phaseframe.PhaseContext, node *t
 }
 ```
 
-#### 8.6.3 shouldSkipComponent 扩展
+#### 9.6.3 shouldSkipComponent 扩展
 
 当前 `shouldSkipComponent` 仅检查 `DeclarativeUpgrade.IsCompleted`，需扩展以支持 Binary/Helm：
 
@@ -3794,11 +4477,11 @@ func (s *Scheduler) shouldSkipComponent(phaseCtx *phaseframe.PhaseContext, node 
 ---
 
 
-### 8.7 组件状态回写机制
+### 9.7 组件状态回写机制
 
 
 
-#### 8.7.1 状态回写流程
+#### 9.7.1 状态回写流程
 
 ```
 组件执行完成 (成功/失败)
@@ -3822,7 +4505,7 @@ func (s *Scheduler) shouldSkipComponent(phaseCtx *phaseframe.PhaseContext, node 
 └──────────────────────────────────────┘
 ```
 
-#### 8.7.2 Binary/Helm 组件状态记录
+#### 9.7.2 Binary/Helm 组件状态记录
 
 当前 `DeclarativeUpgrade` 状态已支持 `IsCompleted`/`MarkCompleted`/`MarkFailure`。
 Binary/Helm 组件复用同一状态结构，无需扩展。
@@ -3837,7 +4520,7 @@ Binary/Helm 组件复用同一状态结构，无需扩展。
 // 在 persistBatchResults 中统一处理
 ```
 
-#### 8.7.3 BinaryComponentExecutor 逐节点状态记录
+#### 9.7.3 BinaryComponentExecutor 逐节点状态记录
 
 对于滚动升级场景，需要记录每个节点的执行状态：
 
@@ -3872,9 +4555,9 @@ func recordBinaryNodeStatus(phaseCtx *phaseframe.PhaseContext, componentName str
 ---
 
 
-## 9. 完整安装流程详细设计
+## 10. 完整安装流程详细设计
 
-### 9.1 安装流程图
+### 10.1 安装流程图
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -4012,9 +4695,9 @@ func recordBinaryNodeStatus(phaseCtx *phaseframe.PhaseContext, componentName str
 
 ---
 
-## 10. 完整升级流程详细设计
+## 11. 完整升级流程详细设计
 
-### 10.1 升级流程图
+### 11.1 升级流程图
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -4128,9 +4811,9 @@ func recordBinaryNodeStatus(phaseCtx *phaseframe.PhaseContext, componentName str
 
 ---
 
-## 11. 迁移策略详细设计
+## 12. 迁移策略详细设计
 
-### 11.1 迁移流程图
+### 12.1 迁移流程图
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -4170,7 +4853,7 @@ func recordBinaryNodeStatus(phaseCtx *phaseframe.PhaseContext, componentName str
                     └──────────────────────────────────────┘
 ```
 
-### 11.2 Feature Gate 定义
+### 12.2 Feature Gate 定义
 
 ```go
 // pkg/featuregate/features.go
@@ -4192,11 +4875,11 @@ var defaultFeatureGates = map[string]bool{
 
 ---
 
-### 11.3 兼容层实现与迁移验证
+### 12.3 兼容层实现与迁移验证
 
 
 
-#### 11.3.1 Feature Gate 扩展
+#### 12.3.1 Feature Gate 扩展
 
 ```go
 // pkg/featuregate/features.go 扩展
@@ -4226,7 +4909,7 @@ func Enabled(gate string) bool {
 }
 ```
 
-#### 11.3.2 BKEClusterReconciler 兼容层
+#### 12.3.2 BKEClusterReconciler 兼容层
 
 ```go
 // controllers/capbke/bkecluster_upgrade_dag.go 扩展
@@ -4257,7 +4940,7 @@ func (r *BKEClusterReconciler) executeBinaryComponent(ctx context.Context, phase
 }
 ```
 
-#### 11.3.3 迁移验证清单
+#### 12.3.3 迁移验证清单
 
 | 检查项 | 验证方式 | 通过标准 |
 |--------|---------|---------|
@@ -4270,9 +4953,9 @@ func (r *BKEClusterReconciler) executeBinaryComponent(ctx context.Context, phase
 ---
 
 
-## 12. 错误处理与恢复
+## 13. 错误处理与恢复
 
-### 12.1 错误处理流程图
+### 13.1 错误处理流程图
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -4319,11 +5002,11 @@ func (r *BKEClusterReconciler) executeBinaryComponent(ctx context.Context, phase
 
 ---
 
-### 12.2 错误分类实现
+### 13.2 错误分类实现
 
 
 
-#### 12.2.1 classifyError - 错误分类
+#### 13.2.1 classifyError - 错误分类
 
 ```go
 // pkg/dagexec/error_classifier.go
@@ -4373,9 +5056,9 @@ func classifyError(err error) ErrorCategory {
 ```
 
 
-## 13. 测试设计
+## 14. 测试设计
 
-### 13.1 单元测试
+### 14.1 单元测试
 
 | 测试模块 | 测试场景 | 覆盖目标 |
 |---------|---------|---------|
@@ -4386,7 +5069,7 @@ func classifyError(err error) ErrorCategory {
 | **HelmInstaller** | OCI/HTTP/本地 Chart 获取、Values 渲染、Install/Upgrade/Rollback | >85% |
 | **BinaryComponentExecutor** | Rolling/Parallel/Batch 执行策略、FailurePolicy | >85% |
 
-### 13.2 集成测试
+### 14.2 集成测试
 
 | 测试场景 | 验证内容 | 预期结果 |
 |---------|---------|---------|
@@ -4399,7 +5082,7 @@ func classifyError(err error) ErrorCategory {
 | **离线环境** | 无网络时使用本地缓存 | 安装/升级正常完成 |
 | **多架构** | amd64 + arm64 混合集群 | 各节点下载对应架构制品 |
 
-### 13.3 E2E 测试
+### 14.3 E2E 测试
 
 | 测试场景 | 集群规模 | 验证内容 |
 |---------|---------|---------|
@@ -4410,9 +5093,9 @@ func classifyError(err error) ErrorCategory {
 
 ---
 
-## 14. 工作量与任务拆解
+## 15. 工作量与任务拆解
 
-### 14.1 工作量评估
+### 15.1 工作量评估
 
 | 任务 | 预估工时 | 风险等级 | 依赖 |
 |------|---------|---------|------|
@@ -4433,7 +5116,7 @@ func classifyError(err error) ErrorCategory {
 | **代码审查与修复** | 3 人日 | 中 | 测试完成 |
 | **总计** | **45 人日** | | |
 
-### 14.2 Sprint 计划
+### 15.2 Sprint 计划
 
 #### Sprint 1 (第1-2周): BinaryInstaller 核心实现
 
@@ -4470,7 +5153,7 @@ func classifyError(err error) ErrorCategory {
 | 集成测试 | 开发A+B+C | 安装/升级/回滚场景 |
 | E2E 测试 | 开发A+B+C | 多场景端到端验证 |
 
-### 14.3 里程碑
+### 15.3 里程碑
 
 | 里程碑 | 时间 | 交付内容 | 验收标准 |
 |--------|------|---------|---------|
@@ -4483,9 +5166,9 @@ func classifyError(err error) ErrorCategory {
 
 ---
 
-## 15. 附录
+## 16. 附录
 
-### 15.1 参考文档
+### 16.1 参考文档
 
 - KEP-5: 基于 ClusterVersion/ReleaseImage/UpgradePath 的声明式集群版本升级
 - KEP-6: 基于 ReleaseImage 的二进制与 Helm 组件声明式管理方案
@@ -4494,7 +5177,7 @@ func classifyError(err error) ErrorCategory {
 - DAG 调度器设计文档
 - Helm Action API: https://pkg.go.dev/helm.sh/helm/v3/pkg/action
 
-### 15.2 术语表
+### 16.2 术语表
 
 | 术语 | 定义 |
 |------|------|
