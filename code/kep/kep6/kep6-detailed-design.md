@@ -2713,7 +2713,1644 @@ var defaultFeatureGates = map[string]bool{
 
 ---
 
-## 15. 附录
+## 15. 补充设计：核心类型定义
+
+> 本节补充第 4-7 节中引用但未定义的核心类型。
+
+### 15.1 Artifact 与 ArtifactCache 类型
+
+```go
+// pkg/binaryinstaller/types.go
+
+// Artifact 表示已下载的二进制制品
+type Artifact struct {
+    // 制品名称 (来自 ArtifactSpec.Name)
+    Name string
+    // 解析后的实际下载 URL
+    URL string
+    // 期望的校验和 (来自 ArtifactSpec.Checksum)
+    Checksum string
+    // 下载后的制品内容
+    Data []byte
+    // 制品在本地缓存中的文件路径
+    Path string
+    // 制品的可执行文件名
+    Executable string
+    // 制品的安装路径
+    InstallPath string
+}
+
+// ArtifactCache 管理二进制制品的本地文件缓存
+type ArtifactCache struct {
+    // cacheDir 缓存根目录 (如 /var/cache/bke/artifacts)
+    cacheDir string
+}
+
+// NewArtifactCache 创建缓存管理器
+func NewArtifactCache(cacheDir string) (*ArtifactCache, error) {
+    if err := os.MkdirAll(cacheDir, 0755); err != nil {
+        return nil, fmt.Errorf("failed to create cache directory %s: %w", cacheDir, err)
+    }
+    return &ArtifactCache{cacheDir: cacheDir}, nil
+}
+
+// Get 从缓存中获取制品，返回 nil 表示未命中
+func (c *ArtifactCache) Get(cacheKey string) *Artifact {
+    metaPath := filepath.Join(c.cacheDir, cacheKey+".meta")
+    dataPath := filepath.Join(c.cacheDir, cacheKey+".data")
+
+    metaBytes, err := os.ReadFile(metaPath)
+    if err != nil {
+        return nil
+    }
+
+    var artifact Artifact
+    if err := json.Unmarshal(metaBytes, &artifact); err != nil {
+        return nil
+    }
+
+    // 验证数据文件是否存在
+    if _, err := os.Stat(dataPath); err != nil {
+        return nil
+    }
+
+    artifact.Path = dataPath
+    return &artifact
+}
+
+// Save 将制品保存到缓存，返回数据文件路径
+func (c *ArtifactCache) Save(cacheKey string, artifact *Artifact) string {
+    metaPath := filepath.Join(c.cacheDir, cacheKey+".meta")
+    dataPath := filepath.Join(c.cacheDir, cacheKey+".data")
+
+    // 保存元数据
+    meta := *artifact
+    meta.Data = nil // 不将二进制内容序列化到 meta
+    meta.Path = dataPath
+    metaBytes, _ := json.Marshal(&meta)
+    os.WriteFile(metaPath, metaBytes, 0644)
+
+    // 保存数据文件
+    os.WriteFile(dataPath, artifact.Data, 0644)
+
+    return dataPath
+}
+
+// Clean 清理超过 maxAge 的缓存文件
+func (c *ArtifactCache) Clean(maxAge time.Duration) error {
+    entries, err := os.ReadDir(c.cacheDir)
+    if err != nil {
+        return err
+    }
+    cutoff := time.Now().Add(-maxAge)
+    for _, entry := range entries {
+        info, err := entry.Info()
+        if err != nil {
+            continue
+        }
+        if info.ModTime().Before(cutoff) {
+            os.Remove(filepath.Join(c.cacheDir, entry.Name()))
+        }
+    }
+    return nil
+}
+```
+
+### 15.2 ScriptData 与 ArtifactData 类型
+
+```go
+// pkg/binaryinstaller/template_data.go
+
+// ScriptData 安装脚本模板渲染数据 (对应第 6.1 节 8 类变量)
+type ScriptData struct {
+    // ---- 1. 集群信息 ----
+    ClusterName      string
+    ClusterNamespace string
+    APIServer        string
+    APIServerPort    string
+    ServiceCIDR      string
+    PodCIDR          string
+    DNSDomain        string
+    ClusterDNS       string
+
+    // ---- 2. 节点信息 ----
+    NodeIP            string
+    NodeHostname      string
+    NodeRole          string // master / worker / etcd
+    NodeArch          string // amd64 / arm64
+    NodeOS            string // centos / ubuntu / kylin
+    NodeOSVersion     string // 7 / 8 / 20.04 / V10
+    NodeKernelVersion string
+    NodeCPUs          int
+    NodeMemoryMB      int
+    NodeDiskGB        int
+
+    // ---- 3. 版本信息 ----
+    ComponentVersion         string
+    ComponentPreviousVersion string
+    ClusterVersion           string
+    EtcdVersion              string
+    ContainerdVersion        string
+    BKEAgentVersion          string
+
+    // ---- 4. 二进制制品 ----
+    Artifact map[string]*ArtifactData
+
+    // ---- 5. 镜像仓库 ----
+    ImageRegistry   string
+    ImagePullSecret string
+    ImageNamespace  string
+
+    // ---- 6. 安装路径 ----
+    InstallPath string // 默认 /usr/local/bin
+    ConfigPath  string // 默认 /etc/<component>
+    LogPath     string // 默认 /var/log/<component>
+    DataPath    string // 默认 /var/lib/<component>
+    BinPath     string // 默认 /usr/local/bin
+
+    // ---- 7. 操作类型 ----
+    Action    string // Install / Upgrade / Uninstall
+    IsUpgrade bool
+    IsInstall bool
+
+    // ---- 8. 自定义变量 ----
+    Variables map[string]string
+}
+
+// ArtifactData 制品模板数据
+type ArtifactData struct {
+    Name     string
+    Path     string // 制品在节点上的远程路径
+    URL      string // 制品原始 URL
+    Checksum string // 制品校验和
+    Filename string // 制品文件名
+}
+
+// BuildScriptData 从 InstallOptions 构建模板渲染数据
+func BuildScriptData(opts InstallOptions) ScriptData {
+    component := opts.Component
+    cluster := opts.Cluster
+    node := opts.Node
+    binary := component.Spec.Binary
+
+    data := ScriptData{
+        ClusterName:      cluster.Name,
+        ClusterNamespace: cluster.Namespace,
+        ClusterVersion:   cluster.Spec.ClusterConfig.Cluster.KubernetesVersion,
+        NodeIP:           node.Spec.IP,
+        NodeHostname:     node.Spec.Hostname,
+        NodeRole:         node.Spec.Role,
+        NodeArch:         node.Spec.Architecture,
+        NodeOS:           node.Spec.OperatingSystem,
+        NodeOSVersion:    node.Spec.OperatingSystemVersion,
+        ComponentVersion: component.Spec.Version,
+        Action:           string(opts.Action),
+        IsUpgrade:        opts.Action == BinaryActionUpgrade,
+        IsInstall:        opts.Action == BinaryActionInstall,
+        Variables:        binary.Variables,
+        Artifact:         make(map[string]*ArtifactData),
+    }
+
+    // 集群网络信息
+    if cluster.Spec.ClusterConfig.Network != nil {
+        data.ServiceCIDR = cluster.Spec.ClusterConfig.Network.ServiceCIDR
+        data.PodCIDR = cluster.Spec.ClusterConfig.Network.PodCIDR
+    }
+
+    // 镜像仓库信息
+    if cluster.Spec.ClusterConfig.Registry != nil {
+        data.ImageRegistry = cluster.Spec.ClusterConfig.Registry.Endpoint
+    }
+
+    // 安装路径 (从 BinarySpec 默认值)
+    data.InstallPath = binary.DefaultInstallPath
+    if data.InstallPath == "" {
+        data.InstallPath = "/usr/local/bin"
+    }
+    data.ConfigPath = binary.DefaultConfigPath
+    if data.ConfigPath == "" {
+        data.ConfigPath = fmt.Sprintf("/etc/%s", component.Spec.Name)
+    }
+    data.LogPath = binary.DefaultLogPath
+    if data.LogPath == "" {
+        data.LogPath = fmt.Sprintf("/var/log/%s", component.Spec.Name)
+    }
+    data.DataPath = binary.DefaultDataPath
+    if data.DataPath == "" {
+        data.DataPath = fmt.Sprintf("/var/lib/%s", component.Spec.Name)
+    }
+    data.BinPath = binary.DefaultBinPath
+    if data.BinPath == "" {
+        data.BinPath = "/usr/local/bin"
+    }
+
+    return data
+}
+```
+
+---
+
+## 16. 补充设计：BinaryInstaller 方法实现
+
+> 本节补充第 4.3 节中引用但未实现的核心方法。
+
+### 16.1 resolveTemplate - URL 模板变量解析
+
+```go
+// resolveTemplate 将 URL 中的 {{componentVersion}}/{{nodeArch}}/{{nodeOS}} 替换为实际值
+func (i *BinaryInstaller) resolveTemplate(tmpl string, vars map[string]string) (string, error) {
+    result := tmpl
+    for key, value := range vars {
+        result = strings.ReplaceAll(result, key, value)
+    }
+    // 检查是否还有未解析的变量
+    if strings.Contains(result, "{{") && strings.Contains(result, "}}") {
+        return "", fmt.Errorf("unresolved template variables in %q", result)
+    }
+    return result, nil
+}
+```
+
+### 16.2 computeCacheKey - 缓存键计算
+
+```go
+// computeCacheKey 基于 URL 和 Checksum 生成缓存键
+// 格式: sha256(url + ":" + checksum) 的前 16 位
+func (i *BinaryInstaller) computeCacheKey(url, checksum string) string {
+    h := sha256.New()
+    h.Write([]byte(url + ":" + checksum))
+    return hex.EncodeToString(h.Sum(nil))[:16]
+}
+```
+
+### 16.3 downloadAndVerify - 下载制品并校验
+
+```go
+// downloadAndVerify 下载制品并校验 Checksum
+func (i *BinaryInstaller) downloadAndVerify(ctx context.Context, url, expectedChecksum string) ([]byte, error) {
+    req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+    if err != nil {
+        return nil, fmt.Errorf("failed to create request for %s: %w", url, err)
+    }
+
+    resp, err := i.httpClient.Do(req)
+    if err != nil {
+        return nil, fmt.Errorf("failed to download %s: %w", url, err)
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode != http.StatusOK {
+        return nil, fmt.Errorf("download %s returned status %d", url, resp.StatusCode)
+    }
+
+    data, err := io.ReadAll(io.LimitReader(resp.Body, 500*1024*1024)) // 500MB 上限
+    if err != nil {
+        return nil, fmt.Errorf("failed to read response body from %s: %w", url, err)
+    }
+
+    // 校验 Checksum
+    if err := verifyChecksum(data, expectedChecksum); err != nil {
+        return nil, fmt.Errorf("checksum verification failed for %s: %w", url, err)
+    }
+
+    return data, nil
+}
+
+// verifyChecksum 校验数据的 Checksum
+// expectedChecksum 格式: "sha256:abc123..."
+func verifyChecksum(data []byte, expectedChecksum string) error {
+    if expectedChecksum == "" {
+        return nil
+    }
+
+    parts := strings.SplitN(expectedChecksum, ":", 2)
+    if len(parts) != 2 {
+        return fmt.Errorf("invalid checksum format: %s", expectedChecksum)
+    }
+
+    algorithm := parts[0]
+    expected := parts[1]
+
+    switch algorithm {
+    case "sha256":
+        h := sha256.Sum256(data)
+        actual := hex.EncodeToString(h[:])
+        if actual != expected {
+            return fmt.Errorf("checksum mismatch: expected %s, got %s", expected, actual)
+        }
+    case "sha512":
+        h := sha512.Sum512(data)
+        actual := hex.EncodeToString(h[:])
+        if actual != expected {
+            return fmt.Errorf("checksum mismatch: expected %s, got %s", expected, actual)
+        }
+    default:
+        return fmt.Errorf("unsupported checksum algorithm: %s", algorithm)
+    }
+
+    return nil
+}
+```
+
+### 16.4 renderInstallScript - 渲染安装脚本
+
+```go
+// renderInstallScript 使用 TemplateRenderer 渲染安装脚本
+func (i *BinaryInstaller) renderInstallScript(script string, artifacts map[string]*Artifact, opts InstallOptions) (string, error) {
+    renderer := NewTemplateRenderer()
+    data := BuildScriptData(opts)
+
+    // 构建制品数据
+    data.Artifact = make(map[string]*ArtifactData)
+    for name, art := range artifacts {
+        data.Artifact[name] = &ArtifactData{
+            Name:     art.Name,
+            Path:     art.Path,
+            URL:      art.URL,
+            Checksum: art.Checksum,
+            Filename: filepath.Base(art.Path),
+        }
+    }
+
+    return renderer.RenderScript(script, data)
+}
+```
+
+### 16.5 renderConfigTemplates - 渲染配置文件模板
+
+```go
+// renderConfigTemplates 渲染所有配置文件模板
+func (i *BinaryInstaller) renderConfigTemplates(templates []ConfigTemplateSpec, opts InstallOptions) (map[string][]byte, error) {
+    renderer := &ConfigRenderer{
+        client:  i.client,
+        funcMap: NewTemplateRenderer().funcMap,
+    }
+
+    configs := make(map[string][]byte)
+    for _, tmpl := range templates {
+        content, err := renderer.RenderConfig(context.Background(), tmpl, opts)
+        if err != nil {
+            return nil, fmt.Errorf("failed to render config template %s: %w", tmpl.Name, err)
+        }
+        configs[tmpl.Name] = content
+    }
+
+    return configs, nil
+}
+```
+
+---
+
+## 17. 补充设计：DAG 集成详细实现
+
+> 本节补充第 8 节中引用但未实现的 DAG 构建与执行逻辑。
+
+### 17.1 ComponentNode 扩展 - 支持 Binary/Helm 类型
+
+当前 `topology.ComponentNode` 仅有 `Inline` 字段，需扩展以支持 Binary/Helm 类型：
+
+```go
+// pkg/topology/component.go 扩展
+
+// BinaryRef 指向一个二进制组件
+type BinaryRef struct {
+    Name    string
+    Version string
+}
+
+// HelmRef 指向一个 Helm 组件
+type HelmRef struct {
+    Name        string
+    Version     string
+    Namespace   string
+    ReleaseName string
+}
+
+// ComponentNode 扩展后定义 (兼容现有 Inline 字段)
+type ComponentNode struct {
+    Name          string
+    Version       string
+    Inline        *InlineRef   // type=inline 时非 nil
+    Binary        *BinaryRef   // type=binary 时非 nil
+    Helm          *HelmRef     // type=helm 时非 nil
+    FailurePolicy FailurePolicy
+    Dependencies  []string
+}
+
+// ComponentType 返回组件类型
+func (n *ComponentNode) ComponentType() string {
+    switch {
+    case n.Inline != nil:
+        return "inline"
+    case n.Binary != nil:
+        return "binary"
+    case n.Helm != nil:
+        return "helm"
+    default:
+        return "yaml"
+    }
+}
+```
+
+### 17.2 Scheduler 扩展 - 支持 Binary/Helm 执行路径
+
+当前 `Scheduler.executeComponent()` 仅有 inline 和 manifest 两条路径，需扩展：
+
+```go
+// pkg/dagexec/scheduler.go 扩展
+
+// BinaryInstaller 执行二进制组件安装 (接口定义)
+type BinaryInstaller interface {
+    Install(ctx context.Context, opts BinaryInstallOptions) error
+}
+
+// HelmInstaller 执行 Helm 组件安装 (接口定义)
+type HelmInstaller interface {
+    Install(ctx context.Context, opts HelmInstallOptions) error
+}
+
+// Scheduler 扩展字段
+type Scheduler struct {
+    InlineRunner          InlinePhaseRunner
+    ManifestStore         manifest.Store
+    ManifestApplier       manifest.Applier
+    BinaryInstaller       BinaryInstaller       // 新增
+    HelmInstaller         HelmInstaller         // 新增
+    MaxParallelPerBatch   int
+}
+
+// Config 扩展字段
+type Config struct {
+    InlineRunner          InlinePhaseRunner
+    ManifestStore         manifest.Store
+    ManifestApplier       manifest.Applier
+    BinaryInstaller       BinaryInstaller       // 新增
+    HelmInstaller         HelmInstaller         // 新增
+    MaxParallelPerBatch   int
+}
+
+// executeComponent 扩展实现
+func (s *Scheduler) executeComponent(
+    ctx context.Context,
+    phaseCtx *phaseframe.PhaseContext,
+    oldCluster, newCluster *bkev1beta1.BKECluster,
+    node *topology.ComponentNode,
+    tmpl manifest.TemplateContext,
+) error {
+    switch node.ComponentType() {
+    case "inline":
+        return s.executeInline(phaseCtx, oldCluster, newCluster, node)
+    case "binary":
+        return s.executeBinary(ctx, phaseCtx, node)
+    case "helm":
+        return s.executeHelm(ctx, phaseCtx, node)
+    default:
+        return s.executeManifest(ctx, phaseCtx, node, tmpl)
+    }
+}
+
+// executeBinary 执行二进制组件
+func (s *Scheduler) executeBinary(
+    ctx context.Context,
+    phaseCtx *phaseframe.PhaseContext,
+    node *topology.ComponentNode,
+) error {
+    if s.BinaryInstaller == nil {
+        return fmt.Errorf("binary installer is not configured")
+    }
+    if node.Binary == nil {
+        return fmt.Errorf("component %q has no binary ref", node.Name)
+    }
+
+    action := BinaryActionInstall
+    if phaseCtx.IsUpgrade {
+        action = BinaryActionUpgrade
+    }
+
+    nodes, err := s.getTargetNodes(phaseCtx, node)
+    if err != nil {
+        return fmt.Errorf("failed to get target nodes for %s: %w", node.Name, err)
+    }
+
+    cv, err := s.getComponentVersion(node.Name, node.Version)
+    if err != nil {
+        return fmt.Errorf("failed to get component version for %s: %w", node.Name, err)
+    }
+
+    strategy := cv.Spec.UpgradeStrategy
+    switch strategy.Mode {
+    case "Rolling":
+        return s.executeBinaryRolling(ctx, phaseCtx, nodes, cv, strategy, action)
+    case "Parallel":
+        return s.executeBinaryParallel(ctx, phaseCtx, nodes, cv, strategy, action)
+    case "Batch":
+        return s.executeBinaryBatch(ctx, phaseCtx, nodes, cv, strategy, action)
+    default:
+        return s.executeBinaryRolling(ctx, phaseCtx, nodes, cv, strategy, action)
+    }
+}
+
+// executeHelm 执行 Helm 组件
+func (s *Scheduler) executeHelm(
+    ctx context.Context,
+    phaseCtx *phaseframe.PhaseContext,
+    node *topology.ComponentNode,
+) error {
+    if s.HelmInstaller == nil {
+        return fmt.Errorf("helm installer is not configured")
+    }
+    if node.Helm == nil {
+        return fmt.Errorf("component %q has no helm ref", node.Name)
+    }
+
+    action := HelmActionInstall
+    if phaseCtx.IsUpgrade {
+        action = HelmActionUpgrade
+    }
+
+    cv, err := s.getComponentVersion(node.Name, node.Version)
+    if err != nil {
+        return fmt.Errorf("failed to get component version for %s: %w", node.Name, err)
+    }
+
+    opts := HelmInstallOptions{
+        Component: cv,
+        Cluster:   phaseCtx.BKECluster,
+        Action:    action,
+        Timeout:   parseDuration(cv.Spec.UpgradeStrategy.Timeout),
+    }
+
+    return s.HelmInstaller.Install(ctx, opts)
+}
+```
+
+### 17.3 getTargetNodes - 目标节点获取
+
+```go
+// getTargetNodes 从 PhaseContext 获取组件需要操作的目标节点列表
+// 逻辑：根据组件名称决定目标节点范围
+//   - containerd / bkeagent: 所有节点
+//   - kubernetes (master): 仅控制面节点
+//   - kubernetes (worker): 仅工作节点
+func (s *Scheduler) getTargetNodes(phaseCtx *phaseframe.PhaseContext, node *topology.ComponentNode) ([]*BKENodeTarget, error) {
+    if phaseCtx == nil || phaseCtx.BKECluster == nil {
+        return nil, fmt.Errorf("phase context or BKECluster is nil")
+    }
+
+    cluster := phaseCtx.BKECluster
+    var targets []*BKENodeTarget
+
+    switch node.Name {
+    case "containerd", "bkeagent":
+        // 二进制组件：所有节点
+        for _, n := range cluster.Spec.Nodes {
+            targets = append(targets, &BKENodeTarget{
+                IP:            n.IP,
+                Hostname:      n.Hostname,
+                Role:          n.Role,
+                Architecture:  n.Architecture,
+                OS:            n.OperatingSystem,
+                OSVersion:     n.OperatingSystemVersion,
+            })
+        }
+    case "agent":
+        // Agent: 所有节点
+        for _, n := range cluster.Spec.Nodes {
+            targets = append(targets, &BKENodeTarget{
+                IP:            n.IP,
+                Hostname:      n.Hostname,
+                Role:          n.Role,
+                Architecture:  n.Architecture,
+                OS:            n.OperatingSystem,
+                OSVersion:     n.OperatingSystemVersion,
+            })
+        }
+    default:
+        // 默认：所有节点 (可通过 ComponentVersion.Dependencies 进一步过滤)
+        for _, n := range cluster.Spec.Nodes {
+            targets = append(targets, &BKENodeTarget{
+                IP:            n.IP,
+                Hostname:      n.Hostname,
+                Role:          n.Role,
+                Architecture:  n.Architecture,
+                OS:            n.OperatingSystem,
+                OSVersion:     n.OperatingSystemVersion,
+            })
+        }
+    }
+
+    if len(targets) == 0 {
+        return nil, fmt.Errorf("no target nodes found for component %s", node.Name)
+    }
+
+    return targets, nil
+}
+
+// BKENodeTarget 统一的节点信息结构 (从 BKECluster.Spec.Nodes 提取)
+type BKENodeTarget struct {
+    IP           string
+    Hostname     string
+    Role         string // master / worker / etcd
+    Architecture string // amd64 / arm64
+    OS           string // centos / ubuntu / kylin
+    OSVersion    string // 7 / 8 / 20.04 / V10
+}
+```
+
+### 17.4 executeBinaryRolling / Parallel / Batch - 执行策略实现
+
+```go
+// executeBinaryRolling 逐节点滚动执行二进制组件
+func (s *Scheduler) executeBinaryRolling(
+    ctx context.Context,
+    phaseCtx *phaseframe.PhaseContext,
+    nodes []*BKENodeTarget,
+    cv *ComponentVersion,
+    strategy UpgradeStrategySpec,
+    action BinaryAction,
+) error {
+    for _, node := range nodes {
+        select {
+        case <-ctx.Done():
+            return ctx.Err()
+        default:
+        }
+
+        opts := BinaryInstallOptions{
+            Component:  cv,
+            Node:       node,
+            Cluster:    phaseCtx.BKECluster,
+            Action:     action,
+            Timeout:    parseDuration(strategy.Timeout),
+            RetryCount: 3,
+        }
+
+        if err := s.BinaryInstaller.Install(ctx, opts); err != nil {
+            switch strategy.FailurePolicy {
+            case "FailFast":
+                return fmt.Errorf("node %s failed: %w", node.IP, err)
+            case "Continue":
+                phaseCtx.Log.Info("BinaryRolling", "node %s failed, continuing: %v", node.IP, err)
+                continue
+            case "Rollback":
+                if rbErr := s.executeBinaryRollback(ctx, phaseCtx, node, cv); rbErr != nil {
+                    return fmt.Errorf("node %s upgrade failed: %w; rollback also failed: %v", node.IP, err, rbErr)
+                }
+                continue
+            }
+        }
+    }
+    return nil
+}
+
+// executeBinaryParallel 所有节点并行执行二进制组件
+func (s *Scheduler) executeBinaryParallel(
+    ctx context.Context,
+    phaseCtx *phaseframe.PhaseContext,
+    nodes []*BKENodeTarget,
+    cv *ComponentVersion,
+    strategy UpgradeStrategySpec,
+    action BinaryAction,
+) error {
+    g, gCtx := errgroup.WithContext(ctx)
+    sem := make(chan struct{}, len(nodes)) // 不限制并发数
+
+    for _, node := range nodes {
+        node := node
+        g.Go(func() error {
+            select {
+            case sem <- struct{}{}:
+                defer func() { <-sem }()
+            case <-gCtx.Done():
+                return gCtx.Err()
+            }
+
+            opts := BinaryInstallOptions{
+                Component:  cv,
+                Node:       node,
+                Cluster:    phaseCtx.BKECluster,
+                Action:     action,
+                Timeout:    parseDuration(strategy.Timeout),
+                RetryCount: 3,
+            }
+
+            if err := s.BinaryInstaller.Install(gCtx, opts); err != nil {
+                if strategy.FailurePolicy == "FailFast" {
+                    return err
+                }
+                phaseCtx.Log.Info("BinaryParallel", "node %s failed, continuing: %v", node.IP, err)
+                return nil
+            }
+            return nil
+        })
+    }
+
+    return g.Wait()
+}
+
+// executeBinaryBatch 分批执行二进制组件
+func (s *Scheduler) executeBinaryBatch(
+    ctx context.Context,
+    phaseCtx *phaseframe.PhaseContext,
+    nodes []*BKENodeTarget,
+    cv *ComponentVersion,
+    strategy UpgradeStrategySpec,
+    action BinaryAction,
+) error {
+    batchSize := strategy.BatchSize
+    if batchSize <= 0 {
+        batchSize = 1
+    }
+
+    for i := 0; i < len(nodes); i += batchSize {
+        select {
+        case <-ctx.Done():
+            return ctx.Err()
+        default:
+        }
+
+        end := i + batchSize
+        if end > len(nodes) {
+            end = len(nodes)
+        }
+        batch := nodes[i:end]
+
+        g, gCtx := errgroup.WithContext(ctx)
+        for _, node := range batch {
+            node := node
+            g.Go(func() error {
+                opts := BinaryInstallOptions{
+                    Component:  cv,
+                    Node:       node,
+                    Cluster:    phaseCtx.BKECluster,
+                    Action:     action,
+                    Timeout:    parseDuration(strategy.Timeout),
+                    RetryCount: 3,
+                }
+                return s.BinaryInstaller.Install(gCtx, opts)
+            })
+        }
+
+        if err := g.Wait(); err != nil {
+            switch strategy.FailurePolicy {
+            case "FailFast":
+                return fmt.Errorf("batch [%d:%d] failed: %w", i, end, err)
+            case "Continue":
+                phaseCtx.Log.Info("BinaryBatch", "batch [%d:%d] failed, continuing: %v", i, end, err)
+            case "Rollback":
+                for _, node := range batch {
+                    s.executeBinaryRollback(ctx, phaseCtx, node, cv)
+                }
+            }
+        }
+    }
+    return nil
+}
+
+// executeBinaryRollback 执行二进制组件回滚
+func (s *Scheduler) executeBinaryRollback(
+    ctx context.Context,
+    phaseCtx *phaseframe.PhaseContext,
+    node *BKENodeTarget,
+    cv *ComponentVersion,
+) error {
+    if cv.Spec.Binary == nil || cv.Spec.Binary.UninstallScript == "" {
+        return fmt.Errorf("no uninstall script defined for component %s", cv.Spec.Name)
+    }
+
+    opts := BinaryInstallOptions{
+        Component: cv,
+        Node:      node,
+        Cluster:   phaseCtx.BKECluster,
+        Action:    BinaryActionUninstall,
+    }
+
+    return s.BinaryInstaller.Install(ctx, opts)
+}
+
+// parseDuration 解析超时字符串
+func parseDuration(s string) time.Duration {
+    if s == "" {
+        return 10 * time.Minute
+    }
+    d, err := time.ParseDuration(s)
+    if err != nil {
+        return 10 * time.Minute
+    }
+    return d
+}
+```
+
+### 17.5 BuildInstallDAG / BuildUpgradeDAG - DAG 构建实现
+
+```go
+// pkg/topology/build.go 扩展 (现有 BuildUpgradeDAG 基础上新增)
+
+// BuildInstallDAG 从 ReleaseImage 构建安装 DAG
+func BuildInstallDAG(bundle *manifest.Bundle) (*UpgradeDAG, error) {
+    dag := NewUpgradeDAG()
+
+    // 1. 添加 CommonPhases (安装流程前序)
+    commonPhases := []struct {
+        name   string
+        policy FailurePolicy
+    }{
+        {"finalizer", FailurePolicyFailFast},
+        {"paused", FailurePolicyContinue},
+        {"manage", FailurePolicyContinue},
+        {"delete", FailurePolicyContinue},
+        {"dryrun", FailurePolicyFailFast},
+    }
+    for _, p := range commonPhases {
+        dag.AddNode(&ComponentNode{
+            Name:          p.name,
+            FailurePolicy: p.policy,
+            Inline:        &InlineRef{Handler: "Ensure" + strings.Title(p.name)},
+        })
+    }
+    // CommonPhases 依赖链: finalizer → paused → manage → delete → dryrun
+    dag.AddDependency("finalizer", "paused")
+    dag.AddDependency("paused", "manage")
+    dag.AddDependency("manage", "delete")
+    dag.AddDependency("delete", "dryrun")
+
+    // 2. 从 ReleaseImage install.components 动态构建 DeployPhases
+    for _, comp := range bundle.Spec.Install.Components {
+        cv := bundle.GetComponent(comp.Name, comp.Version)
+        if cv == nil {
+            continue
+        }
+
+        node := &ComponentNode{
+            Name:          comp.Name,
+            Version:       comp.Version,
+            FailurePolicy: getFailurePolicy(cv.Spec.UpgradeStrategy.FailurePolicy),
+            Dependencies:  getDependencyNames(cv.Spec.Dependencies),
+        }
+
+        // 根据组件类型设置引用
+        switch cv.Spec.Type {
+        case "binary":
+            node.Binary = &BinaryRef{Name: comp.Name, Version: comp.Version}
+        case "helm":
+            node.Helm = &HelmRef{
+                Name:        comp.Name,
+                Version:     comp.Version,
+                Namespace:   cv.Spec.Helm.Namespace,
+                ReleaseName: cv.Spec.Helm.ReleaseName,
+            }
+        case "inline":
+            node.Inline = &InlineRef{Handler: cv.Spec.Inline.Handler, Version: cv.Spec.Inline.Version}
+        default:
+            // yaml/manifest 类型不设置特殊引用
+        }
+
+        dag.AddNode(node)
+
+        // 所有部署组件依赖 dryrun
+        dag.AddDependency("dryrun", comp.Name)
+
+        // 添加组件间依赖
+        for _, dep := range cv.Spec.Dependencies {
+            dag.AddDependency(dep.Name, comp.Name)
+        }
+    }
+
+    return dag, nil
+}
+
+// getFailurePolicy 将字符串转换为 FailurePolicy
+func getFailurePolicy(policy string) FailurePolicy {
+    switch policy {
+    case "FailFast":
+        return FailurePolicyFailFast
+    case "Continue":
+        return FailurePolicyContinue
+    case "Rollback":
+        return FailurePolicyRollback
+    default:
+        return FailurePolicyContinue
+    }
+}
+
+// getDependencyNames 提取依赖组件名称列表
+func getDependencyNames(deps []Dependency) []string {
+    names := make([]string, 0, len(deps))
+    for _, d := range deps {
+        names = append(names, d.Name)
+    }
+    return names
+}
+```
+
+---
+
+## 18. 补充设计：NeedExecute 接口适配
+
+> 本节补充第 1.3 节约束中"复用现有 NeedExecute() 接口"的具体适配方案。
+
+### 18.1 现有 NeedExecute 机制分析
+
+当前 `NeedExecute` 接口定义在 `phaseframe.Phase` 接口中：
+
+```go
+// 现有接口 (pkg/phaseframe/phases/phase_flow.go)
+type Phase interface {
+    Name() string
+    NeedExecute(old, new *bkev1beta1.BKECluster) bool
+    Execute() error
+}
+```
+
+对于 inline Phase，`NeedExecute` 通过 `NeedExecuteWithVersionContext` 判断版本是否需要升级。
+对于 Binary/Helm 组件，不在 Phase 流程中，而是在 DAG 调度流程中执行。
+
+### 18.2 Binary/Helm 组件的 NeedExecute 适配方案
+
+Binary/Helm 组件在 DAG 调度器中执行，**不直接实现 Phase 接口**。其"是否需要执行"的判断逻辑如下：
+
+```go
+// pkg/dagexec/need_execute.go
+
+// shouldExecuteBinary 判断二进制组件是否需要执行
+// 逻辑: 基于 VersionContext 判断版本是否变更
+func (s *Scheduler) shouldExecuteBinary(phaseCtx *phaseframe.PhaseContext, node *topology.ComponentNode) bool {
+    // 1. 如果 VersionContext 存在，使用版本上下文判断
+    if phaseCtx.VersionContext != nil {
+        if phaseCtx.VersionContext.HasTarget(node.Name) {
+            return phaseCtx.VersionContext.NeedsUpgrade(node.Name)
+        }
+    }
+
+    // 2. 回退: 检查 BKECluster.Status.DeclarativeUpgrade 是否已记录完成
+    if phaseCtx.BKECluster != nil && phaseCtx.BKECluster.Status.DeclarativeUpgrade != nil {
+        return !phaseCtx.BKECluster.Status.DeclarativeUpgrade.IsCompleted(node.Name, node.Version)
+    }
+
+    // 3. 默认需要执行
+    return true
+}
+
+// shouldExecuteHelm 判断 Helm 组件是否需要执行
+// 逻辑: 同 shouldExecuteBinary
+func (s *Scheduler) shouldExecuteHelm(phaseCtx *phaseframe.PhaseContext, node *topology.ComponentNode) bool {
+    return s.shouldExecuteBinary(phaseCtx, node)
+}
+```
+
+### 18.3 shouldSkipComponent 扩展
+
+当前 `shouldSkipComponent` 仅检查 `DeclarativeUpgrade.IsCompleted`，需扩展以支持 Binary/Helm：
+
+```go
+// shouldSkipComponent 扩展实现
+func (s *Scheduler) shouldSkipComponent(phaseCtx *phaseframe.PhaseContext, node *topology.ComponentNode) bool {
+    if phaseCtx == nil || phaseCtx.BKECluster == nil || node == nil {
+        return false
+    }
+
+    // 检查 DeclarativeUpgrade 状态
+    st := phaseCtx.BKECluster.Status.DeclarativeUpgrade
+    if st != nil && st.IsCompleted(node.Name, s.nodeVersionKey(node)) {
+        return true
+    }
+
+    // Binary/Helm 组件: 使用 VersionContext 判断是否需要跳过
+    switch node.ComponentType() {
+    case "binary":
+        return !s.shouldExecuteBinary(phaseCtx, node)
+    case "helm":
+        return !s.shouldExecuteHelm(phaseCtx, node)
+    }
+
+    return false
+}
+```
+
+---
+
+## 19. 补充设计：HelmInstaller 方法实现
+
+> 本节补充第 5.3 节中引用但未实现的 HelmInstaller 方法。
+
+### 19.1 uninstall - Helm 卸载
+
+```go
+// uninstall 执行 Helm Uninstall
+func (i *HelmInstaller) uninstall(ctx context.Context, actionConfig *action.Configuration, helm *HelmSpec, opts InstallOptions) error {
+    client := action.NewUninstall(actionConfig)
+    client.Wait = true
+    client.Timeout, _ = time.ParseDuration(helm.Strategy.WaitTimeout)
+
+    _, err := client.Run(helm.ReleaseName)
+    if err != nil {
+        return fmt.Errorf("helm uninstall failed: %w", err)
+    }
+    return nil
+}
+```
+
+### 19.2 rollback - Helm 回滚
+
+```go
+// rollback 执行 Helm Rollback
+func (i *HelmInstaller) rollback(ctx context.Context, actionConfig *action.Configuration, helm *HelmSpec, opts InstallOptions) error {
+    client := action.NewRollback(actionConfig)
+    client.Wait = true
+    client.Timeout, _ = time.ParseDuration(helm.Strategy.WaitTimeout)
+
+    if err := client.Run(helm.ReleaseName); err != nil {
+        return fmt.Errorf("helm rollback failed: %w", err)
+    }
+    return nil
+}
+```
+
+### 19.3 runHealthCheck - 健康检查
+
+```go
+// runHealthCheck 执行健康检查
+func (i *HelmInstaller) runHealthCheck(ctx context.Context, spec HealthCheckSpec, opts InstallOptions) error {
+    if !spec.Enabled {
+        return nil
+    }
+
+    timeout := parseDuration(spec.Timeout)
+    interval := parseDuration(spec.Interval)
+    if interval == 0 {
+        interval = 10 * time.Second
+    }
+
+    ctx, cancel := context.WithTimeout(ctx, timeout)
+    defer cancel()
+
+    ticker := time.NewTicker(interval)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-ctx.Done():
+            return fmt.Errorf("health check timed out after %s", timeout)
+        case <-ticker.C:
+            allReady := true
+            for _, check := range spec.Checks {
+                switch check.Type {
+                case "PodReady":
+                    ready, err := i.checkPodReady(ctx, check, opts)
+                    if err != nil || !ready {
+                        allReady = false
+                    }
+                case "EndpointReady":
+                    ready, err := i.checkEndpointReady(ctx, check, opts)
+                    if err != nil || !ready {
+                        allReady = false
+                    }
+                }
+            }
+            if allReady {
+                return nil
+            }
+        }
+    }
+}
+
+// checkPodReady 检查 Pod 是否就绪
+func (i *HelmInstaller) checkPodReady(ctx context.Context, check HealthCheckItemSpec, opts InstallOptions) (bool, error) {
+    pods := &corev1.PodList{}
+    labelSel, _ := labels.Parse(check.LabelSelector)
+    if err := i.client.List(ctx, pods,
+        client.InNamespace(check.Namespace),
+        client.MatchingLabelsSelector{Selector: labelSel},
+    ); err != nil {
+        return false, err
+    }
+
+    readyCount := int32(0)
+    for _, pod := range pods.Items {
+        for _, c := range pod.Status.Conditions {
+            if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
+                readyCount++
+                break
+            }
+        }
+    }
+
+    return readyCount >= check.MinReady, nil
+}
+
+// checkEndpointReady 检查 Endpoint 是否就绪
+func (i *HelmInstaller) checkEndpointReady(ctx context.Context, check HealthCheckItemSpec, opts InstallOptions) (bool, error) {
+    ep := &corev1.Endpoints{}
+    if err := i.client.Get(ctx, types.NamespacedName{
+        Name:      check.Name,
+        Namespace: check.Namespace,
+    }, ep); err != nil {
+        return false, err
+    }
+
+    for _, subset := range ep.Subsets {
+        if len(subset.Addresses) > 0 {
+            return true, nil
+        }
+    }
+    return false, nil
+}
+```
+
+### 19.4 getActionConfig - Helm Action 配置初始化
+
+```go
+// getActionConfig 获取 Helm Action 配置
+func (i *HelmInstaller) getActionConfig(ctx context.Context, namespace string) (*action.Configuration, error) {
+    actionConfig := new(action.Configuration)
+    getter := helmCLI.NewConfigFlagsFromConfig(i.restConfig)
+    if err := actionConfig.Init(getter, namespace, "secret", func(format string, v ...interface{}) {
+        // Helm log output
+    }); err != nil {
+        return nil, fmt.Errorf("failed to initialize helm action config: %w", err)
+    }
+    return actionConfig, nil
+}
+```
+
+### 19.5 loadValuesFile - 加载自定义 Values 文件
+
+```go
+// loadValuesFile 加载自定义 Values 文件
+func (i *HelmInstaller) loadValuesFile(ctx context.Context, valuesFile string, opts InstallOptions) (map[string]interface{}, error) {
+    // 渲染文件名中的模板变量
+    renderedFile, err := i.renderTemplateString(valuesFile, opts)
+    if err != nil {
+        return nil, fmt.Errorf("failed to render values file path %s: %w", valuesFile, err)
+    }
+
+    data, err := os.ReadFile(renderedFile)
+    if err != nil {
+        return nil, fmt.Errorf("failed to read values file %s: %w", renderedFile, err)
+    }
+
+    values := make(map[string]interface{})
+    if err := yaml.Unmarshal(data, &values); err != nil {
+        return nil, fmt.Errorf("failed to parse values file %s: %w", renderedFile, err)
+    }
+
+    return values, nil
+}
+```
+
+### 19.6 mergeValues - Values 合并策略
+
+```go
+// mergeValues 合并两份 Values (dst 被 src 覆盖)
+// 策略: 递归合并 map，src 中的值覆盖 dst 中的同名键
+func mergeValues(dst, src map[string]interface{}) map[string]interface{} {
+    result := make(map[string]interface{})
+    for k, v := range dst {
+        result[k] = v
+    }
+    for k, v := range src {
+        if dstMap, ok := dst[k].(map[string]interface{}); ok {
+            if srcMap, ok := v.(map[string]interface{}); ok {
+                result[k] = mergeValues(dstMap, srcMap)
+                continue
+            }
+        }
+        result[k] = v
+    }
+    return result
+}
+```
+
+### 19.7 renderString - ConfigRenderer 字符串模板渲染
+
+```go
+// renderString 渲染字符串中的模板变量
+func (r *ConfigRenderer) renderString(tmpl string, opts InstallOptions) (string, error) {
+    if tmpl == "" {
+        return "", nil
+    }
+
+    // 简单变量替换: {{.key}} → value
+    data := r.buildTemplateData(context.Background(), opts)
+    t, err := template.New("renderString").Parse(tmpl)
+    if err != nil {
+        return tmpl, nil // 非模板字符串直接返回
+    }
+
+    var buf bytes.Buffer
+    if err := t.Execute(&buf, data); err != nil {
+        return "", fmt.Errorf("failed to render string %q: %w", tmpl, err)
+    }
+    return buf.String(), nil
+}
+```
+
+---
+
+## 20. 补充设计：组件状态回写机制
+
+> 本节补充设计中缺失的组件安装/升级/失败状态回写方案。
+
+### 20.1 状态回写流程
+
+```
+组件执行完成 (成功/失败)
+        │
+        ▼
+┌──────────────────────────┐
+│  BinaryComponentExecutor │
+│  HelmComponentExecutor   │
+│  调用回调函数            │
+└────────────┬─────────────┘
+             │
+             ▼
+┌──────────────────────────────────────┐
+│  Scheduler.markComponentCompleted()  │  ← 已存在
+│  Scheduler.markComponentFailed()     │  ← 已存在
+│                                      │
+│  写入 BKECluster.Status.             │
+│    DeclarativeUpgrade                │
+│      .MarkCompleted(name, version)   │
+│      .MarkFailure(name, version, err)│
+└──────────────────────────────────────┘
+```
+
+### 20.2 Binary/Helm 组件状态记录
+
+当前 `DeclarativeUpgrade` 状态已支持 `IsCompleted`/`MarkCompleted`/`MarkFailure`。
+Binary/Helm 组件复用同一状态结构，无需扩展。
+
+```go
+// Binary/Helm 组件执行成功后:
+// Scheduler 已有 markComponentCompleted() 方法
+// 在 executeBinary/executeHelm 成功返回后由 persistBatchResults 统一处理
+
+// Binary/Helm 组件执行失败后:
+// Scheduler 已有 markComponentFailed() 方法
+// 在 persistBatchResults 中统一处理
+```
+
+### 20.3 BinaryComponentExecutor 逐节点状态记录 (新增)
+
+对于滚动升级场景，需要记录每个节点的执行状态：
+
+```go
+// pkg/dagexec/node_status.go
+
+// BinaryNodeStatus 记录二进制组件在单个节点上的执行状态
+type BinaryNodeStatus struct {
+    NodeIP    string `json:"nodeIP"`
+    NodeName  string `json:"nodeName"`
+    Status    string `json:"status"` // Succeeded / Failed / Pending
+    Error     string `json:"error,omitempty"`
+    Timestamp string `json:"timestamp"`
+}
+
+// 记录节点级别状态到 PhaseContext (用于日志和状态查询)
+func recordBinaryNodeStatus(phaseCtx *phaseframe.PhaseContext, componentName string, status BinaryNodeStatus) {
+    if phaseCtx == nil || phaseCtx.Log == nil {
+        return
+    }
+
+    if status.Status == "Succeeded" {
+        phaseCtx.Log.Info("BinaryNodeSucceeded",
+            "component=%s, node=%s, status=%s", componentName, status.NodeIP, status.Status)
+    } else {
+        phaseCtx.Log.Info("BinaryNodeFailed",
+            "component=%s, node=%s, status=%s, error=%s", componentName, status.NodeIP, status.Status, status.Error)
+    }
+}
+```
+
+---
+
+## 21. 补充设计：错误分类与 PreInstallHooks
+
+> 本节补充第 12 节错误处理和第 5 节 Helm Hooks 执行引擎。
+
+### 21.1 classifyError - 错误分类
+
+```go
+// pkg/dagexec/error_classifier.go
+
+// ErrorCategory 错误类别
+type ErrorCategory string
+
+const (
+    ErrorCategoryRetryable    ErrorCategory = "Retryable"    // 可重试错误
+    ErrorCategoryNonRetryable ErrorCategory = "NonRetryable" // 不可重试错误
+    ErrorCategoryPartial      ErrorCategory = "Partial"      // 部分失败
+)
+
+// classifyError 对错误进行分类
+func classifyError(err error) ErrorCategory {
+    if err == nil {
+        return ErrorCategoryRetryable
+    }
+
+    errMsg := err.Error()
+
+    // 可重试错误: 网络/超时/临时性错误
+    retryablePatterns := []string{
+        "connection refused",
+        "connection reset",
+        "timeout",
+        "i/o timeout",
+        "temporary",
+        "EOF",
+        "dial tcp",
+        "network is unreachable",
+    }
+    for _, pattern := range retryablePatterns {
+        if strings.Contains(strings.ToLower(errMsg), strings.ToLower(pattern)) {
+            return ErrorCategoryRetryable
+        }
+    }
+
+    // 部分失败: 节点级别错误 (滚动升级中部分节点成功、部分失败)
+    if strings.Contains(errMsg, "node") && strings.Contains(errMsg, "failed") {
+        return ErrorCategoryPartial
+    }
+
+    // 不可重试错误: 配置错误/校验失败/版本不兼容
+    return ErrorCategoryNonRetryable
+}
+```
+
+### 21.2 PreInstallHooks 执行引擎
+
+```go
+// pkg/helminstaller/hooks.go
+
+// executePreInstallHooks 执行安装前钩子
+func (i *HelmInstaller) executePreInstallHooks(ctx context.Context, hooks []HookSpec, opts InstallOptions) error {
+    for _, hook := range hooks {
+        if hook.Type != "Job" {
+            continue
+        }
+
+        // 渲染钩子 Manifest 中的模板变量
+        manifest, err := i.renderTemplateString(hook.Manifest, opts)
+        if err != nil {
+            return fmt.Errorf("failed to render hook %s manifest: %w", hook.Name, err)
+        }
+
+        // Apply Job Manifest
+        obj, err := i.applyHookManifest(ctx, manifest, opts)
+        if err != nil {
+            return fmt.Errorf("failed to apply hook %s: %w", hook.Name, err)
+        }
+
+        // 等待 Job 完成
+        if err := i.waitForHookJob(ctx, obj, opts); err != nil {
+            return fmt.Errorf("hook %s failed: %w", hook.Name, err)
+        }
+
+        // 清理 Job
+        i.cleanupHookJob(ctx, obj, opts)
+    }
+    return nil
+}
+
+// applyHookManifest 应用钩子 Manifest
+func (i *HelmInstaller) applyHookManifest(ctx context.Context, manifest string, opts InstallOptions) (*unstructured.Unstructured, error) {
+    decoder := yaml.NewYAMLOrJSONDecoder(strings.NewReader(manifest), 4096)
+    var raw unstructured.Unstructured
+    if err := decoder.Decode(&raw); err != nil {
+        return nil, fmt.Errorf("failed to decode hook manifest: %w", err)
+    }
+
+    if err := i.client.Create(ctx, &raw); err != nil {
+        if !kerrors.IsAlreadyExists(err) {
+            return nil, fmt.Errorf("failed to create hook resource: %w", err)
+        }
+    }
+
+    return &raw, nil
+}
+
+// waitForHookJob 等待钩子 Job 完成
+func (i *HelmInstaller) waitForHookJob(ctx context.Context, obj *unstructured.Unstructured, opts InstallOptions) error {
+    name := obj.GetName()
+    namespace := obj.GetNamespace()
+
+    return wait.PollUntilContextTimeout(ctx, 2*time.Second, 5*time.Minute, true,
+        func(ctx context.Context) (bool, error) {
+            job := &batchv1.Job{}
+            if err := i.client.Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, job); err != nil {
+                return false, err
+            }
+            for _, c := range job.Status.Conditions {
+                if c.Type == batchv1.JobComplete && c.Status == corev1.ConditionTrue {
+                    return true, nil
+                }
+                if c.Type == batchv1.JobFailed && c.Status == corev1.ConditionTrue {
+                    return false, fmt.Errorf("hook job %s failed: %s", name, c.Message)
+                }
+            }
+            return false, nil
+        },
+    )
+}
+
+// cleanupHookJob 清理钩子 Job
+func (i *HelmInstaller) cleanupHookJob(ctx context.Context, obj *unstructured.Unstructured, opts InstallOptions) {
+    i.client.Delete(ctx, obj)
+}
+```
+
+### 21.3 HelmInstaller.Install 集成 Hooks
+
+```go
+// Install 方法补充: 在 Helm Install/Upgrade 前执行 PreInstallHooks
+func (i *HelmInstaller) Install(ctx context.Context, opts InstallOptions) error {
+    component := opts.Component
+    helm := component.Spec.Helm
+
+    // 0. 执行前置钩子
+    if len(helm.PreInstallHooks) > 0 {
+        if err := i.executePreInstallHooks(ctx, helm.PreInstallHooks, opts); err != nil {
+            return fmt.Errorf("pre-install hooks failed: %w", err)
+        }
+    }
+
+    // 1. 获取 Chart (同原设计)
+    chart, err := i.getChart(ctx, helm.Chart)
+    if err != nil {
+        return fmt.Errorf("failed to get chart: %w", err)
+    }
+
+    // ... (后续逻辑同原设计 5.3 节)
+}
+```
+
+---
+
+## 22. 补充设计：兼容层完整实现
+
+> 本节补充第 11 节迁移策略中的兼容层完整实现。
+
+### 22.1 Feature Gate 扩展
+
+```go
+// pkg/featuregate/features.go 扩展
+
+const (
+    // 现有
+    DeclarativeUpgradeAnnotationKey = "cvo.openfuyao.cn/declarative-upgrade"
+    UpgradeReadyAnnotationKey       = "cvo.openfuyao.cn/upgrade-ready"
+
+    // 新增
+    BinaryComponentSupport = "BinaryComponentSupport"
+    HelmComponentSupport   = "HelmComponentSupport"
+)
+
+// Enabled 检查 Feature Gate 是否启用
+// 兼容现有注解式实现
+func Enabled(gate string) bool {
+    switch gate {
+    case BinaryComponentSupport:
+        // 通过 BKECluster Annotation 或环境变量控制
+        return os.Getenv("BKE_BINARY_COMPONENT_SUPPORT") == "true"
+    case HelmComponentSupport:
+        return os.Getenv("BKE_HELM_COMPONENT_SUPPORT") == "true"
+    default:
+        return false
+    }
+}
+```
+
+### 22.2 BKEClusterReconciler 兼容层
+
+```go
+// controllers/capbke/bkecluster_upgrade_dag.go 扩展
+
+// executeContainerdUpgrade 兼容层: 新旧双轨运行
+func (r *BKEClusterReconciler) executeContainerdUpgrade(ctx context.Context, phaseCtx *phaseframe.PhaseContext) error {
+    if featuregate.Enabled(featuregate.BinaryComponentSupport) {
+        // 新路径: 通过 DAG + BinaryInstaller 执行
+        return r.executeBinaryComponent(ctx, phaseCtx, "containerd")
+    }
+    // 旧路径: 使用硬编码 Phase EnsureContainerdUpgrade
+    return r.executeLegacyContainerdUpgrade(ctx, phaseCtx)
+}
+
+// executeBKEAgentUpgrade 兼容层
+func (r *BKEClusterReconciler) executeBKEAgentUpgrade(ctx context.Context, phaseCtx *phaseframe.PhaseContext) error {
+    if featuregate.Enabled(featuregate.BinaryComponentSupport) {
+        return r.executeBinaryComponent(ctx, phaseCtx, "bkeagent")
+    }
+    return r.executeLegacyBKEAgentUpgrade(ctx, phaseCtx)
+}
+
+// executeBinaryComponent 通过 BinaryInstaller 执行二进制组件升级
+func (r *BKEClusterReconciler) executeBinaryComponent(ctx context.Context, phaseCtx *phaseframe.PhaseContext, componentName string) error {
+    // 由 DAG Scheduler 统一调度，此方法仅做路由
+    // 实际逻辑在 dagexec.Scheduler.executeBinary() 中
+    return nil
+}
+```
+
+### 22.3 迁移验证清单
+
+| 检查项 | 验证方式 | 通过标准 |
+|--------|---------|---------|
+| Feature Gate 关闭时旧路径正常 | 设置 `BKE_BINARY_COMPONENT_SUPPORT=false` | containerd/bkeagent 通过旧 Phase 安装/升级 |
+| Feature Gate 开启时新路径正常 | 设置 `BKE_BINARY_COMPONENT_SUPPORT=true` | containerd/bkeagent 通过 BinaryInstaller 安装/升级 |
+| 新旧路径结果一致 | 对比新旧路径的安装结果 | 二进制版本/配置/服务状态一致 |
+| 灰度切换无中断 | 运行中切换 Feature Gate | 已安装节点不受影响，新节点走新路径 |
+| 升级中途切换 Feature Gate | 升级过程中切换 | 已完成节点正常，未完成节点走对应路径 |
+
+---
+
+## 23. 补充设计：BKENode 扩展字段
+
+> 本节补充 BKENode 缺失的 Architecture/OperatingSystem 字段。
+
+### 23.1 BKENodeSpec 扩展
+
+当前 `BKENodeSpec` 缺少 `Architecture` 和 `OperatingSystem` 字段，需要扩展：
+
+```go
+// api/bkecommon/v1beta1/bkenode_types.go 扩展
+
+type BKENodeSpec struct {
+    // 现有字段
+    IP           string `json:"ip"`
+    Hostname     string `json:"hostname,omitempty"`
+    Role         string `json:"role"`
+    Port         int32  `json:"port,omitempty"`
+    Username     string `json:"username,omitempty"`
+    Password     string `json:"password,omitempty"`
+    ControlPlane bool   `json:"controlPlane,omitempty"`
+    Kubelet      *KubeletConfig `json:"kubelet,omitempty"`
+    Labels       map[string]string `json:"labels,omitempty"`
+
+    // 新增字段
+    Architecture        string `json:"architecture,omitempty"`        // amd64 / arm64
+    OperatingSystem     string `json:"operatingSystem,omitempty"`     // centos / ubuntu / kylin
+    OperatingSystemVersion string `json:"operatingSystemVersion,omitempty"` // 7 / 8 / 20.04 / V10
+}
+```
+
+### 23.2 默认值与自动检测
+
+```go
+// pkg/phaseframe/phaseutil/node_detect.go
+
+// DetectNodeArchitecture 自动检测节点架构
+// 如果 BKENodeSpec.Architecture 未设置，通过 SSH 检测
+func DetectNodeArchitecture(sshClient *bkessh.MultiCli, nodeIP string) string {
+    result, err := sshClient.Execute(nodeIP, "uname -m")
+    if err != nil {
+        return "amd64" // 默认
+    }
+    arch := strings.TrimSpace(result.Stdout)
+    switch arch {
+    case "x86_64":
+        return "amd64"
+    case "aarch64":
+        return "arm64"
+    default:
+        return arch
+    }
+}
+
+// DetectNodeOS 自动检测节点操作系统
+func DetectNodeOS(sshClient *bkessh.MultiCli, nodeIP string) (os, version string) {
+    result, err := sshClient.Execute(nodeIP, "cat /etc/os-release")
+    if err != nil {
+        return "centos", "7" // 默认
+    }
+
+    output := result.Stdout
+    if strings.Contains(output, "CentOS") {
+        os = "centos"
+    } else if strings.Contains(output, "Ubuntu") {
+        os = "ubuntu"
+    } else if strings.Contains(output, "Kylin") {
+        os = "kylin"
+    } else {
+        os = "centos"
+    }
+
+    // 解析版本号
+    versionLine := ""
+    for _, line := range strings.Split(output, "\n") {
+        if strings.HasPrefix(line, "VERSION_ID=") {
+            versionLine = strings.Trim(strings.TrimPrefix(line, "VERSION_ID="), "\"")
+            break
+        }
+    }
+    version = versionLine
+
+    return os, version
+}
+```
+
+---
+
+## 24. 附录
 
 ### 15.1 参考文档
 
