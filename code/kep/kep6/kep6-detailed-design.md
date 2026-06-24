@@ -948,6 +948,8 @@ spec:
 
 ### 4.3 核心接口定义
 
+**设计思路**：BinaryInstaller 的接口设计复用现有的 `manifest.TemplateContext`，避免重复传递集群和节点信息。DAG 调度器构建的 TemplateContext 直接传递给 BinaryInstaller，BinaryInstaller 在此基础上填充制品信息。
+
 ```go
 // pkg/binaryinstaller/installer.go
 
@@ -958,13 +960,13 @@ type BinaryInstaller struct {
     cacheDir   string
     httpClient *http.Client
     cache      *ArtifactCache
+    renderer   *TemplateRenderer  // 复用 TemplateRenderer
 }
 
 // InstallOptions 安装选项
 type InstallOptions struct {
     Component   *ComponentVersion
-    Node        *BKENode
-    Cluster     *BKECluster
+    TemplateCtx manifest.TemplateContext  // 复用现有 TemplateContext
     Action      BinaryAction  // Install / Upgrade / Uninstall
     Timeout     time.Duration
     RetryCount  int
@@ -983,10 +985,11 @@ const (
 func (i *BinaryInstaller) Install(ctx context.Context, opts InstallOptions) error {
     component := opts.Component
     binary := component.Spec.Binary
+    tmplCtx := opts.TemplateCtx  // 复用 DAG 调度器传递的 TemplateContext
     
-    // 1. 解析架构和操作系统
-    arch := opts.Node.Spec.Architecture
-    os := opts.Node.Spec.OperatingSystem
+    // 1. 从 TemplateContext 获取架构和操作系统
+    arch := tmplCtx.NodeArch
+    os := tmplCtx.NodeOS
     
     // 2. 下载二进制制品 (带缓存)
     artifacts, err := i.downloadArtifacts(ctx, binary, arch, os)
@@ -994,24 +997,39 @@ func (i *BinaryInstaller) Install(ctx context.Context, opts InstallOptions) erro
         return fmt.Errorf("failed to download artifacts: %w", err)
     }
     
-    // 3. 渲染安装脚本
-    script, err := i.renderInstallScript(binary.InstallScript, artifacts, opts)
+    // 3. 填充 TemplateContext 的制品信息
+    tmplCtx.Artifacts = make(map[string]*ArtifactInfo)
+    for name, art := range artifacts {
+        tmplCtx.Artifacts[name] = &ArtifactInfo{
+            Name:     art.Name,
+            Path:     art.Path,
+            URL:      art.URL,
+            Checksum: art.Checksum,
+            Filename: art.Filename,
+        }
+    }
+    
+    // 4. 填充自定义变量
+    tmplCtx.Variables = binary.Variables
+    
+    // 5. 渲染安装脚本 (使用完整的 TemplateContext)
+    script, err := i.renderer.RenderScript(binary.InstallScript, tmplCtx)
     if err != nil {
         return fmt.Errorf("failed to render install script: %w", err)
     }
     
-    // 4. 渲染配置文件模板
-    configs, err := i.renderConfigTemplates(binary.ConfigTemplates, opts)
+    // 6. 渲染配置文件模板
+    configs, err := i.renderConfigTemplates(binary.ConfigTemplates, tmplCtx)
     if err != nil {
         return fmt.Errorf("failed to render config templates: %w", err)
     }
     
-    // 5. SSH 执行安装
+    // 7. SSH 执行安装
     switch opts.Action {
     case BinaryActionInstall, BinaryActionUpgrade:
-        return i.executeInstall(ctx, opts.Node, script, artifacts, configs)
+        return i.executeInstall(ctx, tmplCtx.NodeIP, script, artifacts, configs)
     case BinaryActionUninstall:
-        return i.executeUninstall(ctx, opts.Node, binary.UninstallScript)
+        return i.executeUninstall(ctx, tmplCtx.NodeIP, binary.UninstallScript, tmplCtx)
     }
     
     return nil
@@ -1266,6 +1284,8 @@ func (i *BinaryInstaller) executeInstall(ctx context.Context, node *BKENode, scr
 
 ### 5.3 核心接口定义
 
+**设计思路**：HelmInstaller 的接口设计也复用现有的 `manifest.TemplateContext`，与 BinaryInstaller 保持一致。DAG 调度器构建的 TemplateContext 直接传递给 HelmInstaller，用于渲染 Helm Values。
+
 ```go
 // pkg/helminstaller/installer.go
 
@@ -1281,7 +1301,7 @@ type HelmInstaller struct {
 // InstallOptions Helm 安装选项
 type InstallOptions struct {
     Component   *ComponentVersion
-    Cluster     *BKECluster
+    TemplateCtx manifest.TemplateContext  // 复用现有 TemplateContext
     Action      HelmAction  // Install / Upgrade / Uninstall / Rollback
     Timeout     time.Duration
     DryRun      bool
@@ -1301,6 +1321,7 @@ const (
 func (i *HelmInstaller) Install(ctx context.Context, opts InstallOptions) error {
     component := opts.Component
     helm := component.Spec.Helm
+    tmplCtx := opts.TemplateCtx  // 复用 DAG 调度器传递的 TemplateContext
     
     // 1. 获取 Chart
     chart, err := i.getChart(ctx, helm.Chart)
@@ -1308,15 +1329,15 @@ func (i *HelmInstaller) Install(ctx context.Context, opts InstallOptions) error 
         return fmt.Errorf("failed to get chart: %w", err)
     }
     
-    // 2. 渲染 Values
-    values, err := i.renderValues(ctx, helm.Values, opts)
+    // 2. 渲染 Values (使用 TemplateContext)
+    values, err := i.renderValues(ctx, helm.Values, tmplCtx)
     if err != nil {
         return fmt.Errorf("failed to render values: %w", err)
     }
     
     // 3. 加载自定义 Values 文件
     for _, vf := range helm.ValuesFiles {
-        customValues, err := i.loadValuesFile(ctx, vf, opts)
+        customValues, err := i.loadValuesFile(ctx, vf, tmplCtx)
         if err != nil {
             log.Warn("failed to load values file %s: %v", vf, err)
             continue
@@ -1427,93 +1448,170 @@ func (i *HelmInstaller) upgrade(ctx context.Context, actionConfig *action.Config
 
 ## 6. TemplateRenderer 详细设计
 
+### 6.0 与现有 TemplateContext 的复用关系
+
+**设计思路**：为避免重复造轮子，TemplateRenderer 复用并扩展现有的 `pkg/manifest.TemplateContext` 结构体。现有 TemplateContext 用于 YAML/Manifest 组件的模板渲染，包含 4 个基础字段。TemplateRenderer 在此基础上扩展，增加 Binary 组件所需的节点信息、制品信息、自定义变量等字段。
+
+**复用策略**：
+- **向后兼容**：现有 TemplateContext 的 4 个字段保持不变，YAML 组件代码无需修改
+- **扩展字段**：新增字段均为可选，YAML 组件不使用时留空即可
+- **统一接口**：BinaryInstaller 和 HelmInstaller 共享同一个 TemplateContext，简化 DAG 调度器的数据传递
+
+**现有 TemplateContext** (`pkg/manifest/types.go`)：
+```go
+type TemplateContext struct {
+    ClusterName       string  // 已有：集群名称
+    Namespace         string  // 已有：命名空间
+    KubernetesVersion string  // 已有：K8s 版本
+    OpenFuyaoVersion  string  // 已有：OpenFuyao 版本
+}
+```
+
+**扩展后的 TemplateContext**：
+```go
+type TemplateContext struct {
+    // 现有字段 (保持向后兼容)
+    ClusterName       string
+    Namespace         string
+    KubernetesVersion string
+    OpenFuyaoVersion  string
+    
+    // 新增：集群扩展信息 (Binary 组件需要)
+    APIServer         string
+    ServiceCIDR       string
+    PodCIDR           string
+    DNSDomain         string
+    
+    // 新增：节点信息 (Binary 组件需要)
+    NodeIP            string
+    NodeHostname      string
+    NodeRole          string
+    NodeArch          string
+    NodeOS            string
+    NodeOSVersion     string
+    
+    // 新增：版本信息
+    ComponentVersion          string
+    ComponentPreviousVersion  string
+    
+    // 新增：制品信息 (Binary 组件需要)
+    Artifacts         map[string]*ArtifactInfo
+    
+    // 新增：镜像仓库
+    ImageRegistry     string
+    ImagePullSecret   string
+    
+    // 新增：自定义变量
+    Variables         map[string]string
+}
+
+type ArtifactInfo struct {
+    Name     string
+    Path     string
+    URL      string
+    Checksum string
+    Filename string
+}
+```
+
+**使用场景对比**：
+
+| 组件类型 | 使用的字段 | 说明 |
+|---------|-----------|------|
+| **YAML/Manifest** | ClusterName, Namespace, KubernetesVersion, OpenFuyaoVersion | 现有字段，向后兼容 |
+| **Helm** | 同上 + APIServer, ServiceCIDR 等 | 可选使用扩展字段 |
+| **Binary** | 所有字段 | 完整使用，包括节点信息、制品信息等 |
+
 ### 6.1 模板变量系统
 
 TemplateRenderer 支持 8 类 50+ 模板变量，覆盖集群、节点、版本、制品、镜像仓库、路径、操作类型和自定义变量。
 
+**变量与 TemplateContext 字段映射**：
+
 #### 1. 集群信息变量 (Cluster Variables)
 
-| 变量 | 说明 | 示例值 |
-|------|------|--------|
-| `{{clusterName}}` | 集群名称 | `my-cluster` |
-| `{{clusterNamespace}}` | 集群命名空间 | `default` |
-| `{{apiServer}}` | API Server 地址 | `https://10.0.0.1:6443` |
-| `{{apiServerPort}}` | API Server 端口 | `6443` |
-| `{{serviceCIDR}}` | Service CIDR | `10.96.0.0/12` |
-| `{{podCIDR}}` | Pod CIDR | `192.168.0.0/16` |
-| `{{dnsDomain}}` | DNS 域名 | `cluster.local` |
-| `{{clusterDNS}}` | Cluster DNS IP | `10.96.0.10` |
+| 变量 | 说明 | TemplateContext 字段 | 示例值 |
+|------|------|---------------------|--------|
+| `{{clusterName}}` | 集群名称 | `.ClusterName` | `my-cluster` |
+| `{{clusterNamespace}}` | 集群命名空间 | `.Namespace` | `default` |
+| `{{apiServer}}` | API Server 地址 | `.APIServer` | `https://10.0.0.1:6443` |
+| `{{apiServerPort}}` | API Server 端口 | 从 APIServer 解析 | `6443` |
+| `{{serviceCIDR}}` | Service CIDR | `.ServiceCIDR` | `10.96.0.0/12` |
+| `{{podCIDR}}` | Pod CIDR | `.PodCIDR` | `192.168.0.0/16` |
+| `{{dnsDomain}}` | DNS 域名 | `.DNSDomain` | `cluster.local` |
+| `{{clusterDNS}}` | Cluster DNS IP | 从 ServiceCIDR 计算 | `10.96.0.10` |
 
 #### 2. 节点信息变量 (Node Variables)
 
-| 变量 | 说明 | 示例值 |
-|------|------|--------|
-| `{{nodeIP}}` | 节点 IP | `192.168.1.10` |
-| `{{nodeHostname}}` | 节点主机名 | `node-01` |
-| `{{nodeRole}}` | 节点角色 | `master` / `worker` / `etcd` |
-| `{{nodeArch}}` | 节点架构 | `amd64` / `arm64` |
-| `{{nodeOS}}` | 操作系统 | `centos` / `ubuntu` / `kylin` |
-| `{{nodeOSVersion}}` | 操作系统版本 | `7` / `8` / `20.04` / `V10` |
-| `{{nodeKernelVersion}}` | 内核版本 | `5.4.0-150-generic` |
-| `{{nodeCPUs}}` | CPU 核心数 | `8` |
-| `{{nodeMemoryMB}}` | 内存大小 (MB) | `16384` |
-| `{{nodeDiskGB}}` | 磁盘大小 (GB) | `100` |
+| 变量 | 说明 | TemplateContext 字段 | 示例值 |
+|------|------|---------------------|--------|
+| `{{nodeIP}}` | 节点 IP | `.NodeIP` | `192.168.1.10` |
+| `{{nodeHostname}}` | 节点主机名 | `.NodeHostname` | `node-01` |
+| `{{nodeRole}}` | 节点角色 | `.NodeRole` | `master` / `worker` / `etcd` |
+| `{{nodeArch}}` | 节点架构 | `.NodeArch` | `amd64` / `arm64` |
+| `{{nodeOS}}` | 操作系统 | `.NodeOS` | `centos` / `ubuntu` / `kylin` |
+| `{{nodeOSVersion}}` | 操作系统版本 | `.NodeOSVersion` | `7` / `8` / `20.04` / `V10` |
+| `{{nodeKernelVersion}}` | 内核版本 | 运行时获取 | `5.4.0-150-generic` |
+| `{{nodeCPUs}}` | CPU 核心数 | 运行时获取 | `8` |
+| `{{nodeMemoryMB}}` | 内存大小 (MB) | 运行时获取 | `16384` |
+| `{{nodeDiskGB}}` | 磁盘大小 (GB) | 运行时获取 | `100` |
 
 #### 3. 版本信息变量 (Version Variables)
 
-| 变量 | 说明 | 示例值 |
-|------|------|--------|
-| `{{componentVersion}}` | 当前组件版本 | `v1.7.18` |
-| `{{componentPreviousVersion}}` | 上一组件版本 (升级时) | `v1.7.15` |
-| `{{clusterVersion}}` | 集群 Kubernetes 版本 | `v1.29.0` |
-| `{{etcdVersion}}` | Etcd 版本 | `v3.5.12` |
-| `{{containerdVersion}}` | Containerd 版本 | `v1.7.18` |
-| `{{bkeagentVersion}}` | BKEAgent 版本 | `v2.6.0` |
+| 变量 | 说明 | TemplateContext 字段 | 示例值 |
+|------|------|---------------------|--------|
+| `{{componentVersion}}` | 当前组件版本 | `.ComponentVersion` | `v1.7.18` |
+| `{{componentPreviousVersion}}` | 上一组件版本 | `.ComponentPreviousVersion` | `v1.7.15` |
+| `{{clusterVersion}}` | 集群 Kubernetes 版本 | `.KubernetesVersion` | `v1.29.0` |
+| `{{openFuyaoVersion}}` | OpenFuyao 版本 | `.OpenFuyaoVersion` | `v2.6.0` |
+| `{{etcdVersion}}` | Etcd 版本 | 从 VersionContext 获取 | `v3.5.12` |
+| `{{containerdVersion}}` | Containerd 版本 | 从 VersionContext 获取 | `v1.7.18` |
+| `{{bkeagentVersion}}` | BKEAgent 版本 | 从 VersionContext 获取 | `v2.6.0` |
 
 #### 4. 二进制制品变量 (Artifact Variables)
 
-| 变量 | 说明 | 示例值 |
-|------|------|--------|
-| `{{artifact.<name>.path}}` | 制品本地路径 | `/tmp/bke-install/containerd.tar.gz` |
-| `{{artifact.<name>.url}}` | 制品原始 URL | `https://release-repo.../containerd.tar.gz` |
-| `{{artifact.<name>.checksum}}` | 制品校验和 | `sha256:abc123...` |
-| `{{artifact.<name>.filename}}` | 制品文件名 | `containerd-1.7.18-linux-amd64.tar.gz` |
+| 变量 | 说明 | TemplateContext 字段 | 示例值 |
+|------|------|---------------------|--------|
+| `{{artifact.<name>.path}}` | 制品本地路径 | `.Artifacts[name].Path` | `/tmp/bke-install/containerd.tar.gz` |
+| `{{artifact.<name>.url}}` | 制品原始 URL | `.Artifacts[name].URL` | `https://release-repo.../containerd.tar.gz` |
+| `{{artifact.<name>.checksum}}` | 制品校验和 | `.Artifacts[name].Checksum` | `sha256:abc123...` |
+| `{{artifact.<name>.filename}}` | 制品文件名 | `.Artifacts[name].Filename` | `containerd-1.7.18-linux-amd64.tar.gz` |
 
 #### 5. 镜像仓库变量 (Registry Variables)
 
-| 变量 | 说明 | 示例值 |
-|------|------|--------|
-| `{{imageRegistry}}` | 镜像仓库地址 | `registry.openfuyao.cn` |
-| `{{imagePullSecret}}` | 镜像拉取 Secret | `registry-secret` |
-| `{{imageNamespace}}` | 镜像命名空间 | `openfuyao` |
+| 变量 | 说明 | TemplateContext 字段 | 示例值 |
+|------|------|---------------------|--------|
+| `{{imageRegistry}}` | 镜像仓库地址 | `.ImageRegistry` | `registry.openfuyao.cn` |
+| `{{imagePullSecret}}` | 镜像拉取 Secret | `.ImagePullSecret` | `registry-secret` |
+| `{{imageNamespace}}` | 镜像命名空间 | 从 ImageRegistry 解析 | `openfuyao` |
 
 #### 6. 安装路径变量 (Path Variables)
 
-| 变量 | 说明 | 示例值 |
-|------|------|--------|
-| `{{installPath}}` | 默认安装路径 | `/usr/local/bin` |
-| `{{configPath}}` | 配置路径 | `/etc/containerd` |
-| `{{logPath}}` | 日志路径 | `/var/log/containerd` |
-| `{{dataPath}}` | 数据路径 | `/var/lib/containerd` |
-| `{{binPath}}` | 二进制路径 | `/usr/local/bin` |
+| 变量 | 说明 | TemplateContext 字段 | 示例值 |
+|------|------|---------------------|--------|
+| `{{installPath}}` | 默认安装路径 | 从 ComponentVersion 获取 | `/usr/local/bin` |
+| `{{configPath}}` | 配置路径 | 从 ComponentVersion 获取 | `/etc/containerd` |
+| `{{logPath}}` | 日志路径 | 从 ComponentVersion 获取 | `/var/log/containerd` |
+| `{{dataPath}}` | 数据路径 | 从 ComponentVersion 获取 | `/var/lib/containerd` |
+| `{{binPath}}` | 二进制路径 | 从 ComponentVersion 获取 | `/usr/local/bin` |
 
 #### 7. 操作类型变量 (Action Variables)
 
-| 变量 | 说明 | 示例值 |
-|------|------|--------|
-| `{{action}}` | 操作类型 | `install` / `upgrade` / `uninstall` |
-| `{{isUpgrade}}` | 是否升级 | `true` / `false` |
-| `{{isInstall}}` | 是否安装 | `true` / `false` |
+| 变量 | 说明 | TemplateContext 字段 | 示例值 |
+|------|------|---------------------|--------|
+| `{{action}}` | 操作类型 | 运行时确定 | `install` / `upgrade` / `uninstall` |
+| `{{isUpgrade}}` | 是否升级 | 运行时确定 | `true` / `false` |
+| `{{isInstall}}` | 是否安装 | 运行时确定 | `true` / `false` |
 
 #### 8. 自定义变量 (Custom Variables)
 
 通过 ComponentVersion 的 `binary.variables` 字段定义，可在 installScript 中引用：
 
-| 变量 | 说明 | 示例值 |
-|------|------|--------|
-| `{{.Variables.<key>}}` | 自定义变量 | - |
-| `{{.Variables.logLevel}}` | 日志级别 | `info` |
-| `{{.Variables.snapshotter}}` | 快照器类型 | `overlayfs` |
+| 变量 | 说明 | TemplateContext 字段 | 示例值 |
+|------|------|---------------------|--------|
+| `{{.Variables.<key>}}` | 自定义变量 | `.Variables[key]` | - |
+| `{{.Variables.logLevel}}` | 日志级别 | `.Variables["logLevel"]` | `info` |
+| `{{.Variables.snapshotter}}` | 快照器类型 | `.Variables["snapshotter"]` | `overlayfs` |
 
 **使用示例**：
 ```yaml
@@ -1532,10 +1630,11 @@ installScript: |
 
 ### 6.2 TemplateRenderer 渲染流程图
 
-**设计思路**：TemplateRenderer 的渲染流程分为 5 个主要步骤：构建模板数据、构建制品数据、构建自定义变量、创建模板解析器、执行模板渲染。整个流程采用 Go text/template 标准库，支持自定义函数和条件渲染。
+**设计思路**：TemplateRenderer 的渲染流程分为 5 个主要步骤：接收 TemplateContext、构建制品数据、创建模板解析器、执行模板渲染、返回结果。整个流程复用 DAG 调度器传递的 TemplateContext，避免重复构建模板数据。
 
 **关键设计点**：
-- **数据构建**：从集群、节点、组件、制品等多个来源构建模板数据
+- **复用 TemplateContext**：直接使用 DAG 调度器构建的 TemplateContext，包含集群、节点、版本等信息
+- **制品数据构建**：根据 ComponentVersion 的 artifacts 定义，下载并构建制品信息
 - **自定义函数**：提供 upper/lower/eq/ne/default/joinPath 等常用函数
 - **条件渲染**：支持 `{{if eq .nodeOS "centos"}}` 等条件判断
 - **错误处理**：模板解析和执行失败时返回详细错误信息
@@ -1552,37 +1651,33 @@ installScript: |
                                        │
                                        ▼
                     ┌──────────────────────────────────────┐
-                    │  1. 构建模板数据                    │
-                    │  BuildScriptData(ctx, opts)          │
-                    └────────────────────┬─────────────────┘
-                                         │
-                    ┌────────────────────┼────────────────────┐
-                    │                    │                    │
-                    ▼                    ▼                    ▼
-          ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
-          │  集群信息       │  │  节点信息       │  │  版本信息       │
-          │  ClusterName    │  │  NodeIP         │  │  ComponentVer   │
-          │  APIServer      │  │  NodeArch       │  │  ClusterVer     │
-          │  ServiceCIDR    │  │  NodeOS         │  │                 │
-          └────────┬────────┘  └────────┬────────┘  └────────┬────────┘
-                   │                    │                    │
-                   └────────────────────┼────────────────────┘
-                                        │
-                                        ▼
-                    ┌──────────────────────────────────────┐
-                    │  2. 构建制品数据                    │
-                    │  buildArtifactData(ctx, binary, opts)│
+                    │  1. 接收 TemplateContext             │
+                    │  (由 DAG Scheduler 构建并传递)       │
+                    │                                      │
+                    │  TemplateContext 包含:               │
+                    │  - ClusterName, Namespace            │
+                    │  - KubernetesVersion, OpenFuyaoVer   │
+                    │  - NodeIP, NodeArch, NodeOS          │
+                    │  - ComponentVersion                  │
+                    │  - Artifacts (待填充)                │
+                    │  - Variables                         │
                     └────────────────────┬─────────────────┘
                                          │
                                          ▼
                     ┌──────────────────────────────────────┐
-                    │  3. 构建自定义变量                  │
-                    │  Variables: binary.Variables         │
+                    │  2. 构建制品数据                     │
+                    │  downloadArtifacts(ctx, binary,      │
+                    │                    nodeArch, nodeOS) │
+                    │                                      │
+                    │  填充 TemplateContext.Artifacts:     │
+                    │  - containerd: {path, url, checksum} │
+                    │  - ctr: {path, url, checksum}        │
+                    │  - shim: {path, url, checksum}       │
                     └────────────────────┬─────────────────┘
                                          │
                                          ▼
                     ┌──────────────────────────────────────┐
-                    │  4. 创建模板解析器                  │
+                    │  3. 创建模板解析器                   │
                     │  template.New("installScript")       │
                     │         .Funcs(funcMap)              │
                     │         .Parse(script)               │
@@ -1599,8 +1694,16 @@ installScript: |
                              │
                              ▼
                     ┌──────────────────────────────────────┐
-                    │  5. 执行模板渲染                    │
-                    │  tmpl.Execute(&buf, data)            │
+                    │  4. 执行模板渲染                     │
+                    │  tmpl.Execute(&buf, tmplCtx)         │
+                    │                                      │
+                    │  模板变量替换:                       │
+                    │  - {{clusterName}} → tmplCtx.ClusterName
+                    │  - {{nodeArch}} → tmplCtx.NodeArch   │
+                    │  - {{artifact.containerd.path}} →    │
+                    │    tmplCtx.Artifacts["containerd"].Path
+                    │  - {{.Variables.logLevel}} →         │
+                    │    tmplCtx.Variables["logLevel"]     │
                     └────────────────────┬─────────────────┘
                                          │
                               ┌──────────┴──────────┐
@@ -1615,7 +1718,66 @@ installScript: |
                     └─────────────────┘   └─────────────────┘
 ```
 
-### 6.3 自定义函数定义
+### 6.3 TemplateContext 构建流程
+
+**设计思路**：DAG 调度器在执行组件前构建 TemplateContext，包含集群信息、节点信息、版本信息等。对于 Binary 组件，还需要在 TemplateRenderer 中填充制品信息。
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                        TemplateContext 构建流程                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+                    ┌──────────────────────────────────────┐
+                    │  DAG Scheduler.ExecuteDAG()          │
+                    └────────────────────┬─────────────────┘
+                                         │
+                                         ▼
+                    ┌──────────────────────────────────────┐
+                    │  构建基础 TemplateContext            │
+                    │                                      │
+                    │  tmpl := manifest.TemplateContext{   │
+                    │    ClusterName:       cluster.Name,  │
+                    │    Namespace:         cluster.NS,    │
+                    │    KubernetesVersion: cluster.K8sVer,│
+                    │    OpenFuyaoVersion:  cluster.OFVer, │
+                    │    APIServer:         cluster.API,   │
+                    │    ServiceCIDR:       cluster.SvcCIDR│
+                    │  }                                   │
+                    └────────────────────┬─────────────────┘
+                                         │
+                                         ▼
+                    ┌──────────────────────────────────────┐
+                    │  遍历执行批次                        │
+                    │  for _, batch := range batches       │
+                    └────────────────────┬─────────────────┘
+                                         │
+                                         ▼
+                    ┌──────────────────────────────────────┐
+                    │  对每个组件:                         │
+                    │  executeComponent(ctx, node, tmpl)   │
+                    └────────────────────┬─────────────────┘
+                                         │
+                    ┌────────────────────┼────────────────────┐
+                    │                    │                    │
+                    ▼                    ▼                    ▼
+          ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
+          │  YAML 组件      │  │  Helm 组件      │  │  Binary 组件    │
+          │                 │  │                 │  │                 │
+          │  使用基础字段   │  │  使用基础字段   │  │  扩展节点信息   │
+          │  - ClusterName  │  │  + APIServer    │  │  + NodeIP       │
+          │  - Namespace    │  │  + ServiceCIDR  │  │  + NodeArch     │
+          │  - K8sVersion   │  │                 │  │  + NodeOS       │
+          │                 │  │                 │  │  + Artifacts    │
+          │  渲染 Manifest  │  │  渲染 Values    │  │  + Variables    │
+          │  应用到集群     │  │  helm install   │  │                 │
+          │                 │  │                 │  │  渲染脚本       │
+          │                 │  │                 │  │  SSH 执行       │
+          └─────────────────┘  └─────────────────┘  └─────────────────┘
+```
+
+### 6.4 自定义函数定义
+
+**设计思路**：TemplateRenderer 提供一组自定义函数，用于在模板中进行字符串处理、条件判断、版本比较等操作。这些函数通过 Go text/template 的 FuncMap 机制注册。
 
 ```go
 // pkg/binaryinstaller/template_renderer.go
@@ -1957,13 +2119,13 @@ func (r *ConfigRenderer) renderSecretTemplate(ctx context.Context, template Conf
 }
 
 // renderKubeconfigTemplate 动态生成 kubeconfig
-func (r *ConfigRenderer) renderKubeconfigTemplate(ctx context.Context, template ConfigTemplateSpec, opts InstallOptions) ([]byte, error) {
+func (r *ConfigRenderer) renderKubeconfigTemplate(ctx context.Context, template ConfigTemplateSpec, tmplCtx manifest.TemplateContext) ([]byte, error) {
     kc := template.KubeconfigTemplate
     
-    // 解析模板变量
-    clusterName, _ := r.renderString(kc.ClusterName, opts)
-    apiServer, _ := r.renderString(kc.APIServer, opts)
-    namespace, _ := r.renderString(kc.Namespace, opts)
+    // 解析模板变量 (使用 TemplateContext)
+    clusterName := r.renderTemplateString(kc.ClusterName, tmplCtx)
+    apiServer := r.renderTemplateString(kc.APIServer, tmplCtx)
+    namespace := r.renderTemplateString(kc.Namespace, tmplCtx)
     
     kubeconfig := clientcmdapi.Config{
         Kind:       "Config",
@@ -1993,33 +2155,42 @@ func (r *ConfigRenderer) renderKubeconfigTemplate(ctx context.Context, template 
     return clientcmd.Write(kubeconfig)
 }
 
-// buildTemplateData 构建模板数据
-func (r *ConfigRenderer) buildTemplateData(ctx context.Context, opts InstallOptions) map[string]interface{} {
-    cluster := opts.Cluster
-    node := opts.Node
+// renderConfigTemplates 渲染配置文件模板 (使用 TemplateContext)
+func (r *ConfigRenderer) renderConfigTemplates(templates []ConfigTemplateSpec, tmplCtx manifest.TemplateContext) (map[string][]byte, error) {
+    configs := make(map[string][]byte)
     
-    return map[string]interface{}{
-        // 集群信息
-        "clusterName":      cluster.Name,
-        "clusterNamespace": cluster.Namespace,
-        "apiServer":        cluster.Spec.ClusterConfig.Cluster.APIServer,
+    for _, tmpl := range templates {
+        var content []byte
+        var err error
         
-        // 节点信息
-        "nodeIP":       node.IP,
-        "nodeHostname": node.Hostname,
-        "nodeRole":     node.Role,
-        "nodeArch":     node.Spec.Architecture,
-        "nodeOS":       node.Spec.OperatingSystem,
+        switch {
+        case tmpl.Content != "":
+            // Content 模式：使用 TemplateContext 渲染
+            content, err = r.renderContentTemplate(tmpl.Content, tmplCtx)
+        case tmpl.SecretRef != nil:
+            // SecretRef 模式：从 Secret 获取
+            content, err = r.renderSecretTemplate(tmpl.SecretRef, tmplCtx)
+        case tmpl.KubeconfigTemplate != nil:
+            // KubeconfigTemplate 模式：动态生成
+            content, err = r.renderKubeconfigTemplate(context.Background(), tmpl, tmplCtx)
+        default:
+            return nil, fmt.Errorf("no template content specified for %s", tmpl.Name)
+        }
         
-        // 版本信息
-        "componentVersion": opts.Component.Spec.Version,
-        "clusterVersion":   cluster.Spec.ClusterConfig.Cluster.KubernetesVersion,
-        
-        // 自定义变量
-        "Variables": opts.Component.Spec.Binary.Variables,
+        if err != nil {
+            return nil, fmt.Errorf("failed to render template %s: %w", tmpl.Name, err)
+        }
+        configs[tmpl.Name] = content
     }
+    
+    return configs, nil
 }
 ```
+
+**设计说明**：ConfigRenderer 的所有渲染方法都接收 `manifest.TemplateContext` 作为参数，而不是单独传递集群、节点等信息。这样：
+1. 与 DAG 调度器传递的 TemplateContext 保持一致
+2. 避免重复构建模板数据
+3. BinaryInstaller 和 HelmInstaller 共享相同的模板上下文
 
 ---
 
@@ -2157,13 +2328,16 @@ func (r *ConfigRenderer) buildTemplateData(ctx context.Context, opts InstallOpti
 
 ### 8.3 核心接口定义
 
+**设计思路**：DAG 调度器在执行组件时传递 `manifest.TemplateContext`，BinaryComponentExecutor 在此基础上扩展节点信息和制品信息，然后传递给 BinaryInstaller。这样所有组件类型共享同一个 TemplateContext，避免重复构建。
+
 ```go
 // pkg/dagexec/executor.go
 
 // ComponentExecutor 组件执行器接口
 type ComponentExecutor interface {
-    // ExecuteComponent 执行组件
-    ExecuteComponent(ctx context.Context, node *ComponentNode, phaseCtx *phaseframe.PhaseContext) error
+    // ExecuteComponent 执行组件 (接收 TemplateContext)
+    ExecuteComponent(ctx context.Context, node *ComponentNode, 
+        phaseCtx *phaseframe.PhaseContext, tmpl manifest.TemplateContext) error
     
     // GetComponentType 获取组件类型
     GetComponentType() ComponentType
@@ -2176,7 +2350,8 @@ type BinaryComponentExecutor struct {
 }
 
 // ExecuteComponent 执行二进制组件
-func (e *BinaryComponentExecutor) ExecuteComponent(ctx context.Context, node *ComponentNode, phaseCtx *phaseframe.PhaseContext) error {
+func (e *BinaryComponentExecutor) ExecuteComponent(ctx context.Context, node *ComponentNode, 
+    phaseCtx *phaseframe.PhaseContext, tmpl manifest.TemplateContext) error {
     component := node.Component
     
     // 1. 获取 ComponentVersion
@@ -2193,22 +2368,23 @@ func (e *BinaryComponentExecutor) ExecuteComponent(ctx context.Context, node *Co
     // 3. 获取需要操作的节点
     nodes := e.getTargetNodes(phaseCtx, component)
     
-    // 4. 根据升级策略执行
+    // 4. 根据升级策略执行 (传递 TemplateContext)
     strategy := cv.Spec.UpgradeStrategy
     switch strategy.Mode {
     case "Rolling":
-        return e.executeRolling(ctx, nodes, cv, strategy)
+        return e.executeRolling(ctx, nodes, cv, strategy, tmpl)
     case "Parallel":
-        return e.executeParallel(ctx, nodes, cv, strategy)
+        return e.executeParallel(ctx, nodes, cv, strategy, tmpl)
     case "Batch":
-        return e.executeBatch(ctx, nodes, cv, strategy)
+        return e.executeBatch(ctx, nodes, cv, strategy, tmpl)
     }
     
     return nil
 }
 
 // executeRolling 滚动执行 (逐节点)
-func (e *BinaryComponentExecutor) executeRolling(ctx context.Context, nodes []Node, cv *ComponentVersion, strategy UpgradeStrategySpec) error {
+func (e *BinaryComponentExecutor) executeRolling(ctx context.Context, nodes []Node, 
+    cv *ComponentVersion, strategy UpgradeStrategySpec, baseTmpl manifest.TemplateContext) error {
     for _, node := range nodes {
         select {
         case <-ctx.Done():
@@ -2216,12 +2392,22 @@ func (e *BinaryComponentExecutor) executeRolling(ctx context.Context, nodes []No
         default:
         }
         
+        // 为每个节点扩展 TemplateContext
+        nodeTmpl := baseTmpl  // 复制基础 TemplateContext
+        nodeTmpl.NodeIP = node.IP
+        nodeTmpl.NodeHostname = node.Hostname
+        nodeTmpl.NodeRole = node.Role
+        nodeTmpl.NodeArch = node.Spec.Architecture
+        nodeTmpl.NodeOS = node.Spec.OperatingSystem
+        nodeTmpl.NodeOSVersion = node.Spec.OperatingSystemVersion
+        nodeTmpl.ComponentVersion = cv.Spec.Version
+        
         opts := binaryinstaller.InstallOptions{
-            Component:  cv,
-            Node:       node,
-            Action:     binaryinstaller.BinaryActionUpgrade,
-            Timeout:    strategy.Timeout,
-            RetryCount: 3,
+            Component:   cv,
+            TemplateCtx: nodeTmpl,  // 传递扩展后的 TemplateContext
+            Action:      binaryinstaller.BinaryActionUpgrade,
+            Timeout:     strategy.Timeout,
+            RetryCount:  3,
         }
         
         if err := e.installer.Install(ctx, opts); err != nil {
@@ -2249,8 +2435,9 @@ type HelmComponentExecutor struct {
     store     *manifest.Store
 }
 
-// ExecuteComponent 执行 Helm 组件
-func (e *HelmComponentExecutor) ExecuteComponent(ctx context.Context, node *ComponentNode, phaseCtx *phaseframe.PhaseContext) error {
+// ExecuteComponent 执行 Helm 组件 (接收 TemplateContext)
+func (e *HelmComponentExecutor) ExecuteComponent(ctx context.Context, node *ComponentNode, 
+    phaseCtx *phaseframe.PhaseContext, tmpl manifest.TemplateContext) error {
     component := node.Component
     
     // 1. 获取 ComponentVersion
@@ -2270,17 +2457,27 @@ func (e *HelmComponentExecutor) ExecuteComponent(ctx context.Context, node *Comp
         action = helminstaller.HelmActionUpgrade
     }
     
-    // 4. 执行 Helm 操作
+    // 4. 填充 TemplateContext 的版本信息
+    tmpl.ComponentVersion = cv.Spec.Version
+    
+    // 5. 执行 Helm 操作 (传递 TemplateContext)
     opts := helminstaller.InstallOptions{
-        Component: cv,
-        Cluster:   phaseCtx.BKECluster,
-        Action:    action,
-        Timeout:   cv.Spec.UpgradeStrategy.Timeout,
+        Component:   cv,
+        TemplateCtx: tmpl,  // 传递 TemplateContext
+        Action:      action,
+        Timeout:     cv.Spec.UpgradeStrategy.Timeout,
     }
     
     return e.installer.Install(ctx, opts)
 }
 ```
+
+**设计说明**：所有 ComponentExecutor 的 ExecuteComponent 方法都接收 `manifest.TemplateContext` 参数：
+- **YAML/Manifest 组件**：使用基础字段 (ClusterName, Namespace, KubernetesVersion)
+- **Helm 组件**：使用基础字段 + 扩展字段 (APIServer, ServiceCIDR 等)
+- **Binary 组件**：使用所有字段，包括节点信息、制品信息、自定义变量
+
+这样 DAG 调度器只需构建一次 TemplateContext，所有组件类型共享使用。
 
 ---
 
