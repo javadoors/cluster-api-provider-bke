@@ -2335,16 +2335,141 @@ func (r *ConfigRenderer) renderConfigTemplates(templates []ConfigTemplateSpec, t
 
 ### 8.3 核心接口定义
 
-**设计思路**：DAG 调度器在执行组件时传递 `manifest.TemplateContext`，BinaryComponentExecutor 在此基础上扩展节点信息和制品信息，然后传递给 BinaryInstaller。这样所有组件类型共享同一个 TemplateContext，避免重复构建。
+**设计思路**：DAG 调度器在执行组件时传递 `ExecutionContext`，该上下文完全独立于 phaseframe 包，包含集群信息、节点提供者、日志记录器等。通过 `NodeProvider` 接口抽象节点获取逻辑，实现与 phaseframe 的完全解耦。
+
+**解耦设计**：
+- **ExecutionContext**：替代 `phaseframe.PhaseContext`，独立定义组件执行所需上下文
+- **NodeProvider**：抽象节点获取逻辑，替代 `phaseCtx.NodeFetcher()`
+- **TemplateContext**：复用 `manifest.TemplateContext`，统一模板渲染
+
+#### 8.3.1 ExecutionContext 定义
+
+```go
+// pkg/dagexec/context.go
+
+// ExecutionContext 组件执行上下文 (完全独立于 phaseframe)
+type ExecutionContext struct {
+    // 集群信息
+    Cluster *bkev1beta1.BKECluster
+    
+    // 节点提供者 (抽象接口，不依赖 phaseframe)
+    NodeProvider NodeProvider
+    
+    // 日志记录器
+    Log *bkev1beta1.BKELogger
+    
+    // 操作类型
+    IsUpgrade bool
+    
+    // 模板上下文 (复用 manifest.TemplateContext)
+    TemplateContext manifest.TemplateContext
+}
+
+// NewExecutionContext 创建执行上下文
+func NewExecutionContext(
+    cluster *bkev1beta1.BKECluster,
+    nodeProvider NodeProvider,
+    log *bkev1beta1.BKELogger,
+    isUpgrade bool,
+) *ExecutionContext {
+    return &ExecutionContext{
+        Cluster:      cluster,
+        NodeProvider: nodeProvider,
+        Log:          log,
+        IsUpgrade:    isUpgrade,
+    }
+}
+```
+
+#### 8.3.2 NodeProvider 接口定义
+
+```go
+// pkg/dagexec/node_provider.go
+
+// NodeProvider 节点提供者接口 (替代 phaseframe.NodeFetcher)
+type NodeProvider interface {
+    // GetNodes 获取集群的节点列表
+    GetNodes(ctx context.Context, cluster *bkev1beta1.BKECluster) ([]Node, error)
+    
+    // GetNodesByRole 按角色获取节点
+    GetNodesByRole(ctx context.Context, cluster *bkev1beta1.BKECluster, role string) ([]Node, error)
+}
+
+// Node 节点信息 (简化版，不依赖 phaseframe)
+type Node struct {
+    Name       string
+    IP         string
+    Hostname   string
+    Role       string  // master/worker/etcd
+    Arch       string
+    OS         string
+    OSVersion  string
+    Status     NodeStatus
+}
+
+// NodeStatus 节点状态
+type NodeStatus struct {
+    Ready         bool
+    KernelVersion string
+    CPU           int
+    MemoryMB      int
+    DiskGB        int
+}
+
+// BKENodeProvider NodeProvider 的默认实现
+type BKENodeProvider struct {
+    client client.Client
+}
+
+// NewBKENodeProvider 创建节点提供者
+func NewBKENodeProvider(client client.Client) *BKENodeProvider {
+    return &BKENodeProvider{client: client}
+}
+
+// GetNodes 获取集群的节点列表
+func (p *BKENodeProvider) GetNodes(ctx context.Context, cluster *bkev1beta1.BKECluster) ([]Node, error) {
+    var nodes []Node
+    for _, ref := range cluster.Spec.NodeRefs {
+        node := Node{
+            Name:      ref.Name,
+            IP:        ref.IP,
+            Hostname:  ref.Hostname,
+            Role:      ref.Role,
+            Arch:      ref.Architecture,
+            OS:        ref.OperatingSystem,
+            OSVersion: ref.OperatingSystemVersion,
+        }
+        nodes = append(nodes, node)
+    }
+    return nodes, nil
+}
+
+// GetNodesByRole 按角色获取节点
+func (p *BKENodeProvider) GetNodesByRole(ctx context.Context, cluster *bkev1beta1.BKECluster, role string) ([]Node, error) {
+    allNodes, err := p.GetNodes(ctx, cluster)
+    if err != nil {
+        return nil, err
+    }
+    
+    var filtered []Node
+    for _, node := range allNodes {
+        if node.Role == role {
+            filtered = append(filtered, node)
+        }
+    }
+    return filtered, nil
+}
+```
+
+#### 8.3.3 ComponentExecutor 接口 (解耦后)
 
 ```go
 // pkg/dagexec/executor.go
 
-// ComponentExecutor 组件执行器接口
+// ComponentExecutor 组件执行器接口 (不再依赖 phaseframe)
 type ComponentExecutor interface {
-    // ExecuteComponent 执行组件 (接收 TemplateContext)
-    ExecuteComponent(ctx context.Context, node *ComponentNode, 
-        phaseCtx *phaseframe.PhaseContext, tmpl manifest.TemplateContext) error
+    // ExecuteComponent 执行组件
+    ExecuteComponent(ctx context.Context, node *ComponentNode, execCtx *ExecutionContext) error
     
     // GetComponentType 获取组件类型
     GetComponentType() ComponentType
@@ -2357,8 +2482,7 @@ type BinaryComponentExecutor struct {
 }
 
 // ExecuteComponent 执行二进制组件
-func (e *BinaryComponentExecutor) ExecuteComponent(ctx context.Context, node *ComponentNode, 
-    phaseCtx *phaseframe.PhaseContext, tmpl manifest.TemplateContext) error {
+func (e *BinaryComponentExecutor) ExecuteComponent(ctx context.Context, node *ComponentNode, execCtx *ExecutionContext) error {
     component := node.Component
     
     // 1. 获取 ComponentVersion
@@ -2372,18 +2496,21 @@ func (e *BinaryComponentExecutor) ExecuteComponent(ctx context.Context, node *Co
         return fmt.Errorf("component %s is not a binary component", component.Name)
     }
     
-    // 3. 获取需要操作的节点
-    nodes := e.getTargetNodes(phaseCtx, component)
+    // 3. 获取需要操作的节点 (通过 NodeProvider，不再依赖 phaseCtx)
+    nodes, err := execCtx.NodeProvider.GetNodes(ctx, execCtx.Cluster)
+    if err != nil {
+        return fmt.Errorf("failed to get nodes: %w", err)
+    }
     
-    // 4. 根据升级策略执行 (传递 TemplateContext)
+    // 4. 根据升级策略执行
     strategy := cv.Spec.UpgradeStrategy
     switch strategy.Mode {
     case "Rolling":
-        return e.executeRolling(ctx, nodes, cv, strategy, tmpl)
+        return e.executeRolling(ctx, nodes, cv, strategy, execCtx)
     case "Parallel":
-        return e.executeParallel(ctx, nodes, cv, strategy, tmpl)
+        return e.executeParallel(ctx, nodes, cv, strategy, execCtx)
     case "Batch":
-        return e.executeBatch(ctx, nodes, cv, strategy, tmpl)
+        return e.executeBatch(ctx, nodes, cv, strategy, execCtx)
     }
     
     return nil
@@ -2391,7 +2518,7 @@ func (e *BinaryComponentExecutor) ExecuteComponent(ctx context.Context, node *Co
 
 // executeRolling 滚动执行 (逐节点)
 func (e *BinaryComponentExecutor) executeRolling(ctx context.Context, nodes []Node, 
-    cv *ComponentVersion, strategy UpgradeStrategySpec, baseTmpl manifest.TemplateContext) error {
+    cv *ComponentVersion, strategy UpgradeStrategySpec, execCtx *ExecutionContext) error {
     for _, node := range nodes {
         select {
         case <-ctx.Done():
@@ -2400,13 +2527,13 @@ func (e *BinaryComponentExecutor) executeRolling(ctx context.Context, nodes []No
         }
         
         // 为每个节点扩展 TemplateContext
-        nodeTmpl := baseTmpl  // 复制基础 TemplateContext
+        nodeTmpl := execCtx.TemplateContext  // 复制基础 TemplateContext
         nodeTmpl.NodeIP = node.IP
         nodeTmpl.NodeHostname = node.Hostname
         nodeTmpl.NodeRole = node.Role
-        nodeTmpl.NodeArch = node.Spec.Architecture
-        nodeTmpl.NodeOS = node.Spec.OperatingSystem
-        nodeTmpl.NodeOSVersion = node.Spec.OperatingSystemVersion
+        nodeTmpl.NodeArch = node.Arch
+        nodeTmpl.NodeOS = node.OS
+        nodeTmpl.NodeOSVersion = node.OSVersion
         nodeTmpl.ComponentVersion = cv.Spec.Version
         
         opts := binaryinstaller.InstallOptions{
@@ -2422,7 +2549,7 @@ func (e *BinaryComponentExecutor) executeRolling(ctx context.Context, nodes []No
             case "FailFast":
                 return err
             case "Continue":
-                log.Warn("node %s upgrade failed, continuing: %v", node.IP, err)
+                execCtx.Log.Warn("node %s upgrade failed, continuing: %v", node.IP, err)
                 continue
             case "Rollback":
                 if rbErr := e.rollback(node, cv); rbErr != nil {
@@ -2442,9 +2569,8 @@ type HelmComponentExecutor struct {
     store     *manifest.Store
 }
 
-// ExecuteComponent 执行 Helm 组件 (接收 TemplateContext)
-func (e *HelmComponentExecutor) ExecuteComponent(ctx context.Context, node *ComponentNode, 
-    phaseCtx *phaseframe.PhaseContext, tmpl manifest.TemplateContext) error {
+// ExecuteComponent 执行 Helm 组件
+func (e *HelmComponentExecutor) ExecuteComponent(ctx context.Context, node *ComponentNode, execCtx *ExecutionContext) error {
     component := node.Component
     
     // 1. 获取 ComponentVersion
@@ -2458,33 +2584,76 @@ func (e *HelmComponentExecutor) ExecuteComponent(ctx context.Context, node *Comp
         return fmt.Errorf("component %s is not a helm component", component.Name)
     }
     
-    // 3. 确定操作类型
+    // 3. 确定操作类型 (从 execCtx 获取，不再依赖 phaseCtx)
     action := helminstaller.HelmActionInstall
-    if phaseCtx.IsUpgrade {
+    if execCtx.IsUpgrade {
         action = helminstaller.HelmActionUpgrade
     }
     
     // 4. 填充 TemplateContext 的版本信息
+    tmpl := execCtx.TemplateContext
     tmpl.ComponentVersion = cv.Spec.Version
     
-    // 5. 执行 Helm 操作 (传递 TemplateContext)
+    // 5. 执行 Helm 操作
     opts := helminstaller.InstallOptions{
         Component:   cv,
-        TemplateCtx: tmpl,  // 传递 TemplateContext
+        TemplateCtx: tmpl,
         Action:      action,
         Timeout:     cv.Spec.UpgradeStrategy.Timeout,
     }
     
     return e.installer.Install(ctx, opts)
 }
+
+// ManifestComponentExecutor YAML/Manifest 组件执行器
+type ManifestComponentExecutor struct {
+    applier *manifest.Applier
+    store   *manifest.Store
+}
+
+// ExecuteComponent 执行 YAML/Manifest 组件
+func (e *ManifestComponentExecutor) ExecuteComponent(ctx context.Context, node *ComponentNode, execCtx *ExecutionContext) error {
+    component := node.Component
+    
+    // 1. 获取 ComponentVersion
+    cv, err := e.store.GetComponentVersion(component.Name, component.Version)
+    if err != nil {
+        return fmt.Errorf("failed to get component version: %w", err)
+    }
+    
+    // 2. 确认是 YAML 类型
+    if cv.Spec.Type != configv1alpha1.ComponentTypeYAML {
+        return fmt.Errorf("component %s is not a yaml component", component.Name)
+    }
+    
+    // 3. 构建 ComponentPackage
+    pkg := &manifest.ComponentPackage{
+        Name:      component.Name,
+        Version:   component.Version,
+        Resources: cv.Spec.Resources,
+    }
+    
+    // 4. 应用 Manifest
+    return e.applier.ApplyComponent(ctx, pkg)
+}
 ```
 
-**设计说明**：所有 ComponentExecutor 的 ExecuteComponent 方法都接收 `manifest.TemplateContext` 参数：
-- **YAML/Manifest 组件**：使用基础字段 (ClusterName, Namespace, KubernetesVersion)
-- **Helm 组件**：使用基础字段 + 扩展字段 (APIServer, ServiceCIDR 等)
-- **Binary 组件**：使用所有字段，包括节点信息、制品信息、自定义变量
+#### 8.3.4 依赖关系对比
 
-这样 DAG 调度器只需构建一次 TemplateContext，所有组件类型共享使用。
+| 维度 | 修改前 | 修改后 |
+|------|--------|--------|
+| **接口依赖** | `phaseframe.PhaseContext` | `dagexec.ExecutionContext` |
+| **节点获取** | `phaseCtx.NodeFetcher()` | `execCtx.NodeProvider.GetNodes()` |
+| **集群信息** | `phaseCtx.BKECluster` | `execCtx.Cluster` |
+| **日志记录** | `phaseCtx.Log` | `execCtx.Log` |
+| **操作类型** | `phaseCtx.IsUpgrade` | `execCtx.IsUpgrade` |
+| **包依赖** | `pkg/dagexec` → `pkg/phaseframe` | `pkg/dagexec` 独立，无 phaseframe 依赖 |
+
+**设计说明**：
+- **ExecutionContext**：完全独立于 phaseframe，仅包含组件执行所需的最小上下文
+- **NodeProvider**：通过接口抽象节点获取逻辑，便于测试和扩展
+- **TemplateContext**：复用 `manifest.TemplateContext`，所有组件类型共享使用
+- **解耦收益**：`pkg/dagexec` 包可独立编译和测试，不依赖 phaseframe
 
 ---
 
