@@ -3279,20 +3279,29 @@ var defaultFeatureGates = map[string]bool{
 |------|---------|---------|------|
 | **BinaryInstaller 核心实现** | 5 人日 | 中 | 无 |
 | **HelmInstaller 核心实现** | 5 人日 | 中 | 无 |
+| **YAMLManifestExecutor 核心实现** | 5 人日 | 中 | 无 |
 | **TemplateRenderer 实现** | 3 人日 | 低 | 无 |
 | **ConfigRenderer 实现** | 3 人日 | 低 | TemplateRenderer |
-| **ComponentVersion CRD 扩展** | 2 人日 | 低 | 无 |
+| **ApplyStrategy 引擎实现** | 3 人日 | 中 | YAMLManifestExecutor |
+| **Prune 裁剪功能实现** | 3 人日 | 中 | ApplyStrategy 引擎 |
+| **PreInstallHooks 执行引擎** | 3 人日 | 中 | HelmInstaller |
+| **ComponentVersion CRD 扩展** | 3 人日 | 低 | 无 |
+| **VersionContext 与 ExecutionContext 实现** | 3 人日 | 中 | 无 |
 | **BinaryComponentExecutor 集成** | 3 人日 | 中 | BinaryInstaller |
 | **HelmComponentExecutor 集成** | 3 人日 | 中 | HelmInstaller |
+| **YAMLManifestExecutor 集成** | 2 人日 | 中 | YAMLManifestExecutor |
 | **ComponentVersion YAML 编写** | 2 人日 | 低 | CRD 扩展 |
-| **DAG 调度器适配** | 2 人日 | 低 | Executor 集成 |
+| **DAG 调度器适配** | 3 人日 | 低 | Executor 集成 |
 | **Feature Gate 实现** | 1 人日 | 低 | 无 |
-| **单元测试** | 5 人日 | 低 | 核心实现完成 |
-| **集成测试** | 3 人日 | 中 | 单元测试完成 |
-| **E2E 测试** | 3 人日 | 中 | 集成测试完成 |
-| **文档编写** | 2 人日 | 低 | 无 |
-| **代码审查与修复** | 3 人日 | 中 | 测试完成 |
-| **总计** | **45 人日** | | |
+| **兼容层实现** | 3 人日 | 中 | DAG 调度器适配 |
+| **错误分类与恢复机制** | 3 人日 | 中 | 核心实现完成 |
+| **单元测试** | 8 人日 | 低 | 核心实现完成 |
+| **集成测试** | 5 人日 | 中 | 单元测试完成 |
+| **E2E 测试** | 5 人日 | 中 | 集成测试完成 |
+| **迁移验证** | 3 人日 | 中 | 兼容层实现 |
+| **文档编写** | 4 人日 | 低 | 无 |
+| **代码审查与修复** | 4 人日 | 中 | 测试完成 |
+| **总计** | **88 人日 (约 4 人月)** | | |
 
 ### 14.2 Sprint 计划
 
