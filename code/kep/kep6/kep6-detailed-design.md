@@ -2685,8 +2685,9 @@ func (e *ManifestComponentExecutor) ExecuteComponent(ctx context.Context, node *
 **关键设计点**：
 - **声明式安装**：通过 ReleaseImage 声明需要安装的组件列表
 - **DAG 调度**：根据组件依赖关系构建 DAG，按拓扑顺序执行
-- **多类型支持**：Binary（containerd/bkeagent）、Helm（coredns/kube-proxy）、Inline（kubernetes）
+- **多类型支持**：Binary（containerd/bkeagent）、Helm（coredns/kube-proxy）、YAML（openfuyao-core）、Inline（kubernetes）
 - **健康检查**：安装完成后执行 PodReady/EndpointReady 检查
+- **YAML 清单应用**：YAML 类型组件通过 YAMLManifestExecutor 应用 Kubernetes 清单，支持 ServerSideApply/Replace/CreateOnly 三种策略
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -2714,11 +2715,12 @@ func (e *ManifestComponentExecutor) ExecuteComponent(ctx context.Context, node *
                                          │
                                          ▼
                     ┌──────────────────────────────────────┐
-                    │  install.components:                 │
-                    │  ├── containerd/v1.7.18 (binary)     │
-                    │  ├── bkeagent/v2.6.0 (binary)        │
-                    │  ├── coredns/v1.11.1 (helm)          │
-                    │  └── kubernetes/v1.29.0 (composite)  │
+                     │  install.components:                 │
+                     │  ├── containerd/v1.7.18 (binary)     │
+                     │  ├── bkeagent/v2.6.0 (binary)        │
+                     │  ├── coredns/v1.11.1 (helm)          │
+                     │  ├── openfuyao-core/v26.03 (yaml)    │
+                     │  └── kubernetes/v1.29.0 (composite)  │
                     └────────────────────┬─────────────────┘
                                          │
                                          ▼
@@ -2735,17 +2737,19 @@ func (e *ManifestComponentExecutor) ExecuteComponent(ctx context.Context, node *
                                          │
                                          ▼
                     ┌──────────────────────────────────────┐
-                    │  DAG 结构:                           │
-                    │  finalizer → ... → dryrun            │
-                    │                   → agent (binary)   │
-                    │                   → containerd       │
-                    │                   → apiobj → certs   │
-                    │                   → master_init      │
-                    │                   → master_join      │
-                    │                   → worker_join      │
-                    │                   → coredns (helm)   │
-                    │                   → addon            │
-                    │                   → postprocess      │
+                     │  DAG 结构:                           │
+                     │  finalizer → ... → dryrun            │
+                     │                   → agent (binary)   │
+                     │                   → containerd       │
+                     │                   → apiobj → certs   │
+                     │                   → master_init      │
+                     │                   → master_join      │
+                     │                   → worker_join      │
+                     │                   → coredns (helm)   │
+                     │                   → openfuyao-core   │
+                     │                     (yaml)           │
+                     │                   → addon            │
+                     │                   → postprocess      │
                     └────────────────────┬─────────────────┘
                                          │
                                          ▼
@@ -2798,17 +2802,34 @@ func (e *ManifestComponentExecutor) ExecuteComponent(ctx context.Context, node *
                     │                    │                    │
                     ▼                    ▼                    ▼
           ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
-          │  拉取 Chart     │  │  渲染 Values    │  │  Helm Install   │
-          │  OCI Registry   │  │  模板变量       │  │  --atomic       │
-          └────────┬────────┘  └────────┬────────┘  └────────┬────────┘
-                   │                    │                    │
-                   └────────────────────┼────────────────────┘
-                                        │
-                                        ▼
-                    ┌──────────────────────────────────────┐
-                    │  8. 健康检查                         │
-                    │  PodReady + EndpointReady            │
-                    └────────────────────┬─────────────────┘
+           │  拉取 Chart     │  │  渲染 Values    │  │  Helm Install   │
+           │  OCI Registry   │  │  模板变量       │  │  --atomic       │
+           └────────┬────────┘  └────────┬────────┘  └────────┬────────┘
+                    │                    │                    │
+                    └────────────────────┼────────────────────┘
+                                         │
+                                         ▼
+                     ┌──────────────────────────────────────┐
+                     │  8. YAMLManifestExecutor             │
+                     │  执行 openfuyao-core 安装            │
+                     └────────────────────┬─────────────────┘
+                                          │
+                     ┌────────────────────┼────────────────────┐
+                     │                    │                    │
+                     ▼                    ▼                    ▼
+           ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
+           │  获取清单       │  │  解析多文档     │  │  按策略应用     │
+           │  ManifestStore  │  │  YAML Parser    │  │  ServerSideApply│
+           │  或 URL 下载    │  │  → Unstructured │  │  → K8s Applier  │
+           └────────┬────────┘  └────────┬────────┘  └────────┬────────┘
+                    │                    │                    │
+                    └────────────────────┼────────────────────┘
+                                         │
+                                         ▼
+                     ┌──────────────────────────────────────┐
+                     │  9. 健康检查                         │
+                     │  PodReady + EndpointReady            │
+                     └────────────────────┬─────────────────┘
                                          │
                               ┌──────────┴──────────┐
                               │                     │
@@ -2835,6 +2856,7 @@ func (e *ManifestComponentExecutor) ExecuteComponent(ctx context.Context, node *
 - **滚动升级**：Binary 组件逐节点升级，确保服务不中断
 - **原子升级**：Helm 组件使用 `--atomic` 标志，失败自动回滚
 - **失败策略**：支持 FailFast/Continue/Rollback 三种策略
+- **YAML 清单升级**：YAML 类型组件通过 ServerSideApply 增量更新，支持 Prune 裁剪不再需要的资源
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -2874,10 +2896,11 @@ func (e *ManifestComponentExecutor) ExecuteComponent(ctx context.Context, node *
                                          │
                                          ▼
                     ┌──────────────────────────────────────┐
-                    │  需要升级的组件:                     │
-                    │  ├── containerd: v1.7.15 → v1.7.18   │
-                    │  ├── bkeagent: v2.5.0 → v2.6.0       │
-                    │  └── coredns: v1.10.1 → v1.11.1      │
+                     │  需要升级的组件:                     │
+                     │  ├── containerd: v1.7.15 → v1.7.18   │
+                     │  ├── bkeagent: v2.5.0 → v2.6.0       │
+                     │  ├── coredns: v1.10.1 → v1.11.1      │
+                     │  └── openfuyao-core: v26.01 → v26.03 │
                     └────────────────────┬─────────────────┘
                                          │
                                          ▼
@@ -2888,14 +2911,15 @@ func (e *ManifestComponentExecutor) ExecuteComponent(ctx context.Context, node *
                                          │
                                          ▼
                     ┌──────────────────────────────────────┐
-                    │  DAG 结构:                           │
-                    │  provider → agent (binary)           │
-                    │            → containerd (binary)     │
-                    │            → coredns (helm)          │
-                    │            → etcd (inline)           │
-                    │            → worker (inline)         │
-                    │            → master (inline)         │
-                    │            → component → cluster     │
+                     │  DAG 结构:                           │
+                     │  provider → agent (binary)           │
+                     │            → containerd (binary)     │
+                     │            → coredns (helm)          │
+                     │            → openfuyao-core (yaml)   │
+                     │            → etcd (inline)           │
+                     │            → worker (inline)         │
+                     │            → master (inline)         │
+                     │            → component → cluster     │
                     └────────────────────┬─────────────────┘
                                          │
                                          ▼
@@ -2917,21 +2941,28 @@ func (e *ManifestComponentExecutor) ExecuteComponent(ctx context.Context, node *
                                         │
                                         ▼
                     ┌──────────────────────────────────────┐
-                    │  Batch 4: coredns (helm)             │
-                    │  helm upgrade --atomic               │
-                    └────────────────────┬─────────────────┘
-                                         │
-                                         ▼
-                    ┌──────────────────────────────────────┐
-                    │  Batch 5: etcd → worker → master     │
-                    │  (inline Phase 执行)                 │
-                    └────────────────────┬─────────────────┘
-                                         │
-                                         ▼
-                    ┌──────────────────────────────────────┐
-                    │  Batch 6: component → cluster        │
-                    │  最终健康检查                        │
-                    └────────────────────┬─────────────────┘
+                     │  Batch 4: coredns (helm)             │
+                     │  helm upgrade --atomic               │
+                     └────────────────────┬─────────────────┘
+                                          │
+                                          ▼
+                     ┌──────────────────────────────────────┐
+                     │  Batch 5: openfuyao-core (yaml)      │
+                     │  ServerSideApply 增量更新             │
+                     │  + Prune 裁剪废弃资源                 │
+                     └────────────────────┬─────────────────┘
+                                          │
+                                          ▼
+                     ┌──────────────────────────────────────┐
+                     │  Batch 6: etcd → worker → master     │
+                     │  (inline Phase 执行)                 │
+                     └────────────────────┬─────────────────┘
+                                          │
+                                          ▼
+                     ┌──────────────────────────────────────┐
+                     │  Batch 7: component → cluster        │
+                     │  最终健康检查                        │
+                     └────────────────────┬─────────────────┘
                                          │
                               ┌──────────┴──────────┐
                               │                     │
