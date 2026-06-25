@@ -2801,7 +2801,7 @@ func (e *ManifestComponentExecutor) ExecuteComponent(ctx context.Context, node *
 
 ### 9.1 安装流程图
 
-**设计思路**：完整安装流程从用户创建 BKECluster 开始，经过 ReleaseImage 解析、ComponentVersion 加载、DAG 构建、DAG 执行，最终完成所有组件的安装。流程中 Binary/Helm/Inline 三种类型的组件通过各自的 Executor 并行执行，最终通过健康检查确认安装成功。
+**设计思路**：完整安装流程从用户创建 BKECluster 开始，经过 ReleaseImage 解析、ComponentVersion 加载、DAG 构建、DAG 执行，最终完成所有组件的安装。流程中 Binary/Helm/YAML/Inline 四种类型的组件通过各自的 Executor 并行执行——Binary 组件通过 SSH 在远程节点安装二进制制品，Helm 组件通过 Helm SDK 部署 Chart，YAML 组件通过 YAMLManifestExecutor 将 Kubernetes 清单直接应用到目标集群，Inline 组件通过内联执行器完成 Kubernetes 集群初始化。所有组件安装完成后通过健康检查确认安装成功。
 
 **关键设计点**：
 - **声明式安装**：通过 ReleaseImage 声明需要安装的组件列表
