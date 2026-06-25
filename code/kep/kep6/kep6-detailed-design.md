@@ -2357,12 +2357,79 @@ func (r *ConfigRenderer) renderConfigTemplates(templates []ConfigTemplateSpec, t
 
 ### 8.3 核心接口定义
 
-**设计思路**：DAG 调度器在执行组件时传递 `ExecutionContext`，该上下文完全独立于 phaseframe 包，包含集群信息、节点提供者、日志记录器等。通过 `NodeProvider` 接口抽象节点获取逻辑，实现与 phaseframe 的完全解耦。
+**设计思路 - 接口分层与解耦**：
 
-**解耦设计**：
-- **ExecutionContext**：替代 `phaseframe.PhaseContext`，独立定义组件执行所需上下文
-- **NodeProvider**：抽象节点获取逻辑，替代 `phaseCtx.NodeFetcher()`
-- **TemplateContext**：复用 `manifest.TemplateContext`，统一模板渲染
+当前 `pkg/dagexec` 包依赖 `pkg/phaseframe` 包，导致 DAG 调度器无法独立编译和测试。本节通过三层接口设计实现完全解耦：
+
+1. **上下文层（ExecutionContext）**：替代 `phaseframe.PhaseContext`，携带组件执行所需的全部上下文信息（集群、节点、版本、模板）。Executor 仅依赖此接口，不直接依赖 phaseframe。
+2. **数据源层（NodeProvider）**：抽象节点获取逻辑，Executor 通过此接口获取目标节点列表，而非直接调用 `phaseCtx.NodeFetcher()`。便于测试时注入 Mock 节点。
+3. **执行层（ComponentExecutor）**：统一组件执行器接口，Binary/Helm/YAML/Inline 四种执行器各自实现。Scheduler 通过此接口多态分发，不关心具体实现类型。
+
+**接口间关系**：
+
+- `Scheduler` 负责创建 `ExecutionContext`（内含 `VersionContext` + `NodeProvider` + `Cluster` + `TemplateContext`）
+- `Scheduler` 根据 `ComponentNode.ComponentType()` 选择对应的 `ComponentExecutor`
+- `ComponentExecutor` 从 `ExecutionContext` 获取上下文信息，**自主决定**操作类型（Install/Upgrade/Skip），而非由调用方下达指令
+- `VersionContext` 提供版本事实，`NodeProvider` 提供节点事实，`ComponentExecutor` 基于事实做决策——这是声明式协调模式的核心
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                           核心接口架构                                            │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────┐
+  │  Scheduler   │
+  │  (调度入口)  │
+  └──────┬───────┘
+         │
+         │ 创建
+         ▼
+  ┌──────────────────────────────────────────────────────────┐
+  │                    ExecutionContext                       │
+  │                                                          │
+  │  ┌─────────────────┐  ┌──────────────┐  ┌────────────┐  │
+  │  │ VersionContext  │  │ NodeProvider │  │  Cluster   │  │
+  │  │ (版本事实)      │  │ (节点获取)   │  │ (集群信息) │  │
+  │  │                 │  │              │  │            │  │
+  │  │ HasCurrent()    │  │ GetNodes()   │  │            │  │
+  │  │ HasTarget()     │  │ GetNodesBy   │  │            │  │
+  │  │ NeedsUpgrade()  │  │   Role()     │  │            │  │
+  │  └─────────────────┘  └──────────────┘  └────────────┘  │
+  │                                                          │
+  │  ┌────────────────────────────────────────────────────┐  │
+  │  │              TemplateContext                        │  │
+  │  │              (模板渲染上下文)                       │  │
+  │  └────────────────────────────────────────────────────┘  │
+  └──────────────────────────────────────────────────────────┘
+         │
+         │ 传递 ExecutionContext
+         ▼
+  ┌──────────────────────────────────────────────────────────┐
+  │              ComponentExecutor (统一接口)                 │
+  │                                                          │
+  │  ExecuteComponent(ctx, node, execCtx) error              │
+  │  GetComponentType() ComponentType                        │
+  └──────────────────────────┬───────────────────────────────┘
+                             │
+            ┌────────────────┼────────────────┬──────────────┐
+            │                │                │              │
+            ▼                ▼                ▼              ▼
+  ┌──────────────┐  ┌──────────────┐  ┌────────────┐  ┌────────────┐
+  │   Binary     │  │    Helm      │  │    YAML    │  │   Inline   │
+  │ Component    │  │ Component    │  │ Manifest   │  │ Component  │
+  │ Executor     │  │ Executor     │  │ Executor   │  │ Executor   │
+  └──────┬───────┘  └──────┬───────┘  └─────┬──────┘  └─────┬──────┘
+         │                 │                │               │
+         ▼                 ▼                ▼               ▼
+  ┌──────────────┐  ┌──────────────┐  ┌────────────┐  ┌────────────┐
+  │ 从 VC 决定   │  │ 从 VC 决定   │  │ 从 VC 决定 │  │ 从 VC 决定 │
+  │ Install或    │  │ Install或    │  │ 是否 Skip  │  │ Install或  │
+  │ Upgrade      │  │ Upgrade      │  │            │  │ Upgrade    │
+  └──────────────┘  └──────────────┘  └────────────┘  └────────────┘
+
+  数据流: Scheduler → ExecutionContext → ComponentExecutor → Installer
+  控制流: ComponentExecutor 根据 VersionContext 自主决定操作类型
+```
 
 #### 8.3.1 ExecutionContext 定义
 
