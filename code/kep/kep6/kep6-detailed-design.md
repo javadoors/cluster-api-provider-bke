@@ -2370,20 +2370,93 @@ func (r *ConfigRenderer) renderConfigTemplates(templates []ConfigTemplateSpec, t
 ```go
 // pkg/dagexec/context.go
 
+// VersionContext 携带组件版本事实，Executor 据此自主决定操作类型
+//
+// 设计思路 - 为什么用 VersionContext 而非 IsUpgrade bool 或 OperationType 枚举：
+// 1. 声明式协调：Kubernetes 控制器应基于"当前状态 vs 期望状态"自主决定操作，
+//    而非由调用方显式下达操作指令。VersionContext 提供版本事实（已安装版本、目标版本），
+//    Executor 根据 HasCurrent/HasTarget/NeedsUpgrade 自主推断 Install/Upgrade/Skip。
+// 2. 避免概念重复：BinaryAction (Install/Upgrade/Uninstall) 和 HelmAction (Install/Upgrade/
+//    Rollback) 已在各自 Executor 中定义。ExecutionContext 中再放 OperationType 枚举会造成
+//    两套枚举需要映射，增加维护负担。
+// 3. 扩展性：后续支持 Rollback 时，只需在 VersionContext 中新增版本历史记录
+//    (previousVersions map)，Executor 即可推断 Rollback 操作，无需修改 ExecutionContext 接口。
+// 4. 与实际代码一致：当前 PhaseContext 已使用 VersionContext 进行版本判断，
+//    设计文档与实现保持一致。
+type VersionContext struct {
+    // currentVersions 组件已安装版本映射 (componentName → currentVersion)
+    // 空表示组件未安装
+    currentVersions map[string]string
+
+    // targetVersions 组件目标版本映射 (componentName → targetVersion)
+    // 空表示组件无升级目标
+    targetVersions map[string]string
+}
+
+// HasCurrent 组件是否已安装
+func (vc *VersionContext) HasCurrent(name string) bool {
+    return vc != nil && vc.currentVersions != nil
+    _, ok := vc.currentVersions[name]
+    return ok
+}
+
+// HasTarget 组件是否有升级目标
+func (vc *VersionContext) HasTarget(name string) bool {
+    if vc == nil || vc.targetVersions == nil {
+        return false
+    }
+    _, ok := vc.targetVersions[name]
+    return ok
+}
+
+// NeedsUpgrade 组件是否需要升级 (已安装且目标版本不同于当前版本)
+func (vc *VersionContext) NeedsUpgrade(name string) bool {
+    if vc == nil {
+        return true
+    }
+    current, hasCurrent := vc.currentVersions[name]
+    target, hasTarget := vc.targetVersions[name]
+    if !hasTarget {
+        return true // 无目标版本，默认需要执行
+    }
+    if !hasCurrent {
+        return true // 未安装，需要安装
+    }
+    return current != target // 版本不同，需要升级
+}
+
+// CurrentVersion 获取组件当前已安装版本
+func (vc *VersionContext) CurrentVersion(name string) (string, bool) {
+    if vc == nil || vc.currentVersions == nil {
+        return "", false
+    }
+    v, ok := vc.currentVersions[name]
+    return v, ok
+}
+
+// TargetVersion 获取组件目标版本
+func (vc *VersionContext) TargetVersion(name string) (string, bool) {
+    if vc == nil || vc.targetVersions == nil {
+        return "", false
+    }
+    v, ok := vc.targetVersions[name]
+    return v, ok
+}
+
 // ExecutionContext 组件执行上下文 (完全独立于 phaseframe)
 type ExecutionContext struct {
     // 集群信息
     Cluster *bkev1beta1.BKECluster
-    
+
     // 节点提供者 (抽象接口，不依赖 phaseframe)
     NodeProvider NodeProvider
-    
+
     // 日志记录器
     Log *bkev1beta1.BKELogger
-    
-    // 操作类型
-    IsUpgrade bool
-    
+
+    // 版本上下文 (替代 IsUpgrade bool，携带版本事实供 Executor 自主决定操作)
+    VersionContext *VersionContext
+
     // 模板上下文 (复用 manifest.TemplateContext)
     TemplateContext manifest.TemplateContext
 }
@@ -2393,13 +2466,13 @@ func NewExecutionContext(
     cluster *bkev1beta1.BKECluster,
     nodeProvider NodeProvider,
     log *bkev1beta1.BKELogger,
-    isUpgrade bool,
+    versionContext *VersionContext,
 ) *ExecutionContext {
     return &ExecutionContext{
-        Cluster:      cluster,
-        NodeProvider: nodeProvider,
-        Log:          log,
-        IsUpgrade:    isUpgrade,
+        Cluster:        cluster,
+        NodeProvider:   nodeProvider,
+        Log:            log,
+        VersionContext: versionContext,
     }
 }
 ```
@@ -2523,7 +2596,14 @@ func (e *BinaryComponentExecutor) ExecuteComponent(ctx context.Context, node *Co
         return fmt.Errorf("failed to get nodes: %w", err)
     }
     
-    // 4. 根据升级策略执行
+    // 4. 根据 VersionContext 判断操作类型
+    vc := execCtx.VersionContext
+    if vc != nil && !vc.NeedsUpgrade(component.Name) {
+        execCtx.Log.Info("component %s already at target version, skipping", component.Name)
+        return nil
+    }
+    
+    // 5. 根据升级策略执行
     strategy := cv.Spec.UpgradeStrategy
     switch strategy.Mode {
     case "Rolling":
@@ -2555,10 +2635,16 @@ func (e *BinaryComponentExecutor) executeRolling(ctx context.Context, nodes []No
         nodeTmpl.NodeRole = node.Role
         nodeTmpl.ComponentVersion = cv.Spec.Version
         
+        // 根据 VersionContext 自主决定操作类型
+        action := binaryinstaller.BinaryActionInstall
+        if execCtx.VersionContext != nil && execCtx.VersionContext.HasCurrent(component.Name) {
+            action = binaryinstaller.BinaryActionUpgrade // 已安装 → 升级
+        }
+        
         opts := binaryinstaller.InstallOptions{
             Component:   cv,
             TemplateCtx: nodeTmpl,  // 传递扩展后的 TemplateContext
-            Action:      binaryinstaller.BinaryActionUpgrade,
+            Action:      action,
             Timeout:     strategy.Timeout,
             RetryCount:  3,
         }
@@ -2603,10 +2689,16 @@ func (e *HelmComponentExecutor) ExecuteComponent(ctx context.Context, node *Comp
         return fmt.Errorf("component %s is not a helm component", component.Name)
     }
     
-    // 3. 确定操作类型 (从 execCtx 获取，不再依赖 phaseCtx)
+    // 3. 根据 VersionContext 判断操作类型 (Executor 自主决定，不再依赖 IsUpgrade)
+    vc := execCtx.VersionContext
+    if vc != nil && !vc.NeedsUpgrade(component.Name) {
+        execCtx.Log.Info("component %s already at target version, skipping", component.Name)
+        return nil
+    }
+    
     action := helminstaller.HelmActionInstall
-    if execCtx.IsUpgrade {
-        action = helminstaller.HelmActionUpgrade
+    if vc != nil && vc.HasCurrent(component.Name) {
+        action = helminstaller.HelmActionUpgrade // 已安装 → 升级
     }
     
     // 4. 填充 TemplateContext 的版本信息
@@ -2645,14 +2737,21 @@ func (e *ManifestComponentExecutor) ExecuteComponent(ctx context.Context, node *
         return fmt.Errorf("component %s is not a yaml component", component.Name)
     }
     
-    // 3. 构建 ComponentPackage
+    // 3. 根据 VersionContext 判断是否需要执行 (幂等性检查)
+    vc := execCtx.VersionContext
+    if vc != nil && !vc.NeedsUpgrade(component.Name) {
+        execCtx.Log.Info("component %s already at target version, skipping", component.Name)
+        return nil
+    }
+    
+    // 4. 构建 ComponentPackage
     pkg := &manifest.ComponentPackage{
         Name:      component.Name,
         Version:   component.Version,
         Resources: cv.Spec.Resources,
     }
     
-    // 4. 应用 Manifest
+    // 5. 应用 Manifest
     return e.applier.ApplyComponent(ctx, pkg)
 }
 ```
@@ -2665,12 +2764,13 @@ func (e *ManifestComponentExecutor) ExecuteComponent(ctx context.Context, node *
 | **节点获取** | `phaseCtx.NodeFetcher()` | `execCtx.NodeProvider.GetNodes()` |
 | **集群信息** | `phaseCtx.BKECluster` | `execCtx.Cluster` |
 | **日志记录** | `phaseCtx.Log` | `execCtx.Log` |
-| **操作类型** | `phaseCtx.IsUpgrade` | `execCtx.IsUpgrade` |
+| **操作类型** | `phaseCtx.IsUpgrade` | `execCtx.VersionContext` (携带版本事实，Executor 自主决定操作) |
 | **包依赖** | `pkg/dagexec` → `pkg/phaseframe` | `pkg/dagexec` 独立，无 phaseframe 依赖 |
 
 **设计说明**：
 - **ExecutionContext**：完全独立于 phaseframe，仅包含组件执行所需的最小上下文
 - **NodeProvider**：通过接口抽象节点获取逻辑，便于测试和扩展
+- **VersionContext**：携带版本事实（已安装版本、目标版本），Executor 据此自主决定操作类型（Install/Upgrade/Skip），替代原有的 `IsUpgrade bool`，符合 Kubernetes 声明式协调模式
 - **TemplateContext**：复用 `manifest.TemplateContext`，所有组件类型共享使用
 - **解耦收益**：`pkg/dagexec` 包可独立编译和测试，不依赖 phaseframe
 
