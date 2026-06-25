@@ -2836,12 +2836,15 @@ func (e *ManifestComponentExecutor) ExecuteComponent(ctx context.Context, node *
                                          │
                                          ▼
                     ┌──────────────────────────────────────┐
-                     │  install.components:                 │
-                     │  ├── containerd/v1.7.18 (binary)     │
-                     │  ├── bkeagent/v2.6.0 (binary)        │
-                     │  ├── coredns/v1.11.1 (helm)          │
-                     │  ├── openfuyao-core/v26.03 (yaml)    │
-                     │  └── kubernetes/v1.29.0 (composite)  │
+                      │  install.components:                 │
+                      │  ├── containerd/v1.7.18 (binary)     │
+                      │  ├── bkeagent/v2.6.0 (binary)        │
+                      │  ├── coredns/v1.11.1 (helm)          │
+                      │  ├── openfuyao-core/v26.03 (yaml)    │
+                      │  ├── kubernetes-master/v1.29.0       │
+                      │  │                   (inline)        │
+                      │  └── kubernetes-worker/v1.29.0       │
+                      │                      (inline)        │
                     └────────────────────┬─────────────────┘
                                          │
                                          ▼
@@ -2858,19 +2861,19 @@ func (e *ManifestComponentExecutor) ExecuteComponent(ctx context.Context, node *
                                          │
                                          ▼
                     ┌──────────────────────────────────────┐
-                     │  DAG 结构:                           │
-                     │  finalizer → ... → dryrun            │
-                     │                   → agent (binary)   │
-                     │                   → containerd       │
-                     │                   → apiobj → certs   │
-                     │                   → master_init      │
-                     │                   → master_join      │
-                     │                   → worker_join      │
-                     │                   → coredns (helm)   │
-                     │                   → openfuyao-core   │
-                     │                     (yaml)           │
-                     │                   → addon            │
-                     │                   → postprocess      │
+                      │  DAG 结构:                           │
+                      │  finalizer → ... → dryrun            │
+                      │                   → agent (binary)   │
+                      │                   → containerd       │
+                      │                   → kubernetes-master │
+                      │                     (inline)         │
+                      │                   → kubernetes-worker │
+                      │                     (inline)         │
+                      │                   → coredns (helm)   │
+                      │                   → openfuyao-core   │
+                      │                     (yaml)           │
+                      │                   → addon            │
+                      │                   → postprocess      │
                     └────────────────────┬─────────────────┘
                                          │
                                          ▼
@@ -3032,15 +3035,17 @@ func (e *ManifestComponentExecutor) ExecuteComponent(ctx context.Context, node *
                                          │
                                          ▼
                     ┌──────────────────────────────────────┐
-                     │  DAG 结构:                           │
-                     │  provider → agent (binary)           │
-                     │            → containerd (binary)     │
-                     │            → coredns (helm)          │
-                     │            → openfuyao-core (yaml)   │
-                     │            → etcd (inline)           │
-                     │            → worker (inline)         │
-                     │            → master (inline)         │
-                     │            → component → cluster     │
+                      │  DAG 结构:                           │
+                      │  provider → agent (binary)           │
+                      │            → containerd (binary)     │
+                      │            → coredns (helm)          │
+                      │            → openfuyao-core (yaml)   │
+                      │            → etcd (inline)           │
+                      │            → kubernetes-worker       │
+                      │              (inline)                │
+                      │            → kubernetes-master       │
+                      │              (inline)                │
+                      │            → component → cluster     │
                     └────────────────────┬─────────────────┘
                                          │
                                          ▼
