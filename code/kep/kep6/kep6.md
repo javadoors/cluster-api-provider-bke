@@ -3,7 +3,7 @@
 | 字段 | 值 |
 |------|-----|
 | **KEP 编号** | KEP-6 |
-| **标题** | 基于 ReleaseImage 的 Binary/Helm 组件声明式管理：Containerd 与 BKEAgent 重构方案 |
+| **标题** | 基于 ReleaseImage 的 Binary/Helm/YAML 组件声明式管理方案 |
 | **状态** | `provisional` |
 | **类型** | Feature |
 | **作者** | openFuyao Team |
@@ -12,7 +12,7 @@
 
 ## 1. 摘要
 
-本提案将 Containerd 与 BKEAgent 组件从硬编码 Phase 重构为 ReleaseImage 中声明式的二进制组件 (`ComponentTypeBinary`)，同时新增 Helm 组件类型 (`ComponentTypeHelm`) 支持。方案引入 `BinaryInstaller` 和 `HelmInstaller` 两个统一安装器，配合 `configTemplates` 配置模板引擎和 `installScript` 模板变量系统，实现组件安装/升级的声明式管理。架构彻底解耦，新增二进制/Helm 组件只需添加 ComponentVersion YAML，核心代码零侵入。
+本提案将 Containerd 与 BKEAgent 组件从硬编码 Phase 重构为 ReleaseImage 中声明式的二进制组件 (`ComponentTypeBinary`)，同时新增 Helm 组件类型 (`ComponentTypeHelm`) 和 YAML 清单组件类型 (`ComponentTypeYAML`) 支持。方案引入 `BinaryInstaller`、`HelmInstaller` 和 `YAMLManifestExecutor` 三个统一安装器，配合 `configTemplates` 配置模板引擎和 `installScript` 模板变量系统，实现组件安装/升级的声明式管理。YAML 类型组件通过 `VersionContext` 携带版本事实，Executor 据此自主决定操作类型（Install/Upgrade/Skip），符合 Kubernetes 声明式协调模式。架构彻底解耦，新增二进制/Helm/YAML 组件只需添加 ComponentVersion YAML，核心代码零侵入。
 
 ## 2. 动机
 
@@ -31,10 +31,12 @@
 
 1. 实现 `ComponentTypeBinary` 类型组件的完整支持，包括制品下载、模板渲染、SSH 安装。
 2. 实现 `ComponentTypeHelm` 类型组件的完整支持，包括 OCI/HTTP/本地 Chart 获取、Values 渲染、健康检查。
-3. 设计 `configTemplates` 配置模板引擎，支持 Go template、Secret 引用、动态 kubeconfig 生成。
-4. 设计 `installScript` 模板变量系统，支持 8 类 50+ 变量和条件渲染。
-5. 将 Containerd/BKEAgent 从硬编码 Phase 迁移到 ReleaseImage 声明式管理。
-6. 提供平滑迁移方案，Feature Gate 控制，新旧双轨运行。
+3. 实现 `ComponentTypeYAML` 类型组件的完整支持，包括清单获取、多文档解析、ServerSideApply/Replace/CreateOnly 三种应用策略、Prune 裁剪。
+4. 设计 `configTemplates` 配置模板引擎，支持 Go template、Secret 引用、动态 kubeconfig 生成。
+5. 设计 `installScript` 模板变量系统，支持 8 类 50+ 变量和条件渲染。
+6. 引入 `VersionContext` 携带版本事实，Executor 据此自主决定操作类型，替代 `IsUpgrade bool`，符合 Kubernetes 声明式协调模式。
+7. 将 Containerd/BKEAgent 从硬编码 Phase 迁移到 ReleaseImage 声明式管理。
+8. 提供平滑迁移方案，Feature Gate 控制，新旧双轨运行。
 
 ### 2.3 非目标
 
@@ -49,12 +51,14 @@
 
 | 范围 | 说明 |
 |------|------|
-| CRD 扩展 | `ComponentVersion` 新增 `binary` 和 `helm` 类型的完整字段定义 |
+| CRD 扩展 | `ComponentVersion` 新增 `binary`、`helm`、`yaml` 类型的完整字段定义，以及 `SubComponents`、`Resources` 通用字段 |
 | BinaryInstaller | 二进制制品下载、缓存、模板渲染、SSH 安装、卸载 |
 | HelmInstaller | Chart 获取 (OCI/HTTP/本地)、Values 渲染、Install/Upgrade/Rollback/Uninstall |
+| YAMLManifestExecutor | YAML 清单获取、多文档解析、ServerSideApply/Replace/CreateOnly 应用策略、Prune 裁剪 |
 | configTemplates | Go template 渲染、Secret 引用、动态 kubeconfig 生成 |
 | installScript | 8 类 50+ 模板变量、条件渲染、自定义变量 |
-| DAG 集成 | BinaryComponentExecutor、HelmComponentExecutor 集成到 DAG 调度器 |
+| DAG 集成 | BinaryComponentExecutor、HelmComponentExecutor、YAMLManifestExecutor 集成到 DAG 调度器 |
+| VersionContext | 携带版本事实（已安装版本、目标版本），Executor 自主决定 Install/Upgrade/Skip |
 | Phase 迁移 | 移除 `EnsureContainerdUpgrade`、`EnsureBKEAgent`、`EnsureAgentUpgrade` 硬编码逻辑 |
 
 ### 3.2 约束
@@ -103,6 +107,12 @@
 │    ├── helm.chart.oci: registry/charts/coredns                          │
 │    ├── helm.values: (带模板变量)                                        │
 │    └── helm.healthCheck: PodReady + EndpointReady                       │
+│                                                                         │
+│  openfuyao-core/v26.03/component.yaml  ← type: yaml                     │
+│    ├── yaml.manifests: [crds.yaml, deployment.yaml]                     │
+│    ├── yaml.applyStrategy: ServerSideApply                              │
+│    ├── yaml.prune: true (按 label selector 裁剪废弃资源)                 │
+│    └── subComponents: [kubernetes-master, kubernetes-worker]            │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -288,6 +298,45 @@ spec:
     failurePolicy: FailFast
 ```
 
+### 4.3a ComponentVersion YAML 类型定义
+
+```yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: openfuyao-core-v26.03
+spec:
+  name: openfuyao-core
+  type: yaml
+  version: v26.03
+
+  yaml:
+    # YAML 清单文件列表
+    manifests:
+      - url: "https://release-repo.openfuyao.cn/manifests/openfuyao-core/v26.03/crds.yaml"
+        checksum: "sha256:mno345..."
+      - url: "https://release-repo.openfuyao.cn/manifests/openfuyao-core/v26.03/deployment.yaml"
+        checksum: "sha256:stu901..."
+
+    namespace: openfuyao-system
+    applyStrategy: ServerSideApply
+    prune: true
+    pruneLabelSelector:
+      app.kubernetes.io/managed-by: openfuyao-core
+
+  # 子组件引用 (组合关系: openfuyao-core 包含 kubernetes 和 etcd)
+  subComponents:
+    - name: kubernetes-master
+      version: v1.29.0
+    - name: kubernetes-worker
+      version: v1.29.0
+
+  upgradeStrategy:
+    mode: Parallel
+    failurePolicy: FailFast
+    timeout: "5m"
+```
+
 ### 4.4 核心组件设计
 
 #### 4.4.1 BinaryInstaller 架构
@@ -403,6 +452,41 @@ configTemplates 支持三种渲染模式:
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+#### 4.4.6 YAMLManifestExecutor 架构
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    YAMLManifestExecutor                           │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  ┌──────────────────┐    ┌──────────────────┐                   │
+│  │ManifestDownloader│    │  YAML Parser     │                   │
+│  │                  │    │                  │                   │
+│  │ • ManifestStore  │    │ • 多文档解析     │                   │
+│  │ • HTTP URL 下载  │    │ • GVK 识别       │                   │
+│  │ • Checksum 校验  │    │ • 资源分组       │                   │
+│  └────────┬─────────┘    └────────┬─────────┘                   │
+│           │                       │                              │
+│           ▼                       ▼                              │
+│  ┌──────────────────────────────────────────┐                   │
+│  │       ApplyStrategy Engine               │                   │
+│  │                                          │                   │
+│  │ • ServerSideApply (默认, 声明式字段管理) │                   │
+│  │ • Replace (删除+重建)                    │                   │
+│  │ • CreateOnly (仅创建)                    │                   │
+│  └──────────────────┬───────────────────────┘                   │
+│                     │                                          │
+│                     ▼                                          │
+│  ┌──────────────────────────────────────────┐                   │
+│  │            K8s Applier                    │                   │
+│  │                                          │                   │
+│  │ • 应用清单到目标集群                     │                   │
+│  │ • Prune 裁剪废弃资源 (按 label selector) │                   │
+│  └──────────────────────────────────────────┘                   │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
 ### 4.5 DAG 调度集成
 
 #### 4.5.1 执行器注册
@@ -414,10 +498,10 @@ case ComponentTypeBinary:
     executor = &BinaryComponentExecutor{installer: binaryInstaller}
 case ComponentTypeHelm:
     executor = &HelmComponentExecutor{installer: helmInstaller}
+case ComponentTypeYAML:
+    executor = &YAMLManifestExecutor{applier: manifestApplier, store: manifestStore}
 case ComponentTypeInline:
     executor = &InlineComponentExecutor{factory: componentFactory}
-case ComponentTypeYAML:
-    executor = &ManifestComponentExecutor{applier: manifestApplier}
 }
 ```
 
@@ -433,34 +517,49 @@ ClusterVersionReconciler 解析 ReleaseImage v2.6.0
   │     ├── containerd/v1.7.18 (type: binary)
   │     ├── bkeagent/v2.6.0 (type: binary)
   │     ├── coredns/v1.11.1 (type: helm)
-  │     └── kubernetes/v1.29.0 (type: composite)
+  │     ├── openfuyao-core/v26.03 (type: yaml)
+  │     ├── kubernetes-master/v1.29.0 (type: inline)
+  │     └── kubernetes-worker/v1.29.0 (type: inline)
+  │
+  ├── 构建 VersionContext (版本事实)
+  │     vc.SetTarget("containerd", "v1.7.18")  → HasCurrent=false → Action=Install
+  │     vc.SetTarget("coredns", "v1.11.1")     → HasCurrent=false → Action=Install
+  │     vc.SetTarget("openfuyao-core", "v26.03") → HasCurrent=false → Action=Install
   │
   ├── 构建安装 DAG
   │     ┌─────────────────────────────────────────────────┐
   │     │ finalizer → ... → dryrun                        │
   │     │                    → agent (binary)             │
   │     │                    → containerd (binary)        │
-  │     │                    → apiobj → certs → lb        │
-  │     │                    → master_init → master_join  │
-  │     │                    → worker_join                │
+  │     │                    → kubernetes-master (inline) │
+  │     │                    → kubernetes-worker (inline) │
   │     │                    → coredns (helm)             │
-  │     │                    → kube-proxy (helm)          │
+  │     │                    → openfuyao-core (yaml)      │
   │     │                    → addon → postprocess        │
   │     └─────────────────────────────────────────────────┘
   │
   ├── DAG Scheduler 执行 (按拓扑批次)
   │     │
   │     ├── BinaryComponentExecutor 执行 containerd
+  │     │     ├── VersionContext.HasCurrent("containerd")=false → Action=Install
   │     │     ├── ArtifactDownloader 下载 containerd-1.7.18-linux-amd64.tar.gz
   │     │     ├── TemplateRenderer 渲染 installScript (替换 50+ 变量)
   │     │     ├── ConfigRenderer 渲染 configTemplates (config.toml, service)
   │     │     └── SSH Executor 上传制品 + 配置 + 执行脚本
   │     │
-  │     └── HelmComponentExecutor 执行 coredns
-  │           ├── ChartFetcher 从 OCI Registry 拉取 Chart
-  │           ├── ValuesRenderer 渲染 Values (替换 {{clusterName}} 等)
-  │           ├── Helm Action: helm install coredns --namespace kube-system
-  │           └── HealthCheck: PodReady + EndpointReady
+  │     ├── HelmComponentExecutor 执行 coredns
+  │     │     ├── VersionContext.HasCurrent("coredns")=false → Action=Install
+  │     │     ├── ChartFetcher 从 OCI Registry 拉取 Chart
+  │     │     ├── ValuesRenderer 渲染 Values (替换 {{clusterName}} 等)
+  │     │     ├── Helm Action: helm install coredns --namespace kube-system
+  │     │     └── HealthCheck: PodReady + EndpointReady
+  │     │
+  │     └── YAMLManifestExecutor 执行 openfuyao-core
+  │           ├── VersionContext.NeedsUpgrade("openfuyao-core")=true
+  │           ├── resolveManifests(): 下载 crds.yaml + deployment.yaml
+  │           ├── parseYAMLDocuments(): 解析多文档 YAML
+  │           ├── ApplyWithStrategy(ServerSideApply): 应用到目标集群
+  │           └── PruneResources(): 首次安装无废弃资源
   │
   └── 安装完成 → ClusterStatus = Ready
 ```
@@ -473,28 +572,32 @@ ClusterVersionReconciler 解析 ReleaseImage v2.6.0
   ▼
 ClusterVersionReconciler 检测到版本变更
   │
-  ├── 对比版本，确定需要升级的组件
-  │     ├── containerd: v1.7.15 → v1.7.18 ✅ 需要升级
-  │     ├── bkeagent: v2.5.0 → v2.6.0 ✅ 需要升级
-  │     └── coredns: v1.10.1 → v1.11.1 ✅ 需要升级
+  ├── 对比版本，构建 VersionContext
+  │     ├── containerd: v1.7.15 → v1.7.18  HasCurrent=true  NeedsUpgrade=true  → Action=Upgrade
+  │     ├── bkeagent: v2.5.0 → v2.6.0      HasCurrent=true  NeedsUpgrade=true  → Action=Upgrade
+  │     ├── coredns: v1.10.1 → v1.11.1     HasCurrent=true  NeedsUpgrade=true  → Action=Upgrade
+  │     ├── openfuyao-core: v26.01 → v26.03 HasCurrent=true NeedsUpgrade=true  → Action=Upgrade
+  │     └── kubernetes-master: v1.29.0 (不变) HasCurrent=true NeedsUpgrade=false → Skip
   │
   ├── 构建升级 DAG
   │     ┌─────────────────────────────────────────────────┐
   │     │ provider → agent (binary)                       │
   │     │           → containerd (binary)                  │
   │     │           → coredns (helm)                       │
-  │     │           → etcd (inline) → worker (inline)      │
-  │     │           → master (inline) → component → cluster│
+  │     │           → openfuyao-core (yaml)                │
+  │     │           → etcd (inline) → kubernetes-worker    │
+  │     │           → kubernetes-master (inline)           │
+  │     │           → component → cluster                  │
   │     └─────────────────────────────────────────────────┘
   │
   ├── DAG Scheduler 执行 (按拓扑批次)
   │     │
   │     ├── Batch 1: provider
-  │     ├── Batch 2: agent (binary) → 逐节点滚动升级
-  │     ├── Batch 3: containerd (binary) → 逐节点滚动升级
+  │     ├── Batch 2: agent (binary) → Batch(batchSize=2) 逐批升级
+  │     ├── Batch 3: containerd (binary) → Rolling 逐节点滚动升级
   │     ├── Batch 4: coredns (helm) → helm upgrade --atomic
-  │     ├── Batch 5: etcd → worker → master (inline)
-  │     └── Batch 6: component → cluster
+  │     ├── Batch 5: openfuyao-core (yaml) → ServerSideApply 增量更新 + Prune 裁剪
+  │     └── Batch 6: etcd → kubernetes-worker → kubernetes-master (inline)
   │
   └── 升级完成 → ClusterStatus = Ready
 ```
@@ -520,8 +623,18 @@ spec:
         version: v1.11.1
       - name: kube-proxy
         version: v1.29.0
-      - name: kubernetes
+      - name: openfuyao-core
+        version: v26.03
+      - name: kubernetes-master
         version: v1.29.0
+        inline:
+          handler: EnsureMasterInit
+          version: v1.0.0
+      - name: kubernetes-worker
+        version: v1.29.0
+        inline:
+          handler: EnsureWorkerJoin
+          version: v1.0.0
         
   upgrade:
     components:
@@ -595,6 +708,8 @@ func (r *BKEClusterReconciler) executeContainerdUpgrade(ctx context.Context) err
 | **ConfigRenderer** | content 渲染、secretRef 获取、kubeconfig 生成 | >90% |
 | **BinaryInstaller** | Install/Upgrade/Uninstall 完整流程、失败重试 | >85% |
 | **HelmInstaller** | OCI/HTTP/本地 Chart 获取、Values 渲染、Install/Upgrade/Rollback | >85% |
+| **YAMLManifestExecutor** | 清单获取、多文档解析、ServerSideApply/Replace/CreateOnly、Prune | >85% |
+| **VersionContext** | HasCurrent/HasTarget/NeedsUpgrade 决策逻辑 | >90% |
 | **BinaryComponentExecutor** | Rolling/Parallel/Batch 执行策略、FailurePolicy | >85% |
 
 ### 6.2 集成测试
@@ -603,8 +718,11 @@ func (r *BKEClusterReconciler) executeContainerdUpgrade(ctx context.Context) err
 |---------|---------|---------|
 | **全新安装 (binary)** | containerd + bkeagent 安装 | 二进制正确安装，服务启动，版本验证通过 |
 | **全新安装 (helm)** | coredns + kube-proxy 安装 | Chart 正确部署，Pod Ready，Endpoint Ready |
+| **全新安装 (yaml)** | openfuyao-core 安装 | YAML 清单正确应用，资源创建成功 |
 | **升级 (binary)** | containerd v1.7.15 → v1.7.18 | 逐节点滚动升级，服务不中断 |
 | **升级 (helm)** | coredns v1.10.1 → v1.11.1 | helm upgrade 成功，Pod 滚动更新 |
+| **升级 (yaml)** | openfuyao-core v26.01 → v26.03 | ServerSideApply 增量更新，Prune 裁剪废弃资源 |
+| **VersionContext 跳过** | kubernetes-master 版本不变 | NeedsUpgrade=false，组件跳过执行 |
 | **回滚 (binary)** | 升级失败后执行 uninstallScript | 旧版本恢复，服务正常 |
 | **回滚 (helm)** | helm upgrade 失败后 rollback | 自动回滚到上一版本 |
 | **离线环境** | 无网络时使用本地缓存 | 安装/升级正常完成 |
@@ -616,8 +734,9 @@ func (r *BKEClusterReconciler) executeContainerdUpgrade(ctx context.Context) err
 |---------|---------|---------|
 | **小规模安装** | 1 Master + 2 Worker | 完整安装流程，所有组件正常 |
 | **中规模安装** | 3 Master + 10 Worker | 并行安装性能，无资源竞争 |
-| **跨版本升级** | 3 Master + 5 Worker | v2.5.0 → v2.6.0 完整升级 |
+| **跨版本升级** | 3 Master + 5 Worker | v2.5.0 → v2.6.0 完整升级 (含 YAML 类型组件) |
 | **升级失败恢复** | 3 Master + 3 Worker | 模拟节点失败，验证 Continue/Rollback 策略 |
+| **YAML Prune 验证** | 1 Master + 2 Worker | 升级后验证废弃资源被正确裁剪 |
 
 ## 7. 工作量评估与任务拆解
 
@@ -627,24 +746,33 @@ func (r *BKEClusterReconciler) executeContainerdUpgrade(ctx context.Context) err
 |------|---------|---------|------|
 | **BinaryInstaller 核心实现** | 5 人日 | 中 | 无 |
 | **HelmInstaller 核心实现** | 5 人日 | 中 | 无 |
+| **YAMLManifestExecutor 核心实现** | 5 人日 | 中 | 无 |
 | **TemplateRenderer 实现** | 3 人日 | 低 | 无 |
 | **ConfigRenderer 实现** | 3 人日 | 低 | TemplateRenderer |
-| **ComponentVersion CRD 扩展** | 2 人日 | 低 | 无 |
+| **ApplyStrategy 引擎实现** | 3 人日 | 中 | YAMLManifestExecutor |
+| **Prune 裁剪功能实现** | 3 人日 | 中 | ApplyStrategy 引擎 |
+| **PreInstallHooks 执行引擎** | 3 人日 | 中 | HelmInstaller |
+| **ComponentVersion CRD 扩展** | 3 人日 | 低 | 无 |
+| **VersionContext 与 ExecutionContext 实现** | 3 人日 | 中 | 无 |
 | **BinaryComponentExecutor 集成** | 3 人日 | 中 | BinaryInstaller |
 | **HelmComponentExecutor 集成** | 3 人日 | 中 | HelmInstaller |
+| **YAMLManifestExecutor 集成** | 2 人日 | 中 | YAMLManifestExecutor |
 | **ComponentVersion YAML 编写** | 2 人日 | 低 | CRD 扩展 |
-| **DAG 调度器适配** | 2 人日 | 低 | Executor 集成 |
+| **DAG 调度器适配** | 3 人日 | 低 | Executor 集成 |
 | **Feature Gate 实现** | 1 人日 | 低 | 无 |
-| **单元测试** | 5 人日 | 低 | 核心实现完成 |
-| **集成测试** | 3 人日 | 中 | 单元测试完成 |
-| **E2E 测试** | 3 人日 | 中 | 集成测试完成 |
-| **文档编写** | 2 人日 | 低 | 无 |
-| **代码审查与修复** | 3 人日 | 中 | 测试完成 |
-| **总计** | **45 人日** | | |
+| **兼容层实现** | 3 人日 | 中 | DAG 调度器适配 |
+| **错误分类与恢复机制** | 3 人日 | 中 | 核心实现完成 |
+| **单元测试** | 8 人日 | 低 | 核心实现完成 |
+| **集成测试** | 5 人日 | 中 | 单元测试完成 |
+| **E2E 测试** | 5 人日 | 中 | 集成测试完成 |
+| **迁移验证** | 3 人日 | 中 | 兼容层实现 |
+| **文档编写** | 4 人日 | 低 | 无 |
+| **代码审查与修复** | 4 人日 | 中 | 测试完成 |
+| **总计** | **88 人日 (约 4 人月)** | | |
 
 ### 7.2 任务拆解
 
-#### Sprint 1 (第1-2周): BinaryInstaller 核心实现
+#### Sprint 1 (第1-2周): BinaryInstaller + YAMLManifestExecutor 核心实现
 
 | 任务 | 负责人 | 交付物 |
 |------|--------|--------|
@@ -652,10 +780,12 @@ func (r *BKEClusterReconciler) executeContainerdUpgrade(ctx context.Context) err
 | ArtifactDownloader 实现 | 开发A | 下载/缓存/checksum 功能 |
 | TemplateRenderer 实现 | 开发B | `pkg/binaryinstaller/template_renderer.go` |
 | ConfigRenderer 实现 | 开发B | `pkg/binaryinstaller/config_renderer.go` |
+| YAMLManifestExecutor 核心实现 | 开发D | `pkg/yamlexecutor/executor.go` |
+| ApplyStrategy 引擎实现 | 开发D | ServerSideApply/Replace/CreateOnly |
 | SSH 执行逻辑 | 开发A | 上传/执行/日志收集 |
 | 单元测试 (BinaryInstaller) | 开发A+B | 测试覆盖率 >85% |
 
-#### Sprint 2 (第3-4周): HelmInstaller 核心实现
+#### Sprint 2 (第3-4周): HelmInstaller + Prune + PreInstallHooks
 
 | 任务 | 负责人 | 交付物 |
 |------|--------|--------|
@@ -664,29 +794,35 @@ func (r *BKEClusterReconciler) executeContainerdUpgrade(ctx context.Context) err
 | ValuesRenderer 实现 | 开发C | Values 模板渲染 |
 | Helm Action Executor 实现 | 开发C | Install/Upgrade/Rollback/Uninstall |
 | HealthCheck 实现 | 开发C | PodReady/EndpointReady 检查 |
+| PreInstallHooks 执行引擎 | 开发C | Job 类型钩子创建/等待/清理 |
+| Prune 裁剪功能实现 | 开发D | 按 label selector 裁剪废弃资源 |
 | 单元测试 (HelmInstaller) | 开发C | 测试覆盖率 >85% |
 
 #### Sprint 3 (第5-6周): DAG 集成与 Phase 迁移
 
 | 任务 | 负责人 | 交付物 |
 |------|--------|--------|
-| ComponentVersion CRD 扩展 | 开发A | binary/helm 字段定义 |
+| ComponentVersion CRD 扩展 | 开发A | binary/helm/yaml/SubComponents/Resources 字段 |
+| VersionContext 与 ExecutionContext | 开发A | `pkg/dagexec/context.go` |
 | BinaryComponentExecutor | 开发A | `pkg/dagexec/binary_component_executor.go` |
 | HelmComponentExecutor | 开发C | `pkg/dagexec/helm_component_executor.go` |
-| ComponentVersion YAML 编写 | 开发B | containerd/bkeagent/coredns YAML |
+| YAMLManifestExecutor 集成 | 开发D | `pkg/dagexec/yaml_component_executor.go` |
+| ComponentVersion YAML 编写 | 开发B | containerd/bkeagent/coredns/openfuyao-core YAML |
 | DAG 调度器适配 | 开发B | 执行器注册与调度 |
 | Feature Gate 实现 | 开发A | 开关控制逻辑 |
-| 集成测试 | 开发A+B+C | 安装/升级/回滚场景 |
-| E2E 测试 | 开发A+B+C | 多场景端到端验证 |
+| 兼容层实现 | 开发B | Feature Gate 双轨切换 |
+| 集成测试 | 开发A+B+C+D | 安装/升级/回滚场景 |
+| E2E 测试 | 开发A+B+C+D | 多场景端到端验证 |
 
 ### 7.3 里程碑
 
 | 里程碑 | 时间 | 交付内容 | 验收标准 |
 |--------|------|---------|---------|
 | **M1: BinaryInstaller 完成** | 第2周末 | BinaryInstaller 核心功能 + 单元测试 | 单元测试覆盖率 >85% |
-| **M2: HelmInstaller 完成** | 第4周末 | HelmInstaller 核心功能 + 单元测试 | 单元测试覆盖率 >85% |
-| **M3: DAG 集成完成** | 第5周末 | Executor 集成 + ComponentVersion YAML | 集成测试通过 |
-| **M4: Beta 发布** | 第6周末 | Feature Gate 灰度 + E2E 测试 | E2E 通过率 >95% |
+| **M2: YAMLManifestExecutor 完成** | 第2周末 | YAMLManifestExecutor + ApplyStrategy + Prune | 单元测试覆盖率 >85% |
+| **M3: HelmInstaller 完成** | 第4周末 | HelmInstaller + PreInstallHooks + 单元测试 | 单元测试覆盖率 >85% |
+| **M4: DAG 集成完成** | 第5周末 | Executor 集成 + VersionContext + ComponentVersion YAML | 集成测试通过 |
+| **M5: Beta 发布** | 第6周末 | Feature Gate 灰度 + 兼容层 + E2E 测试 | E2E 通过率 >95% |
 
 ## 8. 风险与缓解
 
@@ -703,11 +839,13 @@ func (r *BKEClusterReconciler) executeContainerdUpgrade(ctx context.Context) err
 
 | 维度 | 当前 | 重构后 | 提升 |
 |------|------|--------|------|
-| **组件类型支持** | inline + manifest | inline + manifest + binary + helm | 完整覆盖 |
+| **组件类型支持** | inline + manifest | inline + manifest + binary + helm + yaml | 完整覆盖 |
 | **配置管理** | 硬编码在脚本中 | configTemplates 声明式 | 可维护性↑ |
 | **模板变量** | 仅 {{arch}} | 8类50+变量 | 灵活性↑ |
 | **条件渲染** | 无 | Go template 完整支持 | 表达能力↑ |
 | **Helm 支持** | 无 | OCI/HTTP/本地 Chart | 生态兼容↑ |
+| **YAML 清单应用** | 无 | ServerSideApply/Replace/CreateOnly + Prune | 声明式资源管理↑ |
+| **版本决策** | IsUpgrade bool | VersionContext 携带版本事实 | 声明式协调↑ |
 | **新增组件** | 修改代码 + 新增 Phase | 添加 ComponentVersion YAML | 零代码侵入 |
 | **安装/升级一致性** | 不同的 Phase 实现 | 统一的 Installer | 逻辑复用 |
 | **架构适配** | 硬编码在代码中 | 模板变量 `{{nodeArch}}` | 声明式配置 |
@@ -729,6 +867,11 @@ func (r *BKEClusterReconciler) executeContainerdUpgrade(ctx context.Context) err
 |------|------|
 | **BinaryInstaller** | 负责二进制组件下载、渲染、安装的安装器 |
 | **HelmInstaller** | 负责 Helm Chart 获取、渲染、部署的安装器 |
+| **YAMLManifestExecutor** | 负责 YAML 清单获取、解析、应用、裁剪的执行器 |
+| **VersionContext** | 携带组件版本事实（已安装版本、目标版本），Executor 据此自主决定操作类型 |
+| **ApplyStrategy** | YAML 清单应用策略：ServerSideApply/Replace/CreateOnly |
+| **Prune** | 按标签选择器裁剪不再需要的 Kubernetes 资源 |
+| **SubComponents** | 组件的组合关系（父子包含），区别于 Dependencies（执行顺序） |
 | **configTemplates** | 配置文件模板系统，支持 Go template/Secret/kubeconfig |
 | **installScript** | 安装脚本模板，支持 8 类 50+ 变量和条件渲染 |
 | **Artifact** | 二进制制品，包含 URL、Checksum、安装路径等信息 |
