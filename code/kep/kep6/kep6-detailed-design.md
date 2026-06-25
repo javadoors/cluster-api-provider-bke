@@ -2806,7 +2806,7 @@ func (e *ManifestComponentExecutor) ExecuteComponent(ctx context.Context, node *
 **关键设计点**：
 - **声明式安装**：通过 ReleaseImage 声明需要安装的组件列表
 - **DAG 调度**：根据组件依赖关系构建 DAG，按拓扑顺序执行
-- **多类型支持**：Binary（containerd/bkeagent）、Helm（coredns/kube-proxy）、YAML（openfuyao-core）、Inline（kubernetes）
+- **多类型支持**：Binary、Helm、YAML、Inline
 - **健康检查**：安装完成后执行 PodReady/EndpointReady 检查
 - **YAML 清单应用**：YAML 类型组件通过 YAMLManifestExecutor 应用 Kubernetes 清单，支持 ServerSideApply/Replace/CreateOnly 三种策略
 
@@ -2931,8 +2931,8 @@ func (e *ManifestComponentExecutor) ExecuteComponent(ctx context.Context, node *
                                          │
                                          ▼
                      ┌──────────────────────────────────────┐
-                     │  8. YAMLManifestExecutor             │
-                     │  执行 openfuyao-core 安装            │
+                      │  8. YAMLManifestExecutor             │
+                      │  执行 YAML 类型组件安装              │
                      └────────────────────┬─────────────────┘
                                           │
                      ┌────────────────────┼────────────────────┐
