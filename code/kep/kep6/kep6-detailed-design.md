@@ -3447,6 +3447,4 @@ var defaultFeatureGates = map[string]bool{
 ---
 
 **文档版本**: v1.0  
-**创建日期**: 2026-06-12  
-**最后更新**: 2026-06-12  
 **维护者**: openFuyao Team
