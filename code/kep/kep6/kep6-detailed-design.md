@@ -2367,11 +2367,11 @@ func (r *ConfigRenderer) renderConfigTemplates(templates []ConfigTemplateSpec, t
 
 #### 8.3.1 ExecutionContext 定义
 
-> **设计思路 - 为什么用 VersionContext 而非 IsUpgrade bool 或 OperationType 枚举**：
-> 1. **声明式协调**：Kubernetes 控制器应基于"当前状态 vs 期望状态"自主决定操作，而非由调用方显式下达操作指令。VersionContext 提供版本事实（已安装版本、目标版本），Executor 根据 `HasCurrent`/`HasTarget`/`NeedsUpgrade` 自主推断 Install/Upgrade/Skip。
-> 2. **避免概念重复**：`BinaryAction` (Install/Upgrade/Uninstall) 和 `HelmAction` (Install/Upgrade/Rollback) 已在各自 Executor 中定义。ExecutionContext 中再放 OperationType 枚举会造成两套枚举需要映射，增加维护负担。
-> 3. **扩展性**：后续支持 Rollback 时，只需在 VersionContext 中新增版本历史记录 (`previousVersions map`)，Executor 即可推断 Rollback 操作，无需修改 ExecutionContext 接口。
-> 4. **与实际代码一致**：当前 `PhaseContext` 已使用 `VersionContext` 进行版本判断，设计文档与实现保持一致。
+**设计思路 - 为什么用 VersionContext 而非 IsUpgrade bool 或 OperationType 枚举**：
+1. **声明式协调**：Kubernetes 控制器应基于"当前状态 vs 期望状态"自主决定操作，而非由调用方显式下达操作指令。VersionContext 提供版本事实（已安装版本、目标版本），Executor 根据 `HasCurrent`/`HasTarget`/`NeedsUpgrade` 自主推断 Install/Upgrade/Skip。
+2. **避免概念重复**：`BinaryAction` (Install/Upgrade/Uninstall) 和 `HelmAction` (Install/Upgrade/Rollback) 已在各自 Executor 中定义。ExecutionContext 中再放 OperationType 枚举会造成两套枚举需要映射，增加维护负担。
+3. **扩展性**：后续支持 Rollback 时，只需在 VersionContext 中新增版本历史记录 (`previousVersions map`)，Executor 即可推断 Rollback 操作，无需修改 ExecutionContext 接口。
+4. **与实际代码一致**：当前 `PhaseContext` 已使用 `VersionContext` 进行版本判断，设计文档与实现保持一致。
 
 ```go
 // pkg/dagexec/context.go
