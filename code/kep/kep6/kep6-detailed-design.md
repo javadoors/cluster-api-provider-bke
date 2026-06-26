@@ -1497,6 +1497,7 @@ type BinaryInstaller struct {
     cache      *ArtifactCache
     renderer   *TemplateRenderer  // 复用 TemplateRenderer
 }
+```
 
 **设计思路 — Install 与 Upgrade 共用 InstallScript**：
 
