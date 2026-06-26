@@ -2873,7 +2873,260 @@ func (r *ConfigRenderer) renderConfigTemplates(templates []ConfigTemplateSpec, t
               └──────────────────────────────────────┘
 ```
 
-### 8.2 DAG 调度流程图
+#### 8.1.1 当前代码分析
+
+当前 `pkg/dagexec/scheduler.go` 中的 `executeComponent()` 仅二路分发，无执行器注册机制：
+
+```go
+// 当前代码: 仅 Inline vs Manifest 两条路径 (scheduler.go:326-337)
+func (s *Scheduler) executeComponent(
+    ctx context.Context,
+    phaseCtx *phaseframe.PhaseContext,
+    oldCluster, newCluster *bkev1beta1.BKECluster,
+    node *topology.ComponentNode,
+    tmpl manifest.TemplateContext,
+) error {
+    if node.Inline != nil {
+        return s.executeInline(phaseCtx, oldCluster, newCluster, node)
+    }
+    return s.executeManifest(ctx, phaseCtx, node, tmpl)
+}
+```
+
+**问题**：
+- 无 Binary/Helm/YAML 执行器，Binary 和 Helm 组件类型无法处理
+- 分发逻辑硬编码在 if-else 中，新增类型需修改 Scheduler 代码
+- 无执行器注册机制，无法按需注入
+
+#### 8.1.2 执行器注册表设计
+
+**设计思路 - 为什么用注册表而非 switch-case**：
+
+当前代码用 `if node.Inline != nil` 硬编码分发，新增组件类型需修改 `executeComponent()` 方法。引入 `ExecutorRegistry` 注册表后，新增类型只需调用 `registry.Register()` 注册新执行器，Scheduler 代码无需修改——符合开闭原则。
+
+注册表还支持按需注入：Feature Gate OFF 时不注册 Binary/Helm/YAML 执行器，`registry.Get()` 返回错误，自动回退到旧路径。
+
+```go
+// pkg/dagexec/registry.go
+
+// ExecutorRegistry 执行器注册表 (按组件类型注册)
+type ExecutorRegistry struct {
+    executors map[string]ComponentExecutor
+}
+
+// NewExecutorRegistry 创建空注册表
+func NewExecutorRegistry() *ExecutorRegistry {
+    return &ExecutorRegistry{
+        executors: make(map[string]ComponentExecutor),
+    }
+}
+
+// Register 注册执行器 (按组件类型)
+func (r *ExecutorRegistry) Register(componentType string, executor ComponentExecutor) {
+    r.executors[componentType] = executor
+}
+
+// Get 获取执行器 (未注册返回错误)
+func (r *ExecutorRegistry) Get(componentType string) (ComponentExecutor, error) {
+    executor, ok := r.executors[componentType]
+    if !ok {
+        return nil, fmt.Errorf("no executor registered for component type %q", componentType)
+    }
+    return executor, nil
+}
+
+// Has 检查是否已注册某类型
+func (r *ExecutorRegistry) Has(componentType string) bool {
+    _, ok := r.executors[componentType]
+    return ok
+}
+```
+
+#### 8.1.3 执行器分发实现
+
+```go
+// pkg/dagexec/scheduler.go 扩展
+
+// executeComponent 四路分发 (Feature Gate ON)
+func (s *Scheduler) executeComponent(
+    ctx context.Context,
+    phaseCtx *phaseframe.PhaseContext,
+    oldCluster, newCluster *bkev1beta1.BKECluster,
+    node *topology.ComponentNode,
+    tmpl manifest.TemplateContext,
+) error {
+    // Feature Gate OFF: 回退到旧路径 (二路分发)
+    if !featuregate.Enabled(featuregate.BinaryComponentSupport) {
+        return s.executeComponentLegacy(ctx, phaseCtx, oldCluster, newCluster, node, tmpl)
+    }
+
+    // Feature Gate ON: 四路分发
+    componentType := node.ComponentType()
+    executor, err := s.registry.Get(componentType)
+    if err != nil {
+        // 未注册的类型回退到 Manifest 路径 (兼容未迁移的组件)
+        if s.registry.Has("yaml") {
+            return s.registry.Get("yaml").ExecuteComponent(ctx, node, s.buildExecutionContext(phaseCtx, node, tmpl))
+        }
+        return s.executeManifest(ctx, phaseCtx, node, tmpl)
+    }
+
+    execCtx := s.buildExecutionContext(phaseCtx, node, tmpl)
+    return executor.ExecuteComponent(ctx, node, execCtx)
+}
+
+// executeComponentLegacy 旧路径 (Feature Gate OFF 时的二路分发)
+func (s *Scheduler) executeComponentLegacy(
+    ctx context.Context,
+    phaseCtx *phaseframe.PhaseContext,
+    oldCluster, newCluster *bkev1beta1.BKECluster,
+    node *topology.ComponentNode,
+    tmpl manifest.TemplateContext,
+) error {
+    if node.Inline != nil {
+        return s.executeInline(phaseCtx, oldCluster, newCluster, node)
+    }
+    return s.executeManifest(ctx, phaseCtx, node, tmpl)
+}
+
+// buildExecutionContext 从 PhaseContext 构建 ExecutionContext
+func (s *Scheduler) buildExecutionContext(
+    phaseCtx *phaseframe.PhaseContext,
+    node *topology.ComponentNode,
+    tmpl manifest.TemplateContext,
+) *ExecutionContext {
+    return &ExecutionContext{
+        Cluster:         phaseCtx.BKECluster,
+        NodeProvider:    s.nodeProvider,
+        Log:             phaseCtx.Log,
+        VersionContext:  s.buildVersionContext(phaseCtx),
+        TemplateContext: tmpl,
+    }
+}
+```
+
+#### 8.1.4 Scheduler 初始化与执行器注入
+
+```go
+// pkg/dagexec/scheduler.go 扩展
+
+// Config 扩展: 新增 Binary/Helm/YAML 执行器依赖
+type Config struct {
+    InlineRunner        InlinePhaseRunner
+    ManifestStore       manifest.Store
+    ManifestApplier     manifest.Applier
+    BinaryInstaller     BinaryInstaller       // 新增 (Feature Gate ON 时注入)
+    HelmInstaller       HelmInstaller         // 新增
+    YAMLExecutor        YAMLManifestExecutor  // 新增
+    NodeProvider        NodeProvider          // 新增
+    MaxParallelPerBatch int
+}
+
+// NewScheduler 创建调度器, 按需注册执行器
+func NewScheduler(cfg Config) *Scheduler {
+    maxParallel := cfg.MaxParallelPerBatch
+    if maxParallel == 0 {
+        maxParallel = defaultMaxParallelPerBatch
+    }
+
+    registry := NewExecutorRegistry()
+
+    // Inline 执行器: 始终注册
+    registry.Register("inline", &InlineComponentExecutor{
+        runner: cfg.InlineRunner,
+    })
+
+    // Binary 执行器: Feature Gate ON 且依赖已注入时注册
+    if cfg.BinaryInstaller != nil {
+        registry.Register("binary", &BinaryComponentExecutor{
+            installer: cfg.BinaryInstaller,
+            store:     cfg.ManifestStore,
+        })
+    }
+
+    // Helm 执行器: Feature Gate ON 且依赖已注入时注册
+    if cfg.HelmInstaller != nil {
+        registry.Register("helm", &HelmComponentExecutor{
+            installer: cfg.HelmInstaller,
+            store:     cfg.ManifestStore,
+        })
+    }
+
+    // YAML 执行器: Feature Gate ON 且依赖已注入时注册
+    if cfg.YAMLExecutor != nil {
+        registry.Register("yaml", &ManifestComponentExecutor{
+            applier: cfg.ManifestApplier,
+            store:   cfg.ManifestStore,
+        })
+    }
+
+    return &Scheduler{
+        InlineRunner:        cfg.InlineRunner,
+        ManifestStore:       cfg.ManifestStore,
+        ManifestApplier:     cfg.ManifestApplier,
+        registry:            registry,
+        nodeProvider:        cfg.NodeProvider,
+        MaxParallelPerBatch: maxParallel,
+    }
+}
+```
+
+#### 8.1.5 InlineComponentExecutor 实现
+
+当前 Inline 路径也需要适配为 `ComponentExecutor` 接口，保持与 Binary/Helm/YAML 一致的分发方式：
+
+```go
+// pkg/dagexec/inline_executor.go
+
+// InlineComponentExecutor 内联组件执行器
+type InlineComponentExecutor struct {
+    runner InlinePhaseRunner
+}
+
+func (e *InlineComponentExecutor) GetComponentType() string {
+    return "inline"
+}
+
+func (e *InlineComponentExecutor) ExecuteComponent(
+    ctx context.Context,
+    node *ComponentNode,
+    execCtx *ExecutionContext,
+) error {
+    if node.Inline == nil {
+        return fmt.Errorf("component %q has no inline ref", node.Name)
+    }
+
+    handler := node.Inline.Handler
+    version := node.Inline.Version
+    if handler == "" {
+        return fmt.Errorf("inline component %q missing handler", node.Name)
+    }
+    if version == "" {
+        version = defaultComponentVersion
+    }
+
+    // Inline 执行器需要 oldCluster/newCluster, 从 ExecutionContext.Cluster 推导
+    return e.runner.Execute(
+        execCtx.phaseCtx,
+        execCtx.oldCluster,
+        execCtx.Cluster,
+        handler,
+        version,
+    )
+}
+```
+
+#### 8.1.6 当前代码 vs 目标设计对比
+
+| 维度 | 当前代码 (scheduler.go) | 目标设计 |
+|------|------------------------|---------|
+| **分发方式** | `if node.Inline != nil` 二路 | `registry.Get(node.ComponentType())` 四路 |
+| **执行器注册** | 无（硬编码 if-else） | `ExecutorRegistry` 按类型注册 |
+| **执行器实例** | 无独立 Executor | Binary/Helm/YAML/Inline 各自实现 `ComponentExecutor` |
+| **依赖注入** | `InlineRunner` + `ManifestStore` + `ManifestApplier` | 额外注入 `BinaryInstaller` + `HelmInstaller` + `YAMLExecutor` + `NodeProvider` |
+| **Feature Gate** | 无 | ON→四路分发, OFF→`executeComponentLegacy` 二路分发 |
+| **扩展性** | 新增类型需修改 `executeComponent()` | 新增类型只需 `registry.Register()`，Scheduler 不变 |
+| **未注册类型处理** | 走 Manifest 路径 | 回退到 YAML/Manifest 路径（兼容未迁移组件） |
 
 **设计思路**：DAG 调度采用"批次间串行、批次内并行"的执行策略。首先通过拓扑排序将 DAG 分解为多个批次，然后按顺序执行每个批次，批次内的组件可以并行执行。这种策略既保证了依赖关系的正确性，又最大化了并行度。
 
