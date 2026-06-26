@@ -3262,19 +3262,34 @@ var defaultFeatureGates = map[string]bool{
 
 ### 11.3 containerd 重构详细设计
 
-#### 11.3.1 当前 EnsureContainerdUpgrade Phase 逻辑分析
+#### 11.3.1 当前 Phase 逻辑分析
 
-当前 containerd 升级通过硬编码 Phase `EnsureContainerdUpgrade` 实现，核心逻辑如下：
+containerd 的安装和升级分别由两个 Phase 负责，且都依赖 bkeagent 内置命令完成：
 
-1. **版本比较**：`isContainerdNeedUpgrade` 比较 `BKECluster.Status.ContainerdVersion` 与 `BKECluster.Spec.ClusterConfig.Cluster.ContainerdVersion`，若目标版本高于当前版本则触发升级。
-2. **逐节点滚动升级**：`rolloutContainerd` 遍历所有节点，逐个执行 SSH 命令。
-3. **硬编码内容**：
-   - 二进制下载 URL：拼接 `releaseRepo + "/containerd/" + version + "/containerd-" + version + "-linux-" + arch + ".tar.gz"`
-   - 架构适配：`arch` 从节点信息获取，硬编码为 `amd64` 或 `arm64`
-   - config.toml：内容硬编码在 Go 代码中，通过字符串拼接生成
-   - containerd.service：systemd 服务文件硬编码在 Go 代码中
-   - 安装脚本：硬编码为 SSH 命令序列（停止→备份→下载→解压→启动→验证）
-   - 升级策略：固定为逐节点滚动，不可配置
+**安装路径 — `EnsureNodesEnv` Phase**：
+
+containerd 安装嵌入在节点环境初始化流程中，不是独立 Phase：
+
+1. `EnsureNodesEnv.Execute()` → `CheckOrInitNodesEnv()` → `buildEnvCommand()`
+2. `buildEnvCommand()` → `BuildCommonEnvCommand()` → `ENV.New()` → `buildCommandSpec()`
+3. `buildCommandSpec()` 生成三步内置命令：
+   - `K8sEnvInit(scope=node)` — 硬件资源检查
+   - `Reset(scope=cert,manifests,container,kubelet,extra)` — 节点重置
+   - `K8sEnvInit(scope=time,hosts,dns,kernel,firewall,selinux,swap,httpRepo,runtime,iptables,registry,extra)` — 环境初始化
+4. 其中 `scope=runtime` 即 containerd 安装：bkeagent 内部负责下载 containerd 二进制包、生成 config.toml、安装 systemd service、启动服务
+
+**升级路径 — `EnsureContainerdUpgrade` Phase**：
+
+1. **版本比较**：`isContainerdNeedUpgrade` 比较 `BKECluster.Status.ContainerdVersion` 与 `Spec.ClusterConfig.Cluster.ContainerdVersion`
+2. **两步升级**：`rolloutContainerd()` 依次调用：
+   - `resetContainerd()` → `NewConatinerdReset()` → 发送 `Reset` 命令（`scope=containerd-cfg`）→ bkeagent 重置 containerd 配置
+   - `redeployContainerd()` → `NewConatinerdRedeploy()` → 发送 `K8sEnvInit` 命令（`scope=runtime`, `containerdVersion=x.x.x`）→ bkeagent 重新安装 containerd
+
+**关键问题**：
+- containerd 安装逻辑封装在 bkeagent 内置命令中，控制器无法控制安装路径、配置内容、制品来源
+- 安装路径不是独立 Phase，嵌在 `EnsureNodesEnv` 的 `K8sEnvInit(scope=runtime)` 中
+- 升级路径 `EnsureContainerdUpgrade` 也委托给 bkeagent 内置命令，非 SSH 推送
+- config.toml、containerd.service 内容由 bkeagent 内部生成，不可声明式配置
 
 #### 11.3.2 ComponentVersion YAML 完整定义
 
@@ -3301,11 +3316,6 @@ spec:
         checksum: "sha256:abc123def456..."
         installPath: "/usr/local"
         executable: containerd
-      - name: containerd-shim-runc-v2
-        url: "https://release-repo.openfuyao.cn/binaries/containerd/{{version}}/containerd-shim-runc-v2-{{version}}-linux-{{arch}}"
-        checksum: "sha256:def456ghi789..."
-        installPath: "/usr/local/bin"
-        executable: containerd-shim-runc-v2
 
     configTemplates:
       - name: config.toml
@@ -3366,10 +3376,9 @@ spec:
       cp {{binPath}}/containerd {{binPath}}/containerd.bak.$(date +%Y%m%d%H%M%S)
       {{end}}
 
-      # 4. 解压并安装新二进制
+      # 4. 解压并安装新二进制 (tar.gz 包含 containerd, containerd-shim-runc-v2, ctr)
       tar -xzf {{artifact.containerd.path}} -C {{installPath}}
       chmod +x {{binPath}}/containerd
-      install -m 0755 {{artifact.containerd-shim-runc-v2.path}} {{binPath}}/containerd-shim-runc-v2
 
       # 5. 安装配置文件和服务 (由 ConfigRenderer 自动上传)
       # config.toml → {{configPath}}/config.toml
@@ -3385,7 +3394,7 @@ spec:
       #!/bin/bash
       systemctl stop containerd || true
       systemctl disable containerd || true
-      rm -f {{binPath}}/containerd {{binPath}}/containerd-shim-runc-v2 {{binPath}}/ctr
+      rm -f {{binPath}}/containerd {{binPath}}/containerd-shim-runc-v2 {{binPath}}/containerd-stress {{binPath}}/ctr
       rm -f /etc/systemd/system/containerd.service
       systemctl daemon-reload
 
@@ -3424,14 +3433,17 @@ spec:
 
 | 旧硬编码逻辑 | 新 ComponentVersion 字段 | 说明 |
 |-------------|------------------------|------|
+| `EnsureNodesEnv` → `K8sEnvInit(scope=runtime)` 安装 containerd | `BinaryComponentExecutor` → `BinaryInstaller.Install()` | 安装从 agent 内置命令改为 SSH 推送 |
+| `EnsureContainerdUpgrade` → `resetContainerd` + `redeployContainerd` | `BinaryInstaller.Install(Action=Upgrade)` | 升级从 agent 内置命令改为 SSH 推送 |
+| bkeagent 内置 containerd 二进制下载 | `binary.artifacts[].url` | 制品下载声明式化 |
+| bkeagent 内置 config.toml 生成 | `binary.configTemplates[0].content`（Go template） | 配置模板声明式化 |
+| bkeagent 内置 containerd.service 生成 | `binary.configTemplates[1].content` | systemd 服务声明式化 |
+| `ENV.ContainerdVersion` 传参给 bkeagent | `VersionContext.TargetVersion("containerd")` | 版本传递声明式化 |
 | `Spec.ClusterConfig.Cluster.ContainerdVersion` | `spec.version` | 版本号 |
-| 下载 URL 字符串拼接 | `binary.artifacts[].url`（含 `{{version}}/{{arch}}` 模板） | 制品地址声明式化 |
 | `checksum` 硬编码常量 | `binary.artifacts[].checksum` | 校验和声明式化 |
-| `installPath` 硬编码 `/usr/local/bin` | `binary.artifacts[].installPath` | 安装路径可配置 |
-| config.toml Go 代码拼接 | `binary.configTemplates[0].content`（Go template） | 配置模板声明式化 |
-| containerd.service Go 代码硬编码 | `binary.configTemplates[1].content` | systemd 服务声明式化 |
+| `installPath` 硬编码 | `binary.artifacts[].installPath` | 安装路径可配置 |
 | SSH 命令序列硬编码 | `binary.installScript`（Go template） | 安装脚本声明式化 |
-| `arch` 硬编码 `linux_{arch}` | `{{arch}}` 模板变量 | 架构适配模板化 |
+| `arch` 硬编码 | `{{arch}}` 模板变量 | 架构适配模板化 |
 | `isContainerdNeedUpgrade()` 版本比较 | `VersionContext.NeedsUpgrade("containerd")` | 版本决策声明式化 |
 | 固定逐节点滚动 | `upgradeStrategy.mode: Rolling` | 升级策略可配置 |
 | 无失败策略 | `upgradeStrategy.failurePolicy: FailFast` | 失败策略可配置 |
@@ -3440,30 +3452,123 @@ spec:
 
 #### 11.3.4 行为等价性验证点
 
-| 验证项 | 旧路径 (EnsureContainerdUpgrade) | 新路径 (BinaryInstaller) | 验证方法 |
-|--------|--------------------------------|------------------------|---------|
-| 二进制文件路径 | `/usr/local/bin/containerd` | `artifacts[0].installPath` = `/usr/local` | 检查远程节点文件路径一致 |
-| config.toml 内容 | Go 代码拼接 | Go template 渲染 | `diff` 对比两份输出 |
-| containerd.service 内容 | Go 代码硬编码 | `configTemplates[1].content` | `diff` 对比两份输出 |
-| 安装执行顺序 | 停止→备份→下载→解压→启动 | installScript: 停止→备份→解压→启动 | 对比 SSH 执行日志 |
-| 版本比较逻辑 | `Status.ContainerdVersion != Spec.ContainerdVersion` | `VersionContext.NeedsUpgrade()` | 相同版本输入，决策结果一致 |
-| 架构适配 | `arch == "amd64" \|\| arch == "arm64"` | `{{arch}}` 模板替换 | amd64/arm64 节点分别验证 |
-| 滚动升级行为 | 逐节点串行 | `upgradeStrategy.mode: Rolling` | 3 节点集群验证逐节点执行 |
+| 验证项 | 旧路径 | 新路径 (BinaryInstaller) | 验证方法 |
+|--------|--------|------------------------|---------|
+| containerd 安装时机 | `EnsureNodesEnv` 中 `K8sEnvInit(scope=runtime)` | containerd binary 节点先于 `EnsureNodesEnv` | DAG 拓扑顺序验证 |
+| EnsureNodesEnv scope | 含 `runtime` | 不含 `runtime` | 检查 `K8sEnvInit` 命令参数 |
+| 二进制文件路径 | bkeagent 内部决定 | `artifacts[0].installPath` = `/usr/local` (解压后二进制在 `/usr/local/bin/`) | 检查远程节点文件路径 |
+| config.toml 内容 | bkeagent 内部生成 | Go template 渲染 | `diff` 对比两份输出 |
+| containerd.service 内容 | bkeagent 内部生成 | `configTemplates[1].content` | `diff` 对比两份输出 |
+| 安装执行顺序 | bkeagent 内置逻辑 | installScript: 停止→备份→解压→启动 | 对比 SSH 执行日志 |
+| 版本比较逻辑 | `Status.ContainerdVersion != Spec.ContainerdVersion` | `VersionContext.NeedsUpgrade("containerd")` | 相同版本输入，决策结果一致 |
+| 架构适配 | bkeagent 内部处理 | `{{arch}}` 模板替换 | amd64/arm64 节点分别验证 |
+| 滚动升级行为 | bkeagent 内置（全节点同时） | `upgradeStrategy.mode: Rolling` (逐节点) | 3 节点集群验证逐节点执行 |
+| Feature Gate OFF 回退 | `EnsureNodesEnv` 含 `runtime` | `EnsureNodesEnv` 含 `runtime` | 行为不变 |
+| containerd 版本传递 | `ENV.ContainerdVersion` 字段 | `VersionContext.TargetVersion` | 相同版本输入结果一致 |
+
+#### 11.3.5 EnsureNodesEnv 重构设计
+
+**设计思路**：当前 containerd 安装嵌入在 `EnsureNodesEnv` 的 `K8sEnvInit(scope=runtime)` 中，由 bkeagent 内置命令完成。重构后将 containerd 拆出为独立 binary 组件，通过 BinaryInstaller SSH 推送安装，`EnsureNodesEnv` 的 scope 中移除 `runtime`。
+
+**scope 变更**：
+
+| 命令步骤 | 重构前 scope | 重构后 scope (Feature Gate ON) | 重构后 scope (Feature Gate OFF) |
+|---------|-------------|-------------------------------|-------------------------------|
+| K8sEnvInit 第3步 | `time,hosts,dns,kernel,firewall,selinux,swap,httpRepo,runtime,iptables,registry,extra` | `time,hosts,dns,kernel,firewall,selinux,swap,httpRepo,iptables,registry,extra` | `time,hosts,dns,kernel,firewall,selinux,swap,httpRepo,runtime,iptables,registry,extra` (不变) |
+| Reset (DeepRestore=true) | `cert,manifests,container,kubelet,containerRuntime,extra` | `cert,manifests,container,kubelet,extra` | `cert,manifests,container,kubelet,containerRuntime,extra` (不变) |
+
+**DAG 依赖关系变更**：
+
+```
+重构前 (DeployPhases):
+  EnsureBKEAgent → EnsureNodesEnv(含 runtime scope) → EnsureClusterAPIObj → ...
+
+重构后 (Feature Gate ON):
+  EnsureBKEAgent → containerd(binary) → EnsureNodesEnv(去除 runtime) → EnsureClusterAPIObj → ...
+```
+
+containerd 作为独立 DAG 节点：
+- **依赖**：bkeagent（需要 agent 在线才能 SSH 推送）
+- **被依赖**：EnsureNodesEnv（需要容器运行时就绪后才能初始化 kubelet 等环境）
+
+**Feature Gate 兼容层实现**：
+
+```go
+// pkg/command/env.go 扩展
+
+// getK8sEnvInitScope 动态构建 K8sEnvInit 的 scope
+// Feature Gate ON 时移除 runtime（containerd 由 BinaryInstaller 安装）
+func (e *ENV) getK8sEnvInitScope() string {
+    scopes := []string{"time", "hosts", "dns", "kernel", "firewall", "selinux", "swap", "httpRepo"}
+    if !featuregate.Enabled(featuregate.BinaryComponentSupport) {
+        scopes = append(scopes, "runtime") // 旧路径: bkeagent 内置命令安装 containerd
+    }
+    scopes = append(scopes, "iptables", "registry", "extra")
+    return "scope=" + strings.Join(scopes, ",")
+}
+
+// getResetScope 动态构建 Reset 的 scope
+func (e *ENV) getResetScope() string {
+    if e.DeepRestore {
+        if featuregate.Enabled(featuregate.BinaryComponentSupport) {
+            return "scope=cert,manifests,container,kubelet,extra"
+        }
+        return "scope=cert,manifests,container,kubelet,containerRuntime,extra"
+    }
+    return "scope=cert,manifests,container,kubelet,extra"
+}
+```
+
+**EnsureContainerdUpgrade 重构**：
+
+| Feature Gate 状态 | 升级路径 | 说明 |
+|-------------------|---------|------|
+| ON | DAG 中 containerd binary 节点 → `BinaryInstaller.Install(Action=Upgrade)` | SSH 推送安装，替代 `resetContainerd` + `redeployContainerd` |
+| OFF | `EnsureContainerdUpgrade` Phase → `resetContainerd` + `redeployContainerd` | bkeagent 内置命令，行为不变 |
+
+兼容层入口：
+```go
+// 兼容层: EnsureContainerdUpgrade Phase 根据Feature Gate选择路径
+func (e *EnsureContainerdUpgrade) Execute() (ctrl.Result, error) {
+    if featuregate.Enabled(featuregate.BinaryComponentSupport) {
+        // 新路径: 不执行任何操作，containerd 升级由 DAG 中的 binary 节点处理
+        return ctrl.Result{}, nil
+    }
+    // 旧路径: resetContainerd + redeployContainerd
+    return e.rolloutContainerd()
+}
+```
 
 ### 11.4 bkeagent 重构详细设计
 
-#### 11.4.1 当前 EnsureAgentUpgrade Phase 逻辑分析
+#### 11.4.1 当前 Phase 逻辑分析
 
-当前 bkeagent 升级通过硬编码 Phase `EnsureAgentUpgrade` 实现，核心逻辑如下：
+bkeagent 的安装和升级分别由两个 Phase 负责，均通过 SSH 推送二进制文件完成：
 
-1. **版本比较**：比较 `BKECluster.Status.BKEAgentVersion` 与 `Spec.BKEAgentVersion`。
-2. **逐节点滚动升级**：遍历所有节点，逐个执行 SSH 命令。
-3. **硬编码内容**：
-   - 二进制下载 URL：拼接 `releaseRepo + "/bkeagent/" + version + "/bkeagent-" + version + "-linux-" + arch`
-   - bkeagent.conf：内容硬编码，包含集群名称、API Server 地址、日志路径等
-   - TLS 证书：从 Kubernetes Secret `bkeagent-tls` 获取，硬编码 Secret 名称和命名空间
-   - kubeconfig：动态生成，硬编码 CA 证书路径、客户端证书路径、API Server 地址
-   - 安装脚本：硬编码为 SSH 命令序列（停止→备份→安装→配置→启动→验证）
+**安装路径 — `EnsureBKEAgent` Phase**（DeployPhases 第一步）：
+
+1. `EnsureBKEAgent.Execute()` → `loadLocalKubeConfig()` → `getNeedPushNodes()` → `pushAgent()`
+2. `pushAgent()` → `prepareServiceFile()` 生成 bkeagent.service → `performAgentPush()` SSH 推送
+3. SSH 命令序列（`ensure_bke_agent.go:470-498`）：
+   - `executePreCommand`: `chmod 777 /usr/local/bin/` → `systemctl stop bkeagent` → `rm -rf /usr/local/bin/bkeagent*` → `rm -rf /etc/openFuyao/bkeagent`
+   - `executeStartCommand`: 上传 bkeagent 二进制到 `/usr/local/bin/` → `mv bkeagent_* bkeagent` → `chmod +x bkeagent` → 上传 kubeconfig → `systemctl daemon-reload` → `systemctl enable bkeagent` → `systemctl restart bkeagent`
+   - `postCommand`: `chmod 755 /usr/local/bin/` → `chmod 755 /etc/systemd/system/`
+
+**升级路径 — `EnsureAgentUpgrade` Phase**（DeclarativeInlineUpgradePhases）：
+
+1. **版本比较**：`NeedExecuteWithVersionContext(upgrade.ComponentBKEAgent, ...)` 通过 VersionContext 判断是否需要升级
+2. **SSH 推送升级**：`upgradeBKEAgentViaSSH()` → `agentssh.ParamsFromCluster()` 构建下载参数 → `agentssh.DiscoverArchs()` 发现节点架构 → `agentssh.PrepareStaging()` 下载制品到本地暂存 → `agentssh.SSHUpgrade()` SSH 推送
+3. SSH 命令序列（`push_upgrade.go:123-184`）：
+   - `upgradeHostFileFunc`: 上传 `bkeagent_linux_{arch}` 到 `/usr/local/bin/`
+   - `executeUpgradePreCommand`: `systemctl stop bkeagent` → `cp bkeagent bkeagent.bak.{timestamp}`
+   - `executeUpgradeStartCommand`: 上传 bkeagent.service → `mv bkeagent_* bkeagent` → `chmod +x bkeagent` → `systemctl daemon-reload` → `systemctl enable bkeagent` → `systemctl restart bkeagent`
+
+**关键事实**：
+- 制品名为 `bkeagent_linux_{arch}`（`push_upgrade.go:126`），不是 `bkeagent-{version}-linux-{arch}`
+- 安装路径为 `/usr/local/bin/`（`push_upgrade.go:129`）
+- 配置目录为 `/etc/openFuyao/bkeagent`（`push_upgrade.go:131`）
+- bkeagent.service 从 HTTP 仓库下载（`artifacts.go:80-97`），非动态生成
+- 安装和升级均为 SSH 推送模式，与 containerd（bkeagent 内置命令模式）不同
 
 #### 11.4.2 ComponentVersion YAML 完整定义
 
@@ -3481,7 +3586,7 @@ spec:
   binary:
     artifacts:
       - name: bkeagent
-        url: "https://release-repo.openfuyao.cn/binaries/bkeagent/{{version}}/bkeagent-{{version}}-linux-{{arch}}"
+        url: "{{imageRegistry}}/bkeagent/{{version}}/bkeagent_linux_{{arch}}"
         checksum: "sha256:xyz789abc012..."
         installPath: "/usr/local/bin"
         executable: bkeagent
@@ -3663,12 +3768,16 @@ spec:
 | **containerd config.toml** | `diff` 旧路径输出 vs 新路径输出 | 内容一致（模板变量替换后） |
 | **containerd.service** | `diff` 旧路径输出 vs 新路径输出 | 内容一致 |
 | **containerd 版本跳过** | VersionContext 设置相同版本 | `NeedsUpgrade` 返回 false，跳过执行 |
+| **EnsureNodesEnv scope 变更** | Feature Gate ON，检查 `K8sEnvInit` 命令参数 | scope 中无 `runtime` |
+| **containerd 先于 EnsureNodesEnv** | DAG 拓扑顺序 | containerd 在 EnsureNodesEnv 前一批次 |
+| **EnsureContainerdUpgrade 空跳过** | Feature Gate ON，触发升级 | `Execute()` 直接返回 nil，升级由 DAG binary 节点处理 |
 | **bkeagent 全新安装** | Feature Gate 开启，新建集群 | bkeagent 版本正确，服务运行中 |
 | **bkeagent 升级** | Feature Gate 开启，v2.5.0→v2.6.0 | 分批升级（2+1），服务正常 |
+| **bkeagent 制品名** | 检查下载 URL | 包含 `bkeagent_linux_{arch}`，不是 `bkeagent-{version}-linux-{arch}` |
 | **bkeagent.conf** | `diff` 旧路径输出 vs 新路径输出 | 内容一致 |
 | **bkeagent TLS 证书** | 对比远程节点 tls.crt 内容 | 与 Secret 中数据一致 |
 | **bkeagent kubeconfig** | `diff` 旧路径输出 vs 新路径输出 | 内容一致 |
-| **Feature Gate 关闭回退** | 关闭 Feature Gate，执行升级 | 走旧 Phase 路径，行为不变 |
+| **Feature Gate 关闭回退** | 关闭 Feature Gate，执行安装/升级 | EnsureNodesEnv scope 含 `runtime`，EnsureContainerdUpgrade 走旧路径，行为不变 |
 | **混合模式** | containerd 开启、bkeagent 关闭 | containerd 走新路径，bkeagent 走旧路径 |
 
 ---
