@@ -243,7 +243,7 @@
 
 ## 3. ComponentVersion CRD 详细设计
 
-### 3.1 Binary 类型完整字段定义
+### 3.1 ComponentVersion 类型定义
 
 ```go
 // pkg/api/v1alpha1/componentversion_types.go
@@ -265,6 +265,9 @@ type ComponentVersionSpec struct {
     // Helm 类型配置 (type=helm 时必填)
     Helm *HelmSpec `json:"helm,omitempty"`
     
+    // YAML 类型配置 (type=yaml 时必填)
+    YAML *YAMLSpec `json:"yaml,omitempty"`
+    
     // Inline 类型配置 (type=inline 时必填)
     Inline *InlineSpec `json:"inline,omitempty"`
     
@@ -276,6 +279,72 @@ type ComponentVersionSpec struct {
     
     // 升级策略
     UpgradeStrategy UpgradeStrategySpec `json:"upgradeStrategy,omitempty"`
+    
+    // Kubernetes 资源定义列表
+    Resources []ResourceSpec `json:"resources,omitempty"`
+}
+
+// SubComponent 定义子组件引用
+type SubComponent struct {
+    // 子组件名称
+    Name string `json:"name"`
+    
+    // 子组件版本
+    Version string `json:"version"`
+}
+
+// ResourceSpec 定义 Kubernetes 资源
+type ResourceSpec struct {
+    // 资源类型
+    Kind string `json:"kind"`
+    
+    // API 版本
+    APIVersion string `json:"apiVersion"`
+    
+    // 命名空间
+    Namespace string `json:"namespace,omitempty"`
+    
+    // 资源名称
+    Name string `json:"name"`
+    
+    // 标签选择器
+    Labels map[string]string `json:"labels,omitempty"`
+    
+    // Data 字段
+    Data map[string]string `json:"data,omitempty"`
+    
+    // StringData 字段
+    StringData map[string]string `json:"stringData,omitempty"`
+    
+    // 原始 Manifest 内容
+    Manifest string `json:"manifest,omitempty"`
+}
+
+// YAMLSpec 定义 YAML 清单组件规格
+type YAMLSpec struct {
+    // YAML 清单文件列表
+    Manifests []ManifestRef `json:"manifests"`
+    
+    // 部署目标命名空间
+    Namespace string `json:"namespace,omitempty"`
+    
+    // 应用策略: ServerSideApply, Replace, CreateOnly
+    ApplyStrategy string `json:"applyStrategy,omitempty"`
+    
+    // 是否启用裁剪 (按 label selector 删除不再需要的资源)
+    Prune bool `json:"prune,omitempty"`
+    
+    // 裁剪使用的标签选择器
+    PruneLabelSelector map[string]string `json:"pruneLabelSelector,omitempty"`
+}
+
+// ManifestRef 定义 YAML 清单文件引用
+type ManifestRef struct {
+    // 清单文件 URL 或路径
+    URL string `json:"url"`
+    
+    // 校验和
+    Checksum string `json:"checksum,omitempty"`
 }
 
 // BinarySpec 定义二进制组件规格
@@ -405,7 +474,7 @@ type OSSpec struct {
 }
 ```
 
-### 3.2 Helm 类型完整字段定义
+### 3.2 Helm 类型字段定义
 
 ```go
 // HelmSpec 定义 Helm 组件规格
@@ -547,6 +616,64 @@ type HookSpec struct {
     
     // 钩子 Manifest
     Manifest string `json:"manifest"`
+}
+
+// InlineSpec 定义内联执行器配置
+type InlineSpec struct {
+    // Handler 名称 (对应 ComponentFactory 注册的 handler)
+    Handler string `json:"handler"`
+    
+    // Handler 版本
+    Version string `json:"version"`
+}
+
+// ComponentType 定义组件类型
+type ComponentType string
+
+const (
+    ComponentTypeYAML   ComponentType = "yaml"
+    ComponentTypeHelm   ComponentType = "helm"
+    ComponentTypeInline ComponentType = "inline"
+    ComponentTypeBinary ComponentType = "binary"
+)
+
+// CompatibilitySpec 定义兼容性约束
+type CompatibilitySpec struct {
+    // 约束列表
+    Constraints []Constraint `json:"constraints,omitempty"`
+}
+
+// Constraint 定义单个兼容性约束
+type Constraint struct {
+    // 依赖组件名称
+    Component string `json:"component"`
+    
+    // 版本规则 (semver range, 如 ">=1.26.0")
+    Rule string `json:"rule"`
+}
+
+// Dependency 定义组件间依赖关系
+type Dependency struct {
+    // 依赖组件名称
+    Name string `json:"name"`
+    
+    // 依赖阶段 (Install / Upgrade)
+    Phase string `json:"phase,omitempty"`
+}
+
+// UpgradeStrategySpec 定义升级策略
+type UpgradeStrategySpec struct {
+    // 升级模式: Rolling / Parallel / Batch
+    Mode string `json:"mode,omitempty"`
+    
+    // 批量大小 (Batch 模式下每批节点数)
+    BatchSize int `json:"batchSize,omitempty"`
+    
+    // 超时时间
+    Timeout string `json:"timeout,omitempty"`
+    
+    // 失败策略: FailFast / Continue / Rollback
+    FailurePolicy string `json:"failurePolicy,omitempty"`
 }
 ```
 
