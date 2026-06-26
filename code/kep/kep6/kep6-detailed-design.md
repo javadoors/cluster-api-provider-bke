@@ -970,6 +970,29 @@ type BinaryInstaller struct {
     renderer   *TemplateRenderer  // 复用 TemplateRenderer
 }
 
+**设计思路 — Install 与 Upgrade 共用 InstallScript**：
+
+`BinaryAction` 有三个值（Install/Upgrade/Uninstall），但 `BinarySpec` 只有 `InstallScript` 和 `UninstallScript` 两个脚本，没有 `UpgradeScript`。这是有意的：
+
+1. **Install 和 Upgrade 本质是同一操作**——"让目标版本成为运行版本"，区别仅在于是否有旧版本存在。大部分步骤相同（下载→解压→配置→启动），仅少数步骤不同（备份旧版本、停止旧服务）。
+2. **通过 `{{if .isUpgrade}}` 条件渲染区分差异**，以 containerd 为例：备份步骤仅在升级时执行，其余步骤完全一致。避免 90% 代码重复。
+3. **不设 UpgradeScript 的原因**：① 避免用户编写维护两份高度重复的脚本；② 防止 Install 和 Upgrade 行为漂移（一份脚本改了另一份忘改）；③ 与 Helm Chart 模板惯例一致（`helm install` 和 `helm upgrade` 渲染同一套模板）。
+4. **Uninstall 独立 UninstallScript 的原因**：卸载与安装是逆向操作（停止服务→删除二进制→清理配置→清理数据），逻辑完全不同，无法共用。
+
+**`isUpgrade` 的来源链路**：
+
+```
+VersionContext.HasCurrent("containerd")    // 版本事实: 组件是否已安装
+  → true: BinaryActionUpgrade              // Executor 自主决定: 已安装 → 升级
+  → false: BinaryActionInstall             // Executor 自主决定: 未安装 → 安装
+    → InstallOptions.Action 传递给 BinaryInstaller.Install()
+      → tmplCtx.IsUpgrade = (Action == Upgrade)   // 填入 TemplateContext
+        → 模板渲染: {{if .isUpgrade}}...{{end}}    // installScript 中条件渲染
+```
+
+`isUpgrade` 不是用户配置，而是由 `VersionContext` 在运行时推断：`HasCurrent` 返回 true（组件已安装）→ `BinaryActionUpgrade` → `tmplCtx.IsUpgrade = true` → 模板中 `{{if .isUpgrade}}` 生效。
+
+```go
 // InstallOptions 安装选项
 type InstallOptions struct {
     Component   *ComponentVersion
@@ -1034,19 +1057,23 @@ func (i *BinaryInstaller) Install(ctx context.Context, opts InstallOptions) erro
     tmplCtx.DataPath = binary.DefaultDataPath
     tmplCtx.BinPath = binary.DefaultBinPath
     
-    // 5. 渲染安装脚本 (使用完整的 TemplateContext)
+    // 5. 填充操作类型 (从 InstallOptions.Action → TemplateContext, 供模板 {{isUpgrade}} 引用)
+    tmplCtx.Action = string(opts.Action)
+    tmplCtx.IsUpgrade = opts.Action == BinaryActionUpgrade
+    
+    // 6. 渲染安装脚本 (使用完整的 TemplateContext)
     script, err := i.renderer.RenderScript(binary.InstallScript, tmplCtx)
     if err != nil {
         return fmt.Errorf("failed to render install script: %w", err)
     }
     
-    // 6. 渲染配置文件模板
+    // 7. 渲染配置文件模板
     configs, err := i.renderConfigTemplates(binary.ConfigTemplates, tmplCtx)
     if err != nil {
         return fmt.Errorf("failed to render config templates: %w", err)
     }
     
-    // 7. SSH 执行安装
+    // 8. SSH 执行安装
     switch opts.Action {
     case BinaryActionInstall, BinaryActionUpgrade:
         return i.executeInstall(ctx, tmplCtx.NodeIP, script, artifacts, configs)
@@ -1538,6 +1565,10 @@ type TemplateContext struct {
     DataPath          string
     BinPath           string
     
+    // 新增：操作类型 (从 InstallOptions.Action 填充, 供模板 {{isUpgrade}} 等引用)
+    Action            string  // "Install" / "Upgrade" / "Uninstall"
+    IsUpgrade         bool    // Action == "Upgrade" 时为 true
+    
     // 新增：自定义变量
     Variables         map[string]string
 }
@@ -1645,11 +1676,13 @@ fi
 
 #### 7. 操作类型变量 (Action Variables)
 
-| 变量 | 说明 | TemplateContext 字段 | 示例值 |
-|------|------|---------------------|--------|
-| `{{action}}` | 操作类型 | 运行时确定 | `install` / `upgrade` / `uninstall` |
-| `{{isUpgrade}}` | 是否升级 | 运行时确定 | `true` / `false` |
-| `{{isInstall}}` | 是否安装 | 运行时确定 | `true` / `false` |
+| 变量 | 说明 | 来源 | 示例值 |
+|------|------|------|--------|
+| `{{action}}` | 操作类型 | `TemplateContext.Action`（从 `InstallOptions.Action` 填充） | `Install` / `Upgrade` / `Uninstall` |
+| `{{isUpgrade}}` | 是否升级 | `TemplateContext.IsUpgrade`（`Action == Upgrade` 时为 true） | `true` / `false` |
+| `{{isInstall}}` | 是否安装 | `TemplateContext.Action == Install` | `true` / `false` |
+
+**`isUpgrade` 的来源链路**：`VersionContext.HasCurrent()` → `BinaryActionUpgrade` → `InstallOptions.Action` → `tmplCtx.IsUpgrade` → 模板 `{{if .isUpgrade}}`
 
 #### 8. 自定义变量 (Custom Variables)
 
