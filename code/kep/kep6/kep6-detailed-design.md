@@ -3993,7 +3993,7 @@ spec:
 #### 16.1.1 ComponentVersion YAML 样例
 
 ```yaml
-# bke-manifests/containerd/v1.7.18/component.yaml
+# bke-manifests/containerd/v1.7.18/component.yaml (简化示例，完整定义见 11.3.2)
 apiVersion: config.openfuyao.cn/v1alpha1
 kind: ComponentVersion
 metadata:
@@ -4013,10 +4013,12 @@ spec:
       #!/bin/bash
       set -e
       systemctl stop containerd || true
-      tar -xzf {{artifact.containerd.path}} -C /usr/local
-      chmod +x /usr/local/bin/containerd
+      tar -xzf {{artifact.containerd.path}} -C {{installPath}}
+      chmod +x {{binPath}}/containerd
       systemctl daemon-reload
+      systemctl enable containerd
       systemctl start containerd
+      {{binPath}}/containerd --version
     supportedArchitectures: ["amd64", "arm64"]
     supportedOS:
       - name: centos
@@ -4025,6 +4027,9 @@ spec:
         versions: ["20.04", "22.04"]
     defaultInstallPath: "/usr/local"
     defaultConfigPath: "/etc/containerd"
+    defaultLogPath: "/var/log/containerd"
+    defaultDataPath: "/var/lib/containerd"
+    defaultBinPath: "/usr/local/bin"
   upgradeStrategy:
     mode: Rolling
     failurePolicy: FailFast

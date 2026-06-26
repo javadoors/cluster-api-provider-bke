@@ -59,7 +59,7 @@
 | installScript | 8 类 50+ 模板变量、条件渲染、自定义变量 |
 | DAG 集成 | BinaryComponentExecutor、HelmComponentExecutor、YAMLManifestExecutor 集成到 DAG 调度器 |
 | VersionContext | 携带版本事实（已安装版本、目标版本），Executor 自主决定 Install/Upgrade/Skip |
-| Phase 迁移 | 移除 `EnsureContainerdUpgrade`、`EnsureBKEAgent`、`EnsureAgentUpgrade` 硬编码逻辑 |
+| Phase 迁移 | 移除 `EnsureContainerdUpgrade`、`EnsureBKEAgent`、`EnsureAgentUpgrade` 硬编码逻辑；`EnsureNodesEnv` 移除 `runtime` scope（containerd 安装由 BinaryInstaller 接管） |
 
 ### 3.2 约束
 
@@ -135,17 +135,13 @@ spec:
       maxConcurrentDownloads: 10
       snapshotter: "overlayfs"
     
-    # 二进制制品定义
+    # 二进制制品定义 (tar.gz 包含 containerd, containerd-shim-runc-v2, ctr)
     artifacts:
       - name: containerd
         url: "https://release-repo.openfuyao.cn/binaries/containerd/{{componentVersion}}/containerd-{{componentVersion}}-linux-{{nodeArch}}.tar.gz"
         checksum: "sha256:abc123..."
-        installPath: "/usr/local/bin"
-      
-      - name: containerd-shim-runc-v2
-        url: "https://release-repo.openfuyao.cn/binaries/containerd/{{componentVersion}}/containerd-shim-runc-v2-{{componentVersion}}-linux-{{nodeArch}}"
-        checksum: "sha256:def456..."
-        installPath: "/usr/local/bin"
+        installPath: "/usr/local"
+        executable: containerd
     
     # 配置文件模板
     configTemplates:
@@ -202,22 +198,23 @@ spec:
       
       # 3. 备份旧版本 (仅升级时)
       {{if .isUpgrade}}
-      cp /usr/local/bin/containerd /usr/local/bin/containerd.bak.$(date +%Y%m%d%H%M%S)
+      cp {{binPath}}/containerd {{binPath}}/containerd.bak.$(date +%Y%m%d%H%M%S)
       {{end}}
       
-      # 4. 安装新二进制
+      # 4. 安装新二进制 (tar.gz 包含 containerd, containerd-shim-runc-v2, ctr)
       tar -xzf "{{artifact.containerd.path}}" -C {{installPath}}
+      chmod +x {{binPath}}/containerd
       
       # 5. 启动并验证
       systemctl daemon-reload && systemctl enable containerd && systemctl start containerd
-      /usr/local/bin/containerd --version
+      {{binPath}}/containerd --version
     
     # 卸载脚本
     uninstallScript: |
       #!/bin/bash
       systemctl stop containerd || true
       systemctl disable containerd || true
-      rm -f /usr/local/bin/containerd /usr/local/bin/ctr
+      rm -f {{binPath}}/containerd {{binPath}}/containerd-shim-runc-v2 {{binPath}}/ctr
       rm -f /etc/systemd/system/containerd.service
       systemctl daemon-reload
     
@@ -688,7 +685,7 @@ spec:
 | **Phase 1** | 第1周 | 实现 BinaryInstaller 核心逻辑 (下载/缓存/渲染/SSH) | 低 (独立组件) | 不启用 Feature Gate |
 | **Phase 2** | 第2周 | 实现 HelmInstaller 核心逻辑 (Chart/Values/Action) | 低 (独立组件) | 不启用 Feature Gate |
 | **Phase 3** | 第3周 | 创建 containerd/bkeagent/coredns 的 ComponentVersion YAML | 低 (声明式配置) | 回退到旧 YAML |
-| **Phase 4** | 第4周 | 集成 BinaryComponentExecutor/HelmComponentExecutor 到 DAG | 中 (需充分测试) | 关闭 Feature Gate |
+| **Phase 4** | 第4周 | 集成 BinaryComponentExecutor/HelmComponentExecutor 到 DAG；`EnsureNodesEnv` 移除 `runtime` scope | 中 (需充分测试) | 关闭 Feature Gate |
 | **Phase 5** | 第5周 | 灰度发布：新集群使用新路径，旧集群保持旧路径 | 中 (需要监控) | 切换回旧路径 |
 | **Phase 6** | 第6周 | 移除旧 Phase 代码 (`EnsureContainerdUpgrade` 等) | 高 (需要回滚预案) | 保留旧代码分支 |
 
