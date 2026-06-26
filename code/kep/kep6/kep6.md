@@ -160,6 +160,27 @@ spec:
               sandbox_image = "{{imageRegistry}}/pause:3.9"
               [plugins."io.containerd.grpc.v1.cri".containerd]
                 snapshotter = "{{.Variables.snapshotter}}"
+      
+      - name: containerd.service
+        path: "/etc/systemd/system/containerd.service"
+        mode: "0644"
+        owner: "root:root"
+        content: |
+          [Unit]
+          Description=containerd container runtime
+          Documentation=https://containerd.io
+          After=network.target
+
+          [Service]
+          ExecStartPre=/sbin/modprobe overlay
+          ExecStart=/usr/local/bin/containerd
+          Restart=always
+          RestartSec=5
+          Delegate=yes
+          KillMode=process
+
+          [Install]
+          WantedBy=multi-user.target
     
     # 安装脚本
     installScript: |
