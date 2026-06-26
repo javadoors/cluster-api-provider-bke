@@ -1019,19 +1019,26 @@ func (i *BinaryInstaller) Install(ctx context.Context, opts InstallOptions) erro
     // 3. 填充自定义变量
     tmplCtx.Variables = binary.Variables
     
-    // 4. 渲染安装脚本 (使用完整的 TemplateContext)
+    // 4. 填充默认路径变量 (从 BinarySpec.Default*Path → TemplateContext)
+    tmplCtx.InstallPath = binary.DefaultInstallPath
+    tmplCtx.ConfigPath = binary.DefaultConfigPath
+    tmplCtx.LogPath = binary.DefaultLogPath
+    tmplCtx.DataPath = binary.DefaultDataPath
+    tmplCtx.BinPath = binary.DefaultBinPath
+    
+    // 5. 渲染安装脚本 (使用完整的 TemplateContext)
     script, err := i.renderer.RenderScript(binary.InstallScript, tmplCtx)
     if err != nil {
         return fmt.Errorf("failed to render install script: %w", err)
     }
     
-    // 5. 渲染配置文件模板
+    // 6. 渲染配置文件模板
     configs, err := i.renderConfigTemplates(binary.ConfigTemplates, tmplCtx)
     if err != nil {
         return fmt.Errorf("failed to render config templates: %w", err)
     }
     
-    // 6. SSH 执行安装
+    // 7. SSH 执行安装
     switch opts.Action {
     case BinaryActionInstall, BinaryActionUpgrade:
         return i.executeInstall(ctx, tmplCtx.NodeIP, script, artifacts, configs)
@@ -1512,6 +1519,13 @@ type TemplateContext struct {
     // 新增：镜像仓库
     ImageRegistry     string
     ImagePullSecret   string
+    
+    // 新增：默认路径 (从 BinarySpec.Default*Path 填充)
+    InstallPath       string
+    ConfigPath        string
+    LogPath           string
+    DataPath          string
+    BinPath           string
     
     // 新增：自定义变量
     Variables         map[string]string
@@ -3349,29 +3363,29 @@ spec:
 
       # 3. 备份旧版本 (仅升级时)
       {{if .isUpgrade}}
-      cp /usr/local/bin/containerd /usr/local/bin/containerd.bak.$(date +%Y%m%d%H%M%S)
+      cp {{binPath}}/containerd {{binPath}}/containerd.bak.$(date +%Y%m%d%H%M%S)
       {{end}}
 
       # 4. 解压并安装新二进制
-      tar -xzf {{artifact.containerd.path}} -C /usr/local
-      chmod +x /usr/local/bin/containerd
-      install -m 0755 {{artifact.containerd-shim-runc-v2.path}} /usr/local/bin/containerd-shim-runc-v2
+      tar -xzf {{artifact.containerd.path}} -C {{installPath}}
+      chmod +x {{binPath}}/containerd
+      install -m 0755 {{artifact.containerd-shim-runc-v2.path}} {{binPath}}/containerd-shim-runc-v2
 
       # 5. 安装配置文件和服务 (由 ConfigRenderer 自动上传)
-      # config.toml → /etc/containerd/config.toml
+      # config.toml → {{configPath}}/config.toml
       # containerd.service → /etc/systemd/system/containerd.service
 
       # 6. 启动并验证
       systemctl daemon-reload
       systemctl enable containerd
       systemctl start containerd
-      /usr/local/bin/containerd --version
+      {{binPath}}/containerd --version
 
     uninstallScript: |
       #!/bin/bash
       systemctl stop containerd || true
       systemctl disable containerd || true
-      rm -f /usr/local/bin/containerd /usr/local/bin/containerd-shim-runc-v2 /usr/local/bin/ctr
+      rm -f {{binPath}}/containerd {{binPath}}/containerd-shim-runc-v2 {{binPath}}/ctr
       rm -f /etc/systemd/system/containerd.service
       systemctl daemon-reload
 
@@ -3529,26 +3543,26 @@ spec:
       # 版本: {{componentVersion}}, 操作: {{action}}
 
       # 1. 创建目录
-      mkdir -p /etc/openFuyao/bkeagent
-      mkdir -p /var/log/bkeagent
+      mkdir -p {{configPath}}
+      mkdir -p {{logPath}}
 
       # 2. 停止旧服务
       systemctl stop bkeagent || true
 
       # 3. 备份旧版本 (仅升级时)
       {{if .isUpgrade}}
-      cp /usr/local/bin/bkeagent /usr/local/bin/bkeagent.bak.$(date +%Y%m%d%H%M%S)
+      cp {{binPath}}/bkeagent {{binPath}}/bkeagent.bak.$(date +%Y%m%d%H%M%S)
       {{end}}
 
       # 4. 安装新二进制
-      install -m 0755 {{artifact.bkeagent.path}} /usr/local/bin/bkeagent
+      install -m 0755 {{artifact.bkeagent.path}} {{binPath}}/bkeagent
 
       # 5. 安装 systemd service (由 ConfigRenderer 自动上传配置文件)
-      # bkeagent.conf → /etc/openFuyao/bkeagent/bkeagent.conf
-      # tls.crt → /etc/openFuyao/bkeagent/tls.crt
-      # tls.key → /etc/openFuyao/bkeagent/tls.key
-      # ca.crt → /etc/openFuyao/bkeagent/ca.crt
-      # kubeconfig → /etc/openFuyao/bkeagent/kubeconfig
+      # bkeagent.conf → {{configPath}}/bkeagent.conf
+      # tls.crt → {{configPath}}/tls.crt
+      # tls.key → {{configPath}}/tls.key
+      # ca.crt → {{configPath}}/ca.crt
+      # kubeconfig → {{configPath}}/kubeconfig
 
       cat > /etc/systemd/system/bkeagent.service << 'EOF'
       [Unit]
@@ -3556,7 +3570,7 @@ spec:
       After=network.target
 
       [Service]
-      ExecStart=/usr/local/bin/bkeagent --config /etc/openFuyao/bkeagent/bkeagent.conf
+      ExecStart={{binPath}}/bkeagent --config {{configPath}}/bkeagent.conf
       Restart=always
       RestartSec=5
 
@@ -3575,9 +3589,9 @@ spec:
       #!/bin/bash
       systemctl stop bkeagent || true
       systemctl disable bkeagent || true
-      rm -f /usr/local/bin/bkeagent
+      rm -f {{binPath}}/bkeagent
       rm -f /etc/systemd/system/bkeagent.service
-      rm -rf /etc/openFuyao/bkeagent
+      rm -rf {{configPath}}
       systemctl daemon-reload
 
     supportedArchitectures: ["amd64", "arm64"]
