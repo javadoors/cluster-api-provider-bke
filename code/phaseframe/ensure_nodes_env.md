@@ -1,3 +1,35 @@
+#  `Reset(scope=container)` 的作用
+
+## `Reset(scope=container)` 的作用
+
+`Reset` 命令的 `scope=container` 对应 `CleanContainerPhase`（`cleanphases.go:240`），其清理函数为 `ContainerClean`（`clean.go:314`）。
+
+**作用：清理节点上所有正在运行的容器（不含容器运行时本身）**
+
+具体逻辑：
+1. 自动检测容器运行时类型（Docker / Containerd）
+2. 如果是 Containerd：
+   - 通过 `crictl` 列出所有容器 ID
+   - 逐个 `crictl stop` → `crictl rm` 停止并删除容器
+   - 失败时尝试 `crictl rm -f` 强制删除
+3. 如果是 Docker：
+   - 通过 `docker ps -a --filter name=k8s_` 列出所有 K8s 容器
+   - 逐个 `docker stop` → `docker rm --volumes` 停止并删除
+
+**与 `containerRuntime` scope 的区别**：
+
+| scope | 对应函数 | 清理内容 | 破坏性 |
+|-------|---------|---------|--------|
+| `container` | `ContainerClean` | 停止并删除所有运行中的容器 | 中（可重新拉起） |
+| `containerRuntime` | `ContainerRuntimeClean` | 停止并卸载整个容器运行时（containerd/docker 二进制、配置、数据目录、CNI） | 高（需重装运行时） |
+| `containerd-cfg` | `ContainerdCfgClean` | 停止 containerd 服务 + 删除 containerd 二进制和配置文件 | 高（需重装 containerd） |
+
+**在 `EnsureNodesEnv` 中的位置**：
+
+`EnsureNodesEnv` 发送 `Reset` 命令时 scope 为 `cert,manifests,container,kubelet,extra`（非 DeepRestore）或 `cert,manifests,container,kubelet,containerRuntime,extra`（DeepRestore）。`container` scope 在此处的作用是：在节点环境初始化前，先清理掉所有遗留的容器，确保干净的环境。
+
+**对重构的影响**：`container` scope 清理的是容器实例（Pod），不是 containerd 二进制。重构后 containerd 安装由 BinaryInstaller 接管，但 `container` scope 仍需保留在 `EnsureNodesEnv` 的 Reset 命令中——它清理的是运行中的容器，与 containerd 安装方式无关。需要移除的仅是 `runtime`（K8sEnvInit 中安装 containerd）和 `containerRuntime`（DeepRestore 时卸载容器运行时）。
+
 # `ensure_nodes_env.go` 的设计
 **`ensure_nodes_env.go` 的设计核心是：在集群生命周期的某个阶段，统一检查并初始化节点环境，确保节点具备运行 Kubernetes 所需的基础依赖与脚本。它通过 Phase 框架抽象出一个可重用的阶段，结合节点状态标记、命令执行、脚本安装和条件同步，形成一个声明式、可编排的节点环境初始化流程。**
 ## 📑 设计要点
