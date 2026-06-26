@@ -3246,6 +3246,417 @@ var defaultFeatureGates = map[string]bool{
 }
 ```
 
+### 11.3 containerd 重构详细设计
+
+#### 11.3.1 当前 EnsureContainerdUpgrade Phase 逻辑分析
+
+当前 containerd 升级通过硬编码 Phase `EnsureContainerdUpgrade` 实现，核心逻辑如下：
+
+1. **版本比较**：`isContainerdNeedUpgrade` 比较 `BKECluster.Status.ContainerdVersion` 与 `BKECluster.Spec.ClusterConfig.Cluster.ContainerdVersion`，若目标版本高于当前版本则触发升级。
+2. **逐节点滚动升级**：`rolloutContainerd` 遍历所有节点，逐个执行 SSH 命令。
+3. **硬编码内容**：
+   - 二进制下载 URL：拼接 `releaseRepo + "/containerd/" + version + "/containerd-" + version + "-linux-" + arch + ".tar.gz"`
+   - 架构适配：`arch` 从节点信息获取，硬编码为 `amd64` 或 `arm64`
+   - config.toml：内容硬编码在 Go 代码中，通过字符串拼接生成
+   - containerd.service：systemd 服务文件硬编码在 Go 代码中
+   - 安装脚本：硬编码为 SSH 命令序列（停止→备份→下载→解压→启动→验证）
+   - 升级策略：固定为逐节点滚动，不可配置
+
+#### 11.3.2 ComponentVersion YAML 完整定义
+
+```yaml
+# bke-manifests/containerd/v1.7.18/component.yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: containerd-v1.7.18
+spec:
+  name: containerd
+  type: binary
+  version: v1.7.18
+
+  binary:
+    variables:
+      logLevel: "info"
+      snapshotter: "overlayfs"
+      sandboxImage: "{{imageRegistry}}/pause:3.9"
+
+    artifacts:
+      - name: containerd
+        url: "https://release-repo.openfuyao.cn/binaries/containerd/{{version}}/containerd-{{version}}-linux-{{arch}}.tar.gz"
+        checksum: "sha256:abc123def456..."
+        installPath: "/usr/local"
+        executable: containerd
+      - name: containerd-shim-runc-v2
+        url: "https://release-repo.openfuyao.cn/binaries/containerd/{{version}}/containerd-shim-runc-v2-{{version}}-linux-{{arch}}"
+        checksum: "sha256:def456ghi789..."
+        installPath: "/usr/local/bin"
+        executable: containerd-shim-runc-v2
+
+    configTemplates:
+      - name: config.toml
+        path: "/etc/containerd/config.toml"
+        mode: "0644"
+        owner: "root:root"
+        content: |
+          version = 2
+          [plugins]
+            [plugins."io.containerd.grpc.v1.cri"]
+              sandbox_image = "{{.Variables.sandboxImage}}"
+              [plugins."io.containerd.grpc.v1.cri".containerd]
+                snapshotter = "{{.Variables.snapshotter}}"
+              [plugins."io.containerd.grpc.v1.cri".registry]
+                [plugins."io.containerd.grpc.v1.cri".registry.mirrors]
+                  [plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
+                    endpoint = ["https://{{imageRegistry}}"]
+
+      - name: containerd.service
+        path: "/etc/systemd/system/containerd.service"
+        mode: "0644"
+        owner: "root:root"
+        content: |
+          [Unit]
+          Description=containerd container runtime
+          Documentation=https://containerd.io
+          After=network.target
+
+          [Service]
+          ExecStartPre=/sbin/modprobe overlay
+          ExecStart=/usr/local/bin/containerd
+          Restart=always
+          RestartSec=5
+          Delegate=yes
+          KillMode=process
+
+          [Install]
+          WantedBy=multi-user.target
+
+    installScript: |
+      #!/bin/bash
+      set -e
+      # 集群: {{clusterName}}, 节点: {{nodeIP}} ({{nodeRole}})
+      # 架构: {{nodeArch}}, 版本: {{componentVersion}}, 操作: {{action}}
+
+      # 1. 环境检查
+      {{if eq .nodeOS "centos"}}
+      yum install -y libseccomp || true
+      {{else if eq .nodeOS "ubuntu"}}
+      apt-get update && apt-get install -y libseccomp2 || true
+      {{end}}
+
+      # 2. 停止旧服务
+      systemctl stop containerd || true
+
+      # 3. 备份旧版本 (仅升级时)
+      {{if .isUpgrade}}
+      cp /usr/local/bin/containerd /usr/local/bin/containerd.bak.$(date +%Y%m%d%H%M%S)
+      {{end}}
+
+      # 4. 解压并安装新二进制
+      tar -xzf {{artifact.containerd.path}} -C /usr/local
+      chmod +x /usr/local/bin/containerd
+      install -m 0755 {{artifact.containerd-shim-runc-v2.path}} /usr/local/bin/containerd-shim-runc-v2
+
+      # 5. 安装配置文件和服务 (由 ConfigRenderer 自动上传)
+      # config.toml → /etc/containerd/config.toml
+      # containerd.service → /etc/systemd/system/containerd.service
+
+      # 6. 启动并验证
+      systemctl daemon-reload
+      systemctl enable containerd
+      systemctl start containerd
+      /usr/local/bin/containerd --version
+
+    uninstallScript: |
+      #!/bin/bash
+      systemctl stop containerd || true
+      systemctl disable containerd || true
+      rm -f /usr/local/bin/containerd /usr/local/bin/containerd-shim-runc-v2 /usr/local/bin/ctr
+      rm -f /etc/systemd/system/containerd.service
+      systemctl daemon-reload
+
+    supportedArchitectures: ["amd64", "arm64"]
+    supportedOS:
+      - name: centos
+        versions: ["7", "8"]
+      - name: ubuntu
+        versions: ["20.04", "22.04"]
+      - name: kylin
+        versions: ["V10"]
+
+    defaultInstallPath: "/usr/local"
+    defaultConfigPath: "/etc/containerd"
+    defaultLogPath: "/var/log/containerd"
+    defaultDataPath: "/var/lib/containerd"
+    defaultBinPath: "/usr/local/bin"
+
+  compatibility:
+    constraints:
+      - component: kubernetes-master
+        rule: ">=1.26.0"
+
+  dependencies:
+    - name: bkeagent
+      phase: Upgrade
+
+  upgradeStrategy:
+    mode: Rolling
+    batchSize: 1
+    timeout: "10m"
+    failurePolicy: FailFast
+```
+
+#### 11.3.3 字段映射表
+
+| 旧硬编码逻辑 | 新 ComponentVersion 字段 | 说明 |
+|-------------|------------------------|------|
+| `Spec.ClusterConfig.Cluster.ContainerdVersion` | `spec.version` | 版本号 |
+| 下载 URL 字符串拼接 | `binary.artifacts[].url`（含 `{{version}}/{{arch}}` 模板） | 制品地址声明式化 |
+| `checksum` 硬编码常量 | `binary.artifacts[].checksum` | 校验和声明式化 |
+| `installPath` 硬编码 `/usr/local/bin` | `binary.artifacts[].installPath` | 安装路径可配置 |
+| config.toml Go 代码拼接 | `binary.configTemplates[0].content`（Go template） | 配置模板声明式化 |
+| containerd.service Go 代码硬编码 | `binary.configTemplates[1].content` | systemd 服务声明式化 |
+| SSH 命令序列硬编码 | `binary.installScript`（Go template） | 安装脚本声明式化 |
+| `arch` 硬编码 `linux_{arch}` | `{{arch}}` 模板变量 | 架构适配模板化 |
+| `isContainerdNeedUpgrade()` 版本比较 | `VersionContext.NeedsUpgrade("containerd")` | 版本决策声明式化 |
+| 固定逐节点滚动 | `upgradeStrategy.mode: Rolling` | 升级策略可配置 |
+| 无失败策略 | `upgradeStrategy.failurePolicy: FailFast` | 失败策略可配置 |
+| 无超时控制 | `upgradeStrategy.timeout: "10m"` | 超时可配置 |
+| 不支持卸载 | `binary.uninstallScript` | 卸载脚本声明式化 |
+
+#### 11.3.4 行为等价性验证点
+
+| 验证项 | 旧路径 (EnsureContainerdUpgrade) | 新路径 (BinaryInstaller) | 验证方法 |
+|--------|--------------------------------|------------------------|---------|
+| 二进制文件路径 | `/usr/local/bin/containerd` | `artifacts[0].installPath` = `/usr/local` | 检查远程节点文件路径一致 |
+| config.toml 内容 | Go 代码拼接 | Go template 渲染 | `diff` 对比两份输出 |
+| containerd.service 内容 | Go 代码硬编码 | `configTemplates[1].content` | `diff` 对比两份输出 |
+| 安装执行顺序 | 停止→备份→下载→解压→启动 | installScript: 停止→备份→解压→启动 | 对比 SSH 执行日志 |
+| 版本比较逻辑 | `Status.ContainerdVersion != Spec.ContainerdVersion` | `VersionContext.NeedsUpgrade()` | 相同版本输入，决策结果一致 |
+| 架构适配 | `arch == "amd64" \|\| arch == "arm64"` | `{{arch}}` 模板替换 | amd64/arm64 节点分别验证 |
+| 滚动升级行为 | 逐节点串行 | `upgradeStrategy.mode: Rolling` | 3 节点集群验证逐节点执行 |
+
+### 11.4 bkeagent 重构详细设计
+
+#### 11.4.1 当前 EnsureAgentUpgrade Phase 逻辑分析
+
+当前 bkeagent 升级通过硬编码 Phase `EnsureAgentUpgrade` 实现，核心逻辑如下：
+
+1. **版本比较**：比较 `BKECluster.Status.BKEAgentVersion` 与 `Spec.BKEAgentVersion`。
+2. **逐节点滚动升级**：遍历所有节点，逐个执行 SSH 命令。
+3. **硬编码内容**：
+   - 二进制下载 URL：拼接 `releaseRepo + "/bkeagent/" + version + "/bkeagent-" + version + "-linux-" + arch`
+   - bkeagent.conf：内容硬编码，包含集群名称、API Server 地址、日志路径等
+   - TLS 证书：从 Kubernetes Secret `bkeagent-tls` 获取，硬编码 Secret 名称和命名空间
+   - kubeconfig：动态生成，硬编码 CA 证书路径、客户端证书路径、API Server 地址
+   - 安装脚本：硬编码为 SSH 命令序列（停止→备份→安装→配置→启动→验证）
+
+#### 11.4.2 ComponentVersion YAML 完整定义
+
+```yaml
+# bke-manifests/bkeagent/v2.6.0/component.yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: bkeagent-v2.6.0
+spec:
+  name: bkeagent
+  type: binary
+  version: v2.6.0
+
+  binary:
+    artifacts:
+      - name: bkeagent
+        url: "https://release-repo.openfuyao.cn/binaries/bkeagent/{{version}}/bkeagent-{{version}}-linux-{{arch}}"
+        checksum: "sha256:xyz789abc012..."
+        installPath: "/usr/local/bin"
+        executable: bkeagent
+
+    configTemplates:
+      - name: bkeagent.conf
+        path: "/etc/openFuyao/bkeagent/bkeagent.conf"
+        mode: "0644"
+        owner: "root:root"
+        content: |
+          cluster_name: {{clusterName}}
+          api_server: {{apiServer}}
+          kubeconfig_path: /etc/openFuyao/bkeagent/kubeconfig
+          log_level: info
+          log_path: /var/log/bkeagent/bkeagent.log
+
+      - name: tls.crt
+        path: "/etc/openFuyao/bkeagent/tls.crt"
+        mode: "0600"
+        owner: "root:root"
+        secretRef:
+          name: bkeagent-tls
+          namespace: "{{clusterNamespace}}"
+          key: tls.crt
+
+      - name: tls.key
+        path: "/etc/openFuyao/bkeagent/tls.key"
+        mode: "0600"
+        owner: "root:root"
+        secretRef:
+          name: bkeagent-tls
+          namespace: "{{clusterNamespace}}"
+          key: tls.key
+
+      - name: ca.crt
+        path: "/etc/openFuyao/bkeagent/ca.crt"
+        mode: "0644"
+        owner: "root:root"
+        secretRef:
+          name: bkeagent-tls
+          namespace: "{{clusterNamespace}}"
+          key: ca.crt
+
+      - name: kubeconfig
+        path: "/etc/openFuyao/bkeagent/kubeconfig"
+        mode: "0600"
+        owner: "root:root"
+        kubeconfigTemplate:
+          clusterName: "{{clusterName}}"
+          apiServer: "{{apiServer}}"
+          caCertPath: "/etc/openFuyao/bkeagent/ca.crt"
+          clientCertPath: "/etc/openFuyao/bkeagent/tls.crt"
+          clientKeyPath: "/etc/openFuyao/bkeagent/tls.key"
+
+    installScript: |
+      #!/bin/bash
+      set -e
+      # 集群: {{clusterName}}, 节点: {{nodeIP}} ({{nodeRole}})
+      # 版本: {{componentVersion}}, 操作: {{action}}
+
+      # 1. 创建目录
+      mkdir -p /etc/openFuyao/bkeagent
+      mkdir -p /var/log/bkeagent
+
+      # 2. 停止旧服务
+      systemctl stop bkeagent || true
+
+      # 3. 备份旧版本 (仅升级时)
+      {{if .isUpgrade}}
+      cp /usr/local/bin/bkeagent /usr/local/bin/bkeagent.bak.$(date +%Y%m%d%H%M%S)
+      {{end}}
+
+      # 4. 安装新二进制
+      install -m 0755 {{artifact.bkeagent.path}} /usr/local/bin/bkeagent
+
+      # 5. 安装 systemd service (由 ConfigRenderer 自动上传配置文件)
+      # bkeagent.conf → /etc/openFuyao/bkeagent/bkeagent.conf
+      # tls.crt → /etc/openFuyao/bkeagent/tls.crt
+      # tls.key → /etc/openFuyao/bkeagent/tls.key
+      # ca.crt → /etc/openFuyao/bkeagent/ca.crt
+      # kubeconfig → /etc/openFuyao/bkeagent/kubeconfig
+
+      cat > /etc/systemd/system/bkeagent.service << 'EOF'
+      [Unit]
+      Description=BKE Agent
+      After=network.target
+
+      [Service]
+      ExecStart=/usr/local/bin/bkeagent --config /etc/openFuyao/bkeagent/bkeagent.conf
+      Restart=always
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF
+
+      # 6. 启动并验证
+      systemctl daemon-reload
+      systemctl enable bkeagent
+      systemctl start bkeagent
+      sleep 2
+      systemctl is-active bkeagent
+
+    uninstallScript: |
+      #!/bin/bash
+      systemctl stop bkeagent || true
+      systemctl disable bkeagent || true
+      rm -f /usr/local/bin/bkeagent
+      rm -f /etc/systemd/system/bkeagent.service
+      rm -rf /etc/openFuyao/bkeagent
+      systemctl daemon-reload
+
+    supportedArchitectures: ["amd64", "arm64"]
+    supportedOS:
+      - name: centos
+        versions: ["7", "8"]
+      - name: ubuntu
+        versions: ["20.04", "22.04"]
+      - name: kylin
+        versions: ["V10"]
+
+    defaultInstallPath: "/usr/local/bin"
+    defaultConfigPath: "/etc/openFuyao/bkeagent"
+    defaultLogPath: "/var/log/bkeagent"
+
+  compatibility:
+    constraints:
+      - component: kubernetes-master
+        rule: ">=1.26.0"
+
+  dependencies:
+    - name: containerd
+      phase: Upgrade
+
+  upgradeStrategy:
+    mode: Batch
+    batchSize: 2
+    timeout: "10m"
+    failurePolicy: Continue
+```
+
+#### 11.4.3 字段映射表
+
+| 旧硬编码逻辑 | 新 ComponentVersion 字段 | 说明 |
+|-------------|------------------------|------|
+| `Spec.BKEAgentVersion` | `spec.version` | 版本号 |
+| 下载 URL 字符串拼接 | `binary.artifacts[].url`（含 `{{version}}/{{arch}}` 模板） | 制品地址声明式化 |
+| `checksum` 硬编码常量 | `binary.artifacts[].checksum` | 校验和声明式化 |
+| bkeagent.conf Go 代码拼接 | `binary.configTemplates[0].content` | 配置模板声明式化 |
+| TLS 证书从 Secret 获取（硬编码 Secret 名） | `binary.configTemplates[1].secretRef` | Secret 引用声明式化 |
+| kubeconfig 动态生成（硬编码路径） | `binary.configTemplates[4].kubeconfigTemplate` | kubeconfig 模板声明式化 |
+| SSH 命令序列硬编码 | `binary.installScript` | 安装脚本声明式化 |
+| `arch` 硬编码 | `{{arch}}` 模板变量 | 架构适配模板化 |
+| 版本比较逻辑 | `VersionContext.NeedsUpgrade("bkeagent")` | 版本决策声明式化 |
+| 固定逐节点滚动 | `upgradeStrategy.mode: Batch` | 升级策略改为分批 |
+| 无失败策略 | `upgradeStrategy.failurePolicy: Continue` | 失败策略可配置 |
+| 不支持卸载 | `binary.uninstallScript` | 卸载脚本声明式化 |
+
+#### 11.4.4 行为等价性验证点
+
+| 验证项 | 旧路径 (EnsureAgentUpgrade) | 新路径 (BinaryInstaller) | 验证方法 |
+|--------|----------------------------|------------------------|---------|
+| 二进制文件路径 | `/usr/local/bin/bkeagent` | `artifacts[0].installPath` = `/usr/local/bin` | 检查远程节点文件路径一致 |
+| bkeagent.conf 内容 | Go 代码拼接 | Go template 渲染 | `diff` 对比两份输出 |
+| TLS 证书来源 | Secret `bkeagent-tls` 硬编码 | `configTemplates[1].secretRef.name` = `bkeagent-tls` | 验证证书内容一致 |
+| kubeconfig 内容 | Go 代码动态生成 | `kubeconfigTemplate` 渲染 | `diff` 对比两份输出 |
+| 安装执行顺序 | 停止→备份→安装→配置→启动 | installScript: 停止→备份→安装→配置→启动 | 对比 SSH 执行日志 |
+| 版本比较逻辑 | `Status.BKEAgentVersion != Spec.BKEAgentVersion` | `VersionContext.NeedsUpgrade("bkeagent")` | 相同版本输入，决策结果一致 |
+| 升级策略差异 | 固定逐节点滚动 | `Batch (batchSize=2)` | 3 节点集群验证分批执行（2+1） |
+
+> **设计思路 - bkeagent 升级策略从 Rolling 改为 Batch 的原因**：bkeagent 是节点上的代理进程，短暂中断不影响集群可用性（Agent 重启期间节点上已有 Pod 继续运行）。使用 Batch 模式（batchSize=2）比 Rolling 更快完成升级，且每批结束后可检查剩余节点 Agent 状态，兼顾效率与安全性。containerd 是容器运行时，中断会导致节点上所有 Pod 重启，必须使用 Rolling 逐节点升级确保服务连续性。
+
+### 11.5 迁移验证清单
+
+| 验证项 | 验证方法 | 通过标准 |
+|--------|---------|---------|
+| **containerd 全新安装** | Feature Gate 开启，新建集群 | containerd 版本正确，服务运行中 |
+| **containerd 升级** | Feature Gate 开启，v1.7.15→v1.7.18 | 逐节点滚动升级，服务不中断 |
+| **containerd config.toml** | `diff` 旧路径输出 vs 新路径输出 | 内容一致（模板变量替换后） |
+| **containerd.service** | `diff` 旧路径输出 vs 新路径输出 | 内容一致 |
+| **containerd 版本跳过** | VersionContext 设置相同版本 | `NeedsUpgrade` 返回 false，跳过执行 |
+| **bkeagent 全新安装** | Feature Gate 开启，新建集群 | bkeagent 版本正确，服务运行中 |
+| **bkeagent 升级** | Feature Gate 开启，v2.5.0→v2.6.0 | 分批升级（2+1），服务正常 |
+| **bkeagent.conf** | `diff` 旧路径输出 vs 新路径输出 | 内容一致 |
+| **bkeagent TLS 证书** | 对比远程节点 tls.crt 内容 | 与 Secret 中数据一致 |
+| **bkeagent kubeconfig** | `diff` 旧路径输出 vs 新路径输出 | 内容一致 |
+| **Feature Gate 关闭回退** | 关闭 Feature Gate，执行升级 | 走旧 Phase 路径，行为不变 |
+| **混合模式** | containerd 开启、bkeagent 关闭 | containerd 走新路径，bkeagent 走旧路径 |
+
 ---
 
 ## 12. 错误处理与恢复
