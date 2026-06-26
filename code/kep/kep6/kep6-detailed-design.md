@@ -382,20 +382,14 @@ type BinarySpec struct {
     // 支持的操作系统列表
     SupportedOS []OSSpec `json:"supportedOS"`
     
-    // 默认安装路径
-    DefaultInstallPath string `json:"defaultInstallPath,omitempty"`
-    
-    // 默认配置路径
+    // 默认配置路径 (组件级共享)
     DefaultConfigPath string `json:"defaultConfigPath,omitempty"`
     
-    // 默认日志路径
+    // 默认日志路径 (组件级共享)
     DefaultLogPath string `json:"defaultLogPath,omitempty"`
     
-    // 默认数据路径
+    // 默认数据路径 (组件级共享)
     DefaultDataPath string `json:"defaultDataPath,omitempty"`
-    
-    // 默认二进制路径
-    DefaultBinPath string `json:"defaultBinPath,omitempty"`
 }
 
 // ArtifactSpec 定义二进制制品规格
@@ -409,7 +403,9 @@ type ArtifactSpec struct {
     // 制品校验和 (格式: sha256:xxx)
     Checksum string `json:"checksum"`
     
-    // 安装路径
+    // 安装路径 (per-artifact, 不同 artifact 可安装到不同路径)
+    // 通过 {{artifact.<name>.installPath}} 模板变量在 installScript 中引用
+    // 例如: containerd tar.gz → "/usr/local", runc → "/usr/local/sbin"
     InstallPath string `json:"installPath"`
     
     // 可执行文件名
@@ -950,15 +946,11 @@ spec:
                             items:
                               type: string
                         required: [name, versions]
-                    defaultInstallPath:
-                      type: string
                     defaultConfigPath:
                       type: string
                     defaultLogPath:
                       type: string
                     defaultDataPath:
-                      type: string
-                    defaultBinPath:
                       type: string
                   required: [artifacts, installScript, supportedArchitectures, supportedOS]
                 helm:
@@ -1544,7 +1536,10 @@ const (
 func (i *BinaryInstaller) Install(ctx context.Context, opts InstallOptions) error {
     component := opts.Component
     binary := component.Spec.Binary
-    tmplCtx := opts.TemplateCtx  // 复用 DAG 调度器传递的 TemplateContext
+    // 注意: opts.TemplateCtx 是扩展后的 TemplateContext (见 6.3 节)
+    // 当前代码中的 manifest.TemplateContext 仅含 ClusterName/Namespace/KubernetesVersion/OpenFuyaoVersion
+    // KEP-6 设计中需扩展为包含 NodeIP/NodeArch/Artifacts/Variables/ConfigPath 等字段
+    tmplCtx := opts.TemplateCtx  // 复用 DAG 调度器传递的 TemplateContext (扩展后)
     
     // 1. 通过 SSH 发现节点架构 (必需: 制品 URL 包含 {{arch}} 模板变量, 下载前必须解析)
     // 与当前 bkeagent 升级代码 (agentssh.DiscoverArchs) 一致: SSH 执行 uname -m 获取架构
@@ -1564,45 +1559,46 @@ func (i *BinaryInstaller) Install(ctx context.Context, opts InstallOptions) erro
         return fmt.Errorf("failed to download artifacts: %w", err)
     }
     
-    // 2. 填充 TemplateContext 的制品信息
+    // 3. 填充 TemplateContext 的制品信息 (含 per-artifact InstallPath)
     tmplCtx.Artifacts = make(map[string]*ArtifactInfo)
     for name, art := range artifacts {
         tmplCtx.Artifacts[name] = &ArtifactInfo{
-            Name:     art.Name,
-            Path:     art.Path,
-            URL:      art.URL,
-            Checksum: art.Checksum,
-            Filename: art.Filename,
+            Name:        art.Name,
+            Path:        art.Path,
+            URL:         art.URL,
+            Checksum:    art.Checksum,
+            Filename:    art.Filename,
+            InstallPath: art.InstallPath,  // per-artifact 安装路径, 供 {{artifact.<name>.installPath}} 引用
         }
     }
     
-    // 3. 填充自定义变量
+    // 4. 填充自定义变量
     tmplCtx.Variables = binary.Variables
     
-    // 4. 填充默认路径变量 (从 BinarySpec.Default*Path → TemplateContext)
-    tmplCtx.InstallPath = binary.DefaultInstallPath
+    // 5. 填充组件级路径变量 (从 BinarySpec.Default*Path → TemplateContext)
+    // 注意: installPath/binPath 已移至 per-artifact 级别 (ArtifactInfo.InstallPath)
+    // 因为不同 artifact 可能安装到不同路径
     tmplCtx.ConfigPath = binary.DefaultConfigPath
     tmplCtx.LogPath = binary.DefaultLogPath
     tmplCtx.DataPath = binary.DefaultDataPath
-    tmplCtx.BinPath = binary.DefaultBinPath
     
-    // 5. 填充操作类型 (从 InstallOptions.Action → TemplateContext, 供模板 {{isUpgrade}} 引用)
+    // 6. 填充操作类型 (从 InstallOptions.Action → TemplateContext, 供模板 {{isUpgrade}} 引用)
     tmplCtx.Action = string(opts.Action)
     tmplCtx.IsUpgrade = opts.Action == BinaryActionUpgrade
     
-    // 6. 渲染安装脚本 (使用完整的 TemplateContext)
+    // 7. 渲染安装脚本 (使用完整的 TemplateContext)
     script, err := i.renderer.RenderScript(binary.InstallScript, tmplCtx)
     if err != nil {
         return fmt.Errorf("failed to render install script: %w", err)
     }
     
-    // 7. 渲染配置文件模板
+    // 8. 渲染配置文件模板
     configs, err := i.renderConfigTemplates(binary.ConfigTemplates, tmplCtx)
     if err != nil {
         return fmt.Errorf("failed to render config templates: %w", err)
     }
     
-    // 8. SSH 执行安装
+    // 9. SSH 执行安装
     switch opts.Action {
     case BinaryActionInstall, BinaryActionUpgrade:
         return i.executeInstall(ctx, tmplCtx.NodeIP, script, artifacts, configs)
@@ -2087,12 +2083,12 @@ type TemplateContext struct {
     ImageRegistry     string
     ImagePullSecret   string
     
-    // 新增：默认路径 (从 BinarySpec.Default*Path 填充)
-    InstallPath       string
+    // 新增：组件级路径 (从 BinarySpec.Default*Path 填充, 全部 artifact 共享)
+    // 注意: installPath/binPath 已移至 per-artifact 级别 (ArtifactInfo.InstallPath)
+    // 因为不同 artifact 可能安装到不同路径 (如 containerd→/usr/local, runc→/usr/local/sbin)
     ConfigPath        string
     LogPath           string
     DataPath          string
-    BinPath           string
     
     // 新增：操作类型 (从 InstallOptions.Action 填充, 供模板 {{isUpgrade}} 等引用)
     Action            string  // "Install" / "Upgrade" / "Uninstall"
@@ -2103,11 +2099,12 @@ type TemplateContext struct {
 }
 
 type ArtifactInfo struct {
-    Name     string
-    Path     string
-    URL      string
-    Checksum string
-    Filename string
+    Name        string
+    Path        string    // 本地缓存路径 (staging, 上传到远程临时目录)
+    URL         string
+    Checksum    string
+    Filename    string
+    InstallPath string    // 远程节点上的最终安装路径 (per-artifact, 通过 {{artifact.<name>.installPath}} 引用)
 }
 ```
 
@@ -2195,13 +2192,17 @@ fi
 
 #### 6. 安装路径变量 (Path Variables)
 
-| 变量 | 说明 | TemplateContext 字段 | 示例值 |
-|------|------|---------------------|--------|
-| `{{installPath}}` | 默认安装路径 | 从 ComponentVersion 获取 | `/usr/local/bin` |
-| `{{configPath}}` | 配置路径 | 从 ComponentVersion 获取 | `/etc/containerd` |
-| `{{logPath}}` | 日志路径 | 从 ComponentVersion 获取 | `/var/log/containerd` |
-| `{{dataPath}}` | 数据路径 | 从 ComponentVersion 获取 | `/var/lib/containerd` |
-| `{{binPath}}` | 二进制路径 | 从 ComponentVersion 获取 | `/usr/local/bin` |
+| 变量 | 说明 | 来源 | 示例值 |
+|------|------|------|--------|
+| `{{artifact.<name>.installPath}}` | per-artifact 安装路径 | `ArtifactInfo.InstallPath` (从 `ArtifactSpec.installPath` 填充) | `/usr/local` |
+| `{{configPath}}` | 配置路径 (组件级) | `TemplateContext.ConfigPath` (从 `BinarySpec.defaultConfigPath` 填充) | `/etc/containerd` |
+| `{{logPath}}` | 日志路径 (组件级) | `TemplateContext.LogPath` (从 `BinarySpec.defaultLogPath` 填充) | `/var/log/containerd` |
+| `{{dataPath}}` | 数据路径 (组件级) | `TemplateContext.DataPath` (从 `BinarySpec.defaultDataPath` 填充) | `/var/lib/containerd` |
+
+**设计思路 — per-artifact installPath vs 组件级路径**：
+- **`{{artifact.<name>.installPath}}`** 是 per-artifact 级别，不同 artifact 可安装到不同路径。例如 containerd tar.gz 解压到 `/usr/local`（含 bin/ 目录），runc 单独二进制放到 `/usr/local/sbin`。
+- **`{{configPath}}`/`{{logPath}}`/`{{dataPath}}`** 是组件级共享，一个组件的所有 artifact 共用同一套配置/日志/数据路径。
+- 已移除 `{{installPath}}` 和 `{{binPath}}`（组件级单一值无法满足多 artifact 不同路径的需求）。
 
 #### 7. 操作类型变量 (Action Variables)
 
@@ -4204,12 +4205,12 @@ spec:
 
       # 3. 备份旧版本 (仅升级时)
       {{if .isUpgrade}}
-      cp {{binPath}}/containerd {{binPath}}/containerd.bak.$(date +%Y%m%d%H%M%S)
+      cp {{artifact.containerd.installPath}}/bin/containerd {{artifact.containerd.installPath}}/bin/containerd.bak.$(date +%Y%m%d%H%M%S)
       {{end}}
 
       # 4. 解压并安装新二进制 (tar.gz 包含 containerd, containerd-shim-runc-v2, ctr)
-      tar -xzf {{artifact.containerd.path}} -C {{installPath}}
-      chmod +x {{binPath}}/containerd
+      tar -xzf {{artifact.containerd.path}} -C {{artifact.containerd.installPath}}
+      chmod +x {{artifact.containerd.installPath}}/bin/containerd
 
       # 5. 安装配置文件和服务 (由 ConfigRenderer 自动上传)
       # config.toml → {{configPath}}/config.toml
@@ -4219,13 +4220,13 @@ spec:
       systemctl daemon-reload
       systemctl enable containerd
       systemctl start containerd
-      {{binPath}}/containerd --version
+      {{artifact.containerd.installPath}}/bin/containerd --version
 
     uninstallScript: |
       #!/bin/bash
       systemctl stop containerd || true
       systemctl disable containerd || true
-      rm -f {{binPath}}/containerd {{binPath}}/containerd-shim-runc-v2 {{binPath}}/containerd-stress {{binPath}}/ctr
+      rm -f {{artifact.containerd.installPath}}/bin/containerd {{artifact.containerd.installPath}}/bin/containerd-shim-runc-v2 {{artifact.containerd.installPath}}/bin/containerd-stress {{artifact.containerd.installPath}}/bin/ctr
       rm -f /etc/systemd/system/containerd.service
       systemctl daemon-reload
 
@@ -4238,11 +4239,9 @@ spec:
       - name: kylin
         versions: ["V10"]
 
-    defaultInstallPath: "/usr/local"
     defaultConfigPath: "/etc/containerd"
     defaultLogPath: "/var/log/containerd"
     defaultDataPath: "/var/lib/containerd"
-    defaultBinPath: "/usr/local/bin"
 
   compatibility:
     constraints:
@@ -4272,7 +4271,7 @@ spec:
 | `ENV.ContainerdVersion` 传参给 bkeagent | `VersionContext.TargetVersion("containerd")` | 版本传递声明式化 |
 | `Spec.ClusterConfig.Cluster.ContainerdVersion` | `spec.version` | 版本号 |
 | `checksum` 硬编码常量 | `binary.artifacts[].checksum` | 校验和声明式化 |
-| `installPath` 硬编码 | `binary.artifacts[].installPath` | 安装路径可配置 |
+| `installPath` 硬编码 | `binary.artifacts[].installPath` (per-artifact) | 每个 artifact 独立指定安装路径 |
 | SSH 命令序列硬编码 | `binary.installScript`（Go template） | 安装脚本声明式化 |
 | `arch` 硬编码 | `{{arch}}` 模板变量 | 架构适配模板化 |
 | `isContainerdNeedUpgrade()` 版本比较 | `VersionContext.NeedsUpgrade("containerd")` | 版本决策声明式化 |
@@ -4287,7 +4286,7 @@ spec:
 |--------|--------|------------------------|---------|
 | containerd 安装时机 | `EnsureNodesEnv` 中 `K8sEnvInit(scope=runtime)` | containerd binary 节点先于 `EnsureNodesEnv` | DAG 拓扑顺序验证 |
 | EnsureNodesEnv scope | 含 `runtime` | 不含 `runtime` | 检查 `K8sEnvInit` 命令参数 |
-| 二进制文件路径 | bkeagent 内部决定 | `artifacts[0].installPath` = `/usr/local` (解压后二进制在 `/usr/local/bin/`) | 检查远程节点文件路径 |
+| 二进制文件路径 | bkeagent 内部决定 | `artifacts[0].installPath` = `/usr/local` (per-artifact, 解压后二进制在 `/usr/local/bin/`) | 检查远程节点文件路径 |
 | config.toml 内容 | bkeagent 内部生成 | Go template 渲染 | `diff` 对比两份输出 |
 | containerd.service 内容 | bkeagent 内部生成 | `configTemplates[1].content` | `diff` 对比两份输出 |
 | 安装执行顺序 | bkeagent 内置逻辑 | installScript: 停止→备份→解压→启动 | 对比 SSH 执行日志 |
@@ -4487,11 +4486,11 @@ spec:
 
       # 3. 备份旧版本 (仅升级时)
       {{if .isUpgrade}}
-      cp {{binPath}}/bkeagent {{binPath}}/bkeagent.bak.$(date +%Y%m%d%H%M%S)
+      cp {{artifact.bkeagent.installPath}}/bkeagent {{artifact.bkeagent.installPath}}/bkeagent.bak.$(date +%Y%m%d%H%M%S)
       {{end}}
 
       # 4. 安装新二进制
-      install -m 0755 {{artifact.bkeagent.path}} {{binPath}}/bkeagent
+      install -m 0755 {{artifact.bkeagent.path}} {{artifact.bkeagent.installPath}}/bkeagent
 
       # 5. 安装 systemd service (由 ConfigRenderer 自动上传配置文件)
       # bkeagent.conf → {{configPath}}/bkeagent.conf
@@ -4506,7 +4505,7 @@ spec:
       After=network.target
 
       [Service]
-      ExecStart={{binPath}}/bkeagent --config {{configPath}}/bkeagent.conf
+      ExecStart={{artifact.bkeagent.installPath}}/bkeagent --config {{configPath}}/bkeagent.conf
       Restart=always
       RestartSec=5
 
@@ -4525,7 +4524,7 @@ spec:
       #!/bin/bash
       systemctl stop bkeagent || true
       systemctl disable bkeagent || true
-      rm -f {{binPath}}/bkeagent
+      rm -f {{artifact.bkeagent.installPath}}/bkeagent
       rm -f /etc/systemd/system/bkeagent.service
       rm -rf {{configPath}}
       systemctl daemon-reload
@@ -4539,7 +4538,6 @@ spec:
       - name: kylin
         versions: ["V10"]
 
-    defaultInstallPath: "/usr/local/bin"
     defaultConfigPath: "/etc/openFuyao/bkeagent"
     defaultLogPath: "/var/log/bkeagent"
 
@@ -4580,7 +4578,7 @@ spec:
 
 | 验证项 | 旧路径 (EnsureAgentUpgrade) | 新路径 (BinaryInstaller) | 验证方法 |
 |--------|----------------------------|------------------------|---------|
-| 二进制文件路径 | `/usr/local/bin/bkeagent` | `artifacts[0].installPath` = `/usr/local/bin` | 检查远程节点文件路径一致 |
+| 二进制文件路径 | `/usr/local/bin/bkeagent` | `artifacts[0].installPath` = `/usr/local/bin` (per-artifact) | 检查远程节点文件路径一致 |
 | bkeagent.conf 内容 | Go 代码拼接 | Go template 渲染 | `diff` 对比两份输出 |
 | TLS 证书来源 | Secret `bkeagent-tls` 硬编码 | `configTemplates[1].secretRef.name` = `bkeagent-tls` | 验证证书内容一致 |
 | kubeconfig 内容 | Go 代码动态生成 | `kubeconfigTemplate` 渲染 | `diff` 对比两份输出 |
@@ -4845,23 +4843,21 @@ spec:
       #!/bin/bash
       set -e
       systemctl stop containerd || true
-      tar -xzf {{artifact.containerd.path}} -C {{installPath}}
-      chmod +x {{binPath}}/containerd
+      tar -xzf {{artifact.containerd.path}} -C {{artifact.containerd.installPath}}
+      chmod +x {{artifact.containerd.installPath}}/bin/containerd
       systemctl daemon-reload
       systemctl enable containerd
       systemctl start containerd
-      {{binPath}}/containerd --version
+      {{artifact.containerd.installPath}}/bin/containerd --version
     supportedArchitectures: ["amd64", "arm64"]
     supportedOS:
       - name: centos
         versions: ["7", "8"]
       - name: ubuntu
         versions: ["20.04", "22.04"]
-    defaultInstallPath: "/usr/local"
     defaultConfigPath: "/etc/containerd"
     defaultLogPath: "/var/log/containerd"
     defaultDataPath: "/var/lib/containerd"
-    defaultBinPath: "/usr/local/bin"
   upgradeStrategy:
     mode: Rolling
     failurePolicy: FailFast
