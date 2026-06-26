@@ -11,6 +11,10 @@
 1. [概述](#1-概述)
 2. [整体架构设计](#2-整体架构设计)
 3. [ComponentVersion CRD 详细设计](#3-componentversion-crd-详细设计)
+   - 3.1 ComponentVersion 类型定义
+   - 3.2 Helm 类型字段定义
+   - 3.3 CRD YAML 定义
+   - 3.4 CRD 版本迁移设计
 4. [BinaryInstaller 详细设计](#4-binaryinstaller-详细设计)
 5. [HelmInstaller 详细设计](#5-helminstaller-详细设计)
 6. [TemplateRenderer 详细设计](#6-templaterenderer-详细设计)
@@ -281,6 +285,10 @@ type ComponentVersionSpec struct {
     UpgradeStrategy UpgradeStrategySpec `json:"upgradeStrategy,omitempty"`
     
     // Kubernetes 资源定义列表
+    // 注意: 此字段位于顶层是历史原因——最初无独立 YAML 类型, Resources 用于所有类型
+    // 新增 YAML 类型后, 理论上应迁移至 YAMLSpec, 但为保持向后兼容暂不移动
+    // 后续版本可考虑: ① 迁移到 YAMLSpec; ② 或保持顶层但标注仅 YAML 类型生效
+    // 当前代码中 EnsurePreUpgradeResources Phase 和 ManifestComponentExecutor 均使用此字段
     Resources []ResourceSpec `json:"resources,omitempty"`
 }
 
@@ -322,8 +330,12 @@ type ResourceSpec struct {
 
 // YAMLSpec 定义 YAML 清单组件规格
 type YAMLSpec struct {
-    // YAML 清单文件列表
+    // YAML 清单文件列表 (外部 URL 引用)
     Manifests []ManifestRef `json:"manifests"`
+    
+    // 注意: 内联 K8s 资源定义通过 ComponentVersionSpec.Resources (顶层) 提供
+    // 后续版本可考虑将 Resources 迁移至此字段, 作为 YAML 类型的专属配置
+    // 当前为保持向后兼容, Resources 仍位于 ComponentVersionSpec 顶层
     
     // 部署目标命名空间
     Namespace string `json:"namespace,omitempty"`
@@ -696,7 +708,139 @@ spec:
       - cv
   scope: Namespaced
   versions:
+    # v1alpha1: 旧版本, 保留向后兼容, 仅可读 (storage=false)
+    # 不含 binary/helm/yaml 字段定义
     - name: v1alpha1
+      served: true
+      storage: false
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              properties:
+                name:
+                  type: string
+                type:
+                  type: string
+                version:
+                  type: string
+                inline:
+                  type: object
+                  properties:
+                    handler:
+                      type: string
+                    version:
+                      type: string
+                  required: [handler, version]
+                subComponents:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      name:
+                        type: string
+                      version:
+                        type: string
+                    required: [name, version]
+                compatibility:
+                  type: object
+                  properties:
+                    constraints:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          component:
+                            type: string
+                          rule:
+                            type: string
+                        required: [component, rule]
+                dependencies:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      name:
+                        type: string
+                      phase:
+                        type: string
+                    required: [name]
+                upgradeStrategy:
+                  type: object
+                  properties:
+                    mode:
+                      type: string
+                    batchSize:
+                      type: integer
+                    timeout:
+                      type: string
+                    failurePolicy:
+                      type: string
+                resources:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      kind:
+                        type: string
+                      apiVersion:
+                        type: string
+                      namespace:
+                        type: string
+                      name:
+                        type: string
+                      labels:
+                        type: object
+                        additionalProperties:
+                          type: string
+                      data:
+                        type: object
+                        additionalProperties:
+                          type: string
+                      stringData:
+                        type: object
+                        additionalProperties:
+                          type: string
+                      manifest:
+                        type: string
+                    required: [kind, apiVersion, name]
+              required: [name, type, version]
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                        enum: ["True", "False", Unknown]
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                    required: [type, status, lastTransitionTime, reason, message]
+      subresources:
+        status: {}
+    # v1alpha2: 新版本, 新增 binary/helm/yaml 字段定义 (storage=true)
+    # v1alpha1 ↔ v1alpha2 通过 conversion 函数自动转换 (新字段全为 omitempty, 无数据丢失)
+    - name: v1alpha2
       served: true
       storage: true
       schema:
@@ -1069,6 +1213,97 @@ spec:
 ```
 
 ---
+
+### 3.4 CRD 版本迁移设计
+
+**设计思路**：v1alpha1 仅含 inline/subComponents/resources/compatibility/dependencies/upgradeStrategy 字段。v1alpha2 新增 binary/helm/yaml 字段定义。所有新字段均为 omitempty，v1alpha1 数据可无损转换为 v1alpha2。
+
+**版本并存策略**：
+
+```
+阶段 1: 双版本并存 (当前)
+┌───────────────────────────────────────────────────┐
+│ v1alpha1: served=true,  storage=false  (只读兼容) │
+│ v1alpha2: served=true,  storage=true   (新存储版本) │
+└───────────────────────────────────────────────────┘
+转换: v1alpha1 → v1alpha2 (自动, conversion 函数)
+      v1alpha2 → v1alpha1 (自动, 新字段丢弃, 旧字段保留)
+
+阶段 2: 旧版本废弃 (v1alpha2 稳定后)
+┌───────────────────────────────────────────────────┐
+│ v1alpha1: served=false, storage=false  (不再暴露) │
+│ v1alpha2: served=true,  storage=true             │
+└───────────────────────────────────────────────────┘
+
+阶段 3: 移除旧版本
+┌───────────────────────────────────────────────────┐
+│ v1alpha1: 删除                                     │
+│ v1alpha2: served=true,  storage=true             │
+└───────────────────────────────────────────────────┘
+```
+
+**Conversion 函数设计**：
+
+```go
+// api/v1alpha2/conversion.go
+
+// v1alpha2.ComponentVersion 实现 conversion.Hub 接口
+func (cv *ComponentVersion) Hub() {}
+
+// ConvertTo 将 v1alpha1 转换为 v1alpha2 (Hub)
+// 自动转换: v1alpha1 的所有字段在 v1alpha2 中都有对应
+// v1alpha2 新增的 binary/helm/yaml 字段为空 (omitempty, 无影响)
+func (src *v1alpha1.ComponentVersion) ConvertTo(dstRaw conversion.Hub) error {
+    dst := dstRaw.(*v1alpha2.ComponentVersion)
+    dst.ObjectMeta = src.ObjectMeta
+    dst.Spec.Name = src.Spec.Name
+    dst.Spec.Type = v1alpha2.ComponentType(src.Spec.Type)
+    dst.Spec.Version = src.Spec.Version
+    dst.Spec.Inline = (*v1alpha2.InlineSpec)(src.Spec.Inline)
+    dst.Spec.SubComponents = src.Spec.SubComponents
+    dst.Spec.Compatibility = src.Spec.Compatibility
+    dst.Spec.Dependencies = src.Spec.Dependencies
+    dst.Spec.UpgradeStrategy = src.Spec.UpgradeStrategy
+    dst.Spec.Resources = src.Spec.Resources
+    // binary/helm/yaml 在 v1alpha1 中不存在, 留空
+    return nil
+}
+
+// ConvertFrom 将 v1alpha2 转换为 v1alpha1
+// 降级转换: v1alpha2 的 binary/helm/yaml 字段被丢弃
+func (dst *v1alpha1.ComponentVersion) ConvertFrom(srcRaw conversion.Hub) error {
+    src := srcRaw.(*v1alpha2.ComponentVersion)
+    dst.ObjectMeta = src.ObjectMeta
+    dst.Spec.Name = src.Spec.Name
+    dst.Spec.Type = v1alpha1.ComponentType(src.Spec.Type)
+    dst.Spec.Version = src.Spec.Version
+    dst.Spec.Inline = (*v1alpha1.InlineSpec)(src.Spec.Inline)
+    dst.Spec.SubComponents = src.Spec.SubComponents
+    dst.Spec.Compatibility = src.Spec.Compatibility
+    dst.Spec.Dependencies = src.Spec.Dependencies
+    dst.Spec.UpgradeStrategy = src.Spec.UpgradeStrategy
+    dst.Spec.Resources = src.Spec.Resources
+    // binary/helm/yaml 字段在 v1alpha1 中不存在, 丢弃
+    return nil
+}
+```
+
+**迁移步骤**：
+
+| 步骤 | 操作 | 风险 | 回滚方案 |
+|------|------|------|---------|
+| 1 | 创建 v1alpha2 API (复制 v1alpha1 类型 + 新增 BinarySpec/HelmSpec/YAMLSpec) | 无 | 删除 v1alpha2 目录 |
+| 2 | 实现 conversion 函数 (v1alpha1 ↔ v1alpha2) + 单元测试 | 低 | 删除 conversion |
+| 3 | CRD 配置: v1alpha1 served=true storage=false, v1alpha2 served=true storage=true | 中 | 恢复 v1alpha1 storage=true |
+| 4 | 控制器切换到 v1alpha2 API | 中 | 切回 v1alpha1 client |
+| 5 | 观察 1-2 周, 确认 conversion 无异常 | — | — |
+| 6 | v1alpha1 served=false | 低 | served=true |
+| 7 | 删除 v1alpha1 | 高 | 从 Git 历史恢复 |
+
+**注意事项**：
+- v1alpha1 的 `type` 字段已支持 `yaml/helm/inline/binary` 四种值（仅 enum 约束，无 schema 定义），v1alpha2 新增了对应的 schema 约束
+- `Resources` 字段在 v1alpha1 和 v1alpha2 中均位于顶层，conversion 无需特殊处理
+- `SubComponents` 字段同理，两个版本中位置一致
 
 ## 4. BinaryInstaller 详细设计
 
@@ -4233,6 +4468,7 @@ spec:
 | **Prune 裁剪功能实现** | 3 人日 | 中 | ApplyStrategy 引擎 |
 | **PreInstallHooks 执行引擎** | 3 人日 | 中 | HelmInstaller |
 | **ComponentVersion CRD 扩展** | 3 人日 | 低 | 无 |
+| **CRD v1alpha2 版本迁移** | 2 人日 | 中 | CRD 扩展 |
 | **VersionContext 与 ExecutionContext 实现** | 3 人日 | 中 | 无 |
 | **BinaryComponentExecutor 集成** | 3 人日 | 中 | BinaryInstaller |
 | **HelmComponentExecutor 集成** | 3 人日 | 中 | HelmInstaller |
@@ -4248,7 +4484,7 @@ spec:
 | **迁移验证** | 3 人日 | 中 | 兼容层实现 |
 | **文档编写** | 4 人日 | 低 | 无 |
 | **代码审查与修复** | 4 人日 | 中 | 测试完成 |
-| **总计** | **88 人日 (约 4 人月)** | | |
+| **总计** | **90 人日 (约 4 人月)** | | |
 
 ### 14.2 Sprint 计划
 
