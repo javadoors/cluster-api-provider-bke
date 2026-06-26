@@ -847,18 +847,22 @@ spec:
                               └────────┬─────────┘
                                        │
                                        ▼
-                    ┌──────────────────────────────────────┐
-                    │  1. 解析架构和操作系统               │
-                    │  arch = node.Spec.Architecture       │
-                    │  os = node.Spec.OperatingSystem      │
-                    └────────────────────┬─────────────────┘
-                                         │
-                                         ▼
-                    ┌──────────────────────────────────────┐
-                    │  2. 下载二进制制品                    │
-                    │  downloadArtifacts(ctx, binary,      │
-                    │                    arch, os)         │
-                    └────────────────────┬─────────────────┘
+                     ┌──────────────────────────────────────┐
+                     │  1. 通过 SSH 发现节点架构            │
+                     │  arch = sshDiscoverArch(node.IP)     │
+                     │  (执行 uname -m, 返回 amd64/arm64)   │
+                     │                                      │
+                     │  注意: OS 不在此处获取,              │
+                     │  由 installScript 运行时自检测       │
+                     │  (通过 /etc/os-release)              │
+                     └────────────────────┬─────────────────┘
+                                          │
+                                          ▼
+                     ┌──────────────────────────────────────┐
+                     │  2. 下载二进制制品                    │
+                     │  downloadArtifacts(ctx, binary,      │
+                     │                    arch)             │
+                     └────────────────────┬─────────────────┘
                                          │
                     ┌────────────────────┼────────────────────┐
                     │                    │                    │
@@ -990,16 +994,20 @@ func (i *BinaryInstaller) Install(ctx context.Context, opts InstallOptions) erro
     binary := component.Spec.Binary
     tmplCtx := opts.TemplateCtx  // 复用 DAG 调度器传递的 TemplateContext
     
-    // 设计说明: 不在此处获取架构和操作系统信息
-    // 架构和操作系统信息由安装脚本在运行时自检测 (通过 uname -m 和 /etc/os-release)
-    // 这样做的好处:
-    // 1. 简化 NodeProvider，无需 SSH 预检测
-    // 2. 安装脚本可在任意节点上独立运行
-    // 3. 减少模板变量，保持模板简洁
+    // 1. 通过 SSH 发现节点架构 (必需: 制品 URL 包含 {{arch}} 模板变量, 下载前必须解析)
+    // 与当前 bkeagent 升级代码 (agentssh.DiscoverArchs) 一致: SSH 执行 uname -m 获取架构
+    arch, err := i.sshDiscoverArch(ctx, tmplCtx.NodeIP)
+    if err != nil {
+        return fmt.Errorf("failed to discover arch for node %s: %w", tmplCtx.NodeIP, err)
+    }
+    tmplCtx.NodeArch = arch // 填入 TemplateContext, 供 URL 模板解析和脚本引用
     
-    // 1. 下载二进制制品 (带缓存)
-    // 制品 URL 中的架构占位符由脚本在运行时替换
-    artifacts, err := i.downloadArtifacts(ctx, binary)
+    // 设计说明: OS 不在此处获取
+    // OS 信息由安装脚本在运行时自检测 (通过 /etc/os-release), 不影响制品下载
+    // 仅 installScript 中少数场景需要 OS (如包管理器选择 yum/apt), 脚本内 if-else 自检测即可
+    
+    // 2. 下载二进制制品 (带缓存, 使用 arch 解析 URL 中的 {{arch}} 占位符)
+    artifacts, err := i.downloadArtifacts(ctx, binary, arch)
     if err != nil {
         return fmt.Errorf("failed to download artifacts: %w", err)
     }
@@ -1049,16 +1057,16 @@ func (i *BinaryInstaller) Install(ctx context.Context, opts InstallOptions) erro
     return nil
 }
 
-// downloadArtifacts 下载二进制制品
-func (i *BinaryInstaller) downloadArtifacts(ctx context.Context, binary *BinarySpec, arch, os string) (map[string]*Artifact, error) {
+// downloadArtifacts 下载二进制制品 (使用 arch 解析 URL 中的 {{arch}} 占位符)
+func (i *BinaryInstaller) downloadArtifacts(ctx context.Context, binary *BinarySpec, arch string) (map[string]*Artifact, error) {
     artifacts := make(map[string]*Artifact)
     
     for _, art := range binary.Artifacts {
-        // 解析模板变量
+        // 解析 URL 模板变量 (arch 已通过 SSH 发现, version 从 BinarySpec 获取)
         url, err := i.resolveTemplate(art.URL, map[string]string{
             "{{componentVersion}}": binary.Version,
-            "{{nodeArch}}":        arch,
-            "{{nodeOS}}":          os,
+            "{{version}}":          binary.Version,
+            "{{arch}}":             arch,
         })
         if err != nil {
             return nil, fmt.Errorf("failed to resolve URL template: %w", err)
@@ -1471,10 +1479,11 @@ func (i *HelmInstaller) upgrade(ctx context.Context, actionConfig *action.Config
 - **扩展字段**：新增字段均为可选，YAML 组件不使用时留空即可
 - **统一接口**：BinaryInstaller 和 HelmInstaller 共享同一个 TemplateContext，简化 DAG 调度器的数据传递
 
-**设计原则：脚本自检测，模板不感知 OS/Arch**：
-- **为什么不在模板中注入 OS/Arch 信息**：二进制安装脚本本身是 OS 无关的（systemctl、tar、chmod 等命令在所有主流 Linux 通用），只有极少数场景需要 OS 检测（如包管理器安装依赖）。将 OS 检测逻辑放在脚本内部自检测，而非模板渲染时注入，有以下好处：
-  1. **简化 Node 结构体**：NodeProvider 只需提供 IP/Hostname/Role 等基础信息，无需 SSH 预检测
-  2. **脚本可移植**：安装脚本可在任意节点上独立运行，不依赖外部注入的环境信息
+**设计原则：Arch 通过 SSH 发现，OS 脚本自检测**：
+- **Arch 必须在下载前通过 SSH 发现**：制品 URL 包含 `{{arch}}` 模板变量（如 `containerd-{{version}}-linux-{{arch}}.tar.gz`），下载前必须解析为实际架构。BinaryInstaller 在 `Install()` 中通过 SSH 执行 `uname -m` 获取架构（与当前 bkeagent 升级代码 `agentssh.DiscoverArchs` 一致）。
+- **OS 由安装脚本运行时自检测**：二进制安装脚本本身是 OS 无关的（systemctl、tar、chmod 等命令在所有主流 Linux 通用），只有极少数场景需要 OS 检测（如包管理器安装依赖）。将 OS 检测逻辑放在脚本内部自检测，而非模板渲染时注入，有以下好处：
+  1. **简化 Node 结构体**：NodeProvider 只需提供 IP/Hostname/Role 等基础信息，无需 SSH 预检测 OS
+  2. **脚本可移植**：安装脚本可在任意节点上独立运行，不依赖外部注入的 OS 信息
   3. **减少模板变量**：避免模板膨胀，保持模板简洁
   4. **运行时灵活性**：脚本可根据实际环境动态调整行为，而非依赖静态配置
 
@@ -1504,10 +1513,12 @@ type TemplateContext struct {
     DNSDomain         string
     
     // 新增：节点基础信息 (Binary 组件需要)
-    // 注意：不包含 Arch/OS/OSVersion，这些信息在脚本内自检测
+    // 注意：不包含 OS/OSVersion (由安装脚本自检测)
+    // NodeArch 在 Install() 中通过 SSH 发现后填入
     NodeIP            string
     NodeHostname      string
     NodeRole          string
+    NodeArch          string  // SSH 发现后填入 (uname -m), 用于 URL 模板解析 {{arch}}
     
     // 新增：版本信息
     ComponentVersion          string
@@ -1699,15 +1710,16 @@ installScript: |
                     │  - Artifacts (待填充)                │
                     │  - Variables                         │
                     │                                      │
-                    │  注意: 不包含 NodeArch/NodeOS/       │
-                    │  NodeOSVersion，这些信息在安装脚本   │
-                    │  中自检测                            │
+                    │  注意: NodeArch 由 Install() SSH   │
+                    │  发现后填入; NodeOS/NodeOSVersion  │
+                    │  不包含, 由安装脚本自检测           │
                     └────────────────────┬─────────────────┘
                                          │
                                          ▼
                     ┌──────────────────────────────────────┐
-                    │  2. 构建制品数据                     │
-                    │  downloadArtifacts(ctx, binary)      │
+                     │  2. 构建制品数据                     │
+                     │  downloadArtifacts(ctx, binary,      │
+                     │                    arch)             │
                     │                                      │
                     │  填充 TemplateContext.Artifacts:     │
                     │  - containerd: {path, url, checksum} │
@@ -1760,7 +1772,7 @@ installScript: |
 
 ### 6.3 TemplateContext 构建流程
 
-**设计思路**：DAG 调度器在执行组件前构建 TemplateContext，包含集群信息、节点基础信息、版本信息等。对于 Binary 组件，还需要在 TemplateRenderer 中填充制品信息。注意：TemplateContext 不包含 NodeArch/NodeOS/NodeOSVersion，这些信息在安装脚本中自检测。
+**设计思路**：DAG 调度器在执行组件前构建 TemplateContext，包含集群信息、节点基础信息、版本信息等。对于 Binary 组件，还需要在 TemplateRenderer 中填充制品信息。注意：TemplateContext 不包含 NodeOS/NodeOSVersion（由安装脚本自检测），NodeArch 由 BinaryInstaller.Install() 通过 SSH 发现后填入（制品 URL 中的 `{{arch}}` 需要在下载前解析）。
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -2557,11 +2569,12 @@ func NewExecutionContext(
 
 #### 8.3.2 NodeProvider 接口定义
 
-**设计思路**：NodeProvider 接口抽象节点获取逻辑，替代原来对 phaseframe.NodeFetcher 的依赖。Node 结构体仅包含基础信息（Name/IP/Hostname/Role），不包含 Arch/OS/OSVersion。架构和操作系统信息由安装脚本在运行时自检测，而非在 NodeProvider 中预检测。
+**设计思路**：NodeProvider 接口抽象节点获取逻辑，替代原来对 phaseframe.NodeFetcher 的依赖。Node 结构体仅包含基础信息（Name/IP/Hostname/Role），不包含 Arch/OS/OSVersion。Arch 由 BinaryInstaller 在 Install() 中通过 SSH 发现（`uname -m`），OS 由安装脚本运行时自检测（`/etc/os-release`），NodeProvider 不执行 SSH 预检测。
 
 **设计原则**：
 - **最小化 Node 信息**：NodeProvider 只提供节点的基础标识信息，不执行 SSH 检测
-- **脚本自检测**：架构和操作系统信息由安装脚本通过 `uname -m` 和 `/etc/os-release` 自检测
+- **Arch 由 BinaryInstaller SSH 发现**：架构信息由 BinaryInstaller.Install() 通过 SSH 执行 `uname -m` 获取（制品 URL 中的 `{{arch}}` 需下载前解析），NodeProvider 不负责
+- **OS 脚本自检测**：操作系统信息由安装脚本通过 `/etc/os-release` 自检测，不影响制品下载
 - **简化实现**：NodeProvider 实现简单，无需 SSH 连接，只需从 BKECluster 读取节点列表
 
 ```go
@@ -2577,7 +2590,8 @@ type NodeProvider interface {
 }
 
 // Node 节点信息 (最小化，不包含 Arch/OS/OSVersion)
-// Arch/OS/OSVersion 由安装脚本在运行时自检测
+// Arch 由 BinaryInstaller.Install() 通过 SSH 发现 (uname -m)
+// OS/OSVersion 由安装脚本运行时自检测 (/etc/os-release)
 type Node struct {
     Name      string
     IP        string
@@ -2734,7 +2748,9 @@ func (e *BinaryComponentExecutor) executeRolling(ctx context.Context, nodes []No
         }
         
         // 为每个节点扩展 TemplateContext
-        // 注意：不包含 Arch/OS/OSVersion，这些信息在安装脚本中自检测
+        // 注意：不包含 Arch/OS/OSVersion
+        // Arch 由 BinaryInstaller.Install() 通过 SSH 发现后填入 NodeArch
+        // OS/OSVersion 由安装脚本运行时自检测
         nodeTmpl := execCtx.TemplateContext  // 复制基础 TemplateContext
         nodeTmpl.NodeIP = node.IP
         nodeTmpl.NodeHostname = node.Hostname
