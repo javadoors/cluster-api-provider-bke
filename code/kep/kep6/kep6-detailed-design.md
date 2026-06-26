@@ -550,7 +550,7 @@ type HookSpec struct {
 }
 ```
 
-### 3.3 CRD YAML 示例
+### 3.3 CRD YAML 定义
 
 ```yaml
 # config/crd/bases/config.openfuyao.cn_componentversions.yaml
@@ -576,6 +576,12 @@ spec:
         openAPIV3Schema:
           type: object
           properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
             spec:
               type: object
               properties:
@@ -633,6 +639,7 @@ spec:
                                 type: string
                               key:
                                 type: string
+                            required: [name, namespace, key]
                           kubeconfigTemplate:
                             type: object
                             properties:
@@ -646,6 +653,11 @@ spec:
                                 type: string
                               clientKeyPath:
                                 type: string
+                              namespace:
+                                type: string
+                              serviceAccount:
+                                type: string
+                            required: [clusterName, apiServer, caCertPath, clientCertPath, clientKeyPath]
                         required: [name, path]
                     installScript:
                       type: string
@@ -666,6 +678,17 @@ spec:
                             type: array
                             items:
                               type: string
+                        required: [name, versions]
+                    defaultInstallPath:
+                      type: string
+                    defaultConfigPath:
+                      type: string
+                    defaultLogPath:
+                      type: string
+                    defaultDataPath:
+                      type: string
+                    defaultBinPath:
+                      type: string
                   required: [artifacts, installScript, supportedArchitectures, supportedOS]
                 helm:
                   type: object
@@ -680,6 +703,7 @@ spec:
                               type: string
                             tag:
                               type: string
+                          required: [repository, tag]
                         url:
                           type: string
                         localPath:
@@ -693,6 +717,10 @@ spec:
                     values:
                       type: object
                       x-kubernetes-preserve-unknown-fields: true
+                    valuesFiles:
+                      type: array
+                      items:
+                        type: string
                     strategy:
                       type: object
                       properties:
@@ -732,6 +760,7 @@ spec:
                                 type: integer
                               minReady:
                                 type: integer
+                            required: [type]
                     rollback:
                       type: object
                       properties:
@@ -739,7 +768,117 @@ spec:
                           type: boolean
                         maxHistory:
                           type: integer
+                    uninstall:
+                      type: object
+                      properties:
+                        preUninstallHooks:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              name:
+                                type: string
+                              type:
+                                type: string
+                              manifest:
+                                type: string
+                            required: [type, manifest]
+                    preInstallHooks:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          name:
+                            type: string
+                          type:
+                            type: string
+                          manifest:
+                            type: string
+                        required: [type, manifest]
+                    preUninstallHooks:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          name:
+                            type: string
+                          type:
+                            type: string
+                          manifest:
+                            type: string
+                        required: [type, manifest]
                   required: [chart, namespace, releaseName]
+                yaml:
+                  type: object
+                  properties:
+                    manifests:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          url:
+                            type: string
+                          checksum:
+                            type: string
+                        required: [url]
+                    namespace:
+                      type: string
+                    applyStrategy:
+                      type: string
+                      enum: [ServerSideApply, Replace, CreateOnly]
+                    prune:
+                      type: boolean
+                    pruneLabelSelector:
+                      type: object
+                      additionalProperties:
+                        type: string
+                  required: [manifests]
+                inline:
+                  type: object
+                  properties:
+                    handler:
+                      type: string
+                    version:
+                      type: string
+                  required: [handler, version]
+                subComponents:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      name:
+                        type: string
+                      version:
+                        type: string
+                    required: [name, version]
+                resources:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      kind:
+                        type: string
+                      apiVersion:
+                        type: string
+                      namespace:
+                        type: string
+                      name:
+                        type: string
+                      labels:
+                        type: object
+                        additionalProperties:
+                          type: string
+                      data:
+                        type: object
+                        additionalProperties:
+                          type: string
+                      stringData:
+                        type: object
+                        additionalProperties:
+                          type: string
+                      manifest:
+                        type: string
+                    required: [kind, apiVersion, name]
                 compatibility:
                   type: object
                   properties:
@@ -752,6 +891,7 @@ spec:
                             type: string
                           rule:
                             type: string
+                        required: [component, rule]
                 dependencies:
                   type: array
                   items:
@@ -761,6 +901,7 @@ spec:
                         type: string
                       phase:
                         type: string
+                    required: [name]
                 upgradeStrategy:
                   type: object
                   properties:
@@ -773,6 +914,31 @@ spec:
                     failurePolicy:
                       type: string
               required: [name, type, version]
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                        enum: ["True", "False", Unknown]
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                    required: [type, status, lastTransitionTime, reason, message]
+      subresources:
+        status: {}
 ```
 
 ---
