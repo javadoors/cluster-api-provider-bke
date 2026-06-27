@@ -3788,52 +3788,7 @@ func NewScheduler(cfg Config) *Scheduler {
 }
 ```
 
-#### 8.1.5 InlineComponentExecutor 实现
-
-当前 Inline 路径也需要适配为 `ComponentExecutor` 接口，保持与 Binary/Helm/YAML 一致的分发方式：
-
-```go
-// pkg/dagexec/inline_executor.go
-
-// InlineComponentExecutor 内联组件执行器
-type InlineComponentExecutor struct {
-    runner InlinePhaseRunner
-}
-
-func (e *InlineComponentExecutor) GetComponentType() string {
-    return "inline"
-}
-
-func (e *InlineComponentExecutor) ExecuteComponent(
-    ctx context.Context,
-    node *ComponentNode,
-    execCtx *ExecutionContext,
-) error {
-    if node.Inline == nil {
-        return fmt.Errorf("component %q has no inline ref", node.Name)
-    }
-
-    handler := node.Inline.Handler
-    version := node.Inline.Version
-    if handler == "" {
-        return fmt.Errorf("inline component %q missing handler", node.Name)
-    }
-    if version == "" {
-        version = defaultComponentVersion
-    }
-
-    // Inline 执行器需要 oldCluster/newCluster, 从 ExecutionContext.Cluster 推导
-    return e.runner.Execute(
-        execCtx.phaseCtx,
-        execCtx.oldCluster,
-        execCtx.Cluster,
-        handler,
-        version,
-    )
-}
-```
-
-#### 8.1.6 当前代码 vs 目标设计对比
+#### 8.1.5 当前代码 vs 目标设计对比
 
 | 维度 | 当前代码 (scheduler.go) | 目标设计 |
 |------|------------------------|---------|
