@@ -2406,6 +2406,142 @@ func mergeValues(dst, src map[string]interface{}) map[string]interface{} {
 }
 ```
 
+#### 5.3.1 Values / ValuesFiles 使用样例
+
+**场景 1：values + valuesFiles 同时使用（按架构区分）**
+
+```yaml
+# bke-manifests/coredns/v1.11.1/component.yaml
+spec:
+  name: coredns
+  type: helm
+  version: v1.11.1
+  helm:
+    chart:
+      oci:
+        repository: "registry.openfuyao.cn/charts/coredns"
+        tag: "v1.11.1"
+    namespace: kube-system
+    releaseName: coredns
+    
+    # 内联 Values (优先级最高, 覆盖文件中的同名键)
+    values:
+      image:
+        repository: "registry.openfuyao.cn/coredns/coredns"
+        tag: "{{componentVersion}}"
+      replicaCount: 2                        # 覆盖 values-base.yaml 中的 replicaCount: 1
+    
+    # 外部 Values 文件 (按顺序合并, 后者覆盖前者)
+    valuesFiles:
+      - "/etc/bke-values/coredns/values-base.yaml"       # 基础配置
+      - "/etc/bke-values/coredns/values-{{arch}}.yaml"   # 按架构区分
+```
+
+**控制器 Pod 中的文件结构**（通常通过 ConfigMap 挂载）：
+
+```
+/etc/bke-values/coredns/
+├── values-base.yaml          # 基础配置 (所有架构共享)
+├── values-amd64.yaml         # amd64 架构特定配置
+└── values-arm64.yaml         # arm64 架构特定配置
+```
+
+**values-base.yaml 内容**：
+
+```yaml
+image:
+  pullPolicy: IfNotPresent
+resources:
+  limits:
+    cpu: "100m"
+    memory: "128Mi"
+  requests:
+    cpu: "50m"
+    memory: "64Mi"
+replicaCount: 1
+service:
+  type: ClusterIP
+```
+
+**values-amd64.yaml 内容**：
+
+```yaml
+nodeSelector:
+  kubernetes.io/arch: amd64
+image:
+  repository: "registry.openfuyao.cn/coredns/coredns-amd64"  # amd64 专用镜像
+```
+
+**合并结果**（优先级：Chart 默认 < values-base.yaml < values-amd64.yaml < 内联 values）：
+
+```yaml
+image:
+  repository: "registry.openfuyao.cn/coredns/coredns"  # 内联 values 覆盖 amd64 文件
+  tag: "v1.11.1"                                        # 内联 values (模板渲染后)
+  pullPolicy: IfNotPresent                              # 来自 values-base.yaml
+resources:
+  limits:
+    cpu: "100m"                                         # 来自 values-base.yaml
+    memory: "128Mi"                                     # 来自 values-base.yaml
+  requests:
+    cpu: "50m"                                          # 来自 values-base.yaml
+    memory: "64Mi"                                      # 来自 values-base.yaml
+replicaCount: 2                                          # 内联 values 覆盖 base 的 1
+service:
+  type: ClusterIP                                        # 来自 values-base.yaml
+nodeSelector:
+  kubernetes.io/arch: amd64                              # 来自 values-amd64.yaml
+```
+
+**场景 2：仅 values 内联（简单场景）**
+
+```yaml
+helm:
+  values:
+    image:
+      repository: "registry.openfuyao.cn/coredns/coredns"
+      tag: "{{componentVersion}}"
+    replicaCount: 2
+    resources:
+      limits:
+        cpu: "100m"
+        memory: "128Mi"
+```
+
+无需外部文件，所有配置内联在 CRD 中。适用于配置简单、无需按环境区分的场景。
+
+**场景 3：仅 valuesFiles（配置外置）**
+
+```yaml
+helm:
+  valuesFiles:
+    - "/etc/bke-values/coredns/values-{{os}}.yaml"
+```
+
+**values-centos.yaml** 和 **values-ubuntu.yaml** 差异示例：
+
+```yaml
+# values-centos.yaml
+initContainers:
+  - name: sysctl
+    image: "registry.openfuyao.cn/busybox:centos"
+    command: ["sysctl", "-w", "net.core.somaxconn=65535"]
+
+# values-ubuntu.yaml
+initContainers:
+  - name: sysctl
+    image: "registry.openfuyao.cn/busybox:ubuntu"
+    command: ["sysctl", "-w", "net.core.somaxconn=65535"]
+```
+
+适用于配置复杂、需按操作系统区分的场景。内联 `values` 留空，全部配置由文件提供。
+
+---
+
+## 6. TemplateRenderer 详细设计
+
+### 6.0 与现有 TemplateContext 的复用关系
+
 **设计思路**：为避免重复造轮子，TemplateRenderer 复用并扩展现有的 `pkg/manifest.TemplateContext` 结构体。现有 TemplateContext 用于 YAML/Manifest 组件的模板渲染，包含 4 个基础字段。TemplateRenderer 在此基础上扩展，增加 Binary 组件所需的节点信息、制品信息、自定义变量等字段。
 
 **复用策略**：
