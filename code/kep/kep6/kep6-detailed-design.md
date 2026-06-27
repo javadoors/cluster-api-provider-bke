@@ -4195,6 +4195,42 @@ type ComponentExecutor interface {
 }
 ```
 
+**设计思路 — Executor 与 Installer 的分层设计**：
+
+每种组件类型都有两层：**Executor（调度层）** 和 **Installer（执行层）**，遵循单一职责原则（SRP）：
+
+| 层级 | 职责 | 关心什么 | 可独立性 |
+|------|------|---------|---------|
+| **Executor** | DAG 调度 | 哪些节点、什么顺序（Rolling/Batch）、失败怎么办（FailFast/Continue/Rollback） | mock Installer 测试调度逻辑 |
+| **Installer** | 单节点执行 | 单个节点上怎么下载、渲染、SSH 执行、健康检查 | mock SSH/HTTP 测试安装逻辑 |
+
+**为什么不直接在 Executor 中实现**：
+1. **代码复杂度**：Rolling/Batch 并发控制 + SSH 下载/渲染/执行混在一起，单方法 200+ 行
+2. **测试困难**：Executor 测试需 mock SSH/HTTP，Installer 测试需 mock DAG 调度，分离后各自独立
+3. **复用性**：Installer 可被 DAG 之外的场景复用（CLI 工具、Webhook 触发）
+4. **对称设计**：Binary(BinaryComponentExecutor+BinaryInstaller) / Helm(HelmComponentExecutor+HelmInstaller) 模式一致
+
+**TemplateContext 构建职责分工**：
+- Executor 填充：`NodeIP`/`NodeHostname`/`NodeRole`/`ComponentVersion`（节点级信息）
+- Installer 填充：`NodeArch`（SSH 发现）/`Artifacts`/`Variables`/`ConfigPath`/`Action`/`IsUpgrade`（安装级信息）
+- 两者协作完成 TemplateContext 的完整构建，各负责自己层级的信息
+
+**各类型 Executor 的特点**：
+
+| Executor | Installer | 节点级调度 | 单节点执行 | 健康检查 |
+|----------|-----------|-----------|-----------|---------|
+| BinaryComponentExecutor | BinaryInstaller | ✅ Rolling/Parallel/Batch | SSH 下载+渲染+安装 | 脚本式 SSH |
+| HelmComponentExecutor | HelmInstaller | ❌ 无节点级（Helm 部署到集群） | Helm SDK install/upgrade | PodReady/EndpointReady |
+| ManifestComponentExecutor | (无独立 Installer) | ❌ 无节点级（YAML 应用到集群） | K8s API Apply | PodReady/EndpointReady |
+| InlineComponentExecutor | (无独立 Installer) | ❌ 无节点级（Phase 执行） | InlineRunner.Execute | Phase 自身逻辑 |
+
+**Helm/YAML/Inline 无独立 Installer 的原因**：
+- **Helm**：`HelmInstaller` 已存在（第 5 章），但与 `HelmComponentExecutor` 的边界不如 Binary 清晰——Helm 组件部署到集群而非单节点，无节点级并发控制需求
+- **YAML**：清单应用通过 `manifest.Applier` 接口完成（已有），逻辑简单（下载→解析→Apply），无需独立 Installer
+- **Inline**：直接调用 `InlineRunner.Execute()`，无制品下载/模板渲染，无需 Installer
+
+**Binary 是唯一需要独立 Installer 的类型**，因为 Binary 组件的安装逻辑最复杂（SSH 发现架构→下载制品→缓存→校验→渲染脚本→渲染配置→SSH 上传→SSH 执行→健康检查），且需要逐节点执行（节点级并发控制）。
+
 ##### 8.3.3.1 BinaryComponentExecutor
 
 ```go
@@ -4208,6 +4244,15 @@ func (e *BinaryComponentExecutor) GetComponentType() ComponentType {
     return ComponentTypeBinary
 }
 ```
+
+**设计思路 — Binary 是唯一需要节点级调度的类型**：
+
+Binary 组件（containerd/bkeagent）安装在每个节点上，需要逐节点 SSH 操作。其他类型（Helm/YAML 部署到集群，Inline 调用 Phase）无需节点级并发控制。
+
+**Executor 与 BinaryInstaller 的协作**：
+- Executor 负责：获取节点列表 → 选择 Rolling/Parallel/Batch 策略 → 对每个节点构建 InstallOptions（含 NodeIP/NodeRole）→ 调用 `BinaryInstaller.Install()` → 处理 FailurePolicy
+- BinaryInstaller 负责：SSH 发现 arch → 下载制品 → 填充 TemplateContext（Artifacts/Paths/Action）→ 渲染脚本 → SSH 执行 → 健康检查
+- 边界清晰：Executor 不关心"怎么在单节点上安装"，Installer 不关心"在哪些节点上安装、什么顺序"
 
 **设计思路 - 三种节点级执行策略**：
 
@@ -4466,6 +4511,15 @@ func (e *BinaryComponentExecutor) rollback(node Node, cv *ComponentVersion) erro
 
 ##### 8.3.3.2 HelmComponentExecutor
 
+**设计思路 — Helm 组件无需节点级调度**：
+
+Helm 组件通过 Helm SDK 部署到目标集群（`helm install/upgrade`），不涉及逐节点 SSH 操作。因此 HelmComponentExecutor 无 Rolling/Parallel/Batch 策略，直接调用 `HelmInstaller.Install()` 一次完成。
+
+**与 HelmInstaller 的协作**：
+- Executor 负责：获取 ComponentVersion → VersionContext 判断 Install/Upgrade → 读取 `Strategy.Mode` 覆盖 Action → 构建 InstallOptions → 调用 `HelmInstaller.Install()` → FailurePolicy=Rollback 时触发 `helm rollback`
+- HelmInstaller 负责：拉取 Chart → 渲染 Values → 执行 helm install/upgrade（含 `--wait`/`--atomic`）→ 健康检查
+- 与 Binary 的区别：Helm 无节点级并发（部署到集群而非单节点），但需处理 `Strategy.Mode=Rollback` 和 `FailurePolicy=Rollback` 两种回滚场景
+
 ```go
 // HelmComponentExecutor Helm 组件执行器
 type HelmComponentExecutor struct {
@@ -4552,7 +4606,25 @@ func (e *HelmComponentExecutor) ExecuteComponent(ctx context.Context, node *Comp
     
     return nil
 }
+```
 
+##### 8.3.3.3 ManifestComponentExecutor (YAML)
+
+**设计思路 — YAML 组件无独立 Installer**：
+
+YAML 组件通过 K8s API 应用清单（ServerSideApply/Replace/CreateOnly），逻辑简单（下载→解析→Apply），无需独立 Installer。直接复用现有的 `manifest.Applier` 接口完成清单应用。
+
+**Executor 直接完成的全部逻辑**：
+- 获取 ComponentVersion → VersionContext 判断是否需要执行 → 构建 ComponentPackage → `applier.ApplyComponent()` → 健康检查（PodReady/EndpointReady/Custom）
+- 无节点级调度（应用到集群而非单节点）
+- 无回滚机制（SSA 天然支持幂等，重新 Apply 上一版本即可回滚）
+
+**与 Binary/Helm 的区别**：
+- Binary：Executor 调度 + Installer 执行（SSH 层），两层分离
+- Helm：Executor 调度 + HelmInstaller 执行（Helm SDK 层），两层分离
+- YAML：Executor 直接执行（K8s API 层），无独立 Installer，因为逻辑简单无需分层
+
+```go
 // ManifestComponentExecutor YAML/Manifest 组件执行器
 type ManifestComponentExecutor struct {
     applier *manifest.Applier
@@ -4721,6 +4793,24 @@ func (e *ManifestComponentExecutor) checkEndpointReady(
 ```
 
 ##### 8.3.3.4 InlineComponentExecutor
+
+**设计思路 — Inline 是最简执行器，无 Installer、无调度策略**：
+
+Inline 组件通过 `ComponentFactory` 注册的 handler 执行（如 `EnsureMasterInit`/`EnsureWorkerJoin`），是已有 Phase 逻辑的适配层。无制品下载、无模板渲染、无 SSH 操作，直接委托给 `InlineRunner.Execute()`。
+
+**为什么 Inline 不需要 Installer**：
+- Inline handler 内部已封装全部逻辑（kubeadm init/join 等），无需外部的下载/渲染/安装步骤
+- Inline 不操作远程节点（通过 K8s API 或本地命令完成），无需 SSH
+- 健康检查由 Phase 自身的 `NeedExecute()` 逻辑处理，无需额外健康检查
+
+**与其他 Executor 的区别**：
+- Binary：Executor 调度（Rolling/Batch）+ Installer 执行（SSH）
+- Helm：Executor 调度（Mode 覆盖）+ HelmInstaller 执行（Helm SDK）
+- YAML：Executor 直接执行（K8s API Apply + 健康检查）
+- Inline：Executor 直接委托（InlineRunner.Execute），仅做接口适配
+
+**适配 ComponentExecutor 接口的目的**：
+Inline 原有逻辑通过 `phaseframe.Phase` 执行，适配为 `ComponentExecutor` 后可统一注册到 `ExecutorRegistry`，由 DAG Scheduler 统一调度，无需为 Inline 类型走独立的调度路径。
 
 ```go
 // InlineComponentExecutor 内联组件执行器
