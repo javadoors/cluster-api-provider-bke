@@ -640,23 +640,27 @@ type HealthCheckSpec struct {
 }
 
 // HealthCheckItemSpec 定义健康检查项规格
+// 三种检查类型, 各字段用途不同:
+// - PodReady:      使用 Namespace + LabelSelector + MinReady (最少就绪 Pod 数, 0=全部)
+// - EndpointReady: 使用 Namespace + Name (Service 名称) + Port (可选, 检查特定端口)
+// - Custom:        使用 Name (检查命令, 退出码 0=通过)
 type HealthCheckItemSpec struct {
     // 检查类型: PodReady / EndpointReady / Custom
     Type string `json:"type"`
     
-    // 命名空间
+    // 命名空间 (PodReady/EndpointReady 使用)
     Namespace string `json:"namespace,omitempty"`
     
-    // 标签选择器
+    // 标签选择器 (PodReady 使用, 如 "k8s-app=kube-dns")
     LabelSelector string `json:"labelSelector,omitempty"`
     
-    // 名称
+    // 名称: EndpointReady 时为 Service 名称; Custom 时为检查命令 (如 "curl -s http://.../healthz")
     Name string `json:"name,omitempty"`
     
-    // 端口
+    // 端口 (EndpointReady 可选, 检查特定端口是否就绪)
     Port int32 `json:"port,omitempty"`
     
-    // 最小就绪数量
+    // 最小就绪数量 (PodReady 使用, 0=要求全部 Ready, 1=至少 1 个 Ready)
     MinReady int32 `json:"minReady,omitempty"`
 }
 
@@ -2158,9 +2162,125 @@ func (i *HelmInstaller) upgrade(ctx context.Context, actionConfig *action.Config
 }
 ```
 
----
+**设计思路 — Helm `--wait` 与自定义 `healthCheck` 的关系**：
 
-## 6. TemplateRenderer 详细设计
+两者**同时生效**，是两层递进检查，非互斥关系：
+
+| 层级 | 机制 | 触发时机 | 检查内容 | 局限 |
+|------|------|---------|---------|------|
+| **第一层: Helm `--wait`** | Helm SDK 原生 (`strategy.wait: true`) | `helm install/upgrade` 命令内部 | Pod Ready 状态（全部 Pod） | 仅检查 Pod Ready，不检查 Endpoint；要求全部 Ready 才通过 |
+| **第二层: 自定义 `healthCheck`** | Installer 实现 (`healthCheck.enabled: true`) | Helm 命令返回后 | PodReady + EndpointReady + Custom | 支持 `minReady` 部分就绪；支持 Endpoint 检查；支持自定义命令 |
+
+**为什么需要两层**：
+1. **Helm `--wait` 的局限**：仅检查 Pod `Ready` condition，不验证 Service Endpoint 是否就绪（Pod Ready 但 Endpoint 未注册的情况存在）；要求全部 Pod Ready，不支持部分就绪场景。
+2. **自定义 `healthCheck` 的补充**：支持 `minReady`（3 副本中 2 个就绪即可通过）、`EndpointReady`（验证服务可达性）、`Custom`（执行自定义检查命令）。
+3. **执行顺序**：Helm `--wait` 先执行（在 `helm install/upgrade` 命令内部），通过后才执行自定义 `healthCheck`。如果 `--wait` 失败且 `atomic: true`，Helm 自动回滚，不会执行自定义 `healthCheck`。
+4. **配置建议**：如果 `strategy.wait: true` 已启用，`healthCheck` 可仅配置 `EndpointReady` 或 `Custom` 检查（`PodReady` 已由 Helm `--wait` 覆盖），避免重复检查。
+
+```go
+// runHealthCheck 执行 Helm 安装后的自定义健康检查
+// 与 Helm --wait 的关系: 两者同时生效, --wait 先执行 (Helm 命令内部),
+// 自定义 healthCheck 后执行 (Helm 命令返回后), 互补非互斥
+func (i *HelmInstaller) runHealthCheck(
+    ctx context.Context,
+    hc HealthCheckSpec,
+    opts InstallOptions,
+) error {
+    timeout := parseDurationDefault(hc.Timeout, 3*time.Minute)
+    interval := parseDurationDefault(hc.Interval, 5*time.Second)
+    deadline := time.Now().Add(timeout)
+
+    for time.Now().Before(deadline) {
+        allReady := true
+        for _, check := range hc.Checks {
+            switch check.Type {
+            case "PodReady":
+                ready, err := i.checkPodReady(ctx, check, opts)
+                if err != nil || !ready {
+                    allReady = false
+                }
+            case "EndpointReady":
+                ready, err := i.checkEndpointReady(ctx, check, opts)
+                if err != nil || !ready {
+                    allReady = false
+                }
+            case "Custom":
+                ready, err := i.checkCustom(ctx, check, opts)
+                if err != nil || !ready {
+                    allReady = false
+                }
+            }
+        }
+        if allReady {
+            return nil
+        }
+        time.Sleep(interval)
+    }
+
+    return fmt.Errorf("health check timed out after %s", timeout)
+}
+
+// checkPodReady 检查 Pod Ready 状态 (支持 minReady 部分就绪)
+func (i *HelmInstaller) checkPodReady(
+    ctx context.Context,
+    check HealthCheckItemSpec,
+    opts InstallOptions,
+) (bool, error) {
+    pods, err := i.listPods(ctx, check.Namespace, check.LabelSelector)
+    if err != nil {
+        return false, err
+    }
+    minReady := int(check.MinReady)
+    if minReady == 0 {
+        minReady = len(pods) // 默认要求全部 Ready
+    }
+    readyCount := 0
+    for _, pod := range pods {
+        for _, cond := range pod.Status.Conditions {
+            if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+                readyCount++
+                break
+            }
+        }
+    }
+    return readyCount >= minReady, nil
+}
+
+// checkEndpointReady 检查 Service Endpoint 是否有就绪端点
+func (i *HelmInstaller) checkEndpointReady(
+    ctx context.Context,
+    check HealthCheckItemSpec,
+    opts InstallOptions,
+) (bool, error) {
+    endpoints, err := i.clientset.CoreV1().Endpoints(check.Namespace).Get(ctx, check.Name, metav1.GetOptions{})
+    if err != nil {
+        return false, err
+    }
+    for _, subset := range endpoints.Subsets {
+        if len(subset.Addresses) > 0 {
+            return true, nil // 有就绪端点
+        }
+    }
+    return false, nil
+}
+
+// checkCustom 执行自定义检查命令 (在控制器 Pod 中执行)
+// 通过 check.Name 指定命令, 退出码 0 = 通过
+func (i *HelmInstaller) checkCustom(
+    ctx context.Context,
+    check HealthCheckItemSpec,
+    opts InstallOptions,
+) (bool, error) {
+    if check.Name == "" {
+        return false, fmt.Errorf("custom health check requires 'name' field as command")
+    }
+    cmd := exec.CommandContext(ctx, "/bin/sh", "-c", check.Name)
+    if err := cmd.Run(); err != nil {
+        return false, nil // 非零退出码 = 未就绪
+    }
+    return true, nil
+}
+```
 
 ### 6.0 与现有 TemplateContext 的复用关系
 
@@ -3844,7 +3964,8 @@ func (e *ManifestComponentExecutor) ExecuteComponent(ctx context.Context, node *
     return nil
 }
 
-// runHealthCheck 等待 Pod Ready / Endpoint Ready (复用 Helm 健康检查逻辑)
+// runHealthCheck 等待 Pod Ready / Endpoint Ready / Custom 检查通过
+// 复用 Helm 健康检查逻辑 (PodReady/EndpointReady/Custom 三种检查类型)
 func (e *ManifestComponentExecutor) runHealthCheck(
     ctx context.Context,
     hc *HealthCheckSpec,
@@ -3868,6 +3989,11 @@ func (e *ManifestComponentExecutor) runHealthCheck(
                 if err != nil || !ready {
                     allReady = false
                 }
+            case "Custom":
+                ready, err := e.checkCustom(ctx, check)
+                if err != nil || !ready {
+                    allReady = false
+                }
             }
         }
         if allReady {
@@ -3877,6 +4003,22 @@ func (e *ManifestComponentExecutor) runHealthCheck(
     }
 
     return fmt.Errorf("health check timed out after %s", timeout)
+}
+
+// checkCustom 执行自定义检查命令 (在控制器 Pod 中执行, 退出码 0 = 通过)
+// check.Name 字段为检查命令, 如 "curl -s http://.../healthz"
+func (e *ManifestComponentExecutor) checkCustom(
+    ctx context.Context,
+    check HealthCheckItemSpec,
+) (bool, error) {
+    if check.Name == "" {
+        return false, fmt.Errorf("custom health check requires 'name' field as command")
+    }
+    cmd := exec.CommandContext(ctx, "/bin/sh", "-c", check.Name)
+    if err := cmd.Run(); err != nil {
+        return false, nil // 非零退出码 = 未就绪
+    }
+    return true, nil
 }
 ```
 
