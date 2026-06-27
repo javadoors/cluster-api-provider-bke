@@ -640,28 +640,50 @@ type HealthCheckSpec struct {
 }
 
 // HealthCheckItemSpec 定义健康检查项规格
-// 三种检查类型, 各字段用途不同:
-// - PodReady:      使用 Namespace + LabelSelector + MinReady (最少就绪 Pod 数, 0=全部)
-// - EndpointReady: 使用 Namespace + Name (Service 名称) + Port (可选, 检查特定端口)
-// - Custom:        使用 Name (检查命令, 退出码 0=通过)
+// 按检查类型嵌套子结构体, 消除 Name 字段双重含义 (与 ConfigTemplateSpec 模式一致)
+// Type 决定使用哪个子结构体, 其他子结构体应为 nil
 type HealthCheckItemSpec struct {
     // 检查类型: PodReady / EndpointReady / Custom
     Type string `json:"type"`
     
-    // 命名空间 (PodReady/EndpointReady 使用)
-    Namespace string `json:"namespace,omitempty"`
+    // PodReady 检查配置 (type=PodReady 时使用)
+    PodReady *PodReadyCheckSpec `json:"podReady,omitempty"`
     
-    // 标签选择器 (PodReady 使用, 如 "k8s-app=kube-dns")
-    LabelSelector string `json:"labelSelector,omitempty"`
+    // EndpointReady 检查配置 (type=EndpointReady 时使用)
+    EndpointReady *EndpointReadyCheckSpec `json:"endpointReady,omitempty"`
     
-    // 名称: EndpointReady 时为 Service 名称; Custom 时为检查命令 (如 "curl -s http://.../healthz")
-    Name string `json:"name,omitempty"`
+    // Custom 检查配置 (type=Custom 时使用)
+    Custom *CustomCheckSpec `json:"custom,omitempty"`
+}
+
+// PodReadyCheckSpec 定义 Pod 就绪检查规格
+type PodReadyCheckSpec struct {
+    // 命名空间
+    Namespace string `json:"namespace"`
     
-    // 端口 (EndpointReady 可选, 检查特定端口是否就绪)
-    Port int32 `json:"port,omitempty"`
+    // 标签选择器 (如 "k8s-app=kube-dns")
+    LabelSelector string `json:"labelSelector"`
     
-    // 最小就绪数量 (PodReady 使用, 0=要求全部 Ready, 1=至少 1 个 Ready)
+    // 最小就绪数量 (0=要求全部 Ready, 1=至少 1 个 Ready)
     MinReady int32 `json:"minReady,omitempty"`
+}
+
+// EndpointReadyCheckSpec 定义 Endpoint 就绪检查规格
+type EndpointReadyCheckSpec struct {
+    // 命名空间
+    Namespace string `json:"namespace"`
+    
+    // Service 名称
+    ServiceName string `json:"serviceName"`
+    
+    // 端口 (可选, 检查特定端口是否就绪)
+    Port int32 `json:"port,omitempty"`
+}
+
+// CustomCheckSpec 定义自定义检查规格
+type CustomCheckSpec struct {
+    // 检查命令 (在控制器 Pod 中执行, 退出码 0=通过, 如 "curl -s http://.../healthz")
+    Command string `json:"command"`
 }
 
 // RollbackSpec 定义回滚规格
@@ -1090,16 +1112,32 @@ spec:
                             properties:
                               type:
                                 type: string
-                              namespace:
-                                type: string
-                              labelSelector:
-                                type: string
-                              name:
-                                type: string
-                              port:
-                                type: integer
-                              minReady:
-                                type: integer
+                              podReady:
+                                type: object
+                                properties:
+                                  namespace:
+                                    type: string
+                                  labelSelector:
+                                    type: string
+                                  minReady:
+                                    type: integer
+                                required: [namespace, labelSelector]
+                              endpointReady:
+                                type: object
+                                properties:
+                                  namespace:
+                                    type: string
+                                  serviceName:
+                                    type: string
+                                  port:
+                                    type: integer
+                                required: [namespace, serviceName]
+                              custom:
+                                type: object
+                                properties:
+                                  command:
+                                    type: string
+                                required: [command]
                             required: [type]
                     rollback:
                       type: object
@@ -1188,16 +1226,32 @@ spec:
                             properties:
                               type:
                                 type: string
-                              namespace:
-                                type: string
-                              labelSelector:
-                                type: string
-                              name:
-                                type: string
-                              port:
-                                type: integer
-                              minReady:
-                                type: integer
+                              podReady:
+                                type: object
+                                properties:
+                                  namespace:
+                                    type: string
+                                  labelSelector:
+                                    type: string
+                                  minReady:
+                                    type: integer
+                                required: [namespace, labelSelector]
+                              endpointReady:
+                                type: object
+                                properties:
+                                  namespace:
+                                    type: string
+                                  serviceName:
+                                    type: string
+                                  port:
+                                    type: integer
+                                required: [namespace, serviceName]
+                              custom:
+                                type: object
+                                properties:
+                                  command:
+                                    type: string
+                                required: [command]
                             required: [type]
                       required: [enabled]
                   required: [manifests]
@@ -2197,17 +2251,26 @@ func (i *HelmInstaller) runHealthCheck(
         for _, check := range hc.Checks {
             switch check.Type {
             case "PodReady":
-                ready, err := i.checkPodReady(ctx, check, opts)
+                if check.PodReady == nil {
+                    return fmt.Errorf("PodReady check requires 'podReady' config")
+                }
+                ready, err := i.checkPodReady(ctx, check.PodReady)
                 if err != nil || !ready {
                     allReady = false
                 }
             case "EndpointReady":
-                ready, err := i.checkEndpointReady(ctx, check, opts)
+                if check.EndpointReady == nil {
+                    return fmt.Errorf("EndpointReady check requires 'endpointReady' config")
+                }
+                ready, err := i.checkEndpointReady(ctx, check.EndpointReady)
                 if err != nil || !ready {
                     allReady = false
                 }
             case "Custom":
-                ready, err := i.checkCustom(ctx, check, opts)
+                if check.Custom == nil {
+                    return fmt.Errorf("Custom check requires 'custom' config")
+                }
+                ready, err := i.checkCustom(ctx, check.Custom)
                 if err != nil || !ready {
                     allReady = false
                 }
@@ -2225,14 +2288,13 @@ func (i *HelmInstaller) runHealthCheck(
 // checkPodReady 检查 Pod Ready 状态 (支持 minReady 部分就绪)
 func (i *HelmInstaller) checkPodReady(
     ctx context.Context,
-    check HealthCheckItemSpec,
-    opts InstallOptions,
+    spec *PodReadyCheckSpec,
 ) (bool, error) {
-    pods, err := i.listPods(ctx, check.Namespace, check.LabelSelector)
+    pods, err := i.listPods(ctx, spec.Namespace, spec.LabelSelector)
     if err != nil {
         return false, err
     }
-    minReady := int(check.MinReady)
+    minReady := int(spec.MinReady)
     if minReady == 0 {
         minReady = len(pods) // 默认要求全部 Ready
     }
@@ -2251,10 +2313,9 @@ func (i *HelmInstaller) checkPodReady(
 // checkEndpointReady 检查 Service Endpoint 是否有就绪端点
 func (i *HelmInstaller) checkEndpointReady(
     ctx context.Context,
-    check HealthCheckItemSpec,
-    opts InstallOptions,
+    spec *EndpointReadyCheckSpec,
 ) (bool, error) {
-    endpoints, err := i.clientset.CoreV1().Endpoints(check.Namespace).Get(ctx, check.Name, metav1.GetOptions{})
+    endpoints, err := i.client.CoreV1().Endpoints(spec.Namespace).Get(ctx, spec.ServiceName, metav1.GetOptions{})
     if err != nil {
         return false, err
     }
@@ -2267,16 +2328,12 @@ func (i *HelmInstaller) checkEndpointReady(
 }
 
 // checkCustom 执行自定义检查命令 (在控制器 Pod 中执行)
-// 通过 check.Name 指定命令, 退出码 0 = 通过
+// 通过 spec.Command 指定命令, 退出码 0 = 通过
 func (i *HelmInstaller) checkCustom(
     ctx context.Context,
-    check HealthCheckItemSpec,
-    opts InstallOptions,
+    spec *CustomCheckSpec,
 ) (bool, error) {
-    if check.Name == "" {
-        return false, fmt.Errorf("custom health check requires 'name' field as command")
-    }
-    cmd := exec.CommandContext(ctx, "/bin/sh", "-c", check.Name)
+    cmd := exec.CommandContext(ctx, "/bin/sh", "-c", spec.Command)
     if err := cmd.Run(); err != nil {
         return false, nil // 非零退出码 = 未就绪
     }
@@ -4325,17 +4382,26 @@ func (e *ManifestComponentExecutor) runHealthCheck(
         for _, check := range hc.Checks {
             switch check.Type {
             case "PodReady":
-                ready, err := e.checkPodReady(ctx, check, execCtx)
+                if check.PodReady == nil {
+                    return fmt.Errorf("PodReady check requires 'podReady' config")
+                }
+                ready, err := e.checkPodReady(ctx, check.PodReady, execCtx)
                 if err != nil || !ready {
                     allReady = false
                 }
             case "EndpointReady":
-                ready, err := e.checkEndpointReady(ctx, check, execCtx)
+                if check.EndpointReady == nil {
+                    return fmt.Errorf("EndpointReady check requires 'endpointReady' config")
+                }
+                ready, err := e.checkEndpointReady(ctx, check.EndpointReady, execCtx)
                 if err != nil || !ready {
                     allReady = false
                 }
             case "Custom":
-                ready, err := e.checkCustom(ctx, check)
+                if check.Custom == nil {
+                    return fmt.Errorf("Custom check requires 'custom' config")
+                }
+                ready, err := e.checkCustom(ctx, check.Custom)
                 if err != nil || !ready {
                     allReady = false
                 }
@@ -4351,15 +4417,11 @@ func (e *ManifestComponentExecutor) runHealthCheck(
 }
 
 // checkCustom 执行自定义检查命令 (在控制器 Pod 中执行, 退出码 0 = 通过)
-// check.Name 字段为检查命令, 如 "curl -s http://.../healthz"
 func (e *ManifestComponentExecutor) checkCustom(
     ctx context.Context,
-    check HealthCheckItemSpec,
+    spec *CustomCheckSpec,
 ) (bool, error) {
-    if check.Name == "" {
-        return false, fmt.Errorf("custom health check requires 'name' field as command")
-    }
-    cmd := exec.CommandContext(ctx, "/bin/sh", "-c", check.Name)
+    cmd := exec.CommandContext(ctx, "/bin/sh", "-c", spec.Command)
     if err := cmd.Run(); err != nil {
         return false, nil // 非零退出码 = 未就绪
     }
@@ -4369,20 +4431,20 @@ func (e *ManifestComponentExecutor) checkCustom(
 // checkPodReady 检查 Pod Ready 状态 (支持 minReady 部分就绪)
 func (e *ManifestComponentExecutor) checkPodReady(
     ctx context.Context,
-    check HealthCheckItemSpec,
+    spec *PodReadyCheckSpec,
     execCtx *ExecutionContext,
 ) (bool, error) {
-    selector, err := labels.Parse(check.LabelSelector)
+    selector, err := labels.Parse(spec.LabelSelector)
     if err != nil {
-        return false, fmt.Errorf("invalid label selector %q: %w", check.LabelSelector, err)
+        return false, fmt.Errorf("invalid label selector %q: %w", spec.LabelSelector, err)
     }
-    podList, err := execCtx.ClusterClient.CoreV1().Pods(check.Namespace).List(ctx, metav1.ListOptions{
+    podList, err := execCtx.ClusterClient.CoreV1().Pods(spec.Namespace).List(ctx, metav1.ListOptions{
         LabelSelector: selector.String(),
     })
     if err != nil {
         return false, err
     }
-    minReady := int(check.MinReady)
+    minReady := int(spec.MinReady)
     if minReady == 0 {
         minReady = len(podList.Items)
     }
@@ -4401,10 +4463,10 @@ func (e *ManifestComponentExecutor) checkPodReady(
 // checkEndpointReady 检查 Service Endpoint 是否有就绪端点
 func (e *ManifestComponentExecutor) checkEndpointReady(
     ctx context.Context,
-    check HealthCheckItemSpec,
+    spec *EndpointReadyCheckSpec,
     execCtx *ExecutionContext,
 ) (bool, error) {
-    endpoints, err := execCtx.ClusterClient.CoreV1().Endpoints(check.Namespace).Get(ctx, check.Name, metav1.GetOptions{})
+    endpoints, err := execCtx.ClusterClient.CoreV1().Endpoints(spec.Namespace).Get(ctx, spec.ServiceName, metav1.GetOptions{})
     if err != nil {
         return false, err
     }
@@ -5658,9 +5720,10 @@ spec:
       timeout: "3m"
       checks:
         - type: PodReady
-          namespace: kube-system
-          labelSelector: "k8s-app=kube-dns"
-          minReady: 1
+          podReady:
+            namespace: kube-system
+            labelSelector: "k8s-app=kube-dns"
+            minReady: 1
   upgradeStrategy:
     mode: Parallel
     failurePolicy: FailFast
@@ -5693,9 +5756,10 @@ spec:
       timeout: "3m"
       checks:
         - type: PodReady
-          namespace: openfuyao-system
-          labelSelector: "app.kubernetes.io/name=openfuyao-core"
-          minReady: 1
+          podReady:
+            namespace: openfuyao-system
+            labelSelector: "app.kubernetes.io/name=openfuyao-core"
+            minReady: 1
   subComponents:
     - name: kubernetes-master
       version: v1.29.0

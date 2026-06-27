@@ -305,9 +305,10 @@ spec:
       timeout: "3m"
       checks:
         - type: PodReady
-          namespace: kube-system
-          labelSelector: "k8s-app=kube-dns"
-          minReady: 1
+          podReady:
+            namespace: kube-system
+            labelSelector: "k8s-app=kube-dns"
+            minReady: 1
     
     # 回滚配置
     rollback:
@@ -357,9 +358,10 @@ spec:
       timeout: "3m"
       checks:
         - type: PodReady
-          namespace: openfuyao-system
-          labelSelector: "app.kubernetes.io/name=openfuyao-core"
-          minReady: 1
+          podReady:
+            namespace: openfuyao-system
+            labelSelector: "app.kubernetes.io/name=openfuyao-core"
+            minReady: 1
 
   # 子组件引用 (组合关系: openfuyao-core 包含 kubernetes 和 etcd)
   subComponents:
