@@ -12,9 +12,12 @@
 2. [整体架构设计](#2-整体架构设计)
 3. [ComponentVersion CRD 详细设计](#3-componentversion-crd-详细设计)
    - 3.1 ComponentVersion 类型定义
-   - 3.2 Helm 类型字段定义
-   - 3.3 CRD YAML 定义
-   - 3.4 CRD 版本迁移设计
+   - 3.2 Binary 类型字段定义
+   - 3.3 YAML 类型字段定义
+   - 3.4 Helm 类型字段定义
+   - 3.5 Inline 类型字段定义
+   - 3.6 CRD YAML 定义
+   - 3.7 CRD 版本迁移设计
 4. [BinaryInstaller 详细设计](#4-binaryinstaller-详细设计)
 5. [HelmInstaller 详细设计](#5-helminstaller-详细设计)
 6. [TemplateRenderer 详细设计](#6-templaterenderer-详细设计)
@@ -302,15 +305,6 @@ const (
     ComponentTypeBinary ComponentType = "binary"
 )
 
-// InlineSpec 定义内联执行器配置
-type InlineSpec struct {
-    // Handler 名称 (对应 ComponentFactory 注册的 handler)
-    Handler string `json:"handler"`
-    
-    // Handler 版本
-    Version string `json:"version"`
-}
-
 // CompatibilitySpec 定义兼容性约束
 type CompatibilitySpec struct {
     // 约束列表
@@ -431,42 +425,11 @@ type ResourceSpec struct {
     // 也用于 YAML 组件的清单收集 (CollectComponentManifests)
     Manifest string `json:"manifest,omitempty"`
 }
+```
 
-// YAMLSpec 定义 YAML 清单组件规格
-type YAMLSpec struct {
-    // YAML 清单文件列表 (外部 URL 引用)
-    Manifests []ManifestRef `json:"manifests"`
-    
-    // 注意: 内联 K8s 资源定义通过 ComponentVersionSpec.Resources (顶层) 提供
-    // 后续版本可考虑将 Resources 迁移至此字段, 作为 YAML 类型的专属配置
-    // 当前为保持向后兼容, Resources 仍位于 ComponentVersionSpec 顶层
-    
-    // 部署目标命名空间
-    Namespace string `json:"namespace,omitempty"`
-    
-    // 应用策略: ServerSideApply, Replace, CreateOnly
-    ApplyStrategy string `json:"applyStrategy,omitempty"`
-    
-    // 是否启用裁剪 (按 label selector 删除不再需要的资源)
-    Prune bool `json:"prune,omitempty"`
-    
-    // 裁剪使用的标签选择器
-    PruneLabelSelector map[string]string `json:"pruneLabelSelector,omitempty"`
-    
-    // 健康检查配置 (应用清单后验证 Pod/Endpoint 就绪)
-    // 复用 Helm 的 HealthCheckSpec, 因为两者都部署 K8s 资源, 检查机制一致
-    HealthCheck *HealthCheckSpec `json:"healthCheck,omitempty"`
-}
+### 3.2 Binary 类型字段定义
 
-// ManifestRef 定义 YAML 清单文件引用
-type ManifestRef struct {
-    // 清单文件 URL 或路径
-    URL string `json:"url"`
-    
-    // 校验和
-    Checksum string `json:"checksum,omitempty"`
-}
-
+```go
 // BinarySpec 定义二进制组件规格
 type BinarySpec struct {
     // 自定义变量 (可覆盖默认值)
@@ -616,7 +579,46 @@ type OSSpec struct {
 }
 ```
 
-### 3.2 Helm 类型字段定义
+### 3.3 YAML 类型字段定义
+
+```go
+// YAMLSpec 定义 YAML 清单组件规格
+type YAMLSpec struct {
+    // YAML 清单文件列表 (外部 URL 引用)
+    Manifests []ManifestRef `json:"manifests"`
+    
+    // 注意: 内联 K8s 资源定义通过 ComponentVersionSpec.Resources (顶层) 提供
+    // 后续版本可考虑将 Resources 迁移至此字段, 作为 YAML 类型的专属配置
+    // 当前为保持向后兼容, Resources 仍位于 ComponentVersionSpec 顶层
+    
+    // 部署目标命名空间
+    Namespace string `json:"namespace,omitempty"`
+    
+    // 应用策略: ServerSideApply, Replace, CreateOnly
+    ApplyStrategy string `json:"applyStrategy,omitempty"`
+    
+    // 是否启用裁剪 (按 label selector 删除不再需要的资源)
+    Prune bool `json:"prune,omitempty"`
+    
+    // 裁剪使用的标签选择器
+    PruneLabelSelector map[string]string `json:"pruneLabelSelector,omitempty"`
+    
+    // 健康检查配置 (应用清单后验证 Pod/Endpoint 就绪)
+    // 复用 Helm 的 HealthCheckSpec, 因为两者都部署 K8s 资源, 检查机制一致
+    HealthCheck *HealthCheckSpec `json:"healthCheck,omitempty"`
+}
+
+// ManifestRef 定义 YAML 清单文件引用
+type ManifestRef struct {
+    // 清单文件 URL 或路径
+    URL string `json:"url"`
+    
+    // 校验和
+    Checksum string `json:"checksum,omitempty"`
+}
+```
+
+### 3.4 Helm 类型字段定义
 
 ```go
 // HelmSpec 定义 Helm 组件规格
@@ -806,7 +808,22 @@ type HookSpec struct {
 }
 ```
 
-### 3.3 CRD YAML 定义
+### 3.5 Inline 类型字段定义
+
+```go
+// InlineSpec 定义内联执行器配置
+// Inline 组件通过 ComponentFactory 注册的 handler 执行, 无需制品下载/模板渲染
+// handler 名称对应 ComponentFactory.Register() 注册的 key
+type InlineSpec struct {
+    // Handler 名称 (对应 ComponentFactory 注册的 handler)
+    Handler string `json:"handler"`
+    
+    // Handler 版本
+    Version string `json:"version"`
+}
+```
+
+### 3.6 CRD YAML 定义
 
 ```yaml
 # config/crd/bases/config.openfuyao.cn_componentversions.yaml
@@ -1399,7 +1416,7 @@ spec:
 
 ---
 
-### 3.4 CRD 版本迁移设计
+### 3.7 CRD 版本迁移设计
 
 **设计思路**：v1alpha1 仅含 inline/subComponents/resources/compatibility/dependencies/upgradeStrategy 字段。v1alpha2 新增 binary/helm/yaml 字段定义。所有新字段均为 omitempty，v1alpha1 数据可无损转换为 v1alpha2。
 
