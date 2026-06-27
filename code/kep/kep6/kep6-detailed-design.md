@@ -469,7 +469,10 @@ type ArtifactSpec struct {
     // 例如: containerd tar.gz → "/usr/local", runc → "/usr/local/sbin"
     InstallPath string `json:"installPath"`
     
-    // 可执行文件名
+    // 可执行文件名 (解压后的二进制文件名, 通过 {{artifact.<name>.executable}} 引用)
+    // 与 Name 的区别: Name 是制品在 artifacts 列表中的标识, Executable 是解压后实际的文件名
+    // 多数情况下 Name == Executable, 但当 tar.gz 内部文件名与制品名不同时需显式指定
+    // installScript 中用于: chmod +x {{artifact.<name>.installPath}}/bin/{{artifact.<name>.executable}}
     Executable string `json:"executable,omitempty"`
 }
 
@@ -1730,6 +1733,7 @@ func (i *BinaryInstaller) Install(ctx context.Context, opts InstallOptions) erro
             Checksum:    art.Checksum,
             Filename:    art.Filename,
             InstallPath: art.InstallPath,  // per-artifact 安装路径, 供 {{artifact.<name>.installPath}} 引用
+            Executable:  art.Executable,   // 解压后可执行文件名, 供 {{artifact.<name>.executable}} 引用
         }
     }
     
@@ -2772,6 +2776,7 @@ type ArtifactInfo struct {
     Checksum    string
     Filename    string
     InstallPath string    // 远程节点上的最终安装路径 (per-artifact, 通过 {{artifact.<name>.installPath}} 引用)
+    Executable  string    // 解压后的可执行文件名 (通过 {{artifact.<name>.executable}} 引用)
 }
 ```
 
@@ -2848,6 +2853,8 @@ fi
 | `{{artifact.<name>.url}}` | 制品原始 URL | `.Artifacts[name].URL` | `https://release-repo.../containerd.tar.gz` |
 | `{{artifact.<name>.checksum}}` | 制品校验和 | `.Artifacts[name].Checksum` | `sha256:abc123...` |
 | `{{artifact.<name>.filename}}` | 制品文件名 | `.Artifacts[name].Filename` | `containerd-1.7.18-linux-amd64.tar.gz` |
+| `{{artifact.<name>.installPath}}` | per-artifact 安装路径 | `.Artifacts[name].InstallPath` | `/usr/local` |
+| `{{artifact.<name>.executable}}` | 解压后可执行文件名 | `.Artifacts[name].Executable` | `containerd` |
 
 #### 5. 镜像仓库变量 (Registry Variables)
 
@@ -5004,12 +5011,12 @@ spec:
 
       # 3. 备份旧版本 (仅升级时)
       {{if .isUpgrade}}
-      cp {{artifact.containerd.installPath}}/bin/containerd {{artifact.containerd.installPath}}/bin/containerd.bak.$(date +%Y%m%d%H%M%S)
+      cp {{artifact.containerd.installPath}}/bin/{{artifact.containerd.executable}} {{artifact.containerd.installPath}}/bin/{{artifact.containerd.executable}}.bak.$(date +%Y%m%d%H%M%S)
       {{end}}
 
       # 4. 解压并安装新二进制 (tar.gz 包含 containerd, containerd-shim-runc-v2, ctr)
       tar -xzf {{artifact.containerd.path}} -C {{artifact.containerd.installPath}}
-      chmod +x {{artifact.containerd.installPath}}/bin/containerd
+      chmod +x {{artifact.containerd.installPath}}/bin/{{artifact.containerd.executable}}
 
       # 5. 安装配置文件和服务 (由 ConfigRenderer 自动上传)
       # config.toml → {{configPath}}/config.toml
@@ -5019,13 +5026,13 @@ spec:
       systemctl daemon-reload
       systemctl enable containerd
       systemctl start containerd
-      {{artifact.containerd.installPath}}/bin/containerd --version
+      {{artifact.containerd.installPath}}/bin/{{artifact.containerd.executable}} --version
 
     uninstallScript: |
       #!/bin/bash
       systemctl stop containerd || true
       systemctl disable containerd || true
-      rm -f {{artifact.containerd.installPath}}/bin/containerd {{artifact.containerd.installPath}}/bin/containerd-shim-runc-v2 {{artifact.containerd.installPath}}/bin/containerd-stress {{artifact.containerd.installPath}}/bin/ctr
+      rm -f {{artifact.containerd.installPath}}/bin/{{artifact.containerd.executable}} {{artifact.containerd.installPath}}/bin/containerd-shim-runc-v2 {{artifact.containerd.installPath}}/bin/containerd-stress {{artifact.containerd.installPath}}/bin/ctr
       rm -f /etc/systemd/system/containerd.service
       systemctl daemon-reload
 
@@ -5049,7 +5056,7 @@ spec:
       script: |
         #!/bin/bash
         systemctl is-active containerd
-        {{artifact.containerd.installPath}}/bin/containerd --version | grep -q "{{componentVersion}}"
+        {{artifact.containerd.installPath}}/bin/{{artifact.containerd.executable}} --version | grep -q "{{componentVersion}}"
         crictl info > /dev/null 2>&1
 
   compatibility:
@@ -5295,11 +5302,11 @@ spec:
 
       # 3. 备份旧版本 (仅升级时)
       {{if .isUpgrade}}
-      cp {{artifact.bkeagent.installPath}}/bkeagent {{artifact.bkeagent.installPath}}/bkeagent.bak.$(date +%Y%m%d%H%M%S)
+      cp {{artifact.bkeagent.installPath}}/{{artifact.bkeagent.executable}} {{artifact.bkeagent.installPath}}/{{artifact.bkeagent.executable}}.bak.$(date +%Y%m%d%H%M%S)
       {{end}}
 
       # 4. 安装新二进制
-      install -m 0755 {{artifact.bkeagent.path}} {{artifact.bkeagent.installPath}}/bkeagent
+      install -m 0755 {{artifact.bkeagent.path}} {{artifact.bkeagent.installPath}}/{{artifact.bkeagent.executable}}
 
       # 5. 安装 systemd service (由 ConfigRenderer 自动上传配置文件)
       # bkeagent.conf → {{configPath}}/bkeagent.conf
@@ -5314,7 +5321,7 @@ spec:
       After=network.target
 
       [Service]
-      ExecStart={{artifact.bkeagent.installPath}}/bkeagent --config {{configPath}}/bkeagent.conf
+      ExecStart={{artifact.bkeagent.installPath}}/{{artifact.bkeagent.executable}} --config {{configPath}}/bkeagent.conf
       Restart=always
       RestartSec=5
 
@@ -5333,7 +5340,7 @@ spec:
       #!/bin/bash
       systemctl stop bkeagent || true
       systemctl disable bkeagent || true
-      rm -f {{artifact.bkeagent.installPath}}/bkeagent
+      rm -f {{artifact.bkeagent.installPath}}/{{artifact.bkeagent.executable}}
       rm -f /etc/systemd/system/bkeagent.service
       rm -rf {{configPath}}
       systemctl daemon-reload
@@ -5663,11 +5670,11 @@ spec:
       set -e
       systemctl stop containerd || true
       tar -xzf {{artifact.containerd.path}} -C {{artifact.containerd.installPath}}
-      chmod +x {{artifact.containerd.installPath}}/bin/containerd
+      chmod +x {{artifact.containerd.installPath}}/bin/{{artifact.containerd.executable}}
       systemctl daemon-reload
       systemctl enable containerd
       systemctl start containerd
-      {{artifact.containerd.installPath}}/bin/containerd --version
+      {{artifact.containerd.installPath}}/bin/{{artifact.containerd.executable}} --version
     supportedArchitectures: ["amd64", "arm64"]
     supportedOS:
       - name: centos

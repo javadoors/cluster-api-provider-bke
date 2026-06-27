@@ -198,23 +198,23 @@ spec:
       
       # 3. 备份旧版本 (仅升级时)
       {{if .isUpgrade}}
-      cp {{artifact.containerd.installPath}}/bin/containerd {{artifact.containerd.installPath}}/bin/containerd.bak.$(date +%Y%m%d%H%M%S)
+      cp {{artifact.containerd.installPath}}/bin/{{artifact.containerd.executable}} {{artifact.containerd.installPath}}/bin/{{artifact.containerd.executable}}.bak.$(date +%Y%m%d%H%M%S)
       {{end}}
       
       # 4. 安装新二进制 (tar.gz 包含 containerd, containerd-shim-runc-v2, ctr)
       tar -xzf "{{artifact.containerd.path}}" -C {{artifact.containerd.installPath}}
-      chmod +x {{artifact.containerd.installPath}}/bin/containerd
+      chmod +x {{artifact.containerd.installPath}}/bin/{{artifact.containerd.executable}}
       
       # 5. 启动并验证
       systemctl daemon-reload && systemctl enable containerd && systemctl start containerd
-      {{artifact.containerd.installPath}}/bin/containerd --version
+      {{artifact.containerd.installPath}}/bin/{{artifact.containerd.executable}} --version
     
     # 卸载脚本
     uninstallScript: |
       #!/bin/bash
       systemctl stop containerd || true
       systemctl disable containerd || true
-      rm -f {{artifact.containerd.installPath}}/bin/containerd {{artifact.containerd.installPath}}/bin/containerd-shim-runc-v2 {{artifact.containerd.installPath}}/bin/ctr
+      rm -f {{artifact.containerd.installPath}}/bin/{{artifact.containerd.executable}} {{artifact.containerd.installPath}}/bin/containerd-shim-runc-v2 {{artifact.containerd.installPath}}/bin/ctr
       rm -f /etc/systemd/system/containerd.service
       systemctl daemon-reload
     
@@ -236,7 +236,7 @@ spec:
       script: |
         #!/bin/bash
         systemctl is-active containerd
-        {{artifact.containerd.installPath}}/bin/containerd --version | grep -q "{{componentVersion}}"
+        {{artifact.containerd.installPath}}/bin/{{artifact.containerd.executable}} --version | grep -q "{{componentVersion}}"
         crictl info > /dev/null 2>&1
   
   # 兼容性约束
