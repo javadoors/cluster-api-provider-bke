@@ -302,8 +302,39 @@ type SubComponent struct {
 }
 
 // ResourceSpec 定义 Kubernetes 资源
+//
+// 设计思路 — Data、StringData 与 Manifest 三种资源定义方式:
+//
+// ResourceSpec 支持三种方式定义 K8s 资源内容, 通过 Kind 字段分发:
+//
+// 1. Data (ConfigMap 专属): key-value 字符串, 直接作为 ConfigMap.data
+//    - 场景: 简单的配置文件, 如 bkeagent 的 logLevel/snapshotter 等参数
+//    - 优势: 结构化、可校验, 无需写完整 ConfigMap YAML
+//    - 代码: provisionConfigMap() 读取 Data 字段创建 ConfigMap 对象
+//
+// 2. StringData (Secret 专属): key-value 明文字符串, 自动转 base64 编码
+//    - 场景: Secret 中的证书、密钥等敏感数据
+//    - 优势: 用户写明文, 代码自动转 base64, 避免手动编码出错
+//    - 如果用 Manifest 方式, Secret.data 需要 base64 编码, 不友好且易错
+//    - 代码: provisionSecret() 读取 StringData, 自动转为 Secret.data (base64)
+//
+// 3. Manifest (通用): 原始 YAML 字符串, 解析为 unstructured.Unstructured 后创建
+//    - 场景: Deployment/Service/CRD 等复杂资源, 声明式字段无法表达完整定义
+//    - 优势: 支持任意 K8s 资源, 灵活性最高
+//    - 代码: provisionFromManifest() 解析 YAML 并创建资源
+//    - 额外用途: CollectComponentManifests() 收集 Manifest 作为 YAML 组件的清单
+//
+// 分发逻辑 (provisionResource):
+//   - Manifest 非空且 Kind 非 ConfigMap/Secret → 直接用 Manifest
+//   - Kind == ConfigMap → 用 Data 创建
+//   - Kind == Secret → 用 StringData 创建 (避免手动 base64)
+//   - 其他 Kind 且无 Manifest → 报错
+//
+// ConfigMap 用 Data 的原因: 与 Secret 对称设计, 且略简洁 (无需写完整 YAML)
+// Secret 用 StringData 的原因: 避免 base64 编码, 这是核心价值
+// 其他资源用 Manifest 的原因: 声明式字段无法表达完整 K8s 资源定义
 type ResourceSpec struct {
-    // 资源类型
+    // 资源类型 (ConfigMap / Secret / Deployment / CRD 等)
     Kind string `json:"kind"`
     
     // API 版本
@@ -315,16 +346,19 @@ type ResourceSpec struct {
     // 资源名称
     Name string `json:"name"`
     
-    // 标签选择器
+    // 标签 (自动注入到创建的资源中)
     Labels map[string]string `json:"labels,omitempty"`
     
-    // Data 字段
+    // ConfigMap 数据 (Kind=ConfigMap 时使用, 直接作为 ConfigMap.data)
     Data map[string]string `json:"data,omitempty"`
     
-    // StringData 字段
+    // Secret 明文数据 (Kind=Secret 时使用, 自动转 base64 编码为 Secret.data)
+    // 核心价值: 用户写明文, 避免手动 base64 编码
     StringData map[string]string `json:"stringData,omitempty"`
     
-    // 原始 Manifest 内容
+    // 原始 Manifest 内容 (通用, 任意 Kind 均可使用)
+    // ConfigMap/Secret 优先用 Data/StringData, 其他 Kind 用 Manifest
+    // 也用于 YAML 组件的清单收集 (CollectComponentManifests)
     Manifest string `json:"manifest,omitempty"`
 }
 
