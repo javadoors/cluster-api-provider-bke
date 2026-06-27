@@ -29,7 +29,7 @@
 
 ### 2.2 目标
 
-1. 实现 `ComponentTypeBinary` 类型组件的完整支持，包括制品下载、模板渲染、SSH 安装。
+1. 实现 `ComponentTypeBinary` 类型组件的完整支持，包括制品下载、模板渲染、SSH 安装、健康检查。
 2. 实现 `ComponentTypeHelm` 类型组件的完整支持，包括 OCI/HTTP/本地 Chart 获取、Values 渲染、健康检查。
 3. 实现 `ComponentTypeYAML` 类型组件的完整支持，包括清单获取、多文档解析、ServerSideApply/Replace/CreateOnly 三种应用策略、Prune 裁剪。
 4. 设计 `configTemplates` 配置模板引擎，支持 Go template、Secret 引用、动态 kubeconfig 生成。
@@ -52,7 +52,7 @@
 | 范围 | 说明 |
 |------|------|
 | CRD 扩展 | `ComponentVersion` 新增 `binary`、`helm`、`yaml` 类型的完整字段定义，以及 `SubComponents`、`Resources` 通用字段 |
-| BinaryInstaller | 二进制制品下载、缓存、模板渲染、SSH 安装、卸载 |
+| BinaryInstaller | 二进制制品下载、缓存、模板渲染、SSH 安装、健康检查、卸载 |
 | HelmInstaller | Chart 获取 (OCI/HTTP/本地)、Values 渲染、Install/Upgrade/Rollback/Uninstall |
 | YAMLManifestExecutor | YAML 清单获取、多文档解析、ServerSideApply/Replace/CreateOnly 应用策略、Prune 裁剪 |
 | configTemplates | Go template 渲染、Secret 引用、动态 kubeconfig 生成 |
@@ -227,6 +227,17 @@ spec:
         versions: ["20.04", "22.04"]
       - name: kylin
         versions: ["V10"]
+    
+    # 健康检查 (安装/升级后通过 SSH 执行脚本验证服务可用性)
+    healthCheck:
+      enabled: true
+      timeout: "2m"
+      interval: "5s"
+      script: |
+        #!/bin/bash
+        systemctl is-active containerd
+        {{artifact.containerd.installPath}}/bin/containerd --version | grep -q "{{componentVersion}}"
+        crictl info > /dev/null 2>&1
   
   # 兼容性约束
   compatibility:
@@ -883,7 +894,7 @@ func (r *BKEClusterReconciler) executeContainerdUpgrade(ctx context.Context) err
 
 | 术语 | 定义 |
 |------|------|
-| **BinaryInstaller** | 负责二进制组件下载、渲染、安装的安装器 |
+| **BinaryInstaller** | 负责二进制组件下载、渲染、安装、健康检查的安装器 |
 | **HelmInstaller** | 负责 Helm Chart 获取、渲染、部署的安装器 |
 | **YAMLManifestExecutor** | 负责 YAML 清单获取、解析、应用、裁剪的执行器 |
 | **VersionContext** | 携带组件版本事实（已安装版本、目标版本），Executor 据此自主决定操作类型 |

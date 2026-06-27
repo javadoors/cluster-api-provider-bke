@@ -390,6 +390,29 @@ type BinarySpec struct {
     
     // 默认数据路径 (组件级共享)
     DefaultDataPath string `json:"defaultDataPath,omitempty"`
+    
+    // 健康检查配置 (安装/升级后通过 SSH 执行脚本验证服务可用性)
+    HealthCheck *BinaryHealthCheckSpec `json:"healthCheck,omitempty"`
+}
+
+// BinaryHealthCheckSpec 定义二进制组件健康检查规格
+// 与 Helm 的 HealthCheckSpec 不同, Binary 组件运行在远程节点上,
+// 健康检查通过 SSH 执行脚本完成, 退出码 0=健康, 非零=不健康
+type BinaryHealthCheckSpec struct {
+    // 是否启用健康检查
+    Enabled bool `json:"enabled"`
+    
+    // 等待超时时间 (默认 2m)
+    Timeout string `json:"timeout,omitempty"`
+    
+    // 重试间隔 (默认 5s)
+    Interval string `json:"interval,omitempty"`
+    
+    // 健康检查脚本 (Go template, 通过 SSH 在远程节点执行)
+    // 支持 installScript 的所有模板变量 ({{artifact.<name>.installPath}}, {{configPath}} 等)
+    // 退出码 0 = 健康, 非零 = 不健康
+    // 可组合多个检查命令, 任一失败则整体失败
+    Script string `json:"script"`
 }
 
 // ArtifactSpec 定义二进制制品规格
@@ -952,6 +975,18 @@ spec:
                       type: string
                     defaultDataPath:
                       type: string
+                    healthCheck:
+                      type: object
+                      properties:
+                        enabled:
+                          type: boolean
+                        timeout:
+                          type: string
+                        interval:
+                          type: string
+                        script:
+                          type: string
+                      required: [enabled, script]
                   required: [artifacts, installScript, supportedArchitectures, supportedOS]
                 helm:
                   type: object
@@ -1601,12 +1636,51 @@ func (i *BinaryInstaller) Install(ctx context.Context, opts InstallOptions) erro
     // 9. SSH 执行安装
     switch opts.Action {
     case BinaryActionInstall, BinaryActionUpgrade:
-        return i.executeInstall(ctx, tmplCtx.NodeIP, script, artifacts, configs)
+        if err := i.executeInstall(ctx, tmplCtx.NodeIP, script, artifacts, configs); err != nil {
+            return err
+        }
+        // 10. 健康检查 (安装/升级后验证服务可用性)
+        if binary.HealthCheck != nil && binary.HealthCheck.Enabled {
+            if err := i.executeHealthCheck(ctx, tmplCtx.NodeIP, binary.HealthCheck, tmplCtx); err != nil {
+                return fmt.Errorf("health check failed on %s: %w", tmplCtx.NodeIP, err)
+            }
+        }
+        return nil
     case BinaryActionUninstall:
         return i.executeUninstall(ctx, tmplCtx.NodeIP, binary.UninstallScript, tmplCtx)
     }
     
     return nil
+}
+
+// executeHealthCheck 通过 SSH 执行健康检查脚本, 重试直到超时或通过
+func (i *BinaryInstaller) executeHealthCheck(
+    ctx context.Context,
+    nodeIP string,
+    hc *BinaryHealthCheckSpec,
+    tmplCtx *manifest.TemplateContext,
+) error {
+    // 渲染健康检查脚本
+    script, err := i.renderer.RenderScript(hc.Script, tmplCtx)
+    if err != nil {
+        return fmt.Errorf("failed to render health check script: %w", err)
+    }
+
+    timeout := parseDurationDefault(hc.Timeout, 2*time.Minute)
+    interval := parseDurationDefault(hc.Interval, 5*time.Second)
+    deadline := time.Now().Add(timeout)
+
+    for time.Now().Before(deadline) {
+        result, err := i.sshClient.Execute(nodeIP, script)
+        if err == nil {
+            return nil // 退出码 0 = 健康
+        }
+        i.logger.Warn("health check retry on %s: %v (stdout: %s, stderr: %s)",
+            nodeIP, err, result.Stdout, result.Stderr)
+        time.Sleep(interval)
+    }
+
+    return fmt.Errorf("health check timed out after %s on %s", timeout, nodeIP)
 }
 
 // downloadArtifacts 下载二进制制品 (使用 arch 解析 URL 中的 {{arch}} 占位符)
@@ -4243,6 +4317,16 @@ spec:
     defaultLogPath: "/var/log/containerd"
     defaultDataPath: "/var/lib/containerd"
 
+    healthCheck:
+      enabled: true
+      timeout: "2m"
+      interval: "5s"
+      script: |
+        #!/bin/bash
+        systemctl is-active containerd
+        {{artifact.containerd.installPath}}/bin/containerd --version | grep -q "{{componentVersion}}"
+        crictl info > /dev/null 2>&1
+
   compatibility:
     constraints:
       - component: kubernetes-master
@@ -4541,6 +4625,14 @@ spec:
     defaultConfigPath: "/etc/openFuyao/bkeagent"
     defaultLogPath: "/var/log/bkeagent"
 
+    healthCheck:
+      enabled: true
+      timeout: "1m"
+      interval: "3s"
+      script: |
+        #!/bin/bash
+        systemctl is-active bkeagent
+
   compatibility:
     constraints:
       - component: kubernetes-master
@@ -4719,6 +4811,7 @@ spec:
 | **ApplyStrategy 引擎实现** | 3 人日 | 中 | YAMLManifestExecutor |
 | **Prune 裁剪功能实现** | 3 人日 | 中 | ApplyStrategy 引擎 |
 | **PreInstallHooks 执行引擎** | 3 人日 | 中 | HelmInstaller |
+| **Binary 健康检查实现** | 2 人日 | 中 | BinaryInstaller |
 | **ComponentVersion CRD 扩展** | 3 人日 | 低 | 无 |
 | **CRD v1alpha2 版本迁移** | 2 人日 | 中 | CRD 扩展 |
 | **VersionContext 与 ExecutionContext 实现** | 3 人日 | 中 | 无 |
@@ -4736,7 +4829,7 @@ spec:
 | **迁移验证** | 3 人日 | 中 | 兼容层实现 |
 | **文档编写** | 4 人日 | 低 | 无 |
 | **代码审查与修复** | 4 人日 | 中 | 测试完成 |
-| **总计** | **90 人日 (约 4 人月)** | | |
+| **总计** | **92 人日 (约 4 人月)** | | |
 
 ### 14.2 Sprint 计划
 
