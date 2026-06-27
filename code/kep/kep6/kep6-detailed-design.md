@@ -2282,7 +2282,129 @@ func (i *HelmInstaller) checkCustom(
 }
 ```
 
-### 6.0 与现有 TemplateContext 的复用关系
+**设计思路 — Values 与 ValuesFiles 的关系及合并策略**：
+
+`HelmSpec` 提供两种 Values 来源，合并优先级从低到高：
+
+```
+Chart 默认值 → ValuesFiles[0] → ValuesFiles[1] → ... → Values 内联字段 (最高优先级)
+```
+
+1. **Values（内联）**：`map[string]interface{}`，直接在 CRD YAML 中定义，支持模板变量渲染（如 `{{componentVersion}}`）。优先级最高，覆盖所有文件值。
+2. **ValuesFiles（外部文件）**：`[]string`，文件路径列表，路径支持模板变量（如 `values-{{arch}}.yaml`）。从控制器 Pod 本地文件系统读取（通常通过 ConfigMap 挂载）。逐个加载后按顺序合并，后者覆盖前者。
+3. **mergeValues 合并规则**：递归合并 map（src 覆盖 dst 同名键），非 map 类型（list/string/int）整体替换而非追加。与 Helm 自身 `--set` 和 `-f` 合并行为一致。
+4. **文件加载失败为警告而非错误**：ValuesFiles 是可选补充配置，文件可能按条件存在（如 `values-{{arch}}.yaml` 在某些架构上不存在），缺失时使用内联 Values 即可。
+
+**设计思路 — 本地文件系统 vs ConfigMap/URL**：
+
+当前从控制器 Pod 本地文件系统读取 Values 文件。在 Kubernetes 控制器场景下，文件通常通过 ConfigMap 或 Secret 挂载到 Pod 中。选择本地文件而非直接读取 ConfigMap API 的原因是：
+- Values 文件可能很大（超过 etcd 1MB 限制），ConfigMap 不适合存储大型 YAML
+- 文件路径支持模板变量渲染，动态选择不同文件（如 `values-{{arch}}.yaml`）
+- 后续可扩展支持 HTTP URL 和 ConfigMap 引用作为 Values 来源
+
+```go
+// renderValues 渲染 Values 中的模板变量
+// 将 helm.Values (map[string]interface{}) 中的字符串值进行模板变量替换
+// 支持 {{componentVersion}}, {{clusterName}}, {{imageRegistry}} 等变量
+func (i *HelmInstaller) renderValues(
+    ctx context.Context,
+    values map[string]interface{},
+    tmplCtx manifest.TemplateContext,
+) (map[string]interface{}, error) {
+    rendered := make(map[string]interface{})
+    for key, val := range values {
+        switch v := val.(type) {
+        case string:
+            // 字符串值: 渲染模板变量
+            renderedVal, err := i.renderTemplateString(v, tmplCtx)
+            if err != nil {
+                return nil, fmt.Errorf("failed to render value %q: %w", key, err)
+            }
+            rendered[key] = renderedVal
+        case map[string]interface{}:
+            // 嵌套 map: 递归渲染
+            nested, err := i.renderValues(ctx, v, tmplCtx)
+            if err != nil {
+                return nil, err
+            }
+            rendered[key] = nested
+        default:
+            // 非字符串类型 (int/bool/float/list): 原样保留
+            rendered[key] = val
+        }
+    }
+    return rendered, nil
+}
+
+// renderTemplateString 渲染字符串中的模板变量
+// 支持 {{componentVersion}} 简单替换 和 {{.clusterName}} Go template 两种语法
+func (i *HelmInstaller) renderTemplateString(s string, tmplCtx manifest.TemplateContext) (string, error) {
+    if !strings.Contains(s, "{{") {
+        return s, nil // 无模板变量, 直接返回
+    }
+    // 简单变量替换: {{componentVersion}} → tmplCtx.ComponentVersion
+    result := s
+    result = strings.ReplaceAll(result, "{{componentVersion}}", tmplCtx.ComponentVersion)
+    result = strings.ReplaceAll(result, "{{clusterName}}", tmplCtx.ClusterName)
+    result = strings.ReplaceAll(result, "{{namespace}}", tmplCtx.Namespace)
+    result = strings.ReplaceAll(result, "{{kubernetesVersion}}", tmplCtx.KubernetesVersion)
+    result = strings.ReplaceAll(result, "{{imageRegistry}}", tmplCtx.ImageRegistry)
+    return result, nil
+}
+
+// loadValuesFile 加载自定义 Values 文件
+// 1. 渲染文件路径中的模板变量 (如 values-{{arch}}.yaml)
+// 2. 从控制器本地文件系统读取文件 (通常通过 ConfigMap 挂载)
+// 3. 解析 YAML 为 map[string]interface{}
+func (i *HelmInstaller) loadValuesFile(
+    ctx context.Context,
+    valuesFile string,
+    tmplCtx manifest.TemplateContext,
+) (map[string]interface{}, error) {
+    // 1. 渲染文件名中的模板变量
+    renderedFile, err := i.renderTemplateString(valuesFile, tmplCtx)
+    if err != nil {
+        return nil, fmt.Errorf("failed to render values file path %s: %w", valuesFile, err)
+    }
+
+    // 2. 读取文件内容
+    data, err := os.ReadFile(renderedFile)
+    if err != nil {
+        return nil, fmt.Errorf("failed to read values file %s: %w", renderedFile, err)
+    }
+
+    // 3. 解析 YAML
+    values := make(map[string]interface{})
+    if err := yaml.Unmarshal(data, &values); err != nil {
+        return nil, fmt.Errorf("failed to parse values file %s: %w", renderedFile, err)
+    }
+
+    return values, nil
+}
+
+// mergeValues 合并两份 Values (dst 被 src 覆盖)
+// 策略: 递归合并 map, src 中的值覆盖 dst 中的同名键
+// 非 map 类型 (list/string/int/bool) 整体替换, 不追加
+// 与 Helm 自身 --set 和 -f 合并行为一致
+func mergeValues(dst, src map[string]interface{}) map[string]interface{} {
+    result := make(map[string]interface{})
+    for k, v := range dst {
+        result[k] = v
+    }
+    for k, v := range src {
+        if dstMap, ok := dst[k].(map[string]interface{}); ok {
+            if srcMap, ok := v.(map[string]interface{}); ok {
+                // 两边都是 map: 递归合并
+                result[k] = mergeValues(dstMap, srcMap)
+                continue
+            }
+        }
+        // src 覆盖 dst (非 map 类型整体替换, list 不追加)
+        result[k] = v
+    }
+    return result
+}
+```
 
 **设计思路**：为避免重复造轮子，TemplateRenderer 复用并扩展现有的 `pkg/manifest.TemplateContext` 结构体。现有 TemplateContext 用于 YAML/Manifest 组件的模板渲染，包含 4 个基础字段。TemplateRenderer 在此基础上扩展，增加 Binary 组件所需的节点信息、制品信息、自定义变量等字段。
 
