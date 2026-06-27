@@ -610,20 +610,39 @@ type OCIChartSpec struct {
 }
 
 // HelmStrategySpec 定义 Helm 安装策略
+//
+// 设计思路 — 与 UpgradeStrategySpec 的分工:
+// HelmStrategySpec 是 Helm SDK 层策略, 控制 helm 命令参数 (--wait/--atomic/--timeout)
+// UpgradeStrategySpec 是 DAG 调度层策略, 控制节点间并发和失败处理 (Rolling/Batch/FailFast)
+// 两者互补: UpgradeStrategy 决定"何时/如何调度", HelmStrategy 决定"helm 命令怎么执行"
+//
+// Mode 字段的三种值:
+// - Install:  显式指定 helm install (Release 不存在时)
+// - Upgrade:  显式指定 helm upgrade (Release 已存在时)
+// - Rollback: 显式触发 helm rollback (恢复到上一个 Release 版本)
+//
+// Mode 为空时, 由 VersionContext 自动判定:
+//   HasCurrent=false → Install, HasCurrent=true → Upgrade
+//
+// Mode=Rollback 的使用场景:
+// 1. 用户显式回滚: 升级后发现问题, 修改 ComponentVersion 指定 Mode=Rollback 触发回滚
+// 2. 失败自动回滚: 当 UpgradeStrategy.FailurePolicy=Rollback 且 helm upgrade 失败时,
+//    若 Strategy.Atomic=false (Helm SDK 未自动回滚), 系统调用 i.rollback() 执行 helm rollback
+//    若 Strategy.Atomic=true, Helm SDK 已在 upgrade 命令内部自动回滚, 无需额外调用
 type HelmStrategySpec struct {
-    // 安装模式: Install / Upgrade / Rollback
+    // 安装模式: Install / Upgrade / Rollback (空=自动判定)
     Mode string `json:"mode,omitempty"`
     
-    // 是否等待就绪
+    // 是否等待就绪 (对应 helm --wait)
     Wait bool `json:"wait,omitempty"`
     
-    // 等待超时时间
+    // 等待超时时间 (对应 helm --timeout)
     WaitTimeout string `json:"waitTimeout,omitempty"`
     
-    // 是否原子操作 (失败自动回滚)
+    // 是否原子操作 (对应 helm --atomic, 失败时 Helm SDK 自动回滚)
     Atomic bool `json:"atomic,omitempty"`
     
-    // 失败时是否清理
+    // 失败时是否清理 (对应 helm --cleanup-on-fail, 配合 Atomic 使用)
     CleanupOnFail bool `json:"cleanupOnFail,omitempty"`
 }
 
@@ -760,8 +779,16 @@ type Dependency struct {
 }
 
 // UpgradeStrategySpec 定义升级策略
+// 这是 DAG 调度层策略, 适用于所有组件类型 (binary/helm/yaml/inline)
+// 与各类型的专属策略互补:
+// - Binary: 无专属策略, 仅使用 UpgradeStrategy
+// - Helm:   HelmStrategySpec 控制 helm 命令参数, UpgradeStrategy 控制调度和失败处理
+// - YAML:  无专属策略, 仅使用 UpgradeStrategy
+// 两者的 Mode 字段含义不同:
+// - UpgradeStrategy.Mode = Rolling/Parallel/Batch (节点并发策略)
+// - HelmStrategySpec.Mode = Install/Upgrade/Rollback (Helm 操作类型)
 type UpgradeStrategySpec struct {
-    // 升级模式: Rolling / Parallel / Batch
+    // 升级模式: Rolling / Parallel / Batch (节点并发策略)
     Mode string `json:"mode,omitempty"`
     
     // 批量大小 (Batch 模式下每批节点数)
@@ -771,6 +798,10 @@ type UpgradeStrategySpec struct {
     Timeout string `json:"timeout,omitempty"`
     
     // 失败策略: FailFast / Continue / Rollback
+    // FailFast: 立即终止整个组件执行
+    // Continue: 记录警告, 继续执行下一个节点/批次
+    // Rollback: 回滚后继续 (Binary 执行 UninstallScript; Helm 执行 helm rollback)
+    //           注意: Helm 若 Strategy.Atomic=true, Helm SDK 已自动回滚, 无需额外调用
     FailurePolicy string `json:"failurePolicy,omitempty"`
 }
 ```
@@ -4303,9 +4334,20 @@ func (e *HelmComponentExecutor) ExecuteComponent(ctx context.Context, node *Comp
         return nil
     }
     
+    // 4. 确定操作类型 (Strategy.Mode 优先, 为空时由 VersionContext 自动判定)
     action := helminstaller.HelmActionInstall
-    if vc != nil && vc.HasCurrent(component.Name) {
-        action = helminstaller.HelmActionUpgrade // 已安装 → 升级
+    switch cv.Spec.Helm.Strategy.Mode {
+    case "Rollback":
+        action = helminstaller.HelmActionRollback // 显式回滚
+    case "Install":
+        action = helminstaller.HelmActionInstall // 显式安装
+    case "Upgrade":
+        action = helminstaller.HelmActionUpgrade // 显式升级
+    default:
+        // Mode 为空: 由 VersionContext 自动判定
+        if vc != nil && vc.HasCurrent(cv.Spec.Name) {
+            action = helminstaller.HelmActionUpgrade // 已安装 → 升级
+        }
     }
     
     // 4. 填充 TemplateContext 的版本信息
@@ -4320,7 +4362,30 @@ func (e *HelmComponentExecutor) ExecuteComponent(ctx context.Context, node *Comp
         Timeout:     cv.Spec.UpgradeStrategy.Timeout,
     }
     
-    return e.installer.Install(ctx, opts)
+    if err := e.installer.Install(ctx, opts); err != nil {
+        // FailurePolicy=Rollback: 升级失败后执行 helm rollback
+        // 仅当 Atomic=false 时需要手动回滚 (Atomic=true 时 Helm SDK 已自动回滚)
+        if cv.Spec.UpgradeStrategy.FailurePolicy == "Rollback" &&
+           action == helminstaller.HelmActionUpgrade &&
+           !cv.Spec.Helm.Strategy.Atomic {
+            execCtx.Log.Warn("helm upgrade failed, attempting rollback: %v", err)
+            rollbackOpts := helminstaller.InstallOptions{
+                Component:   cv,
+                TemplateCtx: tmpl,
+                Action:      helminstaller.HelmActionRollback,
+                Timeout:     cv.Spec.UpgradeStrategy.Timeout,
+            }
+            if rbErr := e.installer.Install(ctx, rollbackOpts); rbErr != nil {
+                return fmt.Errorf("upgrade failed: %w; rollback also failed: %v", err, rbErr)
+            }
+            // 回滚成功, 根据 FailurePolicy 决定是否继续
+            execCtx.Log.Info("helm rollback succeeded after upgrade failure")
+            return fmt.Errorf("upgrade failed but rollback succeeded: %w", err)
+        }
+        return err
+    }
+    
+    return nil
 }
 
 // ManifestComponentExecutor YAML/Manifest 组件执行器
