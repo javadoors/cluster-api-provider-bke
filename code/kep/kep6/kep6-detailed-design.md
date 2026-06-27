@@ -4193,11 +4193,19 @@ type ComponentExecutor interface {
     // GetComponentType 获取组件类型
     GetComponentType() ComponentType
 }
+```
 
+##### 8.3.3.1 BinaryComponentExecutor
+
+```go
 // BinaryComponentExecutor 二进制组件执行器
 type BinaryComponentExecutor struct {
     installer *binaryinstaller.BinaryInstaller
     store     *manifest.Store
+}
+
+func (e *BinaryComponentExecutor) GetComponentType() ComponentType {
+    return ComponentTypeBinary
 }
 ```
 
@@ -4323,10 +4331,150 @@ func (e *BinaryComponentExecutor) executeRolling(ctx context.Context, nodes []No
     return nil
 }
 
+// executeParallel 并行执行 (全节点同时)
+func (e *BinaryComponentExecutor) executeParallel(ctx context.Context, nodes []Node,
+    cv *ComponentVersion, strategy UpgradeStrategySpec, execCtx *ExecutionContext) error {
+    g, gCtx := errgroup.WithContext(ctx)
+    sem := make(chan struct{}, len(nodes)) // 不限制并发数, 全部同时执行
+    
+    for _, node := range nodes {
+        node := node
+        g.Go(func() error {
+            select {
+            case sem <- struct{}{}:
+                defer func() { <-sem }()
+            case <-gCtx.Done():
+                return gCtx.Err()
+            }
+            
+            nodeTmpl := execCtx.TemplateContext
+            nodeTmpl.NodeIP = node.IP
+            nodeTmpl.NodeHostname = node.Hostname
+            nodeTmpl.NodeRole = node.Role
+            nodeTmpl.ComponentVersion = cv.Spec.Version
+            
+            action := binaryinstaller.BinaryActionInstall
+            if execCtx.VersionContext != nil && execCtx.VersionContext.HasCurrent(cv.Spec.Name) {
+                action = binaryinstaller.BinaryActionUpgrade
+            }
+            
+            opts := binaryinstaller.InstallOptions{
+                Component:   cv,
+                TemplateCtx: nodeTmpl,
+                Action:      action,
+                Timeout:     strategy.Timeout,
+                RetryCount:  3,
+            }
+            
+            if err := e.installer.Install(gCtx, opts); err != nil {
+                if strategy.FailurePolicy == "FailFast" {
+                    return err
+                }
+                execCtx.Log.Warn("node %s upgrade failed, continuing: %v", node.IP, err)
+                return nil // Continue: 记录警告, 不中断其他节点
+            }
+            return nil
+        })
+    }
+    
+    return g.Wait()
+}
+
+// executeBatch 分批执行 (每批 batchSize 个节点)
+func (e *BinaryComponentExecutor) executeBatch(ctx context.Context, nodes []Node,
+    cv *ComponentVersion, strategy UpgradeStrategySpec, execCtx *ExecutionContext) error {
+    batchSize := strategy.BatchSize
+    if batchSize <= 0 {
+        batchSize = 1 // 默认逐个执行
+    }
+    
+    for i := 0; i < len(nodes); i += batchSize {
+        end := i + batchSize
+        if end > len(nodes) {
+            end = len(nodes)
+        }
+        batch := nodes[i:end]
+        
+        // 批内并行执行
+        g, gCtx := errgroup.WithContext(ctx)
+        for _, node := range batch {
+            node := node
+            g.Go(func() error {
+                nodeTmpl := execCtx.TemplateContext
+                nodeTmpl.NodeIP = node.IP
+                nodeTmpl.NodeHostname = node.Hostname
+                nodeTmpl.NodeRole = node.Role
+                nodeTmpl.ComponentVersion = cv.Spec.Version
+                
+                action := binaryinstaller.BinaryActionInstall
+                if execCtx.VersionContext != nil && execCtx.VersionContext.HasCurrent(cv.Spec.Name) {
+                    action = binaryinstaller.BinaryActionUpgrade
+                }
+                
+                opts := binaryinstaller.InstallOptions{
+                    Component:   cv,
+                    TemplateCtx: nodeTmpl,
+                    Action:      action,
+                    Timeout:     strategy.Timeout,
+                    RetryCount:  3,
+                }
+                
+                if err := e.installer.Install(gCtx, opts); err != nil {
+                    if strategy.FailurePolicy == "FailFast" {
+                        return err
+                    }
+                    execCtx.Log.Warn("node %s upgrade failed in batch, continuing: %v", node.IP, err)
+                    return nil
+                }
+                return nil
+            })
+        }
+        
+        if err := g.Wait(); err != nil {
+            if strategy.FailurePolicy == "FailFast" {
+                return err
+            }
+        }
+        execCtx.Log.Info("batch %d-%d completed", i, end-1)
+    }
+    
+    return nil
+}
+
+// rollback 回滚单个节点 (执行 UninstallScript)
+func (e *BinaryComponentExecutor) rollback(node Node, cv *ComponentVersion) error {
+    if cv.Spec.Binary == nil || cv.Spec.Binary.UninstallScript == "" {
+        return fmt.Errorf("no uninstall script defined for component %s", cv.Spec.Name)
+    }
+    
+    tmplCtx := manifest.TemplateContext{
+        NodeIP:           node.IP,
+        NodeHostname:     node.Hostname,
+        NodeRole:         node.Role,
+        ComponentVersion: cv.Spec.Version,
+    }
+    
+    opts := binaryinstaller.InstallOptions{
+        Component:   cv,
+        TemplateCtx: tmplCtx,
+        Action:      binaryinstaller.BinaryActionUninstall,
+    }
+    
+    return e.installer.Install(context.Background(), opts)
+}
+```
+
+##### 8.3.3.2 HelmComponentExecutor
+
+```go
 // HelmComponentExecutor Helm 组件执行器
 type HelmComponentExecutor struct {
     installer *helminstaller.HelmInstaller
     store     *manifest.Store
+}
+
+func (e *HelmComponentExecutor) GetComponentType() ComponentType {
+    return ComponentTypeHelm
 }
 
 // ExecuteComponent 执行 Helm 组件
@@ -4409,6 +4557,10 @@ func (e *HelmComponentExecutor) ExecuteComponent(ctx context.Context, node *Comp
 type ManifestComponentExecutor struct {
     applier *manifest.Applier
     store   *manifest.Store
+}
+
+func (e *ManifestComponentExecutor) GetComponentType() ComponentType {
+    return ComponentTypeYAML
 }
 
 // ExecuteComponent 执行 YAML/Manifest 组件
@@ -4565,6 +4717,50 @@ func (e *ManifestComponentExecutor) checkEndpointReady(
         }
     }
     return false, nil
+}
+```
+
+##### 8.3.3.4 InlineComponentExecutor
+
+```go
+// InlineComponentExecutor 内联组件执行器
+// Inline 组件通过 ComponentFactory 注册的 handler 执行, 无需制品下载/模板渲染
+// 适配 ComponentExecutor 接口, 统一通过 DAG 调度
+type InlineComponentExecutor struct {
+    runner InlinePhaseRunner
+}
+
+func (e *InlineComponentExecutor) GetComponentType() ComponentType {
+    return ComponentTypeInline
+}
+
+func (e *InlineComponentExecutor) ExecuteComponent(
+    ctx context.Context,
+    node *ComponentNode,
+    execCtx *ExecutionContext,
+) error {
+    if node.Inline == nil {
+        return fmt.Errorf("component %q has no inline ref", node.Name)
+    }
+
+    handler := node.Inline.Handler
+    version := node.Inline.Version
+    if handler == "" {
+        return fmt.Errorf("inline component %q missing handler", node.Name)
+    }
+    if version == "" {
+        version = defaultComponentVersion
+    }
+
+    // Inline 执行器需要 oldCluster/newCluster, 从 ExecutionContext 获取
+    // Inline 不使用 VersionContext (由 Phase 自身的 NeedExecute 逻辑决定是否执行)
+    return e.runner.Execute(
+        execCtx.PhaseContext,
+        execCtx.OldCluster,
+        execCtx.Cluster,
+        handler,
+        version,
+    )
 }
 ```
 
