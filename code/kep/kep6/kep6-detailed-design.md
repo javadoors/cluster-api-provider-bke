@@ -348,6 +348,10 @@ type YAMLSpec struct {
     
     // 裁剪使用的标签选择器
     PruneLabelSelector map[string]string `json:"pruneLabelSelector,omitempty"`
+    
+    // 健康检查配置 (应用清单后验证 Pod/Endpoint 就绪)
+    // 复用 Helm 的 HealthCheckSpec, 因为两者都部署 K8s 资源, 检查机制一致
+    HealthCheck *HealthCheckSpec `json:"healthCheck,omitempty"`
 }
 
 // ManifestRef 定义 YAML 清单文件引用
@@ -1130,6 +1134,34 @@ spec:
                       type: object
                       additionalProperties:
                         type: string
+                    healthCheck:
+                      type: object
+                      properties:
+                        enabled:
+                          type: boolean
+                        timeout:
+                          type: string
+                        interval:
+                          type: string
+                        checks:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              type:
+                                type: string
+                              namespace:
+                                type: string
+                              labelSelector:
+                                type: string
+                              name:
+                                type: string
+                              port:
+                                type: integer
+                              minReady:
+                                type: integer
+                            required: [type]
+                      required: [enabled]
                   required: [manifests]
                 inline:
                   type: object
@@ -3764,7 +3796,53 @@ func (e *ManifestComponentExecutor) ExecuteComponent(ctx context.Context, node *
     }
     
     // 5. 应用 Manifest
-    return e.applier.ApplyComponent(ctx, pkg)
+    if err := e.applier.ApplyComponent(ctx, pkg); err != nil {
+        return fmt.Errorf("apply manifests for %s: %w", component.Name, err)
+    }
+    
+    // 6. 健康检查 (应用清单后验证 Pod/Endpoint 就绪)
+    if cv.Spec.YAML != nil && cv.Spec.YAML.HealthCheck != nil && cv.Spec.YAML.HealthCheck.Enabled {
+        if err := e.runHealthCheck(ctx, cv.Spec.YAML.HealthCheck, execCtx); err != nil {
+            return fmt.Errorf("health check failed for %s: %w", component.Name, err)
+        }
+    }
+    
+    return nil
+}
+
+// runHealthCheck 等待 Pod Ready / Endpoint Ready (复用 Helm 健康检查逻辑)
+func (e *ManifestComponentExecutor) runHealthCheck(
+    ctx context.Context,
+    hc *HealthCheckSpec,
+    execCtx *ExecutionContext,
+) error {
+    timeout := parseDurationDefault(hc.Timeout, 3*time.Minute)
+    interval := parseDurationDefault(hc.Interval, 5*time.Second)
+    deadline := time.Now().Add(timeout)
+
+    for time.Now().Before(deadline) {
+        allReady := true
+        for _, check := range hc.Checks {
+            switch check.Type {
+            case "PodReady":
+                ready, err := e.checkPodReady(ctx, check, execCtx)
+                if err != nil || !ready {
+                    allReady = false
+                }
+            case "EndpointReady":
+                ready, err := e.checkEndpointReady(ctx, check, execCtx)
+                if err != nil || !ready {
+                    allReady = false
+                }
+            }
+        }
+        if allReady {
+            return nil
+        }
+        time.Sleep(interval)
+    }
+
+    return fmt.Errorf("health check timed out after %s", timeout)
 }
 ```
 
@@ -4812,6 +4890,7 @@ spec:
 | **Prune 裁剪功能实现** | 3 人日 | 中 | ApplyStrategy 引擎 |
 | **PreInstallHooks 执行引擎** | 3 人日 | 中 | HelmInstaller |
 | **Binary 健康检查实现** | 2 人日 | 中 | BinaryInstaller |
+| **YAML 健康检查实现** | 1 人日 | 低 | YAMLManifestExecutor (复用 Helm 健康检查逻辑) |
 | **ComponentVersion CRD 扩展** | 3 人日 | 低 | 无 |
 | **CRD v1alpha2 版本迁移** | 2 人日 | 中 | CRD 扩展 |
 | **VersionContext 与 ExecutionContext 实现** | 3 人日 | 中 | 无 |
@@ -4829,7 +4908,7 @@ spec:
 | **迁移验证** | 3 人日 | 中 | 兼容层实现 |
 | **文档编写** | 4 人日 | 低 | 无 |
 | **代码审查与修复** | 4 人日 | 中 | 测试完成 |
-| **总计** | **92 人日 (约 4 人月)** | | |
+| **总计** | **93 人日 (约 4 人月)** | | |
 
 ### 14.2 Sprint 计划
 
@@ -5024,6 +5103,14 @@ spec:
     prune: true
     pruneLabelSelector:
       app.kubernetes.io/managed-by: openfuyao-core
+    healthCheck:
+      enabled: true
+      timeout: "3m"
+      checks:
+        - type: PodReady
+          namespace: openfuyao-system
+          labelSelector: "app.kubernetes.io/name=openfuyao-core"
+          minReady: 1
   subComponents:
     - name: kubernetes-master
       version: v1.29.0

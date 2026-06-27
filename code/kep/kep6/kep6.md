@@ -31,7 +31,7 @@
 
 1. 实现 `ComponentTypeBinary` 类型组件的完整支持，包括制品下载、模板渲染、SSH 安装、健康检查。
 2. 实现 `ComponentTypeHelm` 类型组件的完整支持，包括 OCI/HTTP/本地 Chart 获取、Values 渲染、健康检查。
-3. 实现 `ComponentTypeYAML` 类型组件的完整支持，包括清单获取、多文档解析、ServerSideApply/Replace/CreateOnly 三种应用策略、Prune 裁剪。
+3. 实现 `ComponentTypeYAML` 类型组件的完整支持，包括清单获取、多文档解析、ServerSideApply/Replace/CreateOnly 三种应用策略、Prune 裁剪、健康检查。
 4. 设计 `configTemplates` 配置模板引擎，支持 Go template、Secret 引用、动态 kubeconfig 生成。
 5. 设计 `installScript` 模板变量系统，支持 8 类 50+ 变量和条件渲染。
 6. 引入 `VersionContext` 携带版本事实，Executor 据此自主决定操作类型，替代 `IsUpgrade bool`，符合 Kubernetes 声明式协调模式。
@@ -54,7 +54,7 @@
 | CRD 扩展 | `ComponentVersion` 新增 `binary`、`helm`、`yaml` 类型的完整字段定义，以及 `SubComponents`、`Resources` 通用字段 |
 | BinaryInstaller | 二进制制品下载、缓存、模板渲染、SSH 安装、健康检查、卸载 |
 | HelmInstaller | Chart 获取 (OCI/HTTP/本地)、Values 渲染、Install/Upgrade/Rollback/Uninstall |
-| YAMLManifestExecutor | YAML 清单获取、多文档解析、ServerSideApply/Replace/CreateOnly 应用策略、Prune 裁剪 |
+| YAMLManifestExecutor | YAML 清单获取、多文档解析、ServerSideApply/Replace/CreateOnly 应用策略、Prune 裁剪、健康检查 |
 | configTemplates | Go template 渲染、Secret 引用、动态 kubeconfig 生成 |
 | installScript | 8 类 50+ 模板变量、条件渲染、自定义变量 |
 | DAG 集成 | BinaryComponentExecutor、HelmComponentExecutor、YAMLManifestExecutor 集成到 DAG 调度器 |
@@ -352,6 +352,14 @@ spec:
     prune: true
     pruneLabelSelector:
       app.kubernetes.io/managed-by: openfuyao-core
+    healthCheck:
+      enabled: true
+      timeout: "3m"
+      checks:
+        - type: PodReady
+          namespace: openfuyao-system
+          labelSelector: "app.kubernetes.io/name=openfuyao-core"
+          minReady: 1
 
   # 子组件引用 (组合关系: openfuyao-core 包含 kubernetes 和 etcd)
   subComponents:
@@ -737,7 +745,7 @@ func (r *BKEClusterReconciler) executeContainerdUpgrade(ctx context.Context) err
 | **ConfigRenderer** | content 渲染、secretRef 获取、kubeconfig 生成 | >90% |
 | **BinaryInstaller** | Install/Upgrade/Uninstall 完整流程、失败重试 | >85% |
 | **HelmInstaller** | OCI/HTTP/本地 Chart 获取、Values 渲染、Install/Upgrade/Rollback | >85% |
-| **YAMLManifestExecutor** | 清单获取、多文档解析、ServerSideApply/Replace/CreateOnly、Prune | >85% |
+| **YAMLManifestExecutor** | 清单获取、多文档解析、ServerSideApply/Replace/CreateOnly、Prune、健康检查 | >85% |
 | **VersionContext** | HasCurrent/HasTarget/NeedsUpgrade 决策逻辑 | >90% |
 | **BinaryComponentExecutor** | Rolling/Parallel/Batch 执行策略、FailurePolicy | >85% |
 
@@ -896,7 +904,7 @@ func (r *BKEClusterReconciler) executeContainerdUpgrade(ctx context.Context) err
 |------|------|
 | **BinaryInstaller** | 负责二进制组件下载、渲染、安装、健康检查的安装器 |
 | **HelmInstaller** | 负责 Helm Chart 获取、渲染、部署的安装器 |
-| **YAMLManifestExecutor** | 负责 YAML 清单获取、解析、应用、裁剪的执行器 |
+| **YAMLManifestExecutor** | 负责 YAML 清单获取、解析、应用、裁剪、健康检查的执行器 |
 | **VersionContext** | 携带组件版本事实（已安装版本、目标版本），Executor 据此自主决定操作类型 |
 | **ApplyStrategy** | YAML 清单应用策略：ServerSideApply/Replace/CreateOnly |
 | **Prune** | 按标签选择器裁剪不再需要的 Kubernetes 资源 |
