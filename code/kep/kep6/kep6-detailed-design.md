@@ -292,6 +292,76 @@ type ComponentVersionSpec struct {
     Resources []ResourceSpec `json:"resources,omitempty"`
 }
 
+// ComponentType 定义组件类型
+type ComponentType string
+
+const (
+    ComponentTypeYAML   ComponentType = "yaml"
+    ComponentTypeHelm   ComponentType = "helm"
+    ComponentTypeInline ComponentType = "inline"
+    ComponentTypeBinary ComponentType = "binary"
+)
+
+// InlineSpec 定义内联执行器配置
+type InlineSpec struct {
+    // Handler 名称 (对应 ComponentFactory 注册的 handler)
+    Handler string `json:"handler"`
+    
+    // Handler 版本
+    Version string `json:"version"`
+}
+
+// CompatibilitySpec 定义兼容性约束
+type CompatibilitySpec struct {
+    // 约束列表
+    Constraints []Constraint `json:"constraints,omitempty"`
+}
+
+// Constraint 定义单个兼容性约束
+type Constraint struct {
+    // 依赖组件名称
+    Component string `json:"component"`
+    
+    // 版本规则 (semver range, 如 ">=1.26.0")
+    Rule string `json:"rule"`
+}
+
+// Dependency 定义组件间依赖关系
+type Dependency struct {
+    // 依赖组件名称
+    Name string `json:"name"`
+    
+    // 依赖阶段 (Install / Upgrade)
+    Phase string `json:"phase,omitempty"`
+}
+
+// UpgradeStrategySpec 定义升级策略
+// 这是 DAG 调度层策略, 适用于所有组件类型 (binary/helm/yaml/inline)
+// 与各类型的专属策略互补:
+// - Binary: 无专属策略, 仅使用 UpgradeStrategy
+// - Helm:   HelmStrategySpec 控制 helm 命令参数, UpgradeStrategy 控制调度和失败处理
+// - YAML:  无专属策略, 仅使用 UpgradeStrategy
+// 两者的 Mode 字段含义不同:
+// - UpgradeStrategy.Mode = Rolling/Parallel/Batch (节点并发策略)
+// - HelmStrategySpec.Mode = Install/Upgrade/Rollback (Helm 操作类型)
+type UpgradeStrategySpec struct {
+    // 升级模式: Rolling / Parallel / Batch (节点并发策略)
+    Mode string `json:"mode,omitempty"`
+    
+    // 批量大小 (Batch 模式下每批节点数)
+    BatchSize int `json:"batchSize,omitempty"`
+    
+    // 超时时间
+    Timeout string `json:"timeout,omitempty"`
+    
+    // 失败策略: FailFast / Continue / Rollback
+    // FailFast: 立即终止整个组件执行
+    // Continue: 记录警告, 继续执行下一个节点/批次
+    // Rollback: 回滚后继续 (Binary 执行 UninstallScript; Helm 执行 helm rollback)
+    //           注意: Helm 若 Strategy.Atomic=true, Helm SDK 已自动回滚, 无需额外调用
+    FailurePolicy string `json:"failurePolicy,omitempty"`
+}
+
 // SubComponent 定义子组件引用
 type SubComponent struct {
     // 子组件名称
@@ -733,76 +803,6 @@ type HookSpec struct {
     
     // 钩子 Manifest
     Manifest string `json:"manifest"`
-}
-
-// InlineSpec 定义内联执行器配置
-type InlineSpec struct {
-    // Handler 名称 (对应 ComponentFactory 注册的 handler)
-    Handler string `json:"handler"`
-    
-    // Handler 版本
-    Version string `json:"version"`
-}
-
-// ComponentType 定义组件类型
-type ComponentType string
-
-const (
-    ComponentTypeYAML   ComponentType = "yaml"
-    ComponentTypeHelm   ComponentType = "helm"
-    ComponentTypeInline ComponentType = "inline"
-    ComponentTypeBinary ComponentType = "binary"
-)
-
-// CompatibilitySpec 定义兼容性约束
-type CompatibilitySpec struct {
-    // 约束列表
-    Constraints []Constraint `json:"constraints,omitempty"`
-}
-
-// Constraint 定义单个兼容性约束
-type Constraint struct {
-    // 依赖组件名称
-    Component string `json:"component"`
-    
-    // 版本规则 (semver range, 如 ">=1.26.0")
-    Rule string `json:"rule"`
-}
-
-// Dependency 定义组件间依赖关系
-type Dependency struct {
-    // 依赖组件名称
-    Name string `json:"name"`
-    
-    // 依赖阶段 (Install / Upgrade)
-    Phase string `json:"phase,omitempty"`
-}
-
-// UpgradeStrategySpec 定义升级策略
-// 这是 DAG 调度层策略, 适用于所有组件类型 (binary/helm/yaml/inline)
-// 与各类型的专属策略互补:
-// - Binary: 无专属策略, 仅使用 UpgradeStrategy
-// - Helm:   HelmStrategySpec 控制 helm 命令参数, UpgradeStrategy 控制调度和失败处理
-// - YAML:  无专属策略, 仅使用 UpgradeStrategy
-// 两者的 Mode 字段含义不同:
-// - UpgradeStrategy.Mode = Rolling/Parallel/Batch (节点并发策略)
-// - HelmStrategySpec.Mode = Install/Upgrade/Rollback (Helm 操作类型)
-type UpgradeStrategySpec struct {
-    // 升级模式: Rolling / Parallel / Batch (节点并发策略)
-    Mode string `json:"mode,omitempty"`
-    
-    // 批量大小 (Batch 模式下每批节点数)
-    BatchSize int `json:"batchSize,omitempty"`
-    
-    // 超时时间
-    Timeout string `json:"timeout,omitempty"`
-    
-    // 失败策略: FailFast / Continue / Rollback
-    // FailFast: 立即终止整个组件执行
-    // Continue: 记录警告, 继续执行下一个节点/批次
-    // Rollback: 回滚后继续 (Binary 执行 UninstallScript; Helm 执行 helm rollback)
-    //           注意: Helm 若 Strategy.Atomic=true, Helm SDK 已自动回滚, 无需额外调用
-    FailurePolicy string `json:"failurePolicy,omitempty"`
 }
 ```
 
