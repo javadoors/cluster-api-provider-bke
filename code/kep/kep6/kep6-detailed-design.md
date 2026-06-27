@@ -1587,12 +1587,14 @@ func (dst *v1alpha1.ComponentVersion) ConvertFrom(srcRaw conversion.Hub) error {
 
 // BinaryInstaller 二进制组件安装器
 type BinaryInstaller struct {
-    client     client.Client
-    sshClient  *bkessh.MultiCli
-    cacheDir   string
-    httpClient *http.Client
-    cache      *ArtifactCache
-    renderer   *TemplateRenderer  // 复用 TemplateRenderer
+    client          client.Client
+    sshClient       *bkessh.MultiCli
+    cacheDir        string
+    httpClient      *http.Client
+    cache           *ArtifactCache
+    renderer        *TemplateRenderer   // 复用 TemplateRenderer (渲染 installScript)
+    configRenderer  *ConfigRenderer     // 复用 ConfigRenderer (渲染 configTemplates)
+    logger          *bkev1beta1.BKELogger
 }
 ```
 
@@ -1728,7 +1730,7 @@ func (i *BinaryInstaller) executeHealthCheck(
     ctx context.Context,
     nodeIP string,
     hc *BinaryHealthCheckSpec,
-    tmplCtx *manifest.TemplateContext,
+    tmplCtx manifest.TemplateContext,
 ) error {
     // 渲染健康检查脚本
     script, err := i.renderer.RenderScript(hc.Script, tmplCtx)
@@ -1795,33 +1797,33 @@ func (i *BinaryInstaller) downloadArtifacts(ctx context.Context, binary *BinaryS
 }
 
 // executeInstall 通过 SSH 执行安装
-func (i *BinaryInstaller) executeInstall(ctx context.Context, node *BKENode, script string, artifacts map[string]*Artifact, configs map[string][]byte) error {
+func (i *BinaryInstaller) executeInstall(ctx context.Context, nodeIP string, script string, artifacts map[string]*Artifact, configs map[string][]byte) error {
     // 1. 创建远程目录
-    if err := i.sshClient.Execute(node.IP, "mkdir -p /tmp/bke-install"); err != nil {
+    if err := i.sshClient.Execute(nodeIP, "mkdir -p /tmp/bke-install"); err != nil {
         return fmt.Errorf("failed to create remote directory: %w", err)
     }
     
     // 2. 上传二进制文件
     for name, art := range artifacts {
         remotePath := fmt.Sprintf("/tmp/bke-install/%s", name)
-        if err := i.sshClient.Upload(node.IP, art.Data, remotePath); err != nil {
-            return fmt.Errorf("failed to upload %s to %s: %w", name, node.IP, err)
+        if err := i.sshClient.Upload(nodeIP, art.Data, remotePath); err != nil {
+            return fmt.Errorf("failed to upload %s to %s: %w", name, nodeIP, err)
         }
     }
     
     // 3. 上传配置文件
     for name, content := range configs {
         remotePath := fmt.Sprintf("/tmp/bke-install/%s", name)
-        if err := i.sshClient.Upload(node.IP, content, remotePath); err != nil {
-            return fmt.Errorf("failed to upload config %s to %s: %w", name, node.IP, err)
+        if err := i.sshClient.Upload(nodeIP, content, remotePath); err != nil {
+            return fmt.Errorf("failed to upload config %s to %s: %w", name, nodeIP, err)
         }
     }
     
     // 4. 执行安装脚本
-    result, err := i.sshClient.Execute(node.IP, script)
+    result, err := i.sshClient.Execute(nodeIP, script)
     if err != nil {
         return fmt.Errorf("install script failed on %s: %w\nstdout: %s\nstderr: %s", 
-            node.IP, err, result.Stdout, result.Stderr)
+            nodeIP, err, result.Stdout, result.Stderr)
     }
     
     return nil
@@ -2282,7 +2284,97 @@ func (i *HelmInstaller) checkCustom(
 }
 ```
 
-**设计思路 — Values 与 ValuesFiles 的关系及合并策略**：
+```go
+// getActionConfig 初始化 Helm Action 配置 (每次调用创建新实例, 避免状态残留)
+func (i *HelmInstaller) getActionConfig(ctx context.Context, namespace string) (*action.Configuration, error) {
+    actionConfig := new(action.Configuration)
+    if err := actionConfig.Init(i.restConfig, namespace, "secret", func(format string, v ...interface{}) {
+        // Helm 日志输出到标准日志
+    }); err != nil {
+        return nil, fmt.Errorf("failed to init helm action config: %w", err)
+    }
+    return actionConfig, nil
+}
+
+// uninstall 执行 Helm Uninstall
+func (i *HelmInstaller) uninstall(ctx context.Context, actionConfig *action.Configuration,
+    helm *HelmSpec, opts InstallOptions) error {
+    client := action.NewUninstall(actionConfig)
+    client.Wait = helm.Strategy.Wait
+    client.Timeout, _ = time.ParseDuration(helm.Strategy.WaitTimeout)
+    _, err := client.Run(helm.ReleaseName)
+    if err != nil {
+        return fmt.Errorf("helm uninstall failed: %w", err)
+    }
+    return nil
+}
+
+// rollback 执行 Helm Rollback
+func (i *HelmInstaller) rollback(ctx context.Context, actionConfig *action.Configuration,
+    helm *HelmSpec, opts InstallOptions) error {
+    client := action.NewRollback(actionConfig)
+    client.Wait = helm.Strategy.Wait
+    client.Timeout, _ = time.ParseDuration(helm.Strategy.WaitTimeout)
+    if err := client.Run(helm.ReleaseName); err != nil {
+        return fmt.Errorf("helm rollback failed: %w", err)
+    }
+    return nil
+}
+
+// getChartFromOCI 从 OCI Registry 拉取 Chart
+func (i *HelmInstaller) getChartFromOCI(ctx context.Context, oci *OCIChartSpec) (*chart.Chart, error) {
+    ref := fmt.Sprintf("%s:%s", oci.Repository, oci.Tag)
+    puller := ocipuller.New()
+    out, err := puller.Pull(ctx, ref)
+    if err != nil {
+        return nil, fmt.Errorf("failed to pull chart from OCI %s: %w", ref, err)
+    }
+    defer out.Close()
+    ch, err := loader.LoadArchive(out)
+    if err != nil {
+        return nil, fmt.Errorf("failed to load chart from OCI: %w", err)
+    }
+    return ch, nil
+}
+
+// getChartFromURL 从 HTTP URL 下载 Chart
+func (i *HelmInstaller) getChartFromURL(ctx context.Context, url string) (*chart.Chart, error) {
+    resp, err := i.httpClient.Get(url)
+    if err != nil {
+        return nil, fmt.Errorf("failed to download chart from %s: %w", url, err)
+    }
+    defer resp.Body.Close()
+    ch, err := loader.LoadArchive(resp.Body)
+    if err != nil {
+        return nil, fmt.Errorf("failed to load chart from URL: %w", err)
+    }
+    return ch, nil
+}
+
+// getChartFromLocal 从本地路径加载 Chart
+func (i *HelmInstaller) getChartFromLocal(ctx context.Context, path string) (*chart.Chart, error) {
+    ch, err := loader.Load(path)
+    if err != nil {
+        return nil, fmt.Errorf("failed to load chart from %s: %w", path, err)
+    }
+    return ch, nil
+}
+
+// listPods 按标签选择器列出 Pod
+func (i *HelmInstaller) listPods(ctx context.Context, namespace, labelSelector string) ([]corev1.Pod, error) {
+    selector, err := labels.Parse(labelSelector)
+    if err != nil {
+        return nil, fmt.Errorf("invalid label selector %q: %w", labelSelector, err)
+    }
+    podList, err := i.client.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+        LabelSelector: selector.String(),
+    })
+    if err != nil {
+        return nil, err
+    }
+    return podList.Items, nil
+}
+```
 
 `HelmSpec` 提供两种 Values 来源，合并优先级从低到高：
 
@@ -2983,15 +3075,15 @@ func NewTemplateRenderer() *TemplateRenderer {
     }
 }
 
-// RenderScript 渲染安装脚本
-func (r *TemplateRenderer) RenderScript(script string, data ScriptData) (string, error) {
+// RenderScript 渲染安装脚本 (使用 TemplateContext 作为模板数据)
+func (r *TemplateRenderer) RenderScript(script string, tmplCtx manifest.TemplateContext) (string, error) {
     tmpl, err := template.New("installScript").Funcs(r.funcMap).Parse(script)
     if err != nil {
         return "", fmt.Errorf("failed to parse script template: %w", err)
     }
     
     var buf bytes.Buffer
-    if err := tmpl.Execute(&buf, data); err != nil {
+    if err := tmpl.Execute(&buf, tmplCtx); err != nil {
         return "", fmt.Errorf("failed to render script template: %w", err)
     }
     
@@ -3206,36 +3298,29 @@ func (r *ConfigRenderer) RenderConfig(ctx context.Context, template ConfigTempla
     return nil, errors.New("no template content specified")
 }
 
-// renderContentTemplate 渲染内容模板
-func (r *ConfigRenderer) renderContentTemplate(ctx context.Context, template ConfigTemplateSpec, opts InstallOptions) ([]byte, error) {
-    data := r.buildTemplateData(ctx, opts)
-    
-    tmpl, err := template.New(template.Name).Funcs(r.funcMap).Parse(template.Content)
+// renderContentTemplate 渲染内容模板 (使用 TemplateContext)
+func (r *ConfigRenderer) renderContentTemplate(content string, tmplCtx manifest.TemplateContext) ([]byte, error) {
+    tmpl, err := template.New("content").Funcs(r.funcMap).Parse(content)
     if err != nil {
         return nil, fmt.Errorf("failed to parse template: %w", err)
     }
     
     var buf bytes.Buffer
-    if err := tmpl.Execute(&buf, data); err != nil {
+    if err := tmpl.Execute(&buf, tmplCtx); err != nil {
         return nil, fmt.Errorf("failed to render template: %w", err)
     }
     
     return buf.Bytes(), nil
 }
 
-// renderSecretTemplate 从 Secret 获取内容
-func (r *ConfigRenderer) renderSecretTemplate(ctx context.Context, template ConfigTemplateSpec, opts InstallOptions) ([]byte, error) {
-    secretRef := template.SecretRef
-    
+// renderSecretTemplate 从 Secret 获取内容 (使用 TemplateContext 渲染 namespace)
+func (r *ConfigRenderer) renderSecretTemplate(secretRef *SecretRefSpec, tmplCtx manifest.TemplateContext) ([]byte, error) {
     // 渲染 namespace 模板变量
-    namespace, err := r.renderString(secretRef.Namespace, opts)
-    if err != nil {
-        return nil, fmt.Errorf("failed to render namespace: %w", err)
-    }
+    namespace := r.renderTemplateString(secretRef.Namespace, tmplCtx)
     
     // 获取 Secret
     secret := &corev1.Secret{}
-    if err := r.client.Get(ctx, types.NamespacedName{
+    if err := r.client.Get(context.Background(), types.NamespacedName{
         Name:      secretRef.Name,
         Namespace: namespace,
     }, secret); err != nil {
@@ -3647,6 +3732,8 @@ func (e *InlineComponentExecutor) ExecuteComponent(
 | **Feature Gate** | 无 | ON→四路分发, OFF→`executeComponentLegacy` 二路分发 |
 | **扩展性** | 新增类型需修改 `executeComponent()` | 新增类型只需 `registry.Register()`，Scheduler 不变 |
 | **未注册类型处理** | 走 Manifest 路径 | 回退到 YAML/Manifest 路径（兼容未迁移组件） |
+
+### 8.2 DAG 调度执行流程
 
 **设计思路**：DAG 调度采用"批次间串行、批次内并行"的执行策略。首先通过拓扑排序将 DAG 分解为多个批次，然后按顺序执行每个批次，批次内的组件可以并行执行。这种策略既保证了依赖关系的正确性，又最大化了并行度。
 
@@ -4093,7 +4180,7 @@ func (e *BinaryComponentExecutor) executeRolling(ctx context.Context, nodes []No
         
         // 根据 VersionContext 自主决定操作类型
         action := binaryinstaller.BinaryActionInstall
-        if execCtx.VersionContext != nil && execCtx.VersionContext.HasCurrent(component.Name) {
+        if execCtx.VersionContext != nil && execCtx.VersionContext.HasCurrent(cv.Spec.Name) {
             action = binaryinstaller.BinaryActionUpgrade // 已安装 → 升级
         }
         
@@ -4278,9 +4365,57 @@ func (e *ManifestComponentExecutor) checkCustom(
     }
     return true, nil
 }
-```
 
-#### 8.3.4 依赖关系对比
+// checkPodReady 检查 Pod Ready 状态 (支持 minReady 部分就绪)
+func (e *ManifestComponentExecutor) checkPodReady(
+    ctx context.Context,
+    check HealthCheckItemSpec,
+    execCtx *ExecutionContext,
+) (bool, error) {
+    selector, err := labels.Parse(check.LabelSelector)
+    if err != nil {
+        return false, fmt.Errorf("invalid label selector %q: %w", check.LabelSelector, err)
+    }
+    podList, err := execCtx.ClusterClient.CoreV1().Pods(check.Namespace).List(ctx, metav1.ListOptions{
+        LabelSelector: selector.String(),
+    })
+    if err != nil {
+        return false, err
+    }
+    minReady := int(check.MinReady)
+    if minReady == 0 {
+        minReady = len(podList.Items)
+    }
+    readyCount := 0
+    for _, pod := range podList.Items {
+        for _, cond := range pod.Status.Conditions {
+            if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+                readyCount++
+                break
+            }
+        }
+    }
+    return readyCount >= minReady, nil
+}
+
+// checkEndpointReady 检查 Service Endpoint 是否有就绪端点
+func (e *ManifestComponentExecutor) checkEndpointReady(
+    ctx context.Context,
+    check HealthCheckItemSpec,
+    execCtx *ExecutionContext,
+) (bool, error) {
+    endpoints, err := execCtx.ClusterClient.CoreV1().Endpoints(check.Namespace).Get(ctx, check.Name, metav1.GetOptions{})
+    if err != nil {
+        return false, err
+    }
+    for _, subset := range endpoints.Subsets {
+        if len(subset.Addresses) > 0 {
+            return true, nil
+        }
+    }
+    return false, nil
+}
+```
 
 | 维度 | 修改前 | 修改后 |
 |------|--------|--------|
@@ -4297,6 +4432,22 @@ func (e *ManifestComponentExecutor) checkCustom(
 - **VersionContext**：携带版本事实（已安装版本、目标版本），Executor 据此自主决定操作类型（Install/Upgrade/Skip），替代原有的 `IsUpgrade bool`，符合 Kubernetes 声明式协调模式
 - **TemplateContext**：复用 `manifest.TemplateContext`，所有组件类型共享使用
 - **解耦收益**：`pkg/dagexec` 包可独立编译和测试，不依赖 phaseframe
+
+#### 8.3.5 辅助函数
+
+```go
+// parseDurationDefault 解析超时字符串, 空字符串或解析失败时返回默认值
+func parseDurationDefault(s string, defaultVal time.Duration) time.Duration {
+    if s == "" {
+        return defaultVal
+    }
+    d, err := time.ParseDuration(s)
+    if err != nil {
+        return defaultVal
+    }
+    return d
+}
+```
 
 ---
 
@@ -4777,14 +4928,14 @@ spec:
       #!/bin/bash
       set -e
       # 集群: {{clusterName}}, 节点: {{nodeIP}} ({{nodeRole}})
-      # 架构: {{nodeArch}}, 版本: {{componentVersion}}, 操作: {{action}}
+      # 架构: {{arch}}, 版本: {{componentVersion}}, 操作: {{action}}
 
-      # 1. 环境检查
-      {{if eq .nodeOS "centos"}}
-      yum install -y libseccomp || true
-      {{else if eq .nodeOS "ubuntu"}}
-      apt-get update && apt-get install -y libseccomp2 || true
-      {{end}}
+      # 1. 环境检查 (OS 自检测, 非模板变量)
+      if [ -f /etc/redhat-release ]; then
+        yum install -y libseccomp || true
+      elif [ -f /etc/os-release ] && grep -q ubuntu /etc/os-release; then
+        apt-get update && apt-get install -y libseccomp2 || true
+      fi
 
       # 2. 停止旧服务
       systemctl stop containerd || true
