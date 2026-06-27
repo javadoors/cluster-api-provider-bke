@@ -1697,11 +1697,64 @@ type BinaryInstaller struct {
     cacheDir        string
     httpClient      *http.Client
     cache           *ArtifactCache
-    renderer        *TemplateRenderer   // 复用 TemplateRenderer (渲染 installScript)
-    configRenderer  *ConfigRenderer     // 复用 ConfigRenderer (渲染 configTemplates)
+    renderer        *TemplateRenderer   // 模板渲染引擎 (含自定义函数, 无状态, 全局共享)
+    configRenderer  *ConfigRenderer     // 配置文件渲染器 (需 K8s client 读取 Secret)
     logger          *bkev1beta1.BKELogger
 }
+
+// BinaryInstallerConfig BinaryInstaller 构建配置
+type BinaryInstallerConfig struct {
+    Client         client.Client
+    SshClient      *bkessh.MultiCli
+    CacheDir       string
+    HttpClient     *http.Client
+    Renderer       *TemplateRenderer
+    ConfigRenderer *ConfigRenderer
+    Logger         *bkev1beta1.BKELogger
+}
+
+// NewBinaryInstaller 创建二进制组件安装器
+func NewBinaryInstaller(cfg BinaryInstallerConfig) *BinaryInstaller {
+    cache, err := NewArtifactCache(cfg.CacheDir)
+    if err != nil {
+        panic(fmt.Sprintf("failed to create artifact cache: %v", err))
+    }
+    return &BinaryInstaller{
+        client:         cfg.Client,
+        sshClient:      cfg.SshClient,
+        cacheDir:       cfg.CacheDir,
+        httpClient:     cfg.HttpClient,
+        cache:          cache,
+        renderer:       cfg.Renderer,
+        configRenderer: cfg.ConfigRenderer,
+        logger:         cfg.Logger,
+    }
+}
+
+// ArtifactCache 管理二进制制品的本地文件缓存
+type ArtifactCache struct {
+    cacheDir string
+}
+
+// NewArtifactCache 创建缓存管理器
+func NewArtifactCache(cacheDir string) (*ArtifactCache, error) {
+    if err := os.MkdirAll(cacheDir, 0755); err != nil {
+        return nil, fmt.Errorf("failed to create cache directory %s: %w", cacheDir, err)
+    }
+    return &ArtifactCache{cacheDir: cacheDir}, nil
+}
 ```
+
+**设计思路 — TemplateRenderer vs TemplateContext**：
+
+`BinaryInstallerConfig.Renderer` 注入的是 **TemplateRenderer（引擎）**，不是 TemplateContext（数据）：
+
+| 概念 | 类型 | 作用 | 生命周期 |
+|------|------|------|---------|
+| **TemplateRenderer** | 渲染引擎 | Go template 解析+执行引擎，含自定义函数（`upper`/`lower`/`eq`/`now`等） | 全局共享，无状态，通过 Config 注入 |
+| **TemplateContext** | 数据载体 | 模板变量数据（ClusterName/NodeIP/Artifacts/Action 等） | 每节点每组件运行时构建，通过 `InstallOptions.TemplateCtx` 传入 |
+
+TemplateRenderer 是"工具"（怎么渲染），TemplateContext 是"数据"（渲染什么）。`Install()` 中先从 `opts.TemplateCtx` 获取数据，再用 `i.renderer.RenderScript(script, tmplCtx)` 渲染。
 
 **设计思路 — Install 与 Upgrade 共用 InstallScript**：
 
@@ -2122,6 +2175,28 @@ type HelmInstaller struct {
     cacheDir   string
     httpClient *http.Client
     ociClient  *oci.Client
+    logger     *bkev1beta1.BKELogger
+}
+
+// HelmInstallerConfig HelmInstaller 构建配置
+type HelmInstallerConfig struct {
+    Client     client.Client
+    RestConfig *rest.Config
+    CacheDir   string
+    HttpClient *http.Client
+    Logger     *bkev1beta1.BKELogger
+}
+
+// NewHelmInstaller 创建 Helm 组件安装器
+func NewHelmInstaller(cfg HelmInstallerConfig) *HelmInstaller {
+    return &HelmInstaller{
+        client:     cfg.Client,
+        restConfig: cfg.RestConfig,
+        cacheDir:   cfg.CacheDir,
+        httpClient: cfg.HttpClient,
+        ociClient:  oci.NewClient(cfg.RestConfig),
+        logger:     cfg.Logger,
+    }
 }
 
 // InstallOptions Helm 安装选项
@@ -3396,6 +3471,19 @@ type ConfigRenderer struct {
     funcMap     template.FuncMap
 }
 
+// NewConfigRenderer 创建配置文件渲染器
+// client 用于读取 Secret (SecretRef 模式) 和生成 kubeconfig (KubeconfigTemplate 模式)
+func NewConfigRenderer(client client.Client) *ConfigRenderer {
+    return &ConfigRenderer{
+        client: client,
+        funcMap: template.FuncMap{
+            "upper": strings.ToUpper,
+            "lower": strings.ToLower,
+            "trim":  strings.TrimSpace,
+        },
+    }
+}
+
 // RenderConfig 渲染配置文件模板
 func (r *ConfigRenderer) RenderConfig(ctx context.Context, template ConfigTemplateSpec, opts InstallOptions) ([]byte, error) {
     switch {
@@ -3785,6 +3873,99 @@ func NewScheduler(cfg Config) *Scheduler {
         nodeProvider:        cfg.NodeProvider,
         MaxParallelPerBatch: maxParallel,
     }
+}
+```
+
+**设计思路 — Config 构建与 Feature Gate 条件初始化**：
+
+`buildSchedulerConfig()` 是调用方（BKEClusterReconciler）构建 Scheduler Config 的入口。Feature Gate OFF 时仅创建 3 个基础依赖，避免不必要的 SSH/HTTP/缓存初始化开销；ON 时额外构建 Binary/Helm/YAML 执行器依赖。
+
+**依赖构建要点**：
+- **共享依赖**：`httpClient` 在 Binary 和 Helm 之间共享；`ManifestStore`/`ManifestApplier` 在基础路径和 YAMLExecutor 之间共享
+- **缓存目录约定**：Binary 制品缓存 `/var/cache/bke/artifacts`，Helm Chart 缓存 `/var/cache/bke/charts`
+- **httpClient 超时**：5 分钟，覆盖大制品下载场景
+- **SSH client 来源**：从 `BKEClusterReconciler` 注入（已有 SSH 连接池），避免重复创建
+- **TemplateRenderer**：无状态（仅 funcMap），全局共享；**ConfigRenderer**：需 K8s client（读取 Secret），按需创建
+- **各 Config 类型定义**：`BinaryInstallerConfig`（第 4 章）、`HelmInstallerConfig`（第 5 章）、`NewConfigRenderer`（第 7 章）
+
+```go
+// controllers/capbke/bkecluster_upgrade_dag.go 扩展
+
+// buildSchedulerConfig 构建 Scheduler Config (含 Feature Gate 条件构建)
+func (r *BKEClusterReconciler) buildSchedulerConfig(
+    ctx context.Context,
+    phaseCtx *phaseframe.PhaseContext,
+    oldCluster, newCluster *bkev1beta1.BKECluster,
+    bundle *manifest.Bundle,
+    factory *componentfactory.Factory,
+    bkeLogger *bkev1beta1.BKELogger,
+) dagexec.Config {
+    // 基础依赖 (Feature Gate ON/OFF 均需要)
+    cfg := dagexec.Config{
+        InlineRunner:        &componentfactory.PhaseRunner{Factory: factory},
+        ManifestStore:       manifest.NewBundleStore(bundle),
+        ManifestApplier:     r.buildManifestApplier(ctx, phaseCtx, newCluster, bkeLogger),
+        MaxParallelPerBatch: 0, // 0 = defaultMaxParallelPerBatch (8)
+    }
+
+    // Feature Gate ON: 构建 Binary/Helm/YAML 执行器依赖
+    if featuregate.Enabled(featuregate.BinaryComponentSupport) {
+        // 1. 共享依赖
+        cfg.NodeProvider = dagexec.NewBKENodeProvider(r.Client)
+        httpClient := &http.Client{Timeout: 5 * time.Minute}
+        templateRenderer := binaryinstaller.NewTemplateRenderer()
+        configRenderer := binaryinstaller.NewConfigRenderer(r.Client)
+
+        // 2. BinaryInstaller (依赖: SSH client + 缓存 + 渲染器)
+        cfg.BinaryInstaller = binaryinstaller.NewBinaryInstaller(
+            binaryinstaller.BinaryInstallerConfig{
+                Client:         r.Client,
+                SshClient:      r.sshClient,       // 从 reconciler 注入 (已有 SSH 连接池)
+                CacheDir:       "/var/cache/bke/artifacts",
+                HttpClient:     httpClient,
+                Renderer:       templateRenderer,   // 无状态引擎, 全局共享
+                ConfigRenderer: configRenderer,     // 需 K8s client 读取 Secret
+                Logger:         bkeLogger,
+            },
+        )
+
+        // 3. HelmInstaller (依赖: RestConfig + HTTP + OCI)
+        cfg.HelmInstaller = helminstaller.NewHelmInstaller(
+            helminstaller.HelmInstallerConfig{
+                Client:     r.Client,
+                RestConfig: r.RestConfig,
+                CacheDir:   "/var/cache/bke/charts",
+                HttpClient: httpClient,             // 共享 httpClient
+                Logger:     bkeLogger,
+            },
+        )
+
+        // 4. YAMLExecutor (复用 ManifestStore + ManifestApplier)
+        cfg.YAMLExecutor = yamlexecutor.NewYAMLManifestExecutor(
+            yamlexecutor.YAMLManifestExecutorConfig{
+                ManifestStore:   cfg.ManifestStore,   // 复用基础依赖
+                ManifestApplier: cfg.ManifestApplier, // 复用基础依赖
+                Logger:          bkeLogger,
+            },
+        )
+    }
+
+    return cfg
+}
+
+// buildSchedulerAndExecute 构建 Scheduler 并执行 DAG
+func (r *BKEClusterReconciler) buildSchedulerAndExecute(
+    ctx context.Context,
+    phaseCtx *phaseframe.PhaseContext,
+    oldCluster, newCluster *bkev1beta1.BKECluster,
+    dag *topology.UpgradeDAG,
+    bundle *manifest.Bundle,
+    factory *componentfactory.Factory,
+    bkeLogger *bkev1beta1.BKELogger,
+) error {
+    cfg := r.buildSchedulerConfig(ctx, phaseCtx, oldCluster, newCluster, bundle, factory, bkeLogger)
+    sched := dagexec.NewScheduler(cfg)
+    return sched.ExecuteDAG(ctx, phaseCtx, oldCluster, newCluster, dag)
 }
 ```
 
