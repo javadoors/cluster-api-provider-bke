@@ -1989,6 +1989,339 @@ func (i *BinaryInstaller) executeInstall(ctx context.Context, nodeIP string, scr
 }
 ```
 
+### 4.5 ConfigRenderer 详细设计
+
+ConfigRenderer 是 BinaryInstaller 的配置文件渲染器，负责将 `configTemplates` 渲染为最终配置文件内容。支持三种渲染模式：Content（Go template）、SecretRef（从 K8s Secret 获取）、KubeconfigTemplate（动态生成 kubeconfig）。
+
+#### 4.5.1 三种渲染模式
+
+ConfigRenderer 支持三种渲染模式，根据不同的配置来源选择对应的渲染方式。
+
+#### 模式 1: Content 模式 (Go template 渲染)
+
+**设计思路**：直接在 ComponentVersion 中定义配置内容模板，通过 Go template 引擎渲染。适用于配置文件内容可以直接在 YAML 中定义的场景。
+
+**输入**：
+```yaml
+configTemplates:
+  - name: bkeagent.conf
+    path: "/etc/openFuyao/bkeagent/bkeagent.conf"
+    content: |
+      cluster_name: {{.clusterName}}
+      api_server: {{.apiServer}}
+      log_level: {{.Variables.logLevel | default "info"}}
+```
+
+**渲染过程**：
+1. 解析 content 模板
+2. 注入模板数据 (集群信息、节点信息、自定义变量等)
+3. 执行 Go template 渲染
+4. 返回渲染后的内容
+
+**输出**：
+```yaml
+cluster_name: my-cluster
+api_server: https://10.0.0.1:6443
+log_level: info
+```
+
+---
+
+#### 模式 2: SecretRef 模式 (从 Secret 获取)
+
+**设计思路**：从 Kubernetes Secret 中获取配置内容，适用于敏感信息（如证书、密钥）的管理。
+
+**输入**：
+```yaml
+configTemplates:
+  - name: tls.crt
+    path: "/etc/openFuyao/bkeagent/tls.crt"
+    secretRef:
+      name: bkeagent-tls
+      namespace: "{{.clusterNamespace}}"
+      key: tls.crt
+```
+
+**渲染过程**：
+1. 解析 namespace 模板变量
+2. 从 Kubernetes API 获取 Secret
+3. 提取指定 key 的内容
+4. 返回 Secret 数据
+
+**输出**：
+```
+-----BEGIN CERTIFICATE-----
+MIIC...
+-----END CERTIFICATE-----
+```
+
+---
+
+#### 模式 3: KubeconfigTemplate 模式 (动态生成)
+
+**设计思路**：根据集群信息动态生成 kubeconfig 文件，适用于需要为组件生成访问集群凭证的场景。
+
+**输入**：
+```yaml
+configTemplates:
+  - name: kubeconfig
+    path: "/etc/openFuyao/bkeagent/kubeconfig"
+    kubeconfigTemplate:
+      clusterName: "{{.clusterName}}"
+      apiServer: "{{.apiServer}}"
+      caCertPath: "/etc/openFuyao/bkeagent/ca.crt"
+      clientCertPath: "/etc/openFuyao/bkeagent/tls.crt"
+      clientKeyPath: "/etc/openFuyao/bkeagent/tls.key"
+      namespace: "{{.clusterNamespace}}"
+```
+
+**渲染过程**：
+1. 解析模板变量
+2. 构建 kubeconfig 结构
+3. 序列化为 YAML 格式
+4. 返回 kubeconfig 内容
+
+**输出**：
+```yaml
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: https://10.0.0.1:6443
+    certificate-authority: /etc/openFuyao/bkeagent/ca.crt
+  name: my-cluster
+users:
+- user:
+    client-certificate: /etc/openFuyao/bkeagent/tls.crt
+    client-key: /etc/openFuyao/bkeagent/tls.key
+  name: my-cluster
+contexts:
+- context:
+    cluster: my-cluster
+    user: my-cluster
+    namespace: default
+  name: my-cluster
+current-context: my-cluster
+```
+
+#### 4.5.2 ConfigRenderer 渲染流程图
+
+**设计思路**：ConfigRenderer 根据配置模板的类型选择不同的渲染模式：Content 模式使用 Go template 渲染、SecretRef 模式从 Kubernetes Secret 获取、KubeconfigTemplate 模式动态生成 kubeconfig。整个流程采用策略模式，根据模板类型分发到不同的渲染处理器。
+
+**关键设计点**：
+- **三种模式**：Content（模板渲染）、SecretRef（Secret 引用）、KubeconfigTemplate（动态生成）
+- **模板变量**：Content 模式支持完整的模板变量系统
+- **Secret 获取**：SecretRef 模式支持命名空间模板变量
+- **Kubeconfig 生成**：使用 client-go 的 clientcmd 库生成标准格式
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         ConfigRenderer 渲染流程                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+                              ┌──────────────────┐
+                              │  RenderConfig()  │
+                              │  入口函数        │
+                              └────────┬─────────┘
+                                       │
+                                       ▼
+                    ┌──────────────────────────────────────┐
+                    │  判断渲染模式                        │
+                    │  switch {                            │
+                    │  case template.Content != "":        │
+                    │  case template.SecretRef != nil:     │
+                    │  case template.KubeconfigTemplate:   │
+                    │  }                                   │
+                    └────────────────────┬─────────────────┘
+                                         │
+              ┌──────────────────────────┼──────────────────────────┐
+              │                          │                          │
+              ▼                          ▼                          ▼
+    ┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
+    │  Content 模式   │      │  SecretRef 模式 │      │  Kubeconfig     │
+    │                 │      │                 │      │  模式           │
+    └────────┬────────┘      └────────┬────────┘      └────────┬────────┘
+             │                        │                        │
+             ▼                        ▼                        ▼
+    ┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
+    │ 1. 构建模板数据 │      │ 1. 解析命名空间 │      │ 1. 解析模板变量 │
+    │  buildTemplate  │      │  renderString   │      │  renderString   │
+    │  Data()         │      │  (namespace)    │      │                 │
+    └────────┬────────┘      └────────┬────────┘      └────────┬────────┘
+             │                        │                        │
+             ▼                        ▼                        ▼
+    ┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
+    │ 2. 解析模板     │      │ 2. 获取 Secret  │      │ 2. 构建结构     │
+    │  template.Parse │      │  client.Get()   │      │  clientcmdapi   │
+    │  (content)      │      │                 │      │  .Config{}      │
+    └────────┬────────┘      └────────┬────────┘      └────────┬────────┘
+             │                        │                        │
+             ▼                        ▼                        ▼
+    ┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
+    │ 3. 执行渲染     │      │ 3. 提取数据     │      │ 3. 序列化 YAML  │
+    │  tmpl.Execute() │      │  secret.Data[key]│     │  clientcmd.Write│
+    └────────┬────────┘      └────────┬────────┘      └────────┬────────┘
+             │                        │                        │
+             └────────────────────────┼────────────────────────┘
+                                      │
+                                      ▼
+                    ┌──────────────────────────────────────┐
+                    │  返回渲染结果                        │
+                    │  return content, nil                 │
+                    └──────────────────────────────────────┘
+```
+
+#### 4.5.3 核心接口定义
+
+```go
+// pkg/binaryinstaller/config_renderer.go
+
+// ConfigRenderer 配置文件渲染器
+type ConfigRenderer struct {
+    client      client.Client
+    funcMap     template.FuncMap
+}
+
+// NewConfigRenderer 创建配置文件渲染器
+// client 用于读取 Secret (SecretRef 模式) 和生成 kubeconfig (KubeconfigTemplate 模式)
+func NewConfigRenderer(client client.Client) *ConfigRenderer {
+    return &ConfigRenderer{
+        client: client,
+        funcMap: template.FuncMap{
+            "upper": strings.ToUpper,
+            "lower": strings.ToLower,
+            "trim":  strings.TrimSpace,
+        },
+    }
+}
+
+// RenderConfig 渲染配置文件模板
+func (r *ConfigRenderer) RenderConfig(ctx context.Context, template ConfigTemplateSpec, opts InstallOptions) ([]byte, error) {
+    switch {
+    case template.Content != "":
+        return r.renderContentTemplate(ctx, template, opts)
+    case template.SecretRef != nil:
+        return r.renderSecretTemplate(ctx, template, opts)
+    case template.KubeconfigTemplate != nil:
+        return r.renderKubeconfigTemplate(ctx, template, opts)
+    }
+    
+    return nil, errors.New("no template content specified")
+}
+
+// renderContentTemplate 渲染内容模板 (使用 TemplateContext)
+func (r *ConfigRenderer) renderContentTemplate(content string, tmplCtx manifest.TemplateContext) ([]byte, error) {
+    tmpl, err := template.New("content").Funcs(r.funcMap).Parse(content)
+    if err != nil {
+        return nil, fmt.Errorf("failed to parse template: %w", err)
+    }
+    
+    var buf bytes.Buffer
+    if err := tmpl.Execute(&buf, tmplCtx); err != nil {
+        return nil, fmt.Errorf("failed to render template: %w", err)
+    }
+    
+    return buf.Bytes(), nil
+}
+
+// renderSecretTemplate 从 Secret 获取内容 (使用 TemplateContext 渲染 namespace)
+func (r *ConfigRenderer) renderSecretTemplate(secretRef *SecretRefSpec, tmplCtx manifest.TemplateContext) ([]byte, error) {
+    // 渲染 namespace 模板变量
+    namespace := r.renderTemplateString(secretRef.Namespace, tmplCtx)
+    
+    // 获取 Secret
+    secret := &corev1.Secret{}
+    if err := r.client.Get(context.Background(), types.NamespacedName{
+        Name:      secretRef.Name,
+        Namespace: namespace,
+    }, secret); err != nil {
+        return nil, fmt.Errorf("failed to get secret %s/%s: %w", namespace, secretRef.Name, err)
+    }
+    
+    // 获取指定 key 的内容
+    data, ok := secret.Data[secretRef.Key]
+    if !ok {
+        return nil, fmt.Errorf("key %s not found in secret %s/%s", secretRef.Key, namespace, secretRef.Name)
+    }
+    
+    return data, nil
+}
+
+// renderKubeconfigTemplate 动态生成 kubeconfig
+func (r *ConfigRenderer) renderKubeconfigTemplate(ctx context.Context, template ConfigTemplateSpec, tmplCtx manifest.TemplateContext) ([]byte, error) {
+    kc := template.KubeconfigTemplate
+    
+    // 解析模板变量 (使用 TemplateContext)
+    clusterName := r.renderTemplateString(kc.ClusterName, tmplCtx)
+    apiServer := r.renderTemplateString(kc.APIServer, tmplCtx)
+    namespace := r.renderTemplateString(kc.Namespace, tmplCtx)
+    
+    kubeconfig := clientcmdapi.Config{
+        Kind:       "Config",
+        APIVersion: "v1",
+        Clusters: map[string]*clientcmdapi.Cluster{
+            clusterName: {
+                Server:               apiServer,
+                CertificateAuthority: kc.CACertPath,
+            },
+        },
+        AuthInfos: map[string]*clientcmdapi.AuthInfo{
+            clusterName: {
+                ClientCertificate: kc.ClientCertPath,
+                ClientKey:         kc.ClientKeyPath,
+            },
+        },
+        Contexts: map[string]*clientcmdapi.Context{
+            clusterName: {
+                Cluster:   clusterName,
+                AuthInfo:  clusterName,
+                Namespace: namespace,
+            },
+        },
+        CurrentContext: clusterName,
+    }
+    
+    return clientcmd.Write(kubeconfig)
+}
+
+// renderConfigTemplates 渲染配置文件模板 (使用 TemplateContext)
+func (r *ConfigRenderer) renderConfigTemplates(templates []ConfigTemplateSpec, tmplCtx manifest.TemplateContext) (map[string][]byte, error) {
+    configs := make(map[string][]byte)
+    
+    for _, tmpl := range templates {
+        var content []byte
+        var err error
+        
+        switch {
+        case tmpl.Content != "":
+            // Content 模式：使用 TemplateContext 渲染
+            content, err = r.renderContentTemplate(tmpl.Content, tmplCtx)
+        case tmpl.SecretRef != nil:
+            // SecretRef 模式：从 Secret 获取
+            content, err = r.renderSecretTemplate(tmpl.SecretRef, tmplCtx)
+        case tmpl.KubeconfigTemplate != nil:
+            // KubeconfigTemplate 模式：动态生成
+            content, err = r.renderKubeconfigTemplate(context.Background(), tmpl, tmplCtx)
+        default:
+            return nil, fmt.Errorf("no template content specified for %s", tmpl.Name)
+        }
+        
+        if err != nil {
+            return nil, fmt.Errorf("failed to render template %s: %w", tmpl.Name, err)
+        }
+        configs[tmpl.Name] = content
+    }
+    
+    return configs, nil
+}
+```
+
+**设计说明**：ConfigRenderer 的所有渲染方法都接收 `manifest.TemplateContext` 作为参数，而不是单独传递集群、节点等信息。这样：
+1. 与 DAG 调度器传递的 TemplateContext 保持一致
+2. 避免重复构建模板数据
+3. BinaryInstaller 和 HelmInstaller 共享相同的模板上下文
+
+
 ---
 
 ## 5. HelmInstaller 详细设计
@@ -3277,338 +3610,6 @@ func (r *TemplateRenderer) RenderScript(script string, tmplCtx manifest.Template
     return buf.String(), nil
 }
 ```
-
-### 4.5 ConfigRenderer 详细设计
-
-ConfigRenderer 是 BinaryInstaller 的配置文件渲染器，负责将 `configTemplates` 渲染为最终配置文件内容。支持三种渲染模式：Content（Go template）、SecretRef（从 K8s Secret 获取）、KubeconfigTemplate（动态生成 kubeconfig）。
-
-#### 4.5.1 三种渲染模式
-
-ConfigRenderer 支持三种渲染模式，根据不同的配置来源选择对应的渲染方式。
-
-#### 模式 1: Content 模式 (Go template 渲染)
-
-**设计思路**：直接在 ComponentVersion 中定义配置内容模板，通过 Go template 引擎渲染。适用于配置文件内容可以直接在 YAML 中定义的场景。
-
-**输入**：
-```yaml
-configTemplates:
-  - name: bkeagent.conf
-    path: "/etc/openFuyao/bkeagent/bkeagent.conf"
-    content: |
-      cluster_name: {{.clusterName}}
-      api_server: {{.apiServer}}
-      log_level: {{.Variables.logLevel | default "info"}}
-```
-
-**渲染过程**：
-1. 解析 content 模板
-2. 注入模板数据 (集群信息、节点信息、自定义变量等)
-3. 执行 Go template 渲染
-4. 返回渲染后的内容
-
-**输出**：
-```yaml
-cluster_name: my-cluster
-api_server: https://10.0.0.1:6443
-log_level: info
-```
-
----
-
-#### 模式 2: SecretRef 模式 (从 Secret 获取)
-
-**设计思路**：从 Kubernetes Secret 中获取配置内容，适用于敏感信息（如证书、密钥）的管理。
-
-**输入**：
-```yaml
-configTemplates:
-  - name: tls.crt
-    path: "/etc/openFuyao/bkeagent/tls.crt"
-    secretRef:
-      name: bkeagent-tls
-      namespace: "{{.clusterNamespace}}"
-      key: tls.crt
-```
-
-**渲染过程**：
-1. 解析 namespace 模板变量
-2. 从 Kubernetes API 获取 Secret
-3. 提取指定 key 的内容
-4. 返回 Secret 数据
-
-**输出**：
-```
------BEGIN CERTIFICATE-----
-MIIC...
------END CERTIFICATE-----
-```
-
----
-
-#### 模式 3: KubeconfigTemplate 模式 (动态生成)
-
-**设计思路**：根据集群信息动态生成 kubeconfig 文件，适用于需要为组件生成访问集群凭证的场景。
-
-**输入**：
-```yaml
-configTemplates:
-  - name: kubeconfig
-    path: "/etc/openFuyao/bkeagent/kubeconfig"
-    kubeconfigTemplate:
-      clusterName: "{{.clusterName}}"
-      apiServer: "{{.apiServer}}"
-      caCertPath: "/etc/openFuyao/bkeagent/ca.crt"
-      clientCertPath: "/etc/openFuyao/bkeagent/tls.crt"
-      clientKeyPath: "/etc/openFuyao/bkeagent/tls.key"
-      namespace: "{{.clusterNamespace}}"
-```
-
-**渲染过程**：
-1. 解析模板变量
-2. 构建 kubeconfig 结构
-3. 序列化为 YAML 格式
-4. 返回 kubeconfig 内容
-
-**输出**：
-```yaml
-apiVersion: v1
-kind: Config
-clusters:
-- cluster:
-    server: https://10.0.0.1:6443
-    certificate-authority: /etc/openFuyao/bkeagent/ca.crt
-  name: my-cluster
-users:
-- user:
-    client-certificate: /etc/openFuyao/bkeagent/tls.crt
-    client-key: /etc/openFuyao/bkeagent/tls.key
-  name: my-cluster
-contexts:
-- context:
-    cluster: my-cluster
-    user: my-cluster
-    namespace: default
-  name: my-cluster
-current-context: my-cluster
-```
-
-#### 4.5.2 ConfigRenderer 渲染流程图
-
-**设计思路**：ConfigRenderer 根据配置模板的类型选择不同的渲染模式：Content 模式使用 Go template 渲染、SecretRef 模式从 Kubernetes Secret 获取、KubeconfigTemplate 模式动态生成 kubeconfig。整个流程采用策略模式，根据模板类型分发到不同的渲染处理器。
-
-**关键设计点**：
-- **三种模式**：Content（模板渲染）、SecretRef（Secret 引用）、KubeconfigTemplate（动态生成）
-- **模板变量**：Content 模式支持完整的模板变量系统
-- **Secret 获取**：SecretRef 模式支持命名空间模板变量
-- **Kubeconfig 生成**：使用 client-go 的 clientcmd 库生成标准格式
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                         ConfigRenderer 渲染流程                                  │
-└─────────────────────────────────────────────────────────────────────────────────┘
-
-                              ┌──────────────────┐
-                              │  RenderConfig()  │
-                              │  入口函数        │
-                              └────────┬─────────┘
-                                       │
-                                       ▼
-                    ┌──────────────────────────────────────┐
-                    │  判断渲染模式                        │
-                    │  switch {                            │
-                    │  case template.Content != "":        │
-                    │  case template.SecretRef != nil:     │
-                    │  case template.KubeconfigTemplate:   │
-                    │  }                                   │
-                    └────────────────────┬─────────────────┘
-                                         │
-              ┌──────────────────────────┼──────────────────────────┐
-              │                          │                          │
-              ▼                          ▼                          ▼
-    ┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
-    │  Content 模式   │      │  SecretRef 模式 │      │  Kubeconfig     │
-    │                 │      │                 │      │  模式           │
-    └────────┬────────┘      └────────┬────────┘      └────────┬────────┘
-             │                        │                        │
-             ▼                        ▼                        ▼
-    ┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
-    │ 1. 构建模板数据 │      │ 1. 解析命名空间 │      │ 1. 解析模板变量 │
-    │  buildTemplate  │      │  renderString   │      │  renderString   │
-    │  Data()         │      │  (namespace)    │      │                 │
-    └────────┬────────┘      └────────┬────────┘      └────────┬────────┘
-             │                        │                        │
-             ▼                        ▼                        ▼
-    ┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
-    │ 2. 解析模板     │      │ 2. 获取 Secret  │      │ 2. 构建结构     │
-    │  template.Parse │      │  client.Get()   │      │  clientcmdapi   │
-    │  (content)      │      │                 │      │  .Config{}      │
-    └────────┬────────┘      └────────┬────────┘      └────────┬────────┘
-             │                        │                        │
-             ▼                        ▼                        ▼
-    ┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
-    │ 3. 执行渲染     │      │ 3. 提取数据     │      │ 3. 序列化 YAML  │
-    │  tmpl.Execute() │      │  secret.Data[key]│     │  clientcmd.Write│
-    └────────┬────────┘      └────────┬────────┘      └────────┬────────┘
-             │                        │                        │
-             └────────────────────────┼────────────────────────┘
-                                      │
-                                      ▼
-                    ┌──────────────────────────────────────┐
-                    │  返回渲染结果                        │
-                    │  return content, nil                 │
-                    └──────────────────────────────────────┘
-```
-
-#### 4.5.3 核心接口定义
-
-```go
-// pkg/binaryinstaller/config_renderer.go
-
-// ConfigRenderer 配置文件渲染器
-type ConfigRenderer struct {
-    client      client.Client
-    funcMap     template.FuncMap
-}
-
-// NewConfigRenderer 创建配置文件渲染器
-// client 用于读取 Secret (SecretRef 模式) 和生成 kubeconfig (KubeconfigTemplate 模式)
-func NewConfigRenderer(client client.Client) *ConfigRenderer {
-    return &ConfigRenderer{
-        client: client,
-        funcMap: template.FuncMap{
-            "upper": strings.ToUpper,
-            "lower": strings.ToLower,
-            "trim":  strings.TrimSpace,
-        },
-    }
-}
-
-// RenderConfig 渲染配置文件模板
-func (r *ConfigRenderer) RenderConfig(ctx context.Context, template ConfigTemplateSpec, opts InstallOptions) ([]byte, error) {
-    switch {
-    case template.Content != "":
-        return r.renderContentTemplate(ctx, template, opts)
-    case template.SecretRef != nil:
-        return r.renderSecretTemplate(ctx, template, opts)
-    case template.KubeconfigTemplate != nil:
-        return r.renderKubeconfigTemplate(ctx, template, opts)
-    }
-    
-    return nil, errors.New("no template content specified")
-}
-
-// renderContentTemplate 渲染内容模板 (使用 TemplateContext)
-func (r *ConfigRenderer) renderContentTemplate(content string, tmplCtx manifest.TemplateContext) ([]byte, error) {
-    tmpl, err := template.New("content").Funcs(r.funcMap).Parse(content)
-    if err != nil {
-        return nil, fmt.Errorf("failed to parse template: %w", err)
-    }
-    
-    var buf bytes.Buffer
-    if err := tmpl.Execute(&buf, tmplCtx); err != nil {
-        return nil, fmt.Errorf("failed to render template: %w", err)
-    }
-    
-    return buf.Bytes(), nil
-}
-
-// renderSecretTemplate 从 Secret 获取内容 (使用 TemplateContext 渲染 namespace)
-func (r *ConfigRenderer) renderSecretTemplate(secretRef *SecretRefSpec, tmplCtx manifest.TemplateContext) ([]byte, error) {
-    // 渲染 namespace 模板变量
-    namespace := r.renderTemplateString(secretRef.Namespace, tmplCtx)
-    
-    // 获取 Secret
-    secret := &corev1.Secret{}
-    if err := r.client.Get(context.Background(), types.NamespacedName{
-        Name:      secretRef.Name,
-        Namespace: namespace,
-    }, secret); err != nil {
-        return nil, fmt.Errorf("failed to get secret %s/%s: %w", namespace, secretRef.Name, err)
-    }
-    
-    // 获取指定 key 的内容
-    data, ok := secret.Data[secretRef.Key]
-    if !ok {
-        return nil, fmt.Errorf("key %s not found in secret %s/%s", secretRef.Key, namespace, secretRef.Name)
-    }
-    
-    return data, nil
-}
-
-// renderKubeconfigTemplate 动态生成 kubeconfig
-func (r *ConfigRenderer) renderKubeconfigTemplate(ctx context.Context, template ConfigTemplateSpec, tmplCtx manifest.TemplateContext) ([]byte, error) {
-    kc := template.KubeconfigTemplate
-    
-    // 解析模板变量 (使用 TemplateContext)
-    clusterName := r.renderTemplateString(kc.ClusterName, tmplCtx)
-    apiServer := r.renderTemplateString(kc.APIServer, tmplCtx)
-    namespace := r.renderTemplateString(kc.Namespace, tmplCtx)
-    
-    kubeconfig := clientcmdapi.Config{
-        Kind:       "Config",
-        APIVersion: "v1",
-        Clusters: map[string]*clientcmdapi.Cluster{
-            clusterName: {
-                Server:               apiServer,
-                CertificateAuthority: kc.CACertPath,
-            },
-        },
-        AuthInfos: map[string]*clientcmdapi.AuthInfo{
-            clusterName: {
-                ClientCertificate: kc.ClientCertPath,
-                ClientKey:         kc.ClientKeyPath,
-            },
-        },
-        Contexts: map[string]*clientcmdapi.Context{
-            clusterName: {
-                Cluster:   clusterName,
-                AuthInfo:  clusterName,
-                Namespace: namespace,
-            },
-        },
-        CurrentContext: clusterName,
-    }
-    
-    return clientcmd.Write(kubeconfig)
-}
-
-// renderConfigTemplates 渲染配置文件模板 (使用 TemplateContext)
-func (r *ConfigRenderer) renderConfigTemplates(templates []ConfigTemplateSpec, tmplCtx manifest.TemplateContext) (map[string][]byte, error) {
-    configs := make(map[string][]byte)
-    
-    for _, tmpl := range templates {
-        var content []byte
-        var err error
-        
-        switch {
-        case tmpl.Content != "":
-            // Content 模式：使用 TemplateContext 渲染
-            content, err = r.renderContentTemplate(tmpl.Content, tmplCtx)
-        case tmpl.SecretRef != nil:
-            // SecretRef 模式：从 Secret 获取
-            content, err = r.renderSecretTemplate(tmpl.SecretRef, tmplCtx)
-        case tmpl.KubeconfigTemplate != nil:
-            // KubeconfigTemplate 模式：动态生成
-            content, err = r.renderKubeconfigTemplate(context.Background(), tmpl, tmplCtx)
-        default:
-            return nil, fmt.Errorf("no template content specified for %s", tmpl.Name)
-        }
-        
-        if err != nil {
-            return nil, fmt.Errorf("failed to render template %s: %w", tmpl.Name, err)
-        }
-        configs[tmpl.Name] = content
-    }
-    
-    return configs, nil
-}
-```
-
-**设计说明**：ConfigRenderer 的所有渲染方法都接收 `manifest.TemplateContext` 作为参数，而不是单独传递集群、节点等信息。这样：
-1. 与 DAG 调度器传递的 TemplateContext 保持一致
-2. 避免重复构建模板数据
-3. BinaryInstaller 和 HelmInstaller 共享相同的模板上下文
 
 ---
 
