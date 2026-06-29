@@ -1997,6 +1997,105 @@ func (i *BinaryInstaller) executeInstall(ctx context.Context, nodeIP string, scr
 }
 ```
 
+### 4.4 Binary Uninstall 流程
+
+**设计思路 — Uninstall 与 Install/Upgrade 的区别**：
+
+Binary 组件的卸载流程与安装/升级有本质区别：
+- **Install/Upgrade**：下载制品 → 渲染脚本 → SSH 执行 → 健康检查
+- **Uninstall**：渲染卸载脚本 → SSH 执行 → 验证服务已停止
+
+卸载不需要下载制品，因为目标节点上已有二进制文件。卸载脚本负责停止服务、删除二进制、清理配置文件。
+
+**卸载流程图**：
+
+```
+Binary Uninstall 流程:
+┌─────────────────────────────────────────────────────────────┐
+│ 1. 渲染卸载脚本                                             │
+│    - 支持模板变量 ({{binPath}}, {{configPath}} 等)          │
+├─────────────────────────────────────────────────────────────┤
+│ 2. 通过 SSH 执行卸载脚本                                    │
+│    - 停止服务: systemctl stop <service>                     │
+│    - 禁用服务: systemctl disable <service>                  │
+│    - 删除二进制: rm -f /usr/local/bin/<binary>              │
+│    - 删除服务文件: rm -f /etc/systemd/system/<service>      │
+│    - 重新加载 systemd: systemctl daemon-reload              │
+│    - 清理配置目录 (可选): rm -rf /etc/<component>/          │
+├─────────────────────────────────────────────────────────────┤
+│ 3. 验证服务已停止                                           │
+│    - systemctl is-active <service> 返回 "inactive"          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**代码实现**：
+
+```go
+// executeUninstall 执行二进制组件卸载
+func (i *BinaryInstaller) executeUninstall(
+    ctx context.Context,
+    nodeIP string,
+    uninstallScript string,
+    tmplCtx manifest.TemplateContext,
+) error {
+    // 1. 渲染卸载脚本
+    script, err := i.renderer.RenderScript(uninstallScript, tmplCtx)
+    if err != nil {
+        return fmt.Errorf("render uninstall script: %w", err)
+    }
+
+    // 2. 通过 SSH 执行卸载脚本
+    result, err := i.sshClient.Execute(nodeIP, script)
+    if err != nil {
+        return fmt.Errorf("uninstall failed on %s: %w\nstdout: %s\nstderr: %s",
+            nodeIP, err, result.Stdout, result.Stderr)
+    }
+
+    // 3. 验证服务已停止
+    verifyCmd := fmt.Sprintf("systemctl is-active %s || true", tmplCtx.ServiceName)
+    verifyResult, _ := i.sshClient.Execute(nodeIP, verifyCmd)
+    if verifyResult.Stdout == "active" {
+        return fmt.Errorf("service %s still active after uninstall on %s", 
+            tmplCtx.ServiceName, nodeIP)
+    }
+
+    return nil
+}
+```
+
+**卸载脚本示例**：
+
+```yaml
+binary:
+  uninstallScript: |
+    #!/bin/bash
+    set -e
+    
+    # 停止服务
+    systemctl stop containerd || true
+    systemctl disable containerd || true
+    
+    # 删除二进制文件
+    rm -f /usr/bin/containerd
+    rm -f /usr/bin/containerd-shim-runc-v2
+    rm -f /usr/bin/containerd-shim-shimless-v2
+    rm -f /usr/bin/containerd-stress
+    rm -f /usr/bin/ctr
+    rm -f /usr/local/sbin/runc
+    rm -f /usr/bin/crictl
+    rm -f /usr/bin/nerdctl
+    
+    # 删除服务文件
+    rm -f /usr/lib/systemd/system/containerd.service
+    
+    # 删除配置文件
+    rm -f /etc/crictl.yaml
+    rm -rf /etc/containerd/
+    
+    # 重新加载 systemd
+    systemctl daemon-reload
+```
+
 ### 4.5 ConfigRenderer 详细设计
 
 ConfigRenderer 是 BinaryInstaller 的配置文件渲染器，负责将 `configTemplates` 渲染为最终配置文件内容。支持三种渲染模式：Content（Go template）、SecretRef（从 K8s Secret 获取）、KubeconfigTemplate（动态生成 kubeconfig）。
@@ -3057,6 +3156,197 @@ initContainers:
 
 HelmInstaller 的健康检查通过 `runHealthCheck` 方法委托共享 `pkg/healthcheck` 包执行（`return healthcheck.Run(ctx, i.clientset, hc)`）。PodReady/EndpointReady/Custom 三种检查的接口定义与实现、与 Helm `--wait` 的关系、类型归属等详见 **第 7 章 HealthCheck 共享包设计**。
 
+### 5.5 Hooks 执行引擎
+
+**设计思路 — PreInstallHooks 与 PreUninstallHooks 统一设计**：
+
+Helm 组件支持两种钩子：`PreInstallHooks`（安装/升级前执行）和 `PreUninstallHooks`（卸载前执行）。两者共享相同的执行逻辑（创建 Job → 等待完成 → 清理），仅触发时机不同。统一设计为 `HookExecutor` 接口，避免重复实现。
+
+**钩子执行流程**：
+
+```
+Hooks 执行流程:
+┌─────────────────────────────────────────────────────────────┐
+│ 1. 遍历 hooks 列表                                          │
+│    - 过滤支持的 hook.Type (目前仅 "Job")                    │
+├─────────────────────────────────────────────────────────────┤
+│ 2. 渲染 Hook Manifest                                       │
+│    - 支持模板变量 ({{clusterName}}, {{namespace}} 等)       │
+├─────────────────────────────────────────────────────────────┤
+│ 3. 创建 Job 资源                                            │
+│    - Job 名称: pre-install-<hookName>-<timestamp>           │
+│    - 或: pre-uninstall-<hookName>-<timestamp>               │
+├─────────────────────────────────────────────────────────────┤
+│ 4. 等待 Job 完成                                            │
+│    - 超时: 5 分钟 (可配置)                                  │
+│    - 失败处理: 清理 Job 后返回错误                          │
+├─────────────────────────────────────────────────────────────┤
+│ 5. 清理 Job 资源                                            │
+│    - 删除 Job (保留 Pod 日志用于调试)                       │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**代码实现**：
+
+```go
+// pkg/helmhooks/executor.go
+
+// HookExecutor 钩子执行器接口
+type HookExecutor interface {
+    Execute(ctx context.Context, hooks []HookSpec, opts HookOptions) error
+}
+
+// JobHookExecutor Job 类型钩子执行器
+type JobHookExecutor struct {
+    clientset kubernetes.Interface
+    renderer  *HookRenderer
+    logger    *bkev1beta1.BKELogger
+}
+
+// HookOptions 钩子执行选项
+type HookOptions struct {
+    Namespace string
+    Timeout   time.Duration
+    Prefix    string  // "pre-install" 或 "pre-uninstall"
+    // 模板变量
+    TemplateData map[string]interface{}
+}
+
+func (e *JobHookExecutor) Execute(ctx context.Context, hooks []HookSpec, opts HookOptions) error {
+    for _, hook := range hooks {
+        if hook.Type != "Job" {
+            e.logger.Warn("unsupported hook type: %s, skipping", hook.Type)
+            continue
+        }
+        
+        // 1. 渲染 Hook Manifest
+        manifest, err := e.renderer.Render(hook.Manifest, opts.TemplateData)
+        if err != nil {
+            return fmt.Errorf("render hook %s manifest: %w", hook.Name, err)
+        }
+        
+        // 2. 创建 Job
+        jobName := fmt.Sprintf("%s-%s-%d", opts.Prefix, hook.Name, time.Now().Unix())
+        if err := e.createJob(ctx, jobName, manifest, opts.Namespace); err != nil {
+            return fmt.Errorf("create hook job %s: %w", jobName, err)
+        }
+        
+        // 3. 等待 Job 完成
+        if err := e.waitForJob(ctx, jobName, opts.Namespace, opts.Timeout); err != nil {
+            e.cleanupJob(ctx, jobName, opts.Namespace)
+            return fmt.Errorf("hook job %s failed: %w", jobName, err)
+        }
+        
+        // 4. 清理 Job
+        e.cleanupJob(ctx, jobName, opts.Namespace)
+    }
+    return nil
+}
+
+// HookRenderer 钩子 Manifest 渲染器
+type HookRenderer struct {
+    funcMap template.FuncMap
+}
+
+func (r *HookRenderer) Render(manifest string, data map[string]interface{}) (string, error) {
+    t, err := template.New("hook").Funcs(r.funcMap).Parse(manifest)
+    if err != nil {
+        return "", err
+    }
+    var buf bytes.Buffer
+    if err := t.Execute(&buf, data); err != nil {
+        return "", err
+    }
+    return buf.String(), nil
+}
+```
+
+**在 HelmInstaller 中集成**：
+
+```go
+// pkg/helminstaller/installer.go
+
+func (i *HelmInstaller) install(ctx context.Context, actionConfig *action.Configuration,
+    helm *HelmSpec, opts InstallOptions) error {
+    
+    // 1. 执行 PreInstallHooks
+    if len(helm.PreInstallHooks) > 0 {
+        hookOpts := HookOptions{
+            Namespace:    helm.Namespace,
+            Timeout:      5 * time.Minute,
+            Prefix:       "pre-install",
+            TemplateData: buildHookTemplateData(opts),
+        }
+        if err := i.hookExecutor.Execute(ctx, helm.PreInstallHooks, hookOpts); err != nil {
+            return fmt.Errorf("pre-install hooks failed: %w", err)
+        }
+    }
+    
+    // 2. 执行 Helm Install
+    client := action.NewInstall(actionConfig)
+    // ... 原有逻辑
+}
+
+func (i *HelmInstaller) uninstall(ctx context.Context, actionConfig *action.Configuration,
+    helm *HelmSpec, opts InstallOptions) error {
+    
+    // 1. 执行 PreUninstallHooks
+    if len(helm.PreUninstallHooks) > 0 {
+        hookOpts := HookOptions{
+            Namespace:    helm.Namespace,
+            Timeout:      5 * time.Minute,
+            Prefix:       "pre-uninstall",
+            TemplateData: buildHookTemplateData(opts),
+        }
+        if err := i.hookExecutor.Execute(ctx, helm.PreUninstallHooks, hookOpts); err != nil {
+            return fmt.Errorf("pre-uninstall hooks failed: %w", err)
+        }
+    }
+    
+    // 2. 执行 Helm Uninstall
+    client := action.NewUninstall(actionConfig)
+    // ... 原有逻辑
+}
+```
+
+**使用示例**：
+
+```yaml
+helm:
+  releaseName: coredns
+  namespace: kube-system
+  
+  # 安装前钩子：备份现有配置
+  preInstallHooks:
+    - name: backup-config
+      type: Job
+      manifest: |
+        apiVersion: batch/v1
+        kind: Job
+        spec:
+          template:
+            spec:
+              containers:
+              - name: backup
+                image: bitnami/kubectl:latest
+                command: ["/bin/sh", "-c", "kubectl get configmap coredns -n kube-system -o yaml > /backup/coredns.yaml"]
+  
+  # 卸载前钩子：清理依赖资源
+  preUninstallHooks:
+    - name: cleanup-dependencies
+      type: Job
+      manifest: |
+        apiVersion: batch/v1
+        kind: Job
+        spec:
+          template:
+            spec:
+              containers:
+              - name: cleanup
+                image: bitnami/kubectl:latest
+                command: ["/bin/sh", "-c", "kubectl delete configmap coredns-custom -n kube-system --ignore-not-found"]
+```
+
 ---
 
 ## 6. YamlInstaller 详细设计
@@ -3167,6 +3457,95 @@ func (i *YamlInstaller) Apply(ctx context.Context, cv *configv1alpha1.ComponentV
 ### 6.3 健康检查
 
 YamlInstaller 的健康检查在 `Apply` 方法内部调用共享 `pkg/healthcheck` 包执行（`healthcheck.Run(ctx, execCtx.TargetClient, *cv.Spec.YAML.HealthCheck)`）。当 `cv.Spec.YAML.HealthCheck.Enabled` 为 true 时，清单 Apply 后执行 PodReady/EndpointReady/Custom 检查。接口定义与实现详见 **第 7 章 HealthCheck 共享包设计**。
+
+### 6.4 YAML Uninstall 流程
+
+**设计思路 — YAML 组件卸载与 Binary/Helm 的区别**：
+
+YAML 组件的卸载流程与 Binary/Helm 有本质区别：
+- **Binary**：通过 SSH 执行卸载脚本，停止服务、删除二进制
+- **Helm**：通过 Helm SDK 执行 `helm uninstall`，删除 Release
+- **YAML**：通过 K8s API 删除资源，支持 Prune 裁剪
+
+YAML 组件没有"服务"概念，卸载就是删除已应用的 Kubernetes 资源。
+
+**卸载流程图**：
+
+```
+YAML Uninstall 流程:
+┌─────────────────────────────────────────────────────────────┐
+│ 1. 加载已安装资源清单                                       │
+│    - 从 ComponentVersion 获取 Resources                     │
+│    - 或从 ManifestStore 获取已应用的清单                    │
+├─────────────────────────────────────────────────────────────┤
+│ 2. 删除资源 (逆序)                                          │
+│    - 按 GVK 依赖关系逆序删除                                │
+│    - CRD 最后删除                                           │
+│    - 使用 DeletePropagationBackground 或 Foreground         │
+├─────────────────────────────────────────────────────────────┤
+│ 3. 可选：Prune 裁剪                                         │
+│    - 按 PruneLabelSelector 查找资源                         │
+│    - 删除不在当前清单中的资源                               │
+├─────────────────────────────────────────────────────────────┤
+│ 4. 验证删除完成                                             │
+│    - 检查资源是否已删除                                     │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**代码实现**：
+
+```go
+// pkg/yamlinstaller/installer.go
+
+// Uninstall 卸载 YAML 组件
+func (i *YamlInstaller) Uninstall(ctx context.Context, cv *configv1alpha1.ComponentVersion, execCtx *ExecutionContext) error {
+    // 1. 获取已安装资源
+    pkg, err := i.store.GetComponentManifests(ctx, cv.Spec.Name, cv.Spec.Version, execCtx.TemplateContext)
+    if err != nil {
+        return fmt.Errorf("get manifests for %s: %w", cv.Spec.Name, err)
+    }
+
+    // 2. 逆序删除资源
+    if err := i.applier.DeleteComponent(ctx, pkg); err != nil {
+        return fmt.Errorf("delete manifests for %s: %w", cv.Spec.Name, err)
+    }
+
+    // 3. 可选：Prune 裁剪
+    if cv.Spec.YAML != nil && cv.Spec.YAML.Prune {
+        if err := i.applier.PruneResources(ctx, cv.Spec.YAML.PruneLabelSelector); err != nil {
+            return fmt.Errorf("prune resources for %s: %w", cv.Spec.Name, err)
+        }
+    }
+
+    return nil
+}
+```
+
+**Applier 扩展接口**：
+
+```go
+// pkg/manifest/applier.go
+
+// Applier 扩展接口，支持删除和裁剪
+type Applier interface {
+    // ApplyComponent 应用组件清单
+    ApplyComponent(ctx context.Context, pkg *ComponentPackage) error
+    
+    // DeleteComponent 删除组件资源（逆序删除）
+    DeleteComponent(ctx context.Context, pkg *ComponentPackage) error
+    
+    // PruneResources 裁剪不在清单中的资源（按 label selector）
+    PruneResources(ctx context.Context, selector map[string]string) error
+}
+```
+
+**与 Binary/Helm 卸载的对比**：
+
+| 组件类型 | 卸载机制 | 是否需要服务管理 | 是否支持 Prune |
+|---------|---------|-----------------|---------------|
+| Binary | SSH 执行卸载脚本 | ✅ 停止/禁用服务 | ❌ |
+| Helm | Helm SDK `helm uninstall` | ❌ Helm 管理 | ❌ |
+| YAML | K8s API 删除资源 | ❌ 无服务概念 | ✅ 按 label 裁剪 |
 
 ---
 
