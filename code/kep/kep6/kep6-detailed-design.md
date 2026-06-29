@@ -3296,7 +3296,7 @@ func checkCustom(ctx context.Context, spec *CustomCheckSpec) (bool, error) {
 
 ## 8. 模板变量系统与 TemplateContext 详细设计
 
-### 8.0 与现有 TemplateContext 的复用关系
+### 8.0 TemplateContext 扩展策略
 
 **设计思路**：为避免重复造轮子，本设计复用并扩展现有的 `pkg/manifest.TemplateContext` 结构体。现有 TemplateContext 用于 YAML/Manifest 组件的模板渲染，包含 4 个基础字段。在此基础上扩展，增加 Binary 组件所需的节点信息、制品信息、自定义变量等字段。
 
