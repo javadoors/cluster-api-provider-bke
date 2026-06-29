@@ -252,10 +252,12 @@
 
 ### 3.1 ComponentVersion 类型定义
 
-```go
-// pkg/api/v1alpha1/componentversion_types.go
+> **复用说明**：现有 `api/v1alpha1/componentversion_types.go` 已定义 `ComponentVersionSpec`/`ComponentType`/`InlineSpec`/`SubComponent`/`CompatibilitySpec`/`Constraint`/`Dependency`/`UpgradeStrategySpec`/`ResourceSpec` 等类型。本节中这些类型为**复用现有**（仅新增 `Binary`/`Helm`/`YAML` 三个字段及对应 `*Spec` 类型），下文以「✅复用」「🆕新增」标注。路径修正：原设计写 `pkg/api/v1alpha1/...` 有误，实际为 `api/v1alpha1/...`（无 `pkg/` 前缀）。
 
-// ComponentVersionSpec 定义组件版本规格
+```go
+// api/v1alpha1/componentversion_types.go
+
+// ComponentVersionSpec 定义组件版本规格 ✅复用现有，仅新增 Binary/Helm/YAML 字段
 type ComponentVersionSpec struct {
     // 组件名称
     Name string `json:"name"`
@@ -295,7 +297,7 @@ type ComponentVersionSpec struct {
     Resources []ResourceSpec `json:"resources,omitempty"`
 }
 
-// ComponentType 定义组件类型
+// ComponentType 定义组件类型 ✅复用现有 (含 binary/helm/yaml/inline 四值)
 type ComponentType string
 
 const (
@@ -305,13 +307,13 @@ const (
     ComponentTypeBinary ComponentType = "binary"
 )
 
-// CompatibilitySpec 定义兼容性约束
+// CompatibilitySpec 定义兼容性约束 ✅复用现有
 type CompatibilitySpec struct {
     // 约束列表
     Constraints []Constraint `json:"constraints,omitempty"`
 }
 
-// Constraint 定义单个兼容性约束
+// Constraint 定义单个兼容性约束 ✅复用现有
 type Constraint struct {
     // 依赖组件名称
     Component string `json:"component"`
@@ -320,7 +322,7 @@ type Constraint struct {
     Rule string `json:"rule"`
 }
 
-// Dependency 定义组件间依赖关系
+// Dependency 定义组件间依赖关系 ✅复用现有
 type Dependency struct {
     // 依赖组件名称
     Name string `json:"name"`
@@ -329,7 +331,7 @@ type Dependency struct {
     Phase string `json:"phase,omitempty"`
 }
 
-// UpgradeStrategySpec 定义升级策略
+// UpgradeStrategySpec 定义升级策略 ✅复用现有
 // 这是 DAG 调度层策略, 适用于所有组件类型 (binary/helm/yaml/inline)
 // 与各类型的专属策略互补:
 // - Binary: 无专属策略, 仅使用 UpgradeStrategy
@@ -356,7 +358,7 @@ type UpgradeStrategySpec struct {
     FailurePolicy string `json:"failurePolicy,omitempty"`
 }
 
-// SubComponent 定义子组件引用
+// SubComponent 定义子组件引用 ✅复用现有
 type SubComponent struct {
     // 子组件名称
     Name string `json:"name"`
@@ -365,7 +367,7 @@ type SubComponent struct {
     Version string `json:"version"`
 }
 
-// ResourceSpec 定义 Kubernetes 资源
+// ResourceSpec 定义 Kubernetes 资源 ✅复用现有
 //
 // 设计思路 — Data、StringData 与 Manifest 三种资源定义方式:
 //
@@ -430,7 +432,7 @@ type ResourceSpec struct {
 ### 3.2 Binary 类型字段定义
 
 ```go
-// BinarySpec 定义二进制组件规格
+// BinarySpec 定义二进制组件规格 🆕新增 (api/v1alpha1 扩展)
 type BinarySpec struct {
     // 自定义变量 (可覆盖默认值)
     Variables map[string]string `json:"variables,omitempty"`
@@ -582,7 +584,7 @@ type OSSpec struct {
 ### 3.3 YAML 类型字段定义
 
 ```go
-// YAMLSpec 定义 YAML 清单组件规格
+// YAMLSpec 定义 YAML 清单组件规格 🆕新增 (api/v1alpha1 扩展)
 type YAMLSpec struct {
     // YAML 清单文件列表 (外部 URL 引用)
     Manifests []ManifestRef `json:"manifests"`
@@ -621,7 +623,7 @@ type ManifestRef struct {
 ### 3.4 Helm 类型字段定义
 
 ```go
-// HelmSpec 定义 Helm 组件规格
+// HelmSpec 定义 Helm 组件规格 🆕新增 (api/v1alpha1 扩展)
 type HelmSpec struct {
     // Chart 配置
     Chart ChartSpec `json:"chart"`
@@ -811,7 +813,7 @@ type HookSpec struct {
 ### 3.5 Inline 类型字段定义
 
 ```go
-// InlineSpec 定义内联执行器配置
+// InlineSpec 定义内联执行器配置 ✅复用现有 (api/v1alpha1 已定义)
 // Inline 组件通过 ComponentFactory 注册的 handler 执行, 无需制品下载/模板渲染
 // handler 名称对应 ComponentFactory.Register() 注册的 key
 type InlineSpec struct {
@@ -1418,94 +1420,39 @@ spec:
 
 ### 3.7 CRD 版本迁移设计
 
-**设计思路**：v1alpha1 仅含 inline/subComponents/resources/compatibility/dependencies/upgradeStrategy 字段。v1alpha2 新增 binary/helm/yaml 字段定义。所有新字段均为 omitempty，v1alpha1 数据可无损转换为 v1alpha2。
+**设计思路 - 直接扩展 v1alpha1，不引入 v1alpha2**：
 
-**版本并存策略**：
+原设计拟新增 `api/v1alpha2/` + conversion 函数。但经审视，现有 `api/v1alpha1/componentversion_types.go` 的 `Type` 字段已支持 `yaml/helm/inline/binary` 四值（仅 enum，无 schema 定义），且所有新字段（`Binary`/`Helm`/`YAML`）均为 `omitempty` 指针类型，向旧数据完全兼容。引入 v1alpha2 会带来：① 双版本 conversion 维护成本；② `(*v1alpha2.InlineSpec)(src.Spec.Inline)` 等跨包指针强转的脆弱性；③ 现有引用 v1alpha1 的代码全部需评估迁移。
 
-```
-阶段 1: 双版本并存 (当前)
-┌───────────────────────────────────────────────────┐
-│ v1alpha1: served=true,  storage=false  (只读兼容) │
-│ v1alpha2: served=true,  storage=true   (新存储版本) │
-└───────────────────────────────────────────────────┘
-转换: v1alpha1 → v1alpha2 (自动, conversion 函数)
-      v1alpha2 → v1alpha1 (自动, 新字段丢弃, 旧字段保留)
+因此**直接在 v1alpha1 上扩展**：新增 `Binary *BinarySpec`/`Helm *HelmSpec`/`YAML *YAMLSpec` 三个 omitempty 字段及对应 CRD schema。旧 ComponentVersion（无这三个字段）反序列化后新字段为 nil，行为不变；新 ComponentVersion 带新字段，旧控制器忽略（omitempty）。无需 conversion，零迁移风险，最大化复用现有类型文件与 deepcopy 生成代码。
 
-阶段 2: 旧版本废弃 (v1alpha2 稳定后)
-┌───────────────────────────────────────────────────┐
-│ v1alpha1: served=false, storage=false  (不再暴露) │
-│ v1alpha2: served=true,  storage=true             │
-└───────────────────────────────────────────────────┘
+**扩展内容**：
 
-阶段 3: 移除旧版本
-┌───────────────────────────────────────────────────┐
-│ v1alpha1: 删除                                     │
-│ v1alpha2: served=true,  storage=true             │
-└───────────────────────────────────────────────────┘
-```
+| 改动位置 | 内容 |
+|---------|------|
+| `api/v1alpha1/componentversion_types.go` | 新增 `BinarySpec`/`HelmSpec`/`YAMLSpec`/`ArtifactSpec`/`ConfigTemplateSpec`/... 等类型；`ComponentVersionSpec` 增加 `Binary *BinarySpec`/`Helm *HelmSpec`/`YAML *YAMLSpec` 字段 |
+| `api/v1alpha1/zz_generated.deepcopy.go` | 重新 `make` 生成 DeepCopy 方法 |
+| `config/crd/bases/...componentversions.yaml` | v1alpha1 schema 新增 binary/helm/yaml 字段定义（即 3.6 节中 v1alpha2 的 schema 内容合并到 v1alpha1） |
 
-**Conversion 函数设计**：
+**兼容性保证**：
+- 新字段全部 `omitempty` + 指针类型，旧 YAML 不填则为 nil
+- `Type` 字段 enum 已含 `binary`/`helm`/`yaml`，无需改 enum
+- 旧控制器代码不读取新字段，不受影响
+- Feature Gate 关闭时即使新字段存在也不走新路径（见 10.2）
 
-```go
-// api/v1alpha2/conversion.go
-
-// v1alpha2.ComponentVersion 实现 conversion.Hub 接口
-func (cv *ComponentVersion) Hub() {}
-
-// ConvertTo 将 v1alpha1 转换为 v1alpha2 (Hub)
-// 自动转换: v1alpha1 的所有字段在 v1alpha2 中都有对应
-// v1alpha2 新增的 binary/helm/yaml 字段为空 (omitempty, 无影响)
-func (src *v1alpha1.ComponentVersion) ConvertTo(dstRaw conversion.Hub) error {
-    dst := dstRaw.(*v1alpha2.ComponentVersion)
-    dst.ObjectMeta = src.ObjectMeta
-    dst.Spec.Name = src.Spec.Name
-    dst.Spec.Type = v1alpha2.ComponentType(src.Spec.Type)
-    dst.Spec.Version = src.Spec.Version
-    dst.Spec.Inline = (*v1alpha2.InlineSpec)(src.Spec.Inline)
-    dst.Spec.SubComponents = src.Spec.SubComponents
-    dst.Spec.Compatibility = src.Spec.Compatibility
-    dst.Spec.Dependencies = src.Spec.Dependencies
-    dst.Spec.UpgradeStrategy = src.Spec.UpgradeStrategy
-    dst.Spec.Resources = src.Spec.Resources
-    // binary/helm/yaml 在 v1alpha1 中不存在, 留空
-    return nil
-}
-
-// ConvertFrom 将 v1alpha2 转换为 v1alpha1
-// 降级转换: v1alpha2 的 binary/helm/yaml 字段被丢弃
-func (dst *v1alpha1.ComponentVersion) ConvertFrom(srcRaw conversion.Hub) error {
-    src := srcRaw.(*v1alpha2.ComponentVersion)
-    dst.ObjectMeta = src.ObjectMeta
-    dst.Spec.Name = src.Spec.Name
-    dst.Spec.Type = v1alpha1.ComponentType(src.Spec.Type)
-    dst.Spec.Version = src.Spec.Version
-    dst.Spec.Inline = (*v1alpha1.InlineSpec)(src.Spec.Inline)
-    dst.Spec.SubComponents = src.Spec.SubComponents
-    dst.Spec.Compatibility = src.Spec.Compatibility
-    dst.Spec.Dependencies = src.Spec.Dependencies
-    dst.Spec.UpgradeStrategy = src.Spec.UpgradeStrategy
-    dst.Spec.Resources = src.Spec.Resources
-    // binary/helm/yaml 字段在 v1alpha1 中不存在, 丢弃
-    return nil
-}
-```
-
-**迁移步骤**：
+**迁移步骤（简化）**：
 
 | 步骤 | 操作 | 风险 | 回滚方案 |
 |------|------|------|---------|
-| 1 | 创建 v1alpha2 API (复制 v1alpha1 类型 + 新增 BinarySpec/HelmSpec/YAMLSpec) | 无 | 删除 v1alpha2 目录 |
-| 2 | 实现 conversion 函数 (v1alpha1 ↔ v1alpha2) + 单元测试 | 低 | 删除 conversion |
-| 3 | CRD 配置: v1alpha1 served=true storage=false, v1alpha2 served=true storage=true | 中 | 恢复 v1alpha1 storage=true |
-| 4 | 控制器切换到 v1alpha2 API | 中 | 切回 v1alpha1 client |
-| 5 | 观察 1-2 周, 确认 conversion 无异常 | — | — |
-| 6 | v1alpha1 served=false | 低 | served=true |
-| 7 | 删除 v1alpha1 | 高 | 从 Git 历史恢复 |
+| 1 | 在 `api/v1alpha1/componentversion_types.go` 新增 BinarySpec/HelmSpec/YAMLSpec 及子类型 | 无 | 删除新增类型 |
+| 2 | `ComponentVersionSpec` 增加 `Binary/Helm/YAML` 字段 + 重新生成 deepcopy | 低 | 删除字段 |
+| 3 | CRD schema 合并 binary/helm/yaml 定义到 v1alpha1 版本 | 低 | 还原 schema |
+| 4 | 控制器按 Feature Gate 读取新字段 | 中 | 关闭 Feature Gate |
 
 **注意事项**：
-- v1alpha1 的 `type` 字段已支持 `yaml/helm/inline/binary` 四种值（仅 enum 约束，无 schema 定义），v1alpha2 新增了对应的 schema 约束
-- `Resources` 字段在 v1alpha1 和 v1alpha2 中均位于顶层，conversion 无需特殊处理
-- `SubComponents` 字段同理，两个版本中位置一致
+- 路径修正：原设计 3.1 节注释 `pkg/api/v1alpha1/componentversion_types.go` 有误，实际路径为 `api/v1alpha1/componentversion_types.go`（无 `pkg/` 前缀）
+- `Resources`/`SubComponents`/`Compatibility`/`Dependencies`/`UpgradeStrategy` 等类型在 v1alpha1 已存在，本设计的 3.1 节应标注"复用现有"而非"新增"（见 m1）
+- 若未来字段规模膨胀确需 v1alpha2，再按标准 conversion 流程引入，此时 v1alpha1 已是稳定存储版本
 
 ## 4. BinaryInstaller 详细设计
 
@@ -1690,22 +1637,51 @@ func (dst *v1alpha1.ComponentVersion) ConvertFrom(srcRaw conversion.Hub) error {
 ```go
 // pkg/binaryinstaller/installer.go
 
+// SSHExecutor SSH 执行抽象接口 (phaseframe-free)
+//
+// 设计思路 - 为什么不直接用 *bkessh.MultiCli:
+// 现有 bkessh.MultiCli 的 API 是面向"多主机并发"设计的:
+//   - Run(cmd Command) 在所有已注册主机上并发执行，返回聚合结果
+//   - 文件上传通过 Command.FileUp []File 携带，非独立 Upload 方法
+//   - 单主机执行在 HostRemoteClient (remotecli.go) 上，非 MultiCli
+//   - 架构发现通过 RegisterHostsInfo() + NodeArchByAddress()
+// BinaryInstaller 需要的是"单主机执行脚本 + 上传文件 + 发现架构"的简洁 API。
+// 直接依赖 *bkessh.MultiCli 会把多主机并发模型泄漏到 Installer，且无法 Mock。
+// 因此定义 SSHExecutor 接口，由 controllers 层提供 NewMultiCliSSHAdapter
+// 适配 bkessh.MultiCli/HostRemoteClient，使 BinaryInstaller 可独立测试。
+type SSHExecutor interface {
+    // Execute 在指定节点执行脚本，返回 stdout/stderr/exit code
+    Execute(ctx context.Context, nodeIP, script string) (*SSHResult, error)
+    // Upload 上传数据到指定节点的远程路径
+    Upload(ctx context.Context, nodeIP string, data []byte, remotePath string) error
+    // DiscoverArch 发现节点架构 (uname -m → amd64/arm64)
+    // 复用现有 agentssh.DiscoverArchs 逻辑 (从 phaseutil 抽取到 phaseframe-free 包)
+    DiscoverArch(ctx context.Context, nodeIP string) (string, error)
+}
+
+// SSHResult SSH 命令执行结果
+type SSHResult struct {
+    Stdout   string
+    Stderr   string
+    ExitCode int
+}
+
 // BinaryInstaller 二进制组件安装器
 type BinaryInstaller struct {
-    client          client.Client
-    sshClient       *bkessh.MultiCli
-    cacheDir        string
-    httpClient      *http.Client
-    cache           *ArtifactCache
-    renderer        *TemplateRenderer   // 模板渲染引擎 (含自定义函数, 无状态, 全局共享)
-    configRenderer  *ConfigRenderer     // 配置文件渲染器 (需 K8s client 读取 Secret)
-    logger          *bkev1beta1.BKELogger
+    client         client.Client
+    sshExecutor    SSHExecutor          // 抽象接口，不再直接依赖 *bkessh.MultiCli
+    cacheDir       string
+    httpClient     *http.Client
+    cache          *ArtifactCache
+    renderer       *TemplateRenderer   // 模板渲染引擎 (含自定义函数, 无状态, 全局共享)
+    configRenderer *ConfigRenderer     // 配置文件渲染器 (需 K8s client 读取 Secret)
+    logger         *bkev1beta1.BKELogger
 }
 
 // BinaryInstallerConfig BinaryInstaller 构建配置
 type BinaryInstallerConfig struct {
     Client         client.Client
-    SshClient      *bkessh.MultiCli
+    SshExecutor    SSHExecutor          // 替代原 SshClient *bkessh.MultiCli
     CacheDir       string
     HttpClient     *http.Client
     Renderer       *TemplateRenderer
@@ -1713,22 +1689,22 @@ type BinaryInstallerConfig struct {
     Logger         *bkev1beta1.BKELogger
 }
 
-// NewBinaryInstaller 创建二进制组件安装器
-func NewBinaryInstaller(cfg BinaryInstallerConfig) *BinaryInstaller {
+// NewBinaryInstaller 创建二进制组件安装器 (返回 error，不 panic)
+func NewBinaryInstaller(cfg BinaryInstallerConfig) (*BinaryInstaller, error) {
     cache, err := NewArtifactCache(cfg.CacheDir)
     if err != nil {
-        panic(fmt.Sprintf("failed to create artifact cache: %v", err))
+        return nil, fmt.Errorf("failed to create artifact cache: %w", err)
     }
     return &BinaryInstaller{
         client:         cfg.Client,
-        sshClient:      cfg.SshClient,
+        sshExecutor:    cfg.SshExecutor,
         cacheDir:       cfg.CacheDir,
         httpClient:     cfg.HttpClient,
         cache:          cache,
         renderer:       cfg.Renderer,
         configRenderer: cfg.ConfigRenderer,
         logger:         cfg.Logger,
-    }
+    }, nil
 }
 
 // ArtifactCache 管理二进制制品的本地文件缓存
@@ -1744,6 +1720,43 @@ func NewArtifactCache(cacheDir string) (*ArtifactCache, error) {
     return &ArtifactCache{cacheDir: cacheDir}, nil
 }
 ```
+
+**controllers 层 SSH 适配器示例** (适配 `bkessh.MultiCli`，phaseframe-free):
+
+```go
+// controllers/capbke/ssh_adapter.go
+package capbke
+
+// MultiCliSSHAdapter 把 bkessh.MultiCli 适配为 binaryinstaller.SSHExecutor
+// 复用现有 agentssh.DiscoverArchs 的架构发现逻辑 (从 pkg/phaseframe/phaseutil 抽取)
+type MultiCliSSHAdapter struct {
+    multiCli *bkessh.MultiCli
+}
+
+func NewMultiCliSSHAdapter(multiCli *bkessh.MultiCli) *MultiCliSSHAdapter {
+    return &MultiCliSSHAdapter{multiCli: multiCli}
+}
+
+// Execute 单主机执行: 注册单主机 → 构建 Command → Run → 返回结果
+func (a *MultiCliSSHAdapter) Execute(ctx context.Context, nodeIP, script string) (*binaryinstaller.SSHResult, error) {
+    // 复用 bkessh.MultiCli 的单主机执行能力 (通过 HostRemoteClient)
+    // 具体实现: multiCli.RegisterHosts([]bkessh.Host{...}) → multiCli.Run(bkessh.Command{Cmds: []string{script}})
+    // 返回 StdCombine 中对应主机的输出
+    ...
+}
+
+func (a *MultiCliSSHAdapter) Upload(ctx context.Context, nodeIP string, data []byte, remotePath string) error {
+    // 写入本地临时文件 → 构建 Command{FileUp: []bkessh.File{{Src: tmp, Dst: remotePath}}} → Run
+    ...
+}
+
+func (a *MultiCliSSHAdapter) DiscoverArch(ctx context.Context, nodeIP string) (string, error) {
+    // 复用 agentssh.DiscoverArchs (uname -m → amd64/arm64)，该函数需从
+    // pkg/phaseframe/phaseutil 抽取到 phaseframe-free 包 (如 pkg/remote/arch.go)
+    ...
+}
+```
+
 
 **设计思路 — TemplateRenderer vs TemplateContext**：
 
@@ -1807,8 +1820,8 @@ func (i *BinaryInstaller) Install(ctx context.Context, opts InstallOptions) erro
     tmplCtx := opts.TemplateCtx  // 复用 DAG 调度器传递的 TemplateContext (扩展后)
     
     // 1. 通过 SSH 发现节点架构 (必需: 制品 URL 包含 {{arch}} 模板变量, 下载前必须解析)
-    // 与当前 bkeagent 升级代码 (agentssh.DiscoverArchs) 一致: SSH 执行 uname -m 获取架构
-    arch, err := i.sshDiscoverArch(ctx, tmplCtx.NodeIP)
+    // 复用 SSHExecutor.DiscoverArch (内部对接 agentssh.DiscoverArchs 的 uname -m 逻辑)
+    arch, err := i.sshExecutor.DiscoverArch(ctx, tmplCtx.NodeIP)
     if err != nil {
         return fmt.Errorf("failed to discover arch for node %s: %w", tmplCtx.NodeIP, err)
     }
@@ -1902,8 +1915,8 @@ func (i *BinaryInstaller) executeHealthCheck(
     deadline := time.Now().Add(timeout)
 
     for time.Now().Before(deadline) {
-        result, err := i.sshClient.Execute(nodeIP, script)
-        if err == nil {
+        result, err := i.sshExecutor.Execute(ctx, nodeIP, script)
+        if err == nil && result.ExitCode == 0 {
             return nil // 退出码 0 = 健康
         }
         i.logger.Warn("health check retry on %s: %v (stdout: %s, stderr: %s)",
@@ -1958,14 +1971,14 @@ func (i *BinaryInstaller) downloadArtifacts(ctx context.Context, binary *BinaryS
 // executeInstall 通过 SSH 执行安装
 func (i *BinaryInstaller) executeInstall(ctx context.Context, nodeIP string, script string, artifacts map[string]*Artifact, configs map[string][]byte) error {
     // 1. 创建远程目录
-    if err := i.sshClient.Execute(nodeIP, "mkdir -p /tmp/bke-install"); err != nil {
+    if _, err := i.sshExecutor.Execute(ctx, nodeIP, "mkdir -p /tmp/bke-install"); err != nil {
         return fmt.Errorf("failed to create remote directory: %w", err)
     }
     
     // 2. 上传二进制文件
     for name, art := range artifacts {
         remotePath := fmt.Sprintf("/tmp/bke-install/%s", name)
-        if err := i.sshClient.Upload(nodeIP, art.Data, remotePath); err != nil {
+        if err := i.sshExecutor.Upload(ctx, nodeIP, art.Data, remotePath); err != nil {
             return fmt.Errorf("failed to upload %s to %s: %w", name, nodeIP, err)
         }
     }
@@ -1973,13 +1986,13 @@ func (i *BinaryInstaller) executeInstall(ctx context.Context, nodeIP string, scr
     // 3. 上传配置文件
     for name, content := range configs {
         remotePath := fmt.Sprintf("/tmp/bke-install/%s", name)
-        if err := i.sshClient.Upload(nodeIP, content, remotePath); err != nil {
+        if err := i.sshExecutor.Upload(ctx, nodeIP, content, remotePath); err != nil {
             return fmt.Errorf("failed to upload config %s to %s: %w", name, nodeIP, err)
         }
     }
     
     // 4. 执行安装脚本
-    result, err := i.sshClient.Execute(nodeIP, script)
+    result, err := i.sshExecutor.Execute(ctx, nodeIP, script)
     if err != nil {
         return fmt.Errorf("install script failed on %s: %w\nstdout: %s\nstderr: %s", 
             nodeIP, err, result.Stdout, result.Stderr)
@@ -2195,67 +2208,69 @@ func NewConfigRenderer(client client.Client) *ConfigRenderer {
     }
 }
 
-// RenderConfig 渲染配置文件模板
-func (r *ConfigRenderer) RenderConfig(ctx context.Context, template ConfigTemplateSpec, opts InstallOptions) ([]byte, error) {
+// RenderConfig 渲染单个配置文件模板 (统一入口，按 ConfigTemplateSpec 字段分发)
+// 所有 render* 子方法统一签名 (ctx, tmpl, tmplCtx)，消除原设计签名不一致问题
+func (r *ConfigRenderer) RenderConfig(ctx context.Context, tmpl ConfigTemplateSpec, tmplCtx manifest.TemplateContext) ([]byte, error) {
     switch {
-    case template.Content != "":
-        return r.renderContentTemplate(ctx, template, opts)
-    case template.SecretRef != nil:
-        return r.renderSecretTemplate(ctx, template, opts)
-    case template.KubeconfigTemplate != nil:
-        return r.renderKubeconfigTemplate(ctx, template, opts)
+    case tmpl.Content != "":
+        return r.renderContentTemplate(ctx, tmpl, tmplCtx)
+    case tmpl.SecretRef != nil:
+        return r.renderSecretTemplate(ctx, tmpl, tmplCtx)
+    case tmpl.KubeconfigTemplate != nil:
+        return r.renderKubeconfigTemplate(ctx, tmpl, tmplCtx)
     }
-    
     return nil, errors.New("no template content specified")
 }
 
 // renderContentTemplate 渲染内容模板 (使用 TemplateContext)
-func (r *ConfigRenderer) renderContentTemplate(content string, tmplCtx manifest.TemplateContext) ([]byte, error) {
-    tmpl, err := template.New("content").Funcs(r.funcMap).Parse(content)
+func (r *ConfigRenderer) renderContentTemplate(ctx context.Context, tmpl ConfigTemplateSpec, tmplCtx manifest.TemplateContext) ([]byte, error) {
+    t, err := template.New("content").Funcs(r.funcMap).Parse(tmpl.Content)
     if err != nil {
         return nil, fmt.Errorf("failed to parse template: %w", err)
     }
-    
     var buf bytes.Buffer
-    if err := tmpl.Execute(&buf, tmplCtx); err != nil {
+    if err := t.Execute(&buf, tmplCtx); err != nil {
         return nil, fmt.Errorf("failed to render template: %w", err)
     }
-    
     return buf.Bytes(), nil
 }
 
 // renderSecretTemplate 从 Secret 获取内容 (使用 TemplateContext 渲染 namespace)
-func (r *ConfigRenderer) renderSecretTemplate(secretRef *SecretRefSpec, tmplCtx manifest.TemplateContext) ([]byte, error) {
-    // 渲染 namespace 模板变量
-    namespace := r.renderTemplateString(secretRef.Namespace, tmplCtx)
-    
-    // 获取 Secret
+func (r *ConfigRenderer) renderSecretTemplate(ctx context.Context, tmpl ConfigTemplateSpec, tmplCtx manifest.TemplateContext) ([]byte, error) {
+    secretRef := tmpl.SecretRef
+    namespace, err := r.renderTemplateString(secretRef.Namespace, tmplCtx)
+    if err != nil {
+        return nil, fmt.Errorf("failed to render secret namespace: %w", err)
+    }
     secret := &corev1.Secret{}
-    if err := r.client.Get(context.Background(), types.NamespacedName{
+    if err := r.client.Get(ctx, types.NamespacedName{
         Name:      secretRef.Name,
         Namespace: namespace,
     }, secret); err != nil {
         return nil, fmt.Errorf("failed to get secret %s/%s: %w", namespace, secretRef.Name, err)
     }
-    
-    // 获取指定 key 的内容
     data, ok := secret.Data[secretRef.Key]
     if !ok {
         return nil, fmt.Errorf("key %s not found in secret %s/%s", secretRef.Key, namespace, secretRef.Name)
     }
-    
     return data, nil
 }
 
 // renderKubeconfigTemplate 动态生成 kubeconfig
-func (r *ConfigRenderer) renderKubeconfigTemplate(ctx context.Context, template ConfigTemplateSpec, tmplCtx manifest.TemplateContext) ([]byte, error) {
-    kc := template.KubeconfigTemplate
-    
-    // 解析模板变量 (使用 TemplateContext)
-    clusterName := r.renderTemplateString(kc.ClusterName, tmplCtx)
-    apiServer := r.renderTemplateString(kc.APIServer, tmplCtx)
-    namespace := r.renderTemplateString(kc.Namespace, tmplCtx)
-    
+func (r *ConfigRenderer) renderKubeconfigTemplate(ctx context.Context, tmpl ConfigTemplateSpec, tmplCtx manifest.TemplateContext) ([]byte, error) {
+    kc := tmpl.KubeconfigTemplate
+    clusterName, err := r.renderTemplateString(kc.ClusterName, tmplCtx)
+    if err != nil {
+        return nil, err
+    }
+    apiServer, err := r.renderTemplateString(kc.APIServer, tmplCtx)
+    if err != nil {
+        return nil, err
+    }
+    namespace, err := r.renderTemplateString(kc.Namespace, tmplCtx)
+    if err != nil {
+        return nil, err
+    }
     kubeconfig := clientcmdapi.Config{
         Kind:       "Config",
         APIVersion: "v1",
@@ -2280,38 +2295,35 @@ func (r *ConfigRenderer) renderKubeconfigTemplate(ctx context.Context, template 
         },
         CurrentContext: clusterName,
     }
-    
     return clientcmd.Write(kubeconfig)
 }
 
-// renderConfigTemplates 渲染配置文件模板 (使用 TemplateContext)
-func (r *ConfigRenderer) renderConfigTemplates(templates []ConfigTemplateSpec, tmplCtx manifest.TemplateContext) (map[string][]byte, error) {
+// renderTemplateString 渲染字符串中的模板变量 (返回 string + error，原设计漏报 error)
+func (r *ConfigRenderer) renderTemplateString(s string, tmplCtx manifest.TemplateContext) (string, error) {
+    if !strings.Contains(s, "{{") {
+        return s, nil
+    }
+    t, err := template.New("str").Funcs(r.funcMap).Parse(s)
+    if err != nil {
+        return "", fmt.Errorf("failed to parse string template: %w", err)
+    }
+    var buf bytes.Buffer
+    if err := t.Execute(&buf, tmplCtx); err != nil {
+        return "", fmt.Errorf("failed to render string template: %w", err)
+    }
+    return buf.String(), nil
+}
+
+// renderConfigTemplates 渲染配置文件模板列表 (使用 TemplateContext)
+func (r *ConfigRenderer) renderConfigTemplates(ctx context.Context, templates []ConfigTemplateSpec, tmplCtx manifest.TemplateContext) (map[string][]byte, error) {
     configs := make(map[string][]byte)
-    
     for _, tmpl := range templates {
-        var content []byte
-        var err error
-        
-        switch {
-        case tmpl.Content != "":
-            // Content 模式：使用 TemplateContext 渲染
-            content, err = r.renderContentTemplate(tmpl.Content, tmplCtx)
-        case tmpl.SecretRef != nil:
-            // SecretRef 模式：从 Secret 获取
-            content, err = r.renderSecretTemplate(tmpl.SecretRef, tmplCtx)
-        case tmpl.KubeconfigTemplate != nil:
-            // KubeconfigTemplate 模式：动态生成
-            content, err = r.renderKubeconfigTemplate(context.Background(), tmpl, tmplCtx)
-        default:
-            return nil, fmt.Errorf("no template content specified for %s", tmpl.Name)
-        }
-        
+        content, err := r.RenderConfig(ctx, tmpl, tmplCtx)
         if err != nil {
             return nil, fmt.Errorf("failed to render template %s: %w", tmpl.Name, err)
         }
         configs[tmpl.Name] = content
     }
-    
     return configs, nil
 }
 ```
@@ -2504,19 +2516,24 @@ func (r *ConfigRenderer) renderConfigTemplates(templates []ConfigTemplateSpec, t
 // HelmInstaller Helm 组件安装器
 type HelmInstaller struct {
     client     client.Client
+    clientset  kubernetes.Interface  // 目标集群 clientset，健康检查 (Pod/Endpoint) 用
+                                      // 注意: client.Client (controller-runtime) 无 CoreV1() 方法，
+                                      // 健康检查需 typed clientset，故单独注入
     restConfig *rest.Config
     cacheDir   string
     httpClient *http.Client
-    ociClient  *oci.Client
+    chartAuth  *kube.AuthConfig      // 镜像仓库认证，传给 kube.FetchChartUniversal
     logger     *bkev1beta1.BKELogger
 }
 
 // HelmInstallerConfig HelmInstaller 构建配置
 type HelmInstallerConfig struct {
     Client     client.Client
+    Clientset  kubernetes.Interface  // 目标集群 typed clientset
     RestConfig *rest.Config
     CacheDir   string
     HttpClient *http.Client
+    ChartAuth  *kube.AuthConfig      // 复用 pkg/kube.AuthConfig
     Logger     *bkev1beta1.BKELogger
 }
 
@@ -2524,10 +2541,11 @@ type HelmInstallerConfig struct {
 func NewHelmInstaller(cfg HelmInstallerConfig) *HelmInstaller {
     return &HelmInstaller{
         client:     cfg.Client,
+        clientset:  cfg.Clientset,
         restConfig: cfg.RestConfig,
         cacheDir:   cfg.CacheDir,
         httpClient: cfg.HttpClient,
-        ociClient:  oci.NewClient(cfg.RestConfig),
+        chartAuth:  cfg.ChartAuth,
         logger:     cfg.Logger,
     }
 }
@@ -2697,6 +2715,9 @@ func (i *HelmInstaller) upgrade(ctx context.Context, actionConfig *action.Config
 // runHealthCheck 执行 Helm 安装后的自定义健康检查
 // 与 Helm --wait 的关系: 两者同时生效, --wait 先执行 (Helm 命令内部),
 // 自定义 healthCheck 后执行 (Helm 命令返回后), 互补非互斥
+//
+// 复用共享 pkg/healthcheck 包 (与 ManifestComponentExecutor 共用)，
+// 此处仅做委托，避免与 YAML 执行器重复实现 PodReady/EndpointReady/Custom。
 func (i *HelmInstaller) runHealthCheck(
     ctx context.Context,
     hc HealthCheckSpec,
@@ -2775,7 +2796,8 @@ func (i *HelmInstaller) checkEndpointReady(
     ctx context.Context,
     spec *EndpointReadyCheckSpec,
 ) (bool, error) {
-    endpoints, err := i.client.CoreV1().Endpoints(spec.Namespace).Get(ctx, spec.ServiceName, metav1.GetOptions{})
+    // 使用 typed clientset (i.clientset)，而非 controller-runtime client (无 CoreV1())
+    endpoints, err := i.clientset.CoreV1().Endpoints(spec.Namespace).Get(ctx, spec.ServiceName, metav1.GetOptions{})
     if err != nil {
         return false, err
     }
@@ -2838,37 +2860,36 @@ func (i *HelmInstaller) rollback(ctx context.Context, actionConfig *action.Confi
     return nil
 }
 
-// getChartFromOCI 从 OCI Registry 拉取 Chart
-func (i *HelmInstaller) getChartFromOCI(ctx context.Context, oci *OCIChartSpec) (*chart.Chart, error) {
-    ref := fmt.Sprintf("%s:%s", oci.Repository, oci.Tag)
-    puller := ocipuller.New()
-    out, err := puller.Pull(ctx, ref)
-    if err != nil {
-        return nil, fmt.Errorf("failed to pull chart from OCI %s: %w", ref, err)
-    }
-    defer out.Close()
-    ch, err := loader.LoadArchive(out)
-    if err != nil {
-        return nil, fmt.Errorf("failed to load chart from OCI: %w", err)
-    }
-    return ch, nil
+// 复用现有 pkg/kube/chart.go 的 Chart 拉取能力，避免重复实现 OCI/HTTP/本地加载。
+//
+// 现有可复用函数 (pkg/kube/chart.go):
+//   - FetchChartUniversal(chartRepo, chartName, version, auth, logger) (*chart.Chart, error)
+//     支持 OCI Registry 与传统 HTTP 仓库，自动识别 oci:// 前缀 (chart.go:442-465)
+//   - FetchChartOCI(...) (chart.go:525-582)
+//   - FetchChartTraditional(...) (chart.go:688-728)
+//   - initActionConfig(namespace) (*action.Configuration, error) (chart.go:113-121)
+//   - releaseExists(actionConfig, releaseName, ns) (bool, error) (chart.go:123-136)
+//
+// HelmInstaller 不再直接调用 ocipuller/loader，而是通过 kube.FetchChartUniversal 拉取。
+// 这与现有 addon helm 部署链路 (pkg/kube/chart.go installChartAddon) 保持一致，
+// 后续可将 chart.go 中通用部分进一步抽取到 pkg/helminstaller 共享。
+
+// getChartFromOCI 从 OCI Registry 拉取 Chart (复用 kube.FetchChartOCI)
+func (i *HelmInstaller) getChartFromOCI(ctx context.Context, ociSpec *OCIChartSpec) (*chart.Chart, error) {
+    // 复用 pkg/kube/chart.go: FetchChartOCI(repository, tag, auth, logger)
+    // auth 来自集群镜像仓库认证配置 (由 HelmInstaller.chartAuth 提供)
+    return kube.FetchChartOCI(ociSpec.Repository, ociSpec.Tag, i.chartAuth, i.logger.NormalLogger)
 }
 
-// getChartFromURL 从 HTTP URL 下载 Chart
+// getChartFromURL 从 HTTP URL 下载 Chart (复用 kube.FetchChartTraditional)
 func (i *HelmInstaller) getChartFromURL(ctx context.Context, url string) (*chart.Chart, error) {
-    resp, err := i.httpClient.Get(url)
-    if err != nil {
-        return nil, fmt.Errorf("failed to download chart from %s: %w", url, err)
-    }
-    defer resp.Body.Close()
-    ch, err := loader.LoadArchive(resp.Body)
-    if err != nil {
-        return nil, fmt.Errorf("failed to load chart from URL: %w", err)
-    }
-    return ch, nil
+    // 复用 pkg/kube/chart.go: FetchChartTraditional(repo, name, version, auth, logger)
+    // url 形如 https://repo/charts/name-version.tgz，解析出 repo/name/version 后调用
+    repo, name, version := parseChartURL(url)
+    return kube.FetchChartTraditional(repo, name, version, i.chartAuth, i.logger.NormalLogger)
 }
 
-// getChartFromLocal 从本地路径加载 Chart
+// getChartFromLocal 从本地路径加载 Chart (复用 helm loader.Load)
 func (i *HelmInstaller) getChartFromLocal(ctx context.Context, path string) (*chart.Chart, error) {
     ch, err := loader.Load(path)
     if err != nil {
@@ -2877,13 +2898,13 @@ func (i *HelmInstaller) getChartFromLocal(ctx context.Context, path string) (*ch
     return ch, nil
 }
 
-// listPods 按标签选择器列出 Pod
+// listPods 按标签选择器列出 Pod (使用 typed clientset)
 func (i *HelmInstaller) listPods(ctx context.Context, namespace, labelSelector string) ([]corev1.Pod, error) {
     selector, err := labels.Parse(labelSelector)
     if err != nil {
         return nil, fmt.Errorf("invalid label selector %q: %w", labelSelector, err)
     }
-    podList, err := i.client.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+    podList, err := i.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
         LabelSelector: selector.String(),
     })
     if err != nil {
@@ -3265,16 +3286,16 @@ TemplateRenderer 支持 8 类 50+ 模板变量，覆盖集群、节点、版本�
 
 #### 2. 节点信息变量 (Node Variables)
 
-**设计说明**：节点变量仅包含基础信息（IP、Hostname、Role），不包含 Arch/OS/OSVersion。架构和操作系统信息由安装脚本在运行时自检测（通过 `uname -m` 和 `/etc/os-release`），而非模板渲染时注入。这样做的好处是：
-1. 简化 NodeProvider，无需 SSH 预检测
-2. 安装脚本可在任意节点上独立运行
-3. 减少模板变量，保持模板简洁
+**设计说明**：节点变量包含基础信息（IP、Hostname、Role）+ 架构（Arch）。**仅 Arch 作为模板变量注入**，因为制品 URL 含 `{{arch}}` 占位符（如 `containerd-{{version}}-linux-{{arch}}.tar.gz`），下载前必须解析——Arch 由 BinaryInstaller.Install() 通过 SSH `uname -m` 发现后填入 `.NodeArch`。OS/OSVersion 不作为模板变量，由安装脚本运行时自检测（`/etc/os-release`），因为二进制安装本身 OS 无关，仅少数脚本分支需要 OS。
+
+> 命名一致性：模板变量统一写作 `{{arch}}`（与 URL/resolveTemplate 一致），对应 `TemplateContext.NodeArch` 字段。全文 `{{arch}}` 与 `{{nodeArch}}` 视为同一变量，实现层以 `{{arch}}` 为准。
 
 | 变量 | 说明 | TemplateContext 字段 | 示例值 |
 |------|------|---------------------|--------|
 | `{{nodeIP}}` | 节点 IP | `.NodeIP` | `192.168.1.10` |
 | `{{nodeHostname}}` | 节点主机名 | `.NodeHostname` | `node-01` |
 | `{{nodeRole}}` | 节点角色 | `.NodeRole` | `master` / `worker` / `etcd` |
+| `{{arch}}` | 节点架构 (SSH 发现后注入) | `.NodeArch` | `amd64` / `arm64` |
 
 **脚本内自检测示例**（在 installScript 中使用，非模板变量）：
 ```bash
@@ -3750,64 +3771,112 @@ func (r *ExecutorRegistry) Has(componentType string) bool {
 
 #### 7.1.3 执行器分发实现
 
+**设计思路 - 彻底去除 phaseframe 依赖**：
+
+现有 `Scheduler.ExecuteDAG(ctx, phaseCtx *phaseframe.PhaseContext, ...)` 直接接收 phaseframe 类型，使 `pkg/dagexec` 被 phaseframe 绑定。重构后：
+
+1. `ExecuteDAG` 改为接收 phaseframe-free 的 `ExecutionContext`（由 controllers 层从 `phaseframe.PhaseContext` 构建适配，phaseframe 类型不进入 dagexec 包）。
+2. `InlinePhaseRunner`（签名含 `*phaseframe.PhaseContext`）替换为 phaseframe-free 的 `InlineRunner` 接口（见 7.3.3.4），由 controllers 层 `InlinePhaseRunnerAdapter` 桥接。
+3. 这样 `pkg/dagexec` 不再 import `pkg/phaseframe`，可独立编译测试。
+
+**设计思路 - 组件类型分发顺序（解决先有鸡还是先有蛋问题）**：
+
+`ExecutorRegistry` 按 `ComponentType` 分发，但类型信息在 `ComponentVersion.Spec.Type` 中，需先加载 CV。因此分发顺序为：
+1. `ComponentVersionStore.GetComponentVersion(name, version)` 加载 CV
+2. 按 `cv.Spec.Type` 从 `registry` 获取执行器
+3. 执行器从 `ExecutionContext` 取上下文执行
+
+`ComponentNode` 在 DAG 构建期（`pkg/topology`）已可从 bundle 解析出 `ComponentType`，可作为快速路径避免重复加载；若未填充则回退到 CV 加载。
+
 ```go
-// pkg/dagexec/scheduler.go 扩展
+// pkg/dagexec/scheduler.go 重构 (phaseframe-free)
+
+// ComponentVersionStore 加载 ComponentVersion (phaseframe-free)
+// 复用现有 pkg/release/manifest.Bundle 的能力，由 controllers 层提供适配实现
+type ComponentVersionStore interface {
+    GetComponentVersion(ctx context.Context, name, version string) (*configv1alpha1.ComponentVersion, error)
+}
+
+// ExecuteDAG 执行 DAG (phaseframe-free 入口)
+// execCtx 由 controllers 层从 phaseframe.PhaseContext 构建适配后传入
+func (s *Scheduler) ExecuteDAG(
+    ctx context.Context,
+    execCtx *ExecutionContext,
+    dag *topology.UpgradeDAG,
+) error {
+    batches := dag.TopologicalBatches()
+    for _, batch := range batches {
+        if err := s.executeBatchParallel(ctx, execCtx, batch); err != nil {
+            return err
+        }
+    }
+    return nil
+}
 
 // executeComponent 四路分发 (Feature Gate ON)
+// 不再接收 phaseCtx；类型从 ComponentVersionStore 加载或 node.ComponentType() 快速路径
 func (s *Scheduler) executeComponent(
     ctx context.Context,
-    phaseCtx *phaseframe.PhaseContext,
-    oldCluster, newCluster *bkev1beta1.BKECluster,
+    execCtx *ExecutionContext,
     node *topology.ComponentNode,
     tmpl manifest.TemplateContext,
 ) error {
-    // Feature Gate OFF: 回退到旧路径 (二路分发)
-    if !featuregate.Enabled(featuregate.BinaryComponentSupport) {
-        return s.executeComponentLegacy(ctx, phaseCtx, oldCluster, newCluster, node, tmpl)
+    // 1. 解析组件类型 (优先 node 快速路径，回退到 CV 加载)
+    componentType := ""
+    if t, ok := node.ComponentType(); ok {
+        componentType = string(t)
+    } else if s.cvStore != nil {
+        cv, err := s.cvStore.GetComponentVersion(ctx, node.Component.Name, node.Component.Version)
+        if err != nil {
+            return fmt.Errorf("failed to load ComponentVersion for %s: %w", node.Component.Name, err)
+        }
+        componentType = string(cv.Spec.Type)
     }
 
-    // Feature Gate ON: 四路分发
-    componentType := node.ComponentType()
+    // 2. Feature Gate OFF 或类型未注册: 回退到旧路径 (Inline 二路分发)
     executor, err := s.registry.Get(componentType)
     if err != nil {
-        // 未注册的类型回退到 Manifest 路径 (兼容未迁移的组件)
-        if s.registry.Has("yaml") {
-            return s.registry.Get("yaml").ExecuteComponent(ctx, node, s.buildExecutionContext(phaseCtx, node, tmpl))
-        }
-        return s.executeManifest(ctx, phaseCtx, node, tmpl)
+        return s.executeComponentLegacy(ctx, execCtx, node, tmpl)
     }
 
-    execCtx := s.buildExecutionContext(phaseCtx, node, tmpl)
+    // 3. 填充节点级 TemplateContext (ComponentVersion 等由 Executor 自行补全)
+    execCtx.TemplateContext = tmpl
     return executor.ExecuteComponent(ctx, node, execCtx)
 }
 
-// executeComponentLegacy 旧路径 (Feature Gate OFF 时的二路分发)
+// executeComponentLegacy 旧路径 (类型未注册时的二路分发，兼容未迁移组件)
 func (s *Scheduler) executeComponentLegacy(
     ctx context.Context,
-    phaseCtx *phaseframe.PhaseContext,
-    oldCluster, newCluster *bkev1beta1.BKECluster,
+    execCtx *ExecutionContext,
     node *topology.ComponentNode,
     tmpl manifest.TemplateContext,
 ) error {
     if node.Inline != nil {
-        return s.executeInline(phaseCtx, oldCluster, newCluster, node)
+        inlineExec := &InlineComponentExecutor{runner: s.inlineRunner}
+        return inlineExec.ExecuteComponent(ctx, node, execCtx)
     }
-    return s.executeManifest(ctx, phaseCtx, node, tmpl)
+    return s.executeManifest(ctx, execCtx, node, tmpl)
 }
+```
 
-// buildExecutionContext 从 PhaseContext 构建 ExecutionContext
-func (s *Scheduler) buildExecutionContext(
-    phaseCtx *phaseframe.PhaseContext,
-    node *topology.ComponentNode,
-    tmpl manifest.TemplateContext,
-) *ExecutionContext {
-    return &ExecutionContext{
-        Cluster:         phaseCtx.BKECluster,
-        NodeProvider:    s.nodeProvider,
-        Log:             phaseCtx.Log,
-        VersionContext:  s.buildVersionContext(phaseCtx),
-        TemplateContext: tmpl,
-    }
+**controllers 层桥接（phaseframe 仅存在于此）**：
+
+```go
+// controllers/capbke/bkecluster_upgrade_dag.go
+// buildExecutionContext 从 phaseframe.PhaseContext 构建 dagexec.ExecutionContext
+func (r *BKEClusterReconciler) buildExecutionContext(
+    ctx context.Context,
+    phaseCtx *phaseframe.PhaseContext,            // phaseframe 限定在 controllers 包
+    oldCluster, newCluster *bkev1beta1.BKECluster,
+    targetClient kubernetes.Interface,
+) *dagexec.ExecutionContext {
+    return dagexec.NewExecutionContext(
+        oldCluster, newCluster,
+        dagexec.NewBKENodeProvider(r.Client),
+        phaseCtx.Log,
+        phaseCtx.VersionContext,                  // 复用 upgrade.VersionContext
+        targetClient,
+    )
 }
 ```
 
@@ -3817,8 +3886,11 @@ func (s *Scheduler) buildExecutionContext(
 // pkg/dagexec/scheduler.go 扩展
 
 // Config 扩展: 新增 Binary/Helm/YAML 执行器依赖
+// 注意: InlineRunner 使用 dagexec.InlineRunner 接口 (phaseframe-free)，
+//       不再使用 dagexec.InlinePhaseRunner (其签名含 *phaseframe.PhaseContext)
 type Config struct {
-    InlineRunner        InlinePhaseRunner
+    InlineRunner        InlineRunner            // phaseframe-free, 由 controllers 适配
+    CVStore             ComponentVersionStore   // 加载 ComponentVersion (类型分发用)
     ManifestStore       manifest.Store
     ManifestApplier     manifest.Applier
     BinaryInstaller     BinaryInstaller       // 新增 (Feature Gate ON 时注入)
@@ -3842,32 +3914,33 @@ func NewScheduler(cfg Config) *Scheduler {
         runner: cfg.InlineRunner,
     })
 
-    // Binary 执行器: Feature Gate ON 且依赖已注入时注册
+    // Binary 执行器: 依赖已注入时注册 (Feature Gate 控制在 controllers 层是否注入)
     if cfg.BinaryInstaller != nil {
         registry.Register("binary", &BinaryComponentExecutor{
             installer: cfg.BinaryInstaller,
-            store:     cfg.ManifestStore,
+            cvStore:   cfg.CVStore,
         })
     }
 
-    // Helm 执行器: Feature Gate ON 且依赖已注入时注册
+    // Helm 执行器: 依赖已注入时注册
     if cfg.HelmInstaller != nil {
         registry.Register("helm", &HelmComponentExecutor{
             installer: cfg.HelmInstaller,
-            store:     cfg.ManifestStore,
+            cvStore:   cfg.CVStore,
         })
     }
 
-    // YAML 执行器: Feature Gate ON 且依赖已注入时注册
+    // YAML 执行器: 依赖已注入时注册
     if cfg.YAMLExecutor != nil {
         registry.Register("yaml", &ManifestComponentExecutor{
             applier: cfg.ManifestApplier,
-            store:   cfg.ManifestStore,
+            cvStore: cfg.CVStore,
         })
     }
 
     return &Scheduler{
-        InlineRunner:        cfg.InlineRunner,
+        inlineRunner:        cfg.InlineRunner,
+        cvStore:             cfg.CVStore,
         ManifestStore:       cfg.ManifestStore,
         ManifestApplier:     cfg.ManifestApplier,
         registry:            registry,
@@ -3895,7 +3968,7 @@ func NewScheduler(cfg Config) *Scheduler {
 // buildSchedulerConfig 构建 Scheduler Config (含 Feature Gate 条件构建)
 func (r *BKEClusterReconciler) buildSchedulerConfig(
     ctx context.Context,
-    phaseCtx *phaseframe.PhaseContext,
+    phaseCtx *phaseframe.PhaseContext,            // phaseframe 限定在 controllers 包
     oldCluster, newCluster *bkev1beta1.BKECluster,
     bundle *manifest.Bundle,
     factory *componentfactory.Factory,
@@ -3903,25 +3976,31 @@ func (r *BKEClusterReconciler) buildSchedulerConfig(
 ) dagexec.Config {
     // 基础依赖 (Feature Gate ON/OFF 均需要)
     cfg := dagexec.Config{
-        InlineRunner:        &componentfactory.PhaseRunner{Factory: factory},
-        ManifestStore:       manifest.NewBundleStore(bundle),
-        ManifestApplier:     r.buildManifestApplier(ctx, phaseCtx, newCluster, bkeLogger),
+        // InlineRunner: 通过适配器把 componentfactory.PhaseRunner (phaseframe-bound)
+        // 适配为 dagexec.InlineRunner (phaseframe-free)
+        InlineRunner:    NewInlinePhaseRunnerAdapter(phaseCtx, &componentfactory.PhaseRunner{Factory: factory}),
+        CVStore:         NewBundleCVStore(bundle),  // 适配 pkg/release/manifest.Bundle
+        ManifestStore:   manifest.NewBundleStore(bundle),
+        ManifestApplier: r.buildManifestApplier(ctx, phaseCtx, newCluster, bkeLogger),
         MaxParallelPerBatch: 0, // 0 = defaultMaxParallelPerBatch (8)
     }
 
     // Feature Gate ON: 构建 Binary/Helm/YAML 执行器依赖
-    if featuregate.Enabled(featuregate.BinaryComponentSupport) {
+    // 使用现有 pkg/featuregate 的注解/flag 模式 (见 10.2)，而非 featuregate.Enabled(string)
+    if featuregate.BinaryComponentEnabled(newCluster) {
         // 1. 共享依赖
         cfg.NodeProvider = dagexec.NewBKENodeProvider(r.Client)
         httpClient := &http.Client{Timeout: 5 * time.Minute}
         templateRenderer := binaryinstaller.NewTemplateRenderer()
         configRenderer := binaryinstaller.NewConfigRenderer(r.Client)
 
-        // 2. BinaryInstaller (依赖: SSH client + 缓存 + 渲染器)
+        // 2. BinaryInstaller (依赖: SSH 适配器 + 缓存 + 渲染器)
+        // SshClient 字段类型为 binaryinstaller.SSHExecutor 接口 (见 4.3)，
+        // 由 NewMultiCliSSHAdapter 包装 bkessh.MultiCli 提供
         cfg.BinaryInstaller = binaryinstaller.NewBinaryInstaller(
             binaryinstaller.BinaryInstallerConfig{
                 Client:         r.Client,
-                SshClient:      r.sshClient,       // 从 reconciler 注入 (已有 SSH 连接池)
+                SshExecutor:    NewMultiCliSSHAdapter(r.sshClient),  // 适配 bkessh.MultiCli
                 CacheDir:       "/var/cache/bke/artifacts",
                 HttpClient:     httpClient,
                 Renderer:       templateRenderer,   // 无状态引擎, 全局共享
@@ -3930,7 +4009,7 @@ func (r *BKEClusterReconciler) buildSchedulerConfig(
             },
         )
 
-        // 3. HelmInstaller (依赖: RestConfig + HTTP + OCI)
+        // 3. HelmInstaller (依赖: RestConfig + HTTP + 复用 pkg/kube/chart.go)
         cfg.HelmInstaller = helminstaller.NewHelmInstaller(
             helminstaller.HelmInstallerConfig{
                 Client:     r.Client,
@@ -3966,7 +4045,10 @@ func (r *BKEClusterReconciler) buildSchedulerAndExecute(
 ) error {
     cfg := r.buildSchedulerConfig(ctx, phaseCtx, oldCluster, newCluster, bundle, factory, bkeLogger)
     sched := dagexec.NewScheduler(cfg)
-    return sched.ExecuteDAG(ctx, phaseCtx, oldCluster, newCluster, dag)
+    // 构建 phaseframe-free ExecutionContext，DAG 入参不再含 phaseframe 类型
+    targetClient, _ := r.buildTargetClientset(ctx, newCluster)
+    execCtx := r.buildExecutionContext(ctx, phaseCtx, oldCluster, newCluster, targetClient)
+    return sched.ExecuteDAG(ctx, execCtx, dag)
 }
 ```
 
@@ -4142,70 +4224,55 @@ func (r *BKEClusterReconciler) buildSchedulerAndExecute(
 ```go
 // pkg/dagexec/context.go
 
-// VersionContext 携带组件版本事实，Executor 据此自主决定操作类型
-type VersionContext struct {
-    // currentVersions 组件已安装版本映射 (componentName → currentVersion)
-    // 空表示组件未安装
-    currentVersions map[string]string
-
-    // targetVersions 组件目标版本映射 (componentName → targetVersion)
-    // 空表示组件无升级目标
-    targetVersions map[string]string
-}
-
-// HasCurrent 组件是否已安装
-func (vc *VersionContext) HasCurrent(name string) bool {
-    return vc != nil && vc.currentVersions != nil
-    _, ok := vc.currentVersions[name]
-    return ok
-}
-
-// HasTarget 组件是否有升级目标
-func (vc *VersionContext) HasTarget(name string) bool {
-    if vc == nil || vc.targetVersions == nil {
-        return false
-    }
-    _, ok := vc.targetVersions[name]
-    return ok
-}
-
-// NeedsUpgrade 组件是否需要升级 (已安装且目标版本不同于当前版本)
-func (vc *VersionContext) NeedsUpgrade(name string) bool {
-    if vc == nil {
-        return true
-    }
-    current, hasCurrent := vc.currentVersions[name]
-    target, hasTarget := vc.targetVersions[name]
-    if !hasTarget {
-        return true // 无目标版本，默认需要执行
-    }
-    if !hasCurrent {
-        return true // 未安装，需要安装
-    }
-    return current != target // 版本不同，需要升级
-}
-
-// CurrentVersion 获取组件当前已安装版本
-func (vc *VersionContext) CurrentVersion(name string) (string, bool) {
-    if vc == nil || vc.currentVersions == nil {
-        return "", false
-    }
-    v, ok := vc.currentVersions[name]
-    return v, ok
-}
-
-// TargetVersion 获取组件目标版本
-func (vc *VersionContext) TargetVersion(name string) (string, bool) {
-    if vc == nil || vc.targetVersions == nil {
-        return "", false
-    }
-    v, ok := vc.targetVersions[name]
-    return v, ok
-}
+// 复用 pkg/upgrade.VersionContext，不在 dagexec 内重复定义。
+//
+// 现有 pkg/upgrade/context.go 已定义 VersionContext:
+//   type VersionContext struct {
+//       Current map[string]string  // 已安装版本 (componentName → currentVersion)
+//       Target  map[string]string  // 目标版本 (componentName → targetVersion)
+//   }
+// 并已实现 SetCurrent/SetTarget/GetCurrent/GetTarget/HasTarget/NeedsUpgrade/
+//   AnyTargetNeedsUpgrade/TargetNames 等方法。
+//
+// 现有 PhaseContext.VersionContext 字段亦使用此类型 (pkg/phaseframe/context.go)，
+// 设计文档与实现保持一致，复用避免概念重复。
+//
+// 注意: 现有 pkg/upgrade.VersionContext 暂未提供 HasCurrent/CurrentVersion 方法，
+// 需在 pkg/upgrade/context.go 中补充:
+//   func (vc *VersionContext) HasCurrent(name string) bool {
+//       if vc == nil { return false }
+//       _, ok := vc.Current[name]
+//       return ok
+//   }
+//   func (vc *VersionContext) CurrentVersion(name string) (string, bool) {
+//       if vc == nil { return "", false }
+//       v, ok := vc.Current[name]
+//       return v, ok
+//   }
+//   func (vc *VersionContext) TargetVersion(name string) (string, bool) {
+//       if vc == nil { return "", false }
+//       v, ok := vc.Target[name]
+//       return v, ok
+//   }
+// NeedsUpgrade 的语义须满足 Executor 决策需要:
+//   - vc == nil 或无 Target 记录: 返回 true (默认需要执行)
+//   - 无 Current 记录: 返回 true (未安装, 需要安装)
+//   - Current != Target: 返回 true (版本不同, 需要升级)
+//   - 否则: 返回 false (已在目标版本, 跳过)
+// 若现有 NeedsUpgrade 实现与此语义不符，需在 pkg/upgrade 中对齐。
 
 // ExecutionContext 组件执行上下文 (完全独立于 phaseframe)
+//
+// 设计说明:
+// - 不引用 phaseframe 任何类型；Inline 路径通过 InlineRunner 接口桥接
+//   (见 7.3.3.4)，由 controllers 层提供适配实现
+// - OldCluster 供 InlineComponentExecutor 调用 InlineRunner.Execute 时传入
+// - TargetClient 供 Helm/YAML 健康检查访问目标集群 (Pod/Endpoint)
 type ExecutionContext struct {
-    // 集群信息
+    // 旧集群状态 (Inline 执行器需要，对应原 InlinePhaseRunner.Execute 的 oldCluster 参数)
+    OldCluster *bkev1beta1.BKECluster
+
+    // 新集群状态 (期望状态)
     Cluster *bkev1beta1.BKECluster
 
     // 节点提供者 (抽象接口，不依赖 phaseframe)
@@ -4214,25 +4281,32 @@ type ExecutionContext struct {
     // 日志记录器
     Log *bkev1beta1.BKELogger
 
-    // 版本上下文 (替代 IsUpgrade bool，携带版本事实供 Executor 自主决定操作)
-    VersionContext *VersionContext
+    // 版本上下文 (复用 pkg/upgrade.VersionContext，携带版本事实供 Executor 自主决定操作)
+    VersionContext *upgrade.VersionContext
 
     // 模板上下文 (复用 manifest.TemplateContext)
     TemplateContext manifest.TemplateContext
+
+    // 目标集群 Kubernetes clientset (Helm/YAML 健康检查用)
+    // 由 Scheduler 从 manifest.ClusterApplier 复用的远端 client 注入
+    TargetClient kubernetes.Interface
 }
 
 // NewExecutionContext 创建执行上下文
 func NewExecutionContext(
-    cluster *bkev1beta1.BKECluster,
+    oldCluster, cluster *bkev1beta1.BKECluster,
     nodeProvider NodeProvider,
     log *bkev1beta1.BKELogger,
-    versionContext *VersionContext,
+    versionContext *upgrade.VersionContext,
+    targetClient kubernetes.Interface,
 ) *ExecutionContext {
     return &ExecutionContext{
-        Cluster:        cluster,
-        NodeProvider:   nodeProvider,
-        Log:            log,
-        VersionContext: versionContext,
+        OldCluster:      oldCluster,
+        Cluster:         cluster,
+        NodeProvider:    nodeProvider,
+        Log:             log,
+        VersionContext:  versionContext,
+        TargetClient:    targetClient,
     }
 }
 ```
@@ -4374,7 +4448,7 @@ type ComponentExecutor interface {
 // BinaryComponentExecutor 二进制组件执行器
 type BinaryComponentExecutor struct {
     installer *binaryinstaller.BinaryInstaller
-    store     *manifest.Store
+    cvStore   ComponentVersionStore  // 加载 ComponentVersion (替代 *manifest.Store)
 }
 
 func (e *BinaryComponentExecutor) GetComponentType() ComponentType {
@@ -4422,8 +4496,8 @@ DAG 层: Batch 1 [containerd, bkeagent] → Batch 2 [coredns]  (组件间并行)
 func (e *BinaryComponentExecutor) ExecuteComponent(ctx context.Context, node *ComponentNode, execCtx *ExecutionContext) error {
     component := node.Component
     
-    // 1. 获取 ComponentVersion
-    cv, err := e.store.GetComponentVersion(component.Name, component.Version)
+    // 1. 获取 ComponentVersion (通过 ComponentVersionStore)
+    cv, err := e.cvStore.GetComponentVersion(ctx, component.Name, component.Version)
     if err != nil {
         return fmt.Errorf("failed to get component version: %w", err)
     }
@@ -4661,7 +4735,7 @@ Helm 组件通过 Helm SDK 部署到目标集群（`helm install/upgrade`），�
 // HelmComponentExecutor Helm 组件执行器
 type HelmComponentExecutor struct {
     installer *helminstaller.HelmInstaller
-    store     *manifest.Store
+    cvStore   ComponentVersionStore  // 加载 ComponentVersion (替代 *manifest.Store)
 }
 
 func (e *HelmComponentExecutor) GetComponentType() ComponentType {
@@ -4672,8 +4746,8 @@ func (e *HelmComponentExecutor) GetComponentType() ComponentType {
 func (e *HelmComponentExecutor) ExecuteComponent(ctx context.Context, node *ComponentNode, execCtx *ExecutionContext) error {
     component := node.Component
     
-    // 1. 获取 ComponentVersion
-    cv, err := e.store.GetComponentVersion(component.Name, component.Version)
+    // 1. 获取 ComponentVersion (通过 ComponentVersionStore，manifest.Store 无此方法)
+    cv, err := e.cvStore.GetComponentVersion(ctx, component.Name, component.Version)
     if err != nil {
         return fmt.Errorf("failed to get component version: %w", err)
     }
@@ -4763,9 +4837,16 @@ YAML 组件通过 K8s API 应用清单（ServerSideApply/Replace/CreateOnly）�
 
 ```go
 // ManifestComponentExecutor YAML/Manifest 组件执行器
+//
+// 字段类型说明:
+// - applier 为 manifest.Applier 接口 (非指针)；现有 manifest.ClusterApplier 实现该接口
+// - cvStore 为 ComponentVersionStore 接口，用于加载 ComponentVersion
+//   (manifest.Store 接口仅有 GetComponentManifests，无 GetComponentVersion)
+// - 清单数据通过 releasemanifest.CollectComponentManifests(bundle, name, version)
+//   收集后，由 manifest.ClusterApplier.ApplyComponent 应用
 type ManifestComponentExecutor struct {
-    applier *manifest.Applier
-    store   *manifest.Store
+    applier manifest.Applier          // 接口类型，非 *manifest.Applier
+    cvStore ComponentVersionStore
 }
 
 func (e *ManifestComponentExecutor) GetComponentType() ComponentType {
@@ -4776,8 +4857,8 @@ func (e *ManifestComponentExecutor) GetComponentType() ComponentType {
 func (e *ManifestComponentExecutor) ExecuteComponent(ctx context.Context, node *ComponentNode, execCtx *ExecutionContext) error {
     component := node.Component
     
-    // 1. 获取 ComponentVersion
-    cv, err := e.store.GetComponentVersion(component.Name, component.Version)
+    // 1. 获取 ComponentVersion (通过 ComponentVersionStore)
+    cv, err := e.cvStore.GetComponentVersion(ctx, component.Name, component.Version)
     if err != nil {
         return fmt.Errorf("failed to get component version: %w", err)
     }
@@ -4795,10 +4876,16 @@ func (e *ManifestComponentExecutor) ExecuteComponent(ctx context.Context, node *
     }
     
     // 4. 构建 ComponentPackage
+    // 注意: manifest.ComponentPackage (pkg/manifest/types.go:18-22) 字段为
+    //       Name/Version/Manifests [][]byte，无 Resources 字段。
+    // 清单字节由 releasemanifest.CollectComponentManifests(bundle, name, version) 收集
+    // (含 cv.Spec.Resources[].Manifest 内联清单)，再填入 ComponentPackage.Manifests。
+    // 若需直接应用 Resources，应在 pkg/manifest/types.go 扩展 ComponentPackage 字段，
+    // 或由 cvStore 实现层完成收集。
     pkg := &manifest.ComponentPackage{
         Name:      component.Name,
         Version:   component.Version,
-        Resources: cv.Spec.Resources,
+        Manifests: collectManifestsFor(cv),  // 收集 cv.Spec.YAML.Manifests + cv.Spec.Resources
     }
     
     // 5. 应用 Manifest
@@ -4807,126 +4894,39 @@ func (e *ManifestComponentExecutor) ExecuteComponent(ctx context.Context, node *
     }
     
     // 6. 健康检查 (应用清单后验证 Pod/Endpoint 就绪)
+    // 复用共享 pkg/healthcheck 包 (见本节末尾)，避免与 HelmInstaller 重复
     if cv.Spec.YAML != nil && cv.Spec.YAML.HealthCheck != nil && cv.Spec.YAML.HealthCheck.Enabled {
-        if err := e.runHealthCheck(ctx, cv.Spec.YAML.HealthCheck, execCtx); err != nil {
+        if err := healthcheck.Run(ctx, execCtx.TargetClient, *cv.Spec.YAML.HealthCheck); err != nil {
             return fmt.Errorf("health check failed for %s: %w", component.Name, err)
         }
     }
     
     return nil
 }
+```
 
-// runHealthCheck 等待 Pod Ready / Endpoint Ready / Custom 检查通过
-// 复用 Helm 健康检查逻辑 (PodReady/EndpointReady/Custom 三种检查类型)
-func (e *ManifestComponentExecutor) runHealthCheck(
-    ctx context.Context,
-    hc *HealthCheckSpec,
-    execCtx *ExecutionContext,
-) error {
-    timeout := parseDurationDefault(hc.Timeout, 3*time.Minute)
-    interval := parseDurationDefault(hc.Interval, 5*time.Second)
-    deadline := time.Now().Add(timeout)
-
-    for time.Now().Before(deadline) {
-        allReady := true
-        for _, check := range hc.Checks {
-            switch check.Type {
-            case "PodReady":
-                if check.PodReady == nil {
-                    return fmt.Errorf("PodReady check requires 'podReady' config")
-                }
-                ready, err := e.checkPodReady(ctx, check.PodReady, execCtx)
-                if err != nil || !ready {
-                    allReady = false
-                }
-            case "EndpointReady":
-                if check.EndpointReady == nil {
-                    return fmt.Errorf("EndpointReady check requires 'endpointReady' config")
-                }
-                ready, err := e.checkEndpointReady(ctx, check.EndpointReady, execCtx)
-                if err != nil || !ready {
-                    allReady = false
-                }
-            case "Custom":
-                if check.Custom == nil {
-                    return fmt.Errorf("Custom check requires 'custom' config")
-                }
-                ready, err := e.checkCustom(ctx, check.Custom)
-                if err != nil || !ready {
-                    allReady = false
-                }
-            }
-        }
-        if allReady {
-            return nil
-        }
-        time.Sleep(interval)
-    }
-
-    return fmt.Errorf("health check timed out after %s", timeout)
-}
-
-// checkCustom 执行自定义检查命令 (在控制器 Pod 中执行, 退出码 0 = 通过)
-func (e *ManifestComponentExecutor) checkCustom(
-    ctx context.Context,
-    spec *CustomCheckSpec,
-) (bool, error) {
-    cmd := exec.CommandContext(ctx, "/bin/sh", "-c", spec.Command)
-    if err := cmd.Run(); err != nil {
-        return false, nil // 非零退出码 = 未就绪
-    }
-    return true, nil
-}
-
-// checkPodReady 检查 Pod Ready 状态 (支持 minReady 部分就绪)
-func (e *ManifestComponentExecutor) checkPodReady(
-    ctx context.Context,
-    spec *PodReadyCheckSpec,
-    execCtx *ExecutionContext,
-) (bool, error) {
-    selector, err := labels.Parse(spec.LabelSelector)
-    if err != nil {
-        return false, fmt.Errorf("invalid label selector %q: %w", spec.LabelSelector, err)
-    }
-    podList, err := execCtx.ClusterClient.CoreV1().Pods(spec.Namespace).List(ctx, metav1.ListOptions{
-        LabelSelector: selector.String(),
-    })
-    if err != nil {
-        return false, err
-    }
-    minReady := int(spec.MinReady)
-    if minReady == 0 {
-        minReady = len(podList.Items)
-    }
-    readyCount := 0
-    for _, pod := range podList.Items {
-        for _, cond := range pod.Status.Conditions {
-            if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
-                readyCount++
-                break
-            }
-        }
-    }
-    return readyCount >= minReady, nil
-}
-
-// checkEndpointReady 检查 Service Endpoint 是否有就绪端点
-func (e *ManifestComponentExecutor) checkEndpointReady(
-    ctx context.Context,
-    spec *EndpointReadyCheckSpec,
-    execCtx *ExecutionContext,
-) (bool, error) {
-    endpoints, err := execCtx.ClusterClient.CoreV1().Endpoints(spec.Namespace).Get(ctx, spec.ServiceName, metav1.GetOptions{})
-    if err != nil {
-        return false, err
-    }
-    for _, subset := range endpoints.Subsets {
-        if len(subset.Addresses) > 0 {
-            return true, nil
-        }
-    }
-    return false, nil
-}
+// 健康检查逻辑抽取到共享包 pkg/healthcheck，ManifestComponentExecutor 与
+// HelmInstaller 共用，避免重复实现 (PodReady/EndpointReady/Custom)。
+//
+// 共享接口:
+//   pkg/healthcheck/healthcheck.go
+//   func Run(ctx context.Context, client kubernetes.Interface, hc HealthCheckSpec) error
+//
+// Run 内部按 hc.Checks 遍历执行 PodReady/EndpointReady/Custom 检查，重试到超时。
+// - PodReady: clientset.CoreV1().Pods(ns).List(labelSelector)
+// - EndpointReady: clientset.CoreV1().Endpoints(ns).Get(serviceName)
+// - Custom: exec.CommandContext("/bin/sh","-c",command)
+//
+// ManifestComponentExecutor 调用 (见 ExecuteComponent 第 6 步):
+//   healthcheck.Run(ctx, execCtx.TargetClient, *cv.Spec.YAML.HealthCheck)
+//
+// HelmInstaller 同样改为调用 healthcheck.Run(ctx, i.clientset, helm.HealthCheck)，
+// 删除其内部 runHealthCheck/checkPodReady/checkEndpointReady/checkCustom，
+// 消除两处几乎相同的实现 (原设计 M3 问题)。
+//
+// HealthCheckSpec/PodReadyCheckSpec/EndpointReadyCheckSpec/CustomCheckSpec 等
+// 类型定义应迁移到 pkg/healthcheck/types.go，供 Helm/YAML 共用；
+// api/v1alpha1 的 CRD 类型可内嵌或别名这些类型。
 ```
 
 ##### 7.3.3.4 InlineComponentExecutor
@@ -4950,11 +4950,25 @@ Inline 组件通过 `ComponentFactory` 注册的 handler 执行（如 `EnsureMas
 Inline 原有逻辑通过 `phaseframe.Phase` 执行，适配为 `ComponentExecutor` 后可统一注册到 `ExecutorRegistry`，由 DAG Scheduler 统一调度，无需为 Inline 类型走独立的调度路径。
 
 ```go
+// InlineRunner 内联组件执行接口 (不依赖 phaseframe)
+//
+// 设计思路 - 为什么新增此接口而非复用 dagexec.InlinePhaseRunner:
+// 现有 dagexec.InlinePhaseRunner.Execute(phaseCtx *phaseframe.PhaseContext, ...)
+// 的签名直接引用 phaseframe.PhaseContext，使 pkg/dagexec 被 phaseframe 绑定。
+// 为彻底解耦，dagexec 定义此 phaseframe-free 接口；由 controllers 层提供
+// 适配实现 (InlinePhaseRunnerAdapter)，内部桥接 componentfactory.PhaseRunner
+// (其实现仍用 phaseframe.Phase，但适配器把 phaseframe 类型限定在 controllers 包内)。
+//
+// 这样 pkg/dagexec 不再 import pkg/phaseframe，可独立编译与测试。
+type InlineRunner interface {
+    Execute(ctx context.Context, oldCluster, newCluster *bkev1beta1.BKECluster, handler, version string) error
+}
+
 // InlineComponentExecutor 内联组件执行器
 // Inline 组件通过 ComponentFactory 注册的 handler 执行, 无需制品下载/模板渲染
 // 适配 ComponentExecutor 接口, 统一通过 DAG 调度
 type InlineComponentExecutor struct {
-    runner InlinePhaseRunner
+    runner InlineRunner
 }
 
 func (e *InlineComponentExecutor) GetComponentType() ComponentType {
@@ -4981,13 +4995,31 @@ func (e *InlineComponentExecutor) ExecuteComponent(
 
     // Inline 执行器需要 oldCluster/newCluster, 从 ExecutionContext 获取
     // Inline 不使用 VersionContext (由 Phase 自身的 NeedExecute 逻辑决定是否执行)
-    return e.runner.Execute(
-        execCtx.PhaseContext,
-        execCtx.OldCluster,
-        execCtx.Cluster,
-        handler,
-        version,
-    )
+    // 不再传递 phaseframe.PhaseContext；所需依赖由 InlineRunner 适配实现自行注入
+    return e.runner.Execute(ctx, execCtx.OldCluster, execCtx.Cluster, handler, version)
+}
+```
+
+**controllers 层适配实现示例** (phaseframe 类型仅出现在此适配层，不泄漏到 dagexec):
+
+```go
+// controllers/capbke/inline_runner_adapter.go
+package capbke
+
+// InlinePhaseRunnerAdapter 把 componentfactory.PhaseRunner (依赖 phaseframe)
+// 适配为 dagexec.InlineRunner (phaseframe-free)。
+type InlinePhaseRunnerAdapter struct {
+    phaseCtx *phaseframe.PhaseContext   // phaseframe 限定在 controllers 包内
+    runner   *componentfactory.PhaseRunner
+}
+
+func NewInlinePhaseRunnerAdapter(phaseCtx *phaseframe.PhaseContext, runner *componentfactory.PhaseRunner) *InlinePhaseRunnerAdapter {
+    return &InlinePhaseRunnerAdapter{phaseCtx: phaseCtx, runner: runner}
+}
+
+// Execute 实现 dagexec.InlineRunner，桥接回 phaseframe.PhaseContext
+func (a *InlinePhaseRunnerAdapter) Execute(ctx context.Context, oldCluster, newCluster *bkev1beta1.BKECluster, handler, version string) error {
+    return a.runner.Execute(a.phaseCtx, oldCluster, newCluster, handler, version)
 }
 ```
 
@@ -5385,23 +5417,48 @@ func parseDurationDefault(s string, defaultVal time.Duration) time.Duration {
 
 ### 10.2 Feature Gate 定义
 
+**设计思路 - 复用现有 `pkg/featuregate` 注解/flag 模式**：
+
+现有 `pkg/featuregate/features.go` 并非 Kubernetes 标准 `featuregate.MutableFeatureGate` 注册表，而是"注解 + 全局 flag"模式：
+- `DeclarativeUpgradeEnabled(obj client.Object) bool`：全局 `config.DeclarativeUpgrade` 为 true **或** 对象带 `DeclarativeUpgradeAnnotationKey: "true"` 注解时启用。
+- `UpgradeReady(obj client.Object) (string, bool)`：读取 `CVOUpgradeReady` 注解。
+
+本设计沿用同一模式新增 Binary/Helm 开关，**不**引入 `featuregate.Enabled(string)` 这种与现有包不符的 API（原设计此处不符）。
+
 ```go
-// pkg/featuregate/features.go
+// pkg/featuregate/features.go 扩展
 
 const (
-    // BinaryComponentSupport 启用二进制组件支持
-    BinaryComponentSupport = "BinaryComponentSupport"
-    
-    // HelmComponentSupport 启用 Helm 组件支持
-    HelmComponentSupport = "HelmComponentSupport"
+    // BinaryComponentAnnotationKey 控制是否启用 Binary 组件 (BinaryInstaller) 路径
+    // 注解值为 "true" 时启用；未设置时回退到全局 flag
+    BinaryComponentAnnotationKey = "cvo.openfuyao.cn/binary-component"
+
+    // HelmComponentAnnotationKey 控制是否启用 Helm 组件 (HelmInstaller) 路径
+    HelmComponentAnnotationKey = "cvo.openfuyao.cn/helm-component"
 )
 
-// 默认关闭
-var defaultFeatureGates = map[string]bool{
-    BinaryComponentSupport: false,
-    HelmComponentSupport:   false,
+// BinaryComponentEnabled 判断是否启用 Binary 组件路径
+// 优先级: 对象注解 "true" > 全局 config.BinaryComponentSupport flag > false
+// 与现有 DeclarativeUpgradeEnabled 模式一致
+func BinaryComponentEnabled(obj client.Object) bool {
+    if annotations.Has(obj, BinaryComponentAnnotationKey) {
+        return annotations.Get(obj, BinaryComponentAnnotationKey) == "true"
+    }
+    return config.BinaryComponentSupport // 全局 flag (utils/capbke/config)
+}
+
+// HelmComponentEnabled 判断是否启用 Helm 组件路径
+func HelmComponentEnabled(obj client.Object) bool {
+    if annotations.Has(obj, HelmComponentAnnotationKey) {
+        return annotations.Get(obj, HelmComponentAnnotationKey) == "true"
+    }
+    return config.HelmComponentSupport
 }
 ```
+
+**调用方式对齐**：原设计中 `featuregate.Enabled(featuregate.BinaryComponentSupport)` 改为 `featuregate.BinaryComponentEnabled(cluster)`（见 7.1.4 `buildSchedulerConfig`、10.3.5 `getK8sEnvInitScope`）。
+
+**全局 flag 注册**：在 `utils/capbke/config` 中新增 `BinaryComponentSupport`/`HelmComponentSupport` bool 变量，与现有 `DeclarativeUpgrade` 一致，通过控制器启动参数注入。
 
 ### 10.3 containerd 重构详细设计
 
@@ -5649,9 +5706,10 @@ containerd 作为独立 DAG 节点：
 
 // getK8sEnvInitScope 动态构建 K8sEnvInit 的 scope
 // Feature Gate ON 时移除 runtime（containerd 由 BinaryInstaller 安装）
+// 复用 pkg/featuregate.BinaryComponentEnabled(cluster) 注解/flag 模式 (见 10.2)
 func (e *ENV) getK8sEnvInitScope() string {
     scopes := []string{"time", "hosts", "dns", "kernel", "firewall", "selinux", "swap", "httpRepo"}
-    if !featuregate.Enabled(featuregate.BinaryComponentSupport) {
+    if !featuregate.BinaryComponentEnabled(e.bkeCluster) {
         scopes = append(scopes, "runtime") // 旧路径: bkeagent 内置命令安装 containerd
     }
     scopes = append(scopes, "iptables", "registry", "extra")
@@ -5661,7 +5719,7 @@ func (e *ENV) getK8sEnvInitScope() string {
 // getResetScope 动态构建 Reset 的 scope
 func (e *ENV) getResetScope() string {
     if e.DeepRestore {
-        if featuregate.Enabled(featuregate.BinaryComponentSupport) {
+        if featuregate.BinaryComponentEnabled(e.bkeCluster) {
             return "scope=cert,manifests,container,kubelet,extra"
         }
         return "scope=cert,manifests,container,kubelet,containerRuntime,extra"
@@ -5680,8 +5738,9 @@ func (e *ENV) getResetScope() string {
 兼容层入口：
 ```go
 // 兼容层: EnsureContainerdUpgrade Phase 根据Feature Gate选择路径
+// 复用 featuregate.BinaryComponentEnabled(bkeCluster) (注解/flag 模式)
 func (e *EnsureContainerdUpgrade) Execute() (ctrl.Result, error) {
-    if featuregate.Enabled(featuregate.BinaryComponentSupport) {
+    if featuregate.BinaryComponentEnabled(e.Ctx.BKECluster) {
         // 新路径: 不执行任何操作，containerd 升级由 DAG 中的 binary 节点处理
         return ctrl.Result{}, nil
     }
