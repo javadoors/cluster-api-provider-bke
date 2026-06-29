@@ -500,15 +500,10 @@ type ArtifactSpec struct {
     Checksum string `json:"checksum"`
     
     // 安装路径 (per-artifact, 不同 artifact 可安装到不同路径)
-    // 通过 {{artifact.<name>.installPath}} 模板变量在 installScript 中引用
-    // 例如: containerd tar.gz → "/usr/local", runc → "/usr/local/sbin"
+    // 对于归档文件: 解压到此路径 (如 "/" 表示解压到根目录)
+    // 对于单文件: 复制到此路径
+    // installScript 负责所有安装细节 (chmod、移动文件、创建目录等)
     InstallPath string `json:"installPath"`
-    
-    // 可执行文件名 (解压后的二进制文件名, 通过 {{artifact.<name>.executable}} 引用)
-    // 与 Name 的区别: Name 是制品在 artifacts 列表中的标识, Executable 是解压后实际的文件名
-    // 多数情况下 Name == Executable, 但当 tar.gz 内部文件名与制品名不同时需显式指定
-    // installScript 中用于: chmod +x {{artifact.<name>.installPath}}/bin/{{artifact.<name>.executable}}
-    Executable string `json:"executable,omitempty"`
 }
 
 // ConfigTemplateSpec 定义配置文件模板规格
@@ -1018,8 +1013,6 @@ spec:
                           checksum:
                             type: string
                           installPath:
-                            type: string
-                          executable:
                             type: string
                         required: [name, url, checksum, installPath]
                     configTemplates:
@@ -1847,7 +1840,6 @@ func (i *BinaryInstaller) Install(ctx context.Context, opts InstallOptions) erro
             Checksum:    art.Checksum,
             Filename:    art.Filename,
             InstallPath: art.InstallPath,  // per-artifact 安装路径, 供 {{artifact.<name>.installPath}} 引用
-            Executable:  art.Executable,   // 解压后可执行文件名, 供 {{artifact.<name>.executable}} 引用
         }
     }
     
@@ -3252,8 +3244,7 @@ type ArtifactInfo struct {
     URL         string
     Checksum    string
     Filename    string
-    InstallPath string    // 远程节点上的最终安装路径 (per-artifact, 通过 {{artifact.<name>.installPath}} 引用)
-    Executable  string    // 解压后的可执行文件名 (通过 {{artifact.<name>.executable}} 引用)
+    InstallPath string    // 远程节点上的安装路径 (per-artifact, 通过 {{artifact.<name>.installPath}} 引用)
 }
 ```
 
@@ -3331,7 +3322,6 @@ fi
 | `{{artifact.<name>.checksum}}` | 制品校验和 | `.Artifacts[name].Checksum` | `sha256:abc123...` |
 | `{{artifact.<name>.filename}}` | 制品文件名 | `.Artifacts[name].Filename` | `containerd-1.7.18-linux-amd64.tar.gz` |
 | `{{artifact.<name>.installPath}}` | per-artifact 安装路径 | `.Artifacts[name].InstallPath` | `/usr/local` |
-| `{{artifact.<name>.executable}}` | 解压后可执行文件名 | `.Artifacts[name].Executable` | `containerd` |
 
 #### 5. 镜像仓库变量 (Registry Variables)
 
@@ -5514,8 +5504,7 @@ spec:
       - name: containerd
         url: "https://release-repo.openfuyao.cn/binaries/containerd/{{version}}/containerd-{{version}}-linux-{{arch}}.tar.gz"
         checksum: "sha256:abc123def456..."
-        installPath: "/usr/local"
-        executable: containerd
+        installPath: "/"  # 解压到根目录, installScript 负责具体安装细节
 
     configTemplates:
       - name: config.toml
@@ -5573,29 +5562,33 @@ spec:
 
       # 3. 备份旧版本 (仅升级时)
       {{if .isUpgrade}}
-      cp {{artifact.containerd.installPath}}/bin/{{artifact.containerd.executable}} {{artifact.containerd.installPath}}/bin/{{artifact.containerd.executable}}.bak.$(date +%Y%m%d%H%M%S)
+      cp /usr/bin/containerd /usr/bin/containerd.bak.$(date +%Y%m%d%H%M%S) || true
       {{end}}
 
       # 4. 解压并安装新二进制 (tar.gz 包含 containerd, containerd-shim-runc-v2, ctr)
-      tar -xzf {{artifact.containerd.path}} -C {{artifact.containerd.installPath}}
-      chmod +x {{artifact.containerd.installPath}}/bin/{{artifact.containerd.executable}}
+      tar -xzf {{artifact.containerd.path}} -C /
+      chmod +x /usr/bin/containerd
 
       # 5. 安装配置文件和服务 (由 ConfigRenderer 自动上传)
-      # config.toml → {{configPath}}/config.toml
+      # config.toml → /etc/containerd/config.toml
       # containerd.service → /etc/systemd/system/containerd.service
 
       # 6. 启动并验证
       systemctl daemon-reload
       systemctl enable containerd
       systemctl start containerd
-      {{artifact.containerd.installPath}}/bin/{{artifact.containerd.executable}} --version
+      /usr/bin/containerd --version
 
     uninstallScript: |
       #!/bin/bash
       systemctl stop containerd || true
       systemctl disable containerd || true
-      rm -f {{artifact.containerd.installPath}}/bin/{{artifact.containerd.executable}} {{artifact.containerd.installPath}}/bin/containerd-shim-runc-v2 {{artifact.containerd.installPath}}/bin/containerd-stress {{artifact.containerd.installPath}}/bin/ctr
-      rm -f /etc/systemd/system/containerd.service
+      rm -f /usr/bin/containerd /usr/bin/containerd-shim-runc-v2 /usr/bin/containerd-shim-shimless-v2
+      rm -f /usr/bin/containerd-stress /usr/bin/ctr /usr/bin/containerd-shim
+      rm -f /usr/local/sbin/runc /usr/bin/crictl /usr/bin/nerdctl
+      rm -f /usr/lib/systemd/system/containerd.service
+      rm -f /etc/crictl.yaml
+      rm -rf /etc/containerd/
       systemctl daemon-reload
 
     supportedArchitectures: ["amd64", "arm64"]
@@ -5618,7 +5611,7 @@ spec:
       script: |
         #!/bin/bash
         systemctl is-active containerd
-        {{artifact.containerd.installPath}}/bin/{{artifact.containerd.executable}} --version | grep -q "{{componentVersion}}"
+        /usr/bin/containerd --version | grep -q "{{componentVersion}}"
         crictl info > /dev/null 2>&1
 
   compatibility:
@@ -5799,7 +5792,6 @@ spec:
         url: "{{imageRegistry}}/bkeagent/{{version}}/bkeagent_linux_{{arch}}"
         checksum: "sha256:xyz789abc012..."
         installPath: "/usr/local/bin"
-        executable: bkeagent
 
     configTemplates:
       - name: bkeagent.conf
@@ -5866,18 +5858,18 @@ spec:
 
       # 3. 备份旧版本 (仅升级时)
       {{if .isUpgrade}}
-      cp {{artifact.bkeagent.installPath}}/{{artifact.bkeagent.executable}} {{artifact.bkeagent.installPath}}/{{artifact.bkeagent.executable}}.bak.$(date +%Y%m%d%H%M%S)
+      cp /usr/local/bin/bkeagent /usr/local/bin/bkeagent.bak.$(date +%Y%m%d%H%M%S)
       {{end}}
 
       # 4. 安装新二进制
-      install -m 0755 {{artifact.bkeagent.path}} {{artifact.bkeagent.installPath}}/{{artifact.bkeagent.executable}}
+      install -m 0755 {{artifact.bkeagent.path}} /usr/local/bin/bkeagent
 
       # 5. 安装 systemd service (由 ConfigRenderer 自动上传配置文件)
-      # bkeagent.conf → {{configPath}}/bkeagent.conf
-      # tls.crt → {{configPath}}/tls.crt
-      # tls.key → {{configPath}}/tls.key
-      # ca.crt → {{configPath}}/ca.crt
-      # kubeconfig → {{configPath}}/kubeconfig
+      # bkeagent.conf → /etc/openFuyao/bkeagent/bkeagent.conf
+      # tls.crt → /etc/openFuyao/bkeagent/tls.crt
+      # tls.key → /etc/openFuyao/bkeagent/tls.key
+      # ca.crt → /etc/openFuyao/bkeagent/ca.crt
+      # kubeconfig → /etc/openFuyao/bkeagent/kubeconfig
 
       cat > /etc/systemd/system/bkeagent.service << 'EOF'
       [Unit]
@@ -5885,7 +5877,7 @@ spec:
       After=network.target
 
       [Service]
-      ExecStart={{artifact.bkeagent.installPath}}/{{artifact.bkeagent.executable}} --config {{configPath}}/bkeagent.conf
+      ExecStart=/usr/local/bin/bkeagent --config /etc/openFuyao/bkeagent/bkeagent.conf
       Restart=always
       RestartSec=5
 
@@ -5904,9 +5896,9 @@ spec:
       #!/bin/bash
       systemctl stop bkeagent || true
       systemctl disable bkeagent || true
-      rm -f {{artifact.bkeagent.installPath}}/{{artifact.bkeagent.executable}}
+      rm -f /usr/local/bin/bkeagent
       rm -f /etc/systemd/system/bkeagent.service
-      rm -rf {{configPath}}
+      rm -rf /etc/openFuyao/bkeagent
       systemctl daemon-reload
 
     supportedArchitectures: ["amd64", "arm64"]
@@ -6227,18 +6219,17 @@ spec:
       - name: containerd
         url: "https://release-repo.openfuyao.cn/binaries/containerd/{{version}}/containerd-{{version}}-linux-{{arch}}.tar.gz"
         checksum: "sha256:abc123def456..."
-        installPath: "/usr/local"
-        executable: containerd
+        installPath: "/"  # 解压到根目录
     installScript: |
       #!/bin/bash
       set -e
       systemctl stop containerd || true
-      tar -xzf {{artifact.containerd.path}} -C {{artifact.containerd.installPath}}
-      chmod +x {{artifact.containerd.installPath}}/bin/{{artifact.containerd.executable}}
+      tar -xzf {{artifact.containerd.path}} -C /
+      chmod +x /usr/bin/containerd
       systemctl daemon-reload
       systemctl enable containerd
       systemctl start containerd
-      {{artifact.containerd.installPath}}/bin/{{artifact.containerd.executable}} --version
+      /usr/bin/containerd --version
     supportedArchitectures: ["amd64", "arm64"]
     supportedOS:
       - name: centos
