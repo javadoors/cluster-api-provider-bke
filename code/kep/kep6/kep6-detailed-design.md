@@ -3386,7 +3386,56 @@ helm:
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 6.2 核心接口定义
+### 6.2 YamlInstaller 执行流程图
+
+**设计思路**：YamlInstaller 的执行流程分为 4 个主要步骤：加载清单、应用清单、健康检查、返回结果。与 BinaryInstaller（7 步）和 HelmInstaller（7 步）相比更简单——无制品下载/SSH 执行/Helm SDK 等复杂子层，仅 Store 加载 + Applier 应用 + healthcheck。
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         YamlInstaller 执行流程                                   │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+                              ┌──────────────────┐
+                              │   Apply()        │
+                              │   入口函数       │
+                              └────────┬─────────┘
+                                       │
+                                       ▼
+                     ┌──────────────────────────────────────┐
+                     │  1. 加载清单                          │
+                     │  store.GetComponentManifests(         │
+                     │    ctx, name, version, tmplCtx)       │
+                     │  → BundleStore → CollectComponent     │
+                     │    Manifests (bundle文件+内联Resources)│
+                     └────────────────────┬─────────────────┘
+                                          │
+                                          ▼
+                     ┌──────────────────────────────────────┐
+                     │  2. 应用清单                          │
+                     │  applier.ApplyComponent(ctx, pkg)     │
+                     │  → ClusterApplier → ApplyYaml         │
+                     │    (ServerSideApply/Replace/CreateOnly)│
+                     └────────────────────┬─────────────────┘
+                                          │
+                                          ▼
+                     ┌──────────────────────────────────────┐
+                     │  3. 健康检查                          │
+                     │  healthcheck.Run(ctx, clientset, hc)  │
+                     │  (见第 7 章, hc.Enabled=true 时执行)   │
+                     └────────────────────┬─────────────────┘
+                                          │
+                               ┌──────────┴──────────┐
+                               │                     │
+                          检查通过                检查失败
+                               │                     │
+                               ▼                     ▼
+                     ┌─────────────────┐   ┌─────────────────┐
+                     │  返回成功       │   │  返回错误       │
+                     │  return nil     │   │  return err     │
+                     └─────────────────┘   └─────────────────┘
+```
+
+### 6.3 核心接口定义
 
 **设计思路 — YAML 组件两层模型（与 Binary/Helm 对称）**：
 
@@ -3454,7 +3503,7 @@ func (i *YamlInstaller) Apply(ctx context.Context, cv *configv1alpha1.ComponentV
 
 > 健康检查实现委托共享 `pkg/healthcheck` 包（`healthcheck.Run(ctx, execCtx.TargetClient, *cv.Spec.YAML.HealthCheck)`）。共享包的接口定义与 PodReady/EndpointReady/Custom 检查实现详见 **第 7 章 HealthCheck 共享包设计**。
 
-### 6.3 健康检查
+### 6.4 健康检查
 
 YamlInstaller 的健康检查在 `Apply` 方法内部调用共享 `pkg/healthcheck` 包执行（`healthcheck.Run(ctx, execCtx.TargetClient, *cv.Spec.YAML.HealthCheck)`）。当 `cv.Spec.YAML.HealthCheck.Enabled` 为 true 时，清单 Apply 后执行 PodReady/EndpointReady/Custom 检查。接口定义与实现详见 **第 7 章 HealthCheck 共享包设计**。
 
@@ -3553,14 +3602,77 @@ type Applier interface {
 
 **设计思路 — 横切关注点独立成包**：
 
-PodReady/EndpointReady/Custom 三种 K8s 资源就绪检查是 HelmInstaller（5.3）与 YamlInstaller（6.2）共用的横切关注点。原设计中两处各自实现 `runHealthCheck`/`checkPodReady`/`checkEndpointReady`/`checkCustom`，逻辑近乎相同（M3 问题）。现抽取为独立共享包 `pkg/healthcheck`，两处均委托调用，消除重复。
+PodReady/EndpointReady/Custom 三种 K8s 资源就绪检查是 HelmInstaller（5.3）与 YamlInstaller（6.3）共用的横切关注点。原设计中两处各自实现 `runHealthCheck`/`checkPodReady`/`checkEndpointReady`/`checkCustom`，逻辑近乎相同（M3 问题）。现抽取为独立共享包 `pkg/healthcheck`，两处均委托调用，消除重复。
 
 **作用范围**：
 - ✅ `HelmInstaller`（5.3）：Helm `install/upgrade` 返回后执行自定义健康检查
-- ✅ `YamlInstaller`（6.2）：清单 Apply 后执行健康检查
+- ✅ `YamlInstaller`（6.3）：清单 Apply 后执行健康检查
 - ❌ `BinaryInstaller`（4.x）：二进制组件运行在远程节点，健康检查通过 SSH 执行脚本（`BinaryHealthCheckSpec.Script`，退出码判定），机制不同，**不**使用本共享包
 
 **与 Helm `--wait` 的关系**（仅 Helm 侧）：两者同时生效，是两层递进检查非互斥——Helm `--wait`（`strategy.wait: true`）在 `helm install/upgrade` 命令内部先执行（仅检查全部 Pod Ready）；自定义 `healthCheck` 在 Helm 命令返回后执行（支持 `minReady` 部分就绪、Endpoint、Custom）。若 `--wait` 失败且 `atomic: true`，Helm 自动回滚，不执行自定义 `healthCheck`。
+
+**执行流程图**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         HealthCheck 执行流程                                     │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+                              ┌──────────────────┐
+                              │   Run()          │
+                              │  入口函数        │
+                              └────────┬─────────┘
+                                       │
+                                       ▼
+                     ┌──────────────────────────────────────┐
+                     │  设置超时与重试间隔                   │
+                     │  timeout = hc.Timeout (默认 3m)      │
+                     │  interval = hc.Interval (默认 5s)    │
+                     │  deadline = now + timeout            │
+                     └────────────────────┬─────────────────┘
+                                          │
+                                          ▼
+                     ┌──────────────────────────────────────┐
+                     │  now < deadline ?                    │
+                     └────────────────────┬─────────────────┘
+                                          │
+                            ┌─────────────┴─────────────┐
+                            │                           │
+                           是                          否
+                            │                           │
+                            ▼                           ▼
+              ┌─────────────────────────┐   ┌─────────────────┐
+              │  遍历 hc.Checks         │   │  返回超时错误   │
+              │  allReady = true        │   │  return err     │
+              └────────────┬────────────┘   └─────────────────┘
+                           │
+           ┌───────────────┼───────────────┐
+           │               │               │
+           ▼               ▼               ▼
+  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+  │  PodReady    │ │EndpointReady │ │   Custom     │
+  │ list Pods    │ │ get Endpoints│ │ exec command │
+  │ count Ready  │ │ check Addrs  │ │ exit code 0  │
+  └──────┬───────┘ └──────┬───────┘ └──────┬───────┘
+         │                │                │
+         └────────────────┼────────────────┘
+                          │
+                          ▼
+              ┌─────────────────────────┐
+              │  allReady ?             │
+              └────────────┬────────────┘
+                   ┌───────┴───────┐
+                   │               │
+                  是              否
+                   │               │
+                   ▼               ▼
+         ┌─────────────────┐ ┌─────────────────┐
+         │  返回成功       │ │  Sleep(interval)│
+         │  return nil     │ │  继续重试循环   │
+         └─────────────────┘ └─────────────────┘
+                                   │
+                                   └──→ 回到 now < deadline?
+```
 
 ```go
 // pkg/healthcheck/healthcheck.go
@@ -3669,7 +3781,7 @@ func checkCustom(ctx context.Context, spec *CustomCheckSpec) (bool, error) {
 
 **调用方**：
 - `HelmInstaller.runHealthCheck`（5.3）：`return healthcheck.Run(ctx, i.clientset, hc)`
-- `YamlInstaller.Apply`（6.2）：`healthcheck.Run(ctx, execCtx.TargetClient, *cv.Spec.YAML.HealthCheck)`
+- `YamlInstaller.Apply`（6.3）：`healthcheck.Run(ctx, execCtx.TargetClient, *cv.Spec.YAML.HealthCheck)`
 
 ---
 
@@ -4581,6 +4693,50 @@ type ComponentVersionStore interface {
 }
 ```
 
+**查找流程图**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    ComponentVersionStore 查找流程                                │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────┐
+  │  Binary/Helm/YAML    │
+  │  ComponentExecutor   │
+  └──────────┬───────────┘
+             │ cvStore.GetComponentVersion(ctx, name, version)
+             ▼
+  ┌──────────────────────────────────────┐
+  │  BundleStore.GetComponentVersion     │
+  │  (pkg/manifest/bundle_store.go)      │
+  │                                      │
+  │  key = ComponentKey(name, version)   │
+  │       → "name@version"               │
+  └──────────┬───────────────────────────┘
+             │
+             ▼
+  ┌──────────────────────────────────────┐
+  │  Bundle.Components[key]              │
+  │  map[string]ComponentVersion         │
+  │  (pkg/release/manifest/types.go)     │
+  └──────────┬───────────────────────────┘
+             │
+        ┌────┴────┐
+        │         │
+       找到      未找到
+        │         │
+        ▼         ▼
+  ┌──────────┐  ┌──────────────────────┐
+  │ return   │  │ return nil,          │
+  │ &cv, nil │  │ "component %s not    │
+  │ (副本指针)│  │  found in release    │
+  └──────────┘  │  bundle"             │
+                └──────────────────────┘
+
+  数据流: Executor → ComponentVersionStore → BundleStore → Bundle.Components → *ComponentVersion
+  同一对象: BundleStore 同时实现 manifest.Store (GetComponentManifests) + ComponentVersionStore (GetComponentVersion)
+```
+
 **BundleStore 扩展实现**：
 
 现有 `pkg/manifest/bundle_store.go` 的 `BundleStore` 已持有 `*releasemanifest.Bundle` 且 `GetComponentManifests` 内部已做 `bundle.Components[ComponentKey(name, version)]` 查找（验证 CV 存在）——只是未返回 CV 对象本身。因此直接在 `BundleStore` 上扩展 `GetComponentVersion` 方法，使其同时实现 `manifest.Store` 与 `dagexec.ComponentVersionStore` 两个接口，无需独立类型：
@@ -5380,7 +5536,7 @@ func (e *HelmComponentExecutor) ExecuteComponent(ctx context.Context, node *Comp
 
 **设计思路 — YAML 组件两层模型（与 Binary/Helm 对称）**：
 
-YAML 组件采用两层结构：`YamlInstaller`（`pkg/yamlinstaller` 引擎层，负责清单 Apply + 健康检查，**详见第 6 章**）+ `YamlComponentExecutor`（dagexec 调度层，本节）。本节仅描述调度层 `YamlComponentExecutor`，引擎层接口定义见 **6.2 核心接口定义**。
+YAML 组件采用两层结构：`YamlInstaller`（`pkg/yamlinstaller` 引擎层，负责清单 Apply + 健康检查，**详见第 6 章**）+ `YamlComponentExecutor`（dagexec 调度层，本节）。本节仅描述调度层 `YamlComponentExecutor`，引擎层接口定义见 **6.3 核心接口定义**。
 
 ```go
 // pkg/dagexec/yaml_component_executor.go
