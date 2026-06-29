@@ -3100,17 +3100,17 @@ HelmInstaller 的健康检查通过 `runHealthCheck` 方法委托共享 `pkg/hea
 
 **设计思路 — YAML 组件两层模型（与 Binary/Helm 对称）**：
 
-YAML 组件采用与 Binary/Helm 对称的两层结构：`YamlComponentExecutor`（dagexec 调度层，见 9.3.3.3）+ `YamlInstaller`（`pkg/yamlinstaller` 引擎层，本节）。`YamlInstaller` 持有 `manifest.Applier`，负责清单 Apply + 健康检查；与 `BinaryInstaller`/`HelmInstaller` 命名对称。区别仅在 `YamlInstaller` 内部更简单——无 SSH/下载/缓存等子层，仅 Apply + healthcheck。
+YAML 组件采用与 Binary/Helm 对称的两层结构：`YamlComponentExecutor`（dagexec 调度层，见 9.4.3.3）+ `YamlInstaller`（`pkg/yamlinstaller` 引擎层，本节）。`YamlInstaller` 持有 `manifest.Applier`，负责清单 Apply + 健康检查；与 `BinaryInstaller`/`HelmInstaller` 命名对称。区别仅在 `YamlInstaller` 内部更简单——无 SSH/下载/缓存等子层，仅 Apply + healthcheck。
 
 | 层 | Binary | Helm | YAML |
 |----|--------|------|------|
-| dagexec 执行器 | `BinaryComponentExecutor` | `HelmComponentExecutor` | `YamlComponentExecutor`（见 9.3.3.3） |
+| dagexec 执行器 | `BinaryComponentExecutor` | `HelmComponentExecutor` | `YamlComponentExecutor`（见 9.4.3.3） |
 | 独立包引擎 | `binaryinstaller.BinaryInstaller` | `helminstaller.HelmInstaller` | `yamlinstaller.YamlInstaller`（本节） |
 
 **Installer（引擎层）完成的逻辑**（`YamlInstaller.Apply`）：
 - 构建 ComponentPackage → `applier.ApplyComponent()` → 健康检查（PodReady/EndpointReady/Custom）
 
-**Executor（调度层）完成的逻辑**（`YamlComponentExecutor`，见 9.3.3.3）：
+**Executor（调度层）完成的逻辑**（`YamlComponentExecutor`，见 9.4.3.3）：
 - 获取 ComponentVersion → VersionContext 判断是否需要执行 → 委托 `YamlInstaller.Apply()` → 处理失败策略
 - 无节点级调度（应用到集群而非单节点）
 - 无回滚机制（SSA 天然支持幂等，重新 Apply 上一版本即可回滚）
@@ -3900,7 +3900,7 @@ func (r *ExecutorRegistry) Has(componentType string) bool {
 现有 `Scheduler.ExecuteDAG(ctx, phaseCtx *phaseframe.PhaseContext, ...)` 直接接收 phaseframe 类型，使 `pkg/dagexec` 被 phaseframe 绑定。重构后：
 
 1. `ExecuteDAG` 改为接收 phaseframe-free 的 `ExecutionContext`（由 controllers 层从 `phaseframe.PhaseContext` 构建适配，phaseframe 类型不进入 dagexec 包）。
-2. `InlinePhaseRunner`（签名含 `*phaseframe.PhaseContext`）替换为 phaseframe-free 的 `InlineRunner` 接口（见 9.3.3.4），由 controllers 层 `InlinePhaseRunnerAdapter` 桥接。
+2. `InlinePhaseRunner`（签名含 `*phaseframe.PhaseContext`）替换为 phaseframe-free 的 `InlineRunner` 接口（见 9.4.3.4），由 controllers 层 `InlinePhaseRunnerAdapter` 桥接。
 3. 这样 `pkg/dagexec` 不再 import `pkg/phaseframe`，可独立编译测试。
 
 **设计思路 - 组件类型分发顺序（解决先有鸡还是先有蛋问题）**：
@@ -3915,11 +3915,7 @@ func (r *ExecutorRegistry) Has(componentType string) bool {
 ```go
 // pkg/dagexec/scheduler.go 重构 (phaseframe-free)
 
-// ComponentVersionStore 加载 ComponentVersion (phaseframe-free)
-// 由 pkg/manifest.BundleStore 扩展实现 (BundleStore 同时满足 manifest.Store 与本接口)
-type ComponentVersionStore interface {
-    GetComponentVersion(ctx context.Context, name, version string) (*configv1alpha1.ComponentVersion, error)
-}
+// ComponentVersionStore 接口定义见 9.2 节 (pkg/dagexec/component_version_store.go)
 
 // ExecuteDAG 执行 DAG (phaseframe-free 入口)
 // execCtx 由 controllers 层从 phaseframe.PhaseContext 构建适配后传入
@@ -4086,50 +4082,6 @@ func NewScheduler(cfg Config) *Scheduler {
 - **TemplateRenderer**：无状态（仅 funcMap），全局共享；**ConfigRenderer**：需 K8s client（读取 Secret），按需创建
 - **各 Config 类型定义**：`BinaryInstallerConfig`（第 4 章）、`HelmInstallerConfig`（第 5 章）、`NewConfigRenderer`（第 9 章）
 
-#### BundleStore 扩展实现（ComponentVersionStore 适配）
-
-**设计思路 — 镜像 BundleStore 的查找模式**：
-
-`ComponentVersionStore` 接口（见 9.1.3）需要从 `*releasemanifest.Bundle` 加载 `ComponentVersion` 对象。现有 `pkg/manifest/bundle_store.go` 的 `BundleStore` 已持有 `*releasemanifest.Bundle` 且 `GetComponentManifests` 内部已做 `bundle.Components[ComponentKey(name, version)]` 查找（验证 CV 存在）——只是未返回 CV 对象本身。
-
-因此**直接在 `BundleStore` 上扩展 `GetComponentVersion` 方法**，使其同时实现 `manifest.Store` 与 `dagexec.ComponentVersionStore` 两个接口，无需独立的 `BundleCVStore` 类型：
-
-| 接口 | 方法 | 返回 | 用途 |
-|------|------|------|------|
-| `manifest.Store` | `GetComponentManifests` | `*ComponentPackage`（清单字节） | YAML 执行器应用清单 |
-| `dagexec.ComponentVersionStore` | `GetComponentVersion` | `*ComponentVersion`（CV 对象） | 类型分发 + Executor 读取 spec |
-
-`Bundle.Components` 是 `map[string]apiv1.ComponentVersion`（值类型），键由 `releasemanifest.ComponentKey(name, version)` 生成（格式 `"name@version"`）。map 取值即为副本，返回其指针可避免调用方修改 bundle 原始对象。
-
-```go
-// pkg/manifest/bundle_store.go 扩展
-
-// GetComponentVersion 从 Bundle.Components 按 (name, version) 加载 ComponentVersion。
-// 镜像 GetComponentManifests 内部的查找模式 (bundle_store.go:41-44):
-//
-//	key := releasemanifest.ComponentKey(name, version)
-//	cv, ok := bundle.Components[key]
-//
-// BundleStore 通过此方法同时实现 manifest.Store 与 dagexec.ComponentVersionStore，
-// 一个对象、两个接口，消除独立 BundleCVStore 类型的重复。
-func (s *BundleStore) GetComponentVersion(
-	_ context.Context,
-	name, version string,
-) (*configv1alpha1.ComponentVersion, error) {
-	if s == nil || s.bundle == nil {
-		return nil, fmt.Errorf("release bundle is not initialized")
-	}
-	key := releasemanifest.ComponentKey(name, version)
-	cv, ok := s.bundle.Components[key]
-	if !ok {
-		return nil, fmt.Errorf("component %s not found in release bundle", key)
-	}
-	return &cv, nil
-}
-```
-
-> **错误信息约定**：与 `GetComponentManifests` 一致——未找到时返回 `"component %s not found in release bundle"`，其中 `%s` 为 `name@version` 键。
-
 ```go
 // controllers/capbke/bkecluster_upgrade_dag.go 扩展
 
@@ -4234,7 +4186,63 @@ func (r *BKEClusterReconciler) buildSchedulerAndExecute(
 | **扩展性** | 新增类型需修改 `executeComponent()` | 新增类型只需 `registry.Register()`，Scheduler 不变 |
 | **未注册类型处理** | 走 Manifest 路径 | 回退到 YAML/Manifest 路径（兼容未迁移组件） |
 
-### 9.2 DAG 调度执行流程
+### 9.2 ComponentVersionStore
+
+**设计思路 — 跨执行器共享的 CV 加载抽象**：
+
+`ComponentVersionStore` 是 Binary/Helm/YAML 三个 Executor 共用的横切关注点——执行器需要加载 `ComponentVersion` 对象以获取组件类型（`cv.Spec.Type`）和规格（`cv.Spec.Binary`/`cv.Spec.Helm`/`cv.Spec.YAML`）。接口定义独立成文件 `pkg/dagexec/component_version_store.go`，与 `scheduler.go` 分离，便于多执行器引用。
+
+```go
+// pkg/dagexec/component_version_store.go
+
+// ComponentVersionStore 加载 ComponentVersion (phaseframe-free)
+// 由 pkg/manifest.BundleStore 扩展实现 (BundleStore 同时满足 manifest.Store 与本接口)
+type ComponentVersionStore interface {
+    GetComponentVersion(ctx context.Context, name, version string) (*configv1alpha1.ComponentVersion, error)
+}
+```
+
+**BundleStore 扩展实现**：
+
+现有 `pkg/manifest/bundle_store.go` 的 `BundleStore` 已持有 `*releasemanifest.Bundle` 且 `GetComponentManifests` 内部已做 `bundle.Components[ComponentKey(name, version)]` 查找（验证 CV 存在）——只是未返回 CV 对象本身。因此直接在 `BundleStore` 上扩展 `GetComponentVersion` 方法，使其同时实现 `manifest.Store` 与 `dagexec.ComponentVersionStore` 两个接口，无需独立类型：
+
+| 接口 | 方法 | 返回 | 用途 |
+|------|------|------|------|
+| `manifest.Store` | `GetComponentManifests` | `*ComponentPackage`（清单字节） | YAML 执行器应用清单 |
+| `dagexec.ComponentVersionStore` | `GetComponentVersion` | `*ComponentVersion`（CV 对象） | 类型分发 + Executor 读取 spec |
+
+`Bundle.Components` 是 `map[string]apiv1.ComponentVersion`（值类型），键由 `releasemanifest.ComponentKey(name, version)` 生成（格式 `"name@version"`）。map 取值即为副本，返回其指针可避免调用方修改 bundle 原始对象。
+
+```go
+// pkg/manifest/bundle_store.go 扩展
+
+// GetComponentVersion 从 Bundle.Components 按 (name, version) 加载 ComponentVersion。
+// 镜像 GetComponentManifests 内部的查找模式 (bundle_store.go:41-44):
+//
+//	key := releasemanifest.ComponentKey(name, version)
+//	cv, ok := bundle.Components[key]
+//
+// BundleStore 通过此方法同时实现 manifest.Store 与 dagexec.ComponentVersionStore，
+// 一个对象、两个接口，消除独立 BundleCVStore 类型的重复。
+func (s *BundleStore) GetComponentVersion(
+	_ context.Context,
+	name, version string,
+) (*configv1alpha1.ComponentVersion, error) {
+	if s == nil || s.bundle == nil {
+		return nil, fmt.Errorf("release bundle is not initialized")
+	}
+	key := releasemanifest.ComponentKey(name, version)
+	cv, ok := s.bundle.Components[key]
+	if !ok {
+		return nil, fmt.Errorf("component %s not found in release bundle", key)
+	}
+	return &cv, nil
+}
+```
+
+> **错误信息约定**：与 `GetComponentManifests` 一致——未找到时返回 `"component %s not found in release bundle"`，其中 `%s` 为 `name@version` 键。
+
+### 9.3 DAG 调度执行流程
 
 **设计思路**：DAG 调度采用"批次间串行、批次内并行"的执行策略。首先通过拓扑排序将 DAG 分解为多个批次，然后按顺序执行每个批次，批次内的组件可以并行执行。这种策略既保证了依赖关系的正确性，又最大化了并行度。
 
@@ -4307,7 +4315,7 @@ func (r *BKEClusterReconciler) buildSchedulerAndExecute(
                               └─────────────┘ └─────────┘ └─────────┘
 ```
 
-### 9.3 核心接口定义
+### 9.4 核心接口定义
 
 **设计思路 - 接口分层与解耦**：
 
@@ -4383,7 +4391,7 @@ func (r *BKEClusterReconciler) buildSchedulerAndExecute(
   控制流: ComponentExecutor 根据 VersionContext 自主决定操作类型
 ```
 
-#### 9.3.1 ExecutionContext 定义
+#### 9.4.1 ExecutionContext 定义
 
 **设计思路 - 为什么用 VersionContext 而非 IsUpgrade bool 或 OperationType 枚举**：
 1. **声明式协调**：Kubernetes 控制器应基于"当前状态 vs 期望状态"自主决定操作，而非由调用方显式下达操作指令。VersionContext 提供版本事实（已安装版本、目标版本），Executor 根据 `HasCurrent`/`HasTarget`/`NeedsUpgrade` 自主推断 Install/Upgrade/Skip。
@@ -4435,7 +4443,7 @@ func (r *BKEClusterReconciler) buildSchedulerAndExecute(
 //
 // 设计说明:
 // - 不引用 phaseframe 任何类型；Inline 路径通过 InlineRunner 接口桥接
-//   (见 9.3.3.4)，由 controllers 层提供适配实现
+//   (见 9.4.3.4)，由 controllers 层提供适配实现
 // - OldCluster 供 InlineComponentExecutor 调用 InlineRunner.Execute 时传入
 // - TargetClient 供 Helm/YAML 健康检查访问目标集群 (Pod/Endpoint)
 type ExecutionContext struct {
@@ -4481,7 +4489,7 @@ func NewExecutionContext(
 }
 ```
 
-#### 9.3.2 NodeProvider 接口定义
+#### 9.4.2 NodeProvider 接口定义
 
 **设计思路**：NodeProvider 接口抽象节点获取逻辑，替代原来对 phaseframe.NodeFetcher 的依赖。Node 结构体仅包含基础信息（Name/IP/Hostname/Role），不包含 Arch/OS/OSVersion。Arch 由 BinaryInstaller 在 Install() 中通过 SSH 发现（`uname -m`），OS 由安装脚本运行时自检测（`/etc/os-release`），NodeProvider 不执行 SSH 预检测。
 
@@ -4561,7 +4569,7 @@ func (p *BKENodeProvider) GetNodesByRole(ctx context.Context, cluster *bkev1beta
 }
 ```
 
-#### 9.3.3 ComponentExecutor 接口 (解耦后)
+#### 9.4.3 ComponentExecutor 接口 (解耦后)
 
 ```go
 // pkg/dagexec/executor.go
@@ -4612,7 +4620,7 @@ type ComponentExecutor interface {
 
 **Binary 是唯一需要独立 Installer 的类型**，因为 Binary 组件的安装逻辑最复杂（SSH 发现架构→下载制品→缓存→校验→渲染脚本→渲染配置→SSH 上传→SSH 执行→健康检查），且需要逐节点执行（节点级并发控制）。
 
-##### 9.3.3.1 BinaryComponentExecutor
+##### 9.4.3.1 BinaryComponentExecutor
 
 ```go
 // BinaryComponentExecutor 二进制组件执行器
@@ -4890,7 +4898,7 @@ func (e *BinaryComponentExecutor) rollback(node Node, cv *ComponentVersion) erro
 }
 ```
 
-##### 9.3.3.2 HelmComponentExecutor
+##### 9.4.3.2 HelmComponentExecutor
 
 **设计思路 — Helm 组件无需节点级调度**：
 
@@ -4989,7 +4997,7 @@ func (e *HelmComponentExecutor) ExecuteComponent(ctx context.Context, node *Comp
 }
 ```
 
-##### 9.3.3.3 YamlComponentExecutor (YAML)
+##### 9.4.3.3 YamlComponentExecutor (YAML)
 
 **设计思路 — YAML 组件两层模型（与 Binary/Helm 对称）**：
 
@@ -5039,7 +5047,7 @@ func (e *YamlComponentExecutor) ExecuteComponent(ctx context.Context, node *Comp
 
 > 健康检查由 `YamlInstaller.Apply` 内部委托共享 `pkg/healthcheck` 包完成（见 **第 7 章 HealthCheck 共享包设计**）。
 
-##### 9.3.3.4 InlineComponentExecutor
+##### 9.4.3.4 InlineComponentExecutor
 
 **设计思路 — Inline 是最简执行器，无 Installer、无调度策略**：
 
@@ -5149,7 +5157,7 @@ func (a *InlinePhaseRunnerAdapter) Execute(ctx context.Context, oldCluster, newC
 - **TemplateContext**：复用 `manifest.TemplateContext`，所有组件类型共享使用
 - **解耦收益**：`pkg/dagexec` 包可独立编译和测试，不依赖 phaseframe
 
-#### 9.3.5 辅助函数
+#### 9.4.5 辅助函数
 
 ```go
 // parseDurationDefault 解析超时字符串, 空字符串或解析失败时返回默认值
