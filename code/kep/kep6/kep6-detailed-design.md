@@ -141,7 +141,7 @@
 │  │                                                                         │    │
 │  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌────────────┐  │    │
 │  │  │   Binary     │  │    Helm      │  │   Inline     │  │   YAML     │  │    │
-│  │  │  Component   │  │   Component  │  │   Component  │  │  Manifest  │  │    │
+│  │  │  Component   │  │   Component  │  │   Component  │  │  Component  │  │    │
 │  │  │  Executor    │  │   Executor   │  │   Executor   │  │  Executor  │  │    │
 │  │  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └─────┬──────┘  │    │
 │  │         │                 │                 │                │          │    │
@@ -180,7 +180,7 @@
 │  │  └─────────────────────────────────────────────────────────────────┘   │    │
 │  │                                                                         │    │
 │  │  ┌─────────────────────────────────────────────────────────────────┐   │    │
-│  │  │                     ManifestApplier                              │   │    │
+│  │  │                     YamlInstaller                                │   │    │
 │  │  │  ┌────────────────┐  ┌────────────────┐  ┌─────────────────┐   │   │    │
 │  │  │  │   YAML Parser  │  │  Template      │  │  K8s Client     │   │   │    │
 │  │  │  │  (清单解析)    │  │  Renderer      │  │  (Apply/Delete) │   │   │    │
@@ -232,16 +232,16 @@
                ┌──────────────┼──────────────┼──────────────┐
                │              │              │              │
                ▼              ▼              ▼              ▼
-     ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
-     │   Binary     │ │    Helm      │ │   Inline     │ │   Manifest   │
-     │   Executor   │ │   Executor   │ │   Executor   │ │   Executor   │
-     └──────┬───────┘ └──────┬───────┘ └──────┬───────┘ └──────┬───────┘
-            │                │                │                │
-            ▼                ▼                ▼                ▼
-     ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
-     │   Binary     │ │    Helm      │ │  Component   │ │  Manifest    │
-     │  Installer   │ │  Installer   │ │  Factory     │ │  Applier     │
-     └──────┬───────┘ └──────┬───────┘ └──────┬───────┘ └──────┬───────┘
+      ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+      │   Binary     │ │    Helm      │ │   Inline     │ │    YAML      │
+      │   Executor   │ │   Executor   │ │   Executor   │ │   Executor   │
+      └──────┬───────┘ └──────┬───────┘ └──────┬───────┘ └──────┬───────┘
+             │                │                │                │
+             ▼                ▼                ▼                ▼
+      ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+      │   Binary     │ │    Helm      │ │  Component   │ │    Yaml      │
+      │  Installer   │ │  Installer   │ │  Factory     │ │  Installer   │
+      └──────┬───────┘ └──────┬───────┘ └──────┬───────┘ └──────┬───────┘
             │                │                │                │
             ▼                ▼                ▼                ▼
      ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
@@ -1495,6 +1495,14 @@ spec:
 │  │  │  └──────────────┘  └──────────────┘  └─────────────────────┘   │   │    │
 │  │  └─────────────────────────────────────────────────────────────────┘   │    │
 │  │                                                                         │    │
+│  │  ┌─────────────────────────────────────────────────────────────────┐   │    │
+│  │  │                     HealthChecker (SSH)                          │   │    │
+│  │  │  ┌─────────────────────────────────────────────────────┐        │   │    │
+│  │  │  │ SSH 执行健康检查脚本, 退出码 0=健康                │        │   │    │
+│  │  │  │ (BinaryHealthCheckSpec.Script, 见 4.3)              │        │   │    │
+│  │  │  └─────────────────────────────────────────────────────┘        │   │    │
+│  │  └─────────────────────────────────────────────────────────────────┘   │    │
+│  │                                                                         │    │
 │  └─────────────────────────────────────────────────────────────────────────┘    │
 │                                                                                  │
 └─────────────────────────────────────────────────────────────────────────────────┘
@@ -1609,22 +1617,33 @@ spec:
                    └────────────────────┼────────────────────┘
                                         │
                                         ▼
-                    ┌──────────────────────────────────────┐
-                    │  7. 收集执行结果                    │
-                    │  collectResult(stdout, stderr, err)  │
-                    └────────────────────┬─────────────────┘
-                                         │
-                              ┌──────────┴──────────┐
-                              │                     │
-                         执行成功                执行失败
-                              │                     │
-                              ▼                     ▼
-                    ┌─────────────────┐   ┌─────────────────┐
-                    │  返回成功       │   │  返回错误       │
-                    │  return nil     │   │  return err     │
-                    └─────────────────┘   │  (含 stdout/    │
-                                          │   stderr)       │
-                                          └─────────────────┘
+                     ┌──────────────────────────────────────┐
+                     │  7. 收集执行结果                    │
+                     │  collectResult(stdout, stderr, err)  │
+                     └────────────────────┬─────────────────┘
+                                          │
+                               ┌──────────┴──────────┐
+                               │                     │
+                          执行成功                执行失败
+                               │                     │
+                               ▼                     ▼
+                     ┌─────────────────┐   ┌─────────────────┐
+                     │  8. 健康检查    │   │  返回错误       │
+                     │  (HealthCheck   │   │  return err     │
+                     │   Enabled 时)   │   │  (含 stdout/    │
+                     │  SSH 执行脚本   │   │   stderr)       │
+                     │  退出码 0=健康  │   └─────────────────┘
+                     └────────┬────────┘
+                              │
+                     ┌────────┴────────┐
+                     │                 │
+                    检查通过        检查失败
+                     │                 │
+                     ▼                 ▼
+                     ┌─────────────────┐
+                     │  返回成功       │
+                     │  return nil     │
+                     └─────────────────┘
 ```
 
 ### 4.3 核心接口定义
@@ -2045,7 +2064,7 @@ func (i *BinaryInstaller) executeUninstall(
     }
 
     // 2. 通过 SSH 执行卸载脚本
-    result, err := i.sshClient.Execute(nodeIP, script)
+    result, err := i.sshExecutor.Execute(ctx, nodeIP, script)
     if err != nil {
         return fmt.Errorf("uninstall failed on %s: %w\nstdout: %s\nstderr: %s",
             nodeIP, err, result.Stdout, result.Stderr)
@@ -2053,7 +2072,7 @@ func (i *BinaryInstaller) executeUninstall(
 
     // 3. 验证服务已停止
     verifyCmd := fmt.Sprintf("systemctl is-active %s || true", tmplCtx.ServiceName)
-    verifyResult, _ := i.sshClient.Execute(nodeIP, verifyCmd)
+    verifyResult, _ := i.sshExecutor.Execute(ctx, nodeIP, verifyCmd)
     if verifyResult.Stdout == "active" {
         return fmt.Errorf("service %s still active after uninstall on %s", 
             tmplCtx.ServiceName, nodeIP)
@@ -3362,8 +3381,8 @@ helm:
 │  │ManifestDownloader│    │  YAML Parser     │                   │
 │  │                  │    │                  │                   │
 │  │ • ManifestStore  │    │ • 多文档解析     │                   │
-│  │ • HTTP URL 下载  │    │ • GVK 识别       │                   │
-│  │ • Checksum 校验  │    │ • 资源分组       │                   │
+│  │ • bundle文件加载 │    │ • GVK 识别       │                   │
+│  │ • 内联Resources  │    │ • 资源分组       │                   │
 │  └────────┬─────────┘    └────────┬─────────┘                   │
 │           │                       │                              │
 │           ▼                       ▼                              │
@@ -4291,17 +4310,17 @@ func (r *TemplateRenderer) RenderScript(script string, tmplCtx manifest.Template
     └──────┬───────┘ └──────┬───────┘ └──────┬───────┘ └──────┬───────┘
            │                │                │                │
            ▼                ▼                ▼                ▼
-    ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
-    │ BinaryCompo- │ │ HelmCompo-   │ │ InlineCompo- │ │ ManifestCom- │
-    │ nentExecutor │ │ nentExecutor │ │ nentExecutor │ │ ponentExecutor│
-    └──────┬───────┘ └──────┬───────┘ └──────┬───────┘ └──────┬───────┘
-           │                │                │                │
-           │                │                │                ▼
-           │                │                │       ┌──────────────┐
-           │                │                │       │ Manifest     │
-           │                │                │       │ Applier      │
-           │                │                │       │ (K8s Client) │
-           │                │                │       └──────┬───────┘
+     ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+     │ BinaryCompo- │ │ HelmCompo-   │ │ InlineCompo- │ │ YamlCompo-   │
+     │ nentExecutor │ │ nentExecutor │ │ nentExecutor │ │ nentExecutor │
+     └──────┬───────┘ └──────┬───────┘ └──────┬───────┘ └──────┬───────┘
+            │                │                │                │
+            │                │                │                ▼
+            │                │                │       ┌──────────────┐
+            │                │                │       │ Yaml         │
+            │                │                │       │ Installer    │
+            │                │                │       │ (Store+Apply)│
+            │                │                │       └──────┬───────┘
            │                │                │                │
            └────────────────┼────────────────┼────────────────┘
                             │                │
@@ -4542,7 +4561,7 @@ func NewScheduler(cfg Config) *Scheduler {
     }
 
     // YAML 执行器: 依赖已注入时注册
-    if cfg.YAMLExecutor != nil {
+    if cfg.YAMLInstaller != nil {
         registry.Register("yaml", &YamlComponentExecutor{
             installer: cfg.YAMLInstaller,
             cvStore:   cfg.CVStore,
@@ -4566,7 +4585,7 @@ func NewScheduler(cfg Config) *Scheduler {
 `buildSchedulerConfig()` 是调用方（BKEClusterReconciler）构建 Scheduler Config 的入口。Feature Gate OFF 时仅创建 3 个基础依赖，避免不必要的 SSH/HTTP/缓存初始化开销；ON 时额外构建 Binary/Helm/YAML 执行器依赖。
 
 **依赖构建要点**：
-- **共享依赖**：`httpClient` 在 Binary 和 Helm 之间共享；`ManifestStore`/`ManifestApplier` 在基础路径和 YAMLExecutor 之间共享
+- **共享依赖**：`httpClient` 在 Binary 和 Helm 之间共享；`ManifestStore`/`ManifestApplier` 在基础路径和 YamlInstaller 之间共享
 - **缓存目录约定**：Binary 制品缓存 `/var/cache/bke/artifacts`，Helm Chart 缓存 `/var/cache/bke/charts`
 - **httpClient 超时**：5 分钟，覆盖大制品下载场景
 - **SSH client 来源**：从 `BKEClusterReconciler` 注入（已有 SSH 连接池），避免重复创建
@@ -4672,7 +4691,7 @@ func (r *BKEClusterReconciler) buildSchedulerAndExecute(
 | **分发方式** | `if node.Inline != nil` 二路 | `registry.Get(node.ComponentType())` 四路 |
 | **执行器注册** | 无（硬编码 if-else） | `ExecutorRegistry` 按类型注册 |
 | **执行器实例** | 无独立 Executor | Binary/Helm/YAML/Inline 各自实现 `ComponentExecutor` |
-| **依赖注入** | `InlineRunner` + `ManifestStore` + `ManifestApplier` | 额外注入 `BinaryInstaller` + `HelmInstaller` + `YAMLExecutor` + `NodeProvider` |
+| **依赖注入** | `InlineRunner` + `ManifestStore` + `ManifestApplier` | 额外注入 `BinaryInstaller` + `HelmInstaller` + `YAMLInstaller` + `NodeProvider` |
 | **Feature Gate** | 无 | ON→四路分发, OFF→`executeComponentLegacy` 二路分发 |
 | **扩展性** | 新增类型需修改 `executeComponent()` | 新增类型只需 `registry.Register()`，Scheduler 不变 |
 | **未注册类型处理** | 走 Manifest 路径 | 回退到 YAML/Manifest 路径（兼容未迁移组件） |
@@ -4909,10 +4928,10 @@ func (s *BundleStore) GetComponentVersion(
             ┌────────────────┼────────────────┬──────────────┐
             │                │                │              │
             ▼                ▼                ▼              ▼
-  ┌──────────────┐  ┌──────────────┐  ┌────────────┐  ┌────────────┐
-  │   Binary     │  │    Helm      │  │    YAML    │  │   Inline   │
-  │ Component    │  │ Component    │  │ Manifest   │  │ Component  │
-  │ Executor     │  │ Executor     │  │ Executor   │  │ Executor   │
+   ┌──────────────┐  ┌──────────────┐  ┌────────────┐  ┌────────────┐
+   │   Binary     │  │    Helm      │  │    YAML    │  │   Inline   │
+   │ Component    │  │ Component    │  │ Component  │  │ Component  │
+   │ Executor     │  │ Executor     │  │ Executor   │  │ Executor   │
   └──────┬───────┘  └──────┬───────┘  └─────┬──────┘  └─────┬──────┘
          │                 │                │               │
          ▼                 ▼                ▼               ▼
@@ -6040,16 +6059,18 @@ func (a *InlinePhaseRunnerAdapter) Execute(ctx context.Context, oldCluster, newC
                              └─────────┬─────────┘
                                        │
                                        ▼
-                    ┌──────────────────────────────────────┐
-                    │  兼容层处理                          │
-                    │  executeContainerdUpgrade()          │
-                    │  {                                   │
-                    │    if featuregate.Enabled(...) {     │
-                    │      return executeBinaryComponent() │
-                    │    }                                 │
-                    │    return executeLegacyPhase()       │
-                    │  }                                   │
-                    └──────────────────────────────────────┘
+                     ┌──────────────────────────────────────┐
+                     │  兼容层处理                          │
+                     │  executeContainerdUpgrade()          │
+                     │  {                                   │
+                     │    if BinaryComponentEnabled(cluster)│
+                     │      return ctrl.Result{}, nil       │
+                     │      // DAG binary 节点处理升级      │
+                     │    }                                 │
+                     │    return rolloutContainerd()        │
+                     │    // 旧路径: reset+redeploy         │
+                     │  }                                   │
+                     └──────────────────────────────────────┘
 ```
 
 ### 12.2 Feature Gate 定义
