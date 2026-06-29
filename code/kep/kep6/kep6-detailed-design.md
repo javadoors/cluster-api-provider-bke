@@ -2708,110 +2708,17 @@ func (i *HelmInstaller) upgrade(ctx context.Context, actionConfig *action.Config
 // 与 Helm --wait 的关系: 两者同时生效, --wait 先执行 (Helm 命令内部),
 // 自定义 healthCheck 后执行 (Helm 命令返回后), 互补非互斥
 //
-// 复用共享 pkg/healthcheck 包 (与 YamlComponentExecutor 共用)，
-// 此处仅做委托，避免与 YAML 执行器重复实现 PodReady/EndpointReady/Custom。
+// 实现委托给共享 pkg/healthcheck 包 (见 5.4)，避免与 YamlInstaller 重复实现
+// PodReady/EndpointReady/Custom 检查逻辑。
 func (i *HelmInstaller) runHealthCheck(
     ctx context.Context,
     hc HealthCheckSpec,
     opts InstallOptions,
 ) error {
-    timeout := parseDurationDefault(hc.Timeout, 3*time.Minute)
-    interval := parseDurationDefault(hc.Interval, 5*time.Second)
-    deadline := time.Now().Add(timeout)
-
-    for time.Now().Before(deadline) {
-        allReady := true
-        for _, check := range hc.Checks {
-            switch check.Type {
-            case "PodReady":
-                if check.PodReady == nil {
-                    return fmt.Errorf("PodReady check requires 'podReady' config")
-                }
-                ready, err := i.checkPodReady(ctx, check.PodReady)
-                if err != nil || !ready {
-                    allReady = false
-                }
-            case "EndpointReady":
-                if check.EndpointReady == nil {
-                    return fmt.Errorf("EndpointReady check requires 'endpointReady' config")
-                }
-                ready, err := i.checkEndpointReady(ctx, check.EndpointReady)
-                if err != nil || !ready {
-                    allReady = false
-                }
-            case "Custom":
-                if check.Custom == nil {
-                    return fmt.Errorf("Custom check requires 'custom' config")
-                }
-                ready, err := i.checkCustom(ctx, check.Custom)
-                if err != nil || !ready {
-                    allReady = false
-                }
-            }
-        }
-        if allReady {
-            return nil
-        }
-        time.Sleep(interval)
-    }
-
-    return fmt.Errorf("health check timed out after %s", timeout)
-}
-
-// checkPodReady 检查 Pod Ready 状态 (支持 minReady 部分就绪)
-func (i *HelmInstaller) checkPodReady(
-    ctx context.Context,
-    spec *PodReadyCheckSpec,
-) (bool, error) {
-    pods, err := i.listPods(ctx, spec.Namespace, spec.LabelSelector)
-    if err != nil {
-        return false, err
-    }
-    minReady := int(spec.MinReady)
-    if minReady == 0 {
-        minReady = len(pods) // 默认要求全部 Ready
-    }
-    readyCount := 0
-    for _, pod := range pods {
-        for _, cond := range pod.Status.Conditions {
-            if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
-                readyCount++
-                break
-            }
-        }
-    }
-    return readyCount >= minReady, nil
-}
-
-// checkEndpointReady 检查 Service Endpoint 是否有就绪端点
-func (i *HelmInstaller) checkEndpointReady(
-    ctx context.Context,
-    spec *EndpointReadyCheckSpec,
-) (bool, error) {
-    // 使用 typed clientset (i.clientset)，而非 controller-runtime client (无 CoreV1())
-    endpoints, err := i.clientset.CoreV1().Endpoints(spec.Namespace).Get(ctx, spec.ServiceName, metav1.GetOptions{})
-    if err != nil {
-        return false, err
-    }
-    for _, subset := range endpoints.Subsets {
-        if len(subset.Addresses) > 0 {
-            return true, nil // 有就绪端点
-        }
-    }
-    return false, nil
-}
-
-// checkCustom 执行自定义检查命令 (在控制器 Pod 中执行)
-// 通过 spec.Command 指定命令, 退出码 0 = 通过
-func (i *HelmInstaller) checkCustom(
-    ctx context.Context,
-    spec *CustomCheckSpec,
-) (bool, error) {
-    cmd := exec.CommandContext(ctx, "/bin/sh", "-c", spec.Command)
-    if err := cmd.Run(); err != nil {
-        return false, nil // 非零退出码 = 未就绪
-    }
-    return true, nil
+    // 委托共享包: 5.4 HealthCheck 共享包设计
+    // HealthCheckSpec/PodReadyCheckSpec/EndpointReadyCheckSpec/CustomCheckSpec
+    // 类型定义迁移到 pkg/healthcheck/types.go，Helm/YAML 共用
+    return healthcheck.Run(ctx, i.clientset, hc)
 }
 ```
 
@@ -2889,22 +2796,9 @@ func (i *HelmInstaller) getChartFromLocal(ctx context.Context, path string) (*ch
     }
     return ch, nil
 }
-
-// listPods 按标签选择器列出 Pod (使用 typed clientset)
-func (i *HelmInstaller) listPods(ctx context.Context, namespace, labelSelector string) ([]corev1.Pod, error) {
-    selector, err := labels.Parse(labelSelector)
-    if err != nil {
-        return nil, fmt.Errorf("invalid label selector %q: %w", labelSelector, err)
-    }
-    podList, err := i.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
-        LabelSelector: selector.String(),
-    })
-    if err != nil {
-        return nil, err
-    }
-    return podList.Items, nil
-}
 ```
+
+> 说明：原 `listPods`/`checkPodReady`/`checkEndpointReady`/`checkCustom`/`runHealthCheck` 的实现逻辑已移至 **5.4 HealthCheck 共享包设计**（参数化为 `kubernetes.Interface`，Helm/YAML 共用）。HelmInstaller 仅保留 `runHealthCheck` 一行委托（见上方）。
 
 `HelmSpec` 提供两种 Values 来源，合并优先级从低到高：
 
@@ -3157,6 +3051,130 @@ initContainers:
 ```
 
 适用于配置复杂、需按操作系统区分的场景。内联 `values` 留空，全部配置由文件提供。
+
+---
+
+### 5.4 HealthCheck 共享包设计
+
+**设计思路 — 横切关注点独立成包**：
+
+PodReady/EndpointReady/Custom 三种 K8s 资源就绪检查是 HelmInstaller（5.3）与 YamlInstaller（7.3.3.3）共用的横切关注点。原设计中两处各自实现 `runHealthCheck`/`checkPodReady`/`checkEndpointReady`/`checkCustom`，逻辑近乎相同（M3 问题）。现抽取为独立共享包 `pkg/healthcheck`，两处均委托调用，消除重复。
+
+**作用范围**：
+- ✅ `HelmInstaller`（5.3）：Helm `install/upgrade` 返回后执行自定义健康检查
+- ✅ `YamlInstaller`（7.3.3.3）：清单 Apply 后执行健康检查
+- ❌ `BinaryInstaller`（4.x）：二进制组件运行在远程节点，健康检查通过 SSH 执行脚本（`BinaryHealthCheckSpec.Script`，退出码判定），机制不同，**不**使用本共享包
+
+**与 Helm `--wait` 的关系**（仅 Helm 侧）：两者同时生效，是两层递进检查非互斥——Helm `--wait`（`strategy.wait: true`）在 `helm install/upgrade` 命令内部先执行（仅检查全部 Pod Ready）；自定义 `healthCheck` 在 Helm 命令返回后执行（支持 `minReady` 部分就绪、Endpoint、Custom）。若 `--wait` 失败且 `atomic: true`，Helm 自动回滚，不执行自定义 `healthCheck`。
+
+```go
+// pkg/healthcheck/healthcheck.go
+
+// Run 执行健康检查，按 hc.Checks 遍历 PodReady/EndpointReady/Custom，
+// 重试直到全部通过或超时。HelmInstaller 与 YamlInstaller 共用此入口。
+// client 为目标集群 typed clientset (kubernetes.Interface)，非 controller-runtime client。
+func Run(ctx context.Context, client kubernetes.Interface, hc HealthCheckSpec) error {
+    timeout := parseDurationDefault(hc.Timeout, 3*time.Minute)
+    interval := parseDurationDefault(hc.Interval, 5*time.Second)
+    deadline := time.Now().Add(timeout)
+
+    for time.Now().Before(deadline) {
+        allReady := true
+        for _, check := range hc.Checks {
+            switch check.Type {
+            case "PodReady":
+                if check.PodReady == nil {
+                    return fmt.Errorf("PodReady check requires 'podReady' config")
+                }
+                ready, err := checkPodReady(ctx, client, check.PodReady)
+                if err != nil || !ready {
+                    allReady = false
+                }
+            case "EndpointReady":
+                if check.EndpointReady == nil {
+                    return fmt.Errorf("EndpointReady check requires 'endpointReady' config")
+                }
+                ready, err := checkEndpointReady(ctx, client, check.EndpointReady)
+                if err != nil || !ready {
+                    allReady = false
+                }
+            case "Custom":
+                if check.Custom == nil {
+                    return fmt.Errorf("Custom check requires 'custom' config")
+                }
+                ready, err := checkCustom(ctx, check.Custom)
+                if err != nil || !ready {
+                    allReady = false
+                }
+            }
+        }
+        if allReady {
+            return nil
+        }
+        time.Sleep(interval)
+    }
+
+    return fmt.Errorf("health check timed out after %s", timeout)
+}
+
+// checkPodReady 检查 Pod Ready 状态 (支持 minReady 部分就绪)
+// listPods 逻辑内联于此 (原 HelmInstaller.listPods)，使用传入的 client
+func checkPodReady(ctx context.Context, client kubernetes.Interface, spec *PodReadyCheckSpec) (bool, error) {
+    selector, err := labels.Parse(spec.LabelSelector)
+    if err != nil {
+        return false, fmt.Errorf("invalid label selector %q: %w", spec.LabelSelector, err)
+    }
+    podList, err := client.CoreV1().Pods(spec.Namespace).List(ctx, metav1.ListOptions{
+        LabelSelector: selector.String(),
+    })
+    if err != nil {
+        return false, err
+    }
+    minReady := int(spec.MinReady)
+    if minReady == 0 {
+        minReady = len(podList.Items) // 默认要求全部 Ready
+    }
+    readyCount := 0
+    for _, pod := range podList.Items {
+        for _, cond := range pod.Status.Conditions {
+            if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+                readyCount++
+                break
+            }
+        }
+    }
+    return readyCount >= minReady, nil
+}
+
+// checkEndpointReady 检查 Service Endpoint 是否有就绪端点
+func checkEndpointReady(ctx context.Context, client kubernetes.Interface, spec *EndpointReadyCheckSpec) (bool, error) {
+    endpoints, err := client.CoreV1().Endpoints(spec.Namespace).Get(ctx, spec.ServiceName, metav1.GetOptions{})
+    if err != nil {
+        return false, err
+    }
+    for _, subset := range endpoints.Subsets {
+        if len(subset.Addresses) > 0 {
+            return true, nil // 有就绪端点
+        }
+    }
+    return false, nil
+}
+
+// checkCustom 执行自定义检查命令 (在控制器 Pod 中执行, 退出码 0 = 通过)
+func checkCustom(ctx context.Context, spec *CustomCheckSpec) (bool, error) {
+    cmd := exec.CommandContext(ctx, "/bin/sh", "-c", spec.Command)
+    if err := cmd.Run(); err != nil {
+        return false, nil // 非零退出码 = 未就绪
+    }
+    return true, nil
+}
+```
+
+**类型归属**：`HealthCheckSpec`/`HealthCheckItemSpec`/`PodReadyCheckSpec`/`EndpointReadyCheckSpec`/`CustomCheckSpec` 等类型定义应迁移到 `pkg/healthcheck/types.go`，供 Helm/YAML 共用；`api/v1alpha1` 的 CRD 字段类型可内嵌或别名这些类型，避免在 `binaryinstaller`/`helminstaller`/`yamlinstaller` 多处重复定义。
+
+**调用方**：
+- `HelmInstaller.runHealthCheck`（5.3）：`return healthcheck.Run(ctx, i.clientset, hc)`
+- `YamlInstaller.Apply`（7.3.3.3）：`healthcheck.Run(ctx, execCtx.TargetClient, *cv.Spec.YAML.HealthCheck)`
 
 ---
 
@@ -4920,29 +4938,7 @@ func (e *YamlComponentExecutor) ExecuteComponent(ctx context.Context, node *Comp
 }
 ```
 
-// 健康检查逻辑抽取到共享包 pkg/healthcheck，YamlInstaller 与
-// HelmInstaller 共用，避免重复实现 (PodReady/EndpointReady/Custom)。
-//
-// 共享接口:
-//   pkg/healthcheck/healthcheck.go
-//   func Run(ctx context.Context, client kubernetes.Interface, hc HealthCheckSpec) error
-//
-// Run 内部按 hc.Checks 遍历执行 PodReady/EndpointReady/Custom 检查，重试到超时。
-// - PodReady: clientset.CoreV1().Pods(ns).List(labelSelector)
-// - EndpointReady: clientset.CoreV1().Endpoints(ns).Get(serviceName)
-// - Custom: exec.CommandContext("/bin/sh","-c",command)
-//
-// YamlInstaller.Apply 调用 (见上方 Apply 第 3 步):
-//   healthcheck.Run(ctx, execCtx.TargetClient, *cv.Spec.YAML.HealthCheck)
-//
-// HelmInstaller 同样改为调用 healthcheck.Run(ctx, i.clientset, helm.HealthCheck)，
-// 删除其内部 runHealthCheck/checkPodReady/checkEndpointReady/checkCustom，
-// 消除两处几乎相同的实现 (原设计 M3 问题)。
-//
-// HealthCheckSpec/PodReadyCheckSpec/EndpointReadyCheckSpec/CustomCheckSpec 等
-// 类型定义应迁移到 pkg/healthcheck/types.go，供 Helm/YAML 共用；
-// api/v1alpha1 的 CRD 类型可内嵌或别名这些类型。
-```
+> 健康检查实现委托共享 `pkg/healthcheck` 包（`healthcheck.Run(ctx, execCtx.TargetClient, *cv.Spec.YAML.HealthCheck)`，见 `YamlInstaller.Apply` 第 3 步）。共享包的接口定义与 PodReady/EndpointReady/Custom 检查实现详见 **5.4 HealthCheck 共享包设计**。
 
 ##### 7.3.3.4 InlineComponentExecutor
 
