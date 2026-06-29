@@ -5819,54 +5819,124 @@ spec:
         installPath: "/usr/local/bin"
 
     configTemplates:
-      - name: bkeagent.conf
-        path: "/etc/openFuyao/bkeagent/bkeagent.conf"
+      # 节点标识文件
+      - name: node
+        path: "/etc/openFuyao/bkeagent/node"
         mode: "0644"
         owner: "root:root"
-        content: |
-          cluster_name: {{clusterName}}
-          api_server: {{apiServer}}
-          kubeconfig_path: /etc/openFuyao/bkeagent/kubeconfig
-          log_level: info
-          log_path: /var/log/bkeagent/bkeagent.log
+        content: "{{nodeHostname}}"
 
-      - name: tls.crt
-        path: "/etc/openFuyao/bkeagent/tls.crt"
-        mode: "0600"
-        owner: "root:root"
-        secretRef:
-          name: bkeagent-tls
-          namespace: "{{clusterNamespace}}"
-          key: tls.crt
-
-      - name: tls.key
-        path: "/etc/openFuyao/bkeagent/tls.key"
-        mode: "0600"
-        owner: "root:root"
-        secretRef:
-          name: bkeagent-tls
-          namespace: "{{clusterNamespace}}"
-          key: tls.key
-
-      - name: ca.crt
-        path: "/etc/openFuyao/bkeagent/ca.crt"
+      # TLS 证书（从 Secret 获取）
+      - name: trust-chain.crt
+        path: "/etc/openFuyao/certs/trust-chain.crt"
         mode: "0644"
         owner: "root:root"
         secretRef:
           name: bkeagent-tls
           namespace: "{{clusterNamespace}}"
-          key: ca.crt
+          key: trust-chain.crt
 
+      - name: global-ca.crt
+        path: "/etc/openFuyao/certs/global-ca.crt"
+        mode: "0644"
+        owner: "root:root"
+        secretRef:
+          name: bkeagent-tls
+          namespace: "{{clusterNamespace}}"
+          key: global-ca.crt
+
+      - name: global-ca.key
+        path: "/etc/openFuyao/certs/global-ca.key"
+        mode: "0600"
+        owner: "root:root"
+        secretRef:
+          name: bkeagent-tls
+          namespace: "{{clusterNamespace}}"
+          key: global-ca.key
+
+      # Kubeconfig（管理集群访问凭证）
       - name: kubeconfig
-        path: "/etc/openFuyao/bkeagent/kubeconfig"
+        path: "/etc/openFuyao/bkeagent/config"
         mode: "0600"
         owner: "root:root"
         kubeconfigTemplate:
-          clusterName: "{{clusterName}}"
+          clusterName: "management-cluster"
           apiServer: "{{apiServer}}"
-          caCertPath: "/etc/openFuyao/bkeagent/ca.crt"
-          clientCertPath: "/etc/openFuyao/bkeagent/tls.crt"
-          clientKeyPath: "/etc/openFuyao/bkeagent/tls.key"
+          caCertPath: "/etc/openFuyao/certs/global-ca.crt"
+          clientCertPath: "/etc/openFuyao/certs/bkeagent-client.crt"
+          clientKeyPath: "/etc/openFuyao/certs/bkeagent-client.key"
+
+      # CSR 配置文件（17 个，此处列出关键的 3 个作为示例）
+      - name: cluster-ca-policy.json
+        path: "/etc/openFuyao/certs/cert_config/cluster-ca-policy.json"
+        mode: "0644"
+        owner: "root:root"
+        content: |
+          {
+            "signing": {
+              "default": {
+                "expiry": "87600h"
+              },
+              "profiles": {
+                "ca": {
+                  "usages": ["signing", "key encipherment", "cert sign", "crl sign"],
+                  "expiry": "87600h"
+                }
+              }
+            }
+          }
+
+      - name: cluster-ca-csr.json
+        path: "/etc/openFuyao/certs/cert_config/cluster-ca-csr.json"
+        mode: "0644"
+        owner: "root:root"
+        content: |
+          {
+            "CN": "kubernetes",
+            "key": {
+              "algo": "rsa",
+              "size": 2048
+            },
+            "names": [
+              {
+                "C": "CN",
+                "L": "Beijing",
+                "O": "kubernetes",
+                "OU": "bke"
+              }
+            ]
+          }
+
+      - name: sign-policy.json
+        path: "/etc/openFuyao/certs/cert_config/sign-policy.json"
+        mode: "0644"
+        owner: "root:root"
+        content: |
+          {
+            "signing": {
+              "default": {
+                "expiry": "8760h"
+              },
+              "profiles": {
+                "server": {
+                  "usages": ["signing", "key encipherment", "server auth"],
+                  "expiry": "8760h"
+                },
+                "client": {
+                  "usages": ["signing", "key encipherment", "client auth"],
+                  "expiry": "8760h"
+                }
+              }
+            }
+          }
+
+      # 注：实际部署包含 17 个 CSR 配置文件，此处为简化示例
+      # 完整列表：cluster-ca-policy.json, cluster-ca-csr.json, sign-policy.json,
+      # apiserver-csr.json, apiserver-etcd-client-csr.json, front-proxy-client-csr.json,
+      # apiserver-kubelet-client-csr.json, front-proxy-ca-csr.json, etcd-ca-csr.json,
+      # etcd-server-csr.json, etcd-healthcheck-client-csr.json, etcd-peer-csr.json,
+      # admin-kubeconfig-csr.json, kubelet-kubeconfig-csr.json, controller-manager-csr.json,
+      # scheduler-csr.json, kube-proxy-csr.json
 
     installScript: |
       #!/bin/bash
@@ -5874,46 +5944,61 @@ spec:
       # 集群: {{clusterName}}, 节点: {{nodeIP}} ({{nodeRole}})
       # 版本: {{componentVersion}}, 操作: {{action}}
 
-      # 1. 创建目录
-      mkdir -p {{configPath}}
-      mkdir -p {{logPath}}
+      # 1. 创建目录结构
+      mkdir -p /etc/openFuyao/bkeagent
+      mkdir -p /etc/openFuyao/bkeagent/bin
+      mkdir -p /etc/openFuyao/bkeagent/scripts
+      mkdir -p /etc/openFuyao/certs
+      mkdir -p /etc/openFuyao/certs/cert_config
+      mkdir -p /var/log/openFuyao
 
       # 2. 停止旧服务
       systemctl stop bkeagent || true
 
       # 3. 备份旧版本 (仅升级时)
       {{if .isUpgrade}}
-      cp /usr/local/bin/bkeagent /usr/local/bin/bkeagent.bak.$(date +%Y%m%d%H%M%S)
+      cp /usr/local/bin/bkeagent /usr/local/bin/bkeagent.bak.$(date +%s)
+      # 保留最近 3 个备份
+      ls -t /usr/local/bin/bkeagent.bak.* 2>/dev/null | tail -n +4 | xargs rm -f 2>/dev/null || true
       {{end}}
 
       # 4. 安装新二进制
       install -m 0755 {{artifact.bkeagent.path}} /usr/local/bin/bkeagent
 
-      # 5. 安装 systemd service (由 ConfigRenderer 自动上传配置文件)
-      # bkeagent.conf → /etc/openFuyao/bkeagent/bkeagent.conf
-      # tls.crt → /etc/openFuyao/bkeagent/tls.crt
-      # tls.key → /etc/openFuyao/bkeagent/tls.key
-      # ca.crt → /etc/openFuyao/bkeagent/ca.crt
-      # kubeconfig → /etc/openFuyao/bkeagent/kubeconfig
+      # 5. 配置文件由 ConfigRenderer 自动上传到对应路径
+      # - node → /etc/openFuyao/bkeagent/node
+      # - TLS 证书 → /etc/openFuyao/certs/
+      # - Kubeconfig → /etc/openFuyao/bkeagent/config
+      # - CSR 配置 → /etc/openFuyao/certs/cert_config/
 
+      # 6. 安装 systemd service
+      # 注：实际部署中 service 文件从 HTTP 仓库下载
+      # 此处为简化示例，展示 service 文件内容
       cat > /etc/systemd/system/bkeagent.service << 'EOF'
       [Unit]
       Description=BKE Agent
       After=network.target
 
       [Service]
-      ExecStart=/usr/local/bin/bkeagent --config /etc/openFuyao/bkeagent/bkeagent.conf
-      Restart=always
+      Environment="DEBUG=true"
+      ExecStart=/usr/local/bin/bkeagent --kubeconfig=/etc/openFuyao/bkeagent/config --health-port= --ntpserver=
+      KillMode=process
       RestartSec=5
+      Restart=on-failure
+      SuccessExitStatus=0
 
       [Install]
       WantedBy=multi-user.target
       EOF
 
-      # 6. 启动并验证
+      # 7. 设置权限
+      chmod 755 /usr/local/bin/
+      chmod 755 /etc/systemd/system/
+
+      # 8. 启动并验证
       systemctl daemon-reload
       systemctl enable bkeagent
-      systemctl start bkeagent
+      systemctl restart bkeagent
       sleep 2
       systemctl is-active bkeagent
 
@@ -5921,9 +6006,25 @@ spec:
       #!/bin/bash
       systemctl stop bkeagent || true
       systemctl disable bkeagent || true
+      
+      # 删除二进制和备份
       rm -f /usr/local/bin/bkeagent
+      rm -f /usr/local/bin/bkeagent.bak.*
+      
+      # 删除服务文件
       rm -f /etc/systemd/system/bkeagent.service
+      
+      # 删除工作目录
       rm -rf /etc/openFuyao/bkeagent
+      
+      # 删除日志
+      rm -f /var/log/openFuyao/bkeagent.log
+      rm -f /var/log/openFuyao/bkeagent-update.log
+      
+      # 注：证书目录 /etc/openFuyao/certs 默认保留
+      # 如需完全清理，取消注释以下行：
+      # rm -rf /etc/openFuyao/certs
+      
       systemctl daemon-reload
 
     supportedArchitectures: ["amd64", "arm64"]
@@ -5936,7 +6037,7 @@ spec:
         versions: ["V10"]
 
     defaultConfigPath: "/etc/openFuyao/bkeagent"
-    defaultLogPath: "/var/log/bkeagent"
+    defaultLogPath: "/var/log/openFuyao"
 
     healthCheck:
       enabled: true
