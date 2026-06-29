@@ -516,3 +516,168 @@ bkeagent-launcher DaemonSet
 | `/etc/openFuyao/certs/{ca-cert,ca-key}` | 证书 | 集群 CA（可选） |
 | `/etc/openFuyao/certs/cert_config/*` | 配置 | 15 个 CSR 签名配置 |
 | `/var/log/openFuyao/bkeagent.log` | 日志 | Agent 运行日志 |
+
+
+# bkeagent 更新计划：
+
+## 更新计划
+
+### 1. 更新 bkeagent ComponentVersion YAML（11.4.2 节）
+
+**当前设计**：
+```yaml
+artifacts:
+  - name: bkeagent
+    url: "..."
+    installPath: "/usr/local/bin"
+
+configTemplates:
+  - name: bkeagent.conf
+  - name: tls.crt
+  - name: tls.key
+  - name: ca.crt
+  - name: kubeconfig
+```
+
+**实际安装**：
+- **二进制**：1 个（bkeagent）
+- **服务文件**：1 个（bkeagent.service）
+- **配置文件**：2 个（config/kubeconfig, node）
+- **CSR 配置**：17 个（证书签名请求配置）
+- **自更新脚本**：1 个（update.sh）
+- **目录**：多个（/etc/openFuyao/bkeagent, /etc/openFuyao/certs 等）
+
+### 2. 需要补充的内容
+
+#### 2.1 configTemplates 扩展
+
+```yaml
+configTemplates:
+  # 基础配置
+  - name: bkeagent.conf
+    path: "/etc/openFuyao/bkeagent/config"
+    content: |
+      cluster_name: {{clusterName}}
+      api_server: {{apiServer}}
+      ...
+
+  - name: node
+    path: "/etc/openFuyao/bkeagent/node"
+    content: "{{nodeHostname}}"
+
+  # 服务文件
+  - name: bkeagent.service
+    path: "/etc/systemd/system/bkeagent.service"
+    content: |
+      [Unit]
+      Description=BKE Agent
+      ...
+
+  # TLS 证书（条件安装）
+  - name: trust-chain.crt
+    path: "/etc/openFuyao/certs/trust-chain.crt"
+    secretRef:
+      name: bkeagent-tls
+      namespace: "{{clusterNamespace}}"
+      key: trust-chain.crt
+
+  # CSR 配置文件（17 个）
+  - name: cluster-ca-policy.json
+    path: "/etc/openFuyao/certs/cert_config/cluster-ca-policy.json"
+    content: |
+      {...}
+  # ... 其他 16 个 CSR 配置
+```
+
+#### 2.2 installScript 扩展
+
+```yaml
+installScript: |
+  #!/bin/bash
+  set -e
+
+  # 1. 创建目录
+  mkdir -p /etc/openFuyao/bkeagent
+  mkdir -p /etc/openFuyao/bkeagent/bin
+  mkdir -p /etc/openFuyao/bkeagent/scripts
+  mkdir -p /etc/openFuyao/certs
+  mkdir -p /etc/openFuyao/certs/cert_config
+  mkdir -p /var/log/openFuyao
+
+  # 2. 停止旧服务
+  systemctl stop bkeagent || true
+
+  # 3. 备份旧版本
+  {{if .isUpgrade}}
+  cp /usr/local/bin/bkeagent /usr/local/bin/bkeagent.bak.$(date +%s)
+  {{end}}
+
+  # 4. 安装二进制
+  install -m 0755 {{artifact.bkeagent.path}} /usr/local/bin/bkeagent
+
+  # 5. 安装配置文件（由 ConfigRenderer 自动上传）
+  # - bkeagent.conf → /etc/openFuyao/bkeagent/config
+  # - node → /etc/openFuyao/bkeagent/node
+  # - bkeagent.service → /etc/systemd/system/bkeagent.service
+  # - TLS 证书 → /etc/openFuyao/certs/
+  # - CSR 配置 → /etc/openFuyao/certs/cert_config/
+
+  # 6. 安装自更新脚本
+  # update.sh 由 bkeagent 二进制自动部署到 /etc/openFuyao/bkeagent/scripts/
+
+  # 7. 启动服务
+  systemctl daemon-reload
+  systemctl enable bkeagent
+  systemctl start bkeagent
+
+  # 8. 验证
+  sleep 2
+  systemctl is-active bkeagent
+```
+
+#### 2.3 uninstallScript 扩展
+
+```yaml
+uninstallScript: |
+  #!/bin/bash
+  systemctl stop bkeagent || true
+  systemctl disable bkeagent || true
+  
+  # 删除二进制
+  rm -f /usr/local/bin/bkeagent
+  rm -f /usr/local/bin/bkeagent.bak.*
+  
+  # 删除服务文件
+  rm -f /etc/systemd/system/bkeagent.service
+  
+  # 删除工作目录
+  rm -rf /etc/openFuyao/bkeagent
+  
+  # 删除证书目录（可选，保留证书以便重新安装）
+  # rm -rf /etc/openFuyao/certs
+  
+  # 删除日志
+  rm -f /var/log/openFuyao/bkeagent.log
+  rm -f /var/log/openFuyao/bkeagent-update.log
+  
+  systemctl daemon-reload
+```
+
+### 3. 需要澄清的问题
+
+1. **CSR 配置文件**：这 17 个文件是每次安装都需要，还是只在首次安装时生成？
+   - 如果是首次安装，应该放在 `installScript` 中
+   - 如果是每次升级，应该放在 `configTemplates` 中
+
+2. **自更新脚本**：`update.sh` 是由 bkeagent 二进制自动部署，还是需要手动安装？
+
+3. **Launcher 目录**：`/etc/openFuyao/bkeagent/launcher` 是否需要手动创建？
+
+4. **RBAC 资源**：这些是在管理集群创建的，不属于目标节点安装，不需要在 ComponentVersion 中定义
+
+### 4. 设计文档更新步骤
+
+1. 更新 11.4.2 节的 bkeagent YAML 示例
+2. 扩展 configTemplates 列表
+3. 更新 installScript/uninstallScript
+4. 添加必要的注释说明
