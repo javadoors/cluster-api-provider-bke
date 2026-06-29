@@ -4090,6 +4090,72 @@ func NewScheduler(cfg Config) *Scheduler {
 - **TemplateRenderer**：无状态（仅 funcMap），全局共享；**ConfigRenderer**：需 K8s client（读取 Secret），按需创建
 - **各 Config 类型定义**：`BinaryInstallerConfig`（第 4 章）、`HelmInstallerConfig`（第 5 章）、`NewConfigRenderer`（第 9 章）
 
+#### BundleCVStore 实现（ComponentVersionStore 适配）
+
+**设计思路 — 镜像 BundleStore 的查找模式**：
+
+`ComponentVersionStore` 接口（见 9.1.3）需要从 `*releasemanifest.Bundle` 加载 `ComponentVersion` 对象。现有 `pkg/manifest/bundle_store.go` 的 `BundleStore.GetComponentManifests` 已实现相同的 `bundle.Components[ComponentKey(name, version)]` 查找模式（bundle_store.go:41-44），但仅返回清单字节（`*ComponentPackage`），不暴露 `ComponentVersion` 对象本身。
+
+`BundleCVStore` 与 `BundleStore` 互补——两者各自适配同一 `Bundle` 的不同侧面：
+
+| 类型 | 实现接口 | 返回 | 用途 |
+|------|---------|------|------|
+| `BundleStore` | `manifest.Store` | `*ComponentPackage`（清单字节） | YAML 执行器应用清单 |
+| `BundleCVStore` | `dagexec.ComponentVersionStore` | `*ComponentVersion`（CV 对象） | 类型分发 + Executor 读取 spec |
+
+`Bundle.Components` 是 `map[string]apiv1.ComponentVersion`（值类型），键由 `releasemanifest.ComponentKey(name, version)` 生成（格式 `"name@version"`）。map 取值即为副本，返回其指针可避免调用方修改 bundle 原始对象。
+
+```go
+// pkg/manifest/bundle_cv_store.go
+
+package manifest
+
+import (
+	"context"
+	"fmt"
+
+	configv1alpha1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/v1alpha1"
+	releasemanifest "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/release/manifest"
+)
+
+// BundleCVStore 适配 *releasemanifest.Bundle 实现 dagexec.ComponentVersionStore。
+// 镜像 BundleStore.GetComponentManifests 的查找模式 (bundle_store.go:41-44):
+//
+//	key := releasemanifest.ComponentKey(name, version)
+//	cv, ok := bundle.Components[key]
+//
+// 与 BundleStore 的关系: 两者各自适配同一 Bundle 的不同侧面——
+// BundleStore 返回清单字节 (manifest.Store), BundleCVStore 返回 CV 对象 (ComponentVersionStore)。
+type BundleCVStore struct {
+	bundle *releasemanifest.Bundle
+}
+
+// NewBundleCVStore 创建 ComponentVersionStore 的 Bundle 适配实现
+func NewBundleCVStore(bundle *releasemanifest.Bundle) *BundleCVStore {
+	return &BundleCVStore{bundle: bundle}
+}
+
+// GetComponentVersion 从 Bundle.Components 按 (name, version) 加载 ComponentVersion。
+// 复用 releasemanifest.ComponentKey 生成查找键 "name@version"。
+// map value 是值类型，取出即为副本，返回其指针避免调用方修改 bundle 原始对象。
+func (s *BundleCVStore) GetComponentVersion(
+	_ context.Context,
+	name, version string,
+) (*configv1alpha1.ComponentVersion, error) {
+	if s == nil || s.bundle == nil {
+		return nil, fmt.Errorf("release bundle is not initialized")
+	}
+	key := releasemanifest.ComponentKey(name, version)
+	cv, ok := s.bundle.Components[key]
+	if !ok {
+		return nil, fmt.Errorf("component %s not found in release bundle", key)
+	}
+	return &cv, nil
+}
+```
+
+> **错误信息约定**：与 `BundleStore.GetComponentManifests` 一致——未找到时返回 `"component %s not found in release bundle"`，其中 `%s` 为 `name@version` 键。
+
 ```go
 // controllers/capbke/bkecluster_upgrade_dag.go 扩展
 
