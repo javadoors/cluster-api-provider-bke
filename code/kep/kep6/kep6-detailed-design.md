@@ -3119,35 +3119,31 @@ YAML 组件采用与 Binary/Helm 对称的两层结构：`YamlComponentExecutor`
 // pkg/yamlinstaller/installer.go
 
 // YamlInstaller YAML 组件安装器（引擎层，对称 BinaryInstaller/HelmInstaller）
-// 持有 manifest.Applier，负责清单 Apply + 健康检查。
+// 持有 manifest.Store (加载清单) + manifest.Applier (应用清单)，负责清单 Apply + 健康检查。
 // 相比 BinaryInstaller 无 SSH/下载/缓存子层，逻辑较简单。
 type YamlInstaller struct {
-    applier manifest.Applier          // 接口类型，现有 manifest.ClusterApplier 实现
+    store   manifest.Store            // 加载清单 (复用 BundleStore.GetComponentManifests)
+    applier manifest.Applier          // 应用清单 (现有 manifest.ClusterApplier 实现)
     logger  *bkev1beta1.BKELogger
 }
 
 type YamlInstallerConfig struct {
+    Store   manifest.Store
     Applier manifest.Applier
     Logger  *bkev1beta1.BKELogger
 }
 
 func NewYamlInstaller(cfg YamlInstallerConfig) *YamlInstaller {
-    return &YamlInstaller{applier: cfg.Applier, logger: cfg.Logger}
+    return &YamlInstaller{store: cfg.Store, applier: cfg.Applier, logger: cfg.Logger}
 }
 
 // Apply 应用 YAML 清单 + 健康检查 (由 YamlComponentExecutor 委托调用)
 func (i *YamlInstaller) Apply(ctx context.Context, cv *configv1alpha1.ComponentVersion, execCtx *ExecutionContext) error {
-    // 构建 ComponentPackage
-    // 注意: manifest.ComponentPackage (pkg/manifest/types.go:18-22) 字段为
-    //       Name/Version/Manifests [][]byte，无 Resources 字段。
-    // 清单字节由 releasemanifest.CollectComponentManifests(bundle, name, version) 收集
-    // (含 cv.Spec.Resources[].Manifest 内联清单)，再填入 ComponentPackage.Manifests。
-    // 若需直接应用 Resources，应在 pkg/manifest/types.go 扩展 ComponentPackage 字段，
-    // 或由 cvStore 实现层完成收集。
-    pkg := &manifest.ComponentPackage{
-        Name:      cv.Spec.Name,
-        Version:   cv.Spec.Version,
-        Manifests: collectManifestsFor(cv),  // 收集 cv.Spec.YAML.Manifests + cv.Spec.Resources
+    // 通过 manifest.Store 加载清单 (复用 BundleStore.GetComponentManifests 逻辑:
+    // bundle 文件 (components/<name>/<version>/*.yaml) + cv.Spec.Resources 内联清单)
+    pkg, err := i.store.GetComponentManifests(ctx, cv.Spec.Name, cv.Spec.Version, execCtx.TemplateContext)
+    if err != nil {
+        return fmt.Errorf("get manifests for %s: %w", cv.Spec.Name, err)
     }
 
     // 应用 Manifest
@@ -4214,9 +4210,10 @@ func (r *BKEClusterReconciler) buildSchedulerConfig(
             },
         )
 
-        // 4. YamlInstaller (复用 ManifestApplier；对称 Binary/Helm 的 Installer 注入)
+        // 4. YamlInstaller (复用 ManifestStore + ManifestApplier；对称 Binary/Helm 的 Installer 注入)
         cfg.YAMLInstaller = yamlinstaller.NewYamlInstaller(
             yamlinstaller.YamlInstallerConfig{
+                Store:   cfg.ManifestStore,   // 复用基础依赖 (manifest.NewBundleStore(bundle))
                 Applier: cfg.ManifestApplier, // 复用基础依赖
                 Logger:  bkeLogger,
             },
