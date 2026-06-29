@@ -293,7 +293,7 @@ type ComponentVersionSpec struct {
     // 注意: 此字段位于顶层是历史原因——最初无独立 YAML 类型, Resources 用于所有类型
     // 新增 YAML 类型后, 理论上应迁移至 YAMLSpec, 但为保持向后兼容暂不移动
     // 后续版本可考虑: ① 迁移到 YAMLSpec; ② 或保持顶层但标注仅 YAML 类型生效
-    // 当前代码中 EnsurePreUpgradeResources Phase 和 ManifestComponentExecutor 均使用此字段
+    // 当前代码中 EnsurePreUpgradeResources Phase 和 YamlComponentExecutor 均使用此字段
     Resources []ResourceSpec `json:"resources,omitempty"`
 }
 
@@ -2708,7 +2708,7 @@ func (i *HelmInstaller) upgrade(ctx context.Context, actionConfig *action.Config
 // 与 Helm --wait 的关系: 两者同时生效, --wait 先执行 (Helm 命令内部),
 // 自定义 healthCheck 后执行 (Helm 命令返回后), 互补非互斥
 //
-// 复用共享 pkg/healthcheck 包 (与 ManifestComponentExecutor 共用)，
+// 复用共享 pkg/healthcheck 包 (与 YamlComponentExecutor 共用)，
 // 此处仅做委托，避免与 YAML 执行器重复实现 PodReady/EndpointReady/Custom。
 func (i *HelmInstaller) runHealthCheck(
     ctx context.Context,
@@ -3845,7 +3845,7 @@ func (s *Scheduler) executeComponentLegacy(
         inlineExec := &InlineComponentExecutor{runner: s.inlineRunner}
         return inlineExec.ExecuteComponent(ctx, node, execCtx)
     }
-    return s.executeManifest(ctx, execCtx, node, tmpl)
+    return s.executeYaml(ctx, execCtx, node, tmpl)
 }
 ```
 
@@ -3885,7 +3885,7 @@ type Config struct {
     ManifestApplier     manifest.Applier
     BinaryInstaller     BinaryInstaller       // 新增 (Feature Gate ON 时注入)
     HelmInstaller       HelmInstaller         // 新增
-    YAMLExecutor        YAMLManifestExecutor  // 新增
+    YAMLInstaller       *yamlinstaller.YamlInstaller  // 新增 (pkg/yamlinstaller, 对称 Binary/Helm)
     NodeProvider        NodeProvider          // 新增
     MaxParallelPerBatch int
 }
@@ -3922,9 +3922,9 @@ func NewScheduler(cfg Config) *Scheduler {
 
     // YAML 执行器: 依赖已注入时注册
     if cfg.YAMLExecutor != nil {
-        registry.Register("yaml", &ManifestComponentExecutor{
-            applier: cfg.ManifestApplier,
-            cvStore: cfg.CVStore,
+        registry.Register("yaml", &YamlComponentExecutor{
+            installer: cfg.YAMLInstaller,
+            cvStore:   cfg.CVStore,
         })
     }
 
@@ -4010,12 +4010,11 @@ func (r *BKEClusterReconciler) buildSchedulerConfig(
             },
         )
 
-        // 4. YAMLExecutor (复用 ManifestStore + ManifestApplier)
-        cfg.YAMLExecutor = yamlexecutor.NewYAMLManifestExecutor(
-            yamlexecutor.YAMLManifestExecutorConfig{
-                ManifestStore:   cfg.ManifestStore,   // 复用基础依赖
-                ManifestApplier: cfg.ManifestApplier, // 复用基础依赖
-                Logger:          bkeLogger,
+        // 4. YamlInstaller (复用 ManifestApplier；对称 Binary/Helm 的 Installer 注入)
+        cfg.YAMLInstaller = yamlinstaller.NewYamlInstaller(
+            yamlinstaller.YamlInstallerConfig{
+                Applier: cfg.ManifestApplier, // 复用基础依赖
+                Logger:  bkeLogger,
             },
         )
     }
@@ -4422,12 +4421,12 @@ type ComponentExecutor interface {
 |----------|-----------|-----------|-----------|---------|
 | BinaryComponentExecutor | BinaryInstaller | ✅ Rolling/Parallel/Batch | SSH 下载+渲染+安装 | 脚本式 SSH |
 | HelmComponentExecutor | HelmInstaller | ❌ 无节点级（Helm 部署到集群） | Helm SDK install/upgrade | PodReady/EndpointReady |
-| ManifestComponentExecutor | (无独立 Installer) | ❌ 无节点级（YAML 应用到集群） | K8s API Apply | PodReady/EndpointReady |
+| YamlComponentExecutor | YamlInstaller | ❌ 无节点级（YAML 应用到集群） | K8s API Apply | PodReady/EndpointReady |
 | InlineComponentExecutor | (无独立 Installer) | ❌ 无节点级（Phase 执行） | InlineRunner.Execute | Phase 自身逻辑 |
 
-**Helm/YAML/Inline 无独立 Installer 的原因**：
-- **Helm**：`HelmInstaller` 已存在（第 5 章），但与 `HelmComponentExecutor` 的边界不如 Binary 清晰——Helm 组件部署到集群而非单节点，无节点级并发控制需求
-- **YAML**：清单应用通过 `manifest.Applier` 接口完成（已有），逻辑简单（下载→解析→Apply），无需独立 Installer
+**Helm/YAML/Inline 的 Installer 边界说明**：
+- **Helm**：`HelmInstaller` 已存在（第 5 章），与 `HelmComponentExecutor` 两层分离——Helm 组件部署到集群而非单节点，无节点级并发控制需求
+- **YAML**：`YamlInstaller`（`pkg/yamlinstaller`）负责清单 Apply + 健康检查，与 `YamlComponentExecutor` 两层分离（对称 Binary/Helm）；但 `YamlInstaller` 内部仅 Apply + healthcheck，无 SSH/下载/缓存等复杂子层
 - **Inline**：直接调用 `InlineRunner.Execute()`，无制品下载/模板渲染，无需 Installer
 
 **Binary 是唯一需要独立 Installer 的类型**，因为 Binary 组件的安装逻辑最复杂（SSH 发现架构→下载制品→缓存→校验→渲染脚本→渲染配置→SSH 上传→SSH 执行→健康检查），且需要逐节点执行（节点级并发控制）。
@@ -4809,63 +4808,48 @@ func (e *HelmComponentExecutor) ExecuteComponent(ctx context.Context, node *Comp
 }
 ```
 
-##### 7.3.3.3 ManifestComponentExecutor (YAML)
+##### 7.3.3.3 YamlComponentExecutor (YAML)
 
-**设计思路 — YAML 组件无独立 Installer**：
+**设计思路 — YAML 组件两层模型（与 Binary/Helm 对称）**：
 
-YAML 组件通过 K8s API 应用清单（ServerSideApply/Replace/CreateOnly），逻辑简单（下载→解析→Apply），无需独立 Installer。直接复用现有的 `manifest.Applier` 接口完成清单应用。
+YAML 组件采用与 Binary/Helm 对称的两层结构：`YamlComponentExecutor`（dagexec 调度层）+ `YamlInstaller`（`pkg/yamlinstaller` 引擎层）。`YamlInstaller` 持有 `manifest.Applier`，负责清单 Apply + 健康检查；与 `BinaryInstaller`/`HelmInstaller` 命名对称。区别仅在 `YamlInstaller` 内部更简单——无 SSH/下载/缓存等子层，仅 Apply + healthcheck。
 
-**Executor 直接完成的全部逻辑**：
-- 获取 ComponentVersion → VersionContext 判断是否需要执行 → 构建 ComponentPackage → `applier.ApplyComponent()` → 健康检查（PodReady/EndpointReady/Custom）
+| 层 | Binary | Helm | YAML |
+|----|--------|------|------|
+| dagexec 执行器 | `BinaryComponentExecutor` | `HelmComponentExecutor` | `YamlComponentExecutor` |
+| 独立包引擎 | `binaryinstaller.BinaryInstaller` | `helminstaller.HelmInstaller` | `yamlinstaller.YamlInstaller` |
+
+**Executor（调度层）完成的逻辑**：
+- 获取 ComponentVersion → VersionContext 判断是否需要执行 → 委托 `YamlInstaller.Apply()` → 处理失败策略
 - 无节点级调度（应用到集群而非单节点）
 - 无回滚机制（SSA 天然支持幂等，重新 Apply 上一版本即可回滚）
 
-**与 Binary/Helm 的区别**：
-- Binary：Executor 调度 + Installer 执行（SSH 层），两层分离
-- Helm：Executor 调度 + HelmInstaller 执行（Helm SDK 层），两层分离
-- YAML：Executor 直接执行（K8s API 层），无独立 Installer，因为逻辑简单无需分层
+**Installer（引擎层）完成的逻辑**（`YamlInstaller.Apply`）：
+- 构建 ComponentPackage → `applier.ApplyComponent()` → 健康检查（PodReady/EndpointReady/Custom）
 
 ```go
-// ManifestComponentExecutor YAML/Manifest 组件执行器
-//
-// 字段类型说明:
-// - applier 为 manifest.Applier 接口 (非指针)；现有 manifest.ClusterApplier 实现该接口
-// - cvStore 为 ComponentVersionStore 接口，用于加载 ComponentVersion
-//   (manifest.Store 接口仅有 GetComponentManifests，无 GetComponentVersion)
-// - 清单数据通过 releasemanifest.CollectComponentManifests(bundle, name, version)
-//   收集后，由 manifest.ClusterApplier.ApplyComponent 应用
-type ManifestComponentExecutor struct {
-    applier manifest.Applier          // 接口类型，非 *manifest.Applier
-    cvStore ComponentVersionStore
+// pkg/yamlinstaller/installer.go
+
+// YamlInstaller YAML 组件安装器（引擎层，对称 BinaryInstaller/HelmInstaller）
+// 持有 manifest.Applier，负责清单 Apply + 健康检查。
+// 相比 BinaryInstaller 无 SSH/下载/缓存子层，逻辑较简单。
+type YamlInstaller struct {
+    applier manifest.Applier          // 接口类型，现有 manifest.ClusterApplier 实现
+    logger  *bkev1beta1.BKELogger
 }
 
-func (e *ManifestComponentExecutor) GetComponentType() ComponentType {
-    return ComponentTypeYAML
+type YamlInstallerConfig struct {
+    Applier manifest.Applier
+    Logger  *bkev1beta1.BKELogger
 }
 
-// ExecuteComponent 执行 YAML/Manifest 组件
-func (e *ManifestComponentExecutor) ExecuteComponent(ctx context.Context, node *ComponentNode, execCtx *ExecutionContext) error {
-    component := node.Component
-    
-    // 1. 获取 ComponentVersion (通过 ComponentVersionStore)
-    cv, err := e.cvStore.GetComponentVersion(ctx, component.Name, component.Version)
-    if err != nil {
-        return fmt.Errorf("failed to get component version: %w", err)
-    }
-    
-    // 2. 确认是 YAML 类型
-    if cv.Spec.Type != configv1alpha1.ComponentTypeYAML {
-        return fmt.Errorf("component %s is not a yaml component", component.Name)
-    }
-    
-    // 3. 根据 VersionContext 判断是否需要执行 (幂等性检查)
-    vc := execCtx.VersionContext
-    if vc != nil && !vc.NeedsUpgrade(component.Name) {
-        execCtx.Log.Info("component %s already at target version, skipping", component.Name)
-        return nil
-    }
-    
-    // 4. 构建 ComponentPackage
+func NewYamlInstaller(cfg YamlInstallerConfig) *YamlInstaller {
+    return &YamlInstaller{applier: cfg.Applier, logger: cfg.Logger}
+}
+
+// Apply 应用 YAML 清单 + 健康检查 (由 YamlComponentExecutor 委托调用)
+func (i *YamlInstaller) Apply(ctx context.Context, cv *configv1alpha1.ComponentVersion, execCtx *ExecutionContext) error {
+    // 构建 ComponentPackage
     // 注意: manifest.ComponentPackage (pkg/manifest/types.go:18-22) 字段为
     //       Name/Version/Manifests [][]byte，无 Resources 字段。
     // 清单字节由 releasemanifest.CollectComponentManifests(bundle, name, version) 收集
@@ -4873,29 +4857,70 @@ func (e *ManifestComponentExecutor) ExecuteComponent(ctx context.Context, node *
     // 若需直接应用 Resources，应在 pkg/manifest/types.go 扩展 ComponentPackage 字段，
     // 或由 cvStore 实现层完成收集。
     pkg := &manifest.ComponentPackage{
-        Name:      component.Name,
-        Version:   component.Version,
+        Name:      cv.Spec.Name,
+        Version:   cv.Spec.Version,
         Manifests: collectManifestsFor(cv),  // 收集 cv.Spec.YAML.Manifests + cv.Spec.Resources
     }
-    
-    // 5. 应用 Manifest
-    if err := e.applier.ApplyComponent(ctx, pkg); err != nil {
-        return fmt.Errorf("apply manifests for %s: %w", component.Name, err)
+
+    // 应用 Manifest
+    if err := i.applier.ApplyComponent(ctx, pkg); err != nil {
+        return fmt.Errorf("apply manifests for %s: %w", cv.Spec.Name, err)
     }
-    
-    // 6. 健康检查 (应用清单后验证 Pod/Endpoint 就绪)
+
+    // 健康检查 (应用清单后验证 Pod/Endpoint 就绪)
     // 复用共享 pkg/healthcheck 包 (见本节末尾)，避免与 HelmInstaller 重复
     if cv.Spec.YAML != nil && cv.Spec.YAML.HealthCheck != nil && cv.Spec.YAML.HealthCheck.Enabled {
         if err := healthcheck.Run(ctx, execCtx.TargetClient, *cv.Spec.YAML.HealthCheck); err != nil {
-            return fmt.Errorf("health check failed for %s: %w", component.Name, err)
+            return fmt.Errorf("health check failed for %s: %w", cv.Spec.Name, err)
         }
     }
-    
     return nil
 }
 ```
 
-// 健康检查逻辑抽取到共享包 pkg/healthcheck，ManifestComponentExecutor 与
+```go
+// pkg/dagexec/yaml_component_executor.go
+
+// YamlComponentExecutor YAML 组件执行器（调度层）
+// 持有 *yamlinstaller.YamlInstaller + ComponentVersionStore，
+// 负责 VersionContext 判断 + CV 加载 + 委托 YamlInstaller.Apply 执行。
+type YamlComponentExecutor struct {
+    installer *yamlinstaller.YamlInstaller
+    cvStore   ComponentVersionStore
+}
+
+func (e *YamlComponentExecutor) GetComponentType() ComponentType {
+    return ComponentTypeYAML
+}
+
+// ExecuteComponent 执行 YAML/Manifest 组件
+func (e *YamlComponentExecutor) ExecuteComponent(ctx context.Context, node *ComponentNode, execCtx *ExecutionContext) error {
+    component := node.Component
+
+    // 1. 获取 ComponentVersion (通过 ComponentVersionStore)
+    cv, err := e.cvStore.GetComponentVersion(ctx, component.Name, component.Version)
+    if err != nil {
+        return fmt.Errorf("failed to get component version: %w", err)
+    }
+
+    // 2. 确认是 YAML 类型
+    if cv.Spec.Type != configv1alpha1.ComponentTypeYAML {
+        return fmt.Errorf("component %s is not a yaml component", component.Name)
+    }
+
+    // 3. 根据 VersionContext 判断是否需要执行 (幂等性检查)
+    vc := execCtx.VersionContext
+    if vc != nil && !vc.NeedsUpgrade(component.Name) {
+        execCtx.Log.Info("component %s already at target version, skipping", component.Name)
+        return nil
+    }
+
+    // 4. 委托 YamlInstaller 执行 Apply + 健康检查
+    return e.installer.Apply(ctx, cv, execCtx)
+}
+```
+
+// 健康检查逻辑抽取到共享包 pkg/healthcheck，YamlInstaller 与
 // HelmInstaller 共用，避免重复实现 (PodReady/EndpointReady/Custom)。
 //
 // 共享接口:
@@ -4907,7 +4932,7 @@ func (e *ManifestComponentExecutor) ExecuteComponent(ctx context.Context, node *
 // - EndpointReady: clientset.CoreV1().Endpoints(ns).Get(serviceName)
 // - Custom: exec.CommandContext("/bin/sh","-c",command)
 //
-// ManifestComponentExecutor 调用 (见 ExecuteComponent 第 6 步):
+// YamlInstaller.Apply 调用 (见上方 Apply 第 3 步):
 //   healthcheck.Run(ctx, execCtx.TargetClient, *cv.Spec.YAML.HealthCheck)
 //
 // HelmInstaller 同样改为调用 healthcheck.Run(ctx, i.clientset, helm.HealthCheck)，
@@ -4931,9 +4956,9 @@ Inline 组件通过 `ComponentFactory` 注册的 handler 执行（如 `EnsureMas
 - 健康检查由 Phase 自身的 `NeedExecute()` 逻辑处理，无需额外健康检查
 
 **与其他 Executor 的区别**：
-- Binary：Executor 调度（Rolling/Batch）+ Installer 执行（SSH）
+- Binary：Executor 调度（Rolling/Batch）+ BinaryInstaller 执行（SSH）
 - Helm：Executor 调度（Mode 覆盖）+ HelmInstaller 执行（Helm SDK）
-- YAML：Executor 直接执行（K8s API Apply + 健康检查）
+- YAML：Executor 调度（VersionContext 判断）+ YamlInstaller 执行（K8s API Apply + 健康检查）
 - Inline：Executor 直接委托（InlineRunner.Execute），仅做接口适配
 
 **适配 ComponentExecutor 接口的目的**：
@@ -5051,14 +5076,14 @@ func parseDurationDefault(s string, defaultVal time.Duration) time.Duration {
 
 ### 8.1 安装流程图
 
-**设计思路**：完整安装流程从用户创建 BKECluster 开始，经过 ReleaseImage 解析、ComponentVersion 加载、DAG 构建、DAG 执行，最终完成所有组件的安装。流程中 Binary/Helm/YAML/Inline 四种类型的组件通过各自的 Executor 并行执行——Binary 组件通过 SSH 在远程节点安装二进制制品，Helm 组件通过 Helm SDK 部署 Chart，YAML 组件通过 YAMLManifestExecutor 将 Kubernetes 清单直接应用到目标集群，Inline 组件通过内联执行器完成 Kubernetes 集群初始化。所有组件安装完成后通过健康检查确认安装成功。
+**设计思路**：完整安装流程从用户创建 BKECluster 开始，经过 ReleaseImage 解析、ComponentVersion 加载、DAG 构建、DAG 执行，最终完成所有组件的安装。流程中 Binary/Helm/YAML/Inline 四种类型的组件通过各自的 Executor 并行执行——Binary 组件通过 SSH 在远程节点安装二进制制品，Helm 组件通过 Helm SDK 部署 Chart，YAML 组件通过 YamlComponentExecutor 将 Kubernetes 清单直接应用到目标集群，Inline 组件通过内联执行器完成 Kubernetes 集群初始化。所有组件安装完成后通过健康检查确认安装成功。
 
 **关键设计点**：
 - **声明式安装**：通过 ReleaseImage 声明需要安装的组件列表
 - **DAG 调度**：根据组件依赖关系构建 DAG，按拓扑顺序执行
 - **多类型支持**：Binary、Helm、YAML、Inline
 - **健康检查**：安装完成后执行 PodReady/EndpointReady 检查
-- **YAML 清单应用**：YAML 类型组件通过 YAMLManifestExecutor 应用 Kubernetes 清单，支持 ServerSideApply/Replace/CreateOnly 三种策略
+- **YAML 清单应用**：YAML 类型组件通过 YamlComponentExecutor 应用 Kubernetes 清单，支持 ServerSideApply/Replace/CreateOnly 三种策略
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -5184,7 +5209,7 @@ func parseDurationDefault(s string, defaultVal time.Duration) time.Duration {
                                          │
                                          ▼
                      ┌──────────────────────────────────────┐
-                      │  8. YAMLManifestExecutor             │
+                      │  8. YamlComponentExecutor             │
                       │  执行 YAML 类型组件安装              │
                      └────────────────────┬─────────────────┘
                                           │
@@ -6093,20 +6118,20 @@ spec:
 |------|---------|---------|------|
 | **BinaryInstaller 核心实现** | 5 人日 | 中 | 无 |
 | **HelmInstaller 核心实现** | 5 人日 | 中 | 无 |
-| **YAMLManifestExecutor 核心实现** | 5 人日 | 中 | 无 |
+| **YamlComponentExecutor 核心实现** | 5 人日 | 中 | 无 |
 | **TemplateRenderer 实现** | 3 人日 | 低 | 无 |
 | **ConfigRenderer 实现** | 3 人日 | 低 | TemplateRenderer |
-| **ApplyStrategy 引擎实现** | 3 人日 | 中 | YAMLManifestExecutor |
+| **ApplyStrategy 引擎实现** | 3 人日 | 中 | YamlComponentExecutor |
 | **Prune 裁剪功能实现** | 3 人日 | 中 | ApplyStrategy 引擎 |
 | **PreInstallHooks 执行引擎** | 3 人日 | 中 | HelmInstaller |
 | **Binary 健康检查实现** | 2 人日 | 中 | BinaryInstaller |
-| **YAML 健康检查实现** | 1 人日 | 低 | YAMLManifestExecutor (复用 Helm 健康检查逻辑) |
+| **YAML 健康检查实现** | 1 人日 | 低 | YamlComponentExecutor (复用 Helm 健康检查逻辑) |
 | **ComponentVersion CRD 扩展** | 3 人日 | 低 | 无 |
 | **CRD v1alpha2 版本迁移** | 2 人日 | 中 | CRD 扩展 |
 | **VersionContext 与 ExecutionContext 实现** | 3 人日 | 中 | 无 |
 | **BinaryComponentExecutor 集成** | 3 人日 | 中 | BinaryInstaller |
 | **HelmComponentExecutor 集成** | 3 人日 | 中 | HelmInstaller |
-| **YAMLManifestExecutor 集成** | 2 人日 | 中 | YAMLManifestExecutor |
+| **YamlComponentExecutor 集成** | 2 人日 | 中 | YamlComponentExecutor |
 | **ComponentVersion YAML 编写** | 2 人日 | 低 | CRD 扩展 |
 | **DAG 调度器适配** | 3 人日 | 低 | Executor 集成 |
 | **Feature Gate 实现** | 1 人日 | 低 | 无 |
@@ -6422,7 +6447,7 @@ BKEClusterReconciler.Reconcile()
   │         │   ├─ helm install --atomic --wait
   │         │   └─ HealthCheck: PodReady (kube-dns) → ✅
   │         │
-  │         └─ openfuyao-core: YAMLManifestExecutor
+  │         └─ openfuyao-core: YamlComponentExecutor
   │             ├─ VersionContext.HasCurrent("openfuyao-core") = false → 需要安装
   │             ├─ resolveManifests(): 从 URL 下载 crds.yaml + deployment.yaml
   │             ├─ parseYAMLDocuments(): 解析多文档 YAML
@@ -6548,7 +6573,7 @@ ClusterVersionReconciler.Reconcile()
   │         │   │   └─ 失败 → helm 自动回滚到 v1.10.1 (atomic)
   │         │   └─ HealthCheck: PodReady (kube-dns) → ✅
   │         │
-  │         └─ openfuyao-core: YAMLManifestExecutor
+  │         └─ openfuyao-core: YamlComponentExecutor
   │             ├─ VersionContext.NeedsUpgrade("openfuyao-core") = true
   │             ├─ resolveManifests(): 下载 v26.03 清单
   │             ├─ ApplyWithStrategy(ServerSideApply): 增量更新
