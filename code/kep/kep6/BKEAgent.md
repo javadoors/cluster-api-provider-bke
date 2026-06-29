@@ -668,11 +668,8 @@ uninstallScript: |
 1. **CSR 配置文件**：这 17 个文件是每次安装都需要，还是只在首次安装时生成？
    - 如果是首次安装，应该放在 `installScript` 中
    - 如果是每次升级，应该放在 `configTemplates` 中
-
 2. **自更新脚本**：`update.sh` 是由 bkeagent 二进制自动部署，还是需要手动安装？
-
 3. **Launcher 目录**：`/etc/openFuyao/bkeagent/launcher` 是否需要手动创建？
-
 4. **RBAC 资源**：这些是在管理集群创建的，不属于目标节点安装，不需要在 ComponentVersion 中定义
 
 ### 4. 设计文档更新步骤
@@ -681,3 +678,50 @@ uninstallScript: |
 2. 扩展 configTemplates 列表
 3. 更新 installScript/uninstallScript
 4. 添加必要的注释说明
+
+# 根据代码分析，这 17 个 CSR 配置文件的作用如下：
+
+## 用途
+
+这些文件是 **CFSSL（CloudFlare PKI 工具包）配置模板**，用于定义 Kubernetes PKI 证书的参数：
+
+| 文件 | 用途 |
+|------|------|
+| `cluster-ca-policy.json` | 集群根 CA 签名策略 |
+| `cluster-ca-csr.json` | 集群根 CA 证书 CSR |
+| `sign-policy.json` | 通用签名策略 |
+| `apiserver-csr.json` | API Server 服务端证书 |
+| `apiserver-etcd-client-csr.json` | API Server 访问 etcd 的客户端证书 |
+| `front-proxy-client-csr.json` | Front Proxy 客户端证书 |
+| `apiserver-kubelet-client-csr.json` | API Server 访问 kubelet 的客户端证书 |
+| `front-proxy-ca-csr.json` | Front Proxy CA 证书 |
+| `etcd-ca-csr.json` | etcd CA 证书 |
+| `etcd-server-csr.json` | etcd 服务端证书 |
+| `etcd-healthcheck-client-csr.json` | etcd 健康检查客户端证书 |
+| `etcd-peer-csr.json` | etcd 节点间通信证书 |
+| `admin-kubeconfig-csr.json` | admin kubeconfig 证书 |
+| `kubelet-kubeconfig-csr.json` | kubelet kubeconfig 证书 |
+| `controller-manager-csr.json` | controller-manager 证书 |
+| `scheduler-csr.json` | scheduler 证书 |
+| `kube-proxy-csr.json` | kube-proxy 证书 |
+
+## 是否动态生成？
+
+**静态 JSON 文件，但包含模板变量**：
+1. **文件本身是静态的**：这些 JSON 文件在安装时由 bkeagent 从 Provider 节点复制到目标节点的 `/etc/openFuyao/certs/cert_config/` 目录
+2. **部分字段包含模板变量**：例如 `hosts` 字段可以包含 `{{ClusterName}}`、`{{AdvertiseAddress}}` 等变量，在证书生成时由 `CertConfigLoader.processTemplateHosts()` 动态替换
+3. **加载方式**（`pkg/certs/config.go`）：
+   - **优先从 ConfigMap 加载**：`kube-system/cluster-cert-config`
+   - **回退到本地文件**：`/etc/openFuyao/certs/cert_config/`
+   - 如果都不存在，使用默认证书逻辑
+
+## 消费者
+
+| 消费者 | 位置 | 作用 |
+|--------|------|------|
+| 管理平面控制器 | `pkg/certs/config.go` | 加载配置，应用到证书生成 |
+| 目标节点 bkeagent | `utils/bkeagent/pkiutil/kubeconfig.go` | 生成本地证书 |
+
+## 总结
+
+这些文件是**可定制的证书配置模板**，允许用户自定义 Kubernetes 集群的 PKI 证书参数（如 CN、O、OU、有效期、密钥大小等）。文件本身是静态 JSON，但支持模板变量在运行时动态替换。
