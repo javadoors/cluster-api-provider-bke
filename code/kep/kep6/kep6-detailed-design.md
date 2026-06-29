@@ -25,7 +25,7 @@
 6. [YamlInstaller 详细设计](#6-yamlinstaller-详细设计)
    - 6.3 健康检查
 7. [HealthCheck 共享包设计](#7-healthcheck-共享包设计)
-8. [TemplateRenderer 详细设计](#8-templaterenderer-详细设计)
+8. [模板变量系统与 TemplateContext 详细设计](#8-模板变量系统与-templatecontext-详细设计)
 9. [DAG 集成详细设计](#9-dag-集成详细设计)
 10. [完整安装流程详细设计](#10-完整安装流程详细设计)
 11. [完整升级流程详细设计](#11-完整升级流程详细设计)
@@ -3294,11 +3294,11 @@ func checkCustom(ctx context.Context, spec *CustomCheckSpec) (bool, error) {
 
 ---
 
-## 8. TemplateRenderer 详细设计
+## 8. 模板变量系统与 TemplateContext 详细设计
 
 ### 8.0 与现有 TemplateContext 的复用关系
 
-**设计思路**：为避免重复造轮子，TemplateRenderer 复用并扩展现有的 `pkg/manifest.TemplateContext` 结构体。现有 TemplateContext 用于 YAML/Manifest 组件的模板渲染，包含 4 个基础字段。TemplateRenderer 在此基础上扩展，增加 Binary 组件所需的节点信息、制品信息、自定义变量等字段。
+**设计思路**：为避免重复造轮子，本设计复用并扩展现有的 `pkg/manifest.TemplateContext` 结构体。现有 TemplateContext 用于 YAML/Manifest 组件的模板渲染，包含 4 个基础字段。在此基础上扩展，增加 Binary 组件所需的节点信息、制品信息、自定义变量等字段。
 
 **复用策略**：
 - **向后兼容**：现有 TemplateContext 的 4 个字段保持不变，YAML 组件代码无需修改
@@ -3392,7 +3392,7 @@ type ArtifactInfo struct {
 
 ### 8.1 模板变量系统
 
-TemplateRenderer 支持 8 类 50+ 模板变量，覆盖集群、节点、版本、制品、镜像仓库、路径、操作类型和自定义变量。
+模板变量系统支持 8 类 50+ 模板变量，覆盖集群、节点、版本、制品、镜像仓库、路径、操作类型和自定义变量。
 
 **变量与 TemplateContext 字段映射**：
 
@@ -3514,9 +3514,9 @@ installScript: |
   echo "Setting snapshotter to {{.Variables.snapshotter}}"
 ```
 
-### 8.2 TemplateRenderer 渲染流程图
+### 8.2 模板渲染流程图
 
-**设计思路**：TemplateRenderer 的渲染流程分为 5 个主要步骤：接收 TemplateContext、构建制品数据、创建模板解析器、执行模板渲染、返回结果。整个流程复用 DAG 调度器传递的 TemplateContext，避免重复构建模板数据。
+**设计思路**：模板渲染的流程分为 5 个主要步骤：接收 TemplateContext、构建制品数据、创建模板解析器、执行模板渲染、返回结果。整个流程复用 DAG 调度器传递的 TemplateContext，避免重复构建模板数据。
 
 **关键设计点**：
 - **复用 TemplateContext**：直接使用 DAG 调度器构建的 TemplateContext，包含集群、节点、版本等信息
@@ -3527,7 +3527,7 @@ installScript: |
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                        TemplateRenderer 渲染流程                                 │
+│                        模板渲染流程                                              │
 └─────────────────────────────────────────────────────────────────────────────────┘
 
                               ┌──────────────────┐
@@ -3610,7 +3610,7 @@ installScript: |
 
 ### 8.3 TemplateContext 构建流程
 
-**设计思路**：DAG 调度器在执行组件前构建 TemplateContext，包含集群信息、节点基础信息、版本信息等。对于 Binary 组件，还需要在 TemplateRenderer 中填充制品信息。注意：TemplateContext 不包含 NodeOS/NodeOSVersion（由安装脚本自检测），NodeArch 由 BinaryInstaller.Install() 通过 SSH 发现后填入（制品 URL 中的 `{{arch}}` 需要在下载前解析）。
+**设计思路**：DAG 调度器在执行组件前构建 TemplateContext，包含集群信息、节点基础信息、版本信息等。对于 Binary 组件，还需要在 TemplateContext 中填充制品信息。注意：TemplateContext 不包含 NodeOS/NodeOSVersion（由安装脚本自检测），NodeArch 由 BinaryInstaller.Install() 通过 SSH 发现后填入（制品 URL 中的 `{{arch}}` 需要在下载前解析）。
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
