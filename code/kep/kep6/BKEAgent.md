@@ -1,3 +1,257 @@
+# bkeagent 安装完整清单
+
+## bkeagent 安装完整清单
+
+### 一、二进制文件
+
+| 文件 | 目标路径 | 来源 | 权限 |
+|------|---------|------|------|
+| `bkeagent` | `/usr/local/bin/bkeagent` | Provider 镜像或 HTTP 仓库 | 0755 |
+| `bkeagent` (自更新) | `/etc/openFuyao/bkeagent/bin/bkeagent` | HTTP 仓库自更新 | - |
+| `bkeagent.bak.{timestamp}` | `/usr/local/bin/` | 升级时备份（最多保留 3 个） | - |
+
+**代码位置**：
+- `pkg/phaseframe/phases/ensure_bke_agent.go:511-513`
+- `pkg/phaseframe/phaseutil/agentssh/push_upgrade.go:126,179-180`
+
+### 二、Systemd 服务文件
+
+| 文件 | 目标路径 | 模板来源 |
+|------|---------|---------|
+| `bkeagent.service` | `/etc/systemd/system/bkeagent.service` | `hack/bkeagent.service.tmpl` |
+
+**服务文件内容**：
+```ini
+[Unit]
+Description= bkeagent
+After=network.target
+
+[Service]
+Environment="DEBUG=true"
+ExecStart=/usr/local/bin/bkeagent --kubeconfig=/etc/openFuyao/bkeagent/config --health-port= --ntpserver=
+KillMode=process
+RestartSec=5
+Restart=on-failure
+SuccessExitStatus=0
+
+[Install]
+WantedBy=multi-user.target
+```
+**代码位置**：
+- `pkg/phaseframe/phaseutil/bkeagent_service.go:44-57`
+
+### 三、配置文件
+
+| 文件 | 目标路径 | 内容 |
+|------|---------|------|
+| `config` | `/etc/openFuyao/bkeagent/config` | Kubeconfig（管理集群访问凭证） |
+| `node` | `/etc/openFuyao/bkeagent/node` | 节点 hostname |
+
+**Kubeconfig 结构**：
+- Cluster Name: `management-cluster`
+- Context Name: `bkeagent-context`
+- AuthInfo Name: `bkeagent-cert-user`
+- 有效期：100 年
+
+**代码位置**：
+- `pkg/phaseframe/phaseutil/localkubeconfig.go:254-286`
+
+### 四、目录结构
+
+| 目录 | 路径 | 权限 | 用途 |
+|------|------|------|------|
+| bkeagent 工作目录 | `/etc/openFuyao/bkeagent` | 0777 | 主工作目录 |
+| 自更新二进制 | `/etc/openFuyao/bkeagent/bin` | - | 自更新二进制路径 |
+| 自更新脚本 | `/etc/openFuyao/bkeagent/scripts` | - | 自更新脚本路径 |
+| Launcher 目录 | `/etc/openFuyao/bkeagent/launcher` | - | Launcher 工作目录 |
+| 证书目录 | `/etc/openFuyao/certs` | 0755 | TLS 证书存储 |
+| 证书配置目录 | `/etc/openFuyao/certs/cert_config` | - | CSR 配置文件 |
+
+**代码位置**：
+- `utils/const.go:33-35`
+- `pkg/phaseframe/phases/ensure_bke_agent.go:45,49,512`
+
+### 五、TLS 证书文件
+
+| 文件 | 目标路径 | 条件 |
+|------|---------|------|
+| `trust-chain.crt` | `/etc/openFuyao/certs/trust-chain.crt` | 始终安装（如存在） |
+| `global-ca.crt` | `/etc/openFuyao/certs/global-ca.crt` | 仅当 cluster-api addon 存在 |
+| `global-ca.key` | `/etc/openFuyao/certs/global-ca.key` | 仅当 cluster-api addon 存在 |
+
+**代码位置**：
+- `pkg/phaseframe/phases/ensure_bke_agent.go:325-361`
+- `pkg/certs/config_const.go:77-81`
+
+### 六、CSR 配置文件（17 个）
+
+| 文件 | 常量名 |
+|------|--------|
+| `cluster-ca-policy.json` | `ConfigKeyClusterCAPolicy` |
+| `cluster-ca-csr.json` | `ConfigKeyClusterCACSR` |
+| `sign-policy.json` | `ConfigKeySignPolicy` |
+| `apiserver-csr.json` | `ConfigKeyAPIServerCSR` |
+| `apiserver-etcd-client-csr.json` | `ConfigKeyAPIServerEtcdClientCSR` |
+| `front-proxy-client-csr.json` | `ConfigKeyFrontProxyClientCSR` |
+| `apiserver-kubelet-client-csr.json` | `ConfigKeyAPIServerKubeletClientCSR` |
+| `front-proxy-ca-csr.json` | `ConfigKeyFrontProxyCACSR` |
+| `etcd-ca-csr.json` | `ConfigKeyEtcdCACSR` |
+| `etcd-server-csr.json` | `ConfigKeyEtcdServerCSR` |
+| `etcd-healthcheck-client-csr.json` | `ConfigKeyEtcdHealthcheckClientCSR` |
+| `etcd-peer-csr.json` | `ConfigKeyEtcdPeerCSR` |
+| `admin-kubeconfig-csr.json` | `ConfigKeyAdminKubeConfigCSR` |
+| `kubelet-kubeconfig-csr.json` | `ConfigKeyKubeletKubeConfigCSR` |
+| `controller-manager-csr.json` | `ConfigKeyControllerManagerCSR` |
+| `scheduler-csr.json` | `ConfigKeySchedulerCSR` |
+| `kube-proxy-csr.json` | `ConfigKeyKubeProxyCSR` |
+
+**安装路径**：`/etc/openFuyao/certs/cert_config/`
+
+**代码位置**：
+- `pkg/certs/config_const.go:16-64`
+- `pkg/phaseframe/phases/ensure_bke_agent.go:384-410`
+
+### 七、日志文件
+
+| 文件 | 路径 | 配置 |
+|------|------|------|
+| `bkeagent.log` | `/var/log/openFuyao/bkeagent.log` | MaxSize: 100MB, MaxBackups: 30, MaxAge: 14天 |
+| `bkeagent-update.log` | `/var/log/openFuyao/bkeagent-update.log` | 自更新日志 |
+
+**代码位置**：
+- `utils/log/agent_config.go:22`
+- `pkg/job/builtin/selfupdate/update.sh:14`
+
+### 八、自更新脚本
+
+| 文件 | 目标路径 | 来源 |
+|------|---------|------|
+| `update.sh` | `/etc/openFuyao/bkeagent/scripts/update.sh` | 嵌入二进制（`//go:embed`） |
+
+**代码位置**：
+- `pkg/job/builtin/selfupdate/selfupdate.go:40-43,98-103`
+- `pkg/job/builtin/selfupdate/update.sh`
+
+### 九、RBAC 资源（管理集群）
+
+| 资源类型 | 名称 | 用途 |
+|---------|------|------|
+| ClusterRole | `bkeagent-readwrite` | 读写权限 |
+| ClusterRole | `bkeagent-configmap-only` | ConfigMap 专用权限 |
+| ClusterRole | `bkeagent-cluster-access` | 集群访问权限 |
+| RoleBinding | `bkeagent` (per namespace) | 命名空间绑定 |
+| ClusterRoleBinding | `bkeagent-cluster-access` | 集群级绑定 |
+
+**代码位置**：
+- `pkg/phaseframe/phaseutil/localkubeconfig.go:374-589`
+
+### 十、安装前清理
+
+```bash
+chmod 777 /usr/local/bin/
+chmod 777 /etc/systemd/system/
+systemctl stop bkeagent || true
+systemctl disable bkeagent || true
+systemctl daemon-reload || true
+rm -rf /usr/local/bin/bkeagent* || true
+rm -f /etc/systemd/system/bkeagent.service || true
+rm -rf /etc/openFuyao/bkeagent || true
+```
+**代码位置**：`pkg/phaseframe/phases/ensure_bke_agent.go:470-482`
+
+### 十一、安装后命令
+
+```bash
+systemctl daemon-reload
+systemctl enable bkeagent
+systemctl restart bkeagent
+chmod 755 /usr/local/bin/
+chmod 755 /etc/systemd/system/
+```
+**代码位置**：
+- `pkg/phaseframe/phases/ensure_bke_agent.go:517-519`
+- `pkg/phaseframe/phaseutil/agentssh/push_upgrade.go:181-183`
+
+### 十二、目标节点完整文件树
+
+```
+/usr/local/bin/
+├── bkeagent                              # 主二进制
+└── bkeagent.bak.{timestamp}              # 备份（最多3个）
+
+/etc/systemd/system/
+└── bkeagent.service                      # Systemd 服务
+
+/etc/openFuyao/
+├── bkeagent/
+│   ├── config                            # Kubeconfig
+│   ├── node                              # 节点 hostname
+│   ├── bin/
+│   │   └── bkeagent                      # 自更新二进制
+│   ├── scripts/
+│   │   └── update.sh                     # 自更新脚本
+│   └── launcher/                         # Launcher 目录
+└── certs/
+    ├── trust-chain.crt                   # 信任链证书
+    ├── global-ca.crt                     # 全局 CA（可选）
+    ├── global-ca.key                     # 全局 CA 密钥（可选）
+    └── cert_config/                      # 17 个 CSR 配置文件
+        ├── cluster-ca-policy.json
+        ├── cluster-ca-csr.json
+        ├── sign-policy.json
+        ├── apiserver-csr.json
+        ├── apiserver-etcd-client-csr.json
+        ├── front-proxy-client-csr.json
+        ├── apiserver-kubelet-client-csr.json
+        ├── front-proxy-ca-csr.json
+        ├── etcd-ca-csr.json
+        ├── etcd-server-csr.json
+        ├── etcd-healthcheck-client-csr.json
+        ├── etcd-peer-csr.json
+        ├── admin-kubeconfig-csr.json
+        ├── kubelet-kubeconfig-csr.json
+        ├── controller-manager-csr.json
+        ├── scheduler-csr.json
+        └── kube-proxy-csr.json
+
+/var/log/openFuyao/
+├── bkeagent.log                          # 主日志
+└── bkeagent-update.log                   # 更新日志
+```
+
+### 十三、关键源文件索引
+
+| 源文件 | 用途 |
+|--------|------|
+| `pkg/phaseframe/phases/ensure_bke_agent.go` | 初始安装 Phase |
+| `pkg/phaseframe/phases/ensure_agent_upgrade.go` | 升级 Phase |
+| `pkg/phaseframe/phaseutil/bkeagent_service.go` | 服务文件渲染 |
+| `pkg/phaseframe/phaseutil/agent.go` | Agent 推送/检测工具 |
+| `pkg/phaseframe/phaseutil/agentssh/push_upgrade.go` | SSH 升级实现 |
+| `pkg/phaseframe/phaseutil/agentssh/artifacts.go` | 制品下载/暂存 |
+| `pkg/phaseframe/phaseutil/localkubeconfig.go` | Kubeconfig 生成 & RBAC |
+| `hack/bkeagent.service.tmpl` | 服务文件模板 |
+| `pkg/job/builtin/selfupdate/selfupdate.go` | 自更新插件 |
+| `pkg/certs/config_const.go` | 证书路径常量 |
+| `utils/const.go` | 通用常量（路径） |
+| `utils/log/agent_config.go` | 日志配置 |
+
+### 十四、对设计文档的影响
+
+当前设计文档中 bkeagent 的 ComponentVersion YAML 示例只包含：
+- 1 个 artifact（`bkeagent`）
+- 简单的 installScript/uninstallScript
+
+但实际安装包含：
+- **1 个二进制** + **1 个服务文件** + **2 个配置文件** + **17 个 CSR 配置** + **1 个自更新脚本** + **多个目录** + **日志文件**
+
+**关键差异**：
+1. CSR 配置文件（17 个）在设计文档中未体现
+2. 自更新脚本 `update.sh` 未体现
+3. Launcher 目录未体现
+4. 日志目录未体现
+
+
 # BKEAgent
 
 ## BKEAgent 安装完整清单
