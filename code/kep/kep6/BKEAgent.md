@@ -723,5 +723,135 @@ uninstallScript: |
 | 目标节点 bkeagent | `utils/bkeagent/pkiutil/kubeconfig.go` | 生成本地证书 |
 
 ## 总结
-
 这些文件是**可定制的证书配置模板**，允许用户自定义 Kubernetes 集群的 PKI 证书参数（如 CN、O、OU、有效期、密钥大小等）。文件本身是静态 JSON，但支持模板变量在运行时动态替换。
+
+# 根据代码分析，bkeagent 的配置文件如下：
+
+## 核心配置文件
+
+### 1. Kubeconfig（管理集群访问凭证）
+
+| 属性 | 值 |
+|------|-----|
+| **文件路径** | `/etc/openFuyao/bkeagent/config` |
+| **用途** | bkeagent 访问管理集群 API Server 的凭证，用于监听 Command CRD、上报状态、执行节点操作 |
+
+**内容结构**：
+- Cluster Name: `management-cluster`
+- Context Name: `bkeagent-context`
+- AuthInfo Name: `bkeagent-cert-user`
+- 认证方式：X.509 客户端证书（100 年有效期）
+- **两种变体**：
+  1. **最小权限 kubeconfig**（首选）：通过 `GenerateLowPrivilegeKubeConfig()` 生成，RBAC 限制为：
+     - `bkeagent-readwrite` ClusterRole（secrets get, configmaps CRUD）
+     - `bkeagent-configmap-only` ClusterRole（configmaps 只读）
+     - `bkeagent-cluster-access` ClusterRole（BKE CRDs 读取, Commands CRUD）
+  2. **完整本地 kubeconfig**（回退）：从 Secret 读取，用于 cluster-api addon 存在时
+
+**生成来源**：
+
+| 生成者 | 文件 | 机制 |
+|--------|------|------|
+| EnsureBKEAgent（初始部署） | `pkg/phaseframe/phases/ensure_bke_agent.go:516` | SSH 命令：`echo -e {kubeconfig} > /etc/openFuyao/bkeagent/config` |
+| PushAgent（旧版推送） | `pkg/phaseframe/phaseutil/agent.go:307` | SSH 命令 |
+| BKEAgent Launcher（容器部署） | `cmd/bkeagent-launcher/main.go:186-198` | 通过 `nsenter` 复制到宿主机 |
+
+**读取者**：
+- `cmd/bkeagent/main.go:104`：`ctrl.GetConfigOrDie()` 从 `--kubeconfig` 标志读取
+- `utils/bkeagent/cluster/clusterutil.go:31-43`：`kubeclient.NewClient(kubeconfig)`
+
+### 2. 节点标识文件
+
+| 属性 | 值 |
+|------|-----|
+| **文件路径** | `/etc/openFuyao/bkeagent/node` |
+| **用途** | 包含节点 hostname，bkeagent 用于在管理集群中标识自己 |
+
+**内容结构**：纯文本，单行 hostname（如 `node-01`）
+
+**生成来源**：
+
+| 生成者 | 文件 | 机制 |
+|--------|------|------|
+| EnsureBKEAgent | `pkg/phaseframe/phases/ensure_bke_agent.go` | 通过 ping 响应获取 hostname |
+| BKEAgent Launcher | `cmd/bkeagent-launcher/main.go:200-207` | `prepareNodeFile()` 通过 `nsenter` 写入 |
+| Agent SSH Upgrade | `pkg/phaseframe/phaseutil/agentssh/push_upgrade.go:131` | `echo {hostname} > /etc/openFuyao/bkeagent/node` |
+| bkeagent 自身（自动创建） | `utils/utils.go:108-114` | 如果文件不存在，写入 `os.Hostname()` |
+
+**读取者**：
+- `utils.HostName()`（`utils/utils.go:99-131`）：读取文件内容作为节点名
+- `cmd/bkeagent/main.go:120-130`：`CommandReconciler` 使用此 hostname 作为 `NodeName`
+
+### 3. Systemd 服务文件
+
+| 属性 | 值 |
+|------|-----|
+| **文件路径** | `/etc/systemd/system/bkeagent.service` |
+| **用途** | 定义 bkeagent 进程的启动、重启和管理方式 |
+
+**内容结构**（模板）：
+```ini
+[Unit]
+Description= bkeagent
+After=network.target
+
+[Service]
+Environment="DEBUG=true"
+ExecStart=/usr/local/bin/bkeagent --kubeconfig=/etc/openFuyao/bkeagent/config --health-port={{.healthPort}} --ntpserver={{.ntpServer}}
+KillMode=process
+RestartSec=5
+Restart=on-failure
+SuccessExitStatus=0
+
+[Install]
+WantedBy=multi-user.target
+```
+**生成来源**：
+
+| 生成者 | 文件 | 机制 |
+|--------|------|------|
+| EnsureBKEAgent | `pkg/phaseframe/phases/ensure_bke_agent.go:234-249` | 从 Provider 容器读取 `/bkeagent.service.tmpl`，渲染后 SSH 上传 |
+| RenderBKEAgentServiceFile | `pkg/phaseframe/phaseutil/bkeagent_service.go:52-57` | 替换 `--ntpserver=` 和 `--health-port=` |
+| Agent SSH Upgrade | `pkg/phaseframe/phaseutil/agentssh/push_upgrade.go:174-177` | 优先从 HTTP 仓库下载，回退到模板渲染 |
+| BKEAgent Launcher | `cmd/bkeagent-launcher/main.go:159-184` | 渲染嵌入模板，通过 `nsenter` 复制 |
+
+## 附加文件（TLS 证书和 CSR 配置）
+
+虽然这些不是 bkeagent 自身的配置，但 EnsureBKEAgent 阶段也会上传到节点：
+
+| 文件 | 路径 | 用途 |
+|------|------|------|
+| 信任链证书 | `/etc/openFuyao/certs/trust-chain.crt` | 集群 CA 证书链 |
+| 全局 CA 证书 | `/etc/openFuyao/certs/global-ca.crt` | 仅当 cluster-api addon 存在 |
+| 全局 CA 密钥 | `/etc/openFuyao/certs/global-ca.key` | 仅当 cluster-api addon 存在 |
+| 17 个 CSR 配置文件 | `/etc/openFuyao/certs/cert_config/` | 各集群组件的证书签名请求配置 |
+
+这些文件由 `EnsureBKEAgent.prepareFileUploadList()`（`pkg/phaseframe/phases/ensure_bke_agent.go:320-411`）生成/上传。
+
+## 数据流总结
+
+```
+管理集群 (Provider / capbke controller)
+    |
+    |-- EnsureBKEAgent 阶段 (SSH 推送)
+    |       |
+    |       |-- GetLeastPrivilegeKubeConfig() 或 GetLocalKubeConfig()
+    |       |       从 K8s Secret 读取 kubeconfig
+    |       |
+    |       |-- RenderBKEAgentServiceFile()
+    |       |       从 Provider 容器读取 /bkeagent.service.tmpl
+    |       |       替换 --ntpserver= 和 --health-port=
+    |       |
+    |       |-- SSH 到每个节点:
+    |       |       echo {kubeconfig} > /etc/openFuyao/bkeagent/config
+    |       |       cp bkeagent.service  -> /etc/systemd/system/
+    |       |       cp bkeagent binary   -> /usr/local/bin/
+    |       |       systemctl daemon-reload && enable && restart
+    |
+    v
+目标节点:
+    /etc/openFuyao/bkeagent/config    <-- kubeconfig（管理集群访问）
+    /etc/openFuyao/bkeagent/node      <-- hostname（节点标识）
+    /etc/systemd/system/bkeagent.service  <-- systemd 服务（启动配置）
+    /usr/local/bin/bkeagent           <-- 二进制
+```
