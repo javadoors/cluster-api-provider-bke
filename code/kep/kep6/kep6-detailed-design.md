@@ -5157,22 +5157,6 @@ func (a *InlinePhaseRunnerAdapter) Execute(ctx context.Context, oldCluster, newC
 - **TemplateContext**：复用 `manifest.TemplateContext`，所有组件类型共享使用
 - **解耦收益**：`pkg/dagexec` 包可独立编译和测试，不依赖 phaseframe
 
-#### 9.4.5 辅助函数
-
-```go
-// parseDurationDefault 解析超时字符串, 空字符串或解析失败时返回默认值
-func parseDurationDefault(s string, defaultVal time.Duration) time.Duration {
-    if s == "" {
-        return defaultVal
-    }
-    d, err := time.ParseDuration(s)
-    if err != nil {
-        return defaultVal
-    }
-    return d
-}
-```
-
 ---
 
 ## 10. 完整安装流程详细设计
