@@ -1398,4 +1398,339 @@ DAG 依赖：`bkeagent-rbac` → `bkeagent`（RBAC 先于 bkeagent 安装）
 结果完全一致。
 ```
 
-# 
+# func (e *EnsureBKEAgent) getNeedPushNodes() 在bkeagent的ComponentVersion中表达出来？
+
+## 分析：`getNeedPushNodes()` 能否在 ComponentVersion 中表达
+
+### 1. `getNeedPushNodes()` 完整逻辑
+
+```
+getNeedPushNodes()
+│
+├── 1. 获取 BKENodes (从管理集群 API)
+│
+├── 2. 过滤节点 (GetNeedPushAgentNodesWithBKENodes)
+│   ├── 排除 NodeFailedFlag (bit 7)     — 已失败的节点
+│   ├── 排除 NodeDeletingFlag (bit 6)   — 正在删除的节点
+│   ├── 排除 NeedSkip == true           — 需要跳过的节点
+│   ├── 排除 NodeAgentPushedFlag (bit 0) — agent 已推送的节点 (幂等)
+│   └── 排除 Appointment 节点           — 预约添加的节点
+│
+├── 3. 设置节点状态 → NodeInitializing
+│
+└── 4. SyncStatusUntilComplete (等待状态同步)
+```
+核心是**节点级过滤**——决定哪些节点需要推送 agent。
+
+### 2. 这不是 ComponentVersion 的职责
+
+`getNeedPushNodes()` 的逻辑分为两类关注点：
+
+| 关注点 | 逻辑 | 属于 ComponentVersion？ |
+|--------|------|----------------------|
+| **幂等性** | `!NodeAgentPushedFlag` — 已推送的节点跳过 | **否** — 这是运行时状态，不是组件配置 |
+| **错误处理** | 排除 Failed/Deleting/Skipped 节点 | **否** — 这是节点生命周期状态 |
+| **调度约束** | 排除 Appointment 节点 | **否** — 这是集群级调度策略 |
+
+ComponentVersion 描述的是**"怎么安装"**（制品、脚本、配置），不是**"在哪些节点上安装"**（运行时节点状态过滤）。
+
+### 3. KEP-6 新架构中的对应关系
+
+在 KEP-6 的 `BinaryComponentExecutor` 设计中，`getNeedPushNodes()` 的职责被分散到三个层次：
+
+```
+当前代码                              KEP-6 新架构
+─────────────                        ─────────────────────
+NeedExecute()                        VersionContext.NeedsUpgrade("bkeagent")
+  → HasNodesNeedingPhase()             → 组件级: 是否需要执行？
+  → 组件级判断
+
+getNeedPushNodes()                   NodeProvider.GetNodes()
+  → 过滤 Failed/Deleting/Skipped       → 获取节点列表
+  → 过滤 NodeAgentPushedFlag           → ??? (需要补充设计)
+  → 节点级判断
+
+pushAgent()                          BinaryInstaller.Install()
+  → SSH 推送                           → 单节点安装
+  → 设置 NodeAgentPushedFlag           → StatusWriter.MarkSuccess()
+```
+
+### 4. 关键缺口：节点级幂等性
+
+当前 `NodeAgentPushedFlag` 提供了**节点级幂等性**——已推送的节点不会重复推送。KEP-6 设计中：
+
+| 层级 | 当前机制 | KEP-6 机制 | 是否覆盖 |
+|------|---------|-----------|---------|
+| **组件级** | `HasNodesNeedingPhase(flag)` | `VersionContext.NeedsUpgrade(name)` | ✅ 等价 |
+| **节点级幂等** | `!NodeAgentPushedFlag` | `BKECluster.Status.ComponentStatuses` (组件级) | ❌ **不等价** — 缺少 per-node 粒度 |
+| **节点状态过滤** | 排除 Failed/Deleting/Skipped | `NodeProvider` 未设计此过滤 | ❌ **缺失** |
+
+**问题**：KEP-6 的 `VersionContext` 是组件级的（`Current["bkeagent"] = "v2.6.0"`），无法表达"node1 已有 v2.6.0，node2 还是 v2.5.0"这种 per-node 状态。
+
+### 5. 解决方案
+
+节点级过滤属于 **Executor 层** 或 **NodeProvider 层** 的职责，不应放入 ComponentVersion。具体方案：
+
+#### 方案 A：NodeProvider 负责过滤（推荐）
+
+```go
+// NodeProvider 扩展：增加节点状态过滤
+type NodeProvider interface {
+    GetNodes(ctx context.Context, cluster *bkev1beta1.BKECluster) ([]Node, error)
+    GetNodesByRole(ctx context.Context, cluster *bkev1beta1.BKECluster, role string) ([]Node, error)
+    
+    // 新增：获取需要执行操作的节点 (排除 Failed/Deleting/Skipped/已完成)
+    GetNeedExecuteNodes(ctx context.Context, cluster *bkev1beta1.BKECluster, componentName string) ([]Node, error)
+}
+```
+`GetNeedExecuteNodes` 内部：
+- 排除 `NodeFailedFlag` / `NodeDeletingFlag` / `NeedSkip` 节点（等价于当前 `filterNodes` 的硬排除）
+- 排除 per-node 已完成节点（等价于当前 `!NodeAgentPushedFlag`）
+- 排除 Appointment 节点
+
+**判断 per-node 是否已完成**的方式：
+- 复用现有 `BKENode.Status.StateCode` 位标记（向后兼容）
+- 或：新增 `BKECluster.Status.NodeComponentStatuses[nodeIP][componentName]` 字段（更通用）
+
+#### 方案 B：BinaryComponentExecutor 内部过滤
+
+```go
+func (e *BinaryComponentExecutor) ExecuteComponent(...) error {
+    // 获取所有节点
+    allNodes, _ := execCtx.NodeProvider.GetNodes(ctx, execCtx.Cluster)
+    
+    // Executor 内部过滤 (等价于 getNeedPushNodes)
+    var targetNodes []Node
+    for _, node := range allNodes {
+        if e.shouldSkipNode(node, execCtx, cv) {
+            continue
+        }
+        targetNodes = append(targetNodes, node)
+    }
+    
+    // 按策略执行
+    return e.executeRolling(ctx, targetNodes, cv, strategy, execCtx)
+}
+
+func (e *BinaryComponentExecutor) shouldSkipNode(node Node, execCtx *ExecutionContext, cv *ComponentVersion) bool {
+    // 1. 排除 Failed/Deleting/Skipped (从 BKENode.Status 读取)
+    // 2. 排除已完成 (从 per-node component status 读取)
+    // 3. 排除 Appointment 节点
+}
+```
+
+#### 方案 C：依赖 installScript 幂等性（最简单）
+
+不做节点级过滤，对所有节点执行 `BinaryInstaller.Install()`。依赖 `installScript` 的幂等性：
+- 已安装的节点：installScript 重新执行，但结果不变（`systemctl restart` 后版本相同）
+- `VersionContext.NeedsUpgrade()` 在组件级判断，如果所有节点都已是目标版本，整个组件跳过
+
+**优点**：实现最简单，无需 per-node 状态跟踪
+**缺点**：会对已安装节点执行不必要的 SSH 操作（停止服务→重新安装→启动），有短暂服务中断
+
+### 6. 建议
+
+| 方案 | 适用场景 | 推荐度 |
+|------|---------|--------|
+| **A: NodeProvider 过滤** | 需要精确 per-node 控制，保留现有 BKENode 状态模型 | 推荐 |
+| **B: Executor 内部过滤** | 过滤逻辑与组件类型相关（如 Binary 需要 per-node，Helm 不需要） | 可选 |
+| **C: installScript 幂等** | 简单场景，可接受对已安装节点的冗余操作 | 不推荐（有服务中断风险） |
+
+**核心结论**：`getNeedPushNodes()` 的逻辑**不应放入 ComponentVersion**，而应由 `NodeProvider` 或 `BinaryComponentExecutor` 承担。KEP-6 文档需要补充 per-node 状态跟踪的设计。
+
+# 检查代码中的所有二进制组件，它们的节点过滤是不是都是一样的逻辑？还是各个组件都不相同。getNeedPushNodes() 直接内置到BinaryInstaller是否存在扩展性问题？如何更新BKENode的状态？
+## 分析结果
+
+### 1. 各二进制组件的节点过滤逻辑对比
+
+代码库中只有 **2 个 Phase** 做真正的 SSH 二进制推送：
+
+| Phase | 文件 | 推送方式 | 节点过滤逻辑 |
+|-------|------|---------|-------------|
+| **EnsureBKEAgent** | `ensure_bke_agent.go` | 直接 SSH (`bkessh.MultiCli`) | `GetNeedPushAgentNodesWithBKENodes` — 按 `!NodeAgentPushedFlag` 过滤 |
+| **EnsureAgentUpgrade** | `ensure_agent_upgrade.go` | 直接 SSH (`agentssh.SSHUpgrade`) | **无过滤** — 升级所有节点 |
+
+其他操作节点的 Phase（EnsureNodesEnv、EnsureContainerdUpgrade、EnsureMasterUpgrade 等）都通过 **BKEAgent 中转**（创建 Command CRD，Agent 拾取执行），不是直接 SSH 推送。
+
+**各 Phase 的节点过滤逻辑各不相同**：
+
+| Phase | 过滤函数 | 过滤条件 | 排除条件 |
+|-------|---------|---------|---------|
+| EnsureBKEAgent | `GetNeedPushAgentNodesWithBKENodes` | `!NodeAgentPushedFlag` | Failed/Deleting/Skipped/Appointment |
+| EnsureAgentUpgrade | **无** | 全部节点 | 仅检查 `nodes.Length() == 0` |
+| EnsureNodesEnv | `GetNeedInitEnvNodesWithBKENodes` | `!NodeEnvFlag` + `NodeAgentReadyFlag` | Failed/Deleting/Skipped/Appointment |
+| EnsureContainerdUpgrade | `GetNeedUpgradeNodesWithBKENodes` | `OpenFuyaoVersion` 版本比较 | Failed |
+| EnsureMasterUpgrade | `GetNeedUpgradeK8sNodes` + `.Master()` | `KubernetesVersion` 版本比较 + `NodeAgentReadyFlag` | Failed |
+| EnsureWorkerUpgrade | `GetNeedUpgradeK8sNodes` + `.Worker()` | `KubernetesVersion` 版本比较 + `NodeAgentReadyFlag` | Failed |
+| EnsureEtcdUpgrade | `filterUpgradeableNodes` + `.Etcd()` | `EtcdVersion` 比较 + `NodeAgentReadyFlag` | Failed |
+| EnsureNodesPostProcess | `GetNeedPostProcessNodesWithBKENodes` | `NodeBootFlag && !NodePostProcessFlag` | Failed/Deleting/Skipped/Appointment |
+
+**结论**：每个 Phase 的过滤逻辑都不一样——有的按 flag 位标记，有的按版本比较，有的按角色过滤。唯一的共性是 `filterNodes()` 中对 Failed/Deleting/Skipped 的硬排除。
+
+### 2. `getNeedPushNodes()` 内置到 BinaryInstaller 的扩展性问题
+
+**存在严重扩展性问题**，原因如下：
+
+#### 问题 1：过滤逻辑因组件而异
+
+当前 `getNeedPushNodes()` 硬编码了 `!NodeAgentPushedFlag` 过滤。但 KEP-6 新架构中 BinaryInstaller 要服务所有 binary 类型组件（containerd、bkeagent 等），每个组件的"已完成"判断不同：
+
+| 组件 | 当前幂等标记 | 判断方式 |
+|------|------------|---------|
+| bkeagent (安装) | `NodeAgentPushedFlag` | 位标记 |
+| bkeagent (升级) | **无过滤** | 全部节点都执行 |
+| containerd | `OpenFuyaoVersion` 比较 | 版本比较 |
+
+如果 BinaryInstaller 内置了 `getNeedPushNodes()`，就无法适应不同组件的过滤需求。
+
+#### 问题 2：BKENode 状态模型与 KEP-6 不兼容
+
+当前状态更新依赖 `BKENode` CRD 的 `StateCode` 位标记，这是一个 **per-node per-phase** 的模型。KEP-6 的 `BinaryComponentExecutor` 是通用执行器，不应绑定到特定的位标记模型。
+
+#### 问题 3：状态更新时序复杂
+
+当前 `getNeedPushNodes()` 不仅过滤节点，还做了三件事：
+1. 设置节点状态为 `NodeInitializing`（before push）
+2. 推送成功后设置 `NodeAgentPushedFlag`（after push）
+3. 调用 `SyncStatusUntilComplete` 持久化状态
+
+这些是 **编排层** 的职责，不应下沉到 **安装层**（BinaryInstaller）。
+
+#### 建议的架构分层
+
+```
+当前代码                              KEP-6 新架构
+─────────────                        ─────────────────────
+getNeedPushNodes()                   BinaryComponentExecutor.ExecuteComponent()
+  ├─ 过滤节点                          ├─ 获取节点 (NodeProvider)
+  ├─ 设置 NodeInitializing             ├─ 过滤节点 (NodeFilter 接口)
+  └─ SyncStatus                        ├─ 设置节点状态 (StatusUpdater)
+                                       └─ 按策略执行
+pushAgent()                          BinaryInstaller.Install()
+  ├─ SSH 推送                          ├─ 下载制品
+  ├─ 设置 NodeAgentPushedFlag          ├─ 渲染脚本/配置
+  └─ 更新失败状态                       ├─ SSH 执行
+                                       └─ 健康检查
+```
+
+**关键设计**：节点过滤和状态更新应由 **Executor 层** 负责，通过接口注入，BinaryInstaller 只负责单节点安装。
+```go
+// NodeFilter 节点过滤接口 — 各组件可自定义过滤逻辑
+type NodeFilter interface {
+    FilterNodes(ctx context.Context, nodes []Node, cv *ComponentVersion) ([]Node, error)
+}
+
+// NodeStatusUpdater 节点状态更新接口 — 解耦 BKENode CRD 细节
+type NodeStatusUpdater interface {
+    MarkPending(ctx context.Context, nodeIP string, component string) error
+    MarkSuccess(ctx context.Context, nodeIP string, component string, version string) error
+    MarkFailed(ctx context.Context, nodeIP string, component string, err error) error
+}
+```
+这样：
+- **bkeagent 安装**：`NodeFilter` 实现检查 `!NodeAgentPushedFlag`
+- **bkeagent 升级**：`NodeFilter` 实现返回全部节点（不过滤）
+- **containerd 安装**：`NodeFilter` 实现检查 `OpenFuyaoVersion`
+- BinaryInstaller 不感知这些差异，只接收过滤后的节点列表
+
+### 3. BKENode 状态更新机制分析
+
+当前状态更新有 **三层机制**，非常复杂：
+
+#### 第一层：内存操作（BKENodes wrapper）
+
+```go
+// api/capbke/v1beta1/bkenode_types.go
+nodes.SetNodeStateWithMessage(ip, state, msg)   // 设置 State + Message + NeedRecord 脏标记
+nodes.MarkNodeStateFlag(ip, flag)                // 设置 StateCode 位
+nodes.GetModifiedNodes()                          // 获取有脏标记的节点
+nodes.ClearRecordFlags()                          // 清除脏标记
+```
+通过 `NodeStateNeedRecord`（bit 8）作为脏标记，追踪哪些节点需要持久化。
+
+#### 第二层：API 持久化（NodeFetcher）
+
+```go
+// utils/capbke/nodeutil/fetcher.go
+nf.SetNodeStateWithMessage(ctx, ns, cluster, ip, state, msg)  // 单字段更新
+nf.MarkNodeStateFlag(ctx, ns, cluster, ip, flag)               // 位标记设置
+nf.UpdateNodeStatusByIP(ctx, ns, cluster, ip, func(status))   // 多字段原子更新（带冲突重试）
+```
+所有方法都使用 `retry.RetryOnConflict` 处理乐观并发。
+
+#### 第三层：集群级同步（SyncStatusUntilComplete）
+
+```go
+// pkg/mergecluster/bkecluster.go
+mergecluster.SyncStatusUntilComplete(client, bkeCluster)
+```
+带 2 分钟超时的重试循环，将内存中的 BKECluster.Status 变更持久化到 API Server。成功后调用 `UpdateModifiedBKENodes` 清除 BKENode 的 `NeedRecord` 脏标记。
+
+#### 状态更新时序（以 EnsureBKEAgent 为例）
+
+```
+getNeedPushNodes()
+  │
+  ├─ SetNodeStateWithMessage(ip, NodeInitializing, "Pushing bkeagent")  ← 第一层
+  ├─ SyncStatusUntilComplete()                                           ← 第三层
+  │
+pushAgent()
+  │
+  ├─ 成功节点: MarkNodeStateFlag(NodeAgentPushedFlag)                    ← 第二层
+  │
+  ├─ 失败节点: UpdateNodeStatusByIP(func(status) {                       ← 第二层
+  │     State = NodeInitFailed
+  │     Message = "Failed push..."
+  │     NeedSkip = true  (worker 节点)
+  │   })
+  │
+  ├─ pingAgent()
+  │   ├─ 成功: UpdateNodeStatusByIP(func(status) {                       ← 第二层
+  │   │     StateCode |= NodeAgentPushedFlag | NodeAgentReadyFlag
+  │   │     Message = "BKEAgent is ready"
+  │   │   })
+  │   └─ 失败: UpdateNodeStatusByIP(func(status) {                       ← 第二层
+  │         State = NodeInitFailed
+  │         StateCode &= ^NodeAgentPushedFlag  (清除推送标记)
+  │         NeedSkip = true
+  │       })
+```
+
+#### KEP-6 新架构中的状态更新设计
+
+KEP-6 需要解决的核心问题：**当前 StateCode 位标记模型是 per-phase 的，而新架构需要 per-component 的状态跟踪**。
+
+| 维度 | 当前设计 | KEP-6 设计 |
+|------|---------|-----------|
+| 状态存储 | `BKENode.Status.StateCode` (位标记) | `BKECluster.Status.ComponentStatuses[name]` (组件级) + BKENode 位标记 (兼容) |
+| 幂等判断 | `StateCode & NodeAgentPushedFlag` | `ComponentStatuses["bkeagent"].Version == target` |
+| per-node 粒度 | ✅ 有（每个 BKENode 独立 StateCode） | ❓ 需要设计 per-node per-component 状态 |
+| 持久化机制 | 三层（内存→API→集群同步） | 需简化 |
+
+**per-node per-component 状态** 是当前的设计缺口。当前 `ComponentStatuses` 是组件级的（不区分节点），无法表达"node1 已安装 containerd v1.7.18，node2 还是 v1.7.15"。
+
+**建议方案**：在 `BKECluster.Status` 中新增 per-node per-component 状态：
+```go
+type BKEClusterStatus struct {
+    // ... 现有字段 ...
+    
+    // per-node per-component 安装状态
+    // key: nodeIP, value: 该节点上各组件的安装状态
+    NodeComponentStatuses map[string]map[string]NodeComponentStatus `json:"nodeComponentStatuses,omitempty"`
+}
+
+type NodeComponentStatus struct {
+    Version string `json:"version"`           // 已安装版本
+    Phase   string `json:"phase"`             // Installed / Failed / Installing
+    Message string `json:"message,omitempty"` // 错误信息
+}
+```
+这样 `BinaryComponentExecutor` 可以通过 `NodeComponentStatuses[nodeIP]["containerd"].Version` 判断每个节点的幂等性，无需依赖 BKENode 的 StateCode 位标记。
+
+### 总结
+
+| 问题 | 结论 |
+|------|------|
+| 各组件过滤逻辑是否相同？ | **不同** — 每个 Phase 有独立的过滤函数和判断条件 |
+| `getNeedPushNodes()` 内置到 BinaryInstaller 是否有扩展性问题？ | **是** — 过滤逻辑因组件而异，状态更新是编排层职责 |
+| 如何更新 BKENode 状态？ | 当前三层机制复杂，KEP-6 需要新增 per-node per-component 状态模型 |
