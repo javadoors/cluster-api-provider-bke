@@ -1295,3 +1295,107 @@ DAG 依赖：`bkeagent-rbac` → `bkeagent`（RBAC 先于 bkeagent 安装）
 1. **RBAC 放置位置**：`resources[]` 内联 vs 独立 YAML 组件？推荐独立组件，职责更清晰
 2. **`secretRef.name` 是否需要模板变量**：当前硬编码 `localkubeconfig`，如果不同集群环境使用不同 Secret 名，需要支持 `name: "{{.Variables.kubeconfigSecretName}}"`
 3. **安全性**：admin kubeconfig 推送到每个节点，任何 bkeagent 被攻破 = 完整集群访问。是否需要修复原来的 least-privilege 设计（在管理集群创建低权限 kubeconfig Secret）？
+
+# kubeconfig 修改计划
+
+## 修改计划
+
+### 修改范围
+
+需要修改 3 处，均在 12.4 节（bkeagent 重构详细设计）内。`kubeconfigTemplate` 功能本身保留在 CRD 和 ConfigRenderer 中（供其他组件使用），仅 bkeagent 改用 `secretRef`。
+
+### 修改 1：Section 12.4.2 — ComponentVersion YAML 定义
+
+**位置**：lines 6518-6528
+
+**当前内容**：
+```yaml
+      # Kubeconfig（管理集群访问凭证）
+      - name: kubeconfig
+        path: "/etc/openFuyao/bkeagent/config"
+        mode: "0600"
+        owner: "root:root"
+        kubeconfigTemplate:
+          clusterName: "management-cluster"
+          apiServer: "{{apiServer}}"
+          caCertPath: "/etc/openFuyao/certs/global-ca.crt"
+          clientCertPath: "/etc/openFuyao/certs/bkeagent-client.crt"
+          clientKeyPath: "/etc/openFuyao/certs/bkeagent-client.key"
+```
+
+**修改为**：
+```yaml
+      # Kubeconfig（管理集群 admin kubeconfig — 从管理集群 Secret 直接获取）
+      # 等价于当前 loadLocalKubeConfig() → GetLocalKubeConfig()
+      # Secret kube-system/localkubeconfig 由 bke init 预置，内容为嵌入式证书数据
+      - name: kubeconfig
+        path: "/etc/openFuyao/bkeagent/config"
+        mode: "0600"
+        owner: "root:root"
+        secretRef:
+          name: localkubeconfig
+          namespace: kube-system
+          key: config
+```
+**修改理由**：
+- 当前代码 `GetLocalKubeConfig()` 直接读取管理集群 Secret `kube-system/localkubeconfig`，内容为嵌入式证书数据（`certificate-authority-data`/`client-certificate-data`/`client-key-data`）
+- `kubeconfigTemplate` 模式生成的是文件路径引用式 kubeconfig（`certificate-authority: /path/to/ca.crt`），与实际行为不等价
+- `secretRef` 模式直接读取 Secret 内容，与当前代码完全等价
+
+### 修改 2：Section 12.4.3 — 字段映射表
+
+**位置**：line 6734
+
+**当前内容**：
+```
+| kubeconfig 动态生成（硬编码路径） | `binary.configTemplates[4].kubeconfigTemplate` | kubeconfig 模板声明式化 |
+```
+
+**修改为**：
+```
+| kubeconfig 从 Secret 获取（`GetLocalKubeConfig()`） | `binary.configTemplates[4].secretRef`（引用 `kube-system/localkubeconfig`） | kubeconfig 获取声明式化 |
+```
+
+### 修改 3：Section 12.4.4 — 行为等价性验证点
+
+**位置**：line 6749
+
+**当前内容**：
+```
+| kubeconfig 内容 | Go 代码动态生成 | `kubeconfigTemplate` 渲染 | `diff` 对比两份输出 |
+```
+
+**修改为**：
+```
+| kubeconfig 内容 | `GetLocalKubeConfig()` 读取 Secret | `secretRef` 读取同一 Secret（`kube-system/localkubeconfig`） | `diff` 对比两份输出（内容一致） |
+```
+
+### 不需要修改的部分
+
+| 位置 | 原因 |
+|------|------|
+| CRD 类型定义 `KubeconfigTemplateSpec`（line 554） | 功能保留，供其他组件使用 |
+| CRD YAML schema `kubeconfigTemplate`（line 1067） | 功能保留 |
+| ConfigRenderer Mode 3 设计（line 2215） | 功能保留 |
+| containerd ComponentVersion（无 kubeconfig） | 不涉及 |
+| Section 12.5 迁移验证清单（line 6773） | "bkeagent kubeconfig" 验证项仍然有效（diff 对比），无需修改 |
+
+### 数据流等价性
+
+```
+当前代码:
+  GetLocalKubeConfig()
+  → client.Get(kube-system/localkubeconfig)
+  → secret.Data["config"]  (嵌入式证书数据)
+  → echo -e %q > /etc/openFuyao/bkeagent/config
+
+新设计:
+  ConfigRenderer.renderSecretTemplate()
+  → client.Get(kube-system/localkubeconfig)
+  → secret.Data["config"]  (嵌入式证书数据)
+  → ssh.Upload() → /etc/openFuyao/bkeagent/config
+
+结果完全一致。
+```
+
+# 
