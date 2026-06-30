@@ -1,4 +1,4 @@
-# KEP-6 详细设计文档：基于 ReleaseImage 的二进制与 Helm 组件声明式管理方案
+﻿# KEP-6 详细设计文档：基于 ReleaseImage 的二进制与 Helm 组件声明式管理方案
 
 **文档版本**: v1.1  
 **状态**: Draft  
@@ -23,7 +23,10 @@
 5. [HelmInstaller 详细设计](#5-helminstaller-详细设计)
    - 5.4 健康检查
 6. [YamlInstaller 详细设计](#6-yamlinstaller-详细设计)
-   - 6.3 健康检查
+    - 6.3 核心接口定义
+    - 6.4 清单下载与缓存
+    - 6.5 健康检查
+    - 6.6 YAML Uninstall 流程
 7. [HealthCheck 共享包设计](#7-healthcheck-共享包设计)
 8. [模板变量系统与 TemplateContext 详细设计](#8-模板变量系统与-templatecontext-详细设计)
 9. [DAG 集成详细设计](#9-dag-集成详细设计)
@@ -38,19 +41,6 @@
     - 17.1 安装样例
     - 17.2 升级样例
     - 17.3 关键设计点说明
-18. [补充设计：遗漏功能点](#18-补充设计遗漏功能点)
-    - 18.1 YAML 清单 URL 下载与缓存
-    - 18.2 DAG 构建算法
-    - 18.3 Helm 与 Binary 模板渲染差异说明
-    - 18.4 组件执行状态回写
-    - 18.5 YamlInstaller Template Renderer 澄清
-    - 18.6 Applier 扩展实现细节
-    - 18.7 VersionContext 跨 Reconcile 持久化
-    - 18.8 YamlInstaller 健康检查 clientset 来源
-    - 18.9 ComponentVersion Webhook 验证
-    - 18.10 Binary 组件并发安装冲突
-    - 18.11 ReleaseImage 与 ComponentVersion 版本一致性校验
-    - 18.12 离线环境下 ValuesFiles 的 ConfigMap 挂载设计
 
 ---
 
@@ -3542,11 +3532,255 @@ func (i *YamlInstaller) Apply(ctx context.Context, cv *configv1alpha1.ComponentV
 
 > 健康检查实现委托共享 `pkg/healthcheck` 包（`healthcheck.Run(ctx, execCtx.TargetClient, *cv.Spec.YAML.HealthCheck)`）。共享包的接口定义与 PodReady/EndpointReady/Custom 检查实现详见 **第 7 章 HealthCheck 共享包设计**。
 
-### 6.4 健康检查
+**设计思路 — YamlInstaller 健康检查 clientset 来源**：
+
+`YamlInstaller.Apply` 中调用 `healthcheck.Run(ctx, execCtx.TargetClient, ...)` 需要 `kubernetes.Interface` (typed clientset)。当前 `YamlInstallerConfig` 仅注入 `Store` + `Applier`，未注入 clientset。解决方案：通过 `ExecutionContext.TargetClient` 传递，无需修改 `YamlInstallerConfig`。`ExecutionContext.TargetClient` 由 controllers 层在 `buildExecutionContext` 中注入（见 9.1.3 节），是目标集群的 typed clientset。YamlInstaller 通过 `execCtx.TargetClient` 访问，无需在 `YamlInstallerConfig` 中重复注入。这与 `HelmInstaller` 的设计一致——`HelmInstaller` 在 Config 中直接注入 `Clientset`，因为 HelmInstaller 不接收 `ExecutionContext`。
+
+### 6.4 清单下载与缓存
+
+**设计思路**：`yaml.manifests[].url` 引用的外部 YAML 清单文件需要下载、缓存和校验。与 BinaryInstaller 的制品下载类似，但更简单——清单文件体积远小于二进制制品，且格式固定为 YAML。
+
+**关键设计点**：
+- **缓存策略**：按 URL + Checksum 缓存到本地 (`/var/cache/bke/manifests/`)，避免重复下载
+- **多文档解析**：单个 YAML 文件可能包含多个 K8s 资源 (用 `---` 分隔)，需使用 `yaml.NewYAMLOrJSONDecoder` 逐文档解析
+- **Checksum 校验**：下载后校验 SHA256，确保清单完整性
+- **离线支持**：缓存命中时直接使用本地文件，无需网络访问
+
+**流程图**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    YAML 清单下载与缓存流程                                        │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────┐
+  │  YamlInstaller.Apply()               │
+  │  遍历 yaml.manifests[]               │
+  └──────────┬───────────────────────────┘
+             │
+             ▼
+  ┌──────────────────────────────────────┐
+  │  检查缓存                            │
+  │  cacheKey = sha256(url + checksum)   │
+  │  cache.Get(cacheKey)                 │
+  └──────────┬───────────────────────────┘
+             │
+        ┌────┴────┐
+        │         │
+     命中       未命中
+        │         │
+        │         ▼
+        │  ┌────────────────────────────┐
+        │  │  HTTP GET(url)             │
+        │  │  下载清单文件              │
+        │  └──────────┬─────────────────┘
+        │             │
+        │             ▼
+        │  ┌────────────────────────────┐
+        │  │  校验 Checksum             │
+        │  │  sha256(data) == expected? │
+        │  └──────────┬─────────────────┘
+        │             │
+        │        ┌────┴────┐
+        │        │         │
+        │     通过       失败
+        │        │         │
+        │        ▼         ▼
+        │  ┌────────┐ ┌──────────┐
+        │  │保存缓存│ │返回错误  │
+        │  └───┬────┘ └──────────┘
+        │      │
+        └──────┼──────┐
+               │      │
+               ▼      ▼
+  ┌──────────────────────────────────────┐
+  │  合并所有清单内容                    │
+  │  → []byte (多文档 YAML)              │
+  └──────────┬───────────────────────────┘
+             │
+             ▼
+  ┌──────────────────────────────────────┐
+  │  YAML 多文档解析                     │
+  │  yaml.NewYAMLOrJSONDecoder           │
+  │  → []unstructured.Unstructured       │
+  └──────────────────────────────────────┘
+```
+
+**代码实现**：
+
+```go
+// pkg/yamlinstaller/manifest_downloader.go
+
+// ManifestDownloader 管理 YAML 清单的下载与缓存
+type ManifestDownloader struct {
+    cacheDir   string
+    httpClient *http.Client
+}
+
+// NewManifestDownloader 创建清单下载器
+func NewManifestDownloader(cacheDir string, httpClient *http.Client) (*ManifestDownloader, error) {
+    if err := os.MkdirAll(cacheDir, 0755); err != nil {
+        return nil, fmt.Errorf("failed to create manifest cache directory %s: %w", cacheDir, err)
+    }
+    return &ManifestDownloader{cacheDir: cacheDir, httpClient: httpClient}, nil
+}
+
+// DownloadManifest 下载单个清单文件 (带缓存)
+func (d *ManifestDownloader) DownloadManifest(ctx context.Context, ref ManifestRef) ([]byte, error) {
+    cacheKey := d.computeCacheKey(ref.URL, ref.Checksum)
+    cachePath := filepath.Join(d.cacheDir, cacheKey)
+
+    // 1. 检查缓存
+    if data, err := os.ReadFile(cachePath); err == nil {
+        return data, nil
+    }
+
+    // 2. HTTP 下载
+    req, err := http.NewRequestWithContext(ctx, http.MethodGet, ref.URL, nil)
+    if err != nil {
+        return nil, fmt.Errorf("failed to create request for %s: %w", ref.URL, err)
+    }
+    resp, err := d.httpClient.Do(req)
+    if err != nil {
+        return nil, fmt.Errorf("failed to download manifest from %s: %w", ref.URL, err)
+    }
+    defer resp.Body.Close()
+    if resp.StatusCode != http.StatusOK {
+        return nil, fmt.Errorf("failed to download manifest from %s: HTTP %d", ref.URL, resp.StatusCode)
+    }
+    data, err := io.ReadAll(resp.Body)
+    if err != nil {
+        return nil, fmt.Errorf("failed to read manifest body from %s: %w", ref.URL, err)
+    }
+
+    // 3. Checksum 校验
+    if ref.Checksum != "" {
+        if err := verifyChecksum(data, ref.Checksum); err != nil {
+            return nil, fmt.Errorf("checksum verification failed for %s: %w", ref.URL, err)
+        }
+    }
+
+    // 4. 保存到缓存
+    if err := os.WriteFile(cachePath, data, 0644); err != nil {
+        return nil, fmt.Errorf("failed to cache manifest %s: %w", ref.URL, err)
+    }
+
+    return data, nil
+}
+
+// DownloadManifests 下载清单文件列表，合并为多文档 YAML
+func (d *ManifestDownloader) DownloadManifests(ctx context.Context, refs []ManifestRef) ([]byte, error) {
+    var combined bytes.Buffer
+    for i, ref := range refs {
+        data, err := d.DownloadManifest(ctx, ref)
+        if err != nil {
+            return nil, fmt.Errorf("failed to download manifest[%d] %s: %w", i, ref.URL, err)
+        }
+        if i > 0 {
+            combined.WriteString("\n---\n")
+        }
+        combined.Write(data)
+    }
+    return combined.Bytes(), nil
+}
+
+// ParseMultiDocYAML 解析多文档 YAML 为 unstructured 对象列表
+func ParseMultiDocYAML(data []byte) ([]unstructured.Unstructured, error) {
+    var resources []unstructured.Unstructured
+    decoder := yaml.NewYAMLOrJSONDecoder(bytes.NewReader(data), 4096)
+    for {
+        var obj unstructured.Unstructured
+        err := decoder.Decode(&obj)
+        if err == io.EOF {
+            break
+        }
+        if err != nil {
+            return nil, fmt.Errorf("failed to parse YAML document: %w", err)
+        }
+        if obj.Object == nil {
+            continue // 跳过空文档
+        }
+        resources = append(resources, obj)
+    }
+    return resources, nil
+}
+
+func (d *ManifestDownloader) computeCacheKey(url, checksum string) string {
+    h := sha256.New()
+    h.Write([]byte(url))
+    if checksum != "" {
+        h.Write([]byte(checksum))
+    }
+    return fmt.Sprintf("%x.yaml", h.Sum(nil))
+}
+```
+
+**YamlInstaller 集成**：
+
+```go
+// pkg/yamlinstaller/installer.go 扩展
+
+type YamlInstaller struct {
+    store            manifest.Store
+    applier          manifest.Applier
+    manifestDownloader *ManifestDownloader  // 新增：清单下载器
+    logger           *bkev1beta1.BKELogger
+}
+
+type YamlInstallerConfig struct {
+    Store              manifest.Store
+    Applier            manifest.Applier
+    ManifestDownloader *ManifestDownloader  // 新增
+    Logger             *bkev1beta1.BKELogger
+}
+
+// Apply 扩展：支持外部 URL 清单 + 内联 Resources
+func (i *YamlInstaller) Apply(ctx context.Context, cv *configv1alpha1.ComponentVersion, execCtx *ExecutionContext) error {
+    var allResources []unstructured.Unstructured
+
+    // 1. 下载外部 URL 清单 (yaml.manifests[])
+    if cv.Spec.YAML != nil && len(cv.Spec.YAML.Manifests) > 0 {
+        data, err := i.manifestDownloader.DownloadManifests(ctx, cv.Spec.YAML.Manifests)
+        if err != nil {
+            return fmt.Errorf("download manifests for %s: %w", cv.Spec.Name, err)
+        }
+        resources, err := ParseMultiDocYAML(data)
+        if err != nil {
+            return fmt.Errorf("parse manifests for %s: %w", cv.Spec.Name, err)
+        }
+        allResources = append(allResources, resources...)
+    }
+
+    // 2. 加载内联 Resources (cv.Spec.Resources[])
+    inlineResources, err := i.store.GetComponentManifests(ctx, cv.Spec.Name, cv.Spec.Version, execCtx.TemplateContext)
+    if err != nil {
+        return fmt.Errorf("get inline manifests for %s: %w", cv.Spec.Name, err)
+    }
+    if inlineResources != nil {
+        allResources = append(allResources, inlineResources.Resources...)
+    }
+
+    // 3. 应用到集群
+    pkg := &manifest.ComponentPackage{Resources: allResources}
+    if err := i.applier.ApplyComponent(ctx, pkg); err != nil {
+        return fmt.Errorf("apply manifests for %s: %w", cv.Spec.Name, err)
+    }
+
+    // 4. 健康检查
+    if cv.Spec.YAML != nil && cv.Spec.YAML.HealthCheck != nil && cv.Spec.YAML.HealthCheck.Enabled {
+        if err := healthcheck.Run(ctx, execCtx.TargetClient, *cv.Spec.YAML.HealthCheck); err != nil {
+            return fmt.Errorf("health check failed for %s: %w", cv.Spec.Name, err)
+        }
+    }
+    return nil
+}
+```
+
+### 6.5 健康检查
 
 YamlInstaller 的健康检查在 `Apply` 方法内部调用共享 `pkg/healthcheck` 包执行（`healthcheck.Run(ctx, execCtx.TargetClient, *cv.Spec.YAML.HealthCheck)`）。当 `cv.Spec.YAML.HealthCheck.Enabled` 为 true 时，清单 Apply 后执行 PodReady/EndpointReady/Custom 检查。接口定义与实现详见 **第 7 章 HealthCheck 共享包设计**。
 
-### 6.4 YAML Uninstall 流程
+### 6.6 YAML Uninstall 流程
 
 **设计思路 — YAML 组件卸载与 Binary/Helm 的区别**：
 
@@ -7406,1109 +7640,6 @@ bke-manifests/
 | Rolling 模式单节点失败 | Rollback | 对该节点执行 UninstallScript，继续下一个节点 |
 | Batch 模式单批失败 | FailFast | 终止后续批次，已升级批次保留 |
 | Helm `--atomic` 失败 | — | Helm SDK 自动回滚到上一个 Release |
-
----
-
-## 18. 补充设计：遗漏功能点
-
-> **设计思路**：本章补充前文遗漏的 12 个功能设计点，按所属章节归类。这些设计点在前文各章节中未充分展开，此处统一补充，确保设计完整性。
-
-### 18.1 YAML 清单 URL 下载与缓存
-
-> **所属章节**：第 6 章 YamlInstaller 详细设计
-
-**设计思路**：`yaml.manifests[].url` 引用的外部 YAML 清单文件需要下载、缓存和校验。与 BinaryInstaller 的制品下载类似，但更简单——清单文件体积远小于二进制制品，且格式固定为 YAML。
-
-**关键设计点**：
-- **缓存策略**：按 URL + Checksum 缓存到本地 (`/var/cache/bke/manifests/`)，避免重复下载
-- **多文档解析**：单个 YAML 文件可能包含多个 K8s 资源 (用 `---` 分隔)，需使用 `yaml.NewYAMLOrJSONDecoder` 逐文档解析
-- **Checksum 校验**：下载后校验 SHA256，确保清单完整性
-- **离线支持**：缓存命中时直接使用本地文件，无需网络访问
-
-**流程图**：
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                    YAML 清单下载与缓存流程                                        │
-└─────────────────────────────────────────────────────────────────────────────────┘
-
-  ┌──────────────────────────────────────┐
-  │  YamlInstaller.Apply()               │
-  │  遍历 yaml.manifests[]               │
-  └──────────┬───────────────────────────┘
-             │
-             ▼
-  ┌──────────────────────────────────────┐
-  │  检查缓存                            │
-  │  cacheKey = sha256(url + checksum)   │
-  │  cache.Get(cacheKey)                 │
-  └──────────┬───────────────────────────┘
-             │
-        ┌────┴────┐
-        │         │
-     命中       未命中
-        │         │
-        │         ▼
-        │  ┌────────────────────────────┐
-        │  │  HTTP GET(url)             │
-        │  │  下载清单文件              │
-        │  └──────────┬─────────────────┘
-        │             │
-        │             ▼
-        │  ┌────────────────────────────┐
-        │  │  校验 Checksum             │
-        │  │  sha256(data) == expected? │
-        │  └──────────┬─────────────────┘
-        │             │
-        │        ┌────┴────┐
-        │        │         │
-        │     通过       失败
-        │        │         │
-        │        ▼         ▼
-        │  ┌────────┐ ┌──────────┐
-        │  │保存缓存│ │返回错误  │
-        │  └───┬────┘ └──────────┘
-        │      │
-        └──────┼──────┐
-               │      │
-               ▼      ▼
-  ┌──────────────────────────────────────┐
-  │  合并所有清单内容                    │
-  │  → []byte (多文档 YAML)              │
-  └──────────┬───────────────────────────┘
-             │
-             ▼
-  ┌──────────────────────────────────────┐
-  │  YAML 多文档解析                     │
-  │  yaml.NewYAMLOrJSONDecoder           │
-  │  → []unstructured.Unstructured       │
-  └──────────────────────────────────────┘
-```
-
-**代码实现**：
-
-```go
-// pkg/yamlinstaller/manifest_downloader.go
-
-// ManifestDownloader 管理 YAML 清单的下载与缓存
-type ManifestDownloader struct {
-    cacheDir   string
-    httpClient *http.Client
-}
-
-// NewManifestDownloader 创建清单下载器
-func NewManifestDownloader(cacheDir string, httpClient *http.Client) (*ManifestDownloader, error) {
-    if err := os.MkdirAll(cacheDir, 0755); err != nil {
-        return nil, fmt.Errorf("failed to create manifest cache directory %s: %w", cacheDir, err)
-    }
-    return &ManifestDownloader{cacheDir: cacheDir, httpClient: httpClient}, nil
-}
-
-// DownloadManifest 下载单个清单文件 (带缓存)
-func (d *ManifestDownloader) DownloadManifest(ctx context.Context, ref ManifestRef) ([]byte, error) {
-    cacheKey := d.computeCacheKey(ref.URL, ref.Checksum)
-    cachePath := filepath.Join(d.cacheDir, cacheKey)
-
-    // 1. 检查缓存
-    if data, err := os.ReadFile(cachePath); err == nil {
-        return data, nil
-    }
-
-    // 2. HTTP 下载
-    req, err := http.NewRequestWithContext(ctx, http.MethodGet, ref.URL, nil)
-    if err != nil {
-        return nil, fmt.Errorf("failed to create request for %s: %w", ref.URL, err)
-    }
-    resp, err := d.httpClient.Do(req)
-    if err != nil {
-        return nil, fmt.Errorf("failed to download manifest from %s: %w", ref.URL, err)
-    }
-    defer resp.Body.Close()
-    if resp.StatusCode != http.StatusOK {
-        return nil, fmt.Errorf("failed to download manifest from %s: HTTP %d", ref.URL, resp.StatusCode)
-    }
-    data, err := io.ReadAll(resp.Body)
-    if err != nil {
-        return nil, fmt.Errorf("failed to read manifest body from %s: %w", ref.URL, err)
-    }
-
-    // 3. Checksum 校验
-    if ref.Checksum != "" {
-        if err := verifyChecksum(data, ref.Checksum); err != nil {
-            return nil, fmt.Errorf("checksum verification failed for %s: %w", ref.URL, err)
-        }
-    }
-
-    // 4. 保存到缓存
-    if err := os.WriteFile(cachePath, data, 0644); err != nil {
-        return nil, fmt.Errorf("failed to cache manifest %s: %w", ref.URL, err)
-    }
-
-    return data, nil
-}
-
-// DownloadManifests 下载清单文件列表，合并为多文档 YAML
-func (d *ManifestDownloader) DownloadManifests(ctx context.Context, refs []ManifestRef) ([]byte, error) {
-    var combined bytes.Buffer
-    for i, ref := range refs {
-        data, err := d.DownloadManifest(ctx, ref)
-        if err != nil {
-            return nil, fmt.Errorf("failed to download manifest[%d] %s: %w", i, ref.URL, err)
-        }
-        if i > 0 {
-            combined.WriteString("\n---\n")
-        }
-        combined.Write(data)
-    }
-    return combined.Bytes(), nil
-}
-
-// ParseMultiDocYAML 解析多文档 YAML 为 unstructured 对象列表
-func ParseMultiDocYAML(data []byte) ([]unstructured.Unstructured, error) {
-    var resources []unstructured.Unstructured
-    decoder := yaml.NewYAMLOrJSONDecoder(bytes.NewReader(data), 4096)
-    for {
-        var obj unstructured.Unstructured
-        err := decoder.Decode(&obj)
-        if err == io.EOF {
-            break
-        }
-        if err != nil {
-            return nil, fmt.Errorf("failed to parse YAML document: %w", err)
-        }
-        if obj.Object == nil {
-            continue // 跳过空文档
-        }
-        resources = append(resources, obj)
-    }
-    return resources, nil
-}
-
-func (d *ManifestDownloader) computeCacheKey(url, checksum string) string {
-    h := sha256.New()
-    h.Write([]byte(url))
-    if checksum != "" {
-        h.Write([]byte(checksum))
-    }
-    return fmt.Sprintf("%x.yaml", h.Sum(nil))
-}
-```
-
-**YamlInstaller 集成**：
-
-```go
-// pkg/yamlinstaller/installer.go 扩展
-
-type YamlInstaller struct {
-    store            manifest.Store
-    applier          manifest.Applier
-    manifestDownloader *ManifestDownloader  // 新增：清单下载器
-    logger           *bkev1beta1.BKELogger
-}
-
-type YamlInstallerConfig struct {
-    Store              manifest.Store
-    Applier            manifest.Applier
-    ManifestDownloader *ManifestDownloader  // 新增
-    Logger             *bkev1beta1.BKELogger
-}
-
-// Apply 扩展：支持外部 URL 清单 + 内联 Resources
-func (i *YamlInstaller) Apply(ctx context.Context, cv *configv1alpha1.ComponentVersion, execCtx *ExecutionContext) error {
-    var allResources []unstructured.Unstructured
-
-    // 1. 下载外部 URL 清单 (yaml.manifests[])
-    if cv.Spec.YAML != nil && len(cv.Spec.YAML.Manifests) > 0 {
-        data, err := i.manifestDownloader.DownloadManifests(ctx, cv.Spec.YAML.Manifests)
-        if err != nil {
-            return fmt.Errorf("download manifests for %s: %w", cv.Spec.Name, err)
-        }
-        resources, err := ParseMultiDocYAML(data)
-        if err != nil {
-            return fmt.Errorf("parse manifests for %s: %w", cv.Spec.Name, err)
-        }
-        allResources = append(allResources, resources...)
-    }
-
-    // 2. 加载内联 Resources (cv.Spec.Resources[])
-    inlineResources, err := i.store.GetComponentManifests(ctx, cv.Spec.Name, cv.Spec.Version, execCtx.TemplateContext)
-    if err != nil {
-        return fmt.Errorf("get inline manifests for %s: %w", cv.Spec.Name, err)
-    }
-    if inlineResources != nil {
-        allResources = append(allResources, inlineResources.Resources...)
-    }
-
-    // 3. 应用到集群
-    pkg := &manifest.ComponentPackage{Resources: allResources}
-    if err := i.applier.ApplyComponent(ctx, pkg); err != nil {
-        return fmt.Errorf("apply manifests for %s: %w", cv.Spec.Name, err)
-    }
-
-    // 4. 健康检查
-    if cv.Spec.YAML != nil && cv.Spec.YAML.HealthCheck != nil && cv.Spec.YAML.HealthCheck.Enabled {
-        if err := healthcheck.Run(ctx, execCtx.TargetClient, *cv.Spec.YAML.HealthCheck); err != nil {
-            return fmt.Errorf("health check failed for %s: %w", cv.Spec.Name, err)
-        }
-    }
-    return nil
-}
-```
-
-### 18.2 DAG 构建算法
-
-> **所属章节**：第 9 章 DAG 集成详细设计
-
-**设计思路**：DAG 构建算法负责从 ReleaseImage 的组件列表 + ComponentVersion 的依赖声明，构建出可拓扑排序的有向无环图。算法分为三步：组件节点创建、依赖边构建、环检测。
-
-**关键设计点**：
-- **输入**：ReleaseImage (组件列表 + 版本) + ComponentVersion 集合 (依赖关系)
-- **输出**：`topology.UpgradeDAG` (含拓扑批次)
-- **依赖解析**：`cv.Spec.Dependencies[]` 声明依赖的组件名称，DAG 构建时解析为边
-- **环检测**：使用 DFS 检测循环依赖，发现环时返回明确错误
-- **版本过滤**：升级场景下，`VersionContext.NeedsUpgrade(name) == false` 的组件不加入 DAG
-
-**流程图**：
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                         DAG 构建算法流程                                         │
-└─────────────────────────────────────────────────────────────────────────────────┘
-
-  ┌──────────────────────────────────────┐
-  │  输入:                                │
-  │  - ReleaseImage.components[]          │
-  │  - ComponentVersionStore              │
-  │  - VersionContext (升级场景)          │
-  └──────────┬───────────────────────────┘
-             │
-             ▼
-  ┌──────────────────────────────────────┐
-  │  Step 1: 创建组件节点                │
-  │  for _, comp := range components     │
-  │    cv = cvStore.GetComponentVersion  │
-  │    if upgrade && !vc.NeedsUpgrade()  │
-  │      continue  // 跳过无需升级的组件 │
-  │    dag.AddNode(comp.Name, cv)        │
-  └──────────┬───────────────────────────┘
-             │
-             ▼
-  ┌──────────────────────────────────────┐
-  │  Step 2: 构建依赖边                  │
-  │  for _, node := range dag.Nodes      │
-  │    for _, dep := range node.CV.      │
-  │        Spec.Dependencies             │
-  │      if dag.HasNode(dep.Name)        │
-  │        dag.AddEdge(dep.Name,         │
-  │                    node.Name)        │
-  │      // 隐式依赖: 同批次内           │
-  │      // binary 组件依赖 bkeagent     │
-  └──────────┬───────────────────────────┘
-             │
-             ▼
-  ┌──────────────────────────────────────┐
-  │  Step 3: 环检测 (DFS)               │
-  │  if hasCycle(dag)                    │
-  │    return error("circular dependency")│
-  └──────────┬───────────────────────────┘
-             │
-             ▼
-  ┌──────────────────────────────────────┐
-  │  Step 4: 拓扑排序 → 执行批次        │
-  │  batches = dag.TopologicalBatches()  │
-  │  // Kahn 算法: 每批取入度为0的节点  │
-  └──────────┬───────────────────────────┘
-             │
-             ▼
-  ┌──────────────────────────────────────┐
-  │  输出: topology.UpgradeDAG           │
-  │  - Nodes: 组件节点列表               │
-  │  - Edges: 依赖边列表                 │
-  │  - TopologicalBatches: 执行批次      │
-  └──────────────────────────────────────┘
-```
-
-**代码实现**：
-
-```go
-// pkg/topology/dag_builder.go
-
-// DAGBuilder 从 ReleaseImage + ComponentVersionStore 构建 DAG
-type DAGBuilder struct {
-    cvStore dagexec.ComponentVersionStore
-}
-
-// NewDAGBuilder 创建 DAG 构建器
-func NewDAGBuilder(cvStore dagexec.ComponentVersionStore) *DAGBuilder {
-    return &DAGBuilder{cvStore: cvStore}
-}
-
-// BuildInstallDAG 构建安装 DAG (所有组件)
-func (b *DAGBuilder) BuildInstallDAG(
-    ctx context.Context,
-    components []releasemanifest.ComponentRef,
-) (*UpgradeDAG, error) {
-    return b.buildDAG(ctx, components, nil)
-}
-
-// BuildUpgradeDAG 构建升级 DAG (仅需要升级的组件)
-func (b *DAGBuilder) BuildUpgradeDAG(
-    ctx context.Context,
-    components []releasemanifest.ComponentRef,
-    vc *upgrade.VersionContext,
-) (*UpgradeDAG, error) {
-    return b.buildDAG(ctx, components, vc)
-}
-
-// buildDAG 核心构建逻辑
-func (b *DAGBuilder) buildDAG(
-    ctx context.Context,
-    components []releasemanifest.ComponentRef,
-    vc *upgrade.VersionContext,
-) (*UpgradeDAG, error) {
-    dag := NewUpgradeDAG()
-
-    // Step 1: 创建节点 (过滤不需要升级的组件)
-    for _, comp := range components {
-        if vc != nil && !vc.NeedsUpgrade(comp.Name) {
-            continue // 升级场景：跳过已在目标版本的组件
-        }
-        cv, err := b.cvStore.GetComponentVersion(ctx, comp.Name, comp.Version)
-        if err != nil {
-            return nil, fmt.Errorf("failed to load ComponentVersion for %s/%s: %w",
-                comp.Name, comp.Version, err)
-        }
-        dag.AddNode(comp.Name, cv)
-    }
-
-    // Step 2: 构建依赖边
-    for _, node := range dag.Nodes() {
-        for _, dep := range node.ComponentVersion.Spec.Dependencies {
-            if dag.HasNode(dep.Name) {
-                dag.AddEdge(dep.Name, node.Name) // dep → node
-            }
-            // 依赖不存在时不报错 (可能是隐式依赖或已跳过的组件)
-        }
-    }
-
-    // Step 3: 环检测
-    if cycle := dag.DetectCycle(); cycle != nil {
-        return nil, fmt.Errorf("circular dependency detected: %v", cycle)
-    }
-
-    // Step 4: 拓扑排序
-    dag.ComputeTopologicalBatches()
-
-    return dag, nil
-}
-
-// UpgradeDAG DAG 结构
-type UpgradeDAG struct {
-    nodes    map[string]*DAGNode
-    edges    []DAGEdge
-    batches  [][]string // 拓扑批次 (每批可并行)
-}
-
-type DAGNode struct {
-    Name             string
-    ComponentVersion *configv1alpha1.ComponentVersion
-    InDegree         int
-}
-
-type DAGEdge struct {
-    From string
-    To   string
-}
-
-// TopologicalBatches 返回拓扑排序后的执行批次
-// 使用 Kahn 算法: 每批取所有入度为 0 的节点
-func (d *UpgradeDAG) ComputeTopologicalBatches() {
-    inDegree := make(map[string]int)
-    adjList := make(map[string][]string)
-    for name := range d.nodes {
-        inDegree[name] = 0
-    }
-    for _, edge := range d.edges {
-        adjList[edge.From] = append(adjList[edge.From], edge.To)
-        inDegree[edge.To]++
-    }
-
-    var batches [][]string
-    remaining := len(d.nodes)
-    for remaining > 0 {
-        // 收集当前入度为 0 的节点
-        var batch []string
-        for name, degree := range inDegree {
-            if degree == 0 {
-                batch = append(batch, name)
-            }
-        }
-        if len(batch) == 0 {
-            break // 环 (已在 DetectCycle 中处理)
-        }
-        // 移除本批节点，更新入度
-        for _, name := range batch {
-            delete(inDegree, name)
-            for _, neighbor := range adjList[name] {
-                inDegree[neighbor]--
-            }
-            remaining--
-        }
-        batches = append(batches, batch)
-    }
-    d.batches = batches
-}
-```
-
-### 18.3 Helm 与 Binary 模板渲染差异说明
-
-> **所属章节**：第 5 章 HelmInstaller / 第 8 章模板变量系统
-
-**设计思路**：Binary 和 Helm 的模板渲染机制存在有意差异，此处明确说明差异原因和使用约定。
-
-**差异对比**：
-
-| 维度 | Binary (TemplateRenderer) | Helm (renderValues) |
-|------|--------------------------|---------------------|
-| **模板引擎** | Go `text/template` (完整语法) | 简单字符串替换 (`strings.ReplaceAll`) |
-| **变量语法** | `{{.Variables.logLevel}}`, `{{.NodeIP}}` | `{{componentVersion}}`, `{{clusterName}}` |
-| **支持函数** | upper/lower/eq/default/joinPath 等 | 不支持 |
-| **条件渲染** | `{{if .isUpgrade}}...{{end}}` | 不支持 |
-| **渲染对象** | installScript, configTemplates.content | helm.values 中的字符串值 |
-| **渲染时机** | 安装前渲染为最终脚本/配置 | 渲染后传给 Helm SDK 作为 values |
-
-**差异原因**：
-1. **Binary installScript 是 Shell 脚本**：需要完整的模板能力 (条件、循环、函数) 来生成复杂的安装逻辑
-2. **Helm values 是结构化数据**：Helm Chart 自身已有完整的模板引擎 (Go template + Sprig)，values 只需提供数据，不需要在控制器侧再做复杂渲染
-3. **安全边界**：Helm values 中如果支持完整 Go template，可能导致意外的代码执行
-
-**Helm values 中需要动态值时的处理方式**：
-- 简单变量 (版本号、集群名)：使用 `{{componentVersion}}` 等预定义变量
-- 复杂逻辑：在 Chart 模板中处理 (Chart 自身支持完整 Go template)
-- 若确实需要在控制器侧渲染复杂 values，可通过 `valuesFiles` 引用预渲染的文件
-
-### 18.4 组件执行状态回写
-
-> **所属章节**：第 9 章 DAG 集成详细设计
-
-**设计思路**：组件执行结果需要回写到 BKECluster.Status，用于：
-1. 记录当前已安装的组件版本 (供 VersionContext 的 Current map 使用)
-2. 记录执行状态 (成功/失败/进行中)
-3. 提供用户可观测的状态信息
-
-**关键设计点**：
-- **回写时机**：每个组件执行成功后立即回写，而非等所有组件完成
-- **回写内容**：组件名、版本、状态、最后执行时间、错误信息
-- **并发安全**：多组件并行执行时，使用 `patch` 而非 `update` 避免冲突
-- **幂等性**：重复执行相同版本时，状态不变
-
-**数据结构**：
-
-```go
-// api/v1alpha1/bkecluster_types.go 扩展
-
-// BKEClusterStatus 扩展组件状态
-type BKEClusterStatus struct {
-    // ... 现有字段 ...
-
-    // 组件安装状态 (componentName → ComponentStatus)
-    ComponentStatuses map[string]ComponentStatus `json:"componentStatuses,omitempty"`
-}
-
-// ComponentStatus 单个组件的安装状态
-type ComponentStatus struct {
-    // 当前安装版本
-    Version string `json:"version"`
-
-    // 组件类型 (binary/helm/yaml/inline)
-    Type string `json:"type"`
-
-    // 执行状态: Installed / Failed / Installing
-    Phase string `json:"phase"`
-
-    // 最后成功执行时间
-    LastSuccessfulTime *metav1.Time `json:"lastSuccessfulTime,omitempty"`
-
-    // 最后错误信息 (失败时)
-    LastError string `json:"lastError,omitempty"`
-
-    // 最后错误时间
-    LastErrorTime *metav1.Time `json:"lastErrorTime,omitempty"`
-}
-```
-
-**回写流程**：
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                         组件执行状态回写流程                                      │
-└─────────────────────────────────────────────────────────────────────────────────┘
-
-  ┌──────────────────────────────────────┐
-  │  ComponentExecutor.ExecuteComponent  │
-  │  执行成功/失败                       │
-  └──────────┬───────────────────────────┘
-             │
-        ┌────┴────┐
-        │         │
-     成功       失败
-        │         │
-        ▼         ▼
-  ┌──────────┐  ┌──────────────────────┐
-  │ 更新状态 │  │ 更新状态             │
-  │ Phase:   │  │ Phase: Failed        │
-  │ Installed│  │ LastError: err.Msg   │
-  │ Version: │  │ LastErrorTime: now   │
-  │ targetVer│  │ (保留原 Version)     │
-  └────┬─────┘  └──────────┬───────────┘
-       │                   │
-       └─────────┬─────────┘
-                 │
-                 ▼
-  ┌──────────────────────────────────────┐
-  │  StatusWriter.PatchComponentStatus   │
-  │  (使用 Strategic Merge Patch)        │
-  │                                      │
-  │  patch := {                          │
-  │    "status": {                       │
-  │      "componentStatuses": {          │
-  │        "<name>": {                   │
-  │          "version": "...",           │
-  │          "phase": "...",             │
-  │          ...                         │
-  │        }                             │
-  │      }                               │
-  │    }                                 │
-  │  }                                   │
-  │  client.Status().Patch(ctx,          │
-  │    cluster, patch)                   │
-  └──────────────────────────────────────┘
-```
-
-**代码实现**：
-
-```go
-// pkg/dagexec/status_writer.go
-
-// StatusWriter 组件执行状态回写器
-type StatusWriter struct {
-    client client.Client
-}
-
-// NewStatusWriter 创建状态回写器
-func NewStatusWriter(client client.Client) *StatusWriter {
-    return &StatusWriter{client: client}
-}
-
-// MarkSuccess 标记组件执行成功
-func (w *StatusWriter) MarkSuccess(ctx context.Context, cluster *bkev1beta1.BKECluster, name, version, componentType string) error {
-    now := metav1.Now()
-    patch := client.MergeFrom(cluster.DeepCopy())
-    if cluster.Status.ComponentStatuses == nil {
-        cluster.Status.ComponentStatuses = make(map[string]ComponentStatus)
-    }
-    cluster.Status.ComponentStatuses[name] = ComponentStatus{
-        Version:            version,
-        Type:               componentType,
-        Phase:              "Installed",
-        LastSuccessfulTime: &now,
-        LastError:          "",
-    }
-    return w.client.Status().Patch(ctx, cluster, patch)
-}
-
-// MarkFailed 标记组件执行失败
-func (w *StatusWriter) MarkFailed(ctx context.Context, cluster *bkev1beta1.BKECluster, name, componentType string, err error) error {
-    now := metav1.Now()
-    patch := client.MergeFrom(cluster.DeepCopy())
-    if cluster.Status.ComponentStatuses == nil {
-        cluster.Status.ComponentStatuses = make(map[string]ComponentStatus)
-    }
-    status := cluster.Status.ComponentStatuses[name]
-    status.Phase = "Failed"
-    status.LastError = err.Error()
-    status.LastErrorTime = &now
-    cluster.Status.ComponentStatuses[name] = status
-    return w.client.Status().Patch(ctx, cluster, patch)
-}
-```
-
-### 18.5 YamlInstaller Template Renderer 澄清
-
-> **所属章节**：第 2 章整体架构设计 / 第 6 章 YamlInstaller 详细设计
-
-**澄清说明**：
-
-原 2.1 系统架构图中 YamlInstaller 包含 `Template Renderer` 组件，但第 6 章详细设计中未实现此功能。经审视，**YamlInstaller 不需要 Template Renderer**，原因如下：
-
-1. **YAML 清单是静态内容**：`yaml.manifests[].url` 引用的外部 YAML 文件和 `cv.Spec.Resources[].manifest` 内联资源定义，在构建 bke-manifests 时已完成所有变量替换
-2. **与 Helm 的区别**：Helm values 需要运行时渲染 (因为 values 依赖集群信息如镜像仓库地址)，而 YAML 清单在发布时已确定
-3. **简化设计**：YamlInstaller 仅负责下载 → 解析 → Apply → 健康检查，无模板渲染步骤
-
-**已修正**：2.1 系统架构图中 YamlInstaller 的 `Template Renderer` 已替换为 `ManifestDownload (清单获取/缓存)`，与 6.1 架构图和 18.1 节设计保持一致。
-
-### 18.6 Applier 扩展实现细节
-
-> **所属章节**：第 6 章 YamlInstaller 详细设计
-
-**设计思路**：`Applier` 接口扩展了 `DeleteComponent` 和 `PruneResources` 方法 (6.4 节)，需要给出 `ClusterApplier` 的具体实现。
-
-**关键设计点**：
-- **ServerSideApply**：使用 `kubernetes.Patch()` + `application/apply-patch+yaml` content type
-- **Replace**：先 Delete 再 Create，使用 `resourceVersion` 确保原子性
-- **CreateOnly**：直接 Create，已存在则跳过
-- **PruneResources**：按 label selector 查找集群中资源，删除不在当前清单中的资源
-- **删除顺序**：按 GVK 依赖关系逆序删除 (Deployment → ReplicaSet → Pod → Service → CRD)
-
-**代码实现**：
-
-```go
-// pkg/manifest/cluster_applier.go 扩展
-
-// ClusterApplier 实现 Applier 接口 (扩展 DeleteComponent + PruneResources)
-type ClusterApplier struct {
-    client    client.Client
-    clientset kubernetes.Interface
-    mapper    meta.RESTMapper
-}
-
-// ApplyComponent 应用组件清单 (ServerSideApply 默认策略)
-func (a *ClusterApplier) ApplyComponent(ctx context.Context, pkg *ComponentPackage) error {
-    for _, resource := range pkg.Resources {
-        // 设置管理标签 (用于 Prune)
-        labels := resource.GetLabels()
-        if labels == nil {
-            labels = make(map[string]string)
-        }
-        labels["app.kubernetes.io/managed-by"] = "bke"
-        resource.SetLabels(labels)
-
-        // ServerSideApply
-        data, err := json.Marshal(resource.Object)
-        if err != nil {
-            return fmt.Errorf("failed to marshal resource %s/%s: %w",
-                resource.GetKind(), resource.GetName(), err)
-        }
-        err = a.client.Patch(ctx, &resource,
-            client.RawPatch(types.ApplyPatchType, data),
-            client.ForceOwnership,
-            client.FieldOwner("bke-controller"))
-        if err != nil {
-            return fmt.Errorf("failed to apply %s/%s: %w",
-                resource.GetKind(), resource.GetName(), err)
-        }
-    }
-    return nil
-}
-
-// DeleteComponent 删除组件资源 (逆序删除)
-func (a *ClusterApplier) DeleteComponent(ctx context.Context, pkg *ComponentPackage) error {
-    // 逆序删除: 先删除依赖方，再删除被依赖方
-    for i := len(pkg.Resources) - 1; i >= 0; i-- {
-        resource := pkg.Resources[i]
-        err := a.client.Delete(ctx, &resource,
-            client.PropagationPolicy(metav1.DeletePropagationBackground))
-        if err != nil && !apierrors.IsNotFound(err) {
-            return fmt.Errorf("failed to delete %s/%s: %w",
-                resource.GetKind(), resource.GetName(), err)
-        }
-    }
-    return nil
-}
-
-// PruneResources 裁剪不在清单中的资源 (按 label selector)
-func (a *ClusterApplier) PruneResources(ctx context.Context, selector map[string]string) error {
-    // 1. 按 label selector 查找集群中所有被管理的资源
-    for gvk := range a.discoverManagedGVKs(ctx) {
-        mapping, err := a.mapper.RESTMapping(gvk.GroupKind())
-        if err != nil {
-            continue
-        }
-        list, err := a.clientset.Resource(mapping.Resource).
-            Namespace(""). // 所有命名空间
-            List(ctx, metav1.ListOptions{
-                LabelSelector: labels.Set(selector).String(),
-            })
-        if err != nil {
-            continue
-        }
-        // 2. 删除不在当前清单中的资源
-        for _, item := range list.Items {
-            if !a.isInCurrentPackage(item.GetName(), item.GetNamespace(), currentPkg) {
-                err := a.clientset.Resource(mapping.Resource).
-                    Namespace(item.GetNamespace()).
-                    Delete(ctx, item.GetName(), metav1.DeleteOptions{})
-                if err != nil && !apierrors.IsNotFound(err) {
-                    return fmt.Errorf("failed to prune %s/%s: %w",
-                        item.GetKind(), item.GetName(), err)
-                }
-            }
-        }
-    }
-    return nil
-}
-```
-
-### 18.7 VersionContext 跨 Reconcile 持久化
-
-> **所属章节**：第 9 章 DAG 集成详细设计
-
-**设计思路**：`VersionContext` 的 `Current` map 需要在 Reconcile 之间持久化，用于下次升级时判断组件是否已安装及当前版本。持久化通过 `BKECluster.Status.ComponentStatuses` 实现 (见 18.4 节)。
-
-**映射关系**：
-
-| VersionContext 字段 | 持久化位置 | 写入时机 | 读取时机 |
-|---------------------|-----------|---------|---------|
-| `Current[name]` | `BKECluster.Status.ComponentStatuses[name].Version` | 组件执行成功后 (`StatusWriter.MarkSuccess`) | Reconcile 开始时构建 VersionContext |
-| `Target[name]` | `ReleaseImage.spec.upgrade.components[].version` | 无需持久化 (从 ReleaseImage 读取) | DAG 构建时 |
-
-**VersionContext 构建流程**：
-
-```go
-// controllers/capbke/bkecluster_upgrade_dag.go 扩展
-
-// buildVersionContext 从 BKECluster.Status + ReleaseImage 构建 VersionContext
-func (r *BKEClusterReconciler) buildVersionContext(
-    cluster *bkev1beta1.BKECluster,
-    releaseImage *configv1alpha1.ReleaseImage,
-    isUpgrade bool,
-) *upgrade.VersionContext {
-    vc := &upgrade.VersionContext{
-        Current: make(map[string]string),
-        Target:  make(map[string]string),
-    }
-
-    // 1. 填充 Current: 从 BKECluster.Status.ComponentStatuses 读取
-    for name, status := range cluster.Status.ComponentStatuses {
-        if status.Phase == "Installed" {
-            vc.Current[name] = status.Version
-        }
-    }
-
-    // 2. 填充 Target: 从 ReleaseImage 读取
-    var components []releasemanifest.ComponentRef
-    if isUpgrade {
-        components = releaseImage.Spec.Upgrade.Components
-    } else {
-        components = releaseImage.Spec.Install.Components
-    }
-    for _, comp := range components {
-        vc.Target[comp.Name] = comp.Version
-    }
-
-    return vc
-}
-```
-
-**幂等性保证**：
-- 组件执行成功后才写入 `ComponentStatuses[name].Version`
-- 下次 Reconcile 时，`VersionContext.HasCurrent(name) == true` 且 `NeedsUpgrade(name) == false` (版本相同)
-- 组件执行失败时不更新 Version，下次 Reconcile 会重试
-
-### 18.8 YamlInstaller 健康检查 clientset 来源
-
-> **所属章节**：第 6 章 YamlInstaller 详细设计
-
-**设计思路**：`YamlInstaller.Apply` 中调用 `healthcheck.Run(ctx, execCtx.TargetClient, ...)` 需要 `kubernetes.Interface` (typed clientset)。当前 `YamlInstallerConfig` 仅注入 `Store` + `Applier`，未注入 clientset。
-
-**解决方案**：通过 `ExecutionContext.TargetClient` 传递，无需修改 `YamlInstallerConfig`。
-
-**数据流**：
-
-```
-BKEClusterReconciler.buildExecutionContext()
-  │
-  │  targetClient, _ := r.buildTargetClientset(ctx, newCluster)
-  │  execCtx.TargetClient = targetClient
-  │
-  ▼
-Scheduler.ExecuteDAG(ctx, execCtx, dag)
-  │
-  ▼
-YamlComponentExecutor.ExecuteComponent(ctx, node, execCtx)
-  │
-  ▼
-YamlInstaller.Apply(ctx, cv, execCtx)
-  │
-  │  healthcheck.Run(ctx, execCtx.TargetClient, ...)
-  │                        ^^^^^^^^^^^^^^^^^^^^^^^^
-  │                        从 execCtx 获取，无需 Installer 持有
-  │
-  ▼
-pkg/healthcheck.Run(ctx, clientset, hc)
-```
-
-**说明**：`ExecutionContext.TargetClient` 由 controllers 层在 `buildExecutionContext` 中注入 (见 9.1.3 节)，是目标集群的 typed clientset。YamlInstaller 通过 `execCtx.TargetClient` 访问，无需在 `YamlInstallerConfig` 中重复注入。这与 `HelmInstaller` 的设计一致——`HelmInstaller` 在 Config 中直接注入 `Clientset`，因为 HelmInstaller 不接收 `ExecutionContext`。
-
-### 18.9 ComponentVersion Webhook 验证
-
-> **所属章节**：第 3 章 ComponentVersion CRD 详细设计
-
-**设计思路**：新增 `binary`/`helm`/`yaml` 字段后，需要 ValidatingWebhook 校验字段完整性和一致性，防止无效的 ComponentVersion 被创建。
-
-**校验规则**：
-
-| 规则 | 条件 | 错误信息 |
-|------|------|---------|
-| type=binary 时 binary 字段必填 | `spec.type == "binary" && spec.binary == nil` | `binary field is required when type is binary` |
-| type=helm 时 helm 字段必填 | `spec.type == "helm" && spec.helm == nil` | `helm field is required when type is helm` |
-| type=yaml 时 yaml 字段必填 | `spec.type == "yaml" && spec.yaml == nil` | `yaml field is required when type is yaml` |
-| type=inline 时 inline 字段必填 | `spec.type == "inline" && spec.inline == nil` | `inline field is required when type is inline` |
-| binary.artifacts 非空 | `spec.type == "binary" && len(spec.binary.artifacts) == 0` | `binary.artifacts must not be empty` |
-| binary.installScript 非空 | `spec.type == "binary" && spec.binary.installScript == ""` | `binary.installScript is required` |
-| binary.artifacts[].checksum 格式 | 不以 `sha256:` 开头 | `checksum must be in format sha256:<hex>` |
-| binary.supportedArchitectures 非空 | `len(spec.binary.supportedArchitectures) == 0` | `supportedArchitectures must not be empty` |
-| helm.chart 至少一个来源 | oci/url/localPath 全为空 | `helm.chart must specify oci, url, or localPath` |
-| yaml.manifests 非空 | `spec.type == "yaml" && len(spec.yaml.manifests) == 0 && len(spec.resources) == 0` | `yaml.manifests or resources must not be empty` |
-
-**代码实现**：
-
-```go
-// api/v1alpha1/componentversion_webhook.go
-
-// ValidateCreate 创建时校验
-func (r *ComponentVersion) ValidateCreate() (admission.Warnings, error) {
-    return r.validate()
-}
-
-// ValidateUpdate 更新时校验
-func (r *ComponentVersion) ValidateUpdate(old runtime.Object) (admission.Warnings, error) {
-    return r.validate()
-}
-
-func (r *ComponentVersion) validate() (admission.Warnings, error) {
-    var errs []string
-
-    switch r.Spec.Type {
-    case ComponentTypeBinary:
-        if r.Spec.Binary == nil {
-            errs = append(errs, "binary field is required when type is binary")
-        } else {
-            if len(r.Spec.Binary.Artifacts) == 0 {
-                errs = append(errs, "binary.artifacts must not be empty")
-            }
-            if r.Spec.Binary.InstallScript == "" {
-                errs = append(errs, "binary.installScript is required")
-            }
-            if len(r.Spec.Binary.SupportedArchitectures) == 0 {
-                errs = append(errs, "binary.supportedArchitectures must not be empty")
-            }
-            for i, art := range r.Spec.Binary.Artifacts {
-                if art.Checksum != "" && !strings.HasPrefix(art.Checksum, "sha256:") {
-                    errs = append(errs, fmt.Sprintf("binary.artifacts[%d].checksum must be in format sha256:<hex>", i))
-                }
-            }
-        }
-    case ComponentTypeHelm:
-        if r.Spec.Helm == nil {
-            errs = append(errs, "helm field is required when type is helm")
-        } else {
-            chart := r.Spec.Helm.Chart
-            if chart.OCI == nil && chart.URL == "" && chart.LocalPath == "" {
-                errs = append(errs, "helm.chart must specify oci, url, or localPath")
-            }
-        }
-    case ComponentTypeYAML:
-        if r.Spec.YAML == nil {
-            errs = append(errs, "yaml field is required when type is yaml")
-        }
-    case ComponentTypeInline:
-        if r.Spec.Inline == nil {
-            errs = append(errs, "inline field is required when type is inline")
-        }
-    }
-
-    if len(errs) > 0 {
-        return nil, fmt.Errorf("validation failed: %s", strings.Join(errs, "; "))
-    }
-    return nil, nil
-}
-```
-
-### 18.10 Binary 组件并发安装冲突
-
-> **所属章节**：第 4 章 BinaryInstaller / 第 9 章 DAG 集成详细设计
-
-**设计思路**：同一节点上多个 Binary 组件并发安装时可能产生冲突。需要分析冲突场景并给出防护策略。
-
-**潜在冲突**：
-
-| 冲突类型 | 场景 | 示例 | 影响 |
-|---------|------|------|------|
-| **systemd daemon-reload** | 多个组件同时执行 `systemctl daemon-reload` | containerd + bkeagent 同时安装 | daemon-reload 本身幂等，但可能导致短暂的服务状态不一致 |
-| **共享目录写入** | 多个组件写入同一目录 | 两个组件都写 `/usr/local/bin/` | 文件覆盖 (罕见，不同组件二进制名不同) |
-| **端口冲突** | 两个组件的健康检查脚本同时占用端口 | 罕见 | 健康检查误判 |
-| **包管理器锁** | 两个组件同时执行 `yum install` / `apt-get install` | containerd + bkeagent 都安装 libseccomp | 包管理器锁冲突，一个失败 |
-
-**防护策略**：
-
-1. **DAG 依赖控制**：通过 `dependencies` 声明依赖关系，有依赖的组件不会并行执行
-   - containerd 依赖 bkeagent → bkeagent 先安装，containerd 后安装
-   - 同一批次内的 binary 组件才会并行
-
-2. **安装脚本幂等设计**：installScript 应设计为幂等的
-   - 使用 `systemctl restart` 而非 `systemctl start`
-   - 使用 `install -m 0755` 而非 `cp` + `chmod`
-   - 包安装使用 `yum install -y || true` 容忍已安装
-
-3. **批次内串行化 (可选)**：对于高风险场景，可配置 `upgradeStrategy.mode: Rolling` (batchSize=1)
-
-4. **文件锁 (installScript 层面)**：脚本内使用 `flock` 保护共享资源
-   ```bash
-   exec 200>/var/lock/bke-install.lock
-   flock -n 200 || { echo "another install in progress"; exit 1; }
-   ```
-
-**推荐实践**：
-- 通过 DAG 依赖关系避免关键组件并行 (bkeagent → containerd → kubernetes)
-- installScript 编写遵循幂等原则
-- 同一批次内的 binary 组件 (如 containerd + bkeagent) 在实际场景中较少冲突，因为操作的文件/服务不同
-
-### 18.11 ReleaseImage 与 ComponentVersion 版本一致性校验
-
-> **所属章节**：第 3 章 CRD 设计 / 第 9 章 DAG 集成
-
-**设计思路**：ReleaseImage 引用的 `(name, version)` 在 bke-manifests 中不存在时，需要明确的错误处理策略。
-
-**校验时机**：
-
-| 时机 | 校验内容 | 处理方式 |
-|------|---------|---------|
-| DAG 构建时 | `cvStore.GetComponentVersion(name, version)` 返回错误 | 终止 DAG 构建，返回明确错误 |
-| Executor 执行时 | 二次确认 CV 存在 | 跳过该组件，记录错误 |
-
-**错误处理**：
-
-```go
-// pkg/topology/dag_builder.go 扩展
-
-func (b *DAGBuilder) buildDAG(...) (*UpgradeDAG, error) {
-    // ...
-    for _, comp := range components {
-        cv, err := b.cvStore.GetComponentVersion(ctx, comp.Name, comp.Version)
-        if err != nil {
-            // 明确错误：组件版本在 release bundle 中不存在
-            return nil, fmt.Errorf(
-                "ReleaseImage references component %s/%s but it is not found in release bundle. "+
-                "Please ensure bke-manifests contains the correct ComponentVersion",
-                comp.Name, comp.Version)
-        }
-        // ...
-    }
-}
-```
-
-**Webhook 校验 (可选)**：ReleaseImage 创建/更新时，校验所有引用的组件在 bke-manifests 中存在：
-
-```go
-// api/v1alpha1/releaseimage_webhook.go
-
-func (r *ReleaseImage) validate() error {
-    // 校验 install.components 中每个组件在 bke-manifests 中存在
-    for _, comp := range r.Spec.Install.Components {
-        if !manifestStore.HasComponent(comp.Name, comp.Version) {
-            return fmt.Errorf("install component %s/%s not found in bke-manifests",
-                comp.Name, comp.Version)
-        }
-    }
-    // 同理校验 upgrade.components
-    return nil
-}
-```
-
-### 18.12 离线环境下 ValuesFiles 的 ConfigMap 挂载设计
-
-> **所属章节**：第 5 章 HelmInstaller 详细设计
-
-**设计思路**：HelmInstaller 的 `valuesFiles` 从控制器 Pod 本地文件系统读取 (5.3 节)。在 Kubernetes 控制器场景下，这些文件通过 ConfigMap 挂载到 Pod 中。本节补充 ConfigMap 的创建/更新设计。
-
-**ConfigMap 命名约定**：
-
-```
-ConfigMap 名称: bke-helm-values-<componentName>
-命名空间: 控制器所在命名空间 (如 bke-system)
-挂载路径: /etc/bke-values/<componentName>/
-```
-
-**ConfigMap 数据键**：
-
-```yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: bke-helm-values-coredns
-  namespace: bke-system
-data:
-  values-base.yaml: |
-    replicaCount: 1
-    image:
-      pullPolicy: IfNotPresent
-  values-amd64.yaml: |
-    nodeSelector:
-      kubernetes.io/arch: amd64
-  values-arm64.yaml: |
-    nodeSelector:
-      kubernetes.io/arch: arm64
-```
-
-**挂载配置**：
-
-```yaml
-# 控制器 Deployment 中
-spec:
-  template:
-    spec:
-      containers:
-      - name: controller
-        volumeMounts:
-        - name: helm-values
-          mountPath: /etc/bke-values
-          readOnly: true
-      volumes:
-      - name: helm-values
-        projected:
-          sources:
-          - configMap:
-              name: bke-helm-values-coredns
-              items:
-              - key: values-base.yaml
-                path: coredns/values-base.yaml
-              - key: values-amd64.yaml
-                path: coredns/values-amd64.yaml
-              - key: values-arm64.yaml
-                path: coredns/values-arm64.yaml
-          - configMap:
-              name: bke-helm-values-other-component
-              # ...
-```
-
-**ConfigMap 生命周期管理**：
-
-| 操作 | 触发时机 | 说明 |
-|------|---------|------|
-| 创建 | bke-manifests 初始化时 | 随 bke-manifests bundle 一起部署 |
-| 更新 | 组件版本升级时 | 新版本的 values 文件覆盖旧版本 |
-| 删除 | 组件卸载时 | 清理不再需要的 values ConfigMap |
-
-**与 ComponentVersion 的关联**：
-
-ValuesFiles 的 ConfigMap 内容应在 ComponentVersion YAML 中声明，由 bke-manifests 构建工具自动生成：
-
-```yaml
-# bke-manifests/coredns/v1.11.1/component.yaml
-spec:
-  helm:
-    valuesFiles:
-      - "/etc/bke-values/coredns/values-base.yaml"
-      - "/etc/bke-values/coredns/values-{{arch}}.yaml"
-
-# bke-manifests/coredns/v1.11.1/values/ 目录:
-# ├── values-base.yaml
-# ├── values-amd64.yaml
-# └── values-arm64.yaml
-```
-
-bke-manifests 构建工具扫描 `values/` 目录，自动生成对应的 ConfigMap YAML 并打包到 release bundle 中。
 
 ---
 
