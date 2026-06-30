@@ -1,8 +1,824 @@
 # 从编排层、执行器层与每节点、每组件记录状态，分层解耦，设计完整的安装、升级状态记录与冥等性、兼容性设计
-Now I have a complete picture. Let me present the comprehensive design.
 
----
+## 9.5 状态模型、幂等性与兼容性设计
 
+### 9.5.1 问题分析
+
+当前 KEP-6 设计存在三个状态相关缺口：
+
+| 缺口 | 当前设计 | 应有行为 |
+|------|---------|---------|
+| **节点过滤** | `NodeProvider.GetNodes()` 返回全部节点，无过滤 | 应排除 Failed/Deleting/Skipped/已完成节点 |
+| **per-node 幂等** | `VersionContext.NeedsUpgrade(name)` 是组件级判断 | 应支持 per-node 判断（node1 已升级，node2 未升级） |
+| **状态回写** | 无状态回写逻辑 | 应在安装成功/失败后更新 per-node per-component 状态 |
+
+当前代码中各组件的节点过滤逻辑各不相同：
+
+| 组件 | 当前过滤函数 | 过滤条件 |
+|------|------------|---------|
+| bkeagent (安装) | `GetNeedPushAgentNodesWithBKENodes` | `!NodeAgentPushedFlag` + Appointment 排除 |
+| bkeagent (升级) | **无过滤** | 全部节点都执行 |
+| containerd | `GetNeedUpgradeNodesWithBKENodes` | `OpenFuyaoVersion` 版本比较 |
+| kubernetes | `GetNeedUpgradeK8sNodes` + 角色过滤 | `KubernetesVersion` + master/worker |
+| etcd | `filterUpgradeableNodes` + `.Etcd()` | `EtcdVersion` + etcd 角色 |
+
+### 9.5.2 分层架构
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                          编排层 (Orchestration Layer)                             │
+│                                                                                  │
+│  DAG Scheduler                                                                   │
+│  ├─ 拓扑排序 → 执行批次                                                          │
+│  ├─ 批次间串行、批次内并行                                                       │
+│  └─ FailurePolicy (FailFast/Continue/Rollback)                                  │
+│                                                                                  │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                          执行器层 (Executor Layer)                                │
+│                                                                                  │
+│  BinaryComponentExecutor                                                         │
+│  ├─ 加载 ComponentVersion                                                       │
+│  ├─ 组件级幂等判断 (VersionContext.NeedsUpgrade)                                │
+│  ├─ 获取节点列表 (NodeProvider.GetNodes)                                        │
+│  ├─ 节点级过滤 (NodeFilter.Filter)              ← 新增接口                      │
+│  ├─ 按策略执行 (Rolling/Parallel/Batch)                                          │
+│  ├─ 每节点状态更新 (NodeStatusUpdater)          ← 新增接口                      │
+│  └─ 委托 BinaryInstaller.Install()                                              │
+│                                                                                  │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                          安装层 (Installer Layer)                                 │
+│                                                                                  │
+│  BinaryInstaller                                                                 │
+│  ├─ SSH 发现架构                                                                 │
+│  ├─ 下载制品 + 校验                                                              │
+│  ├─ 渲染脚本/配置                                                                │
+│  ├─ SSH 上传 + 执行                                                              │
+│  └─ 健康检查                                                                     │
+│  ※ 不感知节点状态、不做过滤、不更新状态                                         │
+│                                                                                  │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                          状态层 (State Layer)                                     │
+│                                                                                  │
+│  BKECluster.Status.NodeComponentStatuses (per-node per-component)  ← 新增        │
+│  BKENode.Status.StateCode (per-node 位标记，向后兼容)                            │
+│  BKECluster.Status.*Version (集群级版本，向后兼容)                               │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 9.5.3 状态数据模型
+
+#### 新增 `NodeComponentStatuses` 字段
+
+```go
+// api/bkecommon/v1beta1/bkecluster_status.go 扩展
+
+type BKEClusterStatus struct {
+    // ... 现有字段保持不变 ...
+
+    // 每节点每组件安装状态 (KEP-6 新增)
+    // key 外层: 组件名 (如 "containerd", "bkeagent")
+    // key 内层: 节点 IP
+    // 用于 Binary 组件的 per-node 幂等判断和状态追踪
+    // Helm/YAML/Inline 组件不写入此字段 (它们是集群级部署)
+    NodeComponentStatuses map[string]map[string]NodeComponentStatus `json:"nodeComponentStatuses,omitempty"`
+}
+
+// NodeComponentStatus 单个节点上单个组件的安装状态
+type NodeComponentStatus struct {
+    // 已安装版本 (如 "v1.7.18")
+    Version string `json:"version"`
+
+    // 安装阶段: Installing / Installed / Failed
+    Phase string `json:"phase"`
+
+    // 最后更新时间
+    LastUpdateTime *metav1.Time `json:"lastUpdateTime,omitempty"`
+
+    // 错误信息 (Phase=Failed 时)
+    Message string `json:"message,omitempty"`
+}
+```
+
+**设计决策 — 为什么放在 BKECluster.Status 而非 BKENode.Status**：
+
+| 维度 | BKECluster.Status.NodeComponentStatuses | BKENode.Status.ComponentStatuses |
+|------|----------------------------------------|----------------------------------|
+| 更新操作 | 1 次 Patch (整个 BKECluster) | N 次 Update (每个 BKENode) |
+| 并发冲突 | 低 (单对象) | 高 (N 个对象同时更新) |
+| 性能 | ✅ 优 | ❌ 差 (N 次 API 调用) |
+
+#### 状态模型全景
+
+```
+BKECluster.Status
+├── KubernetesVersion          ← 集群级 (现有，向后兼容)
+├── ContainerdVersion          ← 集群级 (现有，向后兼容)
+├── EtcdVersion                ← 集群级 (现有，向后兼容)
+├── OpenFuyaoVersion           ← 集群级 (现有，向后兼容)
+├── ComponentStatuses          ← 组件级 (所有类型共用)
+│   └── [name] → ComponentStatus { Version, Phase, Type, ... }
+└── NodeComponentStatuses      ← per-node per-component (新增，仅 Binary)
+    └── [componentName] → [nodeIP] → NodeComponentStatus { Version, Phase, ... }
+
+BKENode.Status
+├── State                      ← 节点整体状态 (现有)
+├── StateCode                  ← 位标记 (现有，向后兼容)
+│   ├── NodeAgentPushedFlag    ← bit 0
+│   ├── NodeAgentReadyFlag     ← bit 1
+│   ├── NodeEnvFlag            ← bit 2
+│   └── ...
+├── Message                    ← 状态消息 (现有)
+└── NeedSkip                   ← 跳过标记 (现有)
+```
+
+**职责分工**：
+
+| 状态存储 | 谁写入 | 谁读取 | 用途 |
+|---------|--------|--------|------|
+| `BKECluster.Status.*Version` | 兼容层 (Feature Gate OFF) | VersionContext 构建 | 集群级版本判断 |
+| `BKECluster.Status.ComponentStatuses` | ComponentExecutor (所有类型) | DAG 调度器、UI | 组件级状态展示 |
+| `BKECluster.Status.NodeComponentStatuses` | BinaryComponentExecutor | NodeFilter、BinaryComponentExecutor | per-node 幂等判断 |
+| `BKENode.Status.StateCode` | 兼容层 (Feature Gate OFF) | NodeFilter (兼容模式) | 向后兼容 |
+
+### 9.5.4 NodeFilter 接口
+
+#### 接口定义
+
+```go
+// pkg/dagexec/node_filter.go
+
+// NodeFilter 节点过滤接口
+//
+// 设计思路 — 为什么不内置到 BinaryComponentExecutor:
+// 1. 不同组件的过滤逻辑不同 (bkeagent 按位标记，containerd 按版本比较)
+// 2. 过滤逻辑可能随组件类型演化，Executor 不应绑定特定实现
+// 3. 测试时可注入 Mock Filter，独立测试 Executor 调度逻辑
+//
+// 设计思路 — 为什么不内置到 NodeProvider:
+// NodeProvider 职责是"获取节点"，NodeFilter 职责是"过滤节点"
+// 两者关注点不同: Provider 关心数据来源，Filter 关心业务逻辑
+//
+// 设计思路 — 为什么仅用于 Binary 组件:
+// Binary 组件直接在节点上 SSH 执行，需要 Controller 选择目标节点
+// Helm/YAML 组件部署到集群，节点调度由 K8s Scheduler 通过 nodeSelector 处理
+type NodeFilter interface {
+    // Filter 返回需要执行操作的节点列表
+    Filter(ctx context.Context, nodes []Node, cv *configv1alpha1.ComponentVersion, execCtx *ExecutionContext) ([]Node, error)
+}
+```
+
+#### NodeFilterSpec 类型定义
+
+```go
+// api/v1alpha1/componentversion_types.go 扩展
+
+// ComponentVersionSpec 扩展
+type ComponentVersionSpec struct {
+    // ... 现有字段 ...
+
+    // 节点过滤策略 (仅 Binary 组件使用，安装和升级共用)
+    // Helm/YAML 组件通过 values/nodeSelector 自行处理节点调度
+    NodeFilter *NodeFilterSpec `json:"nodeFilter,omitempty"`
+}
+
+// NodeFilterSpec 定义 Binary 组件的节点过滤策略
+type NodeFilterSpec struct {
+    // 目标节点角色列表
+    // 空或不填 = 所有角色
+    // 示例: ["master", "worker"], ["etcd"]
+    Roles []string `json:"roles,omitempty"`
+
+    // 节点标签选择器
+    // 仅选择标签完全匹配的节点 (等值匹配)
+    // 示例: {"gpu": "true", "node-pool": "compute"}
+    MatchLabels map[string]string `json:"matchLabels,omitempty"`
+
+    // 是否跳过已完成的节点 (per-node 幂等)
+    // true:  检查 NodeComponentStatuses[nodeIP].Version == target → 跳过
+    // false: 对所有节点执行，不检查 per-node 状态
+    // 默认: true (大多数场景需要幂等)
+    // 例外: bkeagent 升级设为 false (当前代码 EnsureAgentUpgrade 无过滤)
+    SkipCompleted *bool `json:"skipCompleted,omitempty"`
+
+    // 是否排除预约添加的节点
+    // 默认: true (与当前 filterNodes 的 WithExcludeAppointmentNodes 一致)
+    ExcludeAppointment *bool `json:"excludeAppointment,omitempty"`
+}
+```
+
+#### Node 结构体扩展
+
+```go
+// pkg/dagexec/node_provider.go 扩展
+
+type Node struct {
+    Name      string
+    IP        string
+    Hostname  string
+    Role      string
+    Labels    map[string]string  // 新增：节点标签 (从 BKENode.Labels 读取)
+    Status    NodeStatus
+}
+```
+
+`BKENodeProvider.GetNodes()` 需从 BKENode CRD 读取标签填充 `Labels` 字段。
+
+#### 默认实现: BKENodeFilter
+
+```go
+// pkg/dagexec/bke_node_filter.go
+
+type BKENodeFilter struct {
+    client client.Client
+}
+
+func (f *BKENodeFilter) Filter(
+    ctx context.Context,
+    nodes []Node,
+    cv *configv1alpha1.ComponentVersion,
+    execCtx *ExecutionContext,
+) ([]Node, error) {
+    nf := cv.Spec.NodeFilter
+    skipCompleted := true
+    if nf != nil && nf.SkipCompleted != nil {
+        skipCompleted = *nf.SkipCompleted
+    }
+    excludeAppointment := true
+    if nf != nil && nf.ExcludeAppointment != nil {
+        excludeAppointment = *nf.ExcludeAppointment
+    }
+
+    var targetNodes []Node
+    for _, node := range nodes {
+        // 1. 硬排除: Failed/Deleting/Skipped (不可配置，安全约束)
+        if f.isExcluded(ctx, node, execCtx) {
+            continue
+        }
+
+        // 2. 角色过滤
+        if nf != nil && len(nf.Roles) > 0 {
+            if !slices.Contains(nf.Roles, node.Role) {
+                continue
+            }
+        }
+
+        // 3. 标签过滤
+        if nf != nil && len(nf.MatchLabels) > 0 {
+            if !matchLabels(node.Labels, nf.MatchLabels) {
+                continue
+            }
+        }
+
+        // 4. 预约节点排除
+        if excludeAppointment && f.isAppointmentNode(node, execCtx) {
+            continue
+        }
+
+        // 5. per-node 幂等
+        if skipCompleted && f.isAlreadyAtTarget(ctx, node, cv, execCtx) {
+            continue
+        }
+
+        targetNodes = append(targetNodes, node)
+    }
+
+    return targetNodes, nil
+}
+
+func matchLabels(nodeLabels, selector map[string]string) bool {
+    for k, v := range selector {
+        if nodeLabels[k] != v {
+            return false
+        }
+    }
+    return true
+}
+```
+
+#### isExcluded — 硬排除 (不可配置)
+
+```go
+func (f *BKENodeFilter) isExcluded(ctx context.Context, node Node, execCtx *ExecutionContext) bool {
+    bkeNode := &configv1beta1.BKENode{}
+    err := f.client.Get(ctx, types.NamespacedName{
+        Namespace: execCtx.Cluster.Namespace,
+        Name:      node.Name,
+    }, bkeNode)
+    if err != nil {
+        return true
+    }
+
+    if bkeNode.Status.StateCode&configv1beta1.NodeFailedFlag != 0 {
+        return true
+    }
+    if bkeNode.Status.StateCode&configv1beta1.NodeDeletingFlag != 0 {
+        return true
+    }
+    if bkeNode.Status.NeedSkip {
+        return true
+    }
+    return false
+}
+```
+
+#### isAlreadyAtTarget — per-node 幂等 (双源读取)
+
+```go
+func (f *BKENodeFilter) isAlreadyAtTarget(
+    ctx context.Context,
+    node Node,
+    cv *configv1alpha1.ComponentVersion,
+    execCtx *ExecutionContext,
+) bool {
+    componentName := cv.Spec.Name
+    targetVersion := cv.Spec.Version
+
+    // 优先: 从 NodeComponentStatuses 读取 (新模型)
+    if execCtx.Cluster.Status.NodeComponentStatuses != nil {
+        if compStatuses, ok := execCtx.Cluster.Status.NodeComponentStatuses[componentName]; ok {
+            if status, ok := compStatuses[node.IP]; ok {
+                if status.Phase == "Installed" && status.Version == targetVersion {
+                    return true
+                }
+                if status.Phase == "Installing" {
+                    return true
+                }
+                return false
+            }
+        }
+    }
+
+    // 回退: 从 BKENode.StateCode 读取 (旧模型，向后兼容)
+    bkeNode := &configv1beta1.BKENode{}
+    err := f.client.Get(ctx, types.NamespacedName{
+        Namespace: execCtx.Cluster.Namespace,
+        Name:      node.Name,
+    }, bkeNode)
+    if err != nil {
+        return false
+    }
+
+    switch componentName {
+    case "bkeagent":
+        if execCtx.VersionContext != nil && !execCtx.VersionContext.HasCurrent("bkeagent") {
+            return bkeNode.Status.StateCode&configv1beta1.NodeAgentPushedFlag != 0
+        }
+        return false
+    default:
+        return false
+    }
+}
+```
+
+#### 各组件配置样例
+
+```yaml
+# bkeagent 安装 (首次推送)
+spec:
+  nodeFilter:
+    skipCompleted: true
+    excludeAppointment: true
+
+# bkeagent 升级
+spec:
+  nodeFilter:
+    skipCompleted: false       # 不过滤，所有节点都执行
+
+# containerd — 仅安装到 compute 节点池
+spec:
+  nodeFilter:
+    matchLabels:
+      node-pool: compute
+
+# kubernetes-master
+spec:
+  nodeFilter:
+    roles: ["master"]
+
+# etcd
+spec:
+  nodeFilter:
+    roles: ["etcd"]
+
+# GPU 节点专用组件
+spec:
+  nodeFilter:
+    matchLabels:
+      gpu: "true"
+      accelerator: nvidia
+```
+
+#### 与当前代码的等价性验证
+
+| 组件 | 当前过滤函数 | NodeFilterSpec 配置 | 等价性 |
+|------|------------|-------------------|--------|
+| EnsureBKEAgent | `!NodeAgentPushedFlag` + Appointment 排除 | `skipCompleted: true, excludeAppointment: true` | ✅ |
+| EnsureAgentUpgrade | 无过滤 | `skipCompleted: false` | ✅ |
+| EnsureMasterUpgrade | `.Master()` | `roles: ["master"]` | ✅ |
+| EnsureWorkerUpgrade | `.Worker()` | `roles: ["worker"]` | ✅ |
+| EnsureEtcdUpgrade | `.Etcd()` | `roles: ["etcd"]` | ✅ |
+| GPU 组件 (新增) | 无对应 Phase | `matchLabels: {"gpu": "true"}` | ✅ 新能力 |
+
+### 9.5.5 NodeStatusUpdater 接口
+
+#### 接口定义
+
+```go
+// pkg/dagexec/node_status_updater.go
+
+// NodeStatusUpdater 节点状态更新接口
+//
+// 设计思路 — 为什么不直接在 Executor 中更新:
+// 1. 状态更新涉及 BKECluster.Status 和 BKENode.Status 两个对象
+// 2. 需要处理并发冲突 (retry.RetryOnConflict)
+// 3. 需要处理新旧状态模型的兼容 (NodeComponentStatuses vs StateCode)
+// 4. 测试时可注入 Mock，独立测试 Executor 逻辑
+type NodeStatusUpdater interface {
+    // MarkPending 标记节点开始安装
+    MarkPending(ctx context.Context, cluster *bkev1beta1.BKECluster, nodeIP string, componentName string) error
+
+    // MarkSuccess 标记节点安装成功
+    MarkSuccess(ctx context.Context, cluster *bkev1beta1.BKECluster, nodeIP string, componentName string, version string) error
+
+    // MarkFailed 标记节点安装失败
+    MarkFailed(ctx context.Context, cluster *bkev1beta1.BKECluster, nodeIP string, componentName string, err error) error
+}
+```
+
+#### 默认实现: BKENodeStatusUpdater
+
+```go
+// pkg/dagexec/bke_node_status_updater.go
+
+type BKENodeStatusUpdater struct {
+    client client.Client
+}
+
+func (u *BKENodeStatusUpdater) MarkPending(
+    ctx context.Context,
+    cluster *bkev1beta1.BKECluster,
+    nodeIP string,
+    componentName string,
+) error {
+    return u.updateNodeComponentStatus(ctx, cluster, nodeIP, componentName, NodeComponentStatus{
+        Phase:          "Installing",
+        LastUpdateTime: &metav1.Time{Time: time.Now()},
+    })
+}
+
+func (u *BKENodeStatusUpdater) MarkSuccess(
+    ctx context.Context,
+    cluster *bkev1beta1.BKECluster,
+    nodeIP string,
+    componentName string,
+    version string,
+) error {
+    return u.updateNodeComponentStatus(ctx, cluster, nodeIP, componentName, NodeComponentStatus{
+        Version:        version,
+        Phase:          "Installed",
+        LastUpdateTime: &metav1.Time{Time: time.Now()},
+    })
+}
+
+func (u *BKENodeStatusUpdater) MarkFailed(
+    ctx context.Context,
+    cluster *bkev1beta1.BKECluster,
+    nodeIP string,
+    componentName string,
+    installErr error,
+) error {
+    existingVersion := ""
+    if cluster.Status.NodeComponentStatuses != nil {
+        if compStatuses, ok := cluster.Status.NodeComponentStatuses[componentName]; ok {
+            if status, ok := compStatuses[nodeIP]; ok {
+                existingVersion = status.Version
+            }
+        }
+    }
+
+    return u.updateNodeComponentStatus(ctx, cluster, nodeIP, componentName, NodeComponentStatus{
+        Version:        existingVersion,
+        Phase:          "Failed",
+        Message:        installErr.Error(),
+        LastUpdateTime: &metav1.Time{Time: time.Now()},
+    })
+}
+
+func (u *BKENodeStatusUpdater) updateNodeComponentStatus(
+    ctx context.Context,
+    cluster *bkev1beta1.BKECluster,
+    nodeIP string,
+    componentName string,
+    status NodeComponentStatus,
+) error {
+    return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+        latest := &bkev1beta1.BKECluster{}
+        if err := u.client.Get(ctx, types.NamespacedName{
+            Namespace: cluster.Namespace,
+            Name:      cluster.Name,
+        }, latest); err != nil {
+            return err
+        }
+
+        if latest.Status.NodeComponentStatuses == nil {
+            latest.Status.NodeComponentStatuses = make(map[string]map[string]NodeComponentStatus)
+        }
+        if latest.Status.NodeComponentStatuses[componentName] == nil {
+            latest.Status.NodeComponentStatuses[componentName] = make(map[string]NodeComponentStatus)
+        }
+
+        latest.Status.NodeComponentStatuses[componentName][nodeIP] = status
+
+        return u.client.Status().Update(ctx, latest)
+    })
+}
+```
+
+### 9.5.6 各组件执行流程
+
+#### BinaryComponentExecutor 完整流程
+
+```
+  ┌──────────────────────────────────────┐
+  │  1. 加载 ComponentVersion            │
+  │  cv = cvStore.GetComponentVersion()  │
+  └──────────┬───────────────────────────┘
+             │
+             ▼
+  ┌──────────────────────────────────────┐
+  │  2. 组件级幂等判断                   │
+  │  VersionContext.NeedsUpgrade(name)   │
+  │  → false: 整个组件跳过              │
+  └──────────┬───────────────────────────┘
+             │ true
+             ▼
+  ┌──────────────────────────────────────┐
+  │  3. 获取全部节点                     │
+  │  allNodes = NodeProvider.GetNodes()  │
+  └──────────┬───────────────────────────┘
+             │
+             ▼
+  ┌──────────────────────────────────────┐
+  │  4. 节点级过滤                       │
+  │  targetNodes = NodeFilter.Filter()   │
+  │  ├─ 硬排除: Failed/Deleting/Skipped │
+  │  ├─ 角色过滤: cv.Spec.NodeFilter    │
+  │  ├─ 标签过滤: cv.Spec.NodeFilter    │
+  │  ├─ 预约排除                        │
+  │  └─ 幂等跳过: per-node 已完成       │
+  └──────────┬───────────────────────────┘
+             │
+        ┌────┴────┐
+        │         │
+    有节点     无节点 → 跳过 (全部已完成)
+        │
+        ▼ (对每个目标节点)
+  ┌──────────────────────────────────────┐
+  │  5. 标记安装中                       │
+  │  NodeStatusUpdater.MarkPending()     │
+  └──────────┬───────────────────────────┘
+             │
+             ▼
+  ┌──────────────────────────────────────┐
+  │  6. 执行安装                         │
+  │  BinaryInstaller.Install(opts)       │
+  └──────────┬───────────────────────────┘
+             │
+        ┌────┴────┐
+        │         │
+     成功       失败
+        │         │
+        ▼         ▼
+  ┌──────────┐  ┌────────────────────────┐
+  │MarkSuccess│ │MarkFailed              │
+  │Version=   │ │Message = err.Error()   │
+  │target     │ │                        │
+  │Installed  │ │                        │
+  └────┬─────┘  └──────────┬─────────────┘
+       │                   │
+       │              ┌────┴────┐
+       │           FailFast  Continue
+       │              │         │
+       │              ▼         ▼
+       │         return err  继续下一节点
+       │
+       ▼
+  ┌──────────────────────────────────────┐
+  │  7. 全部节点完成                     │
+  │  更新 ComponentStatuses[name]        │
+  │  = { Version: target, Phase: OK }    │
+  │  return nil                          │
+  └──────────────────────────────────────┘
+```
+
+#### HelmComponentExecutor 完整流程
+
+```
+  ┌──────────────────────────────────────┐
+  │  1. 加载 ComponentVersion            │
+  └──────────┬───────────────────────────┘
+             │
+             ▼
+  ┌──────────────────────────────────────┐
+  │  2. 组件级幂等判断                   │
+  │  VersionContext.NeedsUpgrade(name)   │
+  │  → false: 跳过                      │
+  └──────────┬───────────────────────────┘
+             │ true
+             ▼
+  ┌──────────────────────────────────────┐
+  │  3. 确定操作类型                     │
+  │  Strategy.Mode / VersionContext      │
+  └──────────┬───────────────────────────┘
+             │
+             ▼
+  ┌──────────────────────────────────────┐
+  │  4. 更新组件状态                     │
+  │  ComponentStatuses[name]             │
+  │  = { Phase: "Installing", Type: helm }│
+  └──────────┬───────────────────────────┘
+             │
+             ▼
+  ┌──────────────────────────────────────┐
+  │  5. HelmInstaller.Install()          │
+  └──────────┬───────────────────────────┘
+             │
+        ┌────┴────┐
+        │         │
+     成功       失败
+        │         │
+        ▼         ▼
+  ┌──────────┐  ┌────────────────────────┐
+  │ MarkSucc │  │ FailurePolicy=Rollback │
+  │ Version  │  │ → helm rollback        │
+  │ Installed│  │ MarkFailed             │
+  └──────────┘  └────────────────────────┘
+```
+
+**Helm 不需要 NodeFilter 和 NodeStatusUpdater**：Helm 部署到集群而非单节点，无 per-node 状态。
+
+#### YamlComponentExecutor / InlineComponentExecutor
+
+与 Helm 类似，集群级部署，不需要 NodeFilter/NodeStatusUpdater。Inline 不记录状态（由 Phase 自身 `NeedExecute()` 判断幂等性）。
+
+### 9.5.7 状态转换表
+
+| 当前 Phase | 事件 | 新 Phase | Version | 触发者 |
+|-----------|------|---------|---------|--------|
+| (不存在) | 开始安装 | `Installing` | "" | NodeStatusUpdater.MarkPending |
+| `Installing` | 安装成功 | `Installed` | targetVersion | NodeStatusUpdater.MarkSuccess |
+| `Installing` | 安装失败 | `Failed` | "" (保留原版本) | NodeStatusUpdater.MarkFailed |
+| `Installed` | 目标版本变更 | `Installing` | 保留旧版本 | NodeStatusUpdater.MarkPending |
+| `Failed` | 重试 | `Installing` | 保留旧版本 | NodeStatusUpdater.MarkPending |
+| `Failed` | 组件移除 | (删除条目) | — | Executor |
+| `Installed` | 版本相同 | (跳过) | — | NodeFilter |
+
+### 9.5.8 幂等性设计
+
+#### 各组件类型的幂等机制
+
+| 组件类型 | 幂等粒度 | 判断机制 | 判断位置 |
+|---------|---------|---------|---------|
+| **Binary** | per-node per-component | `NodeComponentStatuses[name][ip].Version == target && Phase == "Installed"` | NodeFilter |
+| **Helm** | 组件级 (集群) | `VersionContext.NeedsUpgrade(name)` | Executor |
+| **YAML** | 组件级 (集群) | `VersionContext.NeedsUpgrade(name)` | Executor |
+| **Inline** | 自定义 | `Phase.NeedExecute()` 自行判断 | InlineRunner |
+
+#### Binary 幂等的三种场景
+
+```
+场景 1: 全新安装
+  NodeComponentStatuses["containerd"] = nil (无记录)
+  → NodeFilter: 不跳过
+  → 执行安装
+  → MarkSuccess: version = "v1.7.18", phase = "Installed"
+
+场景 2: 全部节点已安装 (组件级跳过)
+  VersionContext.NeedsUpgrade("containerd") = false
+  → Executor: 整个组件跳过，不进入 NodeFilter
+
+场景 3: 部分节点已安装 (per-node 跳过)
+  VersionContext.NeedsUpgrade("containerd") = true (集群级需要升级)
+  NodeComponentStatuses["containerd"]["10.0.0.1"] = { Version: "v1.7.18", Phase: "Installed" }
+  NodeComponentStatuses["containerd"]["10.0.0.2"] = { Version: "v1.7.15", Phase: "Installed" }
+  NodeComponentStatuses["containerd"]["10.0.0.3"] = nil (未安装/中断)
+  → NodeFilter: 跳过 10.0.0.1 和 10.0.0.2，仅对 10.0.0.3 执行
+```
+
+#### 失败重试的幂等性
+
+```
+场景: 节点 10.0.0.2 安装失败
+  NodeComponentStatuses["containerd"]["10.0.0.2"] = { Version: "v1.7.15", Phase: "Failed" }
+
+下次 Reconcile:
+  VersionContext.NeedsUpgrade("containerd") = true
+  NodeFilter:
+    10.0.0.1: Phase=Installed, Version=v1.7.18 == target → 跳过
+    10.0.0.2: Phase=Failed → 不跳过 (需要重试)
+    10.0.0.3: 无记录 → 不跳过
+  → 仅对 10.0.0.2 和 10.0.0.3 执行
+```
+
+### 9.5.9 兼容性设计
+
+#### Feature Gate OFF (旧路径)
+
+```
+BKEClusterReconciler → Phase 框架 → EnsureBKEAgent / EnsureContainerdUpgrade / ...
+                                       │
+                                       ├─ 读取: BKENode.Status.StateCode (位标记)
+                                       ├─ 写入: BKENode.Status.StateCode (位标记)
+                                       └─ 写入: BKECluster.Status.*Version (集群级版本)
+
+NodeComponentStatuses: 不写入、不读取
+ComponentStatuses: 不写入、不读取
+```
+
+**完全不变**，现有行为不受影响。
+
+#### Feature Gate ON (新路径)
+
+```
+BKEClusterReconciler → DAG Scheduler → BinaryComponentExecutor / HelmComponentExecutor / ...
+                                          │
+                                          ├─ 读取: NodeComponentStatuses (per-node 幂等)
+                                          ├─ 读取: BKENode.Status.StateCode (硬排除)
+                                          ├─ 写入: NodeComponentStatuses (per-node 状态)
+                                          └─ 写入: ComponentStatuses (组件级状态)
+```
+
+#### 迁移策略：Feature Gate 首次开启
+
+**问题**：Feature Gate 首次开启时，`NodeComponentStatuses` 为空，但节点上已安装了组件（通过旧路径的 StateCode 位标记记录）。如果不处理，NodeFilter 会对所有节点重新安装。
+
+**方案**：NodeFilter 的双源读取（已在 9.5.4 节实现）
+
+```
+NodeFilter.isAlreadyAtTarget():
+  1. 优先读 NodeComponentStatuses (新模型)
+     → 有记录: 按新模型判断
+     → 无记录: 进入步骤 2
+
+  2. 回退读 BKENode.Status.StateCode (旧模型)
+     → bkeagent: NodeAgentPushedFlag → 视为已安装
+     → 其他组件: 不过滤 (由组件级 VersionContext 处理)
+
+  3. 懒初始化: 首次读取旧模型时，写入 NodeComponentStatuses
+     → 后续读取走步骤 1，不再回退
+```
+
+#### 回滚策略：Feature Gate 从 ON 切回 OFF
+
+```
+Feature Gate ON → OFF:
+  NodeComponentStatuses 保留在 BKECluster.Status 中 (不删除)
+  旧路径不读取 NodeComponentStatuses (不受影响)
+  旧路径继续读写 BKENode.Status.StateCode (行为不变)
+
+Feature Gate OFF → ON (再次开启):
+  NodeComponentStatuses 可能不是最新的 (OFF 期间旧路径更新了 StateCode 但未更新 NodeComponentStatuses)
+  → NodeFilter 检测到 NodeComponentStatuses 与 StateCode 不一致时，以 StateCode 为准并重新初始化
+```
+
+#### 兼容性保证矩阵
+
+| 场景 | Feature Gate | 状态来源 | 行为 |
+|------|-------------|---------|------|
+| 全新集群安装 | OFF | StateCode | 旧路径，不变 |
+| 全新集群安装 | ON | NodeComponentStatuses | 新路径 |
+| 已有集群 + FG OFF→ON | ON (首次) | StateCode → NodeComponentStatuses (懒初始化) | 不重复安装 |
+| 已有集群 + FG ON→OFF→ON | ON (再次) | StateCode (OFF 期间更新) → NodeComponentStatuses (重新初始化) | 不重复安装 |
+| 混合模式 (containerd ON, bkeagent OFF) | 部分 ON | 各组件独立判断 | containerd 走新路径，bkeagent 走旧路径 |
+
+### 9.5.10 文档更新计划
+
+| 章节 | 更新内容 |
+|------|---------|
+| **3.1 ComponentVersion 类型定义** | `ComponentVersionSpec` 新增 `NodeFilter *NodeFilterSpec` 字段（顶层）；新增 `NodeFilterSpec` 类型定义 |
+| **3.6 CRD YAML 定义** | v1alpha2 schema 增加顶层 `nodeFilter` 定义 |
+| **9.4.1 ExecutionContext** | 新增 `NodeFilter NodeFilter` 和 `StatusUpdater NodeStatusUpdater` 字段 |
+| **9.4.2 NodeProvider** | `Node` 增加 `Labels` 字段；补充说明: 职责是"获取节点"，过滤由 NodeFilter 负责 |
+| **9.4.3.1 BinaryComponentExecutor** | 重构 `ExecuteComponent` 代码，集成 NodeFilter + NodeStatusUpdater |
+| **9.1.4 Scheduler 初始化** | Config 增加 NodeFilter 和 NodeStatusUpdater 注入 |
+| **12.3.2 containerd YAML** | 增加 `nodeFilter` 配置 |
+| **12.4.2 bkeagent YAML** | 增加 `nodeFilter` 配置（安装 vs 升级不同） |
+| **目录** | 增加 9.5 条目 |
+
+### 9.5.11 设计决策总结
+
+| 决策 | 选择 | 理由 |
+|------|------|------|
+| per-node 状态存储位置 | `BKECluster.Status.NodeComponentStatuses` | 1 次 Patch 更新，避免 N 次 BKENode 更新的并发冲突 |
+| NodeFilter 归属 | 独立接口，由 Executor 持有 | 过滤逻辑因组件而异，不应内置到 Installer 或 NodeProvider |
+| NodeStatusUpdater 归属 | 独立接口，由 Executor 持有 | 状态更新是编排层职责，不应下沉到安装层 |
+| NodeFilterSpec 位置 | `ComponentVersionSpec` 顶层 | 安装和升级都需要节点过滤，不应放在 UpgradeStrategySpec 内 |
+| 新旧状态模型兼容 | NodeFilter 双源读取 + 懒初始化 | 避免 Feature Gate 首次开启时的重复安装 |
+| Helm/YAML 节点过滤 | 不通过 NodeFilter，通过 values/nodeSelector | 集群级部署，节点调度由 K8s Scheduler 处理 |
+| Inline 状态记录 | 不记录 | 由 Phase 自身 `NeedExecute()` 判断幂等性 |
+
+# design 1
 ## 完整设计：分层状态模型、幂等性与兼容性
 
 ### 1. 问题分析
