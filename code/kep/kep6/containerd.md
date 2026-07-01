@@ -130,4 +130,247 @@ Phase 2: Redeploy (scope=runtime)
 
 另外，设计文档中 `installPath: "/usr/local"` 但实际安装到 `/usr/bin/`，路径不一致。
 
-需要我根据这些发现更新设计文档吗？
+# func (cp *ContainerdPlugin) createHostsTOML(runtimeParam map[string]string)功能
+
+## `createHostsTOML` 函数功能分析
+
+### 核心功能
+为 containerd 创建 `hosts.toml` 配置文件，用于配置镜像仓库的访问规则和重定向策略。
+
+### 主要逻辑
+
+#### 1. 参数解析
+```go
+repo := runtimeParam["repo"]              // 主仓库地址（私有仓库）
+offline := runtimeParam["repoInsecure"]   // 是否离线模式
+registries := []string{repo}              // 需要配置的仓库列表
+```
+
+#### 2. 离线模式处理
+```go
+if offline == "true" {
+    // 获取公共仓库列表（如 docker.io, gcr.io 等）
+    publicRegistries := strings.Split(runtimeParam["insecureRegistries"], ",")
+    registries = append(registries, publicRegistries...)
+}
+```
+
+#### 3. 为每个仓库创建配置
+```go
+for _, registry := range registries {
+    // 创建目录：/etc/containerd/certs.d/{registry}/
+    registryDir := filepath.Join(containerdCertsDir, registry)
+    os.MkdirAll(registryDir, utils.RwxRxRx)
+    
+    // 创建 hosts.toml 文件
+    hostsPath := filepath.Join(registryDir, "hosts.toml")
+    // 写入配置内容
+}
+```
+
+#### 4. 生成的 hosts.toml 内容
+```toml
+server = "https://{{.Registry}}"
+[host."https://{{.Repo}}"]
+  capabilities = ["pull", "resolve", "push"]
+  skip_verify = true
+```
+
+### 实际效果
+
+#### 在线模式
+```
+registry = "cr.openfuyao.cn"
+offline = "false"
+
+生成文件：/etc/containerd/certs.d/cr.openfuyao.cn/hosts.toml
+内容：
+  server = "https://cr.openfuyao.cn"
+  [host."https://cr.openfuyao.cn"]
+    capabilities = ["pull", "resolve", "push"]
+    skip_verify = true
+```
+
+#### 离线模式
+```
+registry = "cr.openfuyao.cn"
+offline = "true"
+insecureRegistries = "docker.io,gcr.io,quay.io"
+
+生成文件：
+  /etc/containerd/certs.d/cr.openfuyao.cn/hosts.toml
+  /etc/containerd/certs.d/docker.io/hosts.toml
+  /etc/containerd/certs.d/gcr.io/hosts.toml
+  /etc/containerd/certs.d/quay.io/hosts.toml
+
+docker.io/hosts.toml 内容：
+  server = "https://docker.io"
+  [host."https://cr.openfuyao.cn"]    ← 重定向到私有仓库
+    capabilities = ["pull", "resolve", "push"]
+    skip_verify = true
+```
+
+### 应用场景
+
+#### 场景 1：离线环境部署
+在无法访问公网的环境中，将所有公共镜像仓库的请求重定向到私有仓库：
+- 拉取 `docker.io/library/nginx:latest` → 实际从 `cr.openfuyao.cn/library/nginx:latest` 获取
+- 需要提前将镜像同步到私有仓库
+
+#### 场景 2：镜像加速
+通过私有仓库缓存公共镜像，减少外网访问：
+- 首次拉取从公网获取并缓存
+- 后续拉取直接从私有仓库获取
+
+#### 场景 3：安全合规
+强制所有镜像拉取都经过私有仓库，便于：
+- 镜像扫描和审计
+- 访问控制和权限管理
+- 镜像签名验证
+
+### 与 KEP-6 的关系
+
+在 KEP-6 的新设计中，这个功能应该通过 `configTemplates` 实现：
+```yaml
+configTemplates:
+  - name: docker.io-hosts.toml
+    path: "/etc/containerd/certs.d/docker.io/hosts.toml"
+    mode: "0644"
+    content: |
+      server = "https://docker.io"
+      [host."https://{{imageRegistry}}"]
+        capabilities = ["pull", "resolve", "push"]
+        skip_verify = true
+```
+这样可以：
+1. 将配置声明式化
+2. 支持模板变量（如 `{{imageRegistry}}`）
+3. 与 BinaryInstaller 的 ConfigRenderer 集成
+4. 避免硬编码逻辑
+
+# func (cp *ContainerdPlugin) Execute(commands []string)的commands 是从哪里传进来的
+
+## `ContainerdPlugin.Execute(commands []string)` 的调用链
+
+### 完整调用链
+
+```
+Command CRD (Kubernetes API)
+  └── Spec.Commands[].Command: []string
+      ↓
+CommandReconciler.startTask (controllers/bkeagent/command_controller.go:555)
+  └── for _, execCommand := range command.Spec.Commands
+      ↓
+CommandReconciler.processExecCommand (line 502)
+  └── r.executeWithRetry(execCommand, ...)
+      ↓
+CommandReconciler.executeWithRetry (line 465)
+  └── r.executeByType(execCommand.Type, execCommand.Command)
+      ↓
+CommandReconciler.executeByType (line 445)
+  └── case agentv1beta1.CommandBuiltIn:
+        return r.Job.BuiltIn.Execute(command)
+      ↓
+BuiltIn.Execute (pkg/job/builtin/builtin.go:99)
+  └── pluginRegistry[strings.ToLower(execCommands[0])].Execute(execCommands)
+      ↓
+ContainerdPlugin.Execute (pkg/job/builtin/containerruntime/containerd/containerd.go:295)
+```
+
+### 数据来源
+
+**commands 参数来自 Command CRD 的 `spec.commands[].command` 字段**
+
+#### Command CRD 结构
+
+```yaml
+apiVersion: bkeagent.bocloud.com/v1beta1
+kind: Command
+metadata:
+  name: install-containerd-node1
+  namespace: default
+spec:
+  nodeName: node1                    # 目标节点
+  commands:
+    - id: cmd1
+      type: BuiltIn                  # 命令类型
+      command:                       # ← 这就是传递给 Plugin.Execute 的 commands
+        - "InstallContainerd"
+        - "url=http://deploy.bocloud.k8s:40080/containerd-1.6.16-linux-amd64.tar.gz"
+        - "sandbox=deploy.bocloud.k8s:40443/kubernetes/pause:3.5.1"
+        - "repo=cr.openfuyao.cn"
+    - id: cmd2
+      type: BuiltIn
+      command:
+        - "K8sEnvInit"
+        - "init=true"
+        - "check=true"
+```
+
+### 命令解析流程
+
+在 `ContainerdPlugin.Execute` 中（第 298 行）：
+```go
+runtimeParam, err := plugin.ParseCommands(cp, commands)
+```
+
+`ParseCommands` 会将 `commands` 数组解析为 `map[string]string`：
+```go
+// 输入
+commands = [
+    "InstallContainerd",
+    "url=http://deploy.bocloud.k8s:40080/containerd-1.6.16-linux-amd64.tar.gz",
+    "sandbox=deploy.bocloud.k8s:40443/kubernetes/pause:3.5.1",
+    "repo=cr.openfuyao.cn"
+]
+
+// 输出
+runtimeParam = {
+    "url": "http://deploy.bocloud.k8s:40080/containerd-1.6.16-linux-amd64.tar.gz",
+    "sandbox": "deploy.bocloud.k8s:40443/kubernetes/pause:3.5.1",
+    "repo": "cr.openfuyao.cn"
+}
+```
+
+### 谁创建 Command CRD？
+
+Command CRD 由 **控制器（cluster-api-provider-bke）** 创建，用于向 bkeagent 下发命令。
+
+**示例**：在 `ensure_nodes_env.go` 中创建 containerd 安装命令
+```go
+// pkg/command/env.go
+func (e *ENV) buildContainerdCommand() []string {
+    return []string{
+        "InstallContainerd",
+        fmt.Sprintf("url=%s", e.containerdURL),
+        fmt.Sprintf("sandbox=%s", e.sandboxImage),
+        fmt.Sprintf("repo=%s", e.imageRegistry),
+    }
+}
+
+// 创建 Command CRD
+command := &agentv1beta1.Command{
+    Spec: agentv1beta1.CommandSpec{
+        NodeName: node.Hostname,
+        Commands: []agentv1beta1.ExecCommand{
+            {
+                ID:      "install-containerd",
+                Type:    agentv1beta1.CommandBuiltIn,
+                Command: e.buildContainerdCommand(),
+            },
+        },
+    },
+}
+```
+
+### 总结
+
+| 层级 | 组件 | 职责 |
+|------|------|------|
+| **数据源** | Command CRD | 定义要执行的命令列表 |
+| **创建者** | 控制器 (cluster-api-provider-bke) | 创建 Command CRD 下发给 bkeagent |
+| **执行者** | bkeagent (CommandReconciler) | Watch Command CRD 并执行 |
+| **路由器** | BuiltIn.Execute | 根据命令类型路由到对应 Plugin |
+| **执行器** | ContainerdPlugin.Execute | 执行具体的 containerd 安装逻辑 |
+
+# 
