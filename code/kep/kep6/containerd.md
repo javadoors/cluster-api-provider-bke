@@ -373,4 +373,16 @@ command := &agentv1beta1.Command{
 | **路由器** | BuiltIn.Execute | 根据命令类型路由到对应 Plugin |
 | **执行器** | ContainerdPlugin.Execute | 执行具体的 containerd 安装逻辑 |
 
+# 根据运行时参数生成 containerd 的配置
+
+该函数的作用是**根据运行时参数生成 containerd 的配置**，具体分四步：
+
+1. **解析配置** — 从 `runtimeParam["containerdConfig"]` 中获取 `ContainerdConfig` 对象（`containerd.go:250`）
+2. **执行脚本** — 如果配置中包含 `Script`，则执行 shell 脚本（`containerd.go:254-259`）
+3. **生成 service override** — 如果配置中包含 `Service`，则生成 containerd.service 的覆盖配置（`containerd.go:260-265`）
+4. **渲染 config.toml** — 如果配置中包含 `Main`，则渲染 containerd 主配置文件 `config.toml`（`containerd.go:266-271`）
+5. **生成 hosts.toml** — 如果配置中包含 `Registry`，则生成镜像仓库的 `hosts.toml` 配置（`containerd.go:272-277`）
+
+该函数由 `configureContainerd`（`containerd.go:340`）在 `containerdConfig` 参数非空时调用，是新版配置逻辑（替代 legacy 方式）。
+
 # 
