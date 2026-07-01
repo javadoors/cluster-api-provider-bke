@@ -19,7 +19,8 @@
    - 3.6 CRD YAML 定义
    - 3.7 CRD 版本迁移设计
 4. [BinaryInstaller 详细设计](#4-binaryinstaller-详细设计)
-   - 4.5 ConfigRenderer 详细设计 (含三种渲染模式)
+    - 4.5 ConfigRenderer 详细设计 (含三种渲染模式)
+    - 4.6 BKEAgentSwitch 独立组件设计
 5. [HelmInstaller 详细设计](#5-helminstaller-详细设计)
    - 5.4 健康检查
 6. [YamlInstaller 详细设计](#6-yamlinstaller-详细设计)
@@ -2491,6 +2492,414 @@ func (r *ConfigRenderer) renderConfigTemplates(ctx context.Context, templates []
 1. 与 DAG 调度器传递的 TemplateContext 保持一致
 2. 避免重复构建模板数据
 3. BinaryInstaller 和 HelmInstaller 共享相同的模板上下文
+
+### 4.6 BKEAgentSwitch 独立组件设计
+
+**设计思路 — 为什么需要独立组件**：
+
+bkeagent 的监听切换发生在集群安装完成后（cluster-api 部署后），而 bkeagent 的安装发生在集群安装前。两者在时间线上分离，不应耦合在同一个组件中：
+
+```
+时间线：
+┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+│ bkeagent    │ →  │ 集群安装    │ →  │ cluster-api │ →  │ bkeagent    │
+│ 安装        │    │ (master/    │    │ 部署        │    │ switch      │
+│ (管理集群)  │    │  worker)    │    │             │    │ (目标集群)  │
+└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
+     ↑                                                        ↑
+  监听管理集群                                            切换到目标集群
+```
+
+#### 4.6.1 功能说明
+
+bkeagent-switch 组件负责切换 bkeagent 的监听目标集群：
+
+| 组件 | 作用 |
+|------|------|
+| **注解** | `bke.bocloud.com/bkeagent-listener` 标记目标（`current` / `bkecluster`） |
+| **Condition** | `SwitchBKEAgentCondition` 标记切换完成 |
+| **切换内容** | 更新 `/etc/openFuyao/bkeagent/config`（kubeconfig）、`/etc/openFuyao/bkeagent/node`（hostname）、`/etc/openFuyao/bkeagent/cluster`（clusterName） |
+
+**触发场景**：
+
+```
+EnsureAddonDeploy 部署 cluster-api addon
+    ↓
+markBKEAgentSwitchPending() 设置注解 "bkecluster"
+    ↓
+DAG 调度 bkeagent-switch 组件
+    ↓
+BinaryInstaller.Install()
+    ↓
+SSH 上传配置文件 + 重启 bkeagent
+    ↓
+标记 SwitchBKEAgentCondition = True
+```
+
+#### 4.6.2 ComponentVersion YAML 定义
+
+```yaml
+# bke-manifests/bkeagent-switch/v2.6.0/component.yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: bkeagent-switch-v2.6.0
+spec:
+  name: bkeagent-switch
+  type: binary
+  version: v2.6.0
+  
+  binary:
+    # 无需下载制品（bkeagent 已安装）
+    artifacts: []
+    
+    # 配置文件模板
+    configTemplates:
+      # 目标集群 kubeconfig（从 Secret 获取）
+      - name: kubeconfig
+        path: "/etc/openFuyao/bkeagent/config"
+        mode: "0600"
+        owner: "root:root"
+        secretRef:
+          name: "{{clusterName}}-kubeconfig"
+          namespace: "{{clusterNamespace}}"
+          key: value
+      
+      # 节点标识
+      - name: node
+        path: "/etc/openFuyao/bkeagent/node"
+        mode: "0644"
+        owner: "root:root"
+        content: "{{nodeHostname}}"
+      
+      # 集群标识
+      - name: cluster
+        path: "/etc/openFuyao/bkeagent/cluster"
+        mode: "0644"
+        owner: "root:root"
+        content: "{{clusterName}}"
+    
+    # 安装脚本（仅重启 bkeagent）
+    installScript: |
+      #!/bin/bash
+      set -e
+      
+      # 配置文件由 ConfigRenderer 自动上传到对应路径
+      # 只需重启 bkeagent 使配置生效
+      systemctl restart bkeagent
+      
+      # 等待 bkeagent 启动
+      sleep 2
+      
+      # 验证 bkeagent 运行状态
+      systemctl is-active bkeagent
+      
+      echo "bkeagent switched to cluster {{clusterName}}"
+    
+    # 无需卸载脚本（切换是单向操作）
+    uninstallScript: ""
+    
+    supportedArchitectures: ["amd64", "arm64"]
+    supportedOS:
+      - name: centos
+        versions: ["7", "8"]
+      - name: ubuntu
+        versions: ["20.04", "22.04"]
+    
+    # 健康检查
+    healthCheck:
+      enabled: true
+      timeout: "1m"
+      interval: "3s"
+      script: |
+        #!/bin/bash
+        systemctl is-active bkeagent
+  
+  # 依赖关系：在 cluster-api 部署后执行
+  dependencies:
+    - name: cluster-api
+      phase: Install
+  
+  # 升级策略
+  upgradeStrategy:
+    mode: Parallel  # 所有节点同时切换
+    batchSize: 0
+    timeout: "5m"
+    failurePolicy: Continue  # 失败时继续，不阻塞后续流程
+  
+  # 节点过滤：所有节点都需要切换
+  nodeFilter:
+    roles: []  # 所有角色
+    skipCompleted: true  # 已切换的节点跳过
+```
+
+#### 4.6.3 DAG 依赖关系
+
+```yaml
+# releaseimage-v2.6.0.yaml
+spec:
+  install:
+    components:
+      # Batch 1: bkeagent 安装（监听管理集群）
+      - name: bkeagent
+        version: v2.6.0
+      
+      # Batch 2: 集群安装
+      - name: kubernetes-master
+        version: v1.29.0
+        inline:
+          handler: EnsureMasterInit
+      - name: kubernetes-worker
+        version: v1.29.0
+        inline:
+          handler: EnsureWorkerJoin
+      
+      # Batch 3: cluster-api 部署（创建目标集群 kubeconfig Secret）
+      - name: cluster-api
+        version: v1.5.0
+        type: helm
+      
+      # Batch 4: bkeagent 切换（监听目标集群）
+      - name: bkeagent-switch
+        version: v2.6.0
+        dependencies:
+          - name: cluster-api
+```
+
+#### 4.6.4 执行流程
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    bkeagent-switch 执行流程                                  │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────┐
+  │  1. 前置检查                         │
+  │  ├─ 检查注解 bkeagent-listener       │
+  │  │   → "current" 或缺失: 跳过       │
+  │  │   → "bkecluster": 继续           │
+  │  └─ 检查 Condition SwitchBKEAgent    │
+  │      → True: 跳过                   │
+  │      → False/缺失: 继续             │
+  └──────────┬───────────────────────────┘
+             │
+             ▼
+  ┌──────────────────────────────────────┐
+  │  2. 获取节点列表                     │
+  │  NodeProvider.GetNodes()             │
+  └──────────┬───────────────────────────┘
+             │
+             ▼
+  ┌──────────────────────────────────────┐
+  │  3. 节点过滤                         │
+  │  ├─ 排除 Failed/Deleting/Skipped    │
+  │  └─ 跳过已切换节点                   │
+  │     (NodeComponentStatuses 检查)     │
+  └──────────┬───────────────────────────┘
+             │
+             ▼ (对每个目标节点)
+  ┌──────────────────────────────────────┐
+  │  4. 渲染配置文件                     │
+  │  ConfigRenderer.RenderConfig()       │
+  │  ├─ kubeconfig: 从 Secret 读取      │
+  │  ├─ node: {{nodeHostname}}           │
+  │  └─ cluster: {{clusterName}}         │
+  └──────────┬───────────────────────────┘
+             │
+             ▼
+  ┌──────────────────────────────────────┐
+  │  5. SSH 上传配置文件                 │
+  │  ├─ /etc/openFuyao/bkeagent/config  │
+  │  ├─ /etc/openFuyao/bkeagent/node    │
+  │  └─ /etc/openFuyao/bkeagent/cluster │
+  └──────────┬───────────────────────────┘
+             │
+             ▼
+  ┌──────────────────────────────────────┐
+  │  6. 执行 installScript               │
+  │  ├─ systemctl restart bkeagent       │
+  │  ├─ sleep 2                          │
+  │  └─ systemctl is-active bkeagent    │
+  └──────────┬───────────────────────────┘
+             │
+             ▼
+  ┌──────────────────────────────────────┐
+  │  7. 健康检查                         │
+  │  HealthChecker.Check()               │
+  │  └─ systemctl is-active bkeagent    │
+  └──────────┬───────────────────────────┘
+             │
+        ┌────┴────┐
+        │         │
+     成功       失败
+        │         │
+        ▼         ▼
+  ┌──────────┐  ┌────────────────────────┐
+  │ 更新状态 │  │ 记录错误               │
+  │ ├─ Phase │  │ ├─ Phase: Failed       │
+  │ │Installed│ │ ├─ Message: err.Error()│
+  │ ├─ Node  │  │ └─ Continue: 继续     │
+  │ │Component│  └────────────────────────┘
+  │ │Statuses │
+  │ └─ Listener│
+  │ │Target:  │
+  │ │bkecluster│
+  └──────────┘
+             │
+             ▼
+  ┌──────────────────────────────────────┐
+  │  8. 标记完成                         │
+  │  ConditionMark(SwitchBKEAgent, True) │
+  └──────────────────────────────────────┘
+```
+
+#### 4.6.5 关键设计点
+
+**nodeHostname 获取**：
+
+当前通过 ping 命令获取 hostname，新方案从 BKENode CRD 读取：
+
+```go
+// pkg/dagexec/bke_node_provider.go
+
+func (p *BKENodeProvider) GetNodes(ctx context.Context, cluster *bkev1beta1.BKECluster) ([]Node, error) {
+    var nodes []Node
+    
+    // 获取 BKENode 列表
+    bkeNodeList := &configv1beta1.BKENodeList{}
+    if err := p.client.List(ctx, bkeNodeList, client.MatchingLabels{
+        "cluster.x-k8s.io/cluster-name": cluster.Name,
+    }); err != nil {
+        return nil, err
+    }
+    
+    for _, bkeNode := range bkeNodeList.Items {
+        node := Node{
+            Name:     bkeNode.Name,
+            IP:       bkeNode.Spec.IP,
+            Hostname: bkeNode.Spec.Hostname,  // 从 BKENode 读取
+            Role:     getPrimaryRole(bkeNode.Spec.Role),
+            Labels:   bkeNode.Labels,
+        }
+        nodes = append(nodes, node)
+    }
+    
+    return nodes, nil
+}
+```
+
+**幂等性检查**：
+
+在 `NodeFilter.isAlreadyAtTarget()` 中增加切换状态检查：
+
+```go
+func (f *BKENodeFilter) isAlreadyAtTarget(
+    ctx context.Context,
+    node Node,
+    cv *configv1alpha1.ComponentVersion,
+    execCtx *ExecutionContext,
+) bool {
+    // 现有逻辑...
+    
+    // bkeagent-switch 组件的幂等检查
+    if cv.Spec.Name == "bkeagent-switch" {
+        // 检查 Condition
+        if condition.HasConditionStatus(bkev1beta1.SwitchBKEAgentCondition, execCtx.Cluster, confv1beta1.ConditionTrue) {
+            return true
+        }
+        
+        // 检查 NodeComponentStatuses
+        if execCtx.Cluster.Status.NodeComponentStatuses != nil {
+            if compStatuses, ok := execCtx.Cluster.Status.NodeComponentStatuses["bkeagent-switch"]; ok {
+                if status, ok := compStatuses[node.IP]; ok {
+                    if status.Phase == "Installed" {
+                        return true
+                    }
+                }
+            }
+        }
+    }
+    
+    return false
+}
+```
+
+**前置条件检查**：
+
+在 `BinaryComponentExecutor.ExecuteComponent()` 中增加前置检查：
+
+```go
+func (e *BinaryComponentExecutor) ExecuteComponent(ctx context.Context, node *ComponentNode, execCtx *ExecutionContext) error {
+    cv, err := e.cvStore.GetComponentVersion(ctx, node.Component.Name, node.Component.Version)
+    if err != nil {
+        return err
+    }
+    
+    // bkeagent-switch 前置检查
+    if cv.Spec.Name == "bkeagent-switch" {
+        // 检查注解
+        listener, ok := annotation.HasAnnotation(execCtx.Cluster, common.BKEAgentListenerAnnotationKey)
+        if !ok || listener == common.BKEAgentListenerCurrent {
+            execCtx.Log.Info("bkeagent-switch: skip, already listening current cluster")
+            return nil
+        }
+        
+        // 检查 Condition
+        if condition.HasConditionStatus(bkev1beta1.SwitchBKEAgentCondition, execCtx.Cluster, confv1beta1.ConditionTrue) {
+            execCtx.Log.Info("bkeagent-switch: skip, already switched")
+            return nil
+        }
+    }
+    
+    // ... 现有逻辑 ...
+}
+```
+
+#### 4.6.6 兼容性设计
+
+**Feature Gate OFF（旧路径）**：
+
+```
+EnsureAgentSwitch Phase
+    ↓
+创建 SwitchCluster Command
+    ↓
+bkeagent 通过 Command 机制切换
+```
+
+**Feature Gate ON（新路径）**：
+
+```
+DAG 调度 bkeagent-switch Binary 组件
+    ↓
+前置检查（注解 + Condition）
+    ↓
+BinaryInstaller.Install()
+    ↓
+SSH 上传配置文件 + 重启 bkeagent
+    ↓
+标记 Condition + NodeComponentStatuses
+```
+
+**混合模式**：
+
+| 组件 | Feature Gate | 执行路径 |
+|------|-------------|---------|
+| bkeagent | OFF | EnsureBKEAgent Phase |
+| bkeagent | ON | Binary 组件 |
+| bkeagent-switch | OFF | EnsureAgentSwitch Phase |
+| bkeagent-switch | ON | Binary 组件 |
+
+#### 4.6.7 设计决策总结
+
+| 决策 | 选择 | 理由 |
+|------|------|------|
+| 组件类型 | Binary | 需要在节点上执行 SSH 命令 |
+| 执行时机 | DAG 最后阶段 | 依赖 cluster-api 部署完成 |
+| 制品下载 | 无 | bkeagent 已安装，只需切换配置 |
+| 切换机制 | SSH 脚本 | 架构统一，不依赖 Command 机制 |
+| 幂等检查 | Condition + NodeComponentStatuses | 双重检查，确保可靠性 |
+| 错误处理 | FailurePolicy = Continue | 切换失败不阻塞后续流程 |
 
 ---
 
