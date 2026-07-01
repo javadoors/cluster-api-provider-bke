@@ -1885,11 +1885,208 @@ func upgradeHostFileFunc(stagingDir string) func(host *bkessh.Host) bkessh.Comma
 | `utils/bkeagent/pkiutil/bkecertlist.go:224` | 证书生成时的节点名称 |
 
 ### 总结
-
 `/etc/openFuyao/bkeagent/node` 是 bkeagent 的**核心身份文件**，它：
 - 存储节点的持久化标识（hostname）
 - 用于 Command 资源的精确匹配
 - 确保 kubelet 和 Kubernetes 使用一致的节点名称
 - 解决云环境中 hostname 不一致的问题
 - 提供节点身份的持久化保证（即使系统 hostname 变化）
-- 
+
+# `host *bkessh.Host` 数据来源
+
+## `host *bkessh.Host` 数据来源完整分析
+
+### 1. 数据结构定义
+
+**文件**: `pkg/remote/host.go:20-28`
+```go
+type Host struct {
+    User               string
+    Password           string
+    Address            string
+    Port               string
+    SSHKey             interface{}
+    Extra              map[string]string  // 包含 hostname 和 arch
+    ExtraCustomCmdFunc func(host *Host) Command
+}
+```
+
+### 2. 完整数据流
+
+#### 阶段 1: BKENode CRD (Kubernetes API)
+
+```
+BKENode CRD
+├── Spec.IP: "10.0.0.1"
+├── Spec.Hostname: "node-01"  ← 初始可能为空
+├── Spec.Username: "root"
+├── Spec.Password: "encrypted_password"
+└── Spec.Port: "22"
+```
+
+#### 阶段 2: Ping 命令获取 Hostname
+
+**文件**: `pkg/job/builtin/ping/main.go:36-37`
+```go
+func (Ping) Execute(commands []string) ([]string, error) {
+    return []string{"pong", utils.HostName()}, nil
+}
+```
+- bkeagent 启动后执行 ping 命令
+- `utils.HostName()` 从 `/etc/openFuyao/bkeagent/node` 读取 hostname
+- 返回 `["pong", "node-01"]`
+
+#### 阶段 3: 更新 BKENode CRD
+
+**文件**: `pkg/phaseframe/phaseutil/agent.go:269-270`
+```go
+func updateNodeHostname(bkenodes []confv1beta1.BKENode, nodeIndex int, hostname string) {
+    bkenodes[nodeIndex].Spec.Hostname = hostname
+}
+```
+- `processCommandOutput` 处理 ping 命令输出
+- 如果 `Spec.Hostname` 为空，则从 ping 输出中提取 hostname
+- 更新 BKENode CRD
+
+#### 阶段 4: 转换为 Nodes
+
+**文件**: `common/cluster/node/node.go:56-65`
+```go
+func ConvertBKENodeListToNodes(bkeNodeList *v1beta1.BKENodeList) Nodes {
+    nodes := make(Nodes, 0, len(bkeNodeList.Items))
+    for _, bkeNode := range bkeNodeList.Items {
+        nodes = append(nodes, bkeNode.ToNode())  // 保留 Hostname 字段
+    }
+    return nodes
+}
+```
+
+#### 阶段 5: 转换为 bkessh.Host
+
+**文件**: `pkg/phaseframe/phaseutil/ssh.go:27-44`
+```go
+func NodeToRemoteHost(nodes bkenode.Nodes) []bkessh.Host {
+    var hosts []bkessh.Host
+    for _, node := range nodes.Decrypt() {
+        host := bkessh.Host{
+            User:     node.Username,
+            Address:  node.IP,
+            Port:     node.Port,
+            Password: node.Password,
+            SSHKey:   nil,
+            Extra: map[string]string{
+                "hostname": node.Hostname,  // ← 来自 BKENode.Spec.Hostname
+                "arch":     "unknown",       // ← 初始值
+            },
+        }
+        hosts = append(hosts, host)
+    }
+    return hosts
+}
+```
+
+#### 阶段 6: 获取架构信息
+
+**文件**: `pkg/remote/multicli.go:187-229`
+```go
+func (c *MultiCli) RegisterHostsInfo() map[string]error {
+    checkCommand := Command{
+        Cmds: Commands{
+            CheckArchCommand,  // "echo $(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
+        },
+    }
+    
+    stdErrs, stdOuts := c.Run(checkCommand)
+    
+    for _, remotecli := range c.remotes {
+        host := remotecli.host
+        if v, ok := stdout[host.Address]; ok {
+            if v[0].Command == CheckArchCommand && len(v) > 0 {
+                host.Extra["arch"] = v[0].Out  // ← 更新为实际架构
+            }
+        }
+    }
+}
+```
+- 通过 SSH 执行 `uname -m` 命令
+- 更新 `host.Extra["arch"]` 为 "amd64" 或 "arm64"
+
+### 3. 使用场景
+
+#### 3.1 写入 `/etc/openFuyao/bkeagent/node`
+
+**文件**: `pkg/phaseframe/phaseutil/ssh.go:68-80`
+```go
+func HostCustomCmdFunc(host *bkessh.Host) bkessh.Command {
+    c := []string{
+        fmt.Sprintf("echo %s > /etc/openFuyao/bkeagent/node", host.Extra["hostname"]),
+    }
+    expectAgent := fmt.Sprintf("/bkeagent_linux_%s", host.Extra["arch"])
+    f := []bkessh.File{
+        {Src: expectAgent, Dst: "/usr/local/bin/"},
+    }
+    return bkessh.Command{
+        Cmds:   c,
+        FileUp: f,
+    }
+}
+```
+
+#### 3.2 调用位置
+
+**文件**: `pkg/phaseframe/phases/ensure_bke_agent.go:523`
+```go
+multiCli.RegisterHostsCustomCmdFunc(phaseutil.HostCustomCmdFunc)
+```
+
+### 4. 数据流总结图
+
+```
+BKENode CRD (K8s API)
+    ↓ (1) GetBKENodesFromClient
+BKENodeList
+    ↓ (2) ConvertBKENodeListToNodes
+Nodes []Node
+    ↓ (3) NodeToRemoteHost
+[]bkessh.Host
+    ├─ Extra["hostname"] = node.Hostname
+    └─ Extra["arch"] = "unknown"
+    ↓ (4) RegisterHostsInfo
+[]bkessh.Host
+    ├─ Extra["hostname"] = "node-01"
+    └─ Extra["arch"] = "amd64"  ← SSH 执行 uname -m
+    ↓ (5) HostCustomCmdFunc
+SSH Command
+    ├─ echo "node-01" > /etc/openFuyao/bkeagent/node
+    └─ upload /bkeagent_linux_amd64 → /usr/local/bin/
+```
+
+### 5. Hostname 来源的两种情况
+
+#### 情况 1: 首次安装（Hostname 为空）
+
+1. BKENode CRD 创建时 `Spec.Hostname` 为空
+2. bkeagent 推送到节点后启动
+3. bkeagent 执行 ping 命令，返回 `utils.HostName()`
+4. `utils.HostName()` 从 `/etc/openFuyao/bkeagent/node` 读取
+5. 如果文件不存在，使用系统 hostname 并创建文件
+6. 控制器收到 ping 响应，更新 BKENode CRD 的 `Spec.Hostname`
+
+#### 情况 2: 升级（Hostname 已存在）
+
+1. BKENode CRD 已有 `Spec.Hostname`
+2. 直接使用现有的 hostname
+3. 不覆盖已设置的 hostname（见 `agent.go:244` 注释）
+
+### 6. 关键代码位置
+
+| 步骤 | 文件 | 行号 |
+|------|------|------|
+| Host 结构定义 | `pkg/remote/host.go` | 20-28 |
+| NodeToRemoteHost | `pkg/phaseframe/phaseutil/ssh.go` | 27-44 |
+| HostCustomCmdFunc | `pkg/phaseframe/phaseutil/ssh.go` | 68-80 |
+| RegisterHostsInfo | `pkg/remote/multicli.go` | 187-229 |
+| 更新 BKENode Hostname | `pkg/phaseframe/phaseutil/agent.go` | 269-270 |
+| Ping 命令实现 | `pkg/job/builtin/ping/main.go` | 36-37 |
+| utils.HostName | `utils/utils.go` | 99-131 |
+
