@@ -556,3 +556,30 @@ Execute(commands)
 | **Socket** | `/run/containerd/containerd.sock` | 运行时生成 |
 | **数据目录** | `/var/lib/containerd` | 运行时使用 |
 | **状态目录** | `/run/containerd` | 运行时使用 |
+
+# 两条路径的判定逻辑在 `containerd.go:336`：
+
+```go
+if runtimeParam["containerdConfig"] == "" {
+    return cp.configureContainerdLegacy(runtimeParam)   // 旧路径
+}
+// 新路径：从 ContainerdConfig CR 获取配置
+if err := cp.generateContainerdCfg(runtimeParam); err != nil { ... }
+```
+
+## 实际走的是哪条路径
+
+**默认走旧路径（`configureContainerdLegacy`）**。原因：
+
+`containerdConfig` 参数仅在 `init.go:878-879` 中当 `cfg.Cluster.ContainerdConfigRef != nil` 时才传入：
+```go
+if cfg.Cluster.ContainerdConfigRef != nil {
+    command = append(command, fmt.Sprintf("containerdConfig=%s:%s", ...))
+}
+```
+而 `ContainerdConfigRef` 在 `BKEClusterSpec` 中是 `*ContainerdConfigRef` 指针 + `omitempty`（`bkecluster_spec.go:133`），**默认为 nil**。代码库中没有任何 webhook / 默认值注入逻辑为其赋默认值。
+
+因此：
+- **`ContainerdConfigRef` 未设置（绝大多数场景）** → `containerdConfig` 参数为空 → 走 **旧路径** `configureContainerdLegacy`（用 `dataRoot`/`insecureRegistries`/`repo` 等离散参数 + 内嵌模板生成 `config.toml` + `hosts.toml`）
+- **`ContainerdConfigRef` 显式设置（高级定制场景）** → `containerdConfig="ns:name"` → 走 **新路径** `generateContainerdCfg`（从 `ContainerdConfig` CR 读取 `Script`/`Service`/`Main`/`Registry` 四段配置）
+
