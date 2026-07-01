@@ -583,3 +583,87 @@ if cfg.Cluster.ContainerdConfigRef != nil {
 - **`ContainerdConfigRef` 未设置（绝大多数场景）** → `containerdConfig` 参数为空 → 走 **旧路径** `configureContainerdLegacy`（用 `dataRoot`/`insecureRegistries`/`repo` 等离散参数 + 内嵌模板生成 `config.toml` + `hosts.toml`）
 - **`ContainerdConfigRef` 显式设置（高级定制场景）** → `containerdConfig="ns:name"` → 走 **新路径** `generateContainerdCfg`（从 `ContainerdConfig` CR 读取 `Script`/`Service`/`Main`/`Registry` 四段配置）
 
+# containerd 中 online/offline 判断逻辑
+
+## containerd 中 online/offline 判断逻辑
+
+### 核心判断：`repoInsecure` 参数
+
+online/offline 的判断完全依赖 `runtimeParam["repoInsecure"]` 这个字符串参数，值为 `"true"` 即 offline 模式，否则为 online 模式。
+
+### `repoInsecure` 的设置路径
+
+只有一条路径会设置 `repoInsecure = "true"`，位于 [containerd.go:357-364](file:///pkg/job/builtin/containerruntime/containerd/containerd.go#L357-L364) 的 **Legacy 路径** `configureContainerdLegacy()`：
+```go
+if runtimeParam["insecureRegistries"] != "" {
+    registries := strings.Split(runtimeParam["insecureRegistries"], ",")
+    for i := range registriesLen {
+        if registries[i] == runtimeParam["repo"] && runtimeParam["repo"] != "cr.openfuyao.cn" {
+            registries = append(registries[:i], registries[i+1:]...)
+            runtimeParam["insecureRegistries"] = strings.Join(registries, ",")
+            runtimeParam["repoInsecure"] = "true"  // ← 唯一设置点
+            break
+        }
+    }
+}
+```
+**判断条件**：当 `insecureRegistries` 列表中**包含 `repo`（私有仓库地址）**，且 `repo != "cr.openfuyao.cn"` 时，判定为 offline。
+
+### `insecureRegistries` 的来源
+
+由 [init.go:849-876](file:///pkg/job/builtin/kubeadm/env/init.go#L849-L876) 的 `downloadContainerd()` 传入，来自 `loadRuntimeConfig()`：
+```go
+cfg := runtimeConfig{
+    insecureRegistries: defaultInsecureRegistries,  // 硬编码默认列表
+}
+// 追加用户自定义
+if v, ok := ep.bkeConfig.Cluster.ContainerRuntime.Param["insecure-registries"]; ok {
+    cfg.insecureRegistries = append(cfg.insecureRegistries, strings.Split(v, ",")...)
+}
+```
+
+[env.go:124-138](file:///pkg/job/builtin/kubeadm/env/env.go#L124-L138) 中硬编码的默认列表：
+```go
+defaultInsecureRegistries = []string{
+    "dcr.io:5000", "abcsys.cn:5000", "abcsys.cn:40443",
+    "registry01.com:5000", "registry.com:5000", "deploy.bocloud.k8s:40443",
+    "docker.io", "registry.k8s.io", "k8s.gcr.io", "ghcr.io", "quay.io", "gcr.io",
+    "cr.openfuyao.cn", "hub.oepkgs.net",
+}
+```
+
+### offline 模式下的行为差异
+
+[containerd.go:99-153](file:///pkg/job/builtin/containerruntime/containerd/containerd.go#L99-L153) `createHostsTOML()`：
+
+| | Online (`repoInsecure != "true"`) | Offline (`repoInsecure == "true"`) |
+|---|---|---|
+| **生成 hosts.toml 的 registry 列表** | 仅 `repo`（私有仓库） | `repo` + `insecureRegistries`（私有仓库 + 所有公共仓库） |
+| **公共仓库 hosts.toml** | 不生成 | 为 docker.io、registry.k8s.io 等每个公共仓库生成 hosts.toml，将请求重定向到私有仓库 |
+| **hosts.toml 内容** | `server = "https://repo"` → `[host."https://repo"]` | `server = "https://public-registry"` → `[host."https://repo"]` (重定向) |
+
+### 完整判断链路
+
+```
+loadRuntimeConfig()
+  ├── defaultInsecureRegistries (硬编码 14 个公共仓库)
+  └── Cluster.ContainerRuntime.Param["insecure-registries"] (用户自定义追加)
+        │
+        ▼
+downloadContainerd(insecureRegistries)
+  └── 传入 "insecureRegistries=docker.io,registry.k8s.io,..."
+        │
+        ▼
+configureContainerdLegacy(runtimeParam)
+  └── if insecureRegistries 包含 repo && repo != "cr.openfuyao.cn"
+        → repoInsecure = "true"  (判定为 offline)
+        │
+        ▼
+createHostsTOML(runtimeParam)
+  └── if repoInsecure == "true"
+        → 为每个公共仓库生成 hosts.toml，重定向到 repo
+```
+
+### CR 驱动路径无此逻辑
+
+`generateContainerdCfg()` 路径（[containerd.go:249-277](file:///pkg/job/builtin/containerruntime/containerd/containerd.go#L249-L277)）不经过 `configureContainerdLegacy()`，因此**没有 `repoInsecure` 判断**。CR 路径通过 `ContainerdConfig.Registry` 直接声明每个 registry 的 hosts.toml 配置，online/offline 由用户在 CR 中自行决定。
