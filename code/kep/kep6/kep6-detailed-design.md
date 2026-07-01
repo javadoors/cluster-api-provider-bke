@@ -579,6 +579,12 @@ type ConfigTemplateSpec struct {
     
     // Kubeconfig 模板
     KubeconfigTemplate *KubeconfigTemplateSpec `json:"kubeconfigTemplate,omitempty"`
+    
+    // 生成条件 (Go Template 表达式)
+    // 空 = 始终生成；渲染结果为 "false" 或空时跳过此模板（不生成文件）
+    // 示例: "{{.isOffline}}" → 离线时生成，在线时跳过
+    // 典型场景: hosts.toml 离线重定向文件——在线模式不需要公共仓库的重定向配置
+    Condition string `json:"condition,omitempty"`
 }
 
 // SecretRefSpec 定义 Secret 引用规格
@@ -2475,9 +2481,21 @@ func (r *ConfigRenderer) renderTemplateString(s string, tmplCtx manifest.Templat
 }
 
 // renderConfigTemplates 渲染配置文件模板列表 (使用 TemplateContext)
+// 支持 condition 字段: 评估 Go Template 表达式，"false"/空时跳过该模板
 func (r *ConfigRenderer) renderConfigTemplates(ctx context.Context, templates []ConfigTemplateSpec, tmplCtx manifest.TemplateContext) (map[string][]byte, error) {
     configs := make(map[string][]byte)
     for _, tmpl := range templates {
+        // 评估 condition：空 = 始终生成；"false"/空 = 跳过
+        if tmpl.Condition != "" {
+            result, err := r.renderTemplateString(tmpl.Condition, tmplCtx)
+            if err != nil {
+                return nil, fmt.Errorf("failed to evaluate condition for %s: %w", tmpl.Name, err)
+            }
+            trimmed := strings.TrimSpace(result)
+            if trimmed == "false" || trimmed == "" {
+                continue // 跳过此模板，不生成文件
+            }
+        }
         content, err := r.RenderConfig(ctx, tmpl, tmplCtx)
         if err != nil {
             return nil, fmt.Errorf("failed to render template %s: %w", tmpl.Name, err)
@@ -4290,6 +4308,27 @@ fi
 
 **`isUpgrade` 的来源链路**：`VersionContext.HasCurrent()` → `BinaryActionUpgrade` → `InstallOptions.Action` → `tmplCtx.IsUpgrade` → 模板 `{{if .isUpgrade}}`
 
+#### 9.1 部署模式变量 (Deploy Mode Variables)
+
+| 变量 | 说明 | 来源 | 示例值 |
+|------|------|------|--------|
+| `{{.isOffline}}` | 是否离线模式 | `TemplateContext.Variables["isOffline"]`（由 BinaryComponentExecutor 注入） | `true` / `false` |
+
+**`isOffline` 的来源链路**：
+
+`BinaryComponentExecutor` 在执行前根据集群配置推断：检查 `imageRegistry` 是否在 `insecureRegistries` 列表中（且非 `cr.openfuyao.cn`），是则为离线模式。复用现有 `configureContainerdLegacy:357-364` 的 `repoInsecure` 判定逻辑。
+
+```
+BKECluster.Spec (imageRepo + insecureRegistries)
+  → BinaryComponentExecutor 检查 repo ∈ insecureRegistries
+    → true: tmplCtx.Variables["isOffline"] = "true"
+    → false: tmplCtx.Variables["isOffline"] = "false"
+      → ConfigTemplateSpec.condition: "{{.isOffline}}"
+        → 离线时生成 hosts.toml 重定向文件，在线时跳过
+```
+
+**典型用途**：控制 `configTemplates` 中离线重定向 hosts.toml 的生成——在线模式不生成公共仓库重定向文件，离线模式为每个公共仓库生成重定向到私有仓库的 hosts.toml。
+
 #### 10. 自定义变量 (Custom Variables)
 
 通过 ComponentVersion 的 `binary.variables` 字段定义，可在 installScript 中引用：
@@ -5632,7 +5671,22 @@ func (e *BinaryComponentExecutor) executeRolling(ctx context.Context, nodes []No
         nodeTmpl.NodeHostname = node.Hostname
         nodeTmpl.NodeRole = node.Role
         nodeTmpl.ComponentVersion = cv.Spec.Version
-        
+
+        // 注入部署模式变量 isOffline (用于 configTemplates.condition)
+        // 复用现有 configureContainerdLegacy:357-364 的 repoInsecure 判定逻辑:
+        // imageRegistry 在 insecureRegistries 列表中 (且非 cr.openfuyao.cn) = 离线模式
+        // 离线模式: ConfigRenderer 为公共仓库生成 hosts.toml 重定向文件
+        if nodeTmpl.Variables == nil {
+            nodeTmpl.Variables = make(map[string]string)
+        }
+        nodeTmpl.Variables["isOffline"] = "false"
+        for _, reg := range strings.Split(nodeTmpl.Variables["insecureRegistries"], ",") {
+            if strings.TrimSpace(reg) == nodeTmpl.ImageRegistry && nodeTmpl.ImageRegistry != "cr.openfuyao.cn" {
+                nodeTmpl.Variables["isOffline"] = "true"
+                break
+            }
+        }
+
         // 根据 VersionContext 自主决定操作类型
         action := binaryinstaller.BinaryActionInstall
         if execCtx.VersionContext != nil && execCtx.VersionContext.HasCurrent(cv.Spec.Name) {
@@ -7765,6 +7819,81 @@ spec:
 
           [Install]
           WantedBy=multi-user.target
+
+      # --- hosts.toml: 主仓库 (在线/离线均生成) ---
+      # 配置私有镜像仓库访问, server 指向自身
+      - name: hosts.toml
+        path: "/etc/containerd/certs.d/{{imageRegistry}}/hosts.toml"
+        mode: "0644"
+        owner: "root:root"
+        content: |
+          server = "https://{{imageRegistry}}"
+          [host."https://{{imageRegistry}}"]
+            capabilities = ["pull", "resolve", "push"]
+            skip_verify = true
+
+      # --- hosts.toml: 离线重定向 (仅离线模式生成) ---
+      # 离线模式: 公共仓库请求重定向到私有仓库
+      # condition: "{{.isOffline}}" → 在线时跳过, 离线时生成
+      - name: docker.io-hosts.toml
+        path: "/etc/containerd/certs.d/docker.io/hosts.toml"
+        mode: "0644"
+        condition: "{{.isOffline}}"
+        content: |
+          server = "https://docker.io"
+          [host."https://{{imageRegistry}}"]
+            capabilities = ["pull", "resolve", "push"]
+            skip_verify = true
+
+      - name: registry.k8s.io-hosts.toml
+        path: "/etc/containerd/certs.d/registry.k8s.io/hosts.toml"
+        mode: "0644"
+        condition: "{{.isOffline}}"
+        content: |
+          server = "https://registry.k8s.io"
+          [host."https://{{imageRegistry}}"]
+            capabilities = ["pull", "resolve", "push"]
+            skip_verify = true
+
+      - name: k8s.gcr.io-hosts.toml
+        path: "/etc/containerd/certs.d/k8s.gcr.io/hosts.toml"
+        mode: "0644"
+        condition: "{{.isOffline}}"
+        content: |
+          server = "https://k8s.gcr.io"
+          [host."https://{{imageRegistry}}"]
+            capabilities = ["pull", "resolve", "push"]
+            skip_verify = true
+
+      - name: gcr.io-hosts.toml
+        path: "/etc/containerd/certs.d/gcr.io/hosts.toml"
+        mode: "0644"
+        condition: "{{.isOffline}}"
+        content: |
+          server = "https://gcr.io"
+          [host."https://{{imageRegistry}}"]
+            capabilities = ["pull", "resolve", "push"]
+            skip_verify = true
+
+      - name: quay.io-hosts.toml
+        path: "/etc/containerd/certs.d/quay.io/hosts.toml"
+        mode: "0644"
+        condition: "{{.isOffline}}"
+        content: |
+          server = "https://quay.io"
+          [host."https://{{imageRegistry}}"]
+            capabilities = ["pull", "resolve", "push"]
+            skip_verify = true
+
+      - name: ghcr.io-hosts.toml
+        path: "/etc/containerd/certs.d/ghcr.io/hosts.toml"
+        mode: "0644"
+        condition: "{{.isOffline}}"
+        content: |
+          server = "https://ghcr.io"
+          [host."https://{{imageRegistry}}"]
+            capabilities = ["pull", "resolve", "push"]
+            skip_verify = true
 
     installScript: |
       #!/bin/bash
