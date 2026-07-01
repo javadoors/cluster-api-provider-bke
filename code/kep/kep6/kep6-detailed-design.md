@@ -1,6 +1,6 @@
 ﻿# KEP-6 详细设计文档：基于 ReleaseImage 的二进制与 Helm 组件声明式管理方案
 
-**文档版本**: v1.1  
+**文档版本**: v1.2  
 **状态**: Draft  
 **依赖**: KEP-6 提案文档
 
@@ -5661,8 +5661,35 @@ func (e *BinaryComponentExecutor) executeRolling(ctx context.Context, nodes []No
                 execCtx.Log.Warn("node %s upgrade failed, continuing: %v", node.IP, err)
                 continue
             case "Rollback":
+                // 标记节点开始回滚
+                if e.statusUpdater != nil {
+                    if markErr := e.statusUpdater.MarkRollback(ctx, execCtx.Cluster, node.IP, cv.Spec.Name); markErr != nil {
+                        execCtx.Log.Warn("failed to mark node %s as rolling back: %v", node.IP, markErr)
+                    }
+                }
+                
                 if rbErr := e.rollback(node, cv); rbErr != nil {
+                    // 回滚失败
+                    if e.statusUpdater != nil {
+                        if markErr := e.statusUpdater.MarkFailed(ctx, execCtx.Cluster, node.IP, cv.Spec.Name, rbErr); markErr != nil {
+                            execCtx.Log.Warn("failed to mark node %s as rollback failed: %v", node.IP, markErr)
+                        }
+                    }
                     return fmt.Errorf("upgrade failed and rollback failed: %w; rollback: %v", err, rbErr)
+                }
+                
+                // 回滚成功
+                if e.statusUpdater != nil {
+                    // 获取旧版本
+                    oldVersion := ""
+                    if execCtx.VersionContext != nil {
+                        if v, ok := execCtx.VersionContext.CurrentVersion(cv.Spec.Name); ok {
+                            oldVersion = v
+                        }
+                    }
+                    if markErr := e.statusUpdater.MarkSuccess(ctx, execCtx.Cluster, node.IP, cv.Spec.Name, oldVersion); markErr != nil {
+                        execCtx.Log.Warn("failed to mark node %s as rolled back: %v", node.IP, markErr)
+                    }
                 }
                 continue
             }
@@ -5893,18 +5920,18 @@ func (e *HelmComponentExecutor) ExecuteComponent(ctx context.Context, node *Comp
     }
     
     if err := e.installer.Install(ctx, opts); err != nil {
-        // 标记组件安装失败
-        if e.componentStatusUpdater != nil {
-            if markErr := e.componentStatusUpdater.MarkFailed(ctx, execCtx.Cluster, component.Name, "helm", err); markErr != nil {
-                execCtx.Log.Warn("failed to mark component %s as failed: %v", component.Name, markErr)
-            }
-        }
-        
         // FailurePolicy=Rollback: 升级失败后执行 helm rollback
         // 仅当 Atomic=false 时需要手动回滚 (Atomic=true 时 Helm SDK 已自动回滚)
         if cv.Spec.UpgradeStrategy.FailurePolicy == "Rollback" &&
            action == helminstaller.HelmActionUpgrade &&
            !cv.Spec.Helm.Strategy.Atomic {
+            // 标记组件开始回滚
+            if e.componentStatusUpdater != nil {
+                if markErr := e.componentStatusUpdater.MarkRollback(ctx, execCtx.Cluster, component.Name, "helm"); markErr != nil {
+                    execCtx.Log.Warn("failed to mark component %s as rolling back: %v", component.Name, markErr)
+                }
+            }
+            
             execCtx.Log.Warn("helm upgrade failed, attempting rollback: %v", err)
             rollbackOpts := helminstaller.InstallOptions{
                 Component:   cv,
@@ -5913,11 +5940,37 @@ func (e *HelmComponentExecutor) ExecuteComponent(ctx context.Context, node *Comp
                 Timeout:     cv.Spec.UpgradeStrategy.Timeout,
             }
             if rbErr := e.installer.Install(ctx, rollbackOpts); rbErr != nil {
+                // 回滚失败
+                if e.componentStatusUpdater != nil {
+                    if markErr := e.componentStatusUpdater.MarkFailed(ctx, execCtx.Cluster, component.Name, "helm", rbErr); markErr != nil {
+                        execCtx.Log.Warn("failed to mark component %s as rollback failed: %v", component.Name, markErr)
+                    }
+                }
                 return fmt.Errorf("upgrade failed: %w; rollback also failed: %v", err, rbErr)
             }
-            // 回滚成功, 根据 FailurePolicy 决定是否继续
+            
+            // 回滚成功
+            if e.componentStatusUpdater != nil {
+                // 获取旧版本
+                oldVersion := ""
+                if vc != nil {
+                    if v, ok := vc.CurrentVersion(component.Name); ok {
+                        oldVersion = v
+                    }
+                }
+                if markErr := e.componentStatusUpdater.MarkSuccess(ctx, execCtx.Cluster, component.Name, "helm", oldVersion); markErr != nil {
+                    execCtx.Log.Warn("failed to mark component %s as rolled back: %v", component.Name, markErr)
+                }
+            }
             execCtx.Log.Info("helm rollback succeeded after upgrade failure")
             return fmt.Errorf("upgrade failed but rollback succeeded: %w", err)
+        }
+        
+        // 标记组件安装失败（非回滚场景）
+        if e.componentStatusUpdater != nil {
+            if markErr := e.componentStatusUpdater.MarkFailed(ctx, execCtx.Cluster, component.Name, "helm", err); markErr != nil {
+                execCtx.Log.Warn("failed to mark component %s as failed: %v", component.Name, markErr)
+            }
         }
         return err
     }
@@ -6194,6 +6247,48 @@ func (a *InlinePhaseRunnerAdapter) Execute(ctx context.Context, oldCluster, newC
 
 #### 9.5.3 状态数据模型
 
+**新增 `ComponentPhase` 状态枚举**：
+
+```go
+// api/bkecommon/v1beta1/bkecluster_status.go 扩展
+
+// ComponentPhase 组件安装/升级阶段
+type ComponentPhase string
+
+const (
+    // 基础状态
+    ComponentPhasePending        ComponentPhase = "Pending"         // 等待安装（初始状态）
+    ComponentPhaseInstalling     ComponentPhase = "Installing"      // 首次安装中
+    ComponentPhaseUpgrading      ComponentPhase = "Upgrading"       // 升级中（已有旧版本）
+    ComponentPhaseInstalled      ComponentPhase = "Installed"       // 安装/升级成功
+    ComponentPhaseFailed         ComponentPhase = "Failed"          // 安装/升级失败
+    
+    // 回滚相关状态
+    ComponentPhaseRollingBack    ComponentPhase = "RollingBack"     // 正在回滚到旧版本
+    ComponentPhaseRolledBack     ComponentPhase = "RolledBack"      // 回滚成功，已恢复到旧版本
+    
+    // Binary 组件特有状态
+    ComponentPhasePartialSuccess ComponentPhase = "PartialSuccess"  // 部分节点成功，部分节点失败
+    
+    // 异常状态
+    ComponentPhaseTimeout        ComponentPhase = "Timeout"         // 安装/升级超时
+)
+```
+
+**状态说明**：
+
+| 状态 | 适用组件 | 说明 |
+|------|---------|------|
+| `Pending` | 所有 | 初始状态，等待安装 |
+| `Installing` | Binary/Helm/YAML | 首次安装中 |
+| `Upgrading` | Binary/Helm/YAML | 升级中（已有旧版本） |
+| `Installed` | 所有 | 安装/升级成功 |
+| `Failed` | 所有 | 安装/升级失败 |
+| `RollingBack` | Helm/Binary | 正在回滚到旧版本 |
+| `RolledBack` | Helm/Binary | 回滚成功，已恢复到旧版本 |
+| `PartialSuccess` | Binary | 部分节点成功，部分节点失败 |
+| `Timeout` | 所有 | 安装/升级超时（可通过超时检测自动设置） |
+
 **新增 `NodeComponentStatuses` 字段**：
 
 ```go
@@ -6215,14 +6310,38 @@ type NodeComponentStatus struct {
     // 已安装版本 (如 "v1.7.18")
     Version string `json:"version"`
 
-    // 安装阶段: Installing / Installed / Failed
-    Phase string `json:"phase"`
+    // 安装阶段 (使用 ComponentPhase 枚举)
+    Phase ComponentPhase `json:"phase"`
 
     // 最后更新时间
     LastUpdateTime *metav1.Time `json:"lastUpdateTime,omitempty"`
 
-    // 错误信息 (Phase=Failed 时)
+    // 错误信息 (Phase=Failed/Timeout 时)
     Message string `json:"message,omitempty"`
+}
+
+// ComponentStatus 组件级安装状态 (所有组件类型共用)
+type ComponentStatus struct {
+    // 已安装版本 (如 "v1.11.1")
+    Version string `json:"version"`
+
+    // 安装阶段 (使用 ComponentPhase 枚举)
+    Phase ComponentPhase `json:"phase"`
+
+    // 组件类型: binary / helm / yaml
+    Type string `json:"type"`
+
+    // 最后更新时间
+    LastUpdateTime *metav1.Time `json:"lastUpdateTime,omitempty"`
+
+    // 错误信息 (Phase=Failed/Timeout 时)
+    Message string `json:"message,omitempty"`
+
+    // 成功节点数 (仅 Binary 组件，Phase=PartialSuccess 时)
+    SuccessNodes int `json:"successNodes,omitempty"`
+
+    // 失败节点数 (仅 Binary 组件，Phase=PartialSuccess 时)
+    FailedNodes int `json:"failedNodes,omitempty"`
 }
 ```
 
@@ -6505,14 +6624,20 @@ spec:
 // 3. 需要处理新旧状态模型的兼容 (NodeComponentStatuses vs StateCode)
 // 4. 测试时可注入 Mock，独立测试 Executor 逻辑
 type NodeStatusUpdater interface {
-    // MarkPending 标记节点开始安装
+    // MarkPending 标记节点开始安装/升级
     MarkPending(ctx context.Context, cluster *bkev1beta1.BKECluster, nodeIP string, componentName string) error
 
-    // MarkSuccess 标记节点安装成功
+    // MarkSuccess 标记节点安装/升级/回滚成功
     MarkSuccess(ctx context.Context, cluster *bkev1beta1.BKECluster, nodeIP string, componentName string, version string) error
 
-    // MarkFailed 标记节点安装失败
+    // MarkFailed 标记节点安装/升级/回滚失败
     MarkFailed(ctx context.Context, cluster *bkev1beta1.BKECluster, nodeIP string, componentName string, err error) error
+
+    // MarkTimeout 标记节点安装/升级超时
+    MarkTimeout(ctx context.Context, cluster *bkev1beta1.BKECluster, nodeIP string, componentName string) error
+
+    // MarkRollback 标记节点开始回滚
+    MarkRollback(ctx context.Context, cluster *bkev1beta1.BKECluster, nodeIP string, componentName string) error
 }
 ```
 
@@ -6618,14 +6743,23 @@ func (u *BKENodeStatusUpdater) updateNodeComponentStatus(
 // 3. Binary 组件同时需要节点级和组件级状态更新
 // 4. 接口分离避免职责混淆，测试时可独立 Mock
 type ComponentStatusUpdater interface {
-    // MarkPending 标记组件开始安装
+    // MarkPending 标记组件开始安装/升级
     MarkPending(ctx context.Context, cluster *bkev1beta1.BKECluster, componentName string, componentType string) error
 
-    // MarkSuccess 标记组件安装成功
+    // MarkSuccess 标记组件安装/升级/回滚成功
     MarkSuccess(ctx context.Context, cluster *bkev1beta1.BKECluster, componentName string, componentType string, version string) error
 
-    // MarkFailed 标记组件安装失败
+    // MarkFailed 标记组件安装/升级/回滚失败
     MarkFailed(ctx context.Context, cluster *bkev1beta1.BKECluster, componentName string, componentType string, err error) error
+
+    // MarkTimeout 标记组件安装/升级超时
+    MarkTimeout(ctx context.Context, cluster *bkev1beta1.BKECluster, componentName string, componentType string) error
+
+    // MarkRollback 标记组件开始回滚
+    MarkRollback(ctx context.Context, cluster *bkev1beta1.BKECluster, componentName string, componentType string) error
+
+    // MarkPartialSuccess 标记部分节点成功 (仅 Binary 组件)
+    MarkPartialSuccess(ctx context.Context, cluster *bkev1beta1.BKECluster, componentName string, componentType string, successNodes int, failedNodes int) error
 }
 ```
 
@@ -6844,28 +6978,144 @@ func (u *BKEComponentStatusUpdater) updateComponentStatus(
 
 #### 9.5.7 状态转换表
 
+**状态转换图 (节点级 - NodeComponentStatuses，仅 Binary 组件)**：
+
+```
+                              ┌─────────────┐
+                              │   Pending   │
+                              └──────┬──────┘
+                                     │ MarkPending
+                                     ▼
+                    ┌────────────────────────────────┐
+                    │                                │
+              ┌─────▼─────┐                    ┌─────▼─────┐
+              │ Installing│                    │ Upgrading │
+              └─────┬─────┘                    └─────┬─────┘
+                    │                                │
+         ┌──────────┼──────────┐           ┌─────────┼─────────┐
+         │          │          │           │         │         │
+         ▼          ▼          ▼           ▼         ▼         ▼
+    ┌─────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
+    │Installed│ │ Failed │ │Timeout │ │Installed│ │ Failed │ │Timeout │
+    └─────────┘ └────────┘ └────────┘ └────────┘ └────────┘ └────────┘
+```
+
+**状态转换图 (组件级 - ComponentStatuses，所有组件类型)**：
+
+```
+                              ┌─────────────┐
+                              │   Pending   │
+                              └──────┬──────┘
+                                     │ MarkPending
+                                     ▼
+                    ┌────────────────────────────────┐
+                    │                                │
+              ┌─────▼─────┐                    ┌─────▼─────┐
+              │ Installing│                    │ Upgrading │
+              └─────┬─────┘                    └─────┬─────┘
+                    │                                │
+         ┌──────────┼──────────┐           ┌─────────┼─────────┐
+         │          │          │           │         │         │
+         ▼          ▼          ▼           ▼         ▼         ▼
+    ┌─────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
+    │Installed│ │ Failed │ │Timeout │ │Installed│ │ Failed │ │Timeout │
+    └─────────┘ └───┬────┘ └────────┘ └────────┘ └───┬────┘ └────────┘
+                    │                                 │
+                    │ MarkRollback                    │ MarkRollback
+                    ▼                                 ▼
+              ┌─────────────┐                   ┌─────────────┐
+              │ RollingBack │                   │ RollingBack │
+              └──────┬──────┘                   └──────┬──────┘
+                     │                                 │
+              ┌──────┴──────┐                   ┌──────┴──────┐
+              │             │                   │             │
+              ▼             ▼                   ▼             ▼
+        ┌───────────┐ ┌────────┐          ┌───────────┐ ┌────────┐
+        │RolledBack │ │ Failed │          │RolledBack │ │ Failed │
+        └───────────┘ └────────┘          └───────────┘ └────────┘
+
+Binary 组件特有转换：
+              ┌─────────┐
+              │Upgrading│ (部分节点成功，部分失败)
+              └────┬────┘
+                   │ MarkPartialSuccess
+                   ▼
+            ┌────────────────┐
+            │PartialSuccess  │
+            └────────────────┘
+```
+
+**完整状态转换矩阵**：
+
+| 当前状态 | 事件 | 新状态 | 方法 |
+|---------|------|--------|------|
+| **Pending** | 开始安装 | Installing | MarkPending |
+| **Pending** | 开始升级 | Upgrading | MarkPending |
+| **Installing** | 安装成功 | Installed | MarkSuccess |
+| **Installing** | 安装失败 | Failed | MarkFailed |
+| **Installing** | 超时 | Timeout | MarkTimeout |
+| **Upgrading** | 升级成功 | Installed | MarkSuccess |
+| **Upgrading** | 升级失败 | Failed | MarkFailed |
+| **Upgrading** | 超时 | Timeout | MarkTimeout |
+| **Upgrading** | 部分节点成功 | PartialSuccess | MarkPartialSuccess |
+| **Failed** | 开始回滚 | RollingBack | MarkRollback |
+| **Failed** | 重试 | Installing/Upgrading | MarkPending |
+| **Timeout** | 开始回滚 | RollingBack | MarkRollback |
+| **Timeout** | 重试 | Installing/Upgrading | MarkPending |
+| **RollingBack** | 回滚成功 | RolledBack | MarkSuccess |
+| **RollingBack** | 回滚失败 | Failed | MarkFailed |
+| **Installed** | 目标版本变更 | Upgrading | MarkPending |
+| **RolledBack** | 目标版本变更 | Upgrading | MarkPending |
+| **PartialSuccess** | 重试失败节点 | Upgrading | MarkPending |
+| **PartialSuccess** | 全部成功 | Installed | MarkSuccess |
+
 **节点级状态转换 (NodeComponentStatuses，仅 Binary 组件)**：
 
 | 当前 Phase | 事件 | 新 Phase | Version | 触发者 |
 |-----------|------|---------|---------|--------|
-| (不存在) | 开始安装 | `Installing` | "" | NodeStatusUpdater.MarkPending |
+| (不存在) | 开始安装 | `Pending` | "" | 初始状态 |
+| `Pending` | 开始安装 | `Installing` | "" | NodeStatusUpdater.MarkPending |
+| `Pending` | 开始升级 | `Upgrading` | 保留旧版本 | NodeStatusUpdater.MarkPending |
 | `Installing` | 安装成功 | `Installed` | targetVersion | NodeStatusUpdater.MarkSuccess |
-| `Installing` | 安装失败 | `Failed` | "" (保留原版本) | NodeStatusUpdater.MarkFailed |
-| `Installed` | 目标版本变更 | `Installing` | 保留旧版本 | NodeStatusUpdater.MarkPending |
-| `Failed` | 重试 | `Installing` | 保留旧版本 | NodeStatusUpdater.MarkPending |
-| `Failed` | 组件移除 | (删除条目) | — | Executor |
+| `Installing` | 安装失败 | `Failed` | "" | NodeStatusUpdater.MarkFailed |
+| `Installing` | 超时 | `Timeout` | "" | NodeStatusUpdater.MarkTimeout |
+| `Upgrading` | 升级成功 | `Installed` | targetVersion | NodeStatusUpdater.MarkSuccess |
+| `Upgrading` | 升级失败 | `Failed` | 保留旧版本 | NodeStatusUpdater.MarkFailed |
+| `Upgrading` | 超时 | `Timeout` | 保留旧版本 | NodeStatusUpdater.MarkTimeout |
+| `Failed` | 开始回滚 | `RollingBack` | 保留旧版本 | NodeStatusUpdater.MarkRollback |
+| `Failed` | 重试 | `Installing`/`Upgrading` | 保留旧版本 | NodeStatusUpdater.MarkPending |
+| `Timeout` | 开始回滚 | `RollingBack` | 保留旧版本 | NodeStatusUpdater.MarkRollback |
+| `Timeout` | 重试 | `Installing`/`Upgrading` | 保留旧版本 | NodeStatusUpdater.MarkPending |
+| `RollingBack` | 回滚成功 | `RolledBack` | 旧版本 | NodeStatusUpdater.MarkSuccess |
+| `RollingBack` | 回滚失败 | `Failed` | 保留旧版本 | NodeStatusUpdater.MarkFailed |
+| `Installed` | 目标版本变更 | `Upgrading` | 保留旧版本 | NodeStatusUpdater.MarkPending |
+| `RolledBack` | 目标版本变更 | `Upgrading` | 保留旧版本 | NodeStatusUpdater.MarkPending |
 | `Installed` | 版本相同 | (跳过) | — | NodeFilter |
 
 **组件级状态转换 (ComponentStatuses，所有组件类型)**：
 
 | 当前 Phase | 事件 | 新 Phase | Version | 触发者 |
 |-----------|------|---------|---------|--------|
-| (不存在) | 开始安装 | `Installing` | "" | ComponentStatusUpdater.MarkPending |
+| (不存在) | 开始安装 | `Pending` | "" | 初始状态 |
+| `Pending` | 开始安装 | `Installing` | "" | ComponentStatusUpdater.MarkPending |
+| `Pending` | 开始升级 | `Upgrading` | 保留旧版本 | ComponentStatusUpdater.MarkPending |
 | `Installing` | 安装成功 | `Installed` | targetVersion | ComponentStatusUpdater.MarkSuccess |
-| `Installing` | 安装失败 | `Failed` | "" (保留原版本) | ComponentStatusUpdater.MarkFailed |
-| `Installed` | 目标版本变更 | `Installing` | 保留旧版本 | ComponentStatusUpdater.MarkPending |
-| `Failed` | 重试 | `Installing` | 保留旧版本 | ComponentStatusUpdater.MarkPending |
-| `Failed` | 组件移除 | (删除条目) | — | Executor |
+| `Installing` | 安装失败 | `Failed` | "" | ComponentStatusUpdater.MarkFailed |
+| `Installing` | 超时 | `Timeout` | "" | ComponentStatusUpdater.MarkTimeout |
+| `Upgrading` | 升级成功 | `Installed` | targetVersion | ComponentStatusUpdater.MarkSuccess |
+| `Upgrading` | 升级失败 | `Failed` | 保留旧版本 | ComponentStatusUpdater.MarkFailed |
+| `Upgrading` | 超时 | `Timeout` | 保留旧版本 | ComponentStatusUpdater.MarkTimeout |
+| `Upgrading` | 部分节点成功 | `PartialSuccess` | 保留旧版本 | ComponentStatusUpdater.MarkPartialSuccess |
+| `Failed` | 开始回滚 | `RollingBack` | 保留旧版本 | ComponentStatusUpdater.MarkRollback |
+| `Failed` | 重试 | `Installing`/`Upgrading` | 保留旧版本 | ComponentStatusUpdater.MarkPending |
+| `Timeout` | 开始回滚 | `RollingBack` | 保留旧版本 | ComponentStatusUpdater.MarkRollback |
+| `Timeout` | 重试 | `Installing`/`Upgrading` | 保留旧版本 | ComponentStatusUpdater.MarkPending |
+| `RollingBack` | 回滚成功 | `RolledBack` | 旧版本 | ComponentStatusUpdater.MarkSuccess |
+| `RollingBack` | 回滚失败 | `Failed` | 保留旧版本 | ComponentStatusUpdater.MarkFailed |
+| `Installed` | 目标版本变更 | `Upgrading` | 保留旧版本 | ComponentStatusUpdater.MarkPending |
+| `RolledBack` | 目标版本变更 | `Upgrading` | 保留旧版本 | ComponentStatusUpdater.MarkPending |
+| `PartialSuccess` | 重试失败节点 | `Upgrading` | 保留旧版本 | ComponentStatusUpdater.MarkPending |
+| `PartialSuccess` | 全部成功 | `Installed` | targetVersion | ComponentStatusUpdater.MarkSuccess |
 | `Installed` | 版本相同 | (跳过) | — | VersionContext |
 
 **状态更新职责分工**：
@@ -7001,6 +7251,7 @@ Feature Gate OFF → ON (再次开启):
 |------|------|------|
 | per-node 状态存储位置 | `BKECluster.Status.NodeComponentStatuses` | 1 次 Patch 更新，避免 N 次 BKENode 更新的并发冲突 |
 | 组件级状态存储位置 | `BKECluster.Status.ComponentStatuses` | 所有组件类型共用，1 次 Patch 更新 |
+| 状态枚举设计 | 单个 `Phase` 字段 (9 个状态) | 语义清晰，无需扩展字段，覆盖所有场景 |
 | NodeFilter 归属 | 独立接口，由 Executor 持有 | 过滤逻辑因组件而异，不应内置到 Installer 或 NodeProvider |
 | NodeStatusUpdater 归属 | 独立接口，由 Executor 持有 | 状态更新是编排层职责，不应下沉到安装层 |
 | ComponentStatusUpdater 归属 | 独立接口，由 Executor 持有 | 所有组件类型共用，与 NodeStatusUpdater 分离避免职责混淆 |
@@ -7009,6 +7260,9 @@ Feature Gate OFF → ON (再次开启):
 | Helm/YAML 节点过滤 | 不通过 NodeFilter，通过 values/nodeSelector | 集群级部署，节点调度由 K8s Scheduler 处理 |
 | Inline 状态记录 | 不记录 | 由 Phase 自身 `NeedExecute()` 判断幂等性 |
 | Binary 状态更新 | 节点级 + 组件级双重追踪 | 节点级用于 per-node 幂等，组件级用于整体状态展示 |
+| 回滚状态设计 | `RollingBack` + `RolledBack` | 区分回滚中和回滚成功，语义清晰 |
+| 部分成功状态 | `PartialSuccess` (仅 Binary) | 精确反映多节点部署的部分成功场景 |
+| 超时状态 | `Timeout` | 区分超时和其他失败，便于诊断和重试 |
 
 ---
 
@@ -8714,5 +8968,5 @@ bke-manifests/
 
 ---
 
-**文档版本**: v1.1  
+**文档版本**: v1.2  
 **维护者**: openFuyao Team
