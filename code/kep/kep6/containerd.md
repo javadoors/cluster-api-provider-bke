@@ -385,4 +385,174 @@ command := &agentv1beta1.Command{
 
 该函数由 `configureContainerd`（`containerd.go:340`）在 `containerdConfig` 参数非空时调用，是新版配置逻辑（替代 legacy 方式）。
 
-# 
+# containerd 安装全流程与参数梳理
+
+## containerd 安装全流程与参数梳理
+
+### 一、整体流程概览
+
+入口函数为 [containerd.go](file:///pkg/job/builtin/containerruntime/containerd/containerd.go) 的 `Execute` 方法，流程如下：
+```
+Execute(commands)
+  ├── 1. ParseCommands()          解析命令行参数
+  ├── 2. downloadTar()            下载 containerd tar.gz 到 /tmp
+  ├── 3. unTar()                  解压 tar.gz 到安装目录 (默认 /)
+  ├── 4. configureContainerd()    配置 containerd (两条路径，见下)
+  ├── 5. startContainerdService() systemctl enable + restart containerd
+  └── 6. WaitContainerdReady()   轮询等待 containerd 就绪
+```
+
+### 二、配置阶段双路径
+
+[containerd.go:340-355](file:///pkg/job/builtin/containerruntime/containerd/containerd.go#L340-L355) 中 `configureContainerd` 根据是否传入 `containerdConfig` 参数走两条路径：
+
+| 路径 | 条件 | 方法 | 说明 |
+|------|------|------|------|
+| **Legacy** | `containerdConfig == ""` | `configureContainerdLegacy()` | 使用命令行参数直接生成配置 |
+| **CR 驱动** | `containerdConfig != ""` | `generateContainerdCfg()` | 从 K8s ContainerdConfig CR 获取配置 |
+
+#### Legacy 路径 (`configureContainerdLegacy`)
+1. 创建 `dataRoot` 目录（默认 `/var/lib/containerd`）
+2. 处理 `insecureRegistries`，若 repo 在其中则标记 `repoInsecure=true`
+3. `writeConfigToDisk()` — 渲染嵌入的 [config.toml](file:///pkg/job/builtin/containerruntime/containerd/config.toml) 模板到 `{directory}etc/containerd/config.toml`
+4. `createHostsTOML()` — 为每个 registry 生成 `/etc/containerd/certs.d/{registry}/hosts.toml`
+
+#### CR 驱动路径 (`generateContainerdCfg`)
+[containerd.go:249-277](file:///pkg/job/builtin/containerruntime/containerd/containerd.go#L249-L277) 按顺序执行 4 个子步骤：
+
+1. **Script** — 执行自定义 shell 脚本（`ScriptConfig.Content` 或 `ScriptConfig.Path`）
+2. **Service** — 生成 systemd service drop-in 文件 `10-override.conf`
+3. **Main** — 渲染 `config.toml`（可覆盖 sandboxImage、root、state、configPath、metricsAddress）
+4. **Registry** — 生成多个 registry 的 `hosts.toml`
+
+### 三、插件参数定义
+
+[containerd.go:284-295](file://pkg/job/builtin/containerruntime/containerd/containerd.go#L284-L295) `Param()` 定义：
+
+| 参数 Key | 必填 | 默认值 | 说明 |
+|----------|------|--------|------|
+| `url` | **是** | — | containerd.tar.gz 下载地址 |
+| `repo` | 否 | `{DefaultImageRepo}:{DefaultImageRepoPort}` | 镜像仓库地址 |
+| `sandbox` | 否 | `{repo}/kubernetes/pause:3.9` | Pod sandbox 镜像 |
+| `runtime` | 否 | `runc` | 容器运行时 |
+| `dataRoot` | 否 | `/var/lib/containerd` | 数据根目录 |
+| `directory` | 否 | `/` | tar.gz 解压目录 |
+| `insecureRegistries` | 否 | `""` | 不安全仓库列表，逗号分隔 |
+| `containerdConfig` | 否 | `""` | CR 名称 (格式 `namespace:name`)，非空则走 CR 驱动路径 |
+
+### 四、CR 类型定义（ContainerdConfigSpec）
+
+[containerdconfig_types.go](file:///api/bkecommon/v1beta1/containerdconfig_types.go) 定义了 4 大配置块：
+
+#### 1. ScriptConfig（脚本配置）
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `content` | string | — | 脚本内容（优先于 path） |
+| `path` | string | — | 脚本文件路径 |
+| `args` | []string | — | 脚本参数 |
+| `interpreter` | string | `/bin/bash` | 解释器 |
+
+#### 2. ServiceConfig（Systemd Service 配置）
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `execStart` | string | — | ExecStart 命令（会先清空再设置） |
+| `slice` | string | `system.slice` | systemd slice |
+| `killMode` | enum | `process` | control-group/process/mixed/none |
+| `restart` | enum | `always` | 重启策略 |
+| `restartSec` | string | `5s` | 重启间隔 |
+| `startLimitInterval` | string | `10s` | 启动限流间隔 |
+| `startLimitBurst` | int | `5` | 启动限流突发数 |
+| `timeoutStopSec` | string | `90s` | 停止超时 |
+| `logging` | ServiceLogging | — | 日志配置 |
+| `customExtra` | map | — | 自定义变量 |
+
+**ServiceLogging 子字段**：`standardOutput`(默认journal)、`standardError`(默认journal)、`syslogIdentifier`、`logLevelMax`(emerg~debug)
+
+生成目标：`/etc/systemd/system/containerd.service.d/10-override.conf`，模板见 [service-dropin.tmpl](file:///pkg/job/builtin/containerruntime/containerd/service-dropin.tmpl)
+
+#### 3. MainConfig（config.toml 主配置）
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `metricsAddress` | string | — | Prometheus metrics 地址（如 `0.0.0.0:1338`） |
+| `root` | string | `/var/lib/containerd` | 数据根目录 |
+| `state` | string | `/run/containerd` | 运行时状态目录 |
+| `sandboxImage` | string | `registry.k8s.io/pause:3.9` | sandbox 镜像 |
+| `configPath` | string | `/etc/containerd/certs.d` | registry 配置目录 |
+| `rawTOML` | string | — | 原始 TOML（提供时忽略其他字段） |
+
+生成目标：`{directory}etc/containerd/config.toml`，模板见 [config.toml](file:///pkg/job/builtin/containerruntime/containerd/config.toml)
+
+#### 4. RegistryConfig（Registry 配置）
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `configPath` | string | `/etc/containerd/certs.d` | 配置目录 |
+| `configs` | map[string]RegistryHostConfig | — | 每个 registry 的配置 |
+
+**RegistryHostConfig 子字段**：
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `host` | string | — | registry host URL |
+| `capabilities` | []string | `["pull","resolve"]` | 允许的操作 |
+| `skipVerify` | bool | false | 跳过 TLS 验证 |
+| `plainHTTP` | bool | false | 使用 HTTP |
+| `insecure` | bool | false | 不安全连接 |
+| `overridePath` | bool | false | 路径覆盖 |
+| `tls` | TLSConfig | — | TLS 配置（caFile/certFile/keyFile/insecureSkipVerify） |
+| `auth` | RegistryAuthConfig | — | 认证（username/password/auth/identityToken/registryToken） |
+| `header` | map[string][]string | — | 自定义 headers |
+
+生成目标：`/etc/containerd/certs.d/{registry}/hosts.toml`，模板见 [hosts.toml.tmpl](file:///d:/code/github/cluster-api-provider-bke/pkg/job/builtin/containerruntime/containerd/hosts.toml.tmpl)
+
+### 五、config.toml 模板关键配置项
+
+[config.toml](file:///pkg/job/builtin/containerruntime/containerd/config.toml) 是嵌入的 Go 模板（version=3），关键可变项：
+
+| 配置项 | 模板变量 | 默认值 |
+|--------|----------|--------|
+| `root` | `{{.dataRoot}}` | `/var/lib/containerd` |
+| `state` | `{{.dataState}}` | `/run/containerd` |
+| `grpc.address` | 硬编码 | `/run/containerd/containerd.sock` |
+| `metrics.address` | `{{.metricsAddress}}` | 空（不暴露） |
+| `sandbox_image` | `{{.sandbox}}` | `{repo}/kubernetes/pause:3.9` |
+| `registry.config_path` | `{{.configPath}}` | `/etc/containerd/certs.d` |
+| `runtimes.runc.runtime_type` | 硬编码 | `io.containerd.runc.v2` |
+| `runc.options.SystemdCgroup` | 硬编码 | `true` |
+| `cni.bin_dirs` | 硬编码 | `['/opt/cni/bin']` |
+| `cni.conf_dir` | 硬编码 | `/etc/cni/net.d` |
+| `task.platforms` | `{{.platform}}` | `linux/amd64` |
+| `snapshotter` | 硬编码 | `overlayfs` |
+
+### 六、卸载/清理流程
+
+[clean.go:297-314](file:///pkg/job/builtin/reset/clean.go#L297-L314) `ContainerdCfgClean` 执行：
+```
+1. systemctl stop containerd
+2. systemctl disable containerd
+3. 删除二进制:
+   - /usr/bin/containerd
+   - /usr/bin/containerd-stress
+   - /usr/bin/containerd-shim-shimless-v2
+   - /usr/bin/containerd-shim-runc-v2
+   - /usr/bin/crictl
+   - /usr/bin/ctr
+   - /usr/bin/nerdctl
+   - /usr/local/sbin/runc
+4. 删除服务: /usr/lib/systemd/system/containerd.service
+5. 删除配置: /etc/crictl.yaml
+6. 删除目录: /etc/containerd/  (含 config.toml + certs.d/)
+7. 删除目录: /usr/local/beyondvm
+```
+
+### 七、安装产物清单
+
+| 类别 | 路径 | 来源 |
+|------|------|------|
+| **二进制** | `/usr/bin/containerd`, `/usr/bin/containerd-shim-runc-v2`, `/usr/bin/ctr`, `/usr/bin/crictl`, `/usr/bin/nerdctl`, `/usr/local/sbin/runc` | tar.gz 解压 |
+| **主配置** | `/etc/containerd/config.toml` | 模板渲染 |
+| **Registry 配置** | `/etc/containerd/certs.d/{registry}/hosts.toml` | 模板渲染 |
+| **Systemd 服务** | `/usr/lib/systemd/system/containerd.service` | tar.gz 内置 |
+| **Service Drop-in** | `/etc/systemd/system/containerd.service.d/10-override.conf` | CR 驱动生成（可选） |
+| **crictl 配置** | `/etc/crictl.yaml` | tar.gz 内置 |
+| **Socket** | `/run/containerd/containerd.sock` | 运行时生成 |
+| **数据目录** | `/var/lib/containerd` | 运行时使用 |
+| **状态目录** | `/run/containerd` | 运行时使用 |
