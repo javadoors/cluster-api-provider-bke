@@ -298,6 +298,11 @@ type ComponentVersionSpec struct {
     // 依赖关系
     Dependencies []Dependency `json:"dependencies,omitempty"`
     
+    // 子组件列表
+    // type=yaml 时: 全包含语义, 所有子组件都会被安装
+    // type=selector 时: 互斥选择语义, DAG 构建期评估 condition 选择一个子组件
+    SubComponents []SubComponent `json:"subComponents,omitempty"`
+    
     // 升级策略
     UpgradeStrategy UpgradeStrategySpec `json:"upgradeStrategy,omitempty"`
     
