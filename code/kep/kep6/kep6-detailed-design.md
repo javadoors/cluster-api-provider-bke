@@ -4759,6 +4759,14 @@ type TemplateContext struct {
     
     // 新增：自定义变量
     Variables         map[string]string
+
+    // 新增：组件级结构化数据 (通用, 任意组件可注入, 详见 8.0.1 节)
+    // 第一层 key: 组件名 (如 "containerd", "docker")
+    // 第二层 key: 语义分组 (如 "registry", "sandboxImage")
+    // value: 任意类型 (map/slice/string/bool 等)
+    // 模板引用: {{index (index .ComponentData "containerd") "registry"}}
+    // 辅助函数: {{cd "containerd" "registry"}}
+    ComponentData     map[string]map[string]interface{}
 }
 
 type ArtifactInfo struct {
@@ -4911,6 +4919,130 @@ func buildLegacyContainerdData(bkeConfig *BkeConfig) map[string]interface{} {
 | **YAML/Manifest** | ClusterName, Namespace, KubernetesVersion, OpenFuyaoVersion | 现有字段，向后兼容 |
 | **Helm** | 同上 + APIServer, ServiceCIDR 等 | 可选使用扩展字段 |
 | **Binary** | 所有字段 + ComponentData | 完整使用，包括节点基础信息、制品信息、组件结构化数据等 |
+
+#### 8.0.2 TemplateContext 实现规格
+
+**设计思路**：明确 `TemplateContext` 扩展字段的注入时机和边界条件，确保实现的一致性和可测试性。
+
+**当前代码** (`pkg/manifest/types.go`)：
+
+```go
+// TemplateContext carries cluster fields used to render component templates.
+type TemplateContext struct {
+    ClusterName       string
+    Namespace         string
+    KubernetesVersion string
+    OpenFuyaoVersion  string
+}
+```
+
+**目标代码** (`pkg/manifest/types.go`)：
+
+```go
+// TemplateContext carries cluster fields used to render component templates.
+type TemplateContext struct {
+    // 现有字段 (保持向后兼容)
+    ClusterName       string
+    Namespace         string
+    KubernetesVersion string
+    OpenFuyaoVersion  string
+    
+    // 新增：集群扩展信息 (Binary 组件需要)
+    APIServer         string
+    ServiceCIDR       string
+    PodCIDR           string
+    DNSDomain         string
+    
+    // 新增：节点基础信息 (Binary 组件需要)
+    NodeIP            string
+    NodeHostname      string
+    NodeRole          string
+    NodeArch          string  // SSH 发现后填入 (uname -m)
+    
+    // 新增：版本信息
+    ComponentVersion          string
+    ComponentPreviousVersion  string
+    
+    // 新增：制品信息 (Binary 组件需要)
+    Artifacts         map[string]*ArtifactInfo
+    
+    // 新增：镜像仓库
+    ImageRegistry     string
+    ImagePullSecret   string
+    
+    // 新增：组件级路径
+    ConfigPath        string
+    LogPath           string
+    DataPath          string
+    
+    // 新增：操作类型
+    Action            string  // "Install" / "Upgrade" / "Uninstall"
+    IsUpgrade         bool    // Action == "Upgrade" 时为 true
+    
+    // 新增：自定义变量 (用于 selector condition 评估等)
+    // 例如: ContainerRuntimeCRI, isOffline 等
+    Variables         map[string]string
+    
+    // 新增：组件级结构化数据 (通用, 任意组件可注入)
+    // 第一层 key: 组件名, 第二层 key: 语义分组
+    // 模板引用: {{cd "containerd" "registry"}}
+    ComponentData     map[string]map[string]interface{}
+}
+
+type ArtifactInfo struct {
+    Name        string
+    Path        string    // 本地缓存路径
+    URL         string
+    Checksum    string
+    Filename    string
+    InstallPath string    // 远程节点上的安装路径
+}
+```
+
+**注入时机**：
+
+| 字段组 | 注入时机 | 注入位置 | 说明 |
+|--------|---------|---------|------|
+| 基础字段 | `NewExecutionContext` 初始化时 | `pkg/dagexec/execution_context.go` | ClusterName, Namespace, KubernetesVersion, OpenFuyaoVersion |
+| 集群扩展字段 | `NewExecutionContext` 初始化时 | `pkg/dagexec/execution_context.go` | APIServer, ServiceCIDR, PodCIDR, DNSDomain |
+| `Variables` | `NewExecutionContext` 初始化时 | `pkg/dagexec/execution_context.go` | 初始化 map + 注入 ContainerRuntimeCRI |
+| `ComponentData` | `NewExecutionContext` 初始化时 | `pkg/dagexec/execution_context.go` | 初始化为空 map |
+| 节点字段 | `BinaryComponentExecutor.executePerNode` 时 | `pkg/dagexec/binary_component_executor.go` | NodeIP, NodeHostname, NodeRole, NodeArch |
+| 制品字段 | `BinaryInstaller.Install` 时 | `pkg/binaryinstaller/binary_installer.go` | Artifacts, ConfigPath, LogPath, DataPath |
+| 操作类型 | `BinaryComponentExecutor` 判断后 | `pkg/dagexec/binary_component_executor.go` | Action, IsUpgrade |
+
+**边界条件处理**：
+
+| 场景 | 处理方式 |
+|------|---------|
+| `ClusterConfig` 为 nil | Variables 和 ComponentData 仍初始化为空 map，基础字段留空 |
+| `ContainerRuntime.CRI` 为空 | 不注入 Variables["ContainerRuntimeCRI"]，但 map 仍存在 |
+| `BKECluster` 为 nil | `NewExecutionContext` 返回错误，不创建 ExecutionContext |
+| `ComponentData` 未注入 | 模板中 `index` 返回 nil，不影响现有组件（向后兼容） |
+
+**实现步骤**：
+
+1. **修改 `pkg/manifest/types.go`**
+   - 添加所有新增字段
+   - 添加 `ArtifactInfo` 结构体
+
+2. **修改 `pkg/dagexec/execution_context.go`**
+   - `NewExecutionContext` 中初始化 `Variables` 和 `ComponentData`
+   - 从 `cluster.Spec.ClusterConfig.Cluster.ContainerRuntime.CRI` 注入 `ContainerRuntimeCRI`
+   - 填充基础字段和集群扩展字段
+
+3. **修改 `pkg/dagexec/binary_component_executor.go`**
+   - `executePerNode` 中填充节点字段
+   - 判断操作类型（Install/Upgrade）并填充 Action 和 IsUpgrade
+
+4. **修改 `pkg/binaryinstaller/binary_installer.go`**
+   - `Install` 中填充制品字段和组件级路径
+
+5. **添加测试**
+   - `TestNewExecutionContext_ContainerRuntimeCRI`
+   - `TestNewExecutionContext_EmptyCRI`
+   - `TestNewExecutionContext_NilClusterConfig`
+   - `TestNewExecutionContext_ComponentDataInit`
 
 ### 8.1 模板变量系统
 
@@ -5770,14 +5902,20 @@ func (r *BKEClusterReconciler) buildExecutionContext(
     targetClient kubernetes.Interface,
 ) *dagexec.ExecutionContext {
     return dagexec.NewExecutionContext(
-        oldCluster, newCluster,
+        oldCluster,
+        newCluster,
         dagexec.NewBKENodeProvider(r.Client),
+        dagexec.NewBKENodeFilter(r.Client),
+        dagexec.NewBKENodeStatusUpdater(r.Client),
+        dagexec.NewBKEComponentStatusUpdater(r.Client),
         phaseCtx.Log,
         phaseCtx.VersionContext,                  // 复用 upgrade.VersionContext
         targetClient,
     )
 }
 ```
+
+**说明**：`buildExecutionContext` 是 controllers 层唯一接触 phaseframe 类型的地方。通过此桥接函数，`pkg/dagexec` 包完全不依赖 `pkg/phaseframe`，可独立编译测试。`NewExecutionContext` 内部自动初始化 `TemplateContext`，包括 `Variables` 和 `ComponentData` 字段，并从 `newCluster.Spec.ClusterConfig.Cluster` 提取集群信息（如 `ContainerRuntimeCRI`）。
 
 #### 9.1.4 Scheduler 初始化与执行器注入
 
@@ -6321,7 +6459,7 @@ func NewExecutionContext(
     versionContext *upgrade.VersionContext,
     targetClient kubernetes.Interface,
 ) *ExecutionContext {
-    return &ExecutionContext{
+    ctx := &ExecutionContext{
         OldCluster:             oldCluster,
         Cluster:                cluster,
         NodeProvider:           nodeProvider,
@@ -6332,6 +6470,38 @@ func NewExecutionContext(
         VersionContext:         versionContext,
         TargetClient:           targetClient,
     }
+    
+    // 初始化 TemplateContext
+    ctx.TemplateContext = manifest.TemplateContext{
+        Variables:     make(map[string]string),
+        ComponentData: make(map[string]map[string]interface{}),
+    }
+    
+    // 填充基础字段
+    if cluster != nil {
+        ctx.TemplateContext.ClusterName = cluster.Name
+        ctx.TemplateContext.Namespace = cluster.Namespace
+        
+        // 填充集群扩展字段和自定义变量
+        if cluster.Spec.ClusterConfig != nil {
+            spec := cluster.Spec.ClusterConfig.Cluster
+            ctx.TemplateContext.KubernetesVersion = spec.KubernetesVersion
+            ctx.TemplateContext.OpenFuyaoVersion = spec.OpenFuyaoVersion
+            ctx.TemplateContext.APIServer = spec.APIServer
+            ctx.TemplateContext.ServiceCIDR = spec.Networking.ServiceCIDR
+            ctx.TemplateContext.PodCIDR = spec.Networking.PodCIDR
+            ctx.TemplateContext.DNSDomain = spec.Networking.DNSDomain
+            ctx.TemplateContext.ImageRegistry = spec.ImageRepo.Domain
+            ctx.TemplateContext.ImagePullSecret = spec.ImageRepo.AuthSecretRef.Name
+            
+            // 注入 ContainerRuntimeCRI (用于 selector condition 评估)
+            if spec.ContainerRuntime.CRI != "" {
+                ctx.TemplateContext.Variables["ContainerRuntimeCRI"] = spec.ContainerRuntime.CRI
+            }
+        }
+    }
+    
+    return ctx
 }
 ```
 
@@ -10343,10 +10513,103 @@ SSH 上传配置文件 + 重启 bkeagent
 |---------|---------|---------|
 | **ArtifactDownloader** | HTTP 下载、Checksum 校验、缓存命中/未命中、架构适配 | >90% |
 | **TemplateRenderer** | 8 类变量替换、条件渲染、自定义函数、错误处理 | >90% |
-| **ConfigRenderer** | content 渲染、secretRef 获取、kubeconfig 生成 | >90% |
+| **ConfigRenderer** | content 渲染、secretRef 获取、kubeconfig 生成、forEach 动态多文件生成 | >90% |
 | **BinaryInstaller** | Install/Upgrade/Uninstall 完整流程、失败重试 | >85% |
 | **HelmInstaller** | OCI/HTTP/本地 Chart 获取、Values 渲染、Install/Upgrade/Rollback | >85% |
-| **BinaryComponentExecutor** | Rolling/Parallel/Batch 执行策略、FailurePolicy | >85% |
+| **BinaryComponentExecutor** | Rolling/Parallel/Batch 执行策略、FailurePolicy、ComponentData 注入 | >85% |
+| **ExecutionContext** | TemplateContext 初始化、Variables 注入（ContainerRuntimeCRI）、ComponentData 初始化、边界条件（nil ClusterConfig、空 CRI） | >90% |
+
+#### 14.1.1 ExecutionContext 测试用例
+
+**测试文件**: `pkg/dagexec/execution_context_test.go`
+
+| 测试名称 | 场景 | 输入 | 验证点 |
+|---------|------|------|--------|
+| `TestNewExecutionContext_ContainerRuntimeCRI` | CRI=containerd | `cluster.Spec.ClusterConfig.Cluster.ContainerRuntime.CRI = "containerd"` | `ctx.TemplateContext.Variables["ContainerRuntimeCRI"] == "containerd"` |
+| `TestNewExecutionContext_ContainerRuntimeCRI_Docker` | CRI=docker | `cluster.Spec.ClusterConfig.Cluster.ContainerRuntime.CRI = "docker"` | `ctx.TemplateContext.Variables["ContainerRuntimeCRI"] == "docker"` |
+| `TestNewExecutionContext_EmptyCRI` | CRI 为空 | `cluster.Spec.ClusterConfig.Cluster.ContainerRuntime.CRI = ""` | `ctx.TemplateContext.Variables` 不为 nil，但不包含 "ContainerRuntimeCRI" key |
+| `TestNewExecutionContext_NilClusterConfig` | ClusterConfig 为 nil | `cluster.Spec.ClusterConfig = nil` | `ctx.TemplateContext.Variables` 和 `ComponentData` 正确初始化为空 map，基础字段留空 |
+| `TestNewExecutionContext_ComponentDataInit` | 正常场景 | 完整的 BKECluster | `ctx.TemplateContext.ComponentData` 初始化为空 map，可正常写入 |
+| `TestNewExecutionContext_BasicFields` | 正常场景 | 完整的 BKECluster | `ClusterName`、`Namespace`、`KubernetesVersion`、`OpenFuyaoVersion` 正确填充 |
+| `TestNewExecutionContext_ClusterExtFields` | 正常场景 | 完整的 BKECluster | `APIServer`、`ServiceCIDR`、`PodCIDR`、`DNSDomain`、`ImageRegistry` 正确填充 |
+| `TestNewExecutionContext_NilCluster` | cluster 为 nil | `cluster = nil` | 函数不 panic，`TemplateContext` 仍正确初始化 |
+
+**测试代码示例**:
+
+```go
+func TestNewExecutionContext_ContainerRuntimeCRI(t *testing.T) {
+    cluster := &bkev1beta1.BKECluster{
+        ObjectMeta: metav1.ObjectMeta{
+            Name:      "test-cluster",
+            Namespace: "default",
+        },
+        Spec: confv1beta1.BKEClusterSpec{
+            ClusterConfig: &confv1beta1.ClusterConfig{
+                Cluster: confv1beta1.Cluster{
+                    ContainerRuntime: confv1beta1.ContainerRuntime{
+                        CRI: "containerd",
+                    },
+                },
+            },
+        },
+    }
+    
+    ctx := NewExecutionContext(
+        nil, cluster,
+        nil, nil, nil, nil,
+        nil, nil, nil,
+    )
+    
+    if ctx.TemplateContext.Variables == nil {
+        t.Fatal("Variables should be initialized")
+    }
+    if cri, ok := ctx.TemplateContext.Variables["ContainerRuntimeCRI"]; !ok {
+        t.Fatal("ContainerRuntimeCRI should be injected")
+    } else if cri != "containerd" {
+        t.Fatalf("ContainerRuntimeCRI = %q, want %q", cri, "containerd")
+    }
+}
+
+func TestNewExecutionContext_EmptyCRI(t *testing.T) {
+    cluster := &bkev1beta1.BKECluster{
+        Spec: confv1beta1.BKEClusterSpec{
+            ClusterConfig: &confv1beta1.ClusterConfig{
+                Cluster: confv1beta1.Cluster{
+                    ContainerRuntime: confv1beta1.ContainerRuntime{
+                        CRI: "",
+                    },
+                },
+            },
+        },
+    }
+    
+    ctx := NewExecutionContext(nil, cluster, nil, nil, nil, nil, nil, nil, nil)
+    
+    if ctx.TemplateContext.Variables == nil {
+        t.Fatal("Variables should be initialized")
+    }
+    if _, ok := ctx.TemplateContext.Variables["ContainerRuntimeCRI"]; ok {
+        t.Fatal("ContainerRuntimeCRI should not be injected when CRI is empty")
+    }
+}
+
+func TestNewExecutionContext_NilClusterConfig(t *testing.T) {
+    cluster := &bkev1beta1.BKECluster{
+        Spec: confv1beta1.BKEClusterSpec{
+            ClusterConfig: nil,
+        },
+    }
+    
+    ctx := NewExecutionContext(nil, cluster, nil, nil, nil, nil, nil, nil, nil)
+    
+    if ctx.TemplateContext.Variables == nil {
+        t.Fatal("Variables should be initialized even when ClusterConfig is nil")
+    }
+    if ctx.TemplateContext.ComponentData == nil {
+        t.Fatal("ComponentData should be initialized even when ClusterConfig is nil")
+    }
+}
+```
 
 ### 14.2 集成测试
 
