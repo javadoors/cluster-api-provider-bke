@@ -12,7 +12,11 @@
 
 package manifest
 
-import "context"
+import (
+	"context"
+
+	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
+)
 
 // ComponentPackage holds rendered manifests for one upgrade component.
 type ComponentPackage struct {
@@ -22,11 +26,62 @@ type ComponentPackage struct {
 }
 
 // TemplateContext carries cluster fields used to render component templates.
+//
+// 设计原则：
+// 1. Config 提供完整的集群配置访问，避免数据冗余
+// 2. Variables 提供全局变量的快捷访问（如 ContainerRuntimeCRI）
+// 3. ComponentVariables 提供组件级变量，避免与全局变量冲突
+// 4. cd 辅助函数用于访问 Config 中的嵌套数据
 type TemplateContext struct {
+	// 基础字段（保持向后兼容）
 	ClusterName       string
 	Namespace         string
 	KubernetesVersion string
 	OpenFuyaoVersion  string
+
+	// 完整配置引用（直接访问所有集群配置）
+	// 通过 cd 辅助函数访问嵌套数据：{{cd "containerd" "registry"}}
+	Config *confv1beta1.BKEConfig
+
+	// 全局变量（ExecutionContext 注入）
+	// 提供常用字段的快捷访问，例如：
+	// - ContainerRuntimeCRI: 容器运行时类型
+	// - isOffline: 是否离线模式
+	Variables map[string]string
+
+	// 组件变量（BinaryInstaller 注入）
+	// 从 ComponentVersion.Spec.Binary.Variables 读取
+	// 例如：logLevel, snapshotter 等
+	// 访问方式：{{.ComponentVariables.logLevel}}
+	ComponentVariables map[string]string
+
+	// 节点信息（BinaryInstaller 注入）
+	NodeIP       string
+	NodeHostname string
+	NodeRole     string
+	NodeArch     string // SSH 发现后填入 (uname -m)
+
+	// 制品信息（BinaryInstaller 注入）
+	Artifacts map[string]*ArtifactInfo
+
+	// 组件级路径（BinaryInstaller 注入）
+	ConfigPath string
+	LogPath    string
+	DataPath   string
+
+	// 操作类型（BinaryInstaller 注入）
+	Action    string // "Install" / "Upgrade" / "Uninstall"
+	IsUpgrade bool   // Action == "Upgrade" 时为 true
+}
+
+// ArtifactInfo 制品信息
+type ArtifactInfo struct {
+	Name        string
+	Path        string // 本地缓存路径
+	URL         string
+	Checksum    string
+	Filename    string
+	InstallPath string // 远程节点上的安装路径
 }
 
 // Store loads component manifests from OCI/bke-manifests.

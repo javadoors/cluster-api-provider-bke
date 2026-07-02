@@ -32,7 +32,6 @@
 7. [HealthCheck 共享包设计](#7-healthcheck-共享包设计)
     - 7.1 类型定义
 8. [模板变量系统与 TemplateContext 详细设计](#8-模板变量系统与-templatecontext-详细设计)
-    - 8.5 ComponentData forEach 渲染机制
 9. [DAG 集成详细设计](#9-dag-集成详细设计)
     - 9.5 状态模型、幂等性与兼容性设计
 10. [完整安装流程详细设计](#10-完整安装流程详细设计)
@@ -583,7 +582,7 @@ type ConfigTemplateSpec struct {
     
     // 迭代源路径 (点分隔, 从 TemplateContext 中解析)
     // 支持 map[string]interface{} (按 key/value 迭代) 和 []interface{} (按 index/value 迭代)
-    // 示例: "ComponentData.containerd.registry"
+    // 示例: "Config.Cluster.ContainerRuntime.Registry"
     // 详见 4.6 节 forEach 机制
     ForEach string `json:"forEach,omitempty"`
     
@@ -2684,7 +2683,7 @@ type ConfigTemplateSpec struct {
 
     // 新增：迭代源路径 (点分隔, 从 TemplateContext 中解析)
     // 支持 map[string]interface{} (按 key/value 迭代) 和 []interface{} (按 index/value 迭代)
-    // 示例: "ComponentData.containerd.registry"
+    // 示例: "Config.Cluster.ContainerRuntime.Registry"
     ForEach string `json:"forEach,omitempty"`
 }
 ```
@@ -2704,8 +2703,8 @@ type ConfigTemplateSpec struct {
 
 | forEach 值 | 解析路径 | 迭代类型 |
 |------------|---------|---------|
-| `"ComponentData.containerd.registry"` | `tmplCtx.ComponentData["containerd"]["registry"]` | `map[string]interface{}` → 按 key/value 迭代 |
-| `"ComponentData.containerd.registryList"` | `tmplCtx.ComponentData["containerd"]["registryList"]` | `[]interface{}` → 按 index/value 迭代 |
+| `"Config.Cluster.ContainerRuntime.Registry"` | `tmplCtx.Config.Cluster.ContainerRuntime.Registry` | `map[string]RegistryConfig` → 按 key/value 迭代 |
+| `"Config.Cluster.ContainerRuntime.RegistryList"` | `tmplCtx.Config.Cluster.ContainerRuntime.RegistryList` | `[]RegistryConfig` → 按 index/value 迭代 |
 
 #### 4.6.3 ForEachContext 迭代上下文
 
@@ -2732,7 +2731,7 @@ type ForEachContext struct {
 | `{{.Value}}` | ForEachContext（迭代） | `map[host:... capabilities:...]` |
 | `{{index .Value "host"}}` | 动态访问 Value 内部字段 | `harbor.example.com` |
 | `{{index .Value "capabilities"}}` | 动态访问 Value 内部字段 | `[pull resolve]` |
-| `{{cd "containerd" "root"}}` | 辅助函数访问 ComponentData | `/var/lib/containerd` |
+| `{{cd "containerd" "root"}}` | 辅助函数访问 Config | `/var/lib/containerd` |
 
 #### 4.6.4 渲染引擎核心代码
 
@@ -2795,27 +2794,13 @@ func resolveForEach(path string, tmplCtx manifest.TemplateContext) ([]ForEachIte
 
     var source interface{}
     switch parts[0] {
-    case "ComponentData":
+    case "Config":
         keys := strings.Split(parts[1], ".")
         if len(keys) < 2 {
-            return nil, fmt.Errorf("ComponentData path too short: %s", path)
+            return nil, fmt.Errorf("Config path too short: %s", path)
         }
-        m := tmplCtx.ComponentData
-        for i := 0; i < len(keys)-1; i++ {
-            next, ok := m[keys[i]]
-            if !ok {
-                return nil, fmt.Errorf("key %q not found in ComponentData", keys[i])
-            }
-            if sub, ok := next.(map[string]interface{}); ok {
-                if i == len(keys)-2 {
-                    source = sub[keys[len(keys)-1]]
-                } else {
-                    m = sub
-                }
-            } else {
-                return nil, fmt.Errorf("key %q is not a map", keys[i])
-            }
-        }
+        // 通过反射访问 Config 的嵌套字段
+        source = resolveConfigPath(tmplCtx.Config, keys...)
     default:
         return nil, fmt.Errorf("unsupported forEach root: %s", parts[0])
     }
@@ -4662,13 +4647,11 @@ type TemplateContext struct {
     // 新增：自定义变量
     Variables         map[string]string
 
-    // 新增：组件级结构化数据 (通用, 任意组件可注入, 详见 8.0.1 节)
-    // 第一层 key: 组件名 (如 "containerd", "docker")
-    // 第二层 key: 语义分组 (如 "registry", "sandboxImage")
-    // value: 任意类型 (map/slice/string/bool 等)
-    // 模板引用: {{index (index .ComponentData "containerd") "registry"}}
-    // 辅助函数: {{cd "containerd" "registry"}}
-    ComponentData     map[string]map[string]interface{}
+    // 新增：组件变量（BinaryInstaller 注入）
+    // 从 ComponentVersion.Spec.Binary.Variables 读取
+    // 例如：logLevel, snapshotter 等
+    // 访问方式：{{.ComponentVariables.logLevel}}
+    ComponentVariables map[string]string
 }
 
 type ArtifactInfo struct {
@@ -4707,148 +4690,7 @@ installScript: |
 condition: '{{.Config.Cluster.ContainerRuntime.CRI == "containerd"}}'
 ```
 
-#### 8.0.1 ComponentData 通用扩展
-
-**设计思路**：为避免 TemplateContext 膨胀为组件特定字段的集合，引入通用的 `ComponentData` 字段。任何组件都可以向 `ComponentData` 注入结构化的 `map[string]interface{}` 数据，模板通过 `index` 函数或辅助函数 `cd` 动态访问。这样 TemplateContext 保持通用性，不绑定任何特定组件。
-
-**扩展字段**：
-
-```go
-type TemplateContext struct {
-    // ... 现有字段保持不变 ...
-
-    // 新增：组件级结构化数据 (通用, 任意组件可注入)
-    // 第一层 key: 组件名 (如 "containerd", "docker")
-    // 第二层 key: 语义分组 (如 "registry", "sandboxImage")
-    // value: 任意类型 (map/slice/string/bool 等)
-    // 模板引用: {{index (index .ComponentData "containerd") "registry"}}
-    // 辅助函数: {{cd "containerd" "registry"}}
-    ComponentData map[string]map[string]interface{}
-}
-```
-
-**设计原则**：
-
-| 原则 | 说明 |
-|------|------|
-| 通用性 | `ComponentData` 不引入任何组件特定类型，任意组件可注入任意结构 |
-| 向后兼容 | 新增字段为可选，未注入时模板中 `index` 返回 nil，不影响现有组件 |
-| 命名隔离 | 第一层 key 按组件名隔离，不同组件数据互不干扰 |
-| 可组合 | 数据可嵌套任意深度，模板通过 `index` 链式访问 |
-
-**containerd 数据注入示例**：
-
-在线场景（有 ContainerdConfig CR）和离线场景（Legacy）产出相同的 `map[string]interface{}` 结构，下游模板无感知：
-
-```go
-// 在线场景: 从 ContainerdConfig CR 构建
-func buildContainerdComponentData(containerdConfigRef *ContainerdConfigRef, bkeConfig *BkeConfig) map[string]interface{} {
-    data := map[string]interface{}{
-        "registryConfigPath": "/etc/containerd/certs.d",
-        "sandboxImage":       fmt.Sprintf("%s/pause:3.9", bkeConfig.Cluster.ImageRepo.Domain),
-        "root":               "/var/lib/containerd",
-        "state":              "/run/containerd",
-    }
-
-    if containerdConfigRef != nil {
-        spec, _ := plugin.GetContainerdConfig(...)
-        if spec.Registry != nil {
-            if spec.Registry.ConfigPath != "" {
-                data["registryConfigPath"] = spec.Registry.ConfigPath
-            }
-            registryMap := make(map[string]interface{})
-            for name, cfg := range spec.Registry.Configs {
-                registryMap[name] = map[string]interface{}{
-                    "host":         cfg.Host,
-                    "capabilities": cfg.Capabilities,
-                    "skipVerify":   cfg.SkipVerify,
-                    "plainHTTP":    cfg.PlainHTTP,
-                    "insecure":     cfg.Insecure,
-                    "overridePath": cfg.OverridePath,
-                    "tls":          convertTLS(cfg.TLS),
-                    "auth":         convertAuth(cfg.Auth),
-                    "header":       cfg.Header,
-                }
-            }
-            data["registry"] = registryMap
-        }
-        if spec.Main != nil {
-            if spec.Main.SandboxImage != "" { data["sandboxImage"] = spec.Main.SandboxImage }
-            if spec.Main.Root != ""         { data["root"] = spec.Main.Root }
-            if spec.Main.State != ""        { data["state"] = spec.Main.State }
-            if spec.Main.MetricsAddress != "" { data["metricsAddress"] = spec.Main.MetricsAddress }
-        }
-    }
-    return data
-}
-
-// 离线场景 (Legacy): 从 repo + insecureRegistries 构建等价结构
-func buildLegacyContainerdData(bkeConfig *BkeConfig) map[string]interface{} {
-    repo := bkeConfig.Cluster.ImageRepo.Domain
-    registryMap := make(map[string]interface{})
-
-    // 主仓库
-    registryMap[repo] = map[string]interface{}{
-        "host":         repo,
-        "capabilities": []string{"pull", "resolve", "push"},
-        "skipVerify":   true,
-    }
-
-    // insecureRegistries → 每个都生成一个 entry
-    if insecure := bkeConfig.Cluster.InsecureRegistries; insecure != "" {
-        for _, reg := range strings.Split(insecure, ",") {
-            reg = strings.TrimSpace(reg)
-            if reg == "" { continue }
-            registryMap[reg] = map[string]interface{}{
-                "host":         reg,
-                "capabilities": []string{"pull", "resolve"},
-                "skipVerify":   true,
-                "plainHTTP":    true,
-            }
-        }
-    }
-
-    return map[string]interface{}{
-        "registryConfigPath": "/etc/containerd/certs.d",
-        "sandboxImage":       fmt.Sprintf("%s/pause:3.9", repo),
-        "root":               "/var/lib/containerd",
-        "state":              "/run/containerd",
-        "registry":           registryMap,
-    }
-}
-```
-
-**两种场景产出结构对比**：
-
-```
-在线 registry map:                          离线 registry map:
-├── "harbor.example.com"                    ├── "cr.openfuyao.cn"
-│   ├── host: "harbor.example.com"          │   ├── host: "cr.openfuyao.cn"
-│   ├── capabilities: [pull, resolve]       │   ├── capabilities: [pull, resolve, push]
-│   ├── tls: {caFile: /etc/ssl/ca.crt}      │   ├── skipVerify: true
-│   └── auth: {auth: "dXNlcjpwYXNz"}        │   └── plainHTTP: false
-├── "docker.io"                             ├── "docker.io"
-│   ├── host: "mirror.internal"             │   ├── host: "docker.io"
-│   ├── skipVerify: true                    │   ├── capabilities: [pull, resolve]
-│   └── capabilities: [pull, resolve]       │   ├── skipVerify: true
-                                            │   └── plainHTTP: true
-生成 2 个 hosts.toml                        ├── "ghcr.io"
-                                            │   ├── host: "ghcr.io"
-                                            │   ├── capabilities: [pull, resolve]
-                                            │   ├── skipVerify: true
-                                            │   └── plainHTTP: true
-                                            生成 3 个 hosts.toml
-```
-
-**使用场景对比**（更新）：
-
-| 组件类型 | 使用的字段 | 说明 |
-|---------|-----------|------|
-| **YAML/Manifest** | ClusterName, Namespace, KubernetesVersion, OpenFuyaoVersion | 现有字段，向后兼容 |
-| **Helm** | 同上 + APIServer, ServiceCIDR 等 | 可选使用扩展字段 |
-| **Binary** | 所有字段 + ComponentData | 完整使用，包括节点基础信息、制品信息、组件结构化数据等 |
-
-#### 8.0.2 TemplateContext 实现规格
+#### 8.0.1 TemplateContext 实现规格
 
 **设计思路**：明确 `TemplateContext` 扩展字段的注入时机和边界条件，确保实现的一致性和可测试性。
 
@@ -4917,10 +4759,11 @@ type TemplateContext struct {
     // 例如: ContainerRuntimeCRI, isOffline 等
     Variables         map[string]string
     
-    // 新增：组件级结构化数据 (通用, 任意组件可注入)
-    // 第一层 key: 组件名, 第二层 key: 语义分组
-    // 模板引用: {{cd "containerd" "registry"}}
-    ComponentData     map[string]map[string]interface{}
+    // 新增：组件变量（BinaryInstaller 注入）
+    // 从 ComponentVersion.Spec.Binary.Variables 读取
+    // 例如：logLevel, snapshotter 等
+    // 访问方式：{{.ComponentVariables.logLevel}}
+    ComponentVariables map[string]string
 }
 
 type ArtifactInfo struct {
@@ -4941,7 +4784,7 @@ type ArtifactInfo struct {
 | `Config` | `NewExecutionContext` 初始化时 | `pkg/dagexec/execution_context.go` | 注入完整 BKEConfig 引用 |
 | 集群扩展字段 | `NewExecutionContext` 初始化时 | `pkg/dagexec/execution_context.go` | APIServer, ServiceCIDR, PodCIDR, DNSDomain |
 | `Variables` | `NewExecutionContext` 初始化时 | `pkg/dagexec/execution_context.go` | 初始化 map + 注入 ContainerRuntimeCRI |
-| `ComponentData` | `NewExecutionContext` 初始化时 | `pkg/dagexec/execution_context.go` | 初始化为空 map |
+| `ComponentVariables` | `BinaryInstaller.Install` 时 | `pkg/binaryinstaller/binary_installer.go` | 从 binary.Variables 注入组件变量 |
 | 节点字段 | `BinaryComponentExecutor.executePerNode` 时 | `pkg/dagexec/binary_component_executor.go` | NodeIP, NodeHostname, NodeRole, NodeArch |
 | 制品字段 | `BinaryInstaller.Install` 时 | `pkg/binaryinstaller/binary_installer.go` | Artifacts, ConfigPath, LogPath, DataPath |
 | 操作类型 | `BinaryComponentExecutor` 判断后 | `pkg/dagexec/binary_component_executor.go` | Action, IsUpgrade |
@@ -4950,10 +4793,10 @@ type ArtifactInfo struct {
 
 | 场景 | 处理方式 |
 |------|---------|
-| `ClusterConfig` 为 nil | Variables 和 ComponentData 仍初始化为空 map，基础字段留空 |
+| `ClusterConfig` 为 nil | Variables 和 ComponentVariables 仍初始化为空 map，基础字段留空 |
 | `ContainerRuntime.CRI` 为空 | 不注入 Variables["ContainerRuntimeCRI"]，但 map 仍存在 |
 | `BKECluster` 为 nil | `NewExecutionContext` 返回错误，不创建 ExecutionContext |
-| `ComponentData` 未注入 | 模板中 `index` 返回 nil，不影响现有组件（向后兼容） |
+| `ComponentVariables` 未注入 | 模板中访问返回空字符串，不影响现有组件（向后兼容） |
 
 **实现步骤**：
 
@@ -4962,7 +4805,7 @@ type ArtifactInfo struct {
    - 添加 `ArtifactInfo` 结构体
 
 2. **修改 `pkg/dagexec/execution_context.go`**
-   - `NewExecutionContext` 中初始化 `Variables` 和 `ComponentData`
+   - `NewExecutionContext` 中初始化 `Variables` 和 `ComponentVariables`
    - 从 `cluster.Spec.ClusterConfig.Cluster.ContainerRuntime.CRI` 注入 `ContainerRuntimeCRI`
    - 填充基础字段和集群扩展字段
 
@@ -4977,7 +4820,7 @@ type ArtifactInfo struct {
    - `TestNewExecutionContext_ContainerRuntimeCRI`
    - `TestNewExecutionContext_EmptyCRI`
    - `TestNewExecutionContext_NilClusterConfig`
-   - `TestNewExecutionContext_ComponentDataInit`
+   - `TestNewExecutionContext_ComponentVariablesInit`
 
 ### 8.1 模板变量系统
 
@@ -5385,176 +5228,6 @@ func (r *TemplateRenderer) RenderScript(script string, tmplCtx manifest.Template
 }
 ```
 
-### 8.5 ComponentData 通用扩展与 forEach 渲染机制
-
-**设计思路**：`ComponentData` 为 TemplateContext 提供通用的组件级结构化数据注入能力。结合 `forEach` 机制，单个 `configTemplate` 可按数据条目动态展开为多个配置文件。两者配合，解决了 containerd `hosts.toml`（按 registry 数量生成多个文件）等动态多文件场景。
-
-#### 8.5.1 完整数据流
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        在线场景                                      │
-│  BKECluster.Spec.ClusterConfig.Cluster.ContainerdConfigRef          │
-│       │                                                             │
-│       ▼                                                             │
-│  ContainerdConfig CR (API Server)                                   │
-│       │                                                             │
-│       ▼                                                             │
-│  buildContainerdComponentData()                                     │
-│       │  registry: {                                                │
-│       │    "harbor.example.com": {host, capabilities, tls, auth},   │
-│       │    "docker.io": {host, skipVerify}                          │
-│       │  }                                                          │
-└───────┼─────────────────────────────────────────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                        离线场景 (Legacy)                             │
-│  BKECluster.Spec.ClusterConfig.Cluster                              │
-│       │  ImageRepo: "cr.openfuyao.cn"                               │
-│       │  InsecureRegistries: "docker.io,ghcr.io"                    │
-│       ▼                                                             │
-│  buildLegacyContainerdData()                                        │
-│       │  registry: {                                                │
-│       │    "cr.openfuyao.cn": {host, capabilities:[pull,resolve,push]},│
-│       │    "docker.io": {host, skipVerify, plainHTTP},              │
-│       │    "ghcr.io": {host, skipVerify, plainHTTP}                 │
-│       │  }                                                          │
-└───────┼─────────────────────────────────────────────────────────────┘
-        │
-        ▼  两种场景产出相同的 map[string]interface{} 结构
-┌─────────────────────────────────────────────────────────────────────┐
-│  TemplateContext.ComponentData["containerd"] = data                 │
-│       │                                                             │
-│       ▼                                                             │
-│  ConfigRenderer.renderConfigTemplates()                             │
-│       │                                                             │
-│       ├── 静态 template (无 forEach)                                 │
-│       │   └── config.toml → /etc/containerd/config.toml             │
-│       │   └── containerd.service → /etc/systemd/system/...          │
-│       │                                                             │
-│       └── 动态 template (forEach: "ComponentData.containerd.registry")│
-│           ├── Key="harbor.example.com" → .../harbor.example.com/    │
-│           │   └── hosts.toml (含 TLS/Auth)                          │
-│           └── Key="docker.io" → .../docker.io/hosts.toml            │
-│               └── hosts.toml (skipVerify=true)                      │
-│                                                                     │
-│  每次迭代: ForEachContext{TemplateContext + Key + Value}             │
-│  pathTemplate/content 可访问:                                       │
-│    - 全部 TemplateContext 变量 (.ClusterName, .NodeIP, ...)         │
-│    - 迭代变量 (.Key, .Value, index .Value "field")                  │
-│    - 辅助函数 (cd "containerd" "xxx")                               │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-#### 8.5.2 containerd ComponentVersion YAML 完整示例
-
-```yaml
-# bke-manifests/containerd/v1.7.18/component.yaml
-spec:
-  name: containerd
-  type: binary
-  version: v1.7.18
-
-  binary:
-    configTemplates:
-      # --- 静态: config.toml ---
-      - name: config.toml
-        path: "/etc/containerd/config.toml"
-        mode: "0644"
-        content: |
-          version = 2
-          root = "{{cd "containerd" "root"}}"
-          state = "{{cd "containerd" "state"}}"
-          [plugins]
-            [plugins."io.containerd.grpc.v1.cri"]
-              sandbox_image = "{{cd "containerd" "sandboxImage"}}"
-              [plugins."io.containerd.grpc.v1.cri".registry]
-                config_path = "{{cd "containerd" "registryConfigPath"}}"
-
-      # --- 静态: containerd.service ---
-      - name: containerd.service
-        path: "/etc/systemd/system/containerd.service"
-        mode: "0644"
-        content: |
-          [Unit]
-          Description=containerd container runtime
-          After=network.target
-          [Service]
-          ExecStart=/usr/local/bin/containerd
-          Restart=always
-          [Install]
-          WantedBy=multi-user.target
-
-      # --- 动态: hosts.toml (forEach 展开) ---
-      - name: hosts.toml
-        forEach: "ComponentData.containerd.registry"
-        pathTemplate: "{{cd "containerd" "registryConfigPath"}}/{{.Key}}/hosts.toml"
-        mode: "0644"
-        content: |
-          server = "https://{{.Key}}"
-          [host."https://{{index .Value "host"}}"]
-            capabilities = {{index .Value "capabilities" | toJson}}
-            skip_verify = {{index .Value "skipVerify"}}
-            {{- if index .Value "plainHTTP"}}
-            plain_http = true
-            {{- end}}
-```
-
-#### 8.5.3 模板变量速查表（ComponentData + forEach）
-
-| 变量 | 说明 | 来源 | 示例值 |
-|------|------|------|--------|
-| `{{cd "containerd" "registryConfigPath"}}` | 仓库配置根目录 | `ComponentData["containerd"]["registryConfigPath"]` | `/etc/containerd/certs.d` |
-| `{{cd "containerd" "sandboxImage"}}` | pause 镜像 | `ComponentData["containerd"]["sandboxImage"]` | `registry.example.com/pause:3.9` |
-| `{{cd "containerd" "root"}}` | 状态目录 | `ComponentData["containerd"]["root"]` | `/var/lib/containerd` |
-| `{{cd "containerd" "state"}}` | 运行时目录 | `ComponentData["containerd"]["state"]` | `/run/containerd` |
-| `{{cd "containerd" "metricsAddress"}}` | 指标地址 | `ComponentData["containerd"]["metricsAddress"]` | `0.0.0.0:1338` |
-| `{{.Key}}` (forEach 内) | 当前迭代 key | ForEachContext.Key | `harbor.example.com` |
-| `{{.Value}}` (forEach 内) | 当前迭代 value | ForEachContext.Value | `map[host:... capabilities:...]` |
-| `{{index .Value "host"}}` (forEach 内) | 仓库主机 | ForEachContext.Value["host"] | `harbor.example.com` |
-| `{{index .Value "capabilities"}}` (forEach 内) | 允许操作 | ForEachContext.Value["capabilities"] | `["pull","resolve"]` |
-| `{{index .Value "skipVerify"}}` (forEach 内) | 跳过 TLS | ForEachContext.Value["skipVerify"] | `true` |
-| `{{index .Value "tls"}}` (forEach 内) | TLS 配置 | ForEachContext.Value["tls"] | `map[caFile:... certFile:...]` |
-| `{{index .Value "auth"}}` (forEach 内) | 认证配置 | ForEachContext.Value["auth"] | `map[auth:...]` |
-| `{{.ClusterName}}` (forEach 内) | 集群名称 | TemplateContext.ClusterName (嵌入) | `my-cluster` |
-| `{{.NodeIP}}` (forEach 内) | 节点 IP | TemplateContext.NodeIP (嵌入) | `192.168.1.10` |
-
-#### 8.5.4 cd 辅助函数
-
-```go
-// 在 ConfigRenderer.funcMap 中注册
-funcMap := template.FuncMap{
-    // ... 现有函数 ...
-
-    // cd: ComponentData 便捷访问函数
-    // 用法: {{cd "containerd" "registry"}}
-    // 等价于: {{index (index .ComponentData "containerd") "registry"}}
-    "cd": func(keys ...string) interface{} {
-        return resolveNestedPath(tmplCtx.ComponentData, keys...)
-    },
-}
-
-// resolveNestedPath 按路径逐层取值
-func resolveNestedPath(data map[string]map[string]interface{}, keys ...string) interface{} {
-    if len(keys) < 1 { return nil }
-    m, ok := data[keys[0]]
-    if !ok { return nil }
-    if len(keys) == 1 { return m }
-    var current interface{} = m
-    for _, key := range keys[1:] {
-        switch v := current.(type) {
-        case map[string]interface{}:
-            current, ok = v[key]
-            if !ok { return nil }
-        default:
-            return nil
-        }
-    }
-    return current
-}
-```
-
 ---
 
 ## 9. DAG 集成详细设计
@@ -5850,7 +5523,7 @@ func (r *BKEClusterReconciler) buildExecutionContext(
 }
 ```
 
-**说明**：`buildExecutionContext` 是 controllers 层唯一接触 phaseframe 类型的地方。通过此桥接函数，`pkg/dagexec` 包完全不依赖 `pkg/phaseframe`，可独立编译测试。`NewExecutionContext` 内部自动初始化 `TemplateContext`，包括 `Variables` 和 `ComponentData` 字段，并从 `newCluster.Spec.ClusterConfig.Cluster` 提取集群信息（如 `ContainerRuntimeCRI`）。
+**说明**：`buildExecutionContext` 是 controllers 层唯一接触 phaseframe 类型的地方。通过此桥接函数，`pkg/dagexec` 包完全不依赖 `pkg/phaseframe`，可独立编译测试。`NewExecutionContext` 内部自动初始化 `TemplateContext`，包括 `Variables` 和 `ComponentVariables` 字段，并从 `newCluster.Spec.ClusterConfig.Cluster` 提取集群信息（如 `ContainerRuntimeCRI`）。
 
 #### 9.1.4 Scheduler 初始化与执行器注入
 
@@ -6408,8 +6081,8 @@ func NewExecutionContext(
     
     // 初始化 TemplateContext
     ctx.TemplateContext = manifest.TemplateContext{
-        Variables:     make(map[string]string),
-        ComponentData: make(map[string]map[string]interface{}),
+        Variables:          make(map[string]string),
+        ComponentVariables: make(map[string]string),
     }
     
     // 填充基础字段
@@ -6676,13 +6349,6 @@ func (e *BinaryComponentExecutor) ExecuteComponent(ctx context.Context, node *Co
     if len(targetNodes) == 0 {
         execCtx.Log.Info("component %s: all nodes already at target version, skipping", component.Name)
         return nil
-    }
-
-    // 5.5 🆕 ComponentData 注入 (NodeFilter 之后、策略执行之前)
-    //     确保 configTemplates 中的 forEach 和 cd() 能访问组件结构化数据
-    //     完整实现见 9.5.11.2 节
-    if err := e.injectComponentData(ctx, cv, execCtx); err != nil {
-        return fmt.Errorf("inject component data for %s: %w", component.Name, err)
     }
     
     // 6. 根据升级策略执行
@@ -8386,7 +8052,7 @@ Feature Gate OFF → ON (再次开启):
 
 #### 9.5.11 扩容场景增强设计
 
-**设计思路**：节点扩容（Scale-Out）是集群生命周期中的高频操作。新节点加入时，需要依次完成 bkeagent 推送、containerd 安装、环境初始化、kubeadm join 四个阶段。上述 9.5.1-9.5.10 的设计已覆盖基本的幂等和过滤逻辑，但在以下三个边界场景存在增强空间：① bkeagent 安装完成后 HealthCheck 与 `NodeAgentReadyFlag` 的衔接；② `ComponentData` 在 `ExecuteComponent` 中的注入时机；③ 扩容与升级同时触发时的幂等保护。
+**设计思路**：节点扩容（Scale-Out）是集群生命周期中的高频操作。新节点加入时，需要依次完成 bkeagent 推送、containerd 安装、环境初始化、kubeadm join 四个阶段。上述 9.5.1-9.5.10 的设计已覆盖基本的幂等和过滤逻辑，但在以下两个边界场景存在增强空间：① bkeagent 安装完成后 HealthCheck 与 `NodeAgentReadyFlag` 的衔接；② 扩容与升级同时触发时的幂等保护。
 
 ##### 9.5.11.1 增强 1：bkeagent 就绪状态同步
 
@@ -8454,107 +8120,6 @@ DAG Batch 1: bkeagent (binary)
 DAG Batch 2: containerd (binary, 依赖 bkeagent)     │
   此时 NodeAgentReadyFlag 已设置                     │
   EnsureNodesEnv 检查通过 ←─────────────────────────┘
-```
-
-##### 9.5.11.2 增强 2：ComponentData 显式注入
-
-**问题**：containerd 的 `forEach hosts.toml` 依赖 `TemplateContext.ComponentData["containerd"]["registry"]`。Section 8.0.1 已定义了 `buildContainerdComponentData()` 和 `buildLegacyContainerdData()` 两个数据构建函数，但 `BinaryComponentExecutor.ExecuteComponent()` 的调用链中未显式标注注入时机。
-
-**增强方案**：在 `ExecuteComponent` 步骤 5（NodeFilter）和步骤 6（策略执行）之间，增加 ComponentData 注入步骤。
-
-```go
-// ExecuteComponent 增强 (在现有步骤 5 和 6 之间插入步骤 5.5)
-func (e *BinaryComponentExecutor) ExecuteComponent(ctx context.Context, node *ComponentNode, execCtx *ExecutionContext) error {
-    // ... 步骤 1-5 保持不变 (获取 CV、幂等判断、获取节点、NodeFilter) ...
-
-    // 5.5 🆕 ComponentData 注入 (在 NodeFilter 之后、策略执行之前)
-    //     确保 configTemplates 中的 forEach 和 cd() 函数能访问组件结构化数据
-    if err := e.injectComponentData(ctx, cv, execCtx); err != nil {
-        return fmt.Errorf("inject component data for %s: %w", cv.Spec.Name, err)
-    }
-
-    // 6. 根据升级策略执行 (现有逻辑，不变)
-    strategy := cv.Spec.UpgradeStrategy
-    switch strategy.Mode {
-    case "Rolling":
-        return e.executeRolling(ctx, targetNodes, cv, strategy, execCtx)
-    // ...
-    }
-    return nil
-}
-
-// injectComponentData 按组件名注入 ComponentData 到 TemplateContext
-// 仅对需要结构化数据的组件执行注入，其他组件跳过 (零开销)
-func (e *BinaryComponentExecutor) injectComponentData(
-    ctx context.Context,
-    cv *configv1alpha1.ComponentVersion,
-    execCtx *ExecutionContext,
-) error {
-    if execCtx.TemplateContext.ComponentData == nil {
-        execCtx.TemplateContext.ComponentData = make(map[string]map[string]interface{})
-    }
-
-    switch cv.Spec.Name {
-    case "containerd":
-        data, err := e.buildContainerdComponentData(ctx, execCtx)
-        if err != nil {
-            return err
-        }
-        execCtx.TemplateContext.ComponentData["containerd"] = data
-    // 后续其他组件可在此扩展:
-    // case "docker":
-    //     execCtx.TemplateContext.ComponentData["docker"] = e.buildDockerComponentData(ctx, execCtx)
-    default:
-        // 无需注入的组件，直接返回
-        return nil
-    }
-    return nil
-}
-
-// buildContainerdComponentData 构建 containerd 的 ComponentData
-// 优先从 ContainerdConfig CR 获取 (在线场景)，回退到 Legacy 参数 (离线场景)
-// 数据来源: BKECluster.Spec.ClusterConfig.Cluster.ContainerdConfigRef
-func (e *BinaryComponentExecutor) buildContainerdComponentData(
-    ctx context.Context,
-    execCtx *ExecutionContext,
-) (map[string]interface{}, error) {
-    clusterCfg := execCtx.Cluster.Spec.ClusterConfig.Cluster
-
-    // 在线场景: 有 ContainerdConfigRef
-    if clusterCfg.ContainerdConfigRef != nil {
-        spec, err := plugin.GetContainerdConfig(
-            fmt.Sprintf("%s:%s", clusterCfg.ContainerdConfigRef.Namespace, clusterCfg.ContainerdConfigRef.Name))
-        if err != nil {
-            return nil, fmt.Errorf("get containerd config: %w", err)
-        }
-        return convertContainerdConfigSpecToComponentData(spec, clusterCfg)
-    }
-
-    // 离线场景 (Legacy): 从 repo + insecureRegistries 构建等价结构
-    return buildLegacyContainerdData(clusterCfg), nil
-}
-```
-
-**注入时序**：
-
-```
-ExecuteComponent()
-  │
-  ├─ 步骤 1-4: 获取 CV、幂等判断、获取节点、NodeFilter
-  │   (此时 TemplateContext.ComponentData 可能为空)
-  │
-  ├─ 步骤 5.5: injectComponentData()  ← 🆕增强
-  │   └─ containerd → buildContainerdComponentData()
-  │       ├─ 在线: GetContainerdConfig(CR) → registry map
-  │       └─ 离线: buildLegacyContainerdData() → registry map
-  │   └─ TemplateContext.ComponentData["containerd"] = data
-  │
-  └─ 步骤 6: 策略执行 (Rolling/Parallel/Batch)
-      └─ 每个节点:
-          └─ BinaryInstaller.Install()
-              └─ ConfigRenderer.renderConfigTemplates()
-                  └─ forEach: ComponentData["containerd"]["registry"]
-                      → 展开为多个 hosts.toml
 ```
 
 ##### 9.5.11.3 增强 3：扩容+升级并发幂等保护
@@ -9346,12 +8911,12 @@ spec:
 
 #### 12.3.2.1 containerd 配置模板 (含 forEach hosts.toml)
 
-**设计思路**：containerd 组件的 `configTemplates` 包含两类配置文件：静态文件（config.toml、containerd.service，各一个）和动态文件（hosts.toml，按 registry 数量生成多个）。动态文件通过 `forEach` 机制展开，迭代源为 `ComponentData.containerd.registry`。在线场景（ContainerdConfig CR）和离线场景（Legacy repo + insecureRegistries）由 BinaryInstaller 统一转换为相同的 `map[string]interface{}` 结构，模板无感知。
+**设计思路**：containerd 组件的 `configTemplates` 包含两类配置文件：静态文件（config.toml、containerd.service，各一个）和动态文件（hosts.toml，按 registry 数量生成多个）。动态文件通过 `forEach` 机制展开，迭代源为 `Config.Cluster.ContainerRuntime.Registry`。在线场景（ContainerdConfig CR）和离线场景（Legacy repo + insecureRegistries）由 BinaryInstaller 统一转换为相同的 `map[string]interface{}` 结构，模板无感知。
 
 **在线场景 registry 数据**（来自 ContainerdConfig CR → RegistryConfig.Configs）：
 
 ```yaml
-# ComponentData["containerd"]["registry"] 的内容
+# Config.Cluster.ContainerRuntime.Registry 的内容
 harbor.example.com:
   host: "harbor.example.com"
   capabilities: ["pull", "resolve"]
@@ -9377,7 +8942,7 @@ docker.io:
 **离线场景 registry 数据**（来自 BKECluster.Spec.ClusterConfig.Cluster.ImageRepo + InsecureRegistries）：
 
 ```yaml
-# ComponentData["containerd"]["registry"] 的内容
+# Config.Cluster.ContainerRuntime.Registry 的内容
 cr.openfuyao.cn:
   host: "cr.openfuyao.cn"
   capabilities: ["pull", "resolve", "push"]
@@ -9438,8 +9003,8 @@ configTemplates:
 
   # --- 动态: hosts.toml (forEach 展开, 每个 registry 一个文件) ---
   - name: hosts.toml
-    forEach: "ComponentData.containerd.registry"
-    pathTemplate: "{{cd "containerd" "registryConfigPath"}}/{{.Key}}/hosts.toml"
+    forEach: "Config.Cluster.ContainerRuntime.Registry"
+    pathTemplate: "/etc/containerd/certs.d/{{.Key}}/hosts.toml"
     mode: "0644"
     content: |
       server = "https://{{.Key}}"
@@ -9466,23 +9031,23 @@ configTemplates:
         {{- end}}
 ```
 
-**字段映射表（旧代码 → 新 ComponentData）**：
+**字段映射表（旧代码 → 新 Config）**：
 
-| 旧代码（bkeagent 内部） | 新 ComponentData 字段 | 数据来源 |
+| 旧代码（bkeagent 内部） | 新 Config 字段 | 数据来源 |
 |------------------------|----------------------|---------|
-| `runtimeParam["repo"]` | `ComponentData["containerd"]["registry"][repo]["host"]` | ContainerdConfig CR 或 BKECluster.ImageRepo |
-| `runtimeParam["sandbox"]` | `ComponentData["containerd"]["sandboxImage"]` | ContainerdConfig CR.Main.SandboxImage |
-| `runtimeParam["dataRoot"]` | `ComponentData["containerd"]["root"]` | ContainerdConfig CR.Main.Root |
-| `runtimeParam["insecureRegistries"]` | `ComponentData["containerd"]["registry"][*]["skipVerify"]=true` | ContainerdConfig CR.Registry.Configs |
-| `runtimeParam["containerdConfig"]` | 整个 `ComponentData["containerd"]` | BKECluster.Spec.ClusterConfig.Cluster.ContainerdConfigRef |
-| `createHostsTOML()` 循环 | `forEach: "ComponentData.containerd.registry"` | ConfigRenderer 展开 |
-| `generateHostsToml()` → `GenerateMultipleHostsTOML()` | `forEach: "ComponentData.containerd.registry"` | ConfigRenderer 展开 |
+| `runtimeParam["repo"]` | `Config.Cluster.ContainerRuntime.Registry[repo].Host` | ContainerdConfig CR 或 BKECluster.ImageRepo |
+| `runtimeParam["sandbox"]` | `Config.Cluster.ContainerRuntime.SandboxImage` | ContainerdConfig CR.Main.SandboxImage |
+| `runtimeParam["dataRoot"]` | `Config.Cluster.ContainerRuntime.Root` | ContainerdConfig CR.Main.Root |
+| `runtimeParam["insecureRegistries"]` | `Config.Cluster.ContainerRuntime.Registry[*].SkipVerify=true` | ContainerdConfig CR.Registry.Configs |
+| `runtimeParam["containerdConfig"]` | 整个 `Config.Cluster.ContainerRuntime` | BKECluster.Spec.ClusterConfig.Cluster.ContainerdConfigRef |
+| `createHostsTOML()` 循环 | `forEach: "Config.Cluster.ContainerRuntime.Registry"` | ConfigRenderer 展开 |
+| `generateHostsToml()` → `GenerateMultipleHostsTOML()` | `forEach: "Config.Cluster.ContainerRuntime.Registry"` | ConfigRenderer 展开 |
 
 **等价性验证点**：
 
 | 验证项 | 旧路径 | 新路径 (forEach) | 验证方法 |
 |--------|--------|-----------------|---------|
-| hosts.toml 数量 | `len(registries)` 个 | `len(ComponentData["containerd"]["registry"])` 个 | 对比文件数量 |
+| hosts.toml 数量 | `len(registries)` 个 | `len(Config.Cluster.ContainerRuntime.Registry)` 个 | 对比文件数量 |
 | hosts.toml 路径 | `/etc/containerd/certs.d/<reg>/hosts.toml` | `pathTemplate` 渲染结果 | 对比文件路径 |
 | hosts.toml 内容 | `hosts_toml.go` 生成 | `configTemplates[*].content` 渲染 | `diff` 对比两份输出 |
 | 在线/离线一致性 | 两套独立代码路径 | 同一份 YAML，数据注入不同 | 相同 registry 输入，输出文件一致 |
@@ -10454,8 +10019,8 @@ SSH 上传配置文件 + 重启 bkeagent
 | **ConfigRenderer** | content 渲染、secretRef 获取、kubeconfig 生成、forEach 动态多文件生成 | >90% |
 | **BinaryInstaller** | Install/Upgrade/Uninstall 完整流程、失败重试 | >85% |
 | **HelmInstaller** | OCI/HTTP/本地 Chart 获取、Values 渲染、Install/Upgrade/Rollback | >85% |
-| **BinaryComponentExecutor** | Rolling/Parallel/Batch 执行策略、FailurePolicy、ComponentData 注入 | >85% |
-| **ExecutionContext** | TemplateContext 初始化、Variables 注入（ContainerRuntimeCRI）、ComponentData 初始化、边界条件（nil ClusterConfig、空 CRI） | >90% |
+| **BinaryComponentExecutor** | Rolling/Parallel/Batch 执行策略、FailurePolicy、ComponentVariables 注入 | >85% |
+| **ExecutionContext** | TemplateContext 初始化、Variables 注入（ContainerRuntimeCRI）、ComponentVariables 初始化、边界条件（nil ClusterConfig、空 CRI） | >90% |
 
 #### 14.1.1 ExecutionContext 测试用例
 
@@ -10466,8 +10031,8 @@ SSH 上传配置文件 + 重启 bkeagent
 | `TestNewExecutionContext_ContainerRuntimeCRI` | CRI=containerd | `cluster.Spec.ClusterConfig.Cluster.ContainerRuntime.CRI = "containerd"` | `ctx.TemplateContext.Variables["ContainerRuntimeCRI"] == "containerd"` |
 | `TestNewExecutionContext_ContainerRuntimeCRI_Docker` | CRI=docker | `cluster.Spec.ClusterConfig.Cluster.ContainerRuntime.CRI = "docker"` | `ctx.TemplateContext.Variables["ContainerRuntimeCRI"] == "docker"` |
 | `TestNewExecutionContext_EmptyCRI` | CRI 为空 | `cluster.Spec.ClusterConfig.Cluster.ContainerRuntime.CRI = ""` | `ctx.TemplateContext.Variables` 不为 nil，但不包含 "ContainerRuntimeCRI" key |
-| `TestNewExecutionContext_NilClusterConfig` | ClusterConfig 为 nil | `cluster.Spec.ClusterConfig = nil` | `ctx.TemplateContext.Variables` 和 `ComponentData` 正确初始化为空 map，基础字段留空 |
-| `TestNewExecutionContext_ComponentDataInit` | 正常场景 | 完整的 BKECluster | `ctx.TemplateContext.ComponentData` 初始化为空 map，可正常写入 |
+| `TestNewExecutionContext_NilClusterConfig` | ClusterConfig 为 nil | `cluster.Spec.ClusterConfig = nil` | `ctx.TemplateContext.Variables` 和 `ComponentVariables` 正确初始化为空 map，基础字段留空 |
+| `TestNewExecutionContext_ComponentVariablesInit` | 正常场景 | 完整的 BKECluster | `ctx.TemplateContext.ComponentVariables` 初始化为空 map，可正常写入 |
 | `TestNewExecutionContext_BasicFields` | 正常场景 | 完整的 BKECluster | `ClusterName`、`Namespace`、`KubernetesVersion`、`OpenFuyaoVersion` 正确填充 |
 | `TestNewExecutionContext_ClusterExtFields` | 正常场景 | 完整的 BKECluster | `APIServer`、`ServiceCIDR`、`PodCIDR`、`DNSDomain`、`ImageRegistry` 正确填充 |
 | `TestNewExecutionContext_NilCluster` | cluster 为 nil | `cluster = nil` | 函数不 panic，`TemplateContext` 仍正确初始化 |
@@ -10545,8 +10110,8 @@ func TestNewExecutionContext_NilClusterConfig(t *testing.T) {
     if ctx.TemplateContext.Variables == nil {
         t.Fatal("Variables should be initialized even when ClusterConfig is nil")
     }
-    if ctx.TemplateContext.ComponentData == nil {
-        t.Fatal("ComponentData should be initialized even when ClusterConfig is nil")
+    if ctx.TemplateContext.ComponentVariables == nil {
+        t.Fatal("ComponentVariables should be initialized even when ClusterConfig is nil")
     }
     if ctx.TemplateContext.Config != nil {
         t.Fatal("Config should be nil when ClusterConfig is nil")
