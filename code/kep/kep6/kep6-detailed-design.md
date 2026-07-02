@@ -570,8 +570,21 @@ type ConfigTemplateSpec struct {
     // 模板名称
     Name string `json:"name"`
     
-    // 目标路径
-    Path string `json:"path"`
+    // 静态目标路径 (与 PathTemplate 互斥)
+    // ForEach 为空时使用此字段指定固定路径
+    Path string `json:"path,omitempty"`
+    
+    // 动态路径模板 (Go template, 与 ForEach 配合使用)
+    // ForEach 不为空时使用此字段动态生成路径
+    // 渲染时可访问全部 TemplateContext 变量 + 迭代变量 (.Key, .Value)
+    // 示例: "{{cd "containerd" "registryConfigPath"}}/{{.Key}}/hosts.toml"
+    PathTemplate string `json:"pathTemplate,omitempty"`
+    
+    // 迭代源路径 (点分隔, 从 TemplateContext 中解析)
+    // 支持 map[string]interface{} (按 key/value 迭代) 和 []interface{} (按 index/value 迭代)
+    // 示例: "ComponentData.containerd.registry"
+    // 详见 4.6 节 forEach 机制
+    ForEach string `json:"forEach,omitempty"`
     
     // 文件权限 (如 "0644")
     Mode string `json:"mode,omitempty"`
@@ -595,22 +608,12 @@ type ConfigTemplateSpec struct {
     Condition string `json:"condition,omitempty"`
 }
 
-> **🆕扩展说明**：`ConfigTemplateSpec` 新增 `PathTemplate` 和 `ForEach` 两个字段，支持动态多文件生成（详见 4.6 节）：
->
-> ```go
-> // 新增：动态路径模板 (Go template, 与 ForEach 配合使用)
-> // 渲染时可访问全部 TemplateContext 变量 + 迭代变量 (.Key, .Value)
-> PathTemplate string `json:"pathTemplate,omitempty"`
->
-> // 新增：迭代源路径 (点分隔, 从 TemplateContext 中解析)
-> // 示例: "ComponentData.containerd.registry"
-> ForEach string `json:"forEach,omitempty"`
-> ```
->
-> | 条件 | 说明 |
-> |------|------|
-> | `ForEach != ""` | `PathTemplate` 必填，`Path` 忽略，按迭代源展开为多个文件 |
-> | `ForEach == ""` | `Path` 必填，`PathTemplate` 忽略（原有行为，单文件） |
+**字段约束**：
+
+| 条件 | 说明 |
+|------|------|
+| `ForEach != ""` | `PathTemplate` 必填，`Path` 忽略，按迭代源展开为多个文件 |
+| `ForEach == ""` | `Path` 必填，`PathTemplate` 忽略（原有行为，单文件） |
 
 // SecretRefSpec 定义 Secret 引用规格
 type SecretRefSpec struct {
