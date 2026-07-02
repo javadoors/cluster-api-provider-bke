@@ -30,6 +30,7 @@
     - 6.5 健康检查
     - 6.6 YAML Uninstall 流程
 7. [HealthCheck 共享包设计](#7-healthcheck-共享包设计)
+    - 7.1 类型定义
 8. [模板变量系统与 TemplateContext 详细设计](#8-模板变量系统与-templatecontext-详细设计)
     - 8.5 ComponentData forEach 渲染机制
 9. [DAG 集成详细设计](#9-dag-集成详细设计)
@@ -686,7 +687,7 @@ type YAMLSpec struct {
     PruneLabelSelector map[string]string `json:"pruneLabelSelector,omitempty"`
     
     // 健康检查配置 (应用清单后验证 Pod/Endpoint 就绪)
-    // 复用 Helm 的 HealthCheckSpec, 因为两者都部署 K8s 资源, 检查机制一致
+    // 类型定义见第 7 章 HealthCheck 共享包设计 (7.1 节)
     HealthCheck *HealthCheckSpec `json:"healthCheck,omitempty"`
 }
 
@@ -724,6 +725,7 @@ type HelmSpec struct {
     Strategy HelmStrategySpec `json:"strategy,omitempty"`
     
     // 健康检查配置
+    // 类型定义见第 7 章 HealthCheck 共享包设计 (7.1 节)
     HealthCheck HealthCheckSpec `json:"healthCheck,omitempty"`
     
     // 回滚配置
@@ -800,67 +802,10 @@ type HelmStrategySpec struct {
     CleanupOnFail bool `json:"cleanupOnFail,omitempty"`
 }
 
-// HealthCheckSpec 定义健康检查规格
-type HealthCheckSpec struct {
-    // 是否启用健康检查
-    Enabled bool `json:"enabled"`
-    
-    // 健康检查超时时间
-    Timeout string `json:"timeout,omitempty"`
-    
-    // 健康检查间隔
-    Interval string `json:"interval,omitempty"`
-    
-    // 健康检查项列表
-    Checks []HealthCheckItemSpec `json:"checks,omitempty"`
-}
-
-// HealthCheckItemSpec 定义健康检查项规格
-// 按检查类型嵌套子结构体, 消除 Name 字段双重含义 (与 ConfigTemplateSpec 模式一致)
-// Type 决定使用哪个子结构体, 其他子结构体应为 nil
-type HealthCheckItemSpec struct {
-    // 检查类型: PodReady / EndpointReady / Custom
-    Type string `json:"type"`
-    
-    // PodReady 检查配置 (type=PodReady 时使用)
-    PodReady *PodReadyCheckSpec `json:"podReady,omitempty"`
-    
-    // EndpointReady 检查配置 (type=EndpointReady 时使用)
-    EndpointReady *EndpointReadyCheckSpec `json:"endpointReady,omitempty"`
-    
-    // Custom 检查配置 (type=Custom 时使用)
-    Custom *CustomCheckSpec `json:"custom,omitempty"`
-}
-
-// PodReadyCheckSpec 定义 Pod 就绪检查规格
-type PodReadyCheckSpec struct {
-    // 命名空间
-    Namespace string `json:"namespace"`
-    
-    // 标签选择器 (如 "k8s-app=kube-dns")
-    LabelSelector string `json:"labelSelector"`
-    
-    // 最小就绪数量 (0=要求全部 Ready, 1=至少 1 个 Ready)
-    MinReady int32 `json:"minReady,omitempty"`
-}
-
-// EndpointReadyCheckSpec 定义 Endpoint 就绪检查规格
-type EndpointReadyCheckSpec struct {
-    // 命名空间
-    Namespace string `json:"namespace"`
-    
-    // Service 名称
-    ServiceName string `json:"serviceName"`
-    
-    // 端口 (可选, 检查特定端口是否就绪)
-    Port int32 `json:"port,omitempty"`
-}
-
-// CustomCheckSpec 定义自定义检查规格
-type CustomCheckSpec struct {
-    // 检查命令 (在控制器 Pod 中执行, 退出码 0=通过, 如 "curl -s http://.../healthz")
-    Command string `json:"command"`
-}
+// 健康检查相关类型定义见第 7 章 HealthCheck 共享包设计 (7.1 节)
+// HealthCheckSpec / HealthCheckItemSpec / PodReadyCheckSpec /
+// EndpointReadyCheckSpec / CustomCheckSpec
+// HelmSpec 通过引用 pkg/healthcheck 包中的类型使用
 
 // RollbackSpec 定义回滚规格
 type RollbackSpec struct {
@@ -4684,6 +4629,76 @@ func checkCustom(ctx context.Context, spec *CustomCheckSpec) (bool, error) {
 **调用方**：
 - `HelmInstaller.runHealthCheck`（5.3）：`return healthcheck.Run(ctx, i.clientset, hc)`
 - `YamlInstaller.Apply`（6.3）：`healthcheck.Run(ctx, execCtx.TargetClient, *cv.Spec.YAML.HealthCheck)`
+
+### 7.1 类型定义
+
+**设计思路**：健康检查类型定义独立于具体 Installer，供 Helm/YAML 组件共用。CRD 字段类型引用此处的定义，避免在多处重复定义。
+
+```go
+// pkg/healthcheck/types.go
+
+// HealthCheckSpec 定义健康检查规格
+type HealthCheckSpec struct {
+    // 是否启用健康检查
+    Enabled bool `json:"enabled"`
+    
+    // 健康检查超时时间
+    Timeout string `json:"timeout,omitempty"`
+    
+    // 健康检查间隔
+    Interval string `json:"interval,omitempty"`
+    
+    // 健康检查项列表
+    Checks []HealthCheckItemSpec `json:"checks,omitempty"`
+}
+
+// HealthCheckItemSpec 定义健康检查项规格
+// 按检查类型嵌套子结构体, 消除 Name 字段双重含义 (与 ConfigTemplateSpec 模式一致)
+// Type 决定使用哪个子结构体, 其他子结构体应为 nil
+type HealthCheckItemSpec struct {
+    // 检查类型: PodReady / EndpointReady / Custom
+    Type string `json:"type"`
+    
+    // PodReady 检查配置 (type=PodReady 时使用)
+    PodReady *PodReadyCheckSpec `json:"podReady,omitempty"`
+    
+    // EndpointReady 检查配置 (type=EndpointReady 时使用)
+    EndpointReady *EndpointReadyCheckSpec `json:"endpointReady,omitempty"`
+    
+    // Custom 检查配置 (type=Custom 时使用)
+    Custom *CustomCheckSpec `json:"custom,omitempty"`
+}
+
+// PodReadyCheckSpec 定义 Pod 就绪检查规格
+type PodReadyCheckSpec struct {
+    // 命名空间
+    Namespace string `json:"namespace"`
+    
+    // 标签选择器 (如 "k8s-app=kube-dns")
+    LabelSelector string `json:"labelSelector"`
+    
+    // 最小就绪数量 (0=要求全部 Ready, 1=至少 1 个 Ready)
+    MinReady int32 `json:"minReady,omitempty"`
+}
+
+// EndpointReadyCheckSpec 定义 Endpoint 就绪检查规格
+type EndpointReadyCheckSpec struct {
+    // 命名空间
+    Namespace string `json:"namespace"`
+    
+    // Service 名称
+    ServiceName string `json:"serviceName"`
+    
+    // 端口 (可选, 检查特定端口是否就绪)
+    Port int32 `json:"port,omitempty"`
+}
+
+// CustomCheckSpec 定义自定义检查规格
+type CustomCheckSpec struct {
+    // 检查命令 (在控制器 Pod 中执行, 退出码 0=通过, 如 "curl -s http://.../healthz")
+    Command string `json:"command"`
+}
+```
 
 ---
 
