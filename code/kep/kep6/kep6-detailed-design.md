@@ -1554,6 +1554,26 @@ spec:
                       type: string
                     failurePolicy:
                       type: string
+                nodeFilter:
+                  type: object
+                  description: "Binary 组件的节点过滤策略 (安装和升级共用)"
+                  properties:
+                    roles:
+                      type: array
+                      description: "目标节点角色列表 (空或不填 = 所有角色)"
+                      items:
+                        type: string
+                    matchLabels:
+                      type: object
+                      description: "节点标签选择器 (等值匹配)"
+                      additionalProperties:
+                        type: string
+                    skipCompleted:
+                      type: boolean
+                      description: "是否跳过已完成的节点 (默认: true)"
+                    excludeAppointment:
+                      type: boolean
+                      description: "是否排除预约添加的节点 (默认: true)"
                 resources:
                   type: array
                   items:
