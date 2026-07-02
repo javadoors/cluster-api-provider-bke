@@ -4715,11 +4715,17 @@ type TemplateContext struct {
 **扩展后的 TemplateContext**：
 ```go
 type TemplateContext struct {
-    // 现有字段 (保持向后兼容)
+    // 现有字段 (保持向后兼容，快捷访问)
     ClusterName       string
     Namespace         string
     KubernetesVersion string
     OpenFuyaoVersion  string
+    
+    // 新增：完整配置引用 (通用性与可扩展性)
+    // 注入 BKEConfig，模板可访问任意配置字段
+    // 简单场景使用快捷字段: {{.ClusterName}}
+    // 复杂场景使用完整引用: {{.Config.Cluster.ContainerRuntime.CRI}}
+    Config            *BKEConfig
     
     // 新增：集群扩展信息 (Binary 组件需要)
     APIServer         string
@@ -4777,6 +4783,32 @@ type ArtifactInfo struct {
     Filename    string
     InstallPath string    // 远程节点上的安装路径 (per-artifact, 通过 {{artifact.<name>.installPath}} 引用)
 }
+```
+
+**设计决策 — 混合设计（快捷字段 + 完整配置）**：
+
+| 方案 | 优点 | 缺点 | 选择 |
+|------|------|------|------|
+| 仅快捷字段 | 模板简洁、类型安全 | 新增字段需修改 TemplateContext | ❌ |
+| 仅完整配置 | 通用性强、可扩展 | 模板访问路径长、与结构耦合 | ❌ |
+| **混合设计** | **兼顾简洁与灵活、向后兼容** | **需维护两套访问方式** | **✅** |
+
+**使用示例**：
+
+```yaml
+# 简单场景：使用快捷字段
+installScript: |
+  echo "Cluster: {{.ClusterName}}"
+  echo "K8s Version: {{.KubernetesVersion}}"
+
+# 复杂场景：使用完整配置
+installScript: |
+  echo "CRI: {{.Config.Cluster.ContainerRuntime.CRI}}"
+  echo "Image Repo: {{.Config.Cluster.ImageRepo.Domain}}"
+  echo "Pod CIDR: {{.Config.Cluster.Networking.PodCIDR}}"
+
+# selector condition
+condition: '{{.Config.Cluster.ContainerRuntime.CRI == "containerd"}}'
 ```
 
 #### 8.0.1 ComponentData 通用扩展
@@ -4941,11 +4973,17 @@ type TemplateContext struct {
 ```go
 // TemplateContext carries cluster fields used to render component templates.
 type TemplateContext struct {
-    // 现有字段 (保持向后兼容)
+    // 现有字段 (保持向后兼容，快捷访问)
     ClusterName       string
     Namespace         string
     KubernetesVersion string
     OpenFuyaoVersion  string
+    
+    // 新增：完整配置引用 (通用性与可扩展性)
+    // 注入 BKEConfig，模板可访问任意配置字段
+    // 简单场景使用快捷字段: {{.ClusterName}}
+    // 复杂场景使用完整引用: {{.Config.Cluster.ContainerRuntime.CRI}}
+    Config            *confv1beta1.BKEConfig
     
     // 新增：集群扩展信息 (Binary 组件需要)
     APIServer         string
@@ -5004,6 +5042,7 @@ type ArtifactInfo struct {
 | 字段组 | 注入时机 | 注入位置 | 说明 |
 |--------|---------|---------|------|
 | 基础字段 | `NewExecutionContext` 初始化时 | `pkg/dagexec/execution_context.go` | ClusterName, Namespace, KubernetesVersion, OpenFuyaoVersion |
+| `Config` | `NewExecutionContext` 初始化时 | `pkg/dagexec/execution_context.go` | 注入完整 BKEConfig 引用 |
 | 集群扩展字段 | `NewExecutionContext` 初始化时 | `pkg/dagexec/execution_context.go` | APIServer, ServiceCIDR, PodCIDR, DNSDomain |
 | `Variables` | `NewExecutionContext` 初始化时 | `pkg/dagexec/execution_context.go` | 初始化 map + 注入 ContainerRuntimeCRI |
 | `ComponentData` | `NewExecutionContext` 初始化时 | `pkg/dagexec/execution_context.go` | 初始化为空 map |
@@ -6484,6 +6523,9 @@ func NewExecutionContext(
         
         // 填充集群扩展字段和自定义变量
         if cluster.Spec.ClusterConfig != nil {
+            // 注入完整配置引用 (通用性与可扩展性)
+            ctx.TemplateContext.Config = cluster.Spec.ClusterConfig
+            
             spec := cluster.Spec.ClusterConfig.Cluster
             ctx.TemplateContext.KubernetesVersion = spec.KubernetesVersion
             ctx.TemplateContext.OpenFuyaoVersion = spec.OpenFuyaoVersion
@@ -10533,6 +10575,8 @@ SSH 上传配置文件 + 重启 bkeagent
 | `TestNewExecutionContext_BasicFields` | 正常场景 | 完整的 BKECluster | `ClusterName`、`Namespace`、`KubernetesVersion`、`OpenFuyaoVersion` 正确填充 |
 | `TestNewExecutionContext_ClusterExtFields` | 正常场景 | 完整的 BKECluster | `APIServer`、`ServiceCIDR`、`PodCIDR`、`DNSDomain`、`ImageRegistry` 正确填充 |
 | `TestNewExecutionContext_NilCluster` | cluster 为 nil | `cluster = nil` | 函数不 panic，`TemplateContext` 仍正确初始化 |
+| `TestNewExecutionContext_ConfigInjection` | 正常场景 | 完整的 BKECluster | `ctx.TemplateContext.Config` 不为 nil，且等于 `cluster.Spec.ClusterConfig` |
+| `TestNewExecutionContext_ConfigAccess` | 使用完整配置 | 完整的 BKECluster | 可通过 `ctx.TemplateContext.Config.Cluster.ContainerRuntime.CRI` 访问配置 |
 
 **测试代码示例**:
 
@@ -10544,7 +10588,7 @@ func TestNewExecutionContext_ContainerRuntimeCRI(t *testing.T) {
             Namespace: "default",
         },
         Spec: confv1beta1.BKEClusterSpec{
-            ClusterConfig: &confv1beta1.ClusterConfig{
+            ClusterConfig: &confv1beta1.BKEConfig{
                 Cluster: confv1beta1.Cluster{
                     ContainerRuntime: confv1beta1.ContainerRuntime{
                         CRI: "containerd",
@@ -10573,7 +10617,7 @@ func TestNewExecutionContext_ContainerRuntimeCRI(t *testing.T) {
 func TestNewExecutionContext_EmptyCRI(t *testing.T) {
     cluster := &bkev1beta1.BKECluster{
         Spec: confv1beta1.BKEClusterSpec{
-            ClusterConfig: &confv1beta1.ClusterConfig{
+            ClusterConfig: &confv1beta1.BKEConfig{
                 Cluster: confv1beta1.Cluster{
                     ContainerRuntime: confv1beta1.ContainerRuntime{
                         CRI: "",
@@ -10607,6 +10651,64 @@ func TestNewExecutionContext_NilClusterConfig(t *testing.T) {
     }
     if ctx.TemplateContext.ComponentData == nil {
         t.Fatal("ComponentData should be initialized even when ClusterConfig is nil")
+    }
+    if ctx.TemplateContext.Config != nil {
+        t.Fatal("Config should be nil when ClusterConfig is nil")
+    }
+}
+
+func TestNewExecutionContext_ConfigInjection(t *testing.T) {
+    cluster := &bkev1beta1.BKECluster{
+        Spec: confv1beta1.BKEClusterSpec{
+            ClusterConfig: &confv1beta1.BKEConfig{
+                Cluster: confv1beta1.Cluster{
+                    KubernetesVersion: "v1.25.6",
+                    ContainerRuntime: confv1beta1.ContainerRuntime{
+                        CRI: "containerd",
+                    },
+                },
+            },
+        },
+    }
+    
+    ctx := NewExecutionContext(nil, cluster, nil, nil, nil, nil, nil, nil, nil)
+    
+    if ctx.TemplateContext.Config == nil {
+        t.Fatal("Config should be injected")
+    }
+    if ctx.TemplateContext.Config != cluster.Spec.ClusterConfig {
+        t.Fatal("Config should be the same object as cluster.Spec.ClusterConfig")
+    }
+    if ctx.TemplateContext.Config.Cluster.KubernetesVersion != "v1.25.6" {
+        t.Fatalf("Config.Cluster.KubernetesVersion = %q, want %q", 
+            ctx.TemplateContext.Config.Cluster.KubernetesVersion, "v1.25.6")
+    }
+}
+
+func TestNewExecutionContext_ConfigAccess(t *testing.T) {
+    cluster := &bkev1beta1.BKECluster{
+        Spec: confv1beta1.BKEClusterSpec{
+            ClusterConfig: &confv1beta1.BKEConfig{
+                Cluster: confv1beta1.Cluster{
+                    ContainerRuntime: confv1beta1.ContainerRuntime{
+                        CRI: "docker",
+                    },
+                    ImageRepo: confv1beta1.Repo{
+                        Domain: "registry.example.com",
+                    },
+                },
+            },
+        },
+    }
+    
+    ctx := NewExecutionContext(nil, cluster, nil, nil, nil, nil, nil, nil, nil)
+    
+    // 验证可通过完整路径访问配置
+    if ctx.TemplateContext.Config.Cluster.ContainerRuntime.CRI != "docker" {
+        t.Fatal("Should be able to access CRI via Config")
+    }
+    if ctx.TemplateContext.Config.Cluster.ImageRepo.Domain != "registry.example.com" {
+        t.Fatal("Should be able to access ImageRepo.Domain via Config")
     }
 }
 ```
