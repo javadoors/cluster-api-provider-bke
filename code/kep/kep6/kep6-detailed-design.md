@@ -1161,139 +1161,9 @@ spec:
       - cv
   scope: Namespaced
   versions:
-    # v1alpha1: 旧版本, 保留向后兼容, 仅可读 (storage=false)
-    # 不含 binary/helm/yaml 字段定义
+    # v1alpha1: 唯一版本, 直接扩展 (storage=true)
+    # 包含 binary/helm/yaml/selector 字段定义, 所有新字段均为 omitempty, 向后兼容
     - name: v1alpha1
-      served: true
-      storage: false
-      schema:
-        openAPIV3Schema:
-          type: object
-          properties:
-            apiVersion:
-              type: string
-            kind:
-              type: string
-            metadata:
-              type: object
-            spec:
-              type: object
-              properties:
-                name:
-                  type: string
-                type:
-                  type: string
-                version:
-                  type: string
-                inline:
-                  type: object
-                  properties:
-                    handler:
-                      type: string
-                    version:
-                      type: string
-                  required: [handler, version]
-                subComponents:
-                  type: array
-                  items:
-                    type: object
-                    properties:
-                      name:
-                        type: string
-                      version:
-                        type: string
-                    required: [name, version]
-                compatibility:
-                  type: object
-                  properties:
-                    constraints:
-                      type: array
-                      items:
-                        type: object
-                        properties:
-                          component:
-                            type: string
-                          rule:
-                            type: string
-                        required: [component, rule]
-                dependencies:
-                  type: array
-                  items:
-                    type: object
-                    properties:
-                      name:
-                        type: string
-                      phase:
-                        type: string
-                    required: [name]
-                upgradeStrategy:
-                  type: object
-                  properties:
-                    mode:
-                      type: string
-                    batchSize:
-                      type: integer
-                    timeout:
-                      type: string
-                    failurePolicy:
-                      type: string
-                resources:
-                  type: array
-                  items:
-                    type: object
-                    properties:
-                      kind:
-                        type: string
-                      apiVersion:
-                        type: string
-                      namespace:
-                        type: string
-                      name:
-                        type: string
-                      labels:
-                        type: object
-                        additionalProperties:
-                          type: string
-                      data:
-                        type: object
-                        additionalProperties:
-                          type: string
-                      stringData:
-                        type: object
-                        additionalProperties:
-                          type: string
-                      manifest:
-                        type: string
-                    required: [kind, apiVersion, name]
-              required: [name, type, version]
-            status:
-              type: object
-              properties:
-                phase:
-                  type: string
-                conditions:
-                  type: array
-                  items:
-                    type: object
-                    properties:
-                      type:
-                        type: string
-                      status:
-                        type: string
-                        enum: ["True", "False", Unknown]
-                      lastTransitionTime:
-                        type: string
-                        format: date-time
-                      reason:
-                        type: string
-                      message:
-                        type: string
-                    required: [type, status, lastTransitionTime, reason, message]
-      subresources:
-        status: {}
-    # v1alpha2: 新版本, 新增 binary/helm/yaml 字段定义 (storage=true)
-    # v1alpha1 ↔ v1alpha2 通过 conversion 函数自动转换 (新字段全为 omitempty, 无数据丢失)
-    - name: v1alpha2
       served: true
       storage: true
       schema:
@@ -1346,11 +1216,17 @@ spec:
                             type: string
                           path:
                             type: string
+                          pathTemplate:
+                            type: string
+                          forEach:
+                            type: string
                           mode:
                             type: string
                           owner:
                             type: string
                           content:
+                            type: string
+                          condition:
                             type: string
                           secretRef:
                             type: object
@@ -1380,7 +1256,7 @@ spec:
                               serviceAccount:
                                 type: string
                             required: [clusterName, apiServer, caCertPath, clientCertPath, clientKeyPath]
-                        required: [name, path]
+                        required: [name]
                     installScript:
                       type: string
                     uninstallScript:
@@ -1644,34 +1520,6 @@ spec:
                         type: string
                         description: "Go Template expression, evaluated at DAG build time (type=selector only)"
                     required: [name, version]
-                resources:
-                  type: array
-                  items:
-                    type: object
-                    properties:
-                      kind:
-                        type: string
-                      apiVersion:
-                        type: string
-                      namespace:
-                        type: string
-                      name:
-                        type: string
-                      labels:
-                        type: object
-                        additionalProperties:
-                          type: string
-                      data:
-                        type: object
-                        additionalProperties:
-                          type: string
-                      stringData:
-                        type: object
-                        additionalProperties:
-                          type: string
-                      manifest:
-                        type: string
-                    required: [kind, apiVersion, name]
                 compatibility:
                   type: object
                   properties:
@@ -1706,6 +1554,34 @@ spec:
                       type: string
                     failurePolicy:
                       type: string
+                resources:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      kind:
+                        type: string
+                      apiVersion:
+                        type: string
+                      namespace:
+                        type: string
+                      name:
+                        type: string
+                      labels:
+                        type: object
+                        additionalProperties:
+                          type: string
+                      data:
+                        type: object
+                        additionalProperties:
+                          type: string
+                      stringData:
+                        type: object
+                        additionalProperties:
+                          type: string
+                      manifest:
+                        type: string
+                    required: [kind, apiVersion, name]
               required: [name, type, version]
             status:
               type: object
@@ -1748,7 +1624,7 @@ spec:
 |---------|------|
 | `api/v1alpha1/componentversion_types.go` | 新增 `BinarySpec`/`HelmSpec`/`YAMLSpec`/`ArtifactSpec`/`ConfigTemplateSpec`/... 等类型；`ComponentVersionSpec` 增加 `Binary *BinarySpec`/`Helm *HelmSpec`/`YAML *YAMLSpec` 字段 |
 | `api/v1alpha1/zz_generated.deepcopy.go` | 重新 `make` 生成 DeepCopy 方法 |
-| `config/crd/bases/...componentversions.yaml` | v1alpha1 schema 新增 binary/helm/yaml 字段定义（即 3.7 节中 v1alpha2 的 schema 内容合并到 v1alpha1） |
+| `config/crd/bases/...componentversions.yaml` | v1alpha1 schema 新增 binary/helm/yaml/selector 字段定义（见 3.7 节） |
 
 **兼容性保证**：
 - 新字段全部 `omitempty` + 指针类型，旧 YAML 不填则为 nil
