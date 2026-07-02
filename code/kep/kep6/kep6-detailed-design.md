@@ -319,14 +319,15 @@ type ComponentVersionSpec struct {
     Resources []ResourceSpec `json:"resources,omitempty"`
 }
 
-// ComponentType 定义组件类型 ✅复用现有 (含 binary/helm/yaml/inline 四值)
+// ComponentType 定义组件类型 ✅复用现有 (含 binary/helm/yaml/inline 四值) + 🆕新增 selector
 type ComponentType string
 
 const (
-    ComponentTypeYAML   ComponentType = "yaml"
-    ComponentTypeHelm   ComponentType = "helm"
-    ComponentTypeInline ComponentType = "inline"
-    ComponentTypeBinary ComponentType = "binary"
+    ComponentTypeYAML     ComponentType = "yaml"
+    ComponentTypeHelm     ComponentType = "helm"
+    ComponentTypeInline   ComponentType = "inline"
+    ComponentTypeBinary   ComponentType = "binary"
+    ComponentTypeSelector ComponentType = "selector" // 🆕互斥选择器: 从 subComponents 中按 condition 选择一个
 )
 
 // CompatibilitySpec 定义兼容性约束 ✅复用现有
@@ -411,13 +412,19 @@ type NodeFilterSpec struct {
     ExcludeAppointment *bool `json:"excludeAppointment,omitempty"`
 }
 
-// SubComponent 定义子组件引用 ✅复用现有
+// SubComponent 定义子组件引用 ✅复用现有, 🆕新增 Condition 字段
 type SubComponent struct {
     // 子组件名称
     Name string `json:"name"`
     
     // 子组件版本
     Version string `json:"version"`
+
+    // 🆕生成条件 (Go Template 表达式)
+    // 仅 type=selector 时使用: DAG 构建期评估, condition 为真的子组件纳入 DAG
+    // type=yaml 等其他类型时忽略此字段 (全包含语义不变)
+    // 示例: '{{.ContainerRuntimeCRI == "containerd"}}'
+    Condition string `json:"condition,omitempty"`
 }
 
 // ResourceSpec 定义 Kubernetes 资源 ✅复用现有
@@ -896,7 +903,303 @@ type InlineSpec struct {
 }
 ```
 
-### 3.6 CRD YAML 定义
+### 3.5a Selector 类型字段定义
+
+**设计思路 — 互斥选择器，按 type 区分 subComponents 语义**：
+
+`selector` 类型用于表达"从多个候选组件中选择一个"的场景。典型用例：容器运行时——一个集群只能安装一种容器运行时（containerd 或 docker），选择由 `BKECluster.Spec.Cluster.ContainerRuntime.CRI` 决定。
+
+`subComponents` 字段在不同 `type` 下有不同语义，由 `type` 字段天然消歧：
+
+| 维度 | type=yaml（组合） | type=selector（互斥选择） |
+|------|------|------|
+| subComponents 语义 | 全包含——所有子组件都安装 | 条件选一——评估 condition，为真的纳入 DAG |
+| Condition 字段 | 忽略（不评估） | 评估后选一 |
+| DAG 节点 | 父组件 + 所有子组件各自产生 DAG 节点 | 仅 condition 为真的子组件产生 DAG 节点 |
+| selector 自身 | 不适用 | 不产生 DAG 节点（纯选择器，无自身安装逻辑） |
+| 典型场景 | openfuyao-core 包含 kubernetes-master + kubernetes-worker | container-runtime 选 containerd 或 docker |
+
+selector 类型不定义专属 Spec 结构体（无 `SelectorSpec`），仅复用现有的 `SubComponent`（含 `Condition` 字段）和 `UpgradeStrategySpec`。
+
+**container-runtime ComponentVersion YAML（selector 类型）**：
+
+```yaml
+# bke-manifests/container-runtime/v1.0.0/component.yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: container-runtime-v1.0.0
+spec:
+  name: container-runtime
+  type: selector
+  version: v1.0.0
+  subComponents:
+    # containerd 运行时 (CRI=containerd 时选择)
+    - name: containerd
+      version: v1.7.18
+      condition: '{{.ContainerRuntimeCRI == "containerd"}}'
+
+    # docker 运行时 (CRI=docker 时选择)
+    - name: docker
+      version: v26.0.0
+      condition: '{{.ContainerRuntimeCRI == "docker"}}'
+
+    # cri-dockerd (CRI=docker 时选择, K8s >=1.24 必需)
+    - name: cri-dockerd
+      version: v0.3.9
+      condition: '{{.ContainerRuntimeCRI == "docker"}}'
+
+  upgradeStrategy:
+    mode: Rolling
+    batchSize: 1
+    timeout: "10m"
+    failurePolicy: FailFast
+```
+
+> **ReleaseImage 引用方式**：ReleaseImage 只引用 `container-runtime/v1.0.0`，DAG 构建期自动展开为 containerd 或 docker + cri-dockerd。无需在 ReleaseImage 中分别声明。
+
+**docker ComponentVersion YAML（binary 类型）**：
+
+```yaml
+# bke-manifests/docker/v26.0.0/component.yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: docker-v26.0.0
+spec:
+  name: docker
+  type: binary
+  version: v26.0.0
+
+  binary:
+    variables:
+      cgroupDriver: "systemd"
+      dataRoot: "/var/lib/docker"
+      lowLevelRuntime: "runc"
+      insecureRegistries: ""
+      registryMirror: ""
+
+    # Docker 通过包管理器安装 (非二进制下载), 无 artifacts
+    # installScript 负责通过 yum/apt 安装 docker-ce
+    installScript: |
+      #!/bin/bash
+      set -e
+      systemctl stop docker || true
+      systemctl stop docker.socket || true
+
+      # 1. 通过包管理器安装 docker-ce
+      if [ -f /etc/redhat-release ]; then
+        yum install -y yum-utils
+        yum install -y docker-ce
+      elif [ -f /etc/os-release ] && grep -q ubuntu /etc/os-release; then
+        apt-get update
+        apt-get install -y docker-ce
+      fi
+
+      # 2. 启动并验证
+      systemctl enable docker
+      systemctl restart docker
+      docker --version
+
+    # Docker 配置文件 (对应现有 ConfigDockerDaemon 生成逻辑)
+    configTemplates:
+      - name: daemon.json
+        path: "/etc/docker/daemon.json"
+        mode: "0644"
+        content: |
+          {
+            "exec-opts": ["native.cgroupdriver={{.Variables.cgroupDriver}}"],
+            "data-root": "{{.Variables.dataRoot}}",
+            "runtimes": {
+              "{{.Variables.lowLevelRuntime}}": {"path": "/usr/local/beyondvm/runc"}
+            }
+          }
+
+    healthCheck:
+      enabled: true
+      timeout: "2m"
+      interval: "5s"
+      script: |
+        systemctl is-active docker
+        docker info > /dev/null 2>&1
+
+  dependencies:
+    - name: bkeagent
+      phase: Install
+
+  upgradeStrategy:
+    mode: Rolling
+    batchSize: 1
+    timeout: "10m"
+    failurePolicy: FailFast
+```
+
+> **Docker 与 containerd 的关键差异**：Docker 无 `hosts.toml`（镜像仓库配置在 `daemon.json` 的 `registry-mirrors` 中）；Docker 通过包管理器安装（无 `artifacts` 二进制下载）；Docker 需要 `cri-dockerd` 作为 CRI 适配层（K8s ≥1.24）。
+
+**cri-dockerd ComponentVersion YAML（binary 类型）**：
+
+```yaml
+# bke-manifests/cri-dockerd/v0.3.9/component.yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: cri-dockerd-v0.3.9
+spec:
+  name: cri-dockerd
+  type: binary
+  version: v0.3.9
+
+  binary:
+    artifacts:
+      - name: cri-dockerd
+        url: "{{imageRegistry}}/cri-dockerd/{{version}}/cri-dockerd-{{version}}-{{arch}}"
+        checksum: "sha256:cri-dockerd-checksum-placeholder"
+        installPath: "/usr/bin"
+        executable: cri-dockerd
+
+    configTemplates:
+      - name: cri-dockerd.service
+        path: "/etc/systemd/system/cri-dockerd.service"
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=CRI Interface for Docker Application Container Engine
+          After=network-online.target firewalld.service
+          Wants=network-online.target
+
+          [Service]
+          ExecStart=/usr/bin/cri-dockerd --container-runtime-endpoint unix:///var/run/cri-dockerd.sock --pod-infra-container-image {{.Variables.sandboxImage}}
+          ExecStartPost=/bin/systemctl restart kubelet
+          Delegate=yes
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
+
+      - name: cri-dockerd.socket
+        path: "/etc/systemd/system/cri-dockerd.socket"
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=CRI Dockerd Socket for the API
+
+          [Socket]
+          ListenStream=/var/run/cri-dockerd.sock
+          SocketMode=0660
+          SocketUser=root
+          SocketGroup=docker
+
+          [Install]
+          WantedBy=sockets.target
+
+    installScript: |
+      #!/bin/bash
+      set -e
+      systemctl stop cri-dockerd || true
+      systemctl stop cri-dockerd.socket || true
+
+      # 1. 安装二进制
+      install -m 0755 {{artifact.cri-dockerd.path}} /usr/bin/cri-dockerd
+
+      # 2. 安装依赖
+      if [ -f /etc/redhat-release ]; then
+        yum install -y socat || true
+      elif [ -f /etc/os-release ] && grep -q ubuntu /etc/os-release; then
+        apt-get install -y socat || true
+      fi
+
+      # 3. 启动
+      systemctl daemon-reload
+      systemctl enable cri-dockerd
+      systemctl start cri-dockerd
+
+    healthCheck:
+      enabled: true
+      timeout: "1m"
+      interval: "3s"
+      script: |
+        systemctl is-active cri-dockerd
+
+  dependencies:
+    - name: docker
+      phase: Install
+
+  upgradeStrategy:
+    mode: Rolling
+    batchSize: 1
+    timeout: "5m"
+    failurePolicy: FailFast
+```
+
+**Selector DAG 构建流程图**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                      Selector DAG 构建流程                                        │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+    ┌──────────────────────────────┐
+    │  BuildDAGFromBundle          │
+    │  遍历 ReleaseImage.components │
+    └──────────────┬───────────────┘
+                   │
+                   │ 遇到 container-runtime/v1.0.0
+                   ▼
+    ┌──────────────────────────────┐
+    │  加载 ComponentVersion       │
+    │  cv.Spec.Type == "selector"  │
+    └──────────────┬───────────────┘
+                   │
+                   ▼
+    ┌──────────────────────────────┐
+    │  读取 ContainerRuntimeCRI    │
+    │  从 ExecutionContext         │
+    │  .TemplateContext.Variables  │
+    │  ["ContainerRuntimeCRI"]     │
+    └──────────────┬───────────────┘
+                   │
+                   ▼
+    ┌──────────────────────────────┐
+    │  遍历 cv.Spec.SubComponents  │
+    │  评估每个 sub.Condition      │
+    └──────────────┬───────────────┘
+                   │
+       ┌───────────┼───────────┐
+       │           │           │
+       ▼           ▼           ▼
+  ┌─────────┐ ┌─────────┐ ┌──────────┐
+  │containerd│ │ docker  │ │cri-docker│
+  │condition │ │condition│ │condition │
+  │= true?  │ │= true?  │ │= true?   │
+ └────┬────┘ └────┬────┘ └─────┬────┘
+      │           │             │
+  CRI=containerd CRI=docker   CRI=docker
+      │           │             │
+      ▼           ▼             ▼
+  纳入 DAG     纳入 DAG      纳入 DAG
+  (binary)    (binary)      (binary)
+      │           │             │
+      │           └──────┬──────┘
+      │                  │ 依赖关系
+      │                  ▼
+      │           docker → cri-dockerd
+      │           (DAG 依赖边)
+      │
+      ▼
+  selector 自身不产生 DAG 节点
+  (纯选择器, 无安装逻辑)
+```
+
+**与现有代码的对应关系**：
+
+| 现有代码 | KEP-6 selector 设计 |
+|---------|-------------------|
+| `init.go:789-797` `downloadContainerRuntime` switch CRI | DAG 构建器评估 subComponents.condition |
+| `CRIContainerd = "containerd"` | `condition: '{{.ContainerRuntimeCRI == "containerd"}}'` |
+| `CRIDocker = "docker"` + CRIDockerPlugin | docker + cri-dockerd 两个 ComponentVersion，condition 均匹配 docker |
+| `BKECluster.Spec.Cluster.ContainerRuntime.CRI` | `ExecutionContext.TemplateContext.Variables["ContainerRuntimeCRI"]` |
+| DockerPlugin: yum 安装 + daemon.json | docker ComponentVersion: installScript(yum) + configTemplates(daemon.json) |
+| CRIDockerPlugin: 下载二进制 + service + socket | cri-dockerd ComponentVersion: artifacts + configTemplates(service+socket) |
 
 ```yaml
 # config/crd/bases/config.openfuyao.cn_componentversions.yaml
@@ -1067,7 +1370,7 @@ spec:
                   type: string
                 type:
                   type: string
-                  enum: [yaml, helm, inline, binary]
+                  enum: [yaml, helm, inline, binary, selector]
                 version:
                   type: string
                 binary:
@@ -1394,6 +1697,9 @@ spec:
                         type: string
                       version:
                         type: string
+                      condition:
+                        type: string
+                        description: "Go Template expression, evaluated at DAG build time (type=selector only)"
                     required: [name, version]
                 resources:
                   type: array
@@ -4726,6 +5032,25 @@ BKECluster.Spec (imageRepo + insecureRegistries)
 
 **典型用途**：控制 `configTemplates` 中离线重定向 hosts.toml 的生成——在线模式不生成公共仓库重定向文件，离线模式为每个公共仓库生成重定向到私有仓库的 hosts.toml。
 
+| 变量 | 说明 | 来源 | 示例值 |
+|------|------|------|--------|
+| `{{.ContainerRuntimeCRI}}` | 容器运行时类型 | `BKECluster.Spec.Cluster.ContainerRuntime.CRI`，由 controllers 层注入 `ExecutionContext.TemplateContext.Variables` | `containerd` / `docker` |
+
+**`ContainerRuntimeCRI` 的来源链路**：
+
+controllers 层构建 `ExecutionContext` 时，从 `BKECluster.Spec.Cluster.ContainerRuntime.CRI` 读取，注入 `TemplateContext.Variables["ContainerRuntimeCRI"]`。DAG 构建器评估 selector 组件的 `subComponents[].condition` 时使用此变量。
+
+```
+BKECluster.Spec.Cluster.ContainerRuntime.CRI
+  → controllers 层注入 ExecutionContext.TemplateContext.Variables["ContainerRuntimeCRI"]
+    → DAG 构建器: BuildDAGFromBundle 遇到 type=selector 组件
+      → 评估 subComponents[].condition: '{{.ContainerRuntimeCRI == "containerd"}}'
+        → true: 纳入 containerd 子组件
+        → false: 跳过, 评估下一个 subComponent
+```
+
+**典型用途**：selector 类型组件的 `subComponents[].condition` 评估——根据集群配置的容器运行时类型选择安装 containerd 或 docker。
+
 #### 10. 自定义变量 (Custom Variables)
 
 通过 ComponentVersion 的 `binary.variables` 字段定义，可在 installScript 中引用：
@@ -5338,6 +5663,53 @@ func (s *Scheduler) ExecuteDAG(
         }
     }
     return nil
+}
+
+// expandSelectorComponents 在 DAG 构建期展开 selector 类型的 ComponentVersion
+// selector 自身不产生 DAG 节点；遍历 subComponents，评估 condition，为真的子组件创建 DAG 节点
+// ContainerRuntimeCRI 从 ExecutionContext.TemplateContext.Variables 获取
+func (s *Scheduler) expandSelectorComponents(
+    ctx context.Context,
+    execCtx *ExecutionContext,
+    cv *configv1alpha1.ComponentVersion,
+) ([]topology.ComponentNode, error) {
+    if cv.Spec.Type != configv1alpha1.ComponentTypeSelector {
+        return nil, nil // 非 selector 类型, 不展开
+    }
+
+    cri := execCtx.TemplateContext.Variables["ContainerRuntimeCRI"]
+    var nodes []topology.ComponentNode
+    for _, sub := range cv.Spec.SubComponents {
+        if sub.Condition == "" {
+            // 无 condition = 始终纳入 (兼容组合语义)
+            nodes = append(nodes, topology.ComponentNode{
+                Name:    sub.Name,
+                Version: sub.Version,
+            })
+            continue
+        }
+        // 评估 condition: 简单字符串匹配 (Go Template 在 DAG 构建期由 TemplateRenderer 评估)
+        // condition 示例: '{{.ContainerRuntimeCRI == "containerd"}}'
+        matched, err := evaluateCondition(sub.Condition, cri)
+        if err != nil {
+            return nil, fmt.Errorf("failed to evaluate condition for %s: %w", sub.Name, err)
+        }
+        if matched {
+            nodes = append(nodes, topology.ComponentNode{
+                Name:    sub.Name,
+                Version: sub.Version,
+            })
+        }
+    }
+    return nodes, nil
+}
+
+// evaluateCondition 简单评估 selector condition (匹配 ContainerRuntimeCRI 值)
+// 完整实现使用 TemplateRenderer 渲染 condition 模板, 结果 "true" = 匹配
+func evaluateCondition(condition, cri string) (bool, error) {
+    // 实际实现: 使用 TemplateRenderer 渲染 condition Go Template
+    // 此处简化: 检查 condition 中是否包含 cri 值
+    return strings.Contains(condition, "\""+cri+"\""), nil
 }
 
 // executeComponent 四路分发 (Feature Gate ON)
@@ -8293,6 +8665,56 @@ func HelmComponentEnabled(obj client.Object) bool {
 
 **全局 flag 注册**：在 `utils/capbke/config` 中新增 `BinaryComponentSupport`/`HelmComponentSupport` bool 变量，与现有 `DeclarativeUpgrade` 一致，通过控制器启动参数注入。
 
+### 12.2a Selector 类型迁移：容器运行时互斥选择
+
+**设计思路 — containerd 从直接引用改为通过 selector 间接引用**：
+
+现有代码中容器运行时选择硬编码在 `init.go:789-797`（`downloadContainerRuntime` switch CRI）。KEP-6 引入 `selector` 类型后，ReleaseImage 不再直接引用 `containerd/v1.7.18`，而是引用 `container-runtime/v1.0.0`（type=selector）。DAG 构建期根据 `BKECluster.Spec.Cluster.ContainerRuntime.CRI` 自动展开为 containerd 或 docker + cri-dockerd。
+
+| Feature Gate 状态 | ReleaseImage 引用 | 运行时选择路径 | 说明 |
+|-------------------|-------------------|--------------|------|
+| OFF | `containerd/v1.7.18`（直接引用） | `init.go:789-797` switch CRI | 旧路径，仅支持 containerd |
+| ON | `container-runtime/v1.0.0`（selector 引用） | DAG 构建器评估 condition | 新路径，支持 containerd + docker 互斥选择 |
+
+**Feature Gate ON 时的 ReleaseImage 变化**：
+
+```yaml
+# 旧 ReleaseImage (Feature Gate OFF)
+spec:
+  install:
+    components:
+      - name: containerd          # ← 直接引用 containerd
+        version: v1.7.18
+
+# 新 ReleaseImage (Feature Gate ON)
+spec:
+  install:
+    components:
+      - name: container-runtime   # ← 引用 selector, DAG 展开为 containerd 或 docker
+        version: v1.0.0
+```
+
+**Selector 展开规则**：
+- `BKECluster.Spec.Cluster.ContainerRuntime.CRI == "containerd"` → 展开为 `containerd/v1.7.18`
+- `BKECluster.Spec.Cluster.ContainerRuntime.CRI == "docker"` → 展开为 `docker/v26.0.0` + `cri-dockerd/v0.3.9`（依赖关系：docker → cri-dockerd）
+
+**与现有代码的兼容**：
+- Feature Gate OFF 时 ReleaseImage 仍引用 `containerd/v1.7.18`，走旧路径（`init.go:789-797`），行为不变
+- Feature Gate ON 时 ReleaseImage 引用 `container-runtime/v1.0.0`，DAG 构建器展开，跳过 `init.go` 的运行时选择逻辑
+- `EnsureNodesEnv` 的 scope 变更（移除 `runtime`）仅在 Feature Gate ON 时生效，对 docker 场景同样适用
+
+**bke-manifests 新增文件**：
+
+```
+bke-manifests/
+├── container-runtime/v1.0.0/component.yaml   ← type: selector (新增)
+├── containerd/v1.7.18/component.yaml         ← type: binary (已有)
+├── docker/v26.0.0/component.yaml             ← type: binary (新增)
+├── cri-dockerd/v0.3.9/component.yaml         ← type: binary (新增)
+├── bkeagent/v2.6.0/component.yaml            ← type: binary (已有)
+└── ...
+```
+
 ### 12.3 containerd 重构详细设计
 
 #### 12.3.1 当前 Phase 逻辑分析
@@ -9954,8 +10376,8 @@ spec:
   version: v2.6.0
   install:
     components:
-      - name: containerd
-        version: v1.7.18
+      - name: container-runtime
+        version: v1.0.0
       - name: bkeagent
         version: v2.6.0
       - name: coredns
@@ -10073,8 +10495,8 @@ spec:
   version: v2.6.0
   upgrade:
     components:
-      - name: containerd
-        version: v1.7.18
+      - name: container-runtime
+        version: v1.0.0
       - name: bkeagent
         version: v2.6.0
       - name: coredns
@@ -10184,11 +10606,14 @@ ClusterVersionReconciler.Reconcile()
 
 ```
 bke-manifests/
-├── containerd/v1.7.18/component.yaml     ← type: binary
-├── bkeagent/v2.6.0/component.yaml        ← type: binary
-├── coredns/v1.11.1/component.yaml        ← type: helm
-├── openfuyao-core/v26.03/component.yaml  ← type: yaml (含 subComponents)
-└── kubernetes-master/v1.29.0/            ← type: inline (无需 YAML, 由 inline handler 定义)
+├── container-runtime/v1.0.0/component.yaml  ← type: selector (容器运行时互斥选择)
+├── containerd/v1.7.18/component.yaml        ← type: binary (被 selector 引用)
+├── docker/v26.0.0/component.yaml            ← type: binary (被 selector 引用)
+├── cri-dockerd/v0.3.9/component.yaml        ← type: binary (被 selector 引用, 依赖 docker)
+├── bkeagent/v2.6.0/component.yaml           ← type: binary
+├── coredns/v1.11.1/component.yaml           ← type: helm
+├── openfuyao-core/v26.03/component.yaml     ← type: yaml (含 subComponents)
+└── kubernetes-master/v1.29.0/               ← type: inline (无需 YAML, 由 inline handler 定义)
 ```
 
 **ReleaseImage install vs upgrade components 区别**：
