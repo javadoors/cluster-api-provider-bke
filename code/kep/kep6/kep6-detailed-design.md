@@ -15,9 +15,10 @@
    - 3.2 Binary 类型字段定义
    - 3.3 YAML 类型字段定义
    - 3.4 Helm 类型字段定义
-   - 3.5 Inline 类型字段定义
-   - 3.6 CRD YAML 定义
-   - 3.7 CRD 版本迁移设计
+    - 3.5 Inline 类型字段定义
+    - 3.6 Selector 类型字段定义
+    - 3.7 CRD YAML 定义
+    - 3.8 CRD 版本迁移设计
 4. [BinaryInstaller 详细设计](#4-binaryinstaller-详细设计)
     - 4.5 ConfigRenderer 详细设计 (含三种渲染模式)
     - 4.6 ConfigTemplateSpec forEach 动态多文件生成
@@ -900,7 +901,7 @@ type InlineSpec struct {
 }
 ```
 
-### 3.5a Selector 类型字段定义
+### 3.6 Selector 类型字段定义
 
 **设计思路 — 互斥选择器，按 type 区分 subComponents 语义**：
 
@@ -1197,6 +1198,8 @@ spec:
 | `BKECluster.Spec.Cluster.ContainerRuntime.CRI` | `ExecutionContext.TemplateContext.Variables["ContainerRuntimeCRI"]` |
 | DockerPlugin: yum 安装 + daemon.json | docker ComponentVersion: installScript(yum) + configTemplates(daemon.json) |
 | CRIDockerPlugin: 下载二进制 + service + socket | cri-dockerd ComponentVersion: artifacts + configTemplates(service+socket) |
+
+### 3.7 CRD YAML 定义
 
 ```yaml
 # config/crd/bases/config.openfuyao.cn_componentversions.yaml
@@ -1790,7 +1793,7 @@ spec:
 
 ---
 
-### 3.7 CRD 版本迁移设计
+### 3.8 CRD 版本迁移设计
 
 **设计思路 - 直接扩展 v1alpha1，不引入 v1alpha2**：
 
@@ -1804,7 +1807,7 @@ spec:
 |---------|------|
 | `api/v1alpha1/componentversion_types.go` | 新增 `BinarySpec`/`HelmSpec`/`YAMLSpec`/`ArtifactSpec`/`ConfigTemplateSpec`/... 等类型；`ComponentVersionSpec` 增加 `Binary *BinarySpec`/`Helm *HelmSpec`/`YAML *YAMLSpec` 字段 |
 | `api/v1alpha1/zz_generated.deepcopy.go` | 重新 `make` 生成 DeepCopy 方法 |
-| `config/crd/bases/...componentversions.yaml` | v1alpha1 schema 新增 binary/helm/yaml 字段定义（即 3.6 节中 v1alpha2 的 schema 内容合并到 v1alpha1） |
+| `config/crd/bases/...componentversions.yaml` | v1alpha1 schema 新增 binary/helm/yaml 字段定义（即 3.7 节中 v1alpha2 的 schema 内容合并到 v1alpha1） |
 
 **兼容性保证**：
 - 新字段全部 `omitempty` + 指针类型，旧 YAML 不填则为 nil
@@ -6566,6 +6569,13 @@ func (e *BinaryComponentExecutor) ExecuteComponent(ctx context.Context, node *Co
         execCtx.Log.Info("component %s: all nodes already at target version, skipping", component.Name)
         return nil
     }
+
+    // 5.5 🆕 ComponentData 注入 (NodeFilter 之后、策略执行之前)
+    //     确保 configTemplates 中的 forEach 和 cd() 能访问组件结构化数据
+    //     完整实现见 9.5.11.2 节
+    if err := e.injectComponentData(ctx, cv, execCtx); err != nil {
+        return fmt.Errorf("inject component data for %s: %w", component.Name, err)
+    }
     
     // 6. 根据升级策略执行
     strategy := cv.Spec.UpgradeStrategy
@@ -7549,6 +7559,12 @@ func (f *BKENodeFilter) isAlreadyAtTarget(
         return false
     }
 }
+
+// 🆕增强说明: isAlreadyAtTarget 在扩容+升级并发场景下增加版本过期检测:
+// - Phase=Failed/Timeout → 不跳过，允许重试（安装到最新目标版本）
+// - Phase=Installed 但 Version != targetVersion → 不跳过，允许升级
+// - 防止安装失败后目标版本变更时，重试安装到旧版本
+// 完整实现见 9.5.11.3 节。
 ```
 
 **各组件配置样例**：
@@ -7666,6 +7682,11 @@ func (u *BKENodeStatusUpdater) MarkSuccess(
         LastUpdateTime: &metav1.Time{Time: time.Now()},
     })
 }
+
+// 🆕增强说明: MarkSuccess 在 componentName == "bkeagent" 时，需同步设置
+// BKENode.Status.StateCode 的 NodeAgentReadyFlag (bit 1)，确保后续
+// EnsureNodesEnv 能通过 StateCode 判断 bkeagent 就绪。
+// 完整实现见 9.5.11.1 节。
 
 func (u *BKENodeStatusUpdater) MarkFailed(
     ctx context.Context,
@@ -8254,6 +8275,248 @@ Feature Gate OFF → ON (再次开启):
 | 回滚状态设计 | `RollingBack` + `RolledBack` | 区分回滚中和回滚成功，语义清晰 |
 | 部分成功状态 | `PartialSuccess` (仅 Binary) | 精确反映多节点部署的部分成功场景 |
 | 超时状态 | `Timeout` | 区分超时和其他失败，便于诊断和重试 |
+
+#### 9.5.11 扩容场景增强设计
+
+**设计思路**：节点扩容（Scale-Out）是集群生命周期中的高频操作。新节点加入时，需要依次完成 bkeagent 推送、containerd 安装、环境初始化、kubeadm join 四个阶段。上述 9.5.1-9.5.10 的设计已覆盖基本的幂等和过滤逻辑，但在以下三个边界场景存在增强空间：① bkeagent 安装完成后 HealthCheck 与 `NodeAgentReadyFlag` 的衔接；② `ComponentData` 在 `ExecuteComponent` 中的注入时机；③ 扩容与升级同时触发时的幂等保护。
+
+##### 9.5.11.1 增强 1：bkeagent 就绪状态同步
+
+**问题**：containerd 的 DAG 依赖 bkeagent（拓扑排序保证批次顺序）。bkeagent 安装完成后，`BinaryInstaller.HealthCheck` 仅验证 `systemctl is-active bkeagent`（进程存活），`NodeStatusUpdater.MarkSuccess` 仅写入 `NodeComponentStatuses`。但后续 `EnsureNodesEnv`（Inline 组件）显式检查 `BKENode.Status.StateCode` 的 `NodeAgentReadyFlag`（bit 1）来判断 bkeagent 是否可与控制器通信。两条状态链路独立，可能导致 containerd 安装时 bkeagent 进程存活但尚未注册就绪。
+
+**增强方案**：在 `NodeStatusUpdater.MarkSuccess` 中，当组件为 `bkeagent` 时，同步设置 `BKENode.Status.StateCode` 的 `NodeAgentReadyFlag`。
+
+```go
+// BKENodeStatusUpdater.MarkSuccess 增强 (在现有实现基础上扩展)
+func (u *BKENodeStatusUpdater) MarkSuccess(
+    ctx context.Context,
+    cluster *bkev1beta1.BKECluster,
+    nodeIP string,
+    componentName string,
+    version string,
+) error {
+    // 1. 更新 NodeComponentStatuses (现有逻辑，不变)
+    if err := u.updateNodeComponentStatus(ctx, cluster, nodeIP, componentName, NodeComponentStatus{
+        Version:        version,
+        Phase:          "Installed",
+        LastUpdateTime: &metav1.Time{Time: time.Now()},
+    }); err != nil {
+        return err
+    }
+
+    // 2. 🆕 bkeagent 专属: 同步设置 NodeAgentReadyFlag
+    //    确保后续 EnsureNodesEnv 能通过 StateCode 判断 bkeagent 就绪
+    if componentName == "bkeagent" {
+        if err := u.setNodeReadyFlag(ctx, cluster, nodeIP); err != nil {
+            return fmt.Errorf("set NodeAgentReadyFlag for %s: %w", nodeIP, err)
+        }
+    }
+
+    return nil
+}
+
+// setNodeReadyFlag 设置 BKENode 的 NodeAgentReadyFlag
+// 复用现有 BKENode.Status.StateCode 位标记机制 (bit 1)
+func (u *BKENodeStatusUpdater) setNodeReadyFlag(
+    ctx context.Context,
+    cluster *bkev1beta1.BKECluster,
+    nodeIP string,
+) error {
+    return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+        bkeNode := &bkev1beta1.BKENode{}
+        // 通过 nodeIP 查找对应的 BKENode
+        if err := u.findBKENodeByIP(ctx, cluster, nodeIP, bkeNode); err != nil {
+            return err
+        }
+        bkeNode.Status.StateCode |= configv1beta1.NodeAgentReadyFlag
+        return u.client.Status().Update(ctx, bkeNode)
+    })
+}
+```
+
+**时序保证**：
+
+```
+DAG Batch 1: bkeagent (binary)
+  逐节点:
+    SSH 推送 → HealthCheck (systemctl is-active) → MarkSuccess
+      ├─ NodeComponentStatuses["bkeagent"][nodeIP] = {Phase: Installed}
+      └─ BKENode.StateCode |= NodeAgentReadyFlag  ← 🆕增强
+                                                    │
+DAG Batch 2: containerd (binary, 依赖 bkeagent)     │
+  此时 NodeAgentReadyFlag 已设置                     │
+  EnsureNodesEnv 检查通过 ←─────────────────────────┘
+```
+
+##### 9.5.11.2 增强 2：ComponentData 显式注入
+
+**问题**：containerd 的 `forEach hosts.toml` 依赖 `TemplateContext.ComponentData["containerd"]["registry"]`。Section 8.0.1 已定义了 `buildContainerdComponentData()` 和 `buildLegacyContainerdData()` 两个数据构建函数，但 `BinaryComponentExecutor.ExecuteComponent()` 的调用链中未显式标注注入时机。
+
+**增强方案**：在 `ExecuteComponent` 步骤 5（NodeFilter）和步骤 6（策略执行）之间，增加 ComponentData 注入步骤。
+
+```go
+// ExecuteComponent 增强 (在现有步骤 5 和 6 之间插入步骤 5.5)
+func (e *BinaryComponentExecutor) ExecuteComponent(ctx context.Context, node *ComponentNode, execCtx *ExecutionContext) error {
+    // ... 步骤 1-5 保持不变 (获取 CV、幂等判断、获取节点、NodeFilter) ...
+
+    // 5.5 🆕 ComponentData 注入 (在 NodeFilter 之后、策略执行之前)
+    //     确保 configTemplates 中的 forEach 和 cd() 函数能访问组件结构化数据
+    if err := e.injectComponentData(ctx, cv, execCtx); err != nil {
+        return fmt.Errorf("inject component data for %s: %w", cv.Spec.Name, err)
+    }
+
+    // 6. 根据升级策略执行 (现有逻辑，不变)
+    strategy := cv.Spec.UpgradeStrategy
+    switch strategy.Mode {
+    case "Rolling":
+        return e.executeRolling(ctx, targetNodes, cv, strategy, execCtx)
+    // ...
+    }
+    return nil
+}
+
+// injectComponentData 按组件名注入 ComponentData 到 TemplateContext
+// 仅对需要结构化数据的组件执行注入，其他组件跳过 (零开销)
+func (e *BinaryComponentExecutor) injectComponentData(
+    ctx context.Context,
+    cv *configv1alpha1.ComponentVersion,
+    execCtx *ExecutionContext,
+) error {
+    if execCtx.TemplateContext.ComponentData == nil {
+        execCtx.TemplateContext.ComponentData = make(map[string]map[string]interface{})
+    }
+
+    switch cv.Spec.Name {
+    case "containerd":
+        data, err := e.buildContainerdComponentData(ctx, execCtx)
+        if err != nil {
+            return err
+        }
+        execCtx.TemplateContext.ComponentData["containerd"] = data
+    // 后续其他组件可在此扩展:
+    // case "docker":
+    //     execCtx.TemplateContext.ComponentData["docker"] = e.buildDockerComponentData(ctx, execCtx)
+    default:
+        // 无需注入的组件，直接返回
+        return nil
+    }
+    return nil
+}
+
+// buildContainerdComponentData 构建 containerd 的 ComponentData
+// 优先从 ContainerdConfig CR 获取 (在线场景)，回退到 Legacy 参数 (离线场景)
+// 数据来源: BKECluster.Spec.ClusterConfig.Cluster.ContainerdConfigRef
+func (e *BinaryComponentExecutor) buildContainerdComponentData(
+    ctx context.Context,
+    execCtx *ExecutionContext,
+) (map[string]interface{}, error) {
+    clusterCfg := execCtx.Cluster.Spec.ClusterConfig.Cluster
+
+    // 在线场景: 有 ContainerdConfigRef
+    if clusterCfg.ContainerdConfigRef != nil {
+        spec, err := plugin.GetContainerdConfig(
+            fmt.Sprintf("%s:%s", clusterCfg.ContainerdConfigRef.Namespace, clusterCfg.ContainerdConfigRef.Name))
+        if err != nil {
+            return nil, fmt.Errorf("get containerd config: %w", err)
+        }
+        return convertContainerdConfigSpecToComponentData(spec, clusterCfg)
+    }
+
+    // 离线场景 (Legacy): 从 repo + insecureRegistries 构建等价结构
+    return buildLegacyContainerdData(clusterCfg), nil
+}
+```
+
+**注入时序**：
+
+```
+ExecuteComponent()
+  │
+  ├─ 步骤 1-4: 获取 CV、幂等判断、获取节点、NodeFilter
+  │   (此时 TemplateContext.ComponentData 可能为空)
+  │
+  ├─ 步骤 5.5: injectComponentData()  ← 🆕增强
+  │   └─ containerd → buildContainerdComponentData()
+  │       ├─ 在线: GetContainerdConfig(CR) → registry map
+  │       └─ 离线: buildLegacyContainerdData() → registry map
+  │   └─ TemplateContext.ComponentData["containerd"] = data
+  │
+  └─ 步骤 6: 策略执行 (Rolling/Parallel/Batch)
+      └─ 每个节点:
+          └─ BinaryInstaller.Install()
+              └─ ConfigRenderer.renderConfigTemplates()
+                  └─ forEach: ComponentData["containerd"]["registry"]
+                      → 展开为多个 hosts.toml
+```
+
+##### 9.5.11.3 增强 3：扩容+升级并发幂等保护
+
+**问题**：当新节点加入集群时，如果恰好触发了版本升级（`desiredVersion` 变更），可能出现以下竞态：
+1. bkeagent 安装 Phase 对新节点安装旧版本 → `NodeComponentStatuses["bkeagent"][newIP] = {Version: "v2.5.0", Phase: "Installed"}`
+2. bkeagent 升级 Phase 的 `skipCompleted: false` 对新节点再次执行 → 升级到 v2.6.0
+
+虽然这是**正确行为**（与现有 `EnsureAgentUpgrade` 无过滤逻辑一致），但存在一个边界问题：如果安装和升级在**同一次 Reconcile** 中触发（DAG 构建时 `VersionContext.NeedsUpgrade("bkeagent") = true`），安装 Phase 的 `MarkSuccess` 写入的版本是目标版本（v2.6.0），升级 Phase 的 `isAlreadyAtTarget` 检查 `Version == targetVersion` 会返回 true → 跳过。这是**幂等正确**的。
+
+但 containerd 的场景不同：containerd 安装和升级共用同一个 DAG 节点（由 `VersionContext` 决定 Action=Install 或 Upgrade），不存在两个 Phase 并发的问题。**真正的风险在于**：扩容的新节点 containerd 安装失败（`Phase: "Failed"`），下次 Reconcile 重试时，如果此时 `desiredVersion` 又变了（二次升级），`isAlreadyAtTarget` 会因为 `Phase != "Installed"` 不跳过 → 重试安装的是旧目标版本而非新目标版本。
+
+**增强方案**：在 `isAlreadyAtTarget` 中增加版本过期检测——当 `NodeComponentStatuses` 中的版本既不等于当前版本也不等于目标版本时，视为过期，不跳过。
+
+```go
+// isAlreadyAtTarget 增强 (在现有实现基础上扩展)
+func (f *BKENodeFilter) isAlreadyAtTarget(
+    ctx context.Context,
+    node Node,
+    cv *configv1alpha1.ComponentVersion,
+    execCtx *ExecutionContext,
+) bool {
+    componentName := cv.Spec.Name
+    targetVersion := cv.Spec.Version
+
+    // 优先: 从 NodeComponentStatuses 读取 (新模型)
+    if execCtx.Cluster.Status.NodeComponentStatuses != nil {
+        if compStatuses, ok := execCtx.Cluster.Status.NodeComponentStatuses[componentName]; ok {
+            if status, ok := compStatuses[node.IP]; ok {
+                // 现有逻辑: 已安装且版本匹配 → 跳过
+                if status.Phase == "Installed" && status.Version == targetVersion {
+                    return true
+                }
+                // 现有逻辑: 正在安装中 → 跳过 (避免并发)
+                if status.Phase == "Installing" {
+                    return true
+                }
+                // 🆕增强: 版本过期检测
+                // 当已安装版本既不等于当前版本也不等于目标版本时，视为过期
+                // 典型场景: 安装失败后目标版本变更，需要重新安装到新版本
+                if status.Phase == "Failed" || status.Phase == "Timeout" {
+                    // 不跳过，允许重试 (重试时会安装到最新目标版本)
+                    return false
+                }
+                // 🆕增强: 安装成功但版本不匹配 (可能是二次升级)
+                // 不跳过，允许升级到新版本
+                if status.Phase == "Installed" && status.Version != targetVersion {
+                    return false
+                }
+                return false
+            }
+        }
+    }
+
+    // 回退: 从 BKENode.StateCode 读取 (旧模型，向后兼容) — 现有逻辑不变
+    // ...
+}
+```
+
+**场景验证矩阵**：
+
+| 场景 | NodeComponentStatuses | VersionContext | isAlreadyAtTarget | 行为 |
+|------|----------------------|----------------|-------------------|------|
+| 新节点首次安装 | 无记录 | NeedsUpgrade=true | false → 不跳过 | 安装到目标版本 ✅ |
+| 已安装到目标版本 | `{Phase: Installed, Version: v1.7.18}` | target=v1.7.18 | true → 跳过 | 幂等跳过 ✅ |
+| 安装失败后重试 | `{Phase: Failed, Version: ""}` | NeedsUpgrade=true | false → 不跳过 | 重试安装 ✅ |
+| 安装失败后版本变更 | `{Phase: Failed, Version: ""}` | target 变为 v1.7.20 | false → 不跳过 | 安装到新版本 ✅ |
+| 升级中目标版本又变 | `{Phase: Installed, Version: v1.7.18}` | target 变为 v1.7.20 | false → 不跳过 | 升级到 v1.7.20 ✅ |
+| 扩容+升级同时 | `{Phase: Installed, Version: v2.6.0}` (安装 Phase 已写入) | target=v2.6.0 | true → 跳过 | 升级 Phase 幂等跳过 ✅ |
+| 二次升级中间态 | `{Phase: Installed, Version: v1.7.18}` | target=v1.7.20 | false → 不跳过 | 升级到 v1.7.20 ✅ |
 
 ---
 
