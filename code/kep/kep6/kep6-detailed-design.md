@@ -20,6 +20,7 @@
    - 3.7 CRD 版本迁移设计
 4. [BinaryInstaller 详细设计](#4-binaryinstaller-详细设计)
     - 4.5 ConfigRenderer 详细设计 (含三种渲染模式)
+    - 4.6 ConfigTemplateSpec forEach 动态多文件生成
 5. [HelmInstaller 详细设计](#5-helminstaller-详细设计)
    - 5.4 健康检查
 6. [YamlInstaller 详细设计](#6-yamlinstaller-详细设计)
@@ -29,6 +30,7 @@
     - 6.6 YAML Uninstall 流程
 7. [HealthCheck 共享包设计](#7-healthcheck-共享包设计)
 8. [模板变量系统与 TemplateContext 详细设计](#8-模板变量系统与-templatecontext-详细设计)
+    - 8.5 ComponentData forEach 渲染机制
 9. [DAG 集成详细设计](#9-dag-集成详细设计)
     - 9.5 状态模型、幂等性与兼容性设计
 10. [完整安装流程详细设计](#10-完整安装流程详细设计)
@@ -586,6 +588,23 @@ type ConfigTemplateSpec struct {
     // 典型场景: hosts.toml 离线重定向文件——在线模式不需要公共仓库的重定向配置
     Condition string `json:"condition,omitempty"`
 }
+
+> **🆕扩展说明**：`ConfigTemplateSpec` 新增 `PathTemplate` 和 `ForEach` 两个字段，支持动态多文件生成（详见 4.6 节）：
+>
+> ```go
+> // 新增：动态路径模板 (Go template, 与 ForEach 配合使用)
+> // 渲染时可访问全部 TemplateContext 变量 + 迭代变量 (.Key, .Value)
+> PathTemplate string `json:"pathTemplate,omitempty"`
+>
+> // 新增：迭代源路径 (点分隔, 从 TemplateContext 中解析)
+> // 示例: "ComponentData.containerd.registry"
+> ForEach string `json:"forEach,omitempty"`
+> ```
+>
+> | 条件 | 说明 |
+> |------|------|
+> | `ForEach != ""` | `PathTemplate` 必填，`Path` 忽略，按迭代源展开为多个文件 |
+> | `ForEach == ""` | `Path` 必填，`PathTemplate` 忽略（原有行为，单文件） |
 
 // SecretRefSpec 定义 Secret 引用规格
 type SecretRefSpec struct {
@@ -2511,6 +2530,251 @@ func (r *ConfigRenderer) renderConfigTemplates(ctx context.Context, templates []
 2. 避免重复构建模板数据
 3. BinaryInstaller 和 HelmInstaller 共享相同的模板上下文
 
+### 4.6 ConfigTemplateSpec forEach 动态多文件生成
+
+**设计思路**：某些组件需要按数据条目动态生成多个配置文件（如 containerd 的 `hosts.toml`，每个 registry 一个文件）。`forEach` 机制允许单个 `configTemplate` 按迭代源展开为多个文件，每个文件的路径由 `pathTemplate` 动态渲染。
+
+#### 4.6.1 ConfigTemplateSpec 扩展字段
+
+```go
+// ConfigTemplateSpec 扩展 (在现有字段基础上新增)
+type ConfigTemplateSpec struct {
+    // ... 现有字段保持不变 (Name, Path, Mode, Owner, Content, SecretRef, KubeconfigTemplate) ...
+
+    // 新增：动态路径模板 (Go template 语法, 与 ForEach 配合使用)
+    // 渲染时可访问全部 TemplateContext 变量 + 迭代变量 (.Key, .Value)
+    // 示例: "{{cd "containerd" "registryConfigPath"}}/{{.Key}}/hosts.toml"
+    PathTemplate string `json:"pathTemplate,omitempty"`
+
+    // 新增：迭代源路径 (点分隔, 从 TemplateContext 中解析)
+    // 支持 map[string]interface{} (按 key/value 迭代) 和 []interface{} (按 index/value 迭代)
+    // 示例: "ComponentData.containerd.registry"
+    ForEach string `json:"forEach,omitempty"`
+}
+```
+
+**字段约束**：
+
+| 条件 | 说明 |
+|------|------|
+| `ForEach != ""` 时 | `PathTemplate` 必填，`Path` 忽略 |
+| `ForEach == ""` 时 | `Path` 必填，`PathTemplate` 忽略（原有行为） |
+| `PathTemplate` 中 | 可访问全部 TemplateContext 变量 + `.Key` + `.Value` |
+| `Content` 中 | 同上，可访问全部变量 |
+
+#### 4.6.2 forEach 语义
+
+`forEach` 值为**点分隔路径**，从 `TemplateContext` 中解析：
+
+| forEach 值 | 解析路径 | 迭代类型 |
+|------------|---------|---------|
+| `"ComponentData.containerd.registry"` | `tmplCtx.ComponentData["containerd"]["registry"]` | `map[string]interface{}` → 按 key/value 迭代 |
+| `"ComponentData.containerd.registryList"` | `tmplCtx.ComponentData["containerd"]["registryList"]` | `[]interface{}` → 按 index/value 迭代 |
+
+#### 4.6.3 ForEachContext 迭代上下文
+
+每次迭代创建一个包装上下文，**同时保留全部 TemplateContext 变量 + 迭代变量**：
+
+```go
+// ForEachContext 包装 TemplateContext + 迭代变量
+// Go template 通过反射访问字段, 嵌入的 TemplateContext 字段可直接用 .ClusterName 等访问
+type ForEachContext struct {
+    manifest.TemplateContext   // 嵌入: 保留所有现有变量
+    Key   string              // 当前迭代 key (map) 或 index (slice, 转 string)
+    Value interface{}          // 当前迭代值
+}
+```
+
+**模板变量访问规则**：
+
+| 变量 | 来源 | 示例 |
+|------|------|------|
+| `{{.ClusterName}}` | TemplateContext（嵌入） | `my-cluster` |
+| `{{.NodeIP}}` | TemplateContext（嵌入） | `192.168.1.10` |
+| `{{.imageRegistry}}` | TemplateContext（嵌入） | `registry.example.com` |
+| `{{.Key}}` | ForEachContext（迭代） | `harbor.example.com` |
+| `{{.Value}}` | ForEachContext（迭代） | `map[host:... capabilities:...]` |
+| `{{index .Value "host"}}` | 动态访问 Value 内部字段 | `harbor.example.com` |
+| `{{index .Value "capabilities"}}` | 动态访问 Value 内部字段 | `[pull resolve]` |
+| `{{cd "containerd" "root"}}` | 辅助函数访问 ComponentData | `/var/lib/containerd` |
+
+#### 4.6.4 渲染引擎核心代码
+
+```go
+// renderConfigTemplates 扩展: 支持 forEach 多文件展开
+func (r *ConfigRenderer) renderConfigTemplates(
+    ctx context.Context,
+    templates []ConfigTemplateSpec,
+    tmplCtx manifest.TemplateContext,
+) (map[string][]byte, error) {
+    configs := make(map[string][]byte)
+
+    for _, tmpl := range templates {
+        if tmpl.ForEach != "" {
+            // 动态展开: forEach 迭代
+            items, err := resolveForEach(tmpl.ForEach, tmplCtx)
+            if err != nil {
+                return nil, fmt.Errorf("forEach %q: %w", tmpl.ForEach, err)
+            }
+            for _, item := range items {
+                // 构建迭代上下文: 保留全部 TemplateContext + 注入 Key/Value
+                iterCtx := manifest.ForEachContext{
+                    TemplateContext: tmplCtx,
+                    Key:             item.Key,
+                    Value:           item.Value,
+                }
+
+                // 渲染路径 (支持全部 TemplateContext 变量 + Key/Value)
+                path, err := r.renderTemplateString(tmpl.PathTemplate, iterCtx)
+                if err != nil {
+                    return nil, fmt.Errorf("pathTemplate for key=%s: %w", item.Key, err)
+                }
+
+                // 渲染内容 (同上)
+                content, err := r.renderContentTemplate(ctx, tmpl, iterCtx)
+                if err != nil {
+                    return nil, fmt.Errorf("content for key=%s: %w", item.Key, err)
+                }
+
+                configs[path] = content  // key 用渲染后的 path (而非 name)
+            }
+        } else {
+            // 原有逻辑: 静态单文件
+            content, err := r.RenderConfig(ctx, tmpl, tmplCtx)
+            if err != nil {
+                return nil, fmt.Errorf("template %s: %w", tmpl.Name, err)
+            }
+            configs[tmpl.Name] = content
+        }
+    }
+    return configs, nil
+}
+
+// resolveForEach 按点分隔路径从 TemplateContext 中解析迭代源
+func resolveForEach(path string, tmplCtx manifest.TemplateContext) ([]ForEachItem, error) {
+    parts := strings.SplitN(path, ".", 2)
+    if len(parts) != 2 {
+        return nil, fmt.Errorf("invalid forEach path: %s", path)
+    }
+
+    var source interface{}
+    switch parts[0] {
+    case "ComponentData":
+        keys := strings.Split(parts[1], ".")
+        if len(keys) < 2 {
+            return nil, fmt.Errorf("ComponentData path too short: %s", path)
+        }
+        m := tmplCtx.ComponentData
+        for i := 0; i < len(keys)-1; i++ {
+            next, ok := m[keys[i]]
+            if !ok {
+                return nil, fmt.Errorf("key %q not found in ComponentData", keys[i])
+            }
+            if sub, ok := next.(map[string]interface{}); ok {
+                if i == len(keys)-2 {
+                    source = sub[keys[len(keys)-1]]
+                } else {
+                    m = sub
+                }
+            } else {
+                return nil, fmt.Errorf("key %q is not a map", keys[i])
+            }
+        }
+    default:
+        return nil, fmt.Errorf("unsupported forEach root: %s", parts[0])
+    }
+
+    // 迭代: 支持 map 和 slice
+    var items []ForEachItem
+    switch v := source.(type) {
+    case map[string]interface{}:
+        for k, val := range v {
+            items = append(items, ForEachItem{Key: k, Value: val})
+        }
+    case []interface{}:
+        for i, val := range v {
+            items = append(items, ForEachItem{Key: strconv.Itoa(i), Value: val})
+        }
+    default:
+        return nil, fmt.Errorf("forEach source is not iterable: %T", source)
+    }
+    return items, nil
+}
+
+type ForEachItem struct {
+    Key   string
+    Value interface{}
+}
+```
+
+#### 4.6.5 forEach 渲染流程图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    renderConfigTemplates 扩展流程                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+                    ┌──────────────────────────┐
+                    │  遍历 configTemplates     │
+                    │  for _, tmpl := range     │
+                    │       templates           │
+                    └────────────┬─────────────┘
+                                 │
+                    ┌────────────┴────────────┐
+                    │  tmpl.ForEach != "" ?   │
+                    └─────┬─────────────┬─────┘
+                     Yes  │             │  No
+                          ▼             ▼
+          ┌───────────────────────┐  ┌──────────────────┐
+          │  resolveForEach()     │  │  原有逻辑:       │
+          │  解析点分隔路径       │  │  RenderConfig()  │
+          │  → 获取迭代源         │  │  单文件渲染      │
+          └───────────┬───────────┘  └──────────────────┘
+                      │
+                      ▼
+          ┌───────────────────────┐
+          │  迭代每个条目         │
+          │  for _, item := range │
+          │       items           │
+          └───────────┬───────────┘
+                      │
+                      ▼
+          ┌───────────────────────────────────┐
+          │  构建 ForEachContext              │
+          │  {                                │
+          │    TemplateContext: tmplCtx,      │
+          │    Key:   item.Key,               │
+          │    Value: item.Value,             │
+          │  }                                │
+          │                                   │
+          │  保留全部 TemplateContext 变量    │
+          │  + 注入迭代变量 .Key / .Value     │
+          └───────────┬───────────────────────┘
+                      │
+          ┌───────────┴───────────┐
+          │                       │
+          ▼                       ▼
+┌──────────────────┐   ┌──────────────────┐
+│ 渲染 pathTemplate│   │ 渲染 content     │
+│ (动态路径)       │   │ (模板内容)       │
+│                  │   │                  │
+│ 可访问:          │   │ 可访问:          │
+│ .ClusterName     │   │ .ClusterName     │
+│ .NodeIP          │   │ .NodeIP          │
+│ .Key             │   │ .Key             │
+│ .Value           │   │ .Value           │
+│ cd(...)          │   │ cd(...)          │
+└────────┬─────────┘   └────────┬─────────┘
+         │                       │
+         └───────────┬───────────┘
+                     │
+                     ▼
+          ┌───────────────────────────┐
+          │  configs[path] = content  │
+          │  (key 用渲染后的 path)    │
+          └───────────────────────────┘
+```
+
 ---
 
 ## 5. HelmInstaller 详细设计
@@ -4201,13 +4465,146 @@ type ArtifactInfo struct {
 }
 ```
 
-**使用场景对比**：
+#### 8.0.1 ComponentData 通用扩展
+
+**设计思路**：为避免 TemplateContext 膨胀为组件特定字段的集合，引入通用的 `ComponentData` 字段。任何组件都可以向 `ComponentData` 注入结构化的 `map[string]interface{}` 数据，模板通过 `index` 函数或辅助函数 `cd` 动态访问。这样 TemplateContext 保持通用性，不绑定任何特定组件。
+
+**扩展字段**：
+
+```go
+type TemplateContext struct {
+    // ... 现有字段保持不变 ...
+
+    // 新增：组件级结构化数据 (通用, 任意组件可注入)
+    // 第一层 key: 组件名 (如 "containerd", "docker")
+    // 第二层 key: 语义分组 (如 "registry", "sandboxImage")
+    // value: 任意类型 (map/slice/string/bool 等)
+    // 模板引用: {{index (index .ComponentData "containerd") "registry"}}
+    // 辅助函数: {{cd "containerd" "registry"}}
+    ComponentData map[string]map[string]interface{}
+}
+```
+
+**设计原则**：
+
+| 原则 | 说明 |
+|------|------|
+| 通用性 | `ComponentData` 不引入任何组件特定类型，任意组件可注入任意结构 |
+| 向后兼容 | 新增字段为可选，未注入时模板中 `index` 返回 nil，不影响现有组件 |
+| 命名隔离 | 第一层 key 按组件名隔离，不同组件数据互不干扰 |
+| 可组合 | 数据可嵌套任意深度，模板通过 `index` 链式访问 |
+
+**containerd 数据注入示例**：
+
+在线场景（有 ContainerdConfig CR）和离线场景（Legacy）产出相同的 `map[string]interface{}` 结构，下游模板无感知：
+
+```go
+// 在线场景: 从 ContainerdConfig CR 构建
+func buildContainerdComponentData(containerdConfigRef *ContainerdConfigRef, bkeConfig *BkeConfig) map[string]interface{} {
+    data := map[string]interface{}{
+        "registryConfigPath": "/etc/containerd/certs.d",
+        "sandboxImage":       fmt.Sprintf("%s/pause:3.9", bkeConfig.Cluster.ImageRepo.Domain),
+        "root":               "/var/lib/containerd",
+        "state":              "/run/containerd",
+    }
+
+    if containerdConfigRef != nil {
+        spec, _ := plugin.GetContainerdConfig(...)
+        if spec.Registry != nil {
+            if spec.Registry.ConfigPath != "" {
+                data["registryConfigPath"] = spec.Registry.ConfigPath
+            }
+            registryMap := make(map[string]interface{})
+            for name, cfg := range spec.Registry.Configs {
+                registryMap[name] = map[string]interface{}{
+                    "host":         cfg.Host,
+                    "capabilities": cfg.Capabilities,
+                    "skipVerify":   cfg.SkipVerify,
+                    "plainHTTP":    cfg.PlainHTTP,
+                    "insecure":     cfg.Insecure,
+                    "overridePath": cfg.OverridePath,
+                    "tls":          convertTLS(cfg.TLS),
+                    "auth":         convertAuth(cfg.Auth),
+                    "header":       cfg.Header,
+                }
+            }
+            data["registry"] = registryMap
+        }
+        if spec.Main != nil {
+            if spec.Main.SandboxImage != "" { data["sandboxImage"] = spec.Main.SandboxImage }
+            if spec.Main.Root != ""         { data["root"] = spec.Main.Root }
+            if spec.Main.State != ""        { data["state"] = spec.Main.State }
+            if spec.Main.MetricsAddress != "" { data["metricsAddress"] = spec.Main.MetricsAddress }
+        }
+    }
+    return data
+}
+
+// 离线场景 (Legacy): 从 repo + insecureRegistries 构建等价结构
+func buildLegacyContainerdData(bkeConfig *BkeConfig) map[string]interface{} {
+    repo := bkeConfig.Cluster.ImageRepo.Domain
+    registryMap := make(map[string]interface{})
+
+    // 主仓库
+    registryMap[repo] = map[string]interface{}{
+        "host":         repo,
+        "capabilities": []string{"pull", "resolve", "push"},
+        "skipVerify":   true,
+    }
+
+    // insecureRegistries → 每个都生成一个 entry
+    if insecure := bkeConfig.Cluster.InsecureRegistries; insecure != "" {
+        for _, reg := range strings.Split(insecure, ",") {
+            reg = strings.TrimSpace(reg)
+            if reg == "" { continue }
+            registryMap[reg] = map[string]interface{}{
+                "host":         reg,
+                "capabilities": []string{"pull", "resolve"},
+                "skipVerify":   true,
+                "plainHTTP":    true,
+            }
+        }
+    }
+
+    return map[string]interface{}{
+        "registryConfigPath": "/etc/containerd/certs.d",
+        "sandboxImage":       fmt.Sprintf("%s/pause:3.9", repo),
+        "root":               "/var/lib/containerd",
+        "state":              "/run/containerd",
+        "registry":           registryMap,
+    }
+}
+```
+
+**两种场景产出结构对比**：
+
+```
+在线 registry map:                          离线 registry map:
+├── "harbor.example.com"                    ├── "cr.openfuyao.cn"
+│   ├── host: "harbor.example.com"          │   ├── host: "cr.openfuyao.cn"
+│   ├── capabilities: [pull, resolve]       │   ├── capabilities: [pull, resolve, push]
+│   ├── tls: {caFile: /etc/ssl/ca.crt}      │   ├── skipVerify: true
+│   └── auth: {auth: "dXNlcjpwYXNz"}        │   └── plainHTTP: false
+├── "docker.io"                             ├── "docker.io"
+│   ├── host: "mirror.internal"             │   ├── host: "docker.io"
+│   ├── skipVerify: true                    │   ├── capabilities: [pull, resolve]
+│   └── capabilities: [pull, resolve]       │   ├── skipVerify: true
+                                            │   └── plainHTTP: true
+生成 2 个 hosts.toml                        ├── "ghcr.io"
+                                            │   ├── host: "ghcr.io"
+                                            │   ├── capabilities: [pull, resolve]
+                                            │   ├── skipVerify: true
+                                            │   └── plainHTTP: true
+                                            生成 3 个 hosts.toml
+```
+
+**使用场景对比**（更新）：
 
 | 组件类型 | 使用的字段 | 说明 |
 |---------|-----------|------|
 | **YAML/Manifest** | ClusterName, Namespace, KubernetesVersion, OpenFuyaoVersion | 现有字段，向后兼容 |
 | **Helm** | 同上 + APIServer, ServiceCIDR 等 | 可选使用扩展字段 |
-| **Binary** | 所有字段 | 完整使用，包括节点基础信息、制品信息等 |
+| **Binary** | 所有字段 + ComponentData | 完整使用，包括节点基础信息、制品信息、组件结构化数据等 |
 
 ### 8.1 模板变量系统
 
@@ -4593,6 +4990,176 @@ func (r *TemplateRenderer) RenderScript(script string, tmplCtx manifest.Template
     }
     
     return buf.String(), nil
+}
+```
+
+### 8.5 ComponentData 通用扩展与 forEach 渲染机制
+
+**设计思路**：`ComponentData` 为 TemplateContext 提供通用的组件级结构化数据注入能力。结合 `forEach` 机制，单个 `configTemplate` 可按数据条目动态展开为多个配置文件。两者配合，解决了 containerd `hosts.toml`（按 registry 数量生成多个文件）等动态多文件场景。
+
+#### 8.5.1 完整数据流
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        在线场景                                      │
+│  BKECluster.Spec.ClusterConfig.Cluster.ContainerdConfigRef          │
+│       │                                                             │
+│       ▼                                                             │
+│  ContainerdConfig CR (API Server)                                   │
+│       │                                                             │
+│       ▼                                                             │
+│  buildContainerdComponentData()                                     │
+│       │  registry: {                                                │
+│       │    "harbor.example.com": {host, capabilities, tls, auth},   │
+│       │    "docker.io": {host, skipVerify}                          │
+│       │  }                                                          │
+└───────┼─────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                        离线场景 (Legacy)                             │
+│  BKECluster.Spec.ClusterConfig.Cluster                              │
+│       │  ImageRepo: "cr.openfuyao.cn"                               │
+│       │  InsecureRegistries: "docker.io,ghcr.io"                    │
+│       ▼                                                             │
+│  buildLegacyContainerdData()                                        │
+│       │  registry: {                                                │
+│       │    "cr.openfuyao.cn": {host, capabilities:[pull,resolve,push]},│
+│       │    "docker.io": {host, skipVerify, plainHTTP},              │
+│       │    "ghcr.io": {host, skipVerify, plainHTTP}                 │
+│       │  }                                                          │
+└───────┼─────────────────────────────────────────────────────────────┘
+        │
+        ▼  两种场景产出相同的 map[string]interface{} 结构
+┌─────────────────────────────────────────────────────────────────────┐
+│  TemplateContext.ComponentData["containerd"] = data                 │
+│       │                                                             │
+│       ▼                                                             │
+│  ConfigRenderer.renderConfigTemplates()                             │
+│       │                                                             │
+│       ├── 静态 template (无 forEach)                                 │
+│       │   └── config.toml → /etc/containerd/config.toml             │
+│       │   └── containerd.service → /etc/systemd/system/...          │
+│       │                                                             │
+│       └── 动态 template (forEach: "ComponentData.containerd.registry")│
+│           ├── Key="harbor.example.com" → .../harbor.example.com/    │
+│           │   └── hosts.toml (含 TLS/Auth)                          │
+│           └── Key="docker.io" → .../docker.io/hosts.toml            │
+│               └── hosts.toml (skipVerify=true)                      │
+│                                                                     │
+│  每次迭代: ForEachContext{TemplateContext + Key + Value}             │
+│  pathTemplate/content 可访问:                                       │
+│    - 全部 TemplateContext 变量 (.ClusterName, .NodeIP, ...)         │
+│    - 迭代变量 (.Key, .Value, index .Value "field")                  │
+│    - 辅助函数 (cd "containerd" "xxx")                               │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 8.5.2 containerd ComponentVersion YAML 完整示例
+
+```yaml
+# bke-manifests/containerd/v1.7.18/component.yaml
+spec:
+  name: containerd
+  type: binary
+  version: v1.7.18
+
+  binary:
+    configTemplates:
+      # --- 静态: config.toml ---
+      - name: config.toml
+        path: "/etc/containerd/config.toml"
+        mode: "0644"
+        content: |
+          version = 2
+          root = "{{cd "containerd" "root"}}"
+          state = "{{cd "containerd" "state"}}"
+          [plugins]
+            [plugins."io.containerd.grpc.v1.cri"]
+              sandbox_image = "{{cd "containerd" "sandboxImage"}}"
+              [plugins."io.containerd.grpc.v1.cri".registry]
+                config_path = "{{cd "containerd" "registryConfigPath"}}"
+
+      # --- 静态: containerd.service ---
+      - name: containerd.service
+        path: "/etc/systemd/system/containerd.service"
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=containerd container runtime
+          After=network.target
+          [Service]
+          ExecStart=/usr/local/bin/containerd
+          Restart=always
+          [Install]
+          WantedBy=multi-user.target
+
+      # --- 动态: hosts.toml (forEach 展开) ---
+      - name: hosts.toml
+        forEach: "ComponentData.containerd.registry"
+        pathTemplate: "{{cd "containerd" "registryConfigPath"}}/{{.Key}}/hosts.toml"
+        mode: "0644"
+        content: |
+          server = "https://{{.Key}}"
+          [host."https://{{index .Value "host"}}"]
+            capabilities = {{index .Value "capabilities" | toJson}}
+            skip_verify = {{index .Value "skipVerify"}}
+            {{- if index .Value "plainHTTP"}}
+            plain_http = true
+            {{- end}}
+```
+
+#### 8.5.3 模板变量速查表（ComponentData + forEach）
+
+| 变量 | 说明 | 来源 | 示例值 |
+|------|------|------|--------|
+| `{{cd "containerd" "registryConfigPath"}}` | 仓库配置根目录 | `ComponentData["containerd"]["registryConfigPath"]` | `/etc/containerd/certs.d` |
+| `{{cd "containerd" "sandboxImage"}}` | pause 镜像 | `ComponentData["containerd"]["sandboxImage"]` | `registry.example.com/pause:3.9` |
+| `{{cd "containerd" "root"}}` | 状态目录 | `ComponentData["containerd"]["root"]` | `/var/lib/containerd` |
+| `{{cd "containerd" "state"}}` | 运行时目录 | `ComponentData["containerd"]["state"]` | `/run/containerd` |
+| `{{cd "containerd" "metricsAddress"}}` | 指标地址 | `ComponentData["containerd"]["metricsAddress"]` | `0.0.0.0:1338` |
+| `{{.Key}}` (forEach 内) | 当前迭代 key | ForEachContext.Key | `harbor.example.com` |
+| `{{.Value}}` (forEach 内) | 当前迭代 value | ForEachContext.Value | `map[host:... capabilities:...]` |
+| `{{index .Value "host"}}` (forEach 内) | 仓库主机 | ForEachContext.Value["host"] | `harbor.example.com` |
+| `{{index .Value "capabilities"}}` (forEach 内) | 允许操作 | ForEachContext.Value["capabilities"] | `["pull","resolve"]` |
+| `{{index .Value "skipVerify"}}` (forEach 内) | 跳过 TLS | ForEachContext.Value["skipVerify"] | `true` |
+| `{{index .Value "tls"}}` (forEach 内) | TLS 配置 | ForEachContext.Value["tls"] | `map[caFile:... certFile:...]` |
+| `{{index .Value "auth"}}` (forEach 内) | 认证配置 | ForEachContext.Value["auth"] | `map[auth:...]` |
+| `{{.ClusterName}}` (forEach 内) | 集群名称 | TemplateContext.ClusterName (嵌入) | `my-cluster` |
+| `{{.NodeIP}}` (forEach 内) | 节点 IP | TemplateContext.NodeIP (嵌入) | `192.168.1.10` |
+
+#### 8.5.4 cd 辅助函数
+
+```go
+// 在 ConfigRenderer.funcMap 中注册
+funcMap := template.FuncMap{
+    // ... 现有函数 ...
+
+    // cd: ComponentData 便捷访问函数
+    // 用法: {{cd "containerd" "registry"}}
+    // 等价于: {{index (index .ComponentData "containerd") "registry"}}
+    "cd": func(keys ...string) interface{} {
+        return resolveNestedPath(tmplCtx.ComponentData, keys...)
+    },
+}
+
+// resolveNestedPath 按路径逐层取值
+func resolveNestedPath(data map[string]map[string]interface{}, keys ...string) interface{} {
+    if len(keys) < 1 { return nil }
+    m, ok := data[keys[0]]
+    if !ok { return nil }
+    if len(keys) == 1 { return m }
+    var current interface{} = m
+    for _, key := range keys[1:] {
+        switch v := current.(type) {
+        case map[string]interface{}:
+            current, ok = v[key]
+            if !ok { return nil }
+        default:
+            return nil
+        }
+    }
+    return current
 }
 ```
 
@@ -7990,6 +8557,149 @@ spec:
     # matchLabels:
     #   node-pool: compute
 ```
+
+#### 12.3.2.1 containerd 配置模板 (含 forEach hosts.toml)
+
+**设计思路**：containerd 组件的 `configTemplates` 包含两类配置文件：静态文件（config.toml、containerd.service，各一个）和动态文件（hosts.toml，按 registry 数量生成多个）。动态文件通过 `forEach` 机制展开，迭代源为 `ComponentData.containerd.registry`。在线场景（ContainerdConfig CR）和离线场景（Legacy repo + insecureRegistries）由 BinaryInstaller 统一转换为相同的 `map[string]interface{}` 结构，模板无感知。
+
+**在线场景 registry 数据**（来自 ContainerdConfig CR → RegistryConfig.Configs）：
+
+```yaml
+# ComponentData["containerd"]["registry"] 的内容
+harbor.example.com:
+  host: "harbor.example.com"
+  capabilities: ["pull", "resolve"]
+  skipVerify: false
+  plainHTTP: false
+  tls:
+    caFile: "/etc/ssl/ca.crt"
+    certFile: "/etc/ssl/client.crt"
+    keyFile: "/etc/ssl/client.key"
+  auth:
+    auth: "dXNlcjpwYXNz"
+docker.io:
+  host: "mirror.internal"
+  capabilities: ["pull", "resolve"]
+  skipVerify: true
+  plainHTTP: false
+```
+
+→ 生成 2 个 `hosts.toml`：
+- `/etc/containerd/certs.d/harbor.example.com/hosts.toml`
+- `/etc/containerd/certs.d/docker.io/hosts.toml`
+
+**离线场景 registry 数据**（来自 BKECluster.Spec.ClusterConfig.Cluster.ImageRepo + InsecureRegistries）：
+
+```yaml
+# ComponentData["containerd"]["registry"] 的内容
+cr.openfuyao.cn:
+  host: "cr.openfuyao.cn"
+  capabilities: ["pull", "resolve", "push"]
+  skipVerify: true
+  plainHTTP: false
+docker.io:
+  host: "docker.io"
+  capabilities: ["pull", "resolve"]
+  skipVerify: true
+  plainHTTP: true
+ghcr.io:
+  host: "ghcr.io"
+  capabilities: ["pull", "resolve"]
+  skipVerify: true
+  plainHTTP: true
+```
+
+→ 生成 3 个 `hosts.toml`：
+- `/etc/containerd/certs.d/cr.openfuyao.cn/hosts.toml`
+- `/etc/containerd/certs.d/docker.io/hosts.toml`
+- `/etc/containerd/certs.d/ghcr.io/hosts.toml`
+
+**完整 configTemplates 定义**（在线/离线共用同一份 ComponentVersion YAML）：
+
+```yaml
+configTemplates:
+  # --- 静态: config.toml (单个文件) ---
+  - name: config.toml
+    path: "/etc/containerd/config.toml"
+    mode: "0644"
+    content: |
+      version = 2
+      root = "{{cd "containerd" "root"}}"
+      state = "{{cd "containerd" "state"}}"
+      [plugins]
+        [plugins."io.containerd.grpc.v1.cri"]
+          sandbox_image = "{{cd "containerd" "sandboxImage"}}"
+          [plugins."io.containerd.grpc.v1.cri".registry]
+            config_path = "{{cd "containerd" "registryConfigPath"}}"
+      {{- if cd "containerd" "metricsAddress"}}
+      [metrics]
+        address = "{{cd "containerd" "metricsAddress"}}"
+      {{- end}}
+
+  # --- 静态: containerd.service (单个文件) ---
+  - name: containerd.service
+    path: "/etc/systemd/system/containerd.service"
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=containerd container runtime
+      After=network.target
+      [Service]
+      ExecStart=/usr/local/bin/containerd
+      Restart=always
+      [Install]
+      WantedBy=multi-user.target
+
+  # --- 动态: hosts.toml (forEach 展开, 每个 registry 一个文件) ---
+  - name: hosts.toml
+    forEach: "ComponentData.containerd.registry"
+    pathTemplate: "{{cd "containerd" "registryConfigPath"}}/{{.Key}}/hosts.toml"
+    mode: "0644"
+    content: |
+      server = "https://{{.Key}}"
+
+      [host."https://{{index .Value "host"}}"]
+        capabilities = {{index .Value "capabilities" | toJson}}
+        skip_verify = {{index .Value "skipVerify"}}
+        {{- if index .Value "plainHTTP"}}
+        plain_http = true
+        {{- end}}
+        {{- if $tls := index .Value "tls"}}
+        {{- if index $tls "caFile"}}
+        ca = "{{index $tls "caFile"}}"
+        {{- end}}
+        {{- if index $tls "certFile"}}
+        client = [["{{index $tls "certFile"}}", "{{index $tls "keyFile"}}"]]
+        {{- end}}
+        {{- end}}
+        {{- if $auth := index .Value "auth"}}
+        {{- if index $auth "auth"}}
+        [host."https://{{index .Value "host"}}".header]
+          authorization = ["Basic {{index $auth "auth"}}"]
+        {{- end}}
+        {{- end}}
+```
+
+**字段映射表（旧代码 → 新 ComponentData）**：
+
+| 旧代码（bkeagent 内部） | 新 ComponentData 字段 | 数据来源 |
+|------------------------|----------------------|---------|
+| `runtimeParam["repo"]` | `ComponentData["containerd"]["registry"][repo]["host"]` | ContainerdConfig CR 或 BKECluster.ImageRepo |
+| `runtimeParam["sandbox"]` | `ComponentData["containerd"]["sandboxImage"]` | ContainerdConfig CR.Main.SandboxImage |
+| `runtimeParam["dataRoot"]` | `ComponentData["containerd"]["root"]` | ContainerdConfig CR.Main.Root |
+| `runtimeParam["insecureRegistries"]` | `ComponentData["containerd"]["registry"][*]["skipVerify"]=true` | ContainerdConfig CR.Registry.Configs |
+| `runtimeParam["containerdConfig"]` | 整个 `ComponentData["containerd"]` | BKECluster.Spec.ClusterConfig.Cluster.ContainerdConfigRef |
+| `createHostsTOML()` 循环 | `forEach: "ComponentData.containerd.registry"` | ConfigRenderer 展开 |
+| `generateHostsToml()` → `GenerateMultipleHostsTOML()` | `forEach: "ComponentData.containerd.registry"` | ConfigRenderer 展开 |
+
+**等价性验证点**：
+
+| 验证项 | 旧路径 | 新路径 (forEach) | 验证方法 |
+|--------|--------|-----------------|---------|
+| hosts.toml 数量 | `len(registries)` 个 | `len(ComponentData["containerd"]["registry"])` 个 | 对比文件数量 |
+| hosts.toml 路径 | `/etc/containerd/certs.d/<reg>/hosts.toml` | `pathTemplate` 渲染结果 | 对比文件路径 |
+| hosts.toml 内容 | `hosts_toml.go` 生成 | `configTemplates[*].content` 渲染 | `diff` 对比两份输出 |
+| 在线/离线一致性 | 两套独立代码路径 | 同一份 YAML，数据注入不同 | 相同 registry 输入，输出文件一致 |
 
 #### 12.3.3 字段映射表
 
