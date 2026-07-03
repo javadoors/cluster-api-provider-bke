@@ -6025,11 +6025,43 @@ func (r *BKEClusterReconciler) buildSchedulerAndExecute(
     cfg := r.buildSchedulerConfig(ctx, phaseCtx, oldCluster, newCluster, bundle, factory, bkeLogger)
     sched := dagexec.NewScheduler(cfg)
     // 构建 phaseframe-free ExecutionContext，DAG 入参不再含 phaseframe 类型
-    targetClient, _ := r.buildTargetClientset(ctx, newCluster)
+    targetClient, err := r.buildTargetClientset(ctx, newCluster)
+    if err != nil {
+        return fmt.Errorf("build target clientset: %w", err)
+    }
     execCtx := r.buildExecutionContext(ctx, phaseCtx, oldCluster, newCluster, targetClient)
     return sched.ExecuteDAG(ctx, execCtx, dag)
 }
+
+// buildTargetClientset 构建目标集群的 kubernetes clientset
+// 用于 YamlInstaller/HelmInstaller 的健康检查（需要 typed clientset 执行 Pod/Endpoint 查询）
+// 复用现有 kube.NewRemoteClientByBKECluster 基础设施，与 ClusterApplier.kubeClient() 对称
+func (r *BKEClusterReconciler) buildTargetClientset(
+    ctx context.Context,
+    bkeCluster *bkev1beta1.BKECluster,
+) (kubernetes.Interface, error) {
+    remoteClient, err := kube.NewRemoteClientByBKECluster(ctx, r.Client, bkeCluster)
+    if err != nil {
+        return nil, fmt.Errorf("create remote client for BKECluster %q: %w",
+            utils.ClientObjNS(bkeCluster), err)
+    }
+    clientset, _ := remoteClient.KubeClient()
+    if clientset == nil {
+        return nil, fmt.Errorf("failed to get clientset from remote client for BKECluster %q",
+            utils.ClientObjNS(bkeCluster))
+    }
+    return clientset, nil
+}
 ```
+
+**设计说明 — buildTargetClientset**：
+
+| 设计点 | 说明 |
+|-------|------|
+| **复用现有基础设施** | 使用 `kube.NewRemoteClientByBKECluster` 获取远端 client，与 `ClusterApplier.kubeClient()` 对称 |
+| **返回 typed clientset** | `kubernetes.Interface` 用于健康检查（PodReady/EndpointReady 需要 typed client 执行 List/Get 查询） |
+| **忽略 dynamic client** | `KubeClient()` 返回 `(*kubernetes.Clientset, dynamic.Interface)`，健康检查仅需 typed clientset |
+| **错误处理** | 远端 client 创建失败或 clientset 为 nil 时返回错误，调用方 `buildSchedulerAndExecute` 需处理错误 |
 
 #### 9.1.5 当前代码 vs 目标设计对比
 
