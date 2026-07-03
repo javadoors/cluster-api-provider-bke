@@ -8486,9 +8486,9 @@ DAG Batch 2: containerd (binary, 依赖 bkeagent)     │
 
 虽然这是**正确行为**（与现有 `EnsureAgentUpgrade` 无过滤逻辑一致），但存在一个边界问题：如果安装和升级在**同一次 Reconcile** 中触发（DAG 构建时 `VersionContext.NeedsUpgrade("bkeagent") = true`），安装 Phase 的 `MarkSuccess` 写入的版本是目标版本（v2.6.0），升级 Phase 的 `isAlreadyAtTarget` 检查 `Version == targetVersion` 会返回 true → 跳过。这是**幂等正确**的。
 
-但 containerd 的场景不同：containerd 安装和升级共用同一个 DAG 节点（由 `VersionContext` 决定 Action=Install 或 Upgrade），不存在两个 Phase 并发的问题。**真正的风险在于**：扩容的新节点 containerd 安装失败（`Phase: "Failed"`），下次 Reconcile 重试时，如果此时 `desiredVersion` 又变了（二次升级），`isAlreadyAtTarget` 会因为 `Phase != "Installed"` 不跳过 → 重试安装的是旧目标版本而非新目标版本。
+containerd 的场景不同：containerd 安装和升级共用同一个 DAG 节点（由 `VersionContext` 决定 Action=Install 或 Upgrade），不存在两个 Phase 并发的问题。扩容的新节点 containerd 安装失败（`Phase: "Failed"`）后，下次 Reconcile 时 DAG 从新的 ReleaseImage 重新构建，`cv.Spec.Version` 始终是当前目标版本，因此 `isAlreadyAtTarget` 返回 false 后重试安装的**是新目标版本**——这是正确行为。
 
-**增强方案**：在 `isAlreadyAtTarget` 中增加版本过期检测——当 `NodeComponentStatuses` 中的版本既不等于当前版本也不等于目标版本时，视为过期，不跳过。
+**增强方案**：虽然不存在"安装旧版本"的风险，但 `isAlreadyAtTarget` 仍需显式处理 `Failed`/`Timeout`/版本不匹配等状态，确保幂等语义完整。以下增强使各状态分支的跳过/不跳过逻辑更加清晰：
 
 ```go
 // isAlreadyAtTarget 增强 (在现有实现基础上扩展)
@@ -8513,14 +8513,12 @@ func (f *BKENodeFilter) isAlreadyAtTarget(
                 if status.Phase == "Installing" {
                     return true
                 }
-                // 🆕增强: 版本过期检测
-                // 当已安装版本既不等于当前版本也不等于目标版本时，视为过期
-                // 典型场景: 安装失败后目标版本变更，需要重新安装到新版本
+                // 🆕增强: 失败/超时状态显式处理
+                // 不跳过，允许重试 (DAG 已重建，cv.Spec.Version 为新目标版本)
                 if status.Phase == "Failed" || status.Phase == "Timeout" {
-                    // 不跳过，允许重试 (重试时会安装到最新目标版本)
                     return false
                 }
-                // 🆕增强: 安装成功但版本不匹配 (可能是二次升级)
+                // 🆕增强: 安装成功但版本不匹配 (二次升级场景)
                 // 不跳过，允许升级到新版本
                 if status.Phase == "Installed" && status.Version != targetVersion {
                     return false
