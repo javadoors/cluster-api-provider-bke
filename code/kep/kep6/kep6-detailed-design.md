@@ -5857,9 +5857,9 @@ type Config struct {
     CVStore                  ComponentVersionStore   // 加载 ComponentVersion (类型分发用)
     ManifestStore            manifest.Store
     ManifestApplier          manifest.Applier
-    BinaryInstaller          BinaryInstaller       // 新增 (Feature Gate ON 时注入)
-    HelmInstaller            HelmInstaller         // 新增
-    YAMLInstaller            *yamlinstaller.YamlInstaller  // 新增 (pkg/yamlinstaller, 对称 Binary/Helm)
+    BinaryInstaller          *binaryinstaller.BinaryInstaller  // 新增 (Feature Gate ON 时注入)
+    HelmInstaller            *helminstaller.HelmInstaller      // 新增
+    YAMLInstaller            *yamlinstaller.YamlInstaller      // 新增 (pkg/yamlinstaller, 对称 Binary/Helm)
     NodeProvider             NodeProvider          // 新增
     NodeFilter               NodeFilter            // 新增 (节点过滤，仅 Binary 组件使用)
     NodeStatusUpdater        NodeStatusUpdater     // 新增 (节点状态更新，仅 Binary 组件使用)
