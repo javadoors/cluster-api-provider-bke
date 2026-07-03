@@ -37,6 +37,7 @@
 10. [完整安装流程详细设计](#10-完整安装流程详细设计)
 11. [完整升级流程详细设计](#11-完整升级流程详细设计)
 12. [迁移策略详细设计](#12-迁移策略详细设计)
+    - 12.3 容器运行时重构详细设计
     - 12.5 BKEAgentSwitch 独立组件设计
 13. [错误处理与恢复](#13-错误处理与恢复)
 14. [测试设计](#14-测试设计)
@@ -8988,43 +8989,28 @@ func HelmComponentEnabled(obj client.Object) bool {
 
 **全局 flag 注册**：在 `utils/capbke/config` 中新增 `BinaryComponentSupport`/`HelmComponentSupport` bool 变量，与现有 `DeclarativeUpgrade` 一致，通过控制器启动参数注入。
 
-### 12.2a Selector 类型迁移：容器运行时互斥选择
+### 12.3 容器运行时重构详细设计
 
-**设计思路 — containerd 从直接引用改为通过 selector 间接引用**：
+**设计思路**：容器运行时是集群核心组件，当前代码中 containerd 和 Docker 的安装/升级逻辑均嵌入在 bkeagent 内置命令中，控制器无法控制安装路径、配置内容、制品来源。KEP-6 将容器运行时拆分为独立的 binary 组件，通过 BinaryInstaller SSH 推送安装，实现声明式管理。同时引入 `selector` 类型支持 containerd 和 Docker 的互斥选择。
 
-现有代码中容器运行时选择硬编码在 `init.go:789-797`（`downloadContainerRuntime` switch CRI）。KEP-6 引入 `selector` 类型后，ReleaseImage 不再直接引用 `containerd/v1.7.18`，而是引用 `container-runtime/v1.0.0`（type=selector）。DAG 构建期根据 `BKECluster.Spec.Cluster.ContainerRuntime.CRI` 自动展开为 containerd 或 docker + cri-dockerd。
+#### 12.3.1 概述
 
-| Feature Gate 状态 | ReleaseImage 引用 | 运行时选择路径 | 说明 |
-|-------------------|-------------------|--------------|------|
-| OFF | `containerd/v1.7.18`（直接引用） | `init.go:789-797` switch CRI | 旧路径，仅支持 containerd |
-| ON | `container-runtime/v1.0.0`（selector 引用） | DAG 构建器评估 condition | 新路径，支持 containerd + docker 互斥选择 |
+**重构目标**：
+- 容器运行时安装/升级从 bkeagent 内置命令改为 BinaryInstaller SSH 推送
+- 配置文件（config.toml/daemon.json、systemd service）通过 `configTemplates` 声明式定义
+- 支持 containerd 和 Docker 互斥选择（通过 `selector` 类型）
+- 支持在线/离线场景统一处理
 
-**Feature Gate ON 时的 ReleaseImage 变化**：
+**containerd 与 Docker 的关键差异**：
 
-```yaml
-# 旧 ReleaseImage (Feature Gate OFF)
-spec:
-  install:
-    components:
-      - name: containerd          # ← 直接引用 containerd
-        version: v1.7.18
-
-# 新 ReleaseImage (Feature Gate ON)
-spec:
-  install:
-    components:
-      - name: container-runtime   # ← 引用 selector, DAG 展开为 containerd 或 docker
-        version: v1.0.0
-```
-
-**Selector 展开规则**：
-- `BKECluster.Spec.Cluster.ContainerRuntime.CRI == "containerd"` → 展开为 `containerd/v1.7.18`
-- `BKECluster.Spec.Cluster.ContainerRuntime.CRI == "docker"` → 展开为 `docker/v26.0.0` + `cri-dockerd/v0.3.9`（依赖关系：docker → cri-dockerd）
-
-**与现有代码的兼容**：
-- Feature Gate OFF 时 ReleaseImage 仍引用 `containerd/v1.7.18`，走旧路径（`init.go:789-797`），行为不变
-- Feature Gate ON 时 ReleaseImage 引用 `container-runtime/v1.0.0`，DAG 构建器展开，跳过 `init.go` 的运行时选择逻辑
-- `EnsureNodesEnv` 的 scope 变更（移除 `runtime`）仅在 Feature Gate ON 时生效，对 docker 场景同样适用
+| 维度 | containerd | Docker |
+|------|-----------|--------|
+| **制品方式** | 二进制下载（tar.gz 解压） | 包管理器安装（yum/apt） |
+| **配置文件** | `/etc/containerd/config.toml` + `hosts.toml`（多个） | `/etc/docker/daemon.json`（单个） |
+| **镜像仓库配置** | `hosts.toml` 按 registry 动态生成（forEach） | `daemon.json` 的 `registry-mirrors` 字段 |
+| **CRI 适配** | 原生支持 CRI | 需要 `cri-dockerd` 作为 CRI 适配层（K8s ≥ 1.24） |
+| **组件数量** | 1 个（containerd） | 2 个（docker + cri-dockerd，依赖关系：docker → cri-dockerd） |
+| **安装路径** | `/usr/local/bin/` | 系统包管理器默认路径（`/usr/bin/`） |
 
 **bke-manifests 新增文件**：
 
@@ -9038,9 +9024,64 @@ bke-manifests/
 └── ...
 ```
 
-### 12.3 containerd 重构详细设计
+#### 12.3.2 Selector 类型：容器运行时互斥选择
 
-#### 12.3.1 当前 Phase 逻辑分析
+现有代码中容器运行时选择硬编码在 `init.go:789-797`（`downloadContainerRuntime` switch CRI）。KEP-6 引入 `selector` 类型后，ReleaseImage 不再直接引用 `containerd/v1.7.18`，而是引用 `container-runtime/v1.0.0`（type=selector）。DAG 构建期根据 `BKECluster.Spec.Cluster.ContainerRuntime.CRI` 自动展开为 containerd 或 docker + cri-dockerd。
+
+**ReleaseImage 变化**：
+
+```yaml
+# 当前 ReleaseImage (无 selector 类型)
+spec:
+  install:
+    components:
+      - name: containerd          # ← 直接引用 containerd
+        version: v1.7.18
+
+# 引入 selector 类型后的 ReleaseImage
+spec:
+  install:
+    components:
+      - name: container-runtime   # ← 引用 selector, DAG 展开为 containerd 或 docker
+        version: v1.0.0
+```
+
+**Selector 展开规则**：
+- `BKECluster.Spec.Cluster.ContainerRuntime.CRI == "containerd"` → 展开为 `containerd/v1.7.18`
+- `BKECluster.Spec.Cluster.ContainerRuntime.CRI == "docker"` → 展开为 `docker/v26.0.0` + `cri-dockerd/v0.3.9`（依赖关系：docker → cri-dockerd）
+
+**container-runtime ComponentVersion YAML（selector 类型）**：
+
+```yaml
+# bke-manifests/container-runtime/v1.0.0/component.yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: container-runtime-v1.0.0
+spec:
+  name: container-runtime
+  type: selector
+  version: v1.0.0
+  subComponents:
+    - name: containerd
+      version: v1.7.18
+      condition: '{{.ContainerRuntimeCRI == "containerd"}}'
+    - name: docker
+      version: v26.0.0
+      condition: '{{.ContainerRuntimeCRI == "docker"}}'
+    - name: cri-dockerd
+      version: v0.3.9
+      condition: '{{.ContainerRuntimeCRI == "docker"}}'
+  upgradeStrategy:
+    mode: Rolling
+    batchSize: 1
+    timeout: "10m"
+    failurePolicy: FailFast
+```
+
+#### 12.3.3 containerd 重构
+
+##### 12.3.3.1 当前 Phase 逻辑分析
 
 containerd 的安装和升级分别由两个 Phase 负责，且都依赖 bkeagent 内置命令完成：
 
@@ -9069,7 +9110,7 @@ containerd 安装嵌入在节点环境初始化流程中，不是独立 Phase：
 - 升级路径 `EnsureContainerdUpgrade` 也委托给 bkeagent 内置命令，非 SSH 推送
 - config.toml、containerd.service 内容由 bkeagent 内部生成，不可声明式配置
 
-#### 12.3.2 ComponentVersion YAML 完整定义
+##### 12.3.3.2 ComponentVersion YAML 完整定义
 
 ```yaml
 # bke-manifests/containerd/v1.7.18/component.yaml
@@ -9298,12 +9339,9 @@ spec:
     skipCompleted: true
     # 排除预约添加的节点
     excludeAppointment: true
-    # 示例: 如果只想安装到特定节点池，可添加标签过滤
-    # matchLabels:
-    #   node-pool: compute
 ```
 
-#### 12.3.2.1 containerd 配置模板 (含 forEach hosts.toml)
+##### 12.3.3.3 containerd 配置模板 (含 forEach hosts.toml)
 
 **设计思路**：containerd 组件的 `configTemplates` 包含两类配置文件：静态文件（config.toml、containerd.service，各一个）和动态文件（hosts.toml，按 registry 数量生成多个）。动态文件通过 `forEach` 机制展开，迭代源为 `Config.Cluster.ContainerRuntime.Registry`。在线场景（ContainerdConfig CR）和离线场景（Legacy repo + insecureRegistries）由 BinaryInstaller 统一转换为相同的 `map[string]interface{}` 结构，模板无感知。
 
@@ -9446,7 +9484,7 @@ configTemplates:
 | hosts.toml 内容 | `hosts_toml.go` 生成 | `configTemplates[*].content` 渲染 | `diff` 对比两份输出 |
 | 在线/离线一致性 | 两套独立代码路径 | 同一份 YAML，数据注入不同 | 相同 registry 输入，输出文件一致 |
 
-#### 12.3.3 字段映射表
+##### 12.3.3.4 containerd 字段映射表
 
 | 旧硬编码逻辑 | 新 ComponentVersion 字段 | 说明 |
 |-------------|------------------------|------|
@@ -9467,7 +9505,7 @@ configTemplates:
 | 无超时控制 | `upgradeStrategy.timeout: "10m"` | 超时可配置 |
 | 不支持卸载 | `binary.uninstallScript` | 卸载脚本声明式化 |
 
-#### 12.3.4 行为等价性验证点
+##### 12.3.3.5 containerd 行为等价性验证点
 
 | 验证项 | 旧路径 | 新路径 (BinaryInstaller) | 验证方法 |
 |--------|--------|------------------------|---------|
@@ -9483,9 +9521,88 @@ configTemplates:
 | Feature Gate OFF 回退 | `EnsureNodesEnv` 含 `runtime` | `EnsureNodesEnv` 含 `runtime` | 行为不变 |
 | containerd 版本传递 | `ENV.ContainerdVersion` 字段 | `VersionContext.TargetVersion` | 相同版本输入结果一致 |
 
+#### 12.3.4 Docker + cri-dockerd 重构
+
+##### 12.3.4.1 当前 Phase 逻辑分析
+
+Docker 和 cri-dockerd 的安装嵌入在 `EnsureNodesEnv` 的 `K8sEnvInit(scope=runtime)` 中，由 bkeagent 内置命令完成：
+
+**安装路径 — `EnsureNodesEnv` Phase**：
+
+1. `EnsureNodesEnv.Execute()` → `CheckOrInitNodesEnv()` → `buildEnvCommand()`
+2. `buildEnvCommand()` → `BuildCommonEnvCommand()` → `ENV.New()` → `buildCommandSpec()`
+3. `buildCommandSpec()` 生成三步内置命令，其中 `scope=runtime` 调用 `downloadContainerRuntime()`：
+   - `downloadContainerRuntime()` → switch CRI → `downloadDocker()` 或 `downloadContainerd()`
+   - `downloadDocker()`（`init.go:801-847`）：
+     - 构建参数：`runtime=runc`, `dataRoot=/var/lib/docker`, `cgroupDriver=systemd`, `insecureRegistries=...`
+     - 调用 `dockerPlugin` 内置命令安装 Docker（yum/apt 安装 docker-ce）
+     - 安装完成后调用 `downloadCriDockerd()`
+   - `downloadCriDockerd()`（`init.go:890-932`）：
+     - 仅 K8s ≥ 1.24 时安装
+     - 下载 `cri-dockerd-0.3.9-{arch}` 二进制
+     - 调用 `cridocker` 内置命令安装 systemd service + socket
+4. `configContainerRuntime()`（`init.go:934-958`）：
+   - Docker: 调用 `ConfigDockerDaemon()` 生成 `/etc/docker/daemon.json`
+   - containerd: 当前为空实现（`// todo 适配ContainerRuntime配置`）
+
+**升级路径**：
+
+Docker 目前没有独立的升级 Phase，升级通过重新执行 `EnsureNodesEnv` 的 `scope=runtime` 完成。
+
+**关键问题**：
+- Docker 通过包管理器安装（yum/apt），不是二进制下载，与 containerd 的制品模式不同
+- `daemon.json` 由 bkeagent 内部 `ConfigDockerDaemon()` 生成，不可声明式配置
+- cri-dockerd 安装硬编码版本（`0.3.9`），不可配置
+- Docker 和 cri-dockerd 是两个独立组件，但当前代码中耦合安装
+
+##### 12.3.4.2 Docker ComponentVersion YAML 完整定义
+
+Docker 的 ComponentVersion YAML 定义见 **3.6 Selector 类型字段定义** 中的 docker 示例。关键设计点：
+
+- **无 artifacts**：Docker 通过包管理器安装（yum/apt），不是二进制下载
+- **installScript**：负责通过 yum/apt 安装 docker-ce，启动并验证
+- **configTemplates**：`daemon.json` 配置 cgroup driver、data-root、low-level runtime
+- **镜像仓库配置**：通过 `daemon.json` 的 `registry-mirrors` 字段，不是 `hosts.toml`
+
+##### 12.3.4.3 cri-dockerd ComponentVersion YAML 完整定义
+
+cri-dockerd 的 ComponentVersion YAML 定义见 **3.6 Selector 类型字段定义** 中的 cri-dockerd 示例。关键设计点：
+
+- **有 artifacts**：cri-dockerd 是二进制下载（`cri-dockerd-{version}-{arch}`）
+- **依赖 docker**：`dependencies: [{name: docker, phase: Install}]`
+- **configTemplates**：`cri-dockerd.service` + `cri-dockerd.socket`（两个 systemd 文件）
+- **条件安装**：仅 K8s ≥ 1.24 时需要（通过 selector condition 控制）
+
+##### 12.3.4.4 Docker 字段映射表
+
+| 旧硬编码逻辑 | 新 ComponentVersion 字段 | 说明 |
+|-------------|------------------------|------|
+| `EnsureNodesEnv` → `downloadDocker()` 安装 Docker | `BinaryComponentExecutor` → `BinaryInstaller.Install()` | 安装从 agent 内置命令改为 SSH 推送 |
+| `dockerPlugin` 内置 yum/apt 安装 | `binary.installScript`（yum/apt 命令） | 安装脚本声明式化 |
+| `ConfigDockerDaemon()` 生成 daemon.json | `binary.configTemplates[0].content`（Go template） | 配置模板声明式化 |
+| `ContainerRuntime.Param["data-root"]` | `binary.variables.dataRoot` | 变量声明式化 |
+| `ContainerRuntime.Param["cgroup-driver"]` | `binary.variables.cgroupDriver` | 变量声明式化 |
+| `insecureRegistries` 参数传递 | `daemon.json` 的 `registry-mirrors` 或 `insecure-registries` | 配置模板化 |
+| `downloadCriDockerd()` 硬编码版本 | `cri-dockerd` ComponentVersion `spec.version` | 版本声明式化 |
+| `cridocker` 内置命令安装 service/socket | `cri-dockerd.configTemplates`（service + socket） | systemd 文件声明式化 |
+| Docker + cri-dockerd 耦合安装 | 两个独立 ComponentVersion，通过 `dependencies` 关联 | 组件解耦 |
+
+##### 12.3.4.5 Docker 行为等价性验证点
+
+| 验证项 | 旧路径 | 新路径 (BinaryInstaller) | 验证方法 |
+|--------|--------|------------------------|---------|
+| Docker 安装时机 | `EnsureNodesEnv` 中 `scope=runtime` | docker binary 节点先于 `EnsureNodesEnv` | DAG 拓扑顺序验证 |
+| Docker 安装方式 | `dockerPlugin` 内置命令（yum/apt） | `installScript`（yum/apt 命令） | 对比 SSH 执行日志 |
+| daemon.json 内容 | `ConfigDockerDaemon()` 生成 | Go template 渲染 | `diff` 对比两份输出 |
+| cri-dockerd 安装 | `downloadCriDockerd()` 硬编码 0.3.9 | cri-dockerd ComponentVersion 声明版本 | 检查版本一致性 |
+| cri-dockerd service/socket | `cridocker` 内置命令生成 | `configTemplates` 渲染 | `diff` 对比两份输出 |
+| Docker + cri-dockerd 依赖 | 代码中顺序调用 | `dependencies: [{name: docker}]` | DAG 依赖验证 |
+| K8s ≥ 1.24 条件 | `downloadCriDockerd()` 内部判断 | selector condition 评估 | DAG 构建期验证 |
+| Feature Gate OFF 回退 | `EnsureNodesEnv` 含 `runtime` | `EnsureNodesEnv` 含 `runtime` | 行为不变 |
+
 #### 12.3.5 EnsureNodesEnv 重构设计
 
-**设计思路**：当前 containerd 安装嵌入在 `EnsureNodesEnv` 的 `K8sEnvInit(scope=runtime)` 中，由 bkeagent 内置命令完成。重构后将 containerd 拆出为独立 binary 组件，通过 BinaryInstaller SSH 推送安装，`EnsureNodesEnv` 的 scope 中移除 `runtime`。
+**设计思路**：当前容器运行时安装嵌入在 `EnsureNodesEnv` 的 `K8sEnvInit(scope=runtime)` 中，由 bkeagent 内置命令完成。重构后将 containerd/docker/cri-dockerd 拆出为独立 binary 组件，通过 BinaryInstaller SSH 推送安装，`EnsureNodesEnv` 的 scope 中移除 `runtime`。
 
 **scope 变更**：
 
@@ -9500,13 +9617,17 @@ configTemplates:
 重构前 (DeployPhases):
   EnsureBKEAgent → EnsureNodesEnv(含 runtime scope) → EnsureClusterAPIObj → ...
 
-重构后 (Feature Gate ON):
+重构后 (Feature Gate ON, containerd):
   EnsureBKEAgent → containerd(binary) → EnsureNodesEnv(去除 runtime) → EnsureClusterAPIObj → ...
+
+重构后 (Feature Gate ON, docker):
+  EnsureBKEAgent → docker(binary) → cri-dockerd(binary) → EnsureNodesEnv(去除 runtime) → EnsureClusterAPIObj → ...
 ```
 
-containerd 作为独立 DAG 节点：
+容器运行时作为独立 DAG 节点：
 - **依赖**：bkeagent（需要 agent 在线才能 SSH 推送）
 - **被依赖**：EnsureNodesEnv（需要容器运行时就绪后才能初始化 kubelet 等环境）
+- **docker 场景**：docker → cri-dockerd 有依赖关系（`dependencies: [{name: docker}]`）
 
 **Feature Gate 兼容层实现**：
 
@@ -9514,12 +9635,12 @@ containerd 作为独立 DAG 节点：
 // pkg/command/env.go 扩展
 
 // getK8sEnvInitScope 动态构建 K8sEnvInit 的 scope
-// Feature Gate ON 时移除 runtime（containerd 由 BinaryInstaller 安装）
+// Feature Gate ON 时移除 runtime（容器运行时由 BinaryInstaller 安装）
 // 复用 pkg/featuregate.BinaryComponentEnabled(cluster) 注解/flag 模式 (见 12.2)
 func (e *ENV) getK8sEnvInitScope() string {
     scopes := []string{"time", "hosts", "dns", "kernel", "firewall", "selinux", "swap", "httpRepo"}
     if !featuregate.BinaryComponentEnabled(e.bkeCluster) {
-        scopes = append(scopes, "runtime") // 旧路径: bkeagent 内置命令安装 containerd
+        scopes = append(scopes, "runtime") // 旧路径: bkeagent 内置命令安装容器运行时
     }
     scopes = append(scopes, "iptables", "registry", "extra")
     return "scope=" + strings.Join(scopes, ",")
@@ -9546,7 +9667,7 @@ func (e *ENV) getResetScope() string {
 
 兼容层入口：
 ```go
-// 兼容层: EnsureContainerdUpgrade Phase 根据Feature Gate选择路径
+// 兼容层: EnsureContainerdUpgrade Phase 根据 Feature Gate 选择路径
 // 复用 featuregate.BinaryComponentEnabled(bkeCluster) (注解/flag 模式)
 func (e *EnsureContainerdUpgrade) Execute() (ctrl.Result, error) {
     if featuregate.BinaryComponentEnabled(e.Ctx.BKECluster) {
