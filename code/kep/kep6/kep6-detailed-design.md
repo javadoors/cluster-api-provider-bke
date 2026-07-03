@@ -5204,7 +5204,7 @@ fi
 | `{{imagePullSecret}}` | 镜像拉取 Secret | `.ImagePullSecret` | `registry-secret` |
 | `{{imageNamespace}}` | 镜像命名空间 | 从 ImageRegistry 解析 | `openfuyao` |
 
-#### 8. 安装路径变量 (Path Variables)
+#### 6. 安装路径变量 (Path Variables)
 
 | 变量 | 说明 | 来源 | 示例值 |
 |------|------|------|--------|
@@ -5218,7 +5218,7 @@ fi
 - **`{{configPath}}`/`{{logPath}}`/`{{dataPath}}`** 是组件级共享，一个组件的所有 artifact 共用同一套配置/日志/数据路径。
 - 已移除 `{{installPath}}` 和 `{{binPath}}`（组件级单一值无法满足多 artifact 不同路径的需求）。
 
-#### 9. 操作类型变量 (Action Variables)
+#### 7. 操作类型变量 (Action Variables)
 
 | 变量 | 说明 | 来源 | 示例值 |
 |------|------|------|--------|
@@ -5228,7 +5228,7 @@ fi
 
 **`isUpgrade` 的来源链路**：`VersionContext.HasCurrent()` → `BinaryActionUpgrade` → `InstallOptions.Action` → `tmplCtx.IsUpgrade` → 模板 `{{if .isUpgrade}}`
 
-#### 9.1 部署模式变量 (Deploy Mode Variables)
+#### 7.1 部署模式变量 (Deploy Mode Variables)
 
 | 变量 | 说明 | 来源 | 示例值 |
 |------|------|------|--------|
@@ -5268,7 +5268,7 @@ BKECluster.Spec.Cluster.ContainerRuntime.CRI
 
 **典型用途**：selector 类型组件的 `subComponents[].condition` 评估——根据集群配置的容器运行时类型选择安装 containerd 或 docker。
 
-#### 10. 自定义变量 (Custom Variables)
+#### 8. 自定义变量 (Custom Variables)
 
 通过 ComponentVersion 的 `binary.variables` 字段定义，可在 installScript 中引用：
 
