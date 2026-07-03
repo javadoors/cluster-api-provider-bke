@@ -5301,7 +5301,7 @@ installScript: |
 - **复用 TemplateContext**：直接使用 DAG 调度器构建的 TemplateContext，包含集群、节点、版本等信息
 - **制品数据构建**：根据 ComponentVersion 的 artifacts 定义，下载并构建制品信息
 - **自定义函数**：提供 upper/lower/eq/ne/default/joinPath 等常用函数
-- **脚本自检测**：架构和操作系统信息由安装脚本在运行时自检测，模板不感知
+- **脚本自检测**：操作系统信息由安装脚本在运行时自检测，模板不感知
 - **错误处理**：模板解析和执行失败时返回详细错误信息
 
 ```
