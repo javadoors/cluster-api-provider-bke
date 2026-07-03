@@ -5228,7 +5228,7 @@ fi
 
 **`isUpgrade` 的来源链路**：`VersionContext.HasCurrent()` → `BinaryActionUpgrade` → `InstallOptions.Action` → `tmplCtx.IsUpgrade` → 模板 `{{if .isUpgrade}}`
 
-#### 7.1 部署模式变量 (Deploy Mode Variables)
+#### 8. 部署模式变量 (Deploy Mode Variables)
 
 | 变量 | 说明 | 来源 | 示例值 |
 |------|------|------|--------|
@@ -5268,7 +5268,7 @@ BKECluster.Spec.Cluster.ContainerRuntime.CRI
 
 **典型用途**：selector 类型组件的 `subComponents[].condition` 评估——根据集群配置的容器运行时类型选择安装 containerd 或 docker。
 
-#### 8. 自定义变量 (Custom Variables)
+#### 9. 自定义变量 (Custom Variables)
 
 通过 ComponentVersion 的 `binary.variables` 字段定义，可在 installScript 中引用：
 
@@ -5534,8 +5534,6 @@ func (r *TemplateRenderer) RenderScript(script string, tmplCtx manifest.Template
     return buf.String(), nil
 }
 ```
-
----
 
 ## 9. DAG 集成详细设计
 
