@@ -8528,7 +8528,7 @@ DAG Batch 2: containerd (binary, 依赖 bkeagent)     │
   EnsureNodesEnv 检查通过 ←─────────────────────────┘
 ```
 
-##### 9.5.11.3 增强 3：扩容+升级并发幂等保护
+##### 9.5.11.2 增强 3：扩容+升级并发幂等保护
 
 **问题**：当新节点加入集群时，如果恰好触发了版本升级（`desiredVersion` 变更），可能出现以下竞态：
 1. bkeagent 安装 Phase 对新节点安装旧版本 → `NodeComponentStatuses["bkeagent"][newIP] = {Version: "v2.5.0", Phase: "Installed"}`
