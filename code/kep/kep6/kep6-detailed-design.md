@@ -6795,17 +6795,21 @@ func (e *BinaryComponentExecutor) executeRolling(ctx context.Context, nodes []No
         nodeTmpl.ComponentVersion = cv.Spec.Version
 
         // 注入部署模式变量 isOffline (用于 configTemplates.condition)
-        // 复用现有 configureContainerdLegacy:357-364 的 repoInsecure 判定逻辑:
-        // imageRegistry 在 insecureRegistries 列表中 (且非 cr.openfuyao.cn) = 离线模式
+        // 从 Config.Cluster.ContainerRuntime.Registry 读取 registry 配置
+        // 检查当前 ImageRegistry 是否在 Registry 中且 SkipVerify=true (insecure registry)
         // 离线模式: ConfigRenderer 为公共仓库生成 hosts.toml 重定向文件
+        // 注意: Legacy 的 insecureRegistries 由 BinaryInstaller 在渲染前转换为 Registry 格式
         if nodeTmpl.Variables == nil {
             nodeTmpl.Variables = make(map[string]string)
         }
         nodeTmpl.Variables["isOffline"] = "false"
-        for _, reg := range strings.Split(nodeTmpl.Variables["insecureRegistries"], ",") {
-            if strings.TrimSpace(reg) == nodeTmpl.ImageRegistry && nodeTmpl.ImageRegistry != "cr.openfuyao.cn" {
-                nodeTmpl.Variables["isOffline"] = "true"
-                break
+        if nodeTmpl.Config != nil && nodeTmpl.Config.Cluster.ContainerRuntime.Registry != nil {
+            if regConfig, ok := nodeTmpl.Config.Cluster.ContainerRuntime.Registry[nodeTmpl.ImageRegistry]; ok {
+                // SkipVerify=true 表示 insecure registry (离线模式)
+                // 排除主仓库 cr.openfuyao.cn (它始终 SkipVerify=true 但不代表离线)
+                if regConfig.SkipVerify && nodeTmpl.ImageRegistry != "cr.openfuyao.cn" {
+                    nodeTmpl.Variables["isOffline"] = "true"
+                }
             }
         }
 
