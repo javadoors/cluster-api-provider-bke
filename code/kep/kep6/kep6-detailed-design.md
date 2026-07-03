@@ -9017,32 +9017,24 @@ func HelmComponentEnabled(obj client.Object) bool {
 ```
 bke-manifests/
 ├── container-runtime/v1.0.0/component.yaml   ← type: selector (新增)
-├── containerd/v1.7.18/component.yaml         ← type: binary (已有)
+├── containerd/v1.7.18/component.yaml         ← type: binary (新增)
 ├── docker/v26.0.0/component.yaml             ← type: binary (新增)
 ├── cri-dockerd/v0.3.9/component.yaml         ← type: binary (新增)
-├── bkeagent/v2.6.0/component.yaml            ← type: binary (已有)
+├── bkeagent/v2.6.0/component.yaml            ← type: binary (新增)
 └── ...
 ```
 
 #### 12.3.2 Selector 类型：容器运行时互斥选择
 
-现有代码中容器运行时选择硬编码在 `init.go:789-797`（`downloadContainerRuntime` switch CRI）。KEP-6 引入 `selector` 类型后，ReleaseImage 不再直接引用 `containerd/v1.7.18`，而是引用 `container-runtime/v1.0.0`（type=selector）。DAG 构建期根据 `BKECluster.Spec.Cluster.ContainerRuntime.CRI` 自动展开为 containerd 或 docker + cri-dockerd。
+ReleaseImage 引用 `container-runtime/v1.0.0`（type=selector），DAG 构建期根据 `BKECluster.Spec.Cluster.ContainerRuntime.CRI` 自动展开为 containerd 或 docker + cri-dockerd。
 
-**ReleaseImage 变化**：
+**ReleaseImage 定义**：
 
 ```yaml
-# 当前 ReleaseImage (无 selector 类型)
 spec:
   install:
     components:
-      - name: containerd          # ← 直接引用 containerd
-        version: v1.7.18
-
-# 引入 selector 类型后的 ReleaseImage
-spec:
-  install:
-    components:
-      - name: container-runtime   # ← 引用 selector, DAG 展开为 containerd 或 docker
+      - name: container-runtime   # ← selector 类型, DAG 展开为 containerd 或 docker
         version: v1.0.0
 ```
 
