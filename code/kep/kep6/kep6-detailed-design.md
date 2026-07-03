@@ -5714,7 +5714,7 @@ func (s *Scheduler) ExecuteDAG(
 
 // expandSelectorComponents 在 DAG 构建期展开 selector 类型的 ComponentVersion
 // selector 自身不产生 DAG 节点；遍历 subComponents，评估 condition，为真的子组件创建 DAG 节点
-// ContainerRuntimeCRI 从 ExecutionContext.TemplateContext.Variables 获取
+// condition 通过 TemplateRenderer 通用评估，可访问 TemplateContext 中的所有变量
 func (s *Scheduler) expandSelectorComponents(
     ctx context.Context,
     execCtx *ExecutionContext,
@@ -5724,7 +5724,6 @@ func (s *Scheduler) expandSelectorComponents(
         return nil, nil // 非 selector 类型, 不展开
     }
 
-    cri := execCtx.TemplateContext.Variables["ContainerRuntimeCRI"]
     var nodes []topology.ComponentNode
     for _, sub := range cv.Spec.SubComponents {
         if sub.Condition == "" {
@@ -5735,9 +5734,13 @@ func (s *Scheduler) expandSelectorComponents(
             })
             continue
         }
-        // 评估 condition: 简单字符串匹配 (Go Template 在 DAG 构建期由 TemplateRenderer 评估)
-        // condition 示例: '{{.ContainerRuntimeCRI == "containerd"}}'
-        matched, err := evaluateCondition(sub.Condition, cri)
+        // 评估 condition: 使用 TemplateRenderer 通用评估 Go Template 表达式
+        // condition 可访问 TemplateContext 中的所有变量和函数
+        // 示例: '{{.ContainerRuntimeCRI == "containerd"}}'
+        //       '{{.isOffline}}'
+        //       '{{eq .Variables.logLevel "debug"}}'
+        //       '{{and (eq .ContainerRuntimeCRI "containerd") (ge .KubernetesVersion "1.24")}}'
+        matched, err := s.evaluateCondition(sub.Condition, execCtx.TemplateContext)
         if err != nil {
             return nil, fmt.Errorf("failed to evaluate condition for %s: %w", sub.Name, err)
         }
@@ -5751,12 +5754,21 @@ func (s *Scheduler) expandSelectorComponents(
     return nodes, nil
 }
 
-// evaluateCondition 简单评估 selector condition (匹配 ContainerRuntimeCRI 值)
-// 完整实现使用 TemplateRenderer 渲染 condition 模板, 结果 "true" = 匹配
-func evaluateCondition(condition, cri string) (bool, error) {
-    // 实际实现: 使用 TemplateRenderer 渲染 condition Go Template
-    // 此处简化: 检查 condition 中是否包含 cri 值
-    return strings.Contains(condition, "\""+cri+"\""), nil
+// evaluateCondition 通用评估 selector condition
+// 使用 TemplateRenderer 渲染 condition Go Template，渲染结果为 "true" 时返回 true
+// 可访问 TemplateContext 中的所有变量（集群信息、节点信息、版本信息、自定义变量等）
+// 可使用 TemplateRenderer 注册的所有自定义函数（eq/ne/gt/ge/lt/le/upper/lower/joinPath 等）
+func (s *Scheduler) evaluateCondition(condition string, tmplCtx manifest.TemplateContext) (bool, error) {
+    if s.templateRenderer == nil {
+        return false, fmt.Errorf("templateRenderer is not initialized")
+    }
+    // 渲染 condition 为字符串
+    result, err := s.templateRenderer.RenderScript(condition, tmplCtx)
+    if err != nil {
+        return false, fmt.Errorf("failed to render condition template: %w", err)
+    }
+    // 渲染结果为 "true" 时返回 true（trimSpace 去除首尾空白）
+    return strings.TrimSpace(result) == "true", nil
 }
 
 // executeComponent 四路分发 (Feature Gate ON)
@@ -5852,6 +5864,7 @@ type Config struct {
     NodeFilter               NodeFilter            // 新增 (节点过滤，仅 Binary 组件使用)
     NodeStatusUpdater        NodeStatusUpdater     // 新增 (节点状态更新，仅 Binary 组件使用)
     ComponentStatusUpdater   ComponentStatusUpdater // 新增 (组件状态更新，所有组件类型使用)
+    TemplateRenderer         *binaryinstaller.TemplateRenderer // 新增 (selector condition 通用评估)
     MaxParallelPerBatch      int
 }
 
@@ -5905,6 +5918,7 @@ func NewScheduler(cfg Config) *Scheduler {
         ManifestApplier:     cfg.ManifestApplier,
         registry:            registry,
         nodeProvider:        cfg.NodeProvider,
+        templateRenderer:    cfg.TemplateRenderer,
         MaxParallelPerBatch: maxParallel,
     }
 }
@@ -5955,6 +5969,9 @@ func (r *BKEClusterReconciler) buildSchedulerConfig(
         httpClient := &http.Client{Timeout: 5 * time.Minute}
         templateRenderer := binaryinstaller.NewTemplateRenderer()
         configRenderer := binaryinstaller.NewConfigRenderer(r.Client)
+
+        // 注入 TemplateRenderer 到 Scheduler (selector condition 通用评估)
+        cfg.TemplateRenderer = templateRenderer
 
         // 2. BinaryInstaller (依赖: SSH 适配器 + 缓存 + 渲染器)
         // SshClient 字段类型为 binaryinstaller.SSHExecutor 接口 (见 4.3)，
