@@ -4268,9 +4268,13 @@ func (i *YamlInstaller) Uninstall(ctx context.Context, cv *configv1alpha1.Compon
         return fmt.Errorf("delete manifests for %s: %w", cv.Spec.Name, err)
     }
 
-    // 3. 可选：Prune 裁剪
+    // 3. 可选：Prune 裁剪（按 label selector 列出资源，与当前清单比对后删除多余资源）
     if cv.Spec.YAML != nil && cv.Spec.YAML.Prune {
-        if err := i.applier.PruneResources(ctx, cv.Spec.YAML.PruneLabelSelector); err != nil {
+        namespace := ""
+        if cv.Spec.YAML != nil {
+            namespace = cv.Spec.YAML.Namespace
+        }
+        if err := i.applier.PruneResources(ctx, cv.Spec.YAML.PruneLabelSelector, namespace, pkg.Manifests); err != nil {
             return fmt.Errorf("prune resources for %s: %w", cv.Spec.Name, err)
         }
     }
@@ -4289,13 +4293,316 @@ type Applier interface {
     // ApplyComponent 应用组件清单
     ApplyComponent(ctx context.Context, pkg *ComponentPackage) error
     
-    // DeleteComponent 删除组件资源（逆序删除）
+    // DeleteComponent 删除组件资源（按 GVK 依赖逆序删除，IsNotFound 幂等）
     DeleteComponent(ctx context.Context, pkg *ComponentPackage) error
     
-    // PruneResources 裁剪不在清单中的资源（按 label selector）
-    PruneResources(ctx context.Context, selector map[string]string) error
+    // PruneResources 裁剪不在清单中的资源（按 label selector 列出，与 currentManifests 比对后删除多余资源）
+    // namespace: 限定裁剪的命名空间范围（空字符串表示集群级别）
+    // currentManifests: 当前版本的清单，用于构建 wantSet 比对
+    PruneResources(ctx context.Context, selector map[string]string, namespace string, currentManifests [][]byte) error
 }
 ```
+
+**ClusterApplier 实现**：
+
+```go
+// pkg/manifest/applier.go
+
+import (
+    "bytes"
+    "fmt"
+    "io"
+    "sort"
+    "strings"
+
+    "github.com/pkg/errors"
+    apierrors "k8s.io/apimachinery/pkg/api/errors"
+    "k8s.io/apimachinery/pkg/api/meta"
+    metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+    "k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+    "k8s.io/apimachinery/pkg/runtime/schema"
+    yamlutil "k8s.io/apimachinery/pkg/util/yaml"
+    "k8s.io/client-go/dynamic"
+    "k8s.io/client-go/restmapper"
+
+    "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/constant"
+)
+
+// gvkDeleteOrder 定义资源删除的优先级 (数值越大越先删除)
+// Deployment/Service 等工作负载先删, CRD / Namespace 最后删除
+var gvkDeleteOrder = map[string]int{
+    "Deployment":               50,
+    "StatefulSet":              50,
+    "DaemonSet":                50,
+    "Service":                  40,
+    "ConfigMap":                30,
+    "Secret":                   30,
+    "ServiceAccount":           20,
+    "Role":                     10,
+    "RoleBinding":              10,
+    "ClusterRole":              10,
+    "ClusterRoleBinding":       10,
+    "Namespace":                -10,
+    "APIService":               -20,
+    "CustomResourceDefinition": -30,
+}
+
+// deletePriority 返回 GVK 的删除优先级 (数值越大越先删除)
+func deletePriority(kind string) int {
+    if p, ok := gvkDeleteOrder[kind]; ok {
+        return p
+    }
+    return 0
+}
+
+// DeleteComponent 逆序删除组件资源
+// 按 GVK 依赖关系逆序: Deployment/Service 先删, CRD 最后删
+// 复用现有 pkg/kube.Client 的 dynamic client 基础设施，与 ApplyComponent 对称
+func (a *ClusterApplier) DeleteComponent(ctx context.Context, pkg *ComponentPackage) error {
+    if pkg == nil {
+        return fmt.Errorf("component package is nil")
+    }
+    if len(pkg.Manifests) == 0 {
+        return nil
+    }
+    if a == nil || a.client == nil || a.bkeCluster == nil {
+        return fmt.Errorf("cluster manifest applier is not configured")
+    }
+
+    kubeClient, err := a.kubeClient()
+    if err != nil {
+        return err
+    }
+    clientset, restConfig := kubeClient.KubeClient()
+    if clientset == nil {
+        return fmt.Errorf("failed to get remote clientset for BKECluster")
+    }
+
+    // 1. 解析所有 Manifest 为 unstructured 对象
+    objects, err := parseManifestsToUnstructured(pkg.Manifests)
+    if err != nil {
+        return errors.Wrapf(err, "parse manifests for delete of component %s", pkg.Name)
+    }
+
+    // 2. 按 GVK 依赖关系排序 (数值大的先删)
+    sort.SliceStable(objects, func(i, j int) bool {
+        return deletePriority(objects[i].GetKind()) > deletePriority(objects[j].GetKind())
+    })
+
+    // 3. 构建 dynamic client 和 RESTMapper
+    dc, err := dynamic.NewForConfig(restConfig)
+    if err != nil {
+        return errors.Wrap(err, "create dynamic client for delete")
+    }
+    groupResources, err := restmapper.GetAPIGroupResources(clientset.Discovery())
+    if err != nil {
+        return errors.Wrap(err, "discover API groups for delete")
+    }
+    mapper := restmapper.NewDiscoveryRESTMapper(groupResources)
+
+    // 4. 逆序删除每个资源
+    propagation := metav1.DeletePropagationBackground
+    for _, obj := range objects {
+        gvk := obj.GroupVersionKind()
+        mapping, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+        if err != nil {
+            if a.logger != nil {
+                a.logger.Error(constant.InternalErrorReason,
+                    "failed to find REST mapping for %s %s/%s, skip delete",
+                    gvk.Kind, obj.GetNamespace(), obj.GetName())
+            }
+            continue
+        }
+
+        var dr dynamic.ResourceInterface
+        if mapping.Scope.Name() == meta.RESTScopeNameNamespace {
+            dr = dc.Resource(mapping.Resource).Namespace(obj.GetNamespace())
+        } else {
+            dr = dc.Resource(mapping.Resource)
+        }
+
+        err = dr.Delete(ctx, obj.GetName(), metav1.DeleteOptions{
+            PropagationPolicy: &propagation,
+        })
+        if err != nil {
+            if apierrors.IsNotFound(err) {
+                if a.logger != nil {
+                    a.logger.Info("resource already deleted, skip",
+                        "kind", gvk.Kind, "name", obj.GetName(), "namespace", obj.GetNamespace())
+                }
+                continue
+            }
+            return errors.Wrapf(err, "delete %s %s/%s for component %s",
+                gvk.Kind, obj.GetNamespace(), obj.GetName(), pkg.Name)
+        }
+        if a.logger != nil {
+            a.logger.Info("deleted resource",
+                "kind", gvk.Kind, "name", obj.GetName(), "namespace", obj.GetNamespace())
+        }
+    }
+    return nil
+}
+
+// PruneResources 按 label selector 查找并删除不在当前清单中的资源
+// 遍历 PruneableGVKs 列表，对每种 GVK 执行 List + 比对，删除多余资源
+func (a *ClusterApplier) PruneResources(
+    ctx context.Context,
+    selector map[string]string,
+    namespace string,
+    currentManifests [][]byte,
+) error {
+    if len(selector) == 0 {
+        return fmt.Errorf("prune label selector must not be empty")
+    }
+    if a == nil || a.client == nil || a.bkeCluster == nil {
+        return fmt.Errorf("cluster manifest applier is not configured")
+    }
+
+    kubeClient, err := a.kubeClient()
+    if err != nil {
+        return err
+    }
+    clientset, restConfig := kubeClient.KubeClient()
+    if clientset == nil {
+        return fmt.Errorf("failed to get remote clientset for BKECluster")
+    }
+
+    // 1. 解析当前清单，构建 wantSet (namespace/name 集合)
+    wantSet := make(map[string]struct{})
+    objects, err := parseManifestsToUnstructured(currentManifests)
+    if err != nil {
+        return errors.Wrap(err, "parse current manifests for prune")
+    }
+    for _, obj := range objects {
+        key := fmt.Sprintf("%s/%s/%s", obj.GetKind(), obj.GetNamespace(), obj.GetName())
+        wantSet[key] = struct{}{}
+    }
+
+    // 2. 构建 dynamic client
+    dc, err := dynamic.NewForConfig(restConfig)
+    if err != nil {
+        return errors.Wrap(err, "create dynamic client for prune")
+    }
+    groupResources, err := restmapper.GetAPIGroupResources(clientset.Discovery())
+    if err != nil {
+        return errors.Wrap(err, "discover API groups for prune")
+    }
+    mapper := restmapper.NewDiscoveryRESTMapper(groupResources)
+
+    // 3. 构建 label selector 字符串
+    labelSelector := buildLabelSelector(selector)
+
+    // 4. 遍历可裁剪的 GVK 列表，List 并删除多余资源
+    propagation := metav1.DeletePropagationBackground
+    for _, gvk := range PruneableGVKs {
+        mapping, err := mapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+        if err != nil {
+            continue
+        }
+
+        var dr dynamic.ResourceInterface
+        if namespace != "" {
+            dr = dc.Resource(mapping.Resource).Namespace(namespace)
+        } else {
+            dr = dc.Resource(mapping.Resource)
+        }
+
+        list, err := dr.List(ctx, metav1.ListOptions{
+            LabelSelector: labelSelector,
+        })
+        if err != nil {
+            if apierrors.IsNotFound(err) {
+                continue
+            }
+            return errors.Wrapf(err, "list %s for prune", gvk.Kind)
+        }
+
+        for i := range list.Items {
+            obj := &list.Items[i]
+            key := fmt.Sprintf("%s/%s/%s", obj.GetKind(), obj.GetNamespace(), obj.GetName())
+            if _, wanted := wantSet[key]; wanted {
+                continue
+            }
+            if err := dr.Delete(ctx, obj.GetName(), metav1.DeleteOptions{
+                PropagationPolicy: &propagation,
+            }); err != nil {
+                if apierrors.IsNotFound(err) {
+                    continue
+                }
+                return errors.Wrapf(err, "prune %s %s/%s", gvk.Kind, obj.GetNamespace(), obj.GetName())
+            }
+            if a.logger != nil {
+                a.logger.Info("pruned resource",
+                    "kind", gvk.Kind, "name", obj.GetName(), "namespace", obj.GetNamespace())
+            }
+        }
+    }
+    return nil
+}
+
+// parseManifestsToUnstructured 将 [][]byte 清单解析为 unstructured 对象列表
+// 支持多文档 YAML (--- 分隔)
+func parseManifestsToUnstructured(manifests [][]byte) ([]unstructured.Unstructured, error) {
+    var result []unstructured.Unstructured
+    for _, doc := range manifests {
+        if len(bytes.TrimSpace(doc)) == 0 {
+            continue
+        }
+        reader := yamlutil.NewYAMLOrJSONDecoder(bytes.NewReader(doc), 4096)
+        for {
+            obj := unstructured.Unstructured{}
+            err := reader.Decode(&obj)
+            if err != nil {
+                if err == io.EOF {
+                    break
+                }
+                return nil, errors.Wrap(err, "decode manifest")
+            }
+            if obj.Object == nil {
+                continue
+            }
+            result = append(result, obj)
+        }
+    }
+    return result, nil
+}
+
+// buildLabelSelector 将 map[string]string 转换为 Kubernetes label selector 字符串
+func buildLabelSelector(labels map[string]string) string {
+    parts := make([]string, 0, len(labels))
+    for k, v := range labels {
+        parts = append(parts, fmt.Sprintf("%s=%s", k, v))
+    }
+    sort.Strings(parts)
+    return strings.Join(parts, ",")
+}
+
+// PruneableGVKs 定义可被 Prune 裁剪的资源类型列表
+// 仅包含 YAML 组件常见的可安全删除的资源类型
+var PruneableGVKs = []schema.GroupVersionKind{
+    {Group: "apps", Version: "v1", Kind: "Deployment"},
+    {Group: "apps", Version: "v1", Kind: "StatefulSet"},
+    {Group: "apps", Version: "v1", Kind: "DaemonSet"},
+    {Group: "", Version: "v1", Kind: "Service"},
+    {Group: "", Version: "v1", Kind: "ConfigMap"},
+    {Group: "", Version: "v1", Kind: "Secret"},
+    {Group: "", Version: "v1", Kind: "ServiceAccount"},
+    {Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "Role"},
+    {Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "RoleBinding"},
+    {Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "ClusterRole"},
+    {Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "ClusterRoleBinding"},
+}
+```
+
+**设计说明**：
+
+| 设计点 | 说明 |
+|-------|------|
+| **GVK 删除顺序** | `gvkDeleteOrder` 定义优先级，数值越大越先删除。Deployment(50) > Service(40) > ConfigMap(30) > RBAC(10) > Namespace(-10) > CRD(-30)。未列出的 Kind 优先级为 0，在 RBAC 和 Namespace 之间删除 |
+| **DeletePropagationBackground** | 使用 Background 传播策略，删除请求立即返回，K8s 后台级联删除依赖资源。与 `handleRemoveOperation` 的简单 Delete 不同，这里显式设置 PropagationPolicy 以确保级联行为可控 |
+| **IsNotFound 幂等** | 删除时资源不存在视为成功（与现有 `handleRemoveOperation` 一致），支持重复执行 Uninstall |
+| **Prune 安全范围** | `PruneableGVKs` 显式列出可裁剪的资源类型，避免误删非组件管理的资源。CRD 不在列表中，防止裁剪时意外删除 CRD 导致数据丢失 |
+| **复用基础设施** | 复用 `ClusterApplier.kubeClient()` 获取远端 client，复用 `restmapper` 发现 API 资源，与 `ApplyComponent` 对称 |
 
 **与 Binary/Helm 卸载的对比**：
 
