@@ -6346,29 +6346,77 @@ func (s *BundleStore) GetComponentVersion(
 // 现有 PhaseContext.VersionContext 字段亦使用此类型 (pkg/phaseframe/context.go)，
 // 设计文档与实现保持一致，复用避免概念重复。
 //
-// 注意: 现有 pkg/upgrade.VersionContext 暂未提供 HasCurrent/CurrentVersion 方法，
-// 需在 pkg/upgrade/context.go 中补充:
-//   func (vc *VersionContext) HasCurrent(name string) bool {
-//       if vc == nil { return false }
-//       _, ok := vc.Current[name]
-//       return ok
-//   }
-//   func (vc *VersionContext) CurrentVersion(name string) (string, bool) {
-//       if vc == nil { return "", false }
-//       v, ok := vc.Current[name]
-//       return v, ok
-//   }
-//   func (vc *VersionContext) TargetVersion(name string) (string, bool) {
-//       if vc == nil { return "", false }
-//       v, ok := vc.Target[name]
-//       return v, ok
-//   }
-// NeedsUpgrade 的语义须满足 Executor 决策需要:
-//   - vc == nil 或无 Target 记录: 返回 true (默认需要执行)
-//   - 无 Current 记录: 返回 true (未安装, 需要安装)
-//   - Current != Target: 返回 true (版本不同, 需要升级)
-//   - 否则: 返回 false (已在目标版本, 跳过)
-// 若现有 NeedsUpgrade 实现与此语义不符，需在 pkg/upgrade 中对齐。
+**VersionContext 扩展方法**：
+
+现有 `pkg/upgrade.VersionContext` 已提供 `GetCurrent`/`GetTarget`/`HasTarget`/`NeedsUpgrade` 等方法，但缺少 `HasCurrent` 和带存在性检查的版本查询方法。以下扩展方法需在 `pkg/upgrade/context.go` 中补充：
+
+```go
+// pkg/upgrade/context.go 扩展
+
+// HasCurrent reports whether a current version is recorded for the component.
+// Returns false if vc is nil or no current version exists.
+func (vc *VersionContext) HasCurrent(name string) bool {
+    if vc == nil {
+        return false
+    }
+    vc.mu.RLock()
+    defer vc.mu.RUnlock()
+    _, ok := vc.Current[name]
+    return ok
+}
+
+// CurrentVersion returns the current version and whether it exists.
+// Returns ("", false) if vc is nil or no current version is recorded.
+func (vc *VersionContext) CurrentVersion(name string) (string, bool) {
+    if vc == nil {
+        return "", false
+    }
+    vc.mu.RLock()
+    defer vc.mu.RUnlock()
+    v, ok := vc.Current[name]
+    return v, ok
+}
+
+// TargetVersion returns the target version and whether it exists.
+// Returns ("", false) if vc is nil or no target version is recorded.
+func (vc *VersionContext) TargetVersion(name string) (string, bool) {
+    if vc == nil {
+        return "", false
+    }
+    vc.mu.RLock()
+    defer vc.mu.RUnlock()
+    v, ok := vc.Target[name]
+    return v, ok
+}
+```
+
+**设计说明**：
+
+| 方法 | 用途 | 与现有方法的区别 |
+|------|------|-----------------|
+| `HasCurrent(name)` | 检查组件是否已安装（有当前版本记录） | 现有 `HasTarget` 仅检查目标版本，无对应 `HasCurrent` |
+| `CurrentVersion(name)` | 获取当前版本并判断是否存在 | 现有 `GetCurrent` 返回空字符串表示不存在，无法区分"未记录"和"记录为空串" |
+| `TargetVersion(name)` | 获取目标版本并判断是否存在 | 现有 `GetTarget` 同上，返回 `(string, bool)` 更符合 Go 惯例 |
+
+**NeedsUpgrade 语义对齐**：
+
+现有 `NeedsUpgrade` 实现（`pkg/upgrade/context.go:81-86`）：
+```go
+func (vc *VersionContext) NeedsUpgrade(name string) bool {
+    if vc == nil || !vc.HasTarget(name) {
+        return false  // 无目标版本 → 不需要升级
+    }
+    return vc.GetCurrent(name) != vc.GetTarget(name)  // 当前 != 目标 → 需要升级
+}
+```
+
+此语义满足 Executor 决策需要：
+- **无目标版本**：返回 false（不需要执行，组件不在升级范围内）
+- **有目标版本但无当前版本**：`GetCurrent` 返回空串，`"" != target` → 返回 true（首次安装）
+- **当前版本 != 目标版本**：返回 true（需要升级）
+- **当前版本 == 目标版本**：返回 false（已在目标版本，跳过）
+
+若后续发现语义不符，需在 `pkg/upgrade` 中对齐。
 
 // ExecutionContext 组件执行上下文 (完全独立于 phaseframe)
 //
