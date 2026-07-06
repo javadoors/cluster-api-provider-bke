@@ -6346,7 +6346,8 @@ func (s *BundleStore) GetComponentVersion(
 //
 // 现有 PhaseContext.VersionContext 字段亦使用此类型 (pkg/phaseframe/context.go)，
 // 设计文档与实现保持一致，复用避免概念重复。
-//
+```
+
 **VersionContext 扩展方法**：
 
 现有 `pkg/upgrade.VersionContext` 已提供 `GetCurrent`/`GetTarget`/`HasTarget`/`NeedsUpgrade` 等方法，但缺少 `HasCurrent` 和带存在性检查的版本查询方法。以下扩展方法需在 `pkg/upgrade/context.go` 中补充：
@@ -6419,6 +6420,7 @@ func (vc *VersionContext) NeedsUpgrade(name string) bool {
 
 若后续发现语义不符，需在 `pkg/upgrade` 中对齐。
 
+```go
 // ExecutionContext 组件执行上下文 (完全独立于 phaseframe)
 //
 // 设计说明:
