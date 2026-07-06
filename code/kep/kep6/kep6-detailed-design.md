@@ -10968,17 +10968,6 @@ func TestNewExecutionContext_ConfigAccess(t *testing.T) {
 | **代码审查与修复** | 4 人日 | 中 | 测试完成 |
 | **总计** | **114 人日 (约 5.5 人月)** | | |
 
-**新增工作项说明**：
-
-| 新增项 | 工时 | 说明 |
-|--------|------|------|
-| **containerd 重构** | 5 人日 | YAML 定义 + forEach hosts.toml + 字段映射 + 等价性验证 + EnsureContainerdUpgrade 兼容层 |
-| **docker + cri-dockerd 重构** | 4 人日 | Docker YAML（包管理器安装）+ cri-dockerd YAML + 字段映射 + 等价性验证 |
-| **bkeagent 重构** | 4 人日 | YAML 定义（17 个 CSR + TLS + kubeconfig）+ 字段映射 + 等价性验证 |
-| **EnsureNodesEnv 重构** | 3 人日 | scope 变更 + DAG 依赖变更 + Feature Gate 兼容层（getK8sEnvInitScope/getResetScope） |
-| **Selector 类型实现** | 2 人日 | expandSelectorComponents + evaluateCondition（通用 TemplateRenderer 评估） |
-| **VersionContext 扩展方法** | 1 人日 | HasCurrent/CurrentVersion/TargetVersion |
-
 **E2E 测试场景扩展**：
 
 | 测试场景 | 集群规模 | 验证内容 | 工时 |
