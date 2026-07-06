@@ -9,40 +9,80 @@
 ## 目录
 
 1. [概述](#1-概述)
+   - 1.1 设计目标
+   - 1.2 设计范围
+   - 1.3 设计约束
+   - 1.4 术语表
 2. [整体架构设计](#2-整体架构设计)
+   - 2.1 系统架构图
+   - 2.2 组件交互关系
 3. [ComponentVersion CRD 详细设计](#3-componentversion-crd-详细设计)
    - 3.1 ComponentVersion 类型定义
    - 3.2 Binary 类型字段定义
    - 3.3 YAML 类型字段定义
    - 3.4 Helm 类型字段定义
-    - 3.5 Inline 类型字段定义
-    - 3.6 Selector 类型字段定义
-    - 3.7 CRD YAML 定义
-    - 3.8 CRD 版本迁移设计
+   - 3.5 Inline 类型字段定义
+   - 3.6 Selector 类型字段定义
+   - 3.7 CRD YAML 定义
+   - 3.8 CRD 版本迁移设计
 4. [BinaryInstaller 详细设计](#4-binaryinstaller-详细设计)
-    - 4.5 ConfigRenderer 详细设计 (含三种渲染模式)
-    - 4.6 ConfigTemplateSpec forEach 动态多文件生成
+   - 4.1 核心组件架构
+   - 4.2 BinaryInstaller 执行流程图
+   - 4.3 核心接口定义
+   - 4.4 Binary Uninstall 流程
+   - 4.5 ConfigRenderer 详细设计 (含三种渲染模式)
+   - 4.6 ConfigTemplateSpec forEach 动态多文件生成
 5. [HelmInstaller 详细设计](#5-helminstaller-详细设计)
+   - 5.1 核心组件架构
+   - 5.2 HelmInstaller 执行流程图
+   - 5.3 核心接口定义
    - 5.4 健康检查
+   - 5.5 Hooks 执行引擎
 6. [YamlInstaller 详细设计](#6-yamlinstaller-详细设计)
-    - 6.3 核心接口定义
-    - 6.4 清单下载与缓存
-    - 6.5 健康检查
-    - 6.6 YAML Uninstall 流程
+   - 6.1 核心组件架构
+   - 6.2 YamlInstaller 执行流程图
+   - 6.3 核心接口定义
+   - 6.4 清单下载与缓存
+   - 6.5 健康检查
+   - 6.6 YAML Uninstall 流程
 7. [HealthCheck 共享包设计](#7-healthcheck-共享包设计)
-    - 7.1 类型定义
+   - 7.1 类型定义
 8. [模板变量系统与 TemplateContext 详细设计](#8-模板变量系统与-templatecontext-详细设计)
+   - 8.0 TemplateContext 扩展策略
+   - 8.1 模板变量系统
+   - 8.2 模板渲染流程图
+   - 8.3 TemplateContext 构建流程
+   - 8.4 自定义函数定义
 9. [DAG 集成详细设计](#9-dag-集成详细设计)
-    - 9.5 状态模型、幂等性与兼容性设计
+   - 9.1 执行器注册
+   - 9.2 ComponentVersionStore
+   - 9.3 DAG 构建与执行流程
+   - 9.4 核心接口定义
+   - 9.5 状态模型、幂等性与兼容性设计
 10. [完整安装流程详细设计](#10-完整安装流程详细设计)
+    - 10.1 安装流程图
 11. [完整升级流程详细设计](#11-完整升级流程详细设计)
+    - 11.1 升级流程图
 12. [迁移策略详细设计](#12-迁移策略详细设计)
+    - 12.1 迁移流程图
+    - 12.2 Feature Gate 设计
     - 12.3 容器运行时重构详细设计
+    - 12.4 bkeagent 重构详细设计
     - 12.5 BKEAgentSwitch 独立组件设计
+    - 12.6 迁移验证清单
 13. [错误处理与恢复](#13-错误处理与恢复)
+    - 13.1 错误处理流程图
 14. [测试设计](#14-测试设计)
+    - 14.1 单元测试
+    - 14.2 集成测试
+    - 14.3 E2E 测试
 15. [工作量与任务拆解](#15-工作量与任务拆解)
+    - 15.1 工作量评估
+    - 15.2 Sprint 计划
+    - 15.3 里程碑
 16. [附录](#16-附录)
+    - 16.1 参考文档
+    - 16.2 术语表
 17. [安装与升级样例](./kep6-install-upgrade-samples.md) _(独立文档)_
 
 ---
