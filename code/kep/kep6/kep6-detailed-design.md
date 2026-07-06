@@ -67,6 +67,12 @@
     - 12.1 迁移流程图
     - 12.2 Feature Gate 设计
     - 12.3 容器运行时重构详细设计
+      - 12.3.1 概述
+      - 12.3.2 Selector 类型：容器运行时互斥选择
+      - 12.3.3 Selector 依赖处理
+      - 12.3.4 containerd 重构
+      - 12.3.5 Docker + cri-dockerd 重构
+      - 12.3.6 EnsureNodesEnv 重构设计
     - 12.4 bkeagent 重构详细设计
     - 12.5 BKEAgentSwitch 独立组件设计
     - 12.6 迁移验证清单
@@ -9043,16 +9049,429 @@ spec:
     - name: cri-dockerd
       version: v0.3.9
       condition: '{{.ContainerRuntimeCRI == "docker"}}'
-  upgradeStrategy:
+   upgradeStrategy:
     mode: Rolling
     batchSize: 1
     timeout: "10m"
     failurePolicy: FailFast
 ```
 
-#### 12.3.3 containerd 重构
+#### 12.3.3 Selector 依赖处理
 
-##### 12.3.3.1 当前 Phase 逻辑分析
+当组件类型为 selector 时，依赖解析面临两个问题：
+
+**问题 1：Selector 的依赖需要传递给子组件**
+
+```yaml
+# container-runtime selector
+spec:
+  type: selector
+  dependencies:
+    - name: bkeagent  # selector 依赖 bkeagent
+  subComponents:
+    - name: containerd
+      condition: '{{.ContainerRuntimeCRI == "containerd"}}'
+    - name: docker
+      condition: '{{.ContainerRuntimeCRI == "docker"}}'
+```
+
+展开后，`containerd` 或 `docker` 应该继承 `bkeagent` 依赖，但当前实现不会传递。
+
+**问题 2：其他组件对 selector 的依赖需要展开**
+
+```yaml
+# kubernetes-master 依赖 container-runtime
+spec:
+  dependencies:
+    - name: container-runtime  # 这是 selector
+```
+
+展开后，`kubernetes-master` 应该依赖实际的子组件（`containerd` 或 `docker`），但当前实现无法自动转换。
+
+##### 12.3.3.1 设计原则
+
+**原则 1：依赖定义在具体组件中**
+
+不在 selector 的 `subComponents` 中定义依赖，而是在具体组件的 `spec.dependencies` 中定义：
+
+```yaml
+# containerd/v1.7.18/component.yaml
+spec:
+  name: containerd
+  type: binary
+  dependencies:
+    - name: bkeagent
+
+# docker/v26.0.0/component.yaml
+spec:
+  name: docker
+  type: binary
+  dependencies:
+    - name: bkeagent
+
+# cri-dockerd/v0.3.9/component.yaml
+spec:
+  name: cri-dockerd
+  type: binary
+  dependencies:
+    - name: docker      # cri-dockerd 依赖 docker
+    - name: bkeagent
+```
+
+**优势**：
+- ✅ 不需要扩展 `SubComponent` 结构体
+- ✅ 依赖关系在具体组件中定义，更清晰
+- ✅ 符合现有依赖解析机制
+- ✅ 每个组件独立维护自己的依赖
+
+**原则 2：对 selector 的依赖展开为对所有子组件的依赖（AND 语义）**
+
+当 selector 展开为多个子组件时，将对 selector 的依赖转换为对所有子组件的依赖，由 DAG 拓扑排序自动处理执行顺序。
+
+**示例**：
+```
+CRI=docker
+container-runtime → [docker, cri-dockerd]
+kubernetes-master 依赖 container-runtime → 转换为依赖 [docker, cri-dockerd]
+
+DAG 执行顺序：
+1. bkeagent
+2. docker
+3. cri-dockerd (等待 docker 完成)
+4. kubernetes-master (等待 docker + cri-dockerd 完成)
+```
+
+**实际效果**：虽然 `kubernetes-master` 同时依赖 `docker` 和 `cri-dockerd`，但由于 `cri-dockerd` 已经依赖 `docker`，所以 `docker` 的依赖是冗余的，最终效果等同于只依赖 `cri-dockerd`。
+
+##### 12.3.3.2 实现方案
+
+**数据结构**：
+
+```go
+// SelectorMapping 记录 selector 展开后的子组件映射
+type SelectorMapping struct {
+    SelectorName  string   // selector 名称
+    ExpandedNames []string // 展开后的子组件名称列表
+}
+```
+
+**修改 expandSelectorComponents**：
+
+```go
+// expandSelectorComponents 在 DAG 构建期展开 selector 类型的 ComponentVersion
+// selector 自身不产生 DAG 节点；遍历 subComponents，评估 condition，为真的子组件创建 DAG 节点
+// 同时合并 selector 的依赖和子组件自身的依赖
+func (s *Scheduler) expandSelectorComponents(
+    ctx context.Context,
+    execCtx *ExecutionContext,
+    cv *configv1alpha1.ComponentVersion,
+) ([]topology.ComponentNode, error) {
+    if cv.Spec.Type != configv1alpha1.ComponentTypeSelector {
+        return nil, nil // 非 selector 类型, 不展开
+    }
+
+    var nodes []topology.ComponentNode
+    for _, sub := range cv.Spec.SubComponents {
+        if sub.Condition == "" {
+            // 无 condition = 始终纳入 (兼容组合语义)
+            node, err := s.buildSubComponentNode(ctx, cv, sub)
+            if err != nil {
+                return nil, err
+            }
+            nodes = append(nodes, node)
+            continue
+        }
+        
+        // 评估 condition
+        matched, err := s.evaluateCondition(sub.Condition, execCtx.TemplateContext)
+        if err != nil {
+            return nil, fmt.Errorf("failed to evaluate condition for %s: %w", sub.Name, err)
+        }
+        
+        if matched {
+            node, err := s.buildSubComponentNode(ctx, cv, sub)
+            if err != nil {
+                return nil, err
+            }
+            nodes = append(nodes, node)
+        }
+    }
+    
+    return nodes, nil
+}
+
+// buildSubComponentNode 构建子组件节点，合并 selector 和子组件的依赖
+func (s *Scheduler) buildSubComponentNode(
+    ctx context.Context,
+    selectorCV *configv1alpha1.ComponentVersion,
+    sub configv1alpha1.SubComponent,
+) (topology.ComponentNode, error) {
+    // 加载子组件的 ComponentVersion
+    subCV, err := s.cvStore.GetComponentVersion(ctx, sub.Name, sub.Version)
+    if err != nil {
+        return topology.ComponentNode{}, fmt.Errorf(
+            "failed to load sub-component %s: %w", sub.Name, err)
+    }
+    
+    // 合并依赖：selector 的依赖 + 子组件自己的依赖
+    mergedDeps := mergeDependencies(selectorCV.Spec.Dependencies, subCV.Spec.Dependencies)
+    
+    return topology.ComponentNode{
+        Name:         sub.Name,
+        Version:      sub.Version,
+        Dependencies: mergedDeps,
+    }, nil
+}
+
+// mergeDependencies 合并 selector 和子组件的依赖（去重）
+func mergeDependencies(
+    selectorDeps, subDeps []configv1alpha1.Dependency,
+) []configv1alpha1.Dependency {
+    depMap := make(map[string]configv1alpha1.Dependency)
+    
+    // 先添加 selector 的依赖
+    for _, dep := range selectorDeps {
+        depMap[dep.Name] = dep
+    }
+    
+    // 再添加子组件的依赖（覆盖同名依赖）
+    for _, dep := range subDeps {
+        depMap[dep.Name] = dep
+    }
+    
+    // 转换为切片
+    result := make([]configv1alpha1.Dependency, 0, len(depMap))
+    for _, dep := range depMap {
+        result = append(result, dep)
+    }
+    return result
+}
+```
+
+**修改依赖解析逻辑**：
+
+```go
+// expandSelectorDependencies 将对 selector 的依赖展开为对子组件的依赖
+func expandSelectorDependencies(
+    deps []string,
+    selectorMappings []SelectorMapping,
+) []string {
+    var result []string
+    seen := make(map[string]bool)
+    
+    for _, dep := range deps {
+        // 查找是否为 selector
+        var expanded []string
+        for _, mapping := range selectorMappings {
+            if mapping.SelectorName == dep {
+                expanded = mapping.ExpandedNames
+                break
+            }
+        }
+        
+        if len(expanded) > 0 {
+            // 是 selector，展开为所有子组件
+            for _, subName := range expanded {
+                if !seen[subName] {
+                    result = append(result, subName)
+                    seen[subName] = true
+                }
+            }
+        } else {
+            // 不是 selector，保持原样
+            if !seen[dep] {
+                result = append(result, dep)
+                seen[dep] = true
+            }
+        }
+    }
+    
+    return result
+}
+```
+
+**修改 DAG 构建流程**：
+
+```go
+func BuildUpgradeDAG(
+    components []cvv1alpha1.ReleaseImageUpgradeComponent,
+    resolve topology.DependencyResolver,
+    selectorMappings []SelectorMapping,
+) (*topology.UpgradeDAG, error) {
+    dag := NewUpgradeDAG()
+    
+    // 阶段 1：添加所有组件节点（包括展开后的子组件）
+    for _, comp := range components {
+        node := &ComponentNode{
+            Name:    comp.Name,
+            Version: comp.Version,
+        }
+        if err := dag.AddNode(node); err != nil {
+            return nil, err
+        }
+    }
+    
+    // 阶段 2：解析依赖并添加边
+    for _, comp := range components {
+        // 从 ComponentVersion 读取依赖
+        deps, err := resolve(comp.Name, comp.Version)
+        if err != nil {
+            return nil, err
+        }
+        
+        // 展开 selector 依赖
+        expandedDeps := expandSelectorDependencies(deps, selectorMappings)
+        
+        // 添加依赖边
+        for _, dep := range expandedDeps {
+            if dep == comp.Name {
+                continue // 跳过自依赖
+            }
+            if _, ok := dag.GetNode(dep); !ok {
+                return nil, fmt.Errorf(
+                    "component %q depends on %q which is not in the DAG", 
+                    comp.Name, dep)
+            }
+            if err := dag.AddDependency(dep, comp.Name); err != nil {
+                return nil, err
+            }
+        }
+    }
+    
+    // 阶段 3：验证 DAG（检测循环依赖）
+    if _, err := dag.TopologicalBatches(); err != nil {
+        return nil, fmt.Errorf("invalid DAG: %w", err)
+    }
+    
+    return dag, nil
+}
+```
+
+##### 12.3.3.3 完整流程示例
+
+**输入**：
+```yaml
+# ReleaseImage
+spec:
+  upgrade:
+    components:
+      - name: container-runtime
+        version: v1.0.0
+      - name: kubernetes-master
+        version: v1.29.0
+
+# container-runtime selector (CRI=docker)
+spec:
+  type: selector
+  subComponents:
+    - name: docker
+      version: v26.0.0
+    - name: cri-dockerd
+      version: v0.3.9
+
+# docker
+spec:
+  dependencies:
+    - name: bkeagent
+
+# cri-dockerd
+spec:
+  dependencies:
+    - name: docker
+
+# kubernetes-master
+spec:
+  dependencies:
+    - name: container-runtime
+```
+
+**执行流程**：
+
+```
+1. 展开 selector
+   container-runtime → [docker, cri-dockerd]
+   SelectorMapping: {
+       SelectorName: "container-runtime", 
+       ExpandedNames: ["docker", "cri-dockerd"]
+   }
+
+2. 构建组件列表
+   [bkeagent, docker, cri-dockerd, kubernetes-master]
+
+3. 解析依赖
+   bkeagent: []
+   docker: [bkeagent]
+   cri-dockerd: [docker]
+   kubernetes-master: [container-runtime] → 展开为 [docker, cri-dockerd]
+
+4. 添加依赖边
+   bkeagent → docker
+   docker → cri-dockerd
+   docker → kubernetes-master
+   cri-dockerd → kubernetes-master
+
+5. 拓扑排序
+   Batch 0: [bkeagent]
+   Batch 1: [docker]
+   Batch 2: [cri-dockerd]
+   Batch 3: [kubernetes-master]
+```
+
+##### 12.3.3.4 边界情况处理
+
+**循环依赖检测**：
+
+```go
+// 在 AddDependency 时检测循环
+func (dag *UpgradeDAG) AddDependency(from, to string) error {
+    if from == to {
+        return fmt.Errorf("self-dependency detected: %s", from)
+    }
+    
+    // 检测是否形成循环
+    if dag.hasPath(to, from) {
+        return fmt.Errorf("circular dependency detected: %s -> %s", from, to)
+    }
+    
+    // 添加边
+    dag.edges[from] = append(dag.edges[from], to)
+    return nil
+}
+```
+
+**依赖不存在的组件**：
+
+```go
+// 在添加边之前检查组件是否存在
+for _, dep := range expandedDeps {
+    if _, ok := dag.GetNode(dep); !ok {
+        return nil, fmt.Errorf(
+            "component %q depends on %q which is not in the DAG", 
+            comp.Name, dep)
+    }
+}
+```
+
+**Selector 未展开（condition 全部为 false）**：
+
+```go
+// 如果 selector 展开为空，报错
+if len(expandedNames) == 0 {
+    return nil, fmt.Errorf(
+        "selector %q expanded to zero components", selectorName)
+}
+```
+
+##### 12.3.3.5 优势分析
+
+1. **实现简单**：不需要额外逻辑判断依赖哪个子组件
+2. **正确性保证**：DAG 拓扑排序自动处理执行顺序
+3. **冗余依赖无害**：即使依赖了多个组件，DAG 也会正确执行
+4. **通用性强**：适用于任何 selector 展开场景
+
+#### 12.3.4 containerd 重构
+
+##### 12.3.4.1 当前 Phase 逻辑分析
 
 containerd 的安装和升级分别由两个 Phase 负责，且都依赖 bkeagent 内置命令完成：
 
@@ -9081,7 +9500,7 @@ containerd 安装嵌入在节点环境初始化流程中，不是独立 Phase：
 - 升级路径 `EnsureContainerdUpgrade` 也委托给 bkeagent 内置命令，非 SSH 推送
 - config.toml、containerd.service 内容由 bkeagent 内部生成，不可声明式配置
 
-##### 12.3.3.2 ComponentVersion YAML 完整定义
+##### 12.3.4.2 ComponentVersion YAML 完整定义
 
 ```yaml
 # bke-manifests/containerd/v1.7.18/component.yaml
@@ -9312,7 +9731,7 @@ spec:
     excludeAppointment: true
 ```
 
-##### 12.3.3.3 containerd 配置模板 (含 forEach hosts.toml)
+##### 12.3.4.3 containerd 配置模板 (含 forEach hosts.toml)
 
 **设计思路**：containerd 组件的 `configTemplates` 包含两类配置文件：静态文件（config.toml、containerd.service，各一个）和动态文件（hosts.toml，按 registry 数量生成多个）。动态文件通过 `forEach` 机制展开，迭代源为 `Config.Cluster.ContainerRuntime.Registry`。在线场景（ContainerdConfig CR）和离线场景（Legacy repo + insecureRegistries）由 BinaryInstaller 统一转换为相同的 `map[string]interface{}` 结构，模板无感知。
 
@@ -9455,7 +9874,7 @@ configTemplates:
 | hosts.toml 内容 | `hosts_toml.go` 生成 | `configTemplates[*].content` 渲染 | `diff` 对比两份输出 |
 | 在线/离线一致性 | 两套独立代码路径 | 同一份 YAML，数据注入不同 | 相同 registry 输入，输出文件一致 |
 
-##### 12.3.3.4 containerd 字段映射表
+##### 12.3.4.4 containerd 字段映射表
 
 | 旧硬编码逻辑 | 新 ComponentVersion 字段 | 说明 |
 |-------------|------------------------|------|
@@ -9476,7 +9895,7 @@ configTemplates:
 | 无超时控制 | `upgradeStrategy.timeout: "10m"` | 超时可配置 |
 | 不支持卸载 | `binary.uninstallScript` | 卸载脚本声明式化 |
 
-##### 12.3.3.5 containerd 行为等价性验证点
+##### 12.3.4.5 containerd 行为等价性验证点
 
 | 验证项 | 旧路径 | 新路径 (BinaryInstaller) | 验证方法 |
 |--------|--------|------------------------|---------|
@@ -9492,9 +9911,9 @@ configTemplates:
 | Feature Gate OFF 回退 | `EnsureNodesEnv` 含 `runtime` | `EnsureNodesEnv` 含 `runtime` | 行为不变 |
 | containerd 版本传递 | `ENV.ContainerdVersion` 字段 | `VersionContext.TargetVersion` | 相同版本输入结果一致 |
 
-#### 12.3.4 Docker + cri-dockerd 重构
+#### 12.3.5 Docker + cri-dockerd 重构
 
-##### 12.3.4.1 当前 Phase 逻辑分析
+##### 12.3.5.1 当前 Phase 逻辑分析
 
 Docker 和 cri-dockerd 的安装嵌入在 `EnsureNodesEnv` 的 `K8sEnvInit(scope=runtime)` 中，由 bkeagent 内置命令完成：
 
@@ -9526,7 +9945,7 @@ Docker 目前没有独立的升级 Phase，升级通过重新执行 `EnsureNodes
 - cri-dockerd 安装硬编码版本（`0.3.9`），不可配置
 - Docker 和 cri-dockerd 是两个独立组件，但当前代码中耦合安装
 
-##### 12.3.4.2 Docker ComponentVersion YAML 完整定义
+##### 12.3.5.2 Docker ComponentVersion YAML 完整定义
 
 ```yaml
 # bke-manifests/docker/v26.0.0/component.yaml
@@ -9666,7 +10085,7 @@ spec:
 - **镜像仓库配置**：通过 `daemon.json` 的 `registry-mirrors` 和 `insecure-registries` 字段，不是 `hosts.toml`
 - **变量使用**：`registryMirrors` 和 `insecureRegistries` 通过 `split` 函数转换为 JSON 数组
 
-##### 12.3.4.3 cri-dockerd ComponentVersion YAML 完整定义
+##### 12.3.5.3 cri-dockerd ComponentVersion YAML 完整定义
 
 ```yaml
 # bke-manifests/cri-dockerd/v0.3.9/component.yaml
@@ -9829,7 +10248,7 @@ spec:
 - **条件安装**：仅 K8s ≥ 1.24 时需要（通过 selector condition 控制）
 - **变量使用**：`sandboxImage` 用于指定 pod-infra-container-image
 
-##### 12.3.4.4 Docker 字段映射表
+##### 12.3.5.4 Docker 字段映射表
 
 | 旧硬编码逻辑 | 新 ComponentVersion 字段 | 说明 |
 |-------------|------------------------|------|
@@ -9843,7 +10262,7 @@ spec:
 | `cridocker` 内置命令安装 service/socket | `cri-dockerd.configTemplates`（service + socket） | systemd 文件声明式化 |
 | Docker + cri-dockerd 耦合安装 | 两个独立 ComponentVersion，通过 `dependencies` 关联 | 组件解耦 |
 
-##### 12.3.4.5 Docker 行为等价性验证点
+##### 12.3.5.5 Docker 行为等价性验证点
 
 | 验证项 | 旧路径 | 新路径 (BinaryInstaller) | 验证方法 |
 |--------|--------|------------------------|---------|
@@ -9856,7 +10275,7 @@ spec:
 | K8s ≥ 1.24 条件 | `downloadCriDockerd()` 内部判断 | selector condition 评估 | DAG 构建期验证 |
 | Feature Gate OFF 回退 | `EnsureNodesEnv` 含 `runtime` | `EnsureNodesEnv` 含 `runtime` | 行为不变 |
 
-#### 12.3.5 EnsureNodesEnv 重构设计
+#### 12.3.6 EnsureNodesEnv 重构设计
 
 **设计思路**：当前容器运行时安装嵌入在 `EnsureNodesEnv` 的 `K8sEnvInit(scope=runtime)` 中，由 bkeagent 内置命令完成。重构后将 containerd/docker/cri-dockerd 拆出为独立 binary 组件，通过 BinaryInstaller SSH 推送安装，`EnsureNodesEnv` 的 scope 中移除 `runtime`。
 
