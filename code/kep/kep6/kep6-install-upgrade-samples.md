@@ -13,8 +13,9 @@
    - 1.2 containerd 离线安装
    - 1.3 docker 安装
    - 1.4 bkeagent 安装
-   - 1.5 ReleaseImage 样例
-   - 1.6 安装执行流程
+   - 1.5 bkeagent-switch 切换
+   - 1.6 ReleaseImage 样例
+   - 1.7 安装执行流程
 2. [升级样例](#2-升级样例)
    - 2.1 版本变更对比
    - 2.2 containerd 升级
@@ -622,7 +623,206 @@ spec:
 
 ---
 
-### 1.5 ReleaseImage 样例
+### 1.5 bkeagent-switch 切换
+
+**场景**：cluster-api 部署完成后，切换 bkeagent 的监听目标从管理集群切换到目标集群。
+
+**触发条件**：
+- cluster-api addon 部署完成
+- BKECluster 注解 `bke.bocloud.com/bkeagent-listener: bkecluster` 已设置
+
+**bkeagent-switch ComponentVersion YAML**：
+```yaml
+# bke-manifests/bkeagent-switch/v2.6.0/component.yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: bkeagent-switch-v2.6.0
+spec:
+  name: bkeagent-switch
+  type: binary
+  version: v2.6.0
+
+  binary:
+    # 无需下载制品（bkeagent 已安装）
+    artifacts: []
+
+    configTemplates:
+      # 目标集群 kubeconfig（从 cluster-api 创建的 Secret 获取）
+      - name: kubeconfig
+        path: "/etc/openFuyao/bkeagent/config"
+        mode: "0600"
+        owner: "root:root"
+        secretRef:
+          name: "{{clusterName}}-kubeconfig"
+          namespace: "{{clusterNamespace}}"
+          key: value
+
+      # 节点标识
+      - name: node
+        path: "/etc/openFuyao/bkeagent/node"
+        mode: "0644"
+        owner: "root:root"
+        content: "{{nodeHostname}}"
+
+      # 集群标识
+      - name: cluster
+        path: "/etc/openFuyao/bkeagent/cluster"
+        mode: "0644"
+        owner: "root:root"
+        content: "{{clusterName}}"
+
+    installScript: |
+      #!/bin/bash
+      set -e
+
+      # 配置文件由 ConfigRenderer 自动上传到对应路径
+      # 只需重启 bkeagent 使配置生效
+      systemctl restart bkeagent
+
+      # 等待 bkeagent 启动
+      sleep 2
+
+      # 验证 bkeagent 运行状态
+      systemctl is-active bkeagent
+
+      echo "bkeagent switched to cluster {{clusterName}}"
+
+    uninstallScript: ""  # 切换是单向操作，无需卸载
+
+    supportedArchitectures: ["amd64", "arm64"]
+    supportedOS:
+      - name: centos
+        versions: ["7", "8"]
+      - name: ubuntu
+        versions: ["20.04", "22.04"]
+
+    healthCheck:
+      enabled: true
+      timeout: "1m"
+      interval: "3s"
+      script: |
+        systemctl is-active bkeagent
+
+  dependencies:
+    - name: cluster-api
+      phase: Install
+
+  upgradeStrategy:
+    mode: Parallel  # 所有节点同时切换
+    batchSize: 0
+    timeout: "5m"
+    failurePolicy: Continue  # 失败时继续，不阻塞后续流程
+
+  nodeFilter:
+    roles: []  # 所有角色
+    skipCompleted: true  # 已切换的节点跳过
+```
+
+**执行流程**：
+```
+1. 前置检查:
+   - 检查注解 bke.bocloud.com/bkeagent-listener
+     → "current" 或缺失: 跳过（仍监听管理集群）
+     → "bkecluster": 继续执行
+   - 检查 Condition SwitchBKEAgent
+     → True: 跳过（已切换）
+     → False/缺失: 继续执行
+
+2. 获取节点列表:
+   NodeProvider.GetNodes() → [node1, node2, node3]
+
+3. 节点过滤:
+   - 排除 Failed/Deleting/Skipped 状态节点
+   - 跳过已切换节点（NodeComponentStatuses 检查）
+
+4. 渲染配置文件（Parallel 模式，所有节点并行）:
+   - kubeconfig: 从 Secret {{clusterName}}-kubeconfig 读取
+   - node: 渲染 {{nodeHostname}}
+   - cluster: 渲染 {{clusterName}}
+
+5. SSH 上传配置文件:
+   - /etc/openFuyao/bkeagent/config (目标集群 kubeconfig)
+   - /etc/openFuyao/bkeagent/node (节点标识)
+   - /etc/openFuyao/bkeagent/cluster (集群标识)
+
+6. 执行 installScript:
+   - systemctl restart bkeagent
+   - sleep 2
+   - systemctl is-active bkeagent
+
+7. 健康检查:
+   - systemctl is-active bkeagent → ✅
+
+8. 标记完成:
+   - NodeComponentStatuses[bkeagent-switch][nodeIP] = Installed
+   - Condition: SwitchBKEAgent = True
+   - ListenerTarget: bkecluster
+```
+
+**bke-manifests 目录结构**：
+```
+bke-manifests/
+├── container-runtime/v1.0.0/component.yaml  ← type: selector
+├── containerd/v1.7.18/component.yaml        ← type: binary
+├── docker/v26.0.0/component.yaml            ← type: binary
+├── cri-dockerd/v0.3.9/component.yaml        ← type: binary
+├── bkeagent/v2.6.0/component.yaml           ← type: binary
+├── bkeagent-switch/v2.6.0/component.yaml    ← type: binary (新增)
+├── cluster-api/v1.5.0/component.yaml        ← type: helm (新增)
+├── coredns/v1.11.1/component.yaml           ← type: helm
+├── openfuyao-core/v26.03/component.yaml     ← type: yaml
+└── kubernetes-master/v1.29.0/               ← type: inline
+```
+
+**cluster-api ComponentVersion YAML**：
+```yaml
+# bke-manifests/cluster-api/v1.5.0/component.yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: cluster-api-v1.5.0
+spec:
+  name: cluster-api
+  type: helm
+  version: v1.5.0
+
+  helm:
+    chart:
+      oci:
+        repository: "registry.example.com/charts/cluster-api"
+        tag: "v1.5.0"
+      checksum: "sha256:cluster-api-checksum..."
+    namespace: cluster-api-system
+    releaseName: cluster-api
+    values:
+      image:
+        repository: "registry.example.com/cluster-api"
+        tag: "{{componentVersion}}"
+    strategy:
+      mode: Install
+      wait: true
+      waitTimeout: "5m"
+      atomic: true
+    healthCheck:
+      enabled: true
+      timeout: "3m"
+      checks:
+        - type: PodReady
+          podReady:
+            namespace: cluster-api-system
+            labelSelector: "app=cluster-api"
+            minReady: 1
+
+  upgradeStrategy:
+    mode: Parallel
+    failurePolicy: FailFast
+    timeout: "10m"
+```
+
+---
+
+### 1.6 ReleaseImage 样例
 
 ```yaml
 # releaseimage-v2.6.0.yaml
@@ -634,40 +834,49 @@ spec:
   version: v2.6.0
   install:
     components:
-      # 容器运行时（selector 类型，DAG 构建期展开）
-      - name: container-runtime
-        version: v1.0.0
-      
-      # bkeagent（所有节点）
+      # Batch 1: bkeagent（监听管理集群）
       - name: bkeagent
         version: v2.6.0
       
-      # CoreDNS（Helm）
-      - name: coredns
-        version: v1.11.1
+      # Batch 2: 容器运行时（selector 类型，DAG 构建期展开）
+      - name: container-runtime
+        version: v1.0.0
       
-      # openfuyao-core（YAML）
-      - name: openfuyao-core
-        version: v26.03
-      
-      # Kubernetes 控制面（Inline）
+      # Batch 3: Kubernetes 控制面（Inline）
       - name: kubernetes-master
         version: v1.29.0
         inline:
           handler: EnsureMasterInit
           version: v1.0.0
       
-      # Kubernetes 工作节点（Inline）
+      # Batch 4: Kubernetes 工作节点（Inline）
       - name: kubernetes-worker
         version: v1.29.0
         inline:
           handler: EnsureWorkerJoin
           version: v1.0.0
+      
+      # Batch 5: cluster-api（Helm，创建目标集群 kubeconfig Secret）
+      - name: cluster-api
+        version: v1.5.0
+      
+      # Batch 6: bkeagent-switch（切换到目标集群）
+      - name: bkeagent-switch
+        version: v2.6.0
+        dependencies:
+          - name: cluster-api
+      
+      # Batch 7: 集群插件（Helm/YAML）
+      - name: coredns
+        version: v1.11.1
+      
+      - name: openfuyao-core
+        version: v26.03
 ```
 
 ---
 
-### 1.6 安装执行流程
+### 1.7 安装执行流程
 
 ```
 用户创建 BKECluster (desiredVersion: v2.6.0, CRI: containerd)
@@ -677,7 +886,8 @@ BKEClusterReconciler.Reconcile()
   │
   ├─ 1. 解析 ReleaseImage v2.6.0
   │     releaseImage.GetInstallComponents()
-  │     → [container-runtime, bkeagent, coredns, openfuyao-core, kubernetes-master, kubernetes-worker]
+  │     → [bkeagent, container-runtime, kubernetes-master, kubernetes-worker, 
+  │        cluster-api, bkeagent-switch, coredns, openfuyao-core]
   │
   ├─ 2. 加载 ComponentVersion
   │     manifestStore.GetComponentManifests() 逐个加载组件定义
@@ -687,15 +897,17 @@ BKEClusterReconciler.Reconcile()
   │
   │     DAG 拓扑批次:
   │     Batch 0: [finalizer, paused, manage, delete, dryrun]  (CommonPhases, inline)
-  │     Batch 1: [bkeagent]                                   (binary, 所有节点)
+  │     Batch 1: [bkeagent]                                   (binary, 监听管理集群)
   │     Batch 2: [containerd]                                 (binary, 依赖 bkeagent)
   │     Batch 3: [kubernetes-master]                          (inline, 依赖 containerd)
   │     Batch 4: [kubernetes-worker]                          (inline, 依赖 kubernetes-master)
-  │     Batch 5: [coredns, openfuyao-core]                   (helm/yaml, 依赖 kubernetes-master)
+  │     Batch 5: [cluster-api]                                (helm, 依赖 kubernetes-master)
+  │     Batch 6: [bkeagent-switch]                            (binary, 依赖 cluster-api)
+  │     Batch 7: [coredns, openfuyao-core]                   (helm/yaml, 依赖 kubernetes-master)
   │
   ├─ 4. Scheduler.ExecuteDAG(ctx, dag)
   │     │
-  │     ├─ Batch 1: bkeagent (binary)
+  │     ├─ Batch 1: bkeagent (binary) - 监听管理集群
   │     │   └─ BinaryComponentExecutor
   │     │       ├─ 下载 bkeagent_linux_amd64
   │     │       ├─ 渲染配置（node, TLS, kubeconfig, service）
@@ -715,7 +927,31 @@ BKEClusterReconciler.Reconcile()
   │     ├─ Batch 4: kubernetes-worker (inline)
   │     │   └─ InlineRunner.Execute(handler="EnsureWorkerJoin") → kubeadm join
   │     │
-  │     └─ Batch 5: Helm + YAML 组件 (并行)
+  │     ├─ Batch 5: cluster-api (helm)
+  │     │   └─ HelmComponentExecutor
+  │     │       ├─ 拉取 Chart (OCI Registry)
+  │     │       ├─ 渲染 Values
+  │     │       ├─ helm install --atomic --wait
+  │     │       ├─ HealthCheck: PodReady (cluster-api) → ✅
+  │     │       └─ 创建目标集群 kubeconfig Secret: {{clusterName}}-kubeconfig
+  │     │
+  │     ├─ Batch 6: bkeagent-switch (binary) - 切换到目标集群
+  │     │   └─ BinaryComponentExecutor
+  │     │       ├─ 前置检查:
+  │     │       │   ├─ 注解 bkeagent-listener = "bkecluster" → 继续
+  │     │       │   └─ Condition SwitchBKEAgent = False → 继续
+  │     │       ├─ 渲染配置:
+  │     │       │   ├─ kubeconfig: 从 Secret {{clusterName}}-kubeconfig 读取
+  │     │       │   ├─ node: 渲染 {{nodeHostname}}
+  │     │       │   └─ cluster: 渲染 {{clusterName}}
+  │     │       ├─ SSH 上传配置文件到所有节点
+  │     │       ├─ 执行 installScript: systemctl restart bkeagent
+  │     │       ├─ HealthCheck: systemctl is-active bkeagent → ✅
+  │     │       └─ 标记完成:
+  │     │           ├─ NodeComponentStatuses[bkeagent-switch] = Installed
+  │     │           └─ Condition: SwitchBKEAgent = True
+  │     │
+  │     └─ Batch 7: Helm + YAML 组件 (并行)
   │         ├─ coredns: HelmComponentExecutor
   │         │   ├─ 拉取 Chart (OCI Registry)
   │         │   ├─ 渲染 Values
@@ -732,7 +968,10 @@ BKEClusterReconciler.Reconcile()
   │
   └─ 6. 更新 BKECluster.Status
         phase: Ready
-        conditions: [{type: Ready, status: True}]
+        conditions: 
+          - {type: Ready, status: True}
+          - {type: SwitchBKEAgent, status: True}
+        listenerTarget: bkecluster
 ```
 
 ---
