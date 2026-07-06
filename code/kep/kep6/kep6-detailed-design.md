@@ -904,6 +904,10 @@ spec:
 > **ReleaseImage 引用方式**：ReleaseImage 只引用 `container-runtime/v1.0.0`，DAG 构建期自动展开为 containerd 或 docker + cri-dockerd。无需在 ReleaseImage 中分别声明。
 
 **docker ComponentVersion YAML（binary 类型）**：
+
+> 完整的 Docker ComponentVersion YAML 定义见 **12.3.4.2 Docker ComponentVersion YAML 完整定义**。
+
+简化示例：
 ```yaml
 # bke-manifests/docker/v26.0.0/component.yaml
 apiVersion: config.openfuyao.cn/v1alpha1
@@ -920,52 +924,25 @@ spec:
       cgroupDriver: "systemd"
       dataRoot: "/var/lib/docker"
       lowLevelRuntime: "runc"
-      insecureRegistries: ""
-      registryMirror: ""
 
     # Docker 通过包管理器安装 (非二进制下载), 无 artifacts
-    # installScript 负责通过 yum/apt 安装 docker-ce
     installScript: |
       #!/bin/bash
-      set -e
-      systemctl stop docker || true
-      systemctl stop docker.socket || true
+      # yum/apt 安装 docker-ce
 
-      # 1. 通过包管理器安装 docker-ce
-      if [ -f /etc/redhat-release ]; then
-        yum install -y yum-utils
-        yum install -y docker-ce
-      elif [ -f /etc/os-release ] && grep -q ubuntu /etc/os-release; then
-        apt-get update
-        apt-get install -y docker-ce
-      fi
-
-      # 2. 启动并验证
-      systemctl enable docker
-      systemctl restart docker
-      docker --version
-
-    # Docker 配置文件 (对应现有 ConfigDockerDaemon 生成逻辑)
     configTemplates:
       - name: daemon.json
         path: "/etc/docker/daemon.json"
-        mode: "0644"
         content: |
           {
             "exec-opts": ["native.cgroupdriver={{.Variables.cgroupDriver}}"],
-            "data-root": "{{.Variables.dataRoot}}",
-            "runtimes": {
-              "{{.Variables.lowLevelRuntime}}": {"path": "/usr/local/beyondvm/runc"}
-            }
+            "data-root": "{{.Variables.dataRoot}}"
           }
 
     healthCheck:
       enabled: true
-      timeout: "2m"
-      interval: "5s"
       script: |
         systemctl is-active docker
-        docker info > /dev/null 2>&1
 
   dependencies:
     - name: bkeagent
@@ -974,12 +951,14 @@ spec:
   upgradeStrategy:
     mode: Rolling
     batchSize: 1
-    timeout: "10m"
-    failurePolicy: FailFast
 ```
 > **Docker 与 containerd 的关键差异**：Docker 无 `hosts.toml`（镜像仓库配置在 `daemon.json` 的 `registry-mirrors` 中）；Docker 通过包管理器安装（无 `artifacts` 二进制下载）；Docker 需要 `cri-dockerd` 作为 CRI 适配层（K8s ≥1.24）。
 
 **cri-dockerd ComponentVersion YAML（binary 类型）**：
+
+> 完整的 cri-dockerd ComponentVersion YAML 定义见 **12.3.4.3 cri-dockerd ComponentVersion YAML 完整定义**。
+
+简化示例：
 ```yaml
 # bke-manifests/cri-dockerd/v0.3.9/component.yaml
 apiVersion: config.openfuyao.cn/v1alpha1
@@ -992,73 +971,33 @@ spec:
   version: v0.3.9
 
   binary:
+    variables:
+      sandboxImage: "{{imageRegistry}}/pause:3.9"
+
     artifacts:
       - name: cri-dockerd
         url: "{{imageRegistry}}/cri-dockerd/{{version}}/cri-dockerd-{{version}}-{{arch}}"
-        checksum: "sha256:cri-dockerd-checksum-placeholder"
         installPath: "/usr/bin"
-        executable: cri-dockerd
 
     configTemplates:
       - name: cri-dockerd.service
         path: "/etc/systemd/system/cri-dockerd.service"
-        mode: "0644"
         content: |
-          [Unit]
-          Description=CRI Interface for Docker Application Container Engine
-          After=network-online.target firewalld.service
-          Wants=network-online.target
-
           [Service]
-          ExecStart=/usr/bin/cri-dockerd --container-runtime-endpoint unix:///var/run/cri-dockerd.sock --pod-infra-container-image {{.Variables.sandboxImage}}
-          ExecStartPost=/bin/systemctl restart kubelet
-          Delegate=yes
-          Restart=always
-
-          [Install]
-          WantedBy=multi-user.target
+          ExecStart=/usr/bin/cri-dockerd --pod-infra-container-image {{.Variables.sandboxImage}}
 
       - name: cri-dockerd.socket
         path: "/etc/systemd/system/cri-dockerd.socket"
-        mode: "0644"
         content: |
-          [Unit]
-          Description=CRI Dockerd Socket for the API
-
           [Socket]
           ListenStream=/var/run/cri-dockerd.sock
-          SocketMode=0660
-          SocketUser=root
-          SocketGroup=docker
-
-          [Install]
-          WantedBy=sockets.target
 
     installScript: |
       #!/bin/bash
-      set -e
-      systemctl stop cri-dockerd || true
-      systemctl stop cri-dockerd.socket || true
-
-      # 1. 安装二进制
       install -m 0755 {{artifact.cri-dockerd.path}} /usr/bin/cri-dockerd
-
-      # 2. 安装依赖
-      if [ -f /etc/redhat-release ]; then
-        yum install -y socat || true
-      elif [ -f /etc/os-release ] && grep -q ubuntu /etc/os-release; then
-        apt-get install -y socat || true
-      fi
-
-      # 3. 启动
-      systemctl daemon-reload
-      systemctl enable cri-dockerd
-      systemctl start cri-dockerd
 
     healthCheck:
       enabled: true
-      timeout: "1m"
-      interval: "3s"
       script: |
         systemctl is-active cri-dockerd
 
@@ -1069,8 +1008,6 @@ spec:
   upgradeStrategy:
     mode: Rolling
     batchSize: 1
-    timeout: "5m"
-    failurePolicy: FailFast
 ```
 
 **Selector DAG 构建流程图**：
@@ -9551,21 +9488,306 @@ Docker 目前没有独立的升级 Phase，升级通过重新执行 `EnsureNodes
 
 ##### 12.3.4.2 Docker ComponentVersion YAML 完整定义
 
-Docker 的 ComponentVersion YAML 定义见 **3.6 Selector 类型字段定义** 中的 docker 示例。关键设计点：
+```yaml
+# bke-manifests/docker/v26.0.0/component.yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: docker-v26.0.0
+spec:
+  name: docker
+  type: binary
+  version: v26.0.0
+
+  binary:
+    variables:
+      cgroupDriver: "systemd"
+      dataRoot: "/var/lib/docker"
+      lowLevelRuntime: "runc"
+      lowLevelRuntimePath: "/usr/local/bin/runc"  # 低层运行时路径
+      registryMirrors: ""                          # 镜像加速地址（逗号分隔）
+      insecureRegistries: ""                       # 不安全仓库地址（逗号分隔）
+
+    # Docker 通过包管理器安装 (非二进制下载), 无 artifacts
+    # installScript 负责通过 yum/apt 安装 docker-ce
+
+    installScript: |
+      #!/bin/bash
+      set -e
+      # 集群: {{clusterName}}, 节点: {{nodeIP}} ({{nodeRole}})
+      # 架构: {{arch}}, 版本: {{componentVersion}}, 操作: {{action}}
+
+      # 1. 停止旧服务
+      systemctl stop docker || true
+      systemctl stop docker.socket || true
+
+      # 2. 备份旧版本 (仅升级时)
+      {{if .isUpgrade}}
+      cp /usr/bin/dockerd /usr/bin/dockerd.bak.$(date +%Y%m%d%H%M%S) || true
+      {{end}}
+
+      # 3. 通过包管理器安装 docker-ce
+      if [ -f /etc/redhat-release ]; then
+        yum install -y yum-utils
+        yum install -y docker-ce
+      elif [ -f /etc/os-release ] && grep -q ubuntu /etc/os-release; then
+        apt-get update
+        apt-get install -y docker-ce
+      fi
+
+      # 4. 安装配置文件 (由 ConfigRenderer 自动上传)
+      # daemon.json → /etc/docker/daemon.json
+
+      # 5. 启动并验证
+      systemctl daemon-reload
+      systemctl enable docker
+      systemctl restart docker
+      docker --version
+
+    uninstallScript: |
+      #!/bin/bash
+      systemctl stop docker || true
+      systemctl stop docker.socket || true
+      systemctl disable docker || true
+      rm -f /usr/bin/docker
+      rm -f /usr/bin/dockerd
+      rm -f /usr/bin/docker-proxy
+      rm -f /usr/bin/docker-init
+      rm -f /usr/lib/systemd/system/docker.service
+      rm -f /usr/lib/systemd/system/docker.socket
+      rm -rf /etc/docker/
+      systemctl daemon-reload
+
+    # Docker 配置文件 (对应现有 ConfigDockerDaemon 生成逻辑)
+    configTemplates:
+      - name: daemon.json
+        path: "/etc/docker/daemon.json"
+        mode: "0644"
+        owner: "root:root"
+        content: |
+          {
+            "exec-opts": ["native.cgroupdriver={{.Variables.cgroupDriver}}"],
+            "data-root": "{{.Variables.dataRoot}}",
+            "runtimes": {
+              "{{.Variables.lowLevelRuntime}}": {"path": "{{.Variables.lowLevelRuntimePath}}"}
+            }{{if .Variables.registryMirrors}},
+            "registry-mirrors": [{{range $i, $m := split .Variables.registryMirrors ","}}{{if $i}}, {{end}}"{{$m}}"{{end}}]
+            {{end}}{{if .Variables.insecureRegistries}},
+            "insecure-registries": [{{range $i, $r := split .Variables.insecureRegistries ","}}{{if $i}}, {{end}}"{{$r}}"{{end}}]
+            {{end}}
+          }
+
+    supportedArchitectures: ["amd64", "arm64"]
+    supportedOS:
+      - name: centos
+        versions: ["7", "8"]
+      - name: ubuntu
+        versions: ["20.04", "22.04"]
+
+    defaultConfigPath: "/etc/docker"
+    defaultLogPath: "/var/log/docker"
+    defaultDataPath: "/var/lib/docker"
+
+    healthCheck:
+      enabled: true
+      timeout: "2m"
+      interval: "5s"
+      script: |
+        systemctl is-active docker
+        docker --version | grep -q "{{componentVersion}}"
+        docker info > /dev/null 2>&1
+
+  compatibility:
+    constraints:
+      - component: kubernetes-master
+        rule: ">=1.24.0"  # Docker 需要 K8s >= 1.24 (配合 cri-dockerd)
+
+  dependencies:
+    - name: bkeagent
+      phase: Install
+
+  upgradeStrategy:
+    mode: Rolling
+    batchSize: 1
+    timeout: "10m"
+    failurePolicy: FailFast
+
+  nodeFilter:
+    roles: []  # Docker 安装到所有节点
+    skipCompleted: true
+    excludeAppointment: true
+```
+
+**关键设计点**：
 
 - **无 artifacts**：Docker 通过包管理器安装（yum/apt），不是二进制下载
 - **installScript**：负责通过 yum/apt 安装 docker-ce，启动并验证
-- **configTemplates**：`daemon.json` 配置 cgroup driver、data-root、low-level runtime
-- **镜像仓库配置**：通过 `daemon.json` 的 `registry-mirrors` 字段，不是 `hosts.toml`
+- **configTemplates**：`daemon.json` 配置 cgroup driver、data-root、low-level runtime、registry-mirrors、insecure-registries
+- **镜像仓库配置**：通过 `daemon.json` 的 `registry-mirrors` 和 `insecure-registries` 字段，不是 `hosts.toml`
+- **变量使用**：`registryMirrors` 和 `insecureRegistries` 通过 `split` 函数转换为 JSON 数组
 
 ##### 12.3.4.3 cri-dockerd ComponentVersion YAML 完整定义
 
-cri-dockerd 的 ComponentVersion YAML 定义见 **3.6 Selector 类型字段定义** 中的 cri-dockerd 示例。关键设计点：
+```yaml
+# bke-manifests/cri-dockerd/v0.3.9/component.yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: cri-dockerd-v0.3.9
+spec:
+  name: cri-dockerd
+  type: binary
+  version: v0.3.9
+
+  binary:
+    variables:
+      sandboxImage: "{{imageRegistry}}/pause:3.9"  # 沙箱镜像地址
+
+    artifacts:
+      - name: cri-dockerd
+        url: "{{imageRegistry}}/cri-dockerd/{{version}}/cri-dockerd-{{version}}-{{arch}}"
+        checksum: "sha256:cri-dockerd-checksum-placeholder"
+        installPath: "/usr/bin"
+
+    configTemplates:
+      - name: cri-dockerd.service
+        path: "/etc/systemd/system/cri-dockerd.service"
+        mode: "0644"
+        owner: "root:root"
+        content: |
+          [Unit]
+          Description=CRI Interface for Docker Application Container Engine
+          Documentation=https://docs.mirantis.com
+          After=network-online.target firewalld.service docker.service
+          Wants=network-online.target
+          Requires=docker.service
+
+          [Service]
+          Type=notify
+          ExecStart=/usr/bin/cri-dockerd --container-runtime-endpoint fd:// --pod-infra-container-image {{.Variables.sandboxImage}}
+          ExecReload=/bin/kill -s HUP $MAINPID
+          TimeoutSec=0
+          RestartSec=2
+          Restart=always
+          StartLimitBurst=3
+          StartLimitInterval=60s
+          LimitNOFILE=infinity
+          LimitNPROC=infinity
+          LimitCORE=infinity
+          TasksMax=infinity
+          Delegate=yes
+          KillMode=process
+
+          [Install]
+          WantedBy=multi-user.target
+
+      - name: cri-dockerd.socket
+        path: "/etc/systemd/system/cri-dockerd.socket"
+        mode: "0644"
+        owner: "root:root"
+        content: |
+          [Unit]
+          Description=CRI Docker Socket for the API
+
+          [Socket]
+          ListenStream=/var/run/cri-dockerd.sock
+          SocketMode=0660
+          SocketUser=root
+          SocketGroup=docker
+
+          [Install]
+          WantedBy=sockets.target
+
+    installScript: |
+      #!/bin/bash
+      set -e
+      # 集群: {{clusterName}}, 节点: {{nodeIP}} ({{nodeRole}})
+      # 架构: {{arch}}, 版本: {{componentVersion}}, 操作: {{action}}
+
+      # 1. 停止旧服务
+      systemctl stop cri-dockerd || true
+      systemctl stop cri-dockerd.socket || true
+
+      # 2. 备份旧版本 (仅升级时)
+      {{if .isUpgrade}}
+      cp /usr/bin/cri-dockerd /usr/bin/cri-dockerd.bak.$(date +%Y%m%d%H%M%S) || true
+      {{end}}
+
+      # 3. 安装二进制
+      install -m 0755 {{artifact.cri-dockerd.path}} /usr/bin/cri-dockerd
+
+      # 4. 安装依赖
+      if [ -f /etc/redhat-release ]; then
+        yum install -y socat || true
+      elif [ -f /etc/os-release ] && grep -q ubuntu /etc/os-release; then
+        apt-get install -y socat || true
+      fi
+
+      # 5. 安装配置文件和服务 (由 ConfigRenderer 自动上传)
+      # cri-dockerd.service → /etc/systemd/system/cri-dockerd.service
+      # cri-dockerd.socket → /etc/systemd/system/cri-dockerd.socket
+
+      # 6. 启动
+      systemctl daemon-reload
+      systemctl enable cri-dockerd
+      systemctl start cri-dockerd
+
+    uninstallScript: |
+      #!/bin/bash
+      systemctl stop cri-dockerd || true
+      systemctl stop cri-dockerd.socket || true
+      systemctl disable cri-dockerd || true
+      rm -f /usr/bin/cri-dockerd
+      rm -f /etc/systemd/system/cri-dockerd.service
+      rm -f /etc/systemd/system/cri-dockerd.socket
+      systemctl daemon-reload
+
+    supportedArchitectures: ["amd64", "arm64"]
+    supportedOS:
+      - name: centos
+        versions: ["7", "8"]
+      - name: ubuntu
+        versions: ["20.04", "22.04"]
+
+    defaultConfigPath: "/etc/systemd/system"
+    defaultLogPath: "/var/log/cri-dockerd"
+
+    healthCheck:
+      enabled: true
+      timeout: "1m"
+      interval: "3s"
+      script: |
+        systemctl is-active cri-dockerd
+        cri-dockerd --version | grep -q "{{componentVersion}}"
+
+  compatibility:
+    constraints:
+      - component: kubernetes-master
+        rule: ">=1.24.0"  # cri-dockerd 仅 K8s >= 1.24 需要
+
+  dependencies:
+    - name: docker
+      phase: Install
+
+  upgradeStrategy:
+    mode: Rolling
+    batchSize: 1
+    timeout: "5m"
+    failurePolicy: FailFast
+
+  nodeFilter:
+    roles: []  # cri-dockerd 安装到所有节点
+    skipCompleted: true
+    excludeAppointment: true
+```
+
+**关键设计点**：
 
 - **有 artifacts**：cri-dockerd 是二进制下载（`cri-dockerd-{version}-{arch}`）
 - **依赖 docker**：`dependencies: [{name: docker, phase: Install}]`
 - **configTemplates**：`cri-dockerd.service` + `cri-dockerd.socket`（两个 systemd 文件）
 - **条件安装**：仅 K8s ≥ 1.24 时需要（通过 selector condition 控制）
+- **变量使用**：`sandboxImage` 用于指定 pod-infra-container-image
 
 ##### 12.3.4.4 Docker 字段映射表
 
