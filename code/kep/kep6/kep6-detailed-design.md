@@ -10937,32 +10937,64 @@ func TestNewExecutionContext_ConfigAccess(t *testing.T) {
 |------|---------|---------|------|
 | **BinaryInstaller 核心实现** | 5 人日 | 中 | 无 |
 | **HelmInstaller 核心实现** | 5 人日 | 中 | 无 |
-| **YamlComponentExecutor 核心实现** | 5 人日 | 中 | 无 |
+| **YamlComponentExecutor 核心实现** | 4 人日 | 中 | 无 |
 | **TemplateRenderer 实现** | 3 人日 | 低 | 无 |
 | **ConfigRenderer 实现** | 3 人日 | 低 | TemplateRenderer |
-| **ApplyStrategy 引擎实现** | 3 人日 | 中 | YamlComponentExecutor |
-| **Prune 裁剪功能实现** | 3 人日 | 中 | ApplyStrategy 引擎 |
+| **ApplyStrategy 引擎实现** | 2 人日 | 中 | YamlComponentExecutor |
+| **Prune 裁剪功能实现** | 2 人日 | 中 | ApplyStrategy 引擎 |
 | **PreInstallHooks 执行引擎** | 3 人日 | 中 | HelmInstaller |
 | **Binary 健康检查实现** | 2 人日 | 中 | BinaryInstaller |
 | **YAML 健康检查实现** | 1 人日 | 低 | YamlComponentExecutor (复用 Helm 健康检查逻辑) |
 | **ComponentVersion CRD 扩展** | 3 人日 | 低 | 无 |
-| **CRD v1alpha2 版本迁移** | 2 人日 | 中 | CRD 扩展 |
+| **VersionContext 扩展方法实现** | 1 人日 | 低 | 无 |
 | **VersionContext 与 ExecutionContext 实现** | 3 人日 | 中 | 无 |
+| **Selector 类型实现** | 2 人日 | 中 | VersionContext |
+| **containerd 重构** | 5 人日 | 高 | BinaryInstaller, DAG 调度器适配 |
+| **docker + cri-dockerd 重构** | 4 人日 | 高 | BinaryInstaller, DAG 调度器适配 |
+| **bkeagent 重构** | 4 人日 | 中 | BinaryInstaller, DAG 调度器适配 |
+| **EnsureNodesEnv 重构** | 3 人日 | 高 | containerd/docker 重构 |
 | **BinaryComponentExecutor 集成** | 3 人日 | 中 | BinaryInstaller |
 | **HelmComponentExecutor 集成** | 3 人日 | 中 | HelmInstaller |
 | **YamlComponentExecutor 集成** | 2 人日 | 中 | YamlComponentExecutor |
-| **ComponentVersion YAML 编写** | 2 人日 | 低 | CRD 扩展 |
 | **DAG 调度器适配** | 3 人日 | 低 | Executor 集成 |
 | **Feature Gate 实现** | 1 人日 | 低 | 无 |
 | **兼容层实现** | 3 人日 | 中 | DAG 调度器适配 |
 | **错误分类与恢复机制** | 3 人日 | 中 | 核心实现完成 |
 | **单元测试** | 8 人日 | 低 | 核心实现完成 |
-| **集成测试** | 5 人日 | 中 | 单元测试完成 |
-| **E2E 测试** | 5 人日 | 中 | 集成测试完成 |
+| **集成测试** | 7 人日 | 中 | 单元测试完成 |
+| **E2E 测试** | 12 人日 | 中 | 集成测试完成 |
 | **迁移验证** | 3 人日 | 中 | 兼容层实现 |
 | **文档编写** | 4 人日 | 低 | 无 |
 | **代码审查与修复** | 4 人日 | 中 | 测试完成 |
-| **总计** | **93 人日 (约 4 人月)** | | |
+| **总计** | **114 人日 (约 5.5 人月)** | | |
+
+**新增工作项说明**：
+
+| 新增项 | 工时 | 说明 |
+|--------|------|------|
+| **containerd 重构** | 5 人日 | YAML 定义 + forEach hosts.toml + 字段映射 + 等价性验证 + EnsureContainerdUpgrade 兼容层 |
+| **docker + cri-dockerd 重构** | 4 人日 | Docker YAML（包管理器安装）+ cri-dockerd YAML + 字段映射 + 等价性验证 |
+| **bkeagent 重构** | 4 人日 | YAML 定义（17 个 CSR + TLS + kubeconfig）+ 字段映射 + 等价性验证 |
+| **EnsureNodesEnv 重构** | 3 人日 | scope 变更 + DAG 依赖变更 + Feature Gate 兼容层（getK8sEnvInitScope/getResetScope） |
+| **Selector 类型实现** | 2 人日 | expandSelectorComponents + evaluateCondition（通用 TemplateRenderer 评估） |
+| **VersionContext 扩展方法** | 1 人日 | HasCurrent/CurrentVersion/TargetVersion |
+
+**E2E 测试场景扩展**：
+
+| 测试场景 | 集群规模 | 验证内容 | 工时 |
+|---------|---------|---------|------|
+| containerd 全新安装（在线） | 1M+2W | containerd 安装+配置+健康检查 | 1 人日 |
+| containerd 全新安装（离线） | 1M+2W | 离线缓存+hosts.toml 生成 | 1 人日 |
+| docker 全新安装 | 1M+2W | docker+cri-dockerd 安装 | 1 人日 |
+| containerd 升级 | 1M+2W | v1.7.15→v1.7.18 滚动升级 | 1 人日 |
+| docker 升级 | 1M+2W | docker+cri-dockerd 升级 | 1 人日 |
+| bkeagent 安装+升级 | 1M+2W | bkeagent 全新安装+版本升级 | 1 人日 |
+| 大规模安装 | 3M+10W | 并行安装性能，无资源竞争 | 1 人日 |
+| 跨版本升级 | 3M+5W | v2.5.0 → v2.6.0 完整升级 | 1 人日 |
+| 升级失败恢复 | 3M+3W | 模拟节点失败，验证 Continue/Rollback | 1 人日 |
+| Feature Gate 兼容性 | 1M+2W | ON/OFF 路径、混合模式 | 1 人日 |
+| 多架构测试 | 混合 | amd64/arm64 混合集群安装+升级 | 1 人日 |
+| 回滚测试 | 1M+2W | Binary uninstallScript + Helm rollback | 1 人日 |
 
 ### 15.2 Sprint 计划
 
@@ -10992,14 +11024,44 @@ func TestNewExecutionContext_ConfigAccess(t *testing.T) {
 
 | 任务 | 负责人 | 交付物 |
 |------|--------|--------|
-| ComponentVersion CRD 扩展 | 开发A | binary/helm 字段定义 |
+| ComponentVersion CRD 扩展 | 开发A | binary/helm/selector 字段定义 |
+| VersionContext 扩展方法 | 开发B | HasCurrent/CurrentVersion/TargetVersion |
+| Selector 类型实现 | 开发B | expandSelectorComponents + evaluateCondition |
 | BinaryComponentExecutor | 开发A | `pkg/dagexec/binary_component_executor.go` |
 | HelmComponentExecutor | 开发C | `pkg/dagexec/helm_component_executor.go` |
-| ComponentVersion YAML 编写 | 开发B | containerd/bkeagent/coredns YAML |
 | DAG 调度器适配 | 开发B | 执行器注册与调度 |
 | Feature Gate 实现 | 开发A | 开关控制逻辑 |
-| 集成测试 | 开发A+B+C | 安装/升级/回滚场景 |
-| E2E 测试 | 开发A+B+C | 多场景端到端验证 |
+
+#### Sprint 4 (第7-8周): 容器运行时重构
+
+| 任务 | 负责人 | 交付物 |
+|------|--------|--------|
+| containerd ComponentVersion YAML | 开发A | containerd/v1.7.18/component.yaml |
+| docker ComponentVersion YAML | 开发B | docker/v26.0.0/component.yaml |
+| cri-dockerd ComponentVersion YAML | 开发B | cri-dockerd/v0.3.9/component.yaml |
+| containerd 字段映射与验证 | 开发A | 字段映射表 + 等价性验证点 |
+| docker 字段映射与验证 | 开发B | 字段映射表 + 等价性验证点 |
+| EnsureNodesEnv 重构 | 开发C | scope 变更 + Feature Gate 兼容层 |
+| EnsureContainerdUpgrade 兼容层 | 开发A | Feature Gate ON 时跳过旧逻辑 |
+
+#### Sprint 5 (第9-10周): bkeagent 重构与集成测试
+
+| 任务 | 负责人 | 交付物 |
+|------|--------|--------|
+| bkeagent ComponentVersion YAML | 开发A | bkeagent/v2.6.0/component.yaml |
+| bkeagent 字段映射与验证 | 开发A | 字段映射表 + 等价性验证点 |
+| 兼容层实现 | 开发B | 旧 Phase 兼容逻辑 |
+| 集成测试 | 开发A+B+C | 安装/升级/回滚场景（7 人日） |
+| E2E 测试 (第一批) | 开发A+B+C | containerd/docker/bkeagent 场景（6 人日） |
+
+#### Sprint 6 (第11-12周): 测试与发布
+
+| 任务 | 负责人 | 交付物 |
+|------|--------|--------|
+| E2E 测试 (第二批) | 开发A+B+C | 大规模/跨版本/失败恢复/兼容性/多架构/回滚（6 人日） |
+| 迁移验证 | 开发A | 验证清单所有项目通过 |
+| 文档编写 | 开发B | 用户文档 + 开发文档 |
+| 代码审查与修复 | 开发A+B+C | 测试完成后的最终修复 |
 
 ### 15.3 里程碑
 
@@ -11007,8 +11069,10 @@ func TestNewExecutionContext_ConfigAccess(t *testing.T) {
 |--------|------|---------|---------|
 | **M1: BinaryInstaller 完成** | 第2周末 | BinaryInstaller 核心功能 + 单元测试 | 单元测试覆盖率 >85% |
 | **M2: HelmInstaller 完成** | 第4周末 | HelmInstaller 核心功能 + 单元测试 | 单元测试覆盖率 >85% |
-| **M3: DAG 集成完成** | 第5周末 | Executor 集成 + ComponentVersion YAML | 集成测试通过 |
-| **M4: Beta 发布** | 第6周末 | Feature Gate 灰度 + E2E 测试 | E2E 通过率 >95% |
+| **M3: DAG 集成完成** | 第6周末 | Executor 集成 + Selector 类型 + Feature Gate | 集成测试通过 |
+| **M4: 容器运行时重构完成** | 第8周末 | containerd/docker/cri-dockerd YAML + EnsureNodesEnv 重构 | 字段映射验证通过 |
+| **M5: bkeagent 重构完成** | 第10周末 | bkeagent YAML + 兼容层 + 集成测试 | 集成测试通过 |
+| **M6: Beta 发布** | 第12周末 | E2E 测试 + 迁移验证 + 文档 | E2E 通过率 >95% |
 
 ---
 
