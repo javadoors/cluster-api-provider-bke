@@ -145,6 +145,18 @@ spec:
       # 验证
       containerd --version
 
+    uninstallScript: |
+      #!/bin/bash
+      systemctl stop containerd || true
+      systemctl disable containerd || true
+      rm -f /usr/local/bin/containerd
+      rm -f /usr/local/bin/containerd-shim-runc-v2
+      rm -f /usr/local/bin/containerd-shim-shimless-v2
+      rm -f /usr/local/bin/ctr
+      rm -f /usr/lib/systemd/system/containerd.service
+      rm -rf /etc/containerd/
+      systemctl daemon-reload
+
     healthCheck:
       enabled: true
       timeout: "2m"
@@ -236,6 +248,171 @@ spec:
 ```
 
 **关键差异**：离线模式需要为多个公共仓库生成 hosts.toml，将请求重定向到私有仓库。
+
+**containerd ComponentVersion YAML（离线模式）**：
+```yaml
+# bke-manifests/containerd/v1.7.18/component.yaml (离线模式配置)
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: containerd-v1.7.18
+spec:
+  name: containerd
+  type: binary
+  version: v1.7.18
+
+  binary:
+    variables:
+      logLevel: "info"
+      snapshotter: "overlayfs"
+      sandboxImage: "{{.Config.Cluster.ImageRepo.Domain}}/pause:3.9"
+
+    artifacts:
+      - name: containerd
+        url: "{{.Config.Cluster.ImageRepo.Domain}}/binaries/containerd/{{version}}/containerd-{{version}}-linux-{{arch}}.tar.gz"
+        checksum: "sha256:abc123def456..."
+        installPath: "/"
+
+    configTemplates:
+      # 静态配置：config.toml
+      - name: config.toml
+        path: "/etc/containerd/config.toml"
+        mode: "0644"
+        content: |
+          version = 2
+          root = "/var/lib/containerd"
+          state = "/run/containerd"
+          
+          [plugins."io.containerd.grpc.v1.cri"]
+            sandbox_image = "{{.Variables.sandboxImage}}"
+            [plugins."io.containerd.grpc.v1.cri".containerd]
+              snapshotter = "{{.Variables.snapshotter}}"
+            [plugins."io.containerd.grpc.v1.cri".registry]
+              config_path = "/etc/containerd/certs.d"
+
+      # 静态配置：containerd.service
+      - name: containerd.service
+        path: "/etc/systemd/system/containerd.service"
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=containerd container runtime
+          After=network.target
+
+          [Service]
+          ExecStart=/usr/local/bin/containerd
+          Restart=always
+
+          [Install]
+          WantedBy=multi-user.target
+
+      # 主仓库 hosts.toml（在线/离线均生成）
+      - name: hosts.toml
+        path: "/etc/containerd/certs.d/{{.Config.Cluster.ImageRepo.Domain}}/hosts.toml"
+        mode: "0644"
+        content: |
+          server = "https://{{.Config.Cluster.ImageRepo.Domain}}"
+          
+          [host."https://{{.Config.Cluster.ImageRepo.Domain}}"]
+            capabilities = ["pull", "resolve", "push"]
+            skip_verify = true
+
+      # 离线重定向：docker.io（仅离线模式生成）
+      - name: docker.io-hosts.toml
+        path: "/etc/containerd/certs.d/docker.io/hosts.toml"
+        mode: "0644"
+        condition: "{{.isOffline}}"
+        content: |
+          server = "https://docker.io"
+          
+          [host."https://{{.Config.Cluster.ImageRepo.Domain}}"]
+            capabilities = ["pull", "resolve"]
+            skip_verify = true
+
+      # 离线重定向：ghcr.io（仅离线模式生成）
+      - name: ghcr.io-hosts.toml
+        path: "/etc/containerd/certs.d/ghcr.io/hosts.toml"
+        mode: "0644"
+        condition: "{{.isOffline}}"
+        content: |
+          server = "https://ghcr.io"
+          
+          [host."https://{{.Config.Cluster.ImageRepo.Domain}}"]
+            capabilities = ["pull", "resolve"]
+            skip_verify = true
+
+      # 离线重定向：quay.io（仅离线模式生成）
+      - name: quay.io-hosts.toml
+        path: "/etc/containerd/certs.d/quay.io/hosts.toml"
+        mode: "0644"
+        condition: "{{.isOffline}}"
+        content: |
+          server = "https://quay.io"
+          
+          [host."https://{{.Config.Cluster.ImageRepo.Domain}}"]
+            capabilities = ["pull", "resolve"]
+            skip_verify = true
+
+      # 离线重定向：registry.k8s.io（仅离线模式生成）
+      - name: registry.k8s.io-hosts.toml
+        path: "/etc/containerd/certs.d/registry.k8s.io/hosts.toml"
+        mode: "0644"
+        condition: "{{.isOffline}}"
+        content: |
+          server = "https://registry.k8s.io"
+          
+          [host."https://{{.Config.Cluster.ImageRepo.Domain}}"]
+            capabilities = ["pull", "resolve"]
+            skip_verify = true
+
+    installScript: |
+      #!/bin/bash
+      set -e
+      
+      # 停止旧服务
+      systemctl stop containerd || true
+      
+      # 解压安装
+      tar -xzf {{.Artifacts.containerd.Path}} -C /
+      chmod +x /usr/local/bin/containerd
+      
+      # 启动
+      systemctl daemon-reload
+      systemctl enable containerd
+      systemctl start containerd
+      
+      # 验证
+      containerd --version
+
+    uninstallScript: |
+      #!/bin/bash
+      systemctl stop containerd || true
+      systemctl disable containerd || true
+      rm -f /usr/local/bin/containerd
+      rm -f /usr/local/bin/containerd-shim-runc-v2
+      rm -f /usr/local/bin/containerd-shim-shimless-v2
+      rm -f /usr/local/bin/ctr
+      rm -f /usr/lib/systemd/system/containerd.service
+      rm -rf /etc/containerd/
+      systemctl daemon-reload
+
+    healthCheck:
+      enabled: true
+      timeout: "2m"
+      script: |
+        systemctl is-active containerd
+        containerd --version | grep -q "{{.ComponentVersion}}"
+
+  dependencies:
+    - name: bkeagent
+      phase: Install
+
+  upgradeStrategy:
+    mode: Rolling
+    batchSize: 1
+    timeout: "10m"
+    failurePolicy: FailFast
+```
 
 **hosts.toml 生成结果**：
 ```
@@ -593,6 +770,16 @@ spec:
       # 验证
       sleep 2
       systemctl is-active bkeagent
+
+    uninstallScript: |
+      #!/bin/bash
+      systemctl stop bkeagent || true
+      systemctl disable bkeagent || true
+      rm -f /usr/local/bin/bkeagent
+      rm -f /usr/lib/systemd/system/bkeagent.service
+      rm -rf /etc/openFuyao/bkeagent
+      rm -rf /etc/openFuyao/certs
+      systemctl daemon-reload
 
     healthCheck:
       enabled: true
@@ -1445,6 +1632,8 @@ bke-manifests/
 ├── docker/v26.0.0/component.yaml            ← type: binary (被 selector 引用)
 ├── cri-dockerd/v0.3.9/component.yaml        ← type: binary (被 selector 引用, 依赖 docker)
 ├── bkeagent/v2.6.0/component.yaml           ← type: binary
+├── bkeagent-switch/v2.6.0/component.yaml    ← type: binary (切换监听目标)
+├── cluster-api/v1.5.0/component.yaml        ← type: helm (管理目标集群)
 ├── coredns/v1.11.1/component.yaml           ← type: helm
 ├── openfuyao-core/v26.03/component.yaml     ← type: yaml (含 subComponents)
 └── kubernetes-master/v1.29.0/               ← type: inline (无需 YAML, 由 inline handler 定义)
