@@ -13,9 +13,11 @@
    - 1.2 containerd 离线安装
    - 1.3 docker 安装
    - 1.4 bkeagent 安装
-   - 1.5 bkeagent-switch 切换
-   - 1.6 ReleaseImage 样例
-   - 1.7 安装执行流程
+   - 1.5 cluster-api 部署
+   - 1.6 bkeagent-switch 切换
+   - 1.7 bke-manifests 目录结构
+   - 1.8 ReleaseImage 样例
+   - 1.9 安装执行流程
 2. [升级样例](#2-升级样例)
    - 2.1 版本变更对比
    - 2.2 containerd 升级
@@ -623,7 +625,74 @@ spec:
 
 ---
 
-### 1.5 bkeagent-switch 切换
+### 1.5 cluster-api 部署
+
+**场景**：部署 cluster-api 组件，用于管理目标集群的生命周期，并创建目标集群的 kubeconfig Secret。
+
+**cluster-api ComponentVersion YAML**：
+```yaml
+# bke-manifests/cluster-api/v1.5.0/component.yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: cluster-api-v1.5.0
+spec:
+  name: cluster-api
+  type: helm
+  version: v1.5.0
+
+  helm:
+    chart:
+      oci:
+        repository: "registry.example.com/charts/cluster-api"
+        tag: "v1.5.0"
+      checksum: "sha256:cluster-api-checksum..."
+    namespace: cluster-api-system
+    releaseName: cluster-api
+    values:
+      image:
+        repository: "registry.example.com/cluster-api"
+        tag: "{{componentVersion}}"
+    strategy:
+      mode: Install
+      wait: true
+      waitTimeout: "5m"
+      atomic: true
+    healthCheck:
+      enabled: true
+      timeout: "3m"
+      checks:
+        - type: PodReady
+          podReady:
+            namespace: cluster-api-system
+            labelSelector: "app=cluster-api"
+            minReady: 1
+
+  upgradeStrategy:
+    mode: Parallel
+    failurePolicy: FailFast
+    timeout: "10m"
+```
+
+**执行流程**：
+```
+1. HelmComponentExecutor 执行:
+   - 从 OCI Registry 拉取 cluster-api Chart
+   - 渲染 Values（image.tag = componentVersion）
+   - helm install --namespace cluster-api-system --atomic --wait
+   - 等待 Pod Ready（cluster-api-system 命名空间）
+   - 健康检查通过
+
+2. 创建目标集群 kubeconfig Secret:
+   - Secret 名称: {{clusterName}}-kubeconfig
+   - 命名空间: {{clusterNamespace}}
+   - 内容: 目标集群的 admin kubeconfig
+   - 用途: bkeagent-switch 组件读取此 Secret 切换到目标集群
+```
+
+---
+
+### 1.6 bkeagent-switch 切换
 
 **场景**：cluster-api 部署完成后，切换 bkeagent 的监听目标从管理集群切换到目标集群。
 
@@ -760,7 +829,11 @@ spec:
    - ListenerTarget: bkecluster
 ```
 
-**bke-manifests 目录结构**：
+---
+
+### 1.7 bke-manifests 目录结构
+
+**目录结构**：
 ```
 bke-manifests/
 ├── container-runtime/v1.0.0/component.yaml  ← type: selector
@@ -768,61 +841,21 @@ bke-manifests/
 ├── docker/v26.0.0/component.yaml            ← type: binary
 ├── cri-dockerd/v0.3.9/component.yaml        ← type: binary
 ├── bkeagent/v2.6.0/component.yaml           ← type: binary
-├── bkeagent-switch/v2.6.0/component.yaml    ← type: binary (新增)
-├── cluster-api/v1.5.0/component.yaml        ← type: helm (新增)
+├── bkeagent-switch/v2.6.0/component.yaml    ← type: binary
+├── cluster-api/v1.5.0/component.yaml        ← type: helm
 ├── coredns/v1.11.1/component.yaml           ← type: helm
 ├── openfuyao-core/v26.03/component.yaml     ← type: yaml
 └── kubernetes-master/v1.29.0/               ← type: inline
 ```
 
-**cluster-api ComponentVersion YAML**：
-```yaml
-# bke-manifests/cluster-api/v1.5.0/component.yaml
-apiVersion: config.openfuyao.cn/v1alpha1
-kind: ComponentVersion
-metadata:
-  name: cluster-api-v1.5.0
-spec:
-  name: cluster-api
-  type: helm
-  version: v1.5.0
-
-  helm:
-    chart:
-      oci:
-        repository: "registry.example.com/charts/cluster-api"
-        tag: "v1.5.0"
-      checksum: "sha256:cluster-api-checksum..."
-    namespace: cluster-api-system
-    releaseName: cluster-api
-    values:
-      image:
-        repository: "registry.example.com/cluster-api"
-        tag: "{{componentVersion}}"
-    strategy:
-      mode: Install
-      wait: true
-      waitTimeout: "5m"
-      atomic: true
-    healthCheck:
-      enabled: true
-      timeout: "3m"
-      checks:
-        - type: PodReady
-          podReady:
-            namespace: cluster-api-system
-            labelSelector: "app=cluster-api"
-            minReady: 1
-
-  upgradeStrategy:
-    mode: Parallel
-    failurePolicy: FailFast
-    timeout: "10m"
-```
+**说明**：
+- `container-runtime` 是 selector 类型，在 DAG 构建期根据 `BKECluster.Spec.Cluster.ContainerRuntime.CRI` 展开为具体的容器运行时组件（containerd 或 docker）
+- `bkeagent-switch` 依赖 `cluster-api`，在 cluster-api 部署完成后执行
+- `kubernetes-master` 和 `kubernetes-worker` 是 inline 类型，无需 ComponentVersion YAML
 
 ---
 
-### 1.6 ReleaseImage 样例
+### 1.8 ReleaseImage 样例
 
 ```yaml
 # releaseimage-v2.6.0.yaml
@@ -876,7 +909,7 @@ spec:
 
 ---
 
-### 1.7 安装执行流程
+### 1.9 安装执行流程
 
 ```
 用户创建 BKECluster (desiredVersion: v2.6.0, CRI: containerd)
