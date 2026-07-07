@@ -7,7 +7,6 @@
 | **状态** | `provisional` |
 | **类型** | Feature |
 | **作者** | openFuyao Team |
-| **创建日期** | 2026-06-12 |
 | **依赖** | KEP-5 (ClusterVersion/ReleaseImage/UpgradePath)、ComponentVersion CRD、DAG 调度器、bke-manifests |
 
 ## 1. 摘要
@@ -258,41 +257,7 @@ spec:
     batchSize: 1
     timeout: "10m"
     failurePolicy: Continue
-  
-  # 节点过滤策略 (仅 Binary 组件使用，安装和升级共用)
-  # Helm/YAML 组件通过 values/nodeSelector 自行处理节点调度
-  nodeFilter:
-    # 目标节点角色列表 (空或不填 = 所有角色)
-    roles: []
-    
-    # 节点标签选择器 (仅选择标签完全匹配的节点)
-    # matchLabels:
-    #   node-pool: compute
-    #   gpu: "true"
-    
-    # 是否跳过已完成的节点 (per-node 幂等)
-    # true: 检查 NodeComponentStatuses[nodeIP].Version == target → 跳过
-    # false: 对所有节点执行，不检查 per-node 状态
-    # 默认: true
-    skipCompleted: true
-    
-    # 是否排除预约添加的节点
-    # 默认: true
-    excludeAppointment: true
 ```
-
-**NodeFilterSpec 字段说明**：
-
-| 字段 | 类型 | 说明 | 默认值 |
-|------|------|------|--------|
-| `roles` | `[]string` | 目标节点角色列表，空或不填表示所有角色 | `[]` |
-| `matchLabels` | `map[string]string` | 节点标签选择器，仅选择标签完全匹配的节点 | `{}` |
-| `skipCompleted` | `*bool` | 是否跳过已完成的节点（per-node 幂等） | `true` |
-| `excludeAppointment` | `*bool` | 是否排除预约添加的节点 | `true` |
-
-**设计思路**：
-- **为什么放在 ComponentVersionSpec 顶层而非 UpgradeStrategySpec 内**：安装和升级都需要节点过滤，不应绑定到"升级策略"语义中
-- **为什么仅用于 Binary 组件**：Binary 组件直接在节点上 SSH 执行，需要 Controller 选择目标节点；Helm/YAML 组件部署到集群，节点调度由 K8s Scheduler 通过 nodeSelector 处理
 
 ### 4.3 ComponentVersion Helm 类型定义
 
@@ -409,174 +374,6 @@ spec:
     failurePolicy: FailFast
     timeout: "5m"
 ```
-
-### 4.3b ComponentVersion Selector 类型定义
-
-**设计思路**：`selector` 类型用于表达"从多个候选组件中选择一个"的场景。典型用例：容器运行时——一个集群只能安装一种容器运行时（containerd 或 docker），选择由 `BKECluster.Spec.Cluster.ContainerRuntime.CRI` 决定。
-
-`subComponents` 字段在不同 `type` 下有不同语义：
-
-| 维度 | type=yaml（组合） | type=selector（互斥选择） |
-|------|------|------|
-| subComponents 语义 | 全包含——所有子组件都安装 | 条件选一——评估 condition，为真的纳入 DAG |
-| Condition 字段 | 忽略（不评估） | 评估后选一 |
-| DAG 节点 | 父组件 + 所有子组件各自产生 DAG 节点 | 仅 condition 为真的子组件产生 DAG 节点 |
-| selector 自身 | 不适用 | 不产生 DAG 节点（纯选择器，无自身安装逻辑） |
-
-```yaml
-# bke-manifests/container-runtime/v1.0.0/component.yaml
-apiVersion: config.openfuyao.cn/v1alpha1
-kind: ComponentVersion
-metadata:
-  name: container-runtime-v1.0.0
-spec:
-  name: container-runtime
-  type: selector
-  version: v1.0.0
-  
-  subComponents:
-    # containerd 运行时 (CRI=containerd 时选择)
-    - name: containerd
-      version: v1.7.18
-      condition: '{{.ContainerRuntimeCRI == "containerd"}}'
-    
-    # docker 运行时 (CRI=docker 时选择)
-    - name: docker
-      version: v26.0.0
-      condition: '{{.ContainerRuntimeCRI == "docker"}}'
-    
-    # cri-dockerd (CRI=docker 时选择, K8s >=1.24 必需)
-    - name: cri-dockerd
-      version: v0.3.9
-      condition: '{{.ContainerRuntimeCRI == "docker"}}'
-  
-  upgradeStrategy:
-    mode: Rolling
-    batchSize: 1
-    timeout: "10m"
-    failurePolicy: FailFast
-```
-
-**Selector 展开规则**：
-- DAG 构建期评估 `subComponents[].condition`
-- `BKECluster.Spec.Cluster.ContainerRuntime.CRI == "containerd"` → 展开为 `containerd/v1.7.18`
-- `BKECluster.Spec.Cluster.ContainerRuntime.CRI == "docker"` → 展开为 `docker/v2.6.0` + `cri-dockerd/v0.3.9`
-- ReleaseImage 只引用 `container-runtime/v1.0.0`，无需分别声明容器运行时组件
-
-### 4.2a Docker 运行时支持
-
-**设计思路**：Docker 与 containerd 的关键差异：
-
-| 维度 | containerd | Docker |
-|------|-----------|--------|
-| **制品方式** | 二进制下载（tar.gz 解压） | 包管理器安装（yum/apt） |
-| **配置文件** | `/etc/containerd/config.toml` + `hosts.toml`（多个） | `/etc/docker/daemon.json`（单个） |
-| **镜像仓库配置** | `hosts.toml` 按 registry 动态生成（forEach） | `daemon.json` 的 `registry-mirrors` 字段 |
-| **CRI 适配** | 原生支持 CRI | 需要 `cri-dockerd` 作为 CRI 适配层（K8s ≥ 1.24） |
-| **组件数量** | 1 个（containerd） | 2 个（docker + cri-dockerd，依赖关系：docker → cri-dockerd） |
-| **安装路径** | `/usr/local/bin/` | 系统包管理器默认路径（`/usr/bin/`） |
-
-**Docker ComponentVersion YAML（简化示例）**：
-
-```yaml
-# bke-manifests/docker/v26.0.0/component.yaml
-apiVersion: config.openfuyao.cn/v1alpha1
-kind: ComponentVersion
-metadata:
-  name: docker-v26.0.0
-spec:
-  name: docker
-  type: binary
-  version: v26.0.0
-
-  binary:
-    variables:
-      cgroupDriver: "systemd"
-      dataRoot: "/var/lib/docker"
-      lowLevelRuntime: "runc"
-
-    # Docker 通过包管理器安装 (非二进制下载), 无 artifacts
-    installScript: |
-      #!/bin/bash
-      # yum/apt 安装 docker-ce
-
-    configTemplates:
-      - name: daemon.json
-        path: "/etc/docker/daemon.json"
-        content: |
-          {
-            "exec-opts": ["native.cgroupdriver={{.Variables.cgroupDriver}}"],
-            "data-root": "{{.Variables.dataRoot}}"
-          }
-
-    healthCheck:
-      enabled: true
-      script: |
-        systemctl is-active docker
-
-  dependencies:
-    - name: bkeagent
-      phase: Install
-
-  upgradeStrategy:
-    mode: Rolling
-    batchSize: 1
-```
-
-**cri-dockerd ComponentVersion YAML（简化示例）**：
-
-```yaml
-# bke-manifests/cri-dockerd/v0.3.9/component.yaml
-apiVersion: config.openfuyao.cn/v1alpha1
-kind: ComponentVersion
-metadata:
-  name: cri-dockerd-v0.3.9
-spec:
-  name: cri-dockerd
-  type: binary
-  version: v0.3.9
-
-  binary:
-    variables:
-      sandboxImage: "{{imageRegistry}}/pause:3.9"
-
-    artifacts:
-      - name: cri-dockerd
-        url: "{{imageRegistry}}/cri-dockerd/{{version}}/cri-dockerd-{{version}}-{{arch}}"
-        installPath: "/usr/bin"
-
-    configTemplates:
-      - name: cri-dockerd.service
-        path: "/etc/systemd/system/cri-dockerd.service"
-        content: |
-          [Service]
-          ExecStart=/usr/bin/cri-dockerd --pod-infra-container-image {{.Variables.sandboxImage}}
-
-      - name: cri-dockerd.socket
-        path: "/etc/systemd/system/cri-dockerd.socket"
-        content: |
-          [Socket]
-          ListenStream=/var/run/cri-dockerd.sock
-
-    installScript: |
-      #!/bin/bash
-      install -m 0755 {{artifact.cri-dockerd.path}} /usr/bin/cri-dockerd
-
-    healthCheck:
-      enabled: true
-      script: |
-        systemctl is-active cri-dockerd
-
-  dependencies:
-    - name: docker
-      phase: Install
-
-  upgradeStrategy:
-    mode: Rolling
-    batchSize: 1
-```
-
-> **完整的 Docker 和 cri-dockerd ComponentVersion YAML 定义见详细设计文档 12.3.5 节**。
 
 ### 4.4 核心组件设计
 
@@ -732,8 +529,6 @@ configTemplates 支持三种渲染模式:
 
 #### 4.5.1 执行器注册
 
-**设计思路**：DAG 调度器根据 ComponentVersion 的类型选择对应的执行器。系统支持五种组件类型：Binary（二进制）、Helm（Helm Chart）、Inline（内联代码）、YAML（清单文件）、Selector（互斥选择器）。
-
 ```go
 // DAG 调度器根据组件类型选择对应执行器
 switch cv.Spec.Type {
@@ -745,36 +540,6 @@ case ComponentTypeYAML:
     executor = &YamlComponentExecutor{installer: yamlInstaller}
 case ComponentTypeInline:
     executor = &InlineComponentExecutor{factory: componentFactory}
-case ComponentTypeSelector:
-    // Selector 类型不产生 DAG 节点，在 DAG 构建期展开为具体子组件
-    // 详见 4.5.4 Selector 展开流程
-}
-```
-
-**执行器注册表设计**：
-
-引入 `ExecutorRegistry` 注册表后，新增类型只需调用 `registry.Register()` 注册新执行器，Scheduler 代码无需修改——符合开闭原则。
-
-```go
-// pkg/dagexec/registry.go
-
-// ExecutorRegistry 执行器注册表 (按组件类型注册)
-type ExecutorRegistry struct {
-    executors map[string]ComponentExecutor
-}
-
-// Register 注册执行器 (按组件类型)
-func (r *ExecutorRegistry) Register(componentType string, executor ComponentExecutor) {
-    r.executors[componentType] = executor
-}
-
-// Get 获取执行器 (未注册返回错误)
-func (r *ExecutorRegistry) Get(componentType string) (ComponentExecutor, error) {
-    executor, ok := r.executors[componentType]
-    if !ok {
-        return nil, fmt.Errorf("no executor registered for component type %q", componentType)
-    }
-    return executor, nil
 }
 ```
 
@@ -875,87 +640,6 @@ ClusterVersionReconciler 检测到版本变更
   └── 升级完成 → ClusterStatus = Ready
 ```
 
-#### 4.5.4 Selector 展开流程
-
-**设计思路**：Selector 类型不产生 DAG 节点，在 DAG 构建期展开为具体子组件。展开规则基于 `subComponents[].condition` 评估。
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                      Selector DAG 构建流程                                       │
-└─────────────────────────────────────────────────────────────────────────────────┘
-
-    ┌──────────────────────────────┐
-    │  BuildDAGFromBundle          │
-    │  遍历 ReleaseImage.components│
-    └──────────────┬───────────────┘
-                   │
-                   │ 遇到 container-runtime/v1.0.0
-                   ▼
-    ┌──────────────────────────────┐
-    │  加载 ComponentVersion       │
-    │  cv.Spec.Type == "selector"  │
-    └──────────────┬───────────────┘
-                   │
-                   ▼
-    ┌──────────────────────────────┐
-    │  读取 ContainerRuntimeCRI    │
-    │  从 ExecutionContext         │
-    │  .TemplateContext.Variables  │
-    │  ["ContainerRuntimeCRI"]     │
-    └──────────────┬───────────────┘
-                   │
-                   ▼
-    ┌──────────────────────────────┐
-    │  遍历 cv.Spec.SubComponents  │
-    │  评估每个 sub.Condition       │
-    └──────────────┬───────────────┘
-                   │
-       ┌───────────┼───────────┐
-       │           │           │
-       ▼           ▼           ▼
-  ┌──────────┐ ┌─────────┐ ┌──────────┐
-  │containerd│ │ docker  │ │cri-docker│
-  │condition │ │condition│ │condition │
-  │= true?   │ │= true?  │ │= true?   │
-  └────┬─────┘ └────┬────┘ └─────┬────┘
-       │           │             │
-  CRI=containerd CRI=docker   CRI=docker
-       │           │             │
-       ▼           ▼             ▼
-   纳入 DAG     纳入 DAG      纳入 DAG
-   (binary)    (binary)      (binary)
-      │           │             │
-      │           └──────┬──────┘
-      │                  │ 依赖关系
-      │                  ▼
-      │           docker → cri-dockerd
-      │           (DAG 依赖边)
-      │
-      ▼
-  selector 自身不产生 DAG 节点
-  (纯选择器, 无安装逻辑)
-```
-
-**Selector 依赖处理**：
-
-当组件类型为 selector 时，依赖解析面临两个问题：
-
-1. **Selector 的依赖需要传递给子组件**
-   - 展开后，子组件应该继承 selector 的依赖
-   - 实现：在 `expandSelectorComponents` 中合并 selector 和子组件的依赖
-
-2. **其他组件对 selector 的依赖需要展开**
-   - 展开为对所有子组件的依赖（AND 语义）
-   - 实现：在 DAG 构建时，将对 selector 的依赖转换为对所有子组件的依赖
-
-**设计原则**：
-
-| 原则 | 说明 |
-|------|------|
-| **依赖定义在具体组件中** | 不在 selector 的 `subComponents` 中定义依赖，而是在具体组件的 `spec.dependencies` 中定义 |
-| **AND 语义** | 当 selector 展开为多个子组件时，将对 selector 的依赖转换为对所有子组件的依赖 |
-| **冗余依赖无害** | 即使依赖了多个组件，DAG 也会正确执行 |
-
 ### 4.6 ReleaseImage 引用示例
 
 ```yaml
@@ -969,23 +653,16 @@ spec:
   
   install:
     components:
-      # 容器运行时（selector 类型，DAG 构建期展开为 containerd 或 docker）
-      - name: container-runtime
-        version: v1.0.0
-      
-      # bkeagent（监听管理集群）
+      - name: containerd
+        version: v1.7.18
       - name: bkeagent
         version: v2.6.0
-      
-      # 集群插件
       - name: coredns
         version: v1.11.1
       - name: kube-proxy
         version: v1.29.0
       - name: openfuyao-core
         version: v26.03
-      
-      # Kubernetes 控制面和工作节点（inline 类型）
       - name: kubernetes-master
         version: v1.29.0
         inline:
@@ -996,164 +673,28 @@ spec:
         inline:
           handler: EnsureWorkerJoin
           version: v1.0.0
-      
-      # cluster-api（Helm 类型，创建目标集群 kubeconfig Secret）
-      - name: cluster-api
-        version: v1.5.0
-      
-      # bkeagent-switch（切换到目标集群，依赖 cluster-api）
-      - name: bkeagent-switch
-        version: v2.6.0
-        dependencies:
-          - name: cluster-api
         
   upgrade:
     components:
-      # 容器运行时（selector 类型）
-      - name: container-runtime
-        version: v1.0.0
-      
-      # bkeagent
+      - name: containerd
+        version: v1.7.18
       - name: bkeagent
         version: v2.6.0
-      
-      # 集群插件
       - name: coredns
         version: v1.11.1
       - name: kube-proxy
         version: v1.29.0
-      
-      # 升级前置资源（inline 类型）
       - name: pre-upgrade-resources
         version: v1.0.0
         inline:
           handler: EnsurePreUpgradeResources
           version: v1.0
-      
-      # etcd 升级（inline 类型）
       - name: etcd
         version: v3.5.12
         inline:
           handler: EnsureEtcdUpgrade
           version: v1.0
 ```
-
-**ReleaseImage 引用说明**：
-
-| 组件 | 类型 | 说明 |
-|------|------|------|
-| `container-runtime` | selector | DAG 构建期根据 `BKECluster.Spec.Cluster.ContainerRuntime.CRI` 展开为 `containerd` 或 `docker` + `cri-dockerd` |
-| `bkeagent` | binary | 安装到所有节点，监听管理集群 |
-| `bkeagent-switch` | binary | 依赖 `cluster-api`，在 cluster-api 部署完成后切换到目标集群 |
-| `cluster-api` | helm | 部署 cluster-api 组件，创建目标集群 kubeconfig Secret |
-| `kubernetes-master` / `kubernetes-worker` | inline | 执行 kubeadm init / join |
-
-### 4.7 BKEAgentSwitch 独立组件设计
-
-**设计思路**：bkeagent 的监听切换发生在集群安装完成后（cluster-api 部署后），而 bkeagent 的安装发生在集群安装前。两者在时间线上分离，不应耦合在同一个组件中。
-
-**时间线**：
-```
-┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│ bkeagent    │ →  │ 集群安装    │ →  │ cluster-api │ →  │ bkeagent    │
-│ 安装        │    │ (master/    │    │ 部署        │    │ switch      │
-│ (管理集群)  │    │  worker)    │    │             │    │ (目标集群)  │
-└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
-     ↑                                                        ↑
-  监听管理集群                                            切换到目标集群
-```
-
-**BKEAgentSwitch 组件功能**：
-
-| 组件 | 作用 |
-|------|------|
-| **注解** | `bke.bocloud.com/bkeagent-listener` 标记目标（`current` / `bkecluster`） |
-| **Condition** | `SwitchBKEAgentCondition` 标记切换完成 |
-| **切换内容** | 更新 `/etc/openFuyao/bkeagent/config`（kubeconfig）、`/etc/openFuyao/bkeagent/node`（hostname）、`/etc/openFuyao/bkeagent/cluster`（clusterName） |
-
-**触发场景**：
-```
-EnsureAddonDeploy 部署 cluster-api addon
-    ↓
-markBKEAgentSwitchPending() 设置注解 "bkecluster"
-    ↓
-DAG 调度 bkeagent-switch 组件
-    ↓
-BinaryInstaller.Install()
-    ↓
-SSH 上传配置文件 + 重启 bkeagent
-    ↓
-标记 SwitchBKEAgentCondition = True
-```
-
-**BKEAgentSwitch ComponentVersion YAML（简化示例）**：
-
-```yaml
-# bke-manifests/bkeagent-switch/v2.6.0/component.yaml
-apiVersion: config.openfuyao.cn/v1alpha1
-kind: ComponentVersion
-metadata:
-  name: bkeagent-switch-v2.6.0
-spec:
-  name: bkeagent-switch
-  type: binary
-  version: v2.6.0
-
-  binary:
-    # 无需下载制品（bkeagent 已安装）
-    artifacts: []
-
-    configTemplates:
-      # 目标集群 kubeconfig（从 cluster-api 创建的 Secret 获取）
-      - name: kubeconfig
-        path: "/etc/openFuyao/bkeagent/config"
-        mode: "0600"
-        secretRef:
-          name: "{{clusterName}}-kubeconfig"
-          namespace: "{{clusterNamespace}}"
-          key: value
-
-      # 节点标识
-      - name: node
-        path: "/etc/openFuyao/bkeagent/node"
-        mode: "0644"
-        content: "{{nodeHostname}}"
-
-      # 集群标识
-      - name: cluster
-        path: "/etc/openFuyao/bkeagent/cluster"
-        mode: "0644"
-        content: "{{clusterName}}"
-
-    installScript: |
-      #!/bin/bash
-      systemctl restart bkeagent
-      sleep 2
-      systemctl is-active bkeagent
-
-    healthCheck:
-      enabled: true
-      timeout: "1m"
-      script: |
-        systemctl is-active bkeagent
-
-  dependencies:
-    - name: cluster-api
-      phase: Install
-
-  upgradeStrategy:
-    mode: Parallel
-    batchSize: 0
-    timeout: "5m"
-    failurePolicy: Continue
-
-  nodeFilter:
-    roles: []
-    skipCompleted: true
-    excludeAppointment: true
-```
-
-> **完整的 BKEAgentSwitch ComponentVersion YAML 定义见详细设计文档 12.5 节**。
 
 ## 5. 迁移策略
 
@@ -1243,17 +784,14 @@ func (r *BKEClusterReconciler) executeContainerdUpgrade(ctx context.Context) err
 |------|---------|---------|------|
 | **BinaryInstaller 核心实现** | 5 人日 | 中 | 无 |
 | **HelmInstaller 核心实现** | 5 人日 | 中 | 无 |
-| **YamlInstaller 核心实现** | 4 人日 | 中 | 无 |
+| **YamlInstaller 核心实现** | 5 人日 | 中 | 无 |
 | **TemplateRenderer 实现** | 3 人日 | 低 | 无 |
 | **ConfigRenderer 实现** | 3 人日 | 低 | TemplateRenderer |
-| **ApplyStrategy 引擎实现** | 2 人日 | 中 | YamlInstaller |
-| **Prune 裁剪功能实现** | 2 人日 | 中 | ApplyStrategy 引擎 |
+| **ApplyStrategy 引擎实现** | 3 人日 | 中 | YamlInstaller |
+| **Prune 裁剪功能实现** | 3 人日 | 中 | ApplyStrategy 引擎 |
 | **PreInstallHooks 执行引擎** | 3 人日 | 中 | HelmInstaller |
 | **ComponentVersion CRD 扩展** | 3 人日 | 低 | 无 |
 | **VersionContext 与 ExecutionContext 实现** | 3 人日 | 中 | 无 |
-| **Selector 类型实现** | 2 人日 | 中 | VersionContext |
-| **Docker 支持** | 4 人日 | 中 | BinaryInstaller |
-| **BKEAgentSwitch 组件** | 3 人日 | 中 | BinaryInstaller |
 | **BinaryComponentExecutor 集成** | 3 人日 | 中 | BinaryInstaller |
 | **HelmComponentExecutor 集成** | 3 人日 | 中 | HelmInstaller |
 | **YamlComponentExecutor 集成** | 2 人日 | 中 | YamlInstaller |
@@ -1263,20 +801,12 @@ func (r *BKEClusterReconciler) executeContainerdUpgrade(ctx context.Context) err
 | **兼容层实现** | 3 人日 | 中 | DAG 调度器适配 |
 | **错误分类与恢复机制** | 3 人日 | 中 | 核心实现完成 |
 | **单元测试** | 8 人日 | 低 | 核心实现完成 |
-| **集成测试** | 7 人日 | 中 | 单元测试完成 |
-| **E2E 测试** | 12 人日 | 中 | 集成测试完成 |
+| **集成测试** | 5 人日 | 中 | 单元测试完成 |
+| **E2E 测试** | 5 人日 | 中 | 集成测试完成 |
 | **迁移验证** | 3 人日 | 中 | 兼容层实现 |
 | **文档编写** | 4 人日 | 低 | 无 |
 | **代码审查与修复** | 4 人日 | 中 | 测试完成 |
-| **总计** | **114 人日 (约 5.5 人月)** | | |
-
-**新增工作项说明**：
-
-| 新增项 | 工时 | 说明 |
-|--------|------|------|
-| **Selector 类型实现** | 2 人日 | expandSelectorComponents + evaluateCondition（通用 TemplateRenderer 评估） |
-| **Docker 支持** | 4 人日 | Docker ComponentVersion YAML + cri-dockerd 组件 + 包管理器安装支持 |
-| **BKEAgentSwitch 组件** | 3 人日 | bkeagent-switch ComponentVersion YAML + 切换逻辑 + 依赖 cluster-api |
+| **总计** | **88 人日 (约 4 人月)** | | |
 
 ### 7.2 任务拆解
 
@@ -1380,14 +910,8 @@ func (r *BKEClusterReconciler) executeContainerdUpgrade(ctx context.Context) err
 | **ApplyStrategy** | YAML 清单应用策略：ServerSideApply/Replace/CreateOnly |
 | **Prune** | 按标签选择器裁剪不再需要的 Kubernetes 资源 |
 | **SubComponents** | 组件的组合关系（父子包含），区别于 Dependencies（执行顺序） |
-| **Selector** | 互斥选择器类型，从多个候选组件中按 condition 选择一个，典型用例：容器运行时（containerd 或 docker） |
-| **NodeFilter** | 节点过滤策略，支持按角色、标签、幂等性、预约节点过滤，仅用于 Binary 组件 |
-| **BKEAgentSwitch** | 独立组件，负责在 cluster-api 部署完成后切换 bkeagent 的监听目标从管理集群到目标集群 |
 | **configTemplates** | 配置文件模板系统，支持 Go template/Secret/kubeconfig |
 | **installScript** | 安装脚本模板，支持 8 类 50+ 变量和条件渲染 |
 | **Artifact** | 二进制制品，包含 URL、Checksum、安装路径等信息 |
 | **ComponentVersion** | 组件版本 CRD，定义组件的类型、配置、依赖等 |
 | **ReleaseImage** | 发布版本清单 CRD，定义安装和升级的组件列表 |
-| **ExecutorRegistry** | 执行器注册表，按组件类型注册执行器，支持按需注入和开闭原则 |
-| **TemplateRenderer** | 模板渲染引擎，支持 Go template、自定义函数、条件渲染 |
-| **ConfigRenderer** | 配置文件渲染器，支持 content 模板渲染、secretRef 从 Secret 获取、kubeconfigTemplate 动态生成 |
