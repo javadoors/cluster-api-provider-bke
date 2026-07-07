@@ -18,6 +18,9 @@
    - 1.7 bke-manifests 目录结构
    - 1.8 ReleaseImage 样例
    - 1.9 安装执行流程
+   - 1.10 Helm 组件安装（coredns）
+   - 1.11 YAML 组件安装（openfuyao-core）
+   - 1.12 多架构混合集群安装
 2. [升级样例](#2-升级样例)
    - 2.1 版本变更对比
    - 2.2 containerd 升级
@@ -25,6 +28,9 @@
    - 2.4 bkeagent 升级
    - 2.5 ReleaseImage 样例
    - 2.6 升级执行流程
+   - 2.7 Helm 组件升级（coredns）
+   - 2.8 YAML 组件升级（openfuyao-core）
+   - 2.9 升级策略演示（Continue/Rollback）
 3. [回滚样例](#3-回滚样例)
    - 3.1 Binary 组件回滚
    - 3.2 Helm 组件回滚
@@ -41,6 +47,21 @@
    - 7.1 Selector 依赖传递（containerd 场景）
    - 7.2 Selector 依赖传递（docker 场景）
    - 7.3 其他组件对 selector 的依赖
+8. [错误处理与恢复样例](#8-错误处理与恢复样例)
+   - 8.1 可重试错误处理
+   - 8.2 不可重试错误处理
+   - 8.3 部分失败处理
+9. [幂等性保证样例](#9-幂等性保证样例)
+   - 9.1 重复安装幂等性
+   - 9.2 重复升级幂等性
+   - 9.3 中断恢复场景
+10. [健康检查详细样例](#10-健康检查详细样例)
+    - 10.1 PodReady 检查
+    - 10.2 EndpointReady 检查
+    - 10.3 健康检查失败处理
+11. [大规模场景样例](#11-大规模场景样例)
+    - 11.1 中规模安装（3M+10W）
+    - 11.2 并行性能验证
 
 ---
 
@@ -1204,6 +1225,358 @@ BKEClusterReconciler.Reconcile()
 
 ---
 
+### 1.10 Helm 组件安装（coredns）
+
+**场景**：新建集群，使用 Helm 安装 coredns 组件（DNS 服务）。
+
+**集群配置**：
+```yaml
+apiVersion: config.openfuyao.cn/v1beta1
+kind: BKECluster
+metadata:
+  name: helm-cluster
+  namespace: default
+spec:
+  clusterConfig:
+    cluster:
+      imageRepo:
+        domain: registry.example.com
+```
+
+**coredns ComponentVersion YAML**：
+```yaml
+# bke-manifests/coredns/v1.11.1/component.yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: coredns-v1.11.1
+spec:
+  name: coredns
+  type: helm
+  version: v1.11.1
+
+  helm:
+    chart:
+      oci:
+        repository: "registry.example.com/charts/coredns"
+        tag: "v1.11.1"
+      checksum: "sha256:coredns-chart-checksum..."
+    namespace: kube-system
+    releaseName: coredns
+    values:
+      image:
+        repository: "{{.Config.Cluster.ImageRepo.Domain}}/coredns/coredns"
+        tag: "{{.ComponentVersion}}"
+      replicaCount: 2
+      resources:
+        limits:
+          cpu: "100m"
+          memory: "128Mi"
+    strategy:
+      mode: Install
+      wait: true
+      waitTimeout: "5m"
+      atomic: true
+    healthCheck:
+      enabled: true
+      timeout: "3m"
+      checks:
+        - type: PodReady
+          podReady:
+            namespace: kube-system
+            labelSelector: "k8s-app=kube-dns"
+            minReady: 1
+
+  dependencies:
+    - name: kubernetes-master
+      phase: Install
+
+  upgradeStrategy:
+    mode: Parallel
+    failurePolicy: FailFast
+    timeout: "10m"
+```
+
+**执行流程**：
+```
+HelmComponentExecutor 执行:
+  │
+  ├─ 1. 拉取 Chart
+  │     ├─ 从 OCI Registry 拉取 coredns Chart
+  │     ├─ 校验 checksum
+  │     └─ 解压到临时目录
+  │
+  ├─ 2. 渲染 Values
+  │     ├─ 替换模板变量:
+  │     │   ├─ {{.Config.Cluster.ImageRepo.Domain}} → registry.example.com
+  │     │   └─ {{.ComponentVersion}} → v1.11.1
+  │     └─ 生成最终 values.yaml
+  │
+  ├─ 3. 执行 helm install
+  │     helm install coredns ./coredns-1.11.1.tgz \
+  │       --namespace kube-system \
+  │       --values values.yaml \
+  │       --atomic \
+  │       --wait \
+  │       --timeout 5m
+  │
+  ├─ 4. 健康检查
+  │     ├─ PodReady 检查:
+  │     │   ├─ 查询 Pod: labelSelector="k8s-app=kube-dns"
+  │     │   ├─ 检查 Pod 状态: Ready
+  │     │   └─ 检查 Ready Pod 数量: >= minReady (1)
+  │     └─ 检查通过 → ✅
+  │
+  └─ 5. 更新状态
+        ├─ ComponentStatuses["coredns"] = {Version: "v1.11.1", Phase: "Installed"}
+        └─ Release: coredns (v1.11.1)
+```
+
+**关键设计点**：
+- ✅ **OCI Chart 拉取**：从私有 OCI Registry 拉取 Chart，支持离线环境
+- ✅ **Values 模板渲染**：支持 TemplateContext 变量替换
+- ✅ **原子安装**：`--atomic` 标志确保失败自动回滚
+- ✅ **健康检查**：PodReady 检查确保 DNS 服务就绪
+- ✅ **依赖管理**：依赖 kubernetes-master，确保在集群初始化后安装
+
+---
+
+### 1.11 YAML 组件安装（openfuyao-core）
+
+**场景**：新建集群，使用 YAML 类型安装 openfuyao-core 组件（集群管理核心）。
+
+**集群配置**：
+```yaml
+apiVersion: config.openfuyao.cn/v1beta1
+kind: BKECluster
+metadata:
+  name: yaml-cluster
+  namespace: default
+spec:
+  clusterConfig:
+    cluster:
+      imageRepo:
+        domain: registry.example.com
+```
+
+**openfuyao-core ComponentVersion YAML**：
+```yaml
+# bke-manifests/openfuyao-core/v26.03/component.yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: openfuyao-core-v26.03
+spec:
+  name: openfuyao-core
+  type: yaml
+  version: v26.03
+
+  yaml:
+    manifests:
+      - url: "{{.Config.Cluster.ImageRepo.Domain}}/manifests/openfuyao-core/v26.03/crds.yaml"
+        checksum: "sha256:crds-checksum..."
+      - url: "{{.Config.Cluster.ImageRepo.Domain}}/manifests/openfuyao-core/v26.03/deployment.yaml"
+        checksum: "sha256:deployment-checksum..."
+      - url: "{{.Config.Cluster.ImageRepo.Domain}}/manifests/openfuyao-core/v26.03/service.yaml"
+        checksum: "sha256:service-checksum..."
+    namespace: openfuyao-system
+    applyStrategy: ServerSideApply
+    prune: true
+    pruneLabelSelector:
+      app.kubernetes.io/managed-by: openfuyao-core
+    healthCheck:
+      enabled: true
+      timeout: "3m"
+      checks:
+        - type: PodReady
+          podReady:
+            namespace: openfuyao-system
+            labelSelector: "app.kubernetes.io/name=openfuyao-core"
+            minReady: 1
+        - type: EndpointReady
+          endpointReady:
+            namespace: openfuyao-system
+            serviceName: openfuyao-core
+            minReady: 1
+
+  dependencies:
+    - name: kubernetes-master
+      phase: Install
+
+  upgradeStrategy:
+    mode: Parallel
+    failurePolicy: FailFast
+    timeout: "10m"
+```
+
+**执行流程**：
+```
+YamlComponentExecutor 执行:
+  │
+  ├─ 1. 下载清单
+  │     ├─ 从 URL 下载 crds.yaml
+  │     ├─ 从 URL 下载 deployment.yaml
+  │     ├─ 从 URL 下载 service.yaml
+  │     └─ 校验 checksum
+  │
+  ├─ 2. 解析多文档 YAML
+  │     ├─ 解析每个文件的多个文档（--- 分隔）
+  │     ├─ 转换为 unstructured.Unstructured 对象
+  │     └─ 按 GVK 排序（CRD 优先）
+  │
+  ├─ 3. 应用到集群
+  │     ├─ 按策略应用: ServerSideApply
+  │     ├─ 创建命名空间: openfuyao-system
+  │     ├─ 应用 CRD（优先）
+  │     ├─ 应用 Deployment
+  │     └─ 应用 Service
+  │
+  ├─ 4. 健康检查
+  │     ├─ PodReady 检查:
+  │     │   ├─ 查询 Pod: labelSelector="app.kubernetes.io/name=openfuyao-core"
+  │     │   ├─ 检查 Pod 状态: Ready
+  │     │   └─ 检查 Ready Pod 数量: >= minReady (1)
+  │     ├─ EndpointReady 检查:
+  │     │   ├─ 查询 Service: openfuyao-core
+  │     │   ├─ 检查 Endpoint: 有可用地址
+  │     │   └─ 检查 Endpoint 数量: >= minReady (1)
+  │     └─ 检查通过 → ✅
+  │
+  └─ 5. 更新状态
+        ├─ ComponentStatuses["openfuyao-core"] = {Version: "v26.03", Phase: "Installed"}
+        └─ 记录已应用的资源列表（用于 Prune）
+```
+
+**关键设计点**：
+- ✅ **多文档 YAML 支持**：支持 `---` 分隔的多个资源
+- ✅ **ServerSideApply 策略**：增量更新，保留其他管理者的字段
+- ✅ **Prune 裁剪**：删除不再需要的资源（按 labelSelector）
+- ✅ **双重健康检查**：PodReady + EndpointReady 确保服务完全就绪
+- ✅ **依赖管理**：依赖 kubernetes-master，确保在集群初始化后安装
+
+---
+
+### 1.12 多架构混合集群安装
+
+**场景**：新建集群，包含 amd64 和 arm64 混合节点，需要按架构下载对应制品。
+
+**集群配置**：
+```yaml
+apiVersion: config.openfuyao.cn/v1beta1
+kind: BKECluster
+metadata:
+  name: multi-arch-cluster
+  namespace: default
+spec:
+  nodeRefs:
+    - name: master-amd64
+      ip: 192.168.1.10
+    - name: worker-amd64-1
+      ip: 192.168.1.11
+    - name: worker-arm64-1
+      ip: 192.168.1.20
+    - name: worker-arm64-2
+      ip: 192.168.1.21
+  clusterConfig:
+    cluster:
+      containerRuntime:
+        cri: containerd
+      imageRepo:
+        domain: registry.example.com
+```
+
+**containerd ComponentVersion YAML**（支持多架构）：
+```yaml
+# bke-manifests/containerd/v1.7.18/component.yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: containerd-v1.7.18
+spec:
+  name: containerd
+  type: binary
+  version: v1.7.18
+
+  binary:
+    variables:
+      sandboxImage: "{{.Config.Cluster.ImageRepo.Domain}}/pause:3.9"
+
+    artifacts:
+      - name: containerd
+        # 制品 URL 包含 {{arch}} 模板变量
+        url: "{{.Config.Cluster.ImageRepo.Domain}}/binaries/containerd/{{version}}/containerd-{{version}}-linux-{{arch}}.tar.gz"
+        checksum: "sha256:abc123def456..."
+        installPath: "/"
+
+    supportedArchitectures: ["amd64", "arm64"]
+    supportedOS:
+      - name: centos
+        versions: ["7", "8"]
+      - name: ubuntu
+        versions: ["20.04", "22.04"]
+
+    # ... 其他配置省略
+```
+
+**执行流程**：
+```
+BinaryComponentExecutor 执行:
+  │
+  ├─ 1. 获取节点列表
+  │     NodeProvider.GetNodes() → [master-amd64, worker-amd64-1, worker-arm64-1, worker-arm64-2]
+  │
+  ├─ 2. 逐节点安装（Rolling 模式）
+  │     │
+  │     ├─ master-amd64 (192.168.1.10):
+  │     │   ├─ 架构发现: SSH 执行 `uname -m` → x86_64 → amd64
+  │     │   ├─ 渲染制品 URL:
+  │     │   │   containerd-1.7.18-linux-amd64.tar.gz
+  │     │   ├─ 下载制品（amd64 版本）
+  │     │   ├─ SSH 推送并安装
+  │     │   └─ 健康检查通过 → ✅
+  │     │
+  │     ├─ worker-amd64-1 (192.168.1.11):
+  │     │   ├─ 架构发现: x86_64 → amd64
+  │     │   ├─ 下载制品（amd64 版本）
+  │     │   └─ 安装 → ✅
+  │     │
+  │     ├─ worker-arm64-1 (192.168.1.20):
+  │     │   ├─ 架构发现: SSH 执行 `uname -m` → aarch64 → arm64
+  │     │   ├─ 渲染制品 URL:
+  │     │   │   containerd-1.7.18-linux-arm64.tar.gz
+  │     │   ├─ 下载制品（arm64 版本）
+  │     │   ├─ SSH 推送并安装
+  │     │   └─ 健康检查通过 → ✅
+  │     │
+  │     └─ worker-arm64-2 (192.168.1.21):
+  │         ├─ 架构发现: aarch64 → arm64
+  │         ├─ 下载制品（arm64 版本）
+  │         └─ 安装 → ✅
+  │
+  └─ 3. 更新状态
+        ComponentStatuses["containerd"] = {
+          "192.168.1.10": {Version: "v1.7.18", Phase: "Installed", Arch: "amd64"},
+          "192.168.1.11": {Version: "v1.7.18", Phase: "Installed", Arch: "amd64"},
+          "192.168.1.20": {Version: "v1.7.18", Phase: "Installed", Arch: "arm64"},
+          "192.168.1.21": {Version: "v1.7.18", Phase: "Installed", Arch: "arm64"}
+        }
+```
+
+**架构映射规则**：
+```
+uname -m 输出    →    arch 变量值    →    制品文件名
+x86_64           →    amd64          →    containerd-1.7.18-linux-amd64.tar.gz
+aarch64          →    arm64          →    containerd-1.7.18-linux-arm64.tar.gz
+```
+
+**关键设计点**：
+- ✅ **架构自动发现**：通过 SSH 执行 `uname -m` 自动检测节点架构
+- ✅ **按架构下载制品**：根据架构渲染不同的制品 URL
+- ✅ **混合集群支持**：同一集群可以包含不同架构的节点
+- ✅ **架构记录**：在 NodeComponentStatuses 中记录每个节点的架构信息
+
+---
+
 ## 2. 升级样例
 
 ### 2.1 版本变更对比
@@ -1467,6 +1840,227 @@ ClusterVersionReconciler.Reconcile()
           coredns: v1.11.1
           openfuyao-core: v26.03
 ```
+
+---
+
+### 2.7 Helm 组件升级（coredns）
+
+**场景**：coredns v1.10.1 → v1.11.1，使用 helm upgrade 升级。
+
+**VersionContext 决策**：
+```
+SetCurrent("coredns", "v1.10.1")
+SetTarget("coredns", "v1.11.1")
+
+NeedsUpgrade("coredns") = true
+HasCurrent("coredns") = true
+Action = Upgrade
+```
+
+**执行流程**：
+```
+HelmComponentExecutor 执行:
+  │
+  ├─ 1. 拉取新 Chart
+  │     ├─ 从 OCI Registry 拉取 coredns v1.11.1 Chart
+  │     ├─ 校验 checksum
+  │     └─ 解压到临时目录
+  │
+  ├─ 2. 渲染 Values
+  │     ├─ 替换模板变量:
+  │     │   ├─ {{.Config.Cluster.ImageRepo.Domain}} → registry.example.com
+  │     │   └─ {{.ComponentVersion}} → v1.11.1
+  │     └─ 生成最终 values.yaml
+  │
+  ├─ 3. 执行 helm upgrade
+  │     helm upgrade coredns ./coredns-1.11.1.tgz \
+  │       --namespace kube-system \
+  │       --values values.yaml \
+  │       --atomic \
+  │       --wait \
+  │       --timeout 5m
+  │
+  ├─ 4. 健康检查
+  │     ├─ PodReady 检查:
+  │     │   ├─ 查询 Pod: labelSelector="k8s-app=kube-dns"
+  │     │   ├─ 检查 Pod 状态: Ready
+  │     │   └─ 检查 Ready Pod 数量: >= minReady (1)
+  │     └─ 检查通过 → ✅
+  │
+  └─ 5. 更新状态
+        ├─ ComponentStatuses["coredns"] = {Version: "v1.11.1", Phase: "Installed"}
+        └─ Release: coredns (v1.11.1, revision=2)
+```
+
+**失败处理**：
+```
+如果 helm upgrade 失败:
+  ├─ --atomic 标志触发自动回滚
+  ├─ Release 回滚到 v1.10.1 (revision=1)
+  ├─ 健康检查失败
+  └─ 返回错误，升级终止
+```
+
+---
+
+### 2.8 YAML 组件升级（openfuyao-core）
+
+**场景**：openfuyao-core v26.01 → v26.03，使用 ServerSideApply 增量更新 + Prune 裁剪。
+
+**VersionContext 决策**：
+```
+SetCurrent("openfuyao-core", "v26.01")
+SetTarget("openfuyao-core", "v26.03")
+
+NeedsUpgrade("openfuyao-core") = true
+HasCurrent("openfuyao-core") = true
+Action = Upgrade
+```
+
+**执行流程**：
+```
+YamlComponentExecutor 执行:
+  │
+  ├─ 1. 下载新清单
+  │     ├─ 从 URL 下载 v26.03 的 crds.yaml
+  │     ├─ 从 URL 下载 v26.03 的 deployment.yaml
+  │     ├─ 从 URL 下载 v26.03 的 service.yaml
+  │     └─ 校验 checksum
+  │
+  ├─ 2. 解析多文档 YAML
+  │     ├─ 解析每个文件的多个文档
+  │     ├─ 转换为 unstructured.Unstructured 对象
+  │     └─ 按 GVK 排序
+  │
+  ├─ 3. 应用到集群（增量更新）
+  │     ├─ 按策略应用: ServerSideApply
+  │     ├─ 更新 CRD（如果有变更）
+  │     ├─ 更新 Deployment（增量更新，保留其他管理者的字段）
+  │     └─ 更新 Service（如果有变更）
+  │
+  ├─ 4. Prune 裁剪
+  │     ├─ 查询标签匹配的资源:
+  │     │   labelSelector: app.kubernetes.io/managed-by=openfuyao-core
+  │     ├─ 对比当前清单中的资源
+  │     ├─ 删除不在 v26.03 清单中的资源:
+  │     │   ├─ 删除废弃的 ConfigMap
+  │     │   └─ 删除废弃的 Service
+  │     └─ Prune 完成 → ✅
+  │
+  ├─ 5. 健康检查
+  │     ├─ PodReady 检查:
+  │     │   ├─ 查询 Pod: labelSelector="app.kubernetes.io/name=openfuyao-core"
+  │     │   ├─ 检查 Pod 状态: Ready
+  │     │   └─ 检查 Ready Pod 数量: >= minReady (1)
+  │     ├─ EndpointReady 检查:
+  │     │   ├─ 查询 Service: openfuyao-core
+  │     │   ├─ 检查 Endpoint: 有可用地址
+  │     │   └─ 检查 Endpoint 数量: >= minReady (1)
+  │     └─ 检查通过 → ✅
+  │
+  └─ 6. 更新状态
+        ├─ ComponentStatuses["openfuyao-core"] = {Version: "v26.03", Phase: "Installed"}
+        └─ 记录已应用的资源列表（用于下次 Prune）
+```
+
+**关键设计点**：
+- ✅ **ServerSideApply 增量更新**：只更新变更的字段，保留其他管理者的字段
+- ✅ **Prune 裁剪**：删除不再需要的资源，保持集群整洁
+- ✅ **双重健康检查**：PodReady + EndpointReady 确保服务完全就绪
+
+---
+
+### 2.9 升级策略演示（Continue/Rollback）
+
+**场景**：containerd 升级过程中部分节点失败，演示 Continue 和 Rollback 策略。
+
+#### 2.9.1 Continue 策略
+
+**配置**：
+```yaml
+spec:
+  upgradeStrategy:
+    mode: Rolling
+    batchSize: 1
+    failurePolicy: Continue  # 失败后继续
+```
+
+**执行流程**：
+```
+BinaryComponentExecutor 执行:
+  │
+  ├─ node-1: 升级成功 → ✅
+  │
+  ├─ node-2: 升级失败 ❌
+  │   ├─ 记录错误日志
+  │   ├─ NodeComponentStatuses["containerd"]["192.168.1.11"] = {Phase: "Failed"}
+  │   └─ 继续执行下一个节点（不终止）
+  │
+  ├─ node-3: 升级成功 → ✅
+  │
+  └─ 升级完成（部分成功）
+        ComponentStatuses["containerd"] = {
+          "192.168.1.10": {Version: "v1.7.18", Phase: "Installed"},
+          "192.168.1.11": {Version: "v1.7.15", Phase: "Failed"},  # 保持旧版本
+          "192.168.1.12": {Version: "v1.7.18", Phase: "Installed"}
+        }
+```
+
+**适用场景**：
+- ✅ 非关键组件升级（如日志收集器）
+- ✅ 允许部分节点暂时保持旧版本
+- ✅ 最大化升级进度
+
+#### 2.9.2 Rollback 策略
+
+**配置**：
+```yaml
+spec:
+  upgradeStrategy:
+    mode: Rolling
+    batchSize: 1
+    failurePolicy: Rollback  # 失败后回滚
+```
+
+**执行流程**：
+```
+BinaryComponentExecutor 执行:
+  │
+  ├─ node-1: 升级成功 → ✅
+  │
+  ├─ node-2: 升级失败 ❌
+  │   ├─ 执行 uninstallScript:
+  │   │   ├─ systemctl stop containerd
+  │   │   ├─ rm -f /usr/local/bin/containerd
+  │   │   └─ rm -rf /etc/containerd/
+  │   ├─ 重新安装旧版本 (v1.7.15):
+  │   │   ├─ 下载 containerd-1.7.15
+  │   │   ├─ 执行 installScript
+  │   │   └─ 健康检查通过 → ✅
+  │   └─ NodeComponentStatuses["containerd"]["192.168.1.11"] = {Version: "v1.7.15", Phase: "Installed"}
+  │
+  ├─ node-3: 升级成功 → ✅
+  │
+  └─ 升级完成（部分回滚）
+        ComponentStatuses["containerd"] = {
+          "192.168.1.10": {Version: "v1.7.18", Phase: "Installed"},
+          "192.168.1.11": {Version: "v1.7.15", Phase: "Installed"},  # 回滚到旧版本
+          "192.168.1.12": {Version: "v1.7.18", Phase: "Installed"}
+        }
+```
+
+**适用场景**：
+- ✅ 关键组件升级（如容器运行时）
+- ✅ 需要保证所有节点版本一致
+- ✅ 失败后自动恢复到稳定状态
+
+**策略对比**：
+
+| 策略 | 失败后行为 | 适用场景 | 风险 |
+|------|----------|---------|------|
+| **FailFast** | 立即终止整个升级 | 关键组件，不允许部分成功 | 升级中断，需要手动处理 |
+| **Continue** | 记录错误，继续执行 | 非关键组件，允许部分失败 | 集群版本不一致 |
+| **Rollback** | 回滚到旧版本，继续执行 | 关键组件，需要版本一致 | 升级进度慢，资源消耗大 |
 
 ---
 
@@ -2265,5 +2859,684 @@ bkeagent → docker → cri-dockerd → kubernetes-master
 
 ---
 
-**文档版本**: v1.4  
+## 8. 错误处理与恢复样例
+
+### 8.1 可重试错误处理
+
+**场景**：containerd 制品下载过程中网络超时，触发自动重试。
+
+**错误类型**：
+- 网络超时（HTTP 504 Gateway Timeout）
+- 连接重置（Connection Reset）
+- DNS 解析失败（Temporary Failure）
+
+**重试配置**：
+```yaml
+spec:
+  binary:
+    artifacts:
+      - name: containerd
+        url: "https://registry.example.com/binaries/containerd/v1.7.18/containerd-v1.7.18-linux-amd64.tar.gz"
+        checksum: "sha256:abc123def456..."
+        installPath: "/"
+        retryCount: 3        # 最大重试次数
+        retryInterval: "5s"  # 重试间隔
+```
+
+**执行流程**：
+```
+BinaryInstaller.Install() 执行:
+  │
+  ├─ 第 1 次尝试:
+  │   ├─ 下载制品: HTTP GET
+  │   ├─ 网络超时 ❌
+  │   └─ 记录错误日志: "Download failed: timeout, retrying..."
+  │
+  ├─ 等待 5 秒
+  │
+  ├─ 第 2 次尝试:
+  │   ├─ 下载制品: HTTP GET
+  │   ├─ 网络超时 ❌
+  │   └─ 记录错误日志: "Download failed: timeout, retrying..."
+  │
+  ├─ 等待 5 秒
+  │
+  ├─ 第 3 次尝试:
+  │   ├─ 下载制品: HTTP GET
+  │   ├─ 下载成功 ✅
+  │   ├─ 校验 checksum ✅
+  │   └─ 保存到缓存
+  │
+  └─ 继续执行安装脚本
+```
+
+**指数退避策略**：
+```
+重试间隔: 5s → 10s → 20s → 40s (最大 1 分钟)
+公式: min(retryInterval * 2^(attempt-1), maxInterval)
+```
+
+**适用场景**：
+- ✅ 网络不稳定环境
+- ✅ 大制品下载（容易超时）
+- ✅ 临时性故障（如 CDN 节点故障）
+
+---
+
+### 8.2 不可重试错误处理
+
+**场景**：containerd 制品 checksum 校验失败，立即终止升级。
+
+**错误类型**：
+- Checksum 校验失败
+- 制品不存在（HTTP 404）
+- 权限不足（HTTP 403）
+- 配置错误（无效的模板变量）
+
+**执行流程**：
+```
+BinaryInstaller.Install() 执行:
+  │
+  ├─ 1. 下载制品
+  │     ├─ HTTP GET 请求
+  │     └─ 下载成功 ✅
+  │
+  ├─ 2. 校验 checksum
+  │     ├─ 计算实际 checksum: sha256:xyz789...
+  │     ├─ 对比预期 checksum: sha256:abc123...
+  │     └─ 校验失败 ❌
+  │
+  ├─ 3. 错误处理
+  │     ├─ 记录错误日志: "Checksum mismatch: expected abc123, got xyz789"
+  │     ├─ 删除损坏的制品
+  │     ├─ 标记节点为 Failed:
+  │     │   NodeComponentStatuses["containerd"]["192.168.1.10"] = {Phase: "Failed"}
+  │     └─ 返回错误（不重试）
+  │
+  └─ 4. 根据 FailurePolicy 处理
+        ├─ FailFast: 终止整个升级
+        ├─ Continue: 继续下一个节点
+        └─ Rollback: 回滚到旧版本
+```
+
+**错误分类逻辑**：
+```go
+func classifyError(err error) ErrorType {
+    switch {
+    case isNetworkError(err):
+        return RetryableError  // 可重试
+    case isChecksumError(err):
+        return FatalError      // 不可重试
+    case isPermissionError(err):
+        return FatalError      // 不可重试
+    case isConfigError(err):
+        return FatalError      // 不可重试
+    default:
+        return UnknownError
+    }
+}
+```
+
+**适用场景**：
+- ✅ 制品被篡改（checksum 不匹配）
+- ✅ 制品 URL 错误（404）
+- ✅ 配置错误（无法通过重试解决）
+
+---
+
+### 8.3 部分失败处理
+
+**场景**：Rolling 升级过程中，部分节点成功，部分节点失败。
+
+**集群状态**：
+```
+节点列表: [node-1, node-2, node-3, node-4, node-5]
+升级策略: Rolling, batchSize=1, failurePolicy=Continue
+```
+
+**执行流程**：
+```
+BinaryComponentExecutor 执行:
+  │
+  ├─ node-1: 升级成功 → ✅
+  │   NodeComponentStatuses["containerd"]["192.168.1.10"] = {Version: "v1.7.18", Phase: "Installed"}
+  │
+  ├─ node-2: 升级成功 → ✅
+  │   NodeComponentStatuses["containerd"]["192.168.1.11"] = {Version: "v1.7.18", Phase: "Installed"}
+  │
+  ├─ node-3: 升级失败 ❌
+  │   ├─ 错误: installScript 执行超时
+  │   ├─ NodeComponentStatuses["containerd"]["192.168.1.12"] = {Version: "v1.7.15", Phase: "Failed"}
+  │   └─ 记录警告日志，继续执行
+  │
+  ├─ node-4: 升级成功 → ✅
+  │   NodeComponentStatuses["containerd"]["192.168.1.13"] = {Version: "v1.7.18", Phase: "Installed"}
+  │
+  └─ node-5: 升级失败 ❌
+      ├─ 错误: checksum 校验失败
+      ├─ NodeComponentStatuses["containerd"]["192.168.1.14"] = {Version: "v1.7.15", Phase: "Failed"}
+      └─ 记录警告日志，继续执行
+```
+
+**最终集群状态**：
+```yaml
+ComponentStatuses:
+  containerd:
+    "192.168.1.10": {Version: "v1.7.18", Phase: "Installed"}  # 新版本
+    "192.168.1.11": {Version: "v1.7.18", Phase: "Installed"}  # 新版本
+    "192.168.1.12": {Version: "v1.7.15", Phase: "Failed"}     # 旧版本，失败
+    "192.168.1.13": {Version: "v1.7.18", Phase: "Installed"}  # 新版本
+    "192.168.1.14": {Version: "v1.7.15", Phase: "Failed"}     # 旧版本，失败
+
+BKECluster.Status:
+  phase: PartialSuccess
+  conditions:
+    - type: Upgraded
+      status: True
+      message: "3/5 nodes upgraded successfully"
+```
+
+**后续处理**：
+```
+1. 查看失败节点日志:
+   kubectl logs -n openfuyao-system bke-controller-manager-xxx
+
+2. 手动修复失败节点:
+   - 检查网络连接
+   - 检查制品 URL 和 checksum
+   - 检查节点资源（磁盘空间、内存）
+
+3. 重新触发升级:
+   kubectl annotate bkecluster test-cluster \
+     bke.bocloud.com/retry-failed-nodes=true
+
+4. 系统自动重试失败节点:
+   - 跳过已成功的节点
+   - 仅重试 Failed 状态的节点
+```
+
+---
+
+## 9. 幂等性保证样例
+
+### 9.1 重复安装幂等性
+
+**场景**：containerd 已安装到目标版本，再次触发安装，系统自动跳过。
+
+**当前状态**：
+```yaml
+ComponentStatuses:
+  containerd:
+    "192.168.1.10": {Version: "v1.7.18", Phase: "Installed"}
+    "192.168.1.11": {Version: "v1.7.18", Phase: "Installed"}
+    "192.168.1.12": {Version: "v1.7.18", Phase: "Installed"}
+```
+
+**触发条件**：
+```
+用户误操作或系统重试，再次触发 containerd 安装
+```
+
+**执行流程**：
+```
+BinaryComponentExecutor 执行:
+  │
+  ├─ node-1 (192.168.1.10):
+  │   ├─ isAlreadyAtTarget():
+  │   │   ├─ 查询 NodeComponentStatuses["containerd"]["192.168.1.10"]
+  │   │   ├─ Phase = "Installed"
+  │   │   ├─ Version = "v1.7.18" == targetVersion
+  │   │   └─ 返回 true → 跳过
+  │   └─ 记录日志: "containerd already installed on node-1, skip"
+  │
+  ├─ node-2 (192.168.1.11):
+  │   ├─ isAlreadyAtTarget() = true → 跳过
+  │   └─ 记录日志: "containerd already installed on node-2, skip"
+  │
+  └─ node-3 (192.168.1.12):
+      ├─ isAlreadyAtTarget() = true → 跳过
+      └─ 记录日志: "containerd already installed on node-3, skip"
+```
+
+**幂等性保证**：
+- ✅ 不重复下载制品
+- ✅ 不重复执行 installScript
+- ✅ 不重复更新状态
+- ✅ 快速返回，节省资源
+
+---
+
+### 9.2 重复升级幂等性
+
+**场景**：containerd 已升级到目标版本，再次触发升级，系统自动跳过。
+
+**当前状态**：
+```yaml
+ComponentStatuses:
+  containerd:
+    "192.168.1.10": {Version: "v1.7.18", Phase: "Installed"}
+    "192.168.1.11": {Version: "v1.7.18", Phase: "Installed"}
+    "192.168.1.12": {Version: "v1.7.18", Phase: "Installed"}
+
+VersionContext:
+  Current: "v1.7.18"
+  Target: "v1.7.18"
+```
+
+**触发条件**：
+```
+用户误操作或系统重试，再次触发 containerd 升级
+```
+
+**执行流程**：
+```
+BinaryComponentExecutor 执行:
+  │
+  ├─ 1. VersionContext 检查
+  │     NeedsUpgrade("containerd") = false  // v1.7.18 == v1.7.18
+  │     └─ 整个组件跳过
+  │
+  └─ 2. 记录日志
+        "containerd already at target version v1.7.18, skip upgrade"
+```
+
+**幂等性保证**：
+- ✅ DAG 构建时跳过（不加入 DAG）
+- ✅ 不执行任何节点操作
+- ✅ 快速返回，零开销
+
+---
+
+### 9.3 中断恢复场景
+
+**场景**：升级过程中控制器重启，恢复后从中断点继续。
+
+**中断前状态**：
+```yaml
+ComponentStatuses:
+  containerd:
+    "192.168.1.10": {Version: "v1.7.18", Phase: "Installed"}  # 已完成
+    "192.168.1.11": {Version: "v1.7.18", Phase: "Installing"} # 中断
+    "192.168.1.12": {Version: "v1.7.15", Phase: "Pending"}    # 未开始
+```
+
+**恢复流程**：
+```
+控制器重启后:
+  │
+  ├─ 1. 重建 DAG
+  │     BuildUpgradeDAG(releaseImage)
+  │     └─ containerd 节点加入 DAG
+  │
+  ├─ 2. 检查节点状态
+  │     │
+  │     ├─ node-1 (192.168.1.10):
+  │     │   ├─ Phase = "Installed"
+  │     │   └─ 跳过（已完成）
+  │     │
+  │     ├─ node-2 (192.168.1.11):
+  │     │   ├─ Phase = "Installing"
+  │     │   ├─ 检查是否真的在安装中
+  │     │   ├─ 如果超时 → 标记为 Failed，重试
+  │     │   └─ 如果正常 → 跳过（避免并发）
+  │     │
+  │     └─ node-3 (192.168.1.12):
+  │         ├─ Phase = "Pending"
+  │         └─ 继续升级
+  │
+  └─ 3. 继续执行
+        ├─ node-2: 重试或跳过
+        └─ node-3: 升级到 v1.7.18
+```
+
+**中断恢复保证**：
+- ✅ 已完成的节点不重复执行
+- ✅ 中断的节点可以重试
+- ✅ 未开始的节点正常执行
+- ✅ 状态一致性保证
+
+---
+
+## 10. 健康检查详细样例
+
+### 10.1 PodReady 检查
+
+**场景**：coredns 安装后，检查 Pod 是否就绪。
+
+**健康检查配置**：
+```yaml
+spec:
+  helm:
+    healthCheck:
+      enabled: true
+      timeout: "3m"
+      checks:
+        - type: PodReady
+          podReady:
+            namespace: kube-system
+            labelSelector: "k8s-app=kube-dns"
+            minReady: 2  # 至少 2 个 Pod Ready
+```
+
+**执行流程**：
+```
+HealthChecker.Check() 执行:
+  │
+  ├─ 1. 查询 Pod
+  │     kubectl get pods -n kube-system -l k8s-app=kube-dns
+  │     └─ 返回 Pod 列表: [coredns-xxx-1, coredns-xxx-2, coredns-xxx-3]
+  │
+  ├─ 2. 检查 Pod 状态
+  │     │
+  │     ├─ coredns-xxx-1:
+  │     │   ├─ Status.Phase = "Running"
+  │     │   ├─ Status.Conditions:
+  │     │   │   └─ Type = "Ready", Status = "True"
+  │     │   └─ Ready = true ✅
+  │     │
+  │     ├─ coredns-xxx-2:
+  │     │   ├─ Status.Phase = "Running"
+  │     │   ├─ Status.Conditions:
+  │     │   │   └─ Type = "Ready", Status = "True"
+  │     │   └─ Ready = true ✅
+  │     │
+  │     └─ coredns-xxx-3:
+  │         ├─ Status.Phase = "Running"
+  │         ├─ Status.Conditions:
+  │         │   └─ Type = "Ready", Status = "False"
+  │         └─ Ready = false ❌
+  │
+  ├─ 3. 统计 Ready Pod 数量
+  │     readyCount = 2
+  │
+  ├─ 4. 检查是否满足 minReady
+  │     readyCount (2) >= minReady (2) → 通过 ✅
+  │
+  └─ 5. 返回结果
+        HealthCheckResult: Success
+```
+
+**超时处理**：
+```
+如果 3 分钟内未满足 minReady:
+  ├─ 记录错误日志: "PodReady check timeout: 1/2 ready"
+  ├─ 返回错误
+  └─ 根据 FailurePolicy 处理
+```
+
+---
+
+### 10.2 EndpointReady 检查
+
+**场景**：openfuyao-core 安装后，检查 Service Endpoint 是否就绪。
+
+**健康检查配置**：
+```yaml
+spec:
+  yaml:
+    healthCheck:
+      enabled: true
+      timeout: "3m"
+      checks:
+        - type: EndpointReady
+          endpointReady:
+            namespace: openfuyao-system
+            serviceName: openfuyao-core
+            minReady: 1  # 至少 1 个 Endpoint Ready
+```
+
+**执行流程**：
+```
+HealthChecker.Check() 执行:
+  │
+  ├─ 1. 查询 Service
+  │     kubectl get service openfuyao-core -n openfuyao-system
+  │     └─ 返回 Service 对象
+  │
+  ├─ 2. 查询 Endpoint
+  │     kubectl get endpoints openfuyao-core -n openfuyao-system
+  │     └─ 返回 Endpoint 对象
+  │
+  ├─ 3. 检查 Endpoint 地址
+  │     Endpoint.Subsets[0].Addresses:
+  │       - IP: "192.168.1.10"
+  │         NodeName: "master-amd64"
+  │         TargetRef:
+  │           Kind: "Pod"
+  │           Name: "openfuyao-core-xxx-1"
+  │       - IP: "192.168.1.11"
+  │         NodeName: "worker-amd64-1"
+  │         TargetRef:
+  │           Kind: "Pod"
+  │           Name: "openfuyao-core-xxx-2"
+  │
+  ├─ 4. 统计 Ready Endpoint 数量
+  │     readyCount = 2
+  │
+  ├─ 5. 检查是否满足 minReady
+  │     readyCount (2) >= minReady (1) → 通过 ✅
+  │
+  └─ 6. 返回结果
+        HealthCheckResult: Success
+```
+
+**Endpoint 与 Pod 的区别**：
+- ✅ PodReady: 检查 Pod 是否就绪（进程存活 + 健康检查通过）
+- ✅ EndpointReady: 检查 Service 是否有可用的后端（Pod Ready + 注册到 Endpoint）
+- ✅ EndpointReady 更严格，确保服务可以被访问
+
+---
+
+### 10.3 健康检查失败处理
+
+**场景**：coredns 健康检查失败，Pod 未就绪。
+
+**执行流程**：
+```
+HealthChecker.Check() 执行:
+  │
+  ├─ 1. 查询 Pod
+  │     kubectl get pods -n kube-system -l k8s-app=kube-dns
+  │     └─ 返回 Pod 列表: [coredns-xxx-1]
+  │
+  ├─ 2. 检查 Pod 状态
+  │     coredns-xxx-1:
+  │       ├─ Status.Phase = "Running"
+  │       ├─ Status.Conditions:
+  │       │   └─ Type = "Ready", Status = "False"
+  │       ├─ Status.ContainerStatuses[0]:
+  │       │   ├─ Ready = false
+  │       │   └─ State.Waiting:
+  │       │       ├─ Reason = "CrashLoopBackOff"
+  │       │       └─ Message = "back-off 5m0s restarting failed container"
+  │       └─ Ready = false ❌
+  │
+  ├─ 3. 统计 Ready Pod 数量
+  │     readyCount = 0
+  │
+  ├─ 4. 检查是否满足 minReady
+  │     readyCount (0) < minReady (1) → 失败 ❌
+  │
+  ├─ 5. 等待并重试（直到超时）
+  │     for now < deadline {
+  │       sleep(interval)
+  │       readyCount = checkPodReady()
+  │       if readyCount >= minReady {
+  │         return Success
+  │       }
+  │     }
+  │
+  └─ 6. 超时处理
+        ├─ 记录错误日志: "PodReady check timeout: 0/1 ready"
+        ├─ 记录 Pod 状态: "Pod coredns-xxx-1 in CrashLoopBackOff"
+        ├─ 返回错误
+        └─ 根据 FailurePolicy 处理
+              ├─ FailFast: 终止安装
+              ├─ Continue: 继续下一个组件
+              └─ Rollback: 回滚到旧版本
+```
+
+**失败诊断**：
+```bash
+# 查看 Pod 日志
+kubectl logs coredns-xxx-1 -n kube-system
+
+# 查看 Pod 事件
+kubectl describe pod coredns-xxx-1 -n kube-system
+
+# 查看 Pod 状态
+kubectl get pod coredns-xxx-1 -n kube-system -o yaml
+```
+
+---
+
+## 11. 大规模场景样例
+
+### 11.1 中规模安装（3M+10W）
+
+**场景**：中规模集群安装，3 Master + 10 Worker 节点。
+
+**集群配置**：
+```yaml
+apiVersion: config.openfuyao.cn/v1beta1
+kind: BKECluster
+metadata:
+  name: medium-cluster
+  namespace: default
+spec:
+  nodeRefs:
+    # Master 节点
+    - name: master-1
+      ip: 192.168.1.10
+    - name: master-2
+      ip: 192.168.1.11
+    - name: master-3
+      ip: 192.168.1.12
+    # Worker 节点
+    - name: worker-1
+      ip: 192.168.1.20
+    - name: worker-2
+      ip: 192.168.1.21
+    - name: worker-3
+      ip: 192.168.1.22
+    - name: worker-4
+      ip: 192.168.1.23
+    - name: worker-5
+      ip: 192.168.1.24
+    - name: worker-6
+      ip: 192.168.1.25
+    - name: worker-7
+      ip: 192.168.1.26
+    - name: worker-8
+      ip: 192.168.1.27
+    - name: worker-9
+      ip: 192.168.1.28
+    - name: worker-10
+      ip: 192.168.1.29
+  clusterConfig:
+    cluster:
+      containerRuntime:
+        cri: containerd
+      imageRepo:
+        domain: registry.example.com
+```
+
+**执行流程**：
+```
+DAG Scheduler 执行:
+  │
+  ├─ Batch 1: bkeagent (Rolling, batchSize=1)
+  │   ├─ master-1: SSH 推送 → ✅ (10s)
+  │   ├─ master-2: SSH 推送 → ✅ (10s)
+  │   ├─ master-3: SSH 推送 → ✅ (10s)
+  │   ├─ worker-1~10: SSH 推送 → ✅ (10s each)
+  │   └─ 总耗时: 13 * 10s = 130s ≈ 2.2 分钟
+  │
+  ├─ Batch 2: containerd (Rolling, batchSize=1)
+  │   ├─ master-1: 下载 + 安装 → ✅ (30s)
+  │   ├─ master-2: 下载 + 安装 → ✅ (30s)
+  │   ├─ master-3: 下载 + 安装 → ✅ (30s)
+  │   ├─ worker-1~10: 下载 + 安装 → ✅ (30s each)
+  │   └─ 总耗时: 13 * 30s = 390s ≈ 6.5 分钟
+  │
+  ├─ Batch 3: kubernetes-master (Inline)
+  │   ├─ master-1: kubeadm init → ✅ (120s)
+  │   ├─ master-2: kubeadm join → ✅ (60s)
+  │   ├─ master-3: kubeadm join → ✅ (60s)
+  │   └─ 总耗时: 120s + 60s + 60s = 240s = 4 分钟
+  │
+  ├─ Batch 4: kubernetes-worker (Inline)
+  │   ├─ worker-1~10: kubeadm join → ✅ (60s each)
+  │   └─ 总耗时: 10 * 60s = 600s = 10 分钟
+  │
+  ├─ Batch 5: coredns (Helm, Parallel)
+  │   ├─ helm install → ✅ (60s)
+  │   └─ 总耗时: 60s = 1 分钟
+  │
+  └─ Batch 6: openfuyao-core (YAML, Parallel)
+      ├─ apply manifests → ✅ (30s)
+      └─ 总耗时: 30s = 0.5 分钟
+
+总耗时: 2.2 + 6.5 + 4 + 10 + 1 + 0.5 = 24.2 分钟 ≈ 25 分钟
+```
+
+**性能优化**：
+- ✅ **并行下载**：多个节点可以同时下载制品（如果网络带宽足够）
+- ✅ **缓存复用**：已下载的制品可以缓存在本地，避免重复下载
+- ✅ **批量操作**：kubeadm join 可以并行执行（如果控制面负载允许）
+
+---
+
+### 11.2 并行性能验证
+
+**场景**：验证 Rolling 和 Parallel 模式的性能差异。
+
+**Rolling 模式（batchSize=1）**：
+```
+节点列表: [node-1, node-2, node-3, node-4, node-5]
+执行顺序: node-1 → node-2 → node-3 → node-4 → node-5
+总耗时: 5 * 30s = 150s = 2.5 分钟
+```
+
+**Parallel 模式（batchSize=0）**：
+```
+节点列表: [node-1, node-2, node-3, node-4, node-5]
+执行顺序: [node-1, node-2, node-3, node-4, node-5] (并行)
+总耗时: 30s = 0.5 分钟
+```
+
+**Batch 模式（batchSize=2）**：
+```
+节点列表: [node-1, node-2, node-3, node-4, node-5]
+执行顺序:
+  Batch 1: [node-1, node-2] (并行) → 30s
+  Batch 2: [node-3, node-4] (并行) → 30s
+  Batch 3: [node-5] → 30s
+总耗时: 3 * 30s = 90s = 1.5 分钟
+```
+
+**性能对比**：
+
+| 模式 | batchSize | 并行度 | 总耗时 | 适用场景 |
+|------|----------|--------|--------|---------|
+| **Rolling** | 1 | 1 | 2.5 分钟 | 关键组件，需要逐节点验证 |
+| **Batch** | 2 | 2 | 1.5 分钟 | 平衡性能和安全 |
+| **Parallel** | 0 | N | 0.5 分钟 | 非关键组件，快速升级 |
+
+**资源消耗对比**：
+
+| 模式 | 网络带宽 | 控制面负载 | 磁盘 I/O | 风险 |
+|------|---------|-----------|---------|------|
+| **Rolling** | 低 | 低 | 低 | 低 |
+| **Batch** | 中 | 中 | 中 | 中 |
+| **Parallel** | 高 | 高 | 高 | 高 |
+
+**建议**：
+- ✅ 关键组件（containerd、bkeagent）：使用 Rolling 模式
+- ✅ 非关键组件（coredns、openfuyao-core）：使用 Parallel 模式
+- ✅ 中等规模集群（10-50 节点）：使用 Batch 模式（batchSize=5）
+
+---
+
+**文档版本**: v1.5  
 **维护者**: openFuyao Team
