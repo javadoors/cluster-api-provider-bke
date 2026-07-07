@@ -33,6 +33,14 @@
    - 4.2 Feature Gate OFF 路径
    - 4.3 混合模式
 5. [关键设计点说明](#5-关键设计点说明)
+6. [扩缩容样例](#6-扩缩容样例)
+   - 6.1 节点扩容（Scale-Out）
+   - 6.2 扩容+升级并发场景
+   - 6.3 节点缩容（Scale-In）
+7. [Selector 依赖样例](#7-selector-依赖样例)
+   - 7.1 Selector 依赖传递（containerd 场景）
+   - 7.2 Selector 依赖传递（docker 场景）
+   - 7.3 其他组件对 selector 的依赖
 
 ---
 
@@ -1742,5 +1750,520 @@ aarch64          →    arm64
 
 ---
 
-**文档版本**: v1.3  
+## 6. 扩缩容样例
+
+### 6.1 节点扩容（Scale-Out）
+
+**场景**：向现有集群添加新节点，需要在新节点上安装 bkeagent、containerd，并执行 kubeadm join 加入集群。
+
+**触发条件**：
+- BKECluster.Spec.NodeRefs 增加新节点
+- 新节点状态为 Ready
+
+**集群配置变更**：
+```yaml
+# 变更前
+spec:
+  nodeRefs:
+    - name: node-1
+      ip: 192.168.1.10
+    - name: node-2
+      ip: 192.168.1.11
+
+# 变更后
+spec:
+  nodeRefs:
+    - name: node-1
+      ip: 192.168.1.10
+    - name: node-2
+      ip: 192.168.1.11
+    - name: node-3        # 新增节点
+      ip: 192.168.1.12
+```
+
+**执行流程**：
+```
+BKEClusterReconciler.Reconcile() 检测到新节点
+  │
+  ├─ 1. DAG 构建
+  │     BuildUpgradeDAG(releaseImage)
+  │     ├─ bkeagent: skipCompleted=true, 仅对新节点执行
+  │     ├─ containerd: skipCompleted=true, 仅对新节点执行
+  │     └─ kubernetes-worker: 仅对新节点执行 kubeadm join
+  │
+  ├─ 2. Scheduler.ExecuteDAG(ctx, dag)
+  │     │
+  │     ├─ Batch 1: bkeagent (binary)
+  │     │   └─ BinaryComponentExecutor
+  │     │       ├─ isAlreadyAtTarget(node-3) = false (无 NodeComponentStatuses 记录)
+  │     │       ├─ SSH 推送 bkeagent 到 node-3
+  │     │       ├─ 执行 installScript
+  │     │       ├─ HealthCheck: systemctl is-active bkeagent → ✅
+  │     │       └─ MarkSuccess:
+  │     │           ├─ NodeComponentStatuses["bkeagent"]["192.168.1.12"] = Installed
+  │     │           └─ BKENode.StateCode |= NodeAgentReadyFlag  ← 关键：同步设置就绪标志
+  │     │
+  │     ├─ Batch 2: containerd (binary, 依赖 bkeagent)
+  │     │   └─ BinaryComponentExecutor
+  │     │       ├─ isAlreadyAtTarget(node-3) = false
+  │     │       ├─ SSH 推送 containerd 到 node-3
+  │     │       ├─ 执行 installScript
+  │     │       ├─ HealthCheck: systemctl is-active containerd → ✅
+  │     │       └─ MarkSuccess:
+  │     │           └─ NodeComponentStatuses["containerd"]["192.168.1.12"] = Installed
+  │     │
+  │     └─ Batch 3: kubernetes-worker (inline)
+  │         └─ InlineRunner.Execute(handler="EnsureWorkerJoin")
+  │             ├─ 检查 NodeAgentReadyFlag = true → 继续
+  │             ├─ 执行 kubeadm join 192.168.1.1:6443
+  │             └─ 节点加入集群 → ✅
+  │
+  └─ 3. 更新 BKECluster.Status
+        phase: Ready
+        nodes: [node-1, node-2, node-3]
+```
+
+**幂等性保证**：
+- `isAlreadyAtTarget` 检查 `NodeComponentStatuses`，已安装节点跳过
+- `skipCompleted=true` 确保只对未安装节点执行
+- `NodeAgentReadyFlag` 同步设置，确保后续组件能正确判断 bkeagent 就绪状态
+
+---
+
+### 6.2 扩容+升级并发场景
+
+**场景**：扩容新节点的同时触发版本升级（v2.5.0 → v2.6.0），需要确保新节点安装目标版本，已有节点升级到目标版本。
+
+**触发条件**：
+- BKECluster.Spec.NodeRefs 增加新节点
+- BKECluster.Spec.DesiredVersion 从 v2.5.0 变更为 v2.6.0
+
+**VersionContext 决策**：
+```
+SetCurrent("bkeagent", "v2.5.0")
+SetTarget("bkeagent", "v2.6.0")
+
+NeedsUpgrade("bkeagent") = true
+Action = Upgrade
+```
+
+**执行流程**：
+```
+BKEClusterReconciler.Reconcile() 检测到扩容+升级
+  │
+  ├─ 1. DAG 构建
+  │     BuildUpgradeDAG(releaseImage, versionContext)
+  │     ├─ bkeagent: skipCompleted=true, 对所有节点执行
+  │     └─ containerd: skipCompleted=true, 对所有节点执行
+  │
+  ├─ 2. Scheduler.ExecuteDAG(ctx, dag, versionContext)
+  │     │
+  │     ├─ Batch 1: bkeagent 升级
+  │     │   └─ BinaryComponentExecutor
+  │     │       │
+  │     │       ├─ node-1 (已有节点):
+  │     │       │   ├─ isAlreadyAtTarget: NodeComponentStatuses["bkeagent"]["192.168.1.10"] = {Version: "v2.5.0"}
+  │     │       │   ├─ targetVersion = "v2.6.0"
+  │     │       │   ├─ v2.5.0 != v2.6.0 → 不跳过
+  │     │       │   ├─ SSH 升级 bkeagent 到 v2.6.0
+  │     │       │   └─ MarkSuccess: Version = "v2.6.0"
+  │     │       │
+  │     │       ├─ node-2 (已有节点): (同上) → ✅
+  │     │       │
+  │     │       └─ node-3 (新节点):
+  │     │           ├─ isAlreadyAtTarget: 无 NodeComponentStatuses 记录 → 不跳过
+  │     │           ├─ SSH 安装 bkeagent v2.6.0
+  │     │           └─ MarkSuccess: Version = "v2.6.0"
+  │     │
+  │     └─ Batch 2: containerd 升级
+  │         └─ BinaryComponentExecutor
+  │             ├─ node-1, node-2: 升级到 v1.7.18 → ✅
+  │             └─ node-3: 安装 v1.7.18 → ✅
+  │
+  └─ 3. 更新 BKECluster.Status
+        phase: Ready
+        versions:
+          bkeagent: v2.6.0
+          containerd: v1.7.18
+        nodes: [node-1, node-2, node-3]
+```
+
+**幂等保护机制**：
+
+`isAlreadyAtTarget` 的状态分支处理：
+
+```go
+func (f *BKENodeFilter) isAlreadyAtTarget(
+    ctx context.Context,
+    node Node,
+    cv *configv1alpha1.ComponentVersion,
+    execCtx *ExecutionContext,
+) bool {
+    componentName := cv.Spec.Name
+    targetVersion := cv.Spec.Version
+
+    // 从 NodeComponentStatuses 读取
+    if execCtx.Cluster.Status.NodeComponentStatuses != nil {
+        if compStatuses, ok := execCtx.Cluster.Status.NodeComponentStatuses[componentName]; ok {
+            if status, ok := compStatuses[node.IP]; ok {
+                // 已安装且版本匹配 → 跳过
+                if status.Phase == "Installed" && status.Version == targetVersion {
+                    return true
+                }
+                // 正在安装中 → 跳过 (避免并发)
+                if status.Phase == "Installing" {
+                    return true
+                }
+                // 其他状态 (Failed/Timeout/版本不匹配等) → 不跳过
+                return false
+            }
+        }
+    }
+
+    return false
+}
+```
+
+**场景验证矩阵**：
+
+| 场景 | NodeComponentStatuses | VersionContext | isAlreadyAtTarget | 行为 |
+|------|----------------------|----------------|-------------------|------|
+| 新节点首次安装 | 无记录 | NeedsUpgrade=true | false → 不跳过 | 安装到目标版本 ✅ |
+| 已安装到目标版本 | `{Phase: Installed, Version: v1.7.18}` | target=v1.7.18 | true → 跳过 | 幂等跳过 ✅ |
+| 安装失败后重试 | `{Phase: Failed, Version: ""}` | NeedsUpgrade=true | false → 不跳过 | 重试安装 ✅ |
+| 安装失败后版本变更 | `{Phase: Failed, Version: ""}` | target 变为 v1.7.20 | false → 不跳过 | 安装到新版本 ✅ |
+| 升级中目标版本又变 | `{Phase: Installed, Version: v1.7.18}` | target 变为 v1.7.20 | false → 不跳过 | 升级到 v1.7.20 ✅ |
+| 扩容+升级同时 | `{Phase: Installed, Version: v2.6.0}` (安装 Phase 已写入) | target=v2.6.0 | true → 跳过 | 升级 Phase 幂等跳过 ✅ |
+| 二次升级中间态 | `{Phase: Installed, Version: v1.7.18}` | target=v1.7.20 | false → 不跳过 | 升级到 v1.7.20 ✅ |
+
+---
+
+### 6.3 节点缩容（Scale-In）
+
+**场景**：从集群移除节点，需要清理节点上的组件并删除 BKENode CRD。
+
+**触发条件**：
+- BKECluster.Spec.NodeRefs 移除节点
+- 节点状态为 Ready
+
+**集群配置变更**：
+```yaml
+# 变更前
+spec:
+  nodeRefs:
+    - name: node-1
+      ip: 192.168.1.10
+    - name: node-2
+      ip: 192.168.1.11
+    - name: node-3
+      ip: 192.168.1.12
+
+# 变更后
+spec:
+  nodeRefs:
+    - name: node-1
+      ip: 192.168.1.10
+    - name: node-2
+      ip: 192.168.1.11
+    # node-3 已移除
+```
+
+**执行流程**：
+```
+BKEClusterReconciler.Reconcile() 检测到节点移除
+  │
+  ├─ 1. 标记节点为 Deleting
+  │     BKENode.Status.StateCode |= NodeDeletingFlag
+  │
+  ├─ 2. 驱逐节点上的 Pod
+  │     kubectl cordon node-3
+  │     kubectl drain node-3 --ignore-daemonsets --delete-emptydir-data
+  │
+  ├─ 3. 清理节点上的组件
+  │     │
+  │     ├─ 执行 containerd uninstallScript:
+  │     │   ├─ systemctl stop containerd
+  │     │   ├─ systemctl disable containerd
+  │     │   ├─ rm -f /usr/local/bin/containerd
+  │     │   ├─ rm -rf /etc/containerd/
+  │     │   └─ systemctl daemon-reload
+  │     │
+  │     ├─ 执行 bkeagent uninstallScript:
+  │     │   ├─ systemctl stop bkeagent
+  │     │   ├─ systemctl disable bkeagent
+  │     │   ├─ rm -f /usr/local/bin/bkeagent
+  │     │   ├─ rm -rf /etc/openFuyao/bkeagent
+  │     │   └─ systemctl daemon-reload
+  │     │
+  │     └─ 执行 kubeadm reset:
+  │         ├─ kubeadm reset -f
+  │         └─ 清理 CNI 配置
+  │
+  ├─ 4. 从集群中删除节点
+  │     kubectl delete node node-3
+  │
+  ├─ 5. 删除 BKENode CRD
+  │     kubectl delete bkenode node-3 -n default
+  │
+  └─ 6. 清理 NodeComponentStatuses
+        删除 NodeComponentStatuses 中 node-3 的记录
+```
+
+**注意事项**：
+- 缩容前需要确保节点上的 Pod 已迁移
+- 控制面节点缩容需要特别处理（etcd 成员移除）
+- 缩容后需要更新 BKECluster.Status.Nodes
+
+---
+
+## 7. Selector 依赖样例
+
+### 7.1 Selector 依赖传递（containerd 场景）
+
+**场景**：CRI=containerd，container-runtime selector 展开为 containerd，containerd 依赖 bkeagent。
+
+**集群配置**：
+```yaml
+apiVersion: config.openfuyao.cn/v1beta1
+kind: BKECluster
+metadata:
+  name: containerd-cluster
+spec:
+  clusterConfig:
+    cluster:
+      containerRuntime:
+        cri: containerd
+```
+
+**ComponentVersion YAML 配置**：
+
+```yaml
+# bke-manifests/container-runtime/v1.0.0/component.yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: container-runtime-v1.0.0
+spec:
+  name: container-runtime
+  type: selector
+  version: v1.0.0
+  subComponents:
+    - name: containerd
+      version: v1.7.18
+      condition: '{{.Config.Cluster.ContainerRuntime.CRI == "containerd"}}'
+    - name: docker
+      version: v26.0.0
+      condition: '{{.Config.Cluster.ContainerRuntime.CRI == "docker"}}'
+    - name: cri-dockerd
+      version: v0.3.9
+      condition: '{{.Config.Cluster.ContainerRuntime.CRI == "docker"}}'
+```
+
+```yaml
+# bke-manifests/containerd/v1.7.18/component.yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: containerd-v1.7.18
+spec:
+  name: containerd
+  type: binary
+  version: v1.7.18
+  dependencies:
+    - name: bkeagent  # containerd 依赖 bkeagent
+  # ... 其他配置省略
+```
+
+**DAG 构建流程**：
+```
+1. DAG 构建器加载 container-runtime selector
+2. 评估 condition: Config.Cluster.ContainerRuntime.CRI == "containerd" → true
+3. 展开为 containerd/v1.7.18 节点
+4. 加载 containerd ComponentVersion
+5. 读取 dependencies: [bkeagent]
+6. 构建 DAG 边: bkeagent → containerd
+```
+
+**DAG 执行顺序**：
+```
+Batch 0: [bkeagent]
+  ├─ node-1: SSH 推送 bkeagent → ✅
+  ├─ node-2: SSH 推送 bkeagent → ✅
+  └─ node-3: SSH 推送 bkeagent → ✅
+
+Batch 1: [containerd] (依赖 bkeagent)
+  ├─ node-1: SSH 推送 containerd → ✅
+  ├─ node-2: SSH 推送 containerd → ✅
+  └─ node-3: SSH 推送 containerd → ✅
+
+Batch 2: [kubernetes-master, kubernetes-worker]
+  ├─ kubernetes-master: kubeadm init → ✅
+  └─ kubernetes-worker: kubeadm join → ✅
+```
+
+---
+
+### 7.2 Selector 依赖传递（docker 场景）
+
+**场景**：CRI=docker，container-runtime selector 展开为 docker + cri-dockerd，docker 依赖 bkeagent，cri-dockerd 依赖 docker + bkeagent。
+
+**集群配置**：
+```yaml
+apiVersion: config.openfuyao.cn/v1beta1
+kind: BKECluster
+metadata:
+  name: docker-cluster
+spec:
+  clusterConfig:
+    cluster:
+      containerRuntime:
+        cri: docker
+      kubernetesVersion: "1.29.0"  # K8s >= 1.24 需要 cri-dockerd
+```
+
+**ComponentVersion YAML 配置**：
+
+```yaml
+# bke-manifests/docker/v26.0.0/component.yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: docker-v26.0.0
+spec:
+  name: docker
+  type: binary
+  version: v26.0.0
+  dependencies:
+    - name: bkeagent  # docker 依赖 bkeagent
+  # ... 其他配置省略
+```
+
+```yaml
+# bke-manifests/cri-dockerd/v0.3.9/component.yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: cri-dockerd-v0.3.9
+spec:
+  name: cri-dockerd
+  type: binary
+  version: v0.3.9
+  dependencies:
+    - name: docker      # cri-dockerd 依赖 docker
+    - name: bkeagent    # cri-dockerd 依赖 bkeagent
+  # ... 其他配置省略
+```
+
+**DAG 构建流程**：
+```
+1. DAG 构建器加载 container-runtime selector
+2. 评估 condition: Config.Cluster.ContainerRuntime.CRI == "docker" → true
+3. 展开为 docker/v26.0.0 + cri-dockerd/v0.3.9 两个节点
+4. 加载 docker ComponentVersion
+   - 读取 dependencies: [bkeagent]
+   - 构建 DAG 边: bkeagent → docker
+5. 加载 cri-dockerd ComponentVersion
+   - 读取 dependencies: [docker, bkeagent]
+   - 构建 DAG 边: docker → cri-dockerd, bkeagent → cri-dockerd
+```
+
+**DAG 执行顺序**：
+```
+Batch 0: [bkeagent]
+  ├─ node-1: SSH 推送 bkeagent → ✅
+  ├─ node-2: SSH 推送 bkeagent → ✅
+  └─ node-3: SSH 推送 bkeagent → ✅
+
+Batch 1: [docker] (依赖 bkeagent)
+  ├─ node-1: 包管理器安装 docker → ✅
+  ├─ node-2: 包管理器安装 docker → ✅
+  └─ node-3: 包管理器安装 docker → ✅
+
+Batch 2: [cri-dockerd] (依赖 docker + bkeagent)
+  ├─ node-1: SSH 推送 cri-dockerd → ✅
+  ├─ node-2: SSH 推送 cri-dockerd → ✅
+  └─ node-3: SSH 推送 cri-dockerd → ✅
+
+Batch 3: [kubernetes-master, kubernetes-worker]
+  ├─ kubernetes-master: kubeadm init → ✅
+  └─ kubernetes-worker: kubeadm join → ✅
+```
+
+**依赖关系图**：
+```
+bkeagent
+  ├─→ docker
+  │     └─→ cri-dockerd
+  └─→ cri-dockerd (冗余依赖，但无害)
+```
+
+---
+
+### 7.3 其他组件对 selector 的依赖
+
+**场景**：kubernetes-master 依赖 container-runtime selector，selector 展开为 docker + cri-dockerd，kubernetes-master 需要等待两者都完成。
+
+**ComponentVersion YAML 配置**：
+
+```yaml
+# bke-manifests/kubernetes-master/v1.29.0/component.yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: kubernetes-master-v1.29.0
+spec:
+  name: kubernetes-master
+  type: inline
+  version: v1.29.0
+  dependencies:
+    - name: container-runtime  # 依赖 selector
+  inline:
+    handler: EnsureMasterInit
+    version: v1.0.0
+```
+
+**DAG 构建流程**：
+```
+1. DAG 构建器加载 kubernetes-master
+2. 读取 dependencies: [container-runtime]
+3. 查找 container-runtime 是否为 selector → 是
+4. 展开 container-runtime 为 [docker, cri-dockerd]
+5. 将对 selector 的依赖转换为对所有子组件的依赖（AND 语义）
+6. 构建 DAG 边:
+   - docker → kubernetes-master
+   - cri-dockerd → kubernetes-master
+```
+
+**DAG 执行顺序**：
+```
+Batch 0: [bkeagent]
+  └─ 所有节点: SSH 推送 bkeagent → ✅
+
+Batch 1: [docker] (依赖 bkeagent)
+  └─ 所有节点: 包管理器安装 docker → ✅
+
+Batch 2: [cri-dockerd] (依赖 docker + bkeagent)
+  └─ 所有节点: SSH 推送 cri-dockerd → ✅
+
+Batch 3: [kubernetes-master] (依赖 docker + cri-dockerd)
+  └─ master 节点: kubeadm init → ✅
+```
+
+**实际效果分析**：
+
+虽然 kubernetes-master 同时依赖 docker 和 cri-dockerd，但由于 cri-dockerd 已经依赖 docker，所以 docker 的依赖是冗余的。最终效果等同于：
+
+```
+bkeagent → docker → cri-dockerd → kubernetes-master
+```
+
+**AND 语义的优势**：
+- ✅ 实现简单：不需要额外逻辑判断依赖哪个子组件
+- ✅ 正确性保证：DAG 拓扑排序自动处理执行顺序
+- ✅ 冗余依赖无害：即使依赖了多个组件，DAG 也会正确执行
+- ✅ 通用性强：适用于任何 selector 展开场景
+
+---
+
+**文档版本**: v1.4  
 **维护者**: openFuyao Team
