@@ -1,6 +1,6 @@
 # KEP-6 安装与升级样例
 
-**文档版本**: v1.3  
+**文档版本**: v1.6  
 **状态**: Draft  
 **依赖**: KEP-6 详细设计文档 (kep6-detailed-design.md)
 
@@ -8,66 +8,79 @@
 
 ## 目录
 
-1. [安装样例](#1-安装样例)
-   - 1.1 containerd 在线安装
-   - 1.2 containerd 离线安装
-   - 1.3 docker 安装
-   - 1.4 bkeagent 安装
-   - 1.5 cluster-api 部署
-   - 1.6 bkeagent-switch 切换
-   - 1.7 bke-manifests 目录结构
-   - 1.8 ReleaseImage 样例
-   - 1.9 安装执行流程
-   - 1.10 Helm 组件安装（coredns）
-   - 1.11 YAML 组件安装（openfuyao-core）
-   - 1.12 多架构混合集群安装
-2. [升级样例](#2-升级样例)
+### 第一部分：核心操作
+
+**1. [安装样例](#1-安装样例)**
+   - 1.1 快速开始：containerd 在线安装
+   - 1.2 离线环境：containerd 离线安装
+   - 1.3 Docker 运行时安装
+   - 1.4 Helm 组件安装（coredns）
+   - 1.5 YAML 组件安装（openfuyao-core）
+   - 1.6 多架构混合集群安装
+
+**2. [升级样例](#2-升级样例)**
    - 2.1 版本变更对比
-   - 2.2 containerd 升级
-   - 2.3 docker 升级
-   - 2.4 bkeagent 升级
-   - 2.5 ReleaseImage 样例
-   - 2.6 升级执行流程
-   - 2.7 Helm 组件升级（coredns）
-   - 2.8 YAML 组件升级（openfuyao-core）
-   - 2.9 升级策略演示（Continue/Rollback）
-3. [回滚样例](#3-回滚样例)
+   - 2.2 Binary 组件升级（containerd/docker/bkeagent）
+   - 2.3 Helm 组件升级（coredns）
+   - 2.4 YAML 组件升级（openfuyao-core）
+   - 2.5 升级策略演示（Continue/Rollback）
+
+**3. [回滚样例](#3-回滚样例)**
    - 3.1 Binary 组件回滚
    - 3.2 Helm 组件回滚
-4. [Feature Gate 兼容性](#4-feature-gate-兼容性)
-   - 4.1 Feature Gate ON 路径
-   - 4.2 Feature Gate OFF 路径
-   - 4.3 混合模式
-5. [关键设计点说明](#5-关键设计点说明)
-6. [扩缩容样例](#6-扩缩容样例)
-   - 6.1 节点扩容（Scale-Out）
-   - 6.2 扩容+升级并发场景
-   - 6.3 节点缩容（Scale-In）
-7. [Selector 依赖样例](#7-selector-依赖样例)
-   - 7.1 Selector 依赖传递（containerd 场景）
-   - 7.2 Selector 依赖传递（docker 场景）
-   - 7.3 其他组件对 selector 的依赖
-8. [错误处理与恢复样例](#8-错误处理与恢复样例)
-   - 8.1 可重试错误处理
-   - 8.2 不可重试错误处理
-   - 8.3 部分失败处理
-9. [幂等性保证样例](#9-幂等性保证样例)
-   - 9.1 重复安装幂等性
-   - 9.2 重复升级幂等性
-   - 9.3 中断恢复场景
-10. [健康检查详细样例](#10-健康检查详细样例)
-    - 10.1 PodReady 检查
-    - 10.2 EndpointReady 检查
-    - 10.3 健康检查失败处理
-11. [大规模场景样例](#11-大规模场景样例)
-    - 11.1 中规模安装（3M+10W）
-    - 11.2 并行性能验证
+
+### 第二部分：高级场景
+
+**4. [扩缩容样例](#4-扩缩容样例)**
+   - 4.1 节点扩容（Scale-Out）
+   - 4.2 扩容+升级并发场景
+   - 4.3 节点缩容（Scale-In）
+
+**5. [Selector 依赖样例](#5-selector-依赖样例)**
+   - 5.1 Selector 依赖传递（containerd 场景）
+   - 5.2 Selector 依赖传递（docker 场景）
+   - 5.3 其他组件对 selector 的依赖
+
+**6. [Feature Gate 兼容性](#6-feature-gate-兼容性)**
+   - 6.1 Feature Gate ON 路径
+   - 6.2 Feature Gate OFF 路径
+   - 6.3 混合模式
+
+### 第三部分：补充说明
+
+**7. [错误处理与恢复](#7-错误处理与恢复)**
+   - 7.1 可重试错误处理
+   - 7.2 不可重试错误处理
+   - 7.3 部分失败处理
+
+**8. [幂等性与容错](#8-幂等性与容错)**
+   - 8.1 重复安装幂等性
+   - 8.2 重复升级幂等性
+   - 8.3 中断恢复场景
+
+**9. [健康检查](#9-健康检查)**
+   - 9.1 PodReady 检查
+   - 9.2 EndpointReady 检查
+   - 9.3 健康检查失败处理
+
+**10. [大规模场景](#10-大规模场景)**
+    - 10.1 中规模安装（3M+10W）
+    - 10.2 并行性能验证
+
+### 附录
+
+**[A. bke-manifests 目录结构](#a-bke-manifests-目录结构)**  
+**[B. ReleaseImage 样例](#b-releaseimage-样例)**  
+**[C. 安装执行流程](#c-安装执行流程)**  
+**[D. 关键设计点说明](#d-关键设计点说明)**
 
 ---
 
+## 第一部分：核心操作
+
 ## 1. 安装样例
 
-### 1.1 containerd 在线安装
+### 1.1 快速开始：containerd 在线安装
 
 **场景**：新建集群，使用 containerd 作为容器运行时，在线模式（镜像仓库可访问）。
 
@@ -245,7 +258,7 @@ spec:
 
 ---
 
-### 1.2 containerd 离线安装
+### 1.2 离线环境：containerd 离线安装
 
 **场景**：新建集群，使用 containerd 作为容器运行时，离线模式（需为公共仓库生成 hosts.toml 重定向）。
 
