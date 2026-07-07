@@ -483,7 +483,7 @@ server = "https://docker.io"
 
 ---
 
-### 1.3 docker 安装
+### 1.3 Docker 运行时安装
 
 **场景**：新建集群，使用 docker 作为容器运行时（K8s >= 1.24，需安装 cri-dockerd）。
 
@@ -1060,185 +1060,7 @@ spec:
 
 ---
 
-### 1.7 bke-manifests 目录结构
-
-**目录结构**：
-```
-bke-manifests/
-├── container-runtime/v1.0.0/component.yaml  ← type: selector
-├── containerd/v1.7.18/component.yaml        ← type: binary
-├── docker/v26.0.0/component.yaml            ← type: binary
-├── cri-dockerd/v0.3.9/component.yaml        ← type: binary
-├── bkeagent/v2.6.0/component.yaml           ← type: binary
-├── bkeagent-switch/v2.6.0/component.yaml    ← type: binary
-├── cluster-api/v1.5.0/component.yaml        ← type: helm
-├── coredns/v1.11.1/component.yaml           ← type: helm
-├── openfuyao-core/v26.03/component.yaml     ← type: yaml
-└── kubernetes-master/v1.29.0/               ← type: inline
-```
-
-**说明**：
-- `container-runtime` 是 selector 类型，在 DAG 构建期根据 `BKECluster.Spec.Cluster.ContainerRuntime.CRI` 展开为具体的容器运行时组件（containerd 或 docker）
-- `bkeagent-switch` 依赖 `cluster-api`，在 cluster-api 部署完成后执行
-- `kubernetes-master` 和 `kubernetes-worker` 是 inline 类型，无需 ComponentVersion YAML
-
----
-
-### 1.8 ReleaseImage 样例
-
-```yaml
-# releaseimage-v2.6.0.yaml
-apiVersion: config.openfuyao.cn/v1beta1
-kind: ReleaseImage
-metadata:
-  name: bke-v2.6.0
-spec:
-  version: v2.6.0
-  install:
-    components:
-      # Batch 1: bkeagent（监听管理集群）
-      - name: bkeagent
-        version: v2.6.0
-      
-      # Batch 2: 容器运行时（selector 类型，DAG 构建期展开）
-      - name: container-runtime
-        version: v1.0.0
-      
-      # Batch 3: Kubernetes 控制面（Inline）
-      - name: kubernetes-master
-        version: v1.29.0
-        inline:
-          handler: EnsureMasterInit
-          version: v1.0.0
-      
-      # Batch 4: Kubernetes 工作节点（Inline）
-      - name: kubernetes-worker
-        version: v1.29.0
-        inline:
-          handler: EnsureWorkerJoin
-          version: v1.0.0
-      
-      # Batch 5: cluster-api（Helm，创建目标集群 kubeconfig Secret）
-      - name: cluster-api
-        version: v1.5.0
-      
-      # Batch 6: bkeagent-switch（切换到目标集群）
-      - name: bkeagent-switch
-        version: v2.6.0
-        dependencies:
-          - name: cluster-api
-      
-      # Batch 7: 集群插件（Helm/YAML）
-      - name: coredns
-        version: v1.11.1
-      
-      - name: openfuyao-core
-        version: v26.03
-```
-
----
-
-### 1.9 安装执行流程
-
-```
-用户创建 BKECluster (desiredVersion: v2.6.0, CRI: containerd)
-  │
-  ▼
-BKEClusterReconciler.Reconcile()
-  │
-  ├─ 1. 解析 ReleaseImage v2.6.0
-  │     releaseImage.GetInstallComponents()
-  │     → [bkeagent, container-runtime, kubernetes-master, kubernetes-worker, 
-  │        cluster-api, bkeagent-switch, coredns, openfuyao-core]
-  │
-  ├─ 2. 加载 ComponentVersion
-  │     manifestStore.GetComponentManifests() 逐个加载组件定义
-  │
-  ├─ 3. 构建安装 DAG
-  │     BuildInstallDAG(releaseImage)
-  │
-  │     DAG 拓扑批次:
-  │     Batch 0: [finalizer, paused, manage, delete, dryrun]  (CommonPhases, inline)
-  │     Batch 1: [bkeagent]                                   (binary, 监听管理集群)
-  │     Batch 2: [containerd]                                 (binary, 依赖 bkeagent)
-  │     Batch 3: [kubernetes-master]                          (inline, 依赖 containerd)
-  │     Batch 4: [kubernetes-worker]                          (inline, 依赖 kubernetes-master)
-  │     Batch 5: [cluster-api]                                (helm, 依赖 kubernetes-master)
-  │     Batch 6: [bkeagent-switch]                            (binary, 依赖 cluster-api)
-  │     Batch 7: [coredns, openfuyao-core]                   (helm/yaml, 依赖 kubernetes-master)
-  │
-  ├─ 4. Scheduler.ExecuteDAG(ctx, dag)
-  │     │
-  │     ├─ Batch 1: bkeagent (binary) - 监听管理集群
-  │     │   └─ BinaryComponentExecutor
-  │     │       ├─ 下载 bkeagent_linux_amd64
-  │     │       ├─ 渲染配置（node, TLS, kubeconfig, service）
-  │     │       ├─ Rolling 逐节点安装
-  │     │       └─ 健康检查通过
-  │     │
-  │     ├─ Batch 2: containerd (binary)
-  │     │   └─ BinaryComponentExecutor
-  │     │       ├─ 下载 containerd-1.7.18-linux-amd64.tar.gz
-  │     │       ├─ 渲染配置（config.toml, service, hosts.toml）
-  │     │       ├─ Rolling 逐节点安装
-  │     │       └─ 健康检查通过
-  │     │
-  │     ├─ Batch 3: kubernetes-master (inline)
-  │     │   └─ InlineRunner.Execute(handler="EnsureMasterInit") → kubeadm init
-  │     │
-  │     ├─ Batch 4: kubernetes-worker (inline)
-  │     │   └─ InlineRunner.Execute(handler="EnsureWorkerJoin") → kubeadm join
-  │     │
-  │     ├─ Batch 5: cluster-api (helm)
-  │     │   └─ HelmComponentExecutor
-  │     │       ├─ 拉取 Chart (OCI Registry)
-  │     │       ├─ 渲染 Values
-  │     │       ├─ helm install --atomic --wait
-  │     │       ├─ HealthCheck: PodReady (cluster-api) → ✅
-  │     │       └─ 创建目标集群 kubeconfig Secret: {{clusterName}}-kubeconfig
-  │     │
-  │     ├─ Batch 6: bkeagent-switch (binary) - 切换到目标集群
-  │     │   └─ BinaryComponentExecutor
-  │     │       ├─ 前置检查:
-  │     │       │   ├─ 注解 bkeagent-listener = "bkecluster" → 继续
-  │     │       │   └─ Condition SwitchBKEAgent = False → 继续
-  │     │       ├─ 渲染配置:
-  │     │       │   ├─ kubeconfig: 从 Secret {{clusterName}}-kubeconfig 读取
-  │     │       │   ├─ node: 渲染 {{nodeHostname}}
-  │     │       │   └─ cluster: 渲染 {{clusterName}}
-  │     │       ├─ SSH 上传配置文件到所有节点
-  │     │       ├─ 执行 installScript: systemctl restart bkeagent
-  │     │       ├─ HealthCheck: systemctl is-active bkeagent → ✅
-  │     │       └─ 标记完成:
-  │     │           ├─ NodeComponentStatuses[bkeagent-switch] = Installed
-  │     │           └─ Condition: SwitchBKEAgent = True
-  │     │
-  │     └─ Batch 7: Helm + YAML 组件 (并行)
-  │         ├─ coredns: HelmComponentExecutor
-  │         │   ├─ 拉取 Chart (OCI Registry)
-  │         │   ├─ 渲染 Values
-  │         │   ├─ helm install --atomic --wait
-  │         │   └─ HealthCheck: PodReady (kube-dns) → ✅
-  │         │
-  │         └─ openfuyao-core: YamlComponentExecutor
-  │             ├─ 下载清单 (crds.yaml + deployment.yaml)
-  │             ├─ ApplyWithStrategy(ServerSideApply)
-  │             └─ HealthCheck: PodReady → ✅
-  │
-  ├─ 5. 健康检查
-  │     PodReady + EndpointReady 检查所有组件
-  │
-  └─ 6. 更新 BKECluster.Status
-        phase: Ready
-        conditions: 
-          - {type: Ready, status: True}
-          - {type: SwitchBKEAgent, status: True}
-        listenerTarget: bkecluster
-```
-
----
-
-### 1.10 Helm 组件安装（coredns）
+### 1.4 Helm 组件安装（coredns）
 
 **场景**：新建集群，使用 Helm 安装 coredns 组件（DNS 服务）。
 
@@ -1354,7 +1176,7 @@ HelmComponentExecutor 执行:
 
 ---
 
-### 1.11 YAML 组件安装（openfuyao-core）
+### 1.5 YAML 组件安装（openfuyao-core）
 
 **场景**：新建集群，使用 YAML 类型安装 openfuyao-core 组件（集群管理核心）。
 
@@ -1469,7 +1291,7 @@ YamlComponentExecutor 执行:
 
 ---
 
-### 1.12 多架构混合集群安装
+### 1.6 多架构混合集群安装
 
 **场景**：新建集群，包含 amd64 和 arm64 混合节点，需要按架构下载对应制品。
 
@@ -1607,7 +1429,7 @@ aarch64          →    arm64          →    containerd-1.7.18-linux-arm64.tar.
 
 ---
 
-### 2.2 containerd 升级
+### 2.2 Binary 组件升级（containerd/docker/bkeagent）
 
 **场景**：containerd v1.7.15 → v1.7.18，滚动升级。
 
@@ -1746,117 +1568,7 @@ BinaryComponentExecutor 执行:
 
 ---
 
-### 2.5 ReleaseImage 样例
-
-```yaml
-# releaseimage-v2.6.0.yaml (升级场景)
-apiVersion: config.openfuyao.cn/v1beta1
-kind: ReleaseImage
-metadata:
-  name: bke-v2.6.0
-spec:
-  version: v2.6.0
-  upgrade:
-    components:
-      # 容器运行时（selector 类型）
-      - name: container-runtime
-        version: v1.0.0
-      
-      # bkeagent
-      - name: bkeagent
-        version: v2.6.0
-      
-      # CoreDNS
-      - name: coredns
-        version: v1.11.1
-      
-      # openfuyao-core
-      - name: openfuyao-core
-        version: v26.03
-      
-      # kubernetes-master/worker 版本不变，不升级
-```
-
----
-
-### 2.6 升级执行流程
-
-```
-用户修改 ClusterVersion desiredVersion: v2.5.0 → v2.6.0
-  │
-  ▼
-ClusterVersionReconciler.Reconcile()
-  │
-  ├─ 1. 解析目标 ReleaseImage v2.6.0
-  │     releaseImage.GetUpgradeComponents()
-  │     → [container-runtime, bkeagent, coredns, openfuyao-core]
-  │
-  ├─ 2. 解析当前 ReleaseImage v2.5.0
-  │     currentReleaseImage.GetUpgradeComponents()
-  │     → [containerd:v1.7.15, bkeagent:v2.5.0, coredns:v1.10.1, openfuyao-core:v26.01]
-  │
-  ├─ 3. 构建 VersionContext (版本对比)
-  │     vc.SetCurrent("containerd", "v1.7.15")
-  │     vc.SetTarget("containerd", "v1.7.18")
-  │     vc.SetCurrent("bkeagent", "v2.5.0")
-  │     vc.SetTarget("bkeagent", "v2.6.0")
-  │     ... (每个组件设置 current/target)
-  │
-  │     VersionContext 决策结果:
-  │     containerd:       HasCurrent=true, NeedsUpgrade=true  → Action=Upgrade
-  │     bkeagent:         HasCurrent=true, NeedsUpgrade=true  → Action=Upgrade
-  │     coredns:          HasCurrent=true, NeedsUpgrade=true  → Action=Upgrade
-  │     openfuyao-core:   HasCurrent=true, NeedsUpgrade=true  → Action=Upgrade
-  │     kubernetes-master: HasCurrent=true, NeedsUpgrade=false → Skip
-  │
-  ├─ 4. 构建升级 DAG
-  │     BuildUpgradeDAG(releaseImage)
-  │
-  │     DAG 拓扑批次:
-  │     Batch 0: [provider]                                    (manifest, 前置)
-  │     Batch 1: [bkeagent]                                    (binary, 所有节点)
-  │     Batch 2: [containerd]                                  (binary, 依赖 bkeagent)
-  │     Batch 3: [coredns, openfuyao-core]                     (helm/yaml, 并行)
-  │
-  ├─ 5. Scheduler.ExecuteDAG(ctx, dag, versionContext)
-  │     │
-  │     ├─ Batch 1: bkeagent 升级
-  │     │   └─ BinaryComponentExecutor
-  │     │       ├─ Batch 升级 (batchSize=2)
-  │     │       └─ FailurePolicy=Continue
-  │     │
-  │     ├─ Batch 2: containerd 升级
-  │     │   └─ BinaryComponentExecutor
-  │     │       ├─ Rolling 逐节点升级
-  │     │       └─ FailurePolicy=FailFast
-  │     │
-  │     └─ Batch 3: Helm + YAML 组件升级 (并行)
-  │         ├─ coredns: HelmComponentExecutor
-  │         │   ├─ helm upgrade --atomic --wait
-  │         │   │   ├─ 成功 → Release 更新到 v1.11.1
-  │         │   │   └─ 失败 → helm 自动回滚到 v1.10.1 (atomic)
-  │         │   └─ HealthCheck: PodReady (kube-dns) → ✅
-  │         │
-  │         └─ openfuyao-core: YamlComponentExecutor
-  │             ├─ ApplyWithStrategy(ServerSideApply): 增量更新
-  │             └─ PruneResources(): 删除废弃资源 → ✅
-  │
-  ├─ 6. 健康检查
-  │     所有组件 PodReady + EndpointReady
-  │
-  └─ 7. 更新 BKECluster.Status
-        phase: Ready
-        conditions: [{type: Upgraded, status: True}]
-        versions:
-          containerd: v1.7.18
-          bkeagent: v2.6.0
-          coredns: v1.11.1
-          openfuyao-core: v26.03
-```
-
----
-
-### 2.7 Helm 组件升级（coredns）
+### 2.3 Helm 组件升级（coredns）
 
 **场景**：coredns v1.10.1 → v1.11.1，使用 helm upgrade 升级。
 
@@ -1916,7 +1628,7 @@ HelmComponentExecutor 执行:
 
 ---
 
-### 2.8 YAML 组件升级（openfuyao-core）
+### 2.4 YAML 组件升级（openfuyao-core）
 
 **场景**：openfuyao-core v26.01 → v26.03，使用 ServerSideApply 增量更新 + Prune 裁剪。
 
@@ -1983,7 +1695,7 @@ YamlComponentExecutor 执行:
 
 ---
 
-### 2.9 升级策略演示（Continue/Rollback）
+### 2.5 升级策略演示（Continue/Rollback）
 
 **场景**：containerd 升级过程中部分节点失败，演示 Continue 和 Rollback 策略。
 
@@ -2155,7 +1867,7 @@ HelmComponentExecutor 执行:
 
 ---
 
-## 4. Feature Gate 兼容性
+## 6. Feature Gate 兼容性
 
 ### 4.1 Feature Gate ON 路径
 
@@ -2236,128 +1948,9 @@ BKEClusterReconciler.Reconcile()
 
 ---
 
-## 5. 关键设计点说明
+## 第二部分：高级场景
 
-### 5.1 ComponentVersion YAML 存放路径约定
-
-```
-bke-manifests/
-├── container-runtime/v1.0.0/component.yaml  ← type: selector (容器运行时互斥选择)
-├── containerd/v1.7.18/component.yaml        ← type: binary (被 selector 引用)
-├── docker/v26.0.0/component.yaml            ← type: binary (被 selector 引用)
-├── cri-dockerd/v0.3.9/component.yaml        ← type: binary (被 selector 引用, 依赖 docker)
-├── bkeagent/v2.6.0/component.yaml           ← type: binary
-├── bkeagent-switch/v2.6.0/component.yaml    ← type: binary (切换监听目标)
-├── cluster-api/v1.5.0/component.yaml        ← type: helm (管理目标集群)
-├── coredns/v1.11.1/component.yaml           ← type: helm
-├── openfuyao-core/v26.03/component.yaml     ← type: yaml (含 subComponents)
-└── kubernetes-master/v1.29.0/               ← type: inline (无需 YAML, 由 inline handler 定义)
-```
-
-### 5.2 Selector 类型展开机制
-
-**展开时机**：DAG 构建期（BuildDAGFromBundle）
-
-**展开规则**：
-```go
-func (s *Scheduler) expandSelectorComponents(
-    ctx context.Context,
-    execCtx *ExecutionContext,
-    cv *configv1alpha1.ComponentVersion,
-) ([]topology.ComponentNode, error) {
-    // 遍历 subComponents
-    for _, sub := range cv.Spec.SubComponents {
-        // 评估 condition
-        matched, err := s.evaluateCondition(sub.Condition, execCtx.TemplateContext)
-        if matched {
-            // 创建 DAG 节点
-            nodes = append(nodes, topology.ComponentNode{
-                Name:    sub.Name,
-                Version: sub.Version,
-            })
-        }
-    }
-    return nodes, nil
-}
-```
-
-**condition 评估**：
-```go
-func (s *Scheduler) evaluateCondition(condition string, tmplCtx manifest.TemplateContext) (bool, error) {
-    // 使用 TemplateRenderer 渲染 condition
-    result, err := s.templateRenderer.RenderScript(condition, tmplCtx)
-    if err != nil {
-        return false, err
-    }
-    // 渲染结果为 "true" 时返回 true
-    return strings.TrimSpace(result) == "true", nil
-}
-```
-
-### 5.3 在线/离线场景差异
-
-| 维度 | 在线模式 | 离线模式 |
-|------|---------|---------|
-| **镜像仓库** | 可访问公共仓库 | 仅可访问私有仓库 |
-| **hosts.toml** | 仅为 imageRepo 生成 | 为所有公共仓库生成重定向 |
-| **制品下载** | 从公共仓库下载 | 从私有仓库下载 |
-| **isOffline 变量** | `false` | `true` |
-
-**isOffline 判定逻辑**：
-```go
-// BinaryComponentExecutor 中
-if regConfig, ok := nodeTmpl.Config.Cluster.ContainerRuntime.Registry[nodeTmpl.ImageRegistry]; ok {
-    if regConfig.SkipVerify && nodeTmpl.ImageRegistry != "cr.openfuyao.cn" {
-        nodeTmpl.Variables["isOffline"] = "true"
-    }
-}
-```
-
-### 5.4 多架构支持
-
-**架构发现**：BinaryInstaller.Install() 通过 SSH 执行 `uname -m`
-
-**制品 URL 模板**：
-```yaml
-artifacts:
-  - name: containerd
-    url: "{{.Config.Cluster.ImageRepo.Domain}}/binaries/containerd/{{version}}/containerd-{{version}}-linux-{{arch}}.tar.gz"
-```
-
-**架构映射**：
-```
-uname -m 输出    →    arch 变量值
-x86_64           →    amd64
-aarch64          →    arm64
-```
-
-### 5.5 ReleaseImage install vs upgrade components 区别
-
-- `spec.install.components`：新集群安装时使用，包含所有组件（含 CommonPhases）
-- `spec.upgrade.components`：升级时使用，仅包含需要升级的组件，未列出的组件保持不变
-
-### 5.6 VersionContext 在升级流程中的决策时机
-
-| 决策点 | VersionContext 方法 | 判定结果 | 后续动作 |
-|--------|-------------------|---------|---------|
-| DAG 构建时 | `NeedsUpgrade(name)` | false | 组件不加入 DAG，跳过执行 |
-| Executor 执行时 | `NeedsUpgrade(name)` | false | 组件已在目标版本，返回 nil 跳过 |
-| Executor 执行时 | `HasCurrent(name)` | true | Action = Upgrade |
-| Executor 执行时 | `HasCurrent(name)` | false | Action = Install |
-
-### 5.7 FailurePolicy 在不同场景下的行为
-
-| 场景 | FailurePolicy | 行为 |
-|------|---------------|------|
-| Rolling 模式单节点失败 | FailFast | 立即返回错误，终止整个组件升级 |
-| Rolling 模式单节点失败 | Continue | 记录警告日志，继续升级下一个节点 |
-| Rolling 模式单节点失败 | Rollback | 对该节点执行 UninstallScript，继续下一个节点 |
-| Batch 模式单批失败 | FailFast | 终止后续批次，已升级批次保留 |
-| Helm `--atomic` 失败 | — | Helm SDK 自动回滚到上一个 Release |
-
----
-
-## 6. 扩缩容样例
+## 4. 扩缩容样例
 
 ### 6.1 节点扩容（Scale-Out）
 
@@ -2623,7 +2216,7 @@ BKEClusterReconciler.Reconcile() 检测到节点移除
 
 ---
 
-## 7. Selector 依赖样例
+## 5. Selector 依赖样例
 
 ### 7.1 Selector 依赖传递（containerd 场景）
 
@@ -2872,7 +2465,9 @@ bkeagent → docker → cri-dockerd → kubernetes-master
 
 ---
 
-## 8. 错误处理与恢复样例
+## 第三部分：补充说明
+
+## 7. 错误处理与恢复
 
 ### 8.1 可重试错误处理
 
@@ -3070,7 +2665,7 @@ BKECluster.Status:
 
 ---
 
-## 9. 幂等性保证样例
+## 8. 幂等性与容错
 
 ### 9.1 重复安装幂等性
 
@@ -3210,7 +2805,7 @@ ComponentStatuses:
 
 ---
 
-## 10. 健康检查详细样例
+## 9. 健康检查
 
 ### 10.1 PodReady 检查
 
@@ -3403,7 +2998,7 @@ kubectl get pod coredns-xxx-1 -n kube-system -o yaml
 
 ---
 
-## 11. 大规模场景样例
+## 10. 大规模场景
 
 ### 11.1 中规模安装（3M+10W）
 
@@ -3551,5 +3146,277 @@ DAG Scheduler 执行:
 
 ---
 
-**文档版本**: v1.5  
+## 附录
+
+### A. bke-manifests 目录结构
+
+**目录结构**：
+```
+bke-manifests/
+├── container-runtime/v1.0.0/component.yaml  ← type: selector
+├── containerd/v1.7.18/component.yaml        ← type: binary
+├── docker/v26.0.0/component.yaml            ← type: binary
+├── cri-dockerd/v0.3.9/component.yaml        ← type: binary
+├── bkeagent/v2.6.0/component.yaml           ← type: binary
+├── bkeagent-switch/v2.6.0/component.yaml    ← type: binary
+├── cluster-api/v1.5.0/component.yaml        ← type: helm
+├── coredns/v1.11.1/component.yaml           ← type: helm
+├── openfuyao-core/v26.03/component.yaml     ← type: yaml
+└── kubernetes-master/v1.29.0/               ← type: inline
+```
+
+**说明**：
+- `container-runtime` 是 selector 类型，在 DAG 构建期根据 `BKECluster.Spec.Cluster.ContainerRuntime.CRI` 展开为具体的容器运行时组件（containerd 或 docker）
+- `bkeagent-switch` 依赖 `cluster-api`，在 cluster-api 部署完成后执行
+- `kubernetes-master` 和 `kubernetes-worker` 是 inline 类型，无需 ComponentVersion YAML
+
+### B. ReleaseImage 样例
+
+**安装场景**：
+```yaml
+# releaseimage-v2.6.0.yaml
+apiVersion: config.openfuyao.cn/v1beta1
+kind: ReleaseImage
+metadata:
+  name: bke-v2.6.0
+spec:
+  version: v2.6.0
+  install:
+    components:
+      # Batch 1: bkeagent（监听管理集群）
+      - name: bkeagent
+        version: v2.6.0
+      
+      # Batch 2: 容器运行时（selector 类型，DAG 构建期展开）
+      - name: container-runtime
+        version: v1.0.0
+      
+      # Batch 3: Kubernetes 控制面（Inline）
+      - name: kubernetes-master
+        version: v1.29.0
+        inline:
+          handler: EnsureMasterInit
+          version: v1.0.0
+      
+      # Batch 4: Kubernetes 工作节点（Inline）
+      - name: kubernetes-worker
+        version: v1.29.0
+        inline:
+          handler: EnsureWorkerJoin
+          version: v1.0.0
+      
+      # Batch 5: cluster-api（Helm，创建目标集群 kubeconfig Secret）
+      - name: cluster-api
+        version: v1.5.0
+      
+      # Batch 6: bkeagent-switch（切换到目标集群）
+      - name: bkeagent-switch
+        version: v2.6.0
+        dependencies:
+          - name: cluster-api
+      
+      # Batch 7: 集群插件（Helm/YAML）
+      - name: coredns
+        version: v1.11.1
+      
+      - name: openfuyao-core
+        version: v26.03
+```
+
+**升级场景**：
+```yaml
+# releaseimage-v2.6.0.yaml (升级场景)
+apiVersion: config.openfuyao.cn/v1beta1
+kind: ReleaseImage
+metadata:
+  name: bke-v2.6.0
+spec:
+  version: v2.6.0
+  upgrade:
+    components:
+      # 容器运行时（selector 类型）
+      - name: container-runtime
+        version: v1.0.0
+      
+      # bkeagent
+      - name: bkeagent
+        version: v2.6.0
+      
+      # CoreDNS
+      - name: coredns
+        version: v1.11.1
+      
+      # openfuyao-core
+      - name: openfuyao-core
+        version: v26.03
+      
+      # kubernetes-master/worker 版本不变，不升级
+```
+
+### C. 安装执行流程
+
+```
+用户创建 BKECluster (desiredVersion: v2.6.0, CRI: containerd)
+  │
+  ▼
+BKEClusterReconciler.Reconcile()
+  │
+  ├─ 1. 解析 ReleaseImage v2.6.0
+  │     releaseImage.GetInstallComponents()
+  │     → [bkeagent, container-runtime, kubernetes-master, kubernetes-worker, 
+  │        cluster-api, bkeagent-switch, coredns, openfuyao-core]
+  │
+  ├─ 2. 加载 ComponentVersion
+  │     manifestStore.GetComponentManifests() 逐个加载组件定义
+  │
+  ├─ 3. 构建安装 DAG
+  │     BuildInstallDAG(releaseImage)
+  │
+  │     DAG 拓扑批次:
+  │     Batch 0: [finalizer, paused, manage, delete, dryrun]  (CommonPhases, inline)
+  │     Batch 1: [bkeagent]                                   (binary, 监听管理集群)
+  │     Batch 2: [containerd]                                 (binary, 依赖 bkeagent)
+  │     Batch 3: [kubernetes-master]                          (inline, 依赖 containerd)
+  │     Batch 4: [kubernetes-worker]                          (inline, 依赖 kubernetes-master)
+  │     Batch 5: [cluster-api]                                (helm, 依赖 kubernetes-master)
+  │     Batch 6: [bkeagent-switch]                            (binary, 依赖 cluster-api)
+  │     Batch 7: [coredns, openfuyao-core]                   (helm/yaml, 依赖 kubernetes-master)
+  │
+  ├─ 4. Scheduler.ExecuteDAG(ctx, dag)
+  │     │
+  │     ├─ Batch 1: bkeagent (binary) - 监听管理集群
+  │     │   └─ BinaryComponentExecutor
+  │     │       ├─ 下载 bkeagent_linux_amd64
+  │     │       ├─ 渲染配置（node, TLS, kubeconfig, service）
+  │     │       ├─ Rolling 逐节点安装
+  │     │       └─ 健康检查通过
+  │     │
+  │     ├─ Batch 2: containerd (binary)
+  │     │   └─ BinaryComponentExecutor
+  │     │       ├─ 下载 containerd-1.7.18-linux-amd64.tar.gz
+  │     │       ├─ 渲染配置（config.toml, service, hosts.toml）
+  │     │       ├─ Rolling 逐节点安装
+  │     │       └─ 健康检查通过
+  │     │
+  │     ├─ Batch 3: kubernetes-master (inline)
+  │     │   └─ InlineRunner.Execute(handler="EnsureMasterInit") → kubeadm init
+  │     │
+  │     ├─ Batch 4: kubernetes-worker (inline)
+  │     │   └─ InlineRunner.Execute(handler="EnsureWorkerJoin") → kubeadm join
+  │     │
+  │     ├─ Batch 5: cluster-api (helm)
+  │     │   └─ HelmComponentExecutor
+  │     │       ├─ 拉取 Chart (OCI Registry)
+  │     │       ├─ 渲染 Values
+  │     │       ├─ helm install --atomic --wait
+  │     │       ├─ HealthCheck: PodReady (cluster-api) → ✅
+  │     │       └─ 创建目标集群 kubeconfig Secret: {{clusterName}}-kubeconfig
+  │     │
+  │     ├─ Batch 6: bkeagent-switch (binary) - 切换到目标集群
+  │     │   └─ BinaryComponentExecutor
+  │     │       ├─ 前置检查:
+  │     │       │   ├─ 注解 bkeagent-listener = "bkecluster" → 继续
+  │     │       │   └─ Condition SwitchBKEAgent = False → 继续
+  │     │       ├─ 渲染配置:
+  │     │       │   ├─ kubeconfig: 从 Secret {{clusterName}}-kubeconfig 读取
+  │     │       │   ├─ node: 渲染 {{nodeHostname}}
+  │     │       │   └─ cluster: 渲染 {{clusterName}}
+  │     │       ├─ SSH 上传配置文件到所有节点
+  │     │       ├─ 执行 installScript: systemctl restart bkeagent
+  │     │       ├─ HealthCheck: systemctl is-active bkeagent → ✅
+  │     │       └─ 标记完成:
+  │     │           ├─ NodeComponentStatuses[bkeagent-switch] = Installed
+  │     │           └─ Condition: SwitchBKEAgent = True
+  │     │
+  │     └─ Batch 7: Helm + YAML 组件 (并行)
+  │         ├─ coredns: HelmComponentExecutor
+  │         │   ├─ 拉取 Chart (OCI Registry)
+  │         │   ├─ 渲染 Values
+  │         │   ├─ helm install --atomic --wait
+  │         │   └─ HealthCheck: PodReady (kube-dns) → ✅
+  │         │
+  │         └─ openfuyao-core: YamlComponentExecutor
+  │             ├─ 下载清单 (crds.yaml + deployment.yaml)
+  │             ├─ ApplyWithStrategy(ServerSideApply)
+  │             └─ HealthCheck: PodReady → ✅
+  │
+  ├─ 5. 健康检查
+  │     PodReady + EndpointReady 检查所有组件
+  │
+  └─ 6. 更新 BKECluster.Status
+        phase: Ready
+        conditions: 
+          - {type: Ready, status: True}
+          - {type: SwitchBKEAgent, status: True}
+        listenerTarget: bkecluster
+```
+
+### D. 关键设计点说明
+
+**ComponentVersion YAML 存放路径约定**：
+```
+bke-manifests/
+├── container-runtime/v1.0.0/component.yaml  ← type: selector (容器运行时互斥选择)
+├── containerd/v1.7.18/component.yaml        ← type: binary (被 selector 引用)
+├── docker/v26.0.0/component.yaml            ← type: binary (被 selector 引用)
+├── cri-dockerd/v0.3.9/component.yaml        ← type: binary (被 selector 引用, 依赖 docker)
+├── bkeagent/v2.6.0/component.yaml           ← type: binary
+├── bkeagent-switch/v2.6.0/component.yaml    ← type: binary (切换监听目标)
+├── cluster-api/v1.5.0/component.yaml        ← type: helm (管理目标集群)
+├── coredns/v1.11.1/component.yaml           ← type: helm
+├── openfuyao-core/v26.03/component.yaml     ← type: yaml (含 subComponents)
+└── kubernetes-master/v1.29.0/               ← type: inline (无需 YAML, 由 inline handler 定义)
+```
+
+**Selector 类型展开机制**：
+
+展开时机：DAG 构建期（BuildDAGFromBundle）
+
+**在线/离线场景差异**：
+
+| 维度 | 在线模式 | 离线模式 |
+|------|---------|---------|
+| **镜像仓库** | 可访问公共仓库 | 仅可访问私有仓库 |
+| **hosts.toml** | 仅为 imageRepo 生成 | 为所有公共仓库生成重定向 |
+| **制品下载** | 从公共仓库下载 | 从私有仓库下载 |
+| **isOffline 变量** | `false` | `true` |
+
+**多架构支持**：
+
+架构发现：BinaryInstaller.Install() 通过 SSH 执行 `uname -m`
+
+架构映射：
+```
+uname -m 输出    →    arch 变量值
+x86_64           →    amd64
+aarch64          →    arm64
+```
+
+**ReleaseImage install vs upgrade components 区别**：
+
+- `spec.install.components`：新集群安装时使用，包含所有组件（含 CommonPhases）
+- `spec.upgrade.components`：升级时使用，仅包含需要升级的组件，未列出的组件保持不变
+
+**VersionContext 在升级流程中的决策时机**：
+
+| 决策点 | VersionContext 方法 | 判定结果 | 后续动作 |
+|--------|-------------------|---------|---------|
+| DAG 构建时 | `NeedsUpgrade(name)` | false | 组件不加入 DAG，跳过执行 |
+| Executor 执行时 | `NeedsUpgrade(name)` | false | 组件已在目标版本，返回 nil 跳过 |
+| Executor 执行时 | `HasCurrent(name)` | true | Action = Upgrade |
+| Executor 执行时 | `HasCurrent(name)` | false | Action = Install |
+
+**FailurePolicy 在不同场景下的行为**：
+
+| 场景 | FailurePolicy | 行为 |
+|------|---------------|------|
+| Rolling 模式单节点失败 | FailFast | 立即返回错误，终止整个组件升级 |
+| Rolling 模式单节点失败 | Continue | 记录警告日志，继续升级下一个节点 |
+| Rolling 模式单节点失败 | Rollback | 对该节点执行 UninstallScript，继续下一个节点 |
+| Batch 模式单批失败 | FailFast | 终止后续批次，已升级批次保留 |
+| Helm `--atomic` 失败 | — | Helm SDK 自动回滚到上一个 Release |
+
+---
+
+**文档版本**: v1.6  
 **维护者**: openFuyao Team
