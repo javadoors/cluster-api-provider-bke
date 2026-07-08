@@ -27,9 +27,8 @@
    - 5.1 核心组件架构
    - 5.2 YamlInstaller 执行流程图
    - 5.3 核心接口定义
-   - 5.4 清单下载与缓存
-   - 5.5 健康检查
-   - 5.6 YAML Uninstall 流程
+   - 5.4 健康检查
+   - 5.5 YAML Uninstall 流程
 6. [HealthCheck 共享包设计](#6-healthcheck-共享包设计)
    - 6.1 类型定义
 7. [模板变量系统与 TemplateContext 详细设计](#7-模板变量系统与-templatecontext-详细设计)
@@ -165,8 +164,8 @@
 │  │  ┌─────────────────────────────────────────────────────────────────┐    │    │
 │  │  │                     YamlInstaller                               │    │    │
 │  │  │  ┌────────────────┐  ┌────────────────┐  ┌─────────────────┐    │    │    │
-│  │  │  │ManifestDownload│  │  YAML Parser   │  │  K8s Client     │    │    │    │
-│  │  │  │(清单获取/缓存)  │  │  (解析/分组)    │  │  (Apply/Delete) │    │    │    │
+│  │  │  │  BundleStore   │  │  YAML Parser   │  │  K8s Client     │    │    │    │
+│  │  │  │(清单加载)      │  │  (解析/分组)    │  │  (Apply/Delete) │    │    │    │
 │  │  │  └────────────────┘  └────────────────┘  └─────────────────┘    │    │    │
 │  │  │  ┌─────────────────────────────────────────────────────────┐    │    │    │
 │  │  │  │              HealthChecker (Pod/Endpoint/Custom)        │    │    │    │
@@ -419,13 +418,16 @@ type ResourceSpec struct {
 
 ```go
 // YAMLSpec 定义 YAML 清单组件规格 🆕新增 (api/v1alpha1 扩展)
+//
+// 设计思路 — 移除外部 URL 清单支持:
+// YAMLSpec 不再支持通过外部 URL 引用 YAML 清单文件。所有清单通过以下两种方式提供:
+// 1. Bundle 文件: components/<name>/<version>/*.yaml (由 BundleStore 加载)
+// 2. 内联 Resources: ComponentVersionSpec.Resources (顶层字段)
+// 这消除了对外部网络的依赖，简化了缓存管理，且 Bundle 已包含所有清单。
 type YAMLSpec struct {
-    // YAML 清单文件列表 (外部 URL 引用)
-    Manifests []ManifestRef `json:"manifests"`
-    
     // 注意: 内联 K8s 资源定义通过 ComponentVersionSpec.Resources (顶层) 提供
-    // 后续版本可考虑将 Resources 迁移至此字段, 作为 YAML 类型的专属配置
-    // 当前为保持向后兼容, Resources 仍位于 ComponentVersionSpec 顶层
+    // YAML 清单通过 Bundle 文件 (components/<name>/<version>/*.yaml) 加载
+    // 不再支持外部 URL 引用，所有清单均从本地 Bundle 获取
     
     // 部署目标命名空间
     Namespace string `json:"namespace,omitempty"`
@@ -442,15 +444,6 @@ type YAMLSpec struct {
     // 健康检查配置 (应用清单后验证 Pod/Endpoint 就绪)
     // 类型定义见第 6 章 HealthCheck 共享包设计 (6.1 节)
     HealthCheck *HealthCheckSpec `json:"healthCheck,omitempty"`
-}
-
-// ManifestRef 定义 YAML 清单文件引用
-type ManifestRef struct {
-    // 清单文件 URL 或路径
-    URL string `json:"url"`
-    
-    // 校验和
-    Checksum string `json:"checksum,omitempty"`
 }
 ```
 
@@ -784,16 +777,6 @@ spec:
                 yaml:
                   type: object
                   properties:
-                    manifests:
-                      type: array
-                      items:
-                        type: object
-                        properties:
-                          url:
-                            type: string
-                          checksum:
-                            type: string
-                        required: [url]
                     namespace:
                       type: string
                     applyStrategy:
@@ -849,7 +832,6 @@ spec:
                                 required: [command]
                             required: [type]
                       required: [enabled]
-                  required: [manifests]
                 inline:
                   type: object
                   properties:
@@ -970,7 +952,7 @@ spec:
 
 | 改动位置 | 内容 |
 | --------- | ------ |
-| `api/v1alpha1/componentversion_types.go` | 新增 `HelmSpec`/`YAMLSpec`/`ChartSpec`/`OCIChartSpec`/`HelmStrategySpec`/`RollbackSpec`/`UninstallSpec`/`HookSpec`/`ManifestRef` 等类型；`ComponentVersionSpec` 增加 `Helm *HelmSpec`/`YAML *YAMLSpec` 字段 |
+| `api/v1alpha1/componentversion_types.go` | 新增 `HelmSpec`/`YAMLSpec`/`ChartSpec`/`OCIChartSpec`/`HelmStrategySpec`/`RollbackSpec`/`UninstallSpec`/`HookSpec` 等类型；`ComponentVersionSpec` 增加 `Helm *HelmSpec`/`YAML *YAMLSpec` 字段 |
 | `api/v1alpha1/zz_generated.deepcopy.go` | 重新 `make` 生成 DeepCopy 方法 |
 | `config/crd/bases/...componentversions.yaml` | v1alpha1 schema 新增 helm/yaml 字段定义（见 3.5 节） |
 
@@ -1874,11 +1856,11 @@ helm:
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
 │  ┌──────────────────┐    ┌──────────────────┐                   │
-│  │ManifestDownloader│    │  YAML Parser     │                   │
+│  │   BundleStore    │    │  YAML Parser     │                   │
 │  │                  │    │                  │                   │
-│  │ • ManifestStore  │    │ • 多文档解析      │                   │
-│  │ • bundle文件加载  │    │ • GVK 识别       │                   │
-│  │ • 内联Resources  │    │ • 资源分组        │                   │
+│  │ • bundle文件加载  │    │ • 多文档解析      │                   │
+│  │ • 内联Resources  │    │ • GVK 识别       │                   │
+│  │                  │    │ • 资源分组        │                   │
 │  └────────┬─────────┘    └────────┬─────────┘                   │
 │           │                       │                             │
 │           ▼                       ▼                             │
@@ -2023,252 +2005,11 @@ func (i *YamlInstaller) Apply(ctx context.Context, cv *configv1alpha1.ComponentV
 
 `YamlInstaller.Apply` 中调用 `healthcheck.Run(ctx, execCtx.TargetClient, ...)` 需要 `kubernetes.Interface` (typed clientset)。当前 `YamlInstallerConfig` 仅注入 `Store` + `Applier`，未注入 clientset。解决方案：通过 `ExecutionContext.TargetClient` 传递，无需修改 `YamlInstallerConfig`。`ExecutionContext.TargetClient` 由 controllers 层在 `buildExecutionContext` 中注入，是目标集群的 typed clientset。YamlInstaller 通过 `execCtx.TargetClient` 访问，无需在 `YamlInstallerConfig` 中重复注入。这与 `HelmInstaller` 的设计一致——`HelmInstaller` 在 Config 中直接注入 `Clientset`，因为 HelmInstaller 不接收 `ExecutionContext`。
 
-### 5.4 清单下载与缓存
-
-**设计思路**：`yaml.manifests[].url` 引用的外部 YAML 清单文件需要下载、缓存和校验。清单文件体积远小于二进制制品，且格式固定为 YAML。
-
-**关键设计点**：
-
-- **缓存策略**：按 URL + Checksum 缓存到本地 (`/var/cache/bke/manifests/`)，避免重复下载
-- **多文档解析**：单个 YAML 文件可能包含多个 K8s 资源 (用 `---` 分隔)，需使用 `yaml.NewYAMLOrJSONDecoder` 逐文档解析
-- **Checksum 校验**：下载后校验 SHA256，确保清单完整性
-- **离线支持**：缓存命中时直接使用本地文件，无需网络访问
-
-**流程图**：
-
-```txt
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                    YAML 清单下载与缓存流程                                        │
-└─────────────────────────────────────────────────────────────────────────────────┘
-
-  ┌──────────────────────────────────────┐
-  │  YamlInstaller.Apply()               │
-  │  遍历 yaml.manifests[]               │
-  └──────────┬───────────────────────────┘
-             │
-             ▼
-  ┌──────────────────────────────────────┐
-  │  检查缓存                             │
-  │  cacheKey = sha256(url + checksum)   │
-  │  cache.Get(cacheKey)                 │
-  └──────────┬───────────────────────────┘
-             │
-        ┌────┴────┐
-        │         │
-     命中       未命中
-        │         │
-        │         ▼
-        │  ┌────────────────────────────┐
-        │  │  HTTP GET(url)             │
-        │  │  下载清单文件               │
-        │  └──────────┬─────────────────┘
-        │             │
-        │             ▼
-        │  ┌────────────────────────────┐
-        │  │  校验 Checksum             │
-        │  │  sha256(data) == expected? │
-        │  └──────────┬─────────────────┘
-        │             │
-        │        ┌────┴────┐
-        │        │         │
-        │     通过       失败
-        │        │         │
-        │        ▼         ▼
-        │  ┌────────┐ ┌──────────┐
-        │  │保存缓存 │ │返回错误  │
-        │  └───┬────┘ └──────────┘
-        │      │
-        └──────┼──────┐
-               │      │
-               ▼      ▼
-  ┌──────────────────────────────────────┐
-  │  合并所有清单内容                     │
-  │  → []byte (多文档 YAML)              │
-  └──────────┬───────────────────────────┘
-             │
-             ▼
-  ┌──────────────────────────────────────┐
-  │  YAML 多文档解析                      │
-  │  yaml.NewYAMLOrJSONDecoder           │
-  │  → []unstructured.Unstructured       │
-  └──────────────────────────────────────┘
-```
-
-**代码实现**：
-
-```go
-// pkg/yamlinstaller/manifest_downloader.go
-
-// ManifestDownloader 管理 YAML 清单的下载与缓存
-type ManifestDownloader struct {
-    cacheDir   string
-    httpClient *http.Client
-}
-
-// NewManifestDownloader 创建清单下载器
-func NewManifestDownloader(cacheDir string, httpClient *http.Client) (*ManifestDownloader, error) {
-    if err := os.MkdirAll(cacheDir, 0755); err != nil {
-        return nil, fmt.Errorf("failed to create manifest cache directory %s: %w", cacheDir, err)
-    }
-    return &ManifestDownloader{cacheDir: cacheDir, httpClient: httpClient}, nil
-}
-
-// DownloadManifest 下载单个清单文件 (带缓存)
-func (d *ManifestDownloader) DownloadManifest(ctx context.Context, ref ManifestRef) ([]byte, error) {
-    cacheKey := d.computeCacheKey(ref.URL, ref.Checksum)
-    cachePath := filepath.Join(d.cacheDir, cacheKey)
-
-    // 1. 检查缓存
-    if data, err := os.ReadFile(cachePath); err == nil {
-        return data, nil
-    }
-
-    // 2. HTTP 下载
-    req, err := http.NewRequestWithContext(ctx, http.MethodGet, ref.URL, nil)
-    if err != nil {
-        return nil, fmt.Errorf("failed to create request for %s: %w", ref.URL, err)
-    }
-    resp, err := d.httpClient.Do(req)
-    if err != nil {
-        return nil, fmt.Errorf("failed to download manifest from %s: %w", ref.URL, err)
-    }
-    defer resp.Body.Close()
-    if resp.StatusCode != http.StatusOK {
-        return nil, fmt.Errorf("failed to download manifest from %s: HTTP %d", ref.URL, resp.StatusCode)
-    }
-    data, err := io.ReadAll(resp.Body)
-    if err != nil {
-        return nil, fmt.Errorf("failed to read manifest body from %s: %w", ref.URL, err)
-    }
-
-    // 3. Checksum 校验
-    if ref.Checksum != "" {
-        if err := verifyChecksum(data, ref.Checksum); err != nil {
-            return nil, fmt.Errorf("checksum verification failed for %s: %w", ref.URL, err)
-        }
-    }
-
-    // 4. 保存到缓存
-    if err := os.WriteFile(cachePath, data, 0644); err != nil {
-        return nil, fmt.Errorf("failed to cache manifest %s: %w", ref.URL, err)
-    }
-
-    return data, nil
-}
-
-// DownloadManifests 下载清单文件列表，合并为多文档 YAML
-func (d *ManifestDownloader) DownloadManifests(ctx context.Context, refs []ManifestRef) ([]byte, error) {
-    var combined bytes.Buffer
-    for i, ref := range refs {
-        data, err := d.DownloadManifest(ctx, ref)
-        if err != nil {
-            return nil, fmt.Errorf("failed to download manifest[%d] %s: %w", i, ref.URL, err)
-        }
-        if i > 0 {
-            combined.WriteString("\n---\n")
-        }
-        combined.Write(data)
-    }
-    return combined.Bytes(), nil
-}
-
-// ParseMultiDocYAML 解析多文档 YAML 为 unstructured 对象列表
-func ParseMultiDocYAML(data []byte) ([]unstructured.Unstructured, error) {
-    var resources []unstructured.Unstructured
-    decoder := yaml.NewYAMLOrJSONDecoder(bytes.NewReader(data), 4096)
-    for {
-        var obj unstructured.Unstructured
-        err := decoder.Decode(&obj)
-        if err == io.EOF {
-            break
-        }
-        if err != nil {
-            return nil, fmt.Errorf("failed to parse YAML document: %w", err)
-        }
-        if obj.Object == nil {
-            continue // 跳过空文档
-        }
-        resources = append(resources, obj)
-    }
-    return resources, nil
-}
-
-func (d *ManifestDownloader) computeCacheKey(url, checksum string) string {
-    h := sha256.New()
-    h.Write([]byte(url))
-    if checksum != "" {
-        h.Write([]byte(checksum))
-    }
-    return fmt.Sprintf("%x.yaml", h.Sum(nil))
-}
-```
-
-**YamlInstaller 集成**：
-
-```go
-// pkg/yamlinstaller/installer.go 扩展
-
-type YamlInstaller struct {
-    store            manifest.Store
-    applier          manifest.Applier
-    manifestDownloader *ManifestDownloader  // 新增：清单下载器
-    logger           *bkev1beta1.BKELogger
-}
-
-type YamlInstallerConfig struct {
-    Store              manifest.Store
-    Applier            manifest.Applier
-    ManifestDownloader *ManifestDownloader  // 新增
-    Logger             *bkev1beta1.BKELogger
-}
-
-// Apply 扩展：支持外部 URL 清单 + 内联 Resources
-func (i *YamlInstaller) Apply(ctx context.Context, cv *configv1alpha1.ComponentVersion, execCtx *ExecutionContext) error {
-    var allResources []unstructured.Unstructured
-
-    // 1. 下载外部 URL 清单 (yaml.manifests[])
-    if cv.Spec.YAML != nil && len(cv.Spec.YAML.Manifests) > 0 {
-        data, err := i.manifestDownloader.DownloadManifests(ctx, cv.Spec.YAML.Manifests)
-        if err != nil {
-            return fmt.Errorf("download manifests for %s: %w", cv.Spec.Name, err)
-        }
-        resources, err := ParseMultiDocYAML(data)
-        if err != nil {
-            return fmt.Errorf("parse manifests for %s: %w", cv.Spec.Name, err)
-        }
-        allResources = append(allResources, resources...)
-    }
-
-    // 2. 加载内联 Resources (cv.Spec.Resources[])
-    inlineResources, err := i.store.GetComponentManifests(ctx, cv.Spec.Name, cv.Spec.Version, execCtx.TemplateContext)
-    if err != nil {
-        return fmt.Errorf("get inline manifests for %s: %w", cv.Spec.Name, err)
-    }
-    if inlineResources != nil {
-        allResources = append(allResources, inlineResources.Resources...)
-    }
-
-    // 3. 应用到集群
-    pkg := &manifest.ComponentPackage{Resources: allResources}
-    if err := i.applier.ApplyComponent(ctx, pkg); err != nil {
-        return fmt.Errorf("apply manifests for %s: %w", cv.Spec.Name, err)
-    }
-
-    // 4. 健康检查
-    if cv.Spec.YAML != nil && cv.Spec.YAML.HealthCheck != nil && cv.Spec.YAML.HealthCheck.Enabled {
-        if err := healthcheck.Run(ctx, execCtx.TargetClient, *cv.Spec.YAML.HealthCheck); err != nil {
-            return fmt.Errorf("health check failed for %s: %w", cv.Spec.Name, err)
-        }
-    }
-    return nil
-}
-```
-
-### 5.5 健康检查
+### 5.4 健康检查
 
 YamlInstaller 的健康检查在 `Apply` 方法内部调用共享 `pkg/healthcheck` 包执行（`healthcheck.Run(ctx, execCtx.TargetClient, *cv.Spec.YAML.HealthCheck)`）。当 `cv.Spec.YAML.HealthCheck.Enabled` 为 true 时，清单 Apply 后执行 PodReady/EndpointReady/Custom 检查。接口定义与实现详见 **第 6 章 HealthCheck 共享包设计**。
 
-### 5.6 YAML Uninstall 流程
+### 5.5 YAML Uninstall 流程
 
 **设计思路 — YAML 组件卸载与 Helm 的区别**：
 
@@ -4251,7 +3992,7 @@ func HelmComponentEnabled(obj client.Object) bool {
 | 测试模块 | 测试场景 | 覆盖目标 |
 | --------- | --------- | --------- |
 | **HelmInstaller** | OCI/HTTP/本地 Chart 获取、Values 渲染、Install/Upgrade/Rollback | >85% |
-| **YamlInstaller** | 清单下载/缓存/解析、Apply 策略、健康检查 | >85% |
+| **YamlInstaller** | Bundle 清单加载/解析、Apply 策略、健康检查 | >85% |
 | **HealthCheck** | PodReady/EndpointReady/Custom 检查、超时/重试 | >90% |
 | **ExecutionContext** | TemplateContext 初始化、边界条件（nil ClusterConfig） | >90% |
 | **HelmComponentExecutor** | Install/Upgrade 流程、FailurePolicy、回滚 | >85% |
@@ -4338,7 +4079,6 @@ func HelmComponentEnabled(obj client.Object) bool {
 | 任务 | 负责人 | 交付物 |
 | ------ | -------- | -------- |
 | YamlInstaller 结构定义 | 开发B | `pkg/yamlinstaller/installer.go` |
-| ManifestDownloader 实现 | 开发B | 清单下载/缓存/解析 |
 | ApplyStrategy 引擎实现 | 开发B | ServerSideApply/Replace/CreateOnly |
 | ComponentVersion CRD 扩展 | 开发A | helm/yaml 字段定义 |
 | VersionContext 扩展方法 | 开发B | HasCurrent/CurrentVersion/TargetVersion |
@@ -4377,7 +4117,7 @@ func HelmComponentEnabled(obj client.Object) bool {
 | 术语 | 定义 |
 | ------ | ------ |
 | **HelmInstaller** | 负责 Helm Chart 获取、渲染、部署的安装器 |
-| **YamlInstaller** | 负责 YAML 清单下载、解析、应用的安装器 |
+| **YamlInstaller** | 负责 YAML 清单加载、解析、应用的安装器 |
 | **ComponentVersion** | 组件版本 CRD，定义组件的类型、配置、依赖等 |
 | **ReleaseImage** | 发布版本清单 CRD，定义安装和升级的组件列表 |
 | **DAG** | 有向无根图，用于表示组件依赖关系和执行顺序 |
