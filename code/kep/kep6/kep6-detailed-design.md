@@ -87,8 +87,10 @@
       - 13.2.6 回滚失败处理
       - 13.2.7 回滚状态追踪
       - 13.2.8 回滚可观测性
-      - 13.2.9 手动回滚支持
-      - 13.2.10 回滚测试设计
+       - 13.2.9 手动回滚支持
+       - 13.2.10 回滚测试设计
+       - 13.2.11 BKECluster 版本状态管理
+       - 13.2.12 手动重新升级机制
 14. [测试设计](#14-测试设计)
     - 14.1 单元测试
     - 14.2 集成测试
@@ -11302,9 +11304,28 @@ metadata:
 
 6. 回滚后处理
    ├─ 更新组件状态为 RolledBack
+   ├─ **回滚 BKECluster 版本状态**（详见 13.2.11 节）
+   │   ├─ 将 Spec.DesiredVersion 回滚到失败前的版本
+   │   ├─ 更新 Status.CurrentVersion 为实际运行版本
+   │   └─ 更新 Status.ComponentStatuses[component].Version
+   ├─ **添加回滚 Condition**
+   │   ├─ Type: ComponentRollback
+   │   ├─ Status: True
+   │   ├─ Reason: InstallFailed / HealthCheckFailed / Timeout
+   │   ├─ Message: "组件 xxx 从 v1.7.18 回滚到 v1.7.15，原因: xxx"
+   │   └─ LastTransitionTime: 当前时间
+   ├─ **清理依赖组件状态**
+   │   ├─ 重置依赖组件的 Phase 为 Installed
+   │   └─ 清理依赖组件的 Error 信息
+   ├─ **资源清理**
+   │   ├─ 删除临时文件（/tmp/bke-*）
+   │   ├─ 删除备份文件（*.bak, *.backup）
+   │   └─ 清理 SSH 临时目录
    ├─ 记录回滚日志（详细日志）
    ├─ 触发告警通知（如有）
-   └─ 清理临时文件
+   └─ **提供重新升级入口**（详见 13.2.12 节）
+       ├─ 在 Condition.Message 中说明如何重新触发升级
+       └─ 提供 kubectl 命令示例
 
 7. 回滚失败处理
    ├─ 标记状态为 Failed
@@ -12038,6 +12059,353 @@ func TestDependencyRollback(t *testing.T) {
         t.Fatalf("rollback order = %v, want %v", rollbackOrder, expected)
     }
 }
+```
+
+#### 13.2.11 BKECluster 版本状态管理
+
+**设计思路**：回滚操作需要同时处理组件状态和 BKECluster 的版本状态，确保系统状态的一致性。
+
+**版本状态回滚策略**：
+
+| 策略 | DesiredVersion | CurrentVersion | 优点 | 缺点 | 适用场景 |
+|------|---------------|----------------|------|------|---------|
+| **策略1：保持目标版本** | v1.7.18 | v1.7.15 | 保留用户升级意图 | Reconcile 会不断尝试升级，可能反复失败 | 临时故障，预期很快恢复 |
+| **策略2：回滚目标版本** | v1.7.15 | v1.7.15 | 系统状态一致，不会反复尝试 | 丢失用户升级意图，需要手动重新触发 | 持久性故障，需要人工介入 |
+| **策略3：标记回滚状态** | v1.7.18 | v1.7.15 | 保留用户意图，暂停自动重试 | 需要额外的状态管理逻辑 | 推荐方案 |
+
+**推荐方案：策略2 + Condition 标记**
+
+采用策略2（回滚目标版本）并添加 Condition 标记回滚状态和原因，同时提供手动重新触发升级的机制。
+
+**版本状态回滚流程**：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                BKECluster 版本状态回滚流程                    │
+└─────────────────────────────────────────────────────────────┘
+
+1. 记录回滚前状态
+   ├─ 保存 Spec.DesiredVersion（目标版本）
+   ├─ 保存 Status.CurrentVersion（当前版本）
+   └─ 保存失败原因（错误信息）
+
+2. 执行版本回滚
+   ├─ 将 Spec.DesiredVersion 回滚到失败前的版本
+   │   例如：从 v1.7.18 回滚到 v1.7.15
+   ├─ 更新 Status.CurrentVersion 为实际运行版本
+   │   例如：v1.7.15
+   └─ 更新 Status.ComponentStatuses[component].Version
+       例如：containerd 的版本更新为 v1.7.15
+
+3. 添加回滚 Condition
+   ├─ Type: ComponentRollback
+   ├─ Status: True
+   ├─ Reason: InstallFailed / HealthCheckFailed / Timeout
+   ├─ Message: "组件 containerd 从 v1.7.18 回滚到 v1.7.15，原因: 安装失败"
+   └─ LastTransitionTime: 当前时间
+
+4. 持久化到 API Server
+   └─ 调用 client.Status().Update(ctx, cluster)
+
+5. 提供重新升级入口
+   ├─ 在 Condition.Message 中说明如何重新触发升级
+   └─ 提供 kubectl 命令示例
+```
+
+**代码实现**：
+
+```go
+// rollbackBKEClusterVersion 回滚 BKECluster 版本状态
+func (s *Scheduler) rollbackBKEClusterVersion(
+    ctx context.Context,
+    execCtx *ExecutionContext,
+    componentName string,
+    previousVersion string,
+    rollbackReason string,
+) error {
+    cluster := execCtx.Cluster
+    
+    // 1. 回滚 DesiredVersion
+    if cluster.Spec.DesiredVersion != "" {
+        cluster.Spec.DesiredVersion = previousVersion
+    }
+    
+    // 2. 更新 CurrentVersion
+    if cluster.Status.CurrentVersion == "" {
+        cluster.Status.CurrentVersion = previousVersion
+    }
+    
+    // 3. 更新组件版本状态
+    if cluster.Status.ComponentStatuses != nil {
+        if status, exists := cluster.Status.ComponentStatuses[componentName]; exists {
+            status.Version = previousVersion
+            status.Phase = ComponentPhaseRolledBack
+            cluster.Status.ComponentStatuses[componentName] = status
+        }
+    }
+    
+    // 4. 添加回滚 Condition
+    condition := metav1.Condition{
+        Type:               "ComponentRollback",
+        Status:             metav1.ConditionTrue,
+        Reason:             rollbackReason, // InstallFailed / HealthCheckFailed / Timeout
+        Message: fmt.Sprintf(
+            "组件 %s 从 %s 回滚到版本 %s，原因: %s。如需重新升级，请执行: "+
+                "kubectl patch bkecluster %s -n %s --type merge -p '{\"spec\":{\"desiredVersion\":\"%s\"}}'",
+            componentName,
+            cluster.Status.ComponentStatuses[componentName].Version,
+            previousVersion,
+            rollbackReason,
+            cluster.Name,
+            cluster.Namespace,
+            cluster.Status.ComponentStatuses[componentName].Version,
+        ),
+        LastTransitionTime: metav1.Now(),
+    }
+    
+    // 查找并更新或添加 Condition
+    found := false
+    for i, c := range cluster.Status.Conditions {
+        if c.Type == "ComponentRollback" {
+            cluster.Status.Conditions[i] = condition
+            found = true
+            break
+        }
+    }
+    if !found {
+        cluster.Status.Conditions = append(cluster.Status.Conditions, condition)
+    }
+    
+    // 5. 持久化到 API Server
+    if err := s.client.Status().Update(ctx, cluster); err != nil {
+        return fmt.Errorf("failed to update BKECluster status: %w", err)
+    }
+    
+    execCtx.Log.Info("BKECluster version rolled back",
+        "component", componentName,
+        "previousVersion", previousVersion,
+        "reason", rollbackReason,
+    )
+    
+    return nil
+}
+
+// getPreviousVersion 获取失败前的版本
+func (s *Scheduler) getPreviousVersion(
+    ctx context.Context,
+    cluster *bkev1beta1.BKECluster,
+    componentName string,
+) (string, error) {
+    // 从 VersionContext 获取当前版本
+    if cluster.Status.ComponentStatuses != nil {
+        if status, exists := cluster.Status.ComponentStatuses[componentName]; exists {
+            return status.Version, nil
+        }
+    }
+    
+    // 如果 ComponentStatuses 中没有，从 Status 中获取
+    switch componentName {
+    case "containerd":
+        return cluster.Status.ContainerdVersion, nil
+    case "bkeagent":
+        return cluster.Status.BKEAgentVersion, nil
+    case "kubernetes":
+        return cluster.Status.KubernetesVersion, nil
+    default:
+        return "", fmt.Errorf("unknown component: %s", componentName)
+    }
+}
+```
+
+**版本状态示例**：
+
+```yaml
+# 回滚前的 BKECluster 状态
+apiVersion: bke.bocloud.com/v1beta1
+kind: BKECluster
+metadata:
+  name: my-cluster
+  namespace: default
+spec:
+  desiredVersion: v1.7.18  # 目标版本
+status:
+  currentVersion: v1.7.15  # 当前版本
+  componentStatuses:
+    containerd:
+      version: v1.7.15
+      phase: Installed
+  conditions:
+    - type: Ready
+      status: "True"
+
+# 升级到 v1.7.18 失败后
+status:
+  currentVersion: v1.7.15
+  componentStatuses:
+    containerd:
+      version: v1.7.18
+      phase: Failed
+      message: "安装失败: 健康检查超时"
+
+# 执行回滚后
+spec:
+  desiredVersion: v1.7.15  # 回滚到失败前的版本
+status:
+  currentVersion: v1.7.15
+  componentStatuses:
+    containerd:
+      version: v1.7.15
+      phase: RolledBack
+  conditions:
+    - type: Ready
+      status: "True"
+    - type: ComponentRollback
+      status: "True"
+      reason: HealthCheckFailed
+      message: "组件 containerd 从 v1.7.18 回滚到版本 v1.7.15，原因: 健康检查失败。如需重新升级，请执行: kubectl patch bkecluster my-cluster -n default --type merge -p '{\"spec\":{\"desiredVersion\":\"v1.7.18\"}}'"
+      lastTransitionTime: "2026-07-08T10:00:00Z"
+```
+
+#### 13.2.12 手动重新升级机制
+
+**设计思路**：回滚后需要为用户提供手动重新触发升级的机制，以便在解决问题后重新尝试升级。
+
+**重新升级方式**：
+
+**方式1：修改 DesiredVersion 触发 Reconcile**
+
+```bash
+# 修改 DesiredVersion 触发 Reconcile
+kubectl patch bkecluster my-cluster -n default --type merge -p '{"spec":{"desiredVersion":"v1.7.18"}}'
+```
+
+**工作原理**：
+1. 修改 Spec.DesiredVersion 为新的目标版本
+2. BKECluster Controller 检测到 Spec 变化
+3. 触发 Reconcile 流程
+4. VersionContext 比较 DesiredVersion 和 CurrentVersion
+5. 判断需要升级，触发 DAG 执行
+
+**方式2：删除回滚 Condition 后重新设置 DesiredVersion**
+
+```bash
+# 删除回滚 Condition 并重新设置 DesiredVersion
+kubectl patch bkecluster my-cluster -n default --type json -p='[
+  {"op": "remove", "path": "/status/conditions/-1"},
+  {"op": "replace", "path": "/spec/desiredVersion", "value": "v1.7.18"}
+]'
+```
+
+**工作原理**：
+1. 删除 ComponentRollback Condition
+2. 修改 Spec.DesiredVersion
+3. 触发 Reconcile 流程
+4. 清除回滚状态，重新开始升级
+
+**方式3：使用 kubectl edit 手动编辑**
+
+```bash
+# 手动编辑 BKECluster
+kubectl edit bkecluster my-cluster -n default
+
+# 修改 spec.desiredVersion 字段
+spec:
+  desiredVersion: v1.7.18  # 修改为目标版本
+```
+
+**重新升级流程**：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    手动重新升级流程                           │
+└─────────────────────────────────────────────────────────────┘
+
+1. 用户执行重新升级命令
+   └─ kubectl patch bkecluster my-cluster --type merge -p '{"spec":{"desiredVersion":"v1.7.18"}}'
+
+2. BKECluster Controller 检测到 Spec 变化
+   ├─ 比较 Spec.DesiredVersion 和 Status.CurrentVersion
+   └─ 判断需要升级
+
+3. 清除回滚状态
+   ├─ 删除 ComponentRollback Condition
+   └─ 重置组件状态为 Pending
+
+4. 构建升级 DAG
+   ├─ 根据 ReleaseImage 获取组件列表
+   └─ 构建 DAG 依赖关系
+
+5. 执行升级流程
+   ├─ 下载制品
+   ├─ 渲染配置
+   ├─ 执行安装
+   └─ 健康检查
+
+6. 更新状态
+   ├─ 更新 Status.CurrentVersion
+   ├─ 更新 Status.ComponentStatuses
+   └─ 添加 Ready Condition
+```
+
+**重新升级前置检查**：
+
+在执行重新升级前，建议进行以下检查：
+
+```bash
+# 1. 检查回滚原因
+kubectl get bkecluster my-cluster -n default -o jsonpath='{.status.conditions[?(@.type=="ComponentRollback")].message}'
+
+# 2. 检查组件状态
+kubectl get bkecluster my-cluster -n default -o jsonpath='{.status.componentStatuses}'
+
+# 3. 检查节点状态
+kubectl get nodes
+
+# 4. 检查日志
+kubectl logs -n bke-system deployment/bke-controller-manager
+
+# 5. 检查事件
+kubectl get events -n default --sort-by='.metadata.creationTimestamp' | grep my-cluster
+```
+
+**重新升级最佳实践**：
+
+1. **分析回滚原因**：在重新升级前，先分析回滚的具体原因
+2. **解决问题**：根据回滚原因解决根本问题（如修复配置、增加资源等）
+3. **测试验证**：在测试环境验证修复是否有效
+4. **逐步升级**：对于大规模集群，建议先升级少量节点验证
+5. **监控观察**：升级过程中密切监控组件状态和日志
+
+**重新升级示例场景**：
+
+```yaml
+# 场景：containerd 升级到 v1.7.18 失败，回滚到 v1.7.15
+
+# 1. 查看回滚原因
+$ kubectl get bkecluster my-cluster -n default -o jsonpath='{.status.conditions[?(@.type=="ComponentRollback")].message}'
+组件 containerd 从 v1.7.18 回滚到版本 v1.7.15，原因: 健康检查失败。如需重新升级，请执行: kubectl patch bkecluster my-cluster -n default --type merge -p '{"spec":{"desiredVersion":"v1.7.18"}}'
+
+# 2. 分析问题（假设发现是资源不足）
+$ kubectl describe node node1
+...
+Conditions:
+  Type             Status
+  MemoryPressure   True  # 内存压力
+
+# 3. 解决问题（增加节点资源或清理内存）
+$ kubectl drain node1 --ignore-daemonsets
+# ... 清理内存 ...
+$ kubectl uncordon node1
+
+# 4. 重新升级
+$ kubectl patch bkecluster my-cluster -n default --type merge -p '{"spec":{"desiredVersion":"v1.7.18"}}'
+bkecluster.bke.bocloud.com/my-cluster patched
+
+# 5. 观察升级进度
+$ kubectl get bkecluster my-cluster -n default -w
+NAME         READY   DESIRED   CURRENT   AGE
+my-cluster   True    v1.7.18   v1.7.15   10m
+my-cluster   True    v1.7.18   v1.7.18   12m  # 升级成功
 ```
 
 ---
