@@ -78,6 +78,17 @@
     - 12.6 迁移验证清单
 13. [错误处理与恢复](#13-错误处理与恢复)
     - 13.1 错误处理流程图
+    - 13.2 安装失败回滚机制
+      - 13.2.1 回滚设计原则
+      - 13.2.2 回滚触发条件
+      - 13.2.3 回滚流程设计
+      - 13.2.4 各组件类型回滚策略
+      - 13.2.5 多组件依赖回滚
+      - 13.2.6 回滚失败处理
+      - 13.2.7 回滚状态追踪
+      - 13.2.8 回滚可观测性
+      - 13.2.9 手动回滚支持
+      - 13.2.10 回滚测试设计
 14. [测试设计](#14-测试设计)
     - 14.1 单元测试
     - 14.2 集成测试
@@ -11189,11 +11200,844 @@ SSH 上传配置文件 + 重启 bkeagent
   是                否    FailFast          Continue  FailFast        Continue
   │                 │      │                 │      │                 │
   ▼                 ▼      ▼                 ▼      ▼                 ▼
-┌─────────┐  ┌─────────┐ ┌─────────┐  ┌─────────┐ ┌─────────┐  ┌─────────┐
-│ 重试执行 │  │ 返回错误│ │ 立即终止│  │ 记录错误│ │ 立即终止│  │ 记录错误│
-│ retry() │  │ return  │ │ return  │  │ 继续执行│ │ return  │  │ 继续执行│
-└─────────┘  │  err    │ │  err    │  │ 下一节点│ │  err    │  │ 下一节点│
-             └─────────┘ └─────────┘  └─────────┘ └─────────┘  └─────────┘
+ ┌─────────┐  ┌─────────┐ ┌─────────┐  ┌─────────┐ ┌─────────┐  ┌─────────┐
+ │ 重试执行 │  │ 返回错误│ │ 立即终止│  │ 记录错误│ │ 立即终止│  │ 记录错误│
+ │ retry() │  │ return  │ │ return  │  │ 继续执行│ │ return  │  │ 继续执行│
+ └─────────┘  │  err    │ │  err    │  │ 下一节点│ │  err    │  │ 下一节点│
+              └─────────┘ └─────────┘  └─────────┘ └─────────┘  └─────────┘
+```
+
+### 13.2 安装失败回滚机制
+
+#### 13.2.1 回滚设计原则
+
+**设计思路**：回滚机制是系统可靠性的重要保障。当安装或升级失败时，系统需要能够将组件恢复到之前的稳定状态，避免系统处于不一致的状态。
+
+**核心原则**：
+
+1. **分层回滚**：支持节点级回滚 → 组件级回滚 → 集群级回滚，根据失败范围选择合适的回滚粒度
+2. **依赖感知**：按 DAG 反向顺序回滚依赖组件，确保依赖关系正确
+3. **幂等性保证**：回滚操作必须幂等，可重复执行，不会产生副作用
+4. **状态可追踪**：回滚过程全程记录状态变化，便于问题排查和审计
+5. **失败安全**：回滚失败时保留现场，不破坏已有状态，等待人工介入
+
+**设计目标**：
+
+| 目标 | 说明 | 实现方式 |
+|------|------|---------
+| **快速恢复** | 尽可能快地恢复到稳定状态 | 并行回滚无依赖的组件 |
+| **最小影响** | 回滚范围尽可能小 | 节点级失败只回滚该节点 |
+| **数据完整** | 保留用户数据和配置 | 回滚前备份，回滚后恢复 |
+| **可观测** | 回滚过程透明可追踪 | 详细日志和状态更新 |
+
+#### 13.2.2 回滚触发条件
+
+**自动触发**：
+
+| 触发场景 | 触发条件 | 回滚范围 | 示例 |
+|---------|---------|---------|------
+| **单节点失败** | 节点安装失败 + FailurePolicy=Rollback | 单节点回滚 | containerd 在 node1 安装失败 |
+| **组件级失败** | 组件所有节点失败 + FailurePolicy=Rollback | 组件级回滚 | coredns 部署失败 |
+| **依赖链失败** | 依赖组件失败导致当前组件无法执行 | 依赖链回滚 | bkeagent 失败导致 containerd 无法安装 |
+| **健康检查失败** | 安装后健康检查超时 | 组件级回滚 | containerd 启动后健康检查失败 |
+| **超时失败** | 安装操作超时 | 组件级回滚 | containerd 安装超过 10 分钟 |
+
+**手动触发**：
+
+```yaml
+ 通过 BKECluster 注解触发回滚
+metadata:
+  annotations:
+    bke.bocloud.com/rollback: "containerd"  指定组件名
+    bke.bocloud.com/rollback-target: "v1.7.15"  目标版本（可选，默认回滚到上一版本）
+    bke.bocloud.com/rollback-nodes: "10.0.0.1,10.0.0.2"  指定节点（可选，默认所有节点）
+```
+
+#### 13.2.3 回滚流程设计
+
+**完整回滚流程**：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    安装失败回滚流程                           │
+└─────────────────────────────────────────────────────────────┘
+
+1. 失败检测
+   ├─ 节点安装失败
+   ├─ 健康检查失败
+   ├─ 依赖组件失败
+   └─ 超时失败
+
+2. 回滚决策
+   ├─ 检查 FailurePolicy
+   ├─ 确定回滚范围（节点/组件/依赖链）
+   └─ 计算回滚顺序（DAG 反向）
+
+3. 回滚前检查
+   ├─ 验证回滚脚本存在（UninstallScript/rollback 命令）
+   ├─ 检查回滚前置条件（依赖组件状态）
+   ├─ 备份当前状态（用于回滚失败恢复）
+   └─ 标记组件状态为 RollingBack
+
+4. 执行回滚
+   ├─ Binary: 执行 UninstallScript
+   │   ├─ 停止服务
+   │   ├─ 删除二进制文件
+   │   ├─ 删除配置文件
+   │   └─ 删除 systemd service
+   ├─ Helm: 执行 helm rollback
+   │   ├─ 回滚到上一版本
+   │   ├─ 验证 Pod 状态
+   │   └─ 更新 Release 历史
+   └─ YAML: 删除已创建资源
+       ├─ 收集资源列表
+       ├─ 按依赖反向顺序删除
+       └─ 验证资源已删除
+
+5. 回滚验证
+   ├─ 验证服务已停止（Binary）
+   ├─ 验证资源已清理（YAML）
+   ├─ 验证 Pod 状态正常（Helm）
+   └─ 验证状态已恢复
+
+6. 回滚后处理
+   ├─ 更新组件状态为 RolledBack
+   ├─ 记录回滚日志（详细日志）
+   ├─ 触发告警通知（如有）
+   └─ 清理临时文件
+
+7. 回滚失败处理
+   ├─ 标记状态为 Failed
+   ├─ 保留现场（不删除失败文件）
+   ├─ 记录详细错误信息
+   └─ 等待人工介入
+```
+
+#### 13.2.4 各组件类型回滚策略
+
+**Binary 组件回滚**：
+
+```go
+// BinaryInstaller.Rollback 执行 Binary 组件回滚
+func (i *BinaryInstaller) Rollback(ctx context.Context, opts InstallOptions) error {
+    binary := opts.Component.Spec.Binary
+    
+    // 1. 检查 UninstallScript 是否存在
+    if binary.UninstallScript == "" {
+        return fmt.Errorf("component %s has no uninstall script", opts.Component.Spec.Name)
+    }
+    
+    // 2. 渲染 UninstallScript
+    script, err := i.renderer.RenderScript(binary.UninstallScript, opts.TemplateCtx)
+    if err != nil {
+        return fmt.Errorf("failed to render uninstall script: %w", err)
+    }
+    
+    // 3. 执行回滚脚本
+    result, err := i.sshExecutor.Execute(ctx, opts.TemplateCtx.NodeIP, script)
+    if err != nil {
+        return fmt.Errorf("uninstall script failed: %w\nstdout: %s\nstderr: %s", 
+            err, result.Stdout, result.Stderr)
+    }
+    
+    // 4. 验证服务已停止
+    if err := i.verifyServiceStopped(ctx, opts.TemplateCtx.NodeIP, opts.Component.Spec.Name); err != nil {
+        return fmt.Errorf("service still running after rollback: %w", err)
+    }
+    
+    return nil
+}
+```
+
+**Binary 回滚示例（containerd）**：
+
+```yaml
+ containerd/v1.7.18/component.yaml
+spec:
+  name: containerd
+  type: binary
+  version: v1.7.18
+  
+  binary:
+    installScript: |
+      #!/bin/bash
+      set -e
+      systemctl stop containerd || true
+      tar -xzf {{artifact.containerd.path}} -C /
+      chmod +x /usr/bin/containerd
+      systemctl daemon-reload
+      systemctl enable containerd
+      systemctl start containerd
+    
+    uninstallScript: |
+      #!/bin/bash
+      set -e
+      
+      # 1. 停止服务
+      systemctl stop containerd || true
+      systemctl disable containerd || true
+      
+      # 2. 删除二进制文件
+      rm -f /usr/bin/containerd
+      rm -f /usr/bin/containerd-shim-runc-v2
+      rm -f /usr/bin/ctr
+      
+      # 3. 删除配置文件
+      rm -f /etc/systemd/system/containerd.service
+      rm -rf /etc/containerd
+      
+      # 4. 重载 systemd
+      systemctl daemon-reload
+      
+      # 5. 验证清理完成
+      if [ -f /usr/bin/containerd ]; then
+        echo "ERROR: containerd binary still exists"
+        exit 1
+      fi
+```
+
+**Helm 组件回滚**：
+
+```go
+// HelmInstaller.Rollback 执行 Helm 组件回滚
+func (i *HelmInstaller) Rollback(ctx context.Context, opts InstallOptions) error {
+    helm := opts.Component.Spec.Helm
+    
+    // 1. 初始化 Helm Action Configuration
+    actionConfig, err := i.initActionConfig(ctx, helm.Namespace)
+    if err != nil {
+        return fmt.Errorf("failed to initialize action config: %w", err)
+    }
+    
+    // 2. 创建 Rollback Action
+    client := action.NewRollback(actionConfig)
+    client.Version = 0 // 0 表示回滚到上一版本
+    client.Wait = true
+    client.Timeout = parseDurationDefault(helm.Strategy.WaitTimeout, 5*time.Minute)
+    client.MaxHistory = helm.Rollback.MaxHistory
+    
+    // 3. 执行回滚
+    if err := client.Run(helm.ReleaseName); err != nil {
+        return fmt.Errorf("helm rollback failed: %w", err)
+    }
+    
+    // 4. 验证回滚成功
+    if err := i.verifyRollbackSuccess(ctx, actionConfig, helm.ReleaseName); err != nil {
+        return fmt.Errorf("rollback verification failed: %w", err)
+    }
+    
+    return nil
+}
+```
+
+**Helm 回滚示例（coredns）**：
+
+```yaml
+ coredns/v1.11.1/component.yaml
+spec:
+  name: coredns
+  type: helm
+  version: v1.11.1
+  
+  helm:
+    chart:
+      oci:
+        repository: "registry.openfuyao.cn/charts/coredns"
+        tag: "v1.11.1"
+    namespace: kube-system
+    releaseName: coredns
+    
+    strategy:
+      mode: Upgrade
+      wait: true
+      waitTimeout: "5m"
+      atomic: true  // 失败时自动回滚
+    
+    rollback:
+      enabled: true
+      maxHistory: 10  // 保留最近 10 个版本
+```
+
+**YAML 组件回滚**：
+
+```go
+// YamlInstaller.Rollback 执行 YAML 组件回滚
+func (i *YamlInstaller) Rollback(ctx context.Context, opts InstallOptions) error {
+    // 1. 收集已创建的资源列表
+    resources, err := i.collectCreatedResources(ctx, opts.Component)
+    if err != nil {
+        return fmt.Errorf("failed to collect created resources: %w", err)
+    }
+    
+    // 2. 按依赖反向顺序删除资源
+    for j := len(resources) - 1; j >= 0; j-- {
+        resource := resources[j]
+        if err := i.deleteResource(ctx, resource); err != nil {
+            return fmt.Errorf("failed to delete resource %s/%s: %w", 
+                resource.Namespace, resource.Name, err)
+        }
+    }
+    
+    // 3. 验证资源已删除
+    if err := i.verifyResourcesDeleted(ctx, resources); err != nil {
+        return fmt.Errorf("resources still exist after rollback: %w", err)
+    }
+    
+    return nil
+}
+```
+
+#### 13.2.5 多组件依赖回滚
+
+**场景分析**：
+
+当组件之间存在依赖关系时，回滚需要按照 DAG 的反向顺序执行，确保依赖关系正确。
+
+**示例场景**：
+
+```
+DAG 执行顺序：
+bkeagent → containerd → kubernetes-master → coredns
+
+失败场景：kubernetes-master 安装失败
+
+回滚顺序（反向）：
+1. kubernetes-master (失败，执行回滚)
+2. containerd (已执行，执行回滚)
+3. bkeagent (已执行，执行回滚)
+4. coredns (未执行，跳过)
+```
+
+**依赖回滚算法**：
+
+```go
+// calculateRollbackOrder 计算回滚顺序（DAG 反向）
+func (s *Scheduler) calculateRollbackOrder(dag *topology.UpgradeDAG, 
+    failedComponent string) ([]string, error) {
+    
+    // 1. 获取 DAG 的拓扑顺序
+    topoOrder, err := dag.TopologicalSort()
+    if err != nil {
+        return nil, err
+    }
+    
+    // 2. 找到失败组件的位置
+    failedIdx := -1
+    for i, name := range topoOrder {
+        if name == failedComponent {
+            failedIdx = i
+            break
+        }
+    }
+    
+    if failedIdx == -1 {
+        return nil, fmt.Errorf("component %s not found in DAG", failedComponent)
+    }
+    
+    // 3. 反向遍历，收集需要回滚的组件
+    var rollbackOrder []string
+    for i := failedIdx; i >= 0; i-- {
+        componentName := topoOrder[i]
+        
+        // 检查组件是否已执行
+        if s.isComponentExecuted(componentName) {
+            rollbackOrder = append(rollbackOrder, componentName)
+        }
+    }
+    
+    return rollbackOrder, nil
+}
+
+// executeRollback 执行回滚
+func (s *Scheduler) executeRollback(ctx context.Context, execCtx *ExecutionContext, 
+    rollbackOrder []string) error {
+    
+    for _, componentName := range rollbackOrder {
+        execCtx.Log.Info("rolling back component: %s", componentName)
+        
+        // 标记组件开始回滚
+        if err := s.markComponentRollingBack(ctx, execCtx, componentName); err != nil {
+            return err
+        }
+        
+        // 执行回滚
+        if err := s.rollbackComponent(ctx, execCtx, componentName); err != nil {
+            // 回滚失败，标记为 Failed
+            s.markComponentFailed(ctx, execCtx, componentName, err)
+            return fmt.Errorf("rollback failed for component %s: %w", componentName, err)
+        }
+        
+        // 标记回滚成功
+        if err := s.markComponentRolledBack(ctx, execCtx, componentName); err != nil {
+            return err
+        }
+        
+        execCtx.Log.Info("rollback completed for component: %s", componentName)
+    }
+    
+    return nil
+}
+```
+
+#### 13.2.6 回滚失败处理
+
+**失败场景分类**：
+
+| 失败场景 | 失败原因 | 处理策略 | 后续操作 |
+|---------|---------|---------|---------
+| **UninstallScript 执行失败** | 脚本错误、权限不足 | 重试 3 次，保留现场 | 标记为 Failed，等待人工介入 |
+| **helm rollback 失败** | Release 不存在、版本冲突 | 重试 3 次，使用 --force | 标记为 Failed，保留 Release 历史 |
+| **资源删除失败** | 资源被保护、finalizers 阻塞 | 强制删除（--force --grace-period=0） | 标记为 PartialSuccess |
+| **回滚超时** | 网络问题、资源不足 | 终止回滚，保留当前状态 | 标记为 Timeout |
+| **依赖组件回滚失败** | 依赖组件无法回滚 | 停止当前组件回滚 | 标记为 Failed，等待依赖组件恢复 |
+
+**回滚失败处理流程**：
+
+```go
+// handleRollbackFailure 处理回滚失败
+func (s *Scheduler) handleRollbackFailure(ctx context.Context, 
+    execCtx *ExecutionContext, componentName string, rollbackErr error) error {
+    
+    // 1. 记录详细错误信息
+    execCtx.Log.Error("rollback failed for component %s: %v", componentName, rollbackErr)
+    
+    // 2. 标记组件状态为 Failed
+    if err := s.markComponentFailed(ctx, execCtx, componentName, rollbackErr); err != nil {
+        execCtx.Log.Error("failed to mark component as failed: %v", err)
+    }
+    
+    // 3. 保留现场（不删除失败文件）
+    execCtx.Log.Info("preserving failure state for component %s", componentName)
+    
+    // 4. 触发告警通知
+    if err := s.sendRollbackFailureAlert(ctx, componentName, rollbackErr); err != nil {
+        execCtx.Log.Error("failed to send alert: %v", err)
+    }
+    
+    // 5. 返回错误，等待人工介入
+    return fmt.Errorf("rollback failed for component %s, manual intervention required: %w", 
+        componentName, rollbackErr)
+}
+```
+
+**回滚失败恢复策略**：
+
+1. **人工介入**：回滚失败时，系统保留现场，等待人工介入
+2. **手动清理**：运维人员可以手动清理失败的组件
+3. **重新安装**：清理完成后，可以重新触发安装流程
+4. **版本回退**：如果回滚失败，可以考虑回退到更早的稳定版本
+
+#### 13.2.7 回滚状态追踪
+
+**状态定义**：
+
+```go
+// ComponentPhase 组件安装阶段
+type ComponentPhase string
+
+const (
+    // 基础状态
+    ComponentPhasePending     ComponentPhase = "Pending"     // 等待安装
+    ComponentPhaseInstalling  ComponentPhase = "Installing"  // 安装中
+    ComponentPhaseInstalled   ComponentPhase = "Installed"   // 安装成功
+    ComponentPhaseFailed      ComponentPhase = "Failed"      // 安装失败
+    
+    // 回滚相关状态
+    ComponentPhaseRollingBack ComponentPhase = "RollingBack" // 正在回滚
+    ComponentPhaseRolledBack  ComponentPhase = "RolledBack"  // 回滚成功
+    
+    // 其他状态
+    ComponentPhaseTimeout     ComponentPhase = "Timeout"     // 安装超时
+)
+```
+
+**状态流转图**：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    组件状态流转                               │
+└─────────────────────────────────────────────────────────────┘
+
+正常流程：
+Pending → Installing → Installed
+                         ↓
+失败流程：              Failed
+                         ↓
+回滚流程：              RollingBack → RolledBack
+                         ↓
+回滚失败：              Failed (保留)
+```
+
+**状态更新时机**：
+
+```go
+// markComponentRollingBack 标记组件开始回滚
+func (s *Scheduler) markComponentRollingBack(ctx context.Context, 
+    execCtx *ExecutionContext, componentName string) error {
+    
+    // 更新组件状态为 RollingBack
+    execCtx.Cluster.Status.ComponentStatuses[componentName] = ComponentStatus{
+        Phase:          ComponentPhaseRollingBack,
+        LastUpdateTime: &metav1.Time{Time: time.Now()},
+    }
+    
+    // 持久化到 API Server
+    return s.client.Status().Update(ctx, execCtx.Cluster)
+}
+
+// markComponentRolledBack 标记组件回滚成功
+func (s *Scheduler) markComponentRolledBack(ctx context.Context, 
+    execCtx *ExecutionContext, componentName string) error {
+    
+    // 更新组件状态为 RolledBack
+    execCtx.Cluster.Status.ComponentStatuses[componentName] = ComponentStatus{
+        Phase:          ComponentPhaseRolledBack,
+        LastUpdateTime: &metav1.Time{Time: time.Now()},
+    }
+    
+    // 持久化到 API Server
+    return s.client.Status().Update(ctx, execCtx.Cluster)
+}
+```
+
+**节点级状态追踪**：
+
+```go
+// NodeComponentStatus 节点组件状态
+type NodeComponentStatus struct {
+    Version        string         `json:"version"`
+    Phase          ComponentPhase `json:"phase"`
+    LastUpdateTime *metav1.Time   `json:"lastUpdateTime,omitempty"`
+    Message        string         `json:"message,omitempty"`
+}
+
+// 示例：containerd 在 node1 的状态
+NodeComponentStatus{
+    Version: "v1.7.18",
+    Phase:   ComponentPhaseRolledBack,
+    Message: "rollback completed successfully",
+}
+```
+
+#### 13.2.8 回滚可观测性
+
+**日志记录**：
+
+```go
+// RollbackLogger 回滚日志记录器
+type RollbackLogger struct {
+    logger *log.Logger
+}
+
+// LogRollbackStart 记录回滚开始
+func (l *RollbackLogger) LogRollbackStart(componentName, nodeIP string) {
+    l.logger.Info("starting rollback",
+        "component", componentName,
+        "node", nodeIP,
+        "timestamp", time.Now(),
+    )
+}
+
+// LogRollbackProgress 记录回滚进度
+func (l *RollbackLogger) LogRollbackProgress(componentName, nodeIP, step string) {
+    l.logger.Info("rollback progress",
+        "component", componentName,
+        "node", nodeIP,
+        "step", step,
+    )
+}
+
+// LogRollbackComplete 记录回滚完成
+func (l *RollbackLogger) LogRollbackComplete(componentName, nodeIP string, duration time.Duration) {
+    l.logger.Info("rollback completed",
+        "component", componentName,
+        "node", nodeIP,
+        "duration", duration,
+    )
+}
+
+// LogRollbackFailure 记录回滚失败
+func (l *RollbackLogger) LogRollbackFailure(componentName, nodeIP string, err error) {
+    l.logger.Error("rollback failed",
+        "component", componentName,
+        "node", nodeIP,
+        "error", err.Error(),
+    )
+}
+```
+
+**日志示例**：
+
+```
+[2026-07-08 10:00:00] INFO  starting rollback component=containerd node=10.0.0.1
+[2026-07-08 10:00:01] INFO  rollback progress component=containerd node=10.0.0.1 step=stop_service
+[2026-07-08 10:00:02] INFO  rollback progress component=containerd node=10.0.0.1 step=delete_binary
+[2026-07-08 10:00:03] INFO  rollback progress component=containerd node=10.0.0.1 step=delete_config
+[2026-07-08 10:00:04] INFO  rollback progress component=containerd node=10.0.0.1 step=verify_cleanup
+[2026-07-08 10:00:05] INFO  rollback completed component=containerd node=10.0.0.1 duration=5s
+```
+
+**指标监控**：
+
+```go
+// RollbackMetrics 回滚指标
+type RollbackMetrics struct {
+    // 回滚总数
+    RollbackTotal *prometheus.CounterVec
+    
+    // 回滚耗时
+    RollbackDuration *prometheus.HistogramVec
+    
+    // 回滚失败数
+    RollbackFailureTotal *prometheus.CounterVec
+    
+    // 回滚成功数
+    RollbackSuccessTotal *prometheus.CounterVec
+}
+
+// 初始化指标
+func NewRollbackMetrics() *RollbackMetrics {
+    return &RollbackMetrics{
+        RollbackTotal: prometheus.NewCounterVec(
+            prometheus.CounterOpts{
+                Name: "component_rollback_total",
+                Help: "Total number of component rollbacks",
+            },
+            []string{"component", "result"},
+        ),
+        RollbackDuration: prometheus.NewHistogramVec(
+            prometheus.HistogramOpts{
+                Name:    "component_rollback_duration_seconds",
+                Help:    "Duration of component rollbacks",
+                Buckets: prometheus.ExponentialBuckets(1, 2, 10),
+            },
+            []string{"component"},
+        ),
+        RollbackFailureTotal: prometheus.NewCounterVec(
+            prometheus.CounterOpts{
+                Name: "component_rollback_failure_total",
+                Help: "Total number of failed component rollbacks",
+            },
+            []string{"component", "reason"},
+        ),
+        RollbackSuccessTotal: prometheus.NewCounterVec(
+            prometheus.CounterOpts{
+                Name: "component_rollback_success_total",
+                Help: "Total number of successful component rollbacks",
+            },
+            []string{"component"},
+        ),
+    }
+}
+```
+
+**告警通知**：
+
+```go
+// RollbackAlert 回滚告警
+type RollbackAlert struct {
+    ComponentName string
+    NodeIP        string
+    Error         string
+    Timestamp     time.Time
+    Severity      string // critical, warning, info
+}
+
+// sendRollbackAlert 发送回滚告警
+func (s *Scheduler) sendRollbackAlert(ctx context.Context, alert *RollbackAlert) error {
+    // 根据严重程度选择告警渠道
+    switch alert.Severity {
+    case "critical":
+        // 发送邮件、钉钉、企业微信
+        return s.alertSender.SendCritical(ctx, alert)
+    case "warning":
+        // 发送钉钉、企业微信
+        return s.alertSender.SendWarning(ctx, alert)
+    default:
+        // 记录日志
+        return nil
+    }
+}
+```
+
+#### 13.2.9 手动回滚支持
+
+**触发方式**：
+
+```yaml
+ 通过 BKECluster 注解触发回滚
+metadata:
+  annotations:
+    bke.bocloud.com/rollback: "containerd"  指定组件名
+    bke.bocloud.com/rollback-target: "v1.7.15"  目标版本（可选）
+    bke.bocloud.com/rollback-nodes: "10.0.0.1,10.0.0.2"  指定节点（可选）
+```
+
+**回滚控制器**：
+
+```go
+// RollbackController 监听回滚注解
+type RollbackController struct {
+    client.Client
+    Scheme *runtime.Scheme
+}
+
+// Reconcile 处理回滚请求
+func (r *RollbackController) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    // 1. 获取 BKECluster
+    cluster := &bkev1beta1.BKECluster{}
+    if err := r.Get(ctx, req.NamespacedName, cluster); err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    // 2. 检查回滚注解
+    rollbackAnnotation, exists := cluster.Annotations["bke.bocloud.com/rollback"]
+    if !exists {
+        return ctrl.Result{}, nil
+    }
+    
+    // 3. 解析回滚参数
+    rollbackParams, err := parseRollbackParams(rollbackAnnotation, cluster.Annotations)
+    if err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    // 4. 构建回滚 DAG
+    rollbackDAG, err := r.buildRollbackDAG(ctx, cluster, rollbackParams)
+    if err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    // 5. 执行回滚
+    if err := r.executeRollback(ctx, cluster, rollbackDAG); err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    // 6. 清理回滚注解
+    delete(cluster.Annotations, "bke.bocloud.com/rollback")
+    delete(cluster.Annotations, "bke.bocloud.com/rollback-target")
+    delete(cluster.Annotations, "bke.bocloud.com/rollback-nodes")
+    
+    if err := r.Update(ctx, cluster); err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    return ctrl.Result{}, nil
+}
+```
+
+**回滚参数解析**：
+
+```go
+// RollbackParams 回滚参数
+type RollbackParams struct {
+    ComponentName string   // 组件名
+    TargetVersion string   // 目标版本（可选）
+    Nodes         []string // 指定节点（可选）
+}
+
+// parseRollbackParams 解析回滚参数
+func parseRollbackParams(rollbackAnnotation string, annotations map[string]string) (*RollbackParams, error) {
+    params := &RollbackParams{
+        ComponentName: rollbackAnnotation,
+    }
+    
+    // 解析目标版本
+    if targetVersion, exists := annotations["bke.bocloud.com/rollback-target"]; exists {
+        params.TargetVersion = targetVersion
+    }
+    
+    // 解析指定节点
+    if nodesStr, exists := annotations["bke.bocloud.com/rollback-nodes"]; exists {
+        params.Nodes = strings.Split(nodesStr, ",")
+    }
+    
+    return params, nil
+}
+```
+
+#### 13.2.10 回滚测试设计
+
+**单元测试**：
+
+| 测试场景 | 测试内容 | 验证点 |
+|---------|---------|--------|
+| **单节点回滚** | Binary 组件单节点回滚流程 | UninstallScript 执行成功，服务停止 |
+| **组件级回滚** | Helm 组件回滚流程 | helm rollback 成功，Pod 状态正常 |
+| **依赖链回滚** | 多组件依赖回滚顺序 | 按 DAG 反向顺序回滚 |
+| **回滚失败处理** | 回滚失败场景处理 | 状态标记为 Failed，保留现场 |
+| **手动回滚** | 注解触发回滚流程 | 解析注解参数，执行回滚 |
+
+**集成测试**：
+
+| 测试场景 | 验证内容 | 预期结果 |
+|---------|---------|---------
+| **Binary 组件回滚（containerd）** | containerd 安装失败后回滚 | 服务停止，二进制文件删除 |
+| **Helm 组件回滚（coredns）** | coredns 部署失败后回滚 | Release 回滚到上一版本 |
+| **多组件依赖回滚** | kubernetes-master 失败后回滚依赖链 | 按反向顺序回滚所有依赖组件 |
+| **回滚后重新安装** | 回滚完成后重新触发安装 | 安装成功，状态正常 |
+
+**E2E 测试**：
+
+| 测试场景 | 集群规模 | 验证内容 |
+|---------|---------|---------
+| **生产环境模拟回滚** | 3M+5W | 模拟生产环境故障，验证回滚流程 |
+| **大规模集群回滚** | 3M+20W | 大规模集群回滚性能测试 |
+| **回滚性能测试** | 混合规模 | 回滚耗时、资源占用测试 |
+
+**测试代码示例**：
+
+```go
+// TestBinaryRollback 测试 Binary 组件回滚
+func TestBinaryRollback(t *testing.T) {
+    // 1. 准备测试环境
+    installer := NewBinaryInstaller(mockSSHExecutor)
+    opts := InstallOptions{
+        Component: &ComponentVersion{
+            Spec: ComponentVersionSpec{
+                Name: "containerd",
+                Binary: &BinarySpec{
+                    UninstallScript: "#!/bin/bash\nsystemctl stop containerd",
+                },
+            },
+        },
+        TemplateCtx: TemplateContext{
+            NodeIP: "10.0.0.1",
+        },
+    }
+    
+    // 2. 执行回滚
+    err := installer.Rollback(context.Background(), opts)
+    
+    // 3. 验证结果
+    if err != nil {
+        t.Fatalf("rollback failed: %v", err)
+    }
+    
+    // 4. 验证服务已停止
+    if !mockSSHExecutor.IsServiceStopped("containerd") {
+        t.Fatal("service not stopped after rollback")
+    }
+}
+
+// TestDependencyRollback 测试依赖链回滚
+func TestDependencyRollback(t *testing.T) {
+    // 1. 构建 DAG
+    dag := topology.NewUpgradeDAG()
+    dag.AddComponent("bkeagent", nil)
+    dag.AddComponent("containerd", []string{"bkeagent"})
+    dag.AddComponent("kubernetes-master", []string{"containerd"})
+    
+    // 2. 计算回滚顺序
+    scheduler := NewScheduler()
+    rollbackOrder, err := scheduler.calculateRollbackOrder(dag, "kubernetes-master")
+    
+    // 3. 验证回滚顺序
+    expected := []string{"kubernetes-master", "containerd", "bkeagent"}
+    if !reflect.DeepEqual(rollbackOrder, expected) {
+        t.Fatalf("rollback order = %v, want %v", rollbackOrder, expected)
+    }
+}
 ```
 
 ---
