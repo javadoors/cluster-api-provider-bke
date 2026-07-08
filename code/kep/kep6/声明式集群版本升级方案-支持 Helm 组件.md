@@ -48,7 +48,6 @@
 11. [迁移策略详细设计](#11-迁移策略详细设计)
     - 11.1 迁移流程图
     - 11.2 Feature Gate 设计
-    - 11.3 迁移验证清单
 12. [错误处理与恢复](#12-错误处理与恢复)
     - 12.1 错误处理流程图
 13. [测试设计](#13-测试设计)
@@ -111,8 +110,8 @@
                                   ▼
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │                            ReleaseImage                                         │
-│  spec.install.components: [coredns/v1.11.1, openfuyao-core/v26.03, ...]         │
-│  spec.upgrade.components: [coredns/v1.11.1, openfuyao-core/v26.03, ...]         │
+│  spec.install.components: [coredns/v1.11.1, openfuyao-addon/v26.03, ...]        │
+│  spec.upgrade.components: [coredns/v1.11.1, openfuyao-addon/v26.03, ...]        │
 └────────────────────────────────┬────────────────────────────────────────────────┘
                                   │ 按 (name, version) 定位
                                   ▼
@@ -3616,7 +3615,7 @@ type ComponentStatusUpdater interface {
                       ┌──────────────────────────────────────┐
                       │  install.components:                 │
                       │  ├── coredns/v1.11.1 (helm)          │
-                      │  ├── openfuyao-core/v26.03 (yaml)    │
+                      │  ├── openfuyao-adddon/v26.03 (yaml)  │
                       │  ├── kubernetes-master/v1.29.0       │
                       │  │                   (inline)        │
                       │  └── kubernetes-worker/v1.29.0       │
@@ -3644,7 +3643,7 @@ type ComponentStatusUpdater interface {
                       │                   → kubernetes-worker│
                       │                     (inline)         │
                       │                   → coredns (helm)   │
-                      │                   → openfuyao-core   │
+                      │                   → openfuyao-addon  │
                       │                     (yaml)           │
                       │                   → addon            │
                       │                   → postprocess      │
@@ -3771,8 +3770,7 @@ type ComponentStatusUpdater interface {
                       ┌──────────────────────────────────────┐
                       │  需要升级的组件:                      │
                       │  ├── coredns: v1.10.1 → v1.11.1      │
-                      │  └── openfuyao-core: v26.01 → v26.03 │
-                      └────────────────────┬─────────────────┘
+                      └──────────────────┬───────────────────┘
                                          │
                                          ▼
                     ┌──────────────────────────────────────┐
@@ -3784,14 +3782,13 @@ type ComponentStatusUpdater interface {
                       ┌──────────────────────────────────────┐
                       │  DAG 结构:                           │
                       │  provider → coredns (helm)           │
-                      │            → openfuyao-core (yaml)   │
                       │            → etcd (inline)           │
                       │            → kubernetes-worker       │
                       │              (inline)                │
                       │            → kubernetes-master       │
                       │              (inline)                │
                       │            → component → cluster     │
-                      └────────────────────┬─────────────────┘
+                      └──────────────────┬───────────────────┘
                                          │
                                          ▼
                     ┌──────────────────────────────────────┐
@@ -3803,7 +3800,7 @@ type ComponentStatusUpdater interface {
                     ▼                    ▼                    ▼
           ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
           │  Batch 1:       │  │  Batch 2:       │  │  Batch 3:       │
-          │  provider       │  │  coredns (helm) │  │  openfuyao-core │
+          │  provider       │  │  coredns (helm) │  │  openfuyao-addon│
           │                 │  │  helm upgrade   │  │  (yaml)         │
           │                 │  │  --atomic       │  │  ServerSideApply│
           └────────┬────────┘  └────────┬────────┘  └────────┬────────┘
@@ -3918,17 +3915,6 @@ func HelmComponentEnabled(obj client.Object) bool {
 
 **全局 flag 注册**：在 `utils/capbke/config` 中新增 `HelmComponentSupport` bool 变量，与现有 `DeclarativeUpgrade` 一致，通过控制器启动参数注入。
 
-### 11.3 迁移验证清单
-
-| 验证项 | 验证方法 | 通过标准 |
-| -------- | --------- | --------- |
-| **coredns 全新安装** | Feature Gate 开启，新建集群 | coredns Chart 部署成功，Pod Ready，Endpoint Ready |
-| **coredns 升级** | Feature Gate 开启，v1.10.1→v1.11.1 | helm upgrade 成功，Pod 滚动更新 |
-| **openfuyao-core 全新安装** | Feature Gate 开启，新建集群 | YAML 清单 Apply 成功，资源创建 |
-| **openfuyao-core 升级** | Feature Gate 开启，v26.01→v26.03 | ServerSideApply 增量更新成功 |
-| **coredns Values 渲染** | 检查渲染后的 Values | 模板变量正确替换 |
-| **Feature Gate 关闭回退** | 关闭 Feature Gate，执行安装/升级 | 旧路径执行，行为不变 |
-
 ## 12. 错误处理与恢复
 
 ### 12.1 错误处理流程图
@@ -4016,9 +4002,9 @@ func HelmComponentEnabled(obj client.Object) bool {
 | 测试场景 | 验证内容 | 预期结果 |
 | --------- | --------- | --------- |
 | **全新安装 (helm)** | coredns + kube-proxy 安装 | Chart 正确部署，Pod Ready，Endpoint Ready |
-| **全新安装 (yaml)** | openfuyao-core 安装 | YAML 清单正确 Apply，资源创建 |
+| **全新安装 (yaml)** | openfuyao-addon 安装 | YAML 清单正确 Apply，资源创建 |
 | **升级 (helm)** | coredns v1.10.1 → v1.11.1 | helm upgrade 成功，Pod 滚动更新 |
-| **升级 (yaml)** | openfuyao-core v26.01 → v26.03 | ServerSideApply 增量更新 |
+| **升级 (yaml)** | openfuyao-addon v26.01 → v26.03 | ServerSideApply 增量更新 |
 | **回滚 (helm)** | helm upgrade 失败后 rollback | 自动回滚到上一版本 |
 | **离线环境** | 无网络时使用本地缓存 | 安装/升级正常完成 |
 
