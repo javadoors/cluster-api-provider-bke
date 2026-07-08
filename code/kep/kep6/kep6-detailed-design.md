@@ -43,8 +43,9 @@
    - 6.2 YamlInstaller 执行流程图
    - 6.3 核心接口定义
    - 6.4 清单下载与缓存
-   - 6.5 健康检查
-   - 6.6 YAML Uninstall 流程
+   - 6.5 模板渲染
+   - 6.6 健康检查
+   - 6.7 YAML Uninstall 流程
 7. [HealthCheck 共享包设计](#7-healthcheck-共享包设计)
    - 7.1 类型定义
 8. [模板变量系统与 TemplateContext 详细设计](#8-模板变量系统与-templatecontext-详细设计)
@@ -114,7 +115,7 @@
 
 - **BinaryInstaller**: 二进制组件的下载、渲染、安装
 - **HelmInstaller**: Helm 组件的 Chart 获取、渲染、部署
-- **TemplateRenderer**: BinaryInstaller 内置的脚本与配置模板渲染引擎 (Go template)
+- **TemplateRenderer**: 共享模板渲染引擎 (Go template)，BinaryInstaller 和 YamlInstaller 共同使用
 - **ConfigRenderer**: BinaryInstaller 内置的配置文件模板渲染引擎 (支持 Content/Secret/Kubeconfig 三种模式)
 - **DAG 集成**: 执行器注册与调度流程
 
@@ -124,7 +125,7 @@
 |------|------|
 | CRD 扩展 | ComponentVersion 新增 binary/helm/selector 类型的完整字段定义 |
 | 核心安装器 | BinaryInstaller、HelmInstaller、YamlInstaller 的完整实现 |
-| 渲染引擎 | BinaryInstaller 内置 TemplateRenderer (脚本渲染) + ConfigRenderer (配置渲染) 的完整实现 |
+| 渲染引擎 | BinaryInstaller 和 YamlInstaller 共享 TemplateRenderer (脚本/配置/清单渲染) + ConfigRenderer (配置渲染) 的完整实现 |
 | DAG 集成 | BinaryComponentExecutor、HelmComponentExecutor |
 | 迁移策略 | Feature Gate、向后兼容、灰度发布 |
 
@@ -3828,7 +3829,17 @@ helm:
 │  │ • 内联Resources  │    │ • 资源分组        │                   │
 │  └────────┬─────────┘    └────────┬─────────┘                   │
 │           │                       │                             │
-│           ▼                       ▼                             │
+│           └───────────┬───────────┘                             │
+│                       ▼                                         │
+│  ┌──────────────────────────────────────────┐                   │
+│  │         TemplateRenderer                 │                   │
+│  │                                          │                   │
+│  │ • Go template 渲染 (共享引擎)             │                   │
+│  │ • TemplateContext 变量替换                │                   │
+│  │ • 自定义函数: upper/lower/eq/default 等   │                   │
+│  └──────────────────┬───────────────────────┘                   │
+│                     │                                           │
+│                     ▼                                           │
 │  ┌──────────────────────────────────────────┐                   │
 │  │       ApplyStrategy Engine               │                   │
 │  │                                          │                   │
@@ -3850,7 +3861,7 @@ helm:
 
 ### 6.2 YamlInstaller 执行流程图
 
-**设计思路**：YamlInstaller 的执行流程分为 4 个主要步骤：加载清单、应用清单、健康检查、返回结果。与 BinaryInstaller（7 步）和 HelmInstaller（7 步）相比更简单——无制品下载/SSH 执行/Helm SDK 等复杂子层，仅 Store 加载 + Applier 应用 + healthcheck。
+**设计思路**：YamlInstaller 的执行流程分为 5 个主要步骤：加载清单、模板渲染、应用清单、健康检查、返回结果。与 BinaryInstaller（7 步）和 HelmInstaller（7 步）相比更简单——无制品下载/SSH 执行/Helm SDK 等复杂子层，仅 Store 加载 + 模板渲染 + Applier 应用 + healthcheck。
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -3873,7 +3884,17 @@ helm:
                                           │
                                           ▼
                      ┌────────────────────────────────────────┐
-                     │  2. 应用清单                            │
+                     │  2. 模板渲染                            │
+                     │  renderer.RenderManifests(rawManifests, │
+                     │    execCtx.TemplateContext)             │
+                     │  → Go template 渲染 {{.ClusterName}}   │
+                     │    {{.Config.Cluster.ImageRepo.Domain}} │
+                     │    等模板变量                            │
+                     └────────────────────┬───────────────────┘
+                                          │
+                                          ▼
+                     ┌────────────────────────────────────────┐
+                     │  3. 应用清单                            │
                      │  applier.ApplyComponent(ctx, pkg)      │
                      │  → ClusterApplier → ApplyYaml          │
                      │    (ServerSideApply/Replace/CreateOnly)│
@@ -3881,7 +3902,7 @@ helm:
                                           │
                                           ▼
                      ┌──────────────────────────────────────┐
-                     │  3. 健康检查                          │
+                     │  4. 健康检查                          │
                      │  healthcheck.Run(ctx, clientset, hc) │
                      │  (见第 7 章, hc.Enabled=true 时执行)  │
                      └────────────────────┬─────────────────┘
@@ -3909,7 +3930,7 @@ YAML 组件采用与 Binary/Helm 对称的两层结构：`YamlComponentExecutor`
 | 独立包引擎 | `binaryinstaller.BinaryInstaller` | `helminstaller.HelmInstaller` | `yamlinstaller.YamlInstaller`（本节） |
 
 **Installer（引擎层）完成的逻辑**（`YamlInstaller.Apply`）：
-- 构建 ComponentPackage → `applier.ApplyComponent()` → 健康检查（PodReady/EndpointReady/Custom）
+- 构建 ComponentPackage → 模板渲染（TemplateRenderer） → `applier.ApplyComponent()` → 健康检查（PodReady/EndpointReady/Custom）
 
 **Executor（调度层）完成的逻辑**（`YamlComponentExecutor`，见 9.4.3.3）：
 - 获取 ComponentVersion → VersionContext 判断是否需要执行 → 委托 `YamlInstaller.Apply()` → 处理失败策略
@@ -3920,40 +3941,56 @@ YAML 组件采用与 Binary/Helm 对称的两层结构：`YamlComponentExecutor`
 // pkg/yamlinstaller/installer.go
 
 // YamlInstaller YAML 组件安装器（引擎层，对称 BinaryInstaller/HelmInstaller）
-// 持有 manifest.Store (加载清单) + manifest.Applier (应用清单)，负责清单 Apply + 健康检查。
+// 持有 manifest.Store (加载清单) + manifest.Applier (应用清单) + TemplateRenderer (模板渲染)，
+// 负责清单加载 → 模板渲染 → 清单 Apply → 健康检查。
 // 相比 BinaryInstaller 无 SSH/下载/缓存子层，逻辑较简单。
 type YamlInstaller struct {
-    store   manifest.Store            // 加载清单 (复用 BundleStore.GetComponentManifests)
-    applier manifest.Applier          // 应用清单 (现有 manifest.ClusterApplier 实现)
-    logger  *bkev1beta1.BKELogger
+    store    manifest.Store            // 加载清单 (复用 BundleStore.GetComponentManifests)
+    applier  manifest.Applier          // 应用清单 (现有 manifest.ClusterApplier 实现)
+    renderer *template.TemplateRenderer // 模板渲染引擎 (共享，与 BinaryInstaller 对称)
+    logger   *bkev1beta1.BKELogger
 }
 
 type YamlInstallerConfig struct {
-    Store   manifest.Store
-    Applier manifest.Applier
-    Logger  *bkev1beta1.BKELogger
+    Store    manifest.Store
+    Applier  manifest.Applier
+    Renderer *template.TemplateRenderer // 新增：共享模板渲染引擎
+    Logger   *bkev1beta1.BKELogger
 }
 
 func NewYamlInstaller(cfg YamlInstallerConfig) *YamlInstaller {
-    return &YamlInstaller{store: cfg.Store, applier: cfg.Applier, logger: cfg.Logger}
+    return &YamlInstaller{store: cfg.Store, applier: cfg.Applier, renderer: cfg.Renderer, logger: cfg.Logger}
 }
 
 // Apply 应用 YAML 清单 + 健康检查 (由 YamlComponentExecutor 委托调用)
 func (i *YamlInstaller) Apply(ctx context.Context, cv *configv1alpha1.ComponentVersion, execCtx *ExecutionContext) error {
-    // 通过 manifest.Store 加载清单 (复用 BundleStore.GetComponentManifests 逻辑:
-    // bundle 文件 (components/<name>/<version>/*.yaml) + cv.Spec.Resources 内联清单)
+    // 1. 通过 manifest.Store 加载清单 (复用 BundleStore.GetComponentManifests 逻辑:
+    //    bundle 文件 (components/<name>/<version>/*.yaml) + cv.Spec.Resources 内联清单)
     pkg, err := i.store.GetComponentManifests(ctx, cv.Spec.Name, cv.Spec.Version, execCtx.TemplateContext)
     if err != nil {
         return fmt.Errorf("get manifests for %s: %w", cv.Spec.Name, err)
     }
 
-    // 应用 Manifest
+    // 2. 模板渲染 (新增步骤)
+    //    对加载的原始 YAML 文本执行 Go template 渲染，替换 {{.ClusterName}}、
+    //    {{.Config.Cluster.ImageRepo.Domain}} 等模板变量
+    if i.renderer != nil {
+        for idx, manifest := range pkg.Manifests {
+            rendered, err := i.renderer.RenderManifest(string(manifest), execCtx.TemplateContext)
+            if err != nil {
+                return fmt.Errorf("render manifest[%d] for %s: %w", idx, cv.Spec.Name, err)
+            }
+            pkg.Manifests[idx] = []byte(rendered)
+        }
+    }
+
+    // 3. 应用 Manifest
     if err := i.applier.ApplyComponent(ctx, pkg); err != nil {
         return fmt.Errorf("apply manifests for %s: %w", cv.Spec.Name, err)
     }
 
-    // 健康检查 (应用清单后验证 Pod/Endpoint 就绪)
-    // 复用共享 pkg/healthcheck 包 (见 7)，避免与 HelmInstaller 重复
+    // 4. 健康检查 (应用清单后验证 Pod/Endpoint 就绪)
+    //    复用共享 pkg/healthcheck 包 (见 7)，避免与 HelmInstaller 重复
     if cv.Spec.YAML != nil && cv.Spec.YAML.HealthCheck != nil && cv.Spec.YAML.HealthCheck.Enabled {
         if err := healthcheck.Run(ctx, execCtx.TargetClient, *cv.Spec.YAML.HealthCheck); err != nil {
             return fmt.Errorf("health check failed for %s: %w", cv.Spec.Name, err)
@@ -4154,20 +4191,22 @@ func (d *ManifestDownloader) computeCacheKey(url, checksum string) string {
 // pkg/yamlinstaller/installer.go 扩展
 
 type YamlInstaller struct {
-    store            manifest.Store
-    applier          manifest.Applier
-    manifestDownloader *ManifestDownloader  // 新增：清单下载器
-    logger           *bkev1beta1.BKELogger
+    store              manifest.Store
+    applier            manifest.Applier
+    renderer           *template.TemplateRenderer // 共享模板渲染引擎
+    manifestDownloader *ManifestDownloader        // 新增：清单下载器
+    logger             *bkev1beta1.BKELogger
 }
 
 type YamlInstallerConfig struct {
     Store              manifest.Store
     Applier            manifest.Applier
-    ManifestDownloader *ManifestDownloader  // 新增
+    Renderer           *template.TemplateRenderer // 新增：共享模板渲染引擎
+    ManifestDownloader *ManifestDownloader        // 新增
     Logger             *bkev1beta1.BKELogger
 }
 
-// Apply 扩展：支持外部 URL 清单 + 内联 Resources
+// Apply 扩展：支持外部 URL 清单 + 模板渲染 + 内联 Resources
 func (i *YamlInstaller) Apply(ctx context.Context, cv *configv1alpha1.ComponentVersion, execCtx *ExecutionContext) error {
     var allResources []unstructured.Unstructured
 
@@ -4177,6 +4216,16 @@ func (i *YamlInstaller) Apply(ctx context.Context, cv *configv1alpha1.ComponentV
         if err != nil {
             return fmt.Errorf("download manifests for %s: %w", cv.Spec.Name, err)
         }
+
+        // 1.5 模板渲染：对外部 URL 清单的原始 YAML 文本执行 Go template 渲染
+        if i.renderer != nil {
+            rendered, err := i.renderer.RenderManifest(string(data), execCtx.TemplateContext)
+            if err != nil {
+                return fmt.Errorf("render downloaded manifests for %s: %w", cv.Spec.Name, err)
+            }
+            data = []byte(rendered)
+        }
+
         resources, err := ParseMultiDocYAML(data)
         if err != nil {
             return fmt.Errorf("parse manifests for %s: %w", cv.Spec.Name, err)
@@ -4189,8 +4238,24 @@ func (i *YamlInstaller) Apply(ctx context.Context, cv *configv1alpha1.ComponentV
     if err != nil {
         return fmt.Errorf("get inline manifests for %s: %w", cv.Spec.Name, err)
     }
+
+    // 2.5 模板渲染：对内联清单的原始 YAML 文本执行 Go template 渲染
+    if i.renderer != nil && inlineResources != nil {
+        for idx, manifest := range inlineResources.Manifests {
+            rendered, err := i.renderer.RenderManifest(string(manifest), execCtx.TemplateContext)
+            if err != nil {
+                return fmt.Errorf("render inline manifest[%d] for %s: %w", idx, cv.Spec.Name, err)
+            }
+            inlineResources.Manifests[idx] = []byte(rendered)
+        }
+    }
+
     if inlineResources != nil {
-        allResources = append(allResources, inlineResources.Resources...)
+        parsedInline, err := ParseMultiDocYAML(bytes.Join(inlineResources.Manifests, []byte("\n---\n")))
+        if err != nil {
+            return fmt.Errorf("parse inline manifests for %s: %w", cv.Spec.Name, err)
+        }
+        allResources = append(allResources, parsedInline...)
     }
 
     // 3. 应用到集群
@@ -4209,11 +4274,193 @@ func (i *YamlInstaller) Apply(ctx context.Context, cv *configv1alpha1.ComponentV
 }
 ```
 
-### 6.5 健康检查
+### 6.5 模板渲染
+
+**设计思路 — YAML 组件模板渲染的必要性与实现方案**：
+
+YAML 组件的清单文件（外部 URL 下载、bundle 文件、内联 Resources 的 manifest 字段）可能包含模板变量（如 `{{.ClusterName}}`、`{{.Config.Cluster.ImageRepo.Domain}}`），需要在应用前进行渲染。这与 BinaryInstaller 的脚本渲染、HelmInstaller 的 Values 渲染对称，但 YAML 组件的渲染对象是原始 YAML 文本。
+
+**关键设计点**：
+- **共享 TemplateRenderer**：复用 `pkg/template.TemplateRenderer`（与 BinaryInstaller 共享），保持渲染函数一致（upper/lower/eq/default/joinPath 等）
+- **渲染时机**：在清单加载后、解析为 `unstructured.Unstructured` 前，对原始 YAML 文本执行 Go template 渲染
+- **渲染范围**：
+  - ✅ 外部 URL 清单（`yaml.manifests[].url` 下载后的原始 YAML）
+  - ✅ Bundle 文件（`components/<name>/<version>/*.yaml`）
+  - ✅ 内联 Manifest（`resources[].manifest` 字段的 YAML 字符串）
+  - ❌ 内联 ConfigMap Data（`resources[].data`，结构化字段，由 provisionConfigMap 处理）
+  - ❌ 内联 Secret StringData（`resources[].stringData`，由 provisionSecret 处理）
+- **TemplateContext 来源**：复用 DAG 调度器构建的 `execCtx.TemplateContext`，包含集群信息、版本信息等
+
+**渲染流程图**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    YAML 模板渲染流程                                              │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+  ┌──────────────────────────────────────┐
+  │  YamlInstaller.Apply()               │
+  │  加载清单后                           │
+  └──────────┬───────────────────────────┘
+              │
+              ▼
+  ┌──────────────────────────────────────┐
+  │  遍历原始 YAML 文本                   │
+  │  pkg.Manifests ([][]byte)            │
+  └──────────┬───────────────────────────┘
+              │
+              ▼
+  ┌──────────────────────────────────────┐
+  │  renderer.RenderManifest(manifest,   │
+  │    execCtx.TemplateContext)          │
+  │                                      │
+  │  模板变量替换:                        │
+  │  - {{.ClusterName}} → "test-cluster" │
+  │  - {{.Namespace}} → "default"        │
+  │  - {{.Config.Cluster.ImageRepo.     │
+  │    Domain}} → "registry.example.com" │
+  │  - {{.ComponentVersion}} → "v26.03"  │
+  └──────────┬───────────────────────────┘
+              │
+         ┌────┴────┐
+         │         │
+      渲染成功   渲染失败
+         │         │
+         ▼         ▼
+  ┌────────┐ ┌──────────┐
+  │继续    │ │返回错误  │
+  │下一步  │ │return err│
+  └───┬────┘ └──────────┘
+      │
+      ▼
+  ┌──────────────────────────────────────┐
+  │  渲染后的 YAML 文本                   │
+  │  → 解析为 unstructured.Unstructured  │
+  │  → 应用到集群                         │
+  └──────────────────────────────────────┘
+```
+
+**代码实现**：
+
+```go
+// pkg/template/renderer.go (共享模板渲染引擎)
+
+// RenderManifest 渲染 YAML 清单模板 (使用 TemplateContext 作为模板数据)
+// 与 RenderScript 共用相同的 FuncMap，但使用不同的模板名称以避免冲突
+func (r *TemplateRenderer) RenderManifest(manifest string, tmplCtx manifest.TemplateContext) (string, error) {
+    // 快速检查：无模板变量时直接返回，避免解析开销
+    if !strings.Contains(manifest, "{{") {
+        return manifest, nil
+    }
+
+    tmpl, err := template.New("yamlManifest").Funcs(r.funcMap).Parse(manifest)
+    if err != nil {
+        return "", fmt.Errorf("failed to parse manifest template: %w", err)
+    }
+
+    var buf bytes.Buffer
+    if err := tmpl.Execute(&buf, tmplCtx); err != nil {
+        return "", fmt.Errorf("failed to render manifest template: %w", err)
+    }
+
+    return buf.String(), nil
+}
+```
+
+**模板变量使用样例**：
+
+```yaml
+# ComponentVersion YAML 中使用模板变量
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: openfuyao-core-v26.03
+spec:
+  name: openfuyao-core
+  type: yaml
+  version: v26.03
+
+  yaml:
+    # 外部 URL 清单支持模板变量
+    manifests:
+      - url: "{{.Config.Cluster.ImageRepo.Domain}}/manifests/openfuyao-core/v26.03/deployment.yaml"
+        checksum: "sha256:deployment-checksum..."
+
+  # 内联 Resources 的 manifest 字段也支持模板变量
+  resources:
+    - kind: ConfigMap
+      apiVersion: v1
+      name: openfuyao-config
+      namespace: openfuyao-system
+      manifest: |
+        data:
+          cluster-name: "{{.ClusterName}}"
+          namespace: "{{.Namespace}}"
+          image-repo: "{{.Config.Cluster.ImageRepo.Domain}}"
+          k8s-version: "{{.KubernetesVersion}}"
+
+    - kind: Deployment
+      apiVersion: apps/v1
+      name: openfuyao-core
+      namespace: openfuyao-system
+      manifest: |
+        spec:
+          template:
+            spec:
+              containers:
+                - name: openfuyao-core
+                  image: "{{.Config.Cluster.ImageRepo.Domain}}/openfuyao/core:{{.ComponentVersion}}"
+```
+
+**渲染结果示例**：
+
+```yaml
+# 渲染后的 ConfigMap (模板变量已替换)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openfuyao-config
+  namespace: openfuyao-system
+data:
+  cluster-name: "test-cluster"
+  namespace: "default"
+  image-repo: "registry.example.com"
+  k8s-version: "1.29.0"
+
+# 渲染后的 Deployment (镜像地址已替换)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: openfuyao-core
+  namespace: openfuyao-system
+spec:
+  template:
+    spec:
+      containers:
+        - name: openfuyao-core
+          image: "registry.example.com/openfuyao/core:v26.03"
+```
+
+**与 BinaryInstaller/HelmInstaller 的对比**：
+
+| 维度 | BinaryInstaller | HelmInstaller | YamlInstaller |
+|------|----------------|---------------|---------------|
+| **渲染对象** | installScript + configTemplates | Values (map[string]interface{}) | 原始 YAML 文本 ([][]byte) |
+| **渲染引擎** | TemplateRenderer.RenderScript() | renderTemplateString() (简单替换) | TemplateRenderer.RenderManifest() |
+| **FuncMap** | 完整自定义函数 (upper/lower/eq/...) | 无 (仅字符串替换) | 完整自定义函数 (与 Binary 共享) |
+| **TemplateContext** | 完整字段 (含节点/制品信息) | 基础字段 (集群/版本信息) | 基础字段 (集群/版本信息) |
+
+**设计优势**：
+- ✅ **一致性**：YAML 组件与 Binary 组件使用相同的渲染引擎和函数集，降低学习成本
+- ✅ **灵活性**：清单文件可使用任意模板变量和函数，满足复杂场景需求
+- ✅ **性能**：无模板变量时快速跳过，避免不必要的解析开销
+- ✅ **可维护性**：共享 TemplateRenderer，函数扩展一次生效于所有组件类型
+
+### 6.6 健康检查
 
 YamlInstaller 的健康检查在 `Apply` 方法内部调用共享 `pkg/healthcheck` 包执行（`healthcheck.Run(ctx, execCtx.TargetClient, *cv.Spec.YAML.HealthCheck)`）。当 `cv.Spec.YAML.HealthCheck.Enabled` 为 true 时，清单 Apply 后执行 PodReady/EndpointReady/Custom 检查。接口定义与实现详见 **第 7 章 HealthCheck 共享包设计**。
 
-### 6.6 YAML Uninstall 流程
+### 6.7 YAML Uninstall 流程
 
 **设计思路 — YAML 组件卸载与 Binary/Helm 的区别**：
 
@@ -5427,18 +5674,18 @@ installScript: |
                      │                   │                    │                    │
                      ▼                   ▼                    ▼                    ▼
            ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
-           │  YAML 组件      │  │  Helm 组件       │  │  Binary 组件    │  │  Inline 组件     │
-           │                 │  │                 │  │                 │  │                 │
-           │  使用基础字段    │  │  使用基础字段    │  │  扩展节点信息    │  │  使用基础字段    │
-           │  - ClusterName  │  │  + APIServer    │  │  + NodeIP       │  │  - ClusterName  │
-           │  - Namespace    │  │  + ServiceCIDR  │  │  + NodeHostname │  │  - Namespace    │
-           │  - K8sVersion   │  │                 │  │  + NodeRole     │  │  - K8sVersion   │
-           │                 │  │                 │  │  + Artifacts    │  │                 │
-           │  渲染 Manifest  │  │  渲染 Values     │  │  + Variables    │  │  Phase 执行     │
-           │  应用到集群      │  │  helm install   │  │                 │  │  (无需模板渲染)  │
-           │                 │  │                 │  │  渲染脚本        │  │                 │
-           │                 │  │                 │  │  SSH 执行       │   │                 │
-           └─────────────────┘  └─────────────────┘  └─────────────────┘   └─────────────────┘
+            │  YAML 组件      │  │  Helm 组件       │  │  Binary 组件    │  │  Inline 组件     │
+            │                 │  │                 │  │                 │  │                 │
+            │  使用基础字段    │  │  使用基础字段    │  │  扩展节点信息    │  │  使用基础字段    │
+            │  - ClusterName  │  │  + APIServer    │  │  + NodeIP       │  │  - ClusterName  │
+            │  - Namespace    │  │  + ServiceCIDR  │  │  + NodeHostname │  │  - Namespace    │
+            │  - K8sVersion   │  │                 │  │  + NodeRole     │  │  - K8sVersion   │
+            │                 │  │                 │  │  + Artifacts    │  │                 │
+            │  渲染 Manifest  │  │  渲染 Values     │  │  + Variables    │  │  Phase 执行     │
+            │  (模板变量替换)  │  │  helm install   │  │                 │  │  (无需模板渲染)  │
+            │  应用到集群      │  │                 │  │  渲染脚本        │  │                 │
+            │                 │  │                 │  │  SSH 执行       │   │                 │
+            └─────────────────┘  └─────────────────┘  └─────────────────┘   └─────────────────┘
 ```
 
 ### 8.4 自定义函数定义
@@ -5997,9 +6244,10 @@ func (r *BKEClusterReconciler) buildSchedulerConfig(
         // 4. YamlInstaller (复用 ManifestStore + ManifestApplier；对称 Binary/Helm 的 Installer 注入)
         cfg.YAMLInstaller = yamlinstaller.NewYamlInstaller(
             yamlinstaller.YamlInstallerConfig{
-                Store:   cfg.ManifestStore,   // 复用基础依赖 (manifest.NewBundleStore(bundle))
-                Applier: cfg.ManifestApplier, // 复用基础依赖
-                Logger:  bkeLogger,
+                Store:    cfg.ManifestStore,   // 复用基础依赖 (manifest.NewBundleStore(bundle))
+                Applier:  cfg.ManifestApplier, // 复用基础依赖
+                Renderer: templateRenderer,    // 新增：共享模板渲染引擎 (与 BinaryInstaller 对称)
+                Logger:   bkeLogger,
             },
         )
     }

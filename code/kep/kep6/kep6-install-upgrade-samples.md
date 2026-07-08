@@ -16,7 +16,8 @@
    - 1.3 Docker 运行时安装
    - 1.4 Helm 组件安装（coredns）
    - 1.5 YAML 组件安装（openfuyao-core）
-   - 1.6 多架构混合集群安装
+   - 1.6 YAML 组件安装（内联 Resources + 模板渲染）
+   - 1.7 多架构混合集群安装
 
 **2. [升级样例](#2-升级样例)**
    - 2.1 版本变更对比
@@ -1207,6 +1208,8 @@ spec:
   version: v26.03
 
   yaml:
+    # 外部 URL 清单支持模板变量渲染
+    # {{.Config.Cluster.ImageRepo.Domain}} 在渲染时替换为实际镜像仓库地址
     manifests:
       - url: "{{.Config.Cluster.ImageRepo.Domain}}/manifests/openfuyao-core/v26.03/crds.yaml"
         checksum: "sha256:crds-checksum..."
@@ -1234,6 +1237,23 @@ spec:
             serviceName: openfuyao-core
             minReady: 1
 
+  # 内联 Resources: manifest 字段支持模板变量渲染
+  resources:
+    # ConfigMap 使用 manifest 模式，包含模板变量
+    - kind: ConfigMap
+      apiVersion: v1
+      name: openfuyao-core-config
+      namespace: openfuyao-system
+      labels:
+        app.kubernetes.io/name: openfuyao-core
+        app.kubernetes.io/managed-by: openfuyao-core
+      manifest: |
+        data:
+          cluster-name: "{{.ClusterName}}"
+          namespace: "{{.Namespace}}"
+          image-repo: "{{.Config.Cluster.ImageRepo.Domain}}"
+          k8s-version: "{{.KubernetesVersion}}"
+
   dependencies:
     - name: kubernetes-master
       phase: Install
@@ -1254,19 +1274,30 @@ YamlComponentExecutor 执行:
   │     ├─ 从 URL 下载 service.yaml
   │     └─ 校验 checksum
   │
-  ├─ 2. 解析多文档 YAML
+  ├─ 2. 模板渲染 (TemplateRenderer.RenderManifest)
+  │     ├─ 渲染外部 URL 清单中的模板变量:
+  │     │   └─ {{.Config.Cluster.ImageRepo.Domain}} → registry.example.com
+  │     ├─ 渲染内联 Resources manifest 中的模板变量:
+  │     │   ├─ {{.ClusterName}} → yaml-cluster
+  │     │   ├─ {{.Namespace}} → default
+  │     │   ├─ {{.Config.Cluster.ImageRepo.Domain}} → registry.example.com
+  │     │   └─ {{.KubernetesVersion}} → 1.29.0
+  │     └─ 无模板变量的内容快速跳过 (无 "{{" 时直接返回)
+  │
+  ├─ 3. 解析多文档 YAML
   │     ├─ 解析每个文件的多个文档（--- 分隔）
   │     ├─ 转换为 unstructured.Unstructured 对象
   │     └─ 按 GVK 排序（CRD 优先）
   │
-  ├─ 3. 应用到集群
+  ├─ 4. 应用到集群
   │     ├─ 按策略应用: ServerSideApply
   │     ├─ 创建命名空间: openfuyao-system
   │     ├─ 应用 CRD（优先）
   │     ├─ 应用 Deployment
-  │     └─ 应用 Service
+  │     ├─ 应用 Service
+  │     └─ 应用 ConfigMap (openfuyao-core-config)
   │
-  ├─ 4. 健康检查
+  ├─ 5. 健康检查
   │     ├─ PodReady 检查:
   │     │   ├─ 查询 Pod: labelSelector="app.kubernetes.io/name=openfuyao-core"
   │     │   ├─ 检查 Pod 状态: Ready
@@ -1277,13 +1308,14 @@ YamlComponentExecutor 执行:
   │     │   └─ 检查 Endpoint 数量: >= minReady (1)
   │     └─ 检查通过 → ✅
   │
-  └─ 5. 更新状态
+  └─ 6. 更新状态
         ├─ ComponentStatuses["openfuyao-core"] = {Version: "v26.03", Phase: "Installed"}
         └─ 记录已应用的资源列表（用于 Prune）
 ```
 
 **关键设计点**：
 - ✅ **多文档 YAML 支持**：支持 `---` 分隔的多个资源
+- ✅ **模板渲染**：外部 URL 清单和内联 manifest 支持 `{{.Config.Cluster.ImageRepo.Domain}}`、`{{.ClusterName}}` 等模板变量，渲染引擎与 BinaryInstaller 共享（TemplateRenderer）
 - ✅ **ServerSideApply 策略**：增量更新，保留其他管理者的字段
 - ✅ **Prune 裁剪**：删除不再需要的资源（按 labelSelector）
 - ✅ **双重健康检查**：PodReady + EndpointReady 确保服务完全就绪
@@ -1291,7 +1323,268 @@ YamlComponentExecutor 执行:
 
 ---
 
-### 1.6 多架构混合集群安装
+### 1.6 YAML 组件安装（内联 Resources + 模板渲染）
+
+**场景**：新建集群，使用 YAML 类型安装 `bke-monitoring` 组件，混合使用三种内联 Resources 模式（Data / StringData / Manifest）+ 外部 URL 清单，并在 manifest 字段中使用模板变量。
+
+**集群配置**：
+```yaml
+apiVersion: config.openfuyao.cn/v1beta1
+kind: BKECluster
+metadata:
+  name: yaml-inline-cluster
+  namespace: default
+spec:
+  clusterConfig:
+    cluster:
+      imageRepo:
+        domain: registry.example.com
+```
+
+**bke-monitoring ComponentVersion YAML**：
+```yaml
+# bke-manifests/bke-monitoring/v0.72.0/component.yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: bke-monitoring-v0.72.0
+spec:
+  name: bke-monitoring
+  type: yaml
+  version: v0.72.0
+
+  yaml:
+    # 外部 URL 清单（CRD 等体积较大的资源）
+    # 支持模板变量渲染
+    manifests:
+      - url: "{{.Config.Cluster.ImageRepo.Domain}}/manifests/bke-monitoring/v0.72.0/crds.yaml"
+        checksum: "sha256:monitoring-crds-checksum..."
+    namespace: bke-monitoring
+    applyStrategy: ServerSideApply
+    healthCheck:
+      enabled: true
+      timeout: "3m"
+      checks:
+        - type: PodReady
+          podReady:
+            namespace: bke-monitoring
+            labelSelector: "app.kubernetes.io/name=bke-monitoring"
+            minReady: 1
+
+  # 内联 Resources（与外部 URL 清单合并应用）
+  # 所有 manifest 字段支持模板变量渲染
+  resources:
+    # ── 模式 1: Data — ConfigMap 专属 ──
+    # 使用场景: 简单的配置文件, 结构化定义, 无需写完整 ConfigMap YAML
+    - kind: ConfigMap
+      apiVersion: v1
+      name: monitoring-config
+      namespace: bke-monitoring
+      labels:
+        app.kubernetes.io/name: bke-monitoring
+        app.kubernetes.io/managed-by: bke-monitoring
+      data:
+        alertmanager.yml: |
+          global:
+            resolve_timeout: 5m
+          route:
+            receiver: default
+            group_wait: 30s
+            group_interval: 5m
+            repeat_interval: 12h
+          receivers:
+            - name: default
+              webhook_configs:
+                - url: http://bke-monitoring-webhook:9093/alert
+        recording-rules.yml: |
+          groups:
+            - name: node-rules
+              interval: 30s
+              rules:
+                - record: node:cpu:rate5m
+                  expr: rate(node_cpu_seconds_total[5m])
+                - record: node:memory:usage
+                  expr: 1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)
+
+    # ── 模式 2: StringData — Secret 专属 ──
+    # 使用场景: 敏感数据（证书、密钥、Token）, 用户写明文, 代码自动转 base64
+    # 优势: 避免手动 base64 编码, 减少出错
+    - kind: Secret
+      apiVersion: v1
+      name: monitoring-credentials
+      namespace: bke-monitoring
+      labels:
+        app.kubernetes.io/name: bke-monitoring
+        app.kubernetes.io/managed-by: bke-monitoring
+      stringData:
+        webhook-url: "https://hooks.example.com/alert"
+        api-token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.example-token"
+        basic-auth-password: "monitoring-secret-pwd"
+
+    # ── 模式 3: Manifest — 通用（任意 Kind 的原始 YAML）──
+    # 使用场景: Deployment/Service/CRD/ServiceMonitor 等复杂资源
+    # 声明式字段无法表达完整定义时使用
+    # manifest 字段支持模板变量渲染
+    - kind: ServiceMonitor
+      apiVersion: monitoring.coreos.com/v1
+      name: bke-monitoring-sm
+      namespace: bke-monitoring
+      labels:
+        app.kubernetes.io/name: bke-monitoring
+        app.kubernetes.io/managed-by: bke-monitoring
+      manifest: |
+        spec:
+          selector:
+            matchLabels:
+              app.kubernetes.io/name: bke-monitoring
+          namespaceSelector:
+            matchNames:
+              - bke-monitoring
+          endpoints:
+            - port: metrics
+              interval: 30s
+              path: /metrics
+
+    - kind: Service
+      apiVersion: v1
+      name: bke-monitoring
+      namespace: bke-monitoring
+      labels:
+        app.kubernetes.io/name: bke-monitoring
+        app.kubernetes.io/managed-by: bke-monitoring
+      manifest: |
+        spec:
+          type: ClusterIP
+          selector:
+            app.kubernetes.io/name: bke-monitoring
+          ports:
+            - name: metrics
+              port: 9090
+              targetPort: 9090
+              protocol: TCP
+
+    # ── Manifest 模式使用模板变量示例 ──
+    # manifest 中可使用 {{.ClusterName}}、{{.Config.Cluster.ImageRepo.Domain}} 等模板变量
+    # 渲染引擎与 BinaryInstaller 共享（TemplateRenderer）
+    - kind: ConfigMap
+      apiVersion: v1
+      name: monitoring-grafana-datasource
+      namespace: bke-monitoring
+      labels:
+        app.kubernetes.io/name: bke-monitoring
+        grafana_datasource: "1"
+      manifest: |
+        data:
+          datasource.yaml: |
+            apiVersion: 1
+            datasources:
+              - name: Prometheus
+                type: prometheus
+                url: http://bke-monitoring:9090
+                access: proxy
+                isDefault: true
+                jsonData:
+                  cluster: "{{.ClusterName}}"
+                  imageRepo: "{{.Config.Cluster.ImageRepo.Domain}}"
+                  namespace: "{{.Namespace}}"
+
+  dependencies:
+    - name: kubernetes-master
+      phase: Install
+
+  upgradeStrategy:
+    mode: Parallel
+    failurePolicy: FailFast
+    timeout: "10m"
+```
+
+**执行流程**：
+```
+YamlComponentExecutor 执行:
+  │
+  ├─ 1. 下载外部 URL 清单
+  │     ├─ 从 URL 下载 crds.yaml
+  │     └─ 校验 checksum
+  │
+  ├─ 2. 模板渲染 (TemplateRenderer.RenderManifest)
+  │     ├─ 渲染外部 URL 清单中的模板变量:
+  │     │   └─ {{.Config.Cluster.ImageRepo.Domain}} → registry.example.com
+  │     ├─ 渲染内联 Resources manifest 中的模板变量:
+  │     │   ├─ {{.ClusterName}} → yaml-inline-cluster
+  │     │   ├─ {{.Namespace}} → default
+  │     │   └─ {{.Config.Cluster.ImageRepo.Domain}} → registry.example.com
+  │     └─ 无模板变量的内容快速跳过 (无 "{{" 时直接返回)
+  │
+  ├─ 3. 解析外部清单
+  │     ├─ 解析多文档 YAML（--- 分隔）
+  │     ├─ 转换为 unstructured.Unstructured 对象
+  │     └─ 得到: [CRD x N]
+  │
+  ├─ 4. 加载内联 Resources（cv.Spec.Resources[]）
+  │     ├─ ConfigMap/monitoring-config:
+  │     │   └─ provisionConfigMap(): 读取 Data 字段 → 创建 ConfigMap 对象
+  │     ├─ Secret/monitoring-credentials:
+  │     │   └─ provisionSecret(): 读取 StringData → 自动转 base64 → 创建 Secret 对象
+  │     ├─ ServiceMonitor/bke-monitoring-sm:
+  │     │   └─ provisionFromManifest(): 解析 Manifest YAML → 创建 unstructured 对象
+  │     ├─ Service/bke-monitoring:
+  │     │   └─ provisionFromManifest(): 解析 Manifest YAML → 创建 unstructured 对象
+  │     └─ ConfigMap/monitoring-grafana-datasource:
+  │         └─ provisionFromManifest(): 解析 Manifest YAML (已渲染模板) → 创建 unstructured 对象
+  │
+  ├─ 5. 合并所有资源
+  │     ├─ 外部清单: [CRD x N]
+  │     ├─ 内联 Resources: [ConfigMap x2, Secret, ServiceMonitor, Service]
+  │     ├─ 合并: [CRD x N, ConfigMap x2, Secret, ServiceMonitor, Service]
+  │     └─ 按 GVK 排序（CRD 优先）
+  │
+  ├─ 6. 应用到集群
+  │     ├─ 按策略应用: ServerSideApply
+  │     ├─ 创建命名空间: bke-monitoring
+  │     ├─ 应用 CRD（优先）
+  │     ├─ 应用 ConfigMap x2
+  │     ├─ 应用 Secret（自动 base64 编码）
+  │     ├─ 应用 ServiceMonitor
+  │     └─ 应用 Service
+  │
+  ├─ 7. 健康检查
+  │     ├─ PodReady 检查:
+  │     │   ├─ 查询 Pod: labelSelector="app.kubernetes.io/name=bke-monitoring"
+  │     │   ├─ 检查 Pod 状态: Ready
+  │     │   └─ 检查 Ready Pod 数量: >= minReady (1)
+  │     └─ 检查通过 → ✅
+  │
+  └─ 8. 更新状态
+        ├─ ComponentStatuses["bke-monitoring"] = {Version: "v0.72.0", Phase: "Installed"}
+        └─ 记录已应用的资源列表
+```
+
+**关键设计点**：
+- ✅ **三种内联模式**：Data（ConfigMap 结构化定义）、StringData（Secret 明文自动 base64）、Manifest（任意 Kind 原始 YAML）
+- ✅ **模板渲染**：外部 URL 清单和内联 manifest 字段均支持 `{{.ClusterName}}`、`{{.Config.Cluster.ImageRepo.Domain}}` 等模板变量，渲染引擎与 BinaryInstaller 共享（TemplateRenderer）
+- ✅ **外部 URL + 内联混合**：CRD 等大体资源通过 URL 下载，配置/密钥/自定义资源通过内联定义
+- ✅ **自动 base64 编码**：Secret 使用 `stringData` 字段，用户写明文，代码自动转为 `data`（base64），避免手动编码出错
+- ✅ **provisionResource 分发逻辑**：
+  - `Kind == ConfigMap` → 用 `data` 创建
+  - `Kind == Secret` → 用 `stringData` 创建（自动 base64）
+  - 其他 Kind → 用 `manifest` 创建
+- ✅ **标签自动注入**：`labels` 字段自动注入到创建的资源中，便于管理和 Prune
+- ✅ **ServerSideApply 策略**：增量更新，保留其他管理者的字段
+
+**与 1.5 的对比**：
+
+| 维度 | 1.5 openfuyao-core | 1.6 bke-monitoring |
+|------|-------------------|-------------------|
+| **清单来源** | 仅外部 URL（3 个文件） | 外部 URL（1 个 CRD）+ 内联 Resources（5 个） |
+| **内联模式** | Manifest（含模板变量） | Data + StringData + Manifest（含模板变量） |
+| **模板渲染** | ✅ 外部 URL + 内联 manifest | ✅ 外部 URL + 内联 manifest |
+| **Secret 管理** | 无 | `stringData` 明文定义，自动 base64 |
+| **自定义资源** | 无 | ServiceMonitor（Manifest 模式） |
+| **Prune** | ✅ 按 labelSelector | ❌ 未启用（可后续添加） |
+
+---
+
+### 1.7 多架构混合集群安装
 
 **场景**：新建集群，包含 amd64 和 arm64 混合节点，需要按架构下载对应制品。
 
