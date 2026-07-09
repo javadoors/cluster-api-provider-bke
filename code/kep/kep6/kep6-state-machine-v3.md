@@ -139,57 +139,78 @@ Reconciler (调谐器)
 
 ### 2.3 状态转换图
 
-```
-                    ┌──────────────┐
-                    │   Creating   │
-                    └──────┬───────┘
-                           │
-                           │ 所有节点 Ready + 所有集群级组件 Installed
-                           ▼
-                    ┌──────────────┐
-              ┌────►│   Running    │◄────┐
-              │     └──────┬───────┘     │
-              │            │             │
-              │            │ 触发升级     │ 升级完成
-              │            ▼             │
-              │     ┌──────────────┐    │
-              │     │  Upgrading   │────┘
-              │     └──────┬───────┘
-              │            │
-              │            │ 升级失败
-              │            ▼
-              │     ┌──────────────┐
-              │     │ RollingBack  │
-              │     └──────┬───────┘
-              │            │
-              │            │ 回滚完成
-              │            │
-              │            │ 触发扩容/缩容
-              │            ▼
-              │     ┌──────────────┐
-              └─────│   Scaling    │
-                    └──────────────┘
-                           │
-                           │ 任意状态失败
-                           ▼
-                    ┌──────────────┐
-                    │    Failed    │
-                    └──────────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> Creating
+    Creating --> Running : 所有节点 Ready + 所有集群级组件 Installed
+    Creating --> Failed : 失败
+    
+    Running --> Upgrading : 触发升级
+    Running --> Scaling : 触发扩容/缩容
+    Running --> Failed : 失败
+    
+    Upgrading --> Running : 升级完成
+    Upgrading --> RollingBack : 升级失败
+    Upgrading --> Failed : 失败
+    
+    RollingBack --> Running : 回滚完成
+    RollingBack --> Failed : 回滚失败
+    
+    Scaling --> Running : 扩容/缩容完成
+    Scaling --> Failed : 失败
+    
+    Failed --> Creating : 人工介入重试
+    Failed --> Running : 人工介入重试
+    Failed --> Upgrading : 人工介入重试
 ```
 
-### 2.4 升级进度追踪
+### 2.4 操作进度追踪
 
-升级进度通过 `UpgradeProgress` 追踪，整合到 `Upgrading` 状态：
+所有操作（安装、升级、扩容、缩容、回滚）的进度通过 `OperationProgress` 统一追踪：
 
 ```go
-type UpgradeProgress struct {
-    TargetVersion string
-    StartedAt     *metav1.Time
-    FinishedAt    *metav1.Time
-    LastError     string
-    Completed     []ComponentRecord
+type OperationType string
+
+const (
+    OperationInstall  OperationType = "Install"
+    OperationUpgrade  OperationType = "Upgrade"
+    OperationScale    OperationType = "Scale"
+    OperationRollback OperationType = "Rollback"
+)
+
+type OperationProgress struct {
+    // 操作类型
+    OperationType OperationType `json:"operationType"`
+    
+    // 目标版本
+    TargetVersion string `json:"targetVersion,omitempty"`
+    
+    // 开始时间
+    StartedAt *metav1.Time `json:"startedAt,omitempty"`
+    
+    // 完成时间
+    FinishedAt *metav1.Time `json:"finishedAt,omitempty"`
+    
+    // 最后错误
+    LastError string `json:"lastError,omitempty"`
+    
+    // 已完成组件列表
+    Completed []ComponentRecord `json:"completed,omitempty"`
+    
+    // 当前操作阶段
+    Phase string `json:"phase,omitempty"` // Installing/Upgrading/Scaling/RollingBack
 }
 ```
+
+**使用场景**：
+
+| 场景 | OperationType | Phase |
+|------|---------------|-------|
+| 集群安装 | `Install` | `Installing` |
+| 集群升级 | `Upgrade` | `Upgrading` |
+| 集群扩容 | `Scale` | `Scaling` |
+| 集群缩容 | `Scale` | `Scaling` |
+| 集群回滚 | `Rollback` | `RollingBack` |
 
 ---
 
@@ -208,76 +229,37 @@ type UpgradeProgress struct {
 | `Removed` | 节点已删除 |
 | `Failed` | 节点失败 |
 
-### 3.2 StateCode 位标记
+### 3.2 状态转换图
 
-StateCode 用于细粒度进度追踪（不是独立状态机）：
-
-| 位 | 标记名 | 说明 |
-|----|--------|------|
-| 0 | `NodeAgentPushedFlag` | Agent 已推送 |
-| 1 | `NodeAgentReadyFlag` | Agent 就绪 |
-| 2 | `NodeEnvFlag` | 环境已初始化 |
-| 3 | `NodeBootFlag` | 节点已启动 |
-| 4 | `NodeHAFlag` | 高可用已配置 |
-| 5 | `MasterInitFlag` | Master 已初始化 |
-| 6 | `NodeDeletingFlag` | 节点删除中 |
-| 7 | `NodeFailedFlag` | 节点失败 |
-| 8 | `NodeStateNeedRecord` | 状态需要记录 |
-| 9 | `NodePostProcessFlag` | 后处理已完成 |
-
-### 3.3 状态转换图
-
-```
-                    ┌──────────────┐
-                    │   Pending    │
-                    └──────┬───────┘
-                           │
-                           │ Agent 推送完成 + 环境初始化完成
-                           ▼
-                    ┌──────────────┐
-                    │ Provisioned  │
-                    └──────┬───────┘
-                           │
-                           │ 所有节点级组件 Installed
-                           ▼
-                    ┌──────────────┐
-              ┌────►│    Ready     │◄────┐
-              │     └──────┬───────┘     │
-              │            │             │
-              │            │ 触发升级     │ 升级完成
-              │            ▼             │
-              │     ┌──────────────┐    │
-              │     │  Upgrading   │────┘
-              │     └──────┬───────┘
-              │            │
-              │            │ 升级失败
-              │            ▼
-              │     ┌──────────────┐
-              │     │ RollingBack  │
-              │     └──────┬───────┘
-              │            │
-              │            │ 回滚完成
-              │            │
-              │            │ 触发删除
-              │            ▼
-              │     ┌──────────────┐
-              │     │   Deleting   │
-              │     └──────┬───────┘
-              │            │
-              │            │ 删除完成
-              │            ▼
-              │     ┌──────────────┐
-              └─────│   Removed    │
-                    └──────────────┘
-                           │
-                           │ 任意状态失败
-                           ▼
-                    ┌──────────────┐
-                    │    Failed    │
-                    └──────────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> Pending
+    Pending --> Provisioned : Agent 推送完成 + 环境初始化完成
+    Pending --> Failed : 失败
+    
+    Provisioned --> Ready : 所有节点级组件 Installed
+    Provisioned --> Failed : 失败
+    
+    Ready --> Upgrading : 触发升级
+    Ready --> Deleting : 触发删除
+    Ready --> Failed : 失败
+    
+    Upgrading --> Ready : 升级完成
+    Upgrading --> RollingBack : 升级失败
+    Upgrading --> Failed : 失败
+    
+    RollingBack --> Ready : 回滚完成
+    RollingBack --> Failed : 回滚失败
+    
+    Deleting --> Removed : 删除完成
+    Deleting --> Failed : 失败
+    
+    Failed --> Pending : 人工介入重试
+    Failed --> Provisioned : 人工介入重试
+    Failed --> Ready : 人工介入重试
 ```
 
-### 3.4 节点状态聚合规则
+### 3.3 节点状态聚合规则
 
 节点状态由所有节点级组件状态聚合：
 
@@ -346,54 +328,32 @@ func AggregateNodeState(nodeComponents []ComponentStatus) NodeState {
 
 ### 4.3 状态转换图
 
-```
-                    ┌──────────────┐
-                    │   Pending    │
-                    └──────┬───────┘
-                           │
-                           │ 开始安装
-                           ▼
-                    ┌──────────────┐
-              ┌────►│  Installing  │
-              │     └──────┬───────┘
-              │            │
-              │            │ 安装成功
-              │            ▼
-              │     ┌──────────────┐
-              │     │  Installed   │◄────┐
-              │     └──────┬───────┘     │
-              │            │             │
-              │            │ 触发升级     │ 升级完成
-              │            ▼             │
-              │     ┌──────────────┐    │
-              │     │  Upgrading   │────┘
-              │     └──────┬───────┘
-              │            │
-              │            │ 升级失败
-              │            ▼
-              │     ┌──────────────┐
-              │     │ RollingBack  │
-              │     └──────┬───────┘
-              │            │
-              │            │ 回滚完成
-              │            │
-              │            │ 触发卸载
-              │            ▼
-              │     ┌──────────────┐
-              │     │ Uninstalling │
-              │     └──────┬───────┘
-              │            │
-              │            │ 卸载完成
-              │            ▼
-              │     ┌──────────────┐
-              └─────│   Removed    │
-                    └──────────────┘
-                           │
-                           │ 任意状态失败
-                           ▼
-                    ┌──────────────┐
-                    │    Failed    │
-                    └──────────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> Pending
+    Pending --> Installing : 开始安装
+    Pending --> Failed : 失败
+    
+    Installing --> Installed : 安装成功
+    Installing --> Failed : 失败
+    
+    Installed --> Upgrading : 触发升级
+    Installed --> Uninstalling : 触发卸载
+    Installed --> Failed : 失败
+    
+    Upgrading --> Installed : 升级成功
+    Upgrading --> RollingBack : 升级失败
+    Upgrading --> Failed : 失败
+    
+    RollingBack --> Installed : 回滚成功
+    RollingBack --> Failed : 回滚失败
+    
+    Uninstalling --> Removed : 卸载成功
+    Uninstalling --> Failed : 失败
+    
+    Failed --> Installing : 重试
+    Failed --> Upgrading : 重试
+    Failed --> Uninstalling : 重试
 ```
 
 ### 4.4 聚合规则
@@ -460,27 +420,32 @@ func AggregateClusterStateFromComponents(
 
 ### 5.1 安装场景
 
+**状态字段说明**：
+
+| 字段 | 作用 | 示例值 |
+|------|------|--------|
+| `BKECluster.Status.Phase` | 集群生命周期阶段，反映集群整体状态 | Creating/Running/Upgrading/Scaling/RollingBack/Failed |
+| `BKECluster.Status.ClusterHealthState` | 集群健康状态，反映集群的健康程度 | Healthy/Unhealthy/Degraded |
+
+**状态转换时序**：
+
 ```
 T0: BKEClusterLifecycle = Creating
     BKECluster.Status.Phase = Creating
-    BKECluster.Status.ClusterStatus = Creating
+    OperationProgress.OperationType = Install
+    OperationProgress.Phase = Installing
 
 T1: BKENodeLifecycle = Pending (新节点加入)
     BKENode.State = Pending
-    BKENode.StateCode = 0
 
 T2: 节点级组件 Installing (containerd, bkeagent)
     ComponentLifecycle = Installing
-    BKENode.StateCode |= NodeAgentPushedFlag
 
 T3: 节点级组件 Installed
     ComponentLifecycle = Installed
-    BKENode.StateCode |= NodeAgentReadyFlag
     BKENode.State = Provisioned
 
 T4: 环境初始化完成
-    BKENode.StateCode |= NodeEnvFlag
-    BKENode.StateCode |= NodeBootFlag
     BKENode.State = Ready
 
 T5: 集群级组件 Installing (coredns, kube-proxy)
@@ -492,8 +457,8 @@ T6: 集群级组件 Installed
 T7: BKEClusterLifecycle = Running
     所有节点 Ready + 所有集群级组件 Installed
     BKECluster.Status.Phase = Running
-    BKECluster.Status.ClusterStatus = Ready
     BKECluster.Status.ClusterHealthState = Healthy
+    OperationProgress.FinishedAt = now
 ```
 
 ### 5.2 升级场景
@@ -501,8 +466,9 @@ T7: BKEClusterLifecycle = Running
 ```
 T0: BKEClusterLifecycle = Running → Upgrading
     BKECluster.Status.Phase = Upgrading
-    BKECluster.Status.ClusterStatus = Updating
-    UpgradeProgress.StartedAt = now
+    OperationProgress.OperationType = Upgrade
+    OperationProgress.Phase = Upgrading
+    OperationProgress.StartedAt = now
 
 T1: 节点级组件 Upgrading (containerd, bkeagent)
     ComponentLifecycle = Upgrading
@@ -511,20 +477,19 @@ T1: 节点级组件 Upgrading (containerd, bkeagent)
 T2: 节点级组件 Installed
     ComponentLifecycle = Installed
     BKENode.State = Ready
-    UpgradeProgress.Completed = append(...)
+    OperationProgress.Completed = append(...)
 
 T3: 集群级组件 Upgrading (coredns, kube-proxy)
     ComponentLifecycle = Upgrading
 
 T4: 集群级组件 Installed
     ComponentLifecycle = Installed
-    UpgradeProgress.Completed = append(...)
+    OperationProgress.Completed = append(...)
 
 T5: BKEClusterLifecycle = Upgrading → Running
     所有节点 Ready + 所有集群级组件 Installed
     BKECluster.Status.Phase = Running
-    BKECluster.Status.ClusterStatus = Ready
-    UpgradeProgress.FinishedAt = now
+    OperationProgress.FinishedAt = now
 ```
 
 ### 5.3 回滚场景
@@ -532,10 +497,12 @@ T5: BKEClusterLifecycle = Upgrading → Running
 ```
 T0: 升级失败
     ComponentLifecycle = Failed
-    UpgradeProgress.LastError = "upgrade failed"
+    OperationProgress.LastError = "upgrade failed"
 
 T1: BKEClusterLifecycle = Upgrading → RollingBack
     BKECluster.Status.Phase = RollingBack
+    OperationProgress.OperationType = Rollback
+    OperationProgress.Phase = RollingBack
 
 T2: 节点级组件 RollingBack (containerd, bkeagent)
     ComponentLifecycle = RollingBack
@@ -554,7 +521,7 @@ T5: 集群级组件 Installed
 T6: BKEClusterLifecycle = RollingBack → Running
     所有节点 Ready + 所有集群级组件 Installed
     BKECluster.Status.Phase = Running
-    UpgradeProgress.ResetForTarget(oldVersion)
+    OperationProgress.FinishedAt = now
 ```
 
 ### 5.4 扩容场景
@@ -562,6 +529,8 @@ T6: BKEClusterLifecycle = RollingBack → Running
 ```
 T0: BKEClusterLifecycle = Running → Scaling
     BKECluster.Status.Phase = Scaling
+    OperationProgress.OperationType = Scale
+    OperationProgress.Phase = Scaling
 
 T1: 新节点加入
     BKENodeLifecycle = Pending
@@ -569,7 +538,6 @@ T1: 新节点加入
 
 T2: 节点级组件 Installing (containerd, bkeagent)
     ComponentLifecycle = Installing
-    BKENode.StateCode |= NodeAgentPushedFlag
 
 T3: 节点级组件 Installed
     ComponentLifecycle = Installed
@@ -578,6 +546,7 @@ T3: 节点级组件 Installed
 T4: BKEClusterLifecycle = Scaling → Running
     所有节点 Ready + 所有集群级组件 Installed
     BKECluster.Status.Phase = Running
+    OperationProgress.FinishedAt = now
 ```
 
 ### 5.5 缩容场景
@@ -585,11 +554,12 @@ T4: BKEClusterLifecycle = Scaling → Running
 ```
 T0: BKEClusterLifecycle = Running → Scaling
     BKECluster.Status.Phase = Scaling
+    OperationProgress.OperationType = Scale
+    OperationProgress.Phase = Scaling
 
 T1: 节点标记删除
     BKENodeLifecycle = Ready → Deleting
     BKENode.State = Deleting
-    BKENode.StateCode |= NodeDeletingFlag
 
 T2: 节点级组件 Uninstalling (containerd, bkeagent)
     ComponentLifecycle = Uninstalling
@@ -603,6 +573,7 @@ T4: BKENodeLifecycle = Deleting → Removed
 T5: BKEClusterLifecycle = Scaling → Running
     所有节点 Ready + 所有集群级组件 Installed
     BKECluster.Status.Phase = Running
+    OperationProgress.FinishedAt = now
 ```
 
 ---
@@ -628,11 +599,11 @@ func (r *Reconciler) reconcileWithRetry(ctx context.Context, req ctrl.Request) (
     }
     
     // 检查是否需要重试
-    if cluster.Status.UpgradeProgress != nil && 
-       cluster.Status.UpgradeProgress.LastError != "" {
+    if cluster.Status.OperationProgress != nil && 
+       cluster.Status.OperationProgress.LastError != "" {
         // 已失败，检查重试次数
-        if cluster.Status.UpgradeProgress.LastFailure != nil &&
-           cluster.Status.UpgradeProgress.LastFailure.Attempt >= maxRetries {
+        if cluster.Status.OperationProgress.LastFailure != nil &&
+           cluster.Status.OperationProgress.LastFailure.Attempt >= maxRetries {
             // 达到最大重试次数，等待人工介入
             return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
         }
@@ -641,7 +612,7 @@ func (r *Reconciler) reconcileWithRetry(ctx context.Context, req ctrl.Request) (
         result, err := r.executeDAG(ctx, cluster)
         if err != nil {
             // 更新失败记录
-            cluster.Status.UpgradeProgress.MarkFailure(
+            cluster.Status.OperationProgress.MarkFailure(
                 componentName, version, err.Error(), metav1.Now())
             r.Status().Update(ctx, cluster)
             
@@ -664,15 +635,15 @@ func (r *Reconciler) reconcileWithRetry(ctx context.Context, req ctrl.Request) (
 |------|---------|---------|
 | 组件安装失败 | `ComponentLifecycle = Failed` | 指数退避，最多 3 次 |
 | 节点升级失败 | `BKENodeLifecycle = Failed` | 固定间隔 5 分钟，最多 5 次 |
-| 集群升级失败 | `UpgradeProgress.LastError != ""` | 指数退避，最多 3 次 |
+| 集群操作失败 | `OperationProgress.LastError != ""` | 指数退避，最多 3 次 |
 
 ### 6.2 幂等性保证
 
 ```go
 func (r *Reconciler) isIdempotent(ctx context.Context, cluster *confv1beta1.BKECluster) bool {
     // 检查组件是否已完成
-    if cluster.Status.UpgradeProgress != nil {
-        for _, component := range cluster.Status.UpgradeProgress.Completed {
+    if cluster.Status.OperationProgress != nil {
+        for _, component := range cluster.Status.OperationProgress.Completed {
             if component.Name == componentName && component.Version == version {
                 // 已完成，跳过
                 return true
@@ -707,7 +678,8 @@ kind: BKECluster
 metadata:
   name: my-cluster
 status:
-  upgradeProgress:
+  operationProgress:
+    operationType: Upgrade
     targetVersion: v2.6.0
     lastError: ""  # 清除错误
     lastFailure: null  # 清除失败记录
@@ -727,19 +699,19 @@ metadata:
 
 ```
 T0: 人工介入
-    清除 UpgradeProgress.LastError
-    清除 UpgradeProgress.LastFailure
+    清除 OperationProgress.LastError
+    清除 OperationProgress.LastFailure
 
 T1: Reconciler 检测到状态变更
-    检查 UpgradeProgress.TargetVersion
-    检查 UpgradeProgress.Completed
+    检查 OperationProgress.TargetVersion
+    检查 OperationProgress.Completed
 
 T2: 重新执行 DAG
     跳过已完成的组件
     从失败的组件继续执行
 
-T3: 升级完成
-    UpgradeProgress.FinishedAt = now
+T3: 操作完成
+    OperationProgress.FinishedAt = now
     BKEClusterLifecycle = Running
 ```
 
