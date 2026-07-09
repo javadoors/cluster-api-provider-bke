@@ -2095,6 +2095,245 @@ type Applier interface {
 }
 ```
 
+**Applier 接口实现**：
+
+```go
+// pkg/manifest/applier.go
+
+// DeleteComponent 删除组件资源（按 GVK 依赖逆序删除，IsNotFound 幂等）
+// 复用现有基础设施:
+// - kubeClient() 获取远端 client (与 ApplyComponent 对称)
+// - addonutil.SortUninstallUnstructuredByKind() GVK 逆序排序 (复用 Helm UninstallOrder)
+// - dynamic.Interface.Delete() 执行删除
+func (a *ClusterApplier) DeleteComponent(ctx context.Context, pkg *ComponentPackage) error {
+    if pkg == nil || len(pkg.Manifests) == 0 {
+        return nil
+    }
+
+    kubeClient, err := a.kubeClient()
+    if err != nil {
+        return fmt.Errorf("get kube client for delete %s: %w", pkg.Name, err)
+    }
+    clientset, dynamicClient := kubeClient.KubeClient()
+    if clientset == nil || dynamicClient == nil {
+        return fmt.Errorf("kube client not initialized for %s", pkg.Name)
+    }
+
+    // 1. 解析所有清单为 unstructured 对象
+    var resources []unstructured.Unstructured
+    for _, doc := range pkg.Manifests {
+        parsed, err := parseMultiDocYAML(doc)
+        if err != nil {
+            return fmt.Errorf("parse manifest for delete %s: %w", pkg.Name, err)
+        }
+        resources = append(resources, parsed...)
+    }
+    if len(resources) == 0 {
+        return nil
+    }
+
+    // 2. 按 GVK 依赖逆序排序 (复用 Helm UninstallOrder)
+    //    排序规则: Namespace → CRD → ... → Deployment → Service → ConfigMap → Secret → RBAC
+    //    实现: addonutil.SortUninstallUnstructuredByKind() 使用 releaseutil.UninstallOrder
+    resources = addonutil.SortUninstallUnstructuredByKind(resources)
+
+    // 3. 逐个删除资源
+    for _, res := range resources {
+        gvr, err := a.resolveGVR(clientset, res)
+        if err != nil {
+            a.logger.Warn("skip delete: cannot resolve GVR",
+                "kind", res.GetKind(), "name", res.GetName(), "error", err)
+            continue // 无法解析 GVR 时跳过，不阻塞后续删除
+        }
+
+        namespace := res.GetNamespace()
+        var dr dynamic.ResourceInterface
+        if namespace != "" {
+            dr = dynamicClient.Resource(gvr).Namespace(namespace)
+        } else {
+            dr = dynamicClient.Resource(gvr)
+        }
+
+        // 使用 DeletePropagationBackground: 删除请求立即返回，K8s 后台级联删除依赖资源
+        propagation := metav1.DeletePropagationBackground
+        err = dr.Delete(ctx, res.GetName(), metav1.DeleteOptions{
+            PropagationPolicy: &propagation,
+        })
+        if err != nil {
+            if apierrors.IsNotFound(err) {
+                // 资源不存在视为成功 (幂等)
+                continue
+            }
+            return fmt.Errorf("delete %s %s/%s: %w",
+                res.GetKind(), res.GetNamespace(), res.GetName(), err)
+        }
+    }
+
+    return nil
+}
+
+// PruneResources 裁剪不在当前清单中的资源
+// 流程:
+// 1. 按 label selector 列出目标集群中的资源
+// 2. 从 currentManifests 构建 wantSet (GVK + namespace + name)
+// 3. 删除 wantSet 之外的资源 (仅限 PruneableGVKs 安全范围)
+func (a *ClusterApplier) PruneResources(
+    ctx context.Context,
+    selector map[string]string,
+    namespace string,
+    currentManifests [][]byte,
+) error {
+    kubeClient, err := a.kubeClient()
+    if err != nil {
+        return fmt.Errorf("get kube client for prune: %w", err)
+    }
+    clientset, dynamicClient := kubeClient.KubeClient()
+    if clientset == nil || dynamicClient == nil {
+        return fmt.Errorf("kube client not initialized for prune")
+    }
+
+    // 1. 构建 wantSet: 当前清单中所有资源的 (GVK, namespace, name) 集合
+    wantSet := make(map[resourceKey]struct{})
+    for _, doc := range currentManifests {
+        resources, err := parseMultiDocYAML(doc)
+        if err != nil {
+            return fmt.Errorf("parse manifest for prune: %w", err)
+        }
+        for _, res := range resources {
+            key := resourceKey{
+                gvk:       res.GroupVersionKind(),
+                namespace: res.GetNamespace(),
+                name:      res.GetName(),
+            }
+            wantSet[key] = struct{}{}
+        }
+    }
+
+    // 2. 按 PruneableGVKs 逐类型列出集群中的资源
+    for _, gvk := range PruneableGVKs {
+        gvr, err := a.resolveGVR(clientset, unstructured.Unstructured{Object: map[string]interface{}{
+            "apiVersion": gvk.Group + "/" + gvk.Version,
+            "kind":       gvk.Kind,
+        }})
+        if err != nil {
+            continue // 目标集群不支持此 GVK，跳过
+        }
+
+        var list *unstructured.UnstructuredList
+        if namespace != "" {
+            list, err = dynamicClient.Resource(gvr).Namespace(namespace).List(ctx, metav1.ListOptions{
+                LabelSelector: labels.Set(selector).String(),
+            })
+        } else {
+            list, err = dynamicClient.Resource(gvr).List(ctx, metav1.ListOptions{
+                LabelSelector: labels.Set(selector).String(),
+            })
+        }
+        if err != nil {
+            if apierrors.IsNotFound(err) {
+                continue
+            }
+            return fmt.Errorf("list resources for prune (GVK %s): %w", gvk, err)
+        }
+
+        // 3. 删除不在 wantSet 中的资源
+        for i := range list.Items {
+            item := &list.Items[i]
+            key := resourceKey{
+                gvk:       item.GroupVersionKind(),
+                namespace: item.GetNamespace(),
+                name:      item.GetName(),
+            }
+            if _, wanted := wantSet[key]; wanted {
+                continue // 在当前清单中，保留
+            }
+
+            // 删除多余资源
+            var dr dynamic.ResourceInterface
+            if item.GetNamespace() != "" {
+                dr = dynamicClient.Resource(gvr).Namespace(item.GetNamespace())
+            } else {
+                dr = dynamicClient.Resource(gvr)
+            }
+            propagation := metav1.DeletePropagationBackground
+            if err := dr.Delete(ctx, item.GetName(), metav1.DeleteOptions{
+                PropagationPolicy: &propagation,
+            }); err != nil && !apierrors.IsNotFound(err) {
+                return fmt.Errorf("prune %s %s/%s: %w",
+                    item.GetKind(), item.GetNamespace(), item.GetName(), err)
+            }
+        }
+    }
+
+    return nil
+}
+
+// resourceKey 资源唯一标识 (用于 wantSet 比对)
+type resourceKey struct {
+    gvk       schema.GroupVersionKind
+    namespace string
+    name      string
+}
+
+// PruneableGVKs 可裁剪的资源类型 (安全范围，避免误删 CRD 等核心资源)
+var PruneableGVKs = []schema.GroupVersionKind{
+    {Group: "", Version: "v1", Kind: "ConfigMap"},
+    {Group: "", Version: "v1", Kind: "Secret"},
+    {Group: "", Version: "v1", Kind: "Service"},
+    {Group: "", Version: "v1", Kind: "ServiceAccount"},
+    {Group: "apps", Version: "v1", Kind: "Deployment"},
+    {Group: "apps", Version: "v1", Kind: "DaemonSet"},
+    {Group: "apps", Version: "v1", Kind: "StatefulSet"},
+    {Group: "batch", Version: "v1", Kind: "Job"},
+    {Group: "batch", Version: "v1", Kind: "CronJob"},
+    {Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "Role"},
+    {Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "RoleBinding"},
+    {Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "ClusterRole"},
+    {Group: "rbac.authorization.k8s.io", Version: "v1", Kind: "ClusterRoleBinding"},
+    {Group: "networking.k8s.io", Version: "v1", Kind: "Ingress"},
+    {Group: "policy", Version: "v1", Kind: "PodDisruptionBudget"},
+}
+
+// parseMultiDocYAML 解析多文档 YAML 为 unstructured 对象列表
+// 复用 pkg/kube/yaml.go 中的解析逻辑
+func parseMultiDocYAML(data []byte) ([]unstructured.Unstructured, error) {
+    var resources []unstructured.Unstructured
+    decoder := yaml.NewYAMLOrJSONDecoder(bytes.NewReader(data), 4096)
+    for {
+        var obj unstructured.Unstructured
+        err := decoder.Decode(&obj)
+        if err == io.EOF {
+            break
+        }
+        if err != nil {
+            return nil, fmt.Errorf("parse YAML document: %w", err)
+        }
+        if obj.Object == nil {
+            continue // 跳过空文档
+        }
+        resources = append(resources, obj)
+    }
+    return resources, nil
+}
+
+// resolveGVR 从 GVK 解析 GVR (GroupVersionResource)
+// 复用 restmapper 发现 API 资源
+func (a *ClusterApplier) resolveGVR(
+    clientset kubernetes.Interface,
+    res unstructured.Unstructured,
+) (schema.GroupVersionResource, error) {
+    gvk := res.GroupVersionKind()
+    restMapper := restmapper.NewDeferredDiscoveryRESTMapper(
+        memory.NewMemCacheClient(clientset.Discovery()),
+    )
+    mapping, err := restMapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+    if err != nil {
+        return schema.GroupVersionResource{}, fmt.Errorf("resolve GVR for %s: %w", gvk, err)
+    }
+    return mapping.Resource, nil
+}
+```
+
 **设计说明**：
 
 | 设计点 | 说明 |
