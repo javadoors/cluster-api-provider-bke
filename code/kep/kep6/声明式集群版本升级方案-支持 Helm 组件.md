@@ -30,7 +30,14 @@
    - 5.4 健康检查
    - 5.5 YAML Uninstall 流程
 6. [HealthCheck 共享包设计](#6-healthcheck-共享包设计)
-   - 6.1 类型定义
+    - 6.1 类型定义
+    - 6.2 ClusterHealthState 状态重构
+        - 6.2.1 问题分析
+        - 6.2.2 设计方案
+        - 6.2.3 核心组件设计
+        - 6.2.4 状态转换图
+        - 6.2.5 实施步骤
+        - 6.2.6 测试设计
 7. [模板变量系统与 TemplateContext 详细设计](#7-模板变量系统与-templatecontext-详细设计)
    - 7.1 TemplateContext 扩展策略
    - 7.2 模板变量系统
@@ -2603,6 +2610,976 @@ type EndpointReadyCheckSpec struct {
 type CustomCheckSpec struct {
     // 检查命令 (在控制器 Pod 中执行, 退出码 0=通过, 如 "curl -s http://.../healthz")
     Command string `json:"command"`
+}
+```
+
+### 6.2 ClusterHealthState 状态重构
+
+**设计思路 — 基于组件状态的集群健康状态计算**：
+
+当前 `ClusterHealthState` 基于操作类型（Deploy/Upgrade/Manage）设置，无法反映实际健康状态。本方案引入 `ClusterHealthCalculator` 和 `ComponentHealthChecker`，基于组件状态计算集群健康状态，替代当前基于操作类型的简单状态设置。
+
+**作用范围**：
+
+- ✅ `BKEClusterReconciler`：在 Reconcile 流程中计算集群健康状态
+- ✅ `NodeHealthChecker`：检查节点健康状态
+- ✅ `HelmHealthChecker`：检查 Helm Release 健康状态
+- ✅ `YAMLHealthChecker`：检查 YAML 资源健康状态
+
+**与组件级健康检查的关系**：组件级健康检查（6.1）用于单个组件的就绪检查；集群级健康状态（6.2）基于所有组件的健康状态聚合计算集群整体健康状态。
+
+#### 6.2.1 问题分析
+
+**当前实现的问题**：
+
+1. **基于操作类型而非实际健康状态**
+
+当前逻辑（`bkecluster_controller.go:757-775`）：
+
+```go
+func (r *BKEClusterReconciler) setClusterHealthStatus(
+    bkeCluster *bkev1beta1.BKECluster, 
+    flags ClusterHealthStatusFlags,
+) {
+    // 首次部署设置为正在部署
+    if flags.DeployFlag || flags.DeployFailedFlag {
+        markBKEClusterHealthyStatus(bkeCluster, bkev1beta1.Deploying)
+    }
+    // 需要升级集群设置为正在升级
+    if flags.UpgradeFlag || flags.UpgradeFailedFlag {
+        markBKEClusterHealthyStatus(bkeCluster, bkev1beta1.Upgrading)
+    }
+    // 需要纳管集群设置为正在纳管
+    if flags.ManageFlag || flags.ManageFailedFlag {
+        markBKEClusterHealthyStatus(bkeCluster, bkev1beta1.Managing)
+    }
+    // 删除集群
+    if phaseutil.IsDeleteOrReset(bkeCluster) {
+        markBKEClusterHealthyStatus(bkeCluster, bkev1beta1.Deleting)
+    }
+}
+```
+
+**问题**：
+- ❌ 基于操作类型（Deploy/Upgrade/Manage）而非实际健康状态
+- ❌ 无法反映部分组件健康、部分组件不健康的情况
+- ❌ 无法区分"正在升级"和"升级失败但部分成功"
+- ❌ 没有考虑 DAG 调度中的组件级状态
+
+2. **标志位计算过于简单**
+
+当前逻辑（`bkecluster_controller.go:620-641`）：
+
+```go
+func (r *BKEClusterReconciler) getNodeFlags(
+    ctx context.Context, 
+    bkeCluster *bkev1beta1.BKECluster,
+) (bool, bool, bool) {
+    // 是否是初次部署
+    deployFlag := nodeCount == 0
+    
+    // 是否需要升级集群
+    upgradeFlag := phaseutil.GetNeedUpgradeNodesWithBKENodes(bkeCluster, bkeNodes).Length() > 0
+    
+    // 是否需要纳管集群
+    manageFlag := clusterutil.IsBocloudCluster(bkeCluster) && !clusterutil.FullyControlled(bkeCluster)
+    
+    return deployFlag, upgradeFlag, manageFlag
+}
+```
+
+**问题**：
+- ❌ `deployFlag` 仅基于节点数量，不考虑组件状态
+- ❌ `upgradeFlag` 仅检查是否需要升级，不考虑升级进度
+- ❌ 没有考虑 Helm/YAML 组件的健康状态
+
+3. **健康状态设置时机不当**
+
+**当前逻辑**：
+- 在 `initNodeStatus()` 中设置（`bkecluster_controller.go:496`）
+- 在 Phase 执行前设置，无法反映执行后的实际状态
+
+**问题**：
+- ❌ 无法反映 DAG 执行后的实际健康状态
+- ❌ 无法反映组件级健康检查结果
+
+**需要解决的问题**：
+
+1. **如何检查节点健康状态？**
+   - 检查 NodeState（Ready/Failed/Upgrading）
+   - 检查 StateCode 标志位
+   - 检查 bkeagent 连接状态
+
+2. **如何检查 Helm Release 健康状态？**
+   - 检查 Release.Status（Deployed/Failed/PendingInstall）
+   - 检查 Pod 状态（Ready/Running）
+   - 检查 Deployment 状态（Available/Progressing）
+
+3. **如何检查 YAML 资源健康状态？**
+   - 检查资源状态（Available/Progressing/Degraded）
+   - 检查 Pod 状态
+   - 检查 Endpoint 状态
+
+4. **如何聚合组件健康状态？**
+   - 全部健康 → Healthy
+   - 部分失败 → Unhealthy
+   - 部分进行中 → Upgrading/Deploying
+   - 未知状态 → Unknown
+
+#### 6.2.2 设计方案
+
+**架构设计**：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    BKEClusterReconciler                          │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             │ 调用
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                ClusterHealthCalculator                           │
+│  - CalculateHealthState(ctx, bkeCluster)                        │
+│  - checkNodeHealth(ctx, nodes)                                  │
+│  - checkHelmHealth(ctx, releases)                               │
+│  - checkYAMLHealth(ctx, resources)                              │
+│  - aggregateResults(results)                                    │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+               ┌──────────────┼──────────────┐
+               │              │              │
+               ▼              ▼              ▼
+┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐
+│ NodeHealthChecker│ │HelmHealthChecker │ │YAMLHealthChecker │
+│  - CheckNode()   │ │ - CheckRelease() │ │ - CheckResource()│
+└──────────────────┘ └──────────────────┘ └──────────────────┘
+```
+
+**核心接口设计**：
+
+```go
+// ClusterHealthCalculator 集群健康状态计算器
+type ClusterHealthCalculator interface {
+    // CalculateHealthState 计算集群健康状态
+    CalculateHealthState(
+        ctx context.Context,
+        bkeCluster *bkev1beta1.BKECluster,
+    ) (confv1beta1.ClusterHealthState, error)
+}
+
+// ComponentHealthChecker 组件健康检查器
+type ComponentHealthChecker interface {
+    // CheckHealth 检查组件健康状态
+    CheckHealth(ctx context.Context) (*HealthCheckResult, error)
+}
+
+// HealthCheckResult 健康检查结果
+type HealthCheckResult struct {
+    Component string
+    Healthy   bool
+    Status    string
+    Message   string
+    Error     error
+}
+```
+
+**健康状态计算流程**：
+
+```
+1. 检查是否正在删除
+   └─ if IsDeleteOrReset(): return Deleting
+
+2. 检查声明式升级状态
+   └─ if DeclarativeUpgrade != nil:
+        ├─ if FinishedAt == nil && LastError != "": return UpgradeFailed
+        ├─ if FinishedAt == nil: return Upgrading
+        └─ if FinishedAt != nil && LastError == "": return Healthy
+
+3. 检查组件健康状态
+   ├─ 检查所有节点状态
+   ├─ 检查所有 Helm Release 状态
+   └─ 检查所有 YAML 资源状态
+
+4. 聚合健康状态
+   ├─ if AllHealthy: return Healthy
+   ├─ if AnyFailed: return Unhealthy
+   ├─ if AnyUpgrading: return Upgrading
+   ├─ if AnyDeploying: return Deploying
+   └─ else: return Unknown
+```
+
+#### 6.2.3 核心组件设计
+
+**ClusterHealthCalculator**：
+
+```go
+// pkg/healthcheck/calculator.go
+
+package healthcheck
+
+import (
+    "context"
+    "fmt"
+
+    bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
+    "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
+    "sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+// ClusterHealthCalculator 集群健康状态计算器
+type ClusterHealthCalculator struct {
+    client      client.Client
+    nodeChecker *NodeHealthChecker
+    helmChecker *HelmHealthChecker
+    yamlChecker *YAMLHealthChecker
+}
+
+// NewClusterHealthCalculator 创建健康状态计算器
+func NewClusterHealthCalculator(client client.Client) *ClusterHealthCalculator {
+    return &ClusterHealthCalculator{
+        client:      client,
+        nodeChecker: NewNodeHealthChecker(client),
+        helmChecker: NewHelmHealthChecker(client),
+        yamlChecker: NewYAMLHealthChecker(client),
+    }
+}
+
+// CalculateHealthState 计算集群健康状态
+func (c *ClusterHealthCalculator) CalculateHealthState(
+    ctx context.Context,
+    bkeCluster *bkev1beta1.BKECluster,
+) (bkev1beta1.ClusterHealthState, error) {
+    
+    // 1. 检查是否正在删除
+    if phaseutil.IsDeleteOrReset(bkeCluster) {
+        return bkev1beta1.Deleting, nil
+    }
+    
+    // 2. 检查声明式升级状态
+    if healthState, shouldReturn := c.checkDeclarativeUpgrade(bkeCluster); shouldReturn {
+        return healthState, nil
+    }
+    
+    // 3. 检查组件健康状态
+    results, err := c.checkAllComponents(ctx, bkeCluster)
+    if err != nil {
+        return bkev1beta1.Unhealthy, err
+    }
+    
+    // 4. 聚合健康状态
+    return c.aggregateResults(results), nil
+}
+
+// checkDeclarativeUpgrade 检查声明式升级状态
+func (c *ClusterHealthCalculator) checkDeclarativeUpgrade(
+    bkeCluster *bkev1beta1.BKECluster,
+) (bkev1beta1.ClusterHealthState, bool) {
+    
+    if bkeCluster.Status.DeclarativeUpgrade == nil {
+        return "", false
+    }
+    
+    upgrade := bkeCluster.Status.DeclarativeUpgrade
+    
+    // 升级进行中
+    if upgrade.FinishedAt == nil {
+        if upgrade.LastError != "" {
+            return bkev1beta1.UpgradeFailed, true
+        }
+        return bkev1beta1.Upgrading, true
+    }
+    
+    // 升级完成
+    if upgrade.LastError == "" {
+        return bkev1beta1.Healthy, true
+    }
+    
+    return "", false
+}
+
+// checkAllComponents 检查所有组件健康状态
+func (c *ClusterHealthCalculator) checkAllComponents(
+    ctx context.Context,
+    bkeCluster *bkev1beta1.BKECluster,
+) ([]*HealthCheckResult, error) {
+    
+    results := make([]*HealthCheckResult, 0)
+    
+    // 1. 检查节点状态
+    nodeResults, err := c.nodeChecker.CheckAllNodes(ctx, bkeCluster)
+    if err != nil {
+        return nil, fmt.Errorf("check nodes: %w", err)
+    }
+    results = append(results, nodeResults...)
+    
+    // 2. 检查 Helm Release 状态
+    helmResults, err := c.helmChecker.CheckAllReleases(ctx, bkeCluster)
+    if err != nil {
+        return nil, fmt.Errorf("check helm releases: %w", err)
+    }
+    results = append(results, helmResults...)
+    
+    // 3. 检查 YAML 资源状态
+    yamlResults, err := c.yamlChecker.CheckAllResources(ctx, bkeCluster)
+    if err != nil {
+        return nil, fmt.Errorf("check yaml resources: %w", err)
+    }
+    results = append(results, yamlResults...)
+    
+    return results, nil
+}
+
+// aggregateResults 聚合健康检查结果
+func (c *ClusterHealthCalculator) aggregateResults(
+    results []*HealthCheckResult,
+) bkev1beta1.ClusterHealthState {
+    
+    if len(results) == 0 {
+        return bkev1beta1.Unknown
+    }
+    
+    allHealthy := true
+    anyFailed := false
+    anyUpgrading := false
+    anyDeploying := false
+    
+    for _, result := range results {
+        if !result.Healthy {
+            allHealthy = false
+            
+            if result.Error != nil {
+                anyFailed = true
+            }
+            
+            if result.Status == "Upgrading" {
+                anyUpgrading = true
+            }
+            
+            if result.Status == "Deploying" {
+                anyDeploying = true
+            }
+        }
+    }
+    
+    if allHealthy {
+        return bkev1beta1.Healthy
+    }
+    
+    if anyFailed {
+        return bkev1beta1.Unhealthy
+    }
+    
+    if anyUpgrading {
+        return bkev1beta1.Upgrading
+    }
+    
+    if anyDeploying {
+        return bkev1beta1.Deploying
+    }
+    
+    return bkev1beta1.Unknown
+}
+```
+
+**NodeHealthChecker**：
+
+```go
+// pkg/healthcheck/node_checker.go
+
+package healthcheck
+
+import (
+    "context"
+    "fmt"
+
+    bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
+    "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
+    "sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+// NodeHealthChecker 节点健康检查器
+type NodeHealthChecker struct {
+    client client.Client
+}
+
+// NewNodeHealthChecker 创建节点健康检查器
+func NewNodeHealthChecker(client client.Client) *NodeHealthChecker {
+    return &NodeHealthChecker{client: client}
+}
+
+// CheckAllNodes 检查所有节点健康状态
+func (c *NodeHealthChecker) CheckAllNodes(
+    ctx context.Context,
+    bkeCluster *bkev1beta1.BKECluster,
+) ([]*HealthCheckResult, error) {
+    
+    // 获取所有节点
+    bkeNodes, err := phaseutil.GetBKENodesWrapperForCluster(ctx, bkeCluster)
+    if err != nil {
+        return nil, fmt.Errorf("get nodes: %w", err)
+    }
+    
+    results := make([]*HealthCheckResult, 0, len(bkeNodes))
+    
+    for _, node := range bkeNodes {
+        result := c.checkNode(node)
+        results = append(results, result)
+    }
+    
+    return results, nil
+}
+
+// checkNode 检查单个节点健康状态
+func (c *NodeHealthChecker) checkNode(node *bkev1beta1.BKENode) *HealthCheckResult {
+    result := &HealthCheckResult{
+        Component: fmt.Sprintf("node/%s", node.Spec.IP),
+    }
+    
+    // 检查节点状态
+    switch node.Status.State {
+    case bkev1beta1.NodeReady:
+        result.Healthy = true
+        result.Status = "Ready"
+        result.Message = "Node is ready"
+        
+    case bkev1beta1.NodeFailed:
+        result.Healthy = false
+        result.Status = "Failed"
+        result.Message = node.Status.Message
+        result.Error = fmt.Errorf("node failed: %s", node.Status.Message)
+        
+    case bkev1beta1.NodeUpgrading:
+        result.Healthy = false
+        result.Status = "Upgrading"
+        result.Message = "Node is upgrading"
+        
+    case bkev1beta1.NodeBootStrapping:
+        result.Healthy = false
+        result.Status = "Deploying"
+        result.Message = "Node is bootstrapping"
+        
+    case bkev1beta1.NodeNotReady:
+        result.Healthy = false
+        result.Status = "NotReady"
+        result.Message = "Node is not ready"
+        result.Error = fmt.Errorf("node not ready")
+        
+    default:
+        result.Healthy = false
+        result.Status = "Unknown"
+        result.Message = fmt.Sprintf("Unknown state: %s", node.Status.State)
+        result.Error = fmt.Errorf("unknown node state: %s", node.Status.State)
+    }
+    
+    // 检查 StateCode 标志位
+    if node.Status.StateCode&bkev1beta1.NodeFailedFlag != 0 {
+        result.Healthy = false
+        result.Status = "Failed"
+        result.Message = "Node has failed flag"
+        result.Error = fmt.Errorf("node has failed flag")
+    }
+    
+    if node.Status.StateCode&bkev1beta1.NodeDeletingFlag != 0 {
+        result.Healthy = false
+        result.Status = "Deleting"
+        result.Message = "Node is deleting"
+    }
+    
+    return result
+}
+```
+
+**HelmHealthChecker**：
+
+```go
+// pkg/healthcheck/helm_checker.go
+
+package healthcheck
+
+import (
+    "context"
+    "fmt"
+
+    bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
+    "helm.sh/helm/v3/pkg/action"
+    "helm.sh/helm/v3/pkg/cli"
+    "sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+// HelmHealthChecker Helm Release 健康检查器
+type HelmHealthChecker struct {
+    client client.Client
+}
+
+// NewHelmHealthChecker 创建 Helm 健康检查器
+func NewHelmHealthChecker(client client.Client) *HelmHealthChecker {
+    return &HelmHealthChecker{client: client}
+}
+
+// CheckAllReleases 检查所有 Helm Release 健康状态
+func (c *HelmHealthChecker) CheckAllReleases(
+    ctx context.Context,
+    bkeCluster *bkev1beta1.BKECluster,
+) ([]*HealthCheckResult, error) {
+    
+    results := make([]*HealthCheckResult, 0)
+    
+    // 检查所有 addon
+    for _, addon := range bkeCluster.Spec.ClusterConfig.Cluster.Addons {
+        if addon.Type != "chart" {
+            continue
+        }
+        
+        result, err := c.checkRelease(ctx, addon)
+        if err != nil {
+            return nil, fmt.Errorf("check release %s: %w", addon.Name, err)
+        }
+        
+        results = append(results, result)
+    }
+    
+    return results, nil
+}
+
+// checkRelease 检查单个 Helm Release 健康状态
+func (c *HelmHealthChecker) checkRelease(
+    ctx context.Context,
+    addon bkev1beta1.Product,
+) (*HealthCheckResult, error) {
+    
+    result := &HealthCheckResult{
+        Component: fmt.Sprintf("helm/%s", addon.ReleaseName),
+    }
+    
+    // 初始化 Helm action configuration
+    settings := cli.New()
+    actionConfig := new(action.Configuration)
+    
+    namespace := addon.Namespace
+    if namespace == "" {
+        namespace = "default"
+    }
+    
+    if err := actionConfig.Init(
+        settings.RESTClientGetter(),
+        namespace,
+        "secret",
+        func(format string, v ...interface{}) {},
+    ); err != nil {
+        return nil, fmt.Errorf("init action config: %w", err)
+    }
+    
+    // 获取 Release 状态
+    statusClient := action.NewStatus(actionConfig)
+    release, err := statusClient.Run(addon.ReleaseName)
+    if err != nil {
+        result.Healthy = false
+        result.Status = "NotFound"
+        result.Message = fmt.Sprintf("Release not found: %v", err)
+        result.Error = err
+        return result, nil
+    }
+    
+    // 检查 Release 状态
+    switch release.Info.Status {
+    case "deployed":
+        result.Healthy = true
+        result.Status = "Deployed"
+        result.Message = "Release is deployed"
+        
+    case "failed":
+        result.Healthy = false
+        result.Status = "Failed"
+        result.Message = release.Info.Description
+        result.Error = fmt.Errorf("release failed: %s", release.Info.Description)
+        
+    case "pending-install", "pending-upgrade", "pending-rollback":
+        result.Healthy = false
+        result.Status = "Pending"
+        result.Message = fmt.Sprintf("Release is %s", release.Info.Status)
+        
+    case "uninstalling":
+        result.Healthy = false
+        result.Status = "Uninstalling"
+        result.Message = "Release is uninstalling"
+        
+    case "superseded":
+        result.Healthy = false
+        result.Status = "Superseded"
+        result.Message = "Release is superseded"
+        
+    case "uninstalled":
+        result.Healthy = false
+        result.Status = "Uninstalled"
+        result.Message = "Release is uninstalled"
+        
+    default:
+        result.Healthy = false
+        result.Status = "Unknown"
+        result.Message = fmt.Sprintf("Unknown status: %s", release.Info.Status)
+        result.Error = fmt.Errorf("unknown release status: %s", release.Info.Status)
+    }
+    
+    return result, nil
+}
+```
+
+**YAMLHealthChecker**：
+
+```go
+// pkg/healthcheck/yaml_checker.go
+
+package healthcheck
+
+import (
+    "context"
+    "fmt"
+
+    bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
+    appsv1 "k8s.io/api/apps/v1"
+    corev1 "k8s.io/api/core/v1"
+    "k8s.io/apimachinery/pkg/api/errors"
+    "k8s.io/apimachinery/pkg/types"
+    "sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+// YAMLHealthChecker YAML 资源健康检查器
+type YAMLHealthChecker struct {
+    client client.Client
+}
+
+// NewYAMLHealthChecker 创建 YAML 健康检查器
+func NewYAMLHealthChecker(client client.Client) *YAMLHealthChecker {
+    return &YAMLHealthChecker{client: client}
+}
+
+// CheckAllResources 检查所有 YAML 资源健康状态
+func (c *YAMLHealthChecker) CheckAllResources(
+    ctx context.Context,
+    bkeCluster *bkev1beta1.BKECluster,
+) ([]*HealthCheckResult, error) {
+    
+    results := make([]*HealthCheckResult, 0)
+    
+    // 检查所有 addon
+    for _, addon := range bkeCluster.Spec.ClusterConfig.Cluster.Addons {
+        if addon.Type != "yaml" {
+            continue
+        }
+        
+        result, err := c.checkResource(ctx, addon)
+        if err != nil {
+            return nil, fmt.Errorf("check resource %s: %w", addon.Name, err)
+        }
+        
+        results = append(results, result)
+    }
+    
+    return results, nil
+}
+
+// checkResource 检查单个 YAML 资源健康状态
+func (c *YAMLHealthChecker) checkResource(
+    ctx context.Context,
+    addon bkev1beta1.Product,
+) (*HealthCheckResult, error) {
+    
+    result := &HealthCheckResult{
+        Component: fmt.Sprintf("yaml/%s", addon.Name),
+    }
+    
+    // 检查 Deployment 状态
+    deployment := &appsv1.Deployment{}
+    err := c.client.Get(ctx, types.NamespacedName{
+        Name:      addon.Name,
+        Namespace: addon.Namespace,
+    }, deployment)
+    
+    if err != nil {
+        if errors.IsNotFound(err) {
+            result.Healthy = false
+            result.Status = "NotFound"
+            result.Message = "Deployment not found"
+            result.Error = err
+            return result, nil
+        }
+        return nil, fmt.Errorf("get deployment: %w", err)
+    }
+    
+    // 检查 Deployment 状态
+    if deployment.Status.AvailableReplicas == *deployment.Spec.Replicas {
+        result.Healthy = true
+        result.Status = "Available"
+        result.Message = "Deployment is available"
+    } else if deployment.Status.UnavailableReplicas > 0 {
+        result.Healthy = false
+        result.Status = "Progressing"
+        result.Message = "Deployment is progressing"
+    } else {
+        result.Healthy = false
+        result.Status = "Degraded"
+        result.Message = "Deployment is degraded"
+        result.Error = fmt.Errorf("deployment degraded")
+    }
+    
+    return result, nil
+}
+```
+
+#### 6.2.4 状态转换图
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                ClusterHealthState 状态转换图                     │
+└─────────────────────────────────────────────────────────────────┘
+
+                         ┌──────────────┐
+                         │   Unknown    │
+                         └──────┬───────┘
+                                │
+                    ┌───────────┴───────────┐
+                    │                       │
+                    ▼                       ▼
+          ┌─────────────────┐     ┌─────────────────┐
+          │   Deploying     │     │   Upgrading     │
+          └────────┬────────┘     └────────┬────────┘
+                   │                       │
+         ┌─────────┴─────────┐             │
+         │                   │             │
+         ▼                   ▼             ▼
+┌─────────────────┐ ┌─────────────────┐ ┌──────────────┐
+│     Healthy     │ │  UpgradeFailed  │ │   Unhealthy  │
+└────────┬────────┘ └────────┬────────┘ └──────────────┘
+         │                   │
+         │         ┌─────────┴─────────┐
+         │         │                   │
+         │         ▼                   ▼
+         │  ┌─────────────┐   ┌──────────────┐
+         │  │    Retry    │   │   Deleting   │
+         │  └──────┬──────┘   └──────────────┘
+         │         │
+         │         ▼
+         │  ┌─────────────┐
+         └─►│   Healthy   │
+            └─────────────┘
+
+状态转换规则：
+  Unknown → Deploying (首次部署)
+  Unknown → Upgrading (声明式升级)
+  Deploying → Healthy (所有组件健康)
+  Deploying → Unhealthy (组件失败)
+  Upgrading → Healthy (升级完成)
+  Upgrading → UpgradeFailed (升级失败)
+  UpgradeFailed → Upgrading (重试)
+  Healthy → Upgrading (新升级)
+  Healthy → Deleting (删除)
+```
+
+#### 6.2.5 实施步骤
+
+**阶段 1：核心组件实现（1-2 周）**
+
+1. 创建 `pkg/healthcheck/calculator.go`
+   - 实现 `ClusterHealthCalculator` 接口
+   - 实现 `CalculateHealthState` 方法
+   - 实现 `checkDeclarativeUpgrade` 方法
+   - 实现 `aggregateResults` 方法
+
+2. 创建 `pkg/healthcheck/node_checker.go`
+   - 实现 `NodeHealthChecker` 接口
+   - 实现 `CheckAllNodes` 方法
+   - 实现 `checkNode` 方法
+
+3. 创建 `pkg/healthcheck/helm_checker.go`
+   - 实现 `HelmHealthChecker` 接口
+   - 实现 `CheckAllReleases` 方法
+   - 实现 `checkRelease` 方法
+
+4. 创建 `pkg/healthcheck/yaml_checker.go`
+   - 实现 `YAMLHealthChecker` 接口
+   - 实现 `CheckAllResources` 方法
+   - 实现 `checkResource` 方法
+
+**阶段 2：集成到控制器（1 周）**
+
+1. 在 `BKEClusterReconciler` 中注入 `ClusterHealthCalculator`
+2. 替换 `setClusterHealthStatus` 逻辑
+3. 在 DAG 执行后调用健康检查
+4. 添加错误处理和日志
+
+**阶段 3：测试与优化（1 周）**
+
+1. 编写单元测试
+2. 编写集成测试
+3. 性能优化（缓存、并发）
+4. 错误处理优化
+
+**阶段 4：文档与发布（1 周）**
+
+1. 编写用户文档
+2. 编写开发文档
+3. 代码审查
+4. 发布
+
+#### 6.2.6 测试设计
+
+**单元测试**：
+
+```go
+// pkg/healthcheck/calculator_test.go
+
+func TestCalculateHealthState(t *testing.T) {
+    tests := []struct {
+        name     string
+        cluster  *bkev1beta1.BKECluster
+        expected bkev1beta1.ClusterHealthState
+    }{
+        {
+            name: "deleting cluster",
+            cluster: &bkev1beta1.BKECluster{
+                Spec: bkev1beta1.BKEClusterSpec{
+                    Reset: true,
+                },
+            },
+            expected: bkev1beta1.Deleting,
+        },
+        {
+            name: "upgrading cluster",
+            cluster: &bkev1beta1.BKECluster{
+                Status: bkev1beta1.BKEClusterStatus{
+                    DeclarativeUpgrade: &bkev1beta1.DeclarativeUpgradeStatus{
+                        FinishedAt: nil,
+                        LastError:  "",
+                    },
+                },
+            },
+            expected: bkev1beta1.Upgrading,
+        },
+        {
+            name: "upgrade failed",
+            cluster: &bkev1beta1.BKECluster{
+                Status: bkev1beta1.BKEClusterStatus{
+                    DeclarativeUpgrade: &bkev1beta1.DeclarativeUpgradeStatus{
+                        FinishedAt: nil,
+                        LastError:  "upgrade failed",
+                    },
+                },
+            },
+            expected: bkev1beta1.UpgradeFailed,
+        },
+        {
+            name: "healthy cluster",
+            cluster: &bkev1beta1.BKECluster{
+                Status: bkev1beta1.BKEClusterStatus{
+                    DeclarativeUpgrade: &bkev1beta1.DeclarativeUpgradeStatus{
+                        FinishedAt: &metav1.Time{Time: time.Now()},
+                        LastError:  "",
+                    },
+                },
+            },
+            expected: bkev1beta1.Healthy,
+        },
+    }
+    
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            calculator := NewClusterHealthCalculator(fake.NewClientBuilder().Build())
+            state, err := calculator.CalculateHealthState(context.Background(), tt.cluster)
+            
+            if err != nil {
+                t.Fatalf("unexpected error: %v", err)
+            }
+            
+            if state != tt.expected {
+                t.Errorf("expected %s, got %s", tt.expected, state)
+            }
+        })
+    }
+}
+```
+
+**集成测试**：
+
+```go
+// controllers/capbke/bkecluster_controller_health_test.go
+
+func TestBKEClusterReconciler_HealthCalculation(t *testing.T) {
+    // 创建测试集群
+    cluster := &bkev1beta1.BKECluster{
+        ObjectMeta: metav1.ObjectMeta{
+            Name:      "test-cluster",
+            Namespace: "default",
+        },
+        Spec: bkev1beta1.BKEClusterSpec{
+            ClusterConfig: &bkev1beta1.BKEConfig{
+                Cluster: bkev1beta1.Cluster{
+                    Addons: []bkev1beta1.Product{
+                        {
+                            Name:        "coredns",
+                            Type:        "chart",
+                            ReleaseName: "coredns",
+                            Namespace:   "kube-system",
+                        },
+                    },
+                },
+            },
+        },
+    }
+    
+    // 创建测试节点
+    node := &bkev1beta1.BKENode{
+        ObjectMeta: metav1.ObjectMeta{
+            Name:      "node1",
+            Namespace: "default",
+            Labels: map[string]string{
+                clusterv1.ClusterNameLabel: "test-cluster",
+            },
+        },
+        Spec: bkev1beta1.BKENodeSpec{
+            IP: "10.0.0.1",
+        },
+        Status: bkev1beta1.BKENodeStatus{
+            State: bkev1beta1.NodeReady,
+        },
+    }
+    
+    // 创建 fake client
+    fakeClient := fake.NewClientBuilder().
+        WithObjects(cluster, node).
+        Build()
+    
+    // 创建 reconciler
+    reconciler := &BKEClusterReconciler{
+        Client: fakeClient,
+    }
+    
+    // 执行 Reconcile
+    result, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+        NamespacedName: types.NamespacedName{
+            Name:      "test-cluster",
+            Namespace: "default",
+        },
+    })
+    
+    // 验证结果
+    if err != nil {
+        t.Fatalf("unexpected error: %v", err)
+    }
+    
+    // 验证健康状态
+    updatedCluster := &bkev1beta1.BKECluster{}
+    err = fakeClient.Get(context.Background(), types.NamespacedName{
+        Name:      "test-cluster",
+        Namespace: "default",
+    }, updatedCluster)
+    
+    if err != nil {
+        t.Fatalf("failed to get cluster: %v", err)
+    }
+    
+    if updatedCluster.Status.ClusterHealthState != bkev1beta1.Healthy {
+        t.Errorf("expected Healthy, got %s", updatedCluster.Status.ClusterHealthState)
+    }
 }
 ```
 
