@@ -120,6 +120,28 @@ Reconciler (调谐器)
 | `RollingBack` | 集群正在回滚（升级失败后恢复） |
 | `Failed` | 集群失败（需要人工介入） |
 
+**Scaling 状态设计说明**：
+
+`Scaling` 使用单一状态同时覆盖扩容和缩容场景，而非拆分为 `ScalingUp` 和 `ScalingDown`。原因如下：
+
+1. **节点状态自然区分方向**：
+   - 扩容：新节点进入 `Pending → Provisioned → Ready` 流程
+   - 缩容：节点进入 `Ready → Deleting → Removed` 流程
+   - 通过节点的 `LifecyclePhase` 即可判断扩容还是缩容
+
+2. **组件状态自然区分方向**：
+   - 扩容：组件 `Pending → Installing → Installed`
+   - 缩容：组件 `Installed → Uninstalling → Removed`
+   - 通过组件的 `LifecyclePhase` 即可判断操作方向
+
+3. **OperationProgress 提供精确信息**：
+   - `OperationProgress.Phase` 字段可扩展为 `ScalingUp` / `ScalingDown`
+   - 保持状态机简洁，同时不丢失方向信息
+
+4. **聚合规则简化**：
+   - 单一 `Scaling` 状态使聚合逻辑更简单
+   - 无需在集群层区分扩容/缩容，节点和组件层已足够表达
+
 ### 2.2 状态转换规则
 
 **正常转换**：
@@ -907,8 +929,12 @@ kind: BKECluster
 metadata:
   name: my-cluster
   annotations:
-    bke.bocloud.com/retry-upgrade: "true"
+    cvo.openfuyao.cn/retry-operation: "true"
 ```
+
+> **注解命名说明**：使用 `cvo.openfuyao.cn/retry-operation` 而非 `bke.bocloud.com/retry-upgrade`，原因：
+> 1. **域名一致性**：与现有 CVO 注解（`cvo.openfuyao.cn/upgrade-ready`、`cvo.openfuyao.cn/cluster-version`）保持一致
+> 2. **通用性**：重试操作适用于所有操作类型（Install/Upgrade/Scale/Rollback），不应局限于 "upgrade"
 
 #### 6.3.3 调谐器处理逻辑
 
@@ -924,7 +950,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
     // 1. 检查是否是人工介入触发的重试（通过注解）
     if r.isManualInterventionRetry(cluster) {
         // 清除注解
-        delete(cluster.Annotations, "bke.bocloud.com/retry-upgrade")
+        delete(cluster.Annotations, "cvo.openfuyao.cn/retry-operation")
         if err := r.Update(ctx, cluster); err != nil {
             return ctrl.Result{}, err
         }
@@ -951,7 +977,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 func (r *Reconciler) isManualInterventionRetry(cluster *bkev1beta1.BKECluster) bool {
     // 检查是否有重试注解
-    if annotations.Has(cluster, "bke.bocloud.com/retry-upgrade") {
+    if annotations.Has(cluster, "cvo.openfuyao.cn/retry-operation") {
         return true
     }
     
@@ -1180,7 +1206,7 @@ kubectl get bkecluster my-cluster -o jsonpath='{.status.operationProgress.lastEr
 # ... 修复配置错误 / 增加资源 / 其他修复操作 ...
 
 # 4. 触发立即重试
-kubectl annotate bkecluster my-cluster bke.bocloud.com/retry-upgrade=true
+kubectl annotate bkecluster my-cluster cvo.openfuyao.cn/retry-operation=true
 
 # 5. 查看重试结果
 kubectl get bkecluster my-cluster -w
@@ -1192,13 +1218,14 @@ kubectl get bkecluster my-cluster -w
 
 | 维度 | 自动重试 | 人工介入重试 |
 |------|---------|-------------|
-| **触发条件** | 调谐器返回 RequeueAfter | 用户设置注解 |
+| **触发条件** | 调谐器返回 RequeueAfter | 用户设置注解 `cvo.openfuyao.cn/retry-operation` |
 | **触发时机** | 立即触发（指数退避） | 用户手动触发 |
 | **重试次数** | 有限次数（3 次） | 无限次数（每次都需要用户介入） |
 | **状态转换** | 保持 Failed 状态 | 从 Failed 恢复到操作前状态 |
 | **执行策略** | 从失败点继续 | 可以重新选择执行策略 |
 | **适用场景** | 临时错误（网络超时等） | 配置错误、资源不足等需要人工修复的场景 |
 | **Attempt 计数器** | 每次失败增加 1 | 重置为 1 |
+| **适用操作** | Install/Upgrade/Scale/Rollback | Install/Upgrade/Scale/Rollback |
 
 ---
 
