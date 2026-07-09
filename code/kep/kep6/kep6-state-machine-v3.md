@@ -427,6 +427,36 @@ func AggregateClusterStateFromComponents(
 | `BKECluster.Status.Phase` | 集群生命周期阶段，反映集群整体状态 | Creating/Running/Upgrading/Scaling/RollingBack/Failed |
 | `BKECluster.Status.ClusterHealthState` | 集群健康状态，反映集群的健康程度 | Healthy/Unhealthy/Degraded |
 
+**Phase 与 ClusterHealthState 的关系**：
+
+| 字段 | 类型 | 作用 | 聚合规则 |
+|------|------|------|---------|
+| `Phase` | 生命周期状态 | 反映集群当前处于什么阶段 | 由节点状态和组件状态聚合 |
+| `ClusterHealthState` | 健康状态 | 反映集群的健康程度 | 基于 Phase 和其他健康指标评估 |
+
+**聚合关系**：
+- `Phase` 是基础状态，由节点状态和组件状态聚合而来
+- `ClusterHealthState` 是衍生状态，基于 Phase 和其他健康指标评估
+- 例如：`Phase=Running` + `ClusterHealthState=Healthy` 表示集群正在运行且健康
+
+**依赖关系**：
+- `ClusterHealthState` 依赖于 `Phase`
+- 只有当 `Phase=Running` 时，`ClusterHealthState` 才有意义
+- 当 `Phase=Failed` 时，`ClusterHealthState` 通常为 `Unhealthy`
+
+**状态转换时序说明**：
+
+| 时序 | 状态转换 | 触发条件 | 前置条件 | 结果 |
+|------|---------|---------|---------|------|
+| T0 | BKEClusterLifecycle: [*] → Creating | 创建 BKECluster | 无 | 集群进入创建阶段 |
+| T1 | BKENodeLifecycle: [*] → Pending | 新节点加入集群 | T0 完成 | 节点等待配置 |
+| T2 | ComponentLifecycle: Pending → Installing | 开始安装节点级组件 | T1 完成 | 组件开始安装 |
+| T3 | ComponentLifecycle: Installing → Installed | 节点级组件安装成功 | T2 完成 | 节点进入 Provisioned 状态 |
+| T4 | BKENodeLifecycle: Provisioned → Ready | 环境初始化完成 | T3 完成 | 节点就绪 |
+| T5 | ComponentLifecycle: Pending → Installing | 开始安装集群级组件 | T4 完成 | 组件开始安装 |
+| T6 | ComponentLifecycle: Installing → Installed | 集群级组件安装成功 | T5 完成 | 所有组件安装完成 |
+| T7 | BKEClusterLifecycle: Creating → Running | 所有节点 Ready + 所有集群级组件 Installed | T6 完成 | 集群进入运行状态 |
+
 **状态转换时序**：
 
 ```
@@ -463,6 +493,19 @@ T7: BKEClusterLifecycle = Running
 
 ### 5.2 升级场景
 
+**状态转换时序说明**：
+
+| 时序 | 状态转换 | 触发条件 | 前置条件 | 结果 |
+|------|---------|---------|---------|------|
+| T0 | BKEClusterLifecycle: Running → Upgrading | 用户触发版本升级 | 集群处于 Running 状态 | 集群进入升级阶段 |
+| T1 | ComponentLifecycle: Installed → Upgrading | 开始升级节点级组件 | T0 完成 | 组件开始升级 |
+| T2 | ComponentLifecycle: Upgrading → Installed | 节点级组件升级成功 | T1 完成 | 节点回到 Ready 状态 |
+| T3 | ComponentLifecycle: Installed → Upgrading | 开始升级集群级组件 | T2 完成 | 组件开始升级 |
+| T4 | ComponentLifecycle: Upgrading → Installed | 集群级组件升级成功 | T3 完成 | 所有组件升级完成 |
+| T5 | BKEClusterLifecycle: Upgrading → Running | 所有节点 Ready + 所有集群级组件 Installed | T4 完成 | 集群回到运行状态 |
+
+**状态转换时序**：
+
 ```
 T0: BKEClusterLifecycle = Running → Upgrading
     BKECluster.Status.Phase = Upgrading
@@ -493,6 +536,20 @@ T5: BKEClusterLifecycle = Upgrading → Running
 ```
 
 ### 5.3 回滚场景
+
+**状态转换时序说明**：
+
+| 时序 | 状态转换 | 触发条件 | 前置条件 | 结果 |
+|------|---------|---------|---------|------|
+| T0 | ComponentLifecycle: Upgrading → Failed | 升级过程中出现错误 | 升级操作进行中 | 组件进入失败状态 |
+| T1 | BKEClusterLifecycle: Upgrading → RollingBack | 升级失败，触发回滚 | T0 完成 | 集群进入回滚阶段 |
+| T2 | ComponentLifecycle: Failed → RollingBack | 开始回滚节点级组件 | T1 完成 | 组件开始回滚 |
+| T3 | ComponentLifecycle: RollingBack → Installed | 节点级组件回滚成功 | T2 完成 | 节点回到 Ready 状态 |
+| T4 | ComponentLifecycle: Installed → RollingBack | 开始回滚集群级组件 | T3 完成 | 组件开始回滚 |
+| T5 | ComponentLifecycle: RollingBack → Installed | 集群级组件回滚成功 | T4 完成 | 所有组件回滚完成 |
+| T6 | BKEClusterLifecycle: RollingBack → Running | 所有节点 Ready + 所有集群级组件 Installed | T5 完成 | 集群回到运行状态 |
+
+**状态转换时序**：
 
 ```
 T0: 升级失败
@@ -526,6 +583,18 @@ T6: BKEClusterLifecycle = RollingBack → Running
 
 ### 5.4 扩容场景
 
+**状态转换时序说明**：
+
+| 时序 | 状态转换 | 触发条件 | 前置条件 | 结果 |
+|------|---------|---------|---------|------|
+| T0 | BKEClusterLifecycle: Running → Scaling | 用户触发扩容 | 集群处于 Running 状态 | 集群进入扩容阶段 |
+| T1 | BKENodeLifecycle: [*] → Pending | 新节点加入集群 | T0 完成 | 节点等待配置 |
+| T2 | ComponentLifecycle: Pending → Installing | 开始安装节点级组件 | T1 完成 | 组件开始安装 |
+| T3 | ComponentLifecycle: Installing → Installed | 节点级组件安装成功 | T2 完成 | 节点就绪 |
+| T4 | BKEClusterLifecycle: Scaling → Running | 所有节点 Ready + 所有集群级组件 Installed | T3 完成 | 集群回到运行状态 |
+
+**状态转换时序**：
+
 ```
 T0: BKEClusterLifecycle = Running → Scaling
     BKECluster.Status.Phase = Scaling
@@ -550,6 +619,19 @@ T4: BKEClusterLifecycle = Scaling → Running
 ```
 
 ### 5.5 缩容场景
+
+**状态转换时序说明**：
+
+| 时序 | 状态转换 | 触发条件 | 前置条件 | 结果 |
+|------|---------|---------|---------|------|
+| T0 | BKEClusterLifecycle: Running → Scaling | 用户触发缩容 | 集群处于 Running 状态 | 集群进入缩容阶段 |
+| T1 | BKENodeLifecycle: Ready → Deleting | 节点标记删除 | T0 完成 | 节点开始删除 |
+| T2 | ComponentLifecycle: Installed → Uninstalling | 开始卸载节点级组件 | T1 完成 | 组件开始卸载 |
+| T3 | ComponentLifecycle: Uninstalling → Removed | 节点级组件卸载成功 | T2 完成 | 组件已卸载 |
+| T4 | BKENodeLifecycle: Deleting → Removed | 节点删除完成 | T3 完成 | 节点已删除 |
+| T5 | BKEClusterLifecycle: Scaling → Running | 所有节点 Ready + 所有集群级组件 Installed | T4 完成 | 集群回到运行状态 |
+
+**状态转换时序**：
 
 ```
 T0: BKEClusterLifecycle = Running → Scaling
@@ -669,7 +751,39 @@ func (r *Reconciler) isIdempotent(ctx context.Context, cluster *confv1beta1.BKEC
 
 ### 6.3 人工介入
 
-#### 6.3.1 介入方式
+#### 6.3.1 介入前诊断
+
+**需要查看的字段**：
+
+| 字段 | 作用 | 诊断方法 |
+|------|------|---------|
+| `BKECluster.Status.Phase` | 集群当前阶段 | 判断集群是否处于 Failed 状态 |
+| `BKECluster.Status.OperationProgress` | 操作进度和错误信息 | 查看 LastError 和 LastFailure |
+| `BKECluster.Status.NodeComponentStatuses` | 节点级组件状态 | 判断哪些组件安装失败 |
+| `BKECluster.Status.ComponentStatuses` | 集群级组件状态 | 判断哪些组件安装失败 |
+| `BKENode.Status.State` | 节点状态 | 判断哪些节点处于 Failed 状态 |
+| `ComponentVersion.Status.Phase` | 组件状态 | 判断组件是否处于 Failed 状态 |
+
+**诊断流程**：
+
+1. **查看集群状态**：
+   - 检查 `BKECluster.Status.Phase` 是否为 `Failed`
+   - 检查 `BKECluster.Status.OperationProgress.LastError` 获取错误信息
+
+2. **查看节点状态**：
+   - 检查 `BKECluster.Status.NodeComponentStatuses` 判断哪些节点失败
+   - 检查 `BKENode.Status.State` 判断节点状态
+
+3. **查看组件状态**：
+   - 检查 `BKECluster.Status.ComponentStatuses` 判断哪些组件失败
+   - 检查 `ComponentVersion.Status.Phase` 判断组件状态
+
+4. **判断介入策略**：
+   - 如果是临时错误（网络超时等），清除 OperationProgress 后重试
+   - 如果是配置错误，修复配置后重试
+   - 如果是资源不足，增加资源后重试
+
+#### 6.3.2 介入方式
 
 ```yaml
 # 方式 1: 清除错误状态，触发重试
@@ -695,7 +809,423 @@ metadata:
     bke.bocloud.com/retry-upgrade: "true"
 ```
 
-#### 6.3.2 介入后重试流程
+#### 6.3.3 调谐器处理逻辑
+
+**完整处理流程**：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    人工介入检测                               │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  1. 检测介入信号                                             │
+│     ├─ OperationProgress.LastError 被清除                   │
+│     ├─ 注解 bke.bocloud.com/retry-upgrade: "true"          │
+│     └─ Phase 从 Failed 变为其他状态                         │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  2. 状态验证                                                 │
+│     ├─ 检查 BKECluster.Status.Phase 是否为 Failed          │
+│     ├─ 检查 OperationProgress.OperationType                 │
+│     ├─ 检查 OperationProgress.TargetVersion                 │
+│     └─ 检查 OperationProgress.Completed                     │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  3. 依赖检查                                                 │
+│     ├─ 检查节点状态 (BKENode.State)                         │
+│     ├─ 检查组件状态 (ComponentVersion.Status.Phase)         │
+│     ├─ 检查依赖关系是否满足                                 │
+│     └─ 检查资源是否充足                                     │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  4. 重试决策                                                 │
+│     ├─ 决定重试起点（从头开始 or 从失败点继续）             │
+│     ├─ 决定重试策略（全量重试 or 增量重试）                 │
+│     └─ 决定是否需要回滚                                     │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  5. 状态恢复                                                 │
+│     ├─ 重置 OperationProgress 相关字段                      │
+│     ├─ 恢复 BKECluster.Status.Phase 到操作前状态            │
+│     ├─ 清理失败的组件状态                                   │
+│     └─ 清理失败的资源                                       │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  6. 执行重试                                                 │
+│     ├─ 重新执行 DAG（从头开始）                             │
+│     ├─ 或继续执行失败的步骤（从失败点继续）                 │
+│     └─ 跳过已完成的组件                                     │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  7. 结果处理                                                 │
+│     ├─ 成功：更新 OperationProgress.FinishedAt              │
+│     ├─ 失败：更新 OperationProgress.LastError               │
+│     └─ 达到最大重试次数：等待再次人工介入                   │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**检测介入信号**：
+
+```go
+func (r *Reconciler) detectManualIntervention(cluster *bkev1beta1.BKECluster) bool {
+    // 方式 1: 检查注解
+    if annotations.Has(cluster, "bke.bocloud.com/retry-upgrade") {
+        return true
+    }
+    
+    // 方式 2: 检查 OperationProgress.LastError 是否被清除
+    if cluster.Status.OperationProgress != nil &&
+       cluster.Status.OperationProgress.LastError == "" &&
+       cluster.Status.OperationProgress.LastFailure != nil {
+        // LastError 被清除但 LastFailure 还在，说明是人工介入
+        return true
+    }
+    
+    return false
+}
+```
+
+**状态验证**：
+
+```go
+func (r *Reconciler) validateRetryState(cluster *bkev1beta1.BKECluster) error {
+    // 检查集群状态
+    if cluster.Status.Phase != "Failed" {
+        return fmt.Errorf("cluster phase is %s, expected Failed", cluster.Status.Phase)
+    }
+    
+    // 检查 OperationProgress
+    if cluster.Status.OperationProgress == nil {
+        return fmt.Errorf("operation progress is nil")
+    }
+    
+    // 检查操作类型
+    if cluster.Status.OperationProgress.OperationType == "" {
+        return fmt.Errorf("operation type is empty")
+    }
+    
+    // 检查目标版本
+    if cluster.Status.OperationProgress.TargetVersion == "" {
+        return fmt.Errorf("target version is empty")
+    }
+    
+    return nil
+}
+```
+
+**依赖检查**：
+
+```go
+func (r *Reconciler) validateDependencies(ctx context.Context, cluster *bkev1beta1.BKECluster) error {
+    // 检查节点状态
+    nodes := &bkev1beta1.BKENodeList{}
+    if err := r.List(ctx, nodes, client.MatchingLabels{
+        "cluster.x-k8s.io/cluster-name": cluster.Name,
+    }); err != nil {
+        return err
+    }
+    
+    for _, node := range nodes.Items {
+        if node.Status.State == "Failed" {
+            return fmt.Errorf("node %s is in Failed state", node.Name)
+        }
+    }
+    
+    // 检查组件状态
+    for componentName, status := range cluster.Status.ComponentStatuses {
+        if status.Phase == "Failed" {
+            return fmt.Errorf("component %s is in Failed state", componentName)
+        }
+    }
+    
+    return nil
+}
+```
+
+**重试决策**：
+
+```go
+type RetryStrategy string
+
+const (
+    RetryStrategyFull        RetryStrategy = "Full"        // 从头开始
+    RetryStrategyFromFailure RetryStrategy = "FromFailure" // 从失败点继续
+)
+
+func (r *Reconciler) decideRetryStrategy(cluster *bkev1beta1.BKECluster) RetryStrategy {
+    // 检查已完成的组件
+    completed := cluster.Status.OperationProgress.Completed
+    
+    if len(completed) == 0 {
+        // 没有已完成的组件，从头开始
+        return RetryStrategyFull
+    }
+    
+    // 检查失败的组件
+    lastFailure := cluster.Status.OperationProgress.LastFailure
+    
+    if lastFailure != nil {
+        // 有失败的组件，从失败点继续
+        return RetryStrategyFromFailure
+    }
+    
+    // 默认从头开始
+    return RetryStrategyFull
+}
+```
+
+**状态恢复**：
+
+```go
+func (r *Reconciler) restoreState(ctx context.Context, cluster *bkev1beta1.BKECluster) error {
+    // 重置 OperationProgress
+    cluster.Status.OperationProgress.LastError = ""
+    cluster.Status.OperationProgress.LastFailure = nil
+    
+    // 恢复集群状态
+    switch cluster.Status.OperationProgress.OperationType {
+    case "Install":
+        cluster.Status.Phase = "Creating"
+    case "Upgrade":
+        cluster.Status.Phase = "Upgrading"
+    case "Scale":
+        cluster.Status.Phase = "Scaling"
+    case "Rollback":
+        cluster.Status.Phase = "RollingBack"
+    }
+    
+    // 清理失败的组件状态
+    for componentName, status := range cluster.Status.ComponentStatuses {
+        if status.Phase == "Failed" {
+            // 重置为 Pending 或 Installing
+            cluster.Status.ComponentStatuses[componentName].Phase = "Pending"
+        }
+    }
+    
+    return r.Status().Update(ctx, cluster)
+}
+```
+
+**执行重试**：
+
+```go
+func (r *Reconciler) executeRetry(ctx context.Context, cluster *bkev1beta1.BKECluster) (ctrl.Result, error) {
+    strategy := r.decideRetryStrategy(cluster)
+    
+    switch strategy {
+    case RetryStrategyFull:
+        // 从头开始
+        return r.executeDAG(ctx, cluster)
+    
+    case RetryStrategyFromFailure:
+        // 从失败点继续
+        return r.resumeDAG(ctx, cluster, cluster.Status.OperationProgress.LastFailure)
+    }
+    
+    return ctrl.Result{}, nil
+}
+```
+
+**结果处理**：
+
+```go
+func (r *Reconciler) handleRetryResult(ctx context.Context, cluster *bkev1beta1.BKECluster, err error) (ctrl.Result, error) {
+    if err != nil {
+        // 重试失败
+        cluster.Status.OperationProgress.MarkFailure(
+            componentName, version, err.Error(), metav1.Now())
+        
+        // 检查是否达到最大重试次数
+        if cluster.Status.OperationProgress.LastFailure.Attempt >= maxRetries {
+            // 达到最大重试次数，等待再次人工介入
+            return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+        }
+        
+        // 指数退避
+        backoff := calculateBackoff(cluster.Status.OperationProgress.LastFailure.Attempt)
+        return ctrl.Result{RequeueAfter: backoff}, nil
+    }
+    
+    // 重试成功
+    cluster.Status.OperationProgress.FinishedAt = &metav1.Time{Time: time.Now()}
+    cluster.Status.Phase = "Running"
+    
+    return ctrl.Result{}, r.Status().Update(ctx, cluster)
+}
+```
+
+**完整的人工介入处理流程**：
+
+```go
+func (r *Reconciler) handleManualIntervention(ctx context.Context, cluster *bkev1beta1.BKECluster) (ctrl.Result, error) {
+    // 1. 检测介入信号
+    if !r.detectManualIntervention(cluster) {
+        return ctrl.Result{}, nil
+    }
+    
+    // 2. 状态验证
+    if err := r.validateRetryState(cluster); err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    // 3. 依赖检查
+    if err := r.validateDependencies(ctx, cluster); err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    // 4. 状态恢复
+    if err := r.restoreState(ctx, cluster); err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    // 5. 执行重试
+    result, err := r.executeRetry(ctx, cluster)
+    if err != nil {
+        // 6. 结果处理（失败）
+        return r.handleRetryResult(ctx, cluster, err)
+    }
+    
+    // 6. 结果处理（成功）
+    return r.handleRetryResult(ctx, cluster, nil)
+}
+```
+
+#### 6.3.4 resumeDAG 实现
+
+**resumeDAG 函数**：
+
+```go
+// resumeDAG 从失败点继续执行 DAG
+func (r *Reconciler) resumeDAG(
+    ctx context.Context,
+    cluster *bkev1beta1.BKECluster,
+    lastFailure *bkev1beta1.DeclarativeUpgradeFailureRecord,
+) (ctrl.Result, error) {
+    // 1. 获取 DAG 定义
+    dag, err := r.getDAG(ctx, cluster)
+    if err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    // 2. 获取已完成的组件列表
+    completed := make(map[string]bool)
+    for _, record := range cluster.Status.OperationProgress.Completed {
+        completed[record.Name] = true
+    }
+    
+    // 3. 构建执行计划
+    executionPlan := r.buildExecutionPlan(dag, completed, lastFailure)
+    
+    // 4. 执行 DAG
+    return r.executeExecutionPlan(ctx, cluster, executionPlan)
+}
+
+// getDAG 获取 DAG 定义
+func (r *Reconciler) getDAG(
+    ctx context.Context,
+    cluster *bkev1beta1.BKECluster,
+) (*topology.UpgradeDAG, error) {
+    // 从 ReleaseImage 获取组件列表
+    releaseImage, err := r.getReleaseImage(ctx, cluster)
+    if err != nil {
+        return nil, err
+    }
+    
+    // 构建 DAG
+    builder := topology.NewDAGBuilder(r.Client)
+    return builder.BuildUpgradeDAG(ctx, releaseImage, cluster)
+}
+
+// buildExecutionPlan 构建执行计划
+func (r *Reconciler) buildExecutionPlan(
+    dag *topology.UpgradeDAG,
+    completed map[string]bool,
+    lastFailure *bkev1beta1.DeclarativeUpgradeFailureRecord,
+) []topology.ComponentNode {
+    var executionPlan []topology.ComponentNode
+    
+    // 遍历 DAG 的所有节点
+    for _, node := range dag.Nodes {
+        // 跳过已完成的组件
+        if completed[node.Name] {
+            continue
+        }
+        
+        // 如果是失败的组件，标记为需要重试
+        if lastFailure != nil && lastFailure.Name == node.Name {
+            executionPlan = append(executionPlan, node)
+            continue
+        }
+        
+        // 检查依赖是否满足
+        if r.checkDependencies(node, completed) {
+            executionPlan = append(executionPlan, node)
+        }
+    }
+    
+    return executionPlan
+}
+
+// checkDependencies 检查依赖是否满足
+func (r *Reconciler) checkDependencies(
+    node topology.ComponentNode,
+    completed map[string]bool,
+) bool {
+    for _, dep := range node.Dependencies {
+        if !completed[dep] {
+            return false
+        }
+    }
+    return true
+}
+
+// executeExecutionPlan 执行执行计划
+func (r *Reconciler) executeExecutionPlan(
+    ctx context.Context,
+    cluster *bkev1beta1.BKECluster,
+    executionPlan []topology.ComponentNode,
+) (ctrl.Result, error) {
+    // 创建 DAG 调度器
+    scheduler := dagexec.NewScheduler(dagexec.Config{
+        Client: r.Client,
+        // ... 其他配置
+    })
+    
+    // 执行 DAG
+    for _, node := range executionPlan {
+        result, err := scheduler.ExecuteComponent(ctx, &node, cluster)
+        if err != nil {
+            return result, err
+        }
+        
+        // 更新完成状态
+        cluster.Status.OperationProgress.MarkCompleted(
+            node.Name, node.Version, metav1.Now())
+        
+        if err := r.Status().Update(ctx, cluster); err != nil {
+            return ctrl.Result{}, err
+        }
+    }
+    
+    return ctrl.Result{}, nil
+}
+```
+
+#### 6.3.5 介入后重试流程
 
 ```
 T0: 人工介入
@@ -706,11 +1236,31 @@ T1: Reconciler 检测到状态变更
     检查 OperationProgress.TargetVersion
     检查 OperationProgress.Completed
 
-T2: 重新执行 DAG
-    跳过已完成的组件
-    从失败的组件继续执行
+T2: 状态验证
+    检查 BKECluster.Status.Phase 是否为 Failed
+    检查 OperationProgress.OperationType
+    检查 OperationProgress.TargetVersion
 
-T3: 操作完成
+T3: 依赖检查
+    检查节点状态
+    检查组件状态
+    检查依赖关系
+
+T4: 重试决策
+    决定重试起点（从头开始 or 从失败点继续）
+    决定重试策略（全量重试 or 增量重试）
+
+T5: 状态恢复
+    重置 OperationProgress 相关字段
+    恢复 BKECluster.Status.Phase 到操作前状态
+    清理失败的组件状态
+
+T6: 执行重试
+    重新执行 DAG（从头开始）
+    或继续执行失败的步骤（从失败点继续）
+    跳过已完成的组件
+
+T7: 操作完成
     OperationProgress.FinishedAt = now
     BKEClusterLifecycle = Running
 ```
