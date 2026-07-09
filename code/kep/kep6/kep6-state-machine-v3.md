@@ -666,49 +666,148 @@ T5: BKEClusterLifecycle = Scaling → Running
 
 #### 6.1.1 自动重试
 
+**重试计数器存储位置**
+
+自动重试计数器存储在 `BKECluster.Status.OperationProgress.LastFailure.Attempt` 字段中：
+
 ```go
-type RetryConfig struct {
-    MaxRetries     int           // 最大重试次数
-    BackoffDelay   time.Duration // 重试间隔
-    BackoffFactor  float64       // 退避因子
-    MaxBackoff     time.Duration // 最大退避时间
+type OperationProgress struct {
+    // 操作类型
+    OperationType OperationType `json:"operationType"`
+    
+    // 目标版本
+    TargetVersion string `json:"targetVersion,omitempty"`
+    
+    // 开始时间
+    StartedAt *metav1.Time `json:"startedAt,omitempty"`
+    
+    // 完成时间
+    FinishedAt *metav1.Time `json:"finishedAt,omitempty"`
+    
+    // 最后错误
+    LastError string `json:"lastError,omitempty"`
+    
+    // 是否需要人工介入
+    NeedsManualIntervention bool `json:"needsManualIntervention,omitempty"`
+    
+    // 已完成组件列表
+    Completed []ComponentRecord `json:"completed,omitempty"`
+    
+    // 最后失败记录（包含重试计数器）
+    LastFailure *DeclarativeUpgradeFailureRecord `json:"lastFailure,omitempty"`
 }
 
-func (r *Reconciler) reconcileWithRetry(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-    cluster := &confv1beta1.BKECluster{}
-    if err := r.Get(ctx, req.NamespacedName, cluster); err != nil {
-        return ctrl.Result{}, err
+type DeclarativeUpgradeFailureRecord struct {
+    Name     string      `json:"name"`
+    Version  string      `json:"version,omitempty"`
+    FailedAt metav1.Time `json:"failedAt"`
+    Error    string      `json:"error,omitempty"`
+    Attempt  int32       `json:"attempt,omitempty"` // ← 自动重试计数器
+}
+```
+
+**Attempt 增加逻辑**
+
+Attempt 在每次执行失败后增加 1，在 `MarkFailure` 方法中实现：
+
+```go
+// MarkFailure 更新失败记录，Attempt 增加
+func (p *OperationProgress) MarkFailure(name, version, errMsg string, now metav1.Time) {
+    var attempt int32 = 1
+    
+    // 如果是同一个组件连续失败，Attempt 增加
+    if p.LastFailure != nil && p.LastFailure.Name == name {
+        attempt = p.LastFailure.Attempt + 1
     }
     
-    // 检查是否需要重试
-    if cluster.Status.OperationProgress != nil && 
-       cluster.Status.OperationProgress.LastError != "" {
-        // 已失败，检查重试次数
-        if cluster.Status.OperationProgress.LastFailure != nil &&
-           cluster.Status.OperationProgress.LastFailure.Attempt >= maxRetries {
-            // 达到最大重试次数，等待人工介入
+    p.LastFailure = &DeclarativeUpgradeFailureRecord{
+        Name:     name,
+        Version:  version,
+        FailedAt: now,
+        Error:    errMsg,
+        Attempt:  attempt,
+    }
+    p.LastError = errMsg
+}
+```
+
+**Attempt 增加的场景**
+
+| 场景 | Attempt 值 | 说明 |
+|------|-----------|------|
+| 首次执行失败 | 1 | 第一次失败 |
+| 第一次自动重试失败 | 2 | 第二次失败 |
+| 第二次自动重试失败 | 3 | 第三次失败（达到最大重试次数） |
+| 达到最大重试次数 | 3 | 停止自动重试，等待人工介入 |
+| 人工介入后重试失败 | 1 | 重置计数器 |
+
+**自动重试处理逻辑**
+
+```go
+const maxAutoRetries = 3
+
+func (r *Reconciler) executeDAGWithRetry(ctx context.Context, cluster *bkev1beta1.BKECluster) (ctrl.Result, error) {
+    // 执行 DAG
+    result, err := r.executeDAG(ctx, cluster)
+    
+    if err != nil {
+        // 更新失败记录
+        cluster.Status.OperationProgress.MarkFailure(
+            componentName, version, err.Error(), metav1.Now())
+        
+        // 检查是否达到最大自动重试次数
+        if cluster.Status.OperationProgress.LastFailure.Attempt >= maxAutoRetries {
+            // 达到最大重试次数，设置人工介入标志
+            cluster.Status.OperationProgress.NeedsManualIntervention = true
+            r.Status().Update(ctx, cluster)
+            
+            // 返回 RequeueAfter，等待人工介入
             return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
         }
         
-        // 执行重试
-        result, err := r.executeDAG(ctx, cluster)
-        if err != nil {
-            // 更新失败记录
-            cluster.Status.OperationProgress.MarkFailure(
-                componentName, version, err.Error(), metav1.Now())
-            r.Status().Update(ctx, cluster)
-            
-            // 指数退避
-            backoff := calculateBackoff(attempt)
-            return ctrl.Result{RequeueAfter: backoff}, nil
-        }
+        r.Status().Update(ctx, cluster)
         
-        return result, nil
+        // 指数退避
+        attempt := cluster.Status.OperationProgress.LastFailure.Attempt
+        backoff := calculateBackoff(attempt)
+        return ctrl.Result{RequeueAfter: backoff}, nil
     }
     
-    // 首次执行
-    return r.executeDAG(ctx, cluster)
+    // 执行成功
+    cluster.Status.OperationProgress.FinishedAt = &metav1.Time{Time: time.Now()}
+    cluster.Status.Phase = "Running"
+    cluster.Status.OperationProgress.LastError = ""
+    cluster.Status.OperationProgress.LastFailure = nil
+    
+    return ctrl.Result{}, r.Status().Update(ctx, cluster)
 }
+
+// calculateBackoff 计算指数退避时间
+func calculateBackoff(attempt int32) time.Duration {
+    baseDelay := 5 * time.Second
+    maxDelay := 5 * time.Minute
+    
+    backoff := time.Duration(math.Pow(2, float64(attempt-1))) * baseDelay
+    if backoff > maxDelay {
+        backoff = maxDelay
+    }
+    
+    return backoff
+}
+```
+
+**自动重试状态转换**
+
+```mermaid
+stateDiagram-v2
+    [*] --> Failed: 操作失败
+    Failed --> Failed: 自动重试 (Attempt=1)
+    Failed --> Failed: 自动重试 (Attempt=2)
+    Failed --> Failed: 自动重试 (Attempt=3)
+    Failed --> NeedsManualIntervention: 达到最大重试次数
+    NeedsManualIntervention --> Upgrading: 人工介入
+    Upgrading --> Running: 重试成功
+    Upgrading --> Failed: 重试失败 (Attempt=1)
 ```
 
 #### 6.1.2 重试触发条件
@@ -785,8 +884,9 @@ func (r *Reconciler) isIdempotent(ctx context.Context, cluster *confv1beta1.BKEC
 
 #### 6.3.2 介入方式
 
+**方式 1: 清除错误状态，触发重试**
+
 ```yaml
-# 方式 1: 清除错误状态，触发重试
 apiVersion: bke.bocloud.com/v1beta1
 kind: BKECluster
 metadata:
@@ -799,8 +899,9 @@ status:
     lastFailure: null  # 清除失败记录
 ```
 
+**方式 2: 通过注解触发立即重试**
+
 ```yaml
-# 方式 2: 通过注解触发重试
 apiVersion: bke.bocloud.com/v1beta1
 kind: BKECluster
 metadata:
@@ -811,87 +912,57 @@ metadata:
 
 #### 6.3.3 调谐器处理逻辑
 
-**完整处理流程**：
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    人工介入检测                               │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│  1. 检测介入信号                                             │
-│     ├─ OperationProgress.LastError 被清除                   │
-│     ├─ 注解 bke.bocloud.com/retry-upgrade: "true"          │
-│     └─ Phase 从 Failed 变为其他状态                         │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│  2. 状态验证                                                 │
-│     ├─ 检查 BKECluster.Status.Phase 是否为 Failed          │
-│     ├─ 检查 OperationProgress.OperationType                 │
-│     ├─ 检查 OperationProgress.TargetVersion                 │
-│     └─ 检查 OperationProgress.Completed                     │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│  3. 依赖检查                                                 │
-│     ├─ 检查节点状态 (BKENode.State)                         │
-│     ├─ 检查组件状态 (ComponentVersion.Status.Phase)         │
-│     ├─ 检查依赖关系是否满足                                 │
-│     └─ 检查资源是否充足                                     │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│  4. 重试决策                                                 │
-│     ├─ 决定重试起点（从头开始 or 从失败点继续）             │
-│     ├─ 决定重试策略（全量重试 or 增量重试）                 │
-│     └─ 决定是否需要回滚                                     │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│  5. 状态恢复                                                 │
-│     ├─ 重置 OperationProgress 相关字段                      │
-│     ├─ 恢复 BKECluster.Status.Phase 到操作前状态            │
-│     ├─ 清理失败的组件状态                                   │
-│     └─ 清理失败的资源                                       │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│  6. 执行重试                                                 │
-│     ├─ 重新执行 DAG（从头开始）                             │
-│     ├─ 或继续执行失败的步骤（从失败点继续）                 │
-│     └─ 跳过已完成的组件                                     │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│  7. 结果处理                                                 │
-│     ├─ 成功：更新 OperationProgress.FinishedAt              │
-│     ├─ 失败：更新 OperationProgress.LastError               │
-│     └─ 达到最大重试次数：等待再次人工介入                   │
-└─────────────────────────────────────────────────────────────┘
-```
-
-**检测介入信号**：
+**完整 Reconcile 流程**
 
 ```go
-func (r *Reconciler) detectManualIntervention(cluster *bkev1beta1.BKECluster) bool {
-    // 方式 1: 检查注解
+func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    cluster := &bkev1beta1.BKECluster{}
+    if err := r.Get(ctx, req.NamespacedName, cluster); err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    // 1. 检查是否是人工介入触发的重试（通过注解）
+    if r.isManualInterventionRetry(cluster) {
+        // 清除注解
+        delete(cluster.Annotations, "bke.bocloud.com/retry-upgrade")
+        if err := r.Update(ctx, cluster); err != nil {
+            return ctrl.Result{}, err
+        }
+        
+        // 立即执行重试
+        return r.handleManualIntervention(ctx, cluster)
+    }
+    
+    // 2. 检查是否需要人工介入（达到最大自动重试次数）
+    if r.needsManualIntervention(cluster) {
+        // 设置标志位
+        if !cluster.Status.OperationProgress.NeedsManualIntervention {
+            cluster.Status.OperationProgress.NeedsManualIntervention = true
+            r.Status().Update(ctx, cluster)
+        }
+        
+        // 返回 RequeueAfter，等待人工介入
+        return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+    }
+    
+    // 3. 正常执行或自动重试
+    return r.executeDAGWithRetry(ctx, cluster)
+}
+
+func (r *Reconciler) isManualInterventionRetry(cluster *bkev1beta1.BKECluster) bool {
+    // 检查是否有重试注解
     if annotations.Has(cluster, "bke.bocloud.com/retry-upgrade") {
         return true
     }
     
-    // 方式 2: 检查 OperationProgress.LastError 是否被清除
+    return false
+}
+
+func (r *Reconciler) needsManualIntervention(cluster *bkev1beta1.BKECluster) bool {
+    // 检查是否达到最大自动重试次数
     if cluster.Status.OperationProgress != nil &&
-       cluster.Status.OperationProgress.LastError == "" &&
-       cluster.Status.OperationProgress.LastFailure != nil {
-        // LastError 被清除但 LastFailure 还在，说明是人工介入
+       cluster.Status.OperationProgress.LastFailure != nil &&
+       cluster.Status.OperationProgress.LastFailure.Attempt >= maxAutoRetries {
         return true
     }
     
@@ -899,221 +970,72 @@ func (r *Reconciler) detectManualIntervention(cluster *bkev1beta1.BKECluster) bo
 }
 ```
 
-**状态验证**：
+**人工介入处理逻辑**
 
 ```go
-func (r *Reconciler) validateRetryState(cluster *bkev1beta1.BKECluster) error {
-    // 检查集群状态
-    if cluster.Status.Phase != "Failed" {
-        return fmt.Errorf("cluster phase is %s, expected Failed", cluster.Status.Phase)
+func (r *Reconciler) handleManualIntervention(ctx context.Context, cluster *bkev1beta1.BKECluster) (ctrl.Result, error) {
+    // 1. 状态验证
+    if err := r.validateRetryState(cluster); err != nil {
+        return ctrl.Result{}, err
     }
     
-    // 检查 OperationProgress
-    if cluster.Status.OperationProgress == nil {
-        return fmt.Errorf("operation progress is nil")
+    // 2. 依赖检查
+    if err := r.validateDependencies(ctx, cluster); err != nil {
+        return ctrl.Result{}, err
     }
     
-    // 检查操作类型
-    if cluster.Status.OperationProgress.OperationType == "" {
-        return fmt.Errorf("operation type is empty")
+    // 3. 状态恢复
+    if err := r.restoreState(ctx, cluster); err != nil {
+        return ctrl.Result{}, err
     }
     
-    // 检查目标版本
-    if cluster.Status.OperationProgress.TargetVersion == "" {
-        return fmt.Errorf("target version is empty")
-    }
-    
-    return nil
-}
-```
-
-**依赖检查**：
-
-```go
-func (r *Reconciler) validateDependencies(ctx context.Context, cluster *bkev1beta1.BKECluster) error {
-    // 检查节点状态
-    nodes := &bkev1beta1.BKENodeList{}
-    if err := r.List(ctx, nodes, client.MatchingLabels{
-        "cluster.x-k8s.io/cluster-name": cluster.Name,
-    }); err != nil {
-        return err
-    }
-    
-    for _, node := range nodes.Items {
-        if node.Status.State == "Failed" {
-            return fmt.Errorf("node %s is in Failed state", node.Name)
-        }
-    }
-    
-    // 检查组件状态
-    for componentName, status := range cluster.Status.ComponentStatuses {
-        if status.Phase == "Failed" {
-            return fmt.Errorf("component %s is in Failed state", componentName)
-        }
-    }
-    
-    return nil
-}
-```
-
-**重试决策**：
-
-```go
-type RetryStrategy string
-
-const (
-    RetryStrategyFull        RetryStrategy = "Full"        // 从头开始
-    RetryStrategyFromFailure RetryStrategy = "FromFailure" // 从失败点继续
-)
-
-func (r *Reconciler) decideRetryStrategy(cluster *bkev1beta1.BKECluster) RetryStrategy {
-    // 检查已完成的组件
-    completed := cluster.Status.OperationProgress.Completed
-    
-    if len(completed) == 0 {
-        // 没有已完成的组件，从头开始
-        return RetryStrategyFull
-    }
-    
-    // 检查失败的组件
-    lastFailure := cluster.Status.OperationProgress.LastFailure
-    
-    if lastFailure != nil {
-        // 有失败的组件，从失败点继续
-        return RetryStrategyFromFailure
-    }
-    
-    // 默认从头开始
-    return RetryStrategyFull
-}
-```
-
-**状态恢复**：
-
-```go
-func (r *Reconciler) restoreState(ctx context.Context, cluster *bkev1beta1.BKECluster) error {
-    // 重置 OperationProgress
-    cluster.Status.OperationProgress.LastError = ""
-    cluster.Status.OperationProgress.LastFailure = nil
-    
-    // 恢复集群状态
-    switch cluster.Status.OperationProgress.OperationType {
-    case "Install":
-        cluster.Status.Phase = "Creating"
-    case "Upgrade":
-        cluster.Status.Phase = "Upgrading"
-    case "Scale":
-        cluster.Status.Phase = "Scaling"
-    case "Rollback":
-        cluster.Status.Phase = "RollingBack"
-    }
-    
-    // 清理失败的组件状态
-    for componentName, status := range cluster.Status.ComponentStatuses {
-        if status.Phase == "Failed" {
-            // 重置为 Pending 或 Installing
-            cluster.Status.ComponentStatuses[componentName].Phase = "Pending"
-        }
-    }
-    
-    return r.Status().Update(ctx, cluster)
-}
-```
-
-**执行重试**：
-
-```go
-func (r *Reconciler) executeRetry(ctx context.Context, cluster *bkev1beta1.BKECluster) (ctrl.Result, error) {
+    // 4. 重试决策
     strategy := r.decideRetryStrategy(cluster)
+    
+    // 5. 执行重试
+    var result ctrl.Result
+    var err error
     
     switch strategy {
     case RetryStrategyFull:
         // 从头开始
-        return r.executeDAG(ctx, cluster)
+        result, err = r.executeDAG(ctx, cluster)
     
     case RetryStrategyFromFailure:
         // 从失败点继续
-        return r.resumeDAG(ctx, cluster, cluster.Status.OperationProgress.LastFailure)
+        result, err = r.resumeDAG(ctx, cluster, cluster.Status.OperationProgress.LastFailure)
     }
     
-    return ctrl.Result{}, nil
-}
-```
-
-**结果处理**：
-
-```go
-func (r *Reconciler) handleRetryResult(ctx context.Context, cluster *bkev1beta1.BKECluster, err error) (ctrl.Result, error) {
+    // 6. 结果处理
     if err != nil {
-        // 重试失败
+        // 重试失败，重置 Attempt 计数器
         cluster.Status.OperationProgress.MarkFailure(
             componentName, version, err.Error(), metav1.Now())
+        r.Status().Update(ctx, cluster)
         
-        // 检查是否达到最大重试次数
-        if cluster.Status.OperationProgress.LastFailure.Attempt >= maxRetries {
-            // 达到最大重试次数，等待再次人工介入
-            return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
-        }
-        
-        // 指数退避
-        backoff := calculateBackoff(cluster.Status.OperationProgress.LastFailure.Attempt)
-        return ctrl.Result{RequeueAfter: backoff}, nil
+        return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
     }
     
     // 重试成功
     cluster.Status.OperationProgress.FinishedAt = &metav1.Time{Time: time.Now()}
     cluster.Status.Phase = "Running"
+    cluster.Status.OperationProgress.LastError = ""
+    cluster.Status.OperationProgress.LastFailure = nil
+    cluster.Status.OperationProgress.NeedsManualIntervention = false
     
     return ctrl.Result{}, r.Status().Update(ctx, cluster)
 }
 ```
 
-**完整的人工介入处理流程**：
-
-```go
-func (r *Reconciler) handleManualIntervention(ctx context.Context, cluster *bkev1beta1.BKECluster) (ctrl.Result, error) {
-    // 1. 检测介入信号
-    if !r.detectManualIntervention(cluster) {
-        return ctrl.Result{}, nil
-    }
-    
-    // 2. 状态验证
-    if err := r.validateRetryState(cluster); err != nil {
-        return ctrl.Result{}, err
-    }
-    
-    // 3. 依赖检查
-    if err := r.validateDependencies(ctx, cluster); err != nil {
-        return ctrl.Result{}, err
-    }
-    
-    // 4. 状态恢复
-    if err := r.restoreState(ctx, cluster); err != nil {
-        return ctrl.Result{}, err
-    }
-    
-    // 5. 执行重试
-    result, err := r.executeRetry(ctx, cluster)
-    if err != nil {
-        // 6. 结果处理（失败）
-        return r.handleRetryResult(ctx, cluster, err)
-    }
-    
-    // 6. 结果处理（成功）
-    return r.handleRetryResult(ctx, cluster, nil)
-}
-```
-
 #### 6.3.4 resumeDAG 实现
 
-**resumeDAG 函数**：
+**从失败点继续执行**
 
 ```go
-// resumeDAG 从失败点继续执行 DAG
 func (r *Reconciler) resumeDAG(
     ctx context.Context,
     cluster *bkev1beta1.BKECluster,
-    lastFailure *bkev1beta1.DeclarativeUpgradeFailureRecord,
+    lastFailure *DeclarativeUpgradeFailureRecord,
 ) (ctrl.Result, error) {
     // 1. 获取 DAG 定义
     dag, err := r.getDAG(ctx, cluster)
@@ -1134,27 +1056,10 @@ func (r *Reconciler) resumeDAG(
     return r.executeExecutionPlan(ctx, cluster, executionPlan)
 }
 
-// getDAG 获取 DAG 定义
-func (r *Reconciler) getDAG(
-    ctx context.Context,
-    cluster *bkev1beta1.BKECluster,
-) (*topology.UpgradeDAG, error) {
-    // 从 ReleaseImage 获取组件列表
-    releaseImage, err := r.getReleaseImage(ctx, cluster)
-    if err != nil {
-        return nil, err
-    }
-    
-    // 构建 DAG
-    builder := topology.NewDAGBuilder(r.Client)
-    return builder.BuildUpgradeDAG(ctx, releaseImage, cluster)
-}
-
-// buildExecutionPlan 构建执行计划
 func (r *Reconciler) buildExecutionPlan(
     dag *topology.UpgradeDAG,
     completed map[string]bool,
-    lastFailure *bkev1beta1.DeclarativeUpgradeFailureRecord,
+    lastFailure *DeclarativeUpgradeFailureRecord,
 ) []topology.ComponentNode {
     var executionPlan []topology.ComponentNode
     
@@ -1180,7 +1085,6 @@ func (r *Reconciler) buildExecutionPlan(
     return executionPlan
 }
 
-// checkDependencies 检查依赖是否满足
 func (r *Reconciler) checkDependencies(
     node topology.ComponentNode,
     completed map[string]bool,
@@ -1193,7 +1097,6 @@ func (r *Reconciler) checkDependencies(
     return true
 }
 
-// executeExecutionPlan 执行执行计划
 func (r *Reconciler) executeExecutionPlan(
     ctx context.Context,
     cluster *bkev1beta1.BKECluster,
@@ -1227,42 +1130,92 @@ func (r *Reconciler) executeExecutionPlan(
 
 #### 6.3.5 介入后重试流程
 
+```mermaid
+stateDiagram-v2
+    [*] --> Failed: 达到最大重试次数
+    Failed --> NeedsManualIntervention: 设置标志位
+    NeedsManualIntervention --> Upgrading: 用户介入 (注解)
+    Upgrading --> Running: 重试成功
+    Upgrading --> Failed: 重试失败 (Attempt=1)
 ```
-T0: 人工介入
-    清除 OperationProgress.LastError
-    清除 OperationProgress.LastFailure
 
-T1: Reconciler 检测到状态变更
-    检查 OperationProgress.TargetVersion
-    检查 OperationProgress.Completed
+#### 6.3.6 立即触发重试机制
 
-T2: 状态验证
-    检查 BKECluster.Status.Phase 是否为 Failed
-    检查 OperationProgress.OperationType
-    检查 OperationProgress.TargetVersion
+**为什么注解可以绕过 RequeueAfter？**
 
-T3: 依赖检查
-    检查节点状态
-    检查组件状态
-    检查依赖关系
+controller-runtime 的队列机制：
 
-T4: 重试决策
-    决定重试起点（从头开始 or 从失败点继续）
-    决定重试策略（全量重试 or 增量重试）
+1. **RequeueAfter**：在指定时间后将请求加入队列
+2. **Watch 事件**：立即将请求加入队列（优先级更高）
 
-T5: 状态恢复
-    重置 OperationProgress 相关字段
-    恢复 BKECluster.Status.Phase 到操作前状态
-    清理失败的组件状态
+当用户修改注解时：
+- 触发 Watch 事件
+- controller-runtime 立即将请求加入队列
+- 不受之前 RequeueAfter 的限制
 
-T6: 执行重试
-    重新执行 DAG（从头开始）
-    或继续执行失败的步骤（从失败点继续）
-    跳过已完成的组件
+**立即触发重试的完整流程**
 
-T7: 操作完成
-    OperationProgress.FinishedAt = now
-    BKEClusterLifecycle = Running
+```mermaid
+stateDiagram-v2
+    [*] --> Failed: 达到最大重试次数
+    Failed --> NeedsManualIntervention: Attempt=3
+    NeedsManualIntervention --> RequeueAfter: 返回 RequeueAfter (5分钟)
+    RequeueAfter --> NeedsManualIntervention: 等待人工介入
+    NeedsManualIntervention --> WatchEvent: 用户设置注解
+    WatchEvent --> Upgrading: 立即执行重试
+    Upgrading --> Running: 重试成功
+    Upgrading --> Failed: 重试失败 (Attempt=1)
+```
+
+**使用示例**
+
+```bash
+# 1. 查看集群状态
+kubectl get bkecluster my-cluster -o yaml
+
+# 2. 查看失败信息
+kubectl get bkecluster my-cluster -o jsonpath='{.status.operationProgress.lastError}'
+
+# 3. 修复问题
+# ... 修复配置错误 / 增加资源 / 其他修复操作 ...
+
+# 4. 触发立即重试
+kubectl annotate bkecluster my-cluster bke.bocloud.com/retry-upgrade=true
+
+# 5. 查看重试结果
+kubectl get bkecluster my-cluster -w
+```
+
+---
+
+## 自动重试与人工介入对比
+
+| 维度 | 自动重试 | 人工介入重试 |
+|------|---------|-------------|
+| **触发条件** | 调谐器返回 RequeueAfter | 用户设置注解 |
+| **触发时机** | 立即触发（指数退避） | 用户手动触发 |
+| **重试次数** | 有限次数（3 次） | 无限次数（每次都需要用户介入） |
+| **状态转换** | 保持 Failed 状态 | 从 Failed 恢复到操作前状态 |
+| **执行策略** | 从失败点继续 | 可以重新选择执行策略 |
+| **适用场景** | 临时错误（网络超时等） | 配置错误、资源不足等需要人工修复的场景 |
+| **Attempt 计数器** | 每次失败增加 1 | 重置为 1 |
+
+---
+
+## 完整状态转换图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Running
+    Running --> Upgrading: 触发操作
+    Upgrading --> Running: 成功
+    Upgrading --> Failed: 失败 (Attempt=1)
+    Failed --> Failed: 自动重试 (Attempt=2)
+    Failed --> Failed: 自动重试 (Attempt=3)
+    Failed --> NeedsManualIntervention: 达到最大重试次数
+    NeedsManualIntervention --> Upgrading: 人工介入
+    Upgrading --> Running: 重试成功
+    Upgrading --> Failed: 重试失败 (Attempt=1)
 ```
 
 ---
