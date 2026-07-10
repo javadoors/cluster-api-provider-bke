@@ -2672,8 +2672,8 @@ BKEClusterReconciler.Reconcile()
 const (
     // RetryOperationAnnotation 触发人工介入重试的注解
     // 值格式："{operationType}" 或 "auto"（自动检测当前操作类型）
-    // 示例：bke.bocloud.com/retry-operation: "Upgrade"
-    RetryOperationAnnotation = "bke.bocloud.com/retry-operation"
+    // 示例：cvo.openfuyao.cn/retry-operation: "Upgrade"
+    RetryOperationAnnotation = "cvo.openfuyao.cn/retry-operation"
 )
 ```
 
@@ -3025,7 +3025,7 @@ T0: 升级失败，达到最大重试次数
     OperationProgress.NeedsManualIntervention = true
 
 T1: 用户诊断问题并修复
-    kubectl annotate bkecluster my-cluster bke.bocloud.com/retry-operation=Upgrade
+    kubectl annotate bkecluster my-cluster cvo.openfuyao.cn/retry-operation=Upgrade
 
 T2: Watch 事件触发，立即 Reconcile
     检测到注解 → 清除注解
