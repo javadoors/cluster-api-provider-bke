@@ -1522,6 +1522,9 @@ type ComponentLifecycleStatus struct {
     // 组件名称
     Name string `json:"name"`
 
+    // 节点 IP（节点级组件必填，集群级组件留空）
+    NodeIP string `json:"nodeIP,omitempty"`
+
     // 组件类型（node/cluster）
     ComponentType ComponentType `json:"componentType"`
 
@@ -2154,6 +2157,7 @@ func (m *ComponentLifecycleMachine) updateComponentStatus(ctx *TransitionContext
     now := metav1.Now()
     status := ComponentLifecycleStatus{
         Name:               m.componentName,
+        NodeIP:             m.nodeIP,
         Phase:              phase,
         LastTransitionTime: &now,
         Message:            message,
@@ -2630,6 +2634,7 @@ func (s *Scheduler) updateComponentLifecycle(
 ) {
     status := confv1beta1.ComponentLifecycleStatus{
         Name:               componentName,
+        NodeIP:             nodeIP,
         Phase:              phase,
         CurrentVersion:     version,
         LastTransitionTime: &metav1.Time{Time: time.Now()},
