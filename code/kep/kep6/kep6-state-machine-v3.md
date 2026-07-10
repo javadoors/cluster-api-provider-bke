@@ -2201,6 +2201,105 @@ func (m *ComponentLifecycleMachine) Transition(ctx *TransitionContext, target Li
     }
     return nil
 }
+
+// shouldStartInstall 检查是否应该开始安装
+// 条件：组件尚未安装，且 DAG 调度器已将其标记为待安装
+func (m *ComponentLifecycleMachine) shouldStartInstall(ctx *TransitionContext) bool {
+    status := m.getStatus(ctx)
+    if status == nil || status.Phase == ComponentLifecyclePending {
+        // 检查 DAG 是否已调度该组件（通过 OperationProgress 判断）
+        if ctx.Cluster.Status.OperationProgress != nil {
+            for _, completed := range ctx.Cluster.Status.OperationProgress.Completed {
+                if completed.Name == m.componentName {
+                    return false // 已完成，不需要安装
+                }
+            }
+        }
+        return true // 待安装且未完成
+    }
+    return false
+}
+
+// isInstallCompleted 检查安装是否完成
+// 条件：组件状态为 Installed，且版本与目标版本匹配
+func (m *ComponentLifecycleMachine) isInstallCompleted(ctx *TransitionContext) bool {
+    status := m.getStatus(ctx)
+    if status != nil && status.Phase == ComponentLifecycleInstalled {
+        // 检查版本是否匹配目标版本
+        if ctx.Cluster.Status.OperationProgress != nil && ctx.Cluster.Status.OperationProgress.TargetVersion != "" {
+            return status.CurrentVersion == ctx.Cluster.Status.OperationProgress.TargetVersion
+        }
+        return true
+    }
+    return false
+}
+
+// shouldStartUpgrade 检查是否应该开始升级
+// 条件：组件已安装，但版本低于目标版本
+func (m *ComponentLifecycleMachine) shouldStartUpgrade(ctx *TransitionContext) bool {
+    status := m.getStatus(ctx)
+    if status != nil && status.Phase == ComponentLifecycleInstalled {
+        // 检查是否有目标版本且当前版本不匹配
+        if ctx.Cluster.Status.OperationProgress != nil && ctx.Cluster.Status.OperationProgress.TargetVersion != "" {
+            return status.CurrentVersion != ctx.Cluster.Status.OperationProgress.TargetVersion
+        }
+    }
+    return false
+}
+
+// isUpgradeCompleted 检查升级是否完成
+// 条件：组件状态为 Installed，且版本与目标版本匹配
+func (m *ComponentLifecycleMachine) isUpgradeCompleted(ctx *TransitionContext) bool {
+    return m.isInstallCompleted(ctx) // 升级完成后状态与安装完成相同
+}
+
+// isUpgradeFailed 检查升级是否失败
+// 条件：组件状态为 Failed，且 OperationProgress 中有失败记录
+func (m *ComponentLifecycleMachine) isUpgradeFailed(ctx *TransitionContext) bool {
+    status := m.getStatus(ctx)
+    if status != nil && status.Phase == ComponentLifecycleFailed {
+        if ctx.Cluster.Status.OperationProgress != nil && ctx.Cluster.Status.OperationProgress.LastFailure != nil {
+            return ctx.Cluster.Status.OperationProgress.LastFailure.Name == m.componentName
+        }
+    }
+    return false
+}
+
+// isRollbackCompleted 检查回滚是否完成
+// 条件：组件状态为 Installed，且版本已恢复到回滚前版本
+func (m *ComponentLifecycleMachine) isRollbackCompleted(ctx *TransitionContext) bool {
+    status := m.getStatus(ctx)
+    if status != nil && status.Phase == ComponentLifecycleInstalled {
+        // 回滚完成后，版本应该与失败前的版本一致
+        // 这里简化处理：只要状态为 Installed 就认为回滚完成
+        return true
+    }
+    return false
+}
+
+// shouldStartUninstall 检查是否应该开始卸载
+// 条件：组件已安装，且节点正在删除或组件被显式标记为卸载
+func (m *ComponentLifecycleMachine) shouldStartUninstall(ctx *TransitionContext) bool {
+    status := m.getStatus(ctx)
+    if status != nil && status.Phase == ComponentLifecycleInstalled {
+        // 检查节点是否在删除中
+        if m.nodeIP != "" {
+            for _, node := range ctx.Nodes {
+                if node.Spec.IP == m.nodeIP && node.DeletionTimestamp != nil {
+                    return true
+                }
+            }
+        }
+    }
+    return false
+}
+
+// isUninstallCompleted 检查卸载是否完成
+// 条件：组件状态为 Removed
+func (m *ComponentLifecycleMachine) isUninstallCompleted(ctx *TransitionContext) bool {
+    status := m.getStatus(ctx)
+    return status != nil && status.Phase == ComponentLifecycleRemoved
+}
 ```
 
 ### 7.4 状态聚合器设计
@@ -2414,7 +2513,7 @@ func LegacyClusterStatusToLifecycle(oldStatus confv1beta1.ClusterStatus) Lifecyc
 
 #### 7.6.1 与 PhaseFlow 集成
 
-v3 状态机不替换现有 PhaseFlow，而是在 PhaseFlow 执行后更新生命周期状态：
+v3 状态机不替换现有 PhaseFlow，而是在 PhaseFlow 执行后更新生命周期状态。评估顺序为**自底向上**：组件 → 节点 → 集群，确保上层状态基于最新的下层状态：
 
 ```
 BKEClusterReconciler.Reconcile()
@@ -2423,10 +2522,12 @@ BKEClusterReconciler.Reconcile()
   ├─ 2. handleClusterStatus()
   ├─ 3. executePhaseFlow()           ← 现有逻辑不变
   │     └─ PhaseFlow.Execute()       ← 现有 Phase 执行
-  ├─ 4. ★ evaluateLifecycle()        ← 新增：v3 状态机评估
+  ├─ 4. ★ evaluateLifecycle()        ← 新增：v3 状态机评估（自底向上）
   │     ├─ 构建 TransitionContext
-  │     ├─ ClusterLifecycleMachine.Evaluate()
+  │     ├─ ComponentLifecycleMachine.Evaluate() (节点级组件)
+  │     ├─ ComponentLifecycleMachine.Evaluate() (集群级组件)
   │     ├─ NodeLifecycleMachine.Evaluate() (每个节点)
+  │     ├─ ClusterLifecycleMachine.Evaluate()
   │     └─ 更新 LifecyclePhase 字段
   ├─ 5. ★ syncLegacyFields()         ← 新增：兼容性双写
   └─ 6. getFinalResult()
@@ -2452,18 +2553,44 @@ func (r *BKEClusterReconciler) evaluateLifecycle(
         ClusterComponentStatuses: cluster.Status.ClusterComponentStatuses,
     }
 
-    // 评估集群层状态
-    clusterMachine := statemachine.NewClusterLifecycleMachine()
-    clusterMachine.SetCurrentPhase(LifecyclePhase(cluster.Status.LifecyclePhase))
-    if target, changed := clusterMachine.Evaluate(smCtx); changed {
-        clusterMachine.Transition(smCtx, target)
+    // 1. 评估组件层状态（自底向上）
+    // 评估节点级组件
+    for componentName, nodeComps := range cluster.Status.NodeComponentStatuses {
+        for nodeIP := range nodeComps {
+            compMachine := statemachine.NewComponentLifecycleMachine(componentName, nodeIP)
+            if target, changed := compMachine.Evaluate(smCtx); changed {
+                if err := compMachine.Transition(smCtx, target); err != nil {
+                    return err
+                }
+            }
+        }
+    }
+    // 评估集群级组件
+    for componentName := range cluster.Status.ClusterComponentStatuses {
+        compMachine := statemachine.NewComponentLifecycleMachine(componentName, "")
+        if target, changed := compMachine.Evaluate(smCtx); changed {
+            if err := compMachine.Transition(smCtx, target); err != nil {
+                return err
+            }
+        }
     }
 
-    // 评估节点层状态
+    // 2. 评估节点层状态（依赖组件层状态）
     for i := range nodes {
         nodeMachine := statemachine.NewNodeLifecycleMachine(&nodes[i])
         if target, changed := nodeMachine.Evaluate(smCtx); changed {
-            nodeMachine.Transition(smCtx, target)
+            if err := nodeMachine.Transition(smCtx, target); err != nil {
+                return err
+            }
+        }
+    }
+
+    // 3. 评估集群层状态（依赖节点层 + 组件层状态）
+    clusterMachine := statemachine.NewClusterLifecycleMachine()
+    clusterMachine.SetCurrentPhase(LifecyclePhase(cluster.Status.LifecyclePhase))
+    if target, changed := clusterMachine.Evaluate(smCtx); changed {
+        if err := clusterMachine.Transition(smCtx, target); err != nil {
+            return err
         }
     }
 
