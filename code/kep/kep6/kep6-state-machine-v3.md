@@ -760,8 +760,8 @@ func (r *Reconciler) executeDAGWithRetry(ctx context.Context, cluster *bkev1beta
             cluster.Status.OperationProgress.NeedsManualIntervention = true
             r.Status().Update(ctx, cluster)
             
-            // 返回 RequeueAfter，等待人工介入
-            return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+            // 停止调谐，等待人工介入（注解触发）
+            return ctrl.Result{}, nil
         }
         
         r.Status().Update(ctx, cluster)
@@ -933,14 +933,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
     
     // 2. 检查是否需要人工介入（达到最大自动重试次数）
     if r.needsManualIntervention(cluster) {
-        // 设置标志位
+        // 设置标志位（仅首次）
         if !cluster.Status.OperationProgress.NeedsManualIntervention {
             cluster.Status.OperationProgress.NeedsManualIntervention = true
             r.Status().Update(ctx, cluster)
         }
         
-        // 返回 RequeueAfter，等待人工介入
-        return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+        // 停止调谐，等待人工介入（注解触发）
+        return ctrl.Result{}, nil
     }
     
     // 3. 正常执行或自动重试
@@ -2720,7 +2720,8 @@ func (r *BKEClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
             cluster.Status.OperationProgress.NeedsManualIntervention = true
             r.Status().Update(ctx, cluster)
         }
-        return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+        // 停止调谐，等待人工介入（注解触发）
+        return ctrl.Result{}, nil
     }
 
     // 3. 正常执行
