@@ -207,21 +207,18 @@ type OperationProgress struct {
     
     // 已完成组件列表
     Completed []ComponentRecord `json:"completed,omitempty"`
-    
-    // 当前操作阶段
-    Phase string `json:"phase,omitempty"` // Installing/Upgrading/Scaling/RollingBack
 }
 ```
 
 **使用场景**：
 
-| 场景 | OperationType | Phase |
-|------|---------------|-------|
-| 集群安装 | `Install` | `Installing` |
-| 集群升级 | `Upgrade` | `Upgrading` |
-| 集群扩容 | `Scale` | `Scaling` |
-| 集群缩容 | `Scale` | `Scaling` |
-| 集群回滚 | `Rollback` | `RollingBack` |
+| 场景 | OperationType |
+|------|---------------|
+| 集群安装 | `Install` |
+| 集群升级 | `Upgrade` |
+| 集群扩容 | `Scale` |
+| 集群缩容 | `Scale` |
+| 集群回滚 | `Rollback` |
 
 ---
 
@@ -474,7 +471,6 @@ func AggregateClusterStateFromComponents(
 T0: BKEClusterLifecycle = Creating
     BKECluster.Status.Phase = Creating
     OperationProgress.OperationType = Install
-    OperationProgress.Phase = Installing
 
 T1: BKENodeLifecycle = Pending (新节点加入)
     BKENode.State = Pending
@@ -521,7 +517,6 @@ T7: BKEClusterLifecycle = Running
 T0: BKEClusterLifecycle = Running → Upgrading
     BKECluster.Status.Phase = Upgrading
     OperationProgress.OperationType = Upgrade
-    OperationProgress.Phase = Upgrading
     OperationProgress.StartedAt = now
 
 T1: 节点级组件 Upgrading (containerd, bkeagent)
@@ -570,7 +565,6 @@ T0: 升级失败
 T1: BKEClusterLifecycle = Upgrading → RollingBack
     BKECluster.Status.Phase = RollingBack
     OperationProgress.OperationType = Rollback
-    OperationProgress.Phase = RollingBack
 
 T2: 节点级组件 RollingBack (containerd, bkeagent)
     ComponentLifecycle = RollingBack
@@ -610,7 +604,6 @@ T6: BKEClusterLifecycle = RollingBack → Running
 T0: BKEClusterLifecycle = Running → Scaling
     BKECluster.Status.Phase = Scaling
     OperationProgress.OperationType = Scale
-    OperationProgress.Phase = Scaling
 
 T1: 新节点加入
     BKENodeLifecycle = Pending
@@ -648,7 +641,6 @@ T4: BKEClusterLifecycle = Scaling → Running
 T0: BKEClusterLifecycle = Running → Scaling
     BKECluster.Status.Phase = Scaling
     OperationProgress.OperationType = Scale
-    OperationProgress.Phase = Scaling
 
 T1: 节点标记删除
     BKENodeLifecycle = Ready → Deleting
@@ -705,10 +697,10 @@ type OperationProgress struct {
     Completed []ComponentRecord `json:"completed,omitempty"`
     
     // 最后失败记录（包含重试计数器）
-    LastFailure *DeclarativeUpgradeFailureRecord `json:"lastFailure,omitempty"`
+    LastFailure *OperationFailureRecord `json:"lastFailure,omitempty"`
 }
 
-type DeclarativeUpgradeFailureRecord struct {
+type OperationFailureRecord struct {
     Name     string      `json:"name"`
     Version  string      `json:"version,omitempty"`
     FailedAt metav1.Time `json:"failedAt"`
@@ -731,7 +723,7 @@ func (p *OperationProgress) MarkFailure(name, version, errMsg string, now metav1
         attempt = p.LastFailure.Attempt + 1
     }
     
-    p.LastFailure = &DeclarativeUpgradeFailureRecord{
+    p.LastFailure = &OperationFailureRecord{
         Name:     name,
         Version:  version,
         FailedAt: now,
@@ -1046,7 +1038,7 @@ func (r *Reconciler) handleManualIntervention(ctx context.Context, cluster *bkev
 func (r *Reconciler) resumeDAG(
     ctx context.Context,
     cluster *bkev1beta1.BKECluster,
-    lastFailure *DeclarativeUpgradeFailureRecord,
+    lastFailure *OperationFailureRecord,
 ) (ctrl.Result, error) {
     // 1. 获取 DAG 定义
     dag, err := r.getDAG(ctx, cluster)
@@ -1070,7 +1062,7 @@ func (r *Reconciler) resumeDAG(
 func (r *Reconciler) buildExecutionPlan(
     dag *topology.UpgradeDAG,
     completed map[string]bool,
-    lastFailure *DeclarativeUpgradeFailureRecord,
+    lastFailure *OperationFailureRecord,
 ) []topology.ComponentNode {
     var executionPlan []topology.ComponentNode
     
@@ -1507,11 +1499,8 @@ type OperationProgress struct {
     // 已完成组件列表
     Completed []ComponentRecord `json:"completed,omitempty"`
 
-    // 当前操作阶段
-    Phase string `json:"phase,omitempty"`
-
     // 最后失败记录（包含重试计数器）
-    LastFailure *DeclarativeUpgradeFailureRecord `json:"lastFailure,omitempty"`
+    LastFailure *OperationFailureRecord `json:"lastFailure,omitempty"`
 }
 
 type ComponentRecord struct {
