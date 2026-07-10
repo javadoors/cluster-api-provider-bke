@@ -1745,11 +1745,69 @@ func (m *ClusterLifecycleMachine) Evaluate(ctx *TransitionContext) (LifecyclePha
     return m.currentPhase, false
 }
 
+func (m *ClusterLifecycleMachine) defaultActions() map[LifecyclePhase]func(ctx *TransitionContext) error {
+    return map[LifecyclePhase]func(ctx *TransitionContext) error{
+        ClusterLifecycleRunning: func(ctx *TransitionContext) error {
+            now := metav1.Now()
+            if ctx.Cluster.Status.OperationProgress != nil {
+                ctx.Cluster.Status.OperationProgress.FinishedAt = &now
+                ctx.Cluster.Status.OperationProgress.LastError = ""
+                ctx.Cluster.Status.OperationProgress.LastFailure = nil
+                ctx.Cluster.Status.OperationProgress.NeedsManualIntervention = false
+            }
+            ctx.Cluster.Status.Ready = true
+            return nil
+        },
+        ClusterLifecycleUpgrading: func(ctx *TransitionContext) error {
+            now := metav1.Now()
+            targetVersion := ""
+            if ctx.Cluster.Status.DeclarativeUpgrade != nil {
+                targetVersion = ctx.Cluster.Status.DeclarativeUpgrade.TargetVersion
+            }
+            ctx.Cluster.Status.OperationProgress = &OperationProgress{
+                OperationType: OperationTypeUpgrade,
+                TargetVersion: targetVersion,
+                StartedAt:     &now,
+            }
+            ctx.Cluster.Status.Ready = false
+            return nil
+        },
+        ClusterLifecycleRollingBack: func(ctx *TransitionContext) error {
+            if ctx.Cluster.Status.OperationProgress != nil {
+                ctx.Cluster.Status.OperationProgress.OperationType = OperationTypeRollback
+            }
+            return nil
+        },
+        ClusterLifecycleScaling: func(ctx *TransitionContext) error {
+            now := metav1.Now()
+            ctx.Cluster.Status.OperationProgress = &OperationProgress{
+                OperationType: OperationTypeScale,
+                StartedAt:     &now,
+            }
+            return nil
+        },
+        ClusterLifecycleFailed: func(ctx *TransitionContext) error {
+            if ctx.Cluster.Status.OperationProgress != nil &&
+                ctx.Cluster.Status.OperationProgress.LastFailure != nil &&
+                ctx.Cluster.Status.OperationProgress.LastFailure.Attempt >= maxAutoRetries {
+                ctx.Cluster.Status.OperationProgress.NeedsManualIntervention = true
+            }
+            return nil
+        },
+    }
+}
+
 func (m *ClusterLifecycleMachine) Transition(ctx *TransitionContext, target LifecyclePhase) error {
     if m.currentPhase == target {
         return nil
     }
-    // 执行转换动作（如果有）
+    // 1. 执行目标状态的默认动作
+    if action, ok := m.defaultActions()[target]; ok {
+        if err := action(ctx); err != nil {
+            return err
+        }
+    }
+    // 2. 执行规则自定义动作（如果有）
     for _, rule := range m.rules {
         if (rule.From == m.currentPhase || rule.From == "") && rule.To == target {
             if rule.Action != nil {
@@ -1760,10 +1818,9 @@ func (m *ClusterLifecycleMachine) Transition(ctx *TransitionContext, target Life
             break
         }
     }
+    // 3. 更新状态并同步到旧字段
     m.currentPhase = target
-    // 同步写入 BKECluster.Status.LifecyclePhase
     ctx.Cluster.Status.LifecyclePhase = target
-    // 兼容性：同步写入旧字段
     SyncClusterPhaseToLegacyFields(ctx.Cluster, target)
     return nil
 }
@@ -1876,9 +1933,63 @@ func (m *NodeLifecycleMachine) Evaluate(ctx *TransitionContext) (LifecyclePhase,
     return current, false
 }
 
+func (m *NodeLifecycleMachine) defaultActions() map[LifecyclePhase]func(ctx *TransitionContext) error {
+    return map[LifecyclePhase]func(ctx *TransitionContext) error{
+        NodeLifecycleProvisioned: func(ctx *TransitionContext) error {
+            m.node.Status.Message = "Agent ready and environment initialized"
+            return nil
+        },
+        NodeLifecycleReady: func(ctx *TransitionContext) error {
+            m.node.Status.Message = "All node components installed"
+            return nil
+        },
+        NodeLifecycleUpgrading: func(ctx *TransitionContext) error {
+            m.node.Status.Message = "Node upgrade in progress"
+            return nil
+        },
+        NodeLifecycleRollingBack: func(ctx *TransitionContext) error {
+            m.node.Status.Message = "Node rollback in progress"
+            return nil
+        },
+        NodeLifecycleDeleting: func(ctx *TransitionContext) error {
+            m.node.Status.Message = "Node deletion in progress"
+            return nil
+        },
+        NodeLifecycleRemoved: func(ctx *TransitionContext) error {
+            m.node.Status.Message = "Node removed"
+            return nil
+        },
+        NodeLifecycleFailed: func(ctx *TransitionContext) error {
+            m.node.Status.Message = "Node operation failed"
+            return nil
+        },
+    }
+}
+
 func (m *NodeLifecycleMachine) Transition(ctx *TransitionContext, target LifecyclePhase) error {
+    current := m.CurrentPhase()
+    if current == target {
+        return nil
+    }
+    // 1. 执行目标状态的默认动作
+    if action, ok := m.defaultActions()[target]; ok {
+        if err := action(ctx); err != nil {
+            return err
+        }
+    }
+    // 2. 执行规则自定义动作（如果有）
+    for _, rule := range m.rules {
+        if rule.From == current && rule.To == target {
+            if rule.Action != nil {
+                if err := rule.Action(ctx); err != nil {
+                    return err
+                }
+            }
+            break
+        }
+    }
+    // 3. 更新状态并同步到旧字段
     m.node.Status.LifecyclePhase = target
-    // 兼容性：同步写入旧字段
     SyncNodeStateToLegacyFields(m.node, target)
     return nil
 }
@@ -1998,6 +2109,97 @@ func (m *ComponentLifecycleMachine) CurrentPhase() LifecyclePhase {
         return ComponentLifecyclePending
     }
     return status.Phase
+}
+
+func (m *ComponentLifecycleMachine) Evaluate(ctx *TransitionContext) (LifecyclePhase, bool) {
+    current := m.CurrentPhase()
+    for _, rule := range m.rules {
+        if rule.From != current {
+            continue
+        }
+        if rule.Condition(ctx) {
+            return rule.To, true
+        }
+    }
+    return current, false
+}
+
+func (m *ComponentLifecycleMachine) defaultActions() map[LifecyclePhase]func(ctx *TransitionContext) error {
+    return map[LifecyclePhase]func(ctx *TransitionContext) error{
+        ComponentLifecycleInstalling: func(ctx *TransitionContext) error {
+            return m.updateComponentStatus(ctx, ComponentLifecycleInstalling, "Component installation in progress")
+        },
+        ComponentLifecycleInstalled: func(ctx *TransitionContext) error {
+            return m.updateComponentStatus(ctx, ComponentLifecycleInstalled, "Component installed successfully")
+        },
+        ComponentLifecycleUpgrading: func(ctx *TransitionContext) error {
+            return m.updateComponentStatus(ctx, ComponentLifecycleUpgrading, "Component upgrade in progress")
+        },
+        ComponentLifecycleRollingBack: func(ctx *TransitionContext) error {
+            return m.updateComponentStatus(ctx, ComponentLifecycleRollingBack, "Component rollback in progress")
+        },
+        ComponentLifecycleUninstalling: func(ctx *TransitionContext) error {
+            return m.updateComponentStatus(ctx, ComponentLifecycleUninstalling, "Component uninstallation in progress")
+        },
+        ComponentLifecycleRemoved: func(ctx *TransitionContext) error {
+            return m.updateComponentStatus(ctx, ComponentLifecycleRemoved, "Component removed")
+        },
+        ComponentLifecycleFailed: func(ctx *TransitionContext) error {
+            return m.updateComponentStatus(ctx, ComponentLifecycleFailed, "Component operation failed")
+        },
+    }
+}
+
+func (m *ComponentLifecycleMachine) updateComponentStatus(ctx *TransitionContext, phase LifecyclePhase, message string) error {
+    now := metav1.Now()
+    status := ComponentLifecycleStatus{
+        Name:               m.componentName,
+        Phase:              phase,
+        LastTransitionTime: &now,
+        Message:            message,
+    }
+    if m.nodeIP != "" {
+        // 节点级组件
+        if ctx.Cluster.Status.NodeComponentStatuses == nil {
+            ctx.Cluster.Status.NodeComponentStatuses = make(map[string]map[string]ComponentLifecycleStatus)
+        }
+        if ctx.Cluster.Status.NodeComponentStatuses[m.componentName] == nil {
+            ctx.Cluster.Status.NodeComponentStatuses[m.componentName] = make(map[string]ComponentLifecycleStatus)
+        }
+        ctx.Cluster.Status.NodeComponentStatuses[m.componentName][m.nodeIP] = status
+    } else {
+        // 集群级组件
+        if ctx.Cluster.Status.ClusterComponentStatuses == nil {
+            ctx.Cluster.Status.ClusterComponentStatuses = make(map[string]ComponentLifecycleStatus)
+        }
+        ctx.Cluster.Status.ClusterComponentStatuses[m.componentName] = status
+    }
+    return nil
+}
+
+func (m *ComponentLifecycleMachine) Transition(ctx *TransitionContext, target LifecyclePhase) error {
+    current := m.CurrentPhase()
+    if current == target {
+        return nil
+    }
+    // 1. 执行目标状态的默认动作
+    if action, ok := m.defaultActions()[target]; ok {
+        if err := action(ctx); err != nil {
+            return err
+        }
+    }
+    // 2. 执行规则自定义动作（如果有）
+    for _, rule := range m.rules {
+        if rule.From == current && rule.To == target {
+            if rule.Action != nil {
+                if err := rule.Action(ctx); err != nil {
+                    return err
+                }
+            }
+            break
+        }
+    }
+    return nil
 }
 ```
 
