@@ -2679,15 +2679,22 @@ const (
 
 **触发机制**：
 
-当用户设置注解时，controller-runtime 的 Watch 机制会立即将请求加入队列，绕过 `RequeueAfter` 的限制：
+当达到最大自动重试次数后，控制器停止调谐（返回 `ctrl.Result{}`）。用户设置注解后，controller-runtime 的 Watch 机制检测到资源变更，立即触发 Reconcile：
 
 ```
-正常流程：
-  Reconcile 失败 → RequeueAfter(5min) → 等待 5 分钟 → Reconcile
+自动重试流程：
+  Reconcile 失败 → 指数退避重试（Attempt=1,2,3）→ 达到最大重试次数
 
 人工介入流程：
-  Reconcile 失败 → RequeueAfter(5min) → 等待中...
-  用户设置注解 → Watch 事件触发 → 立即 Reconcile（绕过等待）
+  达到最大重试次数 → 设置 NeedsManualIntervention=true → 停止调谐（ctrl.Result{}）
+  ↓
+  用户诊断问题并修复
+  ↓
+  用户设置注解 cvo.openfuyao.cn/retry-operation
+  ↓
+  Watch 事件触发 → 立即 Reconcile（检测到注解）
+  ↓
+  清除注解 → 重置失败状态 → 执行重试
 ```
 
 #### 7.7.2 Reconciler 集成
