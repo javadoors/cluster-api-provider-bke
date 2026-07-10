@@ -703,9 +703,10 @@ type OperationProgress struct {
 type OperationFailureRecord struct {
     Name     string      `json:"name"`
     Version  string      `json:"version,omitempty"`
+    NodeIP   string      `json:"nodeIP,omitempty"` // 节点级组件必填，集群级组件留空
     FailedAt metav1.Time `json:"failedAt"`
     Error    string      `json:"error,omitempty"`
-    Attempt  int32       `json:"attempt,omitempty"` // ← 自动重试计数器
+    Attempt  int32       `json:"attempt,omitempty"`
 }
 ```
 
@@ -715,17 +716,18 @@ Attempt 在每次执行失败后增加 1，在 `MarkFailure` 方法中实现：
 
 ```go
 // MarkFailure 更新失败记录，Attempt 增加
-func (p *OperationProgress) MarkFailure(name, version, errMsg string, now metav1.Time) {
+func (p *OperationProgress) MarkFailure(name, version, nodeIP, errMsg string, now metav1.Time) {
     var attempt int32 = 1
     
-    // 如果是同一个组件连续失败，Attempt 增加
-    if p.LastFailure != nil && p.LastFailure.Name == name {
+    // 如果是同一个组件在同一节点连续失败，Attempt 增加
+    if p.LastFailure != nil && p.LastFailure.Name == name && p.LastFailure.NodeIP == nodeIP {
         attempt = p.LastFailure.Attempt + 1
     }
     
     p.LastFailure = &OperationFailureRecord{
         Name:     name,
         Version:  version,
+        NodeIP:   nodeIP,
         FailedAt: now,
         Error:    errMsg,
         Attempt:  attempt,
@@ -756,7 +758,7 @@ func (r *Reconciler) executeDAGWithRetry(ctx context.Context, cluster *bkev1beta
     if err != nil {
         // 更新失败记录
         cluster.Status.OperationProgress.MarkFailure(
-            componentName, version, err.Error(), metav1.Now())
+            componentName, version, nodeIP, err.Error(), metav1.Now())
         
         // 检查是否达到最大自动重试次数
         if cluster.Status.OperationProgress.LastFailure.Attempt >= maxAutoRetries {
@@ -1013,7 +1015,7 @@ func (r *Reconciler) handleManualIntervention(ctx context.Context, cluster *bkev
     if err != nil {
         // 重试失败，重置 Attempt 计数器
         cluster.Status.OperationProgress.MarkFailure(
-            componentName, version, err.Error(), metav1.Now())
+            componentName, version, nodeIP, err.Error(), metav1.Now())
         r.Status().Update(ctx, cluster)
         
         return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
@@ -1120,7 +1122,7 @@ func (r *Reconciler) executeExecutionPlan(
         
         // 更新完成状态
         cluster.Status.OperationProgress.MarkCompleted(
-            node.Name, node.Version, metav1.Now())
+            node.Name, node.Version, nodeIP, metav1.Now())
         
         if err := r.Status().Update(ctx, cluster); err != nil {
             return ctrl.Result{}, err
@@ -1506,6 +1508,7 @@ type OperationProgress struct {
 type ComponentRecord struct {
     Name        string      `json:"name"`
     Version     string      `json:"version,omitempty"`
+    NodeIP      string      `json:"nodeIP,omitempty"` // 节点级组件必填，集群级组件留空
     CompletedAt metav1.Time `json:"completedAt"`
 }
 ```
