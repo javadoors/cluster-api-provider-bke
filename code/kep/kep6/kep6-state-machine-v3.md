@@ -19,10 +19,11 @@
    - 7.4 [状态聚合器设计](#74-状态聚合器设计)
    - 7.5 [兼容性映射设计](#75-兼容性映射设计)
    - 7.6 [与现有系统集成设计](#76-与现有系统集成设计)
-   - 7.7 [Feature Gate 设计](#77-feature-gate-设计)
-   - 7.8 [迁移策略](#78-迁移策略)
-   - 7.9 [实现文件清单](#79-实现文件清单)
-   - 7.10 [测试设计](#710-测试设计)
+   - 7.7 [人工介入详细设计](#77-人工介入详细设计)
+   - 7.8 [Feature Gate 设计](#78-feature-gate-设计)
+   - 7.9 [迁移策略](#79-迁移策略)
+   - 7.10 [实现文件清单](#710-实现文件清单)
+   - 7.11 [测试设计](#711-测试设计)
 
 ---
 
@@ -2661,9 +2662,390 @@ BKEClusterReconciler.Reconcile()
   └─ ★ evaluateLifecycle()          ← 新增：在 StatusManager 之后运行
 ```
 
-### 7.7 Feature Gate 设计
+### 7.7 人工介入详细设计
 
-#### 7.7.1 Feature Gate 定义
+#### 7.7.1 注解定义
+
+**文件**：`utils/capbke/annotation/annotation.go`
+
+```go
+const (
+    // RetryOperationAnnotation 触发人工介入重试的注解
+    // 值格式："{operationType}" 或 "auto"（自动检测当前操作类型）
+    // 示例：bke.bocloud.com/retry-operation: "Upgrade"
+    RetryOperationAnnotation = "bke.bocloud.com/retry-operation"
+)
+```
+
+**触发机制**：
+
+当用户设置注解时，controller-runtime 的 Watch 机制会立即将请求加入队列，绕过 `RequeueAfter` 的限制：
+
+```
+正常流程：
+  Reconcile 失败 → RequeueAfter(5min) → 等待 5 分钟 → Reconcile
+
+人工介入流程：
+  Reconcile 失败 → RequeueAfter(5min) → 等待中...
+  用户设置注解 → Watch 事件触发 → 立即 Reconcile（绕过等待）
+```
+
+#### 7.7.2 Reconciler 集成
+
+**文件**：`controllers/capbke/bkecluster_controller.go`
+
+在 `evaluateLifecycle()` 前增加人工介入检查：
+
+```go
+func (r *BKEClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    cluster := &bkev1beta1.BKECluster{}
+    if err := r.Get(ctx, req.NamespacedName, cluster); err != nil {
+        return ctrl.Result{}, err
+    }
+
+    // 1. ★ 检查人工介入注解（最高优先级）
+    if retryOp, hasRetry := cluster.Annotations[annotation.RetryOperationAnnotation]; hasRetry {
+        // 清除注解
+        delete(cluster.Annotations, annotation.RetryOperationAnnotation)
+        if err := r.Update(ctx, cluster); err != nil {
+            return ctrl.Result{}, err
+        }
+        // 执行重试
+        return r.handleManualIntervention(ctx, cluster, retryOp)
+    }
+
+    // 2. 检查是否需要人工介入（达到最大自动重试次数）
+    if r.needsManualIntervention(cluster) {
+        if !cluster.Status.OperationProgress.NeedsManualIntervention {
+            cluster.Status.OperationProgress.NeedsManualIntervention = true
+            r.Status().Update(ctx, cluster)
+        }
+        return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+    }
+
+    // 3. 正常执行
+    return r.executeDAGWithRetry(ctx, cluster)
+}
+
+func (r *BKEClusterReconciler) needsManualIntervention(cluster *bkev1beta1.BKECluster) bool {
+    if cluster.Status.OperationProgress == nil {
+        return false
+    }
+    if cluster.Status.OperationProgress.LastFailure == nil {
+        return false
+    }
+    return cluster.Status.OperationProgress.LastFailure.Attempt >= maxAutoRetries
+}
+```
+
+#### 7.7.3 状态机恢复规则
+
+**文件**：`pkg/statemachine/cluster_machine.go`
+
+为集群层状态机补充 `Failed → 操作状态` 的恢复规则：
+
+```go
+func (m *ClusterLifecycleMachine) buildRules() []TransitionRule {
+    return []TransitionRule{
+        // ... 现有规则 ...
+
+        // Failed → Upgrading: 人工介入后重新升级
+        {
+            From: ClusterLifecycleFailed,
+            To:   ClusterLifecycleUpgrading,
+            Condition: func(ctx *TransitionContext) bool {
+                return ctx.Cluster.Status.OperationProgress != nil &&
+                    ctx.Cluster.Status.OperationProgress.OperationType == OperationTypeUpgrade &&
+                    ctx.Cluster.Status.OperationProgress.LastFailure != nil &&
+                    ctx.Cluster.Status.OperationProgress.LastFailure.Attempt == 1
+            },
+        },
+        // Failed → Scaling: 人工介入后重新扩缩容
+        {
+            From: ClusterLifecycleFailed,
+            To:   ClusterLifecycleScaling,
+            Condition: func(ctx *TransitionContext) bool {
+                return ctx.Cluster.Status.OperationProgress != nil &&
+                    ctx.Cluster.Status.OperationProgress.OperationType == OperationTypeScale &&
+                    ctx.Cluster.Status.OperationProgress.LastFailure != nil &&
+                    ctx.Cluster.Status.OperationProgress.LastFailure.Attempt == 1
+            },
+        },
+        // Failed → Creating: 人工介入后重新创建
+        {
+            From: ClusterLifecycleFailed,
+            To:   ClusterLifecycleCreating,
+            Condition: func(ctx *TransitionContext) bool {
+                return ctx.Cluster.Status.OperationProgress != nil &&
+                    ctx.Cluster.Status.OperationProgress.OperationType == OperationTypeInstall &&
+                    ctx.Cluster.Status.OperationProgress.LastFailure != nil &&
+                    ctx.Cluster.Status.OperationProgress.LastFailure.Attempt == 1
+            },
+        },
+    }
+}
+```
+
+**恢复规则的 `defaultActions`**：
+
+```go
+func (m *ClusterLifecycleMachine) defaultActions() map[LifecyclePhase]func(ctx *TransitionContext) error {
+    return map[LifecyclePhase]func(ctx *TransitionContext) error{
+        // ... 现有动作 ...
+
+        ClusterLifecycleUpgrading: func(ctx *TransitionContext) error {
+            now := metav1.Now()
+            targetVersion := ""
+            if ctx.Cluster.Status.DeclarativeUpgrade != nil {
+                targetVersion = ctx.Cluster.Status.DeclarativeUpgrade.TargetVersion
+            }
+
+            // 如果是从 Failed 恢复，重置 OperationProgress
+            if m.currentPhase == ClusterLifecycleFailed {
+                ctx.Cluster.Status.OperationProgress = &OperationProgress{
+                    OperationType: OperationTypeUpgrade,
+                    TargetVersion: targetVersion,
+                    StartedAt:     &now,
+                    // LastFailure 会被重置，Attempt 从 1 开始
+                }
+            } else {
+                ctx.Cluster.Status.OperationProgress = &OperationProgress{
+                    OperationType: OperationTypeUpgrade,
+                    TargetVersion: targetVersion,
+                    StartedAt:     &now,
+                }
+            }
+            ctx.Cluster.Status.Ready = false
+            return nil
+        },
+    }
+}
+```
+
+#### 7.7.4 状态重置逻辑
+
+**文件**：`controllers/capbke/bkecluster_controller.go`
+
+人工介入时重置状态：
+
+```go
+func (r *BKEClusterReconciler) handleManualIntervention(
+    ctx context.Context,
+    cluster *bkev1beta1.BKECluster,
+    retryOp string,
+) (ctrl.Result, error) {
+    // 1. 状态验证
+    if cluster.Status.OperationProgress == nil {
+        return ctrl.Result{}, fmt.Errorf("no operation progress found")
+    }
+
+    // 2. 重置失败记录
+    cluster.Status.OperationProgress.LastFailure = nil
+    cluster.Status.OperationProgress.NeedsManualIntervention = false
+
+    // 3. 根据重试策略决定是否重置 Completed
+    strategy := r.decideRetryStrategy(cluster, retryOp)
+
+    switch strategy {
+    case RetryStrategyFromFailure:
+        // 从失败点继续：保留 Completed，只重置 LastFailure
+        // Attempt 会在下次失败时从 1 开始
+        r.Log.Info("retrying from failure point",
+            "lastFailedComponent", cluster.Status.OperationProgress.LastFailure.Name,
+            "completedCount", len(cluster.Status.OperationProgress.Completed))
+
+    case RetryStrategyFull:
+        // 从头开始：重置所有进度
+        cluster.Status.OperationProgress.Completed = nil
+        cluster.Status.OperationProgress.StartedAt = &metav1.Time{Time: time.Now()}
+        r.Log.Info("retrying from beginning")
+    }
+
+    // 4. 重置组件生命周期状态（仅针对失败的组件）
+    if err := r.resetFailedComponentLifecycle(ctx, cluster); err != nil {
+        return ctrl.Result{}, err
+    }
+
+    // 5. 更新状态
+    if err := r.Status().Update(ctx, cluster); err != nil {
+        return ctrl.Result{}, err
+    }
+
+    // 6. 立即执行 DAG
+    return r.executeDAG(ctx, cluster)
+}
+
+func (r *BKEClusterReconciler) decideRetryStrategy(
+    cluster *bkev1beta1.BKECluster,
+    retryOp string,
+) RetryStrategy {
+    // 如果注解值为 "full"，强制从头开始
+    if retryOp == "full" {
+        return RetryStrategyFull
+    }
+    // 默认从失败点继续
+    return RetryStrategyFromFailure
+}
+
+func (r *BKEClusterReconciler) resetFailedComponentLifecycle(
+    ctx context.Context,
+    cluster *bkev1beta1.BKECluster,
+) error {
+    if cluster.Status.OperationProgress.LastFailure == nil {
+        return nil
+    }
+
+    failedComponent := cluster.Status.OperationProgress.LastFailure.Name
+    failedNodeIP := cluster.Status.OperationProgress.LastFailure.NodeIP
+
+    // 重置节点级组件状态
+    if failedNodeIP != "" {
+        if nodeComps, ok := cluster.Status.NodeComponentStatuses[failedComponent]; ok {
+            if status, ok := nodeComps[failedNodeIP]; ok {
+                status.Phase = ComponentLifecyclePending
+                status.Message = "reset for manual retry"
+                nodeComps[failedNodeIP] = status
+            }
+        }
+    } else {
+        // 重置集群级组件状态
+        if status, ok := cluster.Status.ClusterComponentStatuses[failedComponent]; ok {
+            status.Phase = ComponentLifecyclePending
+            status.Message = "reset for manual retry"
+            cluster.Status.ClusterComponentStatuses[failedComponent] = status
+        }
+    }
+
+    return nil
+}
+```
+
+#### 7.7.5 resumeDAG 适配
+
+**文件**：`controllers/capbke/bkecluster_controller.go`
+
+基于新类型 `OperationFailureRecord`（含 NodeIP）的断点恢复：
+
+```go
+func (r *BKEClusterReconciler) resumeDAG(
+    ctx context.Context,
+    cluster *bkev1beta1.BKECluster,
+) (ctrl.Result, error) {
+    // 1. 获取 DAG 定义
+    dag, err := r.getDAG(ctx, cluster)
+    if err != nil {
+        return ctrl.Result{}, err
+    }
+
+    // 2. 构建已完成组件集合
+    completed := make(map[string]bool)
+    for _, record := range cluster.Status.OperationProgress.Completed {
+        // 使用 "name:nodeIP" 作为 key，支持同一组件在不同节点的状态追踪
+        key := fmt.Sprintf("%s:%s", record.Name, record.NodeIP)
+        completed[key] = true
+    }
+
+    // 3. 获取失败记录
+    lastFailure := cluster.Status.OperationProgress.LastFailure
+    failedKey := ""
+    if lastFailure != nil {
+        failedKey = fmt.Sprintf("%s:%s", lastFailure.Name, lastFailure.NodeIP)
+    }
+
+    // 4. 构建执行计划
+    executionPlan := r.buildExecutionPlan(dag, completed, failedKey)
+
+    // 5. 执行 DAG
+    return r.executeExecutionPlan(ctx, cluster, executionPlan)
+}
+
+func (r *BKEClusterReconciler) buildExecutionPlan(
+    dag *topology.UpgradeDAG,
+    completed map[string]bool,
+    failedKey string,
+) []topology.ComponentNode {
+    var executionPlan []topology.ComponentNode
+
+    for _, node := range dag.Nodes {
+        // 为每个节点生成 key（考虑 nodeIP）
+        nodeKey := fmt.Sprintf("%s:%s", node.Name, node.NodeIP)
+
+        // 跳过已完成的组件
+        if completed[nodeKey] {
+            continue
+        }
+
+        // 如果是失败的组件，标记为需要重试
+        if nodeKey == failedKey {
+            executionPlan = append(executionPlan, node)
+            continue
+        }
+
+        // 检查依赖是否满足
+        if r.checkDependencies(node, completed) {
+            executionPlan = append(executionPlan, node)
+        }
+    }
+
+    return executionPlan
+}
+```
+
+#### 7.7.6 介入后状态转换图
+
+```mermaid
+stateDiagram-v2
+    [*] --> Upgrading: 升级开始
+    Upgrading --> Failed: 失败 (Attempt=1)
+    Failed --> Failed: 自动重试 (Attempt=2)
+    Failed --> Failed: 自动重试 (Attempt=3)
+    Failed --> NeedsManualIntervention: 达到最大重试次数
+
+    state NeedsManualIntervention {
+        [*] --> WaitingForIntervention
+        WaitingForIntervention --> UserSetsAnnotation: 用户设置注解
+        UserSetsAnnotation --> ResetState: 清除注解
+        ResetState --> ResetComponentLifecycle: 重置失败组件状态
+        ResetComponentLifecycle --> ExecuteDAG: 执行 DAG
+    }
+
+    NeedsManualIntervention --> Upgrading: 重试成功
+    NeedsManualIntervention --> Failed: 重试失败 (Attempt=1)
+
+    Upgrading --> Running: 升级完成
+    Running --> [*]
+```
+
+**状态转换时序**：
+
+```
+T0: 升级失败，达到最大重试次数
+    BKECluster.Status.LifecyclePhase = Failed
+    OperationProgress.LastFailure = {Name: "etcd", NodeIP: "10.0.0.1", Attempt: 3}
+    OperationProgress.NeedsManualIntervention = true
+
+T1: 用户诊断问题并修复
+    kubectl annotate bkecluster my-cluster bke.bocloud.com/retry-operation=Upgrade
+
+T2: Watch 事件触发，立即 Reconcile
+    检测到注解 → 清除注解
+    重置 LastFailure = nil
+    重置 NeedsManualIntervention = false
+    重置组件状态：NodeComponentStatuses["etcd"]["10.0.0.1"].Phase = Pending
+
+T3: 执行 DAG（从失败点继续）
+    跳过已完成的组件（containerd, bkeagent）
+    重试失败的组件（etcd）
+
+T4: 升级完成
+    BKECluster.Status.LifecyclePhase = Running
+    OperationProgress.FinishedAt = now
+    OperationProgress.LastFailure = nil
+```
+
+### 7.8 Feature Gate 设计
+
+#### 7.8.1 Feature Gate 定义
 
 ```go
 // 文件：utils/capbke/featuregate/gates.go
@@ -2677,16 +3059,16 @@ var defaultFeatureGates = map[string]bool{
 }
 ```
 
-#### 7.7.2 Feature Gate 行为矩阵
+#### 7.8.2 Feature Gate 行为矩阵
 
 | Feature Gate | PhaseFlow | DAG 调度 | 生命周期评估 | 旧字段写入 | 新字段写入 |
 |-------------|-----------|---------|-------------|-----------|-----------|
 | `StateMachineV3=false` | ✅ 执行 | ✅ 执行 | ❌ 跳过 | ✅ 写入 | ❌ 不写入 |
 | `StateMachineV3=true` | ✅ 执行 | ✅ 执行 | ✅ 执行 | ✅ 双写 | ✅ 写入 |
 
-### 7.8 迁移策略
+### 7.9 迁移策略
 
-#### 7.8.1 阶段规划
+#### 7.9.1 阶段规划
 
 ```
 Phase 1: 基础设施（v3.0-alpha）
@@ -2718,7 +3100,7 @@ Phase 4: 清理（v4.0）
   └─ 最终移除旧字段
 ```
 
-#### 7.8.2 CRD 版本兼容
+#### 7.9.2 CRD 版本兼容
 
 新增字段均为 `+optional`，不影响现有 CRD 的 backward compatibility：
 
@@ -2735,7 +3117,7 @@ status:
   lifecyclePhase: ""                    # 新增
 ```
 
-### 7.9 实现文件清单
+### 7.10 实现文件清单
 
 | 文件路径 | 操作 | 说明 |
 |---------|------|------|
@@ -2745,30 +3127,33 @@ status:
 | `api/bkecommon/v1beta1/bkecluster_status.go` | 修改 | 新增 LifecyclePhase、OperationProgress 等字段 |
 | `api/bkecommon/v1beta1/bkenode_types.go` | 修改 | 新增 LifecyclePhase 字段 |
 | `pkg/statemachine/engine.go` | 新增 | 状态机引擎核心 |
-| `pkg/statemachine/cluster_machine.go` | 新增 | 集群层状态机 |
+| `pkg/statemachine/cluster_machine.go` | 新增 | 集群层状态机（含 Failed 恢复规则） |
 | `pkg/statemachine/node_machine.go` | 新增 | 节点层状态机 |
 | `pkg/statemachine/component_machine.go` | 新增 | 组件层状态机 |
 | `pkg/statemachine/aggregator.go` | 新增 | 状态聚合器 |
 | `pkg/statemachine/transition.go` | 新增 | 状态转换规则 |
 | `pkg/statemachine/compatibility.go` | 新增 | 兼容性映射 |
 | `pkg/statemachine/types.go` | 新增 | 内部类型 |
-| `controllers/capbke/bkecluster_controller.go` | 修改 | 集成生命周期评估 |
+| `controllers/capbke/bkecluster_controller.go` | 修改 | 集成生命周期评估和人工介入处理 |
+| `controllers/capbke/manual_intervention.go` | 新增 | 人工介入处理逻辑（handleManualIntervention、resumeDAG） |
 | `pkg/dagexec/scheduler.go` | 修改 | 集成组件生命周期更新 |
 | `utils/capbke/featuregate/gates.go` | 修改 | 新增 StateMachineV3 Feature Gate |
+| `utils/capbke/annotation/annotation.go` | 修改 | 新增 RetryOperationAnnotation 常量 |
 
-### 7.10 测试设计
+### 7.11 测试设计
 
-#### 7.10.1 单元测试
+#### 7.11.1 单元测试
 
 | 测试目标 | 测试文件 | 覆盖范围 |
 |---------|---------|---------|
-| 集群层状态机 | `pkg/statemachine/cluster_machine_test.go` | 所有状态转换路径 |
+| 集群层状态机 | `pkg/statemachine/cluster_machine_test.go` | 所有状态转换路径，包括 Failed 恢复 |
 | 节点层状态机 | `pkg/statemachine/node_machine_test.go` | 所有状态转换路径 |
 | 组件层状态机 | `pkg/statemachine/component_machine_test.go` | 所有状态转换路径 |
 | 状态聚合器 | `pkg/statemachine/aggregator_test.go` | 聚合优先级矩阵 |
 | 兼容性映射 | `pkg/statemachine/compatibility_test.go` | 旧 ↔ 新映射正确性 |
+| 人工介入处理 | `controllers/capbke/manual_intervention_test.go` | 注解检测、状态重置、重试策略 |
 
-#### 7.10.2 集成测试
+#### 7.11.2 集成测试
 
 | 测试场景 | 验证内容 |
 |---------|---------|
@@ -2780,8 +3165,12 @@ status:
 | Feature Gate 关闭 | 旧字段正常写入，新字段为空 |
 | Feature Gate 开启 | 新旧字段同时写入，值一致 |
 | Controller 重启恢复 | 从 Status 字段恢复状态机状态 |
+| 人工介入-从失败点继续 | Failed → 注解触发 → 重置失败组件 → 从失败点继续 → Running |
+| 人工介入-从头开始 | Failed → 注解触发(full) → 重置所有进度 → 重新执行 → Running |
+| 人工介入-重试失败 | Failed → 注解触发 → 重试失败 → Attempt 重置为 1 → 再次自动重试 |
+| 人工介入-状态恢复 | Failed → 注解触发 → 组件状态重置为 Pending → 重新安装成功 |
 
 ---
 
-**文档版本**: v3.1  
+**文档版本**: v3.2  
 **维护者**: openFuyao Team
