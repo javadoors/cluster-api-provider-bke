@@ -202,9 +202,6 @@ type OperationProgress struct {
     // 完成时间
     FinishedAt *metav1.Time `json:"finishedAt,omitempty"`
     
-    // 最后错误
-    LastError string `json:"lastError,omitempty"`
-    
     // 已完成组件列表
     Completed []ComponentRecord `json:"completed,omitempty"`
 }
@@ -560,7 +557,7 @@ T5: BKEClusterLifecycle = Upgrading → Running
 ```
 T0: 升级失败
     ComponentLifecycle = Failed
-    OperationProgress.LastError = "upgrade failed"
+    OperationProgress.LastFailure = {Name: "...", Error: "upgrade failed", ...}
 
 T1: BKEClusterLifecycle = Upgrading → RollingBack
     BKECluster.Status.Phase = RollingBack
@@ -687,9 +684,6 @@ type OperationProgress struct {
     // 完成时间
     FinishedAt *metav1.Time `json:"finishedAt,omitempty"`
     
-    // 最后错误
-    LastError string `json:"lastError,omitempty"`
-    
     // 是否需要人工介入
     NeedsManualIntervention bool `json:"needsManualIntervention,omitempty"`
     
@@ -732,7 +726,6 @@ func (p *OperationProgress) MarkFailure(name, version, nodeIP, errMsg string, no
         Error:    errMsg,
         Attempt:  attempt,
     }
-    p.LastError = errMsg
 }
 ```
 
@@ -781,7 +774,6 @@ func (r *Reconciler) executeDAGWithRetry(ctx context.Context, cluster *bkev1beta
     // 执行成功
     cluster.Status.OperationProgress.FinishedAt = &metav1.Time{Time: time.Now()}
     cluster.Status.Phase = "Running"
-    cluster.Status.OperationProgress.LastError = ""
     cluster.Status.OperationProgress.LastFailure = nil
     
     return ctrl.Result{}, r.Status().Update(ctx, cluster)
@@ -821,7 +813,7 @@ stateDiagram-v2
 |------|---------|---------|
 | 组件安装失败 | `ComponentLifecycle = Failed` | 指数退避，最多 3 次 |
 | 节点升级失败 | `BKENodeLifecycle = Failed` | 固定间隔 5 分钟，最多 5 次 |
-| 集群操作失败 | `OperationProgress.LastError != ""` | 指数退避，最多 3 次 |
+| 集群操作失败 | `OperationProgress.LastFailure != nil` | 指数退避，最多 3 次 |
 
 ### 6.2 幂等性保证
 
@@ -862,7 +854,7 @@ func (r *Reconciler) isIdempotent(ctx context.Context, cluster *confv1beta1.BKEC
 | 字段 | 作用 | 诊断方法 |
 |------|------|---------|
 | `BKECluster.Status.Phase` | 集群当前阶段 | 判断集群是否处于 Failed 状态 |
-| `BKECluster.Status.OperationProgress` | 操作进度和错误信息 | 查看 LastError 和 LastFailure |
+| `BKECluster.Status.OperationProgress` | 操作进度和错误信息 | 查看 LastFailure |
 | `BKECluster.Status.NodeComponentStatuses` | 节点级组件状态 | 判断哪些组件安装失败 |
 | `BKECluster.Status.ComponentStatuses` | 集群级组件状态 | 判断哪些组件安装失败 |
 | `BKENode.Status.State` | 节点状态 | 判断哪些节点处于 Failed 状态 |
@@ -872,7 +864,7 @@ func (r *Reconciler) isIdempotent(ctx context.Context, cluster *confv1beta1.BKEC
 
 1. **查看集群状态**：
    - 检查 `BKECluster.Status.Phase` 是否为 `Failed`
-   - 检查 `BKECluster.Status.OperationProgress.LastError` 获取错误信息
+   - 检查 `BKECluster.Status.OperationProgress.LastFailure.Error` 获取错误信息
 
 2. **查看节点状态**：
    - 检查 `BKECluster.Status.NodeComponentStatuses` 判断哪些节点失败
@@ -1024,7 +1016,6 @@ func (r *Reconciler) handleManualIntervention(ctx context.Context, cluster *bkev
     // 重试成功
     cluster.Status.OperationProgress.FinishedAt = &metav1.Time{Time: time.Now()}
     cluster.Status.Phase = "Running"
-    cluster.Status.OperationProgress.LastError = ""
     cluster.Status.OperationProgress.LastFailure = nil
     cluster.Status.OperationProgress.NeedsManualIntervention = false
     
@@ -1492,9 +1483,6 @@ type OperationProgress struct {
     // 完成时间
     FinishedAt *metav1.Time `json:"finishedAt,omitempty"`
 
-    // 最后错误
-    LastError string `json:"lastError,omitempty"`
-
     // 是否需要人工介入
     NeedsManualIntervention bool `json:"needsManualIntervention,omitempty"`
 
@@ -1754,7 +1742,6 @@ func (m *ClusterLifecycleMachine) defaultActions() map[LifecyclePhase]func(ctx *
             now := metav1.Now()
             if ctx.Cluster.Status.OperationProgress != nil {
                 ctx.Cluster.Status.OperationProgress.FinishedAt = &now
-                ctx.Cluster.Status.OperationProgress.LastError = ""
                 ctx.Cluster.Status.OperationProgress.LastFailure = nil
                 ctx.Cluster.Status.OperationProgress.NeedsManualIntervention = false
             }
