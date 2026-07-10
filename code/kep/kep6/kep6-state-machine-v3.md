@@ -1001,7 +1001,7 @@ func (r *Reconciler) handleManualIntervention(ctx context.Context, cluster *bkev
     
     case RetryStrategyFromFailure:
         // 从失败点继续
-        result, err = r.resumeDAG(ctx, cluster, cluster.Status.OperationProgress.LastFailure)
+        result, err = r.resumeDAG(ctx, cluster)
     }
     
     // 6. 结果处理
@@ -1011,7 +1011,7 @@ func (r *Reconciler) handleManualIntervention(ctx context.Context, cluster *bkev
             componentName, version, nodeIP, err.Error(), metav1.Now())
         r.Status().Update(ctx, cluster)
         
-        return ctrl.Result{RequeueAfter: 5 * time.Minute}, nil
+        return ctrl.Result{}, nil
     }
     
     // 重试成功
@@ -1032,7 +1032,6 @@ func (r *Reconciler) handleManualIntervention(ctx context.Context, cluster *bkev
 func (r *Reconciler) resumeDAG(
     ctx context.Context,
     cluster *bkev1beta1.BKECluster,
-    lastFailure *OperationFailureRecord,
 ) (ctrl.Result, error) {
     // 1. 获取 DAG 定义
     dag, err := r.getDAG(ctx, cluster)
@@ -1040,14 +1039,15 @@ func (r *Reconciler) resumeDAG(
         return ctrl.Result{}, err
     }
     
-    // 2. 获取已完成的组件列表
+    // 2. 构建已完成组件集合（使用 "name:nodeIP" 作为 key）
     completed := make(map[string]bool)
     for _, record := range cluster.Status.OperationProgress.Completed {
-        completed[record.Name] = true
+        key := fmt.Sprintf("%s:%s", record.Name, record.NodeIP)
+        completed[key] = true
     }
     
-    // 3. 构建执行计划
-    executionPlan := r.buildExecutionPlan(dag, completed, lastFailure)
+    // 3. 构建执行计划（跳过已完成组件，从失败点继续）
+    executionPlan := r.buildExecutionPlan(dag, completed)
     
     // 4. 执行 DAG
     return r.executeExecutionPlan(ctx, cluster, executionPlan)
@@ -1056,20 +1056,15 @@ func (r *Reconciler) resumeDAG(
 func (r *Reconciler) buildExecutionPlan(
     dag *topology.UpgradeDAG,
     completed map[string]bool,
-    lastFailure *OperationFailureRecord,
 ) []topology.ComponentNode {
     var executionPlan []topology.ComponentNode
     
     // 遍历 DAG 的所有节点
     for _, node := range dag.Nodes {
-        // 跳过已完成的组件
-        if completed[node.Name] {
-            continue
-        }
+        nodeKey := fmt.Sprintf("%s:%s", node.Name, node.NodeIP)
         
-        // 如果是失败的组件，标记为需要重试
-        if lastFailure != nil && lastFailure.Name == node.Name {
-            executionPlan = append(executionPlan, node)
+        // 跳过已完成的组件
+        if completed[nodeKey] {
             continue
         }
         
@@ -1114,7 +1109,7 @@ func (r *Reconciler) executeExecutionPlan(
         
         // 更新完成状态
         cluster.Status.OperationProgress.MarkCompleted(
-            node.Name, node.Version, nodeIP, metav1.Now())
+            node.Name, node.Version, node.NodeIP, metav1.Now())
         
         if err := r.Status().Update(ctx, cluster); err != nil {
             return ctrl.Result{}, err
@@ -2847,9 +2842,12 @@ func (r *BKEClusterReconciler) handleManualIntervention(
         return ctrl.Result{}, fmt.Errorf("no operation progress found")
     }
 
-    // 2. 重置失败记录
-    cluster.Status.OperationProgress.LastFailure = nil
-    cluster.Status.OperationProgress.NeedsManualIntervention = false
+    // 2. 保存失败记录信息（用于日志，避免置 nil 后无法访问）
+    var lastFailedComponent, lastFailedNodeIP string
+    if cluster.Status.OperationProgress.LastFailure != nil {
+        lastFailedComponent = cluster.Status.OperationProgress.LastFailure.Name
+        lastFailedNodeIP = cluster.Status.OperationProgress.LastFailure.NodeIP
+    }
 
     // 3. 根据重试策略决定是否重置 Completed
     strategy := r.decideRetryStrategy(cluster, retryOp)
@@ -2858,13 +2856,18 @@ func (r *BKEClusterReconciler) handleManualIntervention(
     case RetryStrategyFromFailure:
         // 从失败点继续：保留 Completed，只重置 LastFailure
         // Attempt 会在下次失败时从 1 开始
+        cluster.Status.OperationProgress.NeedsManualIntervention = false
+        cluster.Status.OperationProgress.LastFailure = nil
         r.Log.Info("retrying from failure point",
-            "lastFailedComponent", cluster.Status.OperationProgress.LastFailure.Name,
+            "lastFailedComponent", lastFailedComponent,
+            "lastFailedNodeIP", lastFailedNodeIP,
             "completedCount", len(cluster.Status.OperationProgress.Completed))
 
     case RetryStrategyFull:
         // 从头开始：重置所有进度
         cluster.Status.OperationProgress.Completed = nil
+        cluster.Status.OperationProgress.LastFailure = nil
+        cluster.Status.OperationProgress.NeedsManualIntervention = false
         cluster.Status.OperationProgress.StartedAt = &metav1.Time{Time: time.Now()}
         r.Log.Info("retrying from beginning")
     }
@@ -2879,8 +2882,15 @@ func (r *BKEClusterReconciler) handleManualIntervention(
         return ctrl.Result{}, err
     }
 
-    // 6. 立即执行 DAG
-    return r.executeDAG(ctx, cluster)
+    // 6. 根据策略执行 DAG
+    switch strategy {
+    case RetryStrategyFromFailure:
+        return r.resumeDAG(ctx, cluster)
+    case RetryStrategyFull:
+        return r.executeDAG(ctx, cluster)
+    }
+
+    return ctrl.Result{}, nil
 }
 
 func (r *BKEClusterReconciler) decideRetryStrategy(
