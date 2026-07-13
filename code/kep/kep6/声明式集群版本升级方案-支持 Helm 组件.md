@@ -66,6 +66,13 @@
     - 14.2 Sprint 计划
     - 14.3 里程碑
 15. [附录](#15-附录)
+16. [Story 分解与最小集/增强集拆解](#16-story-分解与最小集增强集拆解)
+    - 16.1 设计原则
+    - 16.2 原始 Story 规格
+    - 16.3 最小集（5 个 Milestone）
+    - 16.4 增强集（最小集完成后迭代）
+    - 16.5 对比总览
+    - 16.6 Milestone 依赖关系
     - 15.1 参考文档
     - 15.2 术语表
 
@@ -5398,7 +5405,197 @@ func HelmComponentEnabled(obj client.Object) bool {
 
 **选择 Helm 作为首个组件类型**：Helm 组件（coredns）是集群安装的关键路径，且 HelmInstaller 的 Chart 获取/Values 渲染/Action 执行链路最完整，能充分验证框架设计。
 
-### 16.2 最小集（5 个 Milestone）
+### 16.2 原始 Story 规格
+
+以下为完整的 Story 分解，每个 Story 对应一个或多个 Milestone/Enhancement。
+
+#### Story 1：基础框架 + Scheduler 重构 + Inline 路径打通
+
+**对应 Milestone**：M1 + M2
+
+**规格**：
+- **phaseframe 解耦**：
+  - 新增 `ExecutionContext`（phaseframe-free），携带 OldCluster/Cluster/VersionContext/TemplateContext/TargetClient/Log/ComponentStatusUpdater
+  - 新增 `InlineRunner` 接口（`Execute(ctx, oldCluster, newCluster, handler, version) error`），替代原 `InlinePhaseRunner`
+  - 在 controllers 层实现 `InlinePhaseRunnerAdapter` 桥接，phaseframe 类型仅限 controllers 包
+  - 重构 `Scheduler.ExecuteDAG` 签名，接收 `*ExecutionContext` 而非 `*phaseframe.PhaseContext`
+- **执行器注册表**：
+  - 新增 `ExecutorRegistry`（`Register`/`Get`/`Has`），替代硬编码 if-else 分发
+  - 重构 `executeComponent` 为三路分发：注册表获取 → 未注册则回退 `executeComponentLegacy`
+- **ComponentExecutor 接口与 Inline 实现**：
+  - 定义 `ComponentExecutor` 接口（`ExecuteComponent` + `GetComponentType`）
+  - 实现 `InlineComponentExecutor`：委托 `InlineRunner.Execute`，无 Installer
+- **ComponentVersionStore**：
+  - 定义 `ComponentVersionStore` 接口（`GetComponentVersion(ctx, name, version) (*ComponentVersion, error)`）
+  - 扩展 `BundleStore` 实现该接口
+- **ComponentStatus 状态模型**：
+  - 扩展 `BKEClusterStatus` 新增 `ComponentStatuses map[string]ComponentStatus`
+  - 新增 `ComponentPhase` 枚举（Pending/Installing/Upgrading/Installed/Failed/RollingBack/RolledBack/Timeout）
+  - 定义 `ComponentStatusUpdater` 接口（MarkPending/MarkSuccess/MarkFailed/MarkTimeout/MarkRollback）
+  - 实现 `BKEComponentStatusUpdater`（通过 client.Patch 更新 BKECluster.Status）
+- **TemplateContext 完整扩展**：
+  - 新增字段：Config（*BKEConfig）、APIServer、ServiceCIDR、PodCIDR、DNSDomain、ComponentVersion、ComponentPreviousVersion、ImageRegistry、ImagePullSecret
+  - 在 `NewExecutionContext` 中填充所有扩展字段，处理 nil ClusterConfig 边界条件
+- **Scheduler 初始化扩展**：
+  - `Config` 新增 InlineRunner/CVStore/HelmInstaller/YAMLInstaller/ComponentStatusUpdater/MaxParallelPerBatch 字段
+  - `NewScheduler` 按需注册执行器（依赖非 nil 时注册，Feature Gate OFF 时不注册 Helm/YAML）
+
+**验收标准**：
+1. `pkg/dagexec` 包不再 import `pkg/phaseframe`，可独立编译测试
+2. `ExecutorRegistry.Get()` 对未注册类型返回错误，触发 `executeComponentLegacy` 回退旧路径
+3. InlineComponentExecutor 通过 Adapter 正确调用原有 Phase 逻辑
+4. ComponentStatusUpdater 正确更新 BKECluster.Status.ComponentStatuses，Patch 操作幂等
+5. BundleStore.GetComponentVersion 正确返回 CV 对象，key 不存在时返回明确错误
+6. Scheduler 初始化时，依赖为 nil 时不注册对应执行器
+7. TemplateContext 扩展字段在 `NewExecutionContext` 中正确填充
+8. nil ClusterConfig 时不 panic，基础字段留空
+9. 集成测试：Inline 组件（kubernetes-master/worker）执行通过
+10. 单元测试覆盖率 ≥85%
+
+---
+
+#### Story 2：HelmInstaller + HelmComponentExecutor + CRD Helm 扩展
+
+**对应 Milestone**：M3
+
+**规格**：
+- **HelmInstaller 核心引擎**：
+  - 实现 `HelmInstaller` 结构体（client/clientset/restConfig/cacheDir/httpClient/chartAuth/logger）
+  - Chart 获取：复用 `pkg/kube/chart.go` 的 `FetchChartUniversal`/`FetchChartOCI`/`FetchChartTraditional`，支持 OCI/HTTP/本地三种来源
+  - Chart 来源字段模板渲染：`renderChartSpec` 渲染 OCI.Repository/Tag/URL 中的模板变量
+  - Values 渲染：`renderValues` 递归渲染模板变量（`{{componentVersion}}`/`{{clusterName}}`/`{{imageRegistry}}` 等），支持嵌套 map
+  - ValuesFiles 加载与合并：`loadValuesFile` + `mergeValues`（递归合并 map，src 覆盖 dst，非 map 类型整体替换）
+  - Helm Action：`install`/`upgrade`/`uninstall`/`rollback`，支持 `--wait`/`--atomic`/`--cleanup-on-fail`/`--timeout`
+  - 健康检查：委托 `healthcheck.Run(ctx, clientset, hc)`
+- **HelmComponentExecutor**：
+  - 持有 HelmInstaller + CVStore + ComponentStatusUpdater
+  - 根据 VersionContext 自主决定操作：HasCurrent=false → Install，HasCurrent=true → Upgrade，Strategy.Mode=Rollback → Rollback
+  - FailurePolicy=Rollback + atomic=false 时，升级失败自动触发 `helm rollback`
+  - 执行前后调用 ComponentStatusUpdater 标记状态（Pending → Success/Failed/RolledBack）
+- **CRD Helm 扩展**：
+  - `ComponentVersionSpec` 新增 `Helm *HelmSpec` 字段（omitempty 指针）
+  - 新增类型：`HelmSpec`/`ChartSpec`/`OCIChartSpec`/`HelmStrategySpec`/`RollbackSpec`/`UninstallSpec`/`HookSpec`
+  - `ChartSpec.OCI.Repository`/`Tag`/`URL` 支持模板变量
+  - 更新 CRD schema（v1alpha1 直接扩展）
+  - 重新生成 deepcopy
+
+**验收标准**：
+1. HelmInstaller 三种 Chart 来源均能正确拉取并校验 Checksum
+2. ChartSpec 来源字段模板变量渲染正确
+3. Values 模板变量渲染正确，支持嵌套 map 递归渲染
+4. ValuesFiles 合并结果与 Helm `--set`/`-f` 行为一致（递归合并，后者覆盖前者）
+5. Install/Upgrade/Uninstall/Rollback 四种 Action 执行正确，参数映射到 Helm SDK 正确
+6. `atomic=true` 时 Helm SDK 自动回滚，无需额外调用
+7. `cleanup-on-fail=true` 时安装失败自动清理 Release
+8. HelmComponentExecutor 根据 VersionContext 自动判定 Install/Upgrade，Strategy.Mode 优先
+9. FailurePolicy=Rollback + atomic=false 时，升级失败正确触发 helm rollback，状态标记为 RolledBack
+10. CRD 扩展后旧 ComponentVersion 反序列化不受影响（Helm 字段为 nil）
+11. 集成测试：coredns Helm 组件全新安装 + 升级通过
+12. 单元测试覆盖率 ≥85%
+
+---
+
+#### Story 3：HealthCheck 共享包 + YamlInstaller + YamlComponentExecutor + CRD YAML 扩展 + TemplateContext
+
+**对应 Milestone**：M4
+
+**规格**：
+- **HealthCheck 共享包**：
+  - 抽取 `pkg/healthcheck` 包，类型定义迁移至 `pkg/healthcheck/types.go`
+  - 类型：`HealthCheckSpec`/`HealthCheckItemSpec`/`PodReadyCheckSpec`/`EndpointReadyCheckSpec`/`CustomCheckSpec`
+  - 实现 `Run(ctx, client, hc)`：超时重试循环，遍历 Checks，全部通过或超时返回
+  - 实现 `checkPodReady`（支持 minReady 部分就绪）、`checkEndpointReady`、`checkCustom`
+  - HelmInstaller/YamlInstaller 均委托共享包执行健康检查
+- **YamlInstaller 核心引擎**：
+  - 实现 `YamlInstaller` 结构体（store + applier + logger）
+  - `Apply` 方法：通过 `store.GetComponentManifests` 加载清单（Bundle 文件 + 内联 Resources）→ `applier.ApplyComponent` → 健康检查
+  - `DeleteComponent`：GVK 逆序删除（复用 `addonutil.SortUninstallUnstructuredByKind`），使用 `DeletePropagationBackground`，IsNotFound 幂等
+  - `PruneResources`：按 label selector 列出资源 → 构建 wantSet → 删除不在 wantSet 中的资源（仅限 `PruneableGVKs` 安全范围，排除 CRD/Namespace）
+  - 扩展 `Applier` 接口：新增 `DeleteComponent` + `PruneResources` 方法签名
+  - ApplyStrategy 引擎：ServerSideApply / Replace / CreateOnly 三种策略
+- **YamlComponentExecutor**：
+  - 持有 YamlInstaller + CVStore + ComponentStatusUpdater
+  - 根据 VersionContext.NeedsUpgrade 判断是否跳过
+  - 委托 `YamlInstaller.Apply` 执行清单应用 + 健康检查
+  - 执行前后调用 ComponentStatusUpdater 标记状态
+  - 无回滚机制（SSA 天然幂等，重新 Apply 上一版本即可）
+- **CRD YAML 扩展**：
+  - `ComponentVersionSpec` 新增 `YAML *YAMLSpec` 字段（omitempty 指针）
+  - 新增类型：`YAMLSpec`（Namespace/ApplyStrategy/Prune/PruneLabelSelector/HealthCheck）
+  - 更新 CRD schema（v1alpha1 直接扩展）
+
+**验收标准**：
+1. HealthCheck.Run 超时重试逻辑正确，PodReady 支持 minReady 部分就绪
+2. checkEndpointReady 正确检查 Service Endpoint 是否有就绪端点
+3. checkCustom 正确执行命令，退出码 0=通过
+4. YamlInstaller 能正确加载 Bundle 文件 + 内联 Resources 并应用
+5. ServerSideApply 支持幂等更新，Replace 支持删除重建，CreateOnly 仅创建不更新
+6. DeleteComponent 按 GVK 逆序删除（CRD 最后），IsNotFound 视为成功
+7. PruneResources 仅裁剪 `PruneableGVKs` 安全范围内的资源，不误删 CRD/Namespace
+8. YamlComponentExecutor 根据 VersionContext 正确跳过无需升级的组件
+9. CRD 扩展后旧 ComponentVersion 反序列化不受影响
+10. 集成测试：YAML 组件全新安装/增量更新/Prune 裁剪通过
+11. 单元测试覆盖率 ≥85%
+
+---
+
+#### Story 4：Feature Gate + 兼容层 + 完整流程集成 + 迁移 + 测试
+
+**对应 Milestone/Enhancement**：M5 + E1 + E2 + E3
+
+**规格**：
+- **Feature Gate**：
+  - 新增 `HelmComponentAnnotationKey = "cvo.openfuyao.cn/helm-component"`
+  - 实现 `HelmComponentEnabled(obj)`：全局 `config.HelmComponentSupport` 为 true 或对象带注解 `"true"` 时启用
+  - 在 `utils/capbke/config` 注册全局 flag `--helm-component-support`
+- **兼容层**：
+  - `executeComponent` 中，Feature Gate OFF 或类型未注册时回退 `executeComponentLegacy`（原有 Inline/Manifest 二路分发）
+  - Feature Gate ON 时走新路径：注册表获取执行器 → 填充 TemplateContext 版本信息 → 执行
+  - 旧集群保持原有硬编码 Phase 路径，新集群走 DAG 路径
+- **完整安装流程集成**：
+  - BKEClusterReconciler 检测新集群 → 解析 ReleaseImage.GetInstallComponents → 构建安装 DAG → Scheduler.ExecuteDAG
+  - Helm/YAML/Inline 三种组件通过各自 Executor 并行执行（批次内并发，批次间串行）
+  - 安装完成后健康检查确认，更新 ClusterStatus = Ready
+- **完整升级流程集成**：
+  - ClusterVersionReconciler 检测版本变更 → 对比当前/目标 ReleaseImage 确定升级范围 → 构建升级 DAG → Scheduler.ExecuteDAG
+  - Helm 组件使用 `helm upgrade --atomic` 确保原子性
+  - 失败策略：FailFast（立即终止）/Continue（记录警告继续）/Rollback（回滚后继续）正确执行
+- **Hooks 执行引擎（增强）**：
+  - PreInstallHooks/PreUninstallHooks 执行引擎：Job 类型（创建→等待完成→清理），支持模板变量渲染
+  - PreInstallHooks 在 Helm 操作前执行，Job 失败则中断流程
+  - PreUninstallHooks 在 Helm Uninstall 前执行
+- **高级错误处理与恢复（增强）**：
+  - 错误分类：可重试（网络超时）/不可重试（配置错误）/部分失败
+  - 可重试错误支持指数退避重试
+  - 失败时记录详细错误信息至 ComponentStatus.Message
+- **迁移策略**：
+  - 阶段 1：部署新 CRD 与控制器（Feature Gate 关闭），保持原有逻辑
+  - 阶段 2：开启 Feature Gate，新集群走 DAG 路径，旧集群保持旧路径
+  - 阶段 3：灰度发布，测试环境验证后推广到生产
+- **测试**：
+  - 集成测试：Helm 全新安装/升级/回滚、YAML 全新安装/增量更新/Prune、离线环境
+  - E2E 测试：小规模安装（1M+2W）、中规模安装（3M+10W）、跨版本升级（v2.5.0→v2.6.0）、升级失败恢复
+  - 迁移验证：旧集群 → 部署新 CRD → 开启 Feature Gate → 新流程接管，集群状态一致
+
+**验收标准**：
+1. Feature Gate 关闭时，Helm/YAML 执行器未注册，`registry.Get()` 返回错误并回退旧路径
+2. Feature Gate 开启时，新路径接管，Helm/YAML 组件通过 DAG 调度执行
+3. 注解 `cvo.openfuyao.cn/helm-component: "true"` 可覆盖全局 Flag
+4. 集成测试：Helm 组件全新安装、升级、回滚均通过
+5. 集成测试：YAML 组件全新安装、ServerSideApply 增量更新、Prune 裁剪均通过
+6. 集成测试：离线环境使用本地缓存可正常安装/升级
+7. E2E 测试：小规模安装全流程通过，所有组件健康检查通过
+8. E2E 测试：中规模安装并行执行无资源竞争
+9. E2E 测试：跨版本升级通过，Helm 组件使用 `--atomic` 升级
+10. E2E 测试：升级失败后 Continue/Rollback 策略正确执行
+11. PreInstallHooks 在 Helm 操作前执行，Job 失败则中断流程并返回错误
+12. PreUninstallHooks 在 Helm Uninstall 前执行
+13. 迁移验证：旧集群部署新 CRD → 开启 Feature Gate → 新流程接管，集群状态一致
+14. E2E 通过率 ≥95%
+
+---
+
+### 16.3 最小集（5 个 Milestone）
 
 #### Milestone 1：基础框架
 
@@ -5535,7 +5732,7 @@ func HelmComponentEnabled(obj client.Object) bool {
 6. E2E：小规模安装全流程通过，所有组件健康检查通过
 7. 迁移阶段 1 验证：部署新 CRD + 控制器，Feature Gate 关闭，旧逻辑不受影响
 
-### 16.3 增强集（最小集完成后迭代）
+### 16.4 增强集（最小集完成后迭代）
 
 #### Enhancement 1：Hooks 执行引擎
 
@@ -5567,7 +5764,7 @@ func HelmComponentEnabled(obj client.Object) bool {
 | E3.5 | 跨版本升级 E2E | v2.5.0→v2.6.0 |
 | E3.6 | 升级失败恢复 E2E | Continue/Rollback 策略验证 |
 
-### 16.4 对比总览
+### 16.5 对比总览
 
 | 维度 | 最小集 (M1-M5) | 增强集 (E1-E3) |
 |------|---------------|---------------|
@@ -5582,7 +5779,7 @@ func HelmComponentEnabled(obj client.Object) bool {
 | **测试** | 集成 + 小规模 E2E (1M+2W) | + 中规模 (3M+10W) + 跨版本 + 恢复 |
 | **预估工时** | ~25 人日 | ~8 人日 |
 
-### 16.5 Milestone 依赖关系
+### 16.6 Milestone 依赖关系
 
 ```
 M1 (基础框架)
