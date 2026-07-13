@@ -2111,6 +2111,109 @@ DeclarativeUpgradeAnnotationKey = "cvo.openfuyao.cn/declarative-upgrade"
 
 ---
 
-**文档版本**: v1.0  
-**最后更新**: 2026-07-09  
+## 11. 设计思路分析
+
+> **本章目标**：梳理 v1 状态机的核心设计思路，分析各资源状态的设计意图和存在的问题，为 v2/v3 演进提供依据。
+
+### 11.1 核心发现：状态维度爆炸
+
+v1 文档的核心结论是**"无法在单张图中完整展现"**。原因如下：
+
+| 层级 | 状态字段数 | 状态值数 | 复杂度来源 |
+|------|-----------|---------|-----------|
+| 集群层 | 6 个（Phase, ClusterStatus, ClusterHealthState, PhaseStatus, Conditions, DeclarativeUpgrade） | 33+ | Phase 和 ClusterStatus 语义重叠；ClusterHealthState 是 ClusterStatus 的子集 |
+| 节点层 | 4 个（State, StateCode, Message, NeedSkip） | 33+ | State 和 StateCode 两套并行，StateCode 是事实来源但 State 是对外接口 |
+| 命令层 | 2 个（Phase, Status/Conditions） | 7+3 | Phase 是聚合结果，Conditions 是明细 |
+
+**总计 11 个状态字段，73+ 个状态值**。
+
+### 11.2 各资源状态设计思路
+
+#### 11.2.1 集群层：三套状态体系并存
+
+```
+Phase (12个值)          → "当前在执行哪个阶段"（执行视角）
+ClusterStatus (18个值)  → "集群正在做什么"（操作视角）
+ClusterHealthState (9个值) → "集群是否健康"（健康视角）
+```
+
+**设计意图**：
+- `Phase` 是给开发者/运维看的执行进度
+- `ClusterStatus` 是给 UI/API 消费者看的操作状态
+- `ClusterHealthState` 是给监控系统看的健康指标
+
+**问题**：
+- `Phase` 和 `ClusterStatus` 高度重叠：`Phase=InitControlPlane` 对应 `ClusterStatus=Initializing`，`Phase=UpgradeControlPlane` 对应 `ClusterStatus=Upgrading`
+- `ClusterHealthState` 本质是 `ClusterStatus` 的子集+失败升级版：`Deploying` vs `Initializing`，`Upgrading` vs `Upgrading`，`DeployFailed` vs `InitializationFailed`
+- 三套状态由不同组件在不同时机更新，存在不一致风险
+
+#### 11.2.2 节点层：State + StateCode 双轨制
+
+```
+State (7个值)    → 对外暴露的节点状态（语义化）
+StateCode (10位) → 内部实现细节（位标记累积）
+```
+
+**关键设计**：
+- `StateCode` 是**事实来源**（source of truth），每个 Phase 执行成功后设置对应的位标记
+- `State` 是从 `StateCode` **推导**出来的：`StateCode == 527` → `State = Ready`
+- `NodeStateNeedRecord`（bit 8）是持久化触发器：内存修改 → 标记 → 批量持久化
+
+**问题**：
+- `State` 和 `StateCode` 可能不一致（文档 10.4.3 专门描述了修复机制）
+- 两套状态增加了理解和维护成本
+- `bootstrapReadyStateCode = 527` 是魔法数字
+
+#### 11.2.3 命令层：最清晰的状态机
+
+```
+CommandPhase (7个值) → Pending → Running → Completed/Failed/Skip
+```
+
+**设计特点**：
+- 单字段状态机，语义清晰
+- 内置重试机制（`BackoffLimit`）
+- 聚合逻辑简单：所有子命令成功 → 整体成功
+
+#### 11.2.4 状态聚合：自底向上
+
+```
+Command.Phase → BKENode.StateCode → BKENode.State → ClusterStatus
+```
+
+**聚合规则**（文档 10.2）：
+- 所有节点 Ready → 集群 Ready
+- 任意节点 Upgrading → 集群 Upgrading
+- 任意节点 Failed → 集群 Failed
+
+**问题**：
+- 聚合规则在代码中分散实现（PhaseFlow post-hook、StatusManager、setClusterHealthStatus）
+- 没有统一的聚合入口
+
+### 11.3 v1 → v2 → v3 的演进逻辑
+
+| 维度 | v1（现状） | v2（分层状态机） | v3（生命周期） |
+|------|-----------|----------------|--------------|
+| 集群状态 | 3 套并存（Phase/ClusterStatus/ClusterHealthState） | 保留但明确职责 | 统一为 `LifecyclePhase`（6 个值） |
+| 节点状态 | State + StateCode 双轨 | 保留但明确 StateCode 为内部 | 新增 `LifecyclePhase`，StateCode 降级为实现细节 |
+| 组件状态 | 无独立状态（隐含在 Command/Phase 中） | 引入 ComponentPhase | 引入 `ComponentLifecycleStatus`（8 个值） |
+| 状态聚合 | 分散在 PhaseFlow/StatusManager | 引入 Aggregator | 统一 `Aggregator` + 优先级矩阵 |
+| 重试机制 | Command 级 + 人工注解 | 增加自动重试 + 人工介入 | 完善自动重试 + 注解触发 |
+| 兼容性 | N/A | N/A | 双写过渡 + Feature Gate |
+
+### 11.4 v1 的核心设计问题（驱动 v2/v3 演进）
+
+1. **状态维度太多**：11 个字段 73+ 个值，无法单图展现
+2. **语义重叠**：Phase 和 ClusterStatus 表达相同信息，ClusterHealthState 是 ClusterStatus 的子集
+3. **聚合分散**：状态聚合逻辑散落在 PhaseFlow、StatusManager、setClusterHealthStatus 等多处
+4. **双轨不一致**：State 和 StateCode 可能不一致，需要额外修复机制
+5. **缺少组件层状态**：组件（containerd、coredns 等）没有独立状态追踪，只能通过 Command 间接推断
+6. **重试机制不完整**：只有 Command 级自动重试和人工注解重试，缺少中间的自动重试+人工介入机制
+
+v3 的设计目标就是解决这些问题：统一生命周期、明确聚合规则、补充组件层状态、完善重试机制。
+
+---
+
+**文档版本**: v1.1  
+**最后更新**: 2026-07-13  
 **维护者**: BKE Team
