@@ -498,7 +498,7 @@ type ChartSpec struct {
     // OCI Registry 配置
     OCI *OCIChartSpec `json:"oci,omitempty"`
     
-    // HTTP URL
+    // HTTP URL (支持模板变量，如 "{{imageRegistry}}/charts/coredns-{{componentVersion}}.tgz")
     URL string `json:"url,omitempty"`
     
     // 本地路径
@@ -510,10 +510,10 @@ type ChartSpec struct {
 
 // OCIChartSpec 定义 OCI Chart 规格
 type OCIChartSpec struct {
-    // OCI 仓库地址
+    // OCI 仓库地址 (支持模板变量，如 "{{imageRegistry}}/charts/coredns")
     Repository string `json:"repository"`
     
-    // Chart 标签
+    // Chart 标签 (支持模板变量，如 "{{componentVersion}}")
     Tag string `json:"tag"`
 }
 
@@ -1222,19 +1222,26 @@ func (i *HelmInstaller) Install(ctx context.Context, opts InstallOptions) error 
     helm := component.Spec.Helm
     tmplCtx := opts.TemplateCtx  // 复用 DAG 调度器传递的 TemplateContext
     
-    // 1. 获取 Chart
-    chart, err := i.getChart(ctx, helm.Chart)
+    // 1. 渲染 Chart 来源字段中的模板变量
+    //    支持 {{imageRegistry}}、{{componentVersion}} 等变量在 Repository/Tag/URL 中
+    renderedChart, err := i.renderChartSpec(ctx, helm.Chart, tmplCtx)
+    if err != nil {
+        return fmt.Errorf("failed to render chart spec: %w", err)
+    }
+    
+    // 2. 获取 Chart (使用渲染后的来源)
+    chart, err := i.getChart(ctx, renderedChart)
     if err != nil {
         return fmt.Errorf("failed to get chart: %w", err)
     }
     
-    // 2. 渲染 Values (使用 TemplateContext)
+    // 3. 渲染 Values (使用 TemplateContext)
     values, err := i.renderValues(ctx, helm.Values, tmplCtx)
     if err != nil {
         return fmt.Errorf("failed to render values: %w", err)
     }
     
-    // 3. 加载自定义 Values 文件
+    // 4. 加载自定义 Values 文件
     for _, vf := range helm.ValuesFiles {
         customValues, err := i.loadValuesFile(ctx, vf, tmplCtx)
         if err != nil {
@@ -1244,13 +1251,13 @@ func (i *HelmInstaller) Install(ctx context.Context, opts InstallOptions) error 
         values = mergeValues(values, customValues)
     }
     
-    // 4. 获取 Action Config
+    // 5. 获取 Action Config
     actionConfig, err := i.getActionConfig(ctx, helm.Namespace)
     if err != nil {
         return fmt.Errorf("failed to get action config: %w", err)
     }
     
-    // 5. 执行 Helm Action
+    // 6. 执行 Helm Action
     switch opts.Action {
     case HelmActionInstall:
         return i.install(ctx, actionConfig, chart, values, helm, opts)
@@ -1525,6 +1532,62 @@ func (i *HelmInstaller) renderTemplateString(s string, tmplCtx manifest.Template
     return result, nil
 }
 
+// renderChartSpec 渲染 ChartSpec 中的模板变量
+// 支持 OCI.Repository、OCI.Tag、URL 字段使用模板变量
+// 返回深拷贝，不修改原始 ChartSpec
+func (i *HelmInstaller) renderChartSpec(
+    ctx context.Context,
+    spec ChartSpec,
+    tmplCtx manifest.TemplateContext,
+) (ChartSpec, error) {
+    rendered := spec // 深拷贝
+    
+    // 渲染 OCI 配置
+    if spec.OCI != nil {
+        renderedOCI := *spec.OCI // 深拷贝
+        
+        // 渲染 Repository
+        if spec.OCI.Repository != "" {
+            repo, err := i.renderTemplateString(spec.OCI.Repository, tmplCtx)
+            if err != nil {
+                return rendered, fmt.Errorf("render OCI repository %q: %w", spec.OCI.Repository, err)
+            }
+            renderedOCI.Repository = repo
+        }
+        
+        // 渲染 Tag
+        if spec.OCI.Tag != "" {
+            tag, err := i.renderTemplateString(spec.OCI.Tag, tmplCtx)
+            if err != nil {
+                return rendered, fmt.Errorf("render OCI tag %q: %w", spec.OCI.Tag, err)
+            }
+            renderedOCI.Tag = tag
+        }
+        
+        rendered.OCI = &renderedOCI
+    }
+    
+    // 渲染 URL
+    if spec.URL != "" {
+        url, err := i.renderTemplateString(spec.URL, tmplCtx)
+        if err != nil {
+            return rendered, fmt.Errorf("render URL %q: %w", spec.URL, err)
+        }
+        rendered.URL = url
+    }
+    
+    return rendered, nil
+}
+
+// renderChartSpec 设计说明:
+// Chart 来源字段 (OCI.Repository、OCI.Tag、URL) 支持模板变量的原因:
+// 1. 镜像仓库地址因环境而异: 在线环境使用公共仓库，离线环境使用私有仓库
+//    例如: "{{imageRegistry}}/charts/coredns" 在不同环境渲染为不同地址
+// 2. Chart 版本与组件版本一致: tag 通常等于 componentVersion
+//    例如: tag: "{{componentVersion}}" 避免硬编码版本号
+// 3. 统一配置管理: 与 Values 模板变量保持一致的渲染机制
+// 4. 渲染时机: 在 getChart 之前渲染，确保拉取正确的 Chart 来源
+
 // loadValuesFile 加载自定义 Values 文件
 // 1. 渲染文件路径中的模板变量 (如 values-{{arch}}.yaml)
 // 2. 从控制器本地文件系统读取文件 (通常通过 ConfigMap 挂载)
@@ -1592,8 +1655,8 @@ spec:
   helm:
     chart:
       oci:
-        repository: "registry.openfuyao.cn/charts/coredns"
-        tag: "v1.11.1"
+        repository: "{{imageRegistry}}/charts/coredns"   # 支持模板变量
+        tag: "{{componentVersion}}"                       # 支持模板变量
     namespace: kube-system
     releaseName: coredns
     
