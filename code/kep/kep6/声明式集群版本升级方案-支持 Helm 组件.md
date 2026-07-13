@@ -5452,8 +5452,6 @@ func HelmComponentEnabled(obj client.Object) bool {
 9. 集成测试：Inline 组件（kubernetes-master/worker）执行通过
 10. 单元测试覆盖率 ≥85%
 
----
-
 #### Story 2：HelmInstaller + HelmComponentExecutor + CRD Helm 扩展
 
 **对应 Milestone**：M2
@@ -5492,8 +5490,6 @@ func HelmComponentEnabled(obj client.Object) bool {
 10. CRD 扩展后旧 ComponentVersion 反序列化不受影响（Helm 字段为 nil）
 11. 集成测试：coredns Helm 组件全新安装 + 升级通过
 12. 单元测试覆盖率 ≥85%
-
----
 
 #### Story 3：HealthCheck 共享包 + YamlInstaller + YamlComponentExecutor + CRD YAML 扩展 + TemplateContext
 
@@ -5536,8 +5532,6 @@ func HelmComponentEnabled(obj client.Object) bool {
 9. CRD 扩展后旧 ComponentVersion 反序列化不受影响
 10. 集成测试：YAML 组件全新安装/增量更新/Prune 裁剪通过
 11. 单元测试覆盖率 ≥85%
-
----
 
 #### Story 4：Feature Gate + 兼容层 + 完整流程集成 + 迁移 + 测试
 
@@ -5592,8 +5586,6 @@ func HelmComponentEnabled(obj client.Object) bool {
 12. PreUninstallHooks 在 Helm Uninstall 前执行
 13. 迁移验证：旧集群部署新 CRD → 开启 Feature Gate → 新流程接管，集群状态一致
 14. E2E 通过率 ≥95%
-
----
 
 ### 16.3 最小集（4 个 Milestone）
 
