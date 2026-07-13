@@ -4583,7 +4583,7 @@ func (e *HelmComponentExecutor) ExecuteComponent(ctx context.Context, node *Comp
            action == helminstaller.HelmActionUpgrade &&
            !cv.Spec.Helm.Strategy.Atomic {
             if e.componentStatusUpdater != nil {
-                if markErr := e.componentStatusUpdater.MarkRollback(ctx, execCtx.Cluster, component.Name, "helm"); markErr != nil {
+                if markErr := e.componentStatusUpdater.MarkRollingBack(ctx, execCtx.Cluster, component.Name, bkev1beta1.ComponentTypeCluster, ""); markErr != nil {
                     execCtx.Log.Warn("failed to mark component %s as rolling back: %v", component.Name, markErr)
                 }
             }
@@ -4597,7 +4597,7 @@ func (e *HelmComponentExecutor) ExecuteComponent(ctx context.Context, node *Comp
             }
             if rbErr := e.installer.Install(ctx, rollbackOpts); rbErr != nil {
                 if e.componentStatusUpdater != nil {
-                    if markErr := e.componentStatusUpdater.MarkFailed(ctx, execCtx.Cluster, component.Name, "helm", rbErr); markErr != nil {
+                    if markErr := e.componentStatusUpdater.MarkFailed(ctx, execCtx.Cluster, component.Name, bkev1beta1.ComponentTypeCluster, "", rbErr); markErr != nil {
                         execCtx.Log.Warn("failed to mark component %s as rollback failed: %v", component.Name, markErr)
                     }
                 }
@@ -4611,7 +4611,7 @@ func (e *HelmComponentExecutor) ExecuteComponent(ctx context.Context, node *Comp
                         oldVersion = v
                     }
                 }
-                if markErr := e.componentStatusUpdater.MarkSuccess(ctx, execCtx.Cluster, component.Name, "helm", oldVersion); markErr != nil {
+                if markErr := e.componentStatusUpdater.MarkInstalled(ctx, execCtx.Cluster, component.Name, bkev1beta1.ComponentTypeCluster, "", oldVersion); markErr != nil {
                     execCtx.Log.Warn("failed to mark component %s as rolled back: %v", component.Name, markErr)
                 }
             }
@@ -4620,7 +4620,7 @@ func (e *HelmComponentExecutor) ExecuteComponent(ctx context.Context, node *Comp
         }
         
         if e.componentStatusUpdater != nil {
-            if markErr := e.componentStatusUpdater.MarkFailed(ctx, execCtx.Cluster, component.Name, "helm", err); markErr != nil {
+            if markErr := e.componentStatusUpdater.MarkFailed(ctx, execCtx.Cluster, component.Name, bkev1beta1.ComponentTypeCluster, "", err); markErr != nil {
                 execCtx.Log.Warn("failed to mark component %s as failed: %v", component.Name, markErr)
             }
         }
@@ -4629,7 +4629,7 @@ func (e *HelmComponentExecutor) ExecuteComponent(ctx context.Context, node *Comp
     
     // 8. 标记组件安装成功
     if e.componentStatusUpdater != nil {
-        if err := e.componentStatusUpdater.MarkSuccess(ctx, execCtx.Cluster, component.Name, "helm", cv.Spec.Version); err != nil {
+        if err := e.componentStatusUpdater.MarkInstalled(ctx, execCtx.Cluster, component.Name, bkev1beta1.ComponentTypeCluster, "", cv.Spec.Version); err != nil {
             execCtx.Log.Warn("failed to mark component %s as success: %v", component.Name, err)
         }
     }
@@ -4682,7 +4682,7 @@ func (e *YamlComponentExecutor) ExecuteComponent(ctx context.Context, node *Comp
 
     // 4. 标记组件开始安装
     if e.componentStatusUpdater != nil {
-        if err := e.componentStatusUpdater.MarkPending(ctx, execCtx.Cluster, component.Name, "yaml"); err != nil {
+        if err := e.componentStatusUpdater.MarkPending(ctx, execCtx.Cluster, component.Name, bkev1beta1.ComponentTypeCluster, ""); err != nil {
             execCtx.Log.Warn("failed to mark component %s as pending: %v", component.Name, err)
         }
     }
@@ -4690,7 +4690,7 @@ func (e *YamlComponentExecutor) ExecuteComponent(ctx context.Context, node *Comp
     // 5. 委托 YamlInstaller 执行 Apply + 健康检查
     if err := e.installer.Apply(ctx, cv, execCtx); err != nil {
         if e.componentStatusUpdater != nil {
-            if markErr := e.componentStatusUpdater.MarkFailed(ctx, execCtx.Cluster, component.Name, "yaml", err); markErr != nil {
+            if markErr := e.componentStatusUpdater.MarkFailed(ctx, execCtx.Cluster, component.Name, bkev1beta1.ComponentTypeCluster, "", err); markErr != nil {
                 execCtx.Log.Warn("failed to mark component %s as failed: %v", component.Name, markErr)
             }
         }
@@ -4699,7 +4699,7 @@ func (e *YamlComponentExecutor) ExecuteComponent(ctx context.Context, node *Comp
 
     // 6. 标记组件安装成功
     if e.componentStatusUpdater != nil {
-        if err := e.componentStatusUpdater.MarkSuccess(ctx, execCtx.Cluster, component.Name, "yaml", cv.Spec.Version); err != nil {
+        if err := e.componentStatusUpdater.MarkInstalled(ctx, execCtx.Cluster, component.Name, bkev1beta1.ComponentTypeCluster, "", cv.Spec.Version); err != nil {
             execCtx.Log.Warn("failed to mark component %s as success: %v", component.Name, err)
         }
     }
@@ -4788,32 +4788,36 @@ func (a *InlinePhaseRunnerAdapter) Execute(ctx context.Context, oldCluster, newC
 
 #### 8.5.1 状态数据模型
 
-**新增 `ComponentPhase` 状态枚举**：
+**新增 `LifecyclePhase` 状态枚举**（与 kep6-state-machine-v3.md 对齐）：
 
 ```go
-// api/bkecommon/v1beta1/bkecluster_status.go 扩展
+// api/bkecommon/v1beta1/lifecycle_phase.go
 
-// ComponentPhase 组件安装/升级阶段
-type ComponentPhase string
+// LifecyclePhase 生命周期阶段（集群/节点/组件共用）
+type LifecyclePhase string
+
+// 组件生命周期
+const (
+    ComponentLifecyclePending      LifecyclePhase = "Pending"
+    ComponentLifecycleInstalling   LifecyclePhase = "Installing"
+    ComponentLifecycleInstalled    LifecyclePhase = "Installed"
+    ComponentLifecycleUpgrading    LifecyclePhase = "Upgrading"
+    ComponentLifecycleRollingBack  LifecyclePhase = "RollingBack"
+    ComponentLifecycleUninstalling LifecyclePhase = "Uninstalling"
+    ComponentLifecycleRemoved      LifecyclePhase = "Removed"
+    ComponentLifecycleFailed       LifecyclePhase = "Failed"
+)
+
+// ComponentType 组件类型
+type ComponentType string
 
 const (
-    // 基本状态
-    ComponentPhasePending        ComponentPhase = "Pending"
-    ComponentPhaseInstalling     ComponentPhase = "Installing"
-    ComponentPhaseUpgrading      ComponentPhase = "Upgrading"
-    ComponentPhaseInstalled      ComponentPhase = "Installed"
-    ComponentPhaseFailed         ComponentPhase = "Failed"
-    
-    // 回滚相关状态
-    ComponentPhaseRollingBack    ComponentPhase = "RollingBack"
-    ComponentPhaseRolledBack     ComponentPhase = "RolledBack"
-    
-    // 异常状态
-    ComponentPhaseTimeout        ComponentPhase = "Timeout"
+    ComponentTypeNode    ComponentType = "node"    // 节点级组件
+    ComponentTypeCluster ComponentType = "cluster" // 集群级组件
 )
 ```
 
-**新增 `ComponentStatuses` 字段**：
+**新增组件状态字段**（与 kep6-state-machine-v3.md 对齐）：
 
 ```go
 // api/bkecommon/v1beta1/bkecluster_status.go 扩展
@@ -4821,25 +4825,41 @@ const (
 type BKEClusterStatus struct {
     // ... 现有字段保持不变 ...
 
-    // 组件级安装状态 (新增，所有组件类型共用)
-    ComponentStatuses map[string]ComponentStatus `json:"componentStatuses,omitempty"`
+    // === v3 新增字段 ===
+
+    // NodeComponentStatuses 记录每个节点上每个组件的状态
+    // key: componentName -> nodeIP -> ComponentLifecycleStatus
+    NodeComponentStatuses map[string]map[string]ComponentLifecycleStatus `json:"nodeComponentStatuses,omitempty"`
+
+    // ClusterComponentStatuses 记录集群级组件的状态
+    // key: componentName -> ComponentLifecycleStatus
+    ClusterComponentStatuses map[string]ComponentLifecycleStatus `json:"clusterComponentStatuses,omitempty"`
 }
 
-// ComponentStatus 组件级安装状态 (所有组件类型共用)
-type ComponentStatus struct {
-    // 已安装版本
-    Version string `json:"version"`
+// ComponentLifecycleStatus 组件生命周期状态
+type ComponentLifecycleStatus struct {
+    // 组件名称
+    Name string `json:"name"`
 
-    // 安装阶段
-    Phase ComponentPhase `json:"phase"`
+    // 节点 IP（节点级组件必填，集群级组件留空）
+    NodeIP string `json:"nodeIP,omitempty"`
 
-    // 组件类型: helm / yaml
-    Type string `json:"type"`
+    // 组件类型（node/cluster）
+    ComponentType ComponentType `json:"componentType"`
+
+    // 生命周期阶段
+    Phase LifecyclePhase `json:"phase"`
+
+    // 当前版本
+    CurrentVersion string `json:"currentVersion,omitempty"`
+
+    // 目标版本
+    TargetVersion string `json:"targetVersion,omitempty"`
 
     // 最后更新时间
-    LastUpdateTime *metav1.Time `json:"lastUpdateTime,omitempty"`
+    LastTransitionTime *metav1.Time `json:"lastTransitionTime,omitempty"`
 
-    // 错误信息 (Phase=Failed/Timeout 时)
+    // 错误信息
     Message string `json:"message,omitempty"`
 }
 ```
@@ -4851,11 +4871,23 @@ type ComponentStatus struct {
 
 // ComponentStatusUpdater 组件级状态更新接口
 type ComponentStatusUpdater interface {
-    MarkPending(ctx context.Context, cluster *bkev1beta1.BKECluster, componentName string, componentType string) error
-    MarkSuccess(ctx context.Context, cluster *bkev1beta1.BKECluster, componentName string, componentType string, version string) error
-    MarkFailed(ctx context.Context, cluster *bkev1beta1.BKECluster, componentName string, componentType string, err error) error
-    MarkTimeout(ctx context.Context, cluster *bkev1beta1.BKECluster, componentName string, componentType string) error
-    MarkRollback(ctx context.Context, cluster *bkev1beta1.BKECluster, componentName string, componentType string) error
+    // MarkPending 标记组件等待安装
+    MarkPending(ctx context.Context, cluster *bkev1beta1.BKECluster, componentName string, componentType ComponentType, nodeIP string) error
+    
+    // MarkInstalled 标记组件安装成功
+    MarkInstalled(ctx context.Context, cluster *bkev1beta1.BKECluster, componentName string, componentType ComponentType, nodeIP string, version string) error
+    
+    // MarkFailed 标记组件失败
+    MarkFailed(ctx context.Context, cluster *bkev1beta1.BKECluster, componentName string, componentType ComponentType, nodeIP string, err error) error
+    
+    // MarkRollingBack 标记组件正在回滚
+    MarkRollingBack(ctx context.Context, cluster *bkev1beta1.BKECluster, componentName string, componentType ComponentType, nodeIP string) error
+    
+    // MarkUninstalling 标记组件正在卸载
+    MarkUninstalling(ctx context.Context, cluster *bkev1beta1.BKECluster, componentName string, componentType ComponentType, nodeIP string) error
+    
+    // MarkRemoved 标记组件已卸载
+    MarkRemoved(ctx context.Context, cluster *bkev1beta1.BKECluster, componentName string, componentType ComponentType, nodeIP string) error
 }
 ```
 
@@ -5428,10 +5460,11 @@ func HelmComponentEnabled(obj client.Object) bool {
 - **ComponentVersionStore**：
   - 定义 `ComponentVersionStore` 接口（`GetComponentVersion(ctx, name, version) (*ComponentVersion, error)`）
   - 扩展 `BundleStore` 实现该接口
-- **ComponentStatus 状态模型**：
-  - 扩展 `BKEClusterStatus` 新增 `ComponentStatuses map[string]ComponentStatus`
-  - 新增 `ComponentPhase` 枚举（Pending/Installing/Upgrading/Installed/Failed/RollingBack/RolledBack/Timeout）
-  - 定义 `ComponentStatusUpdater` 接口（MarkPending/MarkSuccess/MarkFailed/MarkTimeout/MarkRollback）
+- **ComponentLifecycleStatus 状态模型**：
+  - 扩展 `BKEClusterStatus` 新增 `NodeComponentStatuses map[string]map[string]ComponentLifecycleStatus` 和 `ClusterComponentStatuses map[string]ComponentLifecycleStatus`
+  - 新增 `LifecyclePhase` 枚举（Pending/Installing/Installed/Upgrading/RollingBack/Uninstalling/Removed/Failed）
+  - 新增 `ComponentType` 枚举（node/cluster）
+  - 定义 `ComponentStatusUpdater` 接口（MarkPending/MarkInstalled/MarkFailed/MarkRollingBack/MarkUninstalling/MarkRemoved）
   - 实现 `BKEComponentStatusUpdater`（通过 client.Patch 更新 BKECluster.Status）
 - **TemplateContext 完整扩展**：
   - 新增字段：Config（*BKEConfig）、APIServer、ServiceCIDR、PodCIDR、DNSDomain、ComponentVersion、ComponentPreviousVersion、ImageRegistry、ImagePullSecret
@@ -5444,7 +5477,7 @@ func HelmComponentEnabled(obj client.Object) bool {
 1. `pkg/dagexec` 包不再 import `pkg/phaseframe`，可独立编译测试
 2. `ExecutorRegistry.Get()` 对未注册类型返回错误，触发 `executeComponentLegacy` 回退旧路径
 3. InlineComponentExecutor 通过 Adapter 正确调用原有 Phase 逻辑
-4. ComponentStatusUpdater 正确更新 BKECluster.Status.ComponentStatuses，Patch 操作幂等
+4. ComponentStatusUpdater 正确更新 BKECluster.Status.NodeComponentStatuses/ClusterComponentStatuses，Patch 操作幂等
 5. BundleStore.GetComponentVersion 正确返回 CV 对象，key 不存在时返回明确错误
 6. Scheduler 初始化时，依赖为 nil 时不注册对应执行器
 7. TemplateContext 扩展字段在 `NewExecutionContext` 中正确填充
@@ -5469,7 +5502,7 @@ func HelmComponentEnabled(obj client.Object) bool {
   - 持有 HelmInstaller + CVStore + ComponentStatusUpdater
   - 根据 VersionContext 自主决定操作：HasCurrent=false → Install，HasCurrent=true → Upgrade，Strategy.Mode=Rollback → Rollback
   - FailurePolicy=Rollback + atomic=false 时，升级失败自动触发 `helm rollback`
-  - 执行前后调用 ComponentStatusUpdater 标记状态（Pending → Success/Failed/RolledBack）
+  - 执行前后调用 ComponentStatusUpdater 标记状态（Pending → Installing → Installed/Failed/RollingBack）
 - **CRD Helm 扩展**：
   - `ComponentVersionSpec` 新增 `Helm *HelmSpec` 字段（omitempty 指针）
   - 新增类型：`HelmSpec`/`ChartSpec`/`OCIChartSpec`/`HelmStrategySpec`/`RollbackSpec`/`UninstallSpec`/`HookSpec`
@@ -5486,7 +5519,7 @@ func HelmComponentEnabled(obj client.Object) bool {
 6. `atomic=true` 时 Helm SDK 自动回滚，无需额外调用
 7. `cleanup-on-fail=true` 时安装失败自动清理 Release
 8. HelmComponentExecutor 根据 VersionContext 自动判定 Install/Upgrade，Strategy.Mode 优先
-9. FailurePolicy=Rollback + atomic=false 时，升级失败正确触发 helm rollback，状态标记为 RolledBack
+9. FailurePolicy=Rollback + atomic=false 时，升级失败正确触发 helm rollback，状态标记为 Installed（回滚到旧版本）
 10. CRD 扩展后旧 ComponentVersion 反序列化不受影响（Helm 字段为 nil）
 11. 集成测试：coredns Helm 组件全新安装 + 升级通过
 12. 单元测试覆盖率 ≥85%
@@ -5561,7 +5594,7 @@ func HelmComponentEnabled(obj client.Object) bool {
 - **高级错误处理与恢复（增强）**：
   - 错误分类：可重试（网络超时）/不可重试（配置错误）/部分失败
   - 可重试错误支持指数退避重试
-  - 失败时记录详细错误信息至 ComponentStatus.Message
+  - 失败时记录详细错误信息至 ComponentLifecycleStatus.Message
 - **迁移策略**：
   - 阶段 1：部署新 CRD 与控制器（Feature Gate 关闭），保持原有逻辑
   - 阶段 2：开启 Feature Gate，新集群走 DAG 路径，旧集群保持旧路径
@@ -5600,7 +5633,7 @@ func HelmComponentEnabled(obj client.Object) bool {
 | 1.3 | `ComponentExecutor` 接口 | `ExecuteComponent` + `GetComponentType` |
 | 1.4 | `ExecutorRegistry` | `Register`/`Get`/`Has`，替代硬编码 if-else |
 | 1.5 | `ComponentVersionStore` 接口 + `BundleStore` 实现 | `GetComponentVersion(ctx, name, version)` |
-| 1.6 | `ComponentStatus` 状态模型 | `ComponentStatuses map`、`ComponentPhase` 枚举、`ComponentStatusUpdater` 接口 |
+| 1.6 | `ComponentLifecycleStatus` 状态模型 | `NodeComponentStatuses`/`ClusterComponentStatuses` map、`LifecyclePhase` 枚举、`ComponentType` 枚举、`ComponentStatusUpdater` 接口 |
 | 1.7 | `BKEComponentStatusUpdater` 实现 | client.Patch 更新，幂等 |
 | 1.8 | `InlineComponentExecutor` 实现 | 委托 `InlineRunner.Execute` |
 | 1.9 | `InlinePhaseRunnerAdapter` | controllers 层桥接，phaseframe 仅限 controllers 包 |
@@ -5703,7 +5736,7 @@ func HelmComponentEnabled(obj client.Object) bool {
 | 4.3 | 兼容层完善 | Feature Gate OFF → 旧路径；ON → 新路径 |
 | 4.4 | 完整安装流程集成 | BKEClusterReconciler → ReleaseImage → DAG → Scheduler.ExecuteDAG |
 | 4.5 | 完整升级流程集成 | ClusterVersionReconciler → 版本对比 → 升级 DAG |
-| 4.6 | 基础错误处理 | FailFast/Continue 策略，错误信息记录到 ComponentStatus.Message |
+| 4.6 | 基础错误处理 | FailFast/Continue 策略，错误信息记录到 ComponentLifecycleStatus.Message |
 | 4.7 | 集成测试 | Helm/YAML/Inline 全新安装/升级、离线环境 |
 | 4.8 | E2E 测试（小规模） | 1M+2W 完整安装流程 |
 
