@@ -37,6 +37,18 @@
    - 7.5 安装/升级失败 → 重试
    - 7.6 删除
 8. [单图完整性评估](#8-单图完整性评估)
+9. [状态更新机制](#9-状态更新机制)
+   - 9.1 状态更新责任矩阵
+   - 9.2 集群状态更新流程
+   - 9.3 节点状态更新流程
+   - 9.4 命令状态更新流程
+   - 9.5 持久化机制
+   - 9.6 状态更新触发条件
+10. [状态间关系](#10-状态间关系)
+   - 10.1 状态依赖关系图
+   - 10.2 状态聚合规则
+   - 10.3 状态因果关系
+   - 10.4 状态冲突处理
 
 ---
 
@@ -1367,6 +1379,681 @@ BKECluster ──1:N──> BKENode ──1:1──> BKEMachine
 - 隐藏 PhaseStatus 和 Conditions
 - 只展示主要状态转换
 - 隐藏节点和命令层细节
+
+---
+
+## 9. 状态更新机制
+
+> **本章目标**：说明各状态字段由谁更新、何时更新、如何持久化，以及状态更新的触发条件和原子性保证。
+
+### 9.1 状态更新责任矩阵
+
+下表明确每个状态字段的**更新责任方**、**更新时机**和**更新方式**：
+
+| 资源 | 状态字段 | 更新责任方 | 更新时机 | 更新方式 | 代码位置 |
+|------|---------|-----------|---------|---------|---------|
+| **BKECluster** | `Phase` | PhaseFlow | 每个 Phase 开始/结束 | `PhaseStatus.SetStatus()` → `SyncStatusUntilComplete()` | `pkg/phaseframe/phaseflow.go` |
+| **BKECluster** | `ClusterStatus` | Phase 钩子 + StatusManager | Phase 执行后（pre/post hook） | `calculatingClusterPostStatusByPhase()` → `SyncStatusUntilComplete()` | `pkg/phaseframe/phases/phase_flow.go` |
+| **BKECluster** | `ClusterHealthState` | BKEClusterReconciler + StatusManager | Reconcile 开始时 + 失败升级时 | `setClusterHealthStatus()` → `recordBKEClusterStatus()` | `controllers/capbke/bkecluster_controller.go` + `pkg/statusmanage/statusmanager.go` |
+| **BKECluster** | `PhaseStatus` | PhaseFlow | 每个 Phase 开始/结束 | `DefaultPreHook()`/`DefaultPostHook()` → `Report()` | `pkg/phaseframe/phaseflow.go` |
+| **BKECluster** | `Conditions` | 各 Phase / StatusManager | 条件满足时 | `condition.ConditionMark()` / `condition.ConditionRemove()` | `utils/capbke/condition/` |
+| **BKECluster** | `DeclarativeUpgrade` | Scheduler (DAG) | 组件执行成功/失败后 | `markComponentCompleted()` / `markComponentFailed()` → `client.Status().Update()` | `pkg/dagexec/scheduler.go` |
+| **BKECluster** | `Ready` / `*Version` | EnsureCluster Phase | 健康检查通过后 | 直接赋值 → `SyncStatusUntilComplete()` | `pkg/phaseframe/phases/ensure_cluster.go` |
+| **BKENode** | `State` | NodeFetcher + Phase | 节点操作后（删除/引导完成） | `UpdateBKENodeState()` → `client.Status().Update()` | `utils/capbke/nodeutil/fetcher.go` |
+| **BKENode** | `StateCode` | Phase（内存操作）+ NodeFetcher（持久化） | Phase 内位标记操作 → Phase 结束后批量持久化 | 内存：`StateCode \|= flag`；持久化：`UpdateModifiedBKENodes()` | `pkg/mergecluster/bkecluster.go` |
+| **BKENode** | `Message` | NodeFetcher + Phase | 状态变化时 | 与 State 一起更新 | `utils/capbke/nodeutil/fetcher.go` |
+| **BKEMachine** | `Ready` / `Bootstrapped` | BKEMachineController | 引导完成后 | Cluster API 自动更新 | `controllers/capbke/bkemachine_controller_phases.go` |
+| **Command** | `Phase` / `Status` | CommandReconciler | 命令执行时 | `executeWithRetry()` → `syncStatusUntilComplete()` | `controllers/bkeagent/command_controller.go` |
+| **Command** | `Conditions[]` | CommandReconciler | 每条子命令执行后 | 直接赋值 → `syncStatusUntilComplete()` | `controllers/bkeagent/command_controller.go` |
+
+### 9.2 集群状态更新流程
+
+#### 9.2.1 ClusterStatus 更新流程
+
+ClusterStatus 的更新分两条路径：**Phase 执行路径**（正常安装/升级）和 **DAG 执行路径**（声明式升级）。
+
+**路径 1：Phase 执行路径**
+
+```
+BKEClusterReconciler.Reconcile()
+  │
+  ├─ executePhaseFlow()
+  │     │
+  │     ├─ for each phase:
+  │     │     │
+  │     │     ├─ ExecutePreHook()
+  │     │     │     ├─ SetStatus(PhaseRunning)
+  │     │     │     ├─ Report() → SyncStatusUntilComplete()    ← 持久化 Phase
+  │     │     │     └─ calculatingClusterPreStatusByPhase()
+  │     │     │           └─ ClusterStatus = 过渡状态            ← 如 ClusterChecking
+  │     │     │
+  │     │     ├─ Execute()                                      ← 实际 Phase 逻辑
+  │     │     │
+  │     │     └─ ExecutePostHook()
+  │     │           ├─ SetStatus(PhaseSucceeded / PhaseFailed)
+  │     │           ├─ Report() → SyncStatusUntilComplete()     ← 持久化 PhaseStatus
+  │     │           └─ calculatingClusterPostStatusByPhase()
+  │     │                 ├─ 根据 Phase 分组路由到对应 handler
+  │     │                 ├─ err != nil → ClusterStatus = *Failed
+  │     │                 └─ err == nil → ClusterStatus = 活跃状态
+  │     │
+  │     └─ getFinalResult()
+  │           └─ StatusManager.GetCtrlResult()
+  │                 ├─ 失败次数 ≤ 限制 → 保持当前状态，requeue 重试
+  │                 └─ 失败次数 > 限制 → ClusterHealthState 升级为 *Failed
+  │
+  └─ SyncStatusUntilComplete()                                  ← 最终持久化
+```
+
+**ClusterStatus 路由规则**（`calculateClusterStatusByPhase`）：
+
+| Phase 分组 | 成功时 ClusterStatus | 失败时 ClusterStatus |
+|-----------|---------------------|---------------------|
+| `ClusterInitPhaseNames` | `ClusterInitializing` | `ClusterInitializationFailed` |
+| `ClusterScaleMasterUpPhaseNames` | `ClusterMasterScalingUp` | `ClusterScaleFailed` |
+| `ClusterScaleWorkerUpPhaseNames` | `ClusterWorkerScalingUp` | `ClusterScaleFailed` |
+| `ClusterScaleMasterDownPhaseNames` | `ClusterMasterScalingDown` | `ClusterScaleFailed` |
+| `ClusterScaleWorkerDownPhaseNames` | `ClusterWorkerScalingDown` | `ClusterScaleFailed` |
+| `ClusterUpgradePhaseNames` | `ClusterUpgrading` | `ClusterUpgradeFailed` |
+| `ClusterAddonsPhaseNames` | `ClusterDeployingAddon` | `ClusterDeployAddonFailed` |
+| `ClusterManagePhaseNames` | `ClusterManaging` | `ClusterManageFailed` |
+| `ClusterDeletePhaseNames` | `ClusterDeleting` | `ClusterDeleteFailed` |
+
+**路径 2：DAG 执行路径**
+
+```
+BKEClusterReconciler.executeUpgradeDAG()
+  │
+  ├─ patchClusterStatus(ClusterUpgrading)     ← 显式 patch
+  │
+  ├─ Scheduler.ExecuteDAG()
+  │     └─ 执行组件...
+  │
+  ├─ 成功 → patchClusterStatus(ClusterReady)
+  │
+  └─ 失败 → patchClusterStatus(ClusterUpgradeFailed)
+```
+
+#### 9.2.2 ClusterHealthState 更新流程
+
+ClusterHealthState 的更新分三个阶段：
+
+```
+阶段 1：初始设置（Reconcile 开始时）
+  │
+  ├─ handleClusterStatus()
+  │     └─ initNodeStatus()
+  │           └─ setClusterHealthStatus(flags)
+  │                 ├─ DeployFlag → ClusterHealthState = Deploying
+  │                 ├─ UpgradeFlag → ClusterHealthState = Upgrading
+  │                 ├─ ManageFlag → ClusterHealthState = Managing
+  │                 └─ DeleteFlag → ClusterHealthState = Deleting
+  │
+  ▼
+阶段 2：Phase 执行中（健康检查 Phase）
+  │
+  ├─ EnsureCluster.performHealthCheck()
+  │     ├─ 检查通过 → ClusterHealthState = Healthy
+  │     └─ 检查失败 → ClusterHealthState = Unhealthy
+  │
+  ▼
+阶段 3：失败升级（StatusManager）
+  │
+  └─ recordBKEClusterStatus()
+        ├─ 失败次数 ≤ ReconcileAllowedFailedCount (默认 10)
+        │     └─ 保持上一个正常状态（掩盖失败，继续重试）
+        │
+        └─ 失败次数 > ReconcileAllowedFailedCount
+              ├─ Deploying → ClusterHealthState = DeployFailed
+              ├─ Upgrading → ClusterHealthState = UpgradeFailed
+              └─ Managing → ClusterHealthState = ManageFailed
+```
+
+### 9.3 节点状态更新流程
+
+#### 9.3.1 State 更新
+
+BKENode.State 由 `NodeFetcher.UpdateBKENodeState()` 统一更新：
+
+```
+更新触发场景：
+  │
+  ├─ 节点标记删除
+  │     └─ handleNodeChanges() → UpdateBKENodeState(NodeDeleting, "Node marked for deletion")
+  │
+  ├─ 引导完成
+  │     └─ BKEClusterReconciler → State = NodeReady, StateCode = 527
+  │
+  └─ Phase 内操作
+        └─ 各 Phase 直接操作 BKENodes 内存对象 → 最终由 UpdateModifiedBKENodes() 持久化
+```
+
+#### 9.3.2 StateCode 更新
+
+StateCode 采用**内存操作 + 批量持久化**模式：
+
+```
+Phase 执行中（内存操作）：
+  │
+  ├─ EnsureBKEAgent:
+  │     StateCode &= ^NodeAgentPushedFlag     ← 清除旧标记
+  │     StateCode |= NodeAgentPushedFlag      ← 设置新标记
+  │     StateCode |= NodeAgentReadyFlag       ← 健康检查通过
+  │
+  ├─ EnsureNodesEnv:
+  │     StateCode |= NodeEnvFlag
+  │
+  ├─ EnsureClusterManage (bootstrap):
+  │     StateCode |= NodeBootFlag
+  │
+  ├─ EnsureMasterInit:
+  │     StateCode |= MasterInitFlag
+  │
+  ├─ EnsureNodesPostProcess:
+  │     StateCode |= NodePostProcessFlag
+  │
+  └─ 任意阶段失败:
+        StateCode |= NodeFailedFlag
+        StateCode |= NodeStateNeedRecord      ← 标记需要持久化
+
+Phase 结束后（批量持久化）：
+  │
+  └─ mergecluster.UpdateModifiedBKENodes()
+        ├─ 遍历所有 BKENode
+        ├─ 检查 NodeStateNeedRecord 标记
+        ├─ StateCode &= ^NodeStateNeedRecord  ← 清除记录标记
+        └─ client.Status().Update(node)       ← 持久化到 API Server
+```
+
+**关键设计**：`NodeStateNeedRecord` 标记（bit 8）是持久化的触发器。Phase 在内存中修改 StateCode 后，设置此标记；Phase 结束后，`UpdateModifiedBKENodes()` 只持久化带此标记的节点，避免不必要的 API 调用。
+
+### 9.4 命令状态更新流程
+
+Command 状态更新由 `CommandReconciler` 驱动，采用**逐条子命令更新 + 最终聚合**模式：
+
+```
+CommandReconciler.Reconcile()
+  │
+  ├─ 1. ensureStatusInitialized()
+  │     └─ Phase = CommandRunning, Status = ConditionUnknown
+  │     └─ syncStatusUntilComplete()                    ← 持久化
+  │
+  ├─ 2. handleSuspend() (如果 Spec.Suspend=true)
+  │     └─ Phase = CommandSuspend
+  │     └─ syncStatusUntilComplete()                    ← 持久化
+  │
+  ├─ 3. executeWithRetry() (逐条子命令)
+  │     │
+  │     └─ for each execCommand:
+  │           │
+  │           ├─ condition.LastStartTime = now
+  │           ├─ condition.Count++
+  │           │
+  │           ├─ executeByType(type, command)
+  │           │     ├─ BuiltIn → 内置命令执行
+  │           │     ├─ Shell → SSH 远程执行
+  │           │     └─ Kubernetes → K8s API 操作
+  │           │
+  │           ├─ 成功:
+  │           │     condition.Status = ConditionTrue
+  │           │     condition.Phase = CommandComplete
+  │           │     break (跳出重试循环)
+  │           │
+  │           └─ 失败:
+  │                 condition.Status = ConditionFalse
+  │                 condition.Phase = CommandFailed
+  │                 continue (继续重试，直到 BackoffLimit)
+  │
+  ├─ 4. BackoffIgnore 处理
+  │     └─ 如果 condition.Status == False && BackoffIgnore == true
+  │           condition.Phase = CommandSkip              ← 跳过失败
+  │
+  └─ 5. finalizeTaskStatus() (聚合)
+        │
+        ├─ ConditionCount(conditions, commandCount)
+        │     ├─ 任意 Failed → Phase = CommandFailed
+        │     ├─ 未完成 → Phase = CommandRunning
+        │     └─ 全部完成 → Phase = CommandComplete
+        │
+        ├─ Succeeded = 成功数
+        ├─ Failed = 失败数
+        ├─ CompletionTime = now
+        │
+        └─ syncStatusUntilComplete()                    ← 持久化
+```
+
+### 9.5 持久化机制
+
+#### 9.5.1 SyncStatusUntilComplete（BKECluster 持久化）
+
+所有 BKECluster 状态持久化最终通过 `SyncStatusUntilComplete()` 完成：
+
+```go
+// pkg/mergecluster/bkecluster.go
+func SyncStatusUntilComplete(c client.Client, bkeCluster *v1beta1.BKECluster, patchs ...PatchFunc) (err error) {
+    ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+    defer cancel()
+    for {
+        err = UpdateCombinedBKECluster(ctx, c, bkeCluster, []string{}, patchs...)
+        if err != nil {
+            if apierrors.IsConflict(err) { continue }   // 冲突重试
+            if apierrors.IsNotFound(err) { break }       // 已删除则放弃
+            continue
+        }
+        break
+    }
+}
+```
+
+**内部流程**：
+
+```
+SyncStatusUntilComplete()
+  │
+  ├─ UpdateCombinedBKECluster()
+  │     │
+  │     ├─ 1. 从 API Server 获取最新 BKECluster（避免冲突）
+  │     │
+  │     ├─ 2. 应用 patchs（状态修改函数）
+  │     │
+  │     ├─ 3. StatusManager.SetStatus()
+  │     │     ├─ recordBKEClusterStatus()    ← 失败计数 + 状态升级
+  │     │     └─ recordBKENodesStatus()      ← 节点级失败计数
+  │     │
+  │     ├─ 4. UpdateModifiedBKENodes()       ← 持久化修改过的 BKENode
+  │     │
+  │     └─ 5. PatchHelper.Patch()            ← 持久化 BKECluster
+  │
+  └─ 冲突/失败 → 重试（2 分钟超时）
+```
+
+#### 9.5.2 syncStatusUntilComplete（Command 持久化）
+
+Command 使用独立的持久化机制，采用**读取-修改-Patch**循环：
+
+```go
+// controllers/bkeagent/command_controller.go
+func (r *CommandReconciler) syncStatusUntilComplete(cmd *agentv1beta1.Command) (err error) {
+    for {
+        obj := &agentv1beta1.Command{}
+        err = r.APIReader.Get(r.Ctx, client.ObjectKey{...}, obj)  // 从 API Server 读取最新
+        objCopy := obj.DeepCopy()
+        objCopy.Status[r.commandStatusKey()] = cmd.Status[r.commandStatusKey()]
+        err = r.Client.Status().Patch(r.Ctx, objCopy, client.MergeFrom(obj))  // merge-patch
+        if err != nil { continue }  // 冲突重试
+        break
+    }
+}
+```
+
+#### 9.5.3 持久化方式对比
+
+| 资源 | 持久化方式 | 冲突处理 | 超时 | 代码位置 |
+|------|-----------|---------|------|---------|
+| BKECluster | `PatchHelper.Patch()` (merge-patch) | 自动重试 | 2 分钟 | `pkg/mergecluster/bkecluster.go` |
+| BKENode | `client.Status().Update()` | `retry.RetryOnConflict()` | 默认重试策略 | `utils/capbke/nodeutil/fetcher.go` |
+| Command | `client.Status().Patch()` (merge-patch) | 循环重试 | 5 分钟 | `controllers/bkeagent/command_controller.go` |
+
+### 9.6 状态更新触发条件
+
+#### 9.6.1 触发源
+
+| 触发源 | 触发条件 | 影响的状态 |
+|--------|---------|-----------|
+| **BKECluster Spec 变更** | 用户修改 `spec.nodes` / `spec.clusterConfig` | Phase, ClusterStatus, ClusterHealthState |
+| **BKECluster 注解变更** | `bke.bocloud.com/retry` / `cvo.openfuyao.cn/upgrade-ready` | DeclarativeUpgrade, ClusterStatus |
+| **BKENode 创建/删除** | 节点加入/离开集群 | BKENode.State, StateCode, ClusterStatus |
+| **Command 创建** | Phase 创建命令在节点上执行 | Command.Phase, Command.Status |
+| **Command 完成** | bkeagent 执行命令完毕 | BKENode.StateCode, ClusterStatus |
+| **Reconcile 循环** | 控制器定期调谐（默认 10 分钟） | 所有状态字段（重新评估） |
+| **Watch 事件** | 关联资源变更触发（BKENode/Command/BKEMachine） | 聚合状态 |
+
+#### 9.6.2 节流与去重
+
+| 机制 | 说明 | 代码位置 |
+|------|------|---------|
+| **Rate Limiter** | 快速重试 10s × 5 次 → 慢速重试 60s | `controllers/capbke/bkecluster_controller.go` |
+| **StatusRecord 注解** | 避免重复记录相同状态 | `pkg/statusmanage/statusmanager.go` |
+| **NodeStateNeedRecord** | 只持久化修改过的节点 | `pkg/mergecluster/bkecluster.go` |
+| **冲突重试** | API Server 冲突时自动重试 | `SyncStatusUntilComplete()` |
+
+#### 9.6.3 原子性保证
+
+| 场景 | 保证方式 |
+|------|---------|
+| BKECluster + BKENode 同时更新 | `UpdateCombinedBKECluster()` 在同一事务中先更新 BKENode 再 Patch BKECluster |
+| 状态 + 注解同时更新 | 在同一个 Patch 请求中完成 |
+| 多节点并发更新 | 每个节点独立 `Status().Update()`，带 `retry.RetryOnConflict()` |
+| Phase 执行中途崩溃 | 下次 Reconcile 重新评估，Phase 幂等执行 |
+
+---
+
+## 10. 状态间关系
+
+> **本章目标**：说明各状态字段之间的依赖关系、聚合规则、因果传播路径和冲突处理策略。
+
+### 10.1 状态依赖关系图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         状态依赖关系总览                                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+集群层内部依赖：
+  ┌─────────────────────────────────────────────────────┐
+  │                                                     │
+  │  ClusterStatus ←── Phase (当前执行阶段)              │
+  │       │                                             │
+  │       ├──← ClusterHealthState (健康视角)             │
+  │       │       │                                     │
+  │       │       └──← 节点聚合状态 + 组件健康状态         │
+  │       │                                             │
+  │       └──← Conditions (细粒度条件)                   │
+  │                                                     │
+  │  PhaseStatus ←── Phase (各阶段执行结果)               │
+  │                                                     │
+  │  DeclarativeUpgrade ←── Phase (DAG 组件执行结果)      │
+  │                                                     │
+  └─────────────────────────────────────────────────────┘
+
+节点层内部依赖：
+  ┌─────────────────────────────────────────────────────┐
+  │                                                     │
+  │  BKENode.State ←── StateCode (位标记聚合)            │
+  │       │                                             │
+  │       └──← BKEMachine.Ready (引导完成标记)            │
+  │                                                     │
+  │  StateCode ←── 各 Phase 位标记                       │
+  │       ├── NodeAgentPushedFlag (bit 0)               │
+  │       ├── NodeAgentReadyFlag  (bit 1)               │
+  │       ├── NodeEnvFlag         (bit 2)               │
+  │       ├── NodeBootFlag        (bit 3)               │
+  │       ├── MasterInitFlag      (bit 5)               │
+  │       ├── NodePostProcessFlag (bit 9)               │
+  │       ├── NodeFailedFlag      (bit 7)  ← 异常       │
+  │       └── NodeDeletingFlag    (bit 6)  ← 删除       │
+  │                                                     │
+  └─────────────────────────────────────────────────────┘
+
+命令层内部依赖：
+  ┌─────────────────────────────────────────────────────┐
+  │                                                     │
+  │  Command.Phase ←── 聚合(所有 Condition.Phase)        │
+  │       │                                             │
+  │       └──← 各子命令执行结果                           │
+  │                                                     │
+  │  Command.Status ←── 聚合(所有 Condition.Status)      │
+  │                                                     │
+  └─────────────────────────────────────────────────────┘
+
+跨层依赖：
+  ┌─────────────────────────────────────────────────────┐
+  │                                                     │
+  │  ClusterStatus ←── 聚合(所有 BKENode.State)          │
+  │                                                     │
+  │  ClusterHealthState ←── 聚合(所有 BKENode.State      │
+  │                         + 集群级组件状态)              │
+  │                                                     │
+  │  BKENode.State ←── 聚合(所有关联 Command.Phase)      │
+  │                                                     │
+  └─────────────────────────────────────────────────────┘
+```
+
+### 10.2 状态聚合规则
+
+#### 10.2.1 节点状态聚合 → 集群状态
+
+```
+规则 1：所有节点 Ready → 集群 Ready
+  if all(node.State == NodeReady for node in nodes):
+      ClusterStatus = ClusterReady
+
+规则 2：任意节点 Upgrading → 集群 Upgrading
+  if any(node.State == NodeUpgrading for node in nodes):
+      ClusterStatus = ClusterUpgrading
+
+规则 3：任意节点 Failed → 集群 Failed
+  if any(node.State == NodeFailed for node in nodes):
+      ClusterStatus = ClusterScaleFailed  // 或 ClusterInitializationFailed 等
+
+规则 4：任意节点 Deleting → 集群 Scaling
+  if any(node.State == NodeDeleting for node in nodes):
+      ClusterStatus = ClusterWorkerScalingDown  // 或 ClusterMasterScalingDown
+
+规则 5：任意节点 Pending/Provisioned → 集群 Creating
+  if any(node.State in [NodePending, NodeProvisioned] for node in nodes):
+      ClusterStatus = ClusterInitializing
+```
+
+#### 10.2.2 StateCode 位标记聚合 → 节点状态
+
+```
+规则 1：StateCode == 527 (bootstrapReadyStateCode) → NodeReady
+  // 527 = bits 0,1,2,3,5,9 = AgentPushed + AgentReady + Env + Boot + MasterInit + PostProcess
+  if node.StateCode & 527 == 527:
+      node.State = NodeReady
+
+规则 2：NodeFailedFlag (bit 7) 置位 → NodeFailed
+  if node.StateCode & NodeFailedFlag != 0:
+      node.State = NodeFailed
+
+规则 3：NodeDeletingFlag (bit 6) 置位 → NodeDeleting
+  if node.StateCode & NodeDeletingFlag != 0:
+      node.State = NodeDeleting
+
+规则 4：StateCode == 0 → NodePending
+  if node.StateCode == 0:
+      node.State = NodePending
+
+规则 5：部分位标记置位 → NodeProvisioned / NodeNotReady
+  if node.StateCode > 0 && node.StateCode != 527:
+      node.State = NodeProvisioned  // 或 NodeNotReady，取决于具体位标记
+```
+
+#### 10.2.3 命令状态聚合 → Command.Phase
+
+```
+规则 1：任意子命令 Failed → Command.Phase = CommandFailed
+  if any(condition.Phase == CommandFailed for condition in conditions):
+      command.Phase = CommandFailed
+
+规则 2：所有子命令 Complete → Command.Phase = CommandComplete
+  if all(condition.Phase == CommandComplete for condition in conditions):
+      command.Phase = CommandComplete
+
+规则 3：部分子命令完成中 → Command.Phase = CommandRunning
+  if any(condition.Phase in [CommandRunning, CommandPending] for condition in conditions):
+      command.Phase = CommandRunning
+
+规则 4：BackoffIgnore + Failed → Command.Phase = CommandSkip
+  if condition.Phase == CommandFailed && execCommand.BackoffIgnore:
+      condition.Phase = CommandSkip
+```
+
+#### 10.2.4 ClusterHealthState 聚合规则
+
+```
+规则 1：DeployFlag (首次部署) → ClusterHealthState = Deploying
+规则 2：UpgradeFlag (升级中) → ClusterHealthState = Upgrading
+规则 3：ManageFlag (管理中) → ClusterHealthState = Managing
+规则 4：DeleteFlag (删除中) → ClusterHealthState = Deleting
+规则 5：健康检查通过 → ClusterHealthState = Healthy
+规则 6：健康检查失败 → ClusterHealthState = Unhealthy
+
+失败升级规则（StatusManager）：
+规则 7：Deploying + 失败次数 > 10 → ClusterHealthState = DeployFailed
+规则 8：Upgrading + 失败次数 > 10 → ClusterHealthState = UpgradeFailed
+规则 9：Managing + 失败次数 > 10 → ClusterHealthState = ManageFailed
+```
+
+### 10.3 状态因果关系
+
+#### 10.3.1 因果传播路径
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         状态因果传播路径                                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+路径 1：命令执行 → 节点状态 → 集群状态
+
+  Command.Phase: Pending → Running → Completed
+       │
+       ▼
+  BKENode.StateCode |= NodeBootFlag (bit 3)
+       │
+       ▼
+  BKENode.State: Provisioned → Ready (当 StateCode == 527)
+       │
+       ▼
+  ClusterStatus: Initializing → Ready (当所有节点 Ready)
+
+路径 2：Phase 执行 → 集群状态
+
+  Phase.Execute() 成功/失败
+       │
+       ▼
+  ClusterStatus: 活跃状态 / *Failed (由 post-hook 设置)
+       │
+       ▼
+  StatusManager.recordBKEClusterStatus()
+       │
+       ├─ 失败次数 ≤ 10 → 保持当前状态，requeue
+       │
+       └─ 失败次数 > 10 → ClusterHealthState 升级为 *Failed
+
+路径 3：节点变化 → 集群状态
+
+  BKENode 创建/删除
+       │
+       ▼
+  BKEClusterReconciler.handleNodeChanges()
+       │
+       ├─ 新节点 → StateCode = 0, State = Pending
+       │              → ClusterStatus = ClusterInitializing
+       │
+       └─ 节点删除 → StateCode |= NodeDeletingFlag
+                       → ClusterStatus = ClusterWorkerScalingDown
+
+路径 4：版本变更 → 声明式升级 → 组件状态
+
+  ClusterVersion.Spec.DesiredVersion 变更
+       │
+       ▼
+  BKECluster 注解: cvo.openfuyao.cn/upgrade-ready = "v2.6.0"
+       │
+       ▼
+  DeclarativeUpgrade.TargetVersion = "v2.6.0"
+       │
+       ▼
+  Scheduler.ExecuteDAG()
+       │
+       ├─ 组件成功 → DeclarativeUpgrade.Completed++
+       │              → ClusterStatus = ClusterUpgrading
+       │
+       └─ 组件失败 → DeclarativeUpgrade.LastFailure++
+                       → ClusterStatus = ClusterUpgradeFailed
+```
+
+#### 10.3.2 因果传播延迟
+
+| 传播路径 | 延迟 | 原因 |
+|---------|------|------|
+| Command → BKENode | 秒级 | Command 完成后立即更新 StateCode |
+| BKENode → BKECluster | 秒级 | Reconcile 循环中聚合 |
+| Phase → ClusterStatus | 秒级 | Phase post-hook 立即设置 |
+| ClusterHealthState 升级 | 分钟级 | 需要累积 10 次失败（默认） |
+| DeclarativeUpgrade 进度 | 秒级 | 每个组件执行后立即更新 |
+
+### 10.4 状态冲突处理
+
+#### 10.4.1 多状态同时变化
+
+**场景**：Phase 执行同时修改 ClusterStatus 和 BKENode.StateCode
+
+**处理策略**：
+
+```
+UpdateCombinedBKECluster() 保证原子性：
+  │
+  ├─ 1. 先持久化 BKENode（UpdateModifiedBKENodes）
+  │
+  ├─ 2. 再持久化 BKECluster（PatchHelper.Patch）
+  │
+  └─ 3. 如果 BKECluster Patch 失败（冲突）
+        └─ 重新读取 → 重新应用 → 重试
+```
+
+#### 10.4.2 状态回滚级联
+
+**场景**：升级失败后回滚
+
+```
+回滚触发：
+  DeclarativeUpgrade.LastFailure.Attempt > 阈值
+       │
+       ▼
+  回滚传播：
+  │
+  ├─ 1. DeclarativeUpgrade.LastError = "升级失败"
+  │
+  ├─ 2. ClusterStatus = ClusterUpgradeFailed
+  │
+  ├─ 3. ClusterHealthState = UpgradeFailed (失败升级后)
+  │
+  ├─ 4. BKENode.StateCode |= NodeFailedFlag (失败节点)
+  │
+  └─ 5. BKENode.State = NodeFailed (失败节点)
+
+回滚恢复（人工介入）：
+  │
+  ├─ 1. 用户添加注解: bke.bocloud.com/retry=""
+  │
+  ├─ 2. BKEClusterReconciler.handleRetryLogic()
+  │     └─ BKENode.StateCode &= ^NodeFailedFlag (清除失败标记)
+  │
+  ├─ 3. StatusManager.ResetCache() (重置失败计数)
+  │
+  └─ 4. 重新执行失败阶段
+        └─ Phase 幂等执行，跳过已完成组件
+```
+
+#### 10.4.3 状态不一致修复
+
+**场景**：BKENode.State 与 StateCode 不一致（如 State=Ready 但 StateCode 缺少位标记）
+
+**修复机制**：
+
+```
+Reconcile 循环中自动修复：
+  │
+  ├─ 1. StatusManager.SetStatus() 重新评估节点状态
+  │     └─ 根据 StateCode 重新计算 State
+  │
+  ├─ 2. 如果 State 与 StateCode 不一致
+  │     └─ 以 StateCode 为准（StateCode 是事实来源）
+  │
+  └─ 3. 更新 BKENode.State 并持久化
+
+人工修复：
+  │
+  ├─ 1. 查看 StateCode: kubectl get bkenode <name> -o jsonpath='{.status.stateCode}'
+  │
+  ├─ 2. 手动修正: kubectl patch bkenode <name> --type merge --subresource status -p '{"status":{"stateCode":527}}'
+  │
+  └─ 3. 触发 Reconcile: kubectl annotate bkecluster <name> bke.bocloud.com/retry=""
+```
+
+#### 10.4.4 状态冲突优先级
+
+当多个状态源产生冲突时，按以下优先级处理：
+
+| 优先级 | 状态源 | 说明 |
+|--------|--------|------|
+| **最高** | StateCode 位标记 | 事实来源，不可覆盖 |
+| **高** | Phase 执行结果 | Phase post-hook 设置的状态 |
+| **中** | StatusManager 聚合 | 基于失败计数的状态升级 |
+| **低** | 用户手动设置 | 可能被 Reconcile 覆盖 |
 
 ---
 
