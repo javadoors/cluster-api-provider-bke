@@ -135,91 +135,72 @@
 
 **实现方案**：
 
-```go
-// pkg/phaseframe/phases/ensure_nodes_env.go
+扩展现有的 `K8sEnvInit` 命令的 `exportImageList()` 方法，从 BKEConfig 中动态读取 Addon 配置，自动获取 Calico 镜像列表。
 
-// getCalicoImages 从 BKECluster 动态获取 Calico 镜像列表
-func (e *EnsureNodesEnv) getCalicoImages(bkeCluster *bkev1beta1.BKECluster) []string {
-    // 从 BKECluster.Spec.ClusterConfig.Addons 中获取 Calico 版本
-    calicoVersion := "v3.31.3" // 默认版本
-    for _, addon := range bkeCluster.Spec.ClusterConfig.Addons {
-        if addon.Name == "calico" && addon.Version != "" {
-            calicoVersion = addon.Version
-            break
+**文件**: `pkg/job/builtin/kubeadm/env/init.go`
+
+```go
+// exportImageList export image list from bkeConfig
+func (ep *EnvPlugin) exportImageList() []string {
+    if ep.bkeConfig == nil {
+        return nil
+    }
+    var images []string
+    cfg := ep.bkeConfig
+    conf := bkeinit.BkeConfig(*cfg)
+    repo := fmt.Sprintf("%s/", strings.TrimRight(conf.ImageFuyaoRepo(), "/"))
+    k8sVersion := strings.TrimPrefix(cfg.Cluster.KubernetesVersion, "v")
+    etcdVersion := strings.TrimPrefix(cfg.Cluster.EtcdVersion, "v")
+
+    // 导出 K8s 核心组件镜像
+    exporter := imagehelper.NewImageExporter(repo, k8sVersion, etcdVersion)
+    images, _ = exporter.ExportImageList()
+
+    // 导出 Addon 镜像（包括 Calico）
+    addonImages := ep.exportAddonImages()
+    images = append(images, addonImages...)
+
+    cNode := ep.currenNode
+    if cNode.IP == "" {
+        return images
+    }
+    // Worker 节点也预拉取 Addon 镜像（如 Calico DaemonSet）
+    if cNode.IsWorker() {
+        return addonImages
+    }
+    return images
+}
+
+// exportAddonImages 从 BKEConfig 中导出 Addon 镜像列表
+// 支持从 CRD 动态获取版本，避免硬编码
+func (ep *EnvPlugin) exportAddonImages() []string {
+    if ep.bkeConfig == nil || len(ep.bkeConfig.Addons) == 0 {
+        return nil
+    }
+
+    var images []string
+    conf := bkeinit.BkeConfig(*ep.bkeConfig)
+    repo := fmt.Sprintf("%s/", strings.TrimRight(conf.ImageFuyaoRepo(), "/"))
+
+    for _, addon := range ep.bkeConfig.Addons {
+        switch addon.Name {
+        case "calico":
+            // 从 Addon 配置中获取 Calico 版本
+            version := addon.Version
+            if version == "" {
+                version = "v3.31.3" // 默认版本
+            }
+            // 添加 Calico 镜像列表
+            images = append(images,
+                fmt.Sprintf("%scalico/node:%s", repo, version),
+                fmt.Sprintf("%scalico/cni:%s", repo, version),
+                fmt.Sprintf("%scalico/kube-controllers:%s", repo, version),
+                fmt.Sprintf("%scalico/pod2daemon-flexvol:%s", repo, version),
+            )
         }
     }
-    
-    // 获取镜像仓库地址（从配置或环境变量获取）
-    registry := e.Config.ImageRepo // 例如: "registry.openfuyao.com"
-    
-    return []string{
-        fmt.Sprintf("%s/calico/node:%s", registry, calicoVersion),
-        fmt.Sprintf("%s/calico/cni:%s", registry, calicoVersion),
-        fmt.Sprintf("%s/calico/kube-controllers:%s", registry, calicoVersion),
-        fmt.Sprintf("%s/calico/pod2daemon-flexvol:%s", registry, calicoVersion),
-    }
-}
 
-// prePullCalicoImages 预置 Calico 镜像
-func (e *EnsureNodesEnv) prePullCalicoImages(nodes bkenode.Nodes, bkeCluster *bkev1beta1.BKECluster) error {
-    // 动态获取镜像列表
-    calicoImages := e.getCalicoImages(bkeCluster)
-    
-    var wg sync.WaitGroup
-    errChan := make(chan error, len(nodes)*len(calicoImages))
-    
-    // 并行预置：每个节点一个 goroutine
-    for _, node := range nodes {
-        wg.Add(1)
-        go func(n bkenode.Node) {
-            defer wg.Done()
-            
-            // 每个节点并行预置所有镜像
-            var nodeWg sync.WaitGroup
-            for _, image := range calicoImages {
-                nodeWg.Add(1)
-                go func(img string) {
-                    defer nodeWg.Done()
-                    
-                    // 检查镜像是否已存在
-                    if e.imageExists(n, img) {
-                        e.Ctx.Log.Debug("Calico image %s already exists on node %s", img, n.IP)
-                        return
-                    }
-                    
-                    // 预置镜像
-                    cmd := fmt.Sprintf("crictl pull %s", img)
-                    if err := e.executeOnNode(n, cmd); err != nil {
-                        errChan <- fmt.Errorf("failed to pre-pull image %s on node %s: %v", img, n.IP, err)
-                    } else {
-                        e.Ctx.Log.Info("Successfully pre-pulled Calico image %s on node %s", img, n.IP)
-                    }
-                }(image)
-            }
-            nodeWg.Wait()
-        }(node)
-    }
-    
-    wg.Wait()
-    close(errChan)
-    
-    // 收集错误
-    var errs []error
-    for err := range errChan {
-        errs = append(errs, err)
-    }
-    
-    if len(errs) > 0 {
-        e.Ctx.Log.Warn("Some Calico images failed to pre-pull, will fallback to normal pull: %v", errs)
-    }
-    
-    return nil
-}
-
-// imageExists 检查镜像是否已存在
-func (e *EnsureNodesEnv) imageExists(node bkenode.Node, image string) bool {
-    cmd := fmt.Sprintf("crictl images | grep -q '%s'", image)
-    return e.executeOnNode(node, cmd) == nil
+    return images
 }
 ```
 
@@ -244,6 +225,17 @@ spec:
 - ✅ 版本从 BKECluster CRD 动态获取，无需修改代码
 - ✅ 支持不同集群使用不同 Calico 版本
 - ✅ 镜像仓库地址可配置，适应不同环境
+- ✅ 复用现有 K8sEnvInit 命令，无需新增代码
+- ✅ 所有节点（包括 Worker）预拉取镜像
+- ✅ 并行预拉取，减少总时间
+- ✅ 预拉取失败不影响集群创建
+
+**工作原理**：
+
+1. **环境初始化阶段**：BKEAgent 在节点上执行 `K8sEnvInit` 命令，`scope=image` 参数触发镜像预拉取
+2. **动态获取镜像列表**：`exportAddonImages()` 从 `bkeConfig.Addons` 中读取 Calico 配置
+3. **并行预拉取**：所有节点并行拉取镜像，充分利用带宽
+4. **DaemonSet 部署**：Calico DaemonSet 创建时，镜像已存在于节点本地，无需再次拉取
 
 **预期效果**：
 

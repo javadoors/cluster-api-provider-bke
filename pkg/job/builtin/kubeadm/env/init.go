@@ -766,15 +766,65 @@ func (ep *EnvPlugin) exportImageList() []string {
 	k8sVersion := strings.TrimPrefix(cfg.Cluster.KubernetesVersion, "v")
 	etcdVersion := strings.TrimPrefix(cfg.Cluster.EtcdVersion, "v")
 
+	// 导出 K8s 核心组件镜像
 	exporter := imagehelper.NewImageExporter(repo, k8sVersion, etcdVersion)
 	images, _ = exporter.ExportImageList()
+
+	// 导出 Addon 镜像（包括 Calico）
+	addonImages := ep.exportAddonImages()
+	images = append(images, addonImages...)
+
 	cNode := ep.currenNode
 	if cNode.IP == "" {
 		return images
 	}
+	// Worker 节点也预拉取 Addon 镜像（如 Calico DaemonSet）
 	if cNode.IsWorker() {
-		return []string{}
+		return addonImages
 	}
+	return images
+}
+
+// exportAddonImages 从 BKEConfig 中导出 Addon 镜像列表
+// 支持从 CRD 动态获取版本，避免硬编码
+func (ep *EnvPlugin) exportAddonImages() []string {
+	if ep.bkeConfig == nil || len(ep.bkeConfig.Addons) == 0 {
+		return nil
+	}
+
+	var images []string
+	conf := bkeinit.BkeConfig(*ep.bkeConfig)
+	repo := fmt.Sprintf("%s/", strings.TrimRight(conf.ImageFuyaoRepo(), "/"))
+
+	for _, addon := range ep.bkeConfig.Addons {
+		switch addon.Name {
+		case "calico":
+			// 从 Addon 配置中获取 Calico 版本
+			version := addon.Version
+			if version == "" {
+				version = "v3.31.3" // 默认版本
+			}
+			// 添加 Calico 镜像列表
+			images = append(images,
+				fmt.Sprintf("%scalico/node:%s", repo, version),
+				fmt.Sprintf("%scalico/cni:%s", repo, version),
+				fmt.Sprintf("%scalico/kube-controllers:%s", repo, version),
+				fmt.Sprintf("%scalico/pod2daemon-flexvol:%s", repo, version),
+			)
+		// 可以继续扩展其他 Addon
+		case "coredns":
+			// 示例：CoreDNS 镜像
+			// version := addon.Version
+			// if version == "" { version = "v1.9.3" }
+			// images = append(images, fmt.Sprintf("%scoredns/coredns:%s", repo, version))
+		case "metrics-server":
+			// 示例：metrics-server 镜像
+			// version := addon.Version
+			// if version == "" { version = "v0.6.2" }
+			// images = append(images, fmt.Sprintf("%smetrics-server/metrics-server:%s", repo, version))
+		}
+	}
+
 	return images
 }
 
