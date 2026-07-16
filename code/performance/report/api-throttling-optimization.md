@@ -435,6 +435,189 @@ func (r *RestClientConfig) ToRESTMapper() (meta.RESTMapper, error) {
 }
 ```
 
+## 设计视图
+
+### 1.1 系统架构总览
+
+```mermaid
+graph TB
+    subgraph "BKE Controller"
+        A[配置层<br/>config.go] --> B[工厂层<br/>client_factory.go]
+        B --> C[使用层<br/>kube.go, main.go]
+        B --> D[RESTMapper 单例<br/>restmapper.go]
+    end
+    
+    subgraph "Kubernetes API Server"
+        E[API Server<br/>管理集群]
+    end
+    
+    C --> E
+    D --> E
+    
+    style A fill:#e1f5ff
+    style B fill:#fff4e1
+    style D fill:#e8f5e9
+```
+
+**组件职责说明：**
+
+| 组件 | 职责 | 文件位置 |
+|------|------|---------|
+| **配置层** | 管理 QPS/Burst 配置，支持命令行标志和环境变量 | `utils/capbke/config/config.go` |
+| **工厂层** | 提供统一的客户端创建方法，自动应用限流配置 | `pkg/kube/client_factory.go` |
+| **RESTMapper 单例** | 全局共享的 RESTMapper，带内存缓存 | `pkg/kube/restmapper.go` |
+| **使用层** | 调用工厂方法创建客户端，使用全局 RESTMapper | `pkg/kube/kube.go`, `cmd/capbke/main.go` 等 |
+
+### 1.2 优化前后对比时序图
+
+```mermaid
+sequenceDiagram
+    participant Client as BKE Controller
+    participant API as API Server
+    
+    Note over Client,API: 优化前（9分37秒）
+    loop 60-90 次 API 发现
+        Client->>API: GET /apis/...
+        API-->>Client: 响应
+        Note right of Client: QPS=5, Burst=10<br/>限流等待 1s→9s
+    end
+    
+    Note over Client,API: 优化后（<30秒）
+    Client->>API: GET /apis/... (首次)
+    API-->>Client: 响应
+    Note right of Client: 缓存到 RESTMapper
+    loop 后续调用
+        Client->>Client: 从缓存读取
+        Note right of Client: 无网络调用<br/>QPS=50, Burst=100
+    end
+```
+
+**性能对比：**
+
+| 指标 | 优化前 | 优化后 | 提升 |
+|------|--------|--------|------|
+| API 发现时间 | 9 分 37 秒 | < 30 秒 | 95% |
+| API 调用次数 | 60-90 次 | 1 次（首次） | 98% |
+| 限流等待时间 | ~10 秒/次 | 0 | 100% |
+| 集群创建总时间 | 29 分 29 秒 | ~18 分钟 | 39% |
+
+### 1.3 组件交互图
+
+```mermaid
+graph LR
+    subgraph "配置管理"
+        A[命令行标志<br/>--client-qps] --> C[config.ClientQPS]
+        B[环境变量<br/>KUBE_CLIENT_QPS] --> C
+        D[默认值<br/>50] --> C
+    end
+    
+    subgraph "客户端创建"
+        C --> E[ApplyThrottlingConfig]
+        E --> F[NewClientFromConfig]
+        E --> G[NewDynamicClientFromConfig]
+        E --> H[GetManagerConfig]
+    end
+    
+    subgraph "RESTMapper 缓存"
+        I[GetGlobalRESTMapper] --> J{首次调用?}
+        J -->|是| K[创建 DiscoveryClient]
+        K --> L[创建 MemCacheClient]
+        L --> M[创建 DeferredDiscoveryRESTMapper]
+        M --> N[缓存到 globalRESTMapper]
+        J -->|否| O[返回 globalRESTMapper]
+        N --> O
+    end
+    
+    subgraph "使用层"
+        P[kube.go] --> F
+        P --> G
+        Q[main.go] --> H
+        R[wait.go] --> I
+        S[helm.go] --> I
+    end
+```
+
+### 1.4 数据流图
+
+```mermaid
+graph TD
+    A[用户启动控制器] --> B{检查配置来源}
+    B -->|命令行标志| C[解析 --client-qps]
+    B -->|环境变量| D[读取 KUBE_CLIENT_QPS]
+    B -->|默认值| E[使用 50]
+    
+    C --> F[config.ClientQPS = 用户值]
+    D --> F
+    E --> F
+    
+    F --> G[创建 Manager]
+    G --> H[GetManagerConfig]
+    H --> I[ApplyThrottlingConfig]
+    I --> J[设置 cfg.QPS = config.ClientQPS]
+    J --> K[设置 cfg.Burst = config.ClientBurst]
+    K --> L[返回配置好的 rest.Config]
+    
+    L --> M[创建 Kubernetes Client]
+    L --> N[创建 RESTMapper]
+    
+    N --> O{缓存存在?}
+    O -->|是| P[返回缓存的 RESTMapper]
+    O -->|否| Q[创建新的 RESTMapper]
+    Q --> R[缓存到 globalRESTMapper]
+    R --> P
+    
+    P --> S[执行 API 发现]
+    M --> S
+    S --> T[API Server]
+```
+
+### 1.5 部署视图
+
+```mermaid
+graph TB
+    subgraph "管理集群"
+        A[BKE Controller<br/>Deployment]
+        B[API Server]
+        C[etcd]
+    end
+    
+    subgraph "配置注入"
+        D[ConfigMap<br/>bke-controller-config]
+        E[命令行参数<br/>--client-qps=50<br/>--client-burst=100]
+        F[环境变量<br/>KUBE_CLIENT_QPS=50]
+    end
+    
+    subgraph "监控"
+        G[Prometheus<br/>指标采集]
+        H[Grafana<br/>可视化]
+        I[日志系统<br/>ELK/Loki]
+    end
+    
+    D --> A
+    E --> A
+    F --> A
+    A --> B
+    B --> C
+    
+    A --> G
+    G --> H
+    A --> I
+    
+    style A fill:#fff4e1
+    style B fill:#e1f5ff
+    style G fill:#e8f5e9
+```
+
+**监控点说明：**
+
+| 监控指标 | 采集方式 | 告警阈值 | 说明 |
+|---------|---------|---------|------|
+| API 发现时间 | Prometheus | > 30s | 优化后的预期时间 |
+| 客户端限流次数 | 日志 | > 0 | 应该完全消除 |
+| API Server 请求速率 | Prometheus | > 1000 QPS | 防止过载 |
+| API Server 请求延迟 | Prometheus | P99 > 1s | 监控性能影响 |
+| RESTMapper 缓存命中率 | 自定义指标 | < 95% | 验证缓存效果 |
+
 ### 测试计划
 
 #### 单元测试
@@ -580,6 +763,122 @@ watch -n 5 'kubectl get bkecluster bke-cluster-128n -o jsonpath="{.status.cluste
 - [ ] 集群创建总时间 < 20 分钟
 - [ ] 生产环境部署 1 个月无问题
 - [ ] 文档已更新
+
+## 工作量评估
+
+### 1. 开发工作量
+
+| 模块 | 任务 | 预估人天 | 优先级 | 依赖 |
+|------|------|---------|--------|------|
+| **配置层** | 添加 QPS/Burst 配置变量 | 0.5 | P0 | 无 |
+| **配置层** | 实现命令行标志解析 | 0.5 | P0 | 配置变量 |
+| **配置层** | 实现环境变量支持 | 0.5 | P1 | 配置变量 |
+| **工厂层** | 实现 client_factory.go | 2 | P0 | 配置层 |
+| **工厂层** | 添加错误处理和日志 | 0.5 | P1 | 工厂方法 |
+| **RESTMapper** | 实现全局单例模式 | 1 | P0 | 无 |
+| **RESTMapper** | 实现内存缓存逻辑 | 1 | P0 | 单例模式 |
+| **使用层** | 修改 pkg/kube/kube.go | 0.5 | P0 | 工厂层 |
+| **使用层** | 修改 cmd/capbke/main.go | 0.5 | P0 | 工厂层 |
+| **使用层** | 修改 cmd/bkeagent/main.go | 0.5 | P0 | 工厂层 |
+| **使用层** | 修改 pkg/kube/wait.go | 0.5 | P0 | RESTMapper |
+| **使用层** | 修改 pkg/kube/helm.go | 0.5 | P0 | RESTMapper |
+| **小计** | | **9** | | |
+
+### 2. 测试工作量
+
+| 测试类型 | 任务 | 预估人天 | 说明 |
+|---------|------|---------|------|
+| **单元测试** | client_factory_test.go | 1 | 覆盖所有工厂方法 |
+| **单元测试** | restmapper_test.go | 1 | 验证单例和缓存 |
+| **单元测试** | config_test.go | 0.5 | 验证配置加载 |
+| **集成测试** | performance_test.go | 2 | API 发现性能测试 |
+| **集成测试** | 并发访问测试 | 1 | 验证线程安全 |
+| **端到端测试** | 64 节点集群测试 | 3 | 实际部署验证 |
+| **性能基准** | 优化前后对比 | 2 | 生成性能报告 |
+| **小计** | | **10.5** | |
+
+### 3. 文档工作量
+
+| 任务 | 预估人天 | 说明 |
+|------|---------|------|
+| 用户文档更新 | 1 | 配置说明、使用示例 |
+| 运维手册更新 | 1 | 监控指标、故障排查 |
+| API 文档更新 | 0.5 | 新增接口说明 |
+| 发布说明 | 0.5 | 版本更新日志 |
+| **小计** | **3** | |
+
+### 4. 总工作量汇总
+
+```mermaid
+pie title 工作量分布
+    "开发 (9人天)" : 9
+    "测试 (10.5人天)" : 10.5
+    "文档 (3人天)" : 3
+```
+
+| 类别 | 人天 | 占比 |
+|------|------|------|
+| 开发 | 9 | 40% |
+| 测试 | 10.5 | 47% |
+| 文档 | 3 | 13% |
+| **总计** | **22.5** | **100%** |
+
+**人力资源配置：**
+- **方案 A**：1 名开发人员，约 4.5 周（22.5 人天 ÷ 5 天/周）
+- **方案 B**：2 名开发人员，约 2.5 周（可并行开发）
+- **推荐**：方案 B，缩短交付周期
+
+### 5. 里程碑计划
+
+```mermaid
+gantt
+    title 项目实施计划
+    dateFormat  YYYY-MM-DD
+    section 开发
+    配置层实现           :a1, 2026-07-16, 2d
+    工厂层实现           :a2, after a1, 2d
+    RESTMapper 实现      :a3, after a2, 2d
+    使用层修改           :a4, after a3, 2d
+    section 测试
+    单元测试             :b1, after a4, 2d
+    集成测试             :b2, after b1, 3d
+    端到端测试           :b3, after b2, 3d
+    section 文档
+    文档更新             :c1, after b3, 2d
+```
+
+| 里程碑 | 时间 | 交付物 | 验收标准 |
+|--------|------|--------|---------|
+| **M1: 核心功能** | Week 1 | 配置层 + 工厂层 | 单元测试通过，配置可加载 |
+| **M2: RESTMapper** | Week 2 | 全局单例实现 | 缓存测试通过，线程安全验证 |
+| **M3: 集成测试** | Week 3 | 性能测试报告 | API 发现 < 30s，无回归 |
+| **M4: 生产就绪** | Week 4 | 端到端测试 + 文档 | 集群创建 < 20min，文档完整 |
+
+### 6. 风险评估与缓冲
+
+| 风险 | 概率 | 影响 | 缓解措施 | 预留缓冲 |
+|------|------|------|---------|---------|
+| API Server 过载 | 中 | 高 | 渐进式调优（5→20→50），监控指标 | +2 天 |
+| 线程安全问题 | 低 | 高 | 并发测试，压力测试 | +1 天 |
+| 性能未达预期 | 中 | 中 | 参数调优，架构优化 | +2 天 |
+| 兼容性问题 | 低 | 中 | 多版本测试，回滚机制 | +1 天 |
+| **总缓冲** | | | | **+6 天** |
+
+**调整后的总工作量：**
+- 基础工作量：22.5 人天
+- 风险缓冲：6 人天
+- **最终工作量：28.5 人天（约 5.7 周，1 名开发人员）**
+
+### 7. 成本效益分析
+
+| 指标 | 数值 | 说明 |
+|------|------|------|
+| **投入成本** | 28.5 人天 | 开发 + 测试 + 文档 + 缓冲 |
+| **性能提升** | 节省 11 分钟/集群 | API 发现从 9m37s → <30s |
+| **年化收益** | 节省 1,320 分钟 | 假设每天创建 2 个集群 |
+| **投资回报率** | 约 46x | 1,320 分钟 ÷ 28.5 人天 ≈ 46 |
+
+**结论：** 该优化具有高投资回报率，建议优先实施。
 
 ### 升级/降级策略
 
