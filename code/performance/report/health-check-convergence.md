@@ -1,27 +1,27 @@
 # KEP-11: 优化健康检查收敛时间
 
 <!--
-This is a template for Kubernetes Enhancement Proposals (KEPs).
-See the KEP template for more information:
+这是 Kubernetes Enhancement Proposals (KEPs) 的模板。
+有关 KEP 模板的更多信息，请参见：
 https://github.com/kubernetes/enhancements/blob/master/keps/NNN-template/README.md
 -->
 
-## Metadata
+## 元数据
 
-| Field | Value |
-|-------|-------|
+| 字段 | 值 |
+|------|-----|
 | **KEP** | 11 |
-| **Title** | 优化健康检查收敛时间 |
-| **Status** | Provisional |
-| **Creation Date** | 2026-07-15 |
-| **Last Updated** | 2026-07-15 |
-| **Authors** | BKE Team |
-| **Reviewers** | TBD |
-| **Approvers** | TBD |
+| **标题** | 优化健康检查收敛时间 |
+| **状态** | 草案 |
+| **创建日期** | 2026-07-15 |
+| **最后更新** | 2026-07-15 |
+| **作者** | BKE 团队 |
+| **审阅者** | 待定 |
+| **批准者** | 待定 |
 | **SIG** | bke-performance |
-| **Sponsor SIG** | bke-performance |
+| **赞助 SIG** | bke-performance |
 
-## Summary
+## 摘要
 
 本 KEP 旨在优化 BKE 集群创建过程中的健康检查收敛时间，将其从当前的 7 分 14 秒降低到 3 分钟以内，提升约 57%。
 
@@ -39,13 +39,13 @@ https://github.com/kubernetes/enhancements/blob/master/keps/NNN-template/README.
 4. **动态间隔**：根据检查结果动态调整下次检查间隔
 5. **Calico 优化**：修复 Calico 部署导致的 Master NotReady 问题
 
-## Motivation
+## 动机
 
-### Why is this needed?
+### 为什么需要这个 KEP？
 
 健康检查收敛是 BKE 集群创建过程中的第二大性能瓶颈，占总耗时的 24.5%。在 64 节点集群的测试中，健康检查阶段耗时 7 分 14 秒，期间出现 33 次 ClusterUnhealthy 警告，Master 节点反复 NotReady。
 
-### What problem does it solve?
+### 解决什么问题？
 
 **当前性能数据（64 节点集群）：**
 - 健康检查收敛时间：7 分 14 秒
@@ -77,49 +77,49 @@ https://github.com/kubernetes/enhancements/blob/master/keps/NNN-template/README.
 - 稳定性风险：Master NotReady 可能导致控制面不可用
 - 资源浪费：频繁 API 调用增加 API Server 负载
 
-### Measurable Goals
+### 可衡量目标
 
 1. 健康检查收敛时间从 7 分 14 秒降低到 3 分钟以内（提升 57%）
 2. Master NotReady 次数从 3 次降低到 0 次
 3. API 调用次数从约 100 次降低到约 30 次（降低 70%）
 4. 关键组件失败检测时间从约 7 分钟降低到约 1 秒
 
-### Non-Goals
+### 非目标
 
-1. 优化 Calico 本身的部署时间（由 KEP-10 处理）
+1. 优化 Calico 本身的部署时间（由 KEP-12 处理）
 2. 修改 Kubernetes 控制面组件的行为
 3. 改变健康检查的业务逻辑（哪些组件需要检查）
 
-## Proposal
+## 提案
 
-### User Stories
+### 用户故事
 
-**Story 1: 快速集群创建**
+**故事 1：快速集群创建**
 作为集群管理员，我希望集群创建过程中的健康检查能够快速收敛，以便在更短的时间内获得可用的集群。
 
-*当前状态*：健康检查耗时 7 分 14 秒，期间 Master 节点反复 NotReady
-*期望状态*：健康检查在 3 分钟内完成，无 Master NotReady
+*当前状态：* 健康检查耗时 7 分 14 秒，期间 Master 节点反复 NotReady
+*期望状态：* 健康检查在 3 分钟内完成，无 Master NotReady
 
-**Story 2: 稳定的控制面**
+**故事 2：稳定的控制面**
 作为集群管理员，我希望在集群创建过程中控制面保持稳定，避免 Master 节点 NotReady。
 
-*当前状态*：Calico 部署后 Master 节点反复 NotReady
-*期望状态*：控制面始终 Ready，无 NotReady 事件
+*当前状态：* Calico 部署后 Master 节点反复 NotReady
+*期望状态：* 控制面始终 Ready，无 NotReady 事件
 
-**Story 3: 可配置的健康检查**
+**故事 3：可配置的健康检查**
 作为集群管理员，我希望能够根据实际需求配置健康检查的组件清单和检查间隔。
 
-*当前状态*：健康检查配置硬编码
-*期望状态*：通过配置文件灵活定义检查组件和间隔
+*当前状态：* 健康检查配置硬编码
+*期望状态：* 通过配置文件灵活定义检查组件和间隔
 
-### Notes/Constraints
+### 注意事项/约束
 
 1. **向后兼容**：必须保持与现有健康检查逻辑的兼容性
 2. **配置灵活**：支持通过配置文件自定义检查组件和间隔
 3. **缓存一致性**：缓存数据需要在合理时间内刷新，避免使用过期数据
 4. **错误处理**：关键组件失败必须立即返回，非关键组件失败可以记录警告
 
-### Implementation Approach
+### 实现方法
 
 #### 优化 1: 渐进式检查架构
 
@@ -567,7 +567,22 @@ optionalComponents:
 2. 如果配置文件不存在或格式错误，使用默认配置
 3. 如果配置文件中某些字段为空，使用默认值填充
 
-### Test Plan
+## 设计细节
+
+### API 变更
+
+本 KEP 不引入新的 API 变更。所有变更都是内部实现优化。
+
+### 代码变更清单
+
+| 文件路径 | 变更类型 | 说明 |
+|---------|---------|------|
+| `pkg/kube/health.go` | 修改 | 重构健康检查逻辑，添加统一检查器 |
+| `pkg/kube/health_cache.go` | 新增 | 实现健康检查缓存机制 |
+| `pkg/phaseframe/phases/ensure_cluster.go` | 修改 | 使用动态间隔替代固定间隔 |
+| `/etc/bke/health-check-config.yaml` | 新增 | 健康检查配置文件 |
+
+### 测试计划
 
 #### 单元测试
 
@@ -703,7 +718,7 @@ kubectl logs -n bke-system deployment/bke-controller-manager | grep "health chec
 # 期望: 健康检查通过，无频繁重试
 ```
 
-### Graduation Criteria
+### 毕业标准
 
 #### Alpha (v0.1)
 - [ ] 实现统一健康检查器
@@ -723,53 +738,7 @@ kubectl logs -n bke-system deployment/bke-controller-manager | grep "health chec
 - [ ] Master NotReady 次数 = 0
 - [ ] 生产环境运行 1 个月无问题
 
-## Design Details
-
-### API Changes
-
-本 KEP 不引入新的 API 变更。所有变更都是内部实现优化。
-
-### Code Changes
-
-#### 1. 统一健康检查器
-
-**文件**: `pkg/kube/health.go`
-
-- 新增 `HealthCheckConfig` 结构体
-- 新增 `HealthCheckResult` 结构体
-- 新增 `UnifiedHealthChecker` 结构体
-- 重构 `CheckClusterHealth()` 函数
-- 新增 `checkNodesParallel()` 函数
-- 新增 `checkCriticalComponentsParallel()` 函数
-- 新增 `checkImportantComponentsParallel()` 函数
-- 新增 `checkOptionalComponentsParallel()` 函数
-- 新增 `checkComponentsByPriority()` 函数
-- 新增 `aggregateResult()` 函数
-- 新增 `GetRequeueInterval()` 函数
-
-#### 2. 健康检查缓存
-
-**文件**: `pkg/kube/health_cache.go` (新文件)
-
-- 新增 `HealthCheckCache` 结构体
-- 新增 `NewHealthCheckCache()` 函数
-- 新增 `GetNodes()` 方法
-- 新增 `GetPods()` 方法
-
-#### 3. 配置加载
-
-**文件**: `pkg/kube/health.go`
-
-- 新增 `LoadHealthCheckConfig()` 函数
-- 新增 `DefaultHealthCheckConfig()` 函数
-
-#### 4. 动态间隔
-
-**文件**: `pkg/phaseframe/phases/ensure_cluster.go`
-
-- 修改 `runHealthChecks()` 函数，使用 `GetRequeueInterval()` 动态调整间隔
-
-### Upgrade / Downgrade Strategy
+### 升级/降级策略
 
 **升级策略：**
 - 配置文件 `/etc/bke/health-check-config.yaml` 可选，不存在时使用默认配置
@@ -780,81 +749,82 @@ kubectl logs -n bke-system deployment/bke-controller-manager | grep "health chec
 - 删除配置文件即可回退到默认配置
 - 代码回退简单，只需恢复原有的 `CheckClusterHealth()` 实现
 
-## Drawbacks
+## 实施历史
+
+- **2026-07-13**: 识别健康检查收敛慢问题
+- **2026-07-14**: 分析根因，确认 Master NotReady 与 Calico 部署的因果关系
+- **2026-07-15**: 设计统一健康检查架构
+- **待定**: Alpha 实现
+- **待定**: Beta 实现
+- **待定**: Stable 发布
+
+## 缺点
 
 1. **复杂度增加**：引入了缓存、配置、动态间隔等机制，代码复杂度增加
-   - 缓解：通过良好的代码组织和文档降低维护成本
+   - **缓解措施**：通过良好的代码组织和文档降低维护成本
 
 2. **缓存一致性**：缓存可能导致使用过期数据
-   - 缓解：设置合理的缓存 TTL（默认 30 秒），在关键检查时强制刷新
+   - **缓解措施**：设置合理的缓存 TTL（默认 30 秒），在关键检查时强制刷新
 
 3. **配置错误风险**：配置文件格式错误可能导致健康检查失败
-   - 缓解：配置文件加载失败时使用默认配置，记录警告日志
+   - **缓解措施**：配置文件加载失败时使用默认配置，记录警告日志
 
-## Alternatives
+## 替代方案
 
-### Alternative 1: 仅优化 Master NotReady 问题
+### 替代方案 1：仅优化 Master NotReady 问题
 
 **方案**：只修复 Calico 部署导致的 Master NotReady 问题，不改变健康检查机制
 
-**优点**：
+**优点：**
 - 改动小，风险低
 - 直接解决根本问题
 
-**缺点**：
+**缺点：**
 - 不解决健康检查机制本身的问题
 - 无法优化 API 调用次数
 - 无法动态调整检查间隔
 
-**决策**：拒绝。需要同时优化健康检查机制和 Master NotReady 问题。
+**决定：** 拒绝。需要同时优化健康检查机制和 Master NotReady 问题。
 
-### Alternative 2: 仅优化健康检查机制
+### 替代方案 2：仅优化健康检查机制
 
 **方案**：只优化健康检查机制（并行化、缓存、动态间隔），不修复 Master NotReady
 
-**优点**：
+**优点：**
 - 减少 API 调用次数
 - 提高检查效率
 
-**缺点**：
+**缺点：**
 - Master NotReady 仍然存在
 - 健康检查仍然会失败
 
-**决策**：拒绝。需要同时优化健康检查机制和 Master NotReady 问题。
+**决定：** 拒绝。需要同时优化健康检查机制和 Master NotReady 问题。
 
-### Alternative 3: 使用 Kubernetes 原生健康检查
+### 替代方案 3：使用 Kubernetes 原生健康检查
 
 **方案**：使用 Kubernetes 原生的 Readiness Probe 和 Liveness Probe，不实现自定义健康检查
 
-**优点**：
+**优点：**
 - 使用 Kubernetes 原生机制
 - 减少自定义代码
 
-**缺点**：
+**缺点：**
 - 无法实现渐进式检查
 - 无法动态调整检查间隔
 - 无法缓存检查结果
 
-**决策**：拒绝。自定义健康检查提供更细粒度的控制和优化空间。
+**决定：** 拒绝。自定义健康检查提供更细粒度的控制和优化空间。
 
-## Infrastructure Needed
+## 所需基础设施
 
 1. **测试环境**：64 节点集群用于端到端测试
 2. **监控工具**：Prometheus + Grafana 用于监控健康检查性能
 3. **日志系统**：ELK 或 Loki 用于分析健康检查日志
 
-## Implementation History
-
-- **2026-07-13**: 识别健康检查收敛慢问题
-- **2026-07-14**: 分析根因，确认 Master NotReady 与 Calico 部署的因果关系
-- **2026-07-15**: 设计统一健康检查架构
-- **TBD**: Alpha 实现
-- **TBD**: Beta 实现
-- **TBD**: Stable 发布
-
-## References
+## 参考资料
 
 1. [BKE 64 节点集群性能瓶颈分析与优化方案](../../performance/report/64节点集群性能瓶颈分析与优化方案.md)
-2. [KEP-10: 消除 API Throttling](../kep10/kep10-api-throttling-optimization.md)
-3. [Kubernetes Health Checking](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
-4. [Controller Runtime Health Checks](https://pkg.go.dev/sigs.k8s.io/controller-runtime/pkg/healthz)
+2. [KEP-10: 消除 API Throttling](./api-throttling-optimization.md)
+3. [KEP-12: 优化 Calico 部署性能](./calico-deployment-optimization.md)
+4. [Kubernetes Health Checking](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+5. [Controller Runtime Health Checks](https://pkg.go.dev/sigs.k8s.io/controller-runtime/pkg/healthz)

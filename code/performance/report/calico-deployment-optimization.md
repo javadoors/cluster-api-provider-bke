@@ -12,6 +12,21 @@
  批准者: TBD
 -->
 
+## 元数据
+
+| 字段 | 值 |
+|------|-----|
+| **KEP** | 12 |
+| **标题** | 优化 Calico 部署性能 |
+| **状态** | 草案 |
+| **创建日期** | 2026-07-15 |
+| **最后更新** | 2026-07-15 |
+| **作者** | BKE 团队 |
+| **审阅者** | 待定 |
+| **批准者** | 待定 |
+| **SIG** | bke-performance |
+| **赞助 SIG** | bke-performance |
+
 ## 摘要
 
 本 KEP 旨在优化 BKE 平台中 Calico 网络插件的部署性能，将 64 节点集群的 Calico 部署时间从当前的 3 分 15 秒降低到 1 分 35 秒，提升约 51%。
@@ -100,7 +115,36 @@
 
 ## 提案
 
-### 优化方案总览
+### 用户故事
+
+**故事 1：快速集群创建**
+作为集群操作员，我希望 Calico 网络插件能够快速部署，以便缩短集群创建总时间。
+
+*当前状态：* Calico 部署需要 3 分 15 秒，其中大部分时间用于镜像拉取和串行部署。
+*期望状态：* Calico 部署在 1 分 35 秒内完成，通过并行化和镜像预置加速。
+
+**故事 2：可预测的部署时间**
+作为集群操作员，我希望 Calico 部署时间稳定可预测，不受网络延迟影响。
+
+*当前状态：* 镜像拉取时间受 Registry 带宽影响，波动较大。
+*期望状态：* 通过镜像预置，部署时间稳定在预期范围内。
+
+**故事 3：降低资源消耗**
+作为集群操作员，我希望减少 Calico 部署过程中的网络带宽和 CPU 消耗。
+
+*当前状态：* 64 个节点同时拉取镜像，造成 Registry 带宽压力。
+*期望状态：* 通过预置和并行化，降低峰值资源消耗。
+
+### 注意事项/约束
+
+1. **向后兼容性**：所有变更必须向后兼容，不影响现有集群
+2. **降级能力**：如果优化失败，必须能够降级到原有部署方式
+3. **监控能力**：必须能够监控优化效果，验证性能提升
+4. **资源限制**：并行部署时需要考虑节点资源限制，避免 OOM
+
+### 实现方法
+
+#### 优化方案总览
 
 | 优化项 | 原理 | 预期效果 | 实施难度 | 风险 |
 |--------|------|----------|----------|------|
@@ -110,9 +154,9 @@
 | **控制面优化** | 优化 calico-kube-controllers 启动参数 | 节省 ~20 秒 | 中 | 中 |
 | **配置精简** | 禁用不必要的功能 | 节省 ~10 秒 | 低 | 低 |
 
-### 详细设计
+#### 详细设计
 
-#### 1. 镜像预置（节省 ~50 秒）
+##### 1. 镜像预置（节省 ~50 秒）
 
 **原理**：在节点环境初始化阶段（EnsureNodesEnv）提前拉取 Calico 镜像，此时集群尚未创建，网络压力较小，可以充分利用带宽。
 
@@ -196,7 +240,7 @@ func (e *EnsureNodesEnv) imageExists(node bkenode.Node, image string) bool {
 | 镜像拉取时间 | ~1 分钟 | ~10 秒 | 83% |
 | 节省时间 | - | ~50 秒 | - |
 
-#### 2. 并行部署（节省 ~20 秒）
+##### 2. 并行部署（节省 ~20 秒）
 
 **原理**：调整 DaemonSet 的 maxUnavailable 参数为 30%，允许 30% 的节点（~19 个节点）同时更新，减少更新轮数。
 
@@ -257,7 +301,7 @@ spec:
 | 网络初始化时间 | ~1.5 分钟 | ~1 分钟 | 33% |
 | 节省时间 | - | ~20 秒 | - |
 
-#### 3. 网络模式优化（节省 ~30 秒）
+##### 3. 网络模式优化（节省 ~30 秒）
 
 **原理**：使用 VXLAN 模式替代 IPIP 模式。VXLAN 使用 UDP 封装，开销更小（8 字节 VXLAN 头 + 8 字节 UDP 头），且不需要为每对节点建立隧道。
 
@@ -305,7 +349,7 @@ data:
 | 网络初始化时间 | ~1 分钟 | ~30 秒 | 50% |
 | 节省时间 | - | ~30 秒 | - |
 
-#### 4. 控制面优化（节省 ~20 秒）
+##### 4. 控制面优化（节省 ~20 秒）
 
 **原理**：只启用必要的控制器（node 控制器），禁用不必要的控制器（policy、namespace、serviceaccount、endpoint）。
 
@@ -367,7 +411,7 @@ spec:
 | 控制面注册时间 | ~30 秒 | ~10 秒 | 67% |
 | 节省时间 | - | ~20 秒 | - |
 
-#### 5. 配置精简（节省 ~10 秒）
+##### 5. 配置精简（节省 ~10 秒）
 
 **原理**：禁用不必要的功能，减少初始化开销。
 
@@ -421,7 +465,7 @@ spec:
 | 配置优化时间 | ~15 秒 | ~5 秒 | 67% |
 | 节省时间 | - | ~10 秒 | - |
 
-### 综合优化效果
+#### 综合优化效果
 
 | 优化项 | 当前耗时 | 优化后耗时 | 节省时间 | 提升 |
 |--------|----------|-----------|----------|------|
@@ -432,77 +476,11 @@ spec:
 | 配置优化 | ~15 秒 | ~5 秒 | ~10 秒 | 67% |
 | **总计** | **3 分 15 秒** | **~1 分 35 秒** | **~1 分 40 秒** | **51%** |
 
-### 实施步骤
+## 设计细节
 
-| 阶段 | 任务 | 预计时间 | 风险 |
-|------|------|---------|------|
-| **阶段 1** | 镜像预置 | 1 天 | 低 |
-| **阶段 2** | 并行部署优化 | 1 天 | 中 |
-| **阶段 3** | 网络初始化优化 | 1 天 | 中 |
-| **阶段 4** | 控制面注册优化 | 0.5 天 | 中 |
-| **阶段 5** | 配置优化 | 0.5 天 | 低 |
-| **总计** | | **4 天** | |
+### API 变更
 
-### 监控和验证
-
-#### 监控指标
-
-```go
-// pkg/metrics/calico_deployment.go
-
-type CalicoDeploymentMetrics struct {
-    ImagePullDuration       time.Duration  // 镜像拉取时间
-    NetworkInitDuration     time.Duration  // 网络初始化时间
-    ControlPlaneRegDuration time.Duration  // 控制面注册时间
-    TotalDuration           time.Duration  // 总部署时间
-    FailedNodes             int            // 失败节点数
-    SuccessNodes            int            // 成功节点数
-}
-
-// RecordCalicoDeployment 记录 Calico 部署指标
-func RecordCalicoDeployment(metrics CalicoDeploymentMetrics) {
-    calicoImagePullDuration.WithLabelValues().Observe(metrics.ImagePullDuration.Seconds())
-    calicoNetworkInitDuration.WithLabelValues().Observe(metrics.NetworkInitDuration.Seconds())
-    calicoControlPlaneRegDuration.WithLabelValues().Observe(metrics.ControlPlaneRegDuration.Seconds())
-    calicoTotalDuration.WithLabelValues().Observe(metrics.TotalDuration.Seconds())
-    calicoFailedNodes.WithLabelValues().Add(float64(metrics.FailedNodes))
-    calicoSuccessNodes.WithLabelValues().Add(float64(metrics.SuccessNodes))
-}
-```
-
-#### 验证测试
-
-```go
-// test/e2e/calico_deployment_test.go
-
-func TestCalicoDeploymentPerformance(t *testing.T) {
-    // 部署 64 节点集群
-    cluster := createTestCluster(64)
-    
-    // 记录部署时间
-    start := time.Now()
-    
-    // 部署 Calico Addon
-    err := deployCalicoAddon(cluster)
-    require.NoError(t, err)
-    
-    elapsed := time.Since(start)
-    
-    // 验证部署时间
-    assert.Less(t, elapsed, 2*time.Minute, "Calico should deploy within 2 minutes")
-    
-    // 验证所有节点就绪
-    nodes := getCalicoNodes(cluster)
-    for _, node := range nodes {
-        assert.True(t, node.Status.Conditions[0].Status == "True", 
-            "Calico node %s should be ready", node.Name)
-    }
-    
-    t.Logf("Calico deployed in %v", elapsed)
-}
-```
-
-## 设计详情
+本 KEP 不涉及 API 变更。
 
 ### 代码变更清单
 
@@ -512,10 +490,6 @@ func TestCalicoDeploymentPerformance(t *testing.T) {
 | `bke-manifests/kubernetes/calico/v3.31.3/calico.yaml` | 修改 | 调整 DaemonSet 配置、网络模式、控制器参数 |
 | `pkg/metrics/calico_deployment.go` | 新增 | 添加 Calico 部署监控指标 |
 | `test/e2e/calico_deployment_test.go` | 新增 | 添加 Calico 部署性能测试 |
-
-### API 变更
-
-本 KEP 不涉及 API 变更。
 
 ### 配置变更
 
@@ -527,83 +501,141 @@ func TestCalicoDeploymentPerformance(t *testing.T) {
 | `FELIX_PROMETHEUSMETRICSENABLED` | `true` | `false` | 禁用 Prometheus 指标 |
 | `FELIX_STARTUPCLEANUP` | `true` | `false` | 禁用启动清理 |
 
-### 向后兼容性
+### 测试计划
 
-所有变更均向后兼容：
-- 镜像预置失败时自动降级到正常拉取
-- VXLAN 模式可通过配置回退到 IPIP 模式
-- 控制器禁用不影响核心网络功能
-
-## 升级与回滚策略
-
-### 升级策略
-
-1. **灰度发布**：先在测试环境验证，再推广到生产环境
-2. **分阶段实施**：按优化项逐步实施，每阶段验证效果
-3. **监控指标**：部署后持续监控 Calico 部署时间和成功率
-
-### 回滚策略
-
-如果优化后出现问题，可快速回滚：
-
-1. **镜像预置回滚**：删除预置逻辑，恢复原有镜像拉取流程
-2. **并行部署回滚**：将 `maxUnavailable` 改回 `1`
-3. **网络模式回滚**：将 `calico_backend` 改回 `bird`
-4. **控制器回滚**：将 `ENABLED_CONTROLLERS` 改回原有值
-
-回滚操作可在 5 分钟内完成，不影响正在运行的集群。
-
-## 测试计划
-
-### 单元测试
+#### 单元测试
 
 - 镜像预置逻辑测试
 - 镜像存在性检查测试
 - 错误处理测试
 
-### 集成测试
+#### 集成测试
 
 - 10 节点集群 Calico 部署测试
 - 32 节点集群 Calico 部署测试
 - 64 节点集群 Calico 部署测试
 
-### 端到端测试
+#### 端到端测试
 
 - 完整集群创建流程测试
 - Calico 网络连通性测试
 - 网络策略功能测试
 
-### 性能测试
+#### 性能测试
 
 - Calico 部署时间测量
 - 镜像拉取时间测量
 - 网络初始化时间测量
 
-## 风险与缓解
+### 毕业标准
 
-| 风险 | 概率 | 影响 | 缓解措施 |
-|------|------|------|----------|
-| 镜像预置失败 | 中 | 低 | 降级到正常拉取，记录错误日志 |
-| VXLAN 模式兼容性问题 | 低 | 中 | 提供回退到 IPIP 模式的配置 |
-| 并行部署导致资源竞争 | 中 | 中 | 设置合理的资源限制 |
-| 禁用功能影响可观测性 | 低 | 低 | 保留健康检查功能，禁用其他非必要功能 |
+#### Alpha (v0.1)
+- [ ] 实现镜像预置功能
+- [ ] 调整 DaemonSet maxUnavailable 参数
+- [ ] 单元测试通过
+- [ ] 现有功能无回归
+
+#### Beta (v0.2)
+- [ ] 集成测试通过
+- [ ] 性能测试显示 Calico 部署时间 < 2 分钟
+- [ ] 监控指标正常工作
+- [ ] 在测试环境验证优化效果
+
+#### Stable (v1.0)
+- [ ] 端到端测试通过
+- [ ] 在 64 节点集群上验证性能提升
+- [ ] 生产环境部署 1 个月无问题
+- [ ] 文档已更新
+
+### 升级/降级策略
+
+**升级：**
+- 无需特殊配置更改
+- 新部署自动使用优化后的配置
+- 现有集群不受影响
+
+**降级：**
+- 恢复原有镜像拉取流程
+- 将 maxUnavailable 改回 1
+- 将 calico_backend 改回 bird
+- 恢复原有控制器配置
 
 ## 实施历史
 
 - **2026-07-13**：识别 Calico 部署慢问题
 - **2026-07-14**：完成根因分析
 - **2026-07-15**：制定优化方案
-- **TBD**：实施镜像预置优化
-- **TBD**：实施并行部署优化
-- **TBD**：实施网络模式优化
-- **TBD**：实施控制面优化
-- **TBD**：实施配置优化
-- **TBD**：完成测试验证
+- **待定**：实施镜像预置优化
+- **待定**：实施并行部署优化
+- **待定**：实施网络模式优化
+- **待定**：实施控制面优化
+- **待定**：实施配置优化
+- **待定**：完成测试验证
+
+## 缺点
+
+1. **镜像预置增加节点初始化时间**：预置镜像会增加节点环境初始化阶段的时间
+   - **缓解措施**：预置失败时自动降级到正常拉取，不影响集群创建
+
+2. **VXLAN 模式兼容性问题**：某些旧版本内核可能不支持 VXLAN
+   - **缓解措施**：提供回退到 IPIP 模式的配置选项
+
+3. **并行部署导致资源竞争**：同时启动更多 Pod 可能增加节点资源压力
+   - **缓解措施**：设置合理的资源限制，监控节点资源使用率
+
+4. **禁用功能影响可观测性**：禁用 Prometheus 指标可能影响监控
+   - **缓解措施**：保留健康检查功能，通过其他方式监控 Calico 状态
+
+## 替代方案
+
+### 替代方案 1：仅优化镜像拉取
+
+**优点：**
+- 实现简单，风险低
+- 不需要修改 Calico 配置
+
+**缺点：**
+- 优化效果有限，无法解决串行部署问题
+- 无法优化网络初始化时间
+
+**决定：** 拒绝。需要综合优化才能显著提升性能。
+
+### 替代方案 2：使用 Calico Typha
+
+**优点：**
+- 减少 API Server 负载
+- 提高大规模集群的可扩展性
+
+**缺点：**
+- 需要额外部署 Typha 组件
+- 增加架构复杂度
+- 对小规模集群收益有限
+
+**决定：** 拒绝。当前优化已足够，Typha 可作为未来优化方向。
+
+### 替代方案 3：升级 Calico 版本
+
+**优点：**
+- 可能获得性能改进
+- 获得新功能和 bug 修复
+
+**缺点：**
+- 升级风险较高
+- 需要全面测试
+- 可能引入兼容性问题
+
+**决定：** 拒绝。当前版本优化已足够，版本升级可作为独立 KEP。
+
+## 所需基础设施
+
+1. **性能测试环境**：用于端到端性能测试的 64 节点集群
+2. **监控工具**：Prometheus + Grafana 用于监控 Calico 部署性能
+3. **日志系统**：ELK 或 Loki 用于分析部署日志
 
 ## 参考资料
 
 1. [Calico 官方文档 - VXLAN 模式](https://docs.tigera.io/calico/latest/network-policy/configure/vxlan-tunnel)
 2. [Kubernetes DaemonSet 更新策略](https://kubernetes.io/docs/tasks/manage-daemon/update-daemon-set/)
 3. [BKE 64 节点集群性能瓶颈分析与优化方案](./64节点集群性能瓶颈分析与优化方案.md)
-4. [KEP-10: 消除 API Throttling](./KEP-10-api-throttling-optimization.md)
-5. [KEP-11: 优化健康检查收敛时间](./KEP-11-health-check-convergence.md)
+4. [KEP-10: 消除 API Throttling](./api-throttling-optimization.md)
+5. [KEP-11: 优化健康检查收敛时间](./health-check-convergence.md)
