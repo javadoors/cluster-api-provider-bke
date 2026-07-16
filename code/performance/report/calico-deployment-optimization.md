@@ -138,18 +138,35 @@
 ```go
 // pkg/phaseframe/phases/ensure_nodes_env.go
 
-// CalicoImages 定义需要预置的 Calico 镜像
-var CalicoImages = []string{
-    "registry.openfuyao.com/calico/node:v3.31.3",
-    "registry.openfuyao.com/calico/cni:v3.31.3",
-    "registry.openfuyao.com/calico/kube-controllers:v3.31.3",
-    "registry.openfuyao.com/calico/pod2daemon-flexvol:v3.31.3",
+// getCalicoImages 从 BKECluster 动态获取 Calico 镜像列表
+func (e *EnsureNodesEnv) getCalicoImages(bkeCluster *bkev1beta1.BKECluster) []string {
+    // 从 BKECluster.Spec.ClusterConfig.Addons 中获取 Calico 版本
+    calicoVersion := "v3.31.3" // 默认版本
+    for _, addon := range bkeCluster.Spec.ClusterConfig.Addons {
+        if addon.Name == "calico" && addon.Version != "" {
+            calicoVersion = addon.Version
+            break
+        }
+    }
+    
+    // 获取镜像仓库地址（从配置或环境变量获取）
+    registry := e.Config.ImageRepo // 例如: "registry.openfuyao.com"
+    
+    return []string{
+        fmt.Sprintf("%s/calico/node:%s", registry, calicoVersion),
+        fmt.Sprintf("%s/calico/cni:%s", registry, calicoVersion),
+        fmt.Sprintf("%s/calico/kube-controllers:%s", registry, calicoVersion),
+        fmt.Sprintf("%s/calico/pod2daemon-flexvol:%s", registry, calicoVersion),
+    }
 }
 
 // prePullCalicoImages 预置 Calico 镜像
-func (e *EnsureNodesEnv) prePullCalicoImages(nodes bkenode.Nodes) error {
+func (e *EnsureNodesEnv) prePullCalicoImages(nodes bkenode.Nodes, bkeCluster *bkev1beta1.BKECluster) error {
+    // 动态获取镜像列表
+    calicoImages := e.getCalicoImages(bkeCluster)
+    
     var wg sync.WaitGroup
-    errChan := make(chan error, len(nodes)*len(CalicoImages))
+    errChan := make(chan error, len(nodes)*len(calicoImages))
     
     // 并行预置：每个节点一个 goroutine
     for _, node := range nodes {
@@ -159,7 +176,7 @@ func (e *EnsureNodesEnv) prePullCalicoImages(nodes bkenode.Nodes) error {
             
             // 每个节点并行预置所有镜像
             var nodeWg sync.WaitGroup
-            for _, image := range CalicoImages {
+            for _, image := range calicoImages {
                 nodeWg.Add(1)
                 go func(img string) {
                     defer nodeWg.Done()
@@ -205,6 +222,28 @@ func (e *EnsureNodesEnv) imageExists(node bkenode.Node, image string) bool {
     return e.executeOnNode(node, cmd) == nil
 }
 ```
+
+**配置示例**：
+
+```yaml
+# BKECluster CRD 配置
+apiVersion: capbke.bocloud.com/v1beta1
+kind: BKECluster
+metadata:
+  name: my-cluster
+spec:
+  clusterConfig:
+    addons:
+    - name: calico
+      version: v3.31.3  # 版本从这里获取，支持动态配置
+      param:
+        calicoMode: vxlan
+```
+
+**优势**：
+- ✅ 版本从 BKECluster CRD 动态获取，无需修改代码
+- ✅ 支持不同集群使用不同 Calico 版本
+- ✅ 镜像仓库地址可配置，适应不同环境
 
 **预期效果**：
 
@@ -324,7 +363,26 @@ data:
 
 ##### 4. 控制面优化（节省 ~20 秒）
 
-**原理**：只启用必要的控制器（node 控制器），禁用不必要的控制器（policy、namespace、serviceaccount、endpoint）。
+**原理**：根据实际使用场景，选择性启用控制器，减少初始化开销。
+
+**控制器功能详解**：
+
+| 控制器 | 功能 | 禁用影响 | 禁用场景 |
+|--------|------|---------|---------|
+| **node** | 节点生命周期管理，自动清理节点资源 | 无法自动清理节点资源 | ❌ 不建议禁用 |
+| **policy** | 网络策略管理，自动同步 NetworkPolicy | 无法使用 Calico 网络策略 | 不使用网络策略时 |
+| **namespace** | 命名空间管理，自动管理命名空间标签 | 无法自动管理命名空间标签 | 不使用命名空间标签时 |
+| **serviceaccount** | 服务账号管理，自动管理服务账号标签 | 无法自动管理服务账号标签 | 不使用服务账号标签时 |
+| **endpoint** | 端点管理，自动管理端点标签 | 无法自动管理端点标签 | 不使用端点标签时 |
+
+**禁用场景决策矩阵**：
+
+| 场景 | 推荐配置 | 说明 |
+|------|---------|------|
+| **生产环境（使用网络策略）** | 保留所有控制器 | 完整功能，支持 NetworkPolicy |
+| **生产环境（不使用网络策略）** | 仅保留 node | 最小化资源消耗，节省 ~20 秒 |
+| **开发/测试环境** | 仅保留 node | 快速部署，节省 ~20 秒 |
+| **大规模集群（>100节点）** | 保留 node + policy | 平衡性能和功能 |
 
 **实现方案**：
 
@@ -341,9 +399,18 @@ spec:
       containers:
       - name: calico-kube-controllers
         env:
-        # 减少初始同步的数据量
+        # 根据场景选择启用的控制器
+        # 场景 1: 生产环境（不使用网络策略）或开发/测试环境
         - name: ENABLED_CONTROLLERS
-          value: "node"  # 只启用 node 控制器，禁用其他控制器
+          value: "node"  # 仅启用 node 控制器，节省 ~20 秒
+        
+        # 场景 2: 生产环境（使用网络策略）
+        # - name: ENABLED_CONTROLLERS
+        #   value: "node,policy"  # 启用 node 和 policy 控制器
+        
+        # 场景 3: 完整功能
+        # - name: ENABLED_CONTROLLERS
+        #   value: "node,policy,namespace,serviceaccount,endpoint"
         
         # 优化同步间隔
         - name: NODE_SYNC_PERIOD
@@ -367,15 +434,19 @@ spec:
             memory: 256Mi
 ```
 
-**控制器功能说明**：
+**重新启用控制器**：
 
-| 控制器 | 功能 | 是否必需 |
-|--------|------|----------|
-| node | 节点生命周期管理 | ✅ 必需 |
-| policy | 网络策略管理 | ❌ 可选 |
-| namespace | 命名空间管理 | ❌ 可选 |
-| serviceaccount | 服务账号管理 | ❌ 可选 |
-| endpoint | 端点管理 | ❌ 可选 |
+如果需要重新启用被禁用的控制器，只需修改 `ENABLED_CONTROLLERS` 环境变量：
+
+```yaml
+# 重新启用所有控制器
+- name: ENABLED_CONTROLLERS
+  value: "node,policy,namespace,serviceaccount,endpoint"
+
+# 重新启用 policy 控制器
+- name: ENABLED_CONTROLLERS
+  value: "node,policy"
+```
 
 **预期效果**：
 
@@ -438,16 +509,181 @@ spec:
 | 配置优化时间 | ~15 秒 | ~5 秒 | 67% |
 | 节省时间 | - | ~10 秒 | - |
 
+##### 6. Typha 优化（大规模集群，节省 ~15 秒）
+
+**原理**：
+
+Typha 作为 calico-node 和 API Server 之间的代理，将 N 个 Watch 连接减少到 1 个（Typha → API Server），显著降低 API Server 负载，提升大规模集群性能。
+
+**架构图**：
+
+```mermaid
+graph TB
+    subgraph "管理集群"
+        A[API Server]
+    end
+    
+    subgraph "目标集群"
+        B[Typha<br/>Deployment]
+        C[calico-node<br/>DaemonSet]
+        D[calico-node<br/>DaemonSet]
+        E[calico-node<br/>DaemonSet]
+    end
+    
+    C -->|Watch| B
+    D -->|Watch| B
+    E -->|Watch| B
+    B -->|单一 Watch| A
+    
+    style B fill:#e8f5e9
+    style A fill:#e1f5ff
+```
+
+**适用场景**：
+
+| 场景 | 是否推荐 | 说明 |
+|------|---------|------|
+| 节点数 < 50 | ❌ 不推荐 | 开销大于收益 |
+| 节点数 50-100 | ✅ 推荐 | 显著降低 API Server 负载 |
+| 节点数 > 100 | ✅ 强烈推荐 | 必需，否则 API Server 可能过载 |
+| 64 节点集群 | ✅ 推荐 | 本提案目标场景 |
+
+**资源消耗**：
+
+| 资源 | Requests | Limits | 说明 |
+|------|----------|--------|------|
+| CPU | 100m | 500m | 低 CPU 消耗 |
+| Memory | 128Mi | 512Mi | 中等内存消耗 |
+| 副本数 | 2-3 | - | 建议高可用部署 |
+
+**实现方案**：
+
+```yaml
+# bke-manifests/kubernetes/calico/v3.31.3/calico.yaml
+
+# 1. 创建 Typha Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: calico-typha
+  namespace: kube-system
+  labels:
+    k8s-app: calico-typha
+spec:
+  selector:
+    k8s-app: calico-typha
+  ports:
+    - port: 5473
+      protocol: TCP
+      targetPort: calico-typha
+---
+# 2. 部署 Typha Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: calico-typha
+  namespace: kube-system
+  labels:
+    k8s-app: calico-typha
+spec:
+  replicas: 2  # 建议 2-3 个副本，保证高可用
+  selector:
+    matchLabels:
+      k8s-app: calico-typha
+  template:
+    metadata:
+      labels:
+        k8s-app: calico-typha
+    spec:
+      containers:
+      - name: calico-typha
+        image: registry.openfuyao.com/calico/typha:v3.31.3
+        ports:
+        - containerPort: 5473
+          name: calico-typha
+          protocol: TCP
+        env:
+        - name: TYPHA_LOGSEVERITYSCREEN
+          value: "info"
+        - name: TYPHA_LOGFILEPATH
+          value: "none"
+        - name: TYPHA_CONNECTIONREBALANCINGMODE
+          value: "kubernetes"
+        - name: TYPHA_DATASTORETYPE
+          value: "kubernetes"
+        - name: TYPHA_HEALTHENABLED
+          value: "true"
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        readinessProbe:
+          httpGet:
+            path: /readiness
+            port: 9098
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /liveness
+            port: 9098
+          periodSeconds: 10
+          initialDelaySeconds: 10
+---
+# 3. 修改 calico-config ConfigMap，启用 Typha
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: calico-config
+  namespace: kube-system
+data:
+  typha_service_name: "calico-typha"  # 启用 Typha
+  calico_backend: "vxlan"
+---
+# 4. 修改 calico-node DaemonSet，配置 Typha
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: calico-node
+  namespace: kube-system
+spec:
+  template:
+    spec:
+      containers:
+      - name: calico-node
+        env:
+        - name: FELIX_TYPHAK8SSERVICENAME
+          value: "calico-typha"  # 指向 Typha Service
+```
+
+**预期效果**：
+
+| 指标 | 优化前 | 优化后 | 提升 |
+|------|--------|--------|------|
+| API Server Watch 连接数 | 64 个 | 1 个（Typha） | 98% |
+| API Server 负载 | 高 | 低 | - |
+| 部署时间 | - | - | 节省 ~15 秒 |
+| 可扩展性 | 中等 | 高 | - |
+
+**注意事项**：
+
+1. **资源开销**：Typha 需要额外的 CPU 和内存资源
+2. **高可用**：建议部署 2-3 个 Typha 副本，避免单点故障
+3. **兼容性**：Typha 与所有 Calico 功能兼容，不影响网络策略、BGP 等功能
+
 #### 综合优化效果
 
 | 优化项 | 当前耗时 | 优化后耗时 | 节省时间 | 提升 |
 |--------|----------|-----------|----------|------|
-| 镜像预置 | ~1 分钟 | ~10 秒 | ~50 秒 | 83% |
+| 镜像预置（动态版本） | ~1 分钟 | ~10 秒 | ~50 秒 | 83% |
 | 并行部署 | ~1.5 分钟 | ~1 分钟 | ~20 秒 | 33% |
-| 网络初始化 | ~1 分钟 | ~30 秒 | ~30 秒 | 50% |
-| 控制面注册 | ~30 秒 | ~10 秒 | ~20 秒 | 67% |
+| 网络初始化（VXLAN） | ~1 分钟 | ~30 秒 | ~30 秒 | 50% |
+| 控制面优化（明确场景） | ~30 秒 | ~10 秒 | ~20 秒 | 67% |
 | 配置优化 | ~15 秒 | ~5 秒 | ~10 秒 | 67% |
-| **总计** | **3 分 15 秒** | **~1 分 35 秒** | **~1 分 40 秒** | **51%** |
+| **Typha 优化（新增）** | - | - | **~15 秒** | - |
+| **总计** | **3 分 15 秒** | **~1 分 20 秒** | **~1 分 55 秒** | **59%** |
 
 ## 设计细节
 
