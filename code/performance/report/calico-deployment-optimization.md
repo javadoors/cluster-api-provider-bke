@@ -2,14 +2,15 @@
 
 ## 摘要
 
-本提案旨在优化 BKE 平台中 Calico 网络插件的部署性能，将 64 节点集群的 Calico 部署时间从当前的 3 分 15 秒降低到 1 分 35 秒，提升约 51%。
+本提案旨在优化 BKE 平台中 Calico 网络插件的部署性能，将 64 节点集群的 Calico 部署时间从当前的 3 分 15 秒降低到 1 分 20 秒，提升约 59%。
 
-通过五项关键优化措施：
-1. **镜像预置**：在节点环境初始化阶段提前拉取 Calico 镜像，节省约 50 秒
+通过六项关键优化措施：
+1. **镜像预置**：扩展现有 K8sEnvInit 机制，在节点环境初始化阶段提前拉取 Calico 镜像，节省约 50 秒
 2. **并行部署**：调整 DaemonSet 的 maxUnavailable 参数为 30%，节省约 20 秒
 3. **网络模式优化**：使用 VXLAN 模式替代 IPIP 模式，节省约 30 秒
-4. **控制面优化**：优化 calico-kube-controllers 启动参数，节省约 20 秒
-5. **配置精简**：禁用不必要的功能，节省约 10 秒
+4. **控制面优化**：根据场景选择性启用控制器，节省约 20 秒
+5. **配置精简**：禁用不必要的 Felix 功能，节省约 10 秒
+6. **Typha 优化**：部署 Typha 代理减少 API Server 负载，节省约 15 秒（大规模集群）
 
 ## 动机
 
@@ -830,6 +831,231 @@ spec:
 | **Typha 优化（新增）** | - | - | **~15 秒** | - |
 | **总计** | **3 分 15 秒** | **~1 分 20 秒** | **~1 分 55 秒** | **59%** |
 
+## 设计视图
+
+### 1. 系统架构总览
+
+```mermaid
+graph TB
+    subgraph "BKE Controller"
+        A[BKECluster CRD<br/>addons.calico] --> B[BKEAgent]
+        B --> C[K8sEnvInit<br/>scope=image]
+    end
+    
+    subgraph "节点环境初始化"
+        C --> D[exportImageList]
+        D --> E[exportAddonImages]
+        E --> F[镜像预拉取<br/>crictl pull]
+    end
+    
+    subgraph "Calico 部署"
+        F --> G[DaemonSet<br/>maxUnavailable=30%]
+        G --> H[VXLAN 模式]
+        H --> I[Typha 代理]
+        I --> J[calico-node<br/>并行启动]
+    end
+    
+    subgraph "API Server"
+        K[API Server]
+        L[etcd]
+    end
+    
+    J --> K
+    I --> K
+    K --> L
+    
+    style F fill:#e8f5e9
+    style J fill:#e1f5ff
+    style I fill:#fff4e1
+```
+
+**组件职责说明：**
+
+| 组件 | 职责 | 文件位置 |
+|------|------|---------|
+| BKECluster CRD | 定义 Calico 版本和配置参数 | `api/bkecommon/v1beta1/bkecluster_spec.go` |
+| K8sEnvInit | 节点环境初始化，包括镜像预拉取 | `pkg/job/builtin/kubeadm/env/env.go` |
+| exportImageList | 导出 K8s 核心组件镜像列表 | `pkg/job/builtin/kubeadm/env/init.go` |
+| exportAddonImages | 从 BKEConfig 导出 Addon 镜像列表 | `pkg/job/builtin/kubeadm/env/init.go` |
+| DaemonSet | 管理 calico-node Pod 的部署和更新 | `bke-manifests/kubernetes/calico/v3.31.3/calico.yaml` |
+| Typha | 作为 calico-node 和 API Server 之间的代理 | `bke-manifests/kubernetes/calico/v3.31.3/calico.yaml` |
+
+### 2. 优化前后对比时序图
+
+```mermaid
+sequenceDiagram
+    participant Controller as BKE Controller
+    participant Agent as BKEAgent
+    participant Node as 节点
+    participant Registry as 镜像仓库
+    participant API as API Server
+    
+    Note over Controller,API: 优化前（3分15秒）
+    Controller->>Agent: 部署 Calico Addon
+    Agent->>Node: 创建 DaemonSet
+    Node->>Registry: 64节点同时拉取镜像
+    Registry-->>Node: 镜像数据（~25.6GB）
+    Note right of Node: 镜像拉取耗时 ~1分钟
+    Node->>API: 建立 BGP 会话（192个）
+    API-->>Node: BGP 响应
+    Note right of Node: 网络初始化耗时 ~1.5分钟
+    Node->>API: 注册 calico-node
+    API-->>Node: 注册确认
+    Note right of Node: 控制面注册耗时 ~30秒
+    
+    Note over Controller,API: 优化后（1分20秒）
+    Controller->>Agent: 环境初始化
+    Agent->>Node: K8sEnvInit (scope=image)
+    Node->>Registry: 预拉取 Calico 镜像
+    Registry-->>Node: 镜像数据
+    Note right of Node: 镜像已预置 ✓
+    Controller->>Agent: 部署 Calico Addon
+    Agent->>Node: 创建 DaemonSet (maxUnavailable=30%)
+    Node->>Node: 使用本地镜像（零拉取）
+    Note right of Node: 镜像拉取耗时 ~10秒
+    Node->>API: VXLAN 模式（无需BGP）
+    API-->>Node: VXLAN 配置
+    Note right of Node: 网络初始化耗时 ~30秒
+    Node->>API: 通过 Typha 注册
+    API-->>Node: 注册确认
+    Note right of Node: 控制面注册耗时 ~10秒
+```
+
+**性能对比：**
+
+| 阶段 | 优化前 | 优化后 | 提升 |
+|------|--------|--------|------|
+| 镜像拉取 | ~1 分钟 | ~10 秒 | 83% |
+| 网络初始化 | ~1.5 分钟 | ~30 秒 | 50% |
+| 控制面注册 | ~30 秒 | ~10 秒 | 67% |
+| 配置加载 | ~15 秒 | ~5 秒 | 67% |
+| **总计** | **3 分 15 秒** | **~1 分 20 秒** | **59%** |
+
+### 3. 组件交互图
+
+```mermaid
+graph LR
+    subgraph "配置读取"
+        A[BKECluster CRD] --> B[bkeConfig.Addons]
+        B --> C{addon.Name == calico?}
+        C -->|是| D[读取 addon.Version]
+        C -->|否| E[跳过]
+        D --> F[构建镜像列表]
+    end
+    
+    subgraph "镜像预拉取"
+        F --> G[exportAddonImages]
+        G --> H[calico/node:version]
+        G --> I[calico/cni:version]
+        G --> J[calico/kube-controllers:version]
+        G --> K[calico/pod2daemon-flexvol:version]
+        H --> L[crictl pull]
+        I --> L
+        J --> L
+        K --> L
+    end
+    
+    subgraph "DaemonSet 部署"
+        L --> M[DaemonSet 创建]
+        M --> N[maxUnavailable=30%]
+        N --> O[并行启动 calico-node]
+        O --> P[VXLAN 模式]
+        P --> Q[Typha 代理]
+    end
+```
+
+### 4. 数据流图
+
+```mermaid
+graph TD
+    A[BKECluster CRD] --> B[Spec.ClusterConfig.Addons]
+    B --> C[addon.Name=calico]
+    C --> D[addon.Version=v3.31.3]
+    
+    D --> E[exportAddonImages]
+    E --> F[构建镜像列表]
+    F --> G[calico/node:v3.31.3]
+    F --> H[calico/cni:v3.31.3]
+    F --> I[calico/kube-controllers:v3.31.3]
+    F --> J[calico/pod2daemon-flexvol:v3.31.3]
+    
+    G --> K[K8sEnvInit<br/>scope=image]
+    H --> K
+    I --> K
+    J --> K
+    
+    K --> L[crictl pull]
+    L --> M[本地镜像缓存]
+    
+    M --> N[DaemonSet 创建]
+    N --> O[calico-node Pod]
+    O --> P[使用本地镜像]
+    P --> Q[启动成功]
+```
+
+### 5. 部署视图
+
+```mermaid
+graph TB
+    subgraph "管理集群"
+        A[BKE Controller<br/>Deployment]
+        B[API Server]
+        C[etcd]
+    end
+    
+    subgraph "目标集群 - Master 节点"
+        D[calico-node<br/>DaemonSet]
+        E[calico-kube-controllers<br/>Deployment]
+        F[calico-typha<br/>Deployment]
+    end
+    
+    subgraph "目标集群 - Worker 节点"
+        G[calico-node<br/>DaemonSet]
+        H[calico-node<br/>DaemonSet]
+        I[calico-node<br/>DaemonSet]
+    end
+    
+    subgraph "监控"
+        J[Prometheus<br/>指标采集]
+        K[Grafana<br/>可视化]
+        L[日志系统<br/>ELK/Loki]
+    end
+    
+    A --> B
+    B --> C
+    
+    D --> B
+    E --> B
+    F --> B
+    G --> B
+    H --> B
+    I --> B
+    
+    F -->|代理| B
+    
+    D --> J
+    E --> J
+    F --> J
+    J --> K
+    D --> L
+    
+    style A fill:#fff4e1
+    style B fill:#e1f5ff
+    style F fill:#e8f5e9
+    style J fill:#f3e5f5
+```
+
+**监控点说明：**
+
+| 监控指标 | 采集方式 | 告警阈值 | 说明 |
+|---------|---------|---------|------|
+| Calico 部署时间 | Prometheus | > 2 分钟 | 优化后的预期时间 |
+| 镜像预拉取成功率 | 日志 | < 95% | 验证预拉取效果 |
+| calico-node 启动时间 | Prometheus | > 30 秒 | 单节点启动时间 |
+| Typha 连接数 | Prometheus | > 100 | 验证 Typha 效果 |
+| API Server 负载 | Prometheus | P99 > 1s | 验证 Typha 减压效果 |
+| BGP 会话数 | calicoctl | > 0（VXLAN模式） | VXLAN 模式应为 0 |
+
 ## 设计细节
 
 ### API 变更
@@ -840,8 +1066,8 @@ spec:
 
 | 文件路径 | 变更类型 | 说明 |
 |---------|---------|------|
-| `pkg/phaseframe/phases/ensure_nodes_env.go` | 修改 | 添加 Calico 镜像预置逻辑 |
-| `bke-manifests/kubernetes/calico/v3.31.3/calico.yaml` | 修改 | 调整 DaemonSet 配置、网络模式、控制器参数 |
+| `pkg/job/builtin/kubeadm/env/init.go` | 修改 | 扩展 exportImageList 方法，新增 exportAddonImages 方法，支持 Addon 镜像预拉取 |
+| `bke-manifests/kubernetes/calico/v3.31.3/calico.yaml` | 修改 | 调整 DaemonSet 配置（maxUnavailable=30%）、网络模式（VXLAN）、控制器参数、添加 Typha 部署 |
 | `pkg/metrics/calico_deployment.go` | 新增 | 添加 Calico 部署监控指标 |
 | `test/e2e/calico_deployment_test.go` | 新增 | 添加 Calico 部署性能测试 |
 
@@ -900,6 +1126,117 @@ spec:
 - [ ] 在 64 节点集群上验证性能提升
 - [ ] 生产环境部署 1 个月无问题
 - [ ] 文档已更新
+
+## 工作量评估
+
+### 1. 开发工作量
+
+| 模块 | 任务 | 预估人天 | 说明 |
+|------|------|---------|------|
+| **镜像预置** | 扩展 exportImageList 方法 | 0.5 | 添加 exportAddonImages 方法 |
+| **镜像预置** | 修改 Worker 节点预拉取逻辑 | 0.5 | Worker 节点也预拉取 Addon 镜像 |
+| **并行部署** | 修改 DaemonSet maxUnavailable | 0.3 | 从 1 改为 30% |
+| **网络模式** | 配置 VXLAN 模式 | 0.5 | 修改 calico-config ConfigMap |
+| **控制面优化** | 明确控制器禁用场景 | 0.5 | 添加场景决策矩阵 |
+| **配置精简** | 优化 Felix 配置参数 | 0.5 | 添加详细配置说明 |
+| **Typha 部署** | 部署 Typha Service 和 Deployment | 1.5 | 包含 Service、Deployment、ConfigMap 配置 |
+| **小计** | | **4.3** | |
+
+### 2. 测试工作量
+
+| 测试类型 | 任务 | 预估人天 | 说明 |
+|---------|------|---------|------|
+| **单元测试** | exportAddonImages 方法测试 | 0.5 | 验证镜像列表导出逻辑 |
+| **单元测试** | 镜像预拉取逻辑测试 | 0.5 | 验证镜像存在性检查 |
+| **集成测试** | 10 节点集群 Calico 部署测试 | 1 | 小规模集群验证 |
+| **集成测试** | 32 节点集群 Calico 部署测试 | 1 | 中规模集群验证 |
+| **集成测试** | 64 节点集群 Calico 部署测试 | 1.5 | 大规模集群验证 |
+| **端到端测试** | 完整集群创建流程测试 | 2 | 验证整体部署流程 |
+| **性能测试** | Calico 部署时间测量 | 1 | 验证性能提升效果 |
+| **小计** | | **7.5** | |
+
+### 3. 文档工作量
+
+| 任务 | 预估人天 | 说明 |
+|------|---------|------|
+| 配置说明更新 | 0.5 | 添加 Felix 配置项详细说明 |
+| 发布说明 | 0.3 | 版本更新日志 |
+| **小计** | **0.8** | |
+
+### 4. 总工作量汇总
+
+```mermaid
+pie title 工作量分布
+    "开发 (4.3人天)" : 4.3
+    "测试 (7.5人天)" : 7.5
+    "文档 (0.8人天)" : 0.8
+```
+
+| 类别 | 人天 | 占比 |
+|------|------|------|
+| 开发 | 4.3 | 34% |
+| 测试 | 7.5 | 59% |
+| 文档 | 0.8 | 7% |
+| **总计** | **12.6** | **100%** |
+
+**人力资源配置：**
+- **方案**：1 名开发人员，约 2.5 周（12.6 人天 ÷ 5 天/周）
+
+### 5. 里程碑计划
+
+```mermaid
+gantt
+    title 项目实施计划
+    dateFormat  YYYY-MM-DD
+    section 开发
+    镜像预置实现           :a1, 2026-07-16, 1d
+    并行部署配置           :a2, after a1, 1d
+    网络模式优化           :a3, after a2, 1d
+    控制面与配置优化       :a4, after a3, 1d
+    Typha 部署             :a5, after a4, 1d
+    section 测试
+    单元测试               :b1, after a5, 1d
+    集成测试               :b2, after b1, 3d
+    端到端测试             :b3, after b2, 2d
+    section 文档
+    文档更新               :c1, after b3, 1d
+```
+
+| 里程碑 | 时间 | 交付物 | 验收标准 |
+|--------|------|--------|---------|
+| **M1: 镜像预置** | Day 1-2 | 扩展 exportImageList 方法 | 单元测试通过，镜像预拉取成功 |
+| **M2: 并行部署** | Day 3-4 | DaemonSet 配置优化 | 10 节点集群测试通过 |
+| **M3: 网络优化** | Day 5-6 | VXLAN 模式配置 | 32 节点集群测试通过 |
+| **M4: 控制面优化** | Day 7-8 | 控制器场景配置 | 64 节点集群测试通过 |
+| **M5: Typha 部署** | Day 9-10 | Typha Service 和 Deployment | 大规模集群测试通过 |
+| **M6: 测试验证** | Day 11-15 | 集成测试和端到端测试 | Calico 部署 < 2 分钟 |
+| **M7: 发布准备** | Day 16 | 文档更新和代码审查 | 文档完整，审查通过 |
+
+### 6. 风险评估与缓冲
+
+| 风险 | 概率 | 影响 | 缓解措施 | 预留缓冲 |
+|------|------|------|---------|---------|
+| VXLAN 模式兼容性问题 | 低 | 中 | 提供回退到 IPIP 模式的配置选项 | +1 天 |
+| Typha 同步延迟 | 低 | 中 | 监控 Typha 连接数，调整副本数 | +0.5 天 |
+| 镜像预拉取失败 | 中 | 低 | 预拉取失败时自动降级到正常拉取 | +0.5 天 |
+| 性能未达预期 | 中 | 中 | 参数调优，架构优化 | +1 天 |
+| **总缓冲** | | | | **+3 天** |
+
+**调整后的总工作量：**
+- 基础工作量：12.6 人天
+- 风险缓冲：3 人天
+- **最终工作量：15.6 人天（约 3.1 周，1 名开发人员）**
+
+### 7. 成本效益分析
+
+| 指标 | 数值 | 说明 |
+|------|------|------|
+| **投入成本** | 15.6 人天 | 开发 + 测试 + 文档 + 缓冲 |
+| **性能提升** | 节省 1 分 55 秒/集群 | Calico 部署从 3m15s → 1m20s |
+| **年化收益** | 节省 1,380 分钟 | 假设每天创建 2 个集群 |
+| **投资回报率** | 约 88x | 1,380 分钟 ÷ 15.6 人天 ≈ 88 |
+
+**结论：** 该优化具有极高的投资回报率（88x），建议优先实施。
 
 ### 升级/降级策略
 
