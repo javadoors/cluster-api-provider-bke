@@ -20,6 +20,120 @@
 | **无**（短路） | `CustomSetStatusPhaseNames`（`EnsureCluster`） | `ClusterChecking`（前置 Hook 专门设置） | — |
 | **无**（default） | 未匹配的 phase | `ClusterUnknown` | `ClusterUnknown` |
 
+### Phase 集合具体 Phase 明细
+
+> **来源**：`pkg/phaseframe/phases/list.go:87-158`
+
+#### ClusterInitPhaseNames（8 个）
+
+| # | Phase 常量 | Phase 值 | 中文名 |
+|---|-----------|---------|--------|
+| 1 | `EnsureFinalizerName` | `"EnsureFinalizer"` | 部署任务创建 |
+| 2 | `EnsureCertsName` | `"EnsureCerts"` | 集群证书创建 |
+| 3 | `EnsureClusterAPIObjName` | `"EnsureClusterAPIObj"` | ClusterAPI对接 |
+| 4 | `EnsureMasterInitName` | `"EnsureMasterInit"` | Master初始化 |
+| 5 | `EnsureBKEAgentName` | `"EnsureBKEAgent"` | 推送Agent |
+| 6 | `EnsureNodesEnvName` | `"EnsureNodesEnv"` | 节点环境准备 |
+| 7 | `EnsureLoadBalanceName` | `"EnsureLoadBalance"` | 集群入口配置 |
+| 8 | `EnsureAgentSwitchName` | `"EnsureAgentSwitch"` | Agent监听切换 |
+
+#### ClusterScaleMasterUpPhaseNames（1 个）
+
+| # | Phase 常量 | Phase 值 | 中文名 |
+|---|-----------|---------|--------|
+| 1 | `EnsureMasterJoinName` | `"EnsureMasterJoin"` | Master加入 |
+
+#### ClusterScaleWorkerUpPhaseNames（1 个）
+
+| # | Phase 常量 | Phase 值 | 中文名 |
+|---|-----------|---------|--------|
+| 1 | `EnsureWorkerJoinName` | `"EnsureWorkerJoin"` | Worker加入 |
+
+#### ClusterScaleMasterDownPhaseNames（1 个）
+
+| # | Phase 常量 | Phase 值 | 中文名 |
+|---|-----------|---------|--------|
+| 1 | `EnsureMasterDeleteName` | `"EnsureMasterDelete"` | Master删除 |
+
+#### ClusterScaleWorkerDownPhaseNames（1 个）
+
+| # | Phase 常量 | Phase 值 | 中文名 |
+|---|-----------|---------|--------|
+| 1 | `EnsureWorkerDeleteName` | `"EnsureWorkerDelete"` | Worker删除 |
+
+#### ClusterDeletePhaseNames（1 个）
+
+| # | Phase 常量 | Phase 值 | 中文名 |
+|---|-----------|---------|--------|
+| 1 | `EnsureDeleteOrResetName` | `"EnsureDeleteOrReset"` | 集群删除 |
+
+#### ClusterPausedPhaseNames（1 个）
+
+| # | Phase 常量 | Phase 值 | 中文名 |
+|---|-----------|---------|--------|
+| 1 | `EnsurePausedName` | `"EnsurePaused"` | 集群管理暂停 |
+
+#### ClusterDryRunPhaseNames（1 个）
+
+| # | Phase 常量 | Phase 值 | 中文名 |
+|---|-----------|---------|--------|
+| 1 | `EnsureDryRunName` | `"EnsureDryRun"` | DryRun部署 |
+
+#### ClusterAddonsPhaseNames（1 个）
+
+| # | Phase 常量 | Phase 值 | 中文名 |
+|---|-----------|---------|--------|
+| 1 | `EnsureAddonDeployName` | `"EnsureAddonDeploy"` | 集群组件部署 |
+
+#### ClusterUpgradePhaseNames（5 个，旧 PhaseFlow 升级路径）
+
+| # | Phase 常量 | Phase 值 | 中文名 |
+|---|-----------|---------|--------|
+| 1 | `EnsureAgentUpgradeName` | `"EnsureAgentUpgrade"` | Agent升级 |
+| 2 | `EnsureContainerdUpgradeName` | `"EnsureContainerdUpgrade"` | Containerd升级 |
+| 3 | `EnsureMasterUpgradeName` | `"EnsureMasterUpgrade"` | Master升级 |
+| 4 | `EnsureWorkerUpgradeName` | `"EnsureWorkerUpgrade"` | Worker升级 |
+| 5 | `EnsureComponentUpgradeName` | `"EnsureComponentUpgrade"` | openFuyao核心组件升级 |
+
+#### DeclarativeClusterUpgradePhaseNames（6 个，声明式 DAG 升级路径）
+
+| # | Phase 常量 | Phase 值 | 中文名 |
+|---|-----------|---------|--------|
+| 1 | `EnsurePreUpgradeResourcesName` | `"EnsurePreUpgradeResources"` | 升级前资源预创建 |
+| 2 | `EnsureAgentUpgradeName` | `"EnsureAgentUpgrade"` | Agent升级 |
+| 3 | `EnsureEtcdUpgradeName` | `"EnsureEtcdUpgrade"` | Etcd升级 |
+| 4 | `EnsureContainerdUpgradeName` | `"EnsureContainerdUpgrade"` | Containerd升级 |
+| 5 | `EnsureMasterUpgradeName` | `"EnsureMasterUpgrade"` | Master升级 |
+| 6 | `EnsureWorkerUpgradeName` | `"EnsureWorkerUpgrade"` | Worker升级 |
+
+> **注意**：`handleClusterUpgradePhase` 同时匹配 `ClusterUpgradePhaseNames`（旧路径 5 个）和 `DeclarativeClusterUpgradePhaseNames`（DAG 路径 6 个）。两者有 4 个重叠 Phase（Agent/Containerd/Master/Worker Upgrade），差异为：旧路径含 `EnsureComponentUpgrade`，DAG 路径含 `EnsurePreUpgradeResources` 和 `EnsureEtcdUpgrade`。
+
+#### ClusterManagePhaseNames（1 个）
+
+| # | Phase 常量 | Phase 值 | 中文名 |
+|---|-----------|---------|--------|
+| 1 | `EnsureClusterManageName` | `"EnsureClusterManage"` | 纳管现有集群 |
+
+#### CustomSetStatusPhaseNames（1 个，短路处理）
+
+| # | Phase 常量 | Phase 值 | 中文名 |
+|---|-----------|---------|--------|
+| 1 | `EnsureClusterName` | `"EnsureCluster"` | 集群健康检查 |
+
+> **注意**：`EnsureCluster` 不走任何 `handleCluster*Phase` 函数，而是在前置 Hook 中短路设置 `ClusterChecking`，由 `ensure_cluster.go` 的健康检查逻辑决定最终设置 `Healthy` 或 `Unhealthy`。
+
+#### 未纳入任何 Phase 集合的 Phase
+
+以下 Phase 存在于 `DeployPhases`/`PostDeployPhases` 注册列表中，但**不在任何 `ClusterXxxPhaseNames` 集合中**，因此它们在 `calculateClusterStatusByPhase` 中走 default 分支，设置 `ClusterUnknown`：
+
+| Phase 常量 | Phase 值 | 中文名 | 所属注册列表 |
+|-----------|---------|--------|-------------|
+| `EnsureNodesPostProcessName` | `"EnsureNodesPostProcess"` | 后置脚本处理 | `DeployPhases` |
+| `EnsureClusterAPIManagerManifestName` | `"EnsureClusterAPIManagerManifest"` | Cluster-API Manager部署 | `PostDeployPhases` |
+| `EnsureProviderSelfUpgradeName` | `"EnsureProviderSelfUpgrade"` | provider自升级 | `PostDeployPhases` |
+
+> **注意**：`EnsureProviderSelfUpgrade` 虽然在 `PostDeployPhases` 中注册，但不在 `ClusterUpgradePhaseNames` 或 `DeclarativeClusterUpgradePhaseNames` 中。在升级场景中它由 DAG 调度器直接执行，不经过 `calculateClusterStatusByPhase` 的状态映射。
+
 ### 共性规律
 
 所有 handler 的逻辑结构完全一致：
