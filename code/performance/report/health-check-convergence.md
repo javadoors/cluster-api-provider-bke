@@ -433,86 +433,303 @@ func GetRequeueInterval(result *HealthCheckResult, config HealthCheckConfig) tim
 
 #### 优化 3: 健康检查缓存实现
 
+##### 推荐方案：基于 Informer 的实时缓存
+
+**核心思路**：使用 client-go 提供的 `SharedInformerFactory`，自动维护本地缓存，实现毫秒级实时性。
+
+**架构设计**：
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  Informer 层（client-go 提供）                           │
+│  ├─ NodeInformer                                        │
+│  │  └─ 自动 Watch Node 资源，维护本地缓存               │
+│  ├─ PodInformer                                         │
+│  │  └─ 自动 Watch Pod 资源，维护本地缓存               │
+│  └─ 自动处理重连、同步、事件去重                         │
+└─────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────┐
+│  健康检查层                                              │
+│  ├─ 直接从 Informer 本地缓存读取（零延迟）              │
+│  ├─ 无需 API 调用                                       │
+│  └─ 实时感知资源变化                                     │
+└─────────────────────────────────────────────────────────┘
+```
+
 **文件**: `pkg/kube/health_cache.go`
 
 ```go
-// HealthCheckCache 健康检查缓存
+package kube
+
+import (
+    "context"
+    "time"
+    
+    corev1 "k8s.io/api/core/v1"
+    coreinformers "k8s.io/client-go/informers/core/v1"
+    "k8s.io/client-go/kubernetes"
+    corelisters "k8s.io/client-go/listers/core/v1"
+    "k8s.io/client-go/tools/cache"
+)
+
+// HealthChecker 使用 Informer 的健康检查器
+type HealthChecker struct {
+    nodeLister  corelisters.NodeLister
+    podLister   corelisters.PodLister
+    informerSynced cache.InformerSynced
+}
+
+// NewHealthChecker 创建健康检查器
+func NewHealthChecker(ctx context.Context, client kubernetes.Interface) (*HealthChecker, error) {
+    // 创建 SharedInformerFactory
+    factory := informers.NewSharedInformerFactory(client, 0)
+    
+    // 获取 Node 和 Pod Informer
+    nodeInformer := factory.Core().V1().Nodes()
+    podInformer := factory.Core().V1().Pods()
+    
+    // 启动 Informer
+    factory.Start(ctx.Done())
+    
+    // 等待缓存同步
+    if !cache.WaitForCacheSync(ctx.Done(), 
+        nodeInformer.Informer().HasSynced,
+        podInformer.Informer().HasSynced) {
+        return nil, fmt.Errorf("failed to sync informer cache")
+    }
+    
+    return &HealthChecker{
+        nodeLister: nodeInformer.Lister(),
+        podLister:  podInformer.Lister(),
+        informerSynced: func() bool {
+            return nodeInformer.Informer().HasSynced() && 
+                   podInformer.Informer().HasSynced()
+        },
+    }, nil
+}
+
+// GetNodes 从 Informer 缓存获取节点列表
+func (h *HealthChecker) GetNodes() ([]*corev1.Node, error) {
+    // 零延迟，直接从 Informer 缓存读取
+    return h.nodeLister.List(labels.Everything())
+}
+
+// GetPods 从 Informer 缓存获取 Pod 列表
+func (h *HealthChecker) GetPods(namespace string) ([]*corev1.Pod, error) {
+    // 零延迟，直接从 Informer 缓存读取
+    return h.podLister.Pods(namespace).List(labels.Everything())
+}
+
+// GetNode 获取单个节点
+func (h *HealthChecker) GetNode(name string) (*corev1.Node, error) {
+    return h.nodeLister.Get(name)
+}
+
+// GetPod 获取单个 Pod
+func (h *HealthChecker) GetPod(namespace, name string) (*corev1.Pod, error) {
+    return h.podLister.Pods(namespace).Get(name)
+}
+```
+
+**预期效果**：
+
+| 指标 | 固定 TTL | Informer | 提升 |
+|------|---------|----------|------|
+| 实时性 | 最多延迟 30s | **毫秒级** | 100x |
+| API 调用 | 每次全量返回 | **首次同步后零调用** | 减少 99% |
+| 健康检查时间 | ~7 分钟 | **< 1 分钟** | 节省 6+ 分钟 |
+| 开发成本 | 0.5 天 | **1-2 天** | +1 天 |
+
+---
+
+##### 备选方案：ResourceVersion + TTL 混合策略
+
+**适用场景**：如果 Informer 方案实施困难，或需要更轻量级的缓存方案。
+
+**核心思路**：使用 ResourceVersion 进行条件查询，减少数据传输，同时保留 TTL 作为兜底。
+
+**文件**: `pkg/kube/health_cache.go`
+
+```go
+package kube
+
+import (
+    "sync"
+    "time"
+    
+    corev1 "k8s.io/api/core/v1"
+    metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+// HealthCheckCache 使用 ResourceVersion 的缓存
 type HealthCheckCache struct {
-    pods     map[string][]corev1.Pod
-    nodes    *corev1.NodeList
-    lastSync time.Time
-    ttl      time.Duration
-    mu       sync.RWMutex
+    nodes       *corev1.NodeList
+    pods        map[string][]corev1.Pod
+    nodeVersion string            // Node 的 ResourceVersion
+    podVersions map[string]string // Pod 的 ResourceVersion
+    lastSync    time.Time
+    ttl         time.Duration     // 5 分钟（兜底）
+    mu          sync.RWMutex
 }
 
 // NewHealthCheckCache 创建缓存
 func NewHealthCheckCache(ttl time.Duration) *HealthCheckCache {
     return &HealthCheckCache{
-        pods: make(map[string][]corev1.Pod),
-        ttl:  ttl,
+        pods:        make(map[string][]corev1.Pod),
+        podVersions: make(map[string]string),
+        ttl:         ttl,
     }
 }
 
 // GetNodes 从缓存获取节点列表
 func (c *HealthCheckCache) GetNodes(client *Client) (*corev1.NodeList, error) {
     c.mu.RLock()
-    if c.nodes != nil && time.Since(c.lastSync) < c.ttl {
-        defer c.mu.RUnlock()
-        return c.nodes, nil
+    
+    // 1. TTL 过期，强制全量刷新
+    if c.nodes == nil || time.Since(c.lastSync) >= c.ttl {
+        c.mu.RUnlock()
+        return c.refreshNodes(client, nil)
+    }
+    
+    // 2. TTL 内，使用 ResourceVersion 条件查询
+    option := &metav1.ListOptions{
+        ResourceVersion: c.nodeVersion,
     }
     c.mu.RUnlock()
     
-    // 缓存过期，重新获取
-    c.mu.Lock()
-    defer c.mu.Unlock()
-    
-    nodes, err := client.ListNodes(nil)
+    list, err := client.ListNodes(option)
     if err != nil {
         return nil, err
     }
     
-    c.nodes = nodes
+    // 3. 检查是否有变化
+    if list.ResourceVersion == c.nodeVersion {
+        // 没变化，使用缓存
+        return c.nodes, nil
+    }
+    
+    // 4. 有变化，更新缓存
+    c.mu.Lock()
+    c.nodes = list
+    c.nodeVersion = list.ResourceVersion
+    c.lastSync = time.Now()
+    c.mu.Unlock()
+    
+    return list, nil
+}
+
+// refreshNodes 刷新节点缓存
+func (c *HealthCheckCache) refreshNodes(client *Client, option *metav1.ListOptions) (*corev1.NodeList, error) {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    
+    list, err := client.ListNodes(option)
+    if err != nil {
+        return nil, err
+    }
+    
+    c.nodes = list
+    c.nodeVersion = list.ResourceVersion
     c.lastSync = time.Now()
     
-    return nodes, nil
+    return list, nil
 }
 
 // GetPods 从缓存获取 Pod 列表
 func (c *HealthCheckCache) GetPods(client *Client, namespace string) ([]corev1.Pod, error) {
     c.mu.RLock()
-    if pods, ok := c.pods[namespace]; ok && time.Since(c.lastSync) < c.ttl {
-        defer c.mu.RUnlock()
-        return pods, nil
+    
+    // 1. TTL 过期，强制全量刷新
+    if _, ok := c.pods[namespace]; !ok || time.Since(c.lastSync) >= c.ttl {
+        c.mu.RUnlock()
+        return c.refreshPods(client, namespace, nil)
+    }
+    
+    // 2. TTL 内，使用 ResourceVersion 条件查询
+    option := &metav1.ListOptions{
+        ResourceVersion: c.podVersions[namespace],
     }
     c.mu.RUnlock()
     
-    // 缓存过期，重新获取
-    c.mu.Lock()
-    defer c.mu.Unlock()
-    
-    pods, err := client.getPods(namespace)
+    list, err := client.getPodsWithOptions(namespace, option)
     if err != nil {
         return nil, err
     }
     
-    c.pods[namespace] = pods
+    // 3. 检查是否有变化
+    if list.ResourceVersion == c.podVersions[namespace] {
+        // 没变化，使用缓存
+        return c.pods[namespace], nil
+    }
+    
+    // 4. 有变化，更新缓存
+    c.mu.Lock()
+    c.pods[namespace] = list.Items
+    c.podVersions[namespace] = list.ResourceVersion
+    c.lastSync = time.Now()
+    c.mu.Unlock()
+    
+    return list.Items, nil
+}
+
+// refreshPods 刷新 Pod 缓存
+func (c *HealthCheckCache) refreshPods(client *Client, namespace string, option *metav1.ListOptions) ([]corev1.Pod, error) {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    
+    list, err := client.getPodsWithOptions(namespace, option)
+    if err != nil {
+        return nil, err
+    }
+    
+    c.pods[namespace] = list.Items
+    c.podVersions[namespace] = list.ResourceVersion
     c.lastSync = time.Now()
     
-    return pods, nil
+    return list.Items, nil
 }
 ```
+
+**预期效果**：
+
+| 指标 | 固定 TTL | RV + TTL | 提升 |
+|------|---------|----------|------|
+| 实时性 | 最多延迟 30s | **秒级** | 10x |
+| API 调用 | 每次全量返回 | **70% 返回 304** | 减少 70% 数据量 |
+| 健康检查时间 | ~7 分钟 | **~3 分钟** | 节省 4 分钟 |
+| 开发成本 | 0.5 天 | **1 天** | +0.5 天 |
+
+---
+
+##### 方案对比与选型建议
+
+| 方案 | 实时性 | API 负载 | 开发成本 | 维护成本 | 推荐度 |
+|------|--------|---------|---------|---------|--------|
+| **Informer** | 毫秒级 | 最低 | 1-2 天 | 低 | ⭐⭐⭐⭐⭐ |
+| **RV + TTL** | 秒级 | 低 | 1 天 | 中 | ⭐⭐⭐⭐ |
+| **固定 TTL** | 差 | 高 | 0.5 天 | 低 | ⭐⭐ |
+
+**选型建议**：
+- **优先选择 Informer**：在 KPI 压力（< 16 分钟）下，实时性优势明显
+- **备选 RV + TTL**：如果 Informer 实施困难，或需要更轻量级方案
+- **不推荐固定 TTL**：实时性差，API 负载高
 
 #### 优化 4: 配置文件
 
 **文件**: `/etc/bke/health-check-config.yaml`
 
 ```yaml
-cacheTTL: 30s
+# Informer 缓存同步超时时间
+cacheSyncTimeout: 30s
+
+# 检查间隔配置
 criticalComponentInterval: 5s
 importantComponentInterval: 15s
 optionalComponentInterval: 30s
 normalInterval: 5m
 
+# 关键组件清单
 criticalComponents:
   - namespace: kube-system
     prefixes:
@@ -521,6 +738,7 @@ criticalComponents:
       - kube-controller-manager-
       - kube-scheduler-
 
+# 重要组件清单
 importantComponents:
   - namespace: kube-system
     prefixes:
@@ -529,6 +747,7 @@ importantComponents:
       - coredns
       - kube-proxy-
 
+# 非关键组件清单
 optionalComponents:
   - namespace: kube-system
     prefixes:
@@ -552,7 +771,7 @@ optionalComponents:
 
 | 配置项 | 说明 | 默认值 |
 |--------|------|--------|
-| `cacheTTL` | 缓存过期时间 | 30s |
+| `cacheSyncTimeout` | Informer 缓存同步超时时间 | 30s |
 | `criticalComponentInterval` | 关键组件失败后的重试间隔 | 5s |
 | `importantComponentInterval` | 重要组件失败后的重试间隔 | 15s |
 | `optionalComponentInterval` | 非关键组件失败后的重试间隔 | 30s |
@@ -686,12 +905,12 @@ func TestHealthCheckPerformance(t *testing.T) {
     elapsed := time.Since(start)
     
     // 验证性能
-    assert.Less(t, elapsed, 3*time.Minute, "Health check should complete within 3 minutes")
+    assert.Less(t, elapsed, 1*time.Minute, "Health check should complete within 1 minute")
     t.Logf("Health check completed in %v", elapsed)
     
-    // 验证 API 调用次数
+    // 验证 API 调用次数（Informer 首次同步后应接近零）
     apiCalls := cluster.GetAPICallCount()
-    assert.Less(t, apiCalls, 30, "API calls should be less than 30")
+    assert.Less(t, apiCalls, 10, "API calls should be less than 10 after initial sync")
     t.Logf("API calls: %d", apiCalls)
 }
 ```
@@ -705,7 +924,7 @@ kubectl apply -f bkecluster-64n.yaml
 # 监控集群状态
 watch -n 5 'kubectl get bkecluster bke-cluster-128n -o jsonpath="{.status.clusterStatus}"'
 
-# 期望: ClusterUnhealthy → ClusterReady 时间 < 3 分钟
+# 期望: ClusterUnhealthy → ClusterReady 时间 < 1 分钟
 
 # 检查 Master 节点状态
 kubectl get nodes -l node-role.kubernetes.io/master
@@ -722,19 +941,19 @@ kubectl logs -n bke-system deployment/bke-controller-manager | grep "health chec
 
 #### Alpha (v0.1)
 - [ ] 实现统一健康检查器
-- [ ] 实现缓存机制
+- [ ] 实现 Informer 缓存机制
 - [ ] 实现动态间隔
 - [ ] 单元测试通过
 
 #### Beta (v0.2)
 - [ ] 集成测试通过
-- [ ] 健康检查收敛时间 < 5 分钟
-- [ ] API 调用次数 < 50 次
+- [ ] 健康检查收敛时间 < 2 分钟
+- [ ] API 调用次数 < 10 次（首次同步后）
 - [ ] 配置文件支持
 
 #### Stable (v1.0)
 - [ ] 端到端测试通过
-- [ ] 健康检查收敛时间 < 3 分钟
+- [ ] 健康检查收敛时间 < 1 分钟
 - [ ] Master NotReady 次数 = 0
 - [ ] 生产环境运行 1 个月无问题
 
@@ -749,6 +968,101 @@ kubectl logs -n bke-system deployment/bke-controller-manager | grep "health chec
 - 删除配置文件即可回退到默认配置
 - 代码回退简单，只需恢复原有的 `CheckClusterHealth()` 实现
 
+## 工作量评估
+
+### 1. 开发工作量
+
+| 模块 | 任务 | 预估人天 | 说明 |
+|------|------|---------|------|
+| **统一健康检查器** | 实现渐进式检查架构 | 1.5 | 4阶段检查逻辑，代码量约200行 |
+| **缓存层** | 实现 Informer 缓存 | 1.5 | 使用 client-go SharedInformerFactory |
+| **缓存层** | 实现 RV+TTL 备选方案 | 0.5 | ResourceVersion 条件查询 |
+| **配置管理** | 实现配置文件加载 | 0.5 | YAML 解析，默认值处理 |
+| **动态间隔** | 实现间隔调整逻辑 | 0.5 | 根据检查结果动态调整 |
+| **小计** | | **4.5** | |
+
+### 2. 测试工作量
+
+| 测试类型 | 任务 | 预估人天 | 说明 |
+|---------|------|---------|------|
+| **单元测试** | 健康检查器测试 | 1 | 覆盖所有检查阶段 |
+| **单元测试** | 缓存层测试 | 1 | 验证 Informer 和 RV+TTL |
+| **集成测试** | 性能测试 | 1.5 | 验证健康检查时间 < 3分钟 |
+| **端到端测试** | 64 节点集群测试 | 2 | 实际部署验证 |
+| **小计** | | **5.5** | |
+
+### 3. 文档工作量
+
+| 任务 | 预估人天 | 说明 |
+|------|---------|------|
+| 配置说明更新 | 0.3 | 添加配置文件说明 |
+| 发布说明 | 0.2 | 版本更新日志 |
+| **小计** | **0.5** | |
+
+### 4. 总工作量汇总
+
+```mermaid
+pie title 工作量分布
+    "开发 (4.5人天)" : 4.5
+    "测试 (5.5人天)" : 5.5
+    "文档 (0.5人天)" : 0.5
+```
+
+| 类别 | 人天 | 占比 |
+|------|------|------|
+| 开发 | 4.5 | 43% |
+| 测试 | 5.5 | 52% |
+| 文档 | 0.5 | 5% |
+| **总计** | **10.5** | **100%** |
+
+**人力资源配置：**
+- **方案**：1 名开发人员，约 2.1 周（10.5 人天 ÷ 5 天/周）
+
+### 5. 里程碑计划
+
+```mermaid
+gantt
+    title 项目实施计划
+    dateFormat  YYYY-MM-DD
+    section 开发
+    核心实现             :a1, 2026-07-16, 4d
+    section 测试
+    测试验证             :b1, after a1, 5d
+    section 发布
+    发布准备             :c1, after b1, 2d
+```
+
+| 里程碑 | 时间 | 交付物 | 验收标准 |
+|--------|------|--------|---------|
+| **M1: 核心实现** | Day 1-4 | 健康检查器 + 缓存层 + 配置管理 | 单元测试通过 |
+| **M2: 测试验证** | Day 5-9 | 集成测试 + 端到端测试 | 健康检查 < 3分钟 |
+| **M3: 发布准备** | Day 10-11 | 文档更新 + 代码审查 | 文档完整，审查通过 |
+
+### 6. 风险评估与缓冲
+
+| 风险 | 概率 | 影响 | 缓解措施 | 预留缓冲 |
+|------|------|------|---------|---------|
+| Informer 同步延迟 | 低 | 中 | 使用 RV+TTL 备选方案 | +1 天 |
+| 缓存一致性问题 | 低 | 中 | Informer 自动处理 | +0.5 天 |
+| 性能未达预期 | 中 | 中 | 参数调优 | +1 天 |
+| **总缓冲** | | | | **+2.5 天** |
+
+**调整后的总工作量：**
+- 基础工作量：10.5 人天
+- 风险缓冲：2.5 人天
+- **最终工作量：13 人天（约 2.6 周，1 名开发人员）**
+
+### 7. 成本效益分析
+
+| 指标 | 数值 | 说明 |
+|------|------|------|
+| **投入成本** | 13 人天 | 开发 + 测试 + 文档 + 缓冲 |
+| **性能提升** | 节省 4+ 分钟/集群 | 健康检查从 7m14s → < 3分钟 |
+| **年化收益** | 节省 960+ 分钟 | 假设每天创建 2 个集群 |
+| **投资回报率** | 约 74x | 960 分钟 ÷ 13 人天 ≈ 74 |
+
+**结论：** 该优化具有高投资回报率（74x），建议优先实施。
+
 ## 实施历史
 
 - **2026-07-13**: 识别健康检查收敛慢问题
@@ -760,11 +1074,11 @@ kubectl logs -n bke-system deployment/bke-controller-manager | grep "health chec
 
 ## 缺点
 
-1. **复杂度增加**：引入了缓存、配置、动态间隔等机制，代码复杂度增加
-   - **缓解措施**：通过良好的代码组织和文档降低维护成本
+1. **复杂度增加**：引入了 Informer 缓存、配置、动态间隔等机制，代码复杂度增加
+   - **缓解措施**：通过良好的代码组织和文档降低维护成本；使用 client-go 提供的 Informer SDK，减少自定义代码
 
-2. **缓存一致性**：缓存可能导致使用过期数据
-   - **缓解措施**：设置合理的缓存 TTL（默认 30 秒），在关键检查时强制刷新
+2. **Informer 资源占用**：Informer 需要维护本地缓存和长连接
+   - **缓解措施**：仅缓存健康检查需要的 Node 和 Pod 资源，内存占用可控；Informer SDK 自动处理连接维护和重连
 
 3. **配置错误风险**：配置文件格式错误可能导致健康检查失败
    - **缓解措施**：配置文件加载失败时使用默认配置，记录警告日志
