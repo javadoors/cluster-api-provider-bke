@@ -765,6 +765,223 @@ optionalComponents:
 2. 如果配置文件不存在或格式错误，使用默认配置
 3. 如果配置文件中某些字段为空，使用默认值填充
 
+## 设计视图
+
+### 1. 系统架构总览
+
+```mermaid
+graph TB
+    subgraph "BKE Controller"
+        A[配置管理<br/>health-check-config.yaml] --> B[统一健康检查器<br/>health.go]
+        B --> C[渐进式检查引擎]
+        C --> D[节点检查器]
+        C --> E[组件检查器]
+        C --> F[Addon检查器]
+        B --> G[缓存层<br/>health_cache.go]
+        G --> H[Informer/RV+TTL]
+    end
+    
+    subgraph "Kubernetes API Server"
+        I[API Server]
+        J[etcd]
+    end
+    
+    H --> I
+    I --> J
+    
+    style B fill:#e1f5ff
+    style G fill:#fff4e1
+    style H fill:#e8f5e9
+```
+
+**组件职责说明：**
+
+| 组件 | 职责 | 文件位置 |
+|------|------|---------|
+| 配置管理 | 加载健康检查配置，支持配置文件和默认值 | `pkg/kube/health.go` |
+| 统一健康检查器 | 协调健康检查流程，聚合检查结果 | `pkg/kube/health.go` |
+| 渐进式检查引擎 | 按优先级分阶段执行检查 | `pkg/kube/health.go` |
+| 节点检查器 | 检查所有节点的 Ready 状态 | `pkg/kube/health.go` |
+| 组件检查器 | 检查控制面组件和重要组件 | `pkg/kube/health.go` |
+| Addon检查器 | 检查可选的 Addon 组件 | `pkg/kube/health.go` |
+| 缓存层 | 缓存 Node 和 Pod 状态，减少 API 调用 | `pkg/kube/health_cache.go` |
+| Informer/RV+TTL | 实现缓存机制（推荐方案/备选方案） | `pkg/kube/health_cache.go` |
+
+### 2. 优化前后对比时序图
+
+```mermaid
+sequenceDiagram
+    participant Controller as BKE Controller
+    participant Checker as 健康检查器
+    participant Cache as 缓存层
+    participant API as API Server
+    
+    Note over Controller,API: 优化前（7分14秒）
+    loop 33次 ClusterUnhealthy
+        Controller->>Checker: CheckClusterHealth()
+        Checker->>API: ListNodes()
+        API-->>Checker: 节点列表
+        Checker->>API: ListPods(kube-system)
+        API-->>Checker: Pod列表
+        Note right of Checker: 串行检查所有组件<br/>每次全量API调用
+        Checker-->>Controller: 失败，等待10秒
+    end
+    
+    Note over Controller,API: 优化后（<1分钟）
+    Controller->>Checker: CheckClusterHealth()
+    Checker->>Cache: GetNodes()
+    Cache-->>Checker: 节点列表（缓存）
+    Checker->>Checker: 并行检查节点
+    Checker->>Cache: GetPods(kube-system)
+    Cache-->>Checker: Pod列表（缓存）
+    Checker->>Checker: 并行检查组件
+    Note right of Checker: 渐进式检查<br/>关键组件失败立即返回
+    Checker-->>Controller: 成功
+```
+
+**性能对比：**
+
+| 指标 | 优化前 | 优化后 | 提升 |
+|------|--------|--------|------|
+| 健康检查时间 | 7分14秒 | < 1分钟 | 86% |
+| API 调用次数 | ~100次 | < 10次（首次同步后） | 90% |
+| Master NotReady 次数 | 3次 | 0次 | 100% |
+| 检查方式 | 串行 | 并行 + 渐进式 | - |
+| 缓存机制 | 无 | Informer/RV+TTL | - |
+
+### 3. 组件交互图
+
+```mermaid
+graph LR
+    subgraph "配置加载"
+        A[LoadHealthCheckConfig] --> B{配置文件存在?}
+        B -->|是| C[解析YAML]
+        B -->|否| D[使用默认配置]
+        C --> E[合并配置]
+        D --> E
+    end
+    
+    subgraph "健康检查流程"
+        E --> F[NewUnifiedHealthChecker]
+        F --> G[Check]
+        G --> H[checkNodesParallel]
+        G --> I[checkCriticalComponentsParallel]
+        G --> J[checkImportantComponentsParallel]
+        G --> K[checkOptionalComponentsParallel]
+        G --> L[aggregateResult]
+    end
+    
+    subgraph "缓存层"
+        H --> M[GetNodes]
+        I --> N[GetPods]
+        J --> N
+        K --> N
+        M --> O{Informer/RV+TTL}
+        N --> O
+    end
+    
+    subgraph "动态间隔"
+        L --> P[GetRequeueInterval]
+        P --> Q{检查结果}
+        Q -->|关键组件失败| R[5秒]
+        Q -->|重要组件失败| S[15秒]
+        Q -->|非关键组件失败| T[30秒]
+        Q -->|全部成功| U[5分钟]
+    end
+```
+
+### 4. 数据流图
+
+```mermaid
+graph TD
+    A[配置文件<br/>health-check-config.yaml] --> B[LoadHealthCheckConfig]
+    B --> C[HealthCheckConfig]
+    
+    C --> D[NewUnifiedHealthChecker]
+    D --> E[UnifiedHealthChecker]
+    
+    E --> F[Check]
+    F --> G[checkNodesParallel]
+    F --> H[checkCriticalComponentsParallel]
+    F --> I[checkImportantComponentsParallel]
+    F --> J[checkOptionalComponentsParallel]
+    
+    G --> K[HealthCheckCache.GetNodes]
+    H --> L[HealthCheckCache.GetPods]
+    I --> L
+    J --> L
+    
+    K --> M{Informer同步?}
+    M -->|是| N[从缓存读取]
+    M -->|否| O[等待同步]
+    O --> N
+    
+    L --> P{RV+TTL?}
+    P -->|TTL内| Q[条件查询]
+    P -->|TTL过期| R[全量刷新]
+    Q --> S{RV变化?}
+    S -->|否| T[使用缓存]
+    S -->|是| U[更新缓存]
+    
+    N --> V[节点/Pod数据]
+    T --> V
+    U --> V
+    R --> V
+    
+    V --> W[检查结果]
+    W --> X[aggregateResult]
+    X --> Y[HealthCheckResult]
+    
+    Y --> Z[GetRequeueInterval]
+    Z --> AA[动态间隔]
+```
+
+### 5. 部署视图
+
+```mermaid
+graph TB
+    subgraph "管理集群"
+        A[BKE Controller<br/>Deployment]
+        B[API Server]
+        C[etcd]
+    end
+    
+    subgraph "配置注入"
+        D[ConfigMap<br/>health-check-config]
+        E[默认配置<br/>代码内置]
+    end
+    
+    subgraph "监控"
+        F[Prometheus<br/>指标采集]
+        G[Grafana<br/>可视化]
+        H[日志系统<br/>ELK/Loki]
+    end
+    
+    D --> A
+    E --> A
+    A --> B
+    B --> C
+    
+    A --> F
+    F --> G
+    A --> H
+    
+    style A fill:#fff4e1
+    style B fill:#e1f5ff
+    style F fill:#e8f5e9
+```
+
+**监控点说明：**
+
+| 监控指标 | 采集方式 | 告警阈值 | 说明 |
+|---------|---------|---------|------|
+| 健康检查时间 | Prometheus | > 3分钟 | 优化后的预期时间 |
+| API 调用次数 | Prometheus | > 50次/次检查 | 应该大幅减少 |
+| Master NotReady 次数 | 日志 | > 0 | 应该完全消除 |
+| Informer 同步时间 | Prometheus | > 30秒 | 首次同步时间 |
+| 缓存命中率 | 自定义指标 | < 90% | 验证缓存效果 |
+| 检查间隔 | 日志 | 异常值 | 验证动态间隔逻辑 |
+
 ## 设计细节
 
 ### API 变更
