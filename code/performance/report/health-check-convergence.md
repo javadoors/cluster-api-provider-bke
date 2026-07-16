@@ -1,29 +1,8 @@
-# KEP-11: 优化健康检查收敛时间
-
-<!--
-这是 Kubernetes Enhancement Proposals (KEPs) 的模板。
-有关 KEP 模板的更多信息，请参见：
-https://github.com/kubernetes/enhancements/blob/master/keps/NNN-template/README.md
--->
-
-## 元数据
-
-| 字段 | 值 |
-|------|-----|
-| **KEP** | 11 |
-| **标题** | 优化健康检查收敛时间 |
-| **状态** | 草案 |
-| **创建日期** | 2026-07-15 |
-| **最后更新** | 2026-07-15 |
-| **作者** | BKE 团队 |
-| **审阅者** | 待定 |
-| **批准者** | 待定 |
-| **SIG** | bke-performance |
-| **赞助 SIG** | bke-performance |
+# 优化健康检查收敛时间
 
 ## 摘要
 
-本 KEP 旨在优化 BKE 集群创建过程中的健康检查收敛时间，将其从当前的 7 分 14 秒降低到 3 分钟以内，提升约 57%。
+本提案旨在优化 BKE 集群创建过程中的健康检查收敛时间，将其从当前的 7 分 14 秒降低到 3 分钟以内，提升约 57%。
 
 当前健康检查存在以下问题：
 1. **串行检查**：所有节点和组件串行检查，耗时长
@@ -41,7 +20,7 @@ https://github.com/kubernetes/enhancements/blob/master/keps/NNN-template/README.
 
 ## 动机
 
-### 为什么需要这个 KEP？
+### 为什么需要这个提案？
 
 健康检查收敛是 BKE 集群创建过程中的第二大性能瓶颈，占总耗时的 24.5%。在 64 节点集群的测试中，健康检查阶段耗时 7 分 14 秒，期间出现 33 次 ClusterUnhealthy 警告，Master 节点反复 NotReady。
 
@@ -86,7 +65,7 @@ https://github.com/kubernetes/enhancements/blob/master/keps/NNN-template/README.
 
 ### 非目标
 
-1. 优化 Calico 本身的部署时间（由 KEP-12 处理）
+1. 优化 Calico 本身的部署时间（由其它提案处理）
 2. 修改 Kubernetes 控制面组件的行为
 3. 改变健康检查的业务逻辑（哪些组件需要检查）
 
@@ -125,25 +104,25 @@ https://github.com/kubernetes/enhancements/blob/master/keps/NNN-template/README.
 
 **架构设计：**
 
-```
+```txt
 ┌─────────────────────────────────────────────────────────────┐
-│                    统一健康检查架构                            │
+│                    统一健康检查架构                          │
 ├─────────────────────────────────────────────────────────────┤
 │                                                             │
 │  1. 初始化阶段                                               │
-│     ├─ 初始化缓存                                           │
-│     └─ 加载检查配置                                         │
+│     ├─ 初始化缓存                                            │
+│     └─ 加载检查配置                                          │
 │                                                             │
 │  2. 渐进式检查阶段（按优先级分 4 个阶段）                      │
-│     ├─ 阶段 1: 节点状态检查（并行）                          │
-│     ├─ 阶段 2: 关键组件检查（并行）                          │
-│     ├─ 阶段 3: 重要组件检查（并行）                          │
-│     └─ 阶段 4: 非关键组件检查（并行）                        │
+│     ├─ 阶段 1: 节点状态检查（并行）                           │
+│     ├─ 阶段 2: 关键组件检查（并行）                           │
+│     ├─ 阶段 3: 重要组件检查（并行）                           │
+│     └─ 阶段 4: 非关键组件检查（并行）                         │
 │                                                             │
 │  3. 结果处理阶段                                             │
-│     ├─ 聚合检查结果                                         │
-│     ├─ 动态调整下次检查间隔                                  │
-│     └─ 更新缓存                                             │
+│     ├─ 聚合检查结果                                          │
+│     ├─ 动态调整下次检查间隔                                   │
+│     └─ 更新缓存                                              │
 │                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -571,7 +550,7 @@ optionalComponents:
 
 ### API 变更
 
-本 KEP 不引入新的 API 变更。所有变更都是内部实现优化。
+本提案不引入新的 API 变更。所有变更都是内部实现优化。
 
 ### 代码变更清单
 
@@ -823,8 +802,5 @@ kubectl logs -n bke-system deployment/bke-controller-manager | grep "health chec
 
 ## 参考资料
 
-1. [BKE 64 节点集群性能瓶颈分析与优化方案](../../performance/report/64节点集群性能瓶颈分析与优化方案.md)
-2. [KEP-10: 消除 API Throttling](./api-throttling-optimization.md)
-3. [KEP-12: 优化 Calico 部署性能](./calico-deployment-optimization.md)
-4. [Kubernetes Health Checking](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
-5. [Controller Runtime Health Checks](https://pkg.go.dev/sigs.k8s.io/controller-runtime/pkg/healthz)
+1. [Kubernetes Health Checking](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+2. [Controller Runtime Health Checks](https://pkg.go.dev/sigs.k8s.io/controller-runtime/pkg/healthz)
