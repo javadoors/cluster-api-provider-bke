@@ -1,35 +1,8 @@
-# KEP-12: 优化 Calico 部署性能
-
-<!--
-这是 KEP 模板的说明，实际文档中应删除此注释块
- KEP 编号: 12
- 标题: 优化 Calico 部署性能
- 状态: Draft
- 创建日期: 2026-07-15
- 最后更新: 2026-07-15
- 作者: BKE Team
- 审阅者: TBD
- 批准者: TBD
--->
-
-## 元数据
-
-| 字段 | 值 |
-|------|-----|
-| **KEP** | 12 |
-| **标题** | 优化 Calico 部署性能 |
-| **状态** | 草案 |
-| **创建日期** | 2026-07-15 |
-| **最后更新** | 2026-07-15 |
-| **作者** | BKE 团队 |
-| **审阅者** | 待定 |
-| **批准者** | 待定 |
-| **SIG** | bke-performance |
-| **赞助 SIG** | bke-performance |
+# 优化 Calico 部署性能
 
 ## 摘要
 
-本 KEP 旨在优化 BKE 平台中 Calico 网络插件的部署性能，将 64 节点集群的 Calico 部署时间从当前的 3 分 15 秒降低到 1 分 35 秒，提升约 51%。
+本提案旨在优化 BKE 平台中 Calico 网络插件的部署性能，将 64 节点集群的 Calico 部署时间从当前的 3 分 15 秒降低到 1 分 35 秒，提升约 51%。
 
 通过五项关键优化措施：
 1. **镜像预置**：在节点环境初始化阶段提前拉取 Calico 镜像，节省约 50 秒
@@ -40,7 +13,7 @@
 
 ## 动机
 
-### 为什么需要这个 KEP？
+### 为什么需要这个提案？
 
 在 64 节点集群的性能测试中，Calico 部署耗时 3 分 15 秒，占 Addon 部署阶段的 78.6%，是第三大性能瓶颈。虽然优先级低于 API Throttling（P0）和健康检查收敛慢（P1），但 Calico 部署优化仍有显著价值：
 
@@ -637,5 +610,3 @@ spec:
 1. [Calico 官方文档 - VXLAN 模式](https://docs.tigera.io/calico/latest/network-policy/configure/vxlan-tunnel)
 2. [Kubernetes DaemonSet 更新策略](https://kubernetes.io/docs/tasks/manage-daemon/update-daemon-set/)
 3. [BKE 64 节点集群性能瓶颈分析与优化方案](./64节点集群性能瓶颈分析与优化方案.md)
-4. [KEP-10: 消除 API Throttling](./api-throttling-optimization.md)
-5. [KEP-11: 优化健康检查收敛时间](./health-check-convergence.md)
