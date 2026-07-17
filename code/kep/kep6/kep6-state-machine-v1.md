@@ -50,6 +50,7 @@
    - 10.2 状态聚合规则
    - 10.3 状态因果关系
    - 10.4 状态冲突处理
+   - 10.5 Command 状态与 Node 状态的关系与设计思路
 
 ---
 
@@ -638,6 +639,10 @@ const (
 
 ### 5.2 节点状态机
 
+节点层包含 BKENode 和 BKEMachine 两个资源，各自有独立的状态模型。本节分别给出两者的状态转换概览；BKEMachine 的详细设计见 5.3 节。
+
+#### 5.2.1 BKENode 状态转换图
+
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        BKENode 状态转换图                            │
@@ -680,6 +685,16 @@ const (
              ┌──────────┐ ┌──────────┐
              │ NotReady │ │ Managing │
              └──────────┘ └──────────┘
+```
+
+#### 5.2.2 BKEMachine 状态概览
+
+BKEMachine **没有 Phase 字段**，状态由布尔元组 `(Ready, Bootstrapped)` + 单个 Condition `BootstrapSucceededCondition` 表达。BKEMachine 控制器在引导过程中会**直接修改关联 BKENode 的 State 和 StateCode**，两者的状态变化交织进行：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      BKEMachine 状态概览                             │
+└─────────────────────────────────────────────────────────────────────┘
 
 BKEMachine 状态（布尔元组 + 单 Condition, 无 Phase 字段）：
   (Ready=false, Bootstrapped=false)
@@ -701,6 +716,8 @@ BKEMachine 状态（布尔元组 + 单 Condition, 无 Phase 字段）：
                    BKENode.StateCode |= NodeBootFlag (bit 3)
                    BKENode.State = NodeNotReady
 ```
+
+> **与 5.3 节的关系**：本节为 BKEMachine 状态的**概览**，以流程线展示布尔元组转换与 BKENode 副作用的交互关系。5.3 节为**详细设计**，包含状态定义表（5.3.1）、Condition 三态表（5.3.2）、BKENode 副作用表（5.3.3）、BKECluster 聚合（5.3.4）、删除流程（5.3.5）、状态转换框图（5.3.6）。
 
 ### 5.3 BKEMachine 状态机
 
@@ -728,6 +745,10 @@ BKEMachine 状态（布尔元组 + 单 Condition, 无 Phase 字段）：
 
 #### 5.3.3 BKEMachine → BKENode 副作用
 
+**为什么称为"副作用"**：
+
+BKEMachine 和 BKENode 是两个**独立的 CRD 资源**，没有 OwnerReference 关联，仅通过 `WorkerNodeHost`/`MasterNodeHost` 标签按 IP 匹配。按职责划分，BKEMachine 控制器应该只管 BKEMachine 自己的状态（`Ready`/`Bootstrapped`/`BootstrapSucceededCondition`）。但实际上，BKEMachine 控制器在引导流程中通过 `NodeFetcher.SetNodeStateWithMessageForCluster` 和 `MarkNodeStateFlagForCluster` **跨资源直接改写了 BKENode 的 `State` 和 `StateCode`**——这不是 BKEMachine 自身的状态变更，而是对另一个资源的"副作用"操作。
+
 BKEMachine 控制器在引导过程中**直接修改 BKENode 的 State 和 StateCode**（通过 `NodeFetcher` 按 IP 匹配）：
 
 | BKEMachine 阶段 | BKENode.State | BKENode.StateCode | 设置位置 |
@@ -738,7 +759,7 @@ BKEMachine 控制器在引导过程中**直接修改 BKENode 的 State 和 State
 | Bootstrap 成功 | `NodeNotReady` | `NodeBootFlag` (bit 3) | `phases.go:1299-1302` |
 | 节点删除 | `NodeDeleting` | — | `controller.go:307` |
 
-> **关键**：上表中 `NodeBootStrapping`/`NodeBootStrapFailed`/`NodeNotReady` 是 **BKENode.NodeState 值**，由 BKEMachine 控制器设置，**不是 BKEMachine 自身的状态**。BKEMachine 自身仅有 `Ready`/`Bootstrapped`/`BootstrapSucceededCondition`。
+> **关键**：上表中 `NodeBootStrapping`/`NodeBootStrapFailed`/`NodeNotReady` 是 **BKENode.NodeState 值**，由 BKEMachine 控制器设置，**不是 BKEMachine 自身的状态**。BKEMachine 自身仅有 `Ready`/`Bootstrapped`/`BootstrapSucceededCondition`。这也是 5.2 节拆分为 BKENode 与 BKEMachine 独立子节的原因——旧文档把 BKEMachine 控制器设置到 BKENode 上的状态误标为"BKEMachine 引导状态"，混淆了两个资源的状态归属。
 
 #### 5.3.4 BKEMachine → BKECluster 聚合
 
@@ -2352,6 +2373,171 @@ Reconcile 循环中自动修复：
 | **高** | Phase 执行结果 | Phase post-hook 设置的状态 |
 | **中** | StatusManager 聚合 | 基于失败计数的状态升级 |
 | **低** | 用户手动设置 | 可能被 Reconcile 覆盖 |
+
+### 10.5 Command 状态与 Node 状态的关系与设计思路
+
+#### 10.5.1 核心关系：执行单元 ↔ 聚合结果
+
+Command 是**执行单元**（做什么操作），BKENode.State + StateCode 是**聚合结果**（节点当前处于什么状态）。两者之间**没有自动映射**，不存在 `CommandPhase → NodeState` 的查找表，关系是间接的、事件驱动的：
+
+```
+Command.Status[nodeKey].Phase = CommandComplete / CommandFailed
+       │  (BKEMachine 控制器通过 Watch 被唤醒)
+       ▼
+reconcileCommand → processBootstrapSuccess / processBootstrapFailure
+       │  (调用 NodeFetcher.SetNodeState / MarkNodeStateFlag)
+       ▼
+BKENode.Status.State / StateCode 更新
+```
+
+> **关键**：`CommandReconciler`（`controllers/bkeagent/command_controller.go`）本身**不触碰 BKENode 状态**——它仅在目标节点上执行命令并写回 `Command.Status`。翻译为 BKENode 状态的工作由 BKEMachine 控制器（`reconcileCommand`，`bkemachine_controller_phases.go:480-618`）和 Phase 框架完成。
+
+#### 10.5.2 三种执行模式
+
+Command 与 Node 状态的交互存在三种不同的执行模式，按操作特性选择：
+
+| 模式 | Command 归属 | 等待方式 | 示例 | Node 状态驱动者 |
+|------|-------------|---------|------|----------------|
+| **A. 异步代理驱动** | BKEMachine | 创建后返回，Watch 等 Agent 回写 | `bootstrap-` / `reset-node-` | BKEMachine 控制器（`reconcileCommand` 翻译结果） |
+| **B. 同步控制器驱动** | BKECluster | `Wait()` 轮询直到完成 | `k8s-env-init` / `preprocess-all-nodes` | Phase 直接读取结果设置 Node 状态 |
+| **C. 无 Command** | — | 直接 SSH 或 Cluster API 操作 | Agent 推送 / Master/Worker Join / Delete | Phase 直接设置 Node 状态 |
+
+**模式 A 数据流**（异步，bootstrap 为例）：
+
+```
+BKEMachine 控制器创建 Bootstrap Command → 返回
+       │
+       ▼ (bkeagent 拉取并执行)
+Command.Status[nodeKey].Phase = Running → Completed/Failed
+       │ (CommandUpdateCompleted predicate 触发 BKEMachine 重新入队)
+       ▼
+reconcileCommand → processBootstrapSuccess / processBootstrapFailure
+       │
+       ▼
+NodeFetcher.SetNodeState(NodeNotReady / NodeBootStrapFailed)
+NodeFetcher.MarkNodeStateFlag(NodeBootFlag)
+```
+
+**模式 B 数据流**（同步，env 为例）：
+
+```
+EnsureNodesEnv Phase 创建 ENV Command → 调用 Wait() 阻塞等待
+       │
+       ▼ (bkeagent 执行，Phase 轮询 CheckCommandStatus)
+Wait() 返回 (successNodes, failedNodes)
+       │
+       ▼
+Phase 直接设置: 成功 → NodeEnvFlag; 失败 → NodeInitFailed
+```
+
+#### 10.5.3 双向数据流：StateCode 既是输入也是输出
+
+StateCode 位标记在 Command 生命周期中扮演**双重角色**：
+
+**作为输入（门控 Command 创建）**——Phase 的 `NeedExecute()` 检查 StateCode 标记，决定是否需要执行：
+
+| Phase | 检查的 StateCode 标记 | 判断逻辑 | 代码位置 |
+|-------|---------------------|---------|---------|
+| `EnsureBKEAgent` | `NodeAgentPushedFlag` (bit 0) | 未设置才推送 Agent | `ensure_bke_agent.go:110` |
+| `EnsureNodesEnv` | `NodeEnvFlag` (bit 2) | 未设置才初始化环境 | `ensure_nodes_env.go:94` |
+| `EnsureMasterJoin` / `EnsureWorkerJoin` | `!NodeBootFlag && !MasterInitFlag` | 未引导才加入 | `phaseutil/util.go:330-348` |
+| `EnsureNodesPostProcess` | `NodeBootFlag && !NodePostProcessFlag` | 已引导但未后处理 | `phaseutil/util.go:304-324` |
+| `BKEMachine.reconcileNormal` | `NodeFailedFlag` (bit 7) | 已设置则跳过该节点 | `bkemachine_controller.go:238-244` |
+
+**作为输出（Command 结果写回）**——Command 执行完成后，控制器/Phase 将结果写入 StateCode：
+
+| Command 类型 | 成功时设置的标记 | 失败时设置的 Node.State | 设置位置 |
+|-------------|----------------|----------------------|---------|
+| Bootstrap Command | `NodeBootFlag` (bit 3) + `MasterInitFlag` (bit 5) | `NodeBootStrapFailed` | `bkemachine_controller_phases.go:1299,242` |
+| ENV Command | `NodeEnvFlag` (bit 2) | `NodeInitFailed` | `ensure_nodes_env.go:268,296` |
+| Agent 推送（无 Command） | `NodeAgentPushedFlag` (bit 0) + `NodeAgentReadyFlag` (bit 1) | `NodeInitFailed` | `ensure_bke_agent.go:295,624-625` |
+| Reset Command | （BKENode 被删除，无标记） | `NodeDeleting`（执行前设置） | `bkemachine_controller_phases.go:841` |
+
+**循环设计**：
+
+```
+StateCode 门控 → Command 创建/执行 → 结果写回 StateCode → 下一个 Phase 检查 StateCode 门控
+```
+
+此循环实现了**幂等性**（已完成的操作不重复执行）和**断点续装**（控制器重启后从 StateCode 恢复进度）。
+
+#### 10.5.4 StatusManager：Node 状态的重试缓冲层
+
+StatusManager **不读取 Command 结果**，它消费的是已被控制器设置好的 `BKENode.Status.State`，在 Node 状态层面提供容错：
+
+```
+Command 失败
+  → BKEMachine 控制器设置 BKENode.State = "BootStrapFailed"
+  → StatusManager.recordSingleNodeState 检测到 "Failed" 后缀
+  │
+  ├─ 重试次数内 (默认 10 次):
+  │   将 State 恢复为 LatestNormalState + NeedRequeue (状态伪装)
+  │   集群表现正常，控制器自动重试
+  │
+  └─ 超过重试次数:
+      保持 Failed 状态 + 设置 NodeFailedFlag (bit 7)
+      后续所有调谐跳过该节点，需人工清除标志位
+```
+
+> **设计意图**：Command 是一次性的执行单元（失败后由 StatusManager 触发重试），Node 状态是持久的聚合结果（带重试缓冲）。StatusManager 在 Node 状态层面而非 Command 层面提供容错，因为 Node 状态持久化在 CRD 中，可跨控制器重启存活。
+
+#### 10.5.5 Command.Status 与 BKENode 的关联机制
+
+两者通过**节点 IP** 关联，无直接字段引用：
+
+```
+Command.Status map key = "NodeName/NodeIP" 或 "NodeName"  (command_controller.go:591-596)
+BKENode.Spec.IP = "10.0.0.1"
+```
+
+| Command 类型 | Status 条目数 | BKENode 关联 | 关联方式 |
+|-------------|--------------|-------------|---------|
+| 单节点 Command（bootstrap/reset） | 1 | 1:1 | `NodeSelector` 含单个 IP 标签 |
+| 多节点 Command（env/preprocess） | N | 1:N | `NodeSelector` 含 N 个 IP 标签 |
+
+`CheckCommandStatus`（`command.go:477-518`）返回 `(successNodes, failedNodes)` 为 Status map key 列表，通过 `GetNodeIPFromCommandWaitResult`（`phaseutil/command.go:174-181`）解析出 IP，再用 `NodeFetcher.SetNodeStateWithMessageForCluster(ip, ...)` 定位 BKENode。
+
+> **注意**：BKENode.Status 没有反向引用特定 Command 的字段。BKENode 的状态是所有影响过它的 Command 的累积结果，关联仅通过时间和 IP 定位。
+
+#### 10.5.6 设计思路总结
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                     三层分离设计                                    │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  Command 层 (执行单元)                                              │
+│  ├── CommandPhase: Pending → Running → Completed/Failed            │
+│  ├── 一次性资源，执行完可清理 (RemoveAfterWait / TTL)                │
+│  └── 不持久化节点状态，仅记录命令执行结果                             │
+│                                                                     │
+│         ↕  翻译者: BKEMachine 控制器 / Phase 框架                    │
+│                                                                     │
+│  BKENode 层 (聚合状态)                                              │
+│  ├── State: 语义状态 (Ready/Failed/BootStrapping/...)              │
+│  ├── StateCode: 位标记累积 (10 位, 事实来源)                         │
+│  ├── 持久化在 CRD Status 中，跨重启存活                              │
+│  └── StateCode 双向: 门控 Command 创建 ← → Command 结果写回          │
+│                                                                     │
+│         ↕  缓冲层: StatusManager                                    │
+│                                                                     │
+│  StatusManager 层 (重试/升级)                                       │
+│  ├── 不读 Command，只读 BKENode.State                               │
+│  ├── 失败重试: 恢复 LatestNormalState + NeedRequeue (状态伪装)       │
+│  └── 超限升级: 保持 Failed + NodeFailedFlag (永久跳过)               │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**核心设计决策**：
+
+1. **Command 与 Node 状态解耦**——Command 不直接设 Node 状态，由控制器翻译，避免执行层与状态层耦合。CommandReconciler 只管执行命令和写回 Command.Status，BKEMachine 控制器/Phase 框架负责翻译结果为 Node 状态。
+
+2. **StateCode 作为门控+累积双重机制**——既防止重复执行（幂等性：`NeedExecute` 检查标记跳过已完成操作），又记录执行进度（可断点续装：控制器重启后从 StateCode 恢复进度）。
+
+3. **StatusManager 在 Node 层而非 Command 层重试**——Command 是一次性的（失败后不重试同一 Command），Node 状态是持久的。在持久层重试才能跨控制器重启存活，通过"状态伪装"（恢复 LatestNormalState）触发 Phase 重新执行。
+
+4. **三种执行模式并存**——异步（bootstrap，适合长时间操作）、同步（env，适合需要立即获取结果的操作）、无 Command（SSH/Cluster API，适合轻量或非命令式操作），按操作特性选择。
 
 ---
 
