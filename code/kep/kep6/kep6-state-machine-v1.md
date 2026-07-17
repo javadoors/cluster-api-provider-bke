@@ -744,6 +744,10 @@ BKEMachine 状态（布尔元组 + 单 Condition, 无 Phase 字段）：
 
 #### 5.3.3 BKEMachine → BKENode 副作用
 
+**为什么称为"副作用"**：
+
+BKEMachine 和 BKENode 是两个**独立的 CRD 资源**，没有 OwnerReference 关联，仅通过 `WorkerNodeHost`/`MasterNodeHost` 标签按 IP 匹配。按职责划分，BKEMachine 控制器应该只管 BKEMachine 自己的状态（`Ready`/`Bootstrapped`/`BootstrapSucceededCondition`）。但实际上，BKEMachine 控制器在引导流程中通过 `NodeFetcher.SetNodeStateWithMessageForCluster` 和 `MarkNodeStateFlagForCluster` **跨资源直接改写了 BKENode 的 `State` 和 `StateCode`**——这不是 BKEMachine 自身的状态变更，而是对另一个资源的"副作用"操作。
+
 BKEMachine 控制器在引导过程中**直接修改 BKENode 的 State 和 StateCode**（通过 `NodeFetcher` 按 IP 匹配）：
 
 | BKEMachine 阶段 | BKENode.State | BKENode.StateCode | 设置位置 |
@@ -754,7 +758,7 @@ BKEMachine 控制器在引导过程中**直接修改 BKENode 的 State 和 State
 | Bootstrap 成功 | `NodeNotReady` | `NodeBootFlag` (bit 3) | `phases.go:1299-1302` |
 | 节点删除 | `NodeDeleting` | — | `controller.go:307` |
 
-> **关键**：上表中 `NodeBootStrapping`/`NodeBootStrapFailed`/`NodeNotReady` 是 **BKENode.NodeState 值**，由 BKEMachine 控制器设置，**不是 BKEMachine 自身的状态**。BKEMachine 自身仅有 `Ready`/`Bootstrapped`/`BootstrapSucceededCondition`。
+> **关键**：上表中 `NodeBootStrapping`/`NodeBootStrapFailed`/`NodeNotReady` 是 **BKENode.NodeState 值**，由 BKEMachine 控制器设置，**不是 BKEMachine 自身的状态**。BKEMachine 自身仅有 `Ready`/`Bootstrapped`/`BootstrapSucceededCondition`。这也是 5.2 节拆分为 BKENode 与 BKEMachine 独立子节的原因——旧文档把 BKEMachine 控制器设置到 BKENode 上的状态误标为"BKEMachine 引导状态"，混淆了两个资源的状态归属。
 
 #### 5.3.4 BKEMachine → BKECluster 聚合
 
