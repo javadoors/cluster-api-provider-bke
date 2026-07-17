@@ -22,9 +22,10 @@
 5. [状态转换图](#5-状态转换图)
    - 5.1 集群状态机
    - 5.2 节点状态机
-   - 5.3 节点 StateCode 生命周期
-   - 5.4 命令状态机
-   - 5.5 声明式升级状态机
+   - 5.3 BKEMachine 状态机
+   - 5.4 节点 StateCode 生命周期
+   - 5.5 命令状态机
+   - 5.6 声明式升级状态机
 6. [重试与幂等机制](#6-重试与幂等机制)
    - 6.1 Command 级别重试
    - 6.2 BKECluster 级别重试（人工介入）
@@ -87,9 +88,11 @@
 
 ### 3.1 集群层状态
 
-#### 3.1.1 ClusterStatus（18 个值）
+#### 3.1.1 ClusterStatus（20 个值）
 
 **定义位置**: `api/capbke/v1beta1/bkecluster_consts.go:151-183`
+
+**业务说明**：`ClusterStatus` 描述集群**当前操作状态**——集群正在执行什么操作、操作是否成功。由 `phase_flow.go` 的 11 个 `handleCluster*Phase` 函数在 Phase 执行前后设置。
 
 ```go
 const (
@@ -136,9 +139,39 @@ const (
 )
 ```
 
+| 常量 | 值 | 分类 | 业务说明 |
+|------|-----|------|---------|
+| `ClusterReady` | `"Ready"` | 基础 | 集群所有节点就绪、健康检查通过，处于稳定运行态。安装/升级/扩缩容完成后最终目标状态 |
+| `ClusterUnhealthy` | `"Unhealthy"` | 基础 | 集群健康检查失败（`EnsureCluster` 阶段检测到节点不可达或组件异常）。此状态不触发 StatusManager 失败计数，集群持续重试调谐 |
+| `ClusterUnknown` | `"Unknown"` | 基础 | 集群状态无法判定。当 Phase 不属于任何已知 `ClusterXxxPhaseNames` 集合时由 default 分支设置，通常是未纳入状态映射的 Phase 执行后 |
+| `ClusterChecking` | `"Checking"` | 基础 | `EnsureCluster` 阶段前置 Hook 专门设置的中间状态，表示正在进行集群健康检查，检查完成后转为 `Ready` 或 `Unhealthy` |
+| `ClusterPaused` | `"Paused"` | 暂停 | `EnsurePaused` 阶段成功执行后设置。集群暂停调谐，不执行任何 Phase，用于维护窗口。StatusManager 不记录此状态 |
+| `ClusterPauseFailed` | `"PauseFailed"` | 暂停 | `EnsurePaused` 阶段执行失败。触发 StatusManager 失败计数，重试次数内恢复为 `Paused`，超限后设为 `ClusterHealthState.DeployFailed` 等 |
+| `ClusterDryRun` | `"DryRun"` | DryRun | `EnsureDryRun` 阶段成功执行后设置。DryRun 模式下仅验证配置不实际部署 |
+| `ClusterDryRunFailed` | `"DryRunFailed"` | DryRun | `EnsureDryRun` 阶段执行失败，配置验证未通过 |
+| `ClusterInitializing` | `"Initializing"` | 初始化 | `ClusterInitPhaseNames`（8 个 Phase）执行中设置。涵盖 Finalizer/Certs/ClusterAPIObj/MasterInit/BKEAgent/NodesEnv/LoadBalance/AgentSwitch 阶段，表示集群首次安装进行中 |
+| `ClusterInitializationFailed` | `"InitializationFailed"` | 初始化 | `ClusterInitPhaseNames` 中任意 Phase 执行失败。触发 StatusManager 失败计数与状态伪装机制 |
+| `ClusterUpgrading` | `"Upgrading"` | 升级 | `ClusterUpgradePhaseNames`（5 个旧路径）或 `DeclarativeClusterUpgradePhaseNames`（6 个 DAG 路径）中的 Phase 执行中设置。表示集群升级进行中 |
+| `ClusterUpgradeFailed` | `"UpgradeFailed"` | 升级 | 升级 Phase 执行失败。触发 StatusManager 失败计数，超限后设为 `ClusterHealthState.UpgradeFailed` |
+| `ClusterMasterScalingUp` | `"ScalingMasterNodesUp"` | 扩缩容 | `EnsureMasterJoin` Phase 执行中设置，表示正在向集群添加 Master 节点 |
+| `ClusterMasterScalingDown` | `"ScalingMasterNodesDown"` | 扩缩容 | `EnsureMasterDelete` Phase 执行中设置，表示正在从集群移除 Master 节点 |
+| `ClusterWorkerScalingUp` | `"ScalingWorkerNodesUp"` | 扩缩容 | `EnsureWorkerJoin` Phase 执行中设置，表示正在向集群添加 Worker 节点 |
+| `ClusterWorkerScalingDown` | `"ScalingWorkerNodesDown"` | 扩缩容 | `EnsureWorkerDelete` Phase 执行中设置，表示正在从集群移除 Worker 节点 |
+| `ClusterScaleFailed` | `"ScaleFailed"` | 扩缩容 | 4 种扩缩容 Phase 中任意一种失败时**共用**此状态。与进行中状态不同（4 种各自独立），失败状态统一为一个 |
+| `ClusterDeployingAddon` | `"DeployingAddon"` | Addon | `EnsureAddonDeploy` Phase 执行中设置，表示正在部署集群组件（coredns/metrics-server 等） |
+| `ClusterDeployAddonFailed` | `"DeployAddonFailed"` | Addon | `EnsureAddonDeploy` Phase 执行失败 |
+| `ClusterManaging` | `"Managing"` | 纳管 | `EnsureClusterManage` Phase 执行中设置，表示正在纳管已有集群（将外部集群纳入 BKE 管理） |
+| `ClusterManageFailed` | `"ManageFailed"` | 纳管 | `EnsureClusterManage` Phase 执行失败 |
+| `ClusterDeleting` | `"Deleting"` | 删除 | `EnsureDeleteOrReset` Phase 执行中设置，表示集群正在被删除 |
+| `ClusterDeleteFailed` | `"DeleteFailed"` | 删除 | `EnsureDeleteOrReset` Phase 执行失败，集群删除未完成 |
+
 #### 3.1.2 ClusterHealthState（9 个值）
 
 **定义位置**: `api/capbke/v1beta1/bkecluster_consts.go:221-231`
+
+**业务说明**：`ClusterHealthState` 描述集群**操作维度健康状态**——集群处于哪个操作生命周期阶段以及该阶段是否失败。由 `setClusterHealthStatus`（`bkecluster_controller.go:757`）在 Reconcile 入口根据操作类型设置，由 `ensure_cluster.go` 健康检查设置 `Healthy`/`Unhealthy`，由 `StatusManager` 在重试超限时设置 `*Failed` 状态。
+
+> **注意**：此字段名为"HealthState"但实际混入了操作状态（Deploying/Upgrading/Managing/Deleting），真正的健康状态仅 `Healthy`/`Unhealthy`。详见 `code/exception/状态机重构.md` 1.7.2 节分析。
 
 ```go
 const (
@@ -154,9 +187,23 @@ const (
 )
 ```
 
+| 常量 | 值 | 分类 | 业务说明 |
+|------|-----|------|---------|
+| `Deploying` | `"Deploying"` | 操作中 | 首次部署进行中。`setClusterHealthStatus` 在 `DeployFlag==true` 或 `DeployFailedFlag==true` 时设置 |
+| `DeployFailed` | `"DeployFailed"` | 操作失败 | 部署失败且重试次数超限。`StatusManager` 在 `CurrentClusterState==Deploying` 且 `!AllowFailed()` 时设置。缺失 `ScalingFailed`/`DeleteFailed`/`DryRunFailed` 等，这些失败无法通过本字段表达 |
+| `Upgrading` | `"Upgrading"` | 操作中 | 升级进行中。`setClusterHealthStatus` 在 `UpgradeFlag==true` 或 `UpgradeFailedFlag==true` 时设置 |
+| `UpgradeFailed` | `"UpgradeFailed"` | 操作失败 | 升级失败且重试次数超限。`StatusManager` 在 `CurrentClusterState==Upgrading` 且 `!AllowFailed()` 时设置 |
+| `Managing` | `"Managing"` | 操作中 | 纳管进行中。`setClusterHealthStatus` 在 `ManageFlag==true` 时设置 |
+| `ManageFailed` | `"ManageFailed"` | 操作失败 | 纳管失败且重试次数超限。`StatusManager` 在 `CurrentClusterState==Managing` 且 `!AllowFailed()` 时设置 |
+| `Unhealthy` | `"Unhealthy"` | 健康 | 集群健康检查失败（`ensure_cluster.go:373`）。此状态不触发 StatusManager 失败计数，集群持续重试调谐 |
+| `Healthy` | `"Healthy"` | 健康 | 集群健康检查通过（`ensure_cluster.go:399`），所有节点就绪、组件正常。此为集群稳定运行的健康标记 |
+| `Deleting` | `"Deleting"` | 操作中 | 集群删除进行中。`setClusterHealthStatus` 在 `IsDeleteOrReset(bkeCluster)` 为 true 时设置。注意：无 `DeleteFailed` 对应值 |
+
 #### 3.1.3 BKEClusterPhaseStatus（6 个值）
 
 **定义位置**: `api/capbke/v1beta1/bkecluster_consts.go:185-192`
+
+**业务说明**：`BKEClusterPhaseStatus` 描述单个 Phase 的**执行结果状态**。由 PhaseFlow 的 `DefaultPreHook`/`DefaultPostHook` 在 Phase 执行前后设置，记录到 `BKECluster.Status.PhaseStatus` 中。
 
 ```go
 const (
@@ -169,9 +216,20 @@ const (
 )
 ```
 
-#### 3.1.4 ClusterConditionType（19 个值）
+| 常量 | 值 | 业务说明 |
+|------|-----|---------|
+| `PhaseSucceeded` | `"Succeeded"` | Phase 执行成功（`Execute()` 返回 nil）。后置 Hook 设置此状态并记录 EndTime |
+| `PhaseFailed` | `"Failed"` | Phase 执行失败（`Execute()` 返回 error）。后置 Hook 设置此状态，记录 EndTime 和错误信息 |
+| `PhaseUnknown` | `"Unknown"` | Phase 执行结果未知，通常是执行过程中控制器异常退出或超时，无法判定成功/失败 |
+| `PhaseWaiting` | `"Waiting"` | Phase 尚未开始执行，在前序 Phase 链中排队等待。初始状态 |
+| `PhaseRunning` | `"Running"` | Phase 正在执行中。前置 Hook (`ExecutePreHook`) 设置此状态并记录 StartTime |
+| `PhaseSkipped` | `"Skipped"` | Phase 的 `NeedExecute()` 返回 false，无需执行直接跳过。不消耗执行时间 |
+
+#### 3.1.4 ClusterConditionType（21 个值）
 
 **定义位置**: `api/capbke/v1beta1/bkecluster_consts.go:108-134`
+
+**业务说明**：`ClusterConditionType` 定义集群级**细粒度条件类型**。每个条件记录某个特定方面的就绪/失败状态（True/False/Unknown），由对应 Phase 在执行后通过 `condition.ConditionMark()` 设置。
 
 ```go
 const (
@@ -201,11 +259,37 @@ const (
 )
 ```
 
+| 常量 | 值 | 分类 | 业务说明 |
+|------|-----|------|---------|
+| `ControlPlaneEndPointSetCondition` | `"ControlPlaneEndPointSet"` | 安装 | 控制面访问入口（负载均衡/API Server 地址）已配置完成。由 `EnsureLoadBalance` 阶段设置 |
+| `TargetClusterReadyCondition` | `"TargetClusterReady"` | 安装 | 目标集群（被管理的 K8s 集群）就绪，API Server 可达且节点已注册 |
+| `TargetClusterBootCondition` | `"TargetClusterBoot"` | 安装 | 目标集群引导完成。由 `reconcileBKEMachine` 聚合所有 BKEMachine.Bootstrapped 后设置（`phases.go:861`） |
+| `ClusterAddonCondition` | `"Addon"` | 安装 | 集群 Addon 部署完成。由 `EnsureAddonDeploy` 阶段设置 |
+| `NodesInfoCondition` | `"NodesInfo"` | 安装 | 节点信息已收集并同步到 BKECluster.Status |
+| `BKEAgentCondition` | `"BKEAgent"` | 安装 | BKEAgent 已推送到所有节点且健康检查通过。由 `EnsureBKEAgent` 阶段设置 |
+| `LoadBalancerCondition` | `"LoadBalancer"` | 安装 | 负载均衡器配置完成，控制面入口可用。由 `EnsureLoadBalance` 阶段设置 |
+| `NodesEnvCondition` | `"NodesEnv"` | 安装 | 所有节点环境初始化完成（容器运行时、内核参数等）。由 `EnsureNodesEnv` 阶段设置 |
+| `ClusterAPIObjCondition` | `"ClusterAPIObj"` | 安装 | Cluster API 对象（Machine/MachineDeployment/KubeadmControlPlane）已创建。由 `EnsureClusterAPIObj` 阶段设置 |
+| `SwitchBKEAgentCondition` | `"SwitchBKEAgent"` | 安装 | Agent 监听切换完成，从安装模式切换到运行模式。由 `EnsureAgentSwitch` 阶段设置 |
+| `ControlPlaneInitializedCondition` | `"ControlPlaneInitialized"` | 安装 | 控制面已初始化（首个 Master 的 `kubeadm init` 完成）。Worker 节点 bootstrap 前会检查此条件 |
+| `BKEConfigCondition` | `"BKEConfig"` | 配置 | BKECluster 配置已同步到目标集群（ConfigMap/Secret 等） |
+| `ClusterHealthyStateCondition` | `"ClusterHealthyState"` | 健康 | 集群健康状态条件。由 `markBKEClusterHealthyStatus`（`controller.go:805`）在设置 ClusterHealthState 时同步标记 |
+| `NodesPostProcessCondition` | `"NodesPostProcess"` | 安装 | 节点后置脚本处理完成。由 `EnsureNodesPostProcess` 阶段设置 |
+| `BootstrapSucceededCondition` | `"BootstrapSucceeded"` | 引导 | **BKEMachine 专用**：节点引导成功。这是 BKEMachine 上唯一的 Condition，三态：True（成功）/ False+WaitingForControlPlaneAvailableReason（Worker 等待 CP）/ False+NodeBootStrapFailedReason（引导失败） |
+| `BocloudClusterDataBackupCondition` | `"BocloudClusterDataBackup"` | 纳管 | **Bocloud 集群专用**：纳管前数据备份完成 |
+| `BocloudClusterMasterCertDistributionCondition` | `"BocloudClusterMasterCertDistribution"` | 纳管 | **Bocloud 集群专用**：Master 节点证书分发完成 |
+| `BocloudClusterWorkerCertDistributionCondition` | `"BocloudClusterWorkerCertDistribution"` | 纳管 | **Bocloud 集群专用**：Worker 节点证书分发完成 |
+| `BocloudClusterEnvInitCondition` | `"BocloudClusterEnvInit"` | 纳管 | **Bocloud 集群专用**：纳管集群环境初始化完成 |
+| `TypeOfManagementClusterGuessCondition` | `"TypeOfManagementClusterGuess"` | 纳管 | 管理集群类型推断完成（推断目标集群由哪种管理平台管理） |
+| `InternalSpecChangeCondition` | `"InternalSpecChange"` | 内部 | 内部 Spec 变更标记，用于触发特定调谐逻辑。非用户可见条件 |
+
 ### 3.2 节点层状态
 
 #### 3.2.1 NodeState（BKENode，7 个值）
 
 **定义位置**: `api/bkecommon/v1beta1/bkenode_types.go:34-43`
+
+**业务说明**：`NodeState` 是 BKENode 的**对外语义状态**，从 `StateCode` 位标记推导而来。由 `NodeFetcher.SetNodeState()` 和各 Phase 直接设置。
 
 ```go
 const (
@@ -219,9 +303,25 @@ const (
 )
 ```
 
-#### 3.2.2 NodeState（BKEMachine/Bootstrap，16 个值）
+| 常量 | 值 | 业务说明 | StateCode 推导条件 |
+|------|-----|---------|-------------------|
+| `NodePending` | `"Pending"` | 节点初始状态，尚未开始任何操作。新加入集群的节点默认此状态 | `StateCode == 0` |
+| `NodeProvisioned` | `"Provisioned"` | 节点已部分配置（Agent 推送/环境初始化等），但尚未完成 bootstrap。处于安装中间态 | `StateCode > 0 && StateCode != 527 && !Failed && !Deleting` |
+| `NodeBootStrapping` | `"BootStrapping"` | 节点正在执行 bootstrap 命令（`kubeadm init/join`）。由 BKEMachine 控制器设置 | BKEMachine 控制器设置，非 StateCode 推导 |
+| `NodeReady` | `"Ready"` | 节点完全就绪：Agent 推送+就绪、环境配置、bootstrap、MasterInit、后处理全部完成。集群 Ready 的前置条件 | `StateCode & 527 == 527`（bits 0,1,2,3,5,9） |
+| `NodeNotReady` | `"NotReady"` | 节点 bootstrap 成功但尚未完全配置（缺少部分 StateCode 位标记），或运行中检测到不可达。BKEMachine 引导成功后设置此状态 | 部分位标记置位但未达 527 |
+| `NodeFailed` | `"Failed"` | 节点操作失败且重试超限。`StatusManager` 设置 `NodeFailedFlag`（bit 7），后续所有调谐跳过此节点，需人工清除标志位才能恢复 | `StateCode & NodeFailedFlag != 0` |
+| `NodeDeleting` | `"Deleting"` | 节点正在被删除。由 `BKEMachineController` 在删除流程中设置，后续 Phase 跳过此节点 | `SetNodeState(NodeDeleting)` 设置，非 StateCode 推导 |
+| `NodeUpgrading` | `"Upgrading"` | 节点正在升级（容器运行时/etcd/k8s 组件等）。升级 Phase 执行中设置 | 升级 Phase 设置，非 StateCode 推导 |
+| `NodeManaging` | `"Managing"` | 节点正在被纳管（将已有节点纳入 BKE 管理）。纳管 Phase 执行中设置 | 纳管 Phase 设置 |
+
+> **注意**：`NodeState` 共 14 个值（含 BKEMachine/Bootstrap 侧定义的 `NodeUnknown`/`NodeInitFailed`/`NodeBootStrapFailed` 等），但 BKENode 实际使用 9 个值，其余由 BKEMachine 控制器设置到 BKENode 上。
+
+#### 3.2.2 NodeState（BKEMachine/Bootstrap，14 个值）
 
 **定义位置**: `api/capbke/v1beta1/bkecluster_consts.go:196-219`
+
+**业务说明**：这些 `NodeState` 值定义在 `capbke/v1beta1` 包中，主要由 **BKEMachine 控制器**在引导流程中设置到 BKENode 上（通过 `NodeFetcher.SetNodeStateWithMessageForCluster`）。与 3.2.1 中的值有部分重叠（`NodeReady`/`NodeNotReady`/`NodeDeleting`/`NodeUpgrading` 值相同），但额外包含引导和升级阶段的细化状态。
 
 ```go
 const (
@@ -243,9 +343,31 @@ const (
 )
 ```
 
+| 常量 | 值 | 分类 | 业务说明 | 设置位置 |
+|------|-----|------|---------|---------|
+| `NodeUnknown` | `"Unknown"` | 初始 | 节点状态未知，通常为新建节点尚未开始任何操作 | 初始默认值 |
+| `NodeInitializing` | `"Initializing"` | 安装 | 节点正在初始化（Agent 推送/环境配置阶段）。由 `EnsureLoadBalance` 等阶段设置 | `ensure_load_balance.go:207` |
+| `NodeInitFailed` | `"InitFailed"` | 安装 | 节点初始化失败（如负载均衡配置失败） | `ensure_load_balance.go:203` |
+| `NodeBootStrapping` | `"BootStrapping"` | 引导 | 节点正在执行 bootstrap 命令（`kubeadm init/join`）。由 BKEMachine 控制器在创建 Bootstrap Command 后设置 | `bkemachine_controller_phases.go:247` |
+| `NodeBootStrapFailed` | `"BootStrapFailed"` | 引导 | 节点 bootstrap 命令执行失败。由 BKEMachine 控制器在 Command 失败后设置，移除标签允许重新绑定 | `bkemachine_controller_phases.go:687,775` |
+| `NodeDeleting` | `"Deleting"` | 删除 | 节点正在被删除。由 BKEMachine 控制器在删除流程中设置 | `bkemachine_controller.go:307` |
+| `NodeDeleteFailed` | `"DeleteFailed"` | 删除 | 节点删除失败（Reset Command 执行失败或超时） | 删除 Phase 失败路径 |
+| `NodeUpgrading` | `"Upgrading"` | 升级 | 节点正在升级（containerd/etcd/k8s 组件）。由升级 Phase 设置 | 升级 Phase |
+| `NodeUpgradeFailed` | `"UpgradeFailed"` | 升级 | 节点升级失败。触发 StatusManager 节点级失败计数 | 升级 Phase 失败路径 |
+| `NodeReady` | `"Ready"` | 就绪 | 节点完全就绪（StateCode == 527）。所有必要 Phase 已完成 | StateCode 推导 |
+| `NodeNotReady` | `"NotReady"` | 就绪 | 节点 bootstrap 成功但未完全配置，或运行中检测到不可达。BKEMachine 引导成功后设置此状态 | `bkemachine_controller_phases.go:1302` |
+| `NodeManaging` | `"Managing"` | 纳管 | 节点正在被纳管 | 纳管 Phase |
+| `NodeManageFailed` | `"ManageFailed"` | 纳管 | 节点纳管失败 | 纳管 Phase 失败路径 |
+| `EtcdUpgrading` | `"Upgrading"` | 升级 | Etcd 正在升级（值与 `NodeUpgrading` 相同，语义上区分 etcd 组件升级） | `EnsureEtcdUpgrade` Phase |
+| `EtcdUpgradeFailed` | `"UpgradeFailed"` | 升级 | Etcd 升级失败（值与 `NodeUpgradeFailed` 相同） | `EnsureEtcdUpgrade` Phase 失败 |
+
+> **注意**：`EtcdUpgrading`/`EtcdUpgradeFailed` 的字符串值与 `NodeUpgrading`/`NodeUpgradeFailed` 完全相同，无法通过值区分——代码中通过上下文（哪个 Phase 设置）来区分语义。
+
 #### 3.2.3 StateCode（位标记，10 位）
 
 **定义位置**: `api/capbke/v1beta1/bkecluster_consts.go:233-246`
+
+**业务说明**：`StateCode` 是 BKENode 的**事实来源**（source of truth），每个 Phase 执行成功后通过 `MarkNodeStateFlag` 设置对应的位标记。`NodeState` 从 `StateCode` 推导：`StateCode == 527` → `NodeReady`。详见 11.2.2 节的 Phase 对应关系。
 
 ```go
 const (
@@ -262,16 +384,33 @@ const (
 )
 ```
 
+| Bit | 常量 | 值 | 业务说明 | 设置 Phase / 机制 |
+|-----|------|-----|---------|-------------------|
+| 0 | `NodeAgentPushedFlag` | 1 | BKEAgent 已推送到节点（二进制/配置已传输），但尚未确认就绪 | `EnsureBKEAgent` / `EnsureClusterManage` |
+| 1 | `NodeAgentReadyFlag` | 2 | BKEAgent 健康检查通过，Agent 可接收并执行命令。与 bit 0 同时设置 | `EnsureBKEAgent` / `EnsureClusterManage` |
+| 2 | `NodeEnvFlag` | 4 | 节点环境初始化完成（容器运行时安装、内核参数配置、系统依赖准备等） | `EnsureNodesEnv` / `EnsureClusterManage` |
+| 3 | `NodeBootFlag` | 8 | 节点 bootstrap 成功（`kubeadm init/join` 执行完成，目标集群 Node 可达验证通过） | `BKEMachineController`（bootstrap 成功）/ `EnsureMasterJoin` / `EnsureWorkerJoin` |
+| 4 | `NodeHAFlag` | 16 | 负载均衡器已配置，节点加入 HA 集群入口。**不参与 Ready 判定**（HA 为可选配置） | `EnsureLoadBalance` |
+| 5 | `MasterInitFlag` | 32 | 首个 Master 节点 `kubeadm init` 完成（仅 Master 节点设置，Worker 不设置） | `BKEMachineController`（`phase == InitControlPlane`） |
+| 6 | `NodeDeletingFlag` | 64 | 节点标记为删除中。⚠️ **代码中仅检查从未设置**——`SetNodeState(NodeDeleting)` 不设置此 flag，是实现缺口 | **无**（仅被 `ensure_nodes_env.go:115` 和 `phaseutil/util.go:1153` 读取） |
+| 7 | `NodeFailedFlag` | 128 | 节点操作失败且重试超限。设置后后续所有调谐跳过此节点，需人工清除标志位才能恢复 | `StatusManager`（`statusmanager.go:346`，非 Phase） |
+| 8 | `NodeStateNeedRecord` | 256 | 持久化触发器：内存中修改节点状态后自动设置此标记，批量持久化后清除。非业务状态，纯实现机制 | `SetNodeState` / `SetNodeStateWithMessage`（自动设置） |
+| 9 | `NodePostProcessFlag` | 512 | 节点后置脚本处理完成（如内核调优、安全加固等后置配置） | `EnsureNodesPostProcess` |
+
 **关键常量**:
 ```go
-bootstrapReadyStateCode = 527  // = 1+2+4+8+32+64+256+128 = bits 0,1,2,3,5,6,7,8
+bootstrapReadyStateCode = 527  // = 1+2+4+8+32+512 = bits 0,1,2,3,5,9
 ```
+
+> **注意**：`527 = NodeAgentPushed(1) + NodeAgentReady(2) + NodeEnv(4) + NodeBoot(8) + MasterInit(32) + NodePostProcess(512)`。当 `StateCode & 527 == 527` 时，节点状态推导为 `NodeReady`。`NodeHAFlag`(bit 4) 不在此掩码中——HA 是可选配置，不影响 Ready 判定。
 
 ### 3.3 命令层状态
 
 #### 3.3.1 CommandPhase（7 个值）
 
 **定义位置**: `api/bkeagent/v1beta1/command_types.go:34-42`
+
+**业务说明**：`CommandPhase` 描述 Command（远程命令执行任务）的**生命周期阶段**。由 `CommandReconciler` 在命令执行过程中设置，支持自动重试（`BackoffLimit`）和超时（`ActiveDeadlineSecond`）。
 
 ```go
 const (
@@ -285,9 +424,23 @@ const (
 )
 ```
 
+| 常量 | 值 | 业务说明 |
+|------|-----|---------|
+| `CommandPending` | `"Pending"` | 命令已创建但尚未开始执行，等待 BKEAgent 拉取。初始状态 |
+| `CommandRunning` | `"Running"` | 命令正在 BKEAgent 上执行中，至少一条子命令已启动 |
+| `CommandComplete` | `"Completed"` | 所有子命令执行成功，命令整体完成。终态 |
+| `CommandSuspend` | `"Suspend"` | 命令被暂停（`Spec.Suspend = true`），暂停期间不执行新子命令，恢复后继续 |
+| `CommandSkip` | `"Skip"` | 子命令被跳过。当 `BackoffIgnore=true` 且子命令失败时，该子命令标记为 Skip 而非 Failed，不影响整体完成 |
+| `CommandFailed` | `"Failed"` | 命令执行失败：有子命令失败且不可跳过，或重试次数耗尽。终态 |
+| `CommandUnKnown` | `"unKnown"` | 命令状态未知，通常为 BKEAgent 不可达或响应超时，无法判定执行结果 |
+
+> **聚合规则**：Command.Phase 由各子命令 Condition.Phase 聚合——任意子命令 Failed → `CommandFailed`；所有子命令 Complete → `CommandComplete`；部分 Running/Pending → `CommandRunning`。详见 10.2.3 节。
+
 #### 3.3.2 CommandType（3 个值）
 
 **定义位置**: `api/bkeagent/v1beta1/command_types.go:23-29`
+
+**业务说明**：`CommandType` 描述 Command 中子命令的**执行类型**，决定 BKEAgent 如何执行该命令。
 
 ```go
 const (
@@ -296,6 +449,12 @@ const (
     CommandKubernetes CommandType = "Kubernetes"
 )
 ```
+
+| 常量 | 值 | 业务说明 |
+|------|-----|---------|
+| `CommandBuiltIn` | `"BuiltIn"` | 内置命令类型，BKEAgent 直接调用内置 Go 函数执行（如文件传输、配置渲染），不依赖外部 shell。性能最高，无需目标节点安装额外工具 |
+| `CommandShell` | `"Shell"` | Shell 命令类型，BKEAgent 通过 `/bin/sh -c` 执行命令字符串。最通用，支持任意 shell 命令、脚本和管道操作 |
+| `CommandKubernetes` | `"Kubernetes"` | Kubernetes 命令类型，BKEAgent 通过 `kubectl`/client-go 执行 K8s 操作（如 `kubectl apply`/`kubectl drain`）。需要在目标节点上安装 kubectl 并配置 kubeconfig |
 
 ---
 
@@ -351,14 +510,28 @@ const (
 ┌─────────────────────────────────────────────────────────────────┐
 │                        BKEMachine                                │
 ├─────────────────────────────────────────────────────────────────┤
+│  Spec:                                                           │
+│    └── ProviderID: *string (Provider ID, 引导完成后设置)          │
 │  Status:                                                         │
 │    ├── Ready: bool (是否就绪)                                    │
 │    ├── Bootstrapped: bool (是否已引导)                           │
 │    ├── Addresses: []MachineAddress (节点地址)                    │
-│    ├── Conditions: clusterv1.Conditions (条件)                   │
-│    └── Node: *confv1beta1.Node (节点配置)                        │
+│    ├── Conditions: clusterv1.Conditions (仅 BootstrapSucceeded)  │
+│    └── Node: *confv1beta1.Node (节点配置快照, 供删除时使用)       │
+│  Labels:                                                         │
+│    ├── WorkerNodeHost / MasterNodeHost: string (节点 IP, 绑定)   │
+│  Annotations:                                                    │
+│    └── BKEMachineProviderIDAnnotationKey: string                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+**BKEMachine 架构特点**：
+
+- **无 Phase 字段**：与 BKECluster（`Phase`/`ClusterStatus`/`ClusterHealthState`）和 BKENode（`State`/`StateCode`）不同，BKEMachine **没有独立的 lifecycle phase 字段**。其状态完全由布尔元组 `(Ready, Bootstrapped)` + 单个 Condition `BootstrapSucceededCondition` 表达。
+- **ProviderID 位于 Spec**：`ProviderID` 在 `BKEMachineSpec`（`bkemachine_types.go:45`）而非 Status，由 `setProviderID`（`bkemachine_controller_phases.go:1372`）在引导完成时设置。Cluster API 核心控制器通过读取 `BKEMachine.Status.Ready` 推断基础设施就绪，再将 ProviderID 拷贝到 `clusterv1.Machine.Spec.ProviderID`。
+- **标签绑定 BKENode**：BKEMachine 通过 `WorkerNodeHost`/`MasterNodeHost` 标签携带节点 IP（`utils/capbke/label/helper.go:31-62`），与 BKENode 通过 IP 匹配关联——两者之间**无 OwnerReference**，无直接字段引用。
+- **Status.Node 为删除快照**：`Status.Node` 存储节点配置快照（IP/hostname/role），注释明确标注"for use during deletion"（`bkemachine_controller_phases.go:385,468`），删除节点时用于定位和清理。
+- **状态不可逆**：`Ready` 和 `Bootstrapped` 一旦设为 `true`（`markBKEMachineBootstrapReady`, phases.go:1292-1293），**永远不会被设回 `false`**。节点删除时 BKEMachine 对象直接被删除，不翻转布尔值。
 
 ### 4.3 命令层（Command）
 
@@ -508,13 +681,133 @@ const (
              │ NotReady │ │ Managing │
              └──────────┘ └──────────┘
 
-BKEMachine 引导状态：
-  Unknown → Initializing → BootStrapping → Ready / BootStrapFailed
-                                            ↓
-                                      Ready (StateCode=527)
+BKEMachine 状态（布尔元组 + 单 Condition, 无 Phase 字段）：
+  (Ready=false, Bootstrapped=false)
+       │
+       │ Worker 等待 ControlPlane 初始化
+       ▼
+  BootstrapSucceededCondition = False (WaitingForControlPlaneAvailableReason)
+       │
+       │ Bootstrap Command 执行中
+       ▼
+  BKENode.State = NodeBootStrapping (BKEMachine 自身状态不变)
+       │
+       ├─ 失败 ──→ BootstrapSucceededCondition = False (NodeBootStrapFailedReason)
+       │           BKENode.State = NodeBootStrapFailed
+       │           移除标签, 允许重新绑定
+       │
+       └─ 成功 ──→ (Ready=true, Bootstrapped=true)
+                   BootstrapSucceededCondition = True
+                   BKENode.StateCode |= NodeBootFlag (bit 3)
+                   BKENode.State = NodeNotReady
 ```
 
-### 5.3 节点 StateCode 生命周期
+### 5.3 BKEMachine 状态机
+
+**设计特点**：BKEMachine **没有 Phase 字段**，与 BKECluster（3 套状态）和 BKENode（State + StateCode 双轨）不同。其状态完全由布尔元组 `(Ready, Bootstrapped)` + 单个 Condition `BootstrapSucceededCondition` 表达。
+
+#### 5.3.1 状态定义
+
+| 状态字段 | 类型 | 定义位置 | 说明 |
+|---------|------|---------|------|
+| `Ready` | `bool` | `bkemachine_types.go:62` | 引导完成且目标集群 Node 可达时设为 true，**不可逆** |
+| `Bootstrapped` | `bool` | `bkemachine_types.go:66` | 引导命令执行成功时设为 true，**不可逆** |
+| `BootstrapSucceededCondition` | `clusterv1.Condition` | `bkecluster_consts.go:124` | 唯一的 Condition，三态（见下表） |
+
+> `Ready` 和 `Bootstrapped` 始终同时设置（`markBKEMachineBootstrapReady`, `bkemachine_controller_phases.go:1292-1293`），不存在 `Bootstrapped=true` 但 `Ready=false` 的中间状态。
+
+#### 5.3.2 BootstrapSucceededCondition 三态
+
+| Condition 状态 | Reason | 设置位置 | 触发场景 |
+|---------------|--------|---------|---------|
+| **True** | — | `phases.go:1294` | Bootstrap 成功 + 目标集群 Node 可达验证通过 |
+| **False** (Info) | `WaitingForControlPlaneAvailableReason` | `phases.go:212-213` | Worker 节点等待 ControlPlane 初始化完成 |
+| **False** (Warning) | `NodeBootStrapFailedReason` | `phases.go:693-695` | Bootstrap Command 执行失败 |
+
+> **读取**：`phases.go:928` 通过 `conditions.GetReason(&bm, BootstrapSucceededCondition) == NodeBootStrapFailedReason` 检测失败节点，驱动集群级聚合。
+
+#### 5.3.3 BKEMachine → BKENode 副作用
+
+BKEMachine 控制器在引导过程中**直接修改 BKENode 的 State 和 StateCode**（通过 `NodeFetcher` 按 IP 匹配）：
+
+| BKEMachine 阶段 | BKENode.State | BKENode.StateCode | 设置位置 |
+|----------------|---------------|-------------------|---------|
+| Bootstrap 开始 | `NodeBootStrapping` | — | `phases.go:247` |
+| InitControlPlane 选中 | — | `MasterInitFlag` (bit 5) | `phases.go:242` |
+| Bootstrap 失败 | `NodeBootStrapFailed` | — | `phases.go:687,775` |
+| Bootstrap 成功 | `NodeNotReady` | `NodeBootFlag` (bit 3) | `phases.go:1299-1302` |
+| 节点删除 | `NodeDeleting` | — | `controller.go:307` |
+
+> **关键**：上表中 `NodeBootStrapping`/`NodeBootStrapFailed`/`NodeNotReady` 是 **BKENode.NodeState 值**，由 BKEMachine 控制器设置，**不是 BKEMachine 自身的状态**。BKEMachine 自身仅有 `Ready`/`Bootstrapped`/`BootstrapSucceededCondition`。
+
+#### 5.3.4 BKEMachine → BKECluster 聚合
+
+`reconcileBKEMachine`（`phases.go:861-892`）聚合所有 BKEMachine 的引导状态，驱动 BKECluster 条件：
+
+```
+所有 BKEMachine.Bootstrapped == true
+  → BKECluster.Status.KubernetesVersion = Spec.ClusterConfig.Cluster.KubernetesVersion
+  → BKECluster TargetClusterBootCondition = True (集群引导完成)
+
+任意 BKEMachine BootstrapSucceededCondition.reason == NodeBootStrapFailedReason
+  → bootstrapNodeFailed = true (阻塞集群就绪)
+```
+
+#### 5.3.5 BKEMachine 删除流程
+
+BKEMachine 删除时**不翻转 `Ready`/`Bootstrapped`**，而是通过注解 + finalizer 机制：
+
+```
+1. 设置 clusterv1.DeleteMachineAnnotation (controller.go:706-714)
+2. 设置 BKENode.State = NodeDeleting (controller.go:307)
+3. 创建 Reset Command, 等待执行完成
+4. 移除 BKEMachineFinalizer (controller.go:319,487,503,528,850)
+5. BKEMachine 对象被 Kubernetes 垃圾回收删除
+   → Ready/Bootstrapped 保持 true, 不翻转
+```
+
+#### 5.3.6 状态转换图
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    BKEMachine 状态转换图                          │
+└─────────────────────────────────────────────────────────────────┘
+
+  初始状态
+  ┌─────────────────────────────────────┐
+  │  Ready = false                      │
+  │  Bootstrapped = false               │
+  │  BootstrapSucceeded = (未设置)       │
+  └──────────────────┬──────────────────┘
+                     │
+         ┌───────────┴───────────┐
+         │                       │
+         ▼ (Worker + CP 未初始化)  ▼ (Master 或 CP 已初始化)
+  ┌──────────────┐        ┌──────────────┐
+  │ Cond = False │        │ 创建 Bootstrap│
+  │ WaitingForCP │        │ Command      │
+  └──────┬───────┘        └──────┬───────┘
+         │                       │
+         │ CP 初始化完成           │
+         └───────→────────────────┤
+                                   │
+                          ┌────────┴────────┐
+                          │                 │
+                     失败  ▼            成功  ▼
+                   ┌──────────────┐  ┌──────────────┐
+                   │ Cond = False │  │ Ready = true │
+                   │ Bootstrap    │  │ Bootstrapped │
+                   │ Failed       │  │  = true      │
+                   │              │  │ Cond = True  │
+                   │ 移除标签      │  └──────────────┘
+                   │ 允许重试      │   (终态, 不可逆)
+                   └──────────────┘
+                          │
+                          │ 重新触发 Reconcile
+                          └──→ 回到创建 Bootstrap Command
+```
+
+### 5.4 节点 StateCode 生命周期
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -562,7 +855,7 @@ StateCode = 527 (bootstrapReadyStateCode)
   人工介入 → 清除 NodeFailedFlag → 重新执行失败阶段
 ```
 
-### 5.4 命令状态机
+### 5.5 命令状态机
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -619,7 +912,7 @@ StateCode = 527 (bootstrapReadyStateCode)
     Phase = CommandSkip
 ```
 
-### 5.5 声明式升级状态机
+### 5.6 声明式升级状态机
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -1067,18 +1360,22 @@ BKECluster:
   Ready → ScalingWorkerNodesDown → Ready
 
 BKENode (被删除节点):
-  StateCode |= NodeDeletingFlag (bit 6)
   State: Ready → Deleting → (removed)
 
-BKEMachine:
-  Ready: true → false
-  Bootstrapped: true → false
+BKEMachine (被删除节点):
+  Ready/Bootstrapped: 保持 true (不翻转, 对象直接删除)
+  设置 clusterv1.DeleteMachineAnnotation
+  创建 Reset Command → 等待完成
+  移除 BKEMachineFinalizer → 对象被垃圾回收
 ```
 
 **关键检查点**:
-- `NodeDeletingFlag` 设置
-- 节点从 Cluster API 中移除
+- `DeleteMachineAnnotation` 设置（`controller.go:706-714`）
+- Reset Command 执行完成
+- `BKEMachineFinalizer` 移除（`controller.go:319,487,503,528,850`）
 - BKENode 资源删除
+
+> **注意**：BKEMachine 的 `Ready`/`Bootstrapped` 一旦设为 `true` 后**永远不会被设回 `false`**（`markBKEMachineBootstrapReady`, `phases.go:1292-1293`）。节点删除通过注解 + finalizer 机制完成，不翻转布尔值。详见 5.3.5 节。
 
 ### 7.4 升级
 
@@ -1255,12 +1552,11 @@ BKECluster:
   ClusterHealthState: Healthy → Deleting
 
 BKENode (所有节点):
-  StateCode |= NodeDeletingFlag
   State: Ready → Deleting → (removed)
 
 BKEMachine (所有节点):
-  Ready: true → false
-  Bootstrapped: true → false
+  Ready/Bootstrapped: 保持 true (不翻转, 对象直接删除)
+  设置 clusterv1.DeleteMachineAnnotation → 移除 Finalizer → 对象删除
 ```
 
 ---
@@ -1316,19 +1612,19 @@ BKECluster ──1:N──> BKENode ──1:1──> BKEMachine
 [BKENode State 状态转换图]
 
 ┌─────────────────────────────────────────────────────────────────┐
-│                节点 StateCode 生命周期（第 5.3 节）               │
+│                节点 StateCode 生命周期（第 5.4 节）               │
 └─────────────────────────────────────────────────────────────────┘
 
 [StateCode 位标记累积图]
 
 ┌─────────────────────────────────────────────────────────────────┐
-│                    命令状态机（第 5.4 节）                        │
+│                    命令状态机（第 5.5 节）                        │
 └─────────────────────────────────────────────────────────────────┘
 
 [CommandPhase 状态转换图]
 
 ┌─────────────────────────────────────────────────────────────────┐
-│                声明式升级状态机（第 5.5 节）                      │
+│                声明式升级状态机（第 5.6 节）                      │
 └─────────────────────────────────────────────────────────────────┘
 
 [DeclarativeUpgrade 状态转换图]
@@ -1402,7 +1698,9 @@ BKECluster ──1:N──> BKENode ──1:1──> BKEMachine
 | **BKENode** | `State` | NodeFetcher + Phase | 节点操作后（删除/引导完成） | `UpdateBKENodeState()` → `client.Status().Update()` | `utils/capbke/nodeutil/fetcher.go` |
 | **BKENode** | `StateCode` | Phase（内存操作）+ NodeFetcher（持久化） | Phase 内位标记操作 → Phase 结束后批量持久化 | 内存：`StateCode \|= flag`；持久化：`UpdateModifiedBKENodes()` | `pkg/mergecluster/bkecluster.go` |
 | **BKENode** | `Message` | NodeFetcher + Phase | 状态变化时 | 与 State 一起更新 | `utils/capbke/nodeutil/fetcher.go` |
-| **BKEMachine** | `Ready` / `Bootstrapped` | BKEMachineController | 引导完成后 | Cluster API 自动更新 | `controllers/capbke/bkemachine_controller_phases.go` |
+| **BKEMachine** | `Ready` / `Bootstrapped` | BKEMachineController | 引导完成后（`markBKEMachineBootstrapReady`） | `markBKEMachineBootstrapReady()` → `patchBKEMachine()` → `client.Status().Update()`；**不可逆**，删除时对象直接删除不翻转 | `controllers/capbke/bkemachine_controller_phases.go:1284-1311` |
+| **BKEMachine** | `BootstrapSucceededCondition` | BKEMachineController | 引导前/失败/成功 | `conditions.MarkFalse()`（WaitingForCP / BootstrapFailed）/ `conditions.MarkTrue()` | `controllers/capbke/bkemachine_controller_phases.go:212,693,1294` |
+| **BKEMachine** | `Spec.ProviderID` | BKEMachineController | 引导完成后 | `setProviderID()` → `client.Update()`（Spec 字段, 非 Status） | `controllers/capbke/bkemachine_controller_phases.go:1372` |
 | **Command** | `Phase` / `Status` | CommandReconciler | 命令执行时 | `executeWithRetry()` → `syncStatusUntilComplete()` | `controllers/bkeagent/command_controller.go` |
 | **Command** | `Conditions[]` | CommandReconciler | 每条子命令执行后 | 直接赋值 → `syncStatusUntilComplete()` | `controllers/bkeagent/command_controller.go` |
 
@@ -2159,10 +2457,66 @@ StateCode (10位) → 内部实现细节（位标记累积）
 - `State` 是从 `StateCode` **推导**出来的：`StateCode == 527` → `State = Ready`
 - `NodeStateNeedRecord`（bit 8）是持久化触发器：内存修改 → 标记 → 批量持久化
 
+##### StateCode 位标记 → Phase 对应关系
+
+> **定义位置**：`api/capbke/v1beta1/bkecluster_consts.go:234-245`
+
+| Bit | 常量 | 值 | 设置位置 | 对应 Phase / 机制 | 设置时机 |
+|-----|------|-----|---------|-------------------|---------|
+| 0 | `NodeAgentPushedFlag` | 1 | `ensure_bke_agent.go:295` | **EnsureBKEAgent** | Agent 推送到节点后 |
+| 0 | `NodeAgentPushedFlag` | 1 | `ensure_cluster_manage.go:306` | **EnsureClusterManage** | 纳管时推送 Agent |
+| 1 | `NodeAgentReadyFlag` | 2 | `ensure_bke_agent.go:624-625` | **EnsureBKEAgent** | Agent 就绪确认（同时设置 bit 0） |
+| 1 | `NodeAgentReadyFlag` | 2 | `ensure_cluster_manage.go:1292-1293` | **EnsureClusterManage** | 纳管时 Agent 就绪 |
+| 2 | `NodeEnvFlag` | 4 | `ensure_nodes_env.go:268` | **EnsureNodesEnv** | 节点环境配置完成 |
+| 2 | `NodeEnvFlag` | 4 | `ensure_cluster_manage.go:1007,1038` | **EnsureClusterManage** | 纳管时环境配置 |
+| 3 | `NodeBootFlag` | 8 | `bkemachine_controller_phases.go:1299` | **BKEMachineController**（EnsureMasterInit/EnsureWorkerJoin 触发的 bootstrap） | Bootstrap 成功后 |
+| 3 | `NodeBootFlag` | 8 | `ensure_master_join.go:196` | **EnsureMasterJoin** | Master 加入后 |
+| 3 | `NodeBootFlag` | 8 | `ensure_worker_join.go:239` | **EnsureWorkerJoin** | Worker 加入后 |
+| 4 | `NodeHAFlag` | 16 | `ensure_load_balance.go:208` | **EnsureLoadBalance** | 负载均衡器配置完成 |
+| 5 | `MasterInitFlag` | 32 | `bkemachine_controller_phases.go:242` | **BKEMachineController**（`phase == InitControlPlane`） | 首个 Master 初始化时 |
+| 6 | `NodeDeletingFlag` | 64 | **无**（仅被读取） | — | ⚠️ 代码中仅检查从未设置，疑似未实现 |
+| 7 | `NodeFailedFlag` | 128 | `statusmanager.go:346` | **StatusManager**（非 Phase） | 节点失败超过重试次数限制 |
+| 8 | `NodeStateNeedRecord` | 256 | `bkenode_types.go:66,90` | **SetNodeState / SetNodeStateWithMessage** | 任意节点状态修改时自动设置（持久化触发器） |
+| 9 | `NodePostProcessFlag` | 512 | `ensure_nodes_postprocess.go:129,169` | **EnsureNodesPostProcess** | 后置脚本处理完成 |
+
+##### bootstrapReadyStateCode = 527 验证
+
+```
+527 = 0b1000001111
+    = bit0(1) + bit1(2) + bit2(4) + bit3(8) + bit5(32) + bit9(512)
+    = NodeAgentPushed + NodeAgentReady + NodeEnv + NodeBoot + MasterInit + NodePostProcess
+```
+
+节点 Ready 需要以下 6 个 Phase 全部完成：
+
+| Bit | Flag | 对应 Phase |
+|-----|------|-----------|
+| 0 | NodeAgentPushedFlag | EnsureBKEAgent |
+| 1 | NodeAgentReadyFlag | EnsureBKEAgent |
+| 2 | NodeEnvFlag | EnsureNodesEnv |
+| 3 | NodeBootFlag | EnsureMasterInit / EnsureWorkerJoin（触发 bootstrap） |
+| 5 | MasterInitFlag | BKEMachineController（首个 Master 初始化） |
+| 9 | NodePostProcessFlag | EnsureNodesPostProcess |
+
+**未纳入 Ready 条件的标记**：
+- `NodeHAFlag`（bit 4）— 仅 EnsureLoadBalance 设置，不参与 Ready 判定（HA 是可选配置）
+- `NodeFailedFlag`（bit 7）/ `NodeDeletingFlag`（bit 6）— 异常/删除标记，与 Ready 互斥
+
+##### 关键发现
+
+1. **NodeDeletingFlag（bit 6）从未被设置**：代码中仅 `ensure_nodes_env.go:115` 和 `phaseutil/util.go:1153` 检查此标记，但无任何代码通过 `MarkNodeStateFlag` 设置它。节点删除时调用的是 `SetNodeState(NodeDeleting)`（`bkemachine_controller.go:307`），但 `SetNodeState` 只设置 `NodeStateNeedRecord`（bit 8），不设置 `NodeDeletingFlag`（bit 6）。这是一个**实现缺口**。
+
+2. **EnsureClusterManage 复用安装 Phase 的标记**：纳管场景下 `EnsureClusterManage` 会重新执行 Agent 推送和环境配置，设置 bit 0/1/2（与 EnsureBKEAgent/EnsureNodesEnv 相同的标记）。
+
+3. **NodeBootFlag 设置来源多样**：由 BKEMachineController（bootstrap 成功）、EnsureMasterJoin、EnsureWorkerJoin 三处设置，因为 bootstrap 可能发生在不同阶段。
+
+4. **NodeFailedFlag 不由 Phase 设置**：由 StatusManager 在重试超限时设置（`statusmanager.go:346`），不属于 PhaseFlow 的任何 Phase。
+
 **问题**：
 - `State` 和 `StateCode` 可能不一致（文档 10.4.3 专门描述了修复机制）
 - 两套状态增加了理解和维护成本
 - `bootstrapReadyStateCode = 527` 是魔法数字
+- `NodeDeletingFlag`（bit 6）定义但从未设置，是实现缺口
 
 #### 11.2.3 命令层：最清晰的状态机
 
