@@ -638,6 +638,10 @@ const (
 
 ### 5.2 节点状态机
 
+节点层包含 BKENode 和 BKEMachine 两个资源，各自有独立的状态模型。本节分别给出两者的状态转换概览；BKEMachine 的详细设计见 5.3 节。
+
+#### 5.2.1 BKENode 状态转换图
+
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        BKENode 状态转换图                            │
@@ -680,6 +684,16 @@ const (
              ┌──────────┐ ┌──────────┐
              │ NotReady │ │ Managing │
              └──────────┘ └──────────┘
+```
+
+#### 5.2.2 BKEMachine 状态概览
+
+BKEMachine **没有 Phase 字段**，状态由布尔元组 `(Ready, Bootstrapped)` + 单个 Condition `BootstrapSucceededCondition` 表达。BKEMachine 控制器在引导过程中会**直接修改关联 BKENode 的 State 和 StateCode**，两者的状态变化交织进行：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                      BKEMachine 状态概览                             │
+└─────────────────────────────────────────────────────────────────────┘
 
 BKEMachine 状态（布尔元组 + 单 Condition, 无 Phase 字段）：
   (Ready=false, Bootstrapped=false)
@@ -701,6 +715,8 @@ BKEMachine 状态（布尔元组 + 单 Condition, 无 Phase 字段）：
                    BKENode.StateCode |= NodeBootFlag (bit 3)
                    BKENode.State = NodeNotReady
 ```
+
+> **与 5.3 节的关系**：本节为 BKEMachine 状态的**概览**，以流程线展示布尔元组转换与 BKENode 副作用的交互关系。5.3 节为**详细设计**，包含状态定义表（5.3.1）、Condition 三态表（5.3.2）、BKENode 副作用表（5.3.3）、BKECluster 聚合（5.3.4）、删除流程（5.3.5）、状态转换框图（5.3.6）。
 
 ### 5.3 BKEMachine 状态机
 
