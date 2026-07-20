@@ -2,10 +2,7 @@
 
 **文档版本**: v1.0  
 **状态**: Draft  
-**创建日期**: 2026-07-09  
 **依赖**: 现有代码实现（api/, controllers/, pkg/）
-
----
 
 ## 目录
 
@@ -934,9 +931,9 @@ flowchart TD
     CheckTarget -->|是| Reset["ResetForTarget:<br/>清除 Completed/LastError/LastFailure<br/>FinishedAt = nil"]
     Reset --> Exec
     CheckTarget -->|否| Exec["2. 组件执行<br/>for each component in DAG"]
-    Exec --> IsDone{IsCompleted<br/>(name, version)?}
+    Exec --> IsDone["IsCompleted (name, version)?"]
     IsDone -->|是| Skip["跳过 (幂等)"]
-    IsDone -->|否| Run["executeComponent()"]
+    IsDone -->|否| Run["executeComponent"]
     Run -->|成功| MarkDone["MarkCompleted:<br/>追加到 Completed<br/>清除 LastError/LastFailure"]
     Run -->|失败| MarkFail["MarkFailure:<br/>LastFailure.Attempt++<br/>LastError = errMsg"]
     Skip --> Next[下一个组件]
@@ -949,8 +946,6 @@ flowchart TD
     VersionChange -->|是| Reset
     VersionChange -->|否| Done([升级完成])
 ```
-
----
 
 ## 6. 重试与幂等机制
 
