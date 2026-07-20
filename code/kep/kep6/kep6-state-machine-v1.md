@@ -834,6 +834,28 @@ flowchart TD
 - **聚合时机**：由 BKEMachine 控制器在每次引导完成（成功/失败）后触发，非定时轮询
 - **代码观察**：`handleClusterState`（`phases.go:941-967`）中 `handleBootstrapFailure` 和 `handleClusterReady` 两个分支的条件都含 `allBootFlag`，但第一个 `if allBootFlag` 已 `return`，这两个分支实际不可达。`TargetClusterBootCondition=True` 由 `EnsureCluster` Phase 的健康检查设置，非由本聚合函数设置
 
+##### `Status.KubernetesVersion` 的作用
+
+`handleAllNodesBootstrapped` 设置 `BKECluster.Status.KubernetesVersion`，此字段记录**集群当前实际运行的 Kubernetes 版本**，与 `Spec.ClusterConfig.Cluster.KubernetesVersion`（期望版本）形成"期望 vs 实际"对比，驱动安装完成标记、升级判定和健康检查。
+
+| 字段 | 语义 | 设置时机 |
+|------|------|---------|
+| `Spec.ClusterConfig.Cluster.KubernetesVersion` | **期望版本**（用户想要的目标版本） | 用户创建/修改 BKECluster Spec |
+| `Status.KubernetesVersion` | **实际版本**（集群当前运行的版本） | 安装完成 / 升级完成 / 纳管发现 |
+
+`Status.KubernetesVersion` 在 6 个场景中发挥作用：
+
+| # | 作用 | 读写 | 代码位置 | 说明 |
+|---|------|------|---------|------|
+| 1 | **安装完成标记** | 写 | `bkemachine_controller_phases.go:973` | 所有节点引导完成后，从 Spec 拷贝到 Status，标志"集群已运行版本 X"。在此之前 Status 为空，表示集群尚未完成安装 |
+| 2 | **升级判定依据** | 读 | `phaseutil/util.go:794` | `GetNeedUpgradeK8sNodes` 比较 `Status`（当前版本）与 `Spec`（期望版本），`Status < Spec` → 需要升级；`Status == Spec` → 无需升级 |
+| 3 | **升级完成标记** | 写 | `ensure_master_upgrade.go:246` | Master 升级完成后更新 Status 为期望版本（Master 是最后升级的节点），标志整个 K8s 版本升级完成 |
+| 4 | **健康检查参数** | 读 | `ensure_cluster.go:371` | 传给 `CheckClusterHealth()` 作为期望版本，验证目标集群 API Server 是否运行在正确版本上 |
+| 5 | **声明式升级 VersionContext 来源** | 读 | `build_release.go:106` | 作为 `clusterCurrentForReleaseComponent` 的返回值，填充 `VersionContext.Current`，DAG 调度器通过 `HasCurrent` 判定组件是 Install 还是 Upgrade |
+| 6 | **纳管版本发现** | 写 | `ensure_cluster_manage.go:215` | 纳管场景下从远程集群收集实际版本写入 Status（非从 Spec 拷贝），因为集群已存在且版本由远程决定 |
+
+> **核心设计**：Spec → Status 的差距驱动整个升级流程。`Status` 为空 → 正在安装；`Status < Spec` → 需要升级；`Status == Spec` → 版本一致，无需升级。`EnsureCluster` 的 `updateClusterVersionStatus`（`ensure_cluster.go:408-422`）还提供兜底：若 Status 为空则从 Spec 补充，确保健康检查时版本非空。
+
 #### 5.3.5 BKEMachine 删除流程
 
 BKEMachine 删除时**不翻转 `Ready`/`Bootstrapped`**，而是通过注解 + finalizer 机制：
