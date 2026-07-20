@@ -2293,7 +2293,7 @@ flowchart TD
         R3 --> R4["4. BKENode.StateCode \|= NodeFailedFlag (失败节点)"]
         R4 --> R5["5. BKENode.State = NodeFailed (失败节点)"]
     end
-    subgraph 回滚恢复（人工介入）
+    subgraph "回滚恢复（人工介入）"
         S1["1. 用户添加注解: bke.bocloud.com/retry=''"] --> S2["2. BKEClusterReconciler.handleRetryLogic()<br/>BKENode.StateCode &= ^NodeFailedFlag"]
         S2 --> S3["3. StatusManager.ResetCache()<br/>(重置失败计数)"]
         S3 --> S4["4. 重新执行失败阶段<br/>Phase 幂等执行, 跳过已完成组件"]
