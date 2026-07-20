@@ -927,11 +927,11 @@ if failed && BackoffIgnore:
 
 ```mermaid
 flowchart TD
-    Init["1. 初始化<br/>EnsureInitialized{targetVersion, now}"] --> CheckTarget{TargetVersion<br/>变更?}
+    Init["1. 初始化<br/>EnsureInitialized(targetVersion, now)"] --> CheckTarget{TargetVersion<br/>变更?}
     CheckTarget -->|是| Reset["ResetForTarget:<br/>清除 Completed/LastError/LastFailure<br/>FinishedAt = nil"]
     Reset --> Exec
     CheckTarget -->|否| Exec["2. 组件执行<br/>for each component in DAG"]
-    Exec --> IsDone{IsCompleted<br/>{name, version}?}
+    Exec --> IsDone{IsCompleted\n(name, version)?}
     IsDone -->|是| Skip["跳过 (幂等)"]
     IsDone -->|否| Run["executeComponent"]
     Run -->|成功| MarkDone["MarkCompleted:<br/>追加到 Completed<br/>清除 LastError/LastFailure"]
