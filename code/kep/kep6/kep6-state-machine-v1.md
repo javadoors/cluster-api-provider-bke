@@ -1073,6 +1073,27 @@ const (
 )
 ```
 
+**设计思路**:
+
+1. **三层重试体系定位**：系统设计了三层重试，逐级升级：
+
+```mermaid
+flowchart TD
+    L1["第一层: Command 级重试<br/>自动, 秒级<br/>BackoffLimit=3, Rate Limiter"] -->|"重试耗尽"| L2["第二层: StatusManager 状态伪装<br/>自动, 分钟级<br/>默认 10 次, 恢复 LatestNormalState"]
+    L2 -->|"重试超限"| L3["第三层: 人工介入<br/>手动, 确认后重试<br/>清除 NodeFailedFlag + ResetCache"]
+    L3 -->|"问题解决"| L1
+```
+
+Command 级重试是第一层，处理瞬时故障（网络抖动、临时不可达）。重试耗尽后 `Command.Phase = Failed`，由 BKEMachine 控制器设置 `BKENode.State = BootStrapFailed`，触发第二层 StatusManager 状态伪装。StatusManager 超限后设置 `NodeFailedFlag`，节点被永久跳过，需第三层人工介入。
+
+2. **重试参数配合**：三个参数控制重试行为——`BackoffLimit`（重试次数上限，默认 3）+ `BackoffDelay`（重试间隔，秒级）+ `ActiveDeadlineSecond`（总执行超时，默认 1000 秒）。Rate Limiter 在快速重试（10s 间隔，最多 5 次）后切换慢速重试（60s 间隔），避免对目标节点造成过大压力。
+
+3. **BackoffIgnore 设计**：某些子命令失败可跳过（标记 `CommandSkip` 而非 `CommandFailed`），不阻塞整体完成。适用于非关键步骤（如可选的镜像预拉取），失败不影响集群核心功能。
+
+4. **重试耗尽后行为**：Command 重试全部失败后，`Command.Phase = CommandFailed`。此时 Command 本身不再重试（一次性资源），由上层控制器接管：BKEMachine 控制器读取 Command 失败结果 → 设置 `BKENode.State = NodeBootStrapFailed` → StatusManager 检测到 "Failed" 后缀 → 启动第二层状态伪装重试。
+
+5. **幂等性边界**：Command 框架仅提供重试循环和计数，**不保证子命令幂等**。幂等性由子命令自身保证——例如 `kubeadm reset` + `kubeadm init` 可安全重复执行，`kubectl apply` 天然幂等。若子命令不可重入（如 `mkfs`），需通过 `BackoffLimit=0` 禁用重试。
+
 ### 6.2 BKECluster 级别重试（人工介入）
 
 **定义位置**: `controllers/capbke/bkecluster_controller.go:660-744`
@@ -1132,6 +1153,26 @@ func (r *BKEClusterReconciler) processSpecificNodesRetry(bkeCluster *bkev1beta1.
 - StateCode 位标记清除是幂等操作
 - StatusManager 缓存重置确保重新计算
 - Phase 状态重新评估，从 Waiting 阶段开始
+
+**设计思路**:
+
+1. **为什么是人工触发**：StatusManager 第二层重试超限后设置 `NodeFailedFlag`（bit 7），节点被所有 Phase 的 `NeedExecute` 永久跳过。这是**安全机制**——防止故障节点无限重试导致集群雪崩（如反复 `kubeadm init` 失败消耗资源）。需人工确认问题已解决（如修复网络、清理残留配置）后才清除标志位重新执行。
+
+2. **NodeFailedFlag 清除设计**：清除 bit 7 后，节点的 `StateCode` 不再包含失败标记 → `HasNodesNeedingPhase` / `getNodesToInitEnv` / `reconcileNormal` 等门控函数不再跳过该节点 → Phase 的 `NeedExecute` 重新返回 true → 从 StateCode 记录的断点恢复执行（已完成的位标记保留，仅重新执行未完成的步骤）。
+
+3. **StatusManager 缓存重置**：`ResetCache` 清除 `StatusRecord` 中的 `LatestFailedState` / `StatusCount` / `NeedRequeue`。若不重置，旧的失败计数会立即触发"超限"判定，节点刚清除 `NodeFailedFlag` 又被设回，形成死循环。重置后 StatusManager 从零开始计数，给予节点完整的重试周期。
+
+4. **粒度选择**：支持两种粒度——全量重试（`retry=""`，清除所有节点的 `NodeFailedFlag`）和指定节点重试（`retry="10.0.0.1,10.0.0.2"`，仅清除指定节点）。指定节点重试避免不必要的全量重试，减少对正常节点的影响。
+
+5. **三层重试协作关系**：
+
+| 层级 | 触发方式 | 自动/手动 | 时间尺度 | 失败处理 |
+|------|---------|----------|---------|---------|
+| Command 级 | 子命令执行失败 | 自动 | 秒级（10s/60s 间隔） | 重试 `BackoffLimit` 次后标记 Failed |
+| StatusManager | BKENode.State 含 "Failed" 后缀 | 自动 | 分钟级（Reconcile 间隔） | 恢复 `LatestNormalState` + `NeedRequeue`，重试 10 次后设 `NodeFailedFlag` |
+| 人工介入 | `bke.bocloud.com/retry` 注解 | 手动 | 小时/天级 | 清除 `NodeFailedFlag` + `ResetCache`，从断点恢复 |
+
+> **设计意图**：越低层处理越快的故障（瞬时网络抖动），越高层处理越持久的故障（配置错误、硬件故障）。Command 重试不需要外部状态，StatusManager 重试依赖 BKENode.State 持久化，人工介入依赖人工判断。
 
 ### 6.3 声明式升级幂等
 
@@ -1219,6 +1260,26 @@ func (s *Scheduler) markComponentFailed(
 - `IsCompleted()` 检查组件+版本是否已完成
 - 相同组件+版本不会重复执行
 - 目标版本变更时自动重置进度
+
+**设计思路**:
+
+1. **幂等键设计**：以 `(componentName, version)` 二元组作为幂等键——`IsCompleted(name, version)` 检查 `DeclarativeUpgrade.Completed` 列表中是否存在匹配记录。同一组件同一版本只执行一次，即使控制器重启或 Reconcile 多次触发。版本不同则视为不同操作，允许重复执行（如从 v1.10 升级到 v1.11 后再升级到 v1.12，每个版本独立记录）。
+
+2. **TargetVersion 变更重置**：`EnsureInitialized`（`bkecluster_status.go:161-177`）检测 `TargetVersion` 变化时调用 `ResetForTarget`——清除 `Completed` 列表、`LastError`、`LastFailure`、`FinishedAt`，设置新的 `TargetVersion` 和 `StartedAt`。设计意图：新版本是全新的升级周期，旧版本的完成记录不再适用（组件版本号已变），必须从头执行。
+
+3. **与 StatusManager 的区别**：声明式升级**不经过 StatusManager 状态伪装**。组件失败后 DAG 调度器记录 `LastFailure`（`MarkFailure`），但不恢复状态、不伪装成功。下次 Reconcile 时 `shouldSkipComponent` 仅跳过已完成的组件，失败组件会被重新执行。设计差异：StatusManager 的状态伪装适用于 PhaseFlow（顺序执行，失败阻塞后续），声明式升级的显式记录适用于 DAG（拓扑批次，失败不影响无依赖组件）。
+
+4. **断点续升**：控制器重启后，`ExecuteDAG` 从 `DeclarativeUpgrade.Completed` 恢复进度——`shouldSkipComponent` 跳过已完成组件，仅执行未完成组件。无需从头开始整个升级流程，减少升级中断后的恢复时间。`TargetVersion` 不变时 `EnsureInitialized` 不重置进度，保证断点续升的正确性。
+
+5. **FailurePolicy 设计**：DAG 节点支持三种失败策略（`topology.ComponentNode.FailurePolicy`）：
+
+| 策略 | 行为 | 适用场景 |
+|------|------|---------|
+| `FailFast` | 立即终止整个 DAG，返回错误 | 关键组件（如 etcd），失败后继续无意义 |
+| `Continue` | 记录错误，继续执行下一批次 | 非关键组件（如 addon），失败不影响核心功能 |
+| `Rollback` | 回滚后继续（Helm 组件调用 `helm rollback`） | 可回滚组件（如 Helm Release），失败后恢复到上一版本 |
+
+> **与 6.1/6.2 的关系**：声明式升级的幂等机制独立于 Command 级和 BKECluster 级重试。Command 级重试仍作用于底层命令执行（如 `helm upgrade` 命令本身的重试），但 DAG 组件级幂等由 `DeclarativeUpgrade.Completed` 记录保证，不依赖 StatusManager 的状态伪装。三层重试体系在声明式升级路径中仅使用第一层（Command 级）和组件级幂等，不触发第二层（StatusManager）和第三层（人工介入）。
 
 ---
 
