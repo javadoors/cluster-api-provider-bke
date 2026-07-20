@@ -581,67 +581,83 @@ const (
 
 ### 5.1 集群状态机
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                      BKECluster 状态转换图                           │
-└─────────────────────────────────────────────────────────────────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> Unknown
 
-                         ┌──────────────┐
-                         │   Unknown    │
-                         └──────┬───────┘
-                                │
-                    ┌───────────┴───────────┐
-                    │                       │
-                    ▼                       ▼
-          ┌─────────────────┐     ┌─────────────────┐
-          │  Initializing   │     │    Checking     │
-          └────────┬────────┘     └────────┬────────┘
-                   │                       │
-         ┌─────────┴─────────┐             │
-         │                   │             │
-         ▼                   ▼             ▼
-┌─────────────────┐ ┌─────────────────┐ ┌──────────────┐
-│  DeployingAddon │ │     Ready       │ │  Unhealthy   │
-└────────┬────────┘ └────────┬────────┘ └──────────────┘
-         │                   │
-         │         ┌─────────┴─────────┬───────────────┬──────────────┐
-         │         │                   │               │              │
-         │         ▼                   ▼               ▼              ▼
-         │  ┌─────────────┐   ┌──────────────┐ ┌─────────────┐ ┌──────────┐
-         │  │  Upgrading  │   │   Managing   │ │  Deleting   │ │  Paused  │
-         │  └──────┬──────┘   └──────┬───────┘ └──────┬──────┘ └────┬─────┘
-         │         │                 │                │             │
-         │         │                 │                │             │
-         │         ▼                 ▼                ▼             ▼
-         │  ┌─────────────┐   ┌──────────────┐ ┌─────────────┐ ┌──────────┐
-         │  │  ScalingUp  │   │    Ready     │ │  Deleted    │ │  Resume  │
-         │  │ ScalingDown │   │              │ │             │ │  Ready   │
-         │  └──────┬──────┘   └──────────────┘ └─────────────┘ └──────────┘
-         │         │
-         │         └──────────┬──────────┐
-         │                    │          │
-         │                    ▼          ▼
-         │             ┌──────────┐ ┌──────────┐
-         │             │  Ready   │ │ Failed   │
-         │             └──────────┘ └──────────┘
-         │
-         └──────────┬──────────┐
-                    │          │
-                    ▼          ▼
-             ┌──────────┐ ┌──────────┐
-             │  Ready   │ │ Failed   │
-             └──────────┘ └──────────┘
+    Unknown --> Initializing
+    Unknown --> Checking
 
-失败状态转换：
-  Initializing → InitializationFailed
-  DeployingAddon → DeployAddonFailed
-  Upgrading → UpgradeFailed
-  ScalingUp/Down → ScaleFailed
-  Managing → ManageFailed
-  Deleting → DeleteFailed
-  Paused → PauseFailed
-  DryRun → DryRunFailed
+    Initializing --> DeployingAddon
+    Initializing --> Ready
+    Initializing --> InitializationFailed
+
+    Checking --> Ready
+    Checking --> Unhealthy
+
+    DeployingAddon --> Ready
+    DeployingAddon --> DeployAddonFailed
+
+    Ready --> Upgrading
+    Ready --> Managing
+    Ready --> Deleting
+    Ready --> Paused
+    Ready --> DryRun
+
+    Upgrading --> ScalingUp
+    Upgrading --> ScalingDown
+    Upgrading --> Ready
+    Upgrading --> UpgradeFailed
+
+    ScalingUp --> Ready
+    ScalingUp --> ScaleFailed
+    ScalingDown --> Ready
+    ScalingDown --> ScaleFailed
+
+    Managing --> Ready
+    Managing --> ManageFailed
+
+    Deleting --> Deleted
+    Deleting --> DeleteFailed
+
+    Paused --> Ready: Resume
+    Paused --> PauseFailed
+
+    DryRun --> Ready
+    DryRun --> DryRunFailed
+
+    Unhealthy --> Ready
+    Unhealthy --> Checking
+
+    Deleted --> [*]
+
+    note right of Unknown: 集群状态无法判定
+    note right of Ready: 所有节点就绪 + 健康检查通过
+    note right of Unhealthy: 健康检查失败, 不触发失败计数
+    note right of Failed: 统一表示各种 *Failed 状态
 ```
+
+**图中各状态的业务含义**：
+
+| 状态 | 分类 | 业务说明 | 进入条件 | 可转换到 |
+|------|------|---------|---------|---------|
+| `Unknown` | 初始 | 集群状态无法判定，通常为新建集群尚未开始任何操作 | 集群创建后的默认状态 | `Initializing` / `Checking` |
+| `Initializing` | 安装中 | 集群首次安装进行中，涵盖 Finalizer/Certs/MasterInit/BKEAgent/NodesEnv 等 8 个 Phase 的执行 | `ClusterInitPhaseNames` 中任意 Phase 开始执行 | `DeployingAddon` / `Ready` / `InitializationFailed` |
+| `Checking` | 检查中 | `EnsureCluster` 阶段前置 Hook 设置的中间状态，正在进行集群健康检查 | `EnsureCluster` Phase 前置 Hook | `Ready` / `Unhealthy` |
+| `DeployingAddon` | 安装中 | `EnsureAddonDeploy` Phase 执行中，正在部署集群组件（coredns/metrics-server 等） | `EnsureAddonDeploy` Phase 开始 | `Ready` / `DeployAddonFailed` |
+| `Ready` | 稳态 | 集群所有节点就绪、健康检查通过，处于稳定运行态。安装/升级/扩缩容的最终目标状态 | 所有节点 Ready + 健康检查通过 | `Upgrading` / `Managing` / `Deleting` / `Paused` / `ScalingUp` / `ScalingDown` |
+| `Unhealthy` | 异常 | 集群健康检查失败（节点不可达或组件异常）。不触发 StatusManager 失败计数，持续重试 | `EnsureCluster` 健康检查失败 | `Ready`（恢复后）/ `Checking` |
+| `Upgrading` | 升级中 | 升级 Phase 执行中（旧路径 5 个或 DAG 路径 6 个 Phase） | 升级 Phase 开始执行 | `ScalingUp` / `ScalingDown` / `Ready` / `UpgradeFailed` |
+| `ScalingUp` | 扩容中 | 正在向集群添加节点（Master 或 Worker），合并显示 MasterScalingUp / WorkerScalingUp | `EnsureMasterJoin` / `EnsureWorkerJoin` Phase 执行中 | `Ready` / `ScaleFailed` |
+| `ScalingDown` | 缩容中 | 正在从集群移除节点（Master 或 Worker），合并显示 MasterScalingDown / WorkerScalingDown | `EnsureMasterDelete` / `EnsureWorkerDelete` Phase 执行中 | `Ready` / `ScaleFailed` |
+| `Managing` | 纳管中 | `EnsureClusterManage` Phase 执行中，正在纳管已有集群 | 纳管操作触发 | `Ready` / `ManageFailed` |
+| `Deleting` | 删除中 | `EnsureDeleteOrReset` Phase 执行中，集群正在被删除 | 删除操作触发 | `Deleted` / `DeleteFailed` |
+| `Deleted` | 终态 | 集群删除完成，资源被垃圾回收 | 删除流程完成 | （终态，无后续转换） |
+| `Paused` | 暂停 | 集群暂停调谐，不执行任何 Phase，用于维护窗口 | `EnsurePaused` Phase 成功 | `Resume` → `Ready` / `PauseFailed` |
+| `Failed` | 失败 | 图中统一表示各种 `*Failed` 状态（`InitializationFailed`/`UpgradeFailed`/`ScaleFailed`/`DeployAddonFailed` 等） | 对应 Phase 执行失败 | `Retry`（StatusManager 重试恢复）/ 保持 `Failed`（超限后） |
+| `DryRun` | 验证 | DryRun 模式，仅验证配置不实际部署 | `EnsureDryRun` Phase 执行 | `DryRunFailed` / `Ready` |
+
+> 完整的 ClusterStatus 20 个值定义及详细业务说明见 [3.1.1 节](#311-clusterstatus20-个值)。上图中的 `ScalingUp`/`ScalingDown`/`Failed` 为合并展示，实际代码中分别对应 `ClusterMasterScalingUp`/`ClusterWorkerScalingUp`/`ClusterMasterScalingDown`/`ClusterWorkerScalingDown` 和 8 个独立的 `*Failed` 状态。
 
 ### 5.2 节点状态机
 
@@ -649,78 +665,81 @@ const (
 
 #### 5.2.1 BKENode 状态转换图
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        BKENode 状态转换图                            │
-└─────────────────────────────────────────────────────────────────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> Pending
 
-                         ┌──────────────┐
-                         │   Pending    │
-                         └──────┬───────┘
-                                │
-                    ┌───────────┴───────────┐
-                    │                       │
-                    ▼                       ▼
-          ┌─────────────────┐     ┌─────────────────┐
-          │  BootStrapping  │     │   Initializing  │
-          └────────┬────────┘     └────────┬────────┘
-                   │                       │
-         ┌─────────┴─────────┐             │
-         │                   │             │
-         ▼                   ▼             ▼
-┌─────────────────┐ ┌─────────────────┐ ┌──────────────┐
-│     Ready       │ │   NotReady      │ │ InitFailed   │
-└────────┬────────┘ └────────┬────────┘ └──────────────┘
-         │                   │
-         │         ┌─────────┴─────────┬───────────────┐
-         │         │                   │               │
-         │         ▼                   ▼               ▼
-         │  ┌─────────────┐   ┌──────────────┐ ┌─────────────┐
-         │  │  Upgrading  │   │    Failed    │ │  Deleting   │
-         │  └──────┬──────┘   └──────┬───────┘ └──────┬──────┘
-         │         │                 │                │
-         │         │                 │                │
-         │         ▼                 ▼                ▼
-         │  ┌─────────────┐   ┌──────────────┐ ┌─────────────┐
-         │  │    Ready    │   │    Retry     │ │  Deleted    │
-         │  └─────────────┘   └──────────────┘ └─────────────┘
-         │
-         └──────────┬──────────┐
-                    │          │
-                    ▼          ▼
-             ┌──────────┐ ┌──────────┐
-             │ NotReady │ │ Managing │
-             └──────────┘ └──────────┘
+    Pending --> BootStrapping
+    Pending --> Initializing
+
+    BootStrapping --> Ready
+    BootStrapping --> NotReady
+
+    Initializing --> Ready
+    Initializing --> NotReady
+    Initializing --> InitFailed
+
+    Ready --> Upgrading
+    Ready --> NotReady
+    Ready --> Managing
+
+    NotReady --> Failed
+    NotReady --> Deleting
+
+    InitFailed --> Initializing: Retry
+
+    Upgrading --> Ready
+    Upgrading --> Failed
+
+    Failed --> Ready: Retry (人工清除 NodeFailedFlag)
+
+    Deleting --> Deleted
+    Deleted --> [*]
+
+    Managing --> Ready
+    Managing --> NotReady
+
+    note right of Pending: StateCode=0, 新节点默认状态
+    note right of Ready: StateCode==527, 所有必要 Phase 完成
+    note right of Failed: NodeFailedFlag 置位, 重试超限
+    note right of BootStrapping: kubeadm init/join 执行中
+    note right of Deleted: 资源被移除
 ```
+
+**图中各状态的业务含义**：
+
+| 状态 | 业务说明 | 进入条件 | 可转换到 |
+|------|---------|---------|---------|
+| `Pending` | 节点初始状态，`StateCode=0`，尚未开始任何操作 | 新节点加入集群 | `BootStrapping` / `Initializing` |
+| `BootStrapping` | 正在执行 `kubeadm init/join` 引导命令 | BKEMachine 控制器创建 Bootstrap Command | `Ready` / `NotReady` |
+| `Initializing` | 正在初始化（Agent 推送 / 环境配置 / 负载均衡配置） | `EnsureBKEAgent` / `EnsureNodesEnv` / `EnsureLoadBalance` 执行中 | `Ready` / `NotReady` / `InitFailed` |
+| `Ready` | 节点完全就绪，`StateCode==527`，所有必要 Phase 完成 | 6 个必要位标记全部置位 | `Upgrading` / `Deleting` / `NotReady` / `Managing` |
+| `NotReady` | Bootstrap 成功但未完全配置，或运行中检测到不可达 | BKEMachine 引导成功 / 健康检查失败 | `Ready` / `Failed` / `Deleting` / `Managing` |
+| `InitFailed` | 初始化失败（Agent 推送 / 环境配置 / 负载均衡失败） | 初始化 Phase 执行失败 | `Retry` → `Initializing` |
+| `Upgrading` | 节点正在升级（containerd / etcd / k8s 组件） | 升级 Phase 执行中 | `Ready` / `Failed` |
+| `Failed` | 节点失败且重试超限，`NodeFailedFlag`(bit 7) 置位，后续调谐跳过此节点 | StatusManager 重试超限 | `Ready`（人工清除标志位） |
+| `Deleting` | 节点正在被删除 | BKEMachine 控制器删除流程 | `Deleted` |
+| `Deleted` | 节点已删除，BKENode 资源被移除 | 删除完成 | （终态） |
+| `Retry` | 失败后重试——StatusManager 将 State 恢复为 `LatestNormalState` 并设 `NeedRequeue` | 重试次数内（默认 10 次） | → 对应操作状态 |
+| `Managing` | 节点正在被纳管（将已有节点纳入 BKE 管理） | `EnsureClusterManage` 执行中 | `Ready` / `NotReady` |
+
+> 完整的 NodeState 定义见 [3.2.1 节](#321-nodestatebkenode7-个值)。
 
 #### 5.2.2 BKEMachine 状态概览
 
 BKEMachine **没有 Phase 字段**，状态由布尔元组 `(Ready, Bootstrapped)` + 单个 Condition `BootstrapSucceededCondition` 表达。BKEMachine 控制器在引导过程中会**直接修改关联 BKENode 的 State 和 StateCode**，两者的状态变化交织进行：
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                      BKEMachine 状态概览                             │
-└─────────────────────────────────────────────────────────────────────┘
-
-BKEMachine 状态（布尔元组 + 单 Condition, 无 Phase 字段）：
-  (Ready=false, Bootstrapped=false)
-       │
-       │ Worker 等待 ControlPlane 初始化
-       ▼
-  BootstrapSucceededCondition = False (WaitingForControlPlaneAvailableReason)
-       │
-       │ Bootstrap Command 执行中
-       ▼
-  BKENode.State = NodeBootStrapping (BKEMachine 自身状态不变)
-       │
-       ├─ 失败 ──→ BootstrapSucceededCondition = False (NodeBootStrapFailedReason)
-       │           BKENode.State = NodeBootStrapFailed
-       │           移除标签, 允许重新绑定
-       │
-       └─ 成功 ──→ (Ready=true, Bootstrapped=true)
-                   BootstrapSucceededCondition = True
-                   BKENode.StateCode |= NodeBootFlag (bit 3)
-                   BKENode.State = NodeNotReady
+```mermaid
+flowchart TD
+    Start["(Ready=false, Bootstrapped=false)"] --> WaitCP{"Worker 节点?"}
+    WaitCP -->|"是, 等待 CP 初始化"| CondWait["BootstrapSucceeded = False<br/>(WaitingForControlPlaneAvailableReason)"]
+    CondWait --> CreateCmd
+    WaitCP -->|"否, 直接引导"| CreateCmd["创建 Bootstrap Command<br/>BKENode.State = NodeBootStrapping<br/>(BKEMachine 自身状态不变)"]
+    CreateCmd --> Result{Bootstrap 结果}
+    Result -->|失败| Fail["BootstrapSucceeded = False<br/>(NodeBootStrapFailedReason)<br/>BKENode.State = NodeBootStrapFailed<br/>移除标签, 允许重新绑定"]
+    Result -->|成功| Success["(Ready=true, Bootstrapped=true)<br/>BootstrapSucceeded = True<br/>BKENode.StateCode |= NodeBootFlag (bit 3)<br/>BKENode.State = NodeNotReady"]
+    Fail --> Retry["重新触发 Reconcile"] --> CreateCmd
+    Success --> Done(["终态 (不可逆)"])
 ```
 
 > **与 5.3 节的关系**：本节为 BKEMachine 状态的**概览**，以流程线展示布尔元组转换与 BKENode 副作用的交互关系。5.3 节为**详细设计**，包含状态定义表（5.3.1）、Condition 三态表（5.3.2）、BKENode 副作用表（5.3.3）、BKECluster 聚合（5.3.4）、删除流程（5.3.5）、状态转换框图（5.3.6）。
@@ -795,210 +814,141 @@ BKEMachine 删除时**不翻转 `Ready`/`Bootstrapped`**，而是通过注解 + 
 
 #### 5.3.6 状态转换图
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    BKEMachine 状态转换图                          │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+stateDiagram-v2
+    [*] --> Initial: Ready=false<br/>Bootstrapped=false<br/>Cond=(未设置)
 
-  初始状态
-  ┌─────────────────────────────────────┐
-  │  Ready = false                      │
-  │  Bootstrapped = false               │
-  │  BootstrapSucceeded = (未设置)       │
-  └──────────────────┬──────────────────┘
-                     │
-         ┌───────────┴───────────┐
-         │                       │
-         ▼ (Worker + CP 未初始化)  ▼ (Master 或 CP 已初始化)
-  ┌──────────────┐        ┌──────────────┐
-  │ Cond = False │        │ 创建 Bootstrap│
-  │ WaitingForCP │        │ Command      │
-  └──────┬───────┘        └──────┬───────┘
-         │                       │
-         │ CP 初始化完成           │
-         └───────→────────────────┤
-                                   │
-                          ┌────────┴────────┐
-                          │                 │
-                     失败  ▼            成功  ▼
-                   ┌──────────────┐  ┌──────────────┐
-                   │ Cond = False │  │ Ready = true │
-                   │ Bootstrap    │  │ Bootstrapped │
-                   │ Failed       │  │  = true      │
-                   │              │  │ Cond = True  │
-                   │ 移除标签      │  └──────────────┘
-                   │ 允许重试      │   (终态, 不可逆)
-                   └──────────────┘
-                          │
-                          │ 重新触发 Reconcile
-                          └──→ 回到创建 Bootstrap Command
+    Initial --> WaitingForCP: Worker + CP 未初始化
+    Initial --> BootstrapCmd: Master 或 CP 已初始化
+
+    WaitingForCP --> BootstrapCmd: CP 初始化完成
+
+    BootstrapCmd --> BootstrapFailed: 失败
+    BootstrapCmd --> BootstrapReady: 成功
+
+    BootstrapFailed --> BootstrapCmd: 重新触发 Reconcile<br/>(移除标签, 允许重试)
+
+    BootstrapReady --> [*]: Ready=true<br/>Bootstrapped=true<br/>Cond=True<br/>(终态, 不可逆)
+
+    note right of Initial: 布尔元组初始状态
+    note right of WaitingForCP: Cond = False<br/>(WaitingForControlPlaneAvailableReason)
+    note right of BootstrapFailed: Cond = False<br/>(NodeBootStrapFailedReason)
+    note right of BootstrapReady: Ready 和 Bootstrapped<br/>始终同时设置, 不可逆
 ```
 
 ### 5.4 节点 StateCode 生命周期
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    BKENode StateCode 生命周期                        │
-└─────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    S0["StateCode = 0<br/>初始状态"] --> S1["StateCode \|= 1 (bit 0)<br/>NodeAgentPushedFlag<br/>EnsureBKEAgent: bkeagent 推送成功"]
+    S1 --> S2["StateCode \|= 2 (bit 1)<br/>NodeAgentReadyFlag<br/>bkeagent 健康检查通过"]
+    S2 --> S3["StateCode \|= 4 (bit 2)<br/>NodeEnvFlag<br/>EnsureNodesEnv: 环境初始化完成"]
+    S3 --> S4["StateCode \|= 8 (bit 3)<br/>NodeBootFlag<br/>Bootstrap 命令成功"]
+    S4 --> S5["StateCode \|= 32 (bit 5)<br/>MasterInitFlag<br/>Master 节点 InitControlPlane"]
+    S5 --> S6["StateCode \|= 512 (bit 9)<br/>NodePostProcessFlag<br/>EnsureNodesPostProcess"]
+    S6 --> S527["StateCode = 527 (bootstrapReadyStateCode)<br/>= 1+2+4+8+32+512 = bits 0,1,2,3,5,9<br/>→ NodeState = Ready"]
 
-StateCode = 0 (初始状态)
-    │
-    │ EnsureBKEAgent 阶段
-    │ bkeagent 推送成功
-    ▼
-StateCode |= NodeAgentPushedFlag (bit 0, value=1)
-    │
-    │ bkeagent 健康检查通过
-    ▼
-StateCode |= NodeAgentReadyFlag (bit 1, value=2)
-    │
-    │ EnsureNodesEnv 阶段
-    │ 环境初始化完成
-    ▼
-StateCode |= NodeEnvFlag (bit 2, value=4)
-    │
-    │ Bootstrap 命令成功
-    ▼
-StateCode |= NodeBootFlag (bit 3, value=8)
-    │
-    │ Master 节点 InitControlPlane
-    ▼
-StateCode |= MasterInitFlag (bit 5, value=32)
-    │
-    │ EnsureNodesPostProcess 阶段
-    ▼
-StateCode |= NodePostProcessFlag (bit 9, value=512)
-    │
-    ▼
-StateCode = 527 (bootstrapReadyStateCode)
-    = 1 + 2 + 4 + 8 + 32 + 512
-    = bits 0,1,2,3,5,9
+    S527 -.->|"任意阶段失败"| Fail["StateCode \|= 128 (bit 7)<br/>NodeFailedFlag<br/>节点失败, 后续调谐跳过"]
+    S527 -.->|"节点删除中"| Del["StateCode \|= 64 (bit 6)<br/>NodeDeletingFlag<br/>⚠️ 代码中仅检查从未设置"]
 
-异常状态：
-  任意阶段失败 → StateCode |= NodeFailedFlag (bit 7, value=128)
-  节点删除中 → StateCode |= NodeDeletingFlag (bit 6, value=64)
-
-重试机制：
-  人工介入 → 清除 NodeFailedFlag → 重新执行失败阶段
+    Fail -.->|"人工介入: 清除 NodeFailedFlag"| S527
 ```
 
 ### 5.5 命令状态机
 
+```mermaid
+stateDiagram-v2
+    [*] --> Pending
+
+    Pending --> Running: Agent 拉取命令
+    Pending --> Suspend: Spec.Suspend=true
+
+    Running --> Completed: 所有子命令成功
+    Running --> Failed: 子命令失败
+    Running --> Suspend: Spec.Suspend=true
+
+    Suspend --> Running: Resume (Spec.Suspend=false)
+
+    Failed --> BackoffRetry: Count++, 未超限
+    BackoffRetry --> Completed: 重试成功
+    BackoffRetry --> Failed: 超过 BackoffLimit
+
+    Completed --> [*]
+    Failed --> [*]: 超过限制 (终态)
+
+    note right of Pending: 命令已创建, 等待 Agent 拉取
+    note right of Running: 至少一条子命令已启动
+    note right of Completed: 所有子命令成功, 终态
+    note right of Failed: 有子命令失败且不可跳过
+    note right of BackoffRetry: 重试等待中, Count 递增
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                        Command 状态转换图                            │
-└─────────────────────────────────────────────────────────────────────┘
 
-                         ┌──────────────┐
-                         │   Pending    │
-                         └──────┬───────┘
-                                │
-                    ┌───────────┴───────────┐
-                    │                       │
-                    ▼                       ▼
-          ┌─────────────────┐     ┌─────────────────┐
-          │    Running      │     │     Suspend     │
-          └────────┬────────┘     └────────┬────────┘
-                   │                       │
-         ┌─────────┴─────────┐             │
-         │                   │             │
-         ▼                   ▼             ▼
-┌─────────────────┐ ┌─────────────────┐ ┌──────────────┐
-│   Completed     │ │     Failed      │ │    Resume    │
-└─────────────────┘ └────────┬────────┘ └──────┬───────┘
-                             │                 │
-                             │                 │
-                             ▼                 ▼
-                      ┌──────────────┐  ┌──────────────┐
-                      │  BackoffRetry│  │   Running    │
-                      │ (Count++)    │  └──────────────┘
-                      └──────┬───────┘
-                             │
-                    ┌────────┴────────┐
-                    │                 │
-                    ▼                 ▼
-             ┌──────────┐     ┌──────────┐
-             │Completed │     │  Failed  │
-             │          │     │(超过限制)│
-             └──────────┘     └──────────┘
+**重试逻辑**：
 
-重试逻辑：
-  for backoffLimit >= 0 && condition.Count <= backoffLimit:
+```go
+for backoffLimit >= 0 && condition.Count <= backoffLimit:
     condition.Count++
     executeByType()
     if error:
-      condition.Status = ConditionFalse
-      condition.Phase = CommandFailed
-      continue
+        condition.Status = ConditionFalse
+        condition.Phase = CommandFailed
+        continue
     else:
-      condition.Status = ConditionTrue
-      condition.Phase = CommandComplete
-      break
+        condition.Status = ConditionTrue
+        condition.Phase = CommandComplete
+        break
 
-  if failed && BackoffIgnore:
+if failed && BackoffIgnore:
     Phase = CommandSkip
 ```
 
+**图中各状态的业务含义**：
+
+| 状态 | 业务说明 | 进入条件 | 可转换到 |
+|------|---------|---------|---------|
+| `Pending` | 命令已创建但尚未开始执行，等待 BKEAgent 拉取。初始状态 | Command CRD 创建 | `Running` / `Suspend` |
+| `Running` | 命令正在 BKEAgent 上执行中，至少一条子命令已启动 | Agent 拉取命令并开始执行 | `Completed` / `Failed` / `Suspend` |
+| `Suspend` | 命令被暂停（`Spec.Suspend=true`），暂停期间不执行新子命令 | 用户设置 `Spec.Suspend=true` | `Running`（Resume） |
+| `Completed` | 所有子命令执行成功，命令整体完成。终态 | 全部子命令 `Condition.Phase == CommandComplete` | （终态） |
+| `Failed` | 有子命令失败且不可跳过，或重试次数耗尽 | 子命令失败且 `BackoffIgnore=false` | `BackoffRetry`（未超限）/ 终态（超限） |
+| `BackoffRetry` | 重试等待中，`Condition.Count` 递增 | 失败且 `Count <= BackoffLimit` | `Completed`（重试成功）/ `Failed`（超限） |
+| `Skip` | 子命令被跳过。当 `BackoffIgnore=true` 且子命令失败时标记为 Skip 而非 Failed | 子命令失败 + `BackoffIgnore=true` | 不影响整体完成 |
+
+> 完整的 CommandPhase 定义见 [3.3.1 节](#331-commandphase7-个值)。
+
 ### 5.6 声明式升级状态机
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                 DeclarativeUpgrade 状态转换图                        │
-└─────────────────────────────────────────────────────────────────────┘
+**DeclarativeUpgradeStatus 字段**：
 
-DeclarativeUpgradeStatus:
-  TargetVersion: string          // 目标版本
-  StartedAt: *metav1.Time        // 开始时间
-  FinishedAt: *metav1.Time       // 完成时间
-  LastError: string              // 最后错误
-  LastFailure: *FailureRecord    // 最后失败记录
-  Completed: []ComponentRecord   // 已完成组件列表
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `TargetVersion` | `string` | 目标版本，变更时重置所有进度 |
+| `StartedAt` | `*metav1.Time` | 开始时间 |
+| `FinishedAt` | `*metav1.Time` | 完成时间 |
+| `LastError` | `string` | 最后错误信息 |
+| `LastFailure` | `*FailureRecord` | 最后失败记录（Name/Version/FailedAt/Error/Attempt） |
+| `Completed` | `[]ComponentRecord` | 已完成组件列表（Name/Version/CompletedAt） |
 
-状态转换：
-
-1. 初始化
-   EnsureInitialized(targetVersion, now)
-     ├─ if TargetVersion != targetVersion:
-     │     ResetForTarget(targetVersion, now)
-     │     └─ TargetVersion = targetVersion
-     │     └─ StartedAt = now
-     │     └─ FinishedAt = nil
-     │     └─ LastError = ""
-     │     └─ LastFailure = nil
-     │     └─ Completed = nil
-     └─ return true (表示重置)
-
-2. 组件执行
-   for each component in DAG:
-     ├─ if IsCompleted(name, version):
-     │     skip (幂等)
-     └─ executeComponent()
-           ├─ if success:
-           │     MarkCompleted(name, version, now)
-           │     └─ append to Completed
-           │     └─ clear LastError
-           │     └─ clear LastFailure
-           └─ if failed:
-                 MarkFailure(name, version, errMsg, now)
-                 └─ LastFailure.Name = name
-                 └─ LastFailure.Version = version
-                 └─ LastFailure.FailedAt = now
-                 └─ LastFailure.Error = errMsg
-                 └─ LastFailure.Attempt++ (连续失败)
-                 └─ LastError = errMsg
-
-3. 完成
-   completeDeclarativeUpgrade()
-     ├─ FinishedAt = now
-     ├─ LastError = ""
-     ├─ ClearFailure()
-     └─ remove upgrade-ready annotation
-
-4. 目标版本变更
-   if TargetVersion changes:
-     ResetForTarget(newTarget, now)
-     └─ 清除所有进度
-     └─ 重新开始升级
+```mermaid
+flowchart TD
+    Init["1. 初始化<br/>EnsureInitialized(targetVersion, now)"] --> CheckTarget{TargetVersion<br/>变更?}
+    CheckTarget -->|是| Reset["ResetForTarget:<br/>清除 Completed/LastError/LastFailure<br/>FinishedAt = nil"]
+    Reset --> Exec
+    CheckTarget -->|否| Exec["2. 组件执行<br/>for each component in DAG"]
+    Exec --> IsDone{IsCompleted<br/>(name, version)?}
+    IsDone -->|是| Skip["跳过 (幂等)"]
+    IsDone -->|否| Run["executeComponent()"]
+    Run -->|成功| MarkDone["MarkCompleted:<br/>追加到 Completed<br/>清除 LastError/LastFailure"]
+    Run -->|失败| MarkFail["MarkFailure:<br/>LastFailure.Attempt++<br/>LastError = errMsg"]
+    Skip --> Next[下一个组件]
+    MarkDone --> Next
+    MarkFail --> Next
+    Next --> AllDone{所有组件完成?}
+    AllDone -->|否| Exec
+    AllDone -->|是| Complete["3. 完成<br/>completeDeclarativeUpgrade:<br/>FinishedAt = now<br/>移除 upgrade-ready 注解"]
+    Complete --> VersionChange{TargetVersion<br/>再次变更?}
+    VersionChange -->|是| Reset
+    VersionChange -->|否| Done([升级完成])
 ```
 
 ---
@@ -1615,86 +1565,40 @@ BKEMachine (所有节点):
 
 **采用分层图 + 资源关联图**:
 
+```mermaid
+flowchart TD
+    subgraph 资源关联图
+        BKECluster["BKECluster"] -->|"1:N"| BKENode["BKENode"]
+        BKENode -->|"1:1"| BKEMachine["BKEMachine"]
+        BKENode -->|"1:N"| Command["Command"]
+        BKECluster -->|"1:1"| ClusterVersion["ClusterVersion"]
+        ClusterVersion -->|"1:1"| ReleaseImage["ReleaseImage"]
+        ReleaseImage -->|"1:N"| ComponentVersion["ComponentVersion"]
+    end
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    资源关联图（顶层）                             │
-└─────────────────────────────────────────────────────────────────┘
 
-BKECluster ──1:N──> BKENode ──1:1──> BKEMachine
-    │                    │
-    │                    └──1:N──> Command
-    │
-    └──1:1──> ClusterVersion ──1:1──> ReleaseImage ──1:N──> ComponentVersion
-
-┌─────────────────────────────────────────────────────────────────┐
-│                    集群状态机（第 5.1 节）                        │
-└─────────────────────────────────────────────────────────────────┘
-
-[ClusterStatus 状态转换图]
-
-┌─────────────────────────────────────────────────────────────────┐
-│                    节点状态机（第 5.2 节）                        │
-└─────────────────────────────────────────────────────────────────┘
-
-[BKENode State 状态转换图]
-
-┌─────────────────────────────────────────────────────────────────┐
-│                节点 StateCode 生命周期（第 5.4 节）               │
-└─────────────────────────────────────────────────────────────────┘
-
-[StateCode 位标记累积图]
-
-┌─────────────────────────────────────────────────────────────────┐
-│                    命令状态机（第 5.5 节）                        │
-└─────────────────────────────────────────────────────────────────┘
-
-[CommandPhase 状态转换图]
-
-┌─────────────────────────────────────────────────────────────────┐
-│                声明式升级状态机（第 5.6 节）                      │
-└─────────────────────────────────────────────────────────────────┘
-
-[DeclarativeUpgrade 状态转换图]
-```
+分层图引用：
+- 集群状态机 → [第 5.1 节](#51-集群状态机)
+- 节点状态机 → [第 5.2 节](#52-节点状态机)
+- StateCode 生命周期 → [第 5.4 节](#54-节点-statecode-生命周期)
+- 命令状态机 → [第 5.5 节](#55-命令状态机)
+- 声明式升级状态机 → [第 5.6 节](#56-声明式升级状态机)
 
 ### 8.4 替代方案
 
 如果需要单图展示，可以采用**简化版状态机**:
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    BKE 集群简化状态机                             │
-└─────────────────────────────────────────────────────────────────┘
-
-                    ┌──────────────┐
-                    │   Unknown    │
-                    └──────┬───────┘
-                           │
-                           ▼
-                    ┌──────────────┐
-                    │ Initializing │
-                    └──────┬───────┘
-                           │
-                    ┌──────┴───────┐
-                    │              │
-                    ▼              ▼
-             ┌──────────┐   ┌──────────┐
-             │  Ready   │   │  Failed  │
-             └────┬─────┘   └────┬─────┘
-                  │              │
-         ┌────────┴────────┐     │
-         │                 │     │
-         ▼                 ▼     │
-  ┌─────────────┐   ┌─────────┐  │
-  │  Upgrading  │   │ Deleting│  │
-  └──────┬──────┘   └────┬────┘  │
-         │               │       │
-         └───────┬───────┘       │
-                 │               │
-                 ▼               │
-          ┌──────────┐           │
-          │  Ready   │◄──────────┘
-          └──────────┘   (retry)
+```mermaid
+stateDiagram-v2
+    [*] --> Unknown
+    Unknown --> Initializing
+    Initializing --> Ready
+    Initializing --> Failed
+    Ready --> Upgrading
+    Ready --> Deleting
+    Upgrading --> Ready
+    Deleting --> Ready
+    Failed --> Ready: retry (人工介入)
 ```
 
 **简化说明**:
@@ -2059,69 +1963,41 @@ func (r *CommandReconciler) syncStatusUntilComplete(cmd *agentv1beta1.Command) (
 
 ### 10.1 状态依赖关系图
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         状态依赖关系总览                                      │
-└─────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph 集群层内部依赖
+        Phase1["Phase (当前执行阶段)"] --> ClusterStatus["ClusterStatus"]
+        ClusterHealthState["ClusterHealthState"] --> ClusterStatus
+        NodeAgg["节点聚合状态 + 组件健康状态"] --> ClusterHealthState
+        Conditions["Conditions (细粒度条件)"] --> ClusterStatus
+        Phase2["Phase (各阶段执行结果)"] --> PhaseStatus["PhaseStatus"]
+        Phase3["Phase (DAG 组件执行结果)"] --> DeclarativeUpgrade["DeclarativeUpgrade"]
+    end
 
-集群层内部依赖：
-  ┌─────────────────────────────────────────────────────┐
-  │                                                     │
-  │  ClusterStatus ←── Phase (当前执行阶段)              │
-  │       │                                             │
-  │       ├──← ClusterHealthState (健康视角)             │
-  │       │       │                                     │
-  │       │       └──← 节点聚合状态 + 组件健康状态         │
-  │       │                                             │
-  │       └──← Conditions (细粒度条件)                   │
-  │                                                     │
-  │  PhaseStatus ←── Phase (各阶段执行结果)               │
-  │                                                     │
-  │  DeclarativeUpgrade ←── Phase (DAG 组件执行结果)      │
-  │                                                     │
-  └─────────────────────────────────────────────────────┘
+    subgraph 节点层内部依赖
+        StateCode["StateCode (位标记聚合)"] --> NodeState["BKENode.State"]
+        BKEMachineReady["BKEMachine.Ready (引导完成标记)"] --> NodeState
+        PhaseBits["各 Phase 位标记"] --> StateCode
+        PhaseBits --> B0["NodeAgentPushedFlag (bit 0)"]
+        PhaseBits --> B1["NodeAgentReadyFlag (bit 1)"]
+        PhaseBits --> B2["NodeEnvFlag (bit 2)"]
+        PhaseBits --> B3["NodeBootFlag (bit 3)"]
+        PhaseBits --> B5["MasterInitFlag (bit 5)"]
+        PhaseBits --> B9["NodePostProcessFlag (bit 9)"]
+        PhaseBits --> B7["NodeFailedFlag (bit 7) ← 异常"]
+        PhaseBits --> B6["NodeDeletingFlag (bit 6) ← 删除"]
+    end
 
-节点层内部依赖：
-  ┌─────────────────────────────────────────────────────┐
-  │                                                     │
-  │  BKENode.State ←── StateCode (位标记聚合)            │
-  │       │                                             │
-  │       └──← BKEMachine.Ready (引导完成标记)            │
-  │                                                     │
-  │  StateCode ←── 各 Phase 位标记                       │
-  │       ├── NodeAgentPushedFlag (bit 0)               │
-  │       ├── NodeAgentReadyFlag  (bit 1)               │
-  │       ├── NodeEnvFlag         (bit 2)               │
-  │       ├── NodeBootFlag        (bit 3)               │
-  │       ├── MasterInitFlag      (bit 5)               │
-  │       ├── NodePostProcessFlag (bit 9)               │
-  │       ├── NodeFailedFlag      (bit 7)  ← 异常       │
-  │       └── NodeDeletingFlag    (bit 6)  ← 删除       │
-  │                                                     │
-  └─────────────────────────────────────────────────────┘
+    subgraph 命令层内部依赖
+        CondPhase["各子命令 Condition.Phase"] --> CommandPhase["Command.Phase"]
+        CondStatus["各子命令 Condition.Status"] --> CommandStatus["Command.Status"]
+    end
 
-命令层内部依赖：
-  ┌─────────────────────────────────────────────────────┐
-  │                                                     │
-  │  Command.Phase ←── 聚合(所有 Condition.Phase)        │
-  │       │                                             │
-  │       └──← 各子命令执行结果                           │
-  │                                                     │
-  │  Command.Status ←── 聚合(所有 Condition.Status)      │
-  │                                                     │
-  └─────────────────────────────────────────────────────┘
-
-跨层依赖：
-  ┌─────────────────────────────────────────────────────┐
-  │                                                     │
-  │  ClusterStatus ←── 聚合(所有 BKENode.State)          │
-  │                                                     │
-  │  ClusterHealthState ←── 聚合(所有 BKENode.State      │
-  │                         + 集群级组件状态)              │
-  │                                                     │
-  │  BKENode.State ←── 聚合(所有关联 Command.Phase)      │
-  │                                                     │
-  └─────────────────────────────────────────────────────┘
+    subgraph 跨层依赖
+        AllNodeState["聚合(所有 BKENode.State)"] --> CrossClusterStatus["ClusterStatus"]
+        AllNodeState2["聚合(所有 BKENode.State + 集群级组件状态)"] --> CrossClusterHealth["ClusterHealthState"]
+        AllCommandPhase["聚合(所有关联 Command.Phase)"] --> CrossNodeState["BKENode.State"]
+    end
 ```
 
 ### 10.2 状态聚合规则
@@ -2215,69 +2091,46 @@ func (r *CommandReconciler) syncStatusUntilComplete(cmd *agentv1beta1.Command) (
 
 #### 10.3.1 因果传播路径
 
+**路径 1：命令执行 → 节点状态 → 集群状态**
+
+```mermaid
+flowchart TD
+    A1["Command.Phase: Pending → Running → Completed"] --> A2["BKENode.StateCode \|= NodeBootFlag (bit 3)"]
+    A2 --> A3["BKENode.State: Provisioned → Ready<br/>(当 StateCode == 527)"]
+    A3 --> A4["ClusterStatus: Initializing → Ready<br/>(当所有节点 Ready)"]
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         状态因果传播路径                                      │
-└─────────────────────────────────────────────────────────────────────────────┘
 
-路径 1：命令执行 → 节点状态 → 集群状态
+**路径 2：Phase 执行 → 集群状态**
 
-  Command.Phase: Pending → Running → Completed
-       │
-       ▼
-  BKENode.StateCode |= NodeBootFlag (bit 3)
-       │
-       ▼
-  BKENode.State: Provisioned → Ready (当 StateCode == 527)
-       │
-       ▼
-  ClusterStatus: Initializing → Ready (当所有节点 Ready)
+```mermaid
+flowchart TD
+    B1["Phase.Execute() 成功/失败"] --> B2["ClusterStatus: 活跃状态 / *Failed<br/>(由 post-hook 设置)"]
+    B2 --> B3["StatusManager.recordBKEClusterStatus()"]
+    B3 --> B4{"失败次数"}
+    B4 -->|"≤ 10"| B5["保持当前状态, requeue"]
+    B4 -->|"> 10"| B6["ClusterHealthState 升级为 *Failed"]
+```
 
-路径 2：Phase 执行 → 集群状态
+**路径 3：节点变化 → 集群状态**
 
-  Phase.Execute() 成功/失败
-       │
-       ▼
-  ClusterStatus: 活跃状态 / *Failed (由 post-hook 设置)
-       │
-       ▼
-  StatusManager.recordBKEClusterStatus()
-       │
-       ├─ 失败次数 ≤ 10 → 保持当前状态，requeue
-       │
-       └─ 失败次数 > 10 → ClusterHealthState 升级为 *Failed
+```mermaid
+flowchart TD
+    C1["BKENode 创建/删除"] --> C2["BKEClusterReconciler.handleNodeChanges()"]
+    C2 --> C3{"操作类型"}
+    C3 -->|"新节点"| C4["StateCode = 0, State = Pending<br/>→ ClusterStatus = ClusterInitializing"]
+    C3 -->|"节点删除"| C5["StateCode \|= NodeDeletingFlag<br/>→ ClusterStatus = ClusterWorkerScalingDown"]
+```
 
-路径 3：节点变化 → 集群状态
+**路径 4：版本变更 → 声明式升级 → 组件状态**
 
-  BKENode 创建/删除
-       │
-       ▼
-  BKEClusterReconciler.handleNodeChanges()
-       │
-       ├─ 新节点 → StateCode = 0, State = Pending
-       │              → ClusterStatus = ClusterInitializing
-       │
-       └─ 节点删除 → StateCode |= NodeDeletingFlag
-                       → ClusterStatus = ClusterWorkerScalingDown
-
-路径 4：版本变更 → 声明式升级 → 组件状态
-
-  ClusterVersion.Spec.DesiredVersion 变更
-       │
-       ▼
-  BKECluster 注解: cvo.openfuyao.cn/upgrade-ready = "v2.6.0"
-       │
-       ▼
-  DeclarativeUpgrade.TargetVersion = "v2.6.0"
-       │
-       ▼
-  Scheduler.ExecuteDAG()
-       │
-       ├─ 组件成功 → DeclarativeUpgrade.Completed++
-       │              → ClusterStatus = ClusterUpgrading
-       │
-       └─ 组件失败 → DeclarativeUpgrade.LastFailure++
-                       → ClusterStatus = ClusterUpgradeFailed
+```mermaid
+flowchart TD
+    D1["ClusterVersion.Spec.DesiredVersion 变更"] --> D2["BKECluster 注解:<br/>cvo.openfuyao.cn/upgrade-ready = v2.6.0"]
+    D2 --> D3["DeclarativeUpgrade.TargetVersion = v2.6.0"]
+    D3 --> D4["Scheduler.ExecuteDAG()"]
+    D4 --> D5{"组件执行结果"}
+    D5 -->|成功| D6["DeclarativeUpgrade.Completed++<br/>→ ClusterStatus = ClusterUpgrading"]
+    D5 -->|失败| D7["DeclarativeUpgrade.LastFailure++<br/>→ ClusterStatus = ClusterUpgradeFailed"]
 ```
 
 #### 10.3.2 因果传播延迟
@@ -2298,49 +2151,37 @@ func (r *CommandReconciler) syncStatusUntilComplete(cmd *agentv1beta1.Command) (
 
 **处理策略**：
 
-```
-UpdateCombinedBKECluster() 保证原子性：
-  │
-  ├─ 1. 先持久化 BKENode（UpdateModifiedBKENodes）
-  │
-  ├─ 2. 再持久化 BKECluster（PatchHelper.Patch）
-  │
-  └─ 3. 如果 BKECluster Patch 失败（冲突）
-        └─ 重新读取 → 重新应用 → 重试
+```mermaid
+flowchart TD
+    A["UpdateCombinedBKECluster() 保证原子性"] --> B["1. 先持久化 BKENode<br/>(UpdateModifiedBKENodes)"]
+    B --> C["2. 再持久化 BKECluster<br/>(PatchHelper.Patch)"]
+    C --> D{"Patch 成功?"}
+    D -->|否| E["3. 重新读取 → 重新应用 → 重试"]
+    E --> C
+    D -->|是| F["完成"]
 ```
 
 #### 10.4.2 状态回滚级联
 
 **场景**：升级失败后回滚
 
-```
-回滚触发：
-  DeclarativeUpgrade.LastFailure.Attempt > 阈值
-       │
-       ▼
-  回滚传播：
-  │
-  ├─ 1. DeclarativeUpgrade.LastError = "升级失败"
-  │
-  ├─ 2. ClusterStatus = ClusterUpgradeFailed
-  │
-  ├─ 3. ClusterHealthState = UpgradeFailed (失败升级后)
-  │
-  ├─ 4. BKENode.StateCode |= NodeFailedFlag (失败节点)
-  │
-  └─ 5. BKENode.State = NodeFailed (失败节点)
-
-回滚恢复（人工介入）：
-  │
-  ├─ 1. 用户添加注解: bke.bocloud.com/retry=""
-  │
-  ├─ 2. BKEClusterReconciler.handleRetryLogic()
-  │     └─ BKENode.StateCode &= ^NodeFailedFlag (清除失败标记)
-  │
-  ├─ 3. StatusManager.ResetCache() (重置失败计数)
-  │
-  └─ 4. 重新执行失败阶段
-        └─ Phase 幂等执行，跳过已完成组件
+```mermaid
+flowchart TD
+    subgraph 回滚触发
+        T["DeclarativeUpgrade.LastFailure.Attempt > 阈值"]
+    end
+    subgraph 回滚传播
+        T --> R1["1. DeclarativeUpgrade.LastError = 升级失败"]
+        R1 --> R2["2. ClusterStatus = ClusterUpgradeFailed"]
+        R2 --> R3["3. ClusterHealthState = UpgradeFailed"]
+        R3 --> R4["4. BKENode.StateCode \|= NodeFailedFlag (失败节点)"]
+        R4 --> R5["5. BKENode.State = NodeFailed (失败节点)"]
+    end
+    subgraph 回滚恢复（人工介入）
+        S1["1. 用户添加注解: bke.bocloud.com/retry=''"] --> S2["2. BKEClusterReconciler.handleRetryLogic()<br/>BKENode.StateCode &= ^NodeFailedFlag"]
+        S2 --> S3["3. StatusManager.ResetCache()<br/>(重置失败计数)"]
+        S3 --> S4["4. 重新执行失败阶段<br/>Phase 幂等执行, 跳过已完成组件"]
+    end
 ```
 
 #### 10.4.3 状态不一致修复
@@ -2349,24 +2190,18 @@ UpdateCombinedBKECluster() 保证原子性：
 
 **修复机制**：
 
-```
-Reconcile 循环中自动修复：
-  │
-  ├─ 1. StatusManager.SetStatus() 重新评估节点状态
-  │     └─ 根据 StateCode 重新计算 State
-  │
-  ├─ 2. 如果 State 与 StateCode 不一致
-  │     └─ 以 StateCode 为准（StateCode 是事实来源）
-  │
-  └─ 3. 更新 BKENode.State 并持久化
-
-人工修复：
-  │
-  ├─ 1. 查看 StateCode: kubectl get bkenode <name> -o jsonpath='{.status.stateCode}'
-  │
-  ├─ 2. 手动修正: kubectl patch bkenode <name> --type merge --subresource status -p '{"status":{"stateCode":527}}'
-  │
-  └─ 3. 触发 Reconcile: kubectl annotate bkecluster <name> bke.bocloud.com/retry=""
+```mermaid
+flowchart TD
+    subgraph 自动修复（Reconcile 循环）
+        A1["1. StatusManager.SetStatus() 重新评估节点状态<br/>根据 StateCode 重新计算 State"] --> A2{"State 与 StateCode<br/>一致?"}
+        A2 -->|否| A3["2. 以 StateCode 为准<br/>(StateCode 是事实来源)"]
+        A3 --> A4["3. 更新 BKENode.State 并持久化"]
+        A2 -->|是| A5["无需修复"]
+    end
+    subgraph 人工修复
+        B1["1. 查看 StateCode:<br/>kubectl get bkenode &lt;name&gt; -o jsonpath='{.status.stateCode}'"] --> B2["2. 手动修正:<br/>kubectl patch bkenode &lt;name&gt; --type merge --subresource status -p '{...}'"]
+        B2 --> B3["3. 触发 Reconcile:<br/>kubectl annotate bkecluster &lt;name&gt; bke.bocloud.com/retry=''"]
+    end
 ```
 
 #### 10.4.4 状态冲突优先级
@@ -2410,30 +2245,21 @@ Command 与 Node 状态的交互存在三种不同的执行模式，按操作特
 
 **模式 A 数据流**（异步，bootstrap 为例）：
 
-```
-BKEMachine 控制器创建 Bootstrap Command → 返回
-       │
-       ▼ (bkeagent 拉取并执行)
-Command.Status[nodeKey].Phase = Running → Completed/Failed
-       │ (CommandUpdateCompleted predicate 触发 BKEMachine 重新入队)
-       ▼
-reconcileCommand → processBootstrapSuccess / processBootstrapFailure
-       │
-       ▼
-NodeFetcher.SetNodeState(NodeNotReady / NodeBootStrapFailed)
-NodeFetcher.MarkNodeStateFlag(NodeBootFlag)
+```mermaid
+flowchart TD
+    A["BKEMachine 控制器创建 Bootstrap Command → 返回"] --> B["bkeagent 拉取并执行<br/>Command.Status[nodeKey].Phase = Running → Completed/Failed"]
+    B --> C["CommandUpdateCompleted predicate<br/>触发 BKEMachine 重新入队"]
+    C --> D["reconcileCommand →<br/>processBootstrapSuccess / processBootstrapFailure"]
+    D --> E["NodeFetcher.SetNodeState(NodeNotReady / NodeBootStrapFailed)<br/>NodeFetcher.MarkNodeStateFlag(NodeBootFlag)"]
 ```
 
 **模式 B 数据流**（同步，env 为例）：
 
-```
-EnsureNodesEnv Phase 创建 ENV Command → 调用 Wait() 阻塞等待
-       │
-       ▼ (bkeagent 执行，Phase 轮询 CheckCommandStatus)
-Wait() 返回 (successNodes, failedNodes)
-       │
-       ▼
-Phase 直接设置: 成功 → NodeEnvFlag; 失败 → NodeInitFailed
+```mermaid
+flowchart TD
+    A["EnsureNodesEnv Phase 创建 ENV Command<br/>→ 调用 Wait() 阻塞等待"] --> B["bkeagent 执行<br/>Phase 轮询 CheckCommandStatus"]
+    B --> C["Wait() 返回 (successNodes, failedNodes)"]
+    C --> D["Phase 直接设置:<br/>成功 → NodeEnvFlag; 失败 → NodeInitFailed"]
 ```
 
 #### 10.5.3 双向数据流：StateCode 既是输入也是输出
@@ -2461,8 +2287,12 @@ StateCode 位标记在 Command 生命周期中扮演**双重角色**：
 
 **循环设计**：
 
-```
-StateCode 门控 → Command 创建/执行 → 结果写回 StateCode → 下一个 Phase 检查 StateCode 门控
+```mermaid
+flowchart LR
+    A["StateCode 门控"] --> B["Command 创建/执行"]
+    B --> C["结果写回 StateCode"]
+    C --> D["下一个 Phase 检查 StateCode 门控"]
+    D --> A
 ```
 
 此循环实现了**幂等性**（已完成的操作不重复执行）和**断点续装**（控制器重启后从 StateCode 恢复进度）。
@@ -2471,18 +2301,13 @@ StateCode 门控 → Command 创建/执行 → 结果写回 StateCode → 下一
 
 StatusManager **不读取 Command 结果**，它消费的是已被控制器设置好的 `BKENode.Status.State`，在 Node 状态层面提供容错：
 
-```
-Command 失败
-  → BKEMachine 控制器设置 BKENode.State = "BootStrapFailed"
-  → StatusManager.recordSingleNodeState 检测到 "Failed" 后缀
-  │
-  ├─ 重试次数内 (默认 10 次):
-  │   将 State 恢复为 LatestNormalState + NeedRequeue (状态伪装)
-  │   集群表现正常，控制器自动重试
-  │
-  └─ 超过重试次数:
-      保持 Failed 状态 + 设置 NodeFailedFlag (bit 7)
-      后续所有调谐跳过该节点，需人工清除标志位
+```mermaid
+flowchart TD
+    A["Command 失败"] --> B["BKEMachine 控制器设置<br/>BKENode.State = BootStrapFailed"]
+    B --> C["StatusManager.recordSingleNodeState<br/>检测到 Failed 后缀"]
+    C --> D{"重试次数"}
+    D -->|"≤ 10 (默认)"| E["将 State 恢复为 LatestNormalState + NeedRequeue<br/>(状态伪装)<br/>集群表现正常, 控制器自动重试"]
+    D -->|"> 10"| F["保持 Failed 状态<br/>+ 设置 NodeFailedFlag (bit 7)<br/>后续所有调谐跳过该节点<br/>需人工清除标志位"]
 ```
 
 > **设计意图**：Command 是一次性的执行单元（失败后由 StatusManager 触发重试），Node 状态是持久的聚合结果（带重试缓冲）。StatusManager 在 Node 状态层面而非 Command 层面提供容错，因为 Node 状态持久化在 CRD 中，可跨控制器重启存活。
@@ -2507,32 +2332,30 @@ BKENode.Spec.IP = "10.0.0.1"
 
 #### 10.5.6 设计思路总结
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                     三层分离设计                                    │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│  Command 层 (执行单元)                                              │
-│  ├── CommandPhase: Pending → Running → Completed/Failed            │
-│  ├── 一次性资源，执行完可清理 (RemoveAfterWait / TTL)                │
-│  └── 不持久化节点状态，仅记录命令执行结果                             │
-│                                                                     │
-│         ↕  翻译者: BKEMachine 控制器 / Phase 框架                    │
-│                                                                     │
-│  BKENode 层 (聚合状态)                                              │
-│  ├── State: 语义状态 (Ready/Failed/BootStrapping/...)              │
-│  ├── StateCode: 位标记累积 (10 位, 事实来源)                         │
-│  ├── 持久化在 CRD Status 中，跨重启存活                              │
-│  └── StateCode 双向: 门控 Command 创建 ← → Command 结果写回          │
-│                                                                     │
-│         ↕  缓冲层: StatusManager                                    │
-│                                                                     │
-│  StatusManager 层 (重试/升级)                                       │
-│  ├── 不读 Command，只读 BKENode.State                               │
-│  ├── 失败重试: 恢复 LatestNormalState + NeedRequeue (状态伪装)       │
-│  └── 超限升级: 保持 Failed + NodeFailedFlag (永久跳过)               │
-│                                                                     │
-└─────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph Command层["Command 层 (执行单元)"]
+        C1["CommandPhase: Pending → Running → Completed/Failed"]
+        C2["一次性资源, 执行完可清理<br/>(RemoveAfterWait / TTL)"]
+        C3["不持久化节点状态, 仅记录命令执行结果"]
+    end
+
+    Command层 -->|"↕ 翻译者: BKEMachine 控制器 / Phase 框架"| BKENode层
+
+    subgraph BKENode层["BKENode 层 (聚合状态)"]
+        N1["State: 语义状态 (Ready/Failed/BootStrapping/...)"]
+        N2["StateCode: 位标记累积 (10 位, 事实来源)"]
+        N3["持久化在 CRD Status 中, 跨重启存活"]
+        N4["StateCode 双向: 门控 Command 创建 ← → Command 结果写回"]
+    end
+
+    BKENode层 -->|"↕ 缓冲层: StatusManager"| StatusManager层
+
+    subgraph StatusManager层["StatusManager 层 (重试/升级)"]
+        S1["不读 Command, 只读 BKENode.State"]
+        S2["失败重试: 恢复 LatestNormalState + NeedRequeue (状态伪装)"]
+        S3["超限升级: 保持 Failed + NodeFailedFlag (永久跳过)"]
+    end
 ```
 
 **核心设计决策**：
