@@ -630,13 +630,12 @@ stateDiagram-v2
     Unhealthy --> Checking
 
     Deleted --> [*]
-
-    note right of Unknown: 集群状态无法判定
-    note right of Ready: 所有节点就绪 + 健康检查通过
-    note right of Unhealthy: 健康检查失败, 不触发失败计数
-    note right of Failed: 统一表示各种 *Failed 状态
 ```
-
+> - note right of Unknown: 集群状态无法判定
+> - note right of Ready: 所有节点就绪 + 健康检查通过
+> - note right of Unhealthy: 健康检查失败, 不触发失败计数
+> - note right of Failed: 统一表示各种 *Failed 状态
+    
 **图中各状态的业务含义**：
 
 | 状态 | 分类 | 业务说明 | 进入条件 | 可转换到 |
