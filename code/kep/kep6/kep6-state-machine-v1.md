@@ -795,6 +795,45 @@ BKEMachine 控制器在引导过程中**直接修改 BKENode 的 State 和 State
   → bootstrapNodeFailed = true (阻塞集群就绪)
 ```
 
+##### 聚合流程图
+
+```mermaid
+flowchart TD
+    Start["reconcileBKEMachine<br/>(phases.go:861-892)"] --> Short{"TargetClusterBootCondition<br/>已为 True?"}
+    Short -->|是| Return["直接返回 (幂等短路)"]
+    Short -->|否| Gather["获取所有 BKEMachine + BKENode"]
+    Gather --> Check["checkBootstrapStatus()<br/>计算三个布尔值"]
+    Check --> Decide{"allBootFlag?<br/>(所有节点已成功或失败)"}
+    Decide -->|true| AllBoot["handleAllNodesBootstrapped:<br/>设置 KubernetesVersion<br/>return (退出)"]
+    Decide -->|false| Booting["handleClusterBooting:<br/>TargetClusterBootCondition = False<br/>(TargetClusterBootingReason)"]
+```
+
+##### 聚合条件定义
+
+| 布尔值 | 计算逻辑 | 代码位置 | 含义 |
+|--------|---------|---------|------|
+| `clusterReady` | `bkeMachineNum != 0 && bkeMachineNum == nodesNum && 所有 BM.Bootstrapped == true` | `checkBootstrapStatus:921-934` | BKEMachine 数量等于节点数且全部引导完成 |
+| `bootstrapNodeFailed` | 任意 BM 的 `BootstrapSucceededCondition.reason == NodeBootStrapFailedReason` | `checkBootstrapStatus:928-930` | 存在引导失败的节点 |
+| `allBootFlag` | `successBootNodeNum + failedBootNodeNum == nodesNum` | `handleClusterState:950` | 所有节点都已结束引导（成功或失败），无待定节点 |
+
+> `successBootNodeNum` 和 `failedBootNodeNum` 由 `CalculateBKEMachineBootNum`（`phaseutil/bkemachine.go:32-49`）计算：仅统计有 `BootstrapSucceededCondition` 的 BKEMachine，`True` + `Bootstrapped` 计为成功，`False` + `NodeBootStrapFailedReason` 计为失败。
+
+##### 聚合输出
+
+| 聚合结果 | 设置的 BKECluster 字段 | 值 | 设置函数 |
+|---------|----------------------|-----|---------|
+| 所有节点引导完成（不论成功失败） | `Status.KubernetesVersion` | `Spec.ClusterConfig.Cluster.KubernetesVersion` | `handleAllNodesBootstrapped` |
+| 部分节点尚未完成引导 | `TargetClusterBootCondition` | `False` (reason: `TargetClusterBootingReason`) | `handleClusterBooting` |
+| （不可达）所有成功 | `TargetClusterBootCondition` | `True` (reason: `TargetClusterBootReadyReason`) | `handleClusterReady` |
+| （不可达）有失败 | `TargetClusterBootCondition` | `False` (reason: `NodeBootStrapFailedReason`) | `handleBootstrapFailure` |
+
+##### 设计要点
+
+- **幂等短路**：`TargetClusterBootCondition` 已为 True 时直接返回，避免重复聚合
+- **全量聚合**：每次聚合遍历所有 BKEMachine，非增量式——BKEMachine 数量必须等于 BKENode 数量才认为集群可能就绪
+- **聚合时机**：由 BKEMachine 控制器在每次引导完成（成功/失败）后触发，非定时轮询
+- **代码观察**：`handleClusterState`（`phases.go:941-967`）中 `handleBootstrapFailure` 和 `handleClusterReady` 两个分支的条件都含 `allBootFlag`，但第一个 `if allBootFlag` 已 `return`，这两个分支实际不可达。`TargetClusterBootCondition=True` 由 `EnsureCluster` Phase 的健康检查设置，非由本聚合函数设置
+
 #### 5.3.5 BKEMachine 删除流程
 
 BKEMachine 删除时**不翻转 `Ready`/`Bootstrapped`**，而是通过注解 + finalizer 机制：
