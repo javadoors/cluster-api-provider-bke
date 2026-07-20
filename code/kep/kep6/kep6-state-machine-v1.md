@@ -643,6 +643,28 @@ const (
   DryRun → DryRunFailed
 ```
 
+**图中各状态的业务含义**：
+
+| 状态 | 分类 | 业务说明 | 进入条件 | 可转换到 |
+|------|------|---------|---------|---------|
+| `Unknown` | 初始 | 集群状态无法判定，通常为新建集群尚未开始任何操作 | 集群创建后的默认状态 | `Initializing` / `Checking` |
+| `Initializing` | 安装中 | 集群首次安装进行中，涵盖 Finalizer/Certs/MasterInit/BKEAgent/NodesEnv 等 8 个 Phase 的执行 | `ClusterInitPhaseNames` 中任意 Phase 开始执行 | `DeployingAddon` / `Ready` / `InitializationFailed` |
+| `Checking` | 检查中 | `EnsureCluster` 阶段前置 Hook 设置的中间状态，正在进行集群健康检查 | `EnsureCluster` Phase 前置 Hook | `Ready` / `Unhealthy` |
+| `DeployingAddon` | 安装中 | `EnsureAddonDeploy` Phase 执行中，正在部署集群组件（coredns/metrics-server 等） | `EnsureAddonDeploy` Phase 开始 | `Ready` / `DeployAddonFailed` |
+| `Ready` | 稳态 | 集群所有节点就绪、健康检查通过，处于稳定运行态。安装/升级/扩缩容的最终目标状态 | 所有节点 Ready + 健康检查通过 | `Upgrading` / `Managing` / `Deleting` / `Paused` / `ScalingUp` / `ScalingDown` |
+| `Unhealthy` | 异常 | 集群健康检查失败（节点不可达或组件异常）。不触发 StatusManager 失败计数，持续重试 | `EnsureCluster` 健康检查失败 | `Ready`（恢复后）/ `Checking` |
+| `Upgrading` | 升级中 | 升级 Phase 执行中（旧路径 5 个或 DAG 路径 6 个 Phase） | 升级 Phase 开始执行 | `ScalingUp` / `ScalingDown` / `Ready` / `UpgradeFailed` |
+| `ScalingUp` | 扩容中 | 正在向集群添加节点（Master 或 Worker），合并显示 MasterScalingUp / WorkerScalingUp | `EnsureMasterJoin` / `EnsureWorkerJoin` Phase 执行中 | `Ready` / `ScaleFailed` |
+| `ScalingDown` | 缩容中 | 正在从集群移除节点（Master 或 Worker），合并显示 MasterScalingDown / WorkerScalingDown | `EnsureMasterDelete` / `EnsureWorkerDelete` Phase 执行中 | `Ready` / `ScaleFailed` |
+| `Managing` | 纳管中 | `EnsureClusterManage` Phase 执行中，正在纳管已有集群 | 纳管操作触发 | `Ready` / `ManageFailed` |
+| `Deleting` | 删除中 | `EnsureDeleteOrReset` Phase 执行中，集群正在被删除 | 删除操作触发 | `Deleted` / `DeleteFailed` |
+| `Deleted` | 终态 | 集群删除完成，资源被垃圾回收 | 删除流程完成 | （终态，无后续转换） |
+| `Paused` | 暂停 | 集群暂停调谐，不执行任何 Phase，用于维护窗口 | `EnsurePaused` Phase 成功 | `Resume` → `Ready` / `PauseFailed` |
+| `Failed` | 失败 | 图中统一表示各种 `*Failed` 状态（`InitializationFailed`/`UpgradeFailed`/`ScaleFailed`/`DeployAddonFailed` 等） | 对应 Phase 执行失败 | `Retry`（StatusManager 重试恢复）/ 保持 `Failed`（超限后） |
+| `DryRun` | 验证 | DryRun 模式，仅验证配置不实际部署 | `EnsureDryRun` Phase 执行 | `DryRunFailed` / `Ready` |
+
+> 完整的 ClusterStatus 20 个值定义及详细业务说明见 [3.1.1 节](#311-clusterstatus20-个值)。上图中的 `ScalingUp`/`ScalingDown`/`Failed` 为合并展示，实际代码中分别对应 `ClusterMasterScalingUp`/`ClusterWorkerScalingUp`/`ClusterMasterScalingDown`/`ClusterWorkerScalingDown` 和 8 个独立的 `*Failed` 状态。
+
 ### 5.2 节点状态机
 
 节点层包含 BKENode 和 BKEMachine 两个资源，各自有独立的状态模型。本节分别给出两者的状态转换概览；BKEMachine 的详细设计见 5.3 节。
