@@ -2308,7 +2308,7 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    subgraph 自动修复（Reconcile 循环）
+    subgraph "自动修复（Reconcile 循环）"
         A1["1. StatusManager.SetStatus() 重新评估节点状态<br/>根据 StateCode 重新计算 State"] --> A2{"State 与 StateCode<br/>一致?"}
         A2 -->|否| A3["2. 以 StateCode 为准<br/>(StateCode 是事实来源)"]
         A3 --> A4["3. 更新 BKENode.State 并持久化"]
