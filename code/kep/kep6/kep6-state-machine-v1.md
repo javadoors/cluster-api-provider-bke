@@ -2422,8 +2422,8 @@ flowchart TD
     A["Command 失败"] --> B["BKEMachine 控制器设置<br/>BKENode.State = BootStrapFailed"]
     B --> C["StatusManager.recordSingleNodeState<br/>检测到 Failed 后缀"]
     C --> D{"重试次数"}
-    D -->|"≤ 10 (默认)"| E["将 State 恢复为 LatestNormalState + NeedRequeue<br/>(状态伪装)<br/>集群表现正常, 控制器自动重试"]
-    D -->|"> 10"| F["保持 Failed 状态<br/>+ 设置 NodeFailedFlag (bit 7)<br/>后续所有调谐跳过该节点<br/>需人工清除标志位"]
+    D -->|未超限 (默认10次)| E["将 State 恢复为 LatestNormalState + NeedRequeue<br/>(状态伪装)<br/>集群表现正常, 控制器自动重试"]
+    D -->|已超限| F["保持 Failed 状态<br/>+ 设置 NodeFailedFlag (bit 7)<br/>后续所有调谐跳过该节点<br/>需人工清除标志位"]
 ```
 
 > **设计意图**：Command 是一次性的执行单元（失败后由 StatusManager 触发重试），Node 状态是持久的聚合结果（带重试缓冲）。StatusManager 在 Node 状态层面而非 Command 层面提供容错，因为 Node 状态持久化在 CRD 中，可跨控制器重启存活。
