@@ -886,6 +886,174 @@ gantt
 2. **监控**：API 服务器指标监控（请求延迟、队列长度、CPU/内存使用率）
 3. **负载测试工具**：用于模拟 API 服务器负载和测量客户端性能的工具
 
+## 规格与验收标准
+
+### 核心规格
+
+#### 1. 性能规格
+
+| 指标 | 当前值 | 目标值 | 验收标准 |
+|------|--------|--------|----------|
+| API 发现时间 | 9 分 37 秒 | ≤ 30 秒 | 64 节点集群端到端测试 |
+| API 限流事件 | 57 次 | 0 次 | 控制器日志中无 client-side throttling 警告 |
+| 单次请求平均等待时间 | ~10 秒 | 0 秒 | QPS=50/Burst=100 下无排队等待 |
+| 最大请求等待时间 | 9.20 秒 | 0 秒 | Burst 容量覆盖所有并发请求 |
+| 集群创建总时间 | 29 分 29 秒 | ≤ 18 分钟 | 64 节点集群端到端测试 |
+
+#### 2. 功能规格
+
+**集中化 QPS/Burst 配置**
+- 默认值：QPS=50，Burst=100
+- 配置优先级：命令行标志 > 环境变量 > 默认值
+- 命令行标志：`--client-qps`、`--client-burst`
+- 环境变量：`KUBE_CLIENT_QPS`、`KUBE_CLIENT_Burst`
+- 工厂层为唯一真实来源（`ApplyThrottlingConfig`），所有客户端创建必须经过工厂方法
+
+**全局 RESTMapper 单例**
+- 使用 `sync.Once` 保证线程安全初始化
+- 使用 `memory.NewMemCacheClient` 实现内存缓存
+- 首次调用触发 API 发现，后续调用直接返回缓存实例
+- 缓存在进程生命周期内有效，不支持动态失效
+
+**配置覆盖范围**
+- `cmd/capbke/main.go`：Manager 配置
+- `cmd/bkeagent/main.go`：Agent Manager 配置
+- `pkg/kube/kube.go`：远程集群客户端
+- `pkg/kube/wait.go`：RESTMapper 调用
+- `pkg/kube/helm.go`：Helm RESTMapper 调用
+
+#### 3. 配置参数规格
+
+| 参数 | 类型 | 默认值 | 命令行标志 | 环境变量 | 约束 |
+|------|------|--------|-----------|----------|------|
+| ClientQPS | float32 | 50 | `--client-qps` | `KUBE_CLIENT_QPS` | > 0 |
+| ClientBurst | int | 100 | `--client-burst` | `KUBE_CLIENT_BURST` | > 0 |
+
+#### 4. API 服务器安全规格
+
+| 指标 | 告警阈值 | 说明 |
+|------|----------|------|
+| API Server 请求速率 | > 1000 QPS | 防止过载 |
+| API Server 请求延迟 | P99 > 1s | 监控性能影响 |
+| RESTMapper 缓存命中率 | < 95% | 验证缓存效果 |
+
+### 验收标准
+
+#### Alpha 阶段 (v0.1)
+
+| 验收项 | 验收标准 | 验证方法 |
+|--------|----------|----------|
+| 集中化 QPS/Burst 配置实现 | 配置层 + 工厂层代码完整 | 单元测试通过 |
+| 全局 RESTMapper 单例实现 | `sync.Once` + 内存缓存 | 单元测试验证单例 |
+| 命令行标志支持 | `--client-qps` / `--client-burst` 可解析 | 启动参数测试 |
+| 环境变量支持 | `KUBE_CLIENT_QPS` / `KUBE_CLIENT_BURST` 可读取 | 环境变量测试 |
+| 单元测试通过 | 覆盖率 ≥ 80% | `go test -cover` |
+| 现有功能无回归 | 所有现有测试通过 | `go test ./...` |
+
+#### Beta 阶段 (v0.2)
+
+| 验收项 | 验收标准 | 验证方法 |
+|--------|----------|----------|
+| 集成测试通过 | 所有测试用例通过 | `go test ./...` |
+| API 发现时间 | < 30 秒 | 集成测试验证 |
+| 客户端限流警告 | 日志中无 client-side throttling | 日志分析 |
+| API 服务器负载 | 请求速率在可接受范围内 | Prometheus 监控 |
+| 所有使用层已迁移 | 5 个文件均使用工厂方法 | 代码审查 |
+
+#### Stable 阶段 (v1.0)
+
+| 验收项 | 验收标准 | 验证方法 |
+|--------|----------|----------|
+| 端到端测试通过 | 64 节点集群创建成功 | E2E 测试 |
+| 集群创建总时间 | < 20 分钟 | 生产环境监控 |
+| API 限流事件 | 0 次 | 日志分析 |
+| API 服务器稳定性 | 无过载告警 | Prometheus 监控 |
+| 生产稳定性 | 运行 1 个月无问题 | 生产监控 |
+
+### 测试用例规格
+
+#### 单元测试
+
+```go
+// 1. 配置层测试
+TestClientQPSDefault: 验证默认值为 50
+TestClientBurstDefault: 验证默认值为 100
+TestEnvVarOverride: 验证环境变量覆盖默认值
+TestFlagOverride: 验证命令行标志覆盖环境变量
+TestPriorityOrder: 验证优先级：flag > env > default
+
+// 2. 工厂层测试
+TestApplyThrottlingConfig_NilConfig: nil 输入返回 nil
+TestApplyThrottlingConfig_DefaultValues: 验证默认 QPS/Burst 应用
+TestApplyThrottlingConfig_OverrideExisting: 验证覆盖已有值
+TestNewClientFromConfig: 验证客户端创建并应用限流配置
+TestNewDynamicClientFromConfig: 验证动态客户端创建
+TestGetManagerConfig: 验证 Manager 配置应用限流参数
+
+// 3. RESTMapper 单例测试
+TestGetGlobalRESTMapper_Singleton: 验证多次调用返回相同实例
+TestGetGlobalRESTMapper_ConcurrentAccess: 验证并发访问线程安全
+TestGetGlobalRESTMapper_CacheHit: 验证首次调用后无 API 请求
+```
+
+#### 集成测试
+
+```go
+// 性能测试
+TestAPIDiscoveryPerformance: API 发现 < 30 秒
+TestClientThrottlingEliminated: 日志中无限流警告
+
+// 并发测试
+TestConcurrentRESTMapperAccess: 100 goroutine 并发访问 RESTMapper
+TestConcurrentClientCreation: 多 goroutine 并发创建客户端
+
+// 压力测试
+TestHighAPILoad: QPS=50 下 API Server 无过载
+```
+
+#### 端到端测试
+
+```bash
+# 1. 限流消除验证
+kubectl logs -f -n bke-system deployment/bke-controller-manager | grep "client-side throttling"
+# 验证: 无限流警告
+
+# 2. 集群创建性能测试
+kubectl apply -f bkecluster-64n.yaml
+# 验证: 集群创建总时间 < 20 分钟
+
+# 3. API Server 负载监控
+kubectl top pods -n kube-system | grep kube-apiserver
+# 验证: API Server 无过载
+
+# 4. RESTMapper 缓存验证
+kubectl logs -n bke-system deployment/bke-controller-manager | grep "RESTMapper"
+# 验证: 仅首次调用触发 API 发现
+```
+
+### 监控告警规格
+
+| 指标 | 采集方式 | 告警阈值 | 说明 |
+|------|----------|----------|------|
+| API 发现时间 | Prometheus | > 30 秒 | 超过目标值 |
+| 客户端限流次数 | 日志 | > 0 | 应完全消除 |
+| API Server 请求速率 | Prometheus | > 1000 QPS | 防止过载 |
+| API Server 请求延迟 | Prometheus | P99 > 1s | 性能影响监控 |
+| RESTMapper 缓存命中率 | 自定义指标 | < 95% | 验证缓存效果 |
+| QPS/Burst 配置值 | 启动日志 | 与预期不符 | 配置验证 |
+
+### 交付物清单
+
+| 交付物 | 路径 | 验收标准 |
+|--------|------|----------|
+| 配置层 | `utils/capbke/config/config.go` | 单元测试通过 |
+| 工厂层 | `pkg/kube/client_factory.go` | 单元测试通过 |
+| RESTMapper 单例 | `pkg/kube/restmapper.go` | 单例 + 并发测试通过 |
+| 使用层修改 | `pkg/kube/kube.go`, `cmd/capbke/main.go`, `cmd/bkeagent/main.go`, `pkg/kube/wait.go`, `pkg/kube/helm.go` | 所有客户端创建经工厂方法 |
+| 单元测试 | `pkg/kube/client_factory_test.go`, `pkg/kube/restmapper_test.go` | 覆盖率 ≥ 80% |
+| 集成测试 | `test/integration/performance_test.go` | API 发现 < 30s |
+| 文档 | 配置说明、发布说明 | 文档完整 |
+
 ## 参考资料
 
 1. [Kubernetes client-go 速率限制](https://github.com/kubernetes/client-go/blob/master/rest/request.go)

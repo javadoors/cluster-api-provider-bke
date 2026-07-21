@@ -1331,6 +1331,147 @@ gantt
 2. **监控工具**：Prometheus + Grafana 用于监控健康检查性能
 3. **日志系统**：ELK 或 Loki 用于分析健康检查日志
 
+## 规格与验收标准
+
+### 核心规格
+
+#### 1. 性能规格
+
+| 指标 | 当前值 | 目标值 | 验收标准 |
+|------|--------|--------|----------|
+| 健康检查收敛时间 | 7 分 14 秒 | ≤ 3 分钟 | 64 节点集群端到端测试 |
+| API 调用次数 | ~100 次/检查 | ≤ 10 次/检查 | Informer 首次同步后 |
+| Master NotReady 次数 | 3 次 | 0 次 | 完整集群创建周期无 NotReady 事件 |
+| 关键组件失败检测时间 | ~7 分钟 | ≤ 1 秒 | 关键组件失败立即返回 |
+
+#### 2. 功能规格
+
+**统一健康检查器**
+- 支持 4 阶段渐进式检查：节点 → 关键组件 → 重要组件 → 非关键组件
+- 每个阶段内并行检查
+- 关键组件失败立即返回，重要/非关键组件失败记录警告继续
+
+**缓存机制**
+- 优先方案：Informer 实时缓存（毫秒级）
+- 备选方案：ResourceVersion + TTL 混合缓存（秒级）
+- 首次同步后零 API 调用（Informer）或 70% 条件查询命中（RV+TTL）
+
+**动态间隔**
+
+| 检查结果 | 重试间隔 |
+|----------|----------|
+| 节点/关键组件失败 | 5 秒 |
+| 重要组件失败 | 15 秒 |
+| 非关键组件失败 | 30 秒 |
+| 全部成功 | 5 分钟 |
+
+**配置支持**
+- 配置文件：`/etc/bke/health-check-config.yaml`
+- 配置加载失败时使用默认配置
+- 支持自定义组件清单和检查间隔
+
+#### 3. 组件清单规格
+
+| 优先级 | 组件 | 命名空间 | 前缀 |
+|--------|------|----------|------|
+| 关键 | etcd, kube-apiserver, kube-controller-manager, kube-scheduler | kube-system | etcd-, kube-apiserver-, kube-controller-manager-, kube-scheduler- |
+| 重要 | calico-kube-controllers, calico-node, coredns, kube-proxy | kube-system | calico-kube-controllers, calico-node, coredns, kube-proxy- |
+| 非关键 | metrics-server, ingress-nginx, prometheus, alertmanager, node-exporter, console-service, oauth-server, local-harbor | 各命名空间 | 见配置文件 |
+
+### 验收标准
+
+#### Alpha 阶段 (v0.1)
+
+| 验收项 | 验收标准 | 验证方法 |
+|--------|----------|----------|
+| 统一健康检查器实现 | 4 阶段检查逻辑完整 | 单元测试通过 |
+| Informer 缓存实现 | 首次同步后零 API 调用 | 集成测试验证 |
+| 动态间隔实现 | 4 种间隔正确切换 | 单元测试覆盖 |
+| 单元测试通过 | 覆盖率 ≥ 80% | `go test -cover` |
+
+#### Beta 阶段 (v0.2)
+
+| 验收项 | 验收标准 | 验证方法 |
+|--------|----------|----------|
+| 集成测试通过 | 所有测试用例通过 | `go test ./...` |
+| 健康检查时间 | < 2 分钟 | 64 节点集群测试 |
+| API 调用次数 | < 10 次 | 监控指标验证 |
+| 配置文件支持 | 加载/解析/默认值正确 | 配置文件测试 |
+
+#### Stable 阶段 (v1.0)
+
+| 验收项 | 验收标准 | 验证方法 |
+|--------|----------|----------|
+| 端到端测试通过 | 64 节点集群创建成功 | E2E 测试 |
+| 健康检查时间 | < 1 分钟 | 生产环境监控 |
+| Master NotReady 次数 | 0 次 | 日志分析 |
+| 生产稳定性 | 运行 1 个月无问题 | 生产监控 |
+
+### 测试用例规格
+
+#### 单元测试
+
+```go
+// 1. 统一健康检查器测试
+TestUnifiedHealthCheck: 验证 64 节点集群健康检查 < 3 分钟
+TestCriticalComponentFastFail: 验证关键组件失败 < 1 秒返回
+TestDynamicRequeueInterval: 验证 4 种间隔正确切换
+
+// 2. 缓存层测试
+TestInformerCache: 验证首次同步后零 API 调用
+TestRVTTLCache: 验证条件查询命中率 > 70%
+TestCacheConsistency: 验证缓存数据与 API Server 一致
+```
+
+#### 集成测试
+
+```go
+// 性能测试
+TestHealthCheckPerformance: 64 节点集群健康检查 < 1 分钟，API 调用 < 10 次
+
+// 故障注入测试
+TestNodeNotReady: 模拟节点 NotReady，验证检查逻辑
+TestCriticalComponentDown: 模拟 etcd 宕机，验证快速失败
+TestCacheSyncDelay: 模拟 Informer 同步延迟，验证降级逻辑
+```
+
+#### 端到端测试
+
+```bash
+# 1. 集群创建性能测试
+kubectl apply -f bkecluster-64n.yaml
+# 验证: ClusterUnhealthy → ClusterReady < 1 分钟
+
+# 2. Master 稳定性测试
+kubectl get nodes -l node-role.kubernetes.io/master -w
+# 验证: 无 NotReady 事件
+
+# 3. 健康检查日志验证
+kubectl logs -n bke-system deployment/bke-controller-manager | grep "health check"
+# 验证: 无频繁重试，检查通过
+```
+
+### 监控告警规格
+
+| 指标 | 采集方式 | 告警阈值 | 说明 |
+|------|----------|----------|------|
+| 健康检查时间 | Prometheus | > 3 分钟 | 超过目标值 |
+| API 调用次数 | Prometheus | > 50 次/检查 | 缓存失效 |
+| Master NotReady 次数 | 日志 | > 0 | 应完全消除 |
+| Informer 同步时间 | Prometheus | > 30 秒 | 首次同步超时 |
+| 缓存命中率 | 自定义指标 | < 90% | 缓存效果不佳 |
+
+### 交付物清单
+
+| 交付物 | 路径 | 验收标准 |
+|--------|------|----------|
+| 统一健康检查器 | `pkg/kube/health.go` | 单元测试通过 |
+| 缓存层 | `pkg/kube/health_cache.go` | 集成测试通过 |
+| 配置文件 | `/etc/bke/health-check-config.yaml` | 加载测试通过 |
+| 单元测试 | `pkg/kube/health_test.go` | 覆盖率 ≥ 80% |
+| 集成测试 | `test/integration/health_check_test.go` | 性能达标 |
+| 文档 | 配置说明、发布说明 | 文档完整 |
+
 ## 参考资料
 
 1. [Kubernetes Health Checking](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)

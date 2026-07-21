@@ -1256,6 +1256,195 @@ gantt
 2. **监控工具**：Prometheus + Grafana 用于监控 Calico 部署性能
 3. **日志系统**：ELK 或 Loki 用于分析部署日志
 
+## 规格与验收标准
+
+### 核心规格
+
+#### 1. 性能规格
+
+| 指标 | 当前值 | 目标值 | 验收标准 |
+|------|--------|--------|----------|
+| Calico 部署总时间 | 3 分 15 秒 | ≤ 1 分 35 秒 | 64 节点集群端到端测试 |
+| 镜像拉取时间 | ~1 分钟 | ~10 秒 | 镜像预置后本地拉取 |
+| 网络初始化时间 | ~1.5 分钟 | ~30 秒 | VXLAN 模式下无 BGP 会话建立 |
+| 控制面注册时间 | ~30 秒 | ~10 秒 | 仅启用 node 控制器 |
+| 配置加载时间 | ~15 秒 | ~5 秒 | 禁用 Prometheus 指标和启动清理 |
+
+#### 2. 功能规格
+
+**镜像预置**
+- 在 K8sEnvInit 阶段（`scope=image`）提前拉取 Calico 镜像
+- 镜像列表从 BKECluster CRD 的 `addons.calico.version` 动态获取
+- 预拉取 4 个镜像：calico/node、calico/cni、calico/kube-controllers、calico/pod2daemon-flexvol
+- Master 节点预拉取全部 Addon 镜像，Worker 节点仅预拉取 Addon 镜像
+- 预拉取失败不阻塞集群创建流程
+
+**并行部署**
+- DaemonSet maxUnavailable 设置为 30%（约 19 个节点同时更新）
+- maxSurge 设置为 0（不允许额外创建 Pod）
+- readinessProbe periodSeconds 从 10 秒调整为 1 秒，加速 Pod 就绪检测
+
+**网络模式优化**
+- 使用 VXLAN 模式替代 IPIP（bird）模式
+- calico_backend 配置为 `vxlan`
+- 禁用 BGP（bird_ready=false）
+- VXLAN VNI=4096，端口=4789
+
+**控制面优化**
+- ENABLED_CONTROLLERS 默认仅启用 `node` 控制器
+- 支持按场景配置：`node`（开发/测试）、`node,policy`（生产无策略）、全部（生产有策略）
+- NODE_SYNC_PERIOD 从 5 分钟调整为 30 秒
+- 启用 CACHE_ENABLED
+
+**配置精简**
+- FELIX_CHAININSERTMODE：`insert` → `append`
+- FELIX_IPTABLESREFRESHINTERVAL：`90s` → `60s`
+- FELIX_PROMETHEUSMETRICSENABLED：`true` → `false`
+- FELIX_STARTUPCLEANUP：`true` → `false`
+- FELIX_HEALTHENABLED：保持 `true`（不可禁用）
+
+**Typha 优化**
+- 部署 2 个 Typha 副本保证高可用
+- 资源限制：requests cpu=100m/memory=128Mi，limits cpu=500m/memory=512Mi
+- 适用场景：节点数 ≥ 50（64 节点推荐部署）
+- API Server Watch 连接数从 N 个减少到 1 个
+
+#### 3. 配置参数规格
+
+| 参数 | 旧值 | 新值 | 来源 | 约束 |
+|------|------|------|------|------|
+| `calico_backend` | `bird` | `vxlan` | calico-config ConfigMap | 需内核 3.10+ |
+| `maxUnavailable` | `1` | `30%` | DaemonSet updateStrategy | 0-100% |
+| `ENABLED_CONTROLLERS` | 全部 5 个 | `node` | calico-kube-controllers env | 可选组合 |
+| `FELIX_PROMETHEUSMETRICSENABLED` | `true` | `false` | calico-node env | 影响可观测性 |
+| `FELIX_STARTUPCLEANUP` | `true` | `false` | calico-node env | 异常退出时有残留风险 |
+| `FELIX_CHAININSERTMODE` | `insert` | `append` | calico-node env | 影响 iptables 优先级 |
+| `FELIX_IPTABLESREFRESHINTERVAL` | `90` | `60` | calico-node env | CPU 增加约 5% |
+
+#### 4. 镜像预置规格
+
+| 镜像 | 来源 | 预拉取节点 |
+|------|------|-----------|
+| `calico/node:<version>` | BKECluster.Spec.ClusterConfig.Addons[calico].Version | Master + Worker |
+| `calico/cni:<version>` | 同上 | Master + Worker |
+| `calico/kube-controllers:<version>` | 同上 | Master |
+| `calico/pod2daemon-flexvol:<version>` | 同上 | Master |
+| `calico/typha:<version>` | 同上 | Master（Typha 部署时） |
+
+### 验收标准
+
+#### Alpha 阶段 (v0.1)
+
+| 验收项 | 验收标准 | 验证方法 |
+|--------|----------|----------|
+| 镜像预置功能实现 | exportAddonImages 方法从 CRD 动态获取镜像列表 | 单元测试通过 |
+| DaemonSet 并行部署 | maxUnavailable=30%，readinessProbe periodSeconds=1 | YAML 配置验证 |
+| 单元测试通过 | 覆盖率 ≥ 80% | `go test -cover` |
+| 现有功能无回归 | 所有现有测试通过 | `go test ./...` |
+
+#### Beta 阶段 (v0.2)
+
+| 验收项 | 验收标准 | 验证方法 |
+|--------|----------|----------|
+| 集成测试通过 | 10/32/64 节点集群部署成功 | 集成测试 |
+| Calico 部署时间 | < 2 分钟 | Prometheus 监控 |
+| VXLAN 模式生效 | BGP 会话数为 0 | `calicoctl get node` 验证 |
+| 监控指标正常 | 部署时间、启动时间指标可采集 | Grafana 验证 |
+| Typha 正常工作 | 连接数正常，calico-node 通过 Typha 通信 | 日志 + Prometheus |
+
+#### Stable 阶段 (v1.0)
+
+| 验收项 | 验收标准 | 验证方法 |
+|--------|----------|----------|
+| 端到端测试通过 | 64 节点集群完整创建流程成功 | E2E 测试 |
+| Calico 部署总时间 | ≤ 1 分 35 秒 | 生产环境监控 |
+| 网络连通性 | Pod 间通信正常 | 网络连通性测试 |
+| 网络策略功能 | NetworkPolicy 正常生效（如启用 policy 控制器） | 网络策略测试 |
+| 生产稳定性 | 运行 1 个月无问题 | 生产监控 |
+
+### 测试用例规格
+
+#### 单元测试
+
+```go
+// 1. 镜像预置逻辑测试
+TestExportAddonImages_WithCalico: 验证从 BKEConfig 正确导出 Calico 4 个镜像
+TestExportAddonImages_WithoutAddons: 验证无 Addon 配置时返回空列表
+TestExportAddonImages_DefaultVersion: 验证未指定版本时使用默认版本 v3.31.3
+TestExportAddonImages_CustomVersion: 验证自定义版本正确拼接镜像名
+TestExportAddonImages_CustomRepo: 验证自定义镜像仓库地址
+TestExportImageList_MasterNode: 验证 Master 节点拉取全部镜像
+TestExportImageList_WorkerNode: 验证 Worker 节点仅拉取 Addon 镜像
+
+// 2. 配置验证测试
+TestVXLANConfig: 验证 VXLAN 模式配置正确性
+TestDaemonSetUpdateStrategy: 验证 maxUnavailable=30% 配置
+TestFelixConfig: 验证所有 Felix 配置项正确设置
+TestControllerConfig: 验证 ENABLED_CONTROLLERS 按场景配置
+```
+
+#### 集成测试
+
+```go
+// 性能测试
+TestCalicoDeploymentPerformance_10Nodes: 10 节点 Calico 部署 < 1 分钟
+TestCalicoDeploymentPerformance_32Nodes: 32 节点 Calico 部署 < 1.5 分钟
+TestCalicoDeploymentPerformance_64Nodes: 64 节点 Calico 部署 < 1 分 35 秒
+
+// 功能测试
+TestVXLANModeActive: 验证 VXLAN 模式已激活，无 BGP 会话
+TestTyphaConnection: 验证 calico-node 通过 Typha 连接 API Server
+TestImagePrefetch: 验证镜像预拉取成功，DaemonSet 创建时无拉取事件
+TestNetworkConnectivity: 验证 Pod 间网络连通性正常
+TestNetworkPolicy: 验证 NetworkPolicy 功能正常（启用 policy 控制器时）
+```
+
+#### 端到端测试
+
+```bash
+# 1. 完整集群创建性能测试
+kubectl apply -f bkecluster-64n.yaml
+# 验证: Calico 部署时间 ≤ 1 分 35 秒
+
+# 2. 镜像预置验证
+kubectl logs -n bke-system <bkeagent-pod> | grep "pull image"
+# 验证: 环境初始化阶段已完成 Calico 镜像预拉取
+
+# 3. VXLAN 模式验证
+calicoctl get ippool -o wide
+# 验证: VXLAN 模式已启用，无 BGP 会话
+
+# 4. Typha 验证
+kubectl get pods -n kube-system -l k8s-app=calico-typha
+# 验证: 2 个 Typha Pod 运行正常
+
+# 5. 网络连通性验证
+kubectl run test --image=busybox --rm -it --restart=Never -- wget -qO- http://kubernetes.default.svc.cluster.local/healthz
+# 验证: 集群内网络通信正常
+```
+
+### 监控告警规格
+
+| 指标 | 采集方式 | 告警阈值 | 说明 |
+|------|----------|----------|------|
+| Calico 部署时间 | Prometheus | > 2 分钟 | 超过优化后预期 |
+| 镜像预拉取成功率 | 日志 | < 95% | 预拉取效果验证 |
+| calico-node 启动时间 | Prometheus | > 30 秒 | 单节点启动异常 |
+| Typha 连接数 | Prometheus | > 100 或 = 0 | 连接异常 |
+| API Server 负载 | Prometheus | P99 > 1s | Typha 减压效果验证 |
+| BGP 会话数 | calicoctl | > 0（VXLAN 模式） | VXLAN 模式下应为 0 |
+
+### 交付物清单
+
+| 交付物 | 路径 | 验收标准 |
+|--------|------|----------|
+| 镜像预置逻辑 | `pkg/job/builtin/kubeadm/env/init.go` | 单元测试通过 |
+| Calico 部署配置 | `bke-manifests/kubernetes/calico/v3.31.3/calico.yaml` | YAML 配置验证通过 |
+| 监控指标 | `pkg/metrics/calico_deployment.go` | 指标可采集 |
+| 单元测试 | `pkg/job/builtin/kubeadm/env/init_test.go` | 覆盖率 ≥ 80% |
+| E2E 测试 | `test/e2e/calico_deployment_test.go` | 性能达标 |
+| 文档 | 配置说明、发布说明 | 文档完整 |
+
 ## 参考资料
 
 1. [Calico 官方文档 - VXLAN 模式](https://docs.tigera.io/calico/latest/network-policy/configure/vxlan-tunnel)
