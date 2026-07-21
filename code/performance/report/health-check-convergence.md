@@ -992,75 +992,300 @@ graph TB
 
 #### 1. `pkg/kube/health.go` - 修改
 
-**新增结构体：**
-- `HealthCheckConfig` - 健康检查配置结构体
-- `HealthCheckResult` - 健康检查结果结构体
-- `UnifiedHealthChecker` - 统一健康检查器结构体
+##### 1.1 新增结构体
 
-**新增函数/方法：**
-- `NewUnifiedHealthChecker(kubeClient, log, config)` - 创建健康检查器
-- `DefaultHealthCheckConfig()` - 返回默认配置
-- `LoadHealthCheckConfig(configPath)` - 从配置文件加载配置
-- `CheckClusterHealth(kubeClient, log, cluster, currentVersion, bkeNodes)` - 健康检查入口
-- `(h *UnifiedHealthChecker) Check(cluster, currentVersion, bkeNodes)` - 执行健康检查
-- `(h *UnifiedHealthChecker) checkNodesParallel(cluster, currentVersion, bkeNodes, result)` - 并行检查节点
-- `(h *UnifiedHealthChecker) checkCriticalComponentsParallel(result)` - 并行检查关键组件
-- `(h *UnifiedHealthChecker) checkImportantComponentsParallel(result)` - 并行检查重要组件
-- `(h *UnifiedHealthChecker) checkOptionalComponentsParallel(result)` - 并行检查非关键组件
-- `(h *UnifiedHealthChecker) checkComponentsByPriority(components, result)` - 按优先级并行检查
-- `(h *UnifiedHealthChecker) aggregateResult(result)` - 聚合检查结果
-- `GetRequeueInterval(result, config)` - 根据检查结果动态调整间隔
+**位置**：在文件开头（第 30 行后）
 
-**修改内容：**
-- 重构现有的 `CheckClusterHealth` 函数，使用统一检查器
-- 实现 4 阶段渐进式检查逻辑
-- 添加并行检查机制
-- 实现动态间隔调整
+```go
+// HealthCheckConfig 健康检查配置
+type HealthCheckConfig struct {
+    CacheTTL                   time.Duration     `yaml:"cacheTTL"`
+    CriticalComponentInterval  time.Duration     `yaml:"criticalComponentInterval"`
+    ImportantComponentInterval time.Duration     `yaml:"importantComponentInterval"`
+    OptionalComponentInterval  time.Duration     `yaml:"optionalComponentInterval"`
+    NormalInterval             time.Duration     `yaml:"normalInterval"`
+    CriticalComponents         []ComponentCheck  `yaml:"criticalComponents"`
+    ImportantComponents        []ComponentCheck  `yaml:"importantComponents"`
+    OptionalComponents         []ComponentCheck  `yaml:"optionalComponents"`
+}
+
+// HealthCheckResult 健康检查结果
+type HealthCheckResult struct {
+    NodeErrors                []error
+    CriticalComponentErrors   []error
+    ImportantComponentErrors  []error
+    OptionalComponentErrors   []error
+}
+
+// UnifiedHealthChecker 统一健康检查器
+type UnifiedHealthChecker struct {
+    kubeClient kubernetes.Interface
+    log        *log.Logger
+    cache      *HealthCheckCache
+    config     HealthCheckConfig
+}
+```
+
+##### 1.2 新增函数/方法
+
+**位置**：在 `CheckClusterHealth` 函数前
+
+```go
+// NewUnifiedHealthChecker 创建健康检查器
+func NewUnifiedHealthChecker(kubeClient kubernetes.Interface, log *log.Logger, config HealthCheckConfig) *UnifiedHealthChecker
+
+// DefaultHealthCheckConfig 返回默认配置
+func DefaultHealthCheckConfig() HealthCheckConfig
+
+// LoadHealthCheckConfig 从配置文件加载配置
+func LoadHealthCheckConfig(configPath string) HealthCheckConfig
+
+// GetRequeueInterval 根据检查结果动态调整间隔
+func GetRequeueInterval(result *HealthCheckResult, config HealthCheckConfig) time.Duration
+```
+
+**位置**：在 `UnifiedHealthChecker` 结构体后
+
+```go
+// Check 执行健康检查
+func (h *UnifiedHealthChecker) Check(cluster *bkev1beta1.BKECluster, currentVersion string, bkeNodes bkev1beta1.BKENodes) error
+
+// checkNodesParallel 并行检查节点
+func (h *UnifiedHealthChecker) checkNodesParallel(cluster *bkev1beta1.BKECluster, currentVersion string, bkeNodes bkev1beta1.BKENodes, result *HealthCheckResult) error
+
+// checkCriticalComponentsParallel 并行检查关键组件
+func (h *UnifiedHealthChecker) checkCriticalComponentsParallel(result *HealthCheckResult) error
+
+// checkImportantComponentsParallel 并行检查重要组件
+func (h *UnifiedHealthChecker) checkImportantComponentsParallel(result *HealthCheckResult) error
+
+// checkOptionalComponentsParallel 并行检查非关键组件
+func (h *UnifiedHealthChecker) checkOptionalComponentsParallel(result *HealthCheckResult) error
+
+// checkComponentsByPriority 按优先级并行检查
+func (h *UnifiedHealthChecker) checkComponentsByPriority(components []ComponentCheck, result *HealthCheckResult) error
+
+// aggregateResult 聚合检查结果
+func (h *UnifiedHealthChecker) aggregateResult(result *HealthCheckResult) error
+```
+
+##### 1.3 修改现有函数
+
+**位置**：第 31-71 行
+
+**重构点**：
+- 将现有的 `CheckClusterHealth` 函数改为使用 `UnifiedHealthChecker`
+- 保留函数签名不变，内部实现改为调用统一检查器
+
+```go
+func (c *Client) CheckClusterHealth(cluster *bkev1beta1.BKECluster, currentVersion string, bkeNodes bkev1beta1.BKENodes) error {
+    config := LoadHealthCheckConfig("/etc/bke/health-check-config.yaml")
+    checker := NewUnifiedHealthChecker(c.ClientSet, c.Log, config)
+    return checker.Check(cluster, currentVersion, bkeNodes)
+}
+```
 
 #### 2. `pkg/kube/health_cache.go` - 新增
 
-**Informer 方案（推荐）：**
+##### 2.1 Informer 方案（推荐）
 
-**新增结构体：**
-- `HealthChecker` - 使用 Informer 的健康检查器
+**位置**：新文件
 
-**新增函数/方法：**
-- `NewHealthChecker(ctx, client)` - 创建健康检查器
-- `(h *HealthChecker) GetNodes()` - 从 Informer 缓存获取节点列表
-- `(h *HealthChecker) GetPods(namespace)` - 从 Informer 缓存获取 Pod 列表
-- `(h *HealthChecker) GetNode(name)` - 获取单个节点
-- `(h *HealthChecker) GetPod(namespace, name)` - 获取单个 Pod
+```go
+package kube
 
-**RV+TTL 方案（备选）：**
+import (
+    "context"
+    "fmt"
+    
+    corev1 "k8s.io/api/core/v1"
+    "k8s.io/apimachinery/pkg/labels"
+    coreinformers "k8s.io/client-go/informers/core/v1"
+    "k8s.io/client-go/kubernetes"
+    corelisters "k8s.io/client-go/listers/core/v1"
+    "k8s.io/client-go/tools/cache"
+)
 
-**新增结构体：**
-- `HealthCheckCache` - 使用 ResourceVersion 的缓存
+// HealthChecker 使用 Informer 的健康检查器
+type HealthChecker struct {
+    nodeLister     corelisters.NodeLister
+    podLister      corelisters.PodLister
+    informerSynced cache.InformerSynced
+}
 
-**新增函数/方法：**
-- `NewHealthCheckCache(ttl)` - 创建缓存
-- `(c *HealthCheckCache) GetNodes(client)` - 从缓存获取节点列表
-- `(c *HealthCheckCache) refreshNodes(client, option)` - 刷新节点缓存
-- `(c *HealthCheckCache) GetPods(client, namespace)` - 从缓存获取 Pod 列表
-- `(c *HealthCheckCache) refreshPods(client, namespace, option)` - 刷新 Pod 缓存
+// NewHealthChecker 创建健康检查器
+func NewHealthChecker(ctx context.Context, client kubernetes.Interface) (*HealthChecker, error) {
+    factory := informers.NewSharedInformerFactory(client, 0)
+    
+    nodeInformer := factory.Core().V1().Nodes()
+    podInformer := factory.Core().V1().Pods()
+    
+    factory.Start(ctx.Done())
+    
+    if !cache.WaitForCacheSync(ctx.Done(), 
+        nodeInformer.Informer().HasSynced,
+        podInformer.Informer().HasSynced) {
+        return nil, fmt.Errorf("failed to sync informer cache")
+    }
+    
+    return &HealthChecker{
+        nodeLister: nodeInformer.Lister(),
+        podLister:  podInformer.Lister(),
+        informerSynced: func() bool {
+            return nodeInformer.Informer().HasSynced() && 
+                   podInformer.Informer().HasSynced()
+        },
+    }, nil
+}
 
-**新增依赖：**
-- `k8s.io/client-go/informers/core/v1`
-- `k8s.io/client-go/listers/core/v1`
-- `k8s.io/client-go/tools/cache`
+// GetNodes 从 Informer 缓存获取节点列表
+func (h *HealthChecker) GetNodes() ([]*corev1.Node, error) {
+    return h.nodeLister.List(labels.Everything())
+}
+
+// GetPods 从 Informer 缓存获取 Pod 列表
+func (h *HealthChecker) GetPods(namespace string) ([]*corev1.Pod, error) {
+    return h.podLister.Pods(namespace).List(labels.Everything())
+}
+
+// GetNode 获取单个节点
+func (h *HealthChecker) GetNode(name string) (*corev1.Node, error) {
+    return h.nodeLister.Get(name)
+}
+
+// GetPod 获取单个 Pod
+func (h *HealthChecker) GetPod(namespace, name string) (*corev1.Pod, error) {
+    return h.podLister.Pods(namespace).Get(name)
+}
+```
+
+##### 2.2 RV+TTL 方案（备选）
+
+**位置**：同一文件，在 Informer 方案后
+
+```go
+// HealthCheckCache 使用 ResourceVersion 的缓存
+type HealthCheckCache struct {
+    nodes       *corev1.NodeList
+    pods        map[string][]corev1.Pod
+    nodeVersion string
+    podVersions map[string]string
+    lastSync    time.Time
+    ttl         time.Duration
+    mu          sync.RWMutex
+}
+
+// NewHealthCheckCache 创建缓存
+func NewHealthCheckCache(ttl time.Duration) *HealthCheckCache
+
+// GetNodes 从缓存获取节点列表
+func (c *HealthCheckCache) GetNodes(client *Client) (*corev1.NodeList, error)
+
+// refreshNodes 刷新节点缓存
+func (c *HealthCheckCache) refreshNodes(client *Client, option *metav1.ListOptions) (*corev1.NodeList, error)
+
+// GetPods 从缓存获取 Pod 列表
+func (c *HealthCheckCache) GetPods(client *Client, namespace string) ([]corev1.Pod, error)
+
+// refreshPods 刷新 Pod 缓存
+func (c *HealthCheckCache) refreshPods(client *Client, namespace string, option *metav1.ListOptions) ([]corev1.Pod, error)
+```
 
 #### 3. `pkg/phaseframe/phases/ensure_cluster.go` - 修改
 
-**修改内容：**
-- 使用 `GetRequeueInterval` 替代固定的 10 秒间隔
-- 根据健康检查结果动态调整重试间隔
+##### 3.1 具体重构点
 
-**具体变更点：**
-- 查找现有的 `RequeueAfter: 10 * time.Second` 代码
-- 替换为 `RequeueAfter: GetRequeueInterval(result, config)`
+**位置**：第 55-56 行
+
+**当前代码**：
+```go
+const (
+    quickRequeueInterval  = 10 * time.Second
+    periodicCheckInterval = 5 * time.Minute
+)
+```
+
+**重构方案**：
+- 保留这两个常量作为默认值
+- 新增动态间隔计算逻辑
+
+**位置**：第 127 行
+
+**当前代码**：
+```go
+return ctrl.Result{RequeueAfter: quickRequeueInterval}, errors.Errorf("postprocess not finished")
+```
+
+**重构方案**：
+```go
+// 后置处理未完成，使用快速重试间隔
+return ctrl.Result{RequeueAfter: quickRequeueInterval}, errors.Errorf("postprocess not finished")
+```
+
+**位置**：第 130-132 行
+
+**当前代码**：
+```go
+if err = e.ensureClusterReady(); err != nil {
+    errs = append(errs, err)
+    return ctrl.Result{RequeueAfter: quickRequeueInterval}, kerrors.NewAggregate(errs)
+}
+```
+
+**重构方案**：
+```go
+if err = e.ensureClusterReady(); err != nil {
+    errs = append(errs, err)
+    // 根据健康检查结果动态调整重试间隔
+    result := e.getHealthCheckResult()
+    requeueInterval := GetRequeueInterval(result, e.healthCheckConfig)
+    return ctrl.Result{RequeueAfter: requeueInterval}, kerrors.NewAggregate(errs)
+}
+```
+
+**位置**：第 136 行
+
+**当前代码**：
+```go
+return ctrl.Result{RequeueAfter: periodicCheckInterval}, kerrors.NewAggregate(errs)
+```
+
+**重构方案**：
+```go
+// 正常状态下，使用动态间隔（默认为 5 分钟）
+result := e.getHealthCheckResult()
+requeueInterval := GetRequeueInterval(result, e.healthCheckConfig)
+return ctrl.Result{RequeueAfter: requeueInterval}, kerrors.NewAggregate(errs)
+```
+
+##### 3.2 新增辅助方法
+
+**位置**：在 `EnsureCluster` 结构体后
+
+```go
+// getHealthCheckResult 获取健康检查结果
+func (e *EnsureCluster) getHealthCheckResult() *HealthCheckResult {
+    // 从上一次健康检查中获取结果
+    return e.lastHealthCheckResult
+}
+```
+
+##### 3.3 新增字段
+
+**位置**：在 `EnsureCluster` 结构体中
+
+```go
+type EnsureCluster struct {
+    // ... 现有字段 ...
+    healthCheckConfig    HealthCheckConfig
+    lastHealthCheckResult *HealthCheckResult
+}
+```
 
 #### 4. `/etc/bke/health-check-config.yaml` - 新增
 
-**配置文件内容：**
+**位置**：新文件
+
 ```yaml
 # Informer 缓存同步超时时间
 cacheSyncTimeout: 30s
@@ -1111,15 +1336,120 @@ optionalComponents:
 
 #### 5. `pkg/kube/health_test.go` - 新增
 
-**新增测试函数：**
-- `TestUnifiedHealthCheck` - 测试 64 节点集群健康检查 < 3 分钟
-- `TestCriticalComponentFastFail` - 测试关键组件失败 < 1 秒返回
-- `TestDynamicRequeueInterval` - 测试 4 种间隔正确切换
+**位置**：新文件
+
+```go
+package kube
+
+import (
+    "errors"
+    "testing"
+    "time"
+
+    "github.com/stretchr/testify/assert"
+    "github.com/stretchr/testify/require"
+    
+    confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
+    bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
+)
+
+func TestUnifiedHealthCheck(t *testing.T) {
+    // 测试 64 节点集群健康检查 < 3 分钟
+    cluster := createTestCluster(64)
+    
+    start := time.Now()
+    err := cluster.CheckClusterHealth()
+    require.NoError(t, err)
+    
+    elapsed := time.Since(start)
+    assert.Less(t, elapsed, 3*time.Minute, "Health check should complete within 3 minutes")
+}
+
+func TestCriticalComponentFastFail(t *testing.T) {
+    // 测试关键组件失败 < 1 秒返回
+    cluster := createTestClusterWithFailedComponent("etcd-master-1")
+    
+    start := time.Now()
+    err := cluster.CheckClusterHealth()
+    require.Error(t, err)
+    
+    elapsed := time.Since(start)
+    assert.Less(t, elapsed, 1*time.Second, "Critical component failure should fail fast")
+}
+
+func TestDynamicRequeueInterval(t *testing.T) {
+    tests := []struct {
+        name     string
+        result   *HealthCheckResult
+        expected time.Duration
+    }{
+        {
+            name: "critical component error",
+            result: &HealthCheckResult{
+                CriticalComponentErrors: []error{errors.New("etcd failed")},
+            },
+            expected: 5 * time.Second,
+        },
+        {
+            name: "important component error",
+            result: &HealthCheckResult{
+                ImportantComponentErrors: []error{errors.New("calico failed")},
+            },
+            expected: 15 * time.Second,
+        },
+        {
+            name: "optional component error",
+            result: &HealthCheckResult{
+                OptionalComponentErrors: []error{errors.New("metrics-server failed")},
+            },
+            expected: 30 * time.Second,
+        },
+        {
+            name:     "no error",
+            result:   &HealthCheckResult{},
+            expected: 5 * time.Minute,
+        },
+    }
+    
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            interval := GetRequeueInterval(tt.result, DefaultHealthCheckConfig())
+            assert.Equal(t, tt.expected, interval)
+        })
+    }
+}
+```
 
 #### 6. `test/integration/health_check_test.go` - 新增
 
-**新增测试函数：**
-- `TestHealthCheckPerformance` - 64 节点集群健康检查 < 1 分钟，API 调用 < 10 次
+**位置**：新文件
+
+```go
+package integration
+
+import (
+    "testing"
+    "time"
+
+    "github.com/stretchr/testify/assert"
+    "github.com/stretchr/testify/require"
+)
+
+func TestHealthCheckPerformance(t *testing.T) {
+    // 64 节点集群健康检查 < 1 分钟，API 调用 < 10 次
+    cluster := createTestCluster(64)
+    
+    start := time.Now()
+    err := cluster.CheckClusterHealth()
+    require.NoError(t, err)
+    
+    elapsed := time.Since(start)
+    assert.Less(t, elapsed, 1*time.Minute, "Health check should complete within 1 minute")
+    
+    apiCalls := cluster.GetAPICallCount()
+    assert.Less(t, apiCalls, 10, "API calls should be less than 10 after initial sync")
+}
+```
 
 #### 变更统计
 
@@ -1127,11 +1457,11 @@ optionalComponents:
 |------|---------|----------------|----------------|
 | `pkg/kube/health.go` | 修改 | 200 | 50 |
 | `pkg/kube/health_cache.go` | 新增 | 150 | 0 |
-| `pkg/phaseframe/phases/ensure_cluster.go` | 修改 | 5 | 10 |
+| `pkg/phaseframe/phases/ensure_cluster.go` | 修改 | 15 | 20 |
 | `/etc/bke/health-check-config.yaml` | 新增 | 50 | 0 |
 | `pkg/kube/health_test.go` | 新增 | 100 | 0 |
 | `test/integration/health_check_test.go` | 新增 | 50 | 0 |
-| **总计** | | **555** | **60** |
+| **总计** | | **565** | **70** |
 
 #### 实施顺序建议
 
