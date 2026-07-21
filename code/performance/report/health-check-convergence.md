@@ -1388,34 +1388,52 @@ func (c *HealthCheckCache) refreshPods(client *Client, namespace string, option 
 
 #### 3. `pkg/phaseframe/phases/ensure_cluster.go` - 修改
 
-##### 3.1 具体重构点
+##### 3.1 新增字段
 
-**位置**：第 55-56 行
-
-**当前代码**：
-```go
-const (
-    quickRequeueInterval  = 10 * time.Second
-    periodicCheckInterval = 5 * time.Minute
-)
-```
-
-**重构方案**：
-- 保留这两个常量作为默认值
-- 新增动态间隔计算逻辑
-
-**位置**：第 127 行
+**位置**：在 `EnsureCluster` 结构体中（第 59-62 行）
 
 **当前代码**：
 ```go
-return ctrl.Result{RequeueAfter: quickRequeueInterval}, errors.Errorf("postprocess not finished")
+type EnsureCluster struct {
+    phaseframe.BasePhase
+    remoteClient kube.RemoteKubeClient
+}
 ```
 
-**重构方案**：
+**修改后**：
 ```go
-// 后置处理未完成，使用快速重试间隔
-return ctrl.Result{RequeueAfter: quickRequeueInterval}, errors.Errorf("postprocess not finished")
+type EnsureCluster struct {
+    phaseframe.BasePhase
+    remoteClient      kube.RemoteKubeClient
+    healthCheckConfig HealthCheckConfig  // 新增：健康检查配置
+}
 ```
+
+##### 3.2 新增辅助方法
+
+**位置**：在 `EnsureCluster` 结构体后
+
+```go
+// getRequeueInterval 根据健康检查结果动态调整重试间隔
+func (e *EnsureCluster) getRequeueInterval(err error) time.Duration {
+    // 如果健康检查失败，根据错误类型返回不同的间隔
+    if err != nil {
+        // 根据错误类型判断
+        if isCriticalError(err) {
+            return e.healthCheckConfig.CriticalComponentInterval
+        }
+        if isImportantError(err) {
+            return e.healthCheckConfig.ImportantComponentInterval
+        }
+        return e.healthCheckConfig.OptionalComponentInterval
+    }
+    
+    // 正常状态下，使用正常间隔
+    return e.healthCheckConfig.NormalInterval
+}
+```
+
+##### 3.3 修改 Execute 方法
 
 **位置**：第 130-132 行
 
@@ -1427,13 +1445,12 @@ if err = e.ensureClusterReady(); err != nil {
 }
 ```
 
-**重构方案**：
+**修改后**：
 ```go
 if err = e.ensureClusterReady(); err != nil {
     errs = append(errs, err)
     // 根据健康检查结果动态调整重试间隔
-    result := e.getHealthCheckResult()
-    requeueInterval := GetRequeueInterval(result, e.healthCheckConfig)
+    requeueInterval := e.getRequeueInterval(err)
     return ctrl.Result{RequeueAfter: requeueInterval}, kerrors.NewAggregate(errs)
 }
 ```
@@ -1445,37 +1462,17 @@ if err = e.ensureClusterReady(); err != nil {
 return ctrl.Result{RequeueAfter: periodicCheckInterval}, kerrors.NewAggregate(errs)
 ```
 
-**重构方案**：
+**修改后**：
 ```go
 // 正常状态下，使用动态间隔（默认为 5 分钟）
-result := e.getHealthCheckResult()
-requeueInterval := GetRequeueInterval(result, e.healthCheckConfig)
+requeueInterval := e.getRequeueInterval(nil)
 return ctrl.Result{RequeueAfter: requeueInterval}, kerrors.NewAggregate(errs)
 ```
 
-##### 3.2 新增辅助方法
-
-**位置**：在 `EnsureCluster` 结构体后
-
-```go
-// getHealthCheckResult 获取健康检查结果
-func (e *EnsureCluster) getHealthCheckResult() *HealthCheckResult {
-    // 从上一次健康检查中获取结果
-    return e.lastHealthCheckResult
-}
-```
-
-##### 3.3 新增字段
-
-**位置**：在 `EnsureCluster` 结构体中
-
-```go
-type EnsureCluster struct {
-    // ... 现有字段 ...
-    healthCheckConfig    HealthCheckConfig
-    lastHealthCheckResult *HealthCheckResult
-}
-```
+**说明**：
+- 第 127 行（后置处理未完成场景）保持不变，继续使用 `quickRequeueInterval`
+- 第 130-132 行（健康检查失败场景）使用动态间隔
+- 第 136 行（正常状态场景）使用动态间隔
 
 #### 4. `/etc/bke/health-check-config.yaml` - 新增
 
