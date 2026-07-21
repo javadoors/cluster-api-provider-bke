@@ -990,12 +990,173 @@ graph TB
 
 ### 代码变更清单
 
-| 文件路径 | 变更类型 | 说明 |
-|---------|---------|------|
-| `pkg/kube/health.go` | 修改 | 重构健康检查逻辑，添加统一检查器 |
-| `pkg/kube/health_cache.go` | 新增 | 实现健康检查缓存机制 |
-| `pkg/phaseframe/phases/ensure_cluster.go` | 修改 | 使用动态间隔替代固定间隔 |
-| `/etc/bke/health-check-config.yaml` | 新增 | 健康检查配置文件 |
+#### 1. `pkg/kube/health.go` - 修改
+
+**新增结构体：**
+- `HealthCheckConfig` - 健康检查配置结构体
+- `HealthCheckResult` - 健康检查结果结构体
+- `UnifiedHealthChecker` - 统一健康检查器结构体
+
+**新增函数/方法：**
+- `NewUnifiedHealthChecker(kubeClient, log, config)` - 创建健康检查器
+- `DefaultHealthCheckConfig()` - 返回默认配置
+- `LoadHealthCheckConfig(configPath)` - 从配置文件加载配置
+- `CheckClusterHealth(kubeClient, log, cluster, currentVersion, bkeNodes)` - 健康检查入口
+- `(h *UnifiedHealthChecker) Check(cluster, currentVersion, bkeNodes)` - 执行健康检查
+- `(h *UnifiedHealthChecker) checkNodesParallel(cluster, currentVersion, bkeNodes, result)` - 并行检查节点
+- `(h *UnifiedHealthChecker) checkCriticalComponentsParallel(result)` - 并行检查关键组件
+- `(h *UnifiedHealthChecker) checkImportantComponentsParallel(result)` - 并行检查重要组件
+- `(h *UnifiedHealthChecker) checkOptionalComponentsParallel(result)` - 并行检查非关键组件
+- `(h *UnifiedHealthChecker) checkComponentsByPriority(components, result)` - 按优先级并行检查
+- `(h *UnifiedHealthChecker) aggregateResult(result)` - 聚合检查结果
+- `GetRequeueInterval(result, config)` - 根据检查结果动态调整间隔
+
+**修改内容：**
+- 重构现有的 `CheckClusterHealth` 函数，使用统一检查器
+- 实现 4 阶段渐进式检查逻辑
+- 添加并行检查机制
+- 实现动态间隔调整
+
+#### 2. `pkg/kube/health_cache.go` - 新增
+
+**Informer 方案（推荐）：**
+
+**新增结构体：**
+- `HealthChecker` - 使用 Informer 的健康检查器
+
+**新增函数/方法：**
+- `NewHealthChecker(ctx, client)` - 创建健康检查器
+- `(h *HealthChecker) GetNodes()` - 从 Informer 缓存获取节点列表
+- `(h *HealthChecker) GetPods(namespace)` - 从 Informer 缓存获取 Pod 列表
+- `(h *HealthChecker) GetNode(name)` - 获取单个节点
+- `(h *HealthChecker) GetPod(namespace, name)` - 获取单个 Pod
+
+**RV+TTL 方案（备选）：**
+
+**新增结构体：**
+- `HealthCheckCache` - 使用 ResourceVersion 的缓存
+
+**新增函数/方法：**
+- `NewHealthCheckCache(ttl)` - 创建缓存
+- `(c *HealthCheckCache) GetNodes(client)` - 从缓存获取节点列表
+- `(c *HealthCheckCache) refreshNodes(client, option)` - 刷新节点缓存
+- `(c *HealthCheckCache) GetPods(client, namespace)` - 从缓存获取 Pod 列表
+- `(c *HealthCheckCache) refreshPods(client, namespace, option)` - 刷新 Pod 缓存
+
+**新增依赖：**
+- `k8s.io/client-go/informers/core/v1`
+- `k8s.io/client-go/listers/core/v1`
+- `k8s.io/client-go/tools/cache`
+
+#### 3. `pkg/phaseframe/phases/ensure_cluster.go` - 修改
+
+**修改内容：**
+- 使用 `GetRequeueInterval` 替代固定的 10 秒间隔
+- 根据健康检查结果动态调整重试间隔
+
+**具体变更点：**
+- 查找现有的 `RequeueAfter: 10 * time.Second` 代码
+- 替换为 `RequeueAfter: GetRequeueInterval(result, config)`
+
+#### 4. `/etc/bke/health-check-config.yaml` - 新增
+
+**配置文件内容：**
+```yaml
+# Informer 缓存同步超时时间
+cacheSyncTimeout: 30s
+
+# 检查间隔配置
+criticalComponentInterval: 5s
+importantComponentInterval: 15s
+optionalComponentInterval: 30s
+normalInterval: 5m
+
+# 关键组件清单
+criticalComponents:
+  - namespace: kube-system
+    prefixes:
+      - etcd-
+      - kube-apiserver-
+      - kube-controller-manager-
+      - kube-scheduler-
+
+# 重要组件清单
+importantComponents:
+  - namespace: kube-system
+    prefixes:
+      - calico-kube-controllers
+      - calico-node
+      - coredns
+      - kube-proxy-
+
+# 非关键组件清单
+optionalComponents:
+  - namespace: kube-system
+    prefixes:
+      - metrics-server-
+  - namespace: ingress-nginx
+    prefixes:
+      - ingress-nginx-controller
+  - namespace: monitoring
+    prefixes:
+      - alertmanager-main-
+      - prometheus-k8s-
+      - node-exporter-
+  - namespace: openfuyao-system
+    prefixes:
+      - console-service-
+      - oauth-server-
+      - local-harbor-
+```
+
+#### 5. `pkg/kube/health_test.go` - 新增
+
+**新增测试函数：**
+- `TestUnifiedHealthCheck` - 测试 64 节点集群健康检查 < 3 分钟
+- `TestCriticalComponentFastFail` - 测试关键组件失败 < 1 秒返回
+- `TestDynamicRequeueInterval` - 测试 4 种间隔正确切换
+
+#### 6. `test/integration/health_check_test.go` - 新增
+
+**新增测试函数：**
+- `TestHealthCheckPerformance` - 64 节点集群健康检查 < 1 分钟，API 调用 < 10 次
+
+#### 变更统计
+
+| 文件 | 变更类型 | 新增行数（预估） | 修改行数（预估） |
+|------|---------|----------------|----------------|
+| `pkg/kube/health.go` | 修改 | 200 | 50 |
+| `pkg/kube/health_cache.go` | 新增 | 150 | 0 |
+| `pkg/phaseframe/phases/ensure_cluster.go` | 修改 | 5 | 10 |
+| `/etc/bke/health-check-config.yaml` | 新增 | 50 | 0 |
+| `pkg/kube/health_test.go` | 新增 | 100 | 0 |
+| `test/integration/health_check_test.go` | 新增 | 50 | 0 |
+| **总计** | | **555** | **60** |
+
+#### 实施顺序建议
+
+1. **第一阶段：基础设施**
+   - 创建 `pkg/kube/health_cache.go`（缓存层）
+   - 创建 `/etc/bke/health-check-config.yaml`（配置文件）
+
+2. **第二阶段：核心逻辑**
+   - 修改 `pkg/kube/health.go`（统一检查器）
+
+3. **第三阶段：集成**
+   - 修改 `pkg/phaseframe/phases/ensure_cluster.go`（动态间隔）
+
+4. **第四阶段：测试**
+   - 创建 `pkg/kube/health_test.go`（单元测试）
+   - 创建 `test/integration/health_check_test.go`（集成测试）
+
+#### 风险评估
+
+| 风险 | 概率 | 影响 | 缓解措施 |
+|------|------|------|---------|
+| Informer 同步延迟 | 低 | 中 | 提供 RV+TTL 备选方案 |
+| 缓存一致性问题 | 低 | 中 | Informer 自动处理 |
+| 配置文件格式错误 | 中 | 低 | 加载失败时使用默认配置 |
+| 性能未达预期 | 中 | 中 | 参数调优 |
 
 ### 测试计划
 
