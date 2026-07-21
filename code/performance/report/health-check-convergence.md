@@ -140,30 +140,236 @@
 
 **文件**: `pkg/kube/health.go`
 
+##### 2.1 类型定义：优先级、组件名称、组件信息、错误类型
+
 ```go
+// HealthCheckPriority 健康检查优先级，来自配置文件
+type HealthCheckPriority int
+
+const (
+    PriorityCritical  HealthCheckPriority = iota // 关键：控制面组件
+    PriorityImportant                            // 重要：网络、DNS 组件
+    PriorityOptional                             // 非关键：Addon、监控组件
+)
+
+func (p HealthCheckPriority) String() string {
+    switch p {
+    case PriorityCritical:
+        return "critical"
+    case PriorityImportant:
+        return "important"
+    case PriorityOptional:
+        return "optional"
+    default:
+        return "unknown"
+    }
+}
+
+// ParsePriority 解析优先级字符串（配置文件 → 枚举）
+func ParsePriority(s string) (HealthCheckPriority, error) {
+    switch strings.ToLower(s) {
+    case "critical":
+        return PriorityCritical, nil
+    case "important":
+        return PriorityImportant, nil
+    case "optional":
+        return PriorityOptional, nil
+    default:
+        return PriorityOptional, fmt.Errorf("unknown priority: %s", s)
+    }
+}
+
+// ComponentName 组件名称，唯一标识一个组件
+type ComponentName string
+
+const (
+    NameEtcd                  ComponentName = "etcd"
+    NameKubeAPIServer         ComponentName = "kube-apiserver"
+    NameKubeControllerManager ComponentName = "kube-controller-manager"
+    NameKubeScheduler         ComponentName = "kube-scheduler"
+    NameCalicoNode            ComponentName = "calico-node"
+    NameCalicoKubeControllers ComponentName = "calico-kube-controllers"
+    NameKubeProxy             ComponentName = "kube-proxy"
+    NameCoreDNS               ComponentName = "coredns"
+    NameMetricsServer         ComponentName = "metrics-server"
+    NameIngressNginx          ComponentName = "ingress-nginx"
+    NameConsoleService        ComponentName = "console-service"
+    NameOAuthServer           ComponentName = "oauth-server"
+    NameLocalHarbor           ComponentName = "local-harbor"
+    NamePrometheus            ComponentName = "prometheus"
+    NameAlertmanager          ComponentName = "alertmanager"
+    NameNodeExporter          ComponentName = "node-exporter"
+)
+
+// ComponentCheck 组件检查配置（来自配置文件）
+type ComponentCheck struct {
+    Name      ComponentName       `yaml:"name"`
+    Namespace string              `yaml:"namespace"`
+    Prefixes  []string            `yaml:"prefixes"`
+    Priority  HealthCheckPriority `yaml:"priority"` // 必填，来自配置
+}
+
+// UnmarshalYAML 自定义反序列化，解析 priority 字符串
+func (c *ComponentCheck) UnmarshalYAML(unmarshal func(interface{}) error) error {
+    type Alias ComponentCheck
+    aux := &struct {
+        Priority string `yaml:"priority"`
+        *Alias
+    }{
+        Alias: (*Alias)(c),
+    }
+
+    if err := unmarshal(aux); err != nil {
+        return err
+    }
+
+    if aux.Priority == "" {
+        return fmt.Errorf("component %q: priority is required", c.Name)
+    }
+
+    p, err := ParsePriority(aux.Priority)
+    if err != nil {
+        return fmt.Errorf("component %q: %w", c.Name, err)
+    }
+    c.Priority = p
+
+    return nil
+}
+
+// ComponentInfo 组件运行时信息（携带优先级）
+type ComponentInfo struct {
+    Name      ComponentName
+    Namespace string
+    Prefix    string
+    PodName   string
+    Priority  HealthCheckPriority
+}
+
+func (c ComponentInfo) String() string {
+    if c.PodName != "" {
+        return fmt.Sprintf("%s/%s", c.Namespace, c.PodName)
+    }
+    return fmt.Sprintf("%s/%s(%s)", c.Namespace, c.Prefix, c.Name)
+}
+
+// HealthCheckError 带组件信息的健康检查错误
+type HealthCheckError struct {
+    Component ComponentInfo
+    Reason    string // PodNotReady, ImagePullBackOff, PodNotFound...
+    Err       error
+}
+
+func (e *HealthCheckError) Error() string {
+    return fmt.Sprintf("[%s] %s (%s): %v",
+        e.Component.Priority, e.Component, e.Reason, e.Err)
+}
+
+func (e *HealthCheckError) Unwrap() error { return e.Err }
+
+// isCriticalError 判断错误是否包含关键优先级组件
+func isCriticalError(err error) bool {
+    return hasPriority(err, PriorityCritical)
+}
+
+// isImportantError 判断错误是否包含重要优先级组件
+func isImportantError(err error) bool {
+    return hasPriority(err, PriorityImportant)
+}
+
+// hasPriorityError 递归检查错误链中是否包含指定优先级
+func hasPriority(err error, target HealthCheckPriority) bool {
+    if err == nil {
+        return false
+    }
+
+    var hcErr *HealthCheckError
+    if errors.As(err, &hcErr) && hcErr.Component.Priority == target {
+        return true
+    }
+
+    if agg, ok := err.(kerrors.Aggregate); ok {
+        for _, e := range agg.Errors() {
+            if hasPriority(e, target) {
+                return true
+            }
+        }
+    }
+
+    return false
+}
+
+// ComponentErrorsByPriority 提取指定优先级的所有错误（日志/监控用）
+func ComponentErrorsByPriority(err error, priority HealthCheckPriority) []*HealthCheckError {
+    var result []*HealthCheckError
+
+    var hcErr *HealthCheckError
+    if errors.As(err, &hcErr) && hcErr.Component.Priority == priority {
+        result = append(result, hcErr)
+    }
+
+    if agg, ok := err.(kerrors.Aggregate); ok {
+        for _, e := range agg.Errors() {
+            result = append(result, ComponentErrorsByPriority(e, priority)...)
+        }
+    }
+
+    return result
+}
+
+// newComponentError 从 ComponentCheck 构造 HealthCheckError
+func newComponentError(check ComponentCheck, podName, reason string, err error) *HealthCheckError {
+    return &HealthCheckError{
+        Component: ComponentInfo{
+            Name:      check.Name,
+            Namespace: check.Namespace,
+            Prefix:    podName,
+            PodName:   podName,
+            Priority:  check.Priority,
+        },
+        Reason: reason,
+        Err:    err,
+    }
+}
+
+// newNodeError 构造节点错误（关键优先级）
+func newNodeError(nodeName, reason string, err error) *HealthCheckError {
+    return &HealthCheckError{
+        Component: ComponentInfo{
+            Name:      "node",
+            Namespace: "node",
+            PodName:   nodeName,
+            Priority:  PriorityCritical,
+        },
+        Reason: reason,
+        Err:    err,
+    }
+}
+```
+
+##### 2.2 配置结构
+
+```go
+// IntervalConfig 检查间隔配置
+type IntervalConfig struct {
+    Critical  time.Duration `yaml:"critical"`
+    Important time.Duration `yaml:"important"`
+    Optional  time.Duration `yaml:"optional"`
+    Normal    time.Duration `yaml:"normal"`
+}
+
 // HealthCheckConfig 健康检查配置
 type HealthCheckConfig struct {
-    // 缓存配置
-    CacheTTL time.Duration `yaml:"cacheTTL"`
-    
-    // 检查间隔配置
-    CriticalComponentInterval  time.Duration `yaml:"criticalComponentInterval"`  // 关键组件失败：5 秒
-    ImportantComponentInterval time.Duration `yaml:"importantComponentInterval"` // 重要组件失败：15 秒
-    OptionalComponentInterval  time.Duration `yaml:"optionalComponentInterval"`  // 非关键组件失败：30 秒
-    NormalInterval             time.Duration `yaml:"normalInterval"`             // 正常：5 分钟
-    
-    // 组件清单配置
-    CriticalComponents  []ComponentCheck `yaml:"criticalComponents"`
-    ImportantComponents []ComponentCheck `yaml:"importantComponents"`
-    OptionalComponents  []ComponentCheck `yaml:"optionalComponents"`
+    CacheSyncTimeout time.Duration    `yaml:"cacheSyncTimeout"`
+    Intervals        IntervalConfig   `yaml:"intervals"`
+    Components       []ComponentCheck `yaml:"components"`
 }
 
 // HealthCheckResult 健康检查结果
 type HealthCheckResult struct {
-    NodeErrors                []error
-    CriticalComponentErrors   []error
-    ImportantComponentErrors  []error
-    OptionalComponentErrors   []error
+    NodeErrors               []error
+    CriticalComponentErrors  []error
+    ImportantComponentErrors []error
+    OptionalComponentErrors  []error
 }
 
 // UnifiedHealthChecker 统一健康检查器
@@ -179,7 +385,7 @@ func NewUnifiedHealthChecker(kubeClient kubernetes.Interface, log *log.Logger, c
     return &UnifiedHealthChecker{
         kubeClient: kubeClient,
         log:        log,
-        cache:      NewHealthCheckCache(config.CacheTTL),
+        cache:      NewHealthCheckCache(config.CacheSyncTimeout),
         config:     config,
     }
 }
@@ -187,23 +393,30 @@ func NewUnifiedHealthChecker(kubeClient kubernetes.Interface, log *log.Logger, c
 // DefaultHealthCheckConfig 默认配置
 func DefaultHealthCheckConfig() HealthCheckConfig {
     return HealthCheckConfig{
-        CacheTTL:                   30 * time.Second,
-        CriticalComponentInterval:  5 * time.Second,
-        ImportantComponentInterval: 15 * time.Second,
-        OptionalComponentInterval:  30 * time.Second,
-        NormalInterval:             5 * time.Minute,
-        
-        CriticalComponents: []ComponentCheck{
-            {Namespace: "kube-system", Prefixes: []string{"etcd-", "kube-apiserver-", "kube-controller-manager-", "kube-scheduler-"}},
+        CacheSyncTimeout: 30 * time.Second,
+        Intervals: IntervalConfig{
+            Critical:  5 * time.Second,
+            Important: 15 * time.Second,
+            Optional:  30 * time.Second,
+            Normal:    5 * time.Minute,
         },
-        ImportantComponents: []ComponentCheck{
-            {Namespace: "kube-system", Prefixes: []string{"calico-kube-controllers", "calico-node", "coredns", "kube-proxy-"}},
-        },
-        OptionalComponents: []ComponentCheck{
-            {Namespace: "kube-system", Prefixes: []string{"metrics-server-"}},
-            {Namespace: "ingress-nginx", Prefixes: []string{"ingress-nginx-controller"}},
-            {Namespace: "monitoring", Prefixes: []string{"alertmanager-main-", "prometheus-k8s-", "node-exporter-"}},
-            {Namespace: "openfuyao-system", Prefixes: []string{"console-service-", "oauth-server-", "local-harbor-"}},
+        Components: []ComponentCheck{
+            {Name: NameEtcd, Namespace: "kube-system", Prefixes: []string{"etcd-"}, Priority: PriorityCritical},
+            {Name: NameKubeAPIServer, Namespace: "kube-system", Prefixes: []string{"kube-apiserver-"}, Priority: PriorityCritical},
+            {Name: NameKubeControllerManager, Namespace: "kube-system", Prefixes: []string{"kube-controller-manager-"}, Priority: PriorityCritical},
+            {Name: NameKubeScheduler, Namespace: "kube-system", Prefixes: []string{"kube-scheduler-"}, Priority: PriorityCritical},
+            {Name: NameCalicoNode, Namespace: "kube-system", Prefixes: []string{"calico-node"}, Priority: PriorityImportant},
+            {Name: NameCalicoKubeControllers, Namespace: "kube-system", Prefixes: []string{"calico-kube-controllers"}, Priority: PriorityImportant},
+            {Name: NameKubeProxy, Namespace: "kube-system", Prefixes: []string{"kube-proxy-"}, Priority: PriorityImportant},
+            {Name: NameCoreDNS, Namespace: "kube-system", Prefixes: []string{"coredns"}, Priority: PriorityImportant},
+            {Name: NameMetricsServer, Namespace: "kube-system", Prefixes: []string{"metrics-server-"}, Priority: PriorityOptional},
+            {Name: NameIngressNginx, Namespace: "ingress-nginx", Prefixes: []string{"ingress-nginx-controller"}, Priority: PriorityOptional},
+            {Name: NameConsoleService, Namespace: "openfuyao-system", Prefixes: []string{"console-service-"}, Priority: PriorityOptional},
+            {Name: NameOAuthServer, Namespace: "openfuyao-system", Prefixes: []string{"oauth-server-"}, Priority: PriorityOptional},
+            {Name: NameLocalHarbor, Namespace: "openfuyao-system", Prefixes: []string{"local-harbor-"}, Priority: PriorityOptional},
+            {Name: NamePrometheus, Namespace: "monitoring", Prefixes: []string{"prometheus-k8s-"}, Priority: PriorityOptional},
+            {Name: NameAlertmanager, Namespace: "monitoring", Prefixes: []string{"alertmanager-main-"}, Priority: PriorityOptional},
+            {Name: NameNodeExporter, Namespace: "monitoring", Prefixes: []string{"node-exporter-"}, Priority: PriorityOptional},
         },
     }
 }
@@ -215,28 +428,24 @@ func LoadHealthCheckConfig(configPath string) HealthCheckConfig {
         log.Warnf("failed to load health check config from %s, using default: %v", configPath, err)
         return DefaultHealthCheckConfig()
     }
-    
+
     var config HealthCheckConfig
     if err := yaml.Unmarshal(data, &config); err != nil {
         log.Warnf("failed to parse health check config, using default: %v", err)
         return DefaultHealthCheckConfig()
     }
-    
-    // 如果某些字段为空，使用默认值
-    defaultConfig := DefaultHealthCheckConfig()
-    if len(config.CriticalComponents) == 0 {
-        config.CriticalComponents = defaultConfig.CriticalComponents
+
+    if len(config.Components) == 0 {
+        config.Components = DefaultHealthCheckConfig().Components
     }
-    if len(config.ImportantComponents) == 0 {
-        config.ImportantComponents = defaultConfig.ImportantComponents
-    }
-    if len(config.OptionalComponents) == 0 {
-        config.OptionalComponents = defaultConfig.OptionalComponents
-    }
-    
+
     return config
 }
+```
 
+##### 2.3 检查流程
+
+```go
 // CheckClusterHealth 统一健康检查入口
 func CheckClusterHealth(kubeClient kubernetes.Interface, log *log.Logger, cluster *bkev1beta1.BKECluster, currentVersion string, bkeNodes bkev1beta1.BKENodes) error {
     config := LoadHealthCheckConfig("/etc/bke/health-check-config.yaml")
@@ -247,54 +456,69 @@ func CheckClusterHealth(kubeClient kubernetes.Interface, log *log.Logger, cluste
 // Check 执行统一健康检查
 func (h *UnifiedHealthChecker) Check(cluster *bkev1beta1.BKECluster, currentVersion string, bkeNodes bkev1beta1.BKENodes) error {
     result := &HealthCheckResult{}
-    
+
     // 阶段 1: 节点状态检查（并行）
     if err := h.checkNodesParallel(cluster, currentVersion, bkeNodes, result); err != nil {
         result.NodeErrors = append(result.NodeErrors, err)
         return h.aggregateResult(result)
     }
-    
-    // 阶段 2: 关键组件检查（并行）
-    if err := h.checkCriticalComponentsParallel(result); err != nil {
+
+    // 阶段 2: 按优先级分组检查组件
+    critical, important, optional := h.groupByPriority()
+
+    // 关键组件（并行，失败立即返回）
+    if err := h.checkComponentsParallel(critical, result); err != nil {
         result.CriticalComponentErrors = append(result.CriticalComponentErrors, err)
         return h.aggregateResult(result)
     }
-    
-    // 阶段 3: 重要组件检查（并行）
-    if err := h.checkImportantComponentsParallel(result); err != nil {
+
+    // 重要组件（并行，失败记录警告）
+    if err := h.checkComponentsParallel(important, result); err != nil {
         h.log.Warn("important components check failed: %v", err)
         result.ImportantComponentErrors = append(result.ImportantComponentErrors, err)
     }
-    
-    // 阶段 4: 非关键组件检查（并行）
-    if err := h.checkOptionalComponentsParallel(result); err != nil {
+
+    // 非关键组件（并行，失败记录调试信息）
+    if err := h.checkComponentsParallel(optional, result); err != nil {
         h.log.Debug("optional components check failed: %v", err)
         result.OptionalComponentErrors = append(result.OptionalComponentErrors, err)
     }
-    
+
     return h.aggregateResult(result)
+}
+
+// groupByPriority 将组件列表按优先级分组
+func (h *UnifiedHealthChecker) groupByPriority() (critical, important, optional []ComponentCheck) {
+    for _, c := range h.config.Components {
+        switch c.Priority {
+        case PriorityCritical:
+            critical = append(critical, c)
+        case PriorityImportant:
+            important = append(important, c)
+        case PriorityOptional:
+            optional = append(optional, c)
+        }
+    }
+    return
 }
 
 // checkNodesParallel 并行检查节点状态
 func (h *UnifiedHealthChecker) checkNodesParallel(cluster *bkev1beta1.BKECluster, currentVersion string, bkeNodes bkev1beta1.BKENodes, result *HealthCheckResult) error {
-    // 从缓存获取节点列表
     nodes, err := h.cache.GetNodes(h.kubeClient)
     if err != nil {
         return err
     }
-    
-    // 并行检查所有节点
+
     var wg sync.WaitGroup
     errChan := make(chan error, len(nodes.Items))
-    
+
     for _, node := range nodes.Items {
         nodeIP := GetNodeIP(&node)
-        
-        // 跳过需要跳过的节点
+
         if bkeNodes.GetNodeStateNeedSkip(nodeIP) {
             continue
         }
-        
+
         wg.Add(1)
         go func(n corev1.Node) {
             defer wg.Done()
@@ -303,42 +527,26 @@ func (h *UnifiedHealthChecker) checkNodesParallel(cluster *bkev1beta1.BKECluster
             }
         }(node)
     }
-    
+
     wg.Wait()
     close(errChan)
-    
-    // 收集错误
+
     for err := range errChan {
         result.NodeErrors = append(result.NodeErrors, err)
     }
-    
+
     if len(result.NodeErrors) > 0 {
         return kerrors.NewAggregate(result.NodeErrors)
     }
-    
+
     return nil
 }
 
-// checkCriticalComponentsParallel 并行检查关键组件
-func (h *UnifiedHealthChecker) checkCriticalComponentsParallel(result *HealthCheckResult) error {
-    return h.checkComponentsByPriority(h.config.CriticalComponents, result)
-}
-
-// checkImportantComponentsParallel 并行检查重要组件
-func (h *UnifiedHealthChecker) checkImportantComponentsParallel(result *HealthCheckResult) error {
-    return h.checkComponentsByPriority(h.config.ImportantComponents, result)
-}
-
-// checkOptionalComponentsParallel 并行检查非关键组件
-func (h *UnifiedHealthChecker) checkOptionalComponentsParallel(result *HealthCheckResult) error {
-    return h.checkComponentsByPriority(h.config.OptionalComponents, result)
-}
-
-// checkComponentsByPriority 按优先级并行检查组件
-func (h *UnifiedHealthChecker) checkComponentsByPriority(components []ComponentCheck, result *HealthCheckResult) error {
+// checkComponentsParallel 按优先级并行检查组件
+func (h *UnifiedHealthChecker) checkComponentsParallel(components []ComponentCheck, result *HealthCheckResult) error {
     var wg sync.WaitGroup
     errChan := make(chan error, len(components))
-    
+
     for _, check := range components {
         wg.Add(1)
         go func(c ComponentCheck) {
@@ -348,66 +556,122 @@ func (h *UnifiedHealthChecker) checkComponentsByPriority(components []ComponentC
             }
         }(check)
     }
-    
+
     wg.Wait()
     close(errChan)
-    
+
     var errs []error
     for err := range errChan {
         errs = append(errs, err)
     }
-    
+
     if len(errs) > 0 {
         return kerrors.NewAggregate(errs)
     }
-    
+
+    return nil
+}
+
+// checkComponent 检查单个组件健康状态，返回带组件信息的 HealthCheckError
+func (h *UnifiedHealthChecker) checkComponent(check ComponentCheck) error {
+    pods, err := h.cache.GetPods(check.Namespace)
+    if err != nil {
+        return fmt.Errorf("failed to get pods in %s: %w", check.Namespace, err)
+    }
+
+    var errs []error
+    for _, prefix := range check.Prefixes {
+        matchedPods := filterPodsByPrefix(pods, prefix)
+        if len(matchedPods) == 0 {
+            errs = append(errs, newComponentError(check, "", "PodNotFound",
+                fmt.Errorf("no pods with prefix %q in %s", prefix, check.Namespace)))
+            continue
+        }
+
+        for _, pod := range matchedPods {
+            if err := h.checkPodHealth(pod); err != nil {
+                errs = append(errs, newComponentError(check, pod.Name,
+                    getPodUnhealthyReason(pod), err))
+            }
+        }
+    }
+
+    return kerrors.NewAggregate(errs)
+}
+
+// checkNode 检查节点健康状态，返回带组件信息的 HealthCheckError
+func (h *UnifiedHealthChecker) checkNode(node *corev1.Node, currentVersion string) error {
+    if !NodeReady(node) {
+        return newNodeError(node.Name, "NodeNotReady",
+            fmt.Errorf("node %s is not ready", node.Name))
+    }
+
+    if node.Status.NodeInfo.KubeletVersion != currentVersion {
+        return newNodeError(node.Name, "VersionMismatch",
+            fmt.Errorf("expected version %s, got %s",
+                currentVersion, node.Status.NodeInfo.KubeletVersion))
+    }
+
     return nil
 }
 
 // aggregateResult 聚合检查结果
 func (h *UnifiedHealthChecker) aggregateResult(result *HealthCheckResult) error {
-    // 节点错误或关键组件错误，立即返回
-    if len(result.NodeErrors) > 0 || len(result.CriticalComponentErrors) > 0 {
-        var allErrors []error
-        allErrors = append(allErrors, result.NodeErrors...)
-        allErrors = append(allErrors, result.CriticalComponentErrors...)
-        return kerrors.NewAggregate(allErrors)
+    var typedErrs []error
+    typedErrs = append(typedErrs, result.NodeErrors...)
+    typedErrs = append(typedErrs, result.CriticalComponentErrors...)
+    typedErrs = append(typedErrs, result.ImportantComponentErrors...)
+    typedErrs = append(typedErrs, result.OptionalComponentErrors...)
+
+    if len(typedErrs) == 0 {
+        h.log.Info("cluster health check pass")
+        return nil
     }
-    
-    // 重要组件错误，记录警告
-    if len(result.ImportantComponentErrors) > 0 {
-        h.log.Warn("important component errors: %v", result.ImportantComponentErrors)
+
+    agg := kerrors.NewAggregate(typedErrs)
+
+    if criticalErrs := ComponentErrorsByPriority(agg, PriorityCritical); len(criticalErrs) > 0 {
+        h.log.Error("critical component errors: %v", criticalErrs)
     }
-    
-    // 非关键组件错误，记录调试信息
-    if len(result.OptionalComponentErrors) > 0 {
-        h.log.Debug("optional component errors: %v", result.OptionalComponentErrors)
+    if importantErrs := ComponentErrorsByPriority(agg, PriorityImportant); len(importantErrs) > 0 {
+        h.log.Warn("important component errors: %v", importantErrs)
     }
-    
-    h.log.Info("cluster health check pass")
-    return nil
+    if optionalErrs := ComponentErrorsByPriority(agg, PriorityOptional); len(optionalErrs) > 0 {
+        h.log.Debug("optional component errors: %v", optionalErrs)
+    }
+
+    return agg
 }
 
 // GetRequeueInterval 根据检查结果动态调整间隔
-func GetRequeueInterval(result *HealthCheckResult, config HealthCheckConfig) time.Duration {
-    // 节点错误或关键组件错误，快速重试
+func GetRequeueInterval(result *HealthCheckResult, intervals IntervalConfig) time.Duration {
     if len(result.NodeErrors) > 0 || len(result.CriticalComponentErrors) > 0 {
-        return config.CriticalComponentInterval
+        return intervals.Critical
     }
-    
-    // 重要组件错误，中速重试
     if len(result.ImportantComponentErrors) > 0 {
-        return config.ImportantComponentInterval
+        return intervals.Important
     }
-    
-    // 非关键组件错误，慢速重试
     if len(result.OptionalComponentErrors) > 0 {
-        return config.OptionalComponentInterval
+        return intervals.Optional
     }
-    
-    // 正常，使用正常间隔
-    return config.NormalInterval
+    return intervals.Normal
 }
+```
+
+##### 2.4 信息流
+
+```
+配置文件 (priority: critical)
+    ↓
+ComponentCheck.Priority       ← HealthCheckPriority（来自配置）
+    ↓
+ComponentInfo.Priority        ← 直接传递
+    ↓
+HealthCheckError.Component.Priority
+    ↓
+isCriticalError() / isImportantError()
+    ↓
+GetRequeueInterval() → 动态间隔
 ```
 
 #### 优化 3: 健康检查缓存实现
@@ -699,71 +963,114 @@ func (c *HealthCheckCache) refreshPods(client *Client, namespace string, option 
 **文件**: `/etc/bke/health-check-config.yaml`
 
 ```yaml
-# Informer 缓存同步超时时间
+# 检查间隔
+intervals:
+  critical: 5s
+  important: 15s
+  optional: 30s
+  normal: 5m
+
+# 缓存
 cacheSyncTimeout: 30s
 
-# 检查间隔配置
-criticalComponentInterval: 5s
-importantComponentInterval: 15s
-optionalComponentInterval: 30s
-normalInterval: 5m
+# 组件清单（扁平列表，priority 由配置直接定义）
+components:
+  # 控制面
+  - name: etcd
+    namespace: kube-system
+    prefixes: [etcd-]
+    priority: critical
+  - name: kube-apiserver
+    namespace: kube-system
+    prefixes: [kube-apiserver-]
+    priority: critical
+  - name: kube-controller-manager
+    namespace: kube-system
+    prefixes: [kube-controller-manager-]
+    priority: critical
+  - name: kube-scheduler
+    namespace: kube-system
+    prefixes: [kube-scheduler-]
+    priority: critical
 
-# 关键组件清单
-criticalComponents:
-  - namespace: kube-system
-    prefixes:
-      - etcd-
-      - kube-apiserver-
-      - kube-controller-manager-
-      - kube-scheduler-
+  # 网络
+  - name: calico-node
+    namespace: kube-system
+    prefixes: [calico-node]
+    priority: important
+  - name: calico-kube-controllers
+    namespace: kube-system
+    prefixes: [calico-kube-controllers]
+    priority: important
+  - name: kube-proxy
+    namespace: kube-system
+    prefixes: [kube-proxy-]
+    priority: important
 
-# 重要组件清单
-importantComponents:
-  - namespace: kube-system
-    prefixes:
-      - calico-kube-controllers
-      - calico-node
-      - coredns
-      - kube-proxy-
+  # DNS
+  - name: coredns
+    namespace: kube-system
+    prefixes: [coredns]
+    priority: important
 
-# 非关键组件清单
-optionalComponents:
-  - namespace: kube-system
-    prefixes:
-      - metrics-server-
-  - namespace: ingress-nginx
-    prefixes:
-      - ingress-nginx-controller
-  - namespace: monitoring
-    prefixes:
-      - alertmanager-main-
-      - prometheus-k8s-
-      - node-exporter-
-  - namespace: openfuyao-system
-    prefixes:
-      - console-service-
-      - oauth-server-
-      - local-harbor-
+  # Addon
+  - name: metrics-server
+    namespace: kube-system
+    prefixes: [metrics-server-]
+    priority: optional
+  - name: ingress-nginx
+    namespace: ingress-nginx
+    prefixes: [ingress-nginx-controller]
+    priority: optional
+  - name: console-service
+    namespace: openfuyao-system
+    prefixes: [console-service-]
+    priority: optional
+  - name: oauth-server
+    namespace: openfuyao-system
+    prefixes: [oauth-server-]
+    priority: optional
+  - name: local-harbor
+    namespace: openfuyao-system
+    prefixes: [local-harbor-]
+    priority: optional
+
+  # 监控
+  - name: prometheus
+    namespace: monitoring
+    prefixes: [prometheus-k8s-]
+    priority: optional
+  - name: alertmanager
+    namespace: monitoring
+    prefixes: [alertmanager-main-]
+    priority: optional
+  - name: node-exporter
+    namespace: monitoring
+    prefixes: [node-exporter-]
+    priority: optional
 ```
 
 **配置说明：**
 
 | 配置项 | 说明 | 默认值 |
 |--------|------|--------|
+| `intervals.critical` | 关键组件失败后的重试间隔 | 5s |
+| `intervals.important` | 重要组件失败后的重试间隔 | 15s |
+| `intervals.optional` | 非关键组件失败后的重试间隔 | 30s |
+| `intervals.normal` | 正常状态下的检查间隔 | 5m |
 | `cacheSyncTimeout` | Informer 缓存同步超时时间 | 30s |
-| `criticalComponentInterval` | 关键组件失败后的重试间隔 | 5s |
-| `importantComponentInterval` | 重要组件失败后的重试间隔 | 15s |
-| `optionalComponentInterval` | 非关键组件失败后的重试间隔 | 30s |
-| `normalInterval` | 正常状态下的检查间隔 | 5m |
-| `criticalComponents` | 关键组件清单 | etcd, kube-apiserver 等 |
-| `importantComponents` | 重要组件清单 | calico, coredns 等 |
-| `optionalComponents` | 非关键组件清单 | metrics-server, ingress-nginx 等 |
+| `components` | 组件清单（扁平列表） | 见默认配置 |
+| `components[].name` | 组件名称（唯一标识） | 必填 |
+| `components[].namespace` | 组件所在命名空间 | 必填 |
+| `components[].prefixes` | Pod 前缀列表 | 必填 |
+| `components[].priority` | 组件优先级（critical/important/optional） | 必填 |
 
 **配置加载优先级：**
 
 1. 如果配置文件存在且格式正确，使用配置文件
 2. 如果配置文件不存在或格式错误，使用默认配置
-3. 如果配置文件中某些字段为空，使用默认值填充
+3. 如果配置文件中 `components` 为空，使用默认组件清单
+4. `priority` 字段为必填，缺失时加载失败并回退到默认配置
 
 ## 设计视图
 
@@ -772,11 +1079,11 @@ optionalComponents:
 ```mermaid
 graph TB
     subgraph "BKE Controller"
-        A[配置管理<br/>health-check-config.yaml] --> B[统一健康检查器<br/>health.go]
-        B --> C[渐进式检查引擎]
+        A[配置管理<br/>health-check-config.yaml<br/>priority: critical/important/optional] --> B[统一健康检查器<br/>health.go]
+        B --> C[渐进式检查引擎<br/>groupByPriority]
         C --> D[节点检查器]
-        C --> E[组件检查器]
-        C --> F[Addon检查器]
+        C --> E[组件检查器<br/>checkComponent → HealthCheckError]
+        B --> F[错误判断<br/>isCriticalError / isImportantError]
         B --> G[缓存层<br/>health_cache.go]
         G --> H[Informer/RV+TTL]
     end
@@ -792,18 +1099,19 @@ graph TB
     style B fill:#e1f5ff
     style G fill:#fff4e1
     style H fill:#e8f5e9
+    style F fill:#ffe1e1
 ```
 
 **组件职责说明：**
 
 | 组件 | 职责 | 文件位置 |
 |------|------|---------|
-| 配置管理 | 加载健康检查配置，支持配置文件和默认值 | `pkg/kube/health.go` |
+| 配置管理 | 加载健康检查配置，解析 `priority` 字段，支持配置文件和默认值 | `pkg/kube/health.go` |
 | 统一健康检查器 | 协调健康检查流程，聚合检查结果 | `pkg/kube/health.go` |
-| 渐进式检查引擎 | 按优先级分阶段执行检查 | `pkg/kube/health.go` |
-| 节点检查器 | 检查所有节点的 Ready 状态 | `pkg/kube/health.go` |
-| 组件检查器 | 检查控制面组件和重要组件 | `pkg/kube/health.go` |
-| Addon检查器 | 检查可选的 Addon 组件 | `pkg/kube/health.go` |
+| 渐进式检查引擎 | `groupByPriority` 按配置中的 `priority` 分组，分阶段执行检查 | `pkg/kube/health.go` |
+| 节点检查器 | 检查所有节点的 Ready 状态，返回 `HealthCheckError` | `pkg/kube/health.go` |
+| 组件检查器 | 检查所有组件（统一入口），返回带 `ComponentInfo` 的 `HealthCheckError` | `pkg/kube/health.go` |
+| 错误判断 | `isCriticalError` / `isImportantError` 从 `HealthCheckError` 中提取优先级 | `pkg/kube/health.go` |
 | 缓存层 | 缓存 Node 和 Pod 状态，减少 API 调用 | `pkg/kube/health_cache.go` |
 | Informer/RV+TTL | 实现缓存机制（推荐方案/备选方案） | `pkg/kube/health_cache.go` |
 
@@ -855,9 +1163,9 @@ sequenceDiagram
 graph LR
     subgraph "配置加载"
         A[LoadHealthCheckConfig] --> B{配置文件存在?}
-        B -->|是| C[解析YAML]
+        B -->|是| C[解析YAML<br/>priority必填]
         B -->|否| D[使用默认配置]
-        C --> E[合并配置]
+        C --> E[HealthCheckConfig]
         D --> E
     end
     
@@ -865,28 +1173,31 @@ graph LR
         E --> F[NewUnifiedHealthChecker]
         F --> G[Check]
         G --> H[checkNodesParallel]
-        G --> I[checkCriticalComponentsParallel]
-        G --> J[checkImportantComponentsParallel]
-        G --> K[checkOptionalComponentsParallel]
+        G --> I[groupByPriority]
+        I --> I1[critical]
+        I --> I2[important]
+        I --> I3[optional]
+        I1 --> J[checkComponentsParallel]
+        I2 --> J
+        I3 --> J
+        J --> K[checkComponent<br/>返回HealthCheckError]
         G --> L[aggregateResult]
     end
     
     subgraph "缓存层"
         H --> M[GetNodes]
-        I --> N[GetPods]
-        J --> N
-        K --> N
+        J --> N[GetPods]
         M --> O{Informer/RV+TTL}
         N --> O
     end
     
     subgraph "动态间隔"
         L --> P[GetRequeueInterval]
-        P --> Q{检查结果}
-        Q -->|关键组件失败| R[5秒]
-        Q -->|重要组件失败| S[15秒]
-        Q -->|非关键组件失败| T[30秒]
-        Q -->|全部成功| U[5分钟]
+        P --> Q{isCriticalError?}
+        Q -->|是| R[intervals.critical 5秒]
+        Q -->|否| S{isImportantError?}
+        S -->|是| T[intervals.important 15秒]
+        S -->|否| U[intervals.optional 30秒<br/>/ intervals.normal 5分钟]
     end
 ```
 
@@ -894,44 +1205,47 @@ graph LR
 
 ```mermaid
 graph TD
-    A[配置文件<br/>health-check-config.yaml] --> B[LoadHealthCheckConfig]
-    B --> C[HealthCheckConfig]
+    A[配置文件<br/>health-check-config.yaml<br/>priority: critical/important/optional] --> B[LoadHealthCheckConfig]
+    B --> C[HealthCheckConfig<br/>Components: 扁平列表]
     
     C --> D[NewUnifiedHealthChecker]
     D --> E[UnifiedHealthChecker]
     
     E --> F[Check]
     F --> G[checkNodesParallel]
-    F --> H[checkCriticalComponentsParallel]
-    F --> I[checkImportantComponentsParallel]
-    F --> J[checkOptionalComponentsParallel]
+    F --> H[groupByPriority]
+    H --> H1[critical组件]
+    H --> H2[important组件]
+    H --> H3[optional组件]
+    H1 --> I[checkComponentsParallel]
+    H2 --> I
+    H3 --> I
     
-    G --> K[HealthCheckCache.GetNodes]
-    H --> L[HealthCheckCache.GetPods]
-    I --> L
-    J --> L
+    G --> J[HealthCheckCache.GetNodes]
+    I --> K[HealthCheckCache.GetPods]
     
-    K --> M{Informer同步?}
-    M -->|是| N[从缓存读取]
-    M -->|否| O[等待同步]
-    O --> N
+    J --> L{Informer同步?}
+    L -->|是| M[从缓存读取]
+    L -->|否| N[等待同步]
+    N --> M
     
-    L --> P{RV+TTL?}
-    P -->|TTL内| Q[条件查询]
-    P -->|TTL过期| R[全量刷新]
-    Q --> S{RV变化?}
-    S -->|否| T[使用缓存]
-    S -->|是| U[更新缓存]
+    K --> O{RV+TTL?}
+    O -->|TTL内| P[条件查询]
+    O -->|TTL过期| Q[全量刷新]
+    P --> R{RV变化?}
+    R -->|否| S[使用缓存]
+    R -->|是| T[更新缓存]
     
-    N --> V[节点/Pod数据]
-    T --> V
-    U --> V
-    R --> V
+    M --> U[节点/Pod数据]
+    S --> U
+    T --> U
+    Q --> U
     
-    V --> W[检查结果]
-    W --> X[aggregateResult]
-    X --> Y[HealthCheckResult]
+    U --> V[checkComponent<br/>返回HealthCheckError<br/>含ComponentInfo.Priority]
+    V --> W[aggregateResult]
+    W --> X[HealthCheckResult]
     
+    X --> Y[isCriticalError / isImportantError]
     Y --> Z[GetRequeueInterval]
     Z --> AA[动态间隔]
 ```
@@ -992,277 +1306,36 @@ graph TB
 
 #### 1. `pkg/kube/health.go` - 修改
 
-##### 1.1 新增结构体
+##### 1.1 新增类型定义
 
 **位置**：在文件开头（第 30 行后）
 
-```go
-// HealthCheckConfig 健康检查配置
-type HealthCheckConfig struct {
-    CacheTTL                   time.Duration     `yaml:"cacheTTL"`
-    CriticalComponentInterval  time.Duration     `yaml:"criticalComponentInterval"`
-    ImportantComponentInterval time.Duration     `yaml:"importantComponentInterval"`
-    OptionalComponentInterval  time.Duration     `yaml:"optionalComponentInterval"`
-    NormalInterval             time.Duration     `yaml:"normalInterval"`
-    CriticalComponents         []ComponentCheck  `yaml:"criticalComponents"`
-    ImportantComponents        []ComponentCheck  `yaml:"importantComponents"`
-    OptionalComponents         []ComponentCheck  `yaml:"optionalComponents"`
-}
-
-// HealthCheckResult 健康检查结果
-type HealthCheckResult struct {
-    NodeErrors                []error
-    CriticalComponentErrors   []error
-    ImportantComponentErrors  []error
-    OptionalComponentErrors   []error
-}
-
-// UnifiedHealthChecker 统一健康检查器
-type UnifiedHealthChecker struct {
-    kubeClient kubernetes.Interface
-    log        *log.Logger
-    cache      *HealthCheckCache
-    config     HealthCheckConfig
-}
-```
+**新增内容**：
+- `HealthCheckPriority`：优先级枚举（来自配置）
+- `ComponentName`：组件名称常量
+- `ComponentCheck`：组件检查配置（含 `Name`、`Priority`）
+- `ComponentInfo`：组件运行时信息（含 `Priority`）
+- `HealthCheckError`：带组件信息的错误类型
+- `isCriticalError` / `isImportantError`：错误判断函数
+- `IntervalConfig`：检查间隔配置
+- `HealthCheckConfig`：统一配置结构（扁平 `components` 列表）
 
 ##### 1.2 新增函数/方法
 
 **位置**：在 `CheckClusterHealth` 函数前
 
-```go
-// NewUnifiedHealthChecker 创建健康检查器
-func NewUnifiedHealthChecker(kubeClient kubernetes.Interface, log *log.Logger, config HealthCheckConfig) *UnifiedHealthChecker {
-    return &UnifiedHealthChecker{
-        kubeClient: kubeClient,
-        log:        log,
-        cache:      NewHealthCheckCache(config.CacheTTL),
-        config:     config,
-    }
-}
-
-// DefaultHealthCheckConfig 返回默认配置
-func DefaultHealthCheckConfig() HealthCheckConfig {
-    return HealthCheckConfig{
-        CacheTTL:                   30 * time.Second,
-        CriticalComponentInterval:  5 * time.Second,
-        ImportantComponentInterval: 15 * time.Second,
-        OptionalComponentInterval:  30 * time.Second,
-        NormalInterval:             5 * time.Minute,
-        
-        CriticalComponents: []ComponentCheck{
-            {Namespace: "kube-system", Prefixes: []string{"etcd-", "kube-apiserver-", "kube-controller-manager-", "kube-scheduler-"}},
-        },
-        ImportantComponents: []ComponentCheck{
-            {Namespace: "kube-system", Prefixes: []string{"calico-kube-controllers", "calico-node", "coredns", "kube-proxy-"}},
-        },
-        OptionalComponents: []ComponentCheck{
-            {Namespace: "kube-system", Prefixes: []string{"metrics-server-"}},
-            {Namespace: "ingress-nginx", Prefixes: []string{"ingress-nginx-controller"}},
-            {Namespace: "monitoring", Prefixes: []string{"alertmanager-main-", "prometheus-k8s-", "node-exporter-"}},
-            {Namespace: "openfuyao-system", Prefixes: []string{"console-service-", "oauth-server-", "local-harbor-"}},
-        },
-    }
-}
-
-// LoadHealthCheckConfig 从配置文件加载配置
-func LoadHealthCheckConfig(configPath string) HealthCheckConfig {
-    data, err := os.ReadFile(configPath)
-    if err != nil {
-        log.Warnf("failed to load health check config from %s, using default: %v", configPath, err)
-        return DefaultHealthCheckConfig()
-    }
-    
-    var config HealthCheckConfig
-    if err := yaml.Unmarshal(data, &config); err != nil {
-        log.Warnf("failed to parse health check config, using default: %v", err)
-        return DefaultHealthCheckConfig()
-    }
-    
-    // 如果某些字段为空，使用默认值
-    defaultConfig := DefaultHealthCheckConfig()
-    if len(config.CriticalComponents) == 0 {
-        config.CriticalComponents = defaultConfig.CriticalComponents
-    }
-    if len(config.ImportantComponents) == 0 {
-        config.ImportantComponents = defaultConfig.ImportantComponents
-    }
-    if len(config.OptionalComponents) == 0 {
-        config.OptionalComponents = defaultConfig.OptionalComponents
-    }
-    
-    return config
-}
-
-// GetRequeueInterval 根据检查结果动态调整间隔
-func GetRequeueInterval(result *HealthCheckResult, config HealthCheckConfig) time.Duration {
-    // 节点错误或关键组件错误，快速重试
-    if len(result.NodeErrors) > 0 || len(result.CriticalComponentErrors) > 0 {
-        return config.CriticalComponentInterval
-    }
-    
-    // 重要组件错误，中速重试
-    if len(result.ImportantComponentErrors) > 0 {
-        return config.ImportantComponentInterval
-    }
-    
-    // 非关键组件错误，慢速重试
-    if len(result.OptionalComponentErrors) > 0 {
-        return config.OptionalComponentInterval
-    }
-    
-    // 正常，使用正常间隔
-    return config.NormalInterval
-}
-```
-
-**位置**：在 `UnifiedHealthChecker` 结构体后
-
-```go
-// Check 执行健康检查
-func (h *UnifiedHealthChecker) Check(cluster *bkev1beta1.BKECluster, currentVersion string, bkeNodes bkev1beta1.BKENodes) error {
-    result := &HealthCheckResult{}
-    
-    // 阶段 1: 节点状态检查（并行）
-    if err := h.checkNodesParallel(cluster, currentVersion, bkeNodes, result); err != nil {
-        result.NodeErrors = append(result.NodeErrors, err)
-        return h.aggregateResult(result)
-    }
-    
-    // 阶段 2: 关键组件检查（并行）
-    if err := h.checkCriticalComponentsParallel(result); err != nil {
-        result.CriticalComponentErrors = append(result.CriticalComponentErrors, err)
-        return h.aggregateResult(result)
-    }
-    
-    // 阶段 3: 重要组件检查（并行）
-    if err := h.checkImportantComponentsParallel(result); err != nil {
-        h.log.Warn("important components check failed: %v", err)
-        result.ImportantComponentErrors = append(result.ImportantComponentErrors, err)
-    }
-    
-    // 阶段 4: 非关键组件检查（并行）
-    if err := h.checkOptionalComponentsParallel(result); err != nil {
-        h.log.Debug("optional components check failed: %v", err)
-        result.OptionalComponentErrors = append(result.OptionalComponentErrors, err)
-    }
-    
-    return h.aggregateResult(result)
-}
-
-// checkNodesParallel 并行检查节点
-func (h *UnifiedHealthChecker) checkNodesParallel(cluster *bkev1beta1.BKECluster, currentVersion string, bkeNodes bkev1beta1.BKENodes, result *HealthCheckResult) error {
-    // 从缓存获取节点列表
-    nodes, err := h.cache.GetNodes(h.kubeClient)
-    if err != nil {
-        return err
-    }
-    
-    // 并行检查所有节点
-    var wg sync.WaitGroup
-    errChan := make(chan error, len(nodes.Items))
-    
-    for _, node := range nodes.Items {
-        nodeIP := GetNodeIP(&node)
-        
-        // 跳过需要跳过的节点
-        if bkeNodes.GetNodeStateNeedSkip(nodeIP) {
-            continue
-        }
-        
-        wg.Add(1)
-        go func(n corev1.Node) {
-            defer wg.Done()
-            if err := h.checkNode(&n, currentVersion); err != nil {
-                errChan <- err
-            }
-        }(node)
-    }
-    
-    wg.Wait()
-    close(errChan)
-    
-    // 收集错误
-    for err := range errChan {
-        result.NodeErrors = append(result.NodeErrors, err)
-    }
-    
-    if len(result.NodeErrors) > 0 {
-        return kerrors.NewAggregate(result.NodeErrors)
-    }
-    
-    return nil
-}
-
-// checkCriticalComponentsParallel 并行检查关键组件
-func (h *UnifiedHealthChecker) checkCriticalComponentsParallel(result *HealthCheckResult) error {
-    return h.checkComponentsByPriority(h.config.CriticalComponents, result)
-}
-
-// checkImportantComponentsParallel 并行检查重要组件
-func (h *UnifiedHealthChecker) checkImportantComponentsParallel(result *HealthCheckResult) error {
-    return h.checkComponentsByPriority(h.config.ImportantComponents, result)
-}
-
-// checkOptionalComponentsParallel 并行检查非关键组件
-func (h *UnifiedHealthChecker) checkOptionalComponentsParallel(result *HealthCheckResult) error {
-    return h.checkComponentsByPriority(h.config.OptionalComponents, result)
-}
-
-// checkComponentsByPriority 按优先级并行检查
-func (h *UnifiedHealthChecker) checkComponentsByPriority(components []ComponentCheck, result *HealthCheckResult) error {
-    var wg sync.WaitGroup
-    errChan := make(chan error, len(components))
-    
-    for _, check := range components {
-        wg.Add(1)
-        go func(c ComponentCheck) {
-            defer wg.Done()
-            if err := h.checkComponent(c); err != nil {
-                errChan <- err
-            }
-        }(check)
-    }
-    
-    wg.Wait()
-    close(errChan)
-    
-    var errs []error
-    for err := range errChan {
-        errs = append(errs, err)
-    }
-    
-    if len(errs) > 0 {
-        return kerrors.NewAggregate(errs)
-    }
-    
-    return nil
-}
-
-// aggregateResult 聚合检查结果
-func (h *UnifiedHealthChecker) aggregateResult(result *HealthCheckResult) error {
-    // 节点错误或关键组件错误，立即返回
-    if len(result.NodeErrors) > 0 || len(result.CriticalComponentErrors) > 0 {
-        var allErrors []error
-        allErrors = append(allErrors, result.NodeErrors...)
-        allErrors = append(allErrors, result.CriticalComponentErrors...)
-        return kerrors.NewAggregate(allErrors)
-    }
-    
-    // 重要组件错误，记录警告
-    if len(result.ImportantComponentErrors) > 0 {
-        h.log.Warn("important component errors: %v", result.ImportantComponentErrors)
-    }
-    
-    // 非关键组件错误，记录调试信息
-    if len(result.OptionalComponentErrors) > 0 {
-        h.log.Debug("optional component errors: %v", result.OptionalComponentErrors)
-    }
-    
-    h.log.Info("cluster health check pass")
-    return nil
-}
-```
+**新增内容**：完整代码见「优化 2」章节，包含：
+- `NewUnifiedHealthChecker`：创建健康检查器
+- `DefaultHealthCheckConfig`：返回默认配置（含所有组件的 `Name` 和 `Priority`）
+- `LoadHealthCheckConfig`：从配置文件加载配置
+- `Check`：执行统一健康检查（使用 `groupByPriority` 分组）
+- `groupByPriority`：将组件列表按 `Priority` 分组为 critical/important/optional
+- `checkNodesParallel`：并行检查节点状态
+- `checkComponentsParallel`：按优先级并行检查组件
+- `checkComponent`：检查单个组件，返回 `HealthCheckError`
+- `checkNode`：检查节点，返回 `HealthCheckError`
+- `aggregateResult`：聚合检查结果，按优先级分类日志
+- `GetRequeueInterval`：根据检查结果动态调整间隔
 
 ##### 1.3 修改现有函数
 
@@ -1416,20 +1489,16 @@ type EnsureCluster struct {
 ```go
 // getRequeueInterval 根据健康检查结果动态调整重试间隔
 func (e *EnsureCluster) getRequeueInterval(err error) time.Duration {
-    // 如果健康检查失败，根据错误类型返回不同的间隔
     if err != nil {
-        // 根据错误类型判断
         if isCriticalError(err) {
-            return e.healthCheckConfig.CriticalComponentInterval
+            return e.healthCheckConfig.Intervals.Critical
         }
         if isImportantError(err) {
-            return e.healthCheckConfig.ImportantComponentInterval
+            return e.healthCheckConfig.Intervals.Important
         }
-        return e.healthCheckConfig.OptionalComponentInterval
+        return e.healthCheckConfig.Intervals.Optional
     }
-    
-    // 正常状态下，使用正常间隔
-    return e.healthCheckConfig.NormalInterval
+    return e.healthCheckConfig.Intervals.Normal
 }
 ```
 
@@ -1479,51 +1548,87 @@ return ctrl.Result{RequeueAfter: requeueInterval}, kerrors.NewAggregate(errs)
 **位置**：新文件
 
 ```yaml
-# Informer 缓存同步超时时间
+# 检查间隔
+intervals:
+  critical: 5s
+  important: 15s
+  optional: 30s
+  normal: 5m
+
+# 缓存
 cacheSyncTimeout: 30s
 
-# 检查间隔配置
-criticalComponentInterval: 5s
-importantComponentInterval: 15s
-optionalComponentInterval: 30s
-normalInterval: 5m
-
-# 关键组件清单
-criticalComponents:
-  - namespace: kube-system
-    prefixes:
-      - etcd-
-      - kube-apiserver-
-      - kube-controller-manager-
-      - kube-scheduler-
-
-# 重要组件清单
-importantComponents:
-  - namespace: kube-system
-    prefixes:
-      - calico-kube-controllers
-      - calico-node
-      - coredns
-      - kube-proxy-
-
-# 非关键组件清单
-optionalComponents:
-  - namespace: kube-system
-    prefixes:
-      - metrics-server-
-  - namespace: ingress-nginx
-    prefixes:
-      - ingress-nginx-controller
-  - namespace: monitoring
-    prefixes:
-      - alertmanager-main-
-      - prometheus-k8s-
-      - node-exporter-
-  - namespace: openfuyao-system
-    prefixes:
-      - console-service-
-      - oauth-server-
-      - local-harbor-
+# 组件清单（扁平列表，priority 由配置直接定义）
+components:
+  # 控制面
+  - name: etcd
+    namespace: kube-system
+    prefixes: [etcd-]
+    priority: critical
+  - name: kube-apiserver
+    namespace: kube-system
+    prefixes: [kube-apiserver-]
+    priority: critical
+  - name: kube-controller-manager
+    namespace: kube-system
+    prefixes: [kube-controller-manager-]
+    priority: critical
+  - name: kube-scheduler
+    namespace: kube-system
+    prefixes: [kube-scheduler-]
+    priority: critical
+  # 网络
+  - name: calico-node
+    namespace: kube-system
+    prefixes: [calico-node]
+    priority: important
+  - name: calico-kube-controllers
+    namespace: kube-system
+    prefixes: [calico-kube-controllers]
+    priority: important
+  - name: kube-proxy
+    namespace: kube-system
+    prefixes: [kube-proxy-]
+    priority: important
+  # DNS
+  - name: coredns
+    namespace: kube-system
+    prefixes: [coredns]
+    priority: important
+  # Addon
+  - name: metrics-server
+    namespace: kube-system
+    prefixes: [metrics-server-]
+    priority: optional
+  - name: ingress-nginx
+    namespace: ingress-nginx
+    prefixes: [ingress-nginx-controller]
+    priority: optional
+  - name: console-service
+    namespace: openfuyao-system
+    prefixes: [console-service-]
+    priority: optional
+  - name: oauth-server
+    namespace: openfuyao-system
+    prefixes: [oauth-server-]
+    priority: optional
+  - name: local-harbor
+    namespace: openfuyao-system
+    prefixes: [local-harbor-]
+    priority: optional
+  # 监控
+  - name: prometheus
+    namespace: monitoring
+    prefixes: [prometheus-k8s-]
+    priority: optional
+  - name: alertmanager
+    namespace: monitoring
+    prefixes: [alertmanager-main-]
+    priority: optional
+  - name: node-exporter
+    namespace: monitoring
+    prefixes: [node-exporter-]
+    priority: optional
 ```
 
 #### 5. `pkg/kube/health_test.go` - 新增
@@ -1535,41 +1640,129 @@ package kube
 
 import (
     "errors"
+    "fmt"
     "testing"
     "time"
 
     "github.com/stretchr/testify/assert"
     "github.com/stretchr/testify/require"
-    
-    confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
-    bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
+    kerrors "k8s.io/apimachinery/pkg/util/errors"
 )
 
 func TestUnifiedHealthCheck(t *testing.T) {
-    // 测试 64 节点集群健康检查 < 3 分钟
     cluster := createTestCluster(64)
-    
+
     start := time.Now()
     err := cluster.CheckClusterHealth()
     require.NoError(t, err)
-    
+
     elapsed := time.Since(start)
     assert.Less(t, elapsed, 3*time.Minute, "Health check should complete within 3 minutes")
 }
 
 func TestCriticalComponentFastFail(t *testing.T) {
-    // 测试关键组件失败 < 1 秒返回
     cluster := createTestClusterWithFailedComponent("etcd-master-1")
-    
+
     start := time.Now()
     err := cluster.CheckClusterHealth()
     require.Error(t, err)
-    
+
     elapsed := time.Since(start)
     assert.Less(t, elapsed, 1*time.Second, "Critical component failure should fail fast")
 }
 
+func TestHealthCheckErrorPriority(t *testing.T) {
+    tests := []struct {
+        name           string
+        err            error
+        wantCritical   bool
+        wantImportant  bool
+    }{
+        {
+            name: "critical error",
+            err: &HealthCheckError{
+                Component: ComponentInfo{Name: NameEtcd, Namespace: "kube-system", PodName: "etcd-master-1", Priority: PriorityCritical},
+                Reason:    "PodNotReady",
+                Err:       errors.New("etcd not ready"),
+            },
+            wantCritical:  true,
+            wantImportant: false,
+        },
+        {
+            name: "important error",
+            err: &HealthCheckError{
+                Component: ComponentInfo{Name: NameCalicoNode, Namespace: "kube-system", PodName: "calico-node-abc", Priority: PriorityImportant},
+                Reason:    "ImagePullBackOff",
+                Err:       errors.New("image pull failed"),
+            },
+            wantCritical:  false,
+            wantImportant: true,
+        },
+        {
+            name: "aggregate with critical error",
+            err: kerrors.NewAggregate([]error{
+                &HealthCheckError{
+                    Component: ComponentInfo{Name: NameEtcd, Namespace: "kube-system", Priority: PriorityCritical},
+                    Reason:    "PodNotFound",
+                    Err:       errors.New("no pods found"),
+                },
+                &HealthCheckError{
+                    Component: ComponentInfo{Name: NameCoreDNS, Namespace: "kube-system", Priority: PriorityImportant},
+                    Reason:    "PodNotReady",
+                    Err:       errors.New("coredns not ready"),
+                },
+            }),
+            wantCritical:  true,
+            wantImportant: true,
+        },
+        {
+            name:          "plain error (no priority)",
+            err:           fmt.Errorf("some unknown error"),
+            wantCritical:  false,
+            wantImportant: false,
+        },
+    }
+
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            assert.Equal(t, tt.wantCritical, isCriticalError(tt.err))
+            assert.Equal(t, tt.wantImportant, isImportantError(tt.err))
+        })
+    }
+}
+
+func TestComponentErrorsByPriority(t *testing.T) {
+    agg := kerrors.NewAggregate([]error{
+        &HealthCheckError{
+            Component: ComponentInfo{Name: NameEtcd, Namespace: "kube-system", Priority: PriorityCritical},
+            Reason:    "PodNotReady", Err: errors.New("etcd not ready"),
+        },
+        &HealthCheckError{
+            Component: ComponentInfo{Name: NameKubeAPIServer, Namespace: "kube-system", Priority: PriorityCritical},
+            Reason:    "PodNotReady", Err: errors.New("apiserver not ready"),
+        },
+        &HealthCheckError{
+            Component: ComponentInfo{Name: NameCalicoNode, Namespace: "kube-system", Priority: PriorityImportant},
+            Reason:    "ImagePullBackOff", Err: errors.New("image pull failed"),
+        },
+    })
+
+    criticalErrs := ComponentErrorsByPriority(agg, PriorityCritical)
+    assert.Len(t, criticalErrs, 2)
+    assert.Equal(t, NameEtcd, criticalErrs[0].Component.Name)
+    assert.Equal(t, NameKubeAPIServer, criticalErrs[1].Component.Name)
+
+    importantErrs := ComponentErrorsByPriority(agg, PriorityImportant)
+    assert.Len(t, importantErrs, 1)
+    assert.Equal(t, NameCalicoNode, importantErrs[0].Component.Name)
+
+    optionalErrs := ComponentErrorsByPriority(agg, PriorityOptional)
+    assert.Len(t, optionalErrs, 0)
+}
+
 func TestDynamicRequeueInterval(t *testing.T) {
+    intervals := DefaultHealthCheckConfig().Intervals
+
     tests := []struct {
         name     string
         result   *HealthCheckResult
@@ -1578,21 +1771,36 @@ func TestDynamicRequeueInterval(t *testing.T) {
         {
             name: "critical component error",
             result: &HealthCheckResult{
-                CriticalComponentErrors: []error{errors.New("etcd failed")},
+                CriticalComponentErrors: []error{
+                    &HealthCheckError{
+                        Component: ComponentInfo{Name: NameEtcd, Priority: PriorityCritical},
+                        Reason:    "PodNotReady", Err: errors.New("etcd failed"),
+                    },
+                },
             },
             expected: 5 * time.Second,
         },
         {
             name: "important component error",
             result: &HealthCheckResult{
-                ImportantComponentErrors: []error{errors.New("calico failed")},
+                ImportantComponentErrors: []error{
+                    &HealthCheckError{
+                        Component: ComponentInfo{Name: NameCalicoNode, Priority: PriorityImportant},
+                        Reason:    "ImagePullBackOff", Err: errors.New("calico failed"),
+                    },
+                },
             },
             expected: 15 * time.Second,
         },
         {
             name: "optional component error",
             result: &HealthCheckResult{
-                OptionalComponentErrors: []error{errors.New("metrics-server failed")},
+                OptionalComponentErrors: []error{
+                    &HealthCheckError{
+                        Component: ComponentInfo{Name: NameMetricsServer, Priority: PriorityOptional},
+                        Reason:    "PodPending", Err: errors.New("metrics-server failed"),
+                    },
+                },
             },
             expected: 30 * time.Second,
         },
@@ -1602,10 +1810,10 @@ func TestDynamicRequeueInterval(t *testing.T) {
             expected: 5 * time.Minute,
         },
     }
-    
+
     for _, tt := range tests {
         t.Run(tt.name, func(t *testing.T) {
-            interval := GetRequeueInterval(tt.result, DefaultHealthCheckConfig())
+            interval := GetRequeueInterval(tt.result, intervals)
             assert.Equal(t, tt.expected, interval)
         })
     }
@@ -1647,13 +1855,13 @@ func TestHealthCheckPerformance(t *testing.T) {
 
 | 文件 | 变更类型 | 新增行数（预估） | 修改行数（预估） |
 |------|---------|----------------|----------------|
-| `pkg/kube/health.go` | 修改 | 200 | 50 |
+| `pkg/kube/health.go` | 修改 | 300 | 50 |
 | `pkg/kube/health_cache.go` | 新增 | 150 | 0 |
 | `pkg/phaseframe/phases/ensure_cluster.go` | 修改 | 15 | 20 |
-| `/etc/bke/health-check-config.yaml` | 新增 | 50 | 0 |
-| `pkg/kube/health_test.go` | 新增 | 100 | 0 |
+| `/etc/bke/health-check-config.yaml` | 新增 | 70 | 0 |
+| `pkg/kube/health_test.go` | 新增 | 150 | 0 |
 | `test/integration/health_check_test.go` | 新增 | 50 | 0 |
-| **总计** | | **565** | **70** |
+| **总计** | | **735** | **70** |
 
 #### 实施顺序建议
 
@@ -1686,84 +1894,20 @@ func TestHealthCheckPerformance(t *testing.T) {
 
 **文件**: `pkg/kube/health_test.go`
 
-```go
-func TestUnifiedHealthCheck(t *testing.T) {
-    // 部署 64 节点集群
-    cluster := createTestCluster(64)
-    
-    // 记录健康检查时间
-    start := time.Now()
-    
-    // 执行统一健康检查
-    err := cluster.CheckClusterHealth()
-    require.NoError(t, err)
-    
-    elapsed := time.Since(start)
-    
-    // 验证检查时间
-    assert.Less(t, elapsed, 3*time.Minute, "Health check should complete within 3 minutes")
-    t.Logf("Health check completed in %v", elapsed)
-}
+**测试用例清单**：
 
-func TestCriticalComponentFastFail(t *testing.T) {
-    // 模拟关键组件失败场景
-    cluster := createTestClusterWithFailedComponent("etcd-master-1")
-    
-    start := time.Now()
-    
-    // 执行健康检查
-    err := cluster.CheckClusterHealth()
-    require.Error(t, err)
-    
-    elapsed := time.Since(start)
-    
-    // 验证快速失败（应该在 1 秒内返回）
-    assert.Less(t, elapsed, 1*time.Second, "Critical component failure should fail fast")
-    t.Logf("Fast fail completed in %v", elapsed)
-}
+| 测试用例 | 验证内容 |
+|---------|---------|
+| `TestUnifiedHealthCheck` | 64 节点集群健康检查 < 3 分钟 |
+| `TestCriticalComponentFastFail` | 关键组件失败 < 1 秒返回 |
+| `TestHealthCheckErrorPriority` | `HealthCheckError` 优先级判断：单个错误、聚合错误、普通错误 |
+| `TestComponentErrorsByPriority` | 按优先级提取错误列表 |
+| `TestDynamicRequeueInterval` | 4 种间隔正确切换 |
+| `TestParsePriority` | 优先级字符串解析（critical/important/optional/非法值） |
+| `TestComponentCheckUnmarshalYAML` | 配置反序列化：priority 必填校验 |
+| `TestLoadHealthCheckConfig` | 配置文件加载/缺失/格式错误回退到默认值 |
 
-func TestDynamicRequeueInterval(t *testing.T) {
-    tests := []struct {
-        name     string
-        result   *HealthCheckResult
-        expected time.Duration
-    }{
-        {
-            name: "critical component error",
-            result: &HealthCheckResult{
-                CriticalComponentErrors: []error{errors.New("etcd failed")},
-            },
-            expected: 5 * time.Second,
-        },
-        {
-            name: "important component error",
-            result: &HealthCheckResult{
-                ImportantComponentErrors: []error{errors.New("calico failed")},
-            },
-            expected: 15 * time.Second,
-        },
-        {
-            name: "optional component error",
-            result: &HealthCheckResult{
-                OptionalComponentErrors: []error{errors.New("metrics-server failed")},
-            },
-            expected: 30 * time.Second,
-        },
-        {
-            name:     "no error",
-            result:   &HealthCheckResult{},
-            expected: 5 * time.Minute,
-        },
-    }
-    
-    for _, tt := range tests {
-        t.Run(tt.name, func(t *testing.T) {
-            interval := GetRequeueInterval(tt.result, DefaultHealthCheckConfig())
-            assert.Equal(t, tt.expected, interval)
-        })
-    }
-}
-```
+完整代码见「代码变更清单 > 5. `pkg/kube/health_test.go`」章节。
 
 #### 集成测试
 
@@ -2041,25 +2185,39 @@ gantt
 
 **动态间隔**
 
-| 检查结果 | 重试间隔 |
-|----------|----------|
-| 节点/关键组件失败 | 5 秒 |
-| 重要组件失败 | 15 秒 |
-| 非关键组件失败 | 30 秒 |
-| 全部成功 | 5 分钟 |
+| 检查结果 | 重试间隔 | 配置项 |
+|----------|----------|--------|
+| 节点/关键组件失败 | 5 秒 | `intervals.critical` |
+| 重要组件失败 | 15 秒 | `intervals.important` |
+| 非关键组件失败 | 30 秒 | `intervals.optional` |
+| 全部成功 | 5 分钟 | `intervals.normal` |
 
 **配置支持**
 - 配置文件：`/etc/bke/health-check-config.yaml`
 - 配置加载失败时使用默认配置
-- 支持自定义组件清单和检查间隔
+- 组件清单为扁平列表，每个组件通过 `priority` 字段直接定义优先级
+- `priority` 为必填字段，缺失时加载失败并回退到默认配置
 
 #### 3. 组件清单规格
 
-| 优先级 | 组件 | 命名空间 | 前缀 |
-|--------|------|----------|------|
-| 关键 | etcd, kube-apiserver, kube-controller-manager, kube-scheduler | kube-system | etcd-, kube-apiserver-, kube-controller-manager-, kube-scheduler- |
-| 重要 | calico-kube-controllers, calico-node, coredns, kube-proxy | kube-system | calico-kube-controllers, calico-node, coredns, kube-proxy- |
-| 非关键 | metrics-server, ingress-nginx, prometheus, alertmanager, node-exporter, console-service, oauth-server, local-harbor | 各命名空间 | 见配置文件 |
+| 组件名称 (name) | 优先级 (priority) | 命名空间 (namespace) | 前缀 (prefixes) |
+|----------------|-------------------|---------------------|-----------------|
+| etcd | critical | kube-system | etcd- |
+| kube-apiserver | critical | kube-system | kube-apiserver- |
+| kube-controller-manager | critical | kube-system | kube-controller-manager- |
+| kube-scheduler | critical | kube-system | kube-scheduler- |
+| calico-node | important | kube-system | calico-node |
+| calico-kube-controllers | important | kube-system | calico-kube-controllers |
+| kube-proxy | important | kube-system | kube-proxy- |
+| coredns | important | kube-system | coredns |
+| metrics-server | optional | kube-system | metrics-server- |
+| ingress-nginx | optional | ingress-nginx | ingress-nginx-controller |
+| console-service | optional | openfuyao-system | console-service- |
+| oauth-server | optional | openfuyao-system | oauth-server- |
+| local-harbor | optional | openfuyao-system | local-harbor- |
+| prometheus | optional | monitoring | prometheus-k8s- |
+| alertmanager | optional | monitoring | alertmanager-main- |
+| node-exporter | optional | monitoring | node-exporter- |
 
 ### 验收标准
 
