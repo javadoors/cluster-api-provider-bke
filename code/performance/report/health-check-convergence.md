@@ -1032,41 +1032,236 @@ type UnifiedHealthChecker struct {
 
 ```go
 // NewUnifiedHealthChecker 创建健康检查器
-func NewUnifiedHealthChecker(kubeClient kubernetes.Interface, log *log.Logger, config HealthCheckConfig) *UnifiedHealthChecker
+func NewUnifiedHealthChecker(kubeClient kubernetes.Interface, log *log.Logger, config HealthCheckConfig) *UnifiedHealthChecker {
+    return &UnifiedHealthChecker{
+        kubeClient: kubeClient,
+        log:        log,
+        cache:      NewHealthCheckCache(config.CacheTTL),
+        config:     config,
+    }
+}
 
 // DefaultHealthCheckConfig 返回默认配置
-func DefaultHealthCheckConfig() HealthCheckConfig
+func DefaultHealthCheckConfig() HealthCheckConfig {
+    return HealthCheckConfig{
+        CacheTTL:                   30 * time.Second,
+        CriticalComponentInterval:  5 * time.Second,
+        ImportantComponentInterval: 15 * time.Second,
+        OptionalComponentInterval:  30 * time.Second,
+        NormalInterval:             5 * time.Minute,
+        
+        CriticalComponents: []ComponentCheck{
+            {Namespace: "kube-system", Prefixes: []string{"etcd-", "kube-apiserver-", "kube-controller-manager-", "kube-scheduler-"}},
+        },
+        ImportantComponents: []ComponentCheck{
+            {Namespace: "kube-system", Prefixes: []string{"calico-kube-controllers", "calico-node", "coredns", "kube-proxy-"}},
+        },
+        OptionalComponents: []ComponentCheck{
+            {Namespace: "kube-system", Prefixes: []string{"metrics-server-"}},
+            {Namespace: "ingress-nginx", Prefixes: []string{"ingress-nginx-controller"}},
+            {Namespace: "monitoring", Prefixes: []string{"alertmanager-main-", "prometheus-k8s-", "node-exporter-"}},
+            {Namespace: "openfuyao-system", Prefixes: []string{"console-service-", "oauth-server-", "local-harbor-"}},
+        },
+    }
+}
 
 // LoadHealthCheckConfig 从配置文件加载配置
-func LoadHealthCheckConfig(configPath string) HealthCheckConfig
+func LoadHealthCheckConfig(configPath string) HealthCheckConfig {
+    data, err := os.ReadFile(configPath)
+    if err != nil {
+        log.Warnf("failed to load health check config from %s, using default: %v", configPath, err)
+        return DefaultHealthCheckConfig()
+    }
+    
+    var config HealthCheckConfig
+    if err := yaml.Unmarshal(data, &config); err != nil {
+        log.Warnf("failed to parse health check config, using default: %v", err)
+        return DefaultHealthCheckConfig()
+    }
+    
+    // 如果某些字段为空，使用默认值
+    defaultConfig := DefaultHealthCheckConfig()
+    if len(config.CriticalComponents) == 0 {
+        config.CriticalComponents = defaultConfig.CriticalComponents
+    }
+    if len(config.ImportantComponents) == 0 {
+        config.ImportantComponents = defaultConfig.ImportantComponents
+    }
+    if len(config.OptionalComponents) == 0 {
+        config.OptionalComponents = defaultConfig.OptionalComponents
+    }
+    
+    return config
+}
 
 // GetRequeueInterval 根据检查结果动态调整间隔
-func GetRequeueInterval(result *HealthCheckResult, config HealthCheckConfig) time.Duration
+func GetRequeueInterval(result *HealthCheckResult, config HealthCheckConfig) time.Duration {
+    // 节点错误或关键组件错误，快速重试
+    if len(result.NodeErrors) > 0 || len(result.CriticalComponentErrors) > 0 {
+        return config.CriticalComponentInterval
+    }
+    
+    // 重要组件错误，中速重试
+    if len(result.ImportantComponentErrors) > 0 {
+        return config.ImportantComponentInterval
+    }
+    
+    // 非关键组件错误，慢速重试
+    if len(result.OptionalComponentErrors) > 0 {
+        return config.OptionalComponentInterval
+    }
+    
+    // 正常，使用正常间隔
+    return config.NormalInterval
+}
 ```
 
 **位置**：在 `UnifiedHealthChecker` 结构体后
 
 ```go
 // Check 执行健康检查
-func (h *UnifiedHealthChecker) Check(cluster *bkev1beta1.BKECluster, currentVersion string, bkeNodes bkev1beta1.BKENodes) error
+func (h *UnifiedHealthChecker) Check(cluster *bkev1beta1.BKECluster, currentVersion string, bkeNodes bkev1beta1.BKENodes) error {
+    result := &HealthCheckResult{}
+    
+    // 阶段 1: 节点状态检查（并行）
+    if err := h.checkNodesParallel(cluster, currentVersion, bkeNodes, result); err != nil {
+        result.NodeErrors = append(result.NodeErrors, err)
+        return h.aggregateResult(result)
+    }
+    
+    // 阶段 2: 关键组件检查（并行）
+    if err := h.checkCriticalComponentsParallel(result); err != nil {
+        result.CriticalComponentErrors = append(result.CriticalComponentErrors, err)
+        return h.aggregateResult(result)
+    }
+    
+    // 阶段 3: 重要组件检查（并行）
+    if err := h.checkImportantComponentsParallel(result); err != nil {
+        h.log.Warn("important components check failed: %v", err)
+        result.ImportantComponentErrors = append(result.ImportantComponentErrors, err)
+    }
+    
+    // 阶段 4: 非关键组件检查（并行）
+    if err := h.checkOptionalComponentsParallel(result); err != nil {
+        h.log.Debug("optional components check failed: %v", err)
+        result.OptionalComponentErrors = append(result.OptionalComponentErrors, err)
+    }
+    
+    return h.aggregateResult(result)
+}
 
 // checkNodesParallel 并行检查节点
-func (h *UnifiedHealthChecker) checkNodesParallel(cluster *bkev1beta1.BKECluster, currentVersion string, bkeNodes bkev1beta1.BKENodes, result *HealthCheckResult) error
+func (h *UnifiedHealthChecker) checkNodesParallel(cluster *bkev1beta1.BKECluster, currentVersion string, bkeNodes bkev1beta1.BKENodes, result *HealthCheckResult) error {
+    // 从缓存获取节点列表
+    nodes, err := h.cache.GetNodes(h.kubeClient)
+    if err != nil {
+        return err
+    }
+    
+    // 并行检查所有节点
+    var wg sync.WaitGroup
+    errChan := make(chan error, len(nodes.Items))
+    
+    for _, node := range nodes.Items {
+        nodeIP := GetNodeIP(&node)
+        
+        // 跳过需要跳过的节点
+        if bkeNodes.GetNodeStateNeedSkip(nodeIP) {
+            continue
+        }
+        
+        wg.Add(1)
+        go func(n corev1.Node) {
+            defer wg.Done()
+            if err := h.checkNode(&n, currentVersion); err != nil {
+                errChan <- err
+            }
+        }(node)
+    }
+    
+    wg.Wait()
+    close(errChan)
+    
+    // 收集错误
+    for err := range errChan {
+        result.NodeErrors = append(result.NodeErrors, err)
+    }
+    
+    if len(result.NodeErrors) > 0 {
+        return kerrors.NewAggregate(result.NodeErrors)
+    }
+    
+    return nil
+}
 
 // checkCriticalComponentsParallel 并行检查关键组件
-func (h *UnifiedHealthChecker) checkCriticalComponentsParallel(result *HealthCheckResult) error
+func (h *UnifiedHealthChecker) checkCriticalComponentsParallel(result *HealthCheckResult) error {
+    return h.checkComponentsByPriority(h.config.CriticalComponents, result)
+}
 
 // checkImportantComponentsParallel 并行检查重要组件
-func (h *UnifiedHealthChecker) checkImportantComponentsParallel(result *HealthCheckResult) error
+func (h *UnifiedHealthChecker) checkImportantComponentsParallel(result *HealthCheckResult) error {
+    return h.checkComponentsByPriority(h.config.ImportantComponents, result)
+}
 
 // checkOptionalComponentsParallel 并行检查非关键组件
-func (h *UnifiedHealthChecker) checkOptionalComponentsParallel(result *HealthCheckResult) error
+func (h *UnifiedHealthChecker) checkOptionalComponentsParallel(result *HealthCheckResult) error {
+    return h.checkComponentsByPriority(h.config.OptionalComponents, result)
+}
 
 // checkComponentsByPriority 按优先级并行检查
-func (h *UnifiedHealthChecker) checkComponentsByPriority(components []ComponentCheck, result *HealthCheckResult) error
+func (h *UnifiedHealthChecker) checkComponentsByPriority(components []ComponentCheck, result *HealthCheckResult) error {
+    var wg sync.WaitGroup
+    errChan := make(chan error, len(components))
+    
+    for _, check := range components {
+        wg.Add(1)
+        go func(c ComponentCheck) {
+            defer wg.Done()
+            if err := h.checkComponent(c); err != nil {
+                errChan <- err
+            }
+        }(check)
+    }
+    
+    wg.Wait()
+    close(errChan)
+    
+    var errs []error
+    for err := range errChan {
+        errs = append(errs, err)
+    }
+    
+    if len(errs) > 0 {
+        return kerrors.NewAggregate(errs)
+    }
+    
+    return nil
+}
 
 // aggregateResult 聚合检查结果
-func (h *UnifiedHealthChecker) aggregateResult(result *HealthCheckResult) error
+func (h *UnifiedHealthChecker) aggregateResult(result *HealthCheckResult) error {
+    // 节点错误或关键组件错误，立即返回
+    if len(result.NodeErrors) > 0 || len(result.CriticalComponentErrors) > 0 {
+        var allErrors []error
+        allErrors = append(allErrors, result.NodeErrors...)
+        allErrors = append(allErrors, result.CriticalComponentErrors...)
+        return kerrors.NewAggregate(allErrors)
+    }
+    
+    // 重要组件错误，记录警告
+    if len(result.ImportantComponentErrors) > 0 {
+        h.log.Warn("important component errors: %v", result.ImportantComponentErrors)
+    }
+    
+    // 非关键组件错误，记录调试信息
+    if len(result.OptionalComponentErrors) > 0 {
+        h.log.Debug("optional component errors: %v", result.OptionalComponentErrors)
+    }
+    
+    h.log.Info("cluster health check pass")
+    return nil
+}
 ```
 
 ##### 1.3 修改现有函数
