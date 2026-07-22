@@ -5,6 +5,7 @@
 本提案旨在优化 BKE 集群创建过程中的健康检查收敛时间，将其从当前的 7 分 14 秒降低到 3 分钟以内，提升约 57%。
 
 当前健康检查存在以下问题：
+
 1. **串行检查**：所有节点和组件串行检查，耗时长
 2. **无优先级**：关键组件和非关键组件同等对待
 3. **固定间隔**：RequeueAfter 固定为 10 秒，无法根据失败原因动态调整
@@ -12,6 +13,7 @@
 5. **Master NotReady**：Calico 部署后 Master 节点反复 NotReady，导致健康检查失败
 
 解决方案包括：
+
 1. **渐进式检查**：按优先级分阶段检查，关键组件失败立即返回
 2. **并行化检查**：每个阶段内使用并行检查
 3. **缓存机制**：使用缓存减少 API 调用
@@ -27,6 +29,7 @@
 ### 解决什么问题？
 
 **当前性能数据（64 节点集群）：**
+
 - 健康检查收敛时间：7 分 14 秒
 - ClusterUnhealthy 次数：33 次
 - Master NotReady 次数：3 次（m1, m2, m3 各 1 次）
@@ -52,16 +55,17 @@
    - 无缓存机制，API 调用频繁
 
 **影响：**
+
 - 用户体验：集群创建最后 7 分钟无进展
 - 稳定性风险：Master NotReady 可能导致控制面不可用
 - 资源浪费：频繁 API 调用增加 API Server 负载
 
 ### 可衡量目标
 
-1. 健康检查收敛时间从 7 分 14 秒降低到 3 分钟以内（提升 57%）
-2. Master NotReady 次数从 3 次降低到 0 次
-3. API 调用次数从约 100 次降低到约 30 次（降低 70%）
-4. 关键组件失败检测时间从约 7 分钟降低到约 1 秒
+1. 健康检查收敛时间显著缩短，目标提升 50% 以上
+2. Master NotReady 次数大幅减少
+3. API 调用次数显著降低，目标降低 60% 以上
+4. 关键组件失败检测时间大幅缩短
 
 ### 非目标
 
@@ -130,7 +134,7 @@
 **核心设计原则：**
 
 | 原则 | 说明 | 对应优化点 |
-|------|------|-----------|
+| ------ | ------ | ----------- |
 | **渐进式** | 按优先级分阶段检查，关键组件失败立即返回 | 渐进式检查 + 优先级检查 |
 | **并行化** | 每个阶段内使用并行检查 | 并行检查 |
 | **缓存化** | 使用缓存减少 API 调用 | 缓存机制 |
@@ -246,6 +250,9 @@ type ComponentInfo struct {
 }
 
 func (c ComponentInfo) String() string {
+    if c.Namespace == "" {
+        return string(c.Name)
+    }
     if c.PodName != "" {
         return fmt.Sprintf("%s/%s", c.Namespace, c.PodName)
     }
@@ -335,10 +342,8 @@ func newComponentError(check ComponentCheck, podName, reason string, err error) 
 func newNodeError(nodeName, reason string, err error) *HealthCheckError {
     return &HealthCheckError{
         Component: ComponentInfo{
-            Name:      "node",
-            Namespace: "node",
-            PodName:   nodeName,
-            Priority:  PriorityCritical,
+            Name:     ComponentName(nodeName),
+            Priority: PriorityCritical,
         },
         Reason: reason,
         Err:    err,
@@ -660,7 +665,7 @@ func GetRequeueInterval(result *HealthCheckResult, intervals IntervalConfig) tim
 
 ##### 2.4 信息流
 
-```
+```txt
 配置文件 (priority: critical)
     ↓
 ComponentCheck.Priority       ← HealthCheckPriority（来自配置）
@@ -682,7 +687,7 @@ GetRequeueInterval() → 动态间隔
 
 **架构设计**：
 
-```
+```txt
 ┌─────────────────────────────────────────────────────────┐
 │  Informer 层（client-go 提供）                           │
 │  ├─ NodeInformer                                        │
@@ -778,7 +783,7 @@ func (h *HealthChecker) GetPod(namespace, name string) (*corev1.Pod, error) {
 **预期效果**：
 
 | 指标 | 固定 TTL | Informer | 提升 |
-|------|---------|----------|------|
+| ------ | --------- | ---------- | ------ |
 | 实时性 | 最多延迟 30s | **毫秒级** | 100x |
 | API 调用 | 每次全量返回 | **首次同步后零调用** | 减少 99% |
 | 健康检查时间 | ~7 分钟 | **< 1 分钟** | 节省 6+ 分钟 |
@@ -937,7 +942,7 @@ func (c *HealthCheckCache) refreshPods(client *Client, namespace string, option 
 **预期效果**：
 
 | 指标 | 固定 TTL | RV + TTL | 提升 |
-|------|---------|----------|------|
+| ------ | --------- | ---------- | ------ |
 | 实时性 | 最多延迟 30s | **秒级** | 10x |
 | API 调用 | 每次全量返回 | **70% 返回 304** | 减少 70% 数据量 |
 | 健康检查时间 | ~7 分钟 | **~3 分钟** | 节省 4 分钟 |
@@ -948,12 +953,13 @@ func (c *HealthCheckCache) refreshPods(client *Client, namespace string, option 
 ##### 方案对比与选型建议
 
 | 方案 | 实时性 | API 负载 | 开发成本 | 维护成本 | 推荐度 |
-|------|--------|---------|---------|---------|--------|
+| ------ | -------- | --------- | --------- | --------- | -------- |
 | **Informer** | 毫秒级 | 最低 | 1-2 天 | 低 | ⭐⭐⭐⭐⭐ |
 | **RV + TTL** | 秒级 | 低 | 1 天 | 中 | ⭐⭐⭐⭐ |
 | **固定 TTL** | 差 | 高 | 0.5 天 | 低 | ⭐⭐ |
 
 **选型建议**：
+
 - **优先选择 Informer**：在 KPI 压力（< 16 分钟）下，实时性优势明显
 - **备选 RV + TTL**：如果 Informer 实施困难，或需要更轻量级方案
 - **不推荐固定 TTL**：实时性差，API 负载高
@@ -1053,7 +1059,7 @@ components:
 **配置说明：**
 
 | 配置项 | 说明 | 默认值 |
-|--------|------|--------|
+| -------- | ------ | -------- |
 | `intervals.critical` | 关键组件失败后的重试间隔 | 5s |
 | `intervals.important` | 重要组件失败后的重试间隔 | 15s |
 | `intervals.optional` | 非关键组件失败后的重试间隔 | 30s |
@@ -1105,7 +1111,7 @@ graph TB
 **组件职责说明：**
 
 | 组件 | 职责 | 文件位置 |
-|------|------|---------|
+| ------ | ------ | --------- |
 | 配置管理 | 加载健康检查配置，解析 `priority` 字段，支持配置文件和默认值 | `pkg/kube/health.go` |
 | 统一健康检查器 | 协调健康检查流程，聚合检查结果 | `pkg/kube/health.go` |
 | 渐进式检查引擎 | `groupByPriority` 按配置中的 `priority` 分组，分阶段执行检查 | `pkg/kube/health.go` |
@@ -1150,7 +1156,7 @@ sequenceDiagram
 **性能对比：**
 
 | 指标 | 优化前 | 优化后 | 提升 |
-|------|--------|--------|------|
+| ------ | -------- | -------- | ------ |
 | 健康检查时间 | 7分14秒 | < 1分钟 | 86% |
 | API 调用次数 | ~100次 | < 10次（首次同步后） | 90% |
 | Master NotReady 次数 | 3次 | 0次 | 100% |
@@ -1288,7 +1294,7 @@ graph TB
 **监控点说明：**
 
 | 监控指标 | 采集方式 | 告警阈值 | 说明 |
-|---------|---------|---------|------|
+| --------- | --------- | --------- | ------ |
 | 健康检查时间 | Prometheus | > 3分钟 | 优化后的预期时间 |
 | API 调用次数 | Prometheus | > 50次/次检查 | 应该大幅减少 |
 | Master NotReady 次数 | 日志 | > 0 | 应该完全消除 |
@@ -1311,6 +1317,7 @@ graph TB
 **位置**：在文件开头（第 30 行后）
 
 **新增内容**：
+
 - `HealthCheckPriority`：优先级枚举（来自配置）
 - `ComponentName`：组件名称常量
 - `ComponentCheck`：组件检查配置（含 `Name`、`Priority`）
@@ -1325,6 +1332,7 @@ graph TB
 **位置**：在 `CheckClusterHealth` 函数前
 
 **新增内容**：完整代码见「优化 2」章节，包含：
+
 - `NewUnifiedHealthChecker`：创建健康检查器
 - `DefaultHealthCheckConfig`：返回默认配置（含所有组件的 `Name` 和 `Priority`）
 - `LoadHealthCheckConfig`：从配置文件加载配置
@@ -1342,6 +1350,7 @@ graph TB
 **位置**：第 31-71 行
 
 **重构点**：
+
 - 将现有的 `CheckClusterHealth` 函数改为使用 `UnifiedHealthChecker`
 - 保留函数签名不变，内部实现改为调用统一检查器
 
@@ -1466,6 +1475,7 @@ func (c *HealthCheckCache) refreshPods(client *Client, namespace string, option 
 **位置**：在 `EnsureCluster` 结构体中（第 59-62 行）
 
 **当前代码**：
+
 ```go
 type EnsureCluster struct {
     phaseframe.BasePhase
@@ -1474,6 +1484,7 @@ type EnsureCluster struct {
 ```
 
 **修改后**：
+
 ```go
 type EnsureCluster struct {
     phaseframe.BasePhase
@@ -1507,6 +1518,7 @@ func (e *EnsureCluster) getRequeueInterval(err error) time.Duration {
 **位置**：第 130-132 行
 
 **当前代码**：
+
 ```go
 if err = e.ensureClusterReady(); err != nil {
     errs = append(errs, err)
@@ -1515,6 +1527,7 @@ if err = e.ensureClusterReady(); err != nil {
 ```
 
 **修改后**：
+
 ```go
 if err = e.ensureClusterReady(); err != nil {
     errs = append(errs, err)
@@ -1527,11 +1540,13 @@ if err = e.ensureClusterReady(); err != nil {
 **位置**：第 136 行
 
 **当前代码**：
+
 ```go
 return ctrl.Result{RequeueAfter: periodicCheckInterval}, kerrors.NewAggregate(errs)
 ```
 
 **修改后**：
+
 ```go
 // 正常状态下，使用动态间隔（默认为 5 分钟）
 requeueInterval := e.getRequeueInterval(nil)
@@ -1539,6 +1554,7 @@ return ctrl.Result{RequeueAfter: requeueInterval}, kerrors.NewAggregate(errs)
 ```
 
 **说明**：
+
 - 第 127 行（后置处理未完成场景）保持不变，继续使用 `quickRequeueInterval`
 - 第 130-132 行（健康检查失败场景）使用动态间隔
 - 第 136 行（正常状态场景）使用动态间隔
@@ -1854,7 +1870,7 @@ func TestHealthCheckPerformance(t *testing.T) {
 #### 变更统计
 
 | 文件 | 变更类型 | 新增行数（预估） | 修改行数（预估） |
-|------|---------|----------------|----------------|
+| ------ | --------- | ---------------- | ---------------- |
 | `pkg/kube/health.go` | 修改 | 300 | 50 |
 | `pkg/kube/health_cache.go` | 新增 | 150 | 0 |
 | `pkg/phaseframe/phases/ensure_cluster.go` | 修改 | 15 | 20 |
@@ -1882,7 +1898,7 @@ func TestHealthCheckPerformance(t *testing.T) {
 #### 风险评估
 
 | 风险 | 概率 | 影响 | 缓解措施 |
-|------|------|------|---------|
+| ------ | ------ | ------ | --------- |
 | Informer 同步延迟 | 低 | 中 | 提供 RV+TTL 备选方案 |
 | 缓存一致性问题 | 低 | 中 | Informer 自动处理 |
 | 配置文件格式错误 | 中 | 低 | 加载失败时使用默认配置 |
@@ -1897,7 +1913,7 @@ func TestHealthCheckPerformance(t *testing.T) {
 **测试用例清单**：
 
 | 测试用例 | 验证内容 |
-|---------|---------|
+| --------- | --------- |
 | `TestUnifiedHealthCheck` | 64 节点集群健康检查 < 3 分钟 |
 | `TestCriticalComponentFastFail` | 关键组件失败 < 1 秒返回 |
 | `TestHealthCheckErrorPriority` | `HealthCheckError` 优先级判断：单个错误、聚合错误、普通错误 |
@@ -1963,18 +1979,21 @@ kubectl logs -n bke-system deployment/bke-controller-manager | grep "health chec
 ### 毕业标准
 
 #### Alpha (v0.1)
+
 - [ ] 实现统一健康检查器
 - [ ] 实现 Informer 缓存机制
 - [ ] 实现动态间隔
 - [ ] 单元测试通过
 
 #### Beta (v0.2)
+
 - [ ] 集成测试通过
 - [ ] 健康检查收敛时间 < 2 分钟
 - [ ] API 调用次数 < 10 次（首次同步后）
 - [ ] 配置文件支持
 
 #### Stable (v1.0)
+
 - [ ] 端到端测试通过
 - [ ] 健康检查收敛时间 < 1 分钟
 - [ ] Master NotReady 次数 = 0
@@ -1983,11 +2002,13 @@ kubectl logs -n bke-system deployment/bke-controller-manager | grep "health chec
 ### 升级/降级策略
 
 **升级策略：**
+
 - 配置文件 `/etc/bke/health-check-config.yaml` 可选，不存在时使用默认配置
 - 新代码完全兼容旧的健康检查逻辑
 - 可以渐进式部署，先部署到部分节点验证
 
 **降级策略：**
+
 - 删除配置文件即可回退到默认配置
 - 代码回退简单，只需恢复原有的 `CheckClusterHealth()` 实现
 
@@ -1996,7 +2017,7 @@ kubectl logs -n bke-system deployment/bke-controller-manager | grep "health chec
 ### 1. 开发工作量
 
 | 模块 | 任务 | 预估人天 | 说明 |
-|------|------|---------|------|
+| ------ | ------ | --------- | ------ |
 | **统一健康检查器** | 实现渐进式检查架构 | 1.5 | 4阶段检查逻辑，代码量约200行 |
 | **缓存层** | 实现 Informer 缓存 | 1.5 | 使用 client-go SharedInformerFactory |
 | **缓存层** | 实现 RV+TTL 备选方案 | 0.5 | ResourceVersion 条件查询 |
@@ -2007,7 +2028,7 @@ kubectl logs -n bke-system deployment/bke-controller-manager | grep "health chec
 ### 2. 测试工作量
 
 | 测试类型 | 任务 | 预估人天 | 说明 |
-|---------|------|---------|------|
+| --------- | ------ | --------- | ------ |
 | **单元测试** | 健康检查器测试 | 1 | 覆盖所有检查阶段 |
 | **单元测试** | 缓存层测试 | 1 | 验证 Informer 和 RV+TTL |
 | **集成测试** | 性能测试 | 1.5 | 验证健康检查时间 < 3分钟 |
@@ -2017,7 +2038,7 @@ kubectl logs -n bke-system deployment/bke-controller-manager | grep "health chec
 ### 3. 文档工作量
 
 | 任务 | 预估人天 | 说明 |
-|------|---------|------|
+| ------ | --------- | ------ |
 | 配置说明更新 | 0.3 | 添加配置文件说明 |
 | 发布说明 | 0.2 | 版本更新日志 |
 | **小计** | **0.5** | |
@@ -2032,13 +2053,14 @@ pie title 工作量分布
 ```
 
 | 类别 | 人天 | 占比 |
-|------|------|------|
+| ------ | ------ | ------ |
 | 开发 | 4.5 | 43% |
 | 测试 | 5.5 | 52% |
 | 文档 | 0.5 | 5% |
 | **总计** | **10.5** | **100%** |
 
 **人力资源配置：**
+
 - **方案**：1 名开发人员，约 2.1 周（10.5 人天 ÷ 5 天/周）
 
 ### 5. 里程碑计划
@@ -2056,7 +2078,7 @@ gantt
 ```
 
 | 里程碑 | 时间 | 交付物 | 验收标准 |
-|--------|------|--------|---------|
+| -------- | ------ | -------- | --------- |
 | **M1: 核心实现** | Day 1-4 | 健康检查器 + 缓存层 + 配置管理 | 单元测试通过 |
 | **M2: 测试验证** | Day 5-9 | 集成测试 + 端到端测试 | 健康检查 < 3分钟 |
 | **M3: 发布准备** | Day 10-11 | 文档更新 + 代码审查 | 文档完整，审查通过 |
@@ -2064,13 +2086,14 @@ gantt
 ### 6. 风险评估与缓冲
 
 | 风险 | 概率 | 影响 | 缓解措施 | 预留缓冲 |
-|------|------|------|---------|---------|
+| ------ | ------ | ------ | --------- | --------- |
 | Informer 同步延迟 | 低 | 中 | 使用 RV+TTL 备选方案 | +1 天 |
 | 缓存一致性问题 | 低 | 中 | Informer 自动处理 | +0.5 天 |
 | 性能未达预期 | 中 | 中 | 参数调优 | +1 天 |
 | **总缓冲** | | | | **+2.5 天** |
 
 **调整后的总工作量：**
+
 - 基础工作量：10.5 人天
 - 风险缓冲：2.5 人天
 - **最终工作量：13 人天（约 2.6 周，1 名开发人员）**
@@ -2078,7 +2101,7 @@ gantt
 ### 7. 成本效益分析
 
 | 指标 | 数值 | 说明 |
-|------|------|------|
+| ------ | ------ | ------ |
 | **投入成本** | 13 人天 | 开发 + 测试 + 文档 + 缓冲 |
 | **性能提升** | 节省 4+ 分钟/集群 | 健康检查从 7m14s → < 3分钟 |
 | **年化收益** | 节省 960+ 分钟 | 假设每天创建 2 个集群 |
@@ -2113,10 +2136,12 @@ gantt
 **方案**：只修复 Calico 部署导致的 Master NotReady 问题，不改变健康检查机制
 
 **优点：**
+
 - 改动小，风险低
 - 直接解决根本问题
 
 **缺点：**
+
 - 不解决健康检查机制本身的问题
 - 无法优化 API 调用次数
 - 无法动态调整检查间隔
@@ -2128,10 +2153,12 @@ gantt
 **方案**：只优化健康检查机制（并行化、缓存、动态间隔），不修复 Master NotReady
 
 **优点：**
+
 - 减少 API 调用次数
 - 提高检查效率
 
 **缺点：**
+
 - Master NotReady 仍然存在
 - 健康检查仍然会失败
 
@@ -2142,10 +2169,12 @@ gantt
 **方案**：使用 Kubernetes 原生的 Readiness Probe 和 Liveness Probe，不实现自定义健康检查
 
 **优点：**
+
 - 使用 Kubernetes 原生机制
 - 减少自定义代码
 
 **缺点：**
+
 - 无法实现渐进式检查
 - 无法动态调整检查间隔
 - 无法缓存检查结果
@@ -2165,7 +2194,7 @@ gantt
 #### 1. 性能规格
 
 | 指标 | 当前值 | 目标值 | 验收标准 |
-|------|--------|--------|----------|
+| ------ | -------- | -------- | ---------- |
 | 健康检查收敛时间 | 7 分 14 秒 | ≤ 3 分钟 | 64 节点集群端到端测试 |
 | API 调用次数 | ~100 次/检查 | ≤ 10 次/检查 | Informer 首次同步后 |
 | Master NotReady 次数 | 3 次 | 0 次 | 完整集群创建周期无 NotReady 事件 |
@@ -2173,26 +2202,29 @@ gantt
 
 #### 2. 功能规格
 
-**统一健康检查器**
+##### 统一健康检查器
+
 - 支持 4 阶段渐进式检查：节点 → 关键组件 → 重要组件 → 非关键组件
 - 每个阶段内并行检查
 - 关键组件失败立即返回，重要/非关键组件失败记录警告继续
 
-**缓存机制**
+##### 缓存机制
+
 - 优先方案：Informer 实时缓存（毫秒级）
 - 备选方案：ResourceVersion + TTL 混合缓存（秒级）
 - 首次同步后零 API 调用（Informer）或 70% 条件查询命中（RV+TTL）
 
-**动态间隔**
+##### 动态间隔
 
 | 检查结果 | 重试间隔 | 配置项 |
-|----------|----------|--------|
+| ---------- | ---------- | -------- |
 | 节点/关键组件失败 | 5 秒 | `intervals.critical` |
 | 重要组件失败 | 15 秒 | `intervals.important` |
 | 非关键组件失败 | 30 秒 | `intervals.optional` |
 | 全部成功 | 5 分钟 | `intervals.normal` |
 
-**配置支持**
+##### 配置支持
+
 - 配置文件：`/etc/bke/health-check-config.yaml`
 - 配置加载失败时使用默认配置
 - 组件清单为扁平列表，每个组件通过 `priority` 字段直接定义优先级
@@ -2201,7 +2233,7 @@ gantt
 #### 3. 组件清单规格
 
 | 组件名称 (name) | 优先级 (priority) | 命名空间 (namespace) | 前缀 (prefixes) |
-|----------------|-------------------|---------------------|-----------------|
+| ---------------- | ------------------- | --------------------- | ----------------- |
 | etcd | critical | kube-system | etcd- |
 | kube-apiserver | critical | kube-system | kube-apiserver- |
 | kube-controller-manager | critical | kube-system | kube-controller-manager- |
@@ -2224,7 +2256,7 @@ gantt
 #### Alpha 阶段 (v0.1)
 
 | 验收项 | 验收标准 | 验证方法 |
-|--------|----------|----------|
+| -------- | ---------- | ---------- |
 | 统一健康检查器实现 | 4 阶段检查逻辑完整 | 单元测试通过 |
 | Informer 缓存实现 | 首次同步后零 API 调用 | 集成测试验证 |
 | 动态间隔实现 | 4 种间隔正确切换 | 单元测试覆盖 |
@@ -2233,7 +2265,7 @@ gantt
 #### Beta 阶段 (v0.2)
 
 | 验收项 | 验收标准 | 验证方法 |
-|--------|----------|----------|
+| -------- | ---------- | ---------- |
 | 集成测试通过 | 所有测试用例通过 | `go test ./...` |
 | 健康检查时间 | < 2 分钟 | 64 节点集群测试 |
 | API 调用次数 | < 10 次 | 监控指标验证 |
@@ -2242,7 +2274,7 @@ gantt
 #### Stable 阶段 (v1.0)
 
 | 验收项 | 验收标准 | 验证方法 |
-|--------|----------|----------|
+| -------- | ---------- | ---------- |
 | 端到端测试通过 | 64 节点集群创建成功 | E2E 测试 |
 | 健康检查时间 | < 1 分钟 | 生产环境监控 |
 | Master NotReady 次数 | 0 次 | 日志分析 |
@@ -2250,7 +2282,7 @@ gantt
 
 ### 测试用例规格
 
-#### 单元测试
+#### 单元测试用例
 
 ```go
 // 1. 统一健康检查器测试
@@ -2264,7 +2296,7 @@ TestRVTTLCache: 验证条件查询命中率 > 70%
 TestCacheConsistency: 验证缓存数据与 API Server 一致
 ```
 
-#### 集成测试
+#### 集成测试用例
 
 ```go
 // 性能测试
@@ -2276,7 +2308,7 @@ TestCriticalComponentDown: 模拟 etcd 宕机，验证快速失败
 TestCacheSyncDelay: 模拟 Informer 同步延迟，验证降级逻辑
 ```
 
-#### 端到端测试
+#### 端到端测试用例
 
 ```bash
 # 1. 集群创建性能测试
@@ -2295,7 +2327,7 @@ kubectl logs -n bke-system deployment/bke-controller-manager | grep "health chec
 ### 监控告警规格
 
 | 指标 | 采集方式 | 告警阈值 | 说明 |
-|------|----------|----------|------|
+| ------ | ---------- | ---------- | ------ |
 | 健康检查时间 | Prometheus | > 3 分钟 | 超过目标值 |
 | API 调用次数 | Prometheus | > 50 次/检查 | 缓存失效 |
 | Master NotReady 次数 | 日志 | > 0 | 应完全消除 |
@@ -2305,7 +2337,7 @@ kubectl logs -n bke-system deployment/bke-controller-manager | grep "health chec
 ### 交付物清单
 
 | 交付物 | 路径 | 验收标准 |
-|--------|------|----------|
+| -------- | ------ | ---------- |
 | 统一健康检查器 | `pkg/kube/health.go` | 单元测试通过 |
 | 缓存层 | `pkg/kube/health_cache.go` | 集成测试通过 |
 | 配置文件 | `/etc/bke/health-check-config.yaml` | 加载测试通过 |
