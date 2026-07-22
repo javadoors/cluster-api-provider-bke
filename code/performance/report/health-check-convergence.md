@@ -1901,9 +1901,8 @@ pie title 工作量分布
 ```mermaid
 gantt
     title 项目实施计划
-    dateFormat  YYYY-MM-DD
     section 开发
-    核心实现             :a1, 2026-07-16, 4d
+    核心实现             :a1, 4d
     section 测试
     测试验证             :b1, after a1, 5d
     section 发布
