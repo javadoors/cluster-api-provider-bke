@@ -948,7 +948,7 @@ graph TB
 | 组件检查器 | 检查所有组件（统一入口），返回带 `ComponentInfo` 的 `HealthCheckError` | `pkg/kube/health.go` |
 | 错误判断 | `isCriticalError` / `isImportantError` 从 `HealthCheckError` 中提取优先级 | `pkg/kube/health.go` |
 | 缓存层 | 缓存 Node 和 Pod 状态，减少 API 调用 | `pkg/kube/health_cache.go` |
-| Informer | 实现缓存机制（推荐方案） | `pkg/kube/health_cache.go` |
+| Informer | 实现缓存机制 | `pkg/kube/health_cache.go` |
 
 ### 2. 优化前后对比时序图
 
@@ -1064,17 +1064,9 @@ graph TD
     L -->|否| N[等待同步]
     N --> M
     
-    K --> O{RV+TTL?}
-    O -->|TTL内| P[条件查询]
-    O -->|TTL过期| Q[全量刷新]
-    P --> R{RV变化?}
-    R -->|否| S[使用缓存]
-    R -->|是| T[更新缓存]
+    K --> L
     
     M --> U[节点/Pod数据]
-    S --> U
-    T --> U
-    Q --> U
     
     U --> V[checkComponent<br/>返回HealthCheckError<br/>含ComponentInfo.Priority]
     V --> W[aggregateResult]
