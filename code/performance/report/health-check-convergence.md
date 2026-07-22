@@ -789,8 +789,6 @@ func (h *HealthChecker) GetPod(namespace, name string) (*corev1.Pod, error) {
 | 健康检查时间 | ~7 分钟 | **显著缩短** | 大幅节省 |
 | 开发成本 | 0.5 天 | **1-2 天** | +1 天 |
 
----
-
 ##### 选型建议
 
 **优先选择 Informer**：实时性优势明显，API 负载最低
@@ -922,7 +920,7 @@ graph TB
         C --> E[组件检查器<br/>checkComponent → HealthCheckError]
         B --> F[错误判断<br/>isCriticalError / isImportantError]
         B --> G[缓存层<br/>health_cache.go]
-        G --> H[Informer/RV+TTL]
+        G --> H[Informer]
     end
     
     subgraph "Kubernetes API Server"
@@ -950,7 +948,7 @@ graph TB
 | 组件检查器 | 检查所有组件（统一入口），返回带 `ComponentInfo` 的 `HealthCheckError` | `pkg/kube/health.go` |
 | 错误判断 | `isCriticalError` / `isImportantError` 从 `HealthCheckError` 中提取优先级 | `pkg/kube/health.go` |
 | 缓存层 | 缓存 Node 和 Pod 状态，减少 API 调用 | `pkg/kube/health_cache.go` |
-| Informer/RV+TTL | 实现缓存机制（推荐方案/备选方案） | `pkg/kube/health_cache.go` |
+| Informer | 实现缓存机制（推荐方案） | `pkg/kube/health_cache.go` |
 
 ### 2. 优化前后对比时序图
 
@@ -992,7 +990,7 @@ sequenceDiagram
 | API 调用次数 | ~100次 | < 10次（首次同步后） | 90% |
 | Master NotReady 次数 | 3次 | 0次 | 100% |
 | 检查方式 | 串行 | 并行 + 渐进式 | - |
-| 缓存机制 | 无 | Informer/RV+TTL | - |
+| 缓存机制 | 无 | Informer | - |
 
 ### 3. 组件交互图
 
@@ -1024,7 +1022,7 @@ graph LR
     subgraph "缓存层"
         H --> M[GetNodes]
         J --> N[GetPods]
-        M --> O{Informer/RV+TTL}
+        M --> O{Informer}
         N --> O
     end
     
@@ -1265,38 +1263,6 @@ func (h *HealthChecker) GetNode(name string) (*corev1.Node, error) {
 func (h *HealthChecker) GetPod(namespace, name string) (*corev1.Pod, error) {
     return h.podLister.Pods(namespace).Get(name)
 }
-```
-
-##### 2.2 RV+TTL 方案（备选）
-
-**位置**：同一文件，在 Informer 方案后
-
-```go
-// HealthCheckCache 使用 ResourceVersion 的缓存
-type HealthCheckCache struct {
-    nodes       *corev1.NodeList
-    pods        map[string][]corev1.Pod
-    nodeVersion string
-    podVersions map[string]string
-    lastSync    time.Time
-    ttl         time.Duration
-    mu          sync.RWMutex
-}
-
-// NewHealthCheckCache 创建缓存
-func NewHealthCheckCache(ttl time.Duration) *HealthCheckCache
-
-// GetNodes 从缓存获取节点列表
-func (c *HealthCheckCache) GetNodes(client *Client) (*corev1.NodeList, error)
-
-// refreshNodes 刷新节点缓存
-func (c *HealthCheckCache) refreshNodes(client *Client, option *metav1.ListOptions) (*corev1.NodeList, error)
-
-// GetPods 从缓存获取 Pod 列表
-func (c *HealthCheckCache) GetPods(client *Client, namespace string) ([]corev1.Pod, error)
-
-// refreshPods 刷新 Pod 缓存
-func (c *HealthCheckCache) refreshPods(client *Client, namespace string, option *metav1.ListOptions) ([]corev1.Pod, error)
 ```
 
 #### 3. `pkg/phaseframe/phases/ensure_cluster.go` - 修改
@@ -1728,14 +1694,6 @@ func TestHealthCheckPerformance(t *testing.T) {
    - 创建 `pkg/kube/health_test.go`（单元测试）
    - 创建 `test/integration/health_check_test.go`（集成测试）
 
-#### 风险评估
-
-| 风险 | 概率 | 影响 | 缓解措施 |
-| ------ | ------ | ------ | --------- |
-| Informer 同步延迟 | 低 | 中 | 提供 RV+TTL 备选方案 |
-| 缓存一致性问题 | 低 | 中 | Informer 自动处理 |
-| 配置文件格式错误 | 中 | 低 | 加载失败时使用默认配置 |
-| 性能未达预期 | 中 | 中 | 参数调优 |
 
 ### 测试计划
 
@@ -1853,7 +1811,6 @@ kubectl logs -n bke-system deployment/bke-controller-manager | grep "health chec
 | ------ | ------ | --------- | ------ |
 | **统一健康检查器** | 实现渐进式检查架构 | 1.5 | 4阶段检查逻辑，代码量约200行 |
 | **缓存层** | 实现 Informer 缓存 | 1.5 | 使用 client-go SharedInformerFactory |
-| **缓存层** | 实现 RV+TTL 备选方案 | 0.5 | ResourceVersion 条件查询 |
 | **配置管理** | 实现配置文件加载 | 0.5 | YAML 解析，默认值处理 |
 | **动态间隔** | 实现间隔调整逻辑 | 0.5 | 根据检查结果动态调整 |
 | **小计** | | **4.5** | |
@@ -1863,7 +1820,7 @@ kubectl logs -n bke-system deployment/bke-controller-manager | grep "health chec
 | 测试类型 | 任务 | 预估人天 | 说明 |
 | --------- | ------ | --------- | ------ |
 | **单元测试** | 健康检查器测试 | 1 | 覆盖所有检查阶段 |
-| **单元测试** | 缓存层测试 | 1 | 验证 Informer 和 RV+TTL |
+| **单元测试** | 缓存层测试 | 1 | 验证 Informer |
 | **集成测试** | 性能测试 | 1.5 | 验证健康检查时间显著缩短 |
 | **端到端测试** | 64 节点集群测试 | 2 | 实际部署验证 |
 | **小计** | | **5.5** | |
@@ -1919,10 +1876,9 @@ gantt
 
 | 风险 | 概率 | 影响 | 缓解措施 | 预留缓冲 |
 | ------ | ------ | ------ | --------- | --------- |
-| Informer 同步延迟 | 低 | 中 | 使用 RV+TTL 备选方案 | +1 天 |
 | 缓存一致性问题 | 低 | 中 | Informer 自动处理 | +0.5 天 |
 | 性能未达预期 | 中 | 中 | 参数调优 | +1 天 |
-| **总缓冲** | | | | **+2.5 天** |
+| **总缓冲** | | | | **+1.5 天** |
 
 **调整后的总工作量：**
 
@@ -2043,8 +1999,7 @@ gantt
 ##### 缓存机制
 
 - 优先方案：Informer 实时缓存（毫秒级）
-- 备选方案：ResourceVersion + TTL 混合缓存（秒级）
-- 首次同步后零 API 调用（Informer）或 70% 条件查询命中（RV+TTL）
+- 首次同步后零 API 调用（Informer）
 
 ##### 动态间隔
 
@@ -2124,7 +2079,6 @@ TestDynamicRequeueInterval: 验证 4 种间隔正确切换
 
 // 2. 缓存层测试
 TestInformerCache: 验证首次同步后零 API 调用
-TestRVTTLCache: 验证条件查询命中率 > 70%
 TestCacheConsistency: 验证缓存数据与 API Server 一致
 ```
 
