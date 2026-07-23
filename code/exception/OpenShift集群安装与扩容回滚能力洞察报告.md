@@ -336,7 +336,245 @@ func (cvo *ClusterVersionOperator) GetRollbackTarget(cv *configv1.ClusterVersion
    }
    ```
 
-### 4.4 完整回滚流程
+### 4.4 回滚时 ClusterVersion 的目标版本
+
+**核心问题**：回滚时 ClusterVersion 的 `spec.desiredUpdate.version` 是什么？
+
+#### 4.4.1 目标版本确定规则
+
+**回滚目标版本 = 上一个成功升级的版本**
+
+```
+升级前状态：
+  spec.desiredUpdate.version: 4.11.18  (当前运行版本)
+  status.history[0].version: 4.11.18
+  status.history[0].state: Completed
+
+升级到 4.12.0：
+  spec.desiredUpdate.version: 4.12.0   (目标版本)
+  status.history[0].version: 4.12.0
+  status.history[0].state: Partial     (升级中)
+  status.history[1].version: 4.11.18
+  status.history[1].state: Completed
+
+升级失败触发回滚：
+  spec.desiredUpdate.version: 4.11.18  (回滚目标 = 上一个成功版本)
+  status.history[0].version: 4.12.0
+  status.history[0].state: RolledBack  (标记为已回滚)
+  status.history[1].version: 4.11.18
+  status.history[1].state: Completed   (回滚到此版本)
+```
+
+#### 4.4.2 目标版本设置时机
+
+**自动回滚时**：
+
+```go
+// CVO 检测到升级失败后自动设置回滚目标
+func (cvo *ClusterVersionOperator) handleUpgradeFailure(cv *configv1.ClusterVersion) error {
+    // 1. 获取回滚目标版本
+    rollbackVersion, err := cvo.GetRollbackTarget(cv)
+    if err != nil {
+        return err
+    }
+    
+    // 2. 设置回滚目标
+    cv.Spec.DesiredUpdate = &configv1.Update{
+        Version: rollbackVersion,
+        Image:   cvo.getReleaseImage(rollbackVersion),
+        Force:   false,
+    }
+    
+    // 3. 更新 ClusterVersion 对象
+    return cvo.client.Update(context.TODO(), cv)
+}
+```
+
+**手动回滚时**：
+
+```bash
+# 用户手动设置回滚目标
+oc adm upgrade --to=4.11.18 --allow-not-recommended
+
+# 这会修改 ClusterVersion.spec.desiredUpdate
+kubectl get clusterversion version -o yaml
+# spec:
+#   desiredUpdate:
+#     version: 4.11.18
+#     image: quay.io/openshift-release-dev/ocp-release:4.11.18-x86_64
+```
+
+#### 4.4.3 ClusterVersion 状态变化
+
+**升级前**：
+```yaml
+apiVersion: config.openshift.io/v1
+kind: ClusterVersion
+metadata:
+  name: version
+spec:
+  clusterID: xxx
+  channel: stable-4.11
+  desiredUpdate:
+    version: 4.11.18
+    image: quay.io/openshift-release-dev/ocp-release:4.11.18-x86_64
+status:
+  desired:
+    version: 4.11.18
+    image: quay.io/openshift-release-dev/ocp-release:4.11.18-x86_64
+  history:
+  - state: Completed
+    version: 4.11.18
+    startedTime: "2023-12-01T08:00:00Z"
+    completionTime: "2023-12-01T09:30:00Z"
+  - state: Completed
+    version: 4.11.0
+    startedTime: "2023-10-15T10:00:00Z"
+    completionTime: "2023-10-15T11:30:00Z"
+```
+
+**升级到 4.12.0（失败）**：
+```yaml
+spec:
+  desiredUpdate:
+    version: 4.12.0
+    image: quay.io/openshift-release-dev/ocp-release:4.12.0-x86_64
+status:
+  desired:
+    version: 4.12.0
+    image: quay.io/openshift-release-dev/ocp-release:4.12.0-x86_64
+  history:
+  - state: Partial          # 升级失败
+    version: 4.12.0
+    startedTime: "2024-01-15T10:00:00Z"
+  - state: Completed
+    version: 4.11.18
+    startedTime: "2023-12-01T08:00:00Z"
+    completionTime: "2023-12-01T09:30:00Z"
+  conditions:
+  - type: Failing
+    status: "True"
+    reason: UpgradeFailed
+    message: "Upgrade to 4.12.0 failed: Operator health check failed"
+```
+
+**触发自动回滚**：
+```yaml
+spec:
+  desiredUpdate:
+    version: 4.11.18        # 回滚目标 = 上一个成功版本
+    image: quay.io/openshift-release-dev/ocp-release:4.11.18-x86_64
+status:
+  desired:
+    version: 4.11.18        # 目标版本已更新
+    image: quay.io/openshift-release-dev/ocp-release:4.11.18-x86_64
+  history:
+  - state: RolledBack       # 标记为已回滚
+    version: 4.12.0
+    startedTime: "2024-01-15T10:00:00Z"
+    completionTime: "2024-01-15T11:00:00Z"
+  - state: Partial          # 正在回滚
+    version: 4.11.18
+    startedTime: "2024-01-15T11:00:00Z"
+  - state: Completed
+    version: 4.11.0
+  conditions:
+  - type: Failing
+    status: "False"         # 失败状态已清除
+  - type: RollbackInProgress
+    status: "True"
+    reason: AutomaticRollback
+    message: "Rolling back to 4.11.18 due to upgrade failure"
+```
+
+**回滚完成**：
+```yaml
+spec:
+  desiredUpdate:
+    version: 4.11.18        # 保持回滚目标
+    image: quay.io/openshift-release-dev/ocp-release:4.11.18-x86_64
+status:
+  desired:
+    version: 4.11.18
+    image: quay.io/openshift-release-dev/ocp-release:4.11.18-x86_64
+  history:
+  - state: RolledBack       # 失败的升级
+    version: 4.12.0
+    startedTime: "2024-01-15T10:00:00Z"
+    completionTime: "2024-01-15T11:00:00Z"
+  - state: Completed        # 回滚成功
+    version: 4.11.18
+    startedTime: "2024-01-15T11:00:00Z"
+    completionTime: "2024-01-15T12:00:00Z"
+  - state: Completed
+    version: 4.11.0
+  conditions:
+  - type: Available
+    status: "True"
+    reason: AsExpected
+    message: "Cluster version is 4.11.18"
+  - type: RollbackInProgress
+    status: "False"         # 回滚已完成
+```
+
+#### 4.4.4 目标版本选择规则
+
+**CVO 遵循以下规则选择回滚目标**：
+
+| 规则 | 说明 | 示例 |
+|------|------|------|
+| **最近成功原则** | 选择最近的 `state=Completed` 版本 | 4.12.0 失败 → 回滚到 4.11.18 |
+| **升级图验证** | 目标版本必须在官方升级图中 | 不能回滚到不在升级图中的版本 |
+| **镜像验证** | 目标版本的发布镜像必须可用且已验证 | 镜像签名验证通过 |
+| **兼容性检查** | 目标版本与当前组件兼容 | 不能回滚到不兼容的版本 |
+| **单一回滚** | 只能回滚一个版本，不能跨多个版本 | 4.12.0 → 4.11.18，不能直接到 4.11.0 |
+
+#### 4.4.5 特殊情况处理
+
+**情况 1：没有可回滚版本**
+
+```yaml
+status:
+  history:
+  - state: Partial        # 只有失败的升级记录
+    version: 4.12.0
+  - state: Failed         # 没有 Completed 状态
+    version: 4.11.18
+```
+
+**处理**：CVO 无法自动回滚，需要用户手动干预
+```bash
+# 用户需要手动指定回滚目标
+oc adm upgrade --to=4.11.18 --allow-explicit-upgrade --force
+```
+
+**情况 2：回滚目标版本不可用**
+
+```go
+// 发布镜像无法拉取
+if !cvo.isImageAvailable(rollbackImage) {
+    return fmt.Errorf("rollback image %s not available", rollbackImage)
+}
+```
+
+**处理**：CVO 会重试或等待用户介入
+
+**情况 3：多次升级失败**
+
+```yaml
+status:
+  history:
+  - state: Partial        # 第三次升级失败
+    version: 4.13.0
+  - state: RolledBack     # 第二次升级失败并回滚
+    version: 4.12.0
+  - state: Completed      # 当前稳定版本
+    version: 4.11.18
+```
+
+**处理**：回滚目标仍然是最近的 `Completed` 版本（4.11.18）
+
+### 4.5 完整回滚流程
 
 #### 4.4.1 手动回滚流程
 
