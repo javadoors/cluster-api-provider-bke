@@ -281,6 +281,37 @@ status:
     lastTransitionTime: "2024-01-15T10:45:00Z"
 ```
 
+**Partial 状态的详细含义：**
+
+**字面含义**：Partial = 部分的、不完整的
+
+**在 OpenShift 中的含义**：
+- 升级已开始但尚未完成
+- 没有 `completionTime`（完成时间）
+- 可能是正常状态（升级中）或异常状态（升级失败）
+
+**Partial 的两种场景**：
+
+| 场景 | state | conditions | 含义 |
+|------|-------|------------|------|
+| **升级进行中** | `Partial` | `Progressing=True` | 正常状态，升级正在执行 |
+| **升级失败** | `Partial` | `Failing=True` | 异常状态，升级失败 |
+
+**为什么使用 Partial 而不是 Failed？**
+
+1. **升级是渐进过程**：OpenShift 升级涉及多个组件，可能部分成功、部分失败
+2. **保留失败记录**：即使失败，也需要保留记录用于回滚和审计
+3. **允许手动干预**：用户可以选择重试升级或触发回滚
+4. **状态一致性**：Partial 表示"未完成"，不预设结果（成功/失败）
+
+**状态转换图**：
+
+```
+Accepted → Partial (升级中) → Completed (成功)
+                         ↓
+                    Partial (失败) → RolledBack (回滚)
+```
+
 **关键区别：**
 
 | 状态 | history[0].state | completionTime | conditions |
