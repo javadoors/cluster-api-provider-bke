@@ -237,6 +237,8 @@ const (
 
 #### 4.3.2 升级历史示例
 
+**成功升级的历史记录：**
+
 ```yaml
 status:
   history:
@@ -252,12 +254,70 @@ status:
     startedTime: "2023-12-01T08:00:00Z"
     completionTime: "2023-12-01T09:30:00Z"
     verified: true
-  - state: Completed
-    version: 4.11.0
-    image: quay.io/openshift-release-dev/ocp-release:4.11.0-x86_64
-    startedTime: "2023-10-15T10:00:00Z"
-    completionTime: "2023-10-15T11:30:00Z"
+```
+
+**升级失败时的历史记录：**
+
+```yaml
+status:
+  history:
+  - state: Partial          # 升级失败，state 保持为 Partial
+    version: 4.12.0
+    image: quay.io/openshift-release-dev/ocp-release:4.12.0-x86_64
+    startedTime: "2024-01-15T10:00:00Z"
+    # completionTime 不存在，因为升级未完成
     verified: true
+  - state: Completed
+    version: 4.11.18
+    image: quay.io/openshift-release-dev/ocp-release:4.11.18-x86_64
+    startedTime: "2023-12-01T08:00:00Z"
+    completionTime: "2023-12-01T09:30:00Z"
+    verified: true
+  conditions:
+  - type: Failing
+    status: "True"
+    reason: UpgradeFailed
+    message: "Unable to apply 4.12.0: Operator health check failed"
+    lastTransitionTime: "2024-01-15T10:45:00Z"
+```
+
+**关键区别：**
+
+| 状态 | history[0].state | completionTime | conditions |
+|------|------------------|----------------|------------|
+| 升级成功 | `Completed` | 有值 | `Available=True` |
+| 升级失败 | `Partial` | 无值 | `Failing=True` |
+| 升级中 | `Partial` | 无值 | `Progressing=True` |
+
+**CVO 如何检测升级失败：**
+
+```go
+func (cvo *ClusterVersionOperator) isUpgradeFailed(cv *configv1.ClusterVersion) bool {
+    if len(cv.Status.History) == 0 {
+        return false
+    }
+    
+    latest := cv.Status.History[0]
+    
+    // 条件 1: state 为 Partial（未完成）
+    if latest.State != configv1.PartialUpdateState {
+        return false
+    }
+    
+    // 条件 2: 检查 Failing condition
+    for _, cond := range cv.Status.Conditions {
+        if cond.Type == "Failing" && cond.Status == "True" {
+            return true
+        }
+    }
+    
+    // 条件 3: 检查是否超时
+    if time.Since(latest.StartedTime.Time) > cvo.upgradeTimeout {
+        return true
+    }
+    
+    return false
+}
 ```
 
 #### 4.3.3 版本选择算法
