@@ -311,6 +311,7 @@ func NewRemoteKubeClient(ctx context.Context, cfg *rest.Config) (RemoteKubeClien
 package kube
 
 import (
+    "fmt"
     "sync"
     
     "k8s.io/apimachinery/pkg/api/meta"
@@ -319,7 +320,8 @@ import (
     "k8s.io/client-go/rest"
     "k8s.io/client-go/restmapper"
     "k8s.io/client-go/tools/cache"
-    apiextensionsinformers "k8s.io/apiextensions-apiserver/pkg/client/informers/externalversions/apiextensions/v1"
+    apiextensionsclient "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
+    apiextensionsinformers "k8s.io/apiextensions-apiserver/pkg/client/informers/externalversions"
 )
 
 var (
@@ -364,10 +366,11 @@ func newDynamicRESTMapper(config *rest.Config) (*DynamicRESTMapper, error) {
     // 创建 RESTMapper
     mapper := restmapper.NewDeferredDiscoveryRESTMapper(cachedDiscovery)
     
-    // 创建 CRD Informer（使用独立的 clientset）
-    // 注意：这里需要 apiextensions-apiserver 的 clientset
-    // 在实际实现中，需要通过 manager 或独立的 clientset 创建
-    crdInformer := createCRDInformer(config)
+    // 创建 CRD Informer
+    crdInformer, err := createCRDInformer(config)
+    if err != nil {
+        return nil, fmt.Errorf("failed to create CRD informer: %w", err)
+    }
     
     // 创建 DynamicRESTMapper
     drm := &DynamicRESTMapper{
@@ -402,17 +405,22 @@ func newDynamicRESTMapper(config *rest.Config) (*DynamicRESTMapper, error) {
 }
 
 // createCRDInformer 创建 CRD Informer
-// 注意：这是一个示例实现，实际使用时需要根据项目结构调整
-func createCRDInformer(config *rest.Config) cache.SharedIndexInformer {
-    // 这里需要使用 apiextensions-apiserver 的 clientset
-    // 在实际项目中，通常通过 manager 或依赖注入获取
-    // 示例代码：
-    // apiextensionsClient, err := apiextensionsclient.NewForConfig(config)
-    // factory := apiextensionsinformers.NewSharedInformerFactory(apiextensionsClient, 0)
-    // return factory.Apiextensions().V1().CustomResourceDefinitions().Informer()
+// 监听 CRD 的增删改事件，当 CRD 变化时自动清除 RESTMapper 缓存
+func createCRDInformer(config *rest.Config) (cache.SharedIndexInformer, error) {
+    // 创建 apiextensions-apiserver 的 clientset
+    apiextensionsClient, err := apiextensionsclient.NewForConfig(config)
+    if err != nil {
+        return nil, fmt.Errorf("failed to create apiextensions client: %w", err)
+    }
     
-    // 临时返回 nil，实际实现时需要替换
-    return nil
+    // 创建 SharedInformerFactory
+    // resync period 设置为 0，表示不使用定期同步，仅依赖 Watch 机制
+    factory := apiextensionsinformers.NewSharedInformerFactory(apiextensionsClient, 0)
+    
+    // 获取 CRD Informer
+    crdInformer := factory.Apiextensions().V1().CustomResourceDefinitions().Informer()
+    
+    return crdInformer, nil
 }
 
 // RESTMapping 返回给定 GroupKind 的 RESTMapping
