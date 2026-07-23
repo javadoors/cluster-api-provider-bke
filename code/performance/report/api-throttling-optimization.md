@@ -338,12 +338,16 @@ var (
     // ... 现有配置 ...
     
     // ClientQPS 是 Kubernetes 客户端的 QPS
-    // 默认值: 50，可以通过 --client-qps 标志或 KUBE_CLIENT_QPS 环境变量覆盖
+    // 默认值: 50，可以通过命令行标志、环境变量或配置文件覆盖
     ClientQPS float32
     
     // ClientBurst 是 Kubernetes 客户端的突发大小
-    // 默认值: 100，可以通过 --client-burst 标志或 KUBE_CLIENT_BURST 环境变量覆盖
+    // 默认值: 100，可以通过命令行标志、环境变量或配置文件覆盖
     ClientBurst int
+    
+    // ClientConfigFile 是客户端配置文件路径
+    // 默认值: /etc/bke/client-config.yaml
+    ClientConfigFile string
 )
 
 const (
@@ -351,19 +355,32 @@ const (
     DefaultClientQPS = 50
     // DefaultClientBurst 是 Kubernetes 客户端的默认突发大小
     DefaultClientBurst = 100
+    // DefaultClientConfigFile 是默认配置文件路径
+    DefaultClientConfigFile = "/etc/bke/client-config.yaml"
 )
+
+// ClientConfig 客户端配置文件结构
+type ClientConfig struct {
+    QPS   float32 `yaml:"qps"`
+    Burst int     `yaml:"burst"`
+}
 
 func ConfigurationFlag() {
     // ... 现有配置 ...
     
-    flag.Float32Var(&ClientQPS, "client-qps", DefaultClientQPS,
-        "Kubernetes 客户端的 QPS。默认值: 50。也可以通过 KUBE_CLIENT_QPS 环境变量设置")
-    flag.IntVar(&ClientBurst, "client-burst", DefaultClientBurst,
-        "Kubernetes 客户端的突发大小。默认值: 100。也可以通过 KUBE_CLIENT_BURST 环境变量设置")
+    flag.Float32Var(&ClientQPS, "client-qps", 0,
+        "Kubernetes 客户端的 QPS。优先级：命令行 > 环境变量 > 配置文件 > 默认值(50)")
+    flag.IntVar(&ClientBurst, "client-burst", 0,
+        "Kubernetes 客户端的突发大小。优先级：命令行 > 环境变量 > 配置文件 > 默认值(100)")
+    flag.StringVar(&ClientConfigFile, "client-config-file", DefaultClientConfigFile,
+        "客户端配置文件路径。默认: /etc/bke/client-config.yaml")
 }
 
 func init() {
-    // 从环境变量读取
+    // 1. 首先加载配置文件（最低优先级）
+    loadClientConfigFile()
+    
+    // 2. 环境变量覆盖配置文件
     if qps := os.Getenv("KUBE_CLIENT_QPS"); qps != "" {
         if v, err := strconv.ParseFloat(qps, 32); err == nil {
             ClientQPS = float32(v)
@@ -375,7 +392,7 @@ func init() {
         }
     }
     
-    // 如果未设置则使用默认值
+    // 3. 如果仍未设置，使用默认值
     if ClientQPS == 0 {
         ClientQPS = DefaultClientQPS
     }
@@ -383,6 +400,96 @@ func init() {
         ClientBurst = DefaultClientBurst
     }
 }
+
+// loadClientConfigFile 从配置文件加载 QPS/Burst 配置
+// 配置文件格式为 YAML，路径通过 --client-config-file 指定
+func loadClientConfigFile() {
+    if ClientConfigFile == "" {
+        ClientConfigFile = DefaultClientConfigFile
+    }
+    
+    data, err := os.ReadFile(ClientConfigFile)
+    if err != nil {
+        // 配置文件不存在或读取失败，使用默认值
+        return
+    }
+    
+    var config ClientConfig
+    if err := yaml.Unmarshal(data, &config); err != nil {
+        log.Warnf("failed to parse client config file %s: %v, using defaults", ClientConfigFile, err)
+        return
+    }
+    
+    if config.QPS > 0 {
+        ClientQPS = config.QPS
+    }
+    if config.Burst > 0 {
+        ClientBurst = config.Burst
+    }
+}
+```
+
+**配置文件格式：`/etc/bke/client-config.yaml`**
+
+```yaml
+# BKE 客户端配置
+# 通过 ConfigMap 挂载到 Pod
+
+# Kubernetes 客户端限流配置
+qps: 50
+burst: 100
+```
+
+**ConfigMap 定义：**
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bke-client-config
+  namespace: bke-system
+data:
+  client-config.yaml: |
+    # BKE 客户端配置
+    qps: 50
+    burst: 100
+```
+
+**Deployment 挂载配置：**
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bke-controller-manager
+  namespace: bke-system
+spec:
+  template:
+    spec:
+      containers:
+      - name: manager
+        args:
+        - --client-config-file=/etc/bke/client-config.yaml
+        volumeMounts:
+        - name: client-config
+          mountPath: /etc/bke
+          readOnly: true
+      volumes:
+      - name: client-config
+        configMap:
+          name: bke-client-config
+```
+
+**配置优先级：**
+
+```txt
+命令行标志 > 环境变量 > 配置文件 > 默认值
+
+示例：
+1. 命令行：--client-qps=100 --client-burst=200
+2. 环境变量：KUBE_CLIENT_QPS=80 KUBE_CLIENT_BURST=160
+3. 配置文件：/etc/bke/client-config.yaml (qps: 60, burst: 120)
+4. 默认值：QPS=50, Burst=100
 ```
 
 #### 2. 工厂层
@@ -975,10 +1082,12 @@ graph TD
     A[用户启动控制器] --> B{检查配置来源}
     B -->|命令行标志| C[解析 --client-qps]
     B -->|环境变量| D[读取 KUBE_CLIENT_QPS]
+    B -->|配置文件| D1[读取 /etc/bke/client-config.yaml]
     B -->|默认值| E[使用 50]
     
     C --> F[config.ClientQPS = 用户值]
     D --> F
+    D1 --> F
     E --> F
     
     F --> G[创建 Manager]
@@ -1027,9 +1136,9 @@ graph TB
     end
     
     subgraph "配置注入"
-        D[ConfigMap<br/>bke-controller-config]
-        E[命令行参数<br/>--client-qps=50<br/>--client-burst=100]
-        F[环境变量<br/>KUBE_CLIENT_QPS=50]
+        D[ConfigMap<br/>bke-client-config<br/>client-config.yaml]
+        E[命令行参数<br/>--client-config-file=<br/>/etc/bke/client-config.yaml]
+        F[环境变量<br/>KUBE_CLIENT_QPS=50<br/>KUBE_CLIENT_BURST=100]
     end
     
     subgraph "监控"
@@ -1038,7 +1147,7 @@ graph TB
         I[日志系统<br/>ELK/Loki]
     end
     
-    D --> A
+    D -->|挂载到 /etc/bke| A
     E --> A
     F --> A
     A --> B
@@ -1051,6 +1160,7 @@ graph TB
     style A fill:#fff4e1
     style B fill:#e1f5ff
     style G fill:#e8f5e9
+    style D fill:#e8f5e9
 ```
 
 **监控点说明：**
@@ -1315,14 +1425,14 @@ pie title 工作量分布
 ```mermaid
 gantt
     title 项目实施计划
-    dateFormat  YYYY-MM-DD
+    dateFormat YYYY-MM-DD
     section 开发
-    核心实现             :a1, 3d
-    RESTMapper 缓存实现  :a2, after a1, 2d
+    核心实现            :a1, 2026-01-01, 3d
+    RESTMapper缓存实现  :a2, after a1, 2d
     section 测试
-    测试验证             :b1, after a2, 4d
+    测试验证            :b1, after a2, 4d
     section 发布
-    发布准备             :c1, after b1, 2d
+    发布准备            :c1, after b1, 2d
 ```
 
 | 里程碑                  | 时间      | 交付物                                   | 验收标准                               |
@@ -1434,10 +1544,18 @@ gantt
 
 #### 3. 配置参数规格
 
-| 参数        | 类型    | 默认值 | 命令行标志       | 环境变量             | 约束 |
-| ----------- | ------- | ------ | ---------------- | -------------------- | ---- |
-| ClientQPS   | float32 | 50     | `--client-qps`   | `KUBE_CLIENT_QPS`    | > 0  |
-| ClientBurst | int     | 100    | `--client-burst` | `KUBE_CLIENT_BURST`  | > 0  |
+| 参数             | 类型    | 默认值                        | 命令行标志             | 环境变量            | 约束     |
+| ---------------- | ------- | ----------------------------- | ---------------------- | ------------------- | -------- |
+| ClientQPS        | float32 | 50                            | `--client-qps`         | `KUBE_CLIENT_QPS`   | > 0      |
+| ClientBurst      | int     | 100                           | `--client-burst`       | `KUBE_CLIENT_BURST` | > 0      |
+| ClientConfigFile | string  | `/etc/bke/client-config.yaml` | `--client-config-file` | -                   | 有效路径 |
+
+**配置文件格式（YAML）：**
+
+| 字段  | 类型    | 说明                      | 约束 |
+| ----- | ------- | ------------------------- | ---- |
+| qps   | float32 | Kubernetes 客户端 QPS     | > 0  |
+| burst | int     | Kubernetes 客户端突发大小 | > 0  |
 
 #### 4. API 服务器安全规格
 
