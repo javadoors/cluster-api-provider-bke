@@ -578,6 +578,194 @@ status:
     message: "Rolling back to 4.11.18 due to upgrade failure"
 ```
 
+**回滚触发详细流程**：
+
+**步骤 1: 检测升级失败**
+
+CVO 在调谐循环中持续检查升级状态，通过以下条件判断升级是否失败：
+
+```go
+func (cvo *ClusterVersionOperator) detectUpgradeFailure(cv *configv1.ClusterVersion) bool {
+    // 条件 1: 检查最新的升级记录是否为 Partial 状态
+    if len(cv.Status.History) == 0 {
+        return false
+    }
+    
+    latest := cv.Status.History[0]
+    if latest.State != configv1.PartialUpdateState {
+        return false
+    }
+    
+    // 条件 2: 检查 Failing condition 是否为 True
+    for _, cond := range cv.Status.Conditions {
+        if cond.Type == "Failing" && cond.Status == metav1.ConditionTrue {
+            return true
+        }
+    }
+    
+    // 条件 3: 检查是否超时（默认 30 分钟）
+    if time.Since(latest.StartedTime.Time) > cvo.upgradeTimeout {
+        return true
+    }
+    
+    return false
+}
+```
+
+**步骤 2: 获取回滚目标版本**
+
+```go
+func (cvo *ClusterVersionOperator) getRollbackTarget(cv *configv1.ClusterVersion) (string, error) {
+    // 遍历 history，找到最近的 Completed 状态记录
+    // 跳过第一个 Partial 状态记录（失败的升级）
+    for i := 1; i < len(cv.Status.History); i++ {
+        if cv.Status.History[i].State == configv1.CompletedUpdateState {
+            return cv.Status.History[i].Version, nil
+        }
+    }
+    return "", fmt.Errorf("no rollback target found")
+}
+```
+
+**步骤 3: 标记失败记录为 RolledBack**
+
+```go
+func (cvo *ClusterVersionOperator) markAsRolledBack(cv *configv1.ClusterVersion) {
+    // 修改第一个记录的 state 为 RolledBack
+    cv.Status.History[0].State = configv1.RolledBackUpdateState
+    
+    // 设置 completionTime（标记回滚决策时间）
+    now := metav1.Now()
+    cv.Status.History[0].CompletionTime = &now
+    
+    // 清除 Failing condition
+    for i, cond := range cv.Status.Conditions {
+        if cond.Type == "Failing" {
+            cv.Status.Conditions[i].Status = metav1.ConditionFalse
+            cv.Status.Conditions[i].Message = "Upgrade failed, rollback initiated"
+            break
+        }
+    }
+    
+    // 添加 RollbackInProgress condition
+    cv.Status.Conditions = append(cv.Status.Conditions, configv1.ClusterOperatorStatusCondition{
+        Type:               "RollbackInProgress",
+        Status:             metav1.ConditionTrue,
+        Reason:             "AutomaticRollback",
+        Message:            fmt.Sprintf("Rolling back to %s due to upgrade failure", rollbackTarget),
+        LastTransitionTime: metav1.Now(),
+    })
+}
+```
+
+**步骤 4: 创建新的回滚记录**
+
+```go
+func (cvo *ClusterVersionOperator) createRollbackRecord(cv *configv1.ClusterVersion, targetVersion string) {
+    // 创建新的回滚记录
+    rollbackRecord := configv1.UpdateHistory{
+        State:       configv1.PartialUpdateState,  // 初始为 Partial
+        Version:     targetVersion,
+        Image:       cvo.getReleaseImage(targetVersion),
+        StartedTime: metav1.Now(),
+        // CompletionTime 不存在，因为回滚尚未完成
+    }
+    
+    // 插入到 history 数组的开头
+    // 原来的 RolledBack 记录变成 history[0]
+    // 新的回滚记录变成 history[1]
+    newHistory := make([]configv1.UpdateHistory, len(cv.Status.History)+1)
+    newHistory[0] = cv.Status.History[0]  // RolledBack 记录
+    newHistory[1] = rollbackRecord        // 新的回滚记录
+    copy(newHistory[2:], cv.Status.History[1:])  // 其他历史记录
+    
+    cv.Status.History = newHistory
+    
+    // 更新 desired 状态
+    cv.Status.Desired.Version = targetVersion
+    cv.Status.Desired.Image = rollbackRecord.Image
+}
+```
+
+**步骤 5: 更新 ClusterVersion 对象**
+
+```go
+func (cvo *ClusterVersionOperator) executeRollback(cv *configv1.ClusterVersion) error {
+    // 1. 获取回滚目标
+    targetVersion, err := cvo.getRollbackTarget(cv)
+    if err != nil {
+        return err
+    }
+    
+    // 2. 标记失败记录为 RolledBack
+    cvo.markAsRolledBack(cv)
+    
+    // 3. 创建新的回滚记录
+    cvo.createRollbackRecord(cv, targetVersion)
+    
+    // 4. 更新 spec.desiredUpdate（触发回滚执行）
+    cv.Spec.DesiredUpdate = &configv1.Update{
+        Version: targetVersion,
+        Image:   cvo.getReleaseImage(targetVersion),
+    }
+    
+    // 5. 更新 ClusterVersion 对象到 API Server
+    if err := cvo.client.Status().Update(context.TODO(), cv); err != nil {
+        return err
+    }
+    
+    // 6. 发送事件
+    cvo.recorder.Eventf(cv, corev1.EventTypeWarning, "UpgradeFailed",
+        "Upgrade to %s failed, initiating automatic rollback to %s",
+        cv.Status.History[0].Version, targetVersion)
+    
+    return nil
+}
+```
+
+**状态转换时序图**：
+
+```
+时间线                          ClusterVersion 状态变化
+────────────────────────────────────────────────────────────────
+T0: 升级到 4.12.0 开始          history[0] = {state: Partial, version: 4.12.0}
+                                
+T1: 升级失败                    history[0] = {state: Partial, version: 4.12.0}
+                                conditions = [{type: Failing, status: True}]
+                                
+T2: CVO 检测到失败              调用 executeRollback()
+                                
+T3: 标记失败记录                history[0] = {state: RolledBack, version: 4.12.0, completionTime: T3}
+                                history[1] = {state: Partial, version: 4.11.18}  ← 新创建
+                                conditions = [{type: RollbackInProgress, status: True}]
+                                spec.desiredUpdate.version = 4.11.18
+                                
+T4: 回滚执行中                  history[0] = {state: RolledBack, version: 4.12.0}
+                                history[1] = {state: Partial, version: 4.11.18}
+                                
+T5: 回滚完成                    history[0] = {state: RolledBack, version: 4.12.0}
+                                history[1] = {state: Completed, version: 4.11.18, completionTime: T5}
+                                conditions = [{type: Available, status: True}]
+```
+
+**关键点总结**：
+
+| 步骤 | 操作 | history 变化 |
+|------|------|-------------|
+| 1. 检测失败 | 检查 `Partial` + `Failing=True` | 无变化 |
+| 2. 获取目标 | 遍历 history 找 `Completed` 记录 | 无变化 |
+| 3. 标记 RolledBack | 修改 `history[0].state` | `history[0]`: `Partial` → `RolledBack` |
+| 4. 创建回滚记录 | 在 `history[0]` 后插入新记录 | 新增 `history[1]`: `{state: Partial, version: 4.11.18}` |
+| 5. 更新 spec | 修改 `spec.desiredUpdate.version` | 无变化 |
+| 6. 执行回滚 | CVO 执行回滚操作 | `history[1]`: `Partial` → `Completed` |
+
+**为什么需要两个步骤（标记 + 创建）？**
+
+1. **保留失败记录**：将失败的升级标记为 `RolledBack`，保留完整的审计历史
+2. **记录回滚决策**：`completionTime` 记录回滚决策时间，而非回滚完成时间
+3. **触发回滚执行**：创建新的 `Partial` 记录，表示回滚正在进行
+4. **状态一致性**：`spec.desiredUpdate.version` 与 `history[1].version` 一致，触发回滚执行
+
 **回滚完成**：
 ```yaml
 spec:
