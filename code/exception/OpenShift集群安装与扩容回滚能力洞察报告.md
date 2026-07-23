@@ -191,7 +191,241 @@ oc edit clusterversion version
 - 不能跨多个版本回滚（如 4.12 → 4.10）
 - 需要 `--allow-not-recommended` 标志
 
-### 4.3 回滚数据模型
+### 4.3 回滚版本获取机制
+
+**核心问题**：如何确定可以回滚到哪个版本？
+
+#### 4.3.1 升级历史数据结构
+
+OpenShift ClusterVersion 的 `status.history` 字段存储了完整的升级历史：
+
+```go
+type UpdateHistory struct {
+    // state 记录升级状态
+    // - Completed: 升级成功完成
+    // - Partial: 升级进行中或部分完成
+    // - Accepted: 升级已被接受但尚未开始
+    State UpdateState `json:"state"`
+    
+    // version 是目标版本
+    Version string `json:"version"`
+    
+    // image 是发布镜像
+    Image string `json:"image"`
+    
+    // startedTime 是升级开始时间
+    StartedTime metav1.Time `json:"startedTime"`
+    
+    // completionTime 是升级完成时间（仅当 state=Completed 时）
+    CompletionTime *metav1.Time `json:"completionTime,omitempty"`
+    
+    // verified 表示发布镜像是否已验证
+    Verified bool `json:"verified"`
+    
+    // acceptedRisks 记录升级过程中接受的风险
+    AcceptedRisks string `json:"acceptedRisks,omitempty"`
+}
+
+type UpdateState string
+
+const (
+    CompletedUpdateState UpdateState = "Completed"
+    PartialUpdateState   UpdateState = "Partial"
+    AcceptedUpdateState  UpdateState = "Accepted"
+)
+```
+
+#### 4.3.2 升级历史示例
+
+```yaml
+status:
+  history:
+  - state: Completed
+    version: 4.12.0
+    image: quay.io/openshift-release-dev/ocp-release:4.12.0-x86_64
+    startedTime: "2024-01-15T10:00:00Z"
+    completionTime: "2024-01-15T11:30:00Z"
+    verified: true
+  - state: Completed
+    version: 4.11.18
+    image: quay.io/openshift-release-dev/ocp-release:4.11.18-x86_64
+    startedTime: "2023-12-01T08:00:00Z"
+    completionTime: "2023-12-01T09:30:00Z"
+    verified: true
+  - state: Completed
+    version: 4.11.0
+    image: quay.io/openshift-release-dev/ocp-release:4.11.0-x86_64
+    startedTime: "2023-10-15T10:00:00Z"
+    completionTime: "2023-10-15T11:30:00Z"
+    verified: true
+```
+
+#### 4.3.3 版本选择算法
+
+**CVO 通过以下算法确定可回滚版本**：
+
+```go
+// GetRollbackTarget 获取可回滚的目标版本
+func (cvo *ClusterVersionOperator) GetRollbackTarget(cv *configv1.ClusterVersion) (string, error) {
+    // 1. 获取升级历史
+    history := cv.Status.History
+    
+    // 2. 查找最新的 Completed 状态记录（当前版本）
+    var currentVersion string
+    for _, h := range history {
+        if h.State == configv1.CompletedUpdateState {
+            currentVersion = h.Version
+            break
+        }
+    }
+    
+    if currentVersion == "" {
+        return "", fmt.Errorf("no completed upgrade found")
+    }
+    
+    // 3. 查找上一条 Completed 状态记录（可回滚版本）
+    var rollbackVersion string
+    foundCurrent := false
+    for _, h := range history {
+        if h.State == configv1.CompletedUpdateState {
+            if foundCurrent {
+                // 这是上一条 Completed 记录
+                rollbackVersion = h.Version
+                break
+            }
+            if h.Version == currentVersion {
+                foundCurrent = true
+            }
+        }
+    }
+    
+    if rollbackVersion == "" {
+        return "", fmt.Errorf("no rollback target found")
+    }
+    
+    // 4. 验证回滚版本是否在升级图中
+    if !cvo.isVersionInUpgradeGraph(rollbackVersion) {
+        return "", fmt.Errorf("rollback version %s not in upgrade graph", rollbackVersion)
+    }
+    
+    return rollbackVersion, nil
+}
+```
+
+#### 4.3.4 版本验证机制
+
+**CVO 在回滚前会进行以下验证**：
+
+1. **升级图验证**：检查目标版本是否在官方升级图中
+   ```bash
+   # 查看可用升级路径
+   oc adm upgrade --allow-explicit-upgrade --to-image=<image>
+   ```
+
+2. **发布镜像验证**：验证目标版本的发布镜像签名
+   ```go
+   if !verified {
+       return fmt.Errorf("release image not verified")
+   }
+   ```
+
+3. **兼容性验证**：检查目标版本与当前组件的兼容性
+   ```go
+   if !cvo.isCompatible(currentComponents, targetVersion) {
+       return fmt.Errorf("version not compatible with current components")
+   }
+   ```
+
+### 4.4 完整回滚流程
+
+#### 4.4.1 手动回滚流程
+
+```
+步骤 1: 查看升级历史
+  └─ oc get clusterversion version -o yaml
+     └─ 查看 status.history 字段
+
+步骤 2: 确定回滚目标
+  └─ 找到上一条 state=Completed 的记录
+  └─ 记录其 version 字段（如 4.11.18）
+
+步骤 3: 验证回滚路径
+  └─ oc adm upgrade --allow-explicit-upgrade --to-image=<image>
+  └─ 确认回滚路径可用
+
+步骤 4: 触发回滚
+  └─ oc adm upgrade --to=4.11.18 --allow-not-recommended
+  └─ 或修改 ClusterVersion.spec.desiredUpdate
+
+步骤 5: 监控回滚进度
+  └─ oc get clusterversion version -w
+  └─ 查看 status.history 中新增的回滚记录
+
+步骤 6: 验证回滚完成
+  └─ 确认 status.history[0].version = 4.11.18
+  └─ 确认 status.history[0].state = Completed
+  └─ 确认所有节点已回滚到 4.11.18
+```
+
+#### 4.4.2 自动回滚流程
+
+```
+步骤 1: 升级开始
+  └─ CVO 开始执行升级
+  └─ 更新 status.history[0].state = Partial
+
+步骤 2: 检测到失败
+  └─ Operator 健康检查失败
+  └─ 或节点 NotReady
+  └─ 或升级超时
+
+步骤 3: 触发自动回滚
+  └─ CVO 调用 GetRollbackTarget()
+  └─ 获取可回滚版本（如 4.11.18）
+  └─ 更新 spec.desiredUpdate.version = 4.11.18
+
+步骤 4: 执行回滚
+  └─ CVO 按照正常升级流程执行回滚
+  └─ 回滚 Operator 到 4.11.18
+  └─ MCO 回滚节点配置到 4.11.18
+
+步骤 5: 更新历史
+  └─ 更新 status.history[0].state = RolledBack
+  └─ 新增 status.history[1].state = Completed (4.11.18)
+
+步骤 6: 通知用户
+  └─ 发送事件：UpgradeFailedAndRolledBack
+  └─ 记录回滚原因和目标版本
+```
+
+#### 4.4.3 回滚状态转换
+
+```
+升级前：
+  status.history:
+  - state: Completed, version: 4.11.18  ← 当前版本
+  - state: Completed, version: 4.11.0
+
+升级中（失败）：
+  status.history:
+  - state: Partial, version: 4.12.0  ← 升级失败
+  - state: Completed, version: 4.11.18
+  - state: Completed, version: 4.11.0
+
+回滚中：
+  status.history:
+  - state: Partial, version: 4.12.0  ← 标记为 RolledBack
+  - state: Partial, version: 4.11.18  ← 正在回滚
+  - state: Completed, version: 4.11.0
+
+回滚完成：
+  status.history:
+  - state: RolledBack, version: 4.12.0  ← 已回滚
+  - state: Completed, version: 4.11.18  ← 当前版本
+  - state: Completed, version: 4.11.0
+```
+
+### 4.5 回滚数据模型
 
 ```go
 type UpgradeHistory struct {
