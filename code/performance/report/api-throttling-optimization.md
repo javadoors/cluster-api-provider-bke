@@ -1586,8 +1586,9 @@ gantt
 | -------------------------- | ---------------------------------------------------- | ------------------ |
 | 集中化 QPS/Burst 配置实现  | 配置层 + 工厂层代码完整                              | 单元测试通过       |
 | 动态 RESTMapper 缓存实现   | DynamicRESTMapper + CRD Informer 代码完整            | 单元测试通过       |
-| 命令行标志支持             | `--client-qps` / `--client-burst` 可解析             | 启动参数测试       |
+| 命令行标志支持             | `--client-qps` / `--client-burst` / `--client-config-file` 可解析 | 启动参数测试 |
 | 环境变量支持               | `KUBE_CLIENT_QPS` / `KUBE_CLIENT_BURST` 可读取       | 环境变量测试       |
+| 配置文件支持               | 从 YAML 配置文件加载 QPS/Burst 配置                  | 配置文件测试       |
 | 单元测试通过               | 覆盖率 ≥ 80%                                         | `go test -cover`   |
 | 现有功能无回归             | 所有现有测试通过                                     | `go test ./...`    |
 
@@ -1599,9 +1600,10 @@ gantt
 | API 发现时间           | 显著缩短                                     | 集成测试验证       |
 | 客户端限流警告         | 基本消除（日志中无 client-side throttling）  | 日志分析           |
 | API 服务器负载         | 请求速率在可接受范围内                       | Prometheus 监控    |
-| 所有使用层已迁移       | 4 个文件均使用工厂方法                       | 代码审查           |
+| 所有使用层已迁移       | 5 个文件均使用工厂方法                       | 代码审查           |
 | RESTMapper 缓存命中率  | 显著提升                                     | Prometheus 监控    |
 | CRD 变化时缓存自动失效 | 日志中显示 Invalidate 调用                   | 日志分析           |
+| 配置文件加载验证       | ConfigMap 挂载的配置文件可正确加载           | 集成测试验证       |
 
 #### Stable 阶段 (v1.0)
 
@@ -1612,6 +1614,7 @@ gantt
 | API 限流事件     | 基本消除                 | 日志分析           |
 | API 服务器稳定性 | 无过载告警               | Prometheus 监控    |
 | 生产稳定性       | 运行 1 个月无问题        | 生产监控           |
+| 配置灵活性验证   | 支持多种配置方式无缝切换 | 生产环境验证       |
 
 ### 测试用例规格
 
@@ -1623,7 +1626,11 @@ TestClientQPSDefault: 验证默认值为 50
 TestClientBurstDefault: 验证默认值为 100
 TestEnvVarOverride: 验证环境变量覆盖默认值
 TestFlagOverride: 验证命令行标志覆盖环境变量
-TestPriorityOrder: 验证优先级：flag > env > default
+TestConfigFileOverride: 验证配置文件覆盖默认值
+TestPriorityOrder: 验证优先级：flag > env > config file > default
+TestLoadClientConfigFile: 验证从 YAML 文件加载配置
+TestLoadClientConfigFile_NotExist: 验证配置文件不存在时使用默认值
+TestLoadClientConfigFile_InvalidYAML: 验证无效 YAML 格式的处理
 
 // 2. 工厂层测试
 TestApplyThrottlingConfig_NilConfig: nil 输入返回 nil
@@ -1634,9 +1641,12 @@ TestNewDynamicClientFromConfig: 验证动态客户端创建
 TestGetManagerConfig: 验证 Manager 配置应用限流参数
 
 // 3. RESTMapper 缓存层测试
-TestGetDynamicRESTMapper: 验证单例模式
+TestGetDynamicRESTMapper: 验证按集群缓存机制
+TestGetDynamicRESTMapper_MultiCluster: 验证多集群场景下的缓存隔离
 TestDynamicRESTMapper_Invalidate: 验证手动清除缓存
 TestDynamicRESTMapper_CRDChange: 验证 CRD 变化时自动失效
+TestCloseDynamicRESTMapper: 验证资源释放
+TestCreateCRDInformer: 验证 CRD Informer 创建
 ```
 
 #### 集成测试用例
@@ -1647,8 +1657,13 @@ TestAPIDiscoveryPerformance: API 发现时间显著缩短
 TestClientThrottlingEliminated: 日志中无限流警告
 TestDynamicRESTMapperPerformance: 缓存命中性能测试
 
+// 配置测试
+TestConfigFileIntegration: 验证配置文件从 ConfigMap 加载
+TestConfigPriorityIntegration: 验证配置优先级在集成环境中的表现
+
 // 并发测试
 TestConcurrentClientCreation: 多 goroutine 并发创建客户端
+TestConcurrentRESTMapperAccess: 多 goroutine 并发访问 RESTMapper
 
 // 压力测试
 TestHighAPILoad: QPS=50 下 API Server 无过载
@@ -1677,6 +1692,17 @@ kubectl logs -n bke-system deployment/bke-controller-manager | grep "RESTMapper"
 kubectl apply -f new-crd.yaml
 kubectl logs -n bke-system deployment/bke-controller-manager | grep "Invalidate"
 # 验证: CRD 变化时触发缓存失效
+
+# 6. 配置文件加载验证
+kubectl get configmap bke-client-config -n bke-system -o yaml
+kubectl logs -n bke-system deployment/bke-controller-manager | grep "client config"
+# 验证: 配置文件正确加载
+
+# 7. 配置优先级验证
+# 设置环境变量和配置文件，验证命令行标志优先级最高
+kubectl exec -n bke-system deployment/bke-controller-manager -- env | grep KUBE_CLIENT
+kubectl logs -n bke-system deployment/bke-controller-manager | grep "QPS"
+# 验证: 配置优先级正确应用
 ```
 
 ### 监控告警规格
@@ -1688,8 +1714,10 @@ kubectl logs -n bke-system deployment/bke-controller-manager | grep "Invalidate"
 | API Server 请求速率     | Prometheus | > 1000 QPS | 防止过载               |
 | API Server 请求延迟     | Prometheus | P99 > 1s   | 性能影响监控           |
 | QPS/Burst 配置值        | 启动日志   | 与预期不符 | 配置验证               |
+| 配置文件加载状态        | 启动日志   | 加载失败   | 确保配置正确应用       |
 | RESTMapper 缓存命中率   | Prometheus | < 80%      | 验证缓存效果           |
 | CRD Informer 同步状态   | 日志       | 同步失败   | 确保缓存数据一致性     |
+| 多集群 RESTMapper 实例数 | Prometheus | 异常增长   | 资源泄漏监控           |
 
 ### 交付物清单
 
@@ -1698,13 +1726,9 @@ kubectl logs -n bke-system deployment/bke-controller-manager | grep "Invalidate"
 | 配置层             | `utils/capbke/config/config.go`                                      | 单元测试通过                     |
 | 工厂层             | `pkg/kube/client_factory.go`                                         | 单元测试通过                     |
 | RESTMapper 缓存层  | `pkg/kube/restmapper.go`                                             | 单元测试通过，CRD 变化时自动失效 |
-| 使用层修改         | `pkg/kube/kube.go`                                                   | 所有客户端创建经工厂方法         |
-|                    | `cmd/capbke/main.go`                                                 |                                  |
-|                    | `cmd/bkeagent/main.go`                                               |                                  |
-|                    | `pkg/kube/wait.go`                                                   |                                  |
-|                    | `pkg/kube/helm.go`                                                   |                                  |
-| 单元测试           | `pkg/kube/client_factory_test.go`                                    | 覆盖率 ≥ 80%                     |
-|                    | `pkg/kube/restmapper_test.go`                                        |                                  |
+| 使用层修改         | `pkg/kube/kube.go`, `cmd/capbke/main.go`, `cmd/bkeagent/main.go`, `pkg/kube/wait.go`, `pkg/kube/helm.go` | 所有客户端创建经工厂方法 |
+| 配置文件示例       | `deploy/bke-client-config.yaml`                                      | ConfigMap 定义完整               |
+| 单元测试           | `pkg/kube/client_factory_test.go`, `pkg/kube/restmapper_test.go`     | 覆盖率 ≥ 80%                     |
 | 集成测试           | `test/integration/performance_test.go`                               | API 发现时间显著缩短             |
 | 文档               | 配置说明、发布说明                                                   | 文档完整                         |
 
