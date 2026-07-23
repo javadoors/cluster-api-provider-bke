@@ -574,7 +574,285 @@ status:
 
 **处理**：回滚目标仍然是最近的 `Completed` 版本（4.11.18）
 
-### 4.5 完整回滚流程
+### 4.5 回滚触发机制
+
+**核心问题**：当回滚目标版本（4.11.18）与 status 中的实际版本（4.11.18）一致时，CVO 如何触发回滚执行？
+
+#### 4.5.1 关键对比：spec.desiredUpdate vs status.history
+
+**CVO 通过对比 `spec.desiredUpdate.version` 与 `status.history[0].version` 来判断是否需要执行升级/回滚**
+
+```
+升级前：
+  spec.desiredUpdate.version: 4.11.18
+  status.history[0].version: 4.11.18
+  status.history[0].state: Completed
+  → 一致，无需操作
+
+升级到 4.12.0：
+  spec.desiredUpdate.version: 4.12.0  ← 用户设置目标
+  status.history[0].version: 4.12.0
+  status.history[0].state: Partial    ← 升级中
+  → 目标与当前尝试版本一致，继续升级
+
+升级失败触发回滚：
+  spec.desiredUpdate.version: 4.11.18 ← CVO 修改为目标
+  status.history[0].version: 4.12.0   ← 失败的版本
+  status.history[0].state: RolledBack ← 标记为已回滚
+  → 目标 (4.11.18) != 当前尝试 (4.12.0)，触发回滚
+
+回滚执行中：
+  spec.desiredUpdate.version: 4.11.18
+  status.history[0].version: 4.12.0   ← 已标记为 RolledBack
+  status.history[1].version: 4.11.18
+  status.history[1].state: Partial    ← 正在回滚到此版本
+  → 目标与回滚尝试版本一致，继续回滚
+
+回滚完成：
+  spec.desiredUpdate.version: 4.11.18
+  status.history[0].version: 4.12.0   ← RolledBack
+  status.history[1].version: 4.11.18
+  status.history[1].state: Completed  ← 回滚成功
+  → 一致，无需操作
+```
+
+#### 4.5.2 CVO 调谐循环逻辑
+
+```go
+func (cvo *ClusterVersionOperator) Reconcile() error {
+    cv := cvo.getClusterVersion()
+    
+    // 1. 获取期望版本
+    desiredVersion := cv.Spec.DesiredUpdate.Version
+    
+    // 2. 获取当前状态
+    currentHistory := cv.Status.History[0]
+    
+    // 3. 判断是否需要操作
+    if cvo.needsUpgradeOrRollback(desiredVersion, currentHistory) {
+        // 4. 执行升级或回滚
+        return cvo.executeUpgradeOrRollback(desiredVersion)
+    }
+    
+    return nil
+}
+
+func (cvo *ClusterVersionOperator) needsUpgradeOrRollback(
+    desiredVersion string,
+    currentHistory configv1.UpdateHistory,
+) bool {
+    // 情况 1: 当前版本与期望版本一致且已完成 → 无需操作
+    if currentHistory.Version == desiredVersion && 
+       currentHistory.State == configv1.CompletedUpdateState {
+        return false
+    }
+    
+    // 情况 2: 当前版本与期望版本不一致 → 需要升级或回滚
+    if currentHistory.Version != desiredVersion {
+        return true
+    }
+    
+    // 情况 3: 当前版本与期望版本一致但未完成 → 继续执行
+    if currentHistory.State == configv1.PartialUpdateState {
+        return true
+    }
+    
+    return false
+}
+```
+
+#### 4.5.3 回滚触发流程详解
+
+**步骤 1: 升级失败检测**
+
+```go
+func (cvo *ClusterVersionOperator) detectUpgradeFailure(cv *configv1.ClusterVersion) bool {
+    // 检查最新的升级记录
+    if len(cv.Status.History) == 0 {
+        return false
+    }
+    
+    latest := cv.Status.History[0]
+    
+    // 检查是否是失败的升级
+    if latest.State != configv1.PartialUpdateState {
+        return false
+    }
+    
+    // 检查是否超时
+    if time.Since(latest.StartedTime.Time) > cvo.upgradeTimeout {
+        return true
+    }
+    
+    // 检查 Operator 健康状态
+    for _, op := range cvo.getOperators() {
+        if !op.isHealthy() {
+            return true
+        }
+    }
+    
+    // 检查节点状态
+    for _, node := range cvo.getNodes() {
+        if !node.isReady() {
+            return true
+        }
+    }
+    
+    return false
+}
+```
+
+**步骤 2: 触发自动回滚**
+
+```go
+func (cvo *ClusterVersionOperator) handleUpgradeFailure(cv *configv1.ClusterVersion) error {
+    // 1. 检查是否启用自动回滚
+    if !cv.Spec.AutoRollback {
+        return fmt.Errorf("auto rollback disabled, manual intervention required")
+    }
+    
+    // 2. 获取回滚目标版本
+    rollbackVersion, err := cvo.GetRollbackTarget(cv)
+    if err != nil {
+        return err
+    }
+    
+    // 3. 标记当前升级为 RolledBack
+    cv.Status.History[0].State = configv1.RolledBackUpdateState
+    cv.Status.History[0].CompletionTime = &metav1.Time{Time: time.Now()}
+    
+    // 4. 设置回滚目标（关键步骤）
+    cv.Spec.DesiredUpdate = &configv1.Update{
+        Version: rollbackVersion,
+        Image:   cvo.getReleaseImage(rollbackVersion),
+    }
+    
+    // 5. 更新 ClusterVersion 对象
+    if err := cvo.client.Update(context.TODO(), cv); err != nil {
+        return err
+    }
+    
+    // 6. 发送事件
+    cvo.recorder.Eventf(cv, corev1.EventTypeWarning, "UpgradeFailed",
+        "Upgrade to %s failed, rolling back to %s",
+        cv.Status.History[0].Version, rollbackVersion)
+    
+    return nil
+}
+```
+
+**步骤 3: 回滚执行**
+
+```go
+func (cvo *ClusterVersionOperator) executeUpgradeOrRollback(targetVersion string) error {
+    cv := cvo.getClusterVersion()
+    
+    // 1. 检查是否是回滚（目标版本 < 当前版本）
+    isRollback := cvo.isRollback(targetVersion, cv.Status.History[0].Version)
+    
+    // 2. 创建新的升级/回滚记录
+    newHistory := configv1.UpdateHistory{
+        State:       configv1.PartialUpdateState,
+        Version:     targetVersion,
+        Image:       cvo.getReleaseImage(targetVersion),
+        StartedTime: metav1.Time{Time: time.Now()},
+    }
+    
+    // 3. 插入到历史记录开头
+    cv.Status.History = append([]configv1.UpdateHistory{newHistory}, cv.Status.History...)
+    
+    // 4. 更新状态
+    cv.Status.Desired.Version = targetVersion
+    cv.Status.Desired.Image = newHistory.Image
+    
+    // 5. 开始执行升级/回滚
+    if isRollback {
+        cvo.recorder.Eventf(cv, corev1.EventTypeNormal, "RollbackStarted",
+            "Starting rollback to %s", targetVersion)
+    } else {
+        cvo.recorder.Eventf(cv, corev1.EventTypeNormal, "UpgradeStarted",
+            "Starting upgrade to %s", targetVersion)
+    }
+    
+    // 6. 执行实际的升级/回滚操作
+    return cvo.performUpgradeOrRollback(targetVersion)
+}
+```
+
+#### 4.5.4 状态转换图
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     升级/回滚状态机                           │
+└─────────────────────────────────────────────────────────────┘
+
+状态 1: 稳定状态
+  spec.desiredUpdate.version = 4.11.18
+  status.history[0].version = 4.11.18
+  status.history[0].state = Completed
+  → CVO: 无需操作
+
+状态 2: 用户触发升级
+  spec.desiredUpdate.version = 4.12.0  ← 用户修改
+  status.history[0].version = 4.11.18
+  status.history[0].state = Completed
+  → CVO: 检测到不一致，开始升级
+
+状态 3: 升级进行中
+  spec.desiredUpdate.version = 4.12.0
+  status.history[0].version = 4.12.0
+  status.history[0].state = Partial
+  → CVO: 继续升级
+
+状态 4: 升级失败
+  spec.desiredUpdate.version = 4.12.0
+  status.history[0].version = 4.12.0
+  status.history[0].state = Partial
+  → CVO: 检测到失败，触发自动回滚
+
+状态 5: 触发回滚（关键转换）
+  spec.desiredUpdate.version = 4.11.18  ← CVO 修改
+  status.history[0].version = 4.12.0
+  status.history[0].state = RolledBack  ← 标记为已回滚
+  → CVO: 检测到不一致 (4.11.18 != 4.12.0)，开始回滚
+
+状态 6: 回滚进行中
+  spec.desiredUpdate.version = 4.11.18
+  status.history[0].version = 4.12.0 (RolledBack)
+  status.history[1].version = 4.11.18
+  status.history[1].state = Partial
+  → CVO: 继续回滚
+
+状态 7: 回滚完成
+  spec.desiredUpdate.version = 4.11.18
+  status.history[0].version = 4.12.0 (RolledBack)
+  status.history[1].version = 4.11.18
+  status.history[1].state = Completed
+  → CVO: 一致，无需操作
+```
+
+#### 4.5.5 关键洞察
+
+**回滚触发的本质是：`spec.desiredUpdate.version` 与 `status.history[0].version` 的不一致**
+
+| 场景 | spec.desiredUpdate | status.history[0] | 是否触发 |
+|------|-------------------|-------------------|---------|
+| 稳定状态 | 4.11.18 | 4.11.18 (Completed) | ❌ 否 |
+| 升级开始 | 4.12.0 | 4.11.18 (Completed) | ✅ 是 |
+| 升级中 | 4.12.0 | 4.12.0 (Partial) | ✅ 是（继续） |
+| 升级失败 | 4.12.0 | 4.12.0 (Partial) | ✅ 是（失败处理） |
+| **触发回滚** | **4.11.18** | **4.12.0 (RolledBack)** | **✅ 是** |
+| 回滚中 | 4.11.18 | 4.11.18 (Partial) | ✅ 是（继续） |
+| 回滚完成 | 4.11.18 | 4.11.18 (Completed) | ❌ 否 |
+
+**关键点**：
+1. 升级失败时，CVO 将 `status.history[0].state` 标记为 `RolledBack`
+2. CVO 修改 `spec.desiredUpdate.version` 为回滚目标版本（4.11.18）
+3. 此时 `spec.desiredUpdate.version (4.11.18)` != `status.history[0].version (4.12.0)`
+4. CVO 检测到不一致，触发回滚执行
+5. 回滚执行时，创建新的历史记录 `status.history[1]`，版本为 4.11.18
+
+### 4.6 完整回滚流程
 
 #### 4.4.1 手动回滚流程
 
