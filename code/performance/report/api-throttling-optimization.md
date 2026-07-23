@@ -257,13 +257,26 @@ Helm 的 install/upgrade/uninstall 操作每次都走这条路径。
 **配置优先级：**
 
 ```txt
-命令行标志 > 环境变量 > 默认值
+命令行标志 > 环境变量 > 配置文件 > 默认值
 
 示例：
 1. 命令行：--client-qps=100 --client-burst=200
 2. 环境变量：KUBE_CLIENT_QPS=80 KUBE_CLIENT_BURST=160
-3. 默认值：QPS=50, Burst=100
+3. 配置文件：/etc/bke/client-config.yaml (qps: 60, burst: 120)
+4. 默认值：QPS=50, Burst=100
 ```
+
+**配置文件支持：**
+
+通过 `--client-config-file` 参数指定配置文件路径（默认 `/etc/bke/client-config.yaml`），支持以下配置项：
+
+```yaml
+# BKE 客户端配置
+qps: 50      # Kubernetes 客户端 QPS
+burst: 100   # Kubernetes 客户端 Burst
+```
+
+配置文件通过 ConfigMap 挂载到 Pod，便于在 Kubernetes 环境中管理配置。
 
 #### 优化 2：动态 RESTMapper 缓存
 
@@ -1520,9 +1533,10 @@ gantt
 ##### 集中化 QPS/Burst 配置
 
 - 默认值：QPS=50，Burst=100
-- 配置优先级：命令行标志 > 环境变量 > 默认值
+- 配置优先级：命令行标志 > 环境变量 > 配置文件 > 默认值
 - 命令行标志：`--client-qps`、`--client-burst`
 - 环境变量：`KUBE_CLIENT_QPS`、`KUBE_CLIENT_Burst`
+- 配置文件：`/etc/bke/client-config.yaml`（通过 `--client-config-file` 指定）
 - 工厂层为唯一真实来源（`ApplyThrottlingConfig`），所有客户端创建必须经过工厂方法
 
 ##### 动态 RESTMapper 缓存
