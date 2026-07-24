@@ -3322,6 +3322,741 @@ var (
 
 这个兼容重构方案既采用了新设计的优势，又确保了与现有实现的兼容性，降低了迁移风险。
 
+## 十、重建集群方案
+
+### 10.1 重建集群的场景
+
+#### 10.1.1 触发条件
+
+重建集群是**最后的手段**，只在以下情况下使用：
+
+```mermaid
+graph TB
+    A[升级失败] --> B{可以回滚?}
+    B -->|是| C[执行回滚]
+    B -->|否| D{数据可恢复?}
+    D -->|是| E[从备份恢复]
+    D -->|否| F[重建集群]
+    
+    style F fill:#ff6b6b
+    style C fill:#4ecdc4
+    style E fill:#4ecdc4
+```
+
+**具体场景**：
+
+| 场景 | 描述 | 重建原因 |
+|------|------|---------|
+| **跨版本回滚失败** | 需要回滚多个版本，但逐步回滚也失败 | 数据结构不兼容 |
+| **etcd 数据损坏** | etcd 数据损坏且无法从快照恢复 | 控制面不可用 |
+| **证书完全过期** | 所有证书过期且无法续期 | 集群无法通信 |
+| **基础设施故障** | 底层基础设施（VM、网络、存储）故障 | 无法修复 |
+| **配置严重错误** | 配置错误导致集群无法启动 | 无法回滚 |
+
+#### 10.1.2 重建 vs 回滚的决策
+
+```go
+type RebuildDecision struct {
+    // ShouldRebuild 是否应该重建
+    ShouldRebuild bool
+    
+    // Reason 重建原因
+    Reason string
+    
+    // Alternatives 替代方案
+    Alternatives []string
+    
+    // DataLossRisk 数据丢失风险
+    DataLossRisk RiskLevel
+    
+    // EstimatedDowntime 预计停机时间
+    EstimatedDowntime time.Duration
+}
+
+type RiskLevel string
+
+const (
+    RiskLow    RiskLevel = "Low"
+    RiskMedium RiskLevel = "Medium"
+    RiskHigh   RiskLevel = "High"
+)
+
+func (cvo *ClusterVersionOperator) ShouldRebuildCluster(cv *ClusterVersion) *RebuildDecision {
+    // 检查是否可以回滚
+    if canRollback := cvo.canRollback(cv); canRollback {
+        return &RebuildDecision{
+            ShouldRebuild: false,
+            Reason:        "Can rollback to previous version",
+            Alternatives:  []string{"Rollback to " + cvo.getPreviousVersion(cv)},
+            DataLossRisk:  RiskLow,
+        }
+    }
+    
+    // 检查是否有备份
+    if hasBackup := cvo.hasValidBackup(cv); hasBackup {
+        return &RebuildDecision{
+            ShouldRebuild: false,
+            Reason:        "Can restore from backup",
+            Alternatives:  []string{"Restore from latest backup"},
+            DataLossRisk:  RiskLow,
+        }
+    }
+    
+    // 必须重建
+    return &RebuildDecision{
+        ShouldRebuild: true,
+        Reason:        "Cannot rollback or restore",
+        Alternatives:  []string{"Rebuild cluster from scratch"},
+        DataLossRisk:  RiskHigh,
+        EstimatedDowntime: 2 * time.Hour,
+    }
+}
+```
+
+### 10.2 重建前的准备工作
+
+#### 10.2.1 数据备份清单
+
+**必须备份的数据**：
+
+```yaml
+# 备份清单
+backupChecklist:
+  # 1. etcd 数据
+  etcd:
+    - snapshot: "etcd-snapshot-$(date +%Y%m%d-%H%M%S).db"
+      command: "etcdctl snapshot save"
+      location: "/backup/etcd/"
+      
+  # 2. Kubernetes 资源
+  kubernetes:
+    - all-namespaces: true
+      command: "kubectl get all --all-namespaces -o yaml"
+      location: "/backup/k8s-resources/"
+      
+  # 3. ConfigMaps 和 Secrets
+  configs:
+    - configmaps: true
+      secrets: true
+      command: "kubectl get cm,secret --all-namespaces -o yaml"
+      location: "/backup/configs/"
+      
+  # 4. Persistent Volumes
+  pv:
+    - persistentVolumes: true
+      persistentVolumeClaims: true
+      command: "kubectl get pv,pvc --all-namespaces -o yaml"
+      location: "/backup/pv/"
+      
+  # 5. 应用数据
+  application:
+    - databases: true
+      files: true
+      command: "application-specific-backup"
+      location: "/backup/application/"
+```
+
+#### 10.2.2 备份脚本
+
+```bash
+#!/bin/bash
+# backup-before-rebuild.sh
+
+set -e
+
+BACKUP_DIR="/backup/rebuild-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$BACKUP_DIR"
+
+echo "Starting backup to $BACKUP_DIR..."
+
+# 1. 备份 etcd
+echo "Backing up etcd..."
+etcdctl snapshot save "$BACKUP_DIR/etcd-snapshot.db" \
+  --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt \
+  --key=/etc/kubernetes/pki/etcd/healthcheck-client.key
+
+# 2. 备份所有 Kubernetes 资源
+echo "Backing up Kubernetes resources..."
+kubectl get all --all-namespaces -o yaml > "$BACKUP_DIR/all-resources.yaml"
+
+# 3. 备份 ConfigMaps 和 Secrets
+echo "Backing up ConfigMaps and Secrets..."
+kubectl get cm,secret --all-namespaces -o yaml > "$BACKUP_DIR/configs-secrets.yaml"
+
+# 4. 备份 PV 和 PVC
+echo "Backing up Persistent Volumes..."
+kubectl get pv,pvc --all-namespaces -o yaml > "$BACKUP_DIR/pv-pvc.yaml"
+
+# 5. 备份 ClusterVersion
+echo "Backing up ClusterVersion..."
+kubectl get clusterversion version -o yaml > "$BACKUP_DIR/clusterversion.yaml"
+
+# 6. 备份所有 CRD
+echo "Backing up CRDs..."
+kubectl get crd -o yaml > "$BACKUP_DIR/crds.yaml"
+
+# 7. 备份所有自定义资源
+echo "Backing up custom resources..."
+for crd in $(kubectl get crd -o jsonpath='{.items[*].metadata.name}'); do
+    kubectl get "$crd" --all-namespaces -o yaml > "$BACKUP_DIR/cr-$crd.yaml" 2>/dev/null || true
+done
+
+echo "Backup completed: $BACKUP_DIR"
+ls -lh "$BACKUP_DIR"
+```
+
+#### 10.2.3 备份验证
+
+```bash
+#!/bin/bash
+# verify-backup.sh
+
+BACKUP_DIR="$1"
+
+if [ -z "$BACKUP_DIR" ]; then
+    echo "Usage: $0 <backup-dir>"
+    exit 1
+fi
+
+echo "Verifying backup in $BACKUP_DIR..."
+
+# 1. 验证 etcd 快照
+echo "Verifying etcd snapshot..."
+etcdctl snapshot status "$BACKUP_DIR/etcd-snapshot.db" --write-out=table
+
+# 2. 验证 Kubernetes 资源文件
+echo "Verifying Kubernetes resources..."
+if [ -f "$BACKUP_DIR/all-resources.yaml" ]; then
+    echo "✓ all-resources.yaml exists"
+    wc -l "$BACKUP_DIR/all-resources.yaml"
+else
+    echo "✗ all-resources.yaml missing"
+    exit 1
+fi
+
+# 3. 验证配置文件
+echo "Verifying configs..."
+if [ -f "$BACKUP_DIR/configs-secrets.yaml" ]; then
+    echo "✓ configs-secrets.yaml exists"
+else
+    echo "✗ configs-secrets.yaml missing"
+    exit 1
+fi
+
+echo "Backup verification completed"
+```
+
+### 10.3 重建流程
+
+#### 10.3.1 自动化重建流程
+
+```mermaid
+sequenceDiagram
+    participant Admin as 管理员
+    participant Tool as 重建工具
+    participant Infra as 基础设施
+    participant K8s as Kubernetes
+    participant App as 应用
+    
+    Admin->>Tool: 触发重建
+    Tool->>Tool: 验证备份
+    Tool->>Infra: 销毁旧集群
+    Infra-->>Tool: 销毁完成
+    Tool->>Infra: 创建新集群
+    Infra-->>Tool: 集群就绪
+    Tool->>K8s: 恢复 Kubernetes 资源
+    K8s-->>Tool: 资源恢复完成
+    Tool->>App: 恢复应用数据
+    App-->>Tool: 应用恢复完成
+    Tool->>Tool: 验证集群
+    Tool-->>Admin: 重建完成
+```
+
+#### 10.3.2 重建工具设计
+
+```go
+type ClusterRebuilder struct {
+    client          client.Client
+    infraProvider   InfrastructureProvider
+    backupManager   *BackupManager
+    config          RebuildConfig
+}
+
+type RebuildConfig struct {
+    // ClusterName 集群名称
+    ClusterName string
+    
+    // TargetVersion 目标版本
+    TargetVersion string
+    
+    // BackupPath 备份路径
+    BackupPath string
+    
+    // RestoreData 是否恢复数据
+    RestoreData bool
+    
+    // RestoreConfigs 是否恢复配置
+    RestoreConfigs bool
+    
+    // DryRun 是否干运行
+    DryRun bool
+}
+
+type InfrastructureProvider interface {
+    // DestroyCluster 销毁集群
+    DestroyCluster(ctx context.Context, clusterName string) error
+    
+    // CreateCluster 创建集群
+    CreateCluster(ctx context.Context, config ClusterConfig) error
+    
+    // WaitForReady 等待集群就绪
+    WaitForReady(ctx context.Context, clusterName string) error
+}
+
+func (r *ClusterRebuilder) Rebuild(ctx context.Context) error {
+    // 1. 验证备份
+    if err := r.validateBackup(); err != nil {
+        return fmt.Errorf("backup validation failed: %w", err)
+    }
+    
+    // 2. 销毁旧集群
+    if !r.config.DryRun {
+        if err := r.infraProvider.DestroyCluster(ctx, r.config.ClusterName); err != nil {
+            return fmt.Errorf("destroy cluster failed: %w", err)
+        }
+    }
+    
+    // 3. 创建新集群
+    clusterConfig := ClusterConfig{
+        Name:    r.config.ClusterName,
+        Version: r.config.TargetVersion,
+    }
+    
+    if !r.config.DryRun {
+        if err := r.infraProvider.CreateCluster(ctx, clusterConfig); err != nil {
+            return fmt.Errorf("create cluster failed: %w", err)
+        }
+    }
+    
+    // 4. 等待集群就绪
+    if !r.config.DryRun {
+        if err := r.infraProvider.WaitForReady(ctx, r.config.ClusterName); err != nil {
+            return fmt.Errorf("wait for ready failed: %w", err)
+        }
+    }
+    
+    // 5. 恢复 Kubernetes 资源
+    if r.config.RestoreConfigs {
+        if err := r.restoreKubernetesResources(ctx); err != nil {
+            return fmt.Errorf("restore k8s resources failed: %w", err)
+        }
+    }
+    
+    // 6. 恢复应用数据
+    if r.config.RestoreData {
+        if err := r.restoreApplicationData(ctx); err != nil {
+            return fmt.Errorf("restore application data failed: %w", err)
+        }
+    }
+    
+    // 7. 验证集群
+    if err := r.validateCluster(ctx); err != nil {
+        return fmt.Errorf("cluster validation failed: %w", err)
+    }
+    
+    return nil
+}
+```
+
+#### 10.3.3 手动重建步骤
+
+```bash
+#!/bin/bash
+# manual-rebuild.sh
+
+set -e
+
+CLUSTER_NAME="my-cluster"
+TARGET_VERSION="4.11.0"
+BACKUP_DIR="/backup/rebuild-20240115-100000"
+
+echo "=== Manual Cluster Rebuild ==="
+echo "Cluster: $CLUSTER_NAME"
+echo "Target Version: $TARGET_VERSION"
+echo "Backup: $BACKUP_DIR"
+echo ""
+
+# 步骤 1: 确认备份
+echo "Step 1: Verify backup"
+ls -lh "$BACKUP_DIR"
+read -p "Backup verified? (y/n) " -n 1 -r
+echo
+if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    exit 1
+fi
+
+# 步骤 2: 销毁旧集群
+echo ""
+echo "Step 2: Destroy old cluster"
+read -p "Destroy cluster $CLUSTER_NAME? (y/n) " -n 1 -r
+echo
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    openshift-install destroy cluster --dir="$CLUSTER_NAME"
+    echo "Cluster destroyed"
+fi
+
+# 步骤 3: 创建新集群
+echo ""
+echo "Step 3: Create new cluster"
+cat > install-config.yaml <<EOF
+apiVersion: v1
+metadata:
+  name: $CLUSTER_NAME
+baseDomain: example.com
+controlPlane:
+  replicas: 3
+compute:
+- replicas: 3
+platform:
+  aws:
+    region: us-west-2
+EOF
+
+openshift-install create cluster --dir="$CLUSTER_NAME"
+echo "Cluster created"
+
+# 步骤 4: 配置 kubectl
+echo ""
+echo "Step 4: Configure kubectl"
+export KUBECONFIG="$CLUSTER_NAME/auth/kubeconfig"
+kubectl cluster-info
+
+# 步骤 5: 恢复 Kubernetes 资源
+echo ""
+echo "Step 5: Restore Kubernetes resources"
+read -p "Restore Kubernetes resources? (y/n) " -n 1 -r
+echo
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    kubectl apply -f "$BACKUP_DIR/all-resources.yaml"
+    echo "Resources restored"
+fi
+
+# 步骤 6: 恢复配置
+echo ""
+echo "Step 6: Restore configs and secrets"
+read -p "Restore configs and secrets? (y/n) " -n 1 -r
+echo
+if [[ $REPLY =~ ^[Yy]$ ]]; then
+    kubectl apply -f "$BACKUP_DIR/configs-secrets.yaml"
+    echo "Configs restored"
+fi
+
+# 步骤 7: 验证集群
+echo ""
+echo "Step 7: Validate cluster"
+kubectl get nodes
+kubectl get pods --all-namespaces
+
+echo ""
+echo "=== Rebuild Completed ==="
+```
+
+### 10.4 重建后的恢复
+
+#### 10.4.1 恢复 Kubernetes 资源
+
+```bash
+#!/bin/bash
+# restore-k8s-resources.sh
+
+BACKUP_DIR="$1"
+
+if [ -z "$BACKUP_DIR" ]; then
+    echo "Usage: $0 <backup-dir>"
+    exit 1
+fi
+
+echo "Restoring Kubernetes resources from $BACKUP_DIR..."
+
+# 1. 恢复 Namespace
+echo "Restoring namespaces..."
+kubectl apply -f "$BACKUP_DIR/all-resources.yaml" --selector='kind=Namespace'
+
+# 2. 恢复 ConfigMaps
+echo "Restoring ConfigMaps..."
+kubectl apply -f "$BACKUP_DIR/configs-secrets.yaml" --selector='kind=ConfigMap'
+
+# 3. 恢复 Secrets
+echo "Restoring Secrets..."
+kubectl apply -f "$BACKUP_DIR/configs-secrets.yaml" --selector='kind=Secret'
+
+# 4. 恢复 Services
+echo "Restoring Services..."
+kubectl apply -f "$BACKUP_DIR/all-resources.yaml" --selector='kind=Service'
+
+# 5. 恢复 Deployments
+echo "Restoring Deployments..."
+kubectl apply -f "$BACKUP_DIR/all-resources.yaml" --selector='kind=Deployment'
+
+# 6. 恢复 StatefulSets
+echo "Restoring StatefulSets..."
+kubectl apply -f "$BACKUP_DIR/all-resources.yaml" --selector='kind=StatefulSet'
+
+# 7. 恢复 DaemonSets
+echo "Restoring DaemonSets..."
+kubectl apply -f "$BACKUP_DIR/all-resources.yaml" --selector='kind=DaemonSet'
+
+echo "Kubernetes resources restored"
+```
+
+#### 10.4.2 恢复应用数据
+
+```bash
+#!/bin/bash
+# restore-application-data.sh
+
+BACKUP_DIR="$1"
+
+if [ -z "$BACKUP_DIR" ]; then
+    echo "Usage: $0 <backup-dir>"
+    exit 1
+fi
+
+echo "Restoring application data from $BACKUP_DIR..."
+
+# 1. 恢复数据库
+echo "Restoring databases..."
+if [ -f "$BACKUP_DIR/database-dump.sql" ]; then
+    kubectl exec -it deployment/mysql -- mysql -u root -p < "$BACKUP_DIR/database-dump.sql"
+    echo "Database restored"
+fi
+
+# 2. 恢复文件
+echo "Restoring files..."
+if [ -d "$BACKUP_DIR/files" ]; then
+    kubectl cp "$BACKUP_DIR/files" default/file-server:/data
+    echo "Files restored"
+fi
+
+# 3. 恢复 Persistent Volumes
+echo "Restoring Persistent Volumes..."
+kubectl apply -f "$BACKUP_DIR/pv-pvc.yaml"
+echo "PV/PVC restored"
+
+echo "Application data restored"
+```
+
+#### 10.4.3 验证恢复
+
+```bash
+#!/bin/bash
+# verify-restoration.sh
+
+echo "=== Verifying Restoration ==="
+
+# 1. 检查节点状态
+echo "Checking nodes..."
+kubectl get nodes
+if [ $(kubectl get nodes --no-headers | wc -l) -lt 3 ]; then
+    echo "✗ Not enough nodes"
+    exit 1
+fi
+echo "✓ Nodes OK"
+
+# 2. 检查 Pod 状态
+echo "Checking pods..."
+kubectl get pods --all-namespaces | grep -v Running | grep -v Completed
+if [ $? -eq 0 ]; then
+    echo "✗ Some pods not running"
+    exit 1
+fi
+echo "✓ Pods OK"
+
+# 3. 检查服务
+echo "Checking services..."
+kubectl get svc --all-namespaces
+echo "✓ Services OK"
+
+# 4. 检查应用
+echo "Checking applications..."
+kubectl get deployments --all-namespaces
+echo "✓ Applications OK"
+
+# 5. 检查数据
+echo "Checking data..."
+# 应用特定的数据验证
+echo "✓ Data OK"
+
+echo ""
+echo "=== Restoration Verified ==="
+```
+
+### 10.5 重建最佳实践
+
+#### 10.5.1 重建前检查清单
+
+```yaml
+# rebuild-checklist.yaml
+preRebuildChecklist:
+  - name: "备份验证"
+    checks:
+      - "etcd 快照完整"
+      - "Kubernetes 资源文件完整"
+      - "配置文件完整"
+      - "应用数据备份完整"
+      
+  - name: "环境准备"
+    checks:
+      - "基础设施可用"
+      - "网络连通性正常"
+      - "存储空间充足"
+      - "证书和密钥就绪"
+      
+  - name: "人员准备"
+    checks:
+      - "运维团队就位"
+      - "开发团队待命"
+      - "管理层知情"
+      - "用户已通知"
+      
+  - name: "回滚准备"
+    checks:
+      - "回滚方案已准备"
+      - "回滚脚本已测试"
+      - "回滚时间窗口已确认"
+```
+
+#### 10.5.2 重建时间估算
+
+```go
+type RebuildTimeline struct {
+    // Backup 备份时间
+    Backup time.Duration
+    
+    // Destroy 销毁时间
+    Destroy time.Duration
+    
+    // Create 创建时间
+    Create time.Duration
+    
+    // RestoreK8s 恢复 Kubernetes 资源时间
+    RestoreK8s time.Duration
+    
+    // RestoreData 恢复应用数据时间
+    RestoreData time.Duration
+    
+    // Validate 验证时间
+    Validate time.Duration
+    
+    // Total 总时间
+    Total time.Duration
+}
+
+func EstimateRebuildTime(clusterSize int, dataSizeGB int) *RebuildTimeline {
+    timeline := &RebuildTimeline{
+        Backup:      30 * time.Minute,
+        Destroy:     15 * time.Minute,
+        Create:      45 * time.Minute,
+        RestoreK8s:  20 * time.Minute,
+        RestoreData: time.Duration(dataSizeGB) * 2 * time.Minute,
+        Validate:    15 * time.Minute,
+    }
+    
+    timeline.Total = timeline.Backup + timeline.Destroy + timeline.Create + 
+                     timeline.RestoreK8s + timeline.RestoreData + timeline.Validate
+    
+    return timeline
+}
+
+// 示例：100GB 数据的重建时间
+// Backup: 30m
+// Destroy: 15m
+// Create: 45m
+// RestoreK8s: 20m
+// RestoreData: 200m (100GB * 2m/GB)
+// Validate: 15m
+// Total: 325m ≈ 5.4 小时
+```
+
+#### 10.5.3 风险控制
+
+```yaml
+# risk-mitigation.yaml
+risks:
+  - name: "数据丢失"
+    probability: "Medium"
+    impact: "High"
+    mitigation:
+      - "多次备份验证"
+      - "备份到多个位置"
+      - "备份加密"
+      
+  - name: "重建失败"
+    probability: "Low"
+    impact: "High"
+    mitigation:
+      - "先在测试环境验证"
+      - "准备回滚方案"
+      - "分阶段重建"
+      
+  - name: "停机时间过长"
+    probability: "Medium"
+    impact: "Medium"
+    mitigation:
+      - "提前通知用户"
+      - "选择低峰期重建"
+      - "准备应急方案"
+      
+  - name: "资源不足"
+    probability: "Low"
+    impact: "Medium"
+    mitigation:
+      - "提前检查资源"
+      - "预留额外资源"
+      - "准备扩容方案"
+```
+
+### 10.6 总结
+
+#### 10.6.1 重建 vs 回滚对比
+
+| 维度 | 回滚 | 重建 |
+|------|------|------|
+| **时间** | 30 分钟 - 2 小时 | 2 - 6 小时 |
+| **数据丢失** | 无 | 可能丢失 |
+| **复杂度** | 低 | 高 |
+| **风险** | 低 | 高 |
+| **适用场景** | 相邻版本回滚 | 跨版本或严重故障 |
+
+#### 10.6.2 决策流程
+
+```mermaid
+graph TD
+    A[升级失败] --> B{可以回滚?}
+    B -->|是| C[执行回滚]
+    B -->|否| D{有备份?}
+    D -->|是| E{备份有效?}
+    E -->|是| F[从备份恢复]
+    E -->|否| G[重建集群]
+    D -->|否| G
+    
+    style C fill:#4ecdc4
+    style F fill:#4ecdc4
+    style G fill:#ff6b6b
+```
+
+#### 10.6.3 最佳实践
+
+1. **定期备份**：每天自动备份，每周验证备份
+2. **备份验证**：在测试环境验证备份可恢复
+3. **重建演练**：每季度进行一次重建演练
+4. **文档完善**：详细记录重建步骤和注意事项
+5. **团队培训**：确保运维团队熟悉重建流程
+
+重建集群是最后的手段，应该尽量避免。通过完善的备份策略和回滚机制，可以最大程度减少重建的需求。
+
 ---
 
-**报告完成**。此报告基于 OpenShift 4.x 架构和 BKE 代码分析，提供了完整的集群安装与扩容回滚能力洞察。
+**报告完成**。此报告基于 OpenShift 4.x 架构和 BKE 代码分析，提供了完整的集群安装与扩容回滚能力洞察，包括重建集群的完整方案。
