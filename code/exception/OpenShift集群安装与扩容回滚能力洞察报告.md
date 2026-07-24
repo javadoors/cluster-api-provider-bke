@@ -1042,6 +1042,200 @@ func (cvo *ClusterVersionOperator) compareVersions(desired, current string) Acti
 | 手动回滚 | 4.11.0 | 4.11.18 | 4.11.0 < 4.11.18 | `ActionRollback` |
 | 跨版本升级 | 4.13.0 | 4.11.18 | 4.13.0 > 4.11.18 | `ActionUpgrade` |
 
+**问题 1: current 是如何获取的？**
+
+`current` 版本是从 `status.history` 中获取的，但具体获取逻辑取决于 `history[0].state`：
+
+```go
+func (cvo *ClusterVersionOperator) getCurrentVersion(cv *configv1.ClusterVersion) string {
+    if len(cv.Status.History) == 0 {
+        return ""
+    }
+    
+    latest := cv.Status.History[0]
+    
+    // 情况 1: 最新记录是 Completed 状态
+    // → 直接使用其 version 作为 current
+    if latest.State == configv1.CompletedUpdateState {
+        return latest.Version
+    }
+    
+    // 情况 2: 最新记录是 Partial 状态（升级中或失败）
+    // → 需要查找上一个 Completed 记录作为 current
+    if latest.State == configv1.PartialUpdateState {
+        // 遍历 history，找到第一个 Completed 记录
+        for i := 1; i < len(cv.Status.History); i++ {
+            if cv.Status.History[i].State == configv1.CompletedUpdateState {
+                return cv.Status.History[i].Version
+            }
+        }
+    }
+    
+    // 情况 3: 最新记录是 RolledBack 状态
+    // → 查找下一个 Completed 记录作为 current
+    if latest.State == configv1.RolledBackUpdateState {
+        for i := 1; i < len(cv.Status.History); i++ {
+            if cv.Status.History[i].State == configv1.CompletedUpdateState {
+                return cv.Status.History[i].Version
+            }
+        }
+    }
+    
+    return ""
+}
+```
+
+**升级成功时的 history 变化**：
+
+```
+升级前：
+  history[0] = {state: Completed, version: 4.11.18}  ← current = 4.11.18
+
+升级开始：
+  history[0] = {state: Partial, version: 4.12.0}     ← 新记录插入
+  history[1] = {state: Completed, version: 4.11.18}  ← 原记录后移
+  → current = history[1].version = 4.11.18（保持不变）
+
+升级成功：
+  history[0] = {state: Completed, version: 4.12.0}   ← state 更新为 Completed
+  history[1] = {state: Completed, version: 4.11.18}
+  → current = history[0].version = 4.12.0（更新为新版本）
+```
+
+**升级失败时的 history 变化**：
+
+```
+升级前：
+  history[0] = {state: Completed, version: 4.11.18}  ← current = 4.11.18
+
+升级开始：
+  history[0] = {state: Partial, version: 4.12.0}
+  history[1] = {state: Completed, version: 4.11.18}
+  → current = history[1].version = 4.11.18（保持不变）
+
+升级失败：
+  history[0] = {state: Partial, version: 4.12.0}     ← state 保持为 Partial
+  history[1] = {state: Completed, version: 4.11.18}
+  → current = history[1].version = 4.11.18（仍保持不变）
+```
+
+**关键结论**：
+
+| 场景 | history[0].state | current 来源 | current 值 |
+|------|------------------|-------------|-----------|
+| 稳定状态 | `Completed` | `history[0].version` | 当前运行版本 |
+| 升级中 | `Partial` | `history[1].version`（第一个 Completed） | 升级前版本 |
+| 升级失败 | `Partial` | `history[1].version`（第一个 Completed） | 升级前版本 |
+| 回滚中 | `Partial` | `history[1].version`（第一个 Completed） | 回滚目标版本 |
+
+**问题 2: RolledBack 状态记录是什么？**
+
+`RolledBack` 是 OpenShift 4.14+ 引入的特殊状态，用于标记**已回滚的升级记录**。
+
+**UpdateState 完整定义**：
+
+```go
+type UpdateState string
+
+const (
+    // CompletedUpdateState 表示升级已成功完成
+    CompletedUpdateState UpdateState = "Completed"
+    
+    // PartialUpdateState 表示升级正在进行或部分完成
+    // 包括：升级中、升级失败、回滚中
+    PartialUpdateState UpdateState = "Partial"
+    
+    // RolledBackUpdateState 表示升级失败并已回滚
+    // 这是一个终态，表示该升级尝试已被放弃
+    RolledBackUpdateState UpdateState = "RolledBack"
+)
+```
+
+**RolledBack 的含义**：
+
+1. **标记失败的升级**：将失败的升级记录标记为 `RolledBack`，表示该升级尝试已结束
+2. **保留审计历史**：即使升级失败，也保留完整的升级历史记录
+3. **区分回滚决策**：`completionTime` 记录回滚决策时间，而非回滚完成时间
+4. **触发回滚执行**：标记后创建新的 `Partial` 记录，开始执行回滚
+
+**RolledBack 的设置时机**：
+
+```go
+func (cvo *ClusterVersionOperator) markAsRolledBack(cv *configv1.ClusterVersion) {
+    // 检查 history[0] 是否为失败的升级
+    if len(cv.Status.History) == 0 {
+        return
+    }
+    
+    latest := cv.Status.History[0]
+    
+    // 只有 Partial 状态的记录才能被标记为 RolledBack
+    if latest.State != configv1.PartialUpdateState {
+        return
+    }
+    
+    // 检查是否确实失败（Failing condition 为 True）
+    isFailed := false
+    for _, cond := range cv.Status.Conditions {
+        if cond.Type == "Failing" && cond.Status == metav1.ConditionTrue {
+            isFailed = true
+            break
+        }
+    }
+    
+    if !isFailed {
+        return
+    }
+    
+    // 标记为 RolledBack
+    cv.Status.History[0].State = configv1.RolledBackUpdateState
+    cv.Status.History[0].CompletionTime = &metav1.Time{Time: time.Now()}
+    
+    // 发送事件
+    cvo.recorder.Eventf(cv, corev1.EventTypeWarning, "UpgradeRolledBack",
+        "Upgrade to %s failed and has been rolled back",
+        latest.Version)
+}
+```
+
+**RolledBack 的完整生命周期**：
+
+```
+T0: 升级到 4.12.0 开始
+    history[0] = {state: Partial, version: 4.12.0}
+
+T1: 升级失败
+    history[0] = {state: Partial, version: 4.12.0}
+    conditions = [{type: Failing, status: True}]
+
+T2: CVO 检测到失败，触发自动回滚
+    history[0] = {state: RolledBack, version: 4.12.0, completionTime: T2}  ← 标记为 RolledBack
+    history[1] = {state: Partial, version: 4.11.18}                        ← 创建回滚记录
+
+T3: 回滚执行中
+    history[0] = {state: RolledBack, version: 4.12.0}
+    history[1] = {state: Partial, version: 4.11.18}
+
+T4: 回滚完成
+    history[0] = {state: RolledBack, version: 4.12.0}
+    history[1] = {state: Completed, version: 4.11.18, completionTime: T4}
+```
+
+**RolledBack 与 Partial 的区别**：
+
+| 状态 | 含义 | completionTime | 是否终态 |
+|------|------|----------------|---------|
+| `Partial` | 升级进行中或失败 | 无 | 否（可转换） |
+| `RolledBack` | 升级失败并已回滚 | 有（回滚决策时间） | 是（不可转换） |
+| `Completed` | 升级成功完成 | 有（完成时间） | 是（不可转换） |
+
+**为什么需要 RolledBack 状态？**
+
+1. **保留完整历史**：即使升级失败，也保留记录用于审计和问题排查
+2. **区分状态**：区分"正在进行的升级"（Partial）和"已回滚的升级"（RolledBack）
+3. **记录决策时间**：`completionTime` 记录回滚决策时间，便于追踪回滚原因
+4. **触发回滚**：标记后创建新的 `Partial` 记录，开始执行回滚
+
 **判断方法 2: 历史记录推断（辅助方法）**
 
 当版本相同时（`desired == current`），CVO 通过检查历史记录推断操作类型：
