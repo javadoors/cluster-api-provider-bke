@@ -2082,6 +2082,458 @@ type RollbackCondition struct {
 3. **升级失败**：实现自动回滚，参考 OpenShift 的 `AutoRollback` 设计
 4. **状态管理**：完善 `UpgradeHistory`，记录完整的升级/回滚历史
 
+## 八、优化状态设计方案
+
+### 8.1 当前设计的问题分析
+
+#### 8.1.1 状态转换过于复杂
+
+```mermaid
+graph LR
+    A[Accepted] --> B[Partial]
+    B --> C{结果}
+    C -->|成功| D[Completed]
+    C -->|失败| E[RolledBack]
+    E --> F[Partial]
+    F --> G[Completed]
+```
+
+**问题**：
+- `RolledBack` 既是终态，又需要创建新的回滚记录
+- 状态转换路径不清晰
+- 需要同时管理 history 数组和 state 字段
+
+#### 8.1.2 history 数组管理复杂
+
+```go
+// current 获取逻辑复杂
+func getCurrentVersion(cv *ClusterVersion) string {
+    latest := cv.Status.History[0]
+    
+    if latest.State == CompletedUpdateState {
+        return latest.Version
+    }
+    
+    if latest.State == PartialUpdateState {
+        for i := 1; i < len(cv.Status.History); i++ {
+            if cv.Status.History[i].State == CompletedUpdateState {
+                return cv.Status.History[i].Version
+            }
+        }
+    }
+    
+    if latest.State == RolledBackUpdateState {
+        for i := 1; i < len(cv.Status.History); i++ {
+            if cv.Status.History[i].State == CompletedUpdateState {
+                return cv.Status.History[i].Version
+            }
+        }
+    }
+    
+    return ""
+}
+```
+
+**问题**：
+- 需要遍历 history 数组
+- 不同状态的获取逻辑不同
+- 容易出错
+
+#### 8.1.3 状态语义不清晰
+
+| 状态 | 问题 |
+|------|------|
+| `Partial` | 既表示"升级中"，又表示"升级失败"，又表示"回滚中" |
+| `RolledBack` | 既表示"已回滚"，又需要创建新的回滚记录 |
+| `Completed` | 既表示"升级成功"，又表示"回滚成功" |
+
+#### 8.1.4 回滚失败场景处理复杂
+
+```yaml
+# 回滚失败时的状态
+status:
+  history:
+  - state: RolledBack              # 失败的升级记录
+    version: "4.12.0"
+  
+  - state: Partial                 # 失败的回滚记录
+    version: "4.11.18"
+  
+  conditions:
+  - type: Failing
+    status: "True"
+    reason: RollbackFailed
+```
+
+**问题**：
+- 状态不一致
+- 需要人工干预
+- 难以自动恢复
+
+### 8.2 新的状态设计方案
+
+#### 8.2.1 设计原则
+
+1. **分离关注点**：将"操作状态"和"版本状态"分离
+2. **简化状态转换**：减少状态数量，明确状态语义
+3. **独立审计日志**：使用独立的审计日志记录所有操作
+4. **清晰的 current**：使用单一字段表示当前版本
+
+#### 8.2.2 核心设计
+
+##### 1. 状态字段设计
+
+```go
+type ClusterVersionStatus struct {
+    // CurrentVersion 当前稳定运行的版本
+    CurrentVersion string `json:"currentVersion"`
+    
+    // DesiredVersion 期望的目标版本
+    DesiredVersion string `json:"desiredVersion"`
+    
+    // OperationState 当前操作状态
+    OperationState OperationState `json:"operationState"`
+    
+    // AuditLog 审计日志（独立于状态）
+    AuditLog []AuditRecord `json:"auditLog"`
+    
+    // Conditions 状态条件
+    Conditions []metav1.Condition `json:"conditions"`
+}
+```
+
+##### 2. 操作状态设计
+
+```go
+type OperationState string
+
+const (
+    // OperationIdle 空闲状态，无操作进行中
+    OperationIdle OperationState = "Idle"
+    
+    // OperationUpgrading 正在升级
+    OperationUpgrading OperationState = "Upgrading"
+    
+    // OperationRollingBack 正在回滚
+    OperationRollingBack OperationState = "RollingBack"
+    
+    // OperationFailed 操作失败（升级或回滚失败）
+    OperationFailed OperationState = "Failed"
+)
+```
+
+**状态语义**：
+
+| 状态 | 含义 | 是否终态 |
+|------|------|---------|
+| `Idle` | 无操作，集群稳定 | 是 |
+| `Upgrading` | 正在升级到新版本 | 否 |
+| `RollingBack` | 正在回滚到旧版本 | 否 |
+| `Failed` | 操作失败，需要人工干预 | 是 |
+
+##### 3. 审计日志设计
+
+```go
+type AuditRecord struct {
+    // ID 唯一标识符
+    ID string `json:"id"`
+    
+    // OperationType 操作类型
+    OperationType OperationType `json:"operationType"`
+    
+    // FromVersion 操作前版本
+    FromVersion string `json:"fromVersion"`
+    
+    // ToVersion 操作后版本
+    ToVersion string `json:"toVersion"`
+    
+    // Status 操作状态
+    Status OperationStatus `json:"status"`
+    
+    // StartedAt 开始时间
+    StartedAt metav1.Time `json:"startedAt"`
+    
+    // CompletedAt 完成时间
+    CompletedAt *metav1.Time `json:"completedAt,omitempty"`
+    
+    // ErrorMessage 错误信息
+    ErrorMessage string `json:"errorMessage,omitempty"`
+    
+    // Metadata 元数据
+    Metadata map[string]string `json:"metadata,omitempty"`
+}
+
+type OperationType string
+
+const (
+    OperationTypeUpgrade    OperationType = "Upgrade"
+    OperationTypeRollback   OperationType = "Rollback"
+)
+
+type OperationStatus string
+
+const (
+    OperationStatusPending    OperationStatus = "Pending"
+    OperationStatusInProgress OperationStatus = "InProgress"
+    OperationStatusSucceeded  OperationStatus = "Succeeded"
+    OperationStatusFailed     OperationStatus = "Failed"
+)
+```
+
+##### 4. 状态转换设计
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    
+    Idle --> Upgrading : 用户触发升级
+    Idle --> RollingBack : 用户触发回滚
+    
+    Upgrading --> Idle : 升级成功
+    Upgrading --> RollingBack : 升级失败
+    
+    RollingBack --> Idle : 回滚成功
+    RollingBack --> Failed : 回滚失败
+    
+    Failed --> Idle : 人工修复
+```
+
+**状态转换规则**：
+
+| 当前状态 | 触发条件 | 目标状态 | 操作 |
+|---------|---------|---------|------|
+| `Idle` | 用户触发升级 | `Upgrading` | 创建审计记录，开始升级 |
+| `Idle` | 用户触发回滚 | `RollingBack` | 创建审计记录，开始回滚 |
+| `Upgrading` | 升级成功 | `Idle` | 更新 currentVersion，标记审计记录成功 |
+| `Upgrading` | 升级失败 | `RollingBack` | 创建回滚审计记录，开始回滚 |
+| `RollingBack` | 回滚成功 | `Idle` | 标记审计记录成功 |
+| `RollingBack` | 回滚失败 | `Failed` | 标记审计记录失败，需要人工干预 |
+| `Failed` | 人工修复 | `Idle` | 清除错误状态 |
+
+##### 5. 版本管理设计
+
+```go
+type ClusterVersionStatus struct {
+    // CurrentVersion 当前稳定运行的版本
+    // 只有在操作成功完成后才更新
+    CurrentVersion string `json:"currentVersion"`
+    
+    // DesiredVersion 期望的目标版本
+    // 用户设置的目标版本
+    DesiredVersion string `json:"desiredVersion"`
+    
+    // PendingVersion 待生效的版本
+    // 在操作进行中，表示即将生效的版本
+    PendingVersion string `json:"pendingVersion,omitempty"`
+}
+```
+
+**版本状态**：
+
+| 字段 | 含义 | 更新时机 |
+|------|------|---------|
+| `CurrentVersion` | 当前稳定版本 | 操作成功后 |
+| `DesiredVersion` | 期望目标版本 | 用户设置时 |
+| `PendingVersion` | 待生效版本 | 操作开始时 |
+
+**示例**：
+
+```yaml
+# 升级中
+status:
+  currentVersion: "4.11.18"    # 仍在运行旧版本
+  desiredVersion: "4.12.0"     # 目标版本
+  pendingVersion: "4.12.0"     # 待生效版本
+  operationState: "Upgrading"
+
+# 升级成功
+status:
+  currentVersion: "4.12.0"     # 已更新为新版本
+  desiredVersion: "4.12.0"
+  pendingVersion: ""           # 已清空
+  operationState: "Idle"
+
+# 升级失败，开始回滚
+status:
+  currentVersion: "4.11.18"    # 仍为旧版本
+  desiredVersion: "4.12.0"     # 仍为目标版本
+  pendingVersion: "4.11.18"    # 回滚目标
+  operationState: "RollingBack"
+
+# 回滚成功
+status:
+  currentVersion: "4.11.18"    # 保持旧版本
+  desiredVersion: "4.11.18"    # 更新为目标版本
+  pendingVersion: ""           # 已清空
+  operationState: "Idle"
+```
+
+##### 6. 审计日志示例
+
+```yaml
+status:
+  auditLog:
+  - id: "upgrade-001"
+    operationType: "Upgrade"
+    fromVersion: "4.11.18"
+    toVersion: "4.12.0"
+    status: "Failed"
+    startedAt: "2024-01-15T10:00:00Z"
+    completedAt: "2024-01-15T10:45:00Z"
+    errorMessage: "Operator health check failed"
+  
+  - id: "rollback-001"
+    operationType: "Rollback"
+    fromVersion: "4.12.0"
+    toVersion: "4.11.18"
+    status: "Succeeded"
+    startedAt: "2024-01-15T11:00:00Z"
+    completedAt: "2024-01-15T12:00:00Z"
+```
+
+### 8.3 新设计的优势
+
+#### 8.3.1 简化状态转换
+
+| 对比项 | 旧设计 | 新设计 |
+|--------|--------|--------|
+| 状态数量 | 4 个（Accepted, Partial, Completed, RolledBack） | 4 个（Idle, Upgrading, RollingBack, Failed） |
+| 状态语义 | 复杂（Partial 有多种含义） | 清晰（每个状态有明确含义） |
+| 转换路径 | 复杂（需要多次转换） | 简单（直接转换） |
+
+#### 8.3.2 简化版本管理
+
+| 对比项 | 旧设计 | 新设计 |
+|--------|--------|--------|
+| current 获取 | 需要遍历 history 数组 | 直接读取 currentVersion 字段 |
+| 版本状态 | 分散在 history 数组中 | 集中在 status 字段中 |
+| 版本一致性 | 需要手动维护 | 自动维护 |
+
+#### 8.3.3 独立的审计日志
+
+| 对比项 | 旧设计 | 新设计 |
+|--------|--------|--------|
+| 历史记录 | 与状态混合 | 独立存储 |
+| 查询历史 | 需要解析 history 数组 | 直接查询审计日志 |
+| 审计能力 | 有限 | 完整（支持任意查询） |
+
+#### 8.3.4 清晰的错误处理
+
+| 对比项 | 旧设计 | 新设计 |
+|--------|--------|--------|
+| 错误状态 | 分散在多个状态中 | 统一的 Failed 状态 |
+| 错误恢复 | 需要人工判断 | 明确的恢复路径 |
+| 错误信息 | 分散在 conditions 中 | 集中在审计日志中 |
+
+### 8.4 实现示例
+
+#### 8.4.1 升级流程
+
+```go
+func (cvo *ClusterVersionOperator) StartUpgrade(targetVersion string) error {
+    cv := cvo.getClusterVersion()
+    
+    // 1. 检查当前状态
+    if cv.Status.OperationState != OperationIdle {
+        return fmt.Errorf("cannot start upgrade: operation in progress")
+    }
+    
+    // 2. 创建审计记录
+    auditRecord := AuditRecord{
+        ID:            generateID(),
+        OperationType: OperationTypeUpgrade,
+        FromVersion:   cv.Status.CurrentVersion,
+        ToVersion:     targetVersion,
+        Status:        OperationStatusInProgress,
+        StartedAt:     metav1.Now(),
+    }
+    
+    // 3. 更新状态
+    cv.Status.DesiredVersion = targetVersion
+    cv.Status.PendingVersion = targetVersion
+    cv.Status.OperationState = OperationUpgrading
+    cv.Status.AuditLog = append(cv.Status.AuditLog, auditRecord)
+    
+    // 4. 保存
+    return cvo.client.Status().Update(context.TODO(), cv)
+}
+
+func (cvo *ClusterVersionOperator) CompleteUpgrade(success bool, errMsg string) error {
+    cv := cvo.getClusterVersion()
+    
+    // 1. 更新审计记录
+    lastAudit := &cv.Status.AuditLog[len(cv.Status.AuditLog)-1]
+    lastAudit.CompletedAt = &metav1.Time{Time: time.Now()}
+    
+    if success {
+        // 2. 升级成功
+        lastAudit.Status = OperationStatusSucceeded
+        cv.Status.CurrentVersion = cv.Status.DesiredVersion
+        cv.Status.PendingVersion = ""
+        cv.Status.OperationState = OperationIdle
+    } else {
+        // 3. 升级失败，开始回滚
+        lastAudit.Status = OperationStatusFailed
+        lastAudit.ErrorMessage = errMsg
+        cv.Status.OperationState = OperationRollingBack
+        cv.Status.PendingVersion = cv.Status.CurrentVersion
+        
+        // 4. 创建回滚审计记录
+        rollbackAudit := AuditRecord{
+            ID:            generateID(),
+            OperationType: OperationTypeRollback,
+            FromVersion:   cv.Status.DesiredVersion,
+            ToVersion:     cv.Status.CurrentVersion,
+            Status:        OperationStatusInProgress,
+            StartedAt:     metav1.Now(),
+        }
+        cv.Status.AuditLog = append(cv.Status.AuditLog, rollbackAudit)
+    }
+    
+    return cvo.client.Status().Update(context.TODO(), cv)
+}
+```
+
+#### 8.4.2 查询当前版本
+
+```go
+// 新设计：直接读取
+func getCurrentVersion(cv *ClusterVersion) string {
+    return cv.Status.CurrentVersion
+}
+
+// 旧设计：需要遍历
+func getCurrentVersionOld(cv *ClusterVersion) string {
+    latest := cv.Status.History[0]
+    
+    if latest.State == CompletedUpdateState {
+        return latest.Version
+    }
+    
+    if latest.State == PartialUpdateState {
+        for i := 1; i < len(cv.Status.History); i++ {
+            if cv.Status.History[i].State == CompletedUpdateState {
+                return cv.Status.History[i].Version
+            }
+        }
+    }
+    
+    // ... 更多逻辑
+    return ""
+}
+```
+
+### 8.5 总结
+
+新设计的核心优势：
+
+1. **简化状态转换**：4 个状态，语义清晰，转换路径简单
+2. **简化版本管理**：直接读取 currentVersion，无需遍历
+3. **独立审计日志**：完整的操作历史，支持任意查询
+4. **清晰的错误处理**：统一的 Failed 状态，明确的恢复路径
+
+这个设计更适合从头实现，避免了 OpenShift 历史包袱带来的复杂性。
+
 ---
 
 **报告完成**。此报告基于 OpenShift 4.x 架构和 BKE 代码分析，提供了完整的集群安装与扩容回滚能力洞察。
