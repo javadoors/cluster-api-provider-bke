@@ -1333,7 +1333,105 @@ history 数组变化：
 | `Partial` | 升级失败 | `Partial` | 保持 `history[0].state = Partial` |
 | `Partial` | 触发回滚 | `RolledBack` | 更新 `history[0].state = RolledBack`，插入 `history[1] = {Partial, rollback}` |
 | `RolledBack` | 回滚成功 | `Completed` | 更新 `history[1].state = Completed` |
+| `RolledBack` | 回滚失败 | `Partial` | 保持 `history[1].state = Partial`（需要人工干预） |
 | `Completed` | 用户设置新 desired | `Partial` | 插入新 `history[0] = {Partial, desired}` |
+
+**回滚失败的场景分析**：
+
+**场景：升级失败后，回滚也失败**
+
+```
+T0: 升级到 4.12.0 开始
+    history[0] = {state: Partial, version: 4.12.0, startedTime: T0}
+
+T1: 升级失败
+    history[0] = {state: Partial, version: 4.12.0}
+    conditions = [{type: Failing, status: True}]
+
+T2: CVO 触发自动回滚到 4.11.18
+    history[0] = {state: RolledBack, version: 4.12.0, completionTime: T2}
+    history[1] = {state: Partial, version: 4.11.18, startedTime: T2}
+
+T3: 回滚也失败
+    history[0] = {state: RolledBack, version: 4.12.0}
+    history[1] = {state: Partial, version: 4.11.18}  ← 保持为 Partial
+    conditions = [{type: Failing, status: True}]
+```
+
+**回滚失败时的状态**：
+
+```yaml
+status:
+  history:
+  - state: RolledBack              # 失败的升级记录
+    version: "4.12.0"
+    startedTime: "2024-01-15T10:00:00Z"
+    completionTime: "2024-01-15T11:00:00Z"  # 回滚决策时间
+  
+  - state: Partial                 # 回滚失败，保持为 Partial
+    version: "4.11.18"
+    startedTime: "2024-01-15T11:00:00Z"
+    # 没有 completionTime，因为回滚未完成
+  
+  - state: Completed               # 上一个稳定版本
+    version: "4.11.18"
+    startedTime: "2023-12-01T08:00:00Z"
+    completionTime: "2023-12-01T09:30:00Z"
+  
+  conditions:
+  - type: Failing
+    status: "True"
+    reason: RollbackFailed
+    message: "Rollback to 4.11.18 failed: Operator health check failed"
+```
+
+**回滚失败时的集群状态**：
+
+| 维度 | 状态 | 说明 |
+|------|------|------|
+| **集群版本** | 不一致 | 可能处于 4.12.0 和 4.11.18 之间的混合状态 |
+| **current 值** | `4.11.18` | 从 `history[2]`（第一个 Completed）获取 |
+| **desired 值** | `4.11.18` | 回滚目标版本 |
+| **集群健康** | 不健康 | `Failing=True`，需要人工干预 |
+| **CVO 行为** | 持续重试 | CVO 会持续尝试修复，但可能无法成功 |
+
+**回滚失败的处理方式**：
+
+1. **人工干预**：需要集群管理员手动介入
+   ```bash
+   # 检查集群状态
+   oc get clusterversion version -o yaml
+   
+   # 查看失败原因
+   oc describe clusterversion version
+   
+   # 尝试手动回滚
+   oc adm upgrade --to=4.11.18 --allow-not-recommended --force
+   ```
+
+2. **强制回滚**：使用 `--force` 标志强制执行回滚
+   ```bash
+   oc adm upgrade --to=4.11.18 --allow-explicit-upgrade --force
+   ```
+
+3. **重建集群**：如果回滚无法成功，可能需要重建集群
+   ```bash
+   # 备份数据
+   # 销毁集群
+   openshift-install destroy cluster
+   # 重新安装
+   openshift-install create cluster
+   ```
+
+**关键结论**：
+
+| 场景 | history[0].state | history[1].state | 集群状态 | 处理方式 |
+|------|------------------|------------------|---------|---------|
+| 升级成功 | `Completed` | `Completed` | 健康 | 无需处理 |
+| 升级失败 | `Partial` | `Completed` | 不健康 | CVO 自动重试或触发回滚 |
+| 回滚中 | `RolledBack` | `Partial` | 不健康 | 等待回滚完成 |
+| **回滚失败** | `RolledBack` | `Partial` | **严重不健康** | **需要人工干预** |
+| 回滚成功 | `RolledBack` | `Completed` | 健康 | 无需处理 |
 
 **current 值在不同状态下的含义**：
 
