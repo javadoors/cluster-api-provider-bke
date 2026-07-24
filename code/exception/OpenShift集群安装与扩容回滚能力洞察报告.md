@@ -909,8 +909,11 @@ func (cvo *ClusterVersionOperator) Reconcile() error {
     
     // 3. 判断是否需要操作
     if cvo.needsUpgradeOrRollback(desiredVersion, currentHistory) {
-        // 4. 执行升级或回滚
-        return cvo.executeUpgradeOrRollback(desiredVersion)
+        // 4. 判断是升级还是回滚
+        actionType := cvo.determineActionType(desiredVersion, currentHistory)
+        
+        // 5. 执行升级或回滚
+        return cvo.executeUpgradeOrRollback(desiredVersion, actionType)
     }
     
     return nil
@@ -938,9 +941,180 @@ func (cvo *ClusterVersionOperator) needsUpgradeOrRollback(
     
     return false
 }
+
+// determineActionType 判断是升级还是回滚
+func (cvo *ClusterVersionOperator) determineActionType(
+    desiredVersion string,
+    currentHistory configv1.UpdateHistory,
+) ActionType {
+    currentVersion := currentHistory.Version
+    
+    // 情况 1: 版本相同，继续当前操作
+    if currentVersion == desiredVersion {
+        if currentHistory.State == configv1.PartialUpdateState {
+            // 检查是否有 RolledBack 标记
+            // 如果有，说明是回滚操作
+            return cvo.inferActionFromHistory(currentHistory)
+        }
+        return ActionUpgrade // 默认是升级
+    }
+    
+    // 情况 2: 版本不同，通过版本比较判断
+    return cvo.compareVersions(desiredVersion, currentVersion)
+}
+
+// compareVersions 通过版本比较判断是升级还是回滚
+func (cvo *ClusterVersionOperator) compareVersions(desired, current string) ActionType {
+    // 使用语义化版本比较
+    desiredSemver, err := semver.Parse(desired)
+    if err != nil {
+        return ActionUpgrade // 解析失败，默认升级
+    }
+    
+    currentSemver, err := semver.Parse(current)
+    if err != nil {
+        return ActionUpgrade // 解析失败，默认升级
+    }
+    
+    // 版本比较
+    if desiredSemver.GT(currentSemver) {
+        return ActionUpgrade   // desired > current → 升级
+    } else if desiredSemver.LT(currentSemver) {
+        return ActionRollback  // desired < current → 回滚
+    }
+    
+    return ActionUpgrade // 版本相同，默认升级
+}
+
+// inferActionFromHistory 从历史记录推断操作类型
+func (cvo *ClusterVersionOperator) inferActionFromHistory(history configv1.UpdateHistory) ActionType {
+    // 检查 history 中是否有 RolledBack 状态的记录
+    // 如果有，说明当前操作是回滚
+    
+    // 查找最近的 RolledBack 记录
+    for _, h := range cvo.getClusterVersion().Status.History {
+        if h.State == configv1.RolledBackUpdateState {
+            return ActionRollback
+        }
+    }
+    
+    return ActionUpgrade
+}
+
+type ActionType string
+
+const (
+    ActionUpgrade   ActionType = "Upgrade"
+    ActionRollback  ActionType = "Rollback"
+)
 ```
 
-#### 4.5.3 回滚触发流程详解
+#### 4.5.3 升级与回滚的判断逻辑
+
+**核心问题**：当 `spec.desiredUpdate.version != status.history[0].version` 时，如何判断是执行升级还是回滚？
+
+**判断方法 1: 版本比较（主要方法）**
+
+CVO 通过比较版本号的大小来判断操作类型：
+
+```go
+func (cvo *ClusterVersionOperator) compareVersions(desired, current string) ActionType {
+    // 使用语义化版本（Semantic Versioning）比较
+    desiredSemver, _ := semver.Parse(desired)
+    currentSemver, _ := semver.Parse(current)
+    
+    if desiredSemver.GT(currentSemver) {
+        return ActionUpgrade   // 4.12.0 > 4.11.18 → 升级
+    } else if desiredSemver.LT(currentSemver) {
+        return ActionRollback  // 4.11.18 < 4.12.0 → 回滚
+    }
+    
+    return ActionUpgrade
+}
+```
+
+**版本比较示例**：
+
+| 场景 | desired | current | 比较结果 | 操作类型 |
+|------|---------|---------|---------|---------|
+| 正常升级 | 4.12.0 | 4.11.18 | 4.12.0 > 4.11.18 | `ActionUpgrade` |
+| 自动回滚 | 4.11.18 | 4.12.0 | 4.11.18 < 4.12.0 | `ActionRollback` |
+| 手动回滚 | 4.11.0 | 4.11.18 | 4.11.0 < 4.11.18 | `ActionRollback` |
+| 跨版本升级 | 4.13.0 | 4.11.18 | 4.13.0 > 4.11.18 | `ActionUpgrade` |
+
+**判断方法 2: 历史记录推断（辅助方法）**
+
+当版本相同时（`desired == current`），CVO 通过检查历史记录推断操作类型：
+
+```go
+func (cvo *ClusterVersionOperator) inferActionFromHistory(history configv1.UpdateHistory) ActionType {
+    // 检查是否有 RolledBack 状态的记录
+    for _, h := range cvo.getClusterVersion().Status.History {
+        if h.State == configv1.RolledBackUpdateState {
+            return ActionRollback  // 有 RolledBack 记录 → 回滚
+        }
+    }
+    return ActionUpgrade
+}
+```
+
+**判断方法 3: 升级图验证（安全校验）**
+
+CVO 在执行操作前会验证目标版本是否在升级图中：
+
+```go
+func (cvo *ClusterVersionOperator) validateUpgradePath(desired, current string) error {
+    // 检查目标版本是否在官方升级图中
+    if !cvo.isVersionInUpgradeGraph(desired) {
+        return fmt.Errorf("version %s not in upgrade graph", desired)
+    }
+    
+    // 检查是否允许从 current 升级到 desired
+    if !cvo.isUpgradeAllowed(current, desired) {
+        return fmt.Errorf("upgrade from %s to %s not allowed", current, desired)
+    }
+    
+    return nil
+}
+```
+
+**完整的判断流程**：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│              CVO 判断升级/回滚的完整流程                       │
+└─────────────────────────────────────────────────────────────┘
+
+步骤 1: 检查是否需要操作
+  └─ desired == current && state == Completed → 无需操作
+  └─ desired != current → 需要操作
+  
+步骤 2: 判断操作类型
+  ├─ 方法 1: 版本比较（主要）
+  │   └─ desired > current → ActionUpgrade
+  │   └─ desired < current → ActionRollback
+  │
+  ├─ 方法 2: 历史记录推断（辅助）
+  │   └─ 有 RolledBack 记录 → ActionRollback
+  │   └─ 无 RolledBack 记录 → ActionUpgrade
+  │
+  └─ 方法 3: 升级图验证（安全）
+      └─ 目标版本不在升级图中 → 拒绝操作
+      └─ 不允许的路径 → 拒绝操作
+  
+步骤 3: 执行操作
+  └─ ActionUpgrade → 执行升级流程
+  └─ ActionRollback → 执行回滚流程
+```
+
+**关键洞察**：
+
+1. **版本比较是主要方法**：通过语义化版本比较，`desired > current` 为升级，`desired < current` 为回滚
+2. **历史记录是辅助方法**：当版本相同时，通过检查 `RolledBack` 状态推断操作类型
+3. **升级图是安全校验**：确保操作路径在官方支持的范围内
+4. **强制标志可覆盖**：用户可以通过 `--force` 标志强制执行不支持的操作
+
+#### 4.5.4 回滚触发流程详解
 
 **步骤 1: 升级失败检测**
 
