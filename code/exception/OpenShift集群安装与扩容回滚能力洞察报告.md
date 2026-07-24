@@ -205,6 +205,7 @@ type UpdateHistory struct {
     // - Completed: 升级成功完成
     // - Partial: 升级进行中或部分完成
     // - Accepted: 升级已被接受但尚未开始
+    // - RolledBack: 升级失败并已回滚（OpenShift 4.14+）
     State UpdateState `json:"state"`
     
     // version 是目标版本
@@ -216,7 +217,10 @@ type UpdateHistory struct {
     // startedTime 是升级开始时间
     StartedTime metav1.Time `json:"startedTime"`
     
-    // completionTime 是升级完成时间（仅当 state=Completed 时）
+    // completionTime 是升级完成时间
+    // - state=Completed 时：升级成功完成时间
+    // - state=RolledBack 时：回滚决策时间（非回滚完成时间）
+    // - state=Partial 时：不存在
     CompletionTime *metav1.Time `json:"completionTime,omitempty"`
     
     // verified 表示发布镜像是否已验证
@@ -229,11 +233,111 @@ type UpdateHistory struct {
 type UpdateState string
 
 const (
+    // CompletedUpdateState 表示升级已成功完成
     CompletedUpdateState UpdateState = "Completed"
-    PartialUpdateState   UpdateState = "Partial"
-    AcceptedUpdateState  UpdateState = "Accepted"
+    
+    // PartialUpdateState 表示升级正在进行或部分完成
+    // 包括：升级中、升级失败、回滚中
+    PartialUpdateState UpdateState = "Partial"
+    
+    // AcceptedUpdateState 表示升级已被接受但尚未开始
+    AcceptedUpdateState UpdateState = "Accepted"
+    
+    // RolledBackUpdateState 表示升级失败并已回滚（OpenShift 4.14+）
+    // 这是一个终态，表示该升级尝试已被放弃
+    RolledBackUpdateState UpdateState = "RolledBack"
 )
 ```
+
+**回滚记录的字段设计**：
+
+**1. state 字段**
+
+回滚记录有两种形态：
+
+| 形态 | state 值 | 含义 | 是否终态 |
+|------|---------|------|---------|
+| **失败的升级记录** | `RolledBack` | 该升级尝试失败并已回滚 | 是（不可转换） |
+| **回滚执行记录** | `Partial` → `Completed` | 正在执行回滚 → 回滚完成 | 否 → 是 |
+
+**2. completionTime 字段**
+
+`completionTime` 在不同状态下的含义：
+
+| state | completionTime | 含义 |
+|-------|----------------|------|
+| `Completed` | 升级成功完成时间 | 升级流程结束时间 |
+| `RolledBack` | 回滚决策时间 | CVO 决定回滚的时间点 |
+| `Partial` | 不存在 | 操作尚未完成 |
+
+**3. version 字段**
+
+回滚记录中的 `version` 字段含义：
+
+| 记录类型 | version 含义 | 示例 |
+|---------|-------------|------|
+| 失败的升级记录 | 失败的升级目标版本 | `4.12.0`（升级失败） |
+| 回滚执行记录 | 回滚目标版本 | `4.11.18`（回滚到此版本） |
+
+**4. 回滚记录的完整字段说明**
+
+```yaml
+# 失败的升级记录（标记为 RolledBack）
+- state: RolledBack              # 状态：已回滚
+  version: "4.12.0"              # 失败的升级目标版本
+  image: "quay.io/.../4.12.0"    # 失败的发布镜像
+  startedTime: "2024-01-15T10:00:00Z"      # 升级开始时间
+  completionTime: "2024-01-15T11:00:00Z"   # 回滚决策时间
+  verified: true                 # 镜像已验证
+  acceptedRisks: ""              # 无接受的风险
+
+# 回滚执行记录
+- state: Completed               # 状态：回滚完成
+  version: "4.11.18"             # 回滚目标版本
+  image: "quay.io/.../4.11.18"   # 回滚使用的镜像
+  startedTime: "2024-01-15T11:00:00Z"      # 回滚开始时间
+  completionTime: "2024-01-15T12:00:00Z"   # 回滚完成时间
+  verified: true                 # 镜像已验证
+  acceptedRisks: ""              # 无接受的风险
+```
+
+**5. 回滚记录与升级记录的对比**
+
+| 字段 | 升级记录 | 回滚记录（失败） | 回滚记录（执行） |
+|------|---------|-----------------|-----------------|
+| `state` | `Completed` | `RolledBack` | `Partial` → `Completed` |
+| `version` | 升级目标版本 | 失败的升级目标版本 | 回滚目标版本 |
+| `image` | 升级镜像 | 失败的升级镜像 | 回滚镜像 |
+| `startedTime` | 升级开始时间 | 升级开始时间 | 回滚开始时间 |
+| `completionTime` | 升级完成时间 | 回滚决策时间 | 回滚完成时间 |
+| `verified` | 是否验证 | 是否验证 | 是否验证 |
+
+**6. 回滚记录的创建时机**
+
+```
+T0: 升级到 4.12.0 开始
+    创建升级记录：history[0] = {state: Partial, version: 4.12.0, startedTime: T0}
+
+T1: 升级失败
+    升级记录保持：history[0] = {state: Partial, version: 4.12.0}
+
+T2: CVO 触发自动回滚
+    修改升级记录：history[0] = {state: RolledBack, version: 4.12.0, completionTime: T2}
+    创建回滚记录：history[1] = {state: Partial, version: 4.11.18, startedTime: T2}
+
+T3: 回滚执行中
+    回滚记录保持：history[1] = {state: Partial, version: 4.11.18}
+
+T4: 回滚完成
+    更新回滚记录：history[1] = {state: Completed, version: 4.11.18, completionTime: T4}
+```
+
+**7. 回滚记录的关键设计点**
+
+1. **分离失败记录和回滚记录**：失败的升级记录标记为 `RolledBack`，回滚执行创建新记录
+2. **completionTime 的双重含义**：对于 `RolledBack` 记录，`completionTime` 是回滚决策时间；对于 `Completed` 记录，是完成时间
+3. **保留完整历史**：即使升级失败，也保留完整的升级历史记录，便于审计和问题排查
+4. **版本一致性**：回滚记录的 `version` 字段指向回滚目标版本，而非失败的升级版本
 
 #### 4.3.2 升级历史示例
 
