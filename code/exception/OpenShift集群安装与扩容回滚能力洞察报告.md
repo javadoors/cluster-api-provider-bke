@@ -1128,6 +1128,120 @@ func (cvo *ClusterVersionOperator) getCurrentVersion(cv *configv1.ClusterVersion
 | 升级失败 | `Partial` | `history[1].version`（第一个 Completed） | 升级前版本 |
 | 回滚中 | `Partial` | `history[1].version`（第一个 Completed） | 回滚目标版本 |
 
+**current 获取的设计思路**：
+
+**设计原则 1: current 表示"当前稳定运行的版本"**
+
+`current` 的核心语义是**当前稳定运行的版本**，而不是"最新尝试的版本"。这决定了获取逻辑：
+
+- `Completed` 状态表示该版本已稳定运行 → 可以作为 current
+- `Partial` 状态表示该版本正在升级中或失败 → 不能作为 current
+- `RolledBack` 状态表示该版本已被放弃 → 不能作为 current
+
+**设计原则 2: 升级过程中 current 保持不变**
+
+在升级过程中，虽然 `history[0]` 是新版本（Partial 状态），但集群实际仍在运行旧版本。因此：
+
+- 升级开始前：`current = 4.11.18`（旧版本）
+- 升级过程中：`current = 4.11.18`（仍为旧版本，因为新版本尚未稳定）
+- 升级成功后：`current = 4.12.0`（新版本已稳定）
+
+**设计原则 3: 通过查找第一个 Completed 记录确定 current**
+
+无论 `history[0]` 是什么状态，`current` 总是从 `history` 中查找第一个 `Completed` 状态的记录。这确保了：
+
+- 升级中：`history[0] = Partial (4.12.0)`，`history[1] = Completed (4.11.18)` → `current = 4.11.18`
+- 升级失败：`history[0] = Partial (4.12.0)`，`history[1] = Completed (4.11.18)` → `current = 4.11.18`
+- 回滚中：`history[0] = Partial (4.11.18)`，`history[1] = RolledBack (4.12.0)`，`history[2] = Completed (4.11.18)` → `current = 4.11.18`
+
+**设计原则 4: current 用于版本比较判断操作类型**
+
+`current` 的主要用途是与 `desired` 进行版本比较，判断是升级还是回滚：
+
+```go
+if desired > current {
+    return ActionUpgrade   // 升级到更高版本
+} else if desired < current {
+    return ActionRollback  // 回滚到更低版本
+}
+```
+
+**整体状态转换图**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        ClusterVersion 状态机                                 │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+                              ┌──────────────┐
+                              │   Accepted   │  ← 用户设置 desiredUpdate
+                              └──────┬───────┘
+                                     │
+                                     │ 创建 Partial 记录
+                                     ▼
+                              ┌──────────────┐
+                    ┌────────│    Partial    │────────┐
+                    │        │  (升级中/失败) │        │
+                    │        └──────┬───────┘        │
+                    │               │                │
+          升级成功  │      升级失败  │                │ 用户取消
+                    │               │                │
+                    ▼               ▼                ▼
+             ┌────────────┐  ┌────────────┐  ┌────────────┐
+             │  Completed │  │ RolledBack │  │  Partial   │
+             │  (成功)    │  │  (已回滚)  │  │  (回滚中)  │
+             └────────────┘  └─────┬──────┘  └─────┬──────┘
+                                   │               │
+                                   │ 创建回滚记录   │ 回滚成功
+                                   ▼               │
+                            ┌────────────┐         │
+                            │  Partial   │◄────────┘
+                            │  (回滚中)  │
+                            └─────┬──────┘
+                                  │
+                          回滚成功 │
+                                  ▼
+                           ┌────────────┐
+                           │  Completed │
+                           │  (成功)    │
+                           └────────────┘
+
+状态说明：
+- Accepted:     用户设置 desiredUpdate，等待 CVO 处理
+- Partial:      升级/回滚正在进行，或升级失败等待处理
+- Completed:    升级/回滚已成功完成（终态）
+- RolledBack:   升级失败并已标记为回滚（终态）
+
+history 数组变化：
+- Accepted → Partial:     在 history[0] 插入新记录
+- Partial → Completed:    更新 history[0].state = Completed
+- Partial → RolledBack:   更新 history[0].state = RolledBack，插入新 Partial 记录
+- RolledBack → Partial:   在 history[1] 插入回滚记录
+- Partial → Completed:    更新 history[1].state = Completed
+```
+
+**状态转换规则**：
+
+| 当前状态 | 触发条件 | 目标状态 | history 变化 |
+|---------|---------|---------|-------------|
+| `Accepted` | CVO 开始处理 | `Partial` | 插入 `history[0] = {Partial, desired}` |
+| `Partial` | 升级成功 | `Completed` | 更新 `history[0].state = Completed` |
+| `Partial` | 升级失败 | `Partial` | 保持 `history[0].state = Partial` |
+| `Partial` | 触发回滚 | `RolledBack` | 更新 `history[0].state = RolledBack`，插入 `history[1] = {Partial, rollback}` |
+| `RolledBack` | 回滚成功 | `Completed` | 更新 `history[1].state = Completed` |
+| `Completed` | 用户设置新 desired | `Partial` | 插入新 `history[0] = {Partial, desired}` |
+
+**current 值在不同状态下的含义**：
+
+| 状态 | history 示例 | current 值 | 含义 |
+|------|-------------|-----------|------|
+| `Completed` | `[{Completed, 4.11.18}]` | `4.11.18` | 当前稳定运行的版本 |
+| `Partial` (升级中) | `[{Partial, 4.12.0}, {Completed, 4.11.18}]` | `4.11.18` | 仍在运行旧版本 |
+| `Partial` (升级失败) | `[{Partial, 4.12.0}, {Completed, 4.11.18}]` | `4.11.18` | 仍在运行旧版本 |
+| `RolledBack` | `[{RolledBack, 4.12.0}, {Partial, 4.11.18}, {Completed, 4.11.18}]` | `4.11.18` | 正在回滚到旧版本 |
+| `Partial` (回滚中) | `[{RolledBack, 4.12.0}, {Partial, 4.11.18}, {Completed, 4.11.18}]` | `4.11.18` | 正在回滚到旧版本 |
+| `Completed` (回滚完成) | `[{RolledBack, 4.12.0}, {Completed, 4.11.18}, {Completed, 4.11.18}]` | `4.11.18` | 已回滚到旧版本 |
+
 **问题 2: RolledBack 状态记录是什么？**
 
 `RolledBack` 是 OpenShift 4.14+ 引入的特殊状态，用于标记**已回滚的升级记录**。
