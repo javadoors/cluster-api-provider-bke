@@ -1,4 +1,8 @@
-# ensure_addon_deploy.go业务流程梳理。
+# ensure_addon_deploy.go业务流程梳理
+
+> 只处理安装，升级在ManifestApply里
+>
+
 ## EnsureAddonDeploy 业务流程梳理
 ### 一、整体定位
 [ensure_addon_deploy.go](file:///d:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_addon_deploy.go) 负责在**集群控制平面就绪后**，向目标集群**部署/更新/升级/删除 Addon（扩展组件）**。它通过比较 Spec 与 Status 中的 Addon 列表差异，计算出每个 Addon 的操作类型，然后逐一执行，并支持 Addon 的前置/后置自定义操作。
