@@ -1,4 +1,7 @@
-# ensure_agent_switch.go 业务流程梳理。
+# ensure_agent_switch.go 业务流程梳理
+agent连接的是管理集群，只有在引导集群安装管理集群时才会使用此phase。
+
+> 此phase不再使用
 ## EnsureAgentSwitch 业务流程梳理
 ### 一、整体定位
 [ensure_agent_switch.go](file:///d:/code/github/cluster-api-provider-bke/pkg/phaseframe/phases/ensure_agent_switch.go) 负责将 BKEAgent 的**监听集群**从管理集群切换到目标集群（BKECluster）。在集群创建初期，BKEAgent 监听管理集群接收命令；当集群部署完成后，需要将 Agent 切换为监听目标集群自身，使 Agent 能够独立于管理集群运行。
