@@ -1,4 +1,6 @@
 # `ensure_cluster_manage.go` 详细规格与特性
+
+> 通过管理集群安装的业务集群，直接就纳管。此功能针对通过bke安装的集群，但不是通过管理集群安装的集群。
           
 ## `ensure_cluster_manage.go` 详细规格与特性及流程
 
