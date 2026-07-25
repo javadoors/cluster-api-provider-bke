@@ -2138,6 +2138,689 @@ kubectl logs -n bke-system deployment/bke-controller-manager | grep "health chec
 | 集成测试 | `test/integration/health_check_test.go` | 新增 | 性能达标（< 1 分钟） |
 | 文档 | 配置说明、发布说明 | 新增 | 文档完整 |
 
+## 统一二进制健康检查机制
+
+### 问题分析
+
+当前健康检查机制的局限性：
+
+1. **只检查 Pod 组件**：etcd、kube-apiserver、calico-node 等
+2. **缺少二进制组件检查**：containerd、kubelet、bkeagent 等
+3. **检查方式不统一**：Pod 组件和二进制组件使用不同的检查逻辑
+
+### 二进制组件清单
+
+| 组件名称 | 组件类型 | 检查方式 | 优先级 |
+|---------|---------|---------|--------|
+| containerd | 二进制 | systemd 服务状态 | critical |
+| kubelet | 二进制 | systemd 服务状态 | critical |
+| bkeagent | 二进制 | systemd 服务状态 | critical |
+| etcd | 二进制/Pod | 根据部署方式 | critical |
+| docker | 二进制 | systemd 服务状态 | important（如果使用） |
+
+### 统一健康检查架构
+
+```mermaid
+graph TB
+    A[统一健康检查器<br/>UnifiedHealthChecker] --> B[Pod 组件检查]
+    A --> C[二进制组件检查]
+    
+    B --> D[etcd]
+    B --> E[kube-apiserver]
+    B --> F[calico-node]
+    B --> G[其他 Pod 组件]
+    
+    C --> H[containerd]
+    C --> I[kubelet]
+    C --> J[bkeagent]
+    C --> K[其他二进制组件]
+    
+    D --> L[HealthCheckError]
+    E --> L
+    F --> L
+    G --> L
+    H --> L
+    I --> L
+    J --> L
+    K --> L
+    
+    L --> M[聚合结果<br/>aggregateResult]
+```
+
+### 类型定义扩展
+
+```go
+// ComponentType 组件类型
+type ComponentType string
+
+const (
+    ComponentTypePod      ComponentType = "pod"
+    ComponentTypeBinary   ComponentType = "binary"
+)
+
+// BinaryCheckConfig 二进制组件检查配置
+type BinaryCheckConfig struct {
+    Name        ComponentName       `yaml:"name"`
+    Type        ComponentType       `yaml:"type"`        // binary
+    Priority    HealthCheckPriority `yaml:"priority"`
+    ServiceName string              `yaml:"serviceName"` // systemd 服务名称
+    CheckMethod string              `yaml:"checkMethod"` // systemd, http, tcp
+    Endpoint    string              `yaml:"endpoint"`    // HTTP/TCP 端点（可选）
+}
+
+// BinaryCheckResult 二进制组件检查结果
+type BinaryCheckResult struct {
+    Component ComponentInfo
+    IsHealthy bool
+    Reason    string // ServiceNotRunning, ServiceFailed, EndpointUnreachable
+    Details   string // 详细信息
+    CheckedAt time.Time
+}
+```
+
+### 配置扩展
+
+```yaml
+# /etc/bke/health-check-config.yaml
+components:
+  # Pod 组件（现有）
+  - name: etcd
+    type: pod
+    namespace: kube-system
+    prefixes: [etcd-]
+    priority: critical
+  
+  - name: kube-apiserver
+    type: pod
+    namespace: kube-system
+    prefixes: [kube-apiserver-]
+    priority: critical
+  
+  # 二进制组件（新增）
+  - name: containerd
+    type: binary
+    serviceName: containerd
+    checkMethod: systemd
+    priority: critical
+  
+  - name: kubelet
+    type: binary
+    serviceName: kubelet
+    checkMethod: systemd
+    priority: critical
+  
+  - name: bkeagent
+    type: binary
+    serviceName: bkeagent
+    checkMethod: systemd
+    priority: critical
+  
+  - name: docker
+    type: binary
+    serviceName: docker
+    checkMethod: systemd
+    priority: important
+```
+
+### 二进制组件检查器实现
+
+```go
+// BinaryHealthChecker 二进制组件健康检查器
+type BinaryHealthChecker struct {
+    config   []BinaryCheckConfig
+    log      *log.Logger
+    executor CommandExecutor // 命令执行器（用于执行 systemctl 等命令）
+}
+
+// CommandExecutor 命令执行接口
+type CommandExecutor interface {
+    Execute(ctx context.Context, command string, args ...string) (string, error)
+}
+
+// SystemdExecutor systemd 命令执行器
+type SystemdExecutor struct{}
+
+func (e *SystemdExecutor) Execute(ctx context.Context, command string, args ...string) (string, error) {
+    cmd := exec.CommandContext(ctx, command, args...)
+    output, err := cmd.CombinedOutput()
+    return string(output), err
+}
+
+// NewBinaryHealthChecker 创建二进制健康检查器
+func NewBinaryHealthChecker(config []BinaryCheckConfig, log *log.Logger) *BinaryHealthChecker {
+    return &BinaryHealthChecker{
+        config:   config,
+        log:      log,
+        executor: &SystemdExecutor{},
+    }
+}
+
+// Check 检查所有二进制组件
+func (c *BinaryHealthChecker) Check(ctx context.Context, nodeIP string) []error {
+    var errs []error
+    
+    for _, config := range c.config {
+        result := c.checkBinary(ctx, nodeIP, config)
+        if !result.IsHealthy {
+            errs = append(errs, newBinaryCheckError(config, result))
+        }
+    }
+    
+    return errs
+}
+
+// checkBinary 检查单个二进制组件
+func (c *BinaryHealthChecker) checkBinary(ctx context.Context, nodeIP string, config BinaryCheckConfig) BinaryCheckResult {
+    result := BinaryCheckResult{
+        Component: ComponentInfo{
+            Name:     config.Name,
+            Priority: config.Priority,
+        },
+        CheckedAt: time.Now(),
+    }
+    
+    switch config.CheckMethod {
+    case "systemd":
+        return c.checkSystemdService(ctx, nodeIP, config)
+    case "http":
+        return c.checkHTTPEndpoint(ctx, nodeIP, config)
+    case "tcp":
+        return c.checkTCPEndpoint(ctx, nodeIP, config)
+    default:
+        result.IsHealthy = false
+        result.Reason = "UnknownCheckMethod"
+        result.Details = fmt.Sprintf("unknown check method: %s", config.CheckMethod)
+        return result
+    }
+}
+
+// checkSystemdService 检查 systemd 服务状态
+func (c *BinaryHealthChecker) checkSystemdService(ctx context.Context, nodeIP string, config BinaryCheckConfig) BinaryCheckResult {
+    result := BinaryCheckResult{
+        Component: ComponentInfo{
+            Name:     config.Name,
+            Priority: config.Priority,
+        },
+        CheckedAt: time.Now(),
+    }
+    
+    // 在远程节点执行 systemctl is-active 命令
+    command := fmt.Sprintf("ssh %s 'systemctl is-active %s'", nodeIP, config.ServiceName)
+    output, err := c.executor.Execute(ctx, "bash", "-c", command)
+    
+    if err != nil {
+        result.IsHealthy = false
+        result.Reason = "ServiceNotRunning"
+        result.Details = fmt.Sprintf("service %s is not active: %s", config.ServiceName, output)
+        return result
+    }
+    
+    status := strings.TrimSpace(output)
+    if status != "active" {
+        result.IsHealthy = false
+        result.Reason = "ServiceFailed"
+        result.Details = fmt.Sprintf("service %s status: %s", config.ServiceName, status)
+        return result
+    }
+    
+    result.IsHealthy = true
+    return result
+}
+
+// checkHTTPEndpoint 检查 HTTP 端点
+func (c *BinaryHealthChecker) checkHTTPEndpoint(ctx context.Context, nodeIP string, config BinaryCheckConfig) BinaryCheckResult {
+    result := BinaryCheckResult{
+        Component: ComponentInfo{
+            Name:     config.Name,
+            Priority: config.Priority,
+        },
+        CheckedAt: time.Now(),
+    }
+    
+    endpoint := fmt.Sprintf("http://%s%s", nodeIP, config.Endpoint)
+    req, err := http.NewRequestWithContext(ctx, "GET", endpoint, nil)
+    if err != nil {
+        result.IsHealthy = false
+        result.Reason = "InvalidEndpoint"
+        result.Details = err.Error()
+        return result
+    }
+    
+    client := &http.Client{Timeout: 5 * time.Second}
+    resp, err := client.Do(req)
+    if err != nil {
+        result.IsHealthy = false
+        result.Reason = "EndpointUnreachable"
+        result.Details = err.Error()
+        return result
+    }
+    defer resp.Body.Close()
+    
+    if resp.StatusCode != http.StatusOK {
+        result.IsHealthy = false
+        result.Reason = "EndpointUnhealthy"
+        result.Details = fmt.Sprintf("status code: %d", resp.StatusCode)
+        return result
+    }
+    
+    result.IsHealthy = true
+    return result
+}
+
+// checkTCPEndpoint 检查 TCP 端点
+func (c *BinaryHealthChecker) checkTCPEndpoint(ctx context.Context, nodeIP string, config BinaryCheckConfig) BinaryCheckResult {
+    result := BinaryCheckResult{
+        Component: ComponentInfo{
+            Name:     config.Name,
+            Priority: config.Priority,
+        },
+        CheckedAt: time.Now(),
+    }
+    
+    endpoint := fmt.Sprintf("%s%s", nodeIP, config.Endpoint)
+    conn, err := net.DialTimeout("tcp", endpoint, 5*time.Second)
+    if err != nil {
+        result.IsHealthy = false
+        result.Reason = "EndpointUnreachable"
+        result.Details = err.Error()
+        return result
+    }
+    defer conn.Close()
+    
+    result.IsHealthy = true
+    return result
+}
+
+// newBinaryCheckError 构造二进制组件检查错误
+func newBinaryCheckError(config BinaryCheckConfig, result BinaryCheckResult) *HealthCheckError {
+    return &HealthCheckError{
+        Component: ComponentInfo{
+            Name:     config.Name,
+            Priority: config.Priority,
+        },
+        Reason: result.Reason,
+        Err:    fmt.Errorf("%s: %s", result.Reason, result.Details),
+    }
+}
+```
+
+### 统一健康检查器扩展
+
+```go
+// UnifiedHealthChecker 统一健康检查器（扩展）
+type UnifiedHealthChecker struct {
+    kubeClient    kubernetes.Interface
+    log           *log.Logger
+    cache         *HealthCheckCache
+    config        HealthCheckConfig
+    binaryChecker *BinaryHealthChecker  // 新增：二进制组件检查器
+}
+
+// NewUnifiedHealthChecker 创建健康检查器
+func NewUnifiedHealthChecker(kubeClient kubernetes.Interface, log *log.Logger, config HealthCheckConfig) *UnifiedHealthChecker {
+    // 解析二进制组件配置
+    binaryConfigs := parseBinaryConfigs(config.Components)
+    binaryChecker := NewBinaryHealthChecker(binaryConfigs, log)
+    
+    return &UnifiedHealthChecker{
+        kubeClient:    kubeClient,
+        log:           log,
+        cache:         NewHealthCheckCache(config.CacheSyncTimeout),
+        config:        config,
+        binaryChecker: binaryChecker,
+    }
+}
+
+// parseBinaryConfigs 解析二进制组件配置
+func parseBinaryConfigs(components []ComponentCheck) []BinaryCheckConfig {
+    var binaryConfigs []BinaryCheckConfig
+    
+    for _, c := range components {
+        if c.Type == ComponentTypeBinary {
+            binaryConfigs = append(binaryConfigs, BinaryCheckConfig{
+                Name:        c.Name,
+                Type:        c.Type,
+                Priority:    c.Priority,
+                ServiceName: c.ServiceName,
+                CheckMethod: c.CheckMethod,
+                Endpoint:    c.Endpoint,
+            })
+        }
+    }
+    
+    return binaryConfigs
+}
+
+// Check 执行统一健康检查（扩展）
+func (h *UnifiedHealthChecker) Check(cluster *bkev1beta1.BKECluster, currentVersion string, bkeNodes bkev1beta1.BKENodes) error {
+    result := &HealthCheckResult{}
+    
+    // 阶段 1: 节点状态检查（并行）
+    if err := h.checkNodesParallel(cluster, currentVersion, bkeNodes, result); err != nil {
+        result.NodeErrors = append(result.NodeErrors, err)
+        return h.aggregateResult(result)
+    }
+    
+    // 阶段 1.5: 二进制组件检查（新增）
+    if err := h.checkBinaryComponentsParallel(bkeNodes, result); err != nil {
+        result.CriticalComponentErrors = append(result.CriticalComponentErrors, err)
+        return h.aggregateResult(result)
+    }
+    
+    // 阶段 2: 按优先级分组检查 Pod 组件
+    critical, important, optional := h.groupByPriority()
+    
+    // 关键组件（并行，失败立即返回）
+    if err := h.checkComponentsParallel(critical, result); err != nil {
+        result.CriticalComponentErrors = append(result.CriticalComponentErrors, err)
+        return h.aggregateResult(result)
+    }
+    
+    // 重要组件（并行，失败记录警告）
+    if err := h.checkComponentsParallel(important, result); err != nil {
+        h.log.Warn("important components check failed: %v", err)
+        result.ImportantComponentErrors = append(result.ImportantComponentErrors, err)
+    }
+    
+    // 非关键组件（并行，失败记录调试信息）
+    if err := h.checkComponentsParallel(optional, result); err != nil {
+        h.log.Debug("optional components check failed: %v", err)
+        result.OptionalComponentErrors = append(result.OptionalComponentErrors, err)
+    }
+    
+    return h.aggregateResult(result)
+}
+
+// checkBinaryComponentsParallel 并行检查二进制组件
+func (h *UnifiedHealthChecker) checkBinaryComponentsParallel(bkeNodes bkev1beta1.BKENodes, result *HealthCheckResult) error {
+    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+    defer cancel()
+    
+    // 使用 goroutine 池控制并发
+    semaphore := make(chan struct{}, 10) // 最多 10 个并发
+    var wg sync.WaitGroup
+    errChan := make(chan error, len(bkeNodes)*4) // 每个节点 4 个组件
+    
+    for _, node := range bkeNodes {
+        nodeIP := node.Spec.IP
+        
+        if bkeNodes.GetNodeStateNeedSkip(nodeIP) {
+            continue
+        }
+        
+        wg.Add(1)
+        go func(ip string) {
+            defer wg.Done()
+            semaphore <- struct{}{}        // 获取信号量
+            defer func() { <-semaphore }() // 释放信号量
+            
+            errs := h.binaryChecker.Check(ctx, ip)
+            for _, err := range errs {
+                errChan <- err
+            }
+        }(nodeIP)
+    }
+    
+    wg.Wait()
+    close(errChan)
+    
+    var errs []error
+    for err := range errChan {
+        errs = append(errs, err)
+    }
+    
+    if len(errs) > 0 {
+        return kerrors.NewAggregate(errs)
+    }
+    
+    return nil
+}
+```
+
+### 配置结构扩展
+
+```go
+// ComponentCheck 组件检查配置（扩展）
+type ComponentCheck struct {
+    Name        ComponentName       `yaml:"name"`
+    Type        ComponentType       `yaml:"type"`        // pod 或 binary
+    Namespace   string              `yaml:"namespace"`   // Pod 组件必填
+    Prefixes    []string            `yaml:"prefixes"`    // Pod 组件必填
+    Priority    HealthCheckPriority `yaml:"priority"`
+    ServiceName string              `yaml:"serviceName"` // 二进制组件必填
+    CheckMethod string              `yaml:"checkMethod"` // systemd, http, tcp
+    Endpoint    string              `yaml:"endpoint"`    // HTTP/TCP 端点（可选）
+}
+
+// UnmarshalYAML 自定义反序列化（扩展）
+func (c *ComponentCheck) UnmarshalYAML(unmarshal func(interface{}) error) error {
+    type Alias ComponentCheck
+    aux := &struct {
+        Priority string `yaml:"priority"`
+        *Alias
+    }{
+        Alias: (*Alias)(c),
+    }
+    
+    if err := unmarshal(aux); err != nil {
+        return err
+    }
+    
+    if aux.Priority == "" {
+        return fmt.Errorf("component %q: priority is required", c.Name)
+    }
+    
+    p, err := ParsePriority(aux.Priority)
+    if err != nil {
+        return fmt.Errorf("component %q: %w", c.Name, err)
+    }
+    c.Priority = p
+    
+    // 验证必填字段
+    if c.Type == ComponentTypePod {
+        if c.Namespace == "" {
+            return fmt.Errorf("pod component %q: namespace is required", c.Name)
+        }
+        if len(c.Prefixes) == 0 {
+            return fmt.Errorf("pod component %q: prefixes is required", c.Name)
+        }
+    } else if c.Type == ComponentTypeBinary {
+        if c.ServiceName == "" {
+            return fmt.Errorf("binary component %q: serviceName is required", c.Name)
+        }
+        if c.CheckMethod == "" {
+            return fmt.Errorf("binary component %q: checkMethod is required", c.Name)
+        }
+    }
+    
+    return nil
+}
+```
+
+### 默认配置扩展
+
+```go
+// DefaultHealthCheckConfig 默认配置（扩展）
+func DefaultHealthCheckConfig() HealthCheckConfig {
+    return HealthCheckConfig{
+        CacheSyncTimeout: 30 * time.Second,
+        Intervals: IntervalConfig{
+            Critical:  5 * time.Second,
+            Important: 15 * time.Second,
+            Optional:  30 * time.Second,
+            Normal:    5 * time.Minute,
+        },
+        Components: []ComponentCheck{
+            // Pod 组件（现有）
+            {Name: NameEtcd, Type: ComponentTypePod, Namespace: "kube-system", Prefixes: []string{"etcd-"}, Priority: PriorityCritical},
+            {Name: NameKubeAPIServer, Type: ComponentTypePod, Namespace: "kube-system", Prefixes: []string{"kube-apiserver-"}, Priority: PriorityCritical},
+            {Name: NameKubeControllerManager, Type: ComponentTypePod, Namespace: "kube-system", Prefixes: []string{"kube-controller-manager-"}, Priority: PriorityCritical},
+            {Name: NameKubeScheduler, Type: ComponentTypePod, Namespace: "kube-system", Prefixes: []string{"kube-scheduler-"}, Priority: PriorityCritical},
+            {Name: NameCalicoNode, Type: ComponentTypePod, Namespace: "kube-system", Prefixes: []string{"calico-node"}, Priority: PriorityImportant},
+            {Name: NameCalicoKubeControllers, Type: ComponentTypePod, Namespace: "kube-system", Prefixes: []string{"calico-kube-controllers"}, Priority: PriorityImportant},
+            {Name: NameKubeProxy, Type: ComponentTypePod, Namespace: "kube-system", Prefixes: []string{"kube-proxy-"}, Priority: PriorityImportant},
+            {Name: NameCoreDNS, Type: ComponentTypePod, Namespace: "kube-system", Prefixes: []string{"coredns"}, Priority: PriorityImportant},
+            
+            // 二进制组件（新增）
+            {Name: "containerd", Type: ComponentTypeBinary, ServiceName: "containerd", CheckMethod: "systemd", Priority: PriorityCritical},
+            {Name: "kubelet", Type: ComponentTypeBinary, ServiceName: "kubelet", CheckMethod: "systemd", Priority: PriorityCritical},
+            {Name: "bkeagent", Type: ComponentTypeBinary, ServiceName: "bkeagent", CheckMethod: "systemd", Priority: PriorityCritical},
+            {Name: "docker", Type: ComponentTypeBinary, ServiceName: "docker", CheckMethod: "systemd", Priority: PriorityImportant},
+            
+            // 其他 Pod 组件
+            {Name: NameMetricsServer, Type: ComponentTypePod, Namespace: "kube-system", Prefixes: []string{"metrics-server-"}, Priority: PriorityOptional},
+            {Name: NameIngressNginx, Type: ComponentTypePod, Namespace: "ingress-nginx", Prefixes: []string{"ingress-nginx-controller"}, Priority: PriorityOptional},
+            {Name: NameConsoleService, Type: ComponentTypePod, Namespace: "openfuyao-system", Prefixes: []string{"console-service-"}, Priority: PriorityOptional},
+            {Name: NameOAuthServer, Type: ComponentTypePod, Namespace: "openfuyao-system", Prefixes: []string{"oauth-server-"}, Priority: PriorityOptional},
+            {Name: NameLocalHarbor, Type: ComponentTypePod, Namespace: "openfuyao-system", Prefixes: []string{"local-harbor-"}, Priority: PriorityOptional},
+            {Name: NamePrometheus, Type: ComponentTypePod, Namespace: "monitoring", Prefixes: []string{"prometheus-k8s-"}, Priority: PriorityOptional},
+            {Name: NameAlertmanager, Type: ComponentTypePod, Namespace: "monitoring", Prefixes: []string{"alertmanager-main-"}, Priority: PriorityOptional},
+            {Name: NameNodeExporter, Type: ComponentTypePod, Namespace: "monitoring", Prefixes: []string{"node-exporter-"}, Priority: PriorityOptional},
+        },
+    }
+}
+```
+
+### 完整的健康检查流程
+
+```mermaid
+sequenceDiagram
+    participant Controller as BKE Controller
+    participant Checker as 统一健康检查器
+    participant BinaryChecker as 二进制检查器
+    participant PodChecker as Pod 检查器
+    participant Node as 节点
+    participant Cache as 缓存层
+    
+    Controller->>Checker: CheckClusterHealth()
+    
+    Note over Checker: 阶段 1: 节点状态检查
+    Checker->>Cache: GetNodes()
+    Cache-->>Checker: 节点列表
+    Checker->>Checker: 并行检查节点状态
+    
+    Note over Checker: 阶段 1.5: 二进制组件检查
+    loop 每个节点
+        Checker->>BinaryChecker: Check(nodeIP)
+        BinaryChecker->>Node: systemctl is-active containerd
+        Node-->>BinaryChecker: active
+        BinaryChecker->>Node: systemctl is-active kubelet
+        Node-->>BinaryChecker: active
+        BinaryChecker->>Node: systemctl is-active bkeagent
+        Node-->>BinaryChecker: active
+        BinaryChecker-->>Checker: 检查结果
+    end
+    
+    Note over Checker: 阶段 2: Pod 组件检查
+    Checker->>Cache: GetPods(namespace)
+    Cache-->>Checker: Pod 列表
+    Checker->>PodChecker: 并行检查 Pod 状态
+    PodChecker-->>Checker: 检查结果
+    
+    Checker-->>Controller: 聚合结果
+```
+
+### 性能优化
+
+#### 并行检查
+
+```go
+// 并行检查所有节点的二进制组件
+func (h *UnifiedHealthChecker) checkBinaryComponentsParallel(bkeNodes bkev1beta1.BKENodes, result *HealthCheckResult) error {
+    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+    defer cancel()
+    
+    // 使用 goroutine 池控制并发
+    semaphore := make(chan struct{}, 10) // 最多 10 个并发
+    var wg sync.WaitGroup
+    errChan := make(chan error, len(bkeNodes)*4) // 每个节点 4 个组件
+    
+    for _, node := range bkeNodes {
+        nodeIP := node.Spec.IP
+        
+        if bkeNodes.GetNodeStateNeedSkip(nodeIP) {
+            continue
+        }
+        
+        wg.Add(1)
+        go func(ip string) {
+            defer wg.Done()
+            semaphore <- struct{}{}        // 获取信号量
+            defer func() { <-semaphore }() // 释放信号量
+            
+            errs := h.binaryChecker.Check(ctx, ip)
+            for _, err := range errs {
+                errChan <- err
+            }
+        }(nodeIP)
+    }
+    
+    wg.Wait()
+    close(errChan)
+    
+    var errs []error
+    for err := range errChan {
+        errs = append(errs, err)
+    }
+    
+    if len(errs) > 0 {
+        return kerrors.NewAggregate(errs)
+    }
+    
+    return nil
+}
+```
+
+#### 缓存优化
+
+```go
+// 缓存二进制组件状态（可选）
+type BinaryStatusCache struct {
+    statuses map[string]map[string]BinaryCheckResult // nodeIP -> serviceName -> result
+    ttl      time.Duration
+    mu       sync.RWMutex
+}
+
+func (c *BinaryStatusCache) Get(nodeIP, serviceName string) (BinaryCheckResult, bool) {
+    c.mu.RLock()
+    defer c.mu.RUnlock()
+    
+    if nodeStatuses, ok := c.statuses[nodeIP]; ok {
+        if result, ok := nodeStatuses[serviceName]; ok {
+            if time.Since(result.CheckedAt) < c.ttl {
+                return result, true
+            }
+        }
+    }
+    
+    return BinaryCheckResult{}, false
+}
+
+func (c *BinaryStatusCache) Set(nodeIP, serviceName string, result BinaryCheckResult) {
+    c.mu.Lock()
+    defer c.mu.Unlock()
+    
+    if _, ok := c.statuses[nodeIP]; !ok {
+        c.statuses[nodeIP] = make(map[string]BinaryCheckResult)
+    }
+    
+    c.statuses[nodeIP][serviceName] = result
+}
+```
+
+### 总结
+
+统一的二进制健康检查机制提供了：
+
+1. **统一架构**：Pod 组件和二进制组件使用相同的检查框架
+2. **灵活配置**：支持多种检查方法（systemd、HTTP、TCP）
+3. **优先级管理**：与现有优先级系统无缝集成
+4. **性能优化**：并行检查、缓存优化
+5. **错误处理**：统一的错误类型和日志格式
+6. **可扩展性**：易于添加新的二进制组件和检查方法
+
+这个设计可以确保 BKE 集群的所有关键组件（无论是 Pod 还是二进制）都得到统一的健康检查，提高集群的可靠性和可观测性。
+
 ## 参考资料
 
 1. [Kubernetes Health Checking](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
