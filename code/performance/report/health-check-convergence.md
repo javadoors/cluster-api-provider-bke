@@ -10,7 +10,7 @@
 2. **无优先级**：关键组件和非关键组件同等对待
 3. **固定间隔**：RequeueAfter 固定为 10 秒，无法根据失败原因动态调整
 4. **无缓存**：每次检查都重新获取所有 Pod 状态，API 调用频繁
-5. **Master NotReady**：Calico 部署后 Master 节点反复 NotReady，导致健康检查失败
+5. **Master NotReady**：oauth-webhook 安装顺序不当导致 API Server 认证失败，Master 节点反复 NotReady
 
 解决方案包括：
 
@@ -18,7 +18,7 @@
 2. **并行化检查**：每个阶段内使用并行检查
 3. **缓存机制**：使用 Informer 缓存减少 API 调用（首次同步后零调用）
 4. **动态间隔**：根据检查结果动态调整下次检查间隔（5s/15s/30s/5m）
-5. **Calico 优化**：修复 Calico 部署导致的 Master NotReady 问题
+5. **oauth-webhook 安装顺序优化**：调整安装顺序，先部署 webhook 并等待就绪，再配置 API Server，避免认证失败
 
 ## 动机
 
@@ -42,11 +42,41 @@
 
 **根因分析：**
 
-1. **Master NotReady 问题**
-   - Calico 部署后 4-7 分钟，Master 节点依次 NotReady
-   - 异常组件：calico-node, etcd, kube-apiserver, kube-controller-manager
-   - 每次异常持续 30-60 秒后自动恢复
-   - 因果关系：Calico 未部署时 Master 节点 Ready，部署后出现 NotReady
+1. **Master NotReady 问题（oauth-webhook 安装顺序问题）**
+   - **现象**：Calico 部署后 4-7 分钟，Master 节点依次 NotReady
+   - **异常组件**：calico-node, etcd, kube-apiserver, kube-controller-manager
+   - **每次异常持续**：30-60 秒后自动恢复
+   
+   **真实根因**：
+   - oauth-webhook 安装顺序不当导致 API Server 认证失败
+   - 当前安装顺序：
+     ```
+     1. generate_oauth_webhook_tls_cert()  # 生成证书
+     2. modify_kubernetes_manifests()      # 修改 API Server 配置 ← API Server 重启
+     3. install_oauth_webhook()            # 安装 webhook ← 此时还未就绪
+     4. install_oauth_server()             # 安装 OAuth Server
+     ```
+   - 问题：步骤 2 修改 API Server 配置导致重启，但步骤 3 才安装 webhook，导致 API Server 重启时 webhook 不可用，认证失败，Node NotReady
+   
+   **依赖关系分析**：
+   ```
+   oauth-server ────────────> oauth-webhook
+           │                        │
+           │                        └──> kube-apiserver (webhook config)
+   ```
+   - oauth-webhook 的 Ready **不依赖** oauth-server
+   - oauth-server 依赖 oauth-webhook（反向依赖）
+   - kube-apiserver 依赖 oauth-webhook（用于 TokenReview 认证）
+   
+   **解决方案**：调整安装顺序
+   ```
+   1. generate_oauth_webhook_tls_cert()  # 生成证书
+   2. install_oauth_webhook()            # 先安装 webhook
+   3. wait_oauth_webhook_ready()         # 等待 webhook Ready
+   4. modify_kubernetes_manifests()      # 再修改 API Server 配置 ← API Server 重启
+   5. install_oauth_server()             # 最后安装 server
+   ```
+   这样可以确保 API Server 重启时 oauth-webhook 已就绪，避免认证失败。
 
 2. **关键组件长时间 Pending**
    - openfuyao-system-controller：Pending 总时长约 7 分钟
@@ -78,6 +108,7 @@
 1. 优化 Calico 本身的部署时间（由其它提案处理）
 2. 修改 Kubernetes 控制面组件的行为
 3. 改变健康检查的业务逻辑（哪些组件需要检查）
+4. 修改 oauth-server 或 oauth-webhook 的功能逻辑（仅调整安装顺序）
 
 ## 提案
 
@@ -92,7 +123,7 @@
 **故事 2：稳定的控制面**
 作为集群管理员，我希望在集群创建过程中控制面保持稳定，避免 Master 节点 NotReady。
 
-*当前状态：* Calico 部署后 Master 节点反复 NotReady（3 次）
+*当前状态：* oauth-webhook 安装顺序不当导致 API Server 认证失败，Master 节点反复 NotReady（3 次）
 *期望状态：* 控制面保持稳定，NotReady 事件 = 0
 
 **故事 3：可配置的健康检查**
@@ -145,6 +176,84 @@
 | **并行化** | 每个阶段内使用并行检查 | 并行检查 |
 | **缓存化** | 使用缓存减少 API 调用 | 缓存机制 |
 | **智能化** | 根据检查结果动态调整间隔 | 动态间隔 |
+
+#### 优化 1.5: oauth-webhook 安装顺序优化
+
+**问题背景：**
+
+oauth-webhook 是 openfuyao 前端的认证组件，配置在 kube-apiserver 的 `--authentication-token-webhook-config-file` 参数中。当前安装顺序不当导致 API Server 重启时 webhook 未就绪，认证失败，Master 节点 NotReady。
+
+**依赖关系分析：**
+
+```txt
+oauth-server ────────────> oauth-webhook
+        │                        │
+        │                        └──> kube-apiserver (webhook config)
+```
+
+- oauth-webhook 的 Ready **不依赖** oauth-server
+- oauth-server 依赖 oauth-webhook（反向依赖）
+- kube-apiserver 依赖 oauth-webhook（用于 TokenReview 认证）
+
+**当前安装顺序（有问题）：**
+
+```bash
+install_oauth_webhook_and_oauth_server() {
+    # 1. 生成证书
+    generate_oauth_webhook_tls_cert
+    
+    # 2. 修改 API Server 配置 ← API Server 重启
+    modify_kubernetes_manifests
+    
+    # 3. 安装 webhook ← 此时还未就绪
+    install_oauth_webhook
+    
+    # 4. 安装 OAuth Server
+    install_oauth_server
+}
+```
+
+**问题：** 步骤 2 修改 API Server 配置导致重启，但步骤 3 才安装 webhook，导致 API Server 重启时 webhook 不可用，认证失败，Node NotReady。
+
+**优化后安装顺序：**
+
+```bash
+install_oauth_webhook_and_oauth_server() {
+    # 1. 生成证书
+    generate_oauth_webhook_tls_cert
+    
+    # 2. 先安装 webhook
+    install_oauth_webhook
+    
+    # 3. 等待 webhook Ready
+    kubectl wait --for=condition=ready pod -l app=oauth-webhook \
+        -n openfuyao-system --timeout=300s
+    
+    # 4. 再修改 API Server 配置 ← API Server 重启
+    modify_kubernetes_manifests
+    
+    # 5. 最后安装 OAuth Server
+    install_oauth_server
+}
+```
+
+**优势：**
+
+1. **API Server 重启时 webhook 已就绪**：避免认证失败
+2. **不影响安全性**：webhook 配置不变，仅调整安装顺序
+3. **实现简单**：只需调整安装步骤顺序
+4. **可靠性高**：确保 webhook 就绪后再配置 API Server
+
+**实施要点：**
+
+1. 在 `install_oauth_webhook()` 后添加 `wait_oauth_webhook_ready()` 函数
+2. 将 `modify_kubernetes_manifests()` 移到 `wait_oauth_webhook_ready()` 之后
+3. 确保 `install_oauth_server()` 在最后执行
+
+**预期效果：**
+
+- Master NotReady 次数从 3 次减少至 0 次
+- 健康检查收敛时间减少约 2-3 分钟（避免 NotReady 导致的重试）
 
 #### 优化 2: 统一健康检查器实现
 
@@ -205,6 +314,7 @@ const (
     NameIngressNginx          ComponentName = "ingress-nginx"
     NameConsoleService        ComponentName = "console-service"
     NameOAuthServer           ComponentName = "oauth-server"
+    NameOAuthWebhook          ComponentName = "oauth-webhook"
     NameLocalHarbor           ComponentName = "local-harbor"
     NamePrometheus            ComponentName = "prometheus"
     NameAlertmanager          ComponentName = "alertmanager"
@@ -416,6 +526,7 @@ func DefaultHealthCheckConfig() HealthCheckConfig {
             {Name: NameKubeAPIServer, Namespace: "kube-system", Prefixes: []string{"kube-apiserver-"}, Priority: PriorityCritical},
             {Name: NameKubeControllerManager, Namespace: "kube-system", Prefixes: []string{"kube-controller-manager-"}, Priority: PriorityCritical},
             {Name: NameKubeScheduler, Namespace: "kube-system", Prefixes: []string{"kube-scheduler-"}, Priority: PriorityCritical},
+            {Name: NameOAuthWebhook, Namespace: "openfuyao-system", Prefixes: []string{"oauth-webhook-"}, Priority: PriorityCritical},
             {Name: NameCalicoNode, Namespace: "kube-system", Prefixes: []string{"calico-node"}, Priority: PriorityImportant},
             {Name: NameCalicoKubeControllers, Namespace: "kube-system", Prefixes: []string{"calico-kube-controllers"}, Priority: PriorityImportant},
             {Name: NameKubeProxy, Namespace: "kube-system", Prefixes: []string{"kube-proxy-"}, Priority: PriorityImportant},
@@ -832,6 +943,10 @@ components:
   - name: kube-scheduler
     namespace: kube-system
     prefixes: [kube-scheduler-]
+    priority: critical
+  - name: oauth-webhook
+    namespace: openfuyao-system
+    prefixes: [oauth-webhook-]
     priority: critical
 
   # 网络
@@ -1390,6 +1505,10 @@ components:
     namespace: kube-system
     prefixes: [kube-scheduler-]
     priority: critical
+  - name: oauth-webhook
+    namespace: openfuyao-system
+    prefixes: [oauth-webhook-]
+    priority: critical
   # 网络
   - name: calico-node
     namespace: kube-system
@@ -1903,8 +2022,10 @@ gantt
 ## 实施历史
 
 - **2026-07-13**: 识别健康检查收敛慢问题
-- **2026-07-14**: 分析根因，确认 Master NotReady 与 Calico 部署的因果关系
+- **2026-07-14**: 分析根因，初步确认 Master NotReady 与 Calico 部署的因果关系
 - **2026-07-15**: 设计统一健康检查架构
+- **2026-07-27**: 修正根因分析，确认 Master NotReady 的真实原因是 oauth-webhook 安装顺序不当导致 API Server 认证失败
+- **2026-07-27**: 设计 oauth-webhook 安装顺序优化方案
 - **待定**: Alpha 实现
 - **待定**: Beta 实现
 - **待定**: Stable 发布
@@ -1924,7 +2045,7 @@ gantt
 
 ### 替代方案 1：仅优化 Master NotReady 问题
 
-**方案**：只修复 Calico 部署导致的 Master NotReady 问题，不改变健康检查机制
+**方案**：只修复 oauth-webhook 安装顺序问题，不改变健康检查机制
 
 **优点：**
 
@@ -1971,6 +2092,38 @@ gantt
 - 无法缓存检查结果
 
 **决定：** 拒绝。自定义健康检查提供更细粒度的控制和优化空间。
+
+### 替代方案 4：使用 failurePolicy: Ignore
+
+**方案**：配置 oauth-webhook 的 failurePolicy 为 Ignore，当 webhook 不可用时，API Server 不会拒绝请求
+
+**优点：**
+
+- 即使 webhook 不可用，API Server 也能正常认证
+- 不需要调整安装顺序
+
+**缺点：**
+
+- 可能影响安全性（webhook 不可用时，认证行为可能不符合预期）
+- 需要评估安全影响
+
+**决定：** 拒绝。安全性是首要考虑，不应降低认证要求。
+
+### 替代方案 5：使用本地认证回退
+
+**方案**：配置 oauth-webhook 的本地认证回退，当 webhook 不可用时，使用本地认证
+
+**优点：**
+
+- webhook 不可用时，自动回退到本地认证
+- 不影响安全性
+
+**缺点：**
+
+- 实现复杂度高
+- 需要管理本地 token
+
+**决定：** 拒绝。实现复杂度高，且调整安装顺序是更简单的解决方案。
 
 ## 所需基础设施
 
@@ -2029,6 +2182,7 @@ gantt
 | kube-apiserver | critical | kube-system | kube-apiserver- |
 | kube-controller-manager | critical | kube-system | kube-controller-manager- |
 | kube-scheduler | critical | kube-system | kube-scheduler- |
+| oauth-webhook | critical | openfuyao-system | oauth-webhook- |
 | calico-node | important | kube-system | calico-node |
 | calico-kube-controllers | important | kube-system | calico-kube-controllers |
 | kube-proxy | important | kube-system | kube-proxy- |
