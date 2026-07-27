@@ -2204,17 +2204,26 @@ type BinaryCheckConfig struct {
     Type        ComponentType       `yaml:"type"`        // binary
     Priority    HealthCheckPriority `yaml:"priority"`
     ServiceName string              `yaml:"serviceName"` // systemd 服务名称
-    CheckMethod string              `yaml:"checkMethod"` // systemd, http, tcp
+    CheckMethod string              `yaml:"checkMethod"` // systemd, http, tcp, shell
     Endpoint    string              `yaml:"endpoint"`    // HTTP/TCP 端点（可选）
+    Command     string              `yaml:"command"`     // Shell 命令（shell 方法必填）
+    Timeout     time.Duration       `yaml:"timeout"`     // 命令执行超时时间（默认 5s）
 }
 
 // BinaryCheckResult 二进制组件检查结果
 type BinaryCheckResult struct {
     Component ComponentInfo
     IsHealthy bool
-    Reason    string // ServiceNotRunning, ServiceFailed, EndpointUnreachable
+    Reason    string // ServiceNotRunning, ServiceFailed, EndpointUnreachable, CommandTimeout, CommandReturnedNonZero
     Details   string // 详细信息
     CheckedAt time.Time
+}
+
+// ShellCheckResult Shell 命令检查结果
+type ShellCheckResult struct {
+    ExitCode int
+    Output   string
+    Error    error
 }
 ```
 
@@ -2260,6 +2269,44 @@ components:
     serviceName: docker
     checkMethod: systemd
     priority: important
+  
+  # Shell 命令检查（新增）
+  - name: etcd-health
+    type: binary
+    checkMethod: shell
+    command: |
+      etcdctl endpoint health \
+        --endpoints=https://localhost:2379 \
+        --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+        --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt \
+        --key=/etc/kubernetes/pki/etcd/healthcheck-client.key
+    timeout: 10s
+    priority: critical
+  
+  - name: apiserver-health
+    type: binary
+    checkMethod: shell
+    command: "curl -s -k https://localhost:6443/healthz | grep -q ok"
+    timeout: 5s
+    priority: critical
+  
+  - name: kubeconfig-exists
+    type: binary
+    checkMethod: shell
+    command: "test -f /etc/kubernetes/admin.conf"
+    timeout: 2s
+    priority: important
+  
+  - name: master-node-health
+    type: binary
+    checkMethod: shell
+    command: |
+      test -f /etc/kubernetes/admin.conf && \
+      systemctl is-active kubelet && \
+      systemctl is-active containerd && \
+      curl -s -k https://localhost:6443/healthz | grep -q ok
+    timeout: 10s
+    priority: critical
 ```
 
 ### 二进制组件检查器实现
@@ -2326,6 +2373,8 @@ func (c *BinaryHealthChecker) checkBinary(ctx context.Context, nodeIP string, co
         return c.checkHTTPEndpoint(ctx, nodeIP, config)
     case "tcp":
         return c.checkTCPEndpoint(ctx, nodeIP, config)
+    case "shell":
+        return c.checkShellCommand(ctx, nodeIP, config)
     default:
         result.IsHealthy = false
         result.Reason = "UnknownCheckMethod"
@@ -2431,6 +2480,99 @@ func (c *BinaryHealthChecker) checkTCPEndpoint(ctx context.Context, nodeIP strin
     return result
 }
 
+// checkShellCommand 执行 shell 命令检查
+func (c *BinaryHealthChecker) checkShellCommand(ctx context.Context, nodeIP string, config BinaryCheckConfig) BinaryCheckResult {
+    result := BinaryCheckResult{
+        Component: ComponentInfo{
+            Name:     config.Name,
+            Priority: config.Priority,
+        },
+        CheckedAt: time.Now(),
+    }
+    
+    // 设置超时
+    timeout := config.Timeout
+    if timeout == 0 {
+        timeout = 5 * time.Second // 默认 5 秒超时
+    }
+    
+    ctx, cancel := context.WithTimeout(ctx, timeout)
+    defer cancel()
+    
+    // 在远程节点执行 shell 命令
+    // 使用 ssh 执行命令，并捕获退出码和输出
+    command := fmt.Sprintf("ssh %s 'bash -c \"%s\"; echo EXIT_CODE:$?'", nodeIP, escapeShellCommand(config.Command))
+    
+    output, execErr := c.executor.Execute(ctx, "bash", "-c", command)
+    
+    if execErr != nil {
+        // 检查是否是超时错误
+        if ctx.Err() == context.DeadlineExceeded {
+            result.IsHealthy = false
+            result.Reason = "CommandTimeout"
+            result.Details = fmt.Sprintf("command timed out after %v", timeout)
+            return result
+        }
+        
+        result.IsHealthy = false
+        result.Reason = "CommandExecutionFailed"
+        result.Details = fmt.Sprintf("failed to execute command: %v", execErr)
+        return result
+    }
+    
+    // 解析退出码
+    exitCode, shellResult := parseShellOutput(output)
+    
+    if exitCode != 0 {
+        result.IsHealthy = false
+        result.Reason = "CommandReturnedNonZero"
+        result.Details = fmt.Sprintf("command returned exit code %d: %s", exitCode, shellResult)
+        return result
+    }
+    
+    result.IsHealthy = true
+    result.Details = shellResult
+    return result
+}
+
+// escapeShellCommand 转义 shell 命令中的特殊字符
+func escapeShellCommand(cmd string) string {
+    // 替换双引号为转义的双引号
+    cmd = strings.ReplaceAll(cmd, "\"", "\\\"")
+    // 替换换行符为空格（支持多行命令）
+    cmd = strings.ReplaceAll(cmd, "\n", " ")
+    return cmd
+}
+
+// parseShellOutput 解析 shell 命令输出，提取退出码和输出内容
+func parseShellOutput(output string) (int, string) {
+    // 查找 EXIT_CODE: 标记
+    lines := strings.Split(output, "\n")
+    if len(lines) == 0 {
+        return 1, "no output"
+    }
+    
+    // 最后一行应该是 EXIT_CODE:N
+    lastLine := lines[len(lines)-1]
+    if !strings.HasPrefix(lastLine, "EXIT_CODE:") {
+        // 如果没有 EXIT_CODE 标记，假设命令失败
+        return 1, output
+    }
+    
+    // 提取退出码
+    exitCodeStr := strings.TrimPrefix(lastLine, "EXIT_CODE:")
+    exitCode, parseErr := strconv.Atoi(strings.TrimSpace(exitCodeStr))
+    if parseErr != nil {
+        return 1, fmt.Sprintf("failed to parse exit code: %v", parseErr)
+    }
+    
+    // 提取输出内容（除了最后一行）
+    outputLines := lines[:len(lines)-1]
+    outputContent := strings.Join(outputLines, "\n")
+    
+    return exitCode, outputContent
+}
+
 // newBinaryCheckError 构造二进制组件检查错误
 func newBinaryCheckError(config BinaryCheckConfig, result BinaryCheckResult) *HealthCheckError {
     return &HealthCheckError{
@@ -2484,6 +2626,8 @@ func parseBinaryConfigs(components []ComponentCheck) []BinaryCheckConfig {
                 ServiceName: c.ServiceName,
                 CheckMethod: c.CheckMethod,
                 Endpoint:    c.Endpoint,
+                Command:     c.Command,
+                Timeout:     c.Timeout,
             })
         }
     }
@@ -2625,11 +2769,26 @@ func (c *ComponentCheck) UnmarshalYAML(unmarshal func(interface{}) error) error 
             return fmt.Errorf("pod component %q: prefixes is required", c.Name)
         }
     } else if c.Type == ComponentTypeBinary {
-        if c.ServiceName == "" {
-            return fmt.Errorf("binary component %q: serviceName is required", c.Name)
-        }
         if c.CheckMethod == "" {
             return fmt.Errorf("binary component %q: checkMethod is required", c.Name)
+        }
+        
+        // 根据不同的检查方法验证必填字段
+        switch c.CheckMethod {
+        case "systemd":
+            if c.ServiceName == "" {
+                return fmt.Errorf("binary component %q: serviceName is required for systemd check", c.Name)
+            }
+        case "http", "tcp":
+            if c.Endpoint == "" {
+                return fmt.Errorf("binary component %q: endpoint is required for %s check", c.Name, c.CheckMethod)
+            }
+        case "shell":
+            if c.Command == "" {
+                return fmt.Errorf("binary component %q: command is required for shell check", c.Name)
+            }
+        default:
+            return fmt.Errorf("binary component %q: unknown checkMethod %q", c.Name, c.CheckMethod)
         }
     }
     
@@ -2666,6 +2825,32 @@ func DefaultHealthCheckConfig() HealthCheckConfig {
             {Name: "kubelet", Type: ComponentTypeBinary, ServiceName: "kubelet", CheckMethod: "systemd", Priority: PriorityCritical},
             {Name: "bkeagent", Type: ComponentTypeBinary, ServiceName: "bkeagent", CheckMethod: "systemd", Priority: PriorityCritical},
             {Name: "docker", Type: ComponentTypeBinary, ServiceName: "docker", CheckMethod: "systemd", Priority: PriorityImportant},
+            
+            // 二进制组件 - shell 检查（新增）
+            {
+                Name:        "etcd-health",
+                Type:        ComponentTypeBinary,
+                CheckMethod: "shell",
+                Command:     "etcdctl endpoint health --endpoints=https://localhost:2379 --cacert=/etc/kubernetes/pki/etcd/ca.crt --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt --key=/etc/kubernetes/pki/etcd/healthcheck-client.key",
+                Timeout:     10 * time.Second,
+                Priority:    PriorityCritical,
+            },
+            {
+                Name:        "apiserver-health",
+                Type:        ComponentTypeBinary,
+                CheckMethod: "shell",
+                Command:     "curl -s -k https://localhost:6443/healthz | grep -q ok",
+                Timeout:     5 * time.Second,
+                Priority:    PriorityCritical,
+            },
+            {
+                Name:        "kubeconfig-exists",
+                Type:        ComponentTypeBinary,
+                CheckMethod: "shell",
+                Command:     "test -f /etc/kubernetes/admin.conf",
+                Timeout:     2 * time.Second,
+                Priority:    PriorityImportant,
+            },
             
             // 其他 Pod 组件
             {Name: NameMetricsServer, Type: ComponentTypePod, Namespace: "kube-system", Prefixes: []string{"metrics-server-"}, Priority: PriorityOptional},
@@ -2808,16 +2993,135 @@ func (c *BinaryStatusCache) Set(nodeIP, serviceName string, result BinaryCheckRe
 }
 ```
 
+### Shell 命令检查使用示例
+
+#### 示例 1: 简单的文件检查
+
+```yaml
+- name: config-file-exists
+  type: binary
+  checkMethod: shell
+  command: "test -f /etc/kubernetes/config.yaml"
+  timeout: 2s
+  priority: important
+```
+
+#### 示例 2: HTTP 健康检查
+
+```yaml
+- name: apiserver-health
+  type: binary
+  checkMethod: shell
+  command: "curl -s -k https://localhost:6443/healthz | grep -q ok"
+  timeout: 5s
+  priority: critical
+```
+
+#### 示例 3: etcd 健康检查
+
+```yaml
+- name: etcd-cluster-health
+  type: binary
+  checkMethod: shell
+  command: |
+    etcdctl endpoint health \
+      --endpoints=https://localhost:2379 \
+      --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+      --cert=/etc/kubernetes/pki/etcd/healthcheck-client.crt \
+      --key=/etc/kubernetes/pki/etcd/healthcheck-client.key
+  timeout: 10s
+  priority: critical
+```
+
+#### 示例 4: 进程检查
+
+```yaml
+- name: kubelet-process
+  type: binary
+  checkMethod: shell
+  command: "pgrep -f 'kubelet' > /dev/null"
+  timeout: 2s
+  priority: critical
+```
+
+#### 示例 5: 复合检查
+
+```yaml
+- name: master-node-health
+  type: binary
+  checkMethod: shell
+  command: |
+    test -f /etc/kubernetes/admin.conf && \
+    systemctl is-active kubelet && \
+    systemctl is-active containerd && \
+    curl -s -k https://localhost:6443/healthz | grep -q ok
+  timeout: 10s
+  priority: critical
+```
+
+### Shell 命令检查安全性考虑
+
+#### 1. 命令注入防护
+
+- 使用 `escapeShellCommand` 转义特殊字符
+- 限制命令长度（建议不超过 1000 字符）
+- 禁止使用 `sudo` 等提权命令
+
+```go
+// escapeShellCommand 转义 shell 命令中的特殊字符
+func escapeShellCommand(cmd string) string {
+    // 替换双引号为转义的双引号
+    cmd = strings.ReplaceAll(cmd, "\"", "\\\"")
+    // 替换换行符为空格（支持多行命令）
+    cmd = strings.ReplaceAll(cmd, "\n", " ")
+    return cmd
+}
+```
+
+#### 2. 超时控制
+
+- 默认超时 5 秒
+- 最大超时 30 秒
+- 防止命令挂起
+
+```go
+// 设置超时
+timeout := config.Timeout
+if timeout == 0 {
+    timeout = 5 * time.Second // 默认 5 秒超时
+}
+
+ctx, cancel := context.WithTimeout(ctx, timeout)
+defer cancel()
+```
+
+#### 3. 权限控制
+
+- 使用普通用户执行命令
+- 禁止执行危险命令（rm -rf、dd 等）
+- 可以通过白名单限制可执行的命令
+
+#### 4. 错误处理
+
+Shell 命令检查可能遇到以下错误场景：
+
+| 错误类型 | Reason | 说明 |
+|---------|--------|------|
+| 命令超时 | CommandTimeout | 命令执行时间超过配置的超时时间 |
+| SSH 连接失败 | CommandExecutionFailed | 无法连接到远程节点或执行命令失败 |
+| 命令返回非零退出码 | CommandReturnedNonZero | 命令执行成功但返回非零退出码（表示检查失败） |
+
 ### 总结
 
 统一的二进制健康检查机制提供了：
 
 1. **统一架构**：Pod 组件和二进制组件使用相同的检查框架
-2. **灵活配置**：支持多种检查方法（systemd、HTTP、TCP）
+2. **灵活配置**：支持多种检查方法（systemd、HTTP、TCP、shell）
 3. **优先级管理**：与现有优先级系统无缝集成
 4. **性能优化**：并行检查、缓存优化
 5. **错误处理**：统一的错误类型和日志格式
 6. **可扩展性**：易于添加新的二进制组件和检查方法
+7. **Shell 命令检查**：支持执行任意 shell 命令进行健康检查，返回 0 表示健康
 
 这个设计可以确保 BKE 集群的所有关键组件（无论是 Pod 还是二进制）都得到统一的健康检查，提高集群的可靠性和可观测性。
 
