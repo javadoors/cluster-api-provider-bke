@@ -1,7 +1,7 @@
 ﻿# KEP: BKE 状态机问题分析与优化重构方案
 
 | 字段 | 值 |
-|------|-----|
+| ------ | ----- |
 | **KEP 编号** | KEP-6-SM |
 | **标题** | BKE 状态机问题分析与优化重构方案 |
 | **状态** | `provisional` |
@@ -46,12 +46,14 @@
 本提案针对 BKE 集群状态机存在的核心问题进行全面分析和重构设计：
 
 **核心问题**：
+
 - **三字段职责重叠**：`Phase`、`ClusterStatus`、`ClusterHealthState` 三个状态字段语义重叠率高达 50%-56%，导致状态管理混乱
 - **状态转换逻辑分散**：28 个状态转换点分布在 6 个文件中，11 个独立的 `handleCluster*Phase` 函数缺乏统一管理
 - **状态管理器缺陷**：全局单例内存泄漏、固定重试次数（10次）、并发不安全（int 非原子操作）、Failed 状态覆盖不全（3/8）
 - **可观测性不足**：缺乏状态转换事件记录和可视化支持
 
 **重构方案**（分阶段实施）：
+
 - **阶段一（核心）**：三字段整合 —— 以 `ClusterStatus` 为单一数据源，`Phase` 和 `ClusterHealthState` 标记为 Deprecated 并自动同步，提供生命周期阶段映射函数，支持向三层状态机架构平滑演进
 - **阶段二（增强）**：引入状态转换表引擎（64 条规则），替代 11 个分散的 `handleCluster*Phase` 函数
 - **阶段三（增强）**：改进状态管理器（StatusManagerV2），支持按状态索引重试策略、自动过期清理、原子计数器，覆盖全部 8 种 Failed 状态
@@ -65,7 +67,6 @@
 
 ## 2. 动机
 
-
 ## 状态机问题分析与优化重构方案
 
 ### 1. 存在的问题分析
@@ -73,11 +74,13 @@
 #### 1.1 状态转换逻辑分散问题
 
 **问题描述**:
+
 - 状态转换逻辑分散在`phase_flow.go`的多个`handleCluster*Phase`函数中
 - 缺乏统一的状态转换表和转换规则定义
 - 状态转换条件隐含在代码逻辑中，难以理解和维护
 
 **代码示例**:
+
 ```go
 // 当前实现：分散的状态转换函数
 func handleClusterInitPhase(ctx *PhaseContext, err error) {
@@ -99,6 +102,7 @@ func handleClusterScaleMasterUpPhase(ctx *PhaseContext, err error) {
 ```
 
 **问题影响**:
+
 - 新增状态需要修改多处代码
 - 状态转换规则难以验证
 - 缺乏状态转换的可视化支持
@@ -112,7 +116,7 @@ func handleClusterScaleMasterUpPhase(ctx *PhaseContext, err error) {
 **文件**: `pkg/phaseframe/phases/phase_flow.go`
 
 | 行号 | 函数名 | 状态转换 | 说明 |
-|------|--------|---------|------|
+| ------ | -------- | --------- | ------ |
 | 301-309 | `calculatingClusterPreStatusByPhase` | → ClusterChecking | Phase执行前的状态计算 |
 | 311-320 | `calculatingClusterPostStatusByPhase` | 根据Phase结果 | Phase执行后的状态计算 |
 | 322-356 | `calculateClusterStatusByPhase` | 分发到各handle函数 | 核心调度函数 |
@@ -135,7 +139,7 @@ func handleClusterScaleMasterUpPhase(ctx *PhaseContext, err error) {
 **文件**: `pkg/statusmanage/statusmanager.go`
 
 | 行号 | 函数/逻辑 | 状态转换 | 说明 |
-|------|----------|---------|------|
+| ------ | ---------- | --------- | ------ |
 | 121-228 | `recordBKEClusterStatus` | 状态记录和恢复 | 核心状态管理逻辑 |
 | 169 | `SetLatestNormalState` | 记录正常状态 | 保存最后一次正常状态 |
 | 183 | `SetLatestFailedState` | 记录失败状态 | 保存最后一次失败状态 |
@@ -143,6 +147,7 @@ func handleClusterScaleMasterUpPhase(ctx *PhaseContext, err error) {
 | 206-213 | ClusterHealthState转换 | Deploying → DeployFailed等 | 超过重试次数后的状态转换 |
 
 **关键逻辑**:
+
 - 失败计数和重试机制（默认10次）
 - 状态恢复：失败时恢复到 LatestNormalState
 - 超过重试次数后设置 ClusterHealthState
@@ -152,7 +157,7 @@ func handleClusterScaleMasterUpPhase(ctx *PhaseContext, err error) {
 **文件**: `pkg/phaseframe/phases/ensure_cluster.go`
 
 | 行号 | 位置 | 状态转换 | 说明 |
-|------|------|---------|------|
+| ------ | ------ | --------- | ------ |
 | 319 | 条件检查 | ClusterHealthState == Deploying | 检查部署状态 |
 | 373 | 健康检查失败 | → Unhealthy | 集群不健康 |
 | 399 | 健康检查成功 | → Healthy | 集群健康 |
@@ -163,7 +168,7 @@ func handleClusterScaleMasterUpPhase(ctx *PhaseContext, err error) {
 **文件**: `controllers/capbke/bkecluster_controller.go`
 
 | 行号 | 函数 | 状态转换 | 说明 |
-|------|------|---------|------|
+| ------ | ------ | --------- | ------ |
 | 199-220 | `handleClusterStatus` | 状态更新 | 控制器状态处理 |
 | 807 | 直接赋值 | ClusterHealthState | 设置健康状态 |
 
@@ -193,6 +198,7 @@ func handleClusterScaleMasterUpPhase(ctx *PhaseContext, err error) {
 **文件**: `api/capbke/v1beta1/bkecluster_consts.go`
 
 ####### 5.1 ClusterStatus 定义（152-182行）
+
 ```go
 ClusterReady, ClusterUnhealthy, ClusterUnknown, ClusterChecking
 ClusterPaused, ClusterPauseFailed
@@ -208,6 +214,7 @@ ClusterDeleting, ClusterDeleteFailed
 ```
 
 ####### 5.2 ClusterHealthState 定义（222-230行）
+
 ```go
 Deploying, DeployFailed
 Upgrading, UpgradeFailed
@@ -219,7 +226,7 @@ Deleting
 ###### 6. 状态转换逻辑分布统计
 
 | 文件 | 状态转换点数量 | 主要职责 |
-|------|--------------|---------|
+| ------ | -------------- | --------- |
 | phase_flow.go | 14个 | Phase级别的状态转换 |
 | statusmanager.go | 5个 | 状态记录、恢复、重试 |
 | ensure_cluster.go | 3个 | 健康状态转换 |
@@ -275,7 +282,7 @@ type BKEClusterStatus struct {
 **三个字段概览**：
 
 | 字段 | 枚举值数量 | 职责 | 问题 |
-|------|----------|------|------|
+| ------ | ---------- | ------ | ------ |
 | **Phase** | 12 个 | 表达"正在执行哪个 Phase" | 与 ClusterStatus 重叠 50% |
 | **ClusterStatus** | 22 个 | 表达"集群当前处于什么操作状态" | 与 ClusterHealthState 重叠 56% |
 | **ClusterHealthState** | 9 个 | 表达"集群健康状态" | 与 ClusterStatus 重叠 56% |
@@ -285,7 +292,7 @@ type BKEClusterStatus struct {
 **枚举值对比**：
 
 | ClusterStatus（22个值） | ClusterHealthState（9个值） | 重叠情况 |
-|------------------------|---------------------------|---------|
+| ------------------------ | --------------------------- | --------- |
 | `ClusterUpgrading` | `Upgrading` | ❌ **完全重复** |
 | `ClusterUpgradeFailed` | `UpgradeFailed` | ❌ **完全重复** |
 | `ClusterManaging` | `Managing` | ❌ **完全重复** |
@@ -342,7 +349,7 @@ Scale
 **映射关系**：
 
 | Phase | ClusterStatus | 重叠程度 |
-|-------|---------------|---------|
+| ------- | --------------- | --------- |
 | `InitControlPlane` | `Initializing` | ❌ **完全重叠** |
 | `JoinControlPlane` | `Initializing` | ❌ **完全重叠** |
 | `JoinWorker` | `Initializing` | ❌ **完全重叠** |
@@ -417,7 +424,7 @@ func (r *BKEClusterReconciler) setClusterHealthStatus(...) {
 `ClusterStatus` 有但 `ClusterHealthState` 无对应的状态：
 
 | 缺失状态 | ClusterStatus 中的对应 | 影响 |
-|----------|----------------------|------|
+| ---------- | ---------------------- | ------ |
 | `Scaling` / `ScaleFailed` | `ClusterMasterScalingUp/Down`、`ClusterWorkerScalingUp/Down`、`ClusterScaleFailed` | 扩缩容时 `ClusterHealthState` 不变，用户无法从健康状态判断正在扩缩容 |
 | `DeleteFailed` | `ClusterDeleteFailed` | 删除失败后 `ClusterHealthState` 仍为 `Deleting`，无法表达删除失败 |
 | `Unknown` | `ClusterUnknown` | 无"未知健康"状态，新集群或状态丢失时无法表达 |
@@ -428,7 +435,7 @@ func (r *BKEClusterReconciler) setClusterHealthStatus(...) {
 `ClusterStatus` 的 22 个值实际混合了三个维度：
 
 | 维度 | 值 | 说明 |
-|------|-----|------|
+| ------ | ----- | ------ |
 | **健康状态** | `ClusterReady`, `ClusterUnhealthy`, `ClusterUnknown`, `ClusterChecking` | 描述集群"是否健康" |
 | **操作进行中** | `ClusterInitializing`, `ClusterUpgrading`, `ClusterMasterScalingUp`, `ClusterWorkerScalingUp`, `ClusterMasterScalingDown`, `ClusterWorkerScalingDown`, `ClusterDeployingAddon`, `ClusterManaging`, `ClusterDeleting`, `ClusterDryRun`, `ClusterPaused` | 描述集群"正在做什么" |
 | **操作失败** | `ClusterInitializationFailed`, `ClusterUpgradeFailed`, `ClusterScaleFailed`, `ClusterDeployAddonFailed`, `ClusterManageFailed`, `ClusterDeleteFailed`, `ClusterPauseFailed`, `ClusterDryRunFailed` | 描述操作"失败了吗" |
@@ -456,6 +463,7 @@ case bkev1beta1.Upgrading:
 ```
 
 **问题**：
+
 - `ClusterStatus` 由 `phase_flow.go` 的 11 个 `handle*Phase` 函数设置
 - `ClusterHealthState` 由 `setClusterHealthStatus`（controller:757）和 `ensure_cluster.go:373,399` 设置
 - `statusmanager.go` 在失败重试逻辑中同时修改两者
@@ -505,7 +513,7 @@ default:
 **问题总结**：
 
 | 问题 | 严重程度 | 根因 |
-|------|---------|------|
+| ------ | --------- | ------ |
 | 三个字段语义严重重叠 | 高 | 三个类型描述同一信息的不同粒度 |
 | ClusterHealthState 非纯健康状态 | 高 | 命名与内容不符，混入操作状态 |
 | ClusterHealthState 缺失关键状态 | 中 | 扩缩容/删除失败无健康状态表达 |
@@ -515,6 +523,7 @@ default:
 | 缺乏生命周期抽象 | 中 | 双状态设计无法支撑三层状态机架构演进 |
 
 **影响**：
+
 - 开发者难以理解应该使用哪个字段
 - 状态转换逻辑分散在多个字段中，增加维护成本
 - 容易出现状态不一致（Phase=InitControlPlane 但 ClusterStatus=Ready）
@@ -538,6 +547,7 @@ type StatusManager struct {
 ```
 
 **问题**:
+
 - 集群删除后，状态记录可能未被清理
 - 长期运行的管理集群会积累大量无用状态记录
 - 缺乏状态记录的自动过期机制
@@ -553,6 +563,7 @@ func (sr *StatusRecord) AllowFailed() bool {
 ```
 
 **问题**:
+
 - 所有Phase使用相同的失败次数限制
 - 无法针对不同Phase设置不同的重试策略
 - 缺乏指数退避机制
@@ -581,6 +592,7 @@ if sr.AllowFailed() {
 ```
 
 **问题**:
+
 - 状态恢复逻辑与业务逻辑高度耦合
 - 难以理解状态恢复的完整流程
 - 缺乏状态恢复失败的兜底机制
@@ -602,6 +614,7 @@ if len(p.ctx.BKECluster.Status.PhaseStatus) > MaxPhaseStatusHistory {
 ```
 
 **问题**:
+
 - 可能丢失重要的Phase执行历史
 - 无法追溯长时间运行集群的完整历史
 - 调试和问题排查困难
@@ -616,6 +629,7 @@ var FullPhasesRegisFunc = append(append(
 ```
 
 **问题**:
+
 - Phase执行顺序固定，缺乏灵活性
 - 无法动态调整Phase执行顺序
 - 难以支持条件性的Phase跳过
@@ -640,6 +654,7 @@ func (b *StatusManager) recordBKEClusterStatus(bkeCluster *BKECluster) {
 ```
 
 **问题**:
+
 - 在持有锁的情况下修改外部对象状态
 - 可能与其他锁产生死锁
 - 锁的粒度过大
@@ -655,6 +670,7 @@ if sr.AllowFailed() {
 ```
 
 **问题**:
+
 - LatestNormalState可能在读取后被修改
 - 缺乏原子性保证
 - 可能导致状态不一致
@@ -662,6 +678,7 @@ if sr.AllowFailed() {
 #### 1.5 状态可观测性问题
 
 **问题描述**:
+
 - 缺乏状态转换事件记录
 - 难以追踪状态转换历史
 - 缺乏状态机可视化支持
@@ -672,18 +689,18 @@ if sr.AllowFailed() {
 #### 1.6 代码可维护性问题
 
 **问题描述**:
+
 - 状态转换逻辑与业务逻辑耦合
 - 缺乏状态机测试工具
 - 状态定义分散在多个文件
 - 缺乏状态机的文档生成工具
-
 
 ## 3. 范围与约束
 
 ### 3.1 范围
 
 | 范围 | 说明 |
-|------|------|
+| ------ | ------ |
 | **三字段整合** | 以 `ClusterStatus` 为单一数据源，`Phase`/`ClusterHealthState` 标记 Deprecated |
 | **映射函数** | 新增 `MapPhaseToClusterStatus`、`MapClusterHealthStateToClusterStatus`、`MapToLifecyclePhase` 等 |
 | **状态转换表引擎** | 新增 `pkg/phaseframe/statemachine/` 包，64 条转换规则，替代 11 个 handle 函数 |
@@ -693,7 +710,7 @@ if sr.AllowFailed() {
 ### 3.2 约束
 
 | 约束 | 说明 |
-|------|------|
+| ------ | ------ |
 | **向后兼容** | `Phase` 和 `ClusterHealthState` 字段保留，标记 Deprecated，自动同步 |
 | **渐进式迁移** | 分阶段实施，阶段一（三字段整合）必须，阶段二（引擎+管理器）可选 |
 | **前瞻性设计** | 提供 `MapToLifecyclePhase` 映射函数，支持向三层状态机架构平滑演进 |
@@ -717,11 +734,13 @@ if sr.AllowFailed() {
 ###### 2.1.1.1 核心设计理念
 
 **问题本质**：
+
 - 当前存在三个状态字段：`Phase`、`ClusterStatus`、`ClusterHealthState`
 - 三个字段职责重叠，都在表达"集群当前在做什么 + 是否健康 + 是否失败"
 - 导致状态管理混乱、维护成本高、容易出现不一致
 
 **解决思路**：
+
 - **统一状态表达**：使用单一的 `ClusterStatus` 字段表达所有状态信息
 - **保持兼容性**：`Phase` 和 `ClusterHealthState` 字段标记为 Deprecated，但不删除
 - **代码重构**：所有新代码只使用 `ClusterStatus` 字段
@@ -730,7 +749,7 @@ if sr.AllowFailed() {
 ###### 2.1.1.2 设计原则
 
 | 原则 | 说明 | 实现方式 |
-|------|------|----------|
+| ------ | ------ | ---------- |
 | **最小改动原则** | 尽量保持现有代码结构不变 | 只修改必要的代码，不重构整个框架 |
 | **向后兼容原则** | 确保外部消费者不受影响 | 保留旧字段，标记为 Deprecated |
 | **渐进式迁移原则** | 分阶段实施，降低风险 | 当前实施阶段 1（准备阶段），后续阶段在未来实施 |
@@ -739,7 +758,7 @@ if sr.AllowFailed() {
 ###### 2.1.1.3 设计目标
 
 | 目标 | 衡量指标 | 预期结果 |
-|------|----------|----------|
+| ------ | ---------- | ---------- |
 | **简化状态管理** | 代码中使用的状态字段数量 | 从 3 个减少到 1 个 |
 | **提高代码可维护性** | 代码行数 | 减少约 200 行 |
 | **保持兼容性** | 外部消费者影响 | 无影响（字段保留） |
@@ -750,11 +769,13 @@ if sr.AllowFailed() {
 ###### 2.1.2.1 API 层重构
 
 **重构内容**：
+
 - 为 `Phase` 字段添加 Deprecated 注释
 - 为 `ClusterHealthState` 字段添加 Deprecated 注释
 - 保留 `ClusterStatus` 字段定义
 
 **文件清单**：
+
 - `api/bkecommon/v1beta1/bkecluster_status.go`：修改字段注释
 
 **修改方案**：
@@ -764,6 +785,7 @@ if sr.AllowFailed() {
 修改位置：第 277-287 行
 
 修改前：
+
 ```go
 // Phase is the current phase of the cluster.
 // +optional
@@ -779,6 +801,7 @@ ClusterHealthState ClusterHealthState `json:"clusterHealthState,omitempty"`
 ```
 
 修改后：
+
 ```go
 // Phase is the current phase of the cluster.
 //
@@ -805,6 +828,7 @@ ClusterHealthState ClusterHealthState `json:"clusterHealthState,omitempty"`
 ###### 2.1.2.2 映射函数层重构
 
 **重构内容**：
+
 - 新增 `MapPhaseToClusterStatus` 函数：将 Phase 映射到 ClusterStatus
 - 新增 `MapClusterHealthStateToClusterStatus` 函数：将 ClusterHealthState 映射到 ClusterStatus
 - 新增 `MapClusterStatusToPhase` 函数：将 ClusterStatus 映射到 Phase（用于向后兼容）
@@ -812,6 +836,7 @@ ClusterHealthState ClusterHealthState `json:"clusterHealthState,omitempty"`
 - 新增 `MapToLifecyclePhase` 函数：将 ClusterStatus 映射到统一生命周期阶段（面向三层状态机架构的集群层投影）
 
 **文件清单**：
+
 - `pkg/phaseframe/mapper.go`：新增映射函数文件
 - `pkg/phaseframe/mapper_test.go`：新增映射函数单元测试
 
@@ -823,152 +848,152 @@ ClusterHealthState ClusterHealthState `json:"clusterHealthState,omitempty"`
 package phaseframe
 
 import (
-	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
-	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
+ confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
+ bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
 )
 
 // MapPhaseToClusterStatus 将 Phase 映射到 ClusterStatus
 // 用于替代原有的 Phase 字段，统一使用 ClusterStatus 作为状态表达
 func MapPhaseToClusterStatus(phase confv1beta1.BKEClusterPhase, err error) bkev1beta1.ClusterStatus {
-	switch phase {
-	case bkev1beta1.InitControlPlane, bkev1beta1.JoinControlPlane, bkev1beta1.JoinWorker:
-		if err != nil {
-			return bkev1beta1.ClusterInitializationFailed
-		}
-		return bkev1beta1.ClusterInitializing
-	
-	case bkev1beta1.UpgradeControlPlane, bkev1beta1.UpgradeWorker, bkev1beta1.UpgradeEtcd:
-		if err != nil {
-			return bkev1beta1.ClusterUpgradeFailed
-		}
-		return bkev1beta1.ClusterUpgrading
-	
-	case bkev1beta1.Scale:
-		if err != nil {
-			return bkev1beta1.ClusterScaleFailed
-		}
-		// 注意：Scale Phase 既用于扩容也用于缩容，但 Phase 字段本身不携带方向信息。
-		// 此处返回 ClusterInitializing 作为占位状态，实际方向由 Engine 的转换规则
-		// 根据 trigger（EnsureMasterJoin/EnsureWorkerJoin/EnsureMasterDelete/EnsureWorkerDelete）决定。
-		// 新代码应使用 Engine 的转换规则，本函数仅用于向后兼容场景。
-		return bkev1beta1.ClusterInitializing
-	
-	case bkev1beta1.FailedBootstrapNode:
-		return bkev1beta1.ClusterInitializationFailed
-	
-	case bkev1beta1.ClusterReadyOld:
-		return bkev1beta1.ClusterReady
-	
-	default:
-		return bkev1beta1.ClusterUnknown
-	}
+ switch phase {
+ case bkev1beta1.InitControlPlane, bkev1beta1.JoinControlPlane, bkev1beta1.JoinWorker:
+  if err != nil {
+   return bkev1beta1.ClusterInitializationFailed
+  }
+  return bkev1beta1.ClusterInitializing
+ 
+ case bkev1beta1.UpgradeControlPlane, bkev1beta1.UpgradeWorker, bkev1beta1.UpgradeEtcd:
+  if err != nil {
+   return bkev1beta1.ClusterUpgradeFailed
+  }
+  return bkev1beta1.ClusterUpgrading
+ 
+ case bkev1beta1.Scale:
+  if err != nil {
+   return bkev1beta1.ClusterScaleFailed
+  }
+  // 注意：Scale Phase 既用于扩容也用于缩容，但 Phase 字段本身不携带方向信息。
+  // 此处返回 ClusterInitializing 作为占位状态，实际方向由 Engine 的转换规则
+  // 根据 trigger（EnsureMasterJoin/EnsureWorkerJoin/EnsureMasterDelete/EnsureWorkerDelete）决定。
+  // 新代码应使用 Engine 的转换规则，本函数仅用于向后兼容场景。
+  return bkev1beta1.ClusterInitializing
+ 
+ case bkev1beta1.FailedBootstrapNode:
+  return bkev1beta1.ClusterInitializationFailed
+ 
+ case bkev1beta1.ClusterReadyOld:
+  return bkev1beta1.ClusterReady
+ 
+ default:
+  return bkev1beta1.ClusterUnknown
+ }
 }
 
 // MapClusterHealthStateToClusterStatus 将 ClusterHealthState 映射到 ClusterStatus
 // 用于替代原有的 ClusterHealthState 字段
 func MapClusterHealthStateToClusterStatus(healthState confv1beta1.ClusterHealthState) bkev1beta1.ClusterStatus {
-	switch healthState {
-	case bkev1beta1.Deploying:
-		return bkev1beta1.ClusterDeployingAddon
-	case bkev1beta1.DeployFailed:
-		return bkev1beta1.ClusterDeployAddonFailed
-	case bkev1beta1.Upgrading:
-		return bkev1beta1.ClusterUpgrading
-	case bkev1beta1.UpgradeFailed:
-		return bkev1beta1.ClusterUpgradeFailed
-	case bkev1beta1.Managing:
-		return bkev1beta1.ClusterManaging
-	case bkev1beta1.ManageFailed:
-		return bkev1beta1.ClusterManageFailed
-	case bkev1beta1.Unhealthy:
-		return bkev1beta1.ClusterUnhealthy
-	case bkev1beta1.Healthy:
-		return bkev1beta1.ClusterReady
-	case bkev1beta1.Deleting:
-		return bkev1beta1.ClusterDeleting
-	default:
-		return bkev1beta1.ClusterUnknown
-	}
+ switch healthState {
+ case bkev1beta1.Deploying:
+  return bkev1beta1.ClusterDeployingAddon
+ case bkev1beta1.DeployFailed:
+  return bkev1beta1.ClusterDeployAddonFailed
+ case bkev1beta1.Upgrading:
+  return bkev1beta1.ClusterUpgrading
+ case bkev1beta1.UpgradeFailed:
+  return bkev1beta1.ClusterUpgradeFailed
+ case bkev1beta1.Managing:
+  return bkev1beta1.ClusterManaging
+ case bkev1beta1.ManageFailed:
+  return bkev1beta1.ClusterManageFailed
+ case bkev1beta1.Unhealthy:
+  return bkev1beta1.ClusterUnhealthy
+ case bkev1beta1.Healthy:
+  return bkev1beta1.ClusterReady
+ case bkev1beta1.Deleting:
+  return bkev1beta1.ClusterDeleting
+ default:
+  return bkev1beta1.ClusterUnknown
+ }
 }
 
 // MapClusterStatusToPhase 将 ClusterStatus 映射到 Phase
 // 用于向后兼容，保持 Phase 字段与 ClusterStatus 同步
 func MapClusterStatusToPhase(status bkev1beta1.ClusterStatus) confv1beta1.BKEClusterPhase {
-	switch status {
-	case bkev1beta1.ClusterInitializing, bkev1beta1.ClusterInitializationFailed:
-		return bkev1beta1.InitControlPlane
-	case bkev1beta1.ClusterUpgrading, bkev1beta1.ClusterUpgradeFailed:
-		return bkev1beta1.UpgradeControlPlane
-	case bkev1beta1.ClusterMasterScalingUp, bkev1beta1.ClusterMasterScalingDown,
-		bkev1beta1.ClusterWorkerScalingUp, bkev1beta1.ClusterWorkerScalingDown,
-		bkev1beta1.ClusterScaleFailed:
-		return bkev1beta1.Scale
-	case bkev1beta1.ClusterReady:
-		return bkev1beta1.ClusterReadyOld
-	default:
-		return ""
-	}
+ switch status {
+ case bkev1beta1.ClusterInitializing, bkev1beta1.ClusterInitializationFailed:
+  return bkev1beta1.InitControlPlane
+ case bkev1beta1.ClusterUpgrading, bkev1beta1.ClusterUpgradeFailed:
+  return bkev1beta1.UpgradeControlPlane
+ case bkev1beta1.ClusterMasterScalingUp, bkev1beta1.ClusterMasterScalingDown,
+  bkev1beta1.ClusterWorkerScalingUp, bkev1beta1.ClusterWorkerScalingDown,
+  bkev1beta1.ClusterScaleFailed:
+  return bkev1beta1.Scale
+ case bkev1beta1.ClusterReady:
+  return bkev1beta1.ClusterReadyOld
+ default:
+  return ""
+ }
 }
 
 // MapClusterStatusToClusterHealthState 将 ClusterStatus 映射到 ClusterHealthState
 // 用于向后兼容，保持 ClusterHealthState 字段与 ClusterStatus 同步
 func MapClusterStatusToClusterHealthState(status bkev1beta1.ClusterStatus) confv1beta1.ClusterHealthState {
-	switch status {
-	case bkev1beta1.ClusterDeployingAddon:
-		return bkev1beta1.Deploying
-	case bkev1beta1.ClusterDeployAddonFailed:
-		return bkev1beta1.DeployFailed
-	case bkev1beta1.ClusterUpgrading:
-		return bkev1beta1.Upgrading
-	case bkev1beta1.ClusterUpgradeFailed:
-		return bkev1beta1.UpgradeFailed
-	case bkev1beta1.ClusterManaging:
-		return bkev1beta1.Managing
-	case bkev1beta1.ClusterManageFailed:
-		return bkev1beta1.ManageFailed
-	case bkev1beta1.ClusterUnhealthy:
-		return bkev1beta1.Unhealthy
-	case bkev1beta1.ClusterReady:
-		return bkev1beta1.Healthy
-	case bkev1beta1.ClusterDeleting:
-		return bkev1beta1.Deleting
-	default:
-		return ""
-	}
+ switch status {
+ case bkev1beta1.ClusterDeployingAddon:
+  return bkev1beta1.Deploying
+ case bkev1beta1.ClusterDeployAddonFailed:
+  return bkev1beta1.DeployFailed
+ case bkev1beta1.ClusterUpgrading:
+  return bkev1beta1.Upgrading
+ case bkev1beta1.ClusterUpgradeFailed:
+  return bkev1beta1.UpgradeFailed
+ case bkev1beta1.ClusterManaging:
+  return bkev1beta1.Managing
+ case bkev1beta1.ClusterManageFailed:
+  return bkev1beta1.ManageFailed
+ case bkev1beta1.ClusterUnhealthy:
+  return bkev1beta1.Unhealthy
+ case bkev1beta1.ClusterReady:
+  return bkev1beta1.Healthy
+ case bkev1beta1.ClusterDeleting:
+  return bkev1beta1.Deleting
+ default:
+  return ""
+ }
 }
 
 // MapToLifecyclePhase 将 ClusterStatus 映射到统一生命周期阶段
 // 面向三层状态机架构的集群层投影，支持向自底向上的状态聚合模型演进
 func MapToLifecyclePhase(status bkev1beta1.ClusterStatus) string {
-	// LifecyclePhase 定义（集群层，面向三层状态机架构）：
-	// - Creating: 集群创建中（节点加入、Agent 推送、组件安装）
-	// - Running: 集群运行中（所有组件就绪，服务可用）
-	// - Upgrading: 集群升级中（版本变更中）
-	// - Scaling: 集群扩缩容中（节点增减）
-	// - RollingBack: 集群回滚中（升级失败后恢复）
-	// - Failed: 集群失败（需要人工介入）
-	// - Deleting: 集群删除中
-	
-	switch status {
-	case bkev1beta1.ClusterInitializing:
-		return "Creating"
-	case bkev1beta1.ClusterReady:
-		return "Running"
-	case bkev1beta1.ClusterUpgrading:
-		return "Upgrading"
-	case bkev1beta1.ClusterMasterScalingUp, bkev1beta1.ClusterMasterScalingDown,
-		bkev1beta1.ClusterWorkerScalingUp, bkev1beta1.ClusterWorkerScalingDown:
-		return "Scaling"
-	case bkev1beta1.ClusterDeleting:
-		return "Deleting"
-	case bkev1beta1.ClusterInitializationFailed, bkev1beta1.ClusterUpgradeFailed,
-		bkev1beta1.ClusterScaleFailed, bkev1beta1.ClusterDeployAddonFailed,
-		bkev1beta1.ClusterManageFailed, bkev1beta1.ClusterDeleteFailed,
-		bkev1beta1.ClusterPauseFailed, bkev1beta1.ClusterDryRunFailed:
-		return "Failed"
-	default:
-		return ""
-	}
+ // LifecyclePhase 定义（集群层，面向三层状态机架构）：
+ // - Creating: 集群创建中（节点加入、Agent 推送、组件安装）
+ // - Running: 集群运行中（所有组件就绪，服务可用）
+ // - Upgrading: 集群升级中（版本变更中）
+ // - Scaling: 集群扩缩容中（节点增减）
+ // - RollingBack: 集群回滚中（升级失败后恢复）
+ // - Failed: 集群失败（需要人工介入）
+ // - Deleting: 集群删除中
+ 
+ switch status {
+ case bkev1beta1.ClusterInitializing:
+  return "Creating"
+ case bkev1beta1.ClusterReady:
+  return "Running"
+ case bkev1beta1.ClusterUpgrading:
+  return "Upgrading"
+ case bkev1beta1.ClusterMasterScalingUp, bkev1beta1.ClusterMasterScalingDown,
+  bkev1beta1.ClusterWorkerScalingUp, bkev1beta1.ClusterWorkerScalingDown:
+  return "Scaling"
+ case bkev1beta1.ClusterDeleting:
+  return "Deleting"
+ case bkev1beta1.ClusterInitializationFailed, bkev1beta1.ClusterUpgradeFailed,
+  bkev1beta1.ClusterScaleFailed, bkev1beta1.ClusterDeployAddonFailed,
+  bkev1beta1.ClusterManageFailed, bkev1beta1.ClusterDeleteFailed,
+  bkev1beta1.ClusterPauseFailed, bkev1beta1.ClusterDryRunFailed:
+  return "Failed"
+ default:
+  return ""
+ }
 }
 ```
 
@@ -978,309 +1003,311 @@ func MapToLifecyclePhase(status bkev1beta1.ClusterStatus) string {
 package phaseframe
 
 import (
-	"errors"
-	"testing"
+ "errors"
+ "testing"
 
-	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
-	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
-	"github.com/stretchr/testify/assert"
+ confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
+ bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
+ "github.com/stretchr/testify/assert"
 )
 
 func TestMapPhaseToClusterStatus(t *testing.T) {
-	tests := []struct {
-		name     string
-		phase    confv1beta1.BKEClusterPhase
-		err      error
-		expected bkev1beta1.ClusterStatus
-	}{
-		{
-			name:     "InitControlPlane without error",
-			phase:    bkev1beta1.InitControlPlane,
-			err:      nil,
-			expected: bkev1beta1.ClusterInitializing,
-		},
-		{
-			name:     "InitControlPlane with error",
-			phase:    bkev1beta1.InitControlPlane,
-			err:      errors.New("init failed"),
-			expected: bkev1beta1.ClusterInitializationFailed,
-		},
-		{
-			name:     "JoinControlPlane without error",
-			phase:    bkev1beta1.JoinControlPlane,
-			err:      nil,
-			expected: bkev1beta1.ClusterInitializing,
-		},
-		{
-			name:     "JoinWorker without error",
-			phase:    bkev1beta1.JoinWorker,
-			err:      nil,
-			expected: bkev1beta1.ClusterInitializing,
-		},
-		{
-			name:     "UpgradeControlPlane without error",
-			phase:    bkev1beta1.UpgradeControlPlane,
-			err:      nil,
-			expected: bkev1beta1.ClusterUpgrading,
-		},
-		{
-			name:     "UpgradeControlPlane with error",
-			phase:    bkev1beta1.UpgradeControlPlane,
-			err:      errors.New("upgrade failed"),
-			expected: bkev1beta1.ClusterUpgradeFailed,
-		},
-		{
-			name:     "Scale without error",
-			phase:    bkev1beta1.Scale,
-			err:      nil,
-			expected: bkev1beta1.ClusterMasterScalingUp,
-		},
-		{
-			name:     "Scale with error",
-			phase:    bkev1beta1.Scale,
-			err:      errors.New("scale failed"),
-			expected: bkev1beta1.ClusterScaleFailed,
-		},
-		{
-			name:     "FailedBootstrapNode",
-			phase:    bkev1beta1.FailedBootstrapNode,
-			err:      nil,
-			expected: bkev1beta1.ClusterInitializationFailed,
-		},
-		{
-			name:     "ClusterReadyOld",
-			phase:    bkev1beta1.ClusterReadyOld,
-			err:      nil,
-			expected: bkev1beta1.ClusterReady,
-		},
-		{
-			name:     "Unknown phase",
-			phase:    "UnknownPhase",
-			err:      nil,
-			expected: bkev1beta1.ClusterUnknown,
-		},
-	}
+ tests := []struct {
+  name     string
+  phase    confv1beta1.BKEClusterPhase
+  err      error
+  expected bkev1beta1.ClusterStatus
+ }{
+  {
+   name:     "InitControlPlane without error",
+   phase:    bkev1beta1.InitControlPlane,
+   err:      nil,
+   expected: bkev1beta1.ClusterInitializing,
+  },
+  {
+   name:     "InitControlPlane with error",
+   phase:    bkev1beta1.InitControlPlane,
+   err:      errors.New("init failed"),
+   expected: bkev1beta1.ClusterInitializationFailed,
+  },
+  {
+   name:     "JoinControlPlane without error",
+   phase:    bkev1beta1.JoinControlPlane,
+   err:      nil,
+   expected: bkev1beta1.ClusterInitializing,
+  },
+  {
+   name:     "JoinWorker without error",
+   phase:    bkev1beta1.JoinWorker,
+   err:      nil,
+   expected: bkev1beta1.ClusterInitializing,
+  },
+  {
+   name:     "UpgradeControlPlane without error",
+   phase:    bkev1beta1.UpgradeControlPlane,
+   err:      nil,
+   expected: bkev1beta1.ClusterUpgrading,
+  },
+  {
+   name:     "UpgradeControlPlane with error",
+   phase:    bkev1beta1.UpgradeControlPlane,
+   err:      errors.New("upgrade failed"),
+   expected: bkev1beta1.ClusterUpgradeFailed,
+  },
+  {
+   name:     "Scale without error",
+   phase:    bkev1beta1.Scale,
+   err:      nil,
+   expected: bkev1beta1.ClusterMasterScalingUp,
+  },
+  {
+   name:     "Scale with error",
+   phase:    bkev1beta1.Scale,
+   err:      errors.New("scale failed"),
+   expected: bkev1beta1.ClusterScaleFailed,
+  },
+  {
+   name:     "FailedBootstrapNode",
+   phase:    bkev1beta1.FailedBootstrapNode,
+   err:      nil,
+   expected: bkev1beta1.ClusterInitializationFailed,
+  },
+  {
+   name:     "ClusterReadyOld",
+   phase:    bkev1beta1.ClusterReadyOld,
+   err:      nil,
+   expected: bkev1beta1.ClusterReady,
+  },
+  {
+   name:     "Unknown phase",
+   phase:    "UnknownPhase",
+   err:      nil,
+   expected: bkev1beta1.ClusterUnknown,
+  },
+ }
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := MapPhaseToClusterStatus(tt.phase, tt.err)
-			assert.Equal(t, tt.expected, result)
-		})
-	}
+ for _, tt := range tests {
+  t.Run(tt.name, func(t *testing.T) {
+   result := MapPhaseToClusterStatus(tt.phase, tt.err)
+   assert.Equal(t, tt.expected, result)
+  })
+ }
 }
 
 func TestMapClusterHealthStateToClusterStatus(t *testing.T) {
-	tests := []struct {
-		name        string
-		healthState confv1beta1.ClusterHealthState
-		expected    bkev1beta1.ClusterStatus
-	}{
-		{
-			name:        "Deploying",
-			healthState: bkev1beta1.Deploying,
-			expected:    bkev1beta1.ClusterDeployingAddon,
-		},
-		{
-			name:        "DeployFailed",
-			healthState: bkev1beta1.DeployFailed,
-			expected:    bkev1beta1.ClusterDeployAddonFailed,
-		},
-		{
-			name:        "Upgrading",
-			healthState: bkev1beta1.Upgrading,
-			expected:    bkev1beta1.ClusterUpgrading,
-		},
-		{
-			name:        "UpgradeFailed",
-			healthState: bkev1beta1.UpgradeFailed,
-			expected:    bkev1beta1.ClusterUpgradeFailed,
-		},
-		{
-			name:        "Managing",
-			healthState: bkev1beta1.Managing,
-			expected:    bkev1beta1.ClusterManaging,
-		},
-		{
-			name:        "ManageFailed",
-			healthState: bkev1beta1.ManageFailed,
-			expected:    bkev1beta1.ClusterManageFailed,
-		},
-		{
-			name:        "Unhealthy",
-			healthState: bkev1beta1.Unhealthy,
-			expected:    bkev1beta1.ClusterUnhealthy,
-		},
-		{
-			name:        "Healthy",
-			healthState: bkev1beta1.Healthy,
-			expected:    bkev1beta1.ClusterReady,
-		},
-		{
-			name:        "Deleting",
-			healthState: bkev1beta1.Deleting,
-			expected:    bkev1beta1.ClusterDeleting,
-		},
-		{
-			name:        "Unknown health state",
-			healthState: "UnknownState",
-			expected:    bkev1beta1.ClusterUnknown,
-		},
-	}
+ tests := []struct {
+  name        string
+  healthState confv1beta1.ClusterHealthState
+  expected    bkev1beta1.ClusterStatus
+ }{
+  {
+   name:        "Deploying",
+   healthState: bkev1beta1.Deploying,
+   expected:    bkev1beta1.ClusterDeployingAddon,
+  },
+  {
+   name:        "DeployFailed",
+   healthState: bkev1beta1.DeployFailed,
+   expected:    bkev1beta1.ClusterDeployAddonFailed,
+  },
+  {
+   name:        "Upgrading",
+   healthState: bkev1beta1.Upgrading,
+   expected:    bkev1beta1.ClusterUpgrading,
+  },
+  {
+   name:        "UpgradeFailed",
+   healthState: bkev1beta1.UpgradeFailed,
+   expected:    bkev1beta1.ClusterUpgradeFailed,
+  },
+  {
+   name:        "Managing",
+   healthState: bkev1beta1.Managing,
+   expected:    bkev1beta1.ClusterManaging,
+  },
+  {
+   name:        "ManageFailed",
+   healthState: bkev1beta1.ManageFailed,
+   expected:    bkev1beta1.ClusterManageFailed,
+  },
+  {
+   name:        "Unhealthy",
+   healthState: bkev1beta1.Unhealthy,
+   expected:    bkev1beta1.ClusterUnhealthy,
+  },
+  {
+   name:        "Healthy",
+   healthState: bkev1beta1.Healthy,
+   expected:    bkev1beta1.ClusterReady,
+  },
+  {
+   name:        "Deleting",
+   healthState: bkev1beta1.Deleting,
+   expected:    bkev1beta1.ClusterDeleting,
+  },
+  {
+   name:        "Unknown health state",
+   healthState: "UnknownState",
+   expected:    bkev1beta1.ClusterUnknown,
+  },
+ }
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := MapClusterHealthStateToClusterStatus(tt.healthState)
-			assert.Equal(t, tt.expected, result)
-		})
-	}
+ for _, tt := range tests {
+  t.Run(tt.name, func(t *testing.T) {
+   result := MapClusterHealthStateToClusterStatus(tt.healthState)
+   assert.Equal(t, tt.expected, result)
+  })
+ }
 }
 
 func TestMapClusterStatusToPhase(t *testing.T) {
-	tests := []struct {
-		name     string
-		status   bkev1beta1.ClusterStatus
-		expected confv1beta1.BKEClusterPhase
-	}{
-		{
-			name:     "ClusterInitializing",
-			status:   bkev1beta1.ClusterInitializing,
-			expected: bkev1beta1.InitControlPlane,
-		},
-		{
-			name:     "ClusterInitializationFailed",
-			status:   bkev1beta1.ClusterInitializationFailed,
-			expected: bkev1beta1.InitControlPlane,
-		},
-		{
-			name:     "ClusterUpgrading",
-			status:   bkev1beta1.ClusterUpgrading,
-			expected: bkev1beta1.UpgradeControlPlane,
-		},
-		{
-			name:     "ClusterUpgradeFailed",
-			status:   bkev1beta1.ClusterUpgradeFailed,
-			expected: bkev1beta1.UpgradeControlPlane,
-		},
-		{
-			name:     "ClusterMasterScalingUp",
-			status:   bkev1beta1.ClusterMasterScalingUp,
-			expected: bkev1beta1.Scale,
-		},
-		{
-			name:     "ClusterMasterScalingDown",
-			status:   bkev1beta1.ClusterMasterScalingDown,
-			expected: bkev1beta1.Scale,
-		},
-		{
-			name:     "ClusterWorkerScalingUp",
-			status:   bkev1beta1.ClusterWorkerScalingUp,
-			expected: bkev1beta1.Scale,
-		},
-		{
-			name:     "ClusterWorkerScalingDown",
-			status:   bkev1beta1.ClusterWorkerScalingDown,
-			expected: bkev1beta1.Scale,
-		},
-		{
-			name:     "ClusterScaleFailed",
-			status:   bkev1beta1.ClusterScaleFailed,
-			expected: bkev1beta1.Scale,
-		},
-		{
-			name:     "ClusterReady",
-			status:   bkev1beta1.ClusterReady,
-			expected: bkev1beta1.ClusterReadyOld,
-		},
-		{
-			name:     "Unknown status",
-			status:   bkev1beta1.ClusterUnknown,
-			expected: "",
-		},
-	}
+ tests := []struct {
+  name     string
+  status   bkev1beta1.ClusterStatus
+  expected confv1beta1.BKEClusterPhase
+ }{
+  {
+   name:     "ClusterInitializing",
+   status:   bkev1beta1.ClusterInitializing,
+   expected: bkev1beta1.InitControlPlane,
+  },
+  {
+   name:     "ClusterInitializationFailed",
+   status:   bkev1beta1.ClusterInitializationFailed,
+   expected: bkev1beta1.InitControlPlane,
+  },
+  {
+   name:     "ClusterUpgrading",
+   status:   bkev1beta1.ClusterUpgrading,
+   expected: bkev1beta1.UpgradeControlPlane,
+  },
+  {
+   name:     "ClusterUpgradeFailed",
+   status:   bkev1beta1.ClusterUpgradeFailed,
+   expected: bkev1beta1.UpgradeControlPlane,
+  },
+  {
+   name:     "ClusterMasterScalingUp",
+   status:   bkev1beta1.ClusterMasterScalingUp,
+   expected: bkev1beta1.Scale,
+  },
+  {
+   name:     "ClusterMasterScalingDown",
+   status:   bkev1beta1.ClusterMasterScalingDown,
+   expected: bkev1beta1.Scale,
+  },
+  {
+   name:     "ClusterWorkerScalingUp",
+   status:   bkev1beta1.ClusterWorkerScalingUp,
+   expected: bkev1beta1.Scale,
+  },
+  {
+   name:     "ClusterWorkerScalingDown",
+   status:   bkev1beta1.ClusterWorkerScalingDown,
+   expected: bkev1beta1.Scale,
+  },
+  {
+   name:     "ClusterScaleFailed",
+   status:   bkev1beta1.ClusterScaleFailed,
+   expected: bkev1beta1.Scale,
+  },
+  {
+   name:     "ClusterReady",
+   status:   bkev1beta1.ClusterReady,
+   expected: bkev1beta1.ClusterReadyOld,
+  },
+  {
+   name:     "Unknown status",
+   status:   bkev1beta1.ClusterUnknown,
+   expected: "",
+  },
+ }
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := MapClusterStatusToPhase(tt.status)
-			assert.Equal(t, tt.expected, result)
-		})
-	}
+ for _, tt := range tests {
+  t.Run(tt.name, func(t *testing.T) {
+   result := MapClusterStatusToPhase(tt.status)
+   assert.Equal(t, tt.expected, result)
+  })
+ }
 }
 
 func TestMapClusterStatusToClusterHealthState(t *testing.T) {
-	tests := []struct {
-		name     string
-		status   bkev1beta1.ClusterStatus
-		expected confv1beta1.ClusterHealthState
-	}{
-		{
-			name:     "ClusterDeployingAddon",
-			status:   bkev1beta1.ClusterDeployingAddon,
-			expected: bkev1beta1.Deploying,
-		},
-		{
-			name:     "ClusterDeployAddonFailed",
-			status:   bkev1beta1.ClusterDeployAddonFailed,
-			expected: bkev1beta1.DeployFailed,
-		},
-		{
-			name:     "ClusterUpgrading",
-			status:   bkev1beta1.ClusterUpgrading,
-			expected: bkev1beta1.Upgrading,
-		},
-		{
-			name:     "ClusterUpgradeFailed",
-			status:   bkev1beta1.ClusterUpgradeFailed,
-			expected: bkev1beta1.UpgradeFailed,
-		},
-		{
-			name:     "ClusterManaging",
-			status:   bkev1beta1.ClusterManaging,
-			expected: bkev1beta1.Managing,
-		},
-		{
-			name:     "ClusterManageFailed",
-			status:   bkev1beta1.ClusterManageFailed,
-			expected: bkev1beta1.ManageFailed,
-		},
-		{
-			name:     "ClusterUnhealthy",
-			status:   bkev1beta1.ClusterUnhealthy,
-			expected: bkev1beta1.Unhealthy,
-		},
-		{
-			name:     "ClusterReady",
-			status:   bkev1beta1.ClusterReady,
-			expected: bkev1beta1.Healthy,
-		},
-		{
-			name:     "ClusterDeleting",
-			status:   bkev1beta1.ClusterDeleting,
-			expected: bkev1beta1.Deleting,
-		},
-		{
-			name:     "Unknown status",
-			status:   bkev1beta1.ClusterUnknown,
-			expected: "",
-		},
-	}
+ tests := []struct {
+  name     string
+  status   bkev1beta1.ClusterStatus
+  expected confv1beta1.ClusterHealthState
+ }{
+  {
+   name:     "ClusterDeployingAddon",
+   status:   bkev1beta1.ClusterDeployingAddon,
+   expected: bkev1beta1.Deploying,
+  },
+  {
+   name:     "ClusterDeployAddonFailed",
+   status:   bkev1beta1.ClusterDeployAddonFailed,
+   expected: bkev1beta1.DeployFailed,
+  },
+  {
+   name:     "ClusterUpgrading",
+   status:   bkev1beta1.ClusterUpgrading,
+   expected: bkev1beta1.Upgrading,
+  },
+  {
+   name:     "ClusterUpgradeFailed",
+   status:   bkev1beta1.ClusterUpgradeFailed,
+   expected: bkev1beta1.UpgradeFailed,
+  },
+  {
+   name:     "ClusterManaging",
+   status:   bkev1beta1.ClusterManaging,
+   expected: bkev1beta1.Managing,
+  },
+  {
+   name:     "ClusterManageFailed",
+   status:   bkev1beta1.ClusterManageFailed,
+   expected: bkev1beta1.ManageFailed,
+  },
+  {
+   name:     "ClusterUnhealthy",
+   status:   bkev1beta1.ClusterUnhealthy,
+   expected: bkev1beta1.Unhealthy,
+  },
+  {
+   name:     "ClusterReady",
+   status:   bkev1beta1.ClusterReady,
+   expected: bkev1beta1.Healthy,
+  },
+  {
+   name:     "ClusterDeleting",
+   status:   bkev1beta1.ClusterDeleting,
+   expected: bkev1beta1.Deleting,
+  },
+  {
+   name:     "Unknown status",
+   status:   bkev1beta1.ClusterUnknown,
+   expected: "",
+  },
+ }
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := MapClusterStatusToClusterHealthState(tt.status)
-			assert.Equal(t, tt.expected, result)
-		})
-	}
+ for _, tt := range tests {
+  t.Run(tt.name, func(t *testing.T) {
+   result := MapClusterStatusToClusterHealthState(tt.status)
+   assert.Equal(t, tt.expected, result)
+  })
+ }
 }
 ```
 
 ###### 2.1.2.3 PhaseFlow 框架层重构
 
 **重构内容**：
+
 - 修改 `phaseframe/base.go`：在设置 ClusterStatus 的同时，同步设置 Phase 和 ClusterHealthState（向后兼容）
 - 修改 `phaseframe/phases/ensure_paused.go`：使用 ClusterStatus 替代 Phase
 - 修改 `phaseframe/context.go`：使用 ClusterStatus 替代 Phase
 
 **文件清单**：
+
 - `pkg/phaseframe/base.go`：修改 handleRunningStatus 方法
 - `pkg/phaseframe/phases/ensure_paused.go`：修改 Phase 检查逻辑
 - `pkg/phaseframe/context.go`：修改日志输出
@@ -1292,6 +1319,7 @@ func TestMapClusterStatusToClusterHealthState(t *testing.T) {
 修改位置：第 316-327 行
 
 修改前：
+
 ```go
 func (b *BasePhase) handleRunningStatus(status []confv1beta1.PhaseState, phaseName confv1beta1.BKEClusterPhase, bkeCluster *bkev1beta1.BKECluster) []confv1beta1.PhaseState {
     bkeCluster.Status.Phase = phaseName
@@ -1301,6 +1329,7 @@ func (b *BasePhase) handleRunningStatus(status []confv1beta1.PhaseState, phaseNa
 ```
 
 修改后：
+
 ```go
 func (b *BasePhase) handleRunningStatus(status []confv1beta1.PhaseState, phaseName confv1beta1.BKEClusterPhase, bkeCluster *bkev1beta1.BKECluster) []confv1beta1.PhaseState {
     // 使用 ClusterStatus 作为主要状态字段
@@ -1320,6 +1349,7 @@ func (b *BasePhase) handleRunningStatus(status []confv1beta1.PhaseState, phaseNa
 修改位置：第 162 行
 
 修改前：
+
 ```go
 if params.BKECluster.Status.Phase == bkev1beta1.Scale || 
    params.BKECluster.Status.Phase == bkev1beta1.UpgradeControlPlane || 
@@ -1329,6 +1359,7 @@ if params.BKECluster.Status.Phase == bkev1beta1.Scale ||
 ```
 
 修改后：
+
 ```go
 // 使用 ClusterStatus 替代 Phase
 if params.BKECluster.Status.ClusterStatus == bkev1beta1.ClusterMasterScalingUp ||
@@ -1345,11 +1376,13 @@ if params.BKECluster.Status.ClusterStatus == bkev1beta1.ClusterMasterScalingUp |
 修改位置：第 242 行
 
 修改前：
+
 ```go
 log.Info("waiting for phase to complete", "phase", bkeCluster.Status.Phase)
 ```
 
 修改后：
+
 ```go
 log.Info("waiting for phase to complete", "status", bkeCluster.Status.ClusterStatus)
 ```
@@ -1357,10 +1390,12 @@ log.Info("waiting for phase to complete", "status", bkeCluster.Status.ClusterSta
 ###### 2.1.2.4 状态管理层重构
 
 **重构内容**：
+
 - 修改 `pkg/statusmanage/statusmanager.go`：使用 ClusterStatus 替代 ClusterHealthState
 - 在设置 ClusterStatus 的同时，同步设置 ClusterHealthState（向后兼容）
 
 **文件清单**：
+
 - `pkg/statusmanage/statusmanager.go`：修改 5 处代码
 
 **修改方案**：
@@ -1370,6 +1405,7 @@ log.Info("waiting for phase to complete", "status", bkeCluster.Status.ClusterSta
 修改位置 0：StatusRecord 结构体定义（第 40 行附近）
 
 修改前：
+
 ```go
 type StatusRecord struct {
     LatestNormalState   string
@@ -1381,6 +1417,7 @@ type StatusRecord struct {
 ```
 
 修改后：
+
 ```go
 type StatusRecord struct {
     LatestNormalState   string
@@ -1394,11 +1431,13 @@ type StatusRecord struct {
 修改位置 1：第 163 行
 
 修改前：
+
 ```go
 sr.SetCurrentClusterState(bkeCluster.Status.ClusterHealthState)
 ```
 
 修改后：
+
 ```go
 // 使用 ClusterStatus 作为当前状态
 sr.SetCurrentClusterState(bkeCluster.Status.ClusterStatus)
@@ -1407,6 +1446,7 @@ sr.SetCurrentClusterState(bkeCluster.Status.ClusterStatus)
 修改位置 2：第 206-212 行
 
 修改前：
+
 ```go
 switch sr.CurrentClusterState {
 case bkev1beta1.Deploying:
@@ -1422,6 +1462,7 @@ case bkev1beta1.Managing:
 ```
 
 修改后：
+
 ```go
 // 使用 ClusterStatus 作为主要状态字段
 switch sr.CurrentClusterState {
@@ -1443,10 +1484,12 @@ bkeCluster.Status.ClusterHealthState = MapClusterStatusToClusterHealthState(bkeC
 ###### 2.1.2.5 控制器层重构
 
 **重构内容**：
+
 - 修改 `controllers/capbke/bkecluster_controller.go`：使用 ClusterStatus 替代 ClusterHealthState
 - 在设置 ClusterStatus 的同时，同步设置 ClusterHealthState（向后兼容）
 
 **文件清单**：
+
 - `controllers/capbke/bkecluster_controller.go`：修改 markBKEClusterHealthyStatus 函数
 
 **修改方案**：
@@ -1456,6 +1499,7 @@ bkeCluster.Status.ClusterHealthState = MapClusterStatusToClusterHealthState(bkeC
 修改位置：第 805-807 行
 
 修改前：
+
 ```go
 func markBKEClusterHealthyStatus(bkeCluster *bkev1beta1.BKECluster, status confv1beta1.ClusterHealthState) {
     bkeCluster.Status.ClusterHealthState = status
@@ -1463,6 +1507,7 @@ func markBKEClusterHealthyStatus(bkeCluster *bkev1beta1.BKECluster, status confv
 ```
 
 修改后：
+
 ```go
 func markBKEClusterHealthyStatus(bkeCluster *bkev1beta1.BKECluster, status confv1beta1.ClusterHealthState) {
     // 使用 ClusterStatus 作为主要状态字段
@@ -1476,9 +1521,11 @@ func markBKEClusterHealthyStatus(bkeCluster *bkev1beta1.BKECluster, status confv
 ###### 2.1.2.6 Webhook 层重构
 
 **重构内容**：
+
 - 修改 `webhooks/capbke/bkecluster.go`：使用 ClusterStatus 替代 ClusterHealthState
 
 **文件清单**：
+
 - `webhooks/capbke/bkecluster.go`：修改 2 处代码
 
 **修改方案**：
@@ -1488,6 +1535,7 @@ func markBKEClusterHealthyStatus(bkeCluster *bkev1beta1.BKECluster, status confv
 修改位置 1：第 174 行
 
 修改前：
+
 ```go
 if newBKECluster.Status.ClusterHealthState == bkev1beta1.Deploying {
     // 执行部署逻辑
@@ -1495,6 +1543,7 @@ if newBKECluster.Status.ClusterHealthState == bkev1beta1.Deploying {
 ```
 
 修改后：
+
 ```go
 // 使用 ClusterStatus 替代 ClusterHealthState
 if newBKECluster.Status.ClusterStatus == bkev1beta1.ClusterDeployingAddon {
@@ -1505,6 +1554,7 @@ if newBKECluster.Status.ClusterStatus == bkev1beta1.ClusterDeployingAddon {
 修改位置 2：第 646 行
 
 修改前：
+
 ```go
 if newBKECluster.Status.ClusterHealthState != bkev1beta1.Healthy {
     // 执行健康检查逻辑
@@ -1512,6 +1562,7 @@ if newBKECluster.Status.ClusterHealthState != bkev1beta1.Healthy {
 ```
 
 修改后：
+
 ```go
 // 使用 ClusterStatus 替代 ClusterHealthState
 if newBKECluster.Status.ClusterStatus != bkev1beta1.ClusterReady {
@@ -1522,12 +1573,14 @@ if newBKECluster.Status.ClusterStatus != bkev1beta1.ClusterReady {
 ###### 2.1.2.7 其他文件重构
 
 **重构内容**：
+
 - 修改 `pkg/phaseframe/phases/ensure_cluster.go`：使用 ClusterStatus 替代 ClusterHealthState
 - 修改 `pkg/phaseframe/phases/ensure_nodes_env.go`：使用 ClusterStatus 替代 ClusterHealthState
 - 修改 `pkg/phaseframe/phases/ensure_bke_agent.go`：使用 ClusterStatus 替代 ClusterHealthState
 - 修改 `pkg/mergecluster/bkecluster.go`：使用 ClusterStatus 替代 ClusterHealthState
 
 **文件清单**：
+
 - `pkg/phaseframe/phases/ensure_cluster.go`：修改 3 处代码
 - `pkg/phaseframe/phases/ensure_nodes_env.go`：修改 1 处代码
 - `pkg/phaseframe/phases/ensure_bke_agent.go`：修改 1 处代码
@@ -1540,6 +1593,7 @@ if newBKECluster.Status.ClusterStatus != bkev1beta1.ClusterReady {
 修改位置 1：第 319 行
 
 修改前：
+
 ```go
 if bkeCluster.Status.ClusterHealthState == bkev1beta1.Deploying && !phaseutil.ClusterEndDeployedWithContext(ctx, c, e.Ctx.Cluster, bkeCluster, bkeNodes) {
     // 执行部署逻辑
@@ -1547,6 +1601,7 @@ if bkeCluster.Status.ClusterHealthState == bkev1beta1.Deploying && !phaseutil.Cl
 ```
 
 修改后：
+
 ```go
 // 使用 ClusterStatus 替代 ClusterHealthState
 if bkeCluster.Status.ClusterStatus == bkev1beta1.ClusterDeployingAddon && !phaseutil.ClusterEndDeployedWithContext(ctx, c, e.Ctx.Cluster, bkeCluster, bkeNodes) {
@@ -1557,11 +1612,13 @@ if bkeCluster.Status.ClusterStatus == bkev1beta1.ClusterDeployingAddon && !phase
 修改位置 2：第 373 行
 
 修改前：
+
 ```go
 bkeCluster.Status.ClusterHealthState = bkev1beta1.Unhealthy
 ```
 
 修改后：
+
 ```go
 // 使用 ClusterStatus 作为主要状态字段
 bkeCluster.Status.ClusterStatus = bkev1beta1.ClusterUnhealthy
@@ -1573,11 +1630,13 @@ bkeCluster.Status.ClusterHealthState = bkev1beta1.Unhealthy
 修改位置 3：第 399 行
 
 修改前：
+
 ```go
 bkeCluster.Status.ClusterHealthState = bkev1beta1.Healthy
 ```
 
 修改后：
+
 ```go
 // 使用 ClusterStatus 作为主要状态字段
 bkeCluster.Status.ClusterStatus = bkev1beta1.ClusterReady
@@ -1591,6 +1650,7 @@ bkeCluster.Status.ClusterHealthState = bkev1beta1.Healthy
 修改位置：第 337 行
 
 修改前：
+
 ```go
 if bkeCluster.Status.ClusterHealthState == bkev1beta1.Deploying && len(failedNodes) > 0 {
     // 执行节点环境检查逻辑
@@ -1598,6 +1658,7 @@ if bkeCluster.Status.ClusterHealthState == bkev1beta1.Deploying && len(failedNod
 ```
 
 修改后：
+
 ```go
 // 使用 ClusterStatus 替代 ClusterHealthState
 if bkeCluster.Status.ClusterStatus == bkev1beta1.ClusterDeployingAddon && len(failedNodes) > 0 {
@@ -1610,6 +1671,7 @@ if bkeCluster.Status.ClusterStatus == bkev1beta1.ClusterDeployingAddon && len(fa
 修改位置：第 575 行
 
 修改前：
+
 ```go
 if bkeCluster.Status.ClusterHealthState == bkev1beta1.Deploying && len(failedNodesInfo) > 0 {
     // 执行 BKE Agent 检查逻辑
@@ -1617,6 +1679,7 @@ if bkeCluster.Status.ClusterHealthState == bkev1beta1.Deploying && len(failedNod
 ```
 
 修改后：
+
 ```go
 // 使用 ClusterStatus 替代 ClusterHealthState
 if bkeCluster.Status.ClusterStatus == bkev1beta1.ClusterDeployingAddon && len(failedNodesInfo) > 0 {
@@ -1629,11 +1692,13 @@ if bkeCluster.Status.ClusterStatus == bkev1beta1.ClusterDeployingAddon && len(fa
 修改位置：第 442 行
 
 修改前：
+
 ```go
 params.CombinedCluster.Status.ClusterHealthState = newBKECuster.Status.ClusterHealthState
 ```
 
 修改后：
+
 ```go
 // 使用 ClusterStatus 作为主要状态字段
 params.CombinedCluster.Status.ClusterStatus = newBKECuster.Status.ClusterStatus
@@ -1645,14 +1710,17 @@ params.CombinedCluster.Status.ClusterHealthState = newBKECuster.Status.ClusterHe
 ###### 2.1.2.8 测试层重构
 
 **重构内容**：
+
 - 更新所有测试用例：使用 ClusterStatus 替代 Phase 和 ClusterHealthState
 - 新增映射函数单元测试：测试所有映射逻辑
 - 新增集成测试：测试完整的集群生命周期
 
 **文件清单**：
+
 - `*_test.go`：更新所有测试用例
 
 **测试覆盖**：
+
 - 单元测试：映射函数 100% 覆盖
 - 集成测试：集群创建、升级、删除流程
 - 端到端测试：完整的 BKE 系统测试
@@ -1685,7 +1753,7 @@ type Transition struct {
 **转换规则统计**（完整规则见 2.2.3 节 `registerClusterTransitions` 函数）：
 
 | 阶段 | 规则数 | 说明 |
-|------|--------|------|
+| ------ | -------- | ------ |
 | 初始化 | 11 | Unknown→Initializing（8个Phase）+ 成功/失败/重试 |
 | 健康检查 | 4 | Checking 状态的前后转换 |
 | Addon 部署 | 4 | Ready→Deploying→Ready/Failed + 重试 |
@@ -1755,7 +1823,7 @@ func (e *Engine) Transition(cluster *BKECluster, nodes BKENodes, trigger string,
 ###### 修复后的调用行为验证
 
 | 调用场景 | 调用方式 | effectiveTrigger | 匹配规则 | 目标状态 |
-|---------|---------|-----------------|---------|---------|
+| --------- | --------- | ----------------- | --------- | --------- |
 | Pre-hook | `Transition(cluster, "EnsureUpgrade", nil)` | `"EnsureUpgrade"` | `{Ready → Upgrading, "EnsureUpgrade"}` | `ClusterUpgrading` |
 | Post-hook 成功 | `Transition(cluster, "EnsureUpgrade", nil)` | `"EnsureUpgrade"` | `{Upgrading → Ready, "EnsureCluster"}` 或幂等 | `ClusterReady` 或保持 |
 | Post-hook 失败 | `Transition(cluster, "EnsureUpgrade", err)` | `"Error"` | `{Upgrading → UpgradeFailed, "Error"}` | `ClusterUpgradeFailed` |
@@ -1775,6 +1843,7 @@ func (e *Engine) Transition(cluster *BKECluster, nodes BKENodes, trigger string,
 ```
 
 **优势**:
+
 - 状态转换规则集中定义，易于理解和维护
 - 支持状态转换条件验证
 - 易于生成状态机文档和可视化图表
@@ -1817,7 +1886,7 @@ PhaseFlow.Execute()
 **第一层：直接替换（删除 11 个 handle 函数 + 分发器）**
 
 | 文件 | 行号 | 当前代码 | 重构动作 |
-|------|------|---------|---------|
+| ------ | ------ | --------- | --------- |
 | `phase_flow.go` | 322-356 | `calculateClusterStatusByPhase` | **删除**，替换为 `engine.Transition()` |
 | `phase_flow.go` | 359-365 | `handleClusterInitPhase` | **删除**，规则移入转换表 |
 | `phase_flow.go` | 368-374 | `handleClusterScaleMasterUpPhase` | **删除** |
@@ -2178,7 +2247,7 @@ func calculatingClusterPostStatusByPhase(phase phaseframe.Phase, err error) erro
 **第二层：新增文件**
 
 | 文件 | 说明 |
-|------|------|
+| ------ | ------ |
 | `pkg/phaseframe/statemachine/engine.go` | Engine 实现（Transition 方法） |
 | `pkg/phaseframe/statemachine/transitions.go` | ClusterStateTransitionTable 定义（64 条规则） |
 | `pkg/phaseframe/statemachine/conditions.go` | Condition 函数（isClusterReady, needUpgrade 等） |
@@ -2512,7 +2581,7 @@ func TestErrorMappingsCoverage(t *testing.T) {
 **第三层：关联修改（状态设置点）**
 
 | 文件 | 行号 | 当前逻辑 | 重构动作 |
-|------|------|---------|---------|
+| ------ | ------ | --------- | --------- |
 | `statusmanager.go` | 163 | `SetCurrentClusterState(ClusterHealthState)` | 改为 `SetCurrentClusterState(ClusterStatus)` |
 | `statusmanager.go` | 196 | 恢复 `ClusterStatus = LatestNormalState` | 通过 `engine.Transition("Retry")` 统一处理 |
 | `statusmanager.go` | 206-216 | switch 设置 `ClusterHealthState` | 删除，由转换表统一处理 |
@@ -2774,7 +2843,7 @@ if newBKECluster.Status.ClusterStatus != bkev1beta1.ClusterReady {
 Condition 函数（如 `needUpgrade`、`isClusterReady`）需要从现有代码中提取。当前这些条件隐含在 Phase 的 `NeedExecute()` 方法中。重构时需要：
 
 | Condition 函数 | 当前逻辑位置 | 提取方式 |
-|---------------|-------------|---------|
+| --------------- | ------------- | --------- |
 | `needMasterScaleUp` | `EnsureMasterJoin.NeedExecute()` | 检查 spec 中 master 数量 > status 中 master 数量 |
 | `needWorkerScaleUp` | `EnsureWorkerJoin.NeedExecute()` | 检查 spec 中 worker 数量 > status 中 worker 数量 |
 | `needMasterScaleDown` | `EnsureMasterDelete.NeedExecute()` | 检查 spec 中 master 数量 < status 中 master 数量 |
@@ -3098,6 +3167,7 @@ func (e *Engine) handleRetry(cluster *BKECluster, trigger string) error {
 ```
 
 **状态验证说明**：状态转换的前置条件验证已整合到转换表的 `Condition` 字段中（见 2.2.2 节 `conditions.go`），不再需要独立的验证器。这种设计确保：
+
 1. **单一数据源**：所有转换规则集中在一处定义
 2. **精确匹配**：通过 `FromState + Trigger` 精确匹配，避免歧义
 3. **统一失败处理**：所有失败路径统一走 `Error` 触发器
@@ -3705,6 +3775,7 @@ func (b *StatusManagerV2) RemoveSingleNodeStatusCache(bkeCluster *bkev1beta1.BKE
 ```
 
 **优势**:
+
 - 解决内存泄漏问题（自动清理过期记录）
 - 支持Phase级别的重试策略
 - 支持多种退避策略（线性、指数）
@@ -3717,7 +3788,7 @@ func (b *StatusManagerV2) RemoveSingleNodeStatusCache(bkeCluster *bkev1beta1.BKE
 ###### 设计决策
 
 | 决策项 | 方案 | 理由 |
-|--------|------|------|
+| -------- | ------ | ------ |
 | **重试策略索引** | 按 `ClusterStatus` 索引 | StatusManager 无法获取 Phase 名称，但可直接观察 ClusterStatus |
 | **状态伪装机制** | 使用 `LatestNormalState` | 已验证正确，无需额外信息，Engine 的 Retry 转换对此场景增加复杂度无收益 |
 | **接口兼容性** | 保持所有公开方法签名不变 | 8 个调用点零修改，降低迁移风险 |
@@ -3747,14 +3818,14 @@ PhaseFlow.Execute()
 ###### 替换对照表
 
 | 原文件 | 原行数 | 新文件 | 新行数 | 变更说明 |
-|--------|-------|--------|-------|---------|
+| -------- | ------- | -------- | ------- | --------- |
 | `pkg/statusmanage/staterecords.go` | 55 | `pkg/statusmanage/staterecords.go` | ~80 | StatusRecord→StatusRecordV2，新增 RetryPolicy/ExpireTime/LastUpdateTime |
 | `pkg/statusmanage/statusmanager.go` | 362 | `pkg/statusmanage/statusmanager.go` | ~420 | 新增 StatusCleaner、按 ClusterStatus 索引重试、全 8 种 Failed 覆盖 |
 
 ###### 调用方变更清单
 
 | 文件 | 行号 | 当前调用 | 变更 |
-|------|------|---------|------|
+| ------ | ------ | --------- | ------ |
 | `mergecluster/bkecluster.go` | 435 | `SetStatus(newBKECuster, bkeNodes)` | **不变** |
 | `bkecluster_controller.go` | 287 | `GetCtrlResult(bkeCluster)` | **不变** |
 | `bkecluster_controller.go` | 714 | `RemoveClusterStatusManagerCache(bkeCluster)` | **不变** |
@@ -4326,7 +4397,7 @@ func (b *StatusManagerV2) RemoveSingleNodeStatusCache(bkeCluster *bkev1beta1.BKE
 ###### 原代码 vs 新代码关键差异
 
 | 维度 | 原代码 (`StatusManager`) | 新代码 (`StatusManagerV2`) |
-|------|-------------------------|---------------------------|
+| ------ | ------------------------- | --------------------------- |
 | **状态记录类型** | `StatusRecord`（int 计数器） | `StatusRecordV2`（int32 原子计数器） |
 | **当前状态字段** | `ClusterHealthState` | `ClusterStatus` |
 | **重试策略** | 全局固定 `ReconcileAllowedFailedCount=10` | 按 `ClusterStatus` 索引，支持不同策略 |
@@ -4358,7 +4429,7 @@ var BKEClusterStatusManager = NewStatusManagerV2()
 **1. 全局变量替换**
 
 | 变更项 | 原代码 | 新代码 | 文件 |
-|--------|--------|--------|------|
+| -------- | -------- | -------- | ------ |
 | 全局单例 | `BKEClusterStatusManager = NewStatusManager()` | `BKEClusterStatusManager = NewStatusManagerV2()` | `statusmanager.go:36` |
 | 全局常量 | `DefaultAllowedFailedCount = 10` | 保留（向后兼容） | `statusmanager.go` |
 | 全局变量 | `ReconcileAllowedFailedCount int` | 保留（向后兼容） | `statusmanager.go` |
@@ -4366,7 +4437,7 @@ var BKEClusterStatusManager = NewStatusManagerV2()
 **2. 类型定义替换**
 
 | 变更项 | 原代码 | 新代码 | 文件 |
-|--------|--------|--------|------|
+| -------- | -------- | -------- | ------ |
 | 状态记录类型 | `StatusRecord` | `StatusRecordV2` | `staterecords.go` |
 | 状态记录字段 | `CurrentClusterState ClusterHealthState` | `CurrentClusterState ClusterStatus` | `staterecords.go` |
 | 计数器类型 | `StatusCount int` | `StatusCount int32` | `staterecords.go` |
@@ -4377,7 +4448,7 @@ var BKEClusterStatusManager = NewStatusManagerV2()
 **3. 方法签名对比（全部公开方法）**
 
 | 方法 | V1 签名 | V2 签名 | 变更 |
-|------|---------|---------|------|
+| ------ | --------- | --------- | ------ |
 | `SetStatus` | `SetStatus(*BKECluster, BKENodes)` | `SetStatus(*BKECluster, BKENodes)` | **签名不变，内部逻辑变** |
 | `GetCtrlResult` | `GetCtrlResult(*BKECluster) ctrl.Result` | `GetCtrlResult(*BKECluster) ctrl.Result` | **签名不变，内部逻辑变** |
 | `GetNodesResult` | `GetNodesResult(*BKECluster, string) bool` | `GetNodesResult(*BKECluster, string) bool` | **签名不变** |
@@ -4424,7 +4495,7 @@ V2 内部逻辑：
 **5. 新增组件**
 
 | 新增组件 | 说明 | 影响 |
-|---------|------|------|
+| --------- | ------ | ------ |
 | `StatusCleaner` | 定时清理过期记录 | 解决内存泄漏 |
 | `ClusterStatusRetryPolicies` | 按状态索引的重试策略 | 灵活重试 |
 | `calculateBackoff()` | 退避时间计算 | 智能退避 |
@@ -4433,7 +4504,7 @@ V2 内部逻辑：
 ###### 调用方变更清单（完整版）
 
 | 文件 | 行号 | 调用的方法 | 变更说明 |
-|------|------|-----------|---------|
+| ------ | ------ | ----------- | --------- |
 | `mergecluster/bkecluster.go` | 435 | `BKEClusterStatusManager.SetStatus(...)` | **不变**（签名兼容） |
 | `bkecluster_controller.go` | 287 | `BKEClusterStatusManager.GetCtrlResult(...)` | **不变**（签名兼容） |
 | `bkecluster_controller.go` | 714 | `BKEClusterStatusManager.RemoveClusterStatusManagerCache(...)` | **不变** |
@@ -4746,6 +4817,7 @@ func (r *StateMachineEventRecorder) exportDotGraph(events []StateTransitionEvent
 ```
 
 **优势**:
+
 - 完整的状态转换历史记录
 - 支持多种存储后端（内存、持久化）
 - 支持事件查询和过滤
@@ -4795,7 +4867,7 @@ func (r *StateMachineEventRecorder) exportDotGraph(events []StateTransitionEvent
 #### 4.5.3 本提案的铺垫作用
 
 | 本提案设计 | 三层状态机对应 | 铺垫作用 |
-|-----------|--------------|---------|
+| ----------- | -------------- | --------- |
 | `ClusterStatus` 单一数据源 | 集群层 LifecyclePhase | 确立单一数据源原则，为集群层投影奠定基础 |
 | 状态转换表引擎（64 条规则） | StateAggregator（状态聚合器） | 集中管理状态转换规则，为聚合器设计奠定基础 |
 | StatusManagerV2 分层重试 | 三层重试机制（Command→Cluster→人工） | 按状态索引重试策略，为分层重试奠定基础 |
@@ -4896,6 +4968,7 @@ func (r *StateMachineEventRecorder) exportDotGraph(events []StateTransitionEvent
 **总工时**：7-11 天
 
 **验收标准**：
+
 - 所有测试通过
 - ClusterStatus 保持兼容性
 - 外部消费者无感知
@@ -4925,7 +4998,7 @@ func (r *StateMachineEventRecorder) exportDotGraph(events []StateTransitionEvent
 **总工时汇总**：
 
 | 阶段 | 内容 | 工时 |
-|------|------|------|
+| ------ | ------ | ------ |
 | 阶段一 | 三字段整合（2.1 节） | 7-11 天 |
 | 阶段二 | 状态转换表 + 引擎（2.2 节） | 6 天 |
 | 阶段二 | 改进状态管理器（2.3 节） | 3-5 天 |
@@ -4935,6 +5008,7 @@ func (r *StateMachineEventRecorder) exportDotGraph(events []StateTransitionEvent
 > **说明**：状态验证已整合到 2.2 节的转换表 `Condition` 字段中，不再作为独立步骤。
 
 **验收标准**：
+
 - 所有测试通过
 - 状态转换规则集中管理
 - 提供完整的状态转换历史
@@ -4942,17 +5016,20 @@ func (r *StateMachineEventRecorder) exportDotGraph(events []StateTransitionEvent
 #### 3.4 面向三层状态机的演进路径
 
 **当前方案定位**：
+
 - 针对 PhaseFlow 的改进，解决 Phase、ClusterStatus、ClusterHealthState 三个字段的职责重叠问题
 - 确立 `ClusterStatus` 为单一数据源，为三层状态机的集群层投影奠定基础
 - 通过生命周期阶段映射函数，支持向三层状态机架构平滑演进
 
 **三层状态机远景**：
+
 - 集群层（Cluster Lifecycle）：Creating → Running → Upgrading → Scaling → RollingBack → Failed
 - 节点层（Node Lifecycle）：Pending → Provisioned → Ready → Upgrading → RollingBack → Deleting → Failed
 - 组件层（Component Lifecycle）：Pending → Installing → Installed → Upgrading → RollingBack → Failed
 - 聚合关系：组件状态 → 节点状态 → 集群状态（自底向上）
 
 **本提案的铺垫作用**：
+
 - `ClusterStatus` 单一数据源 → 为集群层 LifecyclePhase 奠定基础
 - 状态转换表引擎（64 条规则） → 为状态聚合器（StateAggregator）奠定基础
 - StatusManagerV2 分层重试 → 为三层重试机制奠定基础
@@ -4960,6 +5037,7 @@ func (r *StateMachineEventRecorder) exportDotGraph(events []StateTransitionEvent
 - 事件系统 → 为组件级状态追踪奠定基础
 
 **演进策略**：
+
 - 阶段一（三字段整合）：必须实施，解决当前的职责重叠问题，确立单一数据源
 - 阶段二（状态机增强）：可选实施，引入状态转换表引擎和分层重试，为三层聚合做准备
 - 远景：逐步实现三层状态机聚合（组件→节点→集群），最终替代当前的 PhaseFlow 架构
@@ -5015,6 +5093,7 @@ func calculatingClusterPostStatusByPhase(phase phaseframe.Phase, err error) erro
 4. **阶段 4**：全量启用，删除旧代码
 
 **优势**：
+
 - 零风险切换：可随时回退到旧方式
 - 渐进式验证：逐步确认新方式的正确性
 - 向后兼容：不影响现有功能
@@ -5221,7 +5300,7 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 #### 7.1 问题总结
 
 | 问题类型 | 具体问题 | 影响程度 |
-|---------|---------|---------|
+| --------- | --------- | --------- |
 | 设计问题 | 状态转换逻辑分散 | 高 |
 | 设计问题 | 状态管理器内存泄漏 | 高 |
 | 设计问题 | 失败重试机制不灵活 | 中 |
@@ -5233,7 +5312,7 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 #### 7.2 优化方案总结
 
 | 方案 | 解决的问题 | 实施难度 | 优先级 |
-|-----|-----------|---------|--------|
+| ----- | ----------- | --------- | -------- |
 | 状态转换表 | 状态转换逻辑分散 | 中 | 高 |
 | 改进状态管理器 | 内存泄漏、重试机制 | 中 | 高 |
 | 事件系统 | 可观测性不足 | 中 | 中 |
@@ -5250,7 +5329,6 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 ---
 
 **文档完成**: 本方案完整分析了状态机存在的问题，并给出了详细的优化重构方案，包括状态转换表、改进的状态管理器、事件系统等，所有设计均基于实际代码问题，并考虑了向后兼容和渐进式迁移。
-        
 
 ---
 
@@ -5259,7 +5337,7 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 ### 9.1 回滚方案
 
 | 场景 | 回滚方式 |
-|------|---------|
+| ------ | --------- |
 | 阶段一（三字段整合） | 旧字段保留，可随时回退到直接使用旧字段 |
 | 阶段二（状态机引擎） | 环境变量 `USE_STATE_MACHINE_ENGINE=false` 切换回旧逻辑 |
 | 阶段三（StatusManagerV2） | 全局变量改回 `NewStatusManager()` |
@@ -5307,13 +5385,14 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 ### 10.1 面向三层状态机的演进路径
 
 | 维度 | 本方案（渐进式重构） | 三层状态机远景 |
-|------|-------------------|------------------------------------------|
+| ------ | ------------------- | ------------------------------------------ |
 | **定位** | 面向当下，解决现有问题 | 面向未来，目标架构 |
 | **状态模型** | ClusterStatus 单一字段 | LifecyclePhase 三层状态机（集群层+节点层+组件层） |
 | **迁移方式** | 标记 Deprecated，自动同步 | Feature Gate + 双写 |
 | **时间线** | 立即实施 | 18 个月 |
 
 **演进路径**：
+
 - 本方案的 `MapToLifecyclePhase` 为三层状态机的集群层投影奠定基础
 - 本方案的状态转换表引擎为状态聚合器（StateAggregator）的设计理念奠定基础
 - 本方案的 StatusManagerV2 分层重试为三层重试机制奠定基础
@@ -5322,7 +5401,7 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 ### 10.2 关键文件变更清单
 
 | 文件路径 | 操作 | 说明 |
-|---------|------|------|
+| --------- | ------ | ------ |
 | `api/bkecommon/v1beta1/bkecluster_status.go` | 修改 | 字段标记 Deprecated |
 | `pkg/phaseframe/mapper.go` | **新增** | 映射函数 |
 | `pkg/phaseframe/mapper_test.go` | **新增** | 映射函数测试 |
@@ -5351,7 +5430,7 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 ### A. 术语表
 
 | 术语 | 定义 |
-|------|------|
+| ------ | ------ |
 | **ClusterStatus** | 集群操作状态，重构后的单一数据源 |
 | **ClusterHealthState** | 集群健康状态（Deprecated），将被 ClusterStatus 替代 |
 | **Phase** | 集群阶段（Deprecated），将被 ClusterStatus 替代 |
@@ -5364,7 +5443,7 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 ### B. 问题总结
 
 | 问题类型 | 具体问题 | 影响程度 | 解决方案 |
-|---------|---------|---------|---------|
+| --------- | --------- | --------- | --------- |
 | 设计问题 | 三字段语义严重重叠 | 高 | 阶段一：三字段整合 |
 | 设计问题 | 状态转换逻辑分散（28 个转换点） | 高 | 阶段二：状态转换表引擎 |
 | 设计问题 | 状态管理器内存泄漏 | 高 | 阶段三：StatusManagerV2 |
