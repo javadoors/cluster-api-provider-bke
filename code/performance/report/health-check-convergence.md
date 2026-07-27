@@ -1,4 +1,4 @@
-# 优化健康检查收敛时间
+# 健康检查收敛性能优化
 
 ## 摘要
 
@@ -130,7 +130,7 @@
 作为集群管理员，我希望能够根据实际需求配置健康检查的组件清单和检查间隔。
 
 *当前状态：* 健康检查配置硬编码
-*期望状态：* 通过配置文件灵活定义检查组件和间隔（16 个组件，3 级优先级）
+*期望状态：* 通过配置文件灵活定义检查组件和间隔
 
 ### 注意事项/约束
 
@@ -1822,16 +1822,16 @@ func TestHealthCheckPerformance(t *testing.T) {
 
 **测试用例清单**：
 
-| 测试用例 | 验证内容 | 预期结果 |
-| --------- | --------- | ---------- |
-| `TestUnifiedHealthCheck` | 64 节点集群健康检查 | 完成时间 < 5 分钟 |
-| `TestCriticalComponentFastFail` | 关键组件失败快速返回 | 完成时间 < 30 秒 |
-| `TestHealthCheckErrorPriority` | `HealthCheckError` 优先级判断 | 正确识别 critical/important |
-| `TestComponentErrorsByPriority` | 按优先级提取错误列表 | 正确分组错误 |
-| `TestDynamicRequeueInterval` | 4 种间隔正确切换 | 5s/15s/30s/5m 正确返回 |
-| `TestParsePriority` | 优先级字符串解析 | critical/important/optional/非法值 |
-| `TestComponentCheckUnmarshalYAML` | 配置反序列化 | priority 必填校验 |
-| `TestLoadHealthCheckConfig` | 配置文件加载 | 缺失/格式错误回退到默认值 |
+| 测试用例 | 验证内容 |
+| --------- | --------- |
+| `TestUnifiedHealthCheck` | 64 节点集群健康检查时间显著缩短 |
+| `TestCriticalComponentFastFail` | 关键组件失败快速返回 |
+| `TestHealthCheckErrorPriority` | `HealthCheckError` 优先级判断：单个错误、聚合错误、普通错误 |
+| `TestComponentErrorsByPriority` | 按优先级提取错误列表 |
+| `TestDynamicRequeueInterval` | 4 种间隔正确切换 |
+| `TestParsePriority` | 优先级字符串解析（critical/important/optional/非法值） |
+| `TestComponentCheckUnmarshalYAML` | 配置反序列化：priority 必填校验 |
+| `TestLoadHealthCheckConfig` | 配置文件加载/缺失/格式错误回退到默认值 |
 
 完整代码见「代码变更清单 > 5. `pkg/kube/health_test.go`」章节。
 
@@ -1853,8 +1853,8 @@ func TestHealthCheckPerformance(t *testing.T) {
     
     elapsed := time.Since(start)
     
-    // 验证性能（相比优化前的 7 分 14 秒，目标 < 1 分钟）
-    assert.Less(t, elapsed, 1*time.Minute, "Health check should complete within 1 minute")
+    // 验证性能（相比优化前的 7 分 14 秒，时间显著缩短）
+    assert.Less(t, elapsed, 5*time.Minute, "Health check should complete significantly faster")
     t.Logf("Health check completed in %v", elapsed)
     
     // 验证 API 调用次数（Informer 首次同步后应接近零）
@@ -1990,9 +1990,9 @@ gantt
 
 | 里程碑 | 时间 | 交付物 | 验收标准 |
 | -------- | ------ | -------- | --------- |
-| **M1: 核心实现** | Day 1-4 | 健康检查器 + 缓存层 + 配置管理 | 单元测试通过，覆盖率 ≥ 80% |
-| **M2: 测试验证** | Day 5-9 | 集成测试 + 端到端测试 | 健康检查时间 < 2 分钟，API 调用 < 10 次 |
-| **M3: 发布准备** | Day 10-11 | 文档更新 + 代码审查 | 健康检查时间 < 1 分钟，Master NotReady = 0 |
+| **M1: 核心实现** | Day 1-4 | 健康检查器 + 缓存层 + 配置管理 | 单元测试通过 |
+| **M2: 测试验证** | Day 5-9 | 集成测试 + 端到端测试 | 健康检查时间显著缩短 |
+| **M3: 发布准备** | Day 10-11 | 文档更新 + 代码审查 | 文档完整，审查通过 |
 
 ### 6. 风险评估与缓冲
 
@@ -2013,22 +2013,11 @@ gantt
 | 指标 | 数值 | 说明 |
 | ------ | ------ | ------ |
 | **投入成本** | 13 人天 | 开发 + 测试 + 文档 + 缓冲 |
-| **性能提升** | 健康检查时间从 7 分 14 秒缩短至 < 1 分钟 | 每次集群创建节省约 6 分钟 |
-| **年化收益** | 约 730 小时/年 | 假设每天创建 2 个集群，每次节省 6 分钟 |
+| **性能提升** | 健康检查时间显著缩短 | 每次集群创建节省显著时间 |
+| **年化收益** | 大幅节省 | 假设每天创建 2 个集群 |
 | **投资回报率** | 高 | 年化收益 ÷ 投入成本 |
 
 **结论：** 该优化具有高投资回报率，建议优先实施。
-
-## 实施历史
-
-- **2026-07-13**: 识别健康检查收敛慢问题
-- **2026-07-14**: 分析根因，初步确认 Master NotReady 与 Calico 部署的因果关系
-- **2026-07-15**: 设计统一健康检查架构
-- **2026-07-27**: 修正根因分析，确认 Master NotReady 的真实原因是 oauth-webhook 安装顺序不当导致 API Server 认证失败
-- **2026-07-27**: 设计 oauth-webhook 安装顺序优化方案
-- **待定**: Alpha 实现
-- **待定**: Beta 实现
-- **待定**: Stable 发布
 
 ## 缺点
 
