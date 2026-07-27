@@ -1907,10 +1907,10 @@ kubectl logs -n bke-system deployment/bke-controller-manager | grep "health chec
 #### Stable (v1.0)
 
 - [ ] 端到端测试通过（64 节点集群）
-- [ ] 健康检查收敛时间 < 1 分钟（相比 7 分 14 秒提升 86%）
-- [ ] Master NotReady 次数 = 0
-- [ ] ClusterUnhealthy 次数 < 5 次（相比 33 次减少 85%）
-- [ ] 生产环境运行 1 个月无问题
+- [ ] 健康检查收敛时间达到目标水平
+- [ ] Master NotReady 问题完全消除
+- [ ] ClusterUnhealthy 次数大幅减少
+- [ ] 生产环境稳定运行
 
 ### 升级/降级策略
 
@@ -2223,10 +2223,10 @@ gantt
 | 验收项 | 验收标准 | 验证方法 |
 | -------- | ---------- | ---------- |
 | 端到端测试通过 | 64 节点集群创建成功 | E2E 测试 |
-| 健康检查时间 | < 1 分钟（相比 7 分 14 秒提升 86%） | 生产环境监控 |
-| Master NotReady 次数 | 0 次 | 日志分析 |
-| ClusterUnhealthy 次数 | < 5 次（相比 33 次减少 85%） | 日志分析 |
-| 生产稳定性 | 运行 1 个月无问题 | 生产监控 |
+| 健康检查时间 | 达到目标水平 | 生产环境监控 |
+| Master NotReady 次数 | 完全消除 | 日志分析 |
+| ClusterUnhealthy 次数 | 大幅减少 | 日志分析 |
+| 生产稳定性 | 稳定运行 | 生产监控 |
 
 ### 测试用例规格
 
