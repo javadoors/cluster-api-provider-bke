@@ -2246,15 +2246,15 @@ gantt
 ```bash
 # 1. 集群创建性能测试
 kubectl apply -f bkecluster-64n.yaml
-# 验证: ClusterUnhealthy → ClusterReady 时间 < 1 分钟
+# 验证: ClusterUnhealthy → ClusterReady 时间显著缩短
 
 # 2. Master 稳定性测试
 kubectl get nodes -l node-role.kubernetes.io/master -w
-# 验证: 所有 Master 节点 Ready，无 NotReady 事件
+# 验证: NotReady 事件大幅减少
 
 # 3. 健康检查日志验证
 kubectl logs -n bke-system deployment/bke-controller-manager | grep "health check"
-# 验证: 健康检查通过，无频繁重试
+# 验证: 无频繁重试，检查通过
 ```
 
 ### 监控告警规格
