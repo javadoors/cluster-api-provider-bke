@@ -522,23 +522,19 @@ func DefaultHealthCheckConfig() HealthCheckConfig {
             Normal:    5 * time.Minute,
         },
         Components: []ComponentCheck{
+            // 控制面组件（critical）
             {Name: NameEtcd, Namespace: "kube-system", Prefixes: []string{"etcd-"}, Priority: PriorityCritical},
             {Name: NameKubeAPIServer, Namespace: "kube-system", Prefixes: []string{"kube-apiserver-"}, Priority: PriorityCritical},
             {Name: NameKubeControllerManager, Namespace: "kube-system", Prefixes: []string{"kube-controller-manager-"}, Priority: PriorityCritical},
             {Name: NameKubeScheduler, Namespace: "kube-system", Prefixes: []string{"kube-scheduler-"}, Priority: PriorityCritical},
-            {Name: NameOAuthWebhook, Namespace: "openfuyao-system", Prefixes: []string{"oauth-webhook-"}, Priority: PriorityCritical},
+            
+            // 网络组件（important）
             {Name: NameCalicoNode, Namespace: "kube-system", Prefixes: []string{"calico-node"}, Priority: PriorityImportant},
             {Name: NameCalicoKubeControllers, Namespace: "kube-system", Prefixes: []string{"calico-kube-controllers"}, Priority: PriorityImportant},
             {Name: NameKubeProxy, Namespace: "kube-system", Prefixes: []string{"kube-proxy-"}, Priority: PriorityImportant},
+            
+            // DNS 组件（important）
             {Name: NameCoreDNS, Namespace: "kube-system", Prefixes: []string{"coredns"}, Priority: PriorityImportant},
-            {Name: NameMetricsServer, Namespace: "kube-system", Prefixes: []string{"metrics-server-"}, Priority: PriorityOptional},
-            {Name: NameIngressNginx, Namespace: "ingress-nginx", Prefixes: []string{"ingress-nginx-controller"}, Priority: PriorityOptional},
-            {Name: NameConsoleService, Namespace: "openfuyao-system", Prefixes: []string{"console-service-"}, Priority: PriorityOptional},
-            {Name: NameOAuthServer, Namespace: "openfuyao-system", Prefixes: []string{"oauth-server-"}, Priority: PriorityOptional},
-            {Name: NameLocalHarbor, Namespace: "openfuyao-system", Prefixes: []string{"local-harbor-"}, Priority: PriorityOptional},
-            {Name: NamePrometheus, Namespace: "monitoring", Prefixes: []string{"prometheus-k8s-"}, Priority: PriorityOptional},
-            {Name: NameAlertmanager, Namespace: "monitoring", Prefixes: []string{"alertmanager-main-"}, Priority: PriorityOptional},
-            {Name: NameNodeExporter, Namespace: "monitoring", Prefixes: []string{"node-exporter-"}, Priority: PriorityOptional},
         },
     }
 }
@@ -962,7 +958,7 @@ graph TB
 | 3. 引导节点拉业务集群 | 引导节点 (K3s) | 引导节点 K3s 的 ConfigMap | 直接使用（无需同步） |
 | 4. 管理集群拉业务集群 | 管理集群 | 管理集群的 ConfigMap | 直接使用（无需同步） |
 
-**ConfigMap 定义：**
+**ConfigMap 定义**（示例）：
 
 ```yaml
 apiVersion: v1
@@ -982,7 +978,7 @@ data:
     # 缓存
     cacheSyncTimeout: 30s
     
-    # 组件清单（扁平列表，priority 由配置直接定义）
+    # 组件清单（仅包含 openfuyao-core 组件，不包含 addon 组件）
     components:
       # 控制面
       - name: etcd
@@ -1000,10 +996,6 @@ data:
       - name: kube-scheduler
         namespace: kube-system
         prefixes: [kube-scheduler-]
-        priority: critical
-      - name: oauth-webhook
-        namespace: openfuyao-system
-        prefixes: [oauth-webhook-]
         priority: critical
     
       # 网络
@@ -1025,42 +1017,6 @@ data:
         namespace: kube-system
         prefixes: [coredns]
         priority: important
-    
-      # Addon
-      - name: metrics-server
-        namespace: kube-system
-        prefixes: [metrics-server-]
-        priority: optional
-      - name: ingress-nginx
-        namespace: ingress-nginx
-        prefixes: [ingress-nginx-controller]
-        priority: optional
-      - name: console-service
-        namespace: openfuyao-system
-        prefixes: [console-service-]
-        priority: optional
-      - name: oauth-server
-        namespace: openfuyao-system
-        prefixes: [oauth-server-]
-        priority: optional
-      - name: local-harbor
-        namespace: openfuyao-system
-        prefixes: [local-harbor-]
-        priority: optional
-    
-      # 监控
-      - name: prometheus
-        namespace: monitoring
-        prefixes: [prometheus-k8s-]
-        priority: optional
-      - name: alertmanager
-        namespace: monitoring
-        prefixes: [alertmanager-main-]
-        priority: optional
-      - name: node-exporter
-        namespace: monitoring
-        prefixes: [node-exporter-]
-        priority: optional
 ```
 
 **配置说明：**
@@ -1084,6 +1040,99 @@ data:
 2. 如果 ConfigMap 不存在或格式错误，使用默认配置
 3. 如果配置文件中 `components` 为空，使用默认组件清单
 4. `priority` 字段为必填，缺失时加载失败并回退到默认配置
+
+#### 默认配置
+
+当 ConfigMap 不存在或加载失败时，系统使用代码中内置的默认配置。
+
+**默认配置定义位置**：`pkg/kube/health.go` 中的 `DefaultHealthCheckConfig()` 函数
+
+**默认配置内容**（示例）：
+
+```yaml
+# 默认检查间隔
+intervals:
+  critical: 5s
+  important: 15s
+  optional: 30s
+  normal: 5m
+
+# 默认缓存同步超时
+cacheSyncTimeout: 30s
+
+# 默认组件清单（仅包含 openfuyao-core 组件，不包含 addon 组件）
+components:
+  # 控制面组件（critical）
+  - name: etcd
+    namespace: kube-system
+    prefixes: [etcd-]
+    priority: critical
+  - name: kube-apiserver
+    namespace: kube-system
+    prefixes: [kube-apiserver-]
+    priority: critical
+  - name: kube-controller-manager
+    namespace: kube-system
+    prefixes: [kube-controller-manager-]
+    priority: critical
+  - name: kube-scheduler
+    namespace: kube-system
+    prefixes: [kube-scheduler-]
+    priority: critical
+  
+  # 网络组件（important）
+  - name: calico-node
+    namespace: kube-system
+    prefixes: [calico-node]
+    priority: important
+  - name: calico-kube-controllers
+    namespace: kube-system
+    prefixes: [calico-kube-controllers]
+    priority: important
+  - name: kube-proxy
+    namespace: kube-system
+    prefixes: [kube-proxy-]
+    priority: important
+  
+  # DNS 组件（important）
+  - name: coredns
+    namespace: kube-system
+    prefixes: [coredns]
+    priority: important
+```
+
+**默认配置统计**：
+- 控制面组件：4 个（critical）
+- 网络组件：3 个（important）
+- DNS 组件：1 个（important）
+- **总计：8 个组件**
+
+**使用场景**：
+1. ConfigMap 不存在（首次部署或误删除）
+2. ConfigMap 格式错误（YAML 解析失败）
+3. ConfigMap 中 `components` 字段为空
+4. 需要快速回退到已知配置
+
+**注意事项**：
+- 默认配置仅包含 openfuyao-core 组件，不包含 addon 组件
+- addon 组件（如 metrics-server、ingress-nginx、console-service 等）的健康检查由其他机制负责
+- 修改默认配置需要重新编译和部署 bke-controller-manager
+- 生产环境建议通过 ConfigMap 管理配置，便于动态调整
+
+#### Addon 组件健康检查机制
+
+addon 组件的健康检查由 `EnsureAddonDeploy` Phase 中的 `checkAddonHealth()` 函数负责，不在本健康检查框架的范围内。
+
+**检查机制**：
+1. `EnsureAddonDeploy` Phase 在部署 addon 组件后，会调用 `checkAddonHealth()` 检查组件健康状态
+2. 检查内容包括：Pod 状态、容器状态、资源使用情况等
+3. 如果 addon 组件健康检查失败，Phase 会记录警告日志，但不会阻塞集群创建流程
+4. addon 组件的健康检查是异步进行的，不会阻塞后续 Phase 的执行
+
+**与 openfuyao-core 组件健康检查的区别**：
+- openfuyao-core 组件健康检查由本框架负责，失败会触发重试
+- addon 组件健康检查由 `EnsureAddonDeploy` Phase 负责，失败只记录警告
+- openfuyao-core 组件健康检查是同步的，addon 组件健康检查是异步的
 
 ## 设计视图
 
@@ -1550,7 +1599,7 @@ data:
     # 缓存
     cacheSyncTimeout: 30s
     
-    # 组件清单（扁平列表，priority 由配置直接定义）
+    # 组件清单（仅包含 openfuyao-core 组件，不包含 addon 组件）
     components:
       # 控制面
       - name: etcd
@@ -1568,10 +1617,6 @@ data:
       - name: kube-scheduler
         namespace: kube-system
         prefixes: [kube-scheduler-]
-        priority: critical
-      - name: oauth-webhook
-        namespace: openfuyao-system
-        prefixes: [oauth-webhook-]
         priority: critical
       # 网络
       - name: calico-node
@@ -1591,40 +1636,6 @@ data:
         namespace: kube-system
         prefixes: [coredns]
         priority: important
-      # Addon
-      - name: metrics-server
-        namespace: kube-system
-        prefixes: [metrics-server-]
-        priority: optional
-      - name: ingress-nginx
-        namespace: ingress-nginx
-        prefixes: [ingress-nginx-controller]
-        priority: optional
-      - name: console-service
-        namespace: openfuyao-system
-        prefixes: [console-service-]
-        priority: optional
-      - name: oauth-server
-        namespace: openfuyao-system
-        prefixes: [oauth-server-]
-        priority: optional
-      - name: local-harbor
-        namespace: openfuyao-system
-        prefixes: [local-harbor-]
-        priority: optional
-      # 监控
-      - name: prometheus
-        namespace: monitoring
-        prefixes: [prometheus-k8s-]
-        priority: optional
-      - name: alertmanager
-        namespace: monitoring
-        prefixes: [alertmanager-main-]
-        priority: optional
-      - name: node-exporter
-        namespace: monitoring
-        prefixes: [node-exporter-]
-        priority: optional
 ```
 
 #### 5. `pkg/kube/health_test.go` - 新增
@@ -2235,21 +2246,15 @@ gantt
 | kube-apiserver | critical | kube-system | kube-apiserver- |
 | kube-controller-manager | critical | kube-system | kube-controller-manager- |
 | kube-scheduler | critical | kube-system | kube-scheduler- |
-| oauth-webhook | critical | openfuyao-system | oauth-webhook- |
 | calico-node | important | kube-system | calico-node |
 | calico-kube-controllers | important | kube-system | calico-kube-controllers |
 | kube-proxy | important | kube-system | kube-proxy- |
 | coredns | important | kube-system | coredns |
-| metrics-server | optional | kube-system | metrics-server- |
-| ingress-nginx | optional | ingress-nginx | ingress-nginx-controller |
-| console-service | optional | openfuyao-system | console-service- |
-| oauth-server | optional | openfuyao-system | oauth-server- |
-| local-harbor | optional | openfuyao-system | local-harbor- |
-| prometheus | optional | monitoring | prometheus-k8s- |
-| alertmanager | optional | monitoring | alertmanager-main- |
-| node-exporter | optional | monitoring | node-exporter- |
 
-> **备注**：当前 `health-check-config.yaml` 中理论上只包含 openfuyao-core 的组件，addon 组件（如 metrics-server、ingress-nginx、console-service、oauth-server、local-harbor、prometheus、alertmanager、node-exporter 等）理论上不包含在配置中。addon 组件的健康检查由其他机制负责，不在本健康检查框架的范围内。
+> **备注**：
+> - 当前 `health-check-config.yaml` 中只包含 openfuyao-core 的组件，不包含 addon 组件
+> - oauth-webhook 不包含在默认配置中，其健康检查由其他机制负责
+> - addon 组件（如 metrics-server、ingress-nginx、console-service、oauth-server、local-harbor、prometheus、alertmanager、node-exporter 等）的健康检查由 `EnsureAddonDeploy` Phase 负责，不在本健康检查框架的范围内
 
 ### 验收标准
 
