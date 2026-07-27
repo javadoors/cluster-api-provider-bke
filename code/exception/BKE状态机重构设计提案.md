@@ -8,7 +8,8 @@
 | **类型** | Refactor |
 | **作者** | openFuyao Team |
 | **创建日期** | 2026-07-27 |
-| **依赖** | KEP-5 (ClusterVersion/ReleaseImage)、kep6-state-machine-v1、kep6-state-machine-v3 |
+| **依赖** | KEP-5 (ClusterVersion/ReleaseImage) |
+| **关联** | kep6-state-machine-v1（现状参考）、kep6-state-machine-v3（远景对齐） |
 
 ---
 
@@ -29,6 +30,7 @@
   - [2.2 增强方案一：状态转换表](#22-增强方案一状态转换表适配单字段设计)
   - [2.3 增强方案二：改进状态管理器](#23-增强方案二改进状态管理器适配单字段设计)
   - [2.4 增强方案三：状态转换事件系统](#24-增强方案三状态转换事件系统适配单字段设计)
+  - [4.5 设计远景：三层状态机架构](#45-设计远景三层状态机架构)（新增）
 - [5. 综合重构方案](#5-综合重构方案)（原第3章）
 - [6. 迁移策略](#6-迁移策略)（原第4章）
 - [7. 测试策略](#7-测试策略)（原第5章）
@@ -50,12 +52,14 @@
 - **可观测性不足**：缺乏状态转换事件记录和可视化支持
 
 **重构方案**（分阶段实施）：
-- **阶段一（核心）**：三字段整合 —— 以 `ClusterStatus` 为单一数据源，`Phase` 和 `ClusterHealthState` 标记为 Deprecated 并自动同步，提供映射函数对齐 v3 LifecyclePhase
+- **阶段一（核心）**：三字段整合 —— 以 `ClusterStatus` 为单一数据源，`Phase` 和 `ClusterHealthState` 标记为 Deprecated 并自动同步，提供生命周期阶段映射函数，支持向三层状态机架构平滑演进
 - **阶段二（增强）**：引入状态转换表引擎（64 条规则），替代 11 个分散的 `handleCluster*Phase` 函数
 - **阶段三（增强）**：改进状态管理器（StatusManagerV2），支持按状态索引重试策略、自动过期清理、原子计数器，覆盖全部 8 种 Failed 状态
 - **阶段四（可选）**：状态转换事件系统，支持内存/持久化存储和多格式导出
 
 **预期收益**：状态字段从 3 个减少到 1 个，状态转换规则集中管理，Failed 覆盖从 3/8 提升至 8/8，代码圈复杂度从 15 降至 8 以下，总工时 19-27 天。
+
+**设计远景**：本提案的设计决策面向三层状态机架构（集群层→节点层→组件层）演进。通过确立 `ClusterStatus` 为单一数据源、引入状态转换表引擎、实现分层重试机制、提供生命周期阶段映射，为未来实现自底向上的状态聚合（组件状态→节点状态→集群状态）奠定基础，确保 BKE 状态机架构具备前瞻性和可扩展性。
 
 ---
 
@@ -475,15 +479,19 @@ default:
 }
 ```
 
-####### 问题 6：与 kep6-state-machine-v3 的方向冲突
+####### 问题 6：缺乏面向未来的统一生命周期模型
 
-`kep6-state-machine-v3.md:36-38` 已提出统一的三层状态机架构，将集群状态合并为单一 `BKEClusterLifecycle`：
+业界最佳实践（如 OpenShift CVO、Cluster API）和 BKE 自身演进方向均指向统一的三层生命周期状态机模型：
 
 ```
-Creating → Running → Upgrading → Scaling → RollingBack → Failed
+集群层（Cluster Lifecycle）：Creating → Running → Upgrading → Scaling → RollingBack → Failed
+节点层（Node Lifecycle）：Pending → Provisioned → Ready → Upgrading → RollingBack → Deleting → Failed
+组件层（Component Lifecycle）：Pending → Installing → Installed → Upgrading → RollingBack → Failed
 ```
 
-这与当前 `ClusterStatus` + `ClusterHealthState` 双状态设计直接冲突。v3 设计意图是用一个状态机替代两个，将"操作进行中"、"操作失败"、"健康状态"分离为独立维度（如 `BKEClusterLifecycle` + `HealthCondition`），而非维护两个重叠的枚举。当前代码仍维护两个并行状态，与 v3 演进方向不一致。
+三层模型的核心设计思想是**自底向上的状态聚合**：组件状态聚合为节点状态，节点状态聚合为集群状态。每个层级使用单一的生命周期状态（LifecyclePhase）作为数据源，将"操作进行中"、"操作失败"、"健康状态"分离为独立维度。
+
+当前代码仍维护 `ClusterStatus` + `ClusterHealthState` 两个并行状态，缺乏统一的生命周期抽象，无法支撑三层聚合模型的实现。
 
 ###### 1.1.2.4 综合问题分析
 
@@ -492,7 +500,7 @@ Creating → Running → Upgrading → Scaling → RollingBack → Failed
 1. **三个字段职责重叠**：Phase、ClusterStatus、ClusterHealthState 都在表达集群状态，导致开发者难以理解应该使用哪个字段
 2. **状态转换逻辑分散**：状态转换逻辑分散在多个文件和函数中，增加维护成本
 3. **状态不一致风险**：三个字段可能被独立设置，容易出现状态不一致
-4. **与 v3 设计的映射复杂**：三个字段都需要映射到 v3 的 `LifecyclePhase`，增加了迁移的复杂性
+4. **缺乏统一的生命周期抽象**：三个字段缺乏统一的生命周期抽象，无法支撑向三层状态机架构的演进
 
 **问题总结**：
 
@@ -504,15 +512,15 @@ Creating → Running → Upgrading → Scaling → RollingBack → Failed
 | ClusterStatus 三维度混合 | 中 | 操作/健康/失败塞进一个枚举 |
 | 状态机边界不清 | 高 | 三处独立转换 + statusmanager 桥接 |
 | Failed 粒度不对称 | 中 | 8 vs 3，5 种失败无法映射 |
-| 与 v3 方向冲突 | 中 | 双状态设计将被 v3 单状态机替代 |
+| 缺乏生命周期抽象 | 中 | 双状态设计无法支撑三层状态机架构演进 |
 
 **影响**：
 - 开发者难以理解应该使用哪个字段
 - 状态转换逻辑分散在多个字段中，增加维护成本
 - 容易出现状态不一致（Phase=InitControlPlane 但 ClusterStatus=Ready）
-- 迁移到 v3 架构时成本高昂
+- 向三层状态机架构演进时成本高昂
 
-**核心结论**：`ClusterStatus`、`ClusterHealthState` 和 `Phase` 的根本问题是**职责边界模糊**——三者都在描述"集群当前在做什么 + 是否健康 + 是否失败"，但粒度不同、覆盖面不同、转换逻辑分散在三处。合理的做法是按 `kep6-state-machine-v3` 的方向统一为单一生命周期状态机，将"操作进行中"、"操作失败"、"健康状态"分离为独立维度，而非维护三个重叠的枚举。
+**核心结论**：`ClusterStatus`、`ClusterHealthState` 和 `Phase` 的根本问题是**职责边界模糊**——三者都在描述"集群当前在做什么 + 是否健康 + 是否失败"，但粒度不同、覆盖面不同、转换逻辑分散在三处。合理的做法是按三层生命周期状态机的方向统一为单一生命周期状态机，将"操作进行中"、"操作失败"、"健康状态"分离为独立维度，而非维护三个重叠的枚举。
 
 #### 1.2 状态管理器设计问题
 
@@ -677,7 +685,7 @@ if sr.AllowFailed() {
 | 范围 | 说明 |
 |------|------|
 | **三字段整合** | 以 `ClusterStatus` 为单一数据源，`Phase`/`ClusterHealthState` 标记 Deprecated |
-| **映射函数** | 新增 `MapPhaseToClusterStatus`、`MapClusterHealthStateToClusterStatus`、`MapToV3LifecyclePhase` 等 |
+| **映射函数** | 新增 `MapPhaseToClusterStatus`、`MapClusterHealthStateToClusterStatus`、`MapToLifecyclePhase` 等 |
 | **状态转换表引擎** | 新增 `pkg/phaseframe/statemachine/` 包，64 条转换规则，替代 11 个 handle 函数 |
 | **状态管理器改进** | `StatusManagerV2`：按状态索引重试策略、自动过期清理、原子计数器、覆盖全部 8 种 Failed |
 | **事件系统** | 状态转换事件记录与查询（基础版内存存储，增强版 K8s Event 持久化） |
@@ -688,13 +696,13 @@ if sr.AllowFailed() {
 |------|------|
 | **向后兼容** | `Phase` 和 `ClusterHealthState` 字段保留，标记 Deprecated，自动同步 |
 | **渐进式迁移** | 分阶段实施，阶段一（三字段整合）必须，阶段二（引擎+管理器）可选 |
-| **与 v3 对齐** | 提供 `MapToV3LifecyclePhase` 映射函数，为未来迁移做准备 |
+| **前瞻性设计** | 提供 `MapToLifecyclePhase` 映射函数，支持向三层状态机架构平滑演进 |
 | **接口兼容** | StatusManagerV2 保持所有公开方法签名不变，8 个调用点零修改 |
 
 ### 3.3 非目标
 
 1. 不在此阶段移除 `Phase` 和 `ClusterHealthState` 字段定义（仅标记 Deprecated）
-2. 不实现 v3 三层状态机架构（由 kep6-state-machine-refactor.md 覆盖）
+2. 不在此阶段实现三层状态机聚合（组件层→节点层→集群层），但预留扩展接口
 3. 不修改 PhaseFlow 的执行逻辑，仅重构状态转换部分
 4. 不替换现有 SSH 推送机制
 
@@ -737,7 +745,7 @@ if sr.AllowFailed() {
 | **简化状态管理** | 代码中使用的状态字段数量 | 从 3 个减少到 1 个 |
 | **提高代码可维护性** | 代码行数 | 减少约 200 行 |
 | **保持兼容性** | 外部消费者影响 | 无影响（字段保留） |
-| **与 v3 对齐** | 映射函数覆盖率 | 100% |
+| **前瞻性设计** | 映射函数覆盖率 | 100% |
 
 ##### 2.1.2 重构内容
 
@@ -803,7 +811,7 @@ ClusterHealthState ClusterHealthState `json:"clusterHealthState,omitempty"`
 - 新增 `MapClusterHealthStateToClusterStatus` 函数：将 ClusterHealthState 映射到 ClusterStatus
 - 新增 `MapClusterStatusToPhase` 函数：将 ClusterStatus 映射到 Phase（用于向后兼容）
 - 新增 `MapClusterStatusToClusterHealthState` 函数：将 ClusterStatus 映射到 ClusterHealthState（用于向后兼容）
-- 新增 `MapToV3LifecyclePhase` 函数：将 ClusterStatus 映射到 v3 LifecyclePhase（为未来迁移做准备）
+- 新增 `MapToLifecyclePhase` 函数：将 ClusterStatus 映射到统一生命周期阶段（面向三层状态机架构的集群层投影）
 
 **文件清单**：
 - `pkg/phaseframe/mapper.go`：新增映射函数文件
@@ -931,17 +939,16 @@ func MapClusterStatusToClusterHealthState(status bkev1beta1.ClusterStatus) confv
 	}
 }
 
-// MapToV3LifecyclePhase 将 ClusterStatus 映射到 v3 LifecyclePhase
-// 为未来迁移到 v3 架构做准备，当前返回空字符串（未实现）
-// TODO: 待 v3 架构确定后实现具体映射逻辑
-func MapToV3LifecyclePhase(status bkev1beta1.ClusterStatus) string {
-	// v3 LifecyclePhase 定义（参考 kep6-state-machine-v3.md）：
-	// - Creating: 集群创建中
-	// - Running: 集群运行中
-	// - Upgrading: 集群升级中
-	// - Scaling: 集群扩缩容中
-	// - RollingBack: 集群回滚中
-	// - Failed: 集群失败
+// MapToLifecyclePhase 将 ClusterStatus 映射到统一生命周期阶段
+// 面向三层状态机架构的集群层投影，支持向自底向上的状态聚合模型演进
+func MapToLifecyclePhase(status bkev1beta1.ClusterStatus) string {
+	// LifecyclePhase 定义（集群层，面向三层状态机架构）：
+	// - Creating: 集群创建中（节点加入、Agent 推送、组件安装）
+	// - Running: 集群运行中（所有组件就绪，服务可用）
+	// - Upgrading: 集群升级中（版本变更中）
+	// - Scaling: 集群扩缩容中（节点增减）
+	// - RollingBack: 集群回滚中（升级失败后恢复）
+	// - Failed: 集群失败（需要人工介入）
 	// - Deleting: 集群删除中
 	
 	switch status {
@@ -4748,9 +4755,64 @@ func (r *StateMachineEventRecorder) exportDotGraph(events []StateTransitionEvent
 - 便于调试和问题排查
 - 支持状态机可视化
 
+### 4.5 设计远景：三层状态机架构
+
+本提案的设计决策面向三层状态机架构演进，确保 BKE 状态机具备前瞻性和可扩展性。
+
+#### 4.5.1 三层状态机模型
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    集群层 (Cluster Lifecycle)                                │
+│  Creating → Running → Upgrading → Scaling → RollingBack → Failed           │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                     │ 聚合
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    节点层 (Node Lifecycle)                                   │
+│  Pending → Provisioned → Ready → Upgrading → RollingBack → Deleting        │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                     │ 聚合
+                                     ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    组件层 (Component Lifecycle)                              │
+│  Pending → Installing → Installed → Upgrading → RollingBack → Uninstalling │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 4.5.2 自底向上的状态聚合
+
+三层状态机的核心设计思想是**自底向上的状态聚合**：
+
+- **组件状态 → 节点状态**：节点上所有组件状态聚合为节点生命周期状态
+  - 所有组件 Installed → 节点 Ready
+  - 任意组件 Upgrading → 节点 Upgrading
+  - 任意组件 Failed → 节点 Failed
+
+- **节点状态 → 集群状态**：所有节点状态 + 集群级组件状态聚合为集群生命周期状态
+  - 所有节点 Ready + 所有集群级组件 Installed → 集群 Running
+  - 任意节点 Upgrading 或集群级组件 Upgrading → 集群 Upgrading
+  - 任意节点 Failed 或集群级组件 Failed → 集群 Failed
+
+#### 4.5.3 本提案的铺垫作用
+
+| 本提案设计 | 三层状态机对应 | 铺垫作用 |
+|-----------|--------------|---------|
+| `ClusterStatus` 单一数据源 | 集群层 LifecyclePhase | 确立单一数据源原则，为集群层投影奠定基础 |
+| 状态转换表引擎（64 条规则） | StateAggregator（状态聚合器） | 集中管理状态转换规则，为聚合器设计奠定基础 |
+| StatusManagerV2 分层重试 | 三层重试机制（Command→Cluster→人工） | 按状态索引重试策略，为分层重试奠定基础 |
+| `MapToLifecyclePhase` 映射函数 | 三层聚合的集群层投影 | 22 个 ClusterStatus 归约为 6 个 LifecyclePhase |
+| 事件系统 | 组件级状态追踪 | 状态转换事件记录，为组件生命周期追踪奠定基础 |
+
+#### 4.5.4 演进路径
+
+1. **当前层**：ClusterStatus 单一数据源（本提案阶段一）
+2. **增强层**：状态转换表引擎 + 分层重试（本提案阶段二三）
+3. **远景层**：三层聚合（组件→节点→集群），本提案的 LifecyclePhase 映射和事件系统为其预留接口
+
 ## 5. 综合重构方案
 
-> 以下对应原方案第 3 章，包含整体架构、分阶段实施步骤、与 v3 设计的关系。
+> 以下对应原方案第 3 章，包含整体架构、分阶段实施步骤、面向三层状态机的演进路径。
 
 ### 3. 综合重构方案
 
@@ -4778,7 +4840,7 @@ func (r *StateMachineEventRecorder) exportDotGraph(events []StateTransitionEvent
 │  ┌──────────────────────────────────────────────┐       │
 │  │ 提供映射函数                                  │       │
 │  │ - MapPhaseToClusterStatus                    │       │
-│  │ - MapToV3LifecyclePhase                      │       │
+│  │ - MapToLifecyclePhase                      │       │
 │  └──────────────────────────────────────────────┘       │
 │                                                           │
 │  阶段二：状态机增强（可选）                                │
@@ -4814,7 +4876,7 @@ func (r *StateMachineEventRecorder) exportDotGraph(events []StateTransitionEvent
 
 1. **准备阶段（1-2 天）**
    - 添加映射函数 `MapPhaseToClusterStatus`
-   - 添加映射函数 `MapToV3LifecyclePhase`
+   - 添加映射函数 `MapToLifecyclePhase`
    - 更新文档
 
 2. **删除 Phase 字段（3-4 天）**
@@ -4841,7 +4903,7 @@ func (r *StateMachineEventRecorder) exportDotGraph(events []StateTransitionEvent
 - 所有测试通过
 - ClusterStatus 保持兼容性
 - 外部消费者无感知
-- 提供映射函数到 v3 LifecyclePhase
+- 提供生命周期阶段映射函数，支持向三层状态机架构演进
 
 #### 3.3 阶段二：状态机增强（可选）
 
@@ -4881,27 +4943,30 @@ func (r *StateMachineEventRecorder) exportDotGraph(events []StateTransitionEvent
 - 状态转换规则集中管理
 - 提供完整的状态转换历史
 
-#### 3.4 与 v3 设计的关系
+#### 3.4 面向三层状态机的演进路径
 
 **当前方案定位**：
 - 针对 PhaseFlow 的改进，解决 Phase、ClusterStatus、ClusterHealthState 三个字段的职责重叠问题
-- 保持 ClusterStatus 的兼容性，不做大的改动
-- 为未来迁移到 v3 做准备
+- 确立 `ClusterStatus` 为单一数据源，为三层状态机的集群层投影奠定基础
+- 通过生命周期阶段映射函数，支持向三层状态机架构平滑演进
 
-**v3 方案定位**：
-- 未来的目标架构，三层状态机设计（集群层 + 节点层 + 组件层）
-- 使用单一的 `BKEClusterLifecycle` 状态机
-- 将"操作进行中"、"操作失败"、"健康状态"分离为独立维度
+**三层状态机远景**：
+- 集群层（Cluster Lifecycle）：Creating → Running → Upgrading → Scaling → RollingBack → Failed
+- 节点层（Node Lifecycle）：Pending → Provisioned → Ready → Upgrading → RollingBack → Deleting → Failed
+- 组件层（Component Lifecycle）：Pending → Installing → Installed → Upgrading → RollingBack → Failed
+- 聚合关系：组件状态 → 节点状态 → 集群状态（自底向上）
 
-**对齐关系**：
-- 当前方案的 ClusterStatus 通过 `MapToV3LifecyclePhase` 函数映射到 v3 状态
-- 当前方案的增强方案（状态转换表、事件系统等）与 v3 设计保持一致
-- 当前方案为 v3 方案的实施奠定基础
+**本提案的铺垫作用**：
+- `ClusterStatus` 单一数据源 → 为集群层 LifecyclePhase 奠定基础
+- 状态转换表引擎（64 条规则） → 为状态聚合器（StateAggregator）奠定基础
+- StatusManagerV2 分层重试 → 为三层重试机制奠定基础
+- `MapToLifecyclePhase` 映射函数 → 为三层聚合的集群层投影奠定基础
+- 事件系统 → 为组件级状态追踪奠定基础
 
-**过渡策略**：
-- 阶段一（三字段整合）：必须实施，解决当前的职责重叠问题
-- 阶段二（状态机增强）：可选实施，提升状态机的可维护性
-- 未来：逐步迁移到 v3 架构，最终替代当前的 PhaseFlow 架构
+**演进策略**：
+- 阶段一（三字段整合）：必须实施，解决当前的职责重叠问题，确立单一数据源
+- 阶段二（状态机增强）：可选实施，引入状态转换表引擎和分层重试，为三层聚合做准备
+- 远景：逐步实现三层状态机聚合（组件→节点→集群），最终替代当前的 PhaseFlow 架构
 
 ## 6. 迁移策略
 
@@ -5249,19 +5314,20 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 
 ## 10. 总结
 
-### 10.1 与 v3 设计的关系
+### 10.1 面向三层状态机的演进路径
 
-| 维度 | 本方案（渐进式重构） | v3 方案（kep6-state-machine-refactor.md） |
+| 维度 | 本方案（渐进式重构） | 三层状态机远景 |
 |------|-------------------|------------------------------------------|
 | **定位** | 面向当下，解决现有问题 | 面向未来，目标架构 |
-| **状态模型** | ClusterStatus 单一字段 | LifecyclePhase 三层状态机 |
+| **状态模型** | ClusterStatus 单一字段 | LifecyclePhase 三层状态机（集群层+节点层+组件层） |
 | **迁移方式** | 标记 Deprecated，自动同步 | Feature Gate + 双写 |
 | **时间线** | 立即实施 | 18 个月 |
 
-**对齐关系**：
-- 本方案的 `MapToV3LifecyclePhase` 为 v3 迁移铺路
-- 本方案的状态转换表引擎与 v3 的 StateAggregator 设计理念一致
-- v3 全量上线后，本方案的 ClusterStatus 将被 LifecyclePhase 替代
+**演进路径**：
+- 本方案的 `MapToLifecyclePhase` 为三层状态机的集群层投影奠定基础
+- 本方案的状态转换表引擎为状态聚合器（StateAggregator）的设计理念奠定基础
+- 本方案的 StatusManagerV2 分层重试为三层重试机制奠定基础
+- 三层状态机全量上线后，本方案的 ClusterStatus 将被 LifecyclePhase 替代
 
 ### 10.2 关键文件变更清单
 
@@ -5301,7 +5367,7 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 | **Phase** | 集群阶段（Deprecated），将被 ClusterStatus 替代 |
 | **状态伪装** | StatusManager 在重试期间将 Failed 状态恢复为 LatestNormalState 的机制 |
 | **effectiveTrigger** | 引擎实际使用的触发器，err!=nil 时被替换为 "Error" |
-| **LifecyclePhase** | v3 架构中的统一生命周期状态 |
+| **LifecyclePhase** | 统一生命周期状态，面向三层状态机架构的演进目标 |
 | **Feature Gate** | 功能开关，控制新特性的启用 |
 | **双写** | 同时写入新旧字段，保证兼容性 |
 
@@ -5320,9 +5386,9 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 
 ### C. 相关文档
 
-- [kep6-state-machine-v1.md](../kep/kep6/kep6-state-machine-v1.md) - v1 状态机设计
-- [kep6-state-machine-v3.md](../kep/kep6/kep6-state-machine-v3.md) - v3 三层状态机设计
-- [kep6-state-machine-refactor.md](../kep/kep6/kep6-state-machine-refactor.md) - 状态机重构方案
+- [kep6-state-machine-v1.md](../kep/kep6/kep6-state-machine-v1.md) - v1 状态机设计（现状参考）
+- [kep6-state-machine-v3.md](../kep/kep6/kep6-state-machine-v3.md) - 三层状态机设计（远景对齐参考）
+- [kep6-state-machine-refactor.md](../kep/kep6/kep6-state-machine-refactor.md) - 状态机重构方案（远景实施参考）
 - [kep6.md](../kep/kep6/kep6.md) - KEP-6 基于 ReleaseImage 的声明式管理方案
 
 ---
