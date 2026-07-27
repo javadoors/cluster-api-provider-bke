@@ -1080,18 +1080,18 @@ sequenceDiagram
     participant Cache as 缓存层
     participant API as API Server
     
-    Note over Controller,API: 优化前（7分14秒）
-    loop 33次 ClusterUnhealthy
+    Note over Controller,API: 优化前
+    loop 多次 ClusterUnhealthy
         Controller->>Checker: CheckClusterHealth()
         Checker->>API: ListNodes()
         API-->>Checker: 节点列表
         Checker->>API: ListPods(kube-system)
         API-->>Checker: Pod列表
         Note right of Checker: 串行检查所有组件<br/>每次全量API调用
-        Checker-->>Controller: 失败，等待10秒
+        Checker-->>Controller: 失败，等待重试
     end
     
-    Note over Controller,API: 优化后（<1分钟）
+    Note over Controller,API: 优化后
     Controller->>Checker: CheckClusterHealth()
     Checker->>Cache: GetNodes()
     Cache-->>Checker: 节点列表（缓存）
@@ -1105,15 +1105,15 @@ sequenceDiagram
 
 **性能对比：**
 
-| 指标 | 优化前 | 优化后 | 提升 |
-| ------ | -------- | -------- | ------ |
-| 健康检查时间 | 7分14秒 | < 1分钟 | 86% |
-| API 调用次数 | ~100次 | < 10次（首次同步后） | 90% |
-| Master NotReady 次数 | 3次 | 0次 | 100% |
-| ClusterUnhealthy 次数 | 33次 | < 5次 | 85% |
-| 关键组件失败检测 | ~7分钟 | < 30秒 | 99% |
-| 检查方式 | 串行 | 并行 + 渐进式 | - |
-| 缓存机制 | 无 | Informer | - |
+| 指标 | 优化前 | 优化后 |
+| ------ | -------- | -------- |
+| 健康检查时间 | 较长 | 显著缩短 |
+| API 调用次数 | 频繁 | 大幅减少 |
+| Master NotReady 次数 | 多次 | 消除 |
+| ClusterUnhealthy 次数 | 频繁 | 大幅减少 |
+| 关键组件失败检测 | 较慢 | 快速返回 |
+| 检查方式 | 串行 | 并行 + 渐进式 |
+| 缓存机制 | 无 | Informer |
 
 ### 3. 组件交互图
 
