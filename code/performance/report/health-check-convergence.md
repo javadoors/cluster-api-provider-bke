@@ -3272,3 +3272,69 @@ Shell 命令检查可能遇到以下错误场景：
 
 1. [Kubernetes Health Checking](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
 2. [Controller Runtime Health Checks](https://pkg.go.dev/sigs.k8s.io/controller-runtime/pkg/healthz)
+
+## 附录：ClusterUnhealthy 大幅减少的原因分析
+
+### 1. 解决根本问题：oauth-webhook 安装顺序优化
+
+**当前问题**：
+- oauth-webhook 安装顺序不当，API Server 重启时 webhook 未就绪
+- 导致 API Server 认证失败，Master 节点 NotReady
+- Master NotReady 触发 ClusterUnhealthy
+
+**优化方案**：
+- 先部署 oauth-webhook 并等待就绪
+- 再配置 API Server 的 webhook 认证
+- API Server 重启时 webhook 已就绪，认证不会失败
+
+**效果**：消除 Master NotReady，从而大幅减少 ClusterUnhealthy
+
+### 2. 改进健康检查机制：渐进式检查架构
+
+**当前问题**：
+- 串行检查所有组件
+- 任何一个组件失败都会导致 ClusterUnhealthy
+- 非关键组件（如 metrics-server）Pending 也会触发 ClusterUnhealthy
+
+**优化方案**：
+- 按优先级分阶段检查（节点 → 关键组件 → 重要组件 → 非关键组件）
+- 关键组件失败立即返回
+- 非关键组件失败记录警告，不触发 ClusterUnhealthy
+
+**效果**：避免因非关键组件问题导致 ClusterUnhealthy
+
+### 3. 动态间隔减少重试
+
+**当前问题**：
+- 固定 10 秒重试间隔
+- 频繁重试导致 ClusterUnhealthy 次数累积
+
+**优化方案**：
+- 根据检查结果动态调整间隔
+- 关键组件失败：5 秒重试
+- 重要组件失败：15 秒重试
+- 非关键组件失败：30 秒重试
+- 正常状态：5 分钟检查
+
+**效果**：减少不必要的重试，降低 ClusterUnhealthy 次数
+
+### 4. 缓存机制减少 API 失败
+
+**当前问题**：
+- 每次检查都重新获取所有 Pod 状态
+- API 调用频繁，容易失败
+- API 失败触发 ClusterUnhealthy
+
+**优化方案**：
+- 使用 Informer 缓存减少 API 调用
+- 首次同步后零 API 调用
+
+**效果**：减少 API 调用失败导致的 ClusterUnhealthy
+
+### 总结
+
+ClusterUnhealthy 大幅减少的核心原因是：
+1. **解决了根本问题**：oauth-webhook 安装顺序优化消除了 Master NotReady
+2. **改进了检查机制**：渐进式检查区分了组件优先级，非关键组件失败不再触发 ClusterUnhealthy
+3. **优化了重试策略**：动态间隔减少了不必要的重试
+4. **减少了 API 失败**：缓存机制降低了 API 调用失败的概率
