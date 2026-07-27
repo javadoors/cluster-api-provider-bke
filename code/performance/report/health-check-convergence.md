@@ -98,7 +98,7 @@
 ### 可衡量目标
 
 1. 健康检查收敛时间：显著缩短
-2. Master NotReady 次数：消除
+2. Master NotReady 次数大幅减少
 3. API 调用次数：大幅降低
 4. 关键组件失败检测时间：显著缩短
 5. ClusterUnhealthy 次数：大幅减少
@@ -118,7 +118,7 @@
 作为集群管理员，我希望集群创建过程中的健康检查能够快速收敛，以便在更短的时间内获得可用的集群。
 
 *当前状态：* 健康检查耗时 7 分 14 秒，期间 Master 节点反复 NotReady
-*期望状态：* 健康检查时间 < 1 分钟（提升 86%），Master NotReady = 0
+*期望状态：* 健康检查时间显著缩短，Master NotReady 大幅减少
 
 **故事 2：稳定的控制面**
 作为集群管理员，我希望在集群创建过程中控制面保持稳定，避免 Master 节点 NotReady。
@@ -177,7 +177,7 @@
 | **缓存化** | 使用缓存减少 API 调用 | 缓存机制 |
 | **智能化** | 根据检查结果动态调整间隔 | 动态间隔 |
 
-#### 优化 1.5: oauth-webhook 安装顺序优化
+#### 优化 2: oauth-webhook 安装顺序优化
 
 **问题背景：**
 
@@ -255,7 +255,7 @@ install_oauth_webhook_and_oauth_server() {
 - Master NotReady 次数从 3 次减少至 0 次
 - 健康检查收敛时间减少约 2-3 分钟（避免 NotReady 导致的重试）
 
-#### 优化 2: 统一健康检查器实现
+#### 优化 3: 统一健康检查器实现
 
 **文件**: `pkg/kube/health.go`
 
@@ -796,7 +796,7 @@ isCriticalError() / isImportantError()
 GetRequeueInterval() → 动态间隔
 ```
 
-#### 优化 3: 健康检查缓存实现
+#### 优化 4: 健康检查缓存实现
 
 ##### 推荐方案：基于 Informer 的实时缓存
 
@@ -910,7 +910,7 @@ func (h *HealthChecker) GetPod(namespace, name string) (*corev1.Pod, error) {
 
 **优先选择 Informer**：实时性优势明显，API 负载最低
 
-#### 优化 4: 配置文件
+#### 优化 5: 配置文件
 
 **文件**: `/etc/bke/health-check-config.yaml`
 
@@ -1275,7 +1275,7 @@ graph TB
 
 **位置**：在 `CheckClusterHealth` 函数前
 
-**新增内容**：完整代码见「优化 2」章节，包含：
+**新增内容**：完整代码见「优化 3」章节，包含：
 
 - `NewUnifiedHealthChecker`：创建健康检查器
 - `DefaultHealthCheckConfig`：返回默认配置（含所有组件的 `Name` 和 `Priority`）
