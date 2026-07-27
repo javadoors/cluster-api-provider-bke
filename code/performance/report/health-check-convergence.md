@@ -918,7 +918,7 @@ func (h *HealthChecker) GetPod(namespace, name string) (*corev1.Pod, error) {
 
 #### 优化 5: 配置文件
 
-**配置存储位置**: ConfigMap `cluster-system/health-check-config`
+**配置存储位置**: ConfigMap `bke-config/health-check-config`
 
 **ConfigMap 同步机制：**
 
@@ -926,35 +926,39 @@ func (h *HealthChecker) GetPod(namespace, name string) (*corev1.Pod, error) {
 
 ```mermaid
 graph TB
-    subgraph "阶段 1: bke init"
-        A[bke init] --> B[创建 cluster-system/health-check-config CM]
-        B --> C[引导节点 K3s 的 bke-controller-manager 使用]
+    subgraph "阶段 1: bke init 详细流程"
+        A[bke init 命令] --> B[初始化引导节点 K3s]
+        B --> C[创建 bke-config 命名空间]
+        C --> D[生成 health-check-config ConfigMap]
+        D --> E[写入默认配置内容<br/>intervals、components 等]
+        E --> F[引导节点 bke-controller-manager 启动]
+        F --> G[加载 bke-config/health-check-config CM]
     end
     
     subgraph "阶段 2: 引导节点拉管理集群"
-        D[引导节点 bke-controller-manager] --> E{管理集群 kube-apiserver 就绪?}
-        E -->|是| F[同步 health-check-config CM 到管理集群]
-        F --> G[管理集群 bke-controller-manager 使用]
+        H[引导节点 bke-controller-manager] --> I{管理集群 kube-apiserver 就绪?}
+        I -->|是| J[同步 bke-config/health-check-config CM 到管理集群]
+        J --> K[管理集群 bke-controller-manager 使用]
     end
     
     subgraph "阶段 3: 引导节点拉业务集群"
-        H[引导节点 bke-controller-manager] --> I[直接使用引导节点 K3s 的 health-check-config CM]
+        L[引导节点 bke-controller-manager] --> M[直接使用引导节点 K3s 的 bke-config/health-check-config CM]
     end
     
     subgraph "阶段 4: 管理集群拉业务集群"
-        J[管理集群 bke-controller-manager] --> K[直接使用管理集群的 health-check-config CM]
+        N[管理集群 bke-controller-manager] --> O[直接使用管理集群的 bke-config/health-check-config CM]
     end
     
-    C -.->|阶段 2| F
-    G -.->|阶段 4| K
+    G -.->|阶段 2| J
+    K -.->|阶段 4| O
 ```
 
 **同步流程说明：**
 
 | 阶段 | Controller 位置 | 配置来源 | 同步动作 |
 |------|----------------|---------|---------|
-| 1. bke init | 引导节点 (K3s) | 引导节点 K3s 的 ConfigMap | 创建 ConfigMap |
-| 2. 引导节点拉管理集群 | 引导节点 (K3s) | 引导节点 K3s 的 ConfigMap | 同步到管理集群 |
+| 1. bke init | 引导节点 (K3s) | - | 创建 bke-config 命名空间，生成 health-check-config ConfigMap，写入默认配置 |
+| 2. 引导节点拉管理集群 | 引导节点 (K3s) | 引导节点 K3s 的 ConfigMap | 同步到管理集群的 bke-config 命名空间 |
 | 3. 引导节点拉业务集群 | 引导节点 (K3s) | 引导节点 K3s 的 ConfigMap | 直接使用（无需同步） |
 | 4. 管理集群拉业务集群 | 管理集群 | 管理集群的 ConfigMap | 直接使用（无需同步） |
 
@@ -965,7 +969,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: health-check-config
-  namespace: cluster-system
+  namespace: bke-config
 data:
   config.yaml: |
     # 检查间隔
@@ -1036,7 +1040,7 @@ data:
 
 **配置加载优先级：**
 
-1. 从 `cluster-system/health-check-config` ConfigMap 的 `config.yaml` 字段加载配置
+1. 从 `bke-config/health-check-config` ConfigMap 的 `config.yaml` 字段加载配置
 2. 如果 ConfigMap 不存在或格式错误，使用默认配置
 3. 如果配置文件中 `components` 为空，使用默认组件清单
 4. `priority` 字段为必填，缺失时加载失败并回退到默认配置
@@ -1141,7 +1145,7 @@ addon 组件的健康检查由 `EnsureAddonDeploy` Phase 中的 `checkAddonHealt
 ```mermaid
 graph TB
     subgraph "BKE Controller"
-        A[配置管理<br/>ConfigMap: cluster-system/health-check-config<br/>priority: critical/important/optional] --> B[统一健康检查器<br/>health.go]
+        A[配置管理<br/>ConfigMap: bke-config/health-check-config<br/>priority: critical/important/optional] --> B[统一健康检查器<br/>health.go]
         B --> C[渐进式检查引擎<br/>groupByPriority]
         C --> D[节点检查器]
         C --> E[组件检查器<br/>checkComponent → HealthCheckError]
@@ -1269,7 +1273,7 @@ graph LR
 
 ```mermaid
 graph TD
-    A[ConfigMap<br/>cluster-system/health-check-config<br/>priority: critical/important/optional] --> B[LoadHealthCheckConfig]
+    A[ConfigMap<br/>bke-config/health-check-config<br/>priority: critical/important/optional] --> B[LoadHealthCheckConfig]
     B --> C[HealthCheckConfig<br/>Components: 扁平列表]
     
     C --> D[NewUnifiedHealthChecker]
@@ -1577,7 +1581,7 @@ return ctrl.Result{RequeueAfter: requeueInterval}, kerrors.NewAggregate(errs)
 - 第 130-132 行（健康检查失败场景）使用动态间隔
 - 第 136 行（正常状态场景）使用动态间隔
 
-#### 4. ConfigMap `cluster-system/health-check-config` - 新增
+#### 4. ConfigMap `bke-config/health-check-config` - 新增
 
 **位置**：新 ConfigMap
 
@@ -1586,7 +1590,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: health-check-config
-  namespace: cluster-system
+  namespace: bke-config
 data:
   config.yaml: |
     # 检查间隔
@@ -1867,7 +1871,7 @@ func TestHealthCheckPerformance(t *testing.T) {
 | `pkg/kube/health.go` | 修改 | 300 | 50 |
 | `pkg/kube/health_cache.go` | 新增 | 150 | 0 |
 | `pkg/phaseframe/phases/ensure_cluster.go` | 修改 | 15 | 20 |
-| ConfigMap `cluster-system/health-check-config` | 新增 | 80 | 0 |
+| ConfigMap `bke-config/health-check-config` | 新增 | 80 | 0 |
 | `pkg/kube/health_test.go` | 新增 | 150 | 0 |
 | `test/integration/health_check_test.go` | 新增 | 50 | 0 |
 | **总计** | | **745** | **70** |
@@ -1876,7 +1880,7 @@ func TestHealthCheckPerformance(t *testing.T) {
 
 1. **第一阶段：基础设施**
    - 创建 `pkg/kube/health_cache.go`（缓存层）
-   - 创建 ConfigMap `cluster-system/health-check-config`（配置文件）
+   - 创建 ConfigMap `bke-config/health-check-config`（配置文件）
 
 2. **第二阶段：核心逻辑**
    - 修改 `pkg/kube/health.go`（统一检查器）
@@ -1991,7 +1995,7 @@ kubectl logs -n bke-system deployment/bke-controller-manager | grep "health chec
 
 **升级策略：**
 
-- ConfigMap `cluster-system/health-check-config` 可选，不存在时使用默认配置
+- ConfigMap `bke-config/health-check-config` 可选，不存在时使用默认配置
 - 新代码完全兼容旧的健康检查逻辑
 - 可以渐进式部署，先部署到部分节点验证
 
