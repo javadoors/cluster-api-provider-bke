@@ -543,16 +543,26 @@ func DefaultHealthCheckConfig() HealthCheckConfig {
     }
 }
 
-// LoadHealthCheckConfig 从配置文件加载配置
-func LoadHealthCheckConfig(configPath string) HealthCheckConfig {
-    data, err := os.ReadFile(configPath)
+// LoadHealthCheckConfig 从 ConfigMap 加载配置
+func LoadHealthCheckConfig(ctx context.Context, c client.Client) HealthCheckConfig {
+    cm := &corev1.ConfigMap{}
+    err := c.Get(ctx, client.ObjectKey{
+        Namespace: "cluster-system",
+        Name:      "health-check-config",
+    }, cm)
     if err != nil {
-        log.Warnf("failed to load health check config from %s, using default: %v", configPath, err)
+        log.Warnf("failed to load health check config from ConfigMap, using default: %v", err)
+        return DefaultHealthCheckConfig()
+    }
+
+    configData, ok := cm.Data["config.yaml"]
+    if !ok {
+        log.Warnf("config.yaml not found in ConfigMap, using default")
         return DefaultHealthCheckConfig()
     }
 
     var config HealthCheckConfig
-    if err := yaml.Unmarshal(data, &config); err != nil {
+    if err := yaml.Unmarshal([]byte(configData), &config); err != nil {
         log.Warnf("failed to parse health check config, using default: %v", err)
         return DefaultHealthCheckConfig()
     }
@@ -569,8 +579,8 @@ func LoadHealthCheckConfig(configPath string) HealthCheckConfig {
 
 ```go
 // CheckClusterHealth 统一健康检查入口
-func CheckClusterHealth(kubeClient kubernetes.Interface, log *log.Logger, cluster *bkev1beta1.BKECluster, currentVersion string, bkeNodes bkev1beta1.BKENodes) error {
-    config := LoadHealthCheckConfig("/etc/bke/health-check-config.yaml")
+func CheckClusterHealth(ctx context.Context, c client.Client, kubeClient kubernetes.Interface, log *log.Logger, cluster *bkev1beta1.BKECluster, currentVersion string, bkeNodes bkev1beta1.BKENodes) error {
+    config := LoadHealthCheckConfig(ctx, c)
     checker := NewUnifiedHealthChecker(kubeClient, log, config)
     return checker.Check(cluster, currentVersion, bkeNodes)
 }
@@ -912,98 +922,145 @@ func (h *HealthChecker) GetPod(namespace, name string) (*corev1.Pod, error) {
 
 #### 优化 5: 配置文件
 
-**文件**: `/etc/bke/health-check-config.yaml`
+**配置存储位置**: ConfigMap `cluster-system/health-check-config`
+
+**ConfigMap 同步机制：**
+
+健康检查配置通过 ConfigMap 存储，并在不同集群间同步：
+
+```mermaid
+graph TB
+    subgraph "阶段 1: bke init"
+        A[bke init] --> B[创建 cluster-system/health-check-config CM]
+        B --> C[引导节点 K3s 的 bke-controller-manager 使用]
+    end
+    
+    subgraph "阶段 2: 引导节点拉管理集群"
+        D[引导节点 bke-controller-manager] --> E{管理集群 kube-apiserver 就绪?}
+        E -->|是| F[同步 health-check-config CM 到管理集群]
+        F --> G[管理集群 bke-controller-manager 使用]
+    end
+    
+    subgraph "阶段 3: 引导节点拉业务集群"
+        H[引导节点 bke-controller-manager] --> I[直接使用引导节点 K3s 的 health-check-config CM]
+    end
+    
+    subgraph "阶段 4: 管理集群拉业务集群"
+        J[管理集群 bke-controller-manager] --> K[直接使用管理集群的 health-check-config CM]
+    end
+    
+    C -.->|阶段 2| F
+    G -.->|阶段 4| K
+```
+
+**同步流程说明：**
+
+| 阶段 | Controller 位置 | 配置来源 | 同步动作 |
+|------|----------------|---------|---------|
+| 1. bke init | 引导节点 (K3s) | 引导节点 K3s 的 ConfigMap | 创建 ConfigMap |
+| 2. 引导节点拉管理集群 | 引导节点 (K3s) | 引导节点 K3s 的 ConfigMap | 同步到管理集群 |
+| 3. 引导节点拉业务集群 | 引导节点 (K3s) | 引导节点 K3s 的 ConfigMap | 直接使用（无需同步） |
+| 4. 管理集群拉业务集群 | 管理集群 | 管理集群的 ConfigMap | 直接使用（无需同步） |
+
+**ConfigMap 定义：**
 
 ```yaml
-# 检查间隔
-intervals:
-  critical: 5s
-  important: 15s
-  optional: 30s
-  normal: 5m
-
-# 缓存
-cacheSyncTimeout: 30s
-
-# 组件清单（扁平列表，priority 由配置直接定义）
-components:
-  # 控制面
-  - name: etcd
-    namespace: kube-system
-    prefixes: [etcd-]
-    priority: critical
-  - name: kube-apiserver
-    namespace: kube-system
-    prefixes: [kube-apiserver-]
-    priority: critical
-  - name: kube-controller-manager
-    namespace: kube-system
-    prefixes: [kube-controller-manager-]
-    priority: critical
-  - name: kube-scheduler
-    namespace: kube-system
-    prefixes: [kube-scheduler-]
-    priority: critical
-  - name: oauth-webhook
-    namespace: openfuyao-system
-    prefixes: [oauth-webhook-]
-    priority: critical
-
-  # 网络
-  - name: calico-node
-    namespace: kube-system
-    prefixes: [calico-node]
-    priority: important
-  - name: calico-kube-controllers
-    namespace: kube-system
-    prefixes: [calico-kube-controllers]
-    priority: important
-  - name: kube-proxy
-    namespace: kube-system
-    prefixes: [kube-proxy-]
-    priority: important
-
-  # DNS
-  - name: coredns
-    namespace: kube-system
-    prefixes: [coredns]
-    priority: important
-
-  # Addon
-  - name: metrics-server
-    namespace: kube-system
-    prefixes: [metrics-server-]
-    priority: optional
-  - name: ingress-nginx
-    namespace: ingress-nginx
-    prefixes: [ingress-nginx-controller]
-    priority: optional
-  - name: console-service
-    namespace: openfuyao-system
-    prefixes: [console-service-]
-    priority: optional
-  - name: oauth-server
-    namespace: openfuyao-system
-    prefixes: [oauth-server-]
-    priority: optional
-  - name: local-harbor
-    namespace: openfuyao-system
-    prefixes: [local-harbor-]
-    priority: optional
-
-  # 监控
-  - name: prometheus
-    namespace: monitoring
-    prefixes: [prometheus-k8s-]
-    priority: optional
-  - name: alertmanager
-    namespace: monitoring
-    prefixes: [alertmanager-main-]
-    priority: optional
-  - name: node-exporter
-    namespace: monitoring
-    prefixes: [node-exporter-]
-    priority: optional
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: health-check-config
+  namespace: cluster-system
+data:
+  config.yaml: |
+    # 检查间隔
+    intervals:
+      critical: 5s
+      important: 15s
+      optional: 30s
+      normal: 5m
+    
+    # 缓存
+    cacheSyncTimeout: 30s
+    
+    # 组件清单（扁平列表，priority 由配置直接定义）
+    components:
+      # 控制面
+      - name: etcd
+        namespace: kube-system
+        prefixes: [etcd-]
+        priority: critical
+      - name: kube-apiserver
+        namespace: kube-system
+        prefixes: [kube-apiserver-]
+        priority: critical
+      - name: kube-controller-manager
+        namespace: kube-system
+        prefixes: [kube-controller-manager-]
+        priority: critical
+      - name: kube-scheduler
+        namespace: kube-system
+        prefixes: [kube-scheduler-]
+        priority: critical
+      - name: oauth-webhook
+        namespace: openfuyao-system
+        prefixes: [oauth-webhook-]
+        priority: critical
+    
+      # 网络
+      - name: calico-node
+        namespace: kube-system
+        prefixes: [calico-node]
+        priority: important
+      - name: calico-kube-controllers
+        namespace: kube-system
+        prefixes: [calico-kube-controllers]
+        priority: important
+      - name: kube-proxy
+        namespace: kube-system
+        prefixes: [kube-proxy-]
+        priority: important
+    
+      # DNS
+      - name: coredns
+        namespace: kube-system
+        prefixes: [coredns]
+        priority: important
+    
+      # Addon
+      - name: metrics-server
+        namespace: kube-system
+        prefixes: [metrics-server-]
+        priority: optional
+      - name: ingress-nginx
+        namespace: ingress-nginx
+        prefixes: [ingress-nginx-controller]
+        priority: optional
+      - name: console-service
+        namespace: openfuyao-system
+        prefixes: [console-service-]
+        priority: optional
+      - name: oauth-server
+        namespace: openfuyao-system
+        prefixes: [oauth-server-]
+        priority: optional
+      - name: local-harbor
+        namespace: openfuyao-system
+        prefixes: [local-harbor-]
+        priority: optional
+    
+      # 监控
+      - name: prometheus
+        namespace: monitoring
+        prefixes: [prometheus-k8s-]
+        priority: optional
+      - name: alertmanager
+        namespace: monitoring
+        prefixes: [alertmanager-main-]
+        priority: optional
+      - name: node-exporter
+        namespace: monitoring
+        prefixes: [node-exporter-]
+        priority: optional
 ```
 
 **配置说明：**
@@ -1023,8 +1080,8 @@ components:
 
 **配置加载优先级：**
 
-1. 如果配置文件存在且格式正确，使用配置文件
-2. 如果配置文件不存在或格式错误，使用默认配置
+1. 从 `cluster-system/health-check-config` ConfigMap 的 `config.yaml` 字段加载配置
+2. 如果 ConfigMap 不存在或格式错误，使用默认配置
 3. 如果配置文件中 `components` 为空，使用默认组件清单
 4. `priority` 字段为必填，缺失时加载失败并回退到默认配置
 
@@ -1035,7 +1092,7 @@ components:
 ```mermaid
 graph TB
     subgraph "BKE Controller"
-        A[配置管理<br/>health-check-config.yaml<br/>priority: critical/important/optional] --> B[统一健康检查器<br/>health.go]
+        A[配置管理<br/>ConfigMap: cluster-system/health-check-config<br/>priority: critical/important/optional] --> B[统一健康检查器<br/>health.go]
         B --> C[渐进式检查引擎<br/>groupByPriority]
         C --> D[节点检查器]
         C --> E[组件检查器<br/>checkComponent → HealthCheckError]
@@ -1163,7 +1220,7 @@ graph LR
 
 ```mermaid
 graph TD
-    A[配置文件<br/>health-check-config.yaml<br/>priority: critical/important/optional] --> B[LoadHealthCheckConfig]
+    A[ConfigMap<br/>cluster-system/health-check-config<br/>priority: critical/important/optional] --> B[LoadHealthCheckConfig]
     B --> C[HealthCheckConfig<br/>Components: 扁平列表]
     
     C --> D[NewUnifiedHealthChecker]
@@ -1296,11 +1353,11 @@ graph TB
 **重构点**：
 
 - 将现有的 `CheckClusterHealth` 函数改为使用 `UnifiedHealthChecker`
-- 保留函数签名不变，内部实现改为调用统一检查器
+- 从 ConfigMap 加载配置
 
 ```go
 func (c *Client) CheckClusterHealth(cluster *bkev1beta1.BKECluster, currentVersion string, bkeNodes bkev1beta1.BKENodes) error {
-    config := LoadHealthCheckConfig("/etc/bke/health-check-config.yaml")
+    config := LoadHealthCheckConfig(c.Ctx, c.Client)
     checker := NewUnifiedHealthChecker(c.ClientSet, c.Log, config)
     return checker.Check(cluster, currentVersion, bkeNodes)
 }
@@ -1471,96 +1528,103 @@ return ctrl.Result{RequeueAfter: requeueInterval}, kerrors.NewAggregate(errs)
 - 第 130-132 行（健康检查失败场景）使用动态间隔
 - 第 136 行（正常状态场景）使用动态间隔
 
-#### 4. `/etc/bke/health-check-config.yaml` - 新增
+#### 4. ConfigMap `cluster-system/health-check-config` - 新增
 
-**位置**：新文件
+**位置**：新 ConfigMap
 
 ```yaml
-# 检查间隔
-intervals:
-  critical: 5s
-  important: 15s
-  optional: 30s
-  normal: 5m
-
-# 缓存
-cacheSyncTimeout: 30s
-
-# 组件清单（扁平列表，priority 由配置直接定义）
-components:
-  # 控制面
-  - name: etcd
-    namespace: kube-system
-    prefixes: [etcd-]
-    priority: critical
-  - name: kube-apiserver
-    namespace: kube-system
-    prefixes: [kube-apiserver-]
-    priority: critical
-  - name: kube-controller-manager
-    namespace: kube-system
-    prefixes: [kube-controller-manager-]
-    priority: critical
-  - name: kube-scheduler
-    namespace: kube-system
-    prefixes: [kube-scheduler-]
-    priority: critical
-  - name: oauth-webhook
-    namespace: openfuyao-system
-    prefixes: [oauth-webhook-]
-    priority: critical
-  # 网络
-  - name: calico-node
-    namespace: kube-system
-    prefixes: [calico-node]
-    priority: important
-  - name: calico-kube-controllers
-    namespace: kube-system
-    prefixes: [calico-kube-controllers]
-    priority: important
-  - name: kube-proxy
-    namespace: kube-system
-    prefixes: [kube-proxy-]
-    priority: important
-  # DNS
-  - name: coredns
-    namespace: kube-system
-    prefixes: [coredns]
-    priority: important
-  # Addon
-  - name: metrics-server
-    namespace: kube-system
-    prefixes: [metrics-server-]
-    priority: optional
-  - name: ingress-nginx
-    namespace: ingress-nginx
-    prefixes: [ingress-nginx-controller]
-    priority: optional
-  - name: console-service
-    namespace: openfuyao-system
-    prefixes: [console-service-]
-    priority: optional
-  - name: oauth-server
-    namespace: openfuyao-system
-    prefixes: [oauth-server-]
-    priority: optional
-  - name: local-harbor
-    namespace: openfuyao-system
-    prefixes: [local-harbor-]
-    priority: optional
-  # 监控
-  - name: prometheus
-    namespace: monitoring
-    prefixes: [prometheus-k8s-]
-    priority: optional
-  - name: alertmanager
-    namespace: monitoring
-    prefixes: [alertmanager-main-]
-    priority: optional
-  - name: node-exporter
-    namespace: monitoring
-    prefixes: [node-exporter-]
-    priority: optional
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: health-check-config
+  namespace: cluster-system
+data:
+  config.yaml: |
+    # 检查间隔
+    intervals:
+      critical: 5s
+      important: 15s
+      optional: 30s
+      normal: 5m
+    
+    # 缓存
+    cacheSyncTimeout: 30s
+    
+    # 组件清单（扁平列表，priority 由配置直接定义）
+    components:
+      # 控制面
+      - name: etcd
+        namespace: kube-system
+        prefixes: [etcd-]
+        priority: critical
+      - name: kube-apiserver
+        namespace: kube-system
+        prefixes: [kube-apiserver-]
+        priority: critical
+      - name: kube-controller-manager
+        namespace: kube-system
+        prefixes: [kube-controller-manager-]
+        priority: critical
+      - name: kube-scheduler
+        namespace: kube-system
+        prefixes: [kube-scheduler-]
+        priority: critical
+      - name: oauth-webhook
+        namespace: openfuyao-system
+        prefixes: [oauth-webhook-]
+        priority: critical
+      # 网络
+      - name: calico-node
+        namespace: kube-system
+        prefixes: [calico-node]
+        priority: important
+      - name: calico-kube-controllers
+        namespace: kube-system
+        prefixes: [calico-kube-controllers]
+        priority: important
+      - name: kube-proxy
+        namespace: kube-system
+        prefixes: [kube-proxy-]
+        priority: important
+      # DNS
+      - name: coredns
+        namespace: kube-system
+        prefixes: [coredns]
+        priority: important
+      # Addon
+      - name: metrics-server
+        namespace: kube-system
+        prefixes: [metrics-server-]
+        priority: optional
+      - name: ingress-nginx
+        namespace: ingress-nginx
+        prefixes: [ingress-nginx-controller]
+        priority: optional
+      - name: console-service
+        namespace: openfuyao-system
+        prefixes: [console-service-]
+        priority: optional
+      - name: oauth-server
+        namespace: openfuyao-system
+        prefixes: [oauth-server-]
+        priority: optional
+      - name: local-harbor
+        namespace: openfuyao-system
+        prefixes: [local-harbor-]
+        priority: optional
+      # 监控
+      - name: prometheus
+        namespace: monitoring
+        prefixes: [prometheus-k8s-]
+        priority: optional
+      - name: alertmanager
+        namespace: monitoring
+        prefixes: [alertmanager-main-]
+        priority: optional
+      - name: node-exporter
+        namespace: monitoring
+        prefixes: [node-exporter-]
+        priority: optional
 ```
 
 #### 5. `pkg/kube/health_test.go` - 新增
@@ -1792,16 +1856,16 @@ func TestHealthCheckPerformance(t *testing.T) {
 | `pkg/kube/health.go` | 修改 | 300 | 50 |
 | `pkg/kube/health_cache.go` | 新增 | 150 | 0 |
 | `pkg/phaseframe/phases/ensure_cluster.go` | 修改 | 15 | 20 |
-| `/etc/bke/health-check-config.yaml` | 新增 | 70 | 0 |
+| ConfigMap `cluster-system/health-check-config` | 新增 | 80 | 0 |
 | `pkg/kube/health_test.go` | 新增 | 150 | 0 |
 | `test/integration/health_check_test.go` | 新增 | 50 | 0 |
-| **总计** | | **735** | **70** |
+| **总计** | | **745** | **70** |
 
 #### 实施顺序建议
 
 1. **第一阶段：基础设施**
    - 创建 `pkg/kube/health_cache.go`（缓存层）
-   - 创建 `/etc/bke/health-check-config.yaml`（配置文件）
+   - 创建 ConfigMap `cluster-system/health-check-config`（配置文件）
 
 2. **第二阶段：核心逻辑**
    - 修改 `pkg/kube/health.go`（统一检查器）
@@ -1916,13 +1980,13 @@ kubectl logs -n bke-system deployment/bke-controller-manager | grep "health chec
 
 **升级策略：**
 
-- 配置文件 `/etc/bke/health-check-config.yaml` 可选，不存在时使用默认配置
+- ConfigMap `cluster-system/health-check-config` 可选，不存在时使用默认配置
 - 新代码完全兼容旧的健康检查逻辑
 - 可以渐进式部署，先部署到部分节点验证
 
 **降级策略：**
 
-- 删除配置文件即可回退到默认配置
+- 删除 ConfigMap 即可回退到默认配置
 - 代码回退简单，只需恢复原有的 `CheckClusterHealth()` 实现
 
 ## 工作量评估
@@ -2184,6 +2248,8 @@ gantt
 | prometheus | optional | monitoring | prometheus-k8s- |
 | alertmanager | optional | monitoring | alertmanager-main- |
 | node-exporter | optional | monitoring | node-exporter- |
+
+> **备注**：当前 `health-check-config.yaml` 中理论上只包含 openfuyao-core 的组件，addon 组件（如 metrics-server、ingress-nginx、console-service、oauth-server、local-harbor、prometheus、alertmanager、node-exporter 等）理论上不包含在配置中。addon 组件的健康检查由其他机制负责，不在本健康检查框架的范围内。
 
 ### 验收标准
 
