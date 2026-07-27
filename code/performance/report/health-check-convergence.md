@@ -2057,15 +2057,28 @@ pie title 工作量分布
 ### 5. 里程碑计划
 
 ```mermaid
-gantt
-    title 项目实施计划
-    dateFormat  YYYY-MM-DD
-    section 开发
-    核心实现             :a1, 2026-01-01, 4d
-    section 测试
-    测试验证             :b1, after a1, 5d
-    section 发布
-    发布准备             :c1, after b1, 2d
+graph LR
+    subgraph "开发阶段 (Day 1-4)"
+        A[核心实现] --> B[健康检查器]
+        A --> C[缓存层]
+        A --> D[配置管理]
+    end
+    
+    subgraph "测试阶段 (Day 5-9)"
+        E[测试验证] --> F[集成测试]
+        E --> G[端到端测试]
+    end
+    
+    subgraph "发布阶段 (Day 10-11)"
+        H[发布准备] --> I[文档更新]
+        H --> J[代码审查]
+    end
+    
+    B --> E
+    C --> E
+    D --> E
+    F --> H
+    G --> H
 ```
 
 | 里程碑 | 时间 | 交付物 | 验收标准 |
