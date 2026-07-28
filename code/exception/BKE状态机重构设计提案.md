@@ -837,6 +837,94 @@ if sr.AllowFailed() {
 
 ### 4.1.2 重构内容
 
+#### 4.1.2.0 统一同步机制
+
+**同步策略**：
+
+- `ClusterStatus` 为主字段（Single Source of Truth）
+- `Phase` 和 `ClusterHealthState` 为派生字段（Derived Fields）
+- 所有状态变更必须通过统一同步函数保证一致性
+
+**同步函数**：
+
+```go
+// SyncStatusFields 统一同步函数
+// 在设置 ClusterStatus 后调用，自动同步 Phase 和 ClusterHealthState
+func SyncStatusFields(cluster *bkev1beta1.BKECluster) {
+    cluster.Status.Phase = MapClusterStatusToPhase(cluster.Status.ClusterStatus)
+    cluster.Status.ClusterHealthState = MapClusterStatusToClusterHealthState(cluster.Status.ClusterStatus)
+}
+```
+
+**Setter 方法**：
+
+```go
+// SetClusterStatus 设置 ClusterStatus 并自动同步派生字段
+// 推荐使用此方法替代直接设置 Status.ClusterStatus
+func (c *bkev1beta1.BKECluster) SetClusterStatus(status bkev1beta1.ClusterStatus) {
+    c.Status.ClusterStatus = status
+    SyncStatusFields(c)
+}
+```
+
+**同步时机**：
+
+1. **立即同步**：在设置 ClusterStatus 后立即调用 `SyncStatusFields` 或使用 `SetClusterStatus`
+2. **Reconcile 结束时验证**：在 Reconcile 结束时验证字段一致性
+3. **状态读取时派生**：读取旧字段时，如果为空则从 ClusterStatus 派生
+
+**一致性验证**：
+
+```go
+// ValidateStatusConsistency 验证状态字段一致性
+func ValidateStatusConsistency(cluster *bkev1beta1.BKECluster) error {
+    var errors []string
+    
+    // 1. 验证 ClusterStatus 不为空
+    if cluster.Status.ClusterStatus == "" {
+        errors = append(errors, "ClusterStatus 为空")
+    }
+    
+    // 2. 验证 Phase 一致性
+    expectedPhase := MapClusterStatusToPhase(cluster.Status.ClusterStatus)
+    if cluster.Status.Phase != expectedPhase {
+        errors = append(errors, fmt.Sprintf(
+            "Phase 不一致: 期望 %s, 实际 %s",
+            expectedPhase, cluster.Status.Phase,
+        ))
+    }
+    
+    // 3. 验证 ClusterHealthState 一致性
+    expectedHealthState := MapClusterStatusToClusterHealthState(cluster.Status.ClusterStatus)
+    if cluster.Status.ClusterHealthState != expectedHealthState {
+        errors = append(errors, fmt.Sprintf(
+            "ClusterHealthState 不一致: 期望 %s, 实际 %s",
+            expectedHealthState, cluster.Status.ClusterHealthState,
+        ))
+    }
+    
+    if len(errors) > 0 {
+        return fmt.Errorf("状态不一致: %s", strings.Join(errors, "; "))
+    }
+    
+    return nil
+}
+```
+
+**同步失败处理**：
+
+| 失败场景 | 处理策略 | 说明 |
+|---------|---------|------|
+| 映射函数返回空值 | 使用默认值 + 记录警告日志 | 不阻断流程 |
+| 字段类型不匹配 | 记录错误日志 + 发送告警 | 跳过同步 |
+| 并发更新冲突 | 使用 Patch 机制 + 重试（最多 3 次） | 超过重试次数记录错误 |
+
+**使用规范**：
+
+1. **所有状态变更必须通过统一函数**：使用 `SetClusterStatus()` 方法或调用 `SyncStatusFields()` 函数
+2. **所有派生字段必须从 ClusterStatus 派生**：禁止直接设置 Phase 或 ClusterHealthState
+3. **所有同步点必须使用相同的策略**：PhaseFlow、StatusManager、Controller、Webhook 等所有层统一使用
+
 ### 4.1.2.1 API 层重构
 
 **重构内容**：
@@ -1422,12 +1510,8 @@ func (b *BasePhase) handleRunningStatus(status []confv1beta1.PhaseState, phaseNa
 
 ```go
 func (b *BasePhase) handleRunningStatus(status []confv1beta1.PhaseState, phaseName confv1beta1.BKEClusterPhase, bkeCluster *bkev1beta1.BKECluster) []confv1beta1.PhaseState {
-    // 使用 ClusterStatus 作为主要状态字段
-    bkeCluster.Status.ClusterStatus = MapPhaseToClusterStatus(phaseName, nil)
-    
-    // 向后兼容：同步设置 Phase 和 ClusterHealthState
-    bkeCluster.Status.Phase = phaseName
-    bkeCluster.Status.ClusterHealthState = MapClusterStatusToClusterHealthState(bkeCluster.Status.ClusterStatus)
+    // 使用 SetClusterStatus 统一设置状态并自动同步派生字段
+    bkeCluster.SetClusterStatus(MapPhaseToClusterStatus(phaseName, nil))
     
     // ... 其他逻辑
     return status
@@ -1554,21 +1638,18 @@ case bkev1beta1.Managing:
 修改后：
 
 ```go
-// 使用 ClusterStatus 作为主要状态字段
+// 使用 SetClusterStatus 统一设置状态并自动同步派生字段
 switch sr.CurrentClusterState {
 case bkev1beta1.ClusterDeployingAddon:
-    bkeCluster.Status.ClusterStatus = bkev1beta1.ClusterDeployAddonFailed
+    bkeCluster.SetClusterStatus(bkev1beta1.ClusterDeployAddonFailed)
     msg = string(bkev1beta1.ClusterDeployAddonFailed)
 case bkev1beta1.ClusterUpgrading:
-    bkeCluster.Status.ClusterStatus = bkev1beta1.ClusterUpgradeFailed
+    bkeCluster.SetClusterStatus(bkev1beta1.ClusterUpgradeFailed)
     msg = string(bkev1beta1.ClusterUpgradeFailed)
 case bkev1beta1.ClusterManaging:
-    bkeCluster.Status.ClusterStatus = bkev1beta1.ClusterManageFailed
+    bkeCluster.SetClusterStatus(bkev1beta1.ClusterManageFailed)
     msg = string(bkev1beta1.ClusterManageFailed)
 }
-
-// 向后兼容：同步设置 ClusterHealthState
-bkeCluster.Status.ClusterHealthState = MapClusterStatusToClusterHealthState(bkeCluster.Status.ClusterStatus)
 ```
 
 ### 4.1.2.5 控制器层重构
@@ -1600,11 +1681,8 @@ func markBKEClusterHealthyStatus(bkeCluster *bkev1beta1.BKECluster, status confv
 
 ```go
 func markBKEClusterHealthyStatus(bkeCluster *bkev1beta1.BKECluster, status confv1beta1.ClusterHealthState) {
-    // 使用 ClusterStatus 作为主要状态字段
-    bkeCluster.Status.ClusterStatus = MapClusterHealthStateToClusterStatus(status)
-    
-    // 向后兼容：同步设置 ClusterHealthState
-    bkeCluster.Status.ClusterHealthState = status
+    // 使用 SetClusterStatus 统一设置状态并自动同步派生字段
+    bkeCluster.SetClusterStatus(MapClusterHealthStateToClusterStatus(status))
 }
 ```
 
@@ -1710,11 +1788,8 @@ bkeCluster.Status.ClusterHealthState = bkev1beta1.Unhealthy
 修改后：
 
 ```go
-// 使用 ClusterStatus 作为主要状态字段
-bkeCluster.Status.ClusterStatus = bkev1beta1.ClusterUnhealthy
-
-// 向后兼容：同步设置 ClusterHealthState
-bkeCluster.Status.ClusterHealthState = bkev1beta1.Unhealthy
+// 使用 SetClusterStatus 统一设置状态并自动同步派生字段
+bkeCluster.SetClusterStatus(bkev1beta1.ClusterUnhealthy)
 ```
 
 修改位置 3：第 399 行
@@ -1728,11 +1803,8 @@ bkeCluster.Status.ClusterHealthState = bkev1beta1.Healthy
 修改后：
 
 ```go
-// 使用 ClusterStatus 作为主要状态字段
-bkeCluster.Status.ClusterStatus = bkev1beta1.ClusterReady
-
-// 向后兼容：同步设置 ClusterHealthState
-bkeCluster.Status.ClusterHealthState = bkev1beta1.Healthy
+// 使用 SetClusterStatus 统一设置状态并自动同步派生字段
+bkeCluster.SetClusterStatus(bkev1beta1.ClusterReady)
 ```
 
 **文件：`pkg/phaseframe/phases/ensure_nodes_env.go`**
@@ -1790,11 +1862,8 @@ params.CombinedCluster.Status.ClusterHealthState = newBKECuster.Status.ClusterHe
 修改后：
 
 ```go
-// 使用 ClusterStatus 作为主要状态字段
-params.CombinedCluster.Status.ClusterStatus = newBKECuster.Status.ClusterStatus
-
-// 向后兼容：同步设置 ClusterHealthState
-params.CombinedCluster.Status.ClusterHealthState = newBKECuster.Status.ClusterHealthState
+// 使用 SetClusterStatus 统一设置状态并自动同步派生字段
+params.CombinedCluster.SetClusterStatus(newBKECuster.Status.ClusterStatus)
 ```
 
 ### 4.1.2.8 测试层重构
