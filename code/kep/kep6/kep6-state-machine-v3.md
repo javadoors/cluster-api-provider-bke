@@ -750,6 +750,148 @@ T4: 重新执行操作
    kubectl annotate bkenode node-1 bke.bocloud.com/retry-operation=true
    ```
 
+### 3.4 操作进度追踪
+
+节点层所有操作（安装、升级、回滚、删除）的进度通过 `OperationProgress` 统一追踪：
+
+```go
+type NodeOperationProgress struct {
+    // 操作类型
+    OperationType NodeOperationType `json:"operationType"`
+    
+    // 开始时间
+    StartedAt *metav1.Time `json:"startedAt,omitempty"`
+    
+    // 完成时间
+    FinishedAt *metav1.Time `json:"finishedAt,omitempty"`
+    
+    // 当前阶段
+    CurrentStage string `json:"currentStage,omitempty"`
+    
+    // 总任务数
+    TotalTasks int `json:"totalTasks,omitempty"`
+    
+    // 已完成任务数
+    CompletedTasks int `json:"completedTasks,omitempty"`
+    
+    // 失败的任务列表
+    FailedTasks []string `json:"failedTasks,omitempty"`
+    
+    // 已完成任务列表
+    Completed []NodeTaskRecord `json:"completed,omitempty"`
+    
+    // 最后失败记录
+    LastFailure *NodeOperationFailureRecord `json:"lastFailure,omitempty"`
+    
+    // 是否需要人工介入
+    NeedsManualIntervention bool `json:"needsManualIntervention,omitempty"`
+    
+    // StateCode 变化记录
+    StateCodeChanges []StateCodeChange `json:"stateCodeChanges,omitempty"`
+}
+
+type NodeOperationType string
+
+const (
+    NodeOperationTypeInstall  NodeOperationType = "Install"
+    NodeOperationTypeUpgrade  NodeOperationType = "Upgrade"
+    NodeOperationTypeRollback NodeOperationType = "Rollback"
+    NodeOperationTypeDelete   NodeOperationType = "Delete"
+)
+
+type NodeTaskRecord struct {
+    Name        string      `json:"name"`
+    CompletedAt metav1.Time `json:"completedAt"`
+}
+
+type NodeOperationFailureRecord struct {
+    TaskName string      `json:"taskName"`
+    FailedAt metav1.Time `json:"failedAt"`
+    Error    string      `json:"error,omitempty"`
+    Attempt  int32       `json:"attempt,omitempty"`
+}
+
+type StateCodeChange struct {
+    Timestamp metav1.Time `json:"timestamp"`
+    OldValue  int         `json:"oldValue"`
+    NewValue  int         `json:"newValue"`
+    Reason    string      `json:"reason"`
+}
+```
+
+**使用场景**：
+
+| 场景 | OperationType | CurrentStage |
+|------|---------------|--------------|
+| 节点安装 | `Install` | `PushingAgent` / `InitializingEnvironment` / `InstallingContainerd` / `InstallingKubelet` / `InstallingOtherComponents` |
+| 节点升级 | `Upgrade` | `UpgradingContainerd` / `UpgradingKubelet` / `UpgradingOtherComponents` |
+| 节点回滚 | `Rollback` | `RollingBackContainerd` / `RollingBackKubelet` / `RollingBackOtherComponents` |
+| 节点删除 | `Delete` | `UninstallingComponents` / `CleaningEnvironment` / `RemovingAgent` |
+
+**示例场景**：
+
+**场景 7：节点安装进度追踪**
+```
+T0: 开始安装节点
+    OperationProgress.OperationType = Install
+    OperationProgress.CurrentStage = "PushingAgent"
+    OperationProgress.TotalTasks = 5
+    OperationProgress.CompletedTasks = 0
+
+T1: Agent 推送完成
+    OperationProgress.CurrentStage = "InitializingEnvironment"
+    OperationProgress.CompletedTasks = 1
+    OperationProgress.Completed = [{Name: "PushAgent", CompletedAt: now}]
+    StateCode |= NodeAgentReadyFlag
+    StateCodeChanges = [{Timestamp: now, OldValue: 0, NewValue: 2, Reason: "AgentReady"}]
+
+T2: 环境初始化完成
+    OperationProgress.CurrentStage = "InstallingContainerd"
+    OperationProgress.CompletedTasks = 2
+    OperationProgress.Completed = [{Name: "PushAgent"}, {Name: "InitEnvironment"}]
+    StateCode |= NodeEnvFlag
+    StateCodeChanges = [..., {Timestamp: now, OldValue: 2, NewValue: 6, Reason: "EnvInitialized"}]
+
+T3: containerd 安装完成
+    OperationProgress.CurrentStage = "InstallingKubelet"
+    OperationProgress.CompletedTasks = 3
+
+T4: kubelet 安装完成
+    OperationProgress.CurrentStage = "InstallingOtherComponents"
+    OperationProgress.CompletedTasks = 4
+
+T5: 所有组件安装完成
+    OperationProgress.FinishedAt = now
+    OperationProgress.CompletedTasks = 5
+    LifecyclePhase = Ready
+```
+
+**场景 8：节点升级失败恢复**
+```
+T0: 升级失败
+    OperationProgress.OperationType = Upgrade
+    OperationProgress.CurrentStage = "UpgradingKubelet"
+    OperationProgress.CompletedTasks = 1
+    OperationProgress.FailedTasks = ["UpgradeKubelet"]
+    OperationProgress.LastFailure = {TaskName: "UpgradeKubelet", Error: "upgrade failed"}
+    LifecyclePhase = Failed
+
+T1: 用户诊断问题并修复
+    修复 kubelet 升级脚本
+
+T2: 用户触发恢复
+    kubectl patch bkenode node-1 --type merge \
+      -p '{"status":{"operationProgress":{"lastFailure":null}}}'
+
+T3: 系统自动决定恢复目标
+    OperationProgress.OperationType = Upgrade
+    → LifecyclePhase = Upgrading
+
+T4: 从失败点继续升级
+    OperationProgress.CurrentStage = "UpgradingKubelet"
+    跳过已完成的任务（UpgradeContainerd）
+```
+
 ---
 
 ## 4. 组件层状态机：ComponentLifecycle
@@ -1259,6 +1401,19 @@ type BKEClusterStatus struct {
     OperationProgress   *OperationProgress        `json:"operationProgress,omitempty"` // 增强
     NodeComponentStatuses map[string]map[string]ComponentLifecycleStatus `json:"nodeComponentStatuses,omitempty"`
     ClusterComponentStatuses map[string]ComponentLifecycleStatus `json:"clusterComponentStatuses,omitempty"`
+}
+
+type BKENodeStatus struct {
+    // 现有字段
+    State     NodeState `json:"state,omitempty"`
+    StateCode int       `json:"stateCode,omitempty"`
+    Message   string    `json:"message,omitempty"`
+    NeedSkip  bool      `json:"needSkip,omitempty"`
+    
+    // v3 字段（新增）
+    LifecyclePhase    LifecyclePhase         `json:"lifecyclePhase,omitempty"`
+    HealthStatus      *HealthStatus          `json:"healthStatus,omitempty"`
+    OperationProgress *NodeOperationProgress `json:"operationProgress,omitempty"`
 }
 ```
 
@@ -1830,6 +1985,9 @@ controllers/capbke/
 | StateCode 判断 | 根据 StateCode 判断恢复目标 | 正确恢复到对应状态 |
 | 运行中故障处理 | 模拟 kubelet 崩溃 | LifecyclePhase 保持 Ready，HealthStatus 变为 Unhealthy |
 | 运行中故障自动恢复 | 模拟 kubelet 崩溃后自动恢复 | HealthStatus 恢复为 Healthy |
+| 安装进度追踪 | 模拟节点安装过程 | 正确追踪任务进度和 StateCode 变化 |
+| 升级进度追踪 | 模拟节点升级过程 | 正确追踪任务进度 |
+| StateCode 变化记录 | 模拟 StateCode 变化 | 正确记录 StateCode 变化历史 |
 
 **测试代码示例**：
 
@@ -1973,5 +2131,5 @@ func TestNodeRecoveryFromComponentInstallFailed(t *testing.T) {
 
 ---
 
-**文档版本**: v3.6 (混合模型 - 统一 Failed 恢复机制)  
+**文档版本**: v3.7 (混合模型 - 节点层操作进度追踪)  
 **维护者**: openFuyao Team
