@@ -433,6 +433,66 @@ const (
 | `Removed` | 节点已删除 | 删除完成 |
 | `Failed` | 节点失败 | 操作失败 |
 
+#### 3.1.1 Provisioned 与 Ready 状态的区别
+
+**Provisioned** 和 **Ready** 是节点生命周期的两个不同阶段，主要区别如下：
+
+| 状态 | 说明 | 驱动来源 | 完成条件 |
+|------|------|---------|---------|
+| **Provisioned** | 节点已配置 | Agent 推送完成 | Agent 就绪 + 环境初始化完成 |
+| **Ready** | 节点就绪 | 组件安装完成 | 所有节点级组件安装完成 |
+
+**核心区别**：
+
+- **Provisioned 状态**：
+  - Agent 已就绪：bkeagent 已推送到节点并正常运行
+  - 环境已初始化：节点环境配置完成（如网络、存储等）
+  - 组件未就绪：节点级组件（containerd、kubelet 等）还未安装或未完成
+
+- **Ready 状态**：
+  - 所有组件就绪：节点级组件（containerd、bkeagent、kubelet 等）全部安装完成
+  - 节点可用：节点可以正常加入集群并承担工作负载
+
+**状态转换流程**：
+
+```
+Pending（等待）
+    ↓ Agent 推送 + 环境初始化
+Provisioned（Agent 就绪）
+    ↓ 安装节点级组件
+Ready（组件就绪）
+```
+
+**实际场景示例**：
+
+**场景 1：新节点加入集群**
+```
+T0: 节点加入集群
+    LifecyclePhase = Pending
+    状态：节点等待配置
+
+T1: Agent 推送完成
+    LifecyclePhase = Provisioned
+    状态：bkeagent 已运行，环境已初始化
+    但：containerd、kubelet 还未安装
+
+T2: 节点级组件安装完成
+    LifecyclePhase = Ready
+    状态：containerd、kubelet 等组件已安装
+    节点可以加入集群
+```
+
+**设计意义**：
+
+这两个状态的分离提供了更细粒度的状态追踪：
+1. **Provisioned**：表示基础设施层面已就绪
+2. **Ready**：表示 Kubernetes 层面已就绪
+
+这种设计有助于：
+- 快速定位故障点（是 Agent 问题还是组件问题）
+- 支持部分就绪场景（Agent 就绪但组件未就绪）
+- 提供更精确的健康检查
+
 ### 3.2 驱动规则
 
 节点层状态由**驱动模型**决定，基于节点操作：
