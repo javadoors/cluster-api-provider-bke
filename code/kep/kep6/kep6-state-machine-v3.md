@@ -590,10 +590,13 @@ func (r *Reconciler) determineNodeRecoveryPhase(node *BKENode) LifecyclePhase {
 | Agent 推送失败 | Install | 无 AgentReadyFlag | Pending | 重新推送 Agent |
 | 环境初始化失败 | Install | 无 EnvFlag | Pending | 重新初始化环境 |
 | 组件安装失败 | Install | 有 AgentReadyFlag | Provisioned | 重新安装组件 |
-| 运行中失败 | - | - | Ready | 重启组件 |
 | 升级失败 | Upgrade | - | Ready | 回滚到 Ready |
 | 回滚失败 | Rollback | - | Ready | 重新回滚 |
 | 删除失败 | Delete | - | Ready | 取消删除 |
+
+**为什么没有"运行中失败"？**
+
+运行中故障（如 kubelet 崩溃、容器运行时故障）不是由操作驱动的，不应该改变 `LifecyclePhase`。这类故障应该通过 `HealthStatus` 表达，`LifecyclePhase` 保持 `Ready`。
 
 ### 3.3 状态转换图
 
@@ -609,7 +612,6 @@ stateDiagram-v2
     
     Ready --> Upgrading : 触发升级
     Ready --> Deleting : 触发删除
-    Ready --> Failed : 失败
     
     Upgrading --> Ready : 升级完成
     Upgrading --> RollingBack : 升级失败
@@ -626,6 +628,29 @@ stateDiagram-v2
     Failed --> Ready : 自动恢复（升级/回滚/删除失败）
 ```
 
+**为什么没有 `Ready --> Failed`？**
+
+在驱动模型中，`LifecyclePhase` 由**操作**驱动。`Ready` 是稳定状态，表示节点已就绪，没有进行中的操作。运行中故障（如 kubelet 崩溃、容器运行时故障）不是由操作驱动的，应该通过 `HealthStatus` 表达，而不是改变 `LifecyclePhase`。
+
+**运行中故障处理**：
+
+运行中故障通过 `HealthStatus` 表达，`LifecyclePhase` 保持 `Ready`：
+
+```
+T0: 节点就绪
+    LifecyclePhase = Ready
+    HealthStatus.Overall = Healthy
+
+T1: kubelet 崩溃
+    LifecyclePhase = Ready（不变）
+    HealthStatus.Overall = Unhealthy
+    HealthStatus.Message = "kubelet crashed"
+
+T2: 重启 kubelet
+    LifecyclePhase = Ready（不变）
+    HealthStatus.Overall = Healthy
+```
+
 **自动恢复机制**：
 
 从 `Failed` 状态恢复到哪个状态由 `OperationProgress.OperationType` 和 `StateCode` 自动决定：
@@ -635,7 +660,6 @@ stateDiagram-v2
 | Agent 推送失败 | Install | 无 AgentReadyFlag | Pending | 重新推送 Agent |
 | 环境初始化失败 | Install | 无 EnvFlag | Pending | 重新初始化环境 |
 | 组件安装失败 | Install | 有 AgentReadyFlag | Provisioned | 重新安装组件 |
-| 运行中失败 | - | - | Ready | 重启组件 |
 | 升级失败 | Upgrade | - | Ready | 回滚到 Ready |
 | 回滚失败 | Rollback | - | Ready | 重新回滚 |
 | 删除失败 | Delete | - | Ready | 取消删除 |
@@ -1560,6 +1584,63 @@ T3: 系统自动决定
 T4: 重新安装组件
 ```
 
+**运行中故障处理**：
+
+运行中故障（如 kubelet 崩溃、容器运行时故障）不是由操作驱动的，不应该改变 `LifecyclePhase`。这类故障通过 `HealthStatus` 表达，`LifecyclePhase` 保持 `Ready`。
+
+**运行中故障处理流程**：
+
+```go
+func (r *Reconciler) handleRuntimeFailure(ctx context.Context, node *BKENode, failure RuntimeFailure) (ctrl.Result, error) {
+    // 1. 更新健康状态
+    node.Status.HealthStatus = &HealthStatus{
+        Overall:       HealthLevelUnhealthy,
+        Message:       failure.Message,
+        LastCheckTime: &metav1.Time{Time: time.Now()},
+    }
+    
+    // 2. LifecyclePhase 保持 Ready（不变）
+    // node.Status.LifecyclePhase = NodeLifecycleReady
+    
+    // 3. 更新状态
+    if err := r.Status().Update(ctx, node); err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    // 4. 尝试自动恢复（如重启 kubelet）
+    return r.attemptAutoRecovery(ctx, node, failure)
+}
+```
+
+**场景 5：kubelet 崩溃恢复**
+```
+T0: 节点就绪
+    LifecyclePhase = Ready
+    HealthStatus.Overall = Healthy
+
+T1: kubelet 崩溃
+    LifecyclePhase = Ready（不变）
+    HealthStatus.Overall = Unhealthy
+    HealthStatus.Message = "kubelet crashed"
+
+T2: 健康检查器检测到故障
+    尝试自动恢复（重启 kubelet）
+
+T3: kubelet 重启成功
+    LifecyclePhase = Ready（不变）
+    HealthStatus.Overall = Healthy
+```
+
+**运行中故障 vs 操作失败**：
+
+| 维度 | 运行中故障 | 操作失败 |
+|------|----------|---------|
+| **触发原因** | 运行时异常（kubelet 崩溃、容器运行时故障） | 操作失败（安装失败、升级失败） |
+| **影响范围** | 节点健康状态 | 节点生命周期阶段 |
+| **状态变化** | `HealthStatus` 变化，`LifecyclePhase` 不变 | `LifecyclePhase` 变为 `Failed` |
+| **恢复方式** | 自动恢复（重启组件）或手动修复 | 人工介入，重新执行操作 |
+| **示例** | kubelet 崩溃、containerd 故障 | Agent 推送失败、组件安装失败 |
+
 ### 8.8 Feature Gate 设计
 
 （保留原有设计，详见 v3 文档）
@@ -1636,6 +1717,8 @@ controllers/capbke/
 | 升级失败恢复 | 模拟升级失败，触发恢复 | 自动恢复到 Ready 状态 |
 | 删除失败恢复 | 模拟删除失败，触发恢复 | 自动恢复到 Ready 状态 |
 | StateCode 判断 | 根据 StateCode 判断恢复目标 | 正确恢复到对应状态 |
+| 运行中故障处理 | 模拟 kubelet 崩溃 | LifecyclePhase 保持 Ready，HealthStatus 变为 Unhealthy |
+| 运行中故障自动恢复 | 模拟 kubelet 崩溃后自动恢复 | HealthStatus 恢复为 Healthy |
 
 **测试代码示例**：
 
@@ -1779,5 +1862,5 @@ func TestNodeRecoveryFromComponentInstallFailed(t *testing.T) {
 
 ---
 
-**文档版本**: v3.3 (混合模型 - 状态名称统一)  
+**文档版本**: v3.4 (混合模型 - 移除 Ready->Failed 转换)  
 **维护者**: openFuyao Team
