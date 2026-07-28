@@ -15,27 +15,46 @@
 
 - [1. 摘要](#1-摘要)
 - [2. 动机](#2-动机)
-  - [1.1 状态转换逻辑分散问题](#11-状态转换逻辑分散问题)
-  - [1.2 ClusterStatus、ClusterHealthState 和 Phase 职责重叠问题](#12-clusterstatusclusterhealthstate-和-phase-职责重叠问题)
-  - [1.3 状态管理器设计问题](#13-状态管理器设计问题)
-  - [1.4 Phase 状态管理问题](#14-phase-状态管理问题)
-  - [1.5 并发安全问题](#15-并发安全问题)
-  - [1.6 状态可观测性问题](#16-状态可观测性问题)
-  - [1.7 代码可维护性问题](#17-代码可维护性问题)
+  - [2.1 存在的问题分析](#21-存在的问题分析)
+  - [2.2 状态管理器设计问题](#22-状态管理器设计问题)
+  - [2.3 Phase 状态管理问题](#23-phase-状态管理问题)
+  - [2.4 并发安全问题](#24-并发安全问题)
+  - [2.5 状态可观测性问题](#25-状态可观测性问题)
+  - [2.6 代码可维护性问题](#26-代码可维护性问题)
 - [3. 范围与约束](#3-范围与约束)
+  - [3.1 范围](#31-范围)
+  - [3.2 约束](#32-约束)
+  - [3.3 非目标](#33-非目标)
 - [4. 提案设计](#4-提案设计)
-  - [2.1 重构方案：三字段整合方案](#21-重构方案三字段整合方案保持-clusterstatus-兼容性)
-  - [2.2 增强方案一：状态转换表](#22-增强方案一状态转换表适配单字段设计)
-  - [2.3 增强方案二：改进状态管理器](#23-增强方案二改进状态管理器适配单字段设计)
-  - [2.4 增强方案三：状态转换事件系统](#24-增强方案三状态转换事件系统适配单字段设计)
+  - [4.1 重构方案：三字段整合方案](#41-重构方案三字段整合方案保持-clusterstatus-兼容性)
+  - [4.2 增强方案一：状态转换表](#42-增强方案一状态转换表适配单字段设计)
+  - [4.3 增强方案二：改进状态管理器](#43-增强方案二改进状态管理器适配单字段设计)
+  - [4.4 增强方案三：状态转换事件系统](#44-增强方案三状态转换事件系统适配单字段设计)
   - [4.5 设计远景：三层状态机架构](#45-设计远景三层状态机架构)
 - [5. 综合重构方案](#5-综合重构方案)
+  - [5.1 整体架构](#51-整体架构)
+  - [5.2 阶段一：三字段整合](#52-阶段一三字段整合核心必须)
+  - [5.3 阶段二：状态机增强](#53-阶段二状态机增强可选)
+  - [5.4 面向三层状态机的演进路径](#54-面向三层状态机的演进路径)
 - [6. 迁移策略](#6-迁移策略)
+  - [6.1 向后兼容策略](#61-向后兼容策略)
 - [7. 测试策略](#7-测试策略)
+  - [7.1 单元测试](#71-单元测试)
+  - [7.2 集成测试](#72-集成测试)
 - [8. 性能优化建议](#8-性能优化建议)
+  - [8.1 减少锁竞争](#81-减少锁竞争)
+  - [8.2 异步事件记录](#82-异步事件记录)
 - [9. 风险管理](#9-风险管理)
+  - [9.1 回滚方案](#91-回滚方案)
+  - [9.2 灰度策略](#92-灰度策略)
+  - [9.3 监控告警](#93-监控告警)
 - [10. 总结](#10-总结)
+  - [10.1 面向三层状态机的演进路径](#101-面向三层状态机的演进路径)
+  - [10.2 关键文件变更清单](#102-关键文件变更清单)
 - [附录](#附录)
+  - [A. 术语表](#a-术语表)
+  - [B. 问题总结](#b-问题总结)
+  - [C. 相关文档](#c-相关文档)
 
 ## 1. 摘要
 
@@ -61,9 +80,7 @@
 
 ## 2. 动机
 
-## 状态机问题分析与优化重构方案
-
-### 1. 存在的问题分析
+### 2.1 存在的问题分析
 
 #### 1.1 状态转换逻辑分散问题
 
@@ -101,7 +118,7 @@ func handleClusterScaleMasterUpPhase(ctx *PhaseContext, err error) {
 - 状态转换规则难以验证
 - 缺乏状态转换的可视化支持
 
-##### 1.1.1 状态转换逻辑位置清单
+### 2.1.1 状态转换逻辑位置清单
 
 通过对代码库的全面搜索，梳理出所有状态转换逻辑的分布位置：
 
@@ -252,7 +269,7 @@ Deleting
     - 状态转换条件隐含在代码逻辑中
     - 难以验证状态转换的合法性
 
-##### 1.1.2 ClusterStatus、ClusterHealthState 和 Phase 职责重叠问题
+### 2.1.2 ClusterStatus、ClusterHealthState 和 Phase 职责重叠问题
 
 **问题描述**：
 
@@ -281,7 +298,7 @@ type BKEClusterStatus struct {
 | **ClusterStatus** | 22 个 | 表达"集群当前处于什么操作状态" | 与 ClusterHealthState 重叠 56% |
 | **ClusterHealthState** | 9 个 | 表达"集群健康状态" | 与 ClusterStatus 重叠 56% |
 
-###### 1.1.2.1 ClusterStatus 与 ClusterHealthState 重叠分析
+### 2.1.2.1 ClusterStatus 与 ClusterHealthState 重叠分析
 
 **枚举值对比**：
 
@@ -327,7 +344,7 @@ case bkev1beta1.Managing:
 }
 ```
 
-###### 1.1.2.2 Phase 与 ClusterStatus 重叠分析
+### 2.1.2.2 Phase 与 ClusterStatus 重叠分析
 
 **Phase 枚举值**（12个）：
 
@@ -379,7 +396,7 @@ func handleClusterInitPhase(ctx *phaseframe.PhaseContext, err error) {
 }
 ```
 
-###### 1.1.2.3 状态定义合理性问题
+### 2.1.2.3 状态定义合理性问题
 
 除了职责重叠外，`ClusterStatus` 和 `ClusterHealthState` 还存在 7 个深层次的合理性问题：
 
@@ -495,7 +512,7 @@ default:
 
 当前代码仍维护 `ClusterStatus` + `ClusterHealthState` 两个并行状态，缺乏统一的生命周期抽象，无法支撑三层聚合模型的实现。
 
-###### 1.1.2.4 综合问题分析
+### 2.1.2.4 综合问题分析
 
 **核心问题**：
 
@@ -525,11 +542,11 @@ default:
 
 **核心结论**：`ClusterStatus`、`ClusterHealthState` 和 `Phase` 的根本问题是**职责边界模糊**——三者都在描述"集群当前在做什么 + 是否健康 + 是否失败"，但粒度不同、覆盖面不同、转换逻辑分散在三处。合理的做法是按三层生命周期状态机的方向统一为单一生命周期状态机，将"操作进行中"、"操作失败"、"健康状态"分离为独立维度，而非维护三个重叠的枚举。
 
-#### 1.2 状态管理器设计问题
+### 2.2 状态管理器设计问题
 
 **问题描述**:
 
-##### 1.2.1 全局单例导致内存泄漏风险
+### 2.2.1 全局单例导致内存泄漏风险
 
 ```go
 var BKEClusterStatusManager = NewStatusManager()  // 全局单例
@@ -546,7 +563,7 @@ type StatusManager struct {
 - 长期运行的管理集群会积累大量无用状态记录
 - 缺乏状态记录的自动过期机制
 
-##### 1.2.2 失败重试机制不够灵活
+### 2.2.2 失败重试机制不够灵活
 
 ```go
 const DefaultAllowedFailedCount = 10  // 固定值
@@ -562,7 +579,7 @@ func (sr *StatusRecord) AllowFailed() bool {
 - 无法针对不同Phase设置不同的重试策略
 - 缺乏指数退避机制
 
-##### 1.2.3 状态恢复逻辑复杂
+### 2.2.3 状态恢复逻辑复杂
 
 ```go
 // 复杂的状态恢复逻辑
@@ -591,11 +608,11 @@ if sr.AllowFailed() {
 - 难以理解状态恢复的完整流程
 - 缺乏状态恢复失败的兜底机制
 
-#### 1.3 Phase状态管理问题
+### 2.3 Phase状态管理问题
 
 **问题描述**:
 
-##### 1.3.1 Phase历史记录限制
+### 2.3.1 Phase历史记录限制
 
 ```go
 const MaxPhaseStatusHistory = 20  // 最多保留20个
@@ -613,7 +630,7 @@ if len(p.ctx.BKECluster.Status.PhaseStatus) > MaxPhaseStatusHistory {
 - 无法追溯长时间运行集群的完整历史
 - 调试和问题排查困难
 
-##### 1.3.2 Phase执行顺序硬编码
+### 2.3.2 Phase执行顺序硬编码
 
 ```go
 var FullPhasesRegisFunc = append(append(
@@ -628,11 +645,11 @@ var FullPhasesRegisFunc = append(append(
 - 无法动态调整Phase执行顺序
 - 难以支持条件性的Phase跳过
 
-#### 1.4 并发安全问题
+### 2.4 并发安全问题
 
 **问题描述**:
 
-##### 1.4.1 潜在的死锁风险
+### 2.4.1 潜在的死锁风险
 
 ```go
 func (b *StatusManager) recordBKEClusterStatus(bkeCluster *BKECluster) {
@@ -653,7 +670,7 @@ func (b *StatusManager) recordBKEClusterStatus(bkeCluster *BKECluster) {
 - 可能与其他锁产生死锁
 - 锁的粒度过大
 
-##### 1.4.2 竞态条件
+### 2.4.2 竞态条件
 
 ```go
 // 状态记录和状态恢复之间存在竞态
@@ -669,7 +686,7 @@ if sr.AllowFailed() {
 - 缺乏原子性保证
 - 可能导致状态不一致
 
-#### 1.5 状态可观测性问题
+#### 2.5 状态可观测性问题
 
 **问题描述**:
 
@@ -678,7 +695,7 @@ if sr.AllowFailed() {
 - 缺乏状态机可视化支持
 - 无法导出状态转换日志用于分析
 
-#### 1.6 代码可维护性问题
+#### 2.6 代码可维护性问题
 
 **问题描述**:
 
@@ -717,13 +734,11 @@ if sr.AllowFailed() {
 
 ## 4. 提案设计
 
-### 2. 优化重构方案
+### 4.1 重构方案：三字段整合方案
 
-#### 2.1 重构方案：三字段整合方案（保持 ClusterStatus 兼容性）
+### 4.1.1 设计思路
 
-##### 2.1.1 设计思路
-
-###### 2.1.1.1 核心设计理念
+### 4.1.1.1 核心设计理念
 
 **问题本质**：
 
@@ -738,7 +753,7 @@ if sr.AllowFailed() {
 - **代码重构**：所有新代码只使用 `ClusterStatus` 字段
 - **提供映射机制**：通过映射函数实现字段间的转换，为未来迁移做准备
 
-###### 2.1.1.2 设计原则
+### 4.1.1.2 设计原则
 
 | 原则 | 说明 | 实现方式 |
 | ------ | ------ | ---------- |
@@ -747,7 +762,7 @@ if sr.AllowFailed() {
 | **渐进式迁移原则** | 分阶段实施，降低风险 | 当前实施阶段 1（准备阶段），后续阶段在未来实施 |
 | **单一数据源原则** | 代码中只使用一个字段 | 所有新代码只使用 ClusterStatus |
 
-###### 2.1.1.3 设计目标
+### 4.1.1.3 设计目标
 
 | 目标 | 衡量指标 | 预期结果 |
 | ------ | ---------- | ---------- |
@@ -756,9 +771,9 @@ if sr.AllowFailed() {
 | **保持兼容性** | 外部消费者影响 | 无影响（字段保留） |
 | **前瞻性设计** | 映射函数覆盖率 | 100% |
 
-##### 2.1.2 重构内容
+### 4.1.2 重构内容
 
-###### 2.1.2.1 API 层重构
+### 4.1.2.1 API 层重构
 
 **重构内容**：
 
@@ -817,7 +832,7 @@ ClusterStatus ClusterStatus `json:"clusterStatus,omitempty"`
 ClusterHealthState ClusterHealthState `json:"clusterHealthState,omitempty"`
 ```
 
-###### 2.1.2.2 映射函数层重构
+### 4.1.2.2 映射函数层重构
 
 **重构内容**：
 
@@ -826,6 +841,25 @@ ClusterHealthState ClusterHealthState `json:"clusterHealthState,omitempty"`
 - 新增 `MapClusterStatusToPhase` 函数：将 ClusterStatus 映射到 Phase（用于向后兼容）
 - 新增 `MapClusterStatusToClusterHealthState` 函数：将 ClusterStatus 映射到 ClusterHealthState（用于向后兼容）
 - 新增 `MapToLifecyclePhase` 函数：将 ClusterStatus 映射到统一生命周期阶段（面向三层状态机架构的集群层投影）
+
+**信息丢失说明**：
+
+映射过程中存在信息丢失，使用时需注意：
+
+| 映射函数 | 信息丢失场景 | 处理方式 |
+|---------|-------------|---------|
+| `MapPhaseToClusterStatus` | 多个 Phase 映射到同一个 ClusterStatus（如 InitControlPlane、JoinControlPlane、JoinWorker 都映射到 ClusterInitializing） | 丢失具体 Phase 信息，如需保留请使用 Phase 字段 |
+| `MapClusterHealthStateToClusterStatus` | ClusterHealthState 的 9 个值映射到 ClusterStatus 的 22 个值，存在一对多映射 | 使用默认映射，如需精确映射请检查业务逻辑 |
+| `MapClusterStatusToPhase` | ClusterStatus 的 22 个值映射到 Phase 的 12 个值，存在多对一映射 | 丢失细粒度状态信息，仅用于向后兼容 |
+| `MapClusterStatusToClusterHealthState` | ClusterStatus 的 22 个值映射到 ClusterHealthState 的 9 个值，存在多对一映射 | 丢失细粒度状态信息，仅用于向后兼容 |
+| `MapToLifecyclePhase` | ClusterStatus 的 22 个值映射到 LifecyclePhase 的 6 个值，存在多对一映射 | 丢失细粒度状态信息，用于三层状态机架构演进 |
+
+**使用建议**：
+
+1. **新代码**：优先使用 `ClusterStatus` 字段，避免使用已废弃的 `Phase` 和 `ClusterHealthState` 字段
+2. **向后兼容**：如需支持旧版本 API，使用 `MapClusterStatusToPhase` 和 `MapClusterStatusToClusterHealthState` 函数
+3. **未来演进**：使用 `MapToLifecyclePhase` 函数为三层状态机架构做准备
+4. **信息完整性**：如需保留完整的状态信息，请同时使用 `ClusterStatus`、`Phase` 和 `ClusterHealthState` 三个字段
 
 **文件清单**：
 
@@ -1290,7 +1324,7 @@ func TestMapClusterStatusToClusterHealthState(t *testing.T) {
 }
 ```
 
-###### 2.1.2.3 PhaseFlow 框架层重构
+### 4.1.2.3 PhaseFlow 框架层重构
 
 **重构内容**：
 
@@ -1379,7 +1413,7 @@ log.Info("waiting for phase to complete", "phase", bkeCluster.Status.Phase)
 log.Info("waiting for phase to complete", "status", bkeCluster.Status.ClusterStatus)
 ```
 
-###### 2.1.2.4 状态管理层重构
+### 4.1.2.4 状态管理层重构
 
 **重构内容**：
 
@@ -1473,7 +1507,7 @@ case bkev1beta1.ClusterManaging:
 bkeCluster.Status.ClusterHealthState = MapClusterStatusToClusterHealthState(bkeCluster.Status.ClusterStatus)
 ```
 
-###### 2.1.2.5 控制器层重构
+### 4.1.2.5 控制器层重构
 
 **重构内容**：
 
@@ -1510,7 +1544,7 @@ func markBKEClusterHealthyStatus(bkeCluster *bkev1beta1.BKECluster, status confv
 }
 ```
 
-###### 2.1.2.6 Webhook 层重构
+### 4.1.2.6 Webhook 层重构
 
 **重构内容**：
 
@@ -1562,7 +1596,7 @@ if newBKECluster.Status.ClusterStatus != bkev1beta1.ClusterReady {
 }
 ```
 
-###### 2.1.2.7 其他文件重构
+### 4.1.2.7 其他文件重构
 
 **重构内容**：
 
@@ -1699,7 +1733,7 @@ params.CombinedCluster.Status.ClusterStatus = newBKECuster.Status.ClusterStatus
 params.CombinedCluster.Status.ClusterHealthState = newBKECuster.Status.ClusterHealthState
 ```
 
-###### 2.1.2.8 测试层重构
+### 4.1.2.8 测试层重构
 
 **重构内容**：
 
@@ -1717,11 +1751,11 @@ params.CombinedCluster.Status.ClusterHealthState = newBKECuster.Status.ClusterHe
 - 集成测试：集群创建、升级、删除流程
 - 端到端测试：完整的 BKE 系统测试
 
-#### 2.2 增强方案一：状态转换表（适配单字段设计）
+### 2.2 增强方案一：状态转换表（适配单字段设计）
 
 **设计思路**: 在三字段整合的基础上，使用状态转换表统一定义所有状态转换规则，集中管理状态转换逻辑。
 
-##### 2.2.1 状态转换规则设计
+### 2.2.1 状态转换规则设计
 
 **设计原则**：
 
@@ -1737,12 +1771,30 @@ type Transition struct {
     FromState bkev1beta1.ClusterStatus
     ToState   bkev1beta1.ClusterStatus
     Trigger   string
+    Priority  int  // 规则优先级，数值越小优先级越高（默认 0）
     Condition func(*ConditionContext) bool  // 转换前置条件（可选）
     Action    func(*bkev1beta1.BKECluster) error // 转换动作（可选）
 }
 ```
 
-**转换规则统计**（完整规则见 2.2.3 节 `registerClusterTransitions` 函数）：
+**规则优先级机制**：
+
+当多条规则具有相同的 `FromState` 和 `Trigger` 时，引擎按 `Priority` 字段排序，优先匹配优先级最高的规则。优先级规则如下：
+
+| 优先级 | 场景 | 说明 |
+|--------|------|------|
+| 0（默认） | 普通规则 | 大多数状态转换规则 |
+| -10 | 高优先级规则 | 错误处理、回滚等关键路径 |
+| -20 | 最高优先级规则 | 紧急中断、安全保护等 |
+
+**规则冲突避免**：
+
+设计时需确保同一 `(FromState, Trigger)` 组合下：
+1. 若有多条规则，必须通过 `Condition` 函数区分适用场景
+2. 若 `Condition` 无法区分，必须使用不同的 `Priority` 值
+3. 引擎在注册规则时进行冲突检测，发现潜在冲突时输出警告日志
+
+**转换规则统计**（完整规则见 4.2.3 节 `registerClusterTransitions` 函数）：
 
 | 阶段 | 规则数 | 说明 |
 | ------ | -------- | ------ |
@@ -1760,7 +1812,7 @@ type Transition struct {
 | 删除 | 7 | 多入口→Deleting→Failed |
 | **总计** | **64** | |
 
-##### 2.2.2 状态机引擎实现
+### 2.2.2 状态机引擎实现
 
 ###### 设计缺陷分析：err 参数必须影响触发器选择
 
@@ -1843,7 +1895,7 @@ func (e *Engine) Transition(cluster *BKECluster, nodes BKENodes, trigger string,
 - 只使用 ClusterStatus，简化了状态管理逻辑
 - **err 参数正确影响触发器选择**，确保成功/失败路径正确分离
 
-##### 2.2.3 Transition 替换原有业务逻辑
+### 2.2.3 Transition 替换原有业务逻辑
 
 ###### 调用链对比
 
@@ -3164,7 +3216,7 @@ func (e *Engine) handleRetry(cluster *BKECluster, trigger string) error {
 2. **精确匹配**：通过 `FromState + Trigger` 精确匹配，避免歧义
 3. **统一失败处理**：所有失败路径统一走 `Error` 触发器
 
-#### 2.3 增强方案二：改进状态管理器（适配单字段设计）
+### 2.3 增强方案二：改进状态管理器（适配单字段设计）
 
 **设计思路**: 在三字段整合的基础上，解决内存泄漏、灵活重试、并发安全等问题。
 
@@ -3202,7 +3254,23 @@ const (
     BackoffExponential BackoffType = "Exponential" // 指数退避
 )
 
-// Phase级别的重试策略配置
+// Phase级别的重试策略配置（已废弃）
+//
+// Deprecated: 此配置已废弃，请使用 ClusterStatusRetryPolicies 替代。
+// 原因：
+// 1. StatusManager 无法获取 Phase 名称，只能观察 ClusterStatus
+// 2. 两套配置可能导致不一致
+// 3. 统一使用 ClusterStatus 索引更简洁
+//
+// 迁移指南：
+// - EnsureMasterInit 失败 → ClusterInitializationFailed
+// - EnsureBKEAgent 失败 → ClusterInitializationFailed
+// - EnsureNodesEnv 失败 → ClusterInitializationFailed
+// - EnsureMasterJoin 失败 → ClusterMasterScalingUp
+// - EnsureWorkerJoin 失败 → ClusterWorkerScalingUp
+// - EnsureEtcdUpgrade 失败 → ClusterUpgradeFailed
+// 其他 Phase 请参考状态转换表中的映射关系
+//
 // 策略设计原则：
 // - 关键操作（Master/Etcd/删除）：指数退避，较少重试次数（3-5次），避免长时间阻塞
 // - 常规操作（Worker/Addon/升级）：线性退避，较多重试次数（5-10次），提高成功率
@@ -3775,7 +3843,7 @@ func (b *StatusManagerV2) RemoveSingleNodeStatusCache(bkeCluster *bkev1beta1.BKE
 - 更灵活的状态恢复机制
 - 完整替换旧状态管理器，提供所有核心方法
 
-##### 2.3.1 替换原状态管理器的完整设计
+### 2.3.1 替换原状态管理器的完整设计
 
 ###### 设计决策
 
@@ -4529,7 +4597,7 @@ V2 内部逻辑：
   └── 验证内存泄漏修复
 ```
 
-#### 2.4 增强方案三：状态转换事件系统（适配单字段设计）
+### 2.4 增强方案三：状态转换事件系统（适配单字段设计）
 
 **设计思路**: 在三字段整合的基础上，记录所有状态转换事件，提供可观测性支持。
 
@@ -4876,7 +4944,7 @@ func (r *StateMachineEventRecorder) exportDotGraph(events []StateTransitionEvent
 
 ### 3. 综合重构方案
 
-#### 3.1 整体架构
+### 3.1 整体架构
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -4928,7 +4996,7 @@ func (r *StateMachineEventRecorder) exportDotGraph(events []StateTransitionEvent
 └─────────────────────────────────────────────────────────┘
 ```
 
-#### 3.2 阶段一：三字段整合（核心，必须）
+### 3.2 阶段一：三字段整合（核心，必须）
 
 **目标**：解决 Phase、ClusterStatus、ClusterHealthState 三个字段的职责重叠问题。
 
@@ -4966,7 +5034,7 @@ func (r *StateMachineEventRecorder) exportDotGraph(events []StateTransitionEvent
 - 外部消费者无感知
 - 提供生命周期阶段映射函数，支持向三层状态机架构演进
 
-#### 3.3 阶段二：状态机增强（可选）
+### 3.3 阶段二：状态机增强（可选）
 
 **目标**：在三字段整合的基础上，进一步增强状态机的可维护性和可观测性。
 
@@ -5005,7 +5073,7 @@ func (r *StateMachineEventRecorder) exportDotGraph(events []StateTransitionEvent
 - 状态转换规则集中管理
 - 提供完整的状态转换历史
 
-#### 3.4 面向三层状态机的演进路径
+### 5.4 面向三层状态机的演进路径
 
 **当前方案定位**：
 
@@ -5038,7 +5106,7 @@ func (r *StateMachineEventRecorder) exportDotGraph(events []StateTransitionEvent
 
 ### 4. 迁移策略
 
-#### 4.1 向后兼容策略
+### 2.1 向后兼容策略
 
 **策略一：双轨并行（推荐）**
 
@@ -5094,7 +5162,7 @@ func calculatingClusterPostStatusByPhase(phase phaseframe.Phase, err error) erro
 
 ### 5. 测试策略
 
-#### 5.1 单元测试
+### 3.1 单元测试
 
 ```go
 package statemachine_test
@@ -5182,7 +5250,7 @@ func TestConditionFunctions(t *testing.T) {
 }
 ```
 
-#### 5.2 集成测试
+### 3.2 集成测试
 
 ```go
 package statemachine_test
@@ -5237,7 +5305,7 @@ func createTestCluster() *bkev1beta1.BKECluster {
 
 ### 6. 性能优化建议
 
-#### 6.1 减少锁竞争
+### 2.1 减少锁竞争
 
 ```go
 // 使用分段锁减少竞争
@@ -5258,7 +5326,7 @@ func (m *ShardedStatusManager) getShard(key string) *StatusManagerShard {
 }
 ```
 
-#### 6.2 异步事件记录
+### 8.2 异步事件记录
 
 ```go
 // 异步事件记录器
@@ -5284,41 +5352,6 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
     }
 }
 ```
-
-> 以下为原方案第 7 章「总结」的原始内容。新增的 KEP 总结见第 10 章。
-
-### 7. 总结
-
-#### 7.1 问题总结
-
-| 问题类型 | 具体问题 | 影响程度 |
-| --------- | --------- | --------- |
-| 设计问题 | 状态转换逻辑分散 | 高 |
-| 设计问题 | 状态管理器内存泄漏 | 高 |
-| 设计问题 | 失败重试机制不灵活 | 中 |
-| 实现问题 | 并发安全隐患 | 高 |
-| 实现问题 | Phase历史记录丢失 | 中 |
-| 可观测性问题 | 缺乏状态转换事件 | 中 |
-| 可维护性问题 | 代码耦合度高 | 中 |
-
-#### 7.2 优化方案总结
-
-| 方案 | 解决的问题 | 实施难度 | 优先级 |
-| ----- | ----------- | --------- | -------- |
-| 状态转换表 | 状态转换逻辑分散 | 中 | 高 |
-| 改进状态管理器 | 内存泄漏、重试机制 | 中 | 高 |
-| 事件系统 | 可观测性不足 | 中 | 中 |
-| Phase管理改进 | 历史记录丢失 | 低 | 中 |
-
-#### 7.3 实施建议
-
-1. **优先解决高风险问题**：内存泄漏、并发安全
-2. **渐进式重构**：保持向后兼容，逐步迁移
-3. **充分测试**：单元测试、集成测试、性能测试
-4. **文档完善**：更新状态机文档，提供可视化支持
-5. **监控告警**：添加状态转换异常告警
-
-**文档完成**: 本方案完整分析了状态机存在的问题，并给出了详细的优化重构方案，包括状态转换表、改进的状态管理器、事件系统等，所有设计均基于实际代码问题，并考虑了向后兼容和渐进式迁移。
 
 ## 9. 风险管理
 
