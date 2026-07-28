@@ -259,7 +259,6 @@ stateDiagram-v2
     
     Running --> Upgrading : 用户触发升级
     Running --> Scaling : 用户触发扩缩容
-    Running --> Failed : 运行失败
     
     Upgrading --> Running : 升级完成
     Upgrading --> RollingBack : 升级失败
@@ -283,6 +282,29 @@ stateDiagram-v2
 **为什么没有 `Failed --> Running`？**
 
 在驱动模型中，`LifecyclePhase` 由操作决定。`Failed` 状态意味着某个操作失败，应该重新执行该操作，而不是直接恢复到 `Running` 状态。
+
+**为什么没有 `Running --> Failed`？**
+
+在驱动模型中，`LifecyclePhase` 由**操作**驱动。`Running` 是稳定状态，表示集群正在运行，没有进行中的操作。运行中故障（如 etcd 崩溃、API Server 故障）不是由操作驱动的，应该通过 `HealthStatus` 表达，而不是改变 `LifecyclePhase`。
+
+**运行中故障处理**：
+
+运行中故障通过 `HealthStatus` 表达，`LifecyclePhase` 保持 `Running`：
+
+```
+T0: 集群运行中
+    LifecyclePhase = Running
+    HealthStatus.Overall = Healthy
+
+T1: etcd 崩溃
+    LifecyclePhase = Running（不变）
+    HealthStatus.Overall = Unhealthy
+    HealthStatus.Message = "etcd crashed"
+
+T2: 重启 etcd
+    LifecyclePhase = Running（不变）
+    HealthStatus.Overall = Healthy
+```
 
 **自动恢复机制**：
 
@@ -1641,6 +1663,63 @@ T3: kubelet 重启成功
 | **恢复方式** | 自动恢复（重启组件）或手动修复 | 人工介入，重新执行操作 |
 | **示例** | kubelet 崩溃、containerd 故障 | Agent 推送失败、组件安装失败 |
 
+**集群层运行中故障处理**：
+
+运行中故障（如 etcd 崩溃、API Server 故障、调度器故障）不是由操作驱动的，不应该改变 `LifecyclePhase`。这类故障通过 `HealthStatus` 表达，`LifecyclePhase` 保持 `Running`。
+
+**集群层运行中故障处理流程**：
+
+```go
+func (r *Reconciler) handleClusterRuntimeFailure(ctx context.Context, cluster *BKECluster, failure RuntimeFailure) (ctrl.Result, error) {
+    // 1. 更新健康状态
+    cluster.Status.HealthStatus = &HealthStatus{
+        Overall:       HealthLevelUnhealthy,
+        Message:       failure.Message,
+        LastCheckTime: &metav1.Time{Time: time.Now()},
+    }
+    
+    // 2. LifecyclePhase 保持 Running（不变）
+    // cluster.Status.LifecyclePhase = ClusterLifecycleRunning
+    
+    // 3. 更新状态
+    if err := r.Status().Update(ctx, cluster); err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    // 4. 尝试自动恢复（如重启 etcd）
+    return r.attemptClusterAutoRecovery(ctx, cluster, failure)
+}
+```
+
+**场景 6：etcd 崩溃恢复**
+```
+T0: 集群运行中
+    LifecyclePhase = Running
+    HealthStatus.Overall = Healthy
+
+T1: etcd 崩溃
+    LifecyclePhase = Running（不变）
+    HealthStatus.Overall = Unhealthy
+    HealthStatus.Message = "etcd crashed"
+
+T2: 健康检查器检测到故障
+    尝试自动恢复（重启 etcd）
+
+T3: etcd 重启成功
+    LifecyclePhase = Running（不变）
+    HealthStatus.Overall = Healthy
+```
+
+**集群层运行中故障 vs 操作失败**：
+
+| 维度 | 运行中故障 | 操作失败 |
+|------|----------|---------|
+| **触发原因** | 运行时异常（etcd 崩溃、API Server 故障） | 操作失败（安装失败、升级失败） |
+| **影响范围** | 集群健康状态 | 集群生命周期阶段 |
+| **状态变化** | `HealthStatus` 变化，`LifecyclePhase` 不变 | `LifecyclePhase` 变为 `Failed` |
+| **恢复方式** | 自动恢复（重启组件）或手动修复 | 人工介入，重新执行操作 |
+| **示例** | etcd 崩溃、API Server 故障 | 安装失败、升级失败 |
+
 ### 8.8 Feature Gate 设计
 
 （保留原有设计，详见 v3 文档）
@@ -1707,6 +1786,8 @@ controllers/capbke/
 | 从失败点继续 | 恢复后从失败组件继续 | 跳过已完成组件 |
 | 非 Failed 状态恢复 | 在非 Failed 状态触发恢复 | 返回错误 |
 | 无 OperationProgress 恢复 | 无 OperationProgress 时触发恢复 | 返回错误 |
+| 运行中故障处理 | 模拟 etcd 崩溃 | LifecyclePhase 保持 Running，HealthStatus 变为 Unhealthy |
+| 运行中故障自动恢复 | 模拟 etcd 崩溃后自动恢复 | HealthStatus 恢复为 Healthy |
 
 **节点层测试用例**：
 
@@ -1862,5 +1943,5 @@ func TestNodeRecoveryFromComponentInstallFailed(t *testing.T) {
 
 ---
 
-**文档版本**: v3.4 (混合模型 - 移除 Ready->Failed 转换)  
+**文档版本**: v3.5 (混合模型 - 移除 Running->Failed 转换)  
 **维护者**: openFuyao Team
