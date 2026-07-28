@@ -67,7 +67,7 @@ v3 采用**混合模型**，将状态管理分为两个独立的模型：
 │  │  用户操作 → 集群状态 → 节点状态 → 组件状态                           │   │
 │  │                                                                     │   │
 │  │  决定：LifecyclePhase（生命周期阶段）                                │   │
-│  │  - Creating, Running, Upgrading, Scaling, RollingBack, Failed      │   │
+│  │  - Pending, Installing, Running, Upgrading, Scaling, RollingBack, Failed │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                              │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
@@ -151,8 +151,9 @@ const (
 
 | 状态 | 说明 | 驱动来源 |
 |------|------|---------|
-| `Creating` | 集群正在创建（节点加入、Agent 推送、组件安装） | 用户创建集群 |
-| `Running` | 集群正在运行（所有组件就绪，服务可用） | 默认状态 |
+| `Pending` | 集群等待安装 | 集群创建 |
+| `Installing` | 集群正在安装（节点加入、Agent 推送、组件安装） | 开始安装 |
+| `Running` | 集群正在运行（所有组件就绪，服务可用） | 安装完成 |
 | `Upgrading` | 集群正在升级（版本变更中） | 用户触发升级 |
 | `Scaling` | 集群正在扩容或缩容（节点增减） | 用户触发扩缩容 |
 | `RollingBack` | 集群正在回滚（升级失败后恢复） | 升级失败自动触发 |
@@ -170,7 +171,7 @@ func (r *Reconciler) determineLifecyclePhase(cluster *BKECluster) LifecyclePhase
        cluster.Status.OperationProgress.FinishedAt == nil {
         switch cluster.Status.OperationProgress.OperationType {
         case OperationTypeInstall:
-            return ClusterLifecycleCreating
+            return ClusterLifecycleInstalling
         case OperationTypeUpgrade:
             return ClusterLifecycleUpgrading
         case OperationTypeScale:
@@ -186,14 +187,20 @@ func (r *Reconciler) determineLifecyclePhase(cluster *BKECluster) LifecyclePhase
         return ClusterLifecycleFailed
     }
     
-    // 默认运行状态
-    return ClusterLifecycleRunning
+    // 检查是否已安装
+    if allComponentsInstalled(cluster) {
+        return ClusterLifecycleRunning
+    }
+    
+    // 默认等待状态
+    return ClusterLifecyclePending
 }
 ```
 
 **驱动规则说明**：
-- `Creating`：当 `OperationProgress.OperationType = Install` 且未完成时
-- `Running`：当没有进行中的操作且没有失败时
+- `Pending`：当集群刚创建且未开始安装时
+- `Installing`：当 `OperationProgress.OperationType = Install` 且未完成时
+- `Running`：当所有组件已安装且没有进行中的操作时
 - `Upgrading`：当 `OperationProgress.OperationType = Upgrade` 且未完成时
 - `Scaling`：当 `OperationProgress.OperationType = Scale` 且未完成时
 - `RollingBack`：当 `OperationProgress.OperationType = Rollback` 且未完成时
@@ -211,12 +218,12 @@ func (r *Reconciler) determineLifecyclePhase(cluster *BKECluster) LifecyclePhase
 // determineRecoveryPhase 决定从 Failed 恢复到哪个状态
 func (r *Reconciler) determineRecoveryPhase(cluster *BKECluster) LifecyclePhase {
     if cluster.Status.OperationProgress == nil {
-        return ClusterLifecycleRunning
+        return ClusterLifecyclePending
     }
     
     switch cluster.Status.OperationProgress.OperationType {
     case OperationTypeInstall:
-        return ClusterLifecycleCreating
+        return ClusterLifecycleInstalling
     case OperationTypeUpgrade:
         return ClusterLifecycleUpgrading
     case OperationTypeScale:
@@ -224,7 +231,7 @@ func (r *Reconciler) determineRecoveryPhase(cluster *BKECluster) LifecyclePhase 
     case OperationTypeRollback:
         return ClusterLifecycleRollingBack
     default:
-        return ClusterLifecycleRunning
+        return ClusterLifecyclePending
     }
 }
 ```
@@ -233,7 +240,7 @@ func (r *Reconciler) determineRecoveryPhase(cluster *BKECluster) LifecyclePhase 
 
 | OperationType | 恢复目标 | 说明 |
 |--------------|---------|------|
-| `Install` | `Creating` | 重新执行安装操作 |
+| `Install` | `Installing` | 重新执行安装操作 |
 | `Upgrade` | `Upgrading` | 重新执行升级操作 |
 | `Scale` | `Scaling` | 重新执行扩缩容操作 |
 | `Rollback` | `RollingBack` | 重新执行回滚操作 |
@@ -242,10 +249,13 @@ func (r *Reconciler) determineRecoveryPhase(cluster *BKECluster) LifecyclePhase 
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Creating : 用户创建集群
+    [*] --> Pending : 集群创建
     
-    Creating --> Running : 安装完成
-    Creating --> Failed : 安装失败
+    Pending --> Installing : 开始安装
+    Pending --> Failed : 失败
+    
+    Installing --> Running : 安装完成
+    Installing --> Failed : 安装失败
     
     Running --> Upgrading : 用户触发升级
     Running --> Scaling : 用户触发扩缩容
@@ -261,10 +271,11 @@ stateDiagram-v2
     Scaling --> Running : 扩缩容完成
     Scaling --> Failed : 扩缩容失败
     
-    Failed --> Creating : 人工介入重试
-    Failed --> Upgrading : 人工介入重试
-    Failed --> Scaling : 人工介入重试
-    Failed --> RollingBack : 人工介入重试
+    Failed --> Pending : 自动恢复
+    Failed --> Installing : 自动恢复
+    Failed --> Upgrading : 自动恢复
+    Failed --> Scaling : 自动恢复
+    Failed --> RollingBack : 自动恢复
 ```
 
 **状态转换说明**：
@@ -279,7 +290,7 @@ stateDiagram-v2
 
 | OperationType | 恢复目标 | 说明 |
 |--------------|---------|------|
-| `Install` | `Creating` | 重新执行安装操作 |
+| `Install` | `Installing` | 重新执行安装操作 |
 | `Upgrade` | `Upgrading` | 重新执行升级操作 |
 | `Scale` | `Scaling` | 重新执行扩缩容操作 |
 | `Rollback` | `RollingBack` | 重新执行回滚操作 |
@@ -321,7 +332,7 @@ T4: 重新执行操作
 
 | 失败场景 | 恢复路径 | 说明 |
 |---------|---------|------|
-| Creating 失败 | `Failed --> Creating` | 重新执行安装操作 |
+| Installing 失败 | `Failed --> Installing` | 重新执行安装操作 |
 | Upgrading 失败 | `Failed --> Upgrading` | 重新执行升级操作 |
 | Scaling 失败 | `Failed --> Scaling` | 重新执行扩缩容操作 |
 | RollingBack 失败 | `Failed --> RollingBack` | 重新执行回滚操作 |
@@ -938,24 +949,24 @@ func (c *HealthChecker) CheckClusterHealth(
 
 ```
 T0: 用户创建集群
-    LifecyclePhase = Creating
-    OperationProgress = {Type: Install, StartedAt: now}
+    LifecyclePhase = Pending
     HealthStatus = Unknown
 
-T1: 开始安装节点级组件
-    LifecyclePhase = Creating（不变）
+T1: 开始安装
+    LifecyclePhase = Installing
+    OperationProgress = {Type: Install, StartedAt: now}
     OperationProgress.CurrentStage = "InstallingNodeComponents"
     OperationProgress.TotalComponents = 10
     OperationProgress.CompletedComponents = 0
     HealthStatus = Unknown
 
 T2: 节点级组件安装完成
-    LifecyclePhase = Creating（不变）
+    LifecyclePhase = Installing（不变）
     OperationProgress.CompletedComponents = 10
     HealthStatus = Degraded（部分组件安装中）
 
 T3: 开始安装集群级组件
-    LifecyclePhase = Creating（不变）
+    LifecyclePhase = Installing（不变）
     OperationProgress.CurrentStage = "InstallingClusterComponents"
     OperationProgress.TotalComponents = 5
     OperationProgress.CompletedComponents = 0
@@ -1608,7 +1619,7 @@ controllers/capbke/
 |---------|---------|---------|
 | 升级失败恢复 | 模拟升级失败，触发恢复 | 自动恢复到 Upgrading 状态 |
 | 扩缩容失败恢复 | 模拟扩缩容失败，触发恢复 | 自动恢复到 Scaling 状态 |
-| 安装失败恢复 | 模拟安装失败，触发恢复 | 自动恢复到 Creating 状态 |
+| 安装失败恢复 | 模拟安装失败，触发恢复 | 自动恢复到 Installing 状态 |
 | 回滚失败恢复 | 模拟回滚失败，触发恢复 | 自动恢复到 RollingBack 状态 |
 | 清除 LastFailure 触发 | 通过 patch 清除 LastFailure | 触发自动恢复 |
 | 注解触发恢复 | 通过注解触发恢复 | 触发自动恢复并清除注解 |
@@ -1768,5 +1779,5 @@ func TestNodeRecoveryFromComponentInstallFailed(t *testing.T) {
 
 ---
 
-**文档版本**: v3.2 (混合模型 - 节点层自动恢复机制)  
+**文档版本**: v3.3 (混合模型 - 状态名称统一)  
 **维护者**: openFuyao Team

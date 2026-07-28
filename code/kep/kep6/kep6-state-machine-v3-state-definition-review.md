@@ -14,7 +14,7 @@
 
 | 层级 | 状态数量 | 状态列表 |
 |------|---------|---------|
-| **集群层** | 6 个 | Creating, Running, Upgrading, Scaling, RollingBack, Failed |
+| **集群层** | 7 个 | Pending, Installing, Running, Upgrading, Scaling, RollingBack, Failed |
 | **节点层** | 8 个 | Pending, Provisioned, Ready, Upgrading, RollingBack, Deleting, Removed, Failed |
 | **组件层** | 8 个 | Pending, Installing, Installed, Upgrading, RollingBack, Uninstalling, Removed, Failed |
 
@@ -28,7 +28,8 @@
 
 | 状态 | 说明 | 完整性 |
 |------|------|--------|
-| Creating | 集群创建中（节点加入、Agent 推送、组件安装） | ✅ |
+| Pending | 集群等待安装 | ✅ |
+| Installing | 集群安装中（节点加入、Agent 推送、组件安装） | ✅ |
 | Running | 集群运行中（所有组件就绪，服务可用） | ✅ |
 | Upgrading | 集群升级中（版本变更中） | ✅ |
 | Scaling | 集群扩缩容中（节点增减） | ✅ |
@@ -105,7 +106,7 @@
 
 | 维度 | 状态 | 说明 |
 |------|------|------|
-| **生命周期阶段** | Creating/Running/Upgrading/Scaling/RollingBack/Deleting | 描述"正在做什么" |
+| **生命周期阶段** | Pending/Installing/Running/Upgrading/Scaling/RollingBack/Deleting | 描述"正在做什么" |
 | **健康状态** | Failed | 描述"是否失败" |
 | **终态** | Removed | 描述"是否已删除" |
 
@@ -157,7 +158,7 @@ return NodeLifecycleProvisioned
 文档中定义的聚合规则（7.4.1节）：
 
 ```go
-// 优先级：Failed > RollingBack > Upgrading > Scaling > Creating > Running
+// 优先级：Failed > RollingBack > Upgrading > Scaling > Installing > Running
 if anySliceMatch(nodePhases, NodeLifecycleFailed) ||
     anyMapMatch(clusterComponentStatuses, ComponentLifecycleFailed) {
     return ClusterLifecycleFailed
@@ -174,13 +175,13 @@ if anySliceMatch(nodePhases, NodeLifecycleDeleting) {
     return ClusterLifecycleScaling
 }
 if anySliceMatch(nodePhases, NodeLifecyclePending, NodeLifecycleProvisioned) {
-    return ClusterLifecycleCreating
+    return ClusterLifecycleInstalling
 }
 if allSliceMatch(nodePhases, NodeLifecycleReady) &&
     allMapMatch(clusterComponentStatuses, ComponentLifecycleInstalled) {
     return ClusterLifecycleRunning
 }
-return ClusterLifecycleCreating
+return ClusterLifecycleInstalling
 ```
 
 **完整性评估**：✅ **完整**
