@@ -144,8 +144,6 @@
 
 ### 2.1 存在的问题分析
 
-#### 1.1 状态转换逻辑分散问题
-
 **问题描述**:
 
 - 状态转换逻辑分散在`phase_flow.go`的多个`handleCluster*Phase`函数中
@@ -180,7 +178,7 @@ func handleClusterScaleMasterUpPhase(ctx *PhaseContext, err error) {
 - 状态转换规则难以验证
 - 缺乏状态转换的可视化支持
 
-### 2.1.1 状态转换逻辑位置清单
+#### 2.1.1 状态转换逻辑位置清单
 
 通过对代码库的全面搜索，梳理出所有状态转换逻辑的分布位置：
 
@@ -331,7 +329,7 @@ Deleting
     - 状态转换条件隐含在代码逻辑中
     - 难以验证状态转换的合法性
 
-### 2.1.2 ClusterStatus、ClusterHealthState 和 Phase 职责重叠问题
+#### 2.1.2 ClusterStatus、ClusterHealthState 和 Phase 职责重叠问题
 
 **问题描述**：
 
@@ -360,7 +358,7 @@ type BKEClusterStatus struct {
 | **ClusterStatus** | 22 个 | 表达"集群当前处于什么操作状态" | 与 ClusterHealthState 重叠 56% |
 | **ClusterHealthState** | 9 个 | 表达"集群健康状态" | 与 ClusterStatus 重叠 56% |
 
-### 2.1.2.1 ClusterStatus 与 ClusterHealthState 重叠分析
+##### 2.1.2.1 ClusterStatus 与 ClusterHealthState 重叠分析
 
 **枚举值对比**：
 
@@ -406,7 +404,7 @@ case bkev1beta1.Managing:
 }
 ```
 
-### 2.1.2.2 Phase 与 ClusterStatus 重叠分析
+##### 2.1.2.2 Phase 与 ClusterStatus 重叠分析
 
 **Phase 枚举值**（12个）：
 
@@ -458,7 +456,7 @@ func handleClusterInitPhase(ctx *phaseframe.PhaseContext, err error) {
 }
 ```
 
-### 2.1.2.3 状态定义合理性问题
+##### 2.1.2.3 状态定义合理性问题
 
 除了职责重叠外，`ClusterStatus` 和 `ClusterHealthState` 还存在 7 个深层次的合理性问题：
 
@@ -574,7 +572,7 @@ default:
 
 当前代码仍维护 `ClusterStatus` + `ClusterHealthState` 两个并行状态，缺乏统一的生命周期抽象，无法支撑三层聚合模型的实现。
 
-### 2.1.2.4 综合问题分析
+##### 2.1.2.4 综合问题分析
 
 **核心问题**：
 
@@ -608,7 +606,7 @@ default:
 
 **问题描述**:
 
-### 2.2.1 全局单例导致内存泄漏风险
+#### 2.2.1 全局单例导致内存泄漏风险
 
 ```go
 var BKEClusterStatusManager = NewStatusManager()  // 全局单例
@@ -625,7 +623,7 @@ type StatusManager struct {
 - 长期运行的管理集群会积累大量无用状态记录
 - 缺乏状态记录的自动过期机制
 
-### 2.2.2 失败重试机制不够灵活
+#### 2.2.2 失败重试机制不够灵活
 
 ```go
 const DefaultAllowedFailedCount = 10  // 固定值
@@ -641,7 +639,7 @@ func (sr *StatusRecord) AllowFailed() bool {
 - 无法针对不同Phase设置不同的重试策略
 - 缺乏指数退避机制
 
-### 2.2.3 状态回退逻辑复杂
+#### 2.2.3 状态回退逻辑复杂
 
 ```go
 // 复杂的状态回退逻辑
@@ -674,7 +672,7 @@ if sr.AllowFailed() {
 
 **问题描述**:
 
-### 2.3.1 Phase历史记录限制
+#### 2.3.1 Phase历史记录限制
 
 ```go
 const MaxPhaseStatusHistory = 20  // 最多保留20个
@@ -692,7 +690,7 @@ if len(p.ctx.BKECluster.Status.PhaseStatus) > MaxPhaseStatusHistory {
 - 无法追溯长时间运行集群的完整历史
 - 调试和问题排查困难
 
-### 2.3.2 Phase执行顺序硬编码
+#### 2.3.2 Phase执行顺序硬编码
 
 ```go
 var FullPhasesRegisFunc = append(append(
@@ -711,7 +709,7 @@ var FullPhasesRegisFunc = append(append(
 
 **问题描述**:
 
-### 2.4.1 潜在的死锁风险
+#### 2.4.1 潜在的死锁风险
 
 ```go
 func (b *StatusManager) recordBKEClusterStatus(bkeCluster *BKECluster) {
@@ -732,7 +730,7 @@ func (b *StatusManager) recordBKEClusterStatus(bkeCluster *BKECluster) {
 - 可能与其他锁产生死锁
 - 锁的粒度过大
 
-### 2.4.2 竞态条件
+#### 2.4.2 竞态条件
 
 ```go
 // 状态记录和状态回退之间存在竞态
@@ -748,7 +746,7 @@ if sr.AllowFailed() {
 - 缺乏原子性保证
 - 可能导致状态不一致
 
-#### 2.5 状态可观测性问题
+### 2.5 状态可观测性问题
 
 **问题描述**:
 
@@ -757,7 +755,7 @@ if sr.AllowFailed() {
 - 缺乏状态机可视化支持
 - 无法导出状态转换日志用于分析
 
-#### 2.6 代码可维护性问题
+### 2.6 代码可维护性问题
 
 **问题描述**:
 
