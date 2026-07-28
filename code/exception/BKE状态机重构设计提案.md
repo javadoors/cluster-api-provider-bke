@@ -5024,38 +5024,133 @@ func (r *StateMachineEventRecorder) exportDotGraph(events []StateTransitionEvent
 
 #### 4.5.1 三层状态机模型
 
+**设计原则**：
+- **单一职责**：每层状态只描述该层的生命周期阶段
+- **正交性**：不同维度的状态相互独立（生命周期状态 vs 操作模式）
+- **完整性**：覆盖所有必要的生命周期阶段，包括失败状态
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                    集群层 (Cluster Lifecycle)                                │
+│                    集群层 (Cluster Lifecycle) - 6 个状态                      │
 │  Creating → Running → Upgrading → Scaling → RollingBack → Failed           │
 └─────────────────────────────────────────────────────────────────────────────┘
                                      │ 聚合
                                      ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                    节点层 (Node Lifecycle)                                   │
+│                    节点层 (Node Lifecycle) - 7 个状态                         │
 │  Pending → Provisioned → Ready → Upgrading → RollingBack → Deleting        │
+│                                      ↓                                      │
+│                                    Failed                                   │
 └─────────────────────────────────────────────────────────────────────────────┘
                                      │ 聚合
                                      ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                    组件层 (Component Lifecycle)                              │
+│                    组件层 (Component Lifecycle) - 7 个状态                    │
 │  Pending → Installing → Installed → Upgrading → RollingBack → Uninstalling │
+│                                      ↓                                      │
+│                                    Failed                                   │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+**状态说明**：
+
+| 层级 | 状态 | 说明 |
+|------|------|------|
+| **集群层** | Creating | 集群创建中（节点加入、组件安装） |
+| | Running | 集群运行中（所有组件就绪） |
+| | Upgrading | 集群升级中（节点或组件升级） |
+| | Scaling | 集群扩缩容中（节点增减） |
+| | RollingBack | 集群回滚中（升级失败后恢复） |
+| | Failed | 集群失败（需要人工介入） |
+| **节点层** | Pending | 节点等待配置 |
+| | Provisioned | 节点已配置（Agent 就绪） |
+| | Ready | 节点就绪（所有组件安装完成） |
+| | Upgrading | 节点升级中 |
+| | RollingBack | 节点回滚中 |
+| | Deleting | 节点删除中 |
+| | Failed | 节点失败 |
+| **组件层** | Pending | 组件等待安装 |
+| | Installing | 组件安装中 |
+| | Installed | 组件已安装 |
+| | Upgrading | 组件升级中 |
+| | RollingBack | 组件回滚中 |
+| | Uninstalling | 组件卸载中 |
+| | Failed | 组件失败 |
+
+**设计决策**：
+
+| 决策 | 选择 | 理由 |
+|------|------|------|
+| 是否添加 Paused/Maintenance | 否 | 这些是操作模式，不是生命周期状态 |
+| 是否添加 Removed | 否 | 组件删除后不需要追踪，通过事件系统记录历史 |
+| 集群层是否添加 Deleting | 否 | 删除是操作，通过 Finalizer 机制处理，不是独立生命周期阶段 |
+| 是否抽象为通用状态 | 否 | 保留明确语义（Upgrading vs InProgress），避免丢失信息 |
 
 #### 4.5.2 自底向上的状态聚合
 
 三层状态机的核心设计思想是**自底向上的状态聚合**：
 
-- **组件状态 → 节点状态**：节点上所有组件状态聚合为节点生命周期状态
-  - 所有组件 Installed → 节点 Ready
-  - 任意组件 Upgrading → 节点 Upgrading
-  - 任意组件 Failed → 节点 Failed
+**组件层 → 节点层聚合规则**：
 
-- **节点状态 → 集群状态**：所有节点状态 + 集群级组件状态聚合为集群生命周期状态
-  - 所有节点 Ready + 所有集群级组件 Installed → 集群 Running
-  - 任意节点 Upgrading 或集群级组件 Upgrading → 集群 Upgrading
-  - 任意节点 Failed 或集群级组件 Failed → 集群 Failed
+| 组件状态 | 节点状态 | 说明 |
+|---------|---------|------|
+| 所有组件 Installed | Ready | 节点就绪 |
+| 任意组件 Upgrading | Upgrading | 节点升级中 |
+| 任意组件 RollingBack | RollingBack | 节点回滚中 |
+| 任意组件 Failed | Failed | 节点失败 |
+| 任意组件 Uninstalling | Deleting | 节点删除中 |
+| 所有组件 Pending | Pending | 节点等待配置 |
+| 所有组件 Installing | Provisioned | 节点已配置 |
+
+**节点层 → 集群层聚合规则**：
+
+| 节点状态 | 集群状态 | 说明 |
+|---------|---------|------|
+| 所有节点 Ready + 所有集群级组件 Installed | Running | 集群运行中 |
+| 任意节点 Upgrading | Upgrading | 集群升级中 |
+| 任意节点 RollingBack | RollingBack | 集群回滚中 |
+| 任意节点 Failed | Failed | 集群失败 |
+| 任意节点 Deleting | Scaling | 集群缩容中 |
+| 任意节点 Pending/Provisioned | Creating | 集群创建中 |
+
+**触发源说明**：
+
+**集群层 Upgrading 的触发源**：
+- 节点层 Upgrading（节点升级）
+- 集群级组件 Upgrading（集群级组件升级）
+- 任意一个触发都会导致集群层进入 Upgrading 状态
+
+**集群层 Scaling 的触发源**：
+- 节点层 Deleting（节点删除，缩容）
+- 节点层 Pending（节点增加，扩容）
+- 任意一个触发都会导致集群层进入 Scaling 状态
+
+**聚合优先级**（从高到低）：
+
+```
+Failed > RollingBack > Upgrading > Deleting > Pending/Provisioned > Ready
+```
+
+**聚合示例**：
+
+```
+场景 1：节点 1 升级中，节点 2 就绪
+  节点层：Node1=Upgrading, Node2=Ready
+  集群层：Upgrading（任意节点 Upgrading → 集群 Upgrading）
+
+场景 2：节点 1 失败，节点 2 就绪
+  节点层：Node1=Failed, Node2=Ready
+  集群层：Failed（任意节点 Failed → 集群 Failed）
+
+场景 3：节点 1 删除中，节点 2 就绪
+  节点层：Node1=Deleting, Node2=Ready
+  集群层：Scaling（任意节点 Deleting → 集群 Scaling）
+
+场景 4：所有节点就绪，所有组件安装完成
+  节点层：Node1=Ready, Node2=Ready
+  组件层：所有组件=Installed
+  集群层：Running（所有节点 Ready + 所有组件 Installed → 集群 Running）
+```
 
 #### 4.5.3 本提案的铺垫作用
 
