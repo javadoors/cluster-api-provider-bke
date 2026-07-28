@@ -1,65 +1,138 @@
-# KEP-6 状态机演进设计（v3）
+# KEP-6 状态机演进设计（v3 - 混合模型）
 
-> **文档说明**：本文档是 KEP-6 状态机的演进设计，基于 v2 版本的反馈进行了重构。
+> **文档说明**：本文档是 KEP-6 状态机的演进设计，采用**混合模型**（驱动模型 + 聚合模型）。
 > - **v2 文档**：[kep6-state-machine-v2.md](./kep6-state-machine-v2.md) - 已有实现的参考
-> - **v3 文档**：本文档 - 演进的设计方案
+> - **v3 文档**：本文档 - 混合模型设计方案
 
 ## 目录
 
 1. [状态模型概览](#1-状态模型概览)
+   - [1.1 混合模型架构](#11-混合模型架构)
+   - [1.2 驱动模型](#12-驱动模型)
+   - [1.3 聚合模型](#13-聚合模型)
+   - [1.4 组件类型区分](#14-组件类型区分)
 2. [集群层状态机：BKEClusterLifecycle](#2-集群层状态机bkeclusterlifecycle)
+   - [2.1 状态定义](#21-状态定义)
+   - [2.2 驱动规则](#22-驱动规则)
+   - [2.3 状态转换图](#23-状态转换图)
+   - [2.4 操作进度追踪](#24-操作进度追踪)
 3. [节点层状态机：BKENodeLifecycle](#3-节点层状态机bkenodelifecycle)
+   - [3.1 状态定义](#31-状态定义)
+   - [3.2 驱动规则](#32-驱动规则)
+   - [3.3 状态转换图](#33-状态转换图)
 4. [组件层状态机：ComponentLifecycle](#4-组件层状态机componentlifecycle)
-5. [场景驱动的状态转换](#5-场景驱动的状态转换)
-6. [重试与幂等性](#6-重试与幂等性)
-7. [详细设计](#7-详细设计)
-   - 7.1 [兼容性分析](#71-兼容性分析)
-   - 7.2 [API 类型扩展设计](#72-api-类型扩展设计)
-   - 7.3 [状态机引擎设计](#73-状态机引擎设计)
-   - 7.4 [状态聚合器设计](#74-状态聚合器设计)
-   - 7.5 [兼容性映射设计](#75-兼容性映射设计)
-   - 7.6 [与现有系统集成设计](#76-与现有系统集成设计)
-   - 7.7 [人工介入详细设计](#77-人工介入详细设计)
-   - 7.8 [Feature Gate 设计](#78-feature-gate-设计)
-   - 7.9 [迁移策略](#79-迁移策略)
-   - 7.10 [实现文件清单](#710-实现文件清单)
-   - 7.11 [测试设计](#711-测试设计)
+   - [4.1 状态定义](#41-状态定义)
+   - [4.2 驱动规则](#42-驱动规则)
+   - [4.3 状态转换图](#43-状态转换图)
+5. [健康状态聚合](#5-健康状态聚合)
+   - [5.1 健康状态定义](#51-健康状态定义)
+   - [5.2 聚合规则](#52-聚合规则)
+   - [5.3 健康检查机制](#53-健康检查机制)
+6. [场景驱动的状态转换](#6-场景驱动的状态转换)
+   - [6.1 安装场景](#61-安装场景)
+   - [6.2 升级场景](#62-升级场景)
+   - [6.3 回滚场景](#63-回滚场景)
+   - [6.4 扩容场景](#64-扩容场景)
+   - [6.5 缩容场景](#65-缩容场景)
+7. [重试与幂等性](#7-重试与幂等性)
+8. [详细设计](#8-详细设计)
+   - [8.1 兼容性分析](#81-兼容性分析)
+   - [8.2 API 类型扩展设计](#82-api-类型扩展设计)
+   - [8.3 状态机引擎设计](#83-状态机引擎设计)
+   - [8.4 健康状态聚合器设计](#84-健康状态聚合器设计)
+   - [8.5 兼容性映射设计](#85-兼容性映射设计)
+   - [8.6 与现有系统集成设计](#86-与现有系统集成设计)
+   - [8.7 人工介入详细设计](#87-人工介入详细设计)
+   - [8.8 Feature Gate 设计](#88-feature-gate-设计)
+   - [8.9 迁移策略](#89-迁移策略)
+   - [8.10 实现文件清单](#810-实现文件清单)
+   - [8.11 测试设计](#811-测试设计)
 
 ---
 
 ## 1. 状态模型概览
 
-### 1.1 三层状态机架构
+### 1.1 混合模型架构
+
+v3 采用**混合模型**，将状态管理分为两个独立的模型：
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                    集群层 (BKEClusterLifecycle)                              │
-│  Creating → Running → Upgrading → Scaling → RollingBack → Failed           │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    │ 聚合
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    节点层 (BKENodeLifecycle)                                 │
-│  Pending → Provisioned → Ready → Upgrading → RollingBack → Deleting        │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                    │
-                                    │ 聚合
-                                    ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    组件层 (ComponentLifecycle)                               │
-│  Pending → Installing → Installed → Upgrading → RollingBack → Uninstalling │
+│                         混合模型架构                                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                    驱动模型（自上而下）                               │   │
+│  │                                                                     │   │
+│  │  用户操作 → 集群状态 → 节点状态 → 组件状态                           │   │
+│  │                                                                     │   │
+│  │  决定：LifecyclePhase（生命周期阶段）                                │   │
+│  │  - Creating, Running, Upgrading, Scaling, RollingBack, Failed      │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                    聚合模型（自底向上）                               │   │
+│  │                                                                     │   │
+│  │  组件状态 → 节点状态 → 集群状态                                      │   │
+│  │                                                                     │   │
+│  │  决定：HealthStatus（健康状态）                                      │   │
+│  │  - Healthy, Degraded, Unhealthy, Unknown                           │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 1.2 组件类型区分
+**核心原则**：
+- **驱动模型**：决定集群"正在做什么"（生命周期阶段）
+- **聚合模型**：决定集群"健康状况如何"（健康状态）
+- **两个模型各司其职，互不干扰**
+
+### 1.2 驱动模型
+
+驱动模型采用**自上而下**的方式，由用户操作驱动状态转换：
+
+```
+用户操作（自上而下）：
+  用户触发升级 → 集群进入 Upgrading → 节点逐个升级 → 组件逐个升级
+
+状态转换规则：
+  集群 LifecyclePhase = 由 OperationProgress 决定
+  节点 LifecyclePhase = 由节点操作决定
+  组件 LifecyclePhase = 由组件操作决定
+```
+
+**优势**：
+- ✅ 因果关系清晰：用户操作是原因，状态转换是结果
+- ✅ 状态转换规则简单：直接由操作类型决定
+- ✅ 进度追踪容易：通过 OperationProgress 追踪操作进度
+- ✅ 故障诊断容易：快速定位失败的组件
+
+### 1.3 聚合模型
+
+聚合模型采用**自底向上**的方式，由下层状态聚合出上层健康状态：
+
+```
+健康状态聚合（自底向上）：
+  组件健康状态 → 节点健康状态 → 集群健康状态
+
+聚合规则：
+  集群 HealthStatus = 聚合(所有节点健康状态 + 所有集群级组件健康状态)
+  节点 HealthStatus = 聚合(所有节点级组件健康状态)
+```
+
+**优势**：
+- ✅ 健康状态准确：基于实际组件状态
+- ✅ 故障检测及时：快速发现不健康的组件
+- ✅ 健康检查灵活：可以自定义健康检查规则
+
+### 1.4 组件类型区分
 
 组件分为**节点级组件**和**集群级组件**两类：
 
 | 组件类型 | 示例 | 聚合目标 | 说明 |
 |---------|------|---------|------|
-| **节点级组件** | containerd, bkeagent | 节点状态 | 运行在特定节点上 |
-| **集群级组件** | coredns, kube-proxy | 集群状态 | 运行在集群中 |
+| **节点级组件** | containerd, bkeagent | 节点健康状态 | 运行在特定节点上 |
+| **集群级组件** | coredns, kube-proxy | 集群健康状态 | 运行在集群中 |
 
 ```go
 type ComponentType string
@@ -70,106 +143,84 @@ const (
 )
 ```
 
-### 1.3 状态聚合关系
-
-#### 1.3.1 节点级组件 → 节点状态
-
-```
-节点状态 = 聚合(所有节点级组件状态)
-
-规则：
-- 所有节点级组件 Installed → 节点 Ready
-- 任意节点级组件 Upgrading → 节点 Upgrading
-- 任意节点级组件 RollingBack → 节点 RollingBack
-- 任意节点级组件 Failed → 节点 Failed
-- 所有节点级组件 Removed → 节点 Removed
-```
-
-#### 1.3.2 节点状态 + 集群级组件 → 集群状态
-
-```
-集群状态 = 聚合(所有节点状态 + 所有集群级组件状态)
-
-规则：
-- 所有节点 Ready + 所有集群级组件 Installed → 集群 Running
-- 任意节点 Upgrading 或 任意集群级组件 Upgrading → 集群 Upgrading
-- 任意节点 RollingBack 或 任意集群级组件 RollingBack → 集群 RollingBack
-- 任意节点 Failed 或 任意集群级组件 Failed → 集群 Failed
-- 任意节点 Deleting → 集群 Scaling
-- 任意节点 Pending/Provisioned → 集群 Creating
-```
-
-### 1.4 状态驱动关系
-
-```
-Reconciler (调谐器)
-  │
-  ├─ Watch BKECluster 变更
-  │   └─ 触发集群层状态转换
-  │
-  ├─ Watch BKENode 变更
-  │   └─ 触发节点层状态转换
-  │
-  ├─ Watch ComponentVersion 变更
-  │   └─ 触发组件层状态转换
-  │
-  └─ 执行 DAG
-      └─ 按依赖顺序执行组件安装/升级
-```
-
 ---
 
 ## 2. 集群层状态机：BKEClusterLifecycle
 
 ### 2.1 状态定义
 
-| 状态 | 说明 |
-|------|------|
-| `Creating` | 集群正在创建（节点加入、Agent 推送、组件安装） |
-| `Running` | 集群正在运行（所有组件就绪，服务可用） |
-| `Upgrading` | 集群正在升级（版本变更中） |
-| `Scaling` | 集群正在扩容或缩容（节点增减） |
-| `RollingBack` | 集群正在回滚（升级失败后恢复） |
-| `Failed` | 集群失败（需要人工介入） |
+| 状态 | 说明 | 驱动来源 |
+|------|------|---------|
+| `Creating` | 集群正在创建（节点加入、Agent 推送、组件安装） | 用户创建集群 |
+| `Running` | 集群正在运行（所有组件就绪，服务可用） | 默认状态 |
+| `Upgrading` | 集群正在升级（版本变更中） | 用户触发升级 |
+| `Scaling` | 集群正在扩容或缩容（节点增减） | 用户触发扩缩容 |
+| `RollingBack` | 集群正在回滚（升级失败后恢复） | 升级失败自动触发 |
+| `Failed` | 集群失败（需要人工介入） | 操作失败 |
 
-### 2.2 状态转换规则
+### 2.2 驱动规则
 
-**正常转换**：
-- `Creating → Running`：所有节点 Ready + 所有集群级组件 Installed
-- `Running → Upgrading`：用户触发版本升级
-- `Upgrading → Running`：升级完成，所有组件更新到目标版本
-- `Running → Scaling`：触发扩容或缩容
-- `Scaling → Running`：扩容或缩容完成
+集群层状态由**驱动模型**决定，基于 `OperationProgress` 字段：
 
-**失败转换**：
-- `任意状态 → Failed`：关键组件失败或超时
-- `Failed → Creating/Running/Upgrading`：人工介入后重试
+```go
+// determineLifecyclePhase 由驱动模型决定集群生命周期阶段
+func (r *Reconciler) determineLifecyclePhase(cluster *BKECluster) LifecyclePhase {
+    // 检查是否有进行中的操作
+    if cluster.Status.OperationProgress != nil && 
+       cluster.Status.OperationProgress.FinishedAt == nil {
+        switch cluster.Status.OperationProgress.OperationType {
+        case OperationTypeInstall:
+            return ClusterLifecycleCreating
+        case OperationTypeUpgrade:
+            return ClusterLifecycleUpgrading
+        case OperationTypeScale:
+            return ClusterLifecycleScaling
+        case OperationTypeRollback:
+            return ClusterLifecycleRollingBack
+        }
+    }
+    
+    // 检查是否失败
+    if cluster.Status.OperationProgress != nil &&
+       cluster.Status.OperationProgress.LastFailure != nil {
+        return ClusterLifecycleFailed
+    }
+    
+    // 默认运行状态
+    return ClusterLifecycleRunning
+}
+```
 
-**回滚转换**：
-- `Upgrading → RollingBack`：升级失败，触发回滚
-- `RollingBack → Running`：回滚完成
+**驱动规则说明**：
+- `Creating`：当 `OperationProgress.OperationType = Install` 且未完成时
+- `Running`：当没有进行中的操作且没有失败时
+- `Upgrading`：当 `OperationProgress.OperationType = Upgrade` 且未完成时
+- `Scaling`：当 `OperationProgress.OperationType = Scale` 且未完成时
+- `RollingBack`：当 `OperationProgress.OperationType = Rollback` 且未完成时
+- `Failed`：当 `OperationProgress.LastFailure != nil` 时
 
 ### 2.3 状态转换图
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Creating
-    Creating --> Running : 所有节点 Ready + 所有集群级组件 Installed
-    Creating --> Failed : 失败
+    [*] --> Creating : 用户创建集群
     
-    Running --> Upgrading : 触发升级
-    Running --> Scaling : 触发扩容/缩容
-    Running --> Failed : 失败
+    Creating --> Running : 安装完成
+    Creating --> Failed : 安装失败
+    
+    Running --> Upgrading : 用户触发升级
+    Running --> Scaling : 用户触发扩缩容
+    Running --> Failed : 运行失败
     
     Upgrading --> Running : 升级完成
     Upgrading --> RollingBack : 升级失败
-    Upgrading --> Failed : 失败
+    Upgrading --> Failed : 升级失败
     
     RollingBack --> Running : 回滚完成
     RollingBack --> Failed : 回滚失败
     
-    Scaling --> Running : 扩容/缩容完成
-    Scaling --> Failed : 失败
+    Scaling --> Running : 扩缩容完成
+    Scaling --> Failed : 扩缩容失败
     
     Failed --> Creating : 人工介入重试
     Failed --> Running : 人工介入重试
@@ -181,15 +232,6 @@ stateDiagram-v2
 所有操作（安装、升级、扩容、缩容、回滚）的进度通过 `OperationProgress` 统一追踪：
 
 ```go
-type OperationType string
-
-const (
-    OperationInstall  OperationType = "Install"
-    OperationUpgrade  OperationType = "Upgrade"
-    OperationScale    OperationType = "Scale"
-    OperationRollback OperationType = "Rollback"
-)
-
 type OperationProgress struct {
     // 操作类型
     OperationType OperationType `json:"operationType"`
@@ -203,20 +245,47 @@ type OperationProgress struct {
     // 完成时间
     FinishedAt *metav1.Time `json:"finishedAt,omitempty"`
     
+    // 当前阶段
+    CurrentStage string `json:"currentStage,omitempty"`
+    
+    // 总组件数
+    TotalComponents int `json:"totalComponents,omitempty"`
+    
+    // 已完成组件数
+    CompletedComponents int `json:"completedComponents,omitempty"`
+    
+    // 失败的组件列表
+    FailedComponents []string `json:"failedComponents,omitempty"`
+    
     // 已完成组件列表
     Completed []ComponentRecord `json:"completed,omitempty"`
+    
+    // 最后失败记录
+    LastFailure *OperationFailureRecord `json:"lastFailure,omitempty"`
+    
+    // 是否需要人工介入
+    NeedsManualIntervention bool `json:"needsManualIntervention,omitempty"`
 }
+
+type OperationType string
+
+const (
+    OperationTypeInstall  OperationType = "Install"
+    OperationTypeUpgrade  OperationType = "Upgrade"
+    OperationTypeScale    OperationType = "Scale"
+    OperationTypeRollback OperationType = "Rollback"
+)
 ```
 
 **使用场景**：
 
-| 场景 | OperationType |
-|------|---------------|
-| 集群安装 | `Install` |
-| 集群升级 | `Upgrade` |
-| 集群扩容 | `Scale` |
-| 集群缩容 | `Scale` |
-| 集群回滚 | `Rollback` |
+| 场景 | OperationType | CurrentStage |
+|------|---------------|--------------|
+| 集群安装 | `Install` | `InstallingNodeComponents` / `InstallingClusterComponents` |
+| 集群升级 | `Upgrade` | `UpgradingNodeComponents` / `UpgradingClusterComponents` |
+| 集群扩容 | `Scale` | `ScalingUp` |
+| 集群缩容 | `Scale` | `ScalingDown` |
+| 集群回滚 | `Rollback` | `RollingBackNodeComponents` / `RollingBackClusterComponents` |
 
 ---
 
@@ -224,26 +293,72 @@ type OperationProgress struct {
 
 ### 3.1 状态定义
 
-| 状态 | 说明 |
-|------|------|
-| `Pending` | 节点等待配置（Agent 推送） |
-| `Provisioned` | 节点已配置（Agent 就绪，环境初始化完成） |
-| `Ready` | 节点就绪（所有组件安装完成） |
-| `Upgrading` | 节点正在升级（组件升级中） |
-| `RollingBack` | 节点正在回滚（升级失败后恢复） |
-| `Deleting` | 节点正在删除（组件卸载中） |
-| `Removed` | 节点已删除 |
-| `Failed` | 节点失败 |
+| 状态 | 说明 | 驱动来源 |
+|------|------|---------|
+| `Pending` | 节点等待配置（Agent 推送） | 节点加入集群 |
+| `Provisioned` | 节点已配置（Agent 就绪，环境初始化完成） | Agent 推送完成 |
+| `Ready` | 节点就绪（所有组件安装完成） | 组件安装完成 |
+| `Upgrading` | 节点正在升级（组件升级中） | 用户触发升级 |
+| `RollingBack` | 节点正在回滚（升级失败后恢复） | 升级失败自动触发 |
+| `Deleting` | 节点正在删除（组件卸载中） | 用户触发删除 |
+| `Removed` | 节点已删除 | 删除完成 |
+| `Failed` | 节点失败 | 操作失败 |
 
-### 3.2 状态转换图
+### 3.2 驱动规则
+
+节点层状态由**驱动模型**决定，基于节点操作：
+
+```go
+// determineNodeLifecyclePhase 由驱动模型决定节点生命周期阶段
+func (r *Reconciler) determineNodeLifecyclePhase(node *BKENode) LifecyclePhase {
+    // 检查是否有进行中的操作
+    if node.Status.OperationProgress != nil && 
+       node.Status.OperationProgress.FinishedAt == nil {
+        switch node.Status.OperationProgress.OperationType {
+        case OperationTypeInstall:
+            if node.Status.StateCode&NodeAgentReadyFlag != 0 {
+                return NodeLifecycleProvisioned
+            }
+            return NodeLifecyclePending
+        case OperationTypeUpgrade:
+            return NodeLifecycleUpgrading
+        case OperationTypeRollback:
+            return NodeLifecycleRollingBack
+        case OperationTypeDelete:
+            return NodeLifecycleDeleting
+        }
+    }
+    
+    // 检查是否失败
+    if node.Status.OperationProgress != nil &&
+       node.Status.OperationProgress.LastFailure != nil {
+        return NodeLifecycleFailed
+    }
+    
+    // 检查是否已删除
+    if node.DeletionTimestamp != nil {
+        return NodeLifecycleRemoved
+    }
+    
+    // 检查是否就绪
+    if allNodeComponentsInstalled(node) {
+        return NodeLifecycleReady
+    }
+    
+    return NodeLifecyclePending
+}
+```
+
+### 3.3 状态转换图
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Pending
+    [*] --> Pending : 节点加入集群
+    
     Pending --> Provisioned : Agent 推送完成 + 环境初始化完成
     Pending --> Failed : 失败
     
-    Provisioned --> Ready : 所有节点级组件 Installed
+    Provisioned --> Ready : 所有节点级组件安装完成
     Provisioned --> Failed : 失败
     
     Ready --> Upgrading : 触发升级
@@ -265,78 +380,73 @@ stateDiagram-v2
     Failed --> Ready : 人工介入重试
 ```
 
-### 3.3 节点状态聚合规则
-
-节点状态由所有节点级组件状态聚合：
-
-```go
-func AggregateNodeState(nodeComponents []ComponentStatus) NodeState {
-    // 所有组件 Installed → Ready
-    if allInstalled(nodeComponents) {
-        return NodeReady
-    }
-    
-    // 任意组件 Upgrading → Upgrading
-    if anyUpgrading(nodeComponents) {
-        return NodeUpgrading
-    }
-    
-    // 任意组件 RollingBack → RollingBack
-    if anyRollingBack(nodeComponents) {
-        return NodeRollingBack
-    }
-    
-    // 任意组件 Failed → Failed
-    if anyFailed(nodeComponents) {
-        return NodeFailed
-    }
-    
-    // 所有组件 Removed → Removed
-    if allRemoved(nodeComponents) {
-        return NodeRemoved
-    }
-    
-    // 其他情况 → Pending/Provisioned
-    return determineProvisionState(nodeComponents)
-}
-```
-
 ---
 
 ## 4. 组件层状态机：ComponentLifecycle
 
 ### 4.1 状态定义
 
-| 状态 | 说明 |
-|------|------|
-| `Pending` | 组件等待安装 |
-| `Installing` | 组件正在安装 |
-| `Installed` | 组件已安装（运行中） |
-| `Upgrading` | 组件正在升级 |
-| `RollingBack` | 组件正在回滚（升级失败后恢复） |
-| `Uninstalling` | 组件正在卸载 |
-| `Removed` | 组件已卸载 |
-| `Failed` | 组件安装/升级/卸载失败 |
+| 状态 | 说明 | 驱动来源 |
+|------|------|---------|
+| `Pending` | 组件等待安装 | 组件加入 |
+| `Installing` | 组件正在安装 | 开始安装 |
+| `Installed` | 组件已安装（运行中） | 安装成功 |
+| `Upgrading` | 组件正在升级 | 触发升级 |
+| `RollingBack` | 组件正在回滚（升级失败后恢复） | 升级失败自动触发 |
+| `Uninstalling` | 组件正在卸载 | 触发卸载 |
+| `Removed` | 组件已卸载 | 卸载成功 |
+| `Failed` | 组件安装/升级/卸载失败 | 操作失败 |
 
-### 4.2 组件类型区分
+### 4.2 驱动规则
 
-组件分为节点级和集群级两类：
+组件层状态由**驱动模型**决定，基于组件操作：
 
-**节点级组件**：
-- 运行在特定节点上
-- 聚合到节点状态
-- 示例：containerd, bkeagent
-
-**集群级组件**：
-- 运行在集群中
-- 聚合到集群状态
-- 示例：coredns, kube-proxy
+```go
+// determineComponentLifecyclePhase 由驱动模型决定组件生命周期阶段
+func (r *Reconciler) determineComponentLifecyclePhase(
+    component *ComponentLifecycleStatus,
+) LifecyclePhase {
+    // 检查是否有进行中的操作
+    if component.OperationProgress != nil && 
+       component.OperationProgress.FinishedAt == nil {
+        switch component.OperationProgress.OperationType {
+        case OperationTypeInstall:
+            return ComponentLifecycleInstalling
+        case OperationTypeUpgrade:
+            return ComponentLifecycleUpgrading
+        case OperationTypeRollback:
+            return ComponentLifecycleRollingBack
+        case OperationTypeUninstall:
+            return ComponentLifecycleUninstalling
+        }
+    }
+    
+    // 检查是否失败
+    if component.OperationProgress != nil &&
+       component.OperationProgress.LastFailure != nil {
+        return ComponentLifecycleFailed
+    }
+    
+    // 检查是否已卸载
+    if component.Uninstalled {
+        return ComponentLifecycleRemoved
+    }
+    
+    // 检查是否已安装
+    if component.Installed {
+        return ComponentLifecycleInstalled
+    }
+    
+    return ComponentLifecyclePending
+}
+```
 
 ### 4.3 状态转换图
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Pending
+    [*] --> Pending : 组件加入
+    
     Pending --> Installing : 开始安装
     Pending --> Failed : 失败
     
@@ -362,2839 +472,638 @@ stateDiagram-v2
     Failed --> Uninstalling : 重试
 ```
 
-### 4.4 聚合规则
+---
 
-#### 4.4.1 节点级组件聚合到节点状态
+## 5. 健康状态聚合
+
+### 5.1 健康状态定义
 
 ```go
-func AggregateNodeStateFromComponents(nodeComponents []ComponentStatus) NodeState {
-    // 实现见 3.4 节
+type HealthStatus struct {
+    // 整体健康状态
+    Overall HealthLevel `json:"overall"`
+    
+    // 健康消息
+    Message string `json:"message,omitempty"`
+    
+    // 节点健康状态
+    NodeHealth []NodeHealthStatus `json:"nodeHealth,omitempty"`
+    
+    // 组件健康状态
+    ComponentHealth []ComponentHealthStatus `json:"componentHealth,omitempty"`
+    
+    // 最后检查时间
+    LastCheckTime *metav1.Time `json:"lastCheckTime,omitempty"`
+}
+
+type HealthLevel string
+
+const (
+    HealthLevelHealthy   HealthLevel = "Healthy"
+    HealthLevelDegraded  HealthLevel = "Degraded"
+    HealthLevelUnhealthy HealthLevel = "Unhealthy"
+    HealthLevelUnknown   HealthLevel = "Unknown"
+)
+
+type NodeHealthStatus struct {
+    NodeIP  string      `json:"nodeIP"`
+    Health  HealthLevel `json:"health"`
+    Message string      `json:"message,omitempty"`
+}
+
+type ComponentHealthStatus struct {
+    Name    string      `json:"name"`
+    NodeIP  string      `json:"nodeIP,omitempty"`
+    Health  HealthLevel `json:"health"`
+    Message string      `json:"message,omitempty"`
 }
 ```
 
-#### 4.4.2 集群级组件聚合到集群状态
+**健康级别说明**：
+- `Healthy`：所有组件正常运行
+- `Degraded`：部分组件异常，但集群仍可运行
+- `Unhealthy`：关键组件异常，集群无法正常运行
+- `Unknown`：无法确定健康状态
+
+### 5.2 聚合规则
+
+健康状态由**聚合模型**决定，采用自底向上的方式：
 
 ```go
-func AggregateClusterStateFromComponents(
-    nodes []NodeState,
-    clusterComponents []ComponentStatus,
-) ClusterState {
-    // 所有节点 Ready + 所有集群级组件 Installed → Running
-    if allNodesReady(nodes) && allClusterComponentsInstalled(clusterComponents) {
-        return ClusterRunning
+// determineHealthStatus 由聚合模型决定健康状态
+func (r *Reconciler) determineHealthStatus(
+    nodes []BKENode,
+    clusterComponents map[string]ComponentLifecycleStatus,
+) *HealthStatus {
+    health := &HealthStatus{
+        Overall:       HealthLevelHealthy,
+        LastCheckTime: &metav1.Time{Time: time.Now()},
     }
     
-    // 任意节点或集群级组件 Upgrading → Upgrading
-    if anyNodeUpgrading(nodes) || anyClusterComponentUpgrading(clusterComponents) {
-        return ClusterUpgrading
+    // 聚合节点健康状态
+    for _, node := range nodes {
+        nodeHealth := determineNodeHealth(node)
+        health.NodeHealth = append(health.NodeHealth, nodeHealth)
+        
+        if nodeHealth.Health != HealthLevelHealthy {
+            health.Overall = HealthLevelDegraded
+        }
     }
     
-    // 任意节点或集群级组件 RollingBack → RollingBack
-    if anyNodeRollingBack(nodes) || anyClusterComponentRollingBack(clusterComponents) {
-        return ClusterRollingBack
+    // 聚合组件健康状态
+    for name, status := range clusterComponents {
+        compHealth := determineComponentHealth(status)
+        health.ComponentHealth = append(health.ComponentHealth, compHealth)
+        
+        if compHealth.Health != HealthLevelHealthy {
+            health.Overall = HealthLevelDegraded
+        }
     }
     
-    // 任意节点或集群级组件 Failed → Failed
-    if anyNodeFailed(nodes) || anyClusterComponentFailed(clusterComponents) {
-        return ClusterFailed
+    // 检查是否有 Unhealthy 状态
+    if hasUnhealthyNode(nodes) || hasUnhealthyComponent(clusterComponents) {
+        health.Overall = HealthLevelUnhealthy
     }
     
-    // 任意节点 Deleting → Scaling
-    if anyNodeDeleting(nodes) {
-        return ClusterScaling
+    return health
+}
+
+// determineNodeHealth 确定节点健康状态
+func determineNodeHealth(node BKENode) NodeHealthStatus {
+    health := NodeHealthStatus{
+        NodeIP: node.Spec.IP,
+        Health: HealthLevelHealthy,
     }
     
-    // 任意节点 Pending/Provisioned → Creating
-    if anyNodePendingOrProvisioned(nodes) {
-        return ClusterCreating
+    // 检查节点级组件健康状态
+    for _, comp := range node.Status.Components {
+        if comp.Phase == ComponentLifecycleFailed {
+            health.Health = HealthLevelUnhealthy
+            health.Message = fmt.Sprintf("Component %s failed", comp.Name)
+            break
+        }
+        if comp.Phase != ComponentLifecycleInstalled {
+            health.Health = HealthLevelDegraded
+        }
     }
     
-    return ClusterUnknown
+    return health
+}
+
+// determineComponentHealth 确定组件健康状态
+func determineComponentHealth(status ComponentLifecycleStatus) ComponentHealthStatus {
+    health := ComponentHealthStatus{
+        Name:   status.Name,
+        NodeIP: status.NodeIP,
+        Health: HealthLevelHealthy,
+    }
+    
+    if status.Phase == ComponentLifecycleFailed {
+        health.Health = HealthLevelUnhealthy
+        health.Message = status.Message
+    } else if status.Phase != ComponentLifecycleInstalled {
+        health.Health = HealthLevelDegraded
+    }
+    
+    return health
 }
 ```
 
-#### 4.4.3 集群状态同时聚合节点状态和集群级组件状态
+**聚合规则说明**：
+- 所有组件 `Installed` → 集群 `Healthy`
+- 任意组件 `Failed` → 集群 `Unhealthy`
+- 任意组件非 `Installed` → 集群 `Degraded`
 
-**关键规则**：
-- 集群状态 = 聚合(所有节点状态 + 所有集群级组件状态)
-- 必须同时满足两个条件才能进入 Running 状态
-- 任意一个失败都会导致集群失败
+### 5.3 健康检查机制
+
+健康检查由聚合模型定期执行：
+
+```go
+// HealthChecker 健康检查器
+type HealthChecker struct {
+    client.Client
+}
+
+// CheckClusterHealth 检查集群健康状态
+func (c *HealthChecker) CheckClusterHealth(
+    ctx context.Context,
+    cluster *BKECluster,
+) (*HealthStatus, error) {
+    // 获取所有节点
+    nodes := &BKENodeList{}
+    if err := c.List(ctx, nodes, client.InNamespace(cluster.Namespace)); err != nil {
+        return nil, err
+    }
+    
+    // 获取集群级组件状态
+    clusterComponents := cluster.Status.ClusterComponentStatuses
+    
+    // 聚合健康状态
+    health := determineHealthStatus(nodes.Items, clusterComponents)
+    
+    return health, nil
+}
+```
 
 ---
 
-## 5. 场景驱动的状态转换
+## 6. 场景驱动的状态转换
 
-### 5.1 安装场景
-
-**状态字段说明**：
-
-| 字段 | 作用 | 示例值 |
-|------|------|--------|
-| `BKECluster.Status.Phase` | 集群生命周期阶段，反映集群整体状态 | Creating/Running/Upgrading/Scaling/RollingBack/Failed |
-| `BKECluster.Status.ClusterHealthState` | 集群健康状态，反映集群的健康程度 | Healthy/Unhealthy/Degraded |
-
-**Phase 与 ClusterHealthState 的关系**：
-
-| 字段 | 类型 | 作用 | 聚合规则 |
-|------|------|------|---------|
-| `Phase` | 生命周期状态 | 反映集群当前处于什么阶段 | 由节点状态和组件状态聚合 |
-| `ClusterHealthState` | 健康状态 | 反映集群的健康程度 | 基于 Phase 和其他健康指标评估 |
-
-**聚合关系**：
-- `Phase` 是基础状态，由节点状态和组件状态聚合而来
-- `ClusterHealthState` 是衍生状态，基于 Phase 和其他健康指标评估
-- 例如：`Phase=Running` + `ClusterHealthState=Healthy` 表示集群正在运行且健康
-
-**依赖关系**：
-- `ClusterHealthState` 依赖于 `Phase`
-- 只有当 `Phase=Running` 时，`ClusterHealthState` 才有意义
-- 当 `Phase=Failed` 时，`ClusterHealthState` 通常为 `Unhealthy`
-
-**状态转换时序说明**：
-
-| 时序 | 状态转换 | 触发条件 | 前置条件 | 结果 |
-|------|---------|---------|---------|------|
-| T0 | BKEClusterLifecycle: [*] → Creating | 创建 BKECluster | 无 | 集群进入创建阶段 |
-| T1 | BKENodeLifecycle: [*] → Pending | 新节点加入集群 | T0 完成 | 节点等待配置 |
-| T2 | ComponentLifecycle: Pending → Installing | 开始安装节点级组件 | T1 完成 | 组件开始安装 |
-| T3 | ComponentLifecycle: Installing → Installed | 节点级组件安装成功 | T2 完成 | 节点进入 Provisioned 状态 |
-| T4 | BKENodeLifecycle: Provisioned → Ready | 环境初始化完成 | T3 完成 | 节点就绪 |
-| T5 | ComponentLifecycle: Pending → Installing | 开始安装集群级组件 | T4 完成 | 组件开始安装 |
-| T6 | ComponentLifecycle: Installing → Installed | 集群级组件安装成功 | T5 完成 | 所有组件安装完成 |
-| T7 | BKEClusterLifecycle: Creating → Running | 所有节点 Ready + 所有集群级组件 Installed | T6 完成 | 集群进入运行状态 |
+### 6.1 安装场景
 
 **状态转换时序**：
 
 ```
-T0: BKEClusterLifecycle = Creating
-    BKECluster.Status.Phase = Creating
-    OperationProgress.OperationType = Install
+T0: 用户创建集群
+    LifecyclePhase = Creating
+    OperationProgress = {Type: Install, StartedAt: now}
+    HealthStatus = Unknown
 
-T1: BKENodeLifecycle = Pending (新节点加入)
-    BKENode.State = Pending
+T1: 开始安装节点级组件
+    LifecyclePhase = Creating（不变）
+    OperationProgress.CurrentStage = "InstallingNodeComponents"
+    OperationProgress.TotalComponents = 10
+    OperationProgress.CompletedComponents = 0
+    HealthStatus = Unknown
 
-T2: 节点级组件 Installing (containerd, bkeagent)
-    ComponentLifecycle = Installing
+T2: 节点级组件安装完成
+    LifecyclePhase = Creating（不变）
+    OperationProgress.CompletedComponents = 10
+    HealthStatus = Degraded（部分组件安装中）
 
-T3: 节点级组件 Installed
-    ComponentLifecycle = Installed
-    BKENode.State = Provisioned
+T3: 开始安装集群级组件
+    LifecyclePhase = Creating（不变）
+    OperationProgress.CurrentStage = "InstallingClusterComponents"
+    OperationProgress.TotalComponents = 5
+    OperationProgress.CompletedComponents = 0
+    HealthStatus = Degraded
 
-T4: 环境初始化完成
-    BKENode.State = Ready
-
-T5: 集群级组件 Installing (coredns, kube-proxy)
-    ComponentLifecycle = Installing
-
-T6: 集群级组件 Installed
-    ComponentLifecycle = Installed
-
-T7: BKEClusterLifecycle = Running
-    所有节点 Ready + 所有集群级组件 Installed
-    BKECluster.Status.Phase = Running
-    BKECluster.Status.ClusterHealthState = Healthy
+T4: 集群级组件安装完成
+    LifecyclePhase = Running
     OperationProgress.FinishedAt = now
+    HealthStatus = Healthy
 ```
 
-### 5.2 升级场景
-
-**状态转换时序说明**：
-
-| 时序 | 状态转换 | 触发条件 | 前置条件 | 结果 |
-|------|---------|---------|---------|------|
-| T0 | BKEClusterLifecycle: Running → Upgrading | 用户触发版本升级 | 集群处于 Running 状态 | 集群进入升级阶段 |
-| T1 | ComponentLifecycle: Installed → Upgrading | 开始升级节点级组件 | T0 完成 | 组件开始升级 |
-| T2 | ComponentLifecycle: Upgrading → Installed | 节点级组件升级成功 | T1 完成 | 节点回到 Ready 状态 |
-| T3 | ComponentLifecycle: Installed → Upgrading | 开始升级集群级组件 | T2 完成 | 组件开始升级 |
-| T4 | ComponentLifecycle: Upgrading → Installed | 集群级组件升级成功 | T3 完成 | 所有组件升级完成 |
-| T5 | BKEClusterLifecycle: Upgrading → Running | 所有节点 Ready + 所有集群级组件 Installed | T4 完成 | 集群回到运行状态 |
+### 6.2 升级场景
 
 **状态转换时序**：
 
 ```
-T0: BKEClusterLifecycle = Running → Upgrading
-    BKECluster.Status.Phase = Upgrading
-    OperationProgress.OperationType = Upgrade
-    OperationProgress.StartedAt = now
+T0: 用户触发升级
+    LifecyclePhase = Upgrading
+    OperationProgress = {Type: Upgrade, TargetVersion: v2.6.0, StartedAt: now}
+    HealthStatus = Healthy（升级前）
 
-T1: 节点级组件 Upgrading (containerd, bkeagent)
-    ComponentLifecycle = Upgrading
-    BKENode.State = Upgrading
+T1: 开始升级节点级组件
+    LifecyclePhase = Upgrading（不变）
+    OperationProgress.CurrentStage = "UpgradingNodeComponents"
+    OperationProgress.TotalComponents = 10
+    OperationProgress.CompletedComponents = 0
+    HealthStatus = Degraded（部分组件升级中）
 
-T2: 节点级组件 Installed
-    ComponentLifecycle = Installed
-    BKENode.State = Ready
-    OperationProgress.Completed = append(...)
+T2: 节点级组件升级完成
+    LifecyclePhase = Upgrading（不变）
+    OperationProgress.CompletedComponents = 10
+    HealthStatus = Degraded
 
-T3: 集群级组件 Upgrading (coredns, kube-proxy)
-    ComponentLifecycle = Upgrading
+T3: 开始升级集群级组件
+    LifecyclePhase = Upgrading（不变）
+    OperationProgress.CurrentStage = "UpgradingClusterComponents"
+    OperationProgress.TotalComponents = 5
+    OperationProgress.CompletedComponents = 0
+    HealthStatus = Degraded
 
-T4: 集群级组件 Installed
-    ComponentLifecycle = Installed
-    OperationProgress.Completed = append(...)
-
-T5: BKEClusterLifecycle = Upgrading → Running
-    所有节点 Ready + 所有集群级组件 Installed
-    BKECluster.Status.Phase = Running
+T4: 集群级组件升级完成
+    LifecyclePhase = Running
     OperationProgress.FinishedAt = now
+    HealthStatus = Healthy（升级后）
 ```
 
-### 5.3 回滚场景
-
-**状态转换时序说明**：
-
-| 时序 | 状态转换 | 触发条件 | 前置条件 | 结果 |
-|------|---------|---------|---------|------|
-| T0 | ComponentLifecycle: Upgrading → Failed | 升级过程中出现错误 | 升级操作进行中 | 组件进入失败状态 |
-| T1 | BKEClusterLifecycle: Upgrading → RollingBack | 升级失败，触发回滚 | T0 完成 | 集群进入回滚阶段 |
-| T2 | ComponentLifecycle: Failed → RollingBack | 开始回滚节点级组件 | T1 完成 | 组件开始回滚 |
-| T3 | ComponentLifecycle: RollingBack → Installed | 节点级组件回滚成功 | T2 完成 | 节点回到 Ready 状态 |
-| T4 | ComponentLifecycle: Installed → RollingBack | 开始回滚集群级组件 | T3 完成 | 组件开始回滚 |
-| T5 | ComponentLifecycle: RollingBack → Installed | 集群级组件回滚成功 | T4 完成 | 所有组件回滚完成 |
-| T6 | BKEClusterLifecycle: RollingBack → Running | 所有节点 Ready + 所有集群级组件 Installed | T5 完成 | 集群回到运行状态 |
+### 6.3 回滚场景
 
 **状态转换时序**：
 
 ```
-T0: 升级失败
-    ComponentLifecycle = Failed
-    OperationProgress.LastFailure = {Name: "...", Error: "upgrade failed", ...}
+T0: 升级失败，触发回滚
+    LifecyclePhase = RollingBack
+    OperationProgress = {Type: Rollback, StartedAt: now}
+    HealthStatus = Unhealthy（升级失败）
 
-T1: BKEClusterLifecycle = Upgrading → RollingBack
-    BKECluster.Status.Phase = RollingBack
-    OperationProgress.OperationType = Rollback
+T1: 开始回滚节点级组件
+    LifecyclePhase = RollingBack（不变）
+    OperationProgress.CurrentStage = "RollingBackNodeComponents"
+    HealthStatus = Unhealthy
 
-T2: 节点级组件 RollingBack (containerd, bkeagent)
-    ComponentLifecycle = RollingBack
-    BKENode.State = RollingBack
+T2: 节点级组件回滚完成
+    LifecyclePhase = RollingBack（不变）
+    HealthStatus = Degraded
 
-T3: 节点级组件 Installed
-    ComponentLifecycle = Installed
-    BKENode.State = Ready
+T3: 开始回滚集群级组件
+    LifecyclePhase = RollingBack（不变）
+    OperationProgress.CurrentStage = "RollingBackClusterComponents"
+    HealthStatus = Degraded
 
-T4: 集群级组件 RollingBack (coredns, kube-proxy)
-    ComponentLifecycle = RollingBack
-
-T5: 集群级组件 Installed
-    ComponentLifecycle = Installed
-
-T6: BKEClusterLifecycle = RollingBack → Running
-    所有节点 Ready + 所有集群级组件 Installed
-    BKECluster.Status.Phase = Running
+T4: 集群级组件回滚完成
+    LifecyclePhase = Running
     OperationProgress.FinishedAt = now
+    HealthStatus = Healthy（回滚后）
 ```
 
-### 5.4 扩容场景
-
-**状态转换时序说明**：
-
-| 时序 | 状态转换 | 触发条件 | 前置条件 | 结果 |
-|------|---------|---------|---------|------|
-| T0 | BKEClusterLifecycle: Running → Scaling | 用户触发扩容 | 集群处于 Running 状态 | 集群进入扩容阶段 |
-| T1 | BKENodeLifecycle: [*] → Pending | 新节点加入集群 | T0 完成 | 节点等待配置 |
-| T2 | ComponentLifecycle: Pending → Installing | 开始安装节点级组件 | T1 完成 | 组件开始安装 |
-| T3 | ComponentLifecycle: Installing → Installed | 节点级组件安装成功 | T2 完成 | 节点就绪 |
-| T4 | BKEClusterLifecycle: Scaling → Running | 所有节点 Ready + 所有集群级组件 Installed | T3 完成 | 集群回到运行状态 |
+### 6.4 扩容场景
 
 **状态转换时序**：
 
 ```
-T0: BKEClusterLifecycle = Running → Scaling
-    BKECluster.Status.Phase = Scaling
-    OperationProgress.OperationType = Scale
+T0: 用户触发扩容
+    LifecyclePhase = Scaling
+    OperationProgress = {Type: Scale, StartedAt: now}
+    HealthStatus = Healthy（扩容前）
 
 T1: 新节点加入
-    BKENodeLifecycle = Pending
-    BKENode.State = Pending
+    LifecyclePhase = Scaling（不变）
+    OperationProgress.CurrentStage = "ScalingUp"
+    HealthStatus = Degraded（新节点未就绪）
 
-T2: 节点级组件 Installing (containerd, bkeagent)
-    ComponentLifecycle = Installing
-
-T3: 节点级组件 Installed
-    ComponentLifecycle = Installed
-    BKENode.State = Ready
-
-T4: BKEClusterLifecycle = Scaling → Running
-    所有节点 Ready + 所有集群级组件 Installed
-    BKECluster.Status.Phase = Running
+T2: 新节点就绪
+    LifecyclePhase = Running
     OperationProgress.FinishedAt = now
+    HealthStatus = Healthy（扩容后）
 ```
 
-### 5.5 缩容场景
-
-**状态转换时序说明**：
-
-| 时序 | 状态转换 | 触发条件 | 前置条件 | 结果 |
-|------|---------|---------|---------|------|
-| T0 | BKEClusterLifecycle: Running → Scaling | 用户触发缩容 | 集群处于 Running 状态 | 集群进入缩容阶段 |
-| T1 | BKENodeLifecycle: Ready → Deleting | 节点标记删除 | T0 完成 | 节点开始删除 |
-| T2 | ComponentLifecycle: Installed → Uninstalling | 开始卸载节点级组件 | T1 完成 | 组件开始卸载 |
-| T3 | ComponentLifecycle: Uninstalling → Removed | 节点级组件卸载成功 | T2 完成 | 组件已卸载 |
-| T4 | BKENodeLifecycle: Deleting → Removed | 节点删除完成 | T3 完成 | 节点已删除 |
-| T5 | BKEClusterLifecycle: Scaling → Running | 所有节点 Ready + 所有集群级组件 Installed | T4 完成 | 集群回到运行状态 |
+### 6.5 缩容场景
 
 **状态转换时序**：
 
 ```
-T0: BKEClusterLifecycle = Running → Scaling
-    BKECluster.Status.Phase = Scaling
-    OperationProgress.OperationType = Scale
+T0: 用户触发缩容
+    LifecyclePhase = Scaling
+    OperationProgress = {Type: Scale, StartedAt: now}
+    HealthStatus = Healthy（缩容前）
 
 T1: 节点标记删除
-    BKENodeLifecycle = Ready → Deleting
-    BKENode.State = Deleting
+    LifecyclePhase = Scaling（不变）
+    OperationProgress.CurrentStage = "ScalingDown"
+    HealthStatus = Degraded（节点删除中）
 
-T2: 节点级组件 Uninstalling (containerd, bkeagent)
-    ComponentLifecycle = Uninstalling
-
-T3: 节点级组件 Removed
-    ComponentLifecycle = Removed
-
-T4: BKENodeLifecycle = Deleting → Removed
-    BKENode.State = Removed
-
-T5: BKEClusterLifecycle = Scaling → Running
-    所有节点 Ready + 所有集群级组件 Installed
-    BKECluster.Status.Phase = Running
+T2: 节点删除完成
+    LifecyclePhase = Running
     OperationProgress.FinishedAt = now
+    HealthStatus = Healthy（缩容后）
 ```
 
 ---
 
-## 6. 重试与幂等性
+## 7. 重试与幂等性
 
-### 6.1 重试机制
+（保留原有设计，详见 v3 文档）
 
-#### 6.1.1 自动重试
+---
 
-**重试计数器存储位置**
+## 8. 详细设计
 
-自动重试计数器存储在 `BKECluster.Status.OperationProgress.LastFailure.Attempt` 字段中：
+### 8.1 兼容性分析
+
+（保留原有设计，详见 v3 文档）
+
+### 8.2 API 类型扩展设计
+
+**新增类型**：
+
+```go
+// HealthStatus 健康状态
+type HealthStatus struct {
+    Overall         HealthLevel              `json:"overall"`
+    Message         string                   `json:"message,omitempty"`
+    NodeHealth      []NodeHealthStatus       `json:"nodeHealth,omitempty"`
+    ComponentHealth []ComponentHealthStatus  `json:"componentHealth,omitempty"`
+    LastCheckTime   *metav1.Time             `json:"lastCheckTime,omitempty"`
+}
+
+type HealthLevel string
+
+const (
+    HealthLevelHealthy   HealthLevel = "Healthy"
+    HealthLevelDegraded  HealthLevel = "Degraded"
+    HealthLevelUnhealthy HealthLevel = "Unhealthy"
+    HealthLevelUnknown   HealthLevel = "Unknown"
+)
+
+type NodeHealthStatus struct {
+    NodeIP  string      `json:"nodeIP"`
+    Health  HealthLevel `json:"health"`
+    Message string      `json:"message,omitempty"`
+}
+
+type ComponentHealthStatus struct {
+    Name    string      `json:"name"`
+    NodeIP  string      `json:"nodeIP,omitempty"`
+    Health  HealthLevel `json:"health"`
+    Message string      `json:"message,omitempty"`
+}
+```
+
+**增强类型**：
 
 ```go
 type OperationProgress struct {
-    // 操作类型
-    OperationType OperationType `json:"operationType"`
+    OperationType       OperationType           `json:"operationType"`
+    TargetVersion       string                  `json:"targetVersion,omitempty"`
+    StartedAt           *metav1.Time            `json:"startedAt,omitempty"`
+    FinishedAt          *metav1.Time            `json:"finishedAt,omitempty"`
     
-    // 目标版本
-    TargetVersion string `json:"targetVersion,omitempty"`
+    // 新增字段
+    CurrentStage        string                  `json:"currentStage,omitempty"`
+    TotalComponents     int                     `json:"totalComponents,omitempty"`
+    CompletedComponents int                     `json:"completedComponents,omitempty"`
+    FailedComponents    []string                `json:"failedComponents,omitempty"`
     
-    // 开始时间
-    StartedAt *metav1.Time `json:"startedAt,omitempty"`
-    
-    // 完成时间
-    FinishedAt *metav1.Time `json:"finishedAt,omitempty"`
-    
-    // 是否需要人工介入
-    NeedsManualIntervention bool `json:"needsManualIntervention,omitempty"`
-    
-    // 已完成组件列表
-    Completed []ComponentRecord `json:"completed,omitempty"`
-    
-    // 最后失败记录（包含重试计数器）
-    LastFailure *OperationFailureRecord `json:"lastFailure,omitempty"`
-}
-
-type OperationFailureRecord struct {
-    Name     string      `json:"name"`
-    Version  string      `json:"version,omitempty"`
-    NodeIP   string      `json:"nodeIP,omitempty"` // 节点级组件必填，集群级组件留空
-    FailedAt metav1.Time `json:"failedAt"`
-    Error    string      `json:"error,omitempty"`
-    Attempt  int32       `json:"attempt,omitempty"`
+    // 现有字段
+    Completed           []ComponentRecord       `json:"completed,omitempty"`
+    LastFailure         *OperationFailureRecord `json:"lastFailure,omitempty"`
+    NeedsManualIntervention bool                `json:"needsManualIntervention,omitempty"`
 }
 ```
 
-**Attempt 增加逻辑**
-
-Attempt 在每次执行失败后增加 1，在 `MarkFailure` 方法中实现：
-
-```go
-// MarkFailure 更新失败记录，Attempt 增加
-func (p *OperationProgress) MarkFailure(name, version, nodeIP, errMsg string, now metav1.Time) {
-    var attempt int32 = 1
-    
-    // 如果是同一个组件在同一节点连续失败，Attempt 增加
-    if p.LastFailure != nil && p.LastFailure.Name == name && p.LastFailure.NodeIP == nodeIP {
-        attempt = p.LastFailure.Attempt + 1
-    }
-    
-    p.LastFailure = &OperationFailureRecord{
-        Name:     name,
-        Version:  version,
-        NodeIP:   nodeIP,
-        FailedAt: now,
-        Error:    errMsg,
-        Attempt:  attempt,
-    }
-}
-```
-
-**Attempt 增加的场景**
-
-| 场景 | Attempt 值 | 说明 |
-|------|-----------|------|
-| 首次执行失败 | 1 | 第一次失败 |
-| 第一次自动重试失败 | 2 | 第二次失败 |
-| 第二次自动重试失败 | 3 | 第三次失败（达到最大重试次数） |
-| 达到最大重试次数 | 3 | 停止自动重试，等待人工介入 |
-| 人工介入后重试失败 | 1 | 重置计数器 |
-
-**自动重试处理逻辑**
-
-```go
-const maxAutoRetries = 3
-
-func (r *Reconciler) executeDAGWithRetry(ctx context.Context, cluster *bkev1beta1.BKECluster) (ctrl.Result, error) {
-    // 执行 DAG
-    result, err := r.executeDAG(ctx, cluster)
-    
-    if err != nil {
-        // 更新失败记录
-        cluster.Status.OperationProgress.MarkFailure(
-            componentName, version, nodeIP, err.Error(), metav1.Now())
-        
-        // 检查是否达到最大自动重试次数
-        if cluster.Status.OperationProgress.LastFailure.Attempt >= maxAutoRetries {
-            // 达到最大重试次数，设置人工介入标志
-            cluster.Status.OperationProgress.NeedsManualIntervention = true
-            r.Status().Update(ctx, cluster)
-            
-            // 停止调谐，等待人工介入（注解触发）
-            return ctrl.Result{}, nil
-        }
-        
-        r.Status().Update(ctx, cluster)
-        
-        // 指数退避
-        attempt := cluster.Status.OperationProgress.LastFailure.Attempt
-        backoff := calculateBackoff(attempt)
-        return ctrl.Result{RequeueAfter: backoff}, nil
-    }
-    
-    // 执行成功
-    cluster.Status.OperationProgress.FinishedAt = &metav1.Time{Time: time.Now()}
-    cluster.Status.Phase = "Running"
-    cluster.Status.OperationProgress.LastFailure = nil
-    
-    return ctrl.Result{}, r.Status().Update(ctx, cluster)
-}
-
-// calculateBackoff 计算指数退避时间
-func calculateBackoff(attempt int32) time.Duration {
-    baseDelay := 5 * time.Second
-    maxDelay := 5 * time.Minute
-    
-    backoff := time.Duration(math.Pow(2, float64(attempt-1))) * baseDelay
-    if backoff > maxDelay {
-        backoff = maxDelay
-    }
-    
-    return backoff
-}
-```
-
-**自动重试状态转换**
-
-```mermaid
-stateDiagram-v2
-    [*] --> Failed: 操作失败
-    Failed --> Failed: 自动重试 (Attempt=1)
-    Failed --> Failed: 自动重试 (Attempt=2)
-    Failed --> Failed: 自动重试 (Attempt=3)
-    Failed --> NeedsManualIntervention: 达到最大重试次数
-    NeedsManualIntervention --> Upgrading: 人工介入
-    Upgrading --> Running: 重试成功
-    Upgrading --> Failed: 重试失败 (Attempt=1)
-```
-
-#### 6.1.2 重试触发条件
-
-| 场景 | 触发条件 | 重试策略 |
-|------|---------|---------|
-| 组件安装失败 | `ComponentLifecycle = Failed` | 指数退避，最多 3 次 |
-| 节点升级失败 | `BKENodeLifecycle = Failed` | 固定间隔 5 分钟，最多 5 次 |
-| 集群操作失败 | `OperationProgress.LastFailure != nil` | 指数退避，最多 3 次 |
-
-### 6.2 幂等性保证
-
-```go
-func (r *Reconciler) isIdempotent(ctx context.Context, cluster *confv1beta1.BKECluster) bool {
-    // 检查组件是否已完成
-    if cluster.Status.OperationProgress != nil {
-        for _, component := range cluster.Status.OperationProgress.Completed {
-            if component.Name == componentName && component.Version == version {
-                // 已完成，跳过
-                return true
-            }
-        }
-    }
-    
-    // 检查节点组件状态
-    if cluster.Status.NodeComponentStatuses != nil {
-        if compStatuses, ok := cluster.Status.NodeComponentStatuses[componentName]; ok {
-            if status, ok := compStatuses[nodeIP]; ok {
-                if status.Phase == "Installed" && status.Version == version {
-                    // 已安装到目标版本，跳过
-                    return true
-                }
-            }
-        }
-    }
-    
-    return false
-}
-```
-
-### 6.3 人工介入
-
-#### 6.3.1 介入前诊断
-
-**需要查看的字段**：
-
-| 字段 | 作用 | 诊断方法 |
-|------|------|---------|
-| `BKECluster.Status.Phase` | 集群当前阶段 | 判断集群是否处于 Failed 状态 |
-| `BKECluster.Status.OperationProgress` | 操作进度和错误信息 | 查看 LastFailure |
-| `BKECluster.Status.NodeComponentStatuses` | 节点级组件状态 | 判断哪些组件安装失败 |
-| `BKECluster.Status.ComponentStatuses` | 集群级组件状态 | 判断哪些组件安装失败 |
-| `BKENode.Status.State` | 节点状态 | 判断哪些节点处于 Failed 状态 |
-| `ComponentVersion.Status.Phase` | 组件状态 | 判断组件是否处于 Failed 状态 |
-
-**诊断流程**：
-
-1. **查看集群状态**：
-   - 检查 `BKECluster.Status.Phase` 是否为 `Failed`
-   - 检查 `BKECluster.Status.OperationProgress.LastFailure.Error` 获取错误信息
-
-2. **查看节点状态**：
-   - 检查 `BKECluster.Status.NodeComponentStatuses` 判断哪些节点失败
-   - 检查 `BKENode.Status.State` 判断节点状态
-
-3. **查看组件状态**：
-   - 检查 `BKECluster.Status.ComponentStatuses` 判断哪些组件失败
-   - 检查 `ComponentVersion.Status.Phase` 判断组件状态
-
-4. **判断介入策略**：
-   - 如果是临时错误（网络超时等），清除 OperationProgress 后重试
-   - 如果是配置错误，修复配置后重试
-   - 如果是资源不足，增加资源后重试
-
-#### 6.3.2 介入方式
-
-**方式 1: 清除错误状态，触发重试**
-
-```yaml
-apiVersion: bke.bocloud.com/v1beta1
-kind: BKECluster
-metadata:
-  name: my-cluster
-status:
-  operationProgress:
-    operationType: Upgrade
-    targetVersion: v2.6.0
-    lastError: ""  # 清除错误
-    lastFailure: null  # 清除失败记录
-```
-
-**方式 2: 通过注解触发立即重试**
-
-```yaml
-apiVersion: bke.bocloud.com/v1beta1
-kind: BKECluster
-metadata:
-  name: my-cluster
-  annotations:
-    bke.bocloud.com/retry-upgrade: "true"
-```
-
-#### 6.3.3 调谐器处理逻辑
-
-**完整 Reconcile 流程**
-
-```go
-func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-    cluster := &bkev1beta1.BKECluster{}
-    if err := r.Get(ctx, req.NamespacedName, cluster); err != nil {
-        return ctrl.Result{}, err
-    }
-    
-    // 1. 检查是否是人工介入触发的重试（通过注解）
-    if r.isManualInterventionRetry(cluster) {
-        // 清除注解
-        delete(cluster.Annotations, "bke.bocloud.com/retry-upgrade")
-        if err := r.Update(ctx, cluster); err != nil {
-            return ctrl.Result{}, err
-        }
-        
-        // 立即执行重试
-        return r.handleManualIntervention(ctx, cluster)
-    }
-    
-    // 2. 检查是否需要人工介入（达到最大自动重试次数）
-    if r.needsManualIntervention(cluster) {
-        // 设置标志位（仅首次）
-        if !cluster.Status.OperationProgress.NeedsManualIntervention {
-            cluster.Status.OperationProgress.NeedsManualIntervention = true
-            r.Status().Update(ctx, cluster)
-        }
-        
-        // 停止调谐，等待人工介入（注解触发）
-        return ctrl.Result{}, nil
-    }
-    
-    // 3. 正常执行或自动重试
-    return r.executeDAGWithRetry(ctx, cluster)
-}
-
-func (r *Reconciler) isManualInterventionRetry(cluster *bkev1beta1.BKECluster) bool {
-    // 检查是否有重试注解
-    if annotations.Has(cluster, "bke.bocloud.com/retry-upgrade") {
-        return true
-    }
-    
-    return false
-}
-
-func (r *Reconciler) needsManualIntervention(cluster *bkev1beta1.BKECluster) bool {
-    // 检查是否达到最大自动重试次数
-    if cluster.Status.OperationProgress != nil &&
-       cluster.Status.OperationProgress.LastFailure != nil &&
-       cluster.Status.OperationProgress.LastFailure.Attempt >= maxAutoRetries {
-        return true
-    }
-    
-    return false
-}
-```
-
-**人工介入处理逻辑**
-
-```go
-func (r *Reconciler) handleManualIntervention(ctx context.Context, cluster *bkev1beta1.BKECluster) (ctrl.Result, error) {
-    // 1. 状态验证
-    if err := r.validateRetryState(cluster); err != nil {
-        return ctrl.Result{}, err
-    }
-    
-    // 2. 依赖检查
-    if err := r.validateDependencies(ctx, cluster); err != nil {
-        return ctrl.Result{}, err
-    }
-    
-    // 3. 状态恢复
-    if err := r.restoreState(ctx, cluster); err != nil {
-        return ctrl.Result{}, err
-    }
-    
-    // 4. 重试决策
-    strategy := r.decideRetryStrategy(cluster)
-    
-    // 5. 执行重试
-    var result ctrl.Result
-    var err error
-    
-    switch strategy {
-    case RetryStrategyFull:
-        // 从头开始
-        result, err = r.executeDAG(ctx, cluster)
-    
-    case RetryStrategyFromFailure:
-        // 从失败点继续
-        result, err = r.resumeDAG(ctx, cluster)
-    }
-    
-    // 6. 结果处理
-    if err != nil {
-        // 重试失败，重置 Attempt 计数器
-        cluster.Status.OperationProgress.MarkFailure(
-            componentName, version, nodeIP, err.Error(), metav1.Now())
-        r.Status().Update(ctx, cluster)
-        
-        return ctrl.Result{}, nil
-    }
-    
-    // 重试成功
-    cluster.Status.OperationProgress.FinishedAt = &metav1.Time{Time: time.Now()}
-    cluster.Status.Phase = "Running"
-    cluster.Status.OperationProgress.LastFailure = nil
-    cluster.Status.OperationProgress.NeedsManualIntervention = false
-    
-    return ctrl.Result{}, r.Status().Update(ctx, cluster)
-}
-```
-
-#### 6.3.4 resumeDAG 实现
-
-**从失败点继续执行**
-
-```go
-func (r *Reconciler) resumeDAG(
-    ctx context.Context,
-    cluster *bkev1beta1.BKECluster,
-) (ctrl.Result, error) {
-    // 1. 获取 DAG 定义
-    dag, err := r.getDAG(ctx, cluster)
-    if err != nil {
-        return ctrl.Result{}, err
-    }
-    
-    // 2. 构建已完成组件集合（使用 "name:nodeIP" 作为 key）
-    completed := make(map[string]bool)
-    for _, record := range cluster.Status.OperationProgress.Completed {
-        key := fmt.Sprintf("%s:%s", record.Name, record.NodeIP)
-        completed[key] = true
-    }
-    
-    // 3. 构建执行计划（跳过已完成组件，从失败点继续）
-    executionPlan := r.buildExecutionPlan(dag, completed)
-    
-    // 4. 执行 DAG
-    return r.executeExecutionPlan(ctx, cluster, executionPlan)
-}
-
-func (r *Reconciler) buildExecutionPlan(
-    dag *topology.UpgradeDAG,
-    completed map[string]bool,
-) []topology.ComponentNode {
-    var executionPlan []topology.ComponentNode
-    
-    // 遍历 DAG 的所有节点
-    for _, node := range dag.Nodes {
-        nodeKey := fmt.Sprintf("%s:%s", node.Name, node.NodeIP)
-        
-        // 跳过已完成的组件
-        if completed[nodeKey] {
-            continue
-        }
-        
-        // 检查依赖是否满足
-        if r.checkDependencies(node, completed) {
-            executionPlan = append(executionPlan, node)
-        }
-    }
-    
-    return executionPlan
-}
-
-func (r *Reconciler) checkDependencies(
-    node topology.ComponentNode,
-    completed map[string]bool,
-) bool {
-    for _, dep := range node.Dependencies {
-        if !completed[dep] {
-            return false
-        }
-    }
-    return true
-}
-
-func (r *Reconciler) executeExecutionPlan(
-    ctx context.Context,
-    cluster *bkev1beta1.BKECluster,
-    executionPlan []topology.ComponentNode,
-) (ctrl.Result, error) {
-    // 创建 DAG 调度器
-    scheduler := dagexec.NewScheduler(dagexec.Config{
-        Client: r.Client,
-        // ... 其他配置
-    })
-    
-    // 执行 DAG
-    for _, node := range executionPlan {
-        result, err := scheduler.ExecuteComponent(ctx, &node, cluster)
-        if err != nil {
-            return result, err
-        }
-        
-        // 更新完成状态
-        cluster.Status.OperationProgress.MarkCompleted(
-            node.Name, node.Version, node.NodeIP, metav1.Now())
-        
-        if err := r.Status().Update(ctx, cluster); err != nil {
-            return ctrl.Result{}, err
-        }
-    }
-    
-    return ctrl.Result{}, nil
-}
-```
-
-#### 6.3.5 介入后重试流程
-
-```mermaid
-stateDiagram-v2
-    [*] --> Failed: 达到最大重试次数
-    Failed --> NeedsManualIntervention: 设置标志位
-    NeedsManualIntervention --> Upgrading: 用户介入 (注解)
-    Upgrading --> Running: 重试成功
-    Upgrading --> Failed: 重试失败 (Attempt=1)
-```
-
-#### 6.3.6 立即触发重试机制
-
-**为什么注解可以绕过 RequeueAfter？**
-
-controller-runtime 的队列机制：
-
-1. **RequeueAfter**：在指定时间后将请求加入队列
-2. **Watch 事件**：立即将请求加入队列（优先级更高）
-
-当用户修改注解时：
-- 触发 Watch 事件
-- controller-runtime 立即将请求加入队列
-- 不受之前 RequeueAfter 的限制
-
-**立即触发重试的完整流程**
-
-```mermaid
-stateDiagram-v2
-    [*] --> Failed: 达到最大重试次数
-    Failed --> NeedsManualIntervention: Attempt=3
-    NeedsManualIntervention --> RequeueAfter: 返回 RequeueAfter (5分钟)
-    RequeueAfter --> NeedsManualIntervention: 等待人工介入
-    NeedsManualIntervention --> WatchEvent: 用户设置注解
-    WatchEvent --> Upgrading: 立即执行重试
-    Upgrading --> Running: 重试成功
-    Upgrading --> Failed: 重试失败 (Attempt=1)
-```
-
-**使用示例**
-
-```bash
-# 1. 查看集群状态
-kubectl get bkecluster my-cluster -o yaml
-
-# 2. 查看失败信息
-kubectl get bkecluster my-cluster -o jsonpath='{.status.operationProgress.lastError}'
-
-# 3. 修复问题
-# ... 修复配置错误 / 增加资源 / 其他修复操作 ...
-
-# 4. 触发立即重试
-kubectl annotate bkecluster my-cluster bke.bocloud.com/retry-upgrade=true
-
-# 5. 查看重试结果
-kubectl get bkecluster my-cluster -w
-```
-
----
-
-## 自动重试与人工介入对比
-
-| 维度 | 自动重试 | 人工介入重试 |
-|------|---------|-------------|
-| **触发条件** | 调谐器返回 RequeueAfter | 用户设置注解 |
-| **触发时机** | 立即触发（指数退避） | 用户手动触发 |
-| **重试次数** | 有限次数（3 次） | 无限次数（每次都需要用户介入） |
-| **状态转换** | 保持 Failed 状态 | 从 Failed 恢复到操作前状态 |
-| **执行策略** | 从失败点继续 | 可以重新选择执行策略 |
-| **适用场景** | 临时错误（网络超时等） | 配置错误、资源不足等需要人工修复的场景 |
-| **Attempt 计数器** | 每次失败增加 1 | 重置为 1 |
-
----
-
-## 完整状态转换图
-
-```mermaid
-stateDiagram-v2
-    [*] --> Running
-    Running --> Upgrading: 触发操作
-    Upgrading --> Running: 成功
-    Upgrading --> Failed: 失败 (Attempt=1)
-    Failed --> Failed: 自动重试 (Attempt=2)
-    Failed --> Failed: 自动重试 (Attempt=3)
-    Failed --> NeedsManualIntervention: 达到最大重试次数
-    NeedsManualIntervention --> Upgrading: 人工介入
-    Upgrading --> Running: 重试成功
-    Upgrading --> Failed: 重试失败 (Attempt=1)
-```
-
----
-
-## 附录：状态转换矩阵
-
-### A.1 集群层状态转换矩阵
-
-| 当前状态 | 事件 | 新状态 | 触发者 |
-|---------|------|--------|--------|
-| (初始) | 创建 BKECluster | `Creating` | Reconciler |
-| `Creating` | 所有节点 Ready + 所有集群级组件 Installed | `Running` | Reconciler |
-| `Creating` | 失败 | `Failed` | Reconciler |
-| `Running` | 触发升级 | `Upgrading` | Reconciler |
-| `Running` | 触发扩容/缩容 | `Scaling` | Reconciler |
-| `Upgrading` | 升级完成 | `Running` | Reconciler |
-| `Upgrading` | 升级失败 | `RollingBack` | Reconciler |
-| `Upgrading` | 失败 | `Failed` | Reconciler |
-| `Scaling` | 扩容/缩容完成 | `Running` | Reconciler |
-| `Scaling` | 失败 | `Failed` | Reconciler |
-| `RollingBack` | 回滚完成 | `Running` | Reconciler |
-| `RollingBack` | 失败 | `Failed` | Reconciler |
-| `Failed` | 重试 | `Creating/Running/Upgrading` | 人工介入 |
-
-### A.2 节点层状态转换矩阵
-
-| 当前状态 | 事件 | 新状态 | 触发者 |
-|---------|------|--------|--------|
-| (初始) | 节点加入 | `Pending` | Reconciler |
-| `Pending` | Agent 推送完成 + 环境初始化完成 | `Provisioned` | Reconciler |
-| `Pending` | 失败 | `Failed` | Reconciler |
-| `Provisioned` | 所有节点级组件 Installed | `Ready` | Reconciler |
-| `Provisioned` | 失败 | `Failed` | Reconciler |
-| `Ready` | 触发升级 | `Upgrading` | Reconciler |
-| `Ready` | 触发删除 | `Deleting` | Reconciler |
-| `Upgrading` | 升级完成 | `Ready` | Reconciler |
-| `Upgrading` | 升级失败 | `RollingBack` | Reconciler |
-| `Upgrading` | 失败 | `Failed` | Reconciler |
-| `RollingBack` | 回滚完成 | `Ready` | Reconciler |
-| `RollingBack` | 失败 | `Failed` | Reconciler |
-| `Deleting` | 删除完成 | `Removed` | Reconciler |
-| `Deleting` | 失败 | `Failed` | Reconciler |
-| `Failed` | 重试 | `Pending/Provisioned/Ready` | 人工介入 |
-
-### A.3 组件层状态转换矩阵
-
-| 当前状态 | 事件 | 新状态 | 触发者 |
-|---------|------|--------|--------|
-| `Pending` | 开始安装 | `Installing` | Executor |
-| `Pending` | 失败 | `Failed` | Executor |
-| `Installing` | 安装成功 | `Installed` | Executor |
-| `Installing` | 失败 | `Failed` | Executor |
-| `Installed` | 触发升级 | `Upgrading` | Executor |
-| `Installed` | 触发卸载 | `Uninstalling` | Executor |
-| `Upgrading` | 升级成功 | `Installed` | Executor |
-| `Upgrading` | 升级失败 | `RollingBack` | Executor |
-| `Upgrading` | 失败 | `Failed` | Executor |
-| `RollingBack` | 回滚成功 | `Installed` | Executor |
-| `RollingBack` | 失败 | `Failed` | Executor |
-| `Uninstalling` | 卸载成功 | `Removed` | Executor |
-| `Uninstalling` | 失败 | `Failed` | Executor |
-| `Failed` | 重试 | `Installing/Upgrading/Uninstalling` | Reconciler |
-
----
-
-## 7. 详细设计
-
-### 7.1 兼容性分析
-
-#### 7.1.1 现有状态字段与 v3 生命周期的映射
-
-当前代码中存在多个重叠的状态追踪机制，v3 设计必须与它们共存并逐步替代。以下是现有字段与 v3 生命周期的映射关系：
-
-**集群层映射**：
-
-| 现有字段 | 现有值示例 | v3 生命周期状态 | 映射策略 |
-|---------|-----------|---------------|---------|
-| `BKEClusterPhase` | `InitControlPlane`, `JoinControlPlane`, `JoinWorker` | `Creating` | 多对一聚合 |
-| `BKEClusterPhase` | `UpgradeControlPlane`, `UpgradeWorker`, `UpgradeEtcd` | `Upgrading` | 多对一聚合 |
-| `BKEClusterPhase` | `Scale` | `Scaling` | 直接映射 |
-| `BKEClusterPhase` | `FailedBootstrapNode` | `Failed` | 直接映射 |
-| `ClusterStatus` | `Initializing`, `ClusterReady` | 由 `Phase` + 健康状态推导 | 废弃，保留只读兼容 |
-| `ClusterStatus` | `Upgrading`, `UpgradeFailed` | `Upgrading` / `Failed` | 废弃，保留只读兼容 |
-| `ClusterStatus` | `ScalingMasterNodesUp/Down`, `ScalingWorkerNodesUp/Down` | `Scaling` | 废弃，保留只读兼容 |
-| `ClusterStatus` | `Deleting`, `DeleteFailed` | `Scaling` (缩容) / `Failed` | 废弃，保留只读兼容 |
-| `ClusterHealthState` | `Deploying`, `Upgrading`, `Managing`, `Healthy` | 保留，作为 `Phase` 的衍生健康评估 | 保留并增强 |
-
-**节点层映射**：
-
-| 现有字段 | 现有值示例 | v3 生命周期状态 | 映射策略 |
-|---------|-----------|---------------|---------|
-| `NodeState` | `NotReady` | `Pending` | 重新映射 |
-| `NodeState` | `Initializing`, `BootStrapping` | `Pending` → `Provisioned` | 合并到 Provisioned |
-| `NodeState` | `Ready` | `Ready` | 直接保留 |
-| `NodeState` | `Upgrading`, `UpgradeFailed` | `Upgrading` / `Failed` | 保留 Upgrading，新增 RollingBack |
-| `NodeState` | `Deleting`, `DeleteFailed` | `Deleting` / `Failed` | 保留 Deleting |
-| `NodeState` | `Managing`, `ManageFailed` | `Ready` / `Failed` | 合并 |
-| `StateCode` (位标记) | 各 Flag | 保留作为底层实现细节 | 不暴露到生命周期层 |
-
-**组件层映射**：
-
-| 现有字段 | 现有值示例 | v3 生命周期状态 | 映射策略 |
-|---------|-----------|---------------|---------|
-| `ComponentVersion.Status.Phase` | `""` (空) | `Pending` | 默认值映射 |
-| `DeclarativeUpgradeStatus` | `Completed[]`, `LastFailure` | 组件级状态追踪 | 扩展为通用组件状态 |
-| `NodeComponentStatuses` (PhaseFlow 内部) | `Installing`, `Installed` | `Installing` → `Installed` | 提升为正式 API |
-
-#### 7.1.2 兼容性原则
-
-1. **新增不修改**：新增 `LifecyclePhase` 类型，不修改现有 `BKEClusterPhase`、`ClusterStatus`、`NodeState` 的枚举值
-2. **双写过渡**：在过渡期同时写入旧字段和新字段，读取时优先使用新字段
-3. **旧字段只读**：旧字段在过渡期后标记为 `deprecated`，仅保留写入逻辑供外部消费者读取
-4. **Feature Gate 控制**：通过 Feature Gate 控制是否启用新状态机，默认关闭
-
-### 7.2 API 类型扩展设计
-
-#### 7.2.1 新增生命周期类型
-
-**文件**：`api/bkecommon/v1beta1/lifecycle_types.go`
-
-```go
-package v1beta1
-
-// LifecyclePhase 表示资源的生命周期阶段（v3 状态机）
-type LifecyclePhase string
-
-// 集群生命周期阶段
-const (
-    LifecyclePhaseCreating    LifecyclePhase = "Creating"
-    LifecyclePhaseRunning     LifecyclePhase = "Running"
-    LifecyclePhaseUpgrading   LifecyclePhase = "Upgrading"
-    LifecyclePhaseScaling     LifecyclePhase = "Scaling"
-    LifecyclePhaseRollingBack LifecyclePhase = "RollingBack"
-    LifecyclePhaseFailed      LifecyclePhase = "Failed"
-)
-
-// 节点生命周期阶段
-const (
-    LifecyclePhasePending      LifecyclePhase = "Pending"
-    LifecyclePhaseProvisioned  LifecyclePhase = "Provisioned"
-    LifecyclePhaseReady        LifecyclePhase = "Ready"
-    LifecyclePhaseUpgrading    LifecyclePhase = "Upgrading"
-    LifecyclePhaseRollingBack  LifecyclePhase = "RollingBack"
-    LifecyclePhaseDeleting     LifecyclePhase = "Deleting"
-    LifecyclePhaseRemoved      LifecyclePhase = "Removed"
-    LifecyclePhaseFailed       LifecyclePhase = "Failed"
-)
-
-// 组件生命周期阶段
-const (
-    LifecyclePhasePending      LifecyclePhase = "Pending"
-    LifecyclePhaseInstalling   LifecyclePhase = "Installing"
-    LifecyclePhaseInstalled    LifecyclePhase = "Installed"
-    LifecyclePhaseUpgrading    LifecyclePhase = "Upgrading"
-    LifecyclePhaseRollingBack  LifecyclePhase = "RollingBack"
-    LifecyclePhaseUninstalling LifecyclePhase = "Uninstalling"
-    LifecyclePhaseRemoved      LifecyclePhase = "Removed"
-    LifecyclePhaseFailed       LifecyclePhase = "Failed"
-)
-```
-
-> **注意**：由于 Go 不允许在不同 `const` 块中重复使用相同的 `const` 名称，实际实现中需要使用带前缀的常量名，例如 `ClusterLifecycleCreating`、`NodeLifecyclePending`、`ComponentLifecyclePending`，或者使用不同的类型名来区分。推荐使用带层级前缀的方式：
-
-```go
-// 集群生命周期
-const (
-    ClusterLifecycleCreating    LifecyclePhase = "Creating"
-    ClusterLifecycleRunning     LifecyclePhase = "Running"
-    ClusterLifecycleUpgrading   LifecyclePhase = "Upgrading"
-    ClusterLifecycleScaling     LifecyclePhase = "Scaling"
-    ClusterLifecycleRollingBack LifecyclePhase = "RollingBack"
-    ClusterLifecycleFailed      LifecyclePhase = "Failed"
-)
-
-// 节点生命周期
-const (
-    NodeLifecyclePending      LifecyclePhase = "Pending"
-    NodeLifecycleProvisioned  LifecyclePhase = "Provisioned"
-    NodeLifecycleReady        LifecyclePhase = "Ready"
-    NodeLifecycleUpgrading    LifecyclePhase = "Upgrading"
-    NodeLifecycleRollingBack  LifecyclePhase = "RollingBack"
-    NodeLifecycleDeleting     LifecyclePhase = "Deleting"
-    NodeLifecycleRemoved      LifecyclePhase = "Removed"
-    NodeLifecycleFailed       LifecyclePhase = "Failed"
-)
-
-// 组件生命周期
-const (
-    ComponentLifecyclePending      LifecyclePhase = "Pending"
-    ComponentLifecycleInstalling   LifecyclePhase = "Installing"
-    ComponentLifecycleInstalled    LifecyclePhase = "Installed"
-    ComponentLifecycleUpgrading    LifecyclePhase = "Upgrading"
-    ComponentLifecycleRollingBack  LifecyclePhase = "RollingBack"
-    ComponentLifecycleUninstalling LifecyclePhase = "Uninstalling"
-    ComponentLifecycleRemoved      LifecyclePhase = "Removed"
-    ComponentLifecycleFailed       LifecyclePhase = "Failed"
-)
-```
-
-#### 7.2.2 BKEClusterStatus 扩展
-
-**文件**：`api/bkecommon/v1beta1/bkecluster_status.go`
-
-在现有 `BKEClusterStatus` 中新增字段，不修改现有字段：
+**修改类型**：
 
 ```go
 type BKEClusterStatus struct {
-    // === 现有字段（保留，过渡期双写） ===
-    Ready              bool                  `json:"ready"`
-    OpenFuyaoVersion   string                `json:"openFuyaoVersion,omitempty"`
-    KubernetesVersion  string                `json:"kubernetesVersion,omitempty"`
-    EtcdVersion        string                `json:"etcdVersion,omitempty"`
-    ContainerdVersion  string                `json:"containerdVersion,omitempty"`
-    AgentStatus        BKEAgentStatus        `json:"agentStatus"`
-    Phase              BKEClusterPhase       `json:"phase,omitempty"`
-    ClusterStatus      ClusterStatus         `json:"clusterStatus,omitempty"`
-    ClusterHealthState ClusterHealthState    `json:"clusterHealthState,omitempty"`
-    AddonStatus        []Product             `json:"addonStatus,omitempty"`
-    PhaseStatus        PhaseStatus           `json:"phaseStatus,omitempty"`
-    Conditions         ClusterConditions     `json:"conditions,omitempty"`
-    DeclarativeUpgrade *DeclarativeUpgradeStatus `json:"declarativeUpgrade,omitempty"`
-
-    // === v3 新增字段 ===
-
-    // LifecyclePhase 是集群的生命周期阶段（v3 状态机）
-    // +optional
-    LifecyclePhase LifecyclePhase `json:"lifecyclePhase,omitempty"`
-
-    // OperationProgress 追踪当前操作的进度
-    // +optional
-    OperationProgress *OperationProgress `json:"operationProgress,omitempty"`
-
-    // NodeComponentStatuses 记录每个节点上每个组件的状态
-    // key: componentName -> nodeIP -> ComponentLifecycleStatus
-    // +optional
+    // 现有字段
+    Ready              bool                       `json:"ready"`
+    OpenFuyaoVersion   string                     `json:"openFuyaoVersion,omitempty"`
+    KubernetesVersion  string                     `json:"kubernetesVersion,omitempty"`
+    EtcdVersion        string                     `json:"etcdVersion,omitempty"`
+    ContainerdVersion  string                     `json:"containerdVersion,omitempty"`
+    AgentStatus        BKEAgentStatus             `json:"agentStatus"`
+    Phase              BKEClusterPhase            `json:"phase,omitempty"`
+    ClusterStatus      ClusterStatus              `json:"clusterStatus,omitempty"`
+    ClusterHealthState ClusterHealthState         `json:"clusterHealthState,omitempty"`
+    AddonStatus        []Product                  `json:"addonStatus,omitempty"`
+    PhaseStatus        PhaseStatus                `json:"phaseStatus,omitempty"`
+    Conditions         ClusterConditions          `json:"conditions,omitempty"`
+    DeclarativeUpgrade *DeclarativeUpgradeStatus  `json:"declarativeUpgrade,omitempty"`
+    
+    // v3 字段（更新）
+    LifecyclePhase      LifecyclePhase            `json:"lifecyclePhase,omitempty"`
+    HealthStatus        *HealthStatus             `json:"healthStatus,omitempty"` // 新增
+    OperationProgress   *OperationProgress        `json:"operationProgress,omitempty"` // 增强
     NodeComponentStatuses map[string]map[string]ComponentLifecycleStatus `json:"nodeComponentStatuses,omitempty"`
-
-    // ClusterComponentStatuses 记录集群级组件的状态
-    // key: componentName -> ComponentLifecycleStatus
-    // +optional
     ClusterComponentStatuses map[string]ComponentLifecycleStatus `json:"clusterComponentStatuses,omitempty"`
 }
 ```
 
-#### 7.2.3 OperationProgress 类型定义
+### 8.3 状态机引擎设计
 
-**文件**：`api/bkecommon/v1beta1/operation_progress.go`
+（保留原有设计，详见 v3 文档）
 
-```go
-type OperationType string
+### 8.4 健康状态聚合器设计
 
-const (
-    OperationTypeInstall  OperationType = "Install"
-    OperationTypeUpgrade  OperationType = "Upgrade"
-    OperationTypeScale    OperationType = "Scale"
-    OperationTypeRollback OperationType = "Rollback"
-)
-
-type OperationProgress struct {
-    // 操作类型
-    OperationType OperationType `json:"operationType"`
-
-    // 目标版本
-    TargetVersion string `json:"targetVersion,omitempty"`
-
-    // 开始时间
-    StartedAt *metav1.Time `json:"startedAt,omitempty"`
-
-    // 完成时间
-    FinishedAt *metav1.Time `json:"finishedAt,omitempty"`
-
-    // 是否需要人工介入
-    NeedsManualIntervention bool `json:"needsManualIntervention,omitempty"`
-
-    // 已完成组件列表
-    Completed []ComponentRecord `json:"completed,omitempty"`
-
-    // 最后失败记录（包含重试计数器）
-    LastFailure *OperationFailureRecord `json:"lastFailure,omitempty"`
-}
-
-type ComponentRecord struct {
-    Name        string      `json:"name"`
-    Version     string      `json:"version,omitempty"`
-    NodeIP      string      `json:"nodeIP,omitempty"` // 节点级组件必填，集群级组件留空
-    CompletedAt metav1.Time `json:"completedAt"`
-}
-```
-
-#### 7.2.4 ComponentLifecycleStatus 类型定义
-
-**文件**：`api/bkecommon/v1beta1/component_lifecycle.go`
-
-```go
-type ComponentLifecycleStatus struct {
-    // 组件名称
-    Name string `json:"name"`
-
-    // 节点 IP（节点级组件必填，集群级组件留空）
-    NodeIP string `json:"nodeIP,omitempty"`
-
-    // 组件类型（node/cluster）
-    ComponentType ComponentType `json:"componentType"`
-
-    // 生命周期阶段
-    Phase LifecyclePhase `json:"phase"`
-
-    // 当前版本
-    CurrentVersion string `json:"currentVersion,omitempty"`
-
-    // 目标版本
-    TargetVersion string `json:"targetVersion,omitempty"`
-
-    // 最后更新时间
-    LastTransitionTime *metav1.Time `json:"lastTransitionTime,omitempty"`
-
-    // 错误信息
-    Message string `json:"message,omitempty"`
-}
-
-type ComponentType string
-
-const (
-    ComponentTypeNode    ComponentType = "node"
-    ComponentTypeCluster ComponentType = "cluster"
-)
-```
-
-#### 7.2.5 BKENodeStatus 扩展
-
-**文件**：`api/bkecommon/v1beta1/bkenode_types.go`
-
-在现有 `BKENodeStatus` 中新增字段：
-
-```go
-type BKENodeStatus struct {
-    // === 现有字段（保留） ===
-    State     NodeState `json:"state,omitempty"`
-    StateCode int       `json:"stateCode,omitempty"`
-    Message   string    `json:"message,omitempty"`
-    NeedSkip  bool      `json:"needSkip,omitempty"`
-
-    // === v3 新增字段 ===
-
-    // LifecyclePhase 是节点的生命周期阶段（v3 状态机）
-    // +optional
-    LifecyclePhase LifecyclePhase `json:"lifecyclePhase,omitempty"`
-}
-```
-
-### 7.3 状态机引擎设计
-
-#### 7.3.1 包结构
-
-```
-pkg/statemachine/
-├── engine.go              # 状态机引擎核心
-├── cluster_machine.go     # 集群层状态机
-├── node_machine.go        # 节点层状态机
-├── component_machine.go   # 组件层状态机
-├── aggregator.go          # 状态聚合器
-├── transition.go          # 状态转换规则
-├── compatibility.go       # 兼容性映射（旧字段 ↔ 新字段）
-└── types.go               # 内部类型定义
-```
-
-#### 7.3.2 状态机引擎核心
-
-**文件**：`pkg/statemachine/engine.go`
+**文件**：`pkg/statemachine/health_aggregator.go`
 
 ```go
 package statemachine
 
-// TransitionRule 定义一条状态转换规则
-type TransitionRule struct {
-    // 源状态
-    From LifecyclePhase
-    // 目标状态
-    To LifecyclePhase
-    // 触发条件
-    Condition func(ctx *TransitionContext) bool
-    // 转换动作（可选）
-    Action func(ctx *TransitionContext) error
-}
-
-// TransitionContext 提供状态转换所需的上下文
-type TransitionContext struct {
-    // 集群对象
-    Cluster *confv1beta1.BKECluster
-    // 节点列表
-    Nodes []confv1beta1.BKENode
-    // 节点组件状态
-    NodeComponentStatuses map[string]map[string]confv1beta1.ComponentLifecycleStatus
-    // 集群组件状态
-    ClusterComponentStatuses map[string]confv1beta1.ComponentLifecycleStatus
-}
-
-// StateMachine 通用状态机接口
-type StateMachine interface {
-    // CurrentPhase 返回当前生命周期阶段
-    CurrentPhase() LifecyclePhase
-    // Evaluate 评估是否需要进行状态转换，返回目标状态
-    Evaluate(ctx *TransitionContext) (LifecyclePhase, bool)
-    // Transition 执行状态转换
-    Transition(ctx *TransitionContext, target LifecyclePhase) error
-}
-```
-
-#### 7.3.3 集群层状态机实现
-
-**文件**：`pkg/statemachine/cluster_machine.go`
-
-```go
-package statemachine
-
-type ClusterLifecycleMachine struct {
-    currentPhase LifecyclePhase
-    rules        []TransitionRule
-}
-
-func NewClusterLifecycleMachine() *ClusterLifecycleMachine {
-    m := &ClusterLifecycleMachine{
-        currentPhase: ClusterLifecycleCreating,
-    }
-    m.rules = m.buildRules()
-    return m
-}
-
-func (m *ClusterLifecycleMachine) buildRules() []TransitionRule {
-    return []TransitionRule{
-        // Creating → Running: 所有节点 Ready + 所有集群级组件 Installed
-        {
-            From: ClusterLifecycleCreating,
-            To:   ClusterLifecycleRunning,
-            Condition: func(ctx *TransitionContext) bool {
-                return allNodesReady(ctx.Nodes) &&
-                    allClusterComponentsInstalled(ctx.ClusterComponentStatuses)
-            },
-        },
-        // Running → Upgrading: 用户触发版本升级
-        {
-            From: ClusterLifecycleRunning,
-            To:   ClusterLifecycleUpgrading,
-            Condition: func(ctx *TransitionContext) bool {
-                return ctx.Cluster.Status.DeclarativeUpgrade != nil &&
-                    ctx.Cluster.Status.DeclarativeUpgrade.TargetVersion != "" &&
-                    ctx.Cluster.Status.DeclarativeUpgrade.FinishedAt == nil
-            },
-        },
-        // Upgrading → Running: 升级完成
-        {
-            From: ClusterLifecycleUpgrading,
-            To:   ClusterLifecycleRunning,
-            Condition: func(ctx *TransitionContext) bool {
-                return allNodesReady(ctx.Nodes) &&
-                    allClusterComponentsInstalled(ctx.ClusterComponentStatuses) &&
-                    ctx.Cluster.Status.DeclarativeUpgrade != nil &&
-                    ctx.Cluster.Status.DeclarativeUpgrade.FinishedAt != nil
-            },
-        },
-        // Upgrading → RollingBack: 升级失败
-        {
-            From: ClusterLifecycleUpgrading,
-            To:   ClusterLifecycleRollingBack,
-            Condition: func(ctx *TransitionContext) bool {
-                return ctx.Cluster.Status.DeclarativeUpgrade != nil &&
-                    ctx.Cluster.Status.DeclarativeUpgrade.LastFailure != nil &&
-                    ctx.Cluster.Status.DeclarativeUpgrade.LastFailure.Attempt >= maxAutoRetries
-            },
-        },
-        // RollingBack → Running: 回滚完成
-        {
-            From: ClusterLifecycleRollingBack,
-            To:   ClusterLifecycleRunning,
-            Condition: func(ctx *TransitionContext) bool {
-                return allNodesReady(ctx.Nodes) &&
-                    allClusterComponentsInstalled(ctx.ClusterComponentStatuses)
-            },
-        },
-        // Running → Scaling: 触发扩容或缩容
-        {
-            From: ClusterLifecycleRunning,
-            To:   ClusterLifecycleScaling,
-            Condition: func(ctx *TransitionContext) bool {
-                return anyNodePending(ctx.Nodes) || anyNodeDeleting(ctx.Nodes)
-            },
-        },
-        // Scaling → Running: 扩容或缩容完成
-        {
-            From: ClusterLifecycleScaling,
-            To:   ClusterLifecycleRunning,
-            Condition: func(ctx *TransitionContext) bool {
-                return allNodesReady(ctx.Nodes) &&
-                    !anyNodePending(ctx.Nodes) &&
-                    !anyNodeDeleting(ctx.Nodes)
-            },
-        },
-        // 任意状态 → Failed: 关键失败
-        {
-            From: "", // 匹配任意状态
-            To:   ClusterLifecycleFailed,
-            Condition: func(ctx *TransitionContext) bool {
-                return anyCriticalComponentFailed(ctx)
-            },
-        },
-    }
-}
-
-func (m *ClusterLifecycleMachine) CurrentPhase() LifecyclePhase {
-    return m.currentPhase
-}
-
-func (m *ClusterLifecycleMachine) Evaluate(ctx *TransitionContext) (LifecyclePhase, bool) {
-    for _, rule := range m.rules {
-        if rule.From != "" && rule.From != m.currentPhase {
-            continue
-        }
-        if rule.Condition(ctx) {
-            return rule.To, true
-        }
-    }
-    return m.currentPhase, false
-}
-
-func (m *ClusterLifecycleMachine) defaultActions() map[LifecyclePhase]func(ctx *TransitionContext) error {
-    return map[LifecyclePhase]func(ctx *TransitionContext) error{
-        ClusterLifecycleRunning: func(ctx *TransitionContext) error {
-            now := metav1.Now()
-            if ctx.Cluster.Status.OperationProgress != nil {
-                ctx.Cluster.Status.OperationProgress.FinishedAt = &now
-                ctx.Cluster.Status.OperationProgress.LastFailure = nil
-                ctx.Cluster.Status.OperationProgress.NeedsManualIntervention = false
-            }
-            ctx.Cluster.Status.Ready = true
-            return nil
-        },
-        ClusterLifecycleUpgrading: func(ctx *TransitionContext) error {
-            now := metav1.Now()
-            targetVersion := ""
-            if ctx.Cluster.Status.DeclarativeUpgrade != nil {
-                targetVersion = ctx.Cluster.Status.DeclarativeUpgrade.TargetVersion
-            }
-            ctx.Cluster.Status.OperationProgress = &OperationProgress{
-                OperationType: OperationTypeUpgrade,
-                TargetVersion: targetVersion,
-                StartedAt:     &now,
-            }
-            ctx.Cluster.Status.Ready = false
-            return nil
-        },
-        ClusterLifecycleRollingBack: func(ctx *TransitionContext) error {
-            if ctx.Cluster.Status.OperationProgress != nil {
-                ctx.Cluster.Status.OperationProgress.OperationType = OperationTypeRollback
-            }
-            return nil
-        },
-        ClusterLifecycleScaling: func(ctx *TransitionContext) error {
-            now := metav1.Now()
-            ctx.Cluster.Status.OperationProgress = &OperationProgress{
-                OperationType: OperationTypeScale,
-                StartedAt:     &now,
-            }
-            return nil
-        },
-        ClusterLifecycleFailed: func(ctx *TransitionContext) error {
-            if ctx.Cluster.Status.OperationProgress != nil &&
-                ctx.Cluster.Status.OperationProgress.LastFailure != nil &&
-                ctx.Cluster.Status.OperationProgress.LastFailure.Attempt >= maxAutoRetries {
-                ctx.Cluster.Status.OperationProgress.NeedsManualIntervention = true
-            }
-            return nil
-        },
-    }
-}
-
-func (m *ClusterLifecycleMachine) Transition(ctx *TransitionContext, target LifecyclePhase) error {
-    if m.currentPhase == target {
-        return nil
-    }
-    // 1. 执行目标状态的默认动作
-    if action, ok := m.defaultActions()[target]; ok {
-        if err := action(ctx); err != nil {
-            return err
-        }
-    }
-    // 2. 执行规则自定义动作（如果有）
-    for _, rule := range m.rules {
-        if (rule.From == m.currentPhase || rule.From == "") && rule.To == target {
-            if rule.Action != nil {
-                if err := rule.Action(ctx); err != nil {
-                    return err
-                }
-            }
-            break
-        }
-    }
-    // 3. 更新状态并同步到旧字段
-    m.currentPhase = target
-    ctx.Cluster.Status.LifecyclePhase = target
-    SyncClusterPhaseToLegacyFields(ctx.Cluster, target)
-    return nil
-}
-```
-
-#### 7.3.4 节点层状态机实现
-
-**文件**：`pkg/statemachine/node_machine.go`
-
-```go
-package statemachine
-
-type NodeLifecycleMachine struct {
-    node  *confv1beta1.BKENode
-    rules []TransitionRule
-}
-
-func NewNodeLifecycleMachine(node *confv1beta1.BKENode) *NodeLifecycleMachine {
-    m := &NodeLifecycleMachine{
-        node: node,
-    }
-    m.rules = m.buildRules()
-    return m
-}
-
-func (m *NodeLifecycleMachine) buildRules() []TransitionRule {
-    return []TransitionRule{
-        // Pending → Provisioned: Agent 推送完成 + 环境初始化完成
-        {
-            From: NodeLifecyclePending,
-            To:   NodeLifecycleProvisioned,
-            Condition: func(ctx *TransitionContext) bool {
-                return m.node.Status.StateCode&NodeAgentReadyFlag != 0 &&
-                    m.node.Status.StateCode&NodeEnvFlag != 0
-            },
-        },
-        // Provisioned → Ready: 所有节点级组件 Installed
-        {
-            From: NodeLifecycleProvisioned,
-            To:   NodeLifecycleReady,
-            Condition: func(ctx *TransitionContext) bool {
-                return allNodeComponentsInstalled(ctx, m.node.Spec.IP)
-            },
-        },
-        // Ready → Upgrading: 触发升级
-        {
-            From: NodeLifecycleReady,
-            To:   NodeLifecycleUpgrading,
-            Condition: func(ctx *TransitionContext) bool {
-                return anyNodeComponentUpgrading(ctx, m.node.Spec.IP)
-            },
-        },
-        // Upgrading → Ready: 升级完成
-        {
-            From: NodeLifecycleUpgrading,
-            To:   NodeLifecycleReady,
-            Condition: func(ctx *TransitionContext) bool {
-                return allNodeComponentsInstalled(ctx, m.node.Spec.IP)
-            },
-        },
-        // Upgrading → RollingBack: 升级失败
-        {
-            From: NodeLifecycleUpgrading,
-            To:   NodeLifecycleRollingBack,
-            Condition: func(ctx *TransitionContext) bool {
-                return anyNodeComponentFailed(ctx, m.node.Spec.IP)
-            },
-        },
-        // RollingBack → Ready: 回滚完成
-        {
-            From: NodeLifecycleRollingBack,
-            To:   NodeLifecycleReady,
-            Condition: func(ctx *TransitionContext) bool {
-                return allNodeComponentsInstalled(ctx, m.node.Spec.IP)
-            },
-        },
-        // Ready → Deleting: 触发删除
-        {
-            From: NodeLifecycleReady,
-            To:   NodeLifecycleDeleting,
-            Condition: func(ctx *TransitionContext) bool {
-                return m.node.DeletionTimestamp != nil
-            },
-        },
-        // Deleting → Removed: 删除完成
-        {
-            From: NodeLifecycleDeleting,
-            To:   NodeLifecycleRemoved,
-            Condition: func(ctx *TransitionContext) bool {
-                return allNodeComponentsRemoved(ctx, m.node.Spec.IP)
-            },
-        },
-    }
-}
-
-func (m *NodeLifecycleMachine) CurrentPhase() LifecyclePhase {
-    return LifecyclePhase(m.node.Status.LifecyclePhase)
-}
-
-func (m *NodeLifecycleMachine) Evaluate(ctx *TransitionContext) (LifecyclePhase, bool) {
-    current := m.CurrentPhase()
-    for _, rule := range m.rules {
-        if rule.From != current {
-            continue
-        }
-        if rule.Condition(ctx) {
-            return rule.To, true
-        }
-    }
-    return current, false
-}
-
-func (m *NodeLifecycleMachine) defaultActions() map[LifecyclePhase]func(ctx *TransitionContext) error {
-    return map[LifecyclePhase]func(ctx *TransitionContext) error{
-        NodeLifecycleProvisioned: func(ctx *TransitionContext) error {
-            m.node.Status.Message = "Agent ready and environment initialized"
-            return nil
-        },
-        NodeLifecycleReady: func(ctx *TransitionContext) error {
-            m.node.Status.Message = "All node components installed"
-            return nil
-        },
-        NodeLifecycleUpgrading: func(ctx *TransitionContext) error {
-            m.node.Status.Message = "Node upgrade in progress"
-            return nil
-        },
-        NodeLifecycleRollingBack: func(ctx *TransitionContext) error {
-            m.node.Status.Message = "Node rollback in progress"
-            return nil
-        },
-        NodeLifecycleDeleting: func(ctx *TransitionContext) error {
-            m.node.Status.Message = "Node deletion in progress"
-            return nil
-        },
-        NodeLifecycleRemoved: func(ctx *TransitionContext) error {
-            m.node.Status.Message = "Node removed"
-            return nil
-        },
-        NodeLifecycleFailed: func(ctx *TransitionContext) error {
-            m.node.Status.Message = "Node operation failed"
-            return nil
-        },
-    }
-}
-
-func (m *NodeLifecycleMachine) Transition(ctx *TransitionContext, target LifecyclePhase) error {
-    current := m.CurrentPhase()
-    if current == target {
-        return nil
-    }
-    // 1. 执行目标状态的默认动作
-    if action, ok := m.defaultActions()[target]; ok {
-        if err := action(ctx); err != nil {
-            return err
-        }
-    }
-    // 2. 执行规则自定义动作（如果有）
-    for _, rule := range m.rules {
-        if rule.From == current && rule.To == target {
-            if rule.Action != nil {
-                if err := rule.Action(ctx); err != nil {
-                    return err
-                }
-            }
-            break
-        }
-    }
-    // 3. 更新状态并同步到旧字段
-    m.node.Status.LifecyclePhase = target
-    SyncNodeStateToLegacyFields(m.node, target)
-    return nil
-}
-```
-
-#### 7.3.5 组件层状态机实现
-
-**文件**：`pkg/statemachine/component_machine.go`
-
-```go
-package statemachine
-
-type ComponentLifecycleMachine struct {
-    componentName string
-    nodeIP        string // 空表示集群级组件
-    rules         []TransitionRule
-}
-
-func NewComponentLifecycleMachine(componentName, nodeIP string) *ComponentLifecycleMachine {
-    m := &ComponentLifecycleMachine{
-        componentName: componentName,
-        nodeIP:        nodeIP,
-    }
-    m.rules = m.buildRules()
-    return m
-}
-
-func (m *ComponentLifecycleMachine) buildRules() []TransitionRule {
-    return []TransitionRule{
-        // Pending → Installing: 开始安装
-        {
-            From: ComponentLifecyclePending,
-            To:   ComponentLifecycleInstalling,
-            Condition: func(ctx *TransitionContext) bool {
-                return m.shouldStartInstall(ctx)
-            },
-        },
-        // Installing → Installed: 安装成功
-        {
-            From: ComponentLifecycleInstalling,
-            To:   ComponentLifecycleInstalled,
-            Condition: func(ctx *TransitionContext) bool {
-                return m.isInstallCompleted(ctx)
-            },
-        },
-        // Installed → Upgrading: 触发升级
-        {
-            From: ComponentLifecycleInstalled,
-            To:   ComponentLifecycleUpgrading,
-            Condition: func(ctx *TransitionContext) bool {
-                return m.shouldStartUpgrade(ctx)
-            },
-        },
-        // Upgrading → Installed: 升级成功
-        {
-            From: ComponentLifecycleUpgrading,
-            To:   ComponentLifecycleInstalled,
-            Condition: func(ctx *TransitionContext) bool {
-                return m.isUpgradeCompleted(ctx)
-            },
-        },
-        // Upgrading → RollingBack: 升级失败
-        {
-            From: ComponentLifecycleUpgrading,
-            To:   ComponentLifecycleRollingBack,
-            Condition: func(ctx *TransitionContext) bool {
-                return m.isUpgradeFailed(ctx)
-            },
-        },
-        // RollingBack → Installed: 回滚成功
-        {
-            From: ComponentLifecycleRollingBack,
-            To:   ComponentLifecycleInstalled,
-            Condition: func(ctx *TransitionContext) bool {
-                return m.isRollbackCompleted(ctx)
-            },
-        },
-        // Installed → Uninstalling: 触发卸载
-        {
-            From: ComponentLifecycleInstalled,
-            To:   ComponentLifecycleUninstalling,
-            Condition: func(ctx *TransitionContext) bool {
-                return m.shouldStartUninstall(ctx)
-            },
-        },
-        // Uninstalling → Removed: 卸载成功
-        {
-            From: ComponentLifecycleUninstalling,
-            To:   ComponentLifecycleRemoved,
-            Condition: func(ctx *TransitionContext) bool {
-                return m.isUninstallCompleted(ctx)
-            },
-        },
-    }
-}
-
-func (m *ComponentLifecycleMachine) getStatus(ctx *TransitionContext) *confv1beta1.ComponentLifecycleStatus {
-    if m.nodeIP != "" {
-        // 节点级组件
-        if nodeComps, ok := ctx.NodeComponentStatuses[m.componentName]; ok {
-            if status, ok := nodeComps[m.nodeIP]; ok {
-                return &status
-            }
-        }
-    } else {
-        // 集群级组件
-        if status, ok := ctx.ClusterComponentStatuses[m.componentName]; ok {
-            return &status
-        }
-    }
-    return nil
-}
-
-func (m *ComponentLifecycleMachine) CurrentPhase() LifecyclePhase {
-    status := m.getStatus(nil)
-    if status == nil {
-        return ComponentLifecyclePending
-    }
-    return status.Phase
-}
-
-func (m *ComponentLifecycleMachine) Evaluate(ctx *TransitionContext) (LifecyclePhase, bool) {
-    current := m.CurrentPhase()
-    for _, rule := range m.rules {
-        if rule.From != current {
-            continue
-        }
-        if rule.Condition(ctx) {
-            return rule.To, true
-        }
-    }
-    return current, false
-}
-
-func (m *ComponentLifecycleMachine) defaultActions() map[LifecyclePhase]func(ctx *TransitionContext) error {
-    return map[LifecyclePhase]func(ctx *TransitionContext) error{
-        ComponentLifecycleInstalling: func(ctx *TransitionContext) error {
-            return m.updateComponentStatus(ctx, ComponentLifecycleInstalling, "Component installation in progress")
-        },
-        ComponentLifecycleInstalled: func(ctx *TransitionContext) error {
-            return m.updateComponentStatus(ctx, ComponentLifecycleInstalled, "Component installed successfully")
-        },
-        ComponentLifecycleUpgrading: func(ctx *TransitionContext) error {
-            return m.updateComponentStatus(ctx, ComponentLifecycleUpgrading, "Component upgrade in progress")
-        },
-        ComponentLifecycleRollingBack: func(ctx *TransitionContext) error {
-            return m.updateComponentStatus(ctx, ComponentLifecycleRollingBack, "Component rollback in progress")
-        },
-        ComponentLifecycleUninstalling: func(ctx *TransitionContext) error {
-            return m.updateComponentStatus(ctx, ComponentLifecycleUninstalling, "Component uninstallation in progress")
-        },
-        ComponentLifecycleRemoved: func(ctx *TransitionContext) error {
-            return m.updateComponentStatus(ctx, ComponentLifecycleRemoved, "Component removed")
-        },
-        ComponentLifecycleFailed: func(ctx *TransitionContext) error {
-            return m.updateComponentStatus(ctx, ComponentLifecycleFailed, "Component operation failed")
-        },
-    }
-}
-
-func (m *ComponentLifecycleMachine) updateComponentStatus(ctx *TransitionContext, phase LifecyclePhase, message string) error {
-    now := metav1.Now()
-    status := ComponentLifecycleStatus{
-        Name:               m.componentName,
-        NodeIP:             m.nodeIP,
-        Phase:              phase,
-        LastTransitionTime: &now,
-        Message:            message,
-    }
-    if m.nodeIP != "" {
-        // 节点级组件
-        if ctx.Cluster.Status.NodeComponentStatuses == nil {
-            ctx.Cluster.Status.NodeComponentStatuses = make(map[string]map[string]ComponentLifecycleStatus)
-        }
-        if ctx.Cluster.Status.NodeComponentStatuses[m.componentName] == nil {
-            ctx.Cluster.Status.NodeComponentStatuses[m.componentName] = make(map[string]ComponentLifecycleStatus)
-        }
-        ctx.Cluster.Status.NodeComponentStatuses[m.componentName][m.nodeIP] = status
-    } else {
-        // 集群级组件
-        if ctx.Cluster.Status.ClusterComponentStatuses == nil {
-            ctx.Cluster.Status.ClusterComponentStatuses = make(map[string]ComponentLifecycleStatus)
-        }
-        ctx.Cluster.Status.ClusterComponentStatuses[m.componentName] = status
-    }
-    return nil
-}
-
-func (m *ComponentLifecycleMachine) Transition(ctx *TransitionContext, target LifecyclePhase) error {
-    current := m.CurrentPhase()
-    if current == target {
-        return nil
-    }
-    // 1. 执行目标状态的默认动作
-    if action, ok := m.defaultActions()[target]; ok {
-        if err := action(ctx); err != nil {
-            return err
-        }
-    }
-    // 2. 执行规则自定义动作（如果有）
-    for _, rule := range m.rules {
-        if rule.From == current && rule.To == target {
-            if rule.Action != nil {
-                if err := rule.Action(ctx); err != nil {
-                    return err
-                }
-            }
-            break
-        }
-    }
-    return nil
-}
-
-// shouldStartInstall 检查是否应该开始安装
-// 条件：组件尚未安装，且 DAG 调度器已将其标记为待安装
-func (m *ComponentLifecycleMachine) shouldStartInstall(ctx *TransitionContext) bool {
-    status := m.getStatus(ctx)
-    if status == nil || status.Phase == ComponentLifecyclePending {
-        // 检查 DAG 是否已调度该组件（通过 OperationProgress 判断）
-        if ctx.Cluster.Status.OperationProgress != nil {
-            for _, completed := range ctx.Cluster.Status.OperationProgress.Completed {
-                if completed.Name == m.componentName {
-                    return false // 已完成，不需要安装
-                }
-            }
-        }
-        return true // 待安装且未完成
-    }
-    return false
-}
-
-// isInstallCompleted 检查安装是否完成
-// 条件：组件状态为 Installed，且版本与目标版本匹配
-func (m *ComponentLifecycleMachine) isInstallCompleted(ctx *TransitionContext) bool {
-    status := m.getStatus(ctx)
-    if status != nil && status.Phase == ComponentLifecycleInstalled {
-        // 检查版本是否匹配目标版本
-        if ctx.Cluster.Status.OperationProgress != nil && ctx.Cluster.Status.OperationProgress.TargetVersion != "" {
-            return status.CurrentVersion == ctx.Cluster.Status.OperationProgress.TargetVersion
-        }
-        return true
-    }
-    return false
-}
-
-// shouldStartUpgrade 检查是否应该开始升级
-// 条件：组件已安装，但版本低于目标版本
-func (m *ComponentLifecycleMachine) shouldStartUpgrade(ctx *TransitionContext) bool {
-    status := m.getStatus(ctx)
-    if status != nil && status.Phase == ComponentLifecycleInstalled {
-        // 检查是否有目标版本且当前版本不匹配
-        if ctx.Cluster.Status.OperationProgress != nil && ctx.Cluster.Status.OperationProgress.TargetVersion != "" {
-            return status.CurrentVersion != ctx.Cluster.Status.OperationProgress.TargetVersion
-        }
-    }
-    return false
-}
-
-// isUpgradeCompleted 检查升级是否完成
-// 条件：组件状态为 Installed，且版本与目标版本匹配
-func (m *ComponentLifecycleMachine) isUpgradeCompleted(ctx *TransitionContext) bool {
-    return m.isInstallCompleted(ctx) // 升级完成后状态与安装完成相同
-}
-
-// isUpgradeFailed 检查升级是否失败
-// 条件：组件状态为 Failed，且 OperationProgress 中有失败记录
-func (m *ComponentLifecycleMachine) isUpgradeFailed(ctx *TransitionContext) bool {
-    status := m.getStatus(ctx)
-    if status != nil && status.Phase == ComponentLifecycleFailed {
-        if ctx.Cluster.Status.OperationProgress != nil && ctx.Cluster.Status.OperationProgress.LastFailure != nil {
-            return ctx.Cluster.Status.OperationProgress.LastFailure.Name == m.componentName
-        }
-    }
-    return false
-}
-
-// isRollbackCompleted 检查回滚是否完成
-// 条件：组件状态为 Installed，且版本已恢复到回滚前版本
-func (m *ComponentLifecycleMachine) isRollbackCompleted(ctx *TransitionContext) bool {
-    status := m.getStatus(ctx)
-    if status != nil && status.Phase == ComponentLifecycleInstalled {
-        // 回滚完成后，版本应该与失败前的版本一致
-        // 这里简化处理：只要状态为 Installed 就认为回滚完成
-        return true
-    }
-    return false
-}
-
-// shouldStartUninstall 检查是否应该开始卸载
-// 条件：组件已安装，且节点正在删除或组件被显式标记为卸载
-func (m *ComponentLifecycleMachine) shouldStartUninstall(ctx *TransitionContext) bool {
-    status := m.getStatus(ctx)
-    if status != nil && status.Phase == ComponentLifecycleInstalled {
-        // 检查节点是否在删除中
-        if m.nodeIP != "" {
-            for _, node := range ctx.Nodes {
-                if node.Spec.IP == m.nodeIP && node.DeletionTimestamp != nil {
-                    return true
-                }
-            }
-        }
-    }
-    return false
-}
-
-// isUninstallCompleted 检查卸载是否完成
-// 条件：组件状态为 Removed
-func (m *ComponentLifecycleMachine) isUninstallCompleted(ctx *TransitionContext) bool {
-    status := m.getStatus(ctx)
-    return status != nil && status.Phase == ComponentLifecycleRemoved
-}
-```
-
-### 7.4 状态聚合器设计
-
-#### 7.4.1 聚合器接口
-
-**文件**：`pkg/statemachine/aggregator.go`
-
-```go
-package statemachine
-
-// Aggregator 负责从下层状态聚合出上层状态
-type Aggregator struct{}
-
-// AggregateNodeLifecycle 从节点级组件状态聚合节点生命周期
-func (a *Aggregator) AggregateNodeLifecycle(
-    nodeIP string,
-    nodeComponentStatuses map[string]map[string]confv1beta1.ComponentLifecycleStatus,
-) LifecyclePhase {
-    components := collectNodeComponents(nodeIP, nodeComponentStatuses)
-    if len(components) == 0 {
-        return NodeLifecyclePending
-    }
-
-    // 优先级：Failed > RollingBack > Upgrading > Removing > Installing > Installed > Pending
-    if anyMatch(components, ComponentLifecycleFailed) {
-        return NodeLifecycleFailed
-    }
-    if anyMatch(components, ComponentLifecycleRollingBack) {
-        return NodeLifecycleRollingBack
-    }
-    if anyMatch(components, ComponentLifecycleUpgrading) {
-        return NodeLifecycleUpgrading
-    }
-    if anyMatch(components, ComponentLifecycleUninstalling) {
-        return NodeLifecycleDeleting
-    }
-    if allMatch(components, ComponentLifecycleRemoved) {
-        return NodeLifecycleRemoved
-    }
-    if allMatch(components, ComponentLifecycleInstalled) {
-        return NodeLifecycleReady
-    }
-    if anyMatch(components, ComponentLifecycleInstalling) {
-        return NodeLifecyclePending
-    }
-    return NodeLifecycleProvisioned
-}
-
-// AggregateClusterLifecycle 从节点状态 + 集群级组件状态聚合集群生命周期
-func (a *Aggregator) AggregateClusterLifecycle(
-    nodePhases []LifecyclePhase,
-    clusterComponentStatuses map[string]confv1beta1.ComponentLifecycleStatus,
-) LifecyclePhase {
-    // 优先级规则（按重要性排序）：
-    // 1. Failed: 任意节点或集群级组件 Failed
-    // 2. RollingBack: 任意节点或集群级组件 RollingBack
-    // 3. Upgrading: 任意节点或集群级组件 Upgrading
-    // 4. Scaling: 任意节点 Deleting 或 Pending
-    // 5. Creating: 任意节点 Pending/Provisioned
-    // 6. Running: 所有节点 Ready + 所有集群级组件 Installed
-
-    if anySliceMatch(nodePhases, NodeLifecycleFailed) ||
-        anyMapMatch(clusterComponentStatuses, ComponentLifecycleFailed) {
-        return ClusterLifecycleFailed
-    }
-    if anySliceMatch(nodePhases, NodeLifecycleRollingBack) ||
-        anyMapMatch(clusterComponentStatuses, ComponentLifecycleRollingBack) {
-        return ClusterLifecycleRollingBack
-    }
-    if anySliceMatch(nodePhases, NodeLifecycleUpgrading) ||
-        anyMapMatch(clusterComponentStatuses, ComponentLifecycleUpgrading) {
-        return ClusterLifecycleUpgrading
-    }
-    if anySliceMatch(nodePhases, NodeLifecycleDeleting) {
-        return ClusterLifecycleScaling
-    }
-    if anySliceMatch(nodePhases, NodeLifecyclePending, NodeLifecycleProvisioned) {
-        return ClusterLifecycleCreating
-    }
-    if allSliceMatch(nodePhases, NodeLifecycleReady) &&
-        allMapMatch(clusterComponentStatuses, ComponentLifecycleInstalled) {
-        return ClusterLifecycleRunning
-    }
-    return ClusterLifecycleCreating
-}
-```
-
-#### 7.4.2 聚合优先级矩阵
-
-```
-                    Failed  RollingBack  Upgrading  Deleting  Pending/Provisioned  Ready
-Failed              ✓
-RollingBack         -         ✓
-Upgrading           -         -            ✓
-Scaling             -         -            -           ✓
-Creating            -         -            -           -              ✓
-Running             -         -            -           -              -              ✓
-
-规则：从上到下扫描，第一个匹配的规则决定集群状态
-```
-
-### 7.5 兼容性映射设计
-
-#### 7.5.1 集群层兼容性映射
-
-**文件**：`pkg/statemachine/compatibility.go`
-
-```go
-package statemachine
-
-// SyncClusterPhaseToLegacyFields 将 v3 生命周期状态同步到旧字段
-func SyncClusterPhaseToLegacyFields(cluster *confv1beta1.BKECluster, phase LifecyclePhase) {
-    switch phase {
-    case ClusterLifecycleCreating:
-        cluster.Status.ClusterStatus = bkev1beta1.ClusterInitializing
-        cluster.Status.ClusterHealthState = bkev1beta1.Deploying
-    case ClusterLifecycleRunning:
-        cluster.Status.ClusterStatus = bkev1beta1.ClusterReady
-        cluster.Status.ClusterHealthState = bkev1beta1.Healthy
-        cluster.Status.Ready = true
-    case ClusterLifecycleUpgrading:
-        cluster.Status.ClusterStatus = bkev1beta1.ClusterUpgrading
-        cluster.Status.ClusterHealthState = bkev1beta1.Upgrading
-    case ClusterLifecycleScaling:
-        // 根据扩缩容方向设置不同的旧状态
-        if hasScalingUp(cluster) {
-            cluster.Status.ClusterStatus = bkev1beta1.ClusterWorkerScalingUp
-        } else {
-            cluster.Status.ClusterStatus = bkev1beta1.ClusterWorkerScalingDown
-        }
-    case ClusterLifecycleRollingBack:
-        cluster.Status.ClusterStatus = bkev1beta1.ClusterUpgrading
-        cluster.Status.ClusterHealthState = bkev1beta1.UpgradeFailed
-    case ClusterLifecycleFailed:
-        cluster.Status.ClusterStatus = bkev1beta1.ClusterUpgradeFailed
-        cluster.Status.ClusterHealthState = bkev1beta1.Unhealthy
-    }
-}
-
-// SyncNodeStateToLegacyFields 将 v3 节点生命周期同步到旧字段
-func SyncNodeStateToLegacyFields(node *confv1beta1.BKENode, phase LifecyclePhase) {
-    switch phase {
-    case NodeLifecyclePending:
-        node.Status.State = confv1beta1.NodePending
-    case NodeLifecycleProvisioned:
-        node.Status.State = confv1beta1.NodeProvisioned
-    case NodeLifecycleReady:
-        node.Status.State = confv1beta1.NodeReady
-    case NodeLifecycleUpgrading:
-        node.Status.State = confv1beta1.NodeUpgrading
-    case NodeLifecycleRollingBack:
-        node.Status.State = confv1beta1.NodeUpgrading // 旧版本无 RollingBack，映射到 Upgrading
-    case NodeLifecycleDeleting:
-        node.Status.State = confv1beta1.NodeDeleting
-    case NodeLifecycleRemoved:
-        node.Status.State = confv1beta1.NodeNotReady
-    case NodeLifecycleFailed:
-        node.Status.State = confv1beta1.NodeFailed
-    }
-}
-```
-
-#### 7.5.2 旧状态到 v3 状态的反向映射
-
-```go
-// LegacyPhaseToLifecycle 将旧的 BKEClusterPhase 映射到 v3 生命周期
-func LegacyPhaseToLegacyPhaseToLifecycle(oldPhase confv1beta1.BKEClusterPhase) LifecyclePhase {
-    switch oldPhase {
-    case bkev1beta1.InitControlPlane, bkev1beta1.JoinControlPlane, bkev1beta1.JoinWorker,
-        bkev1beta1.FakeInitControlPlane, bkev1beta1.FakeJoinControlPlane, bkev1beta1.FakeJoinWorker:
-        return ClusterLifecycleCreating
-    case bkev1beta1.UpgradeControlPlane, bkev1beta1.UpgradeWorker, bkev1beta1.UpgradeEtcd:
-        return ClusterLifecycleUpgrading
-    case bkev1beta1.Scale:
-        return ClusterLifecycleScaling
-    case bkev1beta1.FailedBootstrapNode:
-        return ClusterLifecycleFailed
-    case bkev1beta1.ClusterReadyOld:
-        return ClusterLifecycleRunning
-    default:
-        return ClusterLifecycleCreating
-    }
-}
-
-// LegacyClusterStatusToLifecycle 将旧的 ClusterStatus 映射到 v3 生命周期
-func LegacyClusterStatusToLifecycle(oldStatus confv1beta1.ClusterStatus) LifecyclePhase {
-    switch oldStatus {
-    case bkev1beta1.ClusterReady:
-        return ClusterLifecycleRunning
-    case bkev1beta1.ClusterInitializing:
-        return ClusterLifecycleCreating
-    case bkev1beta1.ClusterUpgrading:
-        return ClusterLifecycleUpgrading
-    case bkev1beta1.ClusterMasterScalingUp, bkev1beta1.ClusterMasterScalingDown,
-        bkev1beta1.ClusterWorkerScalingUp, bkev1beta1.ClusterWorkerScalingDown:
-        return ClusterLifecycleScaling
-    case bkev1beta1.ClusterDeleting:
-        return ClusterLifecycleScaling
-    case bkev1beta1.ClusterUpgradeFailed, bkev1beta1.ClusterScaleFailed,
-        bkev1beta1.ClusterInitializationFailed, bkev1beta1.ClusterDeleteFailed,
-        bkev1beta1.ClusterManageFailed, bkev1beta1.ClusterDeployAddonFailed:
-        return ClusterLifecycleFailed
-    default:
-        return ClusterLifecycleCreating
-    }
-}
-```
-
-### 7.6 与现有系统集成设计
-
-#### 7.6.1 与 PhaseFlow 集成
-
-v3 状态机不替换现有 PhaseFlow，而是在 PhaseFlow 执行后更新生命周期状态。评估顺序为**自底向上**：组件 → 节点 → 集群，确保上层状态基于最新的下层状态：
-
-```
-BKEClusterReconciler.Reconcile()
-  │
-  ├─ 1. getAndValidateCluster()
-  ├─ 2. handleClusterStatus()
-  ├─ 3. executePhaseFlow()           ← 现有逻辑不变
-  │     └─ PhaseFlow.Execute()       ← 现有 Phase 执行
-  ├─ 4. ★ evaluateLifecycle()        ← 新增：v3 状态机评估（自底向上）
-  │     ├─ 构建 TransitionContext
-  │     ├─ ComponentLifecycleMachine.Evaluate() (节点级组件)
-  │     ├─ ComponentLifecycleMachine.Evaluate() (集群级组件)
-  │     ├─ NodeLifecycleMachine.Evaluate() (每个节点)
-  │     ├─ ClusterLifecycleMachine.Evaluate()
-  │     └─ 更新 LifecyclePhase 字段
-  ├─ 5. ★ syncLegacyFields()         ← 新增：兼容性双写
-  └─ 6. getFinalResult()
-```
-
-**集成点代码**：
-
-```go
-// 在 bkecluster_controller.go 的 Reconcile 方法中新增
-func (r *BKEClusterReconciler) evaluateLifecycle(
-    ctx context.Context,
-    cluster *bkev1beta1.BKECluster,
+// HealthAggregator 健康状态聚合器
+type HealthAggregator struct{}
+
+// AggregateClusterHealth 聚合集群健康状态
+func (a *HealthAggregator) AggregateClusterHealth(
     nodes []confv1beta1.BKENode,
-) error {
-    if !featuregate.Enabled(featuregate.StateMachineV3) {
-        return nil // Feature Gate 未开启，跳过
+    clusterComponents map[string]confv1beta1.ComponentLifecycleStatus,
+) *confv1beta1.HealthStatus {
+    health := &confv1beta1.HealthStatus{
+        Overall:       confv1beta1.HealthLevelHealthy,
+        LastCheckTime: &metav1.Time{Time: time.Now()},
     }
-
-    smCtx := &statemachine.TransitionContext{
-        Cluster:                  cluster,
-        Nodes:                    nodes,
-        NodeComponentStatuses:    cluster.Status.NodeComponentStatuses,
-        ClusterComponentStatuses: cluster.Status.ClusterComponentStatuses,
+    
+    // 聚合节点健康状态
+    for _, node := range nodes {
+        nodeHealth := a.aggregateNodeHealth(node)
+        health.NodeHealth = append(health.NodeHealth, nodeHealth)
+        
+        if nodeHealth.Health != confv1beta1.HealthLevelHealthy {
+            health.Overall = confv1beta1.HealthLevelDegraded
+        }
     }
+    
+    // 聚合组件健康状态
+    for name, status := range clusterComponents {
+        compHealth := a.aggregateComponentHealth(status)
+        health.ComponentHealth = append(health.ComponentHealth, compHealth)
+        
+        if compHealth.Health != confv1beta1.HealthLevelHealthy {
+            health.Overall = confv1beta1.HealthLevelDegraded
+        }
+    }
+    
+    // 检查是否有 Unhealthy 状态
+    if a.hasUnhealthyNode(nodes) || a.hasUnhealthyComponent(clusterComponents) {
+        health.Overall = confv1beta1.HealthLevelUnhealthy
+    }
+    
+    return health
+}
 
-    // 1. 评估组件层状态（自底向上）
-    // 评估节点级组件
-    for componentName, nodeComps := range cluster.Status.NodeComponentStatuses {
-        for nodeIP := range nodeComps {
-            compMachine := statemachine.NewComponentLifecycleMachine(componentName, nodeIP)
-            if target, changed := compMachine.Evaluate(smCtx); changed {
-                if err := compMachine.Transition(smCtx, target); err != nil {
-                    return err
-                }
+// aggregateNodeHealth 聚合节点健康状态
+func (a *HealthAggregator) aggregateNodeHealth(node confv1beta1.BKENode) confv1beta1.NodeHealthStatus {
+    health := confv1beta1.NodeHealthStatus{
+        NodeIP: node.Spec.IP,
+        Health: confv1beta1.HealthLevelHealthy,
+    }
+    
+    // 检查节点级组件健康状态
+    for _, comp := range node.Status.Components {
+        if comp.Phase == confv1beta1.ComponentLifecycleFailed {
+            health.Health = confv1beta1.HealthLevelUnhealthy
+            health.Message = fmt.Sprintf("Component %s failed", comp.Name)
+            break
+        }
+        if comp.Phase != confv1beta1.ComponentLifecycleInstalled {
+            health.Health = confv1beta1.HealthLevelDegraded
+        }
+    }
+    
+    return health
+}
+
+// aggregateComponentHealth 聚合组件健康状态
+func (a *HealthAggregator) aggregateComponentHealth(status confv1beta1.ComponentLifecycleStatus) confv1beta1.ComponentHealthStatus {
+    health := confv1beta1.ComponentHealthStatus{
+        Name:   status.Name,
+        NodeIP: status.NodeIP,
+        Health: confv1beta1.HealthLevelHealthy,
+    }
+    
+    if status.Phase == confv1beta1.ComponentLifecycleFailed {
+        health.Health = confv1beta1.HealthLevelUnhealthy
+        health.Message = status.Message
+    } else if status.Phase != confv1beta1.ComponentLifecycleInstalled {
+        health.Health = confv1beta1.HealthLevelDegraded
+    }
+    
+    return health
+}
+
+// hasUnhealthyNode 检查是否有不健康的节点
+func (a *HealthAggregator) hasUnhealthyNode(nodes []confv1beta1.BKENode) bool {
+    for _, node := range nodes {
+        for _, comp := range node.Status.Components {
+            if comp.Phase == confv1beta1.ComponentLifecycleFailed {
+                return true
             }
         }
     }
-    // 评估集群级组件
-    for componentName := range cluster.Status.ClusterComponentStatuses {
-        compMachine := statemachine.NewComponentLifecycleMachine(componentName, "")
-        if target, changed := compMachine.Evaluate(smCtx); changed {
-            if err := compMachine.Transition(smCtx, target); err != nil {
-                return err
-            }
+    return false
+}
+
+// hasUnhealthyComponent 检查是否有不健康的组件
+func (a *HealthAggregator) hasUnhealthyComponent(components map[string]confv1beta1.ComponentLifecycleStatus) bool {
+    for _, status := range components {
+        if status.Phase == confv1beta1.ComponentLifecycleFailed {
+            return true
         }
     }
-
-    // 2. 评估节点层状态（依赖组件层状态）
-    for i := range nodes {
-        nodeMachine := statemachine.NewNodeLifecycleMachine(&nodes[i])
-        if target, changed := nodeMachine.Evaluate(smCtx); changed {
-            if err := nodeMachine.Transition(smCtx, target); err != nil {
-                return err
-            }
-        }
-    }
-
-    // 3. 评估集群层状态（依赖节点层 + 组件层状态）
-    clusterMachine := statemachine.NewClusterLifecycleMachine()
-    clusterMachine.SetCurrentPhase(LifecyclePhase(cluster.Status.LifecyclePhase))
-    if target, changed := clusterMachine.Evaluate(smCtx); changed {
-        if err := clusterMachine.Transition(smCtx, target); err != nil {
-            return err
-        }
-    }
-
-    return nil
+    return false
 }
 ```
 
-#### 7.6.2 与 DAG 调度器集成
+### 8.5 兼容性映射设计
 
-DAG 调度器在执行组件时同步更新组件生命周期状态：
+（保留原有设计，详见 v3 文档）
 
-```
-Scheduler.ExecuteDAG()
-  │
-  ├─ 对于每个组件执行：
-  │   ├─ 1. 设置 ComponentLifecycleStatus.Phase = Upgrading/Installing
-  │   ├─ 2. 写入 BKECluster.Status.NodeComponentStatuses 或 ClusterComponentStatuses
-  │   ├─ 3. 执行组件（inline 或 manifest）
-  │   ├─ 4. 成功：设置 Phase = Installed
-  │   └─ 5. 失败：设置 Phase = Failed
-  │
-  └─ DAG 完成后：
-      ├─ 更新 OperationProgress
-      └─ 触发集群层状态重新评估
-```
+### 8.6 与现有系统集成设计
 
-**集成点代码**：
+**集成点**：
 
 ```go
-// 在 dagexec/scheduler.go 中新增
-func (s *Scheduler) updateComponentLifecycle(
-    cluster *confv1beta1.BKECluster,
-    componentName string,
-    nodeIP string,
-    phase LifecyclePhase,
-    version string,
-) {
-    status := confv1beta1.ComponentLifecycleStatus{
-        Name:               componentName,
-        NodeIP:             nodeIP,
-        Phase:              phase,
-        CurrentVersion:     version,
-        LastTransitionTime: &metav1.Time{Time: time.Now()},
-    }
-
-    if nodeIP != "" {
-        // 节点级组件
-        if cluster.Status.NodeComponentStatuses == nil {
-            cluster.Status.NodeComponentStatuses = make(map[string]map[string]confv1beta1.ComponentLifecycleStatus)
-        }
-        if cluster.Status.NodeComponentStatuses[componentName] == nil {
-            cluster.Status.NodeComponentStatuses[componentName] = make(map[string]confv1beta1.ComponentLifecycleStatus)
-        }
-        cluster.Status.NodeComponentStatuses[componentName][nodeIP] = status
-    } else {
-        // 集群级组件
-        if cluster.Status.ClusterComponentStatuses == nil {
-            cluster.Status.ClusterComponentStatuses = make(map[string]confv1beta1.ComponentLifecycleStatus)
-        }
-        cluster.Status.ClusterComponentStatuses[componentName] = status
-    }
-}
-```
-
-#### 7.6.3 与 StatusManager 集成
-
-现有 `StatusManager` 的 retry-with-mask 模式保持不变，v3 状态机在其之后运行：
-
-```
-BKEClusterReconciler.Reconcile()
-  │
-  ├─ ... 执行 PhaseFlow ...
-  │
-  ├─ StatusManager.SetStatus()      ← 现有逻辑（retry mask）
-  ├─ StatusManager.GetCtrlResult()  ← 现有逻辑（决定是否 requeue）
-  │
-  └─ ★ evaluateLifecycle()          ← 新增：在 StatusManager 之后运行
-```
-
-### 7.7 人工介入详细设计
-
-#### 7.7.1 注解定义
-
-**文件**：`utils/capbke/annotation/annotation.go`
-
-```go
-const (
-    // RetryOperationAnnotation 触发人工介入重试的注解
-    // 值格式："{operationType}" 或 "auto"（自动检测当前操作类型）
-    // 示例：cvo.openfuyao.cn/retry-operation: "Upgrade"
-    RetryOperationAnnotation = "cvo.openfuyao.cn/retry-operation"
-)
-```
-
-**触发机制**：
-
-当达到最大自动重试次数后，控制器停止调谐（返回 `ctrl.Result{}`）。用户设置注解后，controller-runtime 的 Watch 机制检测到资源变更，立即触发 Reconcile：
-
-```
-自动重试流程：
-  Reconcile 失败 → 指数退避重试（Attempt=1,2,3）→ 达到最大重试次数
-
-人工介入流程：
-  达到最大重试次数 → 设置 NeedsManualIntervention=true → 停止调谐（ctrl.Result{}）
-  ↓
-  用户诊断问题并修复
-  ↓
-  用户设置注解 cvo.openfuyao.cn/retry-operation
-  ↓
-  Watch 事件触发 → 立即 Reconcile（检测到注解）
-  ↓
-  清除注解 → 重置失败状态 → 执行重试
-```
-
-#### 7.7.2 Reconciler 集成
-
-**文件**：`controllers/capbke/bkecluster_controller.go`
-
-在 `evaluateLifecycle()` 前增加人工介入检查：
-
-```go
+// 在 bkecluster_controller.go 的 Reconcile 方法中集成
 func (r *BKEClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
     cluster := &bkev1beta1.BKECluster{}
     if err := r.Get(ctx, req.NamespacedName, cluster); err != nil {
         return ctrl.Result{}, err
     }
-
-    // 1. ★ 检查人工介入注解（最高优先级）
-    if retryOp, hasRetry := cluster.Annotations[annotation.RetryOperationAnnotation]; hasRetry {
-        // 清除注解
-        delete(cluster.Annotations, annotation.RetryOperationAnnotation)
-        if err := r.Update(ctx, cluster); err != nil {
-            return ctrl.Result{}, err
-        }
-        // 执行重试
-        return r.handleManualIntervention(ctx, cluster, retryOp)
-    }
-
-    // 2. 检查是否需要人工介入（达到最大自动重试次数）
-    if r.needsManualIntervention(cluster) {
-        if !cluster.Status.OperationProgress.NeedsManualIntervention {
-            cluster.Status.OperationProgress.NeedsManualIntervention = true
-            r.Status().Update(ctx, cluster)
-        }
-        // 停止调谐，等待人工介入（注解触发）
-        return ctrl.Result{}, nil
-    }
-
-    // 3. 正常执行
-    return r.executeDAGWithRetry(ctx, cluster)
-}
-
-func (r *BKEClusterReconciler) needsManualIntervention(cluster *bkev1beta1.BKECluster) bool {
-    if cluster.Status.OperationProgress == nil {
-        return false
-    }
-    if cluster.Status.OperationProgress.LastFailure == nil {
-        return false
-    }
-    return cluster.Status.OperationProgress.LastFailure.Attempt >= maxAutoRetries
-}
-```
-
-#### 7.7.3 状态机恢复规则
-
-**文件**：`pkg/statemachine/cluster_machine.go`
-
-为集群层状态机补充 `Failed → 操作状态` 的恢复规则：
-
-```go
-func (m *ClusterLifecycleMachine) buildRules() []TransitionRule {
-    return []TransitionRule{
-        // ... 现有规则 ...
-
-        // Failed → Upgrading: 人工介入后重新升级
-        {
-            From: ClusterLifecycleFailed,
-            To:   ClusterLifecycleUpgrading,
-            Condition: func(ctx *TransitionContext) bool {
-                return ctx.Cluster.Status.OperationProgress != nil &&
-                    ctx.Cluster.Status.OperationProgress.OperationType == OperationTypeUpgrade &&
-                    ctx.Cluster.Status.OperationProgress.LastFailure != nil &&
-                    ctx.Cluster.Status.OperationProgress.LastFailure.Attempt == 1
-            },
-        },
-        // Failed → Scaling: 人工介入后重新扩缩容
-        {
-            From: ClusterLifecycleFailed,
-            To:   ClusterLifecycleScaling,
-            Condition: func(ctx *TransitionContext) bool {
-                return ctx.Cluster.Status.OperationProgress != nil &&
-                    ctx.Cluster.Status.OperationProgress.OperationType == OperationTypeScale &&
-                    ctx.Cluster.Status.OperationProgress.LastFailure != nil &&
-                    ctx.Cluster.Status.OperationProgress.LastFailure.Attempt == 1
-            },
-        },
-        // Failed → Creating: 人工介入后重新创建
-        {
-            From: ClusterLifecycleFailed,
-            To:   ClusterLifecycleCreating,
-            Condition: func(ctx *TransitionContext) bool {
-                return ctx.Cluster.Status.OperationProgress != nil &&
-                    ctx.Cluster.Status.OperationProgress.OperationType == OperationTypeInstall &&
-                    ctx.Cluster.Status.OperationProgress.LastFailure != nil &&
-                    ctx.Cluster.Status.OperationProgress.LastFailure.Attempt == 1
-            },
-        },
-    }
-}
-```
-
-**恢复规则的 `defaultActions`**：
-
-```go
-func (m *ClusterLifecycleMachine) defaultActions() map[LifecyclePhase]func(ctx *TransitionContext) error {
-    return map[LifecyclePhase]func(ctx *TransitionContext) error{
-        // ... 现有动作 ...
-
-        ClusterLifecycleUpgrading: func(ctx *TransitionContext) error {
-            now := metav1.Now()
-            targetVersion := ""
-            if ctx.Cluster.Status.DeclarativeUpgrade != nil {
-                targetVersion = ctx.Cluster.Status.DeclarativeUpgrade.TargetVersion
-            }
-
-            // 如果是从 Failed 恢复，重置 OperationProgress
-            if m.currentPhase == ClusterLifecycleFailed {
-                ctx.Cluster.Status.OperationProgress = &OperationProgress{
-                    OperationType: OperationTypeUpgrade,
-                    TargetVersion: targetVersion,
-                    StartedAt:     &now,
-                    // LastFailure 会被重置，Attempt 从 1 开始
-                }
-            } else {
-                ctx.Cluster.Status.OperationProgress = &OperationProgress{
-                    OperationType: OperationTypeUpgrade,
-                    TargetVersion: targetVersion,
-                    StartedAt:     &now,
-                }
-            }
-            ctx.Cluster.Status.Ready = false
-            return nil
-        },
-    }
-}
-```
-
-#### 7.7.4 状态重置逻辑
-
-**文件**：`controllers/capbke/bkecluster_controller.go`
-
-人工介入时重置状态：
-
-```go
-func (r *BKEClusterReconciler) handleManualIntervention(
-    ctx context.Context,
-    cluster *bkev1beta1.BKECluster,
-    retryOp string,
-) (ctrl.Result, error) {
-    // 1. 状态验证
-    if cluster.Status.OperationProgress == nil {
-        return ctrl.Result{}, fmt.Errorf("no operation progress found")
-    }
-
-    // 2. 保存失败记录信息（用于日志，避免置 nil 后无法访问）
-    var lastFailedComponent, lastFailedNodeIP string
-    if cluster.Status.OperationProgress.LastFailure != nil {
-        lastFailedComponent = cluster.Status.OperationProgress.LastFailure.Name
-        lastFailedNodeIP = cluster.Status.OperationProgress.LastFailure.NodeIP
-    }
-
-    // 3. 根据重试策略决定是否重置 Completed
-    strategy := r.decideRetryStrategy(cluster, retryOp)
-
-    switch strategy {
-    case RetryStrategyFromFailure:
-        // 从失败点继续：保留 Completed，只重置 LastFailure
-        // Attempt 会在下次失败时从 1 开始
-        cluster.Status.OperationProgress.NeedsManualIntervention = false
-        cluster.Status.OperationProgress.LastFailure = nil
-        r.Log.Info("retrying from failure point",
-            "lastFailedComponent", lastFailedComponent,
-            "lastFailedNodeIP", lastFailedNodeIP,
-            "completedCount", len(cluster.Status.OperationProgress.Completed))
-
-    case RetryStrategyFull:
-        // 从头开始：重置所有进度
-        cluster.Status.OperationProgress.Completed = nil
-        cluster.Status.OperationProgress.LastFailure = nil
-        cluster.Status.OperationProgress.NeedsManualIntervention = false
-        cluster.Status.OperationProgress.StartedAt = &metav1.Time{Time: time.Now()}
-        r.Log.Info("retrying from beginning")
-    }
-
-    // 4. 重置组件生命周期状态（仅针对失败的组件）
-    if err := r.resetFailedComponentLifecycle(ctx, cluster); err != nil {
+    
+    // 1. 确定生命周期阶段（驱动模型）
+    lifecyclePhase := r.determineLifecyclePhase(cluster)
+    cluster.Status.LifecyclePhase = lifecyclePhase
+    
+    // 2. 确定健康状态（聚合模型）
+    nodes := &bkev1beta1.BKENodeList{}
+    if err := r.List(ctx, nodes, client.InNamespace(cluster.Namespace)); err != nil {
         return ctrl.Result{}, err
     }
-
-    // 5. 更新状态
+    
+    healthAggregator := &statemachine.HealthAggregator{}
+    healthStatus := healthAggregator.AggregateClusterHealth(nodes.Items, cluster.Status.ClusterComponentStatuses)
+    cluster.Status.HealthStatus = healthStatus
+    
+    // 3. 同步到旧字段（兼容性）
+    statemachine.SyncClusterPhaseToLegacyFields(cluster, lifecyclePhase)
+    
+    // 4. 更新状态
     if err := r.Status().Update(ctx, cluster); err != nil {
         return ctrl.Result{}, err
     }
-
-    // 6. 根据策略执行 DAG
-    switch strategy {
-    case RetryStrategyFromFailure:
-        return r.resumeDAG(ctx, cluster)
-    case RetryStrategyFull:
-        return r.executeDAG(ctx, cluster)
-    }
-
+    
     return ctrl.Result{}, nil
 }
-
-func (r *BKEClusterReconciler) decideRetryStrategy(
-    cluster *bkev1beta1.BKECluster,
-    retryOp string,
-) RetryStrategy {
-    // 如果注解值为 "full"，强制从头开始
-    if retryOp == "full" {
-        return RetryStrategyFull
-    }
-    // 默认从失败点继续
-    return RetryStrategyFromFailure
-}
-
-func (r *BKEClusterReconciler) resetFailedComponentLifecycle(
-    ctx context.Context,
-    cluster *bkev1beta1.BKECluster,
-) error {
-    if cluster.Status.OperationProgress.LastFailure == nil {
-        return nil
-    }
-
-    failedComponent := cluster.Status.OperationProgress.LastFailure.Name
-    failedNodeIP := cluster.Status.OperationProgress.LastFailure.NodeIP
-
-    // 重置节点级组件状态
-    if failedNodeIP != "" {
-        if nodeComps, ok := cluster.Status.NodeComponentStatuses[failedComponent]; ok {
-            if status, ok := nodeComps[failedNodeIP]; ok {
-                status.Phase = ComponentLifecyclePending
-                status.Message = "reset for manual retry"
-                nodeComps[failedNodeIP] = status
-            }
-        }
-    } else {
-        // 重置集群级组件状态
-        if status, ok := cluster.Status.ClusterComponentStatuses[failedComponent]; ok {
-            status.Phase = ComponentLifecyclePending
-            status.Message = "reset for manual retry"
-            cluster.Status.ClusterComponentStatuses[failedComponent] = status
-        }
-    }
-
-    return nil
-}
 ```
 
-#### 7.7.5 resumeDAG 适配
+### 8.7 人工介入详细设计
 
-**文件**：`controllers/capbke/bkecluster_controller.go`
+（保留原有设计，详见 v3 文档）
 
-基于新类型 `OperationFailureRecord`（含 NodeIP）的断点恢复：
+### 8.8 Feature Gate 设计
 
-```go
-func (r *BKEClusterReconciler) resumeDAG(
-    ctx context.Context,
-    cluster *bkev1beta1.BKECluster,
-) (ctrl.Result, error) {
-    // 1. 获取 DAG 定义
-    dag, err := r.getDAG(ctx, cluster)
-    if err != nil {
-        return ctrl.Result{}, err
-    }
+（保留原有设计，详见 v3 文档）
 
-    // 2. 构建已完成组件集合
-    completed := make(map[string]bool)
-    for _, record := range cluster.Status.OperationProgress.Completed {
-        // 使用 "name:nodeIP" 作为 key，支持同一组件在不同节点的状态追踪
-        key := fmt.Sprintf("%s:%s", record.Name, record.NodeIP)
-        completed[key] = true
-    }
+### 8.9 迁移策略
 
-    // 3. 获取失败记录
-    lastFailure := cluster.Status.OperationProgress.LastFailure
-    failedKey := ""
-    if lastFailure != nil {
-        failedKey = fmt.Sprintf("%s:%s", lastFailure.Name, lastFailure.NodeIP)
-    }
+（保留原有设计，详见 v3 文档）
 
-    // 4. 构建执行计划
-    executionPlan := r.buildExecutionPlan(dag, completed, failedKey)
+### 8.10 实现文件清单
 
-    // 5. 执行 DAG
-    return r.executeExecutionPlan(ctx, cluster, executionPlan)
-}
-
-func (r *BKEClusterReconciler) buildExecutionPlan(
-    dag *topology.UpgradeDAG,
-    completed map[string]bool,
-    failedKey string,
-) []topology.ComponentNode {
-    var executionPlan []topology.ComponentNode
-
-    for _, node := range dag.Nodes {
-        // 为每个节点生成 key（考虑 nodeIP）
-        nodeKey := fmt.Sprintf("%s:%s", node.Name, node.NodeIP)
-
-        // 跳过已完成的组件
-        if completed[nodeKey] {
-            continue
-        }
-
-        // 如果是失败的组件，标记为需要重试
-        if nodeKey == failedKey {
-            executionPlan = append(executionPlan, node)
-            continue
-        }
-
-        // 检查依赖是否满足
-        if r.checkDependencies(node, completed) {
-            executionPlan = append(executionPlan, node)
-        }
-    }
-
-    return executionPlan
-}
-```
-
-#### 7.7.6 介入后状态转换图
-
-```mermaid
-stateDiagram-v2
-    [*] --> Upgrading: 升级开始
-    Upgrading --> Failed: 失败 (Attempt=1)
-    Failed --> Failed: 自动重试 (Attempt=2)
-    Failed --> Failed: 自动重试 (Attempt=3)
-    Failed --> NeedsManualIntervention: 达到最大重试次数
-
-    state NeedsManualIntervention {
-        [*] --> WaitingForIntervention
-        WaitingForIntervention --> UserSetsAnnotation: 用户设置注解
-        UserSetsAnnotation --> ResetState: 清除注解
-        ResetState --> ResetComponentLifecycle: 重置失败组件状态
-        ResetComponentLifecycle --> ExecuteDAG: 执行 DAG
-    }
-
-    NeedsManualIntervention --> Upgrading: 重试成功
-    NeedsManualIntervention --> Failed: 重试失败 (Attempt=1)
-
-    Upgrading --> Running: 升级完成
-    Running --> [*]
-```
-
-**状态转换时序**：
+**新增文件**：
 
 ```
-T0: 升级失败，达到最大重试次数
-    BKECluster.Status.LifecyclePhase = Failed
-    OperationProgress.LastFailure = {Name: "etcd", NodeIP: "10.0.0.1", Attempt: 3}
-    OperationProgress.NeedsManualIntervention = true
+pkg/statemachine/
+├── health_aggregator.go  # 健康状态聚合器
+└── health_checker.go     # 健康检查器
 
-T1: 用户诊断问题并修复
-    kubectl annotate bkecluster my-cluster cvo.openfuyao.cn/retry-operation=Upgrade
-
-T2: Watch 事件触发，立即 Reconcile
-    检测到注解 → 清除注解
-    重置 LastFailure = nil
-    重置 NeedsManualIntervention = false
-    重置组件状态：NodeComponentStatuses["etcd"]["10.0.0.1"].Phase = Pending
-
-T3: 执行 DAG（从失败点继续）
-    跳过已完成的组件（containerd, bkeagent）
-    重试失败的组件（etcd）
-
-T4: 升级完成
-    BKECluster.Status.LifecyclePhase = Running
-    OperationProgress.FinishedAt = now
-    OperationProgress.LastFailure = nil
+api/bkecommon/v1beta1/
+└── health_status.go      # 健康状态类型定义
 ```
 
-### 7.8 Feature Gate 设计
-
-#### 7.8.1 Feature Gate 定义
-
-```go
-// 文件：utils/capbke/featuregate/gates.go
-const (
-    // StateMachineV3 启用 v3 状态机
-    StateMachineV3 = "StateMachineV3"
-)
-
-var defaultFeatureGates = map[string]bool{
-    StateMachineV3: false, // 默认关闭
-}
-```
-
-#### 7.8.2 Feature Gate 行为矩阵
-
-| Feature Gate | PhaseFlow | DAG 调度 | 生命周期评估 | 旧字段写入 | 新字段写入 |
-|-------------|-----------|---------|-------------|-----------|-----------|
-| `StateMachineV3=false` | ✅ 执行 | ✅ 执行 | ❌ 跳过 | ✅ 写入 | ❌ 不写入 |
-| `StateMachineV3=true` | ✅ 执行 | ✅ 执行 | ✅ 执行 | ✅ 双写 | ✅ 写入 |
-
-### 7.9 迁移策略
-
-#### 7.9.1 阶段规划
+**修改文件**：
 
 ```
-Phase 1: 基础设施（v3.0-alpha）
-  ├─ 新增 LifecyclePhase 类型和常量
-  ├─ 新增 BKEClusterStatus.LifecyclePhase 字段
-  ├─ 新增 BKENodeStatus.LifecyclePhase 字段
-  ├─ 新增 OperationProgress 类型
-  ├─ 新增 ComponentLifecycleStatus 类型
-  ├─ 实现 pkg/statemachine 包
-  └─ 添加 Feature Gate（默认关闭）
+pkg/statemachine/
+├── aggregator.go         # 移除集群状态聚合逻辑
+├── cluster_machine.go    # 更新状态转换规则
+└── engine.go             # 集成驱动模型
 
-Phase 2: 双写模式（v3.0-beta）
-  ├─ 在 Reconciler 中集成生命周期评估
-  ├─ 实现兼容性映射（新 → 旧）
-  ├─ DAG 调度器集成组件生命周期
-  ├─ 开启 Feature Gate 进行内部测试
-  └─ 验证旧字段写入正确性
+controllers/capbke/
+└── bkecluster_controller.go  # 新增驱动模型逻辑
 
-Phase 3: 默认启用（v3.0）
-  ├─ Feature Gate 默认开启
-  ├─ 外部消费者可以读取新字段
-  ├─ 旧字段保持写入（deprecated）
-  └─ 文档更新
-
-Phase 4: 清理（v4.0）
-  ├─ 移除 Feature Gate
-  ├─ 移除旧字段写入逻辑
-  ├─ 标记旧字段为 deprecated
-  └─ 最终移除旧字段
+api/bkecommon/v1beta1/
+├── lifecycle_types.go        # 新增 HealthStatus 类型
+└── operation_progress.go     # 增强 OperationProgress 类型
 ```
 
-#### 7.9.2 CRD 版本兼容
+### 8.11 测试设计
 
-新增字段均为 `+optional`，不影响现有 CRD 的 backward compatibility：
+**新增测试**：
 
-```yaml
-# BKEClusterStatus 新增字段（均为 optional）
-status:
-  lifecyclePhase: ""                    # 新增
-  operationProgress: null               # 新增
-  nodeComponentStatuses: {}             # 新增
-  clusterComponentStatuses: {}          # 新增
-
-# BKENodeStatus 新增字段（均为 optional）
-status:
-  lifecyclePhase: ""                    # 新增
 ```
+pkg/statemachine/
+├── health_aggregator_test.go  # 健康状态聚合器测试
+└── health_checker_test.go     # 健康检查器测试
 
-### 7.10 实现文件清单
-
-| 文件路径 | 操作 | 说明 |
-|---------|------|------|
-| `api/bkecommon/v1beta1/lifecycle_types.go` | 新增 | LifecyclePhase 类型和常量 |
-| `api/bkecommon/v1beta1/operation_progress.go` | 新增 | OperationProgress 类型 |
-| `api/bkecommon/v1beta1/component_lifecycle.go` | 新增 | ComponentLifecycleStatus 类型 |
-| `api/bkecommon/v1beta1/bkecluster_status.go` | 修改 | 新增 LifecyclePhase、OperationProgress 等字段 |
-| `api/bkecommon/v1beta1/bkenode_types.go` | 修改 | 新增 LifecyclePhase 字段 |
-| `pkg/statemachine/engine.go` | 新增 | 状态机引擎核心 |
-| `pkg/statemachine/cluster_machine.go` | 新增 | 集群层状态机（含 Failed 恢复规则） |
-| `pkg/statemachine/node_machine.go` | 新增 | 节点层状态机 |
-| `pkg/statemachine/component_machine.go` | 新增 | 组件层状态机 |
-| `pkg/statemachine/aggregator.go` | 新增 | 状态聚合器 |
-| `pkg/statemachine/transition.go` | 新增 | 状态转换规则 |
-| `pkg/statemachine/compatibility.go` | 新增 | 兼容性映射 |
-| `pkg/statemachine/types.go` | 新增 | 内部类型 |
-| `controllers/capbke/bkecluster_controller.go` | 修改 | 集成生命周期评估和人工介入处理 |
-| `controllers/capbke/manual_intervention.go` | 新增 | 人工介入处理逻辑（handleManualIntervention、resumeDAG） |
-| `pkg/dagexec/scheduler.go` | 修改 | 集成组件生命周期更新 |
-| `utils/capbke/featuregate/gates.go` | 修改 | 新增 StateMachineV3 Feature Gate |
-| `utils/capbke/annotation/annotation.go` | 修改 | 新增 RetryOperationAnnotation 常量 |
-
-### 7.11 测试设计
-
-#### 7.11.1 单元测试
-
-| 测试目标 | 测试文件 | 覆盖范围 |
-|---------|---------|---------|
-| 集群层状态机 | `pkg/statemachine/cluster_machine_test.go` | 所有状态转换路径，包括 Failed 恢复 |
-| 节点层状态机 | `pkg/statemachine/node_machine_test.go` | 所有状态转换路径 |
-| 组件层状态机 | `pkg/statemachine/component_machine_test.go` | 所有状态转换路径 |
-| 状态聚合器 | `pkg/statemachine/aggregator_test.go` | 聚合优先级矩阵 |
-| 兼容性映射 | `pkg/statemachine/compatibility_test.go` | 旧 ↔ 新映射正确性 |
-| 人工介入处理 | `controllers/capbke/manual_intervention_test.go` | 注解检测、状态重置、重试策略 |
-
-#### 7.11.2 集成测试
-
-| 测试场景 | 验证内容 |
-|---------|---------|
-| 安装流程 | Creating → Running 全路径，旧字段同步正确 |
-| 升级流程 | Running → Upgrading → Running，DAG 组件状态同步 |
-| 升级失败回滚 | Upgrading → RollingBack → Running |
-| 扩容流程 | Running → Scaling → Running |
-| 缩容流程 | Running → Scaling → Running |
-| Feature Gate 关闭 | 旧字段正常写入，新字段为空 |
-| Feature Gate 开启 | 新旧字段同时写入，值一致 |
-| Controller 重启恢复 | 从 Status 字段恢复状态机状态 |
-| 人工介入-从失败点继续 | Failed → 注解触发 → 重置失败组件 → 从失败点继续 → Running |
-| 人工介入-从头开始 | Failed → 注解触发(full) → 重置所有进度 → 重新执行 → Running |
-| 人工介入-重试失败 | Failed → 注解触发 → 重试失败 → Attempt 重置为 1 → 再次自动重试 |
-| 人工介入-状态恢复 | Failed → 注解触发 → 组件状态重置为 Pending → 重新安装成功 |
+controllers/capbke/
+└── bkecluster_controller_lifecycle_test.go  # 生命周期阶段测试
+```
 
 ---
 
-**文档版本**: v3.4  
+**文档版本**: v3.0 (混合模型)  
 **维护者**: openFuyao Team
-
----
-
-## 相关文档
-
-- [状态定义完整性审视报告](./kep6-state-machine-v3-state-definition-review.md) - 对本文档中状态定义完整性的独立审视报告
