@@ -662,12 +662,23 @@ stateDiagram-v2
     
     Failed --> Pending : 人工介入触发（Agent/环境失败）
     Failed --> Provisioned : 人工介入触发（组件安装失败）
-    Failed --> Ready : 人工介入触发（升级/回滚/删除失败）
+    Failed --> Upgrading : 人工介入触发（升级失败）
+    Failed --> RollingBack : 人工介入触发（回滚失败）
+    Failed --> Deleting : 人工介入触发（删除失败）
 ```
 
 **为什么没有 `Ready --> Failed`？**
 
 在驱动模型中，`LifecyclePhase` 由**操作**驱动。`Ready` 是稳定状态，表示节点已就绪，没有进行中的操作。运行中故障（如 kubelet 崩溃、容器运行时故障）不是由操作驱动的，应该通过 `HealthStatus` 表达，而不是改变 `LifecyclePhase`。
+
+**为什么没有 `Failed --> Ready`？**
+
+在驱动模型中，`LifecyclePhase` 由**操作**驱动。`Failed` 状态意味着某个操作失败，应该重新执行该操作，而不是直接恢复到 `Ready` 稳定状态。
+
+**设计原则**：
+- `Failed` 后恢复到**操作状态**（Upgrading/RollingBack/Deleting），而不是**稳定状态**（Ready）
+- 重新执行失败的操作，而不是放弃操作
+- 与集群层设计保持一致（集群层没有 `Failed --> Running`）
 
 **运行中故障处理**：
 
@@ -712,9 +723,9 @@ T2: 重启 kubelet
 | Agent 推送失败 | Install | 无 AgentReadyFlag | Pending | 重新推送 Agent |
 | 环境初始化失败 | Install | 无 EnvFlag | Pending | 重新初始化环境 |
 | 组件安装失败 | Install | 有 AgentReadyFlag | Provisioned | 重新安装组件 |
-| 升级失败 | Upgrade | - | Ready | 回滚到 Ready |
-| 回滚失败 | Rollback | - | Ready | 重新回滚 |
-| 删除失败 | Delete | - | Ready | 取消删除 |
+| 升级失败 | Upgrade | - | Upgrading | 重新升级 |
+| 回滚失败 | Rollback | - | RollingBack | 重新回滚 |
+| 删除失败 | Delete | - | Deleting | 重新删除 |
 
 **恢复流程**：
 
@@ -1980,8 +1991,9 @@ controllers/capbke/
 |---------|---------|---------|
 | Agent 推送失败恢复 | 模拟 Agent 推送失败，触发恢复 | 自动恢复到 Pending 状态 |
 | 组件安装失败恢复 | 模拟组件安装失败，触发恢复 | 自动恢复到 Provisioned 状态 |
-| 升级失败恢复 | 模拟升级失败，触发恢复 | 自动恢复到 Ready 状态 |
-| 删除失败恢复 | 模拟删除失败，触发恢复 | 自动恢复到 Ready 状态 |
+| 升级失败恢复 | 模拟升级失败，触发恢复 | 自动恢复到 Upgrading 状态 |
+| 回滚失败恢复 | 模拟回滚失败，触发恢复 | 自动恢复到 RollingBack 状态 |
+| 删除失败恢复 | 模拟删除失败，触发恢复 | 自动恢复到 Deleting 状态 |
 | StateCode 判断 | 根据 StateCode 判断恢复目标 | 正确恢复到对应状态 |
 | 运行中故障处理 | 模拟 kubelet 崩溃 | LifecyclePhase 保持 Ready，HealthStatus 变为 Unhealthy |
 | 运行中故障自动恢复 | 模拟 kubelet 崩溃后自动恢复 | HealthStatus 恢复为 Healthy |
@@ -2131,5 +2143,5 @@ func TestNodeRecoveryFromComponentInstallFailed(t *testing.T) {
 
 ---
 
-**文档版本**: v3.7 (混合模型 - 节点层操作进度追踪)  
+**文档版本**: v3.8 (混合模型 - 统一 Failed 恢复机制)  
 **维护者**: openFuyao Team
