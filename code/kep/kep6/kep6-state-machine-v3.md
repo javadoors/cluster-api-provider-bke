@@ -538,6 +538,52 @@ func (r *Reconciler) determineNodeLifecyclePhase(node *BKENode) LifecyclePhase {
 }
 ```
 
+**恢复决策逻辑**：
+
+当节点处于 `Failed` 状态时，系统通过以下逻辑决定恢复到哪个状态：
+
+1. 读取 `OperationProgress.OperationType`，获取失败的操作类型
+2. 根据操作类型和 `StateCode` 映射到对应的生命周期阶段
+3. 自动恢复到对应的状态，无需用户手动指定
+
+```go
+// determineNodeRecoveryPhase 决定从 Failed 恢复到哪个状态
+func (r *Reconciler) determineNodeRecoveryPhase(node *BKENode) LifecyclePhase {
+    if node.Status.OperationProgress == nil {
+        return NodeLifecyclePending
+    }
+    
+    switch node.Status.OperationProgress.OperationType {
+    case OperationTypeInstall:
+        // 根据 StateCode 判断恢复到哪个状态
+        if node.Status.StateCode&NodeAgentReadyFlag != 0 {
+            return NodeLifecycleProvisioned
+        }
+        return NodeLifecyclePending
+    case OperationTypeUpgrade:
+        return NodeLifecycleReady
+    case OperationTypeRollback:
+        return NodeLifecycleReady
+    case OperationTypeDelete:
+        return NodeLifecycleReady
+    default:
+        return NodeLifecyclePending
+    }
+}
+```
+
+**恢复决策映射表**：
+
+| 失败操作 | OperationType | StateCode | 恢复目标 | 说明 |
+|---------|--------------|-----------|---------|------|
+| Agent 推送失败 | Install | 无 AgentReadyFlag | Pending | 重新推送 Agent |
+| 环境初始化失败 | Install | 无 EnvFlag | Pending | 重新初始化环境 |
+| 组件安装失败 | Install | 有 AgentReadyFlag | Provisioned | 重新安装组件 |
+| 运行中失败 | - | - | Ready | 重启组件 |
+| 升级失败 | Upgrade | - | Ready | 回滚到 Ready |
+| 回滚失败 | Rollback | - | Ready | 重新回滚 |
+| 删除失败 | Delete | - | Ready | 取消删除 |
+
 ### 3.3 状态转换图
 
 ```mermaid
@@ -564,10 +610,58 @@ stateDiagram-v2
     Deleting --> Removed : 删除完成
     Deleting --> Failed : 失败
     
-    Failed --> Pending : 人工介入重试
-    Failed --> Provisioned : 人工介入重试
-    Failed --> Ready : 人工介入重试
+    Failed --> Pending : 自动恢复（Agent/环境失败）
+    Failed --> Provisioned : 自动恢复（组件安装失败）
+    Failed --> Ready : 自动恢复（升级/回滚/删除失败）
 ```
+
+**自动恢复机制**：
+
+从 `Failed` 状态恢复到哪个状态由 `OperationProgress.OperationType` 和 `StateCode` 自动决定：
+
+| 失败操作 | OperationType | StateCode | 恢复目标 | 说明 |
+|---------|--------------|-----------|---------|------|
+| Agent 推送失败 | Install | 无 AgentReadyFlag | Pending | 重新推送 Agent |
+| 环境初始化失败 | Install | 无 EnvFlag | Pending | 重新初始化环境 |
+| 组件安装失败 | Install | 有 AgentReadyFlag | Provisioned | 重新安装组件 |
+| 运行中失败 | - | - | Ready | 重启组件 |
+| 升级失败 | Upgrade | - | Ready | 回滚到 Ready |
+| 回滚失败 | Rollback | - | Ready | 重新回滚 |
+| 删除失败 | Delete | - | Ready | 取消删除 |
+
+**恢复流程**：
+
+```
+T0: 操作失败，进入 Failed 状态
+    LifecyclePhase = Failed
+    OperationProgress.OperationType = Install
+    StateCode = 0（无 AgentReadyFlag）
+
+T1: 用户诊断问题并修复
+
+T2: 用户触发恢复（清除 LastFailure 或设置注解）
+    OperationProgress.LastFailure = nil
+
+T3: 系统自动决定恢复目标
+    读取 OperationProgress.OperationType = Install
+    检查 StateCode = 0（无 AgentReadyFlag）
+    → LifecyclePhase = Pending
+
+T4: 重新执行操作
+```
+
+**恢复触发方式**：
+
+1. **清除 LastFailure**（推荐）
+   ```bash
+   kubectl patch bkenode node-1 --type merge \
+     -p '{"status":{"operationProgress":{"lastFailure":null}}}'
+   ```
+
+2. **通过注解触发**
+   ```bash
+   kubectl annotate bkenode node-1 bke.bocloud.com/retry-operation=true
+   ```
 
 ---
 
@@ -1378,6 +1472,83 @@ func (r *Reconciler) handleRecovery(ctx context.Context, cluster *BKECluster) (c
 }
 ```
 
+**节点层自动恢复机制**：
+
+当节点触发恢复时，系统自动决定恢复到哪个状态，无需用户手动指定。
+
+**节点层恢复流程**：
+
+```go
+func (r *Reconciler) handleNodeRecovery(ctx context.Context, node *BKENode) (ctrl.Result, error) {
+    // 1. 清除失败状态
+    node.Status.OperationProgress.LastFailure = nil
+    node.Status.OperationProgress.NeedsManualIntervention = false
+    
+    // 2. 自动决定恢复目标
+    recoveryPhase := r.determineNodeRecoveryPhase(node)
+    node.Status.LifecyclePhase = recoveryPhase
+    
+    // 3. 重置操作进度
+    node.Status.OperationProgress.StartedAt = &metav1.Time{Time: time.Now()}
+    
+    // 4. 更新状态
+    if err := r.Status().Update(ctx, node); err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    // 5. 重新执行操作
+    return r.executeNodeOperation(ctx, node, recoveryPhase)
+}
+```
+
+**节点层示例场景**：
+
+**场景 3：Agent 推送失败恢复**
+```
+T0: Agent 推送失败
+    LifecyclePhase = Failed
+    OperationProgress.OperationType = Install
+    StateCode = 0（无 AgentReadyFlag）
+    OperationProgress.LastFailure = {Error: "agent push failed"}
+
+T1: 用户诊断问题并修复
+    修复网络连接
+
+T2: 用户触发恢复
+    kubectl patch bkenode node-1 --type merge \
+      -p '{"status":{"operationProgress":{"lastFailure":null}}}'
+
+T3: 系统自动决定
+    OperationProgress.OperationType = Install
+    StateCode = 0（无 AgentReadyFlag）
+    → LifecyclePhase = Pending
+
+T4: 重新推送 Agent
+```
+
+**场景 4：组件安装失败恢复**
+```
+T0: 组件安装失败
+    LifecyclePhase = Failed
+    OperationProgress.OperationType = Install
+    StateCode = NodeAgentReadyFlag（有 AgentReadyFlag）
+    OperationProgress.LastFailure = {Error: "containerd install failed"}
+
+T1: 用户诊断问题并修复
+    修复 containerd 安装脚本
+
+T2: 用户触发恢复
+    kubectl patch bkenode node-1 --type merge \
+      -p '{"status":{"operationProgress":{"lastFailure":null}}}'
+
+T3: 系统自动决定
+    OperationProgress.OperationType = Install
+    StateCode = NodeAgentReadyFlag（有 AgentReadyFlag）
+    → LifecyclePhase = Provisioned
+
+T4: 重新安装组件
+```
+
 ### 8.8 Feature Gate 设计
 
 （保留原有设计，详见 v3 文档）
@@ -1431,6 +1602,8 @@ controllers/capbke/
 
 **自动恢复机制测试用例**：
 
+**集群层测试用例**：
+
 | 测试场景 | 测试内容 | 预期结果 |
 |---------|---------|---------|
 | 升级失败恢复 | 模拟升级失败，触发恢复 | 自动恢复到 Upgrading 状态 |
@@ -1442,6 +1615,16 @@ controllers/capbke/
 | 从失败点继续 | 恢复后从失败组件继续 | 跳过已完成组件 |
 | 非 Failed 状态恢复 | 在非 Failed 状态触发恢复 | 返回错误 |
 | 无 OperationProgress 恢复 | 无 OperationProgress 时触发恢复 | 返回错误 |
+
+**节点层测试用例**：
+
+| 测试场景 | 测试内容 | 预期结果 |
+|---------|---------|---------|
+| Agent 推送失败恢复 | 模拟 Agent 推送失败，触发恢复 | 自动恢复到 Pending 状态 |
+| 组件安装失败恢复 | 模拟组件安装失败，触发恢复 | 自动恢复到 Provisioned 状态 |
+| 升级失败恢复 | 模拟升级失败，触发恢复 | 自动恢复到 Ready 状态 |
+| 删除失败恢复 | 模拟删除失败，触发恢复 | 自动恢复到 Ready 状态 |
+| StateCode 判断 | 根据 StateCode 判断恢复目标 | 正确恢复到对应状态 |
 
 **测试代码示例**：
 
@@ -1533,9 +1716,57 @@ func TestRecoveryFromFailurePoint(t *testing.T) {
     // 4. 验证跳过已完成组件
     // 应该从 etcd 开始升级，而不是从 containerd 开始
 }
+
+// 测试节点层 Agent 推送失败恢复
+func TestNodeRecoveryFromAgentPushFailed(t *testing.T) {
+    // 1. 创建节点并模拟 Agent 推送失败
+    node := &bkev1beta1.BKENode{
+        Status: bkev1beta1.BKENodeStatus{
+            LifecyclePhase: bkev1beta1.NodeLifecycleFailed,
+            StateCode:      0, // 无 AgentReadyFlag
+            OperationProgress: &bkev1beta1.OperationProgress{
+                OperationType: bkev1beta1.OperationTypeInstall,
+                LastFailure: &bkev1beta1.OperationFailureRecord{
+                    Error: "agent push failed",
+                },
+            },
+        },
+    }
+    
+    // 2. 触发恢复（清除 LastFailure）
+    node.Status.OperationProgress.LastFailure = nil
+    
+    // 3. 验证自动恢复到 Pending 状态
+    recoveryPhase := r.determineNodeRecoveryPhase(node)
+    assert.Equal(t, bkev1beta1.NodeLifecyclePending, recoveryPhase)
+}
+
+// 测试节点层组件安装失败恢复
+func TestNodeRecoveryFromComponentInstallFailed(t *testing.T) {
+    // 1. 创建节点并模拟组件安装失败
+    node := &bkev1beta1.BKENode{
+        Status: bkev1beta1.BKENodeStatus{
+            LifecyclePhase: bkev1beta1.NodeLifecycleFailed,
+            StateCode:      bkev1beta1.NodeAgentReadyFlag, // 有 AgentReadyFlag
+            OperationProgress: &bkev1beta1.OperationProgress{
+                OperationType: bkev1beta1.OperationTypeInstall,
+                LastFailure: &bkev1beta1.OperationFailureRecord{
+                    Error: "containerd install failed",
+                },
+            },
+        },
+    }
+    
+    // 2. 触发恢复（清除 LastFailure）
+    node.Status.OperationProgress.LastFailure = nil
+    
+    // 3. 验证自动恢复到 Provisioned 状态
+    recoveryPhase := r.determineNodeRecoveryPhase(node)
+    assert.Equal(t, bkev1beta1.NodeLifecycleProvisioned, recoveryPhase)
+}
 ```
 
 ---
 
-**文档版本**: v3.1 (混合模型 - 自动恢复机制)  
+**文档版本**: v3.2 (混合模型 - 节点层自动恢复机制)  
 **维护者**: openFuyao Team
