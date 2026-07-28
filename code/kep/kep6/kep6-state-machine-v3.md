@@ -158,7 +158,7 @@ const (
 | `Scaling` | 集群正在扩容或缩容（节点增减） | 用户触发扩缩容 |
 | `RollingBack` | 集群正在回滚（升级失败后恢复） | 升级失败自动触发 |
 | `Deleting` | 集群正在删除（节点删除、组件卸载） | 用户触发删除 |
-| `Removed` | 集群已删除 | 删除完成 |
+| `Deleted` | 集群已删除 | 删除完成 |
 | `Failed` | 集群失败（需要人工介入） | 操作失败 |
 
 ### 2.2 驱动规则
@@ -480,7 +480,7 @@ const (
 | `Upgrading` | 节点正在升级（组件升级中） | 用户触发升级 |
 | `RollingBack` | 节点正在回滚（升级失败后恢复） | 升级失败自动触发 |
 | `Deleting` | 节点正在删除（组件卸载中） | 用户触发删除 |
-| `Removed` | 节点已删除 | 删除完成 |
+| `Deleted` | 节点已删除 | 删除完成 |
 | `Failed` | 节点失败 | 操作失败 |
 
 #### 3.1.1 Provisioned 与 Ready 状态的区别
@@ -576,7 +576,7 @@ func (r *Reconciler) determineNodeLifecyclePhase(node *BKENode) LifecyclePhase {
     
     // 检查是否已删除
     if node.DeletionTimestamp != nil {
-        return NodeLifecycleRemoved
+        return NodeLifecycleDeleted
     }
     
     // 检查是否就绪
@@ -659,7 +659,7 @@ stateDiagram-v2
     RollingBack --> Ready : 回滚完成
     RollingBack --> Failed : 回滚失败
     
-    Deleting --> Removed : 删除完成
+    Deleting --> Deleted : 删除完成
     Deleting --> Failed : 失败
     
     Failed --> Pending : 人工介入触发（Agent/环境失败）
@@ -919,7 +919,7 @@ T4: 从失败点继续升级
 | `Upgrading` | 组件正在升级 | 触发升级 |
 | `RollingBack` | 组件正在回滚（升级失败后恢复） | 升级失败自动触发 |
 | `Deleting` | 组件正在删除 | 触发删除 |
-| `Removed` | 组件已删除 | 删除成功 |
+| `Deleted` | 组件已删除 | 删除成功 |
 | `Failed` | 组件安装/升级/删除失败 | 操作失败 |
 
 ### 4.2 驱动规则
@@ -954,7 +954,7 @@ func (r *Reconciler) determineComponentLifecyclePhase(
     
     // 检查是否已删除
     if component.Deleted {
-        return ComponentLifecycleRemoved
+        return ComponentLifecycleDeleted
     }
     
     // 检查是否已安装
@@ -989,7 +989,7 @@ stateDiagram-v2
     RollingBack --> Installed : 回滚成功
     RollingBack --> Failed : 回滚失败
     
-    Deleting --> Removed : 删除成功
+    Deleting --> Deleted : 删除成功
     Deleting --> Failed : 失败
     
     Failed --> Installing : 重试
@@ -2145,5 +2145,5 @@ func TestNodeRecoveryFromComponentInstallFailed(t *testing.T) {
 
 ---
 
-**文档版本**: v3.10 (混合模型 - 统一删除状态命名)  
+**文档版本**: v3.11 (混合模型 - 统一删除状态命名)  
 **维护者**: openFuyao Team
