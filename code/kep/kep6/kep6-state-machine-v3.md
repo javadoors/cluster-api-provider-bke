@@ -779,17 +779,17 @@ type NodeOperationProgress struct {
     // 当前阶段
     CurrentStage string `json:"currentStage,omitempty"`
     
-    // 总任务数
-    TotalTasks int `json:"totalTasks,omitempty"`
+    // 总组件数
+    TotalComponents int `json:"totalComponents,omitempty"`
     
-    // 已完成任务数
-    CompletedTasks int `json:"completedTasks,omitempty"`
+    // 已完成组件数
+    CompletedComponents int `json:"completedComponents,omitempty"`
     
-    // 失败的任务列表
-    FailedTasks []string `json:"failedTasks,omitempty"`
+    // 失败的组件列表
+    FailedComponents []string `json:"failedComponents,omitempty"`
     
-    // 已完成任务列表
-    Completed []NodeTaskRecord `json:"completed,omitempty"`
+    // 已完成组件列表
+    Completed []NodeComponentRecord `json:"completed,omitempty"`
     
     // 最后失败记录
     LastFailure *NodeOperationFailureRecord `json:"lastFailure,omitempty"`
@@ -810,16 +810,16 @@ const (
     NodeOperationTypeDelete   NodeOperationType = "Delete"
 )
 
-type NodeTaskRecord struct {
+type NodeComponentRecord struct {
     Name        string      `json:"name"`
     CompletedAt metav1.Time `json:"completedAt"`
 }
 
 type NodeOperationFailureRecord struct {
-    TaskName string      `json:"taskName"`
-    FailedAt metav1.Time `json:"failedAt"`
-    Error    string      `json:"error,omitempty"`
-    Attempt  int32       `json:"attempt,omitempty"`
+    ComponentName string      `json:"componentName"`
+    FailedAt      metav1.Time `json:"failedAt"`
+    Error         string      `json:"error,omitempty"`
+    Attempt       int32       `json:"attempt,omitempty"`
 }
 
 type StateCodeChange struct {
@@ -846,34 +846,34 @@ type StateCodeChange struct {
 T0: 开始安装节点
     OperationProgress.OperationType = Install
     OperationProgress.CurrentStage = "PushingAgent"
-    OperationProgress.TotalTasks = 5
-    OperationProgress.CompletedTasks = 0
+    OperationProgress.TotalComponents = 5
+    OperationProgress.CompletedComponents = 0
 
 T1: Agent 推送完成
     OperationProgress.CurrentStage = "InitializingEnvironment"
-    OperationProgress.CompletedTasks = 1
+    OperationProgress.CompletedComponents = 1
     OperationProgress.Completed = [{Name: "PushAgent", CompletedAt: now}]
     StateCode |= NodeAgentReadyFlag
     StateCodeChanges = [{Timestamp: now, OldValue: 0, NewValue: 2, Reason: "AgentReady"}]
 
 T2: 环境初始化完成
     OperationProgress.CurrentStage = "InstallingContainerd"
-    OperationProgress.CompletedTasks = 2
+    OperationProgress.CompletedComponents = 2
     OperationProgress.Completed = [{Name: "PushAgent"}, {Name: "InitEnvironment"}]
     StateCode |= NodeEnvFlag
     StateCodeChanges = [..., {Timestamp: now, OldValue: 2, NewValue: 6, Reason: "EnvInitialized"}]
 
 T3: containerd 安装完成
     OperationProgress.CurrentStage = "InstallingKubelet"
-    OperationProgress.CompletedTasks = 3
+    OperationProgress.CompletedComponents = 3
 
 T4: kubelet 安装完成
     OperationProgress.CurrentStage = "InstallingOtherComponents"
-    OperationProgress.CompletedTasks = 4
+    OperationProgress.CompletedComponents = 4
 
 T5: 所有组件安装完成
     OperationProgress.FinishedAt = now
-    OperationProgress.CompletedTasks = 5
+    OperationProgress.CompletedComponents = 5
     LifecyclePhase = Ready
 ```
 
@@ -882,9 +882,9 @@ T5: 所有组件安装完成
 T0: 升级失败
     OperationProgress.OperationType = Upgrade
     OperationProgress.CurrentStage = "UpgradingKubelet"
-    OperationProgress.CompletedTasks = 1
-    OperationProgress.FailedTasks = ["UpgradeKubelet"]
-    OperationProgress.LastFailure = {TaskName: "UpgradeKubelet", Error: "upgrade failed"}
+    OperationProgress.CompletedComponents = 1
+    OperationProgress.FailedComponents = ["UpgradeKubelet"]
+    OperationProgress.LastFailure = {ComponentName: "UpgradeKubelet", Error: "upgrade failed"}
     LifecyclePhase = Failed
 
 T1: 用户诊断问题并修复
@@ -900,7 +900,7 @@ T3: 系统自动决定恢复目标
 
 T4: 从失败点继续升级
     OperationProgress.CurrentStage = "UpgradingKubelet"
-    跳过已完成的任务（UpgradeContainerd）
+    跳过已完成的组件（UpgradeContainerd）
 ```
 
 ---
@@ -2143,5 +2143,5 @@ func TestNodeRecoveryFromComponentInstallFailed(t *testing.T) {
 
 ---
 
-**文档版本**: v3.8 (混合模型 - 统一 Failed 恢复机制)  
+**文档版本**: v3.9 (混合模型 - 统一组件命名)  
 **维护者**: openFuyao Team
