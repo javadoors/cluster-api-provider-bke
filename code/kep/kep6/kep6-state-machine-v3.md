@@ -223,9 +223,31 @@ stateDiagram-v2
     Scaling --> Failed : 扩缩容失败
     
     Failed --> Creating : 人工介入重试
-    Failed --> Running : 人工介入重试
     Failed --> Upgrading : 人工介入重试
+    Failed --> Scaling : 人工介入重试
+    Failed --> RollingBack : 人工介入重试
 ```
+
+**状态转换说明**：
+
+**为什么没有 `Failed --> Running`？**
+
+在驱动模型中，`LifecyclePhase` 由操作决定。`Failed` 状态意味着某个操作失败，应该重新执行该操作，而不是直接恢复到 `Running` 状态。
+
+**恢复策略**：
+
+| 失败场景 | 恢复路径 | 说明 |
+|---------|---------|------|
+| Creating 失败 | `Failed --> Creating` | 重新执行安装操作 |
+| Upgrading 失败 | `Failed --> Upgrading` | 重新执行升级操作 |
+| Scaling 失败 | `Failed --> Scaling` | 重新执行扩缩容操作 |
+| RollingBack 失败 | `Failed --> RollingBack` | 重新执行回滚操作 |
+
+**特殊场景**：
+
+如果操作已经部分完成，管理员可以选择：
+1. **重新执行操作**：通过状态机恢复（推荐）
+2. **手动完成操作**：通过 API 直接修改状态（不推荐，可能导致状态不一致）
 
 ### 2.4 操作进度追踪
 
