@@ -157,6 +157,8 @@ const (
 | `Upgrading` | 集群正在升级（版本变更中） | 用户触发升级 |
 | `Scaling` | 集群正在扩容或缩容（节点增减） | 用户触发扩缩容 |
 | `RollingBack` | 集群正在回滚（升级失败后恢复） | 升级失败自动触发 |
+| `Deleting` | 集群正在删除（节点删除、组件卸载） | 用户触发删除 |
+| `Removed` | 集群已删除 | 删除完成 |
 | `Failed` | 集群失败（需要人工介入） | 操作失败 |
 
 ### 2.2 驱动规则
@@ -837,7 +839,7 @@ type StateCodeChange struct {
 | 节点安装 | `Install` | `PushingAgent` / `InitializingEnvironment` / `InstallingContainerd` / `InstallingKubelet` / `InstallingOtherComponents` |
 | 节点升级 | `Upgrade` | `UpgradingContainerd` / `UpgradingKubelet` / `UpgradingOtherComponents` |
 | 节点回滚 | `Rollback` | `RollingBackContainerd` / `RollingBackKubelet` / `RollingBackOtherComponents` |
-| 节点删除 | `Delete` | `UninstallingComponents` / `CleaningEnvironment` / `RemovingAgent` |
+| 节点删除 | `Delete` | `DeletingComponents` / `CleaningEnvironment` / `RemovingAgent` |
 
 **示例场景**：
 
@@ -916,9 +918,9 @@ T4: 从失败点继续升级
 | `Installed` | 组件已安装（运行中） | 安装成功 |
 | `Upgrading` | 组件正在升级 | 触发升级 |
 | `RollingBack` | 组件正在回滚（升级失败后恢复） | 升级失败自动触发 |
-| `Uninstalling` | 组件正在卸载 | 触发卸载 |
-| `Removed` | 组件已卸载 | 卸载成功 |
-| `Failed` | 组件安装/升级/卸载失败 | 操作失败 |
+| `Deleting` | 组件正在删除 | 触发删除 |
+| `Removed` | 组件已删除 | 删除成功 |
+| `Failed` | 组件安装/升级/删除失败 | 操作失败 |
 
 ### 4.2 驱动规则
 
@@ -939,8 +941,8 @@ func (r *Reconciler) determineComponentLifecyclePhase(
             return ComponentLifecycleUpgrading
         case OperationTypeRollback:
             return ComponentLifecycleRollingBack
-        case OperationTypeUninstall:
-            return ComponentLifecycleUninstalling
+        case OperationTypeDelete:
+            return ComponentLifecycleDeleting
         }
     }
     
@@ -950,8 +952,8 @@ func (r *Reconciler) determineComponentLifecyclePhase(
         return ComponentLifecycleFailed
     }
     
-    // 检查是否已卸载
-    if component.Uninstalled {
+    // 检查是否已删除
+    if component.Deleted {
         return ComponentLifecycleRemoved
     }
     
@@ -977,7 +979,7 @@ stateDiagram-v2
     Installing --> Failed : 失败
     
     Installed --> Upgrading : 触发升级
-    Installed --> Uninstalling : 触发卸载
+    Installed --> Deleting : 触发删除
     Installed --> Failed : 失败
     
     Upgrading --> Installed : 升级成功
@@ -987,12 +989,12 @@ stateDiagram-v2
     RollingBack --> Installed : 回滚成功
     RollingBack --> Failed : 回滚失败
     
-    Uninstalling --> Removed : 卸载成功
-    Uninstalling --> Failed : 失败
+    Deleting --> Removed : 删除成功
+    Deleting --> Failed : 失败
     
     Failed --> Installing : 重试
     Failed --> Upgrading : 重试
-    Failed --> Uninstalling : 重试
+    Failed --> Deleting : 重试
 ```
 
 ---
@@ -2143,5 +2145,5 @@ func TestNodeRecoveryFromComponentInstallFailed(t *testing.T) {
 
 ---
 
-**文档版本**: v3.9 (混合模型 - 统一组件命名)  
+**文档版本**: v3.10 (混合模型 - 统一删除状态命名)  
 **维护者**: openFuyao Team
