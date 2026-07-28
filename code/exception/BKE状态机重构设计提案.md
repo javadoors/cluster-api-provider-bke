@@ -1817,11 +1817,11 @@ params.CombinedCluster.Status.ClusterHealthState = newBKECuster.Status.ClusterHe
 - 集成测试：集群创建、升级、删除流程
 - 端到端测试：完整的 BKE 系统测试
 
-### 2.2 增强方案一：状态转换表（适配单字段设计）
+### 4.2 增强方案一：状态转换表（适配单字段设计）
 
 **设计思路**: 在三字段整合的基础上，使用状态转换表统一定义所有状态转换规则，集中管理状态转换逻辑。
 
-### 2.2.1 状态转换规则设计
+### 4.2.1 状态转换规则设计
 
 **设计原则**：
 
@@ -1878,7 +1878,7 @@ type Transition struct {
 | 删除 | 7 | 多入口→Deleting→Failed |
 | **总计** | **64** | |
 
-### 2.2.2 状态机引擎实现
+### 4.2.2 状态机引擎实现
 
 ###### 设计缺陷分析：err 参数必须影响触发器选择
 
@@ -1961,7 +1961,7 @@ func (e *Engine) Transition(cluster *BKECluster, nodes BKENodes, trigger string,
 - 只使用 ClusterStatus，简化了状态管理逻辑
 - **err 参数正确影响触发器选择**，确保成功/失败路径正确分离
 
-### 2.2.3 Transition 替换原有业务逻辑
+### 4.2.3 Transition 替换原有业务逻辑
 
 ###### 调用链对比
 
@@ -3282,7 +3282,7 @@ func (e *Engine) handleRetry(cluster *BKECluster, trigger string) error {
 2. **精确匹配**：通过 `FromState + Trigger` 精确匹配，避免歧义
 3. **统一失败处理**：所有失败路径统一走 `Error` 触发器
 
-### 2.3 增强方案二：改进状态管理器（适配单字段设计）
+### 4.3 增强方案二：改进状态管理器（适配单字段设计）
 
 **设计思路**: 在三字段整合的基础上，解决内存泄漏、灵活重试、并发安全等问题。
 
@@ -3909,7 +3909,7 @@ func (b *StatusManagerV2) RemoveSingleNodeStatusCache(bkeCluster *bkev1beta1.BKE
 - 更灵活的状态回退机制
 - 完整替换旧状态管理器，提供所有核心方法
 
-### 2.3.1 替换原状态管理器的完整设计
+### 4.3.1 替换原状态管理器的完整设计
 
 ###### 设计决策
 
@@ -4663,7 +4663,7 @@ V2 内部逻辑：
   └── 验证内存泄漏修复
 ```
 
-### 2.4 增强方案三：状态转换事件系统（适配单字段设计）
+### 4.4 增强方案三：状态转换事件系统（适配单字段设计）
 
 **设计思路**: 在三字段整合的基础上，记录所有状态转换事件，提供可观测性支持。
 
@@ -5062,7 +5062,7 @@ func (r *StateMachineEventRecorder) exportDotGraph(events []StateTransitionEvent
 └─────────────────────────────────────────────────────────┘
 ```
 
-### 3.2 阶段一：三字段整合（核心，必须）
+### 5.2 阶段一：三字段整合（核心，必须）
 
 **目标**：解决 Phase、ClusterStatus、ClusterHealthState 三个字段的职责重叠问题。
 
@@ -5100,7 +5100,7 @@ func (r *StateMachineEventRecorder) exportDotGraph(events []StateTransitionEvent
 - 外部消费者无感知
 - 提供生命周期阶段映射函数，支持向三层状态机架构演进
 
-### 3.3 阶段二：状态机增强（可选）
+### 5.3 阶段二：状态机增强（可选）
 
 **目标**：在三字段整合的基础上，进一步增强状态机的可维护性和可观测性。
 
@@ -5316,7 +5316,7 @@ func TestConditionFunctions(t *testing.T) {
 }
 ```
 
-### 3.2 集成测试
+### 7.2 集成测试
 
 ```go
 package statemachine_test
