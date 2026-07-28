@@ -270,11 +270,11 @@ stateDiagram-v2
     Scaling --> Running : 扩缩容完成
     Scaling --> Failed : 扩缩容失败
     
-    Failed --> Pending : 自动恢复
-    Failed --> Installing : 自动恢复
-    Failed --> Upgrading : 自动恢复
-    Failed --> Scaling : 自动恢复
-    Failed --> RollingBack : 自动恢复
+    Failed --> Pending : 人工介入触发
+    Failed --> Installing : 人工介入触发
+    Failed --> Upgrading : 人工介入触发
+    Failed --> Scaling : 人工介入触发
+    Failed --> RollingBack : 人工介入触发
 ```
 
 **状态转换说明**：
@@ -306,9 +306,24 @@ T2: 重启 etcd
     HealthStatus.Overall = Healthy
 ```
 
-**自动恢复机制**：
+**恢复机制**：
 
-从 `Failed` 状态恢复到哪个状态由 `OperationProgress.OperationType` 自动决定，无需用户手动指定：
+从 `Failed` 状态恢复需要**人工介入触发**，系统根据 `OperationProgress.OperationType` **自动决定恢复目标**：
+
+1. 用户诊断问题并修复
+2. 用户触发恢复（清除 LastFailure 或设置注解）
+3. 系统自动决定恢复目标
+4. 重新执行操作
+
+**为什么需要人工介入？**
+
+- 操作失败通常需要诊断和修复（如网络问题、配置错误）
+- 自动恢复可能掩盖问题
+- 人工介入确保问题得到正确解决
+
+**系统自动决定恢复目标**：
+
+系统根据 `OperationProgress.OperationType` 自动决定恢复到哪个状态，无需用户手动指定：
 
 | OperationType | 恢复目标 | 说明 |
 |--------------|---------|------|
@@ -645,9 +660,9 @@ stateDiagram-v2
     Deleting --> Removed : 删除完成
     Deleting --> Failed : 失败
     
-    Failed --> Pending : 自动恢复（Agent/环境失败）
-    Failed --> Provisioned : 自动恢复（组件安装失败）
-    Failed --> Ready : 自动恢复（升级/回滚/删除失败）
+    Failed --> Pending : 人工介入触发（Agent/环境失败）
+    Failed --> Provisioned : 人工介入触发（组件安装失败）
+    Failed --> Ready : 人工介入触发（升级/回滚/删除失败）
 ```
 
 **为什么没有 `Ready --> Failed`？**
@@ -673,9 +688,24 @@ T2: 重启 kubelet
     HealthStatus.Overall = Healthy
 ```
 
-**自动恢复机制**：
+**恢复机制**：
 
-从 `Failed` 状态恢复到哪个状态由 `OperationProgress.OperationType` 和 `StateCode` 自动决定：
+从 `Failed` 状态恢复需要**人工介入触发**，系统根据 `OperationProgress.OperationType` 和 `StateCode` **自动决定恢复目标**：
+
+1. 用户诊断问题并修复
+2. 用户触发恢复（清除 LastFailure 或设置注解）
+3. 系统自动决定恢复目标
+4. 重新执行操作
+
+**为什么需要人工介入？**
+
+- 操作失败通常需要诊断和修复（如网络问题、配置错误）
+- 自动恢复可能掩盖问题
+- 人工介入确保问题得到正确解决
+
+**系统自动决定恢复目标**：
+
+系统根据 `OperationProgress.OperationType` 和 `StateCode` 自动决定恢复到哪个状态，无需用户手动指定：
 
 | 失败操作 | OperationType | StateCode | 恢复目标 | 说明 |
 |---------|--------------|-----------|---------|------|
@@ -1943,5 +1973,5 @@ func TestNodeRecoveryFromComponentInstallFailed(t *testing.T) {
 
 ---
 
-**文档版本**: v3.5 (混合模型 - 移除 Running->Failed 转换)  
+**文档版本**: v3.6 (混合模型 - 统一 Failed 恢复机制)  
 **维护者**: openFuyao Team
