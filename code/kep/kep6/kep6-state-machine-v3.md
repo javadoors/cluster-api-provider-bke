@@ -199,6 +199,45 @@ func (r *Reconciler) determineLifecyclePhase(cluster *BKECluster) LifecyclePhase
 - `RollingBack`：当 `OperationProgress.OperationType = Rollback` 且未完成时
 - `Failed`：当 `OperationProgress.LastFailure != nil` 时
 
+**恢复决策逻辑**：
+
+当集群处于 `Failed` 状态时，系统通过以下逻辑决定恢复到哪个状态：
+
+1. 读取 `OperationProgress.OperationType`，获取失败的操作类型
+2. 根据操作类型映射到对应的生命周期阶段
+3. 自动恢复到对应的状态，无需用户手动指定
+
+```go
+// determineRecoveryPhase 决定从 Failed 恢复到哪个状态
+func (r *Reconciler) determineRecoveryPhase(cluster *BKECluster) LifecyclePhase {
+    if cluster.Status.OperationProgress == nil {
+        return ClusterLifecycleRunning
+    }
+    
+    switch cluster.Status.OperationProgress.OperationType {
+    case OperationTypeInstall:
+        return ClusterLifecycleCreating
+    case OperationTypeUpgrade:
+        return ClusterLifecycleUpgrading
+    case OperationTypeScale:
+        return ClusterLifecycleScaling
+    case OperationTypeRollback:
+        return ClusterLifecycleRollingBack
+    default:
+        return ClusterLifecycleRunning
+    }
+}
+```
+
+**恢复决策映射表**：
+
+| OperationType | 恢复目标 | 说明 |
+|--------------|---------|------|
+| `Install` | `Creating` | 重新执行安装操作 |
+| `Upgrade` | `Upgrading` | 重新执行升级操作 |
+| `Scale` | `Scaling` | 重新执行扩缩容操作 |
+| `Rollback` | `RollingBack` | 重新执行回滚操作 |
+
 ### 2.3 状态转换图
 
 ```mermaid
@@ -234,6 +273,50 @@ stateDiagram-v2
 
 在驱动模型中，`LifecyclePhase` 由操作决定。`Failed` 状态意味着某个操作失败，应该重新执行该操作，而不是直接恢复到 `Running` 状态。
 
+**自动恢复机制**：
+
+从 `Failed` 状态恢复到哪个状态由 `OperationProgress.OperationType` 自动决定，无需用户手动指定：
+
+| OperationType | 恢复目标 | 说明 |
+|--------------|---------|------|
+| `Install` | `Creating` | 重新执行安装操作 |
+| `Upgrade` | `Upgrading` | 重新执行升级操作 |
+| `Scale` | `Scaling` | 重新执行扩缩容操作 |
+| `Rollback` | `RollingBack` | 重新执行回滚操作 |
+
+**恢复流程**：
+
+```
+T0: 操作失败，进入 Failed 状态
+    LifecyclePhase = Failed
+    OperationProgress.OperationType = Upgrade
+    OperationProgress.LastFailure = {...}
+
+T1: 用户诊断问题并修复
+
+T2: 用户触发恢复（清除 LastFailure 或设置注解）
+    OperationProgress.LastFailure = nil
+
+T3: 系统自动决定恢复目标
+    读取 OperationProgress.OperationType = Upgrade
+    → LifecyclePhase = Upgrading
+
+T4: 重新执行操作
+```
+
+**恢复触发方式**：
+
+1. **清除 LastFailure**（推荐）
+   ```bash
+   kubectl patch bkecluster my-cluster --type merge \
+     -p '{"status":{"operationProgress":{"lastFailure":null}}}'
+   ```
+
+2. **通过注解触发**
+   ```bash
+   kubectl annotate bkecluster my-cluster bke.bocloud.com/retry-operation=true
+   ```
+
 **恢复策略**：
 
 | 失败场景 | 恢复路径 | 说明 |
@@ -242,6 +325,30 @@ stateDiagram-v2
 | Upgrading 失败 | `Failed --> Upgrading` | 重新执行升级操作 |
 | Scaling 失败 | `Failed --> Scaling` | 重新执行扩缩容操作 |
 | RollingBack 失败 | `Failed --> RollingBack` | 重新执行回滚操作 |
+
+**示例场景**：
+
+**场景 1：升级失败恢复**
+```
+T0: 升级失败
+    LifecyclePhase = Failed
+    OperationProgress.OperationType = Upgrade
+    OperationProgress.LastFailure = {Name: "etcd", Error: "upgrade failed"}
+
+T1: 用户诊断问题并修复
+    修复 etcd 升级脚本
+
+T2: 用户触发恢复
+    kubectl patch bkecluster my-cluster --type merge \
+      -p '{"status":{"operationProgress":{"lastFailure":null}}}'
+
+T3: 系统自动决定
+    OperationProgress.OperationType = Upgrade
+    → LifecyclePhase = Upgrading
+
+T4: 重新执行升级操作
+    从失败的组件继续升级
+```
 
 **特殊场景**：
 
@@ -1073,7 +1180,143 @@ func (r *BKEClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 ### 8.7 人工介入详细设计
 
-（保留原有设计，详见 v3 文档）
+**自动恢复机制**：
+
+当用户触发恢复时，系统自动决定恢复到哪个状态，无需用户手动指定。
+
+**触发方式**：
+
+1. **清除 LastFailure**（推荐）
+   ```bash
+   kubectl patch bkecluster my-cluster --type merge \
+     -p '{"status":{"operationProgress":{"lastFailure":null}}}'
+   ```
+
+2. **通过注解触发**
+   ```bash
+   kubectl annotate bkecluster my-cluster bke.bocloud.com/retry-operation=true
+   ```
+
+**恢复流程**：
+
+```go
+func (r *Reconciler) handleRecovery(ctx context.Context, cluster *BKECluster) (ctrl.Result, error) {
+    // 1. 清除失败状态
+    cluster.Status.OperationProgress.LastFailure = nil
+    cluster.Status.OperationProgress.NeedsManualIntervention = false
+    
+    // 2. 自动决定恢复目标
+    recoveryPhase := r.determineRecoveryPhase(cluster)
+    cluster.Status.LifecyclePhase = recoveryPhase
+    
+    // 3. 重置操作进度（保留已完成组件列表）
+    cluster.Status.OperationProgress.StartedAt = &metav1.Time{Time: time.Now()}
+    // 注意：Completed 列表保留，支持从失败点继续
+    
+    // 4. 更新状态
+    if err := r.Status().Update(ctx, cluster); err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    // 5. 重新执行操作
+    return r.executeOperation(ctx, cluster, recoveryPhase)
+}
+```
+
+**注解处理逻辑**：
+
+```go
+func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    cluster := &bkev1beta1.BKECluster{}
+    if err := r.Get(ctx, req.NamespacedName, cluster); err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    // 检查是否有重试注解
+    if _, hasRetry := cluster.Annotations[annotation.RetryOperationAnnotation]; hasRetry {
+        // 清除注解
+        delete(cluster.Annotations, annotation.RetryOperationAnnotation)
+        if err := r.Update(ctx, cluster); err != nil {
+            return ctrl.Result{}, err
+        }
+        
+        // 执行恢复
+        return r.handleRecovery(ctx, cluster)
+    }
+    
+    // 正常 Reconcile 流程
+    return r.reconcile(ctx, cluster)
+}
+```
+
+**示例场景**：
+
+**场景 1：升级失败恢复**
+```
+T0: 升级失败
+    LifecyclePhase = Failed
+    OperationProgress.OperationType = Upgrade
+    OperationProgress.LastFailure = {Name: "etcd", Error: "upgrade failed"}
+    OperationProgress.Completed = [{Name: "containerd"}, {Name: "bkeagent"}]
+
+T1: 用户诊断问题并修复
+    修复 etcd 升级脚本
+
+T2: 用户触发恢复
+    kubectl patch bkecluster my-cluster --type merge \
+      -p '{"status":{"operationProgress":{"lastFailure":null}}}'
+
+T3: 系统自动决定
+    OperationProgress.OperationType = Upgrade
+    → LifecyclePhase = Upgrading
+
+T4: 重新执行升级操作
+    跳过已完成的组件（containerd, bkeagent）
+    从失败的组件继续升级（etcd）
+```
+
+**场景 2：扩缩容失败恢复**
+```
+T0: 扩容失败
+    LifecyclePhase = Failed
+    OperationProgress.OperationType = Scale
+    OperationProgress.LastFailure = {Name: "node-3", Error: "agent push failed"}
+    OperationProgress.Completed = [{Name: "node-1"}, {Name: "node-2"}]
+
+T1: 用户诊断问题并修复
+    修复 node-3 的网络连接
+
+T2: 用户触发恢复
+    kubectl annotate bkecluster my-cluster bke.bocloud.com/retry-operation=true
+
+T3: 系统自动决定
+    OperationProgress.OperationType = Scale
+    → LifecyclePhase = Scaling
+
+T4: 重新执行扩缩容操作
+    跳过已完成的节点（node-1, node-2）
+    从失败的节点继续（node-3）
+```
+
+**错误处理**：
+
+```go
+func (r *Reconciler) handleRecovery(ctx context.Context, cluster *BKECluster) (ctrl.Result, error) {
+    // 验证 OperationProgress 是否存在
+    if cluster.Status.OperationProgress == nil {
+        return ctrl.Result{}, fmt.Errorf("no operation progress found, cannot recover")
+    }
+    
+    // 验证是否处于 Failed 状态
+    if cluster.Status.LifecyclePhase != ClusterLifecycleFailed {
+        return ctrl.Result{}, fmt.Errorf("cluster is not in Failed state, current phase: %s", 
+            cluster.Status.LifecyclePhase)
+    }
+    
+    // 执行恢复逻辑
+    // ...
+}
+```
 
 ### 8.8 Feature Gate 设计
 
@@ -1122,10 +1365,117 @@ pkg/statemachine/
 └── health_checker_test.go     # 健康检查器测试
 
 controllers/capbke/
-└── bkecluster_controller_lifecycle_test.go  # 生命周期阶段测试
+├── bkecluster_controller_lifecycle_test.go  # 生命周期阶段测试
+└── bkecluster_controller_recovery_test.go   # 自动恢复机制测试
+```
+
+**自动恢复机制测试用例**：
+
+| 测试场景 | 测试内容 | 预期结果 |
+|---------|---------|---------|
+| 升级失败恢复 | 模拟升级失败，触发恢复 | 自动恢复到 Upgrading 状态 |
+| 扩缩容失败恢复 | 模拟扩缩容失败，触发恢复 | 自动恢复到 Scaling 状态 |
+| 安装失败恢复 | 模拟安装失败，触发恢复 | 自动恢复到 Creating 状态 |
+| 回滚失败恢复 | 模拟回滚失败，触发恢复 | 自动恢复到 RollingBack 状态 |
+| 清除 LastFailure 触发 | 通过 patch 清除 LastFailure | 触发自动恢复 |
+| 注解触发恢复 | 通过注解触发恢复 | 触发自动恢复并清除注解 |
+| 从失败点继续 | 恢复后从失败组件继续 | 跳过已完成组件 |
+| 非 Failed 状态恢复 | 在非 Failed 状态触发恢复 | 返回错误 |
+| 无 OperationProgress 恢复 | 无 OperationProgress 时触发恢复 | 返回错误 |
+
+**测试代码示例**：
+
+```go
+// 测试升级失败恢复
+func TestRecoveryFromUpgradeFailed(t *testing.T) {
+    // 1. 创建集群并模拟升级失败
+    cluster := &bkev1beta1.BKECluster{
+        Status: bkev1beta1.BKEClusterStatus{
+            LifecyclePhase: bkev1beta1.ClusterLifecycleFailed,
+            OperationProgress: &bkev1beta1.OperationProgress{
+                OperationType: bkev1beta1.OperationTypeUpgrade,
+                LastFailure: &bkev1beta1.OperationFailureRecord{
+                    Name:  "etcd",
+                    Error: "upgrade failed",
+                },
+                Completed: []bkev1beta1.ComponentRecord{
+                    {Name: "containerd"},
+                    {Name: "bkeagent"},
+                },
+            },
+        },
+    }
+    
+    // 2. 触发恢复（清除 LastFailure）
+    cluster.Status.OperationProgress.LastFailure = nil
+    
+    // 3. 验证自动恢复到 Upgrading 状态
+    recoveryPhase := r.determineRecoveryPhase(cluster)
+    assert.Equal(t, bkev1beta1.ClusterLifecycleUpgrading, recoveryPhase)
+    
+    // 4. 验证已完成组件列表保留
+    assert.Len(t, cluster.Status.OperationProgress.Completed, 2)
+}
+
+// 测试通过注解触发恢复
+func TestRecoveryViaAnnotation(t *testing.T) {
+    // 1. 创建集群并设置重试注解
+    cluster := &bkev1beta1.BKECluster{
+        ObjectMeta: metav1.ObjectMeta{
+            Annotations: map[string]string{
+                annotation.RetryOperationAnnotation: "true",
+            },
+        },
+        Status: bkev1beta1.BKEClusterStatus{
+            LifecyclePhase: bkev1beta1.ClusterLifecycleFailed,
+            OperationProgress: &bkev1beta1.OperationProgress{
+                OperationType: bkev1beta1.OperationTypeScale,
+            },
+        },
+    }
+    
+    // 2. 执行 Reconcile
+    result, err := r.Reconcile(ctx, req)
+    
+    // 3. 验证注解被清除
+    _, hasRetry := cluster.Annotations[annotation.RetryOperationAnnotation]
+    assert.False(t, hasRetry)
+    
+    // 4. 验证自动恢复到 Scaling 状态
+    assert.Equal(t, bkev1beta1.ClusterLifecycleScaling, cluster.Status.LifecyclePhase)
+}
+
+// 测试从失败点继续
+func TestRecoveryFromFailurePoint(t *testing.T) {
+    // 1. 创建集群并模拟部分完成
+    cluster := &bkev1beta1.BKECluster{
+        Status: bkev1beta1.BKEClusterStatus{
+            LifecyclePhase: bkev1beta1.ClusterLifecycleFailed,
+            OperationProgress: &bkev1beta1.OperationProgress{
+                OperationType: bkev1beta1.OperationTypeUpgrade,
+                Completed: []bkev1beta1.ComponentRecord{
+                    {Name: "containerd"},
+                    {Name: "bkeagent"},
+                },
+                LastFailure: &bkev1beta1.OperationFailureRecord{
+                    Name: "etcd",
+                },
+            },
+        },
+    }
+    
+    // 2. 触发恢复
+    cluster.Status.OperationProgress.LastFailure = nil
+    
+    // 3. 执行操作
+    r.executeOperation(ctx, cluster, bkev1beta1.ClusterLifecycleUpgrading)
+    
+    // 4. 验证跳过已完成组件
+    // 应该从 etcd 开始升级，而不是从 containerd 开始
+}
 ```
 
 ---
 
-**文档版本**: v3.0 (混合模型)  
+**文档版本**: v3.1 (混合模型 - 自动恢复机制)  
 **维护者**: openFuyao Team
