@@ -1260,9 +1260,19 @@ func (r *Reconciler) determineHealthStatus(
         if nodeHealth.Health != HealthLevelHealthy {
             health.Overall = HealthLevelDegraded
         }
+        
+        // 聚合节点级组件健康状态
+        for _, comp := range node.Status.Components {
+            compHealth := determineComponentHealthFromNode(comp, node.Spec.IP)
+            health.ComponentHealth = append(health.ComponentHealth, compHealth)
+            
+            if compHealth.Health != HealthLevelHealthy {
+                health.Overall = HealthLevelDegraded
+            }
+        }
     }
     
-    // 聚合组件健康状态
+    // 聚合集群级组件健康状态
     for name, status := range clusterComponents {
         compHealth := determineComponentHealth(status)
         health.ComponentHealth = append(health.ComponentHealth, compHealth)
@@ -1302,6 +1312,24 @@ func determineNodeHealth(node BKENode) NodeHealthStatus {
     return health
 }
 
+// determineComponentHealthFromNode 从节点组件确定健康状态
+func determineComponentHealthFromNode(comp ComponentLifecycleStatus, nodeIP string) ComponentHealthStatus {
+    health := ComponentHealthStatus{
+        Name:   comp.Name,
+        NodeIP: nodeIP,
+        Health: HealthLevelHealthy,
+    }
+    
+    if comp.Phase == ComponentLifecycleFailed {
+        health.Health = HealthLevelUnhealthy
+        health.Message = comp.Message
+    } else if comp.Phase != ComponentLifecycleInstalled {
+        health.Health = HealthLevelDegraded
+    }
+    
+    return health
+}
+
 // determineComponentHealth 确定组件健康状态
 func determineComponentHealth(status ComponentLifecycleStatus) ComponentHealthStatus {
     health := ComponentHealthStatus{
@@ -1325,6 +1353,51 @@ func determineComponentHealth(status ComponentLifecycleStatus) ComponentHealthSt
 - 所有组件 `Installed` → 集群 `Healthy`
 - 任意组件 `Failed` → 集群 `Unhealthy`
 - 任意组件非 `Installed` → 集群 `Degraded`
+- 节点级组件和集群级组件都会被追踪到 `ComponentHealth` 列表中
+
+#### 5.2.1 健康状态聚合示例
+
+**场景 11：集群健康状态聚合**
+```
+集群包含：
+- 节点 node-1：containerd (Installed), kubelet (Installed)
+- 节点 node-2：containerd (Installed), kubelet (Failed)
+- 集群级组件：coredns (Installed), kube-proxy (Installed)
+
+聚合结果：
+  Overall: Unhealthy（因为 kubelet Failed）
+  NodeHealth:
+    - node-1: Healthy
+    - node-2: Unhealthy (kubelet failed)
+  ComponentHealth:
+    - containerd@node-1: Healthy
+    - kubelet@node-1: Healthy
+    - containerd@node-2: Healthy
+    - kubelet@node-2: Unhealthy (kubelet failed)
+    - coredns: Healthy
+    - kube-proxy: Healthy
+```
+
+**场景 12：集群降级状态**
+```
+集群包含：
+- 节点 node-1：containerd (Installed), kubelet (Installed)
+- 节点 node-2：containerd (Installing), kubelet (Pending)
+- 集群级组件：coredns (Installed), kube-proxy (Installed)
+
+聚合结果：
+  Overall: Degraded（因为有组件正在安装）
+  NodeHealth:
+    - node-1: Healthy
+    - node-2: Degraded (components installing)
+  ComponentHealth:
+    - containerd@node-1: Healthy
+    - kubelet@node-1: Healthy
+    - containerd@node-2: Degraded (installing)
+    - kubelet@node-2: Degraded (pending)
+    - coredns: Healthy
+    - kube-proxy: Healthy
+```
 
 ### 5.3 健康检查机制
 
@@ -2332,5 +2405,5 @@ func TestNodeRecoveryFromComponentInstallFailed(t *testing.T) {
 
 ---
 
-**文档版本**: v3.14 (混合模型 - 组件层添加操作进度追踪)  
+**文档版本**: v3.15 (混合模型 - 健康状态聚合添加节点级组件)  
 **维护者**: openFuyao Team
