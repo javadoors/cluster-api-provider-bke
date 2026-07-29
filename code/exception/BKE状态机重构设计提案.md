@@ -1545,7 +1545,11 @@ params.CombinedCluster.SetClusterStatus(newBKECuster.Status.ClusterStatus)
 **设计原则**：
 
 1. **单一数据源**：所有转换规则通过 `registerClusterTransitions` 函数编程式注册，不维护声明式表
-2. **Trigger 命名**：使用 Phase 名称常量（如 `EnsureMasterJoinName`），特殊触发器使用 `TriggerError`/`TriggerPhaseComplete`/`TriggerRetry`
+2. **Trigger 区分操作类型**：
+   - `phaseName`（如 `EnsureMasterJoinName`）：Phase 开始执行（pre-hook）
+   - `TriggerPhaseComplete`：Phase 执行成功（post-hook，err==nil）
+   - `TriggerError`：Phase 执行失败（post-hook，err!=nil）
+   - `TriggerRetry`：重试操作（StatusManager 触发）
 3. **Condition 前置检查**：转换规则可附带 `Condition` 函数，不满足条件时跳过该规则
 4. **向后兼容**：未找到匹配规则时返回 `nil`，不阻断流程
 
@@ -1581,21 +1585,27 @@ type Transition struct {
 
 **转换规则统计**（完整规则见 4.2.3 节 `registerClusterTransitions` 函数）：
 
-| 阶段 | 规则数 | 说明 |
-| ------ | -------- | ------ |
-| 初始化 | 11 | Unknown→Initializing（8个Phase）+ 成功/失败/重试 |
-| 健康检查 | 4 | Checking 状态的前后转换 |
-| Addon 部署 | 4 | Ready→Deploying→Ready/Failed + 重试 |
-| Master 扩容 | 4 | Ready→ScalingUp→Ready/Failed + 重试 |
-| Worker 扩容 | 4 | Ready→ScalingUp→Ready/Failed + 重试 |
-| Master 缩容 | 4 | Ready→ScalingDown→Ready/Failed + 重试 |
-| Worker 缩容 | 4 | Ready→ScalingDown→Ready/Failed + 重试 |
-| 升级 | 11 | 旧路径5 + DAG路径2 + 成功/失败/重试 |
-| 纳管 | 4 | Ready→Managing→Ready/Failed + 重试 |
-| 暂停 | 4 | Ready/Upgrading→Paused→Ready/Failed |
-| DryRun | 3 | Ready→DryRun→Ready/Failed |
-| 删除 | 7 | 多入口→Deleting→Failed |
-| **总计** | **64** | |
+| 阶段 | 规则数 | Trigger 类型 | 说明 |
+| ------ | -------- | ------------ | ------ |
+| 初始化 | 11 | phaseName/TriggerPhaseComplete/TriggerError/TriggerRetry | Unknown→Initializing（8个Phase）+ 成功/失败/重试 |
+| 健康检查 | 4 | phaseName/TriggerPhaseComplete/TriggerError | Checking 状态的前后转换 |
+| Addon 部署 | 4 | phaseName/TriggerPhaseComplete/TriggerError/TriggerRetry | Ready→Deploying→Ready/Failed + 重试 |
+| Master 扩容 | 4 | phaseName/TriggerPhaseComplete/TriggerError/TriggerRetry | Ready→ScalingUp→Ready/Failed + 重试 |
+| Worker 扩容 | 4 | phaseName/TriggerPhaseComplete/TriggerError/TriggerRetry | Ready→ScalingUp→Ready/Failed + 重试 |
+| Master 缩容 | 4 | phaseName/TriggerPhaseComplete/TriggerError/TriggerRetry | Ready→ScalingDown→Ready/Failed + 重试 |
+| Worker 缩容 | 4 | phaseName/TriggerPhaseComplete/TriggerError/TriggerRetry | Ready→ScalingDown→Ready/Failed + 重试 |
+| 升级 | 11 | phaseName/TriggerPhaseComplete/TriggerError/TriggerRetry | 旧路径5 + DAG路径2 + 成功/失败/重试 |
+| 纳管 | 4 | phaseName/TriggerPhaseComplete/TriggerError/TriggerRetry | Ready→Managing→Ready/Failed + 重试 |
+| 暂停 | 4 | phaseName/TriggerPhaseComplete/TriggerError | Ready/Upgrading→Paused→Ready/Failed |
+| DryRun | 3 | phaseName/TriggerPhaseComplete/TriggerError | Ready→DryRun→Ready/Failed |
+| 删除 | 7 | phaseName/TriggerError | 多入口→Deleting→Failed |
+| **总计** | **64** | | |
+
+**Trigger 类型说明**：
+- `phaseName`：Phase 开始执行（pre-hook）
+- `TriggerPhaseComplete`：Phase 执行成功（post-hook，err==nil）
+- `TriggerError`：Phase 执行失败（post-hook，err!=nil）
+- `TriggerRetry`：重试操作（StatusManager 触发）
 
 #### 4.2.2 状态机引擎实现
 
@@ -1638,47 +1648,55 @@ func (e *Engine) Transition(cluster *BKECluster, nodes BKENodes, trigger string,
 // ❌ 结果：无论 Phase 成功还是失败，都转换到同一个状态，永远不会进入 ClusterUpgradeFailed
 ```
 
-**修复方案**：`err` 应该用于决定 `effectiveTrigger`：当 `err != nil` 时，使用 `"Error"` 作为触发器，匹配转换表中的失败规则。
+**修复方案**：根据 `err` 参数选择不同的 Trigger：
+- `err != nil` → 使用 `TriggerError`，匹配失败规则
+- `err == nil` → 使用 `TriggerPhaseComplete`，匹配成功规则
 
 #### 正确实现
 
-> **注意**：引擎的完整实现代码见 4.2.3 节的 `pkg/phaseframe/statemachine/engine.go` 文件。此处仅说明核心设计要点：
+> **注意**：引擎的完整实现代码见 4.2.3 节 `registerClusterTransitions` 函数。此处仅说明核心设计要点：
 >
-> - `err` 参数决定 `effectiveTrigger`：当 `err != nil` 时，使用 `"Error"` 作为触发器，匹配转换表中的失败规则
-> - 支持 `Condition` 前置条件检查：匹配规则后先检查 `Condition`，不满足则跳过
-> - 支持 `Action` 转换动作：条件满足后执行 `Action`，失败则返回错误
-> - 未找到匹配规则时返回 `nil`（向后兼容），某些 Phase 可能不需要状态转换
+> - **Trigger 区分操作类型**：`phaseName`（开始执行）、`TriggerPhaseComplete`（成功）、`TriggerError`（失败）、`TriggerRetry`（重试）
+> - **err 参数决定 Trigger**：`err != nil` 时使用 `TriggerError`，`err == nil` 时使用 `TriggerPhaseComplete`
+> - **Condition 控制转换**：匹配规则后先检查 `Condition`，不满足则跳过（如 `IsClusterReady`）
+> - **Action 转换动作**：条件满足后执行 `Action`，失败则返回错误
+> - **未找到匹配规则时返回 nil**：向后兼容，某些 Phase 可能不需要状态转换
 
 #### 修复后的调用行为验证
 
 | 调用场景 | 调用方式 | effectiveTrigger | 匹配规则 | 目标状态 |
 | --------- | --------- | ----------------- | --------- | --------- |
 | Pre-hook | `Transition(cluster, "EnsureUpgrade", nil)` | `"EnsureUpgrade"` | `{Ready → Upgrading, "EnsureUpgrade"}` | `ClusterUpgrading` |
-| Post-hook 成功 | `Transition(cluster, "EnsureUpgrade", nil)` | `"EnsureUpgrade"` | `{Upgrading → Ready, "EnsureCluster"}` 或幂等 | `ClusterReady` 或保持 |
-| Post-hook 失败 | `Transition(cluster, "EnsureUpgrade", err)` | `"Error"` | `{Upgrading → UpgradeFailed, "Error"}` | `ClusterUpgradeFailed` |
+| Post-hook 成功 | `Transition(cluster, TriggerPhaseComplete, nil)` | `TriggerPhaseComplete` | `{Upgrading → Ready, TriggerPhaseComplete}` | `ClusterReady` |
+| Post-hook 失败 | `Transition(cluster, TriggerError, err)` | `TriggerError` | `{Upgrading → UpgradeFailed, TriggerError}` | `ClusterUpgradeFailed` |
+| 重试 | `Transition(cluster, TriggerRetry, nil)` | `TriggerRetry` | `{UpgradeFailed → Upgrading, TriggerRetry}` | `ClusterUpgrading` |
 
 以升级阶段为例，转换表匹配验证：
 
 ```go
-// 成功路径（trigger="EnsureUpgrade", err=nil → effectiveTrigger="EnsureUpgrade"）
-{ClusterReady, ClusterUpgrading, "EnsureUpgrade", needUpgrade, nil},     // pre-hook
-{ClusterUpgrading, ClusterReady, "EnsureCluster", isUpgradeComplete, nil}, // post-hook 成功
+// Pre-hook（trigger="EnsureUpgrade"）
+{ClusterReady, ClusterUpgrading, "EnsureUpgrade", needUpgrade, nil},
 
-// 失败路径（trigger="EnsureUpgrade", err!=nil → effectiveTrigger="Error"）
-{ClusterUpgrading, ClusterUpgradeFailed, "Error", nil, nil},              // post-hook 失败
+// Post-hook 成功（trigger=TriggerPhaseComplete）
+{ClusterUpgrading, ClusterReady, TriggerPhaseComplete, isUpgradeComplete, nil},
 
-// 重试路径（trigger="Retry", err=nil → effectiveTrigger="Retry"）
-{ClusterUpgradeFailed, ClusterUpgrading, "Retry", nil, nil},              // StatusManager 重试
+// Post-hook 失败（trigger=TriggerError）
+{ClusterUpgrading, ClusterUpgradeFailed, TriggerError, nil, nil},
+
+// 重试（trigger=TriggerRetry）
+{ClusterUpgradeFailed, ClusterUpgrading, TriggerRetry, nil, nil},
 ```
 
 **优势**:
 
 - 状态转换规则集中定义，易于理解和维护
-- 支持状态转换条件验证
+- 支持状态转换条件验证（Condition 函数）
 - 易于生成状态机文档和可视化图表
 - 便于单元测试
 - 只使用 ClusterStatus，简化了状态管理逻辑
-- **err 参数正确影响触发器选择**，确保成功/失败路径正确分离
+- **Trigger 设计清晰**：区分"操作类型"（开始/成功/失败/重试），不区分"哪个 Phase"
+- **err 参数正确使用**：根据 err 选择 TriggerError 或 TriggerPhaseComplete，确保成功/失败路径正确分离
+- **Phase 执行历史通过事件系统记录**：状态机只关心状态转换，不关心具体 Phase 执行
 
 #### 4.2.3 Transition 替换原有业务逻辑
 
@@ -1701,14 +1719,58 @@ PhaseFlow.Execute()
 
 ```
 PhaseFlow.Execute()
-  → engine.Transition(cluster, nodes, phaseName, nil)     // pre-hook：err=nil → effectiveTrigger=phaseName
-  → phase.Execute()                                // 执行业务逻辑（不变）
-  → engine.Transition(cluster, nodes, phaseName, err)      // post-hook：
-      // err==nil → effectiveTrigger=phaseName → 匹配成功规则（如 Upgrading→Ready）
-      // err!=nil → effectiveTrigger="Error"     → 匹配失败规则（如 Upgrading→UpgradeFailed）
+  → engine.Transition(cluster, nodes, phaseName, nil)              // pre-hook：设置"进行中"状态
+  → phase.Execute()                                                // 执行业务逻辑（不变）
+  → engine.Transition(cluster, nodes, TriggerPhaseComplete, err)   // post-hook：
+      // err==nil → effectiveTrigger=TriggerPhaseComplete → 匹配成功规则（如 Upgrading→Ready）
+      // err!=nil → effectiveTrigger=TriggerError         → 匹配失败规则（如 Upgrading→UpgradeFailed）
 ```
 
-> **关键设计**：`err` 参数决定 `effectiveTrigger` 的值。当 `err != nil` 时，`effectiveTrigger` 被替换为 `"Error"`，从而匹配转换表中的失败规则（如 `{ClusterUpgrading, ClusterUpgradeFailed, "Error"}`）。这确保了 pre-hook 和 post-hook 的调用虽然使用相同的 `trigger` 参数，但因为 `err` 不同，会匹配到不同的转换规则，实现成功/失败路径的正确分离。
+> **关键设计**：`err` 参数决定 `effectiveTrigger` 的值。当 `err != nil` 时，`effectiveTrigger` 被替换为 `TriggerError`，从而匹配转换表中的失败规则（如 `{ClusterUpgrading, ClusterUpgradeFailed, TriggerError}`）。这确保了 pre-hook 和 post-hook 的调用虽然使用相同的 `trigger` 参数，但因为 `err` 不同，会匹配到不同的转换规则，实现成功/失败路径的正确分离。
+
+#### Trigger 的作用说明
+
+**Trigger 的核心作用**：区分"操作类型"，而不是"哪个 Phase 执行"。
+
+| Trigger 类型 | 含义 | 使用场景 |
+|-------------|------|---------|
+| `phaseName`（如 `EnsureMasterInit`） | Phase 开始执行 | pre-hook：设置"进行中"状态 |
+| `TriggerPhaseComplete` | Phase 执行成功 | post-hook（err==nil）：转换到"完成"状态 |
+| `TriggerError` | Phase 执行失败 | post-hook（err!=nil）：转换到"失败"状态 |
+| `TriggerRetry` | 重试操作 | StatusManager 重试时：从"失败"恢复到"进行中" |
+
+**为什么 post-hook 成功时使用 `TriggerPhaseComplete` 而不是 `phaseName`？**
+
+1. **语义一致性**：状态机只关心"阶段是否完成"，不关心"哪个 Phase 完成"
+2. **与 TriggerError/TriggerRetry 一致**：失败和重试都是统一触发器，成功也应该统一
+3. **Condition 控制转换**：状态转换由 `Condition` 函数决定（如 `IsClusterReady`），不是由 `Trigger` 决定
+4. **减少规则数量**：不需要为每个 Phase 注册成功规则
+
+**示例：初始化阶段**
+
+```
+8 个 Phase 依次执行：EnsureFinalizer → EnsureCerts → ... → EnsureAgentSwitch
+
+每个 Phase 的 post-hook 都使用 TriggerPhaseComplete：
+- EnsureFinalizer 成功 → TriggerPhaseComplete → IsClusterReady=false → 保持 Initializing
+- EnsureCerts 成功 → TriggerPhaseComplete → IsClusterReady=false → 保持 Initializing
+- ...
+- EnsureAgentSwitch 成功 → TriggerPhaseComplete → IsClusterReady=true → 转换到 Ready
+```
+
+**Phase 执行历史如何记录？**
+
+状态机不记录 Phase 执行历史，而是通过事件系统记录：
+
+```go
+type PhaseExecutionEvent struct {
+    PhaseName   string     // 如 "EnsureMasterInit"
+    StartTime   time.Time
+    EndTime     time.Time
+    Success     bool
+    Error       string
+}
+```
 
 #### 需要重构的代码清单
 
@@ -1799,8 +1861,11 @@ func GetClusterEngine() *statemachine.Engine {
 
 // registerClusterTransitions 注册所有集群状态转换规则
 // 设计原则：
-// - Trigger 使用 Phase 名称常量（如 EnsureMasterJoinName）
-// - 特殊触发器：TriggerError（失败）、TriggerPhaseComplete（成功）、TriggerRetry（重试）
+// - Trigger 区分操作类型，不区分具体 Phase：
+//   - phaseName（如 EnsureMasterJoinName）：Phase 开始执行（pre-hook）
+//   - TriggerPhaseComplete：Phase 执行成功（post-hook，err==nil）
+//   - TriggerError：Phase 执行失败（post-hook，err!=nil）
+//   - TriggerRetry：重试操作（StatusManager 触发）
 // - Condition 用于前置条件检查（如 isClusterReady），不满足时跳过该规则
 // - 未找到匹配规则时返回 nil（向后兼容）
 func registerClusterTransitions(e *statemachine.Engine) {
@@ -1934,6 +1999,7 @@ func registerClusterTransitions(e *statemachine.Engine) {
     })
 
     // ===== 暂停阶段 =====
+    // 进入暂停（从 Ready 或 Upgrading 状态）
     e.AddTransition(statemachine.Transition{
         FromState: bkev1beta1.ClusterReady,
         ToState:   bkev1beta1.ClusterPaused,
@@ -1946,10 +2012,11 @@ func registerClusterTransitions(e *statemachine.Engine) {
         Trigger:   string(EnsurePausedName),
         Condition: statemachine.NeedPause,
     })
+    // 恢复暂停（使用 TriggerPhaseComplete，与其他阶段一致）
     e.AddTransition(statemachine.Transition{
         FromState: bkev1beta1.ClusterPaused,
         ToState:   bkev1beta1.ClusterReady,
-        Trigger:   string(EnsurePausedName),
+        Trigger:   statemachine.TriggerPhaseComplete,
         Condition: statemachine.IsResume,
     })
 
@@ -1994,11 +2061,11 @@ func registerClusterTransitions(e *statemachine.Engine) {
         e.AddTransition(statemachine.Transition{
             FromState: from,
             ToState:   to,
-            Trigger:   statemachine.TriggerError,
+            Trigger:   statemachine.TriggerError,  // 失败统一使用 TriggerError
         })
     }
 
-    // ===== 重试转换（Failed → 进行中状态）=====
+    // ===== 重试转换（Failed → 进行中状态，使用 TriggerRetry）=====
     retryMappings := []struct {
         from, to  bkev1beta1.ClusterStatus
         condition func(*bkev1beta1.BKECluster) bool
@@ -2016,7 +2083,7 @@ func registerClusterTransitions(e *statemachine.Engine) {
         e.AddTransition(statemachine.Transition{
             FromState: m.from,
             ToState:   m.to,
-            Trigger:   statemachine.TriggerRetry,
+            Trigger:   statemachine.TriggerRetry,  // 重试统一使用 TriggerRetry
             Condition: m.condition,
         })
     }
@@ -2026,13 +2093,8 @@ func registerClusterTransitions(e *statemachine.Engine) {
 func calculatingClusterPreStatusByPhase(phase phaseframe.Phase) error {
     ctx := phase.GetPhaseContext()
 
-    // EnsureCluster 特殊处理：执行前设为 Checking
-    if phase.Name() == EnsureClusterName {
-        ctx.BKECluster.Status.ClusterStatus = bkev1beta1.ClusterChecking
-        return nil
-    }
-
-    // 其他 Phase：通过状态机引擎转换
+    // 所有 Phase 统一通过状态机引擎转换
+    // Pre-hook 使用 phaseName 作为 Trigger，设置"进行中"状态
     return GetClusterEngine().Transition(ctx.BKECluster, ctx.BKENodes, string(phase.Name()), nil)
 }
 
@@ -2047,15 +2109,14 @@ func calculatingClusterPostStatusByPhase(phase phaseframe.Phase, err error) erro
 
     ctx := phase.GetPhaseContext()
 
-    // EnsureCluster 特殊处理：健康检查结果由 engine 决定最终状态
-    if phase.Name() == EnsureClusterName {
-        return GetClusterEngine().Transition(ctx.BKECluster, ctx.BKENodes, statemachine.TriggerPhaseComplete, err)
+    // Post-hook 成功：使用 TriggerPhaseComplete，匹配成功规则
+    // Post-hook 失败：使用 TriggerError，匹配失败规则
+    // 注意：Trigger 区分"操作类型"（成功/失败/重试），不区分"哪个 Phase"
+    // Phase 执行历史通过事件系统记录
+    if err != nil {
+        return GetClusterEngine().Transition(ctx.BKECluster, ctx.BKENodes, statemachine.TriggerError, err)
     }
-
-    // 其他 Phase：通过状态机引擎转换
-    // err==nil → effectiveTrigger=phaseName → 匹配成功规则
-    // err!=nil → effectiveTrigger="Error"   → 匹配失败规则
-    return GetClusterEngine().Transition(ctx.BKECluster, ctx.BKENodes, string(phase.Name()), err)
+    return GetClusterEngine().Transition(ctx.BKECluster, ctx.BKENodes, statemachine.TriggerPhaseComplete, nil)
 }
 
 // ===== 以下函数全部删除 =====
