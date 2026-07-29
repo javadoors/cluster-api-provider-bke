@@ -1833,7 +1833,7 @@ params.CombinedCluster.SetClusterStatus(newBKECuster.Status.ClusterStatus)
 3. **Condition 前置检查**：转换规则可附带 `Condition` 函数，不满足条件时跳过该规则
 4. **向后兼容**：未找到匹配规则时返回 `nil`，不阻断流程
 
-**Transition 结构体**（定义见 2.2.3 节 `engine.go`）：
+**Transition 结构体**（定义见 4.2.3 节 `engine.go`）：
 
 ```go
 type Transition struct {
@@ -1926,7 +1926,7 @@ func (e *Engine) Transition(cluster *BKECluster, nodes BKENodes, trigger string,
 
 #### 正确实现
 
-> **注意**：引擎的完整实现代码见 2.2.3 节的 `pkg/phaseframe/statemachine/engine.go` 文件。此处仅说明核心设计要点：
+> **注意**：引擎的完整实现代码见 4.2.3 节的 `pkg/phaseframe/statemachine/engine.go` 文件。此处仅说明核心设计要点：
 >
 > - `err` 参数决定 `effectiveTrigger`：当 `err != nil` 时，使用 `"Error"` 作为触发器，匹配转换表中的失败规则
 > - 支持 `Condition` 前置条件检查：匹配规则后先检查 `Condition`，不满足则跳过
@@ -3922,6 +3922,30 @@ func (b *StatusManagerV2) RemoveSingleNodeStatusCache(bkeCluster *bkev1beta1.BKE
 | **状态伪装机制** | 使用 `LatestNormalState` | 已验证正确，无需额外信息，Engine 的 Retry 转换对此场景增加复杂度无收益 |
 | **接口兼容性** | 保持所有公开方法签名不变 | 8 个调用点零修改，降低迁移风险 |
 
+#### Engine 与 StatusManager 职责边界
+
+| 组件 | 职责 | 操作时机 | 状态可见性 |
+|------|------|---------|-----------|
+| **Engine** | 基于转换表执行状态转换，决定"应该进入什么状态" | Phase 执行前后（pre-hook/post-hook） | 写入真实状态到 `ClusterStatus` |
+| **StatusManager** | 重试控制、状态伪装、失败恢复，决定"是否对外暴露真实状态" | `SyncStatusUntilComplete()` 期间 | 可能将 Failed 状态伪装为 `LatestNormalState` |
+
+**状态伪装的完整流程**：
+
+```
+1. Engine 写入真实状态：ClusterStatus = ClusterScaleFailed
+2. StatusManager 观察真实状态，判断重试次数：
+   - count < MaxRetryCount: 伪装 ClusterStatus = LatestNormalState（对外隐藏失败）
+   - count >= MaxRetryCount: 保持 ClusterScaleFailed（对外暴露失败）
+3. 外部消费者（Controller、Webhook）看到的是伪装后的状态
+4. 当重试次数耗尽，真实状态暴露，触发人工介入
+```
+
+**为什么需要状态伪装？**
+
+- 避免短暂失败导致外部消费者误判集群状态
+- 给系统自动恢复的机会，减少人工介入
+- 保持与现有行为兼容，降低迁移风险
+
 #### 状态伪装与 Engine 的协作流程
 
 ```
@@ -4083,7 +4107,7 @@ func NewStatusRecordV2(status bkev1beta1.ClusterStatus) *StatusRecordV2 {
 }
 
 func (r *StatusRecordV2) Inc() {
-    r.StatusCount++
+    atomic.AddInt32(&r.StatusCount, 1)
 }
 
 func (r *StatusRecordV2) Reset() {
@@ -4670,7 +4694,7 @@ V2 内部逻辑：
 
 **设计思路**: 在三字段整合的基础上，记录所有状态转换事件，提供可观测性支持。
 
-> **与 engine.go 的关系**：2.2.3 节的 `engine.go` 内置了基础版事件记录（`recordTransition` + `TransitionEvent`），使用内存列表存储，适合开发调试。本节为增强版事件系统，通过 `EventStore` 接口支持持久化存储、事件查询和多种格式导出，适合生产环境。两者通过接口替换，增强版可无缝替换基础版。
+> **与 engine.go 的关系**：4.2.3 节的 `engine.go` 内置了基础版事件记录（`recordTransition` + `TransitionEvent`），使用内存列表存储，适合开发调试。本节为增强版事件系统，通过 `EventStore` 接口支持持久化存储、事件查询和多种格式导出，适合生产环境。两者通过接口替换，增强版可无缝替换基础版。
 
 **重构设计**:
 
@@ -5184,7 +5208,7 @@ func (r *StateMachineEventRecorder) exportDotGraph(events []StateTransitionEvent
 - **驱动模型（自上而下）**：决定集群"正在做什么"（LifecyclePhase）
   - 集群层：Pending → Installing → Running → Upgrading → Scaling → RollingBack → Deleting → Deleted → Failed
   - 节点层：Pending → Provisioned → Ready → Upgrading → RollingBack → Deleting → Deleted → Failed
-  - 组件层：Pending → Installing → Installed → Upgrading → RollingBack → Deleting → Failed
+  - 组件层：Pending → Installing → Installed → Upgrading → RollingBack → Deleting → Deleted → Failed
 - **聚合模型（自底向上）**：决定集群"健康状况如何"（HealthStatus）
   - 健康级别：Healthy / Degraded / Unhealthy / Unknown
   - 聚合规则：组件状态 → 节点健康 → 集群健康
@@ -5286,10 +5310,24 @@ func calculatingClusterPostStatusByPhase(phase phaseframe.Phase, err error) erro
 | ClusterReady | Running | 运行状态 |
 | ClusterUpgrading | Upgrading | 升级状态 |
 | ClusterMasterScalingDown, ClusterWorkerScalingDown | Scaling | 缩容状态 |
-| ClusterPaused | RollingBack | 暂停/回滚状态 |
+| ClusterPaused | Running | 暂停状态（目标架构中暂停通过注解实现，不属于生命周期阶段） |
 | ClusterDeleting | Deleting | 删除状态 |
 | ClusterDeleted | Deleted | 已删除状态 |
 | ClusterInitializationFailed, ClusterScaleFailed, ClusterDeleteFailed, ClusterPauseFailed, ClusterDryRunFailed, ClusterDeployAddonFailed, ClusterUpgradeFailed, ClusterManageFailed, ClusterUnhealthy | Failed | 所有失败状态 |
+
+**映射信息丢失处理策略**：
+
+22 个 ClusterStatus 映射到 9 个 LifecyclePhase 时，存在信息丢失。目标架构通过以下机制补偿：
+
+| 丢失的信息 | 补偿机制 | 说明 |
+|-----------|---------|------|
+| Master/Worker 扩容区分 | `OperationProgress.CurrentStage` | 通过操作进度字段记录具体操作类型 |
+| Master/Worker 缩容区分 | `OperationProgress.CurrentStage` | 同上 |
+| 具体失败原因 | `OperationProgress.LastFailure` | 通过失败记录字段保存详细错误信息 |
+| 暂停状态 | 注解 `bke.bocloud.com/paused` | 暂停不属于生命周期阶段，通过注解实现 |
+| 健康检查状态 | `HealthStatus.Overall` | 健康状态独立表达，不与生命周期混合 |
+
+**设计原则**：目标架构将"操作类型"、"失败原因"、"健康状态"分离为独立字段，避免将所有信息塞入单一枚举。
 
 **演进成本总结**：
 
@@ -5440,6 +5478,86 @@ func createTestCluster() *bkev1beta1.BKECluster {
         Status: bkev1beta1.BKEClusterStatus{
             ClusterStatus: bkev1beta1.ClusterUnknown,
         },
+    }
+}
+```
+
+### 7.3 Engine 与 StatusManager 协作测试
+
+```go
+// TestEngineAndStatusManagerInteraction 测试 Engine 与 StatusManager 的协作
+func TestEngineAndStatusManagerInteraction(t *testing.T) {
+    t.Run("状态伪装：重试次数内隐藏失败", func(t *testing.T) {
+        // 1. Engine 转换到失败状态
+        engine := statemachine.NewEngine(nil, nil)
+        cluster := &bkev1beta1.BKECluster{
+            Status: bkev1beta1.BKEClusterStatus{
+                ClusterStatus: bkev1beta1.ClusterUpgrading,
+            },
+        }
+        
+        // 模拟 Phase 执行失败
+        err := engine.Transition(cluster, nil, "EnsureUpgrade", errors.New("upgrade failed"))
+        assert.NoError(t, err)
+        assert.Equal(t, bkev1beta1.ClusterUpgradeFailed, cluster.Status.ClusterStatus)
+        
+        // 2. StatusManager 观察失败状态并伪装
+        sm := statusmanage.NewStatusManagerV2()
+        sm.SetStatus(cluster, nil)
+        
+        // 3. 验证：重试次数内，状态被伪装为 LatestNormalState
+        // 外部消费者看到的是伪装后的状态
+        result := sm.GetCtrlResult(cluster)
+        assert.True(t, result.Requeue)
+    })
+    
+    t.Run("状态暴露：重试次数耗尽后暴露失败", func(t *testing.T) {
+        // 模拟重试次数耗尽
+        // 验证：ClusterStatus 保持为 ClusterUpgradeFailed
+        // 验证：NeedRequeue = false
+    })
+    
+    t.Run("并发安全：多协程同时更新状态", func(t *testing.T) {
+        // 模拟多个 Reconcile 循环并发调用 SetStatus
+        // 验证：StatusCount 使用原子操作，无竞态条件
+    })
+}
+```
+
+### 7.4 状态转换完整性测试
+
+```go
+// TestAllTransitionsCovered 验证所有 64 条转换规则都被测试覆盖
+func TestAllTransitionsCovered(t *testing.T) {
+    engine := statemachine.NewEngine(nil, nil)
+    
+    // 获取所有注册的转换规则
+    transitions := engine.GetAllTransitions()
+    assert.Equal(t, 64, len(transitions), "应该有 64 条转换规则")
+    
+    // 验证每条规则都有对应的测试用例
+    for _, trans := range transitions {
+        t.Run(fmt.Sprintf("%s->%s via %s", trans.FromState, trans.ToState, trans.Trigger), func(t *testing.T) {
+            // 构造测试用例，验证转换可以触发
+        })
+    }
+}
+
+// TestNoDeadEndStates 验证没有死胡同状态（除了 Failed 和 Deleted）
+func TestNoDeadEndStates(t *testing.T) {
+    engine := statemachine.NewEngine(nil, nil)
+    
+    // 获取所有状态
+    allStates := engine.GetAllStates()
+    
+    for _, state := range allStates {
+        if state == bkev1beta1.ClusterFailed || state == bkev1beta1.ClusterDeleted {
+            continue // 终态允许没有出边
+        }
+        
+        // 验证每个非终态都有至少一条出边
+        outEdges := engine.GetOutgoingTransitions(state)
+        assert.Greater(t, len(outEdges), 0, "状态 %s 应该有至少一条出边", state)
     }
 }
 ```
@@ -5645,7 +5763,7 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 | **ClusterStatus** | Cluster Status | 集群操作状态，重构后的单一数据源，包含 22 个枚举值 | 所有状态管理场景 |
 | **ClusterHealthState** | Cluster Health State | 集群健康状态（Deprecated），包含 9 个枚举值，将被 ClusterStatus 替代 | 向后兼容场景 |
 | **Phase** | Phase | 集群阶段（Deprecated），包含 12 个枚举值，将被 ClusterStatus 替代 | 向后兼容场景 |
-| **LifecyclePhase** | Lifecycle Phase | 统一生命周期状态，面向三层状态机架构的演进目标，包含 6 个枚举值 | 三层状态机架构 |
+| **LifecyclePhase** | Lifecycle Phase | 统一生命周期状态，面向三层状态机架构的演进目标，包含 9 个枚举值（Pending/Installing/Running/Upgrading/Scaling/RollingBack/Deleting/Deleted/Failed） | 三层状态机架构 |
 
 #### 状态管理机制
 
@@ -5721,7 +5839,7 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 │                    ┌──────────────────┐                         │
 │                    │ LifecyclePhase   │                         │
 │                    │  (三层状态机)     │                         │
-│                    │    6个值          │                         │
+│                    │    9个值          │                         │
 │                    └──────────────────┘                         │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
