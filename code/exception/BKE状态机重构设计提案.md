@@ -3074,22 +3074,22 @@ func countNodesByRole(cluster *bkev1beta1.BKECluster, role string) int {
 
 ##### 简化后的 StatusManager 设计
 
-**StatusManagerV3 结构体**：
+**StatusManagerV2 结构体**：
 
 ```go
-// StatusManagerV3 简化后的状态管理器
-type StatusManagerV3 struct {
+// StatusManagerV2 简化后的状态管理器
+type StatusManagerV2 struct {
     cmux sync.RWMutex
     nmux sync.RWMutex
 
-    BKEClusterStatusMap map[string]*StatusRecordV3
-    BKENodesStatusMap   map[string]map[string]*StatusRecordV3
+    BKEClusterStatusMap map[string]*StatusRecordV2
+    BKENodesStatusMap   map[string]map[string]*StatusRecordV2
 
     cleaner *StatusCleaner
 }
 
-// StatusRecordV3 简化后的状态记录
-type StatusRecordV3 struct {
+// StatusRecordV2 简化后的状态记录
+type StatusRecordV2 struct {
     // 基本信息
     CurrentClusterState bkev1beta1.ClusterStatus
     LatestFailedState   string
@@ -3116,7 +3116,7 @@ type StatusRecordV3 struct {
 
 ```go
 // GetRetryCount 获取重试计数（供 Engine 查询）
-func (b *StatusManagerV3) GetRetryCount(cluster *bkev1beta1.BKECluster) int32 {
+func (b *StatusManagerV2) GetRetryCount(cluster *bkev1beta1.BKECluster) int32 {
     b.cmux.RLock()
     defer b.cmux.RUnlock()
 
@@ -3129,7 +3129,7 @@ func (b *StatusManagerV3) GetRetryCount(cluster *bkev1beta1.BKECluster) int32 {
 }
 
 // GetLatestNormalState 获取最后正常状态（供 Engine 查询）
-func (b *StatusManagerV3) GetLatestNormalState(cluster *bkev1beta1.BKECluster) string {
+func (b *StatusManagerV2) GetLatestNormalState(cluster *bkev1beta1.BKECluster) string {
     b.cmux.RLock()
     defer b.cmux.RUnlock()
 
@@ -3142,7 +3142,7 @@ func (b *StatusManagerV3) GetLatestNormalState(cluster *bkev1beta1.BKECluster) s
 }
 
 // ResetRetryCount 重置重试计数（Engine 在状态转换成功后调用）
-func (b *StatusManagerV3) ResetRetryCount(cluster *bkev1beta1.BKECluster) {
+func (b *StatusManagerV2) ResetRetryCount(cluster *bkev1beta1.BKECluster) {
     b.cmux.Lock()
     defer b.cmux.Unlock()
 
@@ -3375,11 +3375,11 @@ if sr.CurrentClusterState != bkev1beta1.ClusterUnhealthy &&
 
 #### 4.3.1 数据结构设计
 
-##### StatusRecordV3（简化版）
+##### StatusRecordV2（简化版）
 
 ```go
-// StatusRecordV3 简化后的状态记录
-type StatusRecordV3 struct {
+// StatusRecordV2 简化后的状态记录
+type StatusRecordV2 struct {
     // 基本信息
     CurrentClusterState bkev1beta1.ClusterStatus
     LatestFailedState   string
@@ -3396,27 +3396,27 @@ type StatusRecordV3 struct {
     ExpireTime          time.Time
 }
 
-// NewStatusRecordV3 创建状态记录
-func NewStatusRecordV3() *StatusRecordV3 {
-    return &StatusRecordV3{
+// NewStatusRecordV2 创建状态记录
+func NewStatusRecordV2() *StatusRecordV2 {
+    return &StatusRecordV2{
         LastUpdateTime: time.Now(),
         ExpireTime:     time.Now().Add(24 * time.Hour),
     }
 }
 
 // Inc 增加重试计数（原子操作）
-func (r *StatusRecordV3) Inc() {
+func (r *StatusRecordV2) Inc() {
     atomic.AddInt32(&r.StatusCount, 1)
 }
 
 // Reset 重置状态记录
-func (r *StatusRecordV3) Reset() {
+func (r *StatusRecordV2) Reset() {
     r.StatusCount = 0
     r.LatestFailedState = ""
 }
 
 // Equal 检查是否与指定状态相同
-func (r *StatusRecordV3) Equal(state string) bool {
+func (r *StatusRecordV2) Equal(state string) bool {
     return r.LatestFailedState == state
 }
 ```
@@ -3424,25 +3424,25 @@ func (r *StatusRecordV3) Equal(state string) bool {
 **删除的字段**：
 - `RetryPolicy`（由 Engine 管理）
 
-##### StatusManagerV3
+##### StatusManagerV2
 
 ```go
-// StatusManagerV3 简化后的状态管理器
-type StatusManagerV3 struct {
+// StatusManagerV2 简化后的状态管理器
+type StatusManagerV2 struct {
     cmux sync.RWMutex
     nmux sync.RWMutex
 
-    BKEClusterStatusMap map[string]*StatusRecordV3
-    BKENodesStatusMap   map[string]map[string]*StatusRecordV3
+    BKEClusterStatusMap map[string]*StatusRecordV2
+    BKENodesStatusMap   map[string]map[string]*StatusRecordV2
 
     cleaner *StatusCleaner
 }
 
-// NewStatusManagerV3 创建状态管理器
-func NewStatusManagerV3() *StatusManagerV3 {
-    sm := &StatusManagerV3{
-        BKEClusterStatusMap: map[string]*StatusRecordV3{},
-        BKENodesStatusMap:   map[string]map[string]*StatusRecordV3{},
+// NewStatusManagerV2 创建状态管理器
+func NewStatusManagerV2() *StatusManagerV2 {
+    sm := &StatusManagerV2{
+        BKEClusterStatusMap: map[string]*StatusRecordV2{},
+        BKENodesStatusMap:   map[string]map[string]*StatusRecordV2{},
     }
     sm.cleaner = &StatusCleaner{
         cleanupInterval: 1 * time.Hour,
@@ -3460,7 +3460,7 @@ func NewStatusManagerV3() *StatusManagerV3 {
 
 ```go
 // SetStatus 记录集群和节点状态（接口签名不变）
-func (b *StatusManagerV3) SetStatus(bkeCluster *bkev1beta1.BKECluster, bkeNodes bkev1beta1.BKENodes) {
+func (b *StatusManagerV2) SetStatus(bkeCluster *bkev1beta1.BKECluster, bkeNodes bkev1beta1.BKENodes) {
     b.recordBKEClusterStatus(bkeCluster)
     b.recordBKENodesStatus(bkeCluster, bkeNodes)
 }
@@ -3470,7 +3470,7 @@ func (b *StatusManagerV3) SetStatus(bkeCluster *bkev1beta1.BKECluster, bkeNodes 
 
 ```go
 // recordBKEClusterStatus 记录集群状态（简化版，删除状态伪装逻辑）
-func (b *StatusManagerV3) recordBKEClusterStatus(bkeCluster *bkev1beta1.BKECluster) {
+func (b *StatusManagerV2) recordBKEClusterStatus(bkeCluster *bkev1beta1.BKECluster) {
     if _, ok := annotation.HasAnnotation(bkeCluster, annotation.StatusRecordAnnotationKey); !ok {
         return
     }
@@ -3497,7 +3497,7 @@ func (b *StatusManagerV3) recordBKEClusterStatus(bkeCluster *bkev1beta1.BKEClust
     }()
 
     if sr == nil {
-        sr = NewStatusRecordV3()
+        sr = NewStatusRecordV2()
         b.BKEClusterStatusMap[key] = sr
     }
 
@@ -3546,7 +3546,7 @@ func (b *StatusManagerV3) recordBKEClusterStatus(bkeCluster *bkev1beta1.BKEClust
 ##### recordBKENodesStatus（保留）
 
 ```go
-func (b *StatusManagerV3) recordBKENodesStatus(bkeCluster *bkev1beta1.BKECluster, bkeNodes bkev1beta1.BKENodes) {
+func (b *StatusManagerV2) recordBKENodesStatus(bkeCluster *bkev1beta1.BKECluster, bkeNodes bkev1beta1.BKENodes) {
     if bkeNodes == nil || len(bkeNodes) == 0 {
         return
     }
@@ -3560,7 +3560,7 @@ func (b *StatusManagerV3) recordBKENodesStatus(bkeCluster *bkev1beta1.BKECluster
     nodesStatusMap := b.BKENodesStatusMap[key]
 
     if nodesStatusMap == nil {
-        nodesStatusMap = map[string]*StatusRecordV3{}
+        nodesStatusMap = map[string]*StatusRecordV2{}
         b.BKENodesStatusMap[key] = nodesStatusMap
     }
 
@@ -3573,8 +3573,8 @@ func (b *StatusManagerV3) recordBKENodesStatus(bkeCluster *bkev1beta1.BKECluster
 ##### recordSingleNodeState（简化版）
 
 ```go
-func (b *StatusManagerV3) recordSingleNodeState(
-    bkeNode *confv1beta1.BKENode, nodesStatusMap map[string]*StatusRecordV3,
+func (b *StatusManagerV2) recordSingleNodeState(
+    bkeNode *confv1beta1.BKENode, nodesStatusMap map[string]*StatusRecordV2,
     bkeNodes bkev1beta1.BKENodes, log *log.Logger,
 ) {
     nodeIP := bkeNode.Spec.IP
@@ -3603,7 +3603,7 @@ func (b *StatusManagerV3) recordSingleNodeState(
     }()
 
     if sr == nil {
-        sr = NewStatusRecordV3()
+        sr = NewStatusRecordV2()
         nodesStatusMap[nodeIP] = sr
     }
 
@@ -3638,7 +3638,7 @@ func (b *StatusManagerV3) recordSingleNodeState(
 
 ```go
 // GetCtrlResult 获取控制结果（接口签名不变）
-func (b *StatusManagerV3) GetCtrlResult(bkeCluster *bkev1beta1.BKECluster) ctrl.Result {
+func (b *StatusManagerV2) GetCtrlResult(bkeCluster *bkev1beta1.BKECluster) ctrl.Result {
     if bkeCluster.Status.ClusterStatus == bkev1beta1.ClusterPaused {
         return ctrl.Result{}
     }
@@ -3661,7 +3661,7 @@ func (b *StatusManagerV3) GetCtrlResult(bkeCluster *bkev1beta1.BKECluster) ctrl.
 
 ```go
 // GetNodesResult 获取节点结果（接口签名不变）
-func (b *StatusManagerV3) GetNodesResult(bkeCluster *bkev1beta1.BKECluster, nodeIP string) bool {
+func (b *StatusManagerV2) GetNodesResult(bkeCluster *bkev1beta1.BKECluster, nodeIP string) bool {
     b.nmux.RLock()
     defer b.nmux.RUnlock()
 
@@ -3684,7 +3684,7 @@ func (b *StatusManagerV3) GetNodesResult(bkeCluster *bkev1beta1.BKECluster, node
 
 ```go
 // GetRetryCount 获取重试计数（供 Engine 查询）
-func (b *StatusManagerV3) GetRetryCount(cluster *bkev1beta1.BKECluster) int32 {
+func (b *StatusManagerV2) GetRetryCount(cluster *bkev1beta1.BKECluster) int32 {
     b.cmux.RLock()
     defer b.cmux.RUnlock()
 
@@ -3701,7 +3701,7 @@ func (b *StatusManagerV3) GetRetryCount(cluster *bkev1beta1.BKECluster) int32 {
 
 ```go
 // GetLatestNormalState 获取最后正常状态（供 Engine 查询）
-func (b *StatusManagerV3) GetLatestNormalState(cluster *bkev1beta1.BKECluster) string {
+func (b *StatusManagerV2) GetLatestNormalState(cluster *bkev1beta1.BKECluster) string {
     b.cmux.RLock()
     defer b.cmux.RUnlock()
 
@@ -3718,7 +3718,7 @@ func (b *StatusManagerV3) GetLatestNormalState(cluster *bkev1beta1.BKECluster) s
 
 ```go
 // ResetRetryCount 重置重试计数（Engine 在状态转换成功后调用）
-func (b *StatusManagerV3) ResetRetryCount(cluster *bkev1beta1.BKECluster) {
+func (b *StatusManagerV2) ResetRetryCount(cluster *bkev1beta1.BKECluster) {
     b.cmux.Lock()
     defer b.cmux.Unlock()
 
@@ -3738,7 +3738,7 @@ func (b *StatusManagerV3) ResetRetryCount(cluster *bkev1beta1.BKECluster) {
 // StatusCleaner 状态清理器
 type StatusCleaner struct {
     cleanupInterval time.Duration
-    manager         *StatusManagerV3
+    manager         *StatusManagerV2
     stopCh          chan struct{}
 }
 
@@ -3790,13 +3790,13 @@ func (c *StatusCleaner) cleanupExpiredRecords() {
 
 ```go
 // RemoveClusterStatusManagerCache 清理集群和节点缓存
-func (b *StatusManagerV3) RemoveClusterStatusManagerCache(bkeCluster *bkev1beta1.BKECluster) {
+func (b *StatusManagerV2) RemoveClusterStatusManagerCache(bkeCluster *bkev1beta1.BKECluster) {
     b.RemoveBKEClusterStatusCache(bkeCluster)
     b.RemoveNodesStatusCache(bkeCluster)
 }
 
 // RemoveBKEClusterStatusCache 清理集群缓存
-func (b *StatusManagerV3) RemoveBKEClusterStatusCache(bkeCluster *bkev1beta1.BKECluster) {
+func (b *StatusManagerV2) RemoveBKEClusterStatusCache(bkeCluster *bkev1beta1.BKECluster) {
     b.cmux.Lock()
     defer b.cmux.Unlock()
     log := statusLogger.With("bkeCluster", utils.ClientObjNS(bkeCluster))
@@ -3806,7 +3806,7 @@ func (b *StatusManagerV3) RemoveBKEClusterStatusCache(bkeCluster *bkev1beta1.BKE
 }
 
 // RemoveNodesStatusCache 清理节点缓存
-func (b *StatusManagerV3) RemoveNodesStatusCache(bkeCluster *bkev1beta1.BKECluster) {
+func (b *StatusManagerV2) RemoveNodesStatusCache(bkeCluster *bkev1beta1.BKECluster) {
     b.nmux.Lock()
     defer b.nmux.Unlock()
     log := statusLogger.With("bkeCluster", utils.ClientObjNS(bkeCluster))
@@ -3816,7 +3816,7 @@ func (b *StatusManagerV3) RemoveNodesStatusCache(bkeCluster *bkev1beta1.BKEClust
 }
 
 // RemoveSingleNodeStatusCache 清理单个节点缓存
-func (b *StatusManagerV3) RemoveSingleNodeStatusCache(bkeCluster *bkev1beta1.BKECluster, nodeIP string) {
+func (b *StatusManagerV2) RemoveSingleNodeStatusCache(bkeCluster *bkev1beta1.BKECluster, nodeIP string) {
     b.nmux.Lock()
     defer b.nmux.Unlock()
 
@@ -3833,9 +3833,9 @@ func (b *StatusManagerV3) RemoveSingleNodeStatusCache(bkeCluster *bkev1beta1.BKE
 
 #### 4.3.6 与原代码的关键差异
 
-| 维度 | 原代码 (`StatusManagerV2`) | 新代码 (`StatusManagerV3`) |
+| 维度 | 原代码 (`StatusManager`) | 新代码 (`StatusManagerV2`) |
 |------|---------------------------|---------------------------|
-| **状态记录类型** | `StatusRecordV2`（含 RetryPolicy） | `StatusRecordV3`（删除 RetryPolicy） |
+| **状态记录类型** | `StatusRecord`（含 RetryPolicy） | `StatusRecordV2`（删除 RetryPolicy） |
 | **重试策略** | 按 `ClusterStatus` 索引，支持不同策略 | 由 Engine 统一管理 |
 | **状态伪装** | StatusManager 负责伪装 | 由 Engine 统一管理 |
 | **退避策略** | 支持 None/Linear/Exponential | 由 Engine 统一管理 |
@@ -3848,16 +3848,14 @@ func (b *StatusManagerV3) RemoveSingleNodeStatusCache(bkeCluster *bkev1beta1.BKE
 
 ```
 步骤 1: 替换 staterecords.go
-  ├── 保留 StatusRecordV2（标记 Deprecated）
-  ├── 新增 StatusRecordV3（删除 RetryPolicy 字段）
+  ├── 新增 StatusRecordV2（删除 RetryPolicy 字段）
   └── 删除 ClusterStatusRetryPolicies 配置
 
 步骤 2: 替换 statusmanager.go
-  ├── 保留 StatusManagerV2（标记 Deprecated）
-  ├── 新增 StatusManagerV3
+  ├── 新增 StatusManagerV2
   ├── 删除状态伪装逻辑
   ├── 新增 GetRetryCount/GetLatestNormalState/ResetRetryCount 方法
-  ├── 修改 BKEClusterStatusManager = NewStatusManagerV3()
+  ├── 修改 BKEClusterStatusManager = NewStatusManagerV2()
   └── 保留所有公开方法签名
 
 步骤 3: Engine 集成
