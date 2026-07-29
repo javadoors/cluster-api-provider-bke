@@ -1588,22 +1588,33 @@ type Transition struct {
 }
 ```
 
-**规则优先级机制**：
+**规则冲突检查**：
 
-当多条规则具有相同的 `FromState` 和 `Trigger` 时，引擎按 `Priority` 字段排序，优先匹配优先级最高的规则。优先级规则如下：
+经过系统检查，所有转换规则不存在冲突。关键设计保证：
+1. **不同 Trigger**：同一 FromState 下的多条规则使用不同的 Trigger
+2. **不同 FromState**：同一 Trigger 下的多条规则使用不同的 FromState
+3. **Condition 互斥**：ScaleFailed 的 4 条重试规则通过 `LastInProgressState` 区分，每个 Condition 函数检查不同的值
 
-| 优先级 | 场景 | 说明 |
-|--------|------|------|
-| 0（默认） | 普通规则 | 大多数状态转换规则 |
-| -10 | 高优先级规则 | 错误处理、回滚等关键路径 |
-| -20 | 最高优先级规则 | 紧急中断、安全保护等 |
-
-**规则冲突避免**：
-
-设计时需确保同一 `(FromState, Trigger)` 组合下：
-1. 若有多条规则，必须通过 `Condition` 函数区分适用场景
-2. 若 `Condition` 无法区分，必须使用不同的 `Priority` 值
-3. 引擎在注册规则时进行冲突检测，发现潜在冲突时输出警告日志
+| 状态 | Trigger | 规则数 | 是否有冲突 | 说明 |
+|------|---------|-------|-----------|------|
+| Unknown | EnsureFinalizer/Certs/... | 8 | ✅ 无 | 不同 Trigger |
+| Initializing | TriggerPhaseComplete | 1 | ✅ 无 | 单规则 |
+| Initializing | EnsureCluster | 1 | ✅ 无 | 单规则 |
+| Ready | EnsureCluster/MasterJoin/... | 17 | ✅ 无 | 不同 Trigger |
+| Checking | TriggerPhaseComplete | 1 | ✅ 无 | 单规则 |
+| MasterScalingUp/Down | TriggerPhaseComplete | 各1 | ✅ 无 | 不同 FromState |
+| WorkerScalingUp/Down | TriggerPhaseComplete | 各1 | ✅ 无 | 不同 FromState |
+| Upgrading | TriggerPhaseComplete/EnsurePaused/TriggerError | 3 | ✅ 无 | 不同 Trigger |
+| DeployingAddon | TriggerPhaseComplete | 1 | ✅ 无 | 单规则 |
+| Managing | TriggerPhaseComplete | 1 | ✅ 无 | 单规则 |
+| Paused | TriggerPhaseComplete | 1 | ✅ 无 | 单规则 |
+| DryRun | TriggerPhaseComplete | 1 | ✅ 无 | 单规则 |
+| 各进行中状态 | TriggerError | 各1 | ✅ 无 | 不同 FromState |
+| **ScaleFailed** | **TriggerRetry** | **4** | **✅ 无** | **通过 LastInProgressState 区分** |
+| InitializationFailed | TriggerRetry | 1 | ✅ 无 | 单规则 |
+| UpgradeFailed | TriggerRetry | 1 | ✅ 无 | 单规则 |
+| DeployAddonFailed | TriggerRetry | 1 | ✅ 无 | 单规则 |
+| ManageFailed | TriggerRetry | 1 | ✅ 无 | 单规则 |
 
 **使用 LastInProgressState 解决 ScaleFailed 冲突**：
 
