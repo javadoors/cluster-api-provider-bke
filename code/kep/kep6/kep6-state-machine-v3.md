@@ -2482,7 +2482,809 @@ type BKENodeStatus struct {
 
 ### 8.3 状态机引擎设计
 
-（保留原有设计，详见 v3 文档）
+**文件**：`pkg/statemachine/engine.go`
+
+#### 8.3.1 状态机引擎核心
+
+```go
+package statemachine
+
+import (
+    "context"
+    "fmt"
+    "sync"
+    "time"
+
+    "sigs.k8s.io/controller-runtime/pkg/client"
+
+    confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
+)
+
+// StateMachineEngine 状态机引擎
+type StateMachineEngine struct {
+    client client.Client
+    
+    // 状态转换规则
+    clusterTransitions  map[ClusterLifecyclePhase][]ClusterTransitionRule
+    nodeTransitions     map[NodeLifecyclePhase][]NodeTransitionRule
+    componentTransitions map[ComponentLifecyclePhase][]ComponentTransitionRule
+    
+    // 状态聚合器
+    healthAggregator *HealthAggregator
+    
+    // 并发控制
+    mux sync.RWMutex
+}
+
+// NewStateMachineEngine 创建状态机引擎
+func NewStateMachineEngine(client client.Client) *StateMachineEngine {
+    engine := &StateMachineEngine{
+        client:               client,
+        clusterTransitions:   make(map[ClusterLifecyclePhase][]ClusterTransitionRule),
+        nodeTransitions:      make(map[NodeLifecyclePhase][]NodeTransitionRule),
+        componentTransitions: make(map[ComponentLifecyclePhase][]ComponentTransitionRule),
+        healthAggregator:     &HealthAggregator{},
+    }
+    
+    // 初始化状态转换规则
+    engine.initClusterTransitions()
+    engine.initNodeTransitions()
+    engine.initComponentTransitions()
+    
+    return engine
+}
+```
+
+#### 8.3.2 集群层状态转换
+
+```go
+// ClusterTransitionRule 集群状态转换规则
+type ClusterTransitionRule struct {
+    From       ClusterLifecyclePhase
+    To         ClusterLifecyclePhase
+    Condition  func(ctx context.Context, cluster *confv1beta1.BKECluster) bool
+    Action     func(ctx context.Context, cluster *confv1beta1.BKECluster) error
+}
+
+// initClusterTransitions 初始化集群状态转换规则
+func (e *StateMachineEngine) initClusterTransitions() {
+    // Pending -> Installing
+    e.clusterTransitions[ClusterLifecyclePending] = append(
+        e.clusterTransitions[ClusterLifecyclePending],
+        ClusterTransitionRule{
+            From: ClusterLifecyclePending,
+            To:   ClusterLifecycleInstalling,
+            Condition: func(ctx context.Context, cluster *confv1beta1.BKECluster) bool {
+                // 当用户触发安装时
+                return cluster.Spec.DesiredVersion != ""
+            },
+            Action: func(ctx context.Context, cluster *confv1beta1.BKECluster) error {
+                // 初始化 OperationProgress
+                now := metav1.Now()
+                cluster.Status.OperationProgress = &confv1beta1.OperationProgress{
+                    OperationType: confv1beta1.OperationTypeInstall,
+                    StartedAt:     &now,
+                    CurrentStage:  "InstallingNodeComponents",
+                }
+                return nil
+            },
+        },
+    )
+    
+    // Installing -> Running
+    e.clusterTransitions[ClusterLifecycleInstalling] = append(
+        e.clusterTransitions[ClusterLifecycleInstalling],
+        ClusterTransitionRule{
+            From: ClusterLifecycleInstalling,
+            To:   ClusterLifecycleRunning,
+            Condition: func(ctx context.Context, cluster *confv1beta1.BKECluster) bool {
+                // 当所有组件安装完成时
+                return e.allComponentsInstalled(cluster)
+            },
+            Action: func(ctx context.Context, cluster *confv1beta1.BKECluster) error {
+                // 更新 OperationProgress
+                now := metav1.Now()
+                cluster.Status.OperationProgress.FinishedAt = &now
+                return nil
+            },
+        },
+    )
+    
+    // Running -> Upgrading
+    e.clusterTransitions[ClusterLifecycleRunning] = append(
+        e.clusterTransitions[ClusterLifecycleRunning],
+        ClusterTransitionRule{
+            From: ClusterLifecycleRunning,
+            To:   ClusterLifecycleUpgrading,
+            Condition: func(ctx context.Context, cluster *confv1beta1.BKECluster) bool {
+                // 当用户触发升级时
+                return cluster.Spec.DesiredVersion != cluster.Status.CurrentVersion
+            },
+            Action: func(ctx context.Context, cluster *confv1beta1.BKECluster) error {
+                // 初始化 OperationProgress
+                now := metav1.Now()
+                cluster.Status.OperationProgress = &confv1beta1.OperationProgress{
+                    OperationType:   confv1beta1.OperationTypeUpgrade,
+                    TargetVersion:   cluster.Spec.DesiredVersion,
+                    StartedAt:       &now,
+                    CurrentStage:    "UpgradingNodeComponents",
+                }
+                return nil
+            },
+        },
+    )
+    
+    // Upgrading -> Running
+    e.clusterTransitions[ClusterLifecycleUpgrading] = append(
+        e.clusterTransitions[ClusterLifecycleUpgrading],
+        ClusterTransitionRule{
+            From: ClusterLifecycleUpgrading,
+            To:   ClusterLifecycleRunning,
+            Condition: func(ctx context.Context, cluster *confv1beta1.BKECluster) bool {
+                // 当所有组件升级完成时
+                return e.allComponentsUpgraded(cluster)
+            },
+            Action: func(ctx context.Context, cluster *confv1beta1.BKECluster) error {
+                // 更新 OperationProgress
+                now := metav1.Now()
+                cluster.Status.OperationProgress.FinishedAt = &now
+                cluster.Status.CurrentVersion = cluster.Spec.DesiredVersion
+                return nil
+            },
+        },
+    )
+    
+    // Running -> Scaling
+    e.clusterTransitions[ClusterLifecycleRunning] = append(
+        e.clusterTransitions[ClusterLifecycleRunning],
+        ClusterTransitionRule{
+            From: ClusterLifecycleRunning,
+            To:   ClusterLifecycleScaling,
+            Condition: func(ctx context.Context, cluster *confv1beta1.BKECluster) bool {
+                // 当用户触发扩缩容时
+                return e.hasScalingOperation(cluster)
+            },
+            Action: func(ctx context.Context, cluster *confv1beta1.BKECluster) error {
+                // 初始化 OperationProgress
+                now := metav1.Now()
+                cluster.Status.OperationProgress = &confv1beta1.OperationProgress{
+                    OperationType: confv1beta1.OperationTypeScale,
+                    StartedAt:     &now,
+                    CurrentStage:  e.getScalingStage(cluster),
+                }
+                return nil
+            },
+        },
+    )
+    
+    // Scaling -> Running
+    e.clusterTransitions[ClusterLifecycleScaling] = append(
+        e.clusterTransitions[ClusterLifecycleScaling],
+        ClusterTransitionRule{
+            From: ClusterLifecycleScaling,
+            To:   ClusterLifecycleRunning,
+            Condition: func(ctx context.Context, cluster *confv1beta1.BKECluster) bool {
+                // 当扩缩容完成时
+                return e.scalingCompleted(cluster)
+            },
+            Action: func(ctx context.Context, cluster *confv1beta1.BKECluster) error {
+                // 更新 OperationProgress
+                now := metav1.Now()
+                cluster.Status.OperationProgress.FinishedAt = &now
+                return nil
+            },
+        },
+    )
+    
+    // 任意状态 -> Failed
+    for _, phase := range []ClusterLifecyclePhase{
+        ClusterLifecycleInstalling,
+        ClusterLifecycleUpgrading,
+        ClusterLifecycleScaling,
+        ClusterLifecycleRollingBack,
+    } {
+        e.clusterTransitions[phase] = append(
+            e.clusterTransitions[phase],
+            ClusterTransitionRule{
+                From: phase,
+                To:   ClusterLifecycleFailed,
+                Condition: func(ctx context.Context, cluster *confv1beta1.BKECluster) bool {
+                    // 当操作失败且超过最大重试次数时
+                    return e.hasExceededMaxRetries(cluster)
+                },
+                Action: func(ctx context.Context, cluster *confv1beta1.BKECluster) error {
+                    // 标记需要人工介入
+                    cluster.Status.OperationProgress.NeedsManualIntervention = true
+                    return nil
+                },
+            },
+        )
+    }
+}
+```
+
+#### 8.3.3 节点层状态转换
+
+```go
+// NodeTransitionRule 节点状态转换规则
+type NodeTransitionRule struct {
+    From      NodeLifecyclePhase
+    To        NodeLifecyclePhase
+    Condition func(ctx context.Context, node *confv1beta1.BKENode) bool
+    Action    func(ctx context.Context, node *confv1beta1.BKENode) error
+}
+
+// initNodeTransitions 初始化节点状态转换规则
+func (e *StateMachineEngine) initNodeTransitions() {
+    // Pending -> Provisioned
+    e.nodeTransitions[NodeLifecyclePending] = append(
+        e.nodeTransitions[NodeLifecyclePending],
+        NodeTransitionRule{
+            From: NodeLifecyclePending,
+            To:   NodeLifecycleProvisioned,
+            Condition: func(ctx context.Context, node *confv1beta1.BKENode) bool {
+                // 当 Agent 推送完成且环境初始化完成时
+                return node.Status.StateCode&confv1beta1.NodeAgentReadyFlag != 0 &&
+                    node.Status.StateCode&confv1beta1.NodeEnvFlag != 0
+            },
+            Action: func(ctx context.Context, node *confv1beta1.BKENode) error {
+                // 初始化 OperationProgress
+                now := metav1.Now()
+                node.Status.OperationProgress = &confv1beta1.NodeOperationProgress{
+                    OperationType: confv1beta1.NodeOperationTypeInstall,
+                    StartedAt:     &now,
+                    CurrentStage:  "InstallingComponents",
+                }
+                return nil
+            },
+        },
+    )
+    
+    // Provisioned -> Ready
+    e.nodeTransitions[NodeLifecycleProvisioned] = append(
+        e.nodeTransitions[NodeLifecycleProvisioned],
+        NodeTransitionRule{
+            From: NodeLifecycleProvisioned,
+            To:   NodeLifecycleReady,
+            Condition: func(ctx context.Context, node *confv1beta1.BKENode) bool {
+                // 当所有节点级组件安装完成时
+                return e.allNodeComponentsInstalled(node)
+            },
+            Action: func(ctx context.Context, node *confv1beta1.BKENode) error {
+                // 更新 OperationProgress
+                now := metav1.Now()
+                node.Status.OperationProgress.FinishedAt = &now
+                return nil
+            },
+        },
+    )
+    
+    // Ready -> Upgrading
+    e.nodeTransitions[NodeLifecycleReady] = append(
+        e.nodeTransitions[NodeLifecycleReady],
+        NodeTransitionRule{
+            From: NodeLifecycleReady,
+            To:   NodeLifecycleUpgrading,
+            Condition: func(ctx context.Context, node *confv1beta1.BKENode) bool {
+                // 当用户触发升级时
+                return e.hasNodeUpgradeOperation(node)
+            },
+            Action: func(ctx context.Context, node *confv1beta1.BKENode) error {
+                // 初始化 OperationProgress
+                now := metav1.Now()
+                node.Status.OperationProgress = &confv1beta1.NodeOperationProgress{
+                    OperationType: confv1beta1.NodeOperationTypeUpgrade,
+                    StartedAt:     &now,
+                    CurrentStage:  "UpgradingComponents",
+                }
+                return nil
+            },
+        },
+    )
+    
+    // Upgrading -> Ready
+    e.nodeTransitions[NodeLifecycleUpgrading] = append(
+        e.nodeTransitions[NodeLifecycleUpgrading],
+        NodeTransitionRule{
+            From: NodeLifecycleUpgrading,
+            To:   NodeLifecycleReady,
+            Condition: func(ctx context.Context, node *confv1beta1.BKENode) bool {
+                // 当所有组件升级完成时
+                return e.allNodeComponentsUpgraded(node)
+            },
+            Action: func(ctx context.Context, node *confv1beta1.BKENode) error {
+                // 更新 OperationProgress
+                now := metav1.Now()
+                node.Status.OperationProgress.FinishedAt = &now
+                return nil
+            },
+        },
+    )
+    
+    // Ready -> Deleting
+    e.nodeTransitions[NodeLifecycleReady] = append(
+        e.nodeTransitions[NodeLifecycleReady],
+        NodeTransitionRule{
+            From: NodeLifecycleReady,
+            To:   NodeLifecycleDeleting,
+            Condition: func(ctx context.Context, node *confv1beta1.BKENode) bool {
+                // 当用户触发删除时
+                return node.DeletionTimestamp != nil
+            },
+            Action: func(ctx context.Context, node *confv1beta1.BKENode) error {
+                // 初始化 OperationProgress
+                now := metav1.Now()
+                node.Status.OperationProgress = &confv1beta1.NodeOperationProgress{
+                    OperationType: confv1beta1.NodeOperationTypeDelete,
+                    StartedAt:     &now,
+                    CurrentStage:  "DeletingComponents",
+                }
+                return nil
+            },
+        },
+    )
+    
+    // Deleting -> Deleted
+    e.nodeTransitions[NodeLifecycleDeleting] = append(
+        e.nodeTransitions[NodeLifecycleDeleting],
+        NodeTransitionRule{
+            From: NodeLifecycleDeleting,
+            To:   NodeLifecycleDeleted,
+            Condition: func(ctx context.Context, node *confv1beta1.BKENode) bool {
+                // 当所有组件删除完成时
+                return e.allNodeComponentsDeleted(node)
+            },
+            Action: func(ctx context.Context, node *confv1beta1.BKENode) error {
+                // 更新 OperationProgress
+                now := metav1.Now()
+                node.Status.OperationProgress.FinishedAt = &now
+                return nil
+            },
+        },
+    )
+}
+```
+
+#### 8.3.4 组件层状态转换
+
+```go
+// ComponentTransitionRule 组件状态转换规则
+type ComponentTransitionRule struct {
+    From      ComponentLifecyclePhase
+    To        ComponentLifecyclePhase
+    Condition func(ctx context.Context, component *confv1beta1.ComponentLifecycleStatus) bool
+    Action    func(ctx context.Context, component *confv1beta1.ComponentLifecycleStatus) error
+}
+
+// initComponentTransitions 初始化组件状态转换规则
+func (e *StateMachineEngine) initComponentTransitions() {
+    // Pending -> Installing
+    e.componentTransitions[ComponentLifecyclePending] = append(
+        e.componentTransitions[ComponentLifecyclePending],
+        ComponentTransitionRule{
+            From: ComponentLifecyclePending,
+            To:   ComponentLifecycleInstalling,
+            Condition: func(ctx context.Context, component *confv1beta1.ComponentLifecycleStatus) bool {
+                // 当开始安装时
+                return component.OperationProgress != nil &&
+                    component.OperationProgress.OperationType == confv1beta1.ComponentOperationTypeInstall
+            },
+            Action: func(ctx context.Context, component *confv1beta1.ComponentLifecycleStatus) error {
+                // 初始化 OperationProgress
+                now := metav1.Now()
+                component.OperationProgress.StartedAt = &now
+                component.OperationProgress.CurrentStage = "Downloading"
+                return nil
+            },
+        },
+    )
+    
+    // Installing -> Installed
+    e.componentTransitions[ComponentLifecycleInstalling] = append(
+        e.componentTransitions[ComponentLifecycleInstalling],
+        ComponentTransitionRule{
+            From: ComponentLifecycleInstalling,
+            To:   ComponentLifecycleInstalled,
+            Condition: func(ctx context.Context, component *confv1beta1.ComponentLifecycleStatus) bool {
+                // 当安装完成时
+                return e.componentInstallationCompleted(component)
+            },
+            Action: func(ctx context.Context, component *confv1beta1.ComponentLifecycleStatus) error {
+                // 更新 OperationProgress
+                now := metav1.Now()
+                component.OperationProgress.FinishedAt = &now
+                return nil
+            },
+        },
+    )
+    
+    // Installed -> Upgrading
+    e.componentTransitions[ComponentLifecycleInstalled] = append(
+        e.componentTransitions[ComponentLifecycleInstalled],
+        ComponentTransitionRule{
+            From: ComponentLifecycleInstalled,
+            To:   ComponentLifecycleUpgrading,
+            Condition: func(ctx context.Context, component *confv1beta1.ComponentLifecycleStatus) bool {
+                // 当开始升级时
+                return component.OperationProgress != nil &&
+                    component.OperationProgress.OperationType == confv1beta1.ComponentOperationTypeUpgrade
+            },
+            Action: func(ctx context.Context, component *confv1beta1.ComponentLifecycleStatus) error {
+                // 初始化 OperationProgress
+                now := metav1.Now()
+                component.OperationProgress.StartedAt = &now
+                component.OperationProgress.CurrentStage = "BackingUp"
+                return nil
+            },
+        },
+    )
+    
+    // Upgrading -> Installed
+    e.componentTransitions[ComponentLifecycleUpgrading] = append(
+        e.componentTransitions[ComponentLifecycleUpgrading],
+        ComponentTransitionRule{
+            From: ComponentLifecycleUpgrading,
+            To:   ComponentLifecycleInstalled,
+            Condition: func(ctx context.Context, component *confv1beta1.ComponentLifecycleStatus) bool {
+                // 当升级完成时
+                return e.componentUpgradeCompleted(component)
+            },
+            Action: func(ctx context.Context, component *confv1beta1.ComponentLifecycleStatus) error {
+                // 更新 OperationProgress
+                now := metav1.Now()
+                component.OperationProgress.FinishedAt = &now
+                return nil
+            },
+        },
+    )
+    
+    // Installed -> Deleting
+    e.componentTransitions[ComponentLifecycleInstalled] = append(
+        e.componentTransitions[ComponentLifecycleInstalled],
+        ComponentTransitionRule{
+            From: ComponentLifecycleInstalled,
+            To:   ComponentLifecycleDeleting,
+            Condition: func(ctx context.Context, component *confv1beta1.ComponentLifecycleStatus) bool {
+                // 当开始删除时
+                return component.OperationProgress != nil &&
+                    component.OperationProgress.OperationType == confv1beta1.ComponentOperationTypeDelete
+            },
+            Action: func(ctx context.Context, component *confv1beta1.ComponentLifecycleStatus) error {
+                // 初始化 OperationProgress
+                now := metav1.Now()
+                component.OperationProgress.StartedAt = &now
+                component.OperationProgress.CurrentStage = "Stopping"
+                return nil
+            },
+        },
+    )
+    
+    // Deleting -> Deleted
+    e.componentTransitions[ComponentLifecycleDeleting] = append(
+        e.componentTransitions[ComponentLifecycleDeleting],
+        ComponentTransitionRule{
+            From: ComponentLifecycleDeleting,
+            To:   ComponentLifecycleDeleted,
+            Condition: func(ctx context.Context, component *confv1beta1.ComponentLifecycleStatus) bool {
+                // 当删除完成时
+                return e.componentDeletionCompleted(component)
+            },
+            Action: func(ctx context.Context, component *confv1beta1.ComponentLifecycleStatus) error {
+                // 更新 OperationProgress
+                now := metav1.Now()
+                component.OperationProgress.FinishedAt = &now
+                return nil
+            },
+        },
+    )
+}
+```
+
+#### 8.3.5 状态评估与转换
+
+```go
+// EvaluateClusterState 评估集群状态
+func (e *StateMachineEngine) EvaluateClusterState(
+    ctx context.Context,
+    cluster *confv1beta1.BKECluster,
+) error {
+    e.mux.RLock()
+    defer e.mux.RUnlock()
+    
+    currentPhase := cluster.Status.LifecyclePhase
+    transitions := e.clusterTransitions[currentPhase]
+    
+    // 检查每个转换规则
+    for _, rule := range transitions {
+        if rule.Condition(ctx, cluster) {
+            // 执行转换动作
+            if err := rule.Action(ctx, cluster); err != nil {
+                return fmt.Errorf("failed to execute transition action: %w", err)
+            }
+            
+            // 更新状态
+            cluster.Status.LifecyclePhase = rule.To
+            
+            // 记录状态转换事件
+            e.recordClusterTransition(cluster, currentPhase, rule.To)
+            
+            return nil
+        }
+    }
+    
+    return nil
+}
+
+// EvaluateNodeState 评估节点状态
+func (e *StateMachineEngine) EvaluateNodeState(
+    ctx context.Context,
+    node *confv1beta1.BKENode,
+) error {
+    e.mux.RLock()
+    defer e.mux.RUnlock()
+    
+    currentPhase := node.Status.LifecyclePhase
+    transitions := e.nodeTransitions[currentPhase]
+    
+    // 检查每个转换规则
+    for _, rule := range transitions {
+        if rule.Condition(ctx, node) {
+            // 执行转换动作
+            if err := rule.Action(ctx, node); err != nil {
+                return fmt.Errorf("failed to execute transition action: %w", err)
+            }
+            
+            // 更新状态
+            node.Status.LifecyclePhase = rule.To
+            
+            // 记录状态转换事件
+            e.recordNodeTransition(node, currentPhase, rule.To)
+            
+            return nil
+        }
+    }
+    
+    return nil
+}
+
+// EvaluateComponentState 评估组件状态
+func (e *StateMachineEngine) EvaluateComponentState(
+    ctx context.Context,
+    component *confv1beta1.ComponentLifecycleStatus,
+) error {
+    e.mux.RLock()
+    defer e.mux.RUnlock()
+    
+    currentPhase := component.Phase
+    transitions := e.componentTransitions[currentPhase]
+    
+    // 检查每个转换规则
+    for _, rule := range transitions {
+        if rule.Condition(ctx, component) {
+            // 执行转换动作
+            if err := rule.Action(ctx, component); err != nil {
+                return fmt.Errorf("failed to execute transition action: %w", err)
+            }
+            
+            // 更新状态
+            component.Phase = rule.To
+            
+            // 记录状态转换事件
+            e.recordComponentTransition(component, currentPhase, rule.To)
+            
+            return nil
+        }
+    }
+    
+    return nil
+}
+```
+
+#### 8.3.6 辅助函数
+
+```go
+// allComponentsInstalled 检查所有组件是否安装完成
+func (e *StateMachineEngine) allComponentsInstalled(cluster *confv1beta1.BKECluster) bool {
+    // 检查所有节点级组件
+    for _, node := range cluster.Status.Nodes {
+        for _, component := range node.Components {
+            if component.Phase != ComponentLifecycleInstalled {
+                return false
+            }
+        }
+    }
+    
+    // 检查所有集群级组件
+    for _, component := range cluster.Status.ClusterComponentStatuses {
+        if component.Phase != ComponentLifecycleInstalled {
+            return false
+        }
+    }
+    
+    return true
+}
+
+// allComponentsUpgraded 检查所有组件是否升级完成
+func (e *StateMachineEngine) allComponentsUpgraded(cluster *confv1beta1.BKECluster) bool {
+    // 检查所有节点级组件
+    for _, node := range cluster.Status.Nodes {
+        for _, component := range node.Components {
+            if component.Phase != ComponentLifecycleInstalled {
+                return false
+            }
+            if component.CurrentVersion != cluster.Spec.DesiredVersion {
+                return false
+            }
+        }
+    }
+    
+    // 检查所有集群级组件
+    for _, component := range cluster.Status.ClusterComponentStatuses {
+        if component.Phase != ComponentLifecycleInstalled {
+            return false
+        }
+        if component.CurrentVersion != cluster.Spec.DesiredVersion {
+            return false
+        }
+    }
+    
+    return true
+}
+
+// hasScalingOperation 检查是否有扩缩容操作
+func (e *StateMachineEngine) hasScalingOperation(cluster *confv1beta1.BKECluster) bool {
+    // 检查是否有节点需要添加或删除
+    return len(cluster.Spec.NodesToAdd) > 0 || len(cluster.Spec.NodesToRemove) > 0
+}
+
+// getScalingStage 获取扩缩容阶段
+func (e *StateMachineEngine) getScalingStage(cluster *confv1beta1.BKECluster) string {
+    if len(cluster.Spec.NodesToAdd) > 0 {
+        return "ScalingUp"
+    }
+    return "ScalingDown"
+}
+
+// scalingCompleted 检查扩缩容是否完成
+func (e *StateMachineEngine) scalingCompleted(cluster *confv1beta1.BKECluster) bool {
+    // 检查是否所有节点都已就绪
+    for _, node := range cluster.Status.Nodes {
+        if node.LifecyclePhase != NodeLifecycleReady {
+            return false
+        }
+    }
+    
+    return true
+}
+
+// hasExceededMaxRetries 检查是否超过最大重试次数
+func (e *StateMachineEngine) hasExceededMaxRetries(cluster *confv1beta1.BKECluster) bool {
+    if cluster.Status.OperationProgress == nil {
+        return false
+    }
+    
+    if cluster.Status.OperationProgress.LastFailure == nil {
+        return false
+    }
+    
+    return cluster.Status.OperationProgress.LastFailure.Attempt >= DefaultRetryPolicy.MaxRetries
+}
+
+// allNodeComponentsInstalled 检查所有节点级组件是否安装完成
+func (e *StateMachineEngine) allNodeComponentsInstalled(node *confv1beta1.BKENode) bool {
+    for _, component := range node.Status.Components {
+        if component.Phase != ComponentLifecycleInstalled {
+            return false
+        }
+    }
+    return true
+}
+
+// allNodeComponentsUpgraded 检查所有节点级组件是否升级完成
+func (e *StateMachineEngine) allNodeComponentsUpgraded(node *confv1beta1.BKENode) bool {
+    for _, component := range node.Status.Components {
+        if component.Phase != ComponentLifecycleInstalled {
+            return false
+        }
+        if component.CurrentVersion != node.Spec.DesiredVersion {
+            return false
+        }
+    }
+    return true
+}
+
+// allNodeComponentsDeleted 检查所有节点级组件是否删除完成
+func (e *StateMachineEngine) allNodeComponentsDeleted(node *confv1beta1.BKENode) bool {
+    for _, component := range node.Status.Components {
+        if component.Phase != ComponentLifecycleDeleted {
+            return false
+        }
+    }
+    return true
+}
+
+// componentInstallationCompleted 检查组件安装是否完成
+func (e *StateMachineEngine) componentInstallationCompleted(component *confv1beta1.ComponentLifecycleStatus) bool {
+    return component.OperationProgress != nil &&
+        component.OperationProgress.CompletedSteps == component.OperationProgress.TotalSteps
+}
+
+// componentUpgradeCompleted 检查组件升级是否完成
+func (e *StateMachineEngine) componentUpgradeCompleted(component *confv1beta1.ComponentLifecycleStatus) bool {
+    return component.OperationProgress != nil &&
+        component.OperationProgress.CompletedSteps == component.OperationProgress.TotalSteps
+}
+
+// componentDeletionCompleted 检查组件删除是否完成
+func (e *StateMachineEngine) componentDeletionCompleted(component *confv1beta1.ComponentLifecycleStatus) bool {
+    return component.OperationProgress != nil &&
+        component.OperationProgress.CompletedSteps == component.OperationProgress.TotalSteps
+}
+```
+
+#### 8.3.7 状态转换事件记录
+
+```go
+// recordClusterTransition 记录集群状态转换事件
+func (e *StateMachineEngine) recordClusterTransition(
+    cluster *confv1beta1.BKECluster,
+    from, to ClusterLifecyclePhase,
+) {
+    // 发送 Kubernetes Event
+    e.client.Events("").Recordf(
+        cluster,
+        "Normal",
+        "ClusterStateChanged",
+        "Cluster lifecycle phase changed from %s to %s",
+        from, to,
+    )
+    
+    // 记录日志
+    log.Info("Cluster lifecycle phase changed",
+        "cluster", cluster.Name,
+        "namespace", cluster.Namespace,
+        "from", from,
+        "to", to,
+    )
+}
+
+// recordNodeTransition 记录节点状态转换事件
+func (e *StateMachineEngine) recordNodeTransition(
+    node *confv1beta1.BKENode,
+    from, to NodeLifecyclePhase,
+) {
+    // 发送 Kubernetes Event
+    e.client.Events("").Recordf(
+        node,
+        "Normal",
+        "NodeStateChanged",
+        "Node lifecycle phase changed from %s to %s",
+        from, to,
+    )
+    
+    // 记录日志
+    log.Info("Node lifecycle phase changed",
+        "node", node.Name,
+        "namespace", node.Namespace,
+        "from", from,
+        "to", to,
+    )
+}
+
+// recordComponentTransition 记录组件状态转换事件
+func (e *StateMachineEngine) recordComponentTransition(
+    component *confv1beta1.ComponentLifecycleStatus,
+    from, to ComponentLifecyclePhase,
+) {
+    // 记录日志
+    log.Info("Component lifecycle phase changed",
+        "component", component.Name,
+        "nodeIP", component.NodeIP,
+        "from", from,
+        "to", to,
+    )
+}
+```
 
 ### 8.4 健康状态聚合器设计
 
@@ -3195,5 +3997,5 @@ func TestNodeRecoveryFromComponentInstallFailed(t *testing.T) {
 
 ---
 
-**文档版本**: v3.17 (混合模型 - 添加兼容性分析)  
+**文档版本**: v3.18 (混合模型 - 添加状态机引擎设计)  
 **维护者**: openFuyao Team
