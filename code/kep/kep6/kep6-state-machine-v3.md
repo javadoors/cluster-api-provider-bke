@@ -3399,7 +3399,511 @@ func (a *HealthAggregator) hasUnhealthyComponent(components map[string]confv1bet
 
 ### 8.5 兼容性映射设计
 
-（保留原有设计，详见 v3 文档）
+**文件**：`pkg/statemachine/compatibility.go`
+
+#### 8.5.1 集群层状态映射
+
+```go
+package statemachine
+
+import (
+    confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
+)
+
+// SyncClusterPhaseToLegacyFields 将 v3 LifecyclePhase 同步到旧字段
+func SyncClusterPhaseToLegacyFields(
+    cluster *confv1beta1.BKECluster,
+    phase confv1beta1.ClusterLifecyclePhase,
+) {
+    // 同步 Phase 字段
+    cluster.Status.Phase = mapLifecyclePhaseToPhase(phase)
+    
+    // 同步 ClusterStatus 字段
+    cluster.Status.ClusterStatus = mapLifecyclePhaseToClusterStatus(phase)
+    
+    // 同步 ClusterHealthState 字段
+    cluster.Status.ClusterHealthState = mapLifecyclePhaseToClusterHealthState(phase)
+}
+
+// mapLifecyclePhaseToPhase 将 LifecyclePhase 映射到 Phase
+func mapLifecyclePhaseToPhase(phase confv1beta1.ClusterLifecyclePhase) confv1beta1.BKEClusterPhase {
+    switch phase {
+    case confv1beta1.ClusterLifecyclePending:
+        return confv1beta1.ClusterPhasePending
+    case confv1beta1.ClusterLifecycleInstalling:
+        return confv1beta1.ClusterPhaseInstalling
+    case confv1beta1.ClusterLifecycleRunning:
+        return confv1beta1.ClusterPhaseRunning
+    case confv1beta1.ClusterLifecycleUpgrading:
+        return confv1beta1.ClusterPhaseUpgrading
+    case confv1beta1.ClusterLifecycleScaling:
+        return confv1beta1.ClusterPhaseScaling
+    case confv1beta1.ClusterLifecycleRollingBack:
+        return confv1beta1.ClusterPhaseRollingBack
+    case confv1beta1.ClusterLifecycleFailed:
+        return confv1beta1.ClusterPhaseFailed
+    default:
+        return confv1beta1.ClusterPhaseUnknown
+    }
+}
+
+// mapLifecyclePhaseToClusterStatus 将 LifecyclePhase 映射到 ClusterStatus
+func mapLifecyclePhaseToClusterStatus(phase confv1beta1.ClusterLifecyclePhase) confv1beta1.ClusterStatus {
+    switch phase {
+    case confv1beta1.ClusterLifecyclePending:
+        return confv1beta1.ClusterStatusPending
+    case confv1beta1.ClusterLifecycleInstalling:
+        return confv1beta1.ClusterStatusInstalling
+    case confv1beta1.ClusterLifecycleRunning:
+        return confv1beta1.ClusterStatusReady
+    case confv1beta1.ClusterLifecycleUpgrading:
+        return confv1beta1.ClusterStatusUpgrading
+    case confv1beta1.ClusterLifecycleScaling:
+        return confv1beta1.ClusterStatusScaling
+    case confv1beta1.ClusterLifecycleRollingBack:
+        return confv1beta1.ClusterStatusRollingBack
+    case confv1beta1.ClusterLifecycleFailed:
+        return confv1beta1.ClusterStatusFailed
+    default:
+        return confv1beta1.ClusterStatusUnknown
+    }
+}
+
+// mapLifecyclePhaseToClusterHealthState 将 LifecyclePhase 映射到 ClusterHealthState
+func mapLifecyclePhaseToClusterHealthState(phase confv1beta1.ClusterLifecyclePhase) confv1beta1.ClusterHealthState {
+    switch phase {
+    case confv1beta1.ClusterLifecyclePending:
+        return confv1beta1.ClusterHealthStateUnknown
+    case confv1beta1.ClusterLifecycleInstalling:
+        return confv1beta1.ClusterHealthStateInstalling
+    case confv1beta1.ClusterLifecycleRunning:
+        return confv1beta1.ClusterHealthStateHealthy
+    case confv1beta1.ClusterLifecycleUpgrading:
+        return confv1beta1.ClusterHealthStateUpgrading
+    case confv1beta1.ClusterLifecycleScaling:
+        return confv1beta1.ClusterHealthStateScaling
+    case confv1beta1.ClusterLifecycleRollingBack:
+        return confv1beta1.ClusterHealthStateRollingBack
+    case confv1beta1.ClusterLifecycleFailed:
+        return confv1beta1.ClusterHealthStateUnhealthy
+    default:
+        return confv1beta1.ClusterHealthStateUnknown
+    }
+}
+```
+
+#### 8.5.2 节点层状态映射
+
+```go
+// SyncNodePhaseToLegacyFields 将 v3 NodeLifecyclePhase 同步到旧字段
+func SyncNodePhaseToLegacyFields(
+    node *confv1beta1.BKENode,
+    phase confv1beta1.NodeLifecyclePhase,
+) {
+    // 同步 State 字段
+    node.Status.State = mapNodeLifecyclePhaseToState(phase)
+    
+    // 同步 StateCode 字段
+    node.Status.StateCode = mapNodeLifecyclePhaseToStateCode(phase, node.Status.StateCode)
+}
+
+// mapNodeLifecyclePhaseToState 将 NodeLifecyclePhase 映射到 State
+func mapNodeLifecyclePhaseToState(phase confv1beta1.NodeLifecyclePhase) confv1beta1.NodeState {
+    switch phase {
+    case confv1beta1.NodeLifecyclePending:
+        return confv1beta1.NodeStatePending
+    case confv1beta1.NodeLifecycleProvisioned:
+        return confv1beta1.NodeStateProvisioned
+    case confv1beta1.NodeLifecycleReady:
+        return confv1beta1.NodeStateReady
+    case confv1beta1.NodeLifecycleUpgrading:
+        return confv1beta1.NodeStateUpgrading
+    case confv1beta1.NodeLifecycleRollingBack:
+        return confv1beta1.NodeStateRollingBack
+    case confv1beta1.NodeLifecycleDeleting:
+        return confv1beta1.NodeStateDeleting
+    case confv1beta1.NodeLifecycleDeleted:
+        return confv1beta1.NodeStateDeleted
+    case confv1beta1.NodeLifecycleFailed:
+        return confv1beta1.NodeStateFailed
+    default:
+        return confv1beta1.NodeStateUnknown
+    }
+}
+
+// mapNodeLifecyclePhaseToStateCode 将 NodeLifecyclePhase 映射到 StateCode
+func mapNodeLifecyclePhaseToStateCode(
+    phase confv1beta1.NodeLifecyclePhase,
+    currentStateCode int,
+) int {
+    // 保留现有的 StateCode，只更新与生命周期相关的位
+    stateCode := currentStateCode
+    
+    // 清除旧的生命周期位
+    stateCode &^= confv1beta1.NodeLifecycleMask
+    
+    // 设置新的生命周期位
+    switch phase {
+    case confv1beta1.NodeLifecyclePending:
+        stateCode |= confv1beta1.NodeStatePendingFlag
+    case confv1beta1.NodeLifecycleProvisioned:
+        stateCode |= confv1beta1.NodeStateProvisionedFlag
+    case confv1beta1.NodeLifecycleReady:
+        stateCode |= confv1beta1.NodeStateReadyFlag
+    case confv1beta1.NodeLifecycleUpgrading:
+        stateCode |= confv1beta1.NodeStateUpgradingFlag
+    case confv1beta1.NodeLifecycleRollingBack:
+        stateCode |= confv1beta1.NodeStateRollingBackFlag
+    case confv1beta1.NodeLifecycleDeleting:
+        stateCode |= confv1beta1.NodeStateDeletingFlag
+    case confv1beta1.NodeLifecycleDeleted:
+        stateCode |= confv1beta1.NodeStateDeletedFlag
+    case confv1beta1.NodeLifecycleFailed:
+        stateCode |= confv1beta1.NodeStateFailedFlag
+    }
+    
+    return stateCode
+}
+```
+
+#### 8.5.3 组件层状态映射
+
+```go
+// SyncComponentPhaseToLegacyFields 将 v3 ComponentLifecyclePhase 同步到旧字段
+func SyncComponentPhaseToLegacyFields(
+    component *confv1beta1.ComponentLifecycleStatus,
+    phase confv1beta1.ComponentLifecyclePhase,
+) {
+    // 同步 Phase 字段
+    component.Phase = phase
+    
+    // 同步 LegacyPhase 字段（向后兼容）
+    component.LegacyPhase = mapComponentLifecyclePhaseToLegacyPhase(phase)
+}
+
+// mapComponentLifecyclePhaseToLegacyPhase 将 ComponentLifecyclePhase 映射到 LegacyPhase
+func mapComponentLifecyclePhaseToLegacyPhase(phase confv1beta1.ComponentLifecyclePhase) string {
+    switch phase {
+    case confv1beta1.ComponentLifecyclePending:
+        return "Pending"
+    case confv1beta1.ComponentLifecycleInstalling:
+        return "Installing"
+    case confv1beta1.ComponentLifecycleInstalled:
+        return "Installed"
+    case confv1beta1.ComponentLifecycleUpgrading:
+        return "Upgrading"
+    case confv1beta1.ComponentLifecycleRollingBack:
+        return "RollingBack"
+    case confv1beta1.ComponentLifecycleDeleting:
+        return "Deleting"
+    case confv1beta1.ComponentLifecycleDeleted:
+        return "Deleted"
+    case confv1beta1.ComponentLifecycleFailed:
+        return "Failed"
+    default:
+        return "Unknown"
+    }
+}
+```
+
+#### 8.5.4 反向映射（从旧版本到新版本）
+
+```go
+// MapPhaseToLifecyclePhase 将旧 Phase 映射到 LifecyclePhase
+func MapPhaseToLifecyclePhase(phase confv1beta1.BKEClusterPhase) confv1beta1.ClusterLifecyclePhase {
+    switch phase {
+    case confv1beta1.ClusterPhasePending:
+        return confv1beta1.ClusterLifecyclePending
+    case confv1beta1.ClusterPhaseInstalling:
+        return confv1beta1.ClusterLifecycleInstalling
+    case confv1beta1.ClusterPhaseRunning:
+        return confv1beta1.ClusterLifecycleRunning
+    case confv1beta1.ClusterPhaseUpgrading:
+        return confv1beta1.ClusterLifecycleUpgrading
+    case confv1beta1.ClusterPhaseScaling:
+        return confv1beta1.ClusterLifecycleScaling
+    case confv1beta1.ClusterPhaseRollingBack:
+        return confv1beta1.ClusterLifecycleRollingBack
+    case confv1beta1.ClusterPhaseFailed:
+        return confv1beta1.ClusterLifecycleFailed
+    default:
+        return confv1beta1.ClusterLifecycleUnknown
+    }
+}
+
+// MapClusterStatusToLifecyclePhase 将旧 ClusterStatus 映射到 LifecyclePhase
+func MapClusterStatusToLifecyclePhase(status confv1beta1.ClusterStatus) confv1beta1.ClusterLifecyclePhase {
+    switch status {
+    case confv1beta1.ClusterStatusPending:
+        return confv1beta1.ClusterLifecyclePending
+    case confv1beta1.ClusterStatusInstalling:
+        return confv1beta1.ClusterLifecycleInstalling
+    case confv1beta1.ClusterStatusReady:
+        return confv1beta1.ClusterLifecycleRunning
+    case confv1beta1.ClusterStatusUpgrading:
+        return confv1beta1.ClusterLifecycleUpgrading
+    case confv1beta1.ClusterStatusScaling:
+        return confv1beta1.ClusterLifecycleScaling
+    case confv1beta1.ClusterStatusRollingBack:
+        return confv1beta1.ClusterLifecycleRollingBack
+    case confv1beta1.ClusterStatusFailed:
+        return confv1beta1.ClusterLifecycleFailed
+    default:
+        return confv1beta1.ClusterLifecycleUnknown
+    }
+}
+
+// MapStateToNodeLifecyclePhase 将旧 State 映射到 NodeLifecyclePhase
+func MapStateToNodeLifecyclePhase(state confv1beta1.NodeState) confv1beta1.NodeLifecyclePhase {
+    switch state {
+    case confv1beta1.NodeStatePending:
+        return confv1beta1.NodeLifecyclePending
+    case confv1beta1.NodeStateProvisioned:
+        return confv1beta1.NodeLifecycleProvisioned
+    case confv1beta1.NodeStateReady:
+        return confv1beta1.NodeLifecycleReady
+    case confv1beta1.NodeStateUpgrading:
+        return confv1beta1.NodeLifecycleUpgrading
+    case confv1beta1.NodeStateRollingBack:
+        return confv1beta1.NodeLifecycleRollingBack
+    case confv1beta1.NodeStateDeleting:
+        return confv1beta1.NodeLifecycleDeleting
+    case confv1beta1.NodeStateDeleted:
+        return confv1beta1.NodeLifecycleDeleted
+    case confv1beta1.NodeStateFailed:
+        return confv1beta1.NodeLifecycleFailed
+    default:
+        return confv1beta1.NodeLifecycleUnknown
+    }
+}
+```
+
+#### 8.5.5 数据迁移函数
+
+```go
+// MigrateClusterToV3 将 v1/v2 集群迁移到 v3
+func MigrateClusterToV3(cluster *confv1beta1.BKECluster) error {
+    // 1. 迁移 LifecyclePhase
+    if cluster.Status.LifecyclePhase == "" {
+        if cluster.Status.Phase != "" {
+            cluster.Status.LifecyclePhase = MapPhaseToLifecyclePhase(cluster.Status.Phase)
+        } else if cluster.Status.ClusterStatus != "" {
+            cluster.Status.LifecyclePhase = MapClusterStatusToLifecyclePhase(cluster.Status.ClusterStatus)
+        } else {
+            cluster.Status.LifecyclePhase = confv1beta1.ClusterLifecycleUnknown
+        }
+    }
+    
+    // 2. 初始化 HealthStatus
+    if cluster.Status.HealthStatus == nil {
+        cluster.Status.HealthStatus = &confv1beta1.HealthStatus{
+            Overall:       confv1beta1.HealthLevelUnknown,
+            LastCheckTime: &metav1.Time{Time: time.Now()},
+        }
+    }
+    
+    // 3. 初始化 OperationProgress
+    if cluster.Status.OperationProgress == nil {
+        cluster.Status.OperationProgress = &confv1beta1.OperationProgress{}
+    }
+    
+    // 4. 初始化节点和组件状态
+    if cluster.Status.Nodes == nil {
+        cluster.Status.Nodes = []confv1beta1.NodeStatus{}
+    }
+    
+    if cluster.Status.ClusterComponentStatuses == nil {
+        cluster.Status.ClusterComponentStatuses = map[string]confv1beta1.ComponentLifecycleStatus{}
+    }
+    
+    return nil
+}
+
+// MigrateNodeToV3 将 v1/v2 节点迁移到 v3
+func MigrateNodeToV3(node *confv1beta1.BKENode) error {
+    // 1. 迁移 NodeLifecyclePhase
+    if node.Status.LifecyclePhase == "" {
+        if node.Status.State != "" {
+            node.Status.LifecyclePhase = MapStateToNodeLifecyclePhase(node.Status.State)
+        } else {
+            node.Status.LifecyclePhase = confv1beta1.NodeLifecycleUnknown
+        }
+    }
+    
+    // 2. 初始化 HealthStatus
+    if node.Status.HealthStatus == nil {
+        node.Status.HealthStatus = &confv1beta1.HealthStatus{
+            Overall:       confv1beta1.HealthLevelUnknown,
+            LastCheckTime: &metav1.Time{Time: time.Now()},
+        }
+    }
+    
+    // 3. 初始化 OperationProgress
+    if node.Status.OperationProgress == nil {
+        node.Status.OperationProgress = &confv1beta1.NodeOperationProgress{}
+    }
+    
+    // 4. 初始化组件状态
+    if node.Status.Components == nil {
+        node.Status.Components = []confv1beta1.ComponentLifecycleStatus{}
+    }
+    
+    return nil
+}
+
+// MigrateClusterFromV3 将 v3 集群降级到 v1/v2
+func MigrateClusterFromV3(cluster *confv1beta1.BKECluster) error {
+    // 1. 从 LifecyclePhase 映射回 Phase
+    if cluster.Status.Phase == "" && cluster.Status.LifecyclePhase != "" {
+        cluster.Status.Phase = mapLifecyclePhaseToPhase(cluster.Status.LifecyclePhase)
+    }
+    
+    // 2. 从 LifecyclePhase 映射回 ClusterStatus
+    if cluster.Status.ClusterStatus == "" && cluster.Status.LifecyclePhase != "" {
+        cluster.Status.ClusterStatus = mapLifecyclePhaseToClusterStatus(cluster.Status.LifecyclePhase)
+    }
+    
+    // 3. 从 LifecyclePhase 映射回 ClusterHealthState
+    if cluster.Status.ClusterHealthState == "" && cluster.Status.LifecyclePhase != "" {
+        cluster.Status.ClusterHealthState = mapLifecyclePhaseToClusterHealthState(cluster.Status.LifecyclePhase)
+    }
+    
+    // 4. 保留新字段（可选）
+    // LifecyclePhase, HealthStatus, OperationProgress 可以保留
+    
+    return nil
+}
+```
+
+#### 8.5.6 兼容性检查函数
+
+```go
+// CheckClusterCompatibility 检查集群兼容性
+func CheckClusterCompatibility(cluster *confv1beta1.BKECluster) error {
+    // 1. 检查旧字段是否存在
+    if cluster.Status.Phase == "" && cluster.Status.ClusterStatus == "" {
+        return fmt.Errorf("neither Phase nor ClusterStatus field exists, incompatible with v1/v2")
+    }
+    
+    // 2. 检查新字段是否存在
+    if cluster.Status.LifecyclePhase == "" {
+        return fmt.Errorf("LifecyclePhase field is missing, incompatible with v3")
+    }
+    
+    // 3. 检查字段一致性
+    if !isClusterPhaseConsistent(cluster) {
+        return fmt.Errorf("Phase/ClusterStatus and LifecyclePhase are inconsistent")
+    }
+    
+    return nil
+}
+
+// isClusterPhaseConsistent 检查集群状态字段是否一致
+func isClusterPhaseConsistent(cluster *confv1beta1.BKECluster) bool {
+    // 从 Phase 推导 LifecyclePhase
+    expectedLifecyclePhase := MapPhaseToLifecyclePhase(cluster.Status.Phase)
+    
+    // 检查是否与实际的 LifecyclePhase 一致
+    return expectedLifecyclePhase == cluster.Status.LifecyclePhase
+}
+
+// CheckNodeCompatibility 检查节点兼容性
+func CheckNodeCompatibility(node *confv1beta1.BKENode) error {
+    // 1. 检查旧字段是否存在
+    if node.Status.State == "" {
+        return fmt.Errorf("State field is missing, incompatible with v1/v2")
+    }
+    
+    // 2. 检查新字段是否存在
+    if node.Status.LifecyclePhase == "" {
+        return fmt.Errorf("LifecyclePhase field is missing, incompatible with v3")
+    }
+    
+    // 3. 检查字段一致性
+    if !isNodePhaseConsistent(node) {
+        return fmt.Errorf("State and LifecyclePhase are inconsistent")
+    }
+    
+    return nil
+}
+
+// isNodePhaseConsistent 检查节点状态字段是否一致
+func isNodePhaseConsistent(node *confv1beta1.BKENode) bool {
+    // 从 State 推导 LifecyclePhase
+    expectedLifecyclePhase := MapStateToNodeLifecyclePhase(node.Status.State)
+    
+    // 检查是否与实际的 LifecyclePhase 一致
+    return expectedLifecyclePhase == node.Status.LifecyclePhase
+}
+```
+
+#### 8.5.7 兼容性监控函数
+
+```go
+// RecordLegacyFieldUsage 记录旧字段使用情况
+func RecordLegacyFieldUsage(field string, version string) {
+    // 发送 Prometheus 指标
+    legacyFieldUsage.WithLabelValues(field, version).Inc()
+}
+
+// RecordNewFieldUsage 记录新字段使用情况
+func RecordNewFieldUsage(field string, version string) {
+    // 发送 Prometheus 指标
+    newFieldUsage.WithLabelValues(field, version).Inc()
+}
+
+// RecordMigrationResult 记录迁移结果
+func RecordMigrationResult(fromVersion, toVersion string, success bool) {
+    // 发送 Prometheus 指标
+    if success {
+        migrationSuccess.WithLabelValues(fromVersion, toVersion).Inc()
+    } else {
+        migrationFailure.WithLabelValues(fromVersion, toVersion).Inc()
+    }
+}
+
+// Prometheus 指标定义
+var (
+    legacyFieldUsage = prometheus.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "bke_legacy_field_usage_total",
+            Help: "Total number of legacy field usage",
+        },
+        []string{"field", "version"},
+    )
+    
+    newFieldUsage = prometheus.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "bke_new_field_usage_total",
+            Help: "Total number of new field usage",
+        },
+        []string{"field", "version"},
+    )
+    
+    migrationSuccess = prometheus.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "bke_migration_success_total",
+            Help: "Total number of successful migrations",
+        },
+        []string{"from_version", "to_version"},
+    )
+    
+    migrationFailure = prometheus.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "bke_migration_failure_total",
+            Help: "Total number of failed migrations",
+        },
+        []string{"from_version", "to_version"},
+    )
+)
+
+func init() {
+    prometheus.MustRegister(legacyFieldUsage)
+    prometheus.MustRegister(newFieldUsage)
+    prometheus.MustRegister(migrationSuccess)
+    prometheus.MustRegister(migrationFailure)
+}
+```
 
 ### 8.6 与现有系统集成设计
 
@@ -3997,5 +4501,5 @@ func TestNodeRecoveryFromComponentInstallFailed(t *testing.T) {
 
 ---
 
-**文档版本**: v3.18 (混合模型 - 添加状态机引擎设计)  
+**文档版本**: v3.19 (混合模型 - 添加兼容性映射设计)  
 **维护者**: openFuyao Team
