@@ -167,7 +167,7 @@ func handleClusterScaleMasterUpPhase(ctx *PhaseContext, err error) {
 
 ###### 4. 其他控制器中的状态转换
 
-####### 4.1 bkecluster_controller.go
+###### 4.1 bkecluster_controller.go
 **文件**: `controllers/capbke/bkecluster_controller.go`
 
 | 行号 | 函数 | 状态转换 | 说明 |
@@ -175,21 +175,21 @@ func handleClusterScaleMasterUpPhase(ctx *PhaseContext, err error) {
 | 199-220 | `handleClusterStatus` | 状态更新 | 控制器状态处理 |
 | 807 | 直接赋值 | ClusterHealthState | 设置健康状态 |
 
-####### 4.2 bkecluster_upgrade_dag.go
+###### 4.2 bkecluster_upgrade_dag.go
 **文件**: `controllers/capbke/bkecluster_upgrade_dag.go`
 
 | 行号 | 位置 | 状态转换 | 说明 |
 |------|------|---------|------|
 | 310 | 升级流程 | ClusterStatus = status | 升级状态设置 |
 
-####### 4.3 ensure_delete_or_reset.go
+###### 4.3 ensure_delete_or_reset.go
 **文件**: `pkg/phaseframe/phases/ensure_delete_or_reset.go`
 
 | 行号 | 位置 | 状态转换 | 说明 |
 |------|------|---------|------|
 | 179 | 删除流程 | → ClusterDeleting | 删除状态设置 |
 
-####### 4.4 context.go
+###### 4.4 context.go
 **文件**: `pkg/phaseframe/context.go`
 
 | 行号 | 位置 | 状态转换 | 说明 |
@@ -200,7 +200,7 @@ func handleClusterScaleMasterUpPhase(ctx *PhaseContext, err error) {
 
 **文件**: `api/capbke/v1beta1/bkecluster_consts.go`
 
-####### 5.1 ClusterStatus 定义（152-182行）
+###### 5.1 ClusterStatus 定义（152-182行）
 
 ```go
 ClusterReady, ClusterUnhealthy, ClusterUnknown, ClusterChecking
@@ -216,7 +216,7 @@ ClusterManaging, ClusterManageFailed
 ClusterDeleting, ClusterDeleteFailed
 ```
 
-####### 5.2 ClusterHealthState 定义（222-230行）
+###### 5.2 ClusterHealthState 定义（222-230行）
 
 ```go
 Deploying, DeployFailed
@@ -392,7 +392,7 @@ func handleClusterInitPhase(ctx *phaseframe.PhaseContext, err error) {
 
 除了职责重叠外，`ClusterStatus` 和 `ClusterHealthState` 还存在 7 个深层次的合理性问题：
 
-####### 问题 1：ClusterHealthState 不是"纯健康状态"
+###### 问题 1：ClusterHealthState 不是"纯健康状态"
 
 字段名为 `ClusterHealthState`，但实际混入了**操作状态**：
 
@@ -422,7 +422,7 @@ func (r *BKEClusterReconciler) setClusterHealthStatus(...) {
 }
 ```
 
-####### 问题 2：ClusterHealthState 缺失关键状态
+###### 问题 2：ClusterHealthState 缺失关键状态
 
 `ClusterStatus` 有但 `ClusterHealthState` 无对应的状态：
 
@@ -433,7 +433,7 @@ func (r *BKEClusterReconciler) setClusterHealthStatus(...) {
 | `Unknown` | `ClusterUnknown` | 无"未知健康"状态，新集群或状态丢失时无法表达 |
 | `Paused` / `DryRun` | `ClusterPaused` / `ClusterDryRun` | 暂停/DryRun 时健康状态无变化 |
 
-####### 问题 3：ClusterStatus 混合了三种不同维度的状态
+###### 问题 3：ClusterStatus 混合了三种不同维度的状态
 
 `ClusterStatus` 的 22 个值实际混合了三个维度：
 
@@ -445,7 +445,7 @@ func (r *BKEClusterReconciler) setClusterHealthStatus(...) {
 
 三个维度塞进一个枚举导致：`ClusterReady`（健康）和 `ClusterInitializing`（操作中）是互斥的，但它们在同一层级——从 `ClusterInitializing` 到 `ClusterReady` 的转换隐含了"操作完成"和"健康检查通过"两个语义。
 
-####### 问题 4：两个状态机边界不清，通过 statusmanager 桥接导致耦合
+###### 问题 4：两个状态机边界不清，通过 statusmanager 桥接导致耦合
 
 两个状态机各自独立转换，通过 `statusmanager.go:121-228` 桥接：
 
@@ -472,7 +472,7 @@ case bkev1beta1.Upgrading:
 - `statusmanager.go` 在失败重试逻辑中同时修改两者
 - 三处代码各自维护各自的状态转换，没有统一的状态转换表
 
-####### 问题 5：Failed 状态粒度不对称
+###### 问题 5：Failed 状态粒度不对称
 
 `ClusterStatus` 有 8 个 `*Failed` 状态，`ClusterHealthState` 只有 3 个 `*Failed` 状态。`statusmanager.go:165` 用 `strings.HasSuffix(state, "Failed")` 判断失败状态——这个逻辑能正确识别所有 8 个 `ClusterStatus` 的 Failed 状态，但 `ClusterHealthState` 的映射只能覆盖 3 种（Deploy/Upgrade/Manage），其余 5 种 Failed 状态（Scale/Delete/Pause/DryRun/Addon）在超过重试次数后不会更新 `ClusterHealthState`：
 
@@ -490,7 +490,7 @@ default:
 }
 ```
 
-####### 问题 6：缺乏面向未来的统一生命周期模型
+###### 问题 6：缺乏面向未来的统一生命周期模型
 
 业界最佳实践（如 OpenShift CVO、Cluster API）和 BKE 自身演进方向均指向统一的三层生命周期状态机模型：
 
@@ -2015,7 +2015,7 @@ PhaseFlow.Execute()
 | `phase_flow.go` | 301-309 | `calculatingClusterPreStatusByPhase` | **修改**，调用 `engine.Transition(phase, nil)` |
 | `phase_flow.go` | 311-320 | `calculatingClusterPostStatusByPhase` | **修改**，调用 `engine.Transition(phase, err)` |
 
-####### 重构后代码
+###### 重构后代码
 
 **文件：`pkg/phaseframe/phases/phase_flow.go`（重构后）**
 
@@ -2367,7 +2367,7 @@ func calculatingClusterPostStatusByPhase(phase phaseframe.Phase, err error) erro
 | `pkg/phaseframe/statemachine/engine_test.go` | 引擎单元测试 |
 | `pkg/phaseframe/statemachine/transitions_test.go` | 转换表完整性测试 |
 
-####### 新增文件代码
+###### 新增文件代码
 
 **文件：`pkg/phaseframe/statemachine/engine.go`**
 
@@ -2711,7 +2711,7 @@ func TestErrorMappingsCoverage(t *testing.T) {
 | `context.go` | 252 | 直接设置 `ClusterDeleting` | 改为 `engine.Transition("EnsureDeleteOrReset", nil)` |
 | `webhooks/capbke/bkecluster.go` | 174, 646 | 检查 `ClusterHealthState` | 改为检查 `ClusterStatus` |
 
-####### 重构后代码
+###### 重构后代码
 
 **文件：`pkg/statusmanage/statusmanager.go`**
 
@@ -2977,7 +2977,7 @@ Condition 函数（如 `needUpgrade`、`isClusterReady`）需要从现有代码�
 | `isMasterScaleRetry` | StatusManager | 检查 Master 扩缩容重试条件 |
 | `isWorkerScaleRetry` | StatusManager | 检查 Worker 扩缩容重试条件 |
 
-####### 提取后的代码
+###### 提取后的代码
 
 **文件：`pkg/phaseframe/statemachine/conditions.go`**
 
