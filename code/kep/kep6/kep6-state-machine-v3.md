@@ -30,10 +30,11 @@
    - [5.3 健康检查机制](#53-健康检查机制)
 6. [场景驱动的状态转换](#6-场景驱动的状态转换)
    - [6.1 安装场景](#61-安装场景)
-   - [6.2 升级场景](#62-升级场景)
-   - [6.3 回滚场景](#63-回滚场景)
-   - [6.4 扩容场景](#64-扩容场景)
-   - [6.5 缩容场景](#65-缩容场景)
+   - [6.2 纳管场景](#62-纳管场景)
+   - [6.3 升级场景](#63-升级场景)
+   - [6.4 回滚场景](#64-回滚场景)
+   - [6.5 扩容场景](#65-扩容场景)
+   - [6.6 缩容场景](#66-缩容场景)
 7. [重试与幂等性](#7-重试与幂等性)
 8. [详细设计](#8-详细设计)
    - [8.1 兼容性分析](#81-兼容性分析)
@@ -156,6 +157,7 @@ const (
 | `Running` | 集群正在运行（所有组件就绪，服务可用） | 安装完成 |
 | `Upgrading` | 集群正在升级（版本变更中） | 用户触发升级 |
 | `Scaling` | 集群正在扩容或缩容（节点增减） | 用户触发扩缩容 |
+| `Managing` | 集群正在被纳管（验证连接、安装组件、健康检查） | 用户触发纳管 |
 | `RollingBack` | 集群正在回滚（升级失败后恢复） | 升级失败自动触发 |
 | `Deleting` | 集群正在删除（节点删除、组件卸载） | 用户触发删除 |
 | `Deleted` | 集群已删除 | 删除完成 |
@@ -191,6 +193,8 @@ func (r *Reconciler) determineLifecyclePhase(cluster *BKECluster) LifecyclePhase
             return ClusterLifecycleUpgrading
         case OperationTypeScale:
             return ClusterLifecycleScaling
+        case OperationTypeManage:
+            return ClusterLifecycleManaging
         case OperationTypeRollback:
             return ClusterLifecycleRollingBack
         }
@@ -218,6 +222,7 @@ func (r *Reconciler) determineLifecyclePhase(cluster *BKECluster) LifecyclePhase
 - `Running`：当所有组件已安装且没有进行中的操作时
 - `Upgrading`：当 `OperationProgress.OperationType = Upgrade` 且未完成时
 - `Scaling`：当 `OperationProgress.OperationType = Scale` 且未完成时
+- `Managing`：当 `OperationProgress.OperationType = Manage` 且未完成时
 - `RollingBack`：当 `OperationProgress.OperationType = Rollback` 且未完成时
 - `Failed`：当 `OperationProgress.LastFailure != nil` 时
 
@@ -243,6 +248,8 @@ func (r *Reconciler) determineRecoveryPhase(cluster *BKECluster) LifecyclePhase 
         return ClusterLifecycleUpgrading
     case OperationTypeScale:
         return ClusterLifecycleScaling
+    case OperationTypeManage:
+        return ClusterLifecycleManaging
     case OperationTypeRollback:
         return ClusterLifecycleRollingBack
     default:
@@ -258,6 +265,7 @@ func (r *Reconciler) determineRecoveryPhase(cluster *BKECluster) LifecyclePhase 
 | `Install` | `Installing` | 重新执行安装操作 |
 | `Upgrade` | `Upgrading` | 重新执行升级操作 |
 | `Scale` | `Scaling` | 重新执行扩缩容操作 |
+| `Manage` | `Managing` | 重新执行纳管操作 |
 | `Rollback` | `RollingBack` | 重新执行回滚操作 |
 
 ### 2.3 状态转换图
@@ -267,10 +275,14 @@ stateDiagram-v2
     [*] --> Pending : 集群创建
     
     Pending --> Installing : 开始安装
+    Pending --> Managing : 用户触发纳管
     Pending --> Failed : 失败
     
     Installing --> Running : 安装完成
     Installing --> Failed : 安装失败
+    
+    Managing --> Running : 纳管完成
+    Managing --> Failed : 纳管失败
     
     Running --> Upgrading : 用户触发升级
     Running --> Scaling : 用户触发扩缩容
@@ -287,6 +299,7 @@ stateDiagram-v2
     
     Failed --> Pending : 人工介入触发
     Failed --> Installing : 人工介入触发
+    Failed --> Managing : 人工介入触发
     Failed --> Upgrading : 人工介入触发
     Failed --> Scaling : 人工介入触发
     Failed --> RollingBack : 人工介入触发
@@ -343,6 +356,7 @@ T2: 重启 etcd
 | OperationType | 恢复目标 | 说明 |
 |--------------|---------|------|
 | `Install` | `Installing` | 重新执行安装操作 |
+| `Manage` | `Managing` | 重新执行纳管操作 |
 | `Upgrade` | `Upgrading` | 重新执行升级操作 |
 | `Scale` | `Scaling` | 重新执行扩缩容操作 |
 | `Rollback` | `RollingBack` | 重新执行回滚操作 |
@@ -385,6 +399,7 @@ T4: 重新执行操作
 | 失败场景 | 恢复路径 | 说明 |
 |---------|---------|------|
 | Installing 失败 | `Failed --> Installing` | 重新执行安装操作 |
+| Managing 失败 | `Failed --> Managing` | 重新执行纳管操作 |
 | Upgrading 失败 | `Failed --> Upgrading` | 重新执行升级操作 |
 | Scaling 失败 | `Failed --> Scaling` | 重新执行扩缩容操作 |
 | RollingBack 失败 | `Failed --> RollingBack` | 重新执行回滚操作 |
@@ -465,6 +480,7 @@ const (
     OperationTypeInstall  OperationType = "Install"
     OperationTypeUpgrade  OperationType = "Upgrade"
     OperationTypeScale    OperationType = "Scale"
+    OperationTypeManage   OperationType = "Manage"
     OperationTypeRollback OperationType = "Rollback"
 )
 ```
@@ -474,6 +490,7 @@ const (
 | 场景 | OperationType | CurrentStage |
 |------|---------------|--------------|
 | 集群安装 | `Install` | `InstallingNodeComponents` / `InstallingClusterComponents` |
+| 集群纳管 | `Manage` | `ValidatingConnection` / `InstallingComponents` / `RunningHealthCheck` |
 | 集群升级 | `Upgrade` | `UpgradingNodeComponents` / `UpgradingClusterComponents` |
 | 集群扩容 | `Scale` | `ScalingUp` |
 | 集群缩容 | `Scale` | `ScalingDown` |
@@ -1469,7 +1486,59 @@ T4: 集群级组件安装完成
     HealthStatus = Healthy
 ```
 
-### 6.2 升级场景
+### 6.2 纳管场景
+
+**状态转换时序**：
+
+```
+T0: 用户触发纳管
+    LifecyclePhase = Managing
+    OperationProgress = {Type: Manage, StartedAt: now}
+    OperationProgress.CurrentStage = "ValidatingConnection"
+    HealthStatus = Unknown
+
+T1: 连接验证完成
+    LifecyclePhase = Managing（不变）
+    OperationProgress.CurrentStage = "InstallingComponents"
+    HealthStatus = Unknown
+
+T2: 组件安装完成
+    LifecyclePhase = Managing（不变）
+    OperationProgress.CurrentStage = "RunningHealthCheck"
+    HealthStatus = Degraded（组件刚安装）
+
+T3: 健康检查通过
+    LifecyclePhase = Running
+    OperationProgress.FinishedAt = now
+    HealthStatus = Healthy
+```
+
+**纳管失败场景**：
+
+```
+T0: 用户触发纳管
+    LifecyclePhase = Managing
+    OperationProgress = {Type: Manage, StartedAt: now}
+
+T1: 连接验证失败
+    LifecyclePhase = Failed
+    OperationProgress.LastFailure = {Error: "connection refused"}
+
+T2: 用户诊断问题并修复
+    修复网络连接
+
+T3: 用户触发恢复
+    OperationProgress.LastFailure = nil
+
+T4: 系统自动决定恢复目标
+    OperationProgress.OperationType = Manage
+    → LifecyclePhase = Managing
+
+T5: 重新执行纳管操作
+    从 ValidatingConnection 阶段开始
+```
+
+### 6.3 升级场景
 
 **状态转换时序**：
 
@@ -1504,7 +1573,7 @@ T4: 集群级组件升级完成
     HealthStatus = Healthy（升级后）
 ```
 
-### 6.3 回滚场景
+### 6.4 回滚场景
 
 **状态转换时序**：
 
@@ -1534,7 +1603,7 @@ T4: 集群级组件回滚完成
     HealthStatus = Healthy（回滚后）
 ```
 
-### 6.4 扩容场景
+### 6.5 扩容场景
 
 **状态转换时序**：
 
@@ -1555,7 +1624,7 @@ T2: 新节点就绪
     HealthStatus = Healthy（扩容后）
 ```
 
-### 6.5 缩容场景
+### 6.6 缩容场景
 
 **状态转换时序**：
 
