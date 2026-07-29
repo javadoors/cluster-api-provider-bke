@@ -1037,6 +1037,153 @@ stateDiagram-v2
     Failed --> Deleting : 重试
 ```
 
+### 4.4 操作进度追踪
+
+组件层所有操作（安装、升级、回滚、删除）的进度通过 `OperationProgress` 统一追踪：
+
+```go
+type ComponentOperationProgress struct {
+    // 操作类型
+    OperationType ComponentOperationType `json:"operationType"`
+    
+    // 开始时间
+    StartedAt *metav1.Time `json:"startedAt,omitempty"`
+    
+    // 完成时间
+    FinishedAt *metav1.Time `json:"finishedAt,omitempty"`
+    
+    // 当前阶段
+    CurrentStage string `json:"currentStage,omitempty"`
+    
+    // 总步骤数
+    TotalSteps int `json:"totalSteps,omitempty"`
+    
+    // 已完成步骤数
+    CompletedSteps int `json:"completedSteps,omitempty"`
+    
+    // 失败的步骤列表
+    FailedSteps []string `json:"failedSteps,omitempty"`
+    
+    // 已完成步骤列表
+    Completed []ComponentStepRecord `json:"completed,omitempty"`
+    
+    // 最后失败记录
+    LastFailure *ComponentOperationFailureRecord `json:"lastFailure,omitempty"`
+    
+    // 是否需要人工介入
+    NeedsManualIntervention bool `json:"needsManualIntervention,omitempty"`
+}
+
+type ComponentOperationType string
+
+const (
+    ComponentOperationTypeInstall  ComponentOperationType = "Install"
+    ComponentOperationTypeUpgrade  ComponentOperationType = "Upgrade"
+    ComponentOperationTypeRollback ComponentOperationType = "Rollback"
+    ComponentOperationTypeDelete   ComponentOperationType = "Delete"
+)
+
+type ComponentStepRecord struct {
+    Name        string      `json:"name"`
+    CompletedAt metav1.Time `json:"completedAt"`
+}
+
+type ComponentOperationFailureRecord struct {
+    StepName string      `json:"stepName"`
+    FailedAt metav1.Time `json:"failedAt"`
+    Error    string      `json:"error,omitempty"`
+    Attempt  int32       `json:"attempt,omitempty"`
+}
+```
+
+**使用场景**：
+
+| 场景 | OperationType | CurrentStage |
+|------|---------------|--------------|
+| 组件安装 | `Install` | `Downloading` / `Installing` / `Configuring` / `Verifying` |
+| 组件升级 | `Upgrade` | `BackingUp` / `Downloading` / `Stopping` / `Installing` / `Configuring` / `Verifying` |
+| 组件回滚 | `Rollback` | `Stopping` / `Restoring` / `Configuring` / `Verifying` |
+| 组件删除 | `Delete` | `Stopping` / `Uninstalling` / `Cleaning` |
+
+**示例场景**：
+
+**场景 9：组件安装进度追踪**
+```
+T0: 开始安装组件
+    OperationProgress.OperationType = Install
+    OperationProgress.CurrentStage = "Downloading"
+    OperationProgress.TotalSteps = 4
+    OperationProgress.CompletedSteps = 0
+
+T1: 下载完成
+    OperationProgress.CurrentStage = "Installing"
+    OperationProgress.CompletedSteps = 1
+    OperationProgress.Completed = [{Name: "Downloading", CompletedAt: now}]
+
+T2: 安装完成
+    OperationProgress.CurrentStage = "Configuring"
+    OperationProgress.CompletedSteps = 2
+    OperationProgress.Completed = [{Name: "Downloading"}, {Name: "Installing"}]
+
+T3: 配置完成
+    OperationProgress.CurrentStage = "Verifying"
+    OperationProgress.CompletedSteps = 3
+
+T4: 验证完成
+    OperationProgress.FinishedAt = now
+    OperationProgress.CompletedSteps = 4
+    LifecyclePhase = Installed
+```
+
+**场景 10：组件升级失败恢复**
+```
+T0: 升级失败
+    OperationProgress.OperationType = Upgrade
+    OperationProgress.CurrentStage = "Verifying"
+    OperationProgress.CompletedSteps = 5
+    OperationProgress.FailedSteps = ["Verifying"]
+    OperationProgress.LastFailure = {StepName: "Verifying", Error: "health check failed"}
+    LifecyclePhase = Failed
+
+T1: 用户诊断问题并修复
+    修复组件配置
+
+T2: 用户触发恢复
+    kubectl patch component my-component --type merge \
+      -p '{"status":{"operationProgress":{"lastFailure":null}}}'
+
+T3: 系统自动决定恢复目标
+    OperationProgress.OperationType = Upgrade
+    → LifecyclePhase = Upgrading
+
+T4: 从失败点继续升级
+    OperationProgress.CurrentStage = "Verifying"
+    跳过已完成的步骤（BackingUp, Downloading, Stopping, Installing, Configuring）
+```
+
+**恢复机制**：
+
+从 `Failed` 状态恢复需要**人工介入触发**，系统根据 `OperationProgress.OperationType` **自动决定恢复目标**：
+
+1. 用户诊断问题并修复
+2. 用户触发恢复（清除 LastFailure）
+3. 系统自动决定恢复目标
+4. 重新执行操作或从失败点继续
+
+**为什么需要人工介入？**
+
+- 操作失败通常需要诊断和修复（如配置错误、资源不足）
+- 自动恢复可能掩盖问题
+- 人工介入确保问题得到正确解决
+
+**恢复触发方式**：
+
+1. **清除 LastFailure**（推荐）
+   ```bash
+   kubectl patch component my-component --type merge \
+     -p '{"status":{"operationProgress":{"lastFailure":null}}}'
+   ```
+
 ---
 
 ## 5. 健康状态聚合
@@ -2185,5 +2332,5 @@ func TestNodeRecoveryFromComponentInstallFailed(t *testing.T) {
 
 ---
 
-**文档版本**: v3.13 (混合模型 - 组件层添加 Failed->RollingBack 转换)  
+**文档版本**: v3.14 (混合模型 - 组件层添加操作进度追踪)  
 **维护者**: openFuyao Team
