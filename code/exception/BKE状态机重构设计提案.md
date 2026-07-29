@@ -5116,16 +5116,6 @@ func (r *StateMachineEventRecorder) exportDotGraph(events []StateTransitionEvent
 | | Deleted | 组件已删除 | 删除成功 |
 | | Failed | 组件失败 | 操作失败 |
 
-**设计决策**：
-
-| 决策 | 选择 | 理由 |
-|------|------|------|
-| 是否添加 Paused/Maintenance | 否 | 这些是操作模式，不是生命周期状态 |
-| 是否添加 Deleted 状态 | 是 | 三层均包含 Deleted 状态，用于追踪删除完成的终态 |
-| 集群层是否添加 Deleting | 是 | 目标架构明确将删除作为独立生命周期阶段 |
-| 是否抽象为通用状态 | 否 | 保留明确语义（Upgrading vs InProgress），避免丢失信息 |
-| 健康状态与生命周期分离 | 是 | 运行中故障通过 HealthStatus 表达，不改变 LifecyclePhase |
-
 #### 4.5.3 操作进度追踪（OperationProgress）
 
 目标架构通过 `OperationProgress` 统一追踪所有操作（安装、升级、扩容、缩容、回滚）的进度，这是连接本提案与目标架构的关键桥梁。
