@@ -2027,7 +2027,358 @@ func rollbackUpgrade(ctx context.Context, cluster *BKECluster) error {
 
 ### 8.1 兼容性分析
 
-（保留原有设计，详见 v3 文档）
+#### 8.1.1 与旧版本状态机的兼容性
+
+v3 状态机设计与 v1/v2 版本的主要差异：
+
+| 维度 | v1/v2 版本 | v3 版本 | 兼容性 |
+|------|-----------|---------|--------|
+| **状态模型** | 单一状态字段（Phase） | 三层状态模型（LifecyclePhase + HealthStatus + OperationProgress） | ✅ 向后兼容 |
+| **状态数量** | 6 个状态 | 9 个状态（新增 Pending/Deleting/Deleted） | ✅ 向后兼容 |
+| **健康状态** | 无 | 4 级健康状态（Healthy/Degraded/Unhealthy/Unknown） | ✅ 新增字段 |
+| **操作进度** | 无 | 详细的操作进度追踪 | ✅ 新增字段 |
+| **重试机制** | 简单重试 | 三层重试机制（组件/节点/集群） | ✅ 向后兼容 |
+
+#### 8.1.2 API 字段变更兼容性
+
+**新增字段（向后兼容）**：
+
+```go
+type BKEClusterStatus struct {
+    // 现有字段（保持不变）
+    Phase              BKEClusterPhase       `json:"phase,omitempty"`
+    ClusterStatus      ClusterStatus         `json:"clusterStatus,omitempty"`
+    ClusterHealthState ClusterHealthState    `json:"clusterHealthState,omitempty"`
+    
+    // 新增字段（可选）
+    LifecyclePhase     LifecyclePhase        `json:"lifecyclePhase,omitempty"`
+    HealthStatus       *HealthStatus         `json:"healthStatus,omitempty"`
+    OperationProgress  *OperationProgress    `json:"operationProgress,omitempty"`
+}
+```
+
+**兼容性保证**：
+- ✅ 所有新增字段都是可选的（`omitempty`）
+- ✅ 旧版本客户端可以忽略新字段
+- ✅ 新版本客户端可以读取旧字段（向后兼容）
+
+#### 8.1.3 数据迁移策略
+
+**迁移场景 1：从 v1/v2 升级到 v3**
+
+```go
+// MigrateToV3 将 v1/v2 状态迁移到 v3
+func MigrateToV3(ctx context.Context, cluster *BKECluster) error {
+    // 1. 迁移 LifecyclePhase
+    if cluster.Status.LifecyclePhase == "" {
+        cluster.Status.LifecyclePhase = mapPhaseToLifecyclePhase(cluster.Status.Phase)
+    }
+    
+    // 2. 初始化 HealthStatus
+    if cluster.Status.HealthStatus == nil {
+        cluster.Status.HealthStatus = &HealthStatus{
+            Overall:       HealthLevelHealthy,
+            LastCheckTime: &metav1.Time{Time: time.Now()},
+        }
+    }
+    
+    // 3. 初始化 OperationProgress
+    if cluster.Status.OperationProgress == nil {
+        cluster.Status.OperationProgress = &OperationProgress{}
+    }
+    
+    // 4. 保留旧字段（向后兼容）
+    // Phase, ClusterStatus, ClusterHealthState 保持不变
+    
+    return r.Status().Update(ctx, cluster)
+}
+
+// mapPhaseToLifecyclePhase 将旧 Phase 映射到新 LifecyclePhase
+func mapPhaseToLifecyclePhase(phase BKEClusterPhase) LifecyclePhase {
+    switch phase {
+    case ClusterPhasePending:
+        return ClusterLifecyclePending
+    case ClusterPhaseInstalling:
+        return ClusterLifecycleInstalling
+    case ClusterPhaseRunning:
+        return ClusterLifecycleRunning
+    case ClusterPhaseUpgrading:
+        return ClusterLifecycleUpgrading
+    case ClusterPhaseScaling:
+        return ClusterLifecycleScaling
+    case ClusterPhaseRollingBack:
+        return ClusterLifecycleRollingBack
+    case ClusterPhaseFailed:
+        return ClusterLifecycleFailed
+    default:
+        return ClusterLifecyclePending
+    }
+}
+```
+
+**迁移场景 2：从 v3 降级到 v1/v2**
+
+```go
+// MigrateToV1 将 v3 状态降级到 v1/v2
+func MigrateToV1(ctx context.Context, cluster *BKECluster) error {
+    // 1. 从 LifecyclePhase 映射回 Phase
+    if cluster.Status.Phase == "" && cluster.Status.LifecyclePhase != "" {
+        cluster.Status.Phase = mapLifecyclePhaseToPhase(cluster.Status.LifecyclePhase)
+    }
+    
+    // 2. 从 HealthStatus 推导 ClusterHealthState
+    if cluster.Status.ClusterHealthState == "" && cluster.Status.HealthStatus != nil {
+        cluster.Status.ClusterHealthState = mapHealthStatusToClusterHealthState(cluster.Status.HealthStatus)
+    }
+    
+    // 3. 保留新字段（可选）
+    // LifecyclePhase, HealthStatus, OperationProgress 可以保留
+    
+    return r.Status().Update(ctx, cluster)
+}
+```
+
+#### 8.1.4 向后兼容性保证
+
+**兼容性测试矩阵**：
+
+| 客户端版本 | 服务端版本 | 兼容性 | 说明 |
+|-----------|-----------|--------|------|
+| v1 客户端 | v1 服务端 | ✅ | 完全兼容 |
+| v1 客户端 | v3 服务端 | ✅ | 新字段被忽略，旧字段正常读取 |
+| v3 客户端 | v1 服务端 | ✅ | 新字段为空，旧字段正常读取 |
+| v3 客户端 | v3 服务端 | ✅ | 完全兼容 |
+
+**兼容性检查清单**：
+
+```go
+// CheckCompatibility 检查兼容性
+func CheckCompatibility(ctx context.Context, cluster *BKECluster) error {
+    // 1. 检查旧字段是否存在
+    if cluster.Status.Phase == "" {
+        return fmt.Errorf("Phase field is missing, incompatible with v1/v2")
+    }
+    
+    // 2. 检查新字段是否存在
+    if cluster.Status.LifecyclePhase == "" {
+        return fmt.Errorf("LifecyclePhase field is missing, incompatible with v3")
+    }
+    
+    // 3. 检查字段一致性
+    if !isPhaseConsistent(cluster.Status.Phase, cluster.Status.LifecyclePhase) {
+        return fmt.Errorf("Phase and LifecyclePhase are inconsistent")
+    }
+    
+    return nil
+}
+
+// isPhaseConsistent 检查 Phase 和 LifecyclePhase 是否一致
+func isPhaseConsistent(phase BKEClusterPhase, lifecyclePhase LifecyclePhase) bool {
+    expectedLifecyclePhase := mapPhaseToLifecyclePhase(phase)
+    return expectedLifecyclePhase == lifecyclePhase
+}
+```
+
+#### 8.1.5 废弃策略
+
+**废弃时间线**：
+
+| 阶段 | 时间 | 操作 | 说明 |
+|------|------|------|------|
+| **Phase 1** | v3.0 发布 | 新增 LifecyclePhase 字段 | 向后兼容，旧字段保留 |
+| **Phase 2** | v3.6（6 个月后） | 标记旧字段为 Deprecated | 添加 Deprecated 注释 |
+| **Phase 3** | v3.12（12 个月后） | 停止写入旧字段 | 只读取旧字段，不写入 |
+| **Phase 4** | v4.0（18 个月后） | 移除旧字段 | 完全移除旧字段 |
+
+**废弃注释**：
+
+```go
+type BKEClusterStatus struct {
+    // 旧字段（标记为 Deprecated）
+    
+    // Phase is the current phase of the cluster.
+    //
+    // Deprecated: This field is deprecated and will be removed in v4.0.
+    // Use LifecyclePhase instead.
+    Phase BKEClusterPhase `json:"phase,omitempty"`
+    
+    // ClusterStatus is the current operate status of the cluster.
+    //
+    // Deprecated: This field is deprecated and will be removed in v4.0.
+    // Use LifecyclePhase instead.
+    ClusterStatus ClusterStatus `json:"clusterStatus,omitempty"`
+    
+    // ClusterHealthState is the current health state of the cluster.
+    //
+    // Deprecated: This field is deprecated and will be removed in v4.0.
+    // Use HealthStatus instead.
+    ClusterHealthState ClusterHealthState `json:"clusterHealthState,omitempty"`
+    
+    // 新字段
+    
+    // LifecyclePhase is the current lifecycle phase of the cluster.
+    LifecyclePhase LifecyclePhase `json:"lifecyclePhase,omitempty"`
+    
+    // HealthStatus is the current health status of the cluster.
+    HealthStatus *HealthStatus `json:"healthStatus,omitempty"`
+    
+    // OperationProgress is the current operation progress.
+    OperationProgress *OperationProgress `json:"operationProgress,omitempty"`
+}
+```
+
+#### 8.1.6 兼容性测试
+
+**测试场景 1：向后兼容性测试**
+
+```go
+// TestBackwardCompatibility 测试向后兼容性
+func TestBackwardCompatibility(t *testing.T) {
+    // 1. 创建 v1/v2 格式的集群
+    cluster := &BKECluster{
+        Status: BKEClusterStatus{
+            Phase:              ClusterPhaseRunning,
+            ClusterStatus:      ClusterStatusReady,
+            ClusterHealthState: ClusterHealthStateHealthy,
+        },
+    }
+    
+    // 2. 使用 v3 客户端读取
+    v3Cluster := readClusterWithV3Client(cluster)
+    
+    // 3. 验证旧字段正常读取
+    assert.Equal(t, ClusterPhaseRunning, v3Cluster.Status.Phase)
+    assert.Equal(t, ClusterStatusReady, v3Cluster.Status.ClusterStatus)
+    assert.Equal(t, ClusterHealthStateHealthy, v3Cluster.Status.ClusterHealthState)
+    
+    // 4. 验证新字段为空
+    assert.Equal(t, LifecyclePhase(""), v3Cluster.Status.LifecyclePhase)
+    assert.Nil(t, v3Cluster.Status.HealthStatus)
+}
+```
+
+**测试场景 2：向前兼容性测试**
+
+```go
+// TestForwardCompatibility 测试向前兼容性
+func TestForwardCompatibility(t *testing.T) {
+    // 1. 创建 v3 格式的集群
+    cluster := &BKECluster{
+        Status: BKEClusterStatus{
+            LifecyclePhase: ClusterLifecycleRunning,
+            HealthStatus: &HealthStatus{
+                Overall: HealthLevelHealthy,
+            },
+            OperationProgress: &OperationProgress{},
+        },
+    }
+    
+    // 2. 使用 v1/v2 客户端读取
+    v1Cluster := readClusterWithV1Client(cluster)
+    
+    // 3. 验证旧字段正常读取（从新字段推导）
+    assert.Equal(t, ClusterPhaseRunning, v1Cluster.Status.Phase)
+    assert.Equal(t, ClusterStatusReady, v1Cluster.Status.ClusterStatus)
+    assert.Equal(t, ClusterHealthStateHealthy, v1Cluster.Status.ClusterHealthState)
+}
+```
+
+**测试场景 3：数据迁移测试**
+
+```go
+// TestDataMigration 测试数据迁移
+func TestDataMigration(t *testing.T) {
+    // 1. 创建 v1/v2 格式的集群
+    cluster := &BKECluster{
+        Status: BKEClusterStatus{
+            Phase:              ClusterPhaseRunning,
+            ClusterStatus:      ClusterStatusReady,
+            ClusterHealthState: ClusterHealthStateHealthy,
+        },
+    }
+    
+    // 2. 执行迁移
+    err := MigrateToV3(ctx, cluster)
+    assert.NoError(t, err)
+    
+    // 3. 验证新字段已初始化
+    assert.Equal(t, ClusterLifecycleRunning, cluster.Status.LifecyclePhase)
+    assert.NotNil(t, cluster.Status.HealthStatus)
+    assert.Equal(t, HealthLevelHealthy, cluster.Status.HealthStatus.Overall)
+    assert.NotNil(t, cluster.Status.OperationProgress)
+    
+    // 4. 验证旧字段保持不变
+    assert.Equal(t, ClusterPhaseRunning, cluster.Status.Phase)
+    assert.Equal(t, ClusterStatusReady, cluster.Status.ClusterStatus)
+    assert.Equal(t, ClusterHealthStateHealthy, cluster.Status.ClusterHealthState)
+}
+```
+
+#### 8.1.7 兼容性监控
+
+**监控指标**：
+
+```go
+// CompatibilityMetrics 兼容性监控指标
+var CompatibilityMetrics = struct {
+    // 旧字段使用率
+    LegacyFieldUsage *prometheus.CounterVec
+    
+    // 新字段使用率
+    NewFieldUsage *prometheus.CounterVec
+    
+    // 迁移成功率
+    MigrationSuccessRate *prometheus.GaugeVec
+}{
+    LegacyFieldUsage: prometheus.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "bke_legacy_field_usage_total",
+            Help: "Total number of legacy field usage",
+        },
+        []string{"field", "version"},
+    ),
+    NewFieldUsage: prometheus.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "bke_new_field_usage_total",
+            Help: "Total number of new field usage",
+        },
+        []string{"field", "version"},
+    ),
+    MigrationSuccessRate: prometheus.NewGaugeVec(
+        prometheus.GaugeOpts{
+            Name: "bke_migration_success_rate",
+            Help: "Migration success rate",
+        },
+        []string{"from_version", "to_version"},
+    ),
+}
+```
+
+**告警规则**：
+
+```yaml
+# 兼容性告警
+groups:
+  - name: compatibility
+    rules:
+      - alert: LegacyFieldUsageHigh
+        expr: rate(bke_legacy_field_usage_total[1h]) > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Legacy field usage is high"
+          description: "Legacy field {{ $labels.field }} is used {{ $value }} times per hour"
+      
+      - alert: MigrationFailureRateHigh
+        expr: bke_migration_success_rate < 0.95
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Migration failure rate is high"
+          description: "Migration from {{ $labels.from_version }} to {{ $labels.to_version }} has success rate {{ $value }}"
+```
 
 ### 8.2 API 类型扩展设计
 
@@ -2844,5 +3195,5 @@ func TestNodeRecoveryFromComponentInstallFailed(t *testing.T) {
 
 ---
 
-**文档版本**: v3.16 (混合模型 - 添加重试与幂等性章节)  
+**文档版本**: v3.17 (混合模型 - 添加兼容性分析)  
 **维护者**: openFuyao Team
