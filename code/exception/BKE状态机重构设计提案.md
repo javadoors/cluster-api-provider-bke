@@ -19,12 +19,12 @@
   - [4.2 增强方案一：状态转换表](#42-增强方案一状态转换表适配单字段设计)
   - [4.3 增强方案二：改进状态管理器](#43-增强方案二改进状态管理器适配单字段设计)
   - [4.4 增强方案三：状态转换事件系统](#44-增强方案三状态转换事件系统适配单字段设计)
-  - [4.5 设计远景：v3 混合模型架构](#45-设计远景v3-混合模型架构)
+  - [4.5 设计远景：混合模型架构](#45-设计远景混合模型架构)
 - [5. 综合重构方案](#5-综合重构方案)
   - [5.1 整体架构](#51-整体架构)
   - [5.2 阶段一：三字段整合](#52-阶段一三字段整合核心必须)
   - [5.3 阶段二：状态机增强](#53-阶段二状态机增强可选)
-  - [5.4 面向 v3 混合模型的演进路径](#54-面向-v3-混合模型的演进路径)
+  - [5.4 面向目标架构的演进路径](#54-面向目标架构的演进路径)
 - [6. 迁移策略](#6-迁移策略)
   - [6.1 向后兼容策略](#61-向后兼容策略)
 - [7. 测试策略](#7-测试策略)
@@ -38,7 +38,7 @@
   - [9.2 灰度策略](#92-灰度策略)
   - [9.3 监控告警](#93-监控告警)
 - [10. 总结](#10-总结)
-  - [10.1 面向 v3 混合模型的演进路径](#101-面向-v3-混合模型的演进路径)
+  - [10.1 面向目标架构的演进路径](#101-面向目标架构的演进路径)
   - [10.2 演进成本分析](#102-演进成本分析)
   - [10.3 关键文件变更清单](#103-关键文件变更清单)
 - [附录](#附录)
@@ -99,7 +99,7 @@
 | 状态转换表 | [4.2](#42-增强方案一状态转换表适配单字段设计) | 64 条状态转换规则，集中管理状态转换逻辑 |
 | 状态管理器改进 | [4.3](#43-增强方案二改进状态管理器适配单字段设计) | StatusManagerV2，支持按状态索引重试策略 |
 | 事件系统 | [4.4](#44-增强方案三状态转换事件系统适配单字段设计) | 状态转换事件记录和查询 |
-| v3 混合模型 | [4.5](#45-设计远景v3-混合模型架构) | 驱动模型 + 聚合模型，三层状态机架构 |
+| 混合模型 | [4.5](#45-设计远景混合模型架构) | 驱动模型 + 聚合模型，三层状态机架构 |
 | 向后兼容 | [6.1](#61-向后兼容策略) | 双轨并行和渐进式替换策略 |
 | 回滚方案 | [9.1](#91-回滚方案) | 各阶段的回滚方式 |
 | 术语定义 | [附录 A](#a-术语表) | 所有关键术语的定义 |
@@ -126,7 +126,7 @@
 
 **预期收益**：状态字段从 3 个减少到 1 个，状态转换规则集中管理，Failed 覆盖从 3/8 提升至 8/8，代码圈复杂度从 15 降至 8 以下，总工时 19-27 天。
 
-**设计远景**：本提案的设计决策面向 v3 混合模型架构（驱动模型 + 聚合模型，三层状态机）演进。通过确立 `ClusterStatus` 为单一数据源、引入状态转换表引擎、实现分层重试机制、提供生命周期阶段映射，为未来实现操作驱动的 LifecyclePhase 和自底向上的 HealthStatus 聚合奠定基础，确保 BKE 状态机架构具备前瞻性和可扩展性。
+**设计远景**：本提案的设计决策面向混合模型架构（驱动模型 + 聚合模型，三层状态机）演进。通过确立 `ClusterStatus` 为单一数据源、引入状态转换表引擎、实现分层重试机制、提供生命周期阶段映射，为未来实现操作驱动的 LifecyclePhase 和自底向上的 HealthStatus 聚合奠定基础，确保 BKE 状态机架构具备前瞻性和可扩展性。
 
 ## 2. 动机
 
@@ -5008,11 +5008,11 @@ func (r *StateMachineEventRecorder) exportDotGraph(events []StateTransitionEvent
 - 便于调试和问题排查
 - 支持状态机可视化
 
-### 4.5 设计远景：v3 混合模型架构
+### 4.5 设计远景：混合模型架构
 
-本提案的设计决策面向 v3 混合模型架构演进，确保 BKE 状态机具备前瞻性和可扩展性。v3 采用**混合模型**，将状态管理分为两个独立的模型：**驱动模型**（决定集群"正在做什么"）和**聚合模型**（决定集群"健康状况如何"）。
+本提案的设计决策面向混合模型架构演进，确保 BKE 状态机具备前瞻性和可扩展性。目标架构采用**混合模型**，将状态管理分为两个独立的模型：**驱动模型**（决定集群"正在做什么"）和**聚合模型**（决定集群"健康状况如何"）。
 
-#### 4.5.1 v3 混合模型架构
+#### 4.5.1 混合模型架构
 
 **核心原则**：
 - **驱动模型（自上而下）**：由用户操作驱动状态转换，决定 `LifecyclePhase`（生命周期阶段）
@@ -5057,7 +5057,7 @@ func (r *StateMachineEventRecorder) exportDotGraph(events []StateTransitionEvent
 - ✅ 故障检测及时：快速发现不健康的组件
 - ✅ 健康检查灵活：可以自定义健康检查规则
 
-#### 4.5.2 三层状态机模型（v3 目标架构）
+#### 4.5.2 三层状态机模型（目标架构）
 
 **设计原则**：
 - **单一职责**：每层状态只描述该层的生命周期阶段
@@ -5122,13 +5122,13 @@ func (r *StateMachineEventRecorder) exportDotGraph(events []StateTransitionEvent
 |------|------|------|
 | 是否添加 Paused/Maintenance | 否 | 这些是操作模式，不是生命周期状态 |
 | 是否添加 Deleted 状态 | 是 | 三层均包含 Deleted 状态，用于追踪删除完成的终态 |
-| 集群层是否添加 Deleting | 是 | v3 明确将删除作为独立生命周期阶段 |
+| 集群层是否添加 Deleting | 是 | 目标架构明确将删除作为独立生命周期阶段 |
 | 是否抽象为通用状态 | 否 | 保留明确语义（Upgrading vs InProgress），避免丢失信息 |
 | 健康状态与生命周期分离 | 是 | 运行中故障通过 HealthStatus 表达，不改变 LifecyclePhase |
 
 #### 4.5.3 操作进度追踪（OperationProgress）
 
-v3 通过 `OperationProgress` 统一追踪所有操作（安装、升级、扩容、缩容、回滚）的进度，这是连接本提案与 v3 的关键桥梁。
+目标架构通过 `OperationProgress` 统一追踪所有操作（安装、升级、扩容、缩容、回滚）的进度，这是连接本提案与目标架构的关键桥梁。
 
 **集群层 OperationProgress 定义**：
 
@@ -5234,7 +5234,7 @@ T4: 重新执行升级操作
 
 #### 4.5.4 健康状态聚合（HealthStatus）
 
-v3 通过 `HealthStatus` 独立表达集群健康状况，与 `LifecyclePhase` 分离。运行中故障（如 etcd 崩溃、API Server 故障）不改变 `LifecyclePhase`，而是通过 `HealthStatus` 表达。
+目标架构通过 `HealthStatus` 独立表达集群健康状况，与 `LifecyclePhase` 分离。运行中故障（如 etcd 崩溃、API Server 故障）不改变 `LifecyclePhase`，而是通过 `HealthStatus` 表达。
 
 **健康状态定义**：
 
@@ -5327,7 +5327,7 @@ const (
 
 #### 4.5.5 驱动模型的状态转换（LifecyclePhase）
 
-v3 的 `LifecyclePhase` 由**驱动模型**决定，基于 `OperationProgress` 字段：
+目标架构的 `LifecyclePhase` 由**驱动模型**决定，基于 `OperationProgress` 字段：
 
 ```go
 // determineLifecyclePhase 由驱动模型决定集群生命周期阶段
@@ -5378,7 +5378,7 @@ func (r *Reconciler) determineLifecyclePhase(cluster *BKECluster) LifecyclePhase
 
 #### 4.5.6 组件类型区分
 
-v3 将组件分为**节点级组件**和**集群级组件**两类：
+目标架构将组件分为**节点级组件**和**集群级组件**两类：
 
 | 组件类型 | 示例 | 聚合目标 | 说明 |
 |---------|------|---------|------|
@@ -5396,24 +5396,24 @@ const (
 
 #### 4.5.7 本提案的铺垫作用
 
-| 本提案设计 | v3 混合模型对应 | 铺垫作用 |
+| 本提案设计 | 混合模型对应 | 铺垫作用 |
 | ----------- | -------------- | --------- |
 | `ClusterStatus` 单一数据源 | 集群层 LifecyclePhase | 确立单一数据源原则，为集群层投影奠定基础 |
 | 状态转换表引擎（64 条规则） | 三层状态机引擎 | 集中管理状态转换规则，为三层引擎设计奠定基础 |
 | StatusManagerV2 分层重试 | OperationProgress + 人工介入 | 按状态索引重试策略，为操作进度追踪奠定基础 |
-| `MapToLifecyclePhase` 映射函数 | 兼容性映射（v3 → 旧字段） | 22 个 ClusterStatus 归约为 9 个 LifecyclePhase |
+| `MapToLifecyclePhase` 映射函数 | 兼容性映射（目标架构 → 旧字段） | 22 个 ClusterStatus 归约为 9 个 LifecyclePhase |
 | 事件系统 | HealthStatus 聚合器 | 状态转换事件记录，为健康状态聚合奠定基础 |
 
-#### 4.5.8 演进路径（面向 v3 的四层演进）
+#### 4.5.8 演进路径（面向目标架构的四层演进）
 
 1. **当前层**：ClusterStatus 单一数据源（本提案阶段一）
 2. **增强层**：状态转换表引擎 + 分层重试（本提案阶段二三）
-3. **桥梁层**：OperationProgress + HealthStatus（新增，连接本提案与 v3 的关键）
-4. **目标层**：v3 混合模型（驱动模型 + 聚合模型，三层状态机）
+3. **桥梁层**：OperationProgress + HealthStatus（新增，连接本提案与目标架构的关键）
+4. **目标层**：混合模型（驱动模型 + 聚合模型，三层状态机）
 
 **桥梁层说明**：
 
-桥梁层是本提案向 v3 演进的关键过渡阶段，通过引入 `OperationProgress` 和 `HealthStatus` 两个独立字段，逐步将生命周期状态与健康状态分离，为最终实现 v3 混合模型奠定基础。
+桥梁层是本提案向目标架构演进的关键过渡阶段，通过引入 `OperationProgress` 和 `HealthStatus` 两个独立字段，逐步将生命周期状态与健康状态分离，为最终实现混合模型奠定基础。
 
 | 桥梁层组件 | 作用 | 演进成本 |
 |-----------|------|---------|
@@ -5553,16 +5553,16 @@ const (
 - 所有测试通过
 - 状态转换规则集中管理
 - 提供完整的状态转换历史
-
-### 5.4 面向 v3 混合模型的演进路径
+### 5.4 面向目标架构的演进路径
 
 **当前方案定位**：
 
 - 针对 PhaseFlow 的改进，解决 Phase、ClusterStatus、ClusterHealthState 三个字段的职责重叠问题
-- 确立 `ClusterStatus` 为单一数据源，为 v3 混合模型的集群层投影奠定基础
-- 通过生命周期阶段映射函数，支持向 v3 混合模型架构平滑演进
+- 确立 `ClusterStatus` 为单一数据源，为混合模型的集群层投影奠定基础
 
-**v3 混合模型远景**：
+- 通过生命周期阶段映射函数，支持向混合模型架构平滑演进
+
+**混合模型远景**：
 
 - **驱动模型（自上而下）**：决定集群"正在做什么"（LifecyclePhase）
   - 集群层：Pending → Installing → Running → Upgrading → Scaling → RollingBack → Deleting → Deleted → Failed
@@ -5572,16 +5572,16 @@ const (
   - 健康级别：Healthy / Degraded / Unhealthy / Unknown
   - 聚合规则：组件状态 → 节点健康 → 集群健康
 
-**演进映射表（提案组件 → v3 组件）**：
+**演进映射表（提案组件 → 目标组件）**：
 
-| 提案组件 | v3 组件 | 演进成本 | 说明 |
+| 提案组件 | 目标组件 | 演进成本 | 说明 |
 |---------|---------|---------|------|
 | ClusterStatus（22 个值） | LifecyclePhase（9 个值） | 低 | MapToLifecyclePhase 映射函数已存在 |
 | 状态转换表引擎（64 条规则） | 三层状态机引擎 | 中 | 需扩展节点层/组件层转换规则 |
 | StatusManagerV2 | OperationProgress | 低 | 添加操作追踪字段即可 |
 | 事件系统 | HealthStatus 聚合器 | 中 | 需实现健康聚合逻辑 |
 | 重试机制 | 人工介入机制 | 低 | 添加基于 OperationType 的恢复决策 |
-| Phase/ClusterHealthState 字段 | 兼容性映射（v3 → 旧字段） | 低 | 反向映射函数已设计 |
+| Phase/ClusterHealthState 字段 | 兼容性映射（目标架构 → 旧字段） | 低 | 反向映射函数已设计 |
 
 **本提案的铺垫作用**：
 
@@ -5594,9 +5594,9 @@ const (
 **演进策略（四层演进）**：
 
 - **阶段一（三字段整合）**：必须实施，解决当前的职责重叠问题，确立单一数据源
-- **阶段二（状态机增强）**：可选实施，引入状态转换表引擎和分层重试，为 v3 引擎做准备
+- **阶段二（状态机增强）**：可选实施，引入状态转换表引擎和分层重试，为目标架构引擎做准备
 - **阶段三（桥梁层）**：引入 OperationProgress + HealthStatus，逐步分离生命周期与健康状态
-- **阶段四（v3 目标层）**：实现完整的 v3 混合模型（驱动模型 + 聚合模型，三层状态机）
+- **阶段四（目标层）**：实现完整的混合模型（驱动模型 + 聚合模型，三层状态机）
 
 ## 6. 迁移策略
 
@@ -5654,13 +5654,13 @@ func calculatingClusterPostStatusByPhase(phase phaseframe.Phase, err error) erro
 - 渐进式验证：逐步确认新方式的正确性
 - 向后兼容：不影响现有功能
 
-**策略三：面向 v3 的演进兼容**
+**策略三：面向目标架构的演进兼容**
 
-本提案的设计决策已充分考虑向 v3 混合模型的演进，确保最小化演进成本：
+本提案的设计决策已充分考虑向混合模型的演进，确保最小化演进成本：
 
 **1. ClusterStatus → LifecyclePhase 映射**
 
-本提案的 `MapToLifecyclePhase` 函数将 22 个 ClusterStatus 值归约为 9 个 LifecyclePhase 值，为 v3 的兼容性映射奠定基础：
+本提案的 `MapToLifecyclePhase` 函数将 22 个 ClusterStatus 值归约为 9 个 LifecyclePhase 值，为目标架构的兼容性映射奠定基础：
 
 | ClusterStatus（22 个值） | LifecyclePhase（9 个值） | 说明 |
 |-------------------------|-------------------------|------|
@@ -5676,7 +5676,7 @@ func calculatingClusterPostStatusByPhase(phase phaseframe.Phase, err error) erro
 
 **2. 状态转换表引擎 → 三层状态机引擎**
 
-本提案的引擎设计（64 条规则）可直接扩展为 v3 的三层状态机引擎：
+本提案的引擎设计（64 条规则）可直接扩展为目标架构的三层状态机引擎：
 
 ```go
 // 本提案引擎（单层）
@@ -5684,7 +5684,7 @@ type Engine struct {
     transitions map[ClusterStatus][]Transition
 }
 
-// v3 引擎（三层）
+// 目标架构引擎（三层）
 type StateMachineEngine struct {
     clusterTransitions   map[ClusterLifecyclePhase][]ClusterTransitionRule
     nodeTransitions      map[NodeLifecyclePhase][]NodeTransitionRule
@@ -5694,11 +5694,11 @@ type StateMachineEngine struct {
 ```
 
 **演进路径**：
-- 本提案引擎 → 添加节点层转换规则 → 添加组件层转换规则 → 添加健康聚合器 → v3 引擎
+- 本提案引擎 → 添加节点层转换规则 → 添加组件层转换规则 → 添加健康聚合器 → 目标架构引擎
 
 **3. StatusManagerV2 → OperationProgress**
 
-本提案的 StatusManagerV2 可通过添加操作追踪字段演进为 v3 的 OperationProgress：
+本提案的 StatusManagerV2 可通过添加操作追踪字段演进为目标架构的 OperationProgress：
 
 ```go
 // 本提案 StatusRecordV2
@@ -5710,7 +5710,7 @@ type StatusRecordV2 struct {
     RetryPolicy         RetryPolicy
 }
 
-// v3 OperationProgress（扩展）
+// 目标架构 OperationProgress（扩展）
 type OperationProgress struct {
     OperationType       OperationType  // 新增：操作类型
     StartedAt           *metav1.Time   // 新增：开始时间
@@ -5727,7 +5727,7 @@ type OperationProgress struct {
 
 **4. 事件系统 → HealthStatus 聚合器**
 
-本提案的事件系统可通过添加健康检查逻辑演进为 v3 的 HealthStatus 聚合器：
+本提案的事件系统可通过添加健康检查逻辑演进为目标架构的 HealthStatus 聚合器：
 
 ```go
 // 本提案 EventRecorder
@@ -5735,7 +5735,7 @@ type StateMachineEventRecorder struct {
     store EventStore
 }
 
-// v3 HealthAggregator（扩展）
+// 目标架构 HealthAggregator（扩展）
 type HealthAggregator struct {
     // 聚合节点健康状态
     aggregateNodeHealth func(node BKENode) NodeHealthStatus
@@ -5749,12 +5749,12 @@ type HealthAggregator struct {
 **演进路径**：
 - EventRecorder → 添加健康检查函数 → 实现聚合逻辑 → HealthAggregator
 
-**5. 兼容性映射（v3 → 旧字段）**
+**5. 兼容性映射（目标架构 → 旧字段）**
 
-v3 提供反向映射函数，确保与旧版本的兼容性：
+目标架构提供反向映射函数，确保与旧版本的兼容性：
 
 ```go
-// v3 兼容性映射
+// 目标架构兼容性映射
 func SyncClusterPhaseToLegacyFields(cluster *BKECluster, phase ClusterLifecyclePhase) {
     // 同步 Phase 字段
     cluster.Status.Phase = mapLifecyclePhaseToPhase(phase)
@@ -5770,9 +5770,9 @@ func SyncClusterPhaseToLegacyFields(cluster *BKECluster, phase ClusterLifecycleP
 | 演进阶段 | 工作量 | 风险 | 说明 |
 |---------|-------|------|------|
 | 本提案阶段一（三字段整合） | 7-11 天 | 低 | 必须实施，解决当前问题 |
-| 本提案阶段二（状态机增强） | 12-16 天 | 低 | 可选实施，为 v3 做准备 |
+| 本提案阶段二（状态机增强） | 12-16 天 | 低 | 可选实施，为目标架构做准备 |
 | 桥梁层（OperationProgress + HealthStatus） | 10-15 天 | 中 | 关键过渡阶段 |
-| v3 目标层（完整混合模型） | 20-30 天 | 中 | 最终目标架构 |
+| 目标层（完整混合模型） | 20-30 天 | 中 | 最终目标架构 |
 | **总计** | **49-72 天** | - | 分阶段实施，风险可控 |
 
 ## 7. 测试策略
@@ -6024,9 +6024,9 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 
 > **章节摘要**：本章总结重构方案的核心价值，描述面向三层状态机架构的演进路径（当前层→增强层→远景层），以及关键文件变更清单（20 个文件的修改和新增操作）。
 
-### 10.1 面向 v3 混合模型的演进路径
+### 10.1 面向目标架构的演进路径
 
-| 维度 | 本方案（渐进式重构） | v3 混合模型远景 |
+| 维度 | 本方案（渐进式重构） | 混合模型远景 |
 | ------ | ------------------- | ------------------------------------------ |
 | **定位** | 面向当下，解决现有问题 | 面向未来，目标架构 |
 | **状态模型** | ClusterStatus 单一字段（22 个值） | LifecyclePhase（9 个值）+ HealthStatus（4 个级别） |
@@ -6036,17 +6036,17 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 
 **演进路径**：
 
-- 本方案的 `MapToLifecyclePhase` 为 v3 的兼容性映射奠定基础
-- 本方案的状态转换表引擎为 v3 的三层状态机引擎奠定基础
-- 本方案的 StatusManagerV2 为 v3 的 OperationProgress 操作追踪奠定基础
-- 本方案的事件系统为 v3 的 HealthStatus 聚合器奠定基础
-- v3 全量上线后，本方案的 ClusterStatus 将被 LifecyclePhase 替代，但通过兼容性映射保持向后兼容
+- 本方案的 `MapToLifecyclePhase` 为目标架构的兼容性映射奠定基础
+- 本方案的状态转换表引擎为目标架构的三层状态机引擎奠定基础
+- 本方案的 StatusManagerV2 为目标架构的 OperationProgress 操作追踪奠定基础
+- 本方案的事件系统为目标架构的 HealthStatus 聚合器奠定基础
+- 目标架构全量上线后，本方案的 ClusterStatus 将被 LifecyclePhase 替代，但通过兼容性映射保持向后兼容
 
 ### 10.2 演进成本分析
 
 **可复用性分析**：
 
-| 提案组件 | v3 可复用度 | 说明 |
+| 提案组件 | 目标架构可复用度 | 说明 |
 |---------|-----------|------|
 | ClusterStatus 单一数据源 | 100% | 直接映射到 LifecyclePhase |
 | 状态转换表引擎 | 60% | 引擎框架可复用，需扩展节点层/组件层规则 |
@@ -6062,7 +6062,7 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 | **阶段一：三字段整合** | 删除 Phase/ClusterHealthState，保留 ClusterStatus | 7-11 天 | 低 |
 | **阶段二：状态机增强** | 实现状态转换表引擎 + StatusManagerV2 | 12-16 天 | 低 |
 | **阶段三：桥梁层** | 引入 OperationProgress + HealthStatus | 10-15 天 | 中 |
-| **阶段四：v3 目标层** | 实现完整 v3 混合模型（三层状态机） | 20-30 天 | 中 |
+| **阶段四：目标层** | 实现完整混合模型（三层状态机） | 20-30 天 | 中 |
 | **总计** | - | **49-72 天** | - |
 
 **成本优化策略**：
@@ -6079,7 +6079,7 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 | M1：三字段整合完成 | 第 11 天 | ClusterStatus 单一数据源 | 所有测试通过，外部消费者无感知 |
 | M2：状态机增强完成 | 第 27 天 | 状态转换表引擎 + StatusManagerV2 | 状态转换规则集中管理，Failed 覆盖 8/8 |
 | M3：桥梁层完成 | 第 42 天 | OperationProgress + HealthStatus | 支持操作进度追踪，健康状态独立表达 |
-| M4：v3 全量上线 | 第 72 天 | 完整 v3 混合模型 | 三层状态机运行稳定，性能达标 |
+| M4：目标架构全量上线 | 第 72 天 | 完整混合模型 | 三层状态机运行稳定，性能达标 |
 
 ### 10.3 关键文件变更清单
 
