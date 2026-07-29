@@ -19,12 +19,12 @@
   - [4.2 增强方案一：状态转换表](#42-增强方案一状态转换表适配单字段设计)
   - [4.3 增强方案二：改进状态管理器](#43-增强方案二改进状态管理器适配单字段设计)
   - [4.4 增强方案三：状态转换事件系统](#44-增强方案三状态转换事件系统适配单字段设计)
-  - [4.5 设计远景：三层状态机架构](#45-设计远景三层状态机架构)
+  - [4.5 设计远景：v3 混合模型架构](#45-设计远景v3-混合模型架构)
 - [5. 综合重构方案](#5-综合重构方案)
   - [5.1 整体架构](#51-整体架构)
   - [5.2 阶段一：三字段整合](#52-阶段一三字段整合核心必须)
   - [5.3 阶段二：状态机增强](#53-阶段二状态机增强可选)
-  - [5.4 面向三层状态机的演进路径](#54-面向三层状态机的演进路径)
+  - [5.4 面向 v3 混合模型的演进路径](#54-面向-v3-混合模型的演进路径)
 - [6. 迁移策略](#6-迁移策略)
   - [6.1 向后兼容策略](#61-向后兼容策略)
 - [7. 测试策略](#7-测试策略)
@@ -38,8 +38,9 @@
   - [9.2 灰度策略](#92-灰度策略)
   - [9.3 监控告警](#93-监控告警)
 - [10. 总结](#10-总结)
-  - [10.1 面向三层状态机的演进路径](#101-面向三层状态机的演进路径)
-  - [10.2 关键文件变更清单](#102-关键文件变更清单)
+  - [10.1 面向 v3 混合模型的演进路径](#101-面向-v3-混合模型的演进路径)
+  - [10.2 演进成本分析](#102-演进成本分析)
+  - [10.3 关键文件变更清单](#103-关键文件变更清单)
 - [附录](#附录)
   - [A. 术语表](#a-术语表)
   - [B. 问题总结](#b-问题总结)
@@ -68,7 +69,7 @@
 2. **[4.1 重构方案：三字段整合方案](#41-重构方案三字段整合方案保持-clusterstatus-兼容性)** - 阶段一实施细节（30分钟）
 3. **[4.2 增强方案一：状态转换表](#42-增强方案一状态转换表适配单字段设计)** - 阶段二实施细节（30分钟）
 4. **[4.3 增强方案二：改进状态管理器](#43-增强方案二改进状态管理器适配单字段设计)** - 阶段三实施细节（30分钟）
-5. **[10.2 关键文件变更清单](#102-关键文件变更清单)** - 需要修改的文件列表（10分钟）
+5. **[10.3 关键文件变更清单](#103-关键文件变更清单)** - 需要修改的文件列表（10分钟）
 6. **[6. 迁移策略](#6-迁移策略)** - 向后兼容策略（15分钟）
 
 ### 测试验证人员
@@ -98,7 +99,7 @@
 | 状态转换表 | [4.2](#42-增强方案一状态转换表适配单字段设计) | 64 条状态转换规则，集中管理状态转换逻辑 |
 | 状态管理器改进 | [4.3](#43-增强方案二改进状态管理器适配单字段设计) | StatusManagerV2，支持按状态索引重试策略 |
 | 事件系统 | [4.4](#44-增强方案三状态转换事件系统适配单字段设计) | 状态转换事件记录和查询 |
-| 三层状态机 | [4.5](#45-设计远景三层状态机架构) | 集群层→节点层→组件层的分层状态机架构 |
+| v3 混合模型 | [4.5](#45-设计远景v3-混合模型架构) | 驱动模型 + 聚合模型，三层状态机架构 |
 | 向后兼容 | [6.1](#61-向后兼容策略) | 双轨并行和渐进式替换策略 |
 | 回滚方案 | [9.1](#91-回滚方案) | 各阶段的回滚方式 |
 | 术语定义 | [附录 A](#a-术语表) | 所有关键术语的定义 |
@@ -125,7 +126,7 @@
 
 **预期收益**：状态字段从 3 个减少到 1 个，状态转换规则集中管理，Failed 覆盖从 3/8 提升至 8/8，代码圈复杂度从 15 降至 8 以下，总工时 19-27 天。
 
-**设计远景**：本提案的设计决策面向三层状态机架构（集群层→节点层→组件层）演进。通过确立 `ClusterStatus` 为单一数据源、引入状态转换表引擎、实现分层重试机制、提供生命周期阶段映射，为未来实现自底向上的状态聚合（组件状态→节点状态→集群状态）奠定基础，确保 BKE 状态机架构具备前瞻性和可扩展性。
+**设计远景**：本提案的设计决策面向 v3 混合模型架构（驱动模型 + 聚合模型，三层状态机）演进。通过确立 `ClusterStatus` 为单一数据源、引入状态转换表引擎、实现分层重试机制、提供生命周期阶段映射，为未来实现操作驱动的 LifecyclePhase 和自底向上的 HealthStatus 聚合奠定基础，确保 BKE 状态机架构具备前瞻性和可扩展性。
 
 ## 2. 动机
 
@@ -5007,155 +5008,418 @@ func (r *StateMachineEventRecorder) exportDotGraph(events []StateTransitionEvent
 - 便于调试和问题排查
 - 支持状态机可视化
 
-### 4.5 设计远景：三层状态机架构
+### 4.5 设计远景：v3 混合模型架构
 
-本提案的设计决策面向三层状态机架构演进，确保 BKE 状态机具备前瞻性和可扩展性。
+本提案的设计决策面向 v3 混合模型架构演进，确保 BKE 状态机具备前瞻性和可扩展性。v3 采用**混合模型**，将状态管理分为两个独立的模型：**驱动模型**（决定集群"正在做什么"）和**聚合模型**（决定集群"健康状况如何"）。
 
-#### 4.5.1 三层状态机模型
+#### 4.5.1 v3 混合模型架构
+
+**核心原则**：
+- **驱动模型（自上而下）**：由用户操作驱动状态转换，决定 `LifecyclePhase`（生命周期阶段）
+- **聚合模型（自底向上）**：由下层状态聚合出上层健康状态，决定 `HealthStatus`（健康状态）
+- **两个模型各司其职，互不干扰**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         混合模型架构                                         │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                    驱动模型（自上而下）                               │   │
+│  │                                                                     │   │
+│  │  用户操作 → 集群状态 → 节点状态 → 组件状态                           │   │
+│  │                                                                     │   │
+│  │  决定：LifecyclePhase（生命周期阶段）                                │   │
+│  │  - Pending, Installing, Running, Upgrading, Scaling, RollingBack,  │   │
+│  │    Deleting, Deleted, Failed                                       │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                    聚合模型（自底向上）                               │   │
+│  │                                                                     │   │
+│  │  组件状态 → 节点状态 → 集群状态                                      │   │
+│  │                                                                     │   │
+│  │  决定：HealthStatus（健康状态）                                      │   │
+│  │  - Healthy, Degraded, Unhealthy, Unknown                           │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**驱动模型优势**：
+- ✅ 因果关系清晰：用户操作是原因，状态转换是结果
+- ✅ 状态转换规则简单：直接由操作类型决定
+- ✅ 进度追踪容易：通过 OperationProgress 追踪操作进度
+- ✅ 故障诊断容易：快速定位失败的组件
+
+**聚合模型优势**：
+- ✅ 健康状态准确：基于实际组件状态
+- ✅ 故障检测及时：快速发现不健康的组件
+- ✅ 健康检查灵活：可以自定义健康检查规则
+
+#### 4.5.2 三层状态机模型（v3 目标架构）
 
 **设计原则**：
 - **单一职责**：每层状态只描述该层的生命周期阶段
-- **正交性**：不同维度的状态相互独立（生命周期状态 vs 操作模式）
+- **正交性**：生命周期状态（LifecyclePhase）与健康状态（HealthStatus）相互独立
 - **完整性**：覆盖所有必要的生命周期阶段，包括失败状态
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                    集群层 (Cluster Lifecycle) - 6 个状态                      │
-│  Creating → Running → Upgrading → Scaling → RollingBack → Failed           │
+│                    集群层 (Cluster Lifecycle) - 9 个状态                      │
+│  Pending → Installing → Running → Upgrading → Scaling → RollingBack →      │
+│  Deleting → Deleted → Failed                                               │
 └─────────────────────────────────────────────────────────────────────────────┘
                                      │ 聚合
                                      ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                    节点层 (Node Lifecycle) - 7 个状态                         │
-│  Pending → Provisioned → Ready → Upgrading → RollingBack → Deleting        │
-│                                      ↓                                      │
-│                                    Failed                                   │
+│                    节点层 (Node Lifecycle) - 8 个状态                         │
+│  Pending → Provisioned → Ready → Upgrading → RollingBack → Deleting →      │
+│  Deleted → Failed                                                          │
 └─────────────────────────────────────────────────────────────────────────────┘
                                      │ 聚合
                                      ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                    组件层 (Component Lifecycle) - 7 个状态                    │
-│  Pending → Installing → Installed → Upgrading → RollingBack → Uninstalling │
-│                                      ↓                                      │
-│                                    Failed                                   │
+│                    组件层 (Component Lifecycle) - 8 个状态                    │
+│  Pending → Installing → Installed → Upgrading → RollingBack → Deleting →   │
+│  Deleted → Failed                                                          │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 **状态说明**：
 
-| 层级 | 状态 | 说明 |
-|------|------|------|
-| **集群层** | Creating | 集群创建中（节点加入、组件安装） |
-| | Running | 集群运行中（所有组件就绪） |
-| | Upgrading | 集群升级中（节点或组件升级） |
-| | Scaling | 集群扩缩容中（节点增减） |
-| | RollingBack | 集群回滚中（升级失败后恢复） |
-| | Failed | 集群失败（需要人工介入） |
-| **节点层** | Pending | 节点等待配置 |
-| | Provisioned | 节点已配置（Agent 就绪） |
-| | Ready | 节点就绪（所有组件安装完成） |
-| | Upgrading | 节点升级中 |
-| | RollingBack | 节点回滚中 |
-| | Deleting | 节点删除中 |
-| | Failed | 节点失败 |
-| **组件层** | Pending | 组件等待安装 |
-| | Installing | 组件安装中 |
-| | Installed | 组件已安装 |
-| | Upgrading | 组件升级中 |
-| | RollingBack | 组件回滚中 |
-| | Uninstalling | 组件卸载中 |
-| | Failed | 组件失败 |
+| 层级 | 状态 | 说明 | 驱动来源 |
+|------|------|------|---------|
+| **集群层** | Pending | 集群等待安装 | 集群创建 |
+| | Installing | 集群正在安装 | 开始安装 |
+| | Running | 集群正在运行（所有组件就绪） | 安装完成 |
+| | Upgrading | 集群正在升级 | 用户触发升级 |
+| | Scaling | 集群正在扩缩容 | 用户触发扩缩容 |
+| | RollingBack | 集群正在回滚 | 升级失败自动触发 |
+| | Deleting | 集群正在删除 | 用户触发删除 |
+| | Deleted | 集群已删除 | 删除完成 |
+| | Failed | 集群失败（需要人工介入） | 操作失败 |
+| **节点层** | Pending | 节点等待配置 | 节点加入集群 |
+| | Provisioned | 节点已配置（Agent 就绪） | Agent 推送完成 |
+| | Ready | 节点就绪（所有组件安装完成） | 组件安装完成 |
+| | Upgrading | 节点正在升级 | 用户触发升级 |
+| | RollingBack | 节点正在回滚 | 升级失败自动触发 |
+| | Deleting | 节点正在删除 | 用户触发删除 |
+| | Deleted | 节点已删除 | 删除完成 |
+| | Failed | 节点失败 | 操作失败 |
+| **组件层** | Pending | 组件等待安装 | 组件加入 |
+| | Installing | 组件安装中 | 开始安装 |
+| | Installed | 组件已安装 | 安装完成 |
+| | Upgrading | 组件升级中 | 触发升级 |
+| | RollingBack | 组件回滚中 | 升级失败 |
+| | Deleting | 组件删除中 | 触发删除 |
+| | Deleted | 组件已删除 | 删除成功 |
+| | Failed | 组件失败 | 操作失败 |
 
 **设计决策**：
 
 | 决策 | 选择 | 理由 |
 |------|------|------|
 | 是否添加 Paused/Maintenance | 否 | 这些是操作模式，不是生命周期状态 |
-| 是否添加 Removed | 否 | 组件删除后不需要追踪，通过事件系统记录历史 |
-| 集群层是否添加 Deleting | 否 | 删除是操作，通过 Finalizer 机制处理，不是独立生命周期阶段 |
+| 是否添加 Deleted 状态 | 是 | 三层均包含 Deleted 状态，用于追踪删除完成的终态 |
+| 集群层是否添加 Deleting | 是 | v3 明确将删除作为独立生命周期阶段 |
 | 是否抽象为通用状态 | 否 | 保留明确语义（Upgrading vs InProgress），避免丢失信息 |
+| 健康状态与生命周期分离 | 是 | 运行中故障通过 HealthStatus 表达，不改变 LifecyclePhase |
 
-#### 4.5.2 自底向上的状态聚合
+#### 4.5.3 操作进度追踪（OperationProgress）
 
-三层状态机的核心设计思想是**自底向上的状态聚合**：
+v3 通过 `OperationProgress` 统一追踪所有操作（安装、升级、扩容、缩容、回滚）的进度，这是连接本提案与 v3 的关键桥梁。
 
-**组件层 → 节点层聚合规则**：
+**集群层 OperationProgress 定义**：
 
-| 组件状态 | 节点状态 | 说明 |
-|---------|---------|------|
-| 所有组件 Installed | Ready | 节点就绪 |
-| 任意组件 Upgrading | Upgrading | 节点升级中 |
-| 任意组件 RollingBack | RollingBack | 节点回滚中 |
-| 任意组件 Failed | Failed | 节点失败 |
-| 任意组件 Uninstalling | Deleting | 节点删除中 |
-| 所有组件 Pending | Pending | 节点等待配置 |
-| 所有组件 Installing | Provisioned | 节点已配置 |
+```go
+type OperationProgress struct {
+    // 操作类型
+    OperationType OperationType `json:"operationType"`
+    
+    // 目标版本
+    TargetVersion string `json:"targetVersion,omitempty"`
+    
+    // 开始时间
+    StartedAt *metav1.Time `json:"startedAt,omitempty"`
+    
+    // 完成时间
+    FinishedAt *metav1.Time `json:"finishedAt,omitempty"`
+    
+    // 当前阶段
+    CurrentStage string `json:"currentStage,omitempty"`
+    
+    // 总组件数
+    TotalComponents int `json:"totalComponents,omitempty"`
+    
+    // 已完成组件数
+    CompletedComponents int `json:"completedComponents,omitempty"`
+    
+    // 失败的组件列表
+    FailedComponents []string `json:"failedComponents,omitempty"`
+    
+    // 最后失败记录
+    LastFailure *OperationFailureRecord `json:"lastFailure,omitempty"`
+    
+    // 是否需要人工介入
+    NeedsManualIntervention bool `json:"needsManualIntervention,omitempty"`
+}
 
-**节点层 → 集群层聚合规则**：
+type OperationType string
 
-| 节点状态 | 集群状态 | 说明 |
-|---------|---------|------|
-| 所有节点 Ready + 所有集群级组件 Installed | Running | 集群运行中 |
-| 任意节点 Upgrading | Upgrading | 集群升级中 |
-| 任意节点 RollingBack | RollingBack | 集群回滚中 |
-| 任意节点 Failed | Failed | 集群失败 |
-| 任意节点 Deleting | Scaling | 集群缩容中 |
-| 任意节点 Pending/Provisioned | Creating | 集群创建中 |
-
-**触发源说明**：
-
-**集群层 Upgrading 的触发源**：
-- 节点层 Upgrading（节点升级）
-- 集群级组件 Upgrading（集群级组件升级）
-- 任意一个触发都会导致集群层进入 Upgrading 状态
-
-**集群层 Scaling 的触发源**：
-- 节点层 Deleting（节点删除，缩容）
-- 节点层 Pending（节点增加，扩容）
-- 任意一个触发都会导致集群层进入 Scaling 状态
-
-**聚合优先级**（从高到低）：
-
-```
-Failed > RollingBack > Upgrading > Deleting > Pending/Provisioned > Ready
-```
-
-**聚合示例**：
-
-```
-场景 1：节点 1 升级中，节点 2 就绪
-  节点层：Node1=Upgrading, Node2=Ready
-  集群层：Upgrading（任意节点 Upgrading → 集群 Upgrading）
-
-场景 2：节点 1 失败，节点 2 就绪
-  节点层：Node1=Failed, Node2=Ready
-  集群层：Failed（任意节点 Failed → 集群 Failed）
-
-场景 3：节点 1 删除中，节点 2 就绪
-  节点层：Node1=Deleting, Node2=Ready
-  集群层：Scaling（任意节点 Deleting → 集群 Scaling）
-
-场景 4：所有节点就绪，所有组件安装完成
-  节点层：Node1=Ready, Node2=Ready
-  组件层：所有组件=Installed
-  集群层：Running（所有节点 Ready + 所有组件 Installed → 集群 Running）
+const (
+    OperationTypeInstall  OperationType = "Install"
+    OperationTypeUpgrade  OperationType = "Upgrade"
+    OperationTypeScale    OperationType = "Scale"
+    OperationTypeRollback OperationType = "Rollback"
+)
 ```
 
-#### 4.5.3 本提案的铺垫作用
+**使用场景**：
 
-| 本提案设计 | 三层状态机对应 | 铺垫作用 |
+| 场景 | OperationType | CurrentStage |
+|------|---------------|--------------|
+| 集群安装 | `Install` | `InstallingNodeComponents` / `InstallingClusterComponents` |
+| 集群升级 | `Upgrade` | `UpgradingNodeComponents` / `UpgradingClusterComponents` |
+| 集群扩容 | `Scale` | `ScalingUp` |
+| 集群缩容 | `Scale` | `ScalingDown` |
+| 集群回滚 | `Rollback` | `RollingBackNodeComponents` / `RollingBackClusterComponents` |
+
+**恢复决策逻辑**：
+
+当集群处于 `Failed` 状态时，系统通过 `OperationProgress.OperationType` 自动决定恢复到哪个状态，无需用户手动指定：
+
+| OperationType | 恢复目标 | 说明 |
+|--------------|---------|------|
+| `Install` | `Installing` | 重新执行安装操作 |
+| `Upgrade` | `Upgrading` | 重新执行升级操作 |
+| `Scale` | `Scaling` | 重新执行扩缩容操作 |
+| `Rollback` | `RollingBack` | 重新执行回滚操作 |
+
+**恢复触发方式**：
+
+1. **清除 LastFailure**（推荐）
+   ```bash
+   kubectl patch bkecluster my-cluster --type merge \
+     -p '{"status":{"operationProgress":{"lastFailure":null}}}'
+   ```
+
+2. **通过注解触发**
+   ```bash
+   kubectl annotate bkecluster my-cluster bke.bocloud.com/retry-operation=true
+   ```
+
+**示例场景**：
+
+```
+T0: 升级失败
+    LifecyclePhase = Failed
+    OperationProgress.OperationType = Upgrade
+    OperationProgress.LastFailure = {Name: "etcd", Error: "upgrade failed"}
+
+T1: 用户诊断问题并修复
+    修复 etcd 升级脚本
+
+T2: 用户触发恢复
+    kubectl patch bkecluster my-cluster --type merge \
+      -p '{"status":{"operationProgress":{"lastFailure":null}}}'
+
+T3: 系统自动决定
+    OperationProgress.OperationType = Upgrade
+    → LifecyclePhase = Upgrading
+
+T4: 重新执行升级操作
+    从失败的组件继续升级
+```
+
+#### 4.5.4 健康状态聚合（HealthStatus）
+
+v3 通过 `HealthStatus` 独立表达集群健康状况，与 `LifecyclePhase` 分离。运行中故障（如 etcd 崩溃、API Server 故障）不改变 `LifecyclePhase`，而是通过 `HealthStatus` 表达。
+
+**健康状态定义**：
+
+```go
+type HealthStatus struct {
+    // 整体健康状态
+    Overall HealthLevel `json:"overall"`
+    
+    // 健康消息
+    Message string `json:"message,omitempty"`
+    
+    // 节点健康状态
+    NodeHealth []NodeHealthStatus `json:"nodeHealth,omitempty"`
+    
+    // 组件健康状态
+    ComponentHealth []ComponentHealthStatus `json:"componentHealth,omitempty"`
+    
+    // 最后检查时间
+    LastCheckTime *metav1.Time `json:"lastCheckTime,omitempty"`
+}
+
+type HealthLevel string
+
+const (
+    HealthLevelHealthy   HealthLevel = "Healthy"
+    HealthLevelDegraded  HealthLevel = "Degraded"
+    HealthLevelUnhealthy HealthLevel = "Unhealthy"
+    HealthLevelUnknown   HealthLevel = "Unknown"
+)
+```
+
+**健康级别说明**：
+- `Healthy`：所有组件正常运行
+- `Degraded`：部分组件异常，但集群仍可运行
+- `Unhealthy`：关键组件异常，集群无法正常运行
+- `Unknown`：无法确定健康状态
+
+**聚合规则**：
+
+健康状态由**聚合模型**决定，采用自底向上的方式：
+
+| 组件状态 | 节点健康状态 | 说明 |
+|---------|------------|------|
+| 所有组件 Installed | Healthy | 节点健康 |
+| 任意组件 Failed | Unhealthy | 节点不健康 |
+| 任意组件非 Installed | Degraded | 节点降级 |
+
+| 节点/组件状态 | 集群健康状态 | 说明 |
+|-------------|------------|------|
+| 所有节点 Healthy + 所有组件 Healthy | Healthy | 集群健康 |
+| 任意节点/组件 Failed | Unhealthy | 集群不健康 |
+| 任意节点/组件非 Healthy | Degraded | 集群降级 |
+
+**示例场景**：
+
+```
+场景 1：运行中故障
+  T0: 集群运行中
+      LifecyclePhase = Running
+      HealthStatus.Overall = Healthy
+
+  T1: etcd 崩溃
+      LifecyclePhase = Running（不变）
+      HealthStatus.Overall = Unhealthy
+      HealthStatus.Message = "etcd crashed"
+
+  T2: 重启 etcd
+      LifecyclePhase = Running（不变）
+      HealthStatus.Overall = Healthy
+
+场景 2：集群健康状态聚合
+  集群包含：
+  - 节点 node-1：containerd (Installed), kubelet (Installed)
+  - 节点 node-2：containerd (Installed), kubelet (Failed)
+  - 集群级组件：coredns (Installed), kube-proxy (Installed)
+
+  聚合结果：
+    Overall: Unhealthy（因为 kubelet Failed）
+    NodeHealth:
+      - node-1: Healthy
+      - node-2: Unhealthy (kubelet failed)
+    ComponentHealth:
+      - containerd@node-1: Healthy
+      - kubelet@node-1: Healthy
+      - containerd@node-2: Healthy
+      - kubelet@node-2: Unhealthy (kubelet failed)
+      - coredns: Healthy
+      - kube-proxy: Healthy
+```
+
+#### 4.5.5 驱动模型的状态转换（LifecyclePhase）
+
+v3 的 `LifecyclePhase` 由**驱动模型**决定，基于 `OperationProgress` 字段：
+
+```go
+// determineLifecyclePhase 由驱动模型决定集群生命周期阶段
+func (r *Reconciler) determineLifecyclePhase(cluster *BKECluster) LifecyclePhase {
+    // 检查是否有进行中的操作
+    if cluster.Status.OperationProgress != nil && 
+       cluster.Status.OperationProgress.FinishedAt == nil {
+        switch cluster.Status.OperationProgress.OperationType {
+        case OperationTypeInstall:
+            return ClusterLifecycleInstalling
+        case OperationTypeUpgrade:
+            return ClusterLifecycleUpgrading
+        case OperationTypeScale:
+            return ClusterLifecycleScaling
+        case OperationTypeRollback:
+            return ClusterLifecycleRollingBack
+        }
+    }
+    
+    // 检查是否失败
+    if cluster.Status.OperationProgress != nil &&
+       cluster.Status.OperationProgress.LastFailure != nil {
+        return ClusterLifecycleFailed
+    }
+    
+    // 检查是否已安装
+    if allComponentsInstalled(cluster) {
+        return ClusterLifecycleRunning
+    }
+    
+    // 默认等待状态
+    return ClusterLifecyclePending
+}
+```
+
+**驱动规则说明**：
+- `Pending`：当集群刚创建且未开始安装时
+- `Installing`：当 `OperationProgress.OperationType = Install` 且未完成时
+- `Running`：当所有组件已安装且没有进行中的操作时
+- `Upgrading`：当 `OperationProgress.OperationType = Upgrade` 且未完成时
+- `Scaling`：当 `OperationProgress.OperationType = Scale` 且未完成时
+- `RollingBack`：当 `OperationProgress.OperationType = Rollback` 且未完成时
+- `Failed`：当 `OperationProgress.LastFailure != nil` 时
+
+**为什么没有 `Running --> Failed`？**
+
+在驱动模型中，`LifecyclePhase` 由**操作**驱动。`Running` 是稳定状态，表示集群正在运行，没有进行中的操作。运行中故障（如 etcd 崩溃、API Server 故障）不是由操作驱动的，应该通过 `HealthStatus` 表达，而不是改变 `LifecyclePhase`。
+
+#### 4.5.6 组件类型区分
+
+v3 将组件分为**节点级组件**和**集群级组件**两类：
+
+| 组件类型 | 示例 | 聚合目标 | 说明 |
+|---------|------|---------|------|
+| **节点级组件** | containerd, bkeagent | 节点健康状态 | 运行在特定节点上 |
+| **集群级组件** | coredns, kube-proxy | 集群健康状态 | 运行在集群中 |
+
+```go
+type ComponentType string
+
+const (
+    ComponentTypeNode    ComponentType = "node"    // 节点级组件
+    ComponentTypeCluster ComponentType = "cluster" // 集群级组件
+)
+```
+
+#### 4.5.7 本提案的铺垫作用
+
+| 本提案设计 | v3 混合模型对应 | 铺垫作用 |
 | ----------- | -------------- | --------- |
 | `ClusterStatus` 单一数据源 | 集群层 LifecyclePhase | 确立单一数据源原则，为集群层投影奠定基础 |
-| 状态转换表引擎（64 条规则） | StateAggregator（状态聚合器） | 集中管理状态转换规则，为聚合器设计奠定基础 |
-| StatusManagerV2 分层重试 | 三层重试机制（Command→Cluster→人工） | 按状态索引重试策略，为分层重试奠定基础 |
-| `MapToLifecyclePhase` 映射函数 | 三层聚合的集群层投影 | 22 个 ClusterStatus 归约为 6 个 LifecyclePhase |
-| 事件系统 | 组件级状态追踪 | 状态转换事件记录，为组件生命周期追踪奠定基础 |
+| 状态转换表引擎（64 条规则） | 三层状态机引擎 | 集中管理状态转换规则，为三层引擎设计奠定基础 |
+| StatusManagerV2 分层重试 | OperationProgress + 人工介入 | 按状态索引重试策略，为操作进度追踪奠定基础 |
+| `MapToLifecyclePhase` 映射函数 | 兼容性映射（v3 → 旧字段） | 22 个 ClusterStatus 归约为 9 个 LifecyclePhase |
+| 事件系统 | HealthStatus 聚合器 | 状态转换事件记录，为健康状态聚合奠定基础 |
 
-#### 4.5.4 演进路径
+#### 4.5.8 演进路径（面向 v3 的四层演进）
 
 1. **当前层**：ClusterStatus 单一数据源（本提案阶段一）
 2. **增强层**：状态转换表引擎 + 分层重试（本提案阶段二三）
-3. **远景层**：三层聚合（组件→节点→集群），本提案的 LifecyclePhase 映射和事件系统为其预留接口
+3. **桥梁层**：OperationProgress + HealthStatus（新增，连接本提案与 v3 的关键）
+4. **目标层**：v3 混合模型（驱动模型 + 聚合模型，三层状态机）
+
+**桥梁层说明**：
+
+桥梁层是本提案向 v3 演进的关键过渡阶段，通过引入 `OperationProgress` 和 `HealthStatus` 两个独立字段，逐步将生命周期状态与健康状态分离，为最终实现 v3 混合模型奠定基础。
+
+| 桥梁层组件 | 作用 | 演进成本 |
+|-----------|------|---------|
+| OperationProgress | 追踪操作进度，支持基于操作类型的恢复决策 | 低：在 StatusManagerV2 基础上扩展 |
+| HealthStatus | 独立表达健康状态，与 LifecyclePhase 分离 | 中：需要实现健康聚合逻辑 |
+| 组件类型区分 | 区分节点级组件和集群级组件 | 低：在 API 中添加 ComponentType 字段 |
 
 ## 5. 综合重构方案
 
@@ -5290,34 +5554,49 @@ Failed > RollingBack > Upgrading > Deleting > Pending/Provisioned > Ready
 - 状态转换规则集中管理
 - 提供完整的状态转换历史
 
-### 5.4 面向三层状态机的演进路径
+### 5.4 面向 v3 混合模型的演进路径
 
 **当前方案定位**：
 
 - 针对 PhaseFlow 的改进，解决 Phase、ClusterStatus、ClusterHealthState 三个字段的职责重叠问题
-- 确立 `ClusterStatus` 为单一数据源，为三层状态机的集群层投影奠定基础
-- 通过生命周期阶段映射函数，支持向三层状态机架构平滑演进
+- 确立 `ClusterStatus` 为单一数据源，为 v3 混合模型的集群层投影奠定基础
+- 通过生命周期阶段映射函数，支持向 v3 混合模型架构平滑演进
 
-**三层状态机远景**：
+**v3 混合模型远景**：
 
-- 集群层（Cluster Lifecycle）：Creating → Running → Upgrading → Scaling → RollingBack → Failed
-- 节点层（Node Lifecycle）：Pending → Provisioned → Ready → Upgrading → RollingBack → Deleting → Failed
-- 组件层（Component Lifecycle）：Pending → Installing → Installed → Upgrading → RollingBack → Failed
-- 聚合关系：组件状态 → 节点状态 → 集群状态（自底向上）
+- **驱动模型（自上而下）**：决定集群"正在做什么"（LifecyclePhase）
+  - 集群层：Pending → Installing → Running → Upgrading → Scaling → RollingBack → Deleting → Deleted → Failed
+  - 节点层：Pending → Provisioned → Ready → Upgrading → RollingBack → Deleting → Deleted → Failed
+  - 组件层：Pending → Installing → Installed → Upgrading → RollingBack → Deleting → Failed
+- **聚合模型（自底向上）**：决定集群"健康状况如何"（HealthStatus）
+  - 健康级别：Healthy / Degraded / Unhealthy / Unknown
+  - 聚合规则：组件状态 → 节点健康 → 集群健康
+
+**演进映射表（提案组件 → v3 组件）**：
+
+| 提案组件 | v3 组件 | 演进成本 | 说明 |
+|---------|---------|---------|------|
+| ClusterStatus（22 个值） | LifecyclePhase（9 个值） | 低 | MapToLifecyclePhase 映射函数已存在 |
+| 状态转换表引擎（64 条规则） | 三层状态机引擎 | 中 | 需扩展节点层/组件层转换规则 |
+| StatusManagerV2 | OperationProgress | 低 | 添加操作追踪字段即可 |
+| 事件系统 | HealthStatus 聚合器 | 中 | 需实现健康聚合逻辑 |
+| 重试机制 | 人工介入机制 | 低 | 添加基于 OperationType 的恢复决策 |
+| Phase/ClusterHealthState 字段 | 兼容性映射（v3 → 旧字段） | 低 | 反向映射函数已设计 |
 
 **本提案的铺垫作用**：
 
 - `ClusterStatus` 单一数据源 → 为集群层 LifecyclePhase 奠定基础
-- 状态转换表引擎（64 条规则） → 为状态聚合器（StateAggregator）奠定基础
-- StatusManagerV2 分层重试 → 为三层重试机制奠定基础
-- `MapToLifecyclePhase` 映射函数 → 为三层聚合的集群层投影奠定基础
-- 事件系统 → 为组件级状态追踪奠定基础
+- 状态转换表引擎（64 条规则） → 为三层状态机引擎奠定基础
+- StatusManagerV2 分层重试 → 为 OperationProgress 操作追踪奠定基础
+- `MapToLifecyclePhase` 映射函数 → 为兼容性映射奠定基础
+- 事件系统 → 为 HealthStatus 聚合器奠定基础
 
-**演进策略**：
+**演进策略（四层演进）**：
 
-- 阶段一（三字段整合）：必须实施，解决当前的职责重叠问题，确立单一数据源
-- 阶段二（状态机增强）：可选实施，引入状态转换表引擎和分层重试，为三层聚合做准备
-- 远景：逐步实现三层状态机聚合（组件→节点→集群），最终替代当前的 PhaseFlow 架构
+- **阶段一（三字段整合）**：必须实施，解决当前的职责重叠问题，确立单一数据源
+- **阶段二（状态机增强）**：可选实施，引入状态转换表引擎和分层重试，为 v3 引擎做准备
+- **阶段三（桥梁层）**：引入 OperationProgress + HealthStatus，逐步分离生命周期与健康状态
+- **阶段四（v3 目标层）**：实现完整的 v3 混合模型（驱动模型 + 聚合模型，三层状态机）
 
 ## 6. 迁移策略
 
@@ -5374,6 +5653,127 @@ func calculatingClusterPostStatusByPhase(phase phaseframe.Phase, err error) erro
 - 零风险切换：可随时回退到旧方式
 - 渐进式验证：逐步确认新方式的正确性
 - 向后兼容：不影响现有功能
+
+**策略三：面向 v3 的演进兼容**
+
+本提案的设计决策已充分考虑向 v3 混合模型的演进，确保最小化演进成本：
+
+**1. ClusterStatus → LifecyclePhase 映射**
+
+本提案的 `MapToLifecyclePhase` 函数将 22 个 ClusterStatus 值归约为 9 个 LifecyclePhase 值，为 v3 的兼容性映射奠定基础：
+
+| ClusterStatus（22 个值） | LifecyclePhase（9 个值） | 说明 |
+|-------------------------|-------------------------|------|
+| ClusterUnknown, ClusterChecking | Pending | 等待/检查状态 |
+| ClusterInitializing, ClusterMasterScalingUp, ClusterWorkerScalingUp, ClusterManaging | Installing | 安装/扩容/纳管状态 |
+| ClusterReady | Running | 运行状态 |
+| ClusterUpgrading | Upgrading | 升级状态 |
+| ClusterMasterScalingDown, ClusterWorkerScalingDown | Scaling | 缩容状态 |
+| ClusterPaused | RollingBack | 暂停/回滚状态 |
+| ClusterDeleting | Deleting | 删除状态 |
+| ClusterDeleted | Deleted | 已删除状态 |
+| ClusterInitializationFailed, ClusterScaleFailed, ClusterDeleteFailed, ClusterPauseFailed, ClusterDryRunFailed, ClusterDeployAddonFailed, ClusterUpgradeFailed, ClusterManageFailed, ClusterUnhealthy | Failed | 所有失败状态 |
+
+**2. 状态转换表引擎 → 三层状态机引擎**
+
+本提案的引擎设计（64 条规则）可直接扩展为 v3 的三层状态机引擎：
+
+```go
+// 本提案引擎（单层）
+type Engine struct {
+    transitions map[ClusterStatus][]Transition
+}
+
+// v3 引擎（三层）
+type StateMachineEngine struct {
+    clusterTransitions   map[ClusterLifecyclePhase][]ClusterTransitionRule
+    nodeTransitions      map[NodeLifecyclePhase][]NodeTransitionRule
+    componentTransitions map[ComponentLifecyclePhase][]ComponentTransitionRule
+    healthAggregator     *HealthAggregator
+}
+```
+
+**演进路径**：
+- 本提案引擎 → 添加节点层转换规则 → 添加组件层转换规则 → 添加健康聚合器 → v3 引擎
+
+**3. StatusManagerV2 → OperationProgress**
+
+本提案的 StatusManagerV2 可通过添加操作追踪字段演进为 v3 的 OperationProgress：
+
+```go
+// 本提案 StatusRecordV2
+type StatusRecordV2 struct {
+    CurrentClusterState ClusterStatus
+    LatestFailedState   string
+    LatestNormalState   string
+    StatusCount         int32
+    RetryPolicy         RetryPolicy
+}
+
+// v3 OperationProgress（扩展）
+type OperationProgress struct {
+    OperationType       OperationType  // 新增：操作类型
+    StartedAt           *metav1.Time   // 新增：开始时间
+    FinishedAt          *metav1.Time   // 新增：完成时间
+    CurrentStage        string         // 新增：当前阶段
+    TotalComponents     int            // 新增：总组件数
+    CompletedComponents int            // 新增：已完成组件数
+    LastFailure         *OperationFailureRecord  // 新增：最后失败记录
+}
+```
+
+**演进路径**：
+- StatusRecordV2 → 添加 OperationType 字段 → 添加进度追踪字段 → 添加失败记录 → OperationProgress
+
+**4. 事件系统 → HealthStatus 聚合器**
+
+本提案的事件系统可通过添加健康检查逻辑演进为 v3 的 HealthStatus 聚合器：
+
+```go
+// 本提案 EventRecorder
+type StateMachineEventRecorder struct {
+    store EventStore
+}
+
+// v3 HealthAggregator（扩展）
+type HealthAggregator struct {
+    // 聚合节点健康状态
+    aggregateNodeHealth func(node BKENode) NodeHealthStatus
+    // 聚合组件健康状态
+    aggregateComponentHealth func(comp ComponentLifecycleStatus) ComponentHealthStatus
+    // 聚合集群健康状态
+    AggregateClusterHealth func(nodes []BKENode, components map[string]ComponentLifecycleStatus) *HealthStatus
+}
+```
+
+**演进路径**：
+- EventRecorder → 添加健康检查函数 → 实现聚合逻辑 → HealthAggregator
+
+**5. 兼容性映射（v3 → 旧字段）**
+
+v3 提供反向映射函数，确保与旧版本的兼容性：
+
+```go
+// v3 兼容性映射
+func SyncClusterPhaseToLegacyFields(cluster *BKECluster, phase ClusterLifecyclePhase) {
+    // 同步 Phase 字段
+    cluster.Status.Phase = mapLifecyclePhaseToPhase(phase)
+    // 同步 ClusterStatus 字段
+    cluster.Status.ClusterStatus = mapLifecyclePhaseToClusterStatus(phase)
+    // 同步 ClusterHealthState 字段
+    cluster.Status.ClusterHealthState = mapLifecyclePhaseToClusterHealthState(phase)
+}
+```
+
+**演进成本总结**：
+
+| 演进阶段 | 工作量 | 风险 | 说明 |
+|---------|-------|------|------|
+| 本提案阶段一（三字段整合） | 7-11 天 | 低 | 必须实施，解决当前问题 |
+| 本提案阶段二（状态机增强） | 12-16 天 | 低 | 可选实施，为 v3 做准备 |
+| 桥梁层（OperationProgress + HealthStatus） | 10-15 天 | 中 | 关键过渡阶段 |
+| v3 目标层（完整混合模型） | 20-30 天 | 中 | 最终目标架构 |
+| **总计** | **49-72 天** | - | 分阶段实施，风险可控 |
 
 ## 7. 测试策略
 
@@ -5624,23 +6024,64 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 
 > **章节摘要**：本章总结重构方案的核心价值，描述面向三层状态机架构的演进路径（当前层→增强层→远景层），以及关键文件变更清单（20 个文件的修改和新增操作）。
 
-### 10.1 面向三层状态机的演进路径
+### 10.1 面向 v3 混合模型的演进路径
 
-| 维度 | 本方案（渐进式重构） | 三层状态机远景 |
+| 维度 | 本方案（渐进式重构） | v3 混合模型远景 |
 | ------ | ------------------- | ------------------------------------------ |
 | **定位** | 面向当下，解决现有问题 | 面向未来，目标架构 |
-| **状态模型** | ClusterStatus 单一字段 | LifecyclePhase 三层状态机（集群层+节点层+组件层） |
-| **迁移方式** | 标记 Deprecated，自动同步 | Feature Gate + 双写 |
-| **时间线** | 立即实施 | 18 个月 |
+| **状态模型** | ClusterStatus 单一字段（22 个值） | LifecyclePhase（9 个值）+ HealthStatus（4 个级别） |
+| **架构模型** | 单层（集群层） | 混合模型（驱动模型 + 聚合模型，三层状态机） |
+| **迁移方式** | 标记 Deprecated，自动同步 | Feature Gate + 双写 + 兼容性映射 |
+| **时间线** | 立即实施（19-27 天） | 18 个月（分四阶段演进） |
 
 **演进路径**：
 
-- 本方案的 `MapToLifecyclePhase` 为三层状态机的集群层投影奠定基础
-- 本方案的状态转换表引擎为状态聚合器（StateAggregator）的设计理念奠定基础
-- 本方案的 StatusManagerV2 分层重试为三层重试机制奠定基础
-- 三层状态机全量上线后，本方案的 ClusterStatus 将被 LifecyclePhase 替代
+- 本方案的 `MapToLifecyclePhase` 为 v3 的兼容性映射奠定基础
+- 本方案的状态转换表引擎为 v3 的三层状态机引擎奠定基础
+- 本方案的 StatusManagerV2 为 v3 的 OperationProgress 操作追踪奠定基础
+- 本方案的事件系统为 v3 的 HealthStatus 聚合器奠定基础
+- v3 全量上线后，本方案的 ClusterStatus 将被 LifecyclePhase 替代，但通过兼容性映射保持向后兼容
 
-### 10.2 关键文件变更清单
+### 10.2 演进成本分析
+
+**可复用性分析**：
+
+| 提案组件 | v3 可复用度 | 说明 |
+|---------|-----------|------|
+| ClusterStatus 单一数据源 | 100% | 直接映射到 LifecyclePhase |
+| 状态转换表引擎 | 60% | 引擎框架可复用，需扩展节点层/组件层规则 |
+| StatusManagerV2 | 40% | 重试机制可复用，需添加操作追踪字段 |
+| 事件系统 | 30% | 事件记录可复用，需添加健康聚合逻辑 |
+| 映射函数 | 90% | MapToLifecyclePhase 可直接使用 |
+| **总体可复用度** | **约 60%** | - |
+
+**演进成本分解**：
+
+| 演进阶段 | 工作内容 | 工作量 | 风险等级 |
+|---------|---------|-------|---------|
+| **阶段一：三字段整合** | 删除 Phase/ClusterHealthState，保留 ClusterStatus | 7-11 天 | 低 |
+| **阶段二：状态机增强** | 实现状态转换表引擎 + StatusManagerV2 | 12-16 天 | 低 |
+| **阶段三：桥梁层** | 引入 OperationProgress + HealthStatus | 10-15 天 | 中 |
+| **阶段四：v3 目标层** | 实现完整 v3 混合模型（三层状态机） | 20-30 天 | 中 |
+| **总计** | - | **49-72 天** | - |
+
+**成本优化策略**：
+
+1. **渐进式演进**：每个阶段独立可交付，可根据实际情况决定是否继续演进
+2. **最大化复用**：充分利用本提案的代码和设计理念，减少重复开发
+3. **兼容性保障**：通过兼容性映射确保向后兼容，降低迁移风险
+4. **灰度发布**：每个阶段都支持灰度发布，逐步验证新架构的正确性
+
+**关键里程碑**：
+
+| 里程碑 | 时间 | 交付物 | 验收标准 |
+|-------|------|-------|---------|
+| M1：三字段整合完成 | 第 11 天 | ClusterStatus 单一数据源 | 所有测试通过，外部消费者无感知 |
+| M2：状态机增强完成 | 第 27 天 | 状态转换表引擎 + StatusManagerV2 | 状态转换规则集中管理，Failed 覆盖 8/8 |
+| M3：桥梁层完成 | 第 42 天 | OperationProgress + HealthStatus | 支持操作进度追踪，健康状态独立表达 |
+| M4：v3 全量上线 | 第 72 天 | 完整 v3 混合模型 | 三层状态机运行稳定，性能达标 |
+
+### 10.3 关键文件变更清单
 
 | 文件路径 | 操作 | 说明 |
 | --------- | ------ | ------ |
