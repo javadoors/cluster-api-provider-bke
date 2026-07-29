@@ -3366,925 +3366,83 @@ if sr.CurrentClusterState != bkev1beta1.ClusterUnhealthy &&
 
 ### 4.3 增强方案二：改进状态管理器（适配单字段设计）
 
-**设计思路**: 在三字段整合的基础上，解决内存泄漏、灵活重试、并发安全等问题。
+**设计思路**：
 
-**重构设计**:
+- **职责划分**：StatusManager 负责状态记录和重试计数，Engine 负责状态转换和重试策略
+- **删除状态伪装逻辑**：由 Engine 统一管理，简化 StatusManager 职责
+- **简化数据结构**：删除 RetryPolicy 字段，重试策略由 Engine 管理
+- **保持接口兼容性**：所有公开方法签名不变，8 个调用点零修改
+
+#### 4.3.1 数据结构设计
+
+##### StatusRecordV3（简化版）
 
 ```go
-// 改进的状态记录（移除 ClusterHealthState，只使用 ClusterStatus）
-type StatusRecordV2 struct {
-    LatestFailedState    string
-    LatestNormalState    string
-    StatusCount          int32  // 使用int32支持原子操作
-    NeedRequeue          bool
-    CurrentClusterState  ClusterStatus  // 改为 ClusterStatus，不再使用 ClusterHealthState
-    
-    // 新增字段
-    LastUpdateTime       time.Time  // 最后更新时间
-    ExpireTime           time.Time  // 过期时间
-    RetryPolicy          RetryPolicy  // 重试策略
-}
-
-// 重试策略
-type RetryPolicy struct {
-    MaxRetryCount    int           // 最大重试次数
-    BackoffStrategy  BackoffType   // 退避策略
-    InitialDelay     time.Duration // 初始延迟
-    MaxDelay         time.Duration // 最大延迟
-}
-
-// 退避策略类型
-type BackoffType string
-
-const (
-    BackoffNone       BackoffType = "None"       // 无退避
-    BackoffLinear     BackoffType = "Linear"     // 线性退避
-    BackoffExponential BackoffType = "Exponential" // 指数退避
-)
-
-// Phase级别的重试策略配置（已废弃）
-//
-// Deprecated: 此配置已废弃，请使用 ClusterStatusRetryPolicies 替代。
-// 原因：
-// 1. StatusManager 无法获取 Phase 名称，只能观察 ClusterStatus
-// 2. 两套配置可能导致不一致
-// 3. 统一使用 ClusterStatus 索引更简洁
-//
-// 迁移指南：
-// - EnsureMasterInit 失败 → ClusterInitializationFailed
-// - EnsureBKEAgent 失败 → ClusterInitializationFailed
-// - EnsureNodesEnv 失败 → ClusterInitializationFailed
-// - EnsureMasterJoin 失败 → ClusterMasterScalingUp
-// - EnsureWorkerJoin 失败 → ClusterWorkerScalingUp
-// - EnsureEtcdUpgrade 失败 → ClusterUpgradeFailed
-// 其他 Phase 请参考状态转换表中的映射关系
-//
-// 策略设计原则：
-// - 关键操作（Master/Etcd/删除）：指数退避，较少重试次数（3-5次），避免长时间阻塞
-// - 常规操作（Worker/Addon/升级）：线性退避，较多重试次数（5-10次），提高成功率
-// - 特殊操作（Pause）：不重试，立即生效
-var PhaseRetryPolicies = map[string]RetryPolicy{
-    // ========== 初始化阶段 ==========
-    // EnsureFinalizer: 创建 Finalizer，关键操作，失败概率低
-    "EnsureFinalizer": {
-        MaxRetryCount:   3,
-        BackoffStrategy: BackoffExponential,
-        InitialDelay:    5 * time.Second,
-        MaxDelay:        1 * time.Minute,
-    },
-    // EnsureCerts: 创建证书，关键操作，耗时较长
-    "EnsureCerts": {
-        MaxRetryCount:   3,
-        BackoffStrategy: BackoffExponential,
-        InitialDelay:    10 * time.Second,
-        MaxDelay:        2 * time.Minute,
-    },
-    // EnsureClusterAPIObj: 创建 ClusterAPI 对象，关键操作
-    "EnsureClusterAPIObj": {
-        MaxRetryCount:   3,
-        BackoffStrategy: BackoffExponential,
-        InitialDelay:    5 * time.Second,
-        MaxDelay:        1 * time.Minute,
-    },
-    // EnsureMasterInit: Master 初始化，关键操作，耗时较长
-    "EnsureMasterInit": {
-        MaxRetryCount:   5,
-        BackoffStrategy: BackoffExponential,
-        InitialDelay:    10 * time.Second,
-        MaxDelay:        5 * time.Minute,
-    },
-    // EnsureBKEAgent: 推送 BKE Agent，常规操作，可能因网络问题失败
-    "EnsureBKEAgent": {
-        MaxRetryCount:   5,
-        BackoffStrategy: BackoffLinear,
-        InitialDelay:    5 * time.Second,
-        MaxDelay:        2 * time.Minute,
-    },
-    // EnsureNodesEnv: 节点环境准备，常规操作，可能因资源问题失败
-    "EnsureNodesEnv": {
-        MaxRetryCount:   5,
-        BackoffStrategy: BackoffLinear,
-        InitialDelay:    5 * time.Second,
-        MaxDelay:        2 * time.Minute,
-    },
-    // EnsureLoadBalance: 配置负载均衡，关键操作
-    "EnsureLoadBalance": {
-        MaxRetryCount:   3,
-        BackoffStrategy: BackoffExponential,
-        InitialDelay:    5 * time.Second,
-        MaxDelay:        1 * time.Minute,
-    },
-    // EnsureAgentSwitch: Agent 监听切换，常规操作
-    "EnsureAgentSwitch": {
-        MaxRetryCount:   5,
-        BackoffStrategy: BackoffLinear,
-        InitialDelay:    5 * time.Second,
-        MaxDelay:        2 * time.Minute,
-    },
-
-    // ========== 健康检查阶段 ==========
-    // EnsureCluster: 健康检查，常规操作，可能需要多次检查
-    "EnsureCluster": {
-        MaxRetryCount:   10,
-        BackoffStrategy: BackoffLinear,
-        InitialDelay:    10 * time.Second,
-        MaxDelay:        5 * time.Minute,
-    },
-
-    // ========== Addon 部署阶段 ==========
-    // EnsureAddonDeploy: Addon 部署，常规操作，可能因镜像拉取失败
-    "EnsureAddonDeploy": {
-        MaxRetryCount:   5,
-        BackoffStrategy: BackoffLinear,
-        InitialDelay:    10 * time.Second,
-        MaxDelay:        5 * time.Minute,
-    },
-
-    // ========== 扩容阶段 ==========
-    // EnsureMasterJoin: Master 扩容，关键操作，耗时较长
-    "EnsureMasterJoin": {
-        MaxRetryCount:   5,
-        BackoffStrategy: BackoffExponential,
-        InitialDelay:    10 * time.Second,
-        MaxDelay:        5 * time.Minute,
-    },
-    // EnsureWorkerJoin: Worker 扩容，常规操作
-    "EnsureWorkerJoin": {
-        MaxRetryCount:   10,
-        BackoffStrategy: BackoffLinear,
-        InitialDelay:    5 * time.Second,
-        MaxDelay:        2 * time.Minute,
-    },
-
-    // ========== 缩容阶段 ==========
-    // EnsureMasterDelete: Master 缩容，关键操作，需要优雅处理
-    "EnsureMasterDelete": {
-        MaxRetryCount:   5,
-        BackoffStrategy: BackoffExponential,
-        InitialDelay:    10 * time.Second,
-        MaxDelay:        5 * time.Minute,
-    },
-    // EnsureWorkerDelete: Worker 缩容，常规操作
-    "EnsureWorkerDelete": {
-        MaxRetryCount:   10,
-        BackoffStrategy: BackoffLinear,
-        InitialDelay:    5 * time.Second,
-        MaxDelay:        2 * time.Minute,
-    },
-
-    // ========== 升级阶段 ==========
-    // EnsureAgentUpgrade: Agent 升级，常规操作
-    "EnsureAgentUpgrade": {
-        MaxRetryCount:   10,
-        BackoffStrategy: BackoffLinear,
-        InitialDelay:    5 * time.Second,
-        MaxDelay:        2 * time.Minute,
-    },
-    // EnsureContainerdUpgrade: Containerd 升级，常规操作
-    "EnsureContainerdUpgrade": {
-        MaxRetryCount:   10,
-        BackoffStrategy: BackoffLinear,
-        InitialDelay:    5 * time.Second,
-        MaxDelay:        2 * time.Minute,
-    },
-    // EnsureMasterUpgrade: Master 升级，关键操作，耗时较长
-    "EnsureMasterUpgrade": {
-        MaxRetryCount:   5,
-        BackoffStrategy: BackoffExponential,
-        InitialDelay:    10 * time.Second,
-        MaxDelay:        5 * time.Minute,
-    },
-    // EnsureWorkerUpgrade: Worker 升级，常规操作
-    "EnsureWorkerUpgrade": {
-        MaxRetryCount:   10,
-        BackoffStrategy: BackoffLinear,
-        InitialDelay:    5 * time.Second,
-        MaxDelay:        2 * time.Minute,
-    },
-    // EnsureComponentUpgrade: 组件升级，常规操作
-    "EnsureComponentUpgrade": {
-        MaxRetryCount:   10,
-        BackoffStrategy: BackoffLinear,
-        InitialDelay:    5 * time.Second,
-        MaxDelay:        2 * time.Minute,
-    },
-    // EnsurePreUpgradeResources: 升级前资源预创建，常规操作
-    "EnsurePreUpgradeResources": {
-        MaxRetryCount:   5,
-        BackoffStrategy: BackoffLinear,
-        InitialDelay:    5 * time.Second,
-        MaxDelay:        2 * time.Minute,
-    },
-    // EnsureEtcdUpgrade: Etcd 升级，关键操作，风险较高
-    "EnsureEtcdUpgrade": {
-        MaxRetryCount:   3,
-        BackoffStrategy: BackoffExponential,
-        InitialDelay:    30 * time.Second,
-        MaxDelay:        10 * time.Minute,
-    },
-
-    // ========== 纳管阶段 ==========
-    // EnsureClusterManage: 集群纳管，常规操作
-    "EnsureClusterManage": {
-        MaxRetryCount:   10,
-        BackoffStrategy: BackoffLinear,
-        InitialDelay:    5 * time.Second,
-        MaxDelay:        2 * time.Minute,
-    },
-
-    // ========== 暂停阶段 ==========
-    // EnsurePaused: 暂停集群，特殊操作，不重试
-    "EnsurePaused": {
-        MaxRetryCount:   0,
-        BackoffStrategy: BackoffNone,
-        InitialDelay:    0,
-        MaxDelay:        0,
-    },
-
-    // ========== DryRun 阶段 ==========
-    // EnsureDryRun: DryRun 测试，常规操作
-    "EnsureDryRun": {
-        MaxRetryCount:   3,
-        BackoffStrategy: BackoffLinear,
-        InitialDelay:    5 * time.Second,
-        MaxDelay:        1 * time.Minute,
-    },
-
-    // ========== 删除阶段 ==========
-    // EnsureDeleteOrReset: 删除/重置集群，关键操作，需要优雅处理
-    "EnsureDeleteOrReset": {
-        MaxRetryCount:   5,
-        BackoffStrategy: BackoffExponential,
-        InitialDelay:    10 * time.Second,
-        MaxDelay:        5 * time.Minute,
-    },
-}
-
-// 默认重试策略（用于未在 PhaseRetryPolicies 中定义的 Phase）
-var DefaultRetryPolicy = RetryPolicy{
-    MaxRetryCount:   10,
-    BackoffStrategy: BackoffLinear,
-    InitialDelay:    5 * time.Second,
-    MaxDelay:        2 * time.Minute,
-}
-
-// GetRetryPolicy 获取指定 Phase 的重试策略
-// 如果未找到，则返回默认策略
-func GetRetryPolicy(phaseName string) RetryPolicy {
-    if policy, ok := PhaseRetryPolicies[phaseName]; ok {
-        return policy
-    }
-    return DefaultRetryPolicy
-}
-
-// Phase重试策略说明：
-//
-// 1. 指数退避（BackoffExponential）适用于：
-//    - 关键操作（Master/Etcd/删除）
-//    - 失败后需要较长恢复时间的场景
-//    - 重试次数较少（3-5次）
-//    - 延迟增长：10s → 20s → 40s → 80s → ...
-//
-// 2. 线性退避（BackoffLinear）适用于：
-//    - 常规操作（Worker/Addon/升级）
-//    - 失败后恢复时间相对固定的场景
-//    - 重试次数较多（5-10次）
-//    - 延迟增长：5s → 10s → 15s → 20s → ...
-//
-// 3. 无退避（BackoffNone）适用于：
-//    - 特殊操作（Pause）
-//    - 不需要重试的场景
-//    - 立即生效的操作
-//
-// 4. 重试次数选择原则：
-//    - 3次：高风险操作（Etcd升级、证书创建）
-//    - 5次：关键操作（Master初始化/升级/删除）
-//    - 10次：常规操作（Worker扩容/升级、Addon部署）
-//    - 0次：特殊操作（Pause）
-
-// 改进的状态管理器
-type StatusManagerV2 struct {
-    cmux sync.RWMutex
-    nmux sync.RWMutex
-    
-    BKEClusterStatusMap map[string]*StatusRecordV2
-    BKENodesStatusMap   map[string]map[string]*StatusRecordV2
-    
-    // 新增：状态清理器
-    cleaner *StatusCleaner
-}
-
-// 状态清理器
-type StatusCleaner struct {
-    cleanupInterval time.Duration
-    expireDuration  time.Duration
-    stopCh          chan struct{}
-}
-
-func (c *StatusCleaner) Start() {
-    ticker := time.NewTicker(c.cleanupInterval)
-    go func() {
-        for {
-            select {
-            case <-ticker.C:
-                c.cleanupExpiredRecords()
-            case <-c.stopCh:
-                ticker.Stop()
-                return
-            }
-        }
-    }()
-}
-
-func (c *StatusCleaner) cleanupExpiredRecords() {
-    // 清理过期的状态记录
-    now := time.Now()
-    for key, record := range BKEClusterStatusMap {
-        if now.After(record.ExpireTime) {
-            delete(BKEClusterStatusMap, key)
-        }
-    }
-}
-
-// 改进的失败处理逻辑（简化：只处理 ClusterStatus，不再需要处理 ClusterHealthState）
-func (b *StatusManagerV2) handleFailure(cluster *BKECluster, phaseName string) error {
-    key := utils.ClientObjNS(cluster)
-    
-    b.cmux.Lock()
-    defer b.cmux.Unlock()
-    
-    sr := b.BKEClusterStatusMap[key]
-    if sr == nil {
-        sr = &StatusRecordV2{
-            RetryPolicy: PhaseRetryPolicies[phaseName],
-            ExpireTime:  time.Now().Add(24 * time.Hour),
-        }
-        b.BKEClusterStatusMap[key] = sr
-    }
-    
-    // 原子递增计数器
-    newCount := atomic.AddInt32(&sr.StatusCount, 1)
-    
-    // 检查是否允许重试
-    if int(newCount) <= sr.RetryPolicy.MaxRetryCount {
-        // 计算退避时间
-        delay := b.calculateBackoff(sr.RetryPolicy, int(newCount))
-        
-        // 恢复到正常状态（只恢复 ClusterStatus）
-        cluster.Status.ClusterStatus = ClusterStatus(sr.LatestNormalState)
-        sr.NeedRequeue = true
-        
-        // 返回RequeueAfter而不是立即Requeue
-        return &RequeueAfterError{Delay: delay}
-    }
-    
-    // 超过重试次数，设置最终失败状态（只设置 ClusterStatus）
-    b.setFinalFailedState(cluster, sr)
-    sr.NeedRequeue = false
-    
-    return nil
-}
-
-// 计算退避时间
-func (b *StatusManagerV2) calculateBackoff(policy RetryPolicy, count int) time.Duration {
-    switch policy.BackoffStrategy {
-    case BackoffNone:
-        return 0
-    case BackoffLinear:
-        delay := policy.InitialDelay * time.Duration(count)
-        if delay > policy.MaxDelay {
-            return policy.MaxDelay
-        }
-        return delay
-    case BackoffExponential:
-        delay := policy.InitialDelay * time.Duration(1<<uint(count-1))
-        if delay > policy.MaxDelay {
-            return policy.MaxDelay
-        }
-        return delay
-    default:
-        return 0
-    }
-}
-
-// 补充方法 1：SetStatus（入口方法）
-func (b *StatusManagerV2) SetStatus(bkeCluster *bkev1beta1.BKECluster, bkeNodes bkev1beta1.BKENodes) {
-    b.recordBKEClusterStatus(bkeCluster)
-    b.recordBKENodesStatus(bkeCluster, bkeNodes)
-}
-
-// 补充方法 2：recordBKEClusterStatus（记录集群状态）
-func (b *StatusManagerV2) recordBKEClusterStatus(bkeCluster *bkev1beta1.BKECluster) {
-    // 检查注解
-    if _, ok := annotation.HasAnnotation(bkeCluster, annotation.StatusRecordAnnotationKey); !ok {
-        return
-    }
-    defer annotation.RemoveAnnotation(bkeCluster, annotation.StatusRecordAnnotationKey)
-
-    state := string(bkeCluster.Status.ClusterStatus)
-    if state == "" {
-        return
-    }
-    key := utils.ClientObjNS(bkeCluster)
-
-    b.cmux.Lock()
-    defer b.cmux.Unlock()
-
-    sr := b.BKEClusterStatusMap[key]
-    if sr == nil {
-        sr = &StatusRecordV2{
-            ExpireTime: time.Now().Add(24 * time.Hour),
-        }
-        b.BKEClusterStatusMap[key] = sr
-    }
-
-    // 不记录暂停状态
-    if state == string(bkev1beta1.ClusterPaused) {
-        sr.NeedRequeue = false
-        return
-    }
-
-    // 设置当前状态（只使用 ClusterStatus，不再使用 ClusterHealthState）
-    sr.CurrentClusterState = bkeCluster.Status.ClusterStatus
-
-    failedState := strings.HasSuffix(state, "Failed")
-
-    // 正常的状态
-    if !failedState {
-        sr.LatestNormalState = state
-        sr.NeedRequeue = false
-        return
-    }
-
-    // 失败的状态
-    if sr.LatestFailedState == state {
-        // 与上次一致，计数器+1
-        atomic.AddInt32(&sr.StatusCount, 1)
-    } else {
-        // 与上次不一致，重置并记录新的失败状态
-        sr.StatusCount = 0
-        sr.LatestFailedState = state
-        atomic.AddInt32(&sr.StatusCount, 1)
-    }
-
-    // 检查是否允许重试
-    if int(sr.StatusCount) <= sr.RetryPolicy.MaxRetryCount {
-        // 恢复到正常状态
-        bkeCluster.Status.ClusterStatus = ClusterStatus(sr.LatestNormalState)
-        sr.NeedRequeue = true
-    } else {
-        // 超过重试次数，设置最终失败状态
-        bkeCluster.Status.ClusterStatus = ClusterStatus(sr.LatestFailedState)
-        sr.NeedRequeue = false
-        sr.StatusCount = 0
-    }
-}
-
-// 补充方法 3：recordBKENodesStatus（记录节点状态）
-func (b *StatusManagerV2) recordBKENodesStatus(bkeCluster *bkev1beta1.BKECluster, bkeNodes bkev1beta1.BKENodes) {
-    if bkeNodes == nil || len(bkeNodes) == 0 {
-        return
-    }
-
-    key := utils.ClientObjNS(bkeCluster)
-
-    b.nmux.Lock()
-    defer b.nmux.Unlock()
-
-    nodesStatusMap := b.BKENodesStatusMap[key]
-    if nodesStatusMap == nil {
-        nodesStatusMap = map[string]*StatusRecordV2{}
-        b.BKENodesStatusMap[key] = nodesStatusMap
-    }
-
-    for i := range bkeNodes {
-        b.recordSingleNodeState(&bkeNodes[i], nodesStatusMap, bkeNodes)
-    }
-}
-
-// 补充方法 4：recordSingleNodeState（记录单个节点状态）
-func (b *StatusManagerV2) recordSingleNodeState(
-    bkeNode *confv1beta1.BKENode,
-    nodesStatusMap map[string]*StatusRecordV2,
-    bkeNodes bkev1beta1.BKENodes,
-) {
-    nodeIP := bkeNode.Spec.IP
-    if !bkeNodes.GetNodeStateFlag(nodeIP, bkev1beta1.NodeStateNeedRecord) {
-        return
-    }
-    defer bkeNodes.UnmarkNodeStateFlag(nodeIP, bkev1beta1.NodeStateNeedRecord)
-
-    state := string(bkeNode.Status.State)
-    if state == "" {
-        return
-    }
-
-    sr := nodesStatusMap[nodeIP]
-    if sr == nil {
-        sr = &StatusRecordV2{
-            ExpireTime: time.Now().Add(24 * time.Hour),
-        }
-        nodesStatusMap[nodeIP] = sr
-    }
-
-    failedState := strings.HasSuffix(state, "Failed")
-
-    // 正常的状态
-    if !failedState {
-        sr.LatestNormalState = state
-        return
-    }
-
-    // 失败的状态
-    if sr.LatestFailedState == state {
-        atomic.AddInt32(&sr.StatusCount, 1)
-    } else {
-        sr.StatusCount = 0
-        sr.LatestFailedState = state
-        atomic.AddInt32(&sr.StatusCount, 1)
-    }
-
-    // 检查是否允许重试
-    if int(sr.StatusCount) <= sr.RetryPolicy.MaxRetryCount {
-        bkeNodes.SetNodeState(nodeIP, confv1beta1.NodeState(sr.LatestNormalState))
-        sr.NeedRequeue = true
-    } else {
-        bkeNodes.SetNodeState(nodeIP, confv1beta1.NodeState(state))
-        bkeNodes.MarkNodeStateFlag(nodeIP, bkev1beta1.NodeFailedFlag)
-        sr.NeedRequeue = false
-        sr.StatusCount = 0
-    }
-}
-
-// 补充方法 5：GetCtrlResult（获取控制结果）
-func (b *StatusManagerV2) GetCtrlResult(bkeCluster *bkev1beta1.BKECluster) ctrl.Result {
-    if bkeCluster.Status.ClusterStatus == bkev1beta1.ClusterPaused {
-        return ctrl.Result{}
-    }
-
-    b.cmux.RLock()
-    defer b.cmux.RUnlock()
-
-    key := utils.ClientObjNS(bkeCluster)
-    sr := b.BKEClusterStatusMap[key]
-
-    if sr == nil {
-        return ctrl.Result{}
-    }
-
-    return ctrl.Result{Requeue: sr.NeedRequeue}
-}
-
-// 补充方法 6：GetNodesResult（获取节点结果）
-func (b *StatusManagerV2) GetNodesResult(bkeCluster *bkev1beta1.BKECluster, nodeIP string) bool {
-    b.nmux.RLock()
-    defer b.nmux.RUnlock()
-
-    key := utils.ClientObjNS(bkeCluster)
-
-    if sr, ok := b.BKENodesStatusMap[key]; ok {
-        if sr[nodeIP] == nil {
-            return true
-        }
-        return sr[nodeIP].NeedRequeue
-    }
-
-    return true
-}
-
-// 补充方法 7：RemoveBKEClusterStatusCache（清理集群缓存）
-func (b *StatusManagerV2) RemoveBKEClusterStatusCache(bkeCluster *bkev1beta1.BKECluster) {
-    b.cmux.Lock()
-    defer b.cmux.Unlock()
-    key := utils.ClientObjNS(bkeCluster)
-    delete(b.BKEClusterStatusMap, key)
-}
-
-// 补充方法 8：RemoveNodesStatusCache（清理节点缓存）
-func (b *StatusManagerV2) RemoveNodesStatusCache(bkeCluster *bkev1beta1.BKECluster) {
-    b.nmux.Lock()
-    defer b.nmux.Unlock()
-    key := utils.ClientObjNS(bkeCluster)
-    delete(b.BKENodesStatusMap, key)
-}
-
-// 补充方法 9：RemoveSingleNodeStatusCache（清理单个节点缓存）
-func (b *StatusManagerV2) RemoveSingleNodeStatusCache(bkeCluster *bkev1beta1.BKECluster, nodeIP string) {
-    b.nmux.Lock()
-    defer b.nmux.Unlock()
-
-    key := utils.ClientObjNS(bkeCluster)
-    nodesStatusMap := b.BKENodesStatusMap[key]
-    if nodesStatusMap == nil {
-        return
-    }
-    delete(nodesStatusMap, nodeIP)
-}
-```
-
-**优势**:
-
-- 解决内存泄漏问题（自动清理过期记录）
-- 支持Phase级别的重试策略
-- 支持多种退避策略（线性、指数）
-- 改进并发安全（原子操作）
-- 更灵活的状态回退机制
-- 完整替换旧状态管理器，提供所有核心方法
-
-#### 4.3.1 替换原状态管理器的完整设计
-
-#### 设计决策
-
-| 决策项 | 方案 | 理由 |
-| -------- | ------ | ------ |
-| **重试策略索引** | 按 `ClusterStatus` 索引 | StatusManager 无法获取 Phase 名称，但可直接观察 ClusterStatus |
-| **状态伪装机制** | 使用 `LatestNormalState` | 已验证正确，无需额外信息，Engine 的 Retry 转换对此场景增加复杂度无收益 |
-| **接口兼容性** | 保持所有公开方法签名不变 | 8 个调用点零修改，降低迁移风险 |
-
-#### Engine 与 StatusManager 职责边界
-
-| 组件 | 职责 | 操作时机 | 状态可见性 |
-|------|------|---------|-----------|
-| **Engine** | 基于转换表执行状态转换，决定"应该进入什么状态" | Phase 执行前后（pre-hook/post-hook） | 写入真实状态到 `ClusterStatus` |
-| **StatusManager** | 重试控制、状态伪装、失败恢复，决定"是否对外暴露真实状态" | `SyncStatusUntilComplete()` 期间 | 可能将 Failed 状态伪装为 `LatestNormalState` |
-
-**状态伪装的完整流程**：
-
-```
-1. Engine 写入真实状态：ClusterStatus = ClusterScaleFailed
-2. StatusManager 观察真实状态，判断重试次数：
-   - count < MaxRetryCount: 伪装 ClusterStatus = LatestNormalState（对外隐藏失败）
-   - count >= MaxRetryCount: 保持 ClusterScaleFailed（对外暴露失败）
-3. 外部消费者（Controller、Webhook）看到的是伪装后的状态
-4. 当重试次数耗尽，真实状态暴露，触发人工介入
-```
-
-**为什么需要状态伪装？**
-
-- 避免短暂失败导致外部消费者误判集群状态
-- 给系统自动恢复的机会，减少人工介入
-- 保持与现有行为兼容，降低迁移风险
-
-#### 状态伪装与 Engine 的协作流程
-
-```
-PhaseFlow.Execute()
-  → pre-hook: engine.Transition(phase, nil)     → ClusterMasterScalingUp
-  → phase.Execute() → error
-  → post-hook: engine.Transition(phase, err)    → ClusterScaleFailed
-  → mergecluster.SyncStatusUntilComplete()
-    → statusmanager.SetStatus(bkeCluster, bkeNodes)
-      → recordBKEClusterStatus()
-        → 观察 ClusterStatus = ClusterScaleFailed
-        → 查 ClusterStatusRetryPolicies[ClusterScaleFailed]
-        → count < 5: 
-            → 伪装 ClusterStatus = LatestNormalState (="ScalingMasterNodesUp")
-            → NeedRequeue=true
-        → count >= 5: 
-            → 保持 ClusterScaleFailed
-            → NeedRequeue=false
-```
-
-> **关键设计**：状态伪装使用 `LatestNormalState`，不使用 Engine。原因：ScaleFailed 无法仅从当前状态判断应恢复到哪种 Scaling 状态，而 `LatestNormalState` 已记录正确的恢复目标（进入 Phase 前的状态）。
-
-#### 替换对照表
-
-| 原文件 | 原行数 | 新文件 | 新行数 | 变更说明 |
-| -------- | ------- | -------- | ------- | --------- |
-| `pkg/statusmanage/staterecords.go` | 55 | `pkg/statusmanage/staterecords.go` | ~80 | StatusRecord→StatusRecordV2，新增 RetryPolicy/ExpireTime/LastUpdateTime |
-| `pkg/statusmanage/statusmanager.go` | 362 | `pkg/statusmanage/statusmanager.go` | ~420 | 新增 StatusCleaner、按 ClusterStatus 索引重试、全 8 种 Failed 覆盖 |
-
-#### 调用方变更清单
-
-| 文件 | 行号 | 当前调用 | 变更 |
-| ------ | ------ | --------- | ------ |
-| `mergecluster/bkecluster.go` | 435 | `SetStatus(newBKECuster, bkeNodes)` | **不变** |
-| `bkecluster_controller.go` | 287 | `GetCtrlResult(bkeCluster)` | **不变** |
-| `bkecluster_controller.go` | 714 | `RemoveClusterStatusManagerCache(bkeCluster)` | **不变** |
-| `bkecluster_controller.go` | 734 | `RemoveSingleNodeStatusCache(bkeCluster, nodeIP)` | **不变** |
-| `ensure_worker_delete.go` | 668 | `RemoveSingleNodeStatusCache(bkeCluster, node.IP)` | **不变** |
-| `ensure_master_delete.go` | 357 | `RemoveSingleNodeStatusCache(bkeCluster, node.IP)` | **不变** |
-| `ensure_delete_or_reset.go` | 369 | `RemoveBKEClusterStatusCache(bkeCluster)` | **不变** |
-| `common.go` | 86 | `RemoveSingleNodeStatusCache(bkeCluster, node.IP)` | **不变** |
-
-#### 完整替换文件：`pkg/statusmanage/staterecords.go`
-
-```go
-package statusmanage
-
-import (
-    "time"
-
-    confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
-    bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
-)
-
-// BackoffType 退避策略类型
-type BackoffType string
-
-const (
-    BackoffNone        BackoffType = "None"
-    BackoffLinear      BackoffType = "Linear"
-    BackoffExponential BackoffType = "Exponential"
-)
-
-// RetryPolicy 重试策略
-type RetryPolicy struct {
-    MaxRetryCount   int           // 最大重试次数
-    BackoffStrategy BackoffType   // 退避策略
-    InitialDelay    time.Duration // 初始延迟
-    MaxDelay        time.Duration // 最大延迟
-}
-
-// DefaultRetryPolicy 默认重试策略（未配置的 ClusterStatus 使用此策略）
-var DefaultRetryPolicy = RetryPolicy{
-    MaxRetryCount:   10,
-    BackoffStrategy: BackoffNone,
-    InitialDelay:    0,
-    MaxDelay:        0,
-}
-
-// ClusterStatusRetryPolicies 按 ClusterStatus 索引的重试策略
-var ClusterStatusRetryPolicies = map[bkev1beta1.ClusterStatus]RetryPolicy{
-    bkev1beta1.ClusterInitializationFailed: {
-        MaxRetryCount:   5,
-        BackoffStrategy: BackoffExponential,
-        InitialDelay:    10 * time.Second,
-        MaxDelay:        5 * time.Minute,
-    },
-    bkev1beta1.ClusterUpgradeFailed: {
-        MaxRetryCount:   10,
-        BackoffStrategy: BackoffExponential,
-        InitialDelay:    5 * time.Second,
-        MaxDelay:        2 * time.Minute,
-    },
-    bkev1beta1.ClusterScaleFailed: {
-        MaxRetryCount:   5,
-        BackoffStrategy: BackoffLinear,
-        InitialDelay:    10 * time.Second,
-        MaxDelay:        5 * time.Minute,
-    },
-    bkev1beta1.ClusterDeployAddonFailed: {
-        MaxRetryCount:   10,
-        BackoffStrategy: BackoffLinear,
-        InitialDelay:    5 * time.Second,
-        MaxDelay:        2 * time.Minute,
-    },
-    bkev1beta1.ClusterManageFailed: {
-        MaxRetryCount:   10,
-        BackoffStrategy: BackoffLinear,
-        InitialDelay:    5 * time.Second,
-        MaxDelay:        2 * time.Minute,
-    },
-    bkev1beta1.ClusterDeleteFailed: {
-        MaxRetryCount:   3,
-        BackoffStrategy: BackoffExponential,
-        InitialDelay:    30 * time.Second,
-        MaxDelay:        10 * time.Minute,
-    },
-    bkev1beta1.ClusterPauseFailed: {
-        MaxRetryCount:   5,
-        BackoffStrategy: BackoffLinear,
-        InitialDelay:    5 * time.Second,
-        MaxDelay:        1 * time.Minute,
-    },
-    bkev1beta1.ClusterDryRunFailed: {
-        MaxRetryCount:   5,
-        BackoffStrategy: BackoffLinear,
-        InitialDelay:    5 * time.Second,
-        MaxDelay:        1 * time.Minute,
-    },
-}
-
-// GetRetryPolicy 获取指定 ClusterStatus 的重试策略
-func GetRetryPolicy(status bkev1beta1.ClusterStatus) RetryPolicy {
-    if policy, ok := ClusterStatusRetryPolicies[status]; ok {
-        return policy
-    }
-    return DefaultRetryPolicy
-}
-
-// StatusRecordV2 改进的状态记录
-type StatusRecordV2 struct {
-    CurrentClusterState bkev1beta1.ClusterStatus // 改为 ClusterStatus，不再使用 ClusterHealthState
+// StatusRecordV3 简化后的状态记录
+type StatusRecordV3 struct {
+    // 基本信息
+    CurrentClusterState bkev1beta1.ClusterStatus
     LatestFailedState   string
     LatestNormalState   string
-    StatusCount         int32 // 使用 int32 支持原子操作
+    
+    // 重试计数（供 Engine 查询）
+    StatusCount         int32
+    
+    // 控制信息
     NeedRequeue         bool
-    RetryPolicy         RetryPolicy  // 重试策略
-    LastUpdateTime      time.Time    // 最后更新时间
-    ExpireTime          time.Time    // 过期时间
+    
+    // 时间信息
+    LastUpdateTime      time.Time
+    ExpireTime          time.Time
 }
 
-// NewStatusRecordV2 创建状态记录
-func NewStatusRecordV2(status bkev1beta1.ClusterStatus) *StatusRecordV2 {
-    return &StatusRecordV2{
-        RetryPolicy:    GetRetryPolicy(status),
+// NewStatusRecordV3 创建状态记录
+func NewStatusRecordV3() *StatusRecordV3 {
+    return &StatusRecordV3{
         LastUpdateTime: time.Now(),
         ExpireTime:     time.Now().Add(24 * time.Hour),
     }
 }
 
-func (r *StatusRecordV2) Inc() {
+// Inc 增加重试计数（原子操作）
+func (r *StatusRecordV3) Inc() {
     atomic.AddInt32(&r.StatusCount, 1)
 }
 
-func (r *StatusRecordV2) Reset() {
+// Reset 重置状态记录
+func (r *StatusRecordV3) Reset() {
     r.StatusCount = 0
     r.LatestFailedState = ""
 }
 
-func (r *StatusRecordV2) Equal(state string) bool {
+// Equal 检查是否与指定状态相同
+func (r *StatusRecordV3) Equal(state string) bool {
     return r.LatestFailedState == state
-}
-
-func (r *StatusRecordV2) AllowFailed() bool {
-    return int(r.StatusCount) <= r.RetryPolicy.MaxRetryCount
-}
-
-func (r *StatusRecordV2) SetLatestFailedState(state string) {
-    r.LatestFailedState = state
-}
-
-func (r *StatusRecordV2) SetLatestNormalState(state string) {
-    r.LatestNormalState = state
-}
-
-func (r *StatusRecordV2) SetCurrentClusterState(state bkev1beta1.ClusterStatus) {
-    r.CurrentClusterState = state
 }
 ```
 
-#### 完整替换文件：`pkg/statusmanage/statusmanager.go`
+**删除的字段**：
+- `RetryPolicy`（由 Engine 管理）
+
+##### StatusManagerV3
 
 ```go
-package statusmanage
-
-import (
-    "os"
-    "strconv"
-    "strings"
-    "sync"
-    "sync/atomic"
-    "time"
-
-    ctrl "sigs.k8s.io/controller-runtime"
-
-    confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
-    bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
-    "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
-    "gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
-    "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/annotation"
-    "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/condition"
-    "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
-)
-
-const DefaultAllowedFailedCount = 10
-
-var (
-    ReconcileAllowedFailedCount int
-    BKEClusterStatusManager     = NewStatusManagerV2()
-    statusLogger                = log.With("name", "statusManager")
-)
-
-func init() {
-    env, b := os.LookupEnv("ALLOWED_FAILED_COUNT")
-    if b {
-        envAllowed, err := strconv.Atoi(env)
-        if err != nil {
-            ReconcileAllowedFailedCount = DefaultAllowedFailedCount
-        } else {
-            ReconcileAllowedFailedCount = envAllowed
-        }
-    } else {
-        ReconcileAllowedFailedCount = DefaultAllowedFailedCount
-    }
-    statusLogger.Infof("ReconcileAllowedFailedCount: %d", ReconcileAllowedFailedCount)
-}
-
-// StatusManagerV2 改进的状态管理器
-type StatusManagerV2 struct {
+// StatusManagerV3 简化后的状态管理器
+type StatusManagerV3 struct {
     cmux sync.RWMutex
     nmux sync.RWMutex
 
-    BKEClusterStatusMap map[string]*StatusRecordV2
-    BKENodesStatusMap   map[string]map[string]*StatusRecordV2
+    BKEClusterStatusMap map[string]*StatusRecordV3
+    BKENodesStatusMap   map[string]map[string]*StatusRecordV3
 
     cleaner *StatusCleaner
 }
 
-// StatusCleaner 状态清理器
-type StatusCleaner struct {
-    cleanupInterval time.Duration
-    manager         *StatusManagerV2
-    stopCh          chan struct{}
-}
-
-// NewStatusManagerV2 创建状态管理器
-func NewStatusManagerV2() *StatusManagerV2 {
-    sm := &StatusManagerV2{
-        BKEClusterStatusMap: map[string]*StatusRecordV2{},
-        BKENodesStatusMap:   map[string]map[string]*StatusRecordV2{},
+// NewStatusManagerV3 创建状态管理器
+func NewStatusManagerV3() *StatusManagerV3 {
+    sm := &StatusManagerV3{
+        BKEClusterStatusMap: map[string]*StatusRecordV3{},
+        BKENodesStatusMap:   map[string]map[string]*StatusRecordV3{},
     }
     sm.cleaner = &StatusCleaner{
         cleanupInterval: 1 * time.Hour,
@@ -4294,95 +3452,25 @@ func NewStatusManagerV2() *StatusManagerV2 {
     go sm.cleaner.Start()
     return sm
 }
+```
 
-// Start 启动清理器
-func (c *StatusCleaner) Start() {
-    ticker := time.NewTicker(c.cleanupInterval)
-    defer ticker.Stop()
-    for {
-        select {
-        case <-ticker.C:
-            c.cleanupExpiredRecords()
-        case <-c.stopCh:
-            return
-        }
-    }
-}
+#### 4.3.2 核心方法实现
 
-func (c *StatusCleaner) cleanupExpiredRecords() {
-    now := time.Now()
+##### SetStatus（入口方法）
 
-    c.manager.cmux.Lock()
-    for key, record := range c.manager.BKEClusterStatusMap {
-        if now.After(record.ExpireTime) {
-            delete(c.manager.BKEClusterStatusMap, key)
-        }
-    }
-    c.manager.cmux.Unlock()
-
-    c.manager.nmux.Lock()
-    for key, nodesMap := range c.manager.BKENodesStatusMap {
-        for nodeIP, record := range nodesMap {
-            if now.After(record.ExpireTime) {
-                delete(nodesMap, nodeIP)
-            }
-        }
-        if len(nodesMap) == 0 {
-            delete(c.manager.BKENodesStatusMap, key)
-        }
-    }
-    c.manager.nmux.Unlock()
-}
-
+```go
 // SetStatus 记录集群和节点状态（接口签名不变）
-func (b *StatusManagerV2) SetStatus(bkeCluster *bkev1beta1.BKECluster, bkeNodes bkev1beta1.BKENodes) {
+func (b *StatusManagerV3) SetStatus(bkeCluster *bkev1beta1.BKECluster, bkeNodes bkev1beta1.BKENodes) {
     b.recordBKEClusterStatus(bkeCluster)
     b.recordBKENodesStatus(bkeCluster, bkeNodes)
 }
+```
 
-// RemoveClusterStatusManagerCache 清理集群和节点缓存
-func (b *StatusManagerV2) RemoveClusterStatusManagerCache(bkeCluster *bkev1beta1.BKECluster) {
-    b.RemoveBKEClusterStatusCache(bkeCluster)
-    b.RemoveNodesStatusCache(bkeCluster)
-}
+##### recordBKEClusterStatus（简化版）
 
-// GetCtrlResult 获取控制结果（接口签名不变）
-func (b *StatusManagerV2) GetCtrlResult(bkeCluster *bkev1beta1.BKECluster) ctrl.Result {
-    if bkeCluster.Status.ClusterStatus == bkev1beta1.ClusterPaused {
-        return ctrl.Result{}
-    }
-
-    b.cmux.RLock()
-    defer b.cmux.RUnlock()
-
-    key := utils.ClientObjNS(bkeCluster)
-    sr := b.BKEClusterStatusMap[key]
-
-    if sr == nil {
-        return ctrl.Result{}
-    }
-
-    return ctrl.Result{Requeue: sr.NeedRequeue}
-}
-
-// GetNodesResult 获取节点结果（接口签名不变）
-func (b *StatusManagerV2) GetNodesResult(bkeCluster *bkev1beta1.BKECluster, nodeIP string) bool {
-    b.nmux.RLock()
-    defer b.nmux.RUnlock()
-
-    key := utils.ClientObjNS(bkeCluster)
-
-    if sr, ok := b.BKENodesStatusMap[key]; ok {
-        if sr[nodeIP] == nil {
-            return true
-        }
-        return sr[nodeIP].NeedRequeue
-    }
-
-    return true
-}
-
-func (b *StatusManagerV2) recordBKEClusterStatus(bkeCluster *bkev1beta1.BKECluster) {
+```go
+// recordBKEClusterStatus 记录集群状态（简化版，删除状态伪装逻辑）
+func (b *StatusManagerV3) recordBKEClusterStatus(bkeCluster *bkev1beta1.BKECluster) {
     if _, ok := annotation.HasAnnotation(bkeCluster, annotation.StatusRecordAnnotationKey); !ok {
         return
     }
@@ -4409,7 +3497,7 @@ func (b *StatusManagerV2) recordBKEClusterStatus(bkeCluster *bkev1beta1.BKEClust
     }()
 
     if sr == nil {
-        sr = NewStatusRecordV2(bkeCluster.Status.ClusterStatus)
+        sr = NewStatusRecordV3()
         b.BKEClusterStatusMap[key] = sr
     }
 
@@ -4422,14 +3510,14 @@ func (b *StatusManagerV2) recordBKEClusterStatus(bkeCluster *bkev1beta1.BKEClust
         return
     }
 
-    // 使用 ClusterStatus 替代 ClusterHealthState
-    sr.SetCurrentClusterState(bkeCluster.Status.ClusterStatus)
+    // 使用 ClusterStatus
+    sr.CurrentClusterState = bkeCluster.Status.ClusterStatus
 
     failedState := strings.HasSuffix(state, "Failed")
 
     // 正常的状态
     if !failedState {
-        sr.SetLatestNormalState(state)
+        sr.LatestNormalState = state
         sr.NeedRequeue = false
         return
     }
@@ -4440,75 +3528,25 @@ func (b *StatusManagerV2) recordBKEClusterStatus(bkeCluster *bkev1beta1.BKEClust
         log.Debugf("(cluster) Equal latest FailedState %s, count inc to %d", state, sr.StatusCount)
     } else {
         sr.Reset()
-        sr.SetLatestFailedState(state)
-        // 更新重试策略
-        sr.RetryPolicy = GetRetryPolicy(bkeCluster.Status.ClusterStatus)
+        sr.LatestFailedState = state
         atomic.AddInt32(&sr.StatusCount, 1)
         log.Infof("(cluster) Refresh latest FailedState %s", state)
     }
 
-    // 状态伪装：恢复到 LatestNormalState
-    if sr.AllowFailed() {
-        bkeCluster.Status.ClusterStatus = confv1beta1.ClusterStatus(sr.LatestNormalState)
-        sr.NeedRequeue = true
-        return
-    }
-
-    // 超过重试次数，设置最终失败状态
-    log.Infof("(cluster) The failedStatus %s occur more than %d times, not allow to retry",
-        sr.LatestFailedState, sr.RetryPolicy.MaxRetryCount)
-
-    // 覆盖全部 8 种 Failed 状态（原实现只处理 3 种）
-    if sr.CurrentClusterState != bkev1beta1.ClusterUnhealthy &&
-        sr.CurrentClusterState != bkev1beta1.ClusterReady {
-        msg := ""
-        switch sr.CurrentClusterState {
-        case bkev1beta1.ClusterDeployingAddon:
-            bkeCluster.Status.ClusterStatus = bkev1beta1.ClusterDeployAddonFailed
-            msg = string(bkev1beta1.ClusterDeployAddonFailed)
-        case bkev1beta1.ClusterUpgrading:
-            bkeCluster.Status.ClusterStatus = bkev1beta1.ClusterUpgradeFailed
-            msg = string(bkev1beta1.ClusterUpgradeFailed)
-        case bkev1beta1.ClusterManaging:
-            bkeCluster.Status.ClusterStatus = bkev1beta1.ClusterManageFailed
-            msg = string(bkev1beta1.ClusterManageFailed)
-        case bkev1beta1.ClusterMasterScalingUp, bkev1beta1.ClusterMasterScalingDown,
-            bkev1beta1.ClusterWorkerScalingUp, bkev1beta1.ClusterWorkerScalingDown:
-            bkeCluster.Status.ClusterStatus = bkev1beta1.ClusterScaleFailed
-            msg = string(bkev1beta1.ClusterScaleFailed)
-        case bkev1beta1.ClusterDeleting:
-            bkeCluster.Status.ClusterStatus = bkev1beta1.ClusterDeleteFailed
-            msg = string(bkev1beta1.ClusterDeleteFailed)
-        case bkev1beta1.ClusterPaused:
-            bkeCluster.Status.ClusterStatus = bkev1beta1.ClusterPauseFailed
-            msg = string(bkev1beta1.ClusterPauseFailed)
-        case bkev1beta1.ClusterDryRun:
-            bkeCluster.Status.ClusterStatus = bkev1beta1.ClusterDryRunFailed
-            msg = string(bkev1beta1.ClusterDryRunFailed)
-        case bkev1beta1.ClusterChecking:
-            bkeCluster.Status.ClusterStatus = bkev1beta1.ClusterUnhealthy
-            msg = string(bkev1beta1.ClusterUnhealthy)
-        }
-        v, ok := condition.HasCondition(bkev1beta1.ClusterHealthyStateCondition, bkeCluster)
-        if ok && v != nil {
-            condition.ConditionMark(bkeCluster, v.Type, confv1beta1.ConditionFalse, v.Reason, msg)
-        }
-    }
-
-    sr.Reset()
-    sr.NeedRequeue = false
+    // 删除状态伪装逻辑：由 Engine 统一管理
+    // 只记录状态和重试计数，不修改 bkeCluster.Status.ClusterStatus
+    sr.NeedRequeue = true
 }
+```
 
-func (b *StatusManagerV2) RemoveBKEClusterStatusCache(bkeCluster *bkev1beta1.BKECluster) {
-    b.cmux.Lock()
-    defer b.cmux.Unlock()
-    log := statusLogger.With("bkeCluster", utils.ClientObjNS(bkeCluster))
-    key := utils.ClientObjNS(bkeCluster)
-    delete(b.BKEClusterStatusMap, key)
-    log.Infof("cluster %s status already removed from status manager cache", key)
-}
+**删除的逻辑**：
+- 状态伪装：恢复到 LatestNormalState（约 10 行）
+- 超过重试次数，设置最终失败状态（约 40 行）
 
-func (b *StatusManagerV2) recordBKENodesStatus(bkeCluster *bkev1beta1.BKECluster, bkeNodes bkev1beta1.BKENodes) {
+##### recordBKENodesStatus（保留）
+
+```go
+func (b *StatusManagerV3) recordBKENodesStatus(bkeCluster *bkev1beta1.BKECluster, bkeNodes bkev1beta1.BKENodes) {
     if bkeNodes == nil || len(bkeNodes) == 0 {
         return
     }
@@ -4522,7 +3560,7 @@ func (b *StatusManagerV2) recordBKENodesStatus(bkeCluster *bkev1beta1.BKECluster
     nodesStatusMap := b.BKENodesStatusMap[key]
 
     if nodesStatusMap == nil {
-        nodesStatusMap = map[string]*StatusRecordV2{}
+        nodesStatusMap = map[string]*StatusRecordV3{}
         b.BKENodesStatusMap[key] = nodesStatusMap
     }
 
@@ -4530,18 +3568,13 @@ func (b *StatusManagerV2) recordBKENodesStatus(bkeCluster *bkev1beta1.BKECluster
         b.recordSingleNodeState(&bkeNodes[i], nodesStatusMap, bkeNodes, log)
     }
 }
+```
 
-func (b *StatusManagerV2) RemoveNodesStatusCache(bkeCluster *bkev1beta1.BKECluster) {
-    b.nmux.Lock()
-    defer b.nmux.Unlock()
-    log := statusLogger.With("bkeCluster", utils.ClientObjNS(bkeCluster))
-    key := utils.ClientObjNS(bkeCluster)
-    delete(b.BKENodesStatusMap, key)
-    log.Infof("cluster %s nodes status already removed from status manager cache", key)
-}
+##### recordSingleNodeState（简化版）
 
-func (b *StatusManagerV2) recordSingleNodeState(
-    bkeNode *confv1beta1.BKENode, nodesStatusMap map[string]*StatusRecordV2,
+```go
+func (b *StatusManagerV3) recordSingleNodeState(
+    bkeNode *confv1beta1.BKENode, nodesStatusMap map[string]*StatusRecordV3,
     bkeNodes bkev1beta1.BKENodes, log *log.Logger,
 ) {
     nodeIP := bkeNode.Spec.IP
@@ -4570,7 +3603,7 @@ func (b *StatusManagerV2) recordSingleNodeState(
     }()
 
     if sr == nil {
-        sr = NewStatusRecordV2(bkev1beta1.ClusterStatus(state))
+        sr = NewStatusRecordV3()
         nodesStatusMap[nodeIP] = sr
     }
 
@@ -4578,7 +3611,7 @@ func (b *StatusManagerV2) recordSingleNodeState(
 
     // 正常的状态
     if !failedState {
-        sr.SetLatestNormalState(state)
+        sr.LatestNormalState = state
         return
     }
 
@@ -4589,29 +3622,201 @@ func (b *StatusManagerV2) recordSingleNodeState(
             phaseutil.NodeInfo(bkeNode.ToNode()), state, sr.StatusCount)
     } else {
         sr.Reset()
-        sr.SetLatestFailedState(state)
+        sr.LatestFailedState = state
         atomic.AddInt32(&sr.StatusCount, 1)
         log.Infof("(node %s) Refresh latest FailedState %s",
             phaseutil.NodeInfo(bkeNode.ToNode()), state)
     }
 
-    // 状态伪装
-    if sr.AllowFailed() {
-        bkeNodes.SetNodeState(nodeIP, confv1beta1.NodeState(sr.LatestNormalState))
-        sr.NeedRequeue = true
-        return
+    // 删除状态伪装逻辑：由 Engine 统一管理
+    // 只记录状态和重试计数，不修改节点状态
+    sr.NeedRequeue = true
+}
+```
+
+##### GetCtrlResult（保留）
+
+```go
+// GetCtrlResult 获取控制结果（接口签名不变）
+func (b *StatusManagerV3) GetCtrlResult(bkeCluster *bkev1beta1.BKECluster) ctrl.Result {
+    if bkeCluster.Status.ClusterStatus == bkev1beta1.ClusterPaused {
+        return ctrl.Result{}
     }
 
-    // 超过重试次数
-    log.Infof("(node %s) The failedStatus %s occur more than %d times, not allow to retry",
-        phaseutil.NodeInfo(bkeNode.ToNode()), sr.LatestFailedState, sr.RetryPolicy.MaxRetryCount)
-    sr.Reset()
-    sr.NeedRequeue = false
-    bkeNodes.SetNodeState(nodeIP, confv1beta1.NodeState(state))
-    bkeNodes.MarkNodeStateFlag(nodeIP, bkev1beta1.NodeFailedFlag)
+    b.cmux.RLock()
+    defer b.cmux.RUnlock()
+
+    key := utils.ClientObjNS(bkeCluster)
+    sr := b.BKEClusterStatusMap[key]
+
+    if sr == nil {
+        return ctrl.Result{}
+    }
+
+    return ctrl.Result{Requeue: sr.NeedRequeue}
+}
+```
+
+##### GetNodesResult（保留）
+
+```go
+// GetNodesResult 获取节点结果（接口签名不变）
+func (b *StatusManagerV3) GetNodesResult(bkeCluster *bkev1beta1.BKECluster, nodeIP string) bool {
+    b.nmux.RLock()
+    defer b.nmux.RUnlock()
+
+    key := utils.ClientObjNS(bkeCluster)
+
+    if sr, ok := b.BKENodesStatusMap[key]; ok {
+        if sr[nodeIP] == nil {
+            return true
+        }
+        return sr[nodeIP].NeedRequeue
+    }
+
+    return true
+}
+```
+
+#### 4.3.3 新增查询方法（供 Engine 使用）
+
+##### GetRetryCount
+
+```go
+// GetRetryCount 获取重试计数（供 Engine 查询）
+func (b *StatusManagerV3) GetRetryCount(cluster *bkev1beta1.BKECluster) int32 {
+    b.cmux.RLock()
+    defer b.cmux.RUnlock()
+
+    key := utils.ClientObjNS(cluster)
+    sr := b.BKEClusterStatusMap[key]
+    if sr == nil {
+        return 0
+    }
+    return sr.StatusCount
+}
+```
+
+##### GetLatestNormalState
+
+```go
+// GetLatestNormalState 获取最后正常状态（供 Engine 查询）
+func (b *StatusManagerV3) GetLatestNormalState(cluster *bkev1beta1.BKECluster) string {
+    b.cmux.RLock()
+    defer b.cmux.RUnlock()
+
+    key := utils.ClientObjNS(cluster)
+    sr := b.BKEClusterStatusMap[key]
+    if sr == nil {
+        return ""
+    }
+    return sr.LatestNormalState
+}
+```
+
+##### ResetRetryCount
+
+```go
+// ResetRetryCount 重置重试计数（Engine 在状态转换成功后调用）
+func (b *StatusManagerV3) ResetRetryCount(cluster *bkev1beta1.BKECluster) {
+    b.cmux.Lock()
+    defer b.cmux.Unlock()
+
+    key := utils.ClientObjNS(cluster)
+    sr := b.BKEClusterStatusMap[key]
+    if sr != nil {
+        sr.StatusCount = 0
+    }
+}
+```
+
+#### 4.3.4 内存清理机制
+
+##### StatusCleaner
+
+```go
+// StatusCleaner 状态清理器
+type StatusCleaner struct {
+    cleanupInterval time.Duration
+    manager         *StatusManagerV3
+    stopCh          chan struct{}
 }
 
-func (b *StatusManagerV2) RemoveSingleNodeStatusCache(bkeCluster *bkev1beta1.BKECluster, nodeIP string) {
+// Start 启动清理器
+func (c *StatusCleaner) Start() {
+    ticker := time.NewTicker(c.cleanupInterval)
+    defer ticker.Stop()
+    for {
+        select {
+        case <-ticker.C:
+            c.cleanupExpiredRecords()
+        case <-c.stopCh:
+            return
+        }
+    }
+}
+```
+
+##### cleanupExpiredRecords
+
+```go
+func (c *StatusCleaner) cleanupExpiredRecords() {
+    now := time.Now()
+
+    c.manager.cmux.Lock()
+    for key, record := range c.manager.BKEClusterStatusMap {
+        if now.After(record.ExpireTime) {
+            delete(c.manager.BKEClusterStatusMap, key)
+        }
+    }
+    c.manager.cmux.Unlock()
+
+    c.manager.nmux.Lock()
+    for key, nodesMap := range c.manager.BKENodesStatusMap {
+        for nodeIP, record := range nodesMap {
+            if now.After(record.ExpireTime) {
+                delete(nodesMap, nodeIP)
+            }
+        }
+        if len(nodesMap) == 0 {
+            delete(c.manager.BKENodesStatusMap, key)
+        }
+    }
+    c.manager.nmux.Unlock()
+}
+```
+
+#### 4.3.5 缓存清理方法
+
+```go
+// RemoveClusterStatusManagerCache 清理集群和节点缓存
+func (b *StatusManagerV3) RemoveClusterStatusManagerCache(bkeCluster *bkev1beta1.BKECluster) {
+    b.RemoveBKEClusterStatusCache(bkeCluster)
+    b.RemoveNodesStatusCache(bkeCluster)
+}
+
+// RemoveBKEClusterStatusCache 清理集群缓存
+func (b *StatusManagerV3) RemoveBKEClusterStatusCache(bkeCluster *bkev1beta1.BKECluster) {
+    b.cmux.Lock()
+    defer b.cmux.Unlock()
+    log := statusLogger.With("bkeCluster", utils.ClientObjNS(bkeCluster))
+    key := utils.ClientObjNS(bkeCluster)
+    delete(b.BKEClusterStatusMap, key)
+    log.Infof("cluster %s status already removed from status manager cache", key)
+}
+
+// RemoveNodesStatusCache 清理节点缓存
+func (b *StatusManagerV3) RemoveNodesStatusCache(bkeCluster *bkev1beta1.BKECluster) {
+    b.nmux.Lock()
+    defer b.nmux.Unlock()
+    log := statusLogger.With("bkeCluster", utils.ClientObjNS(bkeCluster))
+    key := utils.ClientObjNS(bkeCluster)
+    delete(b.BKENodesStatusMap, key)
+    log.Infof("cluster %s nodes status already removed from status manager cache", key)
+}
+
+// RemoveSingleNodeStatusCache 清理单个节点缓存
+func (b *StatusManagerV3) RemoveSingleNodeStatusCache(bkeCluster *bkev1beta1.BKECluster, nodeIP string) {
     b.nmux.Lock()
     defer b.nmux.Unlock()
 
@@ -4626,148 +3831,66 @@ func (b *StatusManagerV2) RemoveSingleNodeStatusCache(bkeCluster *bkev1beta1.BKE
 }
 ```
 
-#### 原代码 vs 新代码关键差异
+#### 4.3.6 与原代码的关键差异
 
-| 维度 | 原代码 (`StatusManager`) | 新代码 (`StatusManagerV2`) |
-| ------ | ------------------------- | --------------------------- |
-| **状态记录类型** | `StatusRecord`（int 计数器） | `StatusRecordV2`（int32 原子计数器） |
-| **当前状态字段** | `ClusterHealthState` | `ClusterStatus` |
-| **重试策略** | 全局固定 `ReconcileAllowedFailedCount=10` | 按 `ClusterStatus` 索引，支持不同策略 |
-| **退避策略** | 无 | 支持 None/Linear/Exponential |
-| **内存泄漏** | 无清理机制 | `StatusCleaner` 自动清理过期记录 |
-| **过期时间** | 无 | 24 小时自动过期 |
-| **Failed 覆盖** | 3 种（Deploy/Upgrade/Manage） | 全部 8 种 |
-| **并发安全** | `int` 非原子操作 | `int32` + `atomic.AddInt32` |
-| **全局变量** | `BKEClusterStatusManager = NewStatusManager()` | `BKEClusterStatusManager = NewStatusManagerV2()` |
+| 维度 | 原代码 (`StatusManagerV2`) | 新代码 (`StatusManagerV3`) |
+|------|---------------------------|---------------------------|
+| **状态记录类型** | `StatusRecordV2`（含 RetryPolicy） | `StatusRecordV3`（删除 RetryPolicy） |
+| **重试策略** | 按 `ClusterStatus` 索引，支持不同策略 | 由 Engine 统一管理 |
+| **状态伪装** | StatusManager 负责伪装 | 由 Engine 统一管理 |
+| **退避策略** | 支持 None/Linear/Exponential | 由 Engine 统一管理 |
+| **内存泄漏** | `StatusCleaner` 自动清理过期记录 | 保留 |
+| **过期时间** | 24 小时自动过期 | 保留 |
+| **并发安全** | `int32` + `atomic.AddInt32` | 保留 |
+| **代码行数** | 约 600 行 | 约 400 行（减少约 200 行） |
 
-#### 替换入口（唯一需要修改的代码）
-
-由于 `StatusManagerV2` 保持了所有公开方法的签名不变，替换只需要修改 **一行代码**：
-
-**文件：`pkg/statusmanage/statusmanager.go`**
-
-```go
-// 原代码（第 36 行）：
-var BKEClusterStatusManager = NewStatusManager()
-
-// 新代码：
-var BKEClusterStatusManager = NewStatusManagerV2()
-```
-
-> **关键结论**：所有 8 个调用点零修改，替换只需修改全局变量初始化的一行代码。
-
-#### 完整变更清单
-
-**1. 全局变量替换**
-
-| 变更项 | 原代码 | 新代码 | 文件 |
-| -------- | -------- | -------- | ------ |
-| 全局单例 | `BKEClusterStatusManager = NewStatusManager()` | `BKEClusterStatusManager = NewStatusManagerV2()` | `statusmanager.go:36` |
-| 全局常量 | `DefaultAllowedFailedCount = 10` | 保留（向后兼容） | `statusmanager.go` |
-| 全局变量 | `ReconcileAllowedFailedCount int` | 保留（向后兼容） | `statusmanager.go` |
-
-**2. 类型定义替换**
-
-| 变更项 | 原代码 | 新代码 | 文件 |
-| -------- | -------- | -------- | ------ |
-| 状态记录类型 | `StatusRecord` | `StatusRecordV2` | `staterecords.go` |
-| 状态记录字段 | `CurrentClusterState ClusterHealthState` | `CurrentClusterState ClusterStatus` | `staterecords.go` |
-| 计数器类型 | `StatusCount int` | `StatusCount int32` | `staterecords.go` |
-| 新增字段 | 无 | `RetryPolicy`, `LastUpdateTime`, `ExpireTime` | `staterecords.go` |
-| 新增类型 | 无 | `RetryPolicy`, `BackoffType` | `staterecords.go` |
-| 新增配置 | 无 | `ClusterStatusRetryPolicies` | `staterecords.go` |
-
-**3. 方法签名对比（全部公开方法）**
-
-| 方法 | V1 签名 | V2 签名 | 变更 |
-| ------ | --------- | --------- | ------ |
-| `SetStatus` | `SetStatus(*BKECluster, BKENodes)` | `SetStatus(*BKECluster, BKENodes)` | **签名不变，内部逻辑变** |
-| `GetCtrlResult` | `GetCtrlResult(*BKECluster) ctrl.Result` | `GetCtrlResult(*BKECluster) ctrl.Result` | **签名不变，内部逻辑变** |
-| `GetNodesResult` | `GetNodesResult(*BKECluster, string) bool` | `GetNodesResult(*BKECluster, string) bool` | **签名不变** |
-| `RemoveClusterStatusManagerCache` | `RemoveClusterStatusManagerCache(*BKECluster)` | `RemoveClusterStatusManagerCache(*BKECluster)` | **签名不变** |
-| `RemoveBKEClusterStatusCache` | `RemoveBKEClusterStatusCache(*BKECluster)` | `RemoveBKEClusterStatusCache(*BKECluster)` | **签名不变** |
-| `RemoveNodesStatusCache` | `RemoveNodesStatusCache(*BKECluster)` | `RemoveNodesStatusCache(*BKECluster)` | **签名不变** |
-| `RemoveSingleNodeStatusCache` | `RemoveSingleNodeStatusCache(*BKECluster, string)` | `RemoveSingleNodeStatusCache(*BKECluster, string)` | **签名不变** |
-
-**4. 内部逻辑变更（SetStatus 方法）**
-
-```
-V1 内部逻辑：
-  SetStatus()
-    → recordBKEClusterStatus()
-      → sr.SetCurrentClusterState(bkeCluster.Status.ClusterHealthState)  // ← 使用 ClusterHealthState
-      → if sr.AllowFailed():
-          → bkeCluster.Status.ClusterStatus = ClusterStatus(sr.LatestNormalState)
-      → else:
-          → switch sr.CurrentClusterState:  // ← 只覆盖 3 种 Failed
-              → case Deploying: ClusterHealthState = DeployFailed
-              → case Upgrading: ClusterHealthState = UpgradeFailed
-              → case Managing: ClusterHealthState = ManageFailed
-              → default: // 空！
-
-V2 内部逻辑：
-  SetStatus()
-    → recordBKEClusterStatus()
-      → sr.SetCurrentClusterState(bkeCluster.Status.ClusterStatus)  // ← 使用 ClusterStatus
-      → sr.RetryPolicy = GetRetryPolicy(status)  // ← 按状态获取重试策略
-      → if sr.AllowFailed():
-          → bkeCluster.Status.ClusterStatus = ClusterStatus(sr.LatestNormalState)
-      → else:
-          → switch sr.CurrentClusterState:  // ← 覆盖全部 8 种 Failed
-              → case ClusterDeployingAddon: ClusterStatus = ClusterDeployAddonFailed
-              → case ClusterUpgrading: ClusterStatus = ClusterUpgradeFailed
-              → case ClusterManaging: ClusterStatus = ClusterManageFailed
-              → case ClusterMasterScalingUp/Down, ClusterWorkerScalingUp/Down: ClusterStatus = ClusterScaleFailed
-              → case ClusterDeleting: ClusterStatus = ClusterDeleteFailed
-              → case ClusterPaused: ClusterStatus = ClusterPauseFailed
-              → case ClusterDryRun: ClusterStatus = ClusterDryRunFailed
-              → case ClusterChecking: ClusterStatus = ClusterUnhealthy
-```
-
-**5. 新增组件**
-
-| 新增组件 | 说明 | 影响 |
-| --------- | ------ | ------ |
-| `StatusCleaner` | 定时清理过期记录 | 解决内存泄漏 |
-| `ClusterStatusRetryPolicies` | 按状态索引的重试策略 | 灵活重试 |
-| `calculateBackoff()` | 退避时间计算 | 智能退避 |
-| `atomic.AddInt32` | 原子计数器操作 | 并发安全 |
-
-#### 调用方变更清单（完整版）
-
-| 文件 | 行号 | 调用的方法 | 变更说明 |
-| ------ | ------ | ----------- | --------- |
-| `mergecluster/bkecluster.go` | 435 | `BKEClusterStatusManager.SetStatus(...)` | **不变**（签名兼容） |
-| `bkecluster_controller.go` | 287 | `BKEClusterStatusManager.GetCtrlResult(...)` | **不变**（签名兼容） |
-| `bkecluster_controller.go` | 714 | `BKEClusterStatusManager.RemoveClusterStatusManagerCache(...)` | **不变** |
-| `bkecluster_controller.go` | 734 | `BKEClusterStatusManager.RemoveSingleNodeStatusCache(...)` | **不变** |
-| `ensure_worker_delete.go` | 668 | `BKEClusterStatusManager.RemoveSingleNodeStatusCache(...)` | **不变** |
-| `ensure_master_delete.go` | 357 | `BKEClusterStatusManager.RemoveSingleNodeStatusCache(...)` | **不变** |
-| `ensure_delete_or_reset.go` | 369 | `BKEClusterStatusManager.RemoveBKEClusterStatusCache(...)` | **不变** |
-| `common.go` | 86 | `BKEClusterStatusManager.RemoveSingleNodeStatusCache(...)` | **不变** |
-
-#### 实施步骤
+#### 4.3.7 实施步骤
 
 ```
 步骤 1: 替换 staterecords.go
-  ├── 保留 StatusRecord（标记 Deprecated）
-  ├── 新增 StatusRecordV2
-  ├── 新增 RetryPolicy, BackoffType
-  ├── 新增 ClusterStatusRetryPolicies
-  └── 新增 GetRetryPolicy()
+  ├── 保留 StatusRecordV2（标记 Deprecated）
+  ├── 新增 StatusRecordV3（删除 RetryPolicy 字段）
+  └── 删除 ClusterStatusRetryPolicies 配置
 
 步骤 2: 替换 statusmanager.go
-  ├── 保留 StatusManager（标记 Deprecated）
-  ├── 新增 StatusManagerV2
-  ├── 新增 StatusCleaner
-  ├── 修改 BKEClusterStatusManager = NewStatusManagerV2()
+  ├── 保留 StatusManagerV2（标记 Deprecated）
+  ├── 新增 StatusManagerV3
+  ├── 删除状态伪装逻辑
+  ├── 新增 GetRetryCount/GetLatestNormalState/ResetRetryCount 方法
+  ├── 修改 BKEClusterStatusManager = NewStatusManagerV3()
   └── 保留所有公开方法签名
 
-步骤 3: 验证
+步骤 3: Engine 集成
+  ├── 在 Engine 中添加 clusterRetryPolicies 配置
+  ├── 在 Engine 中添加 handleRetry 方法
+  └── 在 Engine 的 Transition 方法中集成状态伪装逻辑
+
+步骤 4: 验证
   ├── 运行所有现有测试
   ├── 验证 8 个调用点零修改
+  ├── 验证重试计数正确性
   └── 验证内存泄漏修复
 ```
+
+#### 4.3.8 优势与风险
+
+**优势**：
+
+| 优势 | 说明 |
+|------|------|
+| **职责清晰** | StatusManager 只负责状态记录和重试计数，Engine 负责状态转换和重试策略 |
+| **代码简化** | 删除约 200 行代码（重试策略配置 + 状态伪装逻辑） |
+| **易于维护** | 重试策略集中在 Engine 中，便于统一管理 |
+| **向后兼容** | 保持所有公开方法签名不变，8 个调用点零修改 |
+| **内存清理** | 保留 StatusCleaner 自动清理过期记录 |
+
+**风险**：
+
+| 风险 | 缓解措施 |
+|------|---------|
+| **Engine 复杂度增加** | Engine 需要管理重试策略，但这是合理的职责扩展 |
+| **状态伪装逻辑变更** | 需要充分测试，确保重试行为与原来一致 |
+| **接口变更** | 新增的查询方法需要确保线程安全 |
 
 ### 4.4 增强方案三：状态转换事件系统（适配单字段设计）
 
