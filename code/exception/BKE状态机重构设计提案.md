@@ -495,7 +495,7 @@ default:
 业界最佳实践（如 OpenShift CVO、Cluster API）和 BKE 自身演进方向均指向统一的三层生命周期状态机模型：
 
 ```
-集群层（Cluster Lifecycle）：Pending → Installing → Running → Upgrading → Scaling → RollingBack → Deleting → Deleted → Failed
+集群层（Cluster Lifecycle）：Pending → Installing → Running → Upgrading → Scaling → Managing → RollingBack → Deleting → Deleted → Failed
 节点层（Node Lifecycle）：Pending → Provisioned → Ready → Upgrading → RollingBack → Deleting → Deleted → Failed
 组件层（Component Lifecycle）：Pending → Installing → Installed → Upgrading → RollingBack → Deleting → Deleted → Failed
 ```
@@ -4716,8 +4716,8 @@ func (r *StateMachineEventRecorder) exportDotGraph(events []StateTransitionEvent
 │  │  用户操作 → 集群状态 → 节点状态 → 组件状态                           │   │
 │  │                                                                     │   │
 │  │  决定：LifecyclePhase（生命周期阶段）                                │   │
-│  │  - Pending, Installing, Running, Upgrading, Scaling, RollingBack,  │   │
-│  │    Deleting, Deleted, Failed                                       │   │
+│  │  - Pending, Installing, Running, Upgrading, Scaling, Managing,       │   │
+│  │    RollingBack, Deleting, Deleted, Failed                            │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                              │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
@@ -4741,9 +4741,9 @@ func (r *StateMachineEventRecorder) exportDotGraph(events []StateTransitionEvent
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                    集群层 (Cluster Lifecycle) - 9 个状态                      │
-│  Pending → Installing → Running → Upgrading → Scaling → RollingBack →      │
-│  Deleting → Deleted → Failed                                               │
+│                    集群层 (Cluster Lifecycle) - 10 个状态                     │
+│  Pending → Installing → Running → Upgrading → Scaling → Managing →         │
+│  RollingBack → Deleting → Deleted → Failed                                 │
 └─────────────────────────────────────────────────────────────────────────────┘
                                      │ 聚合
                                      ▼
@@ -4768,7 +4768,7 @@ func (r *StateMachineEventRecorder) exportDotGraph(events []StateTransitionEvent
 | `ClusterStatus` 单一数据源 | 集群层 LifecyclePhase | 确立单一数据源原则，为集群层投影奠定基础 |
 | 状态转换表引擎（64 条规则） | 三层状态机引擎 | 集中管理状态转换规则，为三层引擎设计奠定基础 |
 | StatusManagerV2 分层重试 | OperationProgress + 人工介入 | 按状态索引重试策略，为操作进度追踪奠定基础 |
-| `MapToLifecyclePhase` 映射函数 | 兼容性映射（目标架构 → 旧字段） | 22 个 ClusterStatus 归约为 9 个 LifecyclePhase |
+| `MapToLifecyclePhase` 映射函数 | 兼容性映射（目标架构 → 旧字段） | 22 个 ClusterStatus 归约为 10 个 LifecyclePhase |
 | 事件系统 | HealthStatus 聚合器 | 状态转换事件记录，为健康状态聚合奠定基础 |
 
 #### 4.5.4 演进路径（面向目标架构的四层演进）
@@ -4922,7 +4922,7 @@ func (r *StateMachineEventRecorder) exportDotGraph(events []StateTransitionEvent
 **混合模型远景**：
 
 - **驱动模型（自上而下）**：决定集群"正在做什么"（LifecyclePhase）
-  - 集群层：Pending → Installing → Running → Upgrading → Scaling → RollingBack → Deleting → Deleted → Failed
+  - 集群层：Pending → Installing → Running → Upgrading → Scaling → Managing → RollingBack → Deleting → Deleted → Failed
   - 节点层：Pending → Provisioned → Ready → Upgrading → RollingBack → Deleting → Deleted → Failed
   - 组件层：Pending → Installing → Installed → Upgrading → RollingBack → Deleting → Deleted → Failed
 - **聚合模型（自底向上）**：决定集群"健康状况如何"（HealthStatus）
@@ -4933,7 +4933,7 @@ func (r *StateMachineEventRecorder) exportDotGraph(events []StateTransitionEvent
 
 | 提案组件 | 目标组件 | 演进成本 | 说明 |
 |---------|---------|---------|------|
-| ClusterStatus（22 个值） | LifecyclePhase（9 个值） | 低 | MapToLifecyclePhase 映射函数已存在 |
+| ClusterStatus（22 个值） | LifecyclePhase（10 个值） | 低 | MapToLifecyclePhase 映射函数已存在 |
 | 状态转换表引擎（64 条规则） | 三层状态机引擎 | 中 | 需扩展节点层/组件层转换规则 |
 | StatusManagerV2 | OperationProgress | 低 | 添加操作追踪字段即可 |
 | 事件系统 | HealthStatus 聚合器 | 中 | 需实现健康聚合逻辑 |
@@ -5017,15 +5017,16 @@ func calculatingClusterPostStatusByPhase(phase phaseframe.Phase, err error) erro
 
 **1. ClusterStatus → LifecyclePhase 映射**
 
-本提案的 `MapToLifecyclePhase` 函数将 22 个 ClusterStatus 值归约为 9 个 LifecyclePhase 值，为目标架构的兼容性映射奠定基础：
+本提案的 `MapToLifecyclePhase` 函数将 22 个 ClusterStatus 值归约为 10 个 LifecyclePhase 值，为目标架构的兼容性映射奠定基础：
 
-| ClusterStatus（22 个值） | LifecyclePhase（9 个值） | 说明 |
+| ClusterStatus（22 个值） | LifecyclePhase（10 个值） | 说明 |
 |-------------------------|-------------------------|------|
 | ClusterUnknown, ClusterChecking | Pending | 等待/检查状态 |
-| ClusterInitializing, ClusterMasterScalingUp, ClusterWorkerScalingUp, ClusterManaging | Installing | 安装/扩容/纳管状态 |
+| ClusterInitializing, ClusterMasterScalingUp, ClusterWorkerScalingUp | Installing | 安装/扩容状态 |
 | ClusterReady | Running | 运行状态 |
 | ClusterUpgrading | Upgrading | 升级状态 |
 | ClusterMasterScalingDown, ClusterWorkerScalingDown | Scaling | 缩容状态 |
+| ClusterManaging | Managing | 纳管状态 |
 | ClusterPaused | Running | 暂停状态（目标架构中暂停通过注解实现，不属于生命周期阶段） |
 | ClusterDeleting | Deleting | 删除状态 |
 | ClusterDeleted | Deleted | 已删除状态 |
@@ -5389,7 +5390,7 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 | 维度 | 本方案（渐进式重构） | 混合模型远景 |
 | ------ | ------------------- | ------------------------------------------ |
 | **定位** | 面向当下，解决现有问题 | 面向未来，目标架构 |
-| **状态模型** | ClusterStatus 单一字段（22 个值） | LifecyclePhase（9 个值）+ HealthStatus（4 个级别） |
+| **状态模型** | ClusterStatus 单一字段（22 个值） | LifecyclePhase（10 个值）+ HealthStatus（4 个级别） |
 | **架构模型** | 单层（集群层） | 混合模型（驱动模型 + 聚合模型，三层状态机） |
 | **迁移方式** | 标记 Deprecated，自动同步 | Feature Gate + 双写 + 兼容性映射 |
 | **时间线** | 立即实施（19-27 天） | 18 个月（分四阶段演进） |
@@ -5479,7 +5480,7 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 | **ClusterStatus** | Cluster Status | 集群操作状态，重构后的单一数据源，包含 22 个枚举值 | 所有状态管理场景 |
 | **ClusterHealthState** | Cluster Health State | 集群健康状态（Deprecated），包含 9 个枚举值，将被 ClusterStatus 替代 | 向后兼容场景 |
 | **Phase** | Phase | 集群阶段（Deprecated），包含 12 个枚举值，将被 ClusterStatus 替代 | 向后兼容场景 |
-| **LifecyclePhase** | Lifecycle Phase | 统一生命周期状态，面向三层状态机架构的演进目标，包含 9 个枚举值（Pending/Installing/Running/Upgrading/Scaling/RollingBack/Deleting/Deleted/Failed） | 三层状态机架构 |
+| **LifecyclePhase** | Lifecycle Phase | 统一生命周期状态，面向三层状态机架构的演进目标，包含 10 个枚举值（Pending/Installing/Running/Upgrading/Scaling/Managing/RollingBack/Deleting/Deleted/Failed） | 三层状态机架构 |
 
 #### 状态管理机制
 
