@@ -13,6 +13,8 @@
    - [1.4 组件类型区分](#14-组件类型区分)
 2. [集群层状态机：BKEClusterLifecycle](#2-集群层状态机bkeclusterlifecycle)
    - [2.1 状态定义](#21-状态定义)
+     - [2.1.1 正常工作状态的语义说明](#211-正常工作状态的语义说明)
+     - [2.1.2 Scaling 状态设计思路](#212-scaling-状态设计思路)
    - [2.2 驱动规则](#22-驱动规则)
    - [2.3 状态转换图](#23-状态转换图)
    - [2.4 操作进度追踪](#24-操作进度追踪)
@@ -34,7 +36,13 @@
    - [6.3 升级场景](#63-升级场景)
    - [6.4 回滚场景](#64-回滚场景)
    - [6.5 扩容场景](#65-扩容场景)
+     - [6.5.1 Master 扩容场景](#651-master-扩容场景)
+     - [6.5.2 Worker 扩容场景](#652-worker-扩容场景)
+     - [6.5.3 同时扩容 Master 和 Worker](#653-同时扩容-master-和-worker)
    - [6.6 缩容场景](#66-缩容场景)
+     - [6.6.1 Master 缩容场景](#661-master-缩容场景)
+     - [6.6.2 Worker 缩容场景](#662-worker-缩容场景)
+     - [6.6.3 同时缩容 Master 和 Worker](#663-同时缩容-master-和-worker)
 7. [重试与幂等性](#7-重试与幂等性)
 8. [详细设计](#8-详细设计)
    - [8.1 兼容性分析](#81-兼容性分析)
@@ -175,6 +183,85 @@ const (
 - 集群是一个**运行的系统**，使用 Running
 - 节点是一个**就绪的资源**，使用 Ready
 - 组件是一个**安装的单元**，使用 Installed
+
+#### 2.1.2 Scaling 状态设计思路
+
+**设计决策**：`Scaling` 状态保持单一状态，不细分为 `MasterScaling` 和 `WorkerScaling`。
+
+**设计理由**：
+
+1. **符合 v3 状态机设计理念**：
+   - v3 状态机强调"状态表示正在做什么"（生命周期阶段），细节通过 `OperationProgress` 等字段表达
+   - 这与 v2 的细分状态设计理念不同，v2 倾向于将每个操作类型都映射为独立状态
+   - v3 通过单一状态 + 详细字段的方式，保持状态机的简洁性
+
+2. **状态机简洁性**：
+   - 避免过多的状态，降低状态机的复杂度
+   - 减少状态转换的数量，降低状态转换规则的复杂性
+   - 使状态机更易于理解和维护
+
+3. **灵活性和扩展性**：
+   - 通过 `OperationProgress.CurrentStage` 可以灵活表达扩容/缩容的方向
+   - 通过 `ScaleDetails` 字段可以提供更详细的扩缩容信息（Master 节点数、Worker 节点数等）
+   - 如果未来需要支持更多类型的扩缩容（如 GPU 节点扩缩容），单一 Scaling 状态更容易扩展
+
+4. **与现有系统的兼容性**：
+   - 现有系统有 4 个细分状态：`ClusterMasterScalingUp`、`ClusterMasterScalingDown`、`ClusterWorkerScalingUp`、`ClusterWorkerScalingDown`
+   - 在兼容性映射设计中，将这 4 个状态统一映射到 v3 的 `Scaling` 状态
+   - 通过 `ScaleDetails` 字段保留详细信息，确保迁移过程中不丢失信息
+
+**扩缩容详情字段设计**：
+
+```go
+type ScaleDetails struct {
+    // Master 节点变更数量（正数表示扩容，负数表示缩容）
+    MasterNodesDelta int `json:"masterNodesDelta,omitempty"`
+    
+    // Worker 节点变更数量（正数表示扩容，负数表示缩容）
+    WorkerNodesDelta int `json:"workerNodesDelta,omitempty"`
+    
+    // 扩缩容方向（"Up" 或 "Down"）
+    Direction string `json:"direction"`
+    
+    // 当前阶段（"ScalingMasterNodes" / "ScalingWorkerNodes" / "ScalingBoth"）
+    CurrentStage string `json:"currentStage,omitempty"`
+}
+```
+
+**使用场景示例**：
+
+| 场景 | Scaling 状态 | ScaleDetails |
+|------|-------------|--------------|
+| Master 扩容 3 个节点 | `Scaling` | `{MasterNodesDelta: 3, Direction: "Up", CurrentStage: "ScalingMasterNodes"}` |
+| Worker 缩容 2 个节点 | `Scaling` | `{WorkerNodesDelta: -2, Direction: "Down", CurrentStage: "ScalingWorkerNodes"}` |
+| 同时扩容 Master 和 Worker | `Scaling` | `{MasterNodesDelta: 1, WorkerNodesDelta: 5, Direction: "Up", CurrentStage: "ScalingBoth"}` |
+
+**兼容性映射**：
+
+```go
+func mapToV3LifecyclePhase(oldStatus confv1beta1.ClusterStatus) string {
+    switch oldStatus {
+    case confv1beta1.ClusterMasterScalingUp,
+         confv1beta1.ClusterMasterScalingDown,
+         confv1beta1.ClusterWorkerScalingUp,
+         confv1beta1.ClusterWorkerScalingDown:
+        return confv1beta1.ClusterLifecycleScaling
+    // ...
+    }
+}
+```
+
+**查询扩缩容详情**：
+
+```bash
+# 查询当前扩缩容状态
+kubectl get bkecluster my-cluster -o jsonpath='{.status.lifecyclePhase}'
+# 输出: Scaling
+
+# 查询扩缩容详情
+kubectl get bkecluster my-cluster -o jsonpath='{.status.operationProgress.scaleDetails}'
+# 输出: {"masterNodesDelta": 3, "direction": "Up", "currentStage": "ScalingMasterNodes"}
+```
 
 ### 2.2 驱动规则
 
@@ -472,6 +559,24 @@ type OperationProgress struct {
     
     // 是否需要人工介入
     NeedsManualIntervention bool `json:"needsManualIntervention,omitempty"`
+    
+    // 扩缩容详情（仅当 OperationType = Scale 时使用）
+    ScaleDetails *ScaleDetails `json:"scaleDetails,omitempty"`
+}
+
+// ScaleDetails 扩缩容详情
+type ScaleDetails struct {
+    // Master 节点变更数量（正数表示扩容，负数表示缩容）
+    MasterNodesDelta int `json:"masterNodesDelta,omitempty"`
+    
+    // Worker 节点变更数量（正数表示扩容，负数表示缩容）
+    WorkerNodesDelta int `json:"workerNodesDelta,omitempty"`
+    
+    // 扩缩容方向（"Up" 或 "Down"）
+    Direction string `json:"direction"`
+    
+    // 当前阶段（"ScalingMasterNodes" / "ScalingWorkerNodes" / "ScalingBoth"）
+    CurrentStage string `json:"currentStage,omitempty"`
 }
 
 type OperationType string
@@ -487,14 +592,17 @@ const (
 
 **使用场景**：
 
-| 场景 | OperationType | CurrentStage |
-|------|---------------|--------------|
-| 集群安装 | `Install` | `InstallingNodeComponents` / `InstallingClusterComponents` |
-| 集群纳管 | `Manage` | `ValidatingConnection` / `InstallingComponents` / `RunningHealthCheck` |
-| 集群升级 | `Upgrade` | `UpgradingNodeComponents` / `UpgradingClusterComponents` |
-| 集群扩容 | `Scale` | `ScalingUp` |
-| 集群缩容 | `Scale` | `ScalingDown` |
-| 集群回滚 | `Rollback` | `RollingBackNodeComponents` / `RollingBackClusterComponents` |
+| 场景 | OperationType | CurrentStage | ScaleDetails |
+|------|---------------|--------------|--------------|
+| 集群安装 | `Install` | `InstallingNodeComponents` / `InstallingClusterComponents` | - |
+| 集群纳管 | `Manage` | `ValidatingConnection` / `InstallingComponents` / `RunningHealthCheck` | - |
+| 集群升级 | `Upgrade` | `UpgradingNodeComponents` / `UpgradingClusterComponents` | - |
+| Master 扩容 | `Scale` | `ScalingUp` | `{MasterNodesDelta: 3, Direction: "Up", CurrentStage: "ScalingMasterNodes"}` |
+| Worker 扩容 | `Scale` | `ScalingUp` | `{WorkerNodesDelta: 5, Direction: "Up", CurrentStage: "ScalingWorkerNodes"}` |
+| Master 缩容 | `Scale` | `ScalingDown` | `{MasterNodesDelta: -2, Direction: "Down", CurrentStage: "ScalingMasterNodes"}` |
+| Worker 缩容 | `Scale` | `ScalingDown` | `{WorkerNodesDelta: -3, Direction: "Down", CurrentStage: "ScalingWorkerNodes"}` |
+| 同时扩容 | `Scale` | `ScalingUp` | `{MasterNodesDelta: 1, WorkerNodesDelta: 5, Direction: "Up", CurrentStage: "ScalingBoth"}` |
+| 集群回滚 | `Rollback` | `RollingBackNodeComponents` / `RollingBackClusterComponents` | - |
 
 ---
 
@@ -1605,20 +1713,69 @@ T4: 集群级组件回滚完成
 
 ### 6.5 扩容场景
 
+#### 6.5.1 Master 扩容场景
+
 **状态转换时序**：
 
 ```
-T0: 用户触发扩容
+T0: 用户触发 Master 扩容（3 个节点）
     LifecyclePhase = Scaling
     OperationProgress = {Type: Scale, StartedAt: now}
+    OperationProgress.ScaleDetails = {MasterNodesDelta: 3, Direction: "Up", CurrentStage: "ScalingMasterNodes"}
+    HealthStatus = Healthy（扩容前）
+
+T1: 新 Master 节点加入
+    LifecyclePhase = Scaling（不变）
+    OperationProgress.CurrentStage = "ScalingMasterNodes"
+    OperationProgress.ScaleDetails.MasterNodesDelta = 3
+    HealthStatus = Degraded（新节点未就绪）
+
+T2: 新 Master 节点就绪
+    LifecyclePhase = Running
+    OperationProgress.FinishedAt = now
+    HealthStatus = Healthy（扩容后）
+```
+
+#### 6.5.2 Worker 扩容场景
+
+**状态转换时序**：
+
+```
+T0: 用户触发 Worker 扩容（5 个节点）
+    LifecyclePhase = Scaling
+    OperationProgress = {Type: Scale, StartedAt: now}
+    OperationProgress.ScaleDetails = {WorkerNodesDelta: 5, Direction: "Up", CurrentStage: "ScalingWorkerNodes"}
+    HealthStatus = Healthy（扩容前）
+
+T1: 新 Worker 节点加入
+    LifecyclePhase = Scaling（不变）
+    OperationProgress.CurrentStage = "ScalingWorkerNodes"
+    OperationProgress.ScaleDetails.WorkerNodesDelta = 5
+    HealthStatus = Degraded（新节点未就绪）
+
+T2: 新 Worker 节点就绪
+    LifecyclePhase = Running
+    OperationProgress.FinishedAt = now
+    HealthStatus = Healthy（扩容后）
+```
+
+#### 6.5.3 同时扩容 Master 和 Worker
+
+**状态转换时序**：
+
+```
+T0: 用户触发同时扩容（1 个 Master + 5 个 Worker）
+    LifecyclePhase = Scaling
+    OperationProgress = {Type: Scale, StartedAt: now}
+    OperationProgress.ScaleDetails = {MasterNodesDelta: 1, WorkerNodesDelta: 5, Direction: "Up", CurrentStage: "ScalingBoth"}
     HealthStatus = Healthy（扩容前）
 
 T1: 新节点加入
     LifecyclePhase = Scaling（不变）
-    OperationProgress.CurrentStage = "ScalingUp"
+    OperationProgress.CurrentStage = "ScalingBoth"
     HealthStatus = Degraded（新节点未就绪）
 
-T2: 新节点就绪
+T2: 所有新节点就绪
     LifecyclePhase = Running
     OperationProgress.FinishedAt = now
     HealthStatus = Healthy（扩容后）
@@ -1626,20 +1783,69 @@ T2: 新节点就绪
 
 ### 6.6 缩容场景
 
+#### 6.6.1 Master 缩容场景
+
 **状态转换时序**：
 
 ```
-T0: 用户触发缩容
+T0: 用户触发 Master 缩容（2 个节点）
     LifecyclePhase = Scaling
     OperationProgress = {Type: Scale, StartedAt: now}
+    OperationProgress.ScaleDetails = {MasterNodesDelta: -2, Direction: "Down", CurrentStage: "ScalingMasterNodes"}
+    HealthStatus = Healthy（缩容前）
+
+T1: Master 节点标记删除
+    LifecyclePhase = Scaling（不变）
+    OperationProgress.CurrentStage = "ScalingMasterNodes"
+    OperationProgress.ScaleDetails.MasterNodesDelta = -2
+    HealthStatus = Degraded（节点删除中）
+
+T2: Master 节点删除完成
+    LifecyclePhase = Running
+    OperationProgress.FinishedAt = now
+    HealthStatus = Healthy（缩容后）
+```
+
+#### 6.6.2 Worker 缩容场景
+
+**状态转换时序**：
+
+```
+T0: 用户触发 Worker 缩容（3 个节点）
+    LifecyclePhase = Scaling
+    OperationProgress = {Type: Scale, StartedAt: now}
+    OperationProgress.ScaleDetails = {WorkerNodesDelta: -3, Direction: "Down", CurrentStage: "ScalingWorkerNodes"}
+    HealthStatus = Healthy（缩容前）
+
+T1: Worker 节点标记删除
+    LifecyclePhase = Scaling（不变）
+    OperationProgress.CurrentStage = "ScalingWorkerNodes"
+    OperationProgress.ScaleDetails.WorkerNodesDelta = -3
+    HealthStatus = Degraded（节点删除中）
+
+T2: Worker 节点删除完成
+    LifecyclePhase = Running
+    OperationProgress.FinishedAt = now
+    HealthStatus = Healthy（缩容后）
+```
+
+#### 6.6.3 同时缩容 Master 和 Worker
+
+**状态转换时序**：
+
+```
+T0: 用户触发同时缩容（1 个 Master + 3 个 Worker）
+    LifecyclePhase = Scaling
+    OperationProgress = {Type: Scale, StartedAt: now}
+    OperationProgress.ScaleDetails = {MasterNodesDelta: -1, WorkerNodesDelta: -3, Direction: "Down", CurrentStage: "ScalingBoth"}
     HealthStatus = Healthy（缩容前）
 
 T1: 节点标记删除
     LifecyclePhase = Scaling（不变）
-    OperationProgress.CurrentStage = "ScalingDown"
+    OperationProgress.CurrentStage = "ScalingBoth"
     HealthStatus = Degraded（节点删除中）
 
-T2: 节点删除完成
+T2: 所有节点删除完成
     LifecyclePhase = Running
     OperationProgress.FinishedAt = now
     HealthStatus = Healthy（缩容后）
