@@ -1033,6 +1033,7 @@ stateDiagram-v2
     
     Failed --> Installing : 重试
     Failed --> Upgrading : 重试
+    Failed --> RollingBack : 重试
     Failed --> Deleting : 重试
 ```
 
@@ -2184,5 +2185,5 @@ func TestNodeRecoveryFromComponentInstallFailed(t *testing.T) {
 
 ---
 
-**文档版本**: v3.12 (混合模型 - 添加正常工作状态语义说明)  
+**文档版本**: v3.13 (混合模型 - 组件层添加 Failed->RollingBack 转换)  
 **维护者**: openFuyao Team
