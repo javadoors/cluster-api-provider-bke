@@ -3057,23 +3057,273 @@ func countNodesByRole(cluster *bkev1beta1.BKECluster, role string) int {
 
 #### StatusManager 与 Engine 协作
 
-StatusManager 的"状态伪装"逻辑（失败 10 次内恢复到 LatestNormalState）应整合到 Engine 的 `Retry` trigger 中：
+##### 职责划分
+
+| 职责 | 负责组件 | 说明 |
+|------|---------|------|
+| **状态记录** | StatusManager | 记录集群和节点的状态变化 |
+| **重试计数** | StatusManager | 记录失败状态的连续出现次数（StatusCount） |
+| **内存清理** | StatusManager | 定期清理过期的状态记录 |
+| **控制结果** | StatusManager | 提供 GetCtrlResult 方法，决定是否需要 Requeue |
+| **节点状态管理** | StatusManager | 管理 BKENodesStatusMap |
+| **状态转换** | Engine | 根据当前状态和 Trigger，查找匹配的转换规则 |
+| **条件检查** | Engine | 执行 Condition 函数，判断是否满足转换条件 |
+| **重试策略** | Engine | 根据 ClusterStatus 提供不同的重试策略 |
+| **状态伪装** | Engine | 在重试次数内，将 Failed 状态伪装为 LatestNormalState |
+| **LastInProgressState** | Engine | 错误转换时记录失败前的进行中状态 |
+
+##### 简化后的 StatusManager 设计
+
+**StatusManagerV3 结构体**：
 
 ```go
-// Engine 内部处理 Retry trigger
-func (e *Engine) handleRetry(cluster *BKECluster, trigger string) error {
-    sr := e.statusManager.GetRecord(cluster)
-    if sr.StatusCount < sr.RetryPolicy.MaxRetryCount {
-        // 找到从当前 Failed 状态出发的 Retry 规则
-        // 例如: ClusterUpgradeFailed → ClusterUpgrading (trigger="Retry")
-        return e.applyTransition(cluster, retryTransition)
-    }
-    // 超过重试次数，保持 Failed 状态
-    return nil
+// StatusManagerV3 简化后的状态管理器
+type StatusManagerV3 struct {
+    cmux sync.RWMutex
+    nmux sync.RWMutex
+
+    BKEClusterStatusMap map[string]*StatusRecordV3
+    BKENodesStatusMap   map[string]map[string]*StatusRecordV3
+
+    cleaner *StatusCleaner
+}
+
+// StatusRecordV3 简化后的状态记录
+type StatusRecordV3 struct {
+    // 基本信息
+    CurrentClusterState bkev1beta1.ClusterStatus
+    LatestFailedState   string
+    LatestNormalState   string
+    
+    // 重试计数（供 Engine 查询）
+    StatusCount         int32
+    
+    // 控制信息
+    NeedRequeue         bool
+    
+    // 时间信息
+    LastUpdateTime      time.Time
+    ExpireTime          time.Time
 }
 ```
 
-这样 `statusmanager.go:196-216` 的状态回退逻辑也可以删除，由 Engine 统一管理。
+**删除的字段**：
+- `RetryPolicy`（由 Engine 管理）
+
+##### 核心方法变更
+
+**新增查询方法（供 Engine 使用）**：
+
+```go
+// GetRetryCount 获取重试计数（供 Engine 查询）
+func (b *StatusManagerV3) GetRetryCount(cluster *bkev1beta1.BKECluster) int32 {
+    b.cmux.RLock()
+    defer b.cmux.RUnlock()
+
+    key := utils.ClientObjNS(cluster)
+    sr := b.BKEClusterStatusMap[key]
+    if sr == nil {
+        return 0
+    }
+    return sr.StatusCount
+}
+
+// GetLatestNormalState 获取最后正常状态（供 Engine 查询）
+func (b *StatusManagerV3) GetLatestNormalState(cluster *bkev1beta1.BKECluster) string {
+    b.cmux.RLock()
+    defer b.cmux.RUnlock()
+
+    key := utils.ClientObjNS(cluster)
+    sr := b.BKEClusterStatusMap[key]
+    if sr == nil {
+        return ""
+    }
+    return sr.LatestNormalState
+}
+
+// ResetRetryCount 重置重试计数（Engine 在状态转换成功后调用）
+func (b *StatusManagerV3) ResetRetryCount(cluster *bkev1beta1.BKECluster) {
+    b.cmux.Lock()
+    defer b.cmux.Unlock()
+
+    key := utils.ClientObjNS(cluster)
+    sr := b.BKEClusterStatusMap[key]
+    if sr != nil {
+        sr.StatusCount = 0
+    }
+}
+```
+
+##### Engine 与 StatusManager 协作
+
+**Engine 处理 Retry trigger**：
+
+```go
+func (e *Engine) handleRetry(cluster *bkev1beta1.BKECluster, trigger string) error {
+    // 1. 获取重试计数
+    retryCount := e.statusManager.GetRetryCount(cluster)
+    
+    // 2. 获取重试策略（从 Engine 内部配置）
+    policy := e.getRetryPolicy(cluster.Status.ClusterStatus)
+    
+    // 3. 判断是否允许重试
+    if retryCount >= policy.MaxRetryCount {
+        // 超过重试次数，保持 Failed 状态
+        return nil
+    }
+    
+    // 4. 找到从当前 Failed 状态出发的 Retry 规则
+    // 例如: ClusterUpgradeFailed → ClusterUpgrading (trigger="Retry")
+    retryTransition := e.findRetryTransition(cluster.Status.ClusterStatus)
+    if retryTransition == nil {
+        return nil
+    }
+    
+    // 5. 执行状态转换
+    return e.applyTransition(cluster, retryTransition)
+}
+```
+
+**Engine 内部重试策略配置**：
+
+```go
+// Engine 内部重试策略配置
+var clusterRetryPolicies = map[bkev1beta1.ClusterStatus]RetryPolicy{
+    bkev1beta1.ClusterInitializationFailed: {
+        MaxRetryCount:   5,
+        BackoffStrategy: BackoffExponential,
+        InitialDelay:    10 * time.Second,
+        MaxDelay:        5 * time.Minute,
+    },
+    bkev1beta1.ClusterUpgradeFailed: {
+        MaxRetryCount:   10,
+        BackoffStrategy: BackoffExponential,
+        InitialDelay:    5 * time.Second,
+        MaxDelay:        2 * time.Minute,
+    },
+    bkev1beta1.ClusterScaleFailed: {
+        MaxRetryCount:   5,
+        BackoffStrategy: BackoffLinear,
+        InitialDelay:    10 * time.Second,
+        MaxDelay:        5 * time.Minute,
+    },
+    bkev1beta1.ClusterDeployAddonFailed: {
+        MaxRetryCount:   10,
+        BackoffStrategy: BackoffLinear,
+        InitialDelay:    5 * time.Second,
+        MaxDelay:        2 * time.Minute,
+    },
+    bkev1beta1.ClusterManageFailed: {
+        MaxRetryCount:   10,
+        BackoffStrategy: BackoffLinear,
+        InitialDelay:    5 * time.Second,
+        MaxDelay:        2 * time.Minute,
+    },
+    bkev1beta1.ClusterDeleteFailed: {
+        MaxRetryCount:   3,
+        BackoffStrategy: BackoffExponential,
+        InitialDelay:    30 * time.Second,
+        MaxDelay:        10 * time.Minute,
+    },
+    bkev1beta1.ClusterPauseFailed: {
+        MaxRetryCount:   5,
+        BackoffStrategy: BackoffLinear,
+        InitialDelay:    5 * time.Second,
+        MaxDelay:        1 * time.Minute,
+    },
+    bkev1beta1.ClusterDryRunFailed: {
+        MaxRetryCount:   5,
+        BackoffStrategy: BackoffLinear,
+        InitialDelay:    5 * time.Second,
+        MaxDelay:        1 * time.Minute,
+    },
+}
+```
+
+##### 删除的代码
+
+**1. 删除 ClusterStatusRetryPolicies 配置**（约 100 行）：
+
+```go
+// 删除以下配置
+var ClusterStatusRetryPolicies = map[bkev1beta1.ClusterStatus]RetryPolicy{
+    bkev1beta1.ClusterInitializationFailed: {...},
+    bkev1beta1.ClusterUpgradeFailed: {...},
+    // ... 其他状态
+}
+
+// 删除以下方法
+func GetRetryPolicy(status bkev1beta1.ClusterStatus) RetryPolicy {
+    // ...
+}
+```
+
+**2. 删除状态伪装逻辑**（约 50 行）：
+
+```go
+// 删除以下逻辑
+// 状态伪装：恢复到 LatestNormalState
+if sr.AllowFailed() {
+    bkeCluster.Status.ClusterStatus = confv1beta1.ClusterStatus(sr.LatestNormalState)
+    sr.NeedRequeue = true
+    return
+}
+
+// 超过重试次数，设置最终失败状态
+if sr.CurrentClusterState != bkev1beta1.ClusterUnhealthy &&
+    sr.CurrentClusterState != bkev1beta1.ClusterReady {
+    // ... 8 种 Failed 状态的 switch 语句
+}
+```
+
+##### 实施步骤
+
+```
+步骤 1 (1天): 简化 StatusManager
+  ├── 删除 ClusterStatusRetryPolicies 配置
+  ├── 删除 GetRetryPolicy 方法
+  ├── 删除状态伪装逻辑
+  ├── 删除最终失败状态设置逻辑
+  └── 新增 GetRetryCount/GetLatestNormalState/ResetRetryCount 方法
+
+步骤 2 (1天): Engine 集成重试策略
+  ├── 在 Engine 中添加 clusterRetryPolicies 配置
+  ├── 在 Engine 中添加 getRetryPolicy 方法
+  ├── 在 Engine 中添加 handleRetry 方法
+  └── 在 Engine 的 Transition 方法中集成 handleRetry
+
+步骤 3 (1天): 集成测试
+  ├── 测试重试计数正确性
+  ├── 测试重试策略生效
+  ├── 测试状态伪装由 Engine 处理
+  └── 测试超过重试次数后保持 Failed 状态
+
+步骤 4 (1天): 回归测试
+  ├── 集群创建全流程
+  ├── 升级流程
+  ├── 扩缩容流程
+  ├── 删除流程
+  └── 失败重试流程
+```
+
+##### 优势与风险
+
+**优势**：
+
+| 优势 | 说明 |
+|------|------|
+| **职责清晰** | StatusManager 只负责状态记录和重试计数，Engine 负责状态转换和重试策略 |
+| **代码简化** | 删除约 150 行代码（重试策略配置 + 状态伪装逻辑） |
+| **易于维护** | 重试策略集中在 Engine 中，便于统一管理 |
+| **向后兼容** | 保持现有接口不变，降低迁移风险 |
+
+**风险**：
+
+| 风险 | 缓解措施 |
+|------|---------|
+| **Engine 复杂度增加** | Engine 需要管理重试策略，但这是合理的职责扩展 |
+| **状态伪装逻辑变更** | 需要充分测试，确保重试行为与原来一致 |
+| **接口变更** | 新增的查询方法需要确保线程安全 |
 
 #### 重构实施步骤
 
