@@ -114,7 +114,7 @@ func handleClusterScaleMasterUpPhase(ctx *PhaseContext, err error) {
 
 通过对代码库的全面搜索，梳理出所有状态转换逻辑的分布位置：
 
-###### 1. 核心状态转换函数（phase_flow.go）
+##### 1. 核心状态转换函数（phase_flow.go）
 
 **文件**: `pkg/phaseframe/phases/phase_flow.go`
 
@@ -137,7 +137,7 @@ func handleClusterScaleMasterUpPhase(ctx *PhaseContext, err error) {
 
 **总计**: 11个状态转换处理函数
 
-###### 2. 状态管理器（statusmanager.go）
+##### 2. 状态管理器（statusmanager.go）
 
 **文件**: `pkg/statusmanage/statusmanager.go`
 
@@ -155,7 +155,7 @@ func handleClusterScaleMasterUpPhase(ctx *PhaseContext, err error) {
 - 状态回退：失败时回退到 LatestNormalState
 - 超过重试次数后设置 ClusterHealthState
 
-###### 3. 集群健康状态转换（ensure_cluster.go）
+##### 3. 集群健康状态转换（ensure_cluster.go）
 
 **文件**: `pkg/phaseframe/phases/ensure_cluster.go`
 
@@ -165,9 +165,9 @@ func handleClusterScaleMasterUpPhase(ctx *PhaseContext, err error) {
 | 373 | 健康检查失败 | → Unhealthy | 集群不健康 |
 | 399 | 健康检查成功 | → Healthy | 集群健康 |
 
-###### 4. 其他控制器中的状态转换
+##### 4. 其他控制器中的状态转换
 
-###### 4.1 bkecluster_controller.go
+##### 4.1 bkecluster_controller.go
 **文件**: `controllers/capbke/bkecluster_controller.go`
 
 | 行号 | 函数 | 状态转换 | 说明 |
@@ -175,32 +175,32 @@ func handleClusterScaleMasterUpPhase(ctx *PhaseContext, err error) {
 | 199-220 | `handleClusterStatus` | 状态更新 | 控制器状态处理 |
 | 807 | 直接赋值 | ClusterHealthState | 设置健康状态 |
 
-###### 4.2 bkecluster_upgrade_dag.go
+##### 4.2 bkecluster_upgrade_dag.go
 **文件**: `controllers/capbke/bkecluster_upgrade_dag.go`
 
 | 行号 | 位置 | 状态转换 | 说明 |
 |------|------|---------|------|
 | 310 | 升级流程 | ClusterStatus = status | 升级状态设置 |
 
-###### 4.3 ensure_delete_or_reset.go
+##### 4.3 ensure_delete_or_reset.go
 **文件**: `pkg/phaseframe/phases/ensure_delete_or_reset.go`
 
 | 行号 | 位置 | 状态转换 | 说明 |
 |------|------|---------|------|
 | 179 | 删除流程 | → ClusterDeleting | 删除状态设置 |
 
-###### 4.4 context.go
+##### 4.4 context.go
 **文件**: `pkg/phaseframe/context.go`
 
 | 行号 | 位置 | 状态转换 | 说明 |
 |------|------|---------|------|
 | 252 | 上下文处理 | → ClusterDeleting | 删除状态设置 |
 
-###### 5. 状态定义（bkecluster_consts.go）
+##### 5. 状态定义（bkecluster_consts.go）
 
 **文件**: `api/capbke/v1beta1/bkecluster_consts.go`
 
-###### 5.1 ClusterStatus 定义（152-182行）
+##### 5.1 ClusterStatus 定义（152-182行）
 
 ```go
 ClusterReady, ClusterUnhealthy, ClusterUnknown, ClusterChecking
@@ -216,7 +216,7 @@ ClusterManaging, ClusterManageFailed
 ClusterDeleting, ClusterDeleteFailed
 ```
 
-###### 5.2 ClusterHealthState 定义（222-230行）
+##### 5.2 ClusterHealthState 定义（222-230行）
 
 ```go
 Deploying, DeployFailed
@@ -226,7 +226,7 @@ Unhealthy, Healthy
 Deleting
 ```
 
-###### 6. 状态转换逻辑分布统计
+##### 6. 状态转换逻辑分布统计
 
 | 文件 | 状态转换点数量 | 主要职责 |
 | ------ | -------------- | --------- |
@@ -237,7 +237,7 @@ Deleting
 | 其他文件 | 4个 | 特定场景状态设置 |
 | **总计** | **28个** | - |
 
-###### 7. 问题总结
+##### 7. 问题总结
 
 **状态转换逻辑分散的具体表现**:
 
@@ -1883,7 +1883,7 @@ type Transition struct {
 
 ### 4.2.2 状态机引擎实现
 
-###### 设计缺陷分析：err 参数必须影响触发器选择
+#### 设计缺陷分析：err 参数必须影响触发器选择
 
 在原始设计中，`Transition` 方法签名包含 `err error` 参数，但实现中从未使用该参数。这会导致严重问题：
 
@@ -1924,7 +1924,7 @@ func (e *Engine) Transition(cluster *BKECluster, nodes BKENodes, trigger string,
 
 **修复方案**：`err` 应该用于决定 `effectiveTrigger`：当 `err != nil` 时，使用 `"Error"` 作为触发器，匹配转换表中的失败规则。
 
-###### 正确实现
+#### 正确实现
 
 > **注意**：引擎的完整实现代码见 2.2.3 节的 `pkg/phaseframe/statemachine/engine.go` 文件。此处仅说明核心设计要点：
 >
@@ -1933,7 +1933,7 @@ func (e *Engine) Transition(cluster *BKECluster, nodes BKENodes, trigger string,
 > - 支持 `Action` 转换动作：条件满足后执行 `Action`，失败则返回错误
 > - 未找到匹配规则时返回 `nil`（向后兼容），某些 Phase 可能不需要状态转换
 
-###### 修复后的调用行为验证
+#### 修复后的调用行为验证
 
 | 调用场景 | 调用方式 | effectiveTrigger | 匹配规则 | 目标状态 |
 | --------- | --------- | ----------------- | --------- | --------- |
@@ -1966,7 +1966,7 @@ func (e *Engine) Transition(cluster *BKECluster, nodes BKENodes, trigger string,
 
 ### 4.2.3 Transition 替换原有业务逻辑
 
-###### 调用链对比
+#### 调用链对比
 
 **当前代码调用链**：
 
@@ -1994,7 +1994,7 @@ PhaseFlow.Execute()
 
 > **关键设计**：`err` 参数决定 `effectiveTrigger` 的值。当 `err != nil` 时，`effectiveTrigger` 被替换为 `"Error"`，从而匹配转换表中的失败规则（如 `{ClusterUpgrading, ClusterUpgradeFailed, "Error"}`）。这确保了 pre-hook 和 post-hook 的调用虽然使用相同的 `trigger` 参数，但因为 `err` 不同，会匹配到不同的转换规则，实现成功/失败路径的正确分离。
 
-###### 需要重构的代码清单
+#### 需要重构的代码清单
 
 **第一层：直接替换（删除 11 个 handle 函数 + 分发器）**
 
@@ -2015,7 +2015,7 @@ PhaseFlow.Execute()
 | `phase_flow.go` | 301-309 | `calculatingClusterPreStatusByPhase` | **修改**，调用 `engine.Transition(phase, nil)` |
 | `phase_flow.go` | 311-320 | `calculatingClusterPostStatusByPhase` | **修改**，调用 `engine.Transition(phase, err)` |
 
-###### 重构后代码
+#### 重构后代码
 
 **文件：`pkg/phaseframe/phases/phase_flow.go`（重构后）**
 
@@ -2367,7 +2367,7 @@ func calculatingClusterPostStatusByPhase(phase phaseframe.Phase, err error) erro
 | `pkg/phaseframe/statemachine/engine_test.go` | 引擎单元测试 |
 | `pkg/phaseframe/statemachine/transitions_test.go` | 转换表完整性测试 |
 
-###### 新增文件代码
+#### 新增文件代码
 
 **文件：`pkg/phaseframe/statemachine/engine.go`**
 
@@ -2711,7 +2711,7 @@ func TestErrorMappingsCoverage(t *testing.T) {
 | `context.go` | 252 | 直接设置 `ClusterDeleting` | 改为 `engine.Transition("EnsureDeleteOrReset", nil)` |
 | `webhooks/capbke/bkecluster.go` | 174, 646 | 检查 `ClusterHealthState` | 改为检查 `ClusterStatus` |
 
-###### 重构后代码
+#### 重构后代码
 
 **文件：`pkg/statusmanage/statusmanager.go`**
 
@@ -2951,7 +2951,7 @@ if newBKECluster.Status.ClusterStatus == bkev1beta1.ClusterDeployingAddon {
 if newBKECluster.Status.ClusterStatus != bkev1beta1.ClusterReady {
 ```
 
-###### Condition 函数提取
+#### Condition 函数提取
 
 Condition 函数（如 `needUpgrade`、`isClusterReady`）需要从现有代码中提取。当前这些条件隐含在 Phase 的 `NeedExecute()` 方法中。重构时需要：
 
@@ -2977,7 +2977,7 @@ Condition 函数（如 `needUpgrade`、`isClusterReady`）需要从现有代码�
 | `isMasterScaleRetry` | StatusManager | 检查 Master 扩缩容重试条件 |
 | `isWorkerScaleRetry` | StatusManager | 检查 Worker 扩缩容重试条件 |
 
-###### 提取后的代码
+#### 提取后的代码
 
 **文件：`pkg/phaseframe/statemachine/conditions.go`**
 
@@ -3226,7 +3226,7 @@ func countNodesByRole(cluster *bkev1beta1.BKECluster, role string) int {
 }
 ```
 
-###### StatusManager 与 Engine 协作
+#### StatusManager 与 Engine 协作
 
 StatusManager 的"状态伪装"逻辑（失败 10 次内恢复到 LatestNormalState）应整合到 Engine 的 `Retry` trigger 中：
 
@@ -3246,7 +3246,7 @@ func (e *Engine) handleRetry(cluster *BKECluster, trigger string) error {
 
 这样 `statusmanager.go:196-216` 的状态回退逻辑也可以删除，由 Engine 统一管理。
 
-###### 重构实施步骤
+#### 重构实施步骤
 
 ```
 步骤 1 (1天): 新增 statemachine 包
@@ -3914,7 +3914,7 @@ func (b *StatusManagerV2) RemoveSingleNodeStatusCache(bkeCluster *bkev1beta1.BKE
 
 ### 4.3.1 替换原状态管理器的完整设计
 
-###### 设计决策
+#### 设计决策
 
 | 决策项 | 方案 | 理由 |
 | -------- | ------ | ------ |
@@ -3922,7 +3922,7 @@ func (b *StatusManagerV2) RemoveSingleNodeStatusCache(bkeCluster *bkev1beta1.BKE
 | **状态伪装机制** | 使用 `LatestNormalState` | 已验证正确，无需额外信息，Engine 的 Retry 转换对此场景增加复杂度无收益 |
 | **接口兼容性** | 保持所有公开方法签名不变 | 8 个调用点零修改，降低迁移风险 |
 
-###### 状态伪装与 Engine 的协作流程
+#### 状态伪装与 Engine 的协作流程
 
 ```
 PhaseFlow.Execute()
@@ -3944,14 +3944,14 @@ PhaseFlow.Execute()
 
 > **关键设计**：状态伪装使用 `LatestNormalState`，不使用 Engine。原因：ScaleFailed 无法仅从当前状态判断应恢复到哪种 Scaling 状态，而 `LatestNormalState` 已记录正确的恢复目标（进入 Phase 前的状态）。
 
-###### 替换对照表
+#### 替换对照表
 
 | 原文件 | 原行数 | 新文件 | 新行数 | 变更说明 |
 | -------- | ------- | -------- | ------- | --------- |
 | `pkg/statusmanage/staterecords.go` | 55 | `pkg/statusmanage/staterecords.go` | ~80 | StatusRecord→StatusRecordV2，新增 RetryPolicy/ExpireTime/LastUpdateTime |
 | `pkg/statusmanage/statusmanager.go` | 362 | `pkg/statusmanage/statusmanager.go` | ~420 | 新增 StatusCleaner、按 ClusterStatus 索引重试、全 8 种 Failed 覆盖 |
 
-###### 调用方变更清单
+#### 调用方变更清单
 
 | 文件 | 行号 | 当前调用 | 变更 |
 | ------ | ------ | --------- | ------ |
@@ -3964,7 +3964,7 @@ PhaseFlow.Execute()
 | `ensure_delete_or_reset.go` | 369 | `RemoveBKEClusterStatusCache(bkeCluster)` | **不变** |
 | `common.go` | 86 | `RemoveSingleNodeStatusCache(bkeCluster, node.IP)` | **不变** |
 
-###### 完整替换文件：`pkg/statusmanage/staterecords.go`
+#### 完整替换文件：`pkg/statusmanage/staterecords.go`
 
 ```go
 package statusmanage
@@ -4112,7 +4112,7 @@ func (r *StatusRecordV2) SetCurrentClusterState(state bkev1beta1.ClusterStatus) 
 }
 ```
 
-###### 完整替换文件：`pkg/statusmanage/statusmanager.go`
+#### 完整替换文件：`pkg/statusmanage/statusmanager.go`
 
 ```go
 package statusmanage
@@ -4523,7 +4523,7 @@ func (b *StatusManagerV2) RemoveSingleNodeStatusCache(bkeCluster *bkev1beta1.BKE
 }
 ```
 
-###### 原代码 vs 新代码关键差异
+#### 原代码 vs 新代码关键差异
 
 | 维度 | 原代码 (`StatusManager`) | 新代码 (`StatusManagerV2`) |
 | ------ | ------------------------- | --------------------------- |
@@ -4537,7 +4537,7 @@ func (b *StatusManagerV2) RemoveSingleNodeStatusCache(bkeCluster *bkev1beta1.BKE
 | **并发安全** | `int` 非原子操作 | `int32` + `atomic.AddInt32` |
 | **全局变量** | `BKEClusterStatusManager = NewStatusManager()` | `BKEClusterStatusManager = NewStatusManagerV2()` |
 
-###### 替换入口（唯一需要修改的代码）
+#### 替换入口（唯一需要修改的代码）
 
 由于 `StatusManagerV2` 保持了所有公开方法的签名不变，替换只需要修改 **一行代码**：
 
@@ -4553,7 +4553,7 @@ var BKEClusterStatusManager = NewStatusManagerV2()
 
 > **关键结论**：所有 8 个调用点零修改，替换只需修改全局变量初始化的一行代码。
 
-###### 完整变更清单
+#### 完整变更清单
 
 **1. 全局变量替换**
 
@@ -4630,7 +4630,7 @@ V2 内部逻辑：
 | `calculateBackoff()` | 退避时间计算 | 智能退避 |
 | `atomic.AddInt32` | 原子计数器操作 | 并发安全 |
 
-###### 调用方变更清单（完整版）
+#### 调用方变更清单（完整版）
 
 | 文件 | 行号 | 调用的方法 | 变更说明 |
 | ------ | ------ | ----------- | --------- |
@@ -4643,7 +4643,7 @@ V2 内部逻辑：
 | `ensure_delete_or_reset.go` | 369 | `BKEClusterStatusManager.RemoveBKEClusterStatusCache(...)` | **不变** |
 | `common.go` | 86 | `BKEClusterStatusManager.RemoveSingleNodeStatusCache(...)` | **不变** |
 
-###### 实施步骤
+#### 实施步骤
 
 ```
 步骤 1: 替换 staterecords.go
