@@ -868,10 +868,11 @@ func ValidateStatusConsistency(cluster *bkev1beta1.BKECluster) error {
 - 为 `Phase` 字段添加 Deprecated 注释
 - 为 `ClusterHealthState` 字段添加 Deprecated 注释
 - 保留 `ClusterStatus` 字段定义
+- 新增 `LastInProgressState` 字段：记录失败时的进行中状态，用于重试时判断恢复目标
 
 **文件清单**：
 
-- `api/bkecommon/v1beta1/bkecluster_status.go`：修改字段注释
+- `api/bkecommon/v1beta1/bkecluster_status.go`：修改字段注释，新增 LastInProgressState 字段
 
 **修改方案**：
 
@@ -918,7 +919,28 @@ ClusterStatus ClusterStatus `json:"clusterStatus,omitempty"`
 // compatibility and is automatically synchronized with ClusterStatus.
 // +optional
 ClusterHealthState ClusterHealthState `json:"clusterHealthState,omitempty"`
+
+// LastInProgressState is the last in-progress state before failure.
+// This field is used to determine the recovery target when retrying from a failed state.
+// For example, if MasterScalingUp fails, LastInProgressState = MasterScalingUp,
+// and the retry will recover to MasterScalingUp (not WorkerScalingUp).
+// +optional
+LastInProgressState ClusterStatus `json:"lastInProgressState,omitempty"`
 ```
+
+**LastInProgressState 设计说明**：
+
+| 场景 | 设置时机 | 值 | 用途 |
+|------|---------|-----|------|
+| Master 扩容失败 | TriggerError 转换时 | MasterScalingUp | 重试时恢复到 MasterScalingUp |
+| Worker 扩容失败 | TriggerError 转换时 | WorkerScalingUp | 重试时恢复到 WorkerScalingUp |
+| Master 缩容失败 | TriggerError 转换时 | MasterScalingDown | 重试时恢复到 MasterScalingDown |
+| Worker 缩容失败 | TriggerError 转换时 | WorkerScalingDown | 重试时恢复到 WorkerScalingDown |
+
+**设计原则**：
+- **语义清晰**：记录"失败时的进行中状态"，不是"进入进行中状态前的正常状态"
+- **持久化存储**：存储在 Cluster.Status 中，重启不丢失
+- **自动设置**：在错误转换时（TriggerError）由引擎自动设置，无需业务代码干预
 
 ##### 4.1.2.2 映射函数层重构
 
@@ -1583,6 +1605,42 @@ type Transition struct {
 2. 若 `Condition` 无法区分，必须使用不同的 `Priority` 值
 3. 引擎在注册规则时进行冲突检测，发现潜在冲突时输出警告日志
 
+**使用 LastInProgressState 解决 ScaleFailed 冲突**：
+
+ScaleFailed 状态存在一个特殊问题：多个进行中状态（MasterScalingUp/Down、WorkerScalingUp/Down）都可能转换到同一个 ScaleFailed 状态，导致重试时无法区分恢复目标。
+
+**解决方案**：使用 `LastInProgressState` 字段记录失败前的进行中状态。
+
+```go
+// 错误转换时，引擎自动设置 LastInProgressState
+if effectiveTrigger == TriggerError {
+    cluster.Status.LastInProgressState = currentState  // 如 MasterScalingUp
+}
+
+// 重试规则通过 Condition 检查 LastInProgressState
+{bkev1beta1.ClusterScaleFailed, bkev1beta1.ClusterMasterScalingUp, IsMasterScaleUpRetry}
+{bkev1beta1.ClusterScaleFailed, bkev1beta1.ClusterWorkerScalingUp, IsWorkerScaleUpRetry}
+
+// Condition 函数
+func IsMasterScaleUpRetry(cc *ConditionContext) bool {
+    return cc.BKECluster.Status.LastInProgressState == bkev1beta1.ClusterMasterScalingUp
+}
+```
+
+**执行流程示例**：
+
+| 步骤 | 状态 | LastInProgressState | 说明 |
+|------|------|---------------------|------|
+| 1 | Ready | - | 初始状态 |
+| 2 | MasterScalingUp | - | Pre-hook 触发 |
+| 3 | ScaleFailed | MasterScalingUp | Post-hook 失败，引擎自动设置 |
+| 4 | MasterScalingUp | MasterScalingUp | 重试，IsMasterScaleUpRetry=true，匹配第一条规则 |
+
+**设计优势**：
+- **无冲突**：每个 Condition 函数检查不同的值，互斥
+- **持久化**：存储在 Cluster.Status 中，重启不丢失
+- **自动化**：引擎在错误转换时自动设置，无需业务代码干预
+
 **转换规则统计**（完整规则见 4.2.3 节 `registerClusterTransitions` 函数）：
 
 | 阶段 | 规则数 | Trigger 类型 | 说明 |
@@ -2066,15 +2124,17 @@ func registerClusterTransitions(e *statemachine.Engine) {
     }
 
     // ===== 重试转换（Failed → 进行中状态，使用 TriggerRetry）=====
+    // 使用 LastInProgressState 判断恢复目标，避免 Condition 冲突
     retryMappings := []struct {
         from, to  bkev1beta1.ClusterStatus
         condition func(*bkev1beta1.BKECluster) bool
     }{
         {bkev1beta1.ClusterInitializationFailed, bkev1beta1.ClusterInitializing, nil},
-        {bkev1beta1.ClusterScaleFailed, bkev1beta1.ClusterMasterScalingUp, statemachine.IsMasterScaleRetry},
-        {bkev1beta1.ClusterScaleFailed, bkev1beta1.ClusterWorkerScalingUp, statemachine.IsWorkerScaleRetry},
-        {bkev1beta1.ClusterScaleFailed, bkev1beta1.ClusterMasterScalingDown, statemachine.IsMasterScaleRetry},
-        {bkev1beta1.ClusterScaleFailed, bkev1beta1.ClusterWorkerScalingDown, statemachine.IsWorkerScaleRetry},
+        // ScaleFailed 恢复：根据 LastInProgressState 判断是 Master 还是 Worker
+        {bkev1beta1.ClusterScaleFailed, bkev1beta1.ClusterMasterScalingUp, statemachine.IsMasterScaleUpRetry},
+        {bkev1beta1.ClusterScaleFailed, bkev1beta1.ClusterMasterScalingDown, statemachine.IsMasterScaleDownRetry},
+        {bkev1beta1.ClusterScaleFailed, bkev1beta1.ClusterWorkerScalingUp, statemachine.IsWorkerScaleUpRetry},
+        {bkev1beta1.ClusterScaleFailed, bkev1beta1.ClusterWorkerScalingDown, statemachine.IsWorkerScaleDownRetry},
         {bkev1beta1.ClusterUpgradeFailed, bkev1beta1.ClusterUpgrading, nil},
         {bkev1beta1.ClusterDeployAddonFailed, bkev1beta1.ClusterDeployingAddon, nil},
         {bkev1beta1.ClusterManageFailed, bkev1beta1.ClusterManaging, nil},
@@ -2256,6 +2316,12 @@ func (e *Engine) Transition(cluster *bkev1beta1.BKECluster, bkeNodes bkev1beta1.
 
             // 应用新状态
             cluster.Status.ClusterStatus = trans.ToState
+
+            // 错误转换时，记录失败前的进行中状态
+            // 用于重试时判断恢复目标（如区分 MasterScalingUp 还是 WorkerScalingUp 失败）
+            if effectiveTrigger == TriggerError {
+                cluster.Status.LastInProgressState = currentState
+            }
 
             // 记录转换事件
             e.recordTransition(cluster, trans, err)
@@ -2751,8 +2817,10 @@ Condition 函数（如 `needUpgrade`、`isClusterReady`）需要从现有代码�
 | `isManageComplete` | `EnsureClusterManage.NeedExecute()` | 检查纳管完成 |
 | `isResume` | `EnsurePaused.NeedExecute()` | 检查 pause annotation 已移除 |
 | `isDryRunComplete` | `EnsureDryRun.NeedExecute()` | 检查 DryRun 完成 |
-| `isMasterScaleRetry` | StatusManager | 检查 Master 扩缩容重试条件 |
-| `isWorkerScaleRetry` | StatusManager | 检查 Worker 扩缩容重试条件 |
+| `isMasterScaleUpRetry` | StatusManager | 检查 LastInProgressState == MasterScalingUp |
+| `isMasterScaleDownRetry` | StatusManager | 检查 LastInProgressState == MasterScalingDown |
+| `isWorkerScaleUpRetry` | StatusManager | 检查 LastInProgressState == WorkerScalingUp |
+| `isWorkerScaleDownRetry` | StatusManager | 检查 LastInProgressState == WorkerScalingDown |
 
 #### 提取后的代码
 
@@ -2979,16 +3047,28 @@ func IsDryRunComplete(cc *ConditionContext) bool {
     return !cc.BKECluster.Spec.DryRun
 }
 
-// IsMasterScaleRetry 检查 Master 扩缩容重试条件
-// 提取自 StatusManager 重试逻辑
-func IsMasterScaleRetry(cc *ConditionContext) bool {
-    return cc.BKECluster.Status.ClusterStatus == bkev1beta1.ClusterScaleFailed
+// IsMasterScaleUpRetry 检查 Master 扩容重试条件
+// 使用 LastInProgressState 判断失败前的进行中状态
+func IsMasterScaleUpRetry(cc *ConditionContext) bool {
+    return cc.BKECluster.Status.LastInProgressState == bkev1beta1.ClusterMasterScalingUp
 }
 
-// IsWorkerScaleRetry 检查 Worker 扩缩容重试条件
-// 提取自 StatusManager 重试逻辑
-func IsWorkerScaleRetry(cc *ConditionContext) bool {
-    return cc.BKECluster.Status.ClusterStatus == bkev1beta1.ClusterScaleFailed
+// IsMasterScaleDownRetry 检查 Master 缩容重试条件
+// 使用 LastInProgressState 判断失败前的进行中状态
+func IsMasterScaleDownRetry(cc *ConditionContext) bool {
+    return cc.BKECluster.Status.LastInProgressState == bkev1beta1.ClusterMasterScalingDown
+}
+
+// IsWorkerScaleUpRetry 检查 Worker 扩容重试条件
+// 使用 LastInProgressState 判断失败前的进行中状态
+func IsWorkerScaleUpRetry(cc *ConditionContext) bool {
+    return cc.BKECluster.Status.LastInProgressState == bkev1beta1.ClusterWorkerScalingUp
+}
+
+// IsWorkerScaleDownRetry 检查 Worker 缩容重试条件
+// 使用 LastInProgressState 判断失败前的进行中状态
+func IsWorkerScaleDownRetry(cc *ConditionContext) bool {
+    return cc.BKECluster.Status.LastInProgressState == bkev1beta1.ClusterWorkerScalingDown
 }
 
 // countNodesByRole 按角色统计节点数量
