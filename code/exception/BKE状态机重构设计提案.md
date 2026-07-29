@@ -1582,7 +1582,6 @@ type Transition struct {
     FromState bkev1beta1.ClusterStatus
     ToState   bkev1beta1.ClusterStatus
     Trigger   string
-    Priority  int  // 规则优先级，数值越小优先级越高（默认 0）
     Condition func(*ConditionContext) bool  // 转换前置条件（可选）
     Action    func(*bkev1beta1.BKECluster) error // 转换动作（可选）
 }
@@ -5647,11 +5646,10 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 
 | 术语 | 英文 | 定义 | 使用场景 |
 |------|------|------|---------|
-| **Transition** | Transition | 状态转换规则，定义 FromState、ToState、Trigger、Priority、Condition、Action | 状态转换表 |
+| **Transition** | Transition | 状态转换规则，定义 FromState、ToState、Trigger、Condition、Action | 状态转换表 |
 | **effectiveTrigger** | Effective Trigger | 引擎实际使用的触发器，err!=nil 时被替换为 "Error" | 状态转换引擎 |
 | **Trigger** | Trigger | 触发状态转换的事件，如 Phase 名称、Error、PhaseComplete、Retry | 状态转换规则 |
 | **Condition** | Condition | 状态转换的前置条件检查函数，返回 bool 值 | 状态转换规则 |
-| **Priority** | Priority | 状态转换规则的优先级，数值越小优先级越高（默认 0） | 规则冲突处理 |
 
 #### 重试机制
 
@@ -5723,9 +5721,8 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 │  │  - FromState │         │  - 规则匹配   │                     │
 │  │  - ToState   │         │  - 条件检查   │                     │
 │  │  - Trigger   │         │  - 动作执行   │                     │
-│  │  - Priority  │         │  - 事件记录   │                     │
-│  │  - Condition │         └──────────────┘                     │
-│  │  - Action    │                                                │
+│  │  - Condition │         │  - 事件记录   │                     │
+│  │  - Action    │         └──────────────┘                     │
 │  └──────────────┘                                                │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
