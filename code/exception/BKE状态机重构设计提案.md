@@ -553,12 +553,16 @@ default:
 业界最佳实践（如 OpenShift CVO、Cluster API）和 BKE 自身演进方向均指向统一的三层生命周期状态机模型：
 
 ```
-集群层（Cluster Lifecycle）：Creating → Running → Upgrading → Scaling → RollingBack → Failed
-节点层（Node Lifecycle）：Pending → Provisioned → Ready → Upgrading → RollingBack → Deleting → Failed
-组件层（Component Lifecycle）：Pending → Installing → Installed → Upgrading → RollingBack → Failed
+集群层（Cluster Lifecycle）：Pending → Installing → Running → Upgrading → Scaling → RollingBack → Deleting → Deleted → Failed
+节点层（Node Lifecycle）：Pending → Provisioned → Ready → Upgrading → RollingBack → Deleting → Deleted → Failed
+组件层（Component Lifecycle）：Pending → Installing → Installed → Upgrading → RollingBack → Deleting → Deleted → Failed
 ```
 
-三层模型的核心设计思想是**自底向上的状态聚合**：组件状态聚合为节点状态，节点状态聚合为集群状态。每个层级使用单一的生命周期状态（LifecyclePhase）作为数据源，将"操作进行中"、"操作失败"、"健康状态"分离为独立维度。
+三层模型的核心设计思想是**混合模型**：
+- **驱动模型（自上而下）**：决定集群"正在做什么"（LifecyclePhase）
+- **聚合模型（自底向上）**：决定集群"健康状况如何"（HealthStatus）
+
+每个层级使用单一的生命周期状态（LifecyclePhase）作为数据源，将"操作进行中"、"操作失败"、"健康状态"分离为独立维度。
 
 当前代码仍维护 `ClusterStatus` + `ClusterHealthState` 两个并行状态，缺乏统一的生命周期抽象，无法支撑三层聚合模型的实现。
 
