@@ -1,16 +1,5 @@
 ﻿# KEP: BKE 状态机问题分析与优化重构方案
 
-| 字段 | 值 |
-| ------ | ----- |
-| **KEP 编号** | KEP-6-SM |
-| **标题** | BKE 状态机问题分析与优化重构方案 |
-| **状态** | `provisional` |
-| **类型** | Refactor |
-| **作者** | openFuyao Team |
-| **创建日期** | 2026-07-27 |
-| **依赖** | KEP-5 (ClusterVersion/ReleaseImage) |
-| **关联** | kep6-state-machine-v1（现状参考）、kep6-state-machine-v3（远景对齐） |
-
 ## 目录
 
 - [1. 摘要](#1-摘要)
@@ -5865,13 +5854,3 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 | 可观测性 | 缺乏状态转换事件 | 中 | 阶段四：事件系统 |
 | 可维护性 | 代码圈复杂度高（15） | 中 | 阶段二：引擎替代分散逻辑 |
 
-### C. 相关文档
-
-- [kep6-state-machine-v1.md](../kep/kep6/kep6-state-machine-v1.md) - v1 状态机设计（现状参考）
-- [kep6-state-machine-v3.md](../kep/kep6/kep6-state-machine-v3.md) - 三层状态机设计（远景对齐参考）
-- [kep6-state-machine-refactor.md](../kep/kep6/kep6-state-machine-refactor.md) - 状态机重构方案（远景实施参考）
-- [kep6.md](../kep/kep6/kep6.md) - KEP-6 基于 ReleaseImage 的声明式管理方案
-
-**文档版本**: v1.0
-**最后更新**: 2026-07-27
-**维护者**: BKE Team
