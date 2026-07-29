@@ -5362,10 +5362,6 @@ func (r *Reconciler) determineLifecyclePhase(cluster *BKECluster) LifecyclePhase
 - `RollingBack`：当 `OperationProgress.OperationType = Rollback` 且未完成时
 - `Failed`：当 `OperationProgress.LastFailure != nil` 时
 
-**为什么没有 `Running --> Failed`？**
-
-在驱动模型中，`LifecyclePhase` 由**操作**驱动。`Running` 是稳定状态，表示集群正在运行，没有进行中的操作。运行中故障（如 etcd 崩溃、API Server 故障）不是由操作驱动的，应该通过 `HealthStatus` 表达，而不是改变 `LifecyclePhase`。
-
 #### 4.5.6 组件类型区分
 
 目标架构将组件分为**节点级组件**和**集群级组件**两类：
