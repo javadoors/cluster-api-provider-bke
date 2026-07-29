@@ -736,9 +736,9 @@ if sr.AllowFailed() {
 
 ### 4.1 重构方案：三字段整合方案
 
-### 4.1.1 设计思路
+#### 4.1.1 设计思路
 
-### 4.1.1.1 核心设计理念
+##### 4.1.1.1 核心设计理念
 
 **问题本质**：
 
@@ -753,7 +753,7 @@ if sr.AllowFailed() {
 - **代码重构**：所有新代码只使用 `ClusterStatus` 字段
 - **提供映射机制**：通过映射函数实现字段间的转换，为未来迁移做准备
 
-### 4.1.1.2 设计原则
+##### 4.1.1.2 设计原则
 
 | 原则 | 说明 | 实现方式 |
 | ------ | ------ | ---------- |
@@ -762,7 +762,7 @@ if sr.AllowFailed() {
 | **渐进式迁移原则** | 分阶段实施，降低风险 | 当前实施阶段 1（准备阶段），后续阶段在未来实施 |
 | **单一数据源原则** | 代码中只使用一个字段 | 所有新代码只使用 ClusterStatus |
 
-### 4.1.1.3 设计目标
+##### 4.1.1.3 设计目标
 
 | 目标 | 衡量指标 | 预期结果 |
 | ------ | ---------- | ---------- |
@@ -771,9 +771,9 @@ if sr.AllowFailed() {
 | **保持兼容性** | 外部消费者影响 | 无影响（字段保留） |
 | **前瞻性设计** | 映射函数覆盖率 | 100% |
 
-### 4.1.2 重构内容
+#### 4.1.2 重构内容
 
-#### 4.1.2.0 统一同步机制
+##### 4.1.2.0 统一同步机制
 
 **同步策略**：
 
@@ -861,7 +861,7 @@ func ValidateStatusConsistency(cluster *bkev1beta1.BKECluster) error {
 2. **所有派生字段必须从 ClusterStatus 派生**：禁止直接设置 Phase 或 ClusterHealthState
 3. **所有同步点必须使用相同的策略**：PhaseFlow、StatusManager、Controller、Webhook 等所有层统一使用
 
-### 4.1.2.1 API 层重构
+##### 4.1.2.1 API 层重构
 
 **重构内容**：
 
@@ -920,7 +920,7 @@ ClusterStatus ClusterStatus `json:"clusterStatus,omitempty"`
 ClusterHealthState ClusterHealthState `json:"clusterHealthState,omitempty"`
 ```
 
-### 4.1.2.2 映射函数层重构
+##### 4.1.2.2 映射函数层重构
 
 **重构内容**：
 
@@ -1111,7 +1111,7 @@ func MapToLifecyclePhase(status bkev1beta1.ClusterStatus) string {
 }
 ```
 
-### 4.1.2.3 PhaseFlow 框架层重构
+##### 4.1.2.3 PhaseFlow 框架层重构
 
 **重构内容**：
 
@@ -1196,7 +1196,7 @@ log.Info("waiting for phase to complete", "phase", bkeCluster.Status.Phase)
 log.Info("waiting for phase to complete", "status", bkeCluster.Status.ClusterStatus)
 ```
 
-### 4.1.2.4 状态管理层重构
+##### 4.1.2.4 状态管理层重构
 
 **重构内容**：
 
@@ -1287,7 +1287,7 @@ case bkev1beta1.ClusterManaging:
 }
 ```
 
-### 4.1.2.5 控制器层重构
+##### 4.1.2.5 控制器层重构
 
 **重构内容**：
 
@@ -1321,7 +1321,7 @@ func markBKEClusterHealthyStatus(bkeCluster *bkev1beta1.BKECluster, status confv
 }
 ```
 
-### 4.1.2.6 Webhook 层重构
+##### 4.1.2.6 Webhook 层重构
 
 **重构内容**：
 
@@ -1373,7 +1373,7 @@ if newBKECluster.Status.ClusterStatus != bkev1beta1.ClusterReady {
 }
 ```
 
-### 4.1.2.7 其他文件重构
+##### 4.1.2.7 其他文件重构
 
 **重构内容**：
 
@@ -1501,7 +1501,7 @@ params.CombinedCluster.Status.ClusterHealthState = newBKECuster.Status.ClusterHe
 params.CombinedCluster.SetClusterStatus(newBKECuster.Status.ClusterStatus)
 ```
 
-### 4.1.2.8 测试层重构
+##### 4.1.2.8 测试层重构
 
 **重构内容**：
 
@@ -1540,7 +1540,7 @@ params.CombinedCluster.SetClusterStatus(newBKECuster.Status.ClusterStatus)
 
 **设计思路**: 在三字段整合的基础上，使用状态转换表统一定义所有状态转换规则，集中管理状态转换逻辑。
 
-### 4.2.1 状态转换规则设计
+#### 4.2.1 状态转换规则设计
 
 **设计原则**：
 
@@ -1597,7 +1597,7 @@ type Transition struct {
 | 删除 | 7 | 多入口→Deleting→Failed |
 | **总计** | **64** | |
 
-### 4.2.2 状态机引擎实现
+#### 4.2.2 状态机引擎实现
 
 #### 设计缺陷分析：err 参数必须影响触发器选择
 
@@ -1680,7 +1680,7 @@ func (e *Engine) Transition(cluster *BKECluster, nodes BKENodes, trigger string,
 - 只使用 ClusterStatus，简化了状态管理逻辑
 - **err 参数正确影响触发器选择**，确保成功/失败路径正确分离
 
-### 4.2.3 Transition 替换原有业务逻辑
+#### 4.2.3 Transition 替换原有业务逻辑
 
 #### 调用链对比
 
@@ -3628,7 +3628,7 @@ func (b *StatusManagerV2) RemoveSingleNodeStatusCache(bkeCluster *bkev1beta1.BKE
 - 更灵活的状态回退机制
 - 完整替换旧状态管理器，提供所有核心方法
 
-### 4.3.1 替换原状态管理器的完整设计
+#### 4.3.1 替换原状态管理器的完整设计
 
 #### 设计决策
 
