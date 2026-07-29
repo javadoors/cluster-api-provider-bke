@@ -1580,7 +1580,446 @@ T2: 节点删除完成
 
 ## 7. 重试与幂等性
 
-（保留原有设计，详见 v3 文档）
+### 7.1 重试机制
+
+#### 7.1.1 自动重试策略
+
+系统采用指数退避策略进行自动重试：
+
+```go
+// RetryPolicy 重试策略配置
+type RetryPolicy struct {
+    // 最大重试次数
+    MaxRetries int `json:"maxRetries"`
+    
+    // 初始延迟（秒）
+    InitialDelay int `json:"initialDelay"`
+    
+    // 最大延迟（秒）
+    MaxDelay int `json:"maxDelay"`
+    
+    // 退避倍数
+    BackoffMultiplier float64 `json:"backoffMultiplier"`
+}
+
+// 默认重试策略
+var DefaultRetryPolicy = RetryPolicy{
+    MaxRetries:        3,
+    InitialDelay:      5,
+    MaxDelay:          60,
+    BackoffMultiplier: 2.0,
+}
+
+// CalculateBackoff 计算退避时间
+func CalculateBackoff(policy RetryPolicy, attempt int) time.Duration {
+    delay := float64(policy.InitialDelay) * math.Pow(policy.BackoffMultiplier, float64(attempt-1))
+    if delay > float64(policy.MaxDelay) {
+        delay = float64(policy.MaxDelay)
+    }
+    return time.Duration(delay) * time.Second
+}
+```
+
+**退避示例**：
+- 第 1 次重试：等待 5 秒
+- 第 2 次重试：等待 10 秒
+- 第 3 次重试：等待 20 秒
+- 第 4 次重试：等待 40 秒
+- 第 5 次重试：等待 60 秒（达到上限）
+
+#### 7.1.2 手动重试触发
+
+当自动重试失败后，用户可以通过以下方式手动触发重试：
+
+**方式 1：清除 LastFailure 字段**
+```bash
+kubectl patch bkecluster my-cluster --type merge \
+  -p '{"status":{"operationProgress":{"lastFailure":null}}}'
+```
+
+**方式 2：设置重试注解**
+```bash
+kubectl annotate bkecluster my-cluster bke.bocloud.com/retry-operation=true
+```
+
+**方式 3：通过 API 触发**
+```bash
+curl -X POST https://api-server/apis/bke.bocloud.com/v1beta1/namespaces/default/bkeclusters/my-cluster/retry
+```
+
+#### 7.1.3 重试条件判断
+
+```go
+// ShouldRetry 判断是否应该重试
+func ShouldRetry(cluster *BKECluster) bool {
+    // 检查是否有失败记录
+    if cluster.Status.OperationProgress.LastFailure == nil {
+        return false
+    }
+    
+    // 检查是否超过最大重试次数
+    if cluster.Status.OperationProgress.LastFailure.Attempt >= DefaultRetryPolicy.MaxRetries {
+        return false
+    }
+    
+    // 检查是否需要人工介入
+    if cluster.Status.OperationProgress.NeedsManualIntervention {
+        return false
+    }
+    
+    return true
+}
+```
+
+### 7.2 幂等性保证
+
+#### 7.2.1 操作幂等性设计
+
+所有操作都必须保证幂等性，即重复执行相同操作不会产生副作用：
+
+```go
+// IdempotentOperation 幂等操作接口
+type IdempotentOperation interface {
+    // Execute 执行操作
+    Execute(ctx context.Context) error
+    
+    // CheckProgress 检查操作进度
+    CheckProgress(ctx context.Context) (*OperationProgress, error)
+    
+    // IsCompleted 检查操作是否完成
+    IsCompleted(ctx context.Context) (bool, error)
+}
+```
+
+**幂等性保证机制**：
+
+1. **状态检查**：执行操作前检查当前状态
+2. **检查点保存**：保存操作进度到 OperationProgress
+3. **重复操作检测**：检测是否已经执行过相同操作
+4. **断点续传**：从上次中断点继续执行
+
+#### 7.2.2 状态检查机制
+
+```go
+// CheckOperationState 检查操作状态
+func CheckOperationState(ctx context.Context, cluster *BKECluster, operationType string) (OperationState, error) {
+    // 检查是否有进行中的操作
+    if cluster.Status.OperationProgress != nil && 
+       cluster.Status.OperationProgress.FinishedAt == nil {
+        return OperationStateInProgress, nil
+    }
+    
+    // 检查操作是否已完成
+    if cluster.Status.OperationProgress != nil && 
+       cluster.Status.OperationProgress.FinishedAt != nil {
+        return OperationStateCompleted, nil
+    }
+    
+    // 检查是否有失败记录
+    if cluster.Status.OperationProgress != nil && 
+       cluster.Status.OperationProgress.LastFailure != nil {
+        return OperationStateFailed, nil
+    }
+    
+    return OperationStateNotStarted, nil
+}
+
+type OperationState string
+
+const (
+    OperationStateNotStarted OperationState = "NotStarted"
+    OperationStateInProgress OperationState = "InProgress"
+    OperationStateCompleted  OperationState = "Completed"
+    OperationStateFailed     OperationState = "Failed"
+)
+```
+
+#### 7.2.3 检查点保存
+
+```go
+// SaveCheckpoint 保存检查点
+func SaveCheckpoint(ctx context.Context, cluster *BKECluster, checkpoint *Checkpoint) error {
+    // 更新 OperationProgress
+    cluster.Status.OperationProgress.CurrentStage = checkpoint.Stage
+    cluster.Status.OperationProgress.CompletedComponents = checkpoint.CompletedCount
+    cluster.Status.OperationProgress.Completed = checkpoint.Completed
+    
+    // 持久化状态
+    return r.Status().Update(ctx, cluster)
+}
+
+// Checkpoint 检查点
+type Checkpoint struct {
+    Stage          string              `json:"stage"`
+    CompletedCount int                 `json:"completedCount"`
+    Completed      []ComponentRecord   `json:"completed"`
+    SavedAt        metav1.Time         `json:"savedAt"`
+}
+```
+
+#### 7.2.4 断点续传
+
+```go
+// ResumeFromCheckpoint 从检查点恢复
+func ResumeFromCheckpoint(ctx context.Context, cluster *BKECluster) error {
+    // 获取上次保存的检查点
+    checkpoint := cluster.Status.OperationProgress
+    
+    // 从上次中断点继续执行
+    switch checkpoint.CurrentStage {
+    case "InstallingNodeComponents":
+        return resumeNodeComponentsInstallation(ctx, cluster, checkpoint.CompletedComponents)
+    case "InstallingClusterComponents":
+        return resumeClusterComponentsInstallation(ctx, cluster, checkpoint.CompletedComponents)
+    default:
+        return fmt.Errorf("unknown stage: %s", checkpoint.CurrentStage)
+    }
+}
+
+// resumeNodeComponentsInstallation 恢复节点组件安装
+func resumeNodeComponentsInstallation(ctx context.Context, cluster *BKECluster, completedCount int) error {
+    // 获取所有节点组件
+    components := getNodeComponents(cluster)
+    
+    // 跳过已完成的组件
+    for i := completedCount; i < len(components); i++ {
+        component := components[i]
+        
+        // 执行安装
+        if err := installComponent(ctx, component); err != nil {
+            // 保存检查点
+            saveCheckpoint(ctx, cluster, i)
+            return err
+        }
+        
+        // 更新进度
+        updateProgress(ctx, cluster, i+1)
+    }
+    
+    return nil
+}
+```
+
+### 7.3 三层重试机制
+
+#### 7.3.1 组件级重试
+
+组件级重试是最细粒度的重试，针对单个组件的安装/升级操作：
+
+```go
+// ComponentRetry 组件级重试
+type ComponentRetry struct {
+    ComponentName string
+    NodeIP        string
+    Attempt       int
+    LastError     error
+}
+
+// RetryComponent 重试组件操作
+func RetryComponent(ctx context.Context, retry *ComponentRetry) error {
+    // 计算退避时间
+    backoff := CalculateBackoff(DefaultRetryPolicy, retry.Attempt)
+    
+    // 等待退避时间
+    time.Sleep(backoff)
+    
+    // 重新执行组件操作
+    return executeComponentOperation(ctx, retry.ComponentName, retry.NodeIP)
+}
+```
+
+**示例场景**：
+```
+T0: 安装 containerd@node-1 失败
+    ComponentRetry = {Name: "containerd", NodeIP: "node-1", Attempt: 1}
+    
+T1: 等待 5 秒后重试
+    Attempt = 2
+    
+T2: 安装成功
+```
+
+#### 7.3.2 节点级重试
+
+节点级重试针对单个节点上的所有组件操作：
+
+```go
+// NodeRetry 节点级重试
+type NodeRetry struct {
+    NodeIP    string
+    Attempt   int
+    LastError error
+}
+
+// RetryNode 重试节点操作
+func RetryNode(ctx context.Context, retry *NodeRetry) error {
+    // 计算退避时间
+    backoff := CalculateBackoff(DefaultRetryPolicy, retry.Attempt)
+    
+    // 等待退避时间
+    time.Sleep(backoff)
+    
+    // 重新执行节点操作
+    return executeNodeOperation(ctx, retry.NodeIP)
+}
+```
+
+**示例场景**：
+```
+T0: node-1 上多个组件安装失败
+    NodeRetry = {NodeIP: "node-1", Attempt: 1}
+    
+T1: 等待 5 秒后重试
+    重新安装所有失败的组件
+    
+T2: 所有组件安装成功
+```
+
+#### 7.3.3 集群级重试
+
+集群级重试针对整个集群的操作：
+
+```go
+// ClusterRetry 集群级重试
+type ClusterRetry struct {
+    Attempt   int
+    LastError error
+}
+
+// RetryCluster 重试集群操作
+func RetryCluster(ctx context.Context, cluster *BKECluster, retry *ClusterRetry) error {
+    // 计算退避时间
+    backoff := CalculateBackoff(DefaultRetryPolicy, retry.Attempt)
+    
+    // 等待退避时间
+    time.Sleep(backoff)
+    
+    // 重新执行集群操作
+    return executeClusterOperation(ctx, cluster)
+}
+```
+
+**示例场景**：
+```
+T0: 集群升级失败（多个节点失败）
+    ClusterRetry = {Attempt: 1}
+    
+T1: 等待 5 秒后重试
+    重新执行整个升级流程
+    
+T2: 升级成功
+```
+
+### 7.4 恢复机制
+
+#### 7.4.1 从失败点恢复
+
+当操作失败后，系统支持从失败点恢复，而不是从头开始：
+
+```go
+// RecoverFromFailure 从失败点恢复
+func RecoverFromFailure(ctx context.Context, cluster *BKECluster) error {
+    // 获取失败记录
+    failure := cluster.Status.OperationProgress.LastFailure
+    
+    // 根据失败类型选择恢复策略
+    switch failure.Type {
+    case "ComponentFailure":
+        return recoverComponentFailure(ctx, cluster, failure)
+    case "NodeFailure":
+        return recoverNodeFailure(ctx, cluster, failure)
+    case "ClusterFailure":
+        return recoverClusterFailure(ctx, cluster, failure)
+    default:
+        return fmt.Errorf("unknown failure type: %s", failure.Type)
+    }
+}
+
+// recoverComponentFailure 恢复组件失败
+func recoverComponentFailure(ctx context.Context, cluster *BKECluster, failure *OperationFailureRecord) error {
+    // 获取检查点
+    checkpoint := cluster.Status.OperationProgress
+    
+    // 从失败的组件继续
+    return resumeFromCheckpoint(ctx, cluster, checkpoint)
+}
+```
+
+#### 7.4.2 状态回滚
+
+当操作失败且无法恢复时，系统支持状态回滚到操作前的状态：
+
+```go
+// RollbackOperation 回滚操作
+func RollbackOperation(ctx context.Context, cluster *BKECluster) error {
+    // 获取操作类型
+    operationType := cluster.Status.OperationProgress.OperationType
+    
+    // 根据操作类型执行回滚
+    switch operationType {
+    case OperationTypeInstall:
+        return rollbackInstallation(ctx, cluster)
+    case OperationTypeUpgrade:
+        return rollbackUpgrade(ctx, cluster)
+    case OperationTypeScale:
+        return rollbackScaling(ctx, cluster)
+    default:
+        return fmt.Errorf("unsupported operation type: %s", operationType)
+    }
+}
+
+// rollbackUpgrade 回滚升级操作
+func rollbackUpgrade(ctx context.Context, cluster *BKECluster) error {
+    // 获取升级前的版本
+    previousVersion := cluster.Status.OperationProgress.PreviousVersion
+    
+    // 回滚所有组件到上一个版本
+    for _, node := range cluster.Status.Nodes {
+        for _, component := range node.Components {
+            if err := rollbackComponent(ctx, component, previousVersion); err != nil {
+                return err
+            }
+        }
+    }
+    
+    // 更新状态
+    cluster.Status.LifecyclePhase = ClusterLifecycleRunning
+    cluster.Status.OperationProgress = nil
+    
+    return r.Status().Update(ctx, cluster)
+}
+```
+
+### 7.5 重试与幂等性最佳实践
+
+#### 7.5.1 重试策略选择
+
+| 操作类型 | 推荐重试策略 | 最大重试次数 | 退避策略 |
+|---------|-------------|-------------|---------|
+| 组件安装 | 指数退避 | 3 | 5s, 10s, 20s |
+| 组件升级 | 指数退避 | 3 | 5s, 10s, 20s |
+| 节点操作 | 指数退避 | 3 | 10s, 20s, 40s |
+| 集群操作 | 指数退避 | 3 | 30s, 60s, 120s |
+
+#### 7.5.2 幂等性检查清单
+
+执行操作前，必须检查以下条件：
+
+1. ✅ 操作是否已经在进行中？
+2. ✅ 操作是否已经完成？
+3. ✅ 操作是否已经失败？
+4. ✅ 是否有检查点可以恢复？
+5. ✅ 是否需要人工介入？
+
+#### 7.5.3 错误处理策略
+
+| 错误类型 | 处理策略 | 是否重试 |
+|---------|---------|---------|
+| 临时错误（网络超时） | 自动重试 | ✅ |
+| 配置错误 | 立即失败 | ❌ |
+| 资源不足 | 等待后重试 | ✅ |
+| 权限错误 | 立即失败 | ❌ |
+| 组件冲突 | 回滚后重试 | ✅ |
 
 ---
 
@@ -2405,5 +2844,5 @@ func TestNodeRecoveryFromComponentInstallFailed(t *testing.T) {
 
 ---
 
-**文档版本**: v3.15 (混合模型 - 健康状态聚合添加节点级组件)  
+**文档版本**: v3.16 (混合模型 - 添加重试与幂等性章节)  
 **维护者**: openFuyao Team
