@@ -1677,60 +1677,22 @@ func IsMasterScaleUpRetry(cc *ConditionContext) bool {
 
 #### 4.2.2 状态机引擎实现
 
-#### 设计缺陷分析：err 参数必须影响触发器选择
+**设计思路**：
 
-在原始设计中，`Transition` 方法签名包含 `err error` 参数，但实现中从未使用该参数。这会导致严重问题：
+状态机引擎的核心职责是根据当前状态和触发器，查找匹配的转换规则，执行状态转换。设计遵循以下原则：
 
-**当前代码的调用模式**：
+1. **Trigger 区分操作类型**：`phaseName`（开始执行）、`TriggerPhaseComplete`（成功）、`TriggerError`（失败）、`TriggerRetry`（重试）
+2. **err 参数决定 Trigger**：`err != nil` 时使用 `TriggerError`，`err == nil` 时使用 `TriggerPhaseComplete`
+3. **Condition 控制转换**：匹配规则后先检查 `Condition`，不满足则跳过（如 `IsClusterReady`）
+4. **Action 转换动作**：条件满足后执行 `Action`，失败则返回错误
+5. **LastInProgressState 自动记录**：错误转换时自动记录失败前的进行中状态，用于重试时判断恢复目标
+6. **未找到匹配规则时返回 nil**：向后兼容，某些 Phase 可能不需要状态转换
 
-```go
-// pre-hook（Phase 执行前）：err 始终为 nil
-calculatingClusterPreStatusByPhase(phase)
-  → calculateClusterStatusByPhase(phase, nil)    // 设置"进行中"状态
-  → handleClusterUpgradePhase(ctx, nil)
-  → ClusterStatus = ClusterUpgrading             // err==nil → 进行中
+**核心设计要点**：
 
-// post-hook（Phase 执行后）：err 可能非 nil
-calculatingClusterPostStatusByPhase(phase, err)
-  → calculateClusterStatusByPhase(phase, err)    // 根据 err 决定状态
-  → handleClusterUpgradePhase(ctx, err)
-  → if err != nil: ClusterStatus = ClusterUpgradeFailed  // err!=nil → 失败
-  → if err == nil: ClusterStatus = ClusterUpgrading      // err==nil → 进行中
-```
+> **注意**：引擎的完整实现代码见 4.2.3 节 `registerClusterTransitions` 函数。此处仅说明核心设计要点。
 
-**如果 Transition 不使用 err 参数**：
-
-```go
-// ❌ 错误实现：err 参数从未使用
-func (e *Engine) Transition(cluster *BKECluster, nodes BKENodes, trigger string, err error) error {
-    for _, trans := range e.transitions {
-        if trans.FromState == currentState && trans.Trigger == trigger {
-            // 无论 err 是否为 nil，都匹配同一条规则
-        }
-    }
-}
-
-// 调用时：
-// Pre-hook:  engine.Transition(cluster, nodes, "EnsureUpgrade", nil) → 匹配 trigger="EnsureUpgrade" → ClusterUpgrading
-// Post-hook: engine.Transition(cluster, nodes, "EnsureUpgrade", err) → 也匹配 trigger="EnsureUpgrade" → ClusterUpgrading
-// ❌ 结果：无论 Phase 成功还是失败，都转换到同一个状态，永远不会进入 ClusterUpgradeFailed
-```
-
-**修复方案**：根据 `err` 参数选择不同的 Trigger：
-- `err != nil` → 使用 `TriggerError`，匹配失败规则
-- `err == nil` → 使用 `TriggerPhaseComplete`，匹配成功规则
-
-#### 正确实现
-
-> **注意**：引擎的完整实现代码见 4.2.3 节 `registerClusterTransitions` 函数。此处仅说明核心设计要点：
->
-> - **Trigger 区分操作类型**：`phaseName`（开始执行）、`TriggerPhaseComplete`（成功）、`TriggerError`（失败）、`TriggerRetry`（重试）
-> - **err 参数决定 Trigger**：`err != nil` 时使用 `TriggerError`，`err == nil` 时使用 `TriggerPhaseComplete`
-> - **Condition 控制转换**：匹配规则后先检查 `Condition`，不满足则跳过（如 `IsClusterReady`）
-> - **Action 转换动作**：条件满足后执行 `Action`，失败则返回错误
-> - **未找到匹配规则时返回 nil**：向后兼容，某些 Phase 可能不需要状态转换
-
-#### 修复后的调用行为验证
+**调用行为验证**：
 
 | 调用场景 | 调用方式 | effectiveTrigger | 匹配规则 | 目标状态 |
 | --------- | --------- | ----------------- | --------- | --------- |
@@ -1755,16 +1717,16 @@ func (e *Engine) Transition(cluster *BKECluster, nodes BKENodes, trigger string,
 {ClusterUpgradeFailed, ClusterUpgrading, TriggerRetry, nil, nil},
 ```
 
-**优势**:
+**设计优势**：
 
-- 状态转换规则集中定义，易于理解和维护
-- 支持状态转换条件验证（Condition 函数）
-- 易于生成状态机文档和可视化图表
-- 便于单元测试
-- 只使用 ClusterStatus，简化了状态管理逻辑
+- **规则集中管理**：状态转换规则集中定义，易于理解和维护
+- **条件验证**：支持状态转换条件验证（Condition 函数）
+- **可视化支持**：易于生成状态机文档和可视化图表
+- **测试友好**：便于单元测试
+- **简化状态管理**：只使用 ClusterStatus，简化了状态管理逻辑
 - **Trigger 设计清晰**：区分"操作类型"（开始/成功/失败/重试），不区分"哪个 Phase"
 - **err 参数正确使用**：根据 err 选择 TriggerError 或 TriggerPhaseComplete，确保成功/失败路径正确分离
-- **Phase 执行历史通过事件系统记录**：状态机只关心状态转换，不关心具体 Phase 执行
+- **Phase 执行历史分离**：状态机只关心状态转换，Phase 执行历史通过事件系统记录
 
 #### 4.2.3 Transition 替换原有业务逻辑
 
