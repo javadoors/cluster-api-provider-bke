@@ -4804,15 +4804,15 @@ func calculatingClusterPostStatusByPhase(phase phaseframe.Phase, err error) erro
 | ClusterStatus（22 个值） | LifecyclePhase（10 个值） | 说明 |
 | ------------------------- | ------------------------- | ------ |
 | ClusterUnknown, ClusterChecking | Pending | 等待/检查状态 |
-| ClusterInitializing, ClusterMasterScalingUp, ClusterWorkerScalingUp | Installing | 安装/扩容状态 |
+| ClusterInitializing | Installing | 安装状态 |
 | ClusterReady | Running | 运行状态 |
 | ClusterUpgrading | Upgrading | 升级状态 |
-| ClusterMasterScalingDown, ClusterWorkerScalingDown | Scaling | 缩容状态 |
+| ClusterMasterScalingUp, ClusterWorkerScalingUp, ClusterMasterScalingDown, ClusterWorkerScalingDown | Scaling | 扩缩容状态 |
 | ClusterManaging | Managing | 纳管状态 |
 | ClusterPaused | Running | 暂停状态（目标架构中暂停通过注解实现，不属于生命周期阶段） |
 | ClusterDeleting | Deleting | 删除状态 |
 | ClusterDeleted | Deleted | 已删除状态 |
-| ClusterInitializationFailed, ClusterScaleFailed, ClusterDeleteFailed, ClusterPauseFailed, ClusterDryRunFailed, ClusterDeployAddonFailed, ClusterUpgradeFailed, ClusterManageFailed, ClusterUnhealthy | Failed | 所有失败状态 |
+| ClusterInitializationFailed, ClusterScaleFailed, ClusterDeleteFailed, ClusterPauseFailed, ClusterDryRunFailed, ClusterDeployAddonFailed, ClusterUpgradeFailed, ClusterManageFailed | Failed | 所有失败状态 |
 
 **映射信息丢失处理策略**：
 
@@ -4840,351 +4840,100 @@ func calculatingClusterPostStatusByPhase(phase phaseframe.Phase, err error) erro
 
 ## 7. 测试策略
 
-> **章节摘要**：本章描述测试策略，包括单元测试（状态转换表测试、Condition 函数测试）和集成测试（端到端状态转换测试），确保重构方案的正确性和稳定性。
+> **章节摘要**：本章描述测试策略的设计点，包括单元测试、集成测试、协作测试、完整性测试和事件追踪测试，确保重构方案的正确性和稳定性。
 
-### 7.1 单元测试
+### 7.1 单元测试设计点
 
-```go
-package statemachine_test
+**状态转换表测试**：
+- 验证所有 64 条转换规则的正确性
+- 测试每条规则的 FromState、Trigger、ToState 映射
+- 测试 err 参数决定 effectiveTrigger 的逻辑
+- 覆盖成功路径和失败路径
 
-import (
-    "errors"
-    "testing"
+**Condition 函数测试**：
+- 测试所有 Condition 函数的返回值
+- 验证 IsClusterReady、NeedUpgrade、IsScaleComplete 等函数
+- 测试边界条件（如节点数量为 0、版本相同等）
 
-    bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
-    "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/statemachine"
-    "github.com/stretchr/testify/assert"
-)
+**Engine 方法测试**：
+- 测试 Transition 方法的状态转换逻辑
+- 测试 AddTransition 方法的规则注册
+- 测试 QueryHistory 方法的事件查询
 
-// 状态转换表测试
-func TestStateTransitionTable(t *testing.T) {
-    tests := []struct {
-        name      string
-        fromState bkev1beta1.ClusterStatus
-        trigger   string
-        err       error
-        wantState bkev1beta1.ClusterStatus
-    }{
-        {
-            name:      "init success",
-            fromState: bkev1beta1.ClusterInitializing,
-            trigger:   statemachine.TriggerPhaseComplete,
-            err:       nil,
-            wantState: bkev1beta1.ClusterReady,
-        },
-        {
-            name:      "init failed",
-            fromState: bkev1beta1.ClusterInitializing,
-            trigger:   "EnsureMasterInit",
-            err:       errors.New("init failed"),
-            wantState: bkev1beta1.ClusterInitializationFailed,
-        },
-        // ... 更多测试用例
-    }
-    
-    for _, tt := range tests {
-        t.Run(tt.name, func(t *testing.T) {
-            engine := statemachine.NewEngine(nil, nil)
-            cluster := &bkev1beta1.BKECluster{
-                Status: bkev1beta1.BKEClusterStatus{
-                    ClusterStatus: tt.fromState,
-                },
-            }
-            
-            err := engine.Transition(cluster, nil, tt.trigger, tt.err)
-            assert.NoError(t, err)
-            assert.Equal(t, tt.wantState, cluster.Status.ClusterStatus)
-        })
-    }
-}
+### 7.2 集成测试设计点
 
-// Condition 函数测试
-func TestConditionFunctions(t *testing.T) {
-    t.Run("IsClusterReady with all nodes ready", func(t *testing.T) {
-        cluster := &bkev1beta1.BKECluster{
-            Status: bkev1beta1.BKEClusterStatus{
-                Nodes: []bkev1beta1.NodeStatus{
-                    {IP: "192.168.1.1", State: bkev1beta1.NodeReady},
-                    {IP: "192.168.1.2", State: bkev1beta1.NodeReady},
-                },
-            },
-        }
-        
-        cc := &statemachine.ConditionContext{BKECluster: cluster}
-        assert.True(t, statemachine.IsClusterReady(cc))
-    })
-    
-    t.Run("IsClusterReady with node not ready", func(t *testing.T) {
-        cluster := &bkev1beta1.BKECluster{
-            Status: bkev1beta1.BKEClusterStatus{
-                Nodes: []bkev1beta1.NodeStatus{
-                    {IP: "192.168.1.1", State: bkev1beta1.NodeReady},
-                    {IP: "192.168.1.2", State: bkev1beta1.NodeNotReady},
-                },
-            },
-        }
-        
-        cc := &statemachine.ConditionContext{BKECluster: cluster}
-        assert.False(t, statemachine.IsClusterReady(cc))
-    })
-}
-```
+**端到端状态转换测试**：
+- 模拟完整的集群生命周期（Pending → Installing → Running → Upgrading → Deleting）
+- 验证每个阶段的状态转换正确性
+- 测试多 Phase 连续执行的状态累积
 
-### 7.2 集成测试
+**失败恢复测试**：
+- 模拟 Phase 执行失败，验证状态转换到 Failed 状态
+- 测试重试机制，验证状态从 Failed 恢复到进行中状态
+- 验证重试次数耗尽后的状态暴露
 
-```go
-package statemachine_test
+**并发测试**：
+- 模拟多个 Reconcile 循环并发执行
+- 验证状态更新的线程安全性
+- 测试 StatusRecordV2 的原子操作
 
-import (
-    "testing"
+### 7.3 Engine 与 StatusManager 协作测试设计点
 
-    bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
-    "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/statemachine"
-    "github.com/stretchr/testify/assert"
-)
+**状态伪装测试**：
+- 验证重试次数内状态被伪装为 LatestNormalState
+- 测试外部消费者看到的是伪装后的状态
+- 验证 NeedRequeue 标志的正确性
 
-// 端到端状态转换测试
-func TestE2EStateTransition(t *testing.T) {
-    // 创建测试集群
-    cluster := createTestCluster()
-    
-    // 启动状态机引擎
-    engine := statemachine.NewEngine(nil, nil)
-    
-    // 模拟完整的生命周期
-    phases := []string{
-        "EnsureFinalizer",
-        "EnsureBKEAgent",
-        "EnsureNodesEnv",
-        "EnsureClusterAPIObj",
-        "EnsureCerts",
-        "EnsureMasterInit",
-        "EnsureCluster",
-    }
-    
-    for _, phase := range phases {
-        err := engine.Transition(cluster, nil, phase, nil)
-        assert.NoError(t, err)
-    }
-    
-    // 验证最终状态
-    assert.Equal(t, bkev1beta1.ClusterReady, cluster.Status.ClusterStatus)
-}
+**状态暴露测试**：
+- 验证重试次数耗尽后状态暴露为真实失败状态
+- 测试 NeedRequeue 标志变为 false
+- 验证状态不再被伪装
 
-// createTestCluster 创建测试集群（辅助函数）
-func createTestCluster() *bkev1beta1.BKECluster {
-    return &bkev1beta1.BKECluster{
-        Status: bkev1beta1.BKEClusterStatus{
-            ClusterStatus: bkev1beta1.ClusterUnknown,
-        },
-    }
-}
-```
+**协作流程测试**：
+- 测试 Engine 转换到失败状态后，StatusManager 的观察和伪装
+- 验证 StatusManager 的重试计数逻辑
+- 测试状态恢复后的协作流程
 
-### 7.3 Engine 与 StatusManager 协作测试
+### 7.4 状态转换完整性测试设计点
 
-```go
-// TestEngineAndStatusManagerInteraction 测试 Engine 与 StatusManager 的协作
-func TestEngineAndStatusManagerInteraction(t *testing.T) {
-    t.Run("状态伪装：重试次数内隐藏失败", func(t *testing.T) {
-        // 1. Engine 转换到失败状态
-        engine := statemachine.NewEngine(nil, nil)
-        cluster := &bkev1beta1.BKECluster{
-            Status: bkev1beta1.BKEClusterStatus{
-                ClusterStatus: bkev1beta1.ClusterUpgrading,
-            },
-        }
-        
-        // 模拟 Phase 执行失败
-        err := engine.Transition(cluster, nil, "EnsureUpgrade", errors.New("upgrade failed"))
-        assert.NoError(t, err)
-        assert.Equal(t, bkev1beta1.ClusterUpgradeFailed, cluster.Status.ClusterStatus)
-        
-        // 2. StatusManager 观察失败状态并伪装
-        sm := statusmanage.NewStatusManagerV2()
-        sm.SetStatus(cluster, nil)
-        
-        // 3. 验证：重试次数内，状态被伪装为 LatestNormalState
-        // 外部消费者看到的是伪装后的状态
-        result := sm.GetCtrlResult(cluster)
-        assert.True(t, result.Requeue)
-    })
-    
-    t.Run("状态暴露：重试次数耗尽后暴露失败", func(t *testing.T) {
-        // 模拟重试次数耗尽
-        // 验证：ClusterStatus 保持为 ClusterUpgradeFailed
-        // 验证：NeedRequeue = false
-    })
-    
-    t.Run("并发安全：多协程同时更新状态", func(t *testing.T) {
-        // 模拟多个 Reconcile 循环并发调用 SetStatus
-        // 验证：StatusCount 使用原子操作，无竞态条件
-    })
-}
-```
+**规则覆盖测试**：
+- 验证所有 64 条转换规则都有对应的测试用例
+- 测试每条规则的可触发性
+- 验证规则注册的正确性
 
-### 7.4 状态转换完整性测试
+**死胡同状态测试**：
+- 验证没有死胡同状态（除了 Failed 和 Deleted）
+- 测试每个非终态都有至少一条出边
+- 验证状态机的连通性
 
-```go
-// TestAllTransitionsCovered 验证所有 64 条转换规则都被测试覆盖
-func TestAllTransitionsCovered(t *testing.T) {
-    engine := statemachine.NewEngine(nil, nil)
-    
-    // 获取所有注册的转换规则
-    transitions := engine.GetAllTransitions()
-    assert.Equal(t, 64, len(transitions), "应该有 64 条转换规则")
-    
-    // 验证每条规则都有对应的测试用例
-    for _, trans := range transitions {
-        t.Run(fmt.Sprintf("%s->%s via %s", trans.FromState, trans.ToState, trans.Trigger), func(t *testing.T) {
-            // 构造测试用例，验证转换可以触发
-        })
-    }
-}
+**状态完整性测试**：
+- 验证所有状态都被正确定义
+- 测试状态枚举值的完整性
+- 验证状态转换规则的覆盖度
 
-// TestNoDeadEndStates 验证没有死胡同状态（除了 Failed 和 Deleted）
-func TestNoDeadEndStates(t *testing.T) {
-    engine := statemachine.NewEngine(nil, nil)
-    
-    // 获取所有状态
-    allStates := engine.GetAllStates()
-    
-    for _, state := range allStates {
-        if state == bkev1beta1.ClusterFailed || state == bkev1beta1.ClusterDeleted {
-            continue // 终态允许没有出边
-        }
-        
-        // 验证每个非终态都有至少一条出边
-        outEdges := engine.GetOutgoingTransitions(state)
-        assert.Greater(t, len(outEdges), 0, "状态 %s 应该有至少一条出边", state)
-    }
-}
-```
+### 7.5 事件追踪测试设计点
 
-### 7.5 事件追踪测试
+**InMemoryEventStore 测试**：
+- 测试 Record 方法的事件记录
+- 测试 Query 方法的过滤逻辑（按集群名称、时间范围、状态等）
+- 测试容量限制（超过 maxSize 时移除最旧事件）
 
-```go
-// TestInMemoryEventStore 测试内存事件存储
-func TestInMemoryEventStore(t *testing.T) {
-    t.Run("Record 记录事件", func(t *testing.T) {
-        store := statemachine.NewInMemoryEventStore(100)
-        
-        event := statemachine.TransitionEvent{
-            Timestamp: time.Now(),
-            Cluster:   "default/test-cluster",
-            FromState: bkev1beta1.ClusterReady,
-            ToState:   bkev1beta1.ClusterUpgrading,
-            Trigger:   "EnsureUpgrade",
-            Error:     nil,
-            Duration:  100 * time.Millisecond,
-        }
-        
-        err := store.Record(event)
-        assert.NoError(t, err)
-        
-        // 验证事件已记录
-        events, err := store.Query(statemachine.EventFilter{})
-        assert.NoError(t, err)
-        assert.Equal(t, 1, len(events))
-    })
-    
-    t.Run("Query 按集群名称过滤", func(t *testing.T) {
-        store := statemachine.NewInMemoryEventStore(100)
-        
-        // 记录多个集群的事件
-        store.Record(statemachine.TransitionEvent{Cluster: "default/cluster-1"})
-        store.Record(statemachine.TransitionEvent{Cluster: "default/cluster-2"})
-        store.Record(statemachine.TransitionEvent{Cluster: "default/cluster-1"})
-        
-        // 查询 cluster-1 的事件
-        events, err := store.Query(statemachine.EventFilter{
-            ClusterName: "default/cluster-1",
-        })
-        assert.NoError(t, err)
-        assert.Equal(t, 2, len(events))
-    })
-    
-    t.Run("Query 按时间范围过滤", func(t *testing.T) {
-        store := statemachine.NewInMemoryEventStore(100)
-        
-        now := time.Now()
-        store.Record(statemachine.TransitionEvent{Timestamp: now.Add(-2 * time.Hour)})
-        store.Record(statemachine.TransitionEvent{Timestamp: now.Add(-1 * time.Hour)})
-        store.Record(statemachine.TransitionEvent{Timestamp: now})
-        
-        // 查询最近 1.5 小时的事件
-        events, err := store.Query(statemachine.EventFilter{
-            StartTime: now.Add(-90 * time.Minute),
-            EndTime:   now,
-        })
-        assert.NoError(t, err)
-        assert.Equal(t, 2, len(events))
-    })
-    
-    t.Run("容量限制", func(t *testing.T) {
-        store := statemachine.NewInMemoryEventStore(3)
-        
-        // 记录 5 个事件
-        for i := 0; i < 5; i++ {
-            store.Record(statemachine.TransitionEvent{Cluster: fmt.Sprintf("cluster-%d", i)})
-        }
-        
-        // 验证只保留最新的 3 个事件
-        events, err := store.Query(statemachine.EventFilter{})
-        assert.NoError(t, err)
-        assert.Equal(t, 3, len(events))
-        assert.Equal(t, "cluster-2", events[0].Cluster)
-        assert.Equal(t, "cluster-3", events[1].Cluster)
-        assert.Equal(t, "cluster-4", events[2].Cluster)
-    })
-}
+**Engine 事件记录测试**：
+- 验证状态转换时自动记录事件
+- 测试事件包含正确的 FromState、ToState、Trigger、Error、Duration
+- 验证失败转换记录错误信息
 
-// TestEngineEventRecording 测试 Engine 自动记录事件
-func TestEngineEventRecording(t *testing.T) {
-    t.Run("状态转换自动记录事件", func(t *testing.T) {
-        engine := statemachine.NewEngine(nil, nil)
-        cluster := &bkev1beta1.BKECluster{
-            Status: bkev1beta1.BKEClusterStatus{
-                ClusterStatus: bkev1beta1.ClusterReady,
-            },
-        }
-        
-        // 执行状态转换
-        err := engine.Transition(cluster, nil, "EnsureUpgrade", nil)
-        assert.NoError(t, err)
-        
-        // 验证事件已自动记录
-        events := engine.QueryHistory(statemachine.EventFilter{
-            ClusterName: fmt.Sprintf("%s/%s", cluster.Namespace, cluster.Name),
-        })
-        assert.Equal(t, 1, len(events))
-        assert.Equal(t, bkev1beta1.ClusterReady, events[0].FromState)
-        assert.Equal(t, bkev1beta1.ClusterUpgrading, events[0].ToState)
-    })
-    
-    t.Run("失败转换记录错误信息", func(t *testing.T) {
-        engine := statemachine.NewEngine(nil, nil)
-        cluster := &bkev1beta1.BKECluster{
-            Status: bkev1beta1.BKEClusterStatus{
-                ClusterStatus: bkev1beta1.ClusterUpgrading,
-            },
-        }
-        
-        // 执行失败的状态转换
-        testErr := errors.New("upgrade failed")
-        err := engine.Transition(cluster, nil, "EnsureUpgrade", testErr)
-        assert.NoError(t, err)
-        
-        // 验证事件记录了错误信息
-        events := engine.QueryHistory(statemachine.EventFilter{
-            ClusterName: fmt.Sprintf("%s/%s", cluster.Namespace, cluster.Name),
-        })
-        assert.Equal(t, 1, len(events))
-        assert.NotNil(t, events[0].Error)
-        assert.Equal(t, "upgrade failed", events[0].ErrorMessage)
-    })
-}
-```
+**事件查询测试**：
+- 测试按集群名称查询事件
+- 测试按时间范围查询事件
+- 测试按状态转换查询事件
+- 验证查询结果的正确性和完整性
+
+**监控指标测试**：
+- 验证事件记录总数的统计
+- 测试事件记录失败次数的统计
+- 测试事件查询次数的统计
+- 验证事件存储大小的统计
 
 ## 8. 性能优化建议
 
