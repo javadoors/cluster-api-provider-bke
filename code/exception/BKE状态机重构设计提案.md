@@ -31,6 +31,9 @@
 - [7. 测试策略](#7-测试策略)
   - [7.1 单元测试](#71-单元测试)
   - [7.2 集成测试](#72-集成测试)
+  - [7.3 Engine 与 StatusManager 协作测试](#73-engine-与-statusmanager-协作测试)
+  - [7.4 状态转换完整性测试](#74-状态转换完整性测试)
+  - [7.5 事件追踪测试](#75-事件追踪测试)
 - [8. 性能优化建议](#8-性能优化建议)
   - [8.1 减少锁竞争](#81-减少锁竞争)
   - [8.2 异步事件记录](#82-异步事件记录)
@@ -3651,7 +3654,7 @@ func (b *StatusManagerV2) RemoveSingleNodeStatusCache(bkeCluster *bkev1beta1.BKE
 
 #### 4.3.6 Engine 与 StatusManager 协作
 
-##### 职责划分
+##### 4.3.6.1 职责划分
 
 | 职责 | 负责组件 | 说明 |
 |------|---------|------|
@@ -3666,7 +3669,111 @@ func (b *StatusManagerV2) RemoveSingleNodeStatusCache(bkeCluster *bkev1beta1.BKE
 | **状态伪装** | Engine | 在重试次数内，将 Failed 状态伪装为 LatestNormalState |
 | **LastInProgressState** | Engine | 错误转换时记录失败前的进行中状态 |
 
-##### Engine 处理 Retry trigger
+##### 4.3.6.2 协作流程
+
+Engine 与 StatusManager 的协作流程如下：
+
+1. **状态转换前**：Engine 准备执行状态转换
+2. **状态转换中**：Engine 调用 `applyTransition` 执行转换
+3. **状态转换后**：
+   - 如果转换成功：Engine 调用 `StatusManager.ResetRetryCount()` 重置重试计数
+   - 如果转换失败：Engine 调用 `StatusManager.IncRetryCount()` 增加重试计数
+4. **重试决策**：Engine 在处理 `TriggerRetry` 时，查询 StatusManager 的重试计数，决定是否允许重试
+
+##### 4.3.6.3 代码示例
+
+```go
+// Engine 中的 Transition 方法
+func (e *Engine) Transition(cluster *bkev1beta1.BKECluster, bkeNodes bkev1beta1.BKENodes, trigger string, err error) error {
+    startTime := time.Now()
+    currentState := cluster.Status.ClusterStatus
+
+    // 根据 err 决定实际触发器
+    effectiveTrigger := trigger
+    if err != nil {
+        effectiveTrigger = TriggerError
+    }
+
+    // 构造 ConditionContext
+    condCtx := &ConditionContext{
+        Client:     e.client,
+        Ctx:        e.ctx,
+        BKECluster: cluster,
+        BKENodes:   bkeNodes,
+    }
+
+    e.mux.RLock()
+    defer e.mux.RUnlock()
+
+    // 查找匹配的转换规则
+    for _, trans := range e.transitions {
+        if trans.FromState == currentState && trans.Trigger == effectiveTrigger {
+            // 检查转换前置条件
+            if trans.Condition != nil && !trans.Condition(condCtx) {
+                continue
+            }
+
+            // 执行转换动作
+            if trans.Action != nil {
+                if actionErr := trans.Action(cluster); actionErr != nil {
+                    return actionErr
+                }
+            }
+
+            // 应用新状态
+            cluster.Status.ClusterStatus = trans.ToState
+
+            // 错误转换时，记录失败前的进行中状态
+            if effectiveTrigger == TriggerError {
+                cluster.Status.LastInProgressState = currentState
+            }
+
+            // 记录转换事件
+            duration := time.Since(startTime)
+            e.recordTransition(cluster, trans, err, duration)
+            
+            // 与 StatusManager 协作：更新重试计数
+            if err == nil {
+                // 转换成功，重置重试计数
+                e.statusManager.ResetRetryCount(cluster)
+            } else {
+                // 转换失败，增加重试计数
+                e.statusManager.IncRetryCount(cluster)
+            }
+            
+            return nil
+        }
+    }
+
+    return nil
+}
+
+// Engine 处理 Retry trigger
+func (e *Engine) handleRetry(cluster *bkev1beta1.BKECluster, trigger string) error {
+    // 1. 获取重试计数
+    retryCount := e.statusManager.GetRetryCount(cluster)
+    
+    // 2. 获取重试策略（从 Engine 内部配置）
+    policy := e.getRetryPolicy(cluster.Status.ClusterStatus)
+    
+    // 3. 判断是否允许重试
+    if retryCount >= policy.MaxRetryCount {
+        // 超过重试次数，保持 Failed 状态
+        return nil
+    }
+    
+    // 4. 找到从当前 Failed 状态出发的 Retry 规则
+    retryTransition := e.findRetryTransition(cluster.Status.ClusterStatus)
+    if retryTransition == nil {
+        return nil
+    }
+    
+    // 5. 执行状态转换
+    return e.applyTransition(cluster, retryTransition)
+}
+```
+
+##### 4.3.6.4 Engine 处理 Retry trigger
 
 ```go
 func (e *Engine) handleRetry(cluster *bkev1beta1.BKECluster, trigger string) error {
@@ -3849,9 +3956,18 @@ if sr.CurrentClusterState != bkev1beta1.ClusterUnhealthy &&
 
 **设计思路**: 提供 `EventStore` 接口的默认内存实现，作为 Engine 的可选组件。Engine 默认使用 `InMemoryEventStore`，也可以通过 `WithEventStore` 选项替换为其他实现。
 
-> **与 4.2.3 节的关系**：4.2.3 节的 `engine.go` 定义了 `EventStore` 接口，本节提供默认的内存实现 `InMemoryEventStore`。Engine 默认使用此实现，也可以通过选项模式替换。
+> **与 4.2.3 节的关系**：4.2.3 节的 `engine.go` 定义了 `EventStore` 接口和事件记录机制，本节提供默认的内存实现 `InMemoryEventStore`，并说明使用场景和最佳实践。
 
-#### 4.4.1 InMemoryEventStore 实现
+#### 4.4.1 使用场景
+
+| 场景 | 说明 | 示例 |
+|------|------|------|
+| **故障排查** | 查询状态转换历史，定位问题 | 集群卡在 Upgrading 状态，查询事件发现最后一次转换失败 |
+| **状态审计** | 合规审计和变更追踪 | 查询某个集群在过去 24 小时内的所有状态变更 |
+| **性能分析** | 识别性能瓶颈 | 统计 Upgrading 状态的平均持续时间，发现升级过程耗时过长 |
+| **问题复现** | 通过事件历史复现问题场景 | 根据事件历史中的触发器和状态序列，在测试环境中复现相同的问题 |
+
+#### 4.4.2 InMemoryEventStore 实现
 
 ```go
 package statemachine
@@ -3905,20 +4021,127 @@ func (s *InMemoryEventStore) Query(filter EventFilter) ([]TransitionEvent, error
 }
 ```
 
-#### 4.4.2 使用方式
+#### 4.4.3 使用方式
+
+**1. 创建 Engine（自动使用默认 EventStore）**
 
 ```go
 // 方式 1：使用默认内存存储（推荐）
 engine := NewEngine(client, ctx)
 
 // 方式 2：自定义 EventStore
-customStore := NewInMemoryEventStore(2000)
+customStore := NewInMemoryEventStore(5000)
 engine := NewEngine(client, ctx, WithEventStore(customStore))
+```
 
-// 查询事件
+**2. 事件记录（自动触发）**
+
+```go
+// 事件记录是自动的，在状态转换时触发
+err := engine.Transition(cluster, nodes, trigger, err)
+// 内部会自动调用 e.eventStore.Record(event)
+// 无需手动调用
+```
+
+**3. 查询事件**
+
+```go
+// 查询某个集群的所有事件
 events := engine.QueryHistory(EventFilter{
     ClusterName: "default/my-cluster",
 })
+
+// 查询某个集群的失败事件
+failed := false
+events := engine.QueryHistory(EventFilter{
+    ClusterName: "default/my-cluster",
+    Success:     &failed,
+})
+
+// 查询某个时间段内的事件
+events := engine.QueryHistory(EventFilter{
+    ClusterName: "default/my-cluster",
+    StartTime:   time.Now().Add(-1 * time.Hour),
+    EndTime:     time.Now(),
+})
+
+// 查询特定状态转换的事件
+events := engine.QueryHistory(EventFilter{
+    ClusterName: "default/my-cluster",
+    FromState:   bkev1beta1.ClusterReady,
+    ToState:     bkev1beta1.ClusterUpgrading,
+})
+```
+
+#### 4.4.4 错误处理
+
+事件记录失败时的处理策略：
+
+- **当前实现**：忽略错误（`_ = e.eventStore.Record(event)`）
+- **原因**：事件记录失败不应影响状态转换的核心逻辑
+- **建议**：
+  - 记录日志：在 `recordTransition` 方法中添加错误日志
+  - 暴露监控指标：统计事件记录失败次数，便于运维监控
+
+**示例代码**：
+
+```go
+func (e *Engine) recordTransition(cluster *BKECluster, trans Transition, err error, duration time.Duration) {
+    event := TransitionEvent{
+        Timestamp:    time.Now(),
+        Cluster:      fmt.Sprintf("%s/%s", cluster.Namespace, cluster.Name),
+        FromState:    trans.FromState,
+        ToState:      trans.ToState,
+        Trigger:      trans.Trigger,
+        Error:        err,
+        Duration:     duration,
+        ErrorMessage: getErrorMessage(err),
+    }
+    
+    if recordErr := e.eventStore.Record(event); recordErr != nil {
+        // 记录日志，但不影响状态转换
+        log.Warn("failed to record transition event", "error", recordErr)
+    }
+}
+```
+
+#### 4.4.5 性能考虑
+
+- **事件记录开销**：事件记录是同步的，但开销很小（只是追加到切片）
+- **内存占用**：如果 maxSize 设置合理（1000-10000），内存占用可控
+- **查询性能**：查询操作是 O(n)，n 为事件数量，建议在 maxSize 设置时考虑查询性能
+- **并发安全**：使用 `sync.RWMutex` 保证并发安全，读多写少场景下性能良好
+
+**性能建议**：
+
+| 场景 | 推荐 maxSize | 说明 |
+|------|-------------|------|
+| 开发测试 | 1000 | 足够调试使用，内存占用小 |
+| 生产环境（小规模） | 5000 | 平衡查询性能和内存占用 |
+| 生产环境（大规模） | 10000 | 需要频繁查询历史事件 |
+
+#### 4.4.6 配置说明
+
+**maxSize 推荐设置**：
+
+- 默认值：1000（适合大多数场景）
+- 可通过代码参数设置：`NewInMemoryEventStore(5000)`
+- 建议通过配置文件或环境变量设置，便于运维调整
+
+**配置示例**：
+
+```go
+// 从环境变量读取配置
+maxSizeStr := os.Getenv("EVENT_STORE_MAX_SIZE")
+maxSize := 1000 // 默认值
+if maxSizeStr != "" {
+    if size, err := strconv.Atoi(maxSizeStr); err == nil {
+        maxSize = size
+    }
+}
+
+eventStore := NewInMemoryEventStore(maxSize)
+engine := NewEngine(client, ctx, WithEventStore(eventStore))
 ```
 
 **优势**:
@@ -3931,11 +4154,52 @@ events := engine.QueryHistory(EventFilter{
 - **性能分析**：记录转换耗时（`Duration` 字段），支持性能瓶颈识别
 - **易于集成**：通过 `EventStore` 接口，可以轻松替换为其他存储实现
 
-**删除的功能**:
+**暂不实现的功能**:
 
-- **PersistentEventStore**：Kubernetes Event 持久化（当前不需要）
-- **多格式导出**：CSV、Graphviz 导出（当前不需要）
-- **StateMachineEventRecorder**：功能已集成到 Engine
+- **PersistentEventStore**：Kubernetes Event 持久化（未来可扩展）
+- **多格式导出**：CSV、Graphviz 导出（未来可扩展）
+
+#### 4.4.7 监控指标
+
+建议暴露以下 Prometheus 指标，便于运维监控：
+
+| 指标名称 | 类型 | 说明 |
+|---------|------|------|
+| `bke_state_machine_events_recorded_total` | Counter | 事件记录总数 |
+| `bke_state_machine_events_record_errors_total` | Counter | 事件记录失败总数 |
+| `bke_state_machine_event_queries_total` | Counter | 事件查询总数 |
+| `bke_state_machine_event_store_size` | Gauge | 当前事件存储大小 |
+
+**监控示例**：
+
+```go
+// 在 InMemoryEventStore 中添加监控指标
+type InMemoryEventStore struct {
+    events  []TransitionEvent
+    maxSize int
+    mux     sync.RWMutex
+    
+    // 监控指标
+    recordedTotal   prometheus.Counter
+    recordErrors    prometheus.Counter
+    queriesTotal    prometheus.Counter
+    storeSize       prometheus.Gauge
+}
+
+func (s *InMemoryEventStore) Record(event TransitionEvent) error {
+    s.mux.Lock()
+    defer s.mux.Unlock()
+    
+    if len(s.events) >= s.maxSize {
+        s.events = s.events[1:]
+    }
+    
+    s.events = append(s.events, event)
+    s.recordedTotal.Inc()
+    s.storeSize.Set(float64(len(s.events)))
+    return nil
+}
+```
 
 ### 4.5 设计远景：混合模型架构
 
@@ -4522,6 +4786,131 @@ func TestNoDeadEndStates(t *testing.T) {
 }
 ```
 
+### 7.5 事件追踪测试
+
+```go
+// TestInMemoryEventStore 测试内存事件存储
+func TestInMemoryEventStore(t *testing.T) {
+    t.Run("Record 记录事件", func(t *testing.T) {
+        store := statemachine.NewInMemoryEventStore(100)
+        
+        event := statemachine.TransitionEvent{
+            Timestamp: time.Now(),
+            Cluster:   "default/test-cluster",
+            FromState: bkev1beta1.ClusterReady,
+            ToState:   bkev1beta1.ClusterUpgrading,
+            Trigger:   "EnsureUpgrade",
+            Error:     nil,
+            Duration:  100 * time.Millisecond,
+        }
+        
+        err := store.Record(event)
+        assert.NoError(t, err)
+        
+        // 验证事件已记录
+        events, err := store.Query(statemachine.EventFilter{})
+        assert.NoError(t, err)
+        assert.Equal(t, 1, len(events))
+    })
+    
+    t.Run("Query 按集群名称过滤", func(t *testing.T) {
+        store := statemachine.NewInMemoryEventStore(100)
+        
+        // 记录多个集群的事件
+        store.Record(statemachine.TransitionEvent{Cluster: "default/cluster-1"})
+        store.Record(statemachine.TransitionEvent{Cluster: "default/cluster-2"})
+        store.Record(statemachine.TransitionEvent{Cluster: "default/cluster-1"})
+        
+        // 查询 cluster-1 的事件
+        events, err := store.Query(statemachine.EventFilter{
+            ClusterName: "default/cluster-1",
+        })
+        assert.NoError(t, err)
+        assert.Equal(t, 2, len(events))
+    })
+    
+    t.Run("Query 按时间范围过滤", func(t *testing.T) {
+        store := statemachine.NewInMemoryEventStore(100)
+        
+        now := time.Now()
+        store.Record(statemachine.TransitionEvent{Timestamp: now.Add(-2 * time.Hour)})
+        store.Record(statemachine.TransitionEvent{Timestamp: now.Add(-1 * time.Hour)})
+        store.Record(statemachine.TransitionEvent{Timestamp: now})
+        
+        // 查询最近 1.5 小时的事件
+        events, err := store.Query(statemachine.EventFilter{
+            StartTime: now.Add(-90 * time.Minute),
+            EndTime:   now,
+        })
+        assert.NoError(t, err)
+        assert.Equal(t, 2, len(events))
+    })
+    
+    t.Run("容量限制", func(t *testing.T) {
+        store := statemachine.NewInMemoryEventStore(3)
+        
+        // 记录 5 个事件
+        for i := 0; i < 5; i++ {
+            store.Record(statemachine.TransitionEvent{Cluster: fmt.Sprintf("cluster-%d", i)})
+        }
+        
+        // 验证只保留最新的 3 个事件
+        events, err := store.Query(statemachine.EventFilter{})
+        assert.NoError(t, err)
+        assert.Equal(t, 3, len(events))
+        assert.Equal(t, "cluster-2", events[0].Cluster)
+        assert.Equal(t, "cluster-3", events[1].Cluster)
+        assert.Equal(t, "cluster-4", events[2].Cluster)
+    })
+}
+
+// TestEngineEventRecording 测试 Engine 自动记录事件
+func TestEngineEventRecording(t *testing.T) {
+    t.Run("状态转换自动记录事件", func(t *testing.T) {
+        engine := statemachine.NewEngine(nil, nil)
+        cluster := &bkev1beta1.BKECluster{
+            Status: bkev1beta1.BKEClusterStatus{
+                ClusterStatus: bkev1beta1.ClusterReady,
+            },
+        }
+        
+        // 执行状态转换
+        err := engine.Transition(cluster, nil, "EnsureUpgrade", nil)
+        assert.NoError(t, err)
+        
+        // 验证事件已自动记录
+        events := engine.QueryHistory(statemachine.EventFilter{
+            ClusterName: fmt.Sprintf("%s/%s", cluster.Namespace, cluster.Name),
+        })
+        assert.Equal(t, 1, len(events))
+        assert.Equal(t, bkev1beta1.ClusterReady, events[0].FromState)
+        assert.Equal(t, bkev1beta1.ClusterUpgrading, events[0].ToState)
+    })
+    
+    t.Run("失败转换记录错误信息", func(t *testing.T) {
+        engine := statemachine.NewEngine(nil, nil)
+        cluster := &bkev1beta1.BKECluster{
+            Status: bkev1beta1.BKEClusterStatus{
+                ClusterStatus: bkev1beta1.ClusterUpgrading,
+            },
+        }
+        
+        // 执行失败的状态转换
+        testErr := errors.New("upgrade failed")
+        err := engine.Transition(cluster, nil, "EnsureUpgrade", testErr)
+        assert.NoError(t, err)
+        
+        // 验证事件记录了错误信息
+        events := engine.QueryHistory(statemachine.EventFilter{
+            ClusterName: fmt.Sprintf("%s/%s", cluster.Namespace, cluster.Name),
+        })
+        assert.Equal(t, 1, len(events))
+        assert.NotNil(t, events[0].Error)
+        assert.Equal(t, "upgrade failed", events[0].ErrorMessage)
+    })
+}
+```
+
 ## 8. 性能优化建议
 
 > **章节摘要**：本章提供性能优化建议，包括减少锁竞争（使用分段锁）和异步事件记录（使用 channel 异步写入），提升系统性能和响应速度。
@@ -4765,10 +5154,10 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 
 | 术语 | 英文 | 定义 | 使用场景 |
 |------|------|------|---------|
-| **StateTransitionEvent** | State Transition Event | 状态转换事件，记录状态转换的时间、来源、目标、触发器、结果 | 事件记录 |
+| **TransitionEvent** | Transition Event | 状态转换事件，记录状态转换的时间、集群、源状态、目标状态、触发器、错误、耗时 | 事件记录 |
 | **EventStore** | Event Store | 事件存储接口，支持内存存储和持久化存储 | 事件管理 |
-| **InMemoryEventStore** | In-Memory Event Store | 内存事件存储，用于短期存储和开发调试 | 开发测试 |
-| **PersistentEventStore** | Persistent Event Store | 持久化事件存储，使用 Kubernetes Event 资源 | 生产环境 |
+| **InMemoryEventStore** | In-Memory Event Store | 内存事件存储，用于短期存储和开发调试，默认容量 1000 条 | 开发测试 |
+| **EventFilter** | Event Filter | 事件查询过滤器，支持按集群、时间、状态、触发器等多维度过滤 | 事件查询 |
 
 #### 映射函数
 
@@ -4798,7 +5187,7 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 │                    ┌──────────────────┐                         │
 │                    │ LifecyclePhase   │                         │
 │                    │  (三层状态机)     │                         │
-│                    │    9个值          │                         │
+│                    │    10个值         │                         │
 │                    └──────────────────┘                         │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
