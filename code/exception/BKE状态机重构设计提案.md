@@ -451,6 +451,11 @@ func (r *BKEClusterReconciler) setClusterHealthStatus(...) {
 
 ###### 问题 4：两个状态机边界不清，通过 statusmanager 桥接导致耦合
 
+**"两个状态机"指的是**：
+
+1. **ClusterStatus 状态机**：由 `phase_flow.go` 的 11 个 `handle*Phase` 函数管理，负责集群操作状态的转换（如 Initializing、Upgrading、ScaleFailed 等 22 个状态）
+2. **ClusterHealthState 状态机**：由 `setClusterHealthStatus`（controller:757）和 `ensure_cluster.go:373,399` 管理，负责集群健康状态的转换（如 Deploying、Upgrading、Healthy、Unhealthy 等 9 个状态）
+
 两个状态机各自独立转换，通过 `statusmanager.go:121-228` 桥接：
 
 ```go
