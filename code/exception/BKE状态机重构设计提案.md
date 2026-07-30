@@ -180,6 +180,7 @@ func handleClusterScaleMasterUpPhase(ctx *PhaseContext, err error) {
 ##### 2.1.1.4 其他控制器中的状态转换
 
 ###### 2.1.1.4.1 bkecluster_controller.go
+
 **文件**: `controllers/capbke/bkecluster_controller.go`
 
 | 行号 | 函数 | 状态转换 | 说明 |
@@ -188,6 +189,7 @@ func handleClusterScaleMasterUpPhase(ctx *PhaseContext, err error) {
 | 807 | 直接赋值 | ClusterHealthState | 设置健康状态 |
 
 ###### 2.1.1.4.2 bkecluster_upgrade_dag.go
+
 **文件**: `controllers/capbke/bkecluster_upgrade_dag.go`
 
 | 行号 | 位置 | 状态转换 | 说明 |
@@ -195,6 +197,7 @@ func handleClusterScaleMasterUpPhase(ctx *PhaseContext, err error) {
 | 310 | 升级流程 | ClusterStatus = status | 升级状态设置 |
 
 ###### 2.1.1.4.3 ensure_delete_or_reset.go
+
 **文件**: `pkg/phaseframe/phases/ensure_delete_or_reset.go`
 
 | 行号 | 位置 | 状态转换 | 说明 |
@@ -202,6 +205,7 @@ func handleClusterScaleMasterUpPhase(ctx *PhaseContext, err error) {
 | 179 | 删除流程 | → ClusterDeleting | 删除状态设置 |
 
 ###### 2.1.1.4.4 context.go
+
 **文件**: `pkg/phaseframe/context.go`
 
 | 行号 | 位置 | 状态转换 | 说明 |
@@ -518,6 +522,7 @@ default:
 ```
 
 三层模型的核心设计思想是**混合模型**：
+
 - **驱动模型（自上而下）**：决定集群"正在做什么"（LifecyclePhase）
 - **聚合模型（自底向上）**：决定集群"健康状况如何"（HealthStatus）
 
@@ -795,6 +800,7 @@ if sr.AllowFailed() {
 #### 4.0.5 总结
 
 **所有 2.1-2.6 节列出的问题都在提案设计中得到了解决**：
+
 - **4.1 节（状态字段整合）**：解决"用什么字段表达状态"的问题
 - **4.2 节（状态转换引擎）**：解决"状态如何转换"的问题
 - **4.3 节（状态管理）**：解决内存泄漏、灵活重试、并发安全等问题
@@ -1006,6 +1012,7 @@ LastInProgressState ClusterStatus `json:"lastInProgressState,omitempty"`
 | Worker 缩容失败 | TriggerError 转换时 | WorkerScalingDown | 重试时恢复到 WorkerScalingDown |
 
 **设计原则**：
+
 - **语义清晰**：记录"失败时的进行中状态"，不是"进入进行中状态前的正常状态"
 - **持久化存储**：存储在 Cluster.Status 中，重启不丢失
 - **自动设置**：在错误转换时（TriggerError）由引擎自动设置，无需业务代码干预
@@ -1623,6 +1630,7 @@ params.CombinedCluster.SetClusterStatus(newBKECuster.Status.ClusterStatus)
 | **缺乏可视化** | 无法生成状态机文档和可视化图表 |
 
 **与 4.1 节的关系**：
+
 - **4.1 节（状态字段整合）**：解决"用什么字段表达状态"的问题（统一为 ClusterStatus）
 - **4.2 节（状态转换引擎）**：解决"状态如何转换"的问题（集中管理转换逻辑）
 
@@ -1658,6 +1666,7 @@ type Transition struct {
 **规则冲突检查**：
 
 经过系统检查，所有转换规则不存在冲突。关键设计保证：
+
 1. **不同 Trigger**：同一 FromState 下的多条规则使用不同的 Trigger
 2. **不同 FromState**：同一 Trigger 下的多条规则使用不同的 FromState
 3. **Condition 互斥**：ScaleFailed 的 4 条重试规则通过 `LastInProgressState` 区分，每个 Condition 函数检查不同的值
@@ -1715,6 +1724,7 @@ func IsMasterScaleUpRetry(cc *ConditionContext) bool {
 | 4 | MasterScalingUp | MasterScalingUp | 重试，IsMasterScaleUpRetry=true，匹配第一条规则 |
 
 **设计优势**：
+
 - **无冲突**：每个 Condition 函数检查不同的值，互斥
 - **持久化**：存储在 Cluster.Status 中，重启不丢失
 - **自动化**：引擎在错误转换时自动设置，无需业务代码干预
@@ -1738,6 +1748,7 @@ func IsMasterScaleUpRetry(cc *ConditionContext) bool {
 | **总计** | **64** | | |
 
 **Trigger 类型说明**：
+
 - `phaseName`：Phase 开始执行（pre-hook）
 - `TriggerPhaseComplete`：Phase 执行成功（post-hook，err==nil）
 - `TriggerError`：Phase 执行失败（post-hook，err!=nil）
@@ -3256,6 +3267,7 @@ func (r *StatusRecordV2) Equal(state string) bool {
 ```
 
 **删除的字段**：
+
 - `RetryPolicy`（由 Engine 管理）
 
 ##### StatusManagerV2
@@ -3374,6 +3386,7 @@ func (b *StatusManagerV2) recordBKEClusterStatus(bkeCluster *bkev1beta1.BKEClust
 ```
 
 **删除的逻辑**：
+
 - 状态伪装：恢复到 LatestNormalState（约 10 行）
 - 超过重试次数，设置最终失败状态（约 40 行）
 
@@ -4221,6 +4234,7 @@ func (s *InMemoryEventStore) Record(event TransitionEvent) error {
 #### 4.5.1 混合模型架构
 
 **核心原则**：
+
 - **驱动模型（自上而下）**：由用户操作驱动状态转换，决定 `LifecyclePhase`（生命周期阶段）
 - **聚合模型（自底向上）**：由下层状态聚合出上层健康状态，决定 `HealthStatus`（健康状态）
 - **两个模型各司其职，互不干扰**
@@ -4255,6 +4269,7 @@ func (s *InMemoryEventStore) Record(event TransitionEvent) error {
 #### 4.5.2 三层状态机模型（目标架构）
 
 **设计原则**：
+
 - **单一职责**：每层状态只描述该层的生命周期阶段
 - **正交性**：生命周期状态（LifecyclePhase）与健康状态（HealthStatus）相互独立
 - **完整性**：覆盖所有必要的生命周期阶段，包括失败状态
@@ -4320,6 +4335,7 @@ func (s *InMemoryEventStore) Record(event TransitionEvent) error {
 - **关系**：操作模式不影响生命周期阶段的转换
 
 **示例**：
+
 ```yaml
 # 场景：集群在 Running 阶段被暂停
 status:
@@ -4364,6 +4380,7 @@ status:
 ```
 
 **控制器行为**：
+
 - 如果 `spec.paused = true`，控制器**跳过**状态转换
 - 如果 `spec.paused = false`，控制器**执行**状态转换
 - 状态机规则本身不变
@@ -4387,6 +4404,7 @@ status:
 ```
 
 **行为**：
+
 - 生命周期阶段保持 `Running`
 - 控制器跳过所有 Reconcile 逻辑
 - 可以通过 `spec.paused = false` 恢复
@@ -4411,6 +4429,7 @@ status:
 ```
 
 **行为**：
+
 - 生命周期阶段保持 `Upgrading`
 - 升级操作暂停
 - 恢复后继续升级
@@ -4432,6 +4451,7 @@ status:
 ```
 
 **行为**：
+
 - 生命周期阶段保持 `Running`
 - 控制器执行 DryRun 逻辑（不实际升级）
 - 返回升级可行性报告
@@ -4567,6 +4587,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 2. **增强层**：状态转换表引擎 + 分层重试（本提案阶段二三）
 3. **桥梁层**：OperationProgress + HealthStatus（新增，连接本提案与目标架构的关键）
 4. **目标层**：混合模型（驱动模型 + 聚合模型，三层状态机）
+
 ## 5. 综合重构方案
 
 > **章节摘要**：本章从整体架构、分阶段实施计划、关键文件变更清单、工时估算与里程碑、验收标准五个维度，综合描述 BKE 状态机的重构方案。重构分为两个阶段：阶段一（状态字段整合，7-11 天，必须实施）确立 `ClusterStatus` 为单一数据源；阶段二（状态机增强，12-16 天，可选实施）引入状态转换引擎（64 条规则）、StatusManagerV2 和事件追踪系统。总工时 19-27 天，面向三层状态机架构（驱动模型 + 聚合模型）平滑演进。
@@ -5092,17 +5113,20 @@ func calculatingClusterPostStatusByPhase(phase phaseframe.Phase, err error) erro
 ### 7.1 单元测试设计点
 
 **状态转换表测试**：
+
 - 验证所有 64 条转换规则的正确性
 - 测试每条规则的 FromState、Trigger、ToState 映射
 - 测试 err 参数决定 effectiveTrigger 的逻辑
 - 覆盖成功路径和失败路径
 
 **Condition 函数测试**：
+
 - 测试所有 Condition 函数的返回值
 - 验证 IsClusterReady、NeedUpgrade、IsScaleComplete 等函数
 - 测试边界条件（如节点数量为 0、版本相同等）
 
 **Engine 方法测试**：
+
 - 测试 Transition 方法的状态转换逻辑
 - 测试 AddTransition 方法的规则注册
 - 测试 QueryHistory 方法的事件查询
@@ -5110,16 +5134,19 @@ func calculatingClusterPostStatusByPhase(phase phaseframe.Phase, err error) erro
 ### 7.2 集成测试设计点
 
 **端到端状态转换测试**：
+
 - 模拟完整的集群生命周期（Pending → Installing → Running → Upgrading → Deleting）
 - 验证每个阶段的状态转换正确性
 - 测试多 Phase 连续执行的状态累积
 
 **失败恢复测试**：
+
 - 模拟 Phase 执行失败，验证状态转换到 Failed 状态
 - 测试重试机制，验证状态从 Failed 恢复到进行中状态
 - 验证重试次数耗尽后的状态暴露
 
 **并发测试**：
+
 - 模拟多个 Reconcile 循环并发执行
 - 验证状态更新的线程安全性
 - 测试 StatusRecordV2 的原子操作
@@ -5127,16 +5154,19 @@ func calculatingClusterPostStatusByPhase(phase phaseframe.Phase, err error) erro
 ### 7.3 Engine 与 StatusManager 协作测试设计点
 
 **状态伪装测试**：
+
 - 验证重试次数内状态被伪装为 LatestNormalState
 - 测试外部消费者看到的是伪装后的状态
 - 验证 NeedRequeue 标志的正确性
 
 **状态暴露测试**：
+
 - 验证重试次数耗尽后状态暴露为真实失败状态
 - 测试 NeedRequeue 标志变为 false
 - 验证状态不再被伪装
 
 **协作流程测试**：
+
 - 测试 Engine 转换到失败状态后，StatusManager 的观察和伪装
 - 验证 StatusManager 的重试计数逻辑
 - 测试状态恢复后的协作流程
@@ -5144,16 +5174,19 @@ func calculatingClusterPostStatusByPhase(phase phaseframe.Phase, err error) erro
 ### 7.4 状态转换完整性测试设计点
 
 **规则覆盖测试**：
+
 - 验证所有 64 条转换规则都有对应的测试用例
 - 测试每条规则的可触发性
 - 验证规则注册的正确性
 
 **死胡同状态测试**：
+
 - 验证没有死胡同状态（除了 Failed 和 Deleted）
 - 测试每个非终态都有至少一条出边
 - 验证状态机的连通性
 
 **状态完整性测试**：
+
 - 验证所有状态都被正确定义
 - 测试状态枚举值的完整性
 - 验证状态转换规则的覆盖度
@@ -5161,22 +5194,26 @@ func calculatingClusterPostStatusByPhase(phase phaseframe.Phase, err error) erro
 ### 7.5 事件追踪测试设计点
 
 **InMemoryEventStore 测试**：
+
 - 测试 Record 方法的事件记录
 - 测试 Query 方法的过滤逻辑（按集群名称、时间范围、状态等）
 - 测试容量限制（超过 maxSize 时移除最旧事件）
 
 **Engine 事件记录测试**：
+
 - 验证状态转换时自动记录事件
 - 测试事件包含正确的 FromState、ToState、Trigger、Error、Duration
 - 验证失败转换记录错误信息
 
 **事件查询测试**：
+
 - 测试按集群名称查询事件
 - 测试按时间范围查询事件
 - 测试按状态转换查询事件
 - 验证查询结果的正确性和完整性
 
 **监控指标测试**：
+
 - 验证事件记录总数的统计
 - 测试事件记录失败次数的统计
 - 测试事件查询次数的统计
@@ -5468,4 +5505,3 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 | 实现问题 | 重试机制不灵活 | 中 | 阶段三：按状态索引重试策略 |
 | 可观测性 | 缺乏状态转换事件 | 中 | 阶段四：事件系统 |
 | 可维护性 | 代码圈复杂度高（15） | 中 | 阶段二：引擎替代分散逻辑 |
-
