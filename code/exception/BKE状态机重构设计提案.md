@@ -2212,32 +2212,57 @@ type Transition struct {
 
 // TransitionEvent 状态转换事件
 type TransitionEvent struct {
-    Timestamp time.Time
-    Cluster   string
-    FromState bkev1beta1.ClusterStatus
-    ToState   bkev1beta1.ClusterStatus
-    Trigger   string
-    Error     error
+    Timestamp    time.Time
+    Cluster      string
+    FromState    bkev1beta1.ClusterStatus
+    ToState      bkev1beta1.ClusterStatus
+    Trigger      string
+    Error        error
+    Duration     time.Duration  // 转换耗时
+    ErrorMessage string         // 错误信息（如果失败）
+}
+
+// EventStore 事件存储接口
+type EventStore interface {
+    Record(event TransitionEvent) error
+    Query(filter EventFilter) ([]TransitionEvent, error)
 }
 
 // Engine 状态机引擎
 type Engine struct {
     transitions []Transition
-    history     []TransitionEvent
+    eventStore  EventStore
     mux         sync.RWMutex
     // 上下文信息，用于构造 ConditionContext
     client      client.Client
     ctx         context.Context
 }
 
+// Option Engine 选项
+type Option func(*Engine)
+
+// WithEventStore 设置事件存储
+func WithEventStore(store EventStore) Option {
+    return func(e *Engine) {
+        e.eventStore = store
+    }
+}
+
 // NewEngine 创建状态机引擎
-func NewEngine(client client.Client, ctx context.Context) *Engine {
-    return &Engine{
+func NewEngine(client client.Client, ctx context.Context, opts ...Option) *Engine {
+    e := &Engine{
         transitions: make([]Transition, 0),
-        history:     make([]TransitionEvent, 0),
+        eventStore:  NewInMemoryEventStore(1000),  // 默认使用内存存储
         client:      client,
         ctx:         ctx,
     }
+    
+    // 应用选项
+    for _, opt := range opts {
+        opt(e)
+    }
+    
+    return e
 }
 
 // AddTransition 添加转换规则
@@ -2252,6 +2277,7 @@ func (e *Engine) AddTransition(t Transition) {
 //   - err==nil → effectiveTrigger=trigger → 匹配成功规则
 //   - err!=nil → effectiveTrigger="Error" → 匹配失败规则
 func (e *Engine) Transition(cluster *bkev1beta1.BKECluster, bkeNodes bkev1beta1.BKENodes, trigger string, err error) error {
+    startTime := time.Now()
     currentState := cluster.Status.ClusterStatus
 
     // 根据 err 决定实际触发器
@@ -2296,7 +2322,8 @@ func (e *Engine) Transition(cluster *bkev1beta1.BKECluster, bkeNodes bkev1beta1.
             }
 
             // 记录转换事件
-            e.recordTransition(cluster, trans, err)
+            duration := time.Since(startTime)
+            e.recordTransition(cluster, trans, err, duration)
             return nil
         }
     }
@@ -2306,37 +2333,79 @@ func (e *Engine) Transition(cluster *bkev1beta1.BKECluster, bkeNodes bkev1beta1.
     return nil
 }
 
-// recordTransition 记录转换事件（基础版：内存列表，用于开发调试）
-// 生产环境可通过 2.4 节的 EventStore 接口替换为增强版（支持持久化/查询/导出）
-func (e *Engine) recordTransition(cluster *bkev1beta1.BKECluster, trans Transition, err error) {
+// recordTransition 记录转换事件
+func (e *Engine) recordTransition(cluster *bkev1beta1.BKECluster, trans Transition, err error, duration time.Duration) {
     event := TransitionEvent{
-        Timestamp: time.Now(),
-        Cluster:   fmt.Sprintf("%s/%s", cluster.Namespace, cluster.Name),
-        FromState: trans.FromState,
-        ToState:   trans.ToState,
-        Trigger:   trans.Trigger,
-        Error:     err,
+        Timestamp:    time.Now(),
+        Cluster:      fmt.Sprintf("%s/%s", cluster.Namespace, cluster.Name),
+        FromState:    trans.FromState,
+        ToState:      trans.ToState,
+        Trigger:      trans.Trigger,
+        Error:        err,
+        Duration:     duration,
+        ErrorMessage: getErrorMessage(err),
     }
-    e.history = append(e.history, event)
-
-    // 限制历史记录大小
-    if len(e.history) > 1000 {
-        e.history = e.history[len(e.history)-1000:]
-    }
+    
+    _ = e.eventStore.Record(event)
 }
 
-// GetHistory 获取转换历史
-func (e *Engine) GetHistory(clusterName string) []TransitionEvent {
-    e.mux.RLock()
-    defer e.mux.RUnlock()
+// getErrorMessage 获取错误信息
+func getErrorMessage(err error) string {
+    if err == nil {
+        return ""
+    }
+    return err.Error()
+}
 
-    var result []TransitionEvent
-    for _, event := range e.history {
-        if event.Cluster == clusterName {
-            result = append(result, event)
+// GetHistory 获取转换历史（简单版本，按集群名称过滤）
+func (e *Engine) GetHistory(clusterName string) []TransitionEvent {
+    return e.QueryHistory(EventFilter{ClusterName: clusterName})
+}
+
+// EventFilter 事件查询过滤器
+type EventFilter struct {
+    ClusterName string                    // 按集群名称过滤
+    StartTime   time.Time                 // 按开始时间过滤
+    EndTime     time.Time                 // 按结束时间过滤
+    FromState   bkev1beta1.ClusterStatus  // 按源状态过滤
+    ToState     bkev1beta1.ClusterStatus  // 按目标状态过滤
+    Trigger     string                    // 按触发器过滤
+    Success     *bool                     // 按成功/失败过滤
+}
+
+// QueryHistory 查询转换历史（高级版本，支持多维度过滤）
+func (e *Engine) QueryHistory(filter EventFilter) []TransitionEvent {
+    result, _ := e.eventStore.Query(filter)
+    return result
+}
+
+// matchesFilter 检查事件是否匹配过滤条件
+func matchesFilter(event TransitionEvent, filter EventFilter) bool {
+    if filter.ClusterName != "" && event.Cluster != filter.ClusterName {
+        return false
+    }
+    if !filter.StartTime.IsZero() && event.Timestamp.Before(filter.StartTime) {
+        return false
+    }
+    if !filter.EndTime.IsZero() && event.Timestamp.After(filter.EndTime) {
+        return false
+    }
+    if filter.FromState != "" && event.FromState != filter.FromState {
+        return false
+    }
+    if filter.ToState != "" && event.ToState != filter.ToState {
+        return false
+    }
+    if filter.Trigger != "" && event.Trigger != filter.Trigger {
+        return false
+    }
+    if filter.Success != nil {
+        eventSuccess := event.Error == nil
+        if eventSuccess != *filter.Success {
+            return false
         }
     }
-    return result
+    return true
 }
 
 // GetTransitions 获取所有转换规则
@@ -3724,56 +3793,25 @@ if sr.CurrentClusterState != bkev1beta1.ClusterUnhealthy &&
 | **状态伪装逻辑变更** | 需要充分测试，确保重试行为与原来一致 |
 | **接口变更** | 新增的查询方法需要确保线程安全 |
 
-### 4.4 增强方案三：状态转换事件系统（适配单字段设计）
+### 4.4 增强方案三：事件存储实现（适配单字段设计）
 
-**设计思路**: 在三字段整合的基础上，记录所有状态转换事件，提供可观测性支持。
+**设计思路**: 提供 `EventStore` 接口的默认内存实现，作为 Engine 的可选组件。Engine 默认使用 `InMemoryEventStore`，也可以通过 `WithEventStore` 选项替换为其他实现。
 
-> **与 engine.go 的关系**：4.2.3 节的 `engine.go` 内置了基础版事件记录（`recordTransition` + `TransitionEvent`），使用内存列表存储，适合开发调试。本节为增强版事件系统，通过 `EventStore` 接口支持事件查询，适合生产环境的问题排查。
+> **与 4.2.3 节的关系**：4.2.3 节的 `engine.go` 定义了 `EventStore` 接口，本节提供默认的内存实现 `InMemoryEventStore`。Engine 默认使用此实现，也可以通过选项模式替换。
 
-#### 使用场景
-
-| 场景 | 说明 | 示例 |
-|------|------|------|
-| **故障排查** | 当集群状态异常时，查询状态转换历史，定位问题发生的时间点和转换路径 | 集群卡在 `ClusterUpgrading` 状态，查询事件历史发现最后一次转换是 `ClusterReady → ClusterUpgrading`，触发器是 `EnsureMasterUpgrade`，错误信息是 `upgrade failed` |
-| **状态审计** | 记录集群的完整生命周期，用于合规审计和变更追踪 | 查询某个集群在过去 24 小时内的所有状态转换，生成状态变更报告 |
-| **性能分析** | 分析状态转换的频率和耗时，识别性能瓶颈 | 统计 `ClusterUpgrading` 状态的平均持续时间，发现升级过程耗时过长 |
-| **问题复现** | 通过事件历史复现问题场景，辅助开发调试 | 根据事件历史中的触发器和状态序列，在测试环境中复现相同的问题 |
-
-#### 简化设计
+#### InMemoryEventStore 实现
 
 ```go
-// StateTransitionEvent 状态转换事件
-type StateTransitionEvent struct {
-    Timestamp    time.Time         // 事件发生时间
-    ClusterName  string            // 集群名称
-    FromState    ClusterStatus     // 源状态
-    ToState      ClusterStatus     // 目标状态
-    Trigger      string            // 触发器（Phase 名称或特殊触发器）
-    Success      bool              // 是否成功
-    ErrorMessage string            // 错误信息（如果失败）
-    Duration     time.Duration     // 转换耗时
-}
+package statemachine
 
-// EventStore 事件存储接口
-type EventStore interface {
-    Record(event StateTransitionEvent) error                    // 记录事件
-    Query(filter EventFilter) ([]StateTransitionEvent, error)   // 查询事件
-}
+import (
+    "sync"
+    "time"
+)
 
-// EventFilter 事件查询过滤器
-type EventFilter struct {
-    ClusterName string        // 按集群名称过滤
-    StartTime   time.Time     // 按开始时间过滤
-    EndTime     time.Time     // 按结束时间过滤
-    FromState   ClusterStatus // 按源状态过滤
-    ToState     ClusterStatus // 按目标状态过滤
-    Trigger     string        // 按触发器过滤
-    Success     *bool         // 按成功/失败过滤
-}
-
-// InMemoryEventStore 内存事件存储
+// InMemoryEventStore 内存事件存储（默认实现）
 type InMemoryEventStore struct {
-    events  []StateTransitionEvent
+    events  []TransitionEvent
     maxSize int
     mux     sync.RWMutex
 }
@@ -3781,13 +3819,13 @@ type InMemoryEventStore struct {
 // NewInMemoryEventStore 创建内存事件存储
 func NewInMemoryEventStore(maxSize int) *InMemoryEventStore {
     return &InMemoryEventStore{
-        events:  make([]StateTransitionEvent, 0),
+        events:  make([]TransitionEvent, 0),
         maxSize: maxSize,
     }
 }
 
 // Record 记录事件
-func (s *InMemoryEventStore) Record(event StateTransitionEvent) error {
+func (s *InMemoryEventStore) Record(event TransitionEvent) error {
     s.mux.Lock()
     defer s.mux.Unlock()
     
@@ -3801,11 +3839,11 @@ func (s *InMemoryEventStore) Record(event StateTransitionEvent) error {
 }
 
 // Query 查询事件
-func (s *InMemoryEventStore) Query(filter EventFilter) ([]StateTransitionEvent, error) {
+func (s *InMemoryEventStore) Query(filter EventFilter) ([]TransitionEvent, error) {
     s.mux.RLock()
     defer s.mux.RUnlock()
     
-    var result []StateTransitionEvent
+    var result []TransitionEvent
     for _, event := range s.events {
         if matchesFilter(event, filter) {
             result = append(result, event)
@@ -3813,143 +3851,39 @@ func (s *InMemoryEventStore) Query(filter EventFilter) ([]StateTransitionEvent, 
     }
     return result, nil
 }
-
-// matchesFilter 检查事件是否匹配过滤条件
-func matchesFilter(event StateTransitionEvent, filter EventFilter) bool {
-    if filter.ClusterName != "" && event.ClusterName != filter.ClusterName {
-        return false
-    }
-    if !filter.StartTime.IsZero() && event.Timestamp.Before(filter.StartTime) {
-        return false
-    }
-    if !filter.EndTime.IsZero() && event.Timestamp.After(filter.EndTime) {
-        return false
-    }
-    if filter.FromState != "" && event.FromState != filter.FromState {
-        return false
-    }
-    if filter.ToState != "" && event.ToState != filter.ToState {
-        return false
-    }
-    if filter.Trigger != "" && event.Trigger != filter.Trigger {
-        return false
-    }
-    if filter.Success != nil && event.Success != *filter.Success {
-        return false
-    }
-    return true
-}
-
-// StateMachineEventRecorder 状态机事件记录器
-type StateMachineEventRecorder struct {
-    store EventStore
-}
-
-// NewStateMachineEventRecorder 创建状态机事件记录器
-func NewStateMachineEventRecorder(store EventStore) *StateMachineEventRecorder {
-    return &StateMachineEventRecorder{
-        store: store,
-    }
-}
-
-// RecordTransition 记录状态转换事件
-func (r *StateMachineEventRecorder) RecordTransition(
-    cluster *BKECluster,
-    fromState, toState ClusterStatus,
-    trigger string,
-    err error,
-    duration time.Duration,
-) {
-    event := StateTransitionEvent{
-        Timestamp:    time.Now(),
-        ClusterName:  utils.ClientObjNS(cluster),
-        FromState:    fromState,
-        ToState:      toState,
-        Trigger:      trigger,
-        Success:      err == nil,
-        ErrorMessage: getErrorMessage(err),
-        Duration:     duration,
-    }
-    
-    _ = r.store.Record(event)
-}
-
-// getErrorMessage 获取错误信息
-func getErrorMessage(err error) string {
-    if err == nil {
-        return ""
-    }
-    return err.Error()
-}
 ```
 
-#### 使用示例
+#### 使用方式
 
 ```go
-// 创建事件存储（最大容量 1000 条）
-eventStore := NewInMemoryEventStore(1000)
+// 方式 1：使用默认内存存储（推荐）
+engine := NewEngine(client, ctx)
 
-// 创建事件记录器
-recorder := NewStateMachineEventRecorder(eventStore)
+// 方式 2：自定义 EventStore
+customStore := NewInMemoryEventStore(2000)
+engine := NewEngine(client, ctx, WithEventStore(customStore))
 
-// 在 Engine 中记录状态转换
-func (e *Engine) recordTransition(cluster *BKECluster, trans Transition, err error) {
-    startTime := time.Now()
-    
-    // 执行状态转换逻辑...
-    
-    duration := time.Since(startTime)
-    
-    // 记录事件
-    e.recorder.RecordTransition(
-        cluster,
-        trans.FromState,
-        trans.ToState,
-        trans.Trigger,
-        err,
-        duration,
-    )
-}
-
-// 查询事件历史
-func queryClusterHistory(clusterName string, store EventStore) {
-    // 查询某个集群的所有事件
-    filter := EventFilter{
-        ClusterName: clusterName,
-    }
-    events, _ := store.Query(filter)
-    
-    // 查询某个集群的失败事件
-    failed := false
-    filter = EventFilter{
-        ClusterName: clusterName,
-        Success:     &failed,
-    }
-    failedEvents, _ := store.Query(filter)
-    
-    // 查询某个时间段内的事件
-    filter = EventFilter{
-        ClusterName: clusterName,
-        StartTime:   time.Now().Add(-24 * time.Hour),
-        EndTime:     time.Now(),
-    }
-    recentEvents, _ := store.Query(filter)
-}
+// 查询事件
+events := engine.QueryHistory(EventFilter{
+    ClusterName: "default/my-cluster",
+})
 ```
 
 **优势**:
 
-- **简化设计**：只保留内存存储，删除持久化和多格式导出
+- **简化设计**：只提供内存存储实现，删除持久化和多格式导出
+- **默认行为**：Engine 默认使用 `InMemoryEventStore`，无需额外配置
+- **灵活扩展**：可以通过 `WithEventStore` 选项替换为其他实现
 - **故障排查**：支持按集群、时间、状态、触发器等多维度查询
 - **状态审计**：记录完整的状态转换历史，支持变更追踪
-- **性能分析**：记录转换耗时，支持性能瓶颈识别
+- **性能分析**：记录转换耗时（`Duration` 字段），支持性能瓶颈识别
 - **易于集成**：通过 `EventStore` 接口，可以轻松替换为其他存储实现
 
 **删除的功能**:
 
 - **PersistentEventStore**：Kubernetes Event 持久化（当前不需要）
 - **多格式导出**：CSV、Graphviz 导出（当前不需要）
-- **复杂查询**：保留基本过滤，删除复杂聚合查询
+- **StateMachineEventRecorder**：功能已集成到 Engine
 
 ### 4.5 设计远景：混合模型架构
 
