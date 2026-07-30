@@ -4268,7 +4268,120 @@ func (s *InMemoryEventStore) Record(event TransitionEvent) error {
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### 4.5.3 本提案的铺垫作用
+#### 4.5.3 Paused 和 DryRun 的设计决策
+
+**设计决策**：`Paused` 和 `DryRun` **不作为独立的生命周期阶段**，而是通过 `Condition` 表达。
+
+**设计理由**：
+
+1. **符合 Kubernetes 最佳实践**：
+   - Cluster API 等主流项目使用 `Condition` 表达操作模式（如 Paused）
+   - `Phase` 应该只表示主要的生命周期阶段，保持简洁
+   - `Condition` 可以精确表达各种操作模式和状态
+
+2. **Paused 是操作模式，不是生命周期阶段**：
+   - 暂停不会改变集群的生命周期阶段（如 Running、Upgrading）
+   - 暂停是一个临时的操作模式，可以随时恢复
+   - 通过 `spec.paused` 字段控制，通过 `status.conditions` 表达状态
+
+3. **DryRun 是测试模式，不是生命周期阶段**：
+   - DryRun 用于测试 API 调用，不会实际执行操作
+   - 不需要在状态机中表达
+   - 通过 `spec.dryRun` 字段控制
+
+**实现方式**：
+
+```go
+// Spec 字段控制
+type BKEClusterSpec struct {
+    // Paused 用于阻止控制器处理 Cluster
+    Paused bool `json:"paused,omitempty"`
+    
+    // DryRun 用于测试 API 调用
+    DryRun bool `json:"dryRun,omitempty"`
+}
+
+// Status Condition 表达状态
+type ConditionType string
+
+const (
+    ConditionPaused  ConditionType = "Paused"
+    ConditionDryRun  ConditionType = "DryRun"
+)
+```
+
+**使用场景示例**：
+
+**场景 1：集群暂停**
+```yaml
+spec:
+  paused: true
+
+status:
+  phase: Running  # Phase 保持不变
+  conditions:
+  - type: Paused
+    status: "True"
+    reason: UserRequested
+    message: "Cluster is paused by user"
+```
+
+**场景 2：升级中暂停**
+```yaml
+spec:
+  paused: true
+
+status:
+  phase: Upgrading  # Phase 表示主要阶段
+  conditions:
+  - type: Upgrading
+    status: "True"
+    reason: VersionUpgrade
+    message: "Upgrading from v1.28 to v1.29"
+  - type: Paused
+    status: "True"
+    reason: UserRequested
+    message: "Cluster is paused during upgrade"
+```
+
+**兼容性映射**：
+
+```go
+// 旧状态 → 新设计
+func mapOldStatusToNewDesign(oldStatus confv1beta1.ClusterStatus) (LifecyclePhase, []Condition) {
+    switch oldStatus {
+    case confv1beta1.ClusterPaused:
+        return ClusterLifecycleRunning, []Condition{
+            {
+                Type:    ConditionPaused,
+                Status:  metav1.ConditionTrue,
+                Reason:  "Paused",
+                Message: "Cluster is paused",
+            },
+        }
+    case confv1beta1.ClusterDryRun:
+        return ClusterLifecycleRunning, []Condition{
+            {
+                Type:    ConditionDryRun,
+                Status:  metav1.ConditionTrue,
+                Reason:  "DryRun",
+                Message: "Cluster is in dry-run mode",
+            },
+        }
+    // ...
+    }
+}
+```
+
+**优势**：
+
+1. **符合 Kubernetes 最佳实践**：使用标准的 Condition 模式
+2. **与 Cluster API 保持一致**：便于用户理解和迁移
+3. **保持状态机简洁**：Phase 只表示主要生命周期阶段
+4. **灵活表达复杂状态**：通过 Condition 可以精确表达各种操作模式
+5. **向后兼容**：通过映射函数可以兼容旧状态
+
+#### 4.5.4 本提案的铺垫作用
 
 | 本提案设计 | 混合模型对应 | 铺垫作用 |
 | ----------- | -------------- | --------- |
@@ -4277,8 +4390,9 @@ func (s *InMemoryEventStore) Record(event TransitionEvent) error {
 | StatusManagerV2 分层重试 | OperationProgress + 人工介入 | 按状态索引重试策略，为操作进度追踪奠定基础 |
 | `MapToLifecyclePhase` 映射函数 | 兼容性映射（目标架构 → 旧字段） | 22 个 ClusterStatus 归约为 10 个 LifecyclePhase |
 | 事件系统 | HealthStatus 聚合器 | 状态转换事件记录，为健康状态聚合奠定基础 |
+| Paused/DryRun 通过 Condition 表达 | 操作模式与生命周期分离 | 符合 Kubernetes 最佳实践，保持状态机简洁 |
 
-#### 4.5.4 演进路径（面向目标架构的四层演进）
+#### 4.5.5 演进路径（面向目标架构的四层演进）
 
 1. **当前层**：ClusterStatus 单一数据源（本提案阶段一）
 2. **增强层**：状态转换表引擎 + 分层重试（本提案阶段二三）

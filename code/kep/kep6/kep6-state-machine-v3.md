@@ -263,6 +263,159 @@ kubectl get bkecluster my-cluster -o jsonpath='{.status.operationProgress.scaleD
 # 输出: {"masterNodesDelta": 3, "direction": "Up", "currentStage": "ScalingMasterNodes"}
 ```
 
+#### 2.1.3 Paused 和 DryRun 的设计决策
+
+**设计决策**：`Paused` 和 `DryRun` **不作为独立的生命周期阶段**，而是通过 `Condition` 表达。
+
+**设计理由**：
+
+1. **符合 Kubernetes 最佳实践**：
+   - Cluster API 等主流项目使用 `Condition` 表达操作模式（如 Paused）
+   - `Phase` 应该只表示主要的生命周期阶段，保持简洁
+   - `Condition` 可以精确表达各种操作模式和状态
+
+2. **Paused 是操作模式，不是生命周期阶段**：
+   - 暂停不会改变集群的生命周期阶段（如 Running、Upgrading）
+   - 暂停是一个临时的操作模式，可以随时恢复
+   - 通过 `spec.paused` 字段控制，通过 `status.conditions` 表达状态
+
+3. **DryRun 是测试模式，不是生命周期阶段**：
+   - DryRun 用于测试 API 调用，不会实际执行操作
+   - 不需要在状态机中表达
+   - 通过 `spec.dryRun` 字段控制
+
+**实现方式**：
+
+```go
+// Spec 字段控制
+type BKEClusterSpec struct {
+    // Paused 用于阻止控制器处理 Cluster
+    Paused bool `json:"paused,omitempty"`
+    
+    // DryRun 用于测试 API 调用
+    DryRun bool `json:"dryRun,omitempty"`
+}
+
+// Status Condition 表达状态
+type ConditionType string
+
+const (
+    ConditionPaused  ConditionType = "Paused"
+    ConditionDryRun  ConditionType = "DryRun"
+)
+
+// Condition 示例
+type Condition struct {
+    Type               ConditionType          `json:"type"`
+    Status             metav1.ConditionStatus `json:"status"`
+    Reason             string                 `json:"reason,omitempty"`
+    Message            string                 `json:"message,omitempty"`
+    LastTransitionTime metav1.Time            `json:"lastTransitionTime"`
+}
+```
+
+**使用场景示例**：
+
+**场景 1：集群暂停**
+```yaml
+spec:
+  paused: true
+
+status:
+  phase: Running  # Phase 保持不变
+  conditions:
+  - type: Paused
+    status: "True"
+    reason: UserRequested
+    message: "Cluster is paused by user"
+    lastTransitionTime: "2024-01-01T00:00:00Z"
+```
+
+**场景 2：DryRun 测试**
+```yaml
+spec:
+  dryRun: true
+
+status:
+  phase: Running  # Phase 保持不变
+  conditions:
+  - type: DryRun
+    status: "True"
+    reason: TestingUpgrade
+    message: "Testing upgrade without actual execution"
+    lastTransitionTime: "2024-01-01T00:00:00Z"
+```
+
+**场景 3：升级中暂停**
+```yaml
+spec:
+  paused: true
+
+status:
+  phase: Upgrading  # Phase 表示主要阶段
+  conditions:
+  - type: Upgrading
+    status: "True"
+    reason: VersionUpgrade
+    message: "Upgrading from v1.28 to v1.29"
+  - type: Paused
+    status: "True"
+    reason: UserRequested
+    message: "Cluster is paused during upgrade"
+```
+
+**兼容性映射**：
+
+```go
+// 旧状态 → 新设计
+func mapOldStatusToNewDesign(oldStatus confv1beta1.ClusterStatus) (LifecyclePhase, []Condition) {
+    switch oldStatus {
+    case confv1beta1.ClusterPaused:
+        return ClusterLifecycleRunning, []Condition{
+            {
+                Type:    ConditionPaused,
+                Status:  metav1.ConditionTrue,
+                Reason:  "Paused",
+                Message: "Cluster is paused",
+            },
+        }
+    case confv1beta1.ClusterDryRun:
+        return ClusterLifecycleRunning, []Condition{
+            {
+                Type:    ConditionDryRun,
+                Status:  metav1.ConditionTrue,
+                Reason:  "DryRun",
+                Message: "Cluster is in dry-run mode",
+            },
+        }
+    // ...
+    }
+}
+```
+
+**查询暂停状态**：
+
+```bash
+# 查询集群是否暂停
+kubectl get bkecluster my-cluster -o jsonpath='{.status.conditions[?(@.type=="Paused")].status}'
+# 输出: True
+
+# 查询暂停原因
+kubectl get bkecluster my-cluster -o jsonpath='{.status.conditions[?(@.type=="Paused")].message}'
+# 输出: Cluster is paused by user
+
+# 恢复集群
+kubectl patch bkecluster my-cluster --type merge -p '{"spec":{"paused":false}}'
+```
+
+**优势**：
+
+1. **符合 Kubernetes 最佳实践**：使用标准的 Condition 模式
+2. **与 Cluster API 保持一致**：便于用户理解和迁移
+3. **保持状态机简洁**：Phase 只表示主要生命周期阶段
+4. **灵活表达复杂状态**：通过 Condition 可以精确表达各种操作模式
+5. **向后兼容**：通过映射函数可以兼容旧状态
+
 ### 2.2 驱动规则
 
 集群层状态由**驱动模型**决定，基于 `OperationProgress` 字段：
