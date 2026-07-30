@@ -263,66 +263,103 @@ kubectl get bkecluster my-cluster -o jsonpath='{.status.operationProgress.scaleD
 # 输出: {"masterNodesDelta": 3, "direction": "Up", "currentStage": "ScalingMasterNodes"}
 ```
 
-#### 2.1.3 Paused 和 DryRun 的设计决策
+#### 2.1.3 生命周期阶段与操作模式的关系
 
-**设计决策**：`Paused` 和 `DryRun` **不作为独立的生命周期阶段**，而是通过 `Condition` 表达。
+##### 核心概念区分
 
-**设计理由**：
+| 概念 | 定义 | 特点 | 示例 |
+|------|------|------|------|
+| **生命周期阶段** | 集群从创建到删除的主要阶段 | 互斥、有序、不可跳过 | Pending → Installing → Running → Upgrading → Deleting → Deleted |
+| **操作模式** | 临时的操作状态，不改变生命周期 | 可叠加、可随时切换、不影响生命周期 | Paused（暂停）、DryRun（测试） |
 
-1. **符合 Kubernetes 最佳实践**：
-   - Cluster API 等主流项目使用 `Condition` 表达操作模式（如 Paused）
-   - `Phase` 应该只表示主要的生命周期阶段，保持简洁
-   - `Condition` 可以精确表达各种操作模式和状态
+##### 关系模型
 
-2. **Paused 是操作模式，不是生命周期阶段**：
-   - 暂停不会改变集群的生命周期阶段（如 Running、Upgrading）
-   - 暂停是一个临时的操作模式，可以随时恢复
-   - 通过 `spec.paused` 字段控制，通过 `status.conditions` 表达状态
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    生命周期阶段（LifecyclePhase）              │
+│  ┌──────┐  ┌──────────┐  ┌─────────┐  ┌──────────┐  ┌─────┐ │
+│  │Pend- │→ │Installing│→ │ Running │→ │Upgrading │→ │Delet│ │
+│  │ing   │  │          │  │         │  │          │  │ing  │ │
+│  └──────┘  └──────────┘  └─────────┘  └──────────┘  └─────┘ │
+│       ↑           ↑            ↑            ↑           ↑    │
+│       │           │            │            │           │    │
+│       └───────────┴────────────┴────────────┴───────────┘    │
+│                          │                                   │
+│                    操作模式（可叠加）                           │
+│                    ┌──────────┐                              │
+│                    │ Paused   │ ← 可以在任何阶段暂停          │
+│                    │ DryRun   │ ← 可以在任何阶段测试          │
+│                    └──────────┘                              │
+└─────────────────────────────────────────────────────────────┘
+```
 
-3. **DryRun 是测试模式，不是生命周期阶段**：
-   - DryRun 用于测试 API 调用，不会实际执行操作
-   - 不需要在状态机中表达
-   - 通过 `spec.dryRun` 字段控制
+##### 关键设计原则
 
-**实现方式**：
+**原则 1：生命周期阶段是主状态，操作模式是附加状态**
+
+- **生命周期阶段**：通过 `status.lifecyclePhase` 表达
+- **操作模式**：通过 `status.conditions` 表达
+- **关系**：操作模式不影响生命周期阶段的转换
+
+**示例**：
+```yaml
+# 场景：集群在 Running 阶段被暂停
+status:
+  lifecyclePhase: Running  # 主状态：运行中
+  conditions:
+  - type: Paused
+    status: "True"
+    reason: UserRequested
+    message: "Cluster is paused by user"
+```
+
+**原则 2：操作模式可以在任何生命周期阶段激活**
+
+| 生命周期阶段 | 可以暂停？ | 可以 DryRun？ | 说明 |
+|------------|----------|-------------|------|
+| Pending | ✅ | ✅ | 等待安装时可以暂停或测试 |
+| Installing | ✅ | ✅ | 安装过程中可以暂停或测试 |
+| Running | ✅ | ✅ | 运行中可以暂停或测试 |
+| Upgrading | ✅ | ✅ | 升级中可以暂停或测试 |
+| Scaling | ✅ | ✅ | 扩缩容中可以暂停或测试 |
+| Managing | ✅ | ✅ | 纳管中可以暂停或测试 |
+| RollingBack | ✅ | ✅ | 回滚中可以暂停或测试 |
+| Deleting | ✅ | ✅ | 删除中可以暂停或测试 |
+| Deleted | ❌ | ❌ | 已删除，无法操作 |
+| Failed | ✅ | ✅ | 失败状态可以暂停或测试 |
+
+**原则 3：操作模式不影响状态机转换规则**
+
+状态机转换规则只关心生命周期阶段，不关心操作模式：
 
 ```go
-// Spec 字段控制
-type BKEClusterSpec struct {
-    // Paused 用于阻止控制器处理 Cluster
-    Paused bool `json:"paused,omitempty"`
-    
-    // DryRun 用于测试 API 调用
-    DryRun bool `json:"dryRun,omitempty"`
-}
-
-// Status Condition 表达状态
-type ConditionType string
-
-const (
-    ConditionPaused  ConditionType = "Paused"
-    ConditionDryRun  ConditionType = "DryRun"
-)
-
-// Condition 示例
-type Condition struct {
-    Type               ConditionType          `json:"type"`
-    Status             metav1.ConditionStatus `json:"status"`
-    Reason             string                 `json:"reason,omitempty"`
-    Message            string                 `json:"message,omitempty"`
-    LastTransitionTime metav1.Time            `json:"lastTransitionTime"`
+// 状态转换规则示例
+{
+    FromState: ClusterLifecycleRunning,
+    ToState:   ClusterLifecycleUpgrading,
+    Trigger:   "EnsureUpgrade",
+    Condition: func(cc *ConditionContext) bool {
+        // 只检查生命周期阶段，不检查 Paused 状态
+        return cc.BKECluster.Spec.DesiredVersion != cc.BKECluster.Status.CurrentVersion
+    },
 }
 ```
 
-**使用场景示例**：
+**控制器行为**：
+- 如果 `spec.paused = true`，控制器**跳过**状态转换
+- 如果 `spec.paused = false`，控制器**执行**状态转换
+- 状态机规则本身不变
 
-**场景 1：集群暂停**
+##### 使用场景示例
+
+**场景 1：Running 阶段暂停**
+
 ```yaml
 spec:
   paused: true
 
 status:
-  phase: Running  # Phase 保持不变
+  lifecyclePhase: Running
   conditions:
   - type: Paused
     status: "True"
@@ -331,28 +368,19 @@ status:
     lastTransitionTime: "2024-01-01T00:00:00Z"
 ```
 
-**场景 2：DryRun 测试**
-```yaml
-spec:
-  dryRun: true
+**行为**：
+- 生命周期阶段保持 `Running`
+- 控制器跳过所有 Reconcile 逻辑
+- 可以通过 `spec.paused = false` 恢复
 
-status:
-  phase: Running  # Phase 保持不变
-  conditions:
-  - type: DryRun
-    status: "True"
-    reason: TestingUpgrade
-    message: "Testing upgrade without actual execution"
-    lastTransitionTime: "2024-01-01T00:00:00Z"
-```
+**场景 2：Upgrading 阶段暂停**
 
-**场景 3：升级中暂停**
 ```yaml
 spec:
   paused: true
 
 status:
-  phase: Upgrading  # Phase 表示主要阶段
+  lifecyclePhase: Upgrading
   conditions:
   - type: Upgrading
     status: "True"
@@ -364,57 +392,145 @@ status:
     message: "Cluster is paused during upgrade"
 ```
 
-**兼容性映射**：
+**行为**：
+- 生命周期阶段保持 `Upgrading`
+- 升级操作暂停
+- 恢复后继续升级
+
+**场景 3：DryRun 测试升级**
+
+```yaml
+spec:
+  desiredVersion: "v1.29.0"
+  dryRun: true
+
+status:
+  lifecyclePhase: Running  # 生命周期阶段不变
+  conditions:
+  - type: DryRun
+    status: "True"
+    reason: TestingUpgrade
+    message: "Testing upgrade to v1.29.0"
+```
+
+**行为**：
+- 生命周期阶段保持 `Running`
+- 控制器执行 DryRun 逻辑（不实际升级）
+- 返回升级可行性报告
+
+##### 与 Kubernetes 标准的关系
+
+**Kubernetes 标准模式**：
+
+| 字段 | 用途 | 示例 |
+|------|------|------|
+| `status.phase` | 主要生命周期阶段 | Running, Failed |
+| `status.conditions` | 详细状态和操作模式 | Available, Paused, Progressing |
+| `spec.paused` | 控制是否暂停 | true/false |
+
+**Cluster API 实现**：
+
+```yaml
+# Cluster API 的 Cluster 对象
+status:
+  phase: Provisioned  # 主要生命周期阶段
+  conditions:
+  - type: Available
+    status: "True"
+  - type: Paused
+    status: "True"
+    reason: UserRequested
+```
+
+##### 设计优势
+
+1. **符合 Kubernetes 最佳实践**：
+   - 使用标准的 `phase` + `conditions` 模式
+   - 与 Cluster API 保持一致
+
+2. **保持状态机简洁**：
+   - 生命周期阶段只有 10 个状态
+   - 操作模式通过 Condition 灵活表达
+
+3. **灵活性和可扩展性**：
+   - 可以在任何生命周期阶段激活操作模式
+   - 可以轻松添加新的操作模式（如 Maintenance、Debug）
+
+4. **向后兼容**：
+   - 通过映射函数可以兼容旧状态（ClusterPaused → Running + Paused Condition）
+
+##### 实施建议
+
+**API 设计**：
 
 ```go
-// 旧状态 → 新设计
-func mapOldStatusToNewDesign(oldStatus confv1beta1.ClusterStatus) (LifecyclePhase, []Condition) {
-    switch oldStatus {
-    case confv1beta1.ClusterPaused:
-        return ClusterLifecycleRunning, []Condition{
-            {
-                Type:    ConditionPaused,
-                Status:  metav1.ConditionTrue,
-                Reason:  "Paused",
-                Message: "Cluster is paused",
-            },
-        }
-    case confv1beta1.ClusterDryRun:
-        return ClusterLifecycleRunning, []Condition{
-            {
-                Type:    ConditionDryRun,
-                Status:  metav1.ConditionTrue,
-                Reason:  "DryRun",
-                Message: "Cluster is in dry-run mode",
-            },
-        }
-    // ...
-    }
+type BKEClusterSpec struct {
+    // 生命周期相关字段
+    DesiredVersion string `json:"desiredVersion,omitempty"`
+    
+    // 操作模式字段
+    Paused bool `json:"paused,omitempty"`
+    DryRun bool `json:"dryRun,omitempty"`
+}
+
+type BKEClusterStatus struct {
+    // 生命周期阶段
+    LifecyclePhase LifecyclePhase `json:"lifecyclePhase"`
+    
+    // 操作进度
+    OperationProgress *OperationProgress `json:"operationProgress,omitempty"`
+    
+    // 健康状态
+    HealthStatus *HealthStatus `json:"healthStatus,omitempty"`
+    
+    // 条件（包括操作模式）
+    Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 ```
 
-**查询暂停状态**：
+**控制器逻辑**：
 
-```bash
-# 查询集群是否暂停
-kubectl get bkecluster my-cluster -o jsonpath='{.status.conditions[?(@.type=="Paused")].status}'
-# 输出: True
-
-# 查询暂停原因
-kubectl get bkecluster my-cluster -o jsonpath='{.status.conditions[?(@.type=="Paused")].message}'
-# 输出: Cluster is paused by user
-
-# 恢复集群
-kubectl patch bkecluster my-cluster --type merge -p '{"spec":{"paused":false}}'
+```go
+func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    cluster := &BKECluster{}
+    if err := r.Get(ctx, req.NamespacedName, cluster); err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    // 检查是否暂停
+    if cluster.Spec.Paused {
+        // 更新 Paused Condition
+        r.updateCondition(cluster, ConditionPaused, metav1.ConditionTrue, "Paused", "Cluster is paused")
+        // 跳过 Reconcile
+        return ctrl.Result{}, nil
+    }
+    
+    // 检查是否 DryRun
+    if cluster.Spec.DryRun {
+        // 更新 DryRun Condition
+        r.updateCondition(cluster, ConditionDryRun, metav1.ConditionTrue, "DryRun", "Cluster is in dry-run mode")
+        // 执行 DryRun 逻辑
+        return r.dryRunReconcile(ctx, cluster)
+    }
+    
+    // 正常 Reconcile
+    return r.normalReconcile(ctx, cluster)
+}
 ```
 
-**优势**：
+##### 总结
 
-1. **符合 Kubernetes 最佳实践**：使用标准的 Condition 模式
-2. **与 Cluster API 保持一致**：便于用户理解和迁移
-3. **保持状态机简洁**：Phase 只表示主要生命周期阶段
-4. **灵活表达复杂状态**：通过 Condition 可以精确表达各种操作模式
-5. **向后兼容**：通过映射函数可以兼容旧状态
+**生命周期阶段**和**操作模式**是两个独立但相关的概念：
+
+| 维度 | 生命周期阶段 | 操作模式 |
+|------|------------|---------|
+| **表达字段** | `status.lifecyclePhase` | `status.conditions` |
+| **控制字段** | 状态机规则 | `spec.paused`、`spec.dryRun` |
+| **特点** | 互斥、有序、不可跳过 | 可叠加、可随时切换 |
+| **影响** | 决定集群的主要阶段 | 影响控制器行为，不影响生命周期 |
+| **示例** | Running, Upgrading, Deleting | Paused, DryRun |
+
+**关系**：操作模式是生命周期阶段的**附加状态**，可以在任何生命周期阶段激活，但不改变生命周期阶段的转换规则。
 
 ### 2.2 驱动规则
 
