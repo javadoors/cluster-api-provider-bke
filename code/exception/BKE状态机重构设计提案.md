@@ -6,7 +6,7 @@
 - [2. 动机](#2-动机)
   - [2.1 存在的问题分析](#21-存在的问题分析)
   - [2.2 状态管理器设计问题](#22-状态管理器设计问题)
-  - [2.3 Phase 状态管理问题](#23-phase-状态管理问题)
+  - [2.3 Phase状态管理问题](#23-Phase状态管理问题)
   - [2.4 并发安全问题](#24-并发安全问题)
   - [2.5 状态可观测性问题](#25-状态可观测性问题)
   - [2.6 代码可维护性问题](#26-代码可维护性问题)
@@ -41,11 +41,11 @@
 - [6. 迁移策略](#6-迁移策略)
   - [6.1 向后兼容策略](#61-向后兼容策略)
 - [7. 测试策略](#7-测试策略)
-  - [7.1 单元测试](#71-单元测试)
-  - [7.2 集成测试](#72-集成测试)
-  - [7.3 Engine 与 StatusManager 协作测试](#73-engine-与-statusmanager-协作测试)
-  - [7.4 状态转换完整性测试](#74-状态转换完整性测试)
-  - [7.5 事件追踪测试](#75-事件追踪测试)
+  - [7.1 单元测试](#71-单元测试设计点)
+  - [7.2 集成测试](#72-集成测试设计点)
+  - [7.3 Engine 与 StatusManager 协作测试设计点](#73-Engine-与-StatusManager-协作测试设计点)
+  - [7.4 状态转换完整性测试设计点](#74-状态转换完整性测试设计点)
+  - [7.5 事件追踪测试设计点](#75-事件追踪测试设计点)
 - [8. 性能优化建议](#8-性能优化建议)
   - [8.1 减少锁竞争](#81-减少锁竞争)
   - [8.2 异步事件记录](#82-异步事件记录)
@@ -56,7 +56,6 @@
 - [附录](#附录)
   - [A. 术语表](#a-术语表)
   - [B. 问题总结](#b-问题总结)
-  - [C. 相关文档](#c-相关文档)
 
 ## 1. 摘要
 
@@ -1813,7 +1812,7 @@ func IsMasterScaleUpRetry(cc *ConditionContext) bool {
 
 **当前代码调用链**：
 
-```
+```txt
 PhaseFlow.Execute()
   → calculatingClusterPreStatusByPhase(phase)     // pre-hook
     → calculateClusterStatusByPhase(phase, nil)    // 分发器
@@ -1826,7 +1825,7 @@ PhaseFlow.Execute()
 
 **重构后调用链**：
 
-```
+```txt
 PhaseFlow.Execute()
   → engine.Transition(cluster, nodes, phaseName, nil)              // pre-hook：设置"进行中"状态
   → phase.Execute()                                                // 执行业务逻辑（不变）
@@ -1857,7 +1856,7 @@ PhaseFlow.Execute()
 
 **示例：初始化阶段**
 
-```
+```txt
 8 个 Phase 依次执行：EnsureFinalizer → EnsureCerts → ... → EnsureAgentSwitch
 
 每个 Phase 的 post-hook 都使用 TriggerPhaseComplete：
@@ -3934,7 +3933,7 @@ if sr.CurrentClusterState != bkev1beta1.ClusterUnhealthy &&
 
 #### 4.3.8 实施步骤
 
-```
+```txt
 步骤 1: 替换 staterecords.go
   ├── 新增 StatusRecordV2（删除 RetryPolicy 字段）
   └── 删除 ClusterStatusRetryPolicies 配置
@@ -4239,7 +4238,7 @@ func (s *InMemoryEventStore) Record(event TransitionEvent) error {
 - **聚合模型（自底向上）**：由下层状态聚合出上层健康状态，决定 `HealthStatus`（健康状态）
 - **两个模型各司其职，互不干扰**
 
-```
+```txt
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                         混合模型架构                                         │
 ├─────────────────────────────────────────────────────────────────────────────┤
@@ -4274,7 +4273,7 @@ func (s *InMemoryEventStore) Record(event TransitionEvent) error {
 - **正交性**：生命周期状态（LifecyclePhase）与健康状态（HealthStatus）相互独立
 - **完整性**：覆盖所有必要的生命周期阶段，包括失败状态
 
-```
+```txt
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                    集群层 (Cluster Lifecycle)                               │
 │  Pending → Installing → Running → Upgrading → Scaling → Managing →         │
@@ -4307,7 +4306,7 @@ func (s *InMemoryEventStore) Record(event TransitionEvent) error {
 
 ##### 关系模型
 
-```
+```txt
 ┌─────────────────────────────────────────────────────────────┐
 │                    生命周期阶段（LifecyclePhase）             │
 │  ┌──────┐  ┌──────────┐  ┌─────────┐  ┌──────────┐  ┌─────┐ │
@@ -4596,7 +4595,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 重构后的系统由四个核心组件构成，分为两个实施阶段：
 
-```
+```txt
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                        BKE 状态机重构整体架构                                │
 ├─────────────────────────────────────────────────────────────────────────────┤
@@ -5285,7 +5284,7 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 
 ### 9.2 灰度策略
 
-```
+```txt
 阶段 1: 新增 statemachine 包，不影响现有逻辑
   └─ Feature Gate 关闭
 
@@ -5318,8 +5317,6 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
   annotations:
     summary: "状态转换失败"
 ```
-
----
 
 ## 附录
 
@@ -5391,7 +5388,7 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 
 #### 概念关系图
 
-```
+```txt
 ┌─────────────────────────────────────────────────────────────────┐
 │                        状态字段层次                              │
 ├─────────────────────────────────────────────────────────────────┤
