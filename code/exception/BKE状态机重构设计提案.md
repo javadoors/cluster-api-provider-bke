@@ -115,7 +115,7 @@ func handleClusterScaleMasterUpPhase(ctx *PhaseContext, err error) {
 
 通过对代码库的全面搜索，梳理出所有状态转换逻辑的分布位置：
 
-##### 1. 核心状态转换函数（phase_flow.go）
+##### 2.1.1.1 核心状态转换函数（phase_flow.go）
 
 **文件**: `pkg/phaseframe/phases/phase_flow.go`
 
@@ -138,7 +138,7 @@ func handleClusterScaleMasterUpPhase(ctx *PhaseContext, err error) {
 
 **总计**: 11个状态转换处理函数
 
-##### 2. 状态管理器（statusmanager.go）
+##### 2.1.1.2 状态管理器（statusmanager.go）
 
 **文件**: `pkg/statusmanage/statusmanager.go`
 
@@ -156,7 +156,7 @@ func handleClusterScaleMasterUpPhase(ctx *PhaseContext, err error) {
 - 状态回退：失败时回退到 LatestNormalState
 - 超过重试次数后设置 ClusterHealthState
 
-##### 3. 集群健康状态转换（ensure_cluster.go）
+##### 2.1.1.3 集群健康状态转换（ensure_cluster.go）
 
 **文件**: `pkg/phaseframe/phases/ensure_cluster.go`
 
@@ -166,9 +166,9 @@ func handleClusterScaleMasterUpPhase(ctx *PhaseContext, err error) {
 | 373 | 健康检查失败 | → Unhealthy | 集群不健康 |
 | 399 | 健康检查成功 | → Healthy | 集群健康 |
 
-##### 4. 其他控制器中的状态转换
+##### 2.1.1.4 其他控制器中的状态转换
 
-##### 4.1 bkecluster_controller.go
+###### 2.1.1.4.1 bkecluster_controller.go
 **文件**: `controllers/capbke/bkecluster_controller.go`
 
 | 行号 | 函数 | 状态转换 | 说明 |
@@ -176,32 +176,32 @@ func handleClusterScaleMasterUpPhase(ctx *PhaseContext, err error) {
 | 199-220 | `handleClusterStatus` | 状态更新 | 控制器状态处理 |
 | 807 | 直接赋值 | ClusterHealthState | 设置健康状态 |
 
-##### 4.2 bkecluster_upgrade_dag.go
+###### 2.1.1.4.2 bkecluster_upgrade_dag.go
 **文件**: `controllers/capbke/bkecluster_upgrade_dag.go`
 
 | 行号 | 位置 | 状态转换 | 说明 |
 |------|------|---------|------|
 | 310 | 升级流程 | ClusterStatus = status | 升级状态设置 |
 
-##### 4.3 ensure_delete_or_reset.go
+###### 2.1.1.4.3 ensure_delete_or_reset.go
 **文件**: `pkg/phaseframe/phases/ensure_delete_or_reset.go`
 
 | 行号 | 位置 | 状态转换 | 说明 |
 |------|------|---------|------|
 | 179 | 删除流程 | → ClusterDeleting | 删除状态设置 |
 
-##### 4.4 context.go
+###### 2.1.1.4.4 context.go
 **文件**: `pkg/phaseframe/context.go`
 
 | 行号 | 位置 | 状态转换 | 说明 |
 |------|------|---------|------|
 | 252 | 上下文处理 | → ClusterDeleting | 删除状态设置 |
 
-##### 5. 状态定义（bkecluster_consts.go）
+##### 2.1.1.5 状态定义（bkecluster_consts.go）
 
 **文件**: `api/capbke/v1beta1/bkecluster_consts.go`
 
-##### 5.1 ClusterStatus 定义（152-182行）
+###### 2.1.1.5.1 ClusterStatus 定义（152-182行）
 
 ```go
 ClusterReady, ClusterUnhealthy, ClusterUnknown, ClusterChecking
@@ -217,7 +217,7 @@ ClusterManaging, ClusterManageFailed
 ClusterDeleting, ClusterDeleteFailed
 ```
 
-##### 5.2 ClusterHealthState 定义（222-230行）
+###### 2.1.1.5.2 ClusterHealthState 定义（222-230行）
 
 ```go
 Deploying, DeployFailed
@@ -227,7 +227,7 @@ Unhealthy, Healthy
 Deleting
 ```
 
-##### 6. 状态转换逻辑分布统计
+##### 2.1.1.6 状态转换逻辑分布统计
 
 | 文件 | 状态转换点数量 | 主要职责 |
 | ------ | -------------- | --------- |
@@ -238,7 +238,7 @@ Deleting
 | 其他文件 | 4个 | 特定场景状态设置 |
 | **总计** | **28个** | - |
 
-##### 7. 问题总结
+##### 2.1.1.7 问题总结
 
 **状态转换逻辑分散的具体表现**:
 
@@ -825,7 +825,7 @@ if sr.AllowFailed() {
 
 #### 4.1.2 重构内容
 
-##### 4.1.2.0 统一同步机制
+##### 4.1.2.1 统一同步机制
 
 **同步策略**：
 
@@ -913,7 +913,7 @@ func ValidateStatusConsistency(cluster *bkev1beta1.BKECluster) error {
 2. **所有派生字段必须从 ClusterStatus 派生**：禁止直接设置 Phase 或 ClusterHealthState
 3. **所有同步点必须使用相同的策略**：PhaseFlow、StatusManager、Controller、Webhook 等所有层统一使用
 
-##### 4.1.2.1 API 层重构
+##### 4.1.2.2 API 层重构
 
 **重构内容**：
 
@@ -994,7 +994,7 @@ LastInProgressState ClusterStatus `json:"lastInProgressState,omitempty"`
 - **持久化存储**：存储在 Cluster.Status 中，重启不丢失
 - **自动设置**：在错误转换时（TriggerError）由引擎自动设置，无需业务代码干预
 
-##### 4.1.2.2 映射函数层重构
+##### 4.1.2.3 映射函数层重构
 
 **重构内容**：
 
@@ -1185,7 +1185,7 @@ func MapToLifecyclePhase(status bkev1beta1.ClusterStatus) string {
 }
 ```
 
-##### 4.1.2.3 PhaseFlow 框架层重构
+##### 4.1.2.4 PhaseFlow 框架层重构
 
 **重构内容**：
 
@@ -1270,7 +1270,7 @@ log.Info("waiting for phase to complete", "phase", bkeCluster.Status.Phase)
 log.Info("waiting for phase to complete", "status", bkeCluster.Status.ClusterStatus)
 ```
 
-##### 4.1.2.4 状态管理层重构
+##### 4.1.2.5 状态管理层重构
 
 **重构内容**：
 
@@ -1361,7 +1361,7 @@ case bkev1beta1.ClusterManaging:
 }
 ```
 
-##### 4.1.2.5 控制器层重构
+##### 4.1.2.6 控制器层重构
 
 **重构内容**：
 
@@ -1395,7 +1395,7 @@ func markBKEClusterHealthyStatus(bkeCluster *bkev1beta1.BKECluster, status confv
 }
 ```
 
-##### 4.1.2.6 Webhook 层重构
+##### 4.1.2.7 Webhook 层重构
 
 **重构内容**：
 
@@ -1447,7 +1447,7 @@ if newBKECluster.Status.ClusterStatus != bkev1beta1.ClusterReady {
 }
 ```
 
-##### 4.1.2.7 其他文件重构
+##### 4.1.2.8 其他文件重构
 
 **重构内容**：
 
@@ -1575,7 +1575,7 @@ params.CombinedCluster.Status.ClusterHealthState = newBKECuster.Status.ClusterHe
 params.CombinedCluster.SetClusterStatus(newBKECuster.Status.ClusterStatus)
 ```
 
-##### 4.1.2.8 测试层重构
+##### 4.1.2.9 测试层重构
 
 **重构内容**：
 
