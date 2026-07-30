@@ -15,7 +15,7 @@
   - [3.2 约束](#32-约束)
   - [3.3 非目标](#33-非目标)
 - [4. 提案设计](#4-提案设计)
-  - [问题与解决方案总览](#问题与解决方案总览)
+  - [4.0 问题与解决方案总览](#40-问题与解决方案总览)
   - [4.1 重构方案：三字段整合方案](#41-重构方案三字段整合方案保持-clusterstatus-兼容性)
   - [4.2 增强方案一：状态转换表](#42-增强方案一状态转换表适配单字段设计)
   - [4.3 增强方案二：改进状态管理器](#43-增强方案二改进状态管理器适配单字段设计)
@@ -735,11 +735,11 @@ if sr.AllowFailed() {
 
 > **章节摘要**：本章详细描述 4 个重构方案：三字段整合方案（以 ClusterStatus 为单一数据源）、状态转换表引擎（64 条规则）、状态管理器改进（StatusManagerV2）、状态转换事件系统（内存/持久化存储），以及面向三层状态机架构的设计远景。
 
-### 问题与解决方案总览
+### 4.0 问题与解决方案总览
 
 本节总结第 2 章列出的所有问题，并说明每个问题在提案设计中的解决方案。
 
-#### 2.1 节问题与解决方案对比
+#### 4.0.1 2.1 节问题与解决方案对比
 
 | 2.1 节问题 | 对应提案章节 | 解决方案 | 状态 |
 |-----------|------------|---------|------|
@@ -747,7 +747,7 @@ if sr.AllowFailed() {
 | **缺乏统一管理**：没有统一的状态转换表和转换规则定义 | 4.2 节（状态转换表） | 定义 `Transition` 结构体，通过 `registerClusterTransitions` 函数统一注册 64 条规则 | ✅ 已解决 |
 | **条件隐含**：状态转换条件隐含在代码逻辑中，难以理解和维护 | 4.2 节（状态转换表） | 使用 `Condition` 函数，将条件显式化，便于理解和测试 | ✅ 已解决 |
 
-#### 2.2 节问题与解决方案对比
+#### 4.0.2 2.2 节问题与解决方案对比
 
 | 2.2 节问题 | 对应提案章节 | 解决方案 | 状态 |
 |-----------|------------|---------|------|
@@ -757,7 +757,7 @@ if sr.AllowFailed() {
 | **并发不安全**：`int` 计数器非原子操作 | 4.3 节（改进状态管理器） | 使用 `int32` + `atomic.AddInt32`，确保并发安全 | ✅ 已解决 |
 | **Failed 状态覆盖不全**：只覆盖 3/8 种 Failed 状态 | 4.3 节（改进状态管理器） | 覆盖全部 8 种 Failed 状态 | ✅ 已解决 |
 
-#### 2.3-2.6 节问题与解决方案对比
+#### 4.0.3 2.3-2.6 节问题与解决方案对比
 
 | 问题章节 | 问题描述 | 对应提案章节 | 解决方案 | 状态 |
 |---------|---------|------------|---------|------|
@@ -766,7 +766,7 @@ if sr.AllowFailed() {
 | 2.5 | **状态可观测性不足**：缺乏状态转换事件记录 | 4.4 节（状态转换事件系统） | 提供 `EventStore` 接口，支持事件记录和查询 | ✅ 已解决 |
 | 2.6 | **代码可维护性差**：代码圈复杂度高（15） | 4.2 节（状态转换表） | 使用状态转换表替代分散逻辑，降低圈复杂度至 8 以下 | ✅ 已解决 |
 
-#### 4.2 节额外解决的问题
+#### 4.0.4 4.2 节额外解决的问题
 
 4.2 节不仅解决了 2.1 节的问题，还预防了以下潜在问题：
 
@@ -776,7 +776,7 @@ if sr.AllowFailed() {
 | **难以验证**：状态转换规则难以验证完整性 | 规则集中定义，便于验证和测试 |
 | **缺乏可视化**：无法生成状态机文档和可视化图表 | 规则集中定义，可生成可视化图表 |
 
-#### 总结
+#### 4.0.5 总结
 
 **所有 2.1-2.6 节列出的问题都在提案设计中得到了解决**：
 - **4.1 节（三字段整合）**：解决"用什么字段表达状态"的问题
@@ -1782,7 +1782,7 @@ func IsMasterScaleUpRetry(cc *ConditionContext) bool {
 
 #### 4.2.3 Transition 替换原有业务逻辑
 
-#### 调用链对比
+##### 4.2.3.1 调用链对比
 
 **当前代码调用链**：
 
@@ -1810,7 +1810,7 @@ PhaseFlow.Execute()
 
 > **关键设计**：`err` 参数决定 `effectiveTrigger` 的值。当 `err != nil` 时，`effectiveTrigger` 被替换为 `TriggerError`，从而匹配转换表中的失败规则（如 `{ClusterUpgrading, ClusterUpgradeFailed, TriggerError}`）。这确保了 pre-hook 和 post-hook 的调用虽然使用相同的 `trigger` 参数，但因为 `err` 不同，会匹配到不同的转换规则，实现成功/失败路径的正确分离。
 
-#### Trigger 的作用说明
+##### 4.2.3.2 Trigger 的作用说明
 
 **Trigger 的核心作用**：区分"操作类型"，而不是"哪个 Phase 执行"。
 
@@ -1854,7 +1854,7 @@ type PhaseExecutionEvent struct {
 }
 ```
 
-#### 需要重构的代码清单
+##### 4.2.3.3 需要重构的代码清单
 
 **第一层：直接替换（删除 11 个 handle 函数 + 分发器）**
 
@@ -1875,7 +1875,7 @@ type PhaseExecutionEvent struct {
 | `phase_flow.go` | 301-309 | `calculatingClusterPreStatusByPhase` | **修改**，调用 `engine.Transition(phase, nil)` |
 | `phase_flow.go` | 311-320 | `calculatingClusterPostStatusByPhase` | **修改**，调用 `engine.Transition(phase, err)` |
 
-#### 重构后代码
+##### 4.2.3.4 重构后代码
 
 **文件：`pkg/phaseframe/phases/phase_flow.go`（重构后）**
 
@@ -2228,7 +2228,7 @@ func calculatingClusterPostStatusByPhase(phase phaseframe.Phase, err error) erro
 | `pkg/phaseframe/statemachine/engine_test.go` | 引擎单元测试 |
 | `pkg/phaseframe/statemachine/transitions_test.go` | 转换表完整性测试 |
 
-#### 新增文件代码
+##### 4.2.3.5 新增文件代码
 
 **文件：`pkg/phaseframe/statemachine/engine.go`**
 
@@ -2647,7 +2647,7 @@ func TestErrorMappingsCoverage(t *testing.T) {
 | `context.go` | 252 | 直接设置 `ClusterDeleting` | 改为 `engine.Transition("EnsureDeleteOrReset", nil)` |
 | `webhooks/capbke/bkecluster.go` | 174, 646 | 检查 `ClusterHealthState` | 改为检查 `ClusterStatus` |
 
-#### 重构后代码
+##### 4.2.3.6 重构后代码
 
 **文件：`pkg/statusmanage/statusmanager.go`**
 
@@ -2887,7 +2887,7 @@ if newBKECluster.Status.ClusterStatus == bkev1beta1.ClusterDeployingAddon {
 if newBKECluster.Status.ClusterStatus != bkev1beta1.ClusterReady {
 ```
 
-#### Condition 函数提取
+##### 4.2.3.7 Condition 函数提取
 
 Condition 函数（如 `needUpgrade`、`isClusterReady`）需要从现有代码中提取。当前这些条件隐含在 Phase 的 `NeedExecute()` 方法中。重构时需要：
 
@@ -2915,7 +2915,7 @@ Condition 函数（如 `needUpgrade`、`isClusterReady`）需要从现有代码�
 | `isWorkerScaleUpRetry` | StatusManager | 检查 LastInProgressState == WorkerScalingUp |
 | `isWorkerScaleDownRetry` | StatusManager | 检查 LastInProgressState == WorkerScalingDown |
 
-#### 提取后的代码
+##### 4.2.3.8 提取后的代码
 
 **文件：`pkg/phaseframe/statemachine/conditions.go`**
 
@@ -3851,7 +3851,7 @@ if sr.CurrentClusterState != bkev1beta1.ClusterUnhealthy &&
 
 > **与 4.2.3 节的关系**：4.2.3 节的 `engine.go` 定义了 `EventStore` 接口，本节提供默认的内存实现 `InMemoryEventStore`。Engine 默认使用此实现，也可以通过选项模式替换。
 
-#### InMemoryEventStore 实现
+#### 4.4.1 InMemoryEventStore 实现
 
 ```go
 package statemachine
@@ -3905,7 +3905,7 @@ func (s *InMemoryEventStore) Query(filter EventFilter) ([]TransitionEvent, error
 }
 ```
 
-#### 使用方式
+#### 4.4.2 使用方式
 
 ```go
 // 方式 1：使用默认内存存储（推荐）
