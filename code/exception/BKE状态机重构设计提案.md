@@ -3662,7 +3662,7 @@ func (b *StatusManagerV2) RemoveSingleNodeStatusCache(bkeCluster *bkev1beta1.BKE
 ##### 4.3.6.1 职责划分
 
 | 职责 | 负责组件 | 说明 |
-|------|---------|------|
+| ------ | --------- | ------ |
 | **状态记录** | StatusManager | 记录集群和节点的状态变化 |
 | **重试计数** | StatusManager | 记录失败状态的连续出现次数（StatusCount） |
 | **内存清理** | StatusManager | 定期清理过期的状态记录 |
@@ -3901,7 +3901,7 @@ if sr.CurrentClusterState != bkev1beta1.ClusterUnhealthy &&
 #### 4.3.7 与原代码的关键差异
 
 | 维度 | 原代码 (`StatusManager`) | 新代码 (`StatusManagerV2`) |
-|------|---------------------------|---------------------------|
+| ------ | --------------------------- | --------------------------- |
 | **状态记录类型** | `StatusRecord`（含 RetryPolicy） | `StatusRecordV2`（删除 RetryPolicy） |
 | **重试策略** | 按 `ClusterStatus` 索引，支持不同策略 | 由 Engine 统一管理 |
 | **状态伪装** | StatusManager 负责伪装 | 由 Engine 统一管理 |
@@ -3942,7 +3942,7 @@ if sr.CurrentClusterState != bkev1beta1.ClusterUnhealthy &&
 **优势**：
 
 | 优势 | 说明 |
-|------|------|
+| ------ | ------ |
 | **职责清晰** | StatusManager 只负责状态记录和重试计数，Engine 负责状态转换和重试策略 |
 | **代码简化** | 删除约 200 行代码（重试策略配置 + 状态伪装逻辑） |
 | **易于维护** | 重试策略集中在 Engine 中，便于统一管理 |
@@ -3952,7 +3952,7 @@ if sr.CurrentClusterState != bkev1beta1.ClusterUnhealthy &&
 **风险**：
 
 | 风险 | 缓解措施 |
-|------|---------|
+| ------ | ------ |
 | **Engine 复杂度增加** | Engine 需要管理重试策略，但这是合理的职责扩展 |
 | **状态伪装逻辑变更** | 需要充分测试，确保重试行为与原来一致 |
 | **接口变更** | 新增的查询方法需要确保线程安全 |
@@ -3966,7 +3966,7 @@ if sr.CurrentClusterState != bkev1beta1.ClusterUnhealthy &&
 #### 4.4.1 使用场景
 
 | 场景 | 说明 | 示例 |
-|------|------|------|
+| ------ | ------ | ------ |
 | **故障排查** | 查询状态转换历史，定位问题 | 集群卡在 Upgrading 状态，查询事件发现最后一次转换失败 |
 | **状态审计** | 合规审计和变更追踪 | 查询某个集群在过去 24 小时内的所有状态变更 |
 | **性能分析** | 识别性能瓶颈 | 统计 Upgrading 状态的平均持续时间，发现升级过程耗时过长 |
@@ -4120,7 +4120,7 @@ func (e *Engine) recordTransition(cluster *BKECluster, trans Transition, err err
 **性能建议**：
 
 | 场景 | 推荐 maxSize | 说明 |
-|------|-------------|------|
+| ------ | ------------- | ------ |
 | 开发测试 | 1000 | 足够调试使用，内存占用小 |
 | 生产环境（小规模） | 5000 | 平衡查询性能和内存占用 |
 | 生产环境（大规模） | 10000 | 需要频繁查询历史事件 |
@@ -4169,7 +4169,7 @@ engine := NewEngine(client, ctx, WithEventStore(eventStore))
 建议暴露以下 Prometheus 指标，便于运维监控：
 
 | 指标名称 | 类型 | 说明 |
-|---------|------|------|
+| --------- | ------ | ------ |
 | `bke_state_machine_events_recorded_total` | Counter | 事件记录总数 |
 | `bke_state_machine_events_record_errors_total` | Counter | 事件记录失败总数 |
 | `bke_state_machine_event_queries_total` | Counter | 事件查询总数 |
@@ -4221,26 +4221,26 @@ func (s *InMemoryEventStore) Record(event TransitionEvent) error {
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                         混合模型架构                                         │
 ├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
+│                                                                             │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
 │  │                    驱动模型（自上而下）                               │   │
 │  │                                                                     │   │
-│  │  用户操作 → 集群状态 → 节点状态 → 组件状态                           │   │
+│  │  用户操作 → 集群状态 → 节点状态 → 组件状态                             │   │
 │  │                                                                     │   │
-│  │  决定：LifecyclePhase（生命周期阶段）                                │   │
-│  │  - Pending, Installing, Running, Upgrading, Scaling, Managing,       │   │
-│  │    RollingBack, Deleting, Deleted, Failed                            │   │
+│  │  决定：LifecyclePhase（生命周期阶段）                                 │   │
+│  │  - Pending, Installing, Running, Upgrading, Scaling, Managing,      │   │
+│  │    RollingBack, Deleting, Deleted, Failed                           │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                              │
+│                                                                            │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
 │  │                    聚合模型（自底向上）                               │   │
 │  │                                                                     │   │
-│  │  组件状态 → 节点状态 → 集群状态                                      │   │
+│  │  组件状态 → 节点状态 → 集群状态                                       │   │
 │  │                                                                     │   │
 │  │  决定：HealthStatus（健康状态）                                      │   │
-│  │  - Healthy, Degraded, Unhealthy, Unknown                           │   │
+│  │  - Healthy, Degraded, Unhealthy, Unknown                            │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                              │
+│                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -4253,24 +4253,24 @@ func (s *InMemoryEventStore) Record(event TransitionEvent) error {
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                    集群层 (Cluster Lifecycle) - 10 个状态                     │
+│                    集群层 (Cluster Lifecycle)                               │
 │  Pending → Installing → Running → Upgrading → Scaling → Managing →         │
 │  RollingBack → Deleting → Deleted → Failed                                 │
-└─────────────────────────────────────────────────────────────────────────────┘
+└────────────────────────────────────────────────────────────────────────────┘
                                      │ 聚合
                                      ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                    节点层 (Node Lifecycle) - 8 个状态                         │
+│                    节点层 (Node Lifecycle)                                  │
 │  Pending → Provisioned → Ready → Upgrading → RollingBack → Deleting →      │
 │  Deleted → Failed                                                          │
-└─────────────────────────────────────────────────────────────────────────────┘
+└────────────────────────────────────────────────────────────────────────────┘
                                      │ 聚合
                                      ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                    组件层 (Component Lifecycle) - 8 个状态                    │
+│                    组件层 (Component Lifecycle)                             │
 │  Pending → Installing → Installed → Upgrading → RollingBack → Deleting →   │
 │  Deleted → Failed                                                          │
-└─────────────────────────────────────────────────────────────────────────────┘
+└────────────────────────────────────────────────────────────────────────────┘
 ```
 
 #### 4.5.3 生命周期阶段与操作模式的关系
@@ -4278,7 +4278,7 @@ func (s *InMemoryEventStore) Record(event TransitionEvent) error {
 ##### 核心概念区分
 
 | 概念 | 定义 | 特点 | 示例 |
-|------|------|------|------|
+| ------ | ------ | ------ | ------ |
 | **生命周期阶段** | 集群从创建到删除的主要阶段 | 互斥、有序、不可跳过 | Pending → Installing → Running → Upgrading → Deleting → Deleted |
 | **操作模式** | 临时的操作状态，不改变生命周期 | 可叠加、可随时切换、不影响生命周期 | Paused（暂停）、DryRun（测试） |
 
@@ -4286,20 +4286,20 @@ func (s *InMemoryEventStore) Record(event TransitionEvent) error {
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    生命周期阶段（LifecyclePhase）              │
+│                    生命周期阶段（LifecyclePhase）             │
 │  ┌──────┐  ┌──────────┐  ┌─────────┐  ┌──────────┐  ┌─────┐ │
 │  │Pend- │→ │Installing│→ │ Running │→ │Upgrading │→ │Delet│ │
 │  │ing   │  │          │  │         │  │          │  │ing  │ │
 │  └──────┘  └──────────┘  └─────────┘  └──────────┘  └─────┘ │
-│       ↑           ↑            ↑            ↑           ↑    │
-│       │           │            │            │           │    │
-│       └───────────┴────────────┴────────────┴───────────┘    │
-│                          │                                   │
-│                    操作模式（可叠加）                           │
-│                    ┌──────────┐                              │
+│       ↑           ↑            ↑            ↑           ↑   │
+│       │           │            │            │           │   │
+│       └───────────┴────────────┴────────────┴───────────┘   │
+│                          │                                  │
+│                    操作模式（可叠加）                         │
+│                    ┌──────────┐                             │
 │                    │ Paused   │ ← 可以在任何阶段暂停          │
 │                    │ DryRun   │ ← 可以在任何阶段测试          │
-│                    └──────────┘                              │
+│                    └──────────┘                             │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -4326,7 +4326,7 @@ status:
 **原则 2：操作模式可以在任何生命周期阶段激活**
 
 | 生命周期阶段 | 可以暂停？ | 可以 DryRun？ | 说明 |
-|------------|----------|-------------|------|
+| ------------ | ---------- | ------------- | ------ |
 | Pending | ✅ | ✅ | 等待安装时可以暂停或测试 |
 | Installing | ✅ | ✅ | 安装过程中可以暂停或测试 |
 | Running | ✅ | ✅ | 运行中可以暂停或测试 |
@@ -4433,7 +4433,7 @@ status:
 **Kubernetes 标准模式**：
 
 | 字段 | 用途 | 示例 |
-|------|------|------|
+| ------ | ------ | ------ |
 | `status.phase` | 主要生命周期阶段 | Running, Failed |
 | `status.conditions` | 详细状态和操作模式 | Available, Paused, Progressing |
 | `spec.paused` | 控制是否暂停 | true/false |
@@ -4533,7 +4533,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 **生命周期阶段**和**操作模式**是两个独立但相关的概念：
 
 | 维度 | 生命周期阶段 | 操作模式 |
-|------|------------|---------|
+| ------ | ------------ | --------- |
 | **表达字段** | `status.lifecyclePhase` | `status.conditions` |
 | **控制字段** | 状态机规则 | `spec.paused`、`spec.dryRun` |
 | **特点** | 互斥、有序、不可跳过 | 可叠加、可随时切换 |
@@ -4573,7 +4573,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 │                                                           │
 │  阶段一：状态字段整合（核心，必须）                          │
 │  ┌─────────────────┐      ┌──────────────────┐          │
-│  │ 删除 Phase      │      │ 删除             │          │
+│  │ 派生 Phase      │      │ 派生             │          │
 │  │ 字段            │      │ ClusterHealth    │          │
 │  │                 │      │ State 字段       │          │
 │  └────────┬────────┘      └────────┬─────────┘          │
@@ -4714,7 +4714,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 **演进映射表（提案组件 → 目标组件）**：
 
 | 提案组件 | 目标组件 | 演进成本 | 说明 |
-|---------|---------|---------|------|
+| --------- | --------- | --------- | ------ |
 | ClusterStatus（22 个值） | LifecyclePhase（10 个值） | 低 | MapToLifecyclePhase 映射函数已存在 |
 | 状态转换引擎（64 条规则） | 三层状态机引擎 | 中 | 需扩展节点层/组件层转换规则 |
 | StatusManagerV2 | OperationProgress | 低 | 添加操作追踪字段即可 |
@@ -4802,7 +4802,7 @@ func calculatingClusterPostStatusByPhase(phase phaseframe.Phase, err error) erro
 本提案的 `MapToLifecyclePhase` 函数将 22 个 ClusterStatus 值归约为 10 个 LifecyclePhase 值，为目标架构的兼容性映射奠定基础：
 
 | ClusterStatus（22 个值） | LifecyclePhase（10 个值） | 说明 |
-|-------------------------|-------------------------|------|
+| ------------------------- | ------------------------- | ------ |
 | ClusterUnknown, ClusterChecking | Pending | 等待/检查状态 |
 | ClusterInitializing, ClusterMasterScalingUp, ClusterWorkerScalingUp | Installing | 安装/扩容状态 |
 | ClusterReady | Running | 运行状态 |
@@ -4816,10 +4816,10 @@ func calculatingClusterPostStatusByPhase(phase phaseframe.Phase, err error) erro
 
 **映射信息丢失处理策略**：
 
-22 个 ClusterStatus 映射到 9 个 LifecyclePhase 时，存在信息丢失。目标架构通过以下机制补偿：
+22 个 ClusterStatus 映射到 10 个 LifecyclePhase 时，存在信息丢失。目标架构通过以下机制补偿：
 
 | 丢失的信息 | 补偿机制 | 说明 |
-|-----------|---------|------|
+| ----------- | --------- | ------ |
 | Master/Worker 扩容区分 | `OperationProgress.CurrentStage` | 通过操作进度字段记录具体操作类型 |
 | Master/Worker 缩容区分 | `OperationProgress.CurrentStage` | 同上 |
 | 具体失败原因 | `OperationProgress.LastFailure` | 通过失败记录字段保存详细错误信息 |
@@ -4831,7 +4831,7 @@ func calculatingClusterPostStatusByPhase(phase phaseframe.Phase, err error) erro
 **演进成本总结**：
 
 | 演进阶段 | 工作量 | 风险 | 说明 |
-|---------|-------|------|------|
+| --------- | ------- | ------ | ------ |
 | 本提案阶段一（三字段整合） | 7-11 天 | 低 | 必须实施，解决当前问题 |
 | 本提案阶段二（状态机增强） | 12-16 天 | 低 | 可选实施，为目标架构做准备 |
 | 桥梁层（OperationProgress + HealthStatus） | 10-15 天 | 中 | 关键过渡阶段 |
@@ -5286,8 +5286,6 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
     summary: "状态转换失败"
 ```
 
----
-
 ## 10. 总结
 
 > **章节摘要**：本章总结重构方案的核心价值，描述面向三层状态机架构的演进路径（当前层→增强层→远景层），以及关键文件变更清单（20 个文件的修改和新增操作）。
@@ -5315,7 +5313,7 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 **可复用性分析**：
 
 | 提案组件 | 目标架构可复用度 | 说明 |
-|---------|-----------|------|
+| --------- | ----------- | ------ |
 | ClusterStatus 单一数据源 | 100% | 直接映射到 LifecyclePhase |
 | 状态转换引擎 | 60% | 引擎框架可复用，需扩展节点层/组件层规则 |
 | StatusManagerV2 | 40% | 重试机制可复用，需添加操作追踪字段 |
@@ -5326,7 +5324,7 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 **演进成本分解**：
 
 | 演进阶段 | 工作内容 | 工作量 | 风险等级 |
-|---------|---------|-------|---------|
+| --------- | --------- | ------- | --------- |
 | **阶段一：状态字段整合** | 删除 Phase/ClusterHealthState，保留 ClusterStatus | 7-11 天 | 低 |
 | **阶段二：状态机增强** | 实现状态转换引擎 + StatusManagerV2 | 12-16 天 | 低 |
 | **阶段三：桥梁层** | 引入 OperationProgress + HealthStatus | 10-15 天 | 中 |
@@ -5343,7 +5341,7 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 **关键里程碑**：
 
 | 里程碑 | 时间 | 交付物 | 验收标准 |
-|-------|------|-------|---------|
+| ------- | ------ | ------- | --------- |
 | M1：状态字段整合完成 | 第 11 天 | ClusterStatus 单一数据源 | 所有测试通过，外部消费者无感知 |
 | M2：状态机增强完成 | 第 27 天 | 状态转换引擎 + StatusManagerV2 | 状态转换规则集中管理，Failed 覆盖 8/8 |
 | M3：桥梁层完成 | 第 42 天 | OperationProgress + HealthStatus | 支持操作进度追踪，健康状态独立表达 |
@@ -5383,7 +5381,7 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 #### 核心概念
 
 | 术语 | 英文 | 定义 | 使用场景 |
-|------|------|------|---------|
+| ------ | ------ | ------ | --------- |
 | **ClusterStatus** | Cluster Status | 集群操作状态，重构后的单一数据源，包含 22 个枚举值 | 所有状态管理场景 |
 | **ClusterHealthState** | Cluster Health State | 集群健康状态（Deprecated），包含 9 个枚举值，将被 ClusterStatus 替代 | 向后兼容场景 |
 | **Phase** | Phase | 集群阶段（Deprecated），包含 12 个枚举值，将被 ClusterStatus 替代 | 向后兼容场景 |
@@ -5392,7 +5390,7 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 #### 状态管理机制
 
 | 术语 | 英文 | 定义 | 使用场景 |
-|------|------|------|---------|
+| ------ | ------ | ------ | --------- |
 | **状态伪装** | State Masking | StatusManager 在重试期间将 Failed 状态临时替换为 LatestNormalState，对外隐藏真实失败状态的机制 | 重试机制设计 |
 | **状态回退** | State Rollback | 从 Failed 状态回退到 LatestNormalState 的过程，用于重试期间恢复集群状态 | 重试机制实现 |
 | **LatestNormalState** | Latest Normal State | 最后一次正常状态记录，用于状态回退时恢复到正常状态 | 状态回退机制 |
@@ -5401,7 +5399,7 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 #### 状态转换机制
 
 | 术语 | 英文 | 定义 | 使用场景 |
-|------|------|------|---------|
+| ------ | ------ | ------ | --------- |
 | **Transition** | Transition | 状态转换规则，定义 FromState、ToState、Trigger、Condition、Action | 状态转换表 |
 | **effectiveTrigger** | Effective Trigger | 引擎实际使用的触发器，err!=nil 时被替换为 "Error" | 状态转换引擎 |
 | **Trigger** | Trigger | 触发状态转换的事件，如 Phase 名称、Error、PhaseComplete、Retry | 状态转换规则 |
@@ -5410,7 +5408,7 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 #### 重试机制
 
 | 术语 | 英文 | 定义 | 使用场景 |
-|------|------|------|---------|
+| ------ | ------ | ------ | --------- |
 | **RetryPolicy** | Retry Policy | 重试策略配置，包含 MaxRetryCount、BackoffStrategy、InitialDelay、MaxDelay | 重试机制设计 |
 | **BackoffStrategy** | Backoff Strategy | 退避策略类型：None（无退避）、Linear（线性退避）、Exponential（指数退避） | 重试间隔控制 |
 | **StatusManager** | Status Manager | 状态管理器，负责状态记录、重试计数、状态回退 | 状态管理 |
@@ -5419,7 +5417,7 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 #### 架构设计
 
 | 术语 | 英文 | 定义 | 使用场景 |
-|------|------|------|---------|
+| ------ | ------ | ------ | --------- |
 | **Feature Gate** | Feature Gate | 功能开关，控制新特性的启用，支持灰度发布 | 迁移策略 |
 | **双写** | Dual Write | 同时写入新旧字段，保证兼容性 | 向后兼容 |
 | **三层状态机** | Three-Layer State Machine | 集群层→节点层→组件层的分层状态机架构 | 远景设计 |
@@ -5428,7 +5426,7 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 #### 事件系统
 
 | 术语 | 英文 | 定义 | 使用场景 |
-|------|------|------|---------|
+| ------ | ------ | ------ | --------- |
 | **TransitionEvent** | Transition Event | 状态转换事件，记录状态转换的时间、集群、源状态、目标状态、触发器、错误、耗时 | 事件记录 |
 | **EventStore** | Event Store | 事件存储接口，支持内存存储和持久化存储 | 事件管理 |
 | **InMemoryEventStore** | In-Memory Event Store | 内存事件存储，用于短期存储和开发调试，默认容量 1000 条 | 开发测试 |
@@ -5437,7 +5435,7 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 #### 映射函数
 
 | 术语 | 英文 | 定义 | 信息丢失 |
-|------|------|------|---------|
+| ------ | ------ | ------ | --------- |
 | **MapPhaseToClusterStatus** | Phase to ClusterStatus Mapper | 将 Phase 映射到 ClusterStatus | 多个 Phase 映射到同一个 ClusterStatus |
 | **MapClusterHealthStateToClusterStatus** | HealthState to ClusterStatus Mapper | 将 ClusterHealthState 映射到 ClusterStatus | 存在一对多映射 |
 | **MapClusterStatusToPhase** | ClusterStatus to Phase Mapper | 将 ClusterStatus 映射到 Phase（向后兼容） | 丢失细粒度状态信息 |
@@ -5450,28 +5448,28 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 ┌─────────────────────────────────────────────────────────────────┐
 │                        状态字段层次                              │
 ├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌──────────────┐    ┌──────────────────┐    ┌──────────────┐  │
-│  │   Phase      │    │ ClusterStatus    │    │ClusterHealth │  │
-│  │ (Deprecated) │───▶│  (单一数据源)     │◀───│   State      │  │
-│  │   12个值     │    │    22个值         │    │ (Deprecated) │  │
-│  └──────────────┘    └────────┬─────────┘    │    9个值     │  │
-│                               │               └──────────────┘  │
-│                               │                                  │
-│                               ▼                                  │
+│                                                                 │
+│  ┌──────────────┐    ┌──────────────────┐    ┌──────────────┐   │
+│  │   Phase      │    │ ClusterStatus    │    │ClusterHealth │   │
+│  │ (Deprecated) │───▶│  (单一数据源)     │◀──│   State      │   │
+│  │   12个值     │    │    22个值         │    │ (Deprecated) │   │
+│  └──────────────┘    └────────┬─────────┘    │    9个值     │   │
+│                               │              └──────────────┘   │
+│                               │                                 │
+│                               ▼                                 │
 │                    ┌──────────────────┐                         │
 │                    │ LifecyclePhase   │                         │
 │                    │  (三层状态机)     │                         │
 │                    │    10个值         │                         │
 │                    └──────────────────┘                         │
-│                                                                  │
+│                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────┐
 │                      状态转换机制                                │
 ├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌──────────────┐         ┌──────────────┐                     │
+│                                                                 │
+│  ┌──────────────┐         ┌──────────────┐                      │
 │  │  Transition  │────────▶│   Engine     │                     │
 │  │  (转换规则)   │         │  (状态机引擎) │                     │
 │  │  - FromState │         │  - 规则匹配   │                     │
@@ -5479,73 +5477,73 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 │  │  - Trigger   │         │  - 动作执行   │                     │
 │  │  - Condition │         │  - 事件记录   │                     │
 │  │  - Action    │         └──────────────┘                     │
-│  └──────────────┘                                                │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
+│  └──────────────┘                                              │
+│                                                                │
+└────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────┐
 │                        重试机制                                  │
 ├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌──────────────┐         ┌──────────────┐                     │
+│                                                                 │
+│  ┌──────────────┐         ┌──────────────┐                      │
 │  │StatusManager │────────▶│ RetryPolicy  │                     │
 │  │  (状态管理器) │         │  (重试策略)   │                     │
 │  │  - 状态记录   │         │  - MaxRetry  │                     │
 │  │  - 失败计数   │         │  - Backoff   │                     │
 │  │  - 状态回退   │         │  - Delay     │                     │
 │  └──────┬───────┘         └──────────────┘                     │
-│         │                                                        │
-│         ▼                                                        │
-│  ┌──────────────┐                                               │
-│  │状态伪装/回退  │                                               │
-│  │ - 临时隐藏    │                                               │
-│  │ - 恢复到正常  │                                               │
-│  └──────────────┘                                               │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
+│         │                                                      │
+│         ▼                                                      │
+│  ┌──────────────┐                                              │
+│  │状态伪装/回退  │                                              │
+│  │ - 临时隐藏    │                                              │
+│  │ - 恢复到正常  │                                              │
+│  └──────────────┘                                              │
+│                                                                │
+└────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────┐
 │                        事件系统                                  │
 ├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌──────────────┐         ┌──────────────┐                     │
-│  │   Engine     │────────▶│StateTransition│                     │
-│  │  (状态机引擎) │         │   Event      │                     │
+│                                                                 │
+│  ┌──────────────┐          ┌──────────────┐                     │
+│  │   Engine     │────────▶│StateTransition│                    │
+│  │  (状态机引擎) │         │   Event       │                     │
 │  └──────────────┘         │  (状态转换事件)│                     │
-│                            └──────┬───────┘                     │
-│                                   │                              │
-│                                   ▼                              │
+│                           └──────┬───────┘                      │
+│                                  │                              │
+│                                  ▼                              │
 │                    ┌──────────────────────┐                     │
 │                    │     EventStore       │                     │
 │                    │    (事件存储接口)     │                     │
 │                    │  - InMemory          │                     │
 │                    │  - Persistent        │                     │
 │                    └──────────────────────┘                     │
-│                                                                  │
+│                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────┐
 │                      三层状态机架构                              │
 ├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  ┌────────────────────────────────────────────────────────┐    │
+│                                                                 │
+│  ┌────────────────────────────────────────────────────────┐     │
 │  │              集群层 (Cluster Lifecycle)                 │    │
-│  │  Creating → Running → Upgrading → Scaling → Failed    │    │
+│  │  Creating → Running → Upgrading → Scaling → Failed     │    │
 │  └────────────────────────┬───────────────────────────────┘    │
-│                           │ 聚合                                │
-│                           ▼                                     │
+│                           │ 聚合                               │
+│                           ▼                                    │
 │  ┌────────────────────────────────────────────────────────┐    │
-│  │              节点层 (Node Lifecycle)                    │    │
-│  │  Pending → Provisioned → Ready → Upgrading → Failed   │    │
+│  │              节点层 (Node Lifecycle)                   │    │
+│  │  Pending → Provisioned → Ready → Upgrading → Failed    │    │
 │  └────────────────────────┬───────────────────────────────┘    │
-│                           │ 聚合                                │
-│                           ▼                                     │
+│                           │ 聚合                               │
+│                           ▼                                    │
 │  ┌────────────────────────────────────────────────────────┐    │
-│  │              组件层 (Component Lifecycle)               │    │
+│  │              组件层 (Component Lifecycle)               │   │
 │  │  Pending → Installing → Installed → Upgrading → Failed│    │
-│  └────────────────────────────────────────────────────────┘    │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
+│  └────────────────────────────────────────────────────────┘   │
+│                                                               │
+└───────────────────────────────────────────────────────────────┘
 ```
 
 ### B. 问题总结
