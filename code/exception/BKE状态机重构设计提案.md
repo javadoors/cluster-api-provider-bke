@@ -36,6 +36,8 @@
     - [5.4.2 关键里程碑](#542-关键里程碑)
     - [5.4.3 风险与回滚](#543-风险与回滚)
   - [5.5 面向目标架构的演进路径](#55-面向目标架构的演进路径)
+  - [5.6 本方案与混合模型远景对比](#56-本方案与混合模型远景对比)
+  - [5.7 关键文件变更清单](#57-关键文件变更清单)
 - [6. 迁移策略](#6-迁移策略)
   - [6.1 向后兼容策略](#61-向后兼容策略)
 - [7. 测试策略](#7-测试策略)
@@ -51,10 +53,6 @@
   - [9.1 回滚方案](#91-回滚方案)
   - [9.2 灰度策略](#92-灰度策略)
   - [9.3 监控告警](#93-监控告警)
-- [10. 总结](#10-总结)
-  - [10.1 面向目标架构的演进路径](#101-面向目标架构的演进路径)
-  - [10.2 演进成本分析](#102-演进成本分析)
-  - [10.3 关键文件变更清单](#103-关键文件变更清单)
 - [附录](#附录)
   - [A. 术语表](#a-术语表)
   - [B. 问题总结](#b-问题总结)
@@ -4944,6 +4942,48 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 | 事件系统 | HealthStatus 聚合器 | 状态转换事件记录，为健康状态聚合奠定基础 |
 | Paused/DryRun 通过 Condition 表达 | 操作模式与生命周期分离 | 符合 Kubernetes 最佳实践，保持状态机简洁 |
 
+**成本优化策略**：
+
+1. **渐进式演进**：每个阶段独立可交付，可根据实际情况决定是否继续演进
+2. **最大化复用**：充分利用本提案的代码和设计理念，减少重复开发
+3. **兼容性保障**：通过兼容性映射确保向后兼容，降低迁移风险
+4. **灰度发布**：每个阶段都支持灰度发布，逐步验证新架构的正确性
+
+### 5.6 本方案与混合模型远景对比
+
+| 维度 | 本方案（渐进式重构） | 混合模型远景 |
+| ------ | ------------------- | ------------------------------------------ |
+| **定位** | 面向当下，解决现有问题 | 面向未来，目标架构 |
+| **状态模型** | ClusterStatus 单一字段（22 个值） | LifecyclePhase（10 个值）+ HealthStatus（4 个级别） |
+| **架构模型** | 单层（集群层） | 混合模型（驱动模型 + 聚合模型，三层状态机） |
+| **迁移方式** | 标记 Deprecated，自动同步 | Feature Gate + 双写 + 兼容性映射 |
+| **时间线** | 立即实施（19-27 天） | 18 个月（分四阶段演进） |
+
+### 5.7 关键文件变更清单
+
+| 文件路径 | 操作 | 说明 |
+| --------- | ------ | ------ |
+| `api/bkecommon/v1beta1/bkecluster_status.go` | 修改 | 字段标记 Deprecated |
+| `pkg/phaseframe/mapper.go` | **新增** | 映射函数 |
+| `pkg/phaseframe/mapper_test.go` | **新增** | 映射函数测试 |
+| `pkg/phaseframe/base.go` | 修改 | handleRunningStatus 使用 ClusterStatus |
+| `pkg/phaseframe/phases/phase_flow.go` | 修改 | 删除 11 个 handle 函数，使用 engine |
+| `pkg/phaseframe/phases/ensure_cluster.go` | 修改 | 3 处 ClusterHealthState → ClusterStatus |
+| `pkg/phaseframe/phases/ensure_paused.go` | 修改 | Phase 检查 → ClusterStatus 检查 |
+| `pkg/phaseframe/phases/ensure_nodes_env.go` | 修改 | 1 处 |
+| `pkg/phaseframe/phases/ensure_bke_agent.go` | 修改 | 1 处 |
+| `pkg/phaseframe/context.go` | 修改 | 日志输出 |
+| `pkg/statusmanage/staterecords.go` | 修改 | StatusRecordV2 |
+| `pkg/statusmanage/statusmanager.go` | 修改 | StatusManagerV2 |
+| `controllers/capbke/bkecluster_controller.go` | 修改 | markBKEClusterHealthyStatus |
+| `webhooks/capbke/bkecluster.go` | 修改 | 2 处 |
+| `pkg/mergecluster/bkecluster.go` | 修改 | 1 处 |
+| `pkg/phaseframe/statemachine/engine.go` | **新增** | 状态机引擎 |
+| `pkg/phaseframe/statemachine/transitions.go` | **新增** | 64 条转换规则 |
+| `pkg/phaseframe/statemachine/conditions.go` | **新增** | Condition 函数 |
+| `pkg/phaseframe/statemachine/engine_test.go` | **新增** | 引擎测试 |
+| `pkg/phaseframe/statemachine/transitions_test.go` | **新增** | 转换表测试 |
+
 ## 6. 迁移策略
 
 > **章节摘要**：本章描述向后兼容策略，包括双轨并行（通过环境变量控制新旧逻辑切换）和渐进式替换（分 4 个阶段逐步启用新逻辑）两种方式，确保零风险切换和向后兼容。
@@ -5241,92 +5281,6 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
   annotations:
     summary: "状态转换失败"
 ```
-
-## 10. 总结
-
-> **章节摘要**：本章总结重构方案的核心价值，描述面向三层状态机架构的演进路径（当前层→增强层→远景层），以及关键文件变更清单（20 个文件的修改和新增操作）。
-
-### 10.1 面向目标架构的演进路径
-
-| 维度 | 本方案（渐进式重构） | 混合模型远景 |
-| ------ | ------------------- | ------------------------------------------ |
-| **定位** | 面向当下，解决现有问题 | 面向未来，目标架构 |
-| **状态模型** | ClusterStatus 单一字段（22 个值） | LifecyclePhase（10 个值）+ HealthStatus（4 个级别） |
-| **架构模型** | 单层（集群层） | 混合模型（驱动模型 + 聚合模型，三层状态机） |
-| **迁移方式** | 标记 Deprecated，自动同步 | Feature Gate + 双写 + 兼容性映射 |
-| **时间线** | 立即实施（19-27 天） | 18 个月（分四阶段演进） |
-
-**演进路径**：
-
-- 本方案的 `MapToLifecyclePhase` 为目标架构的兼容性映射奠定基础
-- 本方案的状态转换引擎为目标架构的三层状态机引擎奠定基础
-- 本方案的 StatusManagerV2 为目标架构的 OperationProgress 操作追踪奠定基础
-- 本方案的事件系统为目标架构的 HealthStatus 聚合器奠定基础
-- 目标架构全量上线后，本方案的 ClusterStatus 将被 LifecyclePhase 替代，但通过兼容性映射保持向后兼容
-
-### 10.2 演进成本分析
-
-**可复用性分析**：
-
-| 提案组件 | 目标架构可复用度 | 说明 |
-| --------- | ----------- | ------ |
-| ClusterStatus 单一数据源 | 100% | 直接映射到 LifecyclePhase |
-| 状态转换引擎 | 60% | 引擎框架可复用，需扩展节点层/组件层规则 |
-| StatusManagerV2 | 40% | 重试机制可复用，需添加操作追踪字段 |
-| 事件系统 | 30% | 事件记录可复用，需添加健康聚合逻辑 |
-| 映射函数 | 90% | MapToLifecyclePhase 可直接使用 |
-| **总体可复用度** | **约 60%** | - |
-
-**演进成本分解**：
-
-| 演进阶段 | 工作内容 | 工作量 | 风险等级 |
-| --------- | --------- | ------- | --------- |
-| **阶段一：状态字段整合** | 删除 Phase/ClusterHealthState，保留 ClusterStatus | 7-11 天 | 低 |
-| **阶段二：状态机增强** | 实现状态转换引擎 + StatusManagerV2 | 12-16 天 | 低 |
-| **阶段三：桥梁层** | 引入 OperationProgress + HealthStatus | 10-15 天 | 中 |
-| **阶段四：目标层** | 实现完整混合模型（三层状态机） | 20-30 天 | 中 |
-| **总计** | - | **49-72 天** | - |
-
-**成本优化策略**：
-
-1. **渐进式演进**：每个阶段独立可交付，可根据实际情况决定是否继续演进
-2. **最大化复用**：充分利用本提案的代码和设计理念，减少重复开发
-3. **兼容性保障**：通过兼容性映射确保向后兼容，降低迁移风险
-4. **灰度发布**：每个阶段都支持灰度发布，逐步验证新架构的正确性
-
-**关键里程碑**：
-
-| 里程碑 | 时间 | 交付物 | 验收标准 |
-| ------- | ------ | ------- | --------- |
-| M1：状态字段整合完成 | 第 11 天 | ClusterStatus 单一数据源 | 所有测试通过，外部消费者无感知 |
-| M2：状态机增强完成 | 第 27 天 | 状态转换引擎 + StatusManagerV2 | 状态转换规则集中管理，Failed 覆盖 8/8 |
-| M3：桥梁层完成 | 第 42 天 | OperationProgress + HealthStatus | 支持操作进度追踪，健康状态独立表达 |
-| M4：目标架构全量上线 | 第 72 天 | 完整混合模型 | 三层状态机运行稳定，性能达标 |
-
-### 10.3 关键文件变更清单
-
-| 文件路径 | 操作 | 说明 |
-| --------- | ------ | ------ |
-| `api/bkecommon/v1beta1/bkecluster_status.go` | 修改 | 字段标记 Deprecated |
-| `pkg/phaseframe/mapper.go` | **新增** | 映射函数 |
-| `pkg/phaseframe/mapper_test.go` | **新增** | 映射函数测试 |
-| `pkg/phaseframe/base.go` | 修改 | handleRunningStatus 使用 ClusterStatus |
-| `pkg/phaseframe/phases/phase_flow.go` | 修改 | 删除 11 个 handle 函数，使用 engine |
-| `pkg/phaseframe/phases/ensure_cluster.go` | 修改 | 3 处 ClusterHealthState → ClusterStatus |
-| `pkg/phaseframe/phases/ensure_paused.go` | 修改 | Phase 检查 → ClusterStatus 检查 |
-| `pkg/phaseframe/phases/ensure_nodes_env.go` | 修改 | 1 处 |
-| `pkg/phaseframe/phases/ensure_bke_agent.go` | 修改 | 1 处 |
-| `pkg/phaseframe/context.go` | 修改 | 日志输出 |
-| `pkg/statusmanage/staterecords.go` | 修改 | StatusRecordV2 |
-| `pkg/statusmanage/statusmanager.go` | 修改 | StatusManagerV2 |
-| `controllers/capbke/bkecluster_controller.go` | 修改 | markBKEClusterHealthyStatus |
-| `webhooks/capbke/bkecluster.go` | 修改 | 2 处 |
-| `pkg/mergecluster/bkecluster.go` | 修改 | 1 处 |
-| `pkg/phaseframe/statemachine/engine.go` | **新增** | 状态机引擎 |
-| `pkg/phaseframe/statemachine/transitions.go` | **新增** | 64 条转换规则 |
-| `pkg/phaseframe/statemachine/conditions.go` | **新增** | Condition 函数 |
-| `pkg/phaseframe/statemachine/engine_test.go` | **新增** | 引擎测试 |
-| `pkg/phaseframe/statemachine/transitions_test.go` | **新增** | 转换表测试 |
 
 ---
 
