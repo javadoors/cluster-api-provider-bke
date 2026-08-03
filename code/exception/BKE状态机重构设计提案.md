@@ -81,7 +81,7 @@
 **重构方案**（分阶段实施）：
 
 - **阶段一（核心）**：状态字段整合 —— 以 `ClusterStatus` 为单一数据源，`Phase` 和 `ClusterHealthState` 标记为 Deprecated 并自动同步，提供生命周期阶段映射函数，支持向三层状态机架构平滑演进
-- **阶段二（增强）**：引入状态转换引擎（64 条规则），替代 11 个分散的 `handleCluster*Phase` 函数
+- **阶段二（增强）**：引入状态转换引擎（58 条规则），替代 11 个分散的 `handleCluster*Phase` 函数
 - **阶段三（增强）**：状态管理（StatusManagerV2），支持按状态索引重试策略、自动过期清理、原子计数器，覆盖全部 8 种 Failed 状态
 - **阶段四（可选）**：事件追踪，支持内存/持久化存储和多格式导出
 
@@ -739,7 +739,7 @@ if sr.AllowFailed() {
 | ------ | ------ |
 | **状态字段整合** | 以 `ClusterStatus` 为单一数据源，`Phase`/`ClusterHealthState` 标记 Deprecated |
 | **映射函数** | 新增 `MapPhaseToClusterStatus`、`MapClusterHealthStateToClusterStatus`、`MapToLifecyclePhase` 等 |
-| **状态转换引擎** | 新增 `pkg/phaseframe/statemachine/` 包，64 条转换规则，替代 11 个 handle 函数 |
+| **状态转换引擎** | 新增 `pkg/phaseframe/statemachine/` 包，58 条转换规则，替代 11 个 handle 函数 |
 | **状态管理** | `StatusManagerV2`：按状态索引重试策略、自动过期清理、原子计数器、覆盖全部 8 种 Failed |
 | **事件追踪** | 状态转换事件记录与查询（基础版内存存储，增强版 K8s Event 持久化） |
 
@@ -761,7 +761,7 @@ if sr.AllowFailed() {
 
 ## 4. 提案设计
 
-> **章节摘要**：本章详细描述 4 个重构方案：状态字段整合方案（以 ClusterStatus 为单一数据源）、状态转换引擎（64 条规则）、状态管理（StatusManagerV2）、事件追踪（内存/持久化存储），以及面向三层状态机架构的设计远景。
+> **章节摘要**：本章详细描述 4 个重构方案：状态字段整合方案（以 ClusterStatus 为单一数据源）、状态转换引擎（58 条规则）、状态管理（StatusManagerV2）、事件追踪（内存/持久化存储），以及面向三层状态机架构的设计远景。
 
 ### 4.0 问题与解决方案总览
 
@@ -772,7 +772,7 @@ if sr.AllowFailed() {
 | 2.1 节问题 | 对应提案章节 | 解决方案 | 状态 |
 |-----------|------------|---------|------|
 | **状态转换逻辑分散**：28 个状态转换点分布在 6 个文件中，11 个独立的 `handleCluster*Phase` 函数 | 4.2 节（状态转换引擎） | 使用状态转换引擎，集中管理所有转换规则，删除 11 个分散的函数 | ✅ 已解决 |
-| **缺乏统一管理**：没有统一的状态转换表和转换规则定义 | 4.2 节（状态转换引擎） | 定义 `Transition` 结构体，通过 `registerClusterTransitions` 函数统一注册 64 条规则 | ✅ 已解决 |
+| **缺乏统一管理**：没有统一的状态转换表和转换规则定义 | 4.2 节（状态转换引擎） | 定义 `Transition` 结构体，通过 `registerClusterTransitions` 函数统一注册 58 条规则 | ✅ 已解决 |
 | **条件隐含**：状态转换条件隐含在代码逻辑中，难以理解和维护 | 4.2 节（状态转换引擎） | 使用 `Condition` 函数，将条件显式化，便于理解和测试 | ✅ 已解决 |
 
 #### 4.0.2 2.2 节问题与解决方案对比
@@ -1747,12 +1747,12 @@ func IsMasterScaleUpRetry(cc *ConditionContext) bool {
 | Worker 扩容 | 4 | phaseName/TriggerPhaseComplete/TriggerError/TriggerRetry | Ready→ScalingUp→Ready/Failed + 重试 |
 | Master 缩容 | 4 | phaseName/TriggerPhaseComplete/TriggerError/TriggerRetry | Ready→ScalingDown→Ready/Failed + 重试 |
 | Worker 缩容 | 4 | phaseName/TriggerPhaseComplete/TriggerError/TriggerRetry | Ready→ScalingDown→Ready/Failed + 重试 |
-| 升级 | 11 | phaseName/TriggerPhaseComplete/TriggerError/TriggerRetry | 旧路径5 + DAG路径2 + 成功/失败/重试 |
+| 升级 | 10 | phaseName/TriggerPhaseComplete/TriggerError/TriggerRetry | 旧路径5 + DAG路径2 + 成功/失败/重试 |
 | 纳管 | 4 | phaseName/TriggerPhaseComplete/TriggerError/TriggerRetry | Ready→Managing→Ready/Failed + 重试 |
 | 暂停 | 4 | phaseName/TriggerPhaseComplete/TriggerError | Ready/Upgrading→Paused→Ready/Failed |
 | DryRun | 3 | phaseName/TriggerPhaseComplete/TriggerError | Ready→DryRun→Ready/Failed |
-| 删除 | 7 | phaseName/TriggerError | 多入口→Deleting→Failed |
-| **总计** | **64** | | |
+| 删除 | 2 | phaseName/TriggerError | 入口→Deleting→Failed |
+| **总计** | **58** | | |
 
 **Trigger 类型说明**：
 
@@ -2257,7 +2257,7 @@ func calculatingClusterPostStatusByPhase(phase phaseframe.Phase, err error) erro
 | 文件 | 说明 |
 | ------ | ------ |
 | `pkg/phaseframe/statemachine/engine.go` | Engine 实现（Transition 方法） |
-| `pkg/phaseframe/statemachine/transitions.go` | ClusterStateTransitionTable 定义（64 条规则） |
+| `pkg/phaseframe/statemachine/transitions.go` | ClusterStateTransitionTable 定义（58 条规则） |
 | `pkg/phaseframe/statemachine/conditions.go` | Condition 函数（isClusterReady, needUpgrade 等） |
 | `pkg/phaseframe/statemachine/engine_test.go` | 引擎单元测试 |
 | `pkg/phaseframe/statemachine/transitions_test.go` | 转换表完整性测试 |
@@ -3294,7 +3294,7 @@ stateDiagram-v2
 
 ##### 完整转换规则表
 
-###### 初始化阶段（11 条规则）
+###### 初始化阶段（10 条规则）
 
 | FromState | Trigger | Condition | ToState | 说明 |
 | --- | --- | --- | --- | --- |
@@ -3307,7 +3307,6 @@ stateDiagram-v2
 | Unknown | EnsureLoadBalance | - | Initializing | 初始化 Phase 7 |
 | Unknown | EnsureAgentSwitch | - | Initializing | 初始化 Phase 8 |
 | Initializing | PhaseComplete | IsClusterReady | Ready | 初始化成功 |
-| Initializing | EnsureCluster | - | Checking | 健康检查入口 |
 | Initializing | Error | - | InitializationFailed | 初始化失败 |
 
 ###### 健康检查阶段（4 条规则）
@@ -3407,7 +3406,7 @@ stateDiagram-v2
 
 | 阶段 | 规则数 | 说明 |
 | --- | --- | --- |
-| 初始化 | 11 | 8 个 Phase + 成功 + 健康检查入口 + 失败 |
+| 初始化 | 10 | 8 个 Phase + 成功 + 失败 |
 | 健康检查 | 4 | 2 个入口 + 成功 + 失败 |
 | 扩缩容 | 12 | 4 个入口 + 4 个完成 + 4 个失败 |
 | 升级 | 9 | 7 个 Phase + 完成 + 失败 |
@@ -3417,9 +3416,9 @@ stateDiagram-v2
 | DryRun | 3 | 入口 + 完成 + 失败 |
 | 删除 | 2 | 入口 + 失败 |
 | 重试 | 8 | 8 种失败状态的重试路径 |
-| **总计** | **59** | - |
+| **总计** | **58** | - |
 
-> **说明**：上表统计的是核心转换规则。完整的 64 条规则还包括部分 Phase 的额外入口（如 Upgrading → Paused）和一些边界情况处理。
+> **说明**：上表统计的是核心转换规则。完整的 58 条规则包括初始化、健康检查、扩缩容、升级、Addon 部署、纳管、暂停、DryRun、删除、错误转换和重试转换。
 
 ### 4.3 状态管理方案
 
@@ -4787,7 +4786,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 | 本提案设计 | 混合模型对应 | 铺垫作用 |
 | ----------- | -------------- | --------- |
 | `ClusterStatus` 单一数据源 | 集群层 LifecyclePhase | 确立单一数据源原则，为集群层投影奠定基础 |
-| 状态转换表引擎（64 条规则） | 三层状态机引擎 | 集中管理状态转换规则，为三层引擎设计奠定基础 |
+| 状态转换表引擎（58 条规则） | 三层状态机引擎 | 集中管理状态转换规则，为三层引擎设计奠定基础 |
 | StatusManagerV2 分层重试 | OperationProgress + 人工介入 | 按状态索引重试策略，为操作进度追踪奠定基础 |
 | `MapToLifecyclePhase` 映射函数 | 兼容性映射（目标架构 → 旧字段） | 22 个 ClusterStatus 归约为 10 个 LifecyclePhase |
 | 事件系统 | HealthStatus 聚合器 | 状态转换事件记录，为健康状态聚合奠定基础 |
@@ -4802,7 +4801,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 ## 5. 综合重构方案
 
-> **章节摘要**：本章从整体架构、分阶段实施计划、总工作量估算、验收标准、演进路径五个维度，综合描述 BKE 状态机的重构方案。重构分为四个阶段，与第 4 章提案设计的四个部分一一对应：阶段一（状态字段整合，对应 4.1 节）确立 `ClusterStatus` 为单一数据源；阶段二（状态转换引擎，对应 4.2 节）集中管理 64 条转换规则；阶段三（状态管理增强，对应 4.3 节）引入 StatusManagerV2；阶段四（事件追踪系统，对应 4.4 节）提供状态转换事件记录与查询。总工作量 73 天，面向三层状态机架构（驱动模型 + 聚合模型）平滑演进。
+> **章节摘要**：本章从整体架构、分阶段实施计划、总工作量估算、验收标准、演进路径五个维度，综合描述 BKE 状态机的重构方案。重构分为四个阶段，与第 4 章提案设计的四个部分一一对应：阶段一（状态字段整合，对应 4.1 节）确立 `ClusterStatus` 为单一数据源；阶段二（状态转换引擎，对应 4.2 节）集中管理 58 条转换规则；阶段三（状态管理增强，对应 4.3 节）引入 StatusManagerV2；阶段四（事件追踪系统，对应 4.4 节）提供状态转换事件记录与查询。总工作量 73 天，面向三层状态机架构（驱动模型 + 聚合模型）平滑演进。
 
 ### 5.1 整体架构
 
@@ -4832,7 +4831,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
 │  │              阶段二：状态转换引擎（4.2 节）                            │   │
 │  │                                                                     │   │
-│  │  Engine ──→ Transition Table(64 条规则) ──→ Condition Functions(21) │   │
+│  │  Engine ──→ Transition Table(58 条规则) ──→ Condition Functions(21) │   │
 │  │           替代 11 个 handleCluster*Phase 函数                        │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                              │                                              │
@@ -4867,7 +4866,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 | 阶段 | 组件 | 对应设计章节 | 职责 | 必要性 |
 | ------ | ------ | --------- | ------ | ------ |
 | **阶段一** | ClusterStatus 单一数据源 + 映射函数层 | 4.1 节 | 统一状态表达，替代三字段并行 | **必须** |
-| **阶段二** | 状态转换引擎 | 4.2 节 | 64 条规则集中管理，替代 11 个 handle 函数 | 推荐 |
+| **阶段二** | 状态转换引擎 | 4.2 节 | 58 条规则集中管理，替代 11 个 handle 函数 | 推荐 |
 | **阶段三** | StatusManagerV2 | 4.3 节 | 状态记录 + 重试计数 + 自动清理 | 推荐 |
 | **阶段四** | 事件追踪系统 | 4.4 节 | 状态转换事件记录与多维度查询 | 可选 |
 
@@ -4963,7 +4962,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 ### 5.3 阶段二：状态转换引擎（推荐）
 
-**目标**：引入状态转换引擎，集中管理 64 条转换规则，替代 11 个分散的 `handleCluster*Phase` 函数，降低代码圈复杂度。
+**目标**：引入状态转换引擎，集中管理 58 条转换规则，替代 11 个分散的 `handleCluster*Phase` 函数，降低代码圈复杂度。
 
 **对应设计章节**：4.2 节（状态转换引擎方案）
 
@@ -4980,7 +4979,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 | 操作 | 文件 | 说明 |
 | ------ | ------ | ------ |
-| 新增 | `pkg/phaseframe/statemachine/transitions.go` | `registerClusterTransitions` 注册 64 条转换规则 |
+| 新增 | `pkg/phaseframe/statemachine/transitions.go` | `registerClusterTransitions` 注册 58 条转换规则 |
 | 新增 | `pkg/phaseframe/statemachine/transitions_test.go` | 转换表完整性测试（规则覆盖 + 冲突检查 + 死胡同检查） |
 
 **步骤 3：Condition 函数提取（5 天）**
@@ -5020,7 +5019,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 | 验收项 | 标准 | 验证方式 |
 | ------ | ------ | ------ |
-| 转换规则集中管理 | 64 条规则全部在 `registerClusterTransitions` 中定义 | 代码审查 |
+| 转换规则集中管理 | 58 条规则全部在 `registerClusterTransitions` 中定义 | 代码审查 |
 | 11 个 handle 函数删除 | `calculateClusterStatusByPhase` 及 11 个 `handleCluster*Phase` 全部删除 | grep 检查 |
 | Failed 覆盖 | 全部 8 种 Failed 状态有对应的错误转换和重试转换规则 | `TestErrorMappingsCoverage` 测试 |
 | 规则无冲突 | 同一 FromState + Trigger 下不存在多条匹配规则（Condition 互斥除外） | `TestRuleConflictCheck` 测试 |
@@ -5161,7 +5160,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 | 里程碑 | 时间 | 交付物 | 验收标准 |
 | ------ | ------ | ------ | ------ |
 | **M1：状态字段整合完成** | 第 22 天 | ClusterStatus 单一数据源 + 映射函数 | 所有测试通过，外部消费者无感知，Deprecated 字段自动同步 |
-| **M2：状态转换引擎上线** | 第 46 天 | Engine + 64 条规则 + 21 个 Condition | 11 个 handle 函数删除，规则无冲突，Failed 覆盖 8/8 |
+| **M2：状态转换引擎上线** | 第 46 天 | Engine + 58 条规则 + 21 个 Condition | 11 个 handle 函数删除，规则无冲突，Failed 覆盖 8/8 |
 | **M3：StatusManagerV2 上线** | 第 62 天 | StatusManagerV2 + StatusCleaner | 接口兼容，内存清理正常，并发安全 |
 | **M4：事件追踪上线** | 第 73 天 | InMemoryEventStore + 查询接口 | 事件自动记录，多维度查询可用 |
 
@@ -5197,7 +5196,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 | 提案组件 | 目标组件 | 演进成本 | 可复用度 | 说明 |
 | --------- | --------- | --------- | --------- | ------ |
 | ClusterStatus（22 个值） | LifecyclePhase（10 个值） | 低 | 100% | `MapToLifecyclePhase` 映射函数已存在 |
-| 状态转换引擎（64 条规则） | 三层状态机引擎 | 中 | 60% | 引擎框架可复用，需扩展节点层/组件层转换规则 |
+| 状态转换引擎（58 条规则） | 三层状态机引擎 | 中 | 60% | 引擎框架可复用，需扩展节点层/组件层转换规则 |
 | StatusManagerV2 | OperationProgress | 低 | 40% | 重试机制可复用，需添加操作追踪字段 |
 | 事件系统 | HealthStatus 聚合器 | 中 | 30% | 事件记录可复用，需添加健康聚合逻辑 |
 | 映射函数 | 兼容性映射（目标架构 → 旧字段） | 低 | 90% | 反向映射函数已设计 |
@@ -5221,7 +5220,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 | 本提案设计 | 混合模型对应 | 铺垫作用 |
 | ----------- | -------------- | ------ |
 | `ClusterStatus` 单一数据源 | 集群层 LifecyclePhase | 确立单一数据源原则，为集群层投影奠定基础 |
-| 状态转换表引擎（64 条规则） | 三层状态机引擎 | 集中管理状态转换规则，为三层引擎设计奠定基础 |
+| 状态转换表引擎（58 条规则） | 三层状态机引擎 | 集中管理状态转换规则，为三层引擎设计奠定基础 |
 | StatusManagerV2 分层重试 | OperationProgress + 人工介入 | 按状态索引重试策略，为操作进度追踪奠定基础 |
 | `MapToLifecyclePhase` 映射函数 | 兼容性映射（目标架构 → 旧字段） | 22 个 ClusterStatus 归约为 10 个 LifecyclePhase |
 | 事件系统 | HealthStatus 聚合器 | 状态转换事件记录，为健康状态聚合奠定基础 |
@@ -5264,7 +5263,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 | `webhooks/capbke/bkecluster.go` | 修改 | 2 处 |
 | `pkg/mergecluster/bkecluster.go` | 修改 | 1 处 |
 | `pkg/phaseframe/statemachine/engine.go` | **新增** | 状态机引擎 |
-| `pkg/phaseframe/statemachine/transitions.go` | **新增** | 64 条转换规则 |
+| `pkg/phaseframe/statemachine/transitions.go` | **新增** | 58 条转换规则 |
 | `pkg/phaseframe/statemachine/conditions.go` | **新增** | Condition 函数 |
 | `pkg/phaseframe/statemachine/engine_test.go` | **新增** | 引擎测试 |
 | `pkg/phaseframe/statemachine/transitions_test.go` | **新增** | 转换表测试 |
@@ -5380,7 +5379,7 @@ func calculatingClusterPostStatusByPhase(phase phaseframe.Phase, err error) erro
 
 **状态转换表测试**：
 
-- 验证所有 64 条转换规则的正确性
+- 验证所有 58 条转换规则的正确性
 - 测试每条规则的 FromState、Trigger、ToState 映射
 - 测试 err 参数决定 effectiveTrigger 的逻辑
 - 覆盖成功路径和失败路径
@@ -5441,7 +5440,7 @@ func calculatingClusterPostStatusByPhase(phase phaseframe.Phase, err error) erro
 
 **规则覆盖测试**：
 
-- 验证所有 64 条转换规则都有对应的测试用例
+- 验证所有 58 条转换规则都有对应的测试用例
 - 测试每条规则的可触发性
 - 验证规则注册的正确性
 
