@@ -1,72 +1,428 @@
-# BKE 回滚与备份能力规划
-
-## 一、概述
-
-本规划基于 OpenShift 集群的回滚和备份能力设计，结合 BKE 状态机架构特点，制定适合 BKE 的回滚和备份能力方案。
-
+# BKE 回滚与备份能力规�?
+## 一、概�?
+本规划基�?OpenShift 集群的回滚和备份能力设计，结�?BKE 状态机架构特点，制定适合 BKE 的回滚和备份能力方案�?
 ### 1.1 设计目标
 
-| 目标 | 说明 | 优先级 |
+| 目标 | 说明 | 优先�?|
 |------|------|--------|
 | **安装失败处理** | 安装失败时支持清理和重建 | P0 |
-| **升级回滚能力** | 升级失败时支持自动/手动回滚 | P0 |
-| **扩缩容回滚** | 扩缩容失败时支持回滚到原状态 | P1 |
+| **升级回滚能力** | 升级失败时支持自�?手动回滚 | P0 |
+| **扩缩容回�?* | 扩缩容失败时支持回滚到原状�?| P1 |
 | **配置备份** | 集群配置、证书、etcd 数据备份 | P0 |
-| **灾难恢复** | 支持从备份恢复集群 | P1 |
+| **灾难恢复** | 支持从备份恢复集�?| P1 |
 
-### 1.2 与 OpenShift 的差异
-
+### 1.2 �?OpenShift 的差�?
 | 维度 | OpenShift | BKE | 说明 |
 |------|-----------|-----|------|
-| **状态管理** | ClusterVersion CRD | ClusterStatus 字段 | BKE 使用状态机管理 |
-| **回滚触发** | spec vs status 对比 | 状态转换引擎 | BKE 使用 Engine 驱动 |
-| **失败记录** | RolledBack 状态 | LastInProgressState | BKE 记录失败前状态 |
+| **状态管�?* | ClusterVersion CRD | ClusterStatus 字段 | BKE 使用状态机管理 |
+| **回滚触发** | spec vs status 对比 | 状态转换引�?| BKE 使用 Engine 驱动 |
+| **失败记录** | RolledBack 状�?| LastInProgressState | BKE 记录失败前状�?|
 | **重试机制** | CVO 调谐循环 | StatusManagerV2 | BKE 集中管理重试 |
 
 ---
 
-## 二、回滚能力规划
+## 二、回滚能力规�?
+BKE 采用双机制架构：**PhaseFlow**（阶段流）和 **ClusterVersion**（版本管理），回滚能力需要基于这两套机制分别设计�?
+### 2.1 双机制架构概�?
+```
+┌─────────────────────────────────────────────────────────────�?�?                   BKE 双机制架�?                             �?└─────────────────────────────────────────────────────────────�?
+┌─────────────────────────────────────────────────────────────�?�? 机制一：PhaseFlow（阶段流�?                                 �?�? ├─ 适用场景：安装、扩缩容、删除、配置变�?                     �?�? ├─ 核心组件：PhaseFlow、Phase、PhaseContext                  �?�? ├─ 状态管理：ClusterStatus 字段（状态机�?                   �?�? ├─ 执行逻辑：NeedExecute() �?Execute() �?ReportStatus()    �?�? └─ 回滚策略：状态机回滚 + Phase 重试                         �?└─────────────────────────────────────────────────────────────�?
+┌─────────────────────────────────────────────────────────────�?�? 机制二：ClusterVersion（版本管理）                           �?�? ├─ 适用场景：集群升级、版本回�?                             �?�? ├─ 核心组件：ClusterVersion CRD、UpgradeHistory            �?�? ├─ 状态管理：ClusterVersion.status（版本状态）              �?�? ├─ 执行逻辑：声明式 DAG �?逐跳升级 �?状态同�?             �?�? └─ 回滚策略：版本回�?+ 历史记录恢复                         �?└─────────────────────────────────────────────────────────────�?```
 
-### 2.1 安装回滚能力
+### 2.2 PhaseFlow 回滚能力
 
-#### 2.1.1 设计原则
+#### 2.2.1 PhaseFlow 回滚机制
 
-**关键洞察**：BKE 安装过程**不支持自动回滚**，与 OpenShift 一致。
+PhaseFlow 通过状态机管理集群状态，回滚基于以下机制�?
+```go
+// PhaseFlow 回滚核心设计
+type PhaseFlowRollback struct {
+    engine        *statemachine.Engine
+    statusManager *StatusManagerV2
+    phaseHistory  []PhaseExecutionRecord
+}
 
+// 触发 PhaseFlow 回滚
+func (r *PhaseFlowRollback) TriggerRollback(cluster *BKECluster) error {
+    // 1. 获取失败前的状态（LastInProgressState�?    lastState := cluster.Status.LastInProgressState
+    if lastState == "" {
+        return fmt.Errorf("no rollback target found")
+    }
+    
+    // 2. 通过状态机引擎回滚到上一状�?    return r.engine.Transition(
+        cluster,
+        nil,
+        TriggerRollback,
+        nil,
+    )
+}
+```
+
+#### 2.2.2 PhaseFlow 回滚场景
+
+| 场景 | 当前状�?| 回滚目标 | 回滚机制 |
+|------|---------|---------|---------|
+| **安装失败** | Initializing/InitializationFailed | 清理并重�?| 不支持自动回�?|
+| **扩容失败** | WorkerScalingUp/ScaleFailed | Ready | 状态机回滚 + 节点清理 |
+| **缩容失败** | WorkerScalingDown/ScaleFailed | Ready | 状态机回滚 + 节点恢复 |
+| **删除失败** | Deleting/DeleteFailed | Ready | 状态机回滚 + 重试删除 |
+| **配置变更失败** | Managing/ManageFailed | Ready | 状态机回滚 + 配置恢复 |
+
+#### 2.2.3 PhaseFlow 回滚状态转�?
+```go
+// PhaseFlow 回滚转换规则
+func registerPhaseFlowRollbackTransitions(e *statemachine.Engine) {
+    // ScaleFailed �?Ready（扩缩容回滚�?    e.AddTransition(statemachine.Transition{
+        FromState: bkev1beta1.ClusterScaleFailed,
+        ToState:   bkev1beta1.ClusterReady,
+        Trigger:   statemachine.TriggerRollback,
+        Condition: statemachine.IsScaleRollbackComplete,
+        Action:    cleanupFailedScaleResources,
+    })
+    
+    // ManageFailed �?Ready（配置变更回滚）
+    e.AddTransition(statemachine.Transition{
+        FromState: bkev1beta1.ClusterManageFailed,
+        ToState:   bkev1beta1.ClusterReady,
+        Trigger:   statemachine.TriggerRollback,
+        Condition: statemachine.IsManageRollbackComplete,
+        Action:    restorePreviousConfig,
+    })
+    
+    // DeleteFailed �?Ready（删除失败回滚）
+    e.AddTransition(statemachine.Transition{
+        FromState: bkev1beta1.ClusterDeleteFailed,
+        ToState:   bkev1beta1.ClusterReady,
+        Trigger:   statemachine.TriggerRollback,
+        Condition: statemachine.IsDeleteRollbackComplete,
+        Action:    retryDeleteOperation,
+    })
+}
+```
+
+#### 2.2.4 PhaseFlow 回滚流程
+
+```
+PhaseFlow 回滚流程（以扩容失败为例）：
+
+1. 检测到扩容失败
+   └─ ClusterStatus: WorkerScalingUp �?ScaleFailed
+   └─ LastInProgressState: WorkerScalingUp
+   └─ Phase 执行记录：PhaseStatus[WorkerScalingUp] = Failed
+
+2. 触发回滚
+   └─ 用户执行：bkectl rollback cluster my-cluster
+   └─ 或自动触发：StatusManager 检测到重试次数超限
+
+3. 状态机回滚
+   └─ ClusterStatus: ScaleFailed �?Ready
+   └─ LastInProgressState: 清空
+
+4. 清理失败资源
+   └─ 删除未就绪的 Worker 节点
+   └─ 清理相关 ConfigMap/Secret
+   └─ 恢复节点池配�?
+5. 验证回滚成功
+   └─ 检查集群状态：Ready
+   └─ 检查节点数量：符合期望
+   └─ 检查应用健康：正常运行
+```
+
+#### 2.2.5 PhaseFlow 回滚数据结构
+
+```go
+// Phase 执行记录
+type PhaseExecutionRecord struct {
+    // Phase 名称
+    PhaseName string `json:"phaseName"`
+    
+    // 执行开始时�?    StartedAt *metav1.Time `json:"startedAt"`
+    
+    // 执行完成时间
+    CompletedAt *metav1.Time `json:"completedAt,omitempty"`
+    
+    // 执行结果
+    Result PhaseResult `json:"result"`
+    
+    // 失败原因
+    FailureReason string `json:"failureReason,omitempty"`
+    
+    // 重试次数
+    RetryCount int `json:"retryCount"`
+}
+
+type PhaseResult string
+
+const (
+    PhaseResultPending   PhaseResult = "Pending"
+    PhaseResultRunning   PhaseResult = "Running"
+    PhaseResultCompleted PhaseResult = "Completed"
+    PhaseResultFailed    PhaseResult = "Failed"
+    PhaseResultRolledBack PhaseResult = "RolledBack"
+)
+
+// BKECluster Status 扩展
+type BKEClusterStatus struct {
+    // ... 现有字段 ...
+    
+    // Phase 执行历史（最多保�?20 条）
+    PhaseHistory []PhaseExecutionRecord `json:"phaseHistory,omitempty"`
+    
+    // 回滚历史
+    RollbackHistory []RollbackRecord `json:"rollbackHistory,omitempty"`
+}
+```
+
+### 2.3 ClusterVersion 回滚能力
+
+#### 2.3.1 ClusterVersion 回滚机制
+
+ClusterVersion 通过版本历史管理升级记录，回滚基于以下机制：
+
+```go
+// ClusterVersion 回滚核心设计
+type ClusterVersionRollback struct {
+    client client.Client
+}
+
+// 触发 ClusterVersion 回滚
+func (r *ClusterVersionRollback) TriggerRollback(
+    ctx context.Context,
+    cv *cvv1alpha1.ClusterVersion,
+    targetVersion string,
+) error {
+    // 1. 验证目标版本在升级历史中
+    if !r.isVersionInHistory(cv, targetVersion) {
+        return fmt.Errorf("target version %s not in upgrade history", targetVersion)
+    }
+    
+    // 2. 设置回滚目标
+    orig := cv.DeepCopy()
+    cv.Spec.DesiredVersion = targetVersion
+    cv.Status.Phase = cvv1alpha1.ClusterVersionPhaseRollingBack
+    
+    // 3. 记录回滚历史
+    now := metav1.Now()
+    cv.Status.UpgradeHistory = append(cv.Status.UpgradeHistory, cvv1alpha1.ClusterUpgradeRecord{
+        From:        cv.Status.CurrentVersion,
+        To:          targetVersion,
+        StartedAt:   &now,
+        Status:      cvv1alpha1.ClusterUpgradeRecordStatusRollingBack,
+    })
+    
+    // 4. 更新 ClusterVersion
+    return r.client.Status().Patch(ctx, cv, client.MergeFrom(orig))
+}
+```
+
+#### 2.3.2 ClusterVersion 回滚场景
+
+| 场景 | 当前版本 | 回滚目标 | 回滚机制 |
+|------|---------|---------|---------|
+| **升级失败** | v26.06 | v26.05 | 版本回滚 + 组件降级 |
+| **升级后发现问�?* | v26.06 | v26.05 | 版本回滚 + 数据迁移 |
+| **跨版本回�?* | v26.07 | v26.05 | 逐跳回滚（v26.07→v26.06→v26.05�?|
+
+#### 2.3.3 ClusterVersion 回滚流程
+
+```
+ClusterVersion 回滚流程�?
+1. 检测到升级失败
+   └─ ClusterVersion.status.phase: Upgrading �?Failed
+   └─ ClusterVersion.status.currentVersion: v26.05
+   └─ ClusterVersion.spec.desiredVersion: v26.06
+
+2. 触发回滚
+   └─ 用户执行：bkectl rollback cluster my-cluster --to v26.05
+   └─ 或自动触发：升级超时/健康检查失�?
+3. 版本回滚
+   └─ ClusterVersion.spec.desiredVersion: v26.06 �?v26.05
+   └─ ClusterVersion.status.phase: Failed �?RollingBack
+   └─ 记录回滚历史：UpgradeHistory = [..., {From: v26.06, To: v26.05, Status: RollingBack}]
+
+4. 执行回滚
+   └─ 降级控制面组件到 v26.05
+   └─ 降级 Operator �?v26.05
+   └─ 降级节点配置�?v26.05
+   └─ 数据迁移（如需要）
+
+5. 完成回滚
+   └─ ClusterVersion.status.currentVersion: v26.05
+   └─ ClusterVersion.status.phase: RollingBack �?Ready
+   └─ 更新回滚历史：Status: Succeeded
+```
+
+#### 2.3.4 ClusterVersion 回滚数据结构
+
+```go
+// ClusterVersion 升级记录
+type ClusterUpgradeRecord struct {
+    // 升级前版�?    From string `json:"from"`
+    
+    // 升级后版�?    To string `json:"to"`
+    
+    // 开始时�?    StartedAt *metav1.Time `json:"startedAt,omitempty"`
+    
+    // 完成时间
+    CompletedAt *metav1.Time `json:"completedAt,omitempty"`
+    
+    // 升级状�?    Status ClusterUpgradeRecordStatus `json:"status"`
+    
+    // 失败原因
+    FailureReason string `json:"failureReason,omitempty"`
+}
+
+type ClusterUpgradeRecordStatus string
+
+const (
+    ClusterUpgradeRecordStatusSucceeded   ClusterUpgradeRecordStatus = "Succeeded"
+    ClusterUpgradeRecordStatusFailed      ClusterUpgradeRecordStatus = "Failed"
+    ClusterUpgradeRecordStatusRollingBack ClusterUpgradeRecordStatus = "RollingBack"
+    ClusterUpgradeRecordStatusRolledBack  ClusterUpgradeRecordStatus = "RolledBack"
+)
+
+// ClusterVersion Status
+type ClusterVersionStatus struct {
+    // 当前版本
+    CurrentVersion string `json:"currentVersion"`
+    
+    // 集群阶段
+    Phase ClusterVersionPhase `json:"phase"`
+    
+    // 升级历史
+    UpgradeHistory []ClusterUpgradeRecord `json:"upgradeHistory,omitempty"`
+    
+    // 条件
+    Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+```
+
+#### 2.3.5 ClusterVersion 回滚验证
+
+```go
+// 验证回滚目标版本
+func (r *ClusterVersionRollback) ValidateRollbackTarget(
+    cv *cvv1alpha1.ClusterVersion,
+    targetVersion string,
+) error {
+    // 1. 检查目标版本是否在升级历史�?    if !r.isVersionInHistory(cv, targetVersion) {
+        return fmt.Errorf("target version %s not in upgrade history", targetVersion)
+    }
+    
+    // 2. 检查目标版本镜像是否可�?    if !r.isImageAvailable(targetVersion) {
+        return fmt.Errorf("target version image not available")
+    }
+    
+    // 3. 检查回滚路径是否支�?    if !r.isRollbackPathSupported(cv.Status.CurrentVersion, targetVersion) {
+        return fmt.Errorf("rollback path not supported")
+    }
+    
+    return nil
+}
+
+// 检查版本是否在历史�?func (r *ClusterVersionRollback) isVersionInHistory(
+    cv *cvv1alpha1.ClusterVersion,
+    version string,
+) bool {
+    for _, record := range cv.Status.UpgradeHistory {
+        if record.To == version && record.Status == ClusterUpgradeRecordStatusSucceeded {
+            return true
+        }
+    }
+    return false
+}
+```
+
+### 2.4 双机制协同回�?
+#### 2.4.1 协同回滚场景
+
+某些场景需�?PhaseFlow �?ClusterVersion 协同回滚�?
+| 场景 | PhaseFlow 回滚 | ClusterVersion 回滚 | 协同策略 |
+|------|---------------|---------------------|---------|
+| **升级后扩缩容失败** | ScaleFailed �?Ready | 保持当前版本 | �?PhaseFlow 回滚 |
+| **升级失败** | 保持当前状�?| v26.06 �?v26.05 | �?ClusterVersion 回滚 |
+| **升级后配置变更失�?* | ManageFailed �?Ready | 保持当前版本 | �?PhaseFlow 回滚 |
+| **升级后删除失�?* | DeleteFailed �?Ready | 保持当前版本 | �?PhaseFlow 回滚 |
+
+#### 2.4.2 协同回滚流程
+
+```
+协同回滚流程（升级后扩缩容失败）�?
+1. 升级�?v26.06 成功
+   └─ ClusterVersion.status.currentVersion: v26.06
+   └─ ClusterVersion.status.phase: Ready
+   └─ ClusterStatus: Ready
+
+2. 扩容 Worker 节点失败
+   └─ ClusterStatus: Ready �?WorkerScalingUp �?ScaleFailed
+   └─ LastInProgressState: WorkerScalingUp
+
+3. 触发 PhaseFlow 回滚
+   └─ ClusterStatus: ScaleFailed �?Ready
+   └─ 清理失败�?Worker 节点
+   └─ ClusterVersion 保持不变（v26.06�?
+4. 验证回滚成功
+   └─ ClusterStatus: Ready
+   └─ ClusterVersion.status.currentVersion: v26.06
+   └─ 集群正常运行
+```
+
+#### 2.4.3 协同回滚决策�?
+```
+回滚决策树：
+
+┌─ 检测到失败
+�?├─ 失败类型�?�? �?�? ├─ 升级失败（ClusterVersion.phase = Failed�?�? �? └─ 触发 ClusterVersion 回滚
+�? �?    └─ 回滚到上一版本
+�? �?�? ├─ PhaseFlow 失败（ClusterStatus = *Failed�?�? �? �?�? �? ├─ 安装失败（InitializationFailed�?�? �? �? └─ 清理并重建（不支持自动回滚）
+�? �? �?�? �? ├─ 扩缩容失败（ScaleFailed�?�? �? �? └─ 触发 PhaseFlow 回滚
+�? �? �?    └─ 回滚�?Ready 状�?�? �? �?�? �? ├─ 配置变更失败（ManageFailed�?�? �? �? └─ 触发 PhaseFlow 回滚
+�? �? �?    └─ 恢复上一配置
+�? �? �?�? �? └─ 删除失败（DeleteFailed�?�? �?    └─ 触发 PhaseFlow 回滚
+�? �?       └─ 重试删除操作
+�? �?�? └─ 未知失败
+�?    └─ 人工介入
+�?└─ 验证回滚成功
+```
+
+### 2.5 安装回滚能力
+
+#### 2.5.1 设计原则
+
+**关键洞察**：BKE 安装过程**不支持自动回�?*，与 OpenShift 一致�?
 | 因素 | 说明 |
 |------|------|
-| **状态不可逆** | etcd 数据、证书、网络配置一旦创建无法简单回滚 |
-| **基础设施耦合** | 云资源（VM、网络、存储）已创建 |
-| **时间窗口** | 安装失败通常在早期阶段，重建比回滚更快 |
+| **状态不可�?* | etcd 数据、证书、网络配置一旦创建无法简单回�?|
+| **基础设施耦合** | 云资源（VM、网络、存储）已创�?|
+| **时间窗口** | 安装失败通常在早期阶段，重建比回滚更�?|
 
-#### 2.1.2 安装失败处理策略
+#### 2.5.2 安装失败处理策略
 
 ```yaml
 installFailureHandling:
-  # 策略 1: 清理并重建（推荐）
-  cleanupAndRebuild:
+  # 策略 1: 清理并重建（推荐�?  cleanupAndRebuild:
     trigger: "安装失败（任何阶段）"
     actions:
-      - "执行清理脚本：删除已创建的资源"
+      - "执行清理脚本：删除已创建的资�?
       - "验证资源完全删除"
       - "重新执行安装流程"
     estimatedTime: "10-30 分钟"
     
   # 策略 2: 部分恢复（特定场景）
   partialRecovery:
-    trigger: "安装后期阶段失败（如 Addon 部署失败）"
+    trigger: "安装后期阶段失败（如 Addon 部署失败�?
     conditions:
       - "控制面已就绪"
       - "etcd 集群健康"
-      - "节点已加入集群"
+      - "节点已加入集�?
     actions:
       - "诊断失败原因"
       - "修复问题"
-      - "重试失败的步骤"
+      - "重试失败的步�?
     estimatedTime: "5-15 分钟"
 ```
 
-#### 2.1.3 清理脚本设计
+#### 2.5.3 清理脚本设计
 
 ```bash
 #!/bin/bash
@@ -83,14 +439,10 @@ kubectl delete bkecluster ${CLUSTER_NAME} -n bke-system
 # 2. 删除节点资源
 kubectl delete bkenode --all -n bke-system
 
-# 3. 删除云资源（根据实际环境）
-# - 删除 VM/实例
-# - 删除负载均衡器
-# - 删除存储卷
-# - 删除网络资源
+# 3. 删除云资源（根据实际环境�?# - 删除 VM/实例
+# - 删除负载均衡�?# - 删除存储�?# - 删除网络资源
 
-# 4. 删除证书和配置
-rm -rf /etc/bke/${CLUSTER_NAME}
+# 4. 删除证书和配�?rm -rf /etc/bke/${CLUSTER_NAME}
 
 # 5. 验证清理完成
 echo "Verifying cleanup..."
@@ -103,342 +455,7 @@ fi
 echo "Cleanup completed successfully"
 ```
 
-### 2.2 升级回滚能力
-
-#### 2.2.1 回滚机制设计
-
-BKE 采用**状态机驱动**的回滚机制，与 OpenShift 的 CVO 调谐循环不同。
-
-```go
-// BKE 回滚机制核心设计
-type RollbackManager struct {
-    engine          *statemachine.Engine
-    statusManager   *StatusManagerV2
-    historyRecorder *HistoryRecorder
-}
-
-// 触发回滚
-func (rm *RollbackManager) TriggerRollback(cluster *BKECluster) error {
-    // 1. 获取回滚目标版本
-    targetVersion, err := rm.getRollbackTarget(cluster)
-    if err != nil {
-        return err
-    }
-    
-    // 2. 记录回滚历史
-    rm.historyRecorder.RecordRollback(cluster, targetVersion)
-    
-    // 3. 通过状态机引擎执行回滚
-    return rm.engine.Transition(
-        cluster,
-        nil,
-        TriggerRollback,
-        nil,
-    )
-}
-
-// 获取回滚目标
-func (rm *RollbackManager) getRollbackTarget(cluster *BKECluster) (string, error) {
-    // 从 LastInProgressState 获取失败前的状态
-    if cluster.Status.LastInProgressState != "" {
-        return cluster.Status.LastInProgressState, nil
-    }
-    
-    // 从历史记录获取上一个成功版本
-    history := cluster.Status.UpgradeHistory
-    for _, h := range history {
-        if h.Result == UpgradeResultCompleted {
-            return h.FromVersion, nil
-        }
-    }
-    
-    return "", fmt.Errorf("no rollback target found")
-}
-```
-
-#### 2.2.2 状态转换规则
-
-在 4.2 节的状态转换引擎中，需要添加回滚相关的转换规则：
-
-```go
-// 回滚转换规则
-func registerRollbackTransitions(e *statemachine.Engine) {
-    // 升级失败 → 回滚中
-    e.AddTransition(statemachine.Transition{
-        FromState: bkev1beta1.ClusterUpgradeFailed,
-        ToState:   bkev1beta1.ClusterRollingBack,
-        Trigger:   statemachine.TriggerRollback,
-        Condition: statemachine.IsRollbackAllowed,
-    })
-    
-    // 回滚中 → 回滚完成
-    e.AddTransition(statemachine.Transition{
-        FromState: bkev1beta1.ClusterRollingBack,
-        ToState:   bkev1beta1.ClusterReady,
-        Trigger:   statemachine.TriggerPhaseComplete,
-        Condition: statemachine.IsRollbackComplete,
-    })
-    
-    // 回滚中 → 回滚失败
-    e.AddTransition(statemachine.Transition{
-        FromState: bkev1beta1.ClusterRollingBack,
-        ToState:   bkev1beta1.ClusterRollbackFailed,
-        Trigger:   statemachine.TriggerError,
-    })
-}
-```
-
-#### 2.2.3 升级历史数据结构
-
-```go
-// 升级历史记录
-type UpgradeHistory struct {
-    // 升级前版本
-    FromVersion string `json:"fromVersion"`
-    
-    // 升级后版本
-    ToVersion string `json:"toVersion"`
-    
-    // 开始时间
-    StartedAt *metav1.Time `json:"startedAt"`
-    
-    // 完成时间
-    CompletedAt *metav1.Time `json:"completedAt,omitempty"`
-    
-    // 升级结果
-    Result UpgradeResult `json:"result"`
-    
-    // 失败的步骤（如果失败）
-    FailedStep *UpgradeStep `json:"failedStep,omitempty"`
-    
-    // 回滚到的版本（如果回滚）
-    RollbackTo string `json:"rollbackTo,omitempty"`
-    
-    // 失败原因
-    FailureReason string `json:"failureReason,omitempty"`
-}
-
-type UpgradeResult string
-
-const (
-    UpgradeResultCompleted   UpgradeResult = "Completed"
-    UpgradeResultFailed      UpgradeResult = "Failed"
-    UpgradeResultRolledBack  UpgradeResult = "RolledBack"
-    UpgradeResultAborted     UpgradeResult = "Aborted"
-)
-
-type UpgradeStep string
-
-const (
-    UpgradeStepPreCheck      UpgradeStep = "PreCheck"
-    UpgradeStepBackup        UpgradeStep = "Backup"
-    UpgradeStepControlPlane  UpgradeStep = "ControlPlane"
-    UpgradeStepOperators     UpgradeStep = "Operators"
-    UpgradeStepNodes         UpgradeStep = "Nodes"
-    UpgradeStepPostCheck     UpgradeStep = "PostCheck"
-)
-```
-
-#### 2.2.4 自动回滚触发条件
-
-```go
-// 自动回滚触发条件
-type AutoRollbackConditions struct {
-    // 升级超时时间
-    UpgradeTimeout time.Duration // 默认 30 分钟
-    
-    // Operator 健康检查失败
-    OperatorHealthCheckFailed bool
-    
-    // 节点 NotReady
-    NodeNotReady bool
-    
-    // etcd 集群不健康
-    EtcdUnhealthy bool
-    
-    // API Server 不可用
-    APIServerUnavailable bool
-}
-
-// 检测是否需要自动回滚
-func (c *AutoRollbackConditions) ShouldAutoRollback(cluster *BKECluster) bool {
-    // 检查升级是否超时
-    if time.Since(cluster.Status.UpgradeHistory[0].StartedAt.Time) > c.UpgradeTimeout {
-        return true
-    }
-    
-    // 检查 Operator 健康状态
-    for _, op := range cluster.Status.OperatorStatus {
-        if !op.Healthy {
-            return true
-        }
-    }
-    
-    // 检查节点状态
-    for _, node := range cluster.Status.NodeStatus {
-        if node.State != NodeReady {
-            return true
-        }
-    }
-    
-    return false
-}
-```
-
-#### 2.2.5 回滚流程
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    BKE 升级回滚流程                            │
-└─────────────────────────────────────────────────────────────┘
-
-步骤 1: 升级开始
-  └─ ClusterStatus: Ready → Upgrading
-  └─ 记录升级历史：history[0] = {FromVersion: 1.0, ToVersion: 1.1, Result: Partial}
-
-步骤 2: 升级执行
-  └─ 执行控制面升级
-  └─ 执行 Operator 升级
-  └─ 执行节点升级
-
-步骤 3: 升级失败检测
-  └─ 检测到 Operator 健康检查失败
-  └─ 或节点 NotReady
-  └─ 或升级超时
-
-步骤 4: 触发自动回滚
-  └─ ClusterStatus: Upgrading → RollingBack
-  └─ 记录回滚历史：history[0].Result = RolledBack, RollbackTo = 1.0
-  └─ 创建新历史记录：history[1] = {FromVersion: 1.1, ToVersion: 1.0, Result: Partial}
-
-步骤 5: 执行回滚
-  └─ 回滚 Operator 到 1.0
-  └─ 回滚节点配置到 1.0
-  └─ 验证回滚成功
-
-步骤 6: 回滚完成
-  └─ ClusterStatus: RollingBack → Ready
-  └─ 更新历史记录：history[1].Result = Completed
-  └─ 发送事件：UpgradeFailedAndRolledBack
-```
-
-### 2.3 扩缩容回滚能力
-
-#### 2.3.1 扩缩容回滚机制
-
-BKE 扩缩容支持**声明式回滚**，通过修改期望状态触发回滚。
-
-```yaml
-# 扩容失败回滚示例
-apiVersion: capbke.openfuyao.cn/v1beta1
-kind: BKECluster
-metadata:
-  name: my-cluster
-spec:
-  clusterConfig:
-    cluster:
-      masterCount: 3
-      workerCount: 5  # 从 10 回滚到 5
-```
-
-#### 2.3.2 扩缩容回滚流程
-
-```
-扩容失败回滚流程：
-
-1. 检测到扩容失败
-   └─ ClusterStatus: WorkerScalingUp → ScaleFailed
-   └─ LastInProgressState: WorkerScalingUp
-
-2. 用户修改期望状态
-   └─ spec.clusterConfig.cluster.workerCount: 10 → 5
-
-3. 状态机引擎检测状态变化
-   └─ 当前状态：ScaleFailed
-   └─ 期望状态：Ready（workerCount=5）
-
-4. 执行回滚
-   └─ 删除多余的 Worker 节点
-   └─ 清理相关资源
-   └─ ClusterStatus: ScaleFailed → Ready
-
-5. 验证回滚成功
-   └─ 检查节点数量是否符合期望
-   └─ 检查集群健康状态
-```
-
-#### 2.3.3 扩缩容回滚状态转换
-
-```go
-// 扩缩容回滚转换规则
-func registerScaleRollbackTransitions(e *statemachine.Engine) {
-    // ScaleFailed → Ready（回滚成功）
-    e.AddTransition(statemachine.Transition{
-        FromState: bkev1beta1.ClusterScaleFailed,
-        ToState:   bkev1beta1.ClusterReady,
-        Trigger:   statemachine.TriggerRollback,
-        Condition: statemachine.IsScaleRollbackComplete,
-    })
-}
-```
-
-### 2.4 配置回滚能力
-
-#### 2.4.1 配置版本管理
-
-BKE 需要支持配置版本管理，以便在配置变更失败时回滚。
-
-```go
-// 配置版本管理
-type ConfigVersion struct {
-    // 版本号
-    Version int `json:"version"`
-    
-    // 配置内容
-    Config *BKEClusterConfig `json:"config"`
-    
-    // 创建时间
-    CreatedAt *metav1.Time `json:"createdAt"`
-    
-    // 创建者
-    CreatedBy string `json:"createdBy"`
-    
-    // 变更说明
-    ChangeLog string `json:"changeLog"`
-}
-
-// 配置历史
-type ConfigHistory struct {
-    // 当前版本
-    CurrentVersion int `json:"currentVersion"`
-    
-    // 历史版本（最多保留 10 个）
-    Versions []ConfigVersion `json:"versions"`
-}
-```
-
-#### 2.4.2 配置回滚流程
-
-```
-配置回滚流程：
-
-1. 配置变更失败
-   └─ 检测到配置应用失败
-   └─ 记录失败原因
-
-2. 触发配置回滚
-   └─ 获取上一个成功的配置版本
-   └─ 应用该配置
-
-3. 验证回滚成功
-   └─ 检查配置是否生效
-   └─ 检查集群健康状态
-```
-
----
-
-## 三、备份能力规划
-
+## 三、备份能力规�?
 ### 3.1 etcd 备份
 
 #### 3.1.1 备份策略
@@ -448,9 +465,7 @@ etcdBackupStrategy:
   # 自动备份
   automaticBackup:
     enabled: true
-    schedule: "0 2 * * *"  # 每天凌晨 2 点
-    retentionDays: 7       # 保留 7 天
-    storageLocation: "/backup/etcd"
+    schedule: "0 2 * * *"  # 每天凌晨 2 �?    retentionDays: 7       # 保留 7 �?    storageLocation: "/backup/etcd"
     
   # 手动备份
   manualBackup:
@@ -460,9 +475,8 @@ etcdBackupStrategy:
   # 备份验证
   backupVerification:
     enabled: true
-    schedule: "0 3 * * 0"  # 每周日凌晨 3 点
-    actions:
-      - "恢复备份到测试环境"
+    schedule: "0 3 * * 0"  # 每周日凌�?3 �?    actions:
+      - "恢复备份到测试环�?
       - "验证集群健康"
       - "清理测试环境"
 ```
@@ -493,7 +507,7 @@ ETCDCTL_API=3 etcdctl snapshot status ${BACKUP_FILE} --write-out=table
 # 4. 压缩备份
 gzip ${BACKUP_FILE}
 
-# 5. 清理旧备份（保留最近 7 天）
+# 5. 清理旧备份（保留最�?7 天）
 find ${BACKUP_DIR} -name "etcd_snapshot_*.db.gz" -mtime +7 -delete
 
 echo "Backup completed: ${BACKUP_FILE}.gz"
@@ -501,11 +515,11 @@ echo "Backup completed: ${BACKUP_FILE}.gz"
 
 #### 3.1.3 备份产物
 
-| 文件名 | 格式 | 内容 | 大小（典型值） |
+| 文件�?| 格式 | 内容 | 大小（典型值） |
 |--------|------|------|----------------|
 | `etcd_snapshot_<timestamp>.db.gz` | 压缩快照 | etcd 完整数据 | 50-200 MB |
 | `bke_config_<timestamp>.yaml` | YAML | BKE 集群配置 | < 1 MB |
-| `certificates_<timestamp>.tar.gz` | 压缩归档 | 证书和密钥 | 1-5 MB |
+| `certificates_<timestamp>.tar.gz` | 压缩归档 | 证书和密�?| 1-5 MB |
 
 ### 3.2 配置备份
 
@@ -520,8 +534,7 @@ configBackup:
     - "相关 ConfigMap"
     - "相关 Secret"
     
-  # 证书和密钥
-  certificates:
+  # 证书和密�?  certificates:
     - "CA 证书"
     - "API Server 证书"
     - "etcd 证书"
@@ -554,7 +567,7 @@ kubectl get bkecluster ${CLUSTER_NAME} -n bke-system -o yaml > \
 kubectl get bkenode -n bke-system -o yaml > \
   ${BACKUP_DIR}/${TIMESTAMP}/bkenodes.yaml
 
-# 3. 导出相关 ConfigMap 和 Secret
+# 3. 导出相关 ConfigMap �?Secret
 kubectl get configmap,secret -n bke-system -l cluster=${CLUSTER_NAME} -o yaml > \
   ${BACKUP_DIR}/${TIMESTAMP}/resources.yaml
 
@@ -593,8 +606,7 @@ applicationDataBackup:
   # 使用 Velero 备份
   veleroBackup:
     enabled: true
-    schedule: "0 1 * * *"  # 每天凌晨 1 点
-    includedNamespaces:
+    schedule: "0 1 * * *"  # 每天凌晨 1 �?    includedNamespaces:
       - "default"
       - "production"
     excludedResources:
@@ -628,8 +640,7 @@ spec:
     storageLocation: bke-backup-location
     volumeSnapshotLocations:
       - bke-vsl
-    ttl: 168h0m0s  # 7 天
-```
+    ttl: 168h0m0s  # 7 �?```
 
 ### 3.4 备份存储
 
@@ -672,16 +683,14 @@ openssl enc -aes-256-cbc -salt -in ${BACKUP_FILE} \
   -out ${BACKUP_FILE}.enc \
   -pass file:${ENCRYPTION_KEY}
 
-# 删除未加密文件
-rm ${BACKUP_FILE}
+# 删除未加密文�?rm ${BACKUP_FILE}
 
 echo "Backup encrypted: ${BACKUP_FILE}.enc"
 ```
 
 ---
 
-## 四、恢复能力规划
-
+## 四、恢复能力规�?
 ### 4.1 etcd 恢复
 
 #### 4.1.1 恢复流程
@@ -722,8 +731,7 @@ ETCDCTL_API=3 etcdctl endpoint health --cluster
 echo "etcd restore completed"
 ```
 
-#### 4.1.2 恢复后验证
-
+#### 4.1.2 恢复后验�?
 ```bash
 # 验证 etcd 集群健康
 ETCDCTL_API=3 etcdctl endpoint status --write-out=table
@@ -754,7 +762,7 @@ CLUSTER_NAME=$2
 kubectl apply -f ${BACKUP_DIR}/bkecluster.yaml
 kubectl apply -f ${BACKUP_DIR}/bkenodes.yaml
 
-# 2. 恢复 ConfigMap 和 Secret
+# 2. 恢复 ConfigMap �?Secret
 kubectl apply -f ${BACKUP_DIR}/resources.yaml
 
 # 3. 恢复证书
@@ -797,16 +805,15 @@ kubectl get pods --all-namespaces
 
 | 场景 | 恢复策略 | 预计恢复时间 |
 |------|---------|-------------|
-| **单节点故障** | 自动替换节点 | 10-30 分钟 |
-| **控制面故障** | 从备份恢复 etcd | 30-60 分钟 |
+| **单节点故�?* | 自动替换节点 | 10-30 分钟 |
+| **控制面故�?* | 从备份恢�?etcd | 30-60 分钟 |
 | **整个集群故障** | 重建集群 + 恢复数据 | 2-4 小时 |
-| **数据丢失** | 从备份恢复数据 | 1-2 小时 |
+| **数据丢失** | 从备份恢复数�?| 1-2 小时 |
 
 #### 4.4.2 灾难恢复流程
 
 ```
-灾难恢复流程：
-
+灾难恢复流程�?
 1. 评估灾难范围
    └─ 确定受影响的组件
    └─ 确定恢复策略
@@ -815,8 +822,7 @@ kubectl get pods --all-namespaces
    └─ 准备新的基础设施（如需要）
    └─ 准备备份文件
 
-3. 恢复控制面
-   └─ 恢复 etcd 数据
+3. 恢复控制�?   └─ 恢复 etcd 数据
    └─ 恢复 API Server
    └─ 恢复 Controller Manager
    └─ 恢复 Scheduler
@@ -837,98 +843,87 @@ kubectl get pods --all-namespaces
 
 ---
 
-## 五、实施计划
-
-### 5.1 阶段一：基础能力（P0）
-
-| 任务 | 工作量 | 优先级 | 说明 |
+## 五、实施计�?
+### 5.1 阶段一：基础能力（P0�?
+| 任务 | 工作�?| 优先�?| 说明 |
 |------|--------|--------|------|
-| etcd 自动备份 | 5 天 | P0 | 实现定时备份和清理 |
-| etcd 恢复脚本 | 3 天 | P0 | 实现 etcd 快照恢复 |
-| 配置备份 | 3 天 | P0 | 实现集群配置备份 |
-| 安装失败清理 | 5 天 | P0 | 实现安装失败清理脚本 |
+| etcd 自动备份 | 5 �?| P0 | 实现定时备份和清�?|
+| etcd 恢复脚本 | 3 �?| P0 | 实现 etcd 快照恢复 |
+| 配置备份 | 3 �?| P0 | 实现集群配置备份 |
+| 安装失败清理 | 5 �?| P0 | 实现安装失败清理脚本 |
 
-### 5.2 阶段二：升级回滚（P0）
-
-| 任务 | 工作量 | 优先级 | 说明 |
+### 5.2 阶段二：升级回滚（P0�?
+| 任务 | 工作�?| 优先�?| 说明 |
 |------|--------|--------|------|
-| 升级历史数据结构 | 5 天 | P0 | 实现 UpgradeHistory 结构 |
-| 自动回滚触发 | 8 天 | P0 | 实现自动回滚检测和触发 |
-| 手动回滚命令 | 5 天 | P0 | 实现手动回滚 CLI 命令 |
-| 回滚状态转换 | 5 天 | P0 | 实现回滚相关的状态转换规则 |
+| 升级历史数据结构 | 5 �?| P0 | 实现 UpgradeHistory 结构 |
+| 自动回滚触发 | 8 �?| P0 | 实现自动回滚检测和触发 |
+| 手动回滚命令 | 5 �?| P0 | 实现手动回滚 CLI 命令 |
+| 回滚状态转�?| 5 �?| P0 | 实现回滚相关的状态转换规�?|
 
-### 5.3 阶段三：扩缩容回滚（P1）
-
-| 任务 | 工作量 | 优先级 | 说明 |
+### 5.3 阶段三：扩缩容回滚（P1�?
+| 任务 | 工作�?| 优先�?| 说明 |
 |------|--------|--------|------|
-| 扩缩容回滚机制 | 5 天 | P1 | 实现扩缩容失败回滚 |
-| 配置版本管理 | 5 天 | P1 | 实现配置版本管理和回滚 |
+| 扩缩容回滚机�?| 5 �?| P1 | 实现扩缩容失败回�?|
+| 配置版本管理 | 5 �?| P1 | 实现配置版本管理和回�?|
 
-### 5.4 阶段四：应用备份（P1）
-
-| 任务 | 工作量 | 优先级 | 说明 |
+### 5.4 阶段四：应用备份（P1�?
+| 任务 | 工作�?| 优先�?| 说明 |
 |------|--------|--------|------|
-| Velero 集成 | 5 天 | P1 | 集成 Velero 备份应用数据 |
-| PVC 快照 | 3 天 | P1 | 实现 PVC 快照备份 |
+| Velero 集成 | 5 �?| P1 | 集成 Velero 备份应用数据 |
+| PVC 快照 | 3 �?| P1 | 实现 PVC 快照备份 |
 
-### 5.5 阶段五：灾难恢复（P2）
-
-| 任务 | 工作量 | 优先级 | 说明 |
+### 5.5 阶段五：灾难恢复（P2�?
+| 任务 | 工作�?| 优先�?| 说明 |
 |------|--------|--------|------|
-| 灾难恢复流程 | 8 天 | P2 | 实现完整的灾难恢复流程 |
-| 恢复验证 | 5 天 | P2 | 实现恢复后的自动验证 |
+| 灾难恢复流程 | 8 �?| P2 | 实现完整的灾难恢复流�?|
+| 恢复验证 | 5 �?| P2 | 实现恢复后的自动验证 |
 
 ---
 
-## 六、最佳实践
-
-### 6.1 备份最佳实践
-
+## 六、最佳实�?
+### 6.1 备份最佳实�?
 | 实践 | 说明 |
 |------|------|
-| **定期备份** | 每天自动备份 etcd 和应用数据 |
-| **备份验证** | 每周验证备份可恢复性 |
+| **定期备份** | 每天自动备份 etcd 和应用数�?|
+| **备份验证** | 每周验证备份可恢复�?|
 | **异地存储** | 备份文件存储到异地（至少 2 个位置） |
 | **备份加密** | 敏感数据备份必须加密 |
 | **备份监控** | 监控备份任务成功率和存储空间 |
 
-### 6.2 回滚最佳实践
-
+### 6.2 回滚最佳实�?
 | 实践 | 说明 |
 |------|------|
-| **升级前备份** | 升级前必须执行完整备份 |
-| **小步升级** | 避免跨多个版本升级 |
-| **灰度发布** | 先在测试环境验证，再升级到生产 |
+| **升级前备�?* | 升级前必须执行完整备�?|
+| **小步升级** | 避免跨多个版本升�?|
+| **灰度发布** | 先在测试环境验证，再升级到生�?|
 | **回滚演练** | 定期演练回滚流程 |
 | **文档记录** | 记录每次升级和回滚的详细信息 |
 
-### 6.3 升级前检查清单
-
+### 6.3 升级前检查清�?
 ```yaml
 preUpgradeChecklist:
-  # 1. 集群健康检查
-  clusterHealth:
-    - "所有节点处于 Ready 状态"
-    - "所有 Operator 处于 Available 状态"
+  # 1. 集群健康检�?  clusterHealth:
+    - "所有节点处�?Ready 状�?
+    - "所�?Operator 处于 Available 状�?
     - "etcd 集群健康"
     
   # 2. 备份验证
   backupVerification:
-    - "etcd 备份已完成且可恢复"
-    - "应用数据备份已完成"
-    - "配置备份已完成"
+    - "etcd 备份已完成且可恢�?
+    - "应用数据备份已完�?
+    - "配置备份已完�?
     
   # 3. 升级路径验证
   upgradePathValidation:
-    - "目标版本在支持的升级路径中"
-    - "升级镜像可访问"
-    - "升级前置条件已满足"
+    - "目标版本在支持的升级路径�?
+    - "升级镜像可访�?
+    - "升级前置条件已满�?
     
   # 4. 回滚计划
   rollbackPlan:
-    - "回滚目标版本已确定"
+    - "回滚目标版本已确�?
     - "回滚流程已文档化"
-    - "回滚演练已完成"
+    - "回滚演练已完�?
 ```
 
 ---
@@ -939,43 +934,37 @@ preUpgradeChecklist:
 
 | 能力 | 支持情况 | 说明 |
 |------|---------|------|
-| **安装回滚** | ❌ 不支持 | 安装失败时清理并重建 |
-| **升级回滚** | ✅ 支持 | 自动/手动回滚到上一版本 |
-| **扩缩容回滚** | ✅ 支持 | 声明式回滚 |
-| **配置回滚** | ✅ 支持 | 配置版本管理和回滚 |
-| **etcd 备份** | ✅ 支持 | 自动/手动备份 |
-| **配置备份** | ✅ 支持 | 集群配置备份 |
-| **应用备份** | ✅ 支持 | Velero 集成 |
-| **灾难恢复** | ✅ 支持 | 完整的恢复流程 |
+| **安装回滚** | �?不支�?| 安装失败时清理并重建 |
+| **升级回滚** | �?支持 | 自动/手动回滚到上一版本 |
+| **扩缩容回�?* | �?支持 | 声明式回�?|
+| **配置回滚** | �?支持 | 配置版本管理和回�?|
+| **etcd 备份** | �?支持 | 自动/手动备份 |
+| **配置备份** | �?支持 | 集群配置备份 |
+| **应用备份** | �?支持 | Velero 集成 |
+| **灾难恢复** | �?支持 | 完整的恢复流�?|
 
-### 7.2 与 OpenShift 的对比
-
+### 7.2 �?OpenShift 的对�?
 | 维度 | OpenShift | BKE | 差异说明 |
 |------|-----------|-----|---------|
 | **回滚机制** | CVO 调谐循环 | 状态机引擎 | BKE 使用 Engine 驱动 |
-| **失败记录** | RolledBack 状态 | LastInProgressState | BKE 记录失败前状态 |
-| **备份工具** | cluster-backup.sh | 自定义脚本 | 功能一致 |
-| **恢复工具** | cluster-restore.sh | 自定义脚本 | 功能一致 |
+| **失败记录** | RolledBack 状�?| LastInProgressState | BKE 记录失败前状�?|
+| **备份工具** | cluster-backup.sh | 自定义脚�?| 功能一�?|
+| **恢复工具** | cluster-restore.sh | 自定义脚�?| 功能一�?|
 
 ### 7.3 关键设计决策
 
-1. **安装不支持回滚**：与 OpenShift 一致，安装失败时清理并重建
-2. **升级支持自动回滚**：检测到升级失败时自动触发回滚
-3. **扩缩容支持声明式回滚**：通过修改期望状态触发回滚
-4. **配置支持版本管理**：保留最近 10 个配置版本
-5. **备份支持多种存储**：本地、S3、NFS、OSS
+1. **安装不支持回�?*：与 OpenShift 一致，安装失败时清理并重建
+2. **升级支持自动回滚**：检测到升级失败时自动触发回�?3. **扩缩容支持声明式回滚**：通过修改期望状态触发回�?4. **配置支持版本管理**：保留最�?10 个配置版�?5. **备份支持多种存储**：本地、S3、NFS、OSS
 
 ### 7.4 后续工作
 
-1. **实现回滚状态转换规则**：在状态机引擎中添加回滚相关的转换规则
-2. **实现升级历史数据结构**：记录升级和回滚的完整历史
-3. **实现自动备份脚本**：实现 etcd 和配置的自动备份
-4. **实现恢复验证工具**：自动验证备份可恢复性
-5. **文档化回滚流程**：编写详细的回滚操作手册
+1. **实现回滚状态转换规�?*：在状态机引擎中添加回滚相关的转换规则
+2. **实现升级历史数据结构**：记录升级和回滚的完整历�?3. **实现自动备份脚本**：实�?etcd 和配置的自动备份
+4. **实现恢复验证工具**：自动验证备份可恢复�?5. **文档化回滚流�?*：编写详细的回滚操作手册
 
 ---
 
 **文档版本**：v1.0  
-**创建日期**：2024-01-15  
-**最后更新**：2024-01-15  
-**维护者**：BKE 团队
+**创建日期**�?024-01-15  
+**最后更�?*�?024-01-15  
+**维护�?*：BKE 团队
