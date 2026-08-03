@@ -27,13 +27,25 @@
     - [5.2.1 实施步骤](#521-实施步骤)
     - [5.2.2 工时与交付物](#522-工时与交付物)
     - [5.2.3 验收标准](#523-验收标准)
-  - [5.3 阶段二：状态机增强（可选）](#53-阶段二状态机增强可选)
+  - [5.3 阶段二：状态转换引擎（推荐）](#53-阶段二状态转换引擎推荐)
     - [5.3.1 实施步骤](#531-实施步骤)
     - [5.3.2 工时与交付物](#532-工时与交付物)
     - [5.3.3 验收标准](#533-验收标准)
-  - [5.4 面向目标架构的演进路径](#54-面向目标架构的演进路径)
-  - [5.5 本方案与混合模型远景对比](#55-本方案与混合模型远景对比)
-  - [5.6 关键文件变更清单](#56-关键文件变更清单)
+  - [5.4 阶段三：状态管理增强（推荐）](#54-阶段三状态管理增强推荐)
+    - [5.4.1 实施步骤](#541-实施步骤)
+    - [5.4.2 工时与交付物](#542-工时与交付物)
+    - [5.4.3 验收标准](#543-验收标准)
+  - [5.5 阶段四：事件追踪系统（可选）](#55-阶段四事件追踪系统可选)
+    - [5.5.1 实施步骤](#551-实施步骤)
+    - [5.5.2 工时与交付物](#552-工时与交付物)
+    - [5.5.3 验收标准](#553-验收标准)
+  - [5.6 总工时汇总与里程碑](#56-总工时汇总与里程碑)
+    - [5.6.1 工时汇总](#561-工时汇总)
+    - [5.6.2 关键里程碑](#562-关键里程碑)
+    - [5.6.3 风险与回滚](#563-风险与回滚)
+  - [5.7 面向目标架构的演进路径](#57-面向目标架构的演进路径)
+  - [5.8 本方案与混合模型远景对比](#58-本方案与混合模型远景对比)
+  - [5.9 关键文件变更清单](#59-关键文件变更清单)
 - [6. 迁移策略](#6-迁移策略)
   - [6.1 向后兼容策略](#61-向后兼容策略)
 - [7. 测试策略](#7-测试策略)
@@ -73,7 +85,7 @@
 - **阶段三（增强）**：状态管理（StatusManagerV2），支持按状态索引重试策略、自动过期清理、原子计数器，覆盖全部 8 种 Failed 状态
 - **阶段四（可选）**：事件追踪，支持内存/持久化存储和多格式导出
 
-**预期收益**：状态字段从 3 个减少到 1 个，状态转换规则集中管理，Failed 覆盖从 3/8 提升至 8/8，代码圈复杂度从 15 降至 8 以下，总工时 19-27 天。
+**预期收益**：状态字段从 3 个减少到 1 个，状态转换规则集中管理，Failed 覆盖从 3/8 提升至 8/8，代码圈复杂度从 15 降至 8 以下，总工时 46-73 天。
 
 **设计远景**：本提案的设计决策面向混合模型架构（驱动模型 + 聚合模型，三层状态机）演进。通过确立 `ClusterStatus` 为单一数据源、引入状态转换表引擎、实现分层重试机制、提供生命周期阶段映射，为未来实现操作驱动的 LifecyclePhase 和自底向上的 HealthStatus 聚合奠定基础，确保 BKE 状态机架构具备前瞻性和可扩展性。
 
@@ -4585,11 +4597,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 ## 5. 综合重构方案
 
-> **章节摘要**：本章从整体架构、分阶段实施计划、关键文件变更清单、工时估算与里程碑、验收标准五个维度，综合描述 BKE 状态机的重构方案。重构分为两个阶段：阶段一（状态字段整合，7-11 天，必须实施）确立 `ClusterStatus` 为单一数据源；阶段二（状态机增强，12-16 天，可选实施）引入状态转换引擎（64 条规则）、StatusManagerV2 和事件追踪系统。总工时 19-27 天，面向三层状态机架构（驱动模型 + 聚合模型）平滑演进。
+> **章节摘要**：本章从整体架构、分阶段实施计划、总工时估算、验收标准、演进路径五个维度，综合描述 BKE 状态机的重构方案。重构分为四个阶段，与第 4 章提案设计的四个部分一一对应：阶段一（状态字段整合，对应 4.1 节）确立 `ClusterStatus` 为单一数据源；阶段二（状态转换引擎，对应 4.2 节）集中管理 64 条转换规则；阶段三（状态管理增强，对应 4.3 节）引入 StatusManagerV2；阶段四（事件追踪系统，对应 4.4 节）提供状态转换事件记录与查询。总工时 38-55 天，面向三层状态机架构（驱动模型 + 聚合模型）平滑演进。
 
 ### 5.1 整体架构
 
-重构后的系统由四个核心组件构成，分为两个实施阶段：
+重构后的系统由四个核心组件构成，分为四个实施阶段，与第 4 章提案设计一一对应：
 
 ```txt
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -4597,95 +4609,62 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                    阶段一：状态字段整合（核心，必须）                   │   │
+│  │              阶段一：状态字段整合（4.1 节，必须）                      │   │
 │  │                                                                     │   │
-│  │  ┌──────────────────┐    ┌──────────────────┐                      │   │
-│  │  │ Phase            │    │ ClusterHealth    │                      │   │
-│  │  │ (Deprecated)     │    │ State            │                      │   │
-│  │  │                  │    │ (Deprecated)     │                      │   │
-│  │  └────────┬─────────┘    └────────┬─────────┘                      │   │
-│  │           │ 自动同步               │ 自动同步                       │   │
-│  │           └──────────┬─────────────┘                                │   │
+│  │  Phase(Deprecated) ──┐                                              │   │
+│  │                      ├──→ ClusterStatus（单一数据源，22 个枚举值）    │   │
+│  │  ClusterHealthState  │    + LastInProgressState                     │   │
+│  │  (Deprecated) ───────┘                                              │   │
+│  │                      │                                              │   │
 │  │                      ▼                                              │   │
-│  │  ┌──────────────────────────────────────────────────────┐          │   │
-│  │  │            ClusterStatus（单一数据源）                 │          │   │
-│  │  │            22 个枚举值，统一状态表达                    │          │   │
-│  │  │            + LastInProgressState（失败前进行中状态）    │          │   │
-│  │  └──────────────────────────┬───────────────────────────┘          │   │
-│  │                              │                                      │   │
-│  │                              ▼                                      │   │
-│  │  ┌──────────────────────────────────────────────────────┐          │   │
-│  │  │              映射函数层（mapper.go）                    │          │   │
-│  │  │  ┌────────────────────────┐ ┌──────────────────────┐ │          │   │
-│  │  │  │ MapPhaseToClusterStatus│ │ MapClusterStatusTo   │ │          │   │
-│  │  │  │                        │ │ Phase                │ │          │   │
-│  │  │  ├────────────────────────┤ ├──────────────────────┤ │          │   │
-│  │  │  │ MapClusterHealthState  │ │ MapClusterStatusTo   │ │          │   │
-│  │  │  │ ToClusterStatus        │ │ ClusterHealthState   │ │          │   │
-│  │  │  ├────────────────────────┤ ├──────────────────────┤ │          │   │
-│  │  │  │ MapToLifecyclePhase    │ │ SyncStatusFields     │ │          │   │
-│  │  │  │ （面向三层状态机演进）   │ │ （统一同步函数）      │ │          │   │
-│  │  │  └────────────────────────┘ └──────────────────────┘ │          │   │
-│  │  └──────────────────────────────────────────────────────┘          │   │
+│  │              映射函数层（mapper.go）                                  │   │
+│  │              MapPhaseToClusterStatus / MapClusterHealthStateTo...    │   │
+│  │              MapClusterStatusToPhase / MapClusterStatusTo...         │   │
+│  │              MapToLifecyclePhase / SyncStatusFields                  │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
-│                                                                             │
+│                              │                                              │
+│                              ▼                                              │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                    阶段二：状态机增强（可选）                          │   │
+│  │              阶段二：状态转换引擎（4.2 节）                            │   │
 │  │                                                                     │   │
-│  │  ┌───────────────────────────────────────────────────────────┐     │   │
-│  │  │              状态转换引擎（4.2 节）                         │     │   │
-│  │  │  ┌──────────────┐  ┌──────────────┐  ┌────────────────┐  │     │   │
-│  │  │  │ Engine       │→ │ Transition   │→ │ Condition      │  │     │   │
-│  │  │  │              │  │ Table(64条)  │  │ Functions      │  │     │   │
-│  │  │  └──────┬───────┘  └──────────────┘  └────────────────┘  │     │   │
-│  │  │         │ 替代 11 个 handleCluster*Phase 函数              │     │   │
-│  │  └─────────┼─────────────────────────────────────────────────┘     │   │
-│  │           │                                                         │   │
-│  │           ▼                                                         │   │
-│  │  ┌───────────────────────────────────────────────────────────┐     │   │
-│  │  │              状态管理器 V2（4.3 节）                        │     │   │
-│  │  │  ┌──────────────┐  ┌──────────────┐  ┌────────────────┐  │     │   │
-│  │  │  │ Status       │→ │ Status       │→ │ Status         │  │     │   │
-│  │  │  │ ManagerV2    │  │ RecordV2     │  │ Cleaner        │  │     │   │
-│  │  │  │              │  │ (原子计数)    │  │ (24h自动过期)  │  │     │   │
-│  │  │  └──────┬───────┘  └──────────────┘  └────────────────┘  │     │   │
-│  │  │         │ 覆盖全部 8 种 Failed 状态                        │     │   │
-│  │  └─────────┼─────────────────────────────────────────────────┘     │   │
-│  │           │                                                         │   │
-│  │           ▼                                                         │   │
-│  │  ┌───────────────────────────────────────────────────────────┐     │   │
-│  │  │              事件追踪系统（4.4 节）                         │     │   │
-│  │  │  ┌──────────────┐  ┌──────────────┐  ┌────────────────┐  │     │   │
-│  │  │  │ EventStore   │→ │ InMemory     │→ │ Event          │  │     │   │
-│  │  │  │ Interface    │  │ EventStore   │  │ Filter/Query   │  │     │   │
-│  │  │  └──────────────┘  └──────────────┘  └────────────────┘  │     │   │
-│  │  │    支持多维度查询：集群名称、时间范围、状态、触发器            │     │   │
-│  │  └───────────────────────────────────────────────────────────┘     │   │
+│  │  Engine ──→ Transition Table(64 条规则) ──→ Condition Functions(21) │   │
+│  │           替代 11 个 handleCluster*Phase 函数                        │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              │                                              │
+│                              ▼                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │              阶段三：状态管理增强（4.3 节）                            │   │
+│  │                                                                     │   │
+│  │  StatusManagerV2 ──→ StatusRecordV2(原子计数) ──→ StatusCleaner     │   │
+│  │                    覆盖全部 8 种 Failed 状态       (24h 自动过期)     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                              │                                              │
+│                              ▼                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │              阶段四：事件追踪系统（4.4 节）                            │   │
+│  │                                                                     │   │
+│  │  EventStore 接口 ──→ InMemoryEventStore ──→ EventFilter/Query       │   │
+│  │                      多维度查询：集群名称、时间范围、状态、触发器       │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                             │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                    设计远景：混合模型架构（4.5 节）                    │   │
+│  │              设计远景：混合模型架构（4.5 节）                          │   │
 │  │                                                                     │   │
 │  │  驱动模型（自上而下）          聚合模型（自底向上）                    │   │
 │  │  用户操作 → LifecyclePhase    组件 → 节点 → 集群 → HealthStatus     │   │
-│  │                                                                     │   │
-│  │  本提案铺垫：ClusterStatus → LifecyclePhase 映射                    │   │
-│  │  本提案铺垫：状态转换引擎 → 三层状态机引擎                           │   │
-│  │  本提案铺垫：事件系统 → HealthStatus 聚合器                         │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**组件关系**：
+**组件与章节对应关系**：
 
-| 组件 | 对应章节 | 职责 | 阶段 |
-| ------ | --------- | ------ | ------ |
-| **ClusterStatus 单一数据源** | 4.1 节 | 统一状态表达，替代三字段并行 | 阶段一 |
-| **映射函数层** | 4.1 节 | 字段间同步、向后兼容、生命周期投影 | 阶段一 |
-| **状态转换引擎** | 4.2 节 | 64 条规则集中管理，替代 11 个 handle 函数 | 阶段二 |
-| **StatusManagerV2** | 4.3 节 | 状态记录 + 重试计数 + 自动清理 | 阶段二 |
-| **事件追踪系统** | 4.4 节 | 状态转换事件记录与多维度查询 | 阶段二 |
+| 阶段 | 组件 | 对应设计章节 | 职责 | 必要性 |
+| ------ | ------ | --------- | ------ | ------ |
+| **阶段一** | ClusterStatus 单一数据源 + 映射函数层 | 4.1 节 | 统一状态表达，替代三字段并行 | **必须** |
+| **阶段二** | 状态转换引擎 | 4.2 节 | 64 条规则集中管理，替代 11 个 handle 函数 | 推荐 |
+| **阶段三** | StatusManagerV2 | 4.3 节 | 状态记录 + 重试计数 + 自动清理 | 推荐 |
+| **阶段四** | 事件追踪系统 | 4.4 节 | 状态转换事件记录与多维度查询 | 可选 |
 
 ### 5.2 阶段一：状态字段整合（核心，必须）
 
@@ -4702,7 +4681,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 #### 5.2.1 实施步骤
 
-**步骤 1：API 层与映射函数（1-2 天）**
+**步骤 1：API 层与映射函数（2-3 天）**
 
 | 操作 | 文件 | 说明 |
 | ------ | ------ | ------ |
@@ -4710,7 +4689,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 | 新增 | `pkg/phaseframe/mapper.go` | 5 个映射函数 + SyncStatusFields + ValidateStatusConsistency |
 | 新增 | `pkg/phaseframe/mapper_test.go` | 映射函数单元测试，100% 覆盖 |
 
-**步骤 2：PhaseFlow 框架层重构（2-3 天）**
+**步骤 2：PhaseFlow 框架层重构（3-5 天）**
 
 | 操作 | 文件 | 修改点 | 说明 |
 | ------ | ------ | ------ | ------ |
@@ -4718,7 +4697,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 | 修改 | `pkg/phaseframe/phases/ensure_paused.go` | 162 行 | Phase 检查改为 ClusterStatus 检查（5 个状态替代 3 个 Phase） |
 | 修改 | `pkg/phaseframe/context.go` | 242 行 | 日志输出从 `phase` 改为 `status` |
 
-**步骤 3：状态管理层重构（1-2 天）**
+**步骤 3：状态管理层重构（2-3 天）**
 
 | 操作 | 文件 | 修改点 | 说明 |
 | ------ | ------ | ------ | ------ |
@@ -4726,7 +4705,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 | 修改 | `pkg/statusmanage/statusmanager.go` | 163 行 | `SetCurrentClusterState(ClusterStatus)` 替代 `ClusterHealthState` |
 | 修改 | `pkg/statusmanage/statusmanager.go` | 206-212 行 | switch 分支改用 ClusterStatus 枚举值，调用 `SetClusterStatus` |
 
-**步骤 4：控制器层与 Webhook 层重构（1-2 天）**
+**步骤 4：控制器层与 Webhook 层重构（2-3 天）**
 
 | 操作 | 文件 | 修改点 | 说明 |
 | ------ | ------ | ------ | ------ |
@@ -4734,7 +4713,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 | 修改 | `webhooks/capbke/bkecluster.go` | 174 行 | `ClusterHealthState == Deploying` → `ClusterStatus == ClusterDeployingAddon` |
 | 修改 | `webhooks/capbke/bkecluster.go` | 646 行 | `ClusterHealthState != Healthy` → `ClusterStatus != ClusterReady` |
 
-**步骤 5：其他文件重构（1-2 天）**
+**步骤 5：其他文件重构（2-3 天）**
 
 | 操作 | 文件 | 修改点 | 说明 |
 | ------ | ------ | ------ | ------ |
@@ -4745,25 +4724,26 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 | 修改 | `pkg/phaseframe/phases/ensure_bke_agent.go` | 575 行 | `ClusterHealthState == Deploying` → `ClusterStatus == ClusterDeployingAddon` |
 | 修改 | `pkg/mergecluster/bkecluster.go` | 442 行 | 改用 `SetClusterStatus` 统一同步 |
 
-**步骤 6：测试验证与清理（1-2 天）**
+**步骤 6：测试验证与回归测试（3-5 天）**
 
 | 操作 | 说明 |
 | ------ | ------ |
 | 更新 | 所有 `*_test.go` 测试用例，使用 ClusterStatus 替代 Phase 和 ClusterHealthState |
 | 验证 | `ValidateStatusConsistency` 在 Reconcile 结束时验证字段一致性 |
 | 验证 | 所有现有测试通过，外部消费者无感知 |
+| 回归 | 完整的集群生命周期回归测试（创建、升级、扩缩容、删除） |
 
 #### 5.2.2 工时与交付物
 
 | 步骤 | 工时 | 交付物 |
 | ------ | ------ | ------ |
-| 步骤 1：API 层与映射函数 | 1-2 天 | mapper.go + mapper_test.go + 字段 Deprecated 标记 |
-| 步骤 2：PhaseFlow 框架层 | 2-3 天 | base.go + ensure_paused.go + context.go 修改 |
-| 步骤 3：状态管理层 | 1-2 天 | statusmanager.go 5 处修改 |
-| 步骤 4：控制器与 Webhook | 1-2 天 | controller + webhook 3 处修改 |
-| 步骤 5：其他文件 | 1-2 天 | ensure_cluster.go 等 4 个文件 6 处修改 |
-| 步骤 6：测试验证 | 1-2 天 | 测试用例更新 + 一致性验证 |
-| **合计** | **7-11 天** | - |
+| 步骤 1：API 层与映射函数 | 2-3 天 | mapper.go + mapper_test.go + 字段 Deprecated 标记 |
+| 步骤 2：PhaseFlow 框架层 | 3-5 天 | base.go + ensure_paused.go + context.go 修改 |
+| 步骤 3：状态管理层 | 2-3 天 | statusmanager.go 5 处修改 |
+| 步骤 4：控制器与 Webhook | 2-3 天 | controller + webhook 3 处修改 |
+| 步骤 5：其他文件 | 2-3 天 | ensure_cluster.go 等 4 个文件 6 处修改 |
+| 步骤 6：测试验证与回归 | 3-5 天 | 测试用例更新 + 一致性验证 + 回归测试 |
+| **合计** | **14-22 天** | - |
 
 #### 5.2.3 验收标准
 
@@ -4776,86 +4756,60 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 | 测试通过 | 所有现有测试和新增映射函数测试通过 | CI/CD |
 | LastInProgressState | 错误转换时自动设置，持久化存储 | 单元测试 |
 
-### 5.3 阶段二：状态机增强（可选）
+### 5.3 阶段二：状态转换引擎（推荐）
 
-**目标**：在状态字段整合的基础上，引入状态转换引擎（集中管理 64 条转换规则）、StatusManagerV2（覆盖全部 8 种 Failed 状态）和事件追踪系统，提升状态机的可维护性、可观测性和并发安全性。
+**目标**：引入状态转换引擎，集中管理 64 条转换规则，替代 11 个分散的 `handleCluster*Phase` 函数，降低代码圈复杂度。
 
-**对应设计章节**：4.2 节（状态转换引擎）、4.3 节（状态管理）、4.4 节（事件追踪）
+**对应设计章节**：4.2 节（状态转换引擎方案）
 
 #### 5.3.1 实施步骤
 
-**步骤 1：状态转换引擎（4-6 天）**
-
-对应 4.2 节详细设计。
+**步骤 1：Engine 核心实现（3-5 天）**
 
 | 操作 | 文件 | 说明 |
 | ------ | ------ | ------ |
-| 新增 | `pkg/phaseframe/statemachine/engine.go` | Engine 核心实现：Transition 方法、事件记录、历史查询 |
+| 新增 | `pkg/phaseframe/statemachine/engine.go` | Engine 核心：Transition 方法、事件记录、历史查询、EventStore 接口 |
+| 新增 | `pkg/phaseframe/statemachine/engine_test.go` | 引擎单元测试（Transition、Condition、Action） |
+
+**步骤 2：转换规则注册（3-4 天）**
+
+| 操作 | 文件 | 说明 |
+| ------ | ------ | ------ |
 | 新增 | `pkg/phaseframe/statemachine/transitions.go` | `registerClusterTransitions` 注册 64 条转换规则 |
+| 新增 | `pkg/phaseframe/statemachine/transitions_test.go` | 转换表完整性测试（规则覆盖 + 冲突检查 + 死胡同检查） |
+
+**步骤 3：Condition 函数提取（3-5 天）**
+
+| 操作 | 文件 | 说明 |
+| ------ | ------ | ------ |
 | 新增 | `pkg/phaseframe/statemachine/conditions.go` | 21 个 Condition 函数（从各 Phase 的 NeedExecute/Execute 提取） |
-| 新增 | `pkg/phaseframe/statemachine/engine_test.go` | 引擎单元测试 |
-| 新增 | `pkg/phaseframe/statemachine/transitions_test.go` | 转换表完整性测试（64 条规则覆盖 + 错误映射覆盖） |
+| 新增 | `conditions_test.go` | 各 Condition 函数单元测试 |
+
+**步骤 4：phase_flow.go 重构与集成（3-5 天）**
+
+| 操作 | 文件 | 说明 |
+| ------ | ------ | ------ |
 | 修改 | `pkg/phaseframe/phases/phase_flow.go` | 删除 11 个 `handleCluster*Phase` 函数 + 分发器，改用 `engine.Transition()` |
+| 修改 | 关联文件 | ensure_cluster.go、ensure_paused.go 等状态检查改用 ClusterStatus |
 
-**重构效果**：
+**步骤 5：集成测试与回归（3-5 天）**
 
-| 指标 | 重构前 | 重构后 |
-| ------ | ------ | ------ |
-| 状态转换函数 | 11 个 `handleCluster*Phase` + 分发器 | 1 个 `engine.Transition()` 调用 |
-| 转换规则 | 分散在 6 个文件 28 个转换点 | 集中在 `registerClusterTransitions` 64 条规则 |
-| 代码圈复杂度 | 15 | < 8 |
-| Failed 状态覆盖 | 3/8（Deploy/Upgrade/Manage） | 8/8（全部覆盖） |
-
-**步骤 2：状态管理器 V2（3-5 天）**
-
-对应 4.3 节详细设计。
-
-| 操作 | 文件 | 说明 |
-| ------ | ------ | ------ |
-| 修改 | `pkg/statusmanage/staterecords.go` | 新增 `StatusRecordV2`（删除 RetryPolicy 字段，由 Engine 管理） |
-| 修改 | `pkg/statusmanage/statusmanager.go` | 新增 `StatusManagerV2`：删除状态伪装逻辑，新增 `GetRetryCount`/`GetLatestNormalState`/`ResetRetryCount` 方法 |
-| 新增 | StatusCleaner 逻辑 | 自动清理过期记录（24 小时过期，1 小时清理间隔） |
-
-**重构效果**：
-
-| 指标 | 重构前 | 重构后 |
-| ------ | ------ | ------ |
-| 代码行数 | ~600 行 | ~400 行（减少约 200 行） |
-| 重试策略 | 全局固定 10 次 | 按 ClusterStatus 索引，支持不同策略（Exponential/Linear） |
-| 并发安全 | `int` 非原子操作 | `int32` + `atomic.AddInt32` |
-| 内存泄漏 | 无清理机制 | `StatusCleaner` 自动清理过期记录 |
-| Failed 覆盖 | 3/8（switch default 为空） | 8/8（全部覆盖） |
-| 接口兼容性 | - | 所有公开方法签名不变，8 个调用点零修改 |
-
-**步骤 3：事件追踪系统（2-3 天）**
-
-对应 4.4 节详细设计。
-
-| 操作 | 文件 | 说明 |
-| ------ | ------ | ------ |
-| 已含 | `pkg/phaseframe/statemachine/engine.go` | `EventStore` 接口 + `TransitionEvent` 结构体（步骤 1 已包含） |
-| 已含 | `engine.go` 内 | `InMemoryEventStore` 默认实现（maxSize=1000，自动淘汰最旧事件） |
-| 已含 | `engine.go` 内 | `EventFilter` 多维度查询（集群名称、时间范围、状态、触发器、成功/失败） |
-
-**步骤 4：关联代码修改与集成测试（3-5 天）**
-
-| 操作 | 文件 | 说明 |
-| ------ | ------ | ------ |
-| 修改 | `pkg/statusmanage/statusmanager.go` | 206-216 行 switch 覆盖全部 8 种 Failed 状态 |
-| 修改 | `pkg/phaseframe/phases/ensure_cluster.go` | 372-373 行、398-399 行：删除直接赋值，改为返回 error/nil 由 engine post-hook 处理 |
-| 修改 | `controllers/capbke/bkecluster_controller.go` | 757-774 行 `setClusterHealthStatus`：同时设置 ClusterStatus 和 ClusterHealthState |
-| 修改 | `controllers/capbke/bkecluster_upgrade_dag.go` | 保持不变（直接设置 ClusterStatus，不需要通过 engine） |
-| 修改 | `pkg/phaseframe/context.go` | 252 行：保持不变（直接设置 ClusterDeleting） |
+| 操作 | 说明 |
+| ------ | ------ |
+| 验证 | 完整集群生命周期端到端测试（创建、升级、扩缩容、删除） |
+| 验证 | 失败恢复与重试路径验证 |
+| 验证 | 双轨并行模式验证（`USE_STATE_MACHINE_ENGINE` 开关） |
 
 #### 5.3.2 工时与交付物
 
 | 步骤 | 工时 | 交付物 |
 | ------ | ------ | ------ |
-| 步骤 1：状态转换引擎 | 4-6 天 | engine.go + transitions.go + conditions.go + 测试 |
-| 步骤 2：状态管理器 V2 | 3-5 天 | StatusRecordV2 + StatusManagerV2 + StatusCleaner |
-| 步骤 3：事件追踪系统 | 2-3 天 | InMemoryEventStore + EventFilter（含在 engine.go 中） |
-| 步骤 4：关联修改与集成测试 | 3-5 天 | 关联代码修改 + 集成测试 |
-| **合计** | **12-16 天** | - |
+| 步骤 1：Engine 核心实现 | 3-5 天 | engine.go + engine_test.go |
+| 步骤 2：转换规则注册 | 3-4 天 | transitions.go + transitions_test.go |
+| 步骤 3：Condition 函数提取 | 3-5 天 | conditions.go + conditions_test.go |
+| 步骤 4：phase_flow.go 重构 | 3-5 天 | phase_flow.go 重构 + 关联文件修改 |
+| 步骤 5：集成测试与回归 | 3-5 天 | 端到端测试 + 双轨验证 |
+| **合计** | **15-24 天** | - |
 
 #### 5.3.3 验收标准
 
@@ -4866,15 +4820,156 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 | Failed 覆盖 | 全部 8 种 Failed 状态有对应的错误转换和重试转换规则 | `TestErrorMappingsCoverage` 测试 |
 | 规则无冲突 | 同一 FromState + Trigger 下不存在多条匹配规则（Condition 互斥除外） | `TestRuleConflictCheck` 测试 |
 | 死胡同检查 | 除 Failed/Deleted 外，每个非终态至少有一条出边 | `TestNoDeadEndStates` 测试 |
-| StatusManagerV2 接口兼容 | 所有公开方法签名不变，8 个调用点零修改 | 编译通过 + 集成测试 |
-| 内存清理 | 过期记录（24 小时）被自动清理 | `TestStatusCleaner` 测试 |
-| 并发安全 | `int32` + `atomic.AddInt32`，无竞态条件 | `go test -race` |
-| 事件记录 | 状态转换时自动记录事件，包含 FromState/ToState/Trigger/Duration | `TestEngine_TransitionHistory` 测试 |
-| 事件查询 | 支持按集群名称、时间范围、状态、触发器等多维度查询 | `TestInMemoryEventStore` 测试 |
 | 向后兼容 | 环境变量 `USE_STATE_MACHINE_ENGINE=false` 可回退到旧逻辑 | 灰度验证 |
 | 测试通过 | 所有现有测试和新增测试通过 | CI/CD |
 
-### 5.4 面向目标架构的演进路径
+### 5.4 阶段三：状态管理增强（推荐）
+
+**目标**：引入 StatusManagerV2，解决全局单例内存泄漏、固定重试次数、并发不安全、Failed 状态覆盖不全（3/8）等问题。
+
+**对应设计章节**：4.3 节（状态管理方案）
+
+#### 5.4.1 实施步骤
+
+**步骤 1：StatusRecordV2 实现（2-3 天）**
+
+| 操作 | 文件 | 说明 |
+| ------ | ------ | ------ |
+| 修改 | `pkg/statusmanage/staterecords.go` | 新增 `StatusRecordV2`（删除 RetryPolicy 字段，由 Engine 管理），`int32` + `atomic.AddInt32` 确保并发安全 |
+| 新增 | `staterecords_test.go` | StatusRecordV2 单元测试（Inc/Reset/Equal 原子操作验证） |
+
+**步骤 2：StatusManagerV2 实现（3-5 天）**
+
+| 操作 | 文件 | 说明 |
+| ------ | ------ | ------ |
+| 修改 | `pkg/statusmanage/statusmanager.go` | 新增 `StatusManagerV2`：删除状态伪装逻辑，新增 `GetRetryCount`/`GetLatestNormalState`/`ResetRetryCount` 方法，覆盖全部 8 种 Failed 状态 |
+| 新增 | `statusmanager_test.go` | StatusManagerV2 单元测试（状态记录、重试计数、接口兼容性） |
+
+**步骤 3：StatusCleaner 实现（2-3 天）**
+
+| 操作 | 文件 | 说明 |
+| ------ | ------ | ------ |
+| 新增 | StatusCleaner 逻辑 | 自动清理过期记录（24 小时过期，1 小时清理间隔） |
+| 新增 | StatusCleaner 测试 | 清理逻辑测试（过期删除、未过期保留、空 map 清理） |
+
+**步骤 4：集成测试与回归（3-5 天）**
+
+| 操作 | 说明 |
+| ------ | ------ |
+| 验证 | 8 个调用点零修改验证 |
+| 验证 | 并发安全验证（`go test -race`） |
+| 验证 | 内存泄漏验证（长时间运行后检查 map 大小） |
+| 回归 | 失败重试路径端到端验证 |
+
+#### 5.4.2 工时与交付物
+
+| 步骤 | 工时 | 交付物 |
+| ------ | ------ | ------ |
+| 步骤 1：StatusRecordV2 | 2-3 天 | staterecords.go + staterecords_test.go |
+| 步骤 2：StatusManagerV2 | 3-5 天 | statusmanager.go + statusmanager_test.go |
+| 步骤 3：StatusCleaner | 2-3 天 | StatusCleaner + 清理测试 |
+| 步骤 4：集成测试与回归 | 3-5 天 | 接口兼容 + 并发安全 + 内存泄漏验证 |
+| **合计** | **10-16 天** | - |
+
+#### 5.4.3 验收标准
+
+| 验收项 | 标准 | 验证方式 |
+| ------ | ------ | ------ |
+| 接口兼容 | 所有公开方法签名不变，8 个调用点零修改 | 编译通过 + 集成测试 |
+| 内存清理 | 过期记录（24 小时）被自动清理 | `TestStatusCleaner` 测试 |
+| 并发安全 | `int32` + `atomic.AddInt32`，无竞态条件 | `go test -race` |
+| Failed 覆盖 | 全部 8 种 Failed 状态有对应的重试处理 | 集成测试 |
+| 代码精简 | 删除状态伪装逻辑，代码行数减少约 200 行 | 代码审查 |
+
+### 5.5 阶段四：事件追踪系统（可选）
+
+**目标**：提供状态转换事件记录与多维度查询能力，提升状态机可观测性。
+
+**对应设计章节**：4.4 节（事件追踪方案）
+
+#### 5.5.1 实施步骤
+
+**步骤 1：EventStore 接口与 InMemoryEventStore 实现（2-3 天）**
+
+| 操作 | 文件 | 说明 |
+| ------ | ------ | ------ |
+| 新增 | `pkg/phaseframe/statemachine/eventstore.go` | `EventStore` 接口 + `InMemoryEventStore` 默认实现（maxSize=1000，自动淘汰最旧事件） |
+| 新增 | `eventstore_test.go` | Record/Query 单元测试 + 容量限制测试 |
+
+**步骤 2：EventFilter 多维度查询（2-3 天）**
+
+| 操作 | 文件 | 说明 |
+| ------ | ------ | ------ |
+| 新增 | `eventstore.go` 内 | `EventFilter` 结构体 + `matchesFilter` 函数（集群名称、时间范围、状态、触发器、成功/失败） |
+| 新增 | `eventstore_test.go` | 多维度查询测试 |
+
+**步骤 3：Engine 集成与监控指标（2-3 天）**
+
+| 操作 | 文件 | 说明 |
+| ------ | ------ | ------ |
+| 修改 | `engine.go` | 集成 EventStore，状态转换时自动记录事件 |
+| 新增 | Prometheus 指标 | `bke_state_machine_events_recorded_total` 等监控指标 |
+
+**步骤 4：集成测试（1-2 天）**
+
+| 操作 | 说明 |
+| ------ | ------ |
+| 验证 | 事件自动记录（FromState/ToState/Trigger/Duration） |
+| 验证 | 多维度查询正确性 |
+| 验证 | 容量限制（超过 maxSize 淘汰最旧事件） |
+
+#### 5.5.2 工时与交付物
+
+| 步骤 | 工时 | 交付物 |
+| ------ | ------ | ------ |
+| 步骤 1：EventStore 实现 | 2-3 天 | eventstore.go + eventstore_test.go |
+| 步骤 2：EventFilter 查询 | 2-3 天 | EventFilter + matchesFilter + 查询测试 |
+| 步骤 3：Engine 集成与监控 | 2-3 天 | engine.go 集成 + Prometheus 指标 |
+| 步骤 4：集成测试 | 1-2 天 | 事件记录 + 查询 + 容量验证 |
+| **合计** | **7-11 天** | - |
+
+#### 5.5.3 验收标准
+
+| 验收项 | 标准 | 验证方式 |
+| ------ | ------ | ------ |
+| 事件记录 | 状态转换时自动记录事件，包含 FromState/ToState/Trigger/Duration | `TestEngine_TransitionHistory` 测试 |
+| 事件查询 | 支持按集群名称、时间范围、状态、触发器等多维度查询 | `TestInMemoryEventStore` 测试 |
+| 容量限制 | 超过 maxSize 时自动淘汰最旧事件 | 容量测试 |
+| 监控指标 | Prometheus 指标正确暴露 | 指标验证 |
+
+### 5.6 总工时汇总与里程碑
+
+#### 5.6.1 工时汇总
+
+| 阶段 | 内容 | 对应章节 | 工时 | 必要性 |
+| ------ | ------ | --------- | ------ | ------ |
+| 阶段一 | 状态字段整合 | 4.1 节 | 14-22 天 | **必须** |
+| 阶段二 | 状态转换引擎 | 4.2 节 | 15-24 天 | 推荐 |
+| 阶段三 | 状态管理增强 | 4.3 节 | 10-16 天 | 推荐 |
+| 阶段四 | 事件追踪系统 | 4.4 节 | 7-11 天 | 可选 |
+| **总计** | | | **46-73 天** | - |
+
+> **说明**：阶段二和阶段三存在依赖关系（StatusManagerV2 需要与 Engine 协作），建议按顺序实施。阶段四可与阶段三并行开发。实际工时可能因团队熟悉度和并行开发而有所变化。
+
+#### 5.6.2 关键里程碑
+
+| 里程碑 | 时间 | 交付物 | 验收标准 |
+| ------ | ------ | ------ | ------ |
+| **M1：状态字段整合完成** | 第 14-22 天 | ClusterStatus 单一数据源 + 映射函数 | 所有测试通过，外部消费者无感知，Deprecated 字段自动同步 |
+| **M2：状态转换引擎上线** | 第 29-46 天 | Engine + 64 条规则 + 21 个 Condition | 11 个 handle 函数删除，规则无冲突，Failed 覆盖 8/8 |
+| **M3：StatusManagerV2 上线** | 第 39-62 天 | StatusManagerV2 + StatusCleaner | 接口兼容，内存清理正常，并发安全 |
+| **M4：事件追踪上线** | 第 46-73 天 | InMemoryEventStore + 查询接口 | 事件自动记录，多维度查询可用 |
+
+#### 5.6.3 风险与回滚
+
+| 阶段 | 风险 | 回滚方案 |
+| ------ | ------ | ------ |
+| 阶段一 | Deprecated 字段同步异常 | `ValidateStatusConsistency` 检测 + 日志告警，字段保留可随时回退 |
+| 阶段二 | 引擎规则匹配错误 | 环境变量 `USE_STATE_MACHINE_ENGINE=false` 切换回旧逻辑 |
+| 阶段三 | StatusManagerV2 行为变更 | 全局变量改回 `NewStatusManager()` |
+| 阶段四 | 事件记录性能问题 | EventStore 为可选组件，可禁用 |
+
+### 5.7 面向目标架构的演进路径
 
 **当前方案定位**：
 
@@ -4908,11 +5003,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 | 阶段 | 内容 | 工时 | 风险 | 说明 |
 | ------ | ------ | ------ | ------ | ------ |
-| **阶段一** | 状态字段整合 | 7-11 天 | 低 | 必须实施，解决当前职责重叠，确立单一数据源 |
-| **阶段二** | 状态机增强 | 12-16 天 | 低 | 可选实施，引入引擎 + 分层重试，为目标架构做准备 |
-| **阶段三** | 桥梁层 | 10-15 天 | 中 | 引入 OperationProgress + HealthStatus，逐步分离生命周期与健康状态 |
-| **阶段四** | 目标层 | 20-30 天 | 中 | 实现完整混合模型（驱动模型 + 聚合模型，三层状态机） |
-| **总计** | | **49-72 天** | - | 分阶段实施，每阶段独立可交付，风险可控 |
+| **阶段一** | 状态字段整合 | 14-22 天 | 低 | 必须实施，解决当前职责重叠，确立单一数据源 |
+| **阶段二** | 状态转换引擎 | 15-24 天 | 低 | 推荐实施，集中管理转换规则，替代分散函数 |
+| **阶段三** | 状态管理增强 | 10-16 天 | 低 | 推荐实施，解决内存泄漏和并发安全问题 |
+| **阶段四** | 事件追踪系统 | 7-11 天 | 低 | 可选实施，提升可观测性 |
+| **阶段五** | 桥梁层 | 10-15 天 | 中 | 引入 OperationProgress + HealthStatus，逐步分离生命周期与健康状态 |
+| **阶段六** | 目标层 | 20-30 天 | 中 | 实现完整混合模型（驱动模型 + 聚合模型，三层状态机） |
+| **总计** | | **76-118 天** | - | 分阶段实施，每阶段独立可交付，风险可控 |
 
 **本提案的铺垫作用**：
 
@@ -4932,7 +5029,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 3. **兼容性保障**：通过兼容性映射确保向后兼容，降低迁移风险
 4. **灰度发布**：每个阶段都支持灰度发布，逐步验证新架构的正确性
 
-### 5.5 本方案与混合模型远景对比
+### 5.8 本方案与混合模型远景对比
 
 | 维度 | 本方案（渐进式重构） | 混合模型远景 |
 | ------ | ------------------- | ------------------------------------------ |
@@ -4940,9 +5037,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 | **状态模型** | ClusterStatus 单一字段（22 个值） | LifecyclePhase（10 个值）+ HealthStatus（4 个级别） |
 | **架构模型** | 单层（集群层） | 混合模型（驱动模型 + 聚合模型，三层状态机） |
 | **迁移方式** | 标记 Deprecated，自动同步 | Feature Gate + 双写 + 兼容性映射 |
-| **时间线** | 立即实施（19-27 天） | 18 个月（分四阶段演进） |
+| **时间线** | 立即实施（46-73 天） | 18 个月（分六阶段演进） |
 
-### 5.6 关键文件变更清单
+### 5.9 关键文件变更清单
 
 | 文件路径 | 操作 | 说明 |
 | --------- | ------ | ------ |
@@ -5062,11 +5159,13 @@ func calculatingClusterPostStatusByPhase(phase phaseframe.Phase, err error) erro
 
 | 演进阶段 | 工作量 | 风险 | 说明 |
 | --------- | ------- | ------ | ------ |
-| 本提案阶段一（三字段整合） | 7-11 天 | 低 | 必须实施，解决当前问题 |
-| 本提案阶段二（状态机增强） | 12-16 天 | 低 | 可选实施，为目标架构做准备 |
+| 本提案阶段一（状态字段整合） | 14-22 天 | 低 | 必须实施，解决当前问题 |
+| 本提案阶段二（状态转换引擎） | 15-24 天 | 低 | 推荐实施，集中管理转换规则 |
+| 本提案阶段三（状态管理增强） | 10-16 天 | 低 | 推荐实施，解决内存泄漏和并发安全 |
+| 本提案阶段四（事件追踪系统） | 7-11 天 | 低 | 可选实施，提升可观测性 |
 | 桥梁层（OperationProgress + HealthStatus） | 10-15 天 | 中 | 关键过渡阶段 |
 | 目标层（完整混合模型） | 20-30 天 | 中 | 最终目标架构 |
-| **总计** | **49-72 天** | - | 分阶段实施，风险可控 |
+| **总计** | **76-118 天** | - | 分阶段实施，风险可控 |
 
 ## 7. 测试策略
 
