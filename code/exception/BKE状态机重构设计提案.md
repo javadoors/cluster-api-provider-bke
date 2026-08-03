@@ -3216,6 +3216,211 @@ func countNodesByRole(cluster *bkev1beta1.BKECluster, role string) int {
 2. **精确匹配**：通过 `FromState + Trigger` 精确匹配，避免歧义
 3. **统一失败处理**：所有失败路径统一走 `Error` 触发器
 
+#### 4.2.4 状态机图
+
+##### 状态分类
+
+| 类别 | 状态 | 数量 |
+| --- | --- | --- |
+| **初始/终态** | Unknown, Ready, Unhealthy | 3 |
+| **进行中状态** | Initializing, Checking, MasterScalingUp, MasterScalingDown, WorkerScalingUp, WorkerScalingDown, Upgrading, DeployingAddon, Managing, Paused, DryRun, Deleting | 12 |
+| **失败状态** | InitializationFailed, ScaleFailed, UpgradeFailed, DeployAddonFailed, ManageFailed, PauseFailed, DryRunFailed, DeleteFailed | 8 |
+
+##### 状态转换图（Mermaid）
+
+```mermaid
+stateDiagram-v2
+    direction TB
+    
+    %% 初始状态
+    [*] --> Unknown : 集群创建
+    
+    %% ===== 初始化流程 =====
+    Unknown --> Initializing : EnsureFinalizer/Certs/ClusterAPIObj/MasterInit/BKEAgent/NodesEnv/LoadBalance/AgentSwitch
+    Initializing --> Ready : PhaseComplete [IsClusterReady]
+    Initializing --> Checking : EnsureCluster
+    Checking --> Ready : PhaseComplete [IsClusterHealthy]
+    
+    %% ===== 从 Ready 出发的操作 =====
+    Ready --> MasterScalingUp : EnsureMasterJoin [NeedMasterScaleUp]
+    Ready --> WorkerScalingUp : EnsureWorkerJoin [NeedWorkerScaleUp]
+    Ready --> MasterScalingDown : EnsureMasterDelete [NeedMasterScaleDown]
+    Ready --> WorkerScalingDown : EnsureWorkerDelete [NeedWorkerScaleDown]
+    Ready --> Upgrading : EnsureAgentUpgrade/ContainerdUpgrade/MasterUpgrade/WorkerUpgrade/ComponentUpgrade/PreUpgradeResources/EtcdUpgrade [NeedUpgrade]
+    Ready --> DeployingAddon : EnsureAddonDeploy [NeedDeployAddon]
+    Ready --> Managing : EnsureClusterManage [NeedManage]
+    Ready --> Paused : EnsurePaused [NeedPause]
+    Ready --> DryRun : EnsureDryRun [NeedDryRun]
+    Ready --> Deleting : EnsureDeleteOrReset [NeedDelete]
+    
+    %% ===== 操作完成回到 Ready =====
+    MasterScalingUp --> Ready : PhaseComplete [IsScaleComplete]
+    MasterScalingDown --> Ready : PhaseComplete [IsScaleComplete]
+    WorkerScalingUp --> Ready : PhaseComplete [IsScaleComplete]
+    WorkerScalingDown --> Ready : PhaseComplete [IsScaleComplete]
+    Upgrading --> Ready : PhaseComplete [IsUpgradeComplete]
+    DeployingAddon --> Ready : PhaseComplete [IsAddonComplete]
+    Managing --> Ready : PhaseComplete [IsManageComplete]
+    Paused --> Ready : PhaseComplete [IsResume]
+    DryRun --> Ready : PhaseComplete [IsDryRunComplete]
+    
+    %% ===== 特殊路径 =====
+    Upgrading --> Paused : EnsurePaused [NeedPause]
+    
+    %% ===== 错误转换（Error）=====
+    Initializing --> InitializationFailed : Error
+    MasterScalingUp --> ScaleFailed : Error
+    MasterScalingDown --> ScaleFailed : Error
+    WorkerScalingUp --> ScaleFailed : Error
+    WorkerScalingDown --> ScaleFailed : Error
+    Upgrading --> UpgradeFailed : Error
+    DeployingAddon --> DeployAddonFailed : Error
+    Managing --> ManageFailed : Error
+    Paused --> PauseFailed : Error
+    DryRun --> DryRunFailed : Error
+    Deleting --> DeleteFailed : Error
+    Checking --> Unhealthy : Error
+    
+    %% ===== 重试转换（Retry）=====
+    InitializationFailed --> Initializing : Retry
+    ScaleFailed --> MasterScalingUp : Retry [IsMasterScaleUpRetry]
+    ScaleFailed --> MasterScalingDown : Retry [IsMasterScaleDownRetry]
+    ScaleFailed --> WorkerScalingUp : Retry [IsWorkerScaleUpRetry]
+    ScaleFailed --> WorkerScalingDown : Retry [IsWorkerScaleDownRetry]
+    UpgradeFailed --> Upgrading : Retry
+    DeployAddonFailed --> DeployingAddon : Retry
+    ManageFailed --> Managing : Retry
+```
+
+##### 完整转换规则表
+
+###### 初始化阶段（11 条规则）
+
+| FromState | Trigger | Condition | ToState | 说明 |
+| --- | --- | --- | --- | --- |
+| Unknown | EnsureFinalizer | - | Initializing | 初始化 Phase 1 |
+| Unknown | EnsureCerts | - | Initializing | 初始化 Phase 2 |
+| Unknown | EnsureClusterAPIObj | - | Initializing | 初始化 Phase 3 |
+| Unknown | EnsureMasterInit | - | Initializing | 初始化 Phase 4 |
+| Unknown | EnsureBKEAgent | - | Initializing | 初始化 Phase 5 |
+| Unknown | EnsureNodesEnv | - | Initializing | 初始化 Phase 6 |
+| Unknown | EnsureLoadBalance | - | Initializing | 初始化 Phase 7 |
+| Unknown | EnsureAgentSwitch | - | Initializing | 初始化 Phase 8 |
+| Initializing | PhaseComplete | IsClusterReady | Ready | 初始化成功 |
+| Initializing | EnsureCluster | - | Checking | 健康检查入口 |
+| Initializing | Error | - | InitializationFailed | 初始化失败 |
+
+###### 健康检查阶段（4 条规则）
+
+| FromState | Trigger | Condition | ToState | 说明 |
+| --- | --- | --- | --- | --- |
+| Ready | EnsureCluster | - | Checking | 健康检查入口 |
+| Initializing | EnsureCluster | - | Checking | 初始化后健康检查 |
+| Checking | PhaseComplete | IsClusterHealthy | Ready | 健康检查通过 |
+| Checking | Error | - | Unhealthy | 健康检查失败 |
+
+###### 扩缩容阶段（12 条规则）
+
+| FromState | Trigger | Condition | ToState | 说明 |
+| --- | --- | --- | --- | --- |
+| Ready | EnsureMasterJoin | NeedMasterScaleUp | MasterScalingUp | Master 扩容 |
+| Ready | EnsureWorkerJoin | NeedWorkerScaleUp | WorkerScalingUp | Worker 扩容 |
+| Ready | EnsureMasterDelete | NeedMasterScaleDown | MasterScalingDown | Master 缩容 |
+| Ready | EnsureWorkerDelete | NeedWorkerScaleDown | WorkerScalingDown | Worker 缩容 |
+| MasterScalingUp | PhaseComplete | IsScaleComplete | Ready | Master 扩容完成 |
+| MasterScalingDown | PhaseComplete | IsScaleComplete | Ready | Master 缩容完成 |
+| WorkerScalingUp | PhaseComplete | IsScaleComplete | Ready | Worker 扩容完成 |
+| WorkerScalingDown | PhaseComplete | IsScaleComplete | Ready | Worker 缩容完成 |
+| MasterScalingUp | Error | - | ScaleFailed | Master 扩容失败 |
+| MasterScalingDown | Error | - | ScaleFailed | Master 缩容失败 |
+| WorkerScalingUp | Error | - | ScaleFailed | Worker 扩容失败 |
+| WorkerScalingDown | Error | - | ScaleFailed | Worker 缩容失败 |
+
+###### 升级阶段（9 条规则）
+
+| FromState | Trigger | Condition | ToState | 说明 |
+| --- | --- | --- | --- | --- |
+| Ready | EnsureAgentUpgrade | NeedUpgrade | Upgrading | Agent 升级 |
+| Ready | EnsureContainerdUpgrade | NeedUpgrade | Upgrading | Containerd 升级 |
+| Ready | EnsureMasterUpgrade | NeedUpgrade | Upgrading | Master 升级 |
+| Ready | EnsureWorkerUpgrade | NeedUpgrade | Upgrading | Worker 升级 |
+| Ready | EnsureComponentUpgrade | NeedUpgrade | Upgrading | 组件升级 |
+| Ready | EnsurePreUpgradeResources | NeedUpgrade | Upgrading | 声明式升级前准备 |
+| Ready | EnsureEtcdUpgrade | NeedUpgrade | Upgrading | Etcd 升级 |
+| Upgrading | PhaseComplete | IsUpgradeComplete | Ready | 升级完成 |
+| Upgrading | Error | - | UpgradeFailed | 升级失败 |
+
+###### Addon 部署阶段（3 条规则）
+
+| FromState | Trigger | Condition | ToState | 说明 |
+| --- | --- | --- | --- | --- |
+| Ready | EnsureAddonDeploy | NeedDeployAddon | DeployingAddon | 开始部署 Addon |
+| DeployingAddon | PhaseComplete | IsAddonComplete | Ready | Addon 部署完成 |
+| DeployingAddon | Error | - | DeployAddonFailed | Addon 部署失败 |
+
+###### 纳管阶段（3 条规则）
+
+| FromState | Trigger | Condition | ToState | 说明 |
+| --- | --- | --- | --- | --- |
+| Ready | EnsureClusterManage | NeedManage | Managing | 开始纳管 |
+| Managing | PhaseComplete | IsManageComplete | Ready | 纳管完成 |
+| Managing | Error | - | ManageFailed | 纳管失败 |
+
+###### 暂停阶段（4 条规则）
+
+| FromState | Trigger | Condition | ToState | 说明 |
+| --- | --- | --- | --- | --- |
+| Ready | EnsurePaused | NeedPause | Paused | 从 Ready 暂停 |
+| Upgrading | EnsurePaused | NeedPause | Paused | 从 Upgrading 暂停 |
+| Paused | PhaseComplete | IsResume | Ready | 恢复暂停 |
+| Paused | Error | - | PauseFailed | 暂停操作失败 |
+
+###### DryRun 阶段（3 条规则）
+
+| FromState | Trigger | Condition | ToState | 说明 |
+| --- | --- | --- | --- | --- |
+| Ready | EnsureDryRun | NeedDryRun | DryRun | 开始 DryRun |
+| DryRun | PhaseComplete | IsDryRunComplete | Ready | DryRun 完成 |
+| DryRun | Error | - | DryRunFailed | DryRun 失败 |
+
+###### 删除阶段（2 条规则）
+
+| FromState | Trigger | Condition | ToState | 说明 |
+| --- | --- | --- | --- | --- |
+| Ready | EnsureDeleteOrReset | NeedDelete | Deleting | 开始删除 |
+| Deleting | Error | - | DeleteFailed | 删除失败 |
+
+###### 重试转换（8 条规则）
+
+| FromState | Trigger | Condition | ToState | 说明 |
+| --- | --- | --- | --- | --- |
+| InitializationFailed | Retry | - | Initializing | 初始化重试 |
+| ScaleFailed | Retry | IsMasterScaleUpRetry | MasterScalingUp | Master 扩容重试 |
+| ScaleFailed | Retry | IsMasterScaleDownRetry | MasterScalingDown | Master 缩容重试 |
+| ScaleFailed | Retry | IsWorkerScaleUpRetry | WorkerScalingUp | Worker 扩容重试 |
+| ScaleFailed | Retry | IsWorkerScaleDownRetry | WorkerScalingDown | Worker 缩容重试 |
+| UpgradeFailed | Retry | - | Upgrading | 升级重试 |
+| DeployAddonFailed | Retry | - | DeployingAddon | Addon 部署重试 |
+| ManageFailed | Retry | - | Managing | 纳管重试 |
+
+##### 规则统计
+
+| 阶段 | 规则数 | 说明 |
+| --- | --- | --- |
+| 初始化 | 11 | 8 个 Phase + 成功 + 健康检查入口 + 失败 |
+| 健康检查 | 4 | 2 个入口 + 成功 + 失败 |
+| 扩缩容 | 12 | 4 个入口 + 4 个完成 + 4 个失败 |
+| 升级 | 9 | 7 个 Phase + 完成 + 失败 |
+| Addon 部署 | 3 | 入口 + 完成 + 失败 |
+| 纳管 | 3 | 入口 + 完成 + 失败 |
+| 暂停 | 4 | 2 个入口 + 恢复 + 失败 |
+| DryRun | 3 | 入口 + 完成 + 失败 |
+| 删除 | 2 | 入口 + 失败 |
+| 重试 | 8 | 8 种失败状态的重试路径 |
+| **总计** | **59** | - |
+
+> **说明**：上表统计的是核心转换规则。完整的 64 条规则还包括部分 Phase 的额外入口（如 Upgrading → Paused）和一些边界情况处理。
+
 ### 4.3 状态管理方案
 
 **设计思路**：
