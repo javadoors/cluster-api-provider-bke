@@ -5621,21 +5621,6 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 - **Mock 注入机制**：状态机引擎支持通过 `WithEventStore()` 选项注入 Mock 实现，便于单元测试隔离
 - **双轨并行验证**：通过环境变量 `USE_STATE_MACHINE_ENGINE` 控制新旧逻辑切换，支持灰度验证
 
-**验证方法**：
-
-- **单元测试**：覆盖所有 58 条转换规则，验证 FromState + Trigger → ToState 映射正确性
-- **集成测试**：验证完整生命周期（Unknown → Initializing → Ready → Upgrading → Ready → Deleting）
-- **状态一致性测试**：随机状态注入 + `ValidateStatusConsistency()` 验证
-- **失败恢复测试**：模拟 Phase 执行失败，验证 Failed 状态转换和重试路径
-- **并发测试**：使用 `go test -race` 验证原子操作和锁机制
-
-**关键指标**：
-
-- 测试覆盖率 ≥ 90%
-- 状态转换规则 100% 可验证
-- 无需修改生产代码即可注入测试状态
-- 状态一致性验证通过率 100%
-
 ### 10.3 可诊断性设计（DFD）
 
 **核心验证目标**：正常/异常场景输出足够观测信息，支撑快速定位根因，降低 MTTR
@@ -5644,23 +5629,8 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 
 - **结构化日志**：所有状态转换输出结构化日志，包含 `cluster`、`fromState`、`toState`、`trigger`、`duration`、`error` 字段
 - **事件追踪系统**：InMemoryEventStore 记录每次状态转换的完整上下文，支持按集群名称、时间范围、状态、触发器多维度查询
-- **Prometheus 监控指标**：暴露 `bke_state_machine_transitions_total`、`bke_state_machine_transition_errors_total`、`bke_state_machine_events_recorded_total` 等指标
 - **LastInProgressState 字段**：错误转换时自动记录失败前的进行中状态，便于分析失败原因和恢复目标
 - **状态转换历史查询**：`Engine.QueryHistory(EventFilter)` 支持按时间范围、状态转换路径过滤事件
-
-**验证方法**：
-
-- **日志验证**：检查状态转换日志是否包含完整字段
-- **事件查询测试**：验证多维度查询的正确性和性能
-- **监控指标验证**：通过 Prometheus 查询验证指标暴露和告警规则
-- **故障注入测试**：模拟网络异常、进程崩溃，验证日志和事件记录的完整性
-
-**关键指标**：
-
-- 日志字段完整率 100%
-- 事件记录成功率 ≥ 99.9%
-- 故障定位时间（MTTR）降低 50%
-- 监控指标延迟 < 5 秒
 
 ### 10.4 可运维性设计（DFS）
 
@@ -5669,25 +5639,8 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 **本方案实现措施**：
 
 - **Kubernetes 原生设计**：状态机基于 CRD（BKECluster）实现，符合 Kubernetes 声明式 API 和控制器模式
-- **Helm Chart 部署**：提供标准化的 Helm Chart，支持一键部署和升级
-- **配置热更新**：通过 ConfigMap 管理状态机配置（如重试策略、超时时间），支持不重启更新
-- **灰度发布支持**：通过环境变量 `USE_STATE_MACHINE_ENGINE` 和注解控制新旧逻辑切换，支持金丝雀发布
-- **回滚机制**：每个阶段独立可交付，支持快速回滚到旧版本（字段保留 + 双轨并行）
+- **灰度发布支持**：通过环境变量 `USE_STATE_MACHINE_ENGINE` 和注解控制新旧逻辑切换
 - **扩缩容适配**：状态转换引擎支持动态注册转换规则，便于扩展新的操作类型
-
-**验证方法**：
-
-- **部署测试**：使用 Helm Chart 在测试集群部署，验证部署流程
-- **升级测试**：从旧版本升级到新版本，验证数据迁移和兼容性
-- **回滚测试**：模拟升级失败，验证回滚流程和数据恢复
-- **配置变更测试**：修改 ConfigMap，验证配置热更新生效
-
-**关键指标**：
-
-- 部署成功率 100%
-- 升级零停机
-- 回滚时间 < 5 分钟
-- 配置变更生效时间 < 30 秒
 
 ### 10.5 可靠性设计（DFR）
 
@@ -5702,20 +5655,6 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 - **错误隔离**：事件记录失败不影响状态转换核心逻辑（`_ = e.eventStore.Record(event)`）
 - **LastInProgressState 持久化**：失败前的进行中状态存储在 Cluster.Status 中，重启不丢失
 
-**验证方法**：
-
-- **故障注入测试**：模拟网络分区、Pod 重启、OOM，验证状态恢复
-- **长时间运行测试**：连续运行 7 天，验证内存泄漏和稳定性
-- **并发压力测试**：模拟 100+ 集群并发 Reconcile，验证锁竞争和原子操作
-- **状态恢复测试**：强制删除 Pod，验证状态持久化和恢复
-
-**关键指标**：
-
-- 系统可用性 ≥ 99.9%
-- 内存泄漏率 < 1 MB/天
-- 并发处理能力 ≥ 100 集群
-- 故障恢复时间 < 30 秒
-
 ### 10.6 性能设计（DFP）
 
 **核心验证目标**：资源开销可控、长期运行稳定、高负载不雪崩，无资源泄漏
@@ -5725,50 +5664,13 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 - **状态转换引擎优化**：使用 `sync.RWMutex` 读写锁，读多写少场景下性能优良
 - **事件存储容量控制**：InMemoryEventStore 设置 maxSize（默认 1000），自动淘汰最旧事件
 - **状态记录过期清理**：StatusCleaner 定期清理过期记录，防止内存无限增长
-- **异步事件记录（可选）**：支持通过 `AsyncEventRecorder` 异步写入事件，降低同步开销
-- **分段锁优化（可选）**：使用 `ShardedStatusManager` 减少锁竞争（高并发场景）
 - **轻量级数据结构**：StatusRecordV2 删除冗余字段（RetryPolicy），减少内存占用
-
-**验证方法**：
-
-- **性能基准测试**：测量状态转换延迟、事件记录延迟、查询延迟
-- **内存占用测试**：监控长时间运行的内存增长趋势
-- **高负载测试**：模拟 1000+ 集群并发，验证系统稳定性
-- **资源泄漏检测**：使用 `pprof` 分析 CPU 和内存热点
-
-**关键指标**：
-
-- 状态转换延迟 P99 < 10 ms
-- 事件记录延迟 P99 < 5 ms
-- 内存占用 < 500 MB（1000 集群）
-- CPU 使用率 < 2 核（1000 集群）
 
 ### 10.7 安全性设计（DFNS）
 
 **核心验证目标**：镜像扫描、Pod 安全策略、零信任、CVE 修复
 
-**本方案实现措施**：
-
-- **最小权限原则**：控制器 ServiceAccount 仅授予必要的 RBAC 权限（BKECluster、BKENode 的 get/list/watch/update）
-- **镜像安全**：使用官方基础镜像（distroless/static），定期扫描 CVE
-- **Pod 安全策略**：设置 `securityContext`（runAsNonRoot: true, readOnlyRootFilesystem: true）
-- **网络隔离**：控制器仅访问 Kubernetes API Server，不暴露外部端口
-- **Secret 管理**：敏感信息（如 SSH 密钥）通过 Kubernetes Secret 管理，不硬编码
-- **审计日志**：记录所有状态变更操作，支持安全审计
-
-**验证方法**：
-
-- **镜像扫描**：使用 Trivy 扫描镜像 CVE
-- **RBAC 验证**：检查 ServiceAccount 权限是否最小化
-- **Pod 安全测试**：使用 `kube-bench` 验证 Pod 安全配置
-- **渗透测试**：模拟攻击场景，验证网络隔离和权限控制
-
-**关键指标**：
-
-- CVE 高危漏洞 0 个
-- RBAC 权限最小化 100%
-- Pod 安全配置合规率 100%
-- 审计日志完整率 100%
+**本方案实现措施**：不涉及
 
 ### 10.8 兼容性设计（DFC）
 
@@ -5776,26 +5678,7 @@ func (r *AsyncEventRecorder) Record(event StateTransitionEvent) {
 
 **本方案实现措施**：
 
-- **Kubernetes 版本兼容**：支持 Kubernetes 1.20+，使用 `sigs.k8s.io/controller-runtime` v0.10+
-- **操作系统兼容**：支持 Linux（CentOS 7/8、Ubuntu 18.04/20.04、Debian 10/11）
-- **架构兼容**：支持 amd64 和 arm64 架构，提供多架构镜像
 - **API 向后兼容**：Phase 和 ClusterHealthState 字段标记 Deprecated 但保留，自动同步到 ClusterStatus
-- **升级路径兼容**：支持从旧版本平滑升级，无需数据迁移
-- **硬件矩阵兼容**：支持物理机、虚拟机、云主机（阿里云、腾讯云、AWS）
-
-**验证方法**：
-
-- **多版本测试**：在 Kubernetes 1.20、1.22、1.24、1.26 版本测试
-- **多 OS 测试**：在 CentOS 7/8、Ubuntu 18.04/20.04 测试
-- **多架构测试**：在 amd64 和 arm64 架构测试
-- **升级测试**：从旧版本升级到新版本，验证兼容性
-
-**关键指标**：
-
-- Kubernetes 版本兼容 ≥ 1.20
-- 操作系统兼容 ≥ 5 种
-- 架构兼容 amd64 + arm64
-- API 向后兼容 100%
 
 ## 附录
 
