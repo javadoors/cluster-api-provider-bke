@@ -200,7 +200,7 @@ func handleClusterScaleMasterUpPhase(ctx *PhaseContext, err error) {
 **文件**: `controllers/capbke/bkecluster_upgrade_dag.go`
 
 | 行号 | 位置 | 状态转换 | 说明 |
-|------|------|---------|------|
+| ------ | ------ | --------- | ------ |
 | 310 | 升级流程 | ClusterStatus = status | 升级状态设置 |
 
 ###### 2.1.1.4.3 ensure_delete_or_reset.go
@@ -208,7 +208,7 @@ func handleClusterScaleMasterUpPhase(ctx *PhaseContext, err error) {
 **文件**: `pkg/phaseframe/phases/ensure_delete_or_reset.go`
 
 | 行号 | 位置 | 状态转换 | 说明 |
-|------|------|---------|------|
+| ------ | ------ | --------- | ------ |
 | 179 | 删除流程 | → ClusterDeleting | 删除状态设置 |
 
 ###### 2.1.1.4.4 context.go
@@ -216,7 +216,7 @@ func handleClusterScaleMasterUpPhase(ctx *PhaseContext, err error) {
 **文件**: `pkg/phaseframe/context.go`
 
 | 行号 | 位置 | 状态转换 | 说明 |
-|------|------|---------|------|
+| ------ | ------ | --------- | ------ |
 | 252 | 上下文处理 | → ClusterDeleting | 删除状态设置 |
 
 ##### 2.1.1.5 状态定义（bkecluster_consts.go）
