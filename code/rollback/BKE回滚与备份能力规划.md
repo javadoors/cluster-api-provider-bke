@@ -61,6 +61,133 @@ BKE 采用双机制架构管理集群生命周期：
 └─────────────────────────────────────────────────────────────┘
 ```
 
+#### 1.2.1 双机制详细说明
+
+**机制一：PhaseFlow（阶段流）**
+
+PhaseFlow 是 BKE 的核心编排引擎，负责管理集群的**操作类任务**。它通过一系列有序的 Phase（阶段）来完成复杂的集群操作。
+
+**核心职责**：
+- **安装**：执行 CommonPhases + DeployPhases + PostDeployPhases，完成集群初始化
+- **扩缩容**：执行 Master/Worker Join/Delete 阶段，调整节点数量
+- **删除**：执行 DeletePhases，清理集群资源
+- **纳管**：执行 EnsureClusterManage，导入已有集群
+- **Addon 部署**：执行 EnsureAddonDeploy，部署附加组件
+
+**工作原理**：
+1. **CalculatePhase()**：根据集群当前状态，计算需要执行的 Phase 列表
+2. **Execute()**：按顺序执行每个 Phase
+   - **NeedExecute()**：判断该 Phase 是否需要执行
+   - **Execute()**：执行 Phase 的核心逻辑
+   - **ReportStatus()**：更新 Phase 执行状态
+3. **状态管理**：通过 `ClusterStatus` 字段跟踪集群状态（如 `Ready`、`ScalingUp`、`Failed` 等）
+
+**关键特点**：
+- **幂等性**：每个 Phase 通过位标志（StateCode）、Kubernetes Conditions 等机制实现幂等性，支持重试
+- **状态机驱动**：使用状态机引擎（`statemachine.Engine`）管理状态转换
+- **失败处理**：Phase 失败时设置 `*Failed` 状态，需人工介入
+
+**机制二：ClusterVersion（版本管理）**
+
+ClusterVersion 是 BKE 的版本生命周期管理组件，负责管理集群的**版本升级**。它通过独立的 CRD 来跟踪和管理版本信息。
+
+**核心职责**：
+- **路径验证**：验证升级路径是否合法（通过 `UpgradePath` CRD）
+- **镜像管理**：拉取和管理 ReleaseImage（OCI 镜像）
+- **状态跟踪**：跟踪集群版本状态（`Pending`、`Upgrading`、`Ready`、`Failed` 等）
+- **升级协调**：设置 `upgrade-ready` 注解，触发 BKECluster 执行升级
+
+**工作原理**：
+1. **用户设置目标版本**：`kubectl patch clusterversion --type merge -p '{"spec":{"desiredVersion":"v26.06"}}'`
+2. **ClusterVersion Controller 验证**：
+   - 查找升级路径（`UpgradePath` CRD）
+   - 拉取 ReleaseImage（OCI 镜像）
+   - 验证兼容性
+3. **设置升级就绪注解**：`cvo.openfuyao.cn/upgrade-ready=<hop-target>`
+4. **BKECluster Controller 检测到注解**：触发声明式 DAG 执行升级
+5. **升级完成**：清除注解，更新 `ClusterVersion.status`
+
+**关键特点**：
+- **声明式**：用户只需设置目标版本，系统自动完成升级
+- **路径验证**：通过 `UpgradePath` CRD 确保升级路径合法
+- **不直接执行**：ClusterVersion 只负责验证和准备，实际升级由声明式 DAG 执行
+
+**执行器：声明式 DAG**
+
+声明式 DAG 是升级/降级的实际执行器，负责按拓扑顺序执行组件升级。
+
+**工作原理**：
+1. **构建 DAG**：根据组件依赖关系构建有向无环图（DAG）
+2. **拓扑排序**：确定组件执行顺序（如 Agent → Containerd → etcd → Master → Worker）
+3. **逐组件执行**：按顺序执行每个组件的升级逻辑
+4. **失败处理**：记录错误到 `DeclarativeUpgrade.LastError`
+
+#### 1.2.2 双机制协作关系
+
+**职责边界**：
+
+| 操作类型 | 负责机制 | 说明 |
+|---------|---------|------|
+| **安装** | PhaseFlow | 执行安装 Phase 列表 |
+| **扩缩容** | PhaseFlow | 执行 Join/Delete Phase |
+| **删除** | PhaseFlow | 执行 Delete Phase |
+| **纳管** | PhaseFlow | 执行 EnsureClusterManage |
+| **Addon 部署** | PhaseFlow | 执行 EnsureAddonDeploy |
+| **版本升级** | ClusterVersion + 声明式 DAG | ClusterVersion 验证路径，DAG 执行升级 |
+| **版本降级** | ClusterVersion + 声明式 DAG | ClusterVersion 验证路径，DAG 执行降级 |
+
+**协作流程（以升级为例）**：
+
+```
+1. 用户设置目标版本
+   └─ kubectl patch clusterversion --type merge -p '{"spec":{"desiredVersion":"v26.06"}}'
+
+2. ClusterVersion Controller（机制二）：
+   ├─ 验证升级路径（UpgradePath CRD）
+   ├─ 拉取 ReleaseImage（OCI 镜像）
+   ├─ 设置注解：cvo.openfuyao.cn/upgrade-ready=v26.06
+   └─ 不负责执行升级
+
+3. BKECluster Controller 检测到注解：
+   ├─ shouldUseDeclarativeUpgrade() 返回 true
+   └─ executeUpgradeDAG() 执行声明式 DAG
+
+4. 声明式 DAG（执行器）执行升级：
+   ├─ EnsurePreUpgradeResources
+   ├─ EnsureAgentUpgrade
+   ├─ EnsureContainerdUpgrade
+   ├─ EnsureEtcdUpgrade
+   ├─ EnsureMasterUpgrade
+   └─ EnsureWorkerUpgrade
+
+5. 升级完成：
+   ├─ 清除 upgrade-ready 注解
+   ├─ 更新 ClusterVersion.status（CompleteUpgradeHop）
+   └─ PhaseFlow 跳过已完成的升级 Phase
+```
+
+**为什么需要双机制？**
+
+1. **职责分离**：
+   - PhaseFlow 专注于**操作编排**（安装、扩缩容、删除等）
+   - ClusterVersion 专注于**版本管理**（升级路径验证、镜像管理）
+   - 两者职责清晰，互不干扰
+
+2. **灵活性**：
+   - PhaseFlow 可以独立管理操作类任务，不受版本升级影响
+   - ClusterVersion 可以独立管理版本生命周期，不受操作任务影响
+   - 两者可以并行工作（如：在扩容的同时进行版本升级）
+
+3. **可观测性**：
+   - PhaseFlow 通过 `ClusterStatus` 字段跟踪操作状态
+   - ClusterVersion 通过 `ClusterVersion.status` 跟踪版本状态
+   - 两者状态独立，便于问题排查
+
+4. **回滚能力**：
+   - PhaseFlow 负责操作类任务的回滚（扩缩容、配置变更等）
+   - ClusterVersion 负责版本升级的回滚（通过声明式 DAG 执行降级）
+   - 两者协同提供完整的回滚能力
+
 ### 1.3 升级流程中的职责分工
 
 ```
