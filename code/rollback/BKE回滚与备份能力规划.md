@@ -613,6 +613,112 @@ func (r *BKEClusterReconciler) applyReleaseBundle(
    - 重试失败的步骤
    - 预计时间：5-15 分钟
 
+**自动化清理脚本范围**：
+
+清理脚本负责删除安装过程中创建的所有资源，具体范围如下：
+
+| 资源类型 | 清理范围 | 清理方式 | 说明 |
+|---------|---------|---------|------|
+| **Kubernetes 资源** | BKECluster CR | `kubectl delete bkecluster` | 删除集群 CR 及其关联资源 |
+| | BKENode CR | `kubectl delete bkenode --all` | 删除所有节点 CR |
+| | 相关 ConfigMap | 自动级联删除 | 集群配置、证书配置等 |
+| | 相关 Secret | 自动级联删除 | 证书、密钥、Token 等 |
+| | 相关 Service | 自动级联删除 | API Server Service 等 |
+| **云资源** | VM/实例 | 通过云 API 删除 | Master 节点、Worker 节点 |
+| | 负载均衡器 | 通过云 API 删除 | API Server LB、Ingress LB |
+| | 存储卷 | 通过云 API 删除 | etcd 数据卷、日志卷等 |
+| | 网络资源 | 通过云 API 删除 | VPC、子网、安全组、弹性 IP |
+| **本地资源** | 证书文件 | `rm -rf /etc/bke/${CLUSTER_NAME}/pki/` | CA 证书、服务证书、密钥 |
+| | 配置文件 | `rm -rf /etc/bke/${CLUSTER_NAME}/config/` | kubelet 配置、containerd 配置等 |
+| | etcd 数据 | `rm -rf /var/lib/etcd/*` | etcd 数据目录 |
+| | 日志文件 | `rm -rf /var/log/bke/*` | 组件日志 |
+
+**清理脚本不负责的范围**（需手动处理）：
+
+| 资源类型 | 说明 | 处理方式 |
+|---------|------|---------|
+| **业务应用数据** | 如果安装过程中已部署测试应用 | 手动删除应用及其 PVC |
+| **外部依赖** | 外部 DNS 记录、外部负载均衡 | 手动清理外部系统配置 |
+| **监控数据** | Prometheus、Grafana 中的监控数据 | 可选清理，不影响重新安装 |
+| **备份数据** | 如果已创建备份 | 保留或删除（根据需求） |
+
+**清理脚本执行流程**：
+
+```
+1. 预检查
+   ├─ 确认集群名称和区域
+   ├─ 检查是否有正在运行的安装任务
+   └─ 提示用户确认清理操作
+
+2. 停止集群组件
+   ├─ 停止所有节点上的 kubelet
+   ├─ 停止所有节点上的 containerd
+   └─ 停止所有节点上的 BKE Agent
+
+3. 删除 Kubernetes 资源
+   ├─ 删除 BKECluster CR（触发级联删除）
+   ├─ 等待关联资源删除完成
+   └─ 验证资源已删除
+
+4. 删除云资源
+   ├─ 删除 VM/实例
+   ├─ 删除负载均衡器
+   ├─ 删除存储卷
+   ├─ 删除网络资源
+   └─ 等待云资源删除完成
+
+5. 清理本地资源
+   ├─ 删除证书文件
+   ├─ 删除配置文件
+   ├─ 删除 etcd 数据
+   └─ 删除日志文件
+
+6. 验证清理完成
+   ├─ 检查 Kubernetes 资源是否已删除
+   ├─ 检查云资源是否已删除
+   ├─ 检查本地文件是否已清理
+   └─ 输出清理报告
+```
+
+**清理脚本示例**：
+
+```bash
+#!/bin/bash
+# bke-install-cleanup.sh
+
+CLUSTER_NAME=$1
+REGION=$2
+
+echo "Starting cleanup for cluster: ${CLUSTER_NAME}"
+
+# 1. 删除 BKECluster 资源（触发级联删除）
+kubectl delete bkecluster ${CLUSTER_NAME} -n bke-system --wait=true
+
+# 2. 删除节点资源
+kubectl delete bkenode --all -n bke-system --wait=true
+
+# 3. 删除云资源（根据实际环境）
+# - 删除 VM/实例
+# - 删除负载均衡器
+# - 删除存储卷
+# - 删除网络资源
+
+# 4. 删除证书和配置
+rm -rf /etc/bke/${CLUSTER_NAME}
+rm -rf /var/lib/etcd/*
+rm -rf /var/log/bke/*
+
+# 5. 验证清理完成
+echo "Verifying cleanup..."
+kubectl get bkecluster ${CLUSTER_NAME} -n bke-system
+if [ $? -eq 0 ]; then
+    echo "ERROR: Cluster still exists"
+    exit 1
+fi
+
+echo "Cleanup completed successfully"
+```
+
 **影响范围**：
 - 所有已创建的基础设施资源
 - 云资源（VM、网络、存储）
