@@ -112,6 +112,167 @@ BKE 采用双机制架构管理集群生命周期：
 | **配置变更失败** | P1 | 配置回滚 |
 | **安装失败** | P0 | 清理重建（状态不可逆） |
 
+#### 2.1.1 升级失败场景说明
+
+**场景描述**：
+集群从版本 v26.05 升级到 v26.06 过程中，某个组件升级失败，导致集群处于不一致状态。
+
+**失败原因**：
+- ReleaseImage 拉取失败（网络问题、镜像损坏）
+- 组件升级失败（Agent、Containerd、etcd、Master、Worker）
+- 升级路径验证失败（不兼容的版本组合）
+- 资源不足（CPU、内存、磁盘空间不足）
+- 健康检查失败（升级后组件无法正常启动）
+
+**当前状态**：
+- ClusterVersion.status.phase = `Failed` 或 `PreCheckFailed`
+- ClusterStatus = `ClusterUpgradeFailed`
+- 部分组件可能已升级到新版本，部分仍在旧版本
+- 集群可能处于不可用状态
+
+**回滚策略**：
+1. ClusterVersion 验证回滚路径（v26.06 → v26.05）
+2. 拉取旧版本 ReleaseImage
+3. 设置 `cvo.openfuyao.cn/rollback-ready=v26.05` 注解
+4. BKECluster 控制器执行降级 DAG
+5. 按相反顺序降级所有组件（Worker → Master → etcd → Containerd → Agent）
+6. 更新 ClusterVersion.status.currentVersion = v26.05
+7. ClusterStatus = `Ready`
+
+**回滚目标**：
+- 所有组件恢复到 v26.05 版本
+- 集群状态恢复到 `Ready`
+- 业务应用恢复正常运行
+
+**影响范围**：
+- 控制面组件（API Server、etcd、Controller Manager、Scheduler）
+- 节点组件（kubelet、containerd、BKE Agent）
+- 业务应用（短暂不可用，降级完成后恢复）
+
+**预计恢复时间**：15-30 分钟
+
+#### 2.1.2 扩缩容失败场景说明
+
+**场景描述**：
+集群扩容（增加 Worker 节点）或缩容（删除 Worker 节点）过程中，操作失败，导致节点处于不一致状态。
+
+**失败原因**：
+- 云资源创建失败（VM、网络、存储）
+- 节点初始化失败（kubelet 启动失败、证书签发失败）
+- 节点加入集群失败（CSR 审批失败、网络不通）
+- 节点删除失败（Pod 驱逐超时、PVC 删除失败）
+- MachineDeployment 更新失败（副本数不一致）
+
+**当前状态**：
+- ClusterStatus = `ClusterScaleFailed`
+- LastInProgressState = `WorkerScalingUp` 或 `WorkerScalingDown`
+- 可能存在未就绪的节点（扩容失败）
+- 可能存在待删除的节点（缩容失败）
+
+**回滚策略**：
+1. 触发 PhaseFlow 回滚（通过 `bke.bocloud.com/rollback=true` 注解）
+2. 状态机引擎执行回滚转换：`ScaleFailed → Ready`
+3. 执行资源清理动作：
+   - 扩容失败：删除未就绪的节点、清理相关 ConfigMap/Secret
+   - 缩容失败：恢复 MachineDeployment 副本数、重新加入节点
+4. 清除回滚注解
+5. ClusterStatus = `Ready`
+
+**回滚目标**：
+- 节点数量恢复到操作前状态
+- 所有节点处于 `Ready` 状态
+- MachineDeployment 副本数一致
+
+**影响范围**：
+- 新增/删除的节点
+- MachineDeployment 资源
+- 业务应用（节点上的 Pod 可能被驱逐）
+
+**预计恢复时间**：5-15 分钟
+
+#### 2.1.3 配置变更失败场景说明
+
+**场景描述**：
+集群配置变更（如纳管新集群、修改集群参数）过程中，配置应用失败，导致集群配置不一致。
+
+**失败原因**：
+- 配置验证失败（参数不合法、冲突的配置）
+- 配置应用失败（ConfigMap/Secret 创建失败）
+- 组件重启失败（配置变更后组件无法启动）
+- 网络配置失败（Service、Ingress 配置错误）
+
+**当前状态**：
+- ClusterStatus = `ClusterManageFailed`
+- 部分配置可能已应用，部分未应用
+- 集群可能处于部分可用状态
+
+**回滚策略**：
+1. 触发 PhaseFlow 回滚（通过 `bke.bocloud.com/rollback=true` 注解）
+2. 状态机引擎执行回滚转换：`ManageFailed → Ready`
+3. 执行配置恢复动作：
+   - 从备份恢复配置文件
+   - 删除错误的 ConfigMap/Secret
+   - 重启受影响的组件
+4. 清除回滚注解
+5. ClusterStatus = `Ready`
+
+**回滚目标**：
+- 配置恢复到变更前状态
+- 所有组件正常运行
+- 集群状态恢复到 `Ready`
+
+**影响范围**：
+- ConfigMap、Secret 资源
+- 受影响的组件（可能需要重启）
+- 业务应用（配置变更后可能需要重新加载）
+
+**预计恢复时间**：3-10 分钟
+
+#### 2.1.4 安装失败场景说明
+
+**场景描述**：
+集群安装过程中，某个阶段失败，导致集群无法完成初始化。
+
+**失败原因**：
+- Bootstrap 节点创建失败
+- etcd 集群初始化失败
+- 控制面组件启动失败（API Server、Controller Manager、Scheduler）
+- 证书签发失败（CA 证书、服务证书）
+- 网络配置失败（CNI 插件初始化失败）
+- 节点加入失败（Worker 节点无法加入集群）
+
+**当前状态**：
+- ClusterStatus = `ClusterInitializationFailed`
+- 部分组件可能已安装，部分未安装
+- 集群处于不可用状态
+
+**回滚策略**：
+**不支持自动回滚**，原因：
+- 安装过程创建的基础设施（etcd、证书、网络）状态不可逆
+- 云资源（VM、网络、存储）已创建，无法简单回滚
+- 重建比回滚更快、更可靠
+
+**推荐处理方式**：
+1. **清理并重建**（推荐）：
+   - 执行清理脚本，删除所有已创建的资源
+   - 验证资源完全删除
+   - 重新执行安装流程
+   - 预计时间：10-30 分钟
+
+2. **部分恢复**（特定场景）：
+   - 适用条件：控制面已就绪、etcd 集群健康、节点已加入
+   - 诊断失败原因
+   - 修复问题
+   - 重试失败的步骤
+   - 预计时间：5-15 分钟
+
+**影响范围**：
+- 所有已创建的基础设施资源
+- 云资源（VM、网络、存储）
+- 证书和配置文件
+
+**预计恢复时间**：10-30 分钟（清理重建）
+
 ### 2.2 PhaseFlow 回滚设计
 
 #### 2.2.1 设计原则
