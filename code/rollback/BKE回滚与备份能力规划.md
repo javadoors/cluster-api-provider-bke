@@ -1178,6 +1178,26 @@ ClusterVersion **只负责验证和准备**，不直接执行降级：
 4. **备份优先**：降级前必须备份当前数据（etcd 快照、配置文件等）
 5. **可观测性**：必须有清晰的降级日志和事件记录，便于问题排查
 
+##### 回滚方案选择
+
+BKE 提供两种回滚方案，与 2.1.1 节升级失败回滚方案保持一致：
+
+**方案一：降级 DAG**
+- 参考升级 DAG 设计，实现专门的降级 DAG
+- 按相反顺序降级组件（Worker → Master → etcd → Containerd → Agent）
+- 为每个组件实现特定的降级逻辑（数据迁移、配置回滚等）
+- 适用于复杂场景（如数据格式变更）
+
+**方案二：重新部署旧版本（OpenShift 方式）**
+- 复用现有部署逻辑，重新部署旧版本的 ReleaseImage
+- 不需要为每个组件编写降级代码
+- 实现简单，工作量小
+- 适用于快速交付和大部分回滚场景
+
+**推荐策略**：
+- **阶段一（P0）**：实现方案二（快速交付回滚能力）
+- **阶段二（P1）**：按需实现方案一（处理特殊场景，如数据格式变更）
+
 #### 2.3.2 支持的回滚场景
 
 **ClusterVersion 回滚场景总览**：
@@ -1368,10 +1388,10 @@ if upgradeFailed && autoRollbackEnabled {
 }
 ```
 
-#### 2.3.6 回滚执行流程
+#### 2.3.6 方案一：降级 DAG 执行流程
 
 ```
-ClusterVersion 回滚执行流程：
+ClusterVersion 回滚执行流程（方案一：降级 DAG）：
 
 1. 用户设置回滚目标
    └─ kubectl patch clusterversion --type merge \
@@ -1403,7 +1423,7 @@ ClusterVersion 回滚执行流程：
    └─ ClusterStatus: Ready
 ```
 
-#### 2.3.7 降级 DAG 设计
+#### 2.3.7 方案一：降级 DAG 设计
 
 **参考升级 DAG 设计降级 DAG**
 
@@ -1451,6 +1471,135 @@ Worker → Master → etcd → Containerd → Agent
 - **升级时**：先升级基础组件（Agent、Containerd），再升级依赖组件（etcd、Master、Worker）
 - **降级时**：先降级依赖组件（Worker、Master），再降级基础组件（etcd、Containerd、Agent）
 - **原因**：确保降级过程中组件之间的兼容性
+
+#### 2.3.8 方案二：重新部署旧版本（OpenShift 方式）
+
+**设计思路**：
+- 回滚的本质是"重新部署旧版本的 ReleaseImage"
+- 复用现有的部署逻辑，不需要为每个组件编写降级代码
+- 通过重新应用旧版本的配置来实现回滚
+
+**执行流程**：
+1. ClusterVersion 验证回滚路径（v26.06 → v26.05）
+2. 拉取旧版本 ReleaseImage
+3. 设置 `cvo.openfuyao.cn/rollback-ready=v26.05` 注解
+4. BKECluster 控制器执行重新部署
+5. 复用部署逻辑，重新部署所有组件：
+   - deployAgent：部署旧版本 Agent
+   - deployContainerd：部署旧版本 Containerd
+   - deployEtcd：部署旧版本 etcd
+   - deployMaster：部署旧版本 Master 组件
+   - deployWorker：部署旧版本 Worker 组件
+6. 等待所有组件就绪
+7. 更新 ClusterVersion.status.currentVersion = v26.05
+8. ClusterStatus = `Ready`
+
+**核心代码示例**：
+```go
+// bkecluster_controller.go
+
+func (r *BKEClusterReconciler) executeRollback(
+    ctx context.Context,
+    bkeCluster *bkev1beta1.BKECluster,
+    targetVersion string,
+) (ctrl.Result, error) {
+    // 1. 解析旧版本 ReleaseImage
+    releaseBundle, err := r.resolveReleaseBundle(ctx, targetVersion)
+    if err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    // 2. 重新部署旧版本（复用部署逻辑）
+    if err := r.applyReleaseBundle(ctx, bkeCluster, releaseBundle); err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    // 3. 等待所有组件就绪
+    if err := r.waitForComponentsReady(ctx, bkeCluster); err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    // 4. 完成回滚
+    return r.completeRollback(ctx, bkeCluster, targetVersion)
+}
+
+// applyReleaseBundle 复用部署逻辑
+func (r *BKEClusterReconciler) applyReleaseBundle(
+    ctx context.Context,
+    bkeCluster *bkev1beta1.BKECluster,
+    releaseBundle *ReleaseBundle,
+) error {
+    // 1. 部署 Agent
+    if err := r.deployAgent(ctx, bkeCluster, releaseBundle.Agent); err != nil {
+        return err
+    }
+    
+    // 2. 部署 Containerd
+    if err := r.deployContainerd(ctx, bkeCluster, releaseBundle.Containerd); err != nil {
+        return err
+    }
+    
+    // 3. 部署 etcd
+    if err := r.deployEtcd(ctx, bkeCluster, releaseBundle.Etcd); err != nil {
+        return err
+    }
+    
+    // 4. 部署 Master 组件
+    if err := r.deployMaster(ctx, bkeCluster, releaseBundle.Master); err != nil {
+        return err
+    }
+    
+    // 5. 部署 Worker 组件
+    if err := r.deployWorker(ctx, bkeCluster, releaseBundle.Worker); err != nil {
+        return err
+    }
+    
+    return nil
+}
+```
+
+**优点**：
+- ✅ 实现简单，复用现有部署逻辑
+- ✅ 不需要为每个组件编写降级代码
+- ✅ 与升级流程对称，易于理解和维护
+- ✅ 实现工作量小，测试工作量小
+- ✅ 可以处理大部分回滚场景
+
+**缺点**：
+- ❌ 可能需要更长时间（需要重新部署所有组件）
+- ❌ 某些状态可能无法完全回滚（如 etcd 数据格式变更不可逆）
+- ❌ 需要确保旧版本的 ReleaseImage 可用
+- ❌ 某些组件可能不支持"重新部署"（如已经修改了用户配置）
+
+**适用场景**：
+- 组件版本间没有数据格式变更
+- 对回滚时间要求不严格
+- 希望快速实现回滚能力
+
+#### 2.3.9 方案对比与建议
+
+**方案对比**：
+
+| 维度 | 方案一：降级 DAG | 方案二：重新部署 |
+|------|----------------|----------------|
+| **实现复杂度** | 高（需要为每个组件编写降级逻辑） | 低（复用部署逻辑） |
+| **实现工作量** | 大（预计 2-3 周） | 小（预计 1 周） |
+| **回滚时间** | 快（只降级需要降级的组件） | 慢（需要重新部署所有组件） |
+| **精确度** | 高（可以精确控制每个组件的降级） | 中（重新部署可能覆盖用户配置） |
+| **可靠性** | 中（降级逻辑需要充分测试） | 高（复用已验证的部署逻辑） |
+| **适用场景** | 组件版本间有数据格式变更 | 组件版本间没有数据格式变更 |
+| **维护成本** | 高（需要维护降级 DAG） | 低（与升级流程对称） |
+
+**推荐实施策略**：
+
+**阶段一（P0）**：实现方案二（重新部署）
+- 快速交付回滚能力
+- 覆盖大部分回滚场景
+- 实现工作量小，风险低
+
+**阶段二（P1）**：根据实际使用情况，决定是否实现方案一
+- 如果发现某些场景方案二无法满足（如 etcd 数据格式变更），再实现方案一
+- 方案一可以作为方案二的补充，处理特殊场景
 
 ### 2.4 双机制协同设计
 
