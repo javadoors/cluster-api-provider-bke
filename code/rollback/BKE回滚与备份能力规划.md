@@ -1122,25 +1122,263 @@ PhaseFlow 回滚流程（以扩缩容失败为例）：
 
 ### 2.3 ClusterVersion 回滚设计
 
-#### 2.3.1 设计原则
+#### 2.3.1 设计思路
 
-**ClusterVersion 不负责执行回滚，只负责触发**
+##### ClusterVersion 回滚的特殊性
 
-- ClusterVersion 验证回滚路径（类似升级路径验证）
-- 设置 `cvo.openfuyao.cn/rollback-ready` 注解
-- 由 BKECluster 控制器执行降级 DAG
+ClusterVersion 回滚是**版本回滚**（降级），与 PhaseFlow 的**操作回滚**有本质区别：
 
-#### 2.3.2 回滚触发流程
+| 维度 | PhaseFlow 操作回滚 | ClusterVersion 版本回滚 |
+|------|-------------------|------------------------|
+| **回滚对象** | 操作结果（节点、配置等） | 组件版本（Agent、etcd、Master 等） |
+| **回滚方向** | 撤销操作，返回 Ready 状态 | 降级组件，返回旧版本 |
+| **复杂度** | 中等（清理资源） | 高（组件降级、数据格式兼容） |
+| **组件顺序** | 无特定顺序 | 必须按相反顺序降级（Worker → Master → etcd → Containerd → Agent） |
+| **数据影响** | 清理创建的资源 | 可能需要数据格式降级 |
+| **风险** | 资源残留 | 版本不兼容、数据丢失 |
+
+**为什么版本回滚更复杂？**
+
+1. **组件依赖关系**：组件之间有依赖关系（如 Master 依赖 etcd），降级顺序必须正确
+2. **数据格式兼容**：新版本可能修改了数据格式（如 etcd 数据格式），降级时需要数据迁移
+3. **证书兼容性**：不同版本可能使用不同的证书格式
+4. **配置兼容性**：新版本的配置可能在旧版本中不支持
+
+##### 升级 vs 回滚的本质区别
+
+| 维度 | 升级（Upgrade） | 回滚（Rollback） |
+|------|----------------|-----------------|
+| **目标** | 将集群升级到新版本 | 将集群降级到旧版本 |
+| **方向** | 向前 - 朝新版本前进 | 向后 - 返回旧版本 |
+| **组件顺序** | Agent → Containerd → etcd → Master → Worker | Worker → Master → etcd → Containerd → Agent |
+| **数据迁移** | 可能需要数据格式升级 | 可能需要数据格式降级 |
+| **风险** | 新版本可能有未知问题 | 旧版本可能不兼容新数据 |
+| **测试覆盖** | 充分测试 | 部分测试（回滚路径可能未充分验证） |
+
+##### ClusterVersion 的职责边界
+
+ClusterVersion **只负责验证和准备**，不直接执行降级：
+
+1. **验证回滚路径**：通过 `UpgradePath` CRD 验证回滚路径是否合法
+2. **拉取旧版本镜像**：拉取目标版本的 ReleaseImage（OCI 镜像）
+3. **设置回滚注解**：设置 `cvo.openfuyao.cn/rollback-ready=<target-version>` 注解
+4. **触发降级 DAG**：由 BKECluster 控制器检测到注解后执行降级 DAG
+
+**为什么不直接执行降级？**
+
+- **职责分离**：ClusterVersion 专注版本管理，BKECluster 专注集群操作
+- **复用现有逻辑**：降级 DAG 可以复用升级 DAG 的执行框架
+- **灵活性**：可以在降级前做额外检查（如备份数据）
+
+##### 回滚的核心原则
+
+1. **路径验证**：必须验证回滚路径合法（通过 UpgradePath CRD）
+2. **组件顺序**：必须按相反顺序降级组件（Worker → Master → etcd → Containerd → Agent）
+3. **数据兼容**：必须确保数据格式兼容（必要时执行数据迁移）
+4. **备份优先**：降级前必须备份当前数据（etcd 快照、配置文件等）
+5. **可观测性**：必须有清晰的降级日志和事件记录，便于问题排查
+
+#### 2.3.2 支持的回滚场景
+
+**ClusterVersion 回滚场景总览**：
+
+| 场景 | 触发条件 | 回滚策略 | 预计时间 |
+|------|---------|---------|---------|
+| 升级失败回滚 | 升级过程中组件失败 | 降级到上一版本 | 15-30分钟 |
+| 升级后发现问题 | 升级完成后发现严重问题 | 降级到上一版本 | 15-30分钟 |
+| 跨版本回滚 | 需要回滚多个版本 | 逐跳降级 | 30-60分钟/跳 |
+
+**支持回滚的场景**：
+
+1. **升级失败回滚**
+   - 触发条件：升级过程中组件失败（镜像拉取失败、健康检查失败等）
+   - 回滚目标：升级到之前的版本（如 v26.06 → v26.05）
+   - 回滚动作：降级所有组件到旧版本
+   - 适用条件：UpgradePath CRD 中存在回滚路径
+
+2. **升级后发现问题回滚**
+   - 触发条件：升级完成后发现严重问题（bug、性能问题、兼容性问题）
+   - 回滚目标：降级到升级前的稳定版本
+   - 回滚动作：降级所有组件到旧版本
+   - 适用条件：升级后 24 小时内（数据格式未发生不可逆变更）
+
+3. **跨版本回滚**
+   - 触发条件：需要回滚多个版本（如 v26.07 → v26.05）
+   - 回滚目标：逐跳降级（v26.07 → v26.06 → v26.05）
+   - 回滚动作：每跳执行完整的降级流程
+   - 适用条件：每一跳都有合法的 UpgradePath
+
+**不支持回滚的场景**：
+
+1. **降级到不存在的版本**
+   - 原因：ReleaseImage 不存在，无法拉取
+   - 处理方式：手动构建 ReleaseImage 或选择其他版本
+
+2. **跳过多个版本直接降级**
+   - 原因：必须逐跳降级，确保每一跳的数据兼容性
+   - 处理方式：逐跳降级（v26.07 → v26.06 → v26.05）
+
+3. **数据格式不兼容的降级**
+   - 原因：新版本修改了数据格式（如 etcd 数据格式），旧版本无法读取
+   - 处理方式：执行数据迁移脚本或重建集群
+
+**回滚决策树**：
 
 ```
-ClusterVersion 回滚流程：
+升级失败或发现问题
+  ↓
+判断问题类型
+  ├─ 瞬时故障（网络超时、镜像拉取失败）→ 重试升级
+  ├─ 根本性问题（版本不兼容、严重 bug）→ 回滚到上一版本
+  └─ 需要回滚多个版本 → 逐跳回滚
+```
+
+#### 2.3.3 回滚场景详细说明
+
+##### 场景 1：升级失败回滚
+
+**失败原因分析**：
+- ReleaseImage 拉取失败（网络问题、镜像损坏）
+- 组件升级失败（Agent、Containerd、etcd、Master、Worker）
+- 健康检查失败（升级后组件无法正常启动）
+- 数据迁移失败（数据格式不兼容）
+
+**重试策略（先尝试修复并重试）**：
+1. 诊断失败原因（查看组件日志、事件记录）
+2. 修复根因（修复网络、重新拉取镜像、修复数据）
+3. 使用 `bke.bocloud.com/retry` 注解触发重试
+4. 升级 DAG 从检查点恢复，继续升级
+
+**回滚策略（重试失败后）**：
+1. 用户设置回滚目标版本
+   ```bash
+   kubectl patch clusterversion --type merge \
+       -p '{"spec":{"desiredVersion":"v26.05"}}'
+   ```
+2. ClusterVersion Controller 验证回滚路径
+3. 拉取旧版本 ReleaseImage
+4. 设置 `cvo.openfuyao.cn/rollback-ready=v26.05` 注解
+5. BKECluster Controller 执行降级 DAG
+6. 按相反顺序降级所有组件
+7. 更新 ClusterVersion.status.currentVersion = v26.05
+8. ClusterStatus = `Ready`
+
+**状态转换**：
+```
+ClusterVersionPhaseFailed → ClusterVersionPhaseRollingBack → ClusterVersionPhaseReady
+```
+
+**预计恢复时间**：15-30 分钟
+
+##### 场景 2：升级后发现问题回滚
+
+**问题类型**：
+- 新版本有严重 bug
+- 性能下降
+- 兼容性问题（某些应用无法运行）
+- 配置不兼容
+
+**回滚策略**：
+1. 备份当前数据（etcd 快照、配置文件）
+2. 用户设置回滚目标版本
+3. ClusterVersion Controller 验证回滚路径
+4. 执行降级 DAG
+5. 降级所有组件到旧版本
+6. 恢复配置（如有必要）
+7. 验证集群健康
+
+**状态转换**：
+```
+ClusterVersionPhaseReady → ClusterVersionPhaseRollingBack → ClusterVersionPhaseReady
+```
+
+**预计恢复时间**：15-30 分钟
+
+##### 场景 3：跨版本回滚
+
+**场景描述**：
+需要从 v26.07 回滚到 v26.05，但 UpgradePath 只支持逐跳回滚（v26.07 → v26.06 → v26.05）
+
+**回滚策略**：
+1. 第一跳：v26.07 → v26.06
+   - 验证回滚路径
+   - 拉取 v26.06 ReleaseImage
+   - 执行降级 DAG
+   - 验证集群健康
+2. 第二跳：v26.06 → v26.05
+   - 验证回滚路径
+   - 拉取 v26.05 ReleaseImage
+   - 执行降级 DAG
+   - 验证集群健康
+
+**状态转换**：
+```
+ClusterVersionPhaseReady (v26.07)
+  → ClusterVersionPhaseRollingBack → ClusterVersionPhaseReady (v26.06)
+  → ClusterVersionPhaseRollingBack → ClusterVersionPhaseReady (v26.05)
+```
+
+**预计恢复时间**：30-60 分钟（每跳 15-30 分钟）
+
+#### 2.3.4 回滚状态转换规则
+
+**ClusterVersion 回滚状态转换**：
+
+```go
+// ClusterVersion 回滚状态转换规则
+ClusterVersionPhaseUpgrading → ClusterVersionPhaseRollingBack (触发回滚)
+ClusterVersionPhaseFailed → ClusterVersionPhaseRollingBack (升级失败后回滚)
+ClusterVersionPhaseReady → ClusterVersionPhaseRollingBack (升级后发现问题回滚)
+ClusterVersionPhaseRollingBack → ClusterVersionPhaseReady (回滚完成)
+ClusterVersionPhaseRollingBack → ClusterVersionPhaseFailed (回滚失败)
+```
+
+**状态转换说明**：
+
+| FromState | ToState | 触发条件 | 说明 |
+|-----------|---------|---------|------|
+| Upgrading | RollingBack | 用户设置 desiredVersion < currentVersion | 升级过程中回滚 |
+| Failed | RollingBack | 升级失败后用户设置 desiredVersion | 升级失败后回滚 |
+| Ready | RollingBack | 升级完成后用户设置 desiredVersion | 升级后发现问题回滚 |
+| RollingBack | Ready | 降级 DAG 执行成功 | 回滚完成 |
+| RollingBack | Failed | 降级 DAG 执行失败 | 回滚失败 |
+
+#### 2.3.5 回滚触发机制
+
+**方案一：手动触发（推荐）**
+
+```bash
+# 用户通过 kubectl 触发回滚
+kubectl patch clusterversion --type merge \
+    -p '{"spec":{"desiredVersion":"v26.05"}}'
+
+# ClusterVersion Controller 检测到 desiredVersion < currentVersion
+# 自动设置 rollback-ready 注解
+```
+
+**方案二：自动触发（可选）**
+
+```go
+// 在 ClusterVersion Controller 中检测升级失败
+if upgradeFailed && autoRollbackEnabled {
+    // 自动设置回滚目标为上一版本
+    cv.Spec.DesiredVersion = previousVersion
+    // 设置 rollback-ready 注解
+    setRollbackReadyAnnotation(cv, previousVersion)
+}
+```
+
+#### 2.3.6 回滚执行流程
+
+```
+ClusterVersion 回滚执行流程：
 
 1. 用户设置回滚目标
    └─ kubectl patch clusterversion --type merge \
        -p '{"spec":{"desiredVersion":"v26.05"}}'
 
 2. ClusterVersion Controller：
-   ├─ 验证回滚路径（v26.06 → v26.05）
+   ├─ 验证回滚路径（UpgradePath CRD）
    ├─ 拉取旧版本 ReleaseImage
    ├─ 设置注解：cvo.openfuyao.cn/rollback-ready=v26.05
    └─ Phase → RollingBack
@@ -1149,7 +1387,7 @@ ClusterVersion 回滚流程：
    ├─ shouldUseDeclarativeRollback() 返回 true
    └─ executeRollbackDAG() 执行降级 DAG
 
-4. 降级 DAG 执行：
+4. 降级 DAG 执行（按相反顺序）：
    ├─ EnsureWorkerDowngrade
    ├─ EnsureMasterDowngrade
    ├─ EnsureEtcdDowngrade
@@ -1165,7 +1403,7 @@ ClusterVersion 回滚流程：
    └─ ClusterStatus: Ready
 ```
 
-#### 2.3.3 降级 DAG 设计
+#### 2.3.7 降级 DAG 设计
 
 **参考升级 DAG 设计降级 DAG**
 
@@ -1197,6 +1435,22 @@ func (r *BKEClusterReconciler) executeRollbackDAG(
     return r.completeDeclarativeRollback(ctx, bkeCluster, targetVersion)
 }
 ```
+
+**降级 DAG 节点顺序**：
+
+```
+升级 DAG 顺序：
+Agent → Containerd → etcd → Master → Worker
+
+降级 DAG 顺序（相反）：
+Worker → Master → etcd → Containerd → Agent
+```
+
+**为什么顺序相反？**
+
+- **升级时**：先升级基础组件（Agent、Containerd），再升级依赖组件（etcd、Master、Worker）
+- **降级时**：先降级依赖组件（Worker、Master），再降级基础组件（etcd、Containerd、Agent）
+- **原因**：确保降级过程中组件之间的兼容性
 
 ### 2.4 双机制协同设计
 
