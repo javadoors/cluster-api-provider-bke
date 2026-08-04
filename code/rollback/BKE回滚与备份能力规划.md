@@ -140,13 +140,214 @@ BKE 采用双机制架构管理集群生命周期：
 - 集群可能处于不可用状态
 
 **回滚策略**：
+
+BKE 提供两种回滚方案，可根据实际场景选择：
+
+##### 方案一：降级 DAG（推荐用于复杂场景）
+
+**设计思路**：
+- 参考升级 DAG 的设计，实现专门的降级 DAG
+- 为每个组件实现特定的降级逻辑（数据迁移、配置回滚等）
+- 按相反顺序执行降级（Worker → Master → etcd → Containerd → Agent）
+
+**执行流程**：
 1. ClusterVersion 验证回滚路径（v26.06 → v26.05）
 2. 拉取旧版本 ReleaseImage
 3. 设置 `cvo.openfuyao.cn/rollback-ready=v26.05` 注解
 4. BKECluster 控制器执行降级 DAG
-5. 按相反顺序降级所有组件（Worker → Master → etcd → Containerd → Agent）
+5. 按相反顺序降级所有组件：
+   - EnsureWorkerDowngrade：停止 kubelet → 回滚配置 → 重新安装旧版本 → 启动 → 验证
+   - EnsureMasterDowngrade：停止控制面组件 → 回滚配置 → 重新安装 → 启动 → 验证
+   - EnsureEtcdDowngrade：备份数据 → 停止 etcd → 回滚数据 → 重新安装 → 启动 → 验证
+   - EnsureContainerdDowngrade：停止 containerd → 回滚配置 → 重新安装 → 启动 → 验证
+   - EnsureAgentDowngrade：停止 Agent → 回滚配置 → 重新安装 → 启动 → 验证
 6. 更新 ClusterVersion.status.currentVersion = v26.05
 7. ClusterStatus = `Ready`
+
+**核心代码示例**：
+```go
+// bkecluster_rollback_dag.go
+
+func (r *BKEClusterReconciler) executeRollbackDAG(
+    ctx context.Context,
+    bkeCluster *bkev1beta1.BKECluster,
+    targetVersion string,
+) (ctrl.Result, error) {
+    // 1. 解析 ReleaseImage
+    releaseBundle, err := r.resolveReleaseBundle(ctx, targetVersion)
+    if err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    // 2. 构建降级 DAG（与升级 DAG 顺序相反）
+    dag := r.buildRollbackDAG(releaseBundle)
+    // DAG 节点顺序：Worker → Master → etcd → Containerd → Agent
+    
+    // 3. 执行降级 DAG
+    if err := r.executeDAG(ctx, bkeCluster, dag); err != nil {
+        bkeCluster.Status.DeclarativeUpgrade.LastError = err.Error()
+        return ctrl.Result{}, err
+    }
+    
+    // 4. 完成降级
+    return r.completeDeclarativeRollback(ctx, bkeCluster, targetVersion)
+}
+
+// 降级处理函数示例
+func EnsureWorkerDowngrade(ctx context.Context, cluster *bkev1beta1.BKECluster) error {
+    // 1. 停止 Worker 节点上的 kubelet
+    // 2. 回滚 Worker 节点配置
+    // 3. 重新安装旧版本 kubelet
+    // 4. 启动 kubelet
+    // 5. 验证 Worker 节点状态
+    return nil
+}
+```
+
+**优点**：
+- ✅ 精确控制每个组件的降级过程
+- ✅ 可以针对每个组件实现特定的降级逻辑（如数据迁移、配置回滚）
+- ✅ 可以处理组件间的依赖关系
+- ✅ 可以实现部分降级（只降级需要降级的组件）
+- ✅ 降级过程可观测、可控制
+
+**缺点**：
+- ❌ 实现复杂，需要为每个组件编写降级代码
+- ❌ 需要维护降级 DAG 的拓扑关系
+- ❌ 测试工作量大
+- ❌ 某些组件可能不支持降级（如 etcd 数据格式变更不可逆）
+
+**适用场景**：
+- 组件版本间有数据格式变更，需要特殊处理
+- 需要精确控制降级过程
+- 对降级时间有严格要求
+
+##### 方案二：重新部署旧版本（推荐用于快速交付）
+
+**设计思路**：
+- 回滚的本质是"重新部署旧版本的 ReleaseImage"
+- 复用现有的部署逻辑，不需要为每个组件编写降级代码
+- 通过重新应用旧版本的配置来实现回滚
+
+**执行流程**：
+1. ClusterVersion 验证回滚路径（v26.06 → v26.05）
+2. 拉取旧版本 ReleaseImage
+3. 设置 `cvo.openfuyao.cn/rollback-ready=v26.05` 注解
+4. BKECluster 控制器执行重新部署
+5. 复用部署逻辑，重新部署所有组件：
+   - deployAgent：部署旧版本 Agent
+   - deployContainerd：部署旧版本 Containerd
+   - deployEtcd：部署旧版本 etcd
+   - deployMaster：部署旧版本 Master 组件
+   - deployWorker：部署旧版本 Worker 组件
+6. 等待所有组件就绪
+7. 更新 ClusterVersion.status.currentVersion = v26.05
+8. ClusterStatus = `Ready`
+
+**核心代码示例**：
+```go
+// bkecluster_controller.go
+
+func (r *BKEClusterReconciler) executeRollback(
+    ctx context.Context,
+    bkeCluster *bkev1beta1.BKECluster,
+    targetVersion string,
+) (ctrl.Result, error) {
+    // 1. 解析旧版本 ReleaseImage
+    releaseBundle, err := r.resolveReleaseBundle(ctx, targetVersion)
+    if err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    // 2. 重新部署旧版本（复用部署逻辑）
+    if err := r.applyReleaseBundle(ctx, bkeCluster, releaseBundle); err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    // 3. 等待所有组件就绪
+    if err := r.waitForComponentsReady(ctx, bkeCluster); err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    // 4. 完成回滚
+    return r.completeRollback(ctx, bkeCluster, targetVersion)
+}
+
+// applyReleaseBundle 复用部署逻辑
+func (r *BKEClusterReconciler) applyReleaseBundle(
+    ctx context.Context,
+    bkeCluster *bkev1beta1.BKECluster,
+    releaseBundle *ReleaseBundle,
+) error {
+    // 1. 部署 Agent
+    if err := r.deployAgent(ctx, bkeCluster, releaseBundle.Agent); err != nil {
+        return err
+    }
+    
+    // 2. 部署 Containerd
+    if err := r.deployContainerd(ctx, bkeCluster, releaseBundle.Containerd); err != nil {
+        return err
+    }
+    
+    // 3. 部署 etcd
+    if err := r.deployEtcd(ctx, bkeCluster, releaseBundle.Etcd); err != nil {
+        return err
+    }
+    
+    // 4. 部署 Master 组件
+    if err := r.deployMaster(ctx, bkeCluster, releaseBundle.Master); err != nil {
+        return err
+    }
+    
+    // 5. 部署 Worker 组件
+    if err := r.deployWorker(ctx, bkeCluster, releaseBundle.Worker); err != nil {
+        return err
+    }
+    
+    return nil
+}
+```
+
+**优点**：
+- ✅ 实现简单，复用现有部署逻辑
+- ✅ 不需要为每个组件编写降级代码
+- ✅ 与升级流程对称，易于理解和维护
+- ✅ 实现工作量小，测试工作量小
+- ✅ 可以处理大部分回滚场景
+
+**缺点**：
+- ❌ 可能需要更长时间（需要重新部署所有组件）
+- ❌ 某些状态可能无法完全回滚（如 etcd 数据格式变更不可逆）
+- ❌ 需要确保旧版本的 ReleaseImage 可用
+- ❌ 某些组件可能不支持"重新部署"（如已经修改了用户配置）
+
+**适用场景**：
+- 组件版本间没有数据格式变更
+- 对回滚时间要求不严格
+- 希望快速实现回滚能力
+
+##### 方案对比与建议
+
+| 维度 | 方案一：降级 DAG | 方案二：重新部署 |
+|------|----------------|----------------|
+| **实现复杂度** | 高（需要为每个组件编写降级逻辑） | 低（复用部署逻辑） |
+| **实现工作量** | 大（预计 2-3 周） | 小（预计 1 周） |
+| **回滚时间** | 快（只降级需要降级的组件） | 慢（需要重新部署所有组件） |
+| **精确度** | 高（可以精确控制每个组件的降级） | 中（重新部署可能覆盖用户配置） |
+| **可靠性** | 中（降级逻辑需要充分测试） | 高（复用已验证的部署逻辑） |
+| **适用场景** | 组件版本间有数据格式变更 | 组件版本间没有数据格式变更 |
+| **维护成本** | 高（需要维护降级 DAG） | 低（与升级流程对称） |
+
+**推荐实施策略**：
+
+**阶段一（P0）**：实现方案二（重新部署）
+- 快速交付回滚能力
+- 覆盖大部分回滚场景
+- 实现工作量小，风险低
+
+**阶段二（P1）**：根据实际使用情况，决定是否实现方案一
+- 如果发现某些场景方案二无法满足（如 etcd 数据格式变更），再实现方案一
+- 方案一可以作为方案二的补充，处理特殊场景
 
 **回滚目标**：
 - 所有组件恢复到 v26.05 版本
