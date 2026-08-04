@@ -581,7 +581,7 @@ func (r *BKEClusterReconciler) applyReleaseBundle(
 集群安装过程中，某个阶段失败，导致集群无法完成初始化。
 
 **失败原因**：
-- Bootstrap 节点创建失败
+- Bootstrap 节点初始化失败
 - etcd 集群初始化失败
 - 控制面组件启动失败（API Server、Controller Manager、Scheduler）
 - 证书签发失败（CA 证书、服务证书）
@@ -596,7 +596,7 @@ func (r *BKEClusterReconciler) applyReleaseBundle(
 **回滚策略**：
 **不支持自动回滚**，原因：
 - 安装过程创建的基础设施（etcd、证书、网络）状态不可逆
-- 云资源（VM、网络、存储）已创建，无法简单回滚
+- 主机已安装组件和配置，无法简单回滚
 - 重建比回滚更快、更可靠
 
 **推荐处理方式**：
@@ -624,10 +624,10 @@ func (r *BKEClusterReconciler) applyReleaseBundle(
 | | 相关 ConfigMap | 自动级联删除 | 集群配置、证书配置等 |
 | | 相关 Secret | 自动级联删除 | 证书、密钥、Token 等 |
 | | 相关 Service | 自动级联删除 | API Server Service 等 |
-| **云资源** | VM/实例 | 通过云 API 删除 | Master 节点、Worker 节点 |
-| | 负载均衡器 | 通过云 API 删除 | API Server LB、Ingress LB |
-| | 存储卷 | 通过云 API 删除 | etcd 数据卷、日志卷等 |
-| | 网络资源 | 通过云 API 删除 | VPC、子网、安全组、弹性 IP |
+| **云资源（可选）** | VM/实例 | 通过云 API 删除 | 如果使用了云主机，可删除 |
+| | 负载均衡器 | 通过云 API 删除 | 如果创建了 LB，可删除 |
+| | 存储卷 | 通过云 API 删除 | 如果创建了云盘，可删除 |
+| | 网络资源 | 通过云 API 删除 | 如果创建了 VPC 等，可删除 |
 | **本地资源** | 证书文件 | `rm -rf /etc/bke/${CLUSTER_NAME}/pki/` | CA 证书、服务证书、密钥 |
 | | 配置文件 | `rm -rf /etc/bke/${CLUSTER_NAME}/config/` | kubelet 配置、containerd 配置等 |
 | | etcd 数据 | `rm -rf /var/lib/etcd/*` | etcd 数据目录 |
@@ -660,7 +660,7 @@ func (r *BKEClusterReconciler) applyReleaseBundle(
    ├─ 等待关联资源删除完成
    └─ 验证资源已删除
 
-4. 删除云资源
+4. 删除云资源（可选，如果使用了云资源）
    ├─ 删除 VM/实例
    ├─ 删除负载均衡器
    ├─ 删除存储卷
@@ -675,7 +675,7 @@ func (r *BKEClusterReconciler) applyReleaseBundle(
 
 6. 验证清理完成
    ├─ 检查 Kubernetes 资源是否已删除
-   ├─ 检查云资源是否已删除
+   ├─ 检查云资源是否已删除（可选）
    ├─ 检查本地文件是否已清理
    └─ 输出清理报告
 ```
@@ -697,7 +697,7 @@ kubectl delete bkecluster ${CLUSTER_NAME} -n bke-system --wait=true
 # 2. 删除节点资源
 kubectl delete bkenode --all -n bke-system --wait=true
 
-# 3. 删除云资源（根据实际环境）
+# 3. 删除云资源（可选，如果使用了云资源）
 # - 删除 VM/实例
 # - 删除负载均衡器
 # - 删除存储卷
