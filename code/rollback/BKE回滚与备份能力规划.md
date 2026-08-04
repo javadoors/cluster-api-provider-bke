@@ -275,7 +275,202 @@ BKE 采用双机制架构管理集群生命周期：
 
 ### 2.2 PhaseFlow 回滚设计
 
-#### 2.2.1 设计原则
+#### 2.2.1 设计思路
+
+##### 重试 vs 回滚的本质区别
+
+BKE 当前已实现完善的**重试机制**，但**回滚机制**是新增能力。理解两者的本质区别是设计回滚能力的前提：
+
+| 维度 | 重试（Retry） | 回滚（Rollback） |
+|------|--------------|-----------------|
+| **目标** | 重新尝试**同一个失败的操作** | **撤销**操作，返回到之前的稳定状态 |
+| **方向** | **向前** - 继续朝原始目标前进 | **向后** - 撤销变更，返回安全状态 |
+| **状态转换** | `*Failed → InProgress`（如 `ScaleFailed → WorkerScalingUp`） | `*Failed → Ready`（如 `ScaleFailed → Ready`） |
+| **数据/资源影响** | 保留部分进度（位标志、条件） | 丢弃部分进度，清理已创建资源 |
+| **适用场景** | 瞬时故障、外部依赖问题 | 根本性失败、状态不一致 |
+| **当前状态** | ✅ 已实现（三层重试架构） | ❌ 未实现（本提案设计） |
+
+##### BKE 三层重试架构
+
+BKE 当前已实现三层重试机制，理解这个架构有助于明确回滚的定位：
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  L1: controller-runtime workqueue rate limiter                      │
+│  ├─ 范围：单次 reconcile 错误                                       │
+│  ├─ 触发：自动（错误返回时）                                        │
+│  ├─ 次数：无限（FastSlowRateLimiter 退避）                          │
+│  └─ 目的：处理瞬时错误（网络抖动、API Server 短暂不可用）            │
+├─────────────────────────────────────────────────────────────────────┤
+│  L2: StatusManager 失败计数器                                       │
+│  ├─ 范围：BKECluster/BKENode 状态级别                               │
+│  ├─ 触发：自动（*Failed 状态）                                      │
+│  ├─ 次数：默认 10 次（ReconcileAllowedFailedCount）                 │
+│  ├─ 行为：状态伪装（显示正常状态）+ 自动重新入队                    │
+│  └─ 超限：设置 NodeFailedFlag，停止自动协调                         │
+├─────────────────────────────────────────────────────────────────────┤
+│  L3: Retry 注解（手动）                                             │
+│  ├─ 范围：失败节点级别                                              │
+│  ├─ 触发：手动（kubectl annotate bke.bocloud.com/retry=...）        │
+│  ├─ 动作：清除 NodeFailedFlag + 重置 StatusManager 缓存             │
+│  └─ 结果：Phase 重新评估 NeedExecute()，从检查点恢复                │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**重试的工作原理**：
+
+1. **Phase 幂等性设计**：每个 Phase 通过位标志（StateCode）、Kubernetes Conditions、资源存在性检查等机制实现幂等性
+2. **检查点恢复**：重试时跳过已完成的子步骤，只重新执行失败的子步骤及后续步骤
+3. **状态伪装**：前 10 次失败时，StatusManager 将 `*Failed` 状态伪装为上一个正常状态，对外表现为"仍在进行中"
+
+**示例**：`EnsureBKEAgent` Phase 通过 `NodeAgentPushedFlag` 位标志记录 Agent 推送状态：
+```go
+if node.StateCode&bkev1beta1.NodeAgentPushedFlag != 0 {
+    return false  // 已推送，跳过
+}
+```
+
+##### 回滚的定位：重试失败后的最后手段
+
+回滚不是重试的替代品，而是**重试失败后的最后手段**。决策流程如下：
+
+```
+操作失败
+  ↓
+L1 自动重试（瞬时故障）
+  ↓ 仍失败
+L2 自动重试（最多 10 次）
+  ↓ 仍失败
+L3 手动重试（修复根因后）
+  ↓ 仍失败
+回滚（放弃操作，返回安全状态）
+```
+
+**什么时候重试？**
+- 失败是**瞬时的**（网络超时、临时资源短缺）
+- 失败是**外部的**（SSH 连接失败、包下载错误）
+- 部分进度**有效且可复用**（etcd 已初始化、证书已生成）
+- 已经**修复了根本原因**（修复网络、释放磁盘空间、纠正配置）
+- 操作处于**早中期**，重新执行是安全的
+
+**什么时候回滚？**
+- 失败是**根本性的**（版本不兼容、配置错误）
+- 部分状态**不一致或损坏**（组件升级一半）
+- 需要**快速返回已知良好状态**
+- 重试多次仍然失败
+- 操作处于**后期**，部分进度不可用
+
+##### 回滚的核心原则
+
+1. **清理副作用**：回滚必须清理操作过程中创建的所有资源（节点、ConfigMap、Secret 等）
+2. **恢复一致状态**：回滚后集群必须处于一致状态，不能有残留的中间状态
+3. **幂等性**：回滚操作本身必须是幂等的，可以安全地重复执行
+4. **可观测性**：回滚过程必须有清晰的日志和事件记录，便于问题排查
+
+#### 2.2.2 回滚场景说明
+
+##### 场景 1：扩缩容失败回滚
+
+**失败原因分析**：
+- 云资源创建失败（VM、网络、存储）
+- 节点初始化失败（kubelet 启动失败、证书签发失败）
+- 节点加入集群失败（CSR 审批失败、网络不通）
+- MachineDeployment 更新失败（副本数不一致）
+
+**重试策略（先尝试修复并重试）**：
+1. 诊断失败原因（查看节点状态、事件日志）
+2. 修复根因（修复网络、释放资源、纠正配置）
+3. 使用 `bke.bocloud.com/retry` 注解触发重试
+4. Phase 从检查点恢复，重新执行失败的子步骤
+
+**回滚策略（重试失败后）**：
+1. 触发回滚（`bke.bocloud.com/rollback=true` 注解）
+2. 状态机执行回滚转换：`ScaleFailed → Ready`
+3. 执行清理动作：
+   - **扩容失败**：删除未就绪的节点、清理相关 ConfigMap/Secret、恢复 MachineDeployment 副本数
+   - **缩容失败**：恢复 MachineDeployment 副本数、重新加入节点
+4. 清除回滚注解
+5. 集群恢复到 Ready 状态
+
+**状态转换**：
+```
+ClusterScaleFailed → ClusterReady
+  Trigger: "Rollback"
+  Condition: isScaleRollbackComplete
+  Action: cleanupFailedScaleResources
+```
+
+**预计恢复时间**：5-15 分钟
+
+##### 场景 2：配置变更失败回滚
+
+**失败原因分析**：
+- 配置验证失败（参数不合法、冲突的配置）
+- 配置应用失败（ConfigMap/Secret 创建失败）
+- 组件重启失败（配置变更后组件无法启动）
+- 网络配置失败（Service、Ingress 配置错误）
+
+**重试策略**：
+1. 诊断失败原因（查看配置差异、组件日志）
+2. 修复配置错误
+3. 使用 `bke.bocloud.com/retry` 注解触发重试
+4. Phase 从检查点恢复，重新应用配置
+
+**回滚策略**：
+1. 触发回滚（`bke.bocloud.com/rollback=true` 注解）
+2. 状态机执行回滚转换：`ManageFailed → Ready`
+3. 执行配置恢复动作：
+   - 从备份恢复配置文件
+   - 删除错误的 ConfigMap/Secret
+   - 重启受影响的组件
+4. 清除回滚注解
+5. 集群恢复到 Ready 状态
+
+**状态转换**：
+```
+ClusterManageFailed → ClusterReady
+  Trigger: "Rollback"
+  Condition: isManageRollbackComplete
+  Action: restorePreviousConfig
+```
+
+**预计恢复时间**：3-10 分钟
+
+##### 场景 3：删除失败回滚
+
+**失败原因分析**：
+- Pod 驱逐超时（PDB 阻止驱逐、Pod 无法终止）
+- PVC 删除失败（仍有 Pod 在使用）
+- 云资源删除失败（API 调用失败、资源被锁定）
+- 网络清理失败（负载均衡器删除失败）
+
+**重试策略**：
+1. 诊断失败原因（查看 Pod 状态、PVC 使用情况）
+2. 手动清理阻塞资源（删除 Pod、解除 PVC 绑定）
+3. 使用 `bke.bocloud.com/retry` 注解触发重试
+4. Phase 从检查点恢复，继续删除操作
+
+**回滚策略**：
+1. 触发回滚（`bke.bocloud.com/rollback=true` 注解）
+2. 状态机执行回滚转换：`DeleteFailed → Ready`
+3. 执行重试删除动作：
+   - 强制删除阻塞的 Pod
+   - 重试删除云资源
+   - 清理残留资源
+4. 清除回滚注解
+5. 集群恢复到 Ready 状态（删除操作完成）
+
+**状态转换**：
+```
+ClusterDeleteFailed → ClusterReady
+  Trigger: "Rollback"
+  Condition: isDeleteRollbackComplete
+  Action: retryDeleteOperation
+```
+
+**预计恢复时间**：5-15 分钟
+
+#### 2.2.3 回滚状态转换规则
 
 **基于现有状态机引擎设计回滚规则**
 
@@ -286,8 +481,6 @@ PhaseFlow 已集成状态机引擎（`statemachine.Engine`），当前支持的�
 
 **需要新增**：
 - `TriggerRollback`：回滚操作触发器
-
-#### 2.2.2 回滚状态转换规则
 
 ```go
 // 需要新增的回滚转换规则
@@ -321,7 +514,7 @@ func registerRollbackTransitions(e *statemachine.Engine) {
 }
 ```
 
-#### 2.2.3 回滚触发机制
+#### 2.2.4 回滚触发机制
 
 **方案一：手动触发（推荐）**
 
@@ -343,7 +536,7 @@ if sr.StatusCount >= maxRetryCount {
 }
 ```
 
-#### 2.2.4 回滚执行流程
+#### 2.2.5 回滚执行流程
 
 ```
 PhaseFlow 回滚流程（以扩缩容失败为例）：
@@ -352,22 +545,27 @@ PhaseFlow 回滚流程（以扩缩容失败为例）：
    └─ ClusterStatus: WorkerScalingUp → ScaleFailed
    └─ PhaseStatus[WorkerScalingUp] = PhaseFailed
 
-2. 触发回滚
-   └─ 用户执行：bkectl rollback cluster my-cluster
-   └─ 或自动触发：重试次数超限
+2. 尝试重试（L1/L2/L3）
+   └─ 自动重试 10 次（L2）
+   └─ 手动重试（L3，修复根因后）
+   └─ 重试仍然失败
 
-3. PhaseFlow 检测回滚注解
+3. 触发回滚
+   └─ 用户执行：bkectl rollback cluster my-cluster
+   └─ 或自动触发：重试次数超限且无法修复
+
+4. PhaseFlow 检测回滚注解
    └─ 检测到 bke.bocloud.com/rollback=true
    └─ 调用状态机引擎：engine.Transition(cluster, "Rollback", nil)
 
-4. 状态机执行回滚转换
+5. 状态机执行回滚转换
    └─ ScaleFailed → Ready
    └─ 执行 Action：cleanupFailedScaleResources
       ├─ 删除未就绪的 Worker 节点
       ├─ 清理相关 ConfigMap/Secret
       └─ 恢复节点池配置
 
-5. 清除回滚注解
+6. 清除回滚注解
    └─ 删除 bke.bocloud.com/rollback 注解
    └─ 集群恢复到 Ready 状态
 ```
