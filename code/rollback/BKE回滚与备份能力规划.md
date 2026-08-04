@@ -1,35 +1,33 @@
-# BKE 回滚与备份能力规划
+# BKE 回滚与备份能力设计提案
 
-## 一、概述
+## 一、现状分析
 
-本规划基于 OpenShift 集群的回滚和备份能力设计，结合 BKE 状态机架构特点，制定适合 BKE 的回滚和备份能力方案。
+### 1.1 当前回滚能力现状
 
-### 1.1 设计目标
+**关键发现：BKE 当前没有任何自动化回滚能力**
 
-| 目标 | 说明 | 优先级 |
-|------|------|--------|
-| **安装失败处理** | 安装失败时支持清理和重建 | P0 |
-| **升级回滚能力** | 升级失败时支持自动/手动回滚 | P0 |
-| **扩缩容回滚** | 扩缩容失败时支持回滚到原状态 | P1 |
-| **配置备份** | 集群配置、证书、etcd 数据备份 | P0 |
-| **灾难恢复** | 支持从备份恢复集群 | P1 |
+通过对 BKE 代码库的深入分析，发现：
 
-### 1.2 与 OpenShift 的差异
+| 机制 | 回滚能力 | 失败处理方式 |
+|------|---------|-------------|
+| **PhaseFlow** | ❌ 无 | 设置 `*Failed` 状态，需人工介入 |
+| **ClusterVersion** | ❌ 无 | 设置 `Failed` 状态，需人工介入 |
+| **声明式 DAG** | ❌ 无 | 记录错误到 `DeclarativeUpgrade.LastError`，需人工介入 |
 
-| 维度 | OpenShift | BKE | 说明 |
-|------|-----------|-----|------|
-| **状态管理** | ClusterVersion CRD | ClusterStatus 字段 | BKE 使用状态机管理 |
-| **回滚触发** | spec vs status 对比 | 状态转换引擎 | BKE 使用 Engine 驱动 |
-| **失败记录** | RolledBack 状态 | LastInProgressState | BKE 记录失败前状态 |
-| **重试机制** | CVO 调谐循环 | StatusManagerV2 | BKE 集中管理重试 |
+**PhaseFlow 失败处理**：
+- 当 Phase 执行失败时，设置 `PhaseStatus = PhaseFailed`
+- 设置 `ClusterStatus = *Failed`（如 `ClusterUpgradeFailed`）
+- 执行停止，返回错误
+- **唯一恢复手段**：通过 `bke.bocloud.com/retry` 注解触发重试
 
----
+**ClusterVersion 失败处理**：
+- 升级路径验证失败：设置 `Phase = PreCheckFailed`
+- ReleaseImage 拉取失败：设置 `Phase = PreCheckFailed`
+- **没有回滚机制**：`ClusterUpgradeRecord.RolledBack` 状态已定义但从未使用
 
-## 二、回滚能力规划
+### 1.2 BKE 双机制架构
 
-BKE 采用双机制架构：**PhaseFlow**（阶段流）和 **ClusterVersion**（版本管理），回滚能力需要基于这两套机制分别设计。
-
-### 2.1 双机制架构概述
+BKE 采用双机制架构管理集群生命周期：
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -38,76 +36,107 @@ BKE 采用双机制架构：**PhaseFlow**（阶段流）和 **ClusterVersion**�
 
 ┌─────────────────────────────────────────────────────────────┐
 │  机制一：PhaseFlow（阶段流）                                  │
-│  ├─ 适用场景：安装、扩缩容、删除、配置变更                      │
+│  ├─ 职责：操作类任务（安装、扩缩容、删除、纳管、Addon部署）     │
 │  ├─ 核心组件：PhaseFlow、Phase、PhaseContext                  │
 │  ├─ 状态管理：ClusterStatus 字段（状态机）                    │
 │  ├─ 执行逻辑：NeedExecute() → Execute() → ReportStatus()    │
-│  └─ 回滚策略：状态机回滚 + Phase 重试                         │
+│  └─ 失败处理：设置 *Failed 状态，需人工介入                   │
 └─────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────┐
 │  机制二：ClusterVersion（版本管理）                           │
-│  ├─ 适用场景：集群升级、版本回滚                              │
-│  ├─ 核心组件：ClusterVersion CRD、UpgradeHistory            │
-│  ├─ 状态管理：ClusterVersion.status（版本状态）              │
-│  ├─ 执行逻辑：声明式 DAG → 逐跳升级 → 状态同步              │
-│  └─ 回滚策略：版本回滚 + 历史记录恢复                         │
+│  ├─ 职责：版本生命周期管理（路径验证、镜像管理）               │
+│  ├─ 核心组件：ClusterVersion CRD、UpgradePath CRD           │
+│  ├─ 状态管理：ClusterVersion.status.phase                   │
+│  ├─ 执行逻辑：验证路径 → 拉取镜像 → 设置 upgrade-ready 注解 │
+│  └─ 失败处理：设置 PreCheckFailed，需人工介入               │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│  执行器：声明式 DAG（升级执行）                               │
+│  ├─ 职责：执行升级/降级操作                                   │
+│  ├─ 触发条件：检测到 upgrade-ready 注解                       │
+│  ├─ 执行逻辑：构建 DAG → 拓扑排序 → 逐组件执行              │
+│  └─ 失败处理：记录错误，需人工介入                           │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 2.2 PhaseFlow 回滚能力
+### 1.3 升级流程中的职责分工
 
-#### 2.2.1 PhaseFlow 回滚机制
+```
+升级流程：
 
-PhaseFlow 通过状态机管理集群状态，回滚基于以下机制：
+1. 用户设置 ClusterVersion.spec.desiredVersion
 
-```go
-// PhaseFlow 回滚核心设计
-type PhaseFlowRollback struct {
-    engine        *statemachine.Engine
-    statusManager *StatusManagerV2
-    phaseHistory  []PhaseExecutionRecord
-}
+2. ClusterVersion Controller：
+   ├─ 验证升级路径（UpgradePath CRD）
+   ├─ 拉取 ReleaseImage（OCI 镜像）
+   ├─ 设置注解：cvo.openfuyao.cn/upgrade-ready=<hop-target>
+   └─ 不负责执行升级
 
-// 触发 PhaseFlow 回滚
-func (r *PhaseFlowRollback) TriggerRollback(cluster *BKECluster) error {
-    // 1. 获取失败前的状态（LastInProgressState）
-    lastState := cluster.Status.LastInProgressState
-    if lastState == "" {
-        return fmt.Errorf("no rollback target found")
-    }
-    
-    // 2. 通过状态机引擎回滚到上一状态
-    return r.engine.Transition(
-        cluster,
-        nil,
-        TriggerRollback,
-        nil,
-    )
-}
+3. BKECluster Controller 检测到注解：
+   ├─ shouldUseDeclarativeUpgrade() 返回 true
+   └─ executeUpgradeDAG() 执行声明式 DAG
+
+4. 声明式 DAG 执行升级：
+   ├─ EnsurePreUpgradeResources
+   ├─ EnsureAgentUpgrade
+   ├─ EnsureContainerdUpgrade
+   ├─ EnsureEtcdUpgrade
+   ├─ EnsureMasterUpgrade
+   └─ EnsureWorkerUpgrade
+
+5. 升级完成：
+   ├─ 清除 upgrade-ready 注解
+   ├─ 更新 ClusterVersion.status（CompleteUpgradeHop）
+   └─ PhaseFlow 跳过已完成的升级 Phase
 ```
 
-#### 2.2.2 PhaseFlow 回滚场景
+**关键洞察**：
+- ClusterVersion **不负责执行升级**，只负责验证和准备
+- 实际升级由 **声明式 DAG** 执行
+- PhaseFlow 在声明式升级期间被跳过
 
-| 场景 | 当前状态 | 回滚目标 | 回滚机制 |
-|------|---------|---------|---------|
-| **安装失败** | Initializing/InitializationFailed | 清理并重建 | 不支持自动回滚 |
-| **扩容失败** | WorkerScalingUp/ScaleFailed | Ready | 状态机回滚 + 节点清理 |
-| **缩容失败** | WorkerScalingDown/ScaleFailed | Ready | 状态机回滚 + 节点恢复 |
-| **删除失败** | Deleting/DeleteFailed | Ready | 状态机回滚 + 重试删除 |
-| **配置变更失败** | Managing/ManageFailed | Ready | 状态机回滚 + 配置恢复 |
+---
 
-#### 2.2.3 PhaseFlow 回滚状态转换
+## 二、回滚能力设计提案
+
+### 2.1 设计目标
+
+为 BKE 构建完整的回滚能力，覆盖以下场景：
+
+| 场景 | 优先级 | 回滚策略 |
+|------|--------|---------|
+| **升级失败** | P0 | 版本回滚（降级） |
+| **扩缩容失败** | P1 | 状态回滚 + 资源清理 |
+| **配置变更失败** | P1 | 配置回滚 |
+| **安装失败** | P0 | 清理重建（状态不可逆） |
+
+### 2.2 PhaseFlow 回滚设计
+
+#### 2.2.1 设计原则
+
+**基于现有状态机引擎设计回滚规则**
+
+PhaseFlow 已集成状态机引擎（`statemachine.Engine`），当前支持的触发器：
+- `TriggerPhaseComplete`：Phase 执行成功
+- `TriggerError`：Phase 执行失败
+- `TriggerRetry`：重试操作
+
+**需要新增**：
+- `TriggerRollback`：回滚操作触发器
+
+#### 2.2.2 回滚状态转换规则
 
 ```go
-// PhaseFlow 回滚转换规则
-func registerPhaseFlowRollbackTransitions(e *statemachine.Engine) {
+// 需要新增的回滚转换规则
+func registerRollbackTransitions(e *statemachine.Engine) {
     // ScaleFailed → Ready（扩缩容回滚）
     e.AddTransition(statemachine.Transition{
         FromState: bkev1beta1.ClusterScaleFailed,
         ToState:   bkev1beta1.ClusterReady,
-        Trigger:   statemachine.TriggerRollback,
-        Condition: statemachine.IsScaleRollbackComplete,
+        Trigger:   "Rollback",
+        Condition: isScaleRollbackComplete,
         Action:    cleanupFailedScaleResources,
     })
     
@@ -115,8 +144,8 @@ func registerPhaseFlowRollbackTransitions(e *statemachine.Engine) {
     e.AddTransition(statemachine.Transition{
         FromState: bkev1beta1.ClusterManageFailed,
         ToState:   bkev1beta1.ClusterReady,
-        Trigger:   statemachine.TriggerRollback,
-        Condition: statemachine.IsManageRollbackComplete,
+        Trigger:   "Rollback",
+        Condition: isManageRollbackComplete,
         Action:    restorePreviousConfig,
     })
     
@@ -124,337 +153,208 @@ func registerPhaseFlowRollbackTransitions(e *statemachine.Engine) {
     e.AddTransition(statemachine.Transition{
         FromState: bkev1beta1.ClusterDeleteFailed,
         ToState:   bkev1beta1.ClusterReady,
-        Trigger:   statemachine.TriggerRollback,
-        Condition: statemachine.IsDeleteRollbackComplete,
+        Trigger:   "Rollback",
+        Condition: isDeleteRollbackComplete,
         Action:    retryDeleteOperation,
     })
 }
 ```
 
-#### 2.2.4 PhaseFlow 回滚流程
+#### 2.2.3 回滚触发机制
+
+**方案一：手动触发（推荐）**
+
+```bash
+# 用户通过 CLI 触发回滚
+bkectl rollback cluster my-cluster
+
+# 实现：设置 BKECluster 注解
+kubectl annotate bkecluster my-cluster bke.bocloud.com/rollback=true
+```
+
+**方案二：自动触发**
+
+```go
+// 在 StatusManagerV2 中检测重试次数超限
+if sr.StatusCount >= maxRetryCount {
+    // 自动触发回滚
+    setRollbackAnnotation(cluster)
+}
+```
+
+#### 2.2.4 回滚执行流程
 
 ```
-PhaseFlow 回滚流程（以扩容失败为例）：
+PhaseFlow 回滚流程（以扩缩容失败为例）：
 
-1. 检测到扩容失败
+1. 检测到扩缩容失败
    └─ ClusterStatus: WorkerScalingUp → ScaleFailed
-   └─ LastInProgressState: WorkerScalingUp
-   └─ Phase 执行记录：PhaseStatus[WorkerScalingUp] = Failed
+   └─ PhaseStatus[WorkerScalingUp] = PhaseFailed
 
 2. 触发回滚
    └─ 用户执行：bkectl rollback cluster my-cluster
-   └─ 或自动触发：StatusManager 检测到重试次数超限
+   └─ 或自动触发：重试次数超限
 
-3. 状态机回滚
-   └─ ClusterStatus: ScaleFailed → Ready
-   └─ LastInProgressState: 清空
+3. PhaseFlow 检测回滚注解
+   └─ 检测到 bke.bocloud.com/rollback=true
+   └─ 调用状态机引擎：engine.Transition(cluster, "Rollback", nil)
 
-4. 清理失败资源
-   └─ 删除未就绪的 Worker 节点
-   └─ 清理相关 ConfigMap/Secret
-   └─ 恢复节点池配置
+4. 状态机执行回滚转换
+   └─ ScaleFailed → Ready
+   └─ 执行 Action：cleanupFailedScaleResources
+      ├─ 删除未就绪的 Worker 节点
+      ├─ 清理相关 ConfigMap/Secret
+      └─ 恢复节点池配置
 
-5. 验证回滚成功
-   └─ 检查集群状态：Ready
-   └─ 检查节点数量：符合期望
-   └─ 检查应用健康：正常运行
+5. 清除回滚注解
+   └─ 删除 bke.bocloud.com/rollback 注解
+   └─ 集群恢复到 Ready 状态
 ```
 
-#### 2.2.5 PhaseFlow 回滚数据结构
+### 2.3 ClusterVersion 回滚设计
 
-```go
-// Phase 执行记录
-type PhaseExecutionRecord struct {
-    // Phase 名称
-    PhaseName string `json:"phaseName"`
-    
-    // 执行开始时间
-    StartedAt *metav1.Time `json:"startedAt"`
-    
-    // 执行完成时间
-    CompletedAt *metav1.Time `json:"completedAt,omitempty"`
-    
-    // 执行结果
-    Result PhaseResult `json:"result"`
-    
-    // 失败原因
-    FailureReason string `json:"failureReason,omitempty"`
-    
-    // 重试次数
-    RetryCount int `json:"retryCount"`
-}
+#### 2.3.1 设计原则
 
-type PhaseResult string
+**ClusterVersion 不负责执行回滚，只负责触发**
 
-const (
-    PhaseResultPending    PhaseResult = "Pending"
-    PhaseResultRunning    PhaseResult = "Running"
-    PhaseResultCompleted  PhaseResult = "Completed"
-    PhaseResultFailed     PhaseResult = "Failed"
-    PhaseResultRolledBack PhaseResult = "RolledBack"
-)
+- ClusterVersion 验证回滚路径（类似升级路径验证）
+- 设置 `cvo.openfuyao.cn/rollback-ready` 注解
+- 由 BKECluster 控制器执行降级 DAG
 
-// BKECluster Status 扩展
-type BKEClusterStatus struct {
-    // ... 现有字段 ...
-    
-    // Phase 执行历史（最多保留 20 条）
-    PhaseHistory []PhaseExecutionRecord `json:"phaseHistory,omitempty"`
-    
-    // 回滚历史
-    RollbackHistory []RollbackRecord `json:"rollbackHistory,omitempty"`
-}
-```
-
-### 2.3 ClusterVersion 回滚能力
-
-#### 2.3.1 ClusterVersion 回滚机制
-
-ClusterVersion 通过版本历史管理升级记录，回滚基于以下机制：
-
-```go
-// ClusterVersion 回滚核心设计
-type ClusterVersionRollback struct {
-    client client.Client
-}
-
-// 触发 ClusterVersion 回滚
-func (r *ClusterVersionRollback) TriggerRollback(
-    ctx context.Context,
-    cv *cvv1alpha1.ClusterVersion,
-    targetVersion string,
-) error {
-    // 1. 验证目标版本在升级历史中
-    if !r.isVersionInHistory(cv, targetVersion) {
-        return fmt.Errorf("target version %s not in upgrade history", targetVersion)
-    }
-    
-    // 2. 设置回滚目标
-    orig := cv.DeepCopy()
-    cv.Spec.DesiredVersion = targetVersion
-    cv.Status.Phase = cvv1alpha1.ClusterVersionPhaseRollingBack
-    
-    // 3. 记录回滚历史
-    now := metav1.Now()
-    cv.Status.UpgradeHistory = append(cv.Status.UpgradeHistory, cvv1alpha1.ClusterUpgradeRecord{
-        From:        cv.Status.CurrentVersion,
-        To:          targetVersion,
-        StartedAt:   &now,
-        Status:      cvv1alpha1.ClusterUpgradeRecordStatusRollingBack,
-    })
-    
-    // 4. 更新 ClusterVersion
-    return r.client.Status().Patch(ctx, cv, client.MergeFrom(orig))
-}
-```
-
-#### 2.3.2 ClusterVersion 回滚场景
-
-| 场景 | 当前版本 | 回滚目标 | 回滚机制 |
-|------|---------|---------|---------|
-| **升级失败** | v26.06 | v26.05 | 版本回滚 + 组件降级 |
-| **升级后发现问题** | v26.06 | v26.05 | 版本回滚 + 数据迁移 |
-| **跨版本回滚** | v26.07 | v26.05 | 逐跳回滚（v26.07→v26.06→v26.05） |
-
-#### 2.3.3 ClusterVersion 回滚流程
+#### 2.3.2 回滚触发流程
 
 ```
 ClusterVersion 回滚流程：
 
-1. 检测到升级失败
-   └─ ClusterVersion.status.phase: Upgrading → Failed
-   └─ ClusterVersion.status.currentVersion: v26.05
-   └─ ClusterVersion.spec.desiredVersion: v26.06
+1. 用户设置回滚目标
+   └─ kubectl patch clusterversion --type merge \
+       -p '{"spec":{"desiredVersion":"v26.05"}}'
 
-2. 触发回滚
-   └─ 用户执行：bkectl rollback cluster my-cluster --to v26.05
-   └─ 或自动触发：升级超时/健康检查失败
+2. ClusterVersion Controller：
+   ├─ 验证回滚路径（v26.06 → v26.05）
+   ├─ 拉取旧版本 ReleaseImage
+   ├─ 设置注解：cvo.openfuyao.cn/rollback-ready=v26.05
+   └─ Phase → RollingBack
 
-3. 版本回滚
-   └─ ClusterVersion.spec.desiredVersion: v26.06 → v26.05
-   └─ ClusterVersion.status.phase: Failed → RollingBack
-   └─ 记录回滚历史：UpgradeHistory = [..., {From: v26.06, To: v26.05, Status: RollingBack}]
+3. BKECluster Controller 检测到注解：
+   ├─ shouldUseDeclarativeRollback() 返回 true
+   └─ executeRollbackDAG() 执行降级 DAG
 
-4. 执行回滚
-   └─ 降级控制面组件到 v26.05
-   └─ 降级 Operator 到 v26.05
-   └─ 降级节点配置到 v26.05
-   └─ 数据迁移（如需要）
+4. 降级 DAG 执行：
+   ├─ EnsureWorkerDowngrade
+   ├─ EnsureMasterDowngrade
+   ├─ EnsureEtcdDowngrade
+   ├─ EnsureContainerdDowngrade
+   └─ EnsureAgentDowngrade
 
-5. 完成回滚
-   └─ ClusterVersion.status.currentVersion: v26.05
-   └─ ClusterVersion.status.phase: RollingBack → Ready
-   └─ 更新回滚历史：Status: Succeeded
+5. 降级完成：
+   ├─ 清除 rollback-ready 注解
+   ├─ 更新 ClusterVersion.status
+   │   ├─ CurrentVersion: v26.05
+   │   ├─ Phase: Ready
+   │   └─ UpgradeHistory: append({From: v26.06, To: v26.05, Status: RolledBack})
+   └─ ClusterStatus: Ready
 ```
 
-#### 2.3.4 ClusterVersion 回滚数据结构
+#### 2.3.3 降级 DAG 设计
+
+**参考升级 DAG 设计降级 DAG**
 
 ```go
-// ClusterVersion 升级记录
-type ClusterUpgradeRecord struct {
-    // 升级前版本
-    From string `json:"from"`
-    
-    // 升级后版本
-    To string `json:"to"`
-    
-    // 开始时间
-    StartedAt *metav1.Time `json:"startedAt,omitempty"`
-    
-    // 完成时间
-    CompletedAt *metav1.Time `json:"completedAt,omitempty"`
-    
-    // 升级状态
-    Status ClusterUpgradeRecordStatus `json:"status"`
-    
-    // 失败原因
-    FailureReason string `json:"failureReason,omitempty"`
-}
+// bkecluster_rollback_dag.go
 
-type ClusterUpgradeRecordStatus string
-
-const (
-    ClusterUpgradeRecordStatusSucceeded   ClusterUpgradeRecordStatus = "Succeeded"
-    ClusterUpgradeRecordStatusFailed      ClusterUpgradeRecordStatus = "Failed"
-    ClusterUpgradeRecordStatusRollingBack ClusterUpgradeRecordStatus = "RollingBack"
-    ClusterUpgradeRecordStatusRolledBack  ClusterUpgradeRecordStatus = "RolledBack"
-)
-
-// ClusterVersion Status
-type ClusterVersionStatus struct {
-    // 当前版本
-    CurrentVersion string `json:"currentVersion"`
-    
-    // 集群阶段
-    Phase ClusterVersionPhase `json:"phase"`
-    
-    // 升级历史
-    UpgradeHistory []ClusterUpgradeRecord `json:"upgradeHistory,omitempty"`
-    
-    // 条件
-    Conditions []metav1.Condition `json:"conditions,omitempty"`
-}
-```
-
-#### 2.3.5 ClusterVersion 回滚验证
-
-```go
-// 验证回滚目标版本
-func (r *ClusterVersionRollback) ValidateRollbackTarget(
-    cv *cvv1alpha1.ClusterVersion,
+func (r *BKEClusterReconciler) executeRollbackDAG(
+    ctx context.Context,
+    bkeCluster *bkev1beta1.BKECluster,
     targetVersion string,
-) error {
-    // 1. 检查目标版本是否在升级历史中
-    if !r.isVersionInHistory(cv, targetVersion) {
-        return fmt.Errorf("target version %s not in upgrade history", targetVersion)
+) (ctrl.Result, error) {
+    // 1. 解析 ReleaseImage
+    releaseBundle, err := r.resolveReleaseBundle(ctx, targetVersion)
+    if err != nil {
+        return ctrl.Result{}, err
     }
     
-    // 2. 检查目标版本镜像是否可用
-    if !r.isImageAvailable(targetVersion) {
-        return fmt.Errorf("target version image not available")
+    // 2. 构建降级 DAG（与升级 DAG 顺序相反）
+    dag := r.buildRollbackDAG(releaseBundle)
+    
+    // 3. 执行降级 DAG
+    if err := r.executeDAG(ctx, bkeCluster, dag); err != nil {
+        // 记录错误
+        bkeCluster.Status.DeclarativeUpgrade.LastError = err.Error()
+        return ctrl.Result{}, err
     }
     
-    // 3. 检查回滚路径是否支持
-    if !r.isRollbackPathSupported(cv.Status.CurrentVersion, targetVersion) {
-        return fmt.Errorf("rollback path not supported")
-    }
-    
-    return nil
-}
-
-// 检查版本是否在历史中
-func (r *ClusterVersionRollback) isVersionInHistory(
-    cv *cvv1alpha1.ClusterVersion,
-    version string,
-) bool {
-    for _, record := range cv.Status.UpgradeHistory {
-        if record.To == version && record.Status == ClusterUpgradeRecordStatusSucceeded {
-            return true
-        }
-    }
-    return false
+    // 4. 完成降级
+    return r.completeDeclarativeRollback(ctx, bkeCluster, targetVersion)
 }
 ```
 
-### 2.4 双机制协同回滚
+### 2.4 双机制协同设计
 
-#### 2.4.1 协同回滚场景
+#### 2.4.1 职责划分
 
-某些场景需要 PhaseFlow 和 ClusterVersion 协同回滚：
-
-| 场景 | PhaseFlow 回滚 | ClusterVersion 回滚 | 协同策略 |
+| 场景 | PhaseFlow 职责 | ClusterVersion 职责 | DAG 职责 |
 |------|---------------|---------------------|---------|
-| **升级后扩缩容失败** | ScaleFailed → Ready | 保持当前版本 | 仅 PhaseFlow 回滚 |
-| **升级失败** | 保持当前状态 | v26.06 → v26.05 | 仅 ClusterVersion 回滚 |
-| **升级后配置变更失败** | ManageFailed → Ready | 保持当前版本 | 仅 PhaseFlow 回滚 |
-| **升级后删除失败** | DeleteFailed → Ready | 保持当前版本 | 仅 PhaseFlow 回滚 |
+| **升级失败** | 保持当前状态 | 验证回滚路径，设置注解 | 执行降级 DAG |
+| **扩缩容失败** | 执行回滚，清理资源 | 不参与 | 不参与 |
+| **配置变更失败** | 执行回滚，恢复配置 | 不参与 | 不参与 |
+| **安装失败** | 清理重建 | 不参与 | 不参与 |
 
-#### 2.4.2 协同回滚流程
+#### 2.4.2 协同回滚场景
+
+**场景：升级后扩缩容失败**
 
 ```
-协同回滚流程（升级后扩缩容失败）：
-
 1. 升级到 v26.06 成功
    └─ ClusterVersion.status.currentVersion: v26.06
-   └─ ClusterVersion.status.phase: Ready
    └─ ClusterStatus: Ready
 
 2. 扩容 Worker 节点失败
    └─ ClusterStatus: Ready → WorkerScalingUp → ScaleFailed
-   └─ LastInProgressState: WorkerScalingUp
 
-3. 触发 PhaseFlow 回滚
-   └─ ClusterStatus: ScaleFailed → Ready
+3. 用户决定回滚扩缩容（不回滚版本）
+   └─ bkectl rollback cluster my-cluster --phase-only
+   └─ 仅触发 PhaseFlow 回滚
+
+4. PhaseFlow 执行回滚
+   └─ ScaleFailed → Ready
    └─ 清理失败的 Worker 节点
    └─ ClusterVersion 保持不变（v26.06）
 
-4. 验证回滚成功
+5. 集群恢复到 Ready 状态
    └─ ClusterStatus: Ready
    └─ ClusterVersion.status.currentVersion: v26.06
-   └─ 集群正常运行
 ```
 
-#### 2.4.3 协同回滚决策树
+**场景：升级失败需要回滚版本**
 
 ```
-回滚决策树：
+1. 升级到 v26.06 失败
+   └─ ClusterVersion.status.phase: Failed
+   └─ ClusterStatus: ClusterUpgradeFailed
 
-┌─ 检测到失败
-│
-├─ 失败类型？
-│  │
-│  ├─ 升级失败（ClusterVersion.phase = Failed）
-│  │  └─ 触发 ClusterVersion 回滚
-│  │     └─ 回滚到上一版本
-│  │
-│  ├─ PhaseFlow 失败（ClusterStatus = *Failed）
-│  │  │
-│  │  ├─ 安装失败（InitializationFailed）
-│  │  │  └─ 清理并重建（不支持自动回滚）
-│  │  │
-│  │  ├─ 扩缩容失败（ScaleFailed）
-│  │  │  └─ 触发 PhaseFlow 回滚
-│  │  │     └─ 回滚到 Ready 状态
-│  │  │
-│  │  ├─ 配置变更失败（ManageFailed）
-│  │  │  └─ 触发 PhaseFlow 回滚
-│  │  │     └─ 恢复上一配置
-│  │  │
-│  │  └─ 删除失败（DeleteFailed）
-│  │     └─ 触发 PhaseFlow 回滚
-│  │        └─ 重试删除操作
-│  │
-│  └─ 未知失败
-│     └─ 人工介入
-│
-└─ 验证回滚成功
+2. 用户决定回滚到 v26.05
+   └─ kubectl patch clusterversion --type merge \
+       -p '{"spec":{"desiredVersion":"v26.05"}}'
+
+3. ClusterVersion 验证回滚路径
+   └─ 验证 v26.06 → v26.05 路径
+   └─ 设置 rollback-ready 注解
+
+4. BKECluster 执行降级 DAG
+   └─ 降级所有组件到 v26.05
+   └─ 更新 ClusterVersion.status
+
+5. 集群恢复到 v26.05
+   └─ ClusterVersion.status.currentVersion: v26.05
+   └─ ClusterStatus: Ready
 ```
 
-### 2.5 安装回滚能力
+### 2.5 安装失败处理
 
 #### 2.5.1 设计原则
 
-**关键洞察**：BKE 安装过程**不支持自动回滚**，与 OpenShift 一致。
+**安装过程不支持自动回滚，与 OpenShift 一致**
 
 | 因素 | 说明 |
 |------|------|
@@ -939,21 +839,23 @@ kubectl get pods --all-namespaces
 | 配置备份 | 3 天 | P0 | 实现集群配置备份 |
 | 安装失败清理 | 5 天 | P0 | 实现安装失败清理脚本 |
 
-### 5.2 阶段二：升级回滚（P0）
+### 5.2 阶段二：PhaseFlow 回滚（P0）
 
 | 任务 | 工作量 | 优先级 | 说明 |
 |------|--------|--------|------|
-| 升级历史数据结构 | 5 天 | P0 | 实现 UpgradeHistory 结构 |
-| 自动回滚触发 | 8 天 | P0 | 实现自动回滚检测和触发 |
-| 手动回滚命令 | 5 天 | P0 | 实现手动回滚 CLI 命令 |
-| 回滚状态转换 | 5 天 | P0 | 实现回滚相关的状态转换规则 |
+| 回滚触发机制 | 5 天 | P0 | 实现手动/自动触发回滚 |
+| 回滚状态转换规则 | 8 天 | P0 | 实现 *Failed → Ready 转换 |
+| 资源清理逻辑 | 5 天 | P0 | 实现失败资源清理 |
+| 回滚验证测试 | 5 天 | P0 | 实现回滚后验证 |
 
-### 5.3 阶段三：扩缩容回滚（P1）
+### 5.3 阶段三：ClusterVersion 回滚（P1）
 
 | 任务 | 工作量 | 优先级 | 说明 |
 |------|--------|--------|------|
-| 扩缩容回滚机制 | 5 天 | P1 | 实现扩缩容失败回滚 |
-| 配置版本管理 | 5 天 | P1 | 实现配置版本管理和回滚 |
+| 回滚路径验证 | 5 天 | P1 | 实现回滚路径验证逻辑 |
+| 降级 DAG 设计 | 8 天 | P1 | 实现降级 DAG 执行器 |
+| 降级组件实现 | 10 天 | P1 | 实现各组件降级逻辑 |
+| 回滚历史管理 | 3 天 | P1 | 实现回滚历史记录 |
 
 ### 5.4 阶段四：应用备份（P1）
 
@@ -1031,42 +933,34 @@ preUpgradeChecklist:
 | 能力 | 支持情况 | 说明 |
 |------|---------|------|
 | **安装回滚** | ❌ 不支持 | 安装失败时清理并重建 |
-| **升级回滚** | ✅ 支持 | 自动/手动回滚到上一版本 |
-| **扩缩容回滚** | ✅ 支持 | 声明式回滚 |
-| **配置回滚** | ✅ 支持 | 配置版本管理和回滚 |
+| **升级回滚** | ✅ 支持（设计中） | 自动/手动回滚到上一版本 |
+| **扩缩容回滚** | ✅ 支持（设计中） | 状态机回滚 + 资源清理 |
+| **配置回滚** | ✅ 支持（设计中） | 配置版本管理和回滚 |
 | **etcd 备份** | ✅ 支持 | 自动/手动备份 |
 | **配置备份** | ✅ 支持 | 集群配置备份 |
 | **应用备份** | ✅ 支持 | Velero 集成 |
 | **灾难恢复** | ✅ 支持 | 完整的恢复流程 |
 
-### 7.2 与 OpenShift 的对比
-
-| 维度 | OpenShift | BKE | 差异说明 |
-|------|-----------|-----|---------|
-| **回滚机制** | CVO 调谐循环 | 状态机引擎 | BKE 使用 Engine 驱动 |
-| **失败记录** | RolledBack 状态 | LastInProgressState | BKE 记录失败前状态 |
-| **备份工具** | cluster-backup.sh | 自定义脚本 | 功能一致 |
-| **恢复工具** | cluster-restore.sh | 自定义脚本 | 功能一致 |
-
-### 7.3 关键设计决策
+### 7.2 关键设计决策
 
 1. **安装不支持回滚**：与 OpenShift 一致，状态不可逆
-2. **升级支持自动回滚**：检测到失败时自动触发
-3. **扩缩容支持声明式回滚**：通过修改期望状态触发
-4. **配置支持版本管理**：保留最近 10 个配置版本
+2. **PhaseFlow 基于状态机引擎回滚**：利用现有 `statemachine.Engine`
+3. **ClusterVersion 不负责执行回滚**：只负责验证路径，由 DAG 执行
+4. **降级 DAG 参考升级 DAG 设计**：顺序相反，逻辑类似
 5. **备份支持多种存储**：本地、S3、NFS、OSS
 
-### 7.4 后续工作
+### 7.3 后续工作
 
-1. **实现回滚状态转换规则**：在状态机引擎中添加回滚相关的转换规则
-2. **实现升级历史数据结构**：记录升级和回滚的完整历史
-3. **实现自动备份脚本**：实现 etcd 和配置的自动备份
-4. **实现恢复验证工具**：自动验证备份可恢复性
-5. **文档化回滚流程**：编写详细的回滚操作手册
+1. **实现 PhaseFlow 回滚机制**：添加 `TriggerRollback` 触发器和转换规则
+2. **实现 ClusterVersion 回滚验证**：验证回滚路径，设置 `rollback-ready` 注解
+3. **实现降级 DAG**：参考升级 DAG 实现降级执行器
+4. **实现自动备份脚本**：实现 etcd 和配置的自动备份
+5. **实现恢复验证工具**：自动验证备份可恢复性
+6. **文档化回滚流程**：编写详细的回滚操作手册
 
 ---
 
-**文档版本**：v1.0  
+**文档版本**：v2.0（设计提案）  
 **创建日期**：2024-01-15  
 **最后更新**：2024-01-15  
 **维护者**：BKE 团队
