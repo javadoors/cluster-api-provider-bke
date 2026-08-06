@@ -24,21 +24,25 @@
 - [5. 综合重构方案](#5-综合重构方案)
   - [5.1 整体架构](#51-整体架构)
   - [5.2 阶段一：状态字段整合（核心，必须）](#52-阶段一状态字段整合核心必须)
-    - [5.2.1 实施步骤](#521-实施步骤)
-    - [5.2.2 工作量与交付物](#522-工作量与交付物)
-    - [5.2.3 验收标准](#523-验收标准)
+    - [5.2.1 需求规格](#521-需求规格)
+    - [5.2.2 实施步骤](#522-实施步骤)
+    - [5.2.3 工作量与交付物](#523-工作量与交付物)
+    - [5.2.4 验收标准](#524-验收标准)
   - [5.3 阶段二：状态转换引擎（推荐）](#53-阶段二状态转换引擎推荐)
-    - [5.3.1 实施步骤](#531-实施步骤)
-    - [5.3.2 工作量与交付物](#532-工作量与交付物)
-    - [5.3.3 验收标准](#533-验收标准)
+    - [5.3.1 需求规格](#531-需求规格)
+    - [5.3.2 实施步骤](#532-实施步骤)
+    - [5.3.3 工作量与交付物](#533-工作量与交付物)
+    - [5.3.4 验收标准](#534-验收标准)
   - [5.4 阶段三：状态管理增强（推荐）](#54-阶段三状态管理增强推荐)
-    - [5.4.1 实施步骤](#541-实施步骤)
-    - [5.4.2 工作量与交付物](#542-工作量与交付物)
-    - [5.4.3 验收标准](#543-验收标准)
+    - [5.4.1 需求规格](#541-需求规格)
+    - [5.4.2 实施步骤](#542-实施步骤)
+    - [5.4.3 工作量与交付物](#543-工作量与交付物)
+    - [5.4.4 验收标准](#544-验收标准)
   - [5.5 阶段四：事件追踪系统（可选）](#55-阶段四事件追踪系统可选)
-    - [5.5.1 实施步骤](#551-实施步骤)
-    - [5.5.2 工作量与交付物](#552-工作量与交付物)
-    - [5.5.3 验收标准](#553-验收标准)
+    - [5.5.1 需求规格](#551-需求规格)
+    - [5.5.2 实施步骤](#552-实施步骤)
+    - [5.5.3 工作量与交付物](#553-工作量与交付物)
+    - [5.5.4 验收标准](#554-验收标准)
   - [5.6 总工作量汇总与里程碑](#56-总工作量汇总与里程碑)
     - [5.6.1 工作量汇总](#561-工作量汇总)
     - [5.6.2 关键里程碑](#562-关键里程碑)
@@ -4892,7 +4896,59 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 - 所有新代码只使用 `ClusterStatus`，通过 `SetClusterStatus()` 统一设置并自动同步派生字段
 - 提供 `MapToLifecyclePhase` 映射函数，为三层状态机架构演进做准备
 
-#### 5.2.1 实施步骤
+#### 5.2.1 需求规格
+
+**功能需求**：
+
+| 需求编号 | 需求描述 | 优先级 |
+|---------|---------|--------|
+| FR-1.1 | ClusterStatus 作为单一数据源，所有状态变更通过 ClusterStatus 进行 | P0 |
+| FR-1.2 | 提供 `SetClusterStatus()` 方法，设置 ClusterStatus 时自动同步 Phase 和 ClusterHealthState | P0 |
+| FR-1.3 | 提供 `SyncStatusFields()` 函数，统一同步所有派生字段 | P0 |
+| FR-1.4 | 提供 `ValidateStatusConsistency()` 函数，验证字段一致性 | P0 |
+| FR-1.5 | 提供 5 个映射函数：MapPhaseToClusterStatus、MapClusterHealthStateToClusterStatus、MapClusterStatusToPhase、MapClusterStatusToClusterHealthState、MapToLifecyclePhase | P0 |
+| FR-1.6 | 新增 LastInProgressState 字段，记录失败前的进行中状态 | P0 |
+| FR-1.7 | Phase 和 ClusterHealthState 字段标记为 Deprecated，但保留字段定义 | P0 |
+
+**非功能需求**：
+
+| 需求编号 | 需求描述 | 优先级 |
+|---------|---------|--------|
+| NFR-1.1 | 向后兼容：现有代码无需修改即可继续运行 | P0 |
+| NFR-1.2 | 性能无影响：映射函数和同步函数的性能开销可忽略 | P0 |
+| NFR-1.3 | 代码覆盖率：新增映射函数单元测试覆盖率 100% | P1 |
+
+**接口需求**：
+
+| 接口名称 | 接口定义 | 说明 |
+|---------|---------|------|
+| SetClusterStatus | `func (c *BKECluster) SetClusterStatus(status ClusterStatus)` | 设置 ClusterStatus 并自动同步派生字段 |
+| SyncStatusFields | `func SyncStatusFields(cluster *BKECluster)` | 统一同步所有派生字段 |
+| ValidateStatusConsistency | `func ValidateStatusConsistency(cluster *BKECluster) error` | 验证字段一致性 |
+| MapPhaseToClusterStatus | `func MapPhaseToClusterStatus(phase BKEClusterPhase) ClusterStatus` | Phase 映射到 ClusterStatus |
+| MapClusterHealthStateToClusterStatus | `func MapClusterHealthStateToClusterStatus(state ClusterHealthState) ClusterStatus` | ClusterHealthState 映射到 ClusterStatus |
+| MapClusterStatusToPhase | `func MapClusterStatusToPhase(status ClusterStatus) BKEClusterPhase` | ClusterStatus 映射到 Phase |
+| MapClusterStatusToClusterHealthState | `func MapClusterStatusToClusterHealthState(status ClusterStatus) ClusterHealthState` | ClusterStatus 映射到 ClusterHealthState |
+| MapToLifecyclePhase | `func MapToLifecyclePhase(status ClusterStatus) string` | ClusterStatus 映射到 LifecyclePhase |
+
+**数据需求**：
+
+| 数据项 | 数据类型 | 说明 |
+|-------|---------|------|
+| ClusterStatus | ClusterStatus 枚举 | 单一数据源，22 个枚举值 |
+| LastInProgressState | ClusterStatus 枚举 | 记录失败前的进行中状态 |
+| Phase | BKEClusterPhase 枚举 | Deprecated，保留但不再使用 |
+| ClusterHealthState | ClusterHealthState 枚举 | Deprecated，保留但不再使用 |
+
+**兼容性需求**：
+
+| 需求编号 | 需求描述 | 优先级 |
+|---------|---------|--------|
+| CR-1.1 | Phase 字段保留，标记 Deprecated，外部消费者可继续读取 | P0 |
+| CR-1.2 | ClusterHealthState 字段保留，标记 Deprecated，外部消费者可继续读取 | P0 |
+| CR-1.3 | 映射函数支持双向映射，确保向后兼容 | P0 |
+
+#### 5.2.2 实施步骤
 
 **步骤 1：API 层与映射函数（3 天）**
 
@@ -4946,7 +5002,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 | 验证 | 所有现有测试通过，外部消费者无感知 |
 | 回归 | 完整的集群生命周期回归测试（创建、升级、扩缩容、删除） |
 
-#### 5.2.2 工作量与交付物
+#### 5.2.3 工作量与交付物
 
 | 步骤 | 工作量 | 交付物 |
 | ------ | ------ | ------ |
@@ -4958,7 +5014,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 | 步骤 6：测试验证与回归 | 5 天 | 测试用例更新 + 一致性验证 + 回归测试 |
 | **合计** | **22 天** | - |
 
-#### 5.2.3 验收标准
+#### 5.2.4 验收标准
 
 | 验收项 | 标准 | 验证方式 |
 | ------ | ------ | ------ |
@@ -4975,7 +5031,57 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 **对应设计章节**：4.2 节（状态转换引擎方案）
 
-#### 5.3.1 实施步骤
+#### 5.3.1 需求规格
+
+**功能需求**：
+
+| 需求编号 | 需求描述 | 优先级 |
+|---------|---------|--------|
+| FR-2.1 | 实现状态转换引擎 Engine，支持状态转换、事件记录、历史查询 | P0 |
+| FR-2.2 | 支持 58 条转换规则集中管理，通过 `registerClusterTransitions` 注册 | P0 |
+| FR-2.3 | 支持 Condition 前置条件检查，不满足条件时跳过规则 | P0 |
+| FR-2.4 | 支持 Action 转换动作，转换时执行自定义逻辑 | P1 |
+| FR-2.5 | 支持事件记录，记录每次状态转换的详细信息 | P0 |
+| FR-2.6 | 支持历史查询，支持按集群、时间、状态等多维度查询 | P1 |
+| FR-2.7 | 替代 11 个 `handleCluster*Phase` 函数，删除分散的状态转换逻辑 | P0 |
+| FR-2.8 | 支持双轨并行模式，通过环境变量 `USE_STATE_MACHINE_ENGINE` 控制 | P0 |
+
+**非功能需求**：
+
+| 需求编号 | 需求描述 | 优先级 |
+|---------|---------|--------|
+| NFR-2.1 | 性能：状态转换延迟 < 10ms | P0 |
+| NFR-2.2 | 可扩展性：支持动态添加转换规则 | P1 |
+| NFR-2.3 | 可测试性：支持单元测试和集成测试 | P0 |
+| NFR-2.4 | 代码圈复杂度：从 15 降低到 8 以下 | P1 |
+
+**接口需求**：
+
+| 接口名称 | 接口定义 | 说明 |
+|---------|---------|------|
+| Engine.Transition | `func (e *Engine) Transition(cluster *BKECluster, trigger string, err error) error` | 执行状态转换 |
+| Engine.AddTransition | `func (e *Engine) AddTransition(t Transition)` | 添加转换规则 |
+| Engine.GetTransitions | `func (e *Engine) GetTransitions() []Transition` | 获取所有转换规则 |
+| Engine.GetHistory | `func (e *Engine) GetHistory(clusterName string) []TransitionEvent` | 获取转换历史 |
+| Engine.QueryHistory | `func (e *Engine) QueryHistory(filter EventFilter) []TransitionEvent` | 按条件查询历史 |
+
+**数据需求**：
+
+| 数据项 | 数据类型 | 说明 |
+|-------|---------|------|
+| Transition | 结构体 | 转换规则：FromState、ToState、Trigger、Condition、Action |
+| TransitionEvent | 结构体 | 转换事件：Timestamp、Cluster、FromState、ToState、Trigger、Error、Duration |
+| EventFilter | 结构体 | 事件过滤器：ClusterName、StartTime、EndTime、FromState、ToState、Trigger |
+| EventStore | 接口 | 事件存储接口：Record、Query |
+
+**兼容性需求**：
+
+| 需求编号 | 需求描述 | 优先级 |
+|---------|---------|--------|
+| CR-2.1 | 支持双轨并行模式，可通过环境变量切换新旧逻辑 | P0 |
+| CR-2.2 | 未找到匹配规则时返回 nil，不阻断流程 | P0 |
+
+#### 5.3.2 实施步骤
 
 **步骤 1：Engine 核心实现（5 天）**
 
@@ -5013,7 +5119,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 | 验证 | 失败恢复与重试路径验证 |
 | 验证 | 双轨并行模式验证（`USE_STATE_MACHINE_ENGINE` 开关） |
 
-#### 5.3.2 工作量与交付物
+#### 5.3.3 工作量与交付物
 
 | 步骤 | 工作量 | 交付物 |
 | ------ | ------ | ------ |
@@ -5024,7 +5130,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 | 步骤 5：集成测试与回归 | 5 天 | 端到端测试 + 双轨验证 |
 | **合计** | **24 天** | - |
 
-#### 5.3.3 验收标准
+#### 5.3.4 验收标准
 
 | 验收项 | 标准 | 验证方式 |
 | ------ | ------ | ------ |
@@ -5042,7 +5148,57 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 **对应设计章节**：4.3 节（状态管理方案）
 
-#### 5.4.1 实施步骤
+#### 5.4.1 需求规格
+
+**功能需求**：
+
+| 需求编号 | 需求描述 | 优先级 |
+|---------|---------|--------|
+| FR-3.1 | 实现 StatusManagerV2，替代原有 StatusManager | P0 |
+| FR-3.2 | 实现 StatusRecordV2，删除 RetryPolicy 字段，由 Engine 管理重试策略 | P0 |
+| FR-3.3 | 实现 StatusCleaner，自动清理过期记录（24 小时过期，1 小时清理间隔） | P0 |
+| FR-3.4 | 覆盖全部 8 种 Failed 状态的重试处理 | P0 |
+| FR-3.5 | 提供 GetRetryCount 方法，供 Engine 查询重试计数 | P0 |
+| FR-3.6 | 提供 GetLatestNormalState 方法，供 Engine 查询最后正常状态 | P0 |
+| FR-3.7 | 提供 ResetRetryCount 方法，供 Engine 重置重试计数 | P0 |
+| FR-3.8 | 保持所有公开方法签名不变，8 个调用点零修改 | P0 |
+
+**非功能需求**：
+
+| 需求编号 | 需求描述 | 优先级 |
+|---------|---------|--------|
+| NFR-3.1 | 并发安全：使用 `int32` + `atomic.AddInt32` 确保原子操作 | P0 |
+| NFR-3.2 | 内存管理：自动清理过期记录，防止内存泄漏 | P0 |
+| NFR-3.3 | 代码精简：删除状态伪装逻辑，代码行数减少约 200 行 | P1 |
+| NFR-3.4 | 接口兼容：所有公开方法签名不变 | P0 |
+
+**接口需求**：
+
+| 接口名称 | 接口定义 | 说明 |
+|---------|---------|------|
+| StatusManagerV2.SetStatus | `func (b *StatusManagerV2) SetStatus(bkeCluster *BKECluster, bkeNodes BKENodes)` | 记录集群和节点状态 |
+| StatusManagerV2.GetCtrlResult | `func (b *StatusManagerV2) GetCtrlResult(bkeCluster *BKECluster) ctrl.Result` | 获取控制结果 |
+| StatusManagerV2.GetNodesResult | `func (b *StatusManagerV2) GetNodesResult(bkeCluster *BKECluster, nodeIP string) bool` | 获取节点结果 |
+| StatusManagerV2.GetRetryCount | `func (b *StatusManagerV2) GetRetryCount(cluster *BKECluster) int32` | 获取重试计数 |
+| StatusManagerV2.GetLatestNormalState | `func (b *StatusManagerV2) GetLatestNormalState(cluster *BKECluster) string` | 获取最后正常状态 |
+| StatusManagerV2.ResetRetryCount | `func (b *StatusManagerV2) ResetRetryCount(cluster *BKECluster)` | 重置重试计数 |
+
+**数据需求**：
+
+| 数据项 | 数据类型 | 说明 |
+|-------|---------|------|
+| StatusRecordV2 | 结构体 | 状态记录：CurrentClusterState、LatestFailedState、LatestNormalState、StatusCount、NeedRequeue、LastUpdateTime、ExpireTime |
+| StatusManagerV2 | 结构体 | 状态管理器：BKEClusterStatusMap、BKENodesStatusMap、cleaner |
+| StatusCleaner | 结构体 | 状态清理器：cleanupInterval、manager、stopCh |
+
+**兼容性需求**：
+
+| 需求编号 | 需求描述 | 优先级 |
+|---------|---------|--------|
+| CR-3.1 | 8 个调用点零修改，保持接口兼容 | P0 |
+| CR-3.2 | 支持从旧 StatusManager 平滑迁移到新 StatusManagerV2 | P0 |
+
+#### 5.4.2 实施步骤
 
 **步骤 1：StatusRecordV2 实现（3 天）**
 
@@ -5074,7 +5230,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 | 验证 | 内存泄漏验证（长时间运行后检查 map 大小） |
 | 回归 | 失败重试路径端到端验证 |
 
-#### 5.4.2 工作量与交付物
+#### 5.4.3 工作量与交付物
 
 | 步骤 | 工作量 | 交付物 |
 | ------ | ------ | ------ |
@@ -5084,7 +5240,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 | 步骤 4：集成测试与回归 | 5 天 | 接口兼容 + 并发安全 + 内存泄漏验证 |
 | **合计** | **16 天** | - |
 
-#### 5.4.3 验收标准
+#### 5.4.4 验收标准
 
 | 验收项 | 标准 | 验证方式 |
 | ------ | ------ | ------ |
@@ -5100,7 +5256,50 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 **对应设计章节**：4.4 节（事件追踪方案）
 
-#### 5.5.1 实施步骤
+#### 5.5.1 需求规格
+
+**功能需求**：
+
+| 需求编号 | 需求描述 | 优先级 |
+|---------|---------|--------|
+| FR-4.1 | 实现 EventStore 接口，支持事件记录和查询 | P0 |
+| FR-4.2 | 实现 InMemoryEventStore 默认实现，maxSize=1000，自动淘汰最旧事件 | P0 |
+| FR-4.3 | 实现 EventFilter 多维度查询，支持按集群名称、时间范围、状态、触发器、成功/失败过滤 | P0 |
+| FR-4.4 | Engine 集成 EventStore，状态转换时自动记录事件 | P0 |
+| FR-4.5 | 提供 Prometheus 监控指标：bke_state_machine_events_recorded_total 等 | P1 |
+
+**非功能需求**：
+
+| 需求编号 | 需求描述 | 优先级 |
+|---------|---------|--------|
+| NFR-4.1 | 性能：事件记录延迟 < 5ms | P0 |
+| NFR-4.2 | 容量限制：超过 maxSize 时自动淘汰最旧事件 | P0 |
+| NFR-4.3 | 并发安全：使用 sync.RWMutex 保证并发安全 | P0 |
+| NFR-4.4 | 可选组件：EventStore 为可选组件，可禁用 | P1 |
+
+**接口需求**：
+
+| 接口名称 | 接口定义 | 说明 |
+|---------|---------|------|
+| EventStore.Record | `func (s *EventStore) Record(event TransitionEvent) error` | 记录事件 |
+| EventStore.Query | `func (s *EventStore) Query(filter EventFilter) ([]TransitionEvent, error)` | 查询事件 |
+
+**数据需求**：
+
+| 数据项 | 数据类型 | 说明 |
+|-------|---------|------|
+| TransitionEvent | 结构体 | 转换事件：Timestamp、Cluster、FromState、ToState、Trigger、Error、Duration |
+| EventFilter | 结构体 | 事件过滤器：ClusterName、StartTime、EndTime、FromState、ToState、Trigger、Success |
+| InMemoryEventStore | 结构体 | 内存事件存储：events、maxSize、mux |
+
+**兼容性需求**：
+
+| 需求编号 | 需求描述 | 优先级 |
+|---------|---------|--------|
+| CR-4.1 | EventStore 为可选组件，不影响核心功能 | P1 |
+| CR-4.2 | 支持通过 WithEventStore 选项替换为其他实现 | P1 |
+
+#### 5.5.2 实施步骤
 
 **步骤 1：EventStore 接口与 InMemoryEventStore 实现（3 天）**
 
@@ -5131,7 +5330,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 | 验证 | 多维度查询正确性 |
 | 验证 | 容量限制（超过 maxSize 淘汰最旧事件） |
 
-#### 5.5.2 工作量与交付物
+#### 5.5.3 工作量与交付物
 
 | 步骤 | 工作量 | 交付物 |
 | ------ | ------ | ------ |
@@ -5141,7 +5340,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 | 步骤 4：集成测试 | 2 天 | 事件记录 + 查询 + 容量验证 |
 | **合计** | **11 天** | - |
 
-#### 5.5.3 验收标准
+#### 5.5.4 验收标准
 
 | 验收项 | 标准 | 验证方式 |
 | ------ | ------ | ------ |
