@@ -500,7 +500,81 @@ ClusterVersion Phase 转为 Failed
 
 ## 八、PodDisruptionBudget 感知设计
 
-### 8.1 PDB 在升级中的作用
+### 8.1 设计思路
+
+#### 8.1.1 问题背景
+
+在 Kubernetes 集群升级过程中，节点需要逐节点进行升级，这涉及到 Pod 的驱逐和重建。当前实现中，Worker 节点升级时直接执行 `drainNode()` 驱逐 Pod，未考虑 PodDisruptionBudget (PDB) 的约束。这可能导致以下问题：
+
+1. **服务中断风险**：如果关键应用（如数据库、消息队列）的多个副本同时被驱逐，可能导致服务不可用
+2. **违反用户预期**：用户通过 PDB 声明了应用的可用性要求，升级过程应该尊重这些约束
+3. **有状态应用风险**：StatefulSet 等有状态应用对可用性要求更高，违反 PDB 可能导致数据不一致或服务故障
+
+#### 8.1.2 设计目标
+
+PDB 感知升级的设计目标：
+
+1. **尊重用户声明**：升级过程必须遵守集群中所有 PDB 的约束
+2. **最小化服务影响**：通过 PDB 感知，确保升级过程中应用的可用性不低于用户声明的最低要求
+3. **渐进式升级**：当 PDB 约束阻止驱逐时，升级应该等待而不是强制驱逐
+4. **可观测性**：升级过程中应该清晰展示 PDB 约束的影响，让用户了解升级进度受阻的原因
+
+#### 8.1.3 核心设计原则
+
+**原则一：PreCheck 阶段识别风险**
+
+在升级开始前，扫描集群中所有 PDB，模拟升级过程对每个 PDB 的影响，识别可能违反 PDB 约束的场景。如果发现高风险场景，提前警告用户并提供调整建议。
+
+**原则二：升级过程中实时检查**
+
+在驱逐每个 Pod 之前，检查该 Pod 所属的 PDB 是否允许驱逐（`DisruptionsAllowed > 0`）。如果不允许，等待 PDB 恢复后再继续。
+
+**原则三：按 PDB 分组驱逐**
+
+将待驱逐的 Pod 按 PDB 分组，每组独立控制驱逐节奏。同一 PDB 下的 Pod 不能同时驱逐超过 `maxUnavailable` 或低于 `minAvailable`。
+
+**原则四：优雅降级策略**
+
+当 PDB 约束导致升级长时间阻塞时，提供以下降级策略：
+- **等待策略**（默认）：等待 PDB 恢复，超时后暂停升级并通知用户
+- **跳过策略**：跳过当前节点，继续升级其他节点
+- **强制策略**（需用户确认）：强制驱逐 Pod，违反 PDB 约束
+
+#### 8.1.4 集成策略
+
+PDB 感知机制需要集成到现有的升级流程中，主要涉及以下环节：
+
+1. **PreCheck 阶段**（新增）：
+   - 在 `executeUpgradeDAG()` 开始前，执行 PDB 兼容性检查
+   - 生成 PDB 影响报告，标记高风险应用
+   - 如果存在严重风险，暂停升级并等待用户确认
+
+2. **Master 节点升级**（增强）：
+   - 在 `EnsureMasterUpgrade` 中，升级控制面组件前检查 Master 节点上的业务 Pod
+   - 如果 Master 节点运行有业务 Pod，执行 PDB 感知的驱逐
+   - 多 Master 场景下，确保至少有一个 API Server 可用
+
+3. **Worker 节点升级**（增强）：
+   - 在 `EnsureWorkerUpgrade` 的 `drainNode()` 中，替换为 PDB 感知的驱逐逻辑
+   - 按 PDB 分组 Pod，逐组驱逐
+   - 实时监控 PDB 状态，动态调整驱逐节奏
+
+4. **PostCheck 阶段**（新增）：
+   - 升级完成后，验证所有 PDB 仍然满足约束
+   - 检查是否有 PDB 在升级过程中被违反
+   - 生成升级报告，包含 PDB 影响分析
+
+#### 8.1.5 关键设计决策
+
+| 决策点 | 选择 | 理由 |
+|--------|------|------|
+| **PDB 检查时机** | PreCheck + 实时检查 | PreCheck 提前识别风险，实时检查确保执行时合规 |
+| **驱逐策略** | 按 PDB 分组，逐组驱逐 | 避免同一 PDB 下的 Pod 同时被驱逐 |
+| **阻塞处理** | 等待 + 超时暂停 | 尊重 PDB 约束，避免无限等待 |
+| **强制驱逐** | 需要用户明确确认 | 防止误操作导致服务中断 |
+| **监控粒度** | 每 30 秒检查一次 PDB 状态 | 平衡实时性和性能开销 |
+
+### 8.2 PDB 在升级中的作用
 
 PodDisruptionBudget (PDB) 是 Kubernetes 保护应用可用性的关键机制，用于限制同时不可用的 Pod 数量。在升级过程中，PDB 可以：
 
@@ -508,7 +582,7 @@ PodDisruptionBudget (PDB) 是 Kubernetes 保护应用可用性的关键机制，
 - **控制升级节奏**：避免同时驱逐过多 Pod 导致服务不可用
 - **保护有状态应用**：确保 StatefulSet 等关键应用的稳定性
 
-### 8.2 升级前 PDB 检查
+### 8.3 升级前 PDB 检查
 
 在升级开始前，应该检查集群中的 PDB 配置，确保升级过程不会违反 PDB 约束。
 
@@ -613,7 +687,7 @@ func (c *PDBChecker) analyzePDBImpact(ctx context.Context, pdb policyv1.PodDisru
 }
 ```
 
-### 8.3 Worker 节点升级时的 PDB 感知 drain
+### 8.4 Worker 节点升级时的 PDB 感知 drain
 
 Worker 节点升级前需要驱逐节点上的 Pod，这个过程必须尊重 PDB 约束。
 
@@ -715,7 +789,7 @@ func (c *PDBChecker) checkPDBAllowsEviction(ctx context.Context, client kubernet
 }
 ```
 
-### 8.4 Master 节点升级时的 PDB 考虑
+### 8.5 Master 节点升级时的 PDB 考虑
 
 Master 节点上通常运行关键的控制面组件（API Server、Controller Manager、Scheduler），这些组件通常不以 Deployment 方式运行，因此不受 PDB 保护。但是，Master 节点上可能还运行其他业务 Pod，这些 Pod 可能受 PDB 保护。
 
@@ -759,7 +833,7 @@ func (e *EnsureMasterUpgrade) ensureAPIServerAvailability(ctx context.Context) e
 }
 ```
 
-### 8.5 PDB 配置建议
+### 8.6 PDB 配置建议
 
 为了确保升级过程的顺利进行，建议用户为关键应用配置合理的 PDB：
 
@@ -798,7 +872,7 @@ spec:
 | **关键业务应用** | `minAvailable: N` | 不允许任何中断 |
 | **测试环境应用** | 不配置 PDB | 允许自由升级 |
 
-### 8.6 升级过程中的 PDB 监控
+### 8.7 升级过程中的 PDB 监控
 
 升级过程中应该持续监控 PDB 状态，及时发现并处理问题。
 
@@ -860,7 +934,7 @@ func (m *PDBMonitor) checkPDBStatus(ctx context.Context) {
 }
 ```
 
-### 8.7 PDB 感知升级的完整流程
+### 8.8 PDB 感知升级的完整流程
 
 ```
 升级开始
@@ -907,7 +981,7 @@ PostCheck 阶段
 升级完成
 ```
 
-### 8.8 代码改造清单
+### 8.9 代码改造清单
 
 | 文件 | 改造内容 | 工作量 |
 |------|---------|--------|
