@@ -981,16 +981,281 @@ PostCheck 阶段
 升级完成
 ```
 
-### 8.9 代码改造清单
+### 8.9 PDB 感知的并行升级
+
+#### 8.9.1 设计思路
+
+**核心洞察**：PDB 约束的本质是限制**同时不可用的 Pod 数量**，而不是限制节点数量。因此，在满足 PDB 约束的前提下，可以并行升级多个节点，显著提升升级效率。
+
+**设计目标**：
+1. 在保证 PDB 合规的前提下，最大化升级并行度
+2. 动态调整并行度，根据 PDB 的 `DisruptionsAllowed` 实时决策
+3. 避免过度并行导致 PDB 违规
+
+**关键问题**：
+- 如何判断哪些节点可以并行升级？
+- 如何计算当前 PDB 允许的最大并行度？
+- 如何在升级过程中动态调整并行度？
+
+#### 8.9.2 算法设计
+
+**节点分组算法**：
+
+```
+输入：
+  - nodes: 待升级的节点列表
+  - pdbs: 集群中所有 PDB
+  - nodePods: 每个节点上的 Pod 列表
+
+输出：
+  - groups: 节点分组列表，每组可以并行升级
+
+算法流程：
+1. 初始化：groups = []
+
+2. 对每个 PDB，计算其影响范围：
+   - 找出所有匹配该 PDB 的 Pod
+   - 统计每个节点上属于该 PDB 的 Pod 数量
+   - 计算该 PDB 的 DisruptionsAllowed
+
+3. 计算每个节点的"升级成本"：
+   - 对每个节点，统计其上的 Pod 属于哪些 PDB
+   - 计算升级该节点会消耗多少 PDB 的 DisruptionsAllowed
+   - 节点的"成本" = max(消耗的 DisruptionsAllowed / 总 DisruptionsAllowed)
+
+4. 节点分组：
+   - 按"成本"从低到高排序节点
+   - 贪心算法：依次将节点加入当前组，直到组的总成本超过阈值
+   - 开始新的组，重复上述过程
+
+5. 返回分组结果
+```
+
+**并行度计算公式**：
+
+```
+对于 PDB_i：
+  - DisruptionsAllowed_i = PDB_i.Status.DisruptionsAllowed
+  - 节点 N 上的 Pod 数量 = PodCount(N, PDB_i)
+
+当前批次可以并行升级的节点数 = min(
+  DisruptionsAllowed_i / max(PodCount(N, PDB_i)) for all PDB_i
+)
+```
+
+#### 8.9.3 代码实现
+
+```go
+// pkg/upgrade/pdb/parallel.go
+
+type NodeGroup struct {
+    Nodes         []string  // 节点列表
+    MaxParallel   int       // 最大并行度
+    PDBConstraints map[string]int // PDB 名称 -> 允许的 disruptions
+}
+
+type ParallelUpgradePlanner struct {
+    client kubernetes.Interface
+}
+
+func (p *ParallelUpgradePlanner) PlanParallelUpgrade(
+    ctx context.Context,
+    nodes []string,
+) ([]NodeGroup, error) {
+    // 1. 获取所有 PDB
+    pdbs, err := p.client.PolicyV1().PodDisruptionBudgets("").List(ctx, metav1.ListOptions{})
+    if err != nil {
+        return nil, err
+    }
+
+    // 2. 获取每个节点上的 Pod
+    nodePods := make(map[string][]v1.Pod)
+    for _, node := range nodes {
+        pods, _ := p.client.CoreV1().Pods("").List(ctx, metav1.ListOptions{
+            FieldSelector: fields.SelectorFromSet(fields.Set{"spec.nodeName": node}).String(),
+        })
+        nodePods[node] = pods.Items
+    }
+
+    // 3. 计算每个 PDB 的 DisruptionsAllowed
+    pdbAllowed := make(map[string]int)
+    for _, pdb := range pdbs.Items {
+        pdbAllowed[pdb.Name] = int(pdb.Status.DisruptionsAllowed)
+    }
+
+    // 4. 计算每个节点的"升级成本"
+    type NodeCost struct {
+        Node string
+        Cost float64
+        PDBImpact map[string]int // PDB 名称 -> 影响的 Pod 数量
+    }
+    
+    var nodeCosts []NodeCost
+    for _, node := range nodes {
+        cost := &NodeCost{
+            Node: node,
+            PDBImpact: make(map[string]int),
+        }
+        
+        // 统计该节点上的 Pod 属于哪些 PDB
+        for _, pod := range nodePods[node] {
+            for _, pdb := range pdbs.Items {
+                selector, _ := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
+                if selector.Matches(labels.Set(pod.Labels)) {
+                    cost.PDBImpact[pdb.Name]++
+                }
+            }
+        }
+        
+        // 计算总成本
+        totalCost := 0.0
+        for pdbName, podCount := range cost.PDBImpact {
+            allowed := pdbAllowed[pdbName]
+            if allowed > 0 {
+                totalCost += float64(podCount) / float64(allowed)
+            } else {
+                totalCost += float64(podCount) * 100 // 不允许 disruption，成本极高
+            }
+        }
+        cost.Cost = totalCost
+        nodeCosts = append(nodeCosts, *cost)
+    }
+
+    // 5. 按成本排序
+    sort.Slice(nodeCosts, func(i, j int) bool {
+        return nodeCosts[i].Cost < nodeCosts[j].Cost
+    })
+
+    // 6. 贪心分组
+    var groups []NodeGroup
+    currentGroup := NodeGroup{
+        Nodes: []string{},
+        PDBConstraints: make(map[string]int),
+    }
+    currentCost := 0.0
+    
+    for _, nc := range nodeCosts {
+        // 如果加入当前节点会超过阈值，开始新组
+        if currentCost + nc.Cost > 1.0 && len(currentGroup.Nodes) > 0 {
+            groups = append(groups, currentGroup)
+            currentGroup = NodeGroup{
+                Nodes: []string{},
+                PDBConstraints: make(map[string]int),
+            }
+            currentCost = 0.0
+        }
+        
+        currentGroup.Nodes = append(currentGroup.Nodes, nc.Node)
+        currentCost += nc.Cost
+        
+        // 更新 PDB 约束
+        for pdbName, podCount := range nc.PDBImpact {
+            currentGroup.PDBConstraints[pdbName] += podCount
+        }
+    }
+    
+    if len(currentGroup.Nodes) > 0 {
+        groups = append(groups, currentGroup)
+    }
+
+    // 7. 计算每组的最大并行度
+    for i := range groups {
+        maxParallel := len(groups[i].Nodes)
+        for pdbName, podCount := range groups[i].PDBConstraints {
+            allowed := pdbAllowed[pdbName]
+            if allowed > 0 {
+                parallel := allowed / podCount
+                if parallel < maxParallel {
+                    maxParallel = parallel
+                }
+            } else {
+                maxParallel = 1 // 不允许 disruption，只能串行
+            }
+        }
+        groups[i].MaxParallel = maxParallel
+    }
+
+    return groups, nil
+}
+```
+
+#### 8.9.4 升级执行流程
+
+```
+升级开始
+  │
+  v
+PlanParallelUpgrade()
+  ├── 获取所有 PDB 和节点信息
+  ├── 计算每个节点的升级成本
+  ├── 按成本排序节点
+  └── 贪心分组
+  │
+  v
+对每个节点组：
+  │
+  ├── 获取组的 MaxParallel
+  │
+  ├── 将组内节点按 MaxParallel 分批
+  │   例如：组有 5 个节点，MaxParallel=2
+  │   批次 1: [节点1, 节点2]
+  │   批次 2: [节点3, 节点4]
+  │   批次 3: [节点5]
+  │
+  ├── 对每个批次：
+  │   ├── 并行升级批次内的所有节点
+  │   │   ├── PDB 感知 drain
+  │   │   ├── 升级 kubelet
+  │   │   └── 验证节点健康
+  │   │
+  │   ├── 等待批次内所有节点升级完成
+  │   │
+  │   └── 验证 PDB 状态
+  │       ├── 如果 PDB 违规，暂停升级
+  │       └── 等待 PDB 恢复后继续
+  │
+  └── 组内所有批次完成
+  │
+  v
+所有组完成
+  │
+  v
+升级完成
+```
+
+#### 8.9.5 性能对比
+
+**场景**：100 个 Worker 节点升级，每个节点上有 10 个 Pod，PDB 配置为 `maxUnavailable: 2`
+
+| 升级策略 | 升级时间 | PDB 违规风险 | 说明 |
+|---------|---------|-------------|------|
+| **逐节点升级** | 100 × 5min = 500min | 低 | 最保守，但最慢 |
+| **PDB 感知并行升级** | 50 × 5min = 250min | 低 | 每次升级 2 个节点，符合 PDB |
+| **无 PDB 感知并行升级** | 10 × 5min = 50min | **高** | 每次升级 10 个节点，可能违反 PDB |
+
+**结论**：PDB 感知的并行升级可以在保证合规的前提下，将升级时间缩短 50%。
+
+#### 8.9.6 关键设计决策
+
+| 决策点 | 选择 | 理由 |
+|--------|------|------|
+| **分组算法** | 贪心算法 | 简单高效，接近最优解 |
+| **成本计算** | 基于 PDB 影响比例 | 综合考虑多个 PDB 的约束 |
+| **并行度控制** | 每组独立计算 | 灵活适应不同 PDB 配置 |
+| **批次大小** | 动态调整 | 根据 PDB 实时状态调整 |
+| **失败处理** | 批次内重试 | 避免单点失败影响整个组 |
+
+### 8.10 代码改造清单
 
 | 文件 | 改造内容 | 工作量 |
 |------|---------|--------|
 | `pkg/upgrade/pdb/checker.go`（新增） | PDB 检查器实现 | 0.3 人月 |
 | `pkg/upgrade/pdb/monitor.go`（新增） | PDB 监控器实现 | 0.2 人月 |
-| `pkg/phaseframe/phases/ensure_worker_upgrade.go` | 集成 PDB 感知 drain | 0.3 人月 |
+| `pkg/upgrade/pdb/parallel.go`（新增） | PDB 感知并行升级规划器 | 0.4 人月 |
+| `pkg/phaseframe/phases/ensure_worker_upgrade.go` | 集成 PDB 感知 drain + 并行升级 | 0.4 人月 |
 | `pkg/phaseframe/phases/ensure_master_upgrade.go` | 集成 PDB 感知 drain + API Server 可用性检查 | 0.2 人月 |
-| 测试与文档 | 单元测试、集成测试、用户文档 | 0.2 人月 |
-| **总计** | | **1.2 人月** |
+| 测试与文档 | 单元测试、集成测试、用户文档 | 0.3 人月 |
+| **总计** | | **1.8 人月** |
 
 ## 九、证书管理
 
