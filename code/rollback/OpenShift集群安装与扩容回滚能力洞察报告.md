@@ -1890,16 +1890,13 @@ func (cvo *ClusterVersionOperator) handleDowngrade(cv *configv1.ClusterVersion) 
 }
 ```
 
-**步骤 3: 回滚执行**
+**步骤 3: 降级执行**
 
 ```go
-func (cvo *ClusterVersionOperator) executeUpgradeOrRollback(targetVersion string) error {
+func (cvo *ClusterVersionOperator) executeDowngrade(targetVersion string) error {
     cv := cvo.getClusterVersion()
     
-    // 1. 检查是否是回滚（目标版本 < 当前版本）
-    isRollback := cvo.isRollback(targetVersion, cv.Status.History[0].Version)
-    
-    // 2. 创建新的升级/回滚记录
+    // 1. 创建新的降级记录
     newHistory := configv1.UpdateHistory{
         State:       configv1.PartialUpdateState,
         Version:     targetVersion,
@@ -1907,24 +1904,19 @@ func (cvo *ClusterVersionOperator) executeUpgradeOrRollback(targetVersion string
         StartedTime: metav1.Time{Time: time.Now()},
     }
     
-    // 3. 插入到历史记录开头
+    // 2. 插入到历史记录开头
     cv.Status.History = append([]configv1.UpdateHistory{newHistory}, cv.Status.History...)
     
-    // 4. 更新状态
+    // 3. 更新状态
     cv.Status.Desired.Version = targetVersion
     cv.Status.Desired.Image = newHistory.Image
     
-    // 5. 开始执行升级/回滚
-    if isRollback {
-        cvo.recorder.Eventf(cv, corev1.EventTypeNormal, "RollbackStarted",
-            "Starting rollback to %s", targetVersion)
-    } else {
-        cvo.recorder.Eventf(cv, corev1.EventTypeNormal, "UpgradeStarted",
-            "Starting upgrade to %s", targetVersion)
-    }
+    // 4. 开始执行降级
+    cvo.recorder.Eventf(cv, corev1.EventTypeNormal, "DowngradeStarted",
+        "Starting downgrade to %s", targetVersion)
     
-    // 6. 执行实际的升级/回滚操作
-    return cvo.performUpgradeOrRollback(targetVersion)
+    // 5. 执行实际的降级操作
+    return cvo.performDowngrade(targetVersion)
 }
 ```
 
@@ -1932,20 +1924,20 @@ func (cvo *ClusterVersionOperator) executeUpgradeOrRollback(targetVersion string
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                     升级/回滚状态机                           │
+│                     升级/降级状态机                           │
 └─────────────────────────────────────────────────────────────┘
 
 状态 1: 稳定状态
   spec.desiredUpdate.version = 4.11.18
-  status.history[0].version = 4.11.18
+  currentVersion = 4.11.18
   status.history[0].state = Completed
   → CVO: 无需操作
 
 状态 2: 用户触发升级
   spec.desiredUpdate.version = 4.12.0  ← 用户修改
-  status.history[0].version = 4.11.18
-  status.history[0].state = Completed
-  → CVO: 检测到不一致，开始升级
+  currentVersion = 4.11.18
+  → CVO: 检测到 desired > current，开始升级
+  → 创建新记录：history[0] = {state: Partial, version: 4.12.0}
 
 状态 3: 升级进行中
   spec.desiredUpdate.version = 4.12.0
@@ -1957,113 +1949,91 @@ func (cvo *ClusterVersionOperator) executeUpgradeOrRollback(targetVersion string
   spec.desiredUpdate.version = 4.12.0
   status.history[0].version = 4.12.0
   status.history[0].state = Partial
-  → CVO: 检测到失败，触发自动回滚
+  conditions = [{type: Failing, status: True}]
+  → CVO: 检测到失败，等待用户手动触发降级
 
-状态 5: 触发回滚（关键转换）
-  spec.desiredUpdate.version = 4.11.18  ← CVO 修改
-  status.history[0].version = 4.12.0
-  status.history[0].state = RolledBack  ← 标记为已回滚
-  → CVO: 检测到不一致 (4.11.18 != 4.12.0)，开始回滚
+状态 5: 用户手动触发降级
+  用户执行：oc adm upgrade --to=4.11.18
+  spec.desiredUpdate.version = 4.11.18  ← 用户设置
+  currentVersion = 4.11.18 (从 history[1] 获取)
+  → CVO: 检测到 desired < previous failed，创建新降级记录
+  → 创建新记录：history[0] = {state: Partial, version: 4.11.18}
+  → 原失败记录后移：history[1] = {state: Partial, version: 4.12.0}
 
-状态 6: 回滚进行中
+状态 6: 降级进行中
   spec.desiredUpdate.version = 4.11.18
-  status.history[0].version = 4.12.0 (RolledBack)
-  status.history[1].version = 4.11.18
-  status.history[1].state = Partial
-  → CVO: 继续回滚
+  status.history[0].version = 4.11.18
+  status.history[0].state = Partial
+  status.history[1].version = 4.12.0 (原失败记录)
+  → CVO: 继续降级
 
-状态 7: 回滚完成
+状态 7: 降级完成
   spec.desiredUpdate.version = 4.11.18
-  status.history[0].version = 4.12.0 (RolledBack)
-  status.history[1].version = 4.11.18
-  status.history[1].state = Completed
-  → CVO: 一致，无需操作
+  status.history[0].version = 4.11.18
+  status.history[0].state = Completed
+  status.history[1].version = 4.12.0 (原失败记录保持)
+  → CVO: desired == current，无需操作
 ```
 
 #### 4.5.5 关键洞察
 
-**回滚触发的本质是：`spec.desiredUpdate.version` 与 `status.history[0].version` 的不一致**
+**降级触发的本质是：用户手动设置 `spec.desiredUpdate.version` 为更低版本**
 
-| 场景 | spec.desiredUpdate | status.history[0] | 是否触发 |
-|------|-------------------|-------------------|---------|
-| 稳定状态 | 4.11.18 | 4.11.18 (Completed) | ❌ 否 |
-| 升级开始 | 4.12.0 | 4.11.18 (Completed) | ✅ 是 |
-| 升级中 | 4.12.0 | 4.12.0 (Partial) | ✅ 是（继续） |
-| 升级失败 | 4.12.0 | 4.12.0 (Partial) | ✅ 是（失败处理） |
-| **触发回滚** | **4.11.18** | **4.12.0 (RolledBack)** | **✅ 是** |
-| 回滚中 | 4.11.18 | 4.11.18 (Partial) | ✅ 是（继续） |
-| 回滚完成 | 4.11.18 | 4.11.18 (Completed) | ❌ 否 |
+| 场景 | spec.desiredUpdate | currentVersion | 操作类型 |
+|------|-------------------|----------------|---------|
+| 稳定状态 | 4.11.18 | 4.11.18 | 无操作 |
+| 用户触发升级 | 4.12.0 | 4.11.18 | 升级 (desired > current) |
+| 升级进行中 | 4.12.0 | 4.11.18 | 继续升级 |
+| 升级失败 | 4.12.0 | 4.11.18 | 等待用户干预 |
+| 用户触发降级 | 4.11.18 | 4.11.18 | 降级 (创建新记录) |
+| 降级进行中 | 4.11.18 | 4.11.18 | 继续降级 |
+| 降级完成 | 4.11.18 | 4.11.18 | 无操作 |
+| 升级开始 | 4.12.0 | 4.11.18 | 升级 (desired > current) |
+| 升级中 | 4.12.0 | 4.11.18 | 继续升级 |
+| 升级失败 | 4.12.0 | 4.11.18 | 等待用户干预 |
+| 用户触发降级 | 4.11.18 | 4.11.18 | 降级 (创建新记录) |
+| 降级中 | 4.11.18 | 4.11.18 | 继续降级 |
+| 降级完成 | 4.11.18 | 4.11.18 | 无操作 |
 
 **关键点**：
-1. 升级失败时，CVO 将 `status.history[0].state` 标记为 `RolledBack`
-2. CVO 修改 `spec.desiredUpdate.version` 为回滚目标版本（4.11.18）
-3. 此时 `spec.desiredUpdate.version (4.11.18)` != `status.history[0].version (4.12.0)`
-4. CVO 检测到不一致，触发回滚执行
-5. 回滚执行时，创建新的历史记录 `status.history[1]`，版本为 4.11.18
+1. 升级失败时，`status.history[0].state` 保持为 `Partial`，`Failing=True`
+2. **用户手动**执行 `oc adm upgrade --to=4.11.18` 触发降级
+3. CVO 创建新的降级记录 `status.history[0] = {Partial, 4.11.18}`
+4. 原失败记录后移 `status.history[1] = {Partial, 4.12.0}`
+5. 降级执行时，按照正常升级流程反向执行
 
-### 4.6 完整回滚流程
+### 4.6 完整降级流程
 
-#### 4.4.1 手动回滚流程
+#### 4.6.1 手动降级流程
 
 ```
 步骤 1: 查看升级历史
   └─ oc get clusterversion version -o yaml
      └─ 查看 status.history 字段
 
-步骤 2: 确定回滚目标
+步骤 2: 确定降级目标
   └─ 找到上一条 state=Completed 的记录
   └─ 记录其 version 字段（如 4.11.18）
 
-步骤 3: 验证回滚路径
+步骤 3: 验证降级路径
   └─ oc adm upgrade --allow-explicit-upgrade --to-image=<image>
-  └─ 确认回滚路径可用
+  └─ 确认降级路径可用
 
-步骤 4: 触发回滚
-  └─ oc adm upgrade --to=4.11.18 --allow-not-recommended
+步骤 4: 触发降级
+  └─ oc adm upgrade --to=4.11.18
   └─ 或修改 ClusterVersion.spec.desiredUpdate
 
-步骤 5: 监控回滚进度
+步骤 5: 监控降级进度
   └─ oc get clusterversion version -w
-  └─ 查看 status.history 中新增的回滚记录
+  └─ 查看 status.history 中新增的降级记录
 
-步骤 6: 验证回滚完成
+步骤 6: 验证降级完成
   └─ 确认 status.history[0].version = 4.11.18
   └─ 确认 status.history[0].state = Completed
-  └─ 确认所有节点已回滚到 4.11.18
+  └─ 确认所有节点已降级到 4.11.18
 ```
 
-#### 4.4.2 自动回滚流程
-
-```
-步骤 1: 升级开始
-  └─ CVO 开始执行升级
-  └─ 更新 status.history[0].state = Partial
-
-步骤 2: 检测到失败
-  └─ Operator 健康检查失败
-  └─ 或节点 NotReady
-  └─ 或升级超时
-
-步骤 3: 触发自动回滚
-  └─ CVO 调用 GetRollbackTarget()
-  └─ 获取可回滚版本（如 4.11.18）
-  └─ 更新 spec.desiredUpdate.version = 4.11.18
-
-步骤 4: 执行回滚
-  └─ CVO 按照正常升级流程执行回滚
-  └─ 回滚 Operator 到 4.11.18
-  └─ MCO 回滚节点配置到 4.11.18
-
-步骤 5: 更新历史
-  └─ 更新 status.history[0].state = RolledBack
-  └─ 新增 status.history[1].state = Completed (4.11.18)
-
-步骤 6: 通知用户
-  └─ 发送事件：UpgradeFailedAndRolledBack
-  └─ 记录回滚原因和目标版本
-```
-
-#### 4.4.3 回滚状态转换
+#### 4.6.2 降级状态转换
 
 ```
 升级前：
@@ -2077,15 +2047,20 @@ func (cvo *ClusterVersionOperator) executeUpgradeOrRollback(targetVersion string
   - state: Completed, version: 4.11.18
   - state: Completed, version: 4.11.0
 
-回滚中：
+用户触发降级：
   status.history:
-  - state: Partial, version: 4.12.0  ← 标记为 RolledBack
-  - state: Partial, version: 4.11.18  ← 正在回滚
+  - state: Partial, version: 4.11.18  ← 新建降级记录
+  - state: Partial, version: 4.12.0   ← 原失败记录保持
+  - state: Completed, version: 4.11.18
   - state: Completed, version: 4.11.0
 
-回滚完成：
+降级完成：
   status.history:
-  - state: RolledBack, version: 4.12.0  ← 已回滚
+  - state: Completed, version: 4.11.18  ← 降级成功
+  - state: Partial, version: 4.12.0     ← 原失败记录保持
+  - state: Completed, version: 4.11.18
+  - state: Completed, version: 4.11.0
+```
   - state: Completed, version: 4.11.18  ← 当前版本
   - state: Completed, version: 4.11.0
 ```
