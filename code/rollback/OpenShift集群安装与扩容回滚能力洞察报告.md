@@ -1507,7 +1507,6 @@ func (cvo *ClusterVersionOperator) getCurrentVersion(cv *configv1.ClusterVersion
 
 - `Completed` 状态表示该版本已稳定运行 → 可以作为 current
 - `Partial` 状态表示该版本正在升级中或失败 → 不能作为 current
-- `RolledBack` 状态表示该版本已被放弃 → 不能作为 current
 
 **设计原则 2: 升级过程中 current 保持不变**
 
@@ -1523,17 +1522,17 @@ func (cvo *ClusterVersionOperator) getCurrentVersion(cv *configv1.ClusterVersion
 
 - 升级中：`history[0] = Partial (4.12.0)`，`history[1] = Completed (4.11.18)` → `current = 4.11.18`
 - 升级失败：`history[0] = Partial (4.12.0)`，`history[1] = Completed (4.11.18)` → `current = 4.11.18`
-- 回滚中：`history[0] = Partial (4.11.18)`，`history[1] = RolledBack (4.12.0)`，`history[2] = Completed (4.11.18)` → `current = 4.11.18`
+- 降级中：`history[0] = Partial (4.11.18)`，`history[1] = Partial (4.12.0)`，`history[2] = Completed (4.11.18)` → `current = 4.11.18`
 
 **设计原则 4: current 用于版本比较判断操作类型**
 
-`current` 的主要用途是与 `desired` 进行版本比较，判断是升级还是回滚：
+`current` 的主要用途是与 `desired` 进行版本比较，判断是升级还是降级：
 
 ```go
 if desired > current {
     return ActionUpgrade   // 升级到更高版本
 } else if desired < current {
-    return ActionRollback  // 回滚到更低版本
+    return ActionDowngrade // 降级到更低版本
 }
 ```
 
@@ -1545,67 +1544,60 @@ if desired > current {
 └─────────────────────────────────────────────────────────────────────────────┘
 
                               ┌──────────────┐
-                              │   Accepted   │  ← 用户设置 desiredUpdate
+                              │   Partial    │  ← 用户设置 desiredUpdate
+                              │  (升级中)    │
                               └──────┬───────┘
                                      │
-                                     │ 创建 Partial 记录
-                                     ▼
-                              ┌──────────────┐
-                    ┌────────│    Partial    │────────┐
-                    │        │  (升级中/失败) │        │
-                    │        └──────┬───────┘        │
-                    │               │                │
-          升级成功  │      升级失败  │                │ 用户取消
-                    │               │                │
-                    ▼               ▼                ▼
-             ┌────────────┐  ┌────────────┐  ┌────────────┐
-             │  Completed │  │ RolledBack │  │  Partial   │
-             │  (成功)    │  │  (已回滚)  │  │  (回滚中)  │
-             └────────────┘  └─────┬──────┘  └─────┬──────┘
-                                   │               │
-                                   │ 创建回滚记录   │ 回滚成功
-                                   ▼               │
-                            ┌────────────┐         │
-                            │  Partial   │◄────────┘
-                            │  (回滚中)  │
-                            └─────┬──────┘
-                                  │
-                          回滚成功 │
-                                  ▼
-                           ┌────────────┐
-                           │  Completed │
-                           │  (成功)    │
-                           └────────────┘
+                          ┌──────────┴──────────┐
+                          │                     │
+                升级成功  │                     │ 升级失败
+                          │                     │
+                          ▼                     ▼
+                   ┌──────────────┐      ┌──────────────┐
+                   │  Completed   │      │   Partial    │
+                   │  (成功)      │      │  (失败)      │
+                   └──────────────┘      └──────┬───────┘
+                                                │
+                                                │ 用户手动触发降级
+                                                ▼
+                                         ┌──────────────┐
+                                         │   Partial    │
+                                         │  (降级中)    │
+                                         └──────┬───────┘
+                                                │
+                                                │ 降级成功
+                                                ▼
+                                         ┌──────────────┐
+                                         │  Completed   │
+                                         │  (成功)      │
+                                         └──────────────┘
 
 状态说明：
-- Accepted:     用户设置 desiredUpdate，等待 CVO 处理
-- Partial:      升级/回滚正在进行，或升级失败等待处理
-- Completed:    升级/回滚已成功完成（终态）
-- RolledBack:   升级失败并已标记为回滚（终态）
+- Partial:      升级/降级正在进行，或升级失败
+- Completed:    升级/降级已成功完成（终态）
 
 history 数组变化：
-- Accepted → Partial:     在 history[0] 插入新记录
-- Partial → Completed:    更新 history[0].state = Completed
-- Partial → RolledBack:   更新 history[0].state = RolledBack，插入新 Partial 记录
-- RolledBack → Partial:   在 history[1] 插入回滚记录
-- Partial → Completed:    更新 history[1].state = Completed
+- 升级开始：在 history[0] 插入新记录 {Partial, desired}
+- 升级成功：更新 history[0].state = Completed
+- 升级失败：保持 history[0].state = Partial
+- 用户触发降级：在 history[0] 插入新记录 {Partial, desired}
+- 降级成功：更新 history[0].state = Completed
 ```
 
 **状态转换规则**：
 
 | 当前状态 | 触发条件 | 目标状态 | history 变化 |
 |---------|---------|---------|-------------|
-| `Accepted` | CVO 开始处理 | `Partial` | 插入 `history[0] = {Partial, desired}` |
 | `Partial` | 升级成功 | `Completed` | 更新 `history[0].state = Completed` |
-| `Partial` | 升级失败 | `Partial` | 保持 `history[0].state = Partial` |
-| `Partial` | 触发回滚 | `RolledBack` | 更新 `history[0].state = RolledBack`，插入 `history[1] = {Partial, rollback}` |
-| `RolledBack` | 回滚成功 | `Completed` | 更新 `history[1].state = Completed` |
-| `RolledBack` | 回滚失败 | `Partial` | 保持 `history[1].state = Partial`（需要人工干预） |
+| `Partial` | 升级失败 | `Partial` | 保持 `history[0].state = Partial`，设置 `Failing=True` |
+| `Partial` | 用户触发降级 | `Partial` | 插入新 `history[0] = {Partial, desired}` |
+| `Partial` | 降级成功 | `Completed` | 更新 `history[0].state = Completed` |
+| `Partial` | 降级失败 | `Partial` | 保持 `history[0].state = Partial`，设置 `Failing=True` |
 | `Completed` | 用户设置新 desired | `Partial` | 插入新 `history[0] = {Partial, desired}` |
 
-**回滚失败的场景分析**：
+**降级失败的场景分析**：
 
-**场景：升级失败后，回滚也失败**
+**场景：升级失败后，降级也失败**
 
 ```
 T0: 升级到 4.12.0 开始
@@ -1615,30 +1607,30 @@ T1: 升级失败
     history[0] = {state: Partial, version: 4.12.0}
     conditions = [{type: Failing, status: True}]
 
-T2: CVO 触发自动回滚到 4.11.18
-    history[0] = {state: RolledBack, version: 4.12.0, completionTime: T2}
-    history[1] = {state: Partial, version: 4.11.18, startedTime: T2}
+T2: 用户手动触发降级到 4.11.18
+    用户执行：oc adm upgrade --to=4.11.18
+    创建新降级记录：history[0] = {state: Partial, version: 4.11.18, startedTime: T2}
+    原失败记录后移：history[1] = {state: Partial, version: 4.12.0}
 
-T3: 回滚也失败
-    history[0] = {state: RolledBack, version: 4.12.0}
-    history[1] = {state: Partial, version: 4.11.18}  ← 保持为 Partial
+T3: 降级也失败
+    history[0] = {state: Partial, version: 4.11.18}  ← 保持为 Partial
+    history[1] = {state: Partial, version: 4.12.0}   ← 原失败记录保持
     conditions = [{type: Failing, status: True}]
 ```
 
-**回滚失败时的状态**：
+**降级失败时的状态**：
 
 ```yaml
 status:
   history:
-  - state: RolledBack              # 失败的升级记录
+  - state: Partial                 # 降级失败，保持为 Partial
+    version: "4.11.18"
+    startedTime: "2024-01-15T12:00:00Z"
+    # 没有 completionTime，因为降级未完成
+  
+  - state: Partial                 # 原升级失败记录，保持 Partial
     version: "4.12.0"
     startedTime: "2024-01-15T10:00:00Z"
-    completionTime: "2024-01-15T11:00:00Z"  # 回滚决策时间
-  
-  - state: Partial                 # 回滚失败，保持为 Partial
-    version: "4.11.18"
-    startedTime: "2024-01-15T11:00:00Z"
-    # 没有 completionTime，因为回滚未完成
   
   - state: Completed               # 上一个稳定版本
     version: "4.11.18"
@@ -1648,8 +1640,8 @@ status:
   conditions:
   - type: Failing
     status: "True"
-    reason: RollbackFailed
-    message: "Rollback to 4.11.18 failed: Operator health check failed"
+    reason: DowngradeFailed
+    message: "Downgrade to 4.11.18 failed: Operator health check failed"
 ```
 
 **回滚失败时的集群状态**：
