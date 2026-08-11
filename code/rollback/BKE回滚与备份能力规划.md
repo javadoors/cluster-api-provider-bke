@@ -609,12 +609,13 @@ func EnsureWorkerDowngrade(ctx context.Context, cluster *bkev1beta1.BKECluster) 
 - 需要精确控制降级过程
 - 对降级时间有严格要求
 
-##### 方案二：重新部署旧版本（推荐用于快速交付）
+##### 方案二：复用升级流程执行降级（推荐用于快速交付）
 
 **设计思路**：
-- 回滚的本质是"重新部署旧版本的 ReleaseImage"
-- 复用现有的部署逻辑，不需要为每个组件编写降级代码
-- 通过重新应用旧版本的配置来实现回滚
+- 参考 OpenShift CVO 机制：回滚本质是"降级"，复用现有升级流程
+- 设置目标版本为旧版本，CVO 按正常升级流程反向执行
+- 不需要为每个组件编写专门的降级代码
+- 通过重新应用旧版本的 manifest 和配置来实现降级
 
 **执行流程**：
 1. ClusterVersion 验证回滚路径（v26.06 → v26.05）
@@ -646,7 +647,7 @@ func (r *BKEClusterReconciler) executeRollback(
         return ctrl.Result{}, err
     }
     
-    // 2. 重新部署旧版本（复用部署逻辑）
+    // 2. 复用升级流程执行降级（复用部署逻辑）
     if err := r.applyReleaseBundle(ctx, bkeCluster, releaseBundle); err != nil {
         return ctrl.Result{}, err
     }
@@ -1443,9 +1444,10 @@ BKE 提供两种回滚方案，与 3.1.1 节升级失败回滚方案保持一致
 - 为每个组件实现特定的降级逻辑（数据迁移、配置回滚等）
 - 适用于复杂场景（如数据格式变更）
 
-**方案二：重新部署旧版本（OpenShift 方式）**
-- 复用现有部署逻辑，重新部署旧版本的 ReleaseImage
-- 不需要为每个组件编写降级代码
+**方案二：复用升级流程执行降级（参考 OpenShift CVO 机制）**
+- 复用现有升级 DAG 流程，将目标版本设为旧版本
+- CVO 按正常升级流程反向执行（降级 Operator、降级节点配置等）
+- 不需要为每个组件编写专门的降级代码
 - 实现简单，工作量小
 - 适用于快速交付和大部分回滚场景
 
@@ -1540,7 +1542,7 @@ BKE 提供两种回滚方案，与 3.1.1 节升级失败回滚方案保持一致
 
 **状态转换**：
 ```
-ClusterVersionPhaseFailed → ClusterVersionPhaseRollingBack → ClusterVersionPhaseReady
+ClusterVersionPhaseFailed → ClusterVersionPhaseUpgrading → ClusterVersionPhaseReady
 ```
 
 **预计恢复时间**：15-30 分钟
@@ -1564,7 +1566,7 @@ ClusterVersionPhaseFailed → ClusterVersionPhaseRollingBack → ClusterVersionP
 
 **状态转换**：
 ```
-ClusterVersionPhaseReady → ClusterVersionPhaseRollingBack → ClusterVersionPhaseReady
+ClusterVersionPhaseReady → ClusterVersionPhaseUpgrading → ClusterVersionPhaseReady
 ```
 
 **预计恢复时间**：15-30 分钟
@@ -1589,8 +1591,8 @@ ClusterVersionPhaseReady → ClusterVersionPhaseRollingBack → ClusterVersionPh
 **状态转换**：
 ```
 ClusterVersionPhaseReady (v26.07)
-  → ClusterVersionPhaseRollingBack → ClusterVersionPhaseReady (v26.06)
-  → ClusterVersionPhaseRollingBack → ClusterVersionPhaseReady (v26.05)
+  → ClusterVersionPhaseUpgrading → ClusterVersionPhaseReady (v26.06)
+  → ClusterVersionPhaseUpgrading → ClusterVersionPhaseReady (v26.05)
 ```
 
 **预计恢复时间**：30-60 分钟（每跳 15-30 分钟）
@@ -1599,24 +1601,24 @@ ClusterVersionPhaseReady (v26.07)
 
 **ClusterVersion 回滚状态转换**：
 
+> **注意**：OpenShift 的 ClusterVersion 没有独立的 `RollingBack` 状态。回滚和升级共用 `Upgrading` 状态，CVO 通过比较 `desiredVersion` 和 `currentVersion` 的大小来判断是升级还是降级。
+
 ```go
-// ClusterVersion 回滚状态转换规则
-ClusterVersionPhaseUpgrading → ClusterVersionPhaseRollingBack (触发回滚)
-ClusterVersionPhaseFailed → ClusterVersionPhaseRollingBack (升级失败后回滚)
-ClusterVersionPhaseReady → ClusterVersionPhaseRollingBack (升级后发现问题回滚)
-ClusterVersionPhaseRollingBack → ClusterVersionPhaseReady (回滚完成)
-ClusterVersionPhaseRollingBack → ClusterVersionPhaseFailed (回滚失败)
+// ClusterVersion 回滚状态转换规则（参考 OpenShift 实际机制）
+ClusterVersionPhaseUpgrading → ClusterVersionPhaseReady (回滚完成，即降级完成)
+ClusterVersionPhaseFailed → ClusterVersionPhaseUpgrading (升级失败后触发回滚，重新进入 Upgrading)
+ClusterVersionPhaseReady → ClusterVersionPhaseUpgrading (升级后发现问题，触发回滚)
+ClusterVersionPhaseUpgrading → ClusterVersionPhaseFailed (回滚失败)
 ```
 
 **状态转换说明**：
 
 | FromState | ToState | 触发条件 | 说明 |
 |-----------|---------|---------|------|
-| Upgrading | RollingBack | 用户设置 desiredVersion < currentVersion | 升级过程中回滚 |
-| Failed | RollingBack | 升级失败后用户设置 desiredVersion | 升级失败后回滚 |
-| Ready | RollingBack | 升级完成后用户设置 desiredVersion | 升级后发现问题回滚 |
-| RollingBack | Ready | 降级 DAG 执行成功 | 回滚完成 |
-| RollingBack | Failed | 降级 DAG 执行失败 | 回滚失败 |
+| Ready | Upgrading | 用户设置 desiredVersion < currentVersion | 触发降级（回滚），与升级共用 Upgrading 状态 |
+| Failed | Upgrading | 升级失败后用户设置 desiredVersion | 升级失败后触发回滚 |
+| Upgrading | Ready | 降级 DAG 执行成功 | 回滚完成 |
+| Upgrading | Failed | 降级 DAG 执行失败 | 回滚失败 |
 
 #### 3.4.5 回滚触发机制
 
@@ -1656,7 +1658,7 @@ ClusterVersion 回滚执行流程（方案一：降级 DAG）：
    ├─ 验证回滚路径（UpgradePath CRD）
    ├─ 拉取旧版本 ReleaseImage
    ├─ 设置注解：cvo.openfuyao.cn/rollback-ready=v26.05
-   └─ Phase → RollingBack
+   └─ Phase → Upgrading（回滚与升级共用 Upgrading 状态）
 
 3. BKECluster Controller 检测到注解：
    ├─ shouldUseDeclarativeRollback() 返回 true
@@ -1727,12 +1729,13 @@ Worker → Master → etcd → Containerd → Agent
 - **降级时**：先降级依赖组件（Worker、Master），再降级基础组件（etcd、Containerd、Agent）
 - **原因**：确保降级过程中组件之间的兼容性
 
-#### 3.4.8 方案二：重新部署旧版本（OpenShift 方式）
+#### 3.4.8 方案二：复用升级流程执行降级（参考 OpenShift CVO 机制）
 
 **设计思路**：
-- 回滚的本质是"重新部署旧版本的 ReleaseImage"
-- 复用现有的部署逻辑，不需要为每个组件编写降级代码
-- 通过重新应用旧版本的配置来实现回滚
+- OpenShift 的回滚本质是"降级"：设置 `spec.desiredUpdate` 为旧版本，CVO 按正常升级流程反向执行
+- 复用现有升级 DAG 流程，将目标版本设为旧版本
+- 不需要为每个组件编写专门的降级代码
+- 通过重新应用旧版本的 manifest 和配置来实现降级
 
 **执行流程**：
 1. ClusterVersion 验证回滚路径（v26.06 → v26.05）
@@ -1764,7 +1767,7 @@ func (r *BKEClusterReconciler) executeRollback(
         return ctrl.Result{}, err
     }
     
-    // 2. 重新部署旧版本（复用部署逻辑）
+    // 2. 复用升级流程执行降级（复用部署逻辑）
     if err := r.applyReleaseBundle(ctx, bkeCluster, releaseBundle); err != nil {
         return ctrl.Result{}, err
     }
@@ -2689,7 +2692,7 @@ kubectl get pods --all-namespaces
 | 任务 | 工作量(人月) | 优先级 | 说明 |
 |------|-------------|--------|------|
 | 版本回滚方案设计 | 0.5 | P1 | 方案二设计、兼容性分析 |
-| 版本回滚逻辑开发 | 1.0 | P1 | 重新部署旧版本、版本验证 |
+| 版本回滚逻辑开发 | 1.0 | P1 | 复用升级流程执行降级、版本验证 |
 | 回滚路径验证开发 | 0.8 | P1 | UpgradePath CRD 扩展、路径验证 |
 | 应用数据备份（Velero） | 0.8 | P1 | Velero 集成、备份策略 |
 | PVC 快照备份 | 0.5 | P1 | SnapshotClass、测试 |
@@ -2784,7 +2787,7 @@ kubectl get pods --all-namespaces
 | R4 | PhaseFlow 资源清理逻辑开发 | **1.0** | 扩缩容/配置变更/删除的清理逻辑 |
 | R5 | PhaseFlow 回滚验证与测试 | **0.8** | 单元测试、集成测试、端到端测试 |
 | R7 | ClusterVersion 版本回滚方案设计 | **0.5** | 方案二设计、兼容性分析 |
-| R8 | ClusterVersion 版本回滚逻辑开发 | **1.0** | 重新部署旧版本、版本验证 |
+| R8 | ClusterVersion 版本回滚逻辑开发 | **1.0** | 复用升级流程执行降级、版本验证 |
 | R9 | ClusterVersion 回滚路径验证开发 | **0.8** | UpgradePath CRD 扩展、路径验证 |
 | R10 | ClusterVersion 降级 DAG 设计 | **0.8** | 反向拓扑排序、组件依赖分析 |
 | R11 | ClusterVersion 降级 DAG 开发 | **3.5** | DAG 编排器、反向执行逻辑 |
@@ -2833,7 +2836,7 @@ kubectl get pods --all-namespaces
 |------|---------|--------|-------------|---------|
 | **BKE Agent** | SSH 重新推送旧版本二进制 + 重启服务 | 简单 | 0.2 | SSH 连通性；服务状态清理 |
 | **证书和密钥** | 从备份恢复 PKI 目录 | 简单 | 0.1 | 证书链验证；信任存储更新 |
-| **Containerd** | 重置 + 重新部署旧版本（复用现有逻辑） | 中等 | 0.3 | 需要驱逐容器；镜像缓存失效 |
+| **Containerd** | 重置 + 降级到旧版本（复用现有逻辑） | 中等 | 0.3 | 需要驱逐容器；镜像缓存失效 |
 | **Master 组件** | 停止静态 Pod → 替换二进制/清单 → 重启 | 中等 | 0.5 | API Server 可用性；证书兼容性 |
 | **Worker 组件** | 驱逐 Pod → 停止 kubelet → 替换二进制 → 重启 | 中等 | 0.3 | Pod 驱逐；节点可用性 |
 | **etcd** | 恢复快照 + 降级二进制 | **复杂** | 0.6 | 数据格式兼容性；集群仲裁 |
@@ -3104,7 +3107,7 @@ preUpgradeChecklist:
 1. **实现升级前置检查自动化**：Pre-Check 自动验证集群健康、备份状态、升级路径
 2. **实现升级后验证自动化**：Post-Upgrade 自动验证组件版本、集群健康
 3. **实现 PhaseFlow 回滚机制**：添加 `TriggerRollback` 触发器和转换规则
-4. **实现 ClusterVersion 回滚验证**：验证回滚路径，设置 `rollback-ready` 注解
+4. **实现 ClusterVersion 回滚验证**：验证回滚路径，设置降级目标版本
 5. **实现降级 DAG**：参考升级 DAG 实现降级执行器
 6. **实现自动备份脚本**：实现 etcd 和配置的自动备份
 7. **实现恢复验证工具**：自动验证备份可恢复性
