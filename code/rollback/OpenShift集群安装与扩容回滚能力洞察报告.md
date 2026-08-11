@@ -138,38 +138,38 @@ spec:
 
 **OpenShift 4.x 支持两种回滚方式**：
 
-#### 4.2.1 自动回滚（Operator 级别）
+#### 4.2.1 升级失败处理
+
+**OpenShift 没有自动回滚机制**。当升级失败时，系统会：
 
 ```yaml
-# ClusterVersion 配置
-apiVersion: config.openshift.io/v1
-kind: ClusterVersion
-metadata:
-  name: version
-spec:
-  clusterID: xxx
-  channel: stable-4.12
-  desiredUpdate:
-    version: 4.12.0
-    image: quay.io/openshift-release-dev/ocp-release:4.12.0
-    force: false
-  autoRollback: true  # 启用自动回滚
-  rollbackTimeout: 30m  # 回滚超时时间
+# 升级失败时的 ClusterVersion 状态
+status:
+  history:
+  - state: Partial              # 升级失败，保持在 Partial 状态
+    version: "4.12.0"
+    startedTime: "2024-01-15T10:00:00Z"
+  conditions:
+  - type: Failing
+    status: "True"
+    reason: UpgradeFailed
+    message: "Upgrade to 4.12.0 failed: Operator health check failed"
 ```
 
-**自动回滚触发条件**：
-- Operator 更新后健康检查失败
-- 节点配置应用后节点 NotReady
-- 升级超时（默认 30 分钟）
+**升级失败后的状态**：
+- ClusterVersion 保持在 `Partial` 状态
+- `Failing=True` condition 标记失败
+- **需要用户手动触发回滚**
 
-**自动回滚流程**：
+**用户手动回滚流程**：
 ```
-1. 检测到升级失败
-2. 回滚 ClusterVersion 到上一版本
-3. CVO 回滚 Operator 到上一版本
-4. MCO 回滚节点配置
-5. 等待所有组件就绪
-6. 更新 ClusterVersion.status.history
+1. 用户检测到升级失败
+2. 用户手动设置 spec.desiredUpdate.version 为旧版本
+3. CVO 检测到 desiredVersion < currentVersion，执行降级流程
+4. CVO 降级 Operator 到旧版本
+5. MCO 降级节点配置
+6. 等待所有组件就绪
+7. 更新 ClusterVersion.status.history
 ```
 
 #### 4.2.2 手动回滚
@@ -550,10 +550,8 @@ OpenShift ClusterVersion 的 `status.history` 字段存储了完整的升级历�
 ```go
 type UpdateHistory struct {
     // state 记录升级状态
-    // - Completed: 升级成功完成
-    // - Partial: 升级进行中或部分完成
-    // - Accepted: 升级已被接受但尚未开始
-    // - RolledBack: 升级失败并已回滚（OpenShift 4.14+）
+    // - Completed: 升级/回滚成功完成
+    // - Partial: 升级/回滚进行中，或升级失败
     State UpdateState `json:"state"`
     
     // version 是目标版本
@@ -562,13 +560,12 @@ type UpdateHistory struct {
     // image 是发布镜像
     Image string `json:"image"`
     
-    // startedTime 是升级开始时间
+    // startedTime 是升级/回滚开始时间
     StartedTime metav1.Time `json:"startedTime"`
     
-    // completionTime 是升级完成时间
-    // - state=Completed 时：升级成功完成时间
-    // - state=RolledBack 时：回滚决策时间（非回滚完成时间）
-    // - state=Partial 时：不存在
+    // completionTime 是完成时间
+    // - state=Completed 时：升级/回滚成功完成时间
+    // - state=Partial 时：不存在（操作尚未完成）
     CompletionTime *metav1.Time `json:"completionTime,omitempty"`
     
     // verified 表示发布镜像是否已验证
@@ -581,111 +578,28 @@ type UpdateHistory struct {
 type UpdateState string
 
 const (
-    // CompletedUpdateState 表示升级已成功完成
+    // CompletedUpdateState 表示升级/回滚已成功完成
     CompletedUpdateState UpdateState = "Completed"
     
-    // PartialUpdateState 表示升级正在进行或部分完成
-    // 包括：升级中、升级失败、回滚中
+    // PartialUpdateState 表示升级/回滚进行中，或升级失败
+    // 这是一个中间状态，操作尚未完成
     PartialUpdateState UpdateState = "Partial"
-    
-    // AcceptedUpdateState 表示升级已被接受但尚未开始
-    AcceptedUpdateState UpdateState = "Accepted"
-    
-    // RolledBackUpdateState 表示升级失败并已回滚（OpenShift 4.14+）
-    // 这是一个终态，表示该升级尝试已被放弃
-    RolledBackUpdateState UpdateState = "RolledBack"
 )
 ```
 
-**回滚记录的字段设计**：
+**状态说明**：
 
-**1. state 字段**
+OpenShift 的 UpdateHistory 只有两个状态，设计非常简洁：
 
-回滚记录有两种形态：
+| state | 含义 | completionTime | 是否终态 |
+|-------|------|----------------|---------|
+| `Completed` | 升级/回滚成功完成 | 有（完成时间） | 是 |
+| `Partial` | 升级/回滚进行中，或升级失败 | 不存在 | 否 |
 
-| 形态 | state 值 | 含义 | 是否终态 |
-|------|---------|------|---------|
-| **失败的升级记录** | `RolledBack` | 该升级尝试失败并已回滚 | 是（不可转换） |
-| **回滚执行记录** | `Partial` → `Completed` | 正在执行回滚 → 回滚完成 | 否 → 是 |
-
-**2. completionTime 字段**
-
-`completionTime` 在不同状态下的含义：
-
-| state | completionTime | 含义 |
-|-------|----------------|------|
-| `Completed` | 升级成功完成时间 | 升级流程结束时间 |
-| `RolledBack` | 回滚决策时间 | CVO 决定回滚的时间点 |
-| `Partial` | 不存在 | 操作尚未完成 |
-
-**3. version 字段**
-
-回滚记录中的 `version` 字段含义：
-
-| 记录类型 | version 含义 | 示例 |
-|---------|-------------|------|
-| 失败的升级记录 | 失败的升级目标版本 | `4.12.0`（升级失败） |
-| 回滚执行记录 | 回滚目标版本 | `4.11.18`（回滚到此版本） |
-
-**4. 回滚记录的完整字段说明**
-
-```yaml
-# 失败的升级记录（标记为 RolledBack）
-- state: RolledBack              # 状态：已回滚
-  version: "4.12.0"              # 失败的升级目标版本
-  image: "quay.io/.../4.12.0"    # 失败的发布镜像
-  startedTime: "2024-01-15T10:00:00Z"      # 升级开始时间
-  completionTime: "2024-01-15T11:00:00Z"   # 回滚决策时间
-  verified: true                 # 镜像已验证
-  acceptedRisks: ""              # 无接受的风险
-
-# 回滚执行记录
-- state: Completed               # 状态：回滚完成
-  version: "4.11.18"             # 回滚目标版本
-  image: "quay.io/.../4.11.18"   # 回滚使用的镜像
-  startedTime: "2024-01-15T11:00:00Z"      # 回滚开始时间
-  completionTime: "2024-01-15T12:00:00Z"   # 回滚完成时间
-  verified: true                 # 镜像已验证
-  acceptedRisks: ""              # 无接受的风险
-```
-
-**5. 回滚记录与升级记录的对比**
-
-| 字段 | 升级记录 | 回滚记录（失败） | 回滚记录（执行） |
-|------|---------|-----------------|-----------------|
-| `state` | `Completed` | `RolledBack` | `Partial` → `Completed` |
-| `version` | 升级目标版本 | 失败的升级目标版本 | 回滚目标版本 |
-| `image` | 升级镜像 | 失败的升级镜像 | 回滚镜像 |
-| `startedTime` | 升级开始时间 | 升级开始时间 | 回滚开始时间 |
-| `completionTime` | 升级完成时间 | 回滚决策时间 | 回滚完成时间 |
-| `verified` | 是否验证 | 是否验证 | 是否验证 |
-
-**6. 回滚记录的创建时机**
-
-```
-T0: 升级到 4.12.0 开始
-    创建升级记录：history[0] = {state: Partial, version: 4.12.0, startedTime: T0}
-
-T1: 升级失败
-    升级记录保持：history[0] = {state: Partial, version: 4.12.0}
-
-T2: CVO 触发自动回滚
-    修改升级记录：history[0] = {state: RolledBack, version: 4.12.0, completionTime: T2}
-    创建回滚记录：history[1] = {state: Partial, version: 4.11.18, startedTime: T2}
-
-T3: 回滚执行中
-    回滚记录保持：history[1] = {state: Partial, version: 4.11.18}
-
-T4: 回滚完成
-    更新回滚记录：history[1] = {state: Completed, version: 4.11.18, completionTime: T4}
-```
-
-**7. 回滚记录的关键设计点**
-
-1. **分离失败记录和回滚记录**：失败的升级记录标记为 `RolledBack`，回滚执行创建新记录
-2. **completionTime 的双重含义**：对于 `RolledBack` 记录，`completionTime` 是回滚决策时间；对于 `Completed` 记录，是完成时间
-3. **保留完整历史**：即使升级失败，也保留完整的升级历史记录，便于审计和问题排查
-4. **版本一致性**：回滚记录的 `version` 字段指向回滚目标版本，而非失败的升级版本
+**关键设计原则**：
+1. **没有独立的回滚状态**：回滚和升级共用 `Partial` 和 `Completed` 状态
+2. **通过版本比较判断操作类型**：`desiredVersion > currentVersion` 为升级，`desiredVersion < currentVersion` 为降级（回滚）
+3. **Partial 状态的多重含义**：可以是升级中、升级失败、回滚中
 
 #### 4.3.2 升级历史示例
 
@@ -733,6 +647,58 @@ status:
     lastTransitionTime: "2024-01-15T10:45:00Z"
 ```
 
+**手动触发回滚后的历史记录：**
+
+```yaml
+# 用户手动设置 spec.desiredUpdate.version = 4.11.18
+# CVO 检测到 desiredVersion < currentVersion，执行降级流程
+status:
+  history:
+  - state: Partial          # 回滚进行中
+    version: 4.11.18        # 回滚目标版本
+    image: quay.io/openshift-release-dev/ocp-release:4.11.18-x86_64
+    startedTime: "2024-01-15T12:00:00Z"
+    verified: true
+  - state: Partial          # 升级失败记录，保持 Partial 状态
+    version: 4.12.0
+    startedTime: "2024-01-15T10:00:00Z"
+    verified: true
+  - state: Completed
+    version: 4.11.18
+    startedTime: "2023-12-01T08:00:00Z"
+    completionTime: "2023-12-01T09:30:00Z"
+    verified: true
+```
+
+**回滚完成后的历史记录：**
+
+```yaml
+status:
+  history:
+  - state: Completed        # 回滚成功完成
+    version: 4.11.18
+    image: quay.io/openshift-release-dev/ocp-release:4.11.18-x86_64
+    startedTime: "2024-01-15T12:00:00Z"
+    completionTime: "2024-01-15T12:30:00Z"
+    verified: true
+  - state: Partial          # 升级失败记录，保持 Partial 状态
+    version: 4.12.0
+    startedTime: "2024-01-15T10:00:00Z"
+    verified: true
+  - state: Completed
+    version: 4.11.18
+    startedTime: "2023-12-01T08:00:00Z"
+    completionTime: "2023-12-01T09:30:00Z"
+    verified: true
+```
+
+**关键设计点**：
+
+1. **升级失败记录保留**：升级失败的记录保持在 `Partial` 状态，不会被删除或修改
+2. **回滚创建新记录**：手动触发回滚时，创建新的 `Partial` 记录
+3. **回滚完成更新状态**：回滚成功后，将新记录更新为 `Completed`
+4. **版本一致性**：回滚记录的 `version` 字段指向回滚目标版本
+
 **Partial 状态的详细含义：**
 
 **字面含义**：Partial = 部分的、不完整的
@@ -759,9 +725,9 @@ status:
 **状态转换图**：
 
 ```
-Accepted → Partial (升级中) → Completed (成功)
-                         ↓
-                    Partial (失败) → RolledBack (回滚)
+Partial (升级中) → Completed (成功)
+     ↓
+Partial (失败) → [用户手动触发回滚] → Partial (回滚中) → Completed (回滚成功)
 ```
 
 **关键区别：**
@@ -771,6 +737,8 @@ Accepted → Partial (升级中) → Completed (成功)
 | 升级成功 | `Completed` | 有值 | `Available=True` |
 | 升级失败 | `Partial` | 无值 | `Failing=True` |
 | 升级中 | `Partial` | 无值 | `Progressing=True` |
+| 回滚中 | `Partial` | 无值 | `Progressing=True` |
+| 回滚成功 | `Completed` | 有值 | `Available=True` |
 
 **CVO 如何检测升级失败：**
 
@@ -900,44 +868,24 @@ func (cvo *ClusterVersionOperator) GetRollbackTarget(cv *configv1.ClusterVersion
   status.history[1].version: 4.11.18
   status.history[1].state: Completed
 
-升级失败触发回滚：
-  spec.desiredUpdate.version: 4.11.18  (回滚目标 = 上一个成功版本)
+升级失败后用户手动触发回滚：
+  用户执行：oc adm upgrade --to=4.11.18
+  spec.desiredUpdate.version: 4.11.18  (用户设置回滚目标)
   status.history[0].version: 4.12.0
-  status.history[0].state: RolledBack  (标记为已回滚)
+  status.history[0].state: Partial     (升级失败记录，保持 Partial)
   status.history[1].version: 4.11.18
-  status.history[1].state: Completed   (回滚到此版本)
+  status.history[1].state: Partial     (新建回滚记录)
+  status.history[2].version: 4.11.18
+  status.history[2].state: Completed   (上一个成功版本)
 ```
 
 #### 4.4.2 目标版本设置时机
-
-**自动回滚时**：
-
-```go
-// CVO 检测到升级失败后自动设置回滚目标
-func (cvo *ClusterVersionOperator) handleUpgradeFailure(cv *configv1.ClusterVersion) error {
-    // 1. 获取回滚目标版本
-    rollbackVersion, err := cvo.GetRollbackTarget(cv)
-    if err != nil {
-        return err
-    }
-    
-    // 2. 设置回滚目标
-    cv.Spec.DesiredUpdate = &configv1.Update{
-        Version: rollbackVersion,
-        Image:   cvo.getReleaseImage(rollbackVersion),
-        Force:   false,
-    }
-    
-    // 3. 更新 ClusterVersion 对象
-    return cvo.client.Update(context.TODO(), cv)
-}
-```
 
 **手动回滚时**：
 
 ```bash
 # 用户手动设置回滚目标
-oc adm upgrade --to=4.11.18 --allow-not-recommended
+oc adm upgrade --to=4.11.18
 
 # 这会修改 ClusterVersion.spec.desiredUpdate
 kubectl get clusterversion version -o yaml
@@ -945,6 +893,35 @@ kubectl get clusterversion version -o yaml
 #   desiredUpdate:
 #     version: 4.11.18
 #     image: quay.io/openshift-release-dev/ocp-release:4.11.18-x86_64
+```
+
+**CVO 检测到回滚请求**：
+
+```go
+// CVO 在 Reconcile 循环中检测回滚请求
+func (cvo *ClusterVersionOperator) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    cv := &configv1.ClusterVersion{}
+    if err := cvo.client.Get(ctx, req.NamespacedName, cv); err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    // 获取当前版本
+    currentVersion := getCurrentVersion(cv)
+    
+    // 获取目标版本
+    desiredVersion := cv.Spec.DesiredUpdate.Version
+    
+    // 判断操作类型
+    if desiredVersion > currentVersion {
+        // 升级
+        return cvo.handleUpgrade(ctx, cv, desiredVersion)
+    } else if desiredVersion < currentVersion {
+        // 降级（回滚）
+        return cvo.handleDowngrade(ctx, cv, desiredVersion)
+    }
+    
+    return ctrl.Result{}, nil
+}
 ```
 
 #### 4.4.3 ClusterVersion 状态变化
@@ -1001,33 +978,33 @@ status:
     message: "Upgrade to 4.12.0 failed: Operator health check failed"
 ```
 
-**触发自动回滚**：
+**用户手动触发回滚**：
 ```yaml
+# 用户执行：oc adm upgrade --to=4.11.18
 spec:
   desiredUpdate:
-    version: 4.11.18        # 回滚目标 = 上一个成功版本
+    version: 4.11.18        # 用户设置回滚目标
     image: quay.io/openshift-release-dev/ocp-release:4.11.18-x86_64
 status:
   desired:
     version: 4.11.18        # 目标版本已更新
     image: quay.io/openshift-release-dev/ocp-release:4.11.18-x86_64
   history:
-  - state: RolledBack       # 标记为已回滚
+  - state: Partial          # 新建回滚记录
+    version: 4.11.18
+    startedTime: "2024-01-15T12:00:00Z"
+  - state: Partial          # 升级失败记录，保持 Partial
     version: 4.12.0
     startedTime: "2024-01-15T10:00:00Z"
-    completionTime: "2024-01-15T11:00:00Z"
-  - state: Partial          # 正在回滚
-    version: 4.11.18
-    startedTime: "2024-01-15T11:00:00Z"
   - state: Completed
-    version: 4.11.0
+    version: 4.11.18
+    startedTime: "2023-12-01T08:00:00Z"
+    completionTime: "2023-12-01T09:30:00Z"
   conditions:
-  - type: Failing
-    status: "False"         # 失败状态已清除
-  - type: RollbackInProgress
+  - type: Progressing
     status: "True"
-    reason: AutomaticRollback
-    message: "Rolling back to 4.11.18 due to upgrade failure"
+    reason: Downgrade
+    message: "Downgrading to 4.11.18"
 ```
 
 **回滚触发详细流程**：
@@ -1079,38 +1056,7 @@ func (cvo *ClusterVersionOperator) getRollbackTarget(cv *configv1.ClusterVersion
 }
 ```
 
-**步骤 3: 标记失败记录为 RolledBack**
-
-```go
-func (cvo *ClusterVersionOperator) markAsRolledBack(cv *configv1.ClusterVersion) {
-    // 修改第一个记录的 state 为 RolledBack
-    cv.Status.History[0].State = configv1.RolledBackUpdateState
-    
-    // 设置 completionTime（标记回滚决策时间）
-    now := metav1.Now()
-    cv.Status.History[0].CompletionTime = &now
-    
-    // 清除 Failing condition
-    for i, cond := range cv.Status.Conditions {
-        if cond.Type == "Failing" {
-            cv.Status.Conditions[i].Status = metav1.ConditionFalse
-            cv.Status.Conditions[i].Message = "Upgrade failed, rollback initiated"
-            break
-        }
-    }
-    
-    // 添加 RollbackInProgress condition
-    cv.Status.Conditions = append(cv.Status.Conditions, configv1.ClusterOperatorStatusCondition{
-        Type:               "RollbackInProgress",
-        Status:             metav1.ConditionTrue,
-        Reason:             "AutomaticRollback",
-        Message:            fmt.Sprintf("Rolling back to %s due to upgrade failure", rollbackTarget),
-        LastTransitionTime: metav1.Now(),
-    })
-}
-```
-
-**步骤 4: 创建新的回滚记录**
+**步骤 3: 创建新的回滚记录**
 
 ```go
 func (cvo *ClusterVersionOperator) createRollbackRecord(cv *configv1.ClusterVersion, targetVersion string) {
@@ -1124,12 +1070,9 @@ func (cvo *ClusterVersionOperator) createRollbackRecord(cv *configv1.ClusterVers
     }
     
     // 插入到 history 数组的开头
-    // 原来的 RolledBack 记录变成 history[0]
-    // 新的回滚记录变成 history[1]
     newHistory := make([]configv1.UpdateHistory, len(cv.Status.History)+1)
-    newHistory[0] = cv.Status.History[0]  // RolledBack 记录
-    newHistory[1] = rollbackRecord        // 新的回滚记录
-    copy(newHistory[2:], cv.Status.History[1:])  // 其他历史记录
+    newHistory[0] = rollbackRecord        // 新的回滚记录
+    copy(newHistory[1:], cv.Status.History)  // 其他历史记录
     
     cv.Status.History = newHistory
     
@@ -1139,37 +1082,38 @@ func (cvo *ClusterVersionOperator) createRollbackRecord(cv *configv1.ClusterVers
 }
 ```
 
-**步骤 5: 更新 ClusterVersion 对象**
+**步骤 4: 更新 ClusterVersion 对象**
 
 ```go
-func (cvo *ClusterVersionOperator) executeRollback(cv *configv1.ClusterVersion) error {
-    // 1. 获取回滚目标
-    targetVersion, err := cvo.getRollbackTarget(cv)
-    if err != nil {
-        return err
-    }
+func (cvo *ClusterVersionOperator) executeDowngrade(cv *configv1.ClusterVersion) error {
+    // 1. 获取降级目标
+    targetVersion := cv.Spec.DesiredUpdate.Version
     
-    // 2. 标记失败记录为 RolledBack
-    cvo.markAsRolledBack(cv)
-    
-    // 3. 创建新的回滚记录
+    // 2. 创建新的回滚记录
     cvo.createRollbackRecord(cv, targetVersion)
     
-    // 4. 更新 spec.desiredUpdate（触发回滚执行）
-    cv.Spec.DesiredUpdate = &configv1.Update{
-        Version: targetVersion,
-        Image:   cvo.getReleaseImage(targetVersion),
+    // 3. 更新 Progressing condition
+    for i, cond := range cv.Status.Conditions {
+        if cond.Type == "Progressing" {
+            cv.Status.Conditions[i].Status = metav1.ConditionTrue
+            cv.Status.Conditions[i].Reason = "Downgrading"
+            cv.Status.Conditions[i].Message = fmt.Sprintf("Downgrading to %s", targetVersion)
+            break
+        }
     }
     
-    // 5. 更新 ClusterVersion 对象到 API Server
+    // 4. 更新 ClusterVersion 对象到 API Server
     if err := cvo.client.Status().Update(context.TODO(), cv); err != nil {
         return err
     }
     
-    // 6. 发送事件
-    cvo.recorder.Eventf(cv, corev1.EventTypeWarning, "UpgradeFailed",
-        "Upgrade to %s failed, initiating automatic rollback to %s",
-        cv.Status.History[0].Version, targetVersion)
+    // 5. 发送事件
+    cvo.recorder.Eventf(cv, corev1.EventTypeNormal, "DowngradeStarted",
+        "Downgrade to %s started", targetVersion)
+    
+    return nil
+}
+```
     
     return nil
 }
@@ -1185,18 +1129,19 @@ T0: 升级到 4.12.0 开始          history[0] = {state: Partial, version: 4.12
 T1: 升级失败                    history[0] = {state: Partial, version: 4.12.0}
                                 conditions = [{type: Failing, status: True}]
                                 
-T2: CVO 检测到失败              调用 executeRollback()
-                                
-T3: 标记失败记录                history[0] = {state: RolledBack, version: 4.12.0, completionTime: T3}
-                                history[1] = {state: Partial, version: 4.11.18}  ← 新创建
-                                conditions = [{type: RollbackInProgress, status: True}]
+T2: 用户手动触发回滚             用户执行：oc adm upgrade --to=4.11.18
                                 spec.desiredUpdate.version = 4.11.18
                                 
-T4: 回滚执行中                  history[0] = {state: RolledBack, version: 4.12.0}
-                                history[1] = {state: Partial, version: 4.11.18}
+T3: CVO 检测到回滚请求           创建新回滚记录
+                                history[0] = {state: Partial, version: 4.11.18}  ← 新创建
+                                history[1] = {state: Partial, version: 4.12.0}   ← 失败记录保持
+                                conditions = [{type: Progressing, status: True}]
                                 
-T5: 回滚完成                    history[0] = {state: RolledBack, version: 4.12.0}
-                                history[1] = {state: Completed, version: 4.11.18, completionTime: T5}
+T4: 回滚执行中                  history[0] = {state: Partial, version: 4.11.18}
+                                history[1] = {state: Partial, version: 4.12.0}
+                                
+T5: 回滚完成                    history[0] = {state: Completed, version: 4.11.18, completionTime: T5}
+                                history[1] = {state: Partial, version: 4.12.0}   ← 失败记录保持
                                 conditions = [{type: Available, status: True}]
 ```
 
@@ -1205,18 +1150,16 @@ T5: 回滚完成                    history[0] = {state: RolledBack, version: 4.
 | 步骤 | 操作 | history 变化 |
 |------|------|-------------|
 | 1. 检测失败 | 检查 `Partial` + `Failing=True` | 无变化 |
-| 2. 获取目标 | 遍历 history 找 `Completed` 记录 | 无变化 |
-| 3. 标记 RolledBack | 修改 `history[0].state` | `history[0]`: `Partial` → `RolledBack` |
-| 4. 创建回滚记录 | 在 `history[0]` 后插入新记录 | 新增 `history[1]`: `{state: Partial, version: 4.11.18}` |
-| 5. 更新 spec | 修改 `spec.desiredUpdate.version` | 无变化 |
-| 6. 执行回滚 | CVO 执行回滚操作 | `history[1]`: `Partial` → `Completed` |
+| 2. 用户触发回滚 | 用户设置 `spec.desiredUpdate.version` | 无变化 |
+| 3. 创建回滚记录 | 在 `history` 开头插入新记录 | 新增 `history[0]`: `{state: Partial, version: 4.11.18}` |
+| 4. 执行回滚 | CVO 执行降级操作 | `history[0]`: `Partial` → `Completed` |
 
-**为什么需要两个步骤（标记 + 创建）？**
+**为什么失败记录保持 Partial 状态？**
 
-1. **保留失败记录**：将失败的升级标记为 `RolledBack`，保留完整的审计历史
-2. **记录回滚决策**：`completionTime` 记录回滚决策时间，而非回滚完成时间
+1. **保留失败记录**：升级失败的记录保持在 `Partial` 状态，用于审计和问题排查
+2. **不修改历史**：OpenShift 不会修改或删除失败的升级记录
 3. **触发回滚执行**：创建新的 `Partial` 记录，表示回滚正在进行
-4. **状态一致性**：`spec.desiredUpdate.version` 与 `history[1].version` 一致，触发回滚执行
+4. **状态一致性**：`spec.desiredUpdate.version` 与 `history[0].version` 一致，触发回滚执行
 
 **回滚完成**：
 ```yaml
@@ -1229,23 +1172,22 @@ status:
     version: 4.11.18
     image: quay.io/openshift-release-dev/ocp-release:4.11.18-x86_64
   history:
-  - state: RolledBack       # 失败的升级
-    version: 4.12.0
-    startedTime: "2024-01-15T10:00:00Z"
-    completionTime: "2024-01-15T11:00:00Z"
   - state: Completed        # 回滚成功
     version: 4.11.18
-    startedTime: "2024-01-15T11:00:00Z"
-    completionTime: "2024-01-15T12:00:00Z"
+    startedTime: "2024-01-15T12:00:00Z"
+    completionTime: "2024-01-15T12:30:00Z"
+  - state: Partial          # 失败的升级记录，保持 Partial
+    version: 4.12.0
+    startedTime: "2024-01-15T10:00:00Z"
   - state: Completed
-    version: 4.11.0
+    version: 4.11.18
+    startedTime: "2023-12-01T08:00:00Z"
+    completionTime: "2023-12-01T09:30:00Z"
   conditions:
   - type: Available
     status: "True"
     reason: AsExpected
     message: "Cluster version is 4.11.18"
-  - type: RollbackInProgress
-    status: "False"         # 回滚已完成
 ```
 
 #### 4.4.4 目标版本选择规则
