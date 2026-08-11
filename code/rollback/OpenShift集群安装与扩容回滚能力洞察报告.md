@@ -1,4 +1,4 @@
-# OpenShift 集群安装与扩容回滚能力洞察报告
+﻿# OpenShift 集群安装与扩容回滚能力洞察报告
 
 ## 一、OpenShift 集群生命周期管理架构
 
@@ -3333,7 +3333,383 @@ businessContinuityGuarantee:
 4. **业务连续性保障**：建立完整的升级前检查、执行监控、升级后验证流程
 5. **回滚准备**：始终保留回滚能力，定义明确的回滚触发条件
 
-## 五、关键设计洞察
+## 五、回滚时的配置与数据管理
+
+### 5.1 回滚时组件启动参数的一致性保证
+
+#### 5.1.1 核心机制：manifest 随版本走
+
+OpenShift 的每个组件（API Server、Controller Manager、Scheduler、etcd 等）的静态 Pod manifest 都包含在 **release payload** 中。每个版本都有自己完整的一套 manifest：
+
+```
+Release Payload v4.11
+├── manifests/
+│   ├── kube-apiserver-pod.yaml       ← v4.11 的启动参数
+│   ├── kube-controller-manager-pod.yaml
+│   ├── kube-scheduler-pod.yaml
+│   └── etcd-pod.yaml
+
+Release Payload v4.12
+├── manifests/
+│   ├── kube-apiserver-pod.yaml       ← v4.12 的启动参数（可能有变化）
+│   ├── kube-controller-manager-pod.yaml
+│   ├── kube-scheduler-pod.yaml
+│   └── etcd-pod.yaml
+```
+
+**回滚时的行为**：不是"修改"当前 manifest，而是**用旧版本的完整 manifest 替换当前 manifest**。
+
+#### 5.1.2 CVO 的回滚流程
+
+```
+1. CVO 拉取旧版本的 release payload（OCI 镜像）
+   │
+   v
+2. CVO 从 payload 中提取旧版本的 manifest
+   │
+   ├── kube-apiserver-pod.yaml (旧版本)
+   │   包含: 旧版本的 feature gates
+   │   包含: 旧版本的启动参数
+   │   不包含: 新版本新增的参数
+   │
+   v
+3. CVO 将旧版本的 manifest 写入 /etc/kubernetes/manifests/
+   │  （覆盖新版本的 manifest）
+   │
+   v
+4. kubelet 检测到 manifest 文件变化
+   │
+   v
+5. kubelet 停止旧的静态 Pod（新版本参数）
+   │
+   v
+6. kubelet 用新的 manifest 启动静态 Pod（旧版本参数）
+```
+
+#### 5.1.3 具体示例
+
+假设 v4.12 的 API Server 新增了一个启动参数：
+
+**v4.11 的 kube-apiserver-pod.yaml**：
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kube-apiserver
+spec:
+  containers:
+  - name: kube-apiserver
+    image: quay.io/openshift/kube-apiserver:v4.11
+    command:
+    - kube-apiserver
+    - --authorization-mode=Node,RBAC
+    - --enable-admission-plugins=NodeRestriction
+    - --feature-gates=RotateKubeletServerCertificate=true
+    # v4.11 没有 --new-feature 参数
+```
+
+**v4.12 的 kube-apiserver-pod.yaml**：
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kube-apiserver
+spec:
+  containers:
+  - name: kube-apiserver
+    image: quay.io/openshift/kube-apiserver:v4.12
+    command:
+    - kube-apiserver
+    - --authorization-mode=Node,RBAC
+    - --enable-admission-plugins=NodeRestriction
+    - --feature-gates=RotateKubeletServerCertificate=true
+    - --new-feature=enabled              # v4.12 新增的参数
+```
+
+**回滚到 v4.11 时**：
+- v4.11 的 manifest 直接覆盖 v4.12 的 manifest
+- `--new-feature` 参数消失（因为 v4.11 的 manifest 中没有）
+- API Server 使用 v4.11 的启动参数重新启动
+
+#### 5.1.4 配置文件的处理
+
+除了静态 Pod manifest，还有一些配置文件也包含在 release payload 中：
+
+```
+/etc/kubernetes/static-pod-resources/
+├── kube-apiserver/
+│   ├── config.yaml           ← API Server 配置
+│   ├── encryption-config.yaml ← 加密配置
+│   └── audit-policy.yaml     ← 审计策略
+```
+
+这些配置文件回滚时同样会被旧版本的配置覆盖。
+
+#### 5.1.5 需要关注的边界情况
+
+| 边界情况 | 说明 | 处理方式 |
+|---------|------|---------|
+| **Feature Gate 变化** | v4.12 新增 FeatureC，回滚后参数消失 | 如果用户在 v4.12 期间使用了 FeatureC 创建的资源，回滚后可能无法被 v4.11 理解 |
+| **Admission Plugin 变化** | v4.12 新增 NewPlugin，回滚后消失 | NewPlugin 创建的资源仍然存在（只要 API 兼容） |
+| **etcd 数据格式变化** | v4.12 在 etcd 中写入新格式数据 | 需要确保存储版本迁移兼容旧版本 |
+
+### 5.2 用户配置的回滚保护机制
+
+#### 5.2.1 两层管理架构
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  第一层：CVO（Cluster Version Operator）                      │
+│  管理范围：平台自身的"骨架"                                    │
+│  ├─ 静态 Pod manifest（API Server、etcd 等）                  │
+│  ├─ Cluster Operator 的 Deployment（如 ingress-operator）     │
+│  ├─ CRD 定义本身                                              │
+│  └─ 回滚时：完全替换为旧版本                                   │
+├──────────────────────────────────────────────────────────────┤
+│  第二层：Cluster Operator（由 CVO 部署）                      │
+│  管理范围：用户通过 CR 配置的"血肉"                            │
+│  ├─ IngressController CR → 生成 router Deployment            │
+│  ├─ Authentication CR → 生成 OAuth 配置                      │
+│  ├─ Proxy CR → 生成代理配置                                   │
+│  └─ 回滚时：CR 不动，Operator 继续按 CR 配置                  │
+└──────────────────────────────────────────────────────────────┘
+```
+
+#### 5.2.2 具体示例：Ingress 配置
+
+用户创建了一个 IngressController CR：
+
+```yaml
+apiVersion: operator.openshift.io/v1
+kind: IngressController
+metadata:
+  name: default
+  namespace: openshift-ingress-operator
+spec:
+  replicas: 5                          # 用户自定义：5 个副本
+  routeSelector:                       # 用户自定义：路由选择器
+    matchLabels:
+      type: production
+  nodePlacement:                       # 用户自定义：调度到特定节点
+    nodeSelector:
+      matchLabels:
+        node-role.kubernetes.io/infra: ""
+```
+
+**回滚时发生了什么**：
+
+| 资源 | 谁管理 | 回滚行为 |
+|------|--------|---------|
+| `openshift-ingress-operator` Deployment | CVO | 替换为旧版本的 Operator 二进制 |
+| `IngressController` CR | 用户（etcd 数据） | **不动**，CR 仍在 etcd 中 |
+| `router-default` Deployment（5 副本） | ingress-operator | Operator 重启后重新读取 CR，按 CR 配置重建 |
+
+#### 5.2.3 技术实现原理
+
+**所有权标记（Owner Reference）**：
+
+CVO 创建的资源带有 CVO 的 owner reference：
+
+```yaml
+metadata:
+  ownerReferences:
+  - apiVersion: config.openshift.io/v1
+    kind: ClusterVersion
+    name: version
+    uid: <cvo-uid>
+```
+
+回滚时，CVO 只操作带有自己 owner reference 的资源。用户创建的 CR 没有 CVO 的 owner reference，所以不会被回滚。
+
+**Operator 的 Reconcile 循环**：
+
+```
+ingress-operator 的 Reconcile 循环：
+
+1. 读取 IngressController CR（从 etcd）
+2. 根据 CR 的 spec 计算期望状态
+3. 创建/更新 router Deployment（按 CR 配置）
+4. 持续监听 CR 变化，实时同步
+
+回滚时：
+1. Operator 二进制被替换为旧版本
+2. Operator Pod 重启
+3. Reconcile 循环重新启动
+4. 重新读取 etcd 中的 IngressController CR
+5. 按 CR 配置重建 router → 用户配置不丢失 ✓
+```
+
+#### 5.2.4 数据存储在 etcd 中
+
+用户的所有 CR 都存储在 etcd 中：
+
+```
+etcd 中的数据：
+├── /registry/operator.openshift.io/ingresscontrollers/.../default
+│   └── {replicas: 5, routeSelector: ...}    ← 用户配置，回滚不动
+├── /registry/authentication/.../cluster
+│   └── {type: OIDC, ...}                    ← 用户配置，回滚不动
+└── /registry/config.openshift.io/proxies/.../cluster
+    └── {httpProxy: ..., httpsProxy: ...}    ← 用户配置，回滚不动
+```
+
+回滚只替换 Operator 的二进制和 manifest，不删除 etcd 中的用户数据。
+
+#### 5.2.5 需要注意的边界情况
+
+| 边界情况 | 说明 | 影响 |
+|---------|------|------|
+| **CRD 不兼容** | v4.12 的 CRD 新增了字段，用户在 CR 中使用了这些字段 | 回滚到 v4.11 后，v4.11 的 CRD 不认识新字段，但 Kubernetes 会保留未知字段 |
+| **Operator 行为变化** | v4.12 的 Operator 对同一个 CR 字段有不同的处理逻辑 | 回滚后 Operator 按 v4.11 的逻辑处理 CR，行为可能变化 |
+| **不可逆的数据迁移** | v4.12 的 Operator 对 etcd 中的数据做了不可逆的修改 | 回滚后 v4.11 的 Operator 可能无法正确恢复配置 |
+
+### 5.3 配置数据的持久化方式
+
+#### 5.3.1 核心原理
+
+```
+回滚时 CVO 替换的内容（会丢失）：
+├── 静态 Pod manifest（/etc/kubernetes/manifests/）
+├── Operator Deployment 的 manifest
+├── CVO 管理的 ConfigMap/Secret（带有 CVO owner reference 的）
+└── CVO 管理的 CRD 定义
+
+回滚时不动的内容（会保留）：
+├── etcd 数据目录（/var/lib/etcd/）
+├── 用户创建的 CR
+├── 用户创建的 ConfigMap/Secret
+├── 用户创建的业务资源（Pod、Service 等）
+└── 节点上的非 CVO 管理文件
+```
+
+**关键洞察**：只要数据存储在 etcd 中（任何 K8s 资源都存储在 etcd 中），且不被 CVO 主动删除，回滚后就会保留。
+
+#### 5.3.2 四种持久化方式
+
+| 方式 | 用途 | 回滚后是否保留 | 说明 |
+|------|------|--------------|------|
+| **CR** | Operator 管理的核心配置 | ✓ 保留 | Operator 主动 watch CR，自动按 CR 配置重建资源 |
+| **ConfigMap/Secret** | 证书、代理配置等 | ✓ 保留 | 存储在 etcd 中，回滚后保留 |
+| **MachineConfig** | 节点级配置（kubelet 参数等） | ✓ 保留 | MCO 管理，存储在 etcd 中 |
+| **注解/标签** | 资源元数据 | ✓ 保留 | 存储在 etcd 中 |
+
+#### 5.3.3 哪些配置必须 CR 化
+
+| 配置类型 | 是否必须 CR 化 | 原因 |
+|---------|--------------|------|
+| **Operator 行为配置**（如 replicas、调度策略） | **是** | Operator 需要 watch 并自动 reconcile |
+| **集群级策略**（如认证、网络策略） | **是** | 需要 schema 验证和版本管理 |
+| **TLS 证书/密钥** | **否** | Secret 存储在 etcd，回滚后保留 |
+| **环境变量/简单键值对** | **否** | ConfigMap 存储在 etcd，回滚后保留 |
+| **节点级配置**（kubelet 参数） | **是**（通过 MachineConfig） | 需要 MCO 管理并自动应用到节点 |
+| **用户业务资源** | **否** | 普通 K8s 资源存储在 etcd，回滚后保留 |
+
+#### 5.3.4 CR 化的真正价值
+
+CR 化不是为了"保留数据"（ConfigMap 也能保留），而是为了：
+
+| 价值 | 说明 |
+|------|------|
+| **Schema 验证** | CRD 定义字段类型，防止配置错误 |
+| **版本转换** | CRD 支持 conversion webhook，跨版本兼容 |
+| **Operator 自动 reconcile** | watch CR → 自动同步状态 |
+| **状态反馈** | CR.status 反映配置的实际执行状态 |
+| **所有权管理** | owner reference 明确谁管理什么 |
+| **RBAC 控制** | 可以对 CR 做细粒度权限控制 |
+
+### 5.4 CRD 变化时的回滚处理
+
+#### 5.4.1 场景分析
+
+假设 v4.12 新增了一个 CRD：
+
+```
+v4.11 的 release payload：
+├── CRD: IngressController (已有)
+├── CRD: Authentication (已有)
+└── 没有 NewFeature CRD
+
+v4.12 的 release payload：
+├── CRD: IngressController (已有)
+├── CRD: Authentication (已有)
+├── CRD: NewFeature (新增)    ← 新增
+└── 用户创建了 NewFeature CR 实例
+```
+
+#### 5.4.2 回滚时的行为
+
+**OpenShift 的实际行为：保留新增的 CRD，不删除**
+
+```
+回滚前（v4.12）：
+  etcd 中：
+  ├── CRD: NewFeature          ← v4.12 新增的
+  ├── CR: NewFeature/my-config ← 用户创建的实例
+  └── CRD: IngressController   ← 已有的
+
+回滚后（v4.11）：
+  etcd 中：
+  ├── CRD: NewFeature          ← 保留（CVO 不删除）
+  ├── CR: NewFeature/my-config ← 保留（数据不丢失）
+  └── CRD: IngressController   ← 保留
+```
+
+**OpenShift 选择保留新增 CRD 的原因**：
+
+1. **数据安全优先**：删除 CRD 会导致用户数据丢失，这是不可接受的
+2. **CRD 本身是声明式的**：CRD 只是 schema 定义，保留它不会造成危害
+3. **Operator 不存在**：v4.11 没有对应的 Operator，CR 不会被 reconcile，但数据仍在
+4. **用户可以手动处理**：用户可以选择保留或手动删除
+
+#### 5.4.3 不同 CRD 变化类型的处理
+
+| 变化类型 | CVO 行为 | 数据是否丢失 | 用户需要做什么 |
+|---------|---------|------------|--------------|
+| **新增 CRD** | 保留 CRD（不删除） | 不丢失 | 无需操作，或手动清理 |
+| **新增 CRD 字段** | CRD 替换为旧版本 | 不丢失（etcd 保留） | 无需操作 |
+| **删除 CRD 字段** | CRD 替换为旧版本 | 可能丢失（取决于数据迁移） | 检查数据完整性 |
+| **修改 CRD 字段类型** | CRD 替换为旧版本 | 可能不兼容 | 检查数据兼容性 |
+
+#### 5.4.4 Kubernetes 对未知字段的处理
+
+CRD 中删除字段定义后：
+- etcd 中已有的 CR 数据**不会被清除**
+- 通过 API 读取 CR 时，未知字段会被**静默丢弃**（不返回）
+- 但数据仍在 etcd 中，如果 CRD 恢复该字段，数据又可见
+
+#### 5.4.5 对 BKE 的启示
+
+| 设计要点 | 建议 |
+|---------|------|
+| **新增 CRD** | 回滚时保留 CRD 和 CR，不删除 |
+| **CRD 字段变化** | 保证相邻版本 CRD 向后兼容 |
+| **数据迁移** | 如果必须删除字段，先做数据迁移再删除 |
+| **版本转换** | 考虑实现 CRD conversion webhook |
+| **回滚前检查** | 检查是否有新版本独有的 CR/数据 |
+
+### 5.5 总结
+
+#### 5.5.1 回滚时数据保护的核心原则
+
+| 原则 | 说明 |
+|------|------|
+| **manifest 随版本走** | 每个版本的 release payload 中包含完整的 manifest 和配置文件 |
+| **CVO 只管 CVO 创建的资源** | 用户通过 CR 创建的资源归 Operator 管，回滚时不动 |
+| **数据持久化在 etcd** | 只要数据存储在 etcd 中且不被主动删除，回滚后就会保留 |
+| **新增 CRD 不删除** | 数据安全优先，保留新增的 CRD 和 CR |
+
+#### 5.5.2 对 BKE 的设计建议
+
+| 设计要点 | OpenShift 的做法 | BKE 需要做的 |
+|---------|-----------------|-------------|
+| **分层管理** | CVO 管骨架，Operator 管血肉 | 明确区分平台配置和用户配置 |
+| **CR 存储在 etcd** | 用户配置作为 CR 存储在 etcd | 用户配置通过 BKECluster CR 管理 |
+| **Operator 独立 Reconcile** | 每个 Operator 独立读取 CR | BKE Agent 独立读取配置 |
+| **回滚只替换二进制** | CVO 只替换 Operator 的 Deployment | 回滚时只替换二进制，不删除用户 CR |
+| **CRD 兼容性** | 保证相邻版本 CRD 兼容 | 保证相邻版本 BKECluster CRD 兼容 |
+| **manifest 版本化** | 每个版本有完整的 manifest 集合 | 需要在 ReleaseImage Bundle 中包含完整 manifest |
+
+## 六、关键设计洞察
 
 ### 5.1 回滚能力对比
 
@@ -3379,9 +3755,9 @@ Installing → Installed → Upgrading → UpgradeFailed → RollingBack → Rol
 | **安全** | 回滚前验证 | 健康检查 + 超时控制 |
 | **幂等** | 多次回滚结果一致 | 基于期望状态的收敛 |
 
-## 六、对 BKE 的借鉴意义
+## 七、对 BKE 的借鉴意义
 
-### 6.1 已借鉴的设计
+### 7.1 已借鉴的设计
 
 从代码分析看，BKE 已借鉴 OpenShift 的核心设计：
 
@@ -3393,11 +3769,11 @@ Installing → Installed → Upgrading → UpgradeFailed → RollingBack → Rol
 | `UpgradeHistory` | `UpgradeHistory` | 升级历史 |
 | `ClusterVersionRollingBack` | `ClusterVersionRollingBack` | 回滚状态 |
 
-### 6.2 建议增强的能力
+### 7.2 建议增强的能力
 
 基于 OpenShift 经验，建议 BKE 增强以下能力：
 
-#### 6.2.1 安装失败处理
+#### 7.2.1 安装失败处理
 
 ```go
 // 建议：增加安装失败处理机制
@@ -3413,7 +3789,7 @@ type InstallFailureHandler struct {
 }
 ```
 
-#### 6.2.2 扩容回滚优化
+#### 7.2.2 扩容回滚优化
 
 ```go
 // 建议：增强扩容回滚能力
@@ -3433,7 +3809,7 @@ type ScaleRollbackSpec struct {
 }
 ```
 
-#### 6.2.3 升级回滚增强
+#### 7.2.3 升级回滚增强
 
 ```go
 // 建议：增强升级回滚能力
@@ -3463,7 +3839,7 @@ type RollbackCondition struct {
 }
 ```
 
-### 6.3 实施建议
+### 7.3 实施建议
 
 | 优先级 | 能力 | 工作量 | 价值 |
 |--------|------|--------|------|
@@ -3474,34 +3850,34 @@ type RollbackCondition struct {
 | **P2** | 跨版本回滚 | 高 | 低 |
 | **P2** | 部分回滚 | 高 | 低 |
 
-## 七、总结
+## 八、总结
 
-### 7.1 OpenShift 回滚能力特点
+### 8.1 OpenShift 回滚能力特点
 
 1. **安装不支持回滚**：设计哲学是"快速失败，重建集群"
 2. **扩容支持回滚**：通过声明式 API 减少 replicas
 3. **升级支持回滚**：自动/手动回滚到相邻版本
 4. **配置支持回滚**：通过 MachineConfig 版本管理
 
-### 7.2 核心设计洞察
+### 8.2 核心设计洞察
 
 1. **声明式优于命令式**：通过修改期望状态触发回滚，而非调用回滚 API
 2. **渐进式回滚**：逐组件、逐节点回滚，降低风险
 3. **完整的历史记录**：`status.history` 提供完整的升级/回滚审计
 4. **安全优先**：回滚前验证、超时控制、健康检查
 
-### 7.3 对 BKE 的启示
+### 8.3 对 BKE 的启示
 
 1. **安装失败**：建议实现自动重试和清理机制，而非回滚
 2. **扩容失败**：实现声明式回滚，减少 replicas 即可
 3. **升级失败**：实现自动回滚，参考 OpenShift 的 `AutoRollback` 设计
 4. **状态管理**：完善 `UpgradeHistory`，记录完整的升级/回滚历史
 
-## 八、优化状态设计方案
+## 九、优化状态设计方案
 
-### 8.1 当前设计的问题分析
+### 9.1 当前设计的问题分析
 
-#### 8.1.1 状态转换过于复杂
+#### 9.1.1 状态转换过于复杂
 
 ```mermaid
 graph LR
@@ -3518,7 +3894,7 @@ graph LR
 - 状态转换路径不清晰
 - 需要同时管理 history 数组和 state 字段
 
-#### 8.1.2 history 数组管理复杂
+#### 9.1.2 history 数组管理复杂
 
 ```go
 // current 获取逻辑复杂
@@ -3554,7 +3930,7 @@ func getCurrentVersion(cv *ClusterVersion) string {
 - 不同状态的获取逻辑不同
 - 容易出错
 
-#### 8.1.3 状态语义不清晰
+#### 9.1.3 状态语义不清晰
 
 | 状态 | 问题 |
 |------|------|
@@ -3562,7 +3938,7 @@ func getCurrentVersion(cv *ClusterVersion) string {
 | `RolledBack` | 既表示"已回滚"，又需要创建新的回滚记录 |
 | `Completed` | 既表示"升级成功"，又表示"回滚成功" |
 
-#### 8.1.4 回滚失败场景处理复杂
+#### 9.1.4 回滚失败场景处理复杂
 
 ```yaml
 # 回滚失败时的状态
@@ -3585,16 +3961,16 @@ status:
 - 需要人工干预
 - 难以自动恢复
 
-### 8.2 新的状态设计方案
+### 9.2 新的状态设计方案
 
-#### 8.2.1 设计原则
+#### 9.2.1 设计原则
 
 1. **分离关注点**：将"操作状态"和"版本状态"分离
 2. **简化状态转换**：减少状态数量，明确状态语义
 3. **独立审计日志**：使用独立的审计日志记录所有操作
 4. **清晰的 current**：使用单一字段表示当前版本
 
-#### 8.2.2 核心设计
+#### 9.2.2 核心设计
 
 ##### 1. 状态字段设计
 
@@ -3806,9 +4182,9 @@ status:
     completedAt: "2024-01-15T12:00:00Z"
 ```
 
-### 8.3 新设计的优势
+### 9.3 新设计的优势
 
-#### 8.3.1 简化状态转换
+#### 9.3.1 简化状态转换
 
 | 对比项 | 旧设计 | 新设计 |
 |--------|--------|--------|
@@ -3816,7 +4192,7 @@ status:
 | 状态语义 | 复杂（Partial 有多种含义） | 清晰（每个状态有明确含义） |
 | 转换路径 | 复杂（需要多次转换） | 简单（直接转换） |
 
-#### 8.3.2 简化版本管理
+#### 9.3.2 简化版本管理
 
 | 对比项 | 旧设计 | 新设计 |
 |--------|--------|--------|
@@ -3824,7 +4200,7 @@ status:
 | 版本状态 | 分散在 history 数组中 | 集中在 status 字段中 |
 | 版本一致性 | 需要手动维护 | 自动维护 |
 
-#### 8.3.3 独立的审计日志
+#### 9.3.3 独立的审计日志
 
 | 对比项 | 旧设计 | 新设计 |
 |--------|--------|--------|
@@ -3832,7 +4208,7 @@ status:
 | 查询历史 | 需要解析 history 数组 | 直接查询审计日志 |
 | 审计能力 | 有限 | 完整（支持任意查询） |
 
-#### 8.3.4 清晰的错误处理
+#### 9.3.4 清晰的错误处理
 
 | 对比项 | 旧设计 | 新设计 |
 |--------|--------|--------|
@@ -3840,9 +4216,9 @@ status:
 | 错误恢复 | 需要人工判断 | 明确的恢复路径 |
 | 错误信息 | 分散在 conditions 中 | 集中在审计日志中 |
 
-### 8.4 实现示例
+### 9.4 实现示例
 
-#### 8.4.1 升级流程
+#### 9.4.1 升级流程
 
 ```go
 func (cvo *ClusterVersionOperator) StartUpgrade(targetVersion string) error {
@@ -3909,7 +4285,7 @@ func (cvo *ClusterVersionOperator) CompleteUpgrade(success bool, errMsg string) 
 }
 ```
 
-#### 8.4.2 查询当前版本
+#### 9.4.2 查询当前版本
 
 ```go
 // 新设计：直接读取
@@ -3938,7 +4314,7 @@ func getCurrentVersionOld(cv *ClusterVersion) string {
 }
 ```
 
-### 8.5 总结
+### 9.5 总结
 
 新设计的核心优势：
 
@@ -3949,11 +4325,11 @@ func getCurrentVersionOld(cv *ClusterVersion) string {
 
 这个设计更适合从头实现，避免了 OpenShift 历史包袱带来的复杂性。
 
-## 九、兼容重构方案
+## 十、兼容重构方案
 
-### 9.1 重构策略选择
+### 10.1 重构策略选择
 
-#### 9.1.1 可选策略对比
+#### 10.1.1 可选策略对比
 
 | 策略 | 优点 | 缺点 | 适用场景 |
 |------|------|------|---------|
@@ -3964,7 +4340,7 @@ func getCurrentVersionOld(cv *ClusterVersion) string {
 
 **推荐策略**：**渐进式迁移 + 特性开关**
 
-### 9.2 兼容重构架构
+### 10.2 兼容重构架构
 
 ```mermaid
 graph TB
@@ -3994,9 +4370,9 @@ graph TB
     end
 ```
 
-### 9.3 分阶段实施计划
+### 10.3 分阶段实施计划
 
-#### 9.3.1 阶段 1: 基础设施准备（2 周）
+#### 10.3.1 阶段 1: 基础设施准备（2 周）
 
 **目标**：搭建兼容框架，不改变现有行为
 
@@ -4082,7 +4458,7 @@ func (s *DataSyncer) SyncNewModelToHistory(cv *ClusterVersion) {
 }
 ```
 
-#### 9.3.2 阶段 2: 控制器适配（3 周）
+#### 10.3.2 阶段 2: 控制器适配（3 周）
 
 **目标**：控制器同时支持新旧两种模式
 
@@ -4168,7 +4544,7 @@ func (r *ClusterVersionReconciler) handleUpgrade(ctx context.Context, cv *Cluste
 }
 ```
 
-#### 9.3.3 阶段 3: 验证与测试（2 周）
+#### 10.3.3 阶段 3: 验证与测试（2 周）
 
 **目标**：确保新旧模式行为一致
 
@@ -4242,7 +4618,7 @@ func BenchmarkReconcile(b *testing.B) {
 }
 ```
 
-#### 9.3.4 阶段 4: 灰度发布（2 周）
+#### 10.3.4 阶段 4: 灰度发布（2 周）
 
 **目标**：逐步切换到新模式
 
@@ -4286,7 +4662,7 @@ func (r *ClusterVersionReconciler) shouldUseNewMode(cv *ClusterVersion) bool {
 }
 ```
 
-#### 9.3.5 阶段 5: 全量切换（1 周）
+#### 10.3.5 阶段 5: 全量切换（1 周）
 
 **目标**：完全切换到新模式
 
@@ -4331,9 +4707,9 @@ func (m *MigrationTool) MigrateAll(ctx context.Context) error {
 // 移除数据同步器
 ```
 
-### 9.4 风险控制
+### 10.4 风险控制
 
-#### 9.4.1 回滚方案
+#### 10.4.1 回滚方案
 
 ```bash
 # 快速回滚到旧模式
@@ -4344,7 +4720,7 @@ kubectl patch configmap cvo-feature-flags -n openshift-cluster-version \
 kubectl rollout restart deployment/cluster-version-operator -n openshift-cluster-version
 ```
 
-#### 9.4.2 监控指标
+#### 10.4.2 监控指标
 
 ```go
 // 监控新旧模式的使用情况
@@ -4367,7 +4743,7 @@ var (
 )
 ```
 
-### 9.5 时间线
+### 10.5 时间线
 
 | 阶段 | 时间 | 里程碑 |
 |------|------|--------|
@@ -4379,7 +4755,7 @@ var (
 
 **总计**：10 周（2.5 个月）
 
-### 9.6 关键成功因素
+### 10.6 关键成功因素
 
 1. **充分的测试覆盖**：确保新旧模式行为一致
 2. **完善的监控指标**：实时监控新旧模式的使用情况
@@ -4389,11 +4765,11 @@ var (
 
 这个兼容重构方案既采用了新设计的优势，又确保了与现有实现的兼容性，降低了迁移风险。
 
-## 十、重建集群方案
+## 十一、重建集群方案
 
-### 10.1 重建集群的场景
+### 11.1 重建集群的场景
 
-#### 10.1.1 触发条件
+#### 11.1.1 触发条件
 
 重建集群是**最后的手段**，只在以下情况下使用：
 
@@ -4420,7 +4796,7 @@ graph TB
 | **基础设施故障** | 底层基础设施（VM、网络、存储）故障 | 无法修复 |
 | **配置严重错误** | 配置错误导致集群无法启动 | 无法回滚 |
 
-#### 10.1.2 重建 vs 回滚的决策
+#### 11.1.2 重建 vs 回滚的决策
 
 ```go
 type RebuildDecision struct {
@@ -4480,9 +4856,9 @@ func (cvo *ClusterVersionOperator) ShouldRebuildCluster(cv *ClusterVersion) *Reb
 }
 ```
 
-### 10.2 重建前的准备工作
+### 11.2 重建前的准备工作
 
-#### 10.2.1 数据备份清单
+#### 11.2.1 数据备份清单
 
 **必须备份的数据**：
 
@@ -4523,7 +4899,7 @@ backupChecklist:
       location: "/backup/application/"
 ```
 
-#### 10.2.2 备份脚本
+#### 11.2.2 备份脚本
 
 ```bash
 #!/bin/bash
@@ -4574,7 +4950,7 @@ echo "Backup completed: $BACKUP_DIR"
 ls -lh "$BACKUP_DIR"
 ```
 
-#### 10.2.3 备份验证
+#### 11.2.3 备份验证
 
 ```bash
 #!/bin/bash
@@ -4615,9 +4991,9 @@ fi
 echo "Backup verification completed"
 ```
 
-### 10.3 重建流程
+### 11.3 重建流程
 
-#### 10.3.1 自动化重建流程
+#### 11.3.1 自动化重建流程
 
 ```mermaid
 sequenceDiagram
@@ -4641,7 +5017,7 @@ sequenceDiagram
     Tool-->>Admin: 重建完成
 ```
 
-#### 10.3.2 重建工具设计
+#### 11.3.2 重建工具设计
 
 ```go
 type ClusterRebuilder struct {
@@ -4737,7 +5113,7 @@ func (r *ClusterRebuilder) Rebuild(ctx context.Context) error {
 }
 ```
 
-#### 10.3.3 手动重建步骤
+#### 11.3.3 手动重建步骤
 
 ```bash
 #!/bin/bash
@@ -4830,9 +5206,9 @@ echo ""
 echo "=== Rebuild Completed ==="
 ```
 
-### 10.4 重建后的恢复
+### 11.4 重建后的恢复
 
-#### 10.4.1 恢复 Kubernetes 资源
+#### 11.4.1 恢复 Kubernetes 资源
 
 ```bash
 #!/bin/bash
@@ -4878,7 +5254,7 @@ kubectl apply -f "$BACKUP_DIR/all-resources.yaml" --selector='kind=DaemonSet'
 echo "Kubernetes resources restored"
 ```
 
-#### 10.4.2 恢复应用数据
+#### 11.4.2 恢复应用数据
 
 ```bash
 #!/bin/bash
@@ -4915,7 +5291,7 @@ echo "PV/PVC restored"
 echo "Application data restored"
 ```
 
-#### 10.4.3 验证恢复
+#### 11.4.3 验证恢复
 
 ```bash
 #!/bin/bash
@@ -4960,9 +5336,9 @@ echo ""
 echo "=== Restoration Verified ==="
 ```
 
-### 10.5 重建最佳实践
+### 11.5 重建最佳实践
 
-#### 10.5.1 重建前检查清单
+#### 11.5.1 重建前检查清单
 
 ```yaml
 # rebuild-checklist.yaml
@@ -4995,7 +5371,7 @@ preRebuildChecklist:
       - "回滚时间窗口已确认"
 ```
 
-#### 10.5.2 重建时间估算
+#### 11.5.2 重建时间估算
 
 ```go
 type RebuildTimeline struct {
@@ -5047,7 +5423,7 @@ func EstimateRebuildTime(clusterSize int, dataSizeGB int) *RebuildTimeline {
 // Total: 325m ≈ 5.4 小时
 ```
 
-#### 10.5.3 风险控制
+#### 11.5.3 风险控制
 
 ```yaml
 # risk-mitigation.yaml
@@ -5085,9 +5461,9 @@ risks:
       - "准备扩容方案"
 ```
 
-### 10.6 总结
+### 11.6 总结
 
-#### 10.6.1 重建 vs 回滚对比
+#### 11.6.1 重建 vs 回滚对比
 
 | 维度 | 回滚 | 重建 |
 |------|------|------|
@@ -5097,7 +5473,7 @@ risks:
 | **风险** | 低 | 高 |
 | **适用场景** | 相邻版本回滚 | 跨版本或严重故障 |
 
-#### 10.6.2 决策流程
+#### 11.6.2 决策流程
 
 ```mermaid
 graph TD
@@ -5114,7 +5490,7 @@ graph TD
     style G fill:#ff6b6b
 ```
 
-#### 10.6.3 最佳实践
+#### 11.6.3 最佳实践
 
 1. **定期备份**：每天自动备份，每周验证备份
 2. **备份验证**：在测试环境验证备份可恢复
@@ -5124,15 +5500,15 @@ graph TD
 
 重建集群是最后的手段，应该尽量避免。通过完善的备份策略和回滚机制，可以最大程度减少重建的需求。
 
-## 十一、OpenShift 备份机制
+## 十二、OpenShift 备份机制
 
 OpenShift 提供了多层次的备份机制，确保集群数据的安全性和可恢复性。
 
-### 11.1 etcd 备份
+### 14.1 etcd 备份
 
 etcd 是 OpenShift 的核心数据存储，备份 etcd 是灾难恢复的关键。
 
-#### 11.1.1 自动备份机制
+#### 14.1.1 自动备份机制
 
 ##### (a) CronJob 定时备份
 
@@ -5202,7 +5578,7 @@ if params.NeedBackup && params.Node.IP == params.BackupNode.IP {
 }
 ```
 
-#### 11.1.2 手动备份方法
+#### 14.1.2 手动备份方法
 
 ##### (a) 使用 etcdctl 命令行工具
 
@@ -5241,7 +5617,7 @@ etcdctl snapshot save /var/backup/etcd/snapshot-$(date +%Y%m%d).db \
   --key=/etc/kubernetes/pki/etcd/healthcheck-client.key
 ```
 
-#### 11.1.3 备份验证
+#### 12.1.3 备份验证
 
 ```bash
 # 验证 etcd 快照完整性
@@ -5255,9 +5631,9 @@ etcdctl snapshot status /backup/etcd-snapshot.db --write-out=table
 # +----------+----------+------------+------------+
 ```
 
-### 11.2 集群资源备份
+### 12.2 集群资源备份
 
-#### 11.2.1 使用 oc/kubectl 命令备份资源
+#### 12.2.1 使用 oc/kubectl 命令备份资源
 
 ```bash
 #!/bin/bash
@@ -5285,7 +5661,7 @@ for crd in $(oc get crd -o jsonpath='{.items[*].metadata.name}'); do
 done
 ```
 
-#### 11.2.2 备份范围
+#### 12.2.2 备份范围
 
 | 资源类型 | 备份命令 | 说明 |
 |---------|---------|------|
@@ -5296,9 +5672,9 @@ done
 | **CRD** | `oc get crd -o yaml` | 自定义资源定义 |
 | **自定义资源** | `oc get <crd-name> --all-namespaces -o yaml` | 自定义资源实例 |
 
-### 11.3 应用数据备份
+### 12.3 应用数据备份
 
-#### 11.3.1 Persistent Volume 备份
+#### 12.3.1 Persistent Volume 备份
 
 ```bash
 # 备份 PV 和 PVC 定义
@@ -5308,7 +5684,7 @@ oc get pv,pvc --all-namespaces -o yaml > pv-pvc.yaml
 oc apply -f pv-pvc.yaml
 ```
 
-#### 11.3.2 数据库备份
+#### 12.3.2 数据库备份
 
 ```bash
 # MySQL 备份
@@ -5321,7 +5697,7 @@ oc exec -it deployment/postgres -- pg_dumpall -U postgres > database-dump.sql
 oc exec -it deployment/mysql -- mysql -u root -p < database-dump.sql
 ```
 
-#### 11.3.3 应用文件备份
+#### 12.3.3 应用文件备份
 
 ```bash
 # 备份应用文件
@@ -5331,9 +5707,9 @@ oc cp default/file-server:/data ./backup/files
 oc cp ./backup/files default/file-server:/data
 ```
 
-### 11.4 灾难恢复
+### 12.4 灾难恢复
 
-#### 11.4.1 从 etcd 备份恢复
+#### 12.4.1 从 etcd 备份恢复
 
 ```bash
 # 1. 停止所有静态 Pod
@@ -5357,7 +5733,7 @@ mv /var/lib/etcd-from-backup /var/lib/etcd
 etcdctl endpoint health --endpoints=https://10.0.0.1:2379
 ```
 
-#### 11.4.2 从资源备份恢复
+#### 12.4.2 从资源备份恢复
 
 ```bash
 #!/bin/bash
@@ -5386,7 +5762,7 @@ oc apply -f "$BACKUP_DIR/all-resources.yaml" --selector='kind=StatefulSet'
 oc apply -f "$BACKUP_DIR/all-resources.yaml" --selector='kind=DaemonSet'
 ```
 
-#### 11.4.3 集群重建恢复
+#### 12.4.3 集群重建恢复
 
 ```bash
 #!/bin/bash
@@ -5417,11 +5793,11 @@ oc get nodes
 oc get pods --all-namespaces
 ```
 
-### 11.5 手工备份集群与恢复方案设计（基于 OpenShift 官方文档）
+### 12.5 手工备份集群与恢复方案设计（基于 OpenShift 官方文档）
 
 基于 OpenShift 4.17 官方文档，本节提供严格遵循官方标准操作流程的手工备份与恢复方案设计。
 
-#### 11.5.1 备份方案设计
+#### 12.5.1 备份方案设计
 
 ##### (a) 备份架构总览
 
@@ -5599,7 +5975,7 @@ backupConstraints:
     - "不要跳过备份验证"
 ```
 
-#### 11.5.2 恢复方案设计
+#### 12.5.2 恢复方案设计
 
 ##### (a) 恢复场景分类
 
@@ -5906,7 +6282,7 @@ restoreConstraints:
     - "不要在未备份的情况下恢复"
 ```
 
-#### 11.5.3 备份恢复 Go 代码模型
+#### 12.5.3 备份恢复 Go 代码模型
 
 ##### BackupManager 设计
 
@@ -6345,7 +6721,7 @@ func (s *BackupSchedule) Stop() {
 }
 ```
 
-#### 11.5.4 对 BKE 的借鉴
+#### 12.5.4 对 BKE 的借鉴
 
 ##### 备份恢复 API 设计
 
@@ -6537,7 +6913,7 @@ func (o *RestoreOrchestrator) OrchestrateRestore(ctx context.Context, req *Resto
 | **恢复编排** | 手动执行 | 实现 RestoreOrchestrator |
 | **通知机制** | 无 | 实现 Notifier 接口 |
 
-#### 11.5.5 证书与 Service、Node 绑定的备份恢复方案
+#### 12.5.5 证书与 Service、Node 绑定的备份恢复方案
 
 OpenShift 中的证书体系复杂，不同类型的证书与不同的组件（控制面、Service、Node）绑定，在备份和恢复时需要采用不同的策略。
 
@@ -7196,9 +7572,9 @@ certificateConstraints:
     - "不要手动修改 service-ca 管理的证书"
 ```
 
-### 11.6 第三方工具
+### 12.6 第三方工具
 
-#### 11.5.1 OADP (OpenShift API for Data Protection)
+#### 12.5.1 OADP (OpenShift API for Data Protection)
 
 OADP 是 Red Hat 提供的备份解决方案，基于 Velero。
 
@@ -7254,7 +7630,7 @@ velero restore create --from-backup my-backup
 velero schedule create daily-backup --schedule="0 1 * * *"
 ```
 
-#### 11.5.2 其他备份工具
+#### 12.5.2 其他备份工具
 
 | 工具 | 用途 | 说明 |
 |------|------|------|
@@ -7263,9 +7639,9 @@ velero schedule create daily-backup --schedule="0 1 * * *"
 | **Rsync** | 数据同步 | PV 数据的增量同步 |
 | **Storage Snapshot** | 存储快照 | 利用存储后端原生快照能力 |
 
-### 11.6 最佳实践
+### 12.6 最佳实践
 
-#### 11.6.1 备份策略
+#### 12.6.1 备份策略
 
 | 维度 | 推荐做法 |
 |------|---------|
@@ -7275,7 +7651,7 @@ velero schedule create daily-backup --schedule="0 1 * * *"
 | **加密** | 备份数据加密存储 |
 | **验证** | 每周验证备份可恢复性 |
 
-#### 11.6.2 升级前检查清单
+#### 12.6.2 升级前检查清单
 
 ```yaml
 preUpgradeChecklist:
@@ -7301,7 +7677,7 @@ preUpgradeChecklist:
       - "用户已通知"
 ```
 
-#### 11.6.3 灾难恢复决策流程
+#### 12.6.3 灾难恢复决策流程
 
 ```mermaid
 graph TD
@@ -7318,7 +7694,7 @@ graph TD
     style G fill:#ff6b6b
 ```
 
-#### 11.6.4 时间估算
+#### 12.6.4 时间估算
 
 | 操作 | 预计时间 |
 |------|---------|
@@ -7330,7 +7706,7 @@ graph TD
 | 验证 | 15 分钟 |
 | **总计（100GB 数据）** | **约 5.4 小时** |
 
-### 11.7 总结
+### 12.7 总结
 
 OpenShift 提供了多层次的备份机制：
 
@@ -7347,11 +7723,11 @@ OpenShift 提供了多层次的备份机制：
 - 制定清晰的灾难恢复流程
 - 定期进行灾难恢复演练
 
-## 十二、OpenShift 备份数据存储方案深度分析
+## 十三、OpenShift 备份数据存储方案深度分析
 
 基于 OpenShift 官方文档（4.18 版本），本章深入分析 OpenShift 的备份数据存储架构，为 BKE 备份体系设计提供参考。
 
-### 12.1 备份存储体系总览
+### 14.1 备份存储体系总览
 
 OpenShift 采用**分层备份架构**，将备份数据按重要性和恢复粒度分为两层：
 
@@ -7380,9 +7756,9 @@ graph TB
     end
 ```
 
-### 12.2 控制平面备份存储方案
+### 14.2 控制平面备份存储方案
 
-#### 12.2.1 etcd 快照存储
+#### 14.2.1 etcd 快照存储
 
 ##### 存储位置与路径
 
@@ -7481,7 +7857,7 @@ etcdBackupSecurity:
       - "https://<master-ip>:2379"
 ```
 
-#### 12.2.2 静态 Pod 资源与证书存储
+#### 14.2.2 静态 Pod 资源与证书存储
 
 ```yaml
 staticResourceBackup:
@@ -7506,9 +7882,9 @@ staticResourceBackup:
     includeTimestamp: true
 ```
 
-### 12.3 应用数据备份存储方案（OADP）
+### 14.3 应用数据备份存储方案（OADP）
 
-#### 12.3.1 OADP 存储架构
+#### 14.3.1 OADP 存储架构
 
 ```mermaid
 graph TB
@@ -7537,7 +7913,7 @@ graph TB
     end
 ```
 
-#### 12.3.2 BackupStorageLocation 配置
+#### 14.3.2 BackupStorageLocation 配置
 
 ```yaml
 apiVersion: oadp.openshift.io/v1alpha1
@@ -7585,7 +7961,7 @@ spec:
           key: cloud
 ```
 
-#### 12.3.3 备份数据存储格式
+#### 14.3.3 备份数据存储格式
 
 ```
 对象存储桶 (Bucket)
@@ -7633,7 +8009,7 @@ spec:
             └── ...                  # 同上 backups/ 结构
 ```
 
-#### 12.3.4 PV 数据存储方式对比
+#### 14.3.4 PV 数据存储方式对比
 
 | 存储方式 | 后端 | 适用场景 | 性能 | 增量支持 |
 |---------|------|---------|------|---------|
@@ -7642,7 +8018,7 @@ spec:
 | **Restic 文件级** | 对象存储（S3/GCS/Azure） | 通用（旧版） | 中 | 是（文件级） |
 | **Storage 快照** | CSI 驱动 + 对象存储 | CSI 兼容环境 | 高 | 取决于 CSI |
 
-#### 12.3.5 DataMover 大规模数据搬运
+#### 14.3.5 DataMover 大规模数据搬运
 
 ```yaml
 # DataMover 架构：高效搬运 PVC 数据到备份存储
@@ -7667,9 +8043,9 @@ dataMover:
     - "适合大规模 PVC 数据（TB 级）"
 ```
 
-### 12.4 备份存储后端选型分析
+### 14.4 备份存储后端选型分析
 
-#### 12.4.1 存储后端对比矩阵
+#### 14.4.1 存储后端对比矩阵
 
 ```go
 type BackupStorageBackend struct {
@@ -7704,7 +8080,7 @@ var BackupStorageBackends = []BackupStorageBackend{
 }
 ```
 
-#### 12.4.2 推荐存储组合
+#### 14.4.2 推荐存储组合
 
 ```yaml
 recommendedStorageCombination:
@@ -7741,9 +8117,9 @@ recommendedStorageCombination:
     schedule: "按需（新镜像推送后）"
 ```
 
-### 12.5 备份存储生命周期管理
+### 14.5 备份存储生命周期管理
 
-#### 12.5.1 数据生命周期策略
+#### 14.5.1 数据生命周期策略
 
 ```go
 type BackupLifecyclePolicy struct {
@@ -7776,7 +8152,7 @@ var LifecycleRules = []LifecycleRule{
 }
 ```
 
-#### 12.5.2 存储容量规划
+#### 14.5.2 存储容量规划
 
 ```go
 func CalculateBackupStorageRequirement(
@@ -7807,9 +8183,9 @@ func CalculateBackupStorageRequirement(
 }
 ```
 
-### 12.6 备份存储安全架构
+### 14.6 备份存储安全架构
 
-#### 12.6.1 安全分层
+#### 14.6.1 安全分层
 
 ```mermaid
 graph TB
@@ -7837,7 +8213,7 @@ graph TB
     end
 ```
 
-#### 12.6.2 凭证安全存储
+#### 14.6.2 凭证安全存储
 
 ```yaml
 backupCredentialSecurity:
@@ -7875,9 +8251,9 @@ backupCredentialSecurity:
       - "密钥文件权限 0600"
 ```
 
-### 12.7 对 BKE 备份存储设计的建议
+### 14.7 对 BKE 备份存储设计的建议
 
-#### 12.7.1 存储架构设计
+#### 14.7.1 存储架构设计
 
 ```go
 type BKEBackupStorageConfig struct {
@@ -7925,7 +8301,7 @@ type PVDataStorageConfig struct {
 }
 ```
 
-#### 12.7.2 关键设计决策
+#### 14.7.2 关键设计决策
 
 | 决策点 | OpenShift 方案 | BKE 建议 | 理由 |
 |--------|---------------|---------|------|
@@ -7936,11 +8312,11 @@ type PVDataStorageConfig struct {
 | **加密** | AES-256 + KMS | AES-256 + 外部 KMS | 合规要求，防止数据泄露 |
 | **生命周期** | 手动管理 | 自动分层（热/温/冷/归档） | 降低长期存储成本 |
 
-#### 12.7.3 文件级备份引擎对比：Kopia / Restic / BorgBackup
+#### 14.7.3 文件级备份引擎对比：Kopia / Restic / BorgBackup
 
 在 OADP 备份体系中，PV 数据的文件级备份依赖底层备份引擎。OpenShift 4.18 默认使用 **Kopia**（替代旧版 Restic）。以下对三种主流去重归档工具进行深度对比。
 
-##### 12.7.3.1 Kopia
+##### 14.7.3.1 Kopia
 
 **定位**：现代高性能备份引擎，Velero/OADP 的默认文件级备份后端（自 Velero 1.9+）。
 
@@ -8025,7 +8401,7 @@ kopia:
     - "内存占用较高（索引缓存）"
 ```
 
-##### 12.7.3.2 Restic
+##### 14.7.3.2 Restic
 
 **定位**：经典 Go 语言备份工具，Velero 1.9 之前的默认文件级备份后端。
 
@@ -8108,7 +8484,7 @@ restic:
     - "压缩功能较晚加入（0.14.0，2022 年）"
 ```
 
-##### 12.7.3.3 BorgBackup
+##### 14.7.3.3 BorgBackup
 
 **定位**：Python 实现的去重归档工具，主要用于 Linux 系统级备份。
 
@@ -8193,7 +8569,7 @@ borgbackup:
     - "仓库空间管理复杂（需手动 prune + compact）"
 ```
 
-##### 12.7.3.4 三者综合对比
+##### 14.7.3.4 三者综合对比
 
 | 维度 | Kopia | Restic | BorgBackup |
 |------|-------|--------|------------|
@@ -8216,7 +8592,7 @@ borgbackup:
 | **GUI** | 有（KopiaUI） | 无 | 无（有第三方 Vorta/Pika） |
 | **适用场景** | 云原生备份、大规模数据 | 通用备份、多云环境 | Linux 服务器系统级备份 |
 
-##### 12.7.3.5 OADP 中的使用方式
+##### 14.7.3.5 OADP 中的使用方式
 
 ```yaml
 # OADP 中使用 Kopia（推荐，默认）
@@ -8244,7 +8620,7 @@ oadpBorg:
   useCase: "适合作为节点级系统备份的补充工具"
 ```
 
-##### 12.7.3.6 选型建议
+##### 14.7.3.6 选型建议
 
 ```mermaid
 graph TD
@@ -8270,7 +8646,7 @@ graph TD
 | **多云/遗留环境** | Restic | 后端支持最广，成熟稳定 |
 | **BKE 控制平面备份** | Kopia 或 etcd 快照 | etcd 快照为主，Kopia 补充远程复制 |
 
-#### 12.7.4 实施优先级
+#### 14.7.4 实施优先级
 
 | 优先级 | 能力 | 存储需求 | 工作量 |
 |--------|------|---------|--------|
@@ -8283,9 +8659,9 @@ graph TD
 | **P3** | DataMover 大规模数据搬运 | 对象存储 + CSI | 高 |
 | **P3** | 备份生命周期自动管理 | 对象存储生命周期策略 | 中 |
 
-## 十三、openFuyao 版本升级策略分析
+## 十四、openFuyao 版本升级策略分析
 
-### 13.1 openFuyao 版本策略概述
+### 14.1 openFuyao 版本策略概述
 
 openFuyao 采用基于时间的版本命名策略，具有以下特点：
 
@@ -8323,7 +8699,7 @@ versionStrategy:
         - "25.12 → 26.12"  # 跨越 4 个版本
 ```
 
-### 13.2 与 OpenShift 策略对比
+### 14.2 与 OpenShift 策略对比
 
 | 维度 | OpenShift | openFuyao | 评估 |
 |------|-----------|-----------|------|
@@ -8334,7 +8710,7 @@ versionStrategy:
 | **支持周期** | 标准版 18 个月，LTS 更长 | 未明确 | 需补充 |
 | **补丁版本** | 4.17.1, 4.17.2 等 | 无 | 需增加 |
 
-### 13.3 优势分析
+### 14.3 优势分析
 
 #### ✅ 优点
 
@@ -8387,7 +8763,7 @@ openFuyao 缺少紧急修复版本机制
 建议增加 26.03.1 格式的补丁版本
 ```
 
-### 13.4 改进建议
+### 14.4 改进建议
 
 #### 建议 1: 增加补丁版本机制
 
@@ -8509,7 +8885,7 @@ func (v *VersionLifecycle) MonthsUntilEOL() int {
 }
 ```
 
-### 13.5 OpenShift 升级策略参考
+### 14.5 OpenShift 升级策略参考
 
 根据 OpenShift 官方文档，其版本策略具有以下特点：
 
@@ -8593,7 +8969,7 @@ openshiftSupportPolicy:
 - 提供迁移工具
 - 确保平滑过渡
 
-### 13.6 综合评估
+### 14.6 综合评估
 
 | 评估项 | 评分 | 说明 |
 |--------|------|------|
@@ -8606,7 +8982,7 @@ openshiftSupportPolicy:
 
 **总体评分: 3.5/5**
 
-### 13.7 最终建议
+### 14.7 最终建议
 
 #### 立即可做
 
@@ -8626,7 +9002,7 @@ openshiftSupportPolicy:
 2. **提供自动化升级工具**
 3. **建立版本兼容性矩阵**
 
-### 13.8 结论
+### 14.8 结论
 
 openFuyao 的版本策略**整体合理**，具有以下特点：
 
