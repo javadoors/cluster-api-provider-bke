@@ -3978,7 +3978,7 @@ status:
 
 | 对比项 | 旧设计 | 新设计 |
 |--------|--------|--------|
-| 状态数量 | 4 个（Accepted, Partial, Completed, RolledBack） | 4 个（Idle, Upgrading, RollingBack, Failed） |
+| 状态数量 | 2 个（Partial, Completed） | 4 个（Idle, Upgrading, RollingBack, Failed） |
 | 状态语义 | 复杂（Partial 有多种含义） | 清晰（每个状态有明确含义） |
 | 转换路径 | 复杂（需要多次转换） | 简单（直接转换） |
 
@@ -4226,8 +4226,6 @@ func (s *DataSyncer) SyncHistoryToNewModel(cv *ClusterVersion) {
         case PartialUpdateState:
             cv.Status.OperationState = OperationUpgrading
             cv.Status.PendingVersion = latest.Version
-        case RolledBackUpdateState:
-            cv.Status.OperationState = OperationRollingBack
         }
     }
     
