@@ -1239,7 +1239,7 @@ status:
   history:
   - state: Partial        # 第三次升级失败
     version: 4.13.0
-  - state: RolledBack     # 第二次升级失败并回滚
+  - state: Partial        # 第二次升级失败，保持 Partial
     version: 4.12.0
   - state: Completed      # 当前稳定版本
     version: 4.11.18
@@ -1249,44 +1249,48 @@ status:
 
 ### 4.5 回滚触发机制
 
-**核心问题**：当回滚目标版本（4.11.18）与 status 中的实际版本（4.11.18）一致时，CVO 如何触发回滚执行？
+**核心问题**：CVO 如何判断是升级还是降级（回滚）？
 
-#### 4.5.1 关键对比：spec.desiredUpdate vs status.history
+#### 4.5.1 关键对比：spec.desiredUpdate vs currentVersion
 
-**CVO 通过对比 `spec.desiredUpdate.version` 与 `status.history[0].version` 来判断是否需要执行升级/回滚**
+**CVO 通过比较 `spec.desiredUpdate.version` 与当前运行版本来判断操作类型**
 
 ```
-升级前：
+稳定状态：
   spec.desiredUpdate.version: 4.11.18
-  status.history[0].version: 4.11.18
-  status.history[0].state: Completed
-  → 一致，无需操作
+  currentVersion (从 history 中第一个 Completed 记录获取): 4.11.18
+  → desired == current，无需操作
 
 升级到 4.12.0：
   spec.desiredUpdate.version: 4.12.0  ← 用户设置目标
-  status.history[0].version: 4.12.0
-  status.history[0].state: Partial    ← 升级中
-  → 目标与当前尝试版本一致，继续升级
+  currentVersion: 4.11.18
+  → desired (4.12.0) > current (4.11.18)，执行升级
+  → history[0] = {state: Partial, version: 4.12.0}
 
-升级失败触发回滚：
-  spec.desiredUpdate.version: 4.11.18 ← CVO 修改为目标
-  status.history[0].version: 4.12.0   ← 失败的版本
-  status.history[0].state: RolledBack ← 标记为已回滚
-  → 目标 (4.11.18) != 当前尝试 (4.12.0)，触发回滚
+升级失败：
+  spec.desiredUpdate.version: 4.12.0
+  currentVersion: 4.11.18 (从 history[1] 获取，因为 history[0] 是 Partial)
+  → history[0] = {state: Partial, version: 4.12.0, Failing=True}
+  → 等待用户手动触发回滚
+
+用户手动触发回滚：
+  用户执行：oc adm upgrade --to=4.11.18
+  spec.desiredUpdate.version: 4.11.18 ← 用户设置
+  currentVersion: 4.11.18 (从 history[1] 获取)
+  → 创建新回滚记录：history[0] = {state: Partial, version: 4.11.18}
+  → desired (4.11.18) < previous failed (4.12.0)，执行降级
 
 回滚执行中：
   spec.desiredUpdate.version: 4.11.18
-  status.history[0].version: 4.12.0   ← 已标记为 RolledBack
-  status.history[1].version: 4.11.18
-  status.history[1].state: Partial    ← 正在回滚到此版本
-  → 目标与回滚尝试版本一致，继续回滚
+  history[0] = {state: Partial, version: 4.11.18}  ← 回滚进行中
+  history[1] = {state: Partial, version: 4.12.0}   ← 失败记录保持
+  → 继续降级
 
 回滚完成：
   spec.desiredUpdate.version: 4.11.18
-  status.history[0].version: 4.12.0   ← RolledBack
-  status.history[1].version: 4.11.18
-  status.history[1].state: Completed  ← 回滚成功
-  → 一致，无需操作
+  history[0] = {state: Completed, version: 4.11.18}  ← 回滚成功
+  history[1] = {state: Partial, version: 4.12.0}     ← 失败记录保持
+  → desired == current，无需操作
 ```
 
 #### 4.5.2 CVO 调谐循环逻辑
@@ -1336,28 +1340,16 @@ func (cvo *ClusterVersionOperator) needsUpgradeOrRollback(
     return false
 }
 
-// determineActionType 判断是升级还是回滚
+// determineActionType 判断是升级还是降级（回滚）
 func (cvo *ClusterVersionOperator) determineActionType(
     desiredVersion string,
-    currentHistory configv1.UpdateHistory,
+    currentVersion string,
 ) ActionType {
-    currentVersion := currentHistory.Version
-    
-    // 情况 1: 版本相同，继续当前操作
-    if currentVersion == desiredVersion {
-        if currentHistory.State == configv1.PartialUpdateState {
-            // 检查是否有 RolledBack 标记
-            // 如果有，说明是回滚操作
-            return cvo.inferActionFromHistory(currentHistory)
-        }
-        return ActionUpgrade // 默认是升级
-    }
-    
-    // 情况 2: 版本不同，通过版本比较判断
+    // 通过版本比较判断操作类型
     return cvo.compareVersions(desiredVersion, currentVersion)
 }
 
-// compareVersions 通过版本比较判断是升级还是回滚
+// compareVersions 通过版本比较判断是升级还是降级
 func (cvo *ClusterVersionOperator) compareVersions(desired, current string) ActionType {
     // 使用语义化版本比较
     desiredSemver, err := semver.Parse(desired)
@@ -1374,40 +1366,25 @@ func (cvo *ClusterVersionOperator) compareVersions(desired, current string) Acti
     if desiredSemver.GT(currentSemver) {
         return ActionUpgrade   // desired > current → 升级
     } else if desiredSemver.LT(currentSemver) {
-        return ActionRollback  // desired < current → 回滚
+        return ActionDowngrade // desired < current → 降级（回滚）
     }
     
     return ActionUpgrade // 版本相同，默认升级
-}
-
-// inferActionFromHistory 从历史记录推断操作类型
-func (cvo *ClusterVersionOperator) inferActionFromHistory(history configv1.UpdateHistory) ActionType {
-    // 检查 history 中是否有 RolledBack 状态的记录
-    // 如果有，说明当前操作是回滚
-    
-    // 查找最近的 RolledBack 记录
-    for _, h := range cvo.getClusterVersion().Status.History {
-        if h.State == configv1.RolledBackUpdateState {
-            return ActionRollback
-        }
-    }
-    
-    return ActionUpgrade
 }
 
 type ActionType string
 
 const (
     ActionUpgrade   ActionType = "Upgrade"
-    ActionRollback  ActionType = "Rollback"
+    ActionDowngrade ActionType = "Downgrade" // 降级（回滚）
 )
 ```
 
-#### 4.5.3 升级与回滚的判断逻辑
+#### 4.5.3 升级与降级的判断逻辑
 
-**核心问题**：当 `spec.desiredUpdate.version != status.history[0].version` 时，如何判断是执行升级还是回滚？
+**核心问题**：如何判断是执行升级还是降级（回滚）？
 
-**判断方法 1: 版本比较（主要方法）**
+**判断方法：版本比较（唯一方法）**
 
 CVO 通过比较版本号的大小来判断操作类型：
 
@@ -1420,7 +1397,7 @@ func (cvo *ClusterVersionOperator) compareVersions(desired, current string) Acti
     if desiredSemver.GT(currentSemver) {
         return ActionUpgrade   // 4.12.0 > 4.11.18 → 升级
     } else if desiredSemver.LT(currentSemver) {
-        return ActionRollback  // 4.11.18 < 4.12.0 → 回滚
+        return ActionDowngrade // 4.11.18 < 4.12.0 → 降级（回滚）
     }
     
     return ActionUpgrade
@@ -1432,7 +1409,7 @@ func (cvo *ClusterVersionOperator) compareVersions(desired, current string) Acti
 | 场景 | desired | current | 比较结果 | 操作类型 |
 |------|---------|---------|---------|---------|
 | 正常升级 | 4.12.0 | 4.11.18 | 4.12.0 > 4.11.18 | `ActionUpgrade` |
-| 自动回滚 | 4.11.18 | 4.12.0 | 4.11.18 < 4.12.0 | `ActionRollback` |
+| 手动降级 | 4.11.18 | 4.12.0 | 4.11.18 < 4.12.0 | `ActionDowngrade` |
 | 手动回滚 | 4.11.0 | 4.11.18 | 4.11.0 < 4.11.18 | `ActionRollback` |
 | 跨版本升级 | 4.13.0 | 4.11.18 | 4.13.0 > 4.11.18 | `ActionUpgrade` |
 
