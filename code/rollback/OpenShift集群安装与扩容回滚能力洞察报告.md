@@ -3613,24 +3613,24 @@ type ScaleRollbackSpec struct {
 #### 7.2.3 升级回滚增强
 
 ```go
-// 建议：增强升级回滚能力
-type UpgradeRollbackSpec struct {
-    // 自动回滚条件
-    AutoRollbackConditions []RollbackCondition
+// 建议：增强升级降级能力
+type UpgradeDowngradeSpec struct {
+    // 降级条件（手动触发）
+    DowngradeConditions []DowngradeCondition
     
-    // 回滚策略
-    Strategy RollbackStrategy
+    // 降级策略
+    Strategy DowngradeStrategy
     
-    // 回滚验证
-    Validation RollbackValidation
+    // 降级验证
+    Validation DowngradeValidation
     
-    // 回滚历史保留
+    // 降级历史保留
     HistoryRetention int
 }
 
-type RollbackCondition struct {
+type DowngradeCondition struct {
     // 条件类型（HealthCheck/Timeout/ErrorThreshold）
-    Type RollbackConditionType
+    Type DowngradeConditionType
     
     // 阈值
     Threshold int
@@ -3671,8 +3671,8 @@ type RollbackCondition struct {
 
 1. **安装失败**：建议实现自动重试和清理机制，而非回滚
 2. **扩容失败**：实现声明式回滚，减少 replicas 即可
-3. **升级失败**：实现自动回滚，参考 OpenShift 的 `AutoRollback` 设计
-4. **状态管理**：完善 `UpgradeHistory`，记录完整的升级/回滚历史
+3. **升级失败**：实现手动降级机制，用户设置目标版本为旧版本即可触发降级
+4. **状态管理**：完善 `UpgradeHistory`，记录完整的升级/降级历史
 
 ## 九、优化状态设计方案
 
@@ -3682,16 +3682,14 @@ type RollbackCondition struct {
 
 ```mermaid
 graph LR
-    A[Accepted] --> B[Partial]
-    B --> C{结果}
-    C -->|成功| D[Completed]
-    C -->|失败| E[RolledBack]
-    E --> F[Partial]
-    F --> G[Completed]
+    A[Partial] --> B{结果}
+    B -->|成功| C[Completed]
+    B -->|失败| D[Partial]
+    D -->|用户触发降级| E[Partial]
+    E -->|降级成功| C
 ```
 
 **问题**：
-- `RolledBack` 既是终态，又需要创建新的回滚记录
 - 状态转换路径不清晰
 - 需要同时管理 history 数组和 state 字段
 
