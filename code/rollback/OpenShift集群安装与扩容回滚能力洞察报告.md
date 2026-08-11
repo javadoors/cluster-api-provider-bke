@@ -1442,16 +1442,6 @@ func (cvo *ClusterVersionOperator) getCurrentVersion(cv *configv1.ClusterVersion
         }
     }
     
-    // 情况 3: 最新记录是 RolledBack 状态
-    // → 查找下一个 Completed 记录作为 current
-    if latest.State == configv1.RolledBackUpdateState {
-        for i := 1; i < len(cv.Status.History); i++ {
-            if cv.Status.History[i].State == configv1.CompletedUpdateState {
-                return cv.Status.History[i].Version
-            }
-        }
-    }
-    
     return ""
 }
 ```
@@ -1699,13 +1689,8 @@ status:
 | `Completed` | `[{Completed, 4.11.18}]` | `4.11.18` | 当前稳定运行的版本 |
 | `Partial` (升级中) | `[{Partial, 4.12.0}, {Completed, 4.11.18}]` | `4.11.18` | 仍在运行旧版本 |
 | `Partial` (升级失败) | `[{Partial, 4.12.0}, {Completed, 4.11.18}]` | `4.11.18` | 仍在运行旧版本 |
-| `RolledBack` | `[{RolledBack, 4.12.0}, {Partial, 4.11.18}, {Completed, 4.11.18}]` | `4.11.18` | 正在回滚到旧版本 |
-| `Partial` (回滚中) | `[{RolledBack, 4.12.0}, {Partial, 4.11.18}, {Completed, 4.11.18}]` | `4.11.18` | 正在回滚到旧版本 |
-| `Completed` (回滚完成) | `[{RolledBack, 4.12.0}, {Completed, 4.11.18}, {Completed, 4.11.18}]` | `4.11.18` | 已回滚到旧版本 |
-
-**问题 2: RolledBack 状态记录是什么？**
-
-`RolledBack` 是 OpenShift 4.14+ 引入的特殊状态，用于标记**已回滚的升级记录**。
+| `Partial` (降级中) | `[{Partial, 4.11.18}, {Partial, 4.12.0}, {Completed, 4.11.18}]` | `4.11.18` | 正在降级到旧版本 |
+| `Completed` (降级完成) | `[{Completed, 4.11.18}, {Partial, 4.12.0}, {Completed, 4.11.18}]` | `4.11.18` | 已降级到旧版本 |
 
 **UpdateState 完整定义**：
 
@@ -1713,11 +1698,11 @@ status:
 type UpdateState string
 
 const (
-    // CompletedUpdateState 表示升级已成功完成
+    // CompletedUpdateState 表示升级/降级已成功完成
     CompletedUpdateState UpdateState = "Completed"
     
-    // PartialUpdateState 表示升级正在进行或部分完成
-    // 包括：升级中、升级失败、降级中
+    // PartialUpdateState 表示升级/降级正在进行或失败
+    // 包括：升级中、升级失败、降级中、降级失败
     PartialUpdateState UpdateState = "Partial"
 )
 ```
