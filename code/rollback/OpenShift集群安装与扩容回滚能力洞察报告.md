@@ -1723,21 +1723,33 @@ OpenShift 的 UpdateHistory 只有两个状态，设计非常简洁：
 3. **Partial 状态的多重含义**：可以是升级中、升级失败、降级中、降级失败
 4. **失败记录保持不变**：升级/降级失败的记录保持在 `Partial` 状态，不会被删除或修改
 
-**判断方法 2: 历史记录推断（辅助方法）**
+**判断方法：版本比较（唯一方法）**
 
-当版本相同时（`desired == current`），CVO 通过检查历史记录推断操作类型：
+CVO 通过比较版本号的大小来判断操作类型：
 
 ```go
-func (cvo *ClusterVersionOperator) inferActionFromHistory(history configv1.UpdateHistory) ActionType {
-    // 检查是否有 RolledBack 状态的记录
-    for _, h := range cvo.getClusterVersion().Status.History {
-        if h.State == configv1.RolledBackUpdateState {
-            return ActionRollback  // 有 RolledBack 记录 → 回滚
-        }
+func (cvo *ClusterVersionOperator) compareVersions(desired, current string) ActionType {
+    // 使用语义化版本（Semantic Versioning）比较
+    desiredSemver, _ := semver.Parse(desired)
+    currentSemver, _ := semver.Parse(current)
+    
+    if desiredSemver.GT(currentSemver) {
+        return ActionUpgrade   // 4.12.0 > 4.11.18 → 升级
+    } else if desiredSemver.LT(currentSemver) {
+        return ActionDowngrade // 4.11.18 < 4.12.0 → 降级（回滚）
     }
+    
     return ActionUpgrade
 }
 ```
+
+**版本比较示例**：
+
+| 场景 | desired | current | 比较结果 | 操作类型 |
+|------|---------|---------|---------|---------|
+| 正常升级 | 4.12.0 | 4.11.18 | 4.12.0 > 4.11.18 | `ActionUpgrade` |
+| 手动降级 | 4.11.18 | 4.12.0 | 4.11.18 < 4.12.0 | `ActionDowngrade` |
+| 版本相同 | 4.11.18 | 4.11.18 | 4.11.18 == 4.11.18 | 无操作 |
 
 **判断方法 3: 升级图验证（安全校验）**
 
@@ -1763,7 +1775,7 @@ func (cvo *ClusterVersionOperator) validateUpgradePath(desired, current string) 
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│              CVO 判断升级/回滚的完整流程                       │
+│              CVO 判断升级/降级的完整流程                       │
 └─────────────────────────────────────────────────────────────┘
 
 步骤 1: 检查是否需要操作
@@ -1771,29 +1783,20 @@ func (cvo *ClusterVersionOperator) validateUpgradePath(desired, current string) 
   └─ desired != current → 需要操作
   
 步骤 2: 判断操作类型
-  ├─ 方法 1: 版本比较（主要）
-  │   └─ desired > current → ActionUpgrade
-  │   └─ desired < current → ActionRollback
-  │
-  ├─ 方法 2: 历史记录推断（辅助）
-  │   └─ 有 RolledBack 记录 → ActionRollback
-  │   └─ 无 RolledBack 记录 → ActionUpgrade
-  │
-  └─ 方法 3: 升级图验证（安全）
-      └─ 目标版本不在升级图中 → 拒绝操作
-      └─ 不允许的路径 → 拒绝操作
+  └─ 版本比较（唯一方法）
+      └─ desired > current → ActionUpgrade
+      └─ desired < current → ActionDowngrade
   
 步骤 3: 执行操作
   └─ ActionUpgrade → 执行升级流程
-  └─ ActionRollback → 执行回滚流程
+  └─ ActionDowngrade → 执行降级流程
 ```
 
 **关键洞察**：
 
-1. **版本比较是主要方法**：通过语义化版本比较，`desired > current` 为升级，`desired < current` 为回滚
-2. **历史记录是辅助方法**：当版本相同时，通过检查 `RolledBack` 状态推断操作类型
-3. **升级图是安全校验**：确保操作路径在官方支持的范围内
-4. **强制标志可覆盖**：用户可以通过 `--force` 标志强制执行不支持的操作
+1. **版本比较是唯一方法**：通过语义化版本比较，`desired > current` 为升级，`desired < current` 为降级
+2. **升级图是安全校验**：确保操作路径在官方支持的范围内
+3. **强制标志可覆盖**：用户可以通过 `--force` 标志强制执行不支持的操作
 
 #### 4.5.4 降级触发流程详解
 
