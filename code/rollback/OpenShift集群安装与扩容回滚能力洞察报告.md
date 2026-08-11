@@ -1677,10 +1677,10 @@ status:
 | 场景 | history[0].state | history[1].state | 集群状态 | 处理方式 |
 |------|------------------|------------------|---------|---------|
 | 升级成功 | `Completed` | `Completed` | 健康 | 无需处理 |
-| 升级失败 | `Partial` | `Completed` | 不健康 | CVO 自动重试或触发回滚 |
-| 回滚中 | `RolledBack` | `Partial` | 不健康 | 等待回滚完成 |
-| **回滚失败** | `RolledBack` | `Partial` | **严重不健康** | **需要人工干预** |
-| 回滚成功 | `RolledBack` | `Completed` | 健康 | 无需处理 |
+| 升级失败 | `Partial` | `Completed` | 不健康 | 等待用户手动触发降级 |
+| 降级中 | `Partial` | `Partial` | 不健康 | 等待降级完成 |
+| **降级失败** | `Partial` | `Partial` | **严重不健康** | **需要人工干预** |
+| 降级成功 | `Completed` | `Partial` | 健康 | 无需处理 |
 
 **current 值在不同状态下的含义**：
 
@@ -3538,12 +3538,12 @@ CRD 中删除字段定义后：
   └─ 云资源销毁
 ```
 
-### 5.3 回滚状态机
+### 5.3 升级/降级状态机
 
 ```
-Installing → Installed → Upgrading → UpgradeFailed → RollingBack → RolledBack
-                                    ↓
-                              Healthy (升级成功)
+Partial (升级中) → Completed (升级成功)
+     ↓
+Partial (升级失败) → [用户手动触发降级] → Partial (降级中) → Completed (降级成功)
 ```
 
 ### 5.4 关键设计原则
@@ -3566,7 +3566,7 @@ Installing → Installed → Upgrading → UpgradeFailed → RollingBack → Rol
 |-----------|---------|------|
 | `ClusterVersion` | `ClusterVersion` | 集群版本管理 |
 | `ReleaseImage` | `ReleaseImage` | 发布版本清单 |
-| `UpgradeStrategy.AutoRollback` | `UpgradeStrategy.AutoRollback` | 自动回滚 |
+| `UpdateHistory` | `UpdateHistory` | 升级历史 |
 | `UpgradeHistory` | `UpgradeHistory` | 升级历史 |
 | `ClusterVersionRollingBack` | `ClusterVersionRollingBack` | 回滚状态 |
 
