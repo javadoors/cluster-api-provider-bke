@@ -3712,14 +3712,6 @@ func getCurrentVersion(cv *ClusterVersion) string {
         }
     }
     
-    if latest.State == RolledBackUpdateState {
-        for i := 1; i < len(cv.Status.History); i++ {
-            if cv.Status.History[i].State == CompletedUpdateState {
-                return cv.Status.History[i].Version
-            }
-        }
-    }
-    
     return ""
 }
 ```
@@ -3733,26 +3725,25 @@ func getCurrentVersion(cv *ClusterVersion) string {
 
 | 状态 | 问题 |
 |------|------|
-| `Partial` | 既表示"升级中"，又表示"升级失败"，又表示"回滚中" |
-| `RolledBack` | 既表示"已回滚"，又需要创建新的回滚记录 |
-| `Completed` | 既表示"升级成功"，又表示"回滚成功" |
+| `Partial` | 既表示"升级中"，又表示"升级失败"，又表示"降级中" |
+| `Completed` | 既表示"升级成功"，又表示"降级成功" |
 
-#### 9.1.4 回滚失败场景处理复杂
+#### 9.1.4 降级失败场景处理复杂
 
 ```yaml
-# 回滚失败时的状态
+# 降级失败时的状态
 status:
   history:
-  - state: RolledBack              # 失败的升级记录
+  - state: Partial                 # 失败的升级记录
     version: "4.12.0"
   
-  - state: Partial                 # 失败的回滚记录
+  - state: Partial                 # 失败的降级记录
     version: "4.11.18"
   
   conditions:
   - type: Failing
     status: "True"
-    reason: RollbackFailed
+    reason: DowngradeFailed
 ```
 
 **问题**：
