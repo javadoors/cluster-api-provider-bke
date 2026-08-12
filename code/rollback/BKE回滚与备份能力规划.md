@@ -611,10 +611,11 @@ func EnsureWorkerDowngrade(ctx context.Context, cluster *bkev1beta1.BKECluster) 
 ##### 方案二：复用升级流程执行降级（推荐用于快速交付）
 
 **设计思路**：
-- 参考 OpenShift CVO 机制：回滚本质是"降级"，复用现有升级流程
-- 设置目标版本为旧版本，CVO 按正常升级流程反向执行
+- BKE 降级机制设计：回滚本质是"降级"，复用现有升级流程
+- 设置目标版本为旧版本，按正常升级流程反向执行
 - 不需要为每个组件编写专门的降级代码
 - 通过重新应用旧版本的 manifest 和配置来实现降级
+- **注意**：OpenShift 不支持版本回滚，这是 BKE 的差异化能力设计
 
 **执行流程**：
 1. ClusterVersion 验证回滚路径（v26.06 → v26.05）
@@ -1441,7 +1442,7 @@ BKE 提供两种回滚方案，与 3.1.1 节升级失败回滚方案保持一致
 - 为每个组件实现特定的降级逻辑（数据迁移、配置回滚等）
 - 适用于复杂场景（如数据格式变更）
 
-**方案二：复用升级流程执行降级（参考 OpenShift CVO 机制）**
+**方案二：复用升级流程执行降级（BKE 差异化能力设计）**
 - 复用现有升级 DAG 流程，将目标版本设为旧版本
 - CVO 按正常升级流程反向执行（降级 Operator、降级节点配置等）
 - 不需要为每个组件编写专门的降级代码
@@ -1598,10 +1599,10 @@ ClusterVersionPhaseReady (v26.07)
 
 **ClusterVersion 回滚状态转换**：
 
-> **注意**：OpenShift 的 ClusterVersion 没有独立的 `RollingBack` 状态。回滚和升级共用 `Upgrading` 状态，CVO 通过比较 `desiredVersion` 和 `currentVersion` 的大小来判断是升级还是降级。
+> **注意**：OpenShift 不支持版本回滚。BKE 的降级机制是 BKE 自己的设计目标，通过比较 `desiredVersion` 和 `currentVersion` 的大小来判断是升级还是降级，这是 BKE 的差异化能力。
 
 ```go
-// ClusterVersion 回滚状态转换规则（参考 OpenShift 实际机制）
+// ClusterVersion 降级状态转换规则（BKE 设计目标，非 OpenShift 能力）
 ClusterVersionPhaseUpgrading → ClusterVersionPhaseReady (回滚完成，即降级完成)
 ClusterVersionPhaseFailed → ClusterVersionPhaseUpgrading (升级失败后触发回滚，重新进入 Upgrading)
 ClusterVersionPhaseReady → ClusterVersionPhaseUpgrading (升级后发现问题，触发回滚)
@@ -1712,10 +1713,11 @@ Worker → Master → etcd → Containerd → Agent
 - **降级时**：先降级依赖组件（Worker、Master），再降级基础组件（etcd、Containerd、Agent）
 - **原因**：确保降级过程中组件之间的兼容性
 
-#### 3.4.8 方案二：复用升级流程执行降级（参考 OpenShift CVO 机制）
+#### 3.4.8 方案二：复用升级流程执行降级（BKE 差异化能力设计）
 
 **设计思路**：
-- OpenShift 的回滚本质是"降级"：设置 `spec.desiredUpdate` 为旧版本，CVO 按正常升级流程反向执行
+- BKE 的降级机制设计：设置 `spec.desiredUpdate` 为旧版本，按正常升级流程反向执行
+- **注意**：OpenShift 不支持版本回滚，这是 BKE 的差异化能力设计
 - 复用现有升级 DAG 流程，将目标版本设为旧版本
 - 不需要为每个组件编写专门的降级代码
 - 通过重新应用旧版本的 manifest 和配置来实现降级
@@ -3065,7 +3067,7 @@ preUpgradeChecklist:
 |------|---------|------|
 | **升级能力** | ✅ 支持（设计中） | 相邻版本升级、LTS 逐跳升级、Pre/Post-Check 自动化 |
 | **安装回滚** | ❌ 不支持 | 安装失败时清理并重建 |
-| **升级回滚** | ✅ 支持（设计中） | 自动/手动回滚到上一版本 |
+| **升级回滚** | ✅ 支持（设计中） | 手动降级到上一版本（BKE 差异化能力） |
 | **扩缩容回滚** | ✅ 支持（设计中） | 状态机回滚 + 资源清理 |
 | **配置回滚** | ✅ 支持（设计中） | 配置版本管理和回滚 |
 | **etcd 备份** | ✅ 支持 | 自动/手动备份 |
