@@ -23,7 +23,7 @@
 **ClusterVersion 失败处理**：
 - 升级路径验证失败：设置 `Phase = PreCheckFailed`
 - ReleaseImage 拉取失败：设置 `Phase = PreCheckFailed`
-- **没有回滚机制**：`ClusterUpgradeRecord.RolledBack` 状态已定义但从未使用
+- **没有自动回滚机制**：升级失败后需要用户手动触发降级
 
 ### 1.2 BKE 双机制架构
 
@@ -507,7 +507,7 @@ Agent → Containerd → etcd → Master → Worker
 #### 3.1.1 升级失败场景说明
 
 **负责机制**：
-- **ClusterVersion**：验证回滚路径（v26.06 → v26.05），拉取旧版本 ReleaseImage，设置 `cvo.openfuyao.cn/rollback-ready` 注解
+- **ClusterVersion**：验证回滚路径（v26.06 → v26.05），拉取旧版本 ReleaseImage
 - **声明式 DAG**：执行降级操作，按相反顺序降级所有组件（Worker → Master → etcd → Containerd → Agent）
 
 **场景描述**：
@@ -540,16 +540,15 @@ BKE 提供两种回滚方案，可根据实际场景选择：
 **执行流程**：
 1. ClusterVersion 验证回滚路径（v26.06 → v26.05）
 2. 拉取旧版本 ReleaseImage
-3. 设置 `cvo.openfuyao.cn/rollback-ready=v26.05` 注解
-4. BKECluster 控制器执行降级 DAG
-5. 按相反顺序降级所有组件：
+3. BKECluster 控制器执行降级 DAG
+4. 按相反顺序降级所有组件：
    - EnsureWorkerDowngrade：停止 kubelet → 回滚配置 → 重新安装旧版本 → 启动 → 验证
    - EnsureMasterDowngrade：停止控制面组件 → 回滚配置 → 重新安装 → 启动 → 验证
    - EnsureEtcdDowngrade：备份数据 → 停止 etcd → 回滚数据 → 重新安装 → 启动 → 验证
    - EnsureContainerdDowngrade：停止 containerd → 回滚配置 → 重新安装 → 启动 → 验证
    - EnsureAgentDowngrade：停止 Agent → 回滚配置 → 重新安装 → 启动 → 验证
-6. 更新 ClusterVersion.status.currentVersion = v26.05
-7. ClusterStatus = `Ready`
+5. 更新 ClusterVersion.status.currentVersion = v26.05
+6. ClusterStatus = `Ready`
 
 **核心代码示例**：
 ```go
@@ -620,17 +619,16 @@ func EnsureWorkerDowngrade(ctx context.Context, cluster *bkev1beta1.BKECluster) 
 **执行流程**：
 1. ClusterVersion 验证回滚路径（v26.06 → v26.05）
 2. 拉取旧版本 ReleaseImage
-3. 设置 `cvo.openfuyao.cn/rollback-ready=v26.05` 注解
-4. BKECluster 控制器执行重新部署
-5. 复用部署逻辑，重新部署所有组件：
+3. BKECluster 控制器执行重新部署
+4. 复用部署逻辑，重新部署所有组件：
    - deployAgent：部署旧版本 Agent
    - deployContainerd：部署旧版本 Containerd
    - deployEtcd：部署旧版本 etcd
    - deployMaster：部署旧版本 Master 组件
    - deployWorker：部署旧版本 Worker 组件
-6. 等待所有组件就绪
-7. 更新 ClusterVersion.status.currentVersion = v26.05
-8. ClusterStatus = `Ready`
+5. 等待所有组件就绪
+6. 更新 ClusterVersion.status.currentVersion = v26.05
+7. ClusterStatus = `Ready`
 
 **核心代码示例**：
 ```go
@@ -1417,8 +1415,7 @@ ClusterVersion **只负责验证和准备**，不直接执行降级：
 
 1. **验证回滚路径**：通过 `UpgradePath` CRD 验证回滚路径是否合法
 2. **拉取旧版本镜像**：拉取目标版本的 ReleaseImage（OCI 镜像）
-3. **设置回滚注解**：设置 `cvo.openfuyao.cn/rollback-ready=<target-version>` 注解
-4. **触发降级 DAG**：由 BKECluster 控制器检测到注解后执行降级 DAG
+3. **触发降级 DAG**：由 BKECluster 控制器检测到 desiredVersion 变化后执行降级 DAG
 
 **为什么不直接执行降级？**
 
@@ -1532,9 +1529,9 @@ BKE 提供两种回滚方案，与 3.1.1 节升级失败回滚方案保持一致
    kubectl patch clusterversion --type merge \
        -p '{"spec":{"desiredVersion":"v26.05"}}'
    ```
-2. ClusterVersion Controller 验证回滚路径
-3. 拉取旧版本 ReleaseImage
-4. 设置 `cvo.openfuyao.cn/rollback-ready=v26.05` 注解
+2. ClusterVersion Controller 检测到 desiredVersion < currentVersion
+3. 验证回滚路径
+4. 拉取旧版本 ReleaseImage
 5. BKECluster Controller 执行降级 DAG
 6. 按相反顺序降级所有组件
 7. 更新 ClusterVersion.status.currentVersion = v26.05
@@ -1630,19 +1627,7 @@ kubectl patch clusterversion --type merge \
     -p '{"spec":{"desiredVersion":"v26.05"}}'
 
 # ClusterVersion Controller 检测到 desiredVersion < currentVersion
-# 自动设置 rollback-ready 注解
-```
-
-**方案二：自动触发（可选）**
-
-```go
-// 在 ClusterVersion Controller 中检测升级失败
-if upgradeFailed && autoRollbackEnabled {
-    // 自动设置回滚目标为上一版本
-    cv.Spec.DesiredVersion = previousVersion
-    // 设置 rollback-ready 注解
-    setRollbackReadyAnnotation(cv, previousVersion)
-}
+# 执行降级流程
 ```
 
 #### 3.4.6 方案一：降级 DAG 执行流程
@@ -1657,12 +1642,11 @@ ClusterVersion 回滚执行流程（方案一：降级 DAG）：
 2. ClusterVersion Controller：
    ├─ 验证回滚路径（UpgradePath CRD）
    ├─ 拉取旧版本 ReleaseImage
-   ├─ 设置注解：cvo.openfuyao.cn/rollback-ready=v26.05
-   └─ Phase → Upgrading（回滚与升级共用 Upgrading 状态）
+   └─ Phase → Upgrading（降级与升级共用 Upgrading 状态）
 
-3. BKECluster Controller 检测到注解：
-   ├─ shouldUseDeclarativeRollback() 返回 true
-   └─ executeRollbackDAG() 执行降级 DAG
+3. BKECluster Controller 检测到 desiredVersion 变化：
+   ├─ shouldUseDeclarativeDowngrade() 返回 true
+   └─ executeDowngradeDAG() 执行降级 DAG
 
 4. 降级 DAG 执行（按相反顺序）：
    ├─ EnsureWorkerDowngrade
@@ -1672,11 +1656,10 @@ ClusterVersion 回滚执行流程（方案一：降级 DAG）：
    └─ EnsureAgentDowngrade
 
 5. 降级完成：
-   ├─ 清除 rollback-ready 注解
    ├─ 更新 ClusterVersion.status
    │   ├─ CurrentVersion: v26.05
    │   ├─ Phase: Ready
-   │   └─ UpgradeHistory: append({From: v26.06, To: v26.05, Status: RolledBack})
+   │   └─ UpgradeHistory: append({From: v26.06, To: v26.05, Status: Completed})
    └─ ClusterStatus: Ready
 ```
 
@@ -1740,17 +1723,16 @@ Worker → Master → etcd → Containerd → Agent
 **执行流程**：
 1. ClusterVersion 验证回滚路径（v26.06 → v26.05）
 2. 拉取旧版本 ReleaseImage
-3. 设置 `cvo.openfuyao.cn/rollback-ready=v26.05` 注解
-4. BKECluster 控制器执行重新部署
-5. 复用部署逻辑，重新部署所有组件：
+3. BKECluster 控制器执行重新部署
+4. 复用部署逻辑，重新部署所有组件：
    - deployAgent：部署旧版本 Agent
    - deployContainerd：部署旧版本 Containerd
    - deployEtcd：部署旧版本 etcd
    - deployMaster：部署旧版本 Master 组件
    - deployWorker：部署旧版本 Worker 组件
-6. 等待所有组件就绪
-7. 更新 ClusterVersion.status.currentVersion = v26.05
-8. ClusterStatus = `Ready`
+5. 等待所有组件就绪
+6. 更新 ClusterVersion.status.currentVersion = v26.05
+7. ClusterStatus = `Ready`
 
 **核心代码示例**：
 ```go
@@ -1909,7 +1891,6 @@ func (r *BKEClusterReconciler) applyReleaseBundle(
 
 3. ClusterVersion 验证回滚路径
    └─ 验证 v26.06 → v26.05 路径
-   └─ 设置 rollback-ready 注解
 
 4. BKECluster 执行降级 DAG
    └─ 降级所有组件到 v26.05
