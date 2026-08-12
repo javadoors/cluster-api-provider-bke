@@ -2274,34 +2274,136 @@ spec:
     ttl: 168h0m0s  # 7 天
 ```
 
-### 4.5 备份存储
+### 4.5 备份存储设计
 
-#### 4.6.1 存储位置
+#### 4.5.1 存储架构
 
-```yaml
-backupStorage:
-  # 本地存储
-  local:
-    path: "/backup"
-    retentionDays: 7
-    
-  # 远程存储（推荐）
-  remote:
-    - type: "s3"
-      bucket: "bke-backups"
-      region: "us-west-2"
-      encryption: true
-      
-    - type: "nfs"
-      server: "nfs.example.com"
-      path: "/backup/bke"
-      
-    - type: "oss"
-      bucket: "bke-backups"
-      region: "cn-hangzhou"
+**双副本存储架构**：本地 + 远程
+
+```
+备份数据流：
+  集群节点 → 本地存储（/backup）→ 远程存储（S3/NFS/OSS）
+  
+存储层级：
+  L1: 本地存储（快速恢复，保留 7 天）
+  L2: 远程存储（灾难恢复，保留 30 天）
 ```
 
-#### 4.6.2 备份加密
+**架构图**：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    BKE 备份存储架构                           │
+└─────────────────────────────────────────────────────────────┘
+
+┌──────────────┐
+│  BKE 集群    │
+│  - etcd      │
+│  - 配置      │
+│  - 应用数据  │
+└──────┬───────┘
+       │
+       │ 备份
+       ▼
+┌──────────────────────────────────────────────────────────────┐
+│  L1: 本地存储（/backup）                                      │
+│  ├─ etcd/          (etcd 快照)                               │
+│  ├─ config/        (集群配置)                                │
+│  ├─ velero/        (应用数据)                                │
+│  └─ 保留策略: 7 天                                           │
+└──────────────────────────────────────────────────────────────┘
+       │
+       │ 同步到远程
+       ▼
+┌──────────────────────────────────────────────────────────────┐
+│  L2: 远程存储                                                │
+│  ├─ S3 兼容存储（推荐）                                      │
+│  │   ├─ Bucket: bke-backups                                 │
+│  │   ├─ 加密: AES-256                                       │
+│  │   └─ 保留策略: 30 天                                      │
+│  ├─ NFS 存储                                                 │
+│  │   ├─ Server: nfs.example.com                             │
+│  │   ├─ Path: /backup/bke                                   │
+│  │   └─ 保留策略: 30 天                                      │
+│  └─ 阿里云 OSS                                               │
+│      ├─ Bucket: bke-backups                                 │
+│      ├─ Region: cn-hangzhou                                 │
+│      └─ 保留策略: 30 天                                      │
+└──────────────────────────────────────────────────────────────┘
+```
+
+#### 4.5.2 存储后端对比
+
+| 存储类型 | 适用场景 | 优点 | 缺点 | 推荐度 |
+|---------|---------|------|------|--------|
+| **本地存储** | 开发测试环境 | 简单、快速、零成本 | 单点故障风险、容量受限 | ⭐⭐ |
+| **S3 兼容存储** | 生产环境（推荐） | 高可用、可扩展、成本低 | 需要网络带宽 | ⭐⭐⭐⭐⭐ |
+| **NFS** | 企业内网 | 成熟稳定、易管理 | 需要 NFS 服务器、性能受限 | ⭐⭐⭐ |
+| **阿里云 OSS** | 阿里云环境 | 成本低、易管理、高可用 | 仅限阿里云环境 | ⭐⭐⭐⭐ |
+| **MinIO** | 私有化部署 | 开源、S3 兼容、自主可控 | 需要维护 MinIO 集群 | ⭐⭐⭐⭐ |
+
+**推荐方案**：
+- **生产环境**：S3 兼容存储（如 AWS S3、阿里云 OSS、MinIO）
+- **开发测试**：本地存储 + NFS
+- **混合云**：S3 + 本地存储双副本
+
+#### 4.5.3 存储容量规划
+
+**容量计算公式**：
+
+```
+总容量 = (etcd 备份 + 配置备份 + 应用数据备份) × 保留天数 × 副本数
+
+示例计算（100 节点集群）：
+- etcd 备份: 200 MB/天
+- 配置备份: 10 MB/天
+- 应用数据备份: 10 GB/天
+- 本地保留: 7 天
+- 远程保留: 30 天
+
+本地存储: (200MB + 10MB + 10GB) × 7 = 71.5 GB
+远程存储: (200MB + 10MB + 10GB) × 30 = 306.6 GB
+总容量: 71.5 GB + 306.6 GB = 378.1 GB
+```
+
+**容量规划表**：
+
+| 集群规模 | etcd 备份 | 配置备份 | 应用数据 | 本地(7天) | 远程(30天) | 总容量 |
+|---------|----------|---------|---------|----------|-----------|--------|
+| **小型**（10 节点） | 50 MB | 5 MB | 1 GB | 7.4 GB | 31.7 GB | 39.1 GB |
+| **中型**（50 节点） | 100 MB | 10 MB | 5 GB | 36 GB | 154 GB | 190 GB |
+| **大型**（100 节点） | 200 MB | 10 MB | 10 GB | 71.5 GB | 306.6 GB | 378.1 GB |
+| **超大型**（500 节点） | 500 MB | 20 MB | 50 GB | 355 GB | 1517 GB | 1872 GB |
+
+#### 4.5.4 备份加密
+
+**加密策略**：
+
+| 加密项 | 加密算法 | 密钥管理 | 说明 |
+|--------|---------|---------|------|
+| **etcd 备份** | AES-256-CBC | 密钥文件 | 敏感数据（Secret、ConfigMap） |
+| **配置备份** | AES-256-CBC | 密钥文件 | 证书、密钥等敏感配置 |
+| **应用数据** | 由 Velero 管理 | Velero 密钥 | Velero 自带加密功能 |
+
+**密钥管理**：
+
+```bash
+# 密钥存储位置
+/etc/bke/backup-encryption.key
+
+# 密钥生成
+openssl rand -base64 32 > /etc/bke/backup-encryption.key
+chmod 600 /etc/bke/backup-encryption.key
+
+# 密钥轮转（每月）
+# 1. 生成新密钥
+openssl rand -base64 32 > /etc/bke/backup-encryption.key.new
+# 2. 使用新密钥重新加密所有备份
+# 3. 替换旧密钥
+mv /etc/bke/backup-encryption.key.new /etc/bke/backup-encryption.key
+```
+
+**加密脚本**：
 
 ```bash
 #!/bin/bash
@@ -2310,15 +2412,165 @@ backupStorage:
 BACKUP_FILE=$1
 ENCRYPTION_KEY="/etc/bke/backup-encryption.key"
 
+if [ ! -f "${ENCRYPTION_KEY}" ]; then
+    echo "ERROR: Encryption key not found: ${ENCRYPTION_KEY}"
+    exit 1
+fi
+
 # 使用 AES-256 加密
 openssl enc -aes-256-cbc -salt -in ${BACKUP_FILE} \
   -out ${BACKUP_FILE}.enc \
   -pass file:${ENCRYPTION_KEY}
 
-# 删除未加密文件
-rm ${BACKUP_FILE}
+# 验证加密成功
+if [ $? -eq 0 ]; then
+    # 删除未加密文件
+    rm ${BACKUP_FILE}
+    echo "Backup encrypted: ${BACKUP_FILE}.enc"
+else
+    echo "ERROR: Encryption failed"
+    exit 1
+fi
+```
 
-echo "Backup encrypted: ${BACKUP_FILE}.enc"
+#### 4.5.5 保留策略
+
+**保留策略配置**：
+
+```yaml
+retentionPolicy:
+  # 本地存储保留策略
+  local:
+    retentionDays: 7          # 保留 7 天
+    maxBackups: 100           # 最多保留 100 个备份
+    cleanupSchedule: "0 3 * * *"  # 每天凌晨 3 点清理
+    
+  # 远程存储保留策略
+  remote:
+    retentionDays: 30         # 保留 30 天
+    maxBackups: 500           # 最多保留 500 个备份
+    cleanupSchedule: "0 4 * * *"  # 每天凌晨 4 点清理
+    
+  # 特殊备份保留策略
+  special:
+    upgradeBackup: 90         # 升级前备份保留 90 天
+    disasterRecovery: 365     # 灾难恢复备份保留 1 年
+```
+
+**清理脚本**：
+
+```bash
+#!/bin/bash
+# 清理过期备份
+
+BACKUP_DIR="/backup"
+RETENTION_DAYS=7
+
+# 清理本地过期备份
+find ${BACKUP_DIR} -type f -mtime +${RETENTION_DAYS} -delete
+
+# 清理远程过期备份（S3 示例）
+aws s3 ls s3://bke-backups/ --recursive | \
+  awk '{print $4}' | \
+  while read file; do
+    file_date=$(aws s3api head-object --bucket bke-backups --key "$file" --query 'LastModified' --output text)
+    if [ $(date -d "$file_date" +%s) -lt $(date -d "-${RETENTION_DAYS} days" +%s) ]; then
+      aws s3 rm s3://bke-backups/"$file"
+    fi
+  done
+
+echo "Cleanup completed"
+```
+
+#### 4.5.6 存储高可用
+
+**高可用设计**：
+
+| 组件 | 高可用方案 | 说明 |
+|------|-----------|------|
+| **本地存储** | RAID 1/5/6 | 磁盘冗余，防止单盘故障 |
+| **S3 存储** | 跨区域复制 | 自动复制到多个区域 |
+| **NFS 存储** | NFS 集群 | 多节点 NFS，防止单点故障 |
+| **MinIO** | MinIO 集群 | 分布式部署，数据冗余 |
+
+**S3 跨区域复制配置**：
+
+```yaml
+# S3 跨区域复制配置
+replication:
+  enabled: true
+  sourceBucket: "bke-backups-primary"
+  destinationBucket: "bke-backups-dr"
+  destinationRegion: "us-east-1"
+  replicationTime:
+    enabled: true
+    minutes: 15  # 15 分钟内完成复制
+```
+
+**备份验证**：
+
+```bash
+#!/bin/bash
+# 验证备份完整性
+
+BACKUP_FILE=$1
+
+# 验证 etcd 备份
+ETCDCTL_API=3 etcdctl snapshot status ${BACKUP_FILE} --write-out=table
+
+# 验证配置文件
+tar -tzf ${BACKUP_FILE} > /dev/null
+
+# 验证加密备份
+openssl enc -aes-256-cbc -d -in ${BACKUP_FILE}.enc \
+  -pass file:/etc/bke/backup-encryption.key > /dev/null
+
+echo "Backup verification completed"
+```
+
+#### 4.5.7 存储监控
+
+**监控指标**：
+
+| 指标 | 说明 | 告警阈值 |
+|------|------|---------|
+| `backup_storage_used_bytes` | 已用存储容量 | > 80% 容量 |
+| `backup_storage_available_bytes` | 可用存储容量 | < 20% 容量 |
+| `backup_count` | 备份文件数量 | > 1000 个 |
+| `backup_age_seconds` | 最旧备份的年龄 | > 7 天 |
+| `backup_duration_seconds` | 备份耗时 | > 1 小时 |
+| `backup_failed_total` | 失败备份次数 | > 0 |
+
+**Prometheus 监控配置**：
+
+```yaml
+# Prometheus 监控规则
+groups:
+  - name: backup_storage
+    rules:
+      - alert: BackupStorageHighUsage
+        expr: backup_storage_used_bytes / backup_storage_total_bytes > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "备份存储使用率超过 80%"
+          
+      - alert: BackupStorageLowSpace
+        expr: backup_storage_available_bytes < 10 * 1024 * 1024 * 1024
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "备份存储可用空间不足 10GB"
+          
+      - alert: BackupFailed
+        expr: backup_failed_total > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "备份任务失败"
 ```
 
 ---
