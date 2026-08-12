@@ -82,28 +82,28 @@ MachineConfigPool (节点池级)
    └─ 节点配置完成
 ```
 
-### 3.2 扩容回滚能力
+### 3.2 扩容后的缩容能力
 
-**支持回滚**，机制如下：
+**支持缩容**（注意：这是节点缩容，不是版本回滚），机制如下：
 
 ```yaml
-# 回滚 MachineDeployment
+# 缩容 MachineDeployment
 apiVersion: machine.openshift.io/v1beta1
 kind: MachineDeployment
 metadata:
   name: worker-us-east-1a
 spec:
-  replicas: 3  # 从 5 回滚到 3
+  replicas: 3  # 从 5 缩容到 3
 ```
 
-**回滚流程**：
+**缩容流程**：
 1. 减少 `replicas` 数量
 2. Machine Controller 删除多余的 Machine
 3. Cloud Provider 销毁 VM/实例
 4. Node 从集群中移除
 
 **关键设计**：
-- **声明式回滚**：通过修改期望状态触发回滚
+- **声明式缩容**：通过修改期望状态触发缩容
 - **优雅删除**：先 cordon → drain → delete
 - **数据保留**：PVC 数据可选择保留或删除
 
@@ -134,13 +134,15 @@ spec:
    └─ 更新 ClusterVersion.status.history
 ```
 
-### 4.2 回滚机制
+### 4.2 升级失败处理
 
-**OpenShift 4.x 支持两种回滚方式**：
+**关键事实：OpenShift 不支持将集群还原到以前版本**
 
-#### 4.2.1 升级失败处理
+根据 Red Hat 官方文档，OpenShift 升级是单向操作，不支持版本回滚。
 
-**OpenShift 没有自动回滚机制**。当升级失败时，系统会：
+#### 4.2.1 升级失败后的状态
+
+当升级失败时，系统会：
 
 ```yaml
 # 升级失败时的 ClusterVersion 状态
@@ -159,37 +161,48 @@ status:
 **升级失败后的状态**：
 - ClusterVersion 保持在 `Partial` 状态
 - `Failing=True` condition 标记失败
-- **需要用户手动触发回滚**
+- **不支持回滚到旧版本**
 
-**用户手动回滚流程**：
-```
-1. 用户检测到升级失败
-2. 用户手动设置 spec.desiredUpdate.version 为旧版本
-3. CVO 检测到 desiredVersion < currentVersion，执行降级流程
-4. CVO 降级 Operator 到旧版本
-5. MCO 降级节点配置
-6. 等待所有组件就绪
-7. 更新 ClusterVersion.status.history
-```
+#### 4.2.2 升级失败后的处理方式
 
-#### 4.2.2 手动回滚
+**方式一：联系 Red Hat 支持**
+- 提交支持工单
+- Red Hat 支持团队提供专业指导
+- 可能需要收集诊断信息（`oc adm must-gather`）
 
+**方式二：从 etcd 备份恢复**
 ```bash
-# 查看升级历史
-oc get clusterversion version -o jsonpath='{.status.history}'
-
-# 手动回滚到指定版本
-oc adm upgrade --to=4.11.0 --allow-not-recommended
-
-# 或者修改 ClusterVersion
-oc edit clusterversion version
-# 修改 spec.channel 和 spec.desiredUpdate
+# 恢复 etcd 备份（需要在所有控制平面节点执行）
+# 1. 停止所有控制平面组件
+# 2. 恢复 etcd 快照
+# 3. 重启控制平面组件
 ```
 
-**手动回滚限制**：
-- 只能回滚到**相邻的上一版本**
-- 不能跨多个版本回滚（如 4.12 → 4.10）
-- 需要 `--allow-not-recommended` 标志
+**方式三：重建集群**
+- 如果无法从备份恢复，需要重建集群
+- 重新安装 OpenShift
+- 重新部署应用
+
+#### 4.2.3 为什么 OpenShift 不支持回滚？
+
+1. **数据格式变更不可逆**：升级过程中 etcd 数据格式可能发生变化
+2. **组件版本依赖复杂**：多个 Operator 之间存在复杂的版本依赖关系
+3. **状态一致性难以保证**：回滚可能导致集群状态不一致
+4. **测试覆盖困难**：回滚路径的测试矩阵过于庞大
+
+#### 4.2.4 最佳实践
+
+**升级前**：
+1. 备份 etcd 数据
+2. 在测试环境验证升级
+3. 阅读版本发布说明
+4. 确认升级路径
+
+**升级失败后**：
+1. 收集诊断信息（`oc adm must-gather`）
+2. 联系 Red Hat 支持
+3. 评估是否可以从 etcd 备份恢复
+4. 必要时重建集群
 
 #### 4.2.1 回滚限制的设计原因
 
@@ -485,16 +498,18 @@ func (cvo *ClusterVersionOperator) RollbackToVersion(targetVersion string) error
 ```bash
 # 如果需要回滚多个版本
 
-# 方案 1：逐步回滚（推荐）
-oc adm upgrade --to=4.11.18  # 4.12 → 4.11.18
-oc adm upgrade --to=4.11.0   # 4.11.18 → 4.11.0
+# OpenShift 不支持版本回滚
+# 升级失败后的处理方式：
 
-# 方案 2：重建集群（更推荐）
-openshift-install destroy cluster
-openshift-install create cluster --version 4.11.0
+# 方案 1：联系 Red Hat 支持（推荐）
+# 提交支持工单，获取专业指导
 
-# 方案 3：从备份恢复
+# 方案 2：从 etcd 备份恢复
 # 如果有 etcd 备份，可以恢复到备份时的状态
+
+# 方案 3：重建集群
+openshift-install destroy cluster
+openshift-install create cluster
 ```
 
 ##### 7. 总结
@@ -868,31 +883,26 @@ func (cvo *ClusterVersionOperator) GetRollbackTarget(cv *configv1.ClusterVersion
   status.history[1].version: 4.11.18
   status.history[1].state: Completed
 
-升级失败后用户手动触发回滚：
-  用户执行：oc adm upgrade --to=4.11.18
-  spec.desiredUpdate.version: 4.11.18  (用户设置回滚目标)
+升级失败后（OpenShift 不支持回滚）：
+  spec.desiredUpdate.version: 4.12.0  (保持失败版本)
   status.history[0].version: 4.12.0
   status.history[0].state: Partial     (升级失败记录，保持 Partial)
   status.history[1].version: 4.11.18
-  status.history[1].state: Partial     (新建回滚记录)
-  status.history[2].version: 4.11.18
-  status.history[2].state: Completed   (上一个成功版本)
+  status.history[1].state: Completed   (上一个成功版本)
+  
+  # 需要联系 Red Hat 支持或从 etcd 备份恢复
 ```
 
 #### 4.4.2 目标版本设置时机
 
-**手动回滚时**：
+**升级失败后（OpenShift 不支持回滚）**：
 
 ```bash
-# 用户手动设置回滚目标
-oc adm upgrade --to=4.11.18
-
-# 这会修改 ClusterVersion.spec.desiredUpdate
-kubectl get clusterversion version -o yaml
-# spec:
-#   desiredUpdate:
-#     version: 4.11.18
-#     image: quay.io/openshift-release-dev/ocp-release:4.11.18-x86_64
+# OpenShift 不支持版本回滚
+# 升级失败后需要：
+# 1. 联系 Red Hat 支持
+# 2. 从 etcd 备份恢复
+# 3. 重建集群
 ```
 
 **CVO 检测到回滚请求**：
@@ -978,21 +988,19 @@ status:
     message: "Upgrade to 4.12.0 failed: Operator health check failed"
 ```
 
-**用户手动触发回滚**：
+**升级失败后（OpenShift 不支持回滚）**：
 ```yaml
-# 用户执行：oc adm upgrade --to=4.11.18
+# OpenShift 不支持版本回滚
+# 升级失败后的状态保持不变
 spec:
   desiredUpdate:
-    version: 4.11.18        # 用户设置回滚目标
-    image: quay.io/openshift-release-dev/ocp-release:4.11.18-x86_64
+    version: 4.12.0        # 保持失败版本
+    image: quay.io/openshift-release-dev/ocp-release:4.12.0-x86_64
 status:
   desired:
-    version: 4.11.18        # 目标版本已更新
-    image: quay.io/openshift-release-dev/ocp-release:4.11.18-x86_64
+    version: 4.12.0        # 目标版本保持不变
+    image: quay.io/openshift-release-dev/ocp-release:4.12.0-x86_64
   history:
-  - state: Partial          # 新建回滚记录
-    version: 4.11.18
-    startedTime: "2024-01-15T12:00:00Z"
   - state: Partial          # 升级失败记录，保持 Partial
     version: 4.12.0
     startedTime: "2024-01-15T10:00:00Z"
@@ -1129,20 +1137,15 @@ T0: 升级到 4.12.0 开始          history[0] = {state: Partial, version: 4.12
 T1: 升级失败                    history[0] = {state: Partial, version: 4.12.0}
                                 conditions = [{type: Failing, status: True}]
                                 
-T2: 用户手动触发回滚             用户执行：oc adm upgrade --to=4.11.18
-                                spec.desiredUpdate.version = 4.11.18
+T2: 升级失败后（OpenShift 不支持回滚）
+                                spec.desiredUpdate.version = 4.12.0 (保持不变)
+                                # 需要联系 Red Hat 支持或从 etcd 备份恢复
                                 
-T3: CVO 检测到回滚请求           创建新回滚记录
-                                history[0] = {state: Partial, version: 4.11.18}  ← 新创建
-                                history[1] = {state: Partial, version: 4.12.0}   ← 失败记录保持
-                                conditions = [{type: Progressing, status: True}]
+T3: 联系 Red Hat 支持           提交支持工单
+                                收集诊断信息（oc adm must-gather）
                                 
-T4: 回滚执行中                  history[0] = {state: Partial, version: 4.11.18}
-                                history[1] = {state: Partial, version: 4.12.0}
-                                
-T5: 回滚完成                    history[0] = {state: Completed, version: 4.11.18, completionTime: T5}
-                                history[1] = {state: Partial, version: 4.12.0}   ← 失败记录保持
-                                conditions = [{type: Available, status: True}]
+T4: 评估恢复方案               评估是否可以从 etcd 备份恢复
+                                或重建集群
 ```
 
 **关键点总结**：
@@ -1215,22 +1218,28 @@ status:
     version: 4.11.18
 ```
 
-**处理**：CVO 无法自动回滚，需要用户手动干预
+**处理**：OpenShift 不支持版本回滚，需要联系 Red Hat 支持或从 etcd 备份恢复
 ```bash
-# 用户需要手动指定回滚目标
-oc adm upgrade --to=4.11.18 --allow-explicit-upgrade --force
+# OpenShift 不支持版本回滚
+# 升级失败后的处理方式：
+# 1. 联系 Red Hat 支持
+# 2. 从 etcd 备份恢复
+# 3. 重建集群
 ```
 
-**情况 2：回滚目标版本不可用**
+**情况 2：升级失败后无法恢复**
 
 ```go
-// 发布镜像无法拉取
-if !cvo.isImageAvailable(rollbackImage) {
-    return fmt.Errorf("rollback image %s not available", rollbackImage)
+// OpenShift 不支持版本回滚
+// 升级失败后需要联系 Red Hat 支持或从 etcd 备份恢复
+if upgradeFailed {
+    // 收集诊断信息
+    // 联系 Red Hat 支持
+    // 或从 etcd 备份恢复
 }
 ```
 
-**处理**：CVO 会重试或等待用户介入
+**处理**：联系 Red Hat 支持或从 etcd 备份恢复
 
 **情况 3：多次升级失败**
 
@@ -1273,24 +1282,15 @@ status:
   → history[0] = {state: Partial, version: 4.12.0, Failing=True}
   → 等待用户手动触发回滚
 
-用户手动触发回滚：
-  用户执行：oc adm upgrade --to=4.11.18
-  spec.desiredUpdate.version: 4.11.18 ← 用户设置
+升级失败后（OpenShift 不支持回滚）：
+  spec.desiredUpdate.version: 4.12.0 ← 保持失败版本
   currentVersion: 4.11.18 (从 history[1] 获取)
-  → 创建新回滚记录：history[0] = {state: Partial, version: 4.11.18}
-  → desired (4.11.18) < previous failed (4.12.0)，执行降级
+  → 需要联系 Red Hat 支持或从 etcd 备份恢复
 
-回滚执行中：
-  spec.desiredUpdate.version: 4.11.18
-  history[0] = {state: Partial, version: 4.11.18}  ← 回滚进行中
-  history[1] = {state: Partial, version: 4.12.0}   ← 失败记录保持
-  → 继续降级
-
-回滚完成：
-  spec.desiredUpdate.version: 4.11.18
-  history[0] = {state: Completed, version: 4.11.18}  ← 回滚成功
-  history[1] = {state: Partial, version: 4.12.0}     ← 失败记录保持
-  → desired == current，无需操作
+恢复方案评估：
+  方案 1：联系 Red Hat 支持
+  方案 2：从 etcd 备份恢复
+  方案 3：重建集群
 ```
 
 #### 4.5.2 CVO 调谐循环逻辑
@@ -1409,9 +1409,9 @@ func (cvo *ClusterVersionOperator) compareVersions(desired, current string) Acti
 | 场景 | desired | current | 比较结果 | 操作类型 |
 |------|---------|---------|---------|---------|
 | 正常升级 | 4.12.0 | 4.11.18 | 4.12.0 > 4.11.18 | `ActionUpgrade` |
-| 手动降级 | 4.11.18 | 4.12.0 | 4.11.18 < 4.12.0 | `ActionDowngrade` |
-| 手动回滚 | 4.11.0 | 4.11.18 | 4.11.0 < 4.11.18 | `ActionRollback` |
 | 跨版本升级 | 4.13.0 | 4.11.18 | 4.13.0 > 4.11.18 | `ActionUpgrade` |
+
+**注意**：OpenShift 不支持版本回滚/降级。上表中的 "手动降级" 是 BKE 的设计目标，非 OpenShift 能力。
 
 **问题 1: current 是如何获取的？**
 
@@ -1597,33 +1597,31 @@ T1: 升级失败
     history[0] = {state: Partial, version: 4.12.0}
     conditions = [{type: Failing, status: True}]
 
-T2: 用户手动触发降级到 4.11.18
-    用户执行：oc adm upgrade --to=4.11.18
-    创建新降级记录：history[0] = {state: Partial, version: 4.11.18, startedTime: T2}
-    原失败记录后移：history[1] = {state: Partial, version: 4.12.0}
+T2: 升级失败后处理（OpenShift 不支持降级）
+    # OpenShift 不支持版本降级
+    # 需要联系 Red Hat 支持或从 etcd 备份恢复
 
-T3: 降级也失败
-    history[0] = {state: Partial, version: 4.11.18}  ← 保持为 Partial
-    history[1] = {state: Partial, version: 4.12.0}   ← 原失败记录保持
-    conditions = [{type: Failing, status: True}]
+T3: 评估恢复方案
+    评估是否可以从 etcd 备份恢复
+    或重建集群
 ```
 
-**降级失败时的状态**：
+**BKE 降级失败时的状态（BKE 设计目标，非 OpenShift 能力）**：
 
 ```yaml
 status:
   history:
   - state: Partial                 # 降级失败，保持为 Partial
-    version: "4.11.18"
+    version: "v26.05"
     startedTime: "2024-01-15T12:00:00Z"
     # 没有 completionTime，因为降级未完成
   
   - state: Partial                 # 原升级失败记录，保持 Partial
-    version: "4.12.0"
+    version: "v26.06"
     startedTime: "2024-01-15T10:00:00Z"
   
   - state: Completed               # 上一个稳定版本
-    version: "4.11.18"
+    version: "v26.05"
     startedTime: "2023-12-01T08:00:00Z"
     completionTime: "2023-12-01T09:30:00Z"
   
@@ -1653,17 +1651,18 @@ status:
    
    # 查看失败原因
    oc describe clusterversion version
-   
-   # 尝试手动回滚
-   oc adm upgrade --to=4.11.18 --allow-not-recommended --force
-   ```
+    
+    # OpenShift 不支持版本回滚
+    # 需要联系 Red Hat 支持或从 etcd 备份恢复
+    ```
 
-2. **强制回滚**：使用 `--force` 标志强制执行回滚
+2. **从 etcd 备份恢复**：如果有 etcd 备份，可以尝试恢复
    ```bash
-   oc adm upgrade --to=4.11.18 --allow-explicit-upgrade --force
+   # 恢复 etcd 备份
+   # 需要在所有控制平面节点执行
    ```
 
-3. **重建集群**：如果回滚无法成功，可能需要重建集群
+3. **重建集群**：如果无法从备份恢复，需要重建集群
    ```bash
    # 备份数据
    # 销毁集群
@@ -1839,14 +1838,14 @@ func (cvo *ClusterVersionOperator) detectUpgradeFailure(cv *configv1.ClusterVers
 }
 ```
 
-**步骤 2: 用户手动触发降级**
+**步骤 2: 升级失败后的处理（OpenShift 不支持降级）**
 
 ```go
-// 用户执行：oc adm upgrade --to=4.11.18
-// 这会修改 ClusterVersion.spec.desiredUpdate
-// CVO 在 Reconcile 循环中检测到 desiredVersion < currentVersion，执行降级流程
+// OpenShift 不支持版本降级
+// 升级失败后需要联系 Red Hat 支持或从 etcd 备份恢复
 
-func (cvo *ClusterVersionOperator) handleDowngrade(cv *configv1.ClusterVersion) error {
+// 以下是 BKE 的设计目标（非 OpenShift 能力）
+func (bke *BKEClusterVersionOperator) handleDowngrade(cv *configv1.ClusterVersion) error {
     // 1. 获取降级目标版本
     targetVersion := cv.Spec.DesiredUpdate.Version
     
@@ -1854,7 +1853,7 @@ func (cvo *ClusterVersionOperator) handleDowngrade(cv *configv1.ClusterVersion) 
     newHistory := configv1.UpdateHistory{
         State:       configv1.PartialUpdateState,
         Version:     targetVersion,
-        Image:       cvo.getReleaseImage(targetVersion),
+        Image:       bke.getReleaseImage(targetVersion),
         StartedTime: metav1.Time{Time: time.Now()},
     }
     
@@ -1866,7 +1865,7 @@ func (cvo *ClusterVersionOperator) handleDowngrade(cv *configv1.ClusterVersion) 
     cv.Status.Desired.Image = newHistory.Image
     
     // 5. 更新 ClusterVersion 对象
-    if err := cvo.client.Status().Update(context.TODO(), cv); err != nil {
+    if err := bke.client.Status().Update(context.TODO(), cv); err != nil {
         return err
     }
     
@@ -1938,115 +1937,106 @@ func (cvo *ClusterVersionOperator) executeDowngrade(targetVersion string) error 
   status.history[0].version = 4.12.0
   status.history[0].state = Partial
   conditions = [{type: Failing, status: True}]
-  → CVO: 检测到失败，等待用户手动触发降级
+  → CVO: 检测到失败，需要联系 Red Hat 支持或从 etcd 备份恢复
 
-状态 5: 用户手动触发降级
-  用户执行：oc adm upgrade --to=4.11.18
-  spec.desiredUpdate.version = 4.11.18  ← 用户设置
-  currentVersion = 4.11.18 (从 history[1] 获取)
-  → CVO: 检测到 desired < previous failed，创建新降级记录
-  → 创建新记录：history[0] = {state: Partial, version: 4.11.18}
-  → 原失败记录后移：history[1] = {state: Partial, version: 4.12.0}
+状态 5: 升级失败后处理（OpenShift 不支持降级）
+  # OpenShift 不支持版本降级
+  # 升级失败后的处理方式：
+  # 1. 联系 Red Hat 支持
+  # 2. 从 etcd 备份恢复
+  # 3. 重建集群
 
-状态 6: 降级进行中
-  spec.desiredUpdate.version = 4.11.18
-  status.history[0].version = 4.11.18
-  status.history[0].state = Partial
-  status.history[1].version = 4.12.0 (原失败记录)
-  → CVO: 继续降级
+状态 6: 恢复方案评估
+  评估是否可以从 etcd 备份恢复
+  或重建集群
 
-状态 7: 降级完成
-  spec.desiredUpdate.version = 4.11.18
-  status.history[0].version = 4.11.18
-  status.history[0].state = Completed
-  status.history[1].version = 4.12.0 (原失败记录保持)
-  → CVO: desired == current，无需操作
+状态 7: 恢复完成
+  # 从 etcd 备份恢复后
+  # 或重建集群后
+  → 集群恢复到升级前状态
 ```
 
 #### 4.5.5 关键洞察
 
-**降级触发的本质是：用户手动设置 `spec.desiredUpdate.version` 为更低版本**
+**OpenShift 升级触发的本质是：用户设置 `spec.desiredUpdate.version` 为更高版本**
 
 | 场景 | spec.desiredUpdate | currentVersion | 操作类型 |
 |------|-------------------|----------------|---------|
 | 稳定状态 | 4.11.18 | 4.11.18 | 无操作 |
 | 用户触发升级 | 4.12.0 | 4.11.18 | 升级 (desired > current) |
 | 升级进行中 | 4.12.0 | 4.11.18 | 继续升级 |
-| 升级失败 | 4.12.0 | 4.11.18 | 等待用户干预 |
-| 用户触发降级 | 4.11.18 | 4.11.18 | 降级 (创建新记录) |
-| 降级进行中 | 4.11.18 | 4.11.18 | 继续降级 |
-| 降级完成 | 4.11.18 | 4.11.18 | 无操作 |
-| 升级开始 | 4.12.0 | 4.11.18 | 升级 (desired > current) |
-| 升级中 | 4.12.0 | 4.11.18 | 继续升级 |
-| 升级失败 | 4.12.0 | 4.11.18 | 等待用户干预 |
-| 用户触发降级 | 4.11.18 | 4.11.18 | 降级 (创建新记录) |
-| 降级中 | 4.11.18 | 4.11.18 | 继续降级 |
-| 降级完成 | 4.11.18 | 4.11.18 | 无操作 |
+| 升级失败 | 4.12.0 | 4.11.18 | 联系 Red Hat 支持或从备份恢复 |
+
+**注意**：OpenShift 不支持版本降级。上表中的 "降级" 相关描述是 BKE 的设计目标，非 OpenShift 能力。
 
 **关键点**：
 1. 升级失败时，`status.history[0].state` 保持为 `Partial`，`Failing=True`
-2. **用户手动**执行 `oc adm upgrade --to=4.11.18` 触发降级
-3. CVO 创建新的降级记录 `status.history[0] = {Partial, 4.11.18}`
-4. 原失败记录后移 `status.history[1] = {Partial, 4.12.0}`
-5. 降级执行时，按照正常升级流程反向执行
+2. **用户手动**执行 `kubectl patch clusterversion` 触发降级（BKE 设计目标）
+3. CVO 创建新的降级记录 `status.history[0] = {Partial, v26.05}`
+4. 原失败记录后移 `status.history[1] = {Partial, v26.06}`
+5. 降级执行时，按照正常升级流程反向执行（BKE 设计目标）
 
-### 4.6 完整降级流程
+### 4.6 BKE 降级流程设计（BKE 设计目标，非 OpenShift 能力）
 
-#### 4.6.1 手动降级流程
+**重要说明**：OpenShift 不支持版本降级。以下内容是 BKE 的设计目标，作为与 OpenShift 的差异化能力。
+
+#### 4.6.1 BKE 手动降级流程设计
 
 ```
 步骤 1: 查看升级历史
-  └─ oc get clusterversion version -o yaml
+  └─ kubectl get clusterversion version -o yaml
      └─ 查看 status.history 字段
 
 步骤 2: 确定降级目标
   └─ 找到上一条 state=Completed 的记录
-  └─ 记录其 version 字段（如 4.11.18）
+  └─ 记录其 version 字段（如 v26.05）
 
 步骤 3: 验证降级路径
-  └─ oc adm upgrade --allow-explicit-upgrade --to-image=<image>
-  └─ 确认降级路径可用
+  └─ 确认 UpgradePath CRD 中存在降级路径
+  └─ 确认目标版本的 ReleaseImage 可用
 
 步骤 4: 触发降级
-  └─ oc adm upgrade --to=4.11.18
+  └─ kubectl patch clusterversion --type merge -p '{"spec":{"desiredVersion":"v26.05"}}'
   └─ 或修改 ClusterVersion.spec.desiredUpdate
 
 步骤 5: 监控降级进度
-  └─ oc get clusterversion version -w
+  └─ kubectl get clusterversion version -w
   └─ 查看 status.history 中新增的降级记录
 
 步骤 6: 验证降级完成
-  └─ 确认 status.history[0].version = 4.11.18
+  └─ 确认 status.history[0].version = v26.05
   └─ 确认 status.history[0].state = Completed
-  └─ 确认所有节点已降级到 4.11.18
+  └─ 确认所有组件已降级到 v26.05
 ```
 
-#### 4.6.2 降级状态转换
+#### 4.6.2 BKE 降级状态转换设计
+
+**重要说明**：以下是 BKE 的设计目标，非 OpenShift 能力。
 
 ```
 升级前：
   status.history:
-  - state: Completed, version: 4.11.18  ← 当前版本
-  - state: Completed, version: 4.11.0
+  - state: Completed, version: v26.05  ← 当前版本
+  - state: Completed, version: v26.03
 
 升级中（失败）：
   status.history:
-  - state: Partial, version: 4.12.0  ← 升级失败
-  - state: Completed, version: 4.11.18
-  - state: Completed, version: 4.11.0
+  - state: Partial, version: v26.06  ← 升级失败
+  - state: Completed, version: v26.05
+  - state: Completed, version: v26.03
 
 用户触发降级：
   status.history:
-  - state: Partial, version: 4.11.18  ← 新建降级记录
-  - state: Partial, version: 4.12.0   ← 原失败记录保持
-  - state: Completed, version: 4.11.18
-  - state: Completed, version: 4.11.0
+  - state: Partial, version: v26.05  ← 新建降级记录
+  - state: Partial, version: v26.06  ← 原失败记录保持
+  - state: Completed, version: v26.05
+  - state: Completed, version: v26.03
 
 降级完成：
   status.history:
-  - state: Completed, version: 4.11.18  ← 降级成功
-  - state: Partial, version: 4.12.0     ← 原失败记录保持
-  - state: Completed, version: 4.11.18
+  - state: Completed, version: v26.05  ← 降级成功
+  - state: Partial, version: v26.06    ← 原失败记录保持
+  - state: Completed, version: v26.05
   - state: Completed, version: 4.11.0
 ```
   - state: Completed, version: 4.11.18  ← 当前版本
@@ -2504,7 +2494,7 @@ type ImpactAssessment struct {
 | **PDB 支持** | 尊重 PDB 约束 | 必须实现 |
 | **优雅终止** | 支持 preStop hook | 必须实现 |
 | **健康检查** | 节点就绪后才继续 | 必须实现 |
-| **回滚能力** | 升级失败自动回滚 | 建议实现 |
+| **升级失败处理** | OpenShift 不支持回滚，需联系支持或从备份恢复 | BKE 建议实现降级能力 |
 | **维护窗口** | 支持暂停升级 | 建议实现 |
 
 ##### (c) 关键结论
@@ -3514,11 +3504,11 @@ CRD 中删除字段定义后：
 
 ### 5.1 回滚能力对比
 
-| 场景 | 是否支持回滚 | 回滚方式 | 复杂度 |
+| 场景 | 是否支持回滚 | 处理方式 | 复杂度 |
 |------|------------|---------|--------|
 | **安装失败** | ❌ 不支持 | 重建集群 | 低 |
-| **扩容失败** | ✅ 支持 | 减少 replicas | 低 |
-| **升级失败** | ✅ 支持 | 自动/手动回滚 | 高 |
+| **扩容失败** | ✅ 支持 | 缩容（减少 replicas） | 低 |
+| **升级失败** | ❌ 不支持 | 联系 Red Hat 支持或从 etcd 备份恢复 | 高 |
 | **配置变更失败** | ✅ 支持 | 回滚 MachineConfig | 中 |
 
 ### 5.2 回滚粒度
@@ -3644,20 +3634,20 @@ type DowngradeCondition struct {
 
 | 优先级 | 能力 | 工作量 | 价值 |
 |--------|------|--------|------|
-| **P0** | 升级失败自动回滚 | 中 | 高 |
-| **P0** | 扩容失败自动回滚 | 低 | 高 |
-| **P1** | 回滚历史审计 | 低 | 中 |
-| **P1** | 回滚钩子机制 | 中 | 中 |
-| **P2** | 跨版本回滚 | 高 | 低 |
-| **P2** | 部分回滚 | 高 | 低 |
+| **P0** | 升级失败降级能力（BKE 差异化能力） | 高 | 高 |
+| **P0** | 扩容失败缩容能力 | 低 | 高 |
+| **P1** | 降级历史审计 | 低 | 中 |
+| **P1** | 降级钩子机制 | 中 | 中 |
+| **P2** | 跨版本降级 | 高 | 低 |
+| **P2** | 部分降级 | 高 | 低 |
 
 ## 八、总结
 
 ### 8.1 OpenShift 回滚能力特点
 
 1. **安装不支持回滚**：设计哲学是"快速失败，重建集群"
-2. **扩容支持回滚**：通过声明式 API 减少 replicas
-3. **升级支持回滚**：自动/手动回滚到相邻版本
+2. **扩容支持缩容**：通过声明式 API 减少 replicas（注意：这是节点缩容，不是版本回滚）
+3. **升级不支持回滚**：OpenShift 不支持将集群还原到以前版本，升级失败后需联系 Red Hat 支持或从 etcd 备份恢复
 4. **配置支持回滚**：通过 MachineConfig 版本管理
 
 ### 8.2 核心设计洞察
@@ -3670,8 +3660,8 @@ type DowngradeCondition struct {
 ### 8.3 对 BKE 的启示
 
 1. **安装失败**：建议实现自动重试和清理机制，而非回滚
-2. **扩容失败**：实现声明式回滚，减少 replicas 即可
-3. **升级失败**：实现手动降级机制，用户设置目标版本为旧版本即可触发降级
+2. **扩容失败**：实现声明式缩容，减少 replicas 即可
+3. **升级失败**：由于 OpenShift 不支持版本回滚，BKE 可以考虑实现自己的降级机制作为差异化能力
 4. **状态管理**：完善 `UpgradeHistory`，记录完整的升级/降级历史
 
 ## 九、优化状态设计方案
