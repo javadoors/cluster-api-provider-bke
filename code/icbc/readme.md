@@ -106,7 +106,6 @@ spec:
 | 备份验证 | 验证 etcd 快照、配置备份是否可用 | 阻止升级 |
 | 路径验证 | 验证升级路径是否合法 | 阻止升级 |
 | 资源检查 | 检查磁盘、内存、CPU 是否充足 | 阻止升级 |
-| PDB 检查 | 检查 PodDisruptionBudget 配置 | 警告提示 |
 
 #### 2.2.5 升级后验证（Post-Upgrade）
 
@@ -510,7 +509,6 @@ AES-256 加密，密钥轮转。
 |------|------|
 | CVO | Cluster Version Operator，集群版本 Operator |
 | DAG | Directed Acyclic Graph，有向无环图 |
-| PDB | PodDisruptionBudget，Pod 中断预算 |
 | etcd | 分布式键值存储，Kubernetes 使用 etcd 存储集群状态 |
 | Velero | Kubernetes 备份恢复工具 |
 02-10 | openFuyao 团队 | 初始版本 |
