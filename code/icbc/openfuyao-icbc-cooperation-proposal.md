@@ -262,6 +262,158 @@ LTS 版本：25.12、26.12、27.12
 | stable | 稳定版本，经过验证 | 生产环境 |
 | candidate | 候选版本，待验证 | 预发布环境 |
 
+#### 3.2.6 OpenShift Operator 生态参考
+
+参考 OpenShift 4.14 的 Operator 架构，其核心 Operator 生态包括：
+
+**版本与配置管理**：
+| Operator | 职责 | 说明 |
+|---------|------|------|
+| **Cluster Version Operator (CVO)** | 集群版本管理和升级 | 管理集群生命周期，协调所有 Operator 升级 |
+| **Machine Config Operator (MCO)** | 节点配置管理和更新 | 管理节点配置，支持滚动更新和回滚 |
+
+**基础设施管理**：
+| Operator | 职责 | 说明 |
+|---------|------|------|
+| **Machine API Operator** | 机器生命周期管理 | 管理 Machine、MachineSet、MachineDeployment |
+| **Cluster Baremetal Operator** | 裸金属服务器管理 | 管理裸金属主机的生命周期 |
+| **Control Plane Machine Set Operator** | 控制平面机器集管理 | 管理控制平面节点的高可用 |
+
+**网络与 DNS**：
+| Operator | 职责 | 说明 |
+|---------|------|------|
+| **Cluster Network Operator** | 集群网络管理 | 管理 CNI 插件和网络配置 |
+| **DNS Operator** | DNS 服务管理 | 管理 CoreDNS 和 DNS 配置 |
+| **Ingress Operator** | Ingress 控制器管理 | 管理 Ingress Controller |
+
+**核心组件**：
+| Operator | 职责 | 说明 |
+|---------|------|------|
+| **Kubernetes API Server Operator** | API Server 管理 | 管理 API Server 的配置和证书 |
+| **Kubernetes Controller Manager Operator** | Controller Manager 管理 | 管理 Controller Manager 配置 |
+| **Kubernetes Scheduler Operator** | Scheduler 管理 | 管理 Scheduler 配置 |
+| **etcd cluster Operator** | etcd 集群管理 | 管理 etcd 集群的生命周期 |
+
+**存储与镜像**：
+| Operator | 职责 | 说明 |
+|---------|------|------|
+| **Cluster Storage Operator** | 存储类管理 | 管理 StorageClass 和 CSI 驱动 |
+| **Cluster Image Registry Operator** | 镜像仓库管理 | 管理内部镜像仓库 |
+| **Cluster CSI Snapshot Controller Operator** | CSI 快照管理 | 管理 VolumeSnapshot |
+
+**监控与安全**：
+| Operator | 职责 | 说明 |
+|---------|------|------|
+| **Cluster Monitoring Operator** | 监控栈管理 | 管理 Prometheus、Grafana、Alertmanager |
+| **Cluster Authentication Operator** | 认证管理 | 管理 OAuth、LDAP 等认证配置 |
+| **OpenShift Service CA Operator** | 服务证书管理 | 自动为服务生成和轮转证书 |
+
+#### 3.2.7 BKE Operator 体系规划
+
+基于 OpenShift 的 Operator 架构和 BKE 的实际需求，规划以下 Operator 体系：
+
+**核心 Operator（P0 - 必须实现）**：
+
+| Operator | 职责 | 参考 OpenShift | 优先级 | 说明 |
+|---------|------|---------------|--------|------|
+| **Cluster Version Operator (CVO)** | 集群版本管理、升级/降级 | CVO | P0（已有） | 已实现声明式版本管理 |
+| **Node Config Operator** | 节点配置管理、配置下发 | MCO | P0 | 管理节点配置，支持滚动更新 |
+| **Network Operator** | 网络插件管理、网络策略 | CNO | P0 | 管理 Calico/Cilium 等 CNI |
+| **Backup Operator** | 备份恢复管理 | 无直接参考 | P0 | 管理 etcd 和应用数据备份 |
+
+**扩展 Operator（P1 - 推荐实现）**：
+
+| Operator | 职责 | 参考 OpenShift | 优先级 | 说明 |
+|---------|------|---------------|--------|------|
+| **Storage Operator** | 存储类管理、PV 管理 | CSO | P1 | 管理 StorageClass 和 CSI 驱动 |
+| **Security Operator** | 证书管理、RBAC 管理 | Service CA | P1 | 自动证书轮转和 RBAC 管理 |
+| **Monitoring Operator** | 监控栈管理、告警规则 | CMO | P1 | 管理 Prometheus 和告警规则 |
+
+**可选 Operator（P2 - 按需实现）**：
+
+| Operator | 职责 | 参考 OpenShift | 优先级 | 说明 |
+|---------|------|---------------|--------|------|
+| **Ingress Operator** | Ingress 控制器管理 | Ingress | P2 | 管理 Nginx/Traefik Ingress |
+| **DNS Operator** | DNS 服务管理 | DNS | P2 | 管理 CoreDNS 配置 |
+| **Machine API Operator** | 机器生命周期管理 | MAO | P2 | 管理云环境中的 VM 生命周期 |
+
+**BKE Operator 架构图**：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    BKE Operator 体系                         │
+└─────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────┐
+│  核心层（P0）                                                 │
+│  ├─ Cluster Version Operator (CVO)                          │
+│  │   └─ 版本管理、升级/降级协调                              │
+│  ├─ Node Config Operator                                    │
+│  │   └─ 节点配置管理、配置下发                               │
+│  ├─ Network Operator                                        │
+│  │   └─ 网络插件管理、网络策略                               │
+│  └─ Backup Operator                                         │
+│      └─ 备份恢复管理                                         │
+└──────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────┐
+│  扩展层（P1）                                                 │
+│  ├─ Storage Operator                                        │
+│  │   └─ 存储类管理、PV 管理                                  │
+│  ├─ Security Operator                                       │
+│  │   └─ 证书管理、RBAC 管理                                  │
+│  └─ Monitoring Operator                                     │
+│      └─ 监控栈管理、告警规则                                 │
+└──────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌──────────────────────────────────────────────────────────────┐
+│  可选层（P2）                                                 │
+│  ├─ Ingress Operator                                        │
+│  │   └─ Ingress 控制器管理                                   │
+│  ├─ DNS Operator                                            │
+│  │   └─ DNS 服务管理                                         │
+│  └─ Machine API Operator                                    │
+│      └─ 机器生命周期管理                                     │
+└──────────────────────────────────────────────────────────────┘
+```
+
+#### 3.2.8 BKE Operator 实施计划
+
+**阶段一（2026 Q1-Q2）：核心 Operator**
+
+| Operator | 开始时间 | 完成时间 | 工作量 | 交付物 |
+|---------|---------|---------|--------|--------|
+| Node Config Operator | 2026-03 | 2026-04 | 2 人月 | Operator 代码 + CRD + 文档 |
+| Network Operator | 2026-04 | 2026-05 | 2 人月 | Operator 代码 + CRD + 文档 |
+| Backup Operator | 2026-05 | 2026-06 | 2 人月 | Operator 代码 + CRD + 文档 |
+
+**阶段二（2026 Q3）：扩展 Operator**
+
+| Operator | 开始时间 | 完成时间 | 工作量 | 交付物 |
+|---------|---------|---------|--------|--------|
+| Storage Operator | 2026-07 | 2026-08 | 1.5 人月 | Operator 代码 + CRD + 文档 |
+| Security Operator | 2026-08 | 2026-09 | 1.5 人月 | Operator 代码 + CRD + 文档 |
+| Monitoring Operator | 2026-09 | 2026-09 | 1 人月 | Operator 代码 + CRD + 文档 |
+
+**阶段三（2026 Q4）：可选 Operator**
+
+| Operator | 开始时间 | 完成时间 | 工作量 | 交付物 |
+|---------|---------|---------|--------|--------|
+| Ingress Operator | 2026-10 | 2026-11 | 1 人月 | Operator 代码 + CRD + 文档 |
+| DNS Operator | 2026-11 | 2026-11 | 0.5 人月 | Operator 代码 + CRD + 文档 |
+| Machine API Operator | 2026-11 | 2026-12 | 1.5 人月 | Operator 代码 + CRD + 文档 |
+
+**总工作量估算**：
+
+| 阶段 | 工作量 | 说明 |
+|------|--------|------|
+| 阶段一：核心 Operator | 6 人月 | Node Config + Network + Backup |
+| 阶段二：扩展 Operator | 4 人月 | Storage + Security + Monitoring |
+| 阶段三：可选 Operator | 3 人月 | Ingress + DNS + Machine API |
+| **总计** | **13 人月** | 10 个 Operator |
+
 ### 3.3 合作价值
 
 | 价值点 | 说明 |
