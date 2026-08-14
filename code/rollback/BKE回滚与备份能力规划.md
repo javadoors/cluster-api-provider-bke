@@ -228,6 +228,139 @@ ClusterVersion 是 BKE 的版本生命周期管理组件，负责管理集群的
 
 ## 二、升级能力设计提案
 
+### 2.0 OpenShift 4.14 官方规格参考
+
+#### 2.0.1 OpenShift 升级/降级/回滚/备份规格
+
+**核心结论**：
+- **升级**：官方支持的标准流程，由 CVO 管理
+- **降级**：官方不支持，只能通过备份恢复实现
+- **回滚**：不支持自动回滚，仅靠备份恢复
+- **备份**：分为 etcd（控制平面）与 OADP（应用层）两类
+
+**对比表**：
+
+| 能力 | OpenShift 4.14 | 说明 |
+|------|---------------|------|
+| **升级** | ✅ 官方支持，CVO 管理 | 使用更新通道控制版本，无需集群停机 |
+| **降级** | ❌ 不支持 | 需恢复旧快照，存在 schema 不兼容风险 |
+| **回滚** | ❌ 不支持自动回滚 | 升级失败需手动恢复 etcd 快照 |
+| **备份** | ✅ 分为 etcd 与 OADP 两类 | etcd 保存控制平面，OADP 保存应用 |
+
+**详细说明**：
+
+**升级（Update/Upgrade）**：
+- **机制**：由 Cluster Version Operator (CVO) 管理，使用 ClusterVersion 对象与 Release Image 进行升级
+- **渠道**：支持 fast-4.14、stable-4.14、candidate-4.14、eus-4.y 等更新通道
+- **特点**：
+  - 升级过程无需下线整个集群，节点由 Machine Config Operator 滚动更新
+  - 支持 Conditional Updates，避免已知风险版本
+- **限制**：只能在官方支持的版本路径内升级，不支持跨大版本跳跃
+
+**降级（Downgrade）**：
+- **官方说明**：OpenShift 不支持直接降级
+- **原因**：集群对象与 API 在升级后可能发生不可逆的 schema 变化
+- **替代方案**：若需回退，只能通过恢复升级前的 etcd 备份来实现
+
+**回滚（Rollback）**：
+- **不支持自动回滚**：升级失败不会自动恢复到旧版本
+- **推荐做法**：
+  - 在升级前执行 etcd 快照备份
+  - 若升级失败或出现严重问题，通过恢复快照将集群回滚到之前状态
+- **风险**：应用层数据需额外使用 OADP 备份，否则仅恢复控制平面状态
+
+**备份与恢复（Backup & Restore）**：
+
+**控制平面备份**：
+- **核心对象**：etcd 数据库，保存所有集群资源对象
+- **操作**：
+  - 使用 `etcdctl snapshot save` 创建快照
+  - 在灾难恢复时用 `etcdctl snapshot restore` 恢复
+- **场景**：节点故障、网络异常、etcd quorum 丢失
+
+**应用层备份**：
+- **工具**：OpenShift API for Data Protection (OADP)
+- **功能**：支持应用数据与持久卷的备份与恢复
+- **要求**：需配置存储后端（如 S3、CSI 驱动）
+
+#### 2.0.2 OpenShift 官方文档引用清单
+
+**1. 升级**
+- **来源**：Updating clusters 文档
+- **关键段落**：
+  > "The Cluster Version Operator (CVO) manages the update process by applying the release image to the cluster."
+- **说明**：升级由 CVO 管理，使用 Release Image，支持不同更新通道
+
+**2. 降级**
+- **来源**：Updating clusters 文档
+- **关键段落**：
+  > "You cannot downgrade your cluster to a previous version. If you must return to a previous version, you must restore from an etcd backup taken before the upgrade."
+- **说明**：官方明确禁止降级，唯一方式是恢复升级前的 etcd 备份
+
+**3. 回滚**
+- **来源**：Disaster recovery with etcd 文档
+- **关键段落**：
+  > "Restoring from an etcd backup reverts the cluster state to the time of the snapshot. This is the only supported method to roll back after an upgrade."
+- **说明**：回滚不支持自动执行，必须依赖升级前的 etcd 快照
+
+**4. 备份**
+- **来源**：Backing up and restoring etcd 文档
+- **关键段落**：
+  > "You must back up your cluster's etcd data regularly and before making any changes such as upgrades."
+- **说明**：etcd 备份是灾难恢复与升级前的必备步骤
+
+- **来源**：OpenShift API for Data Protection (OADP) 文档
+- **关键段落**：
+  > "OADP enables backup and restore of Kubernetes applications, including persistent volumes."
+- **说明**：应用层数据需通过 OADP 进行备份与恢复
+
+#### 2.0.3 风险与建议
+
+**⚠️ 关键风险**：
+
+1. **升级前必须执行 etcd 备份**，否则无法安全回滚
+2. **降级不可行**，需通过恢复旧备份实现
+3. **应用层数据需额外保护**，避免仅恢复控制平面导致业务丢失
+4. **证书有效期**：安装一年后需更新，避免因证书过期导致恢复失败
+
+**✅ 最佳实践**：
+
+1. 升级前执行 etcd 快照备份
+2. 使用 OADP 备份应用层数据
+3. 定期验证备份可恢复性
+4. 建立升级前检查清单（etcd 快照、OADP 配置、证书状态、节点健康）
+
+#### 2.0.4 对 BKE 的启示
+
+**BKE 与 OpenShift 的差异**：
+
+| 能力 | OpenShift | BKE 设计目标 |
+|------|-----------|-------------|
+| **降级** | ❌ 不支持 | ✅ 支持版本降级（差异化能力） |
+| **自动回滚** | ❌ 不支持 | ✅ 可设计自动回滚机制 |
+| **备份恢复** | ✅ etcd + OADP | ✅ etcd 备份 + 降级方案 |
+| **升级前检查** | ✅ 推荐 | ✅ 强制检查机制 |
+
+**BKE 的设计目标**：
+
+1. **支持版本降级**（OpenShift 不支持）
+   - 通过声明式 DAG 执行降级操作
+   - 提供两种降级方案：降级 DAG 和复用升级流程
+
+2. **提供自动回滚能力**（OpenShift 不支持）
+   - 升级失败后可自动触发回滚
+   - 减少人工干预，提高恢复速度
+
+3. **同时提供 etcd 备份恢复作为兜底方案**
+   - 与 OpenShift 一致，提供 etcd 快照备份
+   - 作为降级方案的补充
+
+4. **建立完善的升级前检查机制**
+   - etcd 快照验证
+   - OADP 配置检查
+   - 证书状态检查
+   - 节点健康检查
+
 ### 2.1 升级能力概述
 
 #### 2.1.1 当前升级机制
@@ -3355,3 +3488,30 @@ preUpgradeChecklist:
 **创建日期**：2024-01-15  
 **最后更新**：2024-01-15  
 **维护者**：BKE 团队
+
+---
+
+## 参考文档
+
+### OpenShift 官方文档
+
+- **Updating clusters**：OpenShift 4.14 升级官方文档
+  - https://docs.openshift.com/container-platform/4.14/updating/updating_cluster_cli.html
+  
+- **Disaster recovery with etcd**：OpenShift 4.14 etcd 灾难恢复官方文档
+  - https://docs.openshift.com/container-platform/4.14/backup_and_restore/disaster_recovery/scenario-2-infra-recovery.html
+  
+- **Backing up and restoring etcd**：OpenShift 4.14 etcd 备份与恢复官方文档
+  - https://docs.openshift.com/container-platform/4.14/backup_and_restore/backing_up_etcd/backing-up-etcd.html
+  
+- **OpenShift API for Data Protection (OADP)**：OpenShift 4.14 应用数据保护官方文档
+  - https://docs.openshift.com/container-platform/4.14/backup_and_restore/application_backup_and_restore/about-oadp.html
+
+### BKE 内部文档
+
+- **BKE 状态机重构设计提案**：`code/exception/BKE状态机重构设计提案.md`
+- **K8s 控制面升级设计**：`code/upgrade/k8s-control-plane-upgrade-design.md`
+- **APIServer 跨多版本升级设计**：`code/upgrade/apiserver-multi-version-upgrade-design.md`
+- **K8s 版本倾斜合规方案**：`code/upgrade/k8s-version-skew-compliance-design.md`
+- **OpenShift 集群安装与扩容回滚能力洞察报告**：`code/rollback/OpenShift集群安装与扩容回滚能力洞察报告.md`
+- **BKE 回滚与备份能力规划（领导汇报版）**：`code/rollback/BKE回滚与备份能力规划-领导汇报版.md`
