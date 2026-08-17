@@ -259,157 +259,288 @@ spec:
 
 ### 3.2 核心能力
 
-#### 3.2.0 CVO 架构设计
+#### 3.2.0 OpenShift CVO 架构参考
 
-**CVO 整体架构图**：
+**OpenShift CVO 整体架构图**：
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                          CVO (Cluster Version Operator) 架构                    │
+│               OpenShift CVO (Cluster Version Operator) 架构                      │
+│               参考: github.com/openshift/cluster-version-operator                │
 └─────────────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│  声明层 (Declarative Layer)                                                     │
+│  用户入口                                                                       │
+│  ┌──────────────────────┐  ┌──────────────────────┐  ┌──────────────────────┐  │
+│  │  oc adm upgrade      │  │  Web Console         │  │  GitOps / CI/CD      │  │
+│  │  --to=4.14.8         │  │  (Admin Portal)      │  │  (ArgoCD/Flux)       │  │
+│  └──────────┬───────────┘  └──────────┬───────────┘  └──────────┬───────────┘  │
+└─────────────┼──────────────────────────┼──────────────────────────┼─────────────┘
+              │  写入 spec.desiredUpdate │                          │
+              ▼                          ▼                          ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│  ClusterVersion CRD (config.openshift.io/v1, 集群级单例 "version")              │
 │  ┌─────────────────────────────────────────────────────────────────────────┐    │
-│  │  ClusterVersion CRD                                                     │    │
-│  │  ┌─────────────────────────────────────────────────────────────────┐    │    │
-│  │  │  spec:                                                          │    │    │
-│  │  │    desiredVersion: "26.06"         ← 用户声明的目标版本         │    │    │
-│  │  │    channel: "stable"               ← 升级通道                   │    │    │
-│  │  │    upstream: "https://..."         ← 版本更新源                 │    │    │
-│  │  │  status:                                                        │    │    │
-│  │  │    currentVersion: "26.03"         ← 当前版本                   │    │    │
-│  │  │    phase: "Upgrading"              ← 当前阶段                   │    │    │
-│  │  │    history: [...]                  ← 升级历史                   │    │    │
-│  │  │    conditions: [...]               ← 状态条件                   │    │    │
-│  │  └─────────────────────────────────────────────────────────────────┘    │    │
+│  │  spec:                                                                  │    │
+│  │    channel: "stable-4.14"          ← 升级通道 (stable/fast/candidate)   │    │
+│  │    clusterID: "xxxx-xxxx"          ← 集群唯一标识                       │    │
+│  │    upstream: "https://api.openshift.com/api/upgrades/info"              │    │
+│  │    desiredUpdate:                                                         │    │
+│  │      version: "4.14.8"             ← 目标版本                           │    │
+│  │      image: "quay.io/openshift-release-dev/ocp-release:4.14.8-x86_64"   │    │
+│  │      force: false                  ← 是否强制升级                       │    │
+│  │  status:                                                                  │    │
+│  │    desired: {version: "4.14.8", image: "quay.io/..."}                    │    │
+│  │    history:                                                               │    │
+│  │      - state: "Completed"          ← Completed / Partial                │    │
+│  │        version: "4.14.3"                                                  │    │
+│  │        startedTime: "2024-01-10T..."                                      │    │
+│  │        completionTime: "2024-01-10T..."                                   │    │
+│  │      - state: "Partial"                                                   │    │
+│  │        version: "4.14.8"                                                  │    │
+│  │        startedTime: "2024-02-15T..."                                      │    │
+│  │    availableUpdates: [...]           ← 从 OSUS 获取的可用更新             │    │
+│  │    conditions:                                                              │    │
+│  │      - type: Available              ← Available / Failing / Progressing  │    │
+│  │        status: "True"                                                     │    │
+│  │      - type: Progressing                                                  │    │
+│  │        status: "True"                                                     │    │
+│  │      - type: Failing                                                      │    │
+│  │        status: "False"                                                    │    │
+│  │      - type: RetrievedUpdates                                               │    │
+│  │        status: "True"                                                     │    │
 │  └─────────────────────────────────────────────────────────────────────────┘    │
 └──────────────────────────────────────┬──────────────────────────────────────────┘
                                        │
                                        ▼
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│  协调层 (Reconciliation Layer) — CVO Controller                                 │
-│  ┌─────────────────────────────────────────────────────────────────────────┐    │
-│  │  ClusterVersion Controller                                              │    │
-│  │  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────────┐      │    │
-│  │  │ 版本检测        │  │ 路径验证        │  │ 升级编排            │      │    │
-│  │  │ (Version Detect)│→│ (Path Validate)  │→│ (Upgrade Orchestrate)│      │    │
-│  │  └─────────────────┘  └─────────────────┘  └──────────┬──────────┘      │    │
-│  └────────────────────────────────────────────────────────┼────────────────┘    │
-│                                                           │                     │
-│  ┌────────────────────────────────────────────────────────┼────────────────┐    │
-│  │  ReleaseImage 解析                                      │                │    │
-│  │  ┌─────────────────────────────────────────────────┐    │                │    │
-│  │  │  OCI Image (ReleaseImage)                       │    │                │    │
-│  │  │  ├─ release-manifests/                          │    │                │    │
-│  │  │  │   ├─ ComponentVersion (provider)             │    │                │    │
-│  │  │  │   ├─ ComponentVersion (install-service)      │    │                │    │
-│  │  │  │   ├─ ComponentVersion (bkeagent)             │    │                │    │
-│  │  │  │   ├─ ComponentVersion (kubelet)              │    │                │    │
-│  │  │  │   ├─ ComponentVersion (etcd)                 │    │                │    │
-│  │  │  │   └─ ...                                     │    │                │    │
-│  │  │  └─ image-references                            │    │                │    │
-│  │  └─────────────────────────────────────────────────┘    │                │    │
-│  └─────────────────────────────────────────────────────────┼────────────────┘    │
-└────────────────────────────────────────────────────────────┼─────────────────────┘
-                                                             │
-                                                             ▼
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│  执行层 (Execution Layer) — 升级框架                                            │
-│  ┌─────────────────────────────────────────────────────────────────────────┐    │
-│  │  DAG 编排引擎                                                           │    │
-│  │  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐                │    │
-│  │  │ Phase 1       │  │ Phase 2       │  │ Phase N       │                │    │
-│  │  │ Provider      │→ │ Install-Svc   │→ │ Addons        │                │    │
-│  │  │ Self-Upgrade  │  │ Self-Upgrade  │  │ Upgrade       │                │    │
-│  │  └───────────────┘  └───────────────┘  └───────────────┘                │    │
-│  └─────────────────────────────────────────────────────────────────────────┘    │
+│  CVO Controller (Deployment, ns: openshift-cluster-version, 单副本)             │
 │                                                                                 │
 │  ┌─────────────────────────────────────────────────────────────────────────┐    │
-│  │  三层状态机                                                             │    │
-│  │  ┌─────────────────────────────────────────────────────────────────┐    │    │
-│  │  │  L1: 集群级状态机 (ClusterUpgrade)                              │    │    │
-│  │  │  └─ 协调全局升级流程，管理批次执行顺序                          │    │    │
-│  │  └────────────────────────────┬────────────────────────────────────┘    │    │
-│  │                               ▼                                         │    │
-│  │  ┌─────────────────────────────────────────────────────────────────┐    │    │
-│  │  │  L2: 节点级状态机 (NodeUpgrade)                                 │    │    │
-│  │  │  └─ 管理单节点升级状态，协调节点上组件升级                      │    │    │
-│  │  └────────────────────────────┬────────────────────────────────────┘    │    │
-│  │                               ▼                                         │    │
-│  │  ┌─────────────────────────────────────────────────────────────────┐    │    │
-│  │  │  L3: 组件级状态机 (ComponentUpgrade)                            │    │    │
-│  │  │  └─ 执行具体升级逻辑 (inline/binary/helm/yaml)                  │    │    │
-│  │  └─────────────────────────────────────────────────────────────────┘    │    │
+│  │  1. Update Graph Sync (与 OSUS/Cincinnati 通信)                          │    │
+│  │     ┌──────────────────────────────────────────────────────────────┐     │    │
+│  │     │  GET /api/upgrades_info/v1/graph?channel=stable-4.14        │     │    │
+│  │     │  ┌─────────────────────────────────────────────────────┐    │     │    │
+│  │     │  │  OpenShift Update Service (OSUS / Cincinnati)       │    │     │    │
+│  │     │  │  ┌────────┐  ┌────────┐  ┌────────┐  ┌────────┐   │    │     │    │
+│  │     │  │  │ 4.14.1 │→│ 4.14.3 │→│ 4.14.5 │→│ 4.14.8 │   │    │     │    │
+│  │     │  │  │        │→│        │→│        │  │        │   │    │     │    │
+│  │     │  │  └────────┘  └────────┘  └────────┘  └────────┘   │    │     │    │
+│  │     │  │  (DAG 形式的升级图，定义合法升级路径)               │    │     │    │
+│  │     │  └─────────────────────────────────────────────────────┘    │     │    │
+│  │     └──────────────────────────────────────────────────────────────┘     │    │
+│  └─────────────────────────────────────────────────────────────────────────┘    │
+│                                       │                                         │
+│  ┌─────────────────────────────────────────────────────────────────────────┐    │
+│  │  2. Release Payload Pull (拉取 Release Image)                            │    │
+│  │     ┌──────────────────────────────────────────────────────────────┐     │    │
+│  │     │  OCI Image: quay.io/openshift-release-dev/ocp-release:4.14.8 │     │    │
+│  │     │  ┌────────────────────────────────────────────────────────┐  │     │    │
+│  │     │  │  release-manifests/        (Kubernetes 资源清单)       │  │     │    │
+│  │     │  │  ├─ 0000_00_cluster-version-operator_*.yaml            │  │     │    │
+│  │     │  │  ├─ 0000_05_config-operator_*.yaml                     │  │     │    │
+│  │     │  │  ├─ 0000_10_authentication-operator_*.yaml             │  │     │    │
+│  │     │  │  ├─ 0000_10_dns-operator_*.yaml                        │  │     │    │
+│  │     │  │  ├─ 0000_10_etcd-operator_*.yaml                       │  │     │    │
+│  │     │  │  ├─ 0000_10_ingress-operator_*.yaml                    │  │     │    │
+│  │     │  │  ├─ 0000_10_kube-apiserver-operator_*.yaml             │  │     │    │
+│  │     │  │  ├─ 0000_10_kube-controller-manager-operator_*.yaml    │  │     │    │
+│  │     │  │  ├─ 0000_10_kube-scheduler-operator_*.yaml             │  │     │    │
+│  │     │  │  ├─ 0000_10_machine-api-operator_*.yaml                │  │     │    │
+│  │     │  │  ├─ 0000_10_machine-config-operator_*.yaml             │  │     │    │
+│  │     │  │  ├─ 0000_10_monitoring-operator_*.yaml                 │  │     │    │
+│  │     │  │  ├─ 0000_10_network-operator_*.yaml                    │  │     │    │
+│  │     │  │  ├─ 0000_10_storage-operator_*.yaml                    │  │     │    │
+│  │     │  │  └─ ... (共 60+ 个 manifest 文件)                      │  │     │    │
+│  │     │  ├─ image-references/        (镜像引用清单)               │  │     │    │
+│  │     │  │  └─ image-references (定义所有组件镜像 digest)          │  │     │    │
+│  │     │  └─ release-manifests/       (ClusterOperator 定义)       │  │     │    │
+│  │     │     └─ ClusterOperator CR (每个组件一个)                  │  │     │    │
+│  │     └────────────────────────────────────────────────────────┘  │     │    │
+│  │     文件命名规则: {order}_{weight}_{operator-name}_{manifest}.yaml     │     │
+│  │     按文件名排序执行，order 决定执行优先级                          │     │    │
+│  └──────────────────────────────────────────────────────────────────────┘     │
+│                                       │                                         │
+│  ┌─────────────────────────────────────────────────────────────────────────┐    │
+│  │  3. Reconciliation (按顺序 apply manifests 到集群)                       │    │
+│  │     ┌──────────────────────────────────────────────────────────────┐     │    │
+│  │     │  Graph Builder: 按文件名排序构建执行图                        │     │    │
+│  │     │  ┌──────────────────────────────────────────────────────┐    │     │    │
+│  │     │  │  RunLevel 0: CVO 自身 (self-bootstrap)               │    │     │    │
+│  │     │  │  RunLevel 5: config-operator (全局配置)               │    │     │    │
+│  │     │  │  RunLevel 10: 所有 ClusterOperator manifests          │    │     │    │
+│  │     │  │  ┌────────────────────────────────────────────────┐   │    │     │    │
+│  │     │  │  │  按 order 排序，同 order 内并行 apply           │   │    │     │    │
+│  │     │  │  │  每个 manifest apply 后等待对应 CO 收敛        │   │    │     │    │
+│  │     │  │  └────────────────────────────────────────────────┘   │    │     │    │
+│  │     │  └──────────────────────────────────────────────────────┘    │     │    │
+│  │     └──────────────────────────────────────────────────────────────┘     │    │
+│  └─────────────────────────────────────────────────────────────────────────┘    │
+└──────────────────────────────────────┬──────────────────────────────────────────┘
+                                       │  apply manifests
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│  集群内 ClusterOperators (~40+ 个，每个管理一个集群组件)                          │
+│                                                                                 │
+│  ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐     │
+│  │  kube-apiserver     │  │  etcd               │  │  machine-config     │     │
+│  │  Operator           │  │  Operator           │  │  Operator (MCO)     │     │
+│  │  ┌───────────────┐  │  │  ┌───────────────┐  │  │  ┌───────────────┐  │     │
+│  │  │ Deployment    │  │  │  │ Deployment    │  │  │  │ Deployment    │  │     │
+│  │  │ (apiserver)   │  │  │  │ (etcd)        │  │  │  │ (machine-conf)│  │     │
+│  │  └───────────────┘  │  │  └───────────────┘  │  │  └───────────────┘  │     │
+│  │  status:            │  │  status:            │  │  status:            │     │
+│  │  Available=True     │  │  Available=True     │  │  Available=True     │     │
+│  │  Progressing=False  │  │  Progressing=False  │  │  Progressing=False  │     │
+│  │  Degraded=False     │  │  Degraded=False     │  │  Degraded=False     │     │
+│  └─────────────────────┘  └─────────────────────┘  └─────────────────────┘     │
+│                                                                                 │
+│  ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐     │
+│  │  network            │  │  dns                │  │  ingress            │     │
+│  │  Operator (CNO)     │  │  Operator           │  │  Operator           │     │
+│  │  ┌───────────────┐  │  │  ┌───────────────┐  │  │  ┌───────────────┐  │     │
+│  │  │ Calico/OVN    │  │  │  │ CoreDNS       │  │  │  │ IngressCtrl   │  │     │
+│  │  │ kube-proxy    │  │  │  │               │  │  │  │ (HAProxy)     │  │     │
+│  │  └───────────────┘  │  │  └───────────────┘  │  │  └───────────────┘  │     │
+│  └─────────────────────┘  └─────────────────────┘  └─────────────────────┘     │
+│                                                                                 │
+│  ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────────┐     │
+│  │  monitoring         │  │  authentication     │  │  storage            │     │
+│  │  Operator           │  │  Operator           │  │  Operator           │     │
+│  │  ┌───────────────┐  │  │  ┌───────────────┐  │  │  ┌───────────────┐  │     │
+│  │  │ Prometheus    │  │  │  │ OAuth         │  │  │  │ CSI Drivers   │  │     │
+│  │  │ Alertmanager  │  │  │  │ kube-rbac     │  │  │  │               │  │     │
+│  │  └───────────────┘  │  │  └───────────────┘  │  │  └───────────────┘  │     │
+│  └─────────────────────┘  └─────────────────────┘  └─────────────────────┘     │
+│                                                                                 │
+│  ... 以及更多 ClusterOperators (共 40+ 个)                                      │
+│                                                                                 │
+│  ClusterOperator Status 三条件模型:                                              │
+│  ┌─────────────────────────────────────────────────────────────────────────┐    │
+│  │  Available   = True   → 组件正常运行                                    │    │
+│  │  Progressing = True   → 组件正在更新到新版本                             │    │
+│  │  Degraded    = False  → 组件未降级 (功能正常)                            │    │
+│  │                                                                         │    │
+│  │  CVO 等待所有 CO 的 Progressing=False 且 Available=True 才算升级完成     │    │
 │  └─────────────────────────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────────────────────────┘
-              │
-              ▼
+```
+
+**OpenShift CVO 升级流程**：
+
+```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│  目标集群 (Target Cluster)                                                      │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐        │
-│  │  Master-01   │  │  Master-02   │  │  Master-03   │  │  Worker-N    │        │
-│  │  ┌────────┐  │  │  ┌────────┐  │  │  ┌────────┐  │  │  ┌────────┐  │        │
-│  │  │etcd    │  │  │  │etcd    │  │  │  │etcd    │  │  │  │kubelet │  │        │
-│  │  │apiserver│  │  │  │apiserver│  │  │  │apiserver│ │  │  │kube-proxy│ │        │
-│  │  │controller│ │  │  │scheduler│ │  │  │        │  │  │  │addons  │  │        │
-│  │  └────────┘  │  │  └────────┘  │  │  └────────┘  │  │  └────────┘  │        │
-│  └──────────────┘  └──────────────┘  └──────────────┘  └──────────────┘        │
+│  Step 1: 用户触发升级                                                            │
+│  ─────────────────────                                                           │
+│  oc adm upgrade --to=4.14.8                                                    │
+│       │                                                                          │
+│       ▼                                                                          │
+│  写入 ClusterVersion.spec.desiredUpdate = {version: "4.14.8"}                   │
+└──────────────────────────────────────┬──────────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│  Step 2: CVO 检测版本差异                                                        │
+│  ─────────────────────                                                           │
+│  CVO 发现 spec.desiredUpdate.version ≠ status.history[0].version                │
+│  → 开始升级流程                                                                   │
+│  → 设置 status.conditions[Progressing] = True                                   │
+└──────────────────────────────────────┬──────────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│  Step 3: 拉取 Release Payload Image                                              │
+│  ────────────────────────────                                                    │
+│  从 quay.io/openshift-release-dev/ocp-release:4.14.8-x86_64 拉取 OCI 镜像       │
+│  → 验证镜像签名 (sigstore)                                                       │
+│  → 解析 release-manifests/ 目录                                                  │
+│  → 按文件名排序构建执行图 (Graph)                                                 │
+└──────────────────────────────────────┬──────────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│  Step 4: 按 RunLevel 顺序 Apply Manifests                                       │
+│  ────────────────────────────────────────                                        │
+│  RunLevel 0:  CVO 自身更新 (self-bootstrap)                                      │
+│       ↓ (等待 CVO 自身收敛)                                                      │
+│  RunLevel 5:  config-operator (全局配置)                                          │
+│       ↓ (等待 config-operator 收敛)                                              │
+│  RunLevel 10: 所有 ClusterOperator manifests (按 order 排序)                      │
+│       ├─ 0000_10_authentication-operator → authentication CO                     │
+│       ├─ 0000_10_dns-operator            → dns CO                                │
+│       ├─ 0000_10_etcd-operator           → etcd CO                               │
+│       ├─ 0000_10_ingress-operator        → ingress CO                            │
+│       ├─ 0000_10_kube-apiserver-operator → kube-apiserver CO                     │
+│       ├─ 0000_10_kube-controller-manager-operator → controller-manager CO        │
+│       ├─ 0000_10_kube-scheduler-operator → scheduler CO                          │
+│       ├─ 0000_10_machine-api-operator    → machine-api CO                        │
+│       ├─ 0000_10_machine-config-operator → machine-config CO                     │
+│       ├─ 0000_10_monitoring-operator     → monitoring CO                         │
+│       ├─ 0000_10_network-operator        → network CO                            │
+│       ├─ 0000_10-storage-operator        → storage CO                            │
+│       └─ ... (共 40+ 个 CO)                                                      │
+│                                                                                  │
+│  每个 CO manifest apply 后:                                                      │
+│    → CO Controller 检测到新版本 manifest                                          │
+│    → CO 更新自身 operand (Deployment/DaemonSet)                                   │
+│    → CO 上报 status: Available/Progressing/Degraded                               │
+│    → CVO 等待 CO 的 Progressing=False 且 Available=True                           │
+└──────────────────────────────────────┬──────────────────────────────────────────┘
+                                       │
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│  Step 5: 升级完成                                                                │
+│  ─────────────                                                                   │
+│  所有 ClusterOperator 收敛完成                                                    │
+│  → CVO 更新 status.history:                                                     │
+│    history[0] = {state: "Completed", version: "4.14.8", completionTime: "..."}   │
+│  → CVO 设置 status.conditions[Progressing] = False                               │
+│  → CVO 设置 status.conditions[Available] = True                                  │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**CVO 工作流程**：
+**OpenShift Release Payload 镜像结构**：
 
 ```
-用户设置 desiredVersion: "26.06"
-         │
-         ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  1. CVO Controller 检测版本差异                                   │
-│     currentVersion: "26.03" → desiredVersion: "26.06"           │
-└─────────────────────────────┬───────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  2. 拉取 ReleaseImage (OCI 镜像)                                 │
-│     解析组件清单和依赖关系                                        │
-└─────────────────────────────┬───────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  3. 升级路径验证                                                  │
-│     26.03 → 26.06 (合法路径 ✓)                                   │
-│     预检: 集群健康 / 备份可用 / 资源充足                            │
-└─────────────────────────────┬───────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  4. DAG 拓扑排序，计算执行顺序                                     │
-│     Phase 1: Provider Self-Upgrade (P0)                          │
-│     Phase 2: Agent Upgrade (P0)                                  │
-│     Phase 3: Containerd Upgrade (P0)                             │
-│     Phase 4: Etcd Upgrade (P0)                                   │
-│     Phase 5: Master Upgrade (P0, 滚动)                           │
-│     Phase 6: Worker Upgrade (P0, 滚动)                           │
-│     Phase 7: Component Upgrade (P1)                              │
-└─────────────────────────────┬───────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  5. 三层状态机驱动执行                                          │
-│     L1 集群级: Initializing → Upgrading → Running               │
-│     L2 节点级: Ready → Upgrading → Ready                        │
-│     L3 组件级: Pending → Running → Completed                    │
-└─────────────────────────────┬───────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  6. 升级后验证                                                  │
-│     组件版本一致性 / 集群健康 / 业务应用正常                    │
-│     更新 status.currentVersion = "26.06"                        │
-│     记录升级历史                                                │
-└─────────────────────────────────────────────────────────────────┘
+quay.io/openshift-release-dev/ocp-release:4.14.8-x86_64
+│
+├── release-manifests/
+│   ├── 0000_00_cluster-version-operator_00_deployment.yaml
+│   ├── 0000_00_cluster-version-operator_00_namespace.yaml
+│   ├── 0000_05_config-operator_*.yaml
+│   ├── 0000_10_authentication-operator_*.yaml
+│   ├── 0000_10_cluster-network-operator_*.yaml
+│   ├── 0000_10_dns-operator_*.yaml
+│   ├── 0000_10_etcd-operator_*.yaml
+│   ├── 0000_10_ingress-operator_*.yaml
+│   ├── 0000_10-kube-apiserver-operator_*.yaml
+│   ├── 0000_10-kube-controller-manager-operator_*.yaml
+│   ├── 0000_10-kube-scheduler-operator_*.yaml
+│   ├── 0000_10_machine-api-operator_*.yaml
+│   ├── 0000_10_machine-config-operator_*.yaml
+│   ├── 0000_10_monitoring-operator_*.yaml
+│   ├── 0000_10_openshift-controller-manager-operator_*.yaml
+│   ├── 0000_10_storage-operator_*.yaml
+│   └── ... (共 60+ 个 manifest 文件)
+│
+├── image-references
+│   └── (定义所有组件镜像的 digest 引用)
+│
+└── config/
+    └── (版本元数据、升级通道配置)
 ```
+
+**OpenShift CVO 核心设计理念**：
+
+| 设计理念 | 说明 |
+|---------|------|
+| **单一真相源** | Release Payload Image 是版本的唯一载体，包含所有组件的完整 manifest |
+| **Operator 管理 Operator** | CVO 不直接管理组件，而是通过 apply ClusterOperator manifests 触发各 CO 自行升级 |
+| **RunLevel 排序** | 通过文件命名前缀 (0000_00_, 0000_05_, 0000_10_) 定义执行顺序 |
+| **等待收敛** | CVO apply manifest 后等待对应 CO 上报 Available=True 才继续下一个 |
+| **不可降级** | OpenShift CVO 不支持降级，失败后需 etcd 恢复 |
+| **签名验证** | Release Payload 使用 sigstore 签名，防止篡改 |
+| **升级图 (Update Graph)** | 通过 OSUS (Cincinnati) 服务提供 DAG 形式的合法升级路径 |
 
 **CVO 与 OpenShift CVO 对比**：
 
