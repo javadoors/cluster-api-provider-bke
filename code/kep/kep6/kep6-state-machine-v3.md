@@ -54,8 +54,13 @@
    - [8.7 人工介入详细设计](#87-人工介入详细设计)
    - [8.8 Feature Gate 设计](#88-feature-gate-设计)
    - [8.9 迁移策略](#89-迁移策略)
-   - [8.10 实现文件清单](#810-实现文件清单)
-   - [8.11 测试设计](#811-测试设计)
+    - [8.10 实现文件清单](#810-实现文件清单)
+    - [8.11 测试设计](#811-测试设计)
+9. [可观测性设计](#9-可观测性设计)
+    - [9.1 升级进度实时展示](#91-升级进度实时展示)
+    - [9.2 状态查询](#92-状态查询)
+    - [9.3 事件日志记录](#93-事件日志记录)
+    - [9.4 指标监控](#94-指标监控)
 
 ---
 
@@ -5045,5 +5050,968 @@ func TestNodeRecoveryFromComponentInstallFailed(t *testing.T) {
 
 ---
 
-**文档版本**: v3.19 (混合模型 - 添加兼容性映射设计)  
+## 9. 可观测性设计
+
+可观测性是状态机系统的核心能力，提供升级进度实时展示、状态查询、事件日志记录和指标监控四大能力，帮助用户实时掌握集群状态，快速定位问题。
+
+### 9.1 升级进度实时展示
+
+#### 9.1.1 进度查询 API
+
+通过 Kubernetes API 查询三层进度信息：
+
+```bash
+# 查询集群级升级进度
+kubectl get bkecluster my-cluster -o jsonpath='{.status.operationProgress}'
+
+# 查询节点级升级进度
+kubectl get bkenode node-1 -o jsonpath='{.status.operationProgress}'
+
+# 查询组件级升级进度
+kubectl get bkecluster my-cluster -o jsonpath='{.status.operationProgress.completed}'
+```
+
+#### 9.1.2 进度百分比计算
+
+采用三层进度聚合模型：
+
+```go
+// CalculateUpgradeProgress 计算升级进度百分比
+func CalculateUpgradeProgress(cluster *BKECluster) UpgradeProgress {
+    progress := UpgradeProgress{
+        ClusterLevel: calculateClusterProgress(cluster),
+        NodeLevel:    calculateNodeProgress(cluster),
+        ComponentLevel: calculateComponentProgress(cluster),
+    }
+    
+    // 总体进度 = 集群级 * 0.2 + 节点级 * 0.5 + 组件级 * 0.3
+    progress.Overall = progress.ClusterLevel*0.2 + 
+                       progress.NodeLevel*0.5 + 
+                       progress.ComponentLevel*0.3
+    
+    return progress
+}
+
+// calculateClusterProgress 计算集群级进度
+func calculateClusterProgress(cluster *BKECluster) float64 {
+    if cluster.Status.OperationProgress == nil {
+        return 100.0
+    }
+    
+    op := cluster.Status.OperationProgress
+    if op.TotalComponents == 0 {
+        return 0.0
+    }
+    
+    return float64(op.CompletedComponents) / float64(op.TotalComponents) * 100.0
+}
+
+// calculateNodeProgress 计算节点级进度
+func calculateNodeProgress(cluster *BKECluster) float64 {
+    nodes := getClusterNodes(cluster)
+    if len(nodes) == 0 {
+        return 100.0
+    }
+    
+    var totalProgress float64
+    for _, node := range nodes {
+        if node.Status.OperationProgress == nil {
+            totalProgress += 100.0
+            continue
+        }
+        
+        op := node.Status.OperationProgress
+        if op.TotalComponents == 0 {
+            totalProgress += 0.0
+            continue
+        }
+        
+        progress := float64(op.CompletedComponents) / float64(op.TotalComponents) * 100.0
+        totalProgress += progress
+    }
+    
+    return totalProgress / float64(len(nodes))
+}
+
+// calculateComponentProgress 计算组件级进度
+func calculateComponentProgress(cluster *BKECluster) float64 {
+    if cluster.Status.OperationProgress == nil {
+        return 100.0
+    }
+    
+    completed := len(cluster.Status.OperationProgress.Completed)
+    failed := len(cluster.Status.OperationProgress.FailedComponents)
+    total := cluster.Status.OperationProgress.TotalComponents
+    
+    if total == 0 {
+        return 0.0
+    }
+    
+    return float64(completed) / float64(total) * 100.0
+}
+```
+
+#### 9.1.3 ETA 估算算法
+
+基于历史数据和当前速度估算剩余时间：
+
+```go
+// EstimateETA 估算剩余时间
+func EstimateETA(cluster *BKECluster) time.Duration {
+    if cluster.Status.OperationProgress == nil {
+        return 0
+    }
+    
+    op := cluster.Status.OperationProgress
+    if op.StartedAt == nil || op.CompletedComponents == 0 {
+        return 0
+    }
+    
+    // 计算已用时间
+    elapsed := time.Since(op.StartedAt.Time)
+    
+    // 计算平均每个组件耗时
+    avgPerComponent := elapsed / time.Duration(op.CompletedComponents)
+    
+    // 估算剩余组件数
+    remaining := op.TotalComponents - op.CompletedComponents
+    
+    // 估算剩余时间
+    eta := avgPerComponent * time.Duration(remaining)
+    
+    return eta
+}
+```
+
+#### 9.1.4 Web UI 集成接口
+
+提供 RESTful API 供 Web UI 调用：
+
+```go
+// UpgradeProgressResponse 升级进度响应
+type UpgradeProgressResponse struct {
+    // 总体进度百分比 (0-100)
+    OverallProgress float64 `json:"overallProgress"`
+    
+    // 集群级进度
+    ClusterProgress ProgressDetail `json:"clusterProgress"`
+    
+    // 节点级进度列表
+    NodeProgress []NodeProgressDetail `json:"nodeProgress"`
+    
+    // 组件级进度列表
+    ComponentProgress []ComponentProgressDetail `json:"componentProgress"`
+    
+    // 当前阶段
+    CurrentStage string `json:"currentStage"`
+    
+    // 预估剩余时间（秒）
+    EstimatedSeconds int64 `json:"estimatedSeconds"`
+    
+    // 最后更新时间
+    LastUpdateTime metav1.Time `json:"lastUpdateTime"`
+}
+
+// ProgressDetail 进度详情
+type ProgressDetail struct {
+    Total     int `json:"total"`
+    Completed int `json:"completed"`
+    Failed    int `json:"failed"`
+    Progress  float64 `json:"progress"`
+}
+
+// NodeProgressDetail 节点进度详情
+type NodeProgressDetail struct {
+    NodeIP    string `json:"nodeIP"`
+    Phase     string `json:"phase"`
+    Progress  float64 `json:"progress"`
+    CurrentComponent string `json:"currentComponent"`
+}
+
+// ComponentProgressDetail 组件进度详情
+type ComponentProgressDetail struct {
+    Name      string `json:"name"`
+    NodeIP    string `json:"nodeIP,omitempty"`
+    Phase     string `json:"phase"`
+    Version   string `json:"version"`
+    Message   string `json:"message,omitempty"`
+}
+
+// GetUpgradeProgress 获取升级进度 API
+func (h *Handler) GetUpgradeProgress(w http.ResponseWriter, r *http.Request) {
+    clusterName := r.URL.Query().Get("cluster")
+    
+    cluster, err := h.getCluster(clusterName)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusNotFound)
+        return
+    }
+    
+    progress := CalculateUpgradeProgress(cluster)
+    eta := EstimateETA(cluster)
+    
+    response := UpgradeProgressResponse{
+        OverallProgress: progress.Overall,
+        ClusterProgress: ProgressDetail{
+            Total:     cluster.Status.OperationProgress.TotalComponents,
+            Completed: cluster.Status.OperationProgress.CompletedComponents,
+            Failed:    len(cluster.Status.OperationProgress.FailedComponents),
+            Progress:  progress.ClusterLevel,
+        },
+        CurrentStage:     cluster.Status.OperationProgress.CurrentStage,
+        EstimatedSeconds: int64(eta.Seconds()),
+        LastUpdateTime:   metav1.Now(),
+    }
+    
+    // 填充节点进度
+    nodes := getClusterNodes(cluster)
+    for _, node := range nodes {
+        nodeProgress := NodeProgressDetail{
+            NodeIP:   node.Spec.IP,
+            Phase:    string(node.Status.LifecyclePhase),
+            Progress: calculateNodeProgress(&node),
+        }
+        if node.Status.OperationProgress != nil {
+            nodeProgress.CurrentComponent = node.Status.OperationProgress.CurrentStage
+        }
+        response.NodeProgress = append(response.NodeProgress, nodeProgress)
+    }
+    
+    // 填充组件进度
+    for _, comp := range cluster.Status.OperationProgress.Completed {
+        compProgress := ComponentProgressDetail{
+            Name:    comp.Name,
+            Phase:   "Installed",
+            Version: comp.Version,
+        }
+        response.ComponentProgress = append(response.ComponentProgress, compProgress)
+    }
+    
+    json.NewEncoder(w).Encode(response)
+}
+```
+
+### 9.2 状态查询
+
+#### 9.2.1 三层状态查询 API
+
+提供统一的状态查询接口：
+
+```bash
+# 查询集群状态
+kubectl get bkecluster my-cluster -o wide
+
+# 查询节点状态
+kubectl get bkenode -l cluster=my-cluster -o wide
+
+# 查询组件状态
+kubectl get bkecluster my-cluster -o jsonpath='{.status.componentStatuses}'
+
+# 查询健康状态
+kubectl get bkecluster my-cluster -o jsonpath='{.status.healthStatus}'
+```
+
+#### 9.2.2 状态快照
+
+提供某时刻的完整状态视图：
+
+```go
+// ClusterSnapshot 集群状态快照
+type ClusterSnapshot struct {
+    // 快照时间
+    Timestamp metav1.Time `json:"timestamp"`
+    
+    // 集群基本信息
+    ClusterInfo ClusterInfo `json:"clusterInfo"`
+    
+    // 集群状态
+    ClusterStatus ClusterStatusSnapshot `json:"clusterStatus"`
+    
+    // 节点状态列表
+    NodeStatuses []NodeStatusSnapshot `json:"nodeStatuses"`
+    
+    // 组件状态列表
+    ComponentStatuses []ComponentStatusSnapshot `json:"componentStatuses"`
+    
+    // 健康状态
+    HealthStatus HealthStatus `json:"healthStatus"`
+}
+
+// ClusterInfo 集群基本信息
+type ClusterInfo struct {
+    Name              string `json:"name"`
+    Namespace         string `json:"namespace"`
+    KubernetesVersion string `json:"kubernetesVersion"`
+    OpenFuyaoVersion  string `json:"openFuyaoVersion"`
+    NodeCount         int    `json:"nodeCount"`
+}
+
+// ClusterStatusSnapshot 集群状态快照
+type ClusterStatusSnapshot struct {
+    LifecyclePhase    LifecyclePhase    `json:"lifecyclePhase"`
+    OperationProgress *OperationProgress `json:"operationProgress,omitempty"`
+    Conditions        []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// NodeStatusSnapshot 节点状态快照
+type NodeStatusSnapshot struct {
+    NodeIP          string          `json:"nodeIP"`
+    LifecyclePhase  LifecyclePhase  `json:"lifecyclePhase"`
+    StateCode       int             `json:"stateCode"`
+    HealthStatus    HealthLevel     `json:"healthStatus"`
+    Components      []ComponentStatus `json:"components"`
+}
+
+// ComponentStatusSnapshot 组件状态快照
+type ComponentStatusSnapshot struct {
+    Name           string          `json:"name"`
+    NodeIP         string          `json:"nodeIP,omitempty"`
+    Type           ComponentType   `json:"type"`
+    LifecyclePhase LifecyclePhase  `json:"lifecyclePhase"`
+    Version        string          `json:"version"`
+    HealthStatus   HealthLevel     `json:"healthStatus"`
+}
+
+// GetClusterSnapshot 获取集群状态快照
+func (h *Handler) GetClusterSnapshot(w http.ResponseWriter, r *http.Request) {
+    clusterName := r.URL.Query().Get("cluster")
+    
+    cluster, err := h.getCluster(clusterName)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusNotFound)
+        return
+    }
+    
+    nodes := getClusterNodes(cluster)
+    
+    snapshot := ClusterSnapshot{
+        Timestamp: metav1.Now(),
+        ClusterInfo: ClusterInfo{
+            Name:              cluster.Name,
+            Namespace:         cluster.Namespace,
+            KubernetesVersion: cluster.Status.KubernetesVersion,
+            OpenFuyaoVersion:  cluster.Status.OpenFuyaoVersion,
+            NodeCount:         len(nodes),
+        },
+        ClusterStatus: ClusterStatusSnapshot{
+            LifecyclePhase:    cluster.Status.LifecyclePhase,
+            OperationProgress: cluster.Status.OperationProgress,
+            Conditions:        cluster.Status.Conditions,
+        },
+        HealthStatus: *cluster.Status.HealthStatus,
+    }
+    
+    // 填充节点状态
+    for _, node := range nodes {
+        nodeSnapshot := NodeStatusSnapshot{
+            NodeIP:         node.Spec.IP,
+            LifecyclePhase: node.Status.LifecyclePhase,
+            StateCode:      node.Status.StateCode,
+            HealthStatus:   determineNodeHealth(node).Health,
+            Components:     node.Status.Components,
+        }
+        snapshot.NodeStatuses = append(snapshot.NodeStatuses, nodeSnapshot)
+    }
+    
+    // 填充组件状态
+    for name, comp := range cluster.Status.ClusterComponentStatuses {
+        compSnapshot := ComponentStatusSnapshot{
+            Name:           name,
+            Type:           ComponentTypeCluster,
+            LifecyclePhase: comp.Phase,
+            Version:        comp.Version,
+            HealthStatus:   determineComponentHealth(comp).Health,
+        }
+        snapshot.ComponentStatuses = append(snapshot.ComponentStatuses, compSnapshot)
+    }
+    
+    for _, node := range nodes {
+        for _, comp := range node.Status.Components {
+            compSnapshot := ComponentStatusSnapshot{
+                Name:           comp.Name,
+                NodeIP:         node.Spec.IP,
+                Type:           ComponentTypeNode,
+                LifecyclePhase: comp.Phase,
+                Version:        comp.Version,
+                HealthStatus:   determineComponentHealthFromNode(comp, node.Spec.IP).Health,
+            }
+            snapshot.ComponentStatuses = append(snapshot.ComponentStatuses, compSnapshot)
+        }
+    }
+    
+    json.NewEncoder(w).Encode(snapshot)
+}
+```
+
+#### 9.2.3 历史状态查询
+
+通过 Kubernetes Events 查询历史状态转换：
+
+```bash
+# 查询集群状态转换历史
+kubectl get events --field-selector involvedObject.name=my-cluster,reason=StateTransition
+
+# 查询节点状态转换历史
+kubectl get events --field-selector involvedObject.name=node-1,reason=StateTransition
+
+# 查询操作历史
+kubectl get events --field-selector involvedObject.name=my-cluster,reason=OperationStarted
+
+# 查询健康状态变更历史
+kubectl get events --field-selector involvedObject.name=my-cluster,reason=HealthStatusChanged
+```
+
+#### 9.2.4 查询输出格式
+
+支持多种输出格式：
+
+```bash
+# 表格格式（默认）
+kubectl get bkecluster my-cluster -o wide
+
+# JSON 格式
+kubectl get bkecluster my-cluster -o json
+
+# YAML 格式
+kubectl get bkecluster my-cluster -o yaml
+
+# 自定义格式
+kubectl get bkecluster my-cluster -o custom-columns=NAME:.metadata.name,PHASE:.status.lifecyclePhase,HEALTH:.status.healthStatus.overall
+```
+
+### 9.3 事件日志记录
+
+#### 9.3.1 Kubernetes Events 规范
+
+定义标准的事件类型和 reason：
+
+```go
+// 事件类型常量
+const (
+    // 状态转换事件
+    EventReasonStateTransition = "StateTransition"
+    
+    // 操作事件
+    EventReasonOperationStarted   = "OperationStarted"
+    EventReasonOperationCompleted = "OperationCompleted"
+    EventReasonOperationFailed    = "OperationFailed"
+    
+    // 健康状态变更事件
+    EventReasonHealthStatusChanged = "HealthStatusChanged"
+    
+    // 重试事件
+    EventReasonRetryAttempt = "RetryAttempt"
+    
+    // 组件事件
+    EventReasonComponentInstalled = "ComponentInstalled"
+    EventReasonComponentUpgraded  = "ComponentUpgraded"
+    EventReasonComponentFailed    = "ComponentFailed"
+)
+
+// recordStateTransitionEvent 记录状态转换事件
+func (e *Engine) recordStateTransitionEvent(obj runtime.Object, oldPhase, newPhase LifecyclePhase, reason string) {
+    e.client.Events("").Recordf(
+        obj,
+        v1.EventTypeNormal,
+        EventReasonStateTransition,
+        "Lifecycle phase changed from %s to %s: %s",
+        oldPhase, newPhase, reason,
+    )
+}
+
+// recordOperationStartedEvent 记录操作开始事件
+func (e *Engine) recordOperationStartedEvent(obj runtime.Object, operationType OperationType, targetVersion string) {
+    e.client.Events("").Recordf(
+        obj,
+        v1.EventTypeNormal,
+        EventReasonOperationStarted,
+        "Operation %s started, target version: %s",
+        operationType, targetVersion,
+    )
+}
+
+// recordOperationCompletedEvent 记录操作完成事件
+func (e *Engine) recordOperationCompletedEvent(obj runtime.Object, operationType OperationType, duration time.Duration) {
+    e.client.Events("").Recordf(
+        obj,
+        v1.EventTypeNormal,
+        EventReasonOperationCompleted,
+        "Operation %s completed in %v",
+        operationType, duration,
+    )
+}
+
+// recordOperationFailedEvent 记录操作失败事件
+func (e *Engine) recordOperationFailedEvent(obj runtime.Object, operationType OperationType, errMsg string) {
+    e.client.Events("").Recordf(
+        obj,
+        v1.EventTypeWarning,
+        EventReasonOperationFailed,
+        "Operation %s failed: %s",
+        operationType, errMsg,
+    )
+}
+
+// recordHealthStatusChangedEvent 记录健康状态变更事件
+func (e *Engine) recordHealthStatusChangedEvent(obj runtime.Object, oldHealth, newHealth HealthLevel, message string) {
+    eventType := v1.EventTypeNormal
+    if newHealth == HealthLevelUnhealthy {
+        eventType = v1.EventTypeWarning
+    }
+    
+    e.client.Events("").Recordf(
+        obj,
+        eventType,
+        EventReasonHealthStatusChanged,
+        "Health status changed from %s to %s: %s",
+        oldHealth, newHealth, message,
+    )
+}
+
+// recordRetryAttemptEvent 记录重试事件
+func (e *Engine) recordRetryAttemptEvent(obj runtime.Object, attempt int, maxAttempts int, reason string) {
+    e.client.Events("").Recordf(
+        obj,
+        v1.EventTypeWarning,
+        EventReasonRetryAttempt,
+        "Retry attempt %d/%d: %s",
+        attempt, maxAttempts, reason,
+    )
+}
+```
+
+#### 9.3.2 事件保留策略
+
+配置事件保留策略：
+
+```yaml
+# kube-apiserver 配置
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kube-apiserver-config
+  namespace: kube-system
+data:
+  event-ttl: "24h"  # 事件保留 24 小时
+  event-qps: "100"  # 事件生成速率限制
+```
+
+#### 9.3.3 结构化日志规范
+
+采用 JSON 格式的结构化日志：
+
+```go
+// 日志格式规范
+type LogEntry struct {
+    // 基础字段
+    Timestamp string `json:"timestamp"`
+    Level     string `json:"level"`
+    Message   string `json:"message"`
+    
+    // 上下文字段
+    Cluster   string `json:"cluster,omitempty"`
+    Node      string `json:"node,omitempty"`
+    Component string `json:"component,omitempty"`
+    
+    // 状态机字段
+    OldPhase  string `json:"oldPhase,omitempty"`
+    NewPhase  string `json:"newPhase,omitempty"`
+    Operation string `json:"operation,omitempty"`
+    
+    // 性能字段
+    Duration  string `json:"duration,omitempty"`
+    
+    // 错误字段
+    Error     string `json:"error,omitempty"`
+    Stack     string `json:"stack,omitempty"`
+}
+
+// 日志示例
+func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    log := log.FromContext(ctx).WithValues(
+        "cluster", req.NamespacedName.Name,
+        "namespace", req.NamespacedName.Namespace,
+    )
+    
+    log.Info("Starting reconciliation",
+        "cluster", req.NamespacedName.Name,
+        "operation", "reconcile",
+    )
+    
+    start := time.Now()
+    defer func() {
+        log.Info("Reconciliation completed",
+            "cluster", req.NamespacedName.Name,
+            "duration", time.Since(start).String(),
+        )
+    }()
+    
+    // ... reconciliation logic ...
+    
+    log.Info("State transition",
+        "cluster", cluster.Name,
+        "oldPhase", oldPhase,
+        "newPhase", newPhase,
+        "reason", reason,
+    )
+    
+    return ctrl.Result{}, nil
+}
+```
+
+#### 9.3.4 日志采集与聚合
+
+配置日志采集：
+
+```yaml
+# Fluentd 配置
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fluentd-config
+  namespace: logging
+data:
+  fluent.conf: |
+    <source>
+      @type tail
+      path /var/log/containers/bke-controller-*.log
+      pos_file /var/log/fluentd-bke-controller.log.pos
+      tag kubernetes.bke-controller
+      <parse>
+        @type json
+        time_key timestamp
+        time_format %Y-%m-%dT%H:%M:%S.%NZ
+      </parse>
+    </source>
+    
+    <match kubernetes.bke-controller>
+      @type elasticsearch
+      host elasticsearch.logging.svc.cluster.local
+      port 9200
+      logstash_format true
+      logstash_prefix bke-controller
+      <buffer>
+        @type file
+        path /var/log/fluentd-buf
+        flush_interval 10s
+      </buffer>
+    </match>
+```
+
+### 9.4 指标监控
+
+#### 9.4.1 Prometheus 指标定义
+
+定义完整的指标体系：
+
+```go
+// Prometheus 指标定义
+var (
+    // 状态转换指标
+    stateTransitionTotal = prometheus.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "bke_state_transition_total",
+            Help: "Total number of state transitions",
+        },
+        []string{"layer", "cluster", "old_phase", "new_phase"},
+    )
+    
+    stateTransitionDuration = prometheus.NewHistogramVec(
+        prometheus.HistogramOpts{
+            Name:    "bke_state_transition_duration_seconds",
+            Help:    "Duration of state transitions in seconds",
+            Buckets: prometheus.ExponentialBuckets(0.1, 2, 10),
+        },
+        []string{"layer", "cluster", "old_phase", "new_phase"},
+    )
+    
+    // 操作指标
+    operationTotal = prometheus.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "bke_operation_total",
+            Help: "Total number of operations",
+        },
+        []string{"cluster", "operation_type", "status"},
+    )
+    
+    operationDuration = prometheus.NewHistogramVec(
+        prometheus.HistogramOpts{
+            Name:    "bke_operation_duration_seconds",
+            Help:    "Duration of operations in seconds",
+            Buckets: prometheus.ExponentialBuckets(10, 2, 10),
+        },
+        []string{"cluster", "operation_type"},
+    )
+    
+    // 组件升级指标
+    componentUpgradeTotal = prometheus.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "bke_component_upgrade_total",
+            Help: "Total number of component upgrades",
+        },
+        []string{"cluster", "node", "component", "status"},
+    )
+    
+    componentUpgradeDuration = prometheus.NewHistogramVec(
+        prometheus.HistogramOpts{
+            Name:    "bke_component_upgrade_duration_seconds",
+            Help:    "Duration of component upgrades in seconds",
+            Buckets: prometheus.ExponentialBuckets(1, 2, 10),
+        },
+        []string{"cluster", "node", "component"},
+    )
+    
+    // 健康状态指标
+    healthStatusGauge = prometheus.NewGaugeVec(
+        prometheus.GaugeOpts{
+            Name: "bke_health_status",
+            Help: "Current health status (0=Unknown, 1=Healthy, 2=Degraded, 3=Unhealthy)",
+        },
+        []string{"cluster", "node", "component"},
+    )
+    
+    // 重试指标
+    retryTotal = prometheus.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "bke_retry_total",
+            Help: "Total number of retries",
+        },
+        []string{"cluster", "node", "component", "operation_type"},
+    )
+    
+    // Reconcile 指标
+    reconcileDuration = prometheus.NewHistogramVec(
+        prometheus.HistogramOpts{
+            Name:    "bke_reconcile_duration_seconds",
+            Help:    "Duration of reconciliation in seconds",
+            Buckets: prometheus.ExponentialBuckets(0.01, 2, 10),
+        },
+        []string{"controller", "cluster"},
+    )
+    
+    reconcileErrorsTotal = prometheus.NewCounterVec(
+        prometheus.CounterOpts{
+            Name: "bke_reconcile_errors_total",
+            Help: "Total number of reconciliation errors",
+        },
+        []string{"controller", "cluster"},
+    )
+)
+
+func init() {
+    prometheus.MustRegister(stateTransitionTotal)
+    prometheus.MustRegister(stateTransitionDuration)
+    prometheus.MustRegister(operationTotal)
+    prometheus.MustRegister(operationDuration)
+    prometheus.MustRegister(componentUpgradeTotal)
+    prometheus.MustRegister(componentUpgradeDuration)
+    prometheus.MustRegister(healthStatusGauge)
+    prometheus.MustRegister(retryTotal)
+    prometheus.MustRegister(reconcileDuration)
+    prometheus.MustRegister(reconcileErrorsTotal)
+}
+```
+
+#### 9.4.2 告警规则
+
+定义告警规则：
+
+```yaml
+# 告警规则配置
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-rules
+  namespace: monitoring
+data:
+  bke-alerts.yaml: |
+    groups:
+      - name: bke-state-machine-alerts
+        rules:
+          # 升级失败告警
+          - alert: BKEUpgradeFailed
+            expr: rate(bke_operation_total{operation_type="Upgrade",status="failed"}[5m]) > 0
+            for: 1m
+            labels:
+              severity: critical
+            annotations:
+              summary: "BKE upgrade failed"
+              description: "Cluster {{ $labels.cluster }} upgrade failed"
+          
+          # 健康状态降级告警
+          - alert: BKEHealthDegraded
+            expr: bke_health_status{cluster!=""} == 2
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "BKE cluster health degraded"
+              description: "Cluster {{ $labels.cluster }} health is degraded"
+          
+          # 健康状态不健康告警
+          - alert: BKEHealthUnhealthy
+            expr: bke_health_status{cluster!=""} == 3
+            for: 1m
+            labels:
+              severity: critical
+            annotations:
+              summary: "BKE cluster unhealthy"
+              description: "Cluster {{ $labels.cluster }} is unhealthy"
+          
+          # 重试次数过多告警
+          - alert: BKERetryTooMany
+            expr: rate(bke_retry_total[10m]) > 5
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "BKE retry too many times"
+              description: "Cluster {{ $labels.cluster }} has too many retries"
+          
+          # 状态转换卡住告警
+          - alert: BKEStateTransitionStuck
+            expr: time() - bke_state_transition_duration_seconds > 3600
+            for: 10m
+            labels:
+              severity: critical
+            annotations:
+              summary: "BKE state transition stuck"
+              description: "Cluster {{ $labels.cluster }} state transition is stuck"
+          
+          # 组件升级失败告警
+          - alert: BKEComponentUpgradeFailed
+            expr: rate(bke_component_upgrade_total{status="failed"}[5m]) > 0
+            for: 1m
+            labels:
+              severity: warning
+            annotations:
+              summary: "BKE component upgrade failed"
+              description: "Component {{ $labels.component }} on node {{ $labels.node }} upgrade failed"
+          
+          # Reconcile 错误率过高告警
+          - alert: BKEReconcileErrorRateHigh
+            expr: rate(bke_reconcile_errors_total[5m]) / rate(bke_reconcile_duration_seconds_count[5m]) > 0.1
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "BKE reconcile error rate high"
+              description: "Controller {{ $labels.controller }} reconcile error rate is {{ $value | humanizePercentage }}"
+```
+
+#### 9.4.3 Grafana Dashboard
+
+提供预定义的 Grafana Dashboard：
+
+```json
+{
+  "dashboard": {
+    "title": "BKE State Machine Overview",
+    "panels": [
+      {
+        "title": "Cluster Lifecycle Phase",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "bke_state_transition_total{layer=\"cluster\"}",
+            "legendFormat": "{{cluster}} - {{new_phase}}"
+          }
+        ]
+      },
+      {
+        "title": "Operation Duration",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(bke_operation_duration_seconds_bucket[5m]))",
+            "legendFormat": "P95 - {{operation_type}}"
+          },
+          {
+            "expr": "histogram_quantile(0.50, rate(bke_operation_duration_seconds_bucket[5m]))",
+            "legendFormat": "P50 - {{operation_type}}"
+          }
+        ]
+      },
+      {
+        "title": "Health Status",
+        "type": "stat",
+        "targets": [
+          {
+            "expr": "bke_health_status{cluster!=\"\"}",
+            "legendFormat": "{{cluster}}"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "mappings": [
+              {"options": {"0": {"text": "Unknown"}}, "type": "value"},
+              {"options": {"1": {"text": "Healthy"}, "color": "green"}, "type": "value"},
+              {"options": {"2": {"text": "Degraded"}, "color": "yellow"}, "type": "value"},
+              {"options": {"3": {"text": "Unhealthy"}, "color": "red"}, "type": "value"}
+            ]
+          }
+        }
+      },
+      {
+        "title": "Upgrade Progress",
+        "type": "gauge",
+        "targets": [
+          {
+            "expr": "bke_operation_total{operation_type=\"Upgrade\",status=\"completed\"} / bke_operation_total{operation_type=\"Upgrade\"} * 100",
+            "legendFormat": "{{cluster}}"
+          }
+        ]
+      },
+      {
+        "title": "Component Upgrade Duration",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(bke_component_upgrade_duration_seconds_bucket[5m]))",
+            "legendFormat": "P95 - {{component}}"
+          }
+        ]
+      },
+      {
+        "title": "Retry Count",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(bke_retry_total[5m])",
+            "legendFormat": "{{cluster}} - {{component}}"
+          }
+        ]
+      },
+      {
+        "title": "Reconcile Duration",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "histogram_quantile(0.95, rate(bke_reconcile_duration_seconds_bucket[5m]))",
+            "legendFormat": "P95 - {{controller}}"
+          },
+          {
+            "expr": "histogram_quantile(0.50, rate(bke_reconcile_duration_seconds_bucket[5m]))",
+            "legendFormat": "P50 - {{controller}}"
+          }
+        ]
+      },
+      {
+        "title": "Reconcile Error Rate",
+        "type": "graph",
+        "targets": [
+          {
+            "expr": "rate(bke_reconcile_errors_total[5m]) / rate(bke_reconcile_duration_seconds_count[5m])",
+            "legendFormat": "{{controller}}"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+---
+
+**文档版本**: v3.20 (混合模型 - 添加可观测性设计)  
 **维护者**: openFuyao Team
