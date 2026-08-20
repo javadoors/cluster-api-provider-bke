@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -18,10 +18,7 @@ import (
 
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/stretchr/testify/assert"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-
+	"github.com/stretchr/testify/require"
 	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
 	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
@@ -29,7 +26,11 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/mergecluster"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/clusterutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/nodeutil"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 func createTestEnsureLoadBalance() *EnsureLoadBalance {
@@ -116,8 +117,8 @@ func TestEnsureLoadBalance_NeedExecute_HostIsNode(t *testing.T) {
 	e.Ctx.BKECluster.Status.Ready = true
 	e.Ctx.BKECluster.Spec.ControlPlaneEndpoint.Host = "192.168.1.1"
 
-	patches.ApplyFunc((*nodeutil.NodeFetcher).GetNodesForBKECluster, func(_ *nodeutil.NodeFetcher, ctx context.Context, cluster *bkev1beta1.BKECluster) (bkenode.Nodes, error) {
-		return bkenode.Nodes{{IP: "192.168.1.1"}}, nil
+	patches.ApplyFunc((*nodeutil.NodeFetcher).FetchNodesForCluster, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (*nodeutil.FetchResult, error) {
+		return &nodeutil.FetchResult{Nodes: bkenode.Nodes{{IP: "192.168.1.1"}}}, nil
 	})
 
 	old := &bkev1beta1.BKECluster{}
@@ -134,11 +135,11 @@ func TestEnsureLoadBalance_NeedExecute_NoLoadBalanceNodes(t *testing.T) {
 	e := createTestEnsureLoadBalance()
 	e.Ctx.BKECluster.Status.Ready = true
 
-	patches.ApplyFunc((*nodeutil.NodeFetcher).GetNodesForBKECluster, func(_ *nodeutil.NodeFetcher, ctx context.Context, cluster *bkev1beta1.BKECluster) (bkenode.Nodes, error) {
-		return bkenode.Nodes{{IP: "192.168.1.1"}}, nil
+	patches.ApplyFunc((*nodeutil.NodeFetcher).FetchNodesForCluster, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (*nodeutil.FetchResult, error) {
+		return &nodeutil.FetchResult{Nodes: bkenode.Nodes{{IP: "192.168.1.1"}}}, nil
 	})
 
-	patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapperForCluster, func(_ *nodeutil.NodeFetcher, ctx context.Context, cluster *bkev1beta1.BKECluster) (bkev1beta1.BKENodes, error) {
+	patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapper, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (bkev1beta1.BKENodes, error) {
 		return bkev1beta1.BKENodes{}, nil
 	})
 
@@ -160,11 +161,11 @@ func TestEnsureLoadBalance_NeedExecute_WithLoadBalance(t *testing.T) {
 	e := createTestEnsureLoadBalance()
 	e.Ctx.BKECluster.Status.Ready = true
 
-	patches.ApplyFunc((*nodeutil.NodeFetcher).GetNodesForBKECluster, func(_ *nodeutil.NodeFetcher, ctx context.Context, cluster *bkev1beta1.BKECluster) (bkenode.Nodes, error) {
-		return bkenode.Nodes{{IP: "192.168.1.1", Role: []string{"master"}}}, nil
+	patches.ApplyFunc((*nodeutil.NodeFetcher).FetchNodesForCluster, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (*nodeutil.FetchResult, error) {
+		return &nodeutil.FetchResult{Nodes: bkenode.Nodes{{IP: "192.168.1.1", Role: []string{"master"}}}}, nil
 	})
 
-	patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapperForCluster, func(_ *nodeutil.NodeFetcher, ctx context.Context, cluster *bkev1beta1.BKECluster) (bkev1beta1.BKENodes, error) {
+	patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapper, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (bkev1beta1.BKENodes, error) {
 		return bkev1beta1.BKENodes{{Spec: confv1beta1.BKENodeSpec{IP: "192.168.1.1"}}}, nil
 	})
 
@@ -185,8 +186,8 @@ func TestEnsureLoadBalance_ConfiguringLoadBalancer_NoMasterNodes(t *testing.T) {
 
 	e := createTestEnsureLoadBalance()
 
-	patches.ApplyFunc((*nodeutil.NodeFetcher).GetNodesForBKECluster, func(_ *nodeutil.NodeFetcher, ctx context.Context, cluster *bkev1beta1.BKECluster) (bkenode.Nodes, error) {
-		return bkenode.Nodes{}, nil
+	patches.ApplyFunc((*nodeutil.NodeFetcher).FetchNodesForCluster, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (*nodeutil.FetchResult, error) {
+		return &nodeutil.FetchResult{Nodes: bkenode.Nodes{}}, nil
 	})
 
 	err := e.ConfiguringLoadBalancer()
@@ -200,11 +201,11 @@ func TestEnsureLoadBalance_ConfiguringLoadBalancer_NodeNotReady(t *testing.T) {
 
 	e := createTestEnsureLoadBalance()
 
-	patches.ApplyFunc((*nodeutil.NodeFetcher).GetNodesForBKECluster, func(_ *nodeutil.NodeFetcher, ctx context.Context, cluster *bkev1beta1.BKECluster) (bkenode.Nodes, error) {
-		return bkenode.Nodes{{IP: "192.168.1.1", Role: []string{"master"}}}, nil
+	patches.ApplyFunc((*nodeutil.NodeFetcher).FetchNodesForCluster, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (*nodeutil.FetchResult, error) {
+		return &nodeutil.FetchResult{Nodes: bkenode.Nodes{{IP: "192.168.1.1", Role: []string{"master"}}}}, nil
 	})
 
-	patches.ApplyFunc((*nodeutil.NodeFetcher).GetNodeStateFlagForCluster, func(_ *nodeutil.NodeFetcher, ctx context.Context, cluster *bkev1beta1.BKECluster, nodeIP string, flag int) (bool, error) {
+	patches.ApplyFunc((*nodeutil.NodeFetcher).GetNodeStateFlag, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _, _ string, _ int) (bool, error) {
 		return false, nil
 	})
 
@@ -301,4 +302,174 @@ func TestEnsureLoadBalance_Execute_Error(t *testing.T) {
 	result, err := e.Execute()
 	assert.Error(t, err)
 	assert.False(t, result.Requeue)
+}
+
+func loadBalanceGapsPhase(t *testing.T) *EnsureLoadBalance {
+	t.Helper()
+	cluster := &bkev1beta1.BKECluster{ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "ns"}}
+	ctx := newAdditionalPhaseContext(t, cluster)
+	return &EnsureLoadBalance{BasePhase: phaseframe.NewBasePhase(ctx, EnsureLoadBalanceName)}
+}
+
+// TestLoadBalanceGapsConfigureExternalLoadBalancer covers all branches of
+// configureExternalLoadBalancer (was 0%): create-command error, nil command,
+// execute error, success.
+func TestLoadBalanceGapsConfigureExternalLoadBalancer(t *testing.T) {
+	nodes := bkenode.Nodes{{IP: "10.0.0.1"}}
+
+	t.Run("create_command_error_returns_err", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := loadBalanceGapsPhase(t)
+		patches.ApplyPrivateMethod(e, "createLoadBalancerCommand", func(_ *EnsureLoadBalance, _ bkenode.Nodes) (*command.HA, error) {
+			return nil, assertErr("create failed")
+		})
+		err := e.configureExternalLoadBalancer(nodes)
+		require.Error(t, err)
+	})
+
+	t.Run("nil_command_returns_nil", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := loadBalanceGapsPhase(t)
+		patches.ApplyPrivateMethod(e, "createLoadBalancerCommand", func(_ *EnsureLoadBalance, _ bkenode.Nodes) (*command.HA, error) {
+			return nil, nil
+		})
+		err := e.configureExternalLoadBalancer(nodes)
+		require.NoError(t, err)
+	})
+
+	t.Run("execute_error_returns_err", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := loadBalanceGapsPhase(t)
+		patches.ApplyPrivateMethod(e, "createLoadBalancerCommand", func(_ *EnsureLoadBalance, _ bkenode.Nodes) (*command.HA, error) {
+			return &command.HA{}, nil
+		})
+		patches.ApplyPrivateMethod(e, "executeAndHandleLoadBalancer", func(_ *EnsureLoadBalance, _ *command.HA) error {
+			return assertErr("exec failed")
+		})
+		err := e.configureExternalLoadBalancer(nodes)
+		require.Error(t, err)
+	})
+
+	t.Run("success_returns_nil", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := loadBalanceGapsPhase(t)
+		patches.ApplyPrivateMethod(e, "createLoadBalancerCommand", func(_ *EnsureLoadBalance, _ bkenode.Nodes) (*command.HA, error) {
+			return &command.HA{}, nil
+		})
+		patches.ApplyPrivateMethod(e, "executeAndHandleLoadBalancer", func(_ *EnsureLoadBalance, _ *command.HA) error {
+			return nil
+		})
+		err := e.configureExternalLoadBalancer(nodes)
+		require.NoError(t, err)
+	})
+}
+
+// TestLoadBalanceGapsExecuteAndHandleLoadBalancer covers the wait-error branch
+// of executeAndHandleLoadBalancer (was 66.7%).
+func TestLoadBalanceGapsExecuteAndHandleLoadBalancer(t *testing.T) {
+	t.Run("wait_error_returns_err", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := loadBalanceGapsPhase(t)
+		patches.ApplyMethod(&command.HA{}, "Wait", func(_ *command.HA) (error, []string, []string) {
+			return assertErr("wait failed"), nil, nil
+		})
+		err := e.executeAndHandleLoadBalancer(&command.HA{})
+		require.Error(t, err)
+	})
+
+	t.Run("sync_status_error_returns_err", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := loadBalanceGapsPhase(t)
+		patches.ApplyMethod(&command.HA{}, "Wait", func(_ *command.HA) (error, []string, []string) {
+			return nil, nil, nil
+		})
+		patches.ApplyFunc(mergecluster.SyncStatusUntilComplete, func(_ client.Client, _ *bkev1beta1.BKECluster, _ ...mergecluster.PatchFunc) error {
+			return assertErr("sync failed")
+		})
+		err := e.executeAndHandleLoadBalancer(&command.HA{})
+		require.Error(t, err)
+	})
+
+	t.Run("success_returns_nil", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := loadBalanceGapsPhase(t)
+		patches.ApplyMethod(&command.HA{}, "Wait", func(_ *command.HA) (error, []string, []string) {
+			return nil, []string{"10.0.0.1"}, nil
+		})
+		patches.ApplyFunc((*nodeutil.NodeFetcher).SetNodeStateWithMessage, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _, _ string, _ confv1beta1.NodeState, _ string) error {
+			return nil
+		})
+		patches.ApplyFunc((*nodeutil.NodeFetcher).MarkNodeStateFlag, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _, _ string, _ int) error {
+			return nil
+		})
+		patches.ApplyFunc(mergecluster.SyncStatusUntilComplete, func(_ client.Client, _ *bkev1beta1.BKECluster, _ ...mergecluster.PatchFunc) error {
+			return nil
+		})
+		err := e.executeAndHandleLoadBalancer(&command.HA{})
+		require.NoError(t, err)
+	})
+}
+
+// TestLoadBalanceGapsConfiguringLoadBalancer covers the no-master-nodes branch
+// of ConfiguringLoadBalancer (was 55.6%).
+func TestLoadBalanceGapsConfiguringLoadBalancer(t *testing.T) {
+	t.Run("no_master_nodes_returns_err", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := loadBalanceGapsPhase(t)
+		patches.ApplyFunc((*nodeutil.NodeFetcher).FetchNodesForCluster, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (*nodeutil.FetchResult, error) {
+			return &nodeutil.FetchResult{Nodes: bkenode.Nodes{}}, nil
+		})
+		err := e.ConfiguringLoadBalancer()
+		require.Error(t, err)
+	})
+
+	t.Run("node_not_ready_returns_err", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := loadBalanceGapsPhase(t)
+		patches.ApplyFunc((*nodeutil.NodeFetcher).FetchNodesForCluster, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (*nodeutil.FetchResult, error) {
+			return &nodeutil.FetchResult{Nodes: bkenode.Nodes{{IP: "10.0.0.1", Role: []string{"master"}}}}, nil
+		})
+		patches.ApplyFunc((*nodeutil.NodeFetcher).GetNodeStateFlag, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _, _ string, _ int) (bool, error) {
+			return false, nil
+		})
+		err := e.ConfiguringLoadBalancer()
+		require.Error(t, err)
+	})
+
+	t.Run("internal_endpoint_returns_nil", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		cluster := &bkev1beta1.BKECluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "ns"},
+			Spec: confv1beta1.BKEClusterSpec{
+				ControlPlaneEndpoint: confv1beta1.APIEndpoint{Host: "1.2.3.4", Port: 6443},
+				ClusterConfig:        &confv1beta1.BKEConfig{CustomExtra: map[string]string{}},
+			},
+		}
+		ctx := newAdditionalPhaseContext(t, cluster)
+		e := &EnsureLoadBalance{BasePhase: phaseframe.NewBasePhase(ctx, EnsureLoadBalanceName)}
+		patches.ApplyFunc((*nodeutil.NodeFetcher).FetchNodesForCluster, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (*nodeutil.FetchResult, error) {
+			return &nodeutil.FetchResult{Nodes: bkenode.Nodes{{IP: "10.0.0.1", Role: []string{"master"}}}}, nil
+		})
+		patches.ApplyFunc((*nodeutil.NodeFetcher).GetNodeStateFlag, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _, _ string, _ int) (bool, error) {
+			return true, nil
+		})
+		patches.ApplyFunc(clusterutil.AvailableLoadBalancerEndPoint, func(_ confv1beta1.APIEndpoint, _ bkenode.Nodes) bool {
+			return false
+		})
+		patches.ApplyFunc(mergecluster.SyncStatusUntilComplete, func(_ client.Client, _ *bkev1beta1.BKECluster, _ ...mergecluster.PatchFunc) error {
+			return nil
+		})
+		err := e.ConfiguringLoadBalancer()
+		require.NoError(t, err)
+	})
 }

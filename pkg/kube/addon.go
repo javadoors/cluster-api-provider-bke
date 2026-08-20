@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -13,6 +13,7 @@
 package kube
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -23,15 +24,21 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apierrors2 "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/json"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
 	bkeaddon "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/addon"
 	bkeinit "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/initialize"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/initialize/versions"
 	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
 	bkenet "gopkg.openfuyao.cn/cluster-api-provider-bke/common/utils/net"
 	metricrecord "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/metrics/record"
@@ -60,8 +67,15 @@ type Task struct {
 	Timeout  time.Duration
 	Interval time.Duration
 	Operate  bkeaddon.AddonOperate
-	recorder *AddonRecorder
+	// ApplyStrategy optionally refines UpgradeAddon behavior (e.g. CreateOnly).
+	ApplyStrategy string
+	recorder      *AddonRecorder
 }
+
+// ApplyStrategy values accepted by Task when Operate is UpgradeAddon.
+const (
+	ApplyStrategyCreateOnly = "CreateOnly"
+)
 
 type AddonRecorder struct {
 	AddonName    string
@@ -125,6 +139,11 @@ func (t *Task) SetOperate(operate bkeaddon.AddonOperate) *Task {
 	return t
 }
 
+func (t *Task) SetApplyStrategy(strategy string) *Task {
+	t.ApplyStrategy = strategy
+	return t
+}
+
 func (t *Task) RegisAddonRecorder(recorder *AddonRecorder) *Task {
 	t.recorder = recorder
 	return t
@@ -151,12 +170,12 @@ func (c *Client) installYamlAddon(addon *confv1beta1.Product, addonT *bkeaddon.A
 		return err
 	}
 
-	// For cluster-api addon, 004-manage.yaml must be applied after postprocess.
+	// For cluster-api addon, 003-manage.yaml must be applied after postprocess.
 	// So we skip it here and defer it to a dedicated phase.
 	if addon != nil && addon.Name == "cluster-api" && addonT != nil && addonT.Operate == bkeaddon.CreateAddon {
 		files = filterOutClusterAPIManageYaml(files)
 		if len(files) == 0 {
-			return errors.Errorf("no yaml file found after filtering 004-manage.yaml in addon %q dir", addon.Name)
+			return errors.Errorf("no yaml file found after filtering 003-manage.yaml in addon %q dir", addon.Name)
 		}
 	}
 
@@ -167,9 +186,38 @@ func (c *Client) installYamlAddon(addon *confv1beta1.Product, addonT *bkeaddon.A
 	}
 
 	repo := cfg.ImageRepo()
-	param, err := c.prepareAddonParameters(bkeCluster, addon, files, repo, bkeNodes)
+	param, err := c.prepareAddonParameters(addonParameterConfig{
+		bkeCluster: bkeCluster,
+		addon:      addon,
+		files:      files,
+		repo:       repo,
+		bkeNodes:   bkeNodes,
+		operate:    addonT.Operate,
+	})
 	if err != nil {
 		return err
+	}
+
+	// For cluster-api addon, ensure webhook TLS secrets and AES key exist on
+	// the target cluster, then inject caBundle template params.
+	if addon != nil && addon.Name == "cluster-api" {
+		log.Infof("cluster-api addon detected, operate=%v, ensuring webhook secrets", addonT.Operate)
+		var capiCaBundle, bkeCaBundle string
+		if addonT.Operate != bkeaddon.RemoveAddon {
+			capiCaBundle, bkeCaBundle, err = c.ensureClusterAPISecrets()
+			if err != nil {
+				log.Errorf("failed to ensure cluster-api webhook secrets: %v", err)
+				return errors.Wrapf(err, "failed to ensure cluster-api webhook secrets")
+			}
+			log.Info("cluster-api webhook secrets ensured, injecting caBundle into template params")
+		}
+		for _, p := range param {
+			if p == nil {
+				continue
+			}
+			p["capiCaBundle"] = capiCaBundle
+			p["bkeCaBundle"] = bkeCaBundle
+		}
 	}
 
 	applyConfig := &addonApplyConfig{
@@ -190,7 +238,7 @@ func filterOutClusterAPIManageYaml(files []string) []string {
 	}
 	out := make([]string, 0, len(files))
 	for _, f := range files {
-		if strings.EqualFold(filepath.Base(f), "004-manage.yaml") {
+		if strings.EqualFold(filepath.Base(f), "003-manage.yaml") {
 			continue
 		}
 		out = append(out, f)
@@ -201,7 +249,7 @@ func filterOutClusterAPIManageYaml(files []string) []string {
 func (c *Client) getAddonYamlFiles(addon *confv1beta1.Product) ([]string, error) {
 	addonDir := filepath.Join(constant.K8sManifestsDir, addon.Name, addon.Version)
 	if _, err := os.Stat(addonDir); os.IsNotExist(err) {
-		return nil, errors.Errorf("addon dir %q not exist,err: %v", addonDir, err)
+		return nil, fmt.Errorf("addon dir %q not exist,err: %w", addonDir, err)
 	}
 
 	var files []string
@@ -223,7 +271,23 @@ func (c *Client) getAddonYamlFiles(addon *confv1beta1.Product) ([]string, error)
 	return files, nil
 }
 
-func (c *Client) prepareAddonParameters(bkeCluster *bkev1beta1.BKECluster, addon *confv1beta1.Product, files []string, repo string, bkeNodes bkenode.Nodes) (map[string]map[string]interface{}, error) {
+type addonParameterConfig struct {
+	bkeCluster *bkev1beta1.BKECluster
+	addon      *confv1beta1.Product
+	files      []string
+	repo       string
+	bkeNodes   bkenode.Nodes
+	operate    bkeaddon.AddonOperate
+}
+
+// prepareAddonParameters 准备 Addon 渲染参数，并在 Calico 场景下追加 Provider 计算出的 Typha 参数。
+func (c *Client) prepareAddonParameters(config addonParameterConfig) (map[string]map[string]interface{}, error) {
+	bkeCluster := config.bkeCluster
+	addon := config.addon
+	files := config.files
+	repo := config.repo
+	bkeNodes := config.bkeNodes
+	operate := config.operate
 	commonParam, err := getCommonParamFromBKECluster(bkeCluster, bkeNodes)
 	if err != nil {
 		return nil, err
@@ -248,10 +312,100 @@ func (c *Client) prepareAddonParameters(bkeCluster *bkev1beta1.BKECluster, addon
 		fileName := filesBaseNames[i]
 		param[fileName] = mergeParam(commonParam, param[fileName])
 	}
-
+	if addon != nil && strings.EqualFold(addon.Name, calicoAddonName) {
+		c.logInfof("prepare calico addon parameters, version=%s, files=%d, nodes=%d, operate=%s", addon.Version, len(files), bkeNodes.Length(), operate)
+		if err := applyCalicoScaleParams(addon, files, param, bkeNodes, operate); err != nil {
+			return nil, err
+		}
+	}
 	return param, nil
 }
 
+const (
+	calicoAddonName         = "calico"
+	calicoTyphaName         = "calico-typha"
+	allowTyphaParam         = "allowTypha"
+	typhaReplicasParam      = "typhaReplicas"
+	minTyphaReplicas        = 3
+	maxTyphaReplicas        = 20
+	typhaNodesPerReplica    = 200
+	typhaEnableNodeBoundary = 50
+)
+
+// applyCalicoScaleParams 根据节点规模和目标 manifest 能力计算 Typha 开关及副本数，并覆盖用户旧参数。
+func applyCalicoScaleParams(addon *confv1beta1.Product, files []string, param map[string]map[string]interface{}, bkeNodes bkenode.Nodes, operate bkeaddon.AddonOperate) error {
+	if addon == nil || !strings.EqualFold(addon.Name, calicoAddonName) {
+		return nil
+	}
+
+	nodeCount := bkeNodes.Length()
+	allowTypha := "false"
+	typhaReplicas := "0"
+	if nodeCount > typhaEnableNodeBoundary {
+		supported, err := calicoManifestSupportsTypha(files)
+		if err != nil {
+			return err
+		}
+		if !supported {
+			if operate == bkeaddon.CreateAddon {
+				return errors.Errorf("calico addon %s does not support typha, but node count %d is greater than %d", addon.Version, nodeCount, typhaEnableNodeBoundary)
+			}
+		} else {
+			allowTypha = "true"
+			typhaReplicas = strconv.Itoa(calculateTyphaReplicas(nodeCount))
+		}
+	}
+
+	for _, values := range param {
+		values[allowTyphaParam] = allowTypha
+		values[typhaReplicasParam] = typhaReplicas
+	}
+	return nil
+}
+
+// calculateTyphaReplicas 按每 200 节点 1 副本、最少 3 副本、最多 20 副本计算 Typha 副本数。
+func calculateTyphaReplicas(nodeCount int) int {
+	replicas := ceilDiv(nodeCount, typhaNodesPerReplica)
+	if replicas < minTyphaReplicas {
+		replicas = minTyphaReplicas
+	}
+	if replicas > maxTyphaReplicas {
+		replicas = maxTyphaReplicas
+	}
+	if nodeCount > 0 && replicas >= nodeCount {
+		return nodeCount - 1
+	}
+	return replicas
+}
+
+// ceilDiv 计算向上取整的整数除法结果。
+func ceilDiv(a, b int) int {
+	if b == 0 {
+		return 0
+	}
+	return (a + b - 1) / b
+}
+
+// calicoManifestSupportsTypha 通过模板内容锚点判断目标 Calico manifest 是否具备 Typha 渲染能力。
+func calicoManifestSupportsTypha(files []string) (bool, error) {
+	var combined strings.Builder
+	for _, file := range files {
+		content, err := os.ReadFile(file)
+		if err != nil {
+			return false, errors.Wrapf(err, "read calico manifest %q failed", file)
+		}
+		combined.Write(content)
+		combined.WriteByte('\n')
+	}
+	manifest := combined.String()
+	hasTyphaSwitch := strings.Contains(manifest, allowTyphaParam)
+	hasReplicaParam := strings.Contains(manifest, typhaReplicasParam)
+	hasTyphaDeployment := strings.Contains(manifest, "kind: Deployment") && strings.Contains(manifest, "name: calico-typha")
+	hasTyphaService := strings.Contains(manifest, "kind: Service") && strings.Contains(manifest, "name: calico-typha")
+	hasTyphaPDB := strings.Contains(manifest, "kind: PodDisruptionBudget") && strings.Contains(manifest, "name: calico-typha")
+	hasNodeTyphaConfig := strings.Contains(manifest, "typha_service_name") && strings.Contains(manifest, "FELIX_TYPHAK8SSERVICENAME")
+	return hasTyphaSwitch && hasReplicaParam && hasTyphaDeployment && hasTyphaService && hasTyphaPDB && hasNodeTyphaConfig, nil
+}
 func (c *Client) enhanceCommonParamForSpecialAddons(bkeCluster *bkev1beta1.BKECluster, addon *confv1beta1.Product, commonParam map[string]interface{}, bkeNodes bkenode.Nodes) (map[string]interface{}, error) {
 	if commonParam == nil {
 		commonParam = make(map[string]interface{})
@@ -353,7 +507,65 @@ func (c *Client) PrepareRenderParamForAddonFile(
 	return param[fileBase], nil
 }
 
+// applyAddonFiles 应用 Addon manifest，Calico 会进入专用路径以处理 Typha 升级和回退顺序。
 func (c *Client) applyAddonFiles(config *addonApplyConfig) error {
+	if config.addon != nil && strings.EqualFold(config.addon.Name, calicoAddonName) {
+		return c.applyCalicoAddonFiles(config)
+	}
+	return c.applyAddonFilesInOrder(config)
+}
+
+// applyCalicoAddonFiles 按目标 Typha 状态执行 Calico manifest，保证启用和关闭 Typha 的顺序安全。
+func (c *Client) applyCalicoAddonFiles(config *addonApplyConfig) error {
+	if config == nil || config.addon == nil || config.addonT == nil {
+		return errors.Errorf("invalid calico addon apply config")
+	}
+	if config.addonT.Operate == bkeaddon.RemoveAddon {
+		c.logInfof("remove calico addon, skip typha upgrade or rollback gate")
+		return c.applyAddonFilesInOrder(config)
+	}
+
+	allowTypha := getCalicoAllowTypha(config.param)
+	if allowTypha {
+		includeDependencies := config.addonT.Operate == bkeaddon.CreateAddon
+		if includeDependencies {
+			c.logInfof("calico create target enables typha, bootstrap calico base dependencies and typha before switching calico-node")
+		} else {
+			c.logInfof("calico target enables typha, bootstrap typha before switching calico-node")
+		}
+		if err := c.applyCalicoTyphaBootstrapObjects(config, includeDependencies); err != nil {
+			return err
+		}
+		replicas := getCalicoTyphaReplicas(config.param)
+		if err := c.waitCalicoTyphaReady(replicas, config.addon.Block); err != nil {
+			return err
+		}
+		c.logInfof("calico typha is ready, continue applying full calico manifest")
+		return c.applyAddonFilesInOrder(config)
+	}
+
+	//判断当前集群是否已启用 Typha
+	typhaCurrentlyEnabled, err := c.calicoTyphaCurrentlyEnabled()
+	if err != nil {
+		return err
+	}
+	if err := c.applyAddonFilesInOrder(config); err != nil {
+		return err
+	}
+	if typhaCurrentlyEnabled {
+		c.logInfof("calico target disables typha, wait calico-node ready before deleting typha")
+		if err := c.waitCalicoNodeReady(config.addon.Block); err != nil {
+			return err
+		}
+		if err := c.deleteCalicoTyphaResources(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// applyAddonFilesInOrder 按文件名顺序应用 Addon manifest，保留普通 Addon 的原有行为。
+func (c *Client) applyAddonFilesInOrder(config *addonApplyConfig) error {
 	filesBaseNames := c.extractFileBaseNames(config.files)
 
 	for i, file := range config.files {
@@ -367,6 +579,227 @@ func (c *Client) applyAddonFiles(config *addonApplyConfig) error {
 	return nil
 }
 
+// applyCalicoTyphaBootstrapObjects 预先应用 Typha 启动所需对象。
+// 首次创建 Calico 且目标状态启用 Typha 时，需要先应用 CRD、RBAC、ServiceAccount、ConfigMap 等基础依赖，
+// 再创建 Typha Deployment/Service/PDB，避免 calico-node 还未完整安装时 Typha 因缺少依赖而启动失败。
+func (c *Client) applyCalicoTyphaBootstrapObjects(config *addonApplyConfig, includeDependencies bool) error {
+	restMapper, err := c.getRestMapper()
+	if err != nil {
+		return err
+	}
+	filesBaseNames := c.extractFileBaseNames(config.files)
+	var filtered []unstructured.Unstructured
+	var bootstrapTask *Task
+	bootstrapFile := "calico-typha-bootstrap"
+	for i, file := range config.files {
+		fileName := filesBaseNames[i]
+		task := c.createAddonTask(config, fileName, file)
+		if bootstrapTask == nil {
+			bootstrapTask = task
+		}
+		decoder, err := RenderYamlToDecoder(task)
+		if err != nil {
+			return errors.Wrapf(err, "failed to render calico typha bootstrap yaml %q", file)
+		}
+		objects, err := GetUnStructListFromDecoder(decoder)
+		if err != nil {
+			return errors.Wrapf(err, "failed to decode calico typha bootstrap yaml %q", file)
+		}
+		matched := filterCalicoTyphaBootstrapObjects(c.processUnstructuredList(objects), includeDependencies)
+		if len(matched) == 0 {
+			continue
+		}
+		c.logInfof("collect calico typha bootstrap objects, file=%s, objects=%d, includeDependencies=%t", file, len(matched), includeDependencies)
+		filtered = append(filtered, matched...)
+	}
+	if len(filtered) == 0 {
+		c.logInfof("no calico typha bootstrap objects found, includeDependencies=%t", includeDependencies)
+		return nil
+	}
+	if bootstrapTask == nil {
+		return errors.Errorf("calico typha bootstrap task is nil")
+	}
+	bootstrapTask.FilePath = bootstrapFile
+	bootstrapTask.FilePath = bootstrapFile
+	filtered = c.sortUnstructuredList(filtered, bootstrapTask)
+	c.logInfof("apply calico typha bootstrap objects, objects=%d, includeDependencies=%t", len(filtered), includeDependencies)
+	if err := c.applyUnstructuredList(filtered, restMapper, bootstrapTask); err != nil {
+		return c.handleApplyError(err, config.addon, bootstrapFile, config.addonT.Operate)
+	}
+	return nil
+}
+
+// filterCalicoTyphaBootstrapObjects 从渲染后的对象中筛选 Typha 启动所需资源。
+// 更新/升级场景只提前应用 Typha 自身对象；首次创建场景会额外带上基础依赖，但仍跳过 calico-node DaemonSet。
+func filterCalicoTyphaBootstrapObjects(objects []unstructured.Unstructured, includeDependencies bool) []unstructured.Unstructured {
+	var filtered []unstructured.Unstructured
+	for _, obj := range objects {
+		if isCalicoTyphaObject(obj) || includeDependencies && isCalicoBootstrapDependency(obj) {
+			filtered = append(filtered, obj)
+		}
+	}
+	return filtered
+}
+
+// isCalicoTyphaObject 判断对象是否是 Typha bootstrap 必须提前创建的自身资源。
+func isCalicoTyphaObject(obj unstructured.Unstructured) bool {
+	if obj.GetName() != calicoTyphaName || obj.GetNamespace() != metav1.NamespaceSystem {
+		return false
+	}
+	switch obj.GetKind() {
+	case "Deployment", "Service", "PodDisruptionBudget":
+		return true
+	default:
+		return false
+	}
+}
+
+// isCalicoBootstrapDependency 判断对象是否是首次安装 Calico 时 Typha 启动前必须具备的基础依赖。
+func isCalicoBootstrapDependency(obj unstructured.Unstructured) bool {
+	switch obj.GetKind() {
+	case "CustomResourceDefinition", "ServiceAccount", "ClusterRole", "ClusterRoleBinding", "Role", "RoleBinding", "ConfigMap", "Secret":
+		return true
+	default:
+		return false
+	}
+}
+
+// getCalicoAllowTypha 从文件级渲染参数中读取 Provider 计算出的 Typha 开关。
+func getCalicoAllowTypha(param map[string]map[string]interface{}) bool {
+	for _, values := range param {
+		if fmt.Sprint(values[allowTyphaParam]) == "true" {
+			return true
+		}
+	}
+	return false
+}
+
+// getCalicoTyphaReplicas 从文件级渲染参数中读取 Provider 计算出的 Typha 副本数。
+func getCalicoTyphaReplicas(param map[string]map[string]interface{}) int {
+	for _, values := range param {
+		replicas, err := strconv.Atoi(fmt.Sprint(values[typhaReplicasParam]))
+		if err == nil && replicas > 0 {
+			return replicas
+		}
+	}
+	return minTyphaReplicas
+}
+
+// calicoTyphaCurrentlyEnabled 检查当前集群是否已经通过 calico-config 或 Typha Deployment 启用了 Typha。
+func (c *Client) calicoTyphaCurrentlyEnabled() (bool, error) {
+	if c.ClientSet == nil {
+		return false, nil
+	}
+	cm, err := c.ClientSet.CoreV1().ConfigMaps(metav1.NamespaceSystem).Get(c.context(), "calico-config", metav1.GetOptions{})
+	if err != nil && !apierrors.IsNotFound(err) {
+		return false, err
+	}
+	if err == nil && cm.Data["typha_service_name"] == calicoTyphaName {
+		c.logInfof("current calico-config already points to typha service")
+		return true, nil
+	}
+	_, err = c.ClientSet.AppsV1().Deployments(metav1.NamespaceSystem).Get(c.context(), calicoTyphaName, metav1.GetOptions{})
+	if err == nil {
+		c.logInfof("current calico typha deployment exists")
+		return true, nil
+	}
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+// waitCalicoTyphaReady 等待 Typha Deployment 达到期望副本并确认 Service Endpoints 可用。
+func (c *Client) waitCalicoTyphaReady(expectedReplicas int, block bool) error {
+	if !block || c.ClientSet == nil {
+		return nil
+	}
+	if expectedReplicas < minTyphaReplicas {
+		expectedReplicas = minTyphaReplicas
+	}
+	c.logInfof("wait calico typha ready, expectedReplicas=%d", expectedReplicas)
+	return wait.PollImmediate(bkeinit.DefaultAddonInterval, bkeinit.DefaultAddonTimeout, func() (bool, error) {
+		deploy, err := c.ClientSet.AppsV1().Deployments(metav1.NamespaceSystem).Get(c.context(), calicoTyphaName, metav1.GetOptions{})
+		if err != nil {
+			return false, nil
+		}
+		if int(deploy.Status.ReadyReplicas) < expectedReplicas || int(deploy.Status.AvailableReplicas) < expectedReplicas {
+			return false, nil
+		}
+		endpoints, err := c.ClientSet.CoreV1().Endpoints(metav1.NamespaceSystem).Get(c.context(), calicoTyphaName, metav1.GetOptions{})
+		if err != nil {
+			return false, nil
+		}
+		return endpointHasReadyAddress(endpoints), nil
+	})
+}
+
+// endpointHasReadyAddress 判断 Endpoints 是否至少存在一个可用后端地址。
+func endpointHasReadyAddress(endpoints *corev1.Endpoints) bool {
+	if endpoints == nil {
+		return false
+	}
+	for _, subset := range endpoints.Subsets {
+		if len(subset.Addresses) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// waitCalicoNodeReady 等待 calico-node DaemonSet 完成切换并全部 Ready。
+func (c *Client) waitCalicoNodeReady(block bool) error {
+	if !block || c.ClientSet == nil {
+		return nil
+	}
+	c.logInfof("wait calico-node daemonset ready")
+	return wait.PollImmediate(bkeinit.DefaultAddonInterval, bkeinit.DefaultAddonTimeout, func() (bool, error) {
+		ds, err := c.ClientSet.AppsV1().DaemonSets(metav1.NamespaceSystem).Get(c.context(), "calico-node", metav1.GetOptions{})
+		if err != nil {
+			return false, nil
+		}
+		return ds.Status.DesiredNumberScheduled > 0 &&
+			ds.Status.NumberReady == ds.Status.DesiredNumberScheduled &&
+			ds.Status.UpdatedNumberScheduled == ds.Status.DesiredNumberScheduled, nil
+	})
+}
+
+// deleteCalicoTyphaResources 在 calico-node 切回直连 API Server 后删除 Typha 相关资源。
+func (c *Client) deleteCalicoTyphaResources() error {
+	if c.ClientSet == nil {
+		return nil
+	}
+	ctx := c.context()
+	c.logInfof("delete calico typha deployment, service and pdb")
+	var errs []error
+	if err := c.ClientSet.AppsV1().Deployments(metav1.NamespaceSystem).Delete(ctx, calicoTyphaName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		errs = append(errs, err)
+	}
+	if err := c.ClientSet.CoreV1().Services(metav1.NamespaceSystem).Delete(ctx, calicoTyphaName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		errs = append(errs, err)
+	}
+	if err := c.ClientSet.PolicyV1().PodDisruptionBudgets(metav1.NamespaceSystem).Delete(ctx, calicoTyphaName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		errs = append(errs, err)
+	}
+	return errors.Wrap(kerrors.NewAggregate(errs), "delete calico typha resources failed")
+}
+
+// logInfof 在 kube Client 存在 logger 时打印 info 日志，避免单元测试中的 nil logger panic。
+func (c *Client) logInfof(format string, args ...interface{}) {
+	if c != nil && c.Log != nil {
+		c.Log.Infof(format, args...)
+	}
+}
+
+// context 返回 Kubernetes 调用使用的上下文，未设置时使用 Background。
+func (c *Client) context() context.Context {
+	if c.Ctx != nil {
+		return c.Ctx
+	}
+	return context.Background()
+}
+
+// extractFileBaseNames 提取 manifest 文件名作为参数映射 key，例如 001-typha.yaml 对应 001-typha。
 func (c *Client) extractFileBaseNames(files []string) []string {
 	filesBaseNames := make([]string, len(files))
 	for i, file := range files {
@@ -375,6 +808,7 @@ func (c *Client) extractFileBaseNames(files []string) []string {
 	return filesBaseNames
 }
 
+// createAddonTask 基于单个 manifest 文件和渲染参数创建 ApplyYaml 使用的任务对象。
 func (c *Client) createAddonTask(config *addonApplyConfig, fileName, file string) *Task {
 	task := NewTask(config.addon.Name, file, config.param[fileName]).
 		AddRepo(config.repo).
@@ -389,6 +823,7 @@ func (c *Client) createAddonTask(config *addonApplyConfig, fileName, file string
 	return task
 }
 
+// handleApplyError 统一处理 manifest 应用错误，卸载场景保持原有忽略失败的兼容行为。
 func (c *Client) handleApplyError(err error, addon *confv1beta1.Product, file string, operate bkeaddon.AddonOperate) error {
 	if operate == bkeaddon.RemoveAddon {
 		c.Log.Warnf("(ignore)failed to remove addon %s/%s, err: %v", addon.Name, addon.Version, err)
@@ -544,7 +979,7 @@ func initializeDefaultParams() map[string]interface{} {
 	param["version"] = v.Version
 	param["kubeletDataRoot"] = bkeinit.DefaultKubeletRootDir
 	param["dockerDataRoot"] = bkeinit.DefaultCRIDockerDataRootDir
-	param["k8sVersion"] = bkeinit.DefaultKubernetesVersion
+	param["k8sVersion"] = versions.KubernetesVersion()
 	param["masterReplicas"] = "1"
 	param["workerReplicas"] = "1"
 	param["namespace"] = "cluster-system"

@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -43,18 +43,18 @@ func NewRemoteClient(h *Host) (*HostRemoteClient, error) {
 
 	c.SshClient, err = NewSSHClient(c.host)
 	if err != nil {
-		return nil, errors.Errorf("Failed to create %s ssh client, err: %v", c.host.Address, err)
+		return nil, fmt.Errorf("Failed to create %s ssh client, err: %w", c.host.Address, err)
 	}
 	if c.SshClient == nil {
-		return nil, errors.Errorf("Failed to create %s ssh client,err: %v", c.host.Address, err)
+		return nil, fmt.Errorf("Failed to create %s ssh client,err: %w", c.host.Address, err)
 	}
 
 	c.SftpClient, err = NewSFTPClient(c.SshClient.sshClient)
 	if err != nil {
-		return nil, errors.Errorf("Failed to create %s sftp client, err: %v", c.host.Address, err)
+		return nil, fmt.Errorf("Failed to create %s sftp client, err: %w", c.host.Address, err)
 	}
 	if c.SftpClient == nil {
-		return nil, errors.Errorf("Failed to create %s sftp client, err: %v", c.host.Address, err)
+		return nil, fmt.Errorf("Failed to create %s sftp client, err: %w", c.host.Address, err)
 	}
 	return c, nil
 }
@@ -127,10 +127,10 @@ func (cli *HostRemoteClient) Exec(ctx context.Context, cmd Command, stdErrChan c
 func (cli *HostRemoteClient) CloseRemoteCli() error {
 	var errs []string
 	if err := cli.SftpClient.Close(); err != nil && err != io.EOF {
-		errs = append(errs, errors.Errorf("Failed to close %s sftp client, err: %v", cli.host.Address, err).Error())
+		errs = append(errs, fmt.Errorf("Failed to close %s sftp client, err: %w", cli.host.Address, err).Error())
 	}
 	if err := cli.SshClient.Close(); err != nil && err != io.EOF {
-		errs = append(errs, errors.Errorf("Failed to close %s ssh client, err: %v", cli.host.Address, err).Error())
+		errs = append(errs, fmt.Errorf("Failed to close %s ssh client, err: %w", cli.host.Address, err).Error())
 	}
 	if len(errs) > 0 {
 		return errors.New(strings.Join(errs, ";"))

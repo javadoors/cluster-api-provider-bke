@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -226,11 +226,6 @@ func TestCtxDone(t *testing.T) {
 	cancel()
 	time.Sleep(10 * time.Millisecond)
 	assert.True(t, CtxDone(ctx))
-}
-
-func TestRemoveTimestamps(t *testing.T) {
-	result := RemoveTimestamps("test-1234567890")
-	assert.Equal(t, "test", result)
 }
 
 func TestTimeNowStr(t *testing.T) {

@@ -111,14 +111,14 @@ func (mp *ManifestPlugin) setupEtcdEnvironment(etcdDataDir string) error {
 		createEtcdUserCmd := fmt.Sprintf(`useradd -r -c "etcd user" -s /sbin/nologin etcd -d %s`, etcdDataDir)
 		out, err = mp.exec.ExecuteCommandWithCombinedOutput("/usr/bin/sh", "-c", createEtcdUserCmd)
 		if err != nil {
-			return errors.Errorf("create etcd user failed: %s, err: %v", out, err)
+			return fmt.Errorf("create etcd user failed: %s, err: %w", out, err)
 		}
 	}
 	// change etcd data dir owner
 	ownerCmd := fmt.Sprintf("chown -R etcd:etcd %s", etcdDataDir)
 	out, err = mp.exec.ExecuteCommandWithCombinedOutput("/usr/bin/sh", "-c", ownerCmd)
 	if err != nil {
-		return errors.Errorf("change etcd data dir owner failed: %s, err: %v", out, err)
+		return fmt.Errorf("change etcd data dir owner failed: %s, err: %w", out, err)
 	}
 	return nil
 }

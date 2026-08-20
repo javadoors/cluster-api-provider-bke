@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -56,6 +56,7 @@ type EnsureWorkerDelete struct {
 	phaseframe.BasePhase
 	machinesAndNodesToDelete     map[string]phaseutil.MachineAndNode
 	machinesAndNodesToWaitDelete map[string]phaseutil.MachineAndNode
+	mockClient                   kubernetes.Interface
 }
 
 func NewEnsureWorkerDelete(ctx *phaseframe.PhaseContext) phaseframe.Phase {
@@ -103,6 +104,16 @@ func (e *EnsureWorkerDelete) NeedExecute(old *bkev1beta1.BKECluster, new *bkev1b
 // getTargetClusterNodes gets nodes from the target k8s cluster.
 func (e *EnsureWorkerDelete) getTargetClusterNodes(bkeCluster *bkev1beta1.BKECluster) (bkenode.Nodes, error) {
 	return GetTargetClusterNodes(e.Ctx.Context, e.Ctx.Client, bkeCluster)
+}
+
+// kubeClient returns the kubernetes client used to clean up legacy pods.
+// In production this is obtained from the remote cluster client;
+// tests may inject a fake clientset via mockClient.
+func (e *EnsureWorkerDelete) kubeClient() kubernetes.Interface {
+	if e.mockClient != nil {
+		return e.mockClient
+	}
+	return nil
 }
 
 // DrainNodesParams 包含 drainNodes 函数的参数
@@ -203,8 +214,8 @@ func (e *EnsureWorkerDelete) markMachinesForDeletion(params MarkMachinesForDelet
 	for machineName, machineAndNode := range finalMachineToNodeDeleteMap {
 		machine := machineAndNode.Machine
 		if err := phaseutil.MarkMachineForDeletion(params.Ctx, params.Client, machine); err != nil {
-			params.Log.Error(constant.WorkerDeleteFailedReason, "Can't delete node %s", phaseutil.NodeInfo(machineAndNode.Node))
-			params.Log.Error(constant.WorkerDeleteFailedReason, "Mark machine %s for deletion failed. err: %v", utils.ClientObjNS(machine), err)
+			params.Log.Warn(constant.WorkerDeleteFailedReason, "Can't delete node %s", phaseutil.NodeInfo(machineAndNode.Node))
+			params.Log.Warn(constant.WorkerDeleteFailedReason, "Mark machine %s for deletion failed. err: %v", utils.ClientObjNS(machine), err)
 			finalCanNotDeleteMachinesAndNodes[machineName] = machineAndNode
 			delete(finalMachineToNodeDeleteMap, machineName)
 			e.Ctx.NodeFetcher().SetNodeStateWithMessageForCluster(params.Ctx, params.BKECluster, machineAndNode.Node.IP, bkev1beta1.NodeDeleteFailed, "Failed to mark acssociated machine for deletion")
@@ -275,16 +286,17 @@ func (e *EnsureWorkerDelete) initialSetup(params InitialSetupParams) InitialSetu
 	// 获取 MachineDeployment
 	scope, err := phaseutil.GetClusterAPIAssociateObjs(params.Ctx, params.Client, params.Cluster)
 	if err != nil || scope.MachineDeployment == nil {
-		params.Log.Error(constant.WorkerDeleteFailedReason, "Get cluster-api associate objs failed. err: %v", err)
 		// cluster api object error, no need to continue
-		return InitialSetupResult{Error: err}
+		if err != nil {
+			return InitialSetupResult{Error: fmt.Errorf("Get cluster-api associate objs failed: %w", err)}
+		}
+		return InitialSetupResult{Error: fmt.Errorf("Get cluster-api associate objs failed")}
 	}
 
 	// 暂停 MachineDeployment的运行，以便我们能设置注释指定删除某些节点
 	params.Log.Debug("pause machine deployment")
 	if err = phaseutil.PauseClusterAPIObj(params.Ctx, params.Client, scope.MachineDeployment); err != nil {
-		params.Log.Error(constant.WorkerDeleteFailedReason, "Pause MachineDeployment failed. err: %v", err)
-		return InitialSetupResult{Error: err}
+		return InitialSetupResult{Error: fmt.Errorf("Pause MachineDeployment failed: %w", err)}
 	}
 	params.Log.Debug("Pause MachineDeployment success")
 
@@ -389,18 +401,22 @@ func (e *EnsureWorkerDelete) finalizeDeletion(params FinalizeDeletionParams) Fin
 	if exceptReplicas < 0 {
 		exceptReplicas = 0
 	}
-	params.Scope.MachineDeployment.Spec.Replicas = &exceptReplicas
-
 	params.Log.Info(constant.WorkerDeletingReason, "Scale down MachineDeployment replicas to %d.", exceptReplicas)
 
-	// 重新启动并更新MachineDeployment副本数
-	err := phaseutil.ResumeClusterAPIObj(params.Ctx, params.Client, params.Scope.MachineDeployment)
+	// Update MachineDeployment replicas
+	err := phaseutil.UpdateMachineDeploymentReplicas(params.Ctx, params.Client, params.Scope.MachineDeployment, exceptReplicas)
 	if err != nil {
-		params.Log.Error(constant.WorkerJoinFailedReason, "Scale down MachineDeployment replicas failed. err: %v", err)
-		// cluster api object error, no need to continue
 		return FinalizeDeletionResult{
 			Result: req,
-			Error:  err,
+			Error:  fmt.Errorf("Scale down MachineDeployment replicas failed: %w", err),
+		}
+	}
+
+	// Resume MachineDeployment
+	if err = phaseutil.ResumeClusterAPIObj(params.Ctx, params.Client, params.Scope.MachineDeployment); err != nil {
+		return FinalizeDeletionResult{
+			Result: req,
+			Error:  fmt.Errorf("Resume MachineDeployment failed: %w", err),
 		}
 	}
 
@@ -448,9 +464,11 @@ func (e *EnsureWorkerDelete) reconcileWorkerDelete() (ctrl.Result, error) {
 			log.Debug(constant.WorkerDeleteFailedReason+
 				": Rollback: scale up MachineDeployment replicas to %d.",
 				*currentReplicas)
-			scope.MachineDeployment.Spec.Replicas = currentReplicas
+			if rollbackErr := phaseutil.UpdateMachineDeploymentReplicas(ctx, c, scope.MachineDeployment, *currentReplicas); rollbackErr != nil {
+				log.Warn(constant.WorkerDeleteFailedReason, "Rollback MachineDeployment replicas failed. err: %v", rollbackErr)
+			}
 			if rollbackErr := phaseutil.ResumeClusterAPIObj(ctx, c, scope.MachineDeployment); rollbackErr != nil {
-				log.Error(constant.WorkerDeleteFailedReason, "Rollback MachineDeployment replicas failed. err: %v", rollbackErr)
+				log.Warn(constant.WorkerDeleteFailedReason, "Resume MachineDeployment failed. err: %v", rollbackErr)
 			}
 		}
 	}()
@@ -567,8 +585,7 @@ func (e *EnsureWorkerDelete) waitForMachinesDelete(params WaitMachinesDeletePara
 					successDeletedNode[machineName] = machineWithNode.Node
 					continue
 				}
-				params.Log.Error(constant.WorkerDeleteFailedReason, "Get machine %s failed. err: %v", utils.ClientObjNS(machine), err)
-				return false, err
+				return false, fmt.Errorf("Get machine %s failed: %w", utils.ClientObjNS(machine), err)
 			}
 
 			drainCondition := conditions.Get(machine, clusterv1.DrainingSucceededCondition)
@@ -632,13 +649,18 @@ type ProcessSuccessfulDeletionsParams struct {
 func (e *EnsureWorkerDelete) processSuccessfulDeletions(params ProcessSuccessfulDeletionsParams) error {
 	if len(params.SuccessDeletedNode) != 0 {
 		params.Log.Info(constant.WorkerDeletedReason, "Attempt to clean the legacy daemonset pod of the removed node")
-		remoteClient, err := kube.NewRemoteClientByBKECluster(params.Ctx, params.Client, e.Ctx.BKECluster)
-		if err != nil {
-			params.Log.Warn(constant.WorkerDeletedReason, "Get remote client failed. err: %v", err)
-			return nil
+		var clientSet kubernetes.Interface
+		if cs := e.kubeClient(); cs != nil {
+			clientSet = cs
+		} else {
+			remoteClient, err := kube.NewRemoteClientByBKECluster(params.Ctx, params.Client, e.Ctx.BKECluster)
+			if err != nil {
+				params.Log.Warn(constant.WorkerDeletedReason, "Get remote client failed. err: %v", err)
+				return nil
+			}
+			ks, _ := remoteClient.KubeClient()
+			clientSet = ks
 		}
-
-		clientSet, _ := remoteClient.KubeClient()
 		for _, node := range params.SuccessDeletedNode {
 			// 清理节点上的 Pod
 			if err := e.cleanupNodePods(params.Ctx, clientSet, params.BKECluster, node, params.Log); err != nil {
@@ -673,8 +695,7 @@ func (e *EnsureWorkerDelete) cleanupNodePods(ctx context.Context, clientSet kube
 		FieldSelector: fmt.Sprintf("spec.nodeName=%s", nodeName),
 	})
 	if err != nil {
-		log.Warn(constant.WorkerDeletedReason, "List pods in node %s failed. err: %v", nodeName, err)
-		return err
+		return fmt.Errorf("list pods in node %s failed: %w", nodeName, err)
 	}
 	for _, pod := range pods.Items {
 		// force delete the pod
@@ -682,8 +703,7 @@ func (e *EnsureWorkerDelete) cleanupNodePods(ctx context.Context, clientSet kube
 			GracePeriodSeconds: pointer.Int64(0),
 		})
 		if err != nil {
-			log.Warn(constant.WorkerDeletedReason, "Delete pod %s failed. err: %v", utils.ClientObjNS(&pod), err)
-			return err
+			return fmt.Errorf("delete pod %s failed: %w", utils.ClientObjNS(&pod), err)
 		}
 	}
 	return nil

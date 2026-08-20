@@ -14,6 +14,7 @@ package k8s
 
 import (
 	"context"
+	"fmt"
 	"io/ioutil"
 	"os"
 	"path"
@@ -27,6 +28,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/executor/exec"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
@@ -268,7 +270,28 @@ func (t *Task) handleReadWrite(resourceType, namespace, name, resourcePath strin
 		}
 	}
 
-	err = t.K8sClient.Update(context.Background(), obj)
+	err = phaseutil.RetryOnConflict(func() error {
+		var existingResource client.Object
+		if resourceType == configmap {
+			existingResource = &corev1.ConfigMap{}
+		} else if resourceType == secret {
+			existingResource = &corev1.Secret{}
+		} else {
+			return fmt.Errorf("unsupported resource type: %s", resourceType)
+		}
+		if err := t.K8sClient.Get(context.Background(), client.ObjectKey{Namespace: namespace, Name: name}, existingResource); err != nil {
+			return err
+		}
+		switch v := existingResource.(type) {
+		case *corev1.ConfigMap:
+			v.Data = map[string]string{"content": string(content)}
+		case *corev1.Secret:
+			v.Data = map[string][]byte{"content": content}
+		default:
+			return fmt.Errorf("unsupported resource type: %T", existingResource)
+		}
+		return t.K8sClient.Update(context.Background(), existingResource)
+	})
 	if err != nil {
 		if apierr.IsNotFound(err) {
 			return t.K8sClient.Create(context.Background(), obj)

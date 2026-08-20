@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -39,6 +39,8 @@ type ENV struct {
 	PrePullImage bool
 
 	DeepRestore bool
+
+	IsImmutableOS bool // worker 节点是否为不可变 OS（KubeOS）
 }
 
 func (e *ENV) Validate() error {
@@ -108,7 +110,7 @@ func (e *ENV) NewConatinerdRedeploy() error {
 	return e.newCommand(commandName, BKEClusterLabel, commandSpec)
 }
 
-// New 创建环境初始化命令
+// New 创建环境初始化命令，镜像预拉取已并入主初始化命令，避免再额外下发单独的预拉取命令。
 func (e *ENV) New() error {
 	if err := e.Validate(); err != nil {
 		return err
@@ -128,10 +130,6 @@ func (e *ENV) New() error {
 		commandSpec.Commands = commandSpec.Commands[:1]
 	}
 
-	if e.PrePullImage {
-		e.createPrePullImageCommand(bkeConfigStr)
-	}
-
 	commandSpec.NodeSelector = getNodeSelector(e.Nodes)
 
 	return e.newCommand(commandName, BKEClusterLabel, commandSpec)
@@ -146,15 +144,28 @@ func (e *ENV) getCommandName() string {
 	return commandName
 }
 
-// getScope 获取作用域字符串，根据DeepRestore标志决定具体内容
+// getScope 获取 reset 作用域字符串
 func (e *ENV) getScope() string {
+	if e.IsImmutableOS {
+		// 不可变 OS：跳过 containerRuntime 和 extra
+		return "scope=cert,manifests,container,kubelet"
+	}
 	if e.DeepRestore {
 		return "scope=cert,manifests,container,kubelet,containerRuntime,extra"
 	}
 	return "scope=cert,manifests,container,kubelet,extra"
 }
 
-// buildCommandSpec 构建命令规格
+// getInitScope 获取环境初始化作用域字符串，镜像预拉取合并在主初始化流程内执行。
+func (e *ENV) getInitScope() string {
+	if e.IsImmutableOS {
+		// 不可变 OS：跳过 firewall/selinux/swap/httpRepo/extra，保留 image 以预拉取 Calico 节点镜像。
+		return "scope=time,hosts,dns,kernel,runtime,iptables,registry,image"
+	}
+	return "scope=time,hosts,dns,kernel,firewall,selinux,swap,httpRepo,runtime,iptables,registry,image,extra"
+}
+
+// buildCommandSpec 构建环境初始化命令规格，主初始化 scope 包含 image 以覆盖 Calico 节点镜像预拉取。
 func (e *ENV) buildCommandSpec(bkeConfigStr, extra, extraHosts, scope string) *agentv1beta1.CommandSpec {
 	commandSpec := GenerateDefaultCommandSpec()
 	commandSpec.TTLSecondsAfterFinished = 0
@@ -191,7 +202,7 @@ func (e *ENV) buildCommandSpec(bkeConfigStr, extra, extraHosts, scope string) *a
 				"K8sEnvInit",
 				"init=true",
 				"check=true",
-				"scope=time,hosts,dns,kernel,firewall,selinux,swap,httpRepo,runtime,iptables,registry,extra",
+				e.getInitScope(),
 				bkeConfigStr,
 				extraHosts,
 			},

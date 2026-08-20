@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -141,8 +141,7 @@ func NewDockerClient() (DockerClient, error) {
 	ctx := context.Background()
 	cli, err := dockerapi.NewClientWithOpts(dockerapi.FromEnv, dockerapi.WithAPIVersionNegotiation())
 	if err != nil {
-		log.Error("get container runtime client err:", err)
-		return nil, err
+		return nil, fmt.Errorf("create docker client: %w", err)
 	}
 
 	c := &Client{
@@ -180,8 +179,7 @@ func (c *Client) Pull(img ImageRef) error {
 		}
 		encodedJSON, err := json.Marshal(authConfig)
 		if err != nil {
-			log.Errorf(" encoded docker RegistryAuth err: %v", err)
-			return err
+			return fmt.Errorf("encode docker registry auth for image %s: %w", img.Image, err)
 		}
 		authStr := base64.URLEncoding.EncodeToString(encodedJSON)
 		imagePullOptions.RegistryAuth = authStr
@@ -189,12 +187,11 @@ func (c *Client) Pull(img ImageRef) error {
 
 	reader, err := c.Client.ImagePull(c.ctx, img.Image, imagePullOptions)
 	if err != nil {
-		log.Errorf("docker pull image %s error %v", img.Image, err)
-		return err
+		return fmt.Errorf("pull docker image %s: %w", img.Image, err)
 	}
 	written, err := io.Copy(os.Stdout, reader)
 	if err != nil {
-		return err
+		return fmt.Errorf("read docker pull response for image %s: %w", img.Image, err)
 	}
 	if written < 0 {
 		// This is just to use the written variable, though it should never be negative
@@ -214,8 +211,7 @@ func (c *Client) Push(img ImageRef) (io.ReadCloser, error) {
 		}
 		encodedJSON, err := json.Marshal(authConfig)
 		if err != nil {
-			log.Errorf(" encoded docker RegistryAuth err: %v", err)
-			return nil, err
+			return nil, fmt.Errorf("encode docker registry auth for image %s: %w", img.Image, err)
 		}
 		authStr := base64.URLEncoding.EncodeToString(encodedJSON)
 		imagePushOptions.RegistryAuth = authStr
@@ -223,7 +219,7 @@ func (c *Client) Push(img ImageRef) (io.ReadCloser, error) {
 
 	closer, err := c.Client.ImagePush(c.ctx, img.Image, imagePushOptions)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("push docker image %s: %w", img.Image, err)
 	}
 	return closer, nil
 }
@@ -233,14 +229,12 @@ func (c *Client) Run(cs ContainerSpec) error {
 	resp, err := c.Client.ContainerCreate(c.ctx, cs.ContainerConfig, cs.HostConfig,
 		cs.NetworkingConfig, cs.Platform, cs.ContainerName)
 	if err != nil {
-		log.Error(err)
+		return fmt.Errorf("create container %s: %w", cs.ContainerName, err)
 	}
 	if err := c.Client.ContainerStart(c.ctx, resp.ID, container.StartOptions{}); err != nil {
-		if err != nil {
-			log.Error(err)
-		}
+		return fmt.Errorf("start container %s (id=%s): %w", cs.ContainerName, resp.ID, err)
 	}
-	log.Infof("container ID %s", resp.ID)
+	log.Debugf("container created and started: name=%s id=%s", cs.ContainerName, resp.ID)
 	return nil
 }
 
@@ -334,29 +328,29 @@ func ConfigDockerDaemon(params DockerDaemonConfig) (err error) {
 	}
 	if !utils.Exists("/etc/docker") {
 		if err = os.MkdirAll("/etc/docker", DefaultDirFileMode); err != nil {
-			return errors.Errorf("create /etc/docker dir err: %v", err)
+			return fmt.Errorf("create /etc/docker dir err: %w", err)
 		}
 	}
 
 	if err = BaseConfig(); err != nil {
-		return errors.Errorf("config docker base err: %v", err)
+		return fmt.Errorf("config docker base err: %w", err)
 	}
 
 	if len(insecureRegis) > 0 || insecureRegis != nil {
 		if err = ConfigInsecureRegistries(insecureRegis); err != nil {
-			return errors.Errorf("config docker insecure registries err: %v", err)
+			return fmt.Errorf("config docker insecure registries err: %w", err)
 		}
 	}
 
 	if cgroupDriver != "" {
 		if err = ConfigCgroupDriver(cgroupDriver); err != nil {
-			return errors.Errorf("config docker cgroup driver err: %v", err)
+			return fmt.Errorf("config docker cgroup driver err: %w", err)
 		}
 	}
 
 	if lowLevelRuntime != "" {
 		if err = ConfigRuntime(lowLevelRuntime); err != nil {
-			return errors.Errorf("config docker low level runtime err: %v", err)
+			return fmt.Errorf("config docker low level runtime err: %w", err)
 		}
 	}
 
@@ -367,13 +361,13 @@ func ConfigDockerDaemon(params DockerDaemonConfig) (err error) {
 			}
 		}
 		if err = ConfigDataRoot(dataRoot); err != nil {
-			return errors.Errorf("config docker data root err: %v", err)
+			return fmt.Errorf("config docker data root err: %w", err)
 		}
 	}
 
 	if enableTls {
 		if err = ConfigDockerTls(tlsHost); err != nil {
-			return errors.Errorf("config docker tls err: %v", err)
+			return fmt.Errorf("config docker tls err: %w", err)
 		}
 	}
 
@@ -857,7 +851,7 @@ func setupTLSCerts(tlsHost string) error {
 	output, err := executor.ExecuteCommandWithCombinedOutput("/bin/sh", "-c",
 		"cd /etc/docker/certs && ./tlscert.sh "+tlsHost)
 	if err != nil {
-		return errors.Wrapf(err, "generate docker tls cert failed, output: %s, err: %v", output, err)
+		return fmt.Errorf("generate docker tls cert failed, output: %s: %w", output, err)
 	}
 
 	// export DOCKER_CONFIG=/etc/docker/certs to /etc/profile
@@ -1075,12 +1069,11 @@ func WaitDockerReady() error {
 		if err == nil {
 			return true, nil
 		}
-		log.Warnf("Docker is not available: %v", err)
+		log.Debugf("Docker is not available: %v", err)
 		return false, nil
 	}, ctx.Done())
 	if err != nil {
-		log.Errorf("Failed to wait Docker available: %v", err)
-		return errors.Wrapf(err, "failed to wait Docker available")
+		return fmt.Errorf("wait docker available: %w", err)
 	}
 	return nil
 }

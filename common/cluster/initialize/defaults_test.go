@@ -3,7 +3,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -21,6 +21,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/initialize/versions"
 )
 
 func TestSetDefaultBKEConfig(t *testing.T) {
@@ -28,7 +30,10 @@ func TestSetDefaultBKEConfig(t *testing.T) {
 	SetDefaultBKEConfig(cfg)
 
 	assert.Equal(t, cfg.Cluster.CertificatesDir, DefaultCertificatesDir)
-	assert.Equal(t, cfg.Cluster.KubernetesVersion, DefaultKubernetesVersion)
+	assert.Equal(t, versions.KubernetesVersion(), cfg.Cluster.KubernetesVersion)
+	assert.Equal(t, versions.EtcdVersion(), cfg.Cluster.EtcdVersion)
+	assert.Equal(t, versions.ContainerdVersion(), cfg.Cluster.ContainerdVersion)
+	assert.Equal(t, versions.OpenFuyaoVersion(), cfg.Cluster.OpenFuyaoVersion)
 	assert.Equal(t, cfg.Cluster.HTTPRepo.Domain, DefaultYumRepo)
 	assert.Equal(t, cfg.Cluster.HTTPRepo.Port, DefaultYumRepoPort)
 	assert.Equal(t, cfg.Cluster.ImageRepo.Domain, DefaultImageRepo)
@@ -43,6 +48,21 @@ func TestSetDefaultBKEConfig(t *testing.T) {
 	assert.Equal(t, cfg.Cluster.Kubelet.ManifestsDir, DefaultManifestsDir)
 	assert.Equal(t, cfg.Cluster.ContainerRuntime.CRI, CRIContainerd)
 	assert.Equal(t, cfg.Cluster.ContainerRuntime.Runtime, DefaultRuntime)
+}
+
+func TestSetDefaultBKEConfigPreservesExplicitVersions(t *testing.T) {
+	cfg := &BkeConfig{}
+	cfg.Cluster.KubernetesVersion = "v1.30.0"
+	cfg.Cluster.EtcdVersion = "v3.5.0"
+	cfg.Cluster.ContainerdVersion = "v1.7.0"
+	cfg.Cluster.OpenFuyaoVersion = "v1.0.0"
+
+	SetDefaultBKEConfig(cfg)
+
+	assert.Equal(t, "v1.30.0", cfg.Cluster.KubernetesVersion)
+	assert.Equal(t, "v3.5.0", cfg.Cluster.EtcdVersion)
+	assert.Equal(t, "v1.7.0", cfg.Cluster.ContainerdVersion)
+	assert.Equal(t, "v1.0.0", cfg.Cluster.OpenFuyaoVersion)
 }
 
 // TestSetDefaultBKENodes tests the default node configuration

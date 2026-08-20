@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -41,7 +41,7 @@ func ClientSetFromManagerClusterSecret(nsName ...string) (*kubernetes.Clientset,
 			return nil, err
 		}
 		if err != nil {
-			return nil, errors.Errorf("failed to get manger cluster rest config: %v", err)
+			return nil, fmt.Errorf("failed to get manger cluster rest config: %w", err)
 		}
 		clientSet, err := kubernetes.NewForConfig(config)
 		if err != nil {
@@ -52,7 +52,7 @@ func ClientSetFromManagerClusterSecret(nsName ...string) (*kubernetes.Clientset,
 
 		secret, err := clientSet.CoreV1().Secrets(nsName[0]).Get(context.Background(), secretName, metav1.GetOptions{})
 		if err != nil {
-			return nil, errors.Errorf("failed to get ha kubeconfig secret: %v", err)
+			return nil, fmt.Errorf("failed to get ha kubeconfig secret: %w", err)
 		}
 
 		if err := pkiutil.StoreClusterAPICert(secret, os.TempDir()); err != nil {

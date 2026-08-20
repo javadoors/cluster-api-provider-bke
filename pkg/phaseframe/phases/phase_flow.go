@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -14,6 +14,7 @@ package phases
 
 import (
 	"runtime/debug"
+	"strings"
 
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	"sigs.k8s.io/cluster-api/util"
@@ -21,10 +22,13 @@ import (
 
 	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
+	cvv1alpha1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/v1alpha1"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/clusterversion"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/mergecluster"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/annotation"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/condition"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/constant"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
@@ -72,16 +76,61 @@ func (p *PhaseFlow) determinePhasesFuncs() []func(ctx *phaseframe.PhaseContext) 
 
 // calculateAndAddPhases calculates the phases that need to be executed and adds them to the list
 func (p *PhaseFlow) calculateAndAddPhases(old *bkev1beta1.BKECluster, new *bkev1beta1.BKECluster, phasesFuncs []func(ctx *phaseframe.PhaseContext) phaseframe.Phase) {
+	skipLegacyUpgrade := shouldSkipLegacyUpgrade(p.ctx)
+
 	// 计算需要执行的阶段，并添加到status中
 	for _, f := range phasesFuncs {
 		phase := f(p.ctx)
 		if p.skipPhaseAfterDeclarativeDAG(phase) {
 			continue
 		}
+		if skipLegacyUpgrade && isLegacyClusterUpgradePhase(phase.Name()) {
+			continue
+		}
 		if phase.NeedExecute(old, new) {
 			p.BKEPhases = append(p.BKEPhases, phase)
 		}
 	}
+}
+
+func shouldSkipLegacyUpgrade(ctx *phaseframe.PhaseContext) bool {
+	if ctx == nil || ctx.BKECluster == nil {
+		return false
+	}
+	bkeCluster := ctx.BKECluster
+	if bkeCluster.Status.ClusterHealthState == bkev1beta1.UpgradeFailed {
+		return true
+	}
+	if v, ok := condition.HasCondition(bkev1beta1.ClusterHealthyStateCondition, bkeCluster); ok && v != nil {
+		if v.Status == confv1beta1.ConditionFalse && v.Message == string(bkev1beta1.UpgradeFailed) {
+			return true
+		}
+	}
+	if ctx.Client == nil {
+		return false
+	}
+	cv, err := clusterversion.GetClusterVersionForBKECluster(ctx.Context, ctx.Client, bkeCluster)
+	if err != nil || cv == nil {
+		return false
+	}
+	desired := strings.TrimSpace(cv.Spec.DesiredVersion)
+	current := strings.TrimSpace(cv.Status.CurrentVersion)
+	return cv.Status.Phase == cvv1alpha1.ClusterVersionPhaseFailed &&
+		desired != "" && desired != current
+}
+
+func isLegacyClusterUpgradePhase(name confv1beta1.BKEClusterPhase) bool {
+	for _, phaseName := range ClusterUpgradePhaseNames {
+		if phaseName == name {
+			return true
+		}
+	}
+	for _, phaseName := range DeclarativeClusterUpgradePhaseNames {
+		if phaseName == name {
+			return true
+		}
+	}
+	return name == EnsureProviderSelfUpgradeName
 }
 
 // skipPhaseAfterDeclarativeDAG avoids re-running inline upgrade phases already executed by the DAG.

@@ -70,8 +70,7 @@ func (e *EnsureAgentUpgrade) NeedExecute(old, new *bkev1beta1.BKECluster) bool {
 func (e *EnsureAgentUpgrade) Execute() (ctrl.Result, error) {
 	_, _, _, _, log := e.Ctx.Untie()
 	if err := e.upgradeBKEAgentViaSSH(); err != nil {
-		log.Error("BKEAgentUpgradeFailed", "failed to upgrade bkeagent via ssh: %v", err)
-		return ctrl.Result{}, err
+		return ctrl.Result{}, fmt.Errorf("failed to upgrade bkeagent via ssh: %w", err)
 	}
 	log.Info("BKEAgentUpgradeSuccess", "bkeagent upgrade completed via ssh push")
 	return ctrl.Result{}, nil

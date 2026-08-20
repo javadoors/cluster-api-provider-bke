@@ -13,6 +13,7 @@
 package v1alpha1
 
 import (
+	"encoding/json"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -138,10 +139,39 @@ func TestComponentVersionDeepCopy(t *testing.T) {
 	cv := &ComponentVersion{
 		ObjectMeta: metav1.ObjectMeta{Name: "kubelet"},
 		Spec: ComponentVersionSpec{
-			Name:          "kubelet",
-			Type:          ComponentTypeInline,
-			Version:       "v1.32.0",
-			Inline:        &InlineSpec{Handler: "restart", Version: "v1"},
+			Name:    "kubelet",
+			Type:    ComponentTypeInline,
+			Version: "v1.32.0",
+			Inline:  &InlineSpec{Handler: "restart", Version: "v1"},
+			YAML: &YAMLSpec{
+				Namespace:     "kube-system",
+				ApplyStrategy: ApplyStrategyServerSideApply,
+				Prune:         true,
+				PruneLabelSelector: map[string]string{
+					"app.kubernetes.io/name": "coredns",
+				},
+				HealthCheck: &HealthCheckSpec{
+					Enabled:  true,
+					Timeout:  "5m",
+					Interval: "2s",
+					Checks: []HealthCheckItemSpec{
+						{
+							Type: "PodReady",
+							PodReady: &PodReadyCheckSpec{
+								Namespace:     "kube-system",
+								LabelSelector: "k8s-app=kube-dns",
+								MinReady:      1,
+							},
+						},
+						{
+							Type: "Custom",
+							Custom: &CustomCheckSpec{
+								Command: "true",
+							},
+						},
+					},
+				},
+			},
 			SubComponents: []SubComponent{{Name: "kube-proxy", Version: "v1.32.0"}},
 			Compatibility: CompatibilitySpec{Constraints: []Constraint{{Component: "containerd", Rule: ">=1.7"}}},
 			Dependencies:  []Dependency{{Name: "containerd", Phase: "Ready"}},
@@ -154,6 +184,10 @@ func TestComponentVersionDeepCopy(t *testing.T) {
 
 	copied := cv.DeepCopy()
 	copied.Spec.Inline.Handler = "changed"
+	copied.Spec.YAML.Namespace = "changed"
+	copied.Spec.YAML.PruneLabelSelector["app.kubernetes.io/name"] = "changed"
+	copied.Spec.YAML.HealthCheck.Checks[0].PodReady.LabelSelector = "changed"
+	copied.Spec.YAML.HealthCheck.Checks[1].Custom.Command = "changed"
 	copied.Spec.SubComponents[0].Name = "changed"
 	copied.Spec.Compatibility.Constraints[0].Rule = "changed"
 	copied.Spec.Dependencies[0].Name = "changed"
@@ -162,6 +196,18 @@ func TestComponentVersionDeepCopy(t *testing.T) {
 
 	if cv.Spec.Inline.Handler != "restart" {
 		t.Fatalf("inline spec was not deep copied")
+	}
+	if cv.Spec.YAML.Namespace != "kube-system" {
+		t.Fatalf("yaml namespace was not deep copied")
+	}
+	if cv.Spec.YAML.PruneLabelSelector["app.kubernetes.io/name"] != "coredns" {
+		t.Fatalf("yaml prune labels were not deep copied")
+	}
+	if cv.Spec.YAML.HealthCheck.Checks[0].PodReady.LabelSelector != "k8s-app=kube-dns" {
+		t.Fatalf("yaml health check was not deep copied")
+	}
+	if cv.Spec.YAML.HealthCheck.Checks[1].Custom.Command != "true" {
+		t.Fatalf("yaml health check command was not deep copied")
 	}
 	if cv.Spec.SubComponents[0].Name != "kube-proxy" {
 		t.Fatalf("sub components were not deep copied")
@@ -179,6 +225,32 @@ func TestComponentVersionDeepCopy(t *testing.T) {
 		t.Fatalf("conditions were not deep copied")
 	}
 	assertRuntimeObject(t, cv.DeepCopyObject())
+}
+
+func TestComponentVersionLegacyWithoutYAMLDeserializes(t *testing.T) {
+	// Old ComponentVersion JSON without yaml remains valid; YAML stays nil.
+	raw := []byte(`{
+		"apiVersion":"config.openfuyao.com/v1alpha1",
+		"kind":"ComponentVersion",
+		"metadata":{"name":"legacy-yaml"},
+		"spec":{
+			"name":"coredns",
+			"type":"yaml",
+			"version":"v1.0.0",
+			"resources":[{"kind":"ConfigMap","apiVersion":"v1","name":"coredns"}]
+		}
+	}`)
+	var cv ComponentVersion
+	if err := json.Unmarshal(raw, &cv); err != nil {
+		t.Fatalf("unmarshal legacy ComponentVersion: %v", err)
+	}
+	if cv.Spec.YAML != nil {
+		t.Fatalf("expected nil YAML on legacy object, got %#v", cv.Spec.YAML)
+	}
+	copied := cv.DeepCopy()
+	if copied.Spec.YAML != nil {
+		t.Fatalf("expected nil YAML after deepcopy, got %#v", copied.Spec.YAML)
+	}
 }
 
 func TestListDeepCopyObjects(t *testing.T) {

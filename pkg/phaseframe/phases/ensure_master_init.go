@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -14,6 +14,7 @@ package phases
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -35,6 +36,7 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/condition"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/constant"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/intervention"
 	_ "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/label"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
@@ -75,7 +77,6 @@ func (e *EnsureMasterInit) validateMasterNodes(params ValidateMasterNodesParams)
 	allNodes, _ := nodeFetcher.GetNodesForBKECluster(params.Ctx, params.Ctx.BKECluster)
 	nodes := allNodes.Master()
 	if len(nodes) == 0 {
-		log.Warn(constant.MasterNotInitReason, "no master node")
 		return nil, 0, errors.Errorf("no master node")
 	}
 
@@ -88,7 +89,6 @@ func (e *EnsureMasterInit) validateMasterNodes(params ValidateMasterNodesParams)
 	}
 
 	if count == nodes.Length() {
-		log.Warn(constant.MasterNotInitReason, "all master node not ready,cannot init")
 		return nil, 0, errors.Errorf("all master node agent is not ready")
 	}
 
@@ -102,10 +102,14 @@ type SetupConditionAndRefreshParams struct {
 
 // setupConditionAndRefresh 设置条件和刷新集群状态
 func (e *EnsureMasterInit) setupConditionAndRefresh(params SetupConditionAndRefreshParams) error {
+	// Clear any existing manual intervention mark (a new init round is starting).
+	// Uses ClearInMemory to avoid a redundant SyncStatusUntilComplete; the
+	// existing SyncStatusUntilComplete below will persist the change.
+	intervention.ClearInMemory(params.Ctx.BKECluster)
 	condition.ConditionMark(params.Ctx.BKECluster, bkev1beta1.ControlPlaneInitializedCondition, confv1beta1.ConditionFalse, constant.MasterNotInitReason, "Master still not init")
 
 	if err := mergecluster.SyncStatusUntilComplete(params.Ctx.Client, params.Ctx.BKECluster); err != nil {
-		log.Error(constant.MasterNotInitReason, "failed to add %q status false", bkev1beta1.ControlPlaneInitializedCondition)
+		return fmt.Errorf("failed to mark %q status false: %w", bkev1beta1.ControlPlaneInitializedCondition, err)
 	}
 	if err := params.Ctx.RefreshCtxBKECluster(); err != nil {
 		return err
@@ -163,6 +167,7 @@ func (e *EnsureMasterInit) waitForInitCommandComplete(params WaitForInitCommandC
 				RefreshContext: func() error {
 					return params.Ctx.RefreshCtxBKECluster()
 				},
+				Recorder: params.Ctx.Log.Recorder,
 			}
 			result := ProcessCommandFailure(commandFailureParams)
 			if result.Done {
@@ -199,7 +204,7 @@ func (e *EnsureMasterInit) waitForMachineBootstrap(params WaitForMachineBootstra
 	bkeMachine, err := phaseutil.GetControlPlaneInitBKEMachine(params.Ctx.Context, c, bkeCluster)
 	if err != nil {
 		if *params.PollCount%MasterInitLogIntervalCount == 0 {
-			log.Error(constant.MasterNotInitReason, "get init BKEMachine failed, err: %v", err)
+			log.Debug(constant.MasterNotInitReason, "get init BKEMachine failed, err: %v", err)
 		}
 		return false, nil
 	}
@@ -218,12 +223,10 @@ type CheckClusterInitializedParams struct {
 // checkClusterInitialized 检查集群是否已初始化
 func (e *EnsureMasterInit) checkClusterInitialized(params CheckClusterInitializedParams) (bool, error) {
 	if err := params.Ctx.RefreshCtxCluster(); err != nil {
-		params.Ctx.Log.Error(constant.InternalErrorReason, "Refresh ClusterAPI Cluster obj %q failed, err: %v", utils.ClientObjNS(params.Ctx.Cluster), err)
-		return false, err
+		return false, fmt.Errorf("Refresh ClusterAPI Cluster obj %q failed: %w", utils.ClientObjNS(params.Ctx.Cluster), err)
 	}
 	if err := params.Ctx.RefreshCtxBKECluster(); err != nil {
-		params.Ctx.Log.Error(constant.InternalErrorReason, "Refresh BKECluster obj %q failed, err: %v", utils.ClientObjNS(params.Ctx.BKECluster), err)
-		return false, err
+		return false, fmt.Errorf("Refresh BKECluster obj %q failed: %w", utils.ClientObjNS(params.Ctx.BKECluster), err)
 	}
 
 	if conditions.IsTrue(params.Ctx.Cluster, clusterv1.ControlPlaneInitializedCondition) {
@@ -257,12 +260,10 @@ func (e *EnsureMasterInit) checkClusterInitializedStep(params MasterInitPollPara
 	params.Ctx.Untie()
 
 	if err := params.Ctx.RefreshCtxCluster(); err != nil {
-		log.Error(constant.InternalErrorReason, "Refresh ClusterAPI Cluster obj %q failed, err: %v", utils.ClientObjNS(params.Ctx.Cluster), err)
-		return false, false, err
+		return false, false, fmt.Errorf("Refresh ClusterAPI Cluster obj %q failed: %w", utils.ClientObjNS(params.Ctx.Cluster), err)
 	}
 	if err := params.Ctx.RefreshCtxBKECluster(); err != nil {
-		log.Error(constant.InternalErrorReason, "Refresh BKECluster obj %q failed, err: %v", utils.ClientObjNS(params.Ctx.BKECluster), err)
-		return false, false, err
+		return false, false, fmt.Errorf("Refresh BKECluster obj %q failed: %w", utils.ClientObjNS(params.Ctx.BKECluster), err)
 	}
 
 	if conditions.IsTrue(params.Ctx.Cluster, clusterv1.ControlPlaneInitializedCondition) {
@@ -323,6 +324,7 @@ func (e *EnsureMasterInit) processCommandFailure(params MasterInitPollParams, c 
 		RefreshContext: func() error {
 			return params.Ctx.RefreshCtxBKECluster()
 		},
+		Recorder: e.Ctx.Log.Recorder,
 	}
 	result := ProcessCommandFailure(commandFailureParams)
 	return result.Done, result.Success, result.Err
@@ -397,7 +399,7 @@ func (e *EnsureMasterInit) waitForMachineBootstrapStep(params MasterInitPollPara
 	bkeMachine, err := phaseutil.GetControlPlaneInitBKEMachine(params.Timeout, c, bkeCluster)
 	if err != nil {
 		if pollCount%MasterInitLogIntervalCount == 0 {
-			log.Error(constant.MasterNotInitReason, "get init BKEMachine failed, err: %v", err)
+			log.Debug(constant.MasterNotInitReason, "get init BKEMachine failed, err: %v", err)
 		}
 		return false, false, nil
 	}
@@ -484,14 +486,12 @@ func (e *EnsureMasterInit) Execute() (ctrl.Result, error) {
 	defer func() {
 		// 在最后退出时，只要没有init成功，需要加上condition，来防止环境初始化command清除已经init完成的部分
 		if derr := e.Ctx.RefreshCtxCluster(); derr != nil {
-			e.Ctx.Log.Error(constant.MasterNotInitReason, "Get ClusterAPI Cluster obj failed, err: %v", derr)
-			err = derr
+			err = fmt.Errorf("get ClusterAPI Cluster obj failed: %w", derr)
 		}
 		if e.Ctx.Cluster != nil && !conditions.IsTrue(e.Ctx.Cluster, clusterv1.ControlPlaneInitializedCondition) {
 			condition.ConditionMark(e.Ctx.BKECluster, bkev1beta1.ControlPlaneInitializedCondition, confv1beta1.ConditionFalse, constant.MasterNotInitReason, "Master still not init")
 			if derr := mergecluster.SyncStatusUntilComplete(e.Ctx.Client, e.Ctx.BKECluster); derr != nil {
-				e.Ctx.Log.Error(constant.MasterNotInitReason, "failed to add %q status false, err: %v", bkev1beta1.ControlPlaneInitializedCondition, derr)
-				err = derr
+				err = fmt.Errorf("failed to mark %q status false: %w", bkev1beta1.ControlPlaneInitializedCondition, derr)
 			}
 
 		}
@@ -522,6 +522,12 @@ func (e *EnsureMasterInit) Execute() (ctrl.Result, error) {
 
 	if err != nil {
 		if errors.Is(err, wait.ErrWaitTimeout) {
+			_ = intervention.Require(intervention.Params{
+				BKECluster: e.Ctx.BKECluster,
+				Client:     e.Ctx.Client,
+				Recorder:   e.Ctx.Log.Recorder,
+				Guidance:   intervention.MasterInitTimeout(timeOut),
+			})
 			return ctrl.Result{}, errors.Errorf("Wait master init failed")
 		}
 		return ctrl.Result{}, err

@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -25,6 +25,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
 	kubedrain "k8s.io/kubectl/pkg/drain"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
@@ -138,4 +139,39 @@ func GetPatchConfig(data string) (*PatchConfig, error) {
 		return nil, errors.Errorf("Unable to serialize data %s, err %s", data, err)
 	}
 	return cfg, nil
+}
+
+// ErrLocalPatchKeyNotFound indicates patch.<version> is missing from the local bke-cluster ConfigMap.
+var ErrLocalPatchKeyNotFound = errors.New("patch key not found in local config")
+
+// LoadPatchConfig loads PatchConfig for openFuyaoVersion from local bke-cluster CM
+// and the openfuyao-patch/cm.<version> ConfigMap.
+func LoadPatchConfig(ctx context.Context, c client.Client, openFuyaoVersion string) (*PatchConfig, error) {
+	bkeCmKey := fmt.Sprintf("patch.%s", openFuyaoVersion)
+	patchCmKey := fmt.Sprintf("cm.%s", openFuyaoVersion)
+
+	localConfigMap := &corev1.ConfigMap{}
+	if err := c.Get(ctx, constant.GetLocalConfigMapObjectKey(), localConfigMap); err != nil {
+		return nil, fmt.Errorf("get cm failed: %w", err)
+	}
+
+	if _, ok := localConfigMap.Data[bkeCmKey]; !ok {
+		return nil, fmt.Errorf("%w: %s", ErrLocalPatchKeyNotFound, bkeCmKey)
+	}
+
+	cmKey := client.ObjectKey{
+		Namespace: "openfuyao-patch",
+		Name:      patchCmKey,
+	}
+	patchConfigMap := &corev1.ConfigMap{}
+	if err := c.Get(ctx, cmKey, patchConfigMap); err != nil {
+		return nil, fmt.Errorf("get cm failed: %w", err)
+	}
+
+	data, ok := patchConfigMap.Data[openFuyaoVersion]
+	if !ok {
+		return nil, fmt.Errorf("patch info %s not found in patch config", openFuyaoVersion)
+	}
+
+	return GetPatchConfig(data)
 }

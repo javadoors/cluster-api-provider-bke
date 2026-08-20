@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -58,7 +58,22 @@ const (
 
 type EnsureCluster struct {
 	phaseframe.BasePhase
-	remoteClient kube.RemoteKubeClient
+	remoteClient   kube.RemoteKubeClient
+	healthCheckErr error
+	// mockClient allows tests to inject a fake clientset for the CoreV1()
+	// node label/token operations. nil in production.
+	mockClient kubernetes.Interface
+}
+
+// kubeClient returns the kubernetes clientset used for node label/token ops.
+// In production this is obtained from the remote cluster client; tests may
+// inject a fake clientset via mockClient.
+func (e *EnsureCluster) kubeClient() kubernetes.Interface {
+	if e.mockClient != nil {
+		return e.mockClient
+	}
+	cs, _ := e.remoteClient.KubeClient()
+	return cs
 }
 
 func NewEnsureCluster(ctx *phaseframe.PhaseContext) phaseframe.Phase {
@@ -105,16 +120,19 @@ func (e *EnsureCluster) Execute() (_ ctrl.Result, err error) {
 		errs = append(errs, err)
 	}
 
+	if err = e.ensureRemoteHealthCheckConfigCM(); err != nil {
+		errs = append(errs, err)
+	}
+
 	_, _, bkeCluster, _, log := e.Ctx.Untie()
 	if err != nil {
-		log.Error("some err in ensureCluster.go: %s", err.Error())
 		return ctrl.Result{}, kerrors.NewAggregate(errs)
 	}
 
 	// 如果集群处于特殊状态，则暂不执行定时检查
 	if isClusterInSpecialState(bkeCluster) {
-		log.Error("isClusterInSpecialState func err is %s", err.Error())
-		return ctrl.Result{}, kerrors.NewAggregate(errs) // 返回聚合错误
+		log.Info(constant.ClusterManagingReason, "cluster is in special state, skip health check")
+		return ctrl.Result{RequeueAfter: periodicCheckInterval}, nil
 	}
 
 	// 后置处理未完成时，不进入健康检查，避免误判为已完成
@@ -128,8 +146,11 @@ func (e *EnsureCluster) Execute() (_ ctrl.Result, err error) {
 	}
 
 	if err = e.ensureClusterReady(); err != nil {
-		errs = append(errs, err)
-		return ctrl.Result{RequeueAfter: quickRequeueInterval}, kerrors.NewAggregate(errs)
+		interval := kube.GetHealthCheckRequeueInterval(err)
+		e.healthCheckErr = err
+		log.Warn(constant.TargetClusterNotReadyReason, "cluster health check failed, requeue after %s: %v", interval, err)
+		// 健康检查失败已写入集群健康状态，返回 nil error 才能让 RequeueAfter 严格生效。
+		return ctrl.Result{RequeueAfter: interval}, nil
 	}
 
 	// 正常状态下，定时5min 来检查重新调谐
@@ -169,13 +190,21 @@ func (e *EnsureCluster) NeedExecute(old *bkev1beta1.BKECluster, new *bkev1beta1.
 	return true
 }
 
+func (e *EnsureCluster) ExecutePostHook(err error) error {
+	defer func() { e.healthCheckErr = nil }()
+	if err == nil && e.healthCheckErr != nil {
+		// 健康检查失败不作为 reconcile error 返回，但 phase 状态仍按失败上报。
+		return e.DefaultPostHook(e.healthCheckErr)
+	}
+	return e.DefaultPostHook(err)
+}
+
 // getRemoteClient get remote cluster client
 func (e *EnsureCluster) getRemoteClient() error {
 	ctx, c, bkeCluster, _, log := e.Ctx.Untie()
 	remoteClient, err := kube.NewRemoteClientByBKECluster(ctx, c, bkeCluster)
 	if err != nil {
-		log.Error(constant.InternalErrorReason, "failed to get BKECluster %q remote cluster client", utils.ClientObjNS(bkeCluster))
-		return err
+		return fmt.Errorf("failed to get BKECluster %q remote cluster client: %w", utils.ClientObjNS(bkeCluster), err)
 	}
 	e.remoteClient = remoteClient
 	e.remoteClient.SetLogger(log.NormalLogger)
@@ -190,8 +219,7 @@ func (e *EnsureCluster) setAlertLabel() (err error) {
 	}
 	alterNode, err := e.remoteClient.ListNodes(alterNodeFilter)
 	if err != nil {
-		e.Ctx.Log.Error("SetAlertLabelFailed", "failed to list nodes, err: %v", err)
-		return errors.Errorf("failed to list nodes, err: %v", err)
+		return fmt.Errorf("failed to list nodes: %w", err)
 	}
 	if len(alterNode.Items) > 0 {
 		return
@@ -203,22 +231,26 @@ func (e *EnsureCluster) setAlertLabel() (err error) {
 
 	nodes, err := e.remoteClient.ListNodes(workerNodeFilter)
 	if err != nil {
-		e.Ctx.Log.Error("SetAlertLabelFailed", "failed to list nodes, err: %v", err)
+		e.Ctx.Log.Warn("SetAlertLabelFailed", "failed to list nodes, err: %v", err)
 		return
 	}
 	if len(nodes.Items) == 0 {
-		e.Ctx.Log.Warn("SetAlertLabelFailed", "(ignore)no worker role node found,skip set alert label")
+		e.Ctx.Log.Debug("(ignore)no worker role node found, skip set alert label")
 		return
 	}
 	availableNode := &nodes.Items[0]
-	clientSet, _ := e.remoteClient.KubeClient()
-	labelhelper.SetLabel(availableNode, labelhelper.AlertLabelKey, labelhelper.AlertLabelValue)
-	_, err = clientSet.CoreV1().Nodes().Update(e.Ctx, availableNode, metav1.UpdateOptions{})
+	clientSet := e.kubeClient()
+	err = phaseutil.RetryOnConflict(func() error {
+		latestNode, err := clientSet.CoreV1().Nodes().Get(e.Ctx, availableNode.Name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+		labelhelper.SetLabel(latestNode, labelhelper.AlertLabelKey, labelhelper.AlertLabelValue)
+		_, err = clientSet.CoreV1().Nodes().Update(e.Ctx, latestNode, metav1.UpdateOptions{})
+		return err
+	})
 	if err != nil {
-		e.Ctx.Log.Warn("SetAlertLabelFailed",
-			"(ignore)failed to set alert label to node %s, err: %v: ",
-			availableNode.Name, err)
-		return errors.Errorf("failed to set alert label to node %s, err: %v", availableNode.Name, err)
+		return fmt.Errorf("failed to set alert label to node %s, err: %w", availableNode.Name, err)
 	}
 	return
 }
@@ -228,15 +260,22 @@ func (e *EnsureCluster) setBareMetalLabel() error {
 	if err != nil {
 		return err
 	}
-	clientSet, _ := e.remoteClient.KubeClient()
+	clientSet := e.kubeClient()
 	for i := range nodes.Items {
 		node := &nodes.Items[i]
 		if !labelhelper.HasLabel(node, labelhelper.BareMetalLabelKey) {
-			labelhelper.SetLabel(node, labelhelper.BareMetalLabelKey, "true")
-			if _, err = clientSet.CoreV1().Nodes().Update(e.Ctx, node, metav1.UpdateOptions{}); err != nil {
+			if updateErr := phaseutil.RetryOnConflict(func() error {
+				latestNode, err := clientSet.CoreV1().Nodes().Get(e.Ctx, node.Name, metav1.GetOptions{})
+				if err != nil {
+					return err
+				}
+				labelhelper.SetLabel(latestNode, labelhelper.BareMetalLabelKey, "true")
+				_, err = clientSet.CoreV1().Nodes().Update(e.Ctx, latestNode, metav1.UpdateOptions{})
+				return err
+			}); updateErr != nil {
 				e.Ctx.Log.Warn("SetBareMetalLabelFailed",
 					"(ignore)failed to set baremetal label to node %s, err: %v: ",
-					node.Name, err)
+					node.Name, updateErr)
 				continue
 			}
 		}
@@ -246,41 +285,45 @@ func (e *EnsureCluster) setBareMetalLabel() error {
 
 // ensureK8sToken ensure remote cluster k8s token
 func (e *EnsureCluster) ensureK8sToken() error {
-	ctx, c, bkeCluster, scheme, log := e.Ctx.Untie()
-	secret, err := phaseutil.GetK8sTokenSecret(ctx, c, bkeCluster)
-	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
-			token, err := e.remoteClient.NewK8sToken()
-			if err = phaseutil.NewK8sTokenSecret(ctx, token, c, bkeCluster); err != nil {
-				log.Error(constant.InternalErrorReason, "failed to create BKECluster %q remote cluster k8sToken, err: %v", utils.ClientObjNS(bkeCluster), err)
+	ctx, c, bkeCluster, scheme, _ := e.Ctx.Untie()
+	var secret *v1.Secret
+	if err := phaseutil.RetryOnConflict(func() error {
+		var err error
+		secret, err = phaseutil.GetK8sTokenSecret(ctx, c, bkeCluster)
+		if err != nil {
+			return err
+		}
+		if secret.OwnerReferences == nil || len(secret.OwnerReferences) == 0 {
+			if err = controllerutil.SetControllerReference(bkeCluster, secret, scheme); err != nil {
 				return err
 			}
-			condition.ConditionMark(bkeCluster, "k8sTokenCreated", confv1beta1.ConditionTrue, "k8sTokenCreated", "")
-			return nil
-		}
-		log.Error(constant.InternalErrorReason, "failed to get BKECluster %q remote cluster k8sToken secret, err", utils.ClientObjNS(bkeCluster), err)
-		return err
-	}
-	// add owner reference
-	if secret.OwnerReferences == nil || len(secret.OwnerReferences) == 0 {
-		if err = controllerutil.SetControllerReference(bkeCluster, secret, scheme); err != nil {
-			return err
-		} else {
 			if err = c.Update(ctx, secret); err != nil {
 				return err
 			}
 		}
+		return nil
+	}); err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			token, err := e.remoteClient.NewK8sToken()
+			if err = phaseutil.NewK8sTokenSecret(ctx, token, c, bkeCluster); err != nil {
+				return fmt.Errorf("failed to create BKECluster %q remote cluster k8sToken: %w", utils.ClientObjNS(bkeCluster), err)
+			}
+			condition.ConditionMark(bkeCluster, "k8sTokenCreated", confv1beta1.ConditionTrue, "k8sTokenCreated", "")
+			return nil
+		}
+		return fmt.Errorf("failed to get BKECluster %q remote cluster k8sToken secret: %w", utils.ClientObjNS(bkeCluster), err)
 	}
 
+	if secret == nil {
+		return fmt.Errorf("k8sToken secret is nil for BKECluster %q", utils.ClientObjNS(bkeCluster))
+	}
 	if v, ok := secret.Data["token"]; !ok || string(v) == "" {
 		token, err := e.remoteClient.NewK8sToken()
 		if err != nil {
-			log.Error(constant.InternalErrorReason, "failed to create BKECluster %q remote cluster k8sToken", utils.ClientObjNS(bkeCluster))
-			return err
+			return fmt.Errorf("failed to create BKECluster %q remote cluster k8sToken: %w", utils.ClientObjNS(bkeCluster), err)
 		}
 		if err = phaseutil.NewK8sTokenSecret(ctx, token, c, bkeCluster); err != nil {
-			log.Error(constant.InternalErrorReason, "failed to create BKECluster %q remote cluster k8sToken", utils.ClientObjNS(bkeCluster))
-			return err
+			return fmt.Errorf("failed to create BKECluster %q remote cluster k8sToken: %w", utils.ClientObjNS(bkeCluster), err)
 		}
 	}
 	condition.ConditionMark(bkeCluster, "k8sTokenCreated", confv1beta1.ConditionTrue, "k8sTokenCreated", "")
@@ -290,24 +333,43 @@ func (e *EnsureCluster) ensureK8sToken() error {
 // ensureRemoteBKEConfigCM
 // Deprecated bkeconfig cm will be created before deploy addon cluster-api and bocoperator
 func (e *EnsureCluster) ensureRemoteBKEConfigCM() error {
-	ctx, c, bkeCluster, _, log := e.Ctx.Untie()
+	ctx, c, bkeCluster, _, _ := e.Ctx.Untie()
 
 	clientSet, _ := e.remoteClient.KubeClient()
 	config, err := phaseutil.GetRemoteBKEConfigCM(ctx, clientSet)
 	if err != nil {
-		log.Error(constant.InternalErrorReason,
-			"failed to get BKECluster %q remote cluster bke-config cm, err: %v",
+		return fmt.Errorf("failed to get BKECluster %q remote cluster bke-config cm: %w",
 			utils.ClientObjNS(bkeCluster), err)
-		return err
 	}
 	if config == nil {
 		if err = phaseutil.MigrateBKEConfigCM(ctx, c, clientSet); err != nil {
-			log.Error(constant.InternalErrorReason,
-				"failed to migrate BKECluster %q bke-config cm to remote cluster, err: %v",
+			return fmt.Errorf("failed to migrate BKECluster %q bke-config cm to remote cluster: %w",
 				utils.ClientObjNS(bkeCluster), err)
-			return err
 		}
 	}
+	return nil
+}
+
+// ensureRemoteHealthCheckConfigCM 在检查目标集群健康状态前同步健康检查配置。
+func (e *EnsureCluster) ensureRemoteHealthCheckConfigCM() error {
+	ctx, c, bkeCluster, _, log := e.Ctx.Untie()
+
+	clientSet, _ := e.remoteClient.KubeClient()
+	config, err := phaseutil.GetRemoteHealthCheckConfigCM(ctx, clientSet)
+	if err != nil {
+		return fmt.Errorf("failed to get BKECluster %q remote cluster health-check-config cm: %w",
+			utils.ClientObjNS(bkeCluster), err)
+	}
+	if config == nil {
+		log.Info("HealthCheckConfigSync", "remote health-check-config cm missing, migrate from management cluster")
+		if err = phaseutil.MigrateHealthCheckConfigCM(ctx, c, clientSet); err != nil {
+			return fmt.Errorf("failed to migrate BKECluster %q health-check-config cm to remote cluster: %w",
+				utils.ClientObjNS(bkeCluster), err)
+		}
+		log.Info("HealthCheckConfigSync", "remote health-check-config cm migrated successfully")
+		return nil
+	}
+	log.Info("HealthCheckConfigSync", "remote health-check-config cm already exists")
 	return nil
 }
 
@@ -364,20 +426,17 @@ func (e *EnsureCluster) handleClusterReadyPostCheck(bkeCluster *bkev1beta1.BKECl
 func (e *EnsureCluster) performHealthCheck(ctx context.Context, c client.Client, bkeCluster *bkev1beta1.BKECluster, log *bkev1beta1.BKELogger) error {
 	rawNodes, err := e.Ctx.NodeFetcher().GetBKENodesForBKECluster(e.Ctx.Context, bkeCluster)
 	if err != nil {
-		log.Error(constant.InternalErrorReason, "failed to get nodes for cluster health check: %v", err)
-		return err
+		return fmt.Errorf("failed to get nodes for cluster health check: %w", err)
 	}
 	bkeNodes := bkev1beta1.NewBKENodes(rawNodes)
 	if err := e.remoteClient.CheckClusterHealth(bkeCluster, bkeCluster.Status.KubernetesVersion, bkeNodes); err != nil {
 		bkeCluster.Status.ClusterStatus = bkev1beta1.ClusterUnhealthy
 		bkeCluster.Status.ClusterHealthState = bkev1beta1.Unhealthy
-		log.Warn(constant.ClusterUnhealthyReason, err.Error())
-		log.Error("ensureCluster CheckClusterHealth func err is %s", err.Error())
 
 		if updateErr := mergecluster.UpdateModifiedBKENodes(ctx, c, bkeNodes); updateErr != nil {
 			log.Warn(constant.InternalErrorReason, "Failed to update BKENode status: %v", updateErr)
 		}
-		return err
+		return fmt.Errorf("CheckClusterHealth failed: %w", err)
 	}
 
 	// Update BKENode status after successful health check
@@ -399,8 +458,7 @@ func (e *EnsureCluster) performHealthCheck(ctx context.Context, c client.Client,
 	bkeCluster.Status.ClusterHealthState = bkev1beta1.Healthy
 
 	if err := e.Report("", false); err != nil {
-		log.Error("ensureCluster err is %s", err.Error())
-		return err
+		return fmt.Errorf("ensureCluster report failed: %w", err)
 	}
 	return nil
 }
@@ -432,13 +490,11 @@ func (e *EnsureCluster) ensureAgentStatus() error {
 	if bkeCluster.Status.AgentStatus.Replies != 0 {
 		err, _, failedNodes := phaseutil.PingBKEAgent(ctx, c, scheme, bkeCluster)
 		if err != nil {
-			log.Error(constant.BKEAgentNotReadyReason, "Failed to ping BKEAgent, err: %v", err)
+			return fmt.Errorf("failed to ping BKEAgent: %w", err)
 		}
 
 		if len(failedNodes) != 0 {
-			errInfo := fmt.Sprintf("Failed to ping bkeagent on flow Nodes: %v", failedNodes)
-			log.Error(constant.BKEAgentNotReadyReason, errInfo)
-			return errors.New(errInfo)
+			return fmt.Errorf("failed to ping bkeagent on flow Nodes: %v", failedNodes)
 		}
 		log.Info(constant.BKEAgentReadyReason, "BKEAgent is ready")
 		return nil
@@ -451,17 +507,16 @@ func (e *EnsureCluster) setNodeLabel() error {
 	globalLabels := e.Ctx.BKECluster.Spec.ClusterConfig.Cluster.Labels
 	allNodes, err := e.Ctx.GetNodes()
 	if err != nil {
-		return fmt.Errorf("failed to get nodes: %v", err)
+		return fmt.Errorf("failed to get nodes: %w", err)
 	}
 	nodes, err := e.remoteClient.ListNodes(nil)
 	if err != nil {
-		e.Ctx.Log.Error("GetNodeLabelFailed", "failed to list nodes, err: %v", err)
-		return fmt.Errorf("failed to list nodes: %v", err)
+		return fmt.Errorf("failed to list nodes: %w", err)
 	}
 
 	setNodeLablesMap := e.buildNodeLabelsMap(globalLabels, allNodes)
 
-	clientSet, _ := e.remoteClient.KubeClient()
+	clientSet := e.kubeClient()
 	for i := range nodes.Items {
 		node := &nodes.Items[i]
 		if err = e.applyLabelsToNode(clientSet, node, setNodeLablesMap); err != nil {
@@ -503,7 +558,7 @@ func mergeLabels(nodeLabels []confv1beta1.Label, globalLabels []confv1beta1.Labe
 
 // applyLabelsToNode applies the labels to a given node if necessary.
 func (e *EnsureCluster) applyLabelsToNode(
-	clientSet *kubernetes.Clientset,
+	clientSet kubernetes.Interface,
 	node *v1.Node,
 	setNodeLabelsMap map[string]map[string]string,
 ) error {
@@ -522,7 +577,7 @@ func getNodeLabels(nodeName string, setNodeLabelsMap map[string]map[string]strin
 
 // applyNecessaryLabels checks and applies labels to the node if necessary.
 func (e *EnsureCluster) applyNecessaryLabels(
-	clientSet *kubernetes.Clientset,
+	clientSet kubernetes.Interface,
 	node *v1.Node,
 	labels map[string]string,
 ) error {
@@ -536,7 +591,7 @@ func (e *EnsureCluster) applyNecessaryLabels(
 	return nil
 }
 
-func (e *EnsureCluster) waitLabelReady(clientSet *kubernetes.Clientset, node *v1.Node, k, v string) error {
+func (e *EnsureCluster) waitLabelReady(clientSet kubernetes.Interface, node *v1.Node, k, v string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 
@@ -544,9 +599,8 @@ func (e *EnsureCluster) waitLabelReady(clientSet *kubernetes.Clientset, node *v1
 		// Get the latest version of the node
 		latestNode, err := clientSet.CoreV1().Nodes().Get(e.Ctx, node.Name, metav1.GetOptions{})
 		if err != nil {
-			// Log the error and retry
-			e.Ctx.Log.Error("GetNodeError", "failed to get node %s: %v", node.Name, err)
-			return false, errors.Errorf("failed to get node %s: %v", node.Name, err)
+			// retry
+			return false, fmt.Errorf("failed to get node %s: %w", node.Name, err)
 		}
 
 		// Create a deep copy of the node to avoid modifying the original object
@@ -561,7 +615,7 @@ func (e *EnsureCluster) waitLabelReady(clientSet *kubernetes.Clientset, node *v1
 		})
 
 		if err != nil {
-			e.Ctx.Log.Error("SetNodeLabelConFailed", "failed to set label %s=%s on node %s, error: %v", k, v, node.Name, err)
+			e.Ctx.Log.Warn("SetNodeLabelConFailed", "failed to set label %s=%s on node %s, error: %v", k, v, node.Name, err)
 			return false, nil
 		}
 
@@ -571,7 +625,7 @@ func (e *EnsureCluster) waitLabelReady(clientSet *kubernetes.Clientset, node *v1
 	}, ctx.Done())
 
 	if err != nil {
-		return errors.Errorf("failed to set label %s=%s on node %s after retries: %v", k, v, node.Name, err)
+		return fmt.Errorf("failed to set label %s=%s on node %s after retries: %w", k, v, node.Name, err)
 	}
 
 	return nil

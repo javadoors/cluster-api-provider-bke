@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -14,6 +14,7 @@ package v1beta1
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
@@ -35,12 +36,14 @@ var (
 	ExpectMinK8sVersion, _ = version.ParseMajorMinorPatch("v1.27.0")
 )
 
-// BKELogger is a wrapper of zap.SugaredLogger and record.EventRecorder
+// BKELogger is a wrapper of zap.SugaredLogger and record.EventRecorder.
 // +kubebuilder:object:generate:=false
 type BKELogger struct {
 	NormalLogger *log.Logger
 	Recorder     record.EventRecorder
 	EventBinder  runtime.Object
+
+	mu sync.RWMutex
 }
 
 // NewBKELogger creates a new BKE logger with the specified parameters
@@ -52,12 +55,31 @@ func NewBKELogger(log *log.Logger, recorder record.EventRecorder, binder runtime
 	}
 }
 
+// SetNormalLogger safely updates the underlying normal logger.
+func (logger *BKELogger) SetNormalLogger(l *log.Logger) {
+	if logger == nil {
+		return
+	}
+	logger.mu.Lock()
+	defer logger.mu.Unlock()
+	logger.NormalLogger = l
+}
+
+func (logger *BKELogger) getNormalLogger() *log.Logger {
+	if logger == nil {
+		return nil
+	}
+	logger.mu.RLock()
+	defer logger.mu.RUnlock()
+	return logger.NormalLogger
+}
+
 func (logger *BKELogger) Info(reason, msg string, args ...interface{}) {
 	tameStamp := time.Now().Unix()
 	msg = fmt.Sprintf("(%d) %s", tameStamp, msg)
 	logger.Recorder.AnnotatedEventf(logger.EventBinder, annotation.BKENormalEventAnnotation(), corev1.EventTypeNormal, reason, msg, args...)
-	if logger.NormalLogger != nil {
-		logger.NormalLogger.Infof(msg, args...)
+	if nl := logger.getNormalLogger(); nl != nil {
+		nl.Infof(msg, args...)
 		return
 	}
 	log.Infof(msg, args...)
@@ -67,8 +89,8 @@ func (logger *BKELogger) Error(reason, msg string, args ...interface{}) {
 	tameStamp := time.Now().Unix()
 	msg = fmt.Sprintf("(%d) %s", tameStamp, msg)
 	logger.Recorder.AnnotatedEventf(logger.EventBinder, annotation.BKENormalEventAnnotation(), corev1.EventTypeWarning, reason, msg, args...)
-	if logger.NormalLogger != nil {
-		logger.NormalLogger.Errorf(msg, args...)
+	if nl := logger.getNormalLogger(); nl != nil {
+		nl.Errorf(msg, args...)
 		return
 	}
 	log.Errorf(msg, args...)
@@ -78,8 +100,8 @@ func (logger *BKELogger) Warn(reason, msg string, args ...interface{}) {
 	tameStamp := time.Now().Unix()
 	msg = fmt.Sprintf("(%d) %s", tameStamp, msg)
 	logger.Recorder.AnnotatedEventf(logger.EventBinder, annotation.BKENormalEventAnnotation(), corev1.EventTypeWarning, reason, msg, args...)
-	if logger.NormalLogger != nil {
-		logger.NormalLogger.Warnf(msg, args...)
+	if nl := logger.getNormalLogger(); nl != nil {
+		nl.Warnf(msg, args...)
 		return
 	}
 	log.Warnf(msg, args...)
@@ -89,16 +111,16 @@ func (logger *BKELogger) Finish(reason, msg string, args ...interface{}) {
 	tameStamp := time.Now().Unix()
 	msg = fmt.Sprintf("(%d) %s", tameStamp, msg)
 	logger.Recorder.AnnotatedEventf(logger.EventBinder, annotation.BKEFinishEventAnnotation(), corev1.EventTypeNormal, reason, msg, args...)
-	if logger.NormalLogger != nil {
-		logger.NormalLogger.Infof(msg, args...)
+	if nl := logger.getNormalLogger(); nl != nil {
+		nl.Infof(msg, args...)
 		return
 	}
 	log.Infof(msg, args...)
 }
 
 func (logger *BKELogger) Debug(msg string, args ...interface{}) {
-	if logger.NormalLogger != nil {
-		logger.NormalLogger.Debugf(msg, args...)
+	if nl := logger.getNormalLogger(); nl != nil {
+		nl.Debugf(msg, args...)
 		return
 	}
 	log.Debugf(msg, args...)
@@ -131,6 +153,12 @@ const (
 	TypeOfManagementClusterGuessCondition         confv1beta1.ClusterConditionType = "TypeOfManagementClusterGuess"
 
 	InternalSpecChangeCondition confv1beta1.ClusterConditionType = "InternalSpecChange"
+
+	// ManualInterventionRequiredCondition indicates that manual intervention is required
+	// to resolve a failure that automatic retries cannot fix.
+	// When True, the Message field contains a description of the issue and
+	// actionable guidance for the operator.
+	ManualInterventionRequiredCondition confv1beta1.ClusterConditionType = "ManualInterventionRequired"
 )
 
 const (

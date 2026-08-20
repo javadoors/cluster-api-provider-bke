@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -25,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/kubernetes"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/cluster-api/util/conditions"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -48,6 +49,7 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/mergecluster"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/statusmanage"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/annotation"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/clusterutil"
@@ -58,8 +60,6 @@ import (
 const (
 	// EnsureClusterManageName is the name of the EnsureClusterManage phase
 	EnsureClusterManageName confv1beta1.BKEClusterPhase = "EnsureClusterManage"
-
-	manageClusterEtcdCertDirAnnotationKey = "etcd-cert-dir"
 )
 
 const (
@@ -92,13 +92,12 @@ const (
 	launcherDaemonSetName = "bkeagent-launcher"
 	// launcherNamespace represents daemonset launcher namespace
 	launcherNamespace = "kube-system"
-	// waitTimeout represents the timeout duration for pod is running
-	waitTimeout = 2 * time.Minute
 )
 
 type EnsureClusterManage struct {
 	phaseframe.BasePhase
 	remoteClient kube.RemoteKubeClient
+	mockClient   kubernetes.Interface
 }
 
 // CreateBaseCommandParams 包含 createBaseCommand 函数的参数
@@ -116,6 +115,17 @@ type CreateBaseCommandParams struct {
 func NewEnsureClusterManage(ctx *phaseframe.PhaseContext) phaseframe.Phase {
 	base := phaseframe.NewBasePhase(ctx, EnsureClusterManageName)
 	return &EnsureClusterManage{BasePhase: base}
+}
+
+// kubeClient returns the kubernetes clientset used to query the target cluster.
+// In production this is obtained from the remote client; tests may inject a
+// fake clientset via mockClient. Behavior is identical when mockClient is nil.
+func (e *EnsureClusterManage) kubeClient() kubernetes.Interface {
+	if e.mockClient != nil {
+		return e.mockClient
+	}
+	cs, _ := e.remoteClient.KubeClient()
+	return cs
 }
 
 func (e *EnsureClusterManage) Execute() (ctrl.Result, error) {
@@ -197,8 +207,7 @@ func (e *EnsureClusterManage) collectBaseInfo() error {
 	collectRes, warns, errs := e.remoteClient.Collect()
 	if len(errs) > 0 {
 		err := kerrors.NewAggregate(errs)
-		log.Error(constant.CollectClusterInfoFailedReason, "failed to collect cluster info for BKECluster %s: %v", utils.ClientObjNS(bkeCluster), err)
-		return err
+		return fmt.Errorf("failed to collect cluster info for BKECluster %s: %w", utils.ClientObjNS(bkeCluster), err)
 	}
 	if len(warns) > 0 {
 		for _, warn := range warns {
@@ -208,7 +217,7 @@ func (e *EnsureClusterManage) collectBaseInfo() error {
 
 	patchFunc := func(bkeCluster *bkev1beta1.BKECluster) {
 		clusterutil.MarkClusterBaseInfoCollected(bkeCluster)
-		annotation.SetAnnotation(bkeCluster, manageClusterEtcdCertDirAnnotationKey, collectRes.EtcdCertificatesDir)
+		annotation.SetAnnotation(bkeCluster, annotation.ManageClusterEtcdCertDirAnnotationKey, collectRes.EtcdCertificatesDir)
 		bkeCluster.Spec.ClusterConfig.Cluster.Networking = collectRes.Networking
 		bkeCluster.Spec.ControlPlaneEndpoint = collectRes.ControlPlaneEndpoint
 		bkeCluster.Spec.ClusterConfig.Cluster.KubernetesVersion = collectRes.KubernetesVersion
@@ -233,7 +242,7 @@ func (e *EnsureClusterManage) pushAgent() error {
 
 	nodes, err := e.Ctx.GetNodes()
 	if err != nil {
-		return fmt.Errorf("failed to get nodes: %v", err)
+		return fmt.Errorf("failed to get nodes: %w", err)
 	}
 
 	if !e.checkAgentNeedPush(nodes) {
@@ -245,39 +254,14 @@ func (e *EnsureClusterManage) pushAgent() error {
 	localKubeConfig, err := phaseutil.GetLocalKubeConfig(ctx, c)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			log.Error(constant.BKEAgentNotReadyReason, "Local kubeconfig secret not found")
-			return errors.Errorf("local kubeconfig secret not found")
+			return fmt.Errorf("local kubeconfig secret not found")
 		}
-		log.Error(constant.BKEAgentNotReadyReason, "Failed to get local kubeconfig secret, err: %v", err)
-		return errors.Errorf("failed to get local kubeconfig secret, err: %v", err)
+		return fmt.Errorf("failed to get local kubeconfig secret: %w", err)
 	}
 
-	// get bkeagent image from custom extra
-	cfg := bkeinit.BkeConfig(*bkeCluster.Spec.ClusterConfig)
-	lancherImage := imagehelper.GetFullImageName(cfg.ImageFuyaoRepo(), "bkeagent-launcher", "1.0.1")
-	if v, ok := cfg.CustomExtra["bkeagent-launcher-image"]; ok && v != "" {
-		lancherImage = v
-	}
-	log.Info(constant.ClusterManagingReason, "BKEAgent launcher image: %s", lancherImage)
-	log.Info(constant.ClusterManagingReason, "ntpserver: %s", bkeCluster.Spec.ClusterConfig.Cluster.NTPServer)
-	log.Info(constant.ClusterManagingReason, "agentHealthPort: %s", bkeCluster.Spec.ClusterConfig.Cluster.AgentHealthPort)
-
-	//push agent (use bkeagent launcher daemonset to push agent)
-	launcherAddonT := &bkeaddon.AddonTransfer{
-		Addon: &v1beta1.Product{
-			Name:    "bkeagent",
-			Version: "latest",
-			Param: map[string]string{
-				"clusterName":     bkeCluster.Name,
-				"ntpServer":       bkeCluster.Spec.ClusterConfig.Cluster.NTPServer,
-				"agentHealthPort": bkeCluster.Spec.ClusterConfig.Cluster.AgentHealthPort,
-				"debug":           "true",
-				"kubeconfig":      string(localKubeConfig),
-				"launcherImage":   lancherImage,
-			},
-			Block: true,
-		},
-		Operate: bkeaddon.CreateAddon,
+	launcherAddonT, err := e.createLauncherAddon(bkeCluster, localKubeConfig, log)
+	if err != nil {
+		return err
 	}
 
 	if err = e.remoteClient.InstallAddon(bkeCluster, launcherAddonT, nil, nil, nodes); err != nil {
@@ -286,12 +270,16 @@ func (e *EnsureClusterManage) pushAgent() error {
 		return err
 	}
 
-	// Wait for launcher pods to complete their work before deleting DaemonSet
-	// This ensures launcher has enough time to stop old bkeagent, start new bkeagent, and start HTTP server
-	log.Info(constant.ClusterManagingReason, "waiting for launcher pods to complete agent deployment")
-	if err := e.waitForLauncherPodsComplete(ctx, bkeCluster); err != nil {
-		log.Warn(constant.ReconcileErrorReason, "wait for launcher pods complete failed (continue anyway): %v", err)
+	// Wait for all launcher pods Ready=True (readinessProbe /readyz => bkeagent active) before deleting DaemonSet
+	log.Info(constant.ClusterManagingReason, "waiting for launcher pods to be Ready before deleting DaemonSet")
+	readyNodeNames, waitErr := e.waitForLauncherPodsComplete(ctx, bkeCluster)
+	if waitErr != nil {
+		log.Warn(constant.ReconcileErrorReason, "wait for launcher pods Ready failed (continue anyway): %v", waitErr)
 		// Continue even if wait fails, as launcher may have already completed
+	}
+	readyNodeSet := make(map[string]bool)
+	for _, name := range readyNodeNames {
+		readyNodeSet[name] = true
 	}
 
 	// delete launcher daemonset
@@ -300,9 +288,14 @@ func (e *EnsureClusterManage) pushAgent() error {
 		log.Warn(constant.ReconcileErrorReason, "(Ignore)Failed to delete bke agent launcher daemonset, err: %v", err)
 	}
 
-	// mark node agent pushed flag
+	// mark node agent pushed flag — only for nodes where launcher pod was actually Ready and not NeedSkip
 	nf := e.Ctx.NodeFetcher()
-	for _, node := range nodes {
+	activeNodes := e.filterNeedSkipNodes(nodes)
+	for _, node := range activeNodes {
+		if !readyNodeSet[node.Hostname] {
+			log.Warn(constant.InternalErrorReason, "Skip PushedFlag for node %s (%s): launcher pod not Ready", node.IP, node.Hostname)
+			continue
+		}
 		if err := nf.MarkNodeStateFlagForCluster(ctx, bkeCluster, node.IP, bkev1beta1.NodeAgentPushedFlag); err != nil {
 			log.Warn(constant.InternalErrorReason, "Failed to mark node state flag for %s: %v", node.IP, err)
 		}
@@ -310,8 +303,7 @@ func (e *EnsureClusterManage) pushAgent() error {
 
 	// wait concurrently for pushed flag to be visible for each marked node before pinging
 	if err := e.waitAgentPushedFlagVisible(ctx, nf, bkeCluster, nodes, log); err != nil {
-		log.Error(constant.InternalErrorReason, "%v", err)
-		return err
+		return fmt.Errorf("%w", err)
 	}
 
 	// step 5 ping agent
@@ -331,6 +323,33 @@ func (e *EnsureClusterManage) pushAgent() error {
 	condition.ConditionMark(bkeCluster, bkev1beta1.BKEAgentCondition, confv1beta1.ConditionTrue, constant.BKEAgentReadyReason, "")
 
 	return nil
+}
+
+// createLauncherAddon builds the launcher addon transfer for bkeagent deployment.
+func (e *EnsureClusterManage) createLauncherAddon(bkeCluster *bkev1beta1.BKECluster, localKubeConfig []byte, log *bkev1beta1.BKELogger) (*bkeaddon.AddonTransfer, error) {
+	cfg := bkeinit.BkeConfig(*bkeCluster.Spec.ClusterConfig)
+	lancherImage := imagehelper.GetFullImageName(cfg.ImageFuyaoRepo(), "bkeagent-launcher", "1.0.1")
+	if v, ok := cfg.CustomExtra["bkeagent-launcher-image"]; ok && v != "" {
+		lancherImage = v
+	}
+	log.Info(constant.ClusterManagingReason, "BKEAgent launcher image: %s, ntpserver: %s, agentHealthPort: %s", lancherImage, bkeCluster.Spec.ClusterConfig.Cluster.NTPServer, bkeCluster.Spec.ClusterConfig.Cluster.AgentHealthPort)
+
+	return &bkeaddon.AddonTransfer{
+		Addon: &v1beta1.Product{
+			Name:    "bkeagent",
+			Version: "latest",
+			Param: map[string]string{
+				"clusterName":     bkeCluster.Name,
+				"ntpServer":       bkeCluster.Spec.ClusterConfig.Cluster.NTPServer,
+				"agentHealthPort": bkeCluster.Spec.ClusterConfig.Cluster.AgentHealthPort,
+				"debug":           "true",
+				"kubeconfig":      string(localKubeConfig),
+				"launcherImage":   lancherImage,
+			},
+			Block: true,
+		},
+		Operate: bkeaddon.CreateAddon,
+	}, nil
 }
 
 func (e *EnsureClusterManage) waitAgentPushedFlagVisible(
@@ -365,7 +384,7 @@ func (e *EnsureClusterManage) collectAgentInfo() error {
 	}
 	allNodes, err := e.Ctx.GetNodes()
 	if err != nil {
-		return fmt.Errorf("failed to get nodes: %v", err)
+		return fmt.Errorf("failed to get nodes: %w", err)
 	}
 	bkeNodes := bkenode.Nodes(allNodes)
 	if len(bkeNodes) == 0 {
@@ -376,7 +395,7 @@ func (e *EnsureClusterManage) collectAgentInfo() error {
 	}
 
 	k8sCertDir := bkeCluster.Spec.ClusterConfig.Cluster.CertificatesDir
-	etcdCertDir, ok := annotation.HasAnnotation(bkeCluster, manageClusterEtcdCertDirAnnotationKey)
+	etcdCertDir, ok := annotation.HasAnnotation(bkeCluster, annotation.ManageClusterEtcdCertDirAnnotationKey)
 	if !ok {
 		etcdCertDir = k8sCertDir
 	}
@@ -390,22 +409,20 @@ func (e *EnsureClusterManage) collectAgentInfo() error {
 		K8sCertificatesDir:  k8sCertDir,
 	}
 	if err := collectCommand.New(); err != nil {
-		log.Error(constant.CommandCreateFailedReason, "failed to collect cert for cluster %s: %v", bkeCluster.Name, err)
-		return err
+		return fmt.Errorf("failed to collect cert for cluster %s: %w", bkeCluster.Name, err)
 	}
 	err, _, failedNode := collectCommand.Wait()
 	if err != nil {
-		log.Error(constant.CommandWaitFailedReason, "failed to wait for collect cert for cluster %s: %v", bkeCluster.Name, err)
-		return err
+		return fmt.Errorf("failed to wait for collect cert for cluster %s: %w", bkeCluster.Name, err)
 	}
 	if len(failedNode) > 0 {
 		commandErrs, err := phaseutil.LogCommandFailed(*collectCommand.Command, failedNode, log, constant.CommandExecFailedReason)
 		phaseutil.MarkNodeStatusByCommandErrs(ctx, c, bkeCluster, commandErrs)
-		return errors.Errorf("failed to collect cert for cluster %s: %v, err: %v", bkeCluster.Name, failedNode, err)
+		return fmt.Errorf("failed to collect cert for cluster %s: %v, err: %w", bkeCluster.Name, failedNode, err)
 	}
 
 	if err = e.getContainerRuntimeConfigFromCollectCommand(collectCommand.Command); err != nil {
-		return errors.Errorf("failed to get container runtime config from collect command: %v", err)
+		return fmt.Errorf("failed to get container runtime config from collect command: %w", err)
 	}
 
 	log.Info(constant.CollectClusterInfoSucceedReason, "finish collect cluster info")
@@ -431,11 +448,11 @@ func (e *EnsureClusterManage) reconcileFakeBootstrap() error {
 	// 使得结束伪引导后该集群的机器可以被当前集群管理
 
 	if err := e.fakeBootstrapMaster(); err != nil {
-		return errors.Errorf("failed to fake bootstrap master: %v", err)
+		return fmt.Errorf("failed to fake bootstrap master: %w", err)
 	}
 
 	if err := e.fakeBootstrapWorker(); err != nil {
-		return errors.Errorf("failed to fake bootstrap worker: %v", err)
+		return fmt.Errorf("failed to fake bootstrap worker: %w", err)
 	}
 
 	return nil
@@ -445,7 +462,7 @@ func (e *EnsureClusterManage) fakeBootstrapMaster() error {
 	ctx, c, bkeCluster, _, log := e.Ctx.Untie()
 	allNodes, err := e.Ctx.GetNodes()
 	if err != nil {
-		return fmt.Errorf("failed to get nodes: %v", err)
+		return fmt.Errorf("failed to get nodes: %w", err)
 	}
 	bkeNodes := bkenode.Nodes(allNodes)
 
@@ -481,8 +498,7 @@ func (e *EnsureClusterManage) updateKubeadmControlPlaneReplicas(ctx context.Cont
 	if err != nil {
 		return err
 	}
-	kcp.Spec.Replicas = &replicas
-	return phaseutil.ResumeClusterAPIObj(ctx, c, kcp)
+	return phaseutil.ResumeAndUpdateKubeadmControlPlaneReplicas(ctx, c, kcp, replicas)
 }
 
 // waitForClusterInfrastructureReady 等待集群基础设施就绪
@@ -542,7 +558,7 @@ func (e *EnsureClusterManage) fakeBootstrapWorker() error {
 	ctx, c, bkeCluster, _, log := e.Ctx.Untie()
 	allNodes, err := e.Ctx.GetNodes()
 	if err != nil {
-		return fmt.Errorf("failed to get nodes: %v", err)
+		return fmt.Errorf("failed to get nodes: %w", err)
 	}
 	bkeNodes := bkenode.Nodes(allNodes)
 
@@ -563,8 +579,7 @@ func (e *EnsureClusterManage) doFakeBootstrapWorker(ctx context.Context, c clien
 	if err != nil {
 		return err
 	}
-	md.Spec.Replicas = &expectMDReplicas
-	if err = phaseutil.ResumeClusterAPIObj(ctx, c, md); err != nil {
+	if err = phaseutil.ResumeAndUpdateMachineDeploymentReplicas(ctx, c, md, expectMDReplicas); err != nil {
 		return err
 	}
 
@@ -577,7 +592,7 @@ func (e *EnsureClusterManage) doFakeBootstrapWorker(ctx context.Context, c clien
 		return waitForNodesBootstrap(ctx, c, bkeCluster, workerNodes, successJoinWorkerNodes, expectMDReplicas, log) == nil, nil
 	}, ctxWithTimeout.Done())
 	if err != nil {
-		return errors.Errorf("failed to wait for cluster %s worker nodes fake bootstrap ready: %v", utils.ClientObjNS(e.Ctx.BKECluster), err)
+		return fmt.Errorf("failed to wait for cluster %s worker nodes fake bootstrap ready: %w", utils.ClientObjNS(e.Ctx.BKECluster), err)
 	}
 
 	if err := e.Ctx.RefreshCtxBKECluster(); err != nil {
@@ -594,10 +609,10 @@ func (e *EnsureClusterManage) compatibilityPatch() error {
 	ctx, _, _, _, log := e.Ctx.Untie()
 	allNodes, err := e.Ctx.GetNodes()
 	if err != nil {
-		return fmt.Errorf("failed to get nodes: %v", err)
+		return fmt.Errorf("failed to get nodes: %w", err)
 	}
 	bkeNodes := bkenode.Nodes(allNodes)
-	clientSet, _ := e.remoteClient.KubeClient()
+	clientSet := e.kubeClient()
 	etcdPods, err := clientSet.CoreV1().Pods(metav1.NamespaceSystem).List(ctx, metav1.ListOptions{
 		LabelSelector: "component=etcd",
 	})
@@ -616,12 +631,16 @@ func (e *EnsureClusterManage) compatibilityPatch() error {
 		if _, ok := annotation.HasAnnotation(&pod, annotation.EtcdAdvertiseClientUrlsAnnotationKey); ok {
 			continue
 		}
-		annotation.SetAnnotation(
-			&pod,
-			annotation.EtcdAdvertiseClientUrlsAnnotationKey,
-			phaseutil.GetClientURLByIP(nodes[0].IP))
-		// update etcd pod
-		_, err = clientSet.CoreV1().Pods(metav1.NamespaceSystem).Update(ctx, &pod, metav1.UpdateOptions{})
+		annotateValue := phaseutil.GetClientURLByIP(nodes[0].IP)
+		err = phaseutil.RetryOnConflict(func() error {
+			latestPod, err := clientSet.CoreV1().Pods(metav1.NamespaceSystem).Get(ctx, pod.Name, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			annotation.SetAnnotation(latestPod, annotation.EtcdAdvertiseClientUrlsAnnotationKey, annotateValue)
+			_, err = clientSet.CoreV1().Pods(metav1.NamespaceSystem).Update(ctx, latestPod, metav1.UpdateOptions{})
+			return err
+		})
 		if err != nil {
 			log.Warn(constant.ClusterManageWarningReason, "failed to update etcd pod %s: %v", utils.ClientObjNS(&pod), err)
 			failedUpdateEtcdNode = append(failedUpdateEtcdNode, nodeName)
@@ -635,13 +654,19 @@ func (e *EnsureClusterManage) compatibilityPatch() error {
 	return nil
 }
 
-// waitForLauncherPodsComplete waits for launcher pods to complete their work
-// Launcher pods need time to: stop old bkeagent, prepare files, start new bkeagent, and start HTTP server
-func (e *EnsureClusterManage) waitForLauncherPodsComplete(ctx context.Context, bkeCluster *bkev1beta1.BKECluster) error {
+// waitForLauncherPodsComplete waits until all launcher DaemonSet pods report Ready=True.
+// Ready depends on the pod readinessProbe (typically /readyz), which verifies host bkeagent is active.
+// This is stricter than Phase=Running alone, which can become true before systemctl start finishes.
+// Returns the node names (pod.Spec.NodeName) of pods that are Ready, so callers can selectively
+// mark PushedFlag only for nodes where the launcher actually succeeded.
+func (e *EnsureClusterManage) waitForLauncherPodsComplete(ctx context.Context, bkeCluster *bkev1beta1.BKECluster) ([]string, error) {
 	_, _, _, _, log := e.Ctx.Untie()
-	clientSet, _ := e.remoteClient.KubeClient()
+	clientSet := e.kubeClient()
 
-	log.Info(constant.ClusterManagingReason, "waiting for launcher pods to complete agent deployment (timeout: %v)", waitTimeout)
+	waitTimeout := phaseutil.GetLauncherWaitTimeout(bkeCluster)
+	log.Info(constant.ClusterManagingReason, "waiting for launcher pods to be Ready (timeout: %v)", waitTimeout)
+
+	var readyNodeNames []string
 
 	err := wait.PollUntilContextTimeout(ctx, pollInterval, waitTimeout, true, func(ctx context.Context) (bool, error) {
 		ds, err := clientSet.AppsV1().DaemonSets(launcherNamespace).Get(ctx, launcherDaemonSetName, metav1.GetOptions{})
@@ -652,11 +677,20 @@ func (e *EnsureClusterManage) waitForLauncherPodsComplete(ctx context.Context, b
 			return false, err
 		}
 
-		if ds.Status.DesiredNumberScheduled == 0 {
+		desired := ds.Status.DesiredNumberScheduled
+		if desired == 0 {
 			return false, nil
 		}
 
-		selector, _ := metav1.LabelSelectorAsSelector(ds.Spec.Selector)
+		// Prefer DaemonSet NumberReady so we do not treat a partial schedule as success.
+		if ds.Status.NumberReady < desired {
+			return false, nil
+		}
+
+		selector, err := metav1.LabelSelectorAsSelector(ds.Spec.Selector)
+		if err != nil {
+			return false, err
+		}
 		pods, err := clientSet.CoreV1().Pods(launcherNamespace).List(ctx, metav1.ListOptions{
 			LabelSelector: selector.String(),
 		})
@@ -664,55 +698,43 @@ func (e *EnsureClusterManage) waitForLauncherPodsComplete(ctx context.Context, b
 			return false, err
 		}
 
-		if len(pods.Items) == 0 {
+		readyNodeNames = nil
+		readyCount := int32(0)
+		for _, pod := range pods.Items {
+			if pod.DeletionTimestamp != nil {
+				continue
+			}
+			if !phaseutil.PodIsReady(pod) {
+				return false, nil
+			}
+			readyCount++
+			readyNodeNames = append(readyNodeNames, pod.Spec.NodeName)
+		}
+		if readyCount < desired {
 			return false, nil
 		}
 
-		allRunning := true
-		for _, pod := range pods.Items {
-			if pod.Status.Phase != "Running" {
-				allRunning = false
-				break
-			}
-
-			if pod.Status.StartTime != nil {
-				runningDuration := time.Since(pod.Status.StartTime.Time)
-				if runningDuration < 10*time.Second {
-					allRunning = false
-					break
-				}
-			} else {
-				allRunning = false
-				break
-			}
-		}
-
-		if allRunning {
-			log.Info(constant.ClusterManagingReason, "all launcher pods are running and have been running for sufficient time")
-			return true, nil
-		}
-
-		return false, nil
+		log.Info(constant.ClusterManagingReason, "all launcher pods are Ready (%d/%d)", readyCount, desired)
+		return true, nil
 	})
 
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, wait.ErrWaitTimeout) {
-			log.Warn(constant.ClusterManagingReason, "timeout waiting for launcher pods to complete, but continuing anyway")
-			return nil
+			log.Warn(constant.ClusterManagingReason, "timeout waiting for launcher pods to be Ready, but continuing anyway")
+			return readyNodeNames, nil
 		}
-		return err
+		return nil, err
 	}
 
 	log.Info(constant.ClusterManagingReason, "launcher pods have completed their work")
-	return nil
+	return readyNodeNames, nil
 }
 
 func (e *EnsureClusterManage) getRemoteClient() error {
 	ctx, c, bkeCluster, _, log := e.Ctx.Untie()
 	remoteClient, err := kube.NewRemoteClientByBKECluster(ctx, c, bkeCluster)
 	if err != nil {
-		log.Error(constant.InternalErrorReason, "failed to get BKECluster %q remote cluster client", utils.ClientObjNS(bkeCluster))
-		return err
+		return fmt.Errorf("failed to get BKECluster %q remote cluster client: %w", utils.ClientObjNS(bkeCluster), err)
 	}
 	e.remoteClient = remoteClient
 	e.remoteClient.SetBKELogger(log)
@@ -725,14 +747,15 @@ func (e *EnsureClusterManage) getRemoteClient() error {
 func (e *EnsureClusterManage) bocloudClusterManagePrepare() error {
 	allNodes, err := e.Ctx.GetNodes()
 	if err != nil {
-		return fmt.Errorf("failed to get nodes: %v", err)
+		return fmt.Errorf("failed to get nodes: %w", err)
 	}
-	bkeNodes := bkenode.Nodes(allNodes)
+	// Filter out NeedSkip nodes so backup/cert distribution only target active nodes
+	bkeNodes := e.filterNeedSkipNodes(bkenode.Nodes(allNodes))
 	// todo  reconcile load balancer or other
 
 	masterNode := bkeNodes.Master()
 	//补全证书
-	certsGenerator := certs.NewKubernetesCertGenerator(e.Ctx.Context, e.Ctx.Client, e.Ctx.BKECluster)
+	certsGenerator := certs.NewKubernetesCertGeneratorWithCache(e.Ctx.Context, e.Ctx.Client, e.Ctx.Cache, e.Ctx.BKECluster)
 	certsGenerator.SetNodes(bkeNodes)
 	certsGenerator.ConfigKubeConfig(net.JoinHostPort(masterNode[0].IP, "6443"))
 	if err := certsGenerator.LookUpOrGenerate(); err != nil {
@@ -933,14 +956,15 @@ func (e *EnsureClusterManage) backupBocloudClusterData(bkeNodes bkenode.Nodes) e
 	}
 	err, _, failed := backupCommand.Wait()
 	if err != nil {
-		log.Error(constant.CommandWaitFailedReason, "failed to wait command %q, err: %v", backupCommandName, err)
-		return err
+		return fmt.Errorf("failed to wait command %q: %w", backupCommandName, err)
 	}
 	if failed != nil || len(failed) > 0 {
-		commandErrs, err := phaseutil.LogCommandFailed(*backupCommand.Command, failed, log, "BackupBocloudClusterDataFailed")
+		commandErrs, cmdErr := phaseutil.LogCommandFailed(*backupCommand.Command, failed, log, "BackupBocloudClusterDataFailed")
 		phaseutil.MarkNodeStatusByCommandErrs(ctx, c, bkeCluster, commandErrs)
-		log.Error(constant.CommandExecFailedReason, "failed to backup on flow master node %q，err: %v", failed, err)
-		return errors.Errorf("failed to distribute certificate on flow master node %q，err: %v", failed, err)
+		if cmdErr == nil {
+			cmdErr = fmt.Errorf("command timed out on nodes %q", failed)
+		}
+		return fmt.Errorf("failed to backup bocloud cluster data on nodes %q: %w", failed, cmdErr)
 	}
 	condition.ConditionMark(bkeCluster, bkev1beta1.BocloudClusterDataBackupCondition, confv1beta1.ConditionTrue, constant.BocloudClusterDataBackupSuccessReason, "backup bocloud cluster data success")
 	log.Info(constant.CommandExecSuccessReason, "backup bocloud cluster data success")
@@ -995,8 +1019,7 @@ func (e *EnsureClusterManage) initBocloudClusterEnv() error {
 
 	err, success, failed := envCommand.Wait()
 	if err != nil {
-		log.Error(constant.CommandWaitFailedReason, "failed to wait command %q, err: %v", envCommandName, err)
-		return err
+		return fmt.Errorf("failed to wait command %q: %w", envCommandName, err)
 	}
 
 	nf := e.Ctx.NodeFetcher()
@@ -1025,12 +1048,14 @@ func (e *EnsureClusterManage) initBocloudClusterEnv() error {
 
 	// 只要有失败的就返回，不同于集群部署
 	if len(failed) > 0 {
-		commandErrs, err := phaseutil.LogCommandFailed(*envCommand.Command, failed, log, constant.BocloudClusterEnvInitFailedReason)
+		commandErrs, cmdErr := phaseutil.LogCommandFailed(*envCommand.Command, failed, log, constant.BocloudClusterEnvInitFailedReason)
 		phaseutil.MarkNodeStatusByCommandErrs(ctx, c, bkeCluster, commandErrs)
-		errInfo := fmt.Sprintf("failed to init bocloud cluster env on flow nodes %q, err: %v", failed, err)
+		if cmdErr == nil {
+			cmdErr = fmt.Errorf("command timed out on nodes %q", failed)
+		}
+		errInfo := fmt.Sprintf("failed to init bocloud cluster env on flow nodes %q, err: %v", failed, cmdErr)
 		condition.ConditionMark(bkeCluster, bkev1beta1.BocloudClusterEnvInitCondition, confv1beta1.ConditionFalse, constant.BocloudClusterEnvInitFailedReason, errInfo)
-		log.Error(constant.CommandExecFailedReason, errInfo)
-		return errors.New(errInfo)
+		return fmt.Errorf("failed to init bocloud cluster env on flow nodes %q: %w", failed, cmdErr)
 	}
 
 	condition.ConditionMark(bkeCluster, bkev1beta1.BocloudClusterEnvInitCondition, confv1beta1.ConditionTrue, constant.BocloudClusterEnvInitSuccessReason, "init bocloud cluster env success")
@@ -1112,7 +1137,7 @@ func (e *EnsureClusterManage) getContainerRuntimeConfigFromCollectCommand(collec
 	patchFunc := func(bkeCluster *bkev1beta1.BKECluster) {
 		// mark cluster info collected
 		clusterutil.MarkClusterAgentInfoCollected(bkeCluster)
-		annotation.RemoveAnnotation(bkeCluster, manageClusterEtcdCertDirAnnotationKey)
+		annotation.RemoveAnnotation(bkeCluster, annotation.ManageClusterEtcdCertDirAnnotationKey)
 
 		bkeCluster.Spec.ClusterConfig.Cluster.ContainerRuntime = containerRuntime
 		if bkeCluster.Spec.ClusterConfig.Cluster.Kubelet.ExtraVolumes != nil {
@@ -1229,14 +1254,12 @@ func executeCommandAndWait(params ExecuteCommandAndWaitParams) error {
 
 	err, _, failed := params.Command.Wait()
 	if err != nil {
-		params.Log.Error(constant.CommandWaitFailedReason, "failed to wait command %q, err: %v", params.CommandName, err)
-		return err
+		return fmt.Errorf("failed to wait command %q: %w", params.CommandName, err)
 	}
 	if failed != nil || len(failed) > 0 {
 		commandErrs, err := phaseutil.LogCommandFailed(*params.Command.Command, failed, params.Log, params.FailedReason)
 		phaseutil.MarkNodeStatusByCommandErrs(params.Ctx, params.Client, params.BKECluster, commandErrs)
-		params.Log.Error(constant.CommandExecFailedReason, "failed to execute command on nodes %q, err: %v", failed, err)
-		return errors.Errorf("failed to execute command on nodes %q, err: %v", failed, err)
+		return fmt.Errorf("failed to execute command on nodes %q: %w", failed, err)
 	}
 	condition.ConditionMark(params.BKECluster, params.ConditionType, confv1beta1.ConditionTrue, params.SuccessReason, params.SuccessMessage)
 	params.Log.Info(params.SuccessReason, params.SuccessMessage)
@@ -1259,27 +1282,49 @@ func (e *EnsureClusterManage) markNodesBootstrapSuccess(ctx context.Context, nod
 }
 
 // checkAgentNeedPush 检查是否需要推送 Agent
+// 只有当所有节点都已设置 NodeAgentPushedFlag 时才跳过推送；
+// 任一节点缺少 PushedFlag（如 retry 后或新节点加入）都需要重新推送。
 func (e *EnsureClusterManage) checkAgentNeedPush(nodes bkenode.Nodes) bool {
-	for _, node := range nodes {
+	activeNodes := e.filterNeedSkipNodes(nodes)
+	for _, node := range activeNodes {
 		hasPushedFlag, _ := e.Ctx.GetNodeStateFlag(node.IP, bkev1beta1.NodeAgentPushedFlag)
-		if hasPushedFlag {
-			return false
+		if !hasPushedFlag {
+			return true
 		}
 	}
-	return true
+	return false
+}
+
+// filterNeedSkipNodes returns nodes that are not marked as NeedSkip.
+func (e *EnsureClusterManage) filterNeedSkipNodes(nodes bkenode.Nodes) bkenode.Nodes {
+	nf := e.Ctx.NodeFetcher()
+	ctx, _, bkeCluster, _, _ := e.Ctx.Untie()
+	var result bkenode.Nodes
+	for _, node := range nodes {
+		needSkip, _ := nf.GetNodeStateNeedSkip(ctx, bkeCluster.Namespace, bkeCluster.Name, node.IP)
+		if needSkip {
+			continue
+		}
+		result = append(result, node)
+	}
+	return result
 }
 
 // processAgentPingResults 处理 Agent ping 结果
 func (e *EnsureClusterManage) processAgentPingResults(ctx context.Context, bkeCluster *bkev1beta1.BKECluster,
 	successNodes, failedNodes []string, log *bkev1beta1.BKELogger) {
 	nf := e.Ctx.NodeFetcher()
+	allNodes, err := e.Ctx.GetNodes()
+	if err != nil {
+		log.Warn(constant.InternalErrorReason, "Failed to get nodes for role check: %v", err)
+	}
+	workerNodes := allNodes.Worker()
 
 	for _, node := range failedNodes {
 		nodeIP := phaseutil.GetNodeIPFromCommandWaitResult(node)
+		isWorker := workerNodes.Filter(bkenode.FilterOptions{"IP": nodeIP}).Length() > 0
 		if err := nf.UpdateNodeStatusByIPForCluster(ctx, bkeCluster, nodeIP, func(status *confv1beta1.BKENodeStatus) {
-			status.State = bkev1beta1.NodeInitFailed
-			status.Message = "Failed ping bkeagent"
-			status.StateCode &= ^bkev1beta1.NodeAgentPushedFlag
+			e.markFailedPingNode(status, isWorker)
 		}); err != nil {
 			log.Warn(constant.InternalErrorReason, "Failed to update failed ping status for %s: %v", nodeIP, err)
 		}
@@ -1288,12 +1333,32 @@ func (e *EnsureClusterManage) processAgentPingResults(ctx context.Context, bkeCl
 	for _, node := range successNodes {
 		nodeIP := phaseutil.GetNodeIPFromCommandWaitResult(node)
 		if err := nf.UpdateNodeStatusByIPForCluster(ctx, bkeCluster, nodeIP, func(status *confv1beta1.BKENodeStatus) {
-			status.Message = "BKEAgent is ready"
-			status.StateCode |= bkev1beta1.NodeAgentPushedFlag
-			status.StateCode |= bkev1beta1.NodeAgentReadyFlag
+			markSuccessPingNode(status)
 		}); err != nil {
 			log.Warn(constant.InternalErrorReason, "Failed to update ping success status for %s: %v", nodeIP, err)
 		}
+	}
+}
+
+// markSuccessPingNode sets success status for a node that passed agent ping.
+func markSuccessPingNode(status *confv1beta1.BKENodeStatus) {
+	status.Message = "BKEAgent is ready"
+	status.StateCode |= bkev1beta1.NodeAgentPushedFlag
+	status.StateCode |= bkev1beta1.NodeAgentReadyFlag
+	status.RetryCount = 0
+}
+
+// markFailedPingNode sets failure status for a node that failed agent ping.
+// Worker nodes are marked NeedSkip after exceeding the allowed retry count.
+func (e *EnsureClusterManage) markFailedPingNode(status *confv1beta1.BKENodeStatus, isWorker bool) {
+	status.State = bkev1beta1.NodeInitFailed
+	status.StateCode &= ^bkev1beta1.NodeAgentPushedFlag
+	status.RetryCount++
+	if isWorker && status.RetryCount >= statusmanage.ReconcileAllowedFailedCount {
+		status.NeedSkip = true
+		status.Message = fmt.Sprintf("Failed ping bkeagent after %d retries, marked as NeedSkip", status.RetryCount)
+	} else {
+		status.Message = "Failed ping bkeagent"
 	}
 }
 

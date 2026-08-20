@@ -2,7 +2,7 @@
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -124,6 +124,49 @@ func CompleteUpgradeHop(
 		})
 	}
 	return c.Status().Patch(ctx, cv, client.MergeFrom(orig))
+}
+
+// FailUpgradeHop patches ClusterVersion.status when a declarative upgrade hop fails terminally.
+func FailUpgradeHop(
+	ctx context.Context,
+	c client.Client,
+	cv *cvv1alpha1.ClusterVersion,
+	hopTarget string,
+	cause error,
+) error {
+	if c == nil || cv == nil {
+		return fmt.Errorf("client or cluster version is nil")
+	}
+	hopTarget = strings.TrimSpace(hopTarget)
+	msg := "declarative upgrade failed"
+	if cause != nil {
+		msg = cause.Error()
+	}
+
+	orig := cv.DeepCopy()
+	fromVersion := strings.TrimSpace(cv.Status.CurrentVersion)
+	cv.Status.Phase = cvv1alpha1.ClusterVersionPhaseFailed
+	cv.Status.Conditions = upgradeFailureCondition(msg)
+	if hopTarget != "" && fromVersion != "" && hopTarget != fromVersion {
+		now := metav1.Now()
+		cv.Status.UpgradeHistory = append(cv.Status.UpgradeHistory, cvv1alpha1.ClusterUpgradeRecord{
+			From:        fromVersion,
+			To:          hopTarget,
+			CompletedAt: &now,
+			Status:      cvv1alpha1.ClusterUpgradeRecordStatusFailed,
+		})
+	}
+	return c.Status().Patch(ctx, cv, client.MergeFrom(orig))
+}
+
+func upgradeFailureCondition(message string) []cvv1alpha1.ClusterVersionCondition {
+	return []cvv1alpha1.ClusterVersionCondition{{
+		Type:               "Ready",
+		Status:             metav1.ConditionFalse,
+		Reason:             "UpgradeHopFailed",
+		Message:            message,
+		LastTransitionTime: metav1.Now(),
+	}}
 }
 
 // HasUpgradeRecord reports whether an upgrade history entry exists for from→to.

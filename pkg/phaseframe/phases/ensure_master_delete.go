@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -22,6 +22,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/pointer"
 	"sigs.k8s.io/cluster-api/util"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -49,6 +50,7 @@ type EnsureMasterDelete struct {
 	phaseframe.BasePhase
 	machinesAndNodesToDelete     map[string]phaseutil.MachineAndNode
 	machinesAndNodesToWaitDelete map[string]phaseutil.MachineAndNode
+	mockClient                   kubernetes.Interface
 }
 
 func NewEnsureMasterDelete(ctx *phaseframe.PhaseContext) phaseframe.Phase {
@@ -95,6 +97,16 @@ func (e *EnsureMasterDelete) NeedExecute(old *bkev1beta1.BKECluster, new *bkev1b
 // getTargetClusterNodes gets nodes from the target k8s cluster.
 func (e *EnsureMasterDelete) getTargetClusterNodes(bkeCluster *bkev1beta1.BKECluster) (bkenode.Nodes, error) {
 	return GetTargetClusterNodes(e.Ctx.Context, e.Ctx.Client, bkeCluster)
+}
+
+// kubeClient returns the kubernetes client used to clean up legacy pods.
+// In production this is obtained from the remote cluster client;
+// tests may inject a fake clientset via mockClient.
+func (e *EnsureMasterDelete) kubeClient() kubernetes.Interface {
+	if e.mockClient != nil {
+		return e.mockClient
+	}
+	return nil
 }
 
 func (e *EnsureMasterDelete) reconcileMasterDelete() error {
@@ -171,16 +183,17 @@ func (e *EnsureMasterDelete) pauseAndScaleDownControlPlane(params PauseAndScaleD
 	log.Debug("get kubeadm control plane")
 	scope, err := phaseutil.GetClusterAPIAssociateObjs(ctx, c, e.Ctx.Cluster)
 	if err != nil || scope.KubeadmControlPlane == nil {
-		log.Error(constant.MasterDeleteFailedReason, "Get cluster-api associate objs failed. err: %v", err)
 		// cluster api object error, no need to continue
-		return err
+		if err != nil {
+			return fmt.Errorf("Get cluster-api associate objs failed: %w", err)
+		}
+		return fmt.Errorf("Get cluster-api associate objs failed")
 	}
 
 	// 暂停 KubeadmControlPlane的运行，以便我们能设置注释指定删除某些节点
 	log.Debug("pause kubeadm control plane")
 	if err = phaseutil.PauseClusterAPIObj(ctx, c, scope.KubeadmControlPlane); err != nil {
-		log.Error(constant.MasterDeleteFailedReason, "Pause KubeadmControlPlane failed. err: %v", err)
-		return err
+		return fmt.Errorf("Pause KubeadmControlPlane failed: %w", err)
 	}
 	log.Info(constant.MasterDeletingReason, "Pause KubeadmControlPlane success")
 
@@ -190,9 +203,11 @@ func (e *EnsureMasterDelete) pauseAndScaleDownControlPlane(params PauseAndScaleD
 	defer func() {
 		if err != nil {
 			log.Info(constant.MasterDeleteFailedReason, "Scale up KubeadmControlPlane replicas to %d.", currentReplicas)
-			scope.KubeadmControlPlane.Spec.Replicas = currentReplicas
+			if rollbackErr := phaseutil.UpdateKubeadmControlPlaneReplicas(ctx, c, scope.KubeadmControlPlane, *currentReplicas); rollbackErr != nil {
+				log.Warn(constant.MasterDeleteFailedReason, "Rollback KubeadmControlPlane replicas failed. err: %v", rollbackErr)
+			}
 			if err = phaseutil.ResumeClusterAPIObj(ctx, c, scope.KubeadmControlPlane); err != nil {
-				log.Error(constant.MasterDeleteFailedReason, "Rollback KubeadmControlPlane replicas failed. err: %v", err)
+				log.Warn(constant.MasterDeleteFailedReason, "Resume KubeadmControlPlane failed. err: %v", err)
 			}
 		}
 	}()
@@ -202,8 +217,8 @@ func (e *EnsureMasterDelete) pauseAndScaleDownControlPlane(params PauseAndScaleD
 	for _, machineAndNode := range deleteMap {
 		machine := machineAndNode.Machine
 		if err = phaseutil.MarkMachineForDeletion(ctx, c, machine); err != nil {
-			log.Error(constant.MasterDeleteFailedReason, "Can't delete node %s", phaseutil.NodeInfo(machineAndNode.Node))
-			log.Error(constant.MasterDeleteFailedReason, "Mark machine %s for deletion failed. err: %v", utils.ClientObjNS(machine), err)
+			log.Warn(constant.MasterDeleteFailedReason, "Can't delete node %s", phaseutil.NodeInfo(machineAndNode.Node))
+			log.Warn(constant.MasterDeleteFailedReason, "Mark machine %s for deletion failed. err: %v", utils.ClientObjNS(machine), err)
 			delete(deleteMap, machine.Name)
 		}
 	}
@@ -221,15 +236,16 @@ func (e *EnsureMasterDelete) pauseAndScaleDownControlPlane(params PauseAndScaleD
 	if exceptReplicas < 1 {
 		exceptReplicas = 1
 	}
-	scope.KubeadmControlPlane.Spec.Replicas = &exceptReplicas
-
 	log.Info(constant.MasterDeletingReason, "Scale down KubeadmControlPlane replicas to %d.", exceptReplicas)
 
-	// 重新启动并更新KubeadmControlPlane副本数
+	// Update KubeadmControlPlane replicas
+	if err = phaseutil.UpdateKubeadmControlPlaneReplicas(ctx, c, scope.KubeadmControlPlane, exceptReplicas); err != nil {
+		return fmt.Errorf("Scale down KubeadmControlPlane replicas failed: %w", err)
+	}
+
+	// Resume KubeadmControlPlane
 	if err = phaseutil.ResumeClusterAPIObj(ctx, c, scope.KubeadmControlPlane); err != nil {
-		log.Error(constant.MasterJoinFailedReason, "Scale down KubeadmControlPlane replicas failed. err: %v", err)
-		// cluster api object error, no need to continue
-		return err
+		return fmt.Errorf("Resume KubeadmControlPlane failed: %w", err)
 	}
 
 	return nil
@@ -275,8 +291,7 @@ func (e *EnsureMasterDelete) waitForMachinesDelete(params WaitForMachinesDeleteP
 					successDeletedNode[machineName] = machineWithNode.Node
 					continue
 				}
-				log.Error(constant.MasterDeleteFailedReason, "Get machine %s failed. err: %v", utils.ClientObjNS(machine), err)
-				return false, err
+				return false, fmt.Errorf("Get machine %s failed: %w", utils.ClientObjNS(machine), err)
 			}
 		}
 		if len(successDeletedNode) != len(machinesAndNodesToWaitDelete) {
@@ -344,12 +359,18 @@ func (e *EnsureMasterDelete) cleanupDeletedNodePods(params CleanupDeletedNodePod
 	successDeletedNode := params.SuccessDeletedNode
 	_, _, _, _, log := e.Ctx.Untie() // 获取日志实例
 	log.Info(constant.MasterDeletedReason, "Attempt to clean the legacy daemonset pod of the removed node")
-	remoteClient, err := kube.NewRemoteClientByBKECluster(ctx, c, e.Ctx.BKECluster)
-	if err != nil {
-		log.Warn(constant.MasterDeletedReason, "Get remote client failed. err: %v", err)
-		return nil
+	var clientSet kubernetes.Interface
+	if cs := e.kubeClient(); cs != nil {
+		clientSet = cs
+	} else {
+		remoteClient, err := kube.NewRemoteClientByBKECluster(ctx, c, e.Ctx.BKECluster)
+		if err != nil {
+			log.Warn(constant.MasterDeletedReason, "Get remote client failed. err: %v", err)
+			return nil
+		}
+		cs, _ := remoteClient.KubeClient()
+		clientSet = cs
 	}
-	clientSet, _ := remoteClient.KubeClient()
 	for _, node := range successDeletedNode {
 		// 顺便从bkecluster中删除节点
 		e.Ctx.NodeFetcher().DeleteBKENodeForCluster(params.Ctx, bkeCluster, node.IP)

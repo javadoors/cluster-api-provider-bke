@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -50,14 +50,14 @@ func NewK8sTokenSecret(ctx context.Context, token string, c client.Client, bkeCl
 	if err := c.Create(ctx, secret); err != nil {
 		if apierrors.IsAlreadyExists(err) {
 			if err = c.Delete(ctx, secret); err != nil {
-				return errors.Errorf("delete %q k8s token secret failed: %v", utils.ClientObjNS(bkeCluster), err)
+				return fmt.Errorf("delete %q k8s token secret failed: %w", utils.ClientObjNS(bkeCluster), err)
 			}
 			if err = c.Create(ctx, secret); err != nil {
-				return errors.Errorf("create %q k8s token secret failed: %v", utils.ClientObjNS(bkeCluster), err)
+				return fmt.Errorf("create %q k8s token secret failed: %w", utils.ClientObjNS(bkeCluster), err)
 			}
 			return nil
 		}
-		return errors.Errorf("create %q k8s token secret failed: %v", utils.ClientObjNS(bkeCluster), err)
+		return fmt.Errorf("create %q k8s token secret failed: %w", utils.ClientObjNS(bkeCluster), err)
 	}
 	return nil
 }
@@ -85,7 +85,7 @@ func DeleteK8sTokenSecret(ctx context.Context, c client.Client, bkeCluster *bkev
 		},
 	}
 	if err := c.Delete(ctx, secret); err != nil {
-		return errors.Errorf("delete %q k8s token secret failed: %v", utils.ClientObjNS(bkeCluster), err)
+		return fmt.Errorf("delete %q k8s token secret failed: %w", utils.ClientObjNS(bkeCluster), err)
 	}
 	return nil
 }

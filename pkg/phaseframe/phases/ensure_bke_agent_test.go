@@ -1,14 +1,3 @@
-/*
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
- * openFuyao is licensed under Mulan PSL v2.
- * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain a copy of Mulan PSL v2 at:
- *          http://license.coscl.org.cn/MulanPSL2
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
- * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
- * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
- * See the Mulan PSL v2 for more details.
- */
 package phases
 
 import (
@@ -19,18 +8,23 @@ import (
 
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/stretchr/testify/assert"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-
+	"github.com/stretchr/testify/require"
 	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
 	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
 	bkevalidate "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/validation"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/certs"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/mergecluster"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
 	bkessh "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/remote"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/statusmanage"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/nodeutil"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	ctrlfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 func TestMain(m *testing.M) {
@@ -695,11 +689,11 @@ func TestEnsureBKEAgent_ExecutePreCommand_Success(t *testing.T) {
 	mockMultiCli := &bkessh.MultiCli{}
 	pushAgentErrs := make(map[string]error)
 
-	patches.ApplyPrivateMethod(e, "executePreCommand", func(_ *EnsureBKEAgent, _ *bkessh.MultiCli, _ map[string]error) error {
+	patches.ApplyPrivateMethod(e, "executePreCommand", func(_ *EnsureBKEAgent, _ *bkessh.MultiCli, _ map[string]error, _ bool) error {
 		return nil
 	})
 
-	err := e.executePreCommand(mockMultiCli, pushAgentErrs)
+	err := e.executePreCommand(mockMultiCli, pushAgentErrs, false)
 	assert.NoError(t, err)
 }
 
@@ -714,11 +708,11 @@ func TestEnsureBKEAgent_ExecuteStartCommand_Success(t *testing.T) {
 	mockMultiCli := &bkessh.MultiCli{}
 	pushAgentErrs := make(map[string]error)
 
-	patches.ApplyPrivateMethod(e, "executeStartCommand", func(_ *EnsureBKEAgent, _ *bkessh.MultiCli, _ []byte, _ string, _ map[string]error) error {
+	patches.ApplyPrivateMethod(e, "executeStartCommand", func(_ *EnsureBKEAgent, _ *bkessh.MultiCli, _ []byte, _ string, _ map[string]error, _ bool) error {
 		return nil
 	})
 
-	err := e.executeStartCommand(mockMultiCli, []byte("test"), "/tmp/test.service", pushAgentErrs)
+	err := e.executeStartCommand(mockMultiCli, []byte("test"), "/tmp/test.service", pushAgentErrs, false)
 	assert.NoError(t, err)
 }
 
@@ -984,11 +978,11 @@ func TestEnsureBKEAgent_ExecutePreCommand_Mock(t *testing.T) {
 	mockMultiCli := &bkessh.MultiCli{}
 	pushAgentErrs := make(map[string]error)
 
-	patches.ApplyPrivateMethod(e, "executePreCommand", func(_ *EnsureBKEAgent, _ *bkessh.MultiCli, _ map[string]error) error {
+	patches.ApplyPrivateMethod(e, "executePreCommand", func(_ *EnsureBKEAgent, _ *bkessh.MultiCli, _ map[string]error, _ bool) error {
 		return nil
 	})
 
-	err := e.executePreCommand(mockMultiCli, pushAgentErrs)
+	err := e.executePreCommand(mockMultiCli, pushAgentErrs, false)
 	assert.NoError(t, err)
 }
 
@@ -1003,11 +997,11 @@ func TestEnsureBKEAgent_ExecuteStartCommand_Mock(t *testing.T) {
 	mockMultiCli := &bkessh.MultiCli{}
 	pushAgentErrs := make(map[string]error)
 
-	patches.ApplyPrivateMethod(e, "executeStartCommand", func(_ *EnsureBKEAgent, _ *bkessh.MultiCli, _ []byte, _ string, _ map[string]error) error {
+	patches.ApplyPrivateMethod(e, "executeStartCommand", func(_ *EnsureBKEAgent, _ *bkessh.MultiCli, _ []byte, _ string, _ map[string]error, _ bool) error {
 		return nil
 	})
 
-	err := e.executeStartCommand(mockMultiCli, []byte("test"), "/tmp/test.service", pushAgentErrs)
+	err := e.executeStartCommand(mockMultiCli, []byte("test"), "/tmp/test.service", pushAgentErrs, false)
 	assert.NoError(t, err)
 }
 
@@ -1105,4 +1099,1027 @@ func TestEnsureBKEAgent_CheckAllOrPushedAgentsFailed_PartialFailure(t *testing.T
 
 	err := e.checkAllOrPushedAgentsFailed([]string{testNodeIP1}, []string{testNodeIP2})
 	assert.NoError(t, err)
+}
+
+func newBKEAgentPhaseCov(t *testing.T, bkeCluster *bkev1beta1.BKECluster) *EnsureBKEAgent {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	require.NoError(t, bkev1beta1.AddToScheme(scheme))
+	c := ctrlfake.NewClientBuilder().WithScheme(scheme).Build()
+	ctx := &phaseframe.PhaseContext{
+		Context:    context.Background(),
+		BKECluster: bkeCluster,
+		Client:     c,
+		Scheme:     scheme,
+		Log:        bkev1beta1.NewBKELogger(nil, &fakeRecorder{}, bkeCluster),
+	}
+	return &EnsureBKEAgent{BasePhase: phaseframe.BasePhase{Ctx: ctx}}
+}
+
+func bkeAgentCluster(addons ...confv1beta1.Product) *bkev1beta1.BKECluster {
+	return &bkev1beta1.BKECluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "ns"},
+		Spec:       confv1beta1.BKEClusterSpec{ClusterConfig: &confv1beta1.BKEConfig{Addons: addons}},
+	}
+}
+
+// ---- loadLocalKubeConfig ----
+
+func TestEnsureBKEAgentLoadLocalKubeConfig(t *testing.T) {
+	t.Run("no cluster-api: least privilege success + RBAC", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster(confv1beta1.Product{Name: "other"}))
+		patches.ApplyFunc(phaseutil.GetLeastPrivilegeKubeConfig, func(context.Context, client.Client) ([]byte, error) {
+			return []byte("least-priv"), nil
+		})
+		patches.ApplyFunc(phaseutil.GetLocalKubeConfig, func(context.Context, client.Client) ([]byte, error) {
+			return []byte("local"), nil
+		})
+		patches.ApplyFunc(phaseutil.CreateBKEAgentRBACWithLocalKubeConfig, func(context.Context, []byte, *bkev1beta1.BKECluster) error {
+			return nil
+		})
+		require.NoError(t, e.loadLocalKubeConfig())
+	})
+
+	t.Run("no cluster-api: least privilege error -> fallback local", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster(confv1beta1.Product{Name: "other"}))
+		patches.ApplyFunc(phaseutil.GetLeastPrivilegeKubeConfig, func(context.Context, client.Client) ([]byte, error) {
+			return nil, assertErr("least priv failed")
+		})
+		patches.ApplyFunc(phaseutil.GetLocalKubeConfig, func(context.Context, client.Client) ([]byte, error) {
+			return []byte("local"), nil
+		})
+		require.NoError(t, e.loadLocalKubeConfig())
+	})
+
+	t.Run("no cluster-api: both fail", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster(confv1beta1.Product{Name: "other"}))
+		patches.ApplyFunc(phaseutil.GetLeastPrivilegeKubeConfig, func(context.Context, client.Client) ([]byte, error) {
+			return nil, assertErr("least priv failed")
+		})
+		patches.ApplyFunc(phaseutil.GetLocalKubeConfig, func(context.Context, client.Client) ([]byte, error) {
+			return nil, assertErr("local failed")
+		})
+		err := e.loadLocalKubeConfig()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "local kubeconfig after fallback")
+	})
+
+	t.Run("has cluster-api: local kubeconfig", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster(confv1beta1.Product{Name: "cluster-api"}))
+		patches.ApplyFunc(phaseutil.GetLocalKubeConfig, func(context.Context, client.Client) ([]byte, error) {
+			return []byte("local"), nil
+		})
+		require.NoError(t, e.loadLocalKubeConfig())
+	})
+
+	t.Run("has cluster-api: local kubeconfig error", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster(confv1beta1.Product{Name: "cluster-api"}))
+		patches.ApplyFunc(phaseutil.GetLocalKubeConfig, func(context.Context, client.Client) ([]byte, error) {
+			return nil, assertErr("local failed")
+		})
+		err := e.loadLocalKubeConfig()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "local kubeconfig")
+	})
+}
+
+// ---- getNeedPushNodes ----
+
+func TestEnsureBKEAgentGetNeedPushNodes(t *testing.T) {
+	t.Run("fetch error", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+		patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapper, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (bkev1beta1.BKENodes, error) {
+			return nil, assertErr("fetch failed")
+		})
+		err := e.getNeedPushNodes()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to get BKENodes")
+	})
+
+	t.Run("no need push nodes returns nil", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+		patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapper, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (bkev1beta1.BKENodes, error) {
+			return bkev1beta1.BKENodes{}, nil
+		})
+		patches.ApplyFunc(phaseutil.GetNeedPushAgentNodesWithBKENodes, func(_ *bkev1beta1.BKECluster, _ bkev1beta1.BKENodes) bkenode.Nodes {
+			return nil
+		})
+		require.NoError(t, e.getNeedPushNodes())
+	})
+
+	t.Run("success sets needPushNodes", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+		patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapper, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (bkev1beta1.BKENodes, error) {
+			return bkev1beta1.BKENodes{}, nil
+		})
+		patches.ApplyFunc(phaseutil.GetNeedPushAgentNodesWithBKENodes, func(_ *bkev1beta1.BKECluster, _ bkev1beta1.BKENodes) bkenode.Nodes {
+			return bkenode.Nodes{{IP: "10.0.0.1", Hostname: "n1"}}
+		})
+		patches.ApplyFunc(mergecluster.SyncStatusUntilComplete, func(client.Client, *bkev1beta1.BKECluster, ...mergecluster.PatchFunc) error { return nil })
+		require.NoError(t, e.getNeedPushNodes())
+		assert.Len(t, e.needPushNodes, 1)
+	})
+}
+
+// ---- prepareServiceFile ----
+
+func TestEnsureBKEAgentPrepareServiceFile(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+		patches.ApplyFunc(phaseutil.RenderBKEAgentServiceFile, func(_ *bkev1beta1.BKECluster, _ string) error { return nil })
+		path, err := e.prepareServiceFile(e.Ctx.BKECluster)
+		require.NoError(t, err)
+		assert.NotEmpty(t, path)
+	})
+
+	t.Run("render error", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+		patches.ApplyFunc(phaseutil.RenderBKEAgentServiceFile, func(_ *bkev1beta1.BKECluster, _ string) error { return assertErr("render failed") })
+		_, err := e.prepareServiceFile(e.Ctx.BKECluster)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "bkeagent.service")
+	})
+}
+
+// ---- handlePushResults ----
+
+func TestEnsureBKEAgentHandlePushResults(t *testing.T) {
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyFunc(mergecluster.SyncStatusUntilComplete, func(client.Client, *bkev1beta1.BKECluster, ...mergecluster.PatchFunc) error { return nil })
+	patches.ApplyFunc((*nodeutil.NodeFetcher).MarkNodeStateFlagForCluster, func(_ *nodeutil.NodeFetcher, _ context.Context, _ *bkev1beta1.BKECluster, _ string, _ int) error {
+		return nil
+	})
+
+	t.Run("all failed returns error", func(t *testing.T) {
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+		e.needPushNodes = bkenode.Nodes{{IP: "10.0.0.1"}}
+		err := e.handlePushResults(context.Background(), e.Ctx.Client, e.Ctx.BKECluster, []string{"10.0.0.1"})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "Failed to push agent")
+	})
+
+	t.Run("success marks pushed nodes", func(t *testing.T) {
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+		e.needPushNodes = bkenode.Nodes{{IP: "10.0.0.1"}, {IP: "10.0.0.2"}}
+		require.NoError(t, e.handlePushResults(context.Background(), e.Ctx.Client, e.Ctx.BKECluster, []string{"10.0.0.1"}))
+	})
+
+	t.Run("master failed returns error", func(t *testing.T) {
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+		e.needPushNodes = bkenode.Nodes{{IP: "10.0.0.1", Role: []string{"master"}}, {IP: "10.0.0.2", Role: []string{"worker"}}}
+		err := e.handlePushResults(context.Background(), e.Ctx.Client, e.Ctx.BKECluster, []string{"10.0.0.1"})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "master node failed")
+	})
+}
+
+// ---- allNodesSkippedByIPs ----
+
+func TestAllNodesSkippedByIPs(t *testing.T) {
+	t.Run("empty input returns false", func(t *testing.T) {
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+		assert.False(t, e.allNodesSkippedByIPs(nil))
+	})
+
+	t.Run("fetch error returns false", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+		patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapper, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (bkev1beta1.BKENodes, error) {
+			return nil, assertErr("fetch failed")
+		})
+		assert.False(t, e.allNodesSkippedByIPs([]string{"10.0.0.1"}))
+	})
+
+	t.Run("empty bkeNodes returns false", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+		patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapper, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (bkev1beta1.BKENodes, error) {
+			return bkev1beta1.BKENodes{}, nil
+		})
+		assert.False(t, e.allNodesSkippedByIPs([]string{"10.0.0.1"}))
+	})
+
+	t.Run("all IPs marked NeedSkip returns true", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+		patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapper, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (bkev1beta1.BKENodes, error) {
+			return bkev1beta1.BKENodes{
+				{Spec: confv1beta1.BKENodeSpec{IP: "10.0.0.1"}, Status: confv1beta1.BKENodeStatus{NeedSkip: true}},
+				{Spec: confv1beta1.BKENodeSpec{IP: "10.0.0.2"}, Status: confv1beta1.BKENodeStatus{NeedSkip: true}},
+			}, nil
+		})
+		assert.True(t, e.allNodesSkippedByIPs([]string{"10.0.0.1", "10.0.0.2"}))
+	})
+
+	t.Run("one IP not NeedSkip returns false", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+		patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapper, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (bkev1beta1.BKENodes, error) {
+			return bkev1beta1.BKENodes{
+				{Spec: confv1beta1.BKENodeSpec{IP: "10.0.0.1"}, Status: confv1beta1.BKENodeStatus{NeedSkip: true}},
+				{Spec: confv1beta1.BKENodeSpec{IP: "10.0.0.2"}, Status: confv1beta1.BKENodeStatus{NeedSkip: false}},
+			}, nil
+		})
+		assert.False(t, e.allNodesSkippedByIPs([]string{"10.0.0.1", "10.0.0.2"}))
+	})
+
+	t.Run("IP not in bkeNodes returns false", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+		patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapper, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (bkev1beta1.BKENodes, error) {
+			return bkev1beta1.BKENodes{
+				{Spec: confv1beta1.BKENodeSpec{IP: "10.0.0.1"}, Status: confv1beta1.BKENodeStatus{NeedSkip: true}},
+			}, nil
+		})
+		assert.False(t, e.allNodesSkippedByIPs([]string{"10.0.0.1", "10.0.0.99"}))
+	})
+}
+
+// ---- handleValidationFailure ----
+
+func TestEnsureBKEAgentHandleValidationFailure(t *testing.T) {
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyFunc(mergecluster.SyncStatusUntilComplete, func(client.Client, *bkev1beta1.BKECluster, ...mergecluster.PatchFunc) error { return nil })
+	patches.ApplyFunc((*nodeutil.NodeFetcher).UpdateNodeStatusByIP, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _, _ string, _ func(*confv1beta1.BKENodeStatus)) error {
+		return nil
+	})
+
+	t.Run("hostname not unique updates nodes", func(t *testing.T) {
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+		e.needPushNodes = bkenode.Nodes{{IP: "10.0.0.1", Hostname: "n1"}}
+		err := e.handleValidationFailure(assertErr("hostname is not unique"))
+		require.Error(t, err)
+	})
+
+	t.Run("generic validation error", func(t *testing.T) {
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+		err := e.handleValidationFailure(assertErr("invalid field"))
+		require.Error(t, err)
+	})
+
+	t.Run("sync error", func(t *testing.T) {
+		patches.ApplyFunc(mergecluster.SyncStatusUntilComplete, func(client.Client, *bkev1beta1.BKECluster, ...mergecluster.PatchFunc) error {
+			return assertErr("sync failed")
+		})
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+		err := e.handleValidationFailure(assertErr("invalid"))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "sync status after validation")
+	})
+}
+
+// ---- validateAndHandleNodesField ----
+
+func TestEnsureBKEAgentValidateAndHandleNodesField(t *testing.T) {
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+	patches.ApplyFunc((*nodeutil.NodeFetcher).FetchNodesForCluster, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (*nodeutil.FetchResult, error) {
+		return &nodeutil.FetchResult{Nodes: bkenode.Nodes{{IP: "10.0.0.1"}}}, nil
+	})
+
+	t.Run("bke cluster validation error", func(t *testing.T) {
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster()) // no annotation -> IsBKECluster true
+		patches.ApplyFunc(bkevalidate.ValidateNodesFields, func(_ bkenode.Nodes) error { return assertErr("bad nodes") })
+		patches.ApplyPrivateMethod(e, "handleValidationFailure", func(_ *EnsureBKEAgent, _ error) error { return assertErr("handled") })
+		err := e.validateAndHandleNodesField()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "handled")
+	})
+
+	t.Run("bocloud cluster validation error", func(t *testing.T) {
+		cluster := bkeAgentCluster()
+		cluster.Annotations = map[string]string{"bke.bocloud.com/cluster-from": "bocloud"}
+		e := newBKEAgentPhaseCov(t, cluster)
+		patches.ApplyFunc(bkevalidate.ValidateNonStandardNodesFields, func(_ bkenode.Nodes) error { return assertErr("bad nonstandard") })
+		patches.ApplyPrivateMethod(e, "handleValidationFailure", func(_ *EnsureBKEAgent, _ error) error { return assertErr("handled") })
+		err := e.validateAndHandleNodesField()
+		require.Error(t, err)
+	})
+
+	t.Run("validation nil returns nil", func(t *testing.T) {
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+		patches.ApplyFunc(bkevalidate.ValidateNodesFields, func(_ bkenode.Nodes) error { return nil })
+		require.NoError(t, e.validateAndHandleNodesField())
+	})
+}
+
+// ---- pingAgent ----
+
+func TestEnsureBKEAgentPingAgent(t *testing.T) {
+	t.Run("ping error", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+		patches.ApplyFunc(phaseutil.PingBKEAgent, func(context.Context, client.Client, *runtime.Scheme, *bkev1beta1.BKECluster) (error, []string, []string) {
+			return assertErr("ping failed"), nil, nil
+		})
+		err := e.pingAgent()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "ping failed")
+	})
+
+	t.Run("validate error", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+		patches.ApplyFunc(phaseutil.PingBKEAgent, func(context.Context, client.Client, *runtime.Scheme, *bkev1beta1.BKECluster) (error, []string, []string) {
+			return nil, []string{"10.0.0.1"}, nil
+		})
+		patches.ApplyPrivateMethod(e, "updateNodeStatus", func(_ *EnsureBKEAgent, _ *bkev1beta1.BKECluster, _, _ []string) {})
+		patches.ApplyPrivateMethod(e, "validateAndHandleNodesField", func(_ *EnsureBKEAgent) error { return assertErr("validate failed") })
+		err := e.pingAgent()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "validate failed")
+	})
+
+	t.Run("all agents ping failed", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+		e.needPushNodes = bkenode.Nodes{{IP: "10.0.0.1"}}
+		patches.ApplyFunc(phaseutil.PingBKEAgent, func(context.Context, client.Client, *runtime.Scheme, *bkev1beta1.BKECluster) (error, []string, []string) {
+			return nil, nil, []string{"node 10.0.0.1: failed"}
+		})
+		patches.ApplyPrivateMethod(e, "updateNodeStatus", func(_ *EnsureBKEAgent, _ *bkev1beta1.BKECluster, _, _ []string) {})
+		patches.ApplyPrivateMethod(e, "validateAndHandleNodesField", func(_ *EnsureBKEAgent) error { return nil })
+		patches.ApplyFunc(mergecluster.SyncStatusUntilComplete, func(client.Client, *bkev1beta1.BKECluster, ...mergecluster.PatchFunc) error { return nil })
+		err := e.pingAgent()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "ping all nodes")
+	})
+
+	t.Run("success", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+		patches.ApplyFunc(phaseutil.PingBKEAgent, func(context.Context, client.Client, *runtime.Scheme, *bkev1beta1.BKECluster) (error, []string, []string) {
+			return nil, []string{"10.0.0.1"}, nil
+		})
+		patches.ApplyPrivateMethod(e, "updateNodeStatus", func(_ *EnsureBKEAgent, _ *bkev1beta1.BKECluster, _, _ []string) {})
+		patches.ApplyPrivateMethod(e, "validateAndHandleNodesField", func(_ *EnsureBKEAgent) error { return nil })
+		patches.ApplyFunc(mergecluster.SyncStatusUntilComplete, func(client.Client, *bkev1beta1.BKECluster, ...mergecluster.PatchFunc) error { return nil })
+		require.NoError(t, e.pingAgent())
+	})
+}
+
+// bkeAgentGapsNewMultiCli creates a real *MultiCli for direct method testing.
+// The MultiCli is closed via t.Cleanup to avoid context leaks.
+func bkeAgentGapsNewMultiCli(t *testing.T) *bkessh.MultiCli {
+	t.Helper()
+	multiCli := bkessh.NewMultiCli(context.Background())
+	t.Cleanup(func() { multiCli.Close() })
+	return multiCli
+}
+
+// ---- sshPushAgent ----
+
+func TestEnsureBKEAgentSshPushAgent(t *testing.T) {
+	t.Run("no available hosts after register", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+
+		patches.ApplyFunc((*bkessh.MultiCli).RegisterHosts,
+			func(_ *bkessh.MultiCli, _ []bkessh.Host) map[string]error {
+				return map[string]error{"10.0.0.1": assertErr("register failed")}
+			})
+		patches.ApplyFunc((*bkessh.MultiCli).AvailableHosts,
+			func(_ *bkessh.MultiCli) []string { return []string{} })
+
+		errs, err := e.sshPushAgent(
+			context.Background(),
+			bkessh.Hosts{{Address: "10.0.0.1"}},
+			[]byte("kubeconfig"),
+			"/tmp/bkeagent.service",
+		)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "No available hosts")
+		require.Contains(t, errs, "10.0.0.1")
+		assert.Contains(t, errs["10.0.0.1"].Error(), "register failed")
+	})
+
+	t.Run("no available hosts after arch check", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+
+		patches.ApplyFunc((*bkessh.MultiCli).RegisterHosts,
+			func(_ *bkessh.MultiCli, _ []bkessh.Host) map[string]error {
+				return map[string]error{}
+			})
+		availCallCount := 0
+		patches.ApplyFunc((*bkessh.MultiCli).AvailableHosts,
+			func(_ *bkessh.MultiCli) []string {
+				availCallCount++
+				if availCallCount <= 1 {
+					return []string{"10.0.0.1"}
+				}
+				return []string{}
+			})
+		patches.ApplyFunc((*bkessh.MultiCli).RegisterHostsInfo,
+			func(_ *bkessh.MultiCli) map[string]error {
+				return map[string]error{"10.0.0.1": assertErr("unknown arch")}
+			})
+
+		errs, err := e.sshPushAgent(
+			context.Background(),
+			bkessh.Hosts{{Address: "10.0.0.1"}},
+			[]byte("kubeconfig"),
+			"/tmp/bkeagent.service",
+		)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "No available hosts")
+		require.Contains(t, errs, "10.0.0.1")
+		assert.Contains(t, errs["10.0.0.1"].Error(), "unknown arch")
+	})
+
+	t.Run("executePreCommand error", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+
+		patches.ApplyFunc((*bkessh.MultiCli).RegisterHosts,
+			func(_ *bkessh.MultiCli, _ []bkessh.Host) map[string]error {
+				return map[string]error{}
+			})
+		patches.ApplyFunc((*bkessh.MultiCli).AvailableHosts,
+			func(_ *bkessh.MultiCli) []string { return []string{"10.0.0.1"} })
+		patches.ApplyFunc((*bkessh.MultiCli).RegisterHostsInfo,
+			func(_ *bkessh.MultiCli) map[string]error { return map[string]error{} })
+		patches.ApplyPrivateMethod(e, "executePreCommand",
+			func(_ *EnsureBKEAgent, _ *bkessh.MultiCli, _ map[string]error) error {
+				return assertErr("pre command failed")
+			})
+
+		_, err := e.sshPushAgent(
+			context.Background(),
+			bkessh.Hosts{{Address: "10.0.0.1"}},
+			[]byte("kubeconfig"),
+			"/tmp/bkeagent.service",
+		)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "pre command failed")
+	})
+
+	t.Run("executeStartCommand error", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+
+		patches.ApplyFunc((*bkessh.MultiCli).RegisterHosts,
+			func(_ *bkessh.MultiCli, _ []bkessh.Host) map[string]error {
+				return map[string]error{}
+			})
+		patches.ApplyFunc((*bkessh.MultiCli).AvailableHosts,
+			func(_ *bkessh.MultiCli) []string { return []string{"10.0.0.1"} })
+		patches.ApplyFunc((*bkessh.MultiCli).RegisterHostsInfo,
+			func(_ *bkessh.MultiCli) map[string]error { return map[string]error{} })
+		patches.ApplyPrivateMethod(e, "executePreCommand",
+			func(_ *EnsureBKEAgent, _ *bkessh.MultiCli, _ map[string]error) error { return nil })
+		patches.ApplyPrivateMethod(e, "executeStartCommand",
+			func(_ *EnsureBKEAgent, _ *bkessh.MultiCli, _ []byte, _ string, _ map[string]error) error {
+				return assertErr("start command failed")
+			})
+
+		_, err := e.sshPushAgent(
+			context.Background(),
+			bkessh.Hosts{{Address: "10.0.0.1"}},
+			[]byte("kubeconfig"),
+			"/tmp/bkeagent.service",
+		)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "start command failed")
+	})
+
+	t.Run("success with post command errors", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+
+		patches.ApplyFunc((*bkessh.MultiCli).RegisterHosts,
+			func(_ *bkessh.MultiCli, _ []bkessh.Host) map[string]error {
+				return map[string]error{}
+			})
+		patches.ApplyFunc((*bkessh.MultiCli).AvailableHosts,
+			func(_ *bkessh.MultiCli) []string { return []string{"10.0.0.1"} })
+		patches.ApplyFunc((*bkessh.MultiCli).RegisterHostsInfo,
+			func(_ *bkessh.MultiCli) map[string]error { return map[string]error{} })
+		patches.ApplyPrivateMethod(e, "executePreCommand",
+			func(_ *EnsureBKEAgent, _ *bkessh.MultiCli, _ map[string]error) error { return nil })
+		patches.ApplyPrivateMethod(e, "executeStartCommand",
+			func(_ *EnsureBKEAgent, _ *bkessh.MultiCli, _ []byte, _ string, _ map[string]error) error { return nil })
+		patches.ApplyFunc((*bkessh.MultiCli).Run,
+			func(_ *bkessh.MultiCli, _ bkessh.Command) (bkessh.StdCombine, bkessh.StdCombine) {
+				stdErrs := bkessh.NewStdCombine()
+				stdErrs.Add(bkessh.NewCombineOut("10.0.0.1", "post", "post command failed"))
+				return stdErrs, bkessh.NewStdCombine()
+			})
+
+		errs, err := e.sshPushAgent(
+			context.Background(),
+			bkessh.Hosts{{Address: "10.0.0.1"}},
+			[]byte("kubeconfig"),
+			"/tmp/bkeagent.service",
+		)
+		require.NoError(t, err)
+		require.Contains(t, errs, "10.0.0.1")
+		assert.Contains(t, errs["10.0.0.1"].Error(), "PostCommandFailed")
+	})
+
+	t.Run("success clean", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+
+		patches.ApplyFunc((*bkessh.MultiCli).RegisterHosts,
+			func(_ *bkessh.MultiCli, _ []bkessh.Host) map[string]error {
+				return map[string]error{}
+			})
+		patches.ApplyFunc((*bkessh.MultiCli).AvailableHosts,
+			func(_ *bkessh.MultiCli) []string { return []string{"10.0.0.1"} })
+		patches.ApplyFunc((*bkessh.MultiCli).RegisterHostsInfo,
+			func(_ *bkessh.MultiCli) map[string]error { return map[string]error{} })
+		patches.ApplyPrivateMethod(e, "executePreCommand",
+			func(_ *EnsureBKEAgent, _ *bkessh.MultiCli, _ map[string]error) error { return nil })
+		patches.ApplyPrivateMethod(e, "executeStartCommand",
+			func(_ *EnsureBKEAgent, _ *bkessh.MultiCli, _ []byte, _ string, _ map[string]error) error { return nil })
+		patches.ApplyFunc((*bkessh.MultiCli).Run,
+			func(_ *bkessh.MultiCli, _ bkessh.Command) (bkessh.StdCombine, bkessh.StdCombine) {
+				return bkessh.NewStdCombine(), bkessh.NewStdCombine()
+			})
+
+		errs, err := e.sshPushAgent(
+			context.Background(),
+			bkessh.Hosts{{Address: "10.0.0.1"}},
+			[]byte("kubeconfig"),
+			"/tmp/bkeagent.service",
+		)
+		require.NoError(t, err)
+		assert.Empty(t, errs)
+	})
+}
+
+// ---- executePreCommand ----
+
+func TestEnsureBKEAgentExecutePreCommand(t *testing.T) {
+	t.Run("success no errors", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+		multiCli := bkeAgentGapsNewMultiCli(t)
+
+		patches.ApplyFunc((*bkessh.MultiCli).Run,
+			func(_ *bkessh.MultiCli, _ bkessh.Command) (bkessh.StdCombine, bkessh.StdCombine) {
+				return bkessh.NewStdCombine(), bkessh.NewStdCombine()
+			})
+		patches.ApplyFunc((*bkessh.MultiCli).AvailableHosts,
+			func(_ *bkessh.MultiCli) []string { return []string{"10.0.0.1"} })
+
+		pushAgentErrs := map[string]error{}
+		err := e.executePreCommand(multiCli, pushAgentErrs, false)
+		require.NoError(t, err)
+		assert.Empty(t, pushAgentErrs)
+	})
+
+	t.Run("pre command errors no hosts left", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+		multiCli := bkeAgentGapsNewMultiCli(t)
+
+		patches.ApplyFunc((*bkessh.MultiCli).Run,
+			func(_ *bkessh.MultiCli, _ bkessh.Command) (bkessh.StdCombine, bkessh.StdCombine) {
+				stdErrs := bkessh.NewStdCombine()
+				stdErrs.Add(bkessh.NewCombineOut("10.0.0.1", "pre", "pre command failed"))
+				return stdErrs, bkessh.NewStdCombine()
+			})
+		patches.ApplyFunc((*bkessh.MultiCli).AvailableHosts,
+			func(_ *bkessh.MultiCli) []string { return []string{} })
+
+		pushAgentErrs := map[string]error{}
+		err := e.executePreCommand(multiCli, pushAgentErrs, false)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "No available hosts")
+		require.Contains(t, pushAgentErrs, "10.0.0.1")
+		assert.Contains(t, pushAgentErrs["10.0.0.1"].Error(), "PreCommandFailed")
+	})
+
+	t.Run("pre command errors hosts remain", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+		multiCli := bkeAgentGapsNewMultiCli(t)
+
+		patches.ApplyFunc((*bkessh.MultiCli).Run,
+			func(_ *bkessh.MultiCli, _ bkessh.Command) (bkessh.StdCombine, bkessh.StdCombine) {
+				stdErrs := bkessh.NewStdCombine()
+				stdErrs.Add(bkessh.NewCombineOut("10.0.0.1", "pre", "pre command failed"))
+				return stdErrs, bkessh.NewStdCombine()
+			})
+		patches.ApplyFunc((*bkessh.MultiCli).AvailableHosts,
+			func(_ *bkessh.MultiCli) []string { return []string{"10.0.0.2"} })
+
+		pushAgentErrs := map[string]error{}
+		err := e.executePreCommand(multiCli, pushAgentErrs, false)
+		require.NoError(t, err)
+		require.Contains(t, pushAgentErrs, "10.0.0.1")
+		assert.Contains(t, pushAgentErrs["10.0.0.1"].Error(), "PreCommandFailed")
+	})
+
+	t.Run("nil pushAgentErrs skips map set", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+		multiCli := bkeAgentGapsNewMultiCli(t)
+
+		patches.ApplyFunc((*bkessh.MultiCli).Run,
+			func(_ *bkessh.MultiCli, _ bkessh.Command) (bkessh.StdCombine, bkessh.StdCombine) {
+				stdErrs := bkessh.NewStdCombine()
+				stdErrs.Add(bkessh.NewCombineOut("10.0.0.1", "pre", "pre command failed"))
+				return stdErrs, bkessh.NewStdCombine()
+			})
+		patches.ApplyFunc((*bkessh.MultiCli).AvailableHosts,
+			func(_ *bkessh.MultiCli) []string { return []string{"10.0.0.2"} })
+
+		err := e.executePreCommand(multiCli, nil, false)
+		require.NoError(t, err)
+	})
+}
+
+// ---- executeStartCommand ----
+
+func TestEnsureBKEAgentExecuteStartCommand(t *testing.T) {
+	t.Run("success no errors", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+		multiCli := bkeAgentGapsNewMultiCli(t)
+
+		patches.ApplyFunc((*bkessh.MultiCli).Run,
+			func(_ *bkessh.MultiCli, _ bkessh.Command) (bkessh.StdCombine, bkessh.StdCombine) {
+				return bkessh.NewStdCombine(), bkessh.NewStdCombine()
+			})
+		patches.ApplyFunc((*bkessh.MultiCli).AvailableHosts,
+			func(_ *bkessh.MultiCli) []string { return []string{"10.0.0.1"} })
+
+		pushAgentErrs := map[string]error{}
+		err := e.executeStartCommand(multiCli, []byte("kubeconfig"), "/tmp/bkeagent.service", pushAgentErrs, false)
+		require.NoError(t, err)
+	})
+
+	t.Run("ignores Created symlink stderr", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+		multiCli := bkeAgentGapsNewMultiCli(t)
+
+		patches.ApplyFunc((*bkessh.MultiCli).Run,
+			func(_ *bkessh.MultiCli, _ bkessh.Command) (bkessh.StdCombine, bkessh.StdCombine) {
+				stdErrs := bkessh.NewStdCombine()
+				stdErrs.Add(bkessh.NewCombineOut("10.0.0.1", "start",
+					"Created symlink /etc/systemd/system/multi-user.target.wants/bkeagent.service"))
+				return stdErrs, bkessh.NewStdCombine()
+			})
+		patches.ApplyFunc((*bkessh.MultiCli).AvailableHosts,
+			func(_ *bkessh.MultiCli) []string { return []string{"10.0.0.1"} })
+
+		pushAgentErrs := map[string]error{"10.0.0.1": assertErr("previous error")}
+		err := e.executeStartCommand(multiCli, []byte("kubeconfig"), "/tmp/bkeagent.service", pushAgentErrs, false)
+		require.NoError(t, err)
+		_, exists := pushAgentErrs["10.0.0.1"]
+		assert.False(t, exists, "error should be deleted for Created symlink")
+	})
+
+	t.Run("ignores File exists stderr", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+		multiCli := bkeAgentGapsNewMultiCli(t)
+
+		patches.ApplyFunc((*bkessh.MultiCli).Run,
+			func(_ *bkessh.MultiCli, _ bkessh.Command) (bkessh.StdCombine, bkessh.StdCombine) {
+				stdErrs := bkessh.NewStdCombine()
+				stdErrs.Add(bkessh.NewCombineOut("10.0.0.1", "start",
+					"Failed to execute operation: File exists"))
+				return stdErrs, bkessh.NewStdCombine()
+			})
+		patches.ApplyFunc((*bkessh.MultiCli).AvailableHosts,
+			func(_ *bkessh.MultiCli) []string { return []string{"10.0.0.1"} })
+
+		pushAgentErrs := map[string]error{"10.0.0.1": assertErr("previous error")}
+		err := e.executeStartCommand(multiCli, []byte("kubeconfig"), "/tmp/bkeagent.service", pushAgentErrs, false)
+		require.NoError(t, err)
+		_, exists := pushAgentErrs["10.0.0.1"]
+		assert.False(t, exists, "error should be deleted for File exists")
+	})
+
+	t.Run("start command fails no hosts left", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+		multiCli := bkeAgentGapsNewMultiCli(t)
+
+		patches.ApplyFunc((*bkessh.MultiCli).Run,
+			func(_ *bkessh.MultiCli, _ bkessh.Command) (bkessh.StdCombine, bkessh.StdCombine) {
+				stdErrs := bkessh.NewStdCombine()
+				stdErrs.Add(bkessh.NewCombineOut("10.0.0.1", "start", "real failure"))
+				return stdErrs, bkessh.NewStdCombine()
+			})
+		patches.ApplyFunc((*bkessh.MultiCli).AvailableHosts,
+			func(_ *bkessh.MultiCli) []string { return []string{} })
+
+		pushAgentErrs := map[string]error{}
+		err := e.executeStartCommand(multiCli, []byte("kubeconfig"), "/tmp/bkeagent.service", pushAgentErrs, false)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "No available hosts")
+		require.Contains(t, pushAgentErrs, "10.0.0.1")
+		assert.Contains(t, pushAgentErrs["10.0.0.1"].Error(), "real failure")
+	})
+
+	t.Run("start command fails hosts remain", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newBKEAgentPhaseCov(t, bkeAgentCluster())
+		multiCli := bkeAgentGapsNewMultiCli(t)
+
+		patches.ApplyFunc((*bkessh.MultiCli).Run,
+			func(_ *bkessh.MultiCli, _ bkessh.Command) (bkessh.StdCombine, bkessh.StdCombine) {
+				stdErrs := bkessh.NewStdCombine()
+				stdErrs.Add(bkessh.NewCombineOut("10.0.0.1", "start", "real failure"))
+				return stdErrs, bkessh.NewStdCombine()
+			})
+		patches.ApplyFunc((*bkessh.MultiCli).AvailableHosts,
+			func(_ *bkessh.MultiCli) []string { return []string{"10.0.0.2"} })
+
+		pushAgentErrs := map[string]error{}
+		err := e.executeStartCommand(multiCli, []byte("kubeconfig"), "/tmp/bkeagent.service", pushAgentErrs, false)
+		require.NoError(t, err)
+		require.Contains(t, pushAgentErrs, "10.0.0.1")
+		assert.Contains(t, pushAgentErrs["10.0.0.1"].Error(), "real failure")
+	})
+}
+
+// createRetryTestBKENode creates a BKENode CRD object for testing retry logic.
+func createRetryTestBKENode(name, namespace, clusterName, ip string, role []string, retryCount int) *confv1beta1.BKENode {
+	return &confv1beta1.BKENode{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels:    map[string]string{"cluster.x-k8s.io/cluster-name": clusterName},
+		},
+		Spec: confv1beta1.BKENodeSpec{
+			IP:   ip,
+			Role: role,
+		},
+		Status: confv1beta1.BKENodeStatus{
+			RetryCount: retryCount,
+		},
+	}
+}
+
+// createRetryTestPhaseContext creates a PhaseContext with BKENode objects in the fake client.
+func createRetryTestPhaseContext(bkeCluster *bkev1beta1.BKECluster, bkeNodes ...*confv1beta1.BKENode) *phaseframe.PhaseContext {
+	scheme := runtime.NewScheme()
+	_ = bkev1beta1.AddToScheme(scheme)
+
+	objs := []client.Object{bkeCluster}
+	for _, n := range bkeNodes {
+		objs = append(objs, n)
+	}
+
+	builder := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...)
+	for _, n := range bkeNodes {
+		builder = builder.WithStatusSubresource(n)
+	}
+	c := builder.Build()
+
+	recorder := &fakeRecorder{}
+	return &phaseframe.PhaseContext{
+		BKECluster: bkeCluster,
+		Log:        bkev1beta1.NewBKELogger(nil, recorder, bkeCluster),
+		Client:     c,
+		Scheme:     scheme,
+		Context:    context.Background(),
+	}
+}
+
+// TestEnsureBKEAgent_UpdateNodeStatus_WorkerRetryIncrement tests that RetryCount
+// increments on worker node failure without setting NeedSkip when below ReconcileAllowedFailedCount.
+func TestEnsureBKEAgent_UpdateNodeStatus_WorkerRetryIncrement(t *testing.T) {
+	origAllowed := statusmanage.ReconcileAllowedFailedCount
+	t.Cleanup(func() { statusmanage.ReconcileAllowedFailedCount = origAllowed })
+	statusmanage.ReconcileAllowedFailedCount = 3
+
+	bkeCluster := createTestBKECluster(createTestNodes(1))
+	workerNode := createRetryTestBKENode(
+		"test-cluster-127-0-0-1", testNamespace, testClusterName,
+		testNodeIP1, []string{bkenode.WorkerNodeRole}, 0,
+	)
+
+	ctx := createRetryTestPhaseContext(bkeCluster, workerNode)
+	e := &EnsureBKEAgent{BasePhase: phaseframe.BasePhase{Ctx: ctx}}
+
+	// Simulate first failure (ping failure path in updateNodeStatus)
+	e.updateNodeStatus(bkeCluster, []string{}, []string{testNodeIP1})
+
+	updated := &confv1beta1.BKENode{}
+	err := ctx.Client.Get(context.Background(), client.ObjectKey{
+		Name:      "test-cluster-127-0-0-1",
+		Namespace: testNamespace,
+	}, updated)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, updated.Status.RetryCount)
+	assert.False(t, updated.Status.NeedSkip)
+}
+
+// TestEnsureBKEAgent_UpdateNodeStatus_WorkerMaxRetryNeedSkip tests that NeedSkip is set
+// when RetryCount reaches ReconcileAllowedFailedCount on continued failure.
+func TestEnsureBKEAgent_UpdateNodeStatus_WorkerMaxRetryNeedSkip(t *testing.T) {
+	origAllowed := statusmanage.ReconcileAllowedFailedCount
+	t.Cleanup(func() { statusmanage.ReconcileAllowedFailedCount = origAllowed })
+	statusmanage.ReconcileAllowedFailedCount = 3
+
+	bkeCluster := createTestBKECluster(createTestNodes(1))
+	workerNode := createRetryTestBKENode(
+		"test-cluster-127-0-0-1", testNamespace, testClusterName,
+		testNodeIP1, []string{bkenode.WorkerNodeRole}, statusmanage.ReconcileAllowedFailedCount-1,
+	)
+
+	ctx := createRetryTestPhaseContext(bkeCluster, workerNode)
+	e := &EnsureBKEAgent{BasePhase: phaseframe.BasePhase{Ctx: ctx}}
+
+	// Simulate failure that pushes RetryCount to ReconcileAllowedFailedCount
+	e.updateNodeStatus(bkeCluster, []string{}, []string{testNodeIP1})
+
+	updated := &confv1beta1.BKENode{}
+	err := ctx.Client.Get(context.Background(), client.ObjectKey{
+		Name:      "test-cluster-127-0-0-1",
+		Namespace: testNamespace,
+	}, updated)
+	assert.NoError(t, err)
+	assert.Equal(t, statusmanage.ReconcileAllowedFailedCount, updated.Status.RetryCount)
+	assert.True(t, updated.Status.NeedSkip)
+}
+
+func TestEnsureBKEAgent_UpdateNodeStatus_SuccessResetsState(t *testing.T) {
+	origAllowed := statusmanage.ReconcileAllowedFailedCount
+	t.Cleanup(func() { statusmanage.ReconcileAllowedFailedCount = origAllowed })
+	statusmanage.ReconcileAllowedFailedCount = 3
+
+	bkeCluster := createTestBKECluster(createTestNodes(1))
+	masterNode := createRetryTestBKENode(
+		"test-cluster-127-0-0-1", testNamespace, testClusterName,
+		testNodeIP1, []string{bkenode.MasterNodeRole}, 0,
+	)
+
+	ctx := createRetryTestPhaseContext(bkeCluster, masterNode)
+	e := &EnsureBKEAgent{BasePhase: phaseframe.BasePhase{Ctx: ctx}}
+
+	e.updateNodeStatus(bkeCluster, []string{}, []string{testNodeIP1})
+
+	failedNode := &confv1beta1.BKENode{}
+	_ = ctx.Client.Get(context.Background(), client.ObjectKey{
+		Name: "test-cluster-127-0-0-1", Namespace: testNamespace,
+	}, failedNode)
+	assert.Equal(t, bkev1beta1.NodeInitFailed, failedNode.Status.State)
+
+	e.updateNodeStatus(bkeCluster, []string{testNodeIP1}, []string{})
+
+	successNode := &confv1beta1.BKENode{}
+	err := ctx.Client.Get(context.Background(), client.ObjectKey{
+		Name: "test-cluster-127-0-0-1", Namespace: testNamespace,
+	}, successNode)
+	assert.NoError(t, err)
+	assert.Equal(t, bkev1beta1.NodeInitializing, successNode.Status.State)
+	assert.True(t, successNode.Status.StateCode&bkev1beta1.NodeAgentReadyFlag != 0)
+	assert.True(t, successNode.Status.StateCode&bkev1beta1.NodeAgentPushedFlag != 0)
+	assert.Equal(t, 0, successNode.Status.RetryCount)
+}
+
+func TestEnsureBKEAgent_CheckAllOrPushedAgentsFailed_AllSkipped(t *testing.T) {
+	origAllowed := statusmanage.ReconcileAllowedFailedCount
+	t.Cleanup(func() { statusmanage.ReconcileAllowedFailedCount = origAllowed })
+	statusmanage.ReconcileAllowedFailedCount = 3
+
+	bkeCluster := createTestBKECluster(createTestNodes(two))
+	workerNode := createRetryTestBKENode(
+		"test-cluster-127-0-0-2", testNamespace, testClusterName,
+		testNodeIP2, []string{bkenode.WorkerNodeRole}, statusmanage.ReconcileAllowedFailedCount,
+	)
+	workerNode.Status.NeedSkip = true
+
+	ctx := createRetryTestPhaseContext(bkeCluster, workerNode)
+	e := &EnsureBKEAgent{
+		BasePhase:     phaseframe.BasePhase{Ctx: ctx},
+		needPushNodes: bkenode.Nodes{{IP: testNodeIP2, Hostname: testHostname2}},
+	}
+
+	err := e.checkAllOrPushedAgentsFailed([]string{}, []string{testNodeIP2})
+	assert.NoError(t, err)
+}
+
+func TestEnsureBKEAgent_CheckAllOrPushedAgentsFailed_NotAllSkipped(t *testing.T) {
+	origAllowed := statusmanage.ReconcileAllowedFailedCount
+	t.Cleanup(func() { statusmanage.ReconcileAllowedFailedCount = origAllowed })
+	statusmanage.ReconcileAllowedFailedCount = 3
+
+	bkeCluster := createTestBKECluster(createTestNodes(two))
+	workerNode := createRetryTestBKENode(
+		"test-cluster-127-0-0-2", testNamespace, testClusterName,
+		testNodeIP2, []string{bkenode.WorkerNodeRole}, 0,
+	)
+
+	ctx := createRetryTestPhaseContext(bkeCluster, workerNode)
+	e := &EnsureBKEAgent{
+		BasePhase:     phaseframe.BasePhase{Ctx: ctx},
+		needPushNodes: bkenode.Nodes{{IP: testNodeIP2, Hostname: testHostname2}},
+	}
+
+	err := e.checkAllOrPushedAgentsFailed([]string{}, []string{testNodeIP2})
+	assert.Error(t, err)
+}
+
+// TestEnsureBKEAgent_UpdateNodeStatus_WorkerSuccessResetsRetry tests that RetryCount
+// is reset to 0 when the worker node succeeds.
+func TestEnsureBKEAgent_UpdateNodeStatus_WorkerSuccessResetsRetry(t *testing.T) {
+	origAllowed := statusmanage.ReconcileAllowedFailedCount
+	t.Cleanup(func() { statusmanage.ReconcileAllowedFailedCount = origAllowed })
+	statusmanage.ReconcileAllowedFailedCount = 3
+
+	bkeCluster := createTestBKECluster(createTestNodes(1))
+	workerNode := createRetryTestBKENode(
+		"test-cluster-127-0-0-1", testNamespace, testClusterName,
+		testNodeIP1, []string{bkenode.WorkerNodeRole}, 2,
+	)
+
+	ctx := createRetryTestPhaseContext(bkeCluster, workerNode)
+	e := &EnsureBKEAgent{BasePhase: phaseframe.BasePhase{Ctx: ctx}}
+
+	// Simulate success
+	e.updateNodeStatus(bkeCluster, []string{testNodeIP1}, []string{})
+
+	updated := &confv1beta1.BKENode{}
+	err := ctx.Client.Get(context.Background(), client.ObjectKey{
+		Name:      "test-cluster-127-0-0-1",
+		Namespace: testNamespace,
+	}, updated)
+	assert.NoError(t, err)
+	assert.Equal(t, 0, updated.Status.RetryCount)
+	assert.False(t, updated.Status.NeedSkip)
+}
+
+// TestEnsureBKEAgent_UpdateNodeStatus_MasterFailureIncrementsRetry tests that master node
+// failure increments RetryCount but does NOT set NeedSkip.
+func TestEnsureBKEAgent_UpdateNodeStatus_MasterFailureIncrementsRetry(t *testing.T) {
+	origAllowed := statusmanage.ReconcileAllowedFailedCount
+	t.Cleanup(func() { statusmanage.ReconcileAllowedFailedCount = origAllowed })
+	statusmanage.ReconcileAllowedFailedCount = 3
+
+	bkeCluster := createTestBKECluster(createTestNodes(1))
+	masterNode := createRetryTestBKENode(
+		"test-cluster-127-0-0-1", testNamespace, testClusterName,
+		testNodeIP1, []string{bkenode.MasterNodeRole}, 0,
+	)
+
+	ctx := createRetryTestPhaseContext(bkeCluster, masterNode)
+	e := &EnsureBKEAgent{BasePhase: phaseframe.BasePhase{Ctx: ctx}}
+
+	// Simulate failure
+	e.updateNodeStatus(bkeCluster, []string{}, []string{testNodeIP1})
+
+	updated := &confv1beta1.BKENode{}
+	err := ctx.Client.Get(context.Background(), client.ObjectKey{
+		Name:      "test-cluster-127-0-0-1",
+		Namespace: testNamespace,
+	}, updated)
+	assert.NoError(t, err)
+	assert.Equal(t, 1, updated.Status.RetryCount)
+	assert.False(t, updated.Status.NeedSkip)
 }

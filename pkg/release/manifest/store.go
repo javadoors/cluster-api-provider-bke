@@ -67,7 +67,7 @@ func (s *Store) RefreshRelease(ctx context.Context, ref ReleaseRef) (*Bundle, *B
 	}
 	cached, cacheErr := s.loadDiskCache(ref)
 	if cacheErr != nil {
-		return nil, nil, fmt.Errorf("refresh release failed: pull=%v; cache=%v", err, cacheErr)
+		return nil, nil, fmt.Errorf("refresh release failed: pull=%w; cache=%w", err, cacheErr)
 	}
 	files = &BundleFiles{Files: cached.Files}
 	return cached, files, nil

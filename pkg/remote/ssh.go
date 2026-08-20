@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -18,6 +18,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pkg/errors"
@@ -28,6 +29,7 @@ import (
 
 type Ssh struct {
 	sshClient *gossh.Client
+	mu        sync.RWMutex
 	alive     bool
 }
 
@@ -88,7 +90,12 @@ func (s *Ssh) Exec(cmd string) ([]string, []string, error) {
 	var stdErrs []string
 	var stdOuts []string
 
-	if s.sshClient == nil {
+	s.mu.RLock()
+	client := s.sshClient
+	alive := s.alive
+	s.mu.RUnlock()
+
+	if client == nil {
 		return stdErrs, stdOuts, errors.New("Before run, have to new a ssh client")
 	}
 
@@ -98,11 +105,11 @@ func (s *Ssh) Exec(cmd string) ([]string, []string, error) {
 	}
 
 	// 判断ssh连接是否关闭
-	if !s.alive {
+	if !alive {
 		return stdErrs, stdOuts, errors.New("ssh client is not alive，skip this command")
 	}
 
-	session, err := s.sshClient.NewSession()
+	session, err := client.NewSession()
 	if err != nil {
 		return stdErrs, stdOuts, errors.Wrap(err, "Create session failed")
 	}
@@ -180,6 +187,9 @@ func (s *Ssh) readPipe(reader *bufio.Reader) (string, error) {
 }
 
 func (s *Ssh) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if s.sshClient == nil || !s.alive {
 		return nil
 	}

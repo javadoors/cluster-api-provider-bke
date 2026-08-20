@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -81,6 +81,8 @@ const (
 	BKEAgentUnknownReason = "BKEAgentUnknown"
 	// BKEAgentUpdatingReason (Severity=Info) documents that the BKEAgent is updating
 	BKEAgentUpdatingReason = "BKEAgentPushing"
+	// BKEAgentSkipFailedNodesReason (Severity=Info) documents that failed nodes are skipped after NeedSkip
+	BKEAgentSkipFailedNodesReason = "BKEAgentSkipFailedNodes"
 
 	// LoadBalancerReadyReason (Severity=Info) documents that the LoadBalancer is ready
 	LoadBalancerReadyReason = "LoadBalancerReady"
@@ -261,6 +263,15 @@ const (
 	EnvExtraExecScriptFailed  = "EnvExtraExecScriptFailed"
 	EnvExtraExecScriptSuccess = "EnvExtraExecScriptSuccess"
 	EnvExtraExecScriptSkip    = "EnvExtraExecScriptSkip"
+
+	// ManualInterventionRequiredReason (Severity=Warning) documents that manual intervention is required
+	ManualInterventionRequiredReason = "ManualInterventionRequired"
+	// MasterInitTimeoutReason (Severity=Warning) documents that master initialization timed out
+	MasterInitTimeoutReason = "MasterInitTimeout"
+	// NodeBootstrapTerminalReason (Severity=Warning) documents that node bootstrap failed permanently
+	NodeBootstrapTerminalReason = "NodeBootstrapTerminal"
+	// RetryExhaustedReason (Severity=Warning) documents that retry limit has been exhausted
+	RetryExhaustedReason = "RetryExhausted"
 )
 
 const (

@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -13,6 +13,9 @@
 package mfutil
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"text/template"
 
@@ -262,4 +265,20 @@ func TestIsUpgradeWithOpenFuyao(t *testing.T) {
 			assert.Equal(t, tt.want, result)
 		})
 	}
+}
+
+func fallbackDetectUpgradeWithOpenFuyao() bool {
+	if _, err := os.Stat("/etc/kubernetes/webhook/webhook-config.yaml"); err == nil {
+		return true
+	}
+	manifest := filepath.Join(GetDefaultManifestsPath(), "kube-apiserver.yaml")
+	if data, err := os.ReadFile(manifest); err == nil {
+		return strings.Contains(string(data), "authentication-token-webhook-config-file")
+	}
+	return false
+}
+
+func TestIsUpgradeWithOpenFuyao_NilScopeUsesFallback(t *testing.T) {
+	want := fallbackDetectUpgradeWithOpenFuyao()
+	assert.Equal(t, want, isUpgradeWithOpenFuyao(nil))
 }

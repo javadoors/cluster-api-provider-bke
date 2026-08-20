@@ -331,6 +331,10 @@ spec:
                 description: NeedSkip indicates whether this node should be skipped
                   during operations
                 type: boolean
+              retryCount:
+                description: RetryCount is the number of agent push retries for this
+                  node
+                type: integer
               state:
                 description: State is the current state of the node
                 type: string

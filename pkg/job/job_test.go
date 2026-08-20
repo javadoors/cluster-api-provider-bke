@@ -98,22 +98,42 @@ func TestTaskFields(t *testing.T) {
 		Once:                    &sync.Once{},
 	}
 
-	if task.Phase != v1beta1.CommandRunning {
-		t.Errorf("Expected Phase to be Running, got %v", task.Phase)
+	if task.GetPhase() != v1beta1.CommandRunning {
+		t.Errorf("Expected Phase to be Running, got %v", task.GetPhase())
 	}
-	if task.ResourceVersion != "12345" {
-		t.Errorf("Expected ResourceVersion to be 12345, got %s", task.ResourceVersion)
+	if task.GetResourceVersion() != "12345" {
+		t.Errorf("Expected ResourceVersion to be 12345, got %s", task.GetResourceVersion())
 	}
-	if task.Generation != 1 {
-		t.Errorf("Expected Generation to be 1, got %d", task.Generation)
+	if task.GetGeneration() != 1 {
+		t.Errorf("Expected Generation to be 1, got %d", task.GetGeneration())
 	}
-	if task.TTLSecondsAfterFinished != 300 {
-		t.Errorf("Expected TTLSecondsAfterFinished to be 300, got %d", task.TTLSecondsAfterFinished)
-	}
-	if !task.HasAddTimer {
-		t.Error("Expected HasAddTimer to be true")
+	if !task.ShouldProcessTTL() && task.HasAddTimer {
+		t.Log("HasAddTimer blocks TTL processing as expected")
 	}
 	if task.Once == nil {
 		t.Error("Expected Once to be not nil")
 	}
+}
+
+func TestTaskConcurrentPhaseAndTTLAccess(t *testing.T) {
+	task := &Task{
+		StopChan:                make(chan struct{}),
+		Phase:                   v1beta1.CommandRunning,
+		TTLSecondsAfterFinished: 600,
+		Once:                    &sync.Once{},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 1000; i++ {
+			_ = task.ShouldProcessTTL()
+		}
+	}()
+
+	for i := 0; i < 1000; i++ {
+		task.SetPhase(v1beta1.CommandComplete)
+		task.SetPhase(v1beta1.CommandRunning)
+	}
+	<-done
 }

@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -14,8 +14,8 @@ package phases
 
 import (
 	"context"
+	"fmt"
 
-	"github.com/pkg/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -122,15 +122,21 @@ func (e *EnsurePaused) pauseOrResumeCommands(params PauseOperationParams) error 
 	commandLi := &agentv1beta1.CommandList{}
 	filters := phaseutil.GetListFiltersByBKECluster(params.BKECluster)
 	if err := params.Client.List(params.Ctx, commandLi, filters...); err != nil {
-		params.Log.Error(constant.ReconcileErrorReason, "Failed to list command: %v", err)
-		return errors.Errorf("failed to list command: %v", err)
+		return fmt.Errorf("failed to list command: %w", err)
 	}
 
 	// pause || resume all command in cluster
 	for _, cmd := range commandLi.Items {
 		if cmd.Spec.Suspend != params.BKECluster.Spec.Pause {
-			cmd.Spec.Suspend = params.BKECluster.Spec.Pause
-			if err := params.Client.Update(params.Ctx, &cmd); err != nil {
+			err := phaseutil.RetryOnConflict(func() error {
+				latestCommand := &agentv1beta1.Command{}
+				if err := params.Client.Get(params.Ctx, client.ObjectKey{Name: cmd.Name, Namespace: cmd.Namespace}, latestCommand); err != nil {
+					return err
+				}
+				latestCommand.Spec.Suspend = params.BKECluster.Spec.Pause
+				return params.Client.Update(params.Ctx, latestCommand)
+			})
+			if err != nil {
 				params.Log.Warn(constant.ReconcileErrorReason, "Failed to Suspend command %q, err: %v", cmd.Name, err)
 				continue
 			}

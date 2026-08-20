@@ -23,6 +23,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/annotation"
 )
 
 const (
@@ -52,34 +54,34 @@ func GetDeploymentImage(ctx context.Context, cli client.Client, target Deploymen
 
 // PatchDeploymentImage 更新 Deployment 指定容器的镜像
 func PatchDeploymentImage(ctx context.Context, cli client.Client, target DeploymentTarget, image string) error {
-	var deploy appsv1.Deployment
-	if err := cli.Get(ctx, types.NamespacedName{Namespace: target.Namespace, Name: target.Name}, &deploy); err != nil {
-		return fmt.Errorf("get Deployment: %w", err)
-	}
-
-	// 更新容器镜像
-	updated := false
-	for i := range deploy.Spec.Template.Spec.Containers {
-		if deploy.Spec.Template.Spec.Containers[i].Name == target.Container {
-			deploy.Spec.Template.Spec.Containers[i].Image = image
-			updated = true
-			break
+	return RetryOnConflict(func() error {
+		var deploy appsv1.Deployment
+		if err := cli.Get(ctx, types.NamespacedName{Namespace: target.Namespace, Name: target.Name}, &deploy); err != nil {
+			return fmt.Errorf("get Deployment: %w", err)
 		}
-	}
-	if !updated {
-		return fmt.Errorf("容器 %s 未找到", target.Container)
-	}
 
-	// 打时间戳注解触发滚动
-	if deploy.Spec.Template.Annotations == nil {
-		deploy.Spec.Template.Annotations = make(map[string]string)
-	}
-	deploy.Spec.Template.Annotations["bke.openfuyao.cn/restartedAt"] = time.Now().Format(time.RFC3339)
+		updated := false
+		for i := range deploy.Spec.Template.Spec.Containers {
+			if deploy.Spec.Template.Spec.Containers[i].Name == target.Container {
+				deploy.Spec.Template.Spec.Containers[i].Image = image
+				updated = true
+				break
+			}
+		}
+		if !updated {
+			return fmt.Errorf("容器 %s 未找到", target.Container)
+		}
 
-	if err := cli.Update(ctx, &deploy); err != nil {
-		return fmt.Errorf("update Deployment: %w", err)
-	}
-	return nil
+		if deploy.Spec.Template.Annotations == nil {
+			deploy.Spec.Template.Annotations = make(map[string]string)
+		}
+		deploy.Spec.Template.Annotations[annotation.ProviderRestartedAtAnnotationKey] = time.Now().Format(time.RFC3339)
+
+		if err := cli.Update(ctx, &deploy); err != nil {
+			return fmt.Errorf("update Deployment: %w", err)
+		}
+		return nil
+	})
 }
 
 // WaitDeploymentReady 等待 Deployment Available 且存在使用目标镜像的 Ready Pod

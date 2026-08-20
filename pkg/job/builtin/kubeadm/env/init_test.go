@@ -5,7 +5,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT
@@ -24,17 +24,20 @@ import (
 	"testing"
 
 	"github.com/agiledragon/gomonkey/v2"
+	containerdapi "github.com/containerd/containerd"
 	"github.com/stretchr/testify/assert"
 
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
 	bkeinit "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/initialize"
 	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
 	bkesource "gopkg.openfuyao.cn/cluster-api-provider-bke/common/source"
+	execcontainerd "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/executor/containerd"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/executor/docker"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/executor/exec"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/httprepo"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/initsystem"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/runtime"
 )
 
 const (
@@ -77,6 +80,25 @@ func (m *mockInitSystem) ServiceStart(_ string) error {
 func (m *mockInitSystem) ServiceStop(_ string) error {
 	return nil
 }
+
+type failingContainerdClient struct {
+	images []string
+}
+
+func (f *failingContainerdClient) Pull(execcontainerd.ImageRef) error     { return nil }
+func (f *failingContainerdClient) Close()                                 {}
+func (f *failingContainerdClient) Stop(string) error                      { return nil }
+func (f *failingContainerdClient) Delete(string) error                    { return nil }
+func (f *failingContainerdClient) Run(execcontainerd.ContainerSpec) error { return nil }
+func (f *failingContainerdClient) EnsureImageExists(image execcontainerd.ImageRef) error {
+	f.images = append(f.images, image.Image)
+	return fmt.Errorf("pull failed")
+}
+func (f *failingContainerdClient) EnsureContainerRun(string) (bool, error) { return false, nil }
+func (f *failingContainerdClient) ContainerList(...string) ([]containerdapi.Container, error) {
+	return nil, nil
+}
+func (f *failingContainerdClient) Ping() error { return nil }
 
 func (m *mockInitSystem) ServiceRestart(_ string) error {
 	return nil
@@ -1503,5 +1525,111 @@ func TestInstallNfsUtilIfNeededComplete(t *testing.T) {
 			machine:    machine,
 		}
 		ep.installNfsUtilIfNeeded()
+	}
+}
+
+func TestInitImageIgnoreContainerdPullFailure(t *testing.T) {
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+
+	fakeClient := &failingContainerdClient{}
+	patches.ApplyFunc(runtime.DetectRuntime, func() string {
+		return runtime.ContainerRuntimeContainerd
+	})
+	patches.ApplyFunc(execcontainerd.NewContainedClient, func() (execcontainerd.ContainerdClient, error) {
+		return fakeClient, nil
+	})
+
+	ep := &EnvPlugin{
+		bkeConfig: &bkev1beta1.BKEConfig{
+			Cluster: bkev1beta1.Cluster{
+				KubernetesVersion: "v1.28.0",
+			},
+			Addons: []bkev1beta1.Product{{Name: "calico", Version: "v3.31.3"}},
+		},
+		currenNode: bkenode.Node{
+			IP:   testIP.String(),
+			Role: []string{"node"},
+		},
+	}
+
+	err := ep.initImage()
+
+	assert.NoError(t, err)
+	assert.ElementsMatch(t, []string{
+		"hub.oepkgs.net/openfuyao/calico/cni:v3.31.3",
+		"hub.oepkgs.net/openfuyao/calico/node:v3.31.3",
+	}, fakeClient.images)
+}
+func TestExportImageListWithCalicoWorkerNode(t *testing.T) {
+	cfg := &bkev1beta1.BKEConfig{
+		Cluster: bkev1beta1.Cluster{
+			KubernetesVersion: "v1.28.0",
+		},
+		Addons: []bkev1beta1.Product{{Name: "calico", Version: "v3.31.3"}},
+	}
+
+	ep := &EnvPlugin{
+		bkeConfig: cfg,
+		currenNode: bkenode.Node{
+			IP:   testIP.String(),
+			Role: []string{"node"},
+		},
+	}
+
+	images, err := ep.exportImageListWithError()
+
+	assert.NoError(t, err)
+	assert.ElementsMatch(t, []string{
+		"hub.oepkgs.net/openfuyao/calico/cni:v3.31.3",
+		"hub.oepkgs.net/openfuyao/calico/node:v3.31.3",
+	}, images)
+}
+
+func TestExportImageListWithCalicoMasterNode(t *testing.T) {
+	cfg := &bkev1beta1.BKEConfig{
+		Cluster: bkev1beta1.Cluster{
+			KubernetesVersion: "v1.28.0",
+		},
+		Addons: []bkev1beta1.Product{{Name: "calico", Version: "v3.31.3"}},
+	}
+
+	ep := &EnvPlugin{
+		bkeConfig: cfg,
+		currenNode: bkenode.Node{
+			IP:   testIP.String(),
+			Role: []string{"master"},
+		},
+	}
+
+	images, err := ep.exportImageListWithError()
+
+	assert.NoError(t, err)
+	assert.Contains(t, images, "hub.oepkgs.net/openfuyao/calico/cni:v3.31.3")
+	assert.Contains(t, images, "hub.oepkgs.net/openfuyao/calico/node:v3.31.3")
+	assert.Greater(t, len(images), 2)
+}
+
+func TestExportImageListWithInvalidCalicoAddon(t *testing.T) {
+	tests := []struct {
+		name   string
+		addons []bkev1beta1.Product
+	}{
+		{name: "empty version", addons: []bkev1beta1.Product{{Name: "calico"}}},
+		{name: "multiple calico", addons: []bkev1beta1.Product{{Name: "calico", Version: "v3.31.3"}, {Name: "calico", Version: "v3.31.3"}}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &bkev1beta1.BKEConfig{
+				Cluster: bkev1beta1.Cluster{KubernetesVersion: "v1.28.0"},
+				Addons:  tt.addons,
+			}
+			ep := &EnvPlugin{bkeConfig: cfg}
+
+			_, err := ep.exportImageListWithError()
+
+			assert.Error(t, err)
+		})
 	}
 }

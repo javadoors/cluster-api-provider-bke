@@ -18,7 +18,7 @@ import (
 	"sync"
 	"testing"
 
-	olog "gopkg.openfuyao.cn/common-modules/ologger/log"
+	olog "gopkg.openfuyao.cn/common-modules/ologger/v26/log"
 )
 
 func TestDefaultDelegation(t *testing.T) {
@@ -138,4 +138,33 @@ func TestInitDoesNotPanicOnDiscard(t *testing.T) {
 	}))
 	_ = io.Discard
 	Info("discard path")
+}
+
+func TestAllLogLevelsWithInjectedLogger(t *testing.T) {
+	t.Cleanup(func() { SetLogger(nil) })
+
+	enableConsole := false
+	enableFile := false
+	cfg := olog.Config{
+		Level:         olog.TRACE,
+		Format:        "json",
+		EnableConsole: &enableConsole,
+		EnableFile:    &enableFile,
+	}
+	SetLogger(olog.NewLogger(cfg))
+
+	Trace("trace")
+	Tracef("trace %s", "msg")
+	Log(olog.INFO, "log")
+	Logf(olog.INFO, "log %s", "msg")
+	Debug("debug")
+	Debugf("debug %s", "msg")
+	Info("info")
+	Infof("info %s", "msg")
+	Warn("warn")
+	Warnf("warn %s", "msg")
+	Error("error")
+	Errorf("error %s", "msg")
+	Critical("critical")
+	Criticalf("critical %s", "msg")
 }

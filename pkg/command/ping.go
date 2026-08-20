@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -56,11 +56,15 @@ func (p *Ping) Wait() (error, []string, []string) {
 	err, complete, nodes := p.waitCommandComplete()
 	// means all command not executed
 	if !complete && len(nodes.FailedNodes) == 0 {
+		successIPs := make([]string, 0, len(nodes.SuccessNodes))
+		for _, s := range nodes.SuccessNodes {
+			successIPs = append(successIPs, utils.GetNodeIPFromCommandWaitResult(s))
+		}
 		for _, node := range p.Nodes {
-			if utils.ContainsString(nodes.SuccessNodes, node.Hostname) {
+			if utils.ContainsString(successIPs, node.IP) {
 				continue
 			}
-			nodes.FailedNodes = append(nodes.FailedNodes, node.Hostname)
+			nodes.FailedNodes = append(nodes.FailedNodes, node.IP)
 		}
 	}
 	return err, nodes.SuccessNodes, nodes.FailedNodes

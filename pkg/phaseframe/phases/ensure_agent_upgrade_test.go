@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -13,17 +13,24 @@
 package phases
 
 import (
+	"context"
 	"testing"
 
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/stretchr/testify/assert"
-	ctrl "sigs.k8s.io/controller-runtime"
-
+	"github.com/stretchr/testify/require"
 	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
 	bkeinit "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/initialize"
+	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil/agentssh"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/upgrade"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/nodeutil"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	ctrl "sigs.k8s.io/controller-runtime"
 )
 
 func TestEnsureAgentUpgradeConstants(t *testing.T) {
@@ -128,4 +135,212 @@ func TestEnsureAgentUpgrade_Execute_SSHUpgrade(t *testing.T) {
 	result, err := e.Execute()
 	assert.NoError(t, err)
 	assert.Equal(t, ctrl.Result{}, result)
+}
+
+func newAgentUpgradePhaseCov(t *testing.T, bkeCluster *bkev1beta1.BKECluster) *EnsureAgentUpgrade {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	require.NoError(t, bkev1beta1.AddToScheme(scheme))
+	ctx := &phaseframe.PhaseContext{
+		Context:    context.Background(),
+		BKECluster: bkeCluster,
+		Scheme:     scheme,
+		Log:        bkev1beta1.NewBKELogger(nil, &fakeRecorder{}, bkeCluster),
+	}
+	return &EnsureAgentUpgrade{BasePhase: phaseframe.BasePhase{Ctx: ctx}}
+}
+
+func bkeNodesFor(ip, role string) bkev1beta1.BKENodes {
+	return bkev1beta1.BKENodes{{Spec: confv1beta1.BKENodeSpec{IP: ip, Role: []string{role}}}}
+}
+
+// ---- upgradeFailure (pure) ----
+
+func TestEnsureAgentUpgradeUpgradeFailure(t *testing.T) {
+	e := newAgentUpgradePhaseCov(t, &bkev1beta1.BKECluster{ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "ns"}})
+
+	t.Run("failure on master node", func(t *testing.T) {
+		nodes := bkenode.Nodes{{IP: "192.168.1.1", Role: []string{"master"}}}
+		failures := map[string]error{"192.168.1.1": assertErr("ssh fail")}
+		err := e.upgradeFailure(nodes, failures, 0, 1)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "failed on master node(s)")
+	})
+
+	t.Run("failure on worker node", func(t *testing.T) {
+		nodes := bkenode.Nodes{{IP: "192.168.1.1", Role: []string{"master"}}, {IP: "192.168.1.2", Role: []string{"worker"}}}
+		failures := map[string]error{"192.168.1.2": assertErr("ssh fail")}
+		err := e.upgradeFailure(nodes, failures, 1, 2)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "bkeagent ssh upgrade failed")
+		assert.NotContains(t, err.Error(), "master node(s)")
+	})
+
+	t.Run("empty failures", func(t *testing.T) {
+		nodes := bkenode.Nodes{{IP: "192.168.1.1", Role: []string{"master"}}}
+		err := e.upgradeFailure(nodes, map[string]error{}, 1, 1)
+		require.Error(t, err)
+	})
+}
+
+// ---- upgradeBKEAgentViaSSH (real body via seams) ----
+
+func TestEnsureAgentUpgradeUpgradeBKEAgentViaSSH(t *testing.T) {
+	t.Run("get bke nodes error returns nil", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newAgentUpgradePhaseCov(t, &bkev1beta1.BKECluster{ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "ns"}})
+		patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapper, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (bkev1beta1.BKENodes, error) {
+			return nil, assertErr("fetch failed")
+		})
+		require.NoError(t, e.upgradeBKEAgentViaSSH())
+	})
+
+	t.Run("no nodes returns error", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newAgentUpgradePhaseCov(t, &bkev1beta1.BKECluster{ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "ns"}})
+		patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapper, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (bkev1beta1.BKENodes, error) {
+			return bkev1beta1.BKENodes{}, nil
+		})
+		err := e.upgradeBKEAgentViaSSH()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "no cluster nodes")
+	})
+
+	t.Run("discover archs error", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newAgentUpgradePhaseCov(t, &bkev1beta1.BKECluster{ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "ns"}})
+		patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapper, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (bkev1beta1.BKENodes, error) {
+			return bkeNodesFor("192.168.1.1", "worker"), nil
+		})
+		patches.ApplyFunc(agentssh.DiscoverArchs, func(_ context.Context, _ bkenode.Nodes, _ interface{}) (map[string]struct{}, map[string]error, error) {
+			return nil, nil, assertErr("discover failed")
+		})
+		err := e.upgradeBKEAgentViaSSH()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "discover failed")
+	})
+
+	t.Run("discover errs triggers upgrade failure", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newAgentUpgradePhaseCov(t, &bkev1beta1.BKECluster{ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "ns"}})
+		patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapper, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (bkev1beta1.BKENodes, error) {
+			return bkeNodesFor("192.168.1.1", "master"), nil
+		})
+		patches.ApplyFunc(agentssh.DiscoverArchs, func(_ context.Context, _ bkenode.Nodes, _ interface{}) (map[string]struct{}, map[string]error, error) {
+			return map[string]struct{}{}, map[string]error{"192.168.1.1": assertErr("arch fail")}, nil
+		})
+		err := e.upgradeBKEAgentViaSSH()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "master node(s)")
+	})
+
+	t.Run("prepare staging error", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newAgentUpgradePhaseCov(t, &bkev1beta1.BKECluster{ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "ns"}})
+		patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapper, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (bkev1beta1.BKENodes, error) {
+			return bkeNodesFor("192.168.1.1", "worker"), nil
+		})
+		patches.ApplyFunc(agentssh.DiscoverArchs, func(_ context.Context, _ bkenode.Nodes, _ interface{}) (map[string]struct{}, map[string]error, error) {
+			return map[string]struct{}{"amd64": {}}, nil, nil
+		})
+		patches.ApplyFunc(agentssh.PrepareStaging, func(_ *bkev1beta1.BKECluster, _ agentssh.ArtifactParams, _ []string) (*agentssh.Staging, error) {
+			return nil, assertErr("staging failed")
+		})
+		err := e.upgradeBKEAgentViaSSH()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "prepare upgrade artifacts")
+	})
+
+	t.Run("ssh upgrade error", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newAgentUpgradePhaseCov(t, &bkev1beta1.BKECluster{ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "ns"}})
+		patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapper, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (bkev1beta1.BKENodes, error) {
+			return bkeNodesFor("192.168.1.1", "worker"), nil
+		})
+		patches.ApplyFunc(agentssh.DiscoverArchs, func(_ context.Context, _ bkenode.Nodes, _ interface{}) (map[string]struct{}, map[string]error, error) {
+			return map[string]struct{}{"amd64": {}}, nil, nil
+		})
+		patches.ApplyFunc(agentssh.PrepareStaging, func(_ *bkev1beta1.BKECluster, _ agentssh.ArtifactParams, _ []string) (*agentssh.Staging, error) {
+			return &agentssh.Staging{}, nil
+		})
+		patches.ApplyFunc(agentssh.SSHUpgrade, func(_ context.Context, _ bkenode.Nodes, _ *agentssh.Staging, _ interface{}) (map[string]error, error) {
+			return nil, assertErr("ssh failed")
+		})
+		err := e.upgradeBKEAgentViaSSH()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "ssh failed")
+	})
+
+	t.Run("ssh push errors triggers upgrade failure", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newAgentUpgradePhaseCov(t, &bkev1beta1.BKECluster{ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "ns"}})
+		patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapper, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (bkev1beta1.BKENodes, error) {
+			return bkeNodesFor("192.168.1.1", "master"), nil
+		})
+		patches.ApplyFunc(agentssh.DiscoverArchs, func(_ context.Context, _ bkenode.Nodes, _ interface{}) (map[string]struct{}, map[string]error, error) {
+			return map[string]struct{}{"amd64": {}}, nil, nil
+		})
+		patches.ApplyFunc(agentssh.PrepareStaging, func(_ *bkev1beta1.BKECluster, _ agentssh.ArtifactParams, _ []string) (*agentssh.Staging, error) {
+			return &agentssh.Staging{}, nil
+		})
+		patches.ApplyFunc(agentssh.SSHUpgrade, func(_ context.Context, _ bkenode.Nodes, _ *agentssh.Staging, _ interface{}) (map[string]error, error) {
+			return map[string]error{"192.168.1.1": assertErr("push fail")}, nil
+		})
+		err := e.upgradeBKEAgentViaSSH()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "master node(s)")
+	})
+
+	t.Run("ping failure", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newAgentUpgradePhaseCov(t, &bkev1beta1.BKECluster{ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "ns"}})
+		patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapper, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (bkev1beta1.BKENodes, error) {
+			return bkeNodesFor("192.168.1.1", "worker"), nil
+		})
+		patches.ApplyFunc(agentssh.DiscoverArchs, func(_ context.Context, _ bkenode.Nodes, _ interface{}) (map[string]struct{}, map[string]error, error) {
+			return map[string]struct{}{"amd64": {}}, nil, nil
+		})
+		patches.ApplyFunc(agentssh.PrepareStaging, func(_ *bkev1beta1.BKECluster, _ agentssh.ArtifactParams, _ []string) (*agentssh.Staging, error) {
+			return &agentssh.Staging{}, nil
+		})
+		patches.ApplyFunc(agentssh.SSHUpgrade, func(_ context.Context, _ bkenode.Nodes, _ *agentssh.Staging, _ interface{}) (map[string]error, error) {
+			return nil, nil
+		})
+		patches.ApplyFunc(phaseutil.PingBKEAgentOnNodes, func(_ context.Context, _ interface{}, _ *runtime.Scheme, _ *bkev1beta1.BKECluster, _ bkenode.Nodes) (error, []string, []string) {
+			return assertErr("ping failed"), nil, []string{"192.168.1.1"}
+		})
+		err := e.upgradeBKEAgentViaSSH()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "ping after upgrade failed")
+	})
+
+	t.Run("success", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newAgentUpgradePhaseCov(t, &bkev1beta1.BKECluster{ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "ns"}})
+		patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapper, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (bkev1beta1.BKENodes, error) {
+			return bkeNodesFor("192.168.1.1", "worker"), nil
+		})
+		patches.ApplyFunc(agentssh.DiscoverArchs, func(_ context.Context, _ bkenode.Nodes, _ interface{}) (map[string]struct{}, map[string]error, error) {
+			return map[string]struct{}{"amd64": {}}, nil, nil
+		})
+		patches.ApplyFunc(agentssh.PrepareStaging, func(_ *bkev1beta1.BKECluster, _ agentssh.ArtifactParams, _ []string) (*agentssh.Staging, error) {
+			return &agentssh.Staging{}, nil
+		})
+		patches.ApplyFunc(agentssh.SSHUpgrade, func(_ context.Context, _ bkenode.Nodes, _ *agentssh.Staging, _ interface{}) (map[string]error, error) {
+			return nil, nil
+		})
+		patches.ApplyFunc(phaseutil.PingBKEAgentOnNodes, func(_ context.Context, _ interface{}, _ *runtime.Scheme, _ *bkev1beta1.BKECluster, _ bkenode.Nodes) (error, []string, []string) {
+			return nil, nil, nil
+		})
+		require.NoError(t, e.upgradeBKEAgentViaSSH())
+	})
 }

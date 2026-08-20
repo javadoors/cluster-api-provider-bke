@@ -165,7 +165,7 @@ func (c *CollectPlugin) collectDockerMachineInfo() (string, string, string) {
 
 	cfg, err := edocker.GetDockerDaemonConfig(edocker.DockerDaemonConfigFilePath)
 	if err != nil {
-		log.Errorf("get docker daemon config failed: %v", err)
+		log.Warnf("get docker daemon config failed: %v", err)
 		return lowLevelRuntime, cgroupDriver, dataRoot
 	}
 
@@ -203,7 +203,7 @@ func (c *CollectPlugin) collectContainerdMachineInfo() (string, string, string) 
 
 	cfg, err := econd.GetContainerdConfig(econd.ContainerdConfigFilePath)
 	if err != nil {
-		log.Errorf("get containerd config failed: %v", err)
+		log.Warnf("get containerd config failed: %v", err)
 		return lowLevelRuntime, cgroupDriver, dataRoot
 	}
 	if cfg == nil {
@@ -294,7 +294,7 @@ func (c *CollectPlugin) collectKubeletDataRootDir() string {
 		cmd := fmt.Sprintf("docker inspect kubelet --format '{{.Args}}'")
 		output, err := c.exec.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", cmd)
 		if err != nil {
-			log.Errorf("docker inspect kubelet failed: %v", err)
+			log.Warnf("docker inspect kubelet failed: %v", err)
 			return bkeinit.DefaultKubeletRootDir
 		}
 		return extractRootDirFromArgs(output)
@@ -302,7 +302,7 @@ func (c *CollectPlugin) collectKubeletDataRootDir() string {
 		cmd := fmt.Sprintf("nerdctl -n k8s.io inspect kubelet --format '{{.Args}}'")
 		output, err := c.exec.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", cmd)
 		if err != nil {
-			log.Errorf("nerdctl inspect kubelet failed: %v", err)
+			log.Warnf("nerdctl inspect kubelet failed: %v", err)
 			return bkeinit.DefaultKubeletRootDir
 		}
 		return extractRootDirFromArgs(output)

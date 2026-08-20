@@ -3,7 +3,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -16,6 +16,8 @@ package config
 
 import (
 	"flag"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -43,10 +45,53 @@ func TestConfigurationFlag(t *testing.T) {
 	if WebhookPort != 9443 {
 		t.Errorf("expected default 9443, got %d", WebhookPort)
 	}
-	if E2EMode != false {
-		t.Errorf("expected default false, got %v", E2EMode)
-	}
 	if EnableInternalUpdate != false {
 		t.Errorf("expected default false, got %v", EnableInternalUpdate)
 	}
+}
+func TestResolveClientConfigDefaults(t *testing.T) {
+	resetClientConfigTestState(t)
+
+	ResolveClientConfig()
+
+	if ClientQPS != DefaultClientQPS {
+		t.Fatalf("expected qps %v, got %v", DefaultClientQPS, ClientQPS)
+	}
+	if ClientBurst != DefaultClientBurst {
+		t.Fatalf("expected burst %v, got %v", DefaultClientBurst, ClientBurst)
+	}
+}
+
+func TestResolveClientConfigPriority(t *testing.T) {
+	resetClientConfigTestState(t)
+	t.Setenv("KUBE_CLIENT_QPS", "80")
+	t.Setenv("KUBE_CLIENT_BURST", "160")
+
+	configFile := filepath.Join(t.TempDir(), "client-config.yaml")
+	if err := os.WriteFile(configFile, []byte("qps: 60\nburst: 120\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ConfigurationFlag()
+	if err := flag.CommandLine.Parse([]string{"--client-config-file", configFile, "--client-qps", "100", "--client-burst", "200"}); err != nil {
+		t.Fatal(err)
+	}
+	ResolveClientConfig()
+
+	if ClientQPS != 100 {
+		t.Fatalf("expected qps 100, got %v", ClientQPS)
+	}
+	if ClientBurst != 200 {
+		t.Fatalf("expected burst 200, got %v", ClientBurst)
+	}
+}
+
+func resetClientConfigTestState(t *testing.T) {
+	t.Helper()
+	flag.CommandLine = flag.NewFlagSet(t.Name(), flag.ContinueOnError)
+	ClientQPS = 0
+	ClientBurst = 0
+	ClientConfigFile = ""
+	t.Setenv("KUBE_CLIENT_QPS", "")
+	t.Setenv("KUBE_CLIENT_BURST", "")
 }

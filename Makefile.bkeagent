@@ -2,7 +2,7 @@
 # * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
 # * installer is licensed under Mulan PSL v2.
 # * You can use this software according to the terms and conditions of the Mulan PSL v2.
-# * You may obtain n copy of Mulan PSL v2 at:
+# * You may obtain a copy of Mulan PSL v2 at:
 # *          http://license.coscl.org.cn/MulanPSL2
 # * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
 # * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -101,10 +101,14 @@ vet: ## 静态代码分析
 	@echo "Running go vet..."
 	@go vet ./...
 
+GOTMPDIR ?= $(abspath .gotmp)
+
 .PHONY: test
 test: manifests generate fmt vet envtest ## 运行测试套件
+	@mkdir -p $(GOTMPDIR)
 	@echo "Running tests with K8s $(ENVTEST_K8S_VERSION)..."
-	@KUBEBUILDER_ASSETS="$$($(ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)"
+	@KUBEBUILDER_ASSETS="$$($(ENVTEST) use $(ENVTEST_K8S_VERSION) -p path)" \
+	GOTMPDIR=$(GOTMPDIR) \
 	go test ./... -coverprofile cover.out
 
 ##@ Kubernetes CRD 管理

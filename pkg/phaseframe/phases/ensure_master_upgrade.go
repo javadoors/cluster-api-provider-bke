@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -14,6 +14,7 @@ package phases
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"github.com/pkg/errors"
@@ -21,6 +22,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
 	containerutil "sigs.k8s.io/cluster-api/util/container"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -50,6 +52,22 @@ const (
 
 type EnsureMasterUpgrade struct {
 	phaseframe.BasePhase
+	// mockTargetClient allows tests to inject a fake target-cluster clientset
+	// for the kube-proxy/etcd clientset operations. nil in production.
+	mockTargetClient kubernetes.Interface
+}
+
+// targetClientSet returns the target-cluster kubernetes clientset. In production
+// it is obtained via kube.GetTargetClusterClient; tests may inject mockTargetClient.
+func (e *EnsureMasterUpgrade) targetClientSet(ctx context.Context, c client.Client, bkeCluster *bkev1beta1.BKECluster) (kubernetes.Interface, error) {
+	if e.mockTargetClient != nil {
+		return e.mockTargetClient, nil
+	}
+	cs, _, err := kube.GetTargetClusterClient(ctx, c, bkeCluster)
+	if err != nil {
+		return nil, err
+	}
+	return cs, nil
 }
 
 func NewEnsureMasterUpgrade(ctx *phaseframe.PhaseContext) phaseframe.Phase {
@@ -58,10 +76,10 @@ func NewEnsureMasterUpgrade(ctx *phaseframe.PhaseContext) phaseframe.Phase {
 }
 
 func (e *EnsureMasterUpgrade) Execute() (ctrl.Result, error) {
-	if v, ok := annotation.HasAnnotation(e.Ctx.BKECluster, "deployAction"); !ok || v != "k8s_upgrade" {
+	if v, ok := annotation.HasAnnotation(e.Ctx.BKECluster, annotation.DeployActionAnnotationKey); !ok || v != annotation.DeployActionK8sUpgrade {
 		//添加boc所需的注解
 		patchFunc := func(bkeCluster *bkev1beta1.BKECluster) {
-			annotation.SetAnnotation(bkeCluster, "deployAction", "k8s_upgrade")
+			annotation.SetAnnotation(bkeCluster, annotation.DeployActionAnnotationKey, annotation.DeployActionK8sUpgrade)
 		}
 		if err := mergecluster.SyncStatusUntilComplete(e.Ctx.Client, e.Ctx.BKECluster, patchFunc); err != nil {
 			return ctrl.Result{}, err
@@ -223,8 +241,7 @@ func (e *EnsureMasterUpgrade) rolloutUpgrade() (ctrl.Result, error) {
 	}
 
 	if err := e.ensureEtcdAdvertiseClientUrlsAnnotation(etcdNodes); err != nil {
-		log.Error(constant.MasterUpgradeFailedReason, "ensure etcd advertise client urls annotation failed, err: %v", err)
-		return ctrl.Result{}, errors.Errorf("ensure etcd advertise client urls annotation failed, err: %v", err)
+		return ctrl.Result{}, fmt.Errorf("ensure etcd advertise client urls annotation failed: %w", err)
 	}
 
 	// 升级节点
@@ -256,7 +273,6 @@ func (e *EnsureMasterUpgrade) getNeedUpgradeNodes(bkeCluster *bkev1beta1.BKEClus
 	// Use NodeFetcher to get BKENodes from API server
 	bkeNodes, err := e.Ctx.NodeFetcher().GetBKENodesWrapperForCluster(e.Ctx, bkeCluster)
 	if err != nil {
-		log.Warn(constant.MasterUpgradingReason, "failed to get BKENodes: %v", err)
 		return nil, errors.Wrap(err, "failed to get BKENodes")
 	}
 	nodes := phaseutil.GetNeedUpgradeMasterNodesWithBKENodes(bkeCluster, bkeNodes)
@@ -311,8 +327,7 @@ func (e *EnsureMasterUpgrade) upgradeMasterNodesWithParams(params UpgradeMasterN
 	for _, node := range params.NeedUpgradeNodes {
 		remoteNode, err := phaseutil.GetRemoteNodeByBKENode(params.Ctx, clientSet, node)
 		if err != nil {
-			params.Log.Error(constant.WorkerUpgradeFailedReason, "get remote cluster Node resource failed, err: %v", err)
-			return errors.Errorf("get remote cluster Node resource failed, err: %v", err)
+			return fmt.Errorf("get remote cluster Node resource failed: %w", err)
 		}
 		// 已经是期望版本的节点不需要升级
 		if remoteNode.Status.NodeInfo.KubeletVersion == params.BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion {
@@ -328,12 +343,11 @@ func (e *EnsureMasterUpgrade) upgradeMasterNodesWithParams(params UpgradeMasterN
 
 		if err := e.upgradeNode(params.NeedBackupEtcd, params.BackEtcdNode, node, remoteNode); err != nil {
 			// master node block until upgrade success
-			params.Log.Error(constant.MasterUpgradeFailedReason, "upgrade node %q failed: %v", phaseutil.NodeInfo(node), err)
 			nodeFetcher.SetNodeStateWithMessageForCluster(params.Ctx, params.BKECluster, node.IP, bkev1beta1.NodeUpgradeFailed, err.Error())
-			if err = mergecluster.SyncStatusUntilComplete(params.Client, params.BKECluster); err != nil {
-				return errors.Errorf("upgrade node %q failed: %v", phaseutil.NodeInfo(node), err)
+			if syncErr := mergecluster.SyncStatusUntilComplete(params.Client, params.BKECluster); syncErr != nil {
+				return fmt.Errorf("upgrade node %q failed: %w", phaseutil.NodeInfo(node), syncErr)
 			}
-			return errors.Errorf("upgrade node %q failed: %v", phaseutil.NodeInfo(node), err)
+			return fmt.Errorf("upgrade node %q failed: %w", phaseutil.NodeInfo(node), err)
 		}
 		// mark node as upgrading success
 		nodeFetcher.SetNodeStateWithMessageForCluster(params.Ctx, params.BKECluster, node.IP, bkev1beta1.NodeNotReady, "Upgrading success")
@@ -368,7 +382,7 @@ func normalizeKubeComponentVersion(s string) string {
 
 func (e *EnsureMasterUpgrade) getKubeProxyImageTagFromCluster(c client.Client, bkeCluster *bkev1beta1.BKECluster) (string, error) {
 	ctx, _, _, _, _ := e.Ctx.Untie()
-	clientSet, _, err := kube.GetTargetClusterClient(ctx, c, bkeCluster)
+	clientSet, err := e.targetClientSet(ctx, c, bkeCluster)
 	if err != nil {
 		return "", err
 	}
@@ -489,7 +503,7 @@ func (e *EnsureMasterUpgrade) updateAddonVersions(c client.Client, bkeCluster *b
 		return ctrl.Result{}, nil
 	}
 	if err := mergecluster.SyncStatusUntilComplete(c, bkeCluster, patchFuncs...); err != nil {
-		return ctrl.Result{}, errors.Errorf("failed to upgrade addon version, err: %v", err)
+		return ctrl.Result{}, fmt.Errorf("failed to upgrade addon version, err: %w", err)
 	}
 	return ctrl.Result{}, nil
 }
@@ -573,20 +587,17 @@ func (e *EnsureMasterUpgrade) executeNodeUpgradeWithParams(params ExecuteNodeUpg
 
 	params.Log.Info(constant.MasterUpgradingReason, "start upgrade node %s", phaseutil.NodeInfo(params.Node))
 	if err := upgrade.New(); err != nil {
-		params.Log.Error(constant.MasterUpgradeFailedReason, "upgrade node %q failed: %v", phaseutil.NodeInfo(params.Node), err)
-		return errors.Errorf("create upgrade command，node: %q failed: %v", phaseutil.NodeInfo(params.Node), err)
+		return fmt.Errorf("create upgrade command，node: %q failed: %w", phaseutil.NodeInfo(params.Node), err)
 	}
 	params.Log.Info(constant.MasterUpgradingReason, "wait upgrade node %s finish", phaseutil.NodeInfo(params.Node))
 	err, _, failedNodes := upgrade.Wait()
 	if err != nil {
-		params.Log.Error(constant.MasterUpgradeFailedReason, "wait upgrade command complete failed，node: %q, err: %v", phaseutil.NodeInfo(params.Node), err)
-		return errors.Errorf("wait upgrade command complete failed，node: %q, err: %v", phaseutil.NodeInfo(params.Node), err)
+		return fmt.Errorf("wait upgrade command complete failed，node: %q: %w", phaseutil.NodeInfo(params.Node), err)
 	}
 	if len(failedNodes) != 0 {
-		params.Log.Error(constant.MasterUpgradeFailedReason, "upgrade node %q failed: %v", phaseutil.NodeInfo(params.Node), err)
 		commandErrs, err := phaseutil.LogCommandFailed(*upgrade.Command, failedNodes, params.Log, constant.MasterUpgradeFailedReason)
 		phaseutil.MarkNodeStatusByCommandErrs(params.Ctx, params.Client, params.BKECluster, commandErrs)
-		return errors.Errorf("upgrade node %q failed: %v", phaseutil.NodeInfo(params.Node), err)
+		return fmt.Errorf("upgrade node %q failed: %w", phaseutil.NodeInfo(params.Node), err)
 	}
 	return nil
 }
@@ -616,8 +627,7 @@ func (e *EnsureMasterUpgrade) waitForNodeHealthCheck(ctx context.Context, c clie
 func (e *EnsureMasterUpgrade) waitForNodeHealthCheckWithParams(params WaitForNodeHealthCheckParams) error {
 	remoteClient, err := kube.NewRemoteClientByBKECluster(params.Ctx, params.Client, params.BKECluster)
 	if err != nil {
-		params.Log.Error(constant.MasterUpgradeFailedReason, "get remote client for BKECluster %q failed", utils.ClientObjNS(params.BKECluster))
-		return errors.Errorf("get remote client for BKECluster %q failed: %v", utils.ClientObjNS(params.BKECluster), err)
+		return fmt.Errorf("get remote client for BKECluster %q failed: %w", utils.ClientObjNS(params.BKECluster), err)
 	}
 	clientSet, _ := remoteClient.KubeClient()
 
@@ -634,8 +644,7 @@ func (e *EnsureMasterUpgrade) waitForNodeHealthCheckWithParams(params WaitForNod
 	err = waitForWorkerNodeHealthCheck(masterParams)
 
 	if err != nil {
-		params.Log.Error(constant.MasterUpgradeFailedReason, "upgrade node %q failed: %v", phaseutil.NodeInfo(params.Node), err)
-		return errors.Errorf("wait for node %q pass healthy check failed: %v", phaseutil.NodeInfo(params.Node), err)
+		return fmt.Errorf("wait for node %q pass healthy check failed: %w", phaseutil.NodeInfo(params.Node), err)
 	}
 	params.Log.Info(constant.MasterUpgradingReason, "upgrade master node %q success", phaseutil.NodeInfo(params.Node))
 	return nil
@@ -643,34 +652,35 @@ func (e *EnsureMasterUpgrade) waitForNodeHealthCheckWithParams(params WaitForNod
 
 func (e *EnsureMasterUpgrade) upgradeKubeProxy(expectVersion string) error {
 	ctx, c, bkeCluster, _, log := e.Ctx.Untie()
-	clientSet, _, err := kube.GetTargetClusterClient(ctx, c, bkeCluster)
+	clientSet, err := e.targetClientSet(ctx, c, bkeCluster)
 	if err != nil {
-		return err
-	}
-
-	// get ds
-	ds, err := clientSet.AppsV1().DaemonSets(metav1.NamespaceSystem).Get(ctx, "kube-proxy", metav1.GetOptions{})
-	if err != nil {
-		log.Error(constant.MasterUpgradeFailedReason, "get kube-proxy ds failed: %v", err)
 		return err
 	}
 
 	cfg := bkeinit.BkeConfig(*bkeCluster.Spec.ClusterConfig)
 	imageRepo := cfg.ImageFuyaoRepo()
 
-	// update image
-	srcImage := ds.Spec.Template.Spec.Containers[0].Image
-	srcImage, err = containerutil.ModifyImageRepository(srcImage, imageRepo)
-	if err != nil {
-		return err
-	}
-	dstImage, err := containerutil.ModifyImageTag(srcImage, expectVersion)
-	if err != nil {
-		return err
-	}
-	ds.Spec.Template.Spec.Containers[0].Image = dstImage
+	var dstImage string
+	err = phaseutil.RetryOnConflict(func() error {
+		ds, err := clientSet.AppsV1().DaemonSets(metav1.NamespaceSystem).Get(ctx, "kube-proxy", metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("get kube-proxy ds failed: %w", err)
+		}
 
-	_, err = clientSet.AppsV1().DaemonSets(metav1.NamespaceSystem).Update(ctx, ds, metav1.UpdateOptions{})
+		srcImage := ds.Spec.Template.Spec.Containers[0].Image
+		srcImage, err = containerutil.ModifyImageRepository(srcImage, imageRepo)
+		if err != nil {
+			return err
+		}
+		dstImage, err = containerutil.ModifyImageTag(srcImage, expectVersion)
+		if err != nil {
+			return err
+		}
+		ds.Spec.Template.Spec.Containers[0].Image = dstImage
+
+		_, err = clientSet.AppsV1().DaemonSets(metav1.NamespaceSystem).Update(ctx, ds, metav1.UpdateOptions{})
+		return err
+	})
 	if err != nil {
 		return err
 	}
@@ -682,24 +692,27 @@ func (e *EnsureMasterUpgrade) upgradeKubeProxy(expectVersion string) error {
 // ensure EtcdAdvertiseClientUrlsAnnotation exit in etcd pod annotations
 func (e *EnsureMasterUpgrade) ensureEtcdAdvertiseClientUrlsAnnotation(etcdNodes bkenode.Nodes) error {
 	ctx, c, bkeCluster, _, _ := e.Ctx.Untie()
-	clientSet, _, err := kube.GetTargetClusterClient(ctx, c, bkeCluster)
+	clientSet, err := e.targetClientSet(ctx, c, bkeCluster)
 	if err != nil {
 		return err
 	}
 	for _, n := range etcdNodes {
 		etcdPodName := kube.StaticPodName(mfutil.Etcd, n.Hostname)
 		podClient := clientSet.CoreV1().Pods(metav1.NamespaceSystem)
-		pod, err := podClient.Get(ctx, etcdPodName, metav1.GetOptions{})
-		if err != nil {
+		if err := phaseutil.RetryOnConflict(func() error {
+			pod, err := podClient.Get(ctx, etcdPodName, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			annotations := pod.GetAnnotations()
+			if v, ok := annotations[annotation.EtcdAdvertiseClientUrlsAnnotationKey]; ok && v != "" {
+				return nil
+			}
+			annotations[annotation.EtcdAdvertiseClientUrlsAnnotationKey] = phaseutil.GetClientURLByIP(n.IP)
+			pod.SetAnnotations(annotations)
+			_, err = podClient.Update(ctx, pod, metav1.UpdateOptions{})
 			return err
-		}
-		annotations := pod.GetAnnotations()
-		if v, ok := annotations[annotation.EtcdAdvertiseClientUrlsAnnotationKey]; ok && v != "" {
-			continue
-		}
-		annotations[annotation.EtcdAdvertiseClientUrlsAnnotationKey] = phaseutil.GetClientURLByIP(n.IP)
-		pod.SetAnnotations(annotations)
-		if _, err = podClient.Update(ctx, pod, metav1.UpdateOptions{}); err != nil {
+		}); err != nil {
 			return err
 		}
 	}

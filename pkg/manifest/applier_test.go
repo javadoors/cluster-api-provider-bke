@@ -76,3 +76,16 @@ func TestFallbackRenderParams(t *testing.T) {
 		t.Fatalf("kubernetesVersion: %v", params["kubernetesVersion"])
 	}
 }
+
+func TestClusterApplier_ApplyComponent_NotConfigured(t *testing.T) {
+	a := NewClusterApplier(ClusterApplierConfig{
+		BKECluster: &bkev1beta1.BKECluster{ObjectMeta: metav1.ObjectMeta{Name: "c", Namespace: "ns"}},
+	})
+	err := a.ApplyComponent(context.Background(), &ComponentPackage{
+		Name:      "kube-proxy",
+		Manifests: [][]byte{[]byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: x\n")},
+	})
+	if err == nil || err.Error() != "cluster manifest applier is not configured" {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}

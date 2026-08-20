@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -100,7 +100,7 @@ func (e *EnsureClusterAPIObj) reconcileCreateClusterAPIObj() error {
 
 	defer func() {
 		if err := mergecluster.SyncStatusUntilComplete(c, bkeCluster); err != nil {
-			log.Error("failed to patch BKECluster,err: %s", err.Error())
+			log.Warn(constant.InternalErrorReason, "failed to patch BKECluster: %v", err)
 			return
 		}
 	}()
@@ -116,15 +116,13 @@ func (e *EnsureClusterAPIObj) reconcileCreateClusterAPIObj() error {
 	// 创建BKE配置
 	cfg, err := bkeinit.NewBkeConfigFromClusterConfig(bkeCluster.Spec.ClusterConfig)
 	if err != nil {
-		log.Error(constant.ReconcileErrorReason, "Failed to create bke config: %v", err)
-		return errors.Errorf("Failed to create bke config: %v", err)
+		return fmt.Errorf("Failed to create bke config: %w", err)
 	}
 
 	// 准备外部etcd配置（如果需要）
 	externalEtcd, err := e.prepareExternalEtcdConfig(bkeCluster)
 	if err != nil {
-		log.Error(constant.ReconcileErrorReason, "Failed to prepare external etcd config: %v", err)
-		return err
+		return fmt.Errorf("Failed to prepare external etcd config: %w", err)
 	}
 
 	// 创建集群API对象
@@ -156,7 +154,7 @@ func (e *EnsureClusterAPIObj) prepareExternalEtcdConfig(bkeCluster *bkev1beta1.B
 
 	allNodes, err := e.Ctx.GetNodes()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get nodes: %v", err)
+		return nil, fmt.Errorf("failed to get nodes: %w", err)
 	}
 
 	etcdEndpoints := buildEtcdEndpoints(bkenode.Nodes(allNodes).Etcd())
@@ -188,14 +186,12 @@ func (e *EnsureClusterAPIObj) createClusterAPIObj(params CreateClusterAPIObjPara
 	// generate cluster api obj yaml
 	yamlPath, err := params.Cfg.GenerateClusterAPIConfigFIle(params.BKECluster.Name, params.BKECluster.Namespace, params.ExternalEtcd)
 	if err != nil {
-		params.Log.Error(constant.ClusterAPIObjNotReadyReason, "Failed to generate cluster api config file: %v", err)
-		return err
+		return fmt.Errorf("Failed to generate cluster api config file: %w", err)
 	}
 
 	localClient, err := kube.NewClientFromRestConfig(params.Ctx, e.Ctx.RestConfig)
 	if err != nil {
-		params.Log.Error(constant.ClusterAPIObjNotReadyReason, "Failed to create kube client: %v", err)
-		return err
+		return fmt.Errorf("Failed to create kube client: %w", err)
 	}
 
 	task := kube.NewTask("cluster-api", yamlPath, nil).
@@ -203,8 +199,7 @@ func (e *EnsureClusterAPIObj) createClusterAPIObj(params CreateClusterAPIObjPara
 		SetWaiter(true, bkeinit.DefaultAddonTimeout, bkeinit.DefaultAddonInterval)
 	// apply cluster api obj yaml
 	if err := localClient.ApplyYaml(task); err != nil {
-		params.Log.Error(constant.ClusterAPIObjNotReadyReason, "Failed to create cluster api obj: %v", err)
-		return err
+		return fmt.Errorf("Failed to create cluster api obj: %w", err)
 	}
 
 	params.Log.Info(constant.ClusterAPIObjNotReadyReason, "Cluster api obj create success")
@@ -213,18 +208,19 @@ func (e *EnsureClusterAPIObj) createClusterAPIObj(params CreateClusterAPIObjPara
 }
 
 func (e *EnsureClusterAPIObj) reconcileClusterAPIObj(ctx context.Context) error {
-	_, c, bkeCluster, _, log := e.Ctx.Untie()
-	bkeCluster, err := mergecluster.GetCombinedBKECluster(ctx, e.Ctx.Client, bkeCluster.Namespace, bkeCluster.Name)
+	_, c, bkeCluster, _, _ := e.Ctx.Untie()
+	ns, name := bkeCluster.Namespace, bkeCluster.Name
+	combined, err := mergecluster.GetCombinedBKECluster(ctx, e.Ctx.Client, ns, name)
 	if err != nil {
-		return err
+		return fmt.Errorf("get combined bkeCluster %s/%s: %w", ns, name, err)
 	}
+	bkeCluster = combined
 	e.Ctx.BKECluster = bkeCluster
 
 	if condition.HasConditionStatus(bkev1beta1.ClusterAPIObjCondition, bkeCluster, confv1beta1.ConditionFalse) {
 		condition.ConditionMark(bkeCluster, bkev1beta1.ClusterAPIObjCondition, confv1beta1.ConditionTrue, constant.ClusterAPIObjReadyReason, "cluster api obj ready")
 		if err := mergecluster.SyncStatusUntilComplete(c, bkeCluster); err != nil {
-			log.Warn(constant.ReconcileErrorReason, "failed to update bkeCluster Status: %v", err)
-			return errors.New("failed to update bkeCluster Status")
+			return fmt.Errorf("failed to update bkeCluster Status: %w", err)
 		}
 	}
 	if e.Ctx.BKECluster.OwnerReferences != nil {
@@ -233,7 +229,7 @@ func (e *EnsureClusterAPIObj) reconcileClusterAPIObj(ctx context.Context) error 
 			if apierrors.IsNotFound(err) {
 				return errors.New("Cluster Obj not found")
 			}
-			return errors.Errorf("Failed to get owner cluster: %v", err)
+			return fmt.Errorf("Failed to get owner cluster: %w", err)
 		}
 		if cluster == nil {
 			return errors.New("Cluster Controller has not yet set OwnerRef")

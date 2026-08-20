@@ -13,6 +13,7 @@
 package ha
 
 import (
+	"fmt"
 	"strings"
 	"time"
 
@@ -246,7 +247,7 @@ func (h *HA) Wait(cfg map[string]interface{}) error {
 		return true, nil
 	})
 	if err != nil {
-		return errors.Errorf("wait vip(s) %q ready failed, err: %v", strings.Join(waitIPs, ","), err)
+		return fmt.Errorf("wait vip(s) %q ready failed, err: %w", strings.Join(waitIPs, ","), err)
 	}
 	log.Infof("vip(s) %q ready now", strings.Join(waitIPs, ","))
 	return nil

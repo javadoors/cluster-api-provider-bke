@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -38,6 +38,7 @@ import (
 	agentv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkeagent/v1beta1"
 	bkenet "gopkg.openfuyao.cn/cluster-api-provider-bke/common/utils/net"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
@@ -206,9 +207,9 @@ func handleUpdateError(err error) reconcileResult {
 
 // cleanupTask 清理指定 gid 的任务
 func (r *CommandReconciler) cleanupTask(gid string) {
-	if v, ok := r.Job.Task[gid]; ok {
+	if v, ok := r.Job.GetTask(gid); ok {
 		v.SafeClose()
-		delete(r.Job.Task, gid)
+		r.Job.DeleteTask(gid)
 	}
 }
 
@@ -222,7 +223,15 @@ func (r *CommandReconciler) ensureFinalizer(ctx context.Context,
 	}
 
 	controllerutil.AddFinalizer(command, commandFinalizerName)
-	if err := r.Update(ctx, command); err != nil {
+	err := phaseutil.RetryOnConflict(func() error {
+		latestCommand := &agentv1beta1.Command{}
+		if err := r.Get(ctx, client.ObjectKey{Name: command.Name, Namespace: command.Namespace}, latestCommand); err != nil {
+			return err
+		}
+		controllerutil.AddFinalizer(latestCommand, commandFinalizerName)
+		return r.Update(ctx, latestCommand)
+	})
+	if err != nil {
 		return handleUpdateError(err)
 	}
 	return continueReconcile()
@@ -237,12 +246,16 @@ func (r *CommandReconciler) handleDeletion(ctx context.Context,
 	}
 
 	r.cleanupTask(gid)
-	controllerutil.RemoveFinalizer(command, commandFinalizerName)
 
-	if err := r.Update(ctx, command); err != nil {
-		if apierr.IsConflict(err) {
-			commandLogger().Warnf("conflict when update command, %s", err.Error())
+	err := phaseutil.RetryOnConflict(func() error {
+		latestCommand := &agentv1beta1.Command{}
+		if err := r.Get(ctx, client.ObjectKey{Name: command.Name, Namespace: command.Namespace}, latestCommand); err != nil {
+			return err
 		}
+		controllerutil.RemoveFinalizer(latestCommand, commandFinalizerName)
+		return r.Update(ctx, latestCommand)
+	})
+	if err != nil {
 		return handleUpdateError(err)
 	}
 
@@ -281,9 +294,9 @@ func (r *CommandReconciler) handleSuspend(command *agentv1beta1.Command,
 	}
 
 	commandLogger().Infof("%s has been suspended", gid)
-	if v, ok := r.Job.Task[gid]; ok {
+	if v, ok := r.Job.GetTask(gid); ok {
 		v.SafeClose()
-		v.Phase = agentv1beta1.CommandSuspend
+		v.SetPhase(agentv1beta1.CommandSuspend)
 	}
 
 	// Statistical state
@@ -305,11 +318,11 @@ func (r *CommandReconciler) handleSuspend(command *agentv1beta1.Command,
 // - gid: 全局任务 ID
 // - bool: 如果应该跳过返回 true
 func (r *CommandReconciler) shouldSkipOldTask(command *agentv1beta1.Command, gid string) bool {
-	if v, ok := r.Job.Task[gid]; ok {
+	if v, ok := r.Job.GetTask(gid); ok {
 		// This value is increased by a spec change
-		if command.GetGeneration() <= v.Generation {
+		if command.GetGeneration() <= v.GetGeneration() {
 			commandLogger().Infof("A later version task is being executed, command:%s resourceVersion:%s-%s, generation:%d<=%d",
-				gid, command.GetResourceVersion(), v.ResourceVersion, command.GetGeneration(), v.Generation)
+				gid, command.GetResourceVersion(), v.GetResourceVersion(), command.GetGeneration(), v.GetGeneration())
 			return true
 		}
 		v.SafeClose()
@@ -325,7 +338,7 @@ func (r *CommandReconciler) shouldSkipOldTask(command *agentv1beta1.Command, gid
 // - reconcileResult: 任务创建结果
 func (r *CommandReconciler) createAndStartTask(ctx context.Context, command *agentv1beta1.Command,
 	currentStatus *agentv1beta1.CommandStatus, gid string) reconcileResult {
-	r.Job.Task[gid] = &job.Task{
+	task := &job.Task{
 		StopChan:                make(chan struct{}),
 		Phase:                   agentv1beta1.CommandRunning,
 		ResourceVersion:         command.ResourceVersion,
@@ -334,6 +347,7 @@ func (r *CommandReconciler) createAndStartTask(ctx context.Context, command *age
 		HasAddTimer:             false,
 		Once:                    &sync.Once{},
 	}
+	r.Job.SetTask(gid, task)
 
 	// The start time is reset each time the Reconcile function is entered
 	currentStatus.LastStartTime = &metav1.Time{Time: time.Now()}
@@ -345,12 +359,15 @@ func (r *CommandReconciler) createAndStartTask(ctx context.Context, command *age
 		return finishReconcile(ctrl.Result{}, nil)
 	}
 
-	go r.startTask(ctx, r.Job.Task[gid].StopChan, command)
+	go r.startTask(ctx, task.StopChan, command)
 	return finishReconcile(ctrl.Result{}, nil)
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *CommandReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.NodeIP == "" {
+		r.NodeIP = resolveLocalNodeIP()
+	}
 	// Clears resource objects with TTL set
 	go r.ttlSecondAfterFinished()
 
@@ -368,11 +385,11 @@ func (r *CommandReconciler) shouldReconcileCommand(o *agentv1beta1.Command, even
 		return false
 	}
 	gid := fmt.Sprintf("%s/%s", o.Namespace, o.Name)
-	if v, ok := r.Job.Task[gid]; ok {
+	if v, ok := r.Job.GetTask(gid); ok {
 		// The value of this field will increase only if you update the spec
-		if o.Generation <= v.Generation || o.ResourceVersion <= v.ResourceVersion {
+		if o.Generation <= v.GetGeneration() || o.ResourceVersion <= v.GetResourceVersion() {
 			commandLogger().Debugf("%s: %d<=%d Only update status without Reconcile %s",
-				eventType, o.Generation, v.Generation, gid)
+				eventType, o.Generation, v.GetGeneration(), gid)
 			return false
 		}
 	}
@@ -539,8 +556,8 @@ func (r *CommandReconciler) finalizeTaskStatus(command *agentv1beta1.Command,
 		return err
 	}
 
-	if v, ok := r.Job.Task[gid]; ok {
-		v.Phase = currentStatus.Phase
+	if v, ok := r.Job.GetTask(gid); ok {
+		v.SetPhase(currentStatus.Phase)
 		v.SafeClose()
 	}
 	return nil
@@ -604,7 +621,7 @@ func (r *CommandReconciler) ttlSecondAfterFinished() {
 		default:
 		}
 		time.Sleep(time.Duration(rand.IntnRange(sleepRangeLow, sleepRangeHigh)) * time.Second)
-		for key, value := range r.Job.Task {
+		for key, value := range r.Job.SnapshotTasks() {
 			r.processTTLTask(key, value)
 		}
 	}
@@ -612,7 +629,7 @@ func (r *CommandReconciler) ttlSecondAfterFinished() {
 
 // shouldProcessTask checks if a task should be processed for TTL deletion
 func (r *CommandReconciler) shouldProcessTask(value *job.Task) bool {
-	return !value.HasAddTimer && value.TTLSecondsAfterFinished != 0 && value.Phase == agentv1beta1.CommandComplete
+	return value.ShouldProcessTTL()
 }
 
 // isCommandReadyForDeletion checks if all nodes have completed the command
@@ -656,7 +673,7 @@ func (r *CommandReconciler) processTTLTask(key string, value *job.Task) {
 	obj := &agentv1beta1.Command{}
 	if err := r.Client.Get(r.Ctx, client.ObjectKey{Namespace: namespace, Name: name}, obj); err != nil {
 		if apierr.IsNotFound(err) {
-			delete(r.Job.Task, key)
+			r.Job.DeleteTask(key)
 		} else {
 			commandLogger().Warnf("unable fetch command %s", err.Error())
 		}
@@ -665,8 +682,11 @@ func (r *CommandReconciler) processTTLTask(key string, value *job.Task) {
 	if !r.isCommandReadyForDeletion(obj, key) {
 		return
 	}
-	value.HasAddTimer = true
-	ttl := r.calculateTTL(value.TTLSecondsAfterFinished, obj.Status[r.commandStatusKey()].CompletionTime.Time)
+	ttlSeconds, ok := value.MarkTimerAdded()
+	if !ok {
+		return
+	}
+	ttl := r.calculateTTL(ttlSeconds, obj.Status[r.commandStatusKey()].CompletionTime.Time)
 	r.scheduleCommandDeletion(obj, key, ttl)
 }
 
@@ -748,10 +768,35 @@ func (r *CommandReconciler) nodeMatchNodeSelector(s *metav1.LabelSelector) bool 
 				return false
 			}
 			if ip == tmpIP.String() {
-				r.NodeIP = ip
 				return true
 			}
 		}
 	}
 	return false
+}
+
+// resolveLocalNodeIP returns the first non-loopback, non-link-local interface IP for status map keys.
+// Called once during SetupWithManager so NodeIP is not mutated on the informer path.
+func resolveLocalNodeIP() string {
+	ips, err := bkenet.GetAllInterfaceIP()
+	if err != nil {
+		return ""
+	}
+	var fallbackIP string
+	for _, p := range ips {
+		tmpIP, _, err := net.ParseCIDR(p)
+		if err != nil {
+			continue
+		}
+		if tmpIP.IsLoopback() || tmpIP.IsLinkLocalUnicast() || tmpIP.IsLinkLocalMulticast() {
+			continue
+		}
+		if tmpIP.To4() != nil {
+			return tmpIP.String()
+		}
+		if fallbackIP == "" {
+			fallbackIP = tmpIP.String()
+		}
+	}
+	return fallbackIP
 }

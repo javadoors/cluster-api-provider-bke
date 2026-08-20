@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -656,4 +656,74 @@ func TestConditionStatusConstants(t *testing.T) {
 	assert.Equal(t, ConditionStatus("True"), ConditionTrue)
 	assert.Equal(t, ConditionStatus("False"), ConditionFalse)
 	assert.Equal(t, ConditionStatus("Unknown"), ConditionUnknown)
+}
+
+func TestDeclarativeUpgradeStatusLifecycle(t *testing.T) {
+	now := metav1.Now()
+	status := &DeclarativeUpgradeStatus{
+		TargetVersion: "old",
+		FinishedAt:    &now,
+		LastError:     "previous",
+		LastFailure:   &DeclarativeUpgradeFailureRecord{Name: "kubelet"},
+		Completed: []DeclarativeUpgradeComponentRecord{{
+			Name:    "kube-apiserver",
+			Version: "v1",
+		}},
+	}
+
+	status.ResetForTarget("v26.05", now)
+	assert.Equal(t, "v26.05", status.TargetVersion)
+	assert.Equal(t, &now, status.StartedAt)
+	assert.Nil(t, status.FinishedAt)
+	assert.Empty(t, status.LastError)
+	assert.Nil(t, status.LastFailure)
+	assert.Nil(t, status.Completed)
+
+	later := metav1.Now()
+	assert.False(t, status.EnsureInitialized("v26.05", later))
+	assert.Equal(t, &now, status.StartedAt)
+	status.FinishedAt = &later
+	assert.False(t, status.EnsureInitialized("v26.05", later))
+	assert.Nil(t, status.FinishedAt)
+	assert.True(t, status.EnsureInitialized("v26.06", later))
+	assert.Equal(t, "v26.06", status.TargetVersion)
+}
+
+func TestDeclarativeUpgradeStatusCompletedAndFailure(t *testing.T) {
+	now := metav1.Now()
+	status := &DeclarativeUpgradeStatus{}
+	assert.False(t, status.IsCompleted("kubelet", ""))
+
+	status.MarkCompleted("kubelet", "", now)
+	assert.True(t, status.IsCompleted("kubelet", defaultComponentVersion))
+	status.MarkCompleted("kubelet", defaultComponentVersion, now)
+	assert.Len(t, status.Completed, 1)
+
+	status.MarkFailure("kubelet", "", "boom", now)
+	assert.NotNil(t, status.LastFailure)
+	assert.Equal(t, defaultComponentVersion, status.LastFailure.Version)
+	assert.Equal(t, int32(1), status.LastFailure.Attempt)
+	assert.Equal(t, "boom", status.LastError)
+
+	status.MarkFailure("kubelet", defaultComponentVersion, "boom again", now)
+	assert.Equal(t, int32(2), status.LastFailure.Attempt)
+	assert.Equal(t, "boom again", status.LastError)
+
+	status.MarkFailure("etcd", "v2", "other", now)
+	assert.Equal(t, int32(1), status.LastFailure.Attempt)
+	assert.Equal(t, "v2", status.LastFailure.Version)
+
+	status.ClearFailure()
+	assert.Nil(t, status.LastFailure)
+}
+
+func TestDeclarativeUpgradeStatusNilReceivers(t *testing.T) {
+	now := metav1.Now()
+	var status *DeclarativeUpgradeStatus
+	status.ResetForTarget("v1", now)
+	assert.True(t, status.EnsureInitialized("v1", now))
+	assert.False(t, status.IsCompleted("kubelet", "v1"))
+	status.MarkCompleted("kubelet", "v1", now)
+	status.MarkFailure("kubelet", "v1", "boom", now)
+	status.ClearFailure()
 }

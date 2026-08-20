@@ -108,14 +108,16 @@ func clusterCurrentForReleaseComponent(bc *bkev1beta1.BKECluster, componentName 
 		return bc.Status.ContainerdVersion
 	case ComponentOpenFuyao:
 		return bc.Status.OpenFuyaoVersion
-	case ComponentBKEAgent:
-		for _, addon := range bc.Status.AddonStatus {
-			if addon.Name == ComponentBKEAgent && addon.Version != "" {
-				return addon.Version
-			}
-		}
-		return ""
 	default:
-		return ""
+		// fall through to addon/clusterComponentStatuses lookup below
 	}
+	for _, addon := range bc.Status.AddonStatus {
+		if addon.Name == componentName && addon.Version != "" {
+			return addon.Version
+		}
+	}
+	if st, ok := bc.Status.ClusterComponentStatuses[componentName]; ok && st.CurrentVersion != "" {
+		return st.CurrentVersion
+	}
+	return ""
 }

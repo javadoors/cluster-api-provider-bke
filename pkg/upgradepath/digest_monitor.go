@@ -28,6 +28,7 @@ import (
 	upv1alpha1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/v1alpha1"
 	bkeinit "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/initialize"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/oci"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/annotation"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/clusterutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
@@ -40,7 +41,7 @@ const (
 
 	// OCIDigestAnnotation stores the OCI image digest on the UpgradePath CR; the controller
 	// copies it into status.lastDigest.
-	OCIDigestAnnotation = "config.openfuyao.com/oci-digest"
+	OCIDigestAnnotation = annotation.UpgradePathOCIDigestAnnotationKey
 
 	upgradePathImageName = "upgrade-path"
 	ReleaseImageName     = "release-image"

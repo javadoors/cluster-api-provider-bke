@@ -18,8 +18,6 @@ import (
 	"os"
 	"text/template"
 
-	"github.com/pkg/errors"
-
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/executor/exec"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job/builtin/downloader"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job/builtin/plugin"
@@ -106,7 +104,7 @@ func (cdp CRIDockerPlugin) Execute(commands []string) ([]string, error) {
 
 	downloaderPlugin := downloader.New()
 	if _, err = downloaderPlugin.Execute(cs); err != nil {
-		return nil, errors.Errorf("download cri-dockerd %s failed, err: %v", url, err)
+		return nil, fmt.Errorf("download cri-dockerd %s failed, err: %w", url, err)
 	}
 
 	if err = writeCriDockerdConfigToDisk(runtimeParam); err != nil {
@@ -135,7 +133,7 @@ func (cdp CRIDockerPlugin) startCriDockerd() error {
 	// start cri-dockerd
 	out, err = cdp.exec.ExecuteCommandWithCombinedOutput("sh", "-c", "systemctl restart cri-dockerd")
 	if err != nil {
-		return errors.Errorf("start cri-dockerd failed, err: %v, out: %s", err, out)
+		return fmt.Errorf("start cri-dockerd failed, err: %w, out: %s", err, out)
 	}
 	return nil
 }

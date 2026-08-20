@@ -16,6 +16,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"fmt"
 	"hash"
 	"math/big"
 
@@ -25,8 +26,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
-
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 // ClusterList represents a list of clusters that a user is invited to.
@@ -107,8 +106,7 @@ func GetUserInfo(c dynamic.Interface, name string) (*User, error) {
 	var userCR User
 	err = runtime.DefaultUnstructuredConverter.FromUnstructured(dr.Object, &userCR)
 	if err != nil {
-		log.Errorf("Error converting to %s: %s", userMgmtGVR.Resource, name)
-		return nil, err
+		return nil, fmt.Errorf("error converting to %s %s: %w", userMgmtGVR.Resource, name, err)
 	}
 	return &userCR, nil
 }
@@ -117,14 +115,13 @@ func GetUserInfo(c dynamic.Interface, name string) (*User, error) {
 func CreateUserInfo(c dynamic.Interface, userCR *User) error {
 	obj, err := StructToUnstructured(userCR)
 	if err != nil {
-		log.Error("cannot convert to unstructured object")
-		return err
+		return fmt.Errorf("cannot convert to unstructured object: %w", err)
 	}
 	_, err = c.Resource(userMgmtGVR).Create(context.Background(), obj, v1.CreateOptions{})
 	if err != nil {
-		log.Errorf("update user %s failed: %s", userCR.Name, err.Error())
+		return fmt.Errorf("create user %s failed: %w", userCR.Name, err)
 	}
-	return err
+	return nil
 }
 
 // StructToUnstructured convert from any struct to Unstructured struct
@@ -192,7 +189,7 @@ func prepareUserInstance(username, encryptedPassword string) *User {
 		Spec: UserSpec{
 			Username:          username,
 			EncryptedPassword: []byte(encryptedPassword),
-			Description:       "内置默认平台管理员",
+			Description:       "内置默认平台管理员\nBuilt-in default platform administrator",
 			PlatformRole:      "platform-admin",
 			FirstLogin:        true,
 		},
@@ -228,7 +225,7 @@ func generateRandomIndex(length int) int {
 	bigLength := big.NewInt(int64(length))
 	index, err := rand.Int(rand.Reader, bigLength)
 	if err != nil {
-		log.Errorf("cannot generate random value, err: %v", err)
+		// crypto/rand 失败时退化为 0；无法向上返回 error，由调用方依赖确定性索引
 		return 0
 	}
 	return int(index.Int64())
@@ -239,8 +236,7 @@ func encryptPassword(rawPassword []byte, cfg UserInfoConfig) (string, error) {
 	salt := make([]byte, cfg.SaltLength)
 	_, err := rand.Read(salt)
 	if err != nil {
-		log.Errorf("cannot call rand to generate salt, err: %v", err)
-		return "", err
+		return "", fmt.Errorf("cannot generate salt: %w", err)
 	}
 
 	// 使用 PBKDF2 算法生成密文

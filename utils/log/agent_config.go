@@ -12,7 +12,7 @@
 
 package log
 
-import olog "gopkg.openfuyao.cn/common-modules/ologger/log"
+import olog "gopkg.openfuyao.cn/common-modules/ologger/v26/log"
 
 func DefaultAgentConfig() olog.Config {
 	enableFile, enableConsole := true, false

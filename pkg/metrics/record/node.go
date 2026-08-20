@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -22,7 +22,6 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/config"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 func NodeBootstrapFailedCountRecord(obj client.Object) {
@@ -62,12 +61,4 @@ func NodeBootstrapDurationRecord(obj client.Object, node confv1beta1.Node, start
 		bkemetrics.FormatTime(startTime),
 		bkemetrics.TimeNow(),
 	).Set(time.Since(startTime).Seconds())
-
-	if config.E2EMode {
-		if err := bkemetrics.MetricRegister.E2EDataGather(key); err != nil {
-			log.Errorf("e2e mode enabled, but failed to save metrics data: %v", err)
-			return
-		}
-	}
-
 }

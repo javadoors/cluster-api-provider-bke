@@ -147,8 +147,7 @@ func handleTimeout(params HandleTimeoutParams) (string, error, bool) {
 		log.Infof("timeout waiting for process %s to return after interrupt signal was sent. Sending kill signal to the process", params.Command)
 		var e error
 		if err := params.Cmd.Process.Kill(); err != nil {
-			log.Errorf("Failed to kill process %s: %v", params.Command, err)
-			e = fmt.Errorf("timeout waiting for the command %s to return after interrupt signal was sent. Tried to kill the process but that failed: %v", params.Command, err)
+			e = fmt.Errorf("timeout waiting for the command %s to return after interrupt signal was sent; kill process failed: %w", params.Command, err)
 		} else {
 			e = fmt.Errorf("timeout waiting for the command %s to return", params.Command)
 		}
@@ -157,7 +156,7 @@ func handleTimeout(params HandleTimeoutParams) (string, error, bool) {
 
 	log.Infof("timeout waiting for process %s to return. Sending interrupt signal to the process", params.Command)
 	if err := params.Cmd.Process.Signal(os.Interrupt); err != nil {
-		log.Errorf("Failed to send interrupt signal to process %s: %v", params.Command, err)
+		log.Debugf("failed to send interrupt signal to process %s: %v", params.Command, err)
 		// kill signal will be sent next loop
 	}
 	*params.InterruptSent = true
@@ -206,7 +205,7 @@ func (*CommandExecutor) ExecuteCommandWithOutputFileTimeout(timeout time.Duratio
 
 	outFile, err := ioutil.TempFile("", "")
 	if err != nil {
-		return "", fmt.Errorf("failed to open output file: %+v", err)
+		return "", fmt.Errorf("failed to open output file: %+w", err)
 	}
 	defer outFile.Close()
 	defer os.Remove(outFile.Name())
@@ -246,7 +245,7 @@ func (*CommandExecutor) ExecuteCommandWithOutputFile(command, outfileArg string,
 	// it is cleaned up after this function is done
 	outFile, err := ioutil.TempFile("", "")
 	if err != nil {
-		return "", fmt.Errorf("failed to open output file: %+v", err)
+		return "", fmt.Errorf("failed to open output file: %+w", err)
 	}
 	defer outFile.Close()
 	defer os.Remove(outFile.Name())
@@ -280,7 +279,8 @@ func (*CommandExecutor) ExecuteCommandResidentBinary(timeout time.Duration, comm
 	}
 	go func() {
 		if err := cmd.Run(); err != nil {
-			log.Errorf("run Resident server failed: %s+v", err)
+			// Resident process runs detached; surface via Debug only (no caller return path).
+			log.Debugf("run resident server %s failed: %v", command, err)
 		}
 	}()
 	time.Sleep(timeout)
@@ -301,24 +301,26 @@ func startCommand(env []string, command string, arg ...string) (StartCommandResu
 	cmd := exec.Command(command, arg...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		log.Warnf("failed to open stdout pipe: %+v", err)
+		return StartCommandResult{}, fmt.Errorf("open stdout pipe for command %s: %w", command, err)
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		log.Warnf("failed to open stderr pipe: %+v", err)
+		return StartCommandResult{}, fmt.Errorf("open stderr pipe for command %s: %w", command, err)
 	}
 
 	if len(env) > 0 {
 		cmd.Env = env
 	}
 
-	startErr := cmd.Start()
+	if err := cmd.Start(); err != nil {
+		return StartCommandResult{}, fmt.Errorf("start command %s: %w", command, err)
+	}
 
 	return StartCommandResult{
 		Cmd:    cmd,
 		Stdout: stdout,
 		Stderr: stderr,
-	}, startErr
+	}, nil
 }
 
 // read from reader line by line and write it to the log
@@ -333,7 +335,7 @@ func logFromReader(reader io.ReadCloser) {
 
 func logOutput(stdout, stderr io.ReadCloser) {
 	if stdout == nil || stderr == nil {
-		log.Warnf("failed to collect stdout and stderr")
+		log.Debugf("skip collecting stdout/stderr: nil pipe")
 		return
 	}
 	go logFromReader(stderr)

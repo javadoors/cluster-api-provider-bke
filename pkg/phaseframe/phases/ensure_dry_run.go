@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -15,6 +15,8 @@ package phases
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/pkg/errors"
@@ -31,6 +33,7 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/mergecluster"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/annotation"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/clusterutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/constant"
@@ -151,7 +154,6 @@ func (e *EnsureDryRun) getDryRunNodes(bkeCluster *bkev1beta1.BKECluster, annotat
 	// Use NodeFetcher to get BKENodes from API server
 	allBkeNodes, err := e.Ctx.NodeFetcher().GetBKENodesWrapperForCluster(e.Ctx, bkeCluster)
 	if err != nil {
-		log.Warn(constant.DryRunReason, "failed to get BKENodes: %v", err)
 		return nil, err
 	}
 	bkeNodes := phaseutil.GetNeedInitEnvNodesWithBKENodes(bkeCluster, allBkeNodes)
@@ -159,8 +161,20 @@ func (e *EnsureDryRun) getDryRunNodes(bkeCluster *bkev1beta1.BKECluster, annotat
 	nodes := bkenode.Nodes{}
 	markNodes, ok := annotations[annotation.BKEClusterDryRunAnnotationKey]
 	if ok {
+		// 注解里记录的是已经做过 DryRun 的 IP 列表；
+		// 这里必须做“精确等值”匹配，避免 A 是 B 的子串导致误判。
+		// 同时过滤掉空段（如尾逗号产生的 ""），避免影响精确匹配逻辑。
+		markedIPsRaw := strings.Split(markNodes, ",")
+		markedIPs := make([]string, 0, len(markedIPsRaw))
+		for _, ip := range markedIPsRaw {
+			ip = strings.TrimSpace(ip)
+			if ip == "" {
+				continue
+			}
+			markedIPs = append(markedIPs, ip)
+		}
 		for _, node := range bkeNodes {
-			if !strings.Contains(markNodes, node.IP) {
+			if !utils.ContainsString(markedIPs, node.IP) {
 				nodes = append(nodes, node)
 			}
 		}
@@ -174,10 +188,12 @@ func (e *EnsureDryRun) getDryRunNodes(bkeCluster *bkev1beta1.BKECluster, annotat
 // updateDryRunAnnotation 更新dryRun注解
 func (e *EnsureDryRun) updateDryRunAnnotation(c client.Client, bkeCluster *bkev1beta1.BKECluster, nodes bkenode.Nodes, annotations map[string]string, log *bkev1beta1.BKELogger) error {
 	// add annotation to BKECluster to record dryRun Nodes toavoid reconcile again
-	dryRunNodes := ""
+	// 写入时避免尾逗号（Split 后过滤空段，确保精确等值语义稳定）。
+	dryRunIPs := make([]string, 0, nodes.Length())
 	for _, node := range nodes {
-		dryRunNodes += node.IP + ","
+		dryRunIPs = append(dryRunIPs, strings.TrimSpace(node.IP))
 	}
+	dryRunNodes := strings.Join(dryRunIPs, ",")
 
 	// 检查annotations是否为nil，避免空指针解引用
 	if annotations == nil {
@@ -224,19 +240,42 @@ func (e *EnsureDryRun) pushAgentWithParams(params PushAgentParams) error {
 	localKubeConfigSecret := &corev1.Secret{}
 	if err := params.Client.Get(params.Ctx, constant.GetLocalKubeConfigObjectKey(), localKubeConfigSecret); err != nil {
 		if apierrors.IsNotFound(err) {
-			params.Log.Error(constant.DryRunReason, "Local kubeconfig secret not found")
+			params.Log.Warn(constant.DryRunReason, "Local kubeconfig secret not found")
 			return nil
 		}
-		params.Log.Error(constant.DryRunReason, "Failed to get local kubeconfig secret, err: %v", err)
+		params.Log.Warn(constant.DryRunReason, "Failed to get local kubeconfig secret, err: %v", err)
 		return nil
 	}
 	localKubeConfig := localKubeConfigSecret.Data["config"]
 	params.Log.Info(constant.DryRunReason, "Push BKEAgent will take some time, please wait")
-	hosts := phaseutil.NodeToRemoteHost(params.Nodes)
-	ntpServer := params.BKECluster.Spec.ClusterConfig.Cluster.NTPServer
-	if failedNodes := phaseutil.PushAgent(hosts, localKubeConfig, ntpServer); len(failedNodes) > 0 {
+	pushHelper := &EnsureBKEAgent{
+		BasePhase:       phaseframe.NewBasePhase(e.Ctx, EnsureBKEAgentName),
+		localKubeConfig: localKubeConfig,
+		needPushNodes:   params.Nodes,
+	}
+	servicePath, err := pushHelper.prepareServiceFile(params.BKECluster)
+	if err != nil {
+		params.Log.Warn(constant.DryRunReason, "Failed to prepare bkeagent service file, err: %v", err)
+		return nil
+	}
+	defer func() {
+		if removeErr := os.RemoveAll(filepath.Dir(servicePath)); removeErr != nil {
+			params.Log.Warn(constant.DryRunReason, "Failed to remove temporary directory: %v", removeErr)
+		}
+	}()
+
+	failedNodesWithErr, err := pushHelper.sshPushAgent(params.Ctx, phaseutil.NodeToRemoteHost(params.Nodes), localKubeConfig, servicePath)
+	if err != nil {
+		params.Log.Warn(constant.DryRunReason, "Failed to push bkeagent by ssh, err: %v", err)
+		return nil
+	}
+	failedNodes := make([]string, 0, len(failedNodesWithErr))
+	for nodeIP := range failedNodesWithErr {
+		failedNodes = append(failedNodes, nodeIP)
+	}
+	if len(failedNodes) > 0 {
 		errInfo := "Failed to push bkeagent to flowing Nodes"
-		params.Log.Error(constant.DryRunReason, "%s: %v", errInfo, failedNodes)
+		params.Log.Warn(constant.DryRunReason, "%s: %v", errInfo, failedNodes)
 		// todo retry to push bkeagent to failed Nodes ?
 		return nil
 	}
@@ -248,13 +287,13 @@ func (e *EnsureDryRun) pushAgentWithParams(params PushAgentParams) error {
 func (e *EnsureDryRun) checkBKEAgentStatus(log *bkev1beta1.BKELogger) error {
 	err, _, failedNodes := e.pingBKEAgent()
 	if err != nil {
-		log.Error(constant.DryRunReason, "Failed to ping BKEAgent, err: %v", err)
+		log.Warn(constant.DryRunReason, "Failed to ping BKEAgent, err: %v", err)
 		return nil
 	}
 
 	if len(failedNodes) > 0 {
 		errInfo := fmt.Sprintf("Failed to ping bkeagent on flow Nodes: %v", failedNodes)
-		log.Error(constant.DryRunReason, errInfo)
+		log.Warn(constant.DryRunReason, errInfo)
 		return nil
 	}
 	return nil
@@ -297,9 +336,7 @@ func (e *EnsureDryRun) checkNodeEnvironmentWithParams(params CheckNodeEnvironmen
 		DryRun:        params.BKECluster.Spec.DryRun,
 	}
 	if err := envCommand.New(); err != nil {
-		errInfo := "Failed to create k8s env init command"
-		params.Log.Error(constant.DryRunReason, "%s: %v", errInfo, err)
-		return err
+		return fmt.Errorf("Failed to create k8s env init command: %w", err)
 	}
 	params.Log.Info(constant.DryRunReason, "Waiting for the env check to complete")
 

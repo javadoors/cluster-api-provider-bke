@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -269,9 +269,7 @@ func getStopSignal(labels map[string]string) (syscall.Signal, error) {
 // resumeTask resumes the task if paused
 func resumeTask(task containerd.Task, container containerd.Container, ctx context.Context) error {
 	if err := task.Resume(ctx); err != nil {
-		log.Warnf("Cannot unpause container %s: %s", container.ID(), err)
-	} else {
-		// no need to do it again when send sigkill signal
+		return fmt.Errorf("unpause container %s: %w", container.ID(), err)
 	}
 	return nil
 }
@@ -344,7 +342,8 @@ func (c *Client) findContainerByName(name string) (containerd.Container, map[str
 	return container, labels, nil
 }
 
-// cleanupNerdctlFiles cleans up nerdctl-related files for a container
+// cleanupNerdctlFiles cleans up nerdctl-related files for a container.
+// Best-effort only (called from defer); failures are Debug so the library layer does not emit business Error.
 func (c *Client) cleanupNerdctlFiles(id string, labels map[string]string) {
 	nerdctlDir := filepath.Join("/var/lib/nerdctl", sockAddrHash())
 	dataStoreDir := filepath.Join(nerdctlDir, "datastore")
@@ -355,33 +354,33 @@ func (c *Client) cleanupNerdctlFiles(id string, labels map[string]string) {
 	// 删除nerdctl的容器目录
 	if v, ok := labels["nerdctl/state-dir"]; ok {
 		if err := os.RemoveAll(v); err != nil {
-			log.Errorf("failed to remove container state dir: %s, err:%v", v, err)
+			log.Debugf("failed to remove container state dir %s: %v", v, err)
 		}
 	}
 
 	if v, ok := labels["nerdctl/name"]; ok {
 		if err := os.RemoveAll(filepath.Join(nameStoreDir, v)); err != nil {
 			if !os.IsNotExist(err) {
-				log.Errorf("failed to remove container name: %s, err:%v", v, err)
+				log.Debugf("failed to remove container name %s: %v", v, err)
 			}
 		}
 	}
 	// 删除nerdctl的hosts文件
 	if err := os.RemoveAll(hostsDir); err != nil {
 		if !os.IsNotExist(err) {
-			log.Errorf("failed to remove container hosts dir: %s, err:%v", hostsDir, err)
+			log.Debugf("failed to remove container hosts dir %s: %v", hostsDir, err)
 		}
 	}
 	// 删除nerdctl的容器卷
 	if v, ok := labels["nerdctl/anonymous-volumes"]; ok {
 		var anonVolumes []string
 		if err := json.Unmarshal([]byte(v), &anonVolumes); err != nil {
-			log.Errorf("failed to unmarshal anonymous volumes: %s, err:%v", v, err)
+			log.Debugf("failed to unmarshal anonymous volumes %s: %v", v, err)
+			return
 		}
 		for _, name := range anonVolumes {
-			err := os.RemoveAll(filepath.Join(volumeDir, name))
-			if err != nil {
-				log.Errorf("failed to remove anonymous volume: %s, err:%v", name, err)
+			if err := os.RemoveAll(filepath.Join(volumeDir, name)); err != nil {
+				log.Debugf("failed to remove anonymous volume %s: %v", name, err)
 			}
 		}
 	}
@@ -407,7 +406,7 @@ func (c *Client) handleTaskPaused(task containerd.Task, id string) error {
 // handleTaskRunning handles deletion for Running tasks
 func (c *Client) handleTaskRunning(task containerd.Task, id string) error {
 	if err := task.Kill(c.ctx, syscall.SIGKILL); err != nil {
-		log.Error(err, "failed to send SIGKILL")
+		return fmt.Errorf("send SIGKILL to task %s: %w", id, err)
 	}
 
 	es, err := task.Wait(c.ctx)
@@ -417,7 +416,7 @@ func (c *Client) handleTaskRunning(task containerd.Task, id string) error {
 
 	_, err = task.Delete(c.ctx, containerd.WithProcessKill)
 	if err != nil && !errdefs.IsNotFound(err) {
-		log.Error(err, "failed to delete task %v", id)
+		return fmt.Errorf("delete task %s: %w", id, err)
 	}
 	return nil
 }
@@ -428,7 +427,7 @@ func (c *Client) handleTaskExitStatus(es <-chan containerd.ExitStatus, id string
 		select {
 		case exitStatus := <-es:
 			if exitStatus.ExitCode() != 0 {
-				log.Error(fmt.Errorf("task exited with code %d", exitStatus.ExitCode()), "failed to delete task %v", id)
+				return fmt.Errorf("wait task %s exit: exited with code %d", id, exitStatus.ExitCode())
 			}
 			return nil
 		}
@@ -468,10 +467,13 @@ func (c *Client) Pull(image ImageRef) error {
 		}
 	}
 
-	log.Debugf("PullImageRequest: %v", request)
+	log.Debugf("pulling containerd image %s", image.Image)
 	resp, err := c.imageClient.PullImage(context.Background(), request)
-	log.Debugf("PullImageResponse: %v", resp)
-	return err
+	if err != nil {
+		return fmt.Errorf("pull containerd image %s: %w", image.Image, err)
+	}
+	log.Debugf("pulled containerd image %s, imageRef=%s", image.Image, resp.GetImageRef())
+	return nil
 }
 
 // EnsureImageExists checks if an image exists and pulls it if not
@@ -483,12 +485,12 @@ func (c *Client) EnsureImageExists(image ImageRef) error {
 	}
 	status, err := c.imageClient.ImageStatus(context.Background(), request)
 	if err != nil {
-		return err
+		return fmt.Errorf("get containerd image status for %s: %w", image.Image, err)
 	}
 	if status.Image == nil {
 		log.Infof("Image %s not found, pulling...", image.Image)
 		if err := c.Pull(image); err != nil {
-			return err
+			return fmt.Errorf("ensure containerd image %s exists: %w", image.Image, err)
 		}
 	}
 	return nil
@@ -556,12 +558,11 @@ func WaitContainerdReady() error {
 		if err == nil {
 			return true, nil
 		}
-		log.Warnf("containerd is not available: %v", err)
+		log.Debugf("containerd is not available: %v", err)
 		return false, nil
 	}, ctx.Done())
 	if err != nil {
-		log.Errorf("Failed to wait containerd available: %v", err)
-		return errors.Wrapf(err, "failed to wait containerd available")
+		return fmt.Errorf("wait containerd available: %w", err)
 	}
 	return nil
 }

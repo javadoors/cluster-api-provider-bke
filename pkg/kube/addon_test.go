@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -14,6 +14,7 @@ package kube
 
 import (
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
@@ -1427,4 +1428,253 @@ func TestGetPortalK8sToken(t *testing.T) {
 	if token != "test-token" {
 		t.Errorf("Expected 'test-token', got %s", token)
 	}
+}
+
+func TestCalculateTyphaReplicas(t *testing.T) {
+	tests := []struct {
+		nodeCount int
+		want      int
+	}{
+		{nodeCount: 51, want: maxInt(minTyphaReplicas, 1)},
+		{nodeCount: 400, want: maxInt(minTyphaReplicas, 2)},
+		{nodeCount: 600, want: maxInt(minTyphaReplicas, 3)},
+		{nodeCount: 601, want: maxInt(minTyphaReplicas, 4)},
+		{nodeCount: 1000, want: maxInt(minTyphaReplicas, 5)},
+		{nodeCount: 5000, want: maxTyphaReplicas},
+	}
+
+	for _, tt := range tests {
+		t.Run("replicas", func(t *testing.T) {
+			if got := calculateTyphaReplicas(tt.nodeCount); got != tt.want {
+				t.Errorf("calculateTyphaReplicas(%d) = %d, want %d", tt.nodeCount, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestApplyCalicoScaleParamsOverridesAddonParam(t *testing.T) {
+	file := writeCalicoManifestForTest(t, true)
+	param := map[string]map[string]interface{}{
+		"001-typha": {
+			"allowTypha":    "false",
+			"typhaReplicas": "1",
+		},
+		"002-calico": {},
+	}
+
+	err := applyCalicoScaleParams(
+		&confv1beta1.Product{Name: "calico", Version: "v3.31.3"},
+		[]string{file},
+		param,
+		makeTestNodes(51),
+		bkeaddon.CreateAddon,
+	)
+
+	if err != nil {
+		t.Fatalf("applyCalicoScaleParams() error = %v", err)
+	}
+	for name, values := range param {
+		if values["allowTypha"] != "true" {
+			t.Errorf("%s allowTypha = %v, want true", name, values["allowTypha"])
+		}
+		if values["typhaReplicas"] != strconv.Itoa(calculateTyphaReplicas(51)) {
+			t.Errorf("%s typhaReplicas = %v, want %d", name, values["typhaReplicas"], calculateTyphaReplicas(51))
+		}
+	}
+}
+
+func TestApplyCalicoScaleParamsUnsupportedManifestCreateFails(t *testing.T) {
+	file := writeCalicoManifestForTest(t, false)
+	param := map[string]map[string]interface{}{"calico": {}}
+
+	err := applyCalicoScaleParams(
+		&confv1beta1.Product{Name: "calico", Version: "v3.27.3"},
+		[]string{file},
+		param,
+		makeTestNodes(51),
+		bkeaddon.CreateAddon,
+	)
+
+	if err == nil {
+		t.Fatal("expected unsupported manifest error")
+	}
+}
+
+func TestApplyCalicoScaleParamsUnsupportedManifestUpdateKeepsDisabled(t *testing.T) {
+	file := writeCalicoManifestForTest(t, false)
+	param := map[string]map[string]interface{}{"calico": {}}
+
+	err := applyCalicoScaleParams(
+		&confv1beta1.Product{Name: "calico", Version: "v3.27.3"},
+		[]string{file},
+		param,
+		makeTestNodes(51),
+		bkeaddon.UpdateAddon,
+	)
+
+	if err != nil {
+		t.Fatalf("applyCalicoScaleParams() error = %v", err)
+	}
+	if param["calico"]["allowTypha"] != "false" {
+		t.Errorf("allowTypha = %v, want false", param["calico"]["allowTypha"])
+	}
+	if param["calico"]["typhaReplicas"] != "0" {
+		t.Errorf("typhaReplicas = %v, want 0", param["calico"]["typhaReplicas"])
+	}
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+func writeCalicoManifestForTest(t *testing.T, supportsTypha bool) string {
+	t.Helper()
+	content := "kind: ConfigMap\nmetadata:\n  name: calico-config\ndata:\n  typha_service_name: \"none\"\n"
+	if supportsTypha {
+		content = `{{- if eq .allowTypha "true" }}
+kind: Deployment
+metadata:
+  name: calico-typha
+spec:
+  replicas: {{ .typhaReplicas | int }}
+---
+kind: Service
+metadata:
+  name: calico-typha
+---
+kind: PodDisruptionBudget
+metadata:
+  name: calico-typha
+---
+kind: ConfigMap
+metadata:
+  name: calico-config
+data:
+  typha_service_name: "calico-typha"
+---
+kind: DaemonSet
+spec:
+  template:
+    spec:
+      containers:
+        - name: calico-node
+          env:
+            - name: FELIX_TYPHAK8SSERVICENAME
+              valueFrom:
+                configMapKeyRef:
+                  key: typha_service_name
+{{- end }}
+`
+	}
+	file, err := os.CreateTemp(t.TempDir(), "calico-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString(content); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return file.Name()
+}
+
+func makeTestNodes(count int) bkenode.Nodes {
+	nodes := make(bkenode.Nodes, 0, count)
+	for i := 0; i < count; i++ {
+		nodes = append(nodes, confv1beta1.Node{IP: "10.0.0.1"})
+	}
+	return nodes
+}
+
+func TestFilterCalicoTyphaBootstrapObjects(t *testing.T) {
+	objects := []unstructured.Unstructured{
+		newTestUnstructured("CustomResourceDefinition", "ippools.crd.projectcalico.org", ""),
+		newTestUnstructured("ServiceAccount", "calico-node", "kube-system"),
+		newTestUnstructured("ClusterRole", "calico-node", ""),
+		newTestUnstructured("ClusterRoleBinding", "calico-node", ""),
+		newTestUnstructured("ConfigMap", "calico-config", "kube-system"),
+		newTestUnstructured("Deployment", "calico-typha", "kube-system"),
+		newTestUnstructured("Service", "calico-typha", "kube-system"),
+		newTestUnstructured("PodDisruptionBudget", "calico-typha", "kube-system"),
+		newTestUnstructured("DaemonSet", "calico-node", "kube-system"),
+		newTestUnstructured("Deployment", "calico-kube-controllers", "kube-system"),
+	}
+
+	withoutDependencies := filterCalicoTyphaBootstrapObjects(objects, false)
+	if len(withoutDependencies) != 3 {
+		t.Fatalf("without dependencies got %d objects, want 3", len(withoutDependencies))
+	}
+	for _, obj := range withoutDependencies {
+		if !isCalicoTyphaObject(obj) {
+			t.Fatalf("without dependencies should only contain typha objects, got %s/%s", obj.GetKind(), obj.GetName())
+		}
+	}
+
+	withDependencies := filterCalicoTyphaBootstrapObjects(objects, true)
+	if len(withDependencies) != 8 {
+		t.Fatalf("with dependencies got %d objects, want 8", len(withDependencies))
+	}
+	for _, obj := range withDependencies {
+		if obj.GetKind() == "DaemonSet" && obj.GetName() == "calico-node" {
+			t.Fatal("calico-node DaemonSet must not be applied before typha is ready")
+		}
+		if obj.GetKind() == "Deployment" && obj.GetName() == "calico-kube-controllers" {
+			t.Fatal("calico-kube-controllers Deployment should stay in the full calico apply phase")
+		}
+	}
+}
+
+func TestSortCalicoTyphaBootstrapObjectsForCreate(t *testing.T) {
+	objects := []unstructured.Unstructured{
+		newTestUnstructured("Deployment", "calico-typha", "kube-system"),
+		newTestUnstructured("ServiceAccount", "calico-node", "kube-system"),
+		newTestUnstructured("ClusterRoleBinding", "calico-node", ""),
+		newTestUnstructured("ConfigMap", "calico-config", "kube-system"),
+		newTestUnstructured("DaemonSet", "calico-node", "kube-system"),
+	}
+
+	filtered := filterCalicoTyphaBootstrapObjects(objects, true)
+	sorted := (&Client{}).sortUnstructuredList(filtered, &Task{Operate: bkeaddon.CreateAddon})
+	typhaIndex := indexTestUnstructured(sorted, "Deployment", "calico-typha")
+	if typhaIndex < 0 {
+		t.Fatal("calico-typha Deployment should be included in bootstrap objects")
+	}
+	if indexTestUnstructured(sorted, "DaemonSet", "calico-node") >= 0 {
+		t.Fatal("calico-node DaemonSet must not be applied in typha bootstrap phase")
+	}
+	for _, dep := range []struct {
+		kind string
+		name string
+	}{
+		{kind: "ServiceAccount", name: "calico-node"},
+		{kind: "ClusterRoleBinding", name: "calico-node"},
+		{kind: "ConfigMap", name: "calico-config"},
+	} {
+		depIndex := indexTestUnstructured(sorted, dep.kind, dep.name)
+		if depIndex < 0 {
+			t.Fatalf("%s/%s should be included in bootstrap objects", dep.kind, dep.name)
+		}
+		if depIndex > typhaIndex {
+			t.Fatalf("%s/%s should be applied before calico-typha Deployment", dep.kind, dep.name)
+		}
+	}
+}
+
+func indexTestUnstructured(objects []unstructured.Unstructured, kind, name string) int {
+	for i, obj := range objects {
+		if obj.GetKind() == kind && obj.GetName() == name {
+			return i
+		}
+	}
+	return -1
+}
+func newTestUnstructured(kind, name, namespace string) unstructured.Unstructured {
+	obj := unstructured.Unstructured{}
+	obj.SetKind(kind)
+	obj.SetName(name)
+	obj.SetNamespace(namespace)
+	return obj
 }

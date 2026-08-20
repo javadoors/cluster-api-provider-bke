@@ -2,7 +2,7 @@
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -94,7 +94,7 @@ func enrichUpgradeComponent(
 	comp cvv1alpha1.ReleaseImageUpgradeComponent,
 	bundle *releasemanifest.Bundle,
 ) cvv1alpha1.ReleaseImageUpgradeComponent {
-	if comp.Inline != nil {
+	if comp.Inline != nil || bundle == nil {
 		return comp
 	}
 	cv, ok := bundle.Components[releasemanifest.ComponentKey(comp.Name, comp.Version)]

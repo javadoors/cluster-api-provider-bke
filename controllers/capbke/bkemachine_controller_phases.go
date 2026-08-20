@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -46,6 +46,7 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/kube"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/mergecluster"
 	metricrecord "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/metrics/record"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phases"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/annotation"
@@ -675,6 +676,21 @@ func (r *BKEMachineReconciler) processBootstrapCommand(params ProcessBootstrapCo
 	return params.Res, params.Errs
 }
 
+// markCommandReconciled marks the Command as reconciled with retry on conflict.
+func (r *BKEMachineReconciler) markCommandReconciled(ctx context.Context, cmd *agentv1beta1.Command, logger *log.Logger, errs *[]error) {
+	if err := phaseutil.RetryOnConflict(func() error {
+		latestCommand := &agentv1beta1.Command{}
+		if err := r.Client.Get(ctx, client.ObjectKey{Name: cmd.Name, Namespace: cmd.Namespace}, latestCommand); err != nil {
+			return err
+		}
+		annotation.SetAnnotation(latestCommand, annotation.CommandReconciledAnnotationKey, "true")
+		return r.Client.Update(ctx, latestCommand)
+	}); err != nil {
+		logger.Errorf("failed to mark command reconciled, err: %s", err.Error())
+		*errs = append(*errs, err)
+	}
+}
+
 // processBootstrapFailure processes bootstrap command failures
 func (r *BKEMachineReconciler) processBootstrapFailure(params ProcessBootstrapFailureParams) (ctrl.Result, []error) {
 
@@ -696,11 +712,7 @@ func (r *BKEMachineReconciler) processBootstrapFailure(params ProcessBootstrapFa
 	// 忽略该函数的错误，重点是将信息输出
 	_ = r.reconcileBKEMachine(params.Ctx, params.BKECluster, params.BKEMachine, params.CurrentNode, params.Log)
 
-	annotation.SetAnnotation(params.Cmd, annotation.CommandReconciledAnnotationKey, "true")
-	if err := r.Client.Update(params.Ctx, params.Cmd); err != nil {
-		params.Log.Errorf("failed to mark command reconciled, err: %s", err.Error())
-		params.Errs = append(params.Errs, err)
-	}
+	r.markCommandReconciled(params.Ctx, params.Cmd, params.Log, &params.Errs)
 
 	// 集群master未初始化，后续的部署无法进行
 	if !conditions.IsTrue(params.Cluster, clusterv1.ControlPlaneInitializedCondition) {
@@ -813,11 +825,7 @@ func (r *BKEMachineReconciler) processBootstrapSuccess(params ProcessBootstrapSu
 	metricrecord.NodeBootstrapSuccessCountRecord(params.BKECluster)
 	metricrecord.NodeBootstrapDurationRecord(params.BKECluster, params.CurrentNode, params.Cmd.CreationTimestamp.Time, "success")
 
-	annotation.SetAnnotation(params.Cmd, annotation.CommandReconciledAnnotationKey, "true")
-	if err := r.Client.Update(params.Ctx, params.Cmd); err != nil {
-		params.Log.Errorf("failed to mark command reconciled, err: %s", err.Error())
-		params.Errs = append(params.Errs, err)
-	}
+	r.markCommandReconciled(params.Ctx, params.Cmd, params.Log, &params.Errs)
 
 	if err = r.reconcileBKEMachine(params.Ctx, params.BKECluster, params.BKEMachine, params.CurrentNode, params.Log); err != nil {
 		params.Errs = append(params.Errs, err)
@@ -840,6 +848,12 @@ func (r *BKEMachineReconciler) processResetCommand(params ProcessResetCommandPar
 		// Delete the BKENode CRD instead of removing from in-memory status
 		if err := r.NodeFetcher.DeleteBKENodeForCluster(params.Ctx, params.BKECluster, params.CurrentNode.IP); err != nil {
 			params.Log.Warnf("Failed to delete BKENode: %v", err)
+		}
+		// Delete the Node from target cluster if it still exists
+		if params.CurrentNode.Hostname != "" {
+			if err := phases.DeleteTargetClusterNode(params.Ctx, r.Client, params.BKECluster, params.CurrentNode.Hostname); err != nil {
+				params.Log.Warnf("Failed to delete Node %s from target cluster: %v", params.CurrentNode.Hostname, err)
+			}
 		}
 		// sync bkeCluster Status
 		if err := mergecluster.SyncStatusUntilComplete(r.Client, params.BKECluster); err != nil {
@@ -1488,26 +1502,29 @@ func (r *BKEMachineReconciler) cordonMasterNode(ctx context.Context, bkeCluster 
 
 // setTargetClusterNodeRole patches the node with the given taints,and set role label for the target cluster node
 func setTargetClusterNodeRole(ctx context.Context, c client.Client, node *corev1.Node, nodeRole string) error {
-	switch nodeRole {
-	case bkenode.WorkerNodeRole:
-		labelhelper.SetWorkerRoleLabel(node)
-	case bkenode.MasterNodeRole:
-		labelhelper.SetMasterRoleLabel(node)
-	case bkenode.MasterWorkerNodeRole:
-		labelhelper.SetMasterRoleLabel(node)
-		labelhelper.SetWorkerRoleLabel(node)
-	default:
-		// 不需要特殊处理的情况，保持节点原有的标签状态
-	}
 	bocVersion, found := os.LookupEnv(constant.BocVersionEnvKey)
 	if !found {
 		bocVersion = constant.DefaultBocVersion
 	}
-	labelhelper.SetBocVersionLabel(node, bocVersion)
-	if err := c.Update(ctx, node); err != nil {
-		return err
-	}
-	return nil
+	return phaseutil.RetryOnConflict(func() error {
+		latestNode := &corev1.Node{}
+		if err := c.Get(ctx, client.ObjectKey{Name: node.Name}, latestNode); err != nil {
+			return err
+		}
+		switch nodeRole {
+		case bkenode.WorkerNodeRole:
+			labelhelper.SetWorkerRoleLabel(latestNode)
+		case bkenode.MasterNodeRole:
+			labelhelper.SetMasterRoleLabel(latestNode)
+		case bkenode.MasterWorkerNodeRole:
+			labelhelper.SetMasterRoleLabel(latestNode)
+			labelhelper.SetWorkerRoleLabel(latestNode)
+		default:
+			// 不需要特殊处理的情况，保持节点原有的标签状态
+		}
+		labelhelper.SetBocVersionLabel(latestNode, bocVersion)
+		return c.Update(ctx, latestNode)
+	})
 }
 
 // createOrUpdateConfigMap 创建或更新ConfigMap的通用函数
@@ -1522,7 +1539,14 @@ func createOrUpdateConfigMap(ctx context.Context, c client.Client, name, namespa
 
 	if err := c.Create(ctx, mockCM); err != nil {
 		if apierrors.IsAlreadyExists(err) {
-			return c.Update(ctx, mockCM)
+			return phaseutil.RetryOnConflict(func() error {
+				existingConfigMap := &corev1.ConfigMap{}
+				if err := c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, existingConfigMap); err != nil {
+					return err
+				}
+				existingConfigMap.Data = data
+				return c.Update(ctx, existingConfigMap)
+			})
 		}
 		return err
 	}

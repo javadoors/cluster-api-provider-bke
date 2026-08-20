@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -24,6 +24,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -133,6 +134,9 @@ type HealthCheckParams struct {
 // including backup, version verification, and health checks.
 type EnsureEtcdUpgrade struct {
 	phaseframe.BasePhase
+	// mockClient allows tests to inject a fake kubernetes clientset. When nil
+	// (production), the real client is obtained via kube.GetTargetClusterClient.
+	mockClient kubernetes.Interface
 }
 
 // NewEnsureEtcdUpgrade creates a new EnsureEtcdUpgrade phase instance.
@@ -230,7 +234,6 @@ func (e *EnsureEtcdUpgrade) filterUpgradeableNodes(
 	needUpgradeNodes := bkenode.Nodes{}
 	specNodes, err := e.Ctx.NodeFetcher().GetNodesForBKECluster(e.Ctx, bkeCluster)
 	if err != nil {
-		log.Warn(constant.EtcdUpgradingReason, "failed to get cluster nodes: %v", err)
 		return nil, errors.Wrap(err, "failed to get cluster nodes")
 	}
 	etcdNodes := specNodes.Etcd()
@@ -320,27 +323,6 @@ func (e *EnsureEtcdUpgrade) upgradeSingleNode(params SingleNodeUpgradeParams) er
 	return e.markNodeUpgradeSuccess(nodeStatusParams)
 }
 
-func (e *EnsureEtcdUpgrade) shouldSkipNode(
-	bkeCluster *bkev1beta1.BKECluster,
-	node confv1beta1.Node,
-	log *bkev1beta1.BKELogger,
-) (bool, error) {
-	version, err := e.getEtcdImageVersion(node)
-	if err != nil {
-		log.Error(constant.EtcdUpgradeFailed, "get remote cluster pod resource failed, err: %v", err)
-		return false, errors.Errorf("get remote cluster pod resource failed, err: %v", err)
-	}
-
-	targetVersion := e.resolveEtcdUpgradeVersion()
-	if targetVersion != "" && strings.Contains(targetVersion, version) {
-		log.Info(constant.EtcdUpgradeSuccess, "etcd %q is already the expected version %q,skip upgrade",
-			phaseutil.NodeInfo(node), targetVersion)
-		return true, nil
-	}
-
-	return false, nil
-}
-
 func (e *EnsureEtcdUpgrade) markNodeUpgrading(params NodeStatusParams) error {
 	e.Ctx.NodeFetcher().SetNodeStateWithMessageForCluster(e.Ctx, params.BKECluster, params.Node.IP, bkev1beta1.EtcdUpgrading, "Upgrading")
 	return mergecluster.SyncStatusUntilComplete(params.Client, params.BKECluster)
@@ -352,13 +334,11 @@ func (e *EnsureEtcdUpgrade) markNodeUpgradeSuccess(params NodeStatusParams) erro
 }
 
 func (e *EnsureEtcdUpgrade) handleUpgradeFailure(params UpgradeFailureParams) error {
-	params.Log.Error(constant.EtcdUpgradeFailed, "upgrade node %q failed: %v",
-		phaseutil.NodeInfo(params.Node), params.Error)
 	e.Ctx.NodeFetcher().SetNodeStateWithMessageForCluster(e.Ctx, params.BKECluster, params.Node.IP, bkev1beta1.EtcdUpgradeFailed, params.Error.Error())
 	if err := mergecluster.SyncStatusUntilComplete(params.Client, params.BKECluster); err != nil {
-		return errors.Errorf("upgrade node %q failed: %v", phaseutil.NodeInfo(params.Node), err)
+		return fmt.Errorf("upgrade node %q failed: %w", phaseutil.NodeInfo(params.Node), err)
 	}
-	return errors.Errorf("upgrade node %q failed: %v", phaseutil.NodeInfo(params.Node), params.Error)
+	return fmt.Errorf("upgrade node %q failed: %w", phaseutil.NodeInfo(params.Node), params.Error)
 }
 
 func (e *EnsureEtcdUpgrade) resolveEtcdUpgradeVersion() string {
@@ -386,7 +366,7 @@ func (e *EnsureEtcdUpgrade) finalizeUpgrade(
 	var patchFuncs []mergecluster.PatchFunc
 
 	if err := mergecluster.SyncStatusUntilComplete(c, bkeCluster, patchFuncs...); err != nil {
-		return ctrl.Result{}, errors.Errorf("failed to upgrade addon version, err: %v", err)
+		return ctrl.Result{}, fmt.Errorf("failed to upgrade addon version, err: %w", err)
 	}
 	return ctrl.Result{}, nil
 }
@@ -465,8 +445,7 @@ func (e *EnsureEtcdUpgrade) executeUpgradeCommand(upgrade *command.Upgrade,
 	log.Info(constant.EtcdUpgradedReason, "start upgrade etcd %s", phaseutil.NodeInfo(node))
 
 	if err := upgrade.New(); err != nil {
-		log.Error(constant.EtcdUpgradeFailed, "upgrade etcd %q failed: %v", phaseutil.NodeInfo(node), err)
-		return errors.Errorf("create upgrade command，etcd: %q failed: %v", phaseutil.NodeInfo(node), err)
+		return fmt.Errorf("create upgrade command，etcd: %q failed: %w", phaseutil.NodeInfo(node), err)
 	}
 
 	return nil
@@ -477,19 +456,14 @@ func (e *EnsureEtcdUpgrade) waitForUpgradeComplete(params WaitUpgradeParams) err
 
 	err, _, failedNodes := params.Upgrade.Wait()
 	if err != nil {
-		params.Log.Error(constant.EtcdUpgradeFailed, "wait upgrade command complete failed，"+
-			"etcd: %q, err: %v", phaseutil.NodeInfo(params.Node), err)
-		return errors.Errorf("wait upgrade command complete failed，"+
-			"etcd: %q, err: %v", phaseutil.NodeInfo(params.Node), err)
+		return fmt.Errorf("wait upgrade command complete failed，etcd: %q: %w", phaseutil.NodeInfo(params.Node), err)
 	}
 
 	if len(failedNodes) != 0 {
-		params.Log.Error(constant.EtcdUpgradeFailed, "upgrade etcd %q failed: %v",
-			phaseutil.NodeInfo(params.Node), err)
 		commandErrs, err := phaseutil.LogCommandFailed(*params.Upgrade.Command,
 			failedNodes, params.Log, constant.EtcdUpgradingReason)
 		phaseutil.MarkNodeStatusByCommandErrs(e.Ctx, e.Ctx.Client, params.BKECluster, commandErrs)
-		return errors.Errorf("upgrade etcd %q failed: %v", phaseutil.NodeInfo(params.Node), err)
+		return fmt.Errorf("upgrade etcd %q failed: %w", phaseutil.NodeInfo(params.Node), err)
 	}
 
 	params.Log.Info(constant.EtcdUpgradingReason, "upgrade etcd %q operation succeed",
@@ -512,24 +486,34 @@ func (e *EnsureEtcdUpgrade) waitForEtcdHealthCheck(params HealthCheckParams) err
 			if err != nil {
 				return false, nil
 			}
-			if !strings.Contains(params.Version, currentVersion) {
+			if !etcdVersionsMatch(params.Version, currentVersion) {
 				return false, nil
 			}
 			return true, nil
 		})
 
 	if err != nil {
-		params.Log.Error(constant.EtcdUpgradeFailed, "upgrade etcd %q failed: %v", phaseutil.NodeInfo(params.Node), err)
-		return errors.Errorf("wait for etcd %q pass healthy check failed: %v", phaseutil.NodeInfo(params.Node), err)
+		return fmt.Errorf("wait for etcd %q pass healthy check failed: %w", phaseutil.NodeInfo(params.Node), err)
 	}
 
 	return nil
 }
 
+// targetClientSet returns the kubernetes clientset for the target cluster.
+// In production this is obtained via kube.GetTargetClusterClient; tests may
+// inject a fake clientset via mockClient. Behavior is identical when mockClient is nil.
+func (e *EnsureEtcdUpgrade) targetClientSet(ctx context.Context, bkeCluster *bkev1beta1.BKECluster) (kubernetes.Interface, error) {
+	if e.mockClient != nil {
+		return e.mockClient, nil
+	}
+	cs, _, err := kube.GetTargetClusterClient(ctx, e.Ctx.Client, bkeCluster)
+	return cs, err
+}
+
 // Extract the image version number from the pod
 func (e *EnsureEtcdUpgrade) getEtcdImageVersion(node confv1beta1.Node) (string, error) {
-	ctx, c, bkeCluster, _, _ := e.Ctx.Untie()
-	clientSet, _, err := kube.GetTargetClusterClient(ctx, c, bkeCluster)
+	ctx, _, bkeCluster, _, _ := e.Ctx.Untie()
+	clientSet, err := e.targetClientSet(ctx, bkeCluster)
 	if err != nil {
 		return "", err
 	}
@@ -586,4 +570,13 @@ func extractVersionFromImage(image string) string {
 	}
 
 	return "unknown"
+}
+
+func etcdVersionsMatch(want, current string) bool {
+	want = strings.TrimPrefix(strings.TrimSpace(want), "v")
+	current = strings.TrimPrefix(strings.TrimSpace(current), "v")
+	if want == "" || current == "" || current == "unknown" {
+		return false
+	}
+	return want == current
 }

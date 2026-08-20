@@ -40,6 +40,7 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/annotation"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/clustertracker"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/condition"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/config"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/nodeutil"
 )
@@ -377,6 +378,7 @@ func TestSetClusterHealthStatus(t *testing.T) {
 		name           string
 		flags          ClusterHealthStatusFlags
 		expectState    confv1beta1.ClusterHealthState
+		prepareCluster func(*bkev1beta1.BKECluster)
 		deleteOrReset  bool
 		expectDeleting bool
 	}{
@@ -407,6 +409,18 @@ func TestSetClusterHealthStatus(t *testing.T) {
 				UpgradeFailedFlag: true,
 			},
 			expectState: bkev1beta1.Upgrading,
+		},
+		{
+			name: "terminal upgrade failure preserves UpgradeFailed health",
+			flags: ClusterHealthStatusFlags{
+				UpgradeFlag:       true,
+				UpgradeFailedFlag: true,
+			},
+			prepareCluster: func(cluster *bkev1beta1.BKECluster) {
+				condition.ConditionMark(cluster, bkev1beta1.ClusterHealthyStateCondition,
+					confv1beta1.ConditionFalse, string(bkev1beta1.Upgrading), string(bkev1beta1.UpgradeFailed))
+			},
+			expectState: bkev1beta1.UpgradeFailed,
 		},
 		{
 			name: "manage flag",
@@ -443,6 +457,9 @@ func TestSetClusterHealthStatus(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			r := &BKEClusterReconciler{}
 			bkeCluster := newTestBKECluster()
+			if tt.prepareCluster != nil {
+				tt.prepareCluster(bkeCluster)
+			}
 
 			patches := gomonkey.ApplyFunc(phaseutil.IsDeleteOrReset, func(_ *bkev1beta1.BKECluster) bool {
 				return false
@@ -451,7 +468,7 @@ func TestSetClusterHealthStatus(t *testing.T) {
 
 			r.setClusterHealthStatus(bkeCluster, tt.flags)
 			if tt.expectState != "" {
-				assert.NotNil(t, bkeCluster.Status.Conditions)
+				assert.Equal(t, tt.expectState, bkeCluster.Status.ClusterHealthState)
 			}
 		})
 	}

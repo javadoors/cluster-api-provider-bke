@@ -22,15 +22,16 @@ import (
 	goruntime "runtime"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/blang/semver/v4"
 	"github.com/pkg/errors"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
+	bkecommon "gopkg.openfuyao.cn/cluster-api-provider-bke/common"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/imagehelper"
 	bkeinit "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/initialize"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/initialize/versions"
 	bkevalidte "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/validation"
 	bkesource "gopkg.openfuyao.cn/cluster-api-provider-bke/common/source"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/executor/containerd"
@@ -85,6 +86,10 @@ func (ep *EnvPlugin) processInitScope(scope string) (error, bool) {
 	case "image":
 		return ep.processSimpleInitScope("Start to pull container images", ep.initImage), false
 	case "runtime":
+		if ep.isImmutableOS() {
+			// 不可变 OS：containerd 镜像内置，只配置不下载
+			return ep.processSimpleInitScope("Start to config container runtime (immutable OS)", ep.configRuntimeImmutable), false
+		}
 		return ep.processSimpleInitScope("Start to init container runtime", ep.initRuntime), false
 	case "dns":
 		return ep.processSimpleInitScope("Start to init dns", ep.initDNS), false
@@ -259,7 +264,7 @@ func (ep *EnvPlugin) loadSysModules() []error {
 	var errs []error
 	for _, m := range sysModule {
 		if out, err := ep.exec.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", fmt.Sprintf("modprobe %s", m)); err != nil {
-			errInfo := errors.Errorf("load sys module %q failed, err: %v, output: %s", m, err, out)
+			errInfo := fmt.Errorf("load sys module %q failed, err: %w, output: %s", m, err, out)
 			errs = append(errs, errInfo)
 			continue
 		}
@@ -278,13 +283,13 @@ func (ep *EnvPlugin) setupUbuntuModules() []error {
 	for _, m := range sysModule {
 		found, err := catAndSearch(InitUbuntuSysModuleFilePath, m, "")
 		if err != nil {
-			errs = append(errs, errors.Errorf("cat %s failed, err: %v", InitUbuntuSysModuleFilePath, err))
+			errs = append(errs, fmt.Errorf("cat %s failed, err: %w", InitUbuntuSysModuleFilePath, err))
 			continue
 		}
 		if !found {
 			combinedOutput, err := ep.exec.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", fmt.Sprintf("echo %q >> %s", m, InitUbuntuSysModuleFilePath))
 			if err != nil {
-				errs = append(errs, errors.Errorf("echo %q >> %s failed, err: %v, output: %s", m, InitUbuntuSysModuleFilePath, err, combinedOutput))
+				errs = append(errs, fmt.Errorf("echo %q >> %s failed, err: %w, output: %s", m, InitUbuntuSysModuleFilePath, err, combinedOutput))
 			}
 		}
 	}
@@ -300,10 +305,10 @@ func (ep *EnvPlugin) setupCentosKylinModules() []error {
 	var errs []error
 	log.Infof("create sys module file %s", InitIpvsSysModuleFilePath)
 	if err := os.MkdirAll(filepath.Dir(InitIpvsSysModuleFilePath), RwxRxRx); err != nil {
-		errs = append(errs, errors.Errorf("create sys module file %s failed, err: %v", InitIpvsSysModuleFilePath, err))
+		errs = append(errs, fmt.Errorf("create sys module file %s failed, err: %w", InitIpvsSysModuleFilePath, err))
 	}
 	if err := os.WriteFile(InitIpvsSysModuleFilePath, []byte(systemModules), RwxRxRx); err != nil {
-		errs = append(errs, errors.Errorf("write sys module file %s failed, err: %v", InitIpvsSysModuleFilePath, err))
+		errs = append(errs, fmt.Errorf("write sys module file %s failed, err: %w", InitIpvsSysModuleFilePath, err))
 	}
 	return errs
 }
@@ -325,11 +330,11 @@ func (ep *EnvPlugin) setupKylinRcLocal() []error {
 
 	output, err := ep.exec.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", fmt.Sprintf("sudo echo %q >> %s", sources, rcLoaclFilePath))
 	if err != nil {
-		errs = append(errs, errors.Errorf("failed to add %s to %s,err: %v,out: %s", sources, rcLoaclFilePath, err, output))
+		errs = append(errs, fmt.Errorf("failed to add %s to %s,err: %w,out: %s", sources, rcLoaclFilePath, err, output))
 	}
 	output, err = ep.exec.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", fmt.Sprintf("sudo chmod +x /etc/rc.d/rc.local"))
 	if err != nil {
-		errs = append(errs, errors.Errorf("failed to chmod +x %s,err: %v,out: %s", rcLoaclFilePath, err, output))
+		errs = append(errs, fmt.Errorf("failed to chmod +x %s,err: %w,out: %s", rcLoaclFilePath, err, output))
 	}
 	return errs
 }
@@ -367,15 +372,13 @@ func (ep *EnvPlugin) initFirewall() error {
 
 	initSystem, err := initsystem.GetInitSystem()
 	if err != nil {
-		log.Errorf("Get init system failed: %v", err)
-		return err
+		return fmt.Errorf("Get init system failed: %w", err)
 	}
 
 	if initSystem.ServiceExists("firewalld") {
 		log.Info("stop firewalld")
 		if err := initSystem.ServiceStop("firewalld"); err != nil {
-			log.Errorf("Stop firewalld failed: %v", err)
-			return err
+			return fmt.Errorf("Stop firewalld failed: %w", err)
 		}
 		log.Infof("disable firewalld")
 		if err := initSystem.ServiceDisable("firewalld"); err != nil {
@@ -388,8 +391,7 @@ func (ep *EnvPlugin) initFirewall() error {
 		if initSystem.ServiceIsActive("ufw") {
 			log.Info("stop ufw")
 			if err := initSystem.ServiceStop("ufw"); err != nil {
-				log.Errorf("Stop ufw failed: %v", err)
-				return err
+				return fmt.Errorf("Stop ufw failed: %w", err)
 			}
 		}
 
@@ -466,13 +468,7 @@ func (ep *EnvPlugin) initTime() error {
 
 	//设置时区软链接
 	if out, err := ep.exec.ExecuteCommandWithOutput("/bin/sh", "-c", "sudo ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime"); err != nil {
-		log.Errorf("set time zone failed, err: %s, output: %s", err, out)
 		return errors.Wrapf(err, "set time zone failed, output: %s", out)
-	}
-	// 设置time包的时区
-	loc, err := time.LoadLocation("Asia/Shanghai")
-	if err == nil {
-		time.Local = loc
 	}
 	return nil
 }
@@ -589,7 +585,7 @@ func (ep *EnvPlugin) trySetHostName(bkeNodeName string) {
 	}
 }
 
-// initImage pull image
+// initImage 根据当前容器运行时拉取节点需要的镜像，Calico 镜像预拉取失败会阻断节点环境初始化。
 func (ep *EnvPlugin) initImage() error {
 	switch runtime.DetectRuntime() {
 	case runtime.ContainerRuntimeDocker:
@@ -597,9 +593,15 @@ func (ep *EnvPlugin) initImage() error {
 		if err != nil {
 			return errors.Wrap(err, "get docker client failed")
 		}
-		for _, image := range ep.exportImageList() {
+		images, err := ep.exportImageListWithError()
+		if err != nil {
+			return err
+		}
+		log.Infof("docker runtime will ensure %d images exist", len(images))
+		for _, image := range images {
 			if err := dockerClient.EnsureImageExists(docker.ImageRef{Image: image}); err != nil {
-				return errors.Wrapf(err, "pull image %s failed", image)
+				log.Warnf("pull image %s failed, ignore and continue: %v", image, err)
+				continue
 			}
 		}
 	case runtime.ContainerRuntimeContainerd:
@@ -607,9 +609,15 @@ func (ep *EnvPlugin) initImage() error {
 		if err != nil {
 			return errors.Wrap(err, "failed to create containerd client")
 		}
-		for _, image := range ep.exportImageList() {
+		images, err := ep.exportImageListWithError()
+		if err != nil {
+			return err
+		}
+		log.Infof("containerd runtime will ensure %d images exist", len(images))
+		for _, image := range images {
 			if err := containerdClient.EnsureImageExists(containerd.ImageRef{Image: image}); err != nil {
-				return errors.Wrapf(err, "failed to pull image %s", image)
+				log.Warnf("failed to pull image %s, ignore and continue: %v", image, err)
+				continue
 			}
 			log.Infof("pull image %s success", image)
 		}
@@ -714,7 +722,7 @@ func (ep *EnvPlugin) initRuntime() error {
 
 		downloaderPlugin := downloader.New()
 		if _, err := downloaderPlugin.Execute(commands); err != nil {
-			return errors.Errorf("download richrunc %s failed, err: %v", url, err)
+			return fmt.Errorf("download richrunc %s failed, err: %w", url, err)
 		}
 	}
 	// download cri-dockerd if docker
@@ -741,6 +749,26 @@ func (ep *EnvPlugin) initRuntime() error {
 	return nil
 }
 
+// isImmutableOS 判断当前节点是否按不可变 OS 模式处理。
+// immutableOS 是集群级标志，但仅对 worker 节点生效：master 运行普通 openEuler。
+func (ep *EnvPlugin) isImmutableOS() bool {
+	if ep.bkeConfig == nil || ep.bkeConfig.CustomExtra == nil {
+		return false
+	}
+	// 集群开启不可变 OS 且当前节点不是 master（master 运行普通 openEuler）
+	return ep.bkeConfig.CustomExtra[bkecommon.ImmutableOSCustomExtraKey] == bkecommon.ImmutableOSAnnotationValue &&
+		!ep.currenNode.IsMaster() && !ep.currenNode.IsMasterWorker()
+}
+
+// configRuntimeImmutable 不可变 OS 模式下配置 containerd。plugin 收到后跳过下载解压，只执行配置+启动+等待就绪。
+func (ep *EnvPlugin) configRuntimeImmutable() error {
+	if ep.bkeConfig == nil {
+		return errors.New("bkeConfig is nil in immutable OS runtime config")
+	}
+	cfg := ep.loadRuntimeConfig()
+	return ep.downloadContainerd(cfg.lowLevelRuntime, cfg.insecureRegistries)
+}
+
 func (ep *EnvPlugin) initDNS() error {
 	if !utils.Exists(InitDNSConfPath) {
 		if _, err := os.OpenFile(InitDNSConfPath, os.O_CREATE, RwxRwRw); err != nil {
@@ -754,78 +782,79 @@ func (ep *EnvPlugin) initDNS() error {
 	return nil
 }
 
-// exportImageList export image list from bkeConfig
+// exportImageList 导出当前节点需要预拉取的镜像列表，保留无错误返回形式用于兼容旧调用。
 func (ep *EnvPlugin) exportImageList() []string {
-	if ep.bkeConfig == nil {
+	images, err := ep.exportImageListWithError()
+	if err != nil {
+		log.Warnf("export image list failed: %v", err)
 		return nil
 	}
-	var images []string
+	return images
+}
+
+// exportImageListWithError 导出当前节点需要预拉取的镜像列表，并把 Calico Addon 配置错误返回给主链路。
+func (ep *EnvPlugin) exportImageListWithError() ([]string, error) {
+	if ep.bkeConfig == nil {
+		return nil, nil
+	}
 	cfg := ep.bkeConfig
 	conf := bkeinit.BkeConfig(*cfg)
 	repo := fmt.Sprintf("%s/", strings.TrimRight(conf.ImageFuyaoRepo(), "/"))
 	k8sVersion := strings.TrimPrefix(cfg.Cluster.KubernetesVersion, "v")
 	etcdVersion := strings.TrimPrefix(cfg.Cluster.EtcdVersion, "v")
 
-	// 导出 K8s 核心组件镜像
 	exporter := imagehelper.NewImageExporter(repo, k8sVersion, etcdVersion)
-	images, _ = exporter.ExportImageList()
-
-	// 导出 Addon 镜像（包括 Calico）
-	addonImages := ep.exportAddonImages()
-	images = append(images, addonImages...)
+	images, _ := exporter.ExportImageList()
+	calicoImages, err := exportCalicoNodeImages(cfg)
+	if err != nil {
+		return nil, err
+	}
 
 	cNode := ep.currenNode
 	if cNode.IP == "" {
-		return images
+		result := append(images, calicoImages...)
+		log.Infof("export image list without current node role, total=%d, calico=%d", len(result), len(calicoImages))
+		return result, nil
 	}
-	// Worker 节点也预拉取 Addon 镜像（如 Calico DaemonSet）
 	if cNode.IsWorker() {
-		return addonImages
+		log.Infof("export worker image list, total=%d, calico=%d", len(calicoImages), len(calicoImages))
+		return calicoImages, nil
 	}
-	return images
+	result := append(images, calicoImages...)
+	log.Infof("export master image list, total=%d, calico=%d", len(result), len(calicoImages))
+	return result, nil
 }
 
-// exportAddonImages 从 BKEConfig 中导出 Addon 镜像列表
-// 支持从 CRD 动态获取版本，避免硬编码
-func (ep *EnvPlugin) exportAddonImages() []string {
-	if ep.bkeConfig == nil || len(ep.bkeConfig.Addons) == 0 {
-		return nil
+// exportCalicoNodeImages 根据有效 Calico Addon 生成所有节点都需要预拉取的 Calico 核心镜像。
+func exportCalicoNodeImages(cfg *bkev1beta1.BKEConfig) ([]string, error) {
+	if cfg == nil {
+		return nil, nil
 	}
-
-	var images []string
-	conf := bkeinit.BkeConfig(*ep.bkeConfig)
-	repo := fmt.Sprintf("%s/", strings.TrimRight(conf.ImageFuyaoRepo(), "/"))
-
-	for _, addon := range ep.bkeConfig.Addons {
-		switch addon.Name {
-		case "calico":
-			// 从 Addon 配置中获取 Calico 版本
-			version := addon.Version
-			if version == "" {
-				version = "v3.31.3" // 默认版本
-			}
-			// 添加 Calico 镜像列表
-			images = append(images,
-				fmt.Sprintf("%scalico/node:%s", repo, version),
-				fmt.Sprintf("%scalico/cni:%s", repo, version),
-				fmt.Sprintf("%scalico/kube-controllers:%s", repo, version),
-				fmt.Sprintf("%scalico/pod2daemon-flexvol:%s", repo, version),
-			)
-		// 可以继续扩展其他 Addon
-		case "coredns":
-			// 示例：CoreDNS 镜像
-			// version := addon.Version
-			// if version == "" { version = "v1.9.3" }
-			// images = append(images, fmt.Sprintf("%scoredns/coredns:%s", repo, version))
-		case "metrics-server":
-			// 示例：metrics-server 镜像
-			// version := addon.Version
-			// if version == "" { version = "v0.6.2" }
-			// images = append(images, fmt.Sprintf("%smetrics-server/metrics-server:%s", repo, version))
+	var calicoAddon *bkev1beta1.Product
+	for i := range cfg.Addons {
+		addon := &cfg.Addons[i]
+		if !strings.EqualFold(addon.Name, "calico") {
+			continue
 		}
+		//遗留:后续前置到webhook进行判断
+		if calicoAddon != nil {
+			return nil, errors.Errorf("multiple calico addons found")
+		}
+		calicoAddon = addon
+	}
+	if calicoAddon == nil {
+		return nil, nil
+	}
+	if strings.TrimSpace(calicoAddon.Version) == "" {
+		return nil, errors.Errorf("calico addon version is empty")
 	}
 
-	return images
+	bkeCfg := bkeinit.BkeConfig(*cfg)
+	repo := bkeCfg.ImageThirdRepo()
+	return []string{
+		fmt.Sprintf("%scalico/cni:%s", repo, calicoAddon.Version),
+		fmt.Sprintf("%scalico/node:%s", repo, calicoAddon.Version),
+	}, nil
 }
 
 // getNTPServers get ntp servers from bkeConfig
@@ -843,7 +872,6 @@ func (ep *EnvPlugin) downloadContainerRuntime(containerRuntime, lowLevelRuntime 
 	case runtime.ContainerRuntimeDocker:
 		return ep.downloadDocker(lowLevelRuntime, enableDockerTls, insecureRegistries)
 	default:
-		log.Errorf("unsupported container runtime type %s", containerRuntime)
 		return errors.Errorf("unsupported container runtime type %s", containerRuntime)
 	}
 }
@@ -881,7 +909,6 @@ func (ep *EnvPlugin) downloadDocker(lowLevelRuntime string, enableDockerTls bool
 
 		dp := dockerPlugin.New(ep.exec)
 		if _, err := dp.Execute(command); err != nil {
-			log.Errorf("download docker failed, err: %s", err)
 			return errors.Wrap(err, "download docker failed")
 		}
 		log.Info("download docker success")
@@ -903,7 +930,7 @@ func (ep *EnvPlugin) downloadContainerd(lowLevelRuntime string, insecureRegistri
 		baseUrl := clusterutil.BuildYumRepoDownloadBaseURL(cfg)
 		repo := cfg.ImageThirdRepo()
 		sandboxImage := fmt.Sprintf("%s/pause:%s", strings.TrimRight(repo, "/"),
-			bkeinit.DefaultPauseImageTag)
+			versions.PauseImageTag())
 
 		gzName := fmt.Sprintf("containerd-%s-linux-%s.tar.gz", cfg.Cluster.ContainerdVersion, goruntime.GOARCH)
 		gzName = strings.ReplaceAll(gzName, "{.arch}", goruntime.GOARCH)
@@ -928,12 +955,19 @@ func (ep *EnvPlugin) downloadContainerd(lowLevelRuntime string, insecureRegistri
 		if cfg.Cluster.ContainerdConfigRef != nil {
 			command = append(command, fmt.Sprintf("containerdConfig=%s:%s", cfg.Cluster.ContainerdConfigRef.Namespace, cfg.Cluster.ContainerdConfigRef.Name))
 		}
+		// 不可变 OS：containerd 镜像内置，通知 plugin 跳过下载解压，只做配置
+		if ep.isImmutableOS() {
+			command = append(command, "immutableOS=true")
+		}
 		cp := containerdPlugin.New(ep.exec)
 		if _, err := cp.Execute(command); err != nil {
-			log.Errorf("failed to run containerd plugin, err: %s", err)
 			return errors.Wrap(err, "failed to run containerd plugin ")
 		}
-		log.Infof("download containerd %q success", gzName)
+		if ep.isImmutableOS() {
+			log.Info("configure containerd success (immutable OS, skip download)")
+		} else {
+			log.Infof("download containerd %q success", gzName)
+		}
 		return nil
 	}
 	return errors.New("bke config not found")
@@ -970,7 +1004,6 @@ func (ep *EnvPlugin) downloadCriDockerd() error {
 
 		cdp := cridocker.New(ep.exec)
 		if _, err = cdp.Execute(command); err != nil {
-			log.Errorf("download cri-dockerd failed, err: %s", err)
 			return errors.Wrap(err, "download cri-dockerd failed")
 		}
 
@@ -1003,7 +1036,6 @@ func (ep *EnvPlugin) configContainerRuntime(cfg runtimeConfig, runtimeToUse stri
 		// todo 适配ContainerRuntime配置
 		return nil
 	default:
-		log.Errorf("unsupported container runtime type %s", runtimeToUse)
 		return errors.Errorf("unsupported container runtime type %s", runtimeToUse)
 	}
 }
@@ -1025,7 +1057,7 @@ func (ep *EnvPlugin) initHttpRepo() error {
 	}
 
 	if err := bkesource.SetSource(yumRepo); err != nil {
-		log.Errorf("set http repo failed, err: %s", err)
+		log.Warnf("set http repo failed, err: %v", err)
 		return nil
 	}
 
@@ -1035,8 +1067,7 @@ func (ep *EnvPlugin) initHttpRepo() error {
 			log.Warnf("update http repo failed, err: %s", err)
 			return nil
 		}
-		log.Errorf("update http repo failed, err: %s", err)
-		return err
+		return fmt.Errorf("update http repo failed, err: %w", err)
 	}
 
 	log.Infof("set http repo %q success", yumRepo)
@@ -1111,7 +1142,7 @@ func (ep *EnvPlugin) installNfsUtilIfNeeded() {
 func (ep *EnvPlugin) installLxcfs() error {
 	if !utils.Exists("/var/lib/lxc/lxcfs") {
 		if err := os.MkdirAll("/var/lib/lxc/lxcfs", RwxRxRx); err != nil {
-			log.Errorf("failed create lxcfs dir, err: %v", err)
+			log.Warnf("failed create lxcfs dir, err: %v", err)
 			return nil
 		}
 	}

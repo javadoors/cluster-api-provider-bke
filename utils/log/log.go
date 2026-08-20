@@ -18,7 +18,7 @@ package log
 import (
 	"sync"
 
-	olog "gopkg.openfuyao.cn/common-modules/ologger/log"
+	olog "gopkg.openfuyao.cn/common-modules/ologger/v26/log"
 )
 
 // Logger is the ologger logger type used across the repository.

@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -319,22 +319,26 @@ func TestExecuteWhenScriptsDirExists(t *testing.T) {
 	var writeFileCalled bool
 
 	patches.ApplyFunc(utils.Exists, func(s string) bool {
-		if strings.Contains(s, "scripts") && !strings.Contains(s, "update.sh") {
+		if s == utils.AgentScripts {
 			return true
 		}
-		if strings.Contains(s, "update.sh") {
+		if s == restartScript {
 			return false
 		}
 		return false
 	})
 
-	patches.ApplyFunc(os.MkdirAll, func(_ string, _ os.FileMode) error {
-		mkdirCalled = true
+	patches.ApplyFunc(os.MkdirAll, func(s string, _ os.FileMode) error {
+		if s == utils.AgentScripts {
+			mkdirCalled = true
+		}
 		return nil
 	})
 
-	patches.ApplyFunc(os.WriteFile, func(_ string, _ []byte, _ os.FileMode) error {
-		writeFileCalled = true
+	patches.ApplyFunc(os.WriteFile, func(s string, _ []byte, _ os.FileMode) error {
+		if s == restartScript {
+			writeFileCalled = true
+		}
 		return nil
 	})
 
@@ -361,22 +365,23 @@ func TestExecuteWhenScriptExists(t *testing.T) {
 	var writeFileCalled bool
 
 	patches.ApplyFunc(utils.Exists, func(s string) bool {
-		if s == "/etc/bkeagent/scripts" {
-			return true
-		}
-		if s == "/etc/bkeagent/scripts/update.sh" {
+		if s == utils.AgentScripts || s == restartScript {
 			return true
 		}
 		return true
 	})
 
-	patches.ApplyFunc(os.MkdirAll, func(_ string, _ os.FileMode) error {
-		mkdirCalled = true
+	patches.ApplyFunc(os.MkdirAll, func(s string, _ os.FileMode) error {
+		if s == utils.AgentScripts {
+			mkdirCalled = true
+		}
 		return nil
 	})
 
-	patches.ApplyFunc(os.WriteFile, func(_ string, _ []byte, _ os.FileMode) error {
-		writeFileCalled = true
+	patches.ApplyFunc(os.WriteFile, func(s string, _ []byte, _ os.FileMode) error {
+		if s == restartScript {
+			writeFileCalled = true
+		}
 		return nil
 	})
 
@@ -429,7 +434,7 @@ func TestExecuteWithWriteFileError(t *testing.T) {
 	writeErr := errors.New("write file failed")
 
 	patches.ApplyFunc(utils.Exists, func(s string) bool {
-		if strings.Contains(s, "scripts") && !strings.Contains(s, "update.sh") {
+		if s == utils.AgentScripts {
 			return true
 		}
 		return false
@@ -462,13 +467,7 @@ func TestExecuteWithExecuteCommandError(t *testing.T) {
 
 	execErr := errors.New("execute command failed")
 
-	patches.ApplyFunc(utils.Exists, func(s string) bool {
-		if s == "/etc/bkeagent/scripts" {
-			return true
-		}
-		if s == "/etc/bkeagent/scripts/update.sh" {
-			return true
-		}
+	patches.ApplyFunc(utils.Exists, func(_ string) bool {
 		return true
 	})
 
@@ -520,13 +519,7 @@ func TestExecuteWithCustomAgentUrl(t *testing.T) {
 		return path.Join(utils.AgentBin, agentBinaryName), nil
 	})
 
-	patches.ApplyFunc(utils.Exists, func(s string) bool {
-		if s == "/etc/bkeagent/scripts" {
-			return true
-		}
-		if s == "/etc/bkeagent/scripts/update.sh" {
-			return true
-		}
+	patches.ApplyFunc(utils.Exists, func(_ string) bool {
 		return true
 	})
 
@@ -567,9 +560,8 @@ func TestUpdatePluginConstantName(t *testing.T) {
 }
 
 func TestUpdatePluginRestartScriptPath(t *testing.T) {
-	scriptPath := path.Join("/etc/bkeagent/scripts", "update.sh")
-	expectedPath := "/etc/bkeagent/scripts/update.sh"
-	assert.Equal(t, expectedPath, scriptPath)
+	scriptPath := path.Join(utils.AgentScripts, "update.sh")
+	assert.Equal(t, restartScript, scriptPath)
 }
 
 func TestUpdatePluginNeedUpdateVersionOutputCases(t *testing.T) {
@@ -610,13 +602,7 @@ func TestUpdatePluginExecuteParsesCommands(t *testing.T) {
 	defer patches.Reset()
 	patchDownloadAgentBinary(patches)
 
-	patches.ApplyFunc(utils.Exists, func(s string) bool {
-		if s == "/etc/bkeagent/scripts" {
-			return true
-		}
-		if s == "/etc/bkeagent/scripts/update.sh" {
-			return true
-		}
+	patches.ApplyFunc(utils.Exists, func(_ string) bool {
 		return true
 	})
 
@@ -746,7 +732,7 @@ func TestUpdatePluginUpdateScriptPermission(t *testing.T) {
 	patchDownloadAgentBinary(patches)
 
 	patches.ApplyFunc(utils.Exists, func(s string) bool {
-		if s == "/etc/bkeagent/scripts" {
+		if s == utils.AgentScripts {
 			return true
 		}
 		return false

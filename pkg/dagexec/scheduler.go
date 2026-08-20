@@ -2,7 +2,7 @@
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -22,66 +22,83 @@ import (
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 
+	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/manifest"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/mergecluster"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/topology"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/constant"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/upgrade"
 )
 
 const (
-	defaultComponentVersion   = "v1.0.0"
+	defaultComponentVersion    = "v1.0.0"
 	defaultMaxParallelPerBatch = 8
 )
 
-// InlinePhaseRunner runs an inline upgrade handler registered in ComponentFactory.
-type InlinePhaseRunner interface {
-	Execute(phaseCtx *phaseframe.PhaseContext, oldCluster, newCluster *bkev1beta1.BKECluster, handler, version string) error
-}
-
 // Scheduler executes upgrade components according to a topological DAG.
 type Scheduler struct {
-	InlineRunner          InlinePhaseRunner
-	ManifestStore         manifest.Store
-	ManifestApplier       manifest.Applier
-	MaxParallelPerBatch   int
+	InlineRunner        InlineRunner
+	ManifestStore       manifest.Store
+	ManifestApplier     manifest.Applier
+	MaxParallelPerBatch int
+	Registry            *ExecutorRegistry
+	CVStore             ComponentVersionStore
 }
 
 // Config holds dependencies for DAG execution.
 type Config struct {
-	InlineRunner          InlinePhaseRunner
-	ManifestStore         manifest.Store
-	ManifestApplier       manifest.Applier
+	InlineRunner    InlineRunner
+	ManifestStore   manifest.Store
+	ManifestApplier manifest.Applier
 	// MaxParallelPerBatch limits concurrent components within one batch; 0 uses defaultMaxParallelPerBatch.
-	MaxParallelPerBatch   int
+	MaxParallelPerBatch int
+	// YamlExecutor / HelmExecutor are optional; registered only when non-nil.
+	YamlExecutor ComponentExecutor
+	HelmExecutor ComponentExecutor
+	CVStore      ComponentVersionStore
 }
 
 // NewScheduler creates a scheduler with the given dependencies.
+// Inline is always registered; yaml/helm are registered only when the corresponding executor is non-nil.
 func NewScheduler(cfg Config) *Scheduler {
 	maxParallel := cfg.MaxParallelPerBatch
 	if maxParallel == 0 {
 		maxParallel = defaultMaxParallelPerBatch
+	}
+	reg := NewExecutorRegistry()
+	registerExecutorOrLog(reg, &InlineComponentExecutor{Runner: cfg.InlineRunner}, ComponentTypeInline)
+	if cfg.YamlExecutor != nil {
+		registerExecutorOrLog(reg, cfg.YamlExecutor, ComponentTypeYAML)
+	}
+	if cfg.HelmExecutor != nil {
+		registerExecutorOrLog(reg, cfg.HelmExecutor, ComponentTypeHelm)
 	}
 	return &Scheduler{
 		InlineRunner:        cfg.InlineRunner,
 		ManifestStore:       cfg.ManifestStore,
 		ManifestApplier:     cfg.ManifestApplier,
 		MaxParallelPerBatch: maxParallel,
+		Registry:            reg,
+		CVStore:             cfg.CVStore,
+	}
+}
+
+func registerExecutorOrLog(reg *ExecutorRegistry, executor ComponentExecutor, expectedType ComponentType) {
+	if err := reg.Register(executor); err != nil {
+		NewLogger(nil).Info("skip registering component executor %s; unregistered types fall back to legacy: %v", expectedType, err)
 	}
 }
 
 type componentResult struct {
-	name string
-	node *topology.ComponentNode
-	err  error
+	name        string
+	node        *topology.ComponentNode
+	err         error
+	viaRegistry bool // true when executed via ComponentExecutor (writes clusterComponentStatuses)
 }
 
-// ExecuteDAG runs all components in topological batches.
+// ExecuteDAG runs all components in topological batches using ExecutionContext.
 func (s *Scheduler) ExecuteDAG(
 	ctx context.Context,
-	phaseCtx *phaseframe.PhaseContext,
-	oldCluster, newCluster *bkev1beta1.BKECluster,
+	execCtx *ExecutionContext,
 	dag *topology.UpgradeDAG,
 ) error {
 	if s == nil {
@@ -90,32 +107,29 @@ func (s *Scheduler) ExecuteDAG(
 	if dag == nil {
 		return fmt.Errorf("upgrade DAG is nil")
 	}
-	if phaseCtx == nil {
-		return fmt.Errorf("phase context is required")
+	if execCtx == nil {
+		return fmt.Errorf("execution context is required")
+	}
+	if execCtx.Cluster == nil {
+		return fmt.Errorf("execution context cluster is required")
+	}
+	if execCtx.TemplateContext.ClusterName == "" && execCtx.TemplateContext.Namespace == "" {
+		execCtx.TemplateContext = buildTemplateContext(execCtx.Cluster)
 	}
 
-	if phaseCtx.VersionContext == nil {
-		phaseCtx.BuildAndSetVersionContext()
-	}
 	batches, err := dag.TopologicalBatches()
 	if err != nil {
 		return err
 	}
 
-	tmpl := manifest.TemplateContext{
-		ClusterName: phaseCtx.BKECluster.GetName(),
-		Namespace:   phaseCtx.BKECluster.GetNamespace(),
-	}
-	if phaseCtx.BKECluster.Spec.ClusterConfig != nil {
-		spec := phaseCtx.BKECluster.Spec.ClusterConfig.Cluster
-		tmpl.KubernetesVersion = spec.KubernetesVersion
-		tmpl.OpenFuyaoVersion = spec.OpenFuyaoVersion
-	}
+	oldCluster := execCtx.OldCluster
+	newCluster := execCtx.Cluster
+	tmpl := execCtx.TemplateContext
 
 	var agg []error
 	for batchIdx, batch := range batches {
 		batchErrs, failFastStop := s.executeBatchParallel(
-			ctx, phaseCtx, oldCluster, newCluster, batchIdx, batch, dag, tmpl,
+			ctx, execCtx, oldCluster, newCluster, batchIdx, batch, dag, tmpl,
 		)
 		if len(batchErrs) > 0 {
 			agg = append(agg, batchErrs...)
@@ -129,7 +143,7 @@ func (s *Scheduler) ExecuteDAG(
 
 func (s *Scheduler) executeBatchParallel(
 	ctx context.Context,
-	phaseCtx *phaseframe.PhaseContext,
+	execCtx *ExecutionContext,
 	oldCluster, newCluster *bkev1beta1.BKECluster,
 	batchIdx int,
 	batch []string,
@@ -137,8 +151,9 @@ func (s *Scheduler) executeBatchParallel(
 	tmpl manifest.TemplateContext,
 ) (batchErrs []error, failFastStop bool) {
 	type workItem struct {
-		name string
-		node *topology.ComponentNode
+		name        string
+		node        *topology.ComponentNode
+		viaRegistry bool
 	}
 
 	var items []workItem
@@ -148,10 +163,23 @@ func (s *Scheduler) executeBatchParallel(
 			batchErrs = append(batchErrs, fmt.Errorf("batch %d: component %q not found", batchIdx, compName))
 			continue
 		}
-		if s.shouldSkipComponent(phaseCtx, node) {
+		if s.shouldSkipComponent(execCtx, node) {
 			continue
 		}
-		items = append(items, workItem{name: compName, node: node})
+		if !s.componentNeedsUpgrade(execCtx, node) {
+			continue
+		}
+		viaRegistry := s.usesRegistryExecutor(ctx, node)
+		if viaRegistry {
+			if err := s.markLifecyclePending(ctx, execCtx, node); err != nil {
+				batchErrs = append(batchErrs, fmt.Errorf("%s: mark pending: %w", compName, err))
+				if node.FailurePolicy == topology.FailurePolicyFailFast {
+					return batchErrs, true
+				}
+				continue
+			}
+		}
+		items = append(items, workItem{name: compName, node: node, viaRegistry: viaRegistry})
 	}
 
 	if len(items) == 0 {
@@ -164,7 +192,7 @@ func (s *Scheduler) executeBatchParallel(
 	sem := make(chan struct{}, parallelLimit)
 	var activeWorkers atomic.Int32
 
-	s.logBatchParallel(phaseCtx, "batch start, index=%d, batch_size=%d, runnable=%d, parallel_limit=%d", batchIdx, len(batch), len(items), parallelLimit)
+	loggerFrom(execCtx).Info("batch start, index=%d, batch_size=%d, runnable=%d, parallel_limit=%d", batchIdx, len(batch), len(items), parallelLimit)
 
 	for i, item := range items {
 		i, item := i, item
@@ -177,11 +205,11 @@ func (s *Scheduler) executeBatchParallel(
 			}
 
 			active := activeWorkers.Add(1)
-			s.logBatchParallel(phaseCtx, "component start, batch=%d, component=%s, active_workers=%d", batchIdx, item.name, active)
-			err := s.executeComponent(batchCtx, phaseCtx, oldCluster, newCluster, item.node, tmpl)
-			results[i] = componentResult{name: item.name, node: item.node, err: err}
+			loggerFrom(execCtx).Info("component start, batch=%d, component=%s, active_workers=%d", batchIdx, item.name, active)
+			err := s.executeComponent(batchCtx, execCtx, oldCluster, newCluster, item.node, tmpl)
+			results[i] = componentResult{name: item.name, node: item.node, err: err, viaRegistry: item.viaRegistry}
 			active = activeWorkers.Add(-1)
-			s.logBatchParallel(phaseCtx, "component done, batch=%d, component=%s, active_workers=%d, has_error=%t", batchIdx, item.name, active, err != nil)
+			loggerFrom(execCtx).Info("component done, batch=%d, component=%s, active_workers=%d, has_error=%t", batchIdx, item.name, active, err != nil)
 
 			if err == nil || manifest.IsSkipNotInstalled(err) {
 				return nil
@@ -194,53 +222,113 @@ func (s *Scheduler) executeBatchParallel(
 	}
 
 	_ = g.Wait()
-	s.logBatchParallel(phaseCtx, "batch done, index=%d, batch_size=%d, runnable=%d", batchIdx, len(batch), len(items))
+	loggerFrom(execCtx).Info("batch done, index=%d, batch_size=%d, runnable=%d", batchIdx, len(batch), len(items))
 
-	return s.persistBatchResults(phaseCtx, results, batchErrs)
-}
-
-func (s *Scheduler) logBatchParallel(phaseCtx *phaseframe.PhaseContext, format string, args ...interface{}) {
-	if phaseCtx == nil || phaseCtx.Log == nil {
-		return
-	}
-	phaseCtx.Log.Info(constant.ComponentUpgradingReason, format, args...)
+	return s.persistBatchResults(ctx, execCtx, results, batchErrs)
 }
 
 func (s *Scheduler) persistBatchResults(
-	phaseCtx *phaseframe.PhaseContext,
+	ctx context.Context,
+	execCtx *ExecutionContext,
 	results []componentResult,
 	batchErrs []error,
 ) ([]error, bool) {
 	var failFastStop bool
+	var successes []componentResult
+
 	for _, r := range results {
 		if r.node == nil {
 			continue
 		}
-		compName := r.name
 		if r.err != nil {
-			if manifest.IsSkipNotInstalled(r.err) {
-				continue
-			}
-			if persistErr := s.markComponentFailed(phaseCtx, r.node, r.err); persistErr != nil {
-				batchErrs = append(batchErrs, fmt.Errorf("%s: persist failure: %w", compName, persistErr))
-				if r.node.FailurePolicy == topology.FailurePolicyFailFast {
-					failFastStop = true
-				}
-			}
-			batchErrs = append(batchErrs, fmt.Errorf("%s: %w", compName, r.err))
-			if r.node.FailurePolicy == topology.FailurePolicyFailFast {
+			stop, errs := s.persistBatchFailure(ctx, execCtx, r)
+			batchErrs = append(batchErrs, errs...)
+			if stop {
 				failFastStop = true
 			}
 			continue
 		}
-		if err := s.markComponentCompleted(phaseCtx, r.node); err != nil {
-			batchErrs = append(batchErrs, fmt.Errorf("%s: persist completion: %w", compName, err))
-			if r.node.FailurePolicy == topology.FailurePolicyFailFast {
+		successes = append(successes, r)
+	}
+
+	stop, errs := s.persistBatchSuccesses(ctx, execCtx, successes)
+	batchErrs = append(batchErrs, errs...)
+	if stop {
+		failFastStop = true
+	}
+	return batchErrs, failFastStop
+}
+
+func (s *Scheduler) persistBatchFailure(
+	ctx context.Context,
+	execCtx *ExecutionContext,
+	r componentResult,
+) (bool, []error) {
+	if manifest.IsSkipNotInstalled(r.err) {
+		if r.viaRegistry {
+			if persistErr := s.markLifecycleClear(ctx, execCtx, r.node); persistErr != nil {
+				return false, []error{fmt.Errorf("%s: clear lifecycle after skip: %w", r.name, persistErr)}
+			}
+		}
+		return false, nil
+	}
+	compName := r.name
+	var errs []error
+	if persistErr := s.markComponentFailed(ctx, execCtx, r.node, r.err); persistErr != nil {
+		errs = append(errs, fmt.Errorf("%s: persist failure: %w", compName, persistErr))
+	}
+	if r.viaRegistry {
+		if persistErr := s.markLifecycleFailed(ctx, execCtx, r.node, r.err); persistErr != nil {
+			errs = append(errs, fmt.Errorf("%s: persist lifecycle failure: %w", compName, persistErr))
+		}
+	}
+	errs = append(errs, fmt.Errorf("%s: %w", compName, r.err))
+	return isFailFast(r.node), errs
+}
+
+// persistBatchSuccesses records all successful components in one DeclarativeUpgrade Status
+// patch, then writes per-component lifecycle status when using the registry path.
+func (s *Scheduler) persistBatchSuccesses(
+	ctx context.Context,
+	execCtx *ExecutionContext,
+	successes []componentResult,
+) (bool, []error) {
+	if len(successes) == 0 {
+		return false, nil
+	}
+
+	nodes := make([]*topology.ComponentNode, 0, len(successes))
+	for _, r := range successes {
+		nodes = append(nodes, r.node)
+	}
+
+	var errs []error
+	var failFastStop bool
+	if err := s.markComponentsCompleted(ctx, execCtx, nodes); err != nil {
+		for _, r := range successes {
+			errs = append(errs, fmt.Errorf("%s: persist completion: %w", r.name, err))
+			if isFailFast(r.node) {
 				failFastStop = true
 			}
 		}
 	}
-	return batchErrs, failFastStop
+
+	for _, r := range successes {
+		if !r.viaRegistry {
+			continue
+		}
+		if err := s.markLifecycleInstalled(ctx, execCtx, r.node); err != nil {
+			errs = append(errs, fmt.Errorf("%s: persist lifecycle completion: %w", r.name, err))
+			if isFailFast(r.node) {
+				failFastStop = true
+			}
+		}
+	}
+	return failFastStop, errs
+}
+
+func isFailFast(node *topology.ComponentNode) bool {
+	return node != nil && node.FailurePolicy == topology.FailurePolicyFailFast
 }
 
 func (s *Scheduler) maxParallel(batchLen int) int {
@@ -273,76 +361,212 @@ func (s *Scheduler) nodeVersionKey(node *topology.ComponentNode) string {
 	return defaultComponentVersion
 }
 
-func (s *Scheduler) shouldSkipComponent(phaseCtx *phaseframe.PhaseContext, node *topology.ComponentNode) bool {
-	if phaseCtx == nil || phaseCtx.BKECluster == nil || node == nil {
+func (s *Scheduler) shouldSkipComponent(execCtx *ExecutionContext, node *topology.ComponentNode) bool {
+	if execCtx == nil || execCtx.Cluster == nil || node == nil {
 		return false
 	}
-	st := phaseCtx.BKECluster.Status.DeclarativeUpgrade
+	st := execCtx.Cluster.Status.DeclarativeUpgrade
 	if st == nil {
 		return false
 	}
 	return st.IsCompleted(node.Name, s.nodeVersionKey(node))
 }
 
-func (s *Scheduler) markComponentCompleted(phaseCtx *phaseframe.PhaseContext, node *topology.ComponentNode) error {
-	if phaseCtx == nil || phaseCtx.BKECluster == nil || phaseCtx.Client == nil || node == nil {
+// componentNeedsUpgrade skips components whose current version already matches target.
+func (s *Scheduler) componentNeedsUpgrade(execCtx *ExecutionContext, node *topology.ComponentNode) bool {
+	if node == nil {
+		return false
+	}
+	var vc *upgrade.VersionContext
+	if execCtx != nil {
+		vc = execCtx.VersionContext
+	}
+	return upgrade.NeedsExecution(vc, node.Name)
+}
+
+// markComponentsCompleted persists Completed records for all nodes in one Status patch.
+func (s *Scheduler) markComponentsCompleted(
+	ctx context.Context,
+	execCtx *ExecutionContext,
+	nodes []*topology.ComponentNode,
+) error {
+	if execCtx == nil || execCtx.Cluster == nil || execCtx.Client == nil || len(nodes) == 0 {
 		return nil
 	}
-	return mergecluster.SyncStatusUntilComplete(phaseCtx.Client, phaseCtx.BKECluster, func(bc *bkev1beta1.BKECluster) {
-		if bc.Status.DeclarativeUpgrade == nil {
-			return
+	now := metav1.Now()
+	return patchDeclarativeUpgrade(ctx, execCtx.Client, execCtx.Cluster, func(st *confv1beta1.DeclarativeUpgradeStatus) {
+		for _, node := range nodes {
+			if node == nil {
+				continue
+			}
+			st.MarkCompleted(node.Name, s.nodeVersionKey(node), now)
 		}
-		bc.Status.DeclarativeUpgrade.MarkCompleted(node.Name, s.nodeVersionKey(node), metav1.Now())
-		// Clear last error on successful component execution.
-		bc.Status.DeclarativeUpgrade.LastError = ""
-		bc.Status.DeclarativeUpgrade.ClearFailure()
+		st.LastError = ""
+		st.ClearFailure()
 	})
 }
 
-func (s *Scheduler) markComponentFailed(phaseCtx *phaseframe.PhaseContext, node *topology.ComponentNode, err error) error {
-	if phaseCtx == nil {
-		return nil
-	}
-	if phaseCtx.BKECluster == nil {
-		return nil
-	}
-	if phaseCtx.Client == nil {
-		return nil
-	}
+func (s *Scheduler) markComponentCompleted(
+	ctx context.Context,
+	execCtx *ExecutionContext,
+	node *topology.ComponentNode,
+) error {
 	if node == nil {
 		return nil
 	}
-	if err == nil {
+	return s.markComponentsCompleted(ctx, execCtx, []*topology.ComponentNode{node})
+}
+
+func (s *Scheduler) markComponentFailed(
+	ctx context.Context,
+	execCtx *ExecutionContext,
+	node *topology.ComponentNode,
+	err error,
+) error {
+	if execCtx == nil || execCtx.Cluster == nil || execCtx.Client == nil || node == nil || err == nil {
 		return nil
 	}
-	return mergecluster.SyncStatusUntilComplete(phaseCtx.Client, phaseCtx.BKECluster, func(bc *bkev1beta1.BKECluster) {
-		if bc.Status.DeclarativeUpgrade == nil {
-			return
-		}
-		bc.Status.DeclarativeUpgrade.MarkFailure(node.Name, s.nodeVersionKey(node), err.Error(), metav1.Now())
+	now := metav1.Now()
+	return patchDeclarativeUpgrade(ctx, execCtx.Client, execCtx.Cluster, func(st *confv1beta1.DeclarativeUpgradeStatus) {
+		st.MarkFailure(node.Name, s.nodeVersionKey(node), err.Error(), now)
 	})
 }
 
 func (s *Scheduler) executeComponent(
 	ctx context.Context,
-	phaseCtx *phaseframe.PhaseContext,
+	execCtx *ExecutionContext,
 	oldCluster, newCluster *bkev1beta1.BKECluster,
 	node *topology.ComponentNode,
 	tmpl manifest.TemplateContext,
 ) error {
-	if node.Inline != nil {
-		return s.executeInline(phaseCtx, oldCluster, newCluster, node)
+	if typ, ok := s.resolveComponentType(ctx, node); ok {
+		if s.Registry != nil {
+			if executor, found := s.Registry.Get(typ); found {
+				return executor.ExecuteComponent(ctx, node, execCtx)
+			}
+		}
 	}
-	return s.executeManifest(ctx, phaseCtx, node, tmpl)
+	return s.executeComponentLegacy(ctx, legacyComponentArgs{
+		execCtx:    execCtx,
+		oldCluster: oldCluster,
+		newCluster: newCluster,
+		node:       node,
+		tmpl:       tmpl,
+	})
+}
+
+// usesRegistryExecutor reports whether executeComponent would dispatch to a registered executor.
+// Legacy path must not write clusterComponentStatuses.
+func (s *Scheduler) usesRegistryExecutor(ctx context.Context, node *topology.ComponentNode) bool {
+	typ, ok := s.resolveComponentType(ctx, node)
+	if !ok || s == nil || s.Registry == nil {
+		return false
+	}
+	_, found := s.Registry.Get(typ)
+	return found
+}
+
+func (s *Scheduler) markLifecyclePending(ctx context.Context, execCtx *ExecutionContext, node *topology.ComponentNode) error {
+	updater, cluster := lifecycleUpdater(execCtx)
+	if updater == nil || cluster == nil || node == nil {
+		return nil
+	}
+	return updater.MarkPending(ctx, lifecycleMarkRef(cluster, node))
+}
+
+func (s *Scheduler) markLifecycleInstalled(ctx context.Context, execCtx *ExecutionContext, node *topology.ComponentNode) error {
+	updater, cluster := lifecycleUpdater(execCtx)
+	if updater == nil || cluster == nil || node == nil {
+		return nil
+	}
+	return updater.MarkInstalled(ctx, lifecycleMarkRef(cluster, node), componentStatusVersion(node))
+}
+
+func (s *Scheduler) markLifecycleFailed(ctx context.Context, execCtx *ExecutionContext, node *topology.ComponentNode, err error) error {
+	updater, cluster := lifecycleUpdater(execCtx)
+	if updater == nil || cluster == nil || node == nil || err == nil {
+		return nil
+	}
+	return updater.MarkFailed(ctx, lifecycleMarkRef(cluster, node), err)
+}
+
+func (s *Scheduler) markLifecycleClear(ctx context.Context, execCtx *ExecutionContext, node *topology.ComponentNode) error {
+	updater, cluster := lifecycleUpdater(execCtx)
+	if updater == nil || cluster == nil || node == nil {
+		return nil
+	}
+	return updater.ClearComponentStatus(ctx, lifecycleMarkRef(cluster, node))
+}
+
+func lifecycleMarkRef(cluster *bkev1beta1.BKECluster, node *topology.ComponentNode) ComponentMarkRef {
+	return ComponentMarkRef{
+		Cluster:       cluster,
+		Name:          node.Name,
+		ComponentType: StatusComponentTypeCluster,
+	}
+}
+
+func lifecycleUpdater(execCtx *ExecutionContext) (ComponentStatusUpdater, *bkev1beta1.BKECluster) {
+	if execCtx == nil {
+		return nil, nil
+	}
+	return execCtx.ComponentStatusUpdater, execCtx.Cluster
+}
+
+func componentStatusVersion(node *topology.ComponentNode) string {
+	if node == nil {
+		return defaultComponentVersion
+	}
+	if node.Version != "" {
+		return node.Version
+	}
+	if node.Inline != nil && node.Inline.Version != "" {
+		return node.Inline.Version
+	}
+	return defaultComponentVersion
+}
+
+// resolveComponentType returns the executor type from CVStore (cv.Spec.Type).
+// When unresolved, callers fall back to Legacy.
+func (s *Scheduler) resolveComponentType(ctx context.Context, node *topology.ComponentNode) (ComponentType, bool) {
+	if node == nil || s == nil || s.CVStore == nil {
+		return "", false
+	}
+	version := node.Version
+	if version == "" {
+		version = defaultComponentVersion
+	}
+	cv, err := s.CVStore.GetComponentVersion(ctx, node.Name, version)
+	if err != nil || cv == nil || cv.Spec.Type == "" {
+		return "", false
+	}
+	return ComponentType(cv.Spec.Type), true
+}
+
+// legacyComponentArgs groups inputs for the pre-registry Inline / Manifest path.
+type legacyComponentArgs struct {
+	execCtx                *ExecutionContext
+	oldCluster, newCluster *bkev1beta1.BKECluster
+	node                   *topology.ComponentNode
+	tmpl                   manifest.TemplateContext
+}
+
+// executeComponentLegacy keeps the pre-registry Inline / Manifest paths.
+// It does not write clusterComponentStatuses via ComponentStatusUpdater.
+func (s *Scheduler) executeComponentLegacy(ctx context.Context, args legacyComponentArgs) error {
+	if args.node != nil && args.node.Inline != nil {
+		return s.executeInline(ctx, args.oldCluster, args.newCluster, args.node)
+	}
+	return s.executeManifest(ctx, args.execCtx, args.node, args.tmpl)
 }
 
 func (s *Scheduler) executeInline(
-	phaseCtx *phaseframe.PhaseContext,
+	ctx context.Context,
 	oldCluster, newCluster *bkev1beta1.BKECluster,
 	node *topology.ComponentNode,
 ) error {
 	if s.InlineRunner == nil {
-		return fmt.Errorf("inline phase runner is nil")
+		return fmt.Errorf("inline runner is nil")
 	}
 	handler := node.Inline.Handler
 	version := node.Inline.Version
@@ -352,32 +576,28 @@ func (s *Scheduler) executeInline(
 	if version == "" {
 		version = defaultComponentVersion
 	}
-	return s.InlineRunner.Execute(phaseCtx, oldCluster, newCluster, handler, version)
+	return s.InlineRunner.Execute(ctx, oldCluster, newCluster, handler, version)
 }
 
-// manifestNeedsUpgrade mirrors inline NeedExecuteWithVersionContext: when VersionContext
-// has a target for the component, skip manifest apply if current already matches target.
-func manifestNeedsUpgrade(phaseCtx *phaseframe.PhaseContext, componentName string) bool {
-	if phaseCtx == nil || phaseCtx.VersionContext == nil {
-		return true
-	}
-	vc := phaseCtx.VersionContext
-	if !vc.HasTarget(componentName) {
-		return true
-	}
-	return vc.NeedsUpgrade(componentName)
+// manifestNeedsUpgrade skips apply when VersionContext has a target and current already matches.
+func manifestNeedsUpgrade(vc *upgrade.VersionContext, componentName string) bool {
+	return upgrade.NeedsExecution(vc, componentName)
 }
 
 func (s *Scheduler) executeManifest(
 	ctx context.Context,
-	phaseCtx *phaseframe.PhaseContext,
+	execCtx *ExecutionContext,
 	node *topology.ComponentNode,
 	tmpl manifest.TemplateContext,
 ) error {
 	if node == nil {
 		return fmt.Errorf("component node is nil")
 	}
-	if !manifestNeedsUpgrade(phaseCtx, node.Name) {
+	var vc *upgrade.VersionContext
+	if execCtx != nil {
+		vc = execCtx.VersionContext
+	}
+	if !manifestNeedsUpgrade(vc, node.Name) {
 		return nil
 	}
 	version := node.Version

@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -131,7 +131,7 @@ func GetBKEClusterAssociateCommands(ctx context.Context, c client.Client, bkeClu
 			continue
 		}
 		if err := command.ValidateCommand(&cmd); err != nil {
-			log.Error(cmd.Name, err)
+			log.Warnf("skip invalid command %s: %v", cmd.Name, err)
 			continue
 		}
 		commands = append(commands, cmd)
@@ -155,6 +155,22 @@ func GetListFiltersByBKECluster(bkecluster *bkev1beta1.BKECluster) []client.List
 
 // GetIngressConfig 获取bkecluster ingress(ELB) addon配置
 
+const defaultLauncherWaitTimeout = 5 * time.Minute
+
+// GetLauncherWaitTimeout returns the wait timeout for bkeagent-launcher pods to become Ready.
+// Falls back to 5m when the annotation is absent or invalid.
+func GetLauncherWaitTimeout(bkeCluster *bkev1beta1.BKECluster) time.Duration {
+	v, found := annotation.HasAnnotation(bkeCluster, annotation.LauncherWaitTimeOutAnnotationKey)
+	if !found || v == "" {
+		return defaultLauncherWaitTimeout
+	}
+	timeout, err := time.ParseDuration(v)
+	if err != nil {
+		return defaultLauncherWaitTimeout
+	}
+	return timeout
+}
+
 func GetBootTimeOut(bkeCluster *bkev1beta1.BKECluster) (time.Duration, error) {
 	v, found := annotation.HasAnnotation(bkeCluster, annotation.NodeBootWaitTimeOutAnnotationKey)
 	if !found {
@@ -163,7 +179,7 @@ func GetBootTimeOut(bkeCluster *bkev1beta1.BKECluster) (time.Duration, error) {
 	}
 	timeout, err := time.ParseDuration(v)
 	if err != nil {
-		return 10 * time.Minute, errors.Errorf("parse annotation %s value %s error: %v, use default value 10m", annotation.NodeBootWaitTimeOutAnnotationKey, v, err)
+		return 10 * time.Minute, fmt.Errorf("parse annotation %s value %s error: %w, use default value 10m", annotation.NodeBootWaitTimeOutAnnotationKey, v, err)
 	}
 	return timeout, nil
 }

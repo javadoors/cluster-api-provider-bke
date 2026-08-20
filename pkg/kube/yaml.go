@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	yamlutil "k8s.io/apimachinery/pkg/util/yaml"
+	"k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/restmapper"
 
@@ -71,7 +72,7 @@ func (c *Client) ApplyYaml(task *Task) error {
 	unstructList, err := GetUnStructListFromDecoder(decoder)
 	if err != nil {
 		c.Log.Errorf("failed to get unstruct list from file %s: %v", task.FilePath, err)
-		return errors.Errorf("failed to get unstruct list from decoder: %v", err)
+		return fmt.Errorf("failed to get unstruct list from decoder: %w", err)
 	}
 
 	finalUnstructuredList := c.processUnstructuredList(unstructList)
@@ -81,12 +82,20 @@ func (c *Client) ApplyYaml(task *Task) error {
 }
 
 func (c *Client) getRestMapper() (meta.RESTMapper, error) {
-	dc := c.ClientSet.Discovery()
-	restMapperRes, err := restmapper.GetAPIGroupResources(dc)
-	if err != nil {
-		return nil, err
+	if c.RESTMapper == nil {
+		return nil, errors.New("RESTMapper is not initialized")
 	}
-	return restmapper.NewDiscoveryRESTMapper(restMapperRes), nil
+	return c.RESTMapper, nil
+}
+
+func (c *Client) rebuildRESTMapperFromDiscovery() (meta.RESTMapper, error) {
+	if c.ClientSet == nil {
+		return nil, errors.New("ClientSet is not initialized")
+	}
+	cachedDiscovery := memory.NewMemCacheClient(c.ClientSet.Discovery())
+	mapper := restmapper.NewDeferredDiscoveryRESTMapper(cachedDiscovery)
+	c.RESTMapper = mapper
+	return mapper, nil
 }
 
 func (c *Client) processUnstructuredList(unstructList []*unstructured.Unstructured) []unstructured.Unstructured {
@@ -121,6 +130,12 @@ func (c *Client) applyUnstructuredList(
 	task *Task) error {
 
 	for _, unstruct := range list {
+		var err error
+		restMapper, err = c.getRestMapper()
+		if err != nil {
+			return err
+		}
+
 		gvk := unstruct.GroupVersionKind()
 		c.Log.Debugf("gvk: %v", gvk.String())
 
@@ -160,16 +175,21 @@ func (c *Client) getMapping(
 	mapping, err := restMapper.RESTMapping(gvk.GroupKind(), gvk.Version)
 	if err != nil {
 		// if no resource match, try refresh restMapper
-		if apierrors2.IsNoMatchError(err) {
-			dc := c.ClientSet.Discovery()
-			restMapperRes, err := restmapper.GetAPIGroupResources(dc)
-			if err != nil {
-				return nil, err
-			}
-			restMapper = restmapper.NewDiscoveryRESTMapper(restMapperRes)
+		if apierrors2.IsNoMatchError(err) && c.mapperCache != nil {
+			c.Log.Infof("RESTMapping not found for %s/%s, invalidating RESTMapper cache and retrying", gvk.GroupKind().String(), gvk.Version)
+			c.mapperCache.Invalidate()
 		}
 		// try again
 		mapping, err = restMapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+		if err != nil {
+			freshMapper, freshErr := c.rebuildRESTMapperFromDiscovery()
+			if freshErr == nil {
+				c.Log.Infof("RESTMapping failed for %s/%s, rebuilding RESTMapper from current discovery client and retrying", gvk.GroupKind().String(), gvk.Version)
+				mapping, err = freshMapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+			} else {
+				c.Log.Warnf("failed to rebuild RESTMapper from current discovery client: %v", freshErr)
+			}
+		}
 		if err != nil {
 			if apierrors2.IsNoMatchError(err) && gvk.Kind == "ServiceMonitor" {
 				c.Log.Infof("addon obj Kind: %s, Name %s, APIVersion %s, not support %s in target cluster skip",
@@ -207,7 +227,11 @@ func (c *Client) handleOperation(
 	case bkeaddon.UpdateAddon:
 		obj, err = c.handleUpdateOperation(dr, unstruct, task, gvk)
 	case bkeaddon.UpgradeAddon:
-		obj, err = c.handleUpgradeOperation(dr, unstruct, task)
+		if task.ApplyStrategy == ApplyStrategyCreateOnly {
+			obj, err = c.handleCreateOnlyOperation(dr, unstruct, task)
+		} else {
+			obj, err = c.handleUpgradeOperation(dr, unstruct, task)
+		}
 	case bkeaddon.RemoveAddon:
 		err = c.handleRemoveOperation(dr, unstruct, task)
 	default:
@@ -287,12 +311,46 @@ func (c *Client) handleUpgradeOperation(
 	return obj, nil
 }
 
+// handleCreateOnlyOperation creates the object only when it does not already exist.
+func (c *Client) handleCreateOnlyOperation(
+	dr dynamic.ResourceInterface,
+	unstruct unstructured.Unstructured,
+	task *Task) (*unstructured.Unstructured, error) {
+
+	existing, err := dr.Get(c.Ctx, unstruct.GetName(), metav1.GetOptions{})
+	if err == nil {
+		c.Log.Infof("addon obj Kind: %s, Name %s already exists, skip create-only apply",
+			unstruct.GetKind(), unstruct.GetName())
+		if task.recorder != nil {
+			task.recorder.Record(existing)
+		}
+		return existing, nil
+	}
+	if !apierrors.IsNotFound(err) {
+		c.Log.Errorf("failed to get %v before create-only apply, error: %v", unstruct.GroupVersionKind(), err)
+		return nil, errors.Wrapf(err, "get %s before create-only apply", unstruct.GroupVersionKind())
+	}
+
+	obj, err := dr.Create(c.Ctx, &unstruct, metav1.CreateOptions{})
+	if err != nil {
+		c.Log.Errorf("failed to create %v, error: %v", unstruct.GroupVersionKind(), err)
+		return nil, errors.Wrapf(err, "create-only create %s", unstruct.GroupVersionKind())
+	}
+	if task.recorder != nil {
+		task.recorder.Record(obj)
+	}
+	return obj, nil
+}
+
 func (c *Client) handleRemoveOperation(
 	dr dynamic.ResourceInterface,
 	unstruct unstructured.Unstructured,
 	task *Task) error {
 
-	err := dr.Delete(c.Ctx, unstruct.GetName(), metav1.DeleteOptions{})
+	propagation := metav1.DeletePropagationBackground
+	err := dr.Delete(c.Ctx, unstruct.GetName(), metav1.DeleteOptions{
+		PropagationPolicy: &propagation,
+	})
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			c.Log.Warnf("addon obj Kind: %s, Name %s not found, skip delete",
@@ -400,7 +458,7 @@ func GetUnStructListFromDecoder(decoder *yamlutil.YAMLOrJSONDecoder) ([]*unstruc
 			if err == io.EOF {
 				break
 			}
-			return nil, errors.Errorf("latest success resource %s, err: %v", latestUnstructName, err)
+			return nil, fmt.Errorf("latest success resource %s, err: %w", latestUnstructName, err)
 		}
 		latestUnstructName = fmt.Sprintf("kind: %s name: %s", unstruct.GetKind(), unstruct.GetName())
 		unstructList = append(unstructList, unstruct)

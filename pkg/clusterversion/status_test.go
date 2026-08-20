@@ -6,6 +6,7 @@ package clusterversion
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -187,5 +188,46 @@ func TestHasUpgradeRecord(t *testing.T) {
 	}
 	if HasUpgradeRecord(records, "v26.04", "v26.06") {
 		t.Fatal("unexpected record")
+	}
+}
+
+func TestFailUpgradeHop(t *testing.T) {
+	cv := &cvv1alpha1.ClusterVersion{
+		ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "ns"},
+		Spec:       cvv1alpha1.ClusterVersionSpec{DesiredVersion: "v26.06"},
+		Status: cvv1alpha1.ClusterVersionStatus{
+			CurrentVersion: "v26.05",
+			Phase:          cvv1alpha1.ClusterVersionPhaseUpgrading,
+		},
+	}
+	scheme := runtime.NewScheme()
+	_ = cvv1alpha1.AddToScheme(scheme)
+	c := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(cv).
+		WithStatusSubresource(&cvv1alpha1.ClusterVersion{}).
+		Build()
+
+	if err := FailUpgradeHop(context.Background(), c, cv, "v26.06", fmt.Errorf("etcd upgrade failed")); err != nil {
+		t.Fatal(err)
+	}
+	got := &cvv1alpha1.ClusterVersion{}
+	if err := c.Get(context.Background(), types.NamespacedName{Namespace: "ns", Name: "c1"}, got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != cvv1alpha1.ClusterVersionPhaseFailed {
+		t.Fatalf("phase %q", got.Status.Phase)
+	}
+	if got.Status.CurrentVersion != "v26.05" {
+		t.Fatalf("currentVersion should remain v26.05, got %q", got.Status.CurrentVersion)
+	}
+	if len(got.Status.UpgradeHistory) != 1 {
+		t.Fatalf("history %+v", got.Status.UpgradeHistory)
+	}
+	if got.Status.UpgradeHistory[0].Status != cvv1alpha1.ClusterUpgradeRecordStatusFailed {
+		t.Fatalf("history status %q", got.Status.UpgradeHistory[0].Status)
+	}
+	if len(got.Status.Conditions) != 1 || got.Status.Conditions[0].Reason != "UpgradeHopFailed" {
+		t.Fatalf("conditions %+v", got.Status.Conditions)
 	}
 }

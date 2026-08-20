@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -76,5 +76,20 @@ func HostCustomCmdFunc(host *bkessh.Host) bkessh.Command {
 	return bkessh.Command{
 		Cmds:   c,
 		FileUp: f,
+	}
+}
+
+// ImmutableHostNodeFileCmdFunc 不可变 OS 模式下专用的 custom cmd func。
+// KubeOS 镜像内置 bkeagent，开机即启动，此时 hostname 仍为模板默认值（如 localhost.localdomain），
+// 会被写入 /etc/openFuyao/bkeagent/node 文件。此处用 BKENode 配置的正确 hostname 覆写 node 文件，
+// 避免 checkHost 阶段 expectedBKENodeName 对比失败。不上传二进制（镜像已内置）。
+// 同时负责重启 bkeagent，确保重启时读取到正确的 node 文件。
+func ImmutableHostNodeFileCmdFunc(host *bkessh.Host) bkessh.Command {
+	c := []string{
+		fmt.Sprintf("echo %s > /etc/openFuyao/bkeagent/node", host.Extra["hostname"]),
+		"systemctl restart bkeagent 2>&1 >/dev/null",
+	}
+	return bkessh.Command{
+		Cmds: c,
 	}
 }

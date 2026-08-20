@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/initialize/versions"
 )
 
 const (
@@ -32,8 +33,6 @@ const (
 	DefaultPodSubnet = "10.250.0.0/16"
 	// DefaultDNSIPIndex defines the default index for DNS IP calculation in service subnet
 	DefaultDNSIPIndex = 10
-	// DefaultKubernetesVersion defines default kubernetes version
-	DefaultKubernetesVersion = "v1.25.6"
 	// DefaultAPIBindPort defines default API port
 	DefaultAPIBindPort = 6443
 	// DefaultLoadBalancerBindPort defines default load balancer bind port
@@ -79,10 +78,6 @@ const (
 	DefaultCRIDockerDataRootDir     = "/var/lib/docker"
 	DefaultRuntime                  = "runc"
 	DefaultCgroupDriver             = "systemd"
-
-	DefaultEtcdVersion   = "v3.5.21-of.1"
-	DefaultEtcdImageTag  = "3.5.21-of.1"
-	DefaultPauseImageTag = "3.9"
 
 	//Deprecated
 	DefaultK8sV121EtcdImageTag = "3.4.13-0"
@@ -135,6 +130,8 @@ func SetDefaultCluster(obj *BkeConfig) {
 	SetDefaultCertificatesDir(&obj.Cluster)
 	SetDefaultKubernetesVersion(&obj.Cluster)
 	SetDefaultEtcdVersion(&obj.Cluster)
+	SetDefaultContainerdVersion(&obj.Cluster)
+	SetDefaultOpenFuyaoVersion(&obj.Cluster)
 	SetDefaultHttpRepo(&obj.Cluster)
 	SetDefaultImageRepo(&obj.Cluster)
 	SetDefaultChartRepo(&obj.Cluster)
@@ -155,14 +152,28 @@ func SetDefaultCertificatesDir(obj *v1beta1.Cluster) {
 
 func SetDefaultKubernetesVersion(obj *v1beta1.Cluster) {
 	if obj.KubernetesVersion == "" {
-		obj.KubernetesVersion = DefaultKubernetesVersion
+		obj.KubernetesVersion = versions.KubernetesVersion()
 	}
 }
 
 // SetDefaultEtcdVersion sets the default etcd version if the current etcd version is empty
 func SetDefaultEtcdVersion(obj *v1beta1.Cluster) {
 	if obj.EtcdVersion == "" {
-		obj.EtcdVersion = DefaultEtcdVersion
+		obj.EtcdVersion = versions.EtcdVersion()
+	}
+}
+
+// SetDefaultContainerdVersion sets the default containerd version if empty.
+func SetDefaultContainerdVersion(obj *v1beta1.Cluster) {
+	if obj.ContainerdVersion == "" {
+		obj.ContainerdVersion = versions.ContainerdVersion()
+	}
+}
+
+// SetDefaultOpenFuyaoVersion sets the default openFuyao version if empty.
+func SetDefaultOpenFuyaoVersion(obj *v1beta1.Cluster) {
+	if obj.OpenFuyaoVersion == "" {
+		obj.OpenFuyaoVersion = versions.OpenFuyaoVersion()
 	}
 }
 

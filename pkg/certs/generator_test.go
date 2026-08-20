@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -18,6 +18,7 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
@@ -1107,109 +1108,117 @@ func TestLookupRegularCert(t *testing.T) {
 	}
 }
 
-// TestCheckKubeConfigSecret tests the checkKubeConfigSecret function
-func TestCheckKubeConfigSecret(t *testing.T) {
+// TestLookupKubeConfigCert tests the new phaseutil.RetryReadNotFound-backed
+// lookupKubeConfigCert function. The retry helper is exercised but should
+// ultimately return the same result as the field-level checks would suggest.
+func TestLookupKubeConfigCert(t *testing.T) {
 	scheme := createSchemeWithCoreV1()
+
+	haCluster := &bkev1beta1.BKECluster{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default"},
+		Spec: confv1beta1.BKEClusterSpec{
+			ControlPlaneEndpoint: confv1beta1.APIEndpoint{
+				Host: testHADomain,
+				Port: testEndpointPort,
+			},
+		},
+	}
+	haNodes := bkenode.Nodes{{IP: testIPAddress1}}
 
 	tests := []struct {
 		name        string
 		secret      *corev1.Secret
 		bkeCluster  *bkev1beta1.BKECluster
 		nodes       bkenode.Nodes
-		setupClient func(*corev1.Secret, *bkev1beta1.BKECluster) client.Client
-		attempt     int
-		maxRetries  int
+		setupClient func(*corev1.Secret) client.Client
 		expectFound bool
-		expectRetry bool
+		expectError bool
 	}{
 		{
-			name: "secret not found",
-			secret: &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
-			},
+			name:       "secret not found returns false (retry budget exhausted)",
+			secret:     &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"}},
 			bkeCluster: bkeCluster,
-			setupClient: func(s *corev1.Secret, c *bkev1beta1.BKECluster) client.Client {
+			setupClient: func(s *corev1.Secret) client.Client {
 				return fake.NewClientBuilder().WithScheme(scheme).Build()
 			},
-			attempt:     1,
-			maxRetries:  3,
 			expectFound: false,
-			expectRetry: false,
+			expectError: false,
 		},
 		{
-			name: "secret found without value field",
+			name: "secret without value field returns false (synthesised NotFound)",
 			secret: &corev1.Secret{
 				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
 				Data:       map[string][]byte{},
 			},
 			bkeCluster: bkeCluster,
-			setupClient: func(s *corev1.Secret, c *bkev1beta1.BKECluster) client.Client {
+			setupClient: func(s *corev1.Secret) client.Client {
 				return fake.NewClientBuilder().WithScheme(scheme).WithObjects(s).Build()
 			},
-			attempt:     1,
-			maxRetries:  3,
 			expectFound: false,
-			expectRetry: false,
+			expectError: false,
 		},
 		{
-			name: "HA cluster secret without ha field",
+			name: "HA cluster secret without ha field returns false (synthesised NotFound)",
+			secret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Data:       map[string][]byte{"value": []byte("kubeconfig")},
+			},
+			bkeCluster: haCluster,
+			nodes:      haNodes,
+			setupClient: func(s *corev1.Secret) client.Client {
+				return fake.NewClientBuilder().WithScheme(scheme).WithObjects(s).Build()
+			},
+			expectFound: false,
+			expectError: false,
+		},
+		{
+			name: "HA cluster secret with value+ha returns true",
 			secret: &corev1.Secret{
 				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
 				Data: map[string][]byte{
 					"value": []byte("kubeconfig"),
+					"ha":    []byte("ha-kubeconfig"),
 				},
 			},
-			bkeCluster: &bkev1beta1.BKECluster{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "default"},
-				Spec: confv1beta1.BKEClusterSpec{
-					ControlPlaneEndpoint: confv1beta1.APIEndpoint{
-						Host: testHADomain,
-						Port: testEndpointPort,
-					},
-				},
-			},
-			nodes: bkenode.Nodes{
-				{IP: testIPAddress1},
-			},
-			setupClient: func(s *corev1.Secret, c *bkev1beta1.BKECluster) client.Client {
+			bkeCluster: haCluster,
+			nodes:      haNodes,
+			setupClient: func(s *corev1.Secret) client.Client {
 				return fake.NewClientBuilder().WithScheme(scheme).WithObjects(s).Build()
 			},
-			attempt:     1,
-			maxRetries:  3,
-			expectFound: false,
-			expectRetry: true,
+			expectFound: true,
+			expectError: false,
 		},
 		{
-			name: "secret found with value field - non-HA",
+			name: "non-HA cluster secret with value only returns true",
 			secret: &corev1.Secret{
 				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
-				Data: map[string][]byte{
-					"value": []byte("kubeconfig"),
-				},
+				Data:       map[string][]byte{"value": []byte("kubeconfig")},
 			},
 			bkeCluster: &bkev1beta1.BKECluster{
 				ObjectMeta: metav1.ObjectMeta{Namespace: "default"},
 				Spec:       confv1beta1.BKEClusterSpec{},
 			},
 			nodes: nil,
-			setupClient: func(s *corev1.Secret, c *bkev1beta1.BKECluster) client.Client {
+			setupClient: func(s *corev1.Secret) client.Client {
 				return fake.NewClientBuilder().WithScheme(scheme).WithObjects(s).Build()
 			},
-			attempt:     1,
-			maxRetries:  3,
 			expectFound: true,
-			expectRetry: false,
+			expectError: false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			generator := NewKubernetesCertGenerator(context.TODO(), tt.setupClient(tt.secret, tt.bkeCluster), tt.bkeCluster)
+			generator := NewKubernetesCertGenerator(context.TODO(), tt.setupClient(tt.secret), tt.bkeCluster)
 			generator.SetNodes(tt.nodes)
-			found, shouldRetry := generator.checkKubeConfigSecret(tt.secret.ObjectMeta.Name, tt.attempt, tt.maxRetries)
+			found, err := generator.lookupKubeConfigCert(tt.secret.ObjectMeta.Name)
 
 			assert.Equal(t, tt.expectFound, found)
-			assert.Equal(t, tt.expectRetry, shouldRetry)
+			if tt.expectError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
 		})
 	}
 }
@@ -1432,59 +1441,6 @@ func TestGetCertificateFromSecret(t *testing.T) {
 	}
 }
 
-// TestVerifyExpirationTime tests the VerifyExpirationTime function
-func TestVerifyExpirationTime(t *testing.T) {
-	scheme := createSchemeWithCoreV1()
-
-	tests := []struct {
-		name        string
-		setupClient func() client.Client
-		expectError bool
-	}{
-		{
-			name: "secrets not found",
-			setupClient: func() client.Client {
-				return fake.NewClientBuilder().WithScheme(scheme).Build()
-			},
-			expectError: true,
-		},
-		{
-			name: "valid certificates",
-			setupClient: func() client.Client {
-				validCertBytes, validKeyBytes := createValidTestCertAndKey()
-				rootCASecret := &corev1.Secret{
-					ObjectMeta: metav1.ObjectMeta{Name: "test-ca", Namespace: "default"},
-					Data:       map[string][]byte{TLSCrtDataName: validCertBytes, TLSKeyDataName: validKeyBytes},
-				}
-				etcdCASecret := &corev1.Secret{
-					ObjectMeta: metav1.ObjectMeta{Name: "test-etcd", Namespace: "default"},
-					Data:       map[string][]byte{TLSCrtDataName: validCertBytes, TLSKeyDataName: validKeyBytes},
-				}
-				frontProxyCASecret := &corev1.Secret{
-					ObjectMeta: metav1.ObjectMeta{Name: "test-proxy", Namespace: "default"},
-					Data:       map[string][]byte{TLSCrtDataName: validCertBytes, TLSKeyDataName: validKeyBytes},
-				}
-				return fake.NewClientBuilder().WithScheme(scheme).WithObjects(rootCASecret, etcdCASecret, frontProxyCASecret).Build()
-			},
-			expectError: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			generator := NewKubernetesCertGenerator(context.TODO(), tt.setupClient(), bkeCluster)
-			generator.certClusterName = "test"
-			err := generator.VerifyExpirationTime()
-
-			if tt.expectError {
-				assert.Error(t, err)
-			} else {
-				assert.NoError(t, err)
-			}
-		})
-	}
-}
-
 // TestVerifyCertificateSans tests the VerifyCertificateSans function
 func TestVerifyCertificateSans(t *testing.T) {
 	scheme := createSchemeWithCoreV1()
@@ -1654,50 +1610,201 @@ func TestCreateCertificateSecrets(t *testing.T) {
 	}
 }
 
-// TestLookupKubeConfigCert tests the lookupKubeConfigCert function
-func TestLookupKubeConfigCert(t *testing.T) {
+// createExpiringTestCertAndKey creates a CA certificate that expires within 1 hour.
+func createExpiringTestCertAndKey() ([]byte, []byte) {
+	cert := pkiutil.BKECertRootCA()
+	cert.Config.Validity = 1 * time.Hour
+	caCert, caKey, _ := pkiutil.NewCertificateAuthority(cert)
+	return pkiutil.EncodeCertToPEM(caCert), pkiutil.EncodeKeyToPEM(caKey)
+}
+
+// createExpiredTestCertAndKey creates a CA certificate that has already expired.
+func createExpiredTestCertAndKey() ([]byte, []byte) {
+	cert := pkiutil.BKECertRootCA()
+	// Negative validity produces a NotAfter in the past
+	cert.Config.Validity = -1 * time.Hour
+	caCert, caKey, _ := pkiutil.NewCertificateAuthority(cert)
+	return pkiutil.EncodeCertToPEM(caCert), pkiutil.EncodeKeyToPEM(caKey)
+}
+
+// TestIsCertExpiringSoon tests the isCertExpiringSoon function.
+func TestIsCertExpiringSoon(t *testing.T) {
 	scheme := createSchemeWithCoreV1()
+	validCertBytes, _ := createValidTestCertAndKey()
+	expiringCertBytes, _ := createExpiringTestCertAndKey()
+	expiredCertBytes, _ := createExpiredTestCertAndKey()
 
 	tests := []struct {
-		name        string
-		secret      *corev1.Secret
-		setupClient func(*corev1.Secret) client.Client
-		bkeCluster  *bkev1beta1.BKECluster
-		expectFound bool
+		name         string
+		cert         *pkiutil.BKECert
+		setupClient  func() client.Client
+		expectExpiry bool
 	}{
 		{
-			name:   "secret not found",
-			secret: &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"}},
-			setupClient: func(s *corev1.Secret) client.Client {
+			name: "kubeconfig skipped",
+			cert: pkiutil.BKEAdminKubeConfig(),
+			setupClient: func() client.Client {
 				return fake.NewClientBuilder().WithScheme(scheme).Build()
 			},
-			bkeCluster:  bkeCluster,
-			expectFound: false,
+			expectExpiry: false,
 		},
 		{
-			name: "secret found with value",
-			secret: &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{Name: "test-kubeconfig", Namespace: "default"},
-				Data: map[string][]byte{
-					"value": []byte("kubeconfig"),
-				},
+			name: "valid certificate not expiring",
+			cert: pkiutil.BKECertRootCA(),
+			setupClient: func() client.Client {
+				secret := &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-ca", Namespace: "default"},
+					Data:       map[string][]byte{TLSCrtDataName: validCertBytes},
+				}
+				return fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 			},
-			setupClient: func(s *corev1.Secret) client.Client {
-				return fake.NewClientBuilder().WithScheme(scheme).WithObjects(s).Build()
+			expectExpiry: false,
+		},
+		{
+			name: "certificate expiring soon",
+			cert: pkiutil.BKECertRootCA(),
+			setupClient: func() client.Client {
+				secret := &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-ca", Namespace: "default"},
+					Data:       map[string][]byte{TLSCrtDataName: expiringCertBytes},
+				}
+				return fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 			},
-			bkeCluster: &bkev1beta1.BKECluster{
-				ObjectMeta: metav1.ObjectMeta{Namespace: "default"},
-				Spec:       confv1beta1.BKEClusterSpec{},
+			expectExpiry: true,
+		},
+		{
+			name: "certificate already expired",
+			cert: pkiutil.BKECertRootCA(),
+			setupClient: func() client.Client {
+				secret := &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-ca", Namespace: "default"},
+					Data:       map[string][]byte{TLSCrtDataName: expiredCertBytes},
+				}
+				return fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
 			},
-			expectFound: true,
+			expectExpiry: true,
+		},
+		{
+			name: "secret not found returns false (not blocking)",
+			cert: pkiutil.BKECertRootCA(),
+			setupClient: func() client.Client {
+				return fake.NewClientBuilder().WithScheme(scheme).Build()
+			},
+			expectExpiry: false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			generator := NewKubernetesCertGenerator(context.TODO(), tt.setupClient(tt.secret), tt.bkeCluster)
-			found, _ := generator.lookupKubeConfigCert(tt.secret.ObjectMeta.Name)
-			assert.Equal(t, tt.expectFound, found)
+			generator := NewKubernetesCertGenerator(context.TODO(), tt.setupClient(), bkeCluster)
+			generator.certClusterName = "test"
+			result := generator.isCertExpiringSoon(tt.cert)
+			assert.Equal(t, tt.expectExpiry, result)
 		})
 	}
+}
+
+// TestLookupWithExpiration tests that lookup() returns false for expiring certs.
+func TestLookupWithExpiration(t *testing.T) {
+	scheme := createSchemeWithCoreV1()
+	validCertBytes, validKeyBytes := createValidTestCertAndKey()
+	expiringCertBytes, expiringKeyBytes := createExpiringTestCertAndKey()
+
+	tests := []struct {
+		name        string
+		cert        *pkiutil.BKECert
+		setupClient func() client.Client
+		expectFound bool
+		expectError bool
+	}{
+		{
+			name: "valid cert exists - returns true",
+			cert: pkiutil.BKECertRootCA(),
+			setupClient: func() client.Client {
+				secret := &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-ca", Namespace: "default"},
+					Data:       map[string][]byte{TLSCrtDataName: validCertBytes, TLSKeyDataName: validKeyBytes},
+				}
+				return fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+			},
+			expectFound: true,
+			expectError: false,
+		},
+		{
+			name: "expiring cert exists - returns false to trigger regeneration",
+			cert: pkiutil.BKECertRootCA(),
+			setupClient: func() client.Client {
+				secret := &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{Name: "test-ca", Namespace: "default"},
+					Data:       map[string][]byte{TLSCrtDataName: expiringCertBytes, TLSKeyDataName: expiringKeyBytes},
+				}
+				return fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+			},
+			expectFound: false,
+			expectError: false,
+		},
+		{
+			name: "cert not found - returns false",
+			cert: pkiutil.BKECertRootCA(),
+			setupClient: func() client.Client {
+				return fake.NewClientBuilder().WithScheme(scheme).Build()
+			},
+			expectFound: false,
+			expectError: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			generator := NewKubernetesCertGenerator(context.TODO(), tt.setupClient(), bkeCluster)
+			generator.certClusterName = "test"
+			found, err := generator.lookup(tt.cert)
+
+			assert.Equal(t, tt.expectFound, found)
+			if tt.expectError {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+// TestGenerateCertificatesCACascade tests that regenerating a CA forces leaf cert regeneration.
+func TestGenerateCertificatesCACascade(t *testing.T) {
+	scheme := createSchemeWithCoreV1()
+
+	// Create an expiring Root CA cert (will trigger regeneration + cascade)
+	expiringCertBytes, expiringKeyBytes := createExpiringTestCertAndKey()
+
+	// Create a valid (non-expiring) leaf cert to simulate one that would otherwise be skipped.
+	// The cascade logic should force its regeneration regardless.
+	leafCertBytes, leafKeyBytes := createValidTestCertAndKey()
+
+	rootCASecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-ca", Namespace: "default"},
+		Data:       map[string][]byte{TLSCrtDataName: expiringCertBytes, TLSKeyDataName: expiringKeyBytes},
+	}
+	leafSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-apiserver", Namespace: "default"},
+		Data:       map[string][]byte{TLSCrtDataName: leafCertBytes, TLSKeyDataName: leafKeyBytes},
+	}
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(rootCASecret, leafSecret).
+		Build()
+
+	generator := NewKubernetesCertGenerator(context.TODO(), fakeClient, bkeCluster)
+	generator.certClusterName = "test"
+	generator.bkeCerts = pkiutil.Certificates{
+		pkiutil.BKECertRootCA(),
+		pkiutil.BKECertAPIServer(),
+	}
+
+	needCreate, err := generator.generateCertificates()
+
+	assert.NoError(t, err)
+	// Both certs should be regenerated: CA because it's expiring, leaf because of cascade
+	assert.True(t, needCreate)
 }

@@ -2,7 +2,7 @@
  * Copyright (c) 2024 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -14,11 +14,14 @@ package phases
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/pkg/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/cluster-api/util/conditions"
@@ -27,7 +30,9 @@ import (
 
 	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
+	bkecommon "gopkg.openfuyao.cn/cluster-api-provider-bke/common"
 	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/kube"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/mergecluster"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
@@ -107,7 +112,7 @@ func (e *EnsureWorkerJoin) reconcileWorkerJoin() error {
 
 	// 检查控制平面是否已初始化
 	if conditions.IsFalse(e.Ctx.Cluster, clusterv1.ControlPlaneInitializedCondition) {
-		log.Warn(constant.MasterNotInitReason, "master is not initialized, skip join worker nodes process")
+		log.Info(constant.MasterNotInitReason, "master is not initialized, skip join worker nodes process")
 		return nil
 	}
 
@@ -139,8 +144,7 @@ func (e *EnsureWorkerJoin) reconcileWorkerJoin() error {
 	// 获取集群API关联对象
 	scope, err := phaseutil.GetClusterAPIAssociateObjs(ctx, c, e.Ctx.Cluster)
 	if err != nil || scope.MachineDeployment == nil {
-		log.Error(constant.WorkerJoinFailedReason, "Get cluster-api associate objs failed. err: %v", err)
-		return err
+		return fmt.Errorf("Get cluster-api associate objs failed: %w", err)
 	}
 
 	// 调整MachineDeployment副本数
@@ -196,32 +200,33 @@ func (e *EnsureWorkerJoin) scaleMachineDeployment(params ScaleMachineDeploymentP
 		exceptReplicas = int32(workerNodes.Length())
 	}
 
-	params.Scope.MachineDeployment.Spec.Replicas = &exceptReplicas
-
 	_, _, _, _, log := e.Ctx.Untie()
 	log.Info(constant.WorkerJoiningReason, "Scale up MachineDeployment replicas %d to %d", *currentReplicas, exceptReplicas)
 
-	// 如果节点加入过程中出现异常，需要将节点数量恢复到加入前的状态
+	// If node join fails, rollback replicas to pre-join state
 	var scaleErr error
 	defer func() {
 		if scaleErr != nil {
 			log.Info(constant.WorkerJoinFailedReason, "Scale down MachineDeployment replicas to %d.", *currentReplicas)
-			params.Scope.MachineDeployment.Spec.Replicas = currentReplicas
+			if err := phaseutil.UpdateMachineDeploymentReplicas(params.Ctx, params.Client, params.Scope.MachineDeployment, *currentReplicas); err != nil {
+				log.Warn(constant.WorkerJoinFailedReason, "Rollback MachineDeployment replicas failed. err: %v", err)
+			}
 			if err := phaseutil.ResumeClusterAPIObj(params.Ctx, params.Client, params.Scope.MachineDeployment); err != nil {
-				log.Error(constant.WorkerJoinFailedReason, "Rollback MachineDeployment replicas failed. err: %v", err)
+				log.Warn(constant.WorkerJoinFailedReason, "Resume MachineDeployment failed. err: %v", err)
 			}
 		}
 	}()
 
+	if scaleErr = phaseutil.UpdateMachineDeploymentReplicas(params.Ctx, params.Client, params.Scope.MachineDeployment, exceptReplicas); scaleErr != nil {
+		return fmt.Errorf("Scale up MachineDeployment replicas failed: %w", scaleErr)
+	}
 	if scaleErr = phaseutil.ResumeClusterAPIObj(params.Ctx, params.Client, params.Scope.MachineDeployment); scaleErr != nil {
-		log.Error(constant.WorkerJoinFailedReason, "Scale up MachineDeployment replicas failed. err: %v", scaleErr)
-		return scaleErr
+		return fmt.Errorf("Resume MachineDeployment failed: %w", scaleErr)
 	}
 
 	// 等待worker节点加入
 	if scaleErr = e.waitWorkerJoin(); scaleErr != nil {
-		log.Error(constant.WorkerJoinFailedReason, "Wait for worker join failed. err: %v", scaleErr)
-		return scaleErr
+		return fmt.Errorf("Wait for worker join failed: %w", scaleErr)
 	}
 
 	return nil
@@ -235,7 +240,7 @@ func (e *EnsureWorkerJoin) getJoinableNodesInfo(exceptJoinNodes bkenode.Nodes) (
 	for _, node := range exceptJoinNodes {
 		// 正常应该是找不到关联的machine的
 		if _, err := phaseutil.NodeToMachine(ctx, c, bkeCluster, node); err == nil {
-			log.Warn(constant.WorkerJoinedReason, "Node already exists, skip join node. node: %v", node.Hostname)
+			log.Info(constant.WorkerJoinedReason, "Node already exists, skip join node. node: %v", node.Hostname)
 			e.Ctx.NodeFetcher().MarkNodeStateFlagForCluster(e.Ctx, bkeCluster, node.IP, bkev1beta1.NodeBootFlag)
 		} else {
 			nodesInfos = append(nodesInfos, phaseutil.NodeInfo(node))
@@ -306,7 +311,7 @@ func (e *EnsureWorkerJoin) categorizeJoinedNodes(successJoinNode *sync.Map) (bke
 	return successNodes, failedNodes
 }
 
-// updateSuccessNodesStatus 更新成功节点的状态
+// updateSuccessNodesStatus 更新成功加入节点的状态，不可变 OS 模式下同时打 KubeOS 标签
 func (e *EnsureWorkerJoin) updateSuccessNodesStatus(
 	c client.Client, successNodes bkenode.Nodes) error {
 
@@ -323,7 +328,44 @@ func (e *EnsureWorkerJoin) updateSuccessNodesStatus(
 			node.IP, bkev1beta1.NodeNotReady, "Join worker nodes success")
 	}
 
+	if clusterutil.IsImmutableOSMode(e.Ctx.BKECluster) {
+		if err := e.labelImmutableWorkerNodes(successNodes); err != nil {
+			_, _, _, _, log := e.Ctx.Untie()
+			log.Warn(constant.WorkerJoiningReason, "Failed to label immutable worker nodes: %v", err)
+		}
+	}
+
 	return mergecluster.SyncStatusUntilComplete(c, e.Ctx.BKECluster)
+}
+
+// labelImmutableWorkerNodes 给成功加入的 worker 节点打 KubeOS 标签
+func (e *EnsureWorkerJoin) labelImmutableWorkerNodes(successNodes bkenode.Nodes) error {
+	_, _, bkeCluster, _, log := e.Ctx.Untie()
+
+	targetClient, err := kube.NewRemoteClientByBKECluster(e.Ctx.Context, e.Ctx.Client, bkeCluster)
+	if err != nil {
+		return errors.Wrapf(err, "failed to connect target cluster for labeling")
+	}
+	clientset, _ := targetClient.KubeClient()
+
+	patchBytes := []byte(`{"metadata":{"labels":{"` +
+		bkecommon.LabelImmutableOSKey + `":"` + bkecommon.LabelImmutableOSValue + `","` +
+		bkecommon.LabelImmutableRoleKey + `":"` + bkecommon.LabelImmutableRoleWorkerValue + `","` +
+		bkecommon.LabelImmutableNodeSelectorKey + `":"` + bkecommon.LabelImmutableNodeSelectorValue + `"}}}`)
+
+	for _, node := range successNodes.Worker() {
+		if node.Hostname == "" {
+			continue
+		}
+		if _, err := clientset.CoreV1().Nodes().Patch(e.Ctx.Context, node.Hostname,
+			types.MergePatchType, patchBytes, metav1.PatchOptions{}); err != nil {
+			log.Warn(constant.WorkerJoiningReason, "Failed to label immutable worker node %s: %v", node.Hostname, err)
+			continue
+		}
+		log.Info(constant.WorkerJoiningReason, "Labeled immutable worker node %s with KubeOS labels", node.Hostname)
+	}
+
+	return nil
 }
 
 // handleFailedNodes 处理失败的节点
@@ -338,7 +380,7 @@ func (e *EnsureWorkerJoin) handleFailedNodes(
 
 	// 同步失败节点的状态
 	if err := mergecluster.SyncStatusUntilComplete(c, e.Ctx.BKECluster); err != nil {
-		log.Error(constant.WorkerNodeSkipReason, "Failed to sync status for skipped nodes: %v", err)
+		log.Warn(constant.WorkerNodeSkipReason, "Failed to sync status for skipped nodes: %v", err)
 	}
 
 	log.Warn(constant.WorkerNodeSkipReason, "=========================================")
@@ -393,9 +435,7 @@ func (e *EnsureWorkerJoin) determineDeploymentResult(
 
 	// 如果所有节点都失败了，但不是超时错误，则返回错误
 	if len(failedNodes) > 0 && !errors.Is(pollErr, wait.ErrWaitTimeout) {
-		log.Error(constant.WorkerJoinFailedReason,
-			"All worker nodes failed to join, error: %v", pollErr)
-		return pollErr
+		return fmt.Errorf("All worker nodes failed to join: %w", pollErr)
 	}
 
 	// 如果是超时错误且没有成功节点，记录警告但不返回错误（让集群继续）

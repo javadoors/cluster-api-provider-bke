@@ -57,7 +57,7 @@ func getRuntimeClientConnection(runtimeEndpoint string) (*grpc.ClientConn, error
 	log.Debug("get runtime connection")
 	// If no EP set then use the default endpoint types
 	if runtimeEndpoint == "" {
-		log.Warnf("runtime connect using default endpoints: %v. "+
+		log.Debugf("runtime connect using default endpoints: %v. "+
 			"As the default settings are now deprecated, you should set the "+
 			"endpoint instead.", defaultRuntimeEndpoints)
 		log.Debug("Note that performance maybe affected as each default " +
@@ -83,7 +83,7 @@ func getImageClientConnection(imageEndpoint string) (*grpc.ClientConn, error) {
 	log.Debugf("get image connection")
 	// If no EP set then use the default endpoint types
 	if imageEndpoint == "" {
-		log.Warnf("image connect using default endpoints: %v. "+
+		log.Debugf("image connect using default endpoints: %v. "+
 			"As the default settings are now deprecated, you should set the "+
 			"endpoint instead.", defaultRuntimeEndpoints)
 		log.Debug("Note that performance maybe affected as each default " +
@@ -108,7 +108,7 @@ func getConnection(endPoints []string) (*grpc.ClientConn, error) {
 			if idx == endPointsLen-1 {
 				return nil, err
 			}
-			log.Error(err)
+			log.Debugf("resolve endpoint %s failed, try next: %v", endPoint, err)
 			continue
 		}
 		conn, err = grpc.Dial(addr, grpc.WithInsecure(), grpc.WithBlock(), grpc.WithTimeout(DefaultConnectionTimeout), grpc.WithContextDialer(dialer))
@@ -117,7 +117,7 @@ func getConnection(endPoints []string) (*grpc.ClientConn, error) {
 			if idx == endPointsLen-1 {
 				return nil, errMsg
 			}
-			log.Error(errMsg)
+			log.Debugf("connect endpoint %s failed, try next: %v", endPoint, errMsg)
 		} else {
 			log.Debugf("connected successfully using endpoint: %s", endPoint)
 			break
@@ -166,7 +166,7 @@ func parseEndpointWithFallbackProtocol(endpoint string, fallbackProtocol string)
 	fallbackEndpoint := fmt.Sprintf("%s://%s", fallbackProtocol, endpoint)
 	protocol, addr, err = parseEndpoint(fallbackEndpoint)
 	if err != nil {
-		return "", "", fmt.Errorf("invalid endpoint (%w) and fallback failed: %v", err, err)
+		return "", "", fmt.Errorf("invalid endpoint and fallback parse failed: %w", err)
 	}
 
 	// Log deprecation warning (rate limited in production)

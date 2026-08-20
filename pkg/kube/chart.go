@@ -73,7 +73,7 @@ func (c *Client) installChartAddon(addon *confv1beta1.Product, addonOperate bkea
 func (c *Client) getDataFromCMByKey(name, namespace, key string, localClient client.Client) (string, error) {
 	valuesCM := &corev1.ConfigMap{}
 	if err := localClient.Get(context.TODO(), client.ObjectKey{Namespace: namespace, Name: name}, valuesCM); err != nil {
-		return "", fmt.Errorf("failed to get ConfigMap %s/%s: %v", namespace, name, err)
+		return "", fmt.Errorf("failed to get ConfigMap %s/%s: %w", namespace, name, err)
 	}
 
 	data, ok := valuesCM.Data[key]
@@ -227,7 +227,7 @@ func (c *Client) handleCreateChartOperation(addon *confv1beta1.Product, cfg bkei
 
 	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: addon.Namespace}}
 	if _, err := c.ClientSet.CoreV1().Namespaces().Create(c.Ctx, ns, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("failed to create remote ns %s : %v", addon.Namespace, err)
+		return fmt.Errorf("failed to create remote ns %s : %w", addon.Namespace, err)
 	}
 
 	install := action.NewInstall(actionConfig)

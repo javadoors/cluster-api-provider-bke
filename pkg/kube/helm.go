@@ -18,7 +18,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	cliopt "k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/client-go/discovery"
-	"k8s.io/client-go/discovery/cached/memory"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/restmapper"
 	cmd "k8s.io/client-go/tools/clientcmd"
@@ -54,17 +53,19 @@ func (r *RestClientConfig) ToRESTConfig() (*rest.Config, error) {
 
 // ToRESTMapper returns a restmapper
 func (r *RestClientConfig) ToRESTMapper() (meta.RESTMapper, error) {
-	c, err := r.ToDiscoveryClient()
+	mapperCache, err := GetDynamicRESTMapper(r.restConfig)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create discovery client: %v", err)
+		return nil, fmt.Errorf("failed to get dynamic REST mapper: %w", err)
 	}
-	restMapper := restmapper.NewDeferredDiscoveryRESTMapper(c)
-	se := restmapper.NewShortcutExpander(restMapper, c)
+	se := restmapper.NewShortcutExpander(mapperCache.RESTMapper(), mapperCache.DiscoveryClient())
 	return se, nil
 }
 
 // ToDiscoveryClient returns discovery client
 func (r *RestClientConfig) ToDiscoveryClient() (discovery.CachedDiscoveryInterface, error) {
-	clientForConfig, _ := discovery.NewDiscoveryClientForConfig(r.restConfig)
-	return memory.NewMemCacheClient(clientForConfig), nil
+	mapperCache, err := GetDynamicRESTMapper(r.restConfig)
+	if err != nil {
+		return nil, err
+	}
+	return mapperCache.DiscoveryClient(), nil
 }

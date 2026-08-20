@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -31,6 +31,7 @@ import (
 	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
 	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
+	healthconfig "gopkg.openfuyao.cn/cluster-api-provider-bke/config/health"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/cluster"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/annotation"
@@ -756,6 +757,24 @@ func GetNeedUpgradeComponentNodesWithBKENodes(bkeCluster *bkev1beta1.BKECluster,
 	return nodes
 }
 
+// GetNeedUpgradeContainerdNodesWithBKENodes returns nodes that need containerd upgrade using pre-fetched BKENodes.
+// Use this in controller context where local kubeconfig is not available.
+func GetNeedUpgradeContainerdNodesWithBKENodes(
+	bkeCluster *bkev1beta1.BKECluster,
+	bkeNodes bkev1beta1.BKENodes,
+) bkenode.Nodes {
+	if bkeCluster == nil || bkeCluster.Spec.ClusterConfig == nil {
+		return nil
+	}
+	if bkeCluster.Status.ContainerdVersion == "" {
+		return nil
+	}
+	if !NeedUpgrade(bkeCluster.Status.ContainerdVersion, bkeCluster.Spec.ClusterConfig.Cluster.ContainerdVersion) {
+		return nil
+	}
+	return filterNonFailedNodes(GetBKENodesFromNodesStatusWithBKENodes(bkeNodes))
+}
+
 // GetNeedUpgradeNodes returns nodes that need to be upgraded.
 // In controller context, use GetNeedUpgradeNodesWithBKENodes instead.
 func GetNeedUpgradeNodes(bkeCluster *bkev1beta1.BKECluster) bkenode.Nodes {
@@ -911,24 +930,120 @@ func MigrateBKEConfigCM(ctx context.Context, c client.Client, clientSet *kuberne
 	_, err = clientSet.CoreV1().Namespaces().Create(ctx, ns, metav1.CreateOptions{})
 	if err != nil {
 		if !apierrors.IsAlreadyExists(err) {
-			return errors.Errorf("create remote bke config ns %q failed: %v", err, remoteConfig.Namespace)
+			return fmt.Errorf("create remote bke config ns %q failed: %w", remoteConfig.Namespace, err)
 		}
 	}
 
 	_, err = clientSet.CoreV1().ConfigMaps(remoteConfig.Namespace).Create(ctx, remoteConfig, metav1.CreateOptions{})
 	if err != nil {
 		if apierrors.IsAlreadyExists(err) {
-			_, err = clientSet.CoreV1().ConfigMaps(remoteConfig.Namespace).Update(ctx, remoteConfig, metav1.UpdateOptions{})
+			err = RetryOnConflict(func() error {
+				existingConfigMap, err := clientSet.CoreV1().ConfigMaps(remoteConfig.Namespace).Get(ctx, remoteConfig.Name, metav1.GetOptions{})
+				if err != nil {
+					return err
+				}
+				existingConfigMap.Data = remoteConfig.Data
+				_, err = clientSet.CoreV1().ConfigMaps(remoteConfig.Namespace).Update(ctx, existingConfigMap, metav1.UpdateOptions{})
+				return err
+			})
 			if err != nil {
-				return errors.Errorf("update remote bke config cm failed: %v", err)
+				return fmt.Errorf("update remote bke config cm failed: %w", err)
 			}
 			return nil
 		}
-		return errors.Errorf("create remote bke config cm failed: %v", err)
+		return fmt.Errorf("create remote bke config cm failed: %w", err)
 	}
 	return nil
 }
 
+// EnsureLocalHealthCheckConfigCM ensures the controller cluster has the default health check ConfigMap.
+func EnsureLocalHealthCheckConfigCM(ctx context.Context, c client.Client) error {
+	if err := ensureHealthCheckConfigNamespace(ctx, c); err != nil {
+		return err
+	}
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      healthconfig.Name,
+			Namespace: healthconfig.Namespace,
+		},
+		Data: map[string]string{healthconfig.DataKey: healthconfig.DefaultConfig},
+	}
+	if err := c.Create(ctx, cm); err != nil {
+		if apierrors.IsAlreadyExists(err) {
+			// 已存在时保留用户配置，避免每次调谐都把 ConfigMap 覆盖回默认值。
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func ensureHealthCheckConfigNamespace(ctx context.Context, c client.Client) error {
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: healthconfig.Namespace}}
+	if err := c.Create(ctx, ns); err != nil && !apierrors.IsAlreadyExists(err) {
+		return err
+	}
+	return nil
+}
+
+// GetRemoteHealthCheckConfigCM retrieves health check ConfigMap from remote cluster.
+func GetRemoteHealthCheckConfigCM(ctx context.Context, clientSet *kubernetes.Clientset) (*corev1.ConfigMap, error) {
+	if clientSet == nil {
+		return nil, errors.New("remote kubernetes clientset is nil")
+	}
+	config, err := clientSet.CoreV1().ConfigMaps(healthconfig.Namespace).Get(ctx, healthconfig.Name, metav1.GetOptions{})
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return config, nil
+}
+
+// MigrateHealthCheckConfigCM migrates health check ConfigMap to remote cluster.
+func MigrateHealthCheckConfigCM(ctx context.Context, c client.Client, clientSet *kubernetes.Clientset) error {
+	if clientSet == nil {
+		return errors.New("remote kubernetes clientset is nil")
+	}
+	if err := EnsureLocalHealthCheckConfigCM(ctx, c); err != nil {
+		return fmt.Errorf("ensure local health check config cm failed: %w", err)
+	}
+	config := &corev1.ConfigMap{}
+	key := client.ObjectKey{Namespace: healthconfig.Namespace, Name: healthconfig.Name}
+	if err := c.Get(ctx, key, config); err != nil {
+		return err
+	}
+	remoteConfig := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      healthconfig.Name,
+			Namespace: healthconfig.Namespace,
+		},
+		Data: config.Data,
+	}
+
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: healthconfig.Namespace}}
+	if _, err := clientSet.CoreV1().Namespaces().Create(ctx, ns, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create remote health check config ns %q failed: %w", healthconfig.Namespace, err)
+	}
+
+	_, err := clientSet.CoreV1().ConfigMaps(healthconfig.Namespace).Create(ctx, remoteConfig, metav1.CreateOptions{})
+	if err == nil {
+		return nil
+	}
+	if !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("create remote health check config cm failed: %w", err)
+	}
+	return RetryOnConflict(func() error {
+		existingConfigMap, getErr := clientSet.CoreV1().ConfigMaps(healthconfig.Namespace).Get(ctx, healthconfig.Name, metav1.GetOptions{})
+		if getErr != nil {
+			return getErr
+		}
+		existingConfigMap.Data = remoteConfig.Data
+		_, updateErr := clientSet.CoreV1().ConfigMaps(healthconfig.Namespace).Update(ctx, existingConfigMap, metav1.UpdateOptions{})
+		return updateErr
+	})
+}
 func MigratePatchConfigCM(ctx context.Context, c client.Client, clientSet *kubernetes.Clientset) error {
 	patchNamespace := "openfuyao-patch"
 
@@ -966,7 +1081,15 @@ func MigratePatchConfigCM(ctx context.Context, c client.Client, clientSet *kuber
 			return errors.Wrapf(err, "create remote ConfigMap %s/%s failed", patchNamespace, cm.Name)
 		}
 
-		if _, updateErr := clientSet.CoreV1().ConfigMaps(patchNamespace).Update(ctx, cmCopy, metav1.UpdateOptions{}); updateErr != nil {
+		if updateErr := RetryOnConflict(func() error {
+			existingConfigMap, err := clientSet.CoreV1().ConfigMaps(patchNamespace).Get(ctx, cmCopy.Name, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			existingConfigMap.Data = cmCopy.Data
+			_, err = clientSet.CoreV1().ConfigMaps(patchNamespace).Update(ctx, existingConfigMap, metav1.UpdateOptions{})
+			return err
+		}); updateErr != nil {
 			return errors.Wrapf(updateErr, "update remote ConfigMap %s/%s failed", patchNamespace, cm.Name)
 		}
 	}
@@ -1116,6 +1239,9 @@ func compareVersionAndGetNodesWithBKENodes(
 	oldVersionStr, newVersionStr string,
 	bkeNodes bkev1beta1.BKENodes,
 ) bkenode.Nodes {
+	if !NeedUpgrade(oldVersionStr, newVersionStr) {
+		return nil
+	}
 	return filterNonFailedNodes(GetBKENodesFromNodesStatusWithBKENodes(bkeNodes))
 }
 

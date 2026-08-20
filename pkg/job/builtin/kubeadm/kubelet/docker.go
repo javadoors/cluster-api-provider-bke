@@ -50,8 +50,7 @@ func (kp *kubeletPlugin) runWithDocker(config map[string]string) error {
 	// 如果是麒麟需要重新生成kubelet config，cgroupDriver需要设置为cgroupfs
 	h, _, _, err := host.PlatformInformation()
 	if err != nil {
-		log.Errorf("get host platform information failed, err: %v", err)
-		return errors.Errorf("get host platform information failed, err: %v", err)
+		return fmt.Errorf("get host platform information failed, err: %w", err)
 	}
 	if h == "kylin" {
 		if err := httprepo.RepoSearch("docker-ce"); err != nil {
@@ -67,7 +66,7 @@ func (kp *kubeletPlugin) runWithDocker(config map[string]string) error {
 
 	log.Infof("start kubelet container %q", config["containerName"])
 	if err := newKubeletScript(config); err != nil {
-		return errors.Errorf("failed to generate kubelet script, err: %v", err)
+		return fmt.Errorf("failed to generate kubelet script, err: %w", err)
 	}
 	runKubeletCommand := fmt.Sprintf("%s -a start -r %s", utils.GetKubeletScriptPath(), "docker")
 	if output, err := kp.exec.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", runKubeletCommand); err != nil {

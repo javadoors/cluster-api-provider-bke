@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.19.0
+    controller-gen.kubebuilder.io/version: v0.20.0
   name: componentversions.config.openfuyao.com
 spec:
   group: config.openfuyao.com
@@ -144,6 +144,120 @@ spec:
                 type: object
               version:
                 type: string
+              yaml:
+                description: |-
+                  YAML configures yaml/manifest component install behavior when Type=yaml.
+                  Nil keeps legacy behavior for existing ComponentVersion objects.
+                properties:
+                  applyStrategy:
+                    description: ApplyStrategy selects ServerSideApply (default),
+                      Replace, or CreateOnly.
+                    enum:
+                    - ServerSideApply
+                    - Replace
+                    - CreateOnly
+                    type: string
+                  healthCheck:
+                    description: HealthCheck runs after successful Apply when Enabled
+                      is true.
+                    properties:
+                      checks:
+                        description: Checks is the ordered list of probes; all must
+                          pass.
+                        items:
+                          description: |-
+                            HealthCheckItemSpec is one health probe. Type selects which nested config is used;
+                            the other nested fields should be nil.
+                          properties:
+                            custom:
+                              description: Custom is used when Type=Custom.
+                              properties:
+                                command:
+                                  description: Command is executed via /bin/sh -c
+                                    (e.g. "curl -s http://.../healthz").
+                                  type: string
+                              required:
+                              - command
+                              type: object
+                            endpointReady:
+                              description: EndpointReady is used when Type=EndpointReady.
+                              properties:
+                                namespace:
+                                  description: Namespace of the Service.
+                                  type: string
+                                port:
+                                  description: Port optionally restricts readiness
+                                    to a specific port.
+                                  format: int32
+                                  type: integer
+                                serviceName:
+                                  description: ServiceName is the Endpoints/Service
+                                    name.
+                                  type: string
+                              required:
+                              - namespace
+                              - serviceName
+                              type: object
+                            podReady:
+                              description: PodReady is used when Type=PodReady.
+                              properties:
+                                labelSelector:
+                                  description: LabelSelector is a Kubernetes label
+                                    selector string (e.g. "k8s-app=kube-dns").
+                                  type: string
+                                minReady:
+                                  description: MinReady is the minimum Ready pod count;
+                                    0 means all listed pods must be Ready.
+                                  format: int32
+                                  type: integer
+                                namespace:
+                                  description: Namespace of pods to list.
+                                  type: string
+                              required:
+                              - labelSelector
+                              - namespace
+                              type: object
+                            type:
+                              description: Type is PodReady / EndpointReady / Custom.
+                              enum:
+                              - PodReady
+                              - EndpointReady
+                              - Custom
+                              type: string
+                          required:
+                          - type
+                          type: object
+                        type: array
+                      enabled:
+                        description: Enabled controls whether health checks run after
+                          Apply.
+                        type: boolean
+                      interval:
+                        description: Interval is the poll period between attempts
+                          (Go duration string, e.g. "2s").
+                        type: string
+                      timeout:
+                        description: Timeout bounds the overall retry window (Go duration
+                          string, e.g. "5m").
+                        type: string
+                    required:
+                    - enabled
+                    type: object
+                  namespace:
+                    description: Namespace is the optional target namespace for deployment
+                      and prune listing.
+                    type: string
+                  prune:
+                    description: Prune enables pruning resources that match PruneLabelSelector
+                      but are absent from the current manifests.
+                    type: boolean
+                  pruneLabelSelector:
+                    additionalProperties:
+                      type: string
+                    description: PruneLabelSelector is required when Prune is true;
+                      used to list prune candidates in the cluster.
+                    type: object
+                type: object
             required:
             - name
             - type

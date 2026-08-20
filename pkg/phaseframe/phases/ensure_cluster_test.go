@@ -3,7 +3,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -15,19 +15,35 @@ package phases
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
+	"github.com/agiledragon/gomonkey/v2"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
+	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/kube"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/testutils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/config"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/label"
+	labelhelper "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/label"
+	bklog "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 const (
@@ -421,4 +437,599 @@ func TestEnsureCluster_ApplyNecessaryLabels(t *testing.T) {
 	if err != nil {
 		t.Errorf("applyNecessaryLabels should not error when labels match: %v", err)
 	}
+}
+
+// clusterGaps2RemoteKubeClient is a RemoteKubeClient stub that distinguishes the
+// alter-label ListNodes call from the worker-label one (setAlertLabel calls
+// ListNodes twice with different LabelSelectors).
+type clusterGaps2RemoteKubeClient struct {
+	kube.RemoteKubeClient
+	alterNodes  *corev1.NodeList
+	alterErr    error
+	workerNodes *corev1.NodeList
+	workerErr   error
+	tokenFn     func() (string, error)
+	healthFn    func(*bkev1beta1.BKECluster, string, bkev1beta1.BKENodes) error
+}
+
+func (s *clusterGaps2RemoteKubeClient) ListNodes(o *metav1.ListOptions) (*corev1.NodeList, error) {
+	if o != nil && o.LabelSelector == labelhelper.AlertLabelKey {
+		if s.alterErr != nil {
+			return nil, s.alterErr
+		}
+		if s.alterNodes == nil {
+			return &corev1.NodeList{}, nil
+		}
+		return s.alterNodes, nil
+	}
+	if s.workerErr != nil {
+		return nil, s.workerErr
+	}
+	if s.workerNodes == nil {
+		return &corev1.NodeList{}, nil
+	}
+	return s.workerNodes, nil
+}
+
+func (s *clusterGaps2RemoteKubeClient) NewK8sToken() (string, error) {
+	if s.tokenFn != nil {
+		return s.tokenFn()
+	}
+	return "tok", nil
+}
+
+func (s *clusterGaps2RemoteKubeClient) CheckClusterHealth(c *bkev1beta1.BKECluster, v string, n bkev1beta1.BKENodes) error {
+	if s.healthFn != nil {
+		return s.healthFn(c, v, n)
+	}
+	return nil
+}
+
+func (s *clusterGaps2RemoteKubeClient) KubeClient() (*kubernetes.Clientset, dynamic.Interface) {
+	return nil, nil
+}
+
+func (s *clusterGaps2RemoteKubeClient) SetLogger(*bklog.Logger) {}
+
+func clusterGaps2Phase(t *testing.T) *EnsureCluster {
+	t.Helper()
+	cluster := &bkev1beta1.BKECluster{ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "ns"}}
+	ctx := newAdditionalPhaseContext(t, cluster)
+	return &EnsureCluster{BasePhase: phaseframe.NewBasePhase(ctx, EnsureClusterName)}
+}
+
+// patchRetryOnConflictDirect makes RetryOnConflict invoke fn exactly once so tests
+// avoid the real conflict-retry backoff.
+func patchRetryOnConflictDirect(patches *gomonkey.Patches) {
+	patches.ApplyFunc(phaseutil.RetryOnConflict, func(fn func() error) error {
+		return fn()
+	})
+}
+
+func TestClusterGaps2SetAlertLabel(t *testing.T) {
+	node := func(name string) *corev1.Node {
+		return &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}}
+	}
+	nodeList := func(items ...*corev1.Node) *corev1.NodeList {
+		nl := &corev1.NodeList{}
+		for _, n := range items {
+			nl.Items = append(nl.Items, *n)
+		}
+		return nl
+	}
+
+	t.Run("alter_list_err_returns_err", func(t *testing.T) {
+		e := clusterGaps2Phase(t)
+		e.remoteClient = &clusterGaps2RemoteKubeClient{
+			alterErr: errors.New("list alter boom"),
+		}
+		err := e.setAlertLabel()
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "failed to list nodes")
+	})
+
+	t.Run("alter_node_exists_returns_nil", func(t *testing.T) {
+		e := clusterGaps2Phase(t)
+		e.remoteClient = &clusterGaps2RemoteKubeClient{
+			alterNodes: nodeList(node("alert-node")),
+		}
+		require.NoError(t, e.setAlertLabel())
+	})
+
+	t.Run("worker_list_err_returns_err", func(t *testing.T) {
+		e := clusterGaps2Phase(t)
+		e.remoteClient = &clusterGaps2RemoteKubeClient{
+			workerErr: errors.New("list worker boom"),
+		}
+		err := e.setAlertLabel()
+		require.Error(t, err)
+	})
+
+	t.Run("no_worker_node_returns_nil", func(t *testing.T) {
+		e := clusterGaps2Phase(t)
+		e.remoteClient = &clusterGaps2RemoteKubeClient{
+			workerNodes: nodeList(),
+		}
+		require.NoError(t, e.setAlertLabel())
+	})
+
+	t.Run("set_label_success", func(t *testing.T) {
+		e := clusterGaps2Phase(t)
+		e.mockClient = k8sfake.NewSimpleClientset(node("w1"))
+		e.remoteClient = &clusterGaps2RemoteKubeClient{
+			workerNodes: nodeList(node("w1")),
+		}
+		require.NoError(t, e.setAlertLabel())
+		// alert label applied to the worker node
+		got, err := e.mockClient.CoreV1().Nodes().Get(e.Ctx, "w1", metav1.GetOptions{})
+		require.NoError(t, err)
+		require.Contains(t, got.Labels, labelhelper.AlertLabelKey)
+	})
+
+	t.Run("set_label_get_err_returns_err", func(t *testing.T) {
+		e := clusterGaps2Phase(t)
+		// mockClient does NOT contain "w1" -> Get returns NotFound
+		e.mockClient = k8sfake.NewSimpleClientset()
+		e.remoteClient = &clusterGaps2RemoteKubeClient{
+			workerNodes: nodeList(node("w1")),
+		}
+		err := e.setAlertLabel()
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "failed to set alert label")
+	})
+}
+
+func TestClusterGaps2EnsureK8sToken(t *testing.T) {
+	patchGetToken := func(patches *gomonkey.Patches, secret *corev1.Secret, err error) {
+		patches.ApplyFunc(phaseutil.GetK8sTokenSecret,
+			func(_ context.Context, _ client.Client, _ *bkev1beta1.BKECluster) (*corev1.Secret, error) {
+				return secret, err
+			})
+	}
+	patchNewTokenSecret := func(patches *gomonkey.Patches, err error) {
+		patches.ApplyFunc(phaseutil.NewK8sTokenSecret,
+			func(_ context.Context, _ string, _ client.Client, _ *bkev1beta1.BKECluster) error {
+				return err
+			})
+	}
+
+	ownerRef := []metav1.OwnerReference{{APIVersion: "v1", Kind: "BKECluster", Name: "c1"}}
+
+	t.Run("not_found_then_create_returns_nil", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patchRetryOnConflictDirect(patches)
+		patchGetToken(patches, nil, errors.New("secret not found"))
+		patchNewTokenSecret(patches, nil)
+		e := clusterGaps2Phase(t)
+		e.remoteClient = &clusterGaps2RemoteKubeClient{}
+		require.NoError(t, e.ensureK8sToken())
+	})
+
+	t.Run("get_token_other_err_returns_err", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patchRetryOnConflictDirect(patches)
+		patchGetToken(patches, nil, errors.New("boom other"))
+		e := clusterGaps2Phase(t)
+		e.remoteClient = &clusterGaps2RemoteKubeClient{}
+		err := e.ensureK8sToken()
+		require.Error(t, err)
+	})
+
+	t.Run("token_empty_then_create_returns_nil", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patchRetryOnConflictDirect(patches)
+		secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "tok", OwnerReferences: ownerRef}}
+		patchGetToken(patches, secret, nil)
+		patchNewTokenSecret(patches, nil)
+		e := clusterGaps2Phase(t)
+		e.remoteClient = &clusterGaps2RemoteKubeClient{}
+		require.NoError(t, e.ensureK8sToken())
+	})
+
+	t.Run("token_present_returns_nil", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patchRetryOnConflictDirect(patches)
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "tok", OwnerReferences: ownerRef},
+			Data:       map[string][]byte{"token": []byte("tok")},
+		}
+		patchGetToken(patches, secret, nil)
+		e := clusterGaps2Phase(t)
+		e.remoteClient = &clusterGaps2RemoteKubeClient{}
+		require.NoError(t, e.ensureK8sToken())
+	})
+
+	t.Run("not_found_create_secret_err_returns_err", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patchRetryOnConflictDirect(patches)
+		patchGetToken(patches, nil, errors.New("secret not found"))
+		patchNewTokenSecret(patches, errors.New("create secret boom"))
+		e := clusterGaps2Phase(t)
+		e.remoteClient = &clusterGaps2RemoteKubeClient{}
+		err := e.ensureK8sToken()
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "create secret boom")
+	})
+
+	t.Run("token_empty_new_token_err_returns_err", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patchRetryOnConflictDirect(patches)
+		secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "tok", OwnerReferences: ownerRef}}
+		patchGetToken(patches, secret, nil)
+		e := clusterGaps2Phase(t)
+		e.remoteClient = &clusterGaps2RemoteKubeClient{
+			tokenFn: func() (string, error) { return "", errors.New("new token boom") },
+		}
+		err := e.ensureK8sToken()
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "new token boom")
+	})
+
+	t.Run("owner_refs_empty_update_returns_nil", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		patchRetryOnConflictDirect(patches)
+		// secret has no OwnerReferences -> SetControllerReference + c.Update path
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "tok", Namespace: "ns"},
+			Data:       map[string][]byte{"token": []byte("tok")},
+		}
+		patchGetToken(patches, secret, nil)
+		e := clusterGaps2Phase(t)
+		e.remoteClient = &clusterGaps2RemoteKubeClient{}
+		// SetControllerReference + c.Update path: fake scheme lacks Secret, so
+		// c.Update returns an error which propagates via the RetryOnConflict branch.
+		err := e.ensureK8sToken()
+		require.Error(t, err)
+	})
+}
+
+// ---- shared helpers (clusterGaps prefix to avoid collisions) ----
+
+// clusterGapsBKECluster builds a minimal BKECluster for the EnsureCluster tests.
+func clusterGapsBKECluster() *bkev1beta1.BKECluster {
+	return &bkev1beta1.BKECluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "cgap-cluster", Namespace: "default"},
+	}
+}
+
+// clusterGapsEnsureCluster builds an EnsureCluster wired to a fake controller-runtime
+// client + logger via the existing newAdditionalPhaseContext helper. mockClient and
+// remoteClient are set by individual tests.
+func clusterGapsEnsureCluster(t *testing.T, bc *bkev1beta1.BKECluster) *EnsureCluster {
+	t.Helper()
+	if bc == nil {
+		bc = clusterGapsBKECluster()
+	}
+	ctx := newAdditionalPhaseContext(t, bc)
+	return &EnsureCluster{BasePhase: phaseframe.BasePhase{Ctx: ctx, PhaseName: EnsureClusterName}}
+}
+
+// clusterGapsRemoteKubeClient is a minimal RemoteKubeClient stub used to drive the
+// remoteClient-dependent methods. It only implements ListNodes and KubeClient since
+// those are the only methods invoked by the functions under test.
+type clusterGapsRemoteKubeClient struct {
+	kube.RemoteKubeClient
+	nodes   *corev1.NodeList
+	listErr error
+	cs      *kubernetes.Clientset
+}
+
+func (s clusterGapsRemoteKubeClient) ListNodes(_ *metav1.ListOptions) (*corev1.NodeList, error) {
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
+	return s.nodes, nil
+}
+
+func (s clusterGapsRemoteKubeClient) KubeClient() (*kubernetes.Clientset, dynamic.Interface) {
+	return s.cs, nil
+}
+
+// clusterGapsFailingUpdateCS wraps a kubernetes.Interface and makes Nodes().Update
+// return updateErr while delegating Get to the underlying clientset. Used to exercise
+// the update-error retry branch of waitLabelReady without a 60s real backoff.
+type clusterGapsFailingUpdateCS struct {
+	kubernetes.Interface
+	updateErr error
+}
+
+func (c *clusterGapsFailingUpdateCS) CoreV1() corev1client.CoreV1Interface {
+	return &clusterGapsCoreV1{CoreV1Interface: c.Interface.CoreV1(), updateErr: c.updateErr}
+}
+
+type clusterGapsCoreV1 struct {
+	corev1client.CoreV1Interface
+	updateErr error
+}
+
+func (c *clusterGapsCoreV1) Nodes() corev1client.NodeInterface {
+	return &clusterGapsNodes{NodeInterface: c.CoreV1Interface.Nodes(), updateErr: c.updateErr}
+}
+
+type clusterGapsNodes struct {
+	corev1client.NodeInterface
+	updateErr error
+}
+
+func (n *clusterGapsNodes) Update(_ context.Context, _ *corev1.Node, _ metav1.UpdateOptions) (*corev1.Node, error) {
+	return nil, n.updateErr
+}
+
+// ---- setBareMetalLabel ----
+
+func TestEnsureClusterSetBareMetalLabel(t *testing.T) {
+	t.Run("success sets label on unlabeled node and skips labeled one", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+
+		nodeA := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-a"}}
+		nodeB := &corev1.Node{ObjectMeta: metav1.ObjectMeta{
+			Name:   "node-b",
+			Labels: map[string]string{labelhelper.BareMetalLabelKey: "true"},
+		}}
+		e := clusterGapsEnsureCluster(t, clusterGapsBKECluster())
+		e.mockClient = k8sfake.NewSimpleClientset(nodeA, nodeB)
+		e.remoteClient = clusterGapsRemoteKubeClient{
+			nodes: &corev1.NodeList{Items: []corev1.Node{*nodeA, *nodeB}},
+		}
+
+		require.NoError(t, e.setBareMetalLabel())
+
+		// node-a should now carry the bare-metal label.
+		got, err := e.mockClient.CoreV1().Nodes().Get(e.Ctx, "node-a", metav1.GetOptions{})
+		require.NoError(t, err)
+		assert.Equal(t, "true", got.Labels[labelhelper.BareMetalLabelKey])
+	})
+
+	t.Run("list nodes error returns error", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+
+		e := clusterGapsEnsureCluster(t, clusterGapsBKECluster())
+		e.mockClient = k8sfake.NewSimpleClientset()
+		e.remoteClient = clusterGapsRemoteKubeClient{listErr: errors.New("dial remote: connection refused")}
+
+		err := e.setBareMetalLabel()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "connection refused")
+	})
+
+	t.Run("get node error is swallowed and continues", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+
+		// ListNodes returns a node that is NOT present in the mockClient, so the
+		// inner Get fails and the warn/continue path is exercised (returns nil).
+		ghost := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "ghost-node"}}
+		e := clusterGapsEnsureCluster(t, clusterGapsBKECluster())
+		e.mockClient = k8sfake.NewSimpleClientset()
+		e.remoteClient = clusterGapsRemoteKubeClient{nodes: &corev1.NodeList{Items: []corev1.Node{*ghost}}}
+
+		// Returns nil because the per-node Get error is logged and the loop continues.
+		require.NoError(t, e.setBareMetalLabel())
+	})
+}
+
+// ---- ensureRemoteBKEConfigCM ----
+
+func TestEnsureClusterEnsureRemoteBKEConfigCM(t *testing.T) {
+	t.Run("get cm error returns error", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+
+		patches.ApplyFunc(phaseutil.GetRemoteBKEConfigCM,
+			func(ctx context.Context, cs *kubernetes.Clientset) (*corev1.ConfigMap, error) {
+				return nil, errors.New("remote apiserver unreachable")
+			})
+
+		e := clusterGapsEnsureCluster(t, clusterGapsBKECluster())
+		e.remoteClient = clusterGapsRemoteKubeClient{cs: &kubernetes.Clientset{}}
+
+		err := e.ensureRemoteBKEConfigCM()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "remote apiserver unreachable")
+	})
+
+	t.Run("config nil migrates successfully", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+
+		patches.ApplyFunc(phaseutil.GetRemoteBKEConfigCM,
+			func(ctx context.Context, cs *kubernetes.Clientset) (*corev1.ConfigMap, error) {
+				return nil, nil // not found -> nil config, nil err
+			})
+		patches.ApplyFunc(phaseutil.MigrateBKEConfigCM,
+			func(ctx context.Context, c client.Client, cs *kubernetes.Clientset) error {
+				return nil
+			})
+
+		e := clusterGapsEnsureCluster(t, clusterGapsBKECluster())
+		e.remoteClient = clusterGapsRemoteKubeClient{cs: &kubernetes.Clientset{}}
+
+		require.NoError(t, e.ensureRemoteBKEConfigCM())
+	})
+
+	t.Run("config nil migrate error returns error", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+
+		patches.ApplyFunc(phaseutil.GetRemoteBKEConfigCM,
+			func(ctx context.Context, cs *kubernetes.Clientset) (*corev1.ConfigMap, error) {
+				return nil, nil
+			})
+		patches.ApplyFunc(phaseutil.MigrateBKEConfigCM,
+			func(ctx context.Context, c client.Client, cs *kubernetes.Clientset) error {
+				return errors.New("create remote ns failed")
+			})
+
+		e := clusterGapsEnsureCluster(t, clusterGapsBKECluster())
+		e.remoteClient = clusterGapsRemoteKubeClient{cs: &kubernetes.Clientset{}}
+
+		err := e.ensureRemoteBKEConfigCM()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "create remote ns failed")
+	})
+
+	t.Run("config exists returns nil", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+
+		patches.ApplyFunc(phaseutil.GetRemoteBKEConfigCM,
+			func(ctx context.Context, cs *kubernetes.Clientset) (*corev1.ConfigMap, error) {
+				return &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "bke-config"}}, nil
+			})
+
+		e := clusterGapsEnsureCluster(t, clusterGapsBKECluster())
+		e.remoteClient = clusterGapsRemoteKubeClient{cs: &kubernetes.Clientset{}}
+
+		require.NoError(t, e.ensureRemoteBKEConfigCM())
+	})
+}
+
+// ---- ensureAgentStatus ----
+
+func TestEnsureClusterEnsureAgentStatus(t *testing.T) {
+	t.Run("switch bkeagent condition true skips check", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+
+		bc := clusterGapsBKECluster()
+		bc.Status.Conditions = []confv1beta1.ClusterCondition{
+			{Type: bkev1beta1.SwitchBKEAgentCondition, Status: confv1beta1.ConditionTrue},
+		}
+		e := clusterGapsEnsureCluster(t, bc)
+
+		require.NoError(t, e.ensureAgentStatus())
+	})
+
+	t.Run("zero replies returns nil without pinging", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+
+		bc := clusterGapsBKECluster()
+		bc.Status.AgentStatus = confv1beta1.BKEAgentStatus{Replies: 0}
+		e := clusterGapsEnsureCluster(t, bc)
+
+		require.NoError(t, e.ensureAgentStatus())
+	})
+
+	t.Run("ping returns failed nodes returns error", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+
+		patches.ApplyFunc(phaseutil.PingBKEAgent,
+			func(ctx context.Context, c client.Client, scheme *runtime.Scheme, bc *bkev1beta1.BKECluster) (error, []string, []string) {
+				return nil, nil, []string{"node-1", "node-2"}
+			})
+
+		bc := clusterGapsBKECluster()
+		bc.Status.AgentStatus = confv1beta1.BKEAgentStatus{Replies: 2}
+		e := clusterGapsEnsureCluster(t, bc)
+
+		err := e.ensureAgentStatus()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to ping bkeagent on flow Nodes")
+	})
+
+	t.Run("ping success returns nil", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+
+		patches.ApplyFunc(phaseutil.PingBKEAgent,
+			func(ctx context.Context, c client.Client, scheme *runtime.Scheme, bc *bkev1beta1.BKECluster) (error, []string, []string) {
+				return nil, nil, nil
+			})
+
+		bc := clusterGapsBKECluster()
+		bc.Status.AgentStatus = confv1beta1.BKEAgentStatus{Replies: 3}
+		e := clusterGapsEnsureCluster(t, bc)
+
+		require.NoError(t, e.ensureAgentStatus())
+	})
+
+	t.Run("ping error returns error", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+
+		patches.ApplyFunc(phaseutil.PingBKEAgent,
+			func(ctx context.Context, c client.Client, scheme *runtime.Scheme, bc *bkev1beta1.BKECluster) (error, []string, []string) {
+				return errors.New("transient rpc error"), nil, nil
+			})
+
+		bc := clusterGapsBKECluster()
+		bc.Status.AgentStatus = confv1beta1.BKEAgentStatus{Replies: 1}
+		e := clusterGapsEnsureCluster(t, bc)
+
+		// upstream change: ping err now returns an error even when failedNodes is empty.
+		err := e.ensureAgentStatus()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to ping BKEAgent")
+	})
+}
+
+// ---- waitLabelReady ----
+
+func TestEnsureClusterWaitLabelReady(t *testing.T) {
+	t.Run("success applies label and returns nil", func(t *testing.T) {
+		node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "ready-node"}}
+		cs := k8sfake.NewSimpleClientset(node)
+		e := clusterGapsEnsureCluster(t, clusterGapsBKECluster())
+
+		require.NoError(t, e.waitLabelReady(cs, node, "customized/foo", "bar"))
+
+		got, err := cs.CoreV1().Nodes().Get(e.Ctx, "ready-node", metav1.GetOptions{})
+		require.NoError(t, err)
+		assert.Equal(t, "bar", got.Labels["customized/foo"])
+	})
+
+	t.Run("node not found returns wrapped error", func(t *testing.T) {
+		// Fake clientset has no node, so Get returns NotFound; the condition func
+		// returns an error, which PollImmediateUntil propagates immediately.
+		cs := k8sfake.NewSimpleClientset()
+		e := clusterGapsEnsureCluster(t, clusterGapsBKECluster())
+		node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "missing-node"}}
+
+		err := e.waitLabelReady(cs, node, "customized/foo", "bar")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "failed to set label customized/foo=bar on node missing-node")
+	})
+
+	t.Run("update error retries then times out returning wrapped error", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+
+		// PollImmediateUntil is stubbed to invoke the condition exactly once so the
+		// 10s interval / 1m overall timeout does not slow the test down. When the
+		// condition reports (false, nil) -- i.e. an update error requiring retry --
+		// we surface wait.ErrWaitTimeout to exercise the final error wrap.
+		patches.ApplyFunc(wait.PollImmediateUntil,
+			func(_ time.Duration, condition wait.ConditionFunc, _ <-chan struct{}) error {
+				done, err := condition()
+				if err != nil {
+					return err
+				}
+				if done {
+					return nil
+				}
+				return wait.ErrWaitTimeout
+			})
+
+		node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "update-fail-node"}}
+		cs := &clusterGapsFailingUpdateCS{
+			Interface: k8sfake.NewSimpleClientset(node),
+			updateErr: errors.New("forbidden"),
+		}
+		e := clusterGapsEnsureCluster(t, clusterGapsBKECluster())
+
+		err := e.waitLabelReady(cs, node, "customized/foo", "bar")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "after retries")
+	})
 }

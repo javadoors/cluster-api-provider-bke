@@ -2,7 +2,7 @@
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -73,6 +73,37 @@ func TestBuildVersionContextForUpgrade_FromBundleAndCluster(t *testing.T) {
 	}
 	if !vc.NeedsUpgrade(ComponentProvider) {
 		t.Fatal("expected manifest component upgrade when current is empty")
+	}
+}
+
+func TestBuildVersionContextForUpgrade_ProviderFromClusterComponentStatus(t *testing.T) {
+	bc := &bkev1beta1.BKECluster{
+		Status: confv1beta1.BKEClusterStatus{
+			ClusterComponentStatuses: map[string]confv1beta1.ComponentLifecycleStatus{
+				ComponentProvider: {Name: ComponentProvider, CurrentVersion: "v1.0.0"},
+			},
+		},
+	}
+	vc := BuildVersionContextForUpgrade(testReleaseBundle(), nil, bc)
+	if vc.NeedsUpgrade(ComponentProvider) {
+		t.Fatal("expected provider skip when clusterComponentStatuses matches target")
+	}
+}
+
+func TestBuildVersionContextForUpgrade_BKEAgentFromAddonStatus(t *testing.T) {
+	bundle := testReleaseBundle()
+	bundle.Release.Spec.Upgrade.Components = append(
+		bundle.Release.Spec.Upgrade.Components,
+		apiv1.ReleaseImageUpgradeComponent{Name: ComponentBKEAgent, Version: "v2.0.0"},
+	)
+	bc := &bkev1beta1.BKECluster{
+		Status: confv1beta1.BKEClusterStatus{
+			AddonStatus: []confv1beta1.Product{{Name: ComponentBKEAgent, Version: "v2.0.0"}},
+		},
+	}
+	vc := BuildVersionContextForUpgrade(bundle, nil, bc)
+	if vc.NeedsUpgrade(ComponentBKEAgent) {
+		t.Fatal("expected bkeagent skip when addonStatus matches target")
 	}
 }
 

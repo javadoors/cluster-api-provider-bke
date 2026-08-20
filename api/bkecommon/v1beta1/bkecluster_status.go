@@ -2,7 +2,7 @@
  * Copyright (c) 2024 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -252,6 +252,66 @@ func (s *DeclarativeUpgradeStatus) ClearFailure() {
 	s.LastFailure = nil
 }
 
+// LifecyclePhase is the lifecycle stage of a declarative upgrade component.
+// +kubebuilder:validation:Enum=Pending;Installing;Installed;Upgrading;RollingBack;Uninstalling;Removed;Failed
+type LifecyclePhase string
+
+const (
+	LifecyclePhasePending      LifecyclePhase = "Pending"
+	LifecyclePhaseInstalling   LifecyclePhase = "Installing"
+	LifecyclePhaseInstalled    LifecyclePhase = "Installed"
+	LifecyclePhaseUpgrading    LifecyclePhase = "Upgrading"
+	LifecyclePhaseRollingBack  LifecyclePhase = "RollingBack"
+	LifecyclePhaseUninstalling LifecyclePhase = "Uninstalling"
+	LifecyclePhaseRemoved      LifecyclePhase = "Removed"
+	LifecyclePhaseFailed       LifecyclePhase = "Failed"
+)
+
+// LifecycleComponentType is the status-side component scope (node vs cluster).
+// Distinct from executor install types (inline / yaml / helm).
+// +kubebuilder:validation:Enum=node;cluster
+type LifecycleComponentType string
+
+const (
+	LifecycleComponentTypeNode    LifecycleComponentType = "node"
+	LifecycleComponentTypeCluster LifecycleComponentType = "cluster"
+)
+
+// ComponentLifecycleStatus records one component's lifecycle on BKECluster status.
+type ComponentLifecycleStatus struct {
+	// Name is the component name; usually matches the map key in ClusterComponentStatuses.
+	// +required
+	Name string `json:"name"`
+
+	// NodeIP is set for node-scoped components; empty for cluster-scoped components.
+	// +optional
+	NodeIP string `json:"nodeIP,omitempty"`
+
+	// ComponentType is the status-side scope: node or cluster.
+	// +required
+	ComponentType LifecycleComponentType `json:"componentType"`
+
+	// Phase is the current lifecycle phase.
+	// +required
+	Phase LifecyclePhase `json:"phase"`
+
+	// CurrentVersion is the last successfully installed/aligned version.
+	// +optional
+	CurrentVersion string `json:"currentVersion,omitempty"`
+
+	// TargetVersion is the desired version for the in-progress upgrade.
+	// +optional
+	TargetVersion string `json:"targetVersion,omitempty"`
+
+	// LastTransitionTime is updated when Phase changes.
+	// +optional
+	LastTransitionTime *metav1.Time `json:"lastTransitionTime,omitempty"`
+
+	// Message holds failure details or supplemental notes.
+	// +optional
+	Message string `json:"message,omitempty"`
+}
+
 // BKEClusterStatus defines the observed state of BKECluster
 type BKEClusterStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
@@ -300,6 +360,10 @@ type BKEClusterStatus struct {
 	// DeclarativeUpgrade holds progress for declarative DAG upgrades.
 	// +optional
 	DeclarativeUpgrade *DeclarativeUpgradeStatus `json:"declarativeUpgrade,omitempty"`
+
+	// ClusterComponentStatuses records lifecycle status per component name (DAG/Bundle key).
+	// +optional
+	ClusterComponentStatuses map[string]ComponentLifecycleStatus `json:"clusterComponentStatuses,omitempty"`
 }
 
 // +kubebuilder:object:generate=true

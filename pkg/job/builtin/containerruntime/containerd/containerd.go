@@ -110,7 +110,7 @@ func (cp *ContainerdPlugin) createHostsTOML(runtimeParam map[string]string) erro
 	for _, registry := range registries {
 		registryDir := filepath.Join(containerdCertsDir, registry)
 		if err := os.MkdirAll(registryDir, utils.RwxRxRx); err != nil {
-			return fmt.Errorf("create %s dir failed: %v", registry, err)
+			return fmt.Errorf("create %s dir failed: %w", registry, err)
 		}
 
 		data := struct {
@@ -127,7 +127,7 @@ func (cp *ContainerdPlugin) createHostsTOML(runtimeParam map[string]string) erro
 		hostsPath := filepath.Join(registryDir, "hosts.toml")
 		f, err := os.OpenFile(hostsPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, utils.RwRR)
 		if err != nil {
-			return fmt.Errorf("create %s hosts.toml failed: %v", registry, err)
+			return fmt.Errorf("create %s hosts.toml failed: %w", registry, err)
 		}
 
 		if err := executeTemplateWithFile(hostsTpl, "baseHosts", data, f); err != nil {
@@ -141,7 +141,7 @@ func (cp *ContainerdPlugin) createHostsTOML(runtimeParam map[string]string) erro
 		}
 
 		if err = f.Close(); err != nil {
-			return fmt.Errorf("close hosts.toml fail: %v", err)
+			return fmt.Errorf("close hosts.toml fail: %w", err)
 		}
 		log.Infof("Created base hosts.toml: %s", hostsPath)
 	}
@@ -165,7 +165,7 @@ func createTempScript(content string) (string, error) {
 	}
 
 	if _, err = tmpFile.WriteString(content); err != nil {
-		return "", fmt.Errorf("write content filed: %v", err)
+		return "", fmt.Errorf("write content filed: %w", err)
 	}
 
 	return tmpFile.Name(), nil
@@ -179,7 +179,7 @@ func (cp *ContainerdPlugin) executeScript(script *bkev1beta1.ScriptConfig) error
 		scriptContent = script.Content
 		tmpFile, err := createTempScript(scriptContent)
 		if err != nil {
-			return fmt.Errorf("failed to create temporary script: %v", err)
+			return fmt.Errorf("failed to create temporary script: %w", err)
 		}
 		defer os.Remove(tmpFile)
 		scriptPath = tmpFile
@@ -193,7 +193,7 @@ func (cp *ContainerdPlugin) executeScript(script *bkev1beta1.ScriptConfig) error
 	}
 
 	if err := os.Chmod(scriptPath, utils.RwxRxRx); err != nil {
-		return fmt.Errorf("failed to set script permissions: %v", err)
+		return fmt.Errorf("failed to set script permissions: %w", err)
 	}
 
 	out, err := cp.exec.ExecuteCommandWithCombinedOutput(script.Interpreter, append([]string{scriptPath}, script.Args...)...)
@@ -249,30 +249,30 @@ func generateHostsToml(registry *bkev1beta1.RegistryConfig) error {
 func (cp *ContainerdPlugin) generateContainerdCfg(runtimeParam map[string]string) error {
 	cc, err := plugin.GetContainerdConfig(runtimeParam["containerdConfig"])
 	if err != nil {
-		return fmt.Errorf("get containerd config: %v", err)
+		return fmt.Errorf("get containerd config: %w", err)
 	}
 	if cc.Script != nil {
 		// script shell script execution configuration
 		if err = cp.executeScript(cc.Script); err != nil {
-			return fmt.Errorf("execute script failed: %v", err)
+			return fmt.Errorf("execute script failed: %w", err)
 		}
 	}
 	if cc.Service != nil {
 		// 处理containerd.service
 		if err = generateOverrideService(cc.Service); err != nil {
-			return fmt.Errorf("generate containerd override service failed: %v", err)
+			return fmt.Errorf("generate containerd override service failed: %w", err)
 		}
 	}
 	if cc.Main != nil {
 		// 处理config.toml
 		if err = renderConfigToml(cc.Main, runtimeParam); err != nil {
-			return fmt.Errorf("render containerd config toml failed: %v", err)
+			return fmt.Errorf("render containerd config toml failed: %w", err)
 		}
 	}
 	if cc.Registry != nil {
 		// 处理hosts.toml
 		if err = generateHostsToml(cc.Registry); err != nil {
-			return fmt.Errorf("generate containerd hosts toml failed: %v", err)
+			return fmt.Errorf("generate containerd hosts toml failed: %w", err)
 		}
 	}
 	return nil
@@ -288,6 +288,7 @@ func (cp *ContainerdPlugin) Param() map[string]plugin.PluginParam {
 		"directory":          {Key: "directory", Value: "", Required: false, Default: defaultInstallDirectory, Description: "Specify the unzip directory"},
 		"insecureRegistries": {Key: "insecureRegistries", Value: "", Required: false, Default: "", Description: "Specify the insecure registries, split by ','"},
 		"containerdConfig":   {Key: "containerdConfig", Value: "NameSpace:Name", Required: false, Default: "", Description: "Specify the containerd config, example ns:name"},
+		"immutableOS":        {Key: "immutableOS", Value: "", Required: false, Default: "false", Description: "immutable OS mode, skip containerd download and extract"},
 	}
 }
 
@@ -303,26 +304,27 @@ func (cp *ContainerdPlugin) Execute(commands []string) ([]string, error) {
 		runtimeParam["directory"] = runtimeParam["directory"] + "/"
 	}
 
-	tarFile := path.Join(os.TempDir(), fmt.Sprintf("containerd-%s.tar.gz", econd.GenerateID()[:eight]))
-	defer os.Remove(tarFile)
-	err = downloadTar(runtimeParam["url"], tarFile)
-	if err != nil {
-		return result, err
+	// 不可变 OS：containerd 镜像内置，跳过下载解压
+	if runtimeParam["immutableOS"] != "true" {
+		tarFile := path.Join(os.TempDir(), fmt.Sprintf("containerd-%s.tar.gz", econd.GenerateID()[:eight]))
+		defer os.Remove(tarFile)
+		if err = downloadTar(runtimeParam["url"], tarFile); err != nil {
+			return result, err
+		}
+		if err = unTar(tarFile, runtimeParam["directory"]); err != nil {
+			return result, err
+		}
+	} else {
+		log.Info("skip containerd download in immutable OS mode")
 	}
-	err = unTar(tarFile, runtimeParam["directory"])
-	if err != nil {
-		return result, err
-	}
+
 	runtimeParam["platform"] = cp.getPlatform()
 	if err = cp.configureContainerd(runtimeParam); err != nil {
 		return result, err
 	}
-
-	// enable and start containerd
 	if res, err := cp.startContainerdService(); err != nil {
 		return res, err
 	}
-
 	if err = econd.WaitContainerdReady(); err != nil {
 		return nil, err
 	}
@@ -338,8 +340,7 @@ func (cp *ContainerdPlugin) configureContainerd(runtimeParam map[string]string) 
 	}
 	// 新逻辑，从cr中获取containerd获取数据配置containerd
 	if err := cp.generateContainerdCfg(runtimeParam); err != nil {
-		log.Errorf("Failed to generate containerd config from cr: %v", err)
-		return err
+		return fmt.Errorf("Failed to generate containerd config from cr: %w", err)
 	}
 	return nil
 }
@@ -370,23 +371,26 @@ func (cp *ContainerdPlugin) configureContainerdLegacy(runtimeParam map[string]st
 		return err
 	}
 	if err := cp.createHostsTOML(runtimeParam); err != nil {
-		log.Errorf("Failed to create hosts.toml: %v", err)
-		return err
+		return fmt.Errorf("Failed to create hosts.toml: %w", err)
 	}
 	return nil
 }
 
 func (cp *ContainerdPlugin) startContainerdService() ([]string, error) {
-	out, err := cp.exec.ExecuteCommandWithCombinedOutput("sh", "-c", "systemctl enable containerd")
+	out, err := cp.exec.ExecuteCommandWithCombinedOutput("sh", "-c", "systemctl daemon-reload")
+	if err != nil {
+		log.Warnf("daemon-reload failed, err: %v, out: %s", err, out)
+	}
+
+	out, err = cp.exec.ExecuteCommandWithCombinedOutput("sh", "-c", "systemctl enable containerd")
 	if err != nil {
 		log.Warnf("enable containerd failed, err: %v, out: %s", err, out)
 	}
 
 	out, err = cp.exec.ExecuteCommandWithCombinedOutput("sh", "-c", "systemctl restart containerd")
 	if err != nil {
-		errorMsg := fmt.Sprintf("start docker failed, err: %v, out: %s", err, out)
-		log.Error(errorMsg)
-		return []string{errorMsg}, fmt.Errorf("start docker failed, err: %v, out: %s", err, out)
+		errorMsg := fmt.Sprintf("start containerd failed, err: %v, out: %s", err, out)
+		return []string{errorMsg}, fmt.Errorf("start containerd failed, err: %w, out: %s", err, out)
 	}
 
 	return []string{}, nil
@@ -506,7 +510,16 @@ func ensureRunTime() bool {
 	return true
 }
 
+// ensureContainerdConfigDir 确保 /etc/containerd 目录存在，仅记录错误不中断
+func ensureContainerdConfigDir(dir string) {
+	if err := os.MkdirAll(dir, utils.RwxRxRx); err != nil {
+		log.Warnf("create containerd config dir %s failed: %v", dir, err)
+	}
+}
+
 func writeConfigToDisk(runtimeParam map[string]string) error {
+	// 确保 /etc/containerd 目录存在（immutable OS 模式跳过下载解压时目录可能不存在）
+	ensureContainerdConfigDir(filepath.Join(runtimeParam["directory"], "etc/containerd"))
 	// Render configuration file
 	f, err := os.OpenFile(fmt.Sprintf("%s%s", runtimeParam["directory"], "etc/containerd/config.toml"), os.O_WRONLY|os.O_CREATE, 0644)
 	if err != nil {

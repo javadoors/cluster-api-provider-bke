@@ -37,6 +37,7 @@ type BootScope struct {
 	HostIP           string
 	CurrentNode      bkenode.Node
 	Extra            map[string]interface{}
+	IsImmutableOS    bool // worker 节点是否使用不可变 OS（KubeOS）
 }
 
 // HasOpenFuyaoAddon is used to check if the cluster config has deployed openfuyao system controller

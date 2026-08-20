@@ -21,6 +21,7 @@ import (
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/coreos/go-semver/semver"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/cluster-api/util/version"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -554,6 +555,36 @@ func TestGetNeedUpgradeNodesWithBKENodes(t *testing.T) {
 	assert.Equal(t, 0, len(result))
 }
 
+func TestGetNeedUpgradeContainerdNodesWithBKENodes(t *testing.T) {
+	cluster := &bkev1beta1.BKECluster{
+		Spec: confv1beta1.BKEClusterSpec{
+			ClusterConfig: &confv1beta1.BKEConfig{
+				Cluster: confv1beta1.Cluster{
+					OpenFuyaoVersion: "vfit-cur",
+					ContainerdVersion: "v2.1.2",
+				},
+			},
+		},
+		Status: confv1beta1.BKEClusterStatus{
+			OpenFuyaoVersion: "vfit-cur",
+			ContainerdVersion: "v2.1.1",
+		},
+	}
+	nodes := bkev1beta1.BKENodes{
+		{
+			Spec: confv1beta1.BKENodeSpec{IP: "192.168.1.1"},
+			Status: confv1beta1.BKENodeStatus{StateCode: bkev1beta1.NodeAgentReadyFlag},
+		},
+		{
+			Spec: confv1beta1.BKENodeSpec{IP: "192.168.1.2"},
+			Status: confv1beta1.BKENodeStatus{StateCode: bkev1beta1.NodeAgentReadyFlag | bkev1beta1.NodeFailedFlag},
+		},
+	}
+	result := GetNeedUpgradeContainerdNodesWithBKENodes(cluster, nodes)
+	require.Len(t, result, 1)
+	assert.Equal(t, "192.168.1.1", result[0].IP)
+}
+
 func TestGetNeedUpgradeK8sNodesWithBKENodes(t *testing.T) {
 	cluster := &bkev1beta1.BKECluster{
 		Spec: confv1beta1.BKEClusterSpec{
@@ -771,4 +802,18 @@ func TestGetNodeStateFlag(t *testing.T) {
 	assert.True(t, result)
 	result = GetNodeStateFlag(node, "192.168.1.2", 4)
 	assert.False(t, result)
+}
+func TestGetRemoteHealthCheckConfigCMNilClientset(t *testing.T) {
+	config, err := GetRemoteHealthCheckConfigCM(context.Background(), nil)
+
+	assert.Nil(t, config)
+	assert.ErrorContains(t, err, "remote kubernetes clientset is nil")
+}
+
+func TestMigrateHealthCheckConfigCMNilClientset(t *testing.T) {
+	c := fake.NewClientBuilder().Build()
+
+	err := MigrateHealthCheckConfigCM(context.Background(), c, nil)
+
+	assert.ErrorContains(t, err, "remote kubernetes clientset is nil")
 }

@@ -17,7 +17,6 @@ import (
 	"strings"
 
 	"github.com/blang/semver/v4"
-	"github.com/pkg/errors"
 
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
 	bkeinit "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/initialize"
@@ -207,7 +206,7 @@ func cleanKubeletContainer(extra ExtraClean, containerRuntime string) {
 			}
 		}
 	default:
-		log.Error("unsupported container runtime, skip clean kubelet container")
+		log.Warnf("unsupported container runtime, skip clean kubelet container")
 	}
 	if err != nil {
 		log.Warnf("clean kubelet container failed: %s , err:%s", out, err)
@@ -287,11 +286,11 @@ func ContainerdCfgClean(cfg *bkev1beta1.BKEConfig, extra ExtraClean) error {
 
 	out, err := extra.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", "systemctl stop containerd")
 	if err != nil {
-		return errors.Errorf("stop containerd failed: %s, %v", out, err)
+		return fmt.Errorf("stop containerd failed: %s, %w", out, err)
 	}
 	out, err = extra.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", "systemctl disable containerd")
 	if err != nil {
-		return errors.Errorf("disable containerd failed: %s, %v", out, err)
+		return fmt.Errorf("disable containerd failed: %s, %w", out, err)
 	}
 
 	extra.AddFileToClean("/usr/bin/containerd")
@@ -320,10 +319,10 @@ func ContainerClean(cfg *bkev1beta1.BKEConfig, extra ExtraClean) error {
 	case runtime.ContainerRuntimeContainerd:
 		cleanContainerdContainers(extra)
 	case "":
-		log.Error("detect container runtime failed, skip remove containers")
+		log.Warnf("detect container runtime failed, skip remove containers")
 		return nil
 	default:
-		log.Error("unsupported container runtime, skip remove containers")
+		log.Warnf("unsupported container runtime %q, skip remove containers", containerRuntime)
 		return nil
 	}
 	return extra.CleanAll()
@@ -385,7 +384,7 @@ func ContainerRuntimeClean(cfg *bkev1beta1.BKEConfig, extra ExtraClean) error {
 		extra.AddDirToClean("/etc/cni")
 		extra.AddDirToClean("/opt/cni")
 	default:
-		log.Errorf("unsupported container runtime: %s, skip clean", containerRuntime)
+		log.Warnf("unsupported container runtime %q, skip clean", containerRuntime)
 	}
 	return extra.CleanAll()
 }
@@ -400,7 +399,7 @@ func cleanDockerRuntime(cfg *bkev1beta1.BKEConfig, extra ExtraClean) error {
 	}
 	out, err := extra.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", dockerListAllContainers)
 	if err != nil {
-		return errors.Errorf("list all containers failed: %s, %v", out, err)
+		return fmt.Errorf("list all containers failed: %s, %w", out, err)
 	}
 	for _, pod := range strings.Fields(out) {
 		if out, err = extra.ExecuteCommandWithOutput("/bin/sh", "-c", dockerForceRemovePod+" "+pod); err != nil {
@@ -408,17 +407,17 @@ func cleanDockerRuntime(cfg *bkev1beta1.BKEConfig, extra ExtraClean) error {
 		}
 	}
 	if out, err = extra.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", dockerCleanAll); err != nil {
-		return errors.Errorf("clean docker failed: %s, %v", out, err)
+		return fmt.Errorf("clean docker failed: %s, %w", out, err)
 	}
 	output, err := extra.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", "systemctl stop docker")
 	if err != nil {
-		return errors.Errorf("stop docker failed: %s, %v", output, err)
+		return fmt.Errorf("stop docker failed: %s, %w", output, err)
 	}
 	if output, err = extra.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", "systemctl disable docker"); err != nil {
-		return errors.Errorf("disable docker failed: %s, %v", output, err)
+		return fmt.Errorf("disable docker failed: %s, %w", output, err)
 	}
 	if err := httprepo.RepoRemove("docker*", "containerd.io"); err != nil {
-		log.Errorf("remove docker failed: %v", err)
+		log.Warnf("remove docker packages failed: %v", err)
 	}
 	extra.AddDirToClean(dataRoot)
 	extra.AddDirToClean("/etc/docker")
@@ -429,10 +428,10 @@ func cleanDockerRuntime(cfg *bkev1beta1.BKEConfig, extra ExtraClean) error {
 	if v.GTE(semver.MustParse("1.24.0")) {
 		output, err = extra.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", "systemctl stop cri-dockerd && systemctl stop cri-dockerd.socket")
 		if err != nil {
-			return errors.Errorf("stop cri-dockerd failed: %s, %v", output, err)
+			return fmt.Errorf("stop cri-dockerd failed: %s, %w", output, err)
 		}
 		if output, err = extra.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", "systemctl disable cri-dockerd && systemctl disable cri-dockerd.socket"); err != nil {
-			return errors.Errorf("disable cri-dockerd failed: %s, %v", output, err)
+			return fmt.Errorf("disable cri-dockerd failed: %s, %w", output, err)
 		}
 		extra.AddFileToClean("/usr/bin/cri-dockerd")
 		extra.AddFileToClean("/etc/systemd/system/cri-dockerd.service")
@@ -465,10 +464,10 @@ func cleanContainerdRuntime(cfg *bkev1beta1.BKEConfig, extra ExtraClean) error {
 	}
 	out, err := extra.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", "systemctl stop containerd")
 	if err != nil {
-		return errors.Errorf("stop containerd failed: %s, %v", out, err)
+		return fmt.Errorf("stop containerd failed: %s, %w", out, err)
 	}
 	if out, err = extra.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", "systemctl disable containerd"); err != nil {
-		return errors.Errorf("disable containerd failed: %s, %v", out, err)
+		return fmt.Errorf("disable containerd failed: %s, %w", out, err)
 	}
 	extra.AddFileToClean("/usr/bin/containerd")
 	extra.AddFileToClean("/usr/bin/containerd-shim")
@@ -565,13 +564,14 @@ func ExtraToClean(cfg *bkev1beta1.BKEConfig, extra ExtraClean) error {
 
 // cleanNetworkInterfaces removes network interfaces used by CNI
 func cleanNetworkInterfaces(extra ExtraClean) {
-	needRemoveInters := []string{"vxlan_sys_4789", "gre_sys", "genev_sys_6081", "erspan_sys", "vxlan.calico"}
+	needRemoveInters := []string{"vxlan_sys_4789", "gre_sys", "genev_sys_6081", "erspan_sys", "vxlan.calico", "tunl0"}
 	out, err := extra.Executor.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", `ip link | awk '/state/ {gsub(/:/, ""); print $2}'`)
 	if err != nil {
 		return
 	}
 	for _, inter := range strings.Split(out, "\n") {
-		if !utils.ContainsString(needRemoveInters, inter) {
+		inter = strings.Split(inter, "@")[0]
+		if inter == "" || (!utils.ContainsString(needRemoveInters, inter) && !strings.HasPrefix(inter, "cali")) {
 			continue
 		}
 		log.Infof("down interface: %s", inter)

@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -14,6 +14,7 @@ package phases
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -162,12 +163,11 @@ func (e *EnsureMasterJoin) reconcileMasterJoin() error {
 // checkPreconditions 检查前置条件
 func (e *EnsureMasterJoin) checkPreconditions(params MasterJoinParams) error {
 	if !params.BKECluster.Status.AgentStatus.Ready() {
-		params.Log.Error(constant.MasterJoinFailedReason, "Agent is not ready")
-		return errors.New("agent is not ready")
+		return fmt.Errorf("agent is not ready")
 	}
 
 	if conditions.IsFalse(e.Ctx.Cluster, clusterv1.ControlPlaneInitializedCondition) {
-		params.Log.Warn(constant.MasterJoinFailedReason, "master is not initialized, skip join master nodes process")
+		params.Log.Info(constant.MasterJoinFailedReason, "master is not initialized, skip join master nodes process")
 		return nil
 	}
 	return nil
@@ -192,7 +192,7 @@ func (e *EnsureMasterJoin) getJoinableNodes(params MasterJoinParams) (int, []str
 	for _, node := range nodes {
 		// 正常应该是找不到关联的machine的
 		if _, err := phaseutil.NodeToMachine(params.Ctx, params.Client, params.BKECluster, node); err == nil {
-			params.Log.Warn(constant.MasterJoinedReason, "Node already exists, skip join node. node: %v", node.Hostname)
+			params.Log.Info(constant.MasterJoinedReason, "Node already exists, skip join node. node: %v", node.Hostname)
 			e.Ctx.NodeFetcher().MarkNodeStateFlagForCluster(params.Ctx, params.BKECluster, node.IP, bkev1beta1.NodeBootFlag)
 		} else {
 			nodesInfos = append(nodesInfos, phaseutil.NodeInfo(node))
@@ -207,9 +207,8 @@ func (e *EnsureMasterJoin) getJoinableNodes(params MasterJoinParams) (int, []str
 func (e *EnsureMasterJoin) scaleAndJoinMasterNodes(params MasterJoinScaleParams) error {
 	scope, err := phaseutil.GetClusterAPIAssociateObjs(params.Ctx, params.Client, e.Ctx.Cluster)
 	if err != nil || scope.KubeadmControlPlane == nil {
-		params.Log.Error(constant.MasterJoinFailedReason, "Get cluster-api associate objs failed. err: %v", err)
 		// cluster api object error, no need to continue
-		return err
+		return fmt.Errorf("Get cluster-api associate objs failed: %w", err)
 	}
 
 	specCopy := scope.KubeadmControlPlane.Spec.DeepCopy()
@@ -218,9 +217,11 @@ func (e *EnsureMasterJoin) scaleAndJoinMasterNodes(params MasterJoinScaleParams)
 	defer func() {
 		if err != nil {
 			params.Log.Info(constant.MasterJoinFailedReason, "Scale down KubeadmControlPlane replicas to %d.", currentReplicas)
-			scope.KubeadmControlPlane.Spec.Replicas = currentReplicas
+			if rollbackErr := phaseutil.UpdateKubeadmControlPlaneReplicas(params.Ctx, params.Client, scope.KubeadmControlPlane, *currentReplicas); rollbackErr != nil {
+				params.Log.Warn(constant.MasterJoinFailedReason, "Back up KubeadmControlPlane replicas failed. err: %v", rollbackErr)
+			}
 			if err = phaseutil.ResumeClusterAPIObj(params.Ctx, params.Client, scope.KubeadmControlPlane); err != nil {
-				params.Log.Error(constant.MasterJoinFailedReason, "Back up KubeadmControlPlane replicas failed. err: %v", err)
+				params.Log.Warn(constant.MasterJoinFailedReason, "Resume KubeadmControlPlane failed. err: %v", err)
 			}
 		}
 	}()
@@ -234,19 +235,18 @@ func (e *EnsureMasterJoin) scaleAndJoinMasterNodes(params MasterJoinScaleParams)
 		exceptReplicas = int32(masterNodes.Length())
 	}
 
-	scope.KubeadmControlPlane.Spec.Replicas = &exceptReplicas
-
 	params.Log.Info(constant.MasterJoiningReason, "Scale up KubeadmControlPlane replicas %d to %d", *currentReplicas, exceptReplicas)
 
+	if err = phaseutil.UpdateKubeadmControlPlaneReplicas(params.Ctx, params.Client, scope.KubeadmControlPlane, exceptReplicas); err != nil {
+		return fmt.Errorf("Scale up KubeadmControlPlane replicas failed: %w", err)
+	}
+
 	if err = phaseutil.ResumeClusterAPIObj(params.Ctx, params.Client, scope.KubeadmControlPlane); err != nil {
-		params.Log.Error(constant.MasterJoinFailedReason, "Scale up KubeadmControlPlane replicas failed. err: %v", err)
-		// cluster api object error, no need to continue
-		return err
+		return fmt.Errorf("Resume KubeadmControlPlane failed: %w", err)
 	}
 
 	if err = e.waitMasterJoin(params.NodesCount); err != nil {
-		params.Log.Error(constant.MasterJoinFailedReason, "Wait worker join failed. err: %v", err)
-		return err
+		return fmt.Errorf("Wait worker join failed: %w", err)
 	}
 
 	return nil

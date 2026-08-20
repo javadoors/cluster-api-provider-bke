@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -64,4 +64,33 @@ func TestHostCustomCmdFunc(t *testing.T) {
 	if len(cmd.Cmds) == 0 {
 		t.Error("expected commands")
 	}
+}
+
+func TestImmutableHostNodeFileCmdFunc(t *testing.T) {
+	host := &bkessh.Host{
+		Address: "192.168.1.1",
+		Extra:   map[string]string{"hostname": "worker-1", "arch": "amd64"},
+	}
+	cmd := ImmutableHostNodeFileCmdFunc(host)
+
+	// 应该有 2 条命令：写 node 文件 + restart bkeagent
+	assert.Len(t, cmd.Cmds, 2)
+	// 第一条命令写 node 文件，包含正确的 hostname
+	assert.Contains(t, cmd.Cmds[0], "worker-1")
+	assert.Contains(t, cmd.Cmds[0], "/etc/openFuyao/bkeagent/node")
+	// 第二条命令重启 bkeagent
+	assert.Contains(t, cmd.Cmds[1], "systemctl restart bkeagent")
+	// 不应上传二进制文件
+	assert.Empty(t, cmd.FileUp)
+}
+
+func TestImmutableHostNodeFileCmdFunc_EmptyHostname(t *testing.T) {
+	host := &bkessh.Host{
+		Address: "192.168.1.1",
+		Extra:   map[string]string{"hostname": "", "arch": "amd64"},
+	}
+	cmd := ImmutableHostNodeFileCmdFunc(host)
+	// 即使 hostname 为空，命令结构也应正确
+	assert.Len(t, cmd.Cmds, 2)
+	assert.Empty(t, cmd.FileUp)
 }

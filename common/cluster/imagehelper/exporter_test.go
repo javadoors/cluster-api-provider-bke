@@ -3,7 +3,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -18,11 +18,12 @@ import (
 	"testing"
 
 	common "gopkg.openfuyao.cn/cluster-api-provider-bke/common"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/initialize/versions"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/common/utils"
 )
 
 var mString = map[string]string{
-	"etcd":                    "cr.openfuyao.cn/openfuyao/kubernetes/etcd:3.5.21-of.1",
+	"etcd":                    "cr.openfuyao.cn/openfuyao/kubernetes/etcd:" + versions.EtcdImageTag(),
 	"kube-apiserver":          "cr.openfuyao.cn/openfuyao/kubernetes/kube-apiserver:1.29.1-of.1",
 	"kube-controller-manager": "cr.openfuyao.cn/openfuyao/kubernetes/kube-controller-manager:1.29.1-of.1",
 	"kube-scheduler":          "cr.openfuyao.cn/openfuyao/kubernetes/kube-scheduler:1.29.1-of.1",
@@ -78,7 +79,7 @@ func TestImageExporter_ExportImageList(t *testing.T) {
 				"cr.openfuyao.cn/openfuyao/kubernetes/kube-apiserver:1.29.1-of.1",
 				"cr.openfuyao.cn/openfuyao/kubernetes/kube-controller-manager:1.29.1-of.1",
 				"cr.openfuyao.cn/openfuyao/kubernetes/kube-scheduler:1.29.1-of.1",
-				"cr.openfuyao.cn/openfuyao/kubernetes/etcd:3.5.21-of.1",
+				"cr.openfuyao.cn/openfuyao/kubernetes/etcd:" + versions.EtcdImageTag(),
 			},
 			wantErr: false,
 		},

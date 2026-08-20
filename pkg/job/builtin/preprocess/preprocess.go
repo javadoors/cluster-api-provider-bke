@@ -71,7 +71,6 @@ func (p *PreprocessPlugin) Execute(commands []string) ([]string, error) {
 	// 1. 解析命令参数（nodeIP可选）
 	paramMap, err := plugin.ParseCommands(p, commands)
 	if err != nil {
-		log.Errorf("Preprocess: parse commands failed: %v", err)
 		return nil, err
 	}
 
@@ -81,7 +80,6 @@ func (p *PreprocessPlugin) Execute(commands []string) ([]string, error) {
 		log.Infof("Preprocess: nodeIP not provided, auto-detecting")
 		nodeIP, err = scriptutil.GetCurrentNodeIP()
 		if err != nil {
-			log.Errorf("Preprocess: get current node IP failed: %v", err)
 			return nil, errors.Wrapf(err, "failed to get current node IP")
 		}
 	}
@@ -90,7 +88,6 @@ func (p *PreprocessPlugin) Execute(commands []string) ([]string, error) {
 	// 3. 读取配置（根据优先级：全局 > 批次 > 节点，三种配置互斥，不合并）
 	config, err := p.loadConfig(nodeIP)
 	if err != nil {
-		log.Errorf("Preprocess: load config failed, nodeIP=%s, err=%v", nodeIP, err)
 		return nil, errors.Wrapf(err, "failed to load config for node: %s", nodeIP)
 	}
 	log.Infof("Preprocess: loaded config, scripts=%d, nodeIP=%s", len(config.Scripts), nodeIP)
@@ -98,7 +95,6 @@ func (p *PreprocessPlugin) Execute(commands []string) ([]string, error) {
 	// 4. 从user-system命名空间获取全量脚本列表
 	allScripts, err := p.getAllScripts()
 	if err != nil {
-		log.Errorf("Preprocess: get all scripts failed: %v", err)
 		return nil, errors.Wrapf(err, "failed to get all scripts")
 	}
 	log.Infof("Preprocess: total scripts in user-system=%d", len(allScripts))
@@ -122,7 +118,6 @@ func (p *PreprocessPlugin) Execute(commands []string) ([]string, error) {
 		// 执行脚本
 		result, err := p.executeScript(scriptConfig, nodeIP)
 		if err != nil {
-			log.Errorf("Preprocess: execute script failed, script=%s, err=%v", scriptConfig.ScriptName, err)
 			return nil, errors.Wrapf(err, "failed to execute script: %s", scriptConfig.ScriptName)
 		}
 		results = append(results, result)

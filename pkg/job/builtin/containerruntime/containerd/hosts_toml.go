@@ -94,7 +94,7 @@ func (g *HostsTOMLGenerator) GenerateHostsTOML(registryName string, config *bkev
 
 func (g *HostsTOMLGenerator) GenerateMultipleHostsTOML(registryConfigs map[string]bkev1beta1.RegistryHostConfig) error {
 	if registryConfigs == nil {
-		log.Errorf("registry config is nil, no need to generate containerd config")
+		log.Debugf("registry config is nil, skip generate containerd hosts.toml")
 		return nil
 	}
 

@@ -2,6 +2,8 @@ package capbke
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -158,6 +160,15 @@ func TestBKENode_ValidateDelete(t *testing.T) {
 }
 
 func TestEncryptPasswordIfNeeded(t *testing.T) {
+	// Set a valid 32-byte AES key so AesEncrypt does not refuse with legacy key.
+	// sync.Once in security.loadKey has not been triggered yet in this test
+	// binary, so the env var will be picked up on first call.
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		t.Fatalf("failed to generate test key: %v", err)
+	}
+	t.Setenv("BKE_PASSWORD_ENCRYPTION_KEY", base64.StdEncoding.EncodeToString(key))
+
 	t.Run("plain password", func(t *testing.T) {
 		result, err := encryptPasswordIfNeeded("plaintext")
 		assert.NoError(t, err)

@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -26,6 +26,7 @@ import (
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/constant"
 	labelhelper "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/label"
@@ -130,9 +131,16 @@ func createOrUpdateConfigMap(c client.Client, cm *corev1.ConfigMap) error {
 		log.Infof("script file exist, update env init script file %q to configmap %q",
 			cm.Name, utils.ClientObjNS(cm))
 
-		if err = c.Update(context.Background(), cm); err != nil {
-			return err
-		}
+		key := client.ObjectKey{Name: cm.Name, Namespace: cm.Namespace}
+		return phaseutil.RetryOnConflict(func() error {
+			latest := &corev1.ConfigMap{}
+			if err := c.Get(context.Background(), key, latest); err != nil {
+				return err
+			}
+			latest.Data = cm.Data
+			latest.Labels = cm.Labels
+			return c.Update(context.Background(), latest)
+		})
 	}
 
 	return nil

@@ -2,7 +2,7 @@
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -137,6 +137,12 @@ func (r *ClusterVersionReconciler) reconcileUpgrade(
 		if err := r.clearUpgradeReady(ctx, bc); err != nil {
 			return ctrl.Result{}, err
 		}
+		return ctrl.Result{}, nil
+	}
+
+	if cv.Status.Phase == cvv1beta1.ClusterVersionPhaseFailed {
+		logger.Info("upgrade blocked: ClusterVersion in Failed phase, waiting for spec change or manual retry",
+			"current", current, "desired", desired)
 		return ctrl.Result{}, nil
 	}
 

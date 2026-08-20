@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -19,18 +19,20 @@ import (
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
-
 	agentv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkeagent/v1beta1"
 	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/mergecluster"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/annotation"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
+	controlv1beta1 "sigs.k8s.io/cluster-api/controlplane/kubeadm/api/v1beta1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
+	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 func TestEnsurePaused_NeedExecute(t *testing.T) {
@@ -604,4 +606,445 @@ func TestEnsurePaused_ReconcilePause_CommandsError(t *testing.T) {
 func TestEnsurePaused_ReconcilePause_ClusterAPIError(t *testing.T) {
 	// Skipping - requires mocking private methods
 	t.Skip("Skipping - requires mocking private methods")
+}
+
+func newPausedCov(t *testing.T, bkeCluster *bkev1beta1.BKECluster, objs ...client.Object) *EnsurePaused {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	require.NoError(t, bkev1beta1.AddToScheme(scheme))
+	require.NoError(t, agentv1beta1.AddToScheme(scheme))
+	require.NoError(t, clusterv1.AddToScheme(scheme))
+	builder := ctrlfake.NewClientBuilder().WithScheme(scheme)
+	if bkeCluster != nil {
+		builder = builder.WithObjects(bkeCluster)
+	}
+	for _, o := range objs {
+		builder = builder.WithObjects(o)
+	}
+	c := builder.Build()
+	ctx := &phaseframe.PhaseContext{
+		Context:    context.Background(),
+		BKECluster: bkeCluster,
+		Client:     c,
+		Scheme:     scheme,
+		Log:        bkev1beta1.NewBKELogger(nil, &fakeRecorder{}, bkeCluster),
+		Cluster:    &clusterv1.Cluster{ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"}},
+	}
+	return &EnsurePaused{BasePhase: phaseframe.BasePhase{Ctx: ctx}}
+}
+
+// ---- Execute (0% -> cover via reconcilePause stub) ----
+
+func TestPausedExecute(t *testing.T) {
+	t.Run("success", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newPausedCov(t, &bkev1beta1.BKECluster{ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "default"}})
+		patches.ApplyPrivateMethod(e, "reconcilePause", func(_ *EnsurePaused) error { return nil })
+		_, err := e.Execute()
+		require.NoError(t, err)
+	})
+
+	t.Run("reconcilePause error propagates", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newPausedCov(t, &bkev1beta1.BKECluster{ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "default"}})
+		patches.ApplyPrivateMethod(e, "reconcilePause", func(_ *EnsurePaused) error { return assertErr("pause failed") })
+		_, err := e.Execute()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "pause failed")
+	})
+}
+
+// ---- reconcilePause (62.5% -> cover success + commands/clusterAPI error) ----
+
+func TestPausedReconcilePause(t *testing.T) {
+	t.Run("all success", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newPausedCov(t, &bkev1beta1.BKECluster{ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "default"}})
+		patches.ApplyFunc(mergecluster.SyncStatusUntilComplete, func(client.Client, *bkev1beta1.BKECluster, ...mergecluster.PatchFunc) error { return nil })
+		patches.ApplyPrivateMethod(e, "pauseOrResumeCommands", func(_ *EnsurePaused, _ PauseOperationParams) error { return nil })
+		patches.ApplyPrivateMethod(e, "pauseOrResumeClusterAPIObjs", func(_ *EnsurePaused, _ PauseOperationParams) error { return nil })
+		require.NoError(t, e.reconcilePause())
+	})
+
+	t.Run("commands error propagates", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newPausedCov(t, &bkev1beta1.BKECluster{ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "default"}})
+		patches.ApplyFunc(mergecluster.SyncStatusUntilComplete, func(client.Client, *bkev1beta1.BKECluster, ...mergecluster.PatchFunc) error { return nil })
+		patches.ApplyPrivateMethod(e, "pauseOrResumeCommands", func(_ *EnsurePaused, _ PauseOperationParams) error { return assertErr("commands failed") })
+		err := e.reconcilePause()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "commands failed")
+	})
+
+	t.Run("clusterAPI error propagates", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := newPausedCov(t, &bkev1beta1.BKECluster{ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "default"}})
+		patches.ApplyFunc(mergecluster.SyncStatusUntilComplete, func(client.Client, *bkev1beta1.BKECluster, ...mergecluster.PatchFunc) error { return nil })
+		patches.ApplyPrivateMethod(e, "pauseOrResumeCommands", func(_ *EnsurePaused, _ PauseOperationParams) error { return nil })
+		patches.ApplyPrivateMethod(e, "pauseOrResumeClusterAPIObjs", func(_ *EnsurePaused, _ PauseOperationParams) error { return assertErr("capi failed") })
+		err := e.reconcilePause()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "capi failed")
+	})
+}
+
+// ---- pauseOrResumeCommands (29.4% -> cover update path) ----
+
+func TestPausedPauseOrResumeCommands(t *testing.T) {
+	t.Run("empty list returns nil", func(t *testing.T) {
+		e := newPausedCov(t, &bkev1beta1.BKECluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "default"},
+			Spec:       confv1beta1.BKEClusterSpec{Pause: true},
+		})
+		err := e.pauseOrResumeCommands(PauseOperationParams{
+			Ctx:        context.Background(),
+			Client:     e.Ctx.Client,
+			BKECluster: e.Ctx.BKECluster,
+			Log:        e.Ctx.Log,
+		})
+		require.NoError(t, err)
+	})
+
+	t.Run("command needs update succeeds", func(t *testing.T) {
+		bkeCluster := &bkev1beta1.BKECluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "default"},
+			Spec:       confv1beta1.BKEClusterSpec{Pause: true},
+		}
+		cmd := &agentv1beta1.Command{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "cmd1", Namespace: "default",
+				Labels: map[string]string{clusterv1.ClusterNameLabel: "c1"},
+			},
+			Spec: agentv1beta1.CommandSpec{Suspend: false},
+		}
+		e := newPausedCov(t, bkeCluster, cmd)
+		err := e.pauseOrResumeCommands(PauseOperationParams{
+			Ctx:        context.Background(),
+			Client:     e.Ctx.Client,
+			BKECluster: bkeCluster,
+			Log:        e.Ctx.Log,
+		})
+		require.NoError(t, err)
+	})
+
+	t.Run("resume command succeeds", func(t *testing.T) {
+		bkeCluster := &bkev1beta1.BKECluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "default"},
+			Spec:       confv1beta1.BKEClusterSpec{Pause: false},
+		}
+		cmd := &agentv1beta1.Command{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "cmd1", Namespace: "default",
+				Labels: map[string]string{clusterv1.ClusterNameLabel: "c1"},
+			},
+			Spec: agentv1beta1.CommandSpec{Suspend: true},
+		}
+		e := newPausedCov(t, bkeCluster, cmd)
+		err := e.pauseOrResumeCommands(PauseOperationParams{
+			Ctx:        context.Background(),
+			Client:     e.Ctx.Client,
+			BKECluster: bkeCluster,
+			Log:        e.Ctx.Log,
+		})
+		require.NoError(t, err)
+	})
+}
+
+// ---- pauseOrResumeClusterAPIObjs (35% -> cover all branches with correct signatures) ----
+
+func TestPausedPauseOrResumeClusterAPIObjs(t *testing.T) {
+	t.Run("pause true kcp pause success", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		bkeCluster := &bkev1beta1.BKECluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "default"},
+			Spec:       confv1beta1.BKEClusterSpec{Pause: true},
+		}
+		e := newPausedCov(t, bkeCluster)
+		patches.ApplyFunc(phaseutil.GetClusterAPIKubeadmControlPlane, func(_ context.Context, _ client.Client, _ *clusterv1.Cluster) (*controlv1beta1.KubeadmControlPlane, error) {
+			return &controlv1beta1.KubeadmControlPlane{}, nil
+		})
+		patches.ApplyFunc(phaseutil.GetClusterAPIMachineDeployment, func(_ context.Context, _ client.Client, _ *clusterv1.Cluster) (*clusterv1.MachineDeployment, error) {
+			return nil, nil
+		})
+		paused := false
+		patches.ApplyFunc(phaseutil.PauseClusterAPIObj, func(_ context.Context, _ client.Client, _ client.Object, _ ...string) error {
+			paused = true
+			return nil
+		})
+		err := e.pauseOrResumeClusterAPIObjs(PauseOperationParams{
+			Ctx:        context.Background(),
+			Client:     e.Ctx.Client,
+			BKECluster: bkeCluster,
+			Log:        e.Ctx.Log,
+		})
+		require.NoError(t, err)
+		assert.True(t, paused)
+	})
+
+	t.Run("pause true kcp pause error", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		bkeCluster := &bkev1beta1.BKECluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "default"},
+			Spec:       confv1beta1.BKEClusterSpec{Pause: true},
+		}
+		e := newPausedCov(t, bkeCluster)
+		patches.ApplyFunc(phaseutil.GetClusterAPIKubeadmControlPlane, func(_ context.Context, _ client.Client, _ *clusterv1.Cluster) (*controlv1beta1.KubeadmControlPlane, error) {
+			return &controlv1beta1.KubeadmControlPlane{}, nil
+		})
+		patches.ApplyFunc(phaseutil.PauseClusterAPIObj, func(_ context.Context, _ client.Client, _ client.Object, _ ...string) error {
+			return assertErr("pause kcp failed")
+		})
+		err := e.pauseOrResumeClusterAPIObjs(PauseOperationParams{
+			Ctx:        context.Background(),
+			Client:     e.Ctx.Client,
+			BKECluster: bkeCluster,
+			Log:        e.Ctx.Log,
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "pause kcp failed")
+	})
+
+	t.Run("pause true md pause error", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		bkeCluster := &bkev1beta1.BKECluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "default"},
+			Spec:       confv1beta1.BKEClusterSpec{Pause: true},
+		}
+		e := newPausedCov(t, bkeCluster)
+		patches.ApplyFunc(phaseutil.GetClusterAPIKubeadmControlPlane, func(_ context.Context, _ client.Client, _ *clusterv1.Cluster) (*controlv1beta1.KubeadmControlPlane, error) {
+			return nil, nil
+		})
+		patches.ApplyFunc(phaseutil.GetClusterAPIMachineDeployment, func(_ context.Context, _ client.Client, _ *clusterv1.Cluster) (*clusterv1.MachineDeployment, error) {
+			return &clusterv1.MachineDeployment{}, nil
+		})
+		patches.ApplyFunc(phaseutil.PauseClusterAPIObj, func(_ context.Context, _ client.Client, _ client.Object, _ ...string) error {
+			return assertErr("pause md failed")
+		})
+		err := e.pauseOrResumeClusterAPIObjs(PauseOperationParams{
+			Ctx:        context.Background(),
+			Client:     e.Ctx.Client,
+			BKECluster: bkeCluster,
+			Log:        e.Ctx.Log,
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "pause md failed")
+	})
+
+	t.Run("resume false in scale phase returns nil", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		bkeCluster := &bkev1beta1.BKECluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "default"},
+			Spec:       confv1beta1.BKEClusterSpec{Pause: false},
+			Status:     confv1beta1.BKEClusterStatus{Phase: bkev1beta1.Scale},
+		}
+		e := newPausedCov(t, bkeCluster)
+		patches.ApplyFunc(phaseutil.GetClusterAPIKubeadmControlPlane, func(_ context.Context, _ client.Client, _ *clusterv1.Cluster) (*controlv1beta1.KubeadmControlPlane, error) {
+			return &controlv1beta1.KubeadmControlPlane{}, nil
+		})
+		err := e.pauseOrResumeClusterAPIObjs(PauseOperationParams{
+			Ctx:        context.Background(),
+			Client:     e.Ctx.Client,
+			BKECluster: bkeCluster,
+			Log:        e.Ctx.Log,
+		})
+		require.NoError(t, err)
+	})
+
+	t.Run("resume false in upgrade controlplane phase returns nil", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		bkeCluster := &bkev1beta1.BKECluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "default"},
+			Spec:       confv1beta1.BKEClusterSpec{Pause: false},
+			Status:     confv1beta1.BKEClusterStatus{Phase: bkev1beta1.UpgradeControlPlane},
+		}
+		e := newPausedCov(t, bkeCluster)
+		patches.ApplyFunc(phaseutil.GetClusterAPIKubeadmControlPlane, func(_ context.Context, _ client.Client, _ *clusterv1.Cluster) (*controlv1beta1.KubeadmControlPlane, error) {
+			return nil, nil
+		})
+		patches.ApplyFunc(phaseutil.GetClusterAPIMachineDeployment, func(_ context.Context, _ client.Client, _ *clusterv1.Cluster) (*clusterv1.MachineDeployment, error) {
+			return nil, nil
+		})
+		err := e.pauseOrResumeClusterAPIObjs(PauseOperationParams{
+			Ctx:        context.Background(),
+			Client:     e.Ctx.Client,
+			BKECluster: bkeCluster,
+			Log:        e.Ctx.Log,
+		})
+		require.NoError(t, err)
+	})
+
+	t.Run("resume false in upgrade worker phase returns nil", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		bkeCluster := &bkev1beta1.BKECluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "default"},
+			Spec:       confv1beta1.BKEClusterSpec{Pause: false},
+			Status:     confv1beta1.BKEClusterStatus{Phase: bkev1beta1.UpgradeWorker},
+		}
+		e := newPausedCov(t, bkeCluster)
+		patches.ApplyFunc(phaseutil.GetClusterAPIKubeadmControlPlane, func(_ context.Context, _ client.Client, _ *clusterv1.Cluster) (*controlv1beta1.KubeadmControlPlane, error) {
+			return nil, nil
+		})
+		patches.ApplyFunc(phaseutil.GetClusterAPIMachineDeployment, func(_ context.Context, _ client.Client, _ *clusterv1.Cluster) (*clusterv1.MachineDeployment, error) {
+			return nil, nil
+		})
+		err := e.pauseOrResumeClusterAPIObjs(PauseOperationParams{
+			Ctx:        context.Background(),
+			Client:     e.Ctx.Client,
+			BKECluster: bkeCluster,
+			Log:        e.Ctx.Log,
+		})
+		require.NoError(t, err)
+	})
+
+	t.Run("resume normal kcp resume success", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		bkeCluster := &bkev1beta1.BKECluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "default"},
+			Spec:       confv1beta1.BKEClusterSpec{Pause: false},
+		}
+		e := newPausedCov(t, bkeCluster)
+		patches.ApplyFunc(phaseutil.GetClusterAPIKubeadmControlPlane, func(_ context.Context, _ client.Client, _ *clusterv1.Cluster) (*controlv1beta1.KubeadmControlPlane, error) {
+			return &controlv1beta1.KubeadmControlPlane{}, nil
+		})
+		patches.ApplyFunc(phaseutil.GetClusterAPIMachineDeployment, func(_ context.Context, _ client.Client, _ *clusterv1.Cluster) (*clusterv1.MachineDeployment, error) {
+			return nil, nil
+		})
+		resumed := false
+		patches.ApplyFunc(phaseutil.ResumeClusterAPIObj, func(_ context.Context, _ client.Client, _ client.Object, _ ...string) error {
+			resumed = true
+			return nil
+		})
+		err := e.pauseOrResumeClusterAPIObjs(PauseOperationParams{
+			Ctx:        context.Background(),
+			Client:     e.Ctx.Client,
+			BKECluster: bkeCluster,
+			Log:        e.Ctx.Log,
+		})
+		require.NoError(t, err)
+		assert.True(t, resumed)
+	})
+
+	t.Run("resume normal kcp resume error", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		bkeCluster := &bkev1beta1.BKECluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "default"},
+			Spec:       confv1beta1.BKEClusterSpec{Pause: false},
+		}
+		e := newPausedCov(t, bkeCluster)
+		patches.ApplyFunc(phaseutil.GetClusterAPIKubeadmControlPlane, func(_ context.Context, _ client.Client, _ *clusterv1.Cluster) (*controlv1beta1.KubeadmControlPlane, error) {
+			return &controlv1beta1.KubeadmControlPlane{}, nil
+		})
+		patches.ApplyFunc(phaseutil.ResumeClusterAPIObj, func(_ context.Context, _ client.Client, _ client.Object, _ ...string) error {
+			return assertErr("resume kcp failed")
+		})
+		err := e.pauseOrResumeClusterAPIObjs(PauseOperationParams{
+			Ctx:        context.Background(),
+			Client:     e.Ctx.Client,
+			BKECluster: bkeCluster,
+			Log:        e.Ctx.Log,
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "resume kcp failed")
+	})
+
+	t.Run("resume normal md resume error", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		bkeCluster := &bkev1beta1.BKECluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "default"},
+			Spec:       confv1beta1.BKEClusterSpec{Pause: false},
+		}
+		e := newPausedCov(t, bkeCluster)
+		patches.ApplyFunc(phaseutil.GetClusterAPIKubeadmControlPlane, func(_ context.Context, _ client.Client, _ *clusterv1.Cluster) (*controlv1beta1.KubeadmControlPlane, error) {
+			return nil, nil
+		})
+		patches.ApplyFunc(phaseutil.GetClusterAPIMachineDeployment, func(_ context.Context, _ client.Client, _ *clusterv1.Cluster) (*clusterv1.MachineDeployment, error) {
+			return &clusterv1.MachineDeployment{}, nil
+		})
+		patches.ApplyFunc(phaseutil.ResumeClusterAPIObj, func(_ context.Context, _ client.Client, _ client.Object, _ ...string) error {
+			return assertErr("resume md failed")
+		})
+		err := e.pauseOrResumeClusterAPIObjs(PauseOperationParams{
+			Ctx:        context.Background(),
+			Client:     e.Ctx.Client,
+			BKECluster: bkeCluster,
+			Log:        e.Ctx.Log,
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "resume md failed")
+	})
+}
+
+// ---- syncBKEClusterPauseStatus (77.8% -> cover patch func execution) ----
+
+func TestPausedSyncBKEClusterPauseStatus(t *testing.T) {
+	t.Run("pause true sets annotation", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		bkeCluster := &bkev1beta1.BKECluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "default"},
+			Spec:       confv1beta1.BKEClusterSpec{Pause: true},
+		}
+		e := newPausedCov(t, bkeCluster)
+		var patchApplied bool
+		patches.ApplyFunc(mergecluster.SyncStatusUntilComplete, func(_ client.Client, bc *bkev1beta1.BKECluster, patchs ...mergecluster.PatchFunc) error {
+			for _, pf := range patchs {
+				pf(bc)
+			}
+			patchApplied = true
+			return nil
+		})
+		err := e.syncBKEClusterPauseStatus(PauseOperationParams{
+			Ctx:        context.Background(),
+			Client:     e.Ctx.Client,
+			BKECluster: bkeCluster,
+			Log:        e.Ctx.Log,
+		})
+		require.NoError(t, err)
+		assert.True(t, patchApplied)
+		v, ok := annotation.HasAnnotation(bkeCluster, annotation.BKEClusterPauseAnnotationKey)
+		assert.True(t, ok)
+		assert.Equal(t, "true", v)
+	})
+
+	t.Run("pause false removes annotation", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		bkeCluster := &bkev1beta1.BKECluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "c1", Namespace: "default",
+				Annotations: map[string]string{annotation.BKEClusterPauseAnnotationKey: "true"},
+			},
+			Spec: confv1beta1.BKEClusterSpec{Pause: false},
+		}
+		e := newPausedCov(t, bkeCluster)
+		patches.ApplyFunc(mergecluster.SyncStatusUntilComplete, func(_ client.Client, bc *bkev1beta1.BKECluster, patchs ...mergecluster.PatchFunc) error {
+			for _, pf := range patchs {
+				pf(bc)
+			}
+			return nil
+		})
+		err := e.syncBKEClusterPauseStatus(PauseOperationParams{
+			Ctx:        context.Background(),
+			Client:     e.Ctx.Client,
+			BKECluster: bkeCluster,
+			Log:        e.Ctx.Log,
+		})
+		require.NoError(t, err)
+		_, ok := annotation.HasAnnotation(bkeCluster, annotation.BKEClusterPauseAnnotationKey)
+		assert.False(t, ok)
+	})
 }

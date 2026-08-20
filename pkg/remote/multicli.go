@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -14,6 +14,7 @@ package remote
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/pkg/errors"
@@ -79,6 +80,8 @@ func (c *MultiCli) RegisterHosts(hosts []Host) map[string]error {
 }
 
 // AvailableHosts returns the available hosts for the multi-client.
+//
+//go:noinline
 func (c *MultiCli) AvailableHosts() []string {
 	var hosts []string
 	for k := range c.remotes {
@@ -197,7 +200,7 @@ func (c *MultiCli) RegisterHostsInfo() map[string]error {
 	errs := make(map[string]error)
 
 	for nodeIP, err := range stdErrs.Out() {
-		errs[nodeIP] = errors.Errorf("Register host %s info failed, err: %v", nodeIP, err)
+		errs[nodeIP] = fmt.Errorf("Register host %s info failed, err: %v", nodeIP, err)
 	}
 
 	stdout := stdOuts.Out()

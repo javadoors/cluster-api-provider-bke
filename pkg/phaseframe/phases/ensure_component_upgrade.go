@@ -25,7 +25,6 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
@@ -44,6 +43,17 @@ type EnsureComponentUpgrade struct {
 	phaseframe.BasePhase
 	localKubeConfig []byte
 	remoteClient    *kubernetes.Clientset
+	mockClient      kubernetes.Interface
+}
+
+// kubeClient returns the in-cluster client used to upgrade workload images.
+// In production this is the remote client obtained from the target cluster;
+// tests may inject a fake clientset via mockClient.
+func (e *EnsureComponentUpgrade) kubeClient() kubernetes.Interface {
+	if e.mockClient != nil {
+		return e.mockClient
+	}
+	return e.remoteClient
 }
 
 func NewEnsureComponentUpgrade(ctx *phaseframe.PhaseContext) phaseframe.Phase {
@@ -63,15 +73,13 @@ func (e *EnsureComponentUpgrade) Execute() (ctrl.Result, error) {
 }
 
 func (e *EnsureComponentUpgrade) loadLocalKubeConfig() error {
-	ctx, c, _, _, log := e.Ctx.Untie()
+	ctx, c, _, _, _ := e.Ctx.Untie()
 	localKubeConfig, err := phaseutil.GetLocalKubeConfig(ctx, c)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
-			log.Error(constant.ComponentUpgradeFailed, "Local kubeconfig secret not found")
 			return fmt.Errorf("local kubeconfig secret not found")
 		}
-		log.Error(constant.ComponentUpgradeFailed, "Failed to get local kubeconfig secret, err: %v", err)
-		return fmt.Errorf("failed to get local kubeconfig secret, err: %v", err)
+		return fmt.Errorf("failed to get local kubeconfig secret: %w", err)
 	}
 	e.localKubeConfig = localKubeConfig
 	return nil
@@ -79,11 +87,10 @@ func (e *EnsureComponentUpgrade) loadLocalKubeConfig() error {
 
 // getRemoteClient get remote cluster client
 func (e *EnsureComponentUpgrade) getRemoteClient() error {
-	ctx, c, bkeCluster, _, log := e.Ctx.Untie()
+	ctx, c, bkeCluster, _, _ := e.Ctx.Untie()
 	targetClusterClient, err := kube.NewRemoteClientByBKECluster(ctx, c, bkeCluster)
 	if err != nil {
-		log.Error(constant.InternalErrorReason, "failed to get BKECluster %q remote cluster client", utils.ClientObjNS(bkeCluster))
-		return err
+		return fmt.Errorf("failed to get BKECluster %q remote cluster client: %w", utils.ClientObjNS(bkeCluster), err)
 	}
 	e.remoteClient, _ = targetClusterClient.KubeClient()
 	if e.remoteClient == nil {
@@ -156,35 +163,12 @@ func (e *EnsureComponentUpgrade) getPatchConfig() (*phaseutil.PatchConfig, error
 	openFuyaoVersion := bkeCluster.Spec.ClusterConfig.Cluster.OpenFuyaoVersion
 	log.Info(constant.ComponentUpgradingReason, "openFuyaoVersion: %v", openFuyaoVersion)
 
-	bkeCmKey := fmt.Sprintf("patch.%s", openFuyaoVersion)
-	patchCmKey := fmt.Sprintf("cm.%s", openFuyaoVersion)
-
-	localConfigMap := &corev1.ConfigMap{}
-	if err := c.Get(ctx, constant.GetLocalConfigMapObjectKey(), localConfigMap); err != nil {
-		log.Error(constant.InternalErrorReason, "failed to get local cluster bke-config cm, err: %v", err)
-		return nil, fmt.Errorf("get cm failed %v", err)
+	patchCfg, err := phaseutil.LoadPatchConfig(ctx, c, openFuyaoVersion)
+	if err != nil {
+		return nil, err
 	}
-
-	if _, ok := localConfigMap.Data[bkeCmKey]; !ok {
-		return nil, fmt.Errorf("patch info %s not found in local config", bkeCmKey)
-	}
-
-	cmKey := client.ObjectKey{
-		Namespace: "openfuyao-patch",
-		Name:      patchCmKey,
-	}
-	patchConfigMap := &corev1.ConfigMap{}
-	if err := c.Get(ctx, cmKey, patchConfigMap); err != nil {
-		log.Error(constant.InternalErrorReason, "failed to get patch cm, err: %v", err)
-		return nil, fmt.Errorf("get cm failed %v", err)
-	}
-
-	if _, ok := patchConfigMap.Data[openFuyaoVersion]; !ok {
-		return nil, fmt.Errorf("patch info %s not found in patch config", openFuyaoVersion)
-	}
-
-	log.Info(constant.ComponentUpgradingReason, "get patch config data: %v", patchConfigMap.Data[openFuyaoVersion])
-	return phaseutil.GetPatchConfig(patchConfigMap.Data[openFuyaoVersion])
+	log.Info(constant.ComponentUpgradingReason, "get patch config for version %s successfully", openFuyaoVersion)
+	return patchCfg, nil
 }
 
 func (e *EnsureComponentUpgrade) processImageUpdates(patchCfg *phaseutil.PatchConfig) error {
@@ -235,8 +219,7 @@ func (e *EnsureComponentUpgrade) updateSingleImage(image phaseutil.Image) error 
 		}
 		log.Info(constant.ComponentUpgradingReason, "update info is %+v", updateInfo)
 		if err := e.updatePodImageTag(updateInfo); err != nil {
-			log.Error(constant.ComponentUpgradeFailed, "update image %s tag failed, err: %v", image.Name, err)
-			return err
+			return fmt.Errorf("update image %s tag failed: %w", image.Name, err)
 		}
 	}
 
@@ -247,7 +230,7 @@ func (e *EnsureComponentUpgrade) updatePodImageTag(update *phaseutil.ImageUpdate
 	_, _, _, _, log := e.Ctx.Untie()
 	pods, err := e.findMatchingPods(update.NameSpace, update.PodPrefix)
 	if err != nil {
-		return fmt.Errorf("failed to find matching %s/%s pods: %v", update.NameSpace, update.PodPrefix, err)
+		return fmt.Errorf("failed to find matching %s/%s pods: %w", update.NameSpace, update.PodPrefix, err)
 	}
 
 	if len(pods) == 0 {
@@ -259,7 +242,7 @@ func (e *EnsureComponentUpgrade) updatePodImageTag(update *phaseutil.ImageUpdate
 
 func (e *EnsureComponentUpgrade) findMatchingPods(namespace, podPrefix string) ([]corev1.Pod, error) {
 	ctx, _, _, _, _ := e.Ctx.Untie()
-	pods, err := e.remoteClient.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+	pods, err := e.kubeClient().CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -277,7 +260,7 @@ func (e *EnsureComponentUpgrade) upgradePodImage(pod corev1.Pod, update *phaseut
 	_, _, _, _, log := e.Ctx.Untie()
 	controller, controllerType, err := e.getPodController(pod)
 	if err != nil {
-		return fmt.Errorf("failed to get controller for pod %s: %v", pod.Name, err)
+		return fmt.Errorf("failed to get controller for pod %s: %w", pod.Name, err)
 	}
 	log.Info(constant.ComponentUpgradingReason, "Pod %s is managed by %s: %s", pod.Name, controllerType, controller.GetName())
 
@@ -312,7 +295,7 @@ func (e *EnsureComponentUpgrade) getPodController(pod corev1.Pod) (metav1.Object
 	namespace := e.getNamespace(pod)
 
 	for _, ownerRef := range pod.OwnerReferences {
-		controller, kind, err := e.handleOwnerReference(ctx, e.remoteClient, namespace, ownerRef)
+		controller, kind, err := e.handleOwnerReference(ctx, e.kubeClient(), namespace, ownerRef)
 		if err != nil {
 			return nil, "", err
 		}
@@ -415,7 +398,7 @@ func (e *EnsureComponentUpgrade) upgradeDeploymentImage(deployment *appsv1.Deplo
 		namespace = metav1.NamespaceDefault
 	}
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		deploymentCfg, err := e.remoteClient.AppsV1().Deployments(namespace).Get(ctx, deployment.Name, metav1.GetOptions{})
+		deploymentCfg, err := e.kubeClient().AppsV1().Deployments(namespace).Get(ctx, deployment.Name, metav1.GetOptions{})
 		if err != nil {
 			return fmt.Errorf("get deployment err: %s", err)
 		}
@@ -445,7 +428,7 @@ func (e *EnsureComponentUpgrade) upgradeDeploymentImage(deployment *appsv1.Deplo
 		}
 
 		if needUpdated {
-			_, err = e.remoteClient.AppsV1().Deployments(namespace).Update(ctx, deploymentCfg, metav1.UpdateOptions{})
+			_, err = e.kubeClient().AppsV1().Deployments(namespace).Update(ctx, deploymentCfg, metav1.UpdateOptions{})
 			return err
 		}
 		log.Info(constant.ComponentUpgradingReason, "No containers or initContainers with image '%s' found in Deployment %s", update.ImageName, deployment.Name)
@@ -460,7 +443,7 @@ func (e *EnsureComponentUpgrade) upgradeStatefulSetImage(statefulSet *appsv1.Sta
 		namespace = metav1.NamespaceDefault
 	}
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		stsCfg, err := e.remoteClient.AppsV1().StatefulSets(namespace).Get(ctx, statefulSet.Name, metav1.GetOptions{})
+		stsCfg, err := e.kubeClient().AppsV1().StatefulSets(namespace).Get(ctx, statefulSet.Name, metav1.GetOptions{})
 		if err != nil {
 			return err
 		}
@@ -490,7 +473,7 @@ func (e *EnsureComponentUpgrade) upgradeStatefulSetImage(statefulSet *appsv1.Sta
 		}
 
 		if needUpdated {
-			_, err = e.remoteClient.AppsV1().StatefulSets(namespace).Update(ctx, stsCfg, metav1.UpdateOptions{})
+			_, err = e.kubeClient().AppsV1().StatefulSets(namespace).Update(ctx, stsCfg, metav1.UpdateOptions{})
 			return err
 		}
 
@@ -506,7 +489,7 @@ func (e *EnsureComponentUpgrade) upgradeDaemonSetImage(daemonSet *appsv1.DaemonS
 		namespace = metav1.NamespaceDefault
 	}
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		dsCfg, err := e.remoteClient.AppsV1().DaemonSets(namespace).Get(ctx, daemonSet.Name, metav1.GetOptions{})
+		dsCfg, err := e.kubeClient().AppsV1().DaemonSets(namespace).Get(ctx, daemonSet.Name, metav1.GetOptions{})
 		if err != nil {
 			return err
 		}
@@ -536,7 +519,7 @@ func (e *EnsureComponentUpgrade) upgradeDaemonSetImage(daemonSet *appsv1.DaemonS
 		}
 
 		if dsUpdated {
-			_, err = e.remoteClient.AppsV1().DaemonSets(namespace).Update(ctx, dsCfg, metav1.UpdateOptions{})
+			_, err = e.kubeClient().AppsV1().DaemonSets(namespace).Update(ctx, dsCfg, metav1.UpdateOptions{})
 			return err
 		}
 
@@ -552,7 +535,7 @@ func (e *EnsureComponentUpgrade) upgradeReplicaSetImage(replicaSet *appsv1.Repli
 		namespace = metav1.NamespaceDefault
 	}
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		rsCfg, err := e.remoteClient.AppsV1().ReplicaSets(namespace).Get(ctx, replicaSet.Name, metav1.GetOptions{})
+		rsCfg, err := e.kubeClient().AppsV1().ReplicaSets(namespace).Get(ctx, replicaSet.Name, metav1.GetOptions{})
 		if err != nil {
 			return err
 		}
@@ -582,7 +565,7 @@ func (e *EnsureComponentUpgrade) upgradeReplicaSetImage(replicaSet *appsv1.Repli
 		}
 
 		if rsUpdated {
-			_, err = e.remoteClient.AppsV1().ReplicaSets(namespace).Update(ctx, rsCfg, metav1.UpdateOptions{})
+			_, err = e.kubeClient().AppsV1().ReplicaSets(namespace).Update(ctx, rsCfg, metav1.UpdateOptions{})
 			return err
 		}
 		log.Info(constant.ComponentUpgradingReason, "No containers or initContainers with image '%s' found in ReplicaSet %s", update.ImageName, replicaSet.Name)

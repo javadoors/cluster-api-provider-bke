@@ -2,7 +2,7 @@
  * Copyright (c) 2024 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -17,6 +17,7 @@ import (
 
 	common "gopkg.openfuyao.cn/cluster-api-provider-bke/common"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/initialize"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/initialize/versions"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/validation"
 )
 
@@ -132,7 +133,7 @@ func (e *ImageExporter) generateImageMap() {
 		initialize.DefaultSchedulerImageName: GetImageNameWithTag(
 			initialize.DefaultSchedulerImageName, e.Version),
 		initialize.DefaultEtcdImageName: GetImageNameWithTag(
-			initialize.DefaultEtcdImageName, initialize.DefaultEtcdImageTag),
+			initialize.DefaultEtcdImageName, versions.EtcdImageTag()),
 	}
 
 	if e.EtcdVersion != "" {

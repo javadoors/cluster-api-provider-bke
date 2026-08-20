@@ -2,7 +2,7 @@
  * Copyright (c) 2024 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -45,14 +45,17 @@ import (
 	agentv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkeagent/v1beta1"
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
 	configv1alpha1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/v1alpha1"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/initialize/versions"
 	commonutils "gopkg.openfuyao.cn/cluster-api-provider-bke/common/utils"
 	capbkecontrollers "gopkg.openfuyao.cn/cluster-api-provider-bke/controllers/capbke"
 	clusterversioncontrollers "gopkg.openfuyao.cn/cluster-api-provider-bke/controllers/clusterversion"
 	releaseimagecontrollers "gopkg.openfuyao.cn/cluster-api-provider-bke/controllers/releaseimage"
 	upgradepathcontrollers "gopkg.openfuyao.cn/cluster-api-provider-bke/controllers/upgradepath"
+	pkgkube "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/kube"
 	bkemetrics "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/metrics"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/oci"
 	releasemanifest "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/release/manifest"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/statusmanage"
 	pathstore "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/upgradepath"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/config"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/nodeutil"
@@ -87,13 +90,6 @@ func setupLogger() *log.Logger {
 }
 
 func init() {
-	//设置时区为上海
-	loc, err := time.LoadLocation("Asia/Shanghai")
-	if err == nil {
-		time.Local = loc
-		setupLogger().Info("Set timezone to Asia/Shanghai")
-	}
-
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(clusterv1.AddToScheme(scheme))
 	utilruntime.Must(clusterexpv1.AddToScheme(scheme))
@@ -106,7 +102,31 @@ func init() {
 	//+kubebuilder:scaffold:scheme
 }
 
+func logStartupConfig() {
+	// Keep the startup message but avoid mutating time.Local in init/main.
+	// Mutating time.Local can race with logger background goroutines.
+	if _, err := time.LoadLocation("Asia/Shanghai"); err == nil {
+		setupLogger().Info("Set timezone to Asia/Shanghai")
+	}
+	statusmanage.LogInitConfig()
+}
+
 func main() {
+	if _, err := versions.Load(); err != nil {
+		setupLogger().Errorf("failed to load embedded versions manifest: %v", err)
+		os.Exit(1)
+	}
+	setupLogger().Infof(
+		"Loaded versions manifest: manifestVersion=%s, kubernetes=%s, etcd=%s, containerd=%s, openFuyao=%s, etcdImageTag=%s, pauseImageTag=%s",
+		versions.ManifestVersion(),
+		versions.KubernetesVersion(),
+		versions.EtcdVersion(),
+		versions.ContainerdVersion(),
+		versions.OpenFuyaoVersion(),
+		versions.EtcdImageTag(),
+		versions.PauseImageTag(),
+	)
+	logStartupConfig()
 	setupLogger().Info("Starting the BKE Cluster API Provider")
 	printVersionInfo()
 
@@ -173,6 +193,7 @@ func createManager() (ctrl.Manager, *remote.ClusterCacheTracker) {
 	opts.BindFlags(flag.CommandLine)
 
 	flag.Parse()
+	config.ResolveClientConfig()
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
 	// Configure health probe based on scheme
@@ -182,7 +203,7 @@ func createManager() (ctrl.Manager, *remote.ClusterCacheTracker) {
 		healthProbeAddr = "0"
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+	mgr, err := ctrl.NewManager(pkgkube.ApplyThrottlingConfig(ctrl.GetConfigOrDie()), ctrl.Options{
 		Scheme:                 scheme,
 		MetricsBindAddress:     config.MetricsAddr,
 		Port:                   config.WebhookPort,
@@ -232,6 +253,7 @@ func setupControllers(ctx context.Context, mgr ctrl.Manager, tracker *remote.Clu
 func setupBKEControllers(ctx context.Context, mgr ctrl.Manager, tracker *remote.ClusterCacheTracker, releaseStore *releasemanifest.Store) {
 	if err := (&capbkecontrollers.BKEClusterReconciler{
 		Client:       mgr.GetClient(),
+		Cache:        mgr.GetCache(),
 		Scheme:       mgr.GetScheme(),
 		Recorder:     mgr.GetEventRecorderFor("bke-cluster"),
 		RestConfig:   mgr.GetConfig(),
@@ -328,6 +350,12 @@ func setupWebhooks(mgr ctrl.Manager) {
 		setupLogger().Errorf("unable to create webhook UpgradePath: %v", err)
 		os.Exit(1)
 	}
+	if err := (&capbkewebhooks.BKENode{
+		Client: mgr.GetClient(),
+	}).SetupWebhookWithManager(mgr); err != nil {
+		setupLogger().Errorf("unable to create webhook BKENode: %v", err)
+		os.Exit(1)
+	}
 }
 
 // setupHealthChecks sets up health and ready checks for HTTP probe
@@ -357,7 +385,7 @@ func validateTLSCertificates(certPath, keyPath string) error {
 func loadTLSConfig(certPath, keyPath string) (*tls.Config, error) {
 	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load TLS certificate: %v", err)
+		return nil, fmt.Errorf("failed to load TLS certificate: %w", err)
 	}
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},

@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -15,6 +15,7 @@ package kube
 import (
 	"bytes"
 	"io"
+	"os"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -462,6 +463,131 @@ func TestHandleRemoveOperation_NotFound(t *testing.T) {
 	}
 }
 
+func TestHandleCreateOnlyOperation_SkipWhenExists(t *testing.T) {
+	scheme := runtime.NewScheme()
+	existing := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata": map[string]interface{}{
+			"name":      "test-cm",
+			"namespace": "default",
+		},
+		"data": map[string]interface{}{
+			"k": "old",
+		},
+	}}
+	dynamicClient := fakedynamic.NewSimpleDynamicClient(scheme, existing)
+	c := &Client{Log: (*log.Logger)(nil), DynamicClient: dynamicClient}
+
+	desired := unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata": map[string]interface{}{
+			"name":      "test-cm",
+			"namespace": "default",
+		},
+		"data": map[string]interface{}{
+			"k": "new",
+		},
+	}}
+	mapping := &meta.RESTMapping{
+		Resource: schema.GroupVersionResource{Group: "", Version: "v1", Resource: "configmaps"},
+		Scope:    meta.RESTScopeNamespace,
+	}
+	dr, err := c.getResourceInterface(mapping, desired)
+	if err != nil {
+		t.Fatalf("getResourceInterface: %v", err)
+	}
+
+	obj, err := c.handleCreateOnlyOperation(dr, desired, &Task{Operate: addon.UpgradeAddon, ApplyStrategy: ApplyStrategyCreateOnly})
+	if err != nil {
+		t.Fatalf("create-only: %v", err)
+	}
+	if obj == nil {
+		t.Fatal("expected existing object")
+	}
+	data, _, _ := unstructured.NestedStringMap(obj.Object, "data")
+	if data["k"] != "old" {
+		t.Fatalf("expected existing data preserved, got %#v", data)
+	}
+}
+
+func TestHandleCreateOnlyOperation_CreateWhenMissing(t *testing.T) {
+	scheme := runtime.NewScheme()
+	dynamicClient := fakedynamic.NewSimpleDynamicClient(scheme)
+	c := &Client{Log: (*log.Logger)(nil), DynamicClient: dynamicClient}
+
+	desired := unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata": map[string]interface{}{
+			"name":      "test-cm",
+			"namespace": "default",
+		},
+		"data": map[string]interface{}{
+			"k": "new",
+		},
+	}}
+	mapping := &meta.RESTMapping{
+		Resource: schema.GroupVersionResource{Group: "", Version: "v1", Resource: "configmaps"},
+		Scope:    meta.RESTScopeNamespace,
+	}
+	dr, err := c.getResourceInterface(mapping, desired)
+	if err != nil {
+		t.Fatalf("getResourceInterface: %v", err)
+	}
+
+	obj, err := c.handleCreateOnlyOperation(dr, desired, &Task{Operate: addon.UpgradeAddon, ApplyStrategy: ApplyStrategyCreateOnly})
+	if err != nil {
+		t.Fatalf("create-only: %v", err)
+	}
+	if obj == nil || obj.GetName() != "test-cm" {
+		t.Fatalf("expected created object, got %#v", obj)
+	}
+}
+
+func TestHandleOperation_CreateOnlyStrategy(t *testing.T) {
+	scheme := runtime.NewScheme()
+	existing := &unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata": map[string]interface{}{
+			"name":      "test-cm",
+			"namespace": "default",
+		},
+	}}
+	dynamicClient := fakedynamic.NewSimpleDynamicClient(scheme, existing)
+	c := &Client{Log: (*log.Logger)(nil), DynamicClient: dynamicClient}
+
+	desired := unstructured.Unstructured{Object: map[string]interface{}{
+		"apiVersion": "v1",
+		"kind":       "ConfigMap",
+		"metadata": map[string]interface{}{
+			"name":      "test-cm",
+			"namespace": "default",
+		},
+	}}
+	mapping := &meta.RESTMapping{
+		Resource: schema.GroupVersionResource{Group: "", Version: "v1", Resource: "configmaps"},
+		Scope:    meta.RESTScopeNamespace,
+	}
+	dr, err := c.getResourceInterface(mapping, desired)
+	if err != nil {
+		t.Fatalf("getResourceInterface: %v", err)
+	}
+
+	obj, err := c.handleOperation(dr, desired, &Task{
+		Operate:       addon.UpgradeAddon,
+		ApplyStrategy: ApplyStrategyCreateOnly,
+	}, schema.GroupVersionKind{Group: "", Version: "v1", Kind: "ConfigMap"})
+	if err != nil {
+		t.Fatalf("handleOperation: %v", err)
+	}
+	if obj == nil || obj.GetName() != "test-cm" {
+		t.Fatalf("expected existing object returned, got %#v", obj)
+	}
+}
+
 func TestRenderYamlToDecoder_FileNotFound(t *testing.T) {
 	task := &Task{
 		Name:     "test",
@@ -491,5 +617,51 @@ func TestHandleUpdateOperation_CRD(t *testing.T) {
 	}
 	if obj != nil {
 		t.Error("Expected obj to be nil for CRD")
+	}
+}
+
+func TestRenderManifestAndTaskYAMLBranches(t *testing.T) {
+	empty, err := RenderManifest("empty", nil, nil)
+	if err != nil || empty != nil {
+		t.Fatalf("RenderManifest empty = %q, %v; want nil, nil", string(empty), err)
+	}
+
+	rendered, err := RenderManifest("cm", []byte("kind: ConfigMap\nmetadata:\n  name: {{ .name }}\n"), map[string]interface{}{"name": "rendered-cm"})
+	if err != nil {
+		t.Fatalf("RenderManifest() error = %v", err)
+	}
+	if !bytes.Contains(rendered, []byte("name: rendered-cm")) {
+		t.Fatalf("RenderManifest() = %q", string(rendered))
+	}
+
+	if _, err := renderTaskYAML(nil); err == nil {
+		t.Fatal("renderTaskYAML(nil) expected error")
+	}
+	if _, err := renderTaskYAML(&Task{}); err == nil {
+		t.Fatal("renderTaskYAML(empty task) expected error")
+	}
+
+	file, err := os.CreateTemp(t.TempDir(), "noexecute-*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("kind: ConfigMap\nmetadata:\n  name: {{ .name }}\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := renderTaskYAML(&Task{Name: "noexecute", FilePath: file.Name(), Param: map[string]interface{}{"name": "ignored"}})
+	if err != nil {
+		t.Fatalf("renderTaskYAML(noexecute) error = %v", err)
+	}
+	if !bytes.Contains(raw, []byte("{{ .name }}")) {
+		t.Fatalf("noexecute manifest should not be rendered: %q", string(raw))
+	}
+}
+
+func TestClientGetRestMapperNil(t *testing.T) {
+	if _, err := (&Client{}).getRestMapper(); err == nil {
+		t.Fatal("getRestMapper() expected error when mapper is nil")
 	}
 }

@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	bkeinit "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/initialize"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/initialize/versions"
 	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
 	bkevalidte "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/validation"
 	backupPlugin "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job/builtin/backup"
@@ -41,6 +42,7 @@ import (
 	envPlugin "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job/builtin/kubeadm/env"
 	kubeletPlugin "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job/builtin/kubeadm/kubelet"
 	manifestsPlugin "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job/builtin/kubeadm/manifests"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/cluster"
 	bkeetcd "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/etcd"
@@ -74,7 +76,7 @@ func (k *KubeadmPlugin) installContainerdCommand() error {
 	repo := cfg.ImageThirdRepo()
 	// 后续写在common中
 	sandboxImage := fmt.Sprintf("%s/kubernetes/pause:%s", strings.TrimRight(repo, "/"),
-		bkeinit.DefaultPauseImageTag)
+		versions.PauseImageTag())
 	dataRoot := bkeinit.DefaultCRIContainerdDataRootDir
 	if cfg.Cluster.ContainerRuntime.Param != nil {
 		if v, ok := cfg.Cluster.ContainerRuntime.Param["data-root"]; ok {
@@ -99,7 +101,8 @@ func (k *KubeadmPlugin) installContainerdCommand() error {
 }
 
 // installKubeletCommand used to install kubelet in the target cluster node
-func (k *KubeadmPlugin) installKubeletCommand() error {
+// immutable 参数为 true 时跳过二进制下载（仅 worker join 场景使用）
+func (k *KubeadmPlugin) installKubeletCommand(immutable bool) error {
 	cfg := bkeinit.BkeConfig(*k.boot.BkeConfig)
 	k8sVersion := cfg.Cluster.KubernetesVersion
 	kubeletUrl := clusterutil.BuildYumRepoDownloadBaseURL(cfg)
@@ -110,6 +113,11 @@ func (k *KubeadmPlugin) installKubeletCommand() error {
 	command, err := k.buildKubeletCommand(cfg, kubeletUrl)
 	if err != nil {
 		return err
+	}
+
+	// 不可变 OS：kubelet 镜像内置，通过命令参数通知 plugin 跳过下载
+	if immutable {
+		command = append(command, "immutableOS=true")
 	}
 
 	kp := kubeletPlugin.New(k.k8sClient, k.exec)
@@ -792,19 +800,25 @@ func (k *KubeadmPlugin) createConfigMapForCertConfig(currentClusterClient client
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Name: pkiutil.CertConfigMapName, Namespace: pkiutil.CertConfigMapNamespace},
 		Data:       data}
-	existing := &corev1.ConfigMap{}
-	err = currentClusterClient.Get(
-		context.Background(),
-		client.ObjectKey{Name: cm.Name, Namespace: cm.Namespace},
-		existing,
-	)
-	if apierrors.IsNotFound(err) {
-		log.Infof("ConfigMap %s/%s not exist, creating", cm.Namespace, cm.Name)
-		return currentClusterClient.Create(context.Background(), cm)
-	} else if err != nil {
-		return errors.Wrap(err, "get ConfigMap")
-	}
-	existing.Data = data
-	log.Infof("updating existing ConfigMap %s/%s with %d files", cm.Namespace, cm.Name, len(data))
-	return currentClusterClient.Update(context.Background(), existing)
+	var loggedUpdate bool
+	return phaseutil.RetryOnConflict(func() error {
+		existingConfigMap := &corev1.ConfigMap{}
+		err = currentClusterClient.Get(
+			context.Background(),
+			client.ObjectKey{Name: cm.Name, Namespace: cm.Namespace},
+			existingConfigMap,
+		)
+		if apierrors.IsNotFound(err) {
+			log.Infof("ConfigMap %s/%s not exist, creating", cm.Namespace, cm.Name)
+			return currentClusterClient.Create(context.Background(), cm)
+		} else if err != nil {
+			return errors.Wrap(err, "get ConfigMap")
+		}
+		existingConfigMap.Data = data
+		if !loggedUpdate {
+			log.Infof("updating existing ConfigMap %s/%s with %d files", cm.Namespace, cm.Name, len(data))
+			loggedUpdate = true
+		}
+		return currentClusterClient.Update(context.Background(), existingConfigMap)
+	})
 }

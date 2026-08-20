@@ -53,14 +53,22 @@ func (e *EnsureContainerdUpgrade) getCommand() *command.ENV {
 	// Use NodeFetcher to get BKENodes from API server
 	bkeNodes, err := e.Ctx.NodeFetcher().GetBKENodesWrapperForCluster(e.Ctx, bkeCluster)
 	if err != nil {
-		log.Error(constant.ContainerdUpgradingReason, "failed to get BKENodes: %v", err)
+		log.Warn(constant.ContainerdUpgradingReason, "failed to get BKENodes: %v", err)
 		return nil
 	}
-	exceptEnvNodes := phaseutil.GetNeedUpgradeNodesWithBKENodes(bkeCluster, bkeNodes)
+	exceptEnvNodes := phaseutil.GetNeedUpgradeContainerdNodesWithBKENodes(bkeCluster, bkeNodes)
+	log.Info(constant.ContainerdUpgradingReason,
+		"containerd upgrade node selection: current=%s target=%s fetchedBKENodes=%d selectedNodes=%d",
+		bkeCluster.Status.ContainerdVersion, targetVersion, len(bkeNodes), exceptEnvNodes.Length())
+	if exceptEnvNodes.Length() == 0 {
+		log.Warn(constant.ContainerdUpgradingReason,
+			"containerd upgrade selected zero nodes: current=%s target=%s fetchedBKENodes=%d",
+			bkeCluster.Status.ContainerdVersion, targetVersion, len(bkeNodes))
+	}
 
 	nodes, err := e.Ctx.GetNodes()
 	if err != nil {
-		log.Error(constant.ContainerdUpgradingReason, "failed to get nodes: %v", err)
+		log.Warn(constant.ContainerdUpgradingReason, "failed to get nodes: %v", err)
 		return nil
 	}
 
@@ -90,7 +98,7 @@ func (e *EnsureContainerdUpgrade) getCommand() *command.ENV {
 
 	envCmd, err := BuildCommonEnvCommand(params)
 	if err != nil {
-		log.Error(constant.ContainerdUpgradingReason, "failed to build common env command: %v", err)
+		log.Warn(constant.ContainerdUpgradingReason, "failed to build common env command: %v", err)
 		return nil
 	}
 
@@ -104,17 +112,16 @@ func (e *EnsureContainerdUpgrade) resetContainerd() error {
 		return fmt.Errorf("new containerd command fail")
 	}
 	if err := envCommand.NewConatinerdReset(); err != nil {
-		errInfo := fmt.Sprintf("failed to create k8s containerd reset: %v", err)
-		log.Error(constant.ContainerdUpgradeFailed, errInfo)
-		return err
+		return fmt.Errorf("failed to create k8s containerd reset: %w", err)
 	}
 
 	log.Info(constant.ContainerdUpgradingReason, "Waiting for the k8s containerd reset to complete")
 	err, successNodes, failedNodes := envCommand.Wait()
 	if err != nil || len(failedNodes) > 0 {
-		errInfo := fmt.Sprintf("failed to reset k8s containerd: %d/%d", len(successNodes), len(failedNodes)+len(successNodes))
-		log.Error(constant.ContainerdUpgradeFailed, errInfo)
-		return err
+		if err != nil {
+			return fmt.Errorf("failed to reset k8s containerd: %d/%d: %w", len(successNodes), len(failedNodes)+len(successNodes), err)
+		}
+		return fmt.Errorf("failed to reset k8s containerd: %d/%d", len(successNodes), len(failedNodes)+len(successNodes))
 	}
 	return nil
 }
@@ -126,17 +133,16 @@ func (e *EnsureContainerdUpgrade) redeployContainerd() error {
 		return fmt.Errorf("new containerd command fail")
 	}
 	if err := envCommand.NewConatinerdRedeploy(); err != nil {
-		errInfo := fmt.Sprintf("failed to create k8s containerd redeploy: %v", err)
-		log.Error(constant.ContainerdUpgradeFailed, errInfo)
-		return err
+		return fmt.Errorf("failed to create k8s containerd redeploy: %w", err)
 	}
 
 	log.Info(constant.ContainerdUpgradingReason, "Waiting for the k8s containerd redeploy to complete")
 	err, successNodes, failedNodes := envCommand.Wait()
 	if err != nil || len(failedNodes) > 0 {
-		errInfo := fmt.Sprintf("failed to redeploy k8s containerd: %d/%d", len(successNodes), len(failedNodes)+len(successNodes))
-		log.Error(constant.ContainerdUpgradeFailed, errInfo)
-		return err
+		if err != nil {
+			return fmt.Errorf("failed to redeploy k8s containerd: %d/%d: %w", len(successNodes), len(failedNodes)+len(successNodes), err)
+		}
+		return fmt.Errorf("failed to redeploy k8s containerd: %d/%d", len(successNodes), len(failedNodes)+len(successNodes))
 	}
 	return nil
 }

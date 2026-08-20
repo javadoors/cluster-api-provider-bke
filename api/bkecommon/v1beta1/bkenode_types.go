@@ -98,6 +98,10 @@ type BKENodeStatus struct {
 	// NeedSkip indicates whether this node should be skipped during operations
 	// +optional
 	NeedSkip bool `json:"needSkip,omitempty"`
+
+	// RetryCount is the number of agent push retries for this node
+	// +optional
+	RetryCount int `json:"retryCount,omitempty"`
 }
 
 // +kubebuilder:object:root=true

@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -32,10 +32,12 @@ import (
 	certutil "k8s.io/client-go/util/cert"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/kubeconfig"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
 	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	agentutils "gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/pkiutil"
@@ -52,11 +54,6 @@ const (
 
 	// ChainDataName is the key used to store a chain certificate in the secret's data field.
 	ChainDataName = "trust-chain.crt"
-
-	// kubeConfigRetryDelay is the delay between retries when looking up kubeconfig secrets
-	kubeConfigRetryDelay = 2 * time.Second
-	// kubeConfigMaxRetries is the maximum number of retries when looking up kubeconfig secrets
-	kubeConfigMaxRetries = 3
 )
 
 type BKEKubernetesCertGenerator struct {
@@ -82,16 +79,25 @@ type BKEKubernetesCertGenerator struct {
 
 func NewKubernetesCertGenerator(ctx context.Context, client client.Client,
 	bkeCluster *bkev1beta1.BKECluster) *BKEKubernetesCertGenerator {
-	return &BKEKubernetesCertGenerator{
+	return NewKubernetesCertGeneratorWithCache(ctx, client, nil, bkeCluster)
+}
+
+func NewKubernetesCertGeneratorWithCache(ctx context.Context, c client.Client, cache cache.Cache,
+	bkeCluster *bkev1beta1.BKECluster) *BKEKubernetesCertGenerator {
+	gen := &BKEKubernetesCertGenerator{
 		certNamespace:        bkeCluster.Namespace,
 		certClusterName:      bkeCluster.Name,
 		bkeCluster:           bkeCluster,
-		client:               client,
+		client:               c,
 		ctx:                  ctx,
 		log:                  log.With("name", "certsGenerator").With("clientObjNS", utils.ClientObjNS(bkeCluster)),
 		needCreateKubeConfig: true,
 		kubeConfigEndpoint:   bkeCluster.Spec.ControlPlaneEndpoint.String(),
 	}
+	if cache != nil {
+		gen.client = phaseutil.NewWriteThroughClient(c, cache)
+	}
+	return gen
 }
 
 func (k *BKEKubernetesCertGenerator) ConfigKubeConfig(endpoint string) {
@@ -156,12 +162,19 @@ func (k *BKEKubernetesCertGenerator) setupGlobalCA() error {
 // generateCertificates generates all necessary certificates
 func (k *BKEKubernetesCertGenerator) generateCertificates() (bool, error) {
 	var needCreateSecret = false
+	regeneratedCAs := make(map[string]bool)
 
 	// 生成ca证书，以及其他证书
 	for _, cert := range k.bkeCerts {
 		exit, err := k.lookup(cert)
 		if err != nil {
 			return false, err
+		}
+		// CA cascade: after a CA is regenerated, force regeneration of all leaf certs
+		// signed by that CA to avoid a broken certificate chain (new CA + old leaf cert).
+		if exit && cert.CAName != "" && regeneratedCAs[cert.CAName] {
+			k.log.Infof("CA %q was regenerated, force regenerating dependent cert %q", cert.CAName, cert.Name)
+			exit = false
 		}
 		if exit {
 			continue
@@ -180,6 +193,7 @@ func (k *BKEKubernetesCertGenerator) generateCertificates() (bool, error) {
 		if err := k.generateCACertAndKey(cert); err != nil {
 			return false, err
 		}
+		regeneratedCAs[cert.Name] = true
 	}
 
 	// 生成sa证书
@@ -315,16 +329,31 @@ func (k *BKEKubernetesCertGenerator) fillInCertificateContent(crtBytes, keyBytes
 	k.certificatesContent[certName] = data
 }
 
-// lookup checks if a certificate secret already exists
+// lookup checks if a certificate secret already exists.
+// If the certificate exists but is expiring soon, it is treated as needing regeneration.
 func (k *BKEKubernetesCertGenerator) lookup(cert *pkiutil.BKECert) (bool, error) {
 	secretName := NewCertSecretName(k.certClusterName, cert.Name)
 
-	// For kubeconfig, add retry mechanism to handle HA field race condition
+	var exists bool
+	var err error
 	if cert.Name == KubeConfigCertName {
-		return k.lookupKubeConfigCert(secretName)
+		exists, err = k.lookupKubeConfigCert(secretName)
+	} else {
+		exists, err = k.lookupRegularCert(secretName)
+	}
+	if err != nil || !exists {
+		return exists, err
 	}
 
-	return k.lookupRegularCert(secretName)
+	// Certificate exists - check if it is expiring soon.
+	// Certificates expiring within CertExpireAlertDays are treated as needing regeneration.
+	if k.isCertExpiringSoon(cert) {
+		k.log.Warnf("certificate %q will expire within %d days, will regenerate",
+			cert.Name, constant.CertExpireAlertDays)
+		return false, nil
+	}
+
+	return true, nil
 }
 
 // lookupRegularCert looks up a regular certificate secret
@@ -340,53 +369,39 @@ func (k *BKEKubernetesCertGenerator) lookupRegularCert(secretName string) (bool,
 	return true, nil
 }
 
-// lookupKubeConfigCert looks up a kubeconfig certificate with retry mechanism
 func (k *BKEKubernetesCertGenerator) lookupKubeConfigCert(secretName string) (bool, error) {
-	for attempt := 1; attempt <= kubeConfigMaxRetries; attempt++ {
-		found, shouldRetry := k.checkKubeConfigSecret(secretName, attempt, kubeConfigMaxRetries)
-		if found {
-			return true, nil
-		}
-		if !shouldRetry {
-			return false, nil
-		}
+	secretKey := types.NamespacedName{Namespace: k.certNamespace, Name: secretName}
+	var ready bool
 
-		if attempt < kubeConfigMaxRetries {
-			time.Sleep(kubeConfigRetryDelay)
-		}
+	err := phaseutil.RetryOnError(
+		func() error {
+			secret := &corev1.Secret{}
+			getErr := k.client.Get(k.ctx, secretKey, secret)
+			if getErr != nil {
+				return getErr // predicate below decides whether to retry
+			}
+			if secret.Data["value"] == nil {
+				return apierrors.NewNotFound(corev1.Resource("secret"), secretKey.Name)
+			}
+			if IsHACluster(k.bkeCluster, k.nodes) && secret.Data["ha"] == nil {
+				return apierrors.NewNotFound(corev1.Resource("secret"), secretKey.Name)
+			}
+			ready = true
+			return nil
+		},
+		phaseutil.WithBackoff(phaseutil.ReadBackoff()),
+		phaseutil.WithPredicate(phaseutil.IsNotFound),
+		phaseutil.WithOnRetry(func(attempt int, err error) {
+			k.log.Debugf("lookupKubeConfigCert: retrying read on notfound (%d/%d): %v",
+				attempt, phaseutil.ReadBackoff().Steps, err)
+		}),
+	)
+	if err != nil && !apierrors.IsNotFound(err) {
+		k.log.Errorf("LOOKUP: failed to validate secret %s/%s for cert %s: %v",
+			k.certNamespace, secretName, KubeConfigCertName, err)
+		return false, err
 	}
-
-	k.log.Errorf("LOOKUP: failed to validate secret %s/%s for cert %s after %d attempts",
-		k.certNamespace, secretName, KubeConfigCertName, kubeConfigMaxRetries)
-	return false, nil
-}
-
-// checkKubeConfigSecret checks the kubeconfig secret and determines if retry is needed
-func (k *BKEKubernetesCertGenerator) checkKubeConfigSecret(secretName string, attempt, maxRetries int) (bool, bool) {
-	secret := &corev1.Secret{}
-	err := k.client.Get(k.ctx, types.NamespacedName{Namespace: k.certNamespace, Name: secretName}, secret)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			return false, false
-		}
-		return false, false
-	}
-
-	// Check if value field exists
-	if secret.Data["value"] == nil {
-		return false, false
-	}
-
-	// For HA cluster, check ha field
-	if IsHACluster(k.bkeCluster, k.nodes) && secret.Data["ha"] == nil {
-		// Only retry if not the last attempt
-		if attempt < maxRetries {
-			return false, true
-		}
-		return false, false
-	}
-
-	return true, false
+	return ready, nil
 }
 
 func (k *BKEKubernetesCertGenerator) loadCaCertContent() error {
@@ -479,10 +494,10 @@ func (k *BKEKubernetesCertGenerator) createOrUpdateSecret(secret *corev1.Secret)
 	if err := k.client.Create(k.ctx, secret); err != nil {
 		if apierrors.IsAlreadyExists(err) {
 			if err := k.client.Delete(k.ctx, secret); err != nil {
-				return errors.Errorf("failed to delete secret %q: %v", utils.ClientObjNS(secret), err)
+				return fmt.Errorf("failed to delete secret %q: %w", utils.ClientObjNS(secret), err)
 			}
 			if err := k.client.Create(k.ctx, secret); err != nil {
-				return errors.Errorf("failed to create secret %q: %v", utils.ClientObjNS(secret), err)
+				return fmt.Errorf("failed to create secret %q: %w", utils.ClientObjNS(secret), err)
 			}
 		}
 	}
@@ -497,7 +512,7 @@ func (k *BKEKubernetesCertGenerator) maybeCreateKubeConfig() error {
 
 	if err := k.GenerateKubeConfig(k.kubeConfigEndpoint); err != nil {
 		k.log.Errorf("CREATE_SECRETS: failed to create kubeconfig: %v", err)
-		return errors.Errorf("failed to create kubeconfig secret: %v", err)
+		return fmt.Errorf("failed to create kubeconfig secret: %w", err)
 	}
 	return nil
 }
@@ -509,7 +524,7 @@ func (k *BKEKubernetesCertGenerator) generateCACertAndKey(caCert *pkiutil.BKECer
 	}
 	crt, key, err := pkiutil.NewCertificateAuthority(caCert)
 	if err != nil {
-		return errors.Errorf("failed to generate CA cert and key: %v", err)
+		return fmt.Errorf("failed to generate CA cert and key: %w", err)
 	}
 	k.fillInCertificateContent(pkiutil.EncodeCertToPEM(crt), pkiutil.EncodeKeyToPEM(key), caCert.Name, true)
 	return nil
@@ -519,11 +534,11 @@ func (k *BKEKubernetesCertGenerator) generateCACertAndKey(caCert *pkiutil.BKECer
 func (k *BKEKubernetesCertGenerator) generateSAKeyAndPublicKey(saCert *pkiutil.BKECert) error {
 	pub, key, err := pkiutil.NewRSACertAndKey(saCert)
 	if err != nil {
-		return errors.Errorf("failed to generate private key: %v", err)
+		return fmt.Errorf("failed to generate private key: %w", err)
 	}
 	pubBytes, err := pkiutil.EncodePublicKeyToPEM(pub)
 	if err != nil {
-		return errors.Errorf("failed to encode public key: %v", err)
+		return fmt.Errorf("failed to encode public key: %w", err)
 	}
 	k.fillInCertificateContent(pubBytes, pkiutil.EncodeKeyToPEM(key), saCert.Name, false)
 	return nil
@@ -556,7 +571,7 @@ func (k *BKEKubernetesCertGenerator) generateCertAndKeyWithCA(cert *pkiutil.BKEC
 
 	caCrt, err := crypto.ParseCertsPEM(caCertContent[TLSCrtDataName])
 	if err != nil {
-		return errors.Errorf("failed to parse CA certificate %q: %v", cert.CAName, err)
+		return fmt.Errorf("failed to parse CA certificate %q: %w", cert.CAName, err)
 	}
 	if !caCrt[0].IsCA {
 		return errors.Errorf("certificate %q is not a CA", cert.CAName)
@@ -564,7 +579,7 @@ func (k *BKEKubernetesCertGenerator) generateCertAndKeyWithCA(cert *pkiutil.BKEC
 
 	caKey, err := crypto.ParsePrivateKeyPEM(caCertContent[TLSKeyDataName])
 	if err != nil {
-		return errors.Errorf("failed to parse CA private key %q: %v", cert.CAName, err)
+		return fmt.Errorf("failed to parse CA private key %q: %w", cert.CAName, err)
 	}
 
 	rsaKey, ok := caKey.(*rsa.PrivateKey)
@@ -574,7 +589,7 @@ func (k *BKEKubernetesCertGenerator) generateCertAndKeyWithCA(cert *pkiutil.BKEC
 
 	crt, key, err := pkiutil.NewCertAndKey(cert, caCrt[0], rsaKey)
 	if err != nil {
-		return errors.Errorf("failed to generate cert and key: %v", err)
+		return fmt.Errorf("failed to generate cert and key: %w", err)
 	}
 	if HasServerAuth(crt) {
 		log.Debugf("%q serving cert is signed for DNS names %v and IPs %v",
@@ -597,7 +612,7 @@ func (k *BKEKubernetesCertGenerator) getCertificateFromSecret(certName string) (
 	}
 	if err := k.client.Get(k.ctx, secretKey, secret); err != nil {
 		objNS := utils.ClientObjNS(secret)
-		return nil, errors.Errorf("failed to get secret %q: %v", objNS, err)
+		return nil, fmt.Errorf("failed to get secret %q: %w", objNS, err)
 	}
 
 	crtBytes, ok := secret.Data[TLSCrtDataName]
@@ -624,24 +639,26 @@ func (k *BKEKubernetesCertGenerator) getCertificateFromSecret(certName string) (
 	return crt[0], nil
 }
 
-// VerifyExpirationTime verifies the expiration time of the certificate
-// If the certificate will expire in 30 days, an error will be returned
-func (k *BKEKubernetesCertGenerator) VerifyExpirationTime() error {
-	k.bkeCerts = []*pkiutil.BKECert{
-		pkiutil.BKECertRootCA(),
-		pkiutil.BKECertEtcdCA(),
-		pkiutil.BKECertFrontProxyCA(),
+// isCertExpiringSoon checks if a certificate will expire within CertExpireAlertDays.
+// Returns false for non-cert entries (kubeconfig, SA key pair) or on parse errors
+// to avoid blocking the normal flow.
+func (k *BKEKubernetesCertGenerator) isCertExpiringSoon(cert *pkiutil.BKECert) bool {
+	// kubeconfig is stored as a kubeconfig file in the "value" key, not tls.crt; skip it.
+	if cert.Name == KubeConfigCertName {
+		return false
 	}
-	for _, cert := range k.bkeCerts {
-		crt, err := k.getCertificateFromSecret(cert.Name)
-		if err != nil {
-			return err
-		}
-		if crt.NotAfter.Before(time.Now().AddDate(0, 0, constant.CertExpireAlertDays)) {
-			return errors.Errorf("certificate %q will expire in less than 30 days", cert.Name)
-		}
+
+	crt, err := k.getCertificateFromSecret(cert.Name)
+	if err != nil {
+		// SA key pair is not an x509 certificate; getCertificateFromSecret fails on it.
+		k.log.Debugf("skip expiration check for %q: %v", cert.Name, err)
+		return false
 	}
-	return nil
+
+	if crt.NotAfter.Before(time.Now().AddDate(0, 0, constant.CertExpireAlertDays)) {
+		return true
+	}
+	return false
 }
 
 // VerifyCertificateSans verifies the SANs of the certificate.
@@ -709,18 +726,14 @@ func (k *BKEKubernetesCertGenerator) createInitialKubeConfig(endpoint string) er
 		})
 	if err != nil && !apierrors.IsAlreadyExists(err) {
 		k.log.Errorf("GENERATE_KUBECONFIG: failed to create kubeconfig secret: %v", err)
-		return errors.Errorf("failed to create kubeconfig secret: %v", err)
+		return fmt.Errorf("failed to create kubeconfig secret: %w", err)
 	}
 	k.log.Infof("GENERATE_KUBECONFIG: kubeconfig secret created successfully")
 	return nil
 }
 
-// handleHAKubeConfig handles HA cluster kubeconfig generation
 func (k *BKEKubernetesCertGenerator) handleHAKubeConfig() error {
 	k.log.Infof("GENERATE_KUBECONFIG: processing HA cluster kubeconfig")
-	// 登一秒 太快了get不到
-	k.log.Infof("GENERATE_KUBECONFIG: waiting 1 second before processing HA kubeconfig")
-	time.Sleep(1 * time.Second)
 
 	secretName := NewCertSecretName(k.certClusterName, "kubeconfig")
 	k.log.Infof("GENERATE_KUBECONFIG: getting kubeconfig secret %s/%s", k.certNamespace, secretName)
@@ -728,7 +741,7 @@ func (k *BKEKubernetesCertGenerator) handleHAKubeConfig() error {
 	if err := k.client.Get(k.ctx, types.NamespacedName{Name: secretName, Namespace: k.certNamespace}, secret); err != nil {
 		k.log.Errorf("GENERATE_KUBECONFIG: failed to get kubeconfig secret %s/%s: %v",
 			k.certNamespace, secretName, err)
-		return errors.Errorf("failed to get secret %q: %v", utils.ClientObjNS(secret), err)
+		return fmt.Errorf("failed to get secret %q: %w", utils.ClientObjNS(secret), err)
 	}
 	k.log.Infof("GENERATE_KUBECONFIG: successfully retrieved kubeconfig secret %s/%s",
 		k.certNamespace, secretName)
@@ -757,7 +770,7 @@ func (k *BKEKubernetesCertGenerator) updateHAKubeConfig(secret *corev1.Secret, s
 	if err != nil {
 		k.log.Errorf("GENERATE_KUBECONFIG: failed to load kubeconfig from secret %s/%s: %v",
 			k.certNamespace, secretName, err)
-		return errors.Errorf("failed to load kubeconfig: %v", err)
+		return fmt.Errorf("failed to load kubeconfig: %w", err)
 	}
 	k.log.Infof("GENERATE_KUBECONFIG: successfully loaded kubeconfig from secret %s/%s",
 		k.certNamespace, secretName)
@@ -770,21 +783,27 @@ func (k *BKEKubernetesCertGenerator) updateHAKubeConfig(secret *corev1.Secret, s
 	kubeconfigBytes, err = clientcmd.Write(*kubeconfig)
 	if err != nil {
 		k.log.Errorf("GENERATE_KUBECONFIG: failed to write kubeconfig: %v", err)
-		return errors.Errorf("failed to write kubeconfig: %v", err)
+		return fmt.Errorf("failed to write kubeconfig: %w", err)
 	}
 	k.log.Infof("GENERATE_KUBECONFIG: successfully wrote kubeconfig")
 
-	secret.Data["ha"] = kubeconfigBytes
 	k.log.Infof("GENERATE_KUBECONFIG: adding 'ha' field to kubeconfig secret %s/%s",
 		k.certNamespace, secretName)
-	if err := k.client.Update(k.ctx, secret); err != nil {
+	err = phaseutil.RetryOnConflict(func() error {
+		latestSecret := &corev1.Secret{}
+		if err := k.client.Get(k.ctx, client.ObjectKey{Namespace: k.certNamespace, Name: secretName}, latestSecret); err != nil {
+			return errors.Wrapf(err, "failed to get secret %q", utils.ClientObjNS(secret))
+		}
+		latestSecret.Data["ha"] = kubeconfigBytes
+		return k.client.Update(k.ctx, latestSecret)
+	})
+	if err != nil {
 		k.log.Errorf("GENERATE_KUBECONFIG: failed to update kubeconfig secret %s/%s: %v",
 			k.certNamespace, secretName, err)
-		return errors.Errorf("failed to update secret %q: %v", utils.ClientObjNS(secret), err)
+		return errors.Wrapf(err, "failed to update secret %q", utils.ClientObjNS(secret))
 	}
 	k.log.Infof("GENERATE_KUBECONFIG: successfully updated kubeconfig secret %s/%s with 'ha' field",
 		k.certNamespace, secretName)
-
 	return nil
 }
 
@@ -838,8 +857,7 @@ func (k *BKEKubernetesCertGenerator) tryLoadGlobalCAFromSecret() (map[string][]b
 			k.log.Infof("global CA secret %s/%s not found", GlobalCANamespace, GlobalCASecretName)
 			return nil, false, nil
 		}
-		return nil, false, errors.Errorf("failed to get global CA secret %s/%s:%v",
-			GlobalCANamespace, GlobalCASecretName, err)
+		return nil, false, fmt.Errorf("failed to get global CA secret %s/%s:%w", GlobalCANamespace, GlobalCASecretName, err)
 	}
 	if err := k.validateGlobalCASecret(secret); err != nil {
 		k.log.Warnf("invalid global CA secret %s/%s: %v", GlobalCANamespace, GlobalCASecretName, err)
@@ -860,10 +878,10 @@ func (k *BKEKubernetesCertGenerator) validateGlobalCASecret(secret *corev1.Secre
 		return errors.Errorf("secret missing certificate or key")
 	}
 	if _, err := pkiutil.ParseCertsPEM(crtBytes); err != nil {
-		return errors.Errorf("invalid certificate: %v", err)
+		return fmt.Errorf("invalid certificate: %w", err)
 	}
 	if _, err := pkiutil.ParsePrivateKeyPEM(keyBytes); err != nil {
-		return errors.Errorf("invalid private key: %v", err)
+		return fmt.Errorf("invalid private key: %w", err)
 	}
 	return nil
 }
@@ -889,11 +907,11 @@ func (k *BKEKubernetesCertGenerator) loadLocalGlobalCA() (map[string][]byte, err
 	}
 	if _, err := pkiutil.ParseCertsPEM(crtBytes); err != nil {
 		k.log.Errorf("invalid local CA certificate: path=%s, error=%v", GlobalCACertPath, err)
-		return nil, errors.Errorf("invalid local CA certificate: %v", err)
+		return nil, fmt.Errorf("invalid local CA certificate: %w", err)
 	}
 	if _, err := pkiutil.ParsePrivateKeyPEM(keyBytes); err != nil {
 		k.log.Errorf("invalid local CA key: path=%s, error=%v", GlobalCAKeyPath, err)
-		return nil, errors.Errorf("invalid local CA key: %v", err)
+		return nil, fmt.Errorf("invalid local CA key: %w", err)
 	}
 	chainBytes, err := os.ReadFile(CertChainPath)
 	if err != nil {
@@ -923,7 +941,7 @@ func (k *BKEKubernetesCertGenerator) createGlobalCASecret(data map[string][]byte
 			k.log.Infof("global CA secret %s/%s already exists", GlobalCANamespace, GlobalCASecretName)
 			return err
 		}
-		return errors.Errorf("failed to create global CA secret %s/%s: %v", GlobalCANamespace, GlobalCASecretName, err)
+		return fmt.Errorf("failed to create global CA secret %s/%s: %w", GlobalCANamespace, GlobalCASecretName, err)
 	}
 	k.log.Infof("created global CA secret %s/%s from local files", GlobalCANamespace, GlobalCASecretName)
 	return nil

@@ -2,7 +2,7 @@
  * Copyright (c) 2024 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -14,9 +14,9 @@ package etcd
 
 import (
 	"context"
+	"fmt"
 	"time"
 
-	"github.com/pkg/errors"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.etcd.io/etcd/client/v3/snapshot"
 	"go.uber.org/zap"
@@ -49,12 +49,12 @@ func Save(c *k8setcd.Client, dbPath string) error {
 
 	snapshotLogger, err := zap.NewProduction()
 	if err != nil {
-		return errors.Errorf("failed to create etcd snapshot logger: %v", err)
+		return fmt.Errorf("failed to create etcd snapshot logger: %w", err)
 	}
 	defer func() { _ = snapshotLogger.Sync() }()
 
 	if err := snapshot.Save(ctx, snapshotLogger, cfg, dbPath); err != nil {
-		return errors.Errorf("failed to save etcd snapshot: %v", err)
+		return fmt.Errorf("failed to save etcd snapshot: %w", err)
 	}
 	return nil
 }

@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -310,11 +310,6 @@ func CtxDone(ctx context.Context) bool {
 	}
 }
 
-// RemoveTimestamps 移除字符串中的时间戳，直接移除后十位字符
-func RemoveTimestamps(s string) string {
-	return s[:strings.LastIndex(s, "-")]
-}
-
 // CommonPrefix Returns the longest common prefix with the most occurrences in a set of strings
 func CommonPrefix(strs []string) string {
 	if len(strs) == 0 {
@@ -431,4 +426,13 @@ func GetExtraLoadBalanceIP(customExtra map[string]string) string {
 		}
 	}
 	return ""
+}
+
+func GetNodeIPFromCommandWaitResult(result string) string {
+	nodeInfo := strings.Split(result, "/")
+	nodeIP := nodeInfo[0]
+	if len(nodeInfo) == 2 {
+		nodeIP = nodeInfo[1]
+	}
+	return nodeIP
 }

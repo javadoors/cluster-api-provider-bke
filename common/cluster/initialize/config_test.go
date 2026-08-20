@@ -3,7 +3,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -21,6 +21,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/initialize/versions"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
 )
 
@@ -365,8 +366,8 @@ func TestGetDefaultBKEConfig(t *testing.T) {
 	cfg := GetDefaultBKEConfig()
 
 	// Test default values are set
-	if cfg.Cluster.KubernetesVersion != DefaultKubernetesVersion {
-		t.Errorf("Expected KubernetesVersion to be %s, got %s", DefaultKubernetesVersion, cfg.Cluster.KubernetesVersion)
+	if cfg.Cluster.KubernetesVersion != versions.KubernetesVersion() {
+		t.Errorf("Expected KubernetesVersion to be %s, got %s", versions.KubernetesVersion(), cfg.Cluster.KubernetesVersion)
 	}
 
 	if cfg.Cluster.Networking.ServiceSubnet != DefaultServicesSubnet {
@@ -397,9 +398,9 @@ func TestBKEConfigGetDefaultClusterAPIConfig(t *testing.T) {
 	SetDefaultBKEConfig(cfg)
 
 	// Test that defaults are set properly
-	if cfg.Cluster.KubernetesVersion != DefaultKubernetesVersion {
+	if cfg.Cluster.KubernetesVersion != versions.KubernetesVersion() {
 		t.Errorf("Expected KubernetesVersion to be %s after SetDefaultBKEConfig, got %s",
-			DefaultKubernetesVersion, cfg.Cluster.KubernetesVersion)
+			versions.KubernetesVersion(), cfg.Cluster.KubernetesVersion)
 	}
 
 	if cfg.Cluster.Networking.DNSDomain != DefaultServiceDNSDomain {

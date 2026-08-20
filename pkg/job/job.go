@@ -26,6 +26,7 @@ import (
 
 // Task Global tasks
 type Task struct {
+	mu                      sync.RWMutex
 	StopChan                chan struct{}        `json:"stopChan"`
 	Phase                   v1beta1.CommandPhase `json:"phase"`
 	ResourceVersion         string               `json:"resourceVersion"`
@@ -35,11 +36,55 @@ type Task struct {
 	Once                    *sync.Once           `json:"once"`
 }
 
+func (t *Task) SetPhase(phase v1beta1.CommandPhase) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.Phase = phase
+}
+
+func (t *Task) GetPhase() v1beta1.CommandPhase {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.Phase
+}
+
+func (t *Task) GetGeneration() int64 {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.Generation
+}
+
+func (t *Task) GetResourceVersion() string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.ResourceVersion
+}
+
+// ShouldProcessTTL reports whether the task is complete and eligible for TTL cleanup.
+func (t *Task) ShouldProcessTTL() bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return !t.HasAddTimer && t.TTLSecondsAfterFinished != 0 && t.Phase == v1beta1.CommandComplete
+}
+
+// MarkTimerAdded marks the task as scheduled for TTL deletion.
+// Returns ttl seconds and true when the timer is newly scheduled.
+func (t *Task) MarkTimerAdded() (int, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.HasAddTimer {
+		return 0, false
+	}
+	t.HasAddTimer = true
+	return t.TTLSecondsAfterFinished, true
+}
+
 type Job struct {
 	BuiltIn builtin.BuiltIn
 	K8s     k8s.K8s
 	Shell   shell.Shell
 	Task    map[string]*Task
+	taskMu  sync.RWMutex
 }
 
 func NewJob(client client.Client) (Job, error) {
@@ -64,4 +109,33 @@ func (t *Task) SafeClose() {
 	t.Once.Do(func() {
 		close(t.StopChan)
 	})
+}
+
+func (j *Job) GetTask(gid string) (*Task, bool) {
+	j.taskMu.RLock()
+	defer j.taskMu.RUnlock()
+	t, ok := j.Task[gid]
+	return t, ok
+}
+
+func (j *Job) SetTask(gid string, task *Task) {
+	j.taskMu.Lock()
+	defer j.taskMu.Unlock()
+	j.Task[gid] = task
+}
+
+func (j *Job) DeleteTask(gid string) {
+	j.taskMu.Lock()
+	defer j.taskMu.Unlock()
+	delete(j.Task, gid)
+}
+
+func (j *Job) SnapshotTasks() map[string]*Task {
+	j.taskMu.RLock()
+	defer j.taskMu.RUnlock()
+	snap := make(map[string]*Task, len(j.Task))
+	for k, v := range j.Task {
+		snap[k] = v
+	}
+	return snap
 }

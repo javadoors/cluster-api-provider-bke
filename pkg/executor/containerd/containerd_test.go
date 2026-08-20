@@ -3,7 +3,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT
@@ -836,7 +836,7 @@ func TestWaitContainerdReadyTimeout(t *testing.T) {
 
 	err := WaitContainerdReady()
 	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "failed to wait containerd available")
+	assert.Contains(t, err.Error(), "wait containerd available")
 }
 
 func TestNewContainedClientNamespaceApplied(t *testing.T) {
@@ -1542,7 +1542,8 @@ func TestStopPausedWithResumeError(t *testing.T) {
 	}
 
 	err := client.Stop("test-container")
-	assert.NoError(t, err)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "unpause container test-container")
 }
 
 func TestStopTaskWaitError(t *testing.T) {

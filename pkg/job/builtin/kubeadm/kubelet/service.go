@@ -97,7 +97,7 @@ func (s *ServiceGenerator) GenerateService(config *confv1beta1.KubeletService, c
 		}
 		substitutedContent, err := substitutor.Substitute(configContent)
 		if err != nil {
-			return fmt.Errorf("failed to substitute variables in service content: %v", err)
+			return fmt.Errorf("failed to substitute variables in service content: %w", err)
 		}
 		configContent = substitutedContent
 	}

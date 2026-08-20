@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -21,52 +21,28 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 
-	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/mfutil"
 	labelhelper "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/label"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
+// CheckClusterHealth 先执行优化后的核心健康检查，再继续执行原有 addon 健康检查。
+// 核心健康检查覆盖节点和规格中的 8 个基础组件；addon 续查用于保留旧行为。
 func (c *Client) CheckClusterHealth(cluster *bkev1beta1.BKECluster, currentVersion string, bkeNodes bkev1beta1.BKENodes) error {
-	log := c.Log
-	// check cluster health
-	nodeLi, err := c.ListNodes(nil)
-	if err != nil {
+	c.Log.Infof("cluster %s/%s health check start", cluster.Namespace, cluster.Name)
+	config := c.LoadHealthCheckConfig()
+	c.Log.Infof("cluster %s/%s health check config loaded, intervals critical=%s important=%s optional=%s normal=%s, components=%s",
+		cluster.Namespace, cluster.Name, config.Intervals.Critical, config.Intervals.Important, config.Intervals.Optional, config.Intervals.Normal, healthCheckConfigSummary(config))
+	checker := NewUnifiedHealthChecker(c, config)
+	if err := checker.Check(cluster, currentVersion, bkeNodes); err != nil {
+		return newHealthCheckRequeueError(err, config.Intervals)
+	}
+	c.Log.Infof("cluster %s/%s core health check pass, continue addon health check", cluster.Namespace, cluster.Name)
+	if err := c.CheckAddonComponentsHealth(cluster, c.Log); err != nil {
 		return err
 	}
-	if currentVersion == "" {
-		currentVersion = cluster.Spec.ClusterConfig.Cluster.KubernetesVersion
-	}
-	var errs []error
-	for _, node := range nodeLi.Items {
-		nodeIP := GetNodeIP(&node)
-		if bkeNodes.GetNodeStateNeedSkip(nodeIP) {
-			log.Debugf("node %q (IP: %s) health check skipped due to needskip=true", node.Name, nodeIP)
-			continue
-		}
-
-		if NodeReady(&node) {
-			bkeNodes.SetNodeStateWithMessage(GetNodeIP(&node), confv1beta1.NodeReady, "")
-		}
-
-		if err := c.NodeHealthCheck(&node, currentVersion, log); err != nil {
-			bkeNodes.SetNodeStateWithMessage(GetNodeIP(&node), confv1beta1.NodeNotReady, err.Error())
-			log.Debugf("node %q health check failed: %v", node.Name, err)
-			errs = append(errs, errors.Errorf("node %q health check failed: %v", node.Name, err))
-		}
-	}
-
-	if err = c.CheckAllComponentsHealth(cluster, log); err != nil {
-		errs = append(errs, err)
-		return kerrors.NewAggregate(errs)
-	}
-
-	if len(errs) > 0 {
-		return kerrors.NewAggregate(errs)
-	}
-
-	log.Infof("cluster %s/%s health check pass", cluster.Namespace, cluster.Name)
+	c.Log.Infof("cluster %s/%s health check pass", cluster.Namespace, cluster.Name)
 	return nil
 }
 
@@ -87,8 +63,10 @@ func (c *Client) CheckComponentHealth(node *corev1.Node) error {
 
 // ComponentCheck 定义需要检查的命名空间和对应的 Pod 前缀
 type ComponentCheck struct {
+	Name      ComponentName
 	Namespace string
 	Prefixes  []string
+	Priority  HealthCheckPriority
 }
 
 type AddonCheck struct {
@@ -96,15 +74,38 @@ type AddonCheck struct {
 	Components []ComponentCheck
 }
 
-// 必须安装的扩展件
-var neededAddons = []string{
-	"kubeproxy",
-	"calico",
-	"coredns",
-}
-
-// 额外安装的扩展件
+// 可选安装的扩展件：仅当集群 Spec.Addons 中包含对应 addon 时才执行健康检查
 var extraAddonComponents = []AddonCheck{
+	{
+		Addon: "coredns",
+		Components: []ComponentCheck{
+			{
+				Namespace: "kube-system",
+				Prefixes:  []string{"coredns"},
+			},
+		},
+	},
+	{
+		Addon: "kubeproxy",
+		Components: []ComponentCheck{
+			{
+				Namespace: "kube-system",
+				Prefixes:  []string{"kube-proxy-"},
+			},
+		},
+	},
+	{
+		Addon: "calico",
+		Components: []ComponentCheck{
+			{
+				Namespace: "kube-system",
+				Prefixes: []string{
+					"calico-kube-controllers-",
+					"calico-node-",
+				},
+			},
+		},
+	},
 	{
 		Addon: "cluster-api",
 		Components: []ComponentCheck{
@@ -158,40 +159,21 @@ var extraAddonComponents = []AddonCheck{
 				Namespace: "openfuyao-system-controller",
 				Prefixes:  []string{"openfuyao-system-controller-"},
 			},
-			{
-				Namespace: "cluster-system",
-				Prefixes: []string{
-					"bkeagent-deployer",
-				},
-			},
 		},
 	},
 }
 
-// 全局配置：定义需要检查的组件及其命名空间和前缀
+// 全局配置：定义集群基础控制面组件（不含可选 addon 如 coredns、kube-proxy、calico）
 var neededComponentChecks = []ComponentCheck{
 	{
 		Namespace: "kube-system",
 		Prefixes: []string{
-			"calico-kube-controllers",
-			"calico-node",
-			"coredns",
 			"etcd-",
 			"kube-apiserver-",
 			"kube-controller-manager-",
-			"kube-proxy-",
 			"kube-scheduler-",
 		},
 	},
-}
-
-func checkItemContains(checkItem string, neededAddons []string) bool {
-	for _, item := range neededAddons {
-		if item == checkItem {
-			return true
-		}
-	}
-	return false
 }
 
 // CheckAllComponentsHealth check all components health
@@ -209,17 +191,11 @@ func (c *Client) CheckAllComponentsHealth(cluster *bkev1beta1.BKECluster, log *l
 	addons := cluster.Spec.ClusterConfig.Addons
 
 	for _, addon := range addons {
-		if checkItemContains(addon.Name, neededAddons) {
-			continue
-		}
-		// 判断 Addon 是否在 extraAddonComponents 中（需要校验的 Addon）
 		_, needCheck := findAddonComponent(addon.Name)
 		if !needCheck {
-			// 2. 不在 extraAddonComponents 中 → 自动跳过（用户自定义 Addon 无需校验）
 			log.Debugf("addon %q is not in extraAddonComponents, skip health check", addon.Name)
 			continue
 		}
-		// 仅对「在 extraAddonComponents 中定义的 Addon」执行校验
 		if err := c.processAddonComponentCheck(addon.Name); err != nil {
 			errs = append(errs, err)
 		}
@@ -227,10 +203,44 @@ func (c *Client) CheckAllComponentsHealth(cluster *bkev1beta1.BKECluster, log *l
 	return kerrors.NewAggregate(errs)
 }
 
+// coreHealthAddons 已经由统一健康检查中的 8 个核心组件覆盖。
+// CheckClusterHealth 后续执行 addon 检查时跳过这些 addon，避免重复检查同一批 Pod；
+// CheckAllComponentsHealth 保持旧语义，不使用该去重表。
+var coreHealthAddons = map[string]struct{}{
+	"calico":    {},
+	"coredns":   {},
+	"kubeproxy": {},
+}
+
+// CheckAddonComponentsHealth 保留原 addon 检查路径，但跳过核心健康检查已覆盖的 addon。
+func (c *Client) CheckAddonComponentsHealth(cluster *bkev1beta1.BKECluster, log *log.Logger) error {
+	var errs []error
+	checkedAddons := 0
+	skippedCoreAddons := 0
+	for _, addon := range cluster.Spec.ClusterConfig.Addons {
+		if _, covered := coreHealthAddons[addon.Name]; covered {
+			skippedCoreAddons++
+			log.Debugf("addon %q is covered by core health check, skip duplicate addon health check", addon.Name)
+			continue
+		}
+		_, needCheck := findAddonComponent(addon.Name)
+		if !needCheck {
+			log.Debugf("addon %q is not in extraAddonComponents, skip health check", addon.Name)
+			continue
+		}
+		checkedAddons++
+		if err := c.processAddonComponentCheck(addon.Name); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	log.Infof("addon health check finished, checked=%d, skippedCore=%d, failed=%d", checkedAddons, skippedCoreAddons, len(errs))
+	return kerrors.NewAggregate(errs)
+}
+
 func (c *Client) processComponentCheck(check ComponentCheck) error {
 	pods, err := c.getPods(check.Namespace)
 	if err != nil {
-		return fmt.Errorf("list pods in %s failed: %v", check.Namespace, err)
+		return fmt.Errorf("list pods in %s failed: %w", check.Namespace, err)
 	}
 
 	var errs []error
@@ -288,7 +298,7 @@ func (c *Client) verifyComponentPods(pods []corev1.Pod, prefix string, namespace
 			if err := isPodHealthy(pod); err == nil {
 				return nil
 			} else {
-				errs = append(errs, fmt.Errorf("pod %s/%s unhealthy: %v", pod.Namespace, pod.Name, err))
+				errs = append(errs, fmt.Errorf("pod %s/%s unhealthy: %w", pod.Namespace, pod.Name, err))
 			}
 		}
 		return kerrors.NewAggregate(errs)
@@ -296,7 +306,7 @@ func (c *Client) verifyComponentPods(pods []corev1.Pod, prefix string, namespace
 
 	for _, pod := range matched {
 		if err := isPodHealthy(pod); err != nil {
-			errs = append(errs, fmt.Errorf("pod %s/%s unhealthy: %v", pod.Namespace, pod.Name, err))
+			errs = append(errs, fmt.Errorf("pod %s/%s unhealthy: %w", pod.Namespace, pod.Name, err))
 		}
 	}
 	return kerrors.NewAggregate(errs)

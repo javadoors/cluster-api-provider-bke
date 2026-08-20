@@ -22,4 +22,13 @@ func TestIsSkipNotInstalled(t *testing.T) {
 	if IsSkipNotInstalled(nil) {
 		t.Fatal("nil should not match")
 	}
+	if err.Error() != "manifest upgrade skipped: component not installed: kube-proxy" {
+		t.Fatalf("unexpected error: %s", err)
+	}
+	if got := (*SkipNotInstalledError)(nil).Error(); got != ErrSkipNotInstalled.Error() {
+		t.Fatalf("nil receiver error: %s", got)
+	}
+	if got := (&SkipNotInstalledError{}).Error(); got != ErrSkipNotInstalled.Error() {
+		t.Fatalf("empty component error: %s", got)
+	}
 }

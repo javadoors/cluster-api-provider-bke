@@ -2,7 +2,7 @@
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -23,9 +23,12 @@ import (
 
 const (
 	// DeclarativeUpgradeAnnotationKey enables declarative DAG upgrade on a BKECluster (legacy; gate uses upgrade-ready only).
-	DeclarativeUpgradeAnnotationKey = "cvo.openfuyao.cn/declarative-upgrade"
+	DeclarativeUpgradeAnnotationKey = annotation.CVODeclarativeUpgradeAnnotationKey
 	// UpgradeReadyAnnotationKey is set by ClusterVersionReconciler when an upgrade should run.
 	UpgradeReadyAnnotationKey = annotation.CVOUpgradeReadyAnnotationKey
+	// HelmComponentAnnotationKey enables yaml/helm ComponentExecutor injection for a single object.
+	// When present, its value overrides --helm-component-support (annotation-first).
+	HelmComponentAnnotationKey = "cvo.openfuyao.cn/helm-component"
 )
 
 // DeclarativeUpgradeEnabled reports whether declarative upgrade DAG should run.
@@ -49,4 +52,15 @@ func UpgradeReady(obj client.Object) (string, bool) {
 	v, ok := annotation.HasAnnotation(obj, UpgradeReadyAnnotationKey)
 	v = strings.TrimSpace(v)
 	return v, ok && v != ""
+}
+
+// HelmComponentEnabled reports whether yaml/helm ComponentExecutors may be injected.
+// Annotation cvo.openfuyao.cn/helm-component, when present, overrides --helm-component-support.
+func HelmComponentEnabled(obj client.Object) bool {
+	if obj != nil {
+		if v, ok := annotation.HasAnnotation(obj, HelmComponentAnnotationKey); ok {
+			return strings.EqualFold(strings.TrimSpace(v), "true")
+		}
+	}
+	return config.HelmComponentSupport
 }

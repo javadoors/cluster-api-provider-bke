@@ -13,6 +13,7 @@
 package reset
 
 import (
+	"fmt"
 	"net"
 	"path"
 	"strings"
@@ -77,18 +78,15 @@ func (r ResetPlugin) Execute(commands []string) ([]string, error) {
 	if v, ok := commandsMap["bkeConfig"]; ok && v != "" {
 		cfg, err = plugin.GetBkeConfig(v)
 		if err != nil {
-			log.Errorf("get bke config failed: %v", err)
 			return nil, err
 		}
 		nodesData, err = plugin.GetNodesData(v)
 		if err != nil {
-			log.Errorf("get bke node failed: %v", err)
 			return nil, err
 		}
 	}
 	if cfg == nil {
-		log.Errorf("bke config is required but not provided")
-		return nil, err
+		return nil, fmt.Errorf("bke config is required but not provided")
 	}
 
 	cfg.CustomExtra["allInOne"] = "false"

@@ -13,6 +13,7 @@
 package builtin
 
 import (
+	"fmt"
 	"runtime/debug"
 	"strings"
 
@@ -103,7 +104,7 @@ func (t *Task) Execute(execCommands []string) ([]string, error) {
 			log.Error(string(debug.Stack()))
 			if recoverErr, ok := e.(error); ok {
 				log.Errorf("panic: %v", recoverErr)
-				panicErr = errors.Errorf("panic: %v", recoverErr)
+				panicErr = fmt.Errorf("panic: %w", recoverErr)
 			} else {
 				panicErr = errors.Errorf("panic: %v", e)
 			}

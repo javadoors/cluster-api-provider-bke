@@ -2,7 +2,7 @@
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -30,10 +30,13 @@ type ComponentVersion struct {
 
 // ComponentVersionSpec defines the desired state of ComponentVersion
 type ComponentVersionSpec struct {
-	Name            string              `json:"name"`
-	Type            ComponentType       `json:"type"`
-	Version         string              `json:"version"`
-	Inline          *InlineSpec         `json:"inline,omitempty"`
+	Name    string        `json:"name"`
+	Type    ComponentType `json:"type"`
+	Version string        `json:"version"`
+	Inline  *InlineSpec   `json:"inline,omitempty"`
+	// YAML configures yaml/manifest component install behavior when Type=yaml.
+	// Nil keeps legacy behavior for existing ComponentVersion objects.
+	YAML            *YAMLSpec           `json:"yaml,omitempty"`
 	SubComponents   []SubComponent      `json:"subComponents,omitempty"`
 	Compatibility   CompatibilitySpec   `json:"compatibility,omitempty"`
 	Dependencies    []Dependency        `json:"dependencies,omitempty"`
@@ -45,10 +48,10 @@ type ComponentVersionSpec struct {
 type ComponentType string
 
 const (
-	ComponentTypeYAML    ComponentType = "yaml"
-	ComponentTypeHelm    ComponentType = "helm"
-	ComponentTypeInline  ComponentType = "inline"
-	ComponentTypeBinary  ComponentType = "binary"
+	ComponentTypeYAML   ComponentType = "yaml"
+	ComponentTypeHelm   ComponentType = "helm"
+	ComponentTypeInline ComponentType = "inline"
+	ComponentTypeBinary ComponentType = "binary"
 )
 
 // InlineSpec defines the inline handler configuration
@@ -56,6 +59,81 @@ type InlineSpec struct {
 	Handler string `json:"handler"`
 	Version string `json:"version"`
 }
+
+// YAMLSpec configures YAML/Manifest component Apply / Uninstall / Prune / HealthCheck.
+type YAMLSpec struct {
+	// Namespace is the optional target namespace for deployment and prune listing.
+	Namespace string `json:"namespace,omitempty"`
+	// ApplyStrategy selects ServerSideApply (default), Replace, or CreateOnly.
+	// +kubebuilder:validation:Enum=ServerSideApply;Replace;CreateOnly
+	ApplyStrategy string `json:"applyStrategy,omitempty"`
+	// Prune enables pruning resources that match PruneLabelSelector but are absent from the current manifests.
+	Prune bool `json:"prune,omitempty"`
+	// PruneLabelSelector is required when Prune is true; used to list prune candidates in the cluster.
+	PruneLabelSelector map[string]string `json:"pruneLabelSelector,omitempty"`
+	// HealthCheck runs after successful Apply when Enabled is true.
+	HealthCheck *HealthCheckSpec `json:"healthCheck,omitempty"`
+}
+
+// HealthCheckSpec defines shared health-check configuration for YAML/Helm components.
+// Runtime converts this CRD type to pkg/healthcheck.Spec.
+type HealthCheckSpec struct {
+	// Enabled controls whether health checks run after Apply.
+	Enabled bool `json:"enabled"`
+	// Timeout bounds the overall retry window (Go duration string, e.g. "5m").
+	Timeout string `json:"timeout,omitempty"`
+	// Interval is the poll period between attempts (Go duration string, e.g. "2s").
+	Interval string `json:"interval,omitempty"`
+	// Checks is the ordered list of probes; all must pass.
+	Checks []HealthCheckItemSpec `json:"checks,omitempty"`
+}
+
+// HealthCheckItemSpec is one health probe. Type selects which nested config is used;
+// the other nested fields should be nil.
+type HealthCheckItemSpec struct {
+	// Type is PodReady / EndpointReady / Custom.
+	// +kubebuilder:validation:Enum=PodReady;EndpointReady;Custom
+	Type string `json:"type"`
+	// PodReady is used when Type=PodReady.
+	PodReady *PodReadyCheckSpec `json:"podReady,omitempty"`
+	// EndpointReady is used when Type=EndpointReady.
+	EndpointReady *EndpointReadyCheckSpec `json:"endpointReady,omitempty"`
+	// Custom is used when Type=Custom.
+	Custom *CustomCheckSpec `json:"custom,omitempty"`
+}
+
+// PodReadyCheckSpec checks Pod readiness by label selector.
+type PodReadyCheckSpec struct {
+	// Namespace of pods to list.
+	Namespace string `json:"namespace"`
+	// LabelSelector is a Kubernetes label selector string (e.g. "k8s-app=kube-dns").
+	LabelSelector string `json:"labelSelector"`
+	// MinReady is the minimum Ready pod count; 0 means all listed pods must be Ready.
+	MinReady int32 `json:"minReady,omitempty"`
+}
+
+// EndpointReadyCheckSpec checks that a Service has ready endpoints.
+type EndpointReadyCheckSpec struct {
+	// Namespace of the Service.
+	Namespace string `json:"namespace"`
+	// ServiceName is the Endpoints/Service name.
+	ServiceName string `json:"serviceName"`
+	// Port optionally restricts readiness to a specific port.
+	Port int32 `json:"port,omitempty"`
+}
+
+// CustomCheckSpec runs a command in the controller Pod; exit code 0 means pass.
+type CustomCheckSpec struct {
+	// Command is executed via /bin/sh -c (e.g. "curl -s http://.../healthz").
+	Command string `json:"command"`
+}
+
+// ApplyStrategy constants for YAMLSpec.ApplyStrategy.
+const (
+	ApplyStrategyServerSideApply = "ServerSideApply"
+	ApplyStrategyReplace         = "Replace"
+	ApplyStrategyCreateOnly      = "CreateOnly"
+)
 
 // SubComponent defines a sub-component reference
 type SubComponent struct {
@@ -118,4 +196,3 @@ type ComponentVersionList struct {
 func init() {
 	SchemeBuilder.Register(&ComponentVersion{}, &ComponentVersionList{})
 }
-

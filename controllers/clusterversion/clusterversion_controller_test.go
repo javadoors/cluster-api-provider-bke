@@ -248,6 +248,42 @@ func TestClusterVersionReconcilerClearsUpgradeReadyWhenDesiredEqualsCurrent(t *t
 	assert.NotContains(t, gotCluster.Annotations, AnnotationUpgradePath)
 }
 
+func TestClusterVersionReconcilerSkipsUpgradeWhenPhaseFailed(t *testing.T) {
+	reconciler := newTestReconciler(t,
+		testBKECluster("default", "cluster-a", "v2.5.0"),
+		&cvv1beta1.ClusterVersion{
+			ObjectMeta: objectMeta("default", "cluster-a"),
+			Spec:       cvv1beta1.ClusterVersionSpec{DesiredVersion: "v2.6.0"},
+			Status: cvv1beta1.ClusterVersionStatus{
+				CurrentVersion: "v2.5.0",
+				Phase:          cvv1beta1.ClusterVersionPhaseFailed,
+			},
+		},
+		&cvv1beta1.ReleaseImage{
+			ObjectMeta: objectMeta("default", "release-v2.6.0"),
+			Spec:       cvv1beta1.ReleaseImageSpec{Version: "v2.6.0"},
+			Status:     cvv1beta1.ReleaseImageStatus{Phase: cvv1beta1.ReleaseImagePhaseValid},
+		},
+		&cvv1beta1.UpgradePath{
+			ObjectMeta: objectMeta("", "openfuyao-upgrade-paths"),
+			Spec: cvv1beta1.UpgradePathSpec{
+				Paths:    []cvv1beta1.UpgradePathRule{{From: "v2.5.0", To: "v2.6.0"}},
+				Versions: []cvv1beta1.VersionEntry{{Version: "v2.6.0"}},
+			},
+			Status: cvv1beta1.UpgradePathStatus{Phase: cvv1beta1.UpgradePathPhaseActive},
+		},
+	)
+
+	_, err := reconciler.Reconcile(context.Background(), ctrl.Request{
+		NamespacedName: types.NamespacedName{Namespace: "default", Name: "cluster-a"},
+	})
+	require.NoError(t, err)
+
+	got := &bkev1beta1.BKECluster{}
+	require.NoError(t, reconciler.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "cluster-a"}, got))
+	assert.NotContains(t, got.Annotations, AnnotationUpgradeReady)
+}
+
 func TestClusterVersionReconcilerSkipsUpgradeWhenCurrentVersionMissing(t *testing.T) {
 	reconciler := newTestReconciler(t,
 		&bkev1beta1.BKECluster{

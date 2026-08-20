@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -14,6 +14,7 @@ package phaseutil
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/pkg/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -110,12 +111,12 @@ func GetClusterAPIAssociateObjs(ctx context.Context, c client.Client, cluster *c
 	}
 	kcp, err := GetClusterAPIKubeadmControlPlane(ctx, c, cluster)
 	if err != nil || kcp == nil {
-		return nil, errors.Errorf("get kubeadm control plane failed. err: %v", err)
+		return nil, fmt.Errorf("get kubeadm control plane failed. err: %w", err)
 	}
 
 	md, err := GetClusterAPIMachineDeployment(ctx, c, cluster)
 	if err != nil || md == nil {
-		return nil, errors.Errorf("get machine deployment failed. err: %v", err)
+		return nil, fmt.Errorf("get machine deployment failed. err: %w", err)
 	}
 
 	return &ClusterAPIObjs{
@@ -127,38 +128,120 @@ func GetClusterAPIAssociateObjs(ctx context.Context, c client.Client, cluster *c
 
 // PauseClusterAPIObj add pause Annotations to cluster api obj
 func PauseClusterAPIObj(ctx context.Context, c client.Client, obj client.Object, extraAnnotations ...string) error {
-	// pause cluster api obj
-	annotations := obj.GetAnnotations()
-	if annotations == nil {
-		annotations = map[string]string{}
-	}
-	annotations[clusterv1beta1.PausedAnnotation] = ""
-
-	for _, a := range extraAnnotations {
-		annotations[a] = ""
-	}
-
-	obj.SetAnnotations(annotations)
-	if err := c.Update(ctx, obj); err != nil {
-		return errors.Errorf("pause cluster api obj failed, obj: %s/%s/%s, err: %v", obj.GetObjectKind().GroupVersionKind().Kind, obj.GetNamespace(), obj.GetName(), err)
+	err := RetryOnConflict(func() error {
+		if err := c.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
+			return err
+		}
+		annotations := obj.GetAnnotations()
+		if annotations == nil {
+			annotations = map[string]string{}
+		}
+		annotations[clusterv1beta1.PausedAnnotation] = ""
+		for _, a := range extraAnnotations {
+			annotations[a] = ""
+		}
+		obj.SetAnnotations(annotations)
+		return c.Update(ctx, obj)
+	})
+	if err != nil {
+		return errors.Wrapf(err, "retry pause cluster api obj failed, obj: %s/%s/%s", obj.GetObjectKind().GroupVersionKind().Kind, obj.GetNamespace(), obj.GetName())
 	}
 	return nil
 }
 
-// ResumeClusterAPIObj remove  pause Annotations from cluster api obj
+// ResumeClusterAPIObj remove pause Annotations from cluster api obj
 func ResumeClusterAPIObj(ctx context.Context, c client.Client, obj client.Object, extraAnnotations ...string) error {
-	// resume cluster api obj
-	annotations := obj.GetAnnotations()
-	if annotations == nil {
-		obj.SetAnnotations(map[string]string{})
+	err := RetryOnConflict(func() error {
+		if err := c.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
+			return err
+		}
+		annotations := obj.GetAnnotations()
+		if annotations == nil {
+			annotations = map[string]string{}
+		}
+		delete(annotations, clusterv1beta1.PausedAnnotation)
+		for _, a := range extraAnnotations {
+			delete(annotations, a)
+		}
+		obj.SetAnnotations(annotations)
+		return c.Update(ctx, obj)
+	})
+	if err != nil {
+		return errors.Wrapf(err, "retry resume cluster api obj failed, obj: %s/%s/%s", obj.GetObjectKind().GroupVersionKind().Kind, obj.GetNamespace(), obj.GetName())
 	}
-	delete(annotations, clusterv1beta1.PausedAnnotation)
-	for _, a := range extraAnnotations {
-		delete(annotations, a)
+	return nil
+}
+
+// UpdateMachineDeploymentReplicas updates the replicas of a MachineDeployment with conflict retry.
+func UpdateMachineDeploymentReplicas(ctx context.Context, c client.Client, md *clusterv1beta1.MachineDeployment, replicas int32) error {
+	err := RetryOnConflict(func() error {
+		if err := c.Get(ctx, client.ObjectKeyFromObject(md), md); err != nil {
+			return err
+		}
+		md.Spec.Replicas = &replicas
+		return c.Update(ctx, md)
+	})
+	if err != nil {
+		return errors.Wrapf(err, "retry update MachineDeployment replicas failed, obj: %s/%s", md.GetNamespace(), md.GetName())
 	}
-	obj.SetAnnotations(annotations)
-	if err := c.Update(ctx, obj); err != nil {
-		return errors.Wrapf(err, "resume cluster api obj failed, obj: %s/%s/%s, err: %v", obj.GetObjectKind().GroupVersionKind().Kind, obj.GetNamespace(), obj.GetName(), err)
+	return nil
+}
+
+// UpdateKubeadmControlPlaneReplicas updates the replicas of a KubeadmControlPlane with conflict retry.
+func UpdateKubeadmControlPlaneReplicas(ctx context.Context, c client.Client, kcp *controlv1beta1.KubeadmControlPlane, replicas int32) error {
+	err := RetryOnConflict(func() error {
+		if err := c.Get(ctx, client.ObjectKeyFromObject(kcp), kcp); err != nil {
+			return err
+		}
+		kcp.Spec.Replicas = &replicas
+		return c.Update(ctx, kcp)
+	})
+	if err != nil {
+		return errors.Wrapf(err, "retry update KubeadmControlPlane replicas failed, obj: %s/%s", kcp.GetNamespace(), kcp.GetName())
+	}
+	return nil
+}
+
+// ResumeAndUpdateMachineDeploymentReplicas resumes (removes paused annotation) and updates
+// the replicas of a MachineDeployment in a single retry loop, avoiding a separate API round-trip.
+func ResumeAndUpdateMachineDeploymentReplicas(ctx context.Context, c client.Client, md *clusterv1beta1.MachineDeployment, replicas int32) error {
+	err := RetryOnConflict(func() error {
+		if err := c.Get(ctx, client.ObjectKeyFromObject(md), md); err != nil {
+			return err
+		}
+		annotations := md.GetAnnotations()
+		if annotations == nil {
+			annotations = map[string]string{}
+		}
+		delete(annotations, clusterv1beta1.PausedAnnotation)
+		md.SetAnnotations(annotations)
+		md.Spec.Replicas = &replicas
+		return c.Update(ctx, md)
+	})
+	if err != nil {
+		return errors.Wrapf(err, "retry resume and update MachineDeployment replicas failed, obj: %s/%s", md.GetNamespace(), md.GetName())
+	}
+	return nil
+}
+
+// ResumeAndUpdateKubeadmControlPlaneReplicas resumes (removes paused annotation) and updates
+// the replicas of a KubeadmControlPlane in a single retry loop, avoiding a separate API round-trip.
+func ResumeAndUpdateKubeadmControlPlaneReplicas(ctx context.Context, c client.Client, kcp *controlv1beta1.KubeadmControlPlane, replicas int32) error {
+	err := RetryOnConflict(func() error {
+		if err := c.Get(ctx, client.ObjectKeyFromObject(kcp), kcp); err != nil {
+			return err
+		}
+		annotations := kcp.GetAnnotations()
+		if annotations == nil {
+			annotations = map[string]string{}
+		}
+		delete(annotations, clusterv1beta1.PausedAnnotation)
+		kcp.SetAnnotations(annotations)
+		kcp.Spec.Replicas = &replicas
+		return c.Update(ctx, kcp)
+	})
+	if err != nil {
+		return errors.Wrapf(err, "retry resume and update KubeadmControlPlane replicas failed, obj: %s/%s", kcp.GetNamespace(), kcp.GetName())
 	}
 	return nil
 }
@@ -210,13 +293,19 @@ func NodeToMachine(ctx context.Context, c client.Client, bkeCluster *bkev1beta1.
 
 // MarkMachineForDeletion set delete Annotations for machine
 func MarkMachineForDeletion(ctx context.Context, c client.Client, machine *clusterv1beta1.Machine) error {
-	as := machine.GetAnnotations()
-	if as == nil {
-		as = map[string]string{}
-	}
-	as[clusterv1beta1.DeleteMachineAnnotation] = ""
-	machine.SetAnnotations(as)
-	return c.Update(ctx, machine)
+	return RetryOnConflict(func() error {
+		latestMachine := machine.DeepCopy()
+		if err := c.Get(ctx, client.ObjectKeyFromObject(machine), latestMachine); err != nil {
+			return err
+		}
+		annotations := latestMachine.GetAnnotations()
+		if annotations == nil {
+			annotations = map[string]string{}
+		}
+		annotations[clusterv1beta1.DeleteMachineAnnotation] = ""
+		latestMachine.SetAnnotations(annotations)
+		return c.Update(ctx, latestMachine)
+	})
 }
 
 // GetMachineAssociateKubeadmConfig fetches the kubeadm config for given machine

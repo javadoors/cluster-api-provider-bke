@@ -27,13 +27,18 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	bkecommonv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
+	bkecommon "gopkg.openfuyao.cn/cluster-api-provider-bke/common"
 	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/executor/exec"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/job/builtin/plugin"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/clientutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/mfutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/pkiutil"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/annotation"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/clusterutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
@@ -181,7 +186,7 @@ func (k *KubeadmPlugin) initControlPlane() error {
 	if err := k.initControlPlaneManifestCommand(); err != nil {
 		return err
 	}
-	if err := k.installKubeletCommand(); err != nil {
+	if err := k.installKubeletCommand(false); err != nil {
 		return err
 	}
 	// step 4 upload kubeadm cluster config and kubelet config to cluster-api
@@ -209,7 +214,7 @@ func (k *KubeadmPlugin) joinControlPlane() error {
 		return err
 	}
 	// step 2 run kubelet
-	if err := k.installKubeletCommand(); err != nil {
+	if err := k.installKubeletCommand(false); err != nil {
 		return err
 	}
 	// step 3 generate static pod yaml
@@ -233,12 +238,14 @@ func (k *KubeadmPlugin) joinWorker() error {
 		return err
 	}
 	// step 2 run kubelet
-	if err := k.installKubeletCommand(); err != nil {
+	if err := k.installKubeletCommand(k.boot.IsImmutableOS); err != nil {
 		return err
 	}
-	// step 3 install kubelet in worker node
-	if err := k.installKubectlCommand(); err != nil {
-		return err
+	// step 3 install kubectl（不可变 OS worker 节点不需要 kubectl）
+	if !k.boot.IsImmutableOS {
+		if err := k.installKubectlCommand(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -262,14 +269,12 @@ func (k *KubeadmPlugin) prepareUpgrade(backUpEtcd bool, clusterType string) (map
 
 	// step 3 pre pull image
 	if err := k.upgradePrePullImageCommand(); err != nil {
-		log.Errorf("failed to upgrade pre pull image, err: %v", err)
 		return nil, err
 	}
 
 	// step 4 get component pod hash map
 	beforeHash, err := k.getBeforeUpgradeComponentPodHash()
 	if err != nil {
-		log.Errorf("failed to get before upgrade component pod hash, err: %v", err)
 		return nil, err
 	}
 
@@ -305,8 +310,7 @@ func (k *KubeadmPlugin) upgradeControlPlane(backUpEtcd bool, clusterType string)
 		// 判断是否需要升级该组件
 		need, err := k.needUpgradeComponent(component)
 		if err != nil {
-			log.Errorf("failed to check need upgrade component, err: %v", err)
-			return err
+			return fmt.Errorf("failed to check need upgrade component, err: %w", err)
 		}
 		if !need {
 			log.Debugf("component %s already upgrade to %s, skip upgrade", component, k.boot.BkeConfig.Cluster.KubernetesVersion)
@@ -330,7 +334,7 @@ func (k *KubeadmPlugin) upgradeControlPlane(backUpEtcd bool, clusterType string)
 
 	// step 5 upgrade kubelet
 	log.Infof("upgrade kubelet for cluster %s", k.clusterName)
-	if err := k.installKubeletCommand(); err != nil {
+	if err := k.installKubeletCommand(false); err != nil {
 		return err
 	}
 	log.Infof("upgrade kubectl for control plane node, cluster %s", k.clusterName)
@@ -344,7 +348,7 @@ func (k *KubeadmPlugin) upgradeControlPlane(backUpEtcd bool, clusterType string)
 func (k *KubeadmPlugin) upgradeWorker() error {
 	log.Info("upgrade cluster in upgrade worker node phase", "cluster", k.clusterName)
 	// step 1 upgrade kubelet
-	if err := k.installKubeletCommand(); err != nil {
+	if err := k.installKubeletCommand(k.boot.IsImmutableOS); err != nil {
 		return err
 	}
 	log.Infof("upgrade kubectl for worker node, cluster %s", k.clusterName)
@@ -369,8 +373,7 @@ func (k *KubeadmPlugin) upgradeEtcd(backUpEtcd bool, clusterType string) error {
 	component := mfutil.Etcd
 	need, err := k.needUpgradeEtcd()
 	if err != nil {
-		log.Errorf("failed to check need upgrade component, err: %v", err)
-		return err
+		return fmt.Errorf("failed to check need upgrade component, err: %w", err)
 	}
 	if !need {
 		log.Infof("component %s already upgrade to %s, skip upgrade", component, k.boot.BkeConfig.Cluster.EtcdVersion)
@@ -412,7 +415,14 @@ func (k *KubeadmPlugin) uploadTargetClusterKubeletConfig() error {
 		if !apierrors.IsAlreadyExists(err) {
 			return errors.Wrapf(err, "failed to create %q kubelet config configmap", k.clusterName)
 		}
-		err := k.k8sClient.Update(context.Background(), kubeletConfigCM)
+		err := phaseutil.RetryOnConflict(func() error {
+			existingConfigMap := &corev1.ConfigMap{}
+			if err := k.k8sClient.Get(context.Background(), client.ObjectKey{Namespace: kubeletConfigCM.Namespace, Name: kubeletConfigCM.Name}, existingConfigMap); err != nil {
+				return err
+			}
+			existingConfigMap.Data = kubeletConfigCM.Data
+			return k.k8sClient.Update(context.Background(), existingConfigMap)
+		})
 		if err != nil {
 			return errors.Wrapf(err, "failed to update %q kubelet config configmap", k.clusterName)
 		}
@@ -477,6 +487,7 @@ func (k *KubeadmPlugin) getBKEConfig(bkeConfigNS string) error {
 		HostName:         utils.HostName(),
 		HostIP:           currentNode.IP,
 		CurrentNode:      currentNode,
+		IsImmutableOS:    k.isImmutableOSMode(bkeCluster, config),
 		Extra: map[string]interface{}{
 			"Init":                 false,
 			"gpuEnable":            "false",
@@ -486,6 +497,18 @@ func (k *KubeadmPlugin) getBKEConfig(bkeConfigNS string) error {
 		},
 	}
 	return nil
+}
+
+// isImmutableOSMode 判断是否为不可变 OS 模式。
+// 同时检查 BKECluster annotation 和 BkeConfig.CustomExtra，避免两者不一致导致判断偏差。
+func (k *KubeadmPlugin) isImmutableOSMode(bkeCluster *bkecommonv1beta1.BKECluster, config *bkecommonv1beta1.BKEConfig) bool {
+	if clusterutil.IsImmutableOSModeConf(bkeCluster) {
+		return true
+	}
+	if config != nil && config.CustomExtra != nil {
+		return config.CustomExtra[bkecommon.ImmutableOSCustomExtraKey] == bkecommon.ImmutableOSAnnotationValue
+	}
+	return false
 }
 
 func (k *KubeadmPlugin) waitComponentReady(component, previousHash string) error {
@@ -561,6 +584,36 @@ func (k *KubeadmPlugin) getBeforeUpgradeComponentPodHash() (map[string]string, e
 	return mirrorPodHashes, nil
 }
 
+func imageTagFromReference(image string) string {
+	image = strings.TrimSpace(image)
+	if image == "" {
+		return ""
+	}
+	i := strings.LastIndex(image, "/")
+	short := image
+	if i >= 0 {
+		short = image[i+1:]
+	}
+	c := strings.LastIndex(short, ":")
+	if c < 0 {
+		return ""
+	}
+	return short[c+1:]
+}
+
+func normalizeVersionTag(v string) string {
+	return strings.TrimPrefix(strings.TrimSpace(v), "v")
+}
+
+func imageMatchesVersion(image, version string) bool {
+	tag := normalizeVersionTag(imageTagFromReference(image))
+	want := normalizeVersionTag(version)
+	if tag == "" || want == "" {
+		return false
+	}
+	return tag == want
+}
+
 func (k *KubeadmPlugin) needUpgradeComponent(component string) (bool, error) {
 	image, err := getStaticPodImage(k.localK8sClient, k.boot.HostName, component)
 	if err != nil {
@@ -570,12 +623,10 @@ func (k *KubeadmPlugin) needUpgradeComponent(component string) (bool, error) {
 		return false, errors.New("component image is empty")
 	}
 
-	// 判断镜像tag是否与bkeconfig中的集群版本共同
-	// 如果不同，则需要升级
-	if !strings.Contains(image, k.boot.BkeConfig.Cluster.KubernetesVersion) {
-		return true, nil
+	if imageMatchesVersion(image, k.boot.BkeConfig.Cluster.KubernetesVersion) {
+		return false, nil
 	}
-	return false, err
+	return true, nil
 }
 
 func (k *KubeadmPlugin) needUpgradeEtcd() (bool, error) {
@@ -587,10 +638,10 @@ func (k *KubeadmPlugin) needUpgradeEtcd() (bool, error) {
 		return false, errors.New("component image is empty")
 	}
 
-	if !strings.Contains(image, k.boot.BkeConfig.Cluster.EtcdVersion) {
-		return true, nil
+	if imageMatchesVersion(image, k.boot.BkeConfig.Cluster.EtcdVersion) {
+		return false, nil
 	}
-	return false, err
+	return true, nil
 }
 
 func getStaticPodSingleHash(client *kubernetes.Clientset, nodeName, component string) (string, error) {
@@ -599,7 +650,7 @@ func getStaticPodSingleHash(client *kubernetes.Clientset, nodeName, component st
 	if err != nil {
 		return "", err
 	}
-	podHash := pod.Annotations["kubernetes.io/config.hash"]
+	podHash := pod.Annotations[annotation.KubernetesConfigHashAnnotationKey]
 	log.Debugf("Get component %q pod %q hash %q", component, podName, podHash)
 	return podHash, nil
 }

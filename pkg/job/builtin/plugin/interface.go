@@ -79,7 +79,7 @@ func ParseCommands(plugin Plugin, commands []string) (map[string]string, error) 
 	// The parameter checking
 	pluginParam := map[string]string{}
 	for key, v := range plugin.Param() {
-		log.Debugf("%q plugin param %q, required: %v, default: %s, description: %s", plugin.Name(), key, v.Required, v.Default, v.Description)
+		log.Infof("%q plugin param %q, required: %v, default: %s, description: %s", plugin.Name(), key, v.Required, v.Default, v.Description)
 		if v, ok := externalParam[key]; ok {
 			pluginParam[key] = v
 			continue
@@ -177,7 +177,7 @@ func GetBKEClusterFromClient(c *clientutil.Client, bkeConfigNS string) (*bkev1be
 	}
 	bkeCluster, err := c.DynamicClient.Resource(gvr).Namespace(namespace).Get(context.Background(), name, v1.GetOptions{})
 	if err != nil {
-		return nil, errors.Errorf("Get BKECluster %s error: %v", bkeConfigNS, err)
+		return nil, fmt.Errorf("Get BKECluster %s error: %w", bkeConfigNS, err)
 	}
 
 	bc := &bkev1beta1.BKECluster{}
@@ -202,12 +202,12 @@ func GetBkeConfigFromBkeCluster(bkeCluster *bkev1beta1.BKECluster) (*bkev1beta1.
 	if annotations := bkeCluster.GetAnnotations(); annotations != nil {
 		if v, ok := annotations[common.BKEClusterFromAnnotationKey]; !ok || v == common.BKEClusterFromAnnotationValueBKE {
 			if err := bkevalidte.ValidateBKEConfig(*bkeConfig); err != nil {
-				return nil, errors.Errorf("BKECluster spec.clusterConfig is invalid: %v", err)
+				return nil, fmt.Errorf("BKECluster spec.clusterConfig is invalid: %w", err)
 			}
 		}
 		if v, ok := annotations[common.BKEClusterFromAnnotationKey]; ok && v == common.BKEClusterFromAnnotationValueBocloud {
 			if err := bkevalidte.ValidateNonStandardBKEConfig(*bkeConfig); err != nil {
-				return nil, errors.Errorf("BKECluster spec.clusterConfig is invalid: %v", err)
+				return nil, fmt.Errorf("BKECluster spec.clusterConfig is invalid: %w", err)
 			}
 		}
 	}
@@ -233,13 +233,13 @@ func GetContainerdConfig(containerdCconfigNS string) (*bkev1beta1.ContainerdConf
 	}
 	containerdConfig, err := c.DynamicClient.Resource(gvr).Namespace(namespace).Get(context.Background(), name, v1.GetOptions{})
 	if err != nil {
-		return nil, errors.Errorf("Get ContainerdConfig %s error: %v", containerdConfig, err)
+		return nil, fmt.Errorf("Get ContainerdConfig %s error: %w", containerdConfig, err)
 	}
 
 	// 先提取 spec 字段
 	spec, found, err := unstructured.NestedMap(containerdConfig.Object, "spec")
 	if err != nil {
-		return nil, fmt.Errorf("get spec field failed: %v", err)
+		return nil, fmt.Errorf("get spec field failed: %w", err)
 	}
 	if !found {
 		return nil, fmt.Errorf("spec field not found in containerd config")
@@ -248,7 +248,7 @@ func GetContainerdConfig(containerdCconfigNS string) (*bkev1beta1.ContainerdConf
 	// 将 spec 部分转换为目标结构体
 	cc := &bkev1beta1.ContainerdConfigSpec{}
 	if err = runtime.DefaultUnstructuredConverter.FromUnstructured(spec, cc); err != nil {
-		return nil, fmt.Errorf("convert spec to ContainerdConfigSpec failed: %v", err)
+		return nil, fmt.Errorf("convert spec to ContainerdConfigSpec failed: %w", err)
 	}
 
 	return cc, nil

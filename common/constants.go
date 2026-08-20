@@ -2,7 +2,7 @@
  * Copyright (c) 2024 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -31,9 +31,24 @@ const (
 
 	BKEClusterConfigFileName = "bke-config"
 
-	// ClusterAPIManagerAppliedAnnotationKey marks that cluster-api 004-manage.yaml
+	// ClusterAPIManagerAppliedAnnotationKey marks that cluster-api 003-manage.yaml
 	// has been applied (deferred to postprocess completion).
 	ClusterAPIManagerAppliedAnnotationKey = "bke.bocloud.com/cluster-api-manager-applied"
+
+	// 不可变 OS 适配
+	ImmutableOSAnnotation      = "openfuyao.io/immutable-os"
+	ImmutableOSAnnotationValue = "kubeos"
+	// ImmutableOSCustomExtraKey 用于在 BKEConfig 层面传递不可变 OS 标志到 agent 端 plugin
+	ImmutableOSCustomExtraKey = "immutable-os"
+
+	// KubeOS 节点标签，用于 addon 调度和 KubeOS OS CR 节点选择
+	LabelImmutableOSKey           = "node.openfuyao.io/os"
+	LabelImmutableOSValue         = "kubeos"
+	LabelImmutableRoleKey         = "node.openfuyao.io/role"
+	LabelImmutableRoleWorkerValue = "worker"
+	// LabelImmutableNodeSelectorKey KubeOS OS CR 节点选择标签
+	LabelImmutableNodeSelectorKey   = "upgrade.openeuler.org/node-selector"
+	LabelImmutableNodeSelectorValue = "default-worker-pool"
 )
 
 const (

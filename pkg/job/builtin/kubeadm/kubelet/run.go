@@ -40,6 +40,7 @@ import (
 	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/imagehelper"
 	bkeinit "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/initialize"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/initialize/versions"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/executor/containerd"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/executor/docker"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/executor/exec"
@@ -124,6 +125,7 @@ func (kp *kubeletPlugin) Param() map[string]plugin.PluginParam {
 		"configPath":                 {Key: "configPath", Value: "", Required: false, Default: utils.GetKubeletConfPath(), Description: "local path to store kubelet config"},
 		"fileBasePath":               {Key: "fileBasePath", Value: "", Required: false, Default: "/etc/kubernetes", Description: "base path for delivered files"},
 		"enableVariableSubstitution": {Key: "enableVariableSubstitution", Value: "", Required: false, Default: "false", Description: "enable variable substitution in kubelet config and service files, supports ${VAR_NAME} and ${EXPR|command|END}"},
+		"immutableOS":                {Key: "immutableOS", Value: "", Required: false, Default: "false", Description: "immutable OS mode, skip kubelet binary download"},
 	}
 }
 
@@ -172,8 +174,7 @@ func (kp *kubeletPlugin) Execute(commands []string) ([]string, error) {
 	out, err = kp.exec.ExecuteCommandWithCombinedOutput("sh", "-c", "systemctl restart kubelet")
 	if err != nil {
 		errorMsg := fmt.Sprintf("start kubelet failed, err: %v, out: %s", err, out)
-		log.Error(errorMsg)
-		return []string{errorMsg}, fmt.Errorf("start kubelet failed, err: %v, out: %s", err, out)
+		return []string{errorMsg}, fmt.Errorf("start kubelet failed, err: %w, out: %s", err, out)
 	}
 	// waite for kubelet start
 	_, err = isKubeletActive()
@@ -203,7 +204,7 @@ func (kp *kubeletPlugin) readConfigFromKubeletConfigCR(config map[string]string)
 	// 参照 interface.go 的 GetBKECluster 方法，使用 clientutil.NewKubernetesClient
 	c, err := clientutil.NewKubernetesClient(fmt.Sprintf("%s/%s", utils.Workspace, "config"))
 	if err != nil {
-		return fmt.Errorf("failed to create kubernetes client: %v", err)
+		return fmt.Errorf("failed to create kubernetes client: %w", err)
 	}
 
 	// 定义 KubeletConfig 的 GVR (Group Version Resource)
@@ -217,26 +218,25 @@ func (kp *kubeletPlugin) readConfigFromKubeletConfigCR(config map[string]string)
 	unstructuredObj, err := c.DynamicClient.Resource(gvr).Namespace(kubeletConfigNamespace).Get(
 		context.Background(), kubeletConfigName, metav1.GetOptions{})
 	if err != nil {
-		return fmt.Errorf("failed to get KubeletConfig %s/%s from manager cluster: %v",
-			kubeletConfigNamespace, kubeletConfigName, err)
+		return fmt.Errorf("failed to get KubeletConfig %s/%s from manager cluster: %w", kubeletConfigNamespace, kubeletConfigName, err)
 	}
 
 	// 将 unstructured 对象转换为 KubeletConfig 对象
 	kubeletConfig := &confv1beta1.KubeletConfig{}
 	if err := Runtime.DefaultUnstructuredConverter.FromUnstructured(unstructuredObj.Object, kubeletConfig); err != nil {
-		return fmt.Errorf("failed to convert unstructured object to KubeletConfig: %v", err)
+		return fmt.Errorf("failed to convert unstructured object to KubeletConfig: %w", err)
 	}
 
 	// 处理 KubeletConfiguration (kubelet.conf)
 	if err := kp.processKubeletConfiguration(kubeletConfig.Spec.KubeletConfig, config); err != nil {
-		return fmt.Errorf("failed to process kubelet configuration: %v", err)
+		return fmt.Errorf("failed to process kubelet configuration: %w", err)
 	}
 	log.Infof("process kubelet configuration successfully")
 	// 处理 KubeletService (kubelet.service)
 	if kubeletConfig.Spec.KubeletService != nil {
 		log.Infof("kubelet.service:%v", kubeletConfig.Spec.KubeletService.Service)
 		if err := kp.processKubeletService(&kubeletConfig.Spec.KubeletService.Service, config); err != nil {
-			return fmt.Errorf("failed to process kubelet service: %v", err)
+			return fmt.Errorf("failed to process kubelet service: %w", err)
 		}
 	}
 
@@ -248,7 +248,7 @@ func (kp *kubeletPlugin) processKubeletService(kubeletService *confv1beta1.Kubel
 	//处理 kubelet.service
 	if kubeletService != nil {
 		if err := generateService(kubeletService, config, kp.exec); err != nil {
-			return fmt.Errorf("generate kubelet service failed: %v", err)
+			return fmt.Errorf("generate kubelet service failed: %w", err)
 		}
 		return nil
 	}
@@ -329,7 +329,7 @@ func (kp *kubeletPlugin) processKubeletConfiguration(kubeletConfiguration map[st
 		}
 		var rawConfig RawConfig
 		if err := json.Unmarshal(kubeletConf.Raw, &rawConfig); err != nil {
-			return fmt.Errorf("failed to unmarshal raw config: %v", err)
+			return fmt.Errorf("failed to unmarshal raw config: %w", err)
 		}
 		// 此时 rawConfig.Raw 就是纯 YAML 字符串（如 "apiVersion: ... kind: ..."）
 
@@ -342,7 +342,7 @@ func (kp *kubeletPlugin) processKubeletConfiguration(kubeletConfiguration map[st
 			}
 			substitutedContent, err := substitutor.Substitute(content)
 			if err != nil {
-				return fmt.Errorf("failed to substitute variables: %v", err)
+				return fmt.Errorf("failed to substitute variables: %w", err)
 			}
 			content = substitutedContent
 		}
@@ -355,13 +355,13 @@ func (kp *kubeletPlugin) processKubeletConfiguration(kubeletConfiguration map[st
 		// 手动打开文件，确保写入后刷新到磁盘
 		file, err := os.OpenFile(localPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, RwRR)
 		if err != nil {
-			return fmt.Errorf("failed to open config file: %v", err)
+			return fmt.Errorf("failed to open config file: %w", err)
 		}
 		if _, err := file.WriteString(content); err != nil {
-			return fmt.Errorf("failed to write config content: %v", err)
+			return fmt.Errorf("failed to write config content: %w", err)
 		}
 		if err := file.Sync(); err != nil { // 强制刷盘
-			return fmt.Errorf("failed to sync config to disk: %v", err)
+			return fmt.Errorf("failed to sync config to disk: %w", err)
 		}
 		err = file.Close()
 		if err != nil {
@@ -375,8 +375,7 @@ func (kp *kubeletPlugin) processKubeletConfiguration(kubeletConfiguration map[st
 		} else {
 			// 传入明确的 localPath，避免路径不一致
 			if err := kp.appendProviderIDToConfYaml(config); err != nil {
-				log.Errorf("failed to append providerID to %s: %v", localPath, err)
-				return err // 按需决定是否返回错误（若为必填项则返回，否则 Warn）
+				return fmt.Errorf("append providerID to %s: %w", localPath, err)
 			}
 		}
 		log.Infof("successfully wrote pure YAML config to %s", localPath)
@@ -392,7 +391,7 @@ func (kp *kubeletPlugin) handlerKubeletServiceParam(config map[string]string) ma
 	param["hostName"] = utils.HostName()
 	// 后续从command中传递
 	param["podInfraContainerImage"] = fmt.Sprintf("%s/kubernetes/pause:%s",
-		strings.TrimRight(config["imageRepo"], "/"), bkeinit.DefaultPauseImageTag)
+		strings.TrimRight(config["imageRepo"], "/"), versions.PauseImageTag())
 
 	extraArgs := strings.Split(config["extraArgs"], ";")
 	extra := ""
@@ -429,16 +428,16 @@ func (kp *kubeletPlugin) renderKubeletService(config map[string]string) error {
 	}
 	if !utils.Exists(utils.SystemdDir) {
 		if err := os.MkdirAll(utils.SystemdDir, utils.RwxRxRx); err != nil {
-			return errors.Errorf("create %q directory failed: %v", utils.SystemdDir, err)
+			return fmt.Errorf("create %q directory failed: %w", utils.SystemdDir, err)
 		}
 	}
 	writer, err := os.OpenFile(utils.GetKubeletServicePath(), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, utils.RwxRxRx)
 	defer writer.Close()
 	if err != nil {
-		return errors.Errorf("open kubelet service file failed: %v", err)
+		return fmt.Errorf("open kubelet service file failed: %w", err)
 	}
 	if err := t.Execute(writer, param); err != nil {
-		return errors.Errorf("execute kubelet service template failed: %v", err)
+		return fmt.Errorf("execute kubelet service template failed: %w", err)
 	}
 
 	return nil
@@ -451,8 +450,7 @@ func (kp *kubeletPlugin) generateKubeletConfigByHostOS(config map[string]string)
 	// 如果是麒麟需要重新生成kubelet config，cgroupDriver需要设置为cgroupfs
 	hostOS, _, _, err := host.PlatformInformation()
 	if err != nil {
-		log.Errorf("get host platform info failed, err: %v", err)
-		return errors.Errorf("get host platform info failed, err: %v", err)
+		return fmt.Errorf("get host platform info failed, err: %w", err)
 	}
 	if hostOS == "kylin" {
 		if err := httprepo.RepoSearch("docker-ce"); err != nil {
@@ -539,33 +537,28 @@ func (kp *kubeletPlugin) appendProviderIDToConfYaml(commandMap map[string]string
 		localPath = utils.GetKubeletConfPath()
 	}
 	if err != nil {
-		log.Errorf("prepare line failed: %v", err)
-		return err
+		return fmt.Errorf("prepare line failed: %w", err)
 	}
 
 	// 步骤2：确保目录存在
 	if err := ensureDirExists(localPath); err != nil {
-		log.Errorf("ensure dir failed: %v", err)
-		return err
+		return fmt.Errorf("ensure dir failed: %w", err)
 	}
 
 	// 步骤3：打开文件（defer 确保关闭）
 	file, err := openConfFile(localPath)
 	if err != nil {
-		log.Errorf("open file failed: %v", err)
-		return err
+		return fmt.Errorf("open file failed: %w", err)
 	}
 	defer file.Close()
 
 	// 步骤4：处理文件末尾换行
 	if err := ensureFileEndsWithNewline(file); err != nil {
-		log.Errorf("handle newline failed: %v", err)
-		return err
+		return fmt.Errorf("handle newline failed: %w", err)
 	}
 
 	// 步骤5：追加写入
 	if _, err := file.WriteString(line); err != nil {
-		log.Errorf("append line failed: %v", err)
 		return fmt.Errorf("write line to %s: %w", localPath, err)
 	}
 
@@ -574,6 +567,16 @@ func (kp *kubeletPlugin) appendProviderIDToConfYaml(commandMap map[string]string
 }
 
 func (kp *kubeletPlugin) downloadAndInstallKubeletBinary(commandMap map[string]string) error {
+	// 不可变 OS：kubelet 镜像内置，校验已存在即可
+	if commandMap["immutableOS"] == "true" {
+		kubeletPath := filepath.Join(commandMap["saveto"], commandMap["rename"])
+		if _, err := os.Stat(kubeletPath); err != nil {
+			return fmt.Errorf("kubelet binary not found at %s, should be prebuilt in immutable OS image", kubeletPath)
+		}
+		log.Infof("kubelet binary verified at %s (immutable OS)", kubeletPath)
+		return nil
+	}
+
 	url := commandMap["url"]
 	rename := commandMap["rename"]
 	saveto := commandMap["saveto"]
@@ -629,7 +632,7 @@ func (kp *kubeletPlugin) joinWorkerPrepare(config map[string]string) error {
 func (kp *kubeletPlugin) generateKubeletConfig(config map[string]string) error {
 	if !utils.Exists(utils.KubeletConfigPath) {
 		if err := os.MkdirAll(utils.KubeletConfigPath, utils.RwxRxRx); err != nil {
-			return errors.Errorf("create %q directory failed: %v", utils.KubeletConfigPath, err)
+			return fmt.Errorf("create %q directory failed: %w", utils.KubeletConfigPath, err)
 		}
 	}
 
@@ -810,7 +813,7 @@ func isKubeletActive() (bool, error) {
 	conn, err := dbus.NewSystemConnectionContext(context.Background())
 	if err != nil {
 		log.Warnf("failed to connect to systemd: %v", err)
-		return false, fmt.Errorf("failed to connect to systemd: %v", err)
+		return false, fmt.Errorf("failed to connect to systemd: %w", err)
 	}
 	defer conn.Close()
 
@@ -818,7 +821,7 @@ func isKubeletActive() (bool, error) {
 	prop, err := conn.GetUnitPropertyContext(context.Background(), utils.KubeletServiceUnitName, "ActiveState")
 	if err != nil {
 		log.Warnf("failed to get unit property: %v", err)
-		return false, fmt.Errorf("failed to get unit property: %v", err)
+		return false, fmt.Errorf("failed to get unit property: %w", err)
 	}
 
 	return checkKubeletState(prop)

@@ -37,9 +37,8 @@
             <filefilter name="defaultFilter" desc="Files not to check">
                 <filteritem type="filename" name="go.mod|go.sum"/>
                 <filteritem type="filename" name="*.yaml"/>
-            </filefilter>
-            <filefilter name="binaryFileTypePolicyFilter" desc="Filters for binary file policies">
                 <filteritem type="filename" name="LICENSE"/>
+                <filteritem type="filename" name="*.dockerignore"/>
             </filefilter>
         </filefilterlist>
 

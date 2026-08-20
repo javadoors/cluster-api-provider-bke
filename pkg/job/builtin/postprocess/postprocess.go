@@ -74,7 +74,6 @@ func (p *PostprocessPlugin) Execute(commands []string) ([]string, error) {
 	// 1. 解析命令参数（nodeIP可选）
 	paramMap, err := plugin.ParseCommands(p, commands)
 	if err != nil {
-		log.Errorf("Postprocess: parse commands failed: %v", err)
 		return nil, err
 	}
 
@@ -84,7 +83,6 @@ func (p *PostprocessPlugin) Execute(commands []string) ([]string, error) {
 		log.Infof("Postprocess: nodeIP not provided, auto-detecting")
 		nodeIP, err = scriptutil.GetCurrentNodeIP()
 		if err != nil {
-			log.Errorf("Postprocess: get current node IP failed: %v", err)
 			return nil, errors.Wrapf(err, "failed to get current node IP")
 		}
 	}
@@ -93,7 +91,6 @@ func (p *PostprocessPlugin) Execute(commands []string) ([]string, error) {
 	// 3. 读取配置（根据优先级：全局 > 批次 > 节点，三种配置互斥，不合并）
 	config, err := p.loadConfig(nodeIP)
 	if err != nil {
-		log.Errorf("Postprocess: load config failed, nodeIP=%s, err=%v", nodeIP, err)
 		return nil, errors.Wrapf(err, "failed to load config for node: %s", nodeIP)
 	}
 	log.Infof("Postprocess: loaded config, scripts=%d, nodeIP=%s", len(config.Scripts), nodeIP)
@@ -101,7 +98,6 @@ func (p *PostprocessPlugin) Execute(commands []string) ([]string, error) {
 	// 4. 从user-system命名空间获取全量脚本列表
 	allScripts, err := p.getAllScripts()
 	if err != nil {
-		log.Errorf("Postprocess: get all scripts failed: %v", err)
 		return nil, errors.Wrapf(err, "failed to get all scripts")
 	}
 	log.Infof("Postprocess: total scripts in user-system=%d", len(allScripts))
@@ -125,7 +121,6 @@ func (p *PostprocessPlugin) Execute(commands []string) ([]string, error) {
 		// 执行脚本
 		result, err := p.executeScript(scriptConfig, nodeIP)
 		if err != nil {
-			log.Errorf("Postprocess: execute script failed, script=%s, err=%v", scriptConfig.ScriptName, err)
 			return nil, errors.Wrapf(err, "failed to execute script: %s", scriptConfig.ScriptName)
 		}
 		results = append(results, result)

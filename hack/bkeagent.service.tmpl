@@ -7,7 +7,7 @@ Environment="DEBUG=true"
 ExecStart=/usr/local/bin/bkeagent --kubeconfig=/etc/openFuyao/bkeagent/config --health-port= --ntpserver=
 KillMode=process
 RestartSec=5
-Restart=on-failure
+Restart=always
 SuccessExitStatus=0
 
 [Install]

@@ -3,7 +3,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT
@@ -17,6 +17,7 @@ package exec
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
@@ -409,10 +410,12 @@ func TestStartCommandStdoutPipeError(t *testing.T) {
 
 	result, err := startCommand([]string{}, testCommand, testArg)
 
-	assert.NoError(t, err)
-	assert.NotNil(t, result.Cmd)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "open stdout pipe")
+	assert.True(t, errors.Is(err, pipeError))
+	assert.Nil(t, result.Cmd)
 	assert.Nil(t, result.Stdout)
-	assert.NotNil(t, result.Stderr)
+	assert.Nil(t, result.Stderr)
 }
 
 func TestStartCommandStderrPipeError(t *testing.T) {
@@ -437,9 +440,11 @@ func TestStartCommandStderrPipeError(t *testing.T) {
 
 	result, err := startCommand([]string{}, testCommand, testArg)
 
-	assert.NoError(t, err)
-	assert.NotNil(t, result.Cmd)
-	assert.NotNil(t, result.Stdout)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "open stderr pipe")
+	assert.True(t, errors.Is(err, pipeError))
+	assert.Nil(t, result.Cmd)
+	assert.Nil(t, result.Stdout)
 	assert.Nil(t, result.Stderr)
 }
 
@@ -466,10 +471,11 @@ func TestStartCommandStartError(t *testing.T) {
 	result, err := startCommand([]string{}, testCommand, testArg)
 
 	assert.Error(t, err)
-	assert.Equal(t, startError, err)
-	assert.NotNil(t, result.Cmd)
-	assert.NotNil(t, result.Stdout)
-	assert.NotNil(t, result.Stderr)
+	assert.Contains(t, err.Error(), "start command")
+	assert.True(t, errors.Is(err, startError))
+	assert.Nil(t, result.Cmd)
+	assert.Nil(t, result.Stdout)
+	assert.Nil(t, result.Stderr)
 }
 
 func TestLogFromReader(t *testing.T) {

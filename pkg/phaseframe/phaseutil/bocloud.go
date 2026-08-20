@@ -2,7 +2,7 @@
  * Copyright (c) 2024 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -17,7 +17,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/pkg/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	agentv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkeagent/v1beta1"
@@ -68,14 +67,15 @@ func DistributeKubeProxyKubeConfig(ctx context.Context, c client.Client, bkeClus
 
 	err, _, failed := distributeCommand.Wait()
 	if err != nil {
-		log.Error(constant.CommandWaitFailedReason, "failed to wait command %q, err: %v", distributeCommandName, err)
-		return err
+		return fmt.Errorf("failed to wait command %q: %w", distributeCommandName, err)
 	}
 	if failed != nil || len(failed) > 0 {
-		commandErrs, err := LogCommandFailed(*distributeCommand.Command, failed, log, constant.BocloudClusterMasterCertDistributionFailedReason)
+		commandErrs, cmdErr := LogCommandFailed(*distributeCommand.Command, failed, log, constant.BocloudClusterMasterCertDistributionFailedReason)
 		MarkNodeStatusByCommandErrs(distributeCommand.Ctx, distributeCommand.Client, bkeCluster, commandErrs)
-		log.Error(constant.CommandExecFailedReason, "failed to distribute kube-proxy kubeconfig on flow node %q，err: %v", failed, err)
-		return errors.Errorf("failed to distribute kube-proxy kubeconfig on flow node %q，err: %v", failed, err)
+		if cmdErr != nil {
+			return fmt.Errorf("failed to distribute kube-proxy kubeconfig on flow node %q: %w", failed, cmdErr)
+		}
+		return fmt.Errorf("failed to distribute kube-proxy kubeconfig on flow node %q", failed)
 	}
 	return nil
 }

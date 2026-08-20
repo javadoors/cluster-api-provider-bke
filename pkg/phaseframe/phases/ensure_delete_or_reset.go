@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -36,6 +36,7 @@ import (
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
 	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/command"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/kube"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/mergecluster"
 	bkemetrics "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/metrics"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe"
@@ -95,8 +96,15 @@ func (e *EnsureDeleteOrReset) Execute() (ctrl.Result, error) {
 		} else {
 			for _, command := range commandList.Items {
 				// remove finalizer and delete
-				controllerutil.RemoveFinalizer(&command, "command.bkeagent.bocloud.com/finalizers")
-				if err = c.Update(baseCtx, &command); err != nil {
+				err = phaseutil.RetryOnConflict(func() error {
+					latestCommand := &agentv1beta1.Command{}
+					if err := c.Get(baseCtx, client.ObjectKey{Name: command.Name, Namespace: command.Namespace}, latestCommand); err != nil {
+						return err
+					}
+					controllerutil.RemoveFinalizer(latestCommand, "command.bkeagent.bocloud.com/finalizers")
+					return c.Update(baseCtx, latestCommand)
+				})
+				if err != nil {
 					if apierrors.IsNotFound(err) {
 						continue
 					}
@@ -116,9 +124,15 @@ func (e *EnsureDeleteOrReset) Execute() (ctrl.Result, error) {
 
 	ctx, cancel := context.WithTimeout(baseCtx, DeleteOrResetTimeoutMinutes*time.Minute)
 	defer cancel()
+	maxAttempts := (DeleteOrResetTimeoutMinutes * 60) / DeleteOrResetPollIntervalSeconds
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+	attempt := 0
 	err := wait.PollImmediateUntil(DeleteOrResetPollIntervalSeconds*time.Second, func() (bool, error) {
+		attempt++
 		if err := e.reconcileDelete(ctx); err != nil {
-			log.Warn("RetryDelete", "(ignore)reconcileDelete error, retry: %v", err)
+			log.Warn("RetryDelete", "reconcileDelete failed (attempt %d/%d): %v", attempt, maxAttempts, err)
 			return false, nil
 		}
 		return true, nil
@@ -178,8 +192,7 @@ func (e *EnsureDeleteOrReset) ensureClusterStatusDeleting(c client.Client, bkeCl
 		log.Debug("mark bkeCluster as deleting")
 		bkeCluster.Status.ClusterStatus = bkev1beta1.ClusterDeleting
 		if err := mergecluster.SyncStatusUntilComplete(c, bkeCluster); err != nil {
-			log.Warn(constant.ReconcileErrorReason, "failed to update bkeCluster Status: %v", err)
-			return errors.Errorf("failed to update bkeCluster Status: %v", err)
+			return fmt.Errorf("failed to update bkeCluster Status: %w", err)
 		}
 	}
 	return nil
@@ -191,8 +204,7 @@ func (e *EnsureDeleteOrReset) handleClusterDeletion(ctx context.Context, c clien
 		log.Debug("delete relation cluster-api obj cluster")
 		// delete cluster api obj cluster will delete all relation obj
 		if err := c.Delete(ctx, e.Ctx.Cluster); err != nil {
-			log.Warn(constant.ReconcileErrorReason, "failed to delete cluster: %v", err)
-			return errors.Errorf("failed to delete cluster: %v", err)
+			return fmt.Errorf("failed to delete cluster: %w", err)
 		}
 		// return now, Wait for the deletion of cluster api obj to trigger the deletion of bkeCluster
 		return errors.New("wait for the deletion of cluster api obj to trigger the deletion of bkeCluster")
@@ -207,10 +219,9 @@ func (e *EnsureDeleteOrReset) handleBKEMachineDeletion(ctx context.Context, c cl
 	bkeMachines := &bkev1beta1.BKEMachineList{}
 	if err := c.List(ctx, bkeMachines, client.InNamespace(bkeCluster.Namespace)); err != nil {
 		if !apierrors.IsNotFound(err) {
-			log.Warn(constant.ReconcileErrorReason, "failed to list bkeMachine: %v", err)
-			return errors.Errorf("failed to list bkeMachine: %v", err)
+			return fmt.Errorf("failed to list bkeMachine: %w", err)
 		}
-		return errors.Errorf("failed to list bkeMachine: %v", err)
+		return fmt.Errorf("failed to list bkeMachine: %w", err)
 	}
 	if len(bkeMachines.Items) > 0 {
 		for _, bkeMachine := range bkeMachines.Items {
@@ -221,16 +232,21 @@ func (e *EnsureDeleteOrReset) handleBKEMachineDeletion(ctx context.Context, c cl
 					if apierrors.IsNotFound(err) {
 						continue
 					}
-					log.Warn(constant.ReconcileErrorReason, "failed to delete bkeMachine: %v", err)
 					return err
 				}
 			}
 			// if not have owner, bkemachine Controller will not delete it
 			if len(bkeMachine.OwnerReferences) == 0 || bkeMachine.OwnerReferences == nil {
 				// try force remove finalizer
-				controllerutil.RemoveFinalizer(&bkeMachine, bkev1beta1.BKEMachineFinalizer)
-				if err := c.Update(ctx, &bkeMachine); err != nil {
-					log.Warn(constant.ReconcileErrorReason, "failed to remove finalizer: %v", err)
+				err := phaseutil.RetryOnConflict(func() error {
+					latestBKEMachine := &bkev1beta1.BKEMachine{}
+					if err := c.Get(ctx, client.ObjectKey{Name: bkeMachine.Name, Namespace: bkeMachine.Namespace}, latestBKEMachine); err != nil {
+						return err
+					}
+					controllerutil.RemoveFinalizer(latestBKEMachine, bkev1beta1.BKEMachineFinalizer)
+					return c.Update(ctx, latestBKEMachine)
+				})
+				if err != nil {
 					return err
 				}
 			}
@@ -296,21 +312,24 @@ func (e *EnsureDeleteOrReset) cleanupClusterResources(ctx context.Context, c cli
 				client.InNamespace(bkeCluster.Namespace),
 				client.MatchingLabels{"cluster.x-k8s.io/cluster-name": bkeCluster.Name},
 			); listErr != nil {
-				log.Warn(constant.ReconcileErrorReason, "failed to list BKENode resources for fallback delete: %v", listErr)
 				return listErr
 			}
 
 			for i := range bnList.Items {
 				bn := &bnList.Items[i]
 				if delErr := c.Delete(ctx, bn); delErr != nil && !apierrors.IsNotFound(delErr) {
-					log.Warn(constant.ReconcileErrorReason, "failed to delete BKENode %s/%s: %v", bn.Namespace, bn.Name, delErr)
 					return delErr
 				}
 			}
 		} else if !apierrors.IsNotFound(err) {
-			log.Warn(constant.ReconcileErrorReason, "failed to delete BKENode resources: %v", err)
 			return err
 		}
+	}
+
+	if bkeCluster.Spec.ControlPlaneEndpoint.IsValid() {
+		host := fmt.Sprintf("https://%s", bkeCluster.Spec.ControlPlaneEndpoint.String())
+		log.Debug("delete RESTMapper cache for target cluster host %s", host)
+		kube.DeleteRESTMapperCacheByHost(host)
 	}
 
 	log.Debug("remove bkeCluster finalizer")
@@ -318,8 +337,7 @@ func (e *EnsureDeleteOrReset) cleanupClusterResources(ctx context.Context, c cli
 	// maybe we not need to do anything
 	log.Finish(constant.TargetClusterDeletedReason, "bkeCluster deleted successfully")
 	if err := mergecluster.SyncStatusUntilComplete(c, bkeCluster); err != nil {
-		log.Warn(constant.ReconcileErrorReason, "failed to update bkeCluster Status: %v", err)
-		return errors.Errorf("failed to update bkeCluster Status: %v", err)
+		return fmt.Errorf("failed to update bkeCluster Status: %w", err)
 	}
 	// remove all event created by bkeCluster
 	log.Debug("remove all event created by bkeCluster")

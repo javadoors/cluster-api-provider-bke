@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -260,7 +260,39 @@ func TestInterfaceIpExitMultipleAddresses(t *testing.T) {
 		return mockAddrs, nil
 	})
 
-	result, err := InterfaceIpExit("eth0", "192.168.1")
+	result, err := InterfaceIpExit("eth0", "192.168.1.1")
 	assert.NoError(t, err)
-	assert.Contains(t, result, "192.168.1")
+	assert.Equal(t, "192.168.1.1/24", result)
+}
+
+func TestInterfaceIpExit_IPPrefixBoundary(t *testing.T) {
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+
+	mockInterface := &net.Interface{
+		Name:  "eth0",
+		Index: 1,
+	}
+
+	mockAddrs := []net.Addr{
+		&net.IPNet{
+			IP:   net.ParseIP("122.235.189.16"),
+			Mask: net.IPv4Mask(255, 255, 255, 0),
+		},
+		&net.IPNet{
+			IP:   net.ParseIP("122.235.189.1"),
+			Mask: net.IPv4Mask(255, 255, 255, 255),
+		},
+	}
+
+	patches.ApplyFunc(net.InterfaceByName, func(name string) (*net.Interface, error) {
+		return mockInterface, nil
+	})
+	patches.ApplyMethodFunc(mockInterface, "Addrs", func() ([]net.Addr, error) {
+		return mockAddrs, nil
+	})
+
+	result, err := InterfaceIpExit("eth0", "122.235.189.1")
+	assert.NoError(t, err)
+	assert.Equal(t, "122.235.189.1/32", result)
 }

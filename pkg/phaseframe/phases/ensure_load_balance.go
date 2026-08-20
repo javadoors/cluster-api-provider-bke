@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -102,7 +102,6 @@ func (e *EnsureLoadBalance) ConfiguringLoadBalancer() error {
 	nodes := allNodes.Master()
 
 	if len(nodes) == 0 {
-		log.Warn("ConfigureLoadBalancer", "no master nodes found")
 		return errors.New("no master nodes found")
 	}
 
@@ -114,7 +113,6 @@ func (e *EnsureLoadBalance) ConfiguringLoadBalancer() error {
 		}
 	}
 	if len(errs) > 0 {
-		log.Warn("ConfigureLoadBalancer", strings.Join(errs, ","))
 		return errors.New(strings.Join(errs, ","))
 	}
 
@@ -196,7 +194,7 @@ func (e *EnsureLoadBalance) executeAndHandleLoadBalancer(loadBalanceCommand *com
 	log.Info(constant.LoadBalancerCreatingReason, "Waiting load balancer configured ready")
 	err, successNodes, failedNodes := loadBalanceCommand.Wait()
 	if err != nil {
-		return errors.Errorf("failed to configure load balancer: %v", err)
+		return fmt.Errorf("failed to configure load balancer: %w", err)
 	}
 
 	for _, node := range failedNodes {
@@ -213,12 +211,9 @@ func (e *EnsureLoadBalance) executeAndHandleLoadBalancer(loadBalanceCommand *com
 	}
 
 	if len(failedNodes) > 0 {
-		log.Warn(constant.LoadBalancerNotReadyReason, "failed to configure load balancer: %v", err)
-		log.Warn(constant.LoadBalancerNotReadyReason, "The load balancer configured failed on the following Nodes %v", failedNodes, ",")
-		commandErrs, err := phaseutil.LogCommandFailed(*loadBalanceCommand.Command, failedNodes, log, constant.LoadBalancerNotReadyReason)
+		commandErrs, cmdErr := phaseutil.LogCommandFailed(*loadBalanceCommand.Command, failedNodes, log, constant.LoadBalancerNotReadyReason)
 		phaseutil.MarkNodeStatusByCommandErrs(e.Ctx, e.Ctx.Client, bkeCluster, commandErrs)
-		log.Warn(constant.LoadBalancerNotReadyReason, "Load balancer configured failed, you can check the BKEAgent log on the error node (/var/log/openFuyao/bkeagent.log) and manually resolve the problem. Then restart the BKEAgent on the node")
-		return errors.Errorf("failed to configure load balancer, loadBalanceCommand run failed in flow nodes: %v, err: %v", strings.Join(failedNodes, ","), err)
+		return fmt.Errorf("failed to configure load balancer, loadBalanceCommand run failed in flow nodes: %v, err: %w", strings.Join(failedNodes, ","), cmdErr)
 	}
 
 	endpoint := bkeCluster.Spec.ControlPlaneEndpoint.String()

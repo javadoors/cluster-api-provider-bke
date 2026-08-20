@@ -20,6 +20,7 @@ import (
 	"io/fs"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -27,10 +28,12 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
+	"gopkg.in/yaml.v3"
 	kubeadmapi "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm"
 	"k8s.io/kubernetes/cmd/kubeadm/app/util/etcd"
 
 	bkeinit "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/initialize"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/initialize/versions"
 	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
 	bkenet "gopkg.openfuyao.cn/cluster-api-provider-bke/common/utils/net"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/common/versionutil"
@@ -127,15 +130,109 @@ func renderTemplateAndStore(options *TemplateRenderOptions) error {
 
 // renderK8sAndStore renders a Kubernetes component template and stores it
 func renderK8sAndStore(c *BKEComponent, tmpl []byte, cfg interface{}, funcMap *template.FuncMap) error {
+	filePath := pathForManifest(c)
 	options := &TemplateRenderOptions{
 		Name:     c.Name,
 		Template: tmpl,
 		Data:     cfg,
-		FilePath: pathForManifest(c),
+		FilePath: filePath,
 		FuncMap:  funcMap,
 		FileMode: utils.RwRR,
 	}
-	return renderTemplateAndStore(options)
+	if err := renderTemplateAndStore(options); err != nil {
+		return err
+	}
+	return dedupRenderedPodCommand(filePath)
+}
+
+// dedupRenderedPodCommand 对渲染后的 Pod manifest 执行命令行参数去重。
+// 模板内置参数和 extraArgs 都展开后再处理，确保用户 extraArgs 能按 last-wins 覆盖默认参数。
+func dedupRenderedPodCommand(filePath string) error {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to read rendered pod manifest %s: %w", filePath, err)
+	}
+
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return fmt.Errorf("failed to parse rendered pod manifest %s: %w", filePath, err)
+	}
+
+	if dedupPodCommandNode(&doc) {
+		out, err := yaml.Marshal(&doc)
+		if err != nil {
+			return fmt.Errorf("failed to marshal rendered pod manifest %s: %w", filePath, err)
+		}
+		if err := os.WriteFile(filePath, out, utils.RwRR); err != nil {
+			return fmt.Errorf("failed to write rendered pod manifest %s: %w", filePath, err)
+		}
+	}
+	return nil
+}
+
+// dedupPodCommandNode 查找 spec.containers[].command 并按 flag key 去重。
+func dedupPodCommandNode(doc *yaml.Node) bool {
+	root := doc
+	if root.Kind == yaml.DocumentNode && len(root.Content) > 0 {
+		root = root.Content[0]
+	}
+	spec := mappingValue(root, "spec")
+	containers := mappingValue(spec, "containers")
+	if containers == nil || containers.Kind != yaml.SequenceNode {
+		return false
+	}
+
+	changed := false
+	for _, container := range containers.Content {
+		command := mappingValue(container, "command")
+		if command == nil || command.Kind != yaml.SequenceNode {
+			continue
+		}
+		args := make([]string, 0, len(command.Content))
+		for _, item := range command.Content {
+			args = append(args, item.Value)
+		}
+		deduped := DedupFlags(args)
+		if stringSlicesEqual(args, deduped) {
+			continue
+		}
+		command.Content = command.Content[:0]
+		for _, arg := range deduped {
+			command.Content = append(command.Content, &yaml.Node{
+				Kind:  yaml.ScalarNode,
+				Tag:   "!!str",
+				Value: arg,
+			})
+		}
+		changed = true
+	}
+	return changed
+}
+
+// stringSlicesEqual 判断参数列表是否发生变化，避免无变更时重写 manifest。
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// mappingValue 从 YAML mapping 节点中取指定 key 的 value 节点。
+func mappingValue(node *yaml.Node, key string) *yaml.Node {
+	if node == nil || node.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i].Value == key {
+			return node.Content[i+1]
+		}
+	}
+	return nil
 }
 
 // renderHAAndStore renders a HA component template and stores it
@@ -588,7 +685,7 @@ func keepalivedConfFuncMap() *template.FuncMap {
 					continue
 				}
 				for _, ip := range ips {
-					if strings.Contains(ip, n.IP) {
+					if bkenet.AddressMatchesIP(ip, n.IP) {
 						return strconv.Itoa(defaultPriority - priorityDecrementStep*i)
 					}
 				}
@@ -604,7 +701,7 @@ func KeepalivedInstanceIsMaster(nodes []HANode) bool {
 		return false
 	}
 	for _, ip := range ips {
-		if strings.Contains(ip, nodes[0].IP) {
+		if bkenet.AddressMatchesIP(ip, nodes[0].IP) {
 			return true
 		}
 	}
@@ -626,8 +723,6 @@ func utilFuncMap() *template.FuncMap {
 		"randomString": generateRandomString,
 	}
 }
-
-const DefaultAPIServerAuthorizationMode = "Node,RBAC"
 
 func apiServerFuncMap() *template.FuncMap {
 	return &template.FuncMap{
@@ -664,21 +759,11 @@ func apiServerFuncMap() *template.FuncMap {
 			return fmt.Sprintf("%s:%s", bkeinit.DefaultAPIServerImageName, k8sVersion)
 		},
 		"clientCAFile": func(cfg *BootScope) string {
-			caChainPath := fmt.Sprintf("%s/%s", cfg.BkeConfig.Cluster.CertificatesDir, CertCAAndChainFileName)
-			if utils.Exists(caChainPath) {
-				return caChainPath
-			}
-			return fmt.Sprintf("%s/%s", cfg.BkeConfig.Cluster.CertificatesDir, pkiutil.CACertName)
+			return clientCAFilePath(cfg)
 		},
 		"extraArgs": func(cfg *BootScope) []string {
 			if cfg.CurrentNode.APIServer != nil && cfg.CurrentNode.APIServer.ExtraArgs != nil {
-				if _, ok := cfg.CurrentNode.APIServer.ExtraArgs["authorization-mode"]; !ok {
-					cfg.CurrentNode.APIServer.ExtraArgs["authorization-mode"] = DefaultAPIServerAuthorizationMode
-				}
 				return getExtraArgs(cfg.CurrentNode.APIServer.ExtraArgs)
-			}
-			if _, ok := cfg.BkeConfig.Cluster.APIServer.ExtraArgs["authorization-mode"]; !ok {
-				cfg.BkeConfig.Cluster.APIServer.ExtraArgs["authorization-mode"] = DefaultAPIServerAuthorizationMode
 			}
 			return getExtraArgs(cfg.BkeConfig.Cluster.APIServer.ExtraArgs)
 		},
@@ -687,13 +772,45 @@ func apiServerFuncMap() *template.FuncMap {
 }
 
 func isUpgradeWithOpenFuyao(cfg *BootScope) bool {
-	log.Info("get upgradeWithOpenFuyao param")
-	if _, ok := cfg.Extra["upgradeWithOpenFuyao"]; !ok {
-		log.Info("not found upgradeWithOpenFuyao")
-		return false
+	log.Info("detect upgradeWithOpenFuyao flag")
+
+	if cfg == nil {
+		log.Warn("boot scope is nil, skip boot-extra check and use file-based fallback")
+	} else {
+		// 1) 原有：BkeConfig.Addons 里声明了 openfuyao
+		if v, ok := cfg.Extra["upgradeWithOpenFuyao"].(bool); ok {
+			log.Infof("upgradeWithOpenFuyao from boot extra: %t", v)
+			if v {
+				return true
+			}
+		} else {
+			log.Info("upgradeWithOpenFuyao bool not found in boot extra, fallback to file detection")
+		}
 	}
-	log.Info("upgradeWithOpenFuyao param is ", cfg.Extra["upgradeWithOpenFuyao"].(bool))
-	return cfg.Extra["upgradeWithOpenFuyao"].(bool)
+
+	// 2) 兜底：节点上已存在 webhook 配置文件，说明之前装过 openfuyao
+	webhookCfgPath := "/etc/kubernetes/webhook/webhook-config.yaml"
+	if _, err := os.Stat(webhookCfgPath); err == nil {
+		log.Infof("detected openfuyao webhook config file %q", webhookCfgPath)
+		return true
+	} else if !os.IsNotExist(err) {
+		log.Warnf("stat webhook config file %q failed: %v", webhookCfgPath, err)
+	}
+
+	// 3) 兜底：现有 apiserver 静态 Pod 已经带了 webhook 参数
+	manifest := filepath.Join(GetDefaultManifestsPath(), "kube-apiserver.yaml")
+	if data, err := os.ReadFile(manifest); err == nil {
+		hasWebhookArg := strings.Contains(string(data), "authentication-token-webhook-config-file")
+		log.Infof("detected kube-apiserver manifest %q webhook arg present: %t", manifest, hasWebhookArg)
+		if hasWebhookArg {
+			return true
+		}
+	} else {
+		log.Warnf("read kube-apiserver manifest %q failed: %v", manifest, err)
+	}
+
+	log.Info("upgradeWithOpenFuyao detection result: false")
+	return false
 }
 
 // etcdImageTagFromBootScope resolves the etcd image tag for manifest templates.
@@ -701,7 +818,7 @@ func isUpgradeWithOpenFuyao(cfg *BootScope) bool {
 // or override BkeConfig.Cluster.EtcdVersion on the agent before rendering.
 func etcdImageTagFromBootScope(cfg *BootScope) string {
 	if cfg == nil {
-		return strings.TrimPrefix(bkeinit.DefaultEtcdImageTag, "v")
+		return strings.TrimPrefix(versions.EtcdImageTag(), "v")
 	}
 	var etcdVersion string
 	if cfg.Extra != nil {
@@ -713,7 +830,7 @@ func etcdImageTagFromBootScope(cfg *BootScope) string {
 		etcdVersion = cfg.BkeConfig.Cluster.EtcdVersion
 	}
 	if etcdVersion == "" {
-		etcdVersion = bkeinit.DefaultEtcdImageTag
+		etcdVersion = versions.EtcdImageTag()
 	}
 	return strings.TrimPrefix(etcdVersion, "v")
 }
@@ -758,8 +875,19 @@ func etcdFuncMap() *template.FuncMap {
 
 }
 
+func clientCAFilePath(cfg *BootScope) string {
+	caChainPath := fmt.Sprintf("%s/%s", cfg.BkeConfig.Cluster.CertificatesDir, CertCAAndChainFileName)
+	if utils.Exists(caChainPath) {
+		return caChainPath
+	}
+	return fmt.Sprintf("%s/%s", cfg.BkeConfig.Cluster.CertificatesDir, pkiutil.CACertName)
+}
+
 func controllerFuncMap() *template.FuncMap {
 	return &template.FuncMap{
+		"clientCAFile": func(cfg *BootScope) string {
+			return clientCAFilePath(cfg)
+		},
 		"imageInfo": func(cfg *BootScope) string {
 			k8sVersion := strings.TrimPrefix(cfg.BkeConfig.Cluster.KubernetesVersion, "v") // 去掉前缀字符 v
 			return fmt.Sprintf("%s:%s", bkeinit.DefaultControllerManagerImageName, k8sVersion)

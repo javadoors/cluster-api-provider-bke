@@ -1,23 +1,20 @@
-/*
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
- * openFuyao is licensed under Mulan PSL v2.
- * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain a copy of Mulan PSL v2 at:
- *          http://license.coscl.org.cn/MulanPSL2
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
- * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
- * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
- * See the Mulan PSL v2 for more details.
- */
-
 package phases
 
 import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
+	"github.com/agiledragon/gomonkey/v2"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
+	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/testutils"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/constant"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -25,13 +22,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-
-	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
-	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/testutils"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/constant"
+	ctrlfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 const (
@@ -616,4 +607,243 @@ func TestEnsureProviderSelfUpgradeGetProviderTargetImageError(t *testing.T) {
 // TestEnsureProviderSelfUpgradeRolloutProviderContextCanceled tests context canceled scenario
 func TestEnsureProviderSelfUpgradeRolloutProviderContextCanceled(t *testing.T) {
 	t.Skip("Skipping - requires complex mocking")
+}
+
+func newProviderSelfUpgradeCov(t *testing.T, bkeCluster *bkev1beta1.BKECluster, objs ...client.Object) *EnsureProviderSelfUpgrade {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	require.NoError(t, bkev1beta1.AddToScheme(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, appsv1.AddToScheme(scheme))
+	builder := ctrlfake.NewClientBuilder().WithScheme(scheme)
+	if bkeCluster != nil {
+		builder = builder.WithObjects(bkeCluster)
+	}
+	for _, o := range objs {
+		builder = builder.WithObjects(o)
+	}
+	c := builder.Build()
+	ctx := &phaseframe.PhaseContext{
+		Context:    context.Background(),
+		BKECluster: bkeCluster,
+		Client:     c,
+		Scheme:     scheme,
+		Log: &bkev1beta1.BKELogger{
+			Recorder:     record.NewBroadcaster().NewRecorder(scheme, corev1.EventSource{Component: "test"}),
+			NormalLogger: testutils.NewLog(),
+			EventBinder:  bkeCluster,
+		},
+	}
+	return &EnsureProviderSelfUpgrade{BasePhase: phaseframe.BasePhase{Ctx: ctx}}
+}
+
+// providerClusterWithCMs builds a BKECluster + local CM + patch CM so getProviderTargetImage succeeds.
+func providerClusterWithCMs(t *testing.T) (*bkev1beta1.BKECluster, []client.Object) {
+	t.Helper()
+	version := testTargetVersion
+	cluster := &bkev1beta1.BKECluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "kube-system"},
+		Spec: confv1beta1.BKEClusterSpec{
+			ClusterConfig: &confv1beta1.BKEConfig{
+				Cluster: confv1beta1.Cluster{OpenFuyaoVersion: version},
+			},
+		},
+	}
+	patchKey := "patch." + version
+	patchCMName := "cm." + version
+	objs := []client.Object{
+		createLocalCM(patchKey),
+		createPatchCM(patchCMName, version, getValidPatchYaml()),
+	}
+	return cluster, objs
+}
+
+// ---- Execute (0% -> cover via real rolloutProvider with patched deps) ----
+
+func TestProviderSelfUpgradeExecute(t *testing.T) {
+	t.Run("rolloutProvider error propagates", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		cluster, objs := providerClusterWithCMs(t)
+		p := newProviderSelfUpgradeCov(t, cluster, objs...)
+		patches.ApplyFunc(phaseutil.PatchDeploymentImage, func(_ context.Context, _ client.Client, _ phaseutil.DeploymentTarget, _ string) error {
+			return assertErr("patch failed")
+		})
+		_, err := p.Execute()
+		require.Error(t, err)
+	})
+}
+
+// ---- rolloutProvider (0% -> cover all branches) ----
+
+func TestProviderSelfUpgradeRolloutProvider(t *testing.T) {
+	t.Run("target image empty returns error", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		cluster := &bkev1beta1.BKECluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "ns"},
+			Spec: confv1beta1.BKEClusterSpec{
+				ClusterConfig: &confv1beta1.BKEConfig{
+					Cluster: confv1beta1.Cluster{OpenFuyaoVersion: "v1.0.0"},
+				},
+			},
+		}
+		p := newProviderSelfUpgradeCov(t, cluster)
+		result, err := p.rolloutProvider()
+		require.Error(t, err)
+		assert.False(t, result.Requeue)
+		assert.Contains(t, err.Error(), "unable to parse target image")
+	})
+
+	t.Run("patch deployment error", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		cluster, objs := providerClusterWithCMs(t)
+		p := newProviderSelfUpgradeCov(t, cluster, objs...)
+		patches.ApplyFunc(phaseutil.PatchDeploymentImage, func(_ context.Context, _ client.Client, _ phaseutil.DeploymentTarget, _ string) error {
+			return assertErr("patch failed")
+		})
+		result, err := p.rolloutProvider()
+		require.Error(t, err)
+		assert.False(t, result.Requeue)
+		assert.Contains(t, err.Error(), "patch Deployment failed")
+	})
+
+	t.Run("wait ready error normal", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		cluster, objs := providerClusterWithCMs(t)
+		p := newProviderSelfUpgradeCov(t, cluster, objs...)
+		patches.ApplyFunc(phaseutil.PatchDeploymentImage, func(_ context.Context, _ client.Client, _ phaseutil.DeploymentTarget, _ string) error {
+			return nil
+		})
+		patches.ApplyFunc(phaseutil.WaitDeploymentReady, func(_ context.Context, _ client.Client, _ phaseutil.DeploymentTarget, _ string, _ time.Duration) error {
+			return assertErr("deployment not ready")
+		})
+		result, err := p.rolloutProvider()
+		require.Error(t, err)
+		assert.False(t, result.Requeue)
+		assert.Contains(t, err.Error(), "wait for Deployment ready failed")
+	})
+
+	t.Run("wait ready context canceled image mismatch error", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		cluster, objs := providerClusterWithCMs(t)
+		p := newProviderSelfUpgradeCov(t, cluster, objs...)
+		patches.ApplyFunc(phaseutil.PatchDeploymentImage, func(_ context.Context, _ client.Client, _ phaseutil.DeploymentTarget, _ string) error {
+			return nil
+		})
+		patches.ApplyFunc(phaseutil.WaitDeploymentReady, func(_ context.Context, _ client.Client, _ phaseutil.DeploymentTarget, _ string, _ time.Duration) error {
+			return assertErr("context canceled while waiting")
+		})
+		patches.ApplyFunc(phaseutil.GetDeploymentImage, func(_ context.Context, _ client.Client, _ phaseutil.DeploymentTarget) (string, error) {
+			return "some-other-image:v1", nil
+		})
+		result, err := p.rolloutProvider()
+		require.Error(t, err)
+		assert.False(t, result.Requeue)
+		assert.Contains(t, err.Error(), "wait for Deployment ready failed")
+	})
+
+	t.Run("wait ready context canceled get image error", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		cluster, objs := providerClusterWithCMs(t)
+		p := newProviderSelfUpgradeCov(t, cluster, objs...)
+		patches.ApplyFunc(phaseutil.PatchDeploymentImage, func(_ context.Context, _ client.Client, _ phaseutil.DeploymentTarget, _ string) error {
+			return nil
+		})
+		patches.ApplyFunc(phaseutil.WaitDeploymentReady, func(_ context.Context, _ client.Client, _ phaseutil.DeploymentTarget, _ string, _ time.Duration) error {
+			return assertErr("context canceled while waiting")
+		})
+		patches.ApplyFunc(phaseutil.GetDeploymentImage, func(_ context.Context, _ client.Client, _ phaseutil.DeploymentTarget) (string, error) {
+			return "", assertErr("get image failed")
+		})
+		result, err := p.rolloutProvider()
+		require.Error(t, err)
+		assert.False(t, result.Requeue)
+	})
+}
+
+// ---- PostHook (0% -> cover sleep + default hook) ----
+
+func TestProviderSelfUpgradePostHook(t *testing.T) {
+	t.Run("nil err sleeps and returns nil", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		cluster, objs := providerClusterWithCMs(t)
+		p := newProviderSelfUpgradeCov(t, cluster, objs...)
+		slept := false
+		patches.ApplyMethod(&phaseframe.BasePhase{}, "DefaultPostHook", func(_ *phaseframe.BasePhase, _ error) error { return nil })
+		patches.ApplyFunc(time.Sleep, func(_ time.Duration) { slept = true })
+		err := p.PostHook(nil)
+		require.NoError(t, err)
+		assert.True(t, slept)
+	})
+
+	t.Run("non-nil err no sleep", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		cluster, objs := providerClusterWithCMs(t)
+		p := newProviderSelfUpgradeCov(t, cluster, objs...)
+		slept := false
+		patches.ApplyMethod(&phaseframe.BasePhase{}, "DefaultPostHook", func(_ *phaseframe.BasePhase, _ error) error { return nil })
+		patches.ApplyFunc(time.Sleep, func(_ time.Duration) { slept = true })
+		err := p.PostHook(assertErr("upgrade failed"))
+		require.NoError(t, err)
+		assert.False(t, slept)
+	})
+
+	t.Run("default posthook error propagates", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		cluster, objs := providerClusterWithCMs(t)
+		p := newProviderSelfUpgradeCov(t, cluster, objs...)
+		patches.ApplyMethod(&phaseframe.BasePhase{}, "DefaultPostHook", func(_ *phaseframe.BasePhase, _ error) error {
+			return assertErr("posthook failed")
+		})
+		err := p.PostHook(assertErr("upgrade failed"))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "posthook failed")
+	})
+}
+
+// ---- getPatchConfig additional branch (non-patch version key missing) ----
+
+func TestProviderSelfUpgradeGetPatchConfigVersionKeyMissing(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, bkev1beta1.AddToScheme(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
+
+	cluster := createBKECluster(testTargetVersion, "")
+	// local CM has the patch key but patch CM lacks the version data key
+	patchKey := "patch." + testTargetVersion
+	patchCMName := "cm." + testTargetVersion
+	objs := []client.Object{
+		createLocalCM(patchKey),
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: patchCMName, Namespace: "openfuyao-patch"},
+			Data:       map[string]string{"other-version": "data"},
+		},
+	}
+
+	fakeClient := ctrlfake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+	ctx := &phaseframe.PhaseContext{
+		BKECluster: cluster,
+		Scheme:     scheme,
+		Context:    context.Background(),
+		Client:     fakeClient,
+		Log: &bkev1beta1.BKELogger{
+			Recorder:     record.NewBroadcaster().NewRecorder(scheme, corev1.EventSource{Component: "test"}),
+			NormalLogger: testutils.NewLog(),
+			EventBinder:  cluster,
+		},
+	}
+	p := NewEnsureProviderSelfUpgrade(ctx).(*EnsureProviderSelfUpgrade)
+
+	patchConfig, err := p.getPatchConfig(cluster)
+	require.Error(t, err)
+	assert.Nil(t, patchConfig)
+	assert.Contains(t, err.Error(), "not found in patch config")
 }

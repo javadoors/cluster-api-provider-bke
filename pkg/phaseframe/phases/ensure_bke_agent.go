@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -32,6 +32,7 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
 	bkessh "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/remote"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/statusmanage"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/clusterutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/condition"
@@ -43,6 +44,8 @@ const (
 	EnsureBKEAgentName confv1beta1.BKEClusterPhase = "EnsureBKEAgent"
 	// deployCertDir 是远端 registry 的证书目录
 	deployCertDir = "/etc/openFuyao/certs"
+	// imageRepoCACrt is the image repo ca path for saving
+	imageRepoCACrt = deployCertDir + "/ca.crt"
 	// deployCACrt is the certification chain path for saving
 	deployCACrt = deployCertDir + "/trust-chain.crt"
 	// certConfigDir  is the certification config path for saving
@@ -60,18 +63,16 @@ func NewEnsureBKEAgent(ctx *phaseframe.PhaseContext) phaseframe.Phase {
 	return &EnsureBKEAgent{BasePhase: base}
 }
 
-func (e *EnsureBKEAgent) Execute() (_ ctrl.Result, err error) {
+func (e *EnsureBKEAgent) Execute() (ctrl.Result, error) {
 	_, _, _, _, log := e.Ctx.Untie()
 
 	if err := e.loadLocalKubeConfig(); err != nil {
-		log.Error(constant.BKEAgentNotReadyReason, "Failed to load local kube config, err: %v", err)
-		return ctrl.Result{}, err
+		return ctrl.Result{}, fmt.Errorf("Failed to load local kube config: %w", err)
 	}
 
 	// get need push agent nodes
 	if err := e.getNeedPushNodes(); err != nil {
-		log.Error(constant.BKEAgentNotReadyReason, "Failed to get need push nodes, err: %v", err)
-		return ctrl.Result{}, err
+		return ctrl.Result{}, fmt.Errorf("Failed to get need push nodes: %w", err)
 	}
 
 	if e.needPushNodes == nil || len(e.needPushNodes) == 0 {
@@ -83,13 +84,11 @@ func (e *EnsureBKEAgent) Execute() (_ ctrl.Result, err error) {
 	log.Info(constant.BKEAgentNotReadyReason, "Push BKEAgent will take some time, please wait")
 
 	if err := e.pushAgent(); err != nil {
-		log.Warn(constant.BKEAgentNotReadyReason, "Failed to push agent, err: %v", err)
 		return ctrl.Result{}, err
 	}
 
 	log.Info(constant.BKEAgentNotReadyReason, "Collect node hostname if it is not set in the BKECluster resource")
 	if err := e.pingAgent(); err != nil {
-		log.Warn(constant.BKEAgentNotReadyReason, "Failed to ping agent, err: %v", err)
 		return ctrl.Result{}, err
 	}
 	return ctrl.Result{}, nil
@@ -139,27 +138,23 @@ func (e *EnsureBKEAgent) loadLocalKubeConfig() error {
 			// 回退到使用 localKubeConfig，不需要创建 RBAC
 			localKubeConfig, err = phaseutil.GetLocalKubeConfig(ctx, c)
 			if err != nil {
-				log.Error(constant.BKEAgentNotReadyReason, "Failed to get local kubeconfig after fallback, err: %v", err)
-				return errors.Wrap(err, "failed to get local kubeconfig after fallback")
+				return fmt.Errorf("failed to get local kubeconfig after fallback: %w", err)
 			}
 		} else {
 			// GetLeastPrivilegeKubeConfig 成功，需要创建 RBAC
 			localKubeConfigBytes, err := phaseutil.GetLocalKubeConfig(ctx, c)
 			if err != nil {
-				log.Error(constant.BKEAgentNotReadyReason, "Failed to get localkubeconfig for RBAC creation, err: %v", err)
-				return errors.Wrap(err, "failed to get localkubeconfig for RBAC creation")
+				return fmt.Errorf("failed to get localkubeconfig for RBAC creation: %w", err)
 			}
 
 			if err := phaseutil.CreateBKEAgentRBACWithLocalKubeConfig(ctx, localKubeConfigBytes, bkeCluster); err != nil {
-				log.Warn(constant.BKEAgentNotReadyReason, "Failed to create RBAC resources, err: %v", err)
 				return errors.Wrap(err, "failed to create RBAC resources")
 			}
 		}
 	} else {
 		localKubeConfig, err = phaseutil.GetLocalKubeConfig(ctx, c)
 		if err != nil {
-			log.Error(constant.BKEAgentNotReadyReason, "Failed to get local kubeconfig, err: %v", err)
-			return errors.Wrap(err, "failed to get local kubeconfig")
+			return fmt.Errorf("failed to get local kubeconfig: %w", err)
 		}
 	}
 
@@ -234,7 +229,7 @@ func (e *EnsureBKEAgent) logPushAgentStart() {
 func (e *EnsureBKEAgent) prepareServiceFile(bkeCluster *bkev1beta1.BKECluster) (string, error) {
 	dirName, err := os.MkdirTemp(os.TempDir(), e.Ctx.BKECluster.Name)
 	if err != nil {
-		return "", errors.Errorf("Failed to create temp dir, err: %v", err)
+		return "", fmt.Errorf("Failed to create temp dir, err: %w", err)
 	}
 
 	servicePath := filepath.Join(dirName, "bkeagent.service")
@@ -242,7 +237,7 @@ func (e *EnsureBKEAgent) prepareServiceFile(bkeCluster *bkev1beta1.BKECluster) (
 		if removeErr := os.RemoveAll(dirName); removeErr != nil {
 			e.Ctx.Log.Warn("Failed to remove temporary directory: %v", removeErr.Error())
 		}
-		return "", errors.Errorf("Failed to create bkeagent.service, err: %v", err)
+		return "", fmt.Errorf("Failed to create bkeagent.service, err: %w", err)
 	}
 
 	return servicePath, nil
@@ -259,14 +254,17 @@ func (e *EnsureBKEAgent) performAgentPush(ctx context.Context, c client.Client, 
 		failedNodeIPs = append(failedNodeIPs, nodeIP)
 		if err := e.Ctx.NodeFetcher().UpdateNodeStatusByIPForCluster(ctx, bkeCluster, nodeIP, func(status *confv1beta1.BKENodeStatus) {
 			status.State = bkev1beta1.NodeInitFailed
-			status.Message = fmt.Sprintf("Failed push bkeagent, err: %v", errInfos)
-			if workerNodes.Filter(bkenode.FilterOptions{"IP": nodeIP}).Length() > 0 {
+			status.RetryCount++
+			if workerNodes.Filter(bkenode.FilterOptions{"IP": nodeIP}).Length() > 0 &&
+				status.RetryCount >= statusmanage.ReconcileAllowedFailedCount {
 				status.NeedSkip = true
+				status.Message = fmt.Sprintf("Failed push bkeagent after %d retries, err: %v", status.RetryCount, errInfos)
+			} else {
+				status.Message = fmt.Sprintf("Failed push bkeagent, err: %v", errInfos)
 			}
 		}); err != nil {
 			e.Ctx.Log.Warn(constant.InternalErrorReason, "Failed to update failed push status for %s: %v", nodeIP, err)
 		}
-		e.Ctx.Log.Error(constant.BKEAgentNotReadyReason, errInfos.Error())
 	}
 	return failedNodeIPs, err
 }
@@ -278,6 +276,12 @@ func (e *EnsureBKEAgent) handlePushResults(ctx context.Context, c client.Client,
 		//及时更新node 失败状态
 		if err := mergecluster.SyncStatusUntilComplete(c, bkeCluster); err != nil {
 			return err
+		}
+		// 检查是否所有失败节点都已标记 NeedSkip（如 Worker 凭据无效重试达到上限后）
+		if e.allNodesSkippedByIPs(failedNodeIPs) {
+			e.Ctx.Log.Info(constant.BKEAgentSkipFailedNodesReason,
+				"all failed nodes are marked NeedSkip, continuing installation, failed nodes: %v", failedNodeIPs)
+			return nil
 		}
 		var nodesInfoToPrint []string
 		for _, node := range e.needPushNodes {
@@ -305,7 +309,6 @@ func (e *EnsureBKEAgent) handlePushResults(ctx context.Context, c client.Client,
 	// todo现在是忽略了master节点加入的情况
 	for _, nodeIP := range failedNodeIPs {
 		if e.needPushNodes.Master().Filter(bkenode.FilterOptions{"IP": nodeIP}).Length() != 0 {
-			e.Ctx.Log.Warn(constant.BKEAgentNotReadyReason, "Push agent to master node failed, process exit")
 			return errors.Errorf("Push agent to master node failed, process exit")
 		}
 	}
@@ -321,6 +324,9 @@ func (e *EnsureBKEAgent) prepareFileUploadList(servicePath string) []bkessh.File
 	fileUpList := []bkessh.File{
 		{Src: servicePath, Dst: "/etc/systemd/system"},
 	}
+	// add imageRepoCAFile to upload file list
+	fileUpList = e.addFilesToUploadList(fileUpList, []string{imageRepoCACrt}, deployCertDir)
+
 	// add certification chain to upload file list
 	fileUpList = e.addFilesToUploadList(fileUpList, []string{deployCACrt}, deployCertDir)
 
@@ -411,7 +417,55 @@ func (e *EnsureBKEAgent) addCSRFilesToUploadList(fileUpList []bkessh.File) []bke
 }
 
 func (e *EnsureBKEAgent) sshPushAgent(ctx context.Context, hosts bkessh.Hosts, localKubeConfig []byte, servicePath string) (map[string]error, error) {
+	// 不可变 OS 模式：master 走完整推送，worker 跳过二进制推送
+	if clusterutil.IsImmutableOSMode(e.Ctx.BKECluster) {
+		return e.sshPushAgentImmutable(ctx, hosts, localKubeConfig, servicePath)
+	}
 
+	return e.sshPushAgentNormal(ctx, hosts, localKubeConfig, servicePath)
+}
+
+// sshPushAgentNormal 原有推送逻辑（非不可变模式或 master 节点）
+func (e *EnsureBKEAgent) sshPushAgentNormal(ctx context.Context, hosts bkessh.Hosts, localKubeConfig []byte, servicePath string) (map[string]error, error) {
+	return e.sshPushAgentCore(ctx, hosts, localKubeConfig, servicePath, false)
+}
+
+// sshPushAgentImmutable 不可变 OS 模式：master 走原逻辑，worker 走不可变逻辑
+func (e *EnsureBKEAgent) sshPushAgentImmutable(ctx context.Context, hosts bkessh.Hosts, localKubeConfig []byte, servicePath string) (map[string]error, error) {
+	pushAgentErrs := map[string]error{}
+
+	masterNodes := e.needPushNodes.Master()
+	workerNodes := e.needPushNodes.Worker()
+
+	if masterNodes.Length() > 0 {
+		masterHosts := phaseutil.NodeToRemoteHost(masterNodes)
+		e.Ctx.Log.Info(constant.BKEAgentNotReadyReason, "Push bkeagent to master nodes (normal mode): %v", masterHosts)
+		masterErrs, err := e.sshPushAgentNormal(ctx, masterHosts, localKubeConfig, servicePath)
+		for k, v := range masterErrs {
+			pushAgentErrs[k] = v
+		}
+		if err != nil {
+			return pushAgentErrs, err
+		}
+	}
+
+	if workerNodes.Length() > 0 {
+		workerHosts := phaseutil.NodeToRemoteHost(workerNodes)
+		e.Ctx.Log.Info(constant.BKEAgentNotReadyReason, "Push bkeagent to worker nodes (immutable OS mode): %v", workerHosts)
+		workerErrs, err := e.sshPushAgentCore(ctx, workerHosts, localKubeConfig, servicePath, true)
+		for k, v := range workerErrs {
+			pushAgentErrs[k] = v
+		}
+		if err != nil {
+			return pushAgentErrs, err
+		}
+	}
+
+	return pushAgentErrs, nil
+}
+
+// sshPushAgentCore bkeagent 推送公共逻辑。immutable=true 时跳过二进制上传，只推配置。
+func (e *EnsureBKEAgent) sshPushAgentCore(ctx context.Context, hosts bkessh.Hosts, localKubeConfig []byte, servicePath string, immutable bool) (map[string]error, error) {
 	pushAgentErrs := map[string]error{}
 
 	multiCli := bkessh.NewMultiCli(ctx)
@@ -426,7 +480,6 @@ func (e *EnsureBKEAgent) sshPushAgent(ctx context.Context, hosts bkessh.Hosts, l
 		return pushAgentErrs, errors.New("No available hosts to push")
 	}
 
-	// 检查命令获取目标机器系统架构
 	unknownArchErrs := multiCli.RegisterHostsInfo()
 	for nodeIP, err := range unknownArchErrs {
 		e.Ctx.Log.Warn("HostArchUnknown", "node %s, err: %v", nodeIP, "unknown arch")
@@ -437,21 +490,15 @@ func (e *EnsureBKEAgent) sshPushAgent(ctx context.Context, hosts bkessh.Hosts, l
 		return pushAgentErrs, errors.New("No available hosts to push")
 	}
 
-	if err := e.executePreCommand(multiCli, pushAgentErrs); err != nil {
+	if err := e.executePreCommand(multiCli, pushAgentErrs, immutable); err != nil {
 		return pushAgentErrs, err
 	}
 
-	if err := e.executeStartCommand(multiCli, localKubeConfig, servicePath, pushAgentErrs); err != nil {
+	if err := e.executeStartCommand(multiCli, localKubeConfig, servicePath, pushAgentErrs, immutable); err != nil {
 		return pushAgentErrs, err
 	}
 
-	postCommand := bkessh.Command{
-		Cmds: bkessh.Commands{
-			"chmod 755 /usr/local/bin/",
-			"chmod 755 /etc/systemd/system/",
-		},
-	}
-
+	postCommand := buildPostCommand(immutable)
 	stdErrs, _ := multiCli.Run(postCommand)
 	for nodeIP, serrs := range stdErrs.Out() {
 		e.Ctx.Log.Warn("PostCommandFailed", "node %s, err: %v", nodeIP, serrs.String())
@@ -466,13 +513,20 @@ func (e *EnsureBKEAgent) checkAvailableHosts(multiCli *bkessh.MultiCli, pushAgen
 	return len(multiCli.AvailableHosts()) > 0
 }
 
+// buildPostCommand builds the post-push chmod command. Immutable OS skips /usr/local/bin/ (read-only).
+func buildPostCommand(immutable bool) bkessh.Command {
+	if immutable {
+		return bkessh.Command{Cmds: bkessh.Commands{"chmod 755 /etc/systemd/system/"}}
+	}
+	return bkessh.Command{Cmds: bkessh.Commands{"chmod 755 /usr/local/bin/", "chmod 755 /etc/systemd/system/"}}
+}
+
 // executePreCommand executes prerequisite commands: Modify folder permissions, stop old services, and clean up related files.
-func (e *EnsureBKEAgent) executePreCommand(multiCli *bkessh.MultiCli, pushAgentErrs map[string]error) error {
+func (e *EnsureBKEAgent) executePreCommand(multiCli *bkessh.MultiCli, pushAgentErrs map[string]error, immutable bool) error {
 	preCommand := bkessh.Command{
 		Cmds: bkessh.Commands{
 			"chmod 777 /usr/local/bin/",
 			"chmod 777 /etc/systemd/system/",
-			// 忽略输出
 			"systemctl stop bkeagent 2>&1 >/dev/null || true",
 			"systemctl disable bkeagent 2>&1 >/dev/null || true",
 			"systemctl daemon-reload 2>&1 >/dev/null || true",
@@ -480,6 +534,16 @@ func (e *EnsureBKEAgent) executePreCommand(multiCli *bkessh.MultiCli, pushAgentE
 			"rm -f /etc/systemd/system/bkeagent.service 2>&1 >/dev/null || true",
 			"rm -rf /etc/openFuyao/bkeagent 2>&1 >/dev/null || true",
 		},
+	}
+	if immutable {
+		preCommand = bkessh.Command{
+			Cmds: bkessh.Commands{
+				"systemctl stop bkeagent 2>&1 >/dev/null || true",
+				"systemctl disable bkeagent 2>&1 >/dev/null || true",
+				"rm -f /etc/systemd/system/bkeagent.service 2>&1 >/dev/null || true",
+				"rm -rf /etc/openFuyao/bkeagent 2>&1 >/dev/null || true",
+			},
+		}
 	}
 
 	stdErrs, _ := multiCli.Run(preCommand)
@@ -498,30 +562,47 @@ func (e *EnsureBKEAgent) executePreCommand(multiCli *bkessh.MultiCli, pushAgentE
 }
 
 // executeStartCommand executes the startup command: upload files, configure bkeagent, and start the service.
-func (e *EnsureBKEAgent) executeStartCommand(multiCli *bkessh.MultiCli, localKubeConfig []byte, servicePath string, pushAgentErrs map[string]error) error {
+func (e *EnsureBKEAgent) executeStartCommand(multiCli *bkessh.MultiCli, localKubeConfig []byte, servicePath string, pushAgentErrs map[string]error, immutable bool) error {
 	// 准备文件上传列表
 	fileUpList := e.prepareFileUploadList(servicePath)
 
-	// push and start bkeagent
 	startCommand := bkessh.Command{
-		FileUp: fileUpList, // 动态列表: 仅包含存在的文件
+		FileUp: fileUpList,
 		Cmds: bkessh.Commands{
-			//在要推送的 节点上创建文件夹，且权限正确
 			fmt.Sprintf("mkdir -p -m 755 %s ", deployCertDir),
 			"mv -f /usr/local/bin/bkeagent_* /usr/local/bin/bkeagent",
 			"mkdir -p -m 777 /etc/openFuyao/bkeagent",
 			"chmod +x /usr/local/bin/bkeagent",
-			// nodeIP and localKubeConfig needs pre-exist before start bkeagent
-
 			fmt.Sprintf("echo -e %q > /etc/openFuyao/bkeagent/config", localKubeConfig),
 			"systemctl daemon-reload 2>&1 >/dev/null",
 			"systemctl enable bkeagent 2>&1 >/dev/null",
 			"systemctl restart bkeagent 2>&1 >/dev/null",
 		},
 	}
+	if immutable {
+		// 不可变模式：不在 startCommand 中 restart bkeagent，改由 ImmutableHostNodeFileCmdFunc
+		// 在覆写 node 文件后再 restart，确保 bkeagent 重启时读取到正确的 hostname
+		startCommand = bkessh.Command{
+			FileUp: fileUpList,
+			Cmds: bkessh.Commands{
+				fmt.Sprintf("mkdir -p -m 755 %s ", deployCertDir),
+				"mkdir -p -m 777 /etc/openFuyao/bkeagent",
+				fmt.Sprintf("echo -e %q > /etc/openFuyao/bkeagent/config", localKubeConfig),
+				"systemctl daemon-reload 2>&1 >/dev/null",
+				"systemctl enable bkeagent 2>&1 >/dev/null",
+			},
+		}
+	}
 
-	multiCli.RegisterHostsCustomCmdFunc(phaseutil.HostCustomCmdFunc)
-	defer multiCli.RemoveHostsCustomCmdFunc()
+	// 非不可变模式才注册二进制上传函数
+	if !immutable {
+		multiCli.RegisterHostsCustomCmdFunc(phaseutil.HostCustomCmdFunc)
+		defer multiCli.RemoveHostsCustomCmdFunc()
+	} else {
+		// 不可变模式：注册只写 node 文件并重启 bkeagent 的函数（不上传二进制）
+		multiCli.RegisterHostsCustomCmdFunc(phaseutil.ImmutableHostNodeFileCmdFunc)
+		defer multiCli.RemoveHostsCustomCmdFunc()
+	}
 
 	stdErrs, _ := multiCli.Run(startCommand)
 	// ignore systemctl enable stderr
@@ -557,8 +638,7 @@ func (e *EnsureBKEAgent) pingAgent() error {
 
 	err, successNodesInfo, failedNodesInfo := phaseutil.PingBKEAgent(ctx, c, scheme, bkeCluster)
 	if err != nil {
-		log.Error(constant.BKEAgentNotReadyReason, "Failed to ping bkeagent: %v", err)
-		return err
+		return fmt.Errorf("Failed to ping bkeagent: %w", err)
 	}
 
 	e.updateNodeStatus(bkeCluster, successNodesInfo, failedNodesInfo)
@@ -607,10 +687,14 @@ func (e *EnsureBKEAgent) updateNodeStatus(
 		nodeIP := phaseutil.GetNodeIPFromCommandWaitResult(node)
 		if err := nf.UpdateNodeStatusByIPForCluster(ctx, bkeCluster, nodeIP, func(status *confv1beta1.BKENodeStatus) {
 			status.State = bkev1beta1.NodeInitFailed
-			status.Message = "Failed ping bkeagent"
 			status.StateCode &= ^bkev1beta1.NodeAgentPushedFlag
-			if workerNodes.Filter(bkenode.FilterOptions{"IP": nodeIP}).Length() > 0 {
+			status.RetryCount++
+			if workerNodes.Filter(bkenode.FilterOptions{"IP": nodeIP}).Length() > 0 &&
+				status.RetryCount >= statusmanage.ReconcileAllowedFailedCount {
 				status.NeedSkip = true
+				status.Message = fmt.Sprintf("Failed ping bkeagent after %d retries", status.RetryCount)
+			} else {
+				status.Message = "Failed ping bkeagent"
 			}
 		}); err != nil {
 			e.Ctx.Log.Warn("Failed to update node status for %s: %v", nodeIP, err)
@@ -620,9 +704,11 @@ func (e *EnsureBKEAgent) updateNodeStatus(
 	for _, node := range successNodesInfo {
 		nodeIP := phaseutil.GetNodeIPFromCommandWaitResult(node)
 		if err := nf.UpdateNodeStatusByIPForCluster(ctx, bkeCluster, nodeIP, func(status *confv1beta1.BKENodeStatus) {
+			status.State = bkev1beta1.NodeInitializing
 			status.Message = "BKEAgent is ready"
 			status.StateCode |= bkev1beta1.NodeAgentPushedFlag
 			status.StateCode |= bkev1beta1.NodeAgentReadyFlag
+			status.RetryCount = 0
 		}); err != nil {
 			e.Ctx.Log.Warn(constant.InternalErrorReason, "Failed to mark node state flag for %s: %v", nodeIP, err)
 		}
@@ -656,17 +742,16 @@ func (e *EnsureBKEAgent) handleValidationFailure(err error) error {
 	errInfo := fmt.Sprintf("Failed to validate nodes fields: %v", err)
 
 	condition.ConditionMark(bkeCluster, bkev1beta1.BKEConfigCondition, confv1beta1.ConditionFalse, constant.BKEConfigInvalidReason, errInfo)
-	log.Error(constant.BKEAgentNotReadyReason, err.Error())
 
 	if strings.Contains(err.Error(), "hostname is not unique") {
 		detailedMsg := fmt.Sprintf(
 			"Some nodes have duplicate hostnames. Please fix or set explicitly. err: %v", err,
 		)
 		condition.ConditionMark(bkeCluster, bkev1beta1.BKEConfigCondition, confv1beta1.ConditionFalse, constant.HostNameNotUniqueReason, detailedMsg)
-		log.Error(constant.HostNameNotUniqueReason, detailedMsg)
+		log.Debug("hostname not unique on nodes pending agent push: %s", detailedMsg)
 
 		for _, node := range e.needPushNodes {
-			log.Error(constant.HostNameNotUniqueReason, "IP: %s Hostname: %s", node.IP, node.Hostname)
+			log.Debug("duplicate hostname candidate IP=%s Hostname=%s", node.IP, node.Hostname)
 			if err := nf.UpdateNodeStatusByIPForCluster(ctx, bkeCluster, node.IP, func(status *confv1beta1.BKENodeStatus) {
 				status.StateCode &= ^bkev1beta1.NodeAgentPushedFlag
 				status.StateCode &= ^bkev1beta1.NodeAgentReadyFlag
@@ -686,11 +771,11 @@ func (e *EnsureBKEAgent) handleValidationFailure(err error) error {
 }
 
 func (e *EnsureBKEAgent) checkAllOrPushedAgentsFailed(successNodesInfo, failedNodesInfo []string) error {
-	_, _, _, _, log := e.Ctx.Untie()
-
 	if len(successNodesInfo) == 0 {
-		log.Error(constant.BKEAgentNotReadyReason, "Failed to ping all nodes' bkeagent")
-		return errors.New("failed to ping all nodes' bkeagent")
+		if len(failedNodesInfo) > 0 && e.allFailedNodesSkipped(failedNodesInfo) {
+			return nil
+		}
+		return fmt.Errorf("failed to ping all nodes' bkeagent")
 	}
 
 	if len(failedNodesInfo) > 0 && e.allNeedPushNodesFailed(failedNodesInfo) {
@@ -698,6 +783,37 @@ func (e *EnsureBKEAgent) checkAllOrPushedAgentsFailed(successNodesInfo, failedNo
 	}
 
 	return nil
+}
+
+func (e *EnsureBKEAgent) allFailedNodesSkipped(failedNodesInfo []string) bool {
+	ips := make([]string, 0, len(failedNodesInfo))
+	for _, info := range failedNodesInfo {
+		ips = append(ips, phaseutil.GetNodeIPFromCommandWaitResult(info))
+	}
+	return e.allNodesSkippedByIPs(ips)
+}
+
+// allNodesSkippedByIPs checks whether all given node IPs are marked NeedSkip.
+func (e *EnsureBKEAgent) allNodesSkippedByIPs(nodeIPs []string) bool {
+	if len(nodeIPs) == 0 {
+		return false
+	}
+	bkeNodes, err := e.Ctx.NodeFetcher().GetBKENodesWrapperForCluster(e.Ctx.Context, e.Ctx.BKECluster)
+	if err != nil || len(bkeNodes) == 0 {
+		return false
+	}
+
+	nodeSkipMap := make(map[string]bool, len(bkeNodes))
+	for i := range bkeNodes {
+		nodeSkipMap[bkeNodes[i].Spec.IP] = bkeNodes[i].Status.NeedSkip
+	}
+
+	for _, nodeIP := range nodeIPs {
+		if !nodeSkipMap[nodeIP] {
+			return false
+		}
+	}
+	return true
 }
 
 func (e *EnsureBKEAgent) allNeedPushNodesFailed(failedNodesInfo []string) bool {

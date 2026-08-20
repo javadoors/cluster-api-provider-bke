@@ -47,7 +47,7 @@ func (kp *kubeletPlugin) runWithContainerd(config map[string]string) error {
 
 	log.Infof("start kubelet container %q", config["containerName"])
 	if err := newKubeletScript(config); err != nil {
-		return errors.Errorf("failed to generate kubelet script, err: %v", err)
+		return fmt.Errorf("failed to generate kubelet script, err: %w", err)
 	}
 	runKubeletCommand := fmt.Sprintf("%s -a start -r %s", utils.GetKubeletScriptPath(), "containerd")
 	if output, err := kp.exec.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", runKubeletCommand); err != nil {

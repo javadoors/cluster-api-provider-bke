@@ -65,6 +65,24 @@ func GetAllInterfaceIP() ([]string, error) {
 	return ips, nil
 }
 
+// ParseAddrIP extracts the IP from an address string (CIDR or plain IP).
+func ParseAddrIP(addrStr string) net.IP {
+	if ip, _, err := net.ParseCIDR(addrStr); err == nil {
+		return ip
+	}
+	return net.ParseIP(addrStr)
+}
+
+// AddressMatchesIP reports whether addrStr refers to the same IP as wantIP.
+func AddressMatchesIP(addrStr, wantIP string) bool {
+	target := net.ParseIP(wantIP)
+	if target == nil {
+		return false
+	}
+	parsed := ParseAddrIP(addrStr)
+	return parsed != nil && parsed.Equal(target)
+}
+
 // GetInterfaceFromIp returns the first interface name of the given IP address.
 func GetInterfaceFromIp(ip string) (string, error) {
 	nw := networkInterface{}

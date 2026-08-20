@@ -14,6 +14,8 @@ package phases
 
 import (
 	"context"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/agiledragon/gomonkey/v2"
@@ -235,7 +237,7 @@ func TestEnsureDryRun_GetDryRunNodes_NoAnnotation(t *testing.T) {
 		{IP: testDryRunNodeIP2},
 	}
 
-	patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapperForCluster, func(_ *nodeutil.NodeFetcher, ctx context.Context, cluster *bkev1beta1.BKECluster) (bkev1beta1.BKENodes, error) {
+	patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapper, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (bkev1beta1.BKENodes, error) {
 		return testNodes, nil
 	})
 
@@ -265,7 +267,7 @@ func TestEnsureDryRun_GetDryRunNodes_WithAnnotation(t *testing.T) {
 		{IP: testDryRunNodeIP2},
 	}
 
-	patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapperForCluster, func(_ *nodeutil.NodeFetcher, ctx context.Context, cluster *bkev1beta1.BKECluster) (bkev1beta1.BKENodes, error) {
+	patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapper, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (bkev1beta1.BKENodes, error) {
 		return testNodes, nil
 	})
 
@@ -281,6 +283,42 @@ func TestEnsureDryRun_GetDryRunNodes_WithAnnotation(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Len(t, nodes, 1)
 	assert.Equal(t, testDryRunNodeIP2, nodes[0].IP)
+}
+
+func TestEnsureDryRun_GetDryRunNodes_IPPrefixBoundary(t *testing.T) {
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+
+	e := createTestEnsureDryRun()
+	bkeCluster := &bkev1beta1.BKECluster{}
+
+	const longIP = "122.235.189.16"
+	const shortIP = "122.235.189.1"
+
+	testNodes := bkev1beta1.BKENodes{
+		{Spec: confv1beta1.BKENodeSpec{IP: longIP}},
+		{Spec: confv1beta1.BKENodeSpec{IP: shortIP}},
+	}
+	expectedNodes := bkenode.Nodes{
+		{IP: longIP},
+		{IP: shortIP},
+	}
+
+	patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapperForCluster, func(_ *nodeutil.NodeFetcher, ctx context.Context, cluster *bkev1beta1.BKECluster) (bkev1beta1.BKENodes, error) {
+		return testNodes, nil
+	})
+	patches.ApplyFunc(phaseutil.GetNeedInitEnvNodesWithBKENodes, func(cluster *bkev1beta1.BKECluster, nodes bkev1beta1.BKENodes) bkenode.Nodes {
+		return expectedNodes
+	})
+
+	annotations := map[string]string{
+		annotation.BKEClusterDryRunAnnotationKey: longIP + ",",
+	}
+
+	nodes, err := e.getDryRunNodes(bkeCluster, annotations, createTestLogger())
+	assert.NoError(t, err)
+	assert.Len(t, nodes, 1)
+	assert.Equal(t, shortIP, nodes[0].IP)
 }
 
 func TestEnsureDryRun_UpdateDryRunAnnotation_Success(t *testing.T) {
@@ -403,8 +441,8 @@ func TestEnsureDryRun_PushAgentWithParams_Success(t *testing.T) {
 	})
 
 	params := PushAgentParams{
-		Ctx:    context.Background(),
-		Client: &fakeClient{},
+		Ctx:        context.Background(),
+		Client:     &fakeClient{},
 		BKECluster: newDryRunClusterWithNTP(),
 		Nodes:      nodes,
 		Log:        createTestLogger(),
@@ -412,6 +450,47 @@ func TestEnsureDryRun_PushAgentWithParams_Success(t *testing.T) {
 
 	err := e.pushAgentWithParams(params)
 	assert.NoError(t, err)
+}
+
+func TestEnsureDryRun_PushAgentWithParams_UsesArchAwareSSHFlow(t *testing.T) {
+	patches := gomonkey.NewPatches()
+	defer patches.Reset()
+
+	e := createTestEnsureDryRun()
+	nodes := bkenode.Nodes{{IP: testDryRunNodeIP1, Hostname: "node1"}}
+
+	patches.ApplyMethod(&fakeClient{}, "Get", func(_ *fakeClient, ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		if secret, ok := obj.(*corev1.Secret); ok {
+			secret.Data = map[string][]byte{"config": []byte("test-config")}
+		}
+		return nil
+	})
+
+	servicePrepared := false
+	sshPushed := false
+	patches.ApplyPrivateMethod(&EnsureBKEAgent{}, "prepareServiceFile", func(_ *EnsureBKEAgent, _ *bkev1beta1.BKECluster) (string, error) {
+		servicePrepared = true
+		return filepath.Join(t.TempDir(), "bkeagent.service"), nil
+	})
+	patches.ApplyPrivateMethod(&EnsureBKEAgent{}, "sshPushAgent", func(_ *EnsureBKEAgent, _ context.Context, _ []remote.Host, kubeconfig []byte, servicePath string) (map[string]error, error) {
+		sshPushed = true
+		assert.Equal(t, []byte("test-config"), kubeconfig)
+		assert.True(t, strings.HasSuffix(servicePath, "bkeagent.service"))
+		return map[string]error{}, nil
+	})
+
+	params := PushAgentParams{
+		Ctx:        context.Background(),
+		Client:     &fakeClient{},
+		BKECluster: newDryRunClusterWithNTP(),
+		Nodes:      nodes,
+		Log:        createTestLogger(),
+	}
+
+	err := e.pushAgentWithParams(params)
+	assert.NoError(t, err)
+	assert.True(t, servicePrepared)
+	assert.True(t, sshPushed)
 }
 
 func TestEnsureDryRun_PushAgentWithParams_PushFailed(t *testing.T) {
@@ -513,8 +592,8 @@ func TestEnsureDryRun_CheckNodeEnvironmentWithParams_NewCommandError(t *testing.
 	e := createTestEnsureDryRun()
 	nodes := bkenode.Nodes{{IP: testDryRunNodeIP1}}
 
-	patches.ApplyFunc((*nodeutil.NodeFetcher).GetNodesForBKECluster, func(_ *nodeutil.NodeFetcher, ctx context.Context, cluster *bkev1beta1.BKECluster) (bkenode.Nodes, error) {
-		return bkenode.Nodes{}, nil
+	patches.ApplyFunc((*nodeutil.NodeFetcher).FetchNodesForCluster, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (*nodeutil.FetchResult, error) {
+		return &nodeutil.FetchResult{Nodes: bkenode.Nodes{}}, nil
 	})
 
 	patches.ApplyFunc(clusterutil.AvailableLoadBalancerEndPoint, func(endpoint confv1beta1.APIEndpoint, nodes []confv1beta1.Node) bool {
@@ -545,8 +624,8 @@ func TestEnsureDryRun_CheckNodeEnvironmentWithParams_WaitError(t *testing.T) {
 	e := createTestEnsureDryRun()
 	nodes := bkenode.Nodes{{IP: testDryRunNodeIP1}}
 
-	patches.ApplyFunc((*nodeutil.NodeFetcher).GetNodesForBKECluster, func(_ *nodeutil.NodeFetcher, ctx context.Context, cluster *bkev1beta1.BKECluster) (bkenode.Nodes, error) {
-		return bkenode.Nodes{}, nil
+	patches.ApplyFunc((*nodeutil.NodeFetcher).FetchNodesForCluster, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (*nodeutil.FetchResult, error) {
+		return &nodeutil.FetchResult{Nodes: bkenode.Nodes{}}, nil
 	})
 
 	patches.ApplyMethod(&command.ENV{}, "New", func(_ *command.ENV) error {
@@ -577,8 +656,8 @@ func TestEnsureDryRun_CheckNodeEnvironmentWithParams_FailedNodes(t *testing.T) {
 	e := createTestEnsureDryRun()
 	nodes := bkenode.Nodes{{IP: testDryRunNodeIP1}}
 
-	patches.ApplyFunc((*nodeutil.NodeFetcher).GetNodesForBKECluster, func(_ *nodeutil.NodeFetcher, ctx context.Context, cluster *bkev1beta1.BKECluster) (bkenode.Nodes, error) {
-		return bkenode.Nodes{}, nil
+	patches.ApplyFunc((*nodeutil.NodeFetcher).FetchNodesForCluster, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (*nodeutil.FetchResult, error) {
+		return &nodeutil.FetchResult{Nodes: bkenode.Nodes{}}, nil
 	})
 
 	patches.ApplyMethod(&command.ENV{}, "New", func(_ *command.ENV) error {
@@ -609,8 +688,8 @@ func TestEnsureDryRun_CheckNodeEnvironmentWithParams_Success(t *testing.T) {
 	e := createTestEnsureDryRun()
 	nodes := bkenode.Nodes{{IP: testDryRunNodeIP1}}
 
-	patches.ApplyFunc((*nodeutil.NodeFetcher).GetNodesForBKECluster, func(_ *nodeutil.NodeFetcher, ctx context.Context, cluster *bkev1beta1.BKECluster) (bkenode.Nodes, error) {
-		return bkenode.Nodes{{IP: testDryRunNodeIP1}}, nil
+	patches.ApplyFunc((*nodeutil.NodeFetcher).FetchNodesForCluster, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (*nodeutil.FetchResult, error) {
+		return &nodeutil.FetchResult{Nodes: bkenode.Nodes{{IP: testDryRunNodeIP1}}}, nil
 	})
 
 	patches.ApplyFunc(clusterutil.AvailableLoadBalancerEndPoint, func(endpoint confv1beta1.APIEndpoint, nodes []confv1beta1.Node) bool {
@@ -665,7 +744,7 @@ func TestEnsureDryRun_ReconcileDryRun_NoNodes(t *testing.T) {
 
 	e := createTestEnsureDryRun()
 
-	patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapperForCluster, func(_ *nodeutil.NodeFetcher, ctx context.Context, cluster *bkev1beta1.BKECluster) (bkev1beta1.BKENodes, error) {
+	patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapper, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (bkev1beta1.BKENodes, error) {
 		return bkev1beta1.BKENodes{}, nil
 	})
 
@@ -683,7 +762,7 @@ func TestEnsureDryRun_ReconcileDryRun_UpdateAnnotationError(t *testing.T) {
 
 	e := createTestEnsureDryRun()
 
-	patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapperForCluster, func(_ *nodeutil.NodeFetcher, ctx context.Context, cluster *bkev1beta1.BKECluster) (bkev1beta1.BKENodes, error) {
+	patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapper, func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (bkev1beta1.BKENodes, error) {
 		return bkev1beta1.BKENodes{{Spec: confv1beta1.BKENodeSpec{IP: testDryRunNodeIP1}}}, nil
 	})
 

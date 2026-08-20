@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -151,8 +151,19 @@ func prepareBkeagentBinary() error {
 		log.Errorf("copy bkeagent binary error: %v, out: %s", err, out)
 		return err
 	}
-	// host copy bkeagent binary
-	return copyFile(bkeagentBinarySrc, bkeagentBinaryDst)
+	// 不可变 OS（如 KubeOS）的 /usr/local/bin 为只读，bkeagent 已内置在镜像中，跳过复制
+	if isHostPathWritable(bkeagentBinaryDst) {
+		return copyFile(bkeagentBinarySrc, bkeagentBinaryDst)
+	}
+	log.Infof("host path %s is read-only, skip copying bkeagent binary (prebuilt in image)", bkeagentBinaryDst)
+	return nil
+}
+
+// isHostPathWritable 检测宿主机上指定路径是否可写
+func isHostPathWritable(path string) bool {
+	testFile := fmt.Sprintf("%s/.bkeagent-writable-test", filepath.Dir(path))
+	_, err := executeCommand(fmt.Sprintf("touch %s && rm -f %s", testFile, testFile))
+	return err == nil
 }
 
 // prepareBkeagentService 渲染并复制 bkeagent.service 文件

@@ -31,6 +31,8 @@ import (
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"sigs.k8s.io/yaml"
+
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/annotation"
 )
 
 type Client struct {
@@ -146,7 +148,7 @@ func (i *Image) GetLayerByPath(path string) (*Layer, error) {
 
 	for _, layerDesc := range manifest.Layers {
 		if layerDesc.Annotations != nil {
-			if filePath, ok := layerDesc.Annotations["org.opencontainers.image.title"]; ok && filePath == path {
+			if filePath, ok := layerDesc.Annotations[annotation.OCIImageTitleAnnotationKey]; ok && filePath == path {
 				layer, err := i.inner.LayerByDigest(layerDesc.Digest)
 				if err != nil {
 					return nil, fmt.Errorf("failed to get layer by digest: %w", err)
@@ -187,7 +189,7 @@ func (i *Image) GetLayersByPrefix(prefix string) ([]Layer, error) {
 
 	for _, layerDesc := range manifest.Layers {
 		if layerDesc.Annotations != nil {
-			filePath, ok := layerDesc.Annotations["org.opencontainers.image.title"]
+			filePath, ok := layerDesc.Annotations[annotation.OCIImageTitleAnnotationKey]
 			if !ok {
 				continue
 			}
@@ -245,7 +247,7 @@ func (i *Image) GetFilesByExtensions(exts ...string) ([]Layer, error) {
 		if layerDesc.Annotations == nil {
 			continue
 		}
-		filePath, ok := layerDesc.Annotations["org.opencontainers.image.title"]
+		filePath, ok := layerDesc.Annotations[annotation.OCIImageTitleAnnotationKey]
 		if !ok || !hasAnySuffix(filePath, exts) {
 			continue
 		}

@@ -3,7 +3,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -315,7 +315,7 @@ func TestCleanupTask(t *testing.T) {
 
 	r.cleanupTask(testGID)
 
-	_, ok := r.Job.Task[testGID]
+	_, ok := r.Job.GetTask(testGID)
 	assert.False(t, ok)
 }
 
@@ -637,7 +637,7 @@ func TestShouldSkipOldTask(t *testing.T) {
 				},
 			}
 			if tt.task != nil {
-				r.Job.Task[testGID] = tt.task
+				r.Job.SetTask(testGID, tt.task)
 			}
 
 			skip := r.shouldSkipOldTask(tt.command, testGID)
@@ -1552,7 +1552,7 @@ func TestCreateAndStartTask(t *testing.T) {
 			res := r.createAndStartTask(context.Background(), tt.command, tt.currentStatus, testGID)
 
 			assert.Equal(t, tt.expectDone, res.done)
-			_, taskExists := r.Job.Task[testGID]
+			_, taskExists := r.Job.GetTask(testGID)
 			assert.True(t, taskExists)
 		})
 	}
@@ -1636,7 +1636,7 @@ func TestProcessTTLTask(t *testing.T) {
 				},
 			}
 
-			if tt.value.HasAddTimer == false && tt.value.TTLSecondsAfterFinished > 0 && tt.value.Phase == agentv1beta1.CommandComplete {
+			if tt.value.ShouldProcessTTL() {
 				patches := gomonkey.ApplyFunc(rand.IntnRange, func(low, high int) int {
 					return low
 				})

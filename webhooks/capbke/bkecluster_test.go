@@ -296,6 +296,122 @@ func TestValidateBasicVMComponents(t *testing.T) {
 	})
 }
 
+func TestDefaultConfigContextAppliesCoreDefaults(t *testing.T) {
+	cluster := &bkev1beta1.BKECluster{
+		ObjectMeta: metav1.ObjectMeta{Name: "cluster-a", Namespace: "default"},
+		Spec: confv1beta1.BKEClusterSpec{
+			ClusterConfig: &confv1beta1.BKEConfig{
+				Cluster:     confv1beta1.Cluster{},
+				CustomExtra: map[string]string{},
+				Addons: []confv1beta1.Product{
+					{Name: "bocoperator", Param: map[string]string{}},
+					{Name: "kubeproxy", Param: map[string]string{"proxyMode": "ipvs"}},
+					{Name: "victoriametrics-controller"},
+				},
+			},
+		},
+	}
+	ctx := &defaultConfigContext{
+		bkeCluster: cluster,
+		data: map[string]string{
+			"yumRepoPort":     "40080",
+			"imageRepoPort":   "5000",
+			"imageRepoPrefix": "openfuyao",
+			"ntpServer":       "ntp.example.com",
+			"containerd":      "containerd-1.7.0-linux-amd64.tar.gz",
+			"host":            "192.168.1.10",
+		},
+		bkeNodes: bkenode.Nodes{
+			confv1beta1.Node{
+				Role: []string{"master", "etcd"},
+				IP:   "192.168.1.11",
+			},
+		},
+	}
+
+	ctx.setRepoDefaults()
+	ctx.setNTPServerDefault()
+	ctx.setContainerdDefault()
+	ctx.setHostRelatedDefaults()
+	ctx.setAddonDefaults()
+	for _, patch := range ctx.patchFuncs {
+		patch(cluster)
+	}
+
+	assert.Equal(t, "40080", cluster.Spec.ClusterConfig.Cluster.HTTPRepo.Port)
+	assert.Equal(t, "5000", cluster.Spec.ClusterConfig.Cluster.ImageRepo.Port)
+	assert.Equal(t, "openfuyao", cluster.Spec.ClusterConfig.Cluster.ImageRepo.Prefix)
+	assert.Equal(t, "ntp.example.com", cluster.Spec.ClusterConfig.Cluster.NTPServer)
+	assert.Equal(t, "containerd-1.7.0-linux-{.arch}.tar.gz", cluster.Spec.ClusterConfig.CustomExtra["containerd"])
+	assert.Equal(t, "192.168.1.10", cluster.Spec.ClusterConfig.Cluster.HTTPRepo.Ip)
+	assert.Equal(t, "192.168.1.10", cluster.Spec.ClusterConfig.Cluster.ImageRepo.Ip)
+	assert.Equal(t, "192.168.1.10", cluster.Spec.ClusterConfig.CustomExtra["host"])
+	assert.Equal(t, "192.168.1.10", cluster.Spec.ClusterConfig.CustomExtra["nfsServer"])
+	assert.Equal(t, "/", cluster.Spec.ClusterConfig.CustomExtra["nfsRootDir"])
+	assert.Equal(t, "4.1", cluster.Spec.ClusterConfig.CustomExtra["nfsVersion"])
+	assert.Equal(t, "192.168.1.10", cluster.Spec.ClusterConfig.Addons[0].Param["deployServerIp"])
+	assert.Equal(t, "192.168.1.11", cluster.Spec.ClusterConfig.CustomExtra["pipelineServer"])
+	assert.Equal(t, "false", cluster.Spec.ClusterConfig.CustomExtra["pipelineServerEnableCleanImages"])
+	assert.Equal(t, "ipvs", cluster.Spec.ClusterConfig.CustomExtra["proxyMode"])
+	assert.Equal(t, expectedVMDefaults["vmAgentCpuCount"], cluster.Spec.ClusterConfig.Addons[2].Param["vmAgentCpuCount"])
+}
+
+func TestDefaultConfigContextPreservesExistingDefaults(t *testing.T) {
+	cluster := &bkev1beta1.BKECluster{
+		Spec: confv1beta1.BKEClusterSpec{
+			ClusterConfig: &confv1beta1.BKEConfig{
+				Cluster: confv1beta1.Cluster{
+					HTTPRepo:  confv1beta1.Repo{Ip: "existing-http", Port: "1"},
+					ImageRepo: confv1beta1.Repo{Ip: "existing-image", Port: "2", Prefix: "existing"},
+					NTPServer: "existing-ntp",
+				},
+				CustomExtra: map[string]string{
+					"containerd":                      "existing-containerd",
+					"host":                            "existing-host",
+					"nfsServer":                       "existing-nfs",
+					"nfsRootDir":                      "/data",
+					"nfsVersion":                      "3",
+					"pipelineServer":                  "existing-pipeline",
+					"pipelineServerEnableCleanImages": "true",
+				},
+				Addons: []confv1beta1.Product{{Name: "bocoperator", Param: map[string]string{}}},
+			},
+		},
+	}
+	ctx := &defaultConfigContext{
+		bkeCluster: cluster,
+		data: map[string]string{
+			"yumRepoPort":     "40080",
+			"imageRepoPort":   "5000",
+			"imageRepoPrefix": "openfuyao",
+			"ntpServer":       "ntp.example.com",
+			"containerd":      "containerd-1.7.0-linux-amd64.tar.gz",
+			"host":            "192.168.1.10",
+		},
+		bkeNodes: bkenode.Nodes{{IP: "192.168.1.11", Role: []string{"master"}}},
+	}
+	ctx.setRepoDefaults()
+	ctx.setNTPServerDefault()
+	ctx.setContainerdDefault()
+	ctx.setHostRelatedDefaults()
+	ctx.setAddonDefaults()
+	for _, patch := range ctx.patchFuncs {
+		patch(cluster)
+	}
+
+	assert.Equal(t, "1", cluster.Spec.ClusterConfig.Cluster.HTTPRepo.Port)
+	assert.Equal(t, "2", cluster.Spec.ClusterConfig.Cluster.ImageRepo.Port)
+	assert.Equal(t, "existing", cluster.Spec.ClusterConfig.Cluster.ImageRepo.Prefix)
+	assert.Equal(t, "existing-ntp", cluster.Spec.ClusterConfig.Cluster.NTPServer)
+	assert.Equal(t, "existing-containerd", cluster.Spec.ClusterConfig.CustomExtra["containerd"])
+	assert.Equal(t, "existing-host", cluster.Spec.ClusterConfig.CustomExtra["host"])
+	assert.Equal(t, "existing-nfs", cluster.Spec.ClusterConfig.CustomExtra["nfsServer"])
+	assert.Equal(t, "/data", cluster.Spec.ClusterConfig.CustomExtra["nfsRootDir"])
+	assert.Equal(t, "3", cluster.Spec.ClusterConfig.CustomExtra["nfsVersion"])
+	assert.Equal(t, "existing-pipeline", cluster.Spec.ClusterConfig.CustomExtra["pipelineServer"])
+	assert.Equal(t, "true", cluster.Spec.ClusterConfig.CustomExtra["pipelineServerEnableCleanImages"])
+}
+
 func TestValidateVMAgentSpecialRule(t *testing.T) {
 	// 固定节点计数（假设有3个 vmagent 节点）
 	nodeLabelCount := map[string]int{
@@ -702,6 +818,107 @@ func TestPathsMatch(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			got := pathsMatch(tt.patternPath, tt.actualPath)
 			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestValidateImmutableOSConstraints(t *testing.T) {
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		nodes       bkenode.Nodes
+		wantError   bool
+		errContains string
+	}{
+		{
+			name:        "非不可变模式直接通过",
+			annotations: nil,
+			nodes: bkenode.Nodes{
+				{IP: "10.0.0.1", Role: []string{"master", "node"}},
+			},
+			wantError: false,
+		},
+		{
+			name:        "不可变模式-纯master节点",
+			annotations: map[string]string{"openfuyao.io/immutable-os": "kubeos"},
+			nodes: bkenode.Nodes{
+				{IP: "10.0.0.1", Role: []string{"master"}},
+			},
+			wantError: false,
+		},
+		{
+			name:        "不可变模式-纯worker节点",
+			annotations: map[string]string{"openfuyao.io/immutable-os": "kubeos"},
+			nodes: bkenode.Nodes{
+				{IP: "10.0.0.2", Role: []string{"node"}},
+			},
+			wantError: false,
+		},
+		{
+			name:        "不可变模式-master和node分列数组共节点",
+			annotations: map[string]string{"openfuyao.io/immutable-os": "kubeos"},
+			nodes: bkenode.Nodes{
+				{IP: "10.0.0.1", Role: []string{"master", "node"}},
+			},
+			wantError:   true,
+			errContains: "10.0.0.1",
+		},
+		{
+			name:        "不可变模式-master/node单值视为合法control-plane",
+			annotations: map[string]string{"openfuyao.io/immutable-os": "kubeos"},
+			nodes: bkenode.Nodes{
+				{IP: "10.0.0.1", Role: []string{"master/node"}},
+			},
+			wantError: false,
+		},
+		{
+			name:        "不可变模式-多节点其中一个共节点",
+			annotations: map[string]string{"openfuyao.io/immutable-os": "kubeos"},
+			nodes: bkenode.Nodes{
+				{IP: "10.0.0.1", Role: []string{"master"}},
+				{IP: "10.0.0.2", Role: []string{"master", "node"}},
+				{IP: "10.0.0.3", Role: []string{"node"}},
+			},
+			wantError:   true,
+			errContains: "10.0.0.2",
+		},
+		{
+			name:        "不可变模式-同一IP多BKENode角色冲突",
+			annotations: map[string]string{"openfuyao.io/immutable-os": "kubeos"},
+			nodes: bkenode.Nodes{
+				{IP: "10.0.0.1", Hostname: "node-1", Role: []string{"master"}},
+				{IP: "10.0.0.1", Hostname: "node-2", Role: []string{"node"}},
+			},
+			wantError:   true,
+			errContains: "10.0.0.1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			webhook := &BKECluster{NodeFetcher: &nodeutil.NodeFetcher{}}
+			monkey.PatchInstanceMethod(reflect.TypeOf(webhook.NodeFetcher), "GetNodesForBKECluster",
+				func(_ *nodeutil.NodeFetcher, _ context.Context, _ *bkev1beta1.BKECluster) (bkenode.Nodes, error) {
+					return tt.nodes, nil
+				})
+			defer monkey.UnpatchAll()
+
+			cluster := &bkev1beta1.BKECluster{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:        "test-cluster",
+					Namespace:   "default",
+					Annotations: tt.annotations,
+				},
+			}
+			err := webhook.validateImmutableOSConstraints(context.Background(), cluster)
+			if tt.wantError {
+				assert.Error(t, err)
+				if tt.errContains != "" && err != nil {
+					assert.Contains(t, err.Error(), tt.errContains)
+				}
+			} else {
+				assert.NoError(t, err)
+			}
 		})
 	}
 }

@@ -2,7 +2,7 @@
  * Copyright (c) 2024 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -15,9 +15,11 @@ package validation
 import (
 	"fmt"
 	"net"
+	"net/http"
 	"reflect"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/blang/semver"
@@ -350,7 +352,16 @@ func BuildRepoURL(host, port, prefix string) string {
 
 // 校验连通性
 func checkReachable(addr string) bool {
-	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	host, port := parseHostPort(addr)
+	if host == "" {
+		return false
+	}
+
+	if checkHTTPReachable(host, port) {
+		return true
+	}
+
+	conn, err := net.DialTimeout("tcp", buildDialAddress(host, port), 5*time.Second)
 	if err != nil {
 		return false
 	}
@@ -360,6 +371,61 @@ func checkReachable(addr string) bool {
 		}
 	}()
 	return true
+}
+
+func parseHostPort(addr string) (string, string) {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return "", ""
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err == nil {
+		return strings.TrimSpace(host), strings.TrimSpace(port)
+	}
+	// fallback for inputs without explicit port
+	return strings.TrimSpace(addr), ""
+}
+
+func buildDialAddress(host, port string) string {
+	if port == "" {
+		return net.JoinHostPort(host, "80")
+	}
+	return net.JoinHostPort(host, port)
+}
+
+func buildHTTPProbeURL(host, port string) string {
+	if port == "" {
+		return fmt.Sprintf("http://%s", host)
+	}
+	return fmt.Sprintf("http://%s", net.JoinHostPort(host, port))
+}
+
+func checkHTTPReachable(host, port string) bool {
+	client := &http.Client{Timeout: 5 * time.Second}
+	url := buildHTTPProbeURL(host, port)
+
+	// HEAD is cheap; some servers don't allow it, so fallback to GET.
+	for _, method := range []string{http.MethodHead, http.MethodGet} {
+		req, err := http.NewRequest(method, url, nil)
+		if err != nil {
+			continue
+		}
+		if method == http.MethodGet {
+			req.Header.Set("Range", "bytes=0-0")
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			continue
+		}
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			log.Warnf("failed to close HTTP probe response body: %v, url: %s", closeErr, url)
+		}
+		// Any non-5xx status means endpoint is reachable.
+		if resp.StatusCode < 500 {
+			return true
+		}
+	}
+	return false
 }
 
 // ResolveReachableRepoAddress returns the reachable repo address.

@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -14,10 +14,13 @@ package phases
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/pkg/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/record"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -31,6 +34,7 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/statusmanage"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/constant"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/intervention"
 	labelhelper "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/label"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/nodeutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
@@ -76,6 +80,13 @@ func ProcessNodeMachineMapping(params ProcessNodeMachineMappingParams) (ProcessN
 			params.Log.Warn(params.NodeDeletedReason,
 				"Node %s has not been associated with a Machine, skip delete it",
 				phaseutil.NodeInfo(node))
+			// Delete the Node from target cluster if it still exists
+			if node.Hostname != "" {
+				if err := DeleteTargetClusterNode(ctx, c, bkeCluster, node.Hostname); err != nil {
+					params.Log.Warn(params.NodeDeletedReason,
+						"Failed to delete Node %s from target cluster: %v", node.Hostname, err)
+				}
+			}
 			// 如果节点已经在status中，但是没有关联machine，需要从status中删除
 			if params.NodeFetcher != nil {
 				if err := params.NodeFetcher.DeleteBKENodeForCluster(ctx, bkeCluster, node.IP); err != nil {
@@ -89,8 +100,7 @@ func ProcessNodeMachineMapping(params ProcessNodeMachineMappingParams) (ProcessN
 				phaseutil.RemoveAppointmentDeletedNodes(cluster, node.IP)
 			}
 			if err = mergecluster.SyncStatusUntilComplete(c, bkeCluster, patchFunc); err != nil {
-				params.Log.Error(params.NodeJoinedReason, "Sync status failed. err: %v", err)
-				return ProcessNodeMachineMappingResult{}, err
+				return ProcessNodeMachineMappingResult{}, fmt.Errorf("Sync status failed: %w", err)
 			}
 		} else {
 			if machine.Status.Phase == string(clusterv1.MachinePhaseDeleting) {
@@ -129,6 +139,7 @@ type ProcessCommandFailureParams struct {
 	InitNodeIp     *string
 	FailedNodes    []string
 	RefreshContext func() error
+	Recorder       record.EventRecorder
 }
 
 // ProcessCommandFailureResult 包含处理命令失败的结果
@@ -143,8 +154,7 @@ func ProcessCommandFailure(params ProcessCommandFailureParams) ProcessCommandFai
 	// 等两秒
 	time.Sleep(time.Duration(MasterInitSleepSeconds) * time.Second)
 	if err := params.RefreshContext(); err != nil {
-		log.Error(constant.InternalErrorReason, "Refresh BKECluster obj %q failed, err: %v", utils.ClientObjNS(params.BKECluster), err)
-		return ProcessCommandFailureResult{Done: false, Success: false, Err: err}
+		return ProcessCommandFailureResult{Done: false, Success: false, Err: fmt.Errorf("Refresh BKECluster obj %q failed: %w", utils.ClientObjNS(params.BKECluster), err)}
 	}
 
 	nodeHasFailedFlag, _ := params.NodeFetcher.GetNodeStateFlagForCluster(params.Context, params.BKECluster, *params.InitNodeIp, bkev1beta1.NodeFailedFlag)
@@ -154,6 +164,15 @@ func ProcessCommandFailure(params ProcessCommandFailureParams) ProcessCommandFai
 		if err := params.Client.Delete(params.Context, params.InitCommand); err != nil {
 			log.Warn(constant.MasterNotInitReason, "Delete init command failed, err: %v", err)
 			return ProcessCommandFailureResult{Done: false, Success: false, Err: nil}
+		}
+		// Notify manual intervention requirement
+		if params.Recorder != nil {
+			_ = intervention.Require(intervention.Params{
+				BKECluster: params.BKECluster,
+				Client:     params.Client,
+				Recorder:   params.Recorder,
+				Guidance:   intervention.NodeBootstrapTerminal(*params.InitNodeIp, params.FailedNodes),
+			})
 		}
 		return ProcessCommandFailureResult{Done: true, Success: false, Err: errors.Errorf("master node init failed, failed nodes: %v", params.FailedNodes)}
 	}
@@ -170,13 +189,19 @@ func ProcessCommandFailure(params ProcessCommandFailureParams) ProcessCommandFai
 	}
 
 	ownerBkeMachine := &bkev1beta1.BKEMachine{}
-	if err := params.Client.Get(params.Context, key, ownerBkeMachine); err != nil {
-		log.Error(constant.MasterNotInitReason, "Get init command owner bkeMachine failed, err: %v", err)
-		return ProcessCommandFailureResult{Done: false, Success: false, Err: err}
-	}
-	labelhelper.RemoveBKEMachineLabel(ownerBkeMachine, bkenode.MasterNodeRole)
-	if err := params.Client.Update(params.Context, ownerBkeMachine); err != nil {
-		log.Error(constant.MasterNotInitReason, "Update init command owner bkeMachine failed, err: %v", err)
+	var getFailed bool
+	if err := phaseutil.RetryOnConflict(func() error {
+		if err := params.Client.Get(params.Context, key, ownerBkeMachine); err != nil {
+			getFailed = true
+			return fmt.Errorf("Get init command owner bkeMachine failed: %w", err)
+		}
+		getFailed = false
+		labelhelper.RemoveBKEMachineLabel(ownerBkeMachine, bkenode.MasterNodeRole)
+		return params.Client.Update(params.Context, ownerBkeMachine)
+	}); err != nil {
+		if !getFailed {
+			err = fmt.Errorf("Update init command owner bkeMachine failed: %w", err)
+		}
 		return ProcessCommandFailureResult{Done: false, Success: false, Err: err}
 	}
 	return ProcessCommandFailureResult{Done: false, Success: false, Err: errors.Errorf("master node init command run failed, failed nodes: %v", params.FailedNodes)}
@@ -205,4 +230,20 @@ func GetTargetClusterNodes(ctx context.Context, c client.Client, bkeCluster *bke
 		nodes = append(nodes, node)
 	}
 	return nodes, nil
+}
+
+// deleteTargetClusterNode deletes a Node from the target cluster by name.
+// Returns nil if the Node is not found (already deleted).
+func DeleteTargetClusterNode(ctx context.Context, c client.Client, bkeCluster *bkev1beta1.BKECluster, nodeName string) error {
+	if nodeName == "" {
+		return nil
+	}
+	clientset, _, err := kube.GetTargetClusterClient(ctx, c, bkeCluster)
+	if err != nil {
+		return errors.Wrapf(err, "failed to get target cluster client")
+	}
+	if err := clientset.CoreV1().Nodes().Delete(ctx, nodeName, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		return errors.Wrapf(err, "failed to delete Node %s from target cluster", nodeName)
+	}
+	return nil
 }

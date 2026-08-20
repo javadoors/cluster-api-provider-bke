@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -32,6 +32,14 @@ const (
 	StatusRecordAnnotationKey = "bke.bocloud.com/status-record"
 )
 
+// BKE operations and internal workflow annotations.
+const (
+	ManageClusterEtcdCertDirAnnotationKey = "etcd-cert-dir"
+	DeployActionAnnotationKey             = "deployAction"
+	DeployActionK8sUpgrade                = "k8s_upgrade"
+	ProviderRestartedAtAnnotationKey      = "bke.openfuyao.cn/restartedAt"
+)
+
 // feature gates annotation key
 const (
 	// RetryAnnotationKey is the annotation key for retry
@@ -57,13 +65,24 @@ const (
 
 	// AddonBootWaitTimeOutAnnotationKey is the annotation key for addon boot wait timeout
 	AddonBootWaitTimeOutAnnotationKey = "bke.bocloud.com/addon-boot-wait-timeout"
+	// LauncherWaitTimeOutAnnotationKey is the annotation key for bkeagent-launcher pod ready wait timeout
+	LauncherWaitTimeOutAnnotationKey = "bke.bocloud.com/launcher-wait-timeout"
 )
 
 // ClusterVersion orchestration annotations (written by ClusterVersion reconciler).
 const (
-	CVOUpgradeReadyAnnotationKey   = "cvo.openfuyao.cn/upgrade-ready"
-	CVOClusterVersionAnnotationKey = "cvo.openfuyao.cn/cluster-version"
-	CVOUpgradePathAnnotationKey    = "cvo.openfuyao.cn/upgrade-path"
+	CVOUpgradeReadyAnnotationKey            = "cvo.openfuyao.cn/upgrade-ready"
+	CVOClusterVersionAnnotationKey          = "cvo.openfuyao.cn/cluster-version"
+	CVOUpgradePathAnnotationKey             = "cvo.openfuyao.cn/upgrade-path"
+	CVODeclarativeUpgradeAnnotationKey      = "cvo.openfuyao.cn/declarative-upgrade"
+	UpgradePathOCIDigestAnnotationKey       = "config.openfuyao.com/oci-digest"
+	ReleaseImageBKEClusterNameAnnotationKey = "cvo.openfuyao.cn/bkecluster-name"
+)
+
+// Kubernetes and OCI protocol annotations used by this project.
+const (
+	KubernetesConfigHashAnnotationKey = "kubernetes.io/config.hash"
+	OCIImageTitleAnnotationKey        = "org.opencontainers.image.title"
 )
 
 func SetBKEClusterDefaultAnnotation(bkeCluster client.Object) {
@@ -87,6 +106,9 @@ func SetBKEClusterDefaultAnnotation(bkeCluster client.Object) {
 	}
 	if _, ok := HasAnnotation(bkeCluster, NodeBootWaitTimeOutAnnotationKey); !ok {
 		SetAnnotation(bkeCluster, NodeBootWaitTimeOutAnnotationKey, "10m")
+	}
+	if _, ok := HasAnnotation(bkeCluster, LauncherWaitTimeOutAnnotationKey); !ok {
+		SetAnnotation(bkeCluster, LauncherWaitTimeOutAnnotationKey, "5m")
 	}
 }
 

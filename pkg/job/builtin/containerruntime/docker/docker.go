@@ -77,7 +77,6 @@ func (dp DockerPlugin) Execute(commands []string) ([]string, error) {
 	out, err = dp.exec.ExecuteCommandWithCombinedOutput("sh", "-c", "systemctl restart docker")
 	if err != nil {
 		errorMsg := fmt.Sprintf("start docker failed, err: %v, out: %s", err, out)
-		log.Error(errorMsg)
 		return []string{errorMsg}, errors.New(errorMsg)
 	}
 	if err = edocker.WaitDockerReady(); err != nil {
@@ -97,7 +96,7 @@ func (dp DockerPlugin) installAndConfigureDocker(runtimeParam map[string]string)
 		cs := []string{downloader.Name, url, "chmod=755", "rename=runc", "saveto=/usr/local/beyondvm"}
 		downloaderPlugin := downloader.New()
 		if _, err := downloaderPlugin.Execute(cs); err != nil {
-			return errors.Errorf("download richrunc %s failed, err: %v", url, err)
+			return fmt.Errorf("download richrunc %s failed, err: %w", url, err)
 		}
 	}
 	docker := "docker-ce"
@@ -107,8 +106,7 @@ func (dp DockerPlugin) installAndConfigureDocker(runtimeParam map[string]string)
 		runtimeParam["cgroupDriver"] = "cgroupfs"
 	}
 	if err := httprepo.RepoInstall(docker); err != nil {
-		log.Errorf("install docker failed, err: %v", err)
-		return err
+		return fmt.Errorf("install docker failed, err: %w", err)
 	}
 	enableTls := runtimeParam["enableDockerTls"] == "true"
 	registries := strings.Split(runtimeParam["insecureRegistries"], ",")

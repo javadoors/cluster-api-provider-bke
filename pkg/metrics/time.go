@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -13,6 +13,7 @@
 package metrics
 
 import (
+	"fmt"
 	"strconv"
 	"time"
 
@@ -71,7 +72,7 @@ func ParseTimeFromTo(from, to string) (startTime, endTime time.Time, err error) 
 		// 解析开始时间
 		startTime, err = ParseTimeUnix(from)
 		if err != nil {
-			err = errors.Errorf("Error parsing start time: %v", err)
+			err = fmt.Errorf("Error parsing start time: %w", err)
 			return
 		}
 	}
@@ -82,7 +83,7 @@ func ParseTimeFromTo(from, to string) (startTime, endTime time.Time, err error) 
 		// 解析结束时间
 		endTime, err = ParseTimeUnix(to)
 		if err != nil {
-			err = errors.Errorf("Error parsing end time: %v", err)
+			err = fmt.Errorf("Error parsing end time: %w", err)
 			return
 		}
 	}

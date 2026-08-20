@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -467,17 +467,20 @@ func createClusterAccessClusterRole(ctx context.Context, c client.Client) error 
 
 // createOrUpdateClusterRole creates or updates a ClusterRole
 func createOrUpdateClusterRole(ctx context.Context, c client.Client, role *rbacv1.ClusterRole) error {
-	existing := &rbacv1.ClusterRole{}
-	err := c.Get(ctx, client.ObjectKey{Name: role.Name}, existing)
-	if err != nil {
+	if err := RetryOnConflict(func() error {
+		existingClusterRole := &rbacv1.ClusterRole{}
+		if err := c.Get(ctx, client.ObjectKey{Name: role.Name}, existingClusterRole); err != nil {
+			return err
+		}
+		existingClusterRole.Rules = role.Rules
+		return c.Update(ctx, existingClusterRole)
+	}); err != nil {
 		if apierrors.IsNotFound(err) {
 			return c.Create(ctx, role)
 		}
 		return err
 	}
-
-	existing.Rules = role.Rules
-	return c.Update(ctx, existing)
+	return nil
 }
 
 // getBKEAgentSubject returns the Subject for bkeagent-cert-user
@@ -514,40 +517,49 @@ func ensureNamespaceExists(ctx context.Context, c client.Client, namespace strin
 
 // createOrUpdateRoleBinding creates or updates a RoleBinding
 func createOrUpdateRoleBinding(ctx context.Context, c client.Client, roleBinding *rbacv1.RoleBinding) error {
-	existing := &rbacv1.RoleBinding{}
-	err := c.Get(ctx, client.ObjectKey{Name: roleBinding.Name, Namespace: roleBinding.Namespace}, existing)
-	if err != nil {
+	if err := RetryOnConflict(func() error {
+		existingRoleBinding := &rbacv1.RoleBinding{}
+		if err := c.Get(ctx, client.ObjectKey{Name: roleBinding.Name, Namespace: roleBinding.Namespace}, existingRoleBinding); err != nil {
+			if apierrors.IsNotFound(err) {
+				return err
+			}
+			return errors.Wrapf(err, "failed to get RoleBinding '%s' in namespace %s", roleBinding.Name, roleBinding.Namespace)
+		}
+		existingRoleBinding.Subjects = roleBinding.Subjects
+		existingRoleBinding.RoleRef = roleBinding.RoleRef
+		if err := c.Update(ctx, existingRoleBinding); err != nil {
+			return errors.Wrapf(err, "failed to update RoleBinding '%s' in namespace %s", roleBinding.Name, roleBinding.Namespace)
+		}
+		return nil
+	}); err != nil {
 		if apierrors.IsNotFound(err) {
 			if err := c.Create(ctx, roleBinding); err != nil {
 				return errors.Wrapf(err, "failed to create RoleBinding '%s' in namespace %s", roleBinding.Name, roleBinding.Namespace)
 			}
 			return nil
 		}
-		return errors.Wrapf(err, "failed to get RoleBinding '%s' in namespace %s", roleBinding.Name, roleBinding.Namespace)
-	}
-
-	existing.Subjects = roleBinding.Subjects
-	existing.RoleRef = roleBinding.RoleRef
-	if err := c.Update(ctx, existing); err != nil {
-		return errors.Wrapf(err, "failed to update RoleBinding '%s' in namespace %s", roleBinding.Name, roleBinding.Namespace)
+		return err
 	}
 	return nil
 }
 
 // createOrUpdateClusterRoleBinding creates or updates a ClusterRoleBinding
 func createOrUpdateClusterRoleBinding(ctx context.Context, c client.Client, clusterRoleBinding *rbacv1.ClusterRoleBinding) error {
-	existing := &rbacv1.ClusterRoleBinding{}
-	err := c.Get(ctx, client.ObjectKey{Name: clusterRoleBinding.Name}, existing)
-	if err != nil {
+	if err := RetryOnConflict(func() error {
+		existingClusterRoleBinding := &rbacv1.ClusterRoleBinding{}
+		if err := c.Get(ctx, client.ObjectKey{Name: clusterRoleBinding.Name}, existingClusterRoleBinding); err != nil {
+			return err
+		}
+		existingClusterRoleBinding.Subjects = clusterRoleBinding.Subjects
+		existingClusterRoleBinding.RoleRef = clusterRoleBinding.RoleRef
+		return c.Update(ctx, existingClusterRoleBinding)
+	}); err != nil {
 		if apierrors.IsNotFound(err) {
 			return c.Create(ctx, clusterRoleBinding)
 		}
 		return err
 	}
-
-	existing.Subjects = clusterRoleBinding.Subjects
-	existing.RoleRef = clusterRoleBinding.RoleRef
-	return c.Update(ctx, existing)
+	return nil
 }
 
 // createRoleBindingForNamespace creates a RoleBinding in the specified namespace

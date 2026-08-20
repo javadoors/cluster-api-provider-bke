@@ -48,18 +48,18 @@ func RepoUpdate() error {
 	case "apt":
 		output, err := executor.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", fmt.Sprintf("%s update", packageManager))
 		if err != nil {
-			return errors.Errorf("update packages failed, err: %v, out: %s", err, output)
+			return fmt.Errorf("update packages failed, err: %w, out: %s", err, output)
 		}
 	case "yum":
 		// yum clean all
 		output, err := executor.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", fmt.Sprintf("%s clean all", packageManager))
 		if err != nil {
-			return errors.Errorf("update packages failed, err: %v, out: %s", err, output)
+			return fmt.Errorf("update packages failed, err: %w, out: %s", err, output)
 		}
 		// yum makecache
 		output, err = executor.ExecuteCommandWithCombinedOutput("/bin/sh", "-c", fmt.Sprintf("%s makecache", packageManager))
 		if err != nil {
-			return errors.Errorf("update packages failed, err: %v, out: %s", err, output)
+			return fmt.Errorf("update packages failed, err: %w, out: %s", err, output)
 		}
 	default:
 		return errors.Errorf("package manager %q not supported", packageManager)
@@ -71,7 +71,7 @@ func RepoUpdate() error {
 func RepoSearch(pkg string) error {
 	output, err := executor.ExecuteCommandWithOutput("/bin/sh", "-c", fmt.Sprintf("%s search %s  2>/dev/null | grep -w %s", packageManager, pkg, pkg))
 	if err != nil {
-		return errors.Errorf("search package %q failed, err: %v, out: %s", pkg, err, output)
+		return fmt.Errorf("search package %q failed, err: %w, out: %s", pkg, err, output)
 	}
 	if strings.Contains(output, pkg) {
 		return nil

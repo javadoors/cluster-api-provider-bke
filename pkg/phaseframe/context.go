@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -22,6 +22,7 @@ import (
 	"k8s.io/client-go/rest"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/cluster-api/util"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
@@ -45,9 +46,10 @@ type PhaseContext struct {
 	Log        *bkev1beta1.BKELogger
 	Scheme     *runtime.Scheme
 	RestConfig *rest.Config
+	Cache      cache.Cache // Informer cache; pass to client wrappers that need write-through
 	cancelFunc context.CancelFunc
 
-	mux            sync.Mutex
+	mux            sync.RWMutex
 	nodeFetcher    *nodeutil.NodeFetcher
 	VersionContext *upgrade.VersionContext
 
@@ -61,22 +63,35 @@ func NewReconcilePhaseCtx(ctx context.Context) *PhaseContext {
 	return &PhaseContext{
 		Context:    phaseCancelCtx,
 		cancelFunc: phaseCancel,
-		mux:        sync.Mutex{},
+		mux:        sync.RWMutex{},
 	}
 }
 
 func (pc *PhaseContext) SetBKECluster(bkeCluster *bkev1beta1.BKECluster) *PhaseContext {
+	pc.mux.Lock()
 	pc.BKECluster = bkeCluster
+	pc.mux.Unlock()
 	return pc
 }
 
 func (pc *PhaseContext) SetCluster(cluster *clusterv1.Cluster) *PhaseContext {
+	pc.mux.Lock()
 	pc.Cluster = cluster
+	pc.mux.Unlock()
 	return pc
 }
 
 func (pc *PhaseContext) SetClient(client client.Client) *PhaseContext {
 	pc.Client = client
+	return pc
+}
+
+// SetCache attaches the Informer cache to the phase context. Downstream code
+// that needs write-through caching (e.g. the cert generator) reads this value
+// and wraps the controller-runtime client accordingly. Passing nil is safe
+// and means "no write-through" (the previous behaviour).
+func (pc *PhaseContext) SetCache(c cache.Cache) *PhaseContext {
+	pc.Cache = c
 	return pc
 }
 
@@ -90,8 +105,10 @@ func (pc *PhaseContext) BindPhaseLogger(phaseName confv1beta1.BKEClusterPhase) {
 	if pc == nil || pc.Log == nil {
 		return
 	}
-	pc.Log.NormalLogger = log.With("phase", phaseName.String()).
-		With("bkecluster", utils.ClientObjNS(pc.BKECluster))
+	pc.Log.SetNormalLogger(
+		log.With("phase", phaseName.String()).
+			With("bkecluster", utils.ClientObjNS(pc.BKECluster)),
+	)
 }
 
 func (pc *PhaseContext) SetScheme(scheme *runtime.Scheme) *PhaseContext {
@@ -143,22 +160,29 @@ func (pc *PhaseContext) FinishDeclarativeDAGForPhaseFlow() error {
 }
 
 func (pc *PhaseContext) Untie() (context.Context, client.Client, *bkev1beta1.BKECluster, *runtime.Scheme, *bkev1beta1.BKELogger) {
+	pc.mux.RLock()
+	defer pc.mux.RUnlock()
 	return pc.Context, pc.Client, pc.BKECluster, pc.Scheme, pc.Log
+}
+
+func (pc *PhaseContext) fetchNewestBKECluster(ctx context.Context, bkeCluster *bkev1beta1.BKECluster) (*bkev1beta1.BKECluster, error) {
+	if bkeCluster == nil {
+		return nil, errors.New("BKECluster is nil")
+	}
+	return mergecluster.GetCombinedBKECluster(ctx, pc.Client, bkeCluster.Namespace, bkeCluster.Name)
 }
 
 func (pc *PhaseContext) GetNewestBKECluster(customCtx ...context.Context) (*bkev1beta1.BKECluster, error) {
 	var getCtx context.Context
-	ctx, c, bkeCluster, _, _ := pc.Untie()
+	pc.mux.RLock()
 	if customCtx != nil && len(customCtx) != 0 {
 		getCtx = customCtx[0]
 	} else {
-		getCtx = ctx
+		getCtx = pc.Context
 	}
-	newBKECluster, err := mergecluster.GetCombinedBKECluster(getCtx, c, bkeCluster.Namespace, bkeCluster.Name)
-	if err != nil {
-		return nil, err
-	}
-	return newBKECluster, nil
+	bkeCluster := pc.BKECluster
+	pc.mux.RUnlock()
+	return pc.fetchNewestBKECluster(getCtx, bkeCluster)
 }
 
 func (pc *PhaseContext) RefreshCtxBKECluster(customCtx ...context.Context) error {
@@ -171,9 +195,8 @@ func (pc *PhaseContext) RefreshCtxBKECluster(customCtx ...context.Context) error
 	} else {
 		ctx = pc.Context
 	}
-	newBKECluster, err := pc.GetNewestBKECluster(ctx)
+	newBKECluster, err := pc.fetchNewestBKECluster(ctx, pc.BKECluster)
 	if err != nil {
-		log.Errorf("failed to get newest BKECluster: %v", err)
 		return err
 	}
 	pc.BKECluster = newBKECluster
@@ -189,17 +212,21 @@ func (pc *PhaseContext) RefreshCtxCluster(customCtx ...context.Context) error {
 	}
 	err := pc.RefreshCtxBKECluster(refreshCtx)
 	if err != nil {
-		log.Errorf("failed to refresh BKECluster in RefreshCtxCluster: %v", err)
 		return err
 	}
-	cluster, err := util.GetOwnerCluster(refreshCtx, pc.Client, pc.BKECluster.ObjectMeta)
+	pc.mux.RLock()
+	bkeCluster := pc.BKECluster
+	pc.mux.RUnlock()
+	cluster, err := util.GetOwnerCluster(refreshCtx, pc.Client, bkeCluster.ObjectMeta)
 	if err != nil {
 		return errors.Wrapf(err, "failed to get owner cluster")
 	}
 	if cluster == nil {
 		return errors.New("owner cluster is nil")
 	}
+	pc.mux.Lock()
 	pc.Cluster = cluster
+	pc.mux.Unlock()
 	return nil
 }
 
@@ -208,58 +235,101 @@ func (pc *PhaseContext) Cancel() {
 }
 
 func (pc *PhaseContext) WatchBKEClusterStatus() {
-
 	refreshTicker := time.NewTicker(2 * time.Second)
 	defer refreshTicker.Stop()
 	pausedTicker := time.NewTicker(10 * time.Second)
 	defer pausedTicker.Stop()
 
+	pc.mux.RLock()
 	if pc.BKECluster == nil {
-		pc.Log.Error("", "BKECluster is nil, cannot watch status")
+		pc.mux.RUnlock()
+		if pc.Log != nil {
+			pc.Log.Warn("", "BKECluster is nil, cannot watch status")
+		}
+		return
+	}
+	pc.mux.RUnlock()
+
+	bkeCluster, err := pc.GetNewestBKECluster()
+	if err != nil {
+		if pc.Log != nil {
+			pc.Log.Warn(constant.ReconcileErrorReason, "failed to get newest BKECluster: %v", err)
+		}
 		return
 	}
 
-	pc.mux.Lock()
-	defer pc.mux.Unlock()
-	bkeCluster := pc.BKECluster.DeepCopy()
 	select {
 	case <-refreshTicker.C:
-		cluster, err := pc.GetNewestBKECluster()
-		if err != nil {
+		cluster, ok := pc.refreshWatchedCluster()
+		if !ok {
 			return
 		}
 		bkeCluster = cluster
 
 	case <-pausedTicker.C:
-		v, ok := annotation.HasAnnotation(bkeCluster, annotation.BKEClusterPauseAnnotationKey)
-		flag := ok && v == "true"
-		// 外部设置了暂停但是，还在运行phase，给个日志提示下吧
-		if bkeCluster.Spec.Pause && !flag {
-			// get running phase
-			for _, phase := range bkeCluster.Status.PhaseStatus {
-				if phase.Status == bkev1beta1.PhaseRunning {
-					pc.Log.Info(constant.PhaseRunningReason, "BKECluster is paused, but phase %q is running, "+
-						"waiting for phase to complete", bkeCluster.Status.Phase)
-				}
-			}
-		}
+		bkeCluster = pc.currentBKEClusterOrDefault(bkeCluster)
+		pc.logPausedRunningPhase(bkeCluster)
 
 	case <-pc.Done():
 		return
 	default:
-		if bkeCluster.DeletionTimestamp != nil && bkeCluster.Status.ClusterStatus != bkev1beta1.ClusterDeleting {
-			// mark bkeCluster as deleting
-			bkeCluster.Status.ClusterStatus = bkev1beta1.ClusterDeleting
-			if err := mergecluster.SyncStatusUntilComplete(pc.Client, bkeCluster); err != nil {
-				pc.Log.Warn(constant.ReconcileErrorReason, "failed to update bkeCluster Status: %v", err)
-			}
-
-			pc.Log.Info(constant.ClusterDeletingReason, "BKECluster is deleted, canceling phase context")
-			pc.Cancel()
+		bkeCluster = pc.currentBKEClusterOrDefault(bkeCluster)
+		if pc.handleDeletingBKECluster(bkeCluster) {
 			return
 		}
 
 	}
+}
+
+func (pc *PhaseContext) refreshWatchedCluster() (*bkev1beta1.BKECluster, bool) {
+	cluster, err := pc.GetNewestBKECluster()
+	if err != nil {
+		return nil, false
+	}
+	return cluster, true
+}
+
+func (pc *PhaseContext) currentBKEClusterOrDefault(defaultCluster *bkev1beta1.BKECluster) *bkev1beta1.BKECluster {
+	pc.mux.RLock()
+	current := pc.BKECluster
+	pc.mux.RUnlock()
+	if current != nil {
+		return current
+	}
+	return defaultCluster
+}
+
+func (pc *PhaseContext) logPausedRunningPhase(bkeCluster *bkev1beta1.BKECluster) {
+	v, ok := annotation.HasAnnotation(bkeCluster, annotation.BKEClusterPauseAnnotationKey)
+	flag := ok && v == "true"
+	// 外部设置了暂停但是，还在运行phase，给个日志提示下吧
+	if bkeCluster.Spec.Pause && !flag {
+		// get running phase
+		for _, phase := range bkeCluster.Status.PhaseStatus {
+			if phase.Status == bkev1beta1.PhaseRunning && pc.Log != nil {
+				pc.Log.Info(constant.PhaseRunningReason, "BKECluster is paused, but phase %q is running, "+
+					"waiting for phase to complete", bkeCluster.Status.Phase)
+			}
+		}
+	}
+}
+
+func (pc *PhaseContext) handleDeletingBKECluster(bkeCluster *bkev1beta1.BKECluster) bool {
+	if bkeCluster.DeletionTimestamp == nil || bkeCluster.Status.ClusterStatus == bkev1beta1.ClusterDeleting {
+		return false
+	}
+	// mark bkeCluster as deleting
+	bkeCluster.Status.ClusterStatus = bkev1beta1.ClusterDeleting
+	if err := mergecluster.SyncStatusUntilComplete(pc.Client, bkeCluster); err != nil {
+		if pc.Log != nil {
+			pc.Log.Warn(constant.ReconcileErrorReason, "failed to update bkeCluster Status: %v", err)
+		}
+	}
+	if pc.Log != nil {
+		pc.Log.Info(constant.ClusterDeletingReason, "BKECluster is deleted, canceling phase context")
+	}
+	pc.Cancel()
+	return true
 }
 
 // NodeFetcher 返回懒加载的 NodeFetcher 实例

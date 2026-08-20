@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -15,7 +15,6 @@ package phaseutil
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/pkg/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -92,8 +91,10 @@ func processNodeConditionsWithParams(params ProcessNodeConditionsParams) ([]stri
 			nodeErrs = append(nodeErrs, errInfo)
 			err := errors.New(errInfo)
 			aggregateErr = err
-			// 输出最后一次运行的错误信息
-			params.Log.Error(params.Reason, errInfo)
+			// 中间层只收集错误上抛，由边界层统一打 Error；此处用 Debug 保留节点细节便于排障
+			if params.Log != nil {
+				params.Log.Debug(params.Reason, errInfo)
+			}
 		}
 	}
 	return nodeErrs, aggregateErr
@@ -172,12 +173,7 @@ func GetWorkerJoinCommand(ctx context.Context, c client.Client, bkeCluster *bkev
 }
 
 func GetNodeIPFromCommandWaitResult(result string) string {
-	nodeInfo := strings.Split(result, "/")
-	nodeIP := nodeInfo[0]
-	if len(nodeInfo) == 2 {
-		nodeIP = nodeInfo[1]
-	}
-	return nodeIP
+	return utils.GetNodeIPFromCommandWaitResult(result)
 }
 
 // GetNotSkipFailedNode counts failed nodes that are not marked as needSkip.

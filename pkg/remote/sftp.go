@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -16,6 +16,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"sync"
 
 	"github.com/pkg/errors"
 	gosftp "github.com/pkg/sftp"
@@ -24,6 +25,7 @@ import (
 
 type Sftp struct {
 	sftpClient *gosftp.Client
+	mu         sync.RWMutex
 	alive      bool
 }
 
@@ -40,7 +42,12 @@ func NewSFTPClient(sshClient *gossh.Client) (*Sftp, error) {
 }
 
 func (s *Sftp) UploadFile(localFilePath string, remoteDirPath string) error {
-	if s.sftpClient == nil || !s.alive {
+	s.mu.RLock()
+	alive := s.alive
+	client := s.sftpClient
+	s.mu.RUnlock()
+
+	if client == nil || !alive {
 		return errors.New("sftp client is not alive")
 	}
 
@@ -56,14 +63,14 @@ func (s *Sftp) UploadFile(localFilePath string, remoteDirPath string) error {
 	remoteFilePath := path.Join(remoteDirPath, remoteFileName)
 
 	// 有时因为远程文件已经存在，s.sftpClient.Create会报错，所以默认先删除在重新创建。
-	s.sftpClient.Remove(remoteFilePath)
+	_ = client.Remove(remoteFilePath)
 
 	// 递归创建上层目录（如果已经存在则无操作）
-	if err = s.sftpClient.MkdirAll(remoteDirPath); err != nil {
+	if err = client.MkdirAll(remoteDirPath); err != nil {
 		return errors.Wrapf(err, "failed to create remote directory %s", remoteDirPath)
 	}
 
-	remoteFile, err := s.sftpClient.Create(remoteFilePath)
+	remoteFile, err := client.Create(remoteFilePath)
 	if err != nil {
 		return errors.Wrapf(err, "failed to create remote file %s", remoteFilePath)
 	}
@@ -85,7 +92,7 @@ func (s *Sftp) UploadFile(localFilePath string, remoteDirPath string) error {
 	}
 
 	if statRemoteFile.Size() != statLocalFile.Size() {
-		if err := s.sftpClient.Remove(path.Join(remoteDirPath, remoteFileName)); err != nil {
+		if err := client.Remove(path.Join(remoteDirPath, remoteFileName)); err != nil {
 			return errors.Wrapf(err, "failed to remove damaged remote file %s", remoteFilePath)
 		}
 		return errors.Errorf("file size mismatch after upload: local=%d, remote=%d, file=%s",
@@ -96,6 +103,9 @@ func (s *Sftp) UploadFile(localFilePath string, remoteDirPath string) error {
 }
 
 func (s *Sftp) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if s.sftpClient == nil || !s.alive {
 		return nil
 	}

@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -15,11 +15,13 @@ package kube
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/client-go/kubernetes"
 
 	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
@@ -170,6 +172,18 @@ func TestStaticPodName(t *testing.T) {
 		got := StaticPodName(tt.component, tt.nodeName)
 		if got != tt.want {
 			t.Errorf("StaticPodName(%q, %q) = %q, want %q", tt.component, tt.nodeName, got, tt.want)
+		}
+	}
+}
+
+func TestNeededComponentChecksExcludeOptionalAddons(t *testing.T) {
+	for _, prefix := range []string{"coredns", "kube-proxy-"} {
+		for _, check := range neededComponentChecks {
+			for _, p := range check.Prefixes {
+				if p == prefix {
+					t.Fatalf("prefix %q should not be in neededComponentChecks", prefix)
+				}
+			}
 		}
 	}
 }
@@ -341,28 +355,6 @@ func TestFilterPodsWithPrefix(t *testing.T) {
 			got := filterPodsWithPrefix(pods, tt.prefix)
 			if len(got) != tt.want {
 				t.Errorf("filterPodsWithPrefix() = %v, want %v", len(got), tt.want)
-			}
-		})
-	}
-}
-
-func TestCheckItemContains(t *testing.T) {
-	items := []string{"kubeproxy", "calico", "coredns"}
-
-	tests := []struct {
-		name string
-		item string
-		want bool
-	}{
-		{"found", "calico", true},
-		{"notFound", "metrics-server", false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := checkItemContains(tt.item, items)
-			if got != tt.want {
-				t.Errorf("checkItemContains() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -689,5 +681,295 @@ func TestProcessAddonComponentCheck(t *testing.T) {
 	err := client.processAddonComponentCheck("unknown-addon")
 	if err == nil {
 		t.Error("processAddonComponentCheck() expected error for unknown addon")
+	}
+}
+
+func TestOptionalAddonComponentsIncludeCoreDNSKubeProxyAndCalico(t *testing.T) {
+	cases := []struct {
+		addon    string
+		prefixes []string
+	}{
+		{addon: "coredns", prefixes: []string{"coredns"}},
+		{addon: "kubeproxy", prefixes: []string{"kube-proxy-"}},
+		{addon: "calico", prefixes: []string{"calico-kube-controllers-", "calico-node-"}},
+	}
+	for _, tc := range cases {
+		addonCheck, found := findAddonComponent(tc.addon)
+		if !found {
+			t.Fatalf("addon %q should be registered in extraAddonComponents", tc.addon)
+		}
+		if len(addonCheck.Components) == 0 || len(addonCheck.Components[0].Prefixes) == 0 {
+			t.Fatalf("addon %q should have component prefixes configured", tc.addon)
+		}
+		if len(addonCheck.Components[0].Prefixes) != len(tc.prefixes) {
+			t.Fatalf("addon %q prefixes = %v, want %v", tc.addon, addonCheck.Components[0].Prefixes, tc.prefixes)
+		}
+		for i, prefix := range tc.prefixes {
+			if addonCheck.Components[0].Prefixes[i] != prefix {
+				t.Fatalf("addon %q prefix[%d] = %q, want %q", tc.addon, i, addonCheck.Components[0].Prefixes[i], prefix)
+			}
+		}
+	}
+}
+
+func TestDefaultHealthCheckConfigContainsCoreComponents(t *testing.T) {
+	config := DefaultHealthCheckConfig()
+	if len(config.Components) != 8 {
+		t.Fatalf("DefaultHealthCheckConfig components = %d, want 8", len(config.Components))
+	}
+
+	want := map[ComponentName]HealthCheckPriority{
+		NameEtcd:                  PriorityCritical,
+		NameKubeAPIServer:         PriorityCritical,
+		NameKubeControllerManager: PriorityCritical,
+		NameKubeScheduler:         PriorityCritical,
+		NameCalicoNode:            PriorityImportant,
+		NameCalicoKubeControllers: PriorityImportant,
+		NameKubeProxy:             PriorityImportant,
+		NameCoreDNS:               PriorityImportant,
+	}
+	got := make(map[ComponentName]HealthCheckPriority, len(config.Components))
+	for _, component := range config.Components {
+		got[component.Name] = component.Priority
+	}
+	for name, priority := range want {
+		if got[name] != priority {
+			t.Fatalf("component %s priority = %s, want %s", name, got[name], priority)
+		}
+	}
+}
+
+func TestHealthCheckErrorPriorityHelpers(t *testing.T) {
+	criticalErr := &HealthCheckError{
+		Component: ComponentInfo{Name: NameEtcd, Namespace: metav1.NamespaceSystem, Priority: PriorityCritical},
+		Reason:    "PodNotReady",
+		Err:       errors.New("etcd not ready"),
+	}
+	importantErr := &HealthCheckError{
+		Component: ComponentInfo{Name: NameCoreDNS, Namespace: metav1.NamespaceSystem, Priority: PriorityImportant},
+		Reason:    "PodNotReady",
+		Err:       errors.New("coredns not ready"),
+	}
+	agg := kerrors.NewAggregate([]error{criticalErr, importantErr})
+
+	if !IsCriticalHealthCheckError(agg) {
+		t.Fatal("aggregate error should contain critical health check error")
+	}
+	if !IsImportantHealthCheckError(agg) {
+		t.Fatal("aggregate error should contain important health check error")
+	}
+	if len(ComponentErrorsByPriority(agg, PriorityCritical)) != 1 {
+		t.Fatal("expected one critical health check error")
+	}
+	if len(ComponentErrorsByPriority(agg, PriorityImportant)) != 1 {
+		t.Fatal("expected one important health check error")
+	}
+}
+
+func TestGetHealthCheckRequeueInterval(t *testing.T) {
+	if got := GetHealthCheckRequeueInterval(nil); got != 5*time.Minute {
+		t.Fatalf("normal requeue = %v, want 5m", got)
+	}
+
+	criticalErr := &HealthCheckError{Component: ComponentInfo{Priority: PriorityCritical}, Err: errors.New("critical")}
+	if got := GetHealthCheckRequeueInterval(criticalErr); got != 5*time.Second {
+		t.Fatalf("critical requeue = %v, want 5s", got)
+	}
+
+	importantErr := &HealthCheckError{Component: ComponentInfo{Priority: PriorityImportant}, Err: errors.New("important")}
+	if got := GetHealthCheckRequeueInterval(importantErr); got != 15*time.Second {
+		t.Fatalf("important requeue = %v, want 15s", got)
+	}
+
+	wrappedImportantErr := errors.Wrap(kerrors.NewAggregate([]error{importantErr}), "CheckClusterHealth failed")
+	if got := GetHealthCheckRequeueInterval(wrappedImportantErr); got != 15*time.Second {
+		t.Fatalf("wrapped important requeue = %v, want 15s", got)
+	}
+}
+
+func TestGetHealthCheckRequeueIntervalUsesWrappedConfigIntervals(t *testing.T) {
+	importantErr := &HealthCheckError{Component: ComponentInfo{Priority: PriorityImportant}, Err: errors.New("important")}
+	intervals := IntervalConfig{Critical: time.Second, Important: 45 * time.Second, Optional: time.Minute, Normal: 5 * time.Minute}
+	wrappedErr := newHealthCheckRequeueError(errors.Wrap(kerrors.NewAggregate([]error{importantErr}), "CheckClusterHealth failed"), intervals)
+	if got := GetHealthCheckRequeueInterval(wrappedErr); got != 45*time.Second {
+		t.Fatalf("wrapped config important requeue = %v, want 45s", got)
+	}
+}
+
+func TestUnifiedHealthCheckerKeepsCoreDNSSingleHealthySemantics(t *testing.T) {
+	checker := NewUnifiedHealthChecker(&Client{}, DefaultHealthCheckConfig())
+	pods := []corev1.Pod{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "coredns-unready", Namespace: metav1.NamespaceSystem},
+			Status: corev1.PodStatus{
+				Phase: corev1.PodRunning,
+				Conditions: []corev1.PodCondition{
+					{Type: corev1.PodReady, Status: corev1.ConditionFalse},
+				},
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "coredns-ready", Namespace: metav1.NamespaceSystem},
+			Status: corev1.PodStatus{
+				Phase: corev1.PodRunning,
+				Conditions: []corev1.PodCondition{
+					{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+				},
+				ContainerStatuses: []corev1.ContainerStatus{{Name: "coredns", Ready: true}},
+			},
+		},
+	}
+	check := ComponentCheck{Name: NameCoreDNS, Namespace: metav1.NamespaceSystem, Prefixes: []string{"coredns"}, Priority: PriorityImportant}
+	if err := checker.verifyComponentPods(check, pods, "coredns"); err != nil {
+		t.Fatalf("coredns should pass when at least one pod is healthy: %v", err)
+	}
+}
+
+func TestCoreHealthAddonsAreSkippedOnlyInAddonContinuation(t *testing.T) {
+	for _, addon := range []string{"calico", "coredns", "kubeproxy"} {
+		if _, covered := coreHealthAddons[addon]; !covered {
+			t.Fatalf("addon %q should be covered by core health check", addon)
+		}
+		if _, found := findAddonComponent(addon); !found {
+			t.Fatalf("addon %q should remain registered in extraAddonComponents", addon)
+		}
+	}
+}
+
+func TestHealthCheckCacheCachesNodesAndPods(t *testing.T) {
+	client := &Client{Ctx: context.Background()}
+	nodeCalls := 0
+	patches := gomonkey.ApplyMethod(client, "ListNodes", func(_ *Client, _ *metav1.ListOptions) (*corev1.NodeList, error) {
+		nodeCalls++
+		return &corev1.NodeList{Items: []corev1.Node{{ObjectMeta: metav1.ObjectMeta{Name: "node-1"}}}}, nil
+	})
+	defer patches.Reset()
+	cache := newHealthCheckCache(client)
+	cache.pods[metav1.NamespaceSystem] = []corev1.Pod{{ObjectMeta: metav1.ObjectMeta{Name: "pod-1", Namespace: metav1.NamespaceSystem}}}
+
+	nodes, err := cache.GetNodes()
+	if err != nil {
+		t.Fatalf("GetNodes() error = %v", err)
+	}
+	cachedNodes, err := cache.GetNodes()
+	if err != nil {
+		t.Fatalf("second GetNodes() error = %v", err)
+	}
+	if nodes != cachedNodes || len(cachedNodes.Items) != 1 || nodeCalls != 1 {
+		t.Fatalf("GetNodes() did not return cached node list")
+	}
+
+	pods, err := cache.GetPods(metav1.NamespaceSystem)
+	if err != nil {
+		t.Fatalf("GetPods() error = %v", err)
+	}
+	cachedPods, err := cache.GetPods(metav1.NamespaceSystem)
+	if err != nil {
+		t.Fatalf("second GetPods() error = %v", err)
+	}
+	if len(cachedPods) != 1 || pods[0].Name != cachedPods[0].Name {
+		t.Fatalf("GetPods() did not return cached pod list")
+	}
+}
+
+func TestHealthCheckCachePropagatesListErrors(t *testing.T) {
+	client := &Client{Ctx: context.Background()}
+	patches := gomonkey.ApplyMethod(client, "ListNodes", func(_ *Client, _ *metav1.ListOptions) (*corev1.NodeList, error) {
+		return nil, errors.New("list nodes failed")
+	})
+	defer patches.Reset()
+	cache := newHealthCheckCache(client)
+	if _, err := cache.GetNodes(); err == nil {
+		t.Fatal("GetNodes() expected error")
+	}
+}
+
+func TestHealthUnifiedSmallBranches(t *testing.T) {
+	if got := PriorityOptional.String(); got != "optional" {
+		t.Fatalf("optional priority string = %q", got)
+	}
+	if got := HealthCheckPriority(99).String(); got != "unknown" {
+		t.Fatalf("unknown priority string = %q", got)
+	}
+	if got := (ComponentInfo{Name: NameEtcd}).String(); got != "etcd" {
+		t.Fatalf("component without namespace = %q", got)
+	}
+	if got := (ComponentInfo{Name: NameCoreDNS, Namespace: metav1.NamespaceSystem, Prefix: "coredns"}).String(); got != "kube-system/coredns(coredns)" {
+		t.Fatalf("component with prefix = %q", got)
+	}
+
+	hcErr := &HealthCheckError{Component: ComponentInfo{Name: NameNode, Priority: PriorityCritical}, Reason: "NodeNotReady", Err: errors.New("boom")}
+	if hcErr.Error() == "" {
+		t.Fatal("HealthCheckError Error() should not be empty")
+	}
+
+	config := HealthCheckConfig{Components: []ComponentCheck{{Name: NameEtcd, Namespace: metav1.NamespaceSystem, Prefixes: []string{"etcd-"}, Priority: PriorityCritical}}}
+	if got := healthCheckConfigSummary(config); got != "etcd:kube-system:etcd-:critical" {
+		t.Fatalf("healthCheckConfigSummary() = %q", got)
+	}
+}
+
+func TestHealthUnifiedAggregateNodeAndRequeueBranches(t *testing.T) {
+	checker := NewUnifiedHealthChecker(&Client{}, DefaultHealthCheckConfig())
+	if err := checker.aggregateResult(&HealthCheckResult{}); err != nil {
+		t.Fatalf("empty aggregateResult() error = %v", err)
+	}
+
+	nodeErr := newNodeError("node-1", "NodeNotReady", errors.New("not ready"))
+	if nodeErr.Component.Name != ComponentName("node-1") || nodeErr.Component.Priority != PriorityCritical {
+		t.Fatalf("unexpected node health error: %+v", nodeErr)
+	}
+	defaultNodeErr := newNodeError("", "ListNodesFailed", errors.New("list failed"))
+	if defaultNodeErr.Component.Name != NameNode {
+		t.Fatalf("empty node name component = %s, want %s", defaultNodeErr.Component.Name, NameNode)
+	}
+
+	aggErr := checker.aggregateResult(&HealthCheckResult{
+		NodeErrors:               []error{nodeErr},
+		ImportantComponentErrors: []error{&HealthCheckError{Component: ComponentInfo{Name: NameCoreDNS, Priority: PriorityImportant}, Reason: "PodNotReady", Err: errors.New("important")}},
+		OptionalComponentErrors:  []error{&HealthCheckError{Component: ComponentInfo{Name: ComponentName("optional"), Priority: PriorityOptional}, Reason: "PodNotFound", Err: errors.New("optional")}},
+	})
+	if aggErr == nil || !IsCriticalHealthCheckError(aggErr) || !IsImportantHealthCheckError(aggErr) {
+		t.Fatalf("aggregateResult() did not preserve priorities: %v", aggErr)
+	}
+
+	wrapped := newHealthCheckRequeueError(aggErr, IntervalConfig{Critical: time.Second, Important: 2 * time.Second, Optional: 3 * time.Second, Normal: 4 * time.Second})
+	requeueErr, ok := wrapped.(*healthCheckRequeueError)
+	if !ok {
+		t.Fatalf("newHealthCheckRequeueError type = %T", wrapped)
+	}
+	if requeueErr.Error() != aggErr.Error() || requeueErr.Unwrap().Error() != aggErr.Error() {
+		t.Fatal("healthCheckRequeueError should proxy Error and Unwrap")
+	}
+	if got := requeueErr.RequeueInterval(); got != time.Second {
+		t.Fatalf("RequeueInterval() = %v, want 1s", got)
+	}
+}
+
+func TestGetPodUnhealthyReasonBranches(t *testing.T) {
+	runningReady := corev1.Pod{Status: corev1.PodStatus{
+		Phase:      corev1.PodRunning,
+		Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+	}}
+	if got := getPodUnhealthyReason(runningReady); got != "PodUnhealthy" {
+		t.Fatalf("ready pod fallback reason = %s", got)
+	}
+	if got := getPodUnhealthyReason(corev1.Pod{Status: corev1.PodStatus{Phase: corev1.PodPending}}); got != "PodNotRunning" {
+		t.Fatalf("pending pod reason = %s", got)
+	}
+	notReady := runningReady
+	notReady.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionFalse}}
+	if got := getPodUnhealthyReason(notReady); got != "PodNotReady" {
+		t.Fatalf("not ready pod reason = %s", got)
+	}
+	initCrash := runningReady
+	initCrash.Status.InitContainerStatuses = []corev1.ContainerStatus{{State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}}}}
+	if got := getPodUnhealthyReason(initCrash); got != "CrashLoopBackOff" {
+		t.Fatalf("init crash reason = %s", got)
+	}
+	containerCrash := runningReady
+	containerCrash.Status.ContainerStatuses = []corev1.ContainerStatus{{State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "ImagePullBackOff"}}}}
+	if got := getPodUnhealthyReason(containerCrash); got != "ImagePullBackOff" {
+		t.Fatalf("container crash reason = %s", got)
 	}
 }

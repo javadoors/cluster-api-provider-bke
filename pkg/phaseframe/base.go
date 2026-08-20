@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -26,7 +26,6 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/mergecluster"
 	metricrecord "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/metrics/record"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/clusterutil"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
 
 // BasePhase is the base implementation of Phase, you can use it to implement your own phase
@@ -75,7 +74,6 @@ func (b *BasePhase) DefaultPreHook() error {
 
 	// refresh bkecluster
 	if err := b.Ctx.RefreshCtxBKECluster(); err != nil {
-		log.Errorf("failed to refresh BKECluster in pre-hook for phase %q: %v", b.Name(), err)
 		return err
 	}
 	// refresh cluster, it's not necessary to refresh successfully
@@ -88,7 +86,6 @@ func (b *BasePhase) DefaultPreHook() error {
 	if b.CustomPreHookFuncs != nil && len(b.CustomPreHookFuncs) > 0 {
 		for _, f := range b.CustomPreHookFuncs {
 			if err := f(b); err != nil {
-				log.Errorf("custom pre-hook failed for phase %q: %v", b.Name(), err)
 				return err
 			}
 		}
@@ -121,7 +118,6 @@ func (b *BasePhase) DefaultPostHook(err error) error {
 	if b.CustomPostHookFuncs != nil && len(b.CustomPostHookFuncs) > 0 {
 		for _, f := range b.CustomPostHookFuncs {
 			if err := f(b, err); err != nil {
-				log.Errorf("custom post-hook failed for phase %q: %v", b.Name(), err)
 				return err
 			}
 		}
@@ -143,7 +139,7 @@ func (b *BasePhase) checkCommonNeedExecute(new *bkev1beta1.BKECluster) bool {
 	if new.Spec.DryRun {
 		return false
 	}
-	if strings.HasSuffix(string(new.Status.ClusterHealthState), "Failed") {
+	if strings.HasSuffix(string(new.Status.ClusterStatus), "Failed") {
 		return false
 	}
 	return true
@@ -238,7 +234,7 @@ func (b *BasePhase) Report(msg string, onlyRecord bool) error {
 			return
 		}
 		if err := mergecluster.SyncStatusUntilComplete(c, bkeCluster); err != nil {
-			log.NormalLogger.Errorf("Failed to update BKECluster status: %v", err)
+			log.NormalLogger.Warnf("Failed to update BKECluster status: %v", err)
 		}
 	}()
 

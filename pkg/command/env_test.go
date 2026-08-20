@@ -3,7 +3,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -280,17 +280,32 @@ func TestENVGetScope(t *testing.T) {
 	tests := []struct {
 		name          string
 		deepRestore   bool
+		isImmutableOS bool
 		expectedScope string
 	}{
 		{
 			name:          "Normal scope",
 			deepRestore:   false,
+			isImmutableOS: false,
 			expectedScope: "scope=cert,manifests,container,kubelet,extra",
 		},
 		{
 			name:          "Deep restore scope",
 			deepRestore:   true,
+			isImmutableOS: false,
 			expectedScope: "scope=cert,manifests,container,kubelet,containerRuntime,extra",
+		},
+		{
+			name:          "Immutable OS scope",
+			deepRestore:   false,
+			isImmutableOS: true,
+			expectedScope: "scope=cert,manifests,container,kubelet",
+		},
+		{
+			name:          "Immutable OS scope with deep restore (immutable takes priority)",
+			deepRestore:   true,
+			isImmutableOS: true,
+			expectedScope: "scope=cert,manifests,container,kubelet",
 		},
 	}
 
@@ -298,7 +313,36 @@ func TestENVGetScope(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			env := createTestENV()
 			env.DeepRestore = tt.deepRestore
+			env.IsImmutableOS = tt.isImmutableOS
 			scope := env.getScope()
+			assert.Equal(t, tt.expectedScope, scope)
+		})
+	}
+}
+
+func TestENVGetInitScope(t *testing.T) {
+	tests := []struct {
+		name          string
+		isImmutableOS bool
+		expectedScope string
+	}{
+		{
+			name:          "Normal init scope",
+			isImmutableOS: false,
+			expectedScope: "scope=time,hosts,dns,kernel,firewall,selinux,swap,httpRepo,runtime,iptables,registry,image,extra",
+		},
+		{
+			name:          "Immutable OS init scope",
+			isImmutableOS: true,
+			expectedScope: "scope=time,hosts,dns,kernel,runtime,iptables,registry,image",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := createTestENV()
+			env.IsImmutableOS = tt.isImmutableOS
+			scope := env.getInitScope()
 			assert.Equal(t, tt.expectedScope, scope)
 		})
 	}
@@ -486,4 +530,16 @@ func TestENVBaseCommandValidation(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestENVBuildCommandSpecIncludesImageScope(t *testing.T) {
+	env := createTestENV()
+	commandSpec := env.buildCommandSpec(
+		GenerateBkeConfigStr(testNS, testBKEConfig),
+		"extra=extra1",
+		"extraHosts=host1",
+		env.getScope(),
+	)
+
+	assert.Contains(t, commandSpec.Commands[2].Command, "scope=time,hosts,dns,kernel,firewall,selinux,swap,httpRepo,runtime,iptables,registry,image,extra")
 }

@@ -2,7 +2,7 @@
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -57,31 +57,62 @@ func NewClusterApplier(cfg ClusterApplierConfig) *ClusterApplier {
 	}
 }
 
+// manifestPackageSession holds prepared remote client and render params for one package.
+type manifestPackageSession struct {
+	kubeClient kube.RemoteKubeClient
+	params     map[string]interface{}
+}
+
 // ApplyComponent renders and applies all manifests in the package.
 func (a *ClusterApplier) ApplyComponent(ctx context.Context, pkg *ComponentPackage) error {
+	session, err := a.openManifestPackage(ctx, pkg)
+	if err != nil || session == nil {
+		return err
+	}
+	if err := a.guardComponentInstalled(ctx, session.kubeClient, pkg, session.params); err != nil {
+		// Preserve Skip sentinel for callers (errors.Is); probe failures already wrapped.
+		return err
+	}
+	return a.applyPackageManifests(session.kubeClient, pkg, session.params)
+}
+
+// openManifestPackage validates pkg and prepares remote client + render params.
+// nil session with nil error means pkg has no manifests (no-op).
+func (a *ClusterApplier) openManifestPackage(
+	ctx context.Context,
+	pkg *ComponentPackage,
+) (*manifestPackageSession, error) {
 	if pkg == nil {
-		return fmt.Errorf("component package is nil")
+		return nil, errors.New("component package is nil")
 	}
 	if len(pkg.Manifests) == 0 {
-		return nil
+		return nil, nil
 	}
+	kubeClient, params, err := a.prepareManifestOperation(ctx, pkg)
+	if err != nil {
+		return nil, err
+	}
+	return &manifestPackageSession{kubeClient: kubeClient, params: params}, nil
+}
+
+func (a *ClusterApplier) prepareManifestOperation(
+	ctx context.Context,
+	pkg *ComponentPackage,
+) (kube.RemoteKubeClient, map[string]interface{}, error) {
 	if a == nil || a.client == nil || a.bkeCluster == nil {
-		return fmt.Errorf("cluster manifest applier is not configured")
+		return nil, nil, errors.New("cluster manifest applier is not configured")
 	}
 
 	kubeClient, err := a.kubeClient()
 	if err != nil {
-		return err
+		return nil, nil, errors.Wrapf(err, "component %s: get remote kube client", pkg.Name)
 	}
 	params, err := a.renderParams(kubeClient)
 	if err != nil {
-		return errors.Wrapf(err, "build render params for %s", pkg.Name)
-	}
-	if err := a.guardComponentInstalled(ctx, kubeClient, pkg, params); err != nil {
-		return err
+		return nil, nil, errors.Wrapf(err, "build render params for %s", pkg.Name)
 	}
 	a.prepareKubeClientForApply(kubeClient, ctx)
-	return a.applyPackageManifests(kubeClient, pkg, params)
+	return kubeClient, params, nil
 }
 
 func (a *ClusterApplier) guardComponentInstalled(
@@ -102,7 +133,7 @@ func (a *ClusterApplier) guardComponentInstalled(
 		return nil
 	}
 	if a.logger != nil {
-		a.logger.Info("skip manifest component upgrade", "component", pkg.Name, "reason", SkipReasonNotInstalled)
+		a.logger.Info("skip manifest component upgrade", "component=%s reason=%s", pkg.Name, SkipReasonNotInstalled)
 	}
 	return NewSkipNotInstalledError(pkg.Name)
 }
@@ -140,6 +171,42 @@ func (a *ClusterApplier) applyPackageManifests(
 	pkg *ComponentPackage,
 	params map[string]interface{},
 ) error {
+	strategy, err := NormalizeApplyStrategy(pkg.ApplyStrategy)
+	if err != nil {
+		return errors.Wrapf(err, "component %s", pkg.Name)
+	}
+
+	switch strategy {
+	case ApplyStrategyReplace:
+		// Delete existing objects, then recreate from manifests.
+		if err := a.applyPackageWithStrategy(kubeClient, pkg, params, bkeaddon.RemoveAddon, ""); err != nil {
+			return errors.Wrapf(err, "component %s: replace delete", pkg.Name)
+		}
+		if err := a.applyPackageWithStrategy(kubeClient, pkg, params, bkeaddon.CreateAddon, ""); err != nil {
+			return errors.Wrapf(err, "component %s: replace create", pkg.Name)
+		}
+		return nil
+	case ApplyStrategyCreateOnly:
+		if err := a.applyPackageWithStrategy(kubeClient, pkg, params, bkeaddon.UpgradeAddon, ApplyStrategyCreateOnly); err != nil {
+			return errors.Wrapf(err, "component %s: create-only apply", pkg.Name)
+		}
+		return nil
+	default:
+		// ServerSideApply: declarative upsert via existing upgrade path.
+		if err := a.applyPackageWithStrategy(kubeClient, pkg, params, bkeaddon.UpgradeAddon, ""); err != nil {
+			return errors.Wrapf(err, "component %s: server-side apply", pkg.Name)
+		}
+		return nil
+	}
+}
+
+func (a *ClusterApplier) applyPackageWithStrategy(
+	kubeClient kube.RemoteKubeClient,
+	pkg *ComponentPackage,
+	params map[string]interface{},
+	operate bkeaddon.AddonOperate,
+	applyStrategy string,
+) error {
 	repo := a.imageRepo()
 	for i, doc := range pkg.Manifests {
 		if len(doc) == 0 {
@@ -147,7 +214,8 @@ func (a *ClusterApplier) applyPackageManifests(
 		}
 		task := kube.NewTask(fmt.Sprintf("%s-%d", pkg.Name, i), "", params).
 			AddRepo(repo).
-			SetOperate(bkeaddon.UpgradeAddon).
+			SetOperate(operate).
+			SetApplyStrategy(applyStrategy).
 			SetWaiter(true, bkeinit.DefaultAddonTimeout, bkeinit.DefaultAddonInterval)
 		task.ManifestContent = doc
 		if err := kubeClient.ApplyYaml(task); err != nil {
@@ -163,7 +231,7 @@ func (a *ClusterApplier) kubeClient() (kube.RemoteKubeClient, error) {
 		if a.logger != nil {
 			a.logger.Error(constant.InternalErrorReason, "failed to get BKECluster %q remote cluster client", utils.ClientObjNS(a.bkeCluster))
 		}
-		return nil, err
+		return nil, errors.Wrapf(err, "get remote client for BKECluster %q", utils.ClientObjNS(a.bkeCluster))
 	}
 	clientset, _ := targetClusterClient.KubeClient()
 	if clientset == nil {
@@ -179,7 +247,7 @@ func (a *ClusterApplier) renderParams(kubeClient kube.RemoteKubeClient) (map[str
 	}
 	params, err := impl.RenderParamsForCluster(a.bkeCluster, a.nodes)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "render params for cluster")
 	}
 	if params == nil {
 		return fallbackRenderParams(a.bkeCluster), nil

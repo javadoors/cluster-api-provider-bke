@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -14,6 +14,7 @@ package phases
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -92,10 +93,10 @@ func (e *EnsureWorkerUpgrade) ExecutePreHook() error {
 }
 
 func (e *EnsureWorkerUpgrade) Execute() (ctrl.Result, error) {
-	if v, ok := annotation.HasAnnotation(e.Ctx.BKECluster, "deployAction"); !ok || v != "k8s_upgrade" {
+	if v, ok := annotation.HasAnnotation(e.Ctx.BKECluster, annotation.DeployActionAnnotationKey); !ok || v != annotation.DeployActionK8sUpgrade {
 		//添加boc所需的注解
 		patchFunc := func(bkeCluster *bkev1beta1.BKECluster) {
-			annotation.SetAnnotation(bkeCluster, "deployAction", "k8s_upgrade")
+			annotation.SetAnnotation(bkeCluster, annotation.DeployActionAnnotationKey, annotation.DeployActionK8sUpgrade)
 		}
 		if err := mergecluster.SyncStatusUntilComplete(e.Ctx.Client, e.Ctx.BKECluster, patchFunc); err != nil {
 			return ctrl.Result{}, err
@@ -252,7 +253,6 @@ func (e *EnsureWorkerUpgrade) prepareUpgradeNodes(params PrepareUpgradeNodesPara
 	// Use NodeFetcher to get BKENodes from API server
 	bkeNodes, err := e.Ctx.NodeFetcher().GetBKENodesWrapperForCluster(params.Ctx, params.BKECluster)
 	if err != nil {
-		params.Log.Warn(constant.WorkerUpgradingReason, "failed to get BKENodes: %v", err)
 		return nil, errors.Wrap(err, "failed to get BKENodes")
 	}
 	nodes := phaseutil.GetNeedUpgradeWorkerNodesWithBKENodes(params.BKECluster, bkeNodes)
@@ -294,8 +294,7 @@ func (e *EnsureWorkerUpgrade) processNodeUpgrade(params ProcessNodeUpgradeParams
 	for _, node := range params.NeedUpgradeNodes {
 		remoteNode, err := phaseutil.GetRemoteNodeByBKENode(params.Ctx, clientSet, node)
 		if err != nil {
-			params.Log.Error(constant.WorkerUpgradeFailedReason, "get remote cluster Node resource failed, err: %v", err)
-			return ctrl.Result{}, nil, errors.Errorf("get remote cluster Node resource failed, err: %v", err)
+			return ctrl.Result{}, nil, fmt.Errorf("get remote cluster Node resource failed: %w", err)
 		}
 		// 已经是期望版本的节点不需要升级
 		targetVersion := e.desiredKubernetesVersion()
@@ -370,7 +369,6 @@ func (e *EnsureWorkerUpgrade) rolloutUpgrade() (ctrl.Result, error) {
 		log.Info(constant.WorkerUpgradeSucceedReason, "upgrade all worker success")
 		return ctrl.Result{}, nil
 	} else {
-		log.Warn(constant.WorkerUpgradeFailedReason, "upgrade worker process finished, but some nodes upgrade failed, will retry later nodes: %v", failedUpgradeNodes)
 		// worker node没有升级成功，不允许进入下一阶段
 		return ctrl.Result{}, errors.Errorf("upgrade worker process finished, but some nodes upgrade failed, will retry later nodes: %v", failedUpgradeNodes)
 	}
@@ -421,20 +419,17 @@ func (e *EnsureWorkerUpgrade) executeNodeUpgrade(params ExecuteNodeUpgradeParams
 
 	params.Log.Info(constant.WorkerUpgradingReason, "start upgrade node %s", phaseutil.NodeInfo(params.Node))
 	if err := upgrade.New(); err != nil {
-		params.Log.Error(constant.WorkerUpgradeFailedReason, "upgrade node %q failed: %v", phaseutil.NodeInfo(params.Node), err)
-		return errors.Errorf("create upgrade command，node: %q failed: %v", phaseutil.NodeInfo(params.Node), err)
+		return fmt.Errorf("create upgrade command，node: %q failed: %w", phaseutil.NodeInfo(params.Node), err)
 	}
 	params.Log.Info(constant.WorkerUpgradingReason, "wait upgrade node %s finish", phaseutil.NodeInfo(params.Node))
 	err, _, failedNodes := upgrade.Wait()
 	if err != nil {
-		params.Log.Error(constant.WorkerUpgradeFailedReason, "wait upgrade command complete failed，node: %q, err: %v", phaseutil.NodeInfo(params.Node), err)
-		return errors.Errorf("wait upgrade command complete failed，node: %q, err: %v", phaseutil.NodeInfo(params.Node), err)
+		return fmt.Errorf("wait upgrade command complete failed，node: %q: %w", phaseutil.NodeInfo(params.Node), err)
 	}
 	if len(failedNodes) != 0 {
-		params.Log.Error(constant.WorkerUpgradeFailedReason, "upgrade node %q failed: %v", phaseutil.NodeInfo(params.Node), err)
 		commandErrs, err := phaseutil.LogCommandFailed(*upgrade.Command, failedNodes, params.Log, constant.WorkerUpgradeFailedReason)
 		phaseutil.MarkNodeStatusByCommandErrs(params.Ctx, params.Client, params.BKECluster, commandErrs)
-		return errors.Errorf("upgrade node %q failed: %v", phaseutil.NodeInfo(params.Node), err)
+		return fmt.Errorf("upgrade node %q failed: %w", phaseutil.NodeInfo(params.Node), err)
 	}
 	params.Log.Info(constant.WorkerUpgradeSucceedReason, "upgrade node %q operation succeed", phaseutil.NodeInfo(params.Node))
 	return nil
@@ -453,8 +448,7 @@ type WaitForNodeHealthParams struct {
 func (e *EnsureWorkerUpgrade) waitForNodeHealth(params WaitForNodeHealthParams) error {
 	remoteClient, err := kube.NewRemoteClientByBKECluster(params.Ctx, params.Client, params.BKECluster)
 	if err != nil {
-		params.Log.Error(constant.WorkerUpgradeFailedReason, "get remote client for BKECluster %q failed", utils.ClientObjNS(params.BKECluster))
-		return errors.Errorf("get remote client for BKECluster %q failed: %v", utils.ClientObjNS(params.BKECluster), err)
+		return fmt.Errorf("get remote client for BKECluster %q failed: %w", utils.ClientObjNS(params.BKECluster), err)
 	}
 	clientSet, _ := remoteClient.KubeClient()
 	// wait for node pass healthy check
@@ -470,8 +464,7 @@ func (e *EnsureWorkerUpgrade) waitForNodeHealth(params WaitForNodeHealthParams) 
 	err = waitForWorkerNodeHealthCheck(healthParams)
 
 	if err != nil {
-		params.Log.Error(constant.WorkerUpgradeFailedReason, "upgrade node %q failed: %v", phaseutil.NodeInfo(params.Node), err)
-		return errors.Errorf("wait for node %q pass healthy check failed: %v", phaseutil.NodeInfo(params.Node), err)
+		return fmt.Errorf("wait for node %q pass healthy check failed: %w", phaseutil.NodeInfo(params.Node), err)
 	}
 	params.Log.Info(constant.WorkerUpgradingReason, "upgrade worker node %q success", phaseutil.NodeInfo(params.Node))
 	return nil

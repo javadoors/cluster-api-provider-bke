@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -611,13 +611,66 @@ func TestBaseCommandHandleTimeoutCase(t *testing.T) {
 		Ctx:         context.Background(),
 		Client:      fake.NewClientBuilder().Build(),
 		NameSpace:   testNS,
-		Scheme:      runtime.NewScheme(),
+		Scheme:       runtime.NewScheme(),
 		commandName: "non-existent-command",
 	}
 
 	result := cmd.handleTimeoutCase(false, []string{}, []string{})
 	assert.Error(t, result.Err)
 	assert.False(t, result.Complete)
+}
+
+func TestHandleTimeoutCase_FormatMismatch(t *testing.T) {
+	command := &agentv1beta1.Command{}
+	command.SetName("test-cmd")
+	command.SetNamespace(testNS)
+	command.Spec.NodeSelector = &metav1.LabelSelector{
+		MatchLabels: map[string]string{
+			testNodeIP:  testNodeIP,
+			testNodeIP2: testNodeIP2,
+		},
+	}
+
+	scheme := runtime.NewScheme()
+	_ = agentv1beta1.AddToScheme(scheme)
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(command).Build()
+
+	cmd := &BaseCommand{
+		Ctx:         context.Background(),
+		Client:      fakeClient,
+		NameSpace:   testNS,
+		Scheme:      scheme,
+		commandName: "test-cmd",
+	}
+
+	successNodes := []string{"master-host/" + testNodeIP}
+	failedNodes := []string{}
+
+	result := cmd.handleTimeoutCase(false, successNodes, failedNodes)
+	assert.NoError(t, result.Err)
+	assert.False(t, result.Complete)
+	assert.Contains(t, result.SuccessNodes, "master-host/"+testNodeIP)
+	assert.Contains(t, result.FailedNodes, testNodeIP2)
+	assert.NotContains(t, result.FailedNodes, testNodeIP)
+}
+
+func TestGetNodeIPFromCommandWaitResult(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "hostname/IP format", input: "master-node/192.168.1.1", want: "192.168.1.1"},
+		{name: "bare IP", input: "192.168.1.1", want: "192.168.1.1"},
+		{name: "empty string", input: "", want: ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := utils.GetNodeIPFromCommandWaitResult(tt.input)
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }
 
 func TestClusterNameLabelSelectorRequirement(t *testing.T) {
@@ -680,6 +733,24 @@ func TestBaseCommandSetOwnerReference(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestUniqueCommandBase_IPPrefixBoundary(t *testing.T) {
+	assert.Equal(t, "reset-node-122.235.189.1", uniqueCommandBase("reset-node-122.235.189.1-1784721347"))
+	assert.Equal(t, "reset-node-122.235.189.16", uniqueCommandBase("reset-node-122.235.189.16-1784721348"))
+	assert.Equal(t, "shutdown-bkeagent-122.235.189.16", uniqueCommandBase("shutdown-bkeagent-122.235.189.16"))
+	assert.False(t, isSameUniqueCommandFamily(
+		"reset-node-122.235.189.1-1784721347",
+		"reset-node-122.235.189.16-1784721348",
+	))
+	assert.False(t, isSameUniqueCommandFamily(
+		"shutdown-bkeagent-122.235.189.1",
+		"shutdown-bkeagent-122.235.189.16",
+	))
+	assert.True(t, isSameUniqueCommandFamily(
+		"reset-node-122.235.189.16-1784721347",
+		"reset-node-122.235.189.16-1784721348",
+	))
 }
 
 func TestBaseCommandHandleUniqueCommand(t *testing.T) {

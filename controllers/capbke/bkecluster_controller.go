@@ -2,7 +2,7 @@
  * Copyright (c) 2024 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -19,7 +19,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -33,6 +32,7 @@ import (
 	"sigs.k8s.io/cluster-api/util/annotations"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -57,7 +57,7 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/condition"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/config"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/constant"
-	labelhelper "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/label"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/intervention"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/nodeutil"
 	bkepredicates "gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/predicates"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
@@ -80,6 +80,7 @@ type BKEClusterReconciler struct {
 	Recorder        record.EventRecorder
 	RestConfig      *rest.Config
 	Tracker         *remote.ClusterCacheTracker
+	Cache           cache.Cache // Informer cache, used to enable write-through in cert generator
 	controller      controller.Controller
 	NodeFetcher     *nodeutil.NodeFetcher
 	ReleaseStore    *releasemanifest.Store
@@ -133,7 +134,19 @@ func (r *BKEClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 	// 初始化阶段上下文并执行阶段流程
 	phaseResult, err := r.executePhaseFlow(ctx, bkeCluster, oldBkeCluster, bkeLogger)
+
+	// Detect terminal *Failed state transition and notify manual intervention
+	r.checkAndNotifyManualIntervention(bkeCluster, oldBkeCluster)
+
 	if err != nil {
+		// When the cluster has entered a terminal *Failed state, manual intervention
+		// has already been triggered. Swallow the error to avoid an unnecessary
+		// requeue that would just run through Reconcile again.
+		if strings.HasSuffix(string(bkeCluster.Status.ClusterStatus), "Failed") {
+			bkeClusterLogger().Warnf("cluster %q is in terminal *Failed state %q, swallowing reconcile error: %v",
+				bkeCluster.Name, bkeCluster.Status.ClusterStatus, err)
+			return ctrl.Result{}, nil
+		}
 		return ctrl.Result{}, err
 	}
 
@@ -225,12 +238,15 @@ func (r *BKEClusterReconciler) executePhaseFlow(ctx context.Context,
 
 	if r.shouldUseDeclarativeUpgrade(bkeCluster) {
 		bkeClusterLogger().Infof("running declarative upgrade DAG")
-		dagResult, dagErr := r.executeUpgradeDAG(ctx, phaseCtx, oldBkeCluster, bkeCluster, bkeLogger)
+		dagCompleted, dagResult, dagErr := r.executeUpgradeDAG(ctx, phaseCtx, oldBkeCluster, bkeCluster, bkeLogger)
 		if dagErr != nil {
 			return dagResult, dagErr
 		}
 		if dagResult.Requeue || dagResult.RequeueAfter > 0 {
 			return dagResult, nil
+		}
+		if !dagCompleted {
+			return ctrl.Result{}, nil
 		}
 		if err := phaseCtx.FinishDeclarativeDAGForPhaseFlow(); err != nil {
 			return ctrl.Result{}, err
@@ -247,10 +263,46 @@ func (r *BKEClusterReconciler) executePhaseFlow(ctx context.Context,
 
 	res, err := flow.Execute()
 	if err != nil {
-		bkeClusterLogger().Warnf("Reconcile bkeCluster %q failed: %v", utils.ClientObjNS(bkeCluster), err)
+		// Boundary: log once here; phases should only return wrapped errors.
+		bkeClusterLogger().Errorf("Reconcile bkeCluster %q phase flow failed: %v", utils.ClientObjNS(bkeCluster), err)
+		return res, err
 	}
 
 	return res, nil
+}
+
+// checkAndNotifyManualIntervention detects whether the cluster just transitioned
+// to a *Failed health state (indicating the StatusManager exhausted retries)
+// and, if so, emits a manual intervention notification.
+func (r *BKEClusterReconciler) checkAndNotifyManualIntervention(
+	bkeCluster *bkev1beta1.BKECluster,
+	oldBkeCluster *bkev1beta1.BKECluster,
+) {
+	newFailed := strings.HasSuffix(string(bkeCluster.Status.ClusterStatus), "Failed")
+	oldFailed := oldBkeCluster != nil &&
+		strings.HasSuffix(string(oldBkeCluster.Status.ClusterStatus), "Failed")
+
+	// Only notify on transition (not already in Failed state)
+	if !newFailed || oldFailed {
+		return
+	}
+
+	// Skip if already notified (idempotency at controller level)
+	if intervention.IsRequired(bkeCluster) {
+		return
+	}
+
+	if err := intervention.Require(intervention.Params{
+		BKECluster: bkeCluster,
+		Client:     r.Client,
+		Recorder:   r.Recorder,
+		Guidance: intervention.RetryExhausted(
+			string(bkeCluster.Status.ClusterStatus),
+			statusmanage.ReconcileAllowedFailedCount,
+		),
+	}); err != nil {
+		bkeClusterLogger().Warnf("Failed to notify manual intervention: %v", err)
+	}
 }
 
 // setupClusterWatching 设置集群监控
@@ -316,7 +368,7 @@ func (r *BKEClusterReconciler) SetupWithManager(ctx context.Context,
 			builder.WithPredicates(bkepredicates.BKENodeChange()),
 		).Build(r)
 	if err != nil {
-		return errors.Errorf("failed setting up with a controller manager: %v", err)
+		return fmt.Errorf("failed setting up with a controller manager: %w", err)
 	}
 	r.controller = c
 	return nil
@@ -470,10 +522,6 @@ func (r *BKEClusterReconciler) computeAgentStatus(ctx context.Context, bkeCluste
 }
 
 func (r *BKEClusterReconciler) initNodeStatus(ctx context.Context, bkeCluster *bkev1beta1.BKECluster) error {
-	// 处理升级加入的节点
-	if r.handleNodeUpgrade(ctx, bkeCluster) {
-		return nil
-	}
 	// 处理节点变化 - now uses ctx to fetch BKENodes
 	nodeChangeFlag := r.handleNodeChanges(ctx, bkeCluster)
 
@@ -507,65 +555,6 @@ func (r *BKEClusterReconciler) initNodeStatus(ctx context.Context, bkeCluster *b
 		PatchFunc:         patchFunc,
 	}
 	return r.syncNodeStatusIfNeeded(bkeCluster, params)
-}
-
-func (r *BKEClusterReconciler) handleNodeUpgrade(ctx context.Context, bkeCluster *bkev1beta1.BKECluster) bool {
-	// Fetch nodes from BKENode CRD
-	bkeNodes, err := r.NodeFetcher.GetNodesForBKECluster(ctx, bkeCluster)
-	if err != nil {
-		bkeClusterLogger().Warnf("Failed to fetch BKENodes for cluster %s: %v", bkeCluster.Name, err)
-		return false
-	}
-
-	// Fetch BKEMachine resources in this cluster and derive node IPs from machine labels.
-	bkeMachines := &bkev1beta1.BKEMachineList{}
-	if err := r.Client.List(ctx, bkeMachines,
-		client.InNamespace(bkeCluster.Namespace),
-		client.MatchingLabels{clusterv1.ClusterNameLabel: bkeCluster.Name}); err != nil {
-		bkeClusterLogger().Warnf("Failed to list BKEMachines for cluster %s: %v", bkeCluster.Name, err)
-		return false
-	}
-
-	nodeByIP := make(map[string]struct{}, len(bkeNodes))
-	for _, node := range bkeNodes {
-		nodeByIP[node.IP] = struct{}{}
-	}
-	machineNodeIPSet := map[string]struct{}{}
-	for _, bkeMachine := range bkeMachines.Items {
-		if ip, ok := labelhelper.CheckBKEMachineLabel(&bkeMachine); ok {
-			machineNodeIPSet[ip] = struct{}{}
-		}
-	}
-
-	updated := false
-	var failedNodes []string
-	for nodeIP := range machineNodeIPSet {
-		if _, exists := nodeByIP[nodeIP]; !exists {
-			continue
-		}
-
-		bkeNode, err := r.NodeFetcher.GetNodeByIP(ctx, bkeCluster.Namespace, bkeCluster.Name, nodeIP)
-		if err != nil {
-			bkeClusterLogger().Debugf("Failed to get BKENode by IP %s for cluster %s: %v", nodeIP, bkeCluster.Name, err)
-			failedNodes = append(failedNodes, nodeIP)
-			continue
-		}
-
-		bkeNode.Status.State = confv1beta1.NodeReady
-		bkeNode.Status.StateCode = bootstrapReadyStateCode
-		bkeNode.Status.Message = "node marked ready by bootstrap command"
-		if err := r.NodeFetcher.UpdateNodeStatus(ctx, bkeNode); err != nil {
-			bkeClusterLogger().Debugf("Failed to update BKENode status for IP %s in cluster %s: %v", nodeIP, bkeCluster.Name, err)
-			failedNodes = append(failedNodes, nodeIP)
-			continue
-		}
-		updated = true
-	}
-	if len(failedNodes) > 0 {
-		bkeClusterLogger().Warnf("Failed to process %d nodes in cluster %s: %v", len(failedNodes), bkeCluster.Name, failedNodes)
-	}
-
-	return updated
 }
 
 // handleNodeChanges 处理节点变化
@@ -693,17 +682,18 @@ func (r *BKEClusterReconciler) processAllNodesRetry(ctx context.Context, bkeClus
 	bkeClusterLogger().Debugf("Retry flag present, clearing failure status for all nodes")
 	var failedNodes []string
 	for _, nodeState := range nodeStates {
-		hasFailedFlag, err := r.NodeFetcher.GetNodeStateFlagForCluster(ctx, bkeCluster, nodeState.Node.IP, bkev1beta1.NodeFailedFlag)
-		if err != nil {
-			bkeClusterLogger().Debugf("Failed to get node state flag for node %s: %v", nodeState.Node.IP, err)
-			failedNodes = append(failedNodes, nodeState.Node.IP)
+		hasFailedFlag := nodeState.StateCode&bkev1beta1.NodeFailedFlag != 0
+		needSkip := nodeState.NeedSkip
+		if !hasFailedFlag && !needSkip {
 			continue
 		}
-		if hasFailedFlag {
-			if err := r.NodeFetcher.UnmarkNodeStateFlagForCluster(ctx, bkeCluster, nodeState.Node.IP, bkev1beta1.NodeFailedFlag); err != nil {
-				bkeClusterLogger().Debugf("Failed to unmark node state flag for node %s: %v", nodeState.Node.IP, err)
-				failedNodes = append(failedNodes, nodeState.Node.IP)
-			}
+		if err := r.NodeFetcher.UpdateNodeStatusByIPForCluster(ctx, bkeCluster, nodeState.Node.IP, func(status *confv1beta1.BKENodeStatus) {
+			status.StateCode &= ^bkev1beta1.NodeFailedFlag
+			status.NeedSkip = false
+			status.RetryCount = 0
+		}); err != nil {
+			bkeClusterLogger().Debugf("Failed to clear failure status for node %s: %v", nodeState.Node.IP, err)
+			failedNodes = append(failedNodes, nodeState.Node.IP)
 		}
 	}
 	if len(failedNodes) > 0 {
@@ -725,9 +715,18 @@ func (r *BKEClusterReconciler) processSpecificNodesRetry(ctx context.Context, bk
 			bkeClusterLogger().Warnf("Failed to get node state flag for node %s: %v", nodeIP, err)
 			continue
 		}
-		if hasFailedFlag {
-			if err := r.NodeFetcher.UnmarkNodeStateFlagForCluster(ctx, bkeCluster, nodeIP, bkev1beta1.NodeFailedFlag); err != nil {
-				bkeClusterLogger().Warnf("Failed to unmark node state flag for node %s: %v", nodeIP, err)
+		needSkip, err := r.NodeFetcher.GetNodeStateNeedSkip(ctx, bkeCluster.Namespace, bkeCluster.Name, nodeIP)
+		if err != nil {
+			bkeClusterLogger().Warnf("Failed to get needSkip for node %s: %v", nodeIP, err)
+			continue
+		}
+		if hasFailedFlag || needSkip {
+			if err := r.NodeFetcher.UpdateNodeStatusByIPForCluster(ctx, bkeCluster, nodeIP, func(status *confv1beta1.BKENodeStatus) {
+				status.StateCode &= ^bkev1beta1.NodeFailedFlag
+				status.NeedSkip = false
+				status.RetryCount = 0
+			}); err != nil {
+				bkeClusterLogger().Warnf("Failed to clear failure status for node %s: %v", nodeIP, err)
 			}
 		}
 		bkeClusterLogger().Debugf("Retry flag present, removing status cache for node %s", nodeIP)
@@ -740,6 +739,15 @@ func (r *BKEClusterReconciler) createRemoveRetryAnnotationFunc() func(*bkev1beta
 	return func(cluster *bkev1beta1.BKECluster) {
 		// 移除retry annotation
 		annotation.RemoveAnnotation(cluster, annotation.RetryAnnotationKey)
+		// Reset ClusterStatus so checkCommonNeedExecute does not skip phases.
+		// This runs inside SyncStatusUntilComplete's prepareClusterData, which
+		// patches both the API-fetched object and the in-memory object,
+		// ensuring the reset is persisted to the API server and survives
+		// subsequent handleExternalUpdates merges in phase PostHooks.
+		cluster.Status.ClusterStatus = bkev1beta1.ClusterChecking
+		// Clear manual intervention condition so it is also persisted.
+		condition.ConditionMark(cluster, bkev1beta1.ManualInterventionRequiredCondition,
+			confv1beta1.ConditionFalse, "", "Manual intervention resolved")
 	}
 }
 
@@ -759,9 +767,13 @@ func (r *BKEClusterReconciler) setClusterHealthStatus(bkeCluster *bkev1beta1.BKE
 	if flags.DeployFlag || flags.DeployFailedFlag {
 		markBKEClusterHealthyStatus(bkeCluster, bkev1beta1.Deploying)
 	}
-	// 需要升级集群设置为正在升级
+	// 需要升级集群设置为正在升级；终态升级失败时保持 UpgradeFailed，避免 Legacy 升级被再次拉起。
 	if flags.UpgradeFlag || flags.UpgradeFailedFlag {
-		markBKEClusterHealthyStatus(bkeCluster, bkev1beta1.Upgrading)
+		if isTerminalUpgradeFailure(bkeCluster) {
+			bkeCluster.Status.ClusterHealthState = bkev1beta1.UpgradeFailed
+		} else {
+			markBKEClusterHealthyStatus(bkeCluster, bkev1beta1.Upgrading)
+		}
 	}
 	// 需要纳管集群设置为正在纳管
 	if flags.ManageFlag || flags.ManageFailedFlag {
@@ -800,6 +812,18 @@ func (r *BKEClusterReconciler) syncNodeStatusIfNeeded(bkeCluster *bkev1beta1.BKE
 	}
 
 	return nil
+}
+
+func isTerminalUpgradeFailure(bkeCluster *bkev1beta1.BKECluster) bool {
+	if bkeCluster == nil {
+		return false
+	}
+	if bkeCluster.Status.ClusterHealthState == bkev1beta1.UpgradeFailed {
+		return true
+	}
+	v, ok := condition.HasCondition(bkev1beta1.ClusterHealthyStateCondition, bkeCluster)
+	return ok && v != nil && v.Status == confv1beta1.ConditionFalse &&
+		v.Message == string(bkev1beta1.UpgradeFailed)
 }
 
 func markBKEClusterHealthyStatus(bkeCluster *bkev1beta1.BKECluster, status confv1beta1.ClusterHealthState) {

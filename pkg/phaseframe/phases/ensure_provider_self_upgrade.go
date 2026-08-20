@@ -19,9 +19,8 @@ import (
 	"time"
 
 	"github.com/coreos/go-semver/semver"
-	corev1 "k8s.io/api/core/v1"
+	"github.com/pkg/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
@@ -92,7 +91,7 @@ func (p *EnsureProviderSelfUpgrade) isProviderNeedUpgrade(old, new *bkev1beta1.B
 	target := getProviderDeploymentTarget()
 	currentImage, err := phaseutil.GetDeploymentImage(ctx, c, target)
 	if err != nil {
-		log.Error(constant.ProviderSelfUpgradeFailed, "failed to get current Deployment image, err: %v", err)
+		log.Warn(constant.ProviderSelfUpgradeFailed, "failed to get current Deployment image, err: %v", err)
 		return false
 	}
 
@@ -135,13 +134,11 @@ func (p *EnsureProviderSelfUpgrade) rolloutProvider() (ctrl.Result, error) {
 
 	targetImage, err := p.getProviderTargetImage(bkeCluster)
 	if err != nil || targetImage == "" {
-		log.Error(constant.ProviderSelfUpgradeFailed, "unable to parse target image: %v", err)
 		return ctrl.Result{}, fmt.Errorf("unable to parse target image: %w", err)
 	}
 
 	log.Info(constant.ProviderSelfUpgradeReason, "start patching Deployment image, target: %s", targetImage)
 	if err := phaseutil.PatchDeploymentImage(ctx, c, target, targetImage); err != nil {
-		log.Error(constant.ProviderSelfUpgradeFailed, "patch Deployment failed: %v", err)
 		return ctrl.Result{}, fmt.Errorf("patch Deployment failed: %w", err)
 	}
 
@@ -156,7 +153,6 @@ func (p *EnsureProviderSelfUpgrade) rolloutProvider() (ctrl.Result, error) {
 			}
 		}
 
-		log.Error(constant.ProviderSelfUpgradeFailed, "wait for Deployment ready failed: %v", err)
 		return ctrl.Result{}, fmt.Errorf("wait for Deployment ready failed: %w", err)
 	}
 
@@ -228,38 +224,16 @@ func (p *EnsureProviderSelfUpgrade) getPatchConfig(bkeCluster *bkev1beta1.BKEClu
 	log.Info(constant.ProviderSelfUpgradeReason, "openFuyaoVersion: %v", openFuyaoVersion)
 
 	bkeCmKey := fmt.Sprintf("patch.%s", openFuyaoVersion)
-	patchCmKey := fmt.Sprintf("cm.%s", openFuyaoVersion)
-
-	localConfigMap := &corev1.ConfigMap{}
-	if err := c.Get(ctx, constant.GetLocalConfigMapObjectKey(), localConfigMap); err != nil {
-		log.Error(constant.ProviderSelfUpgradeFailed, "failed to get local cluster bke-config cm, err: %v", err)
-		return nil, fmt.Errorf("get cm failed %v", err)
+	patchCfg, err := phaseutil.LoadPatchConfig(ctx, c, openFuyaoVersion)
+	if err != nil {
+		if errors.Is(err, phaseutil.ErrLocalPatchKeyNotFound) {
+			log.Info(constant.ProviderSelfUpgradeReason, "patch config %s does not exist (may be base version), skip", bkeCmKey)
+			return nil, fmt.Errorf("patch info %s not found (non-patch version)", bkeCmKey)
+		}
+		return nil, err
 	}
-
-	// Check if patch.<version> key exists
-	if _, ok := localConfigMap.Data[bkeCmKey]; !ok {
-		log.Info(constant.ProviderSelfUpgradeReason, "patch config %s does not exist (may be base version), skip", bkeCmKey)
-		return nil, fmt.Errorf("patch info %s not found (non-patch version)", bkeCmKey)
-	}
-
-	// Read openfuyao-patch/cm.<version> ConfigMap
-	cmKey := client.ObjectKey{
-		Namespace: "openfuyao-patch",
-		Name:      patchCmKey,
-	}
-	patchConfigMap := &corev1.ConfigMap{}
-	if err := c.Get(ctx, cmKey, patchConfigMap); err != nil {
-		log.Error(constant.ProviderSelfUpgradeFailed, "failed to get patch cm, err: %v", err)
-		return nil, fmt.Errorf("get cm failed %v", err)
-	}
-
-	// Parse yaml config
-	if _, ok := patchConfigMap.Data[openFuyaoVersion]; !ok {
-		return nil, fmt.Errorf("patch info %s not found in patch config", openFuyaoVersion)
-	}
-
-	log.Info(constant.ProviderSelfUpgradeReason, "get patch config data length: %d", len(patchConfigMap.Data[openFuyaoVersion]))
-	return phaseutil.GetPatchConfig(patchConfigMap.Data[openFuyaoVersion])
+	log.Info(constant.ProviderSelfUpgradeReason, "get patch config for version %s successfully", openFuyaoVersion)
+	return patchCfg, nil
 }
 
 func (p *EnsureProviderSelfUpgrade) isProviderImage(image phaseutil.Image) bool {

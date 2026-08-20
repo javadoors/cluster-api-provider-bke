@@ -837,6 +837,61 @@ spec:
                     format: int32
                     type: integer
                 type: object
+              clusterComponentStatuses:
+                additionalProperties:
+                  description: ComponentLifecycleStatus records one component's lifecycle
+                    on BKECluster status.
+                  properties:
+                    componentType:
+                      description: 'ComponentType is the status-side scope: node or
+                        cluster.'
+                      enum:
+                      - node
+                      - cluster
+                      type: string
+                    currentVersion:
+                      description: CurrentVersion is the last successfully installed/aligned
+                        version.
+                      type: string
+                    lastTransitionTime:
+                      description: LastTransitionTime is updated when Phase changes.
+                      format: date-time
+                      type: string
+                    message:
+                      description: Message holds failure details or supplemental notes.
+                      type: string
+                    name:
+                      description: Name is the component name; usually matches the
+                        map key in ClusterComponentStatuses.
+                      type: string
+                    nodeIP:
+                      description: NodeIP is set for node-scoped components; empty
+                        for cluster-scoped components.
+                      type: string
+                    phase:
+                      description: Phase is the current lifecycle phase.
+                      enum:
+                      - Pending
+                      - Installing
+                      - Installed
+                      - Upgrading
+                      - RollingBack
+                      - Uninstalling
+                      - Removed
+                      - Failed
+                      type: string
+                    targetVersion:
+                      description: TargetVersion is the desired version for the in-progress
+                        upgrade.
+                      type: string
+                  required:
+                  - componentType
+                  - name
+                  - phase
+                  type: object
+                description: ClusterComponentStatuses records lifecycle status per
+                  component name (DAG/Bundle key).
+                type: object
               clusterHealthState:
                 description: ClusterHealthState
                 type: string
@@ -912,6 +967,9 @@ spec:
                       successfully.
                     format: date-time
                     type: string
+                  lastError:
+                    description: LastError records the last observed error during DAG execution for this TargetVersion.
+                    type: string
                   lastFailure:
                     description: |-
                       LastFailure records the last failed component for this TargetVersion, for easier debugging.
@@ -938,10 +996,6 @@ spec:
                     - failedAt
                     - name
                     type: object
-                  lastError:
-                    description: LastError records the last observed error during
-                      DAG execution for this TargetVersion.
-                    type: string
                   startedAt:
                     description: StartedAt marks the first time we initialized progress
                       for TargetVersion.

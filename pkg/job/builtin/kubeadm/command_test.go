@@ -223,7 +223,7 @@ func TestInstallKubeletCommandError(t *testing.T) {
 		},
 	}
 
-	err := k.installKubeletCommand()
+	err := k.installKubeletCommand(false)
 	assert.Error(t, err)
 }
 

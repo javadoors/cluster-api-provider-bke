@@ -2,7 +2,7 @@
  * Copyright (c) 2024 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -222,6 +222,10 @@ func (webhook *BKECluster) ValidateCreate(ctx context.Context, obj runtime.Objec
 		return nil, apierrors.NewBadRequest(fmt.Sprintf("invalide Spec.ClusterConfig, %v", err))
 	}
 	if err := webhook.ValidateControlPlaneEndpoint(bkeCluster); err != nil {
+		return nil, err
+	}
+	// 不可变 OS 模式下校验节点角色约束
+	if err := webhook.validateImmutableOSConstraints(ctx, bkeCluster); err != nil {
 		return nil, err
 	}
 	return nil, nil
@@ -459,6 +463,46 @@ func (webhook *BKECluster) ValidateControlPlaneEndpoint(bkeCluster *bkev1beta1.B
 	}
 }
 
+// validateImmutableOSConstraints 不可变 OS 模式下校验节点角色约束。
+// master 跑普通 openEuler、worker 跑 KubeOS VM，同一节点不能同时作为纯 master 和纯 worker。
+func (webhook *BKECluster) validateImmutableOSConstraints(ctx context.Context, bkeCluster *bkev1beta1.BKECluster) error {
+	if !clusterutil.IsImmutableOSMode(bkeCluster) {
+		return nil
+	}
+
+	nodes, err := webhook.NodeFetcher.GetNodesForBKECluster(ctx, bkeCluster)
+	if err != nil {
+		return errors.Wrapf(err, "failed to get BKENode list")
+	}
+
+	// 按 IP 分组，检查同一 IP 是否被分配为冲突的纯角色
+	ipRoles := make(map[string][]string)
+	for _, node := range nodes {
+		n := bkenode.Node(node)
+		if n.IsMasterWorker() {
+			continue
+		}
+		if n.IsMaster() {
+			ipRoles[node.IP] = append(ipRoles[node.IP], "master("+node.Hostname+")")
+		}
+		if n.IsWorker() {
+			ipRoles[node.IP] = append(ipRoles[node.IP], "worker("+node.Hostname+")")
+		}
+	}
+
+	for ip, roles := range ipRoles {
+		if len(roles) > 1 {
+			return apierrors.NewForbidden(
+				bkev1beta1.GroupVersion.WithResource("bkeclusters").GroupResource(),
+				bkeCluster.Name,
+				fmt.Errorf("immutable OS mode does not allow the same node %s to be assigned as both master and worker "+
+					"(master runs plain openEuler, worker runs KubeOS VM): %v", ip, roles),
+			)
+		}
+	}
+	return nil
+}
+
 // validateVersionUpdate validate the cluster version update
 func (webhook *BKECluster) validateVersionUpdate(ctx context.Context, newBKECluster, oldBKECluster *bkev1beta1.BKECluster) error {
 	if oldBKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion == "" {
@@ -468,11 +512,11 @@ func (webhook *BKECluster) validateVersionUpdate(ctx context.Context, newBKEClus
 	versionPath := field.NewPath("spec", "clusterConfig", "cluster", "kubernetesVersion")
 	fromVersion, err := version.ParseMajorMinorPatch(oldBKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion)
 	if err != nil {
-		return field.InternalError(versionPath, errors.Errorf("parse kubernetes version %q failed, err: %v", oldBKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion, err))
+		return field.InternalError(versionPath, fmt.Errorf("parse kubernetes version %q failed, err: %w", oldBKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion, err))
 	}
 	toVersion, err := version.ParseMajorMinorPatch(newBKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion)
 	if err != nil {
-		return field.InternalError(versionPath, errors.Errorf("parse kubernetes version %q failed, err: %v", newBKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion, err))
+		return field.InternalError(versionPath, fmt.Errorf("parse kubernetes version %q failed, err: %w", newBKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion, err))
 	}
 
 	// return early if kubernetes version not change
@@ -551,13 +595,11 @@ func (webhook *BKECluster) validateEtcdVersionUpdate(ctx context.Context, newBKE
 	versionPath := field.NewPath("spec", "clusterConfig", "cluster", "etcdVersion")
 	fromVersion, err := version.ParseMajorMinorPatch(oldBKECluster.Spec.ClusterConfig.Cluster.EtcdVersion)
 	if err != nil {
-		return field.InternalError(versionPath, errors.Errorf("parse etcd version %q failed, err: %v",
-			oldBKECluster.Spec.ClusterConfig.Cluster.EtcdVersion, err))
+		return field.InternalError(versionPath, fmt.Errorf("parse etcd version %q failed, err: %w", oldBKECluster.Spec.ClusterConfig.Cluster.EtcdVersion, err))
 	}
 	toVersion, err := version.ParseMajorMinorPatch(newBKECluster.Spec.ClusterConfig.Cluster.EtcdVersion)
 	if err != nil {
-		return field.InternalError(versionPath, errors.Errorf("parse etcd version %q failed, err: %v",
-			newBKECluster.Spec.ClusterConfig.Cluster.EtcdVersion, err))
+		return field.InternalError(versionPath, fmt.Errorf("parse etcd version %q failed, err: %w", newBKECluster.Spec.ClusterConfig.Cluster.EtcdVersion, err))
 	}
 
 	// return early if etcd version not change

@@ -188,13 +188,11 @@ func (cp *CertPlugin) handleLoadCACert(certParamMap map[string]string) error {
 	}
 
 	if certParamMap["caCertNames"] == "" {
-		log.Error("caCertNames is required when loadCACert is true")
 		return errors.New("caCertNames is required when loadCACert is true")
 	}
 
 	caCertNames := strings.Split(certParamMap["caCertNames"], ",")
 	if cp.clusterName == "" || cp.namespace == "" {
-		log.Error("clusterName and namespace are required when caCertNames is not empty")
 		return errors.New("clusterName and namespace are required when caCertNames is not empty")
 	}
 
@@ -217,7 +215,6 @@ func (cp *CertPlugin) handleLoadAdminKubeconfig(certParamMap map[string]string) 
 
 	log.Infof("load admin kubeconfig from cluster api secret")
 	if cp.namespace == "" {
-		log.Error("'namespace' is required when 'loadAdminKubeconfig' is true")
 		return errors.New("'namespace' is required when 'loadAdminKubeconfig' is true")
 	}
 	// get kubeconfig from cluster api secret，该kubeconfig是集群的入口
@@ -521,7 +518,7 @@ func (cp *CertPlugin) generateKubeConfigsForScopes(scopes []string, serverPort i
 			Nodes:       cp.nodes,
 		})
 		if err := kubeConfigGenerater.Generate(); err != nil {
-			return errors.Errorf("failed to generate local kubeconfig for %s, err: %v", scope, err)
+			return fmt.Errorf("failed to generate local kubeconfig for %s, err: %w", scope, err)
 		}
 	}
 	return nil
@@ -568,20 +565,20 @@ func (cp *CertPlugin) generateTLSCertsForScopes(scopes []string, nodeIP string) 
 
 		// Append SANs to AltNames using AppendSANsToAltNames which handles validation and deduplication
 		if err := pkiutil.AppendSANsToAltNames(&certSpec.Config.AltNames, sanList, certSpec.BaseName); err != nil {
-			return errors.Errorf("failed to append SANs to TLS cert for %s: %v", scope, err)
+			return fmt.Errorf("failed to append SANs to TLS cert for %s: %w", scope, err)
 		}
 
 		// Load CA certificate and key
 		caCertSpec := pkiutil.BKECertRootCA()
 		caCertSpec.PkiPath = cp.pkiPath
 		if err := pkiutil.CertExists(caCertSpec); err != nil {
-			return errors.Errorf("CA certificate not found for generating TLS cert for %s: %v", scope, err)
+			return fmt.Errorf("CA certificate not found for generating TLS cert for %s: %w", scope, err)
 		}
 
 		// Generate TLS certificate using CA certificate
 		// This will generate client certificate and key signed by the CA with SAN fields
 		if err := pkiutil.GenerateCertWithCA(certSpec, caCertSpec); err != nil {
-			return errors.Errorf("failed to generate TLS cert for %s, err: %v", scope, err)
+			return fmt.Errorf("failed to generate TLS cert for %s, err: %w", scope, err)
 		}
 
 		sanLog := "IP:127.0.0.1,IP:0.0.0.0,DNS:localhost"
@@ -601,7 +598,6 @@ func (cp *CertPlugin) handleUploadCerts(certParamMap map[string]string) error {
 
 	log.Infof("upload all certs to manager k8s as secret")
 	if cp.namespace == "" {
-		log.Error("'namespace' is required when 'uploadCerts' is true")
 		return errors.New("'namespace' is required when 'uploadCerts' is true")
 	}
 	if err := cp.uploadCerts(cp.namespace); err != nil {

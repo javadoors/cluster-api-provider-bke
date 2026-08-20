@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -31,7 +31,6 @@ import (
 
 	agentv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkeagent/v1beta1"
 	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	agentutils "gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/constant"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
@@ -199,27 +198,44 @@ func (b *BaseCommand) newCommand(commandName, labelKey string, commandSpec *agen
 	return b.createCommand(command)
 }
 
+// uniqueCommandBase returns the stable identity of a command name.
+// Only a trailing numeric segment is treated as a timestamp suffix.
+func uniqueCommandBase(name string) string {
+	idx := strings.LastIndex(name, "-")
+	if idx <= 0 {
+		return name
+	}
+	if _, err := strconv.ParseInt(name[idx+1:], 10, 64); err != nil {
+		return name
+	}
+	return name[:idx]
+}
+
+func isSameUniqueCommandFamily(want, existing string) bool {
+	return uniqueCommandBase(want) == uniqueCommandBase(existing)
+}
+
 // handleUniqueCommand 处理唯一性命令，如果设置了Unique，则删除同名前缀的已有命令
 func (b *BaseCommand) handleUniqueCommand(commandName string) error {
 	if !b.Unique {
 		return nil
 	}
 
-	// 去掉字符串的时间戳
-	commandNamePrefix := utils.RemoveTimestamps(commandName)
-	// get all the command
 	commandList := &agentv1beta1.CommandList{}
 	if err := b.Client.List(b.Ctx, commandList, client.InNamespace(b.NameSpace)); err != nil {
 		return errors.Wrapf(err, "failed to list command in namespace %s", b.NameSpace)
 	}
-	// delete the command
 	for _, command := range commandList.Items {
-		if strings.HasPrefix(command.Name, commandNamePrefix) {
-			if err := b.Client.Delete(b.Ctx, &command); err != nil {
-				return errors.Wrapf(err, "failed to delete command %s", command.Name)
-			}
-			break
+		if !isSameUniqueCommandFamily(commandName, command.Name) {
+			continue
 		}
+		if err := b.Client.Delete(b.Ctx, &command); err != nil {
+			if apierrors.IsNotFound(err) {
+				break
+			}
+			return errors.Wrapf(err, "failed to delete command %s", command.Name)
+		}
+		break
 	}
 	return nil
 }
@@ -413,11 +429,11 @@ func (b *BaseCommand) handleTimeoutCase(originalComplete bool, originalSuccessNo
 
 	successNodeSet := make(map[string]struct{}, len(successNodes))
 	for _, node := range successNodes {
-		successNodeSet[node] = struct{}{}
+		successNodeSet[agentutils.GetNodeIPFromCommandWaitResult(node)] = struct{}{}
 	}
 	failedNodeSet := make(map[string]struct{}, len(failedNodes))
 	for _, node := range failedNodes {
-		failedNodeSet[node] = struct{}{}
+		failedNodeSet[agentutils.GetNodeIPFromCommandWaitResult(node)] = struct{}{}
 	}
 
 	// 检查超时后仍未成功的目标节点，并追加到失败列表

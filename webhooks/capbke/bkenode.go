@@ -21,6 +21,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/json"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
@@ -79,6 +80,7 @@ func (webhook *BKENode) Default(ctx context.Context, obj runtime.Object) error {
 			bkeNodeLog.Warnf("Failed to encrypt password for node %s: %v", bkeNode.Spec.IP, err)
 		} else {
 			bkeNode.Spec.Password = encryptedPassword
+			sanitizeLastAppliedPassword(bkeNode, encryptedPassword)
 		}
 	}
 
@@ -100,6 +102,43 @@ func encryptPasswordIfNeeded(password string) (string, error) {
 		return password, err
 	}
 	return encrypted, nil
+}
+
+// sanitizeLastAppliedPassword replaces the plaintext password in the
+// kubectl.kubernetes.io/last-applied-configuration annotation with the
+// encrypted value, preventing plaintext from being stored in etcd.
+func sanitizeLastAppliedPassword(bkeNode *confv1beta1.BKENode, encryptedPassword string) {
+	const annotationKey = "kubectl.kubernetes.io/last-applied-configuration"
+	if bkeNode.Annotations == nil {
+		return
+	}
+	lastApplied, ok := bkeNode.Annotations[annotationKey]
+	if !ok {
+		return
+	}
+	var applied map[string]interface{}
+	if err := json.Unmarshal([]byte(lastApplied), &applied); err != nil {
+		bkeNodeLog.Warnf("Failed to parse last-applied-configuration annotation: %v", err)
+		return
+	}
+	specVal, exists := applied["spec"]
+	if !exists {
+		return
+	}
+	spec, ok := specVal.(map[string]interface{})
+	if !ok {
+		return
+	}
+	if _, hasPassword := spec["password"]; !hasPassword {
+		return
+	}
+	spec["password"] = encryptedPassword
+	updated, err := json.Marshal(applied)
+	if err != nil {
+		bkeNodeLog.Warnf("Failed to marshal updated last-applied-configuration: %v", err)
+		return
+	}
+	bkeNode.Annotations[annotationKey] = string(updated)
 }
 
 // ValidateCreate implements webhook.Validator so a webhook will be registered for the type

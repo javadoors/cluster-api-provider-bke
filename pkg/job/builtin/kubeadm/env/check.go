@@ -330,7 +330,6 @@ func (ep *EnvPlugin) checkHost() error {
 
 	expectedName := ep.expectedBKENodeName()
 	if expectedName != "" && bkeNodeName != expectedName {
-		log.Errorf("BKE node name is not match, current is %s, except %s", bkeNodeName, expectedName)
 		return errors.Errorf("BKE node name is not match, current is %s, except %s", bkeNodeName, expectedName)
 	}
 
@@ -342,7 +341,6 @@ func (ep *EnvPlugin) checkHost() error {
 
 	h, err := NewHostsFile(CheckHostConfPath)
 	if err != nil {
-		log.Errorf("Check hosts file failed, %s", err)
 		return errors.Wrap(err, "check hosts file failed, get hosts file failed")
 	}
 	var extraHosts []string
@@ -378,7 +376,6 @@ func (ep *EnvPlugin) checkHost() error {
 			}
 		}
 		if !flag {
-			log.Errorf("check hosts failed, host: %s not in hosts file", host)
 			return errors.Errorf("check hosts failed,hosts not match, hosts: %s", ep.extraHosts)
 		}
 	}

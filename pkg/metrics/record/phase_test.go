@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -28,7 +28,6 @@ func TestPhaseDurationRecord(t *testing.T) {
 	tests := []struct {
 		name        string
 		metricsAddr string
-		e2eMode     bool
 		err         error
 	}{
 		{
@@ -45,24 +44,16 @@ func TestPhaseDurationRecord(t *testing.T) {
 			metricsAddr: ":8080",
 			err:         errors.New("test error"),
 		},
-		{
-			name:        "e2e mode enabled",
-			metricsAddr: ":8080",
-			e2eMode:     true,
-		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			oldAddr := config.MetricsAddr
-			oldE2E := config.E2EMode
 			defer func() {
 				config.MetricsAddr = oldAddr
-				config.E2EMode = oldE2E
 			}()
 
 			config.MetricsAddr = tt.metricsAddr
-			config.E2EMode = tt.e2eMode
 
 			obj := &bkev1beta1.BKECluster{
 				ObjectMeta: metav1.ObjectMeta{

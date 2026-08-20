@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -135,11 +135,10 @@ func (e *EnsureNodesEnv) getNodesToInitEnv() bkenode.Nodes {
 }
 
 func (e *EnsureNodesEnv) setupClusterConditionAndSync() error {
-	_, c, bkeCluster, _, log := e.Ctx.Untie()
+	_, c, bkeCluster, _, _ := e.Ctx.Untie()
 	condition.ConditionMark(bkeCluster, bkev1beta1.NodesEnvCondition, confv1beta1.ConditionFalse, constant.NodesEnvNotReadyReason, "")
 	if err := mergecluster.SyncStatusUntilComplete(c, bkeCluster); err != nil {
-		log.Error(constant.NodesEnvNotReadyReason, "Failed to sync status: %v", err)
-		return err
+		return fmt.Errorf("Failed to sync status: %w", err)
 	}
 	return nil
 }
@@ -156,6 +155,7 @@ type BuildCommonEnvCommandParams struct {
 	ExtraHosts        []string
 	DryRun            bool
 	DeepRestore       bool
+	IsImmutableOS     bool
 	Log               *bkev1beta1.BKELogger
 }
 
@@ -185,6 +185,7 @@ func BuildCommonEnvCommand(params BuildCommonEnvCommandParams) (*command.ENV, er
 		ExtraHosts:        params.ExtraHosts,
 		DryRun:            params.DryRun,
 		DeepRestore:       params.DeepRestore,
+		IsImmutableOS:     params.IsImmutableOS,
 	}
 
 	return envCmd, nil
@@ -195,6 +196,7 @@ func (e *EnsureNodesEnv) buildEnvCommand(exceptEnvNodes bkenode.Nodes) (*command
 	extra, extraHosts := e.getExtraAndExtraHosts(bkeCluster)
 
 	deepRestore := e.shouldUseDeepRestore(bkeCluster)
+	isImmutableOS := clusterutil.IsImmutableOSMode(bkeCluster)
 
 	envCmd, err := BuildCommonEnvCommand(BuildCommonEnvCommandParams{
 		Ctx:            ctx,
@@ -206,6 +208,7 @@ func (e *EnsureNodesEnv) buildEnvCommand(exceptEnvNodes bkenode.Nodes) (*command
 		ExtraHosts:     extraHosts,
 		DryRun:         bkeCluster.Spec.DryRun,
 		DeepRestore:    deepRestore,
+		IsImmutableOS:  isImmutableOS,
 		Log:            log,
 	})
 	if err != nil {
@@ -213,9 +216,7 @@ func (e *EnsureNodesEnv) buildEnvCommand(exceptEnvNodes bkenode.Nodes) (*command
 	}
 
 	if err := envCmd.New(); err != nil {
-		errInfo := fmt.Sprintf("failed to create k8s env init command: %v", err)
-		log.Error(constant.CommandCreateFailedReason, errInfo)
-		return nil, err
+		return nil, fmt.Errorf("failed to create k8s env init command: %w", err)
 	}
 
 	return envCmd, nil
@@ -306,8 +307,8 @@ func (e *EnsureNodesEnv) handleFailedNodes(envCmd *command.ENV, failedNodes []st
 	commandErrs, err := phaseutil.LogCommandFailed(*envCmd.Command, failedNodes, log, constant.NodesEnvNotReadyReason)
 	phaseutil.MarkNodeStatusByCommandErrs(e.Ctx, e.Ctx.Client, bkeCluster, commandErrs)
 
-	if len(failedNodes) > 0 {
-		log.Error(constant.NodesEnvNotReadyReason, "failed to check k8s env in following nodes: %v", failedNodes)
+	if len(failedNodes) > 0 && err == nil {
+		return fmt.Errorf("failed to check k8s env in following nodes: %v", failedNodes)
 	}
 
 	return err
@@ -320,9 +321,7 @@ func (e *EnsureNodesEnv) finalDecisionAndCleanup(successNodes, failedNodes []str
 	}
 
 	if len(successNodes) == 0 {
-		errMsg := fmt.Sprintf("failed to check k8s env in all nodes: %v", failedNodes)
-		log.Error(constant.NodesEnvNotReadyReason, errMsg)
-		return ctrl.Result{}, errors.New(errMsg)
+		return ctrl.Result{}, fmt.Errorf("failed to check k8s env in all nodes: %v", failedNodes)
 	}
 
 	e.initClusterExtra()
@@ -372,16 +371,13 @@ func (e *EnsureNodesEnv) CheckOrInitNodesEnv() (ctrl.Result, error) {
 
 	err, successNodes, failedNodes := e.executeEnvCommand(envCmd)
 	if err != nil {
-		errInfo := fmt.Sprintf("failed to check k8s env: %v", err)
-		log.Error(constant.NodesEnvNotReadyReason, errInfo)
-		return ctrl.Result{}, err
+		return ctrl.Result{}, fmt.Errorf("failed to check k8s env: %w", err)
 	}
 
 	e.handleSuccessNodes(successNodes)
 
 	if handleErr := e.handleFailedNodes(envCmd, failedNodes); handleErr != nil {
-		errInfo := fmt.Sprintf("handle failed nodes failed: %v", handleErr)
-		log.Error(constant.NodesEnvNotReadyReason, errInfo)
+		log.Warn(constant.NodesEnvNotReadyReason, "handle failed nodes failed: %v", handleErr)
 	}
 
 	return e.finalDecisionAndCleanup(successNodes, failedNodes)
@@ -444,17 +440,17 @@ type InstallOtherScriptParams struct {
 func (e *EnsureNodesEnv) installCommonScripts(params InstallScriptParams) {
 	for _, script := range commonEnvExtraExecScripts {
 		if !utils.ContainsString(params.ScriptsLi, script) {
-			params.Log.Warn(constant.EnvExtraExecScriptFailed, "common script %q not found in configmaps, skipping", script)
+			params.Log.Debug("common script %q not found in configmaps, skipping", script)
 			return
 		}
 
 		nodesIps, err := e.getNodesIpsByScript(script)
 		if err != nil {
-			params.Log.Warn(constant.EnvExtraExecScriptSkip, "failed to get node IPs for common script %q, skipping, err: %v", script, err)
+			params.Log.Debug("failed to get node IPs for common script %q, skipping, err: %v", script, err)
 			return
 		}
 		if len(nodesIps) == 0 {
-			params.Log.Warn(constant.EnvExtraExecScriptSkip, "node IPs empty for common script %q, skipping", script)
+			params.Log.Debug("node IPs empty for common script %q, skipping", script)
 			return
 		}
 
@@ -475,6 +471,12 @@ func (e *EnsureNodesEnv) installCommonScripts(params InstallScriptParams) {
 
 // installOtherCustomScripts 安装其他自定义脚本
 func (e *EnsureNodesEnv) installOtherCustomScripts(params InstallOtherScriptParams) {
+	// 不可变 OS 跳过自定义脚本（安装到只读目录，由镜像内置）
+	if clusterutil.IsImmutableOSMode(params.BKECluster) {
+		params.Log.Info(constant.EnvExtraExecScriptSkip, "skip custom scripts in immutable OS mode")
+		return
+	}
+
 	// 执行其他脚本
 	otherCustomScripts := defaultEnvExtraExecScripts
 
@@ -487,7 +489,7 @@ func (e *EnsureNodesEnv) installOtherCustomScripts(params InstallOtherScriptPara
 
 	for _, script := range otherCustomScripts {
 		if !utils.ContainsString(params.ScriptsLi, script) {
-			params.Log.Warn(constant.EnvExtraExecScriptSkip, "custom script %q not found in configmaps, skipping", script)
+			params.Log.Debug("custom script %q not found in configmaps, skipping", script)
 			continue
 		}
 
@@ -498,11 +500,11 @@ func (e *EnsureNodesEnv) installOtherCustomScripts(params InstallOtherScriptPara
 
 		nodesIps, err := e.getNodesIpsByScript(script)
 		if err != nil {
-			params.Log.Warn(constant.EnvExtraExecScriptSkip, "failed to get node IPs for custom script %q, skipping, err: %v", script, err)
+			params.Log.Debug("failed to get node IPs for custom script %q, skipping, err: %v", script, err)
 			continue
 		}
 		if len(nodesIps) == 0 {
-			params.Log.Warn(constant.EnvExtraExecScriptSkip, "node IPs empty for custom script %q, skipping", script)
+			params.Log.Debug("node IPs empty for custom script %q, skipping", script)
 			continue
 		}
 

@@ -2,7 +2,7 @@
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -13,6 +13,7 @@
 package phases
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
 	"time"
@@ -36,7 +37,7 @@ import (
 )
 
 const (
-	// EnsureClusterAPIManagerManifestName applies cluster-api 004-manage.yaml after postprocess.
+	// EnsureClusterAPIManagerManifestName applies cluster-api 003-manage.yaml after postprocess.
 	EnsureClusterAPIManagerManifestName confv1beta1.BKEClusterPhase = "EnsureClusterAPIManagerManifest"
 )
 
@@ -104,7 +105,7 @@ func (e *EnsureClusterAPIManagerManifest) Execute() (ctrl.Result, error) {
 	targetClusterClient.SetLogger(log.NormalLogger)
 	targetClusterClient.SetBKELogger(log)
 
-	managerYamlPath := filepath.Join(constant.K8sManifestsDir, "cluster-api", version, "004-manage.yaml")
+	managerYamlPath := filepath.Join(constant.K8sManifestsDir, "cluster-api", version, "003-manage.yaml")
 	config := bkeinit.BkeConfig(*bkeCluster.Spec.ClusterConfig)
 	repo := config.ImageRepo()
 
@@ -130,8 +131,7 @@ func (e *EnsureClusterAPIManagerManifest) Execute() (ctrl.Result, error) {
 
 	log.Info(constant.AddonDeployingReason, "apply deferred cluster-api manage manifest, file=%s", managerYamlPath)
 	if err := targetClusterClient.ApplyYaml(task); err != nil {
-		log.Error(constant.AddonDeployFailedReason, "apply deferred cluster-api manage manifest failed: %s", err.Error())
-		return ctrl.Result{}, err
+		return ctrl.Result{}, fmt.Errorf("apply deferred cluster-api manage manifest failed: %w", err)
 	}
 
 	annotation.SetAnnotation(bkeCluster, common.ClusterAPIManagerAppliedAnnotationKey, "true")

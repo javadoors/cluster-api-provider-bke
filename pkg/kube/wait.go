@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -22,7 +22,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/client-go/discovery"
-	memory "k8s.io/client-go/discovery/cached"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -185,12 +184,11 @@ func (f *kubeFactory) ToRESTConfig() (*rest.Config, error) {
 
 // ToRESTMapper returns a REST mapper
 func (f *kubeFactory) ToRESTMapper() (meta.RESTMapper, error) {
-	discoveryClient, err := f.ToDiscoveryClient()
+	mapperCache, err := GetDynamicRESTMapper(f.config)
 	if err != nil {
 		return nil, err
 	}
-	mapper := restmapper.NewDeferredDiscoveryRESTMapper(discoveryClient)
-	expander := restmapper.NewShortcutExpander(mapper, discoveryClient)
+	expander := restmapper.NewShortcutExpander(mapperCache.RESTMapper(), mapperCache.DiscoveryClient())
 	return expander, nil
 }
 
@@ -200,15 +198,13 @@ func (f *kubeFactory) ToDiscoveryClient() (discovery.CachedDiscoveryInterface, e
 	if err != nil {
 		return nil, err
 	}
-
-	// 设置合理的超时时间
 	config.Timeout = Timeout
 
-	discoveryClient, _ := discovery.NewDiscoveryClientForConfig(config)
-	if discoveryClient == nil {
+	mapperCache, err := GetDynamicRESTMapper(config)
+	if err != nil {
 		return nil, err
 	}
-	return memory.NewMemCacheClient(discoveryClient), nil
+	return mapperCache.DiscoveryClient(), nil
 }
 
 // ToRawKubeConfigLoader returns a clientcmd client config

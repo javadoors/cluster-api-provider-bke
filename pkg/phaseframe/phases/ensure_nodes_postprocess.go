@@ -2,7 +2,7 @@
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -99,6 +99,7 @@ func (e *EnsureNodesPostProcess) CheckOrRunPostProcess() (ctrl.Result, error) {
 
 	condition.ConditionMark(bkeCluster, bkev1beta1.NodesPostProcessCondition, confv1beta1.ConditionTrue, constant.NodesPostProcessReadyReason, "")
 	log.Info(constant.NodesPostProcessReadyReason, "Post process scripts complete")
+
 	return ctrl.Result{}, nil
 }
 
@@ -111,13 +112,13 @@ func (e *EnsureNodesPostProcess) executeNodePostProcessScripts() error {
 	var nodesWithoutConfig bkenode.Nodes // 新增：收集没有配置的节点
 	for _, node := range nodes {
 		if node.IP == "" {
-			log.Warn(constant.NodesPostProcessCheckingReason, "nodeIP empty, skip")
+			log.Debug("nodeIP empty, skip postprocess")
 			continue
 		}
 		hasConfig := e.checkPostProcessConfigExists(ctx, c, log, node.IP)
 		if !hasConfig {
 			nodesWithoutConfig = append(nodesWithoutConfig, node)
-			log.Warn(constant.NodesPostProcessCheckingReason, "node %s has no postprocess config, skip", node.IP)
+			log.Debug("node %s has no postprocess config, skip", node.IP)
 			continue
 		}
 		nodesWithConfig = append(nodesWithConfig, node)
@@ -126,6 +127,7 @@ func (e *EnsureNodesPostProcess) executeNodePostProcessScripts() error {
 	for _, node := range nodesWithoutConfig {
 		nodeFetcher := e.Ctx.NodeFetcher()
 		if err := nodeFetcher.UpdateNodeStatusByIPForCluster(ctx, bkeCluster, node.IP, func(status *confv1beta1.BKENodeStatus) {
+			status.State = confv1beta1.NodeReady
 			status.StateCode |= bkev1beta1.NodePostProcessFlag
 			status.Message = "Post process skipped (no config)"
 		}); err != nil {
@@ -153,7 +155,11 @@ func (e *EnsureNodesPostProcess) executeNodePostProcessScripts() error {
 		phaseutil.LogCommandInfo(*cmd.Command, log, constant.NodesPostProcessCheckingReason)
 	}
 	if err != nil || len(failedNodes) > 0 {
-		return errors.Errorf("postprocess failed, success=%v, failed=%v", successNodes, failedNodes)
+		e.handleFailedNodes(cmd, failedNodes)
+		failMsg := fmt.Sprintf("postprocess failed, success=%v, failed=%v", successNodes, failedNodes)
+		condition.ConditionMark(bkeCluster, bkev1beta1.NodesPostProcessCondition,
+			confv1beta1.ConditionFalse, constant.NodesPostProcessNotReadyReason, failMsg)
+		return errors.New(failMsg)
 	}
 
 	e.markPostProcessSuccess(successNodes)
@@ -173,6 +179,25 @@ func (e *EnsureNodesPostProcess) markPostProcessSuccess(successNodes []string) {
 		}
 	}
 	log.Info(constant.NodesPostProcessReadyReason, "postprocess success nodes=%v", successNodes)
+}
+
+func (e *EnsureNodesPostProcess) handleFailedNodes(cmd *command.Custom, failedNodes []string) {
+	ctx, _, bkeCluster, _, log := e.Ctx.Untie()
+	nodeFetcher := e.Ctx.NodeFetcher()
+	for _, node := range failedNodes {
+		nodeIP := phaseutil.GetNodeIPFromCommandWaitResult(node)
+		if err := nodeFetcher.UpdateNodeStatusByIPForCluster(ctx, bkeCluster, nodeIP, func(status *confv1beta1.BKENodeStatus) {
+			status.State = bkev1beta1.NodeInitFailed
+			status.StateCode |= bkev1beta1.NodePostProcessFlag
+			status.Message = "Post process scripts failed"
+		}); err != nil {
+			log.Warn(constant.InternalErrorReason, "Failed to update postprocess failed status for %s: %v", nodeIP, err)
+		}
+	}
+	if cmd.Command != nil {
+		phaseutil.LogCommandFailed(*cmd.Command, failedNodes, log, constant.NodesPostProcessNotReadyReason)
+	}
+	log.Warn(constant.NodesPostProcessNotReadyReason, "postprocess failed nodes=%v", failedNodes)
 }
 
 func (e *EnsureNodesPostProcess) createPostProcessCommand(

@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -213,13 +213,13 @@ func isPortInUse(port int) (bool, error) {
 					return true, nil
 				}
 			}
-			return false, fmt.Errorf("failed to check port availability: %v", err)
+			return false, fmt.Errorf("failed to check port availability: %w", err)
 		}
 	}
 
 	// Successfully created listener means port is available
 	if err = listener.Close(); err != nil {
-		return false, fmt.Errorf("failed to close test listener: %v", err)
+		return false, fmt.Errorf("failed to close test listener: %w", err)
 	}
 
 	// Additional check: try to connect to the port to see if something is listening
@@ -254,13 +254,13 @@ func startHealthServer(port int, hc *healthChecker) error {
 
 	// Validate port range
 	if err := validatePort(port); err != nil {
-		return fmt.Errorf("invalid port: %v", err)
+		return fmt.Errorf("invalid port: %w", err)
 	}
 
 	// Check if port is already in use
 	inUse, err := isPortInUse(port)
 	if err != nil {
-		return fmt.Errorf("failed to check port availability: %v", err)
+		return fmt.Errorf("failed to check port availability: %w", err)
 	}
 	if inUse {
 		return fmt.Errorf("port %d is already in use", port)

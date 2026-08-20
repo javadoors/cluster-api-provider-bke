@@ -21,7 +21,6 @@ import (
 	"text/template"
 
 	"github.com/blang/semver/v4"
-	"github.com/pkg/errors"
 	"github.com/shirou/gopsutil/v3/host"
 
 	bkeinit "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/initialize"
@@ -306,14 +305,14 @@ func (k *RunKubeletCommand) ExportKubeletScript(refresh bool) error {
 		return nil
 	}
 	if err := k.validate(); err != nil {
-		return errors.Errorf("validate kubelet command failed: %v", err)
+		return fmt.Errorf("validate kubelet command failed: %w", err)
 	}
 
 	// get current container runtime and command
 	currenContainerRuntime := k.ContainerRuntime
 	cmd, args, err := k.Command()
 	if err != nil {
-		return errors.Errorf("generate %q run kubelet command failed: %v", currenContainerRuntime, err)
+		return fmt.Errorf("generate %q run kubelet command failed: %w", currenContainerRuntime, err)
 	}
 	currentCommand := fmt.Sprintf("%s %s", cmd, strings.Join(args, " "))
 
@@ -324,7 +323,7 @@ func (k *RunKubeletCommand) ExportKubeletScript(refresh bool) error {
 		k.SetContainerRuntime("containerd")
 		cmd, args, err = k.Command()
 		if err != nil {
-			return errors.Errorf("generate %q run kubelet command failed: %v", currenContainerRuntime, err)
+			return fmt.Errorf("generate %q run kubelet command failed: %w", currenContainerRuntime, err)
 		}
 		containerdCommand = fmt.Sprintf("%s %s", cmd, strings.Join(args, " "))
 	} else {
@@ -332,7 +331,7 @@ func (k *RunKubeletCommand) ExportKubeletScript(refresh bool) error {
 		k.SetContainerRuntime("docker")
 		cmd, args, err = k.Command()
 		if err != nil {
-			return errors.Errorf("generate %q run kubelet command failed: %v", currenContainerRuntime, err)
+			return fmt.Errorf("generate %q run kubelet command failed: %w", currenContainerRuntime, err)
 		}
 		dockerCommand = fmt.Sprintf("%s %s", cmd, strings.Join(args, " "))
 	}
@@ -344,16 +343,16 @@ func (k *RunKubeletCommand) ExportKubeletScript(refresh bool) error {
 	}
 	if !utils.Exists(utils.KubernetesDir) {
 		if err := os.MkdirAll(utils.KubernetesDir, RwxRxRx); err != nil {
-			return errors.Errorf("create %q directory failed: %v", utils.KubernetesDir, err)
+			return fmt.Errorf("create %q directory failed: %w", utils.KubernetesDir, err)
 		}
 	}
 	writer, err := os.OpenFile(utils.GetKubeletScriptPath(), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, RwxRxRx)
 	defer writer.Close()
 	if err != nil {
-		return errors.Errorf("open kubelet script file failed: %v", err)
+		return fmt.Errorf("open kubelet script file failed: %w", err)
 	}
 	if err := t.Execute(writer, param); err != nil {
-		return errors.Errorf("execute kubelet script template failed: %v", err)
+		return fmt.Errorf("execute kubelet script template failed: %w", err)
 	}
 	return nil
 }

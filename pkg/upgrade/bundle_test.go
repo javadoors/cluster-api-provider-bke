@@ -2,7 +2,7 @@
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -50,6 +50,68 @@ func TestEnrichUpgradeComponentPreservesExistingInline(t *testing.T) {
 	}, bundle)
 	if comp.Inline != inline {
 		t.Fatal("expected existing inline configuration to be preserved")
+	}
+}
+
+func TestEnrichUpgradeComponentYAMLHasNoInline(t *testing.T) {
+	bundle := &releasemanifest.Bundle{
+		Components: map[string]cvv1alpha1.ComponentVersion{
+			releasemanifest.ComponentKey("coredns", "v1.0.0"): {
+				Spec: cvv1alpha1.ComponentVersionSpec{
+					Name:    "coredns",
+					Version: "v1.0.0",
+					Type:    cvv1alpha1.ComponentTypeYAML,
+				},
+			},
+		},
+	}
+	comp := enrichUpgradeComponent(cvv1alpha1.ReleaseImageUpgradeComponent{
+		Name: "coredns", Version: "v1.0.0",
+	}, bundle)
+	if comp.Inline != nil {
+		t.Fatalf("yaml component should not get inline: %+v", comp.Inline)
+	}
+}
+
+func TestBuildDAGFromBundle_EnrichesInlineWithoutNodeType(t *testing.T) {
+	const ver = "v1.0.0"
+	bundle := &releasemanifest.Bundle{
+		Release: cvv1alpha1.ReleaseImage{
+			Spec: cvv1alpha1.ReleaseImageSpec{
+				Upgrade: &cvv1alpha1.ReleaseImageUpgradeSpec{
+					Components: []cvv1alpha1.ReleaseImageUpgradeComponent{
+						{Name: "coredns", Version: ver},
+						{Name: ComponentEtcd, Version: ver},
+					},
+				},
+			},
+		},
+		Components: map[string]cvv1alpha1.ComponentVersion{
+			releasemanifest.ComponentKey("coredns", ver): {
+				Spec: cvv1alpha1.ComponentVersionSpec{
+					Name: "coredns", Version: ver, Type: cvv1alpha1.ComponentTypeYAML,
+				},
+			},
+			releasemanifest.ComponentKey(ComponentEtcd, ver): {
+				Spec: cvv1alpha1.ComponentVersionSpec{
+					Name: ComponentEtcd, Version: ver, Type: cvv1alpha1.ComponentTypeInline,
+					Inline: &cvv1alpha1.InlineSpec{Handler: InlineHandlerEtcdUpgrade, Version: ver},
+				},
+			},
+		},
+	}
+
+	dag, err := BuildDAGFromBundle(bundle, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	coredns, ok := dag.GetNode("coredns")
+	if !ok || coredns.Inline != nil {
+		t.Fatalf("coredns should have no inline: ok=%v node=%+v", ok, coredns)
+	}
+	etcd, ok := dag.GetNode(ComponentEtcd)
+	if !ok || etcd.Inline == nil || etcd.Inline.Handler != InlineHandlerEtcdUpgrade {
+		t.Fatalf("etcd inline should be enriched: ok=%v node=%+v", ok, etcd)
 	}
 }
 

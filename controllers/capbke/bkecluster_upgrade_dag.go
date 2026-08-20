@@ -2,7 +2,7 @@
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -21,6 +21,7 @@ import (
 	"github.com/pkg/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -32,116 +33,116 @@ import (
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/componentfactory"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/dagexec"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/featuregate"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/kube"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/manifest"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/mergecluster"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phases"
 	releasemanifest "gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/release/manifest"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/statusmanage"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/topology"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/upgrade"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/yamlinstaller"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/annotation"
 )
 
 const releaseImageRequeueInterval = 30 * time.Second
 
 // executeUpgradeDAG runs declarative upgrade components in topological order.
+// The bool is true only when the hop completed successfully (completeDeclarativeUpgrade).
 func (r *BKEClusterReconciler) executeUpgradeDAG(
 	ctx context.Context,
 	phaseCtx *phaseframe.PhaseContext,
 	oldCluster, newCluster *bkev1beta1.BKECluster,
 	bkeLogger *bkev1beta1.BKELogger,
-) (ctrl.Result, error) {
+) (bool, ctrl.Result, error) {
 	hopTarget, err := r.declarativeUpgradeTargetVersion(newCluster)
 	if err != nil {
-		return ctrl.Result{}, err
+		return false, ctrl.Result{}, err
 	}
 
 	bundle, releaseImage, err := r.resolveUpgradeBundle(ctx, newCluster, hopTarget)
 	if err != nil {
 		if isReleaseImageNotReady(err) {
-			bkeLogger.Info("waiting for release image", "reason", err.Error())
-			return ctrl.Result{RequeueAfter: releaseImageRequeueInterval}, nil
+			bkeLogger.Info("waiting for release image", "reason: %s", err.Error())
+			return false, ctrl.Result{RequeueAfter: releaseImageRequeueInterval}, nil
 		}
-		return ctrl.Result{}, err
+		return false, ctrl.Result{}, err
 	}
 
 	currentBundle, _ := r.resolveCurrentReleaseBundle(ctx, newCluster, hopTarget)
 	phaseCtx.BuildAndSetVersionContextFromBundle(bundle, currentBundle)
 	if err := phaseCtx.SyncUpgradeTargetsToClusterSpec(); err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "sync upgrade targets to cluster spec")
+		return false, ctrl.Result{}, errors.Wrap(err, "sync upgrade targets to cluster spec")
 	}
 	if err := r.patchClusterOpenFuyaoVersionSpecBeforeDAG(newCluster, hopTarget); err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "sync openFuyaoVersion to cluster spec before DAG")
+		return false, ctrl.Result{}, errors.Wrap(err, "sync openFuyaoVersion to cluster spec before DAG")
 	}
 	if err := phaseCtx.RefreshCtxBKECluster(); err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "refresh phase context after openFuyaoVersion spec sync")
+		return false, ctrl.Result{}, errors.Wrap(err, "refresh phase context after openFuyaoVersion spec sync")
 	}
 
 	dag, err := upgrade.BuildDAGFromBundle(bundle, upgrade.BundleDependencyResolver(bundle))
 	if err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "build upgrade DAG")
+		return false, ctrl.Result{}, errors.Wrap(err, "build upgrade DAG")
 	}
 
 	bkeLogger.Info("declarative upgrade",
-		"hopTarget", hopTarget,
-		"releaseImage", releaseImage.Name,
-		"phase", releaseImage.Status.Phase,
-		"components", len(dag.NodeNames()),
-		"source", bundle.Source,
+		"hopTarget=%s releaseImage=%s phase=%s components=%d source=%s",
+		hopTarget, releaseImage.Name, releaseImage.Status.Phase, len(dag.NodeNames()), bundle.Source,
 	)
 
 	if err := r.patchClusterStatus(newCluster, bkev1beta1.ClusterUpgrading); err != nil {
-		return ctrl.Result{}, err
+		return false, ctrl.Result{}, err
 	}
 
 	if err := r.ensureDeclarativeUpgradeProgress(newCluster, hopTarget); err != nil {
-		return ctrl.Result{}, err
+		return false, ctrl.Result{}, err
 	}
 
 	factory, err := componentfactory.NewFactoryFromBundle(bundle)
 	if err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "build component factory from release bundle")
+		return false, ctrl.Result{}, errors.Wrap(err, "build component factory from release bundle")
 	}
 
-	sched := dagexec.NewScheduler(dagexec.Config{
-		InlineRunner:          &componentfactory.PhaseRunner{Factory: factory},
-		ManifestStore:         manifest.NewBundleStore(bundle),
-		ManifestApplier:       r.buildManifestApplier(ctx, phaseCtx, newCluster, bkeLogger),
-		MaxParallelPerBatch:   0, // 0 = dagexec.defaultMaxParallelPerBatch (8)
-	})
-
-	if err := sched.ExecuteDAG(ctx, phaseCtx, oldCluster, newCluster, dag); err != nil {
-		_ = r.patchClusterStatus(newCluster, bkev1beta1.ClusterUpgradeFailed)
-		if res, requeue := dagexec.RequeueAwareError(err); requeue {
-			return res, err
-		}
-		return ctrl.Result{}, err
+	bundleStore := manifest.NewBundleStore(bundle)
+	applier := r.buildManifestApplier(ctx, phaseCtx, newCluster, bkeLogger)
+	yamlExec := &yamlinstaller.YamlComponentExecutor{
+		Installer: yamlinstaller.NewYamlInstaller(yamlinstaller.YamlInstallerConfig{
+			Store:   bundleStore,
+			Applier: applier,
+			Logger:  bkeLogger,
+		}),
+		CVStore: bundleStore,
 	}
+	sched := dagexec.NewScheduler(r.buildDAGSchedulerConfig(newCluster, dagexec.Config{
+		InlineRunner:        NewInlinePhaseRunnerAdapter(phaseCtx, &componentfactory.PhaseRunner{Factory: factory}),
+		ManifestStore:       bundleStore,
+		CVStore:             bundleStore,
+		ManifestApplier:     applier,
+		YamlExecutor:        yamlExec,
+		MaxParallelPerBatch: 0, // 0 = dagexec.defaultMaxParallelPerBatch (8)
+	}))
 
-	if err := r.syncDeclarativeUpgradeStatusFromAPI(ctx, newCluster); err != nil {
-		return ctrl.Result{}, errors.Wrap(err, "refresh declarative upgrade status after DAG")
-	}
-
-	if err := r.completeDeclarativeUpgrade(ctx, newCluster); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	return ctrl.Result{}, nil
-}
-
-// syncDeclarativeUpgradeStatusFromAPI refreshes in-memory DeclarativeUpgrade from the API object.
-func (r *BKEClusterReconciler) syncDeclarativeUpgradeStatusFromAPI(
-	ctx context.Context,
-	bkeCluster *bkev1beta1.BKECluster,
-) error {
-	if bkeCluster == nil {
-		return nil
-	}
-	fresh, err := mergecluster.GetCombinedBKECluster(ctx, r.Client, bkeCluster.Namespace, bkeCluster.Name)
+	targetClient, err := r.targetClusterClientForDAG(ctx, newCluster)
 	if err != nil {
-		return err
+		return false, ctrl.Result{}, errors.Wrap(err, "get target cluster client for declarative upgrade")
 	}
-	mergecluster.PreserveDeclarativeUpgradeFromFresh(fresh, bkeCluster)
-	return nil
+	execCtx := buildExecutionContext(phaseCtx, oldCluster, newCluster, bkeLogger, targetClient)
+	if err := sched.ExecuteDAG(ctx, execCtx, dag); err != nil {
+		if handleErr := r.handleDeclarativeUpgradeDAGFailure(ctx, newCluster, err); handleErr != nil {
+			return false, ctrl.Result{}, handleErr
+		}
+		return false, ctrl.Result{}, nil
+	}
+
+	// Do not re-GET DeclarativeUpgrade from the informer cache here: DAG Status patches already
+	// synced Completed into newCluster memory, and a stale cache read would drop the last batch.
+	if err := r.completeDeclarativeUpgrade(ctx, newCluster); err != nil {
+		return false, ctrl.Result{}, err
+	}
+
+	return true, ctrl.Result{}, nil
 }
 
 func (r *BKEClusterReconciler) ensureDeclarativeUpgradeProgress(bkeCluster *bkev1beta1.BKECluster, targetVersion string) error {
@@ -278,6 +279,27 @@ func (r *BKEClusterReconciler) releaseStore() *releasemanifest.Store {
 	return releasemanifest.NewStore(releasemanifest.ReleaseCacheDir(), nil, nil)
 }
 
+// targetClusterClientForDAG returns the workload-cluster clientset used by YamlInstaller
+// HealthCheck (ExecutionContext.TargetClient). Apply itself still uses ClusterApplier's
+// remote client; this wiring is required so enabled healthCheck does not fail with
+// "health check requires target client".
+func (r *BKEClusterReconciler) targetClusterClientForDAG(
+	ctx context.Context,
+	bkeCluster *bkev1beta1.BKECluster,
+) (kubernetes.Interface, error) {
+	if r == nil || r.Client == nil || bkeCluster == nil {
+		return nil, fmt.Errorf("reconciler client and bke cluster are required")
+	}
+	cs, _, err := kube.GetTargetClusterClient(ctx, r.Client, bkeCluster)
+	if err != nil {
+		return nil, err
+	}
+	if cs == nil {
+		return nil, fmt.Errorf("target cluster clientset is nil")
+	}
+	return cs, nil
+}
+
 func (r *BKEClusterReconciler) buildManifestApplier(
 	ctx context.Context,
 	phaseCtx *phaseframe.PhaseContext,
@@ -308,7 +330,86 @@ func (r *BKEClusterReconciler) patchClusterStatus(
 ) error {
 	return mergecluster.SyncStatusUntilComplete(r.Client, bkeCluster, func(bc *bkev1beta1.BKECluster) {
 		bc.Status.ClusterStatus = status
+		if status == bkev1beta1.ClusterUpgrading {
+			bc.Status.ClusterHealthState = bkev1beta1.Upgrading
+			annotation.SetAnnotation(bc, annotation.StatusRecordAnnotationKey, "")
+		}
 	})
+}
+
+// handleDeclarativeUpgradeDAGFailure records DAG failure, retries via StatusManager
+// (ALLOWED_FAILED_COUNT), and aborts the hop when the retry budget is exhausted.
+func (r *BKEClusterReconciler) handleDeclarativeUpgradeDAGFailure(
+	ctx context.Context,
+	bkeCluster *bkev1beta1.BKECluster,
+	dagErr error,
+) error {
+	if bkeCluster == nil {
+		return nil
+	}
+	if err := mergecluster.SyncStatusUntilComplete(r.Client, bkeCluster, func(bc *bkev1beta1.BKECluster) {
+		bc.Status.ClusterStatus = bkev1beta1.ClusterUpgradeFailed
+		if bc.Status.ClusterHealthState != bkev1beta1.Upgrading {
+			bc.Status.ClusterHealthState = bkev1beta1.Upgrading
+		}
+		annotation.SetAnnotation(bc, annotation.StatusRecordAnnotationKey, "")
+		if dagErr != nil && bc.Status.DeclarativeUpgrade != nil {
+			bc.Status.DeclarativeUpgrade.LastError = dagErr.Error()
+		}
+	}); err != nil {
+		return err
+	}
+
+	if statusmanage.BKEClusterStatusManager.GetCtrlResult(bkeCluster).Requeue {
+		return nil
+	}
+	return r.abortDeclarativeUpgrade(ctx, bkeCluster, dagErr)
+}
+
+// abortDeclarativeUpgrade stops retrying a declarative upgrade hop after retries are exhausted.
+func (r *BKEClusterReconciler) abortDeclarativeUpgrade(
+	ctx context.Context,
+	bkeCluster *bkev1beta1.BKECluster,
+	cause error,
+) error {
+	if bkeCluster == nil {
+		return nil
+	}
+
+	hopTarget, _ := r.declarativeUpgradeTargetVersion(bkeCluster)
+
+	_ = mergecluster.SyncStatusUntilComplete(r.Client, bkeCluster, func(bc *bkev1beta1.BKECluster) {
+		bc.Status.ClusterStatus = bkev1beta1.ClusterUpgradeFailed
+		bc.Status.ClusterHealthState = bkev1beta1.UpgradeFailed
+		if cause != nil && bc.Status.DeclarativeUpgrade != nil {
+			bc.Status.DeclarativeUpgrade.LastError = cause.Error()
+		}
+	})
+
+	orig := bkeCluster.DeepCopy()
+	ann := bkeCluster.GetAnnotations()
+	if ann == nil {
+		ann = make(map[string]string)
+	}
+	delete(ann, featuregate.UpgradeReadyAnnotationKey)
+	delete(ann, clusterversion.AnnotationUpgradePath)
+	delete(ann, clusterversion.AnnotationClusterVersion)
+	bkeCluster.SetAnnotations(ann)
+	if err := r.Patch(ctx, bkeCluster, client.MergeFrom(orig)); err != nil {
+		return err
+	}
+
+	if hopTarget == "" {
+		return nil
+	}
+	cv, err := clusterversion.GetClusterVersionForBKECluster(ctx, r.Client, bkeCluster)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	return clusterversion.FailUpgradeHop(ctx, r.Client, cv, hopTarget, cause)
 }
 
 func (r *BKEClusterReconciler) patchClusterOpenFuyaoVersionSpecBeforeDAG(
@@ -334,6 +435,8 @@ func isReleaseImageNotReady(err error) bool {
 }
 
 // completeDeclarativeUpgrade clears upgrade-ready and syncs ClusterVersion status per design.
+// DeclarativeUpgrade.Completed is taken from in-memory bkeCluster (authoritative after DAG
+// Status patches), not from an informer re-GET, to avoid dropping the last batch.
 func (r *BKEClusterReconciler) completeDeclarativeUpgrade(
 	ctx context.Context,
 	bkeCluster *bkev1beta1.BKECluster,
@@ -347,17 +450,9 @@ func (r *BKEClusterReconciler) completeDeclarativeUpgrade(
 		return err
 	}
 
-	// Mark finished before clearing upgrade-ready so progress survives provider restart.
-	_ = mergecluster.SyncStatusUntilComplete(r.Client, bkeCluster, func(bc *bkev1beta1.BKECluster) {
-		upgrade.ApplyUpgradeHopToClusterStatus(bc, hopTarget)
-		if bc.Status.DeclarativeUpgrade == nil {
-			return
-		}
-		now := metav1.Now()
-		bc.Status.DeclarativeUpgrade.FinishedAt = &now
-		bc.Status.DeclarativeUpgrade.LastError = ""
-		bc.Status.DeclarativeUpgrade.ClearFailure()
-	})
+	if err := r.persistDeclarativeUpgradeFinished(ctx, bkeCluster, hopTarget); err != nil {
+		return err
+	}
 
 	orig := bkeCluster.DeepCopy()
 	ann := bkeCluster.GetAnnotations()
@@ -379,6 +474,55 @@ func (r *BKEClusterReconciler) completeDeclarativeUpgrade(
 		return err
 	}
 	return clusterversion.CompleteUpgradeHop(ctx, r.Client, cv, hopTarget)
+}
+
+// persistDeclarativeUpgradeFinished writes FinishedAt and hop version status fields.
+// Completed records come from memory (DAG), while ResourceVersion comes from a Get for the patch.
+func (r *BKEClusterReconciler) persistDeclarativeUpgradeFinished(
+	ctx context.Context,
+	bkeCluster *bkev1beta1.BKECluster,
+	hopTarget string,
+) error {
+	if r == nil || r.Client == nil || bkeCluster == nil {
+		return nil
+	}
+
+	progress := bkeCluster.Status.DeclarativeUpgrade.DeepCopy()
+	if progress != nil {
+		now := metav1.Now()
+		progress.FinishedAt = &now
+		progress.LastError = ""
+		progress.ClearFailure()
+	}
+
+	key := client.ObjectKeyFromObject(bkeCluster)
+	current := &bkev1beta1.BKECluster{}
+	if err := r.Get(ctx, key, current); err != nil {
+		return err
+	}
+	orig := current.DeepCopy()
+
+	// Spec on current may lag memory after pre-DAG sync; prefer memory Spec for version status.
+	if bkeCluster.Spec.ClusterConfig != nil {
+		current.Spec.ClusterConfig = bkeCluster.Spec.ClusterConfig.DeepCopy()
+	}
+	upgrade.ApplyUpgradeHopToClusterStatus(current, hopTarget)
+	if progress != nil {
+		current.Status.DeclarativeUpgrade = progress
+	}
+
+	if err := r.Status().Patch(ctx, current, client.MergeFrom(orig)); err != nil {
+		return err
+	}
+
+	bkeCluster.Status.OpenFuyaoVersion = current.Status.OpenFuyaoVersion
+	bkeCluster.Status.KubernetesVersion = current.Status.KubernetesVersion
+	bkeCluster.Status.EtcdVersion = current.Status.EtcdVersion
+	bkeCluster.Status.ContainerdVersion = current.Status.ContainerdVersion
+	if progress != nil {
+		bkeCluster.Status.DeclarativeUpgrade = progress.DeepCopy()
+	}
+	return nil
 }
 
 // declarativeUpgradePhaseName maps a DAG node to a BKECluster phase name for status reporting.

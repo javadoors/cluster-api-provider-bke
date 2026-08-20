@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -15,13 +15,13 @@ package kube
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	apiextv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apiextv1beta1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/client-go/dynamic"
@@ -48,6 +48,17 @@ const (
 	// DefaultRestConfigTimeout represents the default timeout for REST config in seconds
 	DefaultRestConfigTimeout = 10
 )
+
+func init() {
+	// Register apiextensions types with the global scheme during process init to
+	// avoid runtime data races when controllers and recorders are already running.
+	if err := apiextv1.AddToScheme(scheme.Scheme); err != nil {
+		panic(err)
+	}
+	if err := apiextv1beta1.AddToScheme(scheme.Scheme); err != nil {
+		panic(err)
+	}
+}
 
 type RemoteKubeClient interface {
 	// InstallAddon install addon to remote cluster
@@ -81,12 +92,12 @@ type Client struct {
 	ClientSet     *kubernetes.Clientset
 	DynamicClient dynamic.Interface
 	RestConfig    *rest.Config
+	RESTMapper    meta.RESTMapper
+	mapperCache   *perClusterRESTMapper
 	Log           *log.Logger
 	BKELog        *bkev1beta1.BKELogger
 	Ctx           context.Context
 }
-
-var addToScheme sync.Once
 
 // 这里有很多生成client的方法，但是几乎适配了任意场景
 
@@ -117,27 +128,24 @@ func NewRemoteClusterClient(ctx context.Context, c client.Client, bkeCluster *bk
 // NewClientFromRestConfig
 // 从rest.Config生成RemoteKubeClient
 func NewClientFromRestConfig(ctx context.Context, config *rest.Config) (RemoteKubeClient, error) {
-	clientSet, err := kubernetes.NewForConfig(config)
+	clientSet, err := newKubernetesClientForConfig(config)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create cluster clientset")
 	}
-	dynamicClient, err := dynamic.NewForConfig(config)
+	dynamicClient, err := newDynamicClientForConfig(config)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create remote cluster dynamicClient")
 	}
-	addToScheme.Do(func() {
-		if err := apiextv1.AddToScheme(scheme.Scheme); err != nil {
-			// This should never happen.
-			panic(err)
-		}
-		if err := apiextv1beta1.AddToScheme(scheme.Scheme); err != nil {
-			panic(err)
-		}
-	})
+	mapperCache, err := GetDynamicRESTMapper(config)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to create RESTMapper")
+	}
 	return &Client{
 		ClientSet:     clientSet,
 		DynamicClient: dynamicClient,
 		RestConfig:    config,
+		RESTMapper:    mapperCache.RESTMapper(),
+		mapperCache:   mapperCache,
 		Log:           log.With("module", "kube"),
 		Ctx:           ctx,
 	}, nil
@@ -220,7 +228,12 @@ func (c *Client) KubeClient() (*kubernetes.Clientset, dynamic.Interface) {
 
 // SetLogger sets the logger for the Kubernetes client.
 func (c *Client) SetLogger(logger *log.Logger) {
-	c.Log = logger
+	if logger == nil {
+		c.Log = nil
+		return
+	}
+	c.Log = logger.WithCallerSkip(0)
+
 }
 
 // SetBKELogger sets the BKE logger for the Kubernetes client.

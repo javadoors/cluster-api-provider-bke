@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/json"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -33,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/bkeagent/pkiutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/log"
 )
@@ -118,8 +120,7 @@ func (l *CertConfigLoader) getCertConfigMap() (*corev1.ConfigMap, error) {
 			return nil, errors.Errorf("certificate configuration ConfigMap %s/%s not found",
 				CertConfigMapNamespace, CertConfigMapName)
 		}
-		return nil, errors.Errorf("failed to get ConfigMap %s/%s: %v",
-			CertConfigMapNamespace, CertConfigMapName, err)
+		return nil, fmt.Errorf("failed to get ConfigMap %s/%s: %w", CertConfigMapNamespace, CertConfigMapName, err)
 	}
 
 	return configMap, nil
@@ -671,21 +672,28 @@ func (l *CertConfigLoader) buildConfigMapData(cfg *CertConfigData) map[string]st
 // upsertCertConfigMap creates or updates the certificate configuration ConfigMap
 func (l *CertConfigLoader) upsertCertConfigMap(data map[string]string) error {
 	cm := &corev1.ConfigMap{}
-	err := l.client.Get(l.ctx, types.NamespacedName{Namespace: CertConfigMapNamespace, Name: CertConfigMapName}, cm)
-	if err != nil {
+	var getErr bool
+	if err := phaseutil.RetryOnConflict(func() error {
+		if err := l.client.Get(l.ctx, types.NamespacedName{Namespace: CertConfigMapNamespace, Name: CertConfigMapName}, cm); err != nil {
+			getErr = true
+			return err
+		}
+		getErr = false
+		if cm.Data == nil {
+			cm.Data = map[string]string{}
+		}
+		for k, v := range data {
+			cm.Data[k] = v
+		}
+		return l.client.Update(l.ctx, cm)
+	}); err != nil {
 		if apierrors.IsNotFound(err) {
 			return l.createCertConfigMap(data)
 		}
-		return errors.Errorf("failed to get ConfigMap %s/%s: %v", CertConfigMapNamespace, CertConfigMapName, err)
-	}
-	if cm.Data == nil {
-		cm.Data = map[string]string{}
-	}
-	for k, v := range data {
-		cm.Data[k] = v
-	}
-	if err := l.client.Update(l.ctx, cm); err != nil {
-		return errors.Errorf("failed to update ConfigMap %s/%s: %v", CertConfigMapNamespace, CertConfigMapName, err)
+		if getErr {
+			return fmt.Errorf("failed to get ConfigMap %s/%s: %w", CertConfigMapNamespace, CertConfigMapName, err)
+		}
+		return fmt.Errorf("failed to update ConfigMap %s/%s: %w", CertConfigMapNamespace, CertConfigMapName, err)
 	}
 	l.log.Infof("Updated certificate configuration ConfigMap %s/%s", CertConfigMapNamespace, CertConfigMapName)
 	return nil
@@ -709,7 +717,7 @@ func (l *CertConfigLoader) createCertConfigMap(data map[string]string) error {
 		}
 	}
 	if err := l.client.Create(l.ctx, cm); err != nil {
-		return errors.Errorf("failed to create ConfigMap %s/%s: %v", CertConfigMapNamespace, CertConfigMapName, err)
+		return fmt.Errorf("failed to create ConfigMap %s/%s: %w", CertConfigMapNamespace, CertConfigMapName, err)
 	}
 	l.log.Infof("Created certificate configuration ConfigMap %s/%s", CertConfigMapNamespace, CertConfigMapName)
 	return nil

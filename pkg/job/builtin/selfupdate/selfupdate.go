@@ -90,14 +90,12 @@ func (u UpdatePlugin) Execute(commands []string) ([]string, error) {
 
 	if !utils.Exists(utils.AgentScripts) {
 		if err := os.MkdirAll(utils.AgentScripts, RwxRxRx); err != nil {
-			log.Errorf("Failed to create dir %s, err: %v", utils.AgentScripts, err)
 			return nil, err
 		}
 	}
 
 	if !utils.Exists(restartScript) {
 		if err := os.WriteFile(restartScript, []byte(updateScript), RwxRxRx); err != nil {
-			log.Errorf("Failed to create file %s, err: %v", restartScript, err)
 			return nil, err
 		}
 	}

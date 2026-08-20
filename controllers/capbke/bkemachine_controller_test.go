@@ -17,6 +17,7 @@ package capbke
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"testing"
 
 	"github.com/agiledragon/gomonkey/v2"
@@ -1162,6 +1163,35 @@ func TestReconcileDelete(t *testing.T) {
 }
 
 // --- executeResetCommand ---
+
+func TestBuildResetExtraCleanupArgs(t *testing.T) {
+	rootKubeConfigPath := filepath.Join("/root", ".kube", "config")
+	userKubeConfigPath := filepath.Join("/home", "workeruser", ".kube", "config")
+
+	t.Run("non-root user appends both user and root kubeconfig paths", func(t *testing.T) {
+		extra := []string{"10.0.0.1", "10.0.0.2"}
+		node := &confv1beta1.Node{Username: "workeruser"}
+
+		got := buildResetExtraCleanupArgsForNode(node, extra)
+
+		assert.Equal(t, []string{"10.0.0.1", "10.0.0.2", rootKubeConfigPath, userKubeConfigPath}, got)
+		assert.Equal(t, []string{"10.0.0.1", "10.0.0.2"}, extra)
+	})
+
+	t.Run("root user only appends root kubeconfig path", func(t *testing.T) {
+		node := &confv1beta1.Node{Username: "root"}
+
+		got := buildResetExtraCleanupArgsForNode(node, nil)
+
+		assert.Equal(t, []string{rootKubeConfigPath}, got)
+	})
+
+	t.Run("legacy helper still appends base cleanup paths", func(t *testing.T) {
+		got := buildResetExtraCleanupArgs(nil)
+
+		assert.Equal(t, []string{rootKubeConfigPath}, got)
+	})
+}
 
 func TestExecuteResetCommand(t *testing.T) {
 	t.Run("requires command.Reset integration", func(t *testing.T) {

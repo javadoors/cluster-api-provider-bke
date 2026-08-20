@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -32,6 +32,7 @@ import (
 	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
 	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/statusmanage"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils"
 	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/annotation"
@@ -866,10 +867,19 @@ func UpdateModifiedBKENodes(ctx context.Context, c client.Client, bkeNodes v1bet
 
 	for i := range modifiedNodes {
 		node := &modifiedNodes[i]
-		// Clear the record flag before updating
-		node.Status.StateCode &= ^v1beta1.NodeStateNeedRecord
-
-		if err := c.Status().Update(ctx, node); err != nil {
+		err := phaseutil.RetryOnConflict(func() error {
+			latestBKENode := &confv1beta1.BKENode{}
+			if err := c.Get(ctx, client.ObjectKey{Name: node.Name, Namespace: node.Namespace}, latestBKENode); err != nil {
+				return err
+			}
+			// Copy in-memory modifications to the API-fetched object
+			latestBKENode.Status.State = node.Status.State
+			latestBKENode.Status.Message = node.Status.Message
+			latestBKENode.Status.StateCode = node.Status.StateCode
+			latestBKENode.Status.StateCode &= ^v1beta1.NodeStateNeedRecord
+			return c.Status().Update(ctx, latestBKENode)
+		})
+		if err != nil {
 			if apierrors.IsNotFound(err) {
 				continue
 			}

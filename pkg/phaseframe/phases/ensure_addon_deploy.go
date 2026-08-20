@@ -2,7 +2,7 @@
  * Copyright (c) 2025 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -131,6 +131,9 @@ func (e *EnsureAddonDeploy) NeedExecute(old *bkev1beta1.BKECluster, new *bkev1be
 	if !hasNodes && new.Spec.ClusterConfig != nil {
 		return new.Spec.ClusterConfig.Addons != nil
 	}
+	if new.Spec.ClusterConfig == nil {
+		return false
+	}
 
 	_, ok := bkeaddon.CompareBKEConfigAddon(new.Status.AddonStatus, new.Spec.ClusterConfig.Addons)
 	if !ok {
@@ -197,8 +200,7 @@ type ProcessAddonResult struct {
 func (e *EnsureAddonDeploy) processAddon(params ProcessAddonParams) ProcessAddonResult {
 	if params.AddonT.Operate == bkeaddon.CreateAddon {
 		if err := e.addonBeforeCreateCustomOperate(params.AddonT.Addon); err != nil {
-			params.Log.Error(constant.AddonDeployFailedReason, "addon %q before create custom operate failed: %s", params.AddonT.Addon.Name, err.Error())
-			return ProcessAddonResult{Error: err, Continue: false}
+			return ProcessAddonResult{Error: fmt.Errorf("addon %q before create custom operate failed: %w", params.AddonT.Addon.Name, err), Continue: false}
 		}
 	}
 
@@ -207,8 +209,7 @@ func (e *EnsureAddonDeploy) processAddon(params ProcessAddonParams) ProcessAddon
 	// Get nodes for addon installation
 	bkeNodes, err := params.Ctx.GetNodes()
 	if err != nil {
-		params.Log.Error(constant.AddonDeployFailedReason, "failed to get nodes for addon %q: %s", params.AddonT.Addon.Name, err.Error())
-		return ProcessAddonResult{Error: err, Continue: false}
+		return ProcessAddonResult{Error: fmt.Errorf("failed to get nodes for addon %q: %w", params.AddonT.Addon.Name, err), Continue: false}
 	}
 
 	addonRecorder := kube.NewAddonRecorder(params.AddonT)
@@ -225,8 +226,7 @@ func (e *EnsureAddonDeploy) processAddon(params ProcessAddonParams) ProcessAddon
 		condition.AddonConditionMark(newestBkeCluster, confv1beta1.ClusterConditionType(params.AddonT.Addon.Name), confv1beta1.ConditionFalse, "ReconcileAddonError", errInfo, params.AddonT.Addon.Name)
 
 		if params.AddonT.Addon.Block {
-			params.Log.Error(constant.AddonDeployFailedReason, "%s %q failed: %s", params.AddonT.Operate, params.AddonT.Addon.Name, operateErr.Error())
-			return ProcessAddonResult{Error: operateErr, Continue: false}
+			return ProcessAddonResult{Error: fmt.Errorf("%s %q failed: %w", params.AddonT.Operate, params.AddonT.Addon.Name, operateErr), Continue: false}
 		} else {
 			params.Log.Warn(constant.AddonDeployFailedReason, "%s %q failed (ignore): %s", params.AddonT.Operate, params.AddonT.Addon.Name, operateErr.Error())
 			return ProcessAddonResult{NewestBKECluster: newestBkeCluster, Continue: true}
@@ -286,8 +286,7 @@ func (e *EnsureAddonDeploy) updateAddonStatus(params UpdateAddonStatusParams) er
 	}
 
 	if err := mergecluster.SyncStatusUntilComplete(params.Client, params.NewestBKECluster); err != nil {
-		params.Log.Error(constant.AddonDeployFailedReason, "update bkecluster %q Status failed: %s", params.NewestBKECluster.Name, err.Error())
-		return err
+		return fmt.Errorf("update bkecluster %q Status failed: %w", params.NewestBKECluster.Name, err)
 	}
 	err := params.Ctx.RefreshCtxBKECluster()
 	if err != nil {
@@ -358,8 +357,7 @@ func (e *EnsureAddonDeploy) reconcileAddon() error {
 
 	prepareResult.Log.Info(constant.AddonDeployedReason, "%d Addons were reconciled, %d succeeded, %d failed", len(prepareResult.AddonsT), len(prepareResult.AddonsT)-len(errs), len(errs))
 	if len(errs) > 0 {
-		prepareResult.Log.Error(constant.AddonDeployedReason, "reconcile addons failed: %s", errs)
-		return kerrors.NewAggregate(errs)
+		return fmt.Errorf("reconcile addons failed: %w", kerrors.NewAggregate(errs))
 	}
 	condition.ConditionMark(prepareResult.BKECluster, bkev1beta1.ClusterAddonCondition, confv1beta1.ConditionTrue, "", "")
 
@@ -386,12 +384,10 @@ func (e *EnsureAddonDeploy) addonBeforeCreateCustomOperate(addon *confv1beta1.Pr
 
 func (e *EnsureAddonDeploy) handleEtcdBackup(addon *confv1beta1.Product) error {
 	if err := e.createEtcdBackupDir(addon.Param["backupDir"]); err != nil {
-		e.Ctx.Log.Error("DeployAddonError", "create etcdbackup dir failed: %s", err.Error())
-		return err
+		return fmt.Errorf("create etcdbackup dir failed: %w", err)
 	}
 	if err := e.createEtcdCertSecret(); err != nil {
-		e.Ctx.Log.Error("DeployAddonError", "create etcd cert secret for addon etcdbackup failed: %s", err.Error())
-		return err
+		return fmt.Errorf("create etcd cert secret for addon etcdbackup failed: %w", err)
 	}
 	return nil
 }
@@ -403,45 +399,39 @@ func (e *EnsureAddonDeploy) handleBeyondELB() error {
 		return nil
 	}
 	if err := e.createBeyondELBVIP(vip, lbNodes); err != nil {
-		e.Ctx.Log.Error("DeployAddonError", "create beyondELB VIP failed: %s", err.Error())
-		return err
+		return fmt.Errorf("create beyondELB VIP failed: %w", err)
 	}
 	if err := e.labelNodesForELB(lbNodes); err != nil {
-		e.Ctx.Log.Error("DeployAddonError", "label nodes for beyondELB failed: %s", err.Error())
-		return err
+		return fmt.Errorf("label nodes for beyondELB failed: %w", err)
 	}
 	return nil
 }
 
 func (e *EnsureAddonDeploy) handleClusterAPI() error {
 	if err := e.createClusterAPILocalkubeconfigSecret(); err != nil {
-		e.Ctx.Log.Error("DeployAddonError", "create cluster-api local kubeconfig secret failed: %s", err.Error())
-		return err
+		return fmt.Errorf("create cluster-api local kubeconfig secret failed: %w", err)
 	}
 	if err := e.createClusterAPILeastPrivilegeKubeConfigSecret(); err != nil {
-		e.Ctx.Log.Error("DeployAddonError", "create cluster-api least privilege kubeconfig secret failed: %s", err.Error())
-		return err
+		return fmt.Errorf("create cluster-api least privilege kubeconfig secret failed: %w", err)
 	}
 	if err := e.markBKEAgentSwitchPending(); err != nil {
-		e.Ctx.Log.Error("DeployAddonError", "mark bkeagent switch pending failed: %s", err.Error())
-		return err
+		return fmt.Errorf("mark bkeagent switch pending failed: %w", err)
 	}
 	if err := e.createClusterAPIBkeconfigCm(); err != nil {
-		e.Ctx.Log.Error("DeployAddonError", "create cluster-api bke config configmap failed: %s", err.Error())
-		return err
+		return fmt.Errorf("create cluster-api bke config configmap failed: %w", err)
+	}
+	if err := e.createClusterAPIHealthCheckConfigCm(); err != nil {
+		return fmt.Errorf("create cluster-api health check config configmap failed: %w", err)
 	}
 	if err := e.createClusterAPIPatchconfigCm(); err != nil {
-		e.Ctx.Log.Error("DeployAddonError", "create cluster-api patch config configmap failed: %s", err.Error())
-		return err
+		return fmt.Errorf("create cluster-api patch config configmap failed: %w", err)
 	}
 	if err := e.createChartRefToBKECluster(); err != nil {
-		e.Ctx.Log.Error("DeployAddonError", "create chart addon ref to bkecluster failed: %s", err.Error())
-		return err
+		return fmt.Errorf("create chart addon ref to bkecluster failed: %w", err)
 	}
 	return nil
 }
 
-// 存储所有values.yaml到目标集群同名configMap，存储所有chart仓库认证信息到目标集群同名secret
 func (e *EnsureAddonDeploy) createChartRefToBKECluster() error {
 	for _, addon := range e.Ctx.BKECluster.Spec.ClusterConfig.Addons {
 		if addon.Type != bkeaddon.ChartAddon {
@@ -472,14 +462,14 @@ func (e *EnsureAddonDeploy) createChartAddonCMRefToBKECluster(addon confv1beta1.
 	// Get local values.yaml configMap
 	localCM := &corev1.ConfigMap{}
 	if err := c.Get(ctx, client.ObjectKey{Namespace: namespace, Name: addon.ValuesConfigMapRef.Name}, localCM); err != nil {
-		return fmt.Errorf("failed to get local values.yaml configmap: %v", err)
+		return fmt.Errorf("failed to get local values.yaml configmap: %w", err)
 	}
 
 	clSet := e.getClient()
 	// Ensure namespace exists
 	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespace}}
 	if _, err := clSet.CoreV1().Namespaces().Create(ctx, ns, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("failed to create remote ns %s : %v", namespace, err)
+		return fmt.Errorf("failed to create remote ns %s : %w", namespace, err)
 	}
 
 	// Create or update remote configMap
@@ -493,10 +483,18 @@ func (e *EnsureAddonDeploy) createChartAddonCMRefToBKECluster(addon confv1beta1.
 
 	if _, err := clSet.CoreV1().ConfigMaps(namespace).Create(ctx, remoteCM, metav1.CreateOptions{}); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
-			return fmt.Errorf("failed to create remote values.yaml cm: %v", err)
+			return fmt.Errorf("failed to create remote values.yaml cm: %w", err)
 		}
-		if _, err := clSet.CoreV1().ConfigMaps(namespace).Update(ctx, remoteCM, metav1.UpdateOptions{}); err != nil {
-			return fmt.Errorf("failed to update remote values.yaml cm: %v", err)
+		if err := phaseutil.RetryOnConflict(func() error {
+			existingConfigMap, err := clSet.CoreV1().ConfigMaps(namespace).Get(ctx, remoteCM.Name, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			existingConfigMap.Data = remoteCM.Data
+			_, err = clSet.CoreV1().ConfigMaps(namespace).Update(ctx, existingConfigMap, metav1.UpdateOptions{})
+			return err
+		}); err != nil {
+			return fmt.Errorf("failed to update remote values.yaml cm: %w", err)
 		}
 	}
 	return nil
@@ -528,14 +526,14 @@ func (e *EnsureAddonDeploy) createChartRepoSecretRefToBKECluster() error {
 	for _, item := range secrets {
 		localSecret := &corev1.Secret{}
 		if err := c.Get(ctx, client.ObjectKey{Namespace: item[1], Name: item[0]}, localSecret); err != nil {
-			return fmt.Errorf("failed to get local repo secret: %v", err)
+			return fmt.Errorf("failed to get local repo secret: %w", err)
 		}
 
 		clSet := e.getClient()
 		// Ensure namespace exists
 		ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: item[1]}}
 		if _, err := clSet.CoreV1().Namespaces().Create(ctx, ns, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
-			return fmt.Errorf("failed to create remote ns %s : %v", item[1], err)
+			return fmt.Errorf("failed to create remote ns %s : %w", item[1], err)
 		}
 
 		// Create or update remote secret
@@ -549,10 +547,18 @@ func (e *EnsureAddonDeploy) createChartRepoSecretRefToBKECluster() error {
 
 		if _, err := clSet.CoreV1().Secrets(item[1]).Create(ctx, remoteSecret, metav1.CreateOptions{}); err != nil {
 			if !apierrors.IsAlreadyExists(err) {
-				return fmt.Errorf("failed to create remote repo secret: %v", err)
+				return fmt.Errorf("failed to create remote repo secret: %w", err)
 			}
-			if _, err := clSet.CoreV1().Secrets(item[1]).Update(ctx, remoteSecret, metav1.UpdateOptions{}); err != nil {
-				return fmt.Errorf("failed to update remote repo secretm: %v", err)
+			if err := phaseutil.RetryOnConflict(func() error {
+				existingSecret, err := clSet.CoreV1().Secrets(item[1]).Get(ctx, remoteSecret.Name, metav1.GetOptions{})
+				if err != nil {
+					return err
+				}
+				existingSecret.Data = remoteSecret.Data
+				_, err = clSet.CoreV1().Secrets(item[1]).Update(ctx, existingSecret, metav1.UpdateOptions{})
+				return err
+			}); err != nil {
+				return fmt.Errorf("failed to update remote repo secretm: %w", err)
 			}
 		}
 	}
@@ -561,8 +567,7 @@ func (e *EnsureAddonDeploy) createChartRepoSecretRefToBKECluster() error {
 
 func (e *EnsureAddonDeploy) handleGPUManager() error {
 	if err := e.reCreateKubeSchedulerStaticPodYaml(); err != nil {
-		e.Ctx.Log.Error("DeployAddonError", "recreate kube-scheduler static pod yaml failed: %s", err.Error())
-		return err
+		return fmt.Errorf("recreate kube-scheduler static pod yaml failed: %w", err)
 	}
 	return nil
 }
@@ -582,7 +587,7 @@ func (e *EnsureAddonDeploy) addonAfterCreateCustomOperate(addon *confv1beta1.Pro
 
 		username, passwd, err := phaseutil.GenerateDefaultUserInfo(e.remoteDynamicClient, cfg)
 		if err != nil {
-			e.Ctx.Log.Error("NotCreateDefaultUser", err.Error())
+			e.Ctx.Log.Warn("NotCreateDefaultUser", err.Error())
 			return
 		}
 		if len(passwd) == 0 {
@@ -614,14 +619,12 @@ func (e *EnsureAddonDeploy) addControlPlaneLabels() error {
 
 	remoteNodes, err := e.targetClusterClient.ListNodes(nil)
 	if err != nil {
-		e.Ctx.Log.Error("GetNodeLabelFailed", "failed to list nodes before deploy openfuyao-system, err: %v",
-			err)
-		return fmt.Errorf("failed to list nodes before deploy openfuyao-system: %v", err)
+		return fmt.Errorf("failed to list nodes before deploy openfuyao-system: %w", err)
 	}
 
 	allNodes, err := e.Ctx.GetNodes()
 	if err != nil {
-		return fmt.Errorf("failed to get nodes: %v", err)
+		return fmt.Errorf("failed to get nodes: %w", err)
 	}
 	bkeNodes := bkenode.Nodes(allNodes).Master()
 	for _, node := range remoteNodes.Items {
@@ -630,8 +633,15 @@ func (e *EnsureAddonDeploy) addControlPlaneLabels() error {
 				continue
 			}
 			log.Info("BeforeCreateCustomOperate", "label node %s as control-plane", node.GetName())
-			labelhelper.SetMasterRoleLabel(&node)
-			_, err := e.remoteClient.CoreV1().Nodes().Update(ctx, &node, metav1.UpdateOptions{})
+			err = phaseutil.RetryOnConflict(func() error {
+				latestNode, err := e.getClient().CoreV1().Nodes().Get(ctx, node.Name, metav1.GetOptions{})
+				if err != nil {
+					return err
+				}
+				labelhelper.SetMasterRoleLabel(latestNode)
+				_, err = e.getClient().CoreV1().Nodes().Update(ctx, latestNode, metav1.UpdateOptions{})
+				return err
+			})
 			if err != nil {
 				return errors.Errorf("failed to set control-plane label to node %s: %s", node.Name, err.Error())
 			}
@@ -649,7 +659,7 @@ func (e *EnsureAddonDeploy) getClient() kubernetes.Interface {
 }
 
 func (e *EnsureAddonDeploy) distributePatchCM() error {
-	ctx, c, bkeCluster, _, log := e.Ctx.Untie()
+	ctx, c, bkeCluster, _, _ := e.Ctx.Untie()
 	openFuyaoVersion := bkeCluster.Spec.ClusterConfig.Cluster.OpenFuyaoVersion
 	bkeCMKey := fmt.Sprintf("patch.%s", openFuyaoVersion)
 	patchCMKey := fmt.Sprintf("cm.%s", openFuyaoVersion)
@@ -657,7 +667,6 @@ func (e *EnsureAddonDeploy) distributePatchCM() error {
 	// Get local ConfigMap
 	localCM := &corev1.ConfigMap{}
 	if err := c.Get(ctx, constant.GetLocalConfigMapObjectKey(), localCM); err != nil {
-		log.Error(constant.InternalErrorReason, "failed to get local cluster bke-config cm, err: %v", err)
 		return fmt.Errorf("get cm failed: %w", err)
 	}
 	if _, ok := localCM.Data[bkeCMKey]; !ok {
@@ -679,7 +688,7 @@ func (e *EnsureAddonDeploy) distributePatchCM() error {
 	nsName := constant.OpenFuyaoSystemController
 	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: nsName}}
 	if _, err := clSet.CoreV1().Namespaces().Create(ctx, ns, metav1.CreateOptions{}); err != nil && !apierrors.IsAlreadyExists(err) {
-		return errors.Errorf("create remote ns %q failed: %v", nsName, err)
+		return fmt.Errorf("create remote ns %q failed: %w", nsName, err)
 	}
 
 	// Create or update remote ConfigMap
@@ -693,10 +702,18 @@ func (e *EnsureAddonDeploy) distributePatchCM() error {
 
 	if _, err := clSet.CoreV1().ConfigMaps(nsName).Create(ctx, remoteCM, metav1.CreateOptions{}); err != nil {
 		if !apierrors.IsAlreadyExists(err) {
-			return errors.Errorf("create remote cm failed: %v", err)
+			return fmt.Errorf("create remote cm failed: %w", err)
 		}
-		if _, err := clSet.CoreV1().ConfigMaps(nsName).Update(ctx, remoteCM, metav1.UpdateOptions{}); err != nil {
-			return errors.Errorf("update remote cm failed: %v", err)
+		if err := phaseutil.RetryOnConflict(func() error {
+			existingConfigMap, err := clSet.CoreV1().ConfigMaps(nsName).Get(ctx, remoteCM.Name, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			existingConfigMap.Data = remoteCM.Data
+			_, err = clSet.CoreV1().ConfigMaps(nsName).Update(ctx, existingConfigMap, metav1.UpdateOptions{})
+			return err
+		}); err != nil {
+			return fmt.Errorf("update remote cm failed: %w", err)
 		}
 	}
 	return nil
@@ -705,14 +722,12 @@ func (e *EnsureAddonDeploy) distributePatchCM() error {
 func (e *EnsureAddonDeploy) handleOpenFuyaoSystemController() error {
 	err := e.addControlPlaneLabels()
 	if err != nil {
-		e.Ctx.Log.Error("addControlPlaneLabels", "failed to add controller plane labels before deploy openfuyao-system, err: %v", err)
-		return err
+		return fmt.Errorf("failed to add controller plane labels before deploy openfuyao-system: %w", err)
 	}
 	// 下发patch configmap到目标集群
 	err = e.distributePatchCM()
 	if err != nil {
-		e.Ctx.Log.Error("distributePatchCM", "failed to distribute patch cm before deploy openfuyao-system, err: %v", err)
-		return err
+		return fmt.Errorf("failed to distribute patch cm before deploy openfuyao-system: %w", err)
 	}
 	return nil
 }
@@ -722,7 +737,7 @@ func (e *EnsureAddonDeploy) createEtcdBackupDir(dir string) error {
 
 	allNodes, err := e.Ctx.GetNodes()
 	if err != nil {
-		return fmt.Errorf("failed to get nodes: %v", err)
+		return fmt.Errorf("failed to get nodes: %w", err)
 	}
 	bkeNodes := bkenode.Nodes(allNodes)
 
@@ -768,7 +783,7 @@ func (e *EnsureAddonDeploy) createEtcdBackupDir(dir string) error {
 		errInfo := "create-etcd-backup-dir command run failed"
 		commandErrs, err := phaseutil.LogCommandFailed(*createDirCommand.Command, failedNodes, log, "create beyondELB VIP failed")
 		phaseutil.MarkNodeStatusByCommandErrs(ctx, c, bkeCluster, commandErrs)
-		return errors.Errorf("%s, createDirCommand run failed in flow nodes: %v, err: %v", errInfo, strings.Join(failedNodes, ","), err)
+		return fmt.Errorf("%s, createDirCommand run failed in flow nodes: %v, err: %w", errInfo, strings.Join(failedNodes, ","), err)
 	}
 	log.Info("BeforeCreateCustomOperate", "create etcd backup dir to fellow nodes success: %v", successNodes)
 	return nil
@@ -777,7 +792,7 @@ func (e *EnsureAddonDeploy) createEtcdBackupDir(dir string) error {
 func (e *EnsureAddonDeploy) createEtcdCertSecret() error {
 	ctx, c, bkeCluster, _, log := e.Ctx.Untie()
 	// 获取secret
-	_, err := e.remoteClient.CoreV1().Secrets("kube-system").Get(ctx, etcdCertsScretName, metav1.GetOptions{})
+	_, err := e.getClient().CoreV1().Secrets("kube-system").Get(ctx, etcdCertsScretName, metav1.GetOptions{})
 	if err != nil {
 		if !apierrors.IsNotFound(err) {
 			return err
@@ -807,7 +822,7 @@ func (e *EnsureAddonDeploy) createEtcdCertSecret() error {
 				"etcd-key":  etcdClientCertContent.Key,
 			},
 		}
-		_, err = e.remoteClient.CoreV1().Secrets(etcdBackupSecret.Namespace).Create(ctx, etcdBackupSecret, metav1.CreateOptions{})
+		_, err = e.getClient().CoreV1().Secrets(etcdBackupSecret.Namespace).Create(ctx, etcdBackupSecret, metav1.CreateOptions{})
 		if err != nil {
 			return err
 		}
@@ -828,7 +843,7 @@ func (e *EnsureAddonDeploy) createBeyondELBVIP(vip string, lbNodes []string) err
 
 	allNodes, err := e.Ctx.GetNodes()
 	if err != nil {
-		return fmt.Errorf("failed to get nodes: %v", err)
+		return fmt.Errorf("failed to get nodes: %w", err)
 	}
 	ingressNodes := phaseutil.ConvertELBNodesToBKENodes(lbNodes, allNodes)
 	if len(ingressNodes) == 0 {
@@ -872,7 +887,7 @@ func (e *EnsureAddonDeploy) createBeyondELBVIP(vip string, lbNodes []string) err
 		errInfo := "failed to create beyondELB VIP"
 		commandErrs, err := phaseutil.LogCommandFailed(*VIPCommand.Command, failedNodes, log, "create beyondELB VIP failed")
 		phaseutil.MarkNodeStatusByCommandErrs(ctx, c, bkeCluster, commandErrs)
-		return errors.Errorf("%s, VIPCommand run failed in flow nodes: %v, err: %v", errInfo, strings.Join(failedNodes, ","), err)
+		return fmt.Errorf("%s, VIPCommand run failed in flow nodes: %v, err: %w", errInfo, strings.Join(failedNodes, ","), err)
 	}
 
 	log.Info("BeforeCreateCustomOperate", "create beyondELB VIP success")
@@ -933,15 +948,22 @@ func (e *EnsureAddonDeploy) findMatchingNodes(params FindMatchingNodesParams) ([
 type LabelAndSaveNodesParams struct {
 	LabelNodes []corev1.Node
 	Ctx        context.Context
-	Client     *kubernetes.Clientset
+	Client     kubernetes.Interface
 	Log        *bkev1beta1.BKELogger
 }
 
 // labelAndSaveNodes 为节点设置标签并保存
 func (e *EnsureAddonDeploy) labelAndSaveNodes(params LabelAndSaveNodesParams) error {
 	for _, node := range params.LabelNodes {
-		labelhelper.SetLabel(&node, labelhelper.BeyondELBLabelKey, labelhelper.BeyondELBLabelValue)
-		_, err := params.Client.CoreV1().Nodes().Update(params.Ctx, &node, metav1.UpdateOptions{})
+		err := phaseutil.RetryOnConflict(func() error {
+			latestNode, err := params.Client.CoreV1().Nodes().Get(params.Ctx, node.Name, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			labelhelper.SetLabel(latestNode, labelhelper.BeyondELBLabelKey, labelhelper.BeyondELBLabelValue)
+			_, err = params.Client.CoreV1().Nodes().Update(params.Ctx, latestNode, metav1.UpdateOptions{})
+			return err
+		})
 		if err != nil {
 			return errors.Errorf("failed to set beyondELB label to node %s: %s", node.Name, err.Error())
 		}
@@ -977,7 +999,7 @@ func (e *EnsureAddonDeploy) labelNodesForELB(lbNodes []string) error {
 func (e *EnsureAddonDeploy) createClusterAPILocalkubeconfigSecret() error {
 	ctx, c, bkeCluster, _, log := e.Ctx.Untie()
 	// 获取secret
-	_, err := e.remoteClient.CoreV1().Secrets("kube-system").Get(ctx, constant.LocalKubeConfigName, metav1.GetOptions{})
+	_, err := e.getClient().CoreV1().Secrets("kube-system").Get(ctx, constant.LocalKubeConfigName, metav1.GetOptions{})
 	if err != nil {
 		if !apierrors.IsNotFound(err) {
 			return err
@@ -998,7 +1020,7 @@ func (e *EnsureAddonDeploy) createClusterAPILocalkubeconfigSecret() error {
 				"config": kubeconfigContent,
 			},
 		}
-		_, err = e.remoteClient.CoreV1().Secrets(localKubeconfigSecret.Namespace).Create(ctx, localKubeconfigSecret, metav1.CreateOptions{})
+		_, err = e.getClient().CoreV1().Secrets(localKubeconfigSecret.Namespace).Create(ctx, localKubeconfigSecret, metav1.CreateOptions{})
 		if err != nil {
 			return err
 		}
@@ -1023,7 +1045,7 @@ func (e *EnsureAddonDeploy) createClusterAPILeastPrivilegeKubeConfigSecret() err
 		return errors.Wrap(err, "failed to generate least privilege kubeconfig")
 	}
 
-	_, err = e.remoteClient.CoreV1().Secrets(metav1.NamespaceSystem).Get(ctx, constant.LeastPrivilegeKubeConfigName, metav1.GetOptions{})
+	_, err = e.getClient().CoreV1().Secrets(metav1.NamespaceSystem).Get(ctx, constant.LeastPrivilegeKubeConfigName, metav1.GetOptions{})
 	if err == nil {
 		log.Info("BeforeCreateCustomOperate", "least privilege kubeconfig secret already exists in remote cluster")
 		return nil
@@ -1041,7 +1063,7 @@ func (e *EnsureAddonDeploy) createClusterAPILeastPrivilegeKubeConfigSecret() err
 			"config": string(leastPrivilegeKubeConfig),
 		},
 	}
-	_, err = e.remoteClient.CoreV1().Secrets(metav1.NamespaceSystem).Create(ctx, leastPrivilegeKubeConfigSecret, metav1.CreateOptions{})
+	_, err = e.getClient().CoreV1().Secrets(metav1.NamespaceSystem).Create(ctx, leastPrivilegeKubeConfigSecret, metav1.CreateOptions{})
 	if err != nil {
 		return errors.Wrap(err, "failed to create least privilege kubeconfig secret in remote cluster")
 	}
@@ -1054,31 +1076,41 @@ func (e *EnsureAddonDeploy) createClusterAPIBkeconfigCm() error {
 	ctx, c, bkeCluster, _, log := e.Ctx.Untie()
 	config, err := phaseutil.GetRemoteBKEConfigCM(ctx, e.remoteClient)
 	if err != nil {
-		log.Error(constant.InternalErrorReason,
-			"failed to get BKECluster %q remote cluster bke-config cm, err: %v",
+		return fmt.Errorf("failed to get BKECluster %q remote cluster bke-config cm: %w",
 			utils.ClientObjNS(bkeCluster), err)
-		return err
 	}
 	if config == nil {
 		if err = phaseutil.MigrateBKEConfigCM(ctx, c, e.remoteClient); err != nil {
-			log.Error(constant.InternalErrorReason,
-				"failed to migrate BKECluster %q bke-config cm to remote cluster, err: %v",
+			return fmt.Errorf("failed to migrate BKECluster %q bke-config cm to remote cluster: %w",
 				utils.ClientObjNS(bkeCluster), err)
-			return err
 		}
 	}
 	log.Info("BeforeCreateCustomOperate", "create cluster-api bke-config cm for cluster-api success")
 	return nil
 }
 
+func (e *EnsureAddonDeploy) createClusterAPIHealthCheckConfigCm() error {
+	ctx, c, bkeCluster, _, log := e.Ctx.Untie()
+	config, err := phaseutil.GetRemoteHealthCheckConfigCM(ctx, e.remoteClient)
+	if err != nil {
+		return fmt.Errorf("failed to get BKECluster %q remote cluster health-check-config cm: %w",
+			utils.ClientObjNS(bkeCluster), err)
+	}
+	if config == nil {
+		if err = phaseutil.MigrateHealthCheckConfigCM(ctx, c, e.remoteClient); err != nil {
+			return fmt.Errorf("failed to migrate BKECluster %q health-check-config cm to remote cluster: %w",
+				utils.ClientObjNS(bkeCluster), err)
+		}
+	}
+	log.Info("BeforeCreateCustomOperate", "create cluster-api health-check-config cm for cluster-api success")
+	return nil
+}
 func (e *EnsureAddonDeploy) createClusterAPIPatchconfigCm() error {
 	ctx, c, bkeCluster, _, log := e.Ctx.Untie()
 
 	if err := phaseutil.MigratePatchConfigCM(ctx, c, e.remoteClient); err != nil {
-		log.Error(constant.InternalErrorReason,
-			"failed to migrate BKECluster %q patch-config cm to remote cluster, err: %v",
+		return fmt.Errorf("failed to migrate BKECluster %q patch-config cm to remote cluster: %w",
 			utils.ClientObjNS(bkeCluster), err)
-		return err
 	}
 
 	log.Info("BeforeCreateCustomOperate", "create cluster-api bke-config cm for cluster-api success")
@@ -1118,7 +1150,7 @@ func (e *EnsureAddonDeploy) reCreateKubeSchedulerStaticPodYaml() error {
 
 	allNodes, err := e.Ctx.GetNodes()
 	if err != nil {
-		return fmt.Errorf("failed to get nodes: %v", err)
+		return fmt.Errorf("failed to get nodes: %w", err)
 	}
 	bkeNodes := bkenode.Nodes(allNodes)
 
@@ -1168,7 +1200,7 @@ func (e *EnsureAddonDeploy) reCreateKubeSchedulerStaticPodYaml() error {
 		errInfo := "recreate-kube-scheduler-static-pod-yaml command run failed"
 		commandErrs, err := phaseutil.LogCommandFailed(*reCreateCommand.Command, failedNodes, log, "recreate kube-scheduler static pod yaml failed")
 		phaseutil.MarkNodeStatusByCommandErrs(ctx, c, bkeCluster, commandErrs)
-		return errors.Errorf("%s, recreate kube-scheduler static pod yaml command run failed in flow nodes: %v, err: %v", errInfo, strings.Join(failedNodes, ","), err)
+		return fmt.Errorf("%s, recreate kube-scheduler static pod yaml command run failed in flow nodes: %v, err: %w", errInfo, strings.Join(failedNodes, ","), err)
 	}
 	log.Info("BeforeCreateCustomOperate", "recreate kube-scheduler static pod yaml command run success in flow nodes: %v", strings.Join(successNodes, ","))
 	return nil
@@ -1360,7 +1392,7 @@ func (e *EnsureAddonDeploy) saveAddonManifestsPostHook(_ phaseframe.Phase, _ err
 	if e.addonRecorders != nil && len(e.addonRecorders) != 0 {
 		allNodes, err := e.Ctx.GetNodes()
 		if err != nil {
-			return fmt.Errorf("failed to get nodes: %v", err)
+			return fmt.Errorf("failed to get nodes: %w", err)
 		}
 		bkeNodes := bkenode.Nodes(allNodes)
 		for _, recorder := range e.addonRecorders {

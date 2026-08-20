@@ -2,7 +2,7 @@
  * Copyright (c) 2024 Bocloud Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -15,6 +15,7 @@ package capbke
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -69,6 +70,19 @@ const (
 	machineControllerName = "bkemachine"
 	shutdownAgentTimeout  = 10 * time.Second
 )
+
+func buildResetExtraCleanupArgs(extra []string) []string {
+	return buildResetExtraCleanupArgsForNode(nil, extra)
+}
+
+func buildResetExtraCleanupArgsForNode(node *confv1beta1.Node, extra []string) []string {
+	cleanupArgs := append([]string{}, extra...)
+	cleanupArgs = append(cleanupArgs, filepath.Join("/root", ".kube", "config"))
+	if node != nil && node.Username != "" && node.Username != "root" {
+		cleanupArgs = append(cleanupArgs, filepath.Join("/home", node.Username, ".kube", "config"))
+	}
+	return cleanupArgs
+}
 
 // +kubebuilder:rbac:groups=bke.bocloud.com,resources=*,verbs=get;list;watch;create;update;patch;delete;deletecollection
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
@@ -463,6 +477,7 @@ func (r *BKEMachineReconciler) executeResetCommand(params BootstrapReconcilePara
 	if ingressVip != "" && ingressVip != params.BKECluster.Spec.ControlPlaneEndpoint.Host {
 		extra = append(extra, ingressVip)
 	}
+	extra = buildResetExtraCleanupArgsForNode(node, extra)
 
 	v, ok := annotation.HasAnnotation(params.BKECluster, annotation.DeepRestoreNodeAnnotationKey)
 	deepRestore := (ok && v == "true") || !ok
@@ -505,8 +520,12 @@ func (r *BKEMachineReconciler) executeResetCommand(params BootstrapReconcilePara
 	}
 	r.logInfoAndEvent(params.Log, params.BKECluster, constant.WorkerDeletedReason, "reset command completed, remove node %q from cluster %q", node.IP, params.Cluster.Name)
 
-	// 关闭agent
-	return r.shutdownAgent(params, node)
+	// Shutdown agent after reset is best-effort; BKEMachine finalizer must be removed once reset succeeds.
+	if _, err := r.shutdownAgent(params, node); err != nil {
+		params.Log.Warnf("shutdown agent after reset failed (best-effort): %v", err)
+		controllerutil.RemoveFinalizer(params.BKEMachine, bkev1beta1.BKEMachineFinalizer)
+	}
+	return ctrl.Result{}, nil
 }
 
 // shutdownAgent shuts down the agent

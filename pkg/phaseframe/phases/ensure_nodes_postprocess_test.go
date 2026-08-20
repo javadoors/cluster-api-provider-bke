@@ -2,7 +2,7 @@
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  * installer is licensed under Mulan PSL v2.
  * You can use this software according to the terms and conditions of the Mulan PSL v2.
- * You may obtain n copy of Mulan PSL v2 at:
+ * You may obtain a copy of Mulan PSL v2 at:
  *          http://license.coscl.org.cn/MulanPSL2
  * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND,
  * EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
@@ -19,19 +19,20 @@ import (
 	"github.com/agiledragon/gomonkey/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
+	bkev1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
+	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/command"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/condition"
+	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/nodeutil"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-
-	confv1beta1 "gopkg.openfuyao.cn/cluster-api-provider-bke/api/bkecommon/v1beta1"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/api/capbke/v1beta1"
-	bkenode "gopkg.openfuyao.cn/cluster-api-provider-bke/common/cluster/node"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/pkg/phaseframe/phaseutil"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/condition"
-	"gopkg.openfuyao.cn/cluster-api-provider-bke/utils/capbke/nodeutil"
 )
 
 // createBKENodeWithFlagsPostprocess creates a BKENode with the specified flags set
@@ -191,6 +192,43 @@ func TestEnsure_nodes_postprocess_mark_success(t *testing.T) {
 	}, updatedNode)
 	require.NoError(t, err)
 	require.True(t, phaseutil.GetNodeStateFlag(updatedNode, "10.0.0.1", v1beta1.NodePostProcessFlag))
+}
+
+func TestEnsure_nodes_postprocess_handle_failed_nodes(t *testing.T) {
+	InitinitPhaseContextFun()
+
+	bkeCluster := initNewBkeCluster.DeepCopy()
+
+	bkeNode1 := createBKENodeWithFlagsPostprocess(
+		bkeCluster.Namespace, bkeCluster.Name,
+		"10.0.0.1", "node1", []string{bkenode.MasterNodeRole},
+	)
+
+	scheme := runtime.NewScheme()
+	require.NoError(t, v1beta1.AddToScheme(scheme))
+	require.NoError(t, corev1.AddToScheme(scheme))
+
+	fakeClient := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(bkeNode1).
+		WithStatusSubresource(bkeNode1).
+		Build()
+
+	initPhaseContext.BKECluster = bkeCluster
+	initPhaseContext.Client = fakeClient
+
+	e := NewEnsureNodesPostProcess(initPhaseContext).(*EnsureNodesPostProcess)
+
+	e.handleFailedNodes(&command.Custom{}, []string{"node1/10.0.0.1"})
+
+	updatedNode := &confv1beta1.BKENode{}
+	err := fakeClient.Get(context.Background(), client.ObjectKey{
+		Namespace: bkeCluster.Namespace,
+		Name:      "node1",
+	}, updatedNode)
+	require.NoError(t, err)
+	require.Equal(t, v1beta1.NodeInitFailed, updatedNode.Status.State)
+	require.Equal(t, "Post process scripts failed", updatedNode.Status.Message)
 }
 
 func TestEnsure_nodes_postprocess_check_or_run_no_nodes(t *testing.T) {
@@ -611,4 +649,112 @@ func TestEnsureNodesPostProcess_NeedExecute_GetKENodesWithMockB(t *testing.T) {
 	result := e.NeedExecute(&initOldBkeCluster, bkeCluster)
 	// When nodes exist, NeedExecute should return true
 	require.True(t, result)
+}
+
+func nodesPostProcessGapsPhase(t *testing.T) *EnsureNodesPostProcess {
+	t.Helper()
+	cluster := &bkev1beta1.BKECluster{ObjectMeta: metav1.ObjectMeta{Name: "c1", Namespace: "ns"}}
+	ctx := newAdditionalPhaseContext(t, cluster)
+	return &EnsureNodesPostProcess{BasePhase: phaseframe.NewBasePhase(ctx, EnsureNodesPostProcessName)}
+}
+
+// TestNodesPostProcessGapsCheckOrRunPostProcess covers the uncovered branches of
+// CheckOrRunPostProcess: get-nodes error, no-nodes short-circuit, scripts error, success.
+func TestNodesPostProcessGapsCheckOrRunPostProcess(t *testing.T) {
+	t.Run("get_nodes_error_returns_err", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := nodesPostProcessGapsPhase(t)
+		patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapper,
+			func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (bkev1beta1.BKENodes, error) {
+				return nil, assertErr("get nodes failed")
+			})
+		_, err := e.CheckOrRunPostProcess()
+		require.Error(t, err)
+	})
+
+	t.Run("no_nodes_need_postprocess_returns_nil", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := nodesPostProcessGapsPhase(t)
+		patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapper,
+			func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (bkev1beta1.BKENodes, error) {
+				return bkev1beta1.BKENodes{}, nil
+			})
+		patches.ApplyFunc(phaseutil.GetNeedPostProcessNodesWithBKENodes,
+			func(_ *bkev1beta1.BKECluster, _ bkev1beta1.BKENodes) bkenode.Nodes {
+				return bkenode.Nodes{}
+			})
+		_, err := e.CheckOrRunPostProcess()
+		require.NoError(t, err)
+	})
+
+	t.Run("execute_scripts_error_returns_err", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := nodesPostProcessGapsPhase(t)
+		patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapper,
+			func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (bkev1beta1.BKENodes, error) {
+				return bkev1beta1.BKENodes{}, nil
+			})
+		patches.ApplyFunc(phaseutil.GetNeedPostProcessNodesWithBKENodes,
+			func(_ *bkev1beta1.BKECluster, _ bkev1beta1.BKENodes) bkenode.Nodes {
+				return bkenode.Nodes{{IP: "10.0.0.1"}}
+			})
+		patches.ApplyPrivateMethod(e, "executeNodePostProcessScripts", func(_ *EnsureNodesPostProcess) error {
+			return assertErr("exec failed")
+		})
+		_, err := e.CheckOrRunPostProcess()
+		require.Error(t, err)
+	})
+
+	t.Run("success_returns_nil", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := nodesPostProcessGapsPhase(t)
+		patches.ApplyFunc((*nodeutil.NodeFetcher).GetBKENodesWrapper,
+			func(_ *nodeutil.NodeFetcher, _ context.Context, _, _ string) (bkev1beta1.BKENodes, error) {
+				return bkev1beta1.BKENodes{}, nil
+			})
+		patches.ApplyFunc(phaseutil.GetNeedPostProcessNodesWithBKENodes,
+			func(_ *bkev1beta1.BKECluster, _ bkev1beta1.BKENodes) bkenode.Nodes {
+				return bkenode.Nodes{{IP: "10.0.0.1"}}
+			})
+		patches.ApplyPrivateMethod(e, "executeNodePostProcessScripts", func(_ *EnsureNodesPostProcess) error {
+			return nil
+		})
+		_, err := e.CheckOrRunPostProcess()
+		require.NoError(t, err)
+	})
+}
+
+// TestNodesPostProcessGapsExecuteNodePostProcessScripts covers branches of
+// executeNodePostProcessScripts: no-config skip, all-skipped short-circuit, success.
+func TestNodesPostProcessGapsExecuteNodePostProcessScripts(t *testing.T) {
+	t.Run("all_nodes_skipped_no_config_returns_nil", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := nodesPostProcessGapsPhase(t)
+		e.nodes = bkenode.Nodes{{IP: "10.0.0.1"}, {IP: "10.0.0.2"}}
+		// checkPostProcessConfigExists returns false -> all nodes collected as withoutConfig -> skipped
+		patches.ApplyPrivateMethod(e, "checkPostProcessConfigExists",
+			func(_ *EnsureNodesPostProcess, _ context.Context, _ client.Client, _ *bkev1beta1.BKELogger, _ string) bool {
+				return false
+			})
+		patches.ApplyFunc((*nodeutil.NodeFetcher).UpdateNodeStatusByIP,
+			func(_ *nodeutil.NodeFetcher, _ context.Context, _, _, _ string, _ func(*confv1beta1.BKENodeStatus)) error {
+				return nil
+			})
+		err := e.executeNodePostProcessScripts()
+		require.NoError(t, err)
+	})
+
+	t.Run("empty_ip_nodes_skipped", func(t *testing.T) {
+		patches := gomonkey.NewPatches()
+		defer patches.Reset()
+		e := nodesPostProcessGapsPhase(t)
+		e.nodes = bkenode.Nodes{{IP: ""}}
+		err := e.executeNodePostProcessScripts()
+		require.NoError(t, err)
+	})
 }
