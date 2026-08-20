@@ -9,7 +9,6 @@
 | **作者** | openFuyao Team |
 | **创建日期** | 2026-08-20 |
 | **依赖** | KEP-5 声明式升级框架、三层状态机、可观测性设计 |
-| **替代** | kep5-2-precheck-postcheck-design.md (v1) |
 
 ## 1. 摘要
 
@@ -17,41 +16,21 @@
 
 ## 2. 动机
 
-### 2.1 v1 设计问题分析
+### 2.1 现状痛点
 
-v1 设计将预检/后检绑定到 `UpgradePathEdge`：
-
-```yaml
-# v1 设计：预检绑定到 UpgradePathEdge
-spec.paths:
-  - from: "v2.5.0"
-    to: "v2.6.0"
-    preCheck:                    # ← 问题：每条路径都要重复配置
-      - name: "cluster-health"
-        required: true
-      - name: "backup-verification"
-        required: true
-    postCheck:                   # ← 问题：每条路径都要重复配置
-      - name: "component-version"
-        required: true
-```
-
-**问题分析**：
-
-| 问题 | 说明 | 严重程度 | 影响 |
-|------|------|---------|------|
-| **职责混淆** | UpgradePath 定义"哪些版本转换合法"，预检定义"升级前需满足什么条件"，两者职责不同 | 高 | 违反单一职责原则 |
-| **维护成本高** | 100 条升级路径需重复配置相同的预检项（cluster-health、backup-verification 等） | 高 | 配置冗余，易出错 |
-| **关注点分离不清** | UpgradePath 由平台团队管理（OCI 镜像），预检由集群运维管理 | 中 | 管理权限混乱 |
-| **灵活性不足** | 无法按集群/环境定制预检策略（如生产环境需要备份检查，测试环境不需要） | 中 | 无法差异化配置 |
-| **扩展困难** | 新增预检项需修改所有 UpgradePathEdge | 高 | 升级路径镜像需频繁更新 |
+| 问题 | 说明 | 影响 |
+|------|------|------|
+| **缺乏升级前验证** | 升级前无自动化检查，依赖人工确认 | 升级失败率高，故障排查困难 |
+| **升级后无验证** | 升级完成后无自动化健康检查 | 无法及时发现升级导致的隐性故障 |
+| **检查结果不透明** | 无统一的检查报告机制 | 运维人员无法快速定位问题 |
+| **检查项不可扩展** | 检查逻辑硬编码在控制器中 | 新增检查项需修改核心代码 |
 
 ### 2.2 目标
 
 1. **解耦设计**：将检查策略从 UpgradePath 中解耦，引入独立的 `CheckPolicy` CRD
-2. **分层策略**：支持全局默认策略 + 路径特定覆盖
-3. **灵活配置**：支持按集群/环境定制检查策略
-4. **向后兼容**：保留 UpgradePathEdge 的 preCheck/postCheck 字段作为覆盖机制
+2. **灵活配置**：支持按集群/环境定制检查策略（通过 LabelSelector + Priority）
+3. **插件化**：检查项通过注册机制接入，支持动态扩展
+4. **可观测**：检查结果持久化，支持事件记录和 Prometheus 指标
 
 ### 2.3 非目标
 
@@ -67,7 +46,7 @@ spec.paths:
 |------|------|
 | CheckPolicy CRD | 独立的检查策略 CRD 设计 |
 | 检查框架设计 | CheckRunner、CheckRegistry、CheckItem 接口定义 |
-| 策略合并机制 | 全局策略 + 路径覆盖的合并逻辑 |
+| 策略解析机制 | 按集群标签匹配 + 优先级选择 |
 | 预检项设计 | 集群健康、备份验证、资源检查、依赖检查 |
 | 后检项设计 | 版本验证、健康验证、节点验证、应用验证 |
 | 执行引擎 | 并行/串行执行、超时控制、失败策略 |
@@ -77,7 +56,7 @@ spec.paths:
 
 | 约束 | 说明 |
 |------|------|
-| **向后兼容** | 保留 UpgradePathEdge 的 preCheck/postCheck 字段 |
+| **职责单一** | UpgradePath 仅定义版本路径合法性，CheckPolicy 独立管理检查策略 |
 | **插件化** | 检查项通过注册机制接入，不侵入核心控制器 |
 | **幂等性** | 检查项执行必须幂等，可重复执行 |
 | **超时控制** | 单个检查项超时不应阻塞整体升级流程 |
@@ -88,133 +67,93 @@ spec.paths:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                          检查框架整体架构 v2                                  │
+│                          检查框架整体架构                                     │
 └─────────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  CheckPolicy CRD (独立资源)                     ◀──── v2 新增               │
+│  CheckPolicy CRD (独立资源)                                                  │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  全局 CheckPolicy (集群级别)                                         │   │
+│  │  CheckPolicy "default" (全局默认)                                    │   │
 │  │  ┌──────────────────────────────────────────────────────────────┐  │   │
-│  │  │  name: "default"                                              │  │   │
 │  │  │  spec:                                                        │  │   │
-│  │  │    preCheck:         ← 全局预检策略                           │  │   │
+│  │  │    preCheck:                                                  │  │   │
 │  │  │      - name: "cluster-health"                                 │  │   │
 │  │  │        required: true                                         │  │   │
 │  │  │      - name: "backup-verification"                            │  │   │
 │  │  │        required: true                                         │  │   │
 │  │  │      - name: "resource-check"                                 │  │   │
 │  │  │        required: false                                        │  │   │
-│  │  │    postCheck:        ← 全局后检策略                           │  │   │
+│  │  │    postCheck:                                                 │  │   │
 │  │  │      - name: "component-version"                              │  │   │
 │  │  │        required: true                                         │  │   │
 │  │  │      - name: "cluster-health"                                 │  │   │
 │  │  │        required: true                                         │  │   │
 │  │  └──────────────────────────────────────────────────────────────┘  │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      │ 合并
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  UpgradePath CRD (路径特定覆盖)                                              │
+│                                                                             │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  spec.paths:                                                         │   │
-│  │    - from: "v2.5.0"                                                  │   │
-│  │      to: "v2.6.0"                                                    │   │
-│  │      preCheckOverride:        ◀──── 仅覆盖/追加，非完整定义          │   │
-│  │        override: "replace"    # replace / merge / append             │   │
-│  │        checks:                                                       │   │
-│  │          - name: "etcd-version-check"   # 路径特定检查               │   │
-│  │            required: true                                            │   │
-│  │      postCheckOverride:       ◀──── 仅覆盖/追加                      │   │
-│  │        override: "append"                                            │   │
-│  │        checks:                                                       │   │
-│  │          - name: "data-migration-check"                              │   │
-│  │            required: true                                            │   │
+│  │  CheckPolicy "production" (生产环境，priority=10)                    │   │
+│  │  ┌──────────────────────────────────────────────────────────────┐  │   │
+│  │  │  spec:                                                        │  │   │
+│  │  │    selector:                                                  │  │   │
+│  │  │      matchLabels: { environment: production }                 │  │   │
+│  │  │    priority: 10                                               │  │   │
+│  │  │    preCheck:                                                  │  │   │
+│  │  │      - name: "resource-check"                                 │  │   │
+│  │  │        required: true   # 生产环境更严格                        │  │   │
+│  │  │      ...                                                      │  │   │
+│  │  └──────────────────────────────────────────────────────────────┘  │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────────────┘
                                       │
-                                      │ 合并结果
+                                      │ 按标签匹配 + 优先级选择
+                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  CheckPolicyResolver (策略解析器)                                            │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  1. 列出所有 CheckPolicy                                            │   │
+│  │  2. 按 Selector 筛选匹配当前集群的策略                               │   │
+│  │  3. 按 Priority 排序，选择最高优先级的策略                           │   │
+│  │  4. 若无匹配，使用内置默认策略                                       │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      │ 检查项列表
                                       ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │  CheckRunner (执行引擎)                                                      │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  合并策略:                                                           │   │
-│  │  ┌──────────────────────────────────────────────────────────────┐  │   │
-│  │  │  1. 加载全局 CheckPolicy                                     │  │   │
-│  │  │  2. 查找匹配的 UpgradePathEdge                               │  │   │
-│  │  │  3. 根据 override 策略合并:                                  │  │   │
-│  │  │     - replace: 完全替换全局策略                              │  │   │
-│  │  │     - merge: 按 name 合并（路径覆盖全局）                    │  │   │
-│  │  │     - append: 追加到全局策略后                               │  │   │
-│  │  │  4. 执行合并后的检查项列表                                   │  │   │
-│  │  └──────────────────────────────────────────────────────────────┘  │   │
+│  │  1. 按 Mode 分组（Parallel / Sequential）                           │   │
+│  │  2. 评估 Condition 条件表达式                                       │   │
+│  │  3. 并行/串行执行检查项                                             │   │
+│  │  4. 支持超时控制和重试                                              │   │
+│  │  5. 生成 CheckReport                                                │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 4.2 策略合并机制
+### 4.2 与 UpgradePath 的职责分离
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          策略合并流程                                         │
-└─────────────────────────────────────────────────────────────────────────────┘
+| 资源 | 职责 | 管理团队 | 存储方式 |
+|------|------|---------|---------|
+| **UpgradePath** | 定义版本转换合法性（from/to/blocked） | 平台团队 | OCI 镜像 |
+| **CheckPolicy** | 定义升级前后的检查策略 | 集群运维 | K8s CRD |
+| **ReleaseImage** | 定义版本包含的组件清单 | 平台团队 | OCI 镜像 |
 
-全局 CheckPolicy:
-  preCheck: [cluster-health, backup-verification, resource-check]
+三者完全独立，互不耦合：
+- UpgradePath 变更（新增版本路径）不影响检查策略
+- CheckPolicy 变更（调整检查项）不影响版本路径
+- 不同环境（生产/测试）可使用不同的 CheckPolicy，共享相同的 UpgradePath
 
-UpgradePathEdge (v2.5.0 → v2.6.0):
-  preCheckOverride:
-    override: "merge"
-    checks:
-      - name: "etcd-version-check"
-        required: true
-      - name: "cluster-health"        # 覆盖全局的 cluster-health
-        required: false               # 改为非必须
+### 4.3 设计优势
 
-合并结果:
-  preCheck: [etcd-version-check, cluster-health(required=false), 
-             backup-verification, resource-check]
-
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                          override 策略说明                                    │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  replace: 完全替换全局策略                                                   │
-│  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │  全局: [A, B, C]                                                     │   │
-│  │  路径: override=replace, checks=[X, Y]                               │   │
-│  │  结果: [X, Y]                                                        │   │
-│  └──────────────────────────────────────────────────────────────────────┘   │
-│                                                                              │
-│  merge: 按 name 合并，路径覆盖全局同名项                                     │
-│  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │  全局: [A, B, C]                                                     │   │
-│  │  路径: override=merge, checks=[B', X]                                │   │
-│  │  结果: [A, B', C, X]  (B 被 B' 覆盖，X 追加)                        │   │
-│  └──────────────────────────────────────────────────────────────────────┘   │
-│                                                                              │
-│  append: 追加到全局策略后                                                    │
-│  ┌──────────────────────────────────────────────────────────────────────┐   │
-│  │  全局: [A, B, C]                                                     │   │
-│  │  路径: override=append, checks=[X, Y]                                │   │
-│  │  结果: [A, B, C, X, Y]                                               │   │
-│  └──────────────────────────────────────────────────────────────────────┘   │
-│                                                                              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-### 4.3 与 v1 设计对比
-
-| 维度 | v1 设计 | v2 设计 |
-|------|---------|---------|
-| **检查策略定义** | 绑定到 UpgradePathEdge | 独立 CheckPolicy CRD |
-| **配置复用** | 每条路径重复配置 | 全局配置一次，路径可选覆盖 |
-| **职责分离** | UpgradePath 承担路径+检查双重职责 | UpgradePath 只管路径，CheckPolicy 管检查 |
-| **灵活性** | 无法按集群定制 | 支持按集群/环境定制 |
-| **扩展性** | 新增检查项需修改所有路径 | 新增检查项只需修改 CheckPolicy |
-| **向后兼容** | N/A | 保留 UpgradePathEdge.preCheck/postCheck 作为覆盖 |
+| 维度 | 说明 |
+|------|------|
+| **职责分离** | UpgradePath 只管路径合法性，CheckPolicy 只管检查策略 |
+| **配置复用** | 全局配置一次，所有升级路径共享 |
+| **灵活性** | 支持按集群标签/环境定制不同检查策略 |
+| **扩展性** | 新增检查项只需修改 CheckPolicy，无需触碰升级路径 |
+| **独立管理** | 平台团队管理 UpgradePath，运维团队管理 CheckPolicy |
 
 ## 5. 数据结构设计
 
@@ -297,46 +236,7 @@ const (
 )
 ```
 
-### 5.2 UpgradePathEdge 扩展（覆盖机制）
-
-```go
-// api/cvo/v1beta1/upgradepath_types.go
-
-// UpgradePathEdge 升级路径边（扩展）
-type UpgradePathEdge struct {
-    From       string `json:"from"`
-    To         string `json:"to"`
-    Blocked    bool   `json:"blocked,omitempty"`
-    Deprecated bool   `json:"deprecated,omitempty"`
-    Notes      string `json:"notes,omitempty"`
-    
-    // v2 新增：预检覆盖（可选）
-    PreCheckOverride *CheckOverride `json:"preCheckOverride,omitempty"`
-    
-    // v2 新增：后检覆盖（可选）
-    PostCheckOverride *CheckOverride `json:"postCheckOverride,omitempty"`
-    
-    // 保留 v1 字段用于向后兼容（已废弃）
-    // Deprecated: 使用 PreCheckOverride 代替
-    PreCheck []CheckStep `json:"preCheck,omitempty"`
-    // Deprecated: 使用 PostCheckOverride 代替
-    PostCheck []CheckStep `json:"postCheck,omitempty"`
-}
-
-// CheckOverride 检查覆盖配置
-type CheckOverride struct {
-    // 覆盖策略
-    // - replace: 完全替换全局策略
-    // - merge: 按 name 合并（路径覆盖全局同名项）
-    // - append: 追加到全局策略后
-    Override string `json:"override"`
-    
-    // 覆盖/追加的检查项
-    Checks []CheckStep `json:"checks,omitempty"`
-}
-```
-
-### 5.3 CheckResult 和 CheckReport
+### 5.2 CheckResult 和 CheckReport
 
 ```go
 // pkg/check/types.go
@@ -371,7 +271,6 @@ type CheckReport struct {
     FailedCount    int           `json:"failedCount"`
     SkippedCount   int           `json:"skippedCount"`
     PolicyName     string        `json:"policyName,omitempty"`     // 使用的 CheckPolicy 名称
-    OverrideSource string        `json:"overrideSource,omitempty"` // 覆盖来源
     ExecutedAt     metav1.Time   `json:"executedAt,omitempty"`
 }
 
@@ -384,7 +283,7 @@ type ClusterVersionStatus struct {
 }
 ```
 
-### 5.4 CheckItem 接口
+### 5.3 CheckItem 接口
 
 ```go
 // pkg/check/item.go
@@ -450,7 +349,7 @@ func (r *CheckRegistry) Get(name string) (CheckItem, bool) {
 ```go
 // pkg/check/resolver.go
 
-// CheckPolicyResolver 解析并合并检查策略
+// CheckPolicyResolver 解析检查策略
 type CheckPolicyResolver struct {
     client client.Client
 }
@@ -459,36 +358,28 @@ type CheckPolicyResolver struct {
 func (r *CheckPolicyResolver) ResolvePreChecks(
     ctx context.Context,
     cluster *bkev1beta1.BKECluster,
-    edge *cvoapi.UpgradePathEdge,
 ) ([]cvoapi.CheckStep, string, error) {
-    // 1. 获取全局 CheckPolicy
-    globalPolicy, err := r.getGlobalCheckPolicy(ctx, cluster)
+    policy, err := r.getMatchingCheckPolicy(ctx, cluster)
     if err != nil {
-        return nil, "", fmt.Errorf("failed to get global CheckPolicy: %w", err)
+        return nil, "", fmt.Errorf("failed to resolve CheckPolicy: %w", err)
     }
-    
-    globalChecks := globalPolicy.Spec.PreCheck
-    
-    // 2. 检查是否有路径覆盖
-    if edge.PreCheckOverride == nil {
-        return globalChecks, globalPolicy.Name, nil
-    }
-    
-    // 3. 根据覆盖策略合并
-    switch edge.PreCheckOverride.Override {
-    case "replace":
-        return edge.PreCheckOverride.Checks, edge.From + "->" + edge.To, nil
-    case "merge":
-        return mergeChecks(globalChecks, edge.PreCheckOverride.Checks), globalPolicy.Name + "+" + edge.From + "->" + edge.To, nil
-    case "append":
-        return append(globalChecks, edge.PreCheckOverride.Checks...), globalPolicy.Name + "+" + edge.From + "->" + edge.To, nil
-    default:
-        return globalChecks, globalPolicy.Name, nil
-    }
+    return policy.Spec.PreCheck, policy.Name, nil
 }
 
-// getGlobalCheckPolicy 获取全局 CheckPolicy
-func (r *CheckPolicyResolver) getGlobalCheckPolicy(
+// ResolvePostChecks 解析后检策略
+func (r *CheckPolicyResolver) ResolvePostChecks(
+    ctx context.Context,
+    cluster *bkev1beta1.BKECluster,
+) ([]cvoapi.CheckStep, string, error) {
+    policy, err := r.getMatchingCheckPolicy(ctx, cluster)
+    if err != nil {
+        return nil, "", fmt.Errorf("failed to resolve CheckPolicy: %w", err)
+    }
+    return policy.Spec.PostCheck, policy.Name, nil
+}
+
+// getMatchingCheckPolicy 按标签匹配 + 优先级选择 CheckPolicy
+func (r *CheckPolicyResolver) getMatchingCheckPolicy(
     ctx context.Context,
     cluster *bkev1beta1.BKECluster,
 ) (*cvoapi.CheckPolicy, error) {
@@ -508,7 +399,7 @@ func (r *CheckPolicyResolver) getGlobalCheckPolicy(
     }
     
     if len(matchedPolicies) == 0 {
-        // 返回默认策略
+        // 无匹配，返回内置默认策略
         return r.getDefaultCheckPolicy(), nil
     }
     
@@ -520,33 +411,23 @@ func (r *CheckPolicyResolver) getGlobalCheckPolicy(
     return matchedPolicies[0], nil
 }
 
-// mergeChecks 按 name 合并检查项
-func mergeChecks(global, override []cvoapi.CheckStep) []cvoapi.CheckStep {
-    result := make([]cvoapi.CheckStep, len(global))
-    copy(result, global)
-    
-    overrideMap := make(map[string]cvoapi.CheckStep)
-    for _, step := range override {
-        overrideMap[step.Name] = step
+// matchesSelector 检查集群是否匹配选择器
+func matchesSelector(selector *metav1.LabelSelector, cluster *bkev1beta1.BKECluster) bool {
+    if selector == nil {
+        return true // 空选择器匹配所有集群
     }
     
-    // 覆盖同名项
-    for i, step := range result {
-        if override, ok := overrideMap[step.Name]; ok {
-            result[i] = override
-            delete(overrideMap, step.Name)
-        }
+    // 转换 selector
+    sel, err := metav1.LabelSelectorAsSelector(selector)
+    if err != nil {
+        return false
     }
     
-    // 追加新项
-    for _, step := range overrideMap {
-        result = append(result, step)
-    }
-    
-    return result
+    // 检查集群标签是否匹配
+    return sel.Matches(labels.Set(cluster.Labels))
 }
 
-// getDefaultCheckPolicy 返回默认 CheckPolicy
+// getDefaultCheckPolicy 返回内置默认 CheckPolicy
 func (r *CheckPolicyResolver) getDefaultCheckPolicy() *cvoapi.CheckPolicy {
     return &cvoapi.CheckPolicy{
         ObjectMeta: metav1.ObjectMeta{Name: "default"},
@@ -582,18 +463,15 @@ type CheckRunner struct {
 func (r *CheckRunner) RunPreChecks(
     ctx context.Context,
     cluster *bkev1beta1.BKECluster,
-    edge *cvoapi.UpgradePathEdge,
 ) (*CheckReport, error) {
     // 解析策略
-    checks, source, err := r.resolver.ResolvePreChecks(ctx, cluster, edge)
+    checks, policyName, err := r.resolver.ResolvePreChecks(ctx, cluster)
     if err != nil {
         return nil, err
     }
     
-    r.logger.Info("Running pre-checks", 
-        "from", edge.From, 
-        "to", edge.To,
-        "policySource", source,
+    r.logger.Info("Running pre-checks",
+        "policyName", policyName,
         "checkCount", len(checks),
     )
     
@@ -602,7 +480,7 @@ func (r *CheckRunner) RunPreChecks(
         return nil, err
     }
     
-    report.PolicyName = source
+    report.PolicyName = policyName
     return report, nil
 }
 
@@ -610,18 +488,15 @@ func (r *CheckRunner) RunPreChecks(
 func (r *CheckRunner) RunPostChecks(
     ctx context.Context,
     cluster *bkev1beta1.BKECluster,
-    edge *cvoapi.UpgradePathEdge,
 ) (*CheckReport, error) {
-    // 解析策略（类似 RunPreChecks）
-    checks, source, err := r.resolver.ResolvePostChecks(ctx, cluster, edge)
+    // 解析策略
+    checks, policyName, err := r.resolver.ResolvePostChecks(ctx, cluster)
     if err != nil {
         return nil, err
     }
     
     r.logger.Info("Running post-checks",
-        "from", edge.From,
-        "to", edge.To,
-        "policySource", source,
+        "policyName", policyName,
         "checkCount", len(checks),
     )
     
@@ -630,7 +505,7 @@ func (r *CheckRunner) RunPostChecks(
         return nil, err
     }
     
-    report.PolicyName = source
+    report.PolicyName = policyName
     return report, nil
 }
 
@@ -1212,47 +1087,6 @@ spec:
       timeout: "5m"
 ```
 
-### 9.3 UpgradePath 路径覆盖
-
-```yaml
-# 升级路径（仅定义路径特定覆盖）
-apiVersion: cvo.openfuyao.cn/v1beta1
-kind: UpgradePath
-metadata:
-  name: openfuyao-upgrade-paths
-spec:
-  ociRef: "registry/openfuyao-upgradepath:latest"
-  paths:
-    - from: "v2.5.0"
-      to: "v2.6.0"
-      blocked: false
-      # 路径特定覆盖：追加一个数据迁移检查
-      preCheckOverride:
-        override: "append"
-        checks:
-          - name: data-migration-check
-            required: true
-            timeout: "10m"
-            params:
-              migrationType: "schema-v2-to-v3"
-      postCheckOverride:
-        override: "append"
-        checks:
-          - name: data-integrity-check
-            required: true
-            timeout: "5m"
-    
-    - from: "v2.4.0"
-      to: "v2.5.0"
-      blocked: false
-      # 无覆盖，使用全局 CheckPolicy
-    
-    - from: "v2.4.0"
-      to: "v2.6.0"
-      blocked: true
-      notes: "Direct upgrade blocked, please upgrade via v2.5.0"
-```
-
 ## 10. 检查结果报告
 
 ### 10.1 CheckReport 示例
@@ -1264,7 +1098,6 @@ status:
   preCheckReport:
     status: "Passed"
     policyName: "production"           # 使用的 CheckPolicy
-    overrideSource: "production+v2.5.0->v2.6.0"  # 策略来源
     results:
       - name: cluster-health
         status: Passed
@@ -1282,12 +1115,8 @@ status:
         status: Passed
         message: "All 15 components passed compatibility check"
         duration: "3s"
-      - name: data-migration-check
-        status: Passed
-        message: "Data migration check passed"
-        duration: "120s"
-    totalDuration: "185.5s"
-    passedCount: 5
+    totalDuration: "65.5s"
+    passedCount: 4
     failedCount: 0
     skippedCount: 0
     executedAt: "2026-08-20T10:00:00Z"
@@ -1352,7 +1181,7 @@ var (
             Name: "bke_check_policy_resolve_total",
             Help: "Total number of CheckPolicy resolve operations",
         },
-        []string{"policy_name", "override_source"},
+        []string{"policy_name"},
     )
 )
 ```
@@ -1370,14 +1199,8 @@ func (r *ClusterVersionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
     
     // ... 现有逻辑 ...
     
-    // Step 4: 查找升级路径
-    edge, err := r.upgradePathGraph.FindPath(cv.Status.CurrentVersion, cv.Spec.DesiredVersion)
-    if err != nil {
-        return r.updateStatus(ctx, cv, cvoapi.PhaseBlocked, "no valid upgrade path")
-    }
-    
-    // Step 5: 执行预检（使用 CheckPolicyResolver 解析策略）
-    preCheckReport, err := r.checkRunner.RunPreChecks(ctx, cluster, edge)
+    // Step 4: 执行预检（CheckPolicyResolver 自动按集群标签匹配策略）
+    preCheckReport, err := r.checkRunner.RunPreChecks(ctx, cluster)
     if err != nil {
         return r.updateStatus(ctx, cv, cvoapi.PhaseFailed, fmt.Sprintf("pre-check error: %v", err))
     }
@@ -1389,11 +1212,11 @@ func (r *ClusterVersionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
         return r.updateStatus(ctx, cv, cvoapi.PhasePreCheckFailed, "pre-check failed")
     }
     
-    // Step 6: 执行 DAG
+    // Step 5: 执行 DAG
     // ... 现有逻辑 ...
     
-    // Step 7: 执行后检
-    postCheckReport, err := r.checkRunner.RunPostChecks(ctx, cluster, edge)
+    // Step 6: 执行后检
+    postCheckReport, err := r.checkRunner.RunPostChecks(ctx, cluster)
     if err != nil {
         r.Log.Error(err, "post-check failed")
         r.Recorder.Eventf(cv, v1.EventTypeWarning, "PostCheckFailed", "post-check error: %v", err)
@@ -1445,53 +1268,59 @@ func main() {
 
 | 测试场景 | 测试内容 | 预期结果 |
 |---------|---------|---------|
-| CheckPolicyResolver - 全局策略 | 无路径覆盖 | 返回全局 CheckPolicy |
-| CheckPolicyResolver - replace | override=replace | 完全替换全局策略 |
-| CheckPolicyResolver - merge | override=merge | 按 name 合并 |
-| CheckPolicyResolver - append | override=append | 追加到全局策略 |
-| CheckPolicyResolver - 优先级 | 多个 CheckPolicy 匹配 | 返回最高优先级 |
-| CheckPolicyResolver - 选择器 | 集群标签匹配 | 返回匹配的 CheckPolicy |
+| CheckRegistry 注册 | 注册检查项并获取 | 正确返回检查项 |
+| CheckRunner 执行 | 执行单个检查项 | 返回正确的 CheckResult |
+| 并行执行 | 并行执行多个检查项 | 所有检查项并行完成 |
+| 超时控制 | 检查项执行超时 | 返回 Timeout 状态 |
+| 重试机制 | 检查项失败后重试 | 按指定次数重试 |
+| Required 判断 | Required=true 失败 | 整体状态为 Failed |
+| Required 判断 | Required=false 失败 | 整体状态为 Passed |
+| CheckPolicyResolver - 默认策略 | 无 CheckPolicy 资源 | 返回内置默认策略 |
+| CheckPolicyResolver - 标签匹配 | 集群标签匹配 CheckPolicy | 返回匹配的 CheckPolicy |
+| CheckPolicyResolver - 优先级 | 多个 CheckPolicy 匹配 | 返回最高优先级的 |
 
 ### 13.2 集成测试
 
 | 测试场景 | 测试内容 | 预期结果 |
 |---------|---------|---------|
 | 全局策略执行 | 仅配置全局 CheckPolicy | 使用全局策略执行检查 |
-| 路径覆盖执行 | 配置路径覆盖 | 使用合并后策略执行检查 |
 | 环境差异化 | 生产/测试环境不同策略 | 按环境选择正确策略 |
+| 预检失败阻断 | Required=true 预检失败 | 升级被阻断 |
+| 预检告警 | Required=false 预检失败 | 升级继续，记录告警 |
 
 ## 14. 工作量评估
 
 | 阶段 | 任务内容 | 工作量 (人天) |
 |------|---------|-------------|
 | CheckPolicy CRD | CRD 定义、Webhook 验证 | 2 |
-| CheckPolicyResolver | 策略解析、合并逻辑 | 3 |
+| CheckPolicyResolver | 策略解析、标签匹配、优先级选择 | 2 |
 | 检查框架 | CheckRegistry、CheckRunner | 3 |
 | 预检项开发 | 4 个预检项实现 | 6 |
 | 后检项开发 | 4 个后检项实现 | 5 |
 | 集成开发 | ClusterVersionReconciler 集成 | 3 |
 | 可观测性 | Prometheus 指标 | 2 |
 | 测试 | 单元测试、集成测试 | 4 |
-| **总计** | | **28 人天** |
+| **总计** | | **27 人天** |
 
 ## 15. 风险与缓解
 
 | 风险 | 影响 | 缓解措施 |
 |------|------|---------|
-| CheckPolicy 配置错误 | 检查项缺失或错误 | Webhook 验证 CheckPolicy 合法性 |
-| 策略合并逻辑复杂 | 难以预测最终策略 | 日志记录策略来源，支持 dry-run 预览 |
-| 向后兼容问题 | 旧 UpgradePath 无法工作 | 保留 UpgradePathEdge.preCheck/postCheck 字段 |
+| CheckPolicy 配置错误 | 检查项缺失或错误 | Webhook 验证 CheckPolicy 合法性，启动时校验 |
+| 检查项执行超时 | 升级流程阻塞 | 设置合理超时时间，支持跳过非关键检查 |
+| 检查项误报 | 升级被错误阻断 | 支持 Required=false 告警模式，支持手动跳过 |
+| 检查项漏报 | 升级后发现问题 | 后检项覆盖关键组件，支持手动触发重新检查 |
+| 多个 CheckPolicy 冲突 | 选择了错误的策略 | 日志记录策略选择过程，支持 dry-run 预览 |
 
-## 16. 迁移计划
+## 16. 部署步骤
 
-### 16.1 从 v1 迁移到 v2
-
-1. **部署新 CRD**：部署 CheckPolicy CRD，保留 UpgradePath 的 preCheck/postCheck 字段
-2. **创建默认 CheckPolicy**：基于现有 UpgradePath 中的检查项，创建全局 CheckPolicy
-3. **灰度切换**：通过 Feature Gate 控制使用 v1 还是 v2 逻辑
-4. **清理旧字段**：稳定后废弃 UpgradePathEdge.preCheck/postCheck 字段
+1. **部署 CheckPolicy CRD**：注册 CheckPolicy CRD 到管理集群
+2. **创建默认 CheckPolicy**：创建 `name: default` 的全局 CheckPolicy
+3. **注册检查项**：在控制器启动时注册所有内置检查项
+4. **创建环境策略**（可选）：为生产/测试环境创建差异化 CheckPolicy
+5. **启用检查框架**：通过 Feature Gate 启用预检/后检功能
 
 ---
 
-**文档版本**: v2.0  
+**文档版本**: v2.1  
 **维护者**: openFuyao Team
