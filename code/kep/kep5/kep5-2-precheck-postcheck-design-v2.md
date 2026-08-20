@@ -49,7 +49,7 @@
 | 策略解析机制 | 按集群标签匹配 + 优先级选择 |
 | 预检项设计 | 集群健康、备份验证、资源检查、依赖检查 |
 | 后检项设计 | 版本验证、健康验证、节点验证、应用验证 |
-| 执行引擎 | 并行/串行执行、超时控制、失败策略 |
+| 执行引擎 | DAG 依赖图执行、超时控制、失败策略 |
 | 结果报告 | CheckReport 聚合、持久化、事件记录 |
 
 ### 3.2 约束
@@ -123,11 +123,12 @@
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │  CheckRunner (执行引擎)                                                      │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  1. 按 Mode 分组（Parallel / Sequential）                           │   │
-│  │  2. 评估 Condition 条件表达式                                       │   │
-│  │  3. 并行/串行执行检查项                                             │   │
-│  │  4. 支持超时控制和重试                                              │   │
-│  │  5. 生成 CheckReport                                                │   │
+│  │  1. 构建 DAG 依赖图                                                  │   │
+│  │  2. 拓扑排序，检测循环依赖                                            │   │
+│  │  3. 评估 Condition 条件表达式                                       │   │
+│  │  4. 按层级并行执行（同层级无依赖的可并行）                           │   │
+│  │  5. 支持超时控制和重试                                              │   │
+│  │  6. 生成 CheckReport                                                │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -202,8 +203,10 @@ type CheckStep struct {
     // 检查参数（传递给 CheckItem.Execute 的参数）
     Params map[string]string `json:"params,omitempty"`
     
-    // 执行模式：Parallel / Sequential（默认 Sequential）
-    Mode string `json:"mode,omitempty"`
+    // 依赖的检查项列表（DAG 依赖关系）
+    // 当前检查项必须等待所有依赖项执行完成后才能执行
+    // 无依赖的检查项可以并行执行
+    Dependencies []string `json:"dependencies,omitempty"`
     
     // 重试次数（默认 0，不重试）
     RetryCount int `json:"retryCount,omitempty"`
@@ -509,7 +512,7 @@ func (r *CheckRunner) RunPostChecks(
     return report, nil
 }
 
-// runChecks 执行检查项列表
+// runChecks 执行检查项列表（基于 DAG 依赖图）
 func (r *CheckRunner) runChecks(
     ctx context.Context,
     cluster *bkev1beta1.BKECluster,
@@ -524,12 +527,15 @@ func (r *CheckRunner) runChecks(
     
     startTime := time.Now()
     
-    // 按执行模式分组
-    parallelSteps := make([]cvoapi.CheckStep, 0)
-    sequentialSteps := make([]cvoapi.CheckStep, 0)
+    // 1. 构建 DAG 依赖图
+    dag, err := r.buildDAG(steps)
+    if err != nil {
+        return nil, fmt.Errorf("failed to build DAG: %w", err)
+    }
     
+    // 2. 评估条件，过滤跳过的检查项
+    activeSteps := make(map[string]cvoapi.CheckStep)
     for _, step := range steps {
-        // 评估条件
         if step.Condition != "" {
             if !evaluateCondition(step.Condition, cluster) {
                 report.Results = append(report.Results, cvoapi.CheckResult{
@@ -542,41 +548,55 @@ func (r *CheckRunner) runChecks(
                 continue
             }
         }
+        activeSteps[step.Name] = step
+    }
+    
+    // 3. 拓扑排序，获取执行层级
+    layers, err := dag.TopologicalSort()
+    if err != nil {
+        return nil, fmt.Errorf("failed to sort DAG: %w", err)
+    }
+    
+    // 4. 按层级执行（同层级可并行）
+    results := make(map[string]*cvoapi.CheckResult)
+    for _, layer := range layers {
+        // 过滤掉已跳过的检查项
+        var activeLayer []string
+        for _, name := range layer {
+            if _, ok := activeSteps[name]; ok {
+                activeLayer = append(activeLayer, name)
+            }
+        }
         
-        if step.Mode == "Parallel" {
-            parallelSteps = append(parallelSteps, step)
-        } else {
-            sequentialSteps = append(sequentialSteps, step)
+        if len(activeLayer) == 0 {
+            continue
         }
-    }
-    
-    // 执行并行检查项
-    if len(parallelSteps) > 0 {
-        results, err := r.runParallelChecks(ctx, cluster, parallelSteps)
+        
+        // 并行执行当前层级的所有检查项
+        layerResults, err := r.runLayerChecks(ctx, cluster, activeSteps, activeLayer, results)
         if err != nil {
             return nil, err
         }
-        report.Results = append(report.Results, results...)
-    }
-    
-    // 执行串行检查项
-    for _, step := range sequentialSteps {
-        result, err := r.runSingleCheck(ctx, cluster, step)
-        if err != nil {
-            return nil, err
+        
+        // 收集结果
+        for name, result := range layerResults {
+            results[name] = result
+            report.Results = append(report.Results, *result)
         }
-        report.Results = append(report.Results, *result)
+        
+        // 检查是否有 required 检查项失败，如果是则提前终止
+        if r.hasRequiredFailure(activeSteps, layerResults) {
+            r.logger.Info("Required check failed, aborting remaining checks")
+            break
+        }
     }
     
-    // 计算整体状态
+    // 5. 计算整体状态
     for _, result := range report.Results {
         if result.Status == cvoapi.CheckStatusFailed || result.Status == cvoapi.CheckStatusTimeout {
             report.FailedCount++
-            for _, step := range steps {
-                if step.Name == result.Name && step.Required {
-                    report.Status = cvoapi.CheckStatusFailed
-                    break
-                }
+            if step, ok := activeSteps[result.Name]; ok && step.Required {
+                report.Status = cvoapi.CheckStatusFailed
             }
         } else if result.Status == cvoapi.CheckStatusPassed {
             report.PassedCount++
@@ -595,6 +615,180 @@ func (r *CheckRunner) runChecks(
     )
     
     return report, nil
+}
+
+// buildDAG 构建检查项依赖图
+func (r *CheckRunner) buildDAG(steps []cvoapi.CheckStep) (*DAG, error) {
+    dag := NewDAG()
+    
+    // 添加所有节点
+    for _, step := range steps {
+        if err := dag.AddNode(step.Name); err != nil {
+            return nil, err
+        }
+    }
+    
+    // 添加依赖边
+    for _, step := range steps {
+        for _, dep := range step.Dependencies {
+            if err := dag.AddEdge(dep, step.Name); err != nil {
+                return nil, err
+            }
+        }
+    }
+    
+    return dag, nil
+}
+
+// runLayerChecks 并行执行同一层级的检查项
+func (r *CheckRunner) runLayerChecks(
+    ctx context.Context,
+    cluster *bkev1beta1.BKECluster,
+    steps map[string]cvoapi.CheckStep,
+    layer []string,
+    previousResults map[string]*cvoapi.CheckResult,
+) (map[string]*cvoapi.CheckResult, error) {
+    var wg sync.WaitGroup
+    results := make(map[string]*cvoapi.CheckResult)
+    var mu sync.Mutex
+    var firstErr error
+    
+    for _, name := range layer {
+        step := steps[name]
+        wg.Add(1)
+        
+        go func(s cvoapi.CheckStep) {
+            defer wg.Done()
+            
+            result, err := r.runSingleCheck(ctx, cluster, s)
+            
+            mu.Lock()
+            defer mu.Unlock()
+            
+            if err != nil {
+                if firstErr == nil {
+                    firstErr = err
+                }
+                return
+            }
+            
+            results[s.Name] = result
+        }(step)
+    }
+    
+    wg.Wait()
+    
+    if firstErr != nil {
+        return nil, firstErr
+    }
+    
+    return results, nil
+}
+
+// hasRequiredFailure 检查是否有必须通过的检查项失败
+func (r *CheckRunner) hasRequiredFailure(
+    steps map[string]cvoapi.CheckStep,
+    results map[string]*cvoapi.CheckResult,
+) bool {
+    for name, result := range results {
+        if result.Status == cvoapi.CheckStatusFailed || result.Status == cvoapi.CheckStatusTimeout {
+            if step, ok := steps[name]; ok && step.Required {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+// DAG 依赖图实现
+// pkg/check/dag.go
+
+// DAG 有向无环图
+type DAG struct {
+    nodes map[string]*DAGNode
+}
+
+// DAGNode DAG 节点
+type DAGNode struct {
+    Name     string
+    InDegree int      // 入度（依赖数量）
+    Edges    []string // 出边（依赖此节点的其他节点）
+}
+
+// NewDAG 创建新的 DAG
+func NewDAG() *DAG {
+    return &DAG{
+        nodes: make(map[string]*DAGNode),
+    }
+}
+
+// AddNode 添加节点
+func (d *DAG) AddNode(name string) error {
+    if _, exists := d.nodes[name]; exists {
+        return fmt.Errorf("node %s already exists", name)
+    }
+    d.nodes[name] = &DAGNode{
+        Name:     name,
+        InDegree: 0,
+        Edges:    []string{},
+    }
+    return nil
+}
+
+// AddEdge 添加依赖边（from -> to 表示 to 依赖 from）
+func (d *DAG) AddEdge(from, to string) error {
+    fromNode, ok := d.nodes[from]
+    if !ok {
+        return fmt.Errorf("node %s not found", from)
+    }
+    toNode, ok := d.nodes[to]
+    if !ok {
+        return fmt.Errorf("node %s not found", to)
+    }
+    
+    fromNode.Edges = append(fromNode.Edges, to)
+    toNode.InDegree++
+    return nil
+}
+
+// TopologicalSort 拓扑排序，返回分层结果
+// 每一层包含可以并行执行的节点（入度为 0 的节点）
+func (d *DAG) TopologicalSort() ([][]string, error) {
+    // 复制入度，避免修改原图
+    inDegree := make(map[string]int)
+    for name, node := range d.nodes {
+        inDegree[name] = node.InDegree
+    }
+    
+    var layers [][]string
+    
+    for len(inDegree) > 0 {
+        // 找到所有入度为 0 的节点（当前层）
+        var currentLayer []string
+        for name, degree := range inDegree {
+            if degree == 0 {
+                currentLayer = append(currentLayer, name)
+            }
+        }
+        
+        if len(currentLayer) == 0 {
+            // 存在循环依赖
+            return nil, fmt.Errorf("cycle detected in DAG, remaining nodes: %v", inDegree)
+        }
+        
+        // 将当前层加入结果
+        layers = append(layers, currentLayer)
+        
+        // 移除当前层节点，更新入度
+        for _, name := range currentLayer {
+            delete(inDegree, name)
+            for _, neighbor := range d.nodes[name].Edges {
+                inDegree[neighbor]--
+            }
+        }
+    }
+    
+    return layers, nil
 }
 
 // runSingleCheck 执行单个检查项
@@ -674,40 +868,6 @@ func (r *CheckRunner) runSingleCheck(
     }
     
     return result, nil
-}
-
-// runParallelChecks 并行执行检查项
-func (r *CheckRunner) runParallelChecks(
-    ctx context.Context,
-    cluster *bkev1beta1.BKECluster,
-    steps []cvoapi.CheckStep,
-) ([]cvoapi.CheckResult, error) {
-    var wg sync.WaitGroup
-    results := make([]cvoapi.CheckResult, len(steps))
-    errors := make([]error, len(steps))
-    
-    for i, step := range steps {
-        wg.Add(1)
-        go func(idx int, s cvoapi.CheckStep) {
-            defer wg.Done()
-            result, err := r.runSingleCheck(ctx, cluster, s)
-            if err != nil {
-                errors[idx] = err
-                return
-            }
-            results[idx] = *result
-        }(i, step)
-    }
-    
-    wg.Wait()
-    
-    for _, err := range errors {
-        if err != nil {
-            return nil, err
-        }
-    }
-    
-    return results, nil
 }
 ```
 
@@ -1002,10 +1162,11 @@ func (c *ComponentVersionCheckItem) getComponentCurrentVersion(
 
 ## 9. YAML 示例
 
-### 9.1 全局 CheckPolicy
+### 9.1 全局 CheckPolicy（无依赖，全部并行）
 
 ```yaml
 # 全局检查策略（适用于所有集群）
+# 所有检查项无依赖，可以全部并行执行
 apiVersion: cvo.openfuyao.cn/v1beta1
 kind: CheckPolicy
 metadata:
@@ -1015,15 +1176,19 @@ spec:
     - name: cluster-health
       required: true
       timeout: "30s"
+      # 无 dependencies，可立即执行
     - name: backup-verification
       required: true
       timeout: "5m"
+      # 无 dependencies，可立即执行
     - name: resource-check
       required: false
       timeout: "1m"
+      # 无 dependencies，可立即执行
     - name: component-dependency
       required: true
       timeout: "30s"
+      # 无 dependencies，可立即执行
   postCheck:
     - name: component-version
       required: true
@@ -1039,7 +1204,100 @@ spec:
       timeout: "2m"
 ```
 
-### 9.2 环境特定 CheckPolicy
+### 9.2 带依赖关系的 CheckPolicy（DAG 执行）
+
+```yaml
+# 带依赖关系的检查策略
+# 执行顺序：
+# Layer 0: cluster-health, backup-verification (并行)
+# Layer 1: resource-check (依赖 cluster-health)
+# Layer 2: component-dependency (依赖 resource-check)
+apiVersion: cvo.openfuyao.cn/v1beta1
+kind: CheckPolicy
+metadata:
+  name: with-dependencies
+spec:
+  preCheck:
+    - name: cluster-health
+      required: true
+      timeout: "30s"
+      # 无依赖，Layer 0 执行
+    
+    - name: backup-verification
+      required: true
+      timeout: "5m"
+      # 无依赖，Layer 0 执行（与 cluster-health 并行）
+    
+    - name: resource-check
+      required: false
+      timeout: "1m"
+      dependencies:
+        - cluster-health  # 依赖 cluster-health，Layer 1 执行
+    
+    - name: component-dependency
+      required: true
+      timeout: "30s"
+      dependencies:
+        - resource-check  # 依赖 resource-check，Layer 2 执行
+  postCheck:
+    - name: component-version
+      required: true
+      timeout: "30s"
+      # 无依赖，Layer 0 执行
+    
+    - name: cluster-health
+      required: true
+      timeout: "1m"
+      dependencies:
+        - component-version  # 等待版本验证完成
+    
+    - name: node-ready
+      required: true
+      timeout: "30s"
+      dependencies:
+        - cluster-health  # 等待集群健康检查完成
+    
+    - name: application-health
+      required: false
+      timeout: "2m"
+      dependencies:
+        - node-ready  # 等待节点就绪检查完成
+```
+
+### 9.3 DAG 执行示意图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          DAG 执行示例（preCheck）                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Layer 0 (并行执行)
+┌─────────────────┐    ┌─────────────────────┐
+│ cluster-health  │    │ backup-verification │
+│   (30s)         │    │      (5m)           │
+└────────┬────────┘    └─────────────────────┘
+         │
+         │ 依赖
+         ▼
+Layer 1 (等待 Layer 0 完成)
+┌─────────────────┐
+│ resource-check  │
+│     (1m)        │
+└────────┬────────┘
+         │
+         │ 依赖
+         ▼
+Layer 2 (等待 Layer 1 完成)
+┌─────────────────────────┐
+│ component-dependency    │
+│        (30s)            │
+└─────────────────────────┘
+
+总耗时 = max(30s, 5m) + 1m + 30s = 6m30s
+（如果全部串行：30s + 5m + 1m + 30s = 7m）
+```
+
+### 9.4 环境特定 CheckPolicy
 
 ```yaml
 # 生产环境检查策略（更严格）
@@ -1322,5 +1580,5 @@ func main() {
 
 ---
 
-**文档版本**: v2.1  
+**文档版本**: v2.2  
 **维护者**: openFuyao Team
