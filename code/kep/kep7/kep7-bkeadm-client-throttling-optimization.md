@@ -181,7 +181,188 @@ func (c *Client) processYamlResources(filepath string, handler yamlResourceHandl
 
 ## 5. 提案设计
 
-### 5.1 改动 1：NewKubernetesClient 添加 QPS/Burst 配置
+### 5.1 改动 1：新增配置层 — 集中化 QPS/Burst 配置
+
+**文件**：`bkeadm/pkg/config/config.go`（新文件）
+
+参考 capbke 的实现（`cluster-api-provider-bke/utils/capbke/config/config.go`），为 bkeadm 新增独立的配置模块，支持多级配置优先级。
+
+**配置优先级**：
+
+```txt
+命令行标志 > 环境变量 > 配置文件 > 默认值
+
+示例：
+1. 命令行：--client-qps=100 --client-burst=200
+2. 环境变量：KUBE_CLIENT_QPS=80 KUBE_CLIENT_BURST=160
+3. 配置文件：/etc/bke/client-config.yaml (qps: 60, burst: 120)
+4. 默认值：QPS=50, Burst=100
+```
+
+**代码实现**：
+
+```go
+// bkeadm/pkg/config/config.go
+
+package config
+
+import (
+    "flag"
+    "os"
+    "strconv"
+
+    "gopkg.openfuyao.cn/bkeadm/utils/log"
+    "gopkg.in/yaml.v3"
+)
+
+var (
+    // ClientQPS 是 Kubernetes 客户端的 QPS
+    // 默认值: 50，可以通过命令行标志、环境变量或配置文件覆盖
+    ClientQPS float32
+
+    // ClientBurst 是 Kubernetes 客户端的突发大小
+    // 默认值: 100，可以通过命令行标志、环境变量或配置文件覆盖
+    ClientBurst int
+
+    // ClientConfigFile 是客户端配置文件路径
+    // 默认值: /etc/bke/client-config.yaml
+    ClientConfigFile string
+)
+
+const (
+    // DefaultClientQPS 是 Kubernetes 客户端的默认 QPS
+    DefaultClientQPS = 50
+    // DefaultClientBurst 是 Kubernetes 客户端的默认突发大小
+    DefaultClientBurst = 100
+    // DefaultClientConfigFile 是默认配置文件路径
+    DefaultClientConfigFile = "/etc/bke/client-config.yaml"
+)
+
+// ClientConfig 客户端配置文件结构
+type ClientConfig struct {
+    QPS   float32 `yaml:"qps"`
+    Burst int     `yaml:"burst"`
+}
+
+// RegisterFlags 注册命令行标志
+func RegisterFlags() {
+    flag.Float32Var(&ClientQPS, "client-qps", 0,
+        "Kubernetes 客户端的 QPS。优先级：命令行 > 环境变量 > 配置文件 > 默认值(50)")
+    flag.IntVar(&ClientBurst, "client-burst", 0,
+        "Kubernetes 客户端的突发大小。优先级：命令行 > 环境变量 > 配置文件 > 默认值(100)")
+    flag.StringVar(&ClientConfigFile, "client-config-file", DefaultClientConfigFile,
+        "客户端配置文件路径。默认: /etc/bke/client-config.yaml")
+}
+
+// ResolveClientConfig 解析配置，按优先级确定最终值
+// 调用时机：命令行标志解析完成后
+func ResolveClientConfig() {
+    // 1. 首先加载配置文件（最低优先级）
+    loadClientConfigFile()
+
+    // 2. 环境变量覆盖配置文件
+    if qps := os.Getenv("KUBE_CLIENT_QPS"); qps != "" {
+        if v, err := strconv.ParseFloat(qps, 32); err == nil {
+            ClientQPS = float32(v)
+        }
+    }
+    if burst := os.Getenv("KUBE_CLIENT_BURST"); burst != "" {
+        if v, err := strconv.Atoi(burst); err == nil {
+            ClientBurst = v
+        }
+    }
+
+    // 3. 如果仍未设置，使用默认值
+    if ClientQPS == 0 {
+        ClientQPS = DefaultClientQPS
+    }
+    if ClientBurst == 0 {
+        ClientBurst = DefaultClientBurst
+    }
+
+    log.Infof("resolved Kubernetes client throttling config: qps=%v, burst=%d, configFile=%s",
+        ClientQPS, ClientBurst, ClientConfigFile)
+}
+
+// loadClientConfigFile 从配置文件加载 QPS/Burst 配置
+func loadClientConfigFile() {
+    if ClientConfigFile == "" {
+        ClientConfigFile = DefaultClientConfigFile
+    }
+
+    data, err := os.ReadFile(ClientConfigFile)
+    if err != nil {
+        // 配置文件不存在或读取失败，使用默认值
+        return
+    }
+
+    var config ClientConfig
+    if err := yaml.Unmarshal(data, &config); err != nil {
+        log.Warnf("failed to parse client config file %s: %v, using defaults", ClientConfigFile, err)
+        return
+    }
+
+    if config.QPS > 0 {
+        ClientQPS = config.QPS
+    }
+    if config.Burst > 0 {
+        ClientBurst = config.Burst
+    }
+}
+```
+
+**配置文件格式**：`/etc/bke/client-config.yaml`
+
+```yaml
+# BKE 客户端配置
+# 通过 ConfigMap 挂载到 Pod
+
+# Kubernetes 客户端限流配置
+qps: 50
+burst: 100
+```
+
+**ConfigMap 定义**：
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bke-client-config
+  namespace: bke-system
+data:
+  client-config.yaml: |
+    # BKE 客户端配置
+    qps: 50
+    burst: 100
+```
+
+**Deployment 挂载配置**：
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bke-controller-manager
+  namespace: bke-system
+spec:
+  template:
+    spec:
+      containers:
+      - name: manager
+        args:
+        - --client-config-file=/etc/bke/client-config.yaml
+        volumeMounts:
+        - name: client-config
+          mountPath: /etc/bke
+          readOnly: true
+      volumes:
+      - name: client-config
+        configMap:
+          name: bke-client-config
+```
+
+### 5.2 改动 2：NewKubernetesClient 使用可配置 QPS/Burst
 
 **文件**：`bkeadm/pkg/executor/k8s/k8s.go`
 
@@ -201,14 +382,14 @@ if config == nil {
 }
 
 // 设置客户端限流参数，避免 API 调用被 client-side throttling 阻塞
-// QPS=50, Burst=100 与 capbke 保持一致
-config.QPS = 50
-config.Burst = 100
+// 使用集中化配置，支持命令行标志、环境变量、配置文件覆盖
+config.QPS = bkeconfig.ClientQPS
+config.Burst = bkeconfig.ClientBurst
 
 clientSet, err := kubernetes.NewForConfig(config)
 ```
 
-### 5.2 改动 2：Client 结构体添加 restMapper 成员
+### 5.3 改动 3：Client 结构体添加 restMapper 成员
 
 **文件**：`bkeadm/pkg/executor/k8s/k8s.go`
 
@@ -229,7 +410,7 @@ type Client struct {
 }
 ```
 
-### 5.3 改动 3：NewKubernetesClient 初始化 restMapper
+### 5.4 改动 4：NewKubernetesClient 初始化 restMapper
 
 **文件**：`bkeadm/pkg/executor/k8s/k8s.go`
 
@@ -255,7 +436,7 @@ return &Client{
 }, nil
 ```
 
-### 5.4 改动 4：processYamlResources 复用 restMapper
+### 5.5 改动 5：processYamlResources 复用 restMapper
 
 **文件**：`bkeadm/pkg/executor/k8s/k8s.go`
 
@@ -274,10 +455,51 @@ restMapper := restmapper.NewDiscoveryRESTMapper(restMapperRes)
 restMapper := c.restMapper
 ```
 
-### 5.5 完整修改后代码
+### 5.6 改动 6：main.go 集成配置解析
+
+**文件**：`bkeadm/main.go`
+
+**修改位置**：`main()` 函数中，在 `cmd.Execute()` 之前
+
+```go
+// 当前代码：
+func main() {
+    if version.Version == "" {
+        version.GitCommitID = gitCommitId
+        version.Version = ver
+        version.Architecture = architecture
+        version.Timestamp = timestamp
+    }
+    cmd.Execute()
+}
+
+// 修改为：
+func main() {
+    if version.Version == "" {
+        version.GitCommitID = gitCommitId
+        version.Version = ver
+        version.Architecture = architecture
+        version.Timestamp = timestamp
+    }
+
+    // 新增：注册并解析客户端限流配置
+    bkeconfig.RegisterFlags()
+    flag.Parse()
+    bkeconfig.ResolveClientConfig()
+
+    cmd.Execute()
+}
+```
+
+### 5.7 完整修改后代码
 
 ```go
 // bkeadm/pkg/executor/k8s/k8s.go
+
+import (
+    bkeconfig "gopkg.openfuyao.cn/bkeadm/pkg/config"
+    // ... 其他导入
+)
 
 type Client struct {
     ClientSet     *kubernetes.Clientset
@@ -304,9 +526,9 @@ func NewKubernetesClient(kubeConfig string) (KubernetesClient, error) {
         return nil, errors.New("The kube config configuration file does not exist. ")
     }
 
-    // 新增：设置客户端限流参数
-    config.QPS = 50
-    config.Burst = 100
+    // 新增：使用集中化配置设置客户端限流参数
+    config.QPS = bkeconfig.ClientQPS
+    config.Burst = bkeconfig.ClientBurst
 
     clientSet, err := kubernetes.NewForConfig(config)
     if err != nil {
@@ -400,8 +622,85 @@ func (c *Client) processYamlResources(filepath string, handler yamlResourceHandl
 
 | 测试场景 | 验证内容 |
 |---------|---------|
-| NewKubernetesClient 初始化 | 验证 QPS=50, Burst=100 已设置 |
+| NewKubernetesClient 初始化 | 验证 QPS/Burst 已从配置读取并设置 |
 | RESTMapper 复用 | 验证多次 processYamlResources 调用只触发 1 次 Discovery |
+| 配置优先级 - 默认值 | 验证无配置时使用默认值 QPS=50, Burst=100 |
+| 配置优先级 - 环境变量 | 验证环境变量覆盖默认值 |
+| 配置优先级 - 配置文件 | 验证配置文件覆盖默认值 |
+| 配置优先级 - 命令行标志 | 验证命令行标志覆盖其他配置 |
+| 配置文件不存在 | 验证配置文件不存在时使用默认值，无报错 |
+| 配置文件格式错误 | 验证配置文件格式错误时降级到默认值，输出警告日志 |
+
+**配置测试代码示例**：
+
+```go
+// bkeadm/pkg/config/config_test.go
+
+func TestResolveClientConfig_Defaults(t *testing.T) {
+    // 清理环境变量
+    os.Unsetenv("KUBE_CLIENT_QPS")
+    os.Unsetenv("KUBE_CLIENT_BURST")
+    ClientConfigFile = "/nonexistent/path"
+
+    ResolveClientConfig()
+
+    assert.Equal(t, float32(50), ClientQPS)
+    assert.Equal(t, 100, ClientBurst)
+}
+
+func TestResolveClientConfig_EnvOverride(t *testing.T) {
+    os.Setenv("KUBE_CLIENT_QPS", "80")
+    os.Setenv("KUBE_CLIENT_BURST", "160")
+    defer os.Unsetenv("KUBE_CLIENT_QPS")
+    defer os.Unsetenv("KUBE_CLIENT_BURST")
+
+    ResolveClientConfig()
+
+    assert.Equal(t, float32(80), ClientQPS)
+    assert.Equal(t, 160, ClientBurst)
+}
+
+func TestResolveClientConfig_FileOverride(t *testing.T) {
+    // 创建临时配置文件
+    tmpFile, _ := os.CreateTemp("", "client-config-*.yaml")
+    defer os.Remove(tmpFile.Name())
+    tmpFile.Write([]byte("qps: 60\nburst: 120\n"))
+    tmpFile.Close()
+
+    os.Unsetenv("KUBE_CLIENT_QPS")
+    os.Unsetenv("KUBE_CLIENT_BURST")
+    ClientConfigFile = tmpFile.Name()
+
+    ResolveClientConfig()
+
+    assert.Equal(t, float32(60), ClientQPS)
+    assert.Equal(t, 120, ClientBurst)
+}
+
+func TestResolveClientConfig_CLIOverridesAll(t *testing.T) {
+    // 创建临时配置文件
+    tmpFile, _ := os.CreateTemp("", "client-config-*.yaml")
+    defer os.Remove(tmpFile.Name())
+    tmpFile.Write([]byte("qps: 60\nburst: 120\n"))
+    tmpFile.Close()
+
+    os.Setenv("KUBE_CLIENT_QPS", "80")
+    os.Setenv("KUBE_CLIENT_BURST", "160")
+    defer os.Unsetenv("KUBE_CLIENT_QPS")
+    defer os.Unsetenv("KUBE_CLIENT_BURST")
+
+    ClientConfigFile = tmpFile.Name()
+    // 模拟命令行标志已解析
+    ClientQPS = 100
+    ClientBurst = 200
+
+    ResolveClientConfig()
+
+    // 命令行标志优先级最高
+    assert.Equal(t, float32(100), ClientQPS)
+    assert.Equal(t, 200, ClientBurst)
+}
+```
 
 ### 7.2 集成测试
 
@@ -422,29 +721,37 @@ func (c *Client) processYamlResources(filepath string, handler yamlResourceHandl
 
 | 风险 | 影响 | 缓解措施 |
 |------|------|---------|
-| QPS/Burst 过高导致 API Server 压力 | API Server 负载增加 | QPS=50, Burst=100 是经过验证的安全值，与 capbke 保持一致 |
+| QPS/Burst 过高导致 API Server 压力 | API Server 负载增加 | 默认值 QPS=50, Burst=100 是经过验证的安全值，与 capbke 保持一致 |
+| 配置文件格式错误 | 配置加载失败 | 配置文件解析失败时降级到默认值，输出警告日志，不影响启动 |
+| 环境变量配置错误 | 配置值异常 | 环境变量解析失败时忽略该值，继续使用其他配置来源 |
 | RESTMapper 缓存过期 | 新创建的 CRD 无法被发现 | 当前场景下 CRD 在客户端初始化前已存在，无风险 |
+| 配置优先级冲突 | 配置值不符合预期 | 启动时打印最终生效的配置值及来源，便于排查 |
 
 ## 9. 工作量评估
 
 | 阶段 | 任务内容 | 工作量 |
 |------|---------|--------|
+| 配置层 | 新增 `bkeadm/pkg/config/config.go`，实现多级配置优先级 | 0.5 人天 |
 | 代码修改 | 修改 `NewKubernetesClient` 和 `processYamlResources` | 0.5 人天 |
+| main.go 集成 | 修改 `main.go` 集成配置解析 | 0.25 人天 |
 | 测试验证 | 单元测试 + 集成测试 + 性能测试 | 1 人天 |
-| 文档更新 | 更新性能分析报告 | 0.5 人天 |
-| **总计** | | **2 人天** |
+| 文档更新 | 更新性能分析报告 | 0.25 人天 |
+| **总计** | | **2.5 人天** |
 
 ## 10. 相关文件
 
 | 文件路径 | 说明 |
 |---------|------|
+| `bkeadm/pkg/config/config.go` | 新增：集中化 QPS/Burst 配置模块 |
 | `bkeadm/pkg/executor/k8s/k8s.go` | 主要修改文件 |
+| `bkeadm/main.go` | 修改：集成配置解析 |
 | `cluster-api-provider-bke/pkg/kube/client_factory.go` | capbke 的参考实现 |
 | `cluster-api-provider-bke/utils/capbke/config/config.go` | capbke 的 QPS/Burst 配置定义 |
+| `code/performance/report/api-throttling-optimization.md` | capbke 限流优化方案参考 |
 | `code/performance/report2/bke-cluster-create2.log` | 性能分析日志 |
 | `code/performance/report2/analysis.md` | 性能分析报告 |
 
 ---
 
-**文档版本**: v1.0  
+**文档版本**: v1.1  
 **维护者**: openFuyao Team
