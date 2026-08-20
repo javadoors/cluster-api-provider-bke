@@ -377,6 +377,198 @@ func (c *Client) processYamlResources(filepath string, handler yamlResourceHandl
 
 **影响**：66 个 BKENode 文件 = 66 次 `processYamlResources` 调用 = 66 次 Discovery API 调用。
 
+### 4.6 RESTMapper 复用的同步风险分析
+
+#### 4.6.1 潜在不同步场景
+
+RESTMapper 复用后，如果 API Server 上的 CRD 发生变化，缓存的 RESTMapper 可能无法感知，导致以下问题：
+
+| 场景 | 描述 | 风险等级 | 发生概率 |
+|------|------|---------|---------|
+| **CRD 新增** | RESTMapper 初始化后，API Server 上新增了 CRD | 高 | 中 |
+| **CRD 删除** | RESTMapper 初始化后，API Server 上删除了 CRD | 低 | 低 |
+| **CRD 更新** | RESTMapper 初始化后，CRD 的 API 版本发生变化 | 中 | 低 |
+
+#### 4.6.2 bkeadm 使用场景分析
+
+```txt
+┌─────────────────────────────────────────────────────────────┐
+│                    bkeadm 使用场景                            │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  bkeadm 是一个短生命周期的 CLI 工具：                        │
+│                                                              │
+│  启动 → 获取 RESTMapper → 提交 67 个资源 → 退出              │
+│         (1次 Discovery)    (约 8 分钟)                       │
+│                                                              │
+│  提交的是 BKECluster 和 BKENode 资源：                       │
+│  - 这些 CRD 由管理集群的 CAPI 提供                           │
+│  - 在 bkeadm 运行期间，这些 CRD 不太可能发生变化             │
+│                                                              │
+│  结论：风险很低                                              │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### 4.6.3 capbke 的解决方案（参考实现）
+
+capbke 已经实现了完整的 CRD 变化监听机制：
+
+```go
+// cluster-api-provider-bke/pkg/kube/restmapper_cache.go
+
+func newPerClusterRESTMapper(cfg *rest.Config) (*perClusterRESTMapper, error) {
+    discoveryClient, err := discovery.NewDiscoveryClientForConfig(ApplyThrottlingConfig(cfg))
+    // ...
+    cachedDiscovery := memory.NewMemCacheClient(discoveryClient)
+    mapper := restmapper.NewDeferredDiscoveryRESTMapper(cachedDiscovery)
+
+    // 创建 CRD Informer 监听 CRD 变化
+    crdInformer, err := newCRDInformer(cfg)
+    // ...
+
+    // CRD 变化时自动清除缓存
+    crdInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+        AddFunc: func(obj interface{}) {
+            m.Invalidate()  // 清除缓存
+        },
+        UpdateFunc: func(oldObj, newObj interface{}) {
+            m.Invalidate()  // 清除缓存
+        },
+        DeleteFunc: func(obj interface{}) {
+            m.Invalidate()  // 清除缓存
+        },
+    })
+
+    go crdInformer.Run(m.stopCh)
+    // ...
+}
+```
+
+#### 4.6.4 bkeadm 的推荐方案
+
+对于 bkeadm 这种短生命周期工具，有两种方案：
+
+**方案 A：简单方案（推荐）**
+
+使用 `DeferredDiscoveryRESTMapper`，它在遇到 `NoMatchError` 时会自动重新发现：
+
+```go
+// bkeadm/pkg/executor/k8s/k8s.go
+
+func NewKubernetesClient(kubeConfig string) (KubernetesClient, error) {
+    // ...
+    
+    // 使用 DeferredDiscoveryRESTMapper + 内存缓存
+    discoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
+    if err != nil {
+        return nil, err
+    }
+    cachedDiscovery := memory.NewMemCacheClient(discoveryClient)
+    restMapper := restmapper.NewDeferredDiscoveryRESTMapper(cachedDiscovery)
+    
+    // ...
+}
+
+func (c *Client) processYamlResources(filepath string, handler yamlResourceHandler) error {
+    // ...
+    
+    // 使用缓存的 RESTMapper
+    restMapper := c.restMapper
+    
+    for {
+        // ...
+        mapping, err := restMapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+        if err != nil {
+            // DeferredDiscoveryRESTMapper 遇到 NoMatchError 时会自动重新发现
+            // 如果仍然失败，可以手动重置缓存
+            if apierrors.IsNoMatchError(err) {
+                if deferred, ok := restMapper.(*restmapper.DeferredDiscoveryRESTMapper); ok {
+                    deferred.Reset()  // 清除缓存
+                    mapping, err = restMapper.RESTMapping(gvk.GroupKind(), gvk.Version)
+                }
+            }
+            if err != nil {
+                return err
+            }
+        }
+        // ...
+    }
+}
+```
+
+**方案 B：完整方案（参考 capbke）**
+
+如果需要完整的 CRD 变化监听，可以参考 capbke 的实现，添加 CRD Informer：
+
+```go
+// bkeadm/pkg/executor/k8s/k8s.go
+
+type Client struct {
+    ClientSet     *kubernetes.Clientset
+    DynamicClient dynamic.Interface
+    restMapper    *perClusterRESTMapper  // 包含 CRD Informer
+}
+
+type perClusterRESTMapper struct {
+    mapper    *restmapper.DeferredDiscoveryRESTMapper
+    discovery discovery.CachedDiscoveryInterface
+    stopCh    chan struct{}
+}
+
+func (m *perClusterRESTMapper) Invalidate() {
+    m.discovery.Invalidate()
+    m.mapper.Reset()
+}
+
+func newPerClusterRESTMapper(cfg *rest.Config) (*perClusterRESTMapper, error) {
+    discoveryClient, err := discovery.NewDiscoveryClientForConfig(cfg)
+    if err != nil {
+        return nil, err
+    }
+    cachedDiscovery := memory.NewMemCacheClient(discoveryClient)
+    mapper := restmapper.NewDeferredDiscoveryRESTMapper(cachedDiscovery)
+
+    // 创建 CRD Informer
+    apiextensionsClient, err := apiextensionsclient.NewForConfig(cfg)
+    if err != nil {
+        return nil, err
+    }
+    factory := apiextensionsinformers.NewSharedInformerFactory(apiextensionsClient, 0)
+    crdInformer := factory.Apiextensions().V1().CustomResourceDefinitions().Informer()
+
+    m := &perClusterRESTMapper{
+        mapper:    mapper,
+        discovery: cachedDiscovery,
+        stopCh:    make(chan struct{}),
+    }
+
+    // CRD 变化时自动清除缓存
+    crdInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+        AddFunc:    func(obj interface{}) { m.Invalidate() },
+        UpdateFunc: func(oldObj, newObj interface{}) { m.Invalidate() },
+        DeleteFunc: func(obj interface{}) { m.Invalidate() },
+    })
+
+    go crdInformer.Run(m.stopCh)
+    cache.WaitForCacheSync(m.stopCh, crdInformer.HasSynced)
+
+    return m, nil
+}
+```
+
+#### 4.6.5 方案对比
+
+| 方案 | 优点 | 缺点 | 适用场景 |
+|------|------|------|---------|
+| **方案 A** | 简单、轻量 | 无法主动感知 CRD 变化 | bkeadm（短生命周期 CLI） |
+| **方案 B** | 完整、实时感知 | 复杂、需要额外资源 | capbke（长生命周期控制器） |
+
+**推荐方案 A**：
+- bkeadm 是短生命周期工具，CRD 在运行期间变化的概率极低
+- 使用 `DeferredDiscoveryRESTMapper` 已经足够
+- 如果遇到 `NoMatchError`，手动调用 `Reset()` 即可
+
 ## 5. 提案设计
 
 ### 5.1 改动 1：新增配置层 — 集中化 QPS/Burst 配置
@@ -951,5 +1143,5 @@ func TestResolveClientConfig_CLIOverridesAll(t *testing.T) {
 
 ---
 
-**文档版本**: v1.2  
+**文档版本**: v1.3  
 **维护者**: openFuyao Team
