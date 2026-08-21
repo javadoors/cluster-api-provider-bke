@@ -50,8 +50,14 @@
    - [8.3 状态机引擎设计](#83-状态机引擎设计)
    - [8.4 健康状态聚合器设计](#84-健康状态聚合器设计)
    - [8.5 兼容性映射设计](#85-兼容性映射设计)
-   - [8.6 与现有系统集成设计](#86-与现有系统集成设计)
-   - [8.7 人工介入详细设计](#87-人工介入详细设计)
+    - [8.6 与现有系统集成设计](#86-与现有系统集成设计)
+      - [8.6.1 StateMachineEngine 初始化与控制器注入](#861-statemachineengine-初始化与控制器注入)
+      - [8.6.2 集群层 Reconcile 集成](#862-集群层-reconcile-集成)
+      - [8.6.3 节点层 Reconcile 集成](#863-节点层-reconcile-集成)
+      - [8.6.4 与 PhaseFrame 的协作机制](#864-与-phaseframe-的协作机制)
+      - [8.6.5 并发控制与状态持久化](#865-并发控制与状态持久化)
+      - [8.6.6 错误处理与重试](#866-错误处理与重试)
+    - [8.7 人工介入详细设计](#87-人工介入详细设计)
    - [8.8 Feature Gate 设计](#88-feature-gate-设计)
    - [8.9 迁移策略](#89-迁移策略)
     - [8.10 实现文件清单](#810-实现文件清单)
@@ -4456,41 +4462,757 @@ func init() {
 
 ### 8.6 与现有系统集成设计
 
-**集成点**：
+本节详细描述 `StateMachineEngine`（8.3 节定义）如何与现有控制器、PhaseFrame、健康聚合器等组件集成，形成完整的状态管理闭环。
+
+#### 8.6.1 StateMachineEngine 初始化与控制器注入
+
+**控制器结构体定义**：
 
 ```go
-// 在 bkecluster_controller.go 的 Reconcile 方法中集成
+// controllers/capbke/bkecluster_controller.go
+
+type BKEClusterReconciler struct {
+    client.Client
+    Scheme   *runtime.Scheme
+    Recorder record.EventRecorder
+    
+    // 状态机引擎（8.3 节定义）
+    engine *statemachine.StateMachineEngine
+    
+    // PhaseFrame 执行器（操作执行层）
+    phaseExecutor *phaseframe.Executor
+    
+    // 健康状态聚合器（8.4 节定义）
+    healthAggregator *statemachine.HealthAggregator
+    
+    // 状态持久化辅助
+    patchHelper *patch.Helper
+}
+```
+
+**初始化流程**：
+
+```go
+// cmd/capbke/main.go
+
+func main() {
+    // ... 其他初始化 ...
+    
+    // 1. 创建状态机引擎（单例，转换规则只初始化一次）
+    engine := statemachine.NewStateMachineEngine(mgr.GetClient())
+    
+    // 2. 创建 PhaseFrame 执行器
+    phaseExecutor := phaseframe.NewExecutor(mgr.GetClient())
+    
+    // 3. 创建健康聚合器
+    healthAggregator := &statemachine.HealthAggregator{}
+    
+    // 4. 注入到 BKEClusterReconciler
+    if err := (&controllers.BKEClusterReconciler{
+        Client:           mgr.GetClient(),
+        Scheme:           mgr.GetScheme(),
+        Recorder:         mgr.GetEventRecorderFor("bkecluster-controller"),
+        engine:           engine,
+        phaseExecutor:    phaseExecutor,
+        healthAggregator: healthAggregator,
+    }).SetupWithManager(mgr); err != nil {
+        setupLog.Error(err, "unable to create controller", "controller", "BKECluster")
+        os.Exit(1)
+    }
+    
+    // 5. 同样注入到 BKENodeReconciler
+    if err := (&controllers.BKENodeReconciler{
+        Client: mgr.GetClient(),
+        Scheme: mgr.GetScheme(),
+        engine: engine, // 共享同一个引擎实例
+    }).SetupWithManager(mgr); err != nil {
+        setupLog.Error(err, "unable to create controller", "controller", "BKENode")
+        os.Exit(1)
+    }
+    
+    // ... 启动 manager ...
+}
+```
+
+**设计要点**：
+
+| 要点 | 说明 |
+|------|------|
+| **单例引擎** | `StateMachineEngine` 在 main 中创建一次，所有控制器共享，避免重复初始化转换规则 |
+| **依赖注入** | 通过构造函数注入，便于单元测试时 Mock |
+| **职责分离** | 引擎负责"状态判断"，PhaseFrame 负责"操作执行"，聚合器负责"健康评估" |
+
+#### 8.6.2 集群层 Reconcile 集成
+
+**完整的 Reconcile 流程**：
+
+```go
+// controllers/capbke/bkecluster_controller.go
+
+func (r *BKEClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    log := log.FromContext(ctx).WithValues("cluster", req.NamespacedName)
+    startTime := time.Now()
+    
+    // ========== 阶段 1: 获取资源 ==========
+    cluster := &bkev1beta1.BKECluster{}
+    if err := r.Get(ctx, req.NamespacedName, cluster); err != nil {
+        return ctrl.Result{}, client.IgnoreNotFound(err)
+    }
+    
+    // 创建 Patch Helper（用于后续状态持久化）
+    patchHelper, err := patch.NewHelper(cluster, r.Client)
+    if err != nil {
+        return ctrl.Result{}, fmt.Errorf("failed to create patch helper: %w", err)
+    }
+    
+    // 确保退出时持久化状态
+    defer func() {
+        if err := patchHelper.Patch(ctx, cluster); err != nil {
+            log.Error(err, "failed to patch cluster status")
+        }
+    }()
+    
+    // ========== 阶段 2: 集群层状态评估 ==========
+    oldPhase := cluster.Status.LifecyclePhase
+    
+    // 调用状态机引擎评估集群状态
+    if err := r.engine.EvaluateClusterState(ctx, cluster); err != nil {
+        log.Error(err, "failed to evaluate cluster state")
+        return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+    }
+    
+    newPhase := cluster.Status.LifecyclePhase
+    
+    // 记录状态转换事件
+    if oldPhase != newPhase {
+        r.engine.RecordClusterTransition(cluster, oldPhase, newPhase)
+        log.Info("Cluster lifecycle phase changed",
+            "oldPhase", oldPhase,
+            "newPhase", newPhase,
+        )
+    }
+    
+    // ========== 阶段 3: 触发操作执行 ==========
+    // 根据当前状态，触发对应的 PhaseFrame 执行
+    if r.shouldExecutePhases(cluster) {
+        if err := r.executePhases(ctx, cluster); err != nil {
+            log.Error(err, "failed to execute phases")
+            // 不立即重试，等待下次 Reconcile
+        }
+    }
+    
+    // ========== 阶段 4: 节点层状态评估 ==========
+    nodes := &bkev1beta1.BKENodeList{}
+    if err := r.List(ctx, nodes, client.InNamespace(cluster.Namespace)); err != nil {
+        return ctrl.Result{}, fmt.Errorf("failed to list nodes: %w", err)
+    }
+    
+    for i := range nodes.Items {
+        node := &nodes.Items[i]
+        oldNodePhase := node.Status.LifecyclePhase
+        
+        if err := r.engine.EvaluateNodeState(ctx, node); err != nil {
+            log.Error(err, "failed to evaluate node state", "node", node.Name)
+            continue
+        }
+        
+        if oldNodePhase != node.Status.LifecyclePhase {
+            r.engine.RecordNodeTransition(node, oldNodePhase, node.Status.LifecyclePhase)
+        }
+        
+        // 持久化节点状态
+        if err := r.Status().Update(ctx, node); err != nil {
+            log.Error(err, "failed to update node status", "node", node.Name)
+        }
+    }
+    
+    // ========== 阶段 5: 组件层状态评估 ==========
+    for name, comp := range cluster.Status.ClusterComponentStatuses {
+        oldCompPhase := comp.Phase
+        
+        if err := r.engine.EvaluateComponentState(ctx, &comp); err != nil {
+            log.Error(err, "failed to evaluate component state", "component", name)
+            continue
+        }
+        
+        if oldCompPhase != comp.Phase {
+            r.engine.RecordComponentTransition(&comp, oldCompPhase, comp.Phase)
+        }
+        
+        cluster.Status.ClusterComponentStatuses[name] = comp
+    }
+    
+    // 评估节点级组件
+    for i := range nodes.Items {
+        node := &nodes.Items[i]
+        for j := range node.Status.Components {
+            comp := &node.Status.Components[j]
+            oldCompPhase := comp.Phase
+            
+            if err := r.engine.EvaluateComponentState(ctx, comp); err != nil {
+                log.Error(err, "failed to evaluate node component state",
+                    "node", node.Name, "component", comp.Name)
+                continue
+            }
+            
+            if oldCompPhase != comp.Phase {
+                r.engine.RecordComponentTransition(comp, oldCompPhase, comp.Phase)
+            }
+        }
+    }
+    
+    // ========== 阶段 6: 健康状态聚合 ==========
+    healthStatus := r.healthAggregator.AggregateClusterHealth(
+        nodes.Items,
+        cluster.Status.ClusterComponentStatuses,
+    )
+    cluster.Status.HealthStatus = healthStatus
+    
+    // ========== 阶段 7: 同步到旧字段（兼容性） ==========
+    statemachine.SyncClusterPhaseToLegacyFields(cluster, cluster.Status.LifecyclePhase)
+    
+    // ========== 阶段 8: 记录指标 ==========
+    r.recordMetrics(cluster, startTime)
+    
+    // ========== 阶段 9: 决定 Requeue 策略 ==========
+    return r.decideRequeue(cluster), nil
+}
+```
+
+**辅助方法**：
+
+```go
+// shouldExecutePhases 判断是否需要执行 PhaseFrame
+func (r *BKEClusterReconciler) shouldExecutePhases(cluster *bkev1beta1.BKECluster) bool {
+    // 只在操作进行中时执行
+    switch cluster.Status.LifecyclePhase {
+    case bkev1beta1.ClusterLifecycleInstalling,
+        bkev1beta1.ClusterLifecycleUpgrading,
+        bkev1beta1.ClusterLifecycleScaling,
+        bkev1beta1.ClusterLifecycleRollingBack:
+        return true
+    default:
+        return false
+    }
+}
+
+// executePhases 执行 PhaseFrame
+func (r *BKEClusterReconciler) executePhases(ctx context.Context, cluster *bkev1beta1.BKECluster) error {
+    // 委托给 PhaseFrame 执行器
+    return r.phaseExecutor.Execute(ctx, cluster)
+}
+
+// decideRequeue 决定 Requeue 策略
+func (r *BKEClusterReconciler) decideRequeue(cluster *bkev1beta1.BKECluster) ctrl.Result {
+    // 操作进行中：快速 Requeue（5 秒）
+    switch cluster.Status.LifecyclePhase {
+    case bkev1beta1.ClusterLifecycleInstalling,
+        bkev1beta1.ClusterLifecycleUpgrading,
+        bkev1beta1.ClusterLifecycleScaling:
+        return ctrl.Result{RequeueAfter: 5 * time.Second}
+    
+    // 失败状态：慢速 Requeue（1 分钟）
+    case bkev1beta1.ClusterLifecycleFailed:
+        return ctrl.Result{RequeueAfter: 1 * time.Minute}
+    
+    // 稳定状态：不 Requeue，等待事件触发
+    default:
+        return ctrl.Result{}
+    }
+}
+
+// recordMetrics 记录 Prometheus 指标
+func (r *BKEClusterReconciler) recordMetrics(cluster *bkev1beta1.BKECluster, startTime time.Time) {
+    duration := time.Since(startTime).Seconds()
+    reconcileDuration.WithLabelValues("bkecluster", cluster.Name).Observe(duration)
+    
+    healthStatusGauge.WithLabelValues(
+        cluster.Name, "", "",
+    ).Set(float64(healthLevelToInt(cluster.Status.HealthStatus.Overall)))
+}
+```
+
+**Reconcile 流程图**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    BKEClusterReconciler.Reconcile()                          │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+    ┌──────────────────────────┐
+    │ 1. 获取 BKECluster       │
+    │    创建 PatchHelper      │
+    └────────────┬─────────────┘
+                 │
+                 ▼
+    ┌──────────────────────────┐
+    │ 2. engine.EvaluateClusterState()
+    │    ├─ 检查转换规则        │
+    │    ├─ 执行 Condition     │
+    │    ├─ 执行 Action        │
+    │    └─ 更新 LifecyclePhase│
+    └────────────┬─────────────┘
+                 │
+                 ▼
+    ┌──────────────────────────┐
+    │ 3. shouldExecutePhases() │
+    │    ├─ Installing?        │
+    │    ├─ Upgrading?         │
+    │    ├─ Scaling?           │
+    │    └─ Yes → executePhases()
+    │         └─ PhaseFrame    │
+    │            执行具体操作   │
+    └────────────┬─────────────┘
+                 │
+                 ▼
+    ┌──────────────────────────┐
+    │ 4. 遍历 BKENode          │
+    │    engine.EvaluateNodeState()
+    │    ├─ 评估节点状态        │
+    │    └─ 记录状态转换事件    │
+    └────────────┬─────────────┘
+                 │
+                 ▼
+    ┌──────────────────────────┐
+    │ 5. 遍历组件              │
+    │    engine.EvaluateComponentState()
+    │    ├─ 集群级组件          │
+    │    └─ 节点级组件          │
+    └────────────┬─────────────┘
+                 │
+                 ▼
+    ┌──────────────────────────┐
+    │ 6. healthAggregator      │
+    │    .AggregateClusterHealth()
+    │    ├─ 聚合节点健康        │
+    │    ├─ 聚合组件健康        │
+    │    └─ 计算 Overall       │
+    └────────────┬─────────────┘
+                 │
+                 ▼
+    ┌──────────────────────────┐
+    │ 7. SyncClusterPhaseToLegacyFields()
+    │    同步到旧字段（兼容性） │
+    └────────────┬─────────────┘
+                 │
+                 ▼
+    ┌──────────────────────────┐
+    │ 8. recordMetrics()       │
+    │    记录 Prometheus 指标   │
+    └────────────┬─────────────┘
+                 │
+                 ▼
+    ┌──────────────────────────┐
+    │ 9. decideRequeue()       │
+    │    ├─ 操作中: 5s         │
+    │    ├─ 失败: 1m           │
+    │    └─ 稳定: 不 Requeue   │
+    └──────────────────────────┘
+```
+
+#### 8.6.3 节点层 Reconcile 集成
+
+**BKENodeReconciler 结构体**：
+
+```go
+// controllers/capbke/bkenode_controller.go
+
+type BKENodeReconciler struct {
+    client.Client
+    Scheme   *runtime.Scheme
+    Recorder record.EventRecorder
+    
+    // 共享状态机引擎
+    engine *statemachine.StateMachineEngine
+}
+```
+
+**节点层 Reconcile 流程**：
+
+```go
+func (r *BKENodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    log := log.FromContext(ctx).WithValues("node", req.NamespacedName)
+    
+    // 1. 获取 BKENode
+    node := &bkev1beta1.BKENode{}
+    if err := r.Get(ctx, req.NamespacedName, node); err != nil {
+        return ctrl.Result{}, client.IgnoreNotFound(err)
+    }
+    
+    // 2. 创建 Patch Helper
+    patchHelper, err := patch.NewHelper(node, r.Client)
+    if err != nil {
+        return ctrl.Result{}, fmt.Errorf("failed to create patch helper: %w", err)
+    }
+    defer func() {
+        if err := patchHelper.Patch(ctx, node); err != nil {
+            log.Error(err, "failed to patch node status")
+        }
+    }()
+    
+    // 3. 评估节点状态
+    oldPhase := node.Status.LifecyclePhase
+    if err := r.engine.EvaluateNodeState(ctx, node); err != nil {
+        log.Error(err, "failed to evaluate node state")
+        return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+    }
+    
+    // 4. 记录状态转换
+    if oldPhase != node.Status.LifecyclePhase {
+        r.engine.RecordNodeTransition(node, oldPhase, node.Status.LifecyclePhase)
+        log.Info("Node lifecycle phase changed",
+            "oldPhase", oldPhase,
+            "newPhase", node.Status.LifecyclePhase,
+        )
+    }
+    
+    // 5. 评估节点级组件状态
+    for i := range node.Status.Components {
+        comp := &node.Status.Components[i]
+        oldCompPhase := comp.Phase
+        
+        if err := r.engine.EvaluateComponentState(ctx, comp); err != nil {
+            log.Error(err, "failed to evaluate component state",
+                "component", comp.Name)
+            continue
+        }
+        
+        if oldCompPhase != comp.Phase {
+            r.engine.RecordComponentTransition(comp, oldCompPhase, comp.Phase)
+        }
+    }
+    
+    // 6. 同步到旧字段
+    statemachine.SyncNodePhaseToLegacyFields(node, node.Status.LifecyclePhase)
+    
+    // 7. 决定 Requeue 策略
+    return r.decideNodeRequeue(node), nil
+}
+
+func (r *BKENodeReconciler) decideNodeRequeue(node *bkev1beta1.BKENode) ctrl.Result {
+    switch node.Status.LifecyclePhase {
+    case bkev1beta1.NodeLifecyclePending,
+        bkev1beta1.NodeLifecycleProvisioned,
+        bkev1beta1.NodeLifecycleUpgrading:
+        return ctrl.Result{RequeueAfter: 5 * time.Second}
+    case bkev1beta1.NodeLifecycleFailed:
+        return ctrl.Result{RequeueAfter: 1 * time.Minute}
+    default:
+        return ctrl.Result{}
+    }
+}
+```
+
+#### 8.6.4 与 PhaseFrame 的协作机制
+
+**职责分离**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    状态机引擎 vs PhaseFrame                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  StateMachineEngine                          PhaseFrame                      │
+│  ──────────────────                          ──────────                      │
+│  职责: 状态判断                              职责: 操作执行                  │
+│  ──────────────                              ──────────────                  │
+│  • 评估当前状态                              • 执行具体安装/升级逻辑         │
+│  • 检查转换条件                              • 管理 Phase 执行顺序           │
+│  • 执行转换动作                              • 处理 Phase 失败/重试          │
+│  • 记录状态转换事件                          • 更新操作进度                  │
+│                                                                              │
+│  输入: BKECluster/BKENode                    输入: BKECluster                │
+│  输出: LifecyclePhase                        输出: OperationProgress         │
+│                                                                              │
+│  调用时机: 每次 Reconcile                    调用时机: 状态机触发            │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**协作流程**：
+
+```go
+// 状态机引擎中的转换规则 Action 触发 PhaseFrame
+
+// 示例: Installing -> Running 的转换规则
+ClusterTransitionRule{
+    From: bkev1beta1.ClusterLifecycleInstalling,
+    To:   bkev1beta1.ClusterLifecycleRunning,
+    Condition: func(ctx context.Context, cluster *bkev1beta1.BKECluster) bool {
+        // 条件: 所有组件安装完成
+        return e.allComponentsInstalled(cluster)
+    },
+    Action: func(ctx context.Context, cluster *bkev1beta1.BKECluster) error {
+        // 动作: 更新 OperationProgress
+        now := metav1.Now()
+        cluster.Status.OperationProgress.FinishedAt = &now
+        return nil
+    },
+}
+
+// 示例: Pending -> Installing 的转换规则
+ClusterTransitionRule{
+    From: bkev1beta1.ClusterLifecyclePending,
+    To:   bkev1beta1.ClusterLifecycleInstalling,
+    Condition: func(ctx context.Context, cluster *bkev1beta1.BKECluster) bool {
+        // 条件: 用户触发安装
+        return cluster.Spec.DesiredVersion != ""
+    },
+    Action: func(ctx context.Context, cluster *bkev1beta1.BKECluster) error {
+        // 动作: 初始化 OperationProgress
+        now := metav1.Now()
+        cluster.Status.OperationProgress = &bkev1beta1.OperationProgress{
+            OperationType: bkev1beta1.OperationTypeInstall,
+            StartedAt:     &now,
+            CurrentStage:  "InstallingNodeComponents",
+        }
+        return nil
+    },
+}
+```
+
+**Reconcile 循环中的协作**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Reconcile 循环中的协作                                     │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Reconcile 开始
+    │
+    ▼
+┌──────────────────────────────────┐
+│ StateMachineEngine               │
+│ EvaluateClusterState()           │
+│                                  │
+│ 检查转换规则:                    │
+│   Pending -> Installing?         │
+│   Condition: DesiredVersion != ""│
+│   ✓ 条件满足                     │
+│                                  │
+│ 执行 Action:                     │
+│   初始化 OperationProgress       │
+│   设置 CurrentStage              │
+│                                  │
+│ 更新 LifecyclePhase = Installing │
+└────────────────┬─────────────────┘
+                 │
+                 ▼
+┌──────────────────────────────────┐
+│ shouldExecutePhases()            │
+│                                  │
+│ LifecyclePhase == Installing?    │
+│ ✓ 是                             │
+└────────────────┬─────────────────┘
+                 │
+                 ▼
+┌──────────────────────────────────┐
+│ PhaseFrame                       │
+│ executePhases()                  │
+│                                  │
+│ 执行具体安装逻辑:                │
+│   1. EnsureBKEAgent              │
+│   2. EnsureNodesEnv              │
+│   3. EnsureMasterInit            │
+│   4. EnsureMasterJoin            │
+│   5. EnsureWorkerJoin            │
+│   6. EnsureAddonDeploy           │
+│                                  │
+│ 更新 OperationProgress:          │
+│   CompletedComponents++          │
+│   CurrentStage = "..."           │
+└────────────────┬─────────────────┘
+                 │
+                 ▼
+┌──────────────────────────────────┐
+│ 下次 Reconcile                   │
+│                                  │
+│ StateMachineEngine               │
+│ EvaluateClusterState()           │
+│                                  │
+│ 检查转换规则:                    │
+│   Installing -> Running?         │
+│   Condition: allComponentsInstalled()
+│   ✓ 条件满足                     │
+│                                  │
+│ 执行 Action:                     │
+│   设置 FinishedAt                │
+│                                  │
+│ 更新 LifecyclePhase = Running    │
+└──────────────────────────────────┘
+```
+
+#### 8.6.5 并发控制与状态持久化
+
+**使用 Patch Helper 保证状态一致性**：
+
+```go
+// 使用 controller-runtime 的 patch.Helper 实现乐观锁
+
 func (r *BKEClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
     cluster := &bkev1beta1.BKECluster{}
     if err := r.Get(ctx, req.NamespacedName, cluster); err != nil {
-        return ctrl.Result{}, err
+        return ctrl.Result{}, client.IgnoreNotFound(err)
     }
     
-    // 1. 确定生命周期阶段（驱动模型）
-    lifecyclePhase := r.determineLifecyclePhase(cluster)
-    cluster.Status.LifecyclePhase = lifecyclePhase
-    
-    // 2. 确定健康状态（聚合模型）
-    nodes := &bkev1beta1.BKENodeList{}
-    if err := r.List(ctx, nodes, client.InNamespace(cluster.Namespace)); err != nil {
-        return ctrl.Result{}, err
+    // 创建 Patch Helper，记录初始状态
+    patchHelper, err := patch.NewHelper(cluster, r.Client)
+    if err != nil {
+        return ctrl.Result{}, fmt.Errorf("failed to create patch helper: %w", err)
     }
     
-    healthAggregator := &statemachine.HealthAggregator{}
-    healthStatus := healthAggregator.AggregateClusterHealth(nodes.Items, cluster.Status.ClusterComponentStatuses)
+    // 使用 defer 确保状态总是被持久化
+    defer func() {
+        // Patch 会自动计算 diff，只更新变化的字段
+        // 如果并发冲突，会返回 Conflict 错误，触发重试
+        if err := patchHelper.Patch(ctx, cluster); err != nil {
+            if apierrors.IsConflict(err) {
+                log.Info("Conflict detected, will retry", "cluster", cluster.Name)
+            } else {
+                log.Error(err, "failed to patch cluster")
+            }
+        }
+    }()
+    
+    // ... 状态评估和更新逻辑 ...
+    
+    // 修改 cluster.Status 的字段
+    cluster.Status.LifecyclePhase = newPhase
     cluster.Status.HealthStatus = healthStatus
     
-    // 3. 同步到旧字段（兼容性）
-    statemachine.SyncClusterPhaseToLegacyFields(cluster, lifecyclePhase)
-    
-    // 4. 更新状态
-    if err := r.Status().Update(ctx, cluster); err != nil {
-        return ctrl.Result{}, err
-    }
-    
+    // defer 中的 patchHelper.Patch() 会自动持久化
     return ctrl.Result{}, nil
 }
 ```
+
+**并发安全保证**：
+
+| 场景 | 机制 | 说明 |
+|------|------|------|
+| **多 Reconcile 并发** | Patch Helper 乐观锁 | 并发修改时返回 Conflict，controller-runtime 自动重试 |
+| **状态机引擎并发** | `sync.RWMutex` | 8.3.1 节定义的 `engine.mux` 保护转换规则 |
+| **节点状态更新** | 独立 Patch | 每个节点独立 Patch，互不影响 |
+| **组件状态更新** | 内存中修改 | 组件状态在内存中修改，随集群一起 Patch |
+
+**状态持久化时机**：
+
+```
+Reconcile 开始
+    │
+    ├─ Get BKECluster (读取最新状态)
+    │
+    ├─ 状态评估和修改 (内存中)
+    │   ├─ cluster.Status.LifecyclePhase = ...
+    │   ├─ cluster.Status.HealthStatus = ...
+    │   ├─ node.Status.LifecyclePhase = ...
+    │   └─ component.Phase = ...
+    │
+    ├─ defer patchHelper.Patch() (持久化集群状态)
+    │
+    └─ Reconcile 结束
+```
+
+#### 8.6.6 错误处理与重试
+
+**状态转换失败处理**：
+
+```go
+func (r *BKEClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    // ...
+    
+    // 状态评估
+    if err := r.engine.EvaluateClusterState(ctx, cluster); err != nil {
+        // 区分错误类型
+        switch {
+        case isTransitionError(err):
+            // 状态转换错误（如循环依赖）
+            // 记录事件，不重试
+            r.Recorder.Eventf(cluster, v1.EventTypeWarning,
+                "StateMachineError",
+                "State transition error: %v", err)
+            return ctrl.Result{}, nil
+        
+        case isConditionError(err):
+            // 条件检查错误（如 API 调用失败）
+            // 短暂重试
+            log.Error(err, "condition check failed, will retry")
+            return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+        
+        case isActionError(err):
+            // 动作执行错误（如更新 Status 失败）
+            // 立即重试
+            log.Error(err, "action execution failed, will retry immediately")
+            return ctrl.Result{Requeue: true}, nil
+        
+        default:
+            // 未知错误
+            log.Error(err, "unknown error during state evaluation")
+            return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+        }
+    }
+    
+    // ...
+}
+```
+
+**与人工介入的衔接**：
+
+```go
+// 当状态转换失败超过阈值时，标记为需要人工介入
+
+func (e *StateMachineEngine) EvaluateClusterState(
+    ctx context.Context,
+    cluster *bkev1beta1.BKECluster,
+) error {
+    // ... 检查转换规则 ...
+    
+    for _, rule := range transitions {
+        if rule.Condition(ctx, cluster) {
+            if err := rule.Action(ctx, cluster); err != nil {
+                // 记录失败
+                e.recordFailure(cluster, err)
+                
+                // 检查是否超过重试阈值
+                if e.hasExceededMaxRetries(cluster) {
+                    // 标记为需要人工介入
+                    cluster.Status.OperationProgress.NeedsManualIntervention = true
+                    
+                    // 转换到 Failed 状态
+                    cluster.Status.LifecyclePhase = bkev1beta1.ClusterLifecycleFailed
+                    
+                    // 记录事件
+                    e.recordClusterTransition(cluster, rule.From, bkev1beta1.ClusterLifecycleFailed)
+                    
+                    return nil // 不返回错误，状态已更新
+                }
+                
+                return fmt.Errorf("transition action failed: %w", err)
+            }
+            
+            // 成功，清除失败计数
+            e.clearFailure(cluster)
+            
+            // 更新状态
+            cluster.Status.LifecyclePhase = rule.To
+            e.recordClusterTransition(cluster, rule.From, rule.To)
+            
+            return nil
+        }
+    }
+    
+    return nil
+}
+```
+
+**错误分类与处理策略**：
+
+| 错误类型 | 示例 | 处理策略 | Requeue |
+|---------|------|---------|---------|
+| **TransitionError** | 循环依赖、无效转换 | 记录事件，不重试 | 不 Requeue |
+| **ConditionError** | API 调用失败、网络超时 | 短暂重试 | 10s |
+| **ActionError** | Status 更新失败 | 立即重试 | 立即 |
+| **PhaseError** | Phase 执行失败 | 记录进度，等待下次 Reconcile | 5s |
+| **MaxRetriesExceeded** | 超过最大重试次数 | 标记人工介入，转 Failed | 1m |
 
 ### 8.7 人工介入详细设计
 
@@ -6013,5 +6735,5 @@ data:
 
 ---
 
-**文档版本**: v3.20 (混合模型 - 添加可观测性设计)  
+**文档版本**: v3.21 (混合模型 - 添加状态机引擎集成设计)  
 **维护者**: openFuyao Team
