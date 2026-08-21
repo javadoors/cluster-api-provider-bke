@@ -3103,7 +3103,7 @@ type ClusterTransitionRule struct {
 
 // initClusterTransitions 初始化集群状态转换规则
 func (e *StateMachineEngine) initClusterTransitions() {
-    // Pending -> Installing
+    // ========== Pending -> Installing ==========
     e.clusterTransitions[ClusterLifecyclePending] = append(
         e.clusterTransitions[ClusterLifecyclePending],
         ClusterTransitionRule{
@@ -3114,19 +3114,25 @@ func (e *StateMachineEngine) initClusterTransitions() {
                 return cluster.Spec.DesiredVersion != ""
             },
             Action: func(ctx context.Context, cluster *confv1beta1.BKECluster) error {
-                // 初始化 OperationProgress
+                // 1. 初始化 OperationProgress
                 now := metav1.Now()
                 cluster.Status.OperationProgress = &confv1beta1.OperationProgress{
                     OperationType: confv1beta1.OperationTypeInstall,
                     StartedAt:     &now,
                     CurrentStage:  "InstallingNodeComponents",
                 }
+                
+                // 2. 执行安装操作（调用 PhaseFrame）
+                if err := e.executeInstall(ctx, cluster); err != nil {
+                    return fmt.Errorf("install execution failed: %w", err)
+                }
+                
                 return nil
             },
         },
     )
     
-    // Installing -> Running
+    // ========== Installing -> Running ==========
     e.clusterTransitions[ClusterLifecycleInstalling] = append(
         e.clusterTransitions[ClusterLifecycleInstalling],
         ClusterTransitionRule{
@@ -3137,15 +3143,23 @@ func (e *StateMachineEngine) initClusterTransitions() {
                 return e.allComponentsInstalled(cluster)
             },
             Action: func(ctx context.Context, cluster *confv1beta1.BKECluster) error {
-                // 更新 OperationProgress
+                // 1. 更新 OperationProgress
                 now := metav1.Now()
                 cluster.Status.OperationProgress.FinishedAt = &now
+                
+                // 2. 记录安装完成事件
+                e.recordClusterTransition(cluster, ClusterLifecycleInstalling, ClusterLifecycleRunning)
+                
+                // 3. 发送 Kubernetes Event
+                e.recorder.Eventf(cluster, v1.EventTypeNormal, "InstallCompleted",
+                    "Cluster installation completed successfully")
+                
                 return nil
             },
         },
     )
     
-    // Running -> Upgrading
+    // ========== Running -> Upgrading ==========
     e.clusterTransitions[ClusterLifecycleRunning] = append(
         e.clusterTransitions[ClusterLifecycleRunning],
         ClusterTransitionRule{
@@ -3156,7 +3170,7 @@ func (e *StateMachineEngine) initClusterTransitions() {
                 return cluster.Spec.DesiredVersion != cluster.Status.CurrentVersion
             },
             Action: func(ctx context.Context, cluster *confv1beta1.BKECluster) error {
-                // 初始化 OperationProgress
+                // 1. 初始化 OperationProgress
                 now := metav1.Now()
                 cluster.Status.OperationProgress = &confv1beta1.OperationProgress{
                     OperationType:   confv1beta1.OperationTypeUpgrade,
@@ -3164,12 +3178,18 @@ func (e *StateMachineEngine) initClusterTransitions() {
                     StartedAt:       &now,
                     CurrentStage:    "UpgradingNodeComponents",
                 }
+                
+                // 2. 执行升级操作（调用 PhaseFrame）
+                if err := e.executeUpgrade(ctx, cluster); err != nil {
+                    return fmt.Errorf("upgrade execution failed: %w", err)
+                }
+                
                 return nil
             },
         },
     )
     
-    // Upgrading -> Running
+    // ========== Upgrading -> Running ==========
     e.clusterTransitions[ClusterLifecycleUpgrading] = append(
         e.clusterTransitions[ClusterLifecycleUpgrading],
         ClusterTransitionRule{
@@ -3180,16 +3200,26 @@ func (e *StateMachineEngine) initClusterTransitions() {
                 return e.allComponentsUpgraded(cluster)
             },
             Action: func(ctx context.Context, cluster *confv1beta1.BKECluster) error {
-                // 更新 OperationProgress
+                // 1. 更新 OperationProgress
                 now := metav1.Now()
                 cluster.Status.OperationProgress.FinishedAt = &now
                 cluster.Status.CurrentVersion = cluster.Spec.DesiredVersion
+                
+                // 2. 记录升级完成事件
+                e.recordClusterTransition(cluster, ClusterLifecycleUpgrading, ClusterLifecycleRunning)
+                
+                // 3. 发送 Kubernetes Event
+                e.recorder.Eventf(cluster, v1.EventTypeNormal, "UpgradeCompleted",
+                    "Cluster upgraded from %s to %s successfully",
+                    cluster.Status.OperationProgress.TargetVersion,
+                    cluster.Spec.DesiredVersion)
+                
                 return nil
             },
         },
     )
     
-    // Running -> Scaling
+    // ========== Running -> Scaling ==========
     e.clusterTransitions[ClusterLifecycleRunning] = append(
         e.clusterTransitions[ClusterLifecycleRunning],
         ClusterTransitionRule{
@@ -3200,19 +3230,25 @@ func (e *StateMachineEngine) initClusterTransitions() {
                 return e.hasScalingOperation(cluster)
             },
             Action: func(ctx context.Context, cluster *confv1beta1.BKECluster) error {
-                // 初始化 OperationProgress
+                // 1. 初始化 OperationProgress
                 now := metav1.Now()
                 cluster.Status.OperationProgress = &confv1beta1.OperationProgress{
                     OperationType: confv1beta1.OperationTypeScale,
                     StartedAt:     &now,
                     CurrentStage:  e.getScalingStage(cluster),
                 }
+                
+                // 2. 执行扩缩容操作（调用 PhaseFrame）
+                if err := e.executeScale(ctx, cluster); err != nil {
+                    return fmt.Errorf("scale execution failed: %w", err)
+                }
+                
                 return nil
             },
         },
     )
     
-    // Scaling -> Running
+    // ========== Scaling -> Running ==========
     e.clusterTransitions[ClusterLifecycleScaling] = append(
         e.clusterTransitions[ClusterLifecycleScaling],
         ClusterTransitionRule{
@@ -3223,15 +3259,23 @@ func (e *StateMachineEngine) initClusterTransitions() {
                 return e.scalingCompleted(cluster)
             },
             Action: func(ctx context.Context, cluster *confv1beta1.BKECluster) error {
-                // 更新 OperationProgress
+                // 1. 更新 OperationProgress
                 now := metav1.Now()
                 cluster.Status.OperationProgress.FinishedAt = &now
+                
+                // 2. 记录扩缩容完成事件
+                e.recordClusterTransition(cluster, ClusterLifecycleScaling, ClusterLifecycleRunning)
+                
+                // 3. 发送 Kubernetes Event
+                e.recorder.Eventf(cluster, v1.EventTypeNormal, "ScaleCompleted",
+                    "Cluster scaling completed successfully")
+                
                 return nil
             },
         },
     )
     
-    // 任意状态 -> Failed
+    // ========== 任意操作状态 -> Failed ==========
     for _, phase := range []ClusterLifecyclePhase{
         ClusterLifecycleInstalling,
         ClusterLifecycleUpgrading,
@@ -3248,13 +3292,119 @@ func (e *StateMachineEngine) initClusterTransitions() {
                     return e.hasExceededMaxRetries(cluster)
                 },
                 Action: func(ctx context.Context, cluster *confv1beta1.BKECluster) error {
-                    // 标记需要人工介入
+                    // 1. 标记需要人工介入
                     cluster.Status.OperationProgress.NeedsManualIntervention = true
+                    
+                    // 2. 记录失败事件
+                    e.recordClusterTransition(cluster, phase, ClusterLifecycleFailed)
+                    
+                    // 3. 发送 Kubernetes Event
+                    e.recorder.Eventf(cluster, v1.EventTypeWarning, "OperationFailed",
+                        "Operation %s failed after %d retries, manual intervention required",
+                        cluster.Status.OperationProgress.OperationType,
+                        cluster.Status.OperationProgress.LastFailure.Attempt)
+                    
                     return nil
                 },
             },
         )
     }
+}
+
+// ========== 操作执行方法 ==========
+
+// executeInstall 执行安装操作
+func (e *StateMachineEngine) executeInstall(ctx context.Context, cluster *confv1beta1.BKECluster) error {
+    log.Info("Starting cluster installation",
+        "cluster", cluster.Name,
+        "targetVersion", cluster.Spec.DesiredVersion)
+    
+    // 委托给 PhaseFrame 执行器
+    // PhaseFrame 会根据 OperationProgress.CurrentStage 决定执行哪些 Phase
+    if err := e.phaseExecutor.Execute(ctx, cluster); err != nil {
+        // 记录失败
+        e.recordFailure(cluster, err)
+        return err
+    }
+    
+    // 更新进度
+    cluster.Status.OperationProgress.CompletedComponents++
+    
+    return nil
+}
+
+// executeUpgrade 执行升级操作
+func (e *StateMachineEngine) executeUpgrade(ctx context.Context, cluster *confv1beta1.BKECluster) error {
+    log.Info("Starting cluster upgrade",
+        "cluster", cluster.Name,
+        "fromVersion", cluster.Status.CurrentVersion,
+        "toVersion", cluster.Spec.DesiredVersion)
+    
+    // 委托给 PhaseFrame 执行器
+    if err := e.phaseExecutor.Execute(ctx, cluster); err != nil {
+        // 记录失败
+        e.recordFailure(cluster, err)
+        return err
+    }
+    
+    // 更新进度
+    cluster.Status.OperationProgress.CompletedComponents++
+    
+    return nil
+}
+
+// executeScale 执行扩缩容操作
+func (e *StateMachineEngine) executeScale(ctx context.Context, cluster *confv1beta1.BKECluster) error {
+    log.Info("Starting cluster scaling",
+        "cluster", cluster.Name,
+        "stage", cluster.Status.OperationProgress.CurrentStage)
+    
+    // 委托给 PhaseFrame 执行器
+    if err := e.phaseExecutor.Execute(ctx, cluster); err != nil {
+        // 记录失败
+        e.recordFailure(cluster, err)
+        return err
+    }
+    
+    // 更新进度
+    cluster.Status.OperationProgress.CompletedComponents++
+    
+    return nil
+}
+
+// executeRollback 执行回滚操作
+func (e *StateMachineEngine) executeRollback(ctx context.Context, cluster *confv1beta1.BKECluster) error {
+    log.Info("Starting cluster rollback",
+        "cluster", cluster.Name,
+        "targetVersion", cluster.Status.CurrentVersion)
+    
+    // 委托给 PhaseFrame 执行器
+    if err := e.phaseExecutor.Execute(ctx, cluster); err != nil {
+        // 记录失败
+        e.recordFailure(cluster, err)
+        return err
+    }
+    
+    // 更新进度
+    cluster.Status.OperationProgress.CompletedComponents++
+    
+    return nil
+}
+
+// recordFailure 记录操作失败
+func (e *StateMachineEngine) recordFailure(cluster *confv1beta1.BKECluster, err error) {
+    if cluster.Status.OperationProgress.LastFailure == nil {
+        cluster.Status.OperationProgress.LastFailure = &confv1beta1.OperationFailureRecord{}
+    }
+    
+    cluster.Status.OperationProgress.LastFailure.Attempt++
+    cluster.Status.OperationProgress.LastFailure.Error = err.Error()
+    cluster.Status.OperationProgress.LastFailure.FailedAt = metav1.Now()
+    
+    log.Error(err, "Operation failed",
+        "cluster", cluster.Name,
+        "operationType", cluster.Status.OperationProgress.OperationType,
+        "attempt", cluster.Status.OperationProgress.LastFailure.Attempt)
 }
 ```
 
