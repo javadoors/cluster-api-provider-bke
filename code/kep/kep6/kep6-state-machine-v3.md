@@ -4668,7 +4668,13 @@ func (r *BKEClusterReconciler) executePhaseFlow(ctx context.Context, ...) {
 ```
 ```
 
-#### 8.3.4 组件层状态转换
+#### 8.3.4 组件层状态转换（嵌入式设计）
+
+**设计原则**：组件层状态转换不独立运行，而是嵌入到节点层/集群层状态机中，由上层状态机驱动。
+
+**组件分类**：
+- **节点级组件**（scope=node）：挂载在节点上，由节点层状态机驱动
+- **集群级组件**（scope=cluster）：挂载在集群上，由集群层状态机驱动
 
 ```go
 // ComponentTransitionRule 组件状态转换规则
@@ -4679,21 +4685,34 @@ type ComponentTransitionRule struct {
     Action    func(ctx context.Context, component *confv1beta1.ComponentLifecycleStatus) error
 }
 
-// initComponentTransitions 初始化组件状态转换规则
-func (e *StateMachineEngine) initComponentTransitions() {
+// ComponentStateMachine 组件层状态机（嵌入式）
+// 不独立运行，由节点层/集群层状态机驱动
+type ComponentStateMachine struct {
+    transitions map[ComponentLifecyclePhase][]ComponentTransitionRule
+}
+
+// NewComponentStateMachine 创建组件层状态机
+func NewComponentStateMachine() *ComponentStateMachine {
+    sm := &ComponentStateMachine{
+        transitions: make(map[ComponentLifecyclePhase][]ComponentTransitionRule),
+    }
+    sm.initTransitions()
+    return sm
+}
+
+// initTransitions 初始化组件状态转换规则
+func (sm *ComponentStateMachine) initTransitions() {
     // Pending -> Installing
-    e.componentTransitions[ComponentLifecyclePending] = append(
-        e.componentTransitions[ComponentLifecyclePending],
+    sm.transitions[ComponentLifecyclePending] = append(
+        sm.transitions[ComponentLifecyclePending],
         ComponentTransitionRule{
             From: ComponentLifecyclePending,
             To:   ComponentLifecycleInstalling,
             Condition: func(ctx context.Context, component *confv1beta1.ComponentLifecycleStatus) bool {
-                // 当开始安装时
                 return component.OperationProgress != nil &&
                     component.OperationProgress.OperationType == confv1beta1.ComponentOperationTypeInstall
             },
             Action: func(ctx context.Context, component *confv1beta1.ComponentLifecycleStatus) error {
-                // 初始化 OperationProgress
                 now := metav1.Now()
                 component.OperationProgress.StartedAt = &now
                 component.OperationProgress.CurrentStage = "Downloading"
@@ -4703,17 +4722,16 @@ func (e *StateMachineEngine) initComponentTransitions() {
     )
     
     // Installing -> Installed
-    e.componentTransitions[ComponentLifecycleInstalling] = append(
-        e.componentTransitions[ComponentLifecycleInstalling],
+    sm.transitions[ComponentLifecycleInstalling] = append(
+        sm.transitions[ComponentLifecycleInstalling],
         ComponentTransitionRule{
             From: ComponentLifecycleInstalling,
             To:   ComponentLifecycleInstalled,
             Condition: func(ctx context.Context, component *confv1beta1.ComponentLifecycleStatus) bool {
-                // 当安装完成时
-                return e.componentInstallationCompleted(component)
+                return component.OperationProgress != nil &&
+                    component.OperationProgress.CompletedSteps == component.OperationProgress.TotalSteps
             },
             Action: func(ctx context.Context, component *confv1beta1.ComponentLifecycleStatus) error {
-                // 更新 OperationProgress
                 now := metav1.Now()
                 component.OperationProgress.FinishedAt = &now
                 return nil
@@ -4722,18 +4740,16 @@ func (e *StateMachineEngine) initComponentTransitions() {
     )
     
     // Installed -> Upgrading
-    e.componentTransitions[ComponentLifecycleInstalled] = append(
-        e.componentTransitions[ComponentLifecycleInstalled],
+    sm.transitions[ComponentLifecycleInstalled] = append(
+        sm.transitions[ComponentLifecycleInstalled],
         ComponentTransitionRule{
             From: ComponentLifecycleInstalled,
             To:   ComponentLifecycleUpgrading,
             Condition: func(ctx context.Context, component *confv1beta1.ComponentLifecycleStatus) bool {
-                // 当开始升级时
                 return component.OperationProgress != nil &&
                     component.OperationProgress.OperationType == confv1beta1.ComponentOperationTypeUpgrade
             },
             Action: func(ctx context.Context, component *confv1beta1.ComponentLifecycleStatus) error {
-                // 初始化 OperationProgress
                 now := metav1.Now()
                 component.OperationProgress.StartedAt = &now
                 component.OperationProgress.CurrentStage = "BackingUp"
@@ -4743,17 +4759,16 @@ func (e *StateMachineEngine) initComponentTransitions() {
     )
     
     // Upgrading -> Installed
-    e.componentTransitions[ComponentLifecycleUpgrading] = append(
-        e.componentTransitions[ComponentLifecycleUpgrading],
+    sm.transitions[ComponentLifecycleUpgrading] = append(
+        sm.transitions[ComponentLifecycleUpgrading],
         ComponentTransitionRule{
             From: ComponentLifecycleUpgrading,
             To:   ComponentLifecycleInstalled,
             Condition: func(ctx context.Context, component *confv1beta1.ComponentLifecycleStatus) bool {
-                // 当升级完成时
-                return e.componentUpgradeCompleted(component)
+                return component.OperationProgress != nil &&
+                    component.OperationProgress.CompletedSteps == component.OperationProgress.TotalSteps
             },
             Action: func(ctx context.Context, component *confv1beta1.ComponentLifecycleStatus) error {
-                // 更新 OperationProgress
                 now := metav1.Now()
                 component.OperationProgress.FinishedAt = &now
                 return nil
@@ -4762,18 +4777,16 @@ func (e *StateMachineEngine) initComponentTransitions() {
     )
     
     // Installed -> Deleting
-    e.componentTransitions[ComponentLifecycleInstalled] = append(
-        e.componentTransitions[ComponentLifecycleInstalled],
+    sm.transitions[ComponentLifecycleInstalled] = append(
+        sm.transitions[ComponentLifecycleInstalled],
         ComponentTransitionRule{
             From: ComponentLifecycleInstalled,
             To:   ComponentLifecycleDeleting,
             Condition: func(ctx context.Context, component *confv1beta1.ComponentLifecycleStatus) bool {
-                // 当开始删除时
                 return component.OperationProgress != nil &&
                     component.OperationProgress.OperationType == confv1beta1.ComponentOperationTypeDelete
             },
             Action: func(ctx context.Context, component *confv1beta1.ComponentLifecycleStatus) error {
-                // 初始化 OperationProgress
                 now := metav1.Now()
                 component.OperationProgress.StartedAt = &now
                 component.OperationProgress.CurrentStage = "Stopping"
@@ -4783,17 +4796,16 @@ func (e *StateMachineEngine) initComponentTransitions() {
     )
     
     // Deleting -> Deleted
-    e.componentTransitions[ComponentLifecycleDeleting] = append(
-        e.componentTransitions[ComponentLifecycleDeleting],
+    sm.transitions[ComponentLifecycleDeleting] = append(
+        sm.transitions[ComponentLifecycleDeleting],
         ComponentTransitionRule{
             From: ComponentLifecycleDeleting,
             To:   ComponentLifecycleDeleted,
             Condition: func(ctx context.Context, component *confv1beta1.ComponentLifecycleStatus) bool {
-                // 当删除完成时
-                return e.componentDeletionCompleted(component)
+                return component.OperationProgress != nil &&
+                    component.OperationProgress.CompletedSteps == component.OperationProgress.TotalSteps
             },
             Action: func(ctx context.Context, component *confv1beta1.ComponentLifecycleStatus) error {
-                // 更新 OperationProgress
                 now := metav1.Now()
                 component.OperationProgress.FinishedAt = &now
                 return nil
@@ -4801,7 +4813,167 @@ func (e *StateMachineEngine) initComponentTransitions() {
         },
     )
 }
+
+// EvaluateComponentState 评估组件状态（由上层状态机调用）
+func (sm *ComponentStateMachine) EvaluateComponentState(
+    ctx context.Context,
+    component *confv1beta1.ComponentLifecycleStatus,
+) error {
+    currentPhase := component.Phase
+    transitions := sm.transitions[currentPhase]
+    
+    for _, rule := range transitions {
+        if rule.Condition(ctx, component) {
+            if err := rule.Action(ctx, component); err != nil {
+                return fmt.Errorf("failed to execute component transition action: %w", err)
+            }
+            component.Phase = rule.To
+            return nil
+        }
+    }
+    
+    return nil
+}
 ```
+
+**节点层状态机嵌入组件层状态机**：
+
+```go
+// NodeStateMachine 节点层状态机（嵌入组件层状态机）
+type NodeStateMachine struct {
+    transitions map[NodeLifecyclePhase][]NodeTransitionRule
+    componentSM *ComponentStateMachine  // 嵌入组件层状态机
+}
+
+// NewNodeStateMachine 创建节点层状态机
+func NewNodeStateMachine() *NodeStateMachine {
+    sm := &NodeStateMachine{
+        transitions: make(map[NodeLifecyclePhase][]NodeTransitionRule),
+        componentSM: NewComponentStateMachine(),  // 嵌入组件层状态机
+    }
+    sm.initTransitions()
+    return sm
+}
+
+// EvaluateNodeState 评估节点状态（同时驱动节点级组件状态）
+func (sm *NodeStateMachine) EvaluateNodeState(
+    ctx context.Context,
+    node *confv1beta1.BKENode,
+) error {
+    // 1. 评估节点状态
+    currentPhase := node.Status.LifecyclePhase
+    transitions := sm.transitions[currentPhase]
+    
+    for _, rule := range transitions {
+        if rule.Condition(ctx, node) {
+            if err := rule.Action(ctx, node); err != nil {
+                return fmt.Errorf("failed to execute node transition action: %w", err)
+            }
+            node.Status.LifecyclePhase = rule.To
+            break
+        }
+    }
+    
+    // 2. 驱动节点级组件状态转换
+    for i := range node.Status.Components {
+        comp := &node.Status.Components[i]
+        if comp.Scope == confv1beta1.ComponentScopeNode {
+            if err := sm.componentSM.EvaluateComponentState(ctx, comp); err != nil {
+                return fmt.Errorf("failed to evaluate node component state: %w", err)
+            }
+        }
+    }
+    
+    return nil
+}
+```
+
+**集群层状态机嵌入节点层状态机**：
+
+```go
+// StateMachineEngine 集群层状态机（嵌入节点层状态机）
+type StateMachineEngine struct {
+    client client.Client
+    
+    clusterSM   *ClusterStateMachine   // 集群层状态机
+    nodeSM      *NodeStateMachine      // 节点层状态机（嵌入组件层）
+    
+    healthAggregator *HealthAggregator
+    mux sync.RWMutex
+}
+
+// NewStateMachineEngine 创建状态机引擎
+func NewStateMachineEngine(client client.Client) *StateMachineEngine {
+    engine := &StateMachineEngine{
+        client:           client,
+        clusterSM:        NewClusterStateMachine(),
+        nodeSM:           NewNodeStateMachine(),  // 节点层状态机（已嵌入组件层）
+        healthAggregator: &HealthAggregator{},
+    }
+    return engine
+}
+
+// EvaluateClusterState 评估集群状态（同时驱动集群级组件和节点状态）
+func (e *StateMachineEngine) EvaluateClusterState(
+    ctx context.Context,
+    cluster *confv1beta1.BKECluster,
+) error {
+    e.mux.RLock()
+    defer e.mux.RUnlock()
+    
+    // 1. 评估集群状态
+    currentPhase := cluster.Status.LifecyclePhase
+    transitions := e.clusterSM.transitions[currentPhase]
+    
+    for _, rule := range transitions {
+        if rule.Condition(ctx, cluster) {
+            if err := rule.Action(ctx, cluster); err != nil {
+                return fmt.Errorf("failed to execute cluster transition action: %w", err)
+            }
+            cluster.Status.LifecyclePhase = rule.To
+            break
+        }
+    }
+    
+    // 2. 驱动集群级组件状态转换
+    for name, comp := range cluster.Status.ClusterComponentStatuses {
+        if comp.Scope == confv1beta1.ComponentScopeCluster {
+            if err := e.nodeSM.componentSM.EvaluateComponentState(ctx, &comp); err != nil {
+                return fmt.Errorf("failed to evaluate cluster component state: %w", err)
+            }
+            cluster.Status.ClusterComponentStatuses[name] = comp
+        }
+    }
+    
+    // 3. 驱动节点状态（节点层状态机会自动驱动节点级组件）
+    nodes := &confv1beta1.BKENodeList{}
+    if err := e.client.List(ctx, nodes, client.InNamespace(cluster.Namespace)); err != nil {
+        return fmt.Errorf("failed to list nodes: %w", err)
+    }
+    
+    for i := range nodes.Items {
+        node := &nodes.Items[i]
+        if err := e.nodeSM.EvaluateNodeState(ctx, node); err != nil {
+            return fmt.Errorf("failed to evaluate node state: %w", err)
+        }
+        // 更新节点状态
+        if err := e.client.Status().Update(ctx, node); err != nil {
+            return fmt.Errorf("failed to update node status: %w", err)
+        }
+    }
+    
+    return nil
+}
+```
+
+**嵌入式设计的优势**：
+
+| 优势 | 说明 |
+|------|------|
+| **状态一致性** | 节点级组件状态由节点层驱动，集群级组件状态由集群层驱动，保证状态一致 |
+| **层次清晰** | 集群层 → 节点层 → 组件层，层次分明，职责明确 |
+| **简化调用** | 只需调用 `EvaluateClusterState()`，自动驱动所有下层状态 |
+| **避免独立运行** | 组件层状态机不独立运行，避免状态不一致 |
 
 #### 8.3.5 状态评估与转换
 
