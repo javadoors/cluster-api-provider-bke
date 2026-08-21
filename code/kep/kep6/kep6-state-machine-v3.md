@@ -3681,23 +3681,10 @@ func (e *StateMachineEngine) recordFailure(cluster *confv1beta1.BKECluster, err 
 
 为支持节点级组件，需要扩展以下数据结构：
 
+**扩展 1: ComponentVersion 增加 Scope 字段**
+
 ```go
-// ========== 扩展 1: ComponentVersion 增加 Scope 字段 ==========
-
 // api/v1alpha1/componentversion_types.go
-
-type ComponentVersionSpec struct {
-    Name            string            `json:"name"`
-    Type            ComponentType     `json:"type"`
-    Version         string            `json:"version"`
-    
-    // 🆕 组件作用域（默认 cluster）
-    // - "cluster": 集群级组件，每个集群执行一次（如 coredns、kube-proxy）
-    // - "node": 节点级组件，每个节点执行一次（如 bkeagent、containerd、kubelet）
-    Scope           ComponentScope    `json:"scope,omitempty"`
-    
-    // ... 其他字段不变 ...
-}
 
 type ComponentScope string
 
@@ -3706,8 +3693,29 @@ const (
     ComponentScopeNode    ComponentScope = "node"     // 节点级
 )
 
-// ========== 扩展 2: ComponentNode 增加节点信息 ==========
+type ComponentVersionSpec struct {
+    Name            string            `json:"name"`
+    Type            ComponentType     `json:"type"`
+    Version         string            `json:"version"`
+    
+    // 组件作用域（默认 cluster）
+    // - "cluster": 集群级组件，每个集群执行一次（如 coredns、kube-proxy）
+    // - "node": 节点级组件，每个节点执行一次（如 bkeagent、containerd、kubelet）
+    Scope           ComponentScope    `json:"scope,omitempty"`
+    
+    Inline          *InlineSpec       `json:"inline,omitempty"`
+    YAML            *YAMLSpec         `json:"yaml,omitempty"`
+    SubComponents   []SubComponent    `json:"subComponents,omitempty"`
+    Compatibility   CompatibilitySpec `json:"compatibility,omitempty"`
+    Dependencies    []Dependency      `json:"dependencies,omitempty"`
+    UpgradeStrategy UpgradeStrategySpec `json:"upgradeStrategy,omitempty"`
+    Resources       []ResourceSpec    `json:"resources,omitempty"`
+}
+```
 
+**扩展 2: ComponentNode 增加节点信息**
+
+```go
 // pkg/topology/component.go
 
 type ComponentNode struct {
@@ -3717,15 +3725,24 @@ type ComponentNode struct {
     FailurePolicy FailurePolicy
     Dependencies  []string
     
-    // 🆕 节点级组件的节点信息
+    // 节点级组件的节点信息
     Scope    ComponentScope  // cluster 或 node
     NodeIP   string          // 节点 IP（仅 scope=node 时有值）
     NodeName string          // 节点名称（仅 scope=node 时有值）
     NodeRole string          // 节点角色 master/worker（仅 scope=node 时有值）
 }
 
-// ========== 扩展 3: ReleaseImage 增加节点级组件声明 ==========
+// NodeInfo 节点信息（用于 DAG 构建）
+type NodeInfo struct {
+    Name string  // 节点名称
+    IP   string  // 节点 IP
+    Role string  // 节点角色：master/worker
+}
+```
 
+**扩展 3: ReleaseImage 增加节点级组件声明**
+
+```go
 // api/v1alpha1/releaseimage_types.go
 
 type ReleaseImageUpgradeComponent struct {
@@ -3733,22 +3750,25 @@ type ReleaseImageUpgradeComponent struct {
     Version string                     `json:"version,omitempty"`
     Inline  *ReleaseImageUpgradeInline `json:"inline,omitempty"`
     
-    // 🆕 组件作用域
+    // 组件作用域（默认 cluster）
     Scope   ComponentScope             `json:"scope,omitempty"`
 }
+```
 
-// ========== 扩展 4: BuildUpgradeDAG 支持节点展开 ==========
+**扩展 4: BuildUpgradeDAG 支持节点展开**
 
+```go
 // pkg/topology/build.go
 
 // BuildUpgradeDAG 构建升级 DAG（扩展：支持节点级组件展开）
 func BuildUpgradeDAG(
     components []cvv1alpha1.ReleaseImageUpgradeComponent,
     resolve DependencyResolver,
-    nodes []NodeInfo,  // 🆕 新增：节点列表
+    nodes []NodeInfo,  // 新增：节点列表
 ) (*UpgradeDAG, error) {
     dag := NewUpgradeDAG()
     
+    // 第一步：创建所有组件节点
     for _, comp := range components {
         switch comp.Scope {
         case ComponentScopeNode:
@@ -3794,14 +3814,112 @@ func BuildUpgradeDAG(
         }
     }
     
-    // 解析依赖关系（节点级组件的依赖需要展开到每个节点）
-    // ...
+    // 第二步：解析依赖关系
+    for _, comp := range components {
+        deps, err := resolve(comp.Name, comp.Version)
+        if err != nil {
+            return nil, fmt.Errorf("resolve dependencies for %s: %w", comp.Name, err)
+        }
+        
+        switch comp.Scope {
+        case ComponentScopeNode:
+            // 节点级组件的依赖需要展开到每个节点
+            for _, node := range nodes {
+                nodeName := fmt.Sprintf("%s@%s", comp.Name, node.IP)
+                for _, dep := range deps {
+                    // 查找依赖组件的 ComponentVersion
+                    depCV, err := lookupComponentVersion(dep, comp.Version)
+                    if err != nil {
+                        return nil, err
+                    }
+                    
+                    if depCV.Spec.Scope == ComponentScopeNode {
+                        // 依赖也是节点级：依赖同一节点的同名组件
+                        depNodeName := fmt.Sprintf("%s@%s", dep, node.IP)
+                        if err := dag.AddDependency(depNodeName, nodeName); err != nil {
+                            return nil, err
+                        }
+                    } else {
+                        // 依赖是集群级：依赖集群级的同名组件
+                        if err := dag.AddDependency(dep, nodeName); err != nil {
+                            return nil, err
+                        }
+                    }
+                }
+            }
+        
+        default: // ComponentScopeCluster
+            // 集群级组件的依赖保持原样
+            for _, dep := range deps {
+                if err := dag.AddDependency(dep, comp.Name); err != nil {
+                    return nil, err
+                }
+            }
+        }
+    }
     
     return dag, nil
 }
 
-// ========== 扩展 5: Scheduler 支持节点级执行 ==========
+// lookupComponentVersion 查找组件版本信息
+func lookupComponentVersion(name, version string) (*cvv1alpha1.ComponentVersion, error) {
+    // 从 ComponentVersionStore 或 manifest store 中查找
+    // 实际实现需要根据具体的存储后端实现
+    return nil, fmt.Errorf("not implemented")
+}
+```
 
+**扩展 5: ExecutionContext 支持节点级上下文**
+
+```go
+// pkg/dagexec/execution_context.go
+
+type ExecutionContext struct {
+    OldCluster             *bkev1beta1.BKECluster
+    Cluster                *bkev1beta1.BKECluster
+    ComponentStatusUpdater ComponentStatusUpdater
+    Log                    *bkev1beta1.BKELogger
+    VersionContext         *upgrade.VersionContext
+    TemplateContext        manifest.TemplateContext
+    TargetClient           kubernetes.Interface
+    Client                 client.Client
+    
+    // 节点级执行上下文（仅 scope=node 时有值）
+    NodeIP   string
+    NodeName string
+    NodeRole string
+    SSHClient SSHClient  // SSH 客户端（用于节点级组件执行）
+}
+
+// ForNode 创建节点级执行上下文
+func (e *ExecutionContext) ForNode(nodeIP, nodeName, nodeRole string) *ExecutionContext {
+    return &ExecutionContext{
+        OldCluster:             e.OldCluster,
+        Cluster:                e.Cluster,
+        ComponentStatusUpdater: e.ComponentStatusUpdater,
+        Log:                    e.Log.WithValues("node", nodeName, "nodeIP", nodeIP),
+        VersionContext:         e.VersionContext,
+        TemplateContext:        e.TemplateContext,
+        TargetClient:           e.TargetClient,
+        Client:                 e.Client,
+        NodeIP:                 nodeIP,
+        NodeName:               nodeName,
+        NodeRole:               nodeRole,
+        SSHClient:              e.createSSHClient(nodeIP),
+    }
+}
+
+// createSSHClient 创建 SSH 客户端
+func (e *ExecutionContext) createSSHClient(nodeIP string) SSHClient {
+    // 从 BKENode CRD 中获取 SSH 连接信息
+    // 实际实现需要根据具体的 SSH 库实现
+    return nil  // placeholder
+}
+```
+
+**扩展 6: Scheduler 支持节点级执行**
+
+```go
 // pkg/dagexec/scheduler.go
 
 // lifecycleMarkRef 扩展：根据 Scope 返回不同的标记引用
@@ -3822,7 +3940,11 @@ func lifecycleMarkRef(cluster *bkev1beta1.BKECluster, node *topology.ComponentNo
 }
 
 // executeComponent 扩展：节点级组件通过 SSH 执行
-func (s *Scheduler) executeComponent(ctx context.Context, execCtx *ExecutionContext, node *topology.ComponentNode) error {
+func (s *Scheduler) executeComponent(
+    ctx context.Context,
+    execCtx *ExecutionContext,
+    node *topology.ComponentNode,
+) error {
     switch node.Scope {
     case topology.ComponentScopeNode:
         // 节点级组件：创建节点级执行上下文，通过 SSH 执行
@@ -3833,6 +3955,241 @@ func (s *Scheduler) executeComponent(ctx context.Context, execCtx *ExecutionCont
         // 集群级组件：原有逻辑
         return s.executeClusterComponent(ctx, execCtx, node)
     }
+}
+
+// executeNodeComponent 执行节点级组件
+func (s *Scheduler) executeNodeComponent(
+    ctx context.Context,
+    execCtx *ExecutionContext,
+    node *topology.ComponentNode,
+) error {
+    execCtx.Log.Info("Executing node component",
+        "component", node.Name,
+        "nodeIP", execCtx.NodeIP,
+        "nodeRole", execCtx.NodeRole)
+    
+    // 1. 更新组件状态为 Installing
+    markRef := lifecycleMarkRef(execCtx.Cluster, node)
+    if err := execCtx.ComponentStatusUpdater.MarkInstalling(ctx, markRef); err != nil {
+        return fmt.Errorf("mark installing: %w", err)
+    }
+    
+    // 2. 根据组件类型执行
+    var err error
+    if node.Inline != nil {
+        // inline 类型：通过 SSH 执行 inline handler
+        err = s.executeNodeInline(ctx, execCtx, node)
+    } else {
+        // yaml/helm 类型：通过 SSH 执行 kubectl/helm 命令
+        err = s.executeNodeManifest(ctx, execCtx, node)
+    }
+    
+    // 3. 更新组件状态
+    if err != nil {
+        execCtx.ComponentStatusUpdater.MarkFailed(ctx, markRef, err)
+        return err
+    }
+    
+    execCtx.ComponentStatusUpdater.MarkInstalled(ctx, markRef)
+    return nil
+}
+
+// executeNodeInline 通过 SSH 执行节点级 inline 组件
+func (s *Scheduler) executeNodeInline(
+    ctx context.Context,
+    execCtx *ExecutionContext,
+    node *topology.ComponentNode,
+) error {
+    if s.inlineRunner == nil {
+        return fmt.Errorf("inline runner not configured")
+    }
+    
+    // 通过 SSH 执行 inline handler
+    // inline handler 需要在目标节点上执行，因此需要通过 SSH 连接
+    return s.inlineRunner.Execute(ctx, execCtx.OldCluster, execCtx.Cluster,
+        node.Inline.Handler, node.Inline.Version)
+}
+
+// executeNodeManifest 通过 SSH 执行节点级 manifest 组件
+func (s *Scheduler) executeNodeManifest(
+    ctx context.Context,
+    execCtx *ExecutionContext,
+    node *topology.ComponentNode,
+) error {
+    if s.yamlExecutor == nil {
+        return fmt.Errorf("yaml executor not configured")
+    }
+    
+    // 获取 ComponentVersion
+    cv, err := execCtx.ComponentStatusUpdater.GetComponentVersion(ctx, node.Name, node.Version)
+    if err != nil {
+        return fmt.Errorf("get component version: %w", err)
+    }
+    
+    // 通过 SSH 执行 YAML/Helm 安装
+    return s.yamlExecutor.Apply(ctx, cv, execCtx)
+}
+
+// executeClusterComponent 执行集群级组件（原有逻辑）
+func (s *Scheduler) executeClusterComponent(
+    ctx context.Context,
+    execCtx *ExecutionContext,
+    node *topology.ComponentNode,
+) error {
+    execCtx.Log.Info("Executing cluster component", "component", node.Name)
+    
+    // 1. 更新组件状态为 Installing
+    markRef := lifecycleMarkRef(execCtx.Cluster, node)
+    if err := execCtx.ComponentStatusUpdater.MarkInstalling(ctx, markRef); err != nil {
+        return fmt.Errorf("mark installing: %w", err)
+    }
+    
+    // 2. 根据组件类型执行
+    var err error
+    if node.Inline != nil {
+        // inline 类型：通过 Registry 查找执行器
+        if s.registry != nil {
+            if executor, ok := s.registry.Get(node.Inline.Handler); ok {
+                err = executor.ExecuteComponent(ctx, node, execCtx)
+            } else {
+                // Registry 未命中，使用 Legacy inline runner
+                err = s.executeInline(ctx, execCtx.OldCluster, execCtx.Cluster, node)
+            }
+        } else {
+            err = s.executeInline(ctx, execCtx.OldCluster, execCtx.Cluster, node)
+        }
+    } else {
+        // yaml/helm 类型
+        err = s.executeManifest(ctx, execCtx, node, nil)
+    }
+    
+    // 3. 更新组件状态
+    if err != nil {
+        execCtx.ComponentStatusUpdater.MarkFailed(ctx, markRef, err)
+        return err
+    }
+    
+    execCtx.ComponentStatusUpdater.MarkInstalled(ctx, markRef)
+    return nil
+}
+```
+
+**扩展 7: ComponentStatusUpdater 支持节点级状态更新**
+
+```go
+// pkg/dagexec/component_status_updater.go
+
+type ComponentStatusUpdater interface {
+    // 集群级组件状态更新
+    MarkInstalling(ctx context.Context, ref ComponentMarkRef) error
+    MarkInstalled(ctx context.Context, ref ComponentMarkRef) error
+    MarkFailed(ctx context.Context, ref ComponentMarkRef, err error) error
+    
+    // 获取 ComponentVersion
+    GetComponentVersion(ctx context.Context, name, version string) (*cvv1alpha1.ComponentVersion, error)
+}
+
+// BKEComponentStatusUpdater BKE 组件状态更新器实现
+type BKEComponentStatusUpdater struct {
+    client client.Client
+}
+
+func (u *BKEComponentStatusUpdater) MarkInstalling(ctx context.Context, ref ComponentMarkRef) error {
+    if ref.ComponentType == StatusComponentTypeNode {
+        // 节点级组件：更新 BKENode.Status.Components
+        return u.updateNodeComponentStatus(ctx, ref, ComponentLifecycleInstalling, nil)
+    }
+    // 集群级组件：更新 BKECluster.Status.ClusterComponentStatuses
+    return u.updateClusterComponentStatus(ctx, ref, ComponentLifecycleInstalling, nil)
+}
+
+func (u *BKEComponentStatusUpdater) MarkInstalled(ctx context.Context, ref ComponentMarkRef) error {
+    if ref.ComponentType == StatusComponentTypeNode {
+        return u.updateNodeComponentStatus(ctx, ref, ComponentLifecycleInstalled, nil)
+    }
+    return u.updateClusterComponentStatus(ctx, ref, ComponentLifecycleInstalled, nil)
+}
+
+func (u *BKEComponentStatusUpdater) MarkFailed(ctx context.Context, ref ComponentMarkRef, err error) error {
+    if ref.ComponentType == StatusComponentTypeNode {
+        return u.updateNodeComponentStatus(ctx, ref, ComponentLifecycleFailed, err)
+    }
+    return u.updateClusterComponentStatus(ctx, ref, ComponentLifecycleFailed, err)
+}
+
+// updateNodeComponentStatus 更新节点级组件状态
+func (u *BKEComponentStatusUpdater) updateNodeComponentStatus(
+    ctx context.Context,
+    ref ComponentMarkRef,
+    phase ComponentLifecyclePhase,
+    err error,
+) error {
+    // 查找 BKENode
+    nodeList := &bkev1beta1.BKENodeList{}
+    if err := u.client.List(ctx, nodeList, client.InNamespace(ref.Cluster.Namespace)); err != nil {
+        return err
+    }
+    
+    var targetNode *bkev1beta1.BKENode
+    for i := range nodeList.Items {
+        if nodeList.Items[i].Spec.IP == ref.NodeIP {
+            targetNode = &nodeList.Items[i]
+            break
+        }
+    }
+    
+    if targetNode == nil {
+        return fmt.Errorf("node not found: %s", ref.NodeIP)
+    }
+    
+    // 更新组件状态
+    found := false
+    for i := range targetNode.Status.Components {
+        if targetNode.Status.Components[i].Name == ref.Name {
+            targetNode.Status.Components[i].Phase = phase
+            if err != nil {
+                targetNode.Status.Components[i].Message = err.Error()
+            }
+            found = true
+            break
+        }
+    }
+    
+    if !found {
+        // 添加新组件状态
+        targetNode.Status.Components = append(targetNode.Status.Components,
+            bkev1beta1.ComponentLifecycleStatus{
+                Name:    ref.Name,
+                Phase:   phase,
+                Message: func() string { if err != nil { return err.Error() }; return "" }(),
+            })
+    }
+    
+    return u.client.Status().Update(ctx, targetNode)
+}
+
+// updateClusterComponentStatus 更新集群级组件状态
+func (u *BKEComponentStatusUpdater) updateClusterComponentStatus(
+    ctx context.Context,
+    ref ComponentMarkRef,
+    phase ComponentLifecyclePhase,
+    err error,
+) error {
+    cluster := ref.Cluster.DeepCopy()
+    
+    if cluster.Status.ClusterComponentStatuses == nil {
+        cluster.Status.ClusterComponentStatuses = make(map[string]bkev1beta1.ComponentLifecycleStatus)
+    }
+    
+    status := cluster.Status.ClusterComponentStatuses[ref.Name]
+    status.Name = ref.Name
+    status.Phase = phase
+    if err != nil {
+        status.Message = err.Error()
+    }
+    cluster.Status.ClusterComponentStatuses[ref.Name] = status
+    
+    return u.client.Status().Update(ctx, cluster)
 }
 ```
 
