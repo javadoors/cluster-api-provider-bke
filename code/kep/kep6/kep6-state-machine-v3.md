@@ -4592,13 +4592,12 @@ func (r *BKEClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
         )
     }
     
-    // ========== 阶段 3: 触发操作执行 ==========
-    // 根据当前状态，触发对应的 PhaseFrame 执行
-    if r.shouldExecutePhases(cluster) {
-        if err := r.executePhases(ctx, cluster); err != nil {
-            log.Error(err, "failed to execute phases")
-            // 不立即重试，等待下次 Reconcile
-        }
+    // ========== 阶段 3: 状态机引擎执行操作 ==========
+    // 状态机引擎根据当前状态，协调执行具体操作
+    // 引擎内部会判断是否需要执行 PhaseFrame，以及执行哪些 Phase
+    if err := r.engine.Execute(ctx, cluster); err != nil {
+        log.Error(err, "failed to execute state machine operations")
+        // 不立即重试，等待下次 Reconcile
     }
     
     // ========== 阶段 4: 节点层状态评估 ==========
@@ -4682,26 +4681,6 @@ func (r *BKEClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 **辅助方法**：
 
 ```go
-// shouldExecutePhases 判断是否需要执行 PhaseFrame
-func (r *BKEClusterReconciler) shouldExecutePhases(cluster *bkev1beta1.BKECluster) bool {
-    // 只在操作进行中时执行
-    switch cluster.Status.LifecyclePhase {
-    case bkev1beta1.ClusterLifecycleInstalling,
-        bkev1beta1.ClusterLifecycleUpgrading,
-        bkev1beta1.ClusterLifecycleScaling,
-        bkev1beta1.ClusterLifecycleRollingBack:
-        return true
-    default:
-        return false
-    }
-}
-
-// executePhases 执行 PhaseFrame
-func (r *BKEClusterReconciler) executePhases(ctx context.Context, cluster *bkev1beta1.BKECluster) error {
-    // 委托给 PhaseFrame 执行器
-    return r.phaseExecutor.Execute(ctx, cluster)
-}
-
 // decideRequeue 决定 Requeue 策略
 func (r *BKEClusterReconciler) decideRequeue(cluster *bkev1beta1.BKECluster) ctrl.Result {
     // 操作进行中：快速 Requeue（5 秒）
@@ -4732,6 +4711,72 @@ func (r *BKEClusterReconciler) recordMetrics(cluster *bkev1beta1.BKECluster, sta
 }
 ```
 
+**状态机引擎 Execute 方法**：
+
+状态机引擎的 `Execute()` 方法负责根据当前状态协调执行具体操作：
+
+```go
+// pkg/statemachine/engine.go
+
+// Execute 根据当前状态执行操作
+// 该方法由 Reconciler 调用，负责协调状态转换和操作执行
+func (e *StateMachineEngine) Execute(ctx context.Context, cluster *bkev1beta1.BKECluster) error {
+    e.mux.RLock()
+    defer e.mux.RUnlock()
+    
+    currentPhase := cluster.Status.LifecyclePhase
+    
+    // 根据当前状态，执行对应的操作
+    switch currentPhase {
+    case bkev1beta1.ClusterLifecycleInstalling:
+        return e.executeInstall(ctx, cluster)
+    
+    case bkev1beta1.ClusterLifecycleUpgrading:
+        return e.executeUpgrade(ctx, cluster)
+    
+    case bkev1beta1.ClusterLifecycleScaling:
+        return e.executeScale(ctx, cluster)
+    
+    case bkev1beta1.ClusterLifecycleRollingBack:
+        return e.executeRollback(ctx, cluster)
+    
+    case bkev1beta1.ClusterLifecycleRunning,
+        bkev1beta1.ClusterLifecyclePending,
+        bkev1beta1.ClusterLifecycleFailed:
+        // 稳定状态或失败状态，无需执行操作
+        return nil
+    
+    default:
+        return fmt.Errorf("unknown lifecycle phase: %s", currentPhase)
+    }
+}
+
+// executeInstall 执行安装操作
+func (e *StateMachineEngine) executeInstall(ctx context.Context, cluster *bkev1beta1.BKECluster) error {
+    // 委托给 PhaseFrame 执行器
+    // PhaseFrame 会根据 OperationProgress.CurrentStage 决定执行哪些 Phase
+    return e.phaseExecutor.Execute(ctx, cluster)
+}
+
+// executeUpgrade 执行升级操作
+func (e *StateMachineEngine) executeUpgrade(ctx context.Context, cluster *bkev1beta1.BKECluster) error {
+    // 委托给 PhaseFrame 执行器
+    return e.phaseExecutor.Execute(ctx, cluster)
+}
+
+// executeScale 执行扩缩容操作
+func (e *StateMachineEngine) executeScale(ctx context.Context, cluster *bkev1beta1.BKECluster) error {
+    // 委托给 PhaseFrame 执行器
+    return e.phaseExecutor.Execute(ctx, cluster)
+}
+
+// executeRollback 执行回滚操作
+func (e *StateMachineEngine) executeRollback(ctx context.Context, cluster *bkev1beta1.BKECluster) error {
+    // 委托给 PhaseFrame 执行器
+    return e.phaseExecutor.Execute(ctx, cluster)
+}
+```
+
 **Reconcile 流程图**：
 
 ```
@@ -4755,13 +4800,17 @@ func (r *BKEClusterReconciler) recordMetrics(cluster *bkev1beta1.BKECluster, sta
                  │
                  ▼
     ┌──────────────────────────┐
-    │ 3. shouldExecutePhases() │
-    │    ├─ Installing?        │
-    │    ├─ Upgrading?         │
-    │    ├─ Scaling?           │
-    │    └─ Yes → executePhases()
-    │         └─ PhaseFrame    │
-    │            执行具体操作   │
+    │ 3. engine.Execute()      │
+    │    ├─ 根据当前状态决定    │
+    │    │  执行什么操作        │
+    │    ├─ Installing →       │
+    │    │  executeInstall()   │
+    │    ├─ Upgrading →        │
+    │    │  executeUpgrade()   │
+    │    ├─ Scaling →          │
+    │    │  executeScale()     │
+    │    └─ 内部协调 PhaseFrame│
+    │       执行具体操作        │
     └────────────┬─────────────┘
                  │
                  ▼
@@ -4914,17 +4963,25 @@ func (r *BKENodeReconciler) decideNodeRequeue(node *bkev1beta1.BKENode) ctrl.Res
 │                                                                              │
 │  StateMachineEngine                          PhaseFrame                      │
 │  ──────────────────                          ──────────                      │
-│  职责: 状态判断                              职责: 操作执行                  │
+│  职责: 状态协调                              职责: 操作执行                  │
 │  ──────────────                              ──────────────                  │
 │  • 评估当前状态                              • 执行具体安装/升级逻辑         │
 │  • 检查转换条件                              • 管理 Phase 执行顺序           │
 │  • 执行转换动作                              • 处理 Phase 失败/重试          │
 │  • 记录状态转换事件                          • 更新操作进度                  │
+│  • 协调操作执行（Execute）                                                   │
 │                                                                              │
 │  输入: BKECluster/BKENode                    输入: BKECluster                │
 │  输出: LifecyclePhase                        输出: OperationProgress         │
+│          OperationProgress                                                   │
 │                                                                              │
-│  调用时机: 每次 Reconcile                    调用时机: 状态机触发            │
+│  调用时机: 每次 Reconcile                    调用时机: 由引擎 Execute() 调用 │
+│                                                                              │
+│  关键方法:                                                                   │
+│  • EvaluateClusterState()                                                    │
+│  • EvaluateNodeState()                                                       │
+│  • EvaluateComponentState()                                                  │
+│  • Execute() → 根据状态调用 PhaseFrame                                       │
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -4999,16 +5056,22 @@ Reconcile 开始
                  │
                  ▼
 ┌──────────────────────────────────┐
-│ shouldExecutePhases()            │
+│ StateMachineEngine               │
+│ Execute()                        │
 │                                  │
-│ LifecyclePhase == Installing?    │
-│ ✓ 是                             │
+│ 根据当前状态决定执行什么操作:    │
+│   LifecyclePhase == Installing   │
+│   → executeInstall()             │
+│                                  │
+│ executeInstall() 内部:           │
+│   委托给 PhaseFrame 执行器       │
+│   phaseExecutor.Execute()        │
 └────────────────┬─────────────────┘
                  │
                  ▼
 ┌──────────────────────────────────┐
 │ PhaseFrame                       │
-│ executePhases()                  │
+│ Execute()                        │
 │                                  │
 │ 执行具体安装逻辑:                │
 │   1. EnsureBKEAgent              │
@@ -5039,6 +5102,9 @@ Reconcile 开始
 │   设置 FinishedAt                │
 │                                  │
 │ 更新 LifecyclePhase = Running    │
+│                                  │
+│ Execute() → 无需执行操作         │
+│ (Running 状态无需执行)           │
 └──────────────────────────────────┘
 ```
 
@@ -6735,5 +6801,5 @@ data:
 
 ---
 
-**文档版本**: v3.21 (混合模型 - 添加状态机引擎集成设计)  
+**文档版本**: v3.22 (混合模型 - 修正状态机引擎集成设计)  
 **维护者**: openFuyao Team
