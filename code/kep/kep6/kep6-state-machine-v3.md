@@ -3523,14 +3523,14 @@ func (e *StateMachineEngine) executeScaleDown(ctx context.Context, cluster *conf
 }
 
 // executeRollback 执行回滚操作（使用声明式 DAG 框架）
-// 回滚本质上是反向升级，从当前版本回退到上一版本
+// 回滚按照升级 DAG 的逆序执行，确保依赖关系正确回退
+// 例如：升级顺序为 A → B → C，回滚顺序为 C → B → A
 func (e *StateMachineEngine) executeRollback(ctx context.Context, cluster *confv1beta1.BKECluster) error {
     log.Info("Starting cluster rollback",
         "cluster", cluster.Name,
         "fromVersion", cluster.Status.CurrentVersion,
         "toVersion", cluster.Status.OperationProgress.TargetVersion)
     
-    // 回滚使用与升级相同的 DAG 框架
     // 1. 解析目标版本（上一版本）的 ReleaseImage Bundle
     targetVersion := cluster.Status.OperationProgress.TargetVersion
     bundle, releaseImage, err := e.resolveReleaseBundle(ctx, cluster, targetVersion)
@@ -3543,17 +3543,97 @@ func (e *StateMachineEngine) executeRollback(ctx context.Context, cluster *confv
     currentBundle, _ := e.resolveCurrentReleaseBundle(ctx, cluster)
     versionCtx := upgrade.BuildVersionContextForUpgrade(bundle, currentBundle, cluster)
     
-    // 3. 构建回滚 DAG
+    // 3. 构建回滚 DAG（与升级使用相同的依赖关系）
     dag, err := upgrade.BuildDAGFromBundle(bundle, upgrade.BundleDependencyResolver(bundle))
     if err != nil {
         e.recordFailure(cluster, err)
         return fmt.Errorf("build rollback DAG: %w", err)
     }
     
-    // 4. 创建 Scheduler 并执行（与升级相同）
-    // ... 省略，与 executeUpgrade 相同 ...
+    // 4. 获取拓扑排序批次
+    batches, err := dag.TopologicalBatches()
+    if err != nil {
+        e.recordFailure(cluster, err)
+        return fmt.Errorf("get topological batches: %w", err)
+    }
     
-    cluster.Status.OperationProgress.CompletedComponents++
+    log.Info("Rollback DAG built",
+        "components", len(dag.NodeNames()),
+        "batches", len(batches))
+    
+    // 5. 反转批次顺序（关键：回滚按逆序执行）
+    // 升级时：Batch 0 → Batch 1 → Batch 2
+    // 回滚时：Batch 2 → Batch 1 → Batch 0
+    reversedBatches := make([][]string, len(batches))
+    for i, batch := range batches {
+        reversedBatches[len(batches)-1-i] = batch
+    }
+    
+    // 6. 创建 ComponentFactory 和 Scheduler
+    factory, err := componentfactory.NewFactoryFromBundle(bundle)
+    if err != nil {
+        e.recordFailure(cluster, err)
+        return fmt.Errorf("build component factory: %w", err)
+    }
+    
+    bundleStore := manifest.NewBundleStore(bundle)
+    applier := e.buildManifestApplier(ctx, cluster)
+    yamlExec := &yamlinstaller.YamlComponentExecutor{
+        Installer: yamlinstaller.NewYamlInstaller(yamlinstaller.YamlInstallerConfig{
+            Store:   bundleStore,
+            Applier: applier,
+        }),
+        CVStore: bundleStore,
+    }
+    
+    sched := dagexec.NewScheduler(dagexec.Config{
+        InlineRunner:    NewInlinePhaseRunnerAdapter(e.phaseCtx, &componentfactory.PhaseRunner{Factory: factory}),
+        ManifestStore:   bundleStore,
+        CVStore:         bundleStore,
+        ManifestApplier: applier,
+        YamlExecutor:    yamlExec,
+    })
+    
+    // 7. 构建执行上下文
+    targetClient, err := e.getTargetClusterClient(ctx, cluster)
+    if err != nil {
+        e.recordFailure(cluster, err)
+        return fmt.Errorf("get target cluster client: %w", err)
+    }
+    execCtx := dagexec.NewExecutionContext(versionCtx, cluster, targetClient)
+    
+    // 8. 按逆序执行回滚批次
+    for batchIdx, batch := range reversedBatches {
+        log.Info("Executing rollback batch",
+            "batch", batchIdx+1,
+            "total", len(reversedBatches),
+            "components", batch)
+        
+        for _, componentName := range batch {
+            node := dag.GetNode(componentName)
+            if node == nil {
+                return fmt.Errorf("component node not found: %s", componentName)
+            }
+            
+            // 执行组件回滚（调用对应的回滚逻辑）
+            if err := sched.RollbackComponent(ctx, execCtx, node); err != nil {
+                e.recordFailure(cluster, err)
+                return fmt.Errorf("rollback component %s: %w", componentName, err)
+            }
+            
+            cluster.Status.OperationProgress.CompletedComponents++
+        }
+    }
+    
+    // 9. 完成回滚
+    now := metav1.Now()
+    cluster.Status.OperationProgress.FinishedAt = &now
+    cluster.Status.CurrentVersion = targetVersion
+    
+    log.Info("Cluster rollback completed",
+        "cluster", cluster.Name,
+        "rolledBackTo", targetVersion)
+    
     return nil
 }
 
