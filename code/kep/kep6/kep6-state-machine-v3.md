@@ -3667,7 +3667,9 @@ type NodeTransitionRule struct {
 
 // initNodeTransitions 初始化节点状态转换规则
 func (e *StateMachineEngine) initNodeTransitions() {
-    // Pending -> Provisioned
+    // ========== Pending -> Provisioned ==========
+    // 触发条件：Agent 推送完成且环境初始化完成
+    // 实际执行：推送 BKEAgent 二进制 + 初始化节点环境
     e.nodeTransitions[NodeLifecyclePending] = append(
         e.nodeTransitions[NodeLifecyclePending],
         NodeTransitionRule{
@@ -3679,19 +3681,44 @@ func (e *StateMachineEngine) initNodeTransitions() {
                     node.Status.StateCode&confv1beta1.NodeEnvFlag != 0
             },
             Action: func(ctx context.Context, node *confv1beta1.BKENode) error {
-                // 初始化 OperationProgress
+                // 1. 初始化 OperationProgress
                 now := metav1.Now()
                 node.Status.OperationProgress = &confv1beta1.NodeOperationProgress{
                     OperationType: confv1beta1.NodeOperationTypeInstall,
                     StartedAt:     &now,
-                    CurrentStage:  "InstallingComponents",
+                    CurrentStage:  "PushingAgent",
                 }
+                
+                // 2. 推送 BKEAgent 到节点（通过 SSH）
+                // 对应实际代码：pkg/phaseframe/phases/ensure_bke_agent.go
+                if err := e.executeNodePhase(ctx, node, "EnsureBKEAgent"); err != nil {
+                    return fmt.Errorf("push BKEAgent to node %s: %w", node.Name, err)
+                }
+                node.Status.OperationProgress.CurrentStage = "InitializingEnvironment"
+                
+                // 3. 初始化节点环境（内核参数、swap、防火墙、时间同步等）
+                // 对应实际代码：pkg/phaseframe/phases/ensure_nodes_env.go
+                if err := e.executeNodePhase(ctx, node, "EnsureNodesEnv"); err != nil {
+                    return fmt.Errorf("init node env for %s: %w", node.Name, err)
+                }
+                
+                // 4. 更新 StateCode 标记
+                node.Status.StateCode |= confv1beta1.NodeAgentReadyFlag
+                node.Status.StateCode |= confv1beta1.NodeEnvFlag
+                
+                // 5. 记录事件
+                e.recordNodeTransition(node, NodeLifecyclePending, NodeLifecycleProvisioned)
+                e.recorder.Eventf(node, v1.EventTypeNormal, "NodeProvisioned",
+                    "Node %s provisioned: agent pushed and env initialized", node.Name)
+                
                 return nil
             },
         },
     )
     
-    // Provisioned -> Ready
+    // ========== Provisioned -> Ready ==========
+    // 触发条件：所有节点级组件安装完成
+    // 实际执行：安装 containerd、kubelet 等节点级组件
     e.nodeTransitions[NodeLifecycleProvisioned] = append(
         e.nodeTransitions[NodeLifecycleProvisioned],
         NodeTransitionRule{
@@ -3702,15 +3729,41 @@ func (e *StateMachineEngine) initNodeTransitions() {
                 return e.allNodeComponentsInstalled(node)
             },
             Action: func(ctx context.Context, node *confv1beta1.BKENode) error {
-                // 更新 OperationProgress
+                // 1. 根据节点角色执行对应的加入操作
+                // 对应实际代码：pkg/phaseframe/phases/ensure_master_join.go 或 ensure_worker_join.go
+                if node.IsMaster() {
+                    // Master 节点：加入控制面
+                    if err := e.executeNodePhase(ctx, node, "EnsureMasterJoin"); err != nil {
+                        return fmt.Errorf("master join for %s: %w", node.Name, err)
+                    }
+                } else {
+                    // Worker 节点：加入工作节点
+                    if err := e.executeNodePhase(ctx, node, "EnsureWorkerJoin"); err != nil {
+                        return fmt.Errorf("worker join for %s: %w", node.Name, err)
+                    }
+                }
+                
+                // 2. 更新 OperationProgress
                 now := metav1.Now()
                 node.Status.OperationProgress.FinishedAt = &now
+                node.Status.OperationProgress.CurrentStage = "Completed"
+                
+                // 3. 更新 StateCode
+                node.Status.StateCode |= confv1beta1.NodeInitFlag
+                
+                // 4. 记录事件
+                e.recordNodeTransition(node, NodeLifecycleProvisioned, NodeLifecycleReady)
+                e.recorder.Eventf(node, v1.EventTypeNormal, "NodeReady",
+                    "Node %s is ready: all components installed", node.Name)
+                
                 return nil
             },
         },
     )
     
-    // Ready -> Upgrading
+    // ========== Ready -> Upgrading ==========
+    // 触发条件：用户触发升级
+    // 实际执行：升级节点级组件（containerd、kubelet 等）
     e.nodeTransitions[NodeLifecycleReady] = append(
         e.nodeTransitions[NodeLifecycleReady],
         NodeTransitionRule{
@@ -3721,19 +3774,36 @@ func (e *StateMachineEngine) initNodeTransitions() {
                 return e.hasNodeUpgradeOperation(node)
             },
             Action: func(ctx context.Context, node *confv1beta1.BKENode) error {
-                // 初始化 OperationProgress
+                // 1. 初始化 OperationProgress
                 now := metav1.Now()
                 node.Status.OperationProgress = &confv1beta1.NodeOperationProgress{
                     OperationType: confv1beta1.NodeOperationTypeUpgrade,
                     StartedAt:     &now,
                     CurrentStage:  "UpgradingComponents",
                 }
+                
+                // 2. 执行节点级组件升级
+                // 对应实际代码：
+                //   - pkg/phaseframe/phases/ensure_containerd_upgrade.go
+                //   - pkg/phaseframe/phases/ensure_master_upgrade.go
+                //   - pkg/phaseframe/phases/ensure_worker_upgrade.go
+                if err := e.executeNodeUpgrade(ctx, node); err != nil {
+                    return fmt.Errorf("upgrade node %s: %w", node.Name, err)
+                }
+                
+                // 3. 记录事件
+                e.recordNodeTransition(node, NodeLifecycleReady, NodeLifecycleUpgrading)
+                e.recorder.Eventf(node, v1.EventTypeNormal, "NodeUpgrading",
+                    "Node %s upgrade started", node.Name)
+                
                 return nil
             },
         },
     )
     
-    // Upgrading -> Ready
+    // ========== Upgrading -> Ready ==========
+    // 触发条件：所有组件升级完成
+    // 实际执行：验证升级结果，更新版本信息
     e.nodeTransitions[NodeLifecycleUpgrading] = append(
         e.nodeTransitions[NodeLifecycleUpgrading],
         NodeTransitionRule{
@@ -3744,15 +3814,27 @@ func (e *StateMachineEngine) initNodeTransitions() {
                 return e.allNodeComponentsUpgraded(node)
             },
             Action: func(ctx context.Context, node *confv1beta1.BKENode) error {
-                // 更新 OperationProgress
+                // 1. 更新 OperationProgress
                 now := metav1.Now()
                 node.Status.OperationProgress.FinishedAt = &now
+                node.Status.OperationProgress.CurrentStage = "Completed"
+                
+                // 2. 更新节点版本信息
+                node.Status.CurrentVersion = node.Spec.DesiredVersion
+                
+                // 3. 记录事件
+                e.recordNodeTransition(node, NodeLifecycleUpgrading, NodeLifecycleReady)
+                e.recorder.Eventf(node, v1.EventTypeNormal, "NodeUpgradeCompleted",
+                    "Node %s upgrade completed successfully", node.Name)
+                
                 return nil
             },
         },
     )
     
-    // Ready -> Deleting
+    // ========== Ready -> Deleting ==========
+    // 触发条件：用户触发删除
+    // 实际执行：驱逐 Pod、删除节点组件
     e.nodeTransitions[NodeLifecycleReady] = append(
         e.nodeTransitions[NodeLifecycleReady],
         NodeTransitionRule{
@@ -3763,19 +3845,49 @@ func (e *StateMachineEngine) initNodeTransitions() {
                 return node.DeletionTimestamp != nil
             },
             Action: func(ctx context.Context, node *confv1beta1.BKENode) error {
-                // 初始化 OperationProgress
+                // 1. 初始化 OperationProgress
                 now := metav1.Now()
                 node.Status.OperationProgress = &confv1beta1.NodeOperationProgress{
                     OperationType: confv1beta1.NodeOperationTypeDelete,
                     StartedAt:     &now,
-                    CurrentStage:  "DeletingComponents",
+                    CurrentStage:  "DrainingNode",
                 }
+                
+                // 2. 驱逐节点上的 Pod（仅 Worker 节点）
+                // 对应实际代码：pkg/phaseframe/phases/ensure_worker_delete.go
+                if !node.IsMaster() {
+                    if err := e.drainNode(ctx, node); err != nil {
+                        return fmt.Errorf("drain node %s: %w", node.Name, err)
+                    }
+                }
+                
+                // 3. 执行节点删除操作
+                // 对应实际代码：
+                //   - pkg/phaseframe/phases/ensure_master_delete.go
+                //   - pkg/phaseframe/phases/ensure_worker_delete.go
+                if node.IsMaster() {
+                    if err := e.executeNodePhase(ctx, node, "EnsureMasterDelete"); err != nil {
+                        return fmt.Errorf("master delete for %s: %w", node.Name, err)
+                    }
+                } else {
+                    if err := e.executeNodePhase(ctx, node, "EnsureWorkerDelete"); err != nil {
+                        return fmt.Errorf("worker delete for %s: %w", node.Name, err)
+                    }
+                }
+                
+                // 4. 记录事件
+                e.recordNodeTransition(node, NodeLifecycleReady, NodeLifecycleDeleting)
+                e.recorder.Eventf(node, v1.EventTypeNormal, "NodeDeleting",
+                    "Node %s deletion started", node.Name)
+                
                 return nil
             },
         },
     )
     
-    // Deleting -> Deleted
+    // ========== Deleting -> Deleted ==========
+    // 触发条件：所有组件删除完成
+    // 实际执行：清理节点资源、移除 Finalizer
     e.nodeTransitions[NodeLifecycleDeleting] = append(
         e.nodeTransitions[NodeLifecycleDeleting],
         NodeTransitionRule{
@@ -3786,13 +3898,219 @@ func (e *StateMachineEngine) initNodeTransitions() {
                 return e.allNodeComponentsDeleted(node)
             },
             Action: func(ctx context.Context, node *confv1beta1.BKENode) error {
-                // 更新 OperationProgress
+                // 1. 更新 OperationProgress
                 now := metav1.Now()
                 node.Status.OperationProgress.FinishedAt = &now
+                node.Status.OperationProgress.CurrentStage = "Completed"
+                
+                // 2. 清理节点资源（移除 BKEAgent、清理配置文件等）
+                if err := e.cleanupNodeResources(ctx, node); err != nil {
+                    return fmt.Errorf("cleanup node %s resources: %w", node.Name, err)
+                }
+                
+                // 3. 从 Kubernetes 中删除 Node 对象
+                if err := e.deleteKubernetesNode(ctx, node); err != nil {
+                    // 忽略 NotFound 错误（节点可能已被删除）
+                    if !apierrors.IsNotFound(err) {
+                        return fmt.Errorf("delete kubernetes node %s: %w", node.Name, err)
+                    }
+                }
+                
+                // 4. 记录事件
+                e.recordNodeTransition(node, NodeLifecycleDeleting, NodeLifecycleDeleted)
+                e.recorder.Eventf(node, v1.EventTypeNormal, "NodeDeleted",
+                    "Node %s deleted successfully", node.Name)
+                
                 return nil
             },
         },
     )
+}
+
+// ========== 节点操作执行方法 ==========
+
+// executeNodePhase 执行节点级 Phase
+// 通过 SSH 连接节点，执行对应的 Phase 逻辑
+func (e *StateMachineEngine) executeNodePhase(
+    ctx context.Context,
+    node *confv1beta1.BKENode,
+    phaseName string,
+) error {
+    log.Info("Executing node phase",
+        "node", node.Name,
+        "phase", phaseName)
+    
+    // 获取集群配置
+    cluster, err := e.getClusterForNode(ctx, node)
+    if err != nil {
+        return fmt.Errorf("get cluster for node: %w", err)
+    }
+    
+    // 创建 SSH 连接
+    sshClient, err := e.createSSHClient(ctx, node)
+    if err != nil {
+        return fmt.Errorf("create SSH client: %w", err)
+    }
+    defer sshClient.Close()
+    
+    // 根据 phaseName 执行对应的逻辑
+    switch phaseName {
+    case "EnsureBKEAgent":
+        // 推送 BKEAgent 二进制和配置
+        return e.pushBKEAgent(ctx, sshClient, cluster, node)
+    
+    case "EnsureNodesEnv":
+        // 初始化节点环境
+        return e.initNodeEnvironment(ctx, sshClient, cluster, node)
+    
+    case "EnsureMasterJoin":
+        // Master 节点加入控制面
+        return e.joinMasterNode(ctx, sshClient, cluster, node)
+    
+    case "EnsureWorkerJoin":
+        // Worker 节点加入集群
+        return e.joinWorkerNode(ctx, sshClient, cluster, node)
+    
+    case "EnsureMasterDelete":
+        // 删除 Master 节点
+        return e.deleteMasterNode(ctx, sshClient, cluster, node)
+    
+    case "EnsureWorkerDelete":
+        // 删除 Worker 节点
+        return e.deleteWorkerNode(ctx, sshClient, cluster, node)
+    
+    default:
+        return fmt.Errorf("unknown phase: %s", phaseName)
+    }
+}
+
+// executeNodeUpgrade 执行节点级组件升级
+// 对应实际代码：pkg/phaseframe/phases/ensure_*_upgrade.go
+func (e *StateMachineEngine) executeNodeUpgrade(
+    ctx context.Context,
+    node *confv1beta1.BKENode,
+) error {
+    log.Info("Executing node upgrade",
+        "node", node.Name,
+        "currentVersion", node.Status.CurrentVersion,
+        "desiredVersion", node.Spec.DesiredVersion)
+    
+    // 获取集群配置
+    cluster, err := e.getClusterForNode(ctx, node)
+    if err != nil {
+        return fmt.Errorf("get cluster for node: %w", err)
+    }
+    
+    // 创建 SSH 连接
+    sshClient, err := e.createSSHClient(ctx, node)
+    if err != nil {
+        return fmt.Errorf("create SSH client: %w", err)
+    }
+    defer sshClient.Close()
+    
+    // 按顺序升级节点级组件
+    // 1. 升级 containerd（如果版本变化）
+    if e.needsContainerdUpgrade(node) {
+        node.Status.OperationProgress.CurrentStage = "UpgradingContainerd"
+        if err := e.upgradeContainerd(ctx, sshClient, cluster, node); err != nil {
+            return fmt.Errorf("upgrade containerd: %w", err)
+        }
+    }
+    
+    // 2. 升级 kubelet（如果版本变化）
+    if e.needsKubeletUpgrade(node) {
+        node.Status.OperationProgress.CurrentStage = "UpgradingKubelet"
+        if node.IsMaster() {
+            if err := e.upgradeMasterKubelet(ctx, sshClient, cluster, node); err != nil {
+                return fmt.Errorf("upgrade master kubelet: %w", err)
+            }
+        } else {
+            if err := e.upgradeWorkerKubelet(ctx, sshClient, cluster, node); err != nil {
+                return fmt.Errorf("upgrade worker kubelet: %w", err)
+            }
+        }
+    }
+    
+    // 3. 升级 Static Pod 组件（etcd/apiserver/controller-manager/scheduler，仅 Master）
+    if node.IsMaster() && e.needsStaticPodUpgrade(node) {
+        node.Status.OperationProgress.CurrentStage = "UpgradingStaticPods"
+        if err := e.upgradeStaticPods(ctx, sshClient, cluster, node); err != nil {
+            return fmt.Errorf("upgrade static pods: %w", err)
+        }
+    }
+    
+    return nil
+}
+
+// drainNode 驱逐节点上的 Pod
+func (e *StateMachineEngine) drainNode(ctx context.Context, node *confv1beta1.BKENode) error {
+    log.Info("Draining node", "node", node.Name)
+    
+    // 获取目标集群客户端
+    targetClient, err := e.getTargetClusterClient(ctx, node)
+    if err != nil {
+        return fmt.Errorf("get target cluster client: %w", err)
+    }
+    
+    // 标记节点为不可调度
+    if err := e.cordonNode(ctx, targetClient, node); err != nil {
+        return fmt.Errorf("cordon node: %w", err)
+    }
+    
+    // 驱逐 Pod
+    if err := e.evictPods(ctx, targetClient, node); err != nil {
+        return fmt.Errorf("evict pods: %w", err)
+    }
+    
+    return nil
+}
+
+// cleanupNodeResources 清理节点资源
+func (e *StateMachineEngine) cleanupNodeResources(ctx context.Context, node *confv1beta1.BKENode) error {
+    log.Info("Cleaning up node resources", "node", node.Name)
+    
+    sshClient, err := e.createSSHClient(ctx, node)
+    if err != nil {
+        return fmt.Errorf("create SSH client: %w", err)
+    }
+    defer sshClient.Close()
+    
+    // 1. 停止并删除 BKEAgent 服务
+    commands := []string{
+        "systemctl stop bkeagent || true",
+        "systemctl disable bkeagent || true",
+        "rm -f /etc/systemd/system/bkeagent.service",
+        "rm -f /usr/local/bin/bkeagent",
+        "rm -rf /etc/openFuyao/bkeagent",
+        "systemctl daemon-reload",
+    }
+    
+    for _, cmd := range commands {
+        if _, err := sshClient.Run(cmd); err != nil {
+            log.Error(err, "failed to execute cleanup command", "command", cmd)
+        }
+    }
+    
+    return nil
+}
+
+// deleteKubernetesNode 从 Kubernetes 中删除 Node 对象
+func (e *StateMachineEngine) deleteKubernetesNode(ctx context.Context, node *confv1beta1.BKENode) error {
+    log.Info("Deleting Kubernetes node", "node", node.Name)
+    
+    targetClient, err := e.getTargetClusterClient(ctx, node)
+    if err != nil {
+        return fmt.Errorf("get target cluster client: %w", err)
+    }
+    
+    // 删除 Node 对象
+    k8sNode := &corev1.Node{
+        ObjectMeta: metav1.ObjectMeta{
+            Name: node.Name,
+        },
+    }
+    
+    return targetClient.Delete(ctx, k8sNode)
 }
 ```
 
@@ -7197,5 +7515,5 @@ data:
 
 ---
 
-**文档版本**: v3.23 (混合模型 - 适配新声明式升级框架)  
+**文档版本**: v3.25 (混合模型 - 补充节点层状态转换实际操作调用)  
 **维护者**: openFuyao Team
