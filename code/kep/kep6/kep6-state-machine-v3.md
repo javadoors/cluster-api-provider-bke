@@ -3311,83 +3311,249 @@ func (e *StateMachineEngine) initClusterTransitions() {
     }
 }
 
-// ========== 操作执行方法 ==========
+// ========== 操作执行方法（基于新声明式升级框架） ==========
 
 // executeInstall 执行安装操作
+// 当前安装仍使用 PhaseFlow（Legacy），后续可迁移到声明式 DAG
 func (e *StateMachineEngine) executeInstall(ctx context.Context, cluster *confv1beta1.BKECluster) error {
     log.Info("Starting cluster installation",
         "cluster", cluster.Name,
         "targetVersion", cluster.Spec.DesiredVersion)
     
-    // 委托给 PhaseFrame 执行器
-    // PhaseFrame 会根据 OperationProgress.CurrentStage 决定执行哪些 Phase
-    if err := e.phaseExecutor.Execute(ctx, cluster); err != nil {
-        // 记录失败
+    // 当前实现：使用 PhaseFlow 执行安装
+    // PhaseFlow 按顺序执行：EnsureBKEAgent → EnsureNodesEnv → EnsureMasterInit → ...
+    if err := e.phaseFlow.Execute(ctx, cluster); err != nil {
         e.recordFailure(cluster, err)
         return err
     }
     
-    // 更新进度
     cluster.Status.OperationProgress.CompletedComponents++
-    
     return nil
 }
 
-// executeUpgrade 执行升级操作
+// executeUpgrade 执行升级操作（使用声明式 DAG 框架）
+// 对应实际代码：controllers/capbke/bkecluster_upgrade_dag.go#executeUpgradeDAG
 func (e *StateMachineEngine) executeUpgrade(ctx context.Context, cluster *confv1beta1.BKECluster) error {
     log.Info("Starting cluster upgrade",
         "cluster", cluster.Name,
         "fromVersion", cluster.Status.CurrentVersion,
         "toVersion", cluster.Spec.DesiredVersion)
     
-    // 委托给 PhaseFrame 执行器
-    if err := e.phaseExecutor.Execute(ctx, cluster); err != nil {
-        // 记录失败
+    // 1. 解析目标版本的 ReleaseImage Bundle
+    bundle, releaseImage, err := e.resolveUpgradeBundle(ctx, cluster)
+    if err != nil {
+        if isReleaseImageNotReady(err) {
+            // ReleaseImage 未就绪，等待下次 Reconcile
+            return &RequeueError{RequeueAfter: 30 * time.Second}
+        }
         e.recordFailure(cluster, err)
         return err
     }
     
-    // 更新进度
-    cluster.Status.OperationProgress.CompletedComponents++
+    // 2. 解析当前版本的 Bundle（用于版本对比）
+    currentBundle, _ := e.resolveCurrentReleaseBundle(ctx, cluster)
     
+    // 3. 构建 VersionContext（决定哪些组件需要升级）
+    versionCtx := upgrade.BuildVersionContextForUpgrade(bundle, currentBundle, cluster)
+    
+    // 4. 构建升级 DAG
+    dag, err := upgrade.BuildDAGFromBundle(bundle, upgrade.BundleDependencyResolver(bundle))
+    if err != nil {
+        e.recordFailure(cluster, err)
+        return fmt.Errorf("build upgrade DAG: %w", err)
+    }
+    
+    log.Info("Declarative upgrade DAG built",
+        "components", len(dag.NodeNames()),
+        "source", bundle.Source)
+    
+    // 5. 创建 ComponentFactory（从 Bundle 注册 inline handlers）
+    factory, err := componentfactory.NewFactoryFromBundle(bundle)
+    if err != nil {
+        e.recordFailure(cluster, err)
+        return fmt.Errorf("build component factory: %w", err)
+    }
+    
+    // 6. 创建 DAG Scheduler
+    bundleStore := manifest.NewBundleStore(bundle)
+    applier := e.buildManifestApplier(ctx, cluster)
+    yamlExec := &yamlinstaller.YamlComponentExecutor{
+        Installer: yamlinstaller.NewYamlInstaller(yamlinstaller.YamlInstallerConfig{
+            Store:   bundleStore,
+            Applier: applier,
+        }),
+        CVStore: bundleStore,
+    }
+    
+    sched := dagexec.NewScheduler(dagexec.Config{
+        InlineRunner:    NewInlinePhaseRunnerAdapter(e.phaseCtx, &componentfactory.PhaseRunner{Factory: factory}),
+        ManifestStore:   bundleStore,
+        CVStore:         bundleStore,
+        ManifestApplier: applier,
+        YamlExecutor:    yamlExec,
+    })
+    
+    // 7. 构建执行上下文
+    targetClient, err := e.getTargetClusterClient(ctx, cluster)
+    if err != nil {
+        e.recordFailure(cluster, err)
+        return fmt.Errorf("get target cluster client: %w", err)
+    }
+    execCtx := dagexec.NewExecutionContext(versionCtx, cluster, targetClient)
+    
+    // 8. 执行 DAG（按拓扑批次并发执行组件）
+    if err := sched.ExecuteDAG(ctx, execCtx, dag); err != nil {
+        if handleErr := e.handleUpgradeDAGFailure(ctx, cluster, err); handleErr != nil {
+            return handleErr
+        }
+        return nil
+    }
+    
+    // 9. 完成升级
+    if err := e.completeDeclarativeUpgrade(ctx, cluster); err != nil {
+        return err
+    }
+    
+    cluster.Status.OperationProgress.CompletedComponents++
     return nil
 }
 
 // executeScale 执行扩缩容操作
+// 对应实际代码：bkeadm/pkg/cluster/cluster.go#Scale
+// 扩缩容通过 Patch BKECluster/BKENodes 触发控制器 Reconcile
 func (e *StateMachineEngine) executeScale(ctx context.Context, cluster *confv1beta1.BKECluster) error {
     log.Info("Starting cluster scaling",
         "cluster", cluster.Name,
         "stage", cluster.Status.OperationProgress.CurrentStage)
     
-    // 委托给 PhaseFrame 执行器
-    if err := e.phaseExecutor.Execute(ctx, cluster); err != nil {
-        // 记录失败
-        e.recordFailure(cluster, err)
-        return err
+    // 扩缩容的执行逻辑：
+    // 1. 用户通过 bkeadm scale 或 kubectl patch 修改 BKECluster.Spec.Nodes
+    // 2. 控制器检测到节点变化，触发 Reconcile
+    // 3. 状态机进入 Scaling 状态
+    // 4. 根据 CurrentStage 执行对应的扩缩容 Phase：
+    //    - "ScalingUp" → 执行 EnsureBKEAgent → EnsureNodesEnv → EnsureMasterJoin/EnsureWorkerJoin
+    //    - "ScalingDown" → 执行 EnsureMasterDelete/EnsureWorkerDelete
+    
+    switch cluster.Status.OperationProgress.CurrentStage {
+    case "ScalingUp":
+        // 扩容：执行节点加入流程
+        if err := e.executeScaleUp(ctx, cluster); err != nil {
+            e.recordFailure(cluster, err)
+            return err
+        }
+    
+    case "ScalingDown":
+        // 缩容：执行节点删除流程
+        if err := e.executeScaleDown(ctx, cluster); err != nil {
+            e.recordFailure(cluster, err)
+            return err
+        }
+    
+    default:
+        return fmt.Errorf("unknown scaling stage: %s", cluster.Status.OperationProgress.CurrentStage)
     }
     
-    // 更新进度
     cluster.Status.OperationProgress.CompletedComponents++
+    return nil
+}
+
+// executeScaleUp 执行扩容操作
+func (e *StateMachineEngine) executeScaleUp(ctx context.Context, cluster *confv1beta1.BKECluster) error {
+    // 获取待扩容的节点列表
+    pendingNodes := e.getPendingScaleUpNodes(cluster)
+    
+    for _, node := range pendingNodes {
+        // 1. 推送 BKEAgent
+        if err := e.executePhase(ctx, cluster, "EnsureBKEAgent", node); err != nil {
+            return fmt.Errorf("push agent to node %s: %w", node.Name, err)
+        }
+        
+        // 2. 初始化节点环境
+        if err := e.executePhase(ctx, cluster, "EnsureNodesEnv", node); err != nil {
+            return fmt.Errorf("init node env for %s: %w", node.Name, err)
+        }
+        
+        // 3. 根据节点角色执行加入操作
+        if node.IsMaster() {
+            if err := e.executePhase(ctx, cluster, "EnsureMasterJoin", node); err != nil {
+                return fmt.Errorf("master join for %s: %w", node.Name, err)
+            }
+        } else {
+            if err := e.executePhase(ctx, cluster, "EnsureWorkerJoin", node); err != nil {
+                return fmt.Errorf("worker join for %s: %w", node.Name, err)
+            }
+        }
+        
+        // 更新节点状态
+        node.Status.LifecyclePhase = NodeLifecycleReady
+    }
     
     return nil
 }
 
-// executeRollback 执行回滚操作
+// executeScaleDown 执行缩容操作
+func (e *StateMachineEngine) executeScaleDown(ctx context.Context, cluster *confv1beta1.BKECluster) error {
+    // 获取待缩容的节点列表
+    pendingNodes := e.getPendingScaleDownNodes(cluster)
+    
+    for _, node := range pendingNodes {
+        // 1. 驱逐节点上的 Pod（如果是 Worker）
+        if !node.IsMaster() {
+            if err := e.drainNode(ctx, cluster, node); err != nil {
+                return fmt.Errorf("drain node %s: %w", node.Name, err)
+            }
+        }
+        
+        // 2. 根据节点角色执行删除操作
+        if node.IsMaster() {
+            if err := e.executePhase(ctx, cluster, "EnsureMasterDelete", node); err != nil {
+                return fmt.Errorf("master delete for %s: %w", node.Name, err)
+            }
+        } else {
+            if err := e.executePhase(ctx, cluster, "EnsureWorkerDelete", node); err != nil {
+                return fmt.Errorf("worker delete for %s: %w", node.Name, err)
+            }
+        }
+        
+        // 更新节点状态
+        node.Status.LifecyclePhase = NodeLifecycleDeleted
+    }
+    
+    return nil
+}
+
+// executeRollback 执行回滚操作（使用声明式 DAG 框架）
+// 回滚本质上是反向升级，从当前版本回退到上一版本
 func (e *StateMachineEngine) executeRollback(ctx context.Context, cluster *confv1beta1.BKECluster) error {
     log.Info("Starting cluster rollback",
         "cluster", cluster.Name,
-        "targetVersion", cluster.Status.CurrentVersion)
+        "fromVersion", cluster.Status.CurrentVersion,
+        "toVersion", cluster.Status.OperationProgress.TargetVersion)
     
-    // 委托给 PhaseFrame 执行器
-    if err := e.phaseExecutor.Execute(ctx, cluster); err != nil {
-        // 记录失败
+    // 回滚使用与升级相同的 DAG 框架
+    // 1. 解析目标版本（上一版本）的 ReleaseImage Bundle
+    targetVersion := cluster.Status.OperationProgress.TargetVersion
+    bundle, releaseImage, err := e.resolveReleaseBundle(ctx, cluster, targetVersion)
+    if err != nil {
         e.recordFailure(cluster, err)
         return err
     }
     
-    // 更新进度
-    cluster.Status.OperationProgress.CompletedComponents++
+    // 2. 构建 VersionContext
+    currentBundle, _ := e.resolveCurrentReleaseBundle(ctx, cluster)
+    versionCtx := upgrade.BuildVersionContextForUpgrade(bundle, currentBundle, cluster)
     
+    // 3. 构建回滚 DAG
+    dag, err := upgrade.BuildDAGFromBundle(bundle, upgrade.BundleDependencyResolver(bundle))
+    if err != nil {
+        e.recordFailure(cluster, err)
+        return fmt.Errorf("build rollback DAG: %w", err)
+    }
+    
+    // 4. 创建 Scheduler 并执行（与升级相同）
+    // ... 省略，与 executeUpgrade 相同 ...
+    
+    cluster.Status.OperationProgress.CompletedComponents++
     return nil
 }
 
@@ -6951,5 +7117,5 @@ data:
 
 ---
 
-**文档版本**: v3.22 (混合模型 - 修正状态机引擎集成设计)  
+**文档版本**: v3.23 (混合模型 - 适配新声明式升级框架)  
 **维护者**: openFuyao Team
