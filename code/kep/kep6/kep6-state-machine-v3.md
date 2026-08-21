@@ -3656,6 +3656,255 @@ func (e *StateMachineEngine) recordFailure(cluster *confv1beta1.BKECluster, err 
 
 #### 8.3.3 节点层状态转换
 
+##### 8.3.3.1 现状分析与重构需求
+
+**当前架构问题**：
+
+当前 BKE 的节点安装由 Legacy PhaseFlow 驱动，节点级操作（EnsureBKEAgent → EnsureNodesEnv → EnsureMasterInit → EnsureMasterJoin → EnsureWorkerJoin）硬编码在 Phase 列表中，存在以下问题：
+
+| 问题 | 说明 | 影响 |
+|------|------|------|
+| **DAG 不支持节点级** | `ComponentNode` 无 NodeIP/NodeName 字段，`BuildUpgradeDAG` 不为每个节点展开组件 | 节点安装无法纳入声明式 DAG |
+| **ReleaseImage 不区分 scope** | `ReleaseImageUpgradeComponent` 无 `scope` 字段 | 无法区分集群级/节点级组件 |
+| **ComponentVersion 无 scope** | `ComponentVersionSpec` 无 `scope`/`nodeLevel` 字段 | 组件定义无法声明作用域 |
+| **Scheduler 硬编码集群级** | `lifecycleMarkRef` 硬编码 `StatusComponentTypeCluster` | 节点级组件状态无法追踪 |
+| **节点安装无状态转换** | 节点安装由 PhaseFlow 隐式驱动，无独立状态机 | 节点安装进度不可观测 |
+
+**重构目标**：
+
+将节点安装/升级/删除全部纳入 ClusterVersion 驱动的声明式 DAG 框架，实现：
+1. 节点安装进度可观测（通过 NodeLifecyclePhase 状态机）
+2. 节点级组件纳入 DAG 拓扑排序
+3. 统一的版本管理（ClusterVersion 驱动所有操作）
+
+##### 8.3.3.2 DAG 框架扩展设计
+
+为支持节点级组件，需要扩展以下数据结构：
+
+```go
+// ========== 扩展 1: ComponentVersion 增加 Scope 字段 ==========
+
+// api/v1alpha1/componentversion_types.go
+
+type ComponentVersionSpec struct {
+    Name            string            `json:"name"`
+    Type            ComponentType     `json:"type"`
+    Version         string            `json:"version"`
+    
+    // 🆕 组件作用域（默认 cluster）
+    // - "cluster": 集群级组件，每个集群执行一次（如 coredns、kube-proxy）
+    // - "node": 节点级组件，每个节点执行一次（如 bkeagent、containerd、kubelet）
+    Scope           ComponentScope    `json:"scope,omitempty"`
+    
+    // ... 其他字段不变 ...
+}
+
+type ComponentScope string
+
+const (
+    ComponentScopeCluster ComponentScope = "cluster"  // 集群级（默认）
+    ComponentScopeNode    ComponentScope = "node"     // 节点级
+)
+
+// ========== 扩展 2: ComponentNode 增加节点信息 ==========
+
+// pkg/topology/component.go
+
+type ComponentNode struct {
+    Name          string
+    Version       string
+    Inline        *InlineRef
+    FailurePolicy FailurePolicy
+    Dependencies  []string
+    
+    // 🆕 节点级组件的节点信息
+    Scope    ComponentScope  // cluster 或 node
+    NodeIP   string          // 节点 IP（仅 scope=node 时有值）
+    NodeName string          // 节点名称（仅 scope=node 时有值）
+    NodeRole string          // 节点角色 master/worker（仅 scope=node 时有值）
+}
+
+// ========== 扩展 3: ReleaseImage 增加节点级组件声明 ==========
+
+// api/v1alpha1/releaseimage_types.go
+
+type ReleaseImageUpgradeComponent struct {
+    Name    string                     `json:"name,omitempty"`
+    Version string                     `json:"version,omitempty"`
+    Inline  *ReleaseImageUpgradeInline `json:"inline,omitempty"`
+    
+    // 🆕 组件作用域
+    Scope   ComponentScope             `json:"scope,omitempty"`
+}
+
+// ========== 扩展 4: BuildUpgradeDAG 支持节点展开 ==========
+
+// pkg/topology/build.go
+
+// BuildUpgradeDAG 构建升级 DAG（扩展：支持节点级组件展开）
+func BuildUpgradeDAG(
+    components []cvv1alpha1.ReleaseImageUpgradeComponent,
+    resolve DependencyResolver,
+    nodes []NodeInfo,  // 🆕 新增：节点列表
+) (*UpgradeDAG, error) {
+    dag := NewUpgradeDAG()
+    
+    for _, comp := range components {
+        switch comp.Scope {
+        case ComponentScopeNode:
+            // 节点级组件：为每个节点生成独立的 ComponentNode
+            for _, node := range nodes {
+                nodeComp := &ComponentNode{
+                    Name:          fmt.Sprintf("%s@%s", comp.Name, node.IP),
+                    Version:       comp.Version,
+                    Scope:         ComponentScopeNode,
+                    NodeIP:        node.IP,
+                    NodeName:      node.Name,
+                    NodeRole:      node.Role,
+                    FailurePolicy: FailurePolicyFailFast,
+                }
+                if comp.Inline != nil {
+                    nodeComp.Inline = &InlineRef{
+                        Handler: comp.Inline.Handler,
+                        Version: comp.Inline.Version,
+                    }
+                }
+                if err := dag.AddNode(nodeComp); err != nil {
+                    return nil, err
+                }
+            }
+        
+        default: // ComponentScopeCluster
+            // 集群级组件：生成单个 ComponentNode
+            node := &ComponentNode{
+                Name:          comp.Name,
+                Version:       comp.Version,
+                Scope:         ComponentScopeCluster,
+                FailurePolicy: FailurePolicyFailFast,
+            }
+            if comp.Inline != nil {
+                node.Inline = &InlineRef{
+                    Handler: comp.Inline.Handler,
+                    Version: comp.Inline.Version,
+                }
+            }
+            if err := dag.AddNode(node); err != nil {
+                return nil, err
+            }
+        }
+    }
+    
+    // 解析依赖关系（节点级组件的依赖需要展开到每个节点）
+    // ...
+    
+    return dag, nil
+}
+
+// ========== 扩展 5: Scheduler 支持节点级执行 ==========
+
+// pkg/dagexec/scheduler.go
+
+// lifecycleMarkRef 扩展：根据 Scope 返回不同的标记引用
+func lifecycleMarkRef(cluster *bkev1beta1.BKECluster, node *topology.ComponentNode) ComponentMarkRef {
+    if node.Scope == topology.ComponentScopeNode {
+        return ComponentMarkRef{
+            Cluster:       cluster,
+            Name:          node.Name,
+            ComponentType: StatusComponentTypeNode,  // 节点级
+            NodeIP:        node.NodeIP,
+        }
+    }
+    return ComponentMarkRef{
+        Cluster:       cluster,
+        Name:          node.Name,
+        ComponentType: StatusComponentTypeCluster,  // 集群级
+    }
+}
+
+// executeComponent 扩展：节点级组件通过 SSH 执行
+func (s *Scheduler) executeComponent(ctx context.Context, execCtx *ExecutionContext, node *topology.ComponentNode) error {
+    switch node.Scope {
+    case topology.ComponentScopeNode:
+        // 节点级组件：创建节点级执行上下文，通过 SSH 执行
+        nodeExecCtx := execCtx.ForNode(node.NodeIP, node.NodeName, node.NodeRole)
+        return s.executeNodeComponent(ctx, nodeExecCtx, node)
+    
+    default:
+        // 集群级组件：原有逻辑
+        return s.executeClusterComponent(ctx, execCtx, node)
+    }
+}
+```
+
+##### 8.3.3.3 节点安装 DAG 示例
+
+以 3 Master + 2 Worker 集群安装为例，DAG 展开后的组件图：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    节点安装 DAG 展开示例（3 Master + 2 Worker）               │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+集群级组件（scope=cluster）：
+  ┌──────────────┐
+  │ pre-upgrade  │
+  │ -resources   │
+  └──────┬───────┘
+         │
+         ▼
+  ┌──────────────┐
+  │ certs        │
+  │ (集群证书)    │
+  └──────┬───────┘
+         │
+         ▼
+  ┌──────────────┐
+  │ coredns      │
+  │ (集群 DNS)    │
+  └──────────────┘
+
+节点级组件（scope=node）：每个节点独立展开
+  ┌──────────────────────────────────────────────────────────────────┐
+  │ Master-1 (192.168.1.1)                                          │
+  │                                                                  │
+  │ bkeagent@192.168.1.1 → nodesenv@192.168.1.1 → masterinit@...1   │
+  │                                              → containerd@...1   │
+  │                                              → kubelet@...1      │
+  ├──────────────────────────────────────────────────────────────────┤
+  │ Master-2 (192.168.1.2)                                          │
+  │                                                                  │
+  │ bkeagent@192.168.1.2 → nodesenv@192.168.1.2 → masterjoin@...2   │
+  │                                              → containerd@...2   │
+  │                                              → kubelet@...2      │
+  ├──────────────────────────────────────────────────────────────────┤
+  │ Master-3 (192.168.1.3)                                          │
+  │                                                                  │
+  │ bkeagent@192.168.1.3 → nodesenv@192.168.1.3 → masterjoin@...3   │
+  │                                              → containerd@...3   │
+  │                                              → kubelet@...3      │
+  ├──────────────────────────────────────────────────────────────────┤
+  │ Worker-1 (192.168.1.4)                                          │
+  │                                                                  │
+  │ bkeagent@192.168.1.4 → nodesenv@192.168.1.4 → workerjoin@...4   │
+  │                                              → containerd@...4   │
+  │                                              → kubelet@...4      │
+  ├──────────────────────────────────────────────────────────────────┤
+  │ Worker-2 (192.168.1.5)                                          │
+  │                                                                  │
+  │ bkeagent@192.168.1.5 → nodesenv@192.168.1.5 → workerjoin@...5   │
+  │                                              → containerd@...5   │
+  │                                              → kubelet@...5      │
+  └──────────────────────────────────────────────────────────────────┘
+
+依赖关系：
+  certs → masterinit@* (证书必须先于 Master 初始化)
+  masterinit@master-1 → masterjoin@master-2 (第一个 Master 先初始化)
+  masterinit@master-1 → masterjoin@master-3
+  masterinit@master-1 → workerjoin@* (Worker 等待控制面就绪)
+```
+
+##### 8.3.3.4 节点层状态转换规则（使用 ClusterVersion 驱动）
+
 ```go
 // NodeTransitionRule 节点状态转换规则
 type NodeTransitionRule struct {
@@ -3668,17 +3917,17 @@ type NodeTransitionRule struct {
 // initNodeTransitions 初始化节点状态转换规则
 func (e *StateMachineEngine) initNodeTransitions() {
     // ========== Pending -> Provisioned ==========
-    // 触发条件：Agent 推送完成且环境初始化完成
-    // 实际执行：推送 BKEAgent 二进制 + 初始化节点环境
+    // 触发条件：ClusterVersion 触发安装，且节点 Agent + 环境组件待执行
+    // 执行方式：通过 DAG 调度器执行节点级组件（bkeagent + nodesenv）
     e.nodeTransitions[NodeLifecyclePending] = append(
         e.nodeTransitions[NodeLifecyclePending],
         NodeTransitionRule{
             From: NodeLifecyclePending,
             To:   NodeLifecycleProvisioned,
             Condition: func(ctx context.Context, node *confv1beta1.BKENode) bool {
-                // 当 Agent 推送完成且环境初始化完成时
-                return node.Status.StateCode&confv1beta1.NodeAgentReadyFlag != 0 &&
-                    node.Status.StateCode&confv1beta1.NodeEnvFlag != 0
+                // 当 ClusterVersion 触发安装，且节点级 Provisioning 组件待执行
+                return e.hasNodeInstallOperation(node) &&
+                    e.hasPendingNodeComponents(node, "provisioning")
             },
             Action: func(ctx context.Context, node *confv1beta1.BKENode) error {
                 // 1. 初始化 OperationProgress
@@ -3686,27 +3935,22 @@ func (e *StateMachineEngine) initNodeTransitions() {
                 node.Status.OperationProgress = &confv1beta1.NodeOperationProgress{
                     OperationType: confv1beta1.NodeOperationTypeInstall,
                     StartedAt:     &now,
-                    CurrentStage:  "PushingAgent",
+                    CurrentStage:  "ProvisioningNodeComponents",
                 }
                 
-                // 2. 推送 BKEAgent 到节点（通过 SSH）
-                // 对应实际代码：pkg/phaseframe/phases/ensure_bke_agent.go
-                if err := e.executeNodePhase(ctx, node, "EnsureBKEAgent"); err != nil {
-                    return fmt.Errorf("push BKEAgent to node %s: %w", node.Name, err)
-                }
-                node.Status.OperationProgress.CurrentStage = "InitializingEnvironment"
-                
-                // 3. 初始化节点环境（内核参数、swap、防火墙、时间同步等）
-                // 对应实际代码：pkg/phaseframe/phases/ensure_nodes_env.go
-                if err := e.executeNodePhase(ctx, node, "EnsureNodesEnv"); err != nil {
-                    return fmt.Errorf("init node env for %s: %w", node.Name, err)
+                // 2. 通过 DAG 调度器执行节点级 Provisioning 组件
+                // DAG 中的节点级组件（scope=node）会被展开到每个节点
+                // 本节点对应的组件：bkeagent@<nodeIP> → nodesenv@<nodeIP>
+                // 对应原 Legacy Phase：EnsureBKEAgent + EnsureNodesEnv
+                if err := e.executeNodeDAGComponents(ctx, node, "provisioning"); err != nil {
+                    return fmt.Errorf("provision node %s: %w", node.Name, err)
                 }
                 
-                // 4. 更新 StateCode 标记
+                // 3. 更新 StateCode 标记
                 node.Status.StateCode |= confv1beta1.NodeAgentReadyFlag
                 node.Status.StateCode |= confv1beta1.NodeEnvFlag
                 
-                // 5. 记录事件
+                // 4. 记录事件
                 e.recordNodeTransition(node, NodeLifecyclePending, NodeLifecycleProvisioned)
                 e.recorder.Eventf(node, v1.EventTypeNormal, "NodeProvisioned",
                     "Node %s provisioned: agent pushed and env initialized", node.Name)
@@ -3717,30 +3961,27 @@ func (e *StateMachineEngine) initNodeTransitions() {
     )
     
     // ========== Provisioned -> Ready ==========
-    // 触发条件：所有节点级组件安装完成
-    // 实际执行：安装 containerd、kubelet 等节点级组件
+    // 触发条件：节点级 Joining 组件待执行
+    // 执行方式：通过 DAG 调度器执行节点级组件（containerd + kubelet + masterjoin/workerjoin）
     e.nodeTransitions[NodeLifecycleProvisioned] = append(
         e.nodeTransitions[NodeLifecycleProvisioned],
         NodeTransitionRule{
             From: NodeLifecycleProvisioned,
             To:   NodeLifecycleReady,
             Condition: func(ctx context.Context, node *confv1beta1.BKENode) bool {
-                // 当所有节点级组件安装完成时
-                return e.allNodeComponentsInstalled(node)
+                // 当节点级 Joining 组件待执行
+                return e.hasPendingNodeComponents(node, "joining")
             },
             Action: func(ctx context.Context, node *confv1beta1.BKENode) error {
-                // 1. 根据节点角色执行对应的加入操作
-                // 对应实际代码：pkg/phaseframe/phases/ensure_master_join.go 或 ensure_worker_join.go
-                if node.IsMaster() {
-                    // Master 节点：加入控制面
-                    if err := e.executeNodePhase(ctx, node, "EnsureMasterJoin"); err != nil {
-                        return fmt.Errorf("master join for %s: %w", node.Name, err)
-                    }
-                } else {
-                    // Worker 节点：加入工作节点
-                    if err := e.executeNodePhase(ctx, node, "EnsureWorkerJoin"); err != nil {
-                        return fmt.Errorf("worker join for %s: %w", node.Name, err)
-                    }
+                // 1. 通过 DAG 调度器执行节点级 Joining 组件
+                // 根据节点角色执行不同的 DAG 组件：
+                //   Master: containerd@<nodeIP> → kubelet@<nodeIP> → masterinit/masterjoin@<nodeIP>
+                //   Worker: containerd@<nodeIP> → kubelet@<nodeIP> → workerjoin@<nodeIP>
+                // 对应原 Legacy Phase：
+                //   Master: EnsureMasterInit/EnsureMasterJoin 中的容器运行时 + kubelet + join
+                //   Worker: EnsureWorkerJoin 中的容器运行时 + kubelet + join
+                if err := e.executeNodeDAGComponents(ctx, node, "joining"); err != nil {
+                    return fmt.Errorf("join node %s: %w", node.Name, err)
                 }
                 
                 // 2. 更新 OperationProgress
@@ -3762,16 +4003,17 @@ func (e *StateMachineEngine) initNodeTransitions() {
     )
     
     // ========== Ready -> Upgrading ==========
-    // 触发条件：用户触发升级
-    // 实际执行：升级节点级组件（containerd、kubelet 等）
+    // 触发条件：ClusterVersion 触发升级，且节点级升级组件待执行
+    // 执行方式：通过 DAG 调度器执行节点级升级组件
     e.nodeTransitions[NodeLifecycleReady] = append(
         e.nodeTransitions[NodeLifecycleReady],
         NodeTransitionRule{
             From: NodeLifecycleReady,
             To:   NodeLifecycleUpgrading,
             Condition: func(ctx context.Context, node *confv1beta1.BKENode) bool {
-                // 当用户触发升级时
-                return e.hasNodeUpgradeOperation(node)
+                // 当 ClusterVersion 触发升级，且节点有版本差异
+                return e.hasNodeUpgradeOperation(node) &&
+                    e.hasPendingNodeComponents(node, "upgrading")
             },
             Action: func(ctx context.Context, node *confv1beta1.BKENode) error {
                 // 1. 初始化 OperationProgress
@@ -3779,15 +4021,17 @@ func (e *StateMachineEngine) initNodeTransitions() {
                 node.Status.OperationProgress = &confv1beta1.NodeOperationProgress{
                     OperationType: confv1beta1.NodeOperationTypeUpgrade,
                     StartedAt:     &now,
-                    CurrentStage:  "UpgradingComponents",
+                    CurrentStage:  "UpgradingNodeComponents",
                 }
                 
-                // 2. 执行节点级组件升级
-                // 对应实际代码：
-                //   - pkg/phaseframe/phases/ensure_containerd_upgrade.go
-                //   - pkg/phaseframe/phases/ensure_master_upgrade.go
-                //   - pkg/phaseframe/phases/ensure_worker_upgrade.go
-                if err := e.executeNodeUpgrade(ctx, node); err != nil {
+                // 2. 通过 DAG 调度器执行节点级升级组件
+                // DAG 中的节点级升级组件会被展开到每个需要升级的节点
+                // 本节点对应的组件：containerd-upgrade@<nodeIP> → kubelet-upgrade@<nodeIP>
+                //   Master 额外: etcd-upgrade@<nodeIP> → apiserver-upgrade@<nodeIP> → ...
+                // 对应原 Legacy Phase：
+                //   - EnsureContainerdUpgrade
+                //   - EnsureMasterUpgrade / EnsureWorkerUpgrade
+                if err := e.executeNodeDAGComponents(ctx, node, "upgrading"); err != nil {
                     return fmt.Errorf("upgrade node %s: %w", node.Name, err)
                 }
                 
@@ -3802,27 +4046,21 @@ func (e *StateMachineEngine) initNodeTransitions() {
     )
     
     // ========== Upgrading -> Ready ==========
-    // 触发条件：所有组件升级完成
-    // 实际执行：验证升级结果，更新版本信息
+    // 触发条件：所有节点级升级组件完成
     e.nodeTransitions[NodeLifecycleUpgrading] = append(
         e.nodeTransitions[NodeLifecycleUpgrading],
         NodeTransitionRule{
             From: NodeLifecycleUpgrading,
             To:   NodeLifecycleReady,
             Condition: func(ctx context.Context, node *confv1beta1.BKENode) bool {
-                // 当所有组件升级完成时
                 return e.allNodeComponentsUpgraded(node)
             },
             Action: func(ctx context.Context, node *confv1beta1.BKENode) error {
-                // 1. 更新 OperationProgress
                 now := metav1.Now()
                 node.Status.OperationProgress.FinishedAt = &now
                 node.Status.OperationProgress.CurrentStage = "Completed"
-                
-                // 2. 更新节点版本信息
                 node.Status.CurrentVersion = node.Spec.DesiredVersion
                 
-                // 3. 记录事件
                 e.recordNodeTransition(node, NodeLifecycleUpgrading, NodeLifecycleReady)
                 e.recorder.Eventf(node, v1.EventTypeNormal, "NodeUpgradeCompleted",
                     "Node %s upgrade completed successfully", node.Name)
@@ -3834,18 +4072,15 @@ func (e *StateMachineEngine) initNodeTransitions() {
     
     // ========== Ready -> Deleting ==========
     // 触发条件：用户触发删除
-    // 实际执行：驱逐 Pod、删除节点组件
     e.nodeTransitions[NodeLifecycleReady] = append(
         e.nodeTransitions[NodeLifecycleReady],
         NodeTransitionRule{
             From: NodeLifecycleReady,
             To:   NodeLifecycleDeleting,
             Condition: func(ctx context.Context, node *confv1beta1.BKENode) bool {
-                // 当用户触发删除时
                 return node.DeletionTimestamp != nil
             },
             Action: func(ctx context.Context, node *confv1beta1.BKENode) error {
-                // 1. 初始化 OperationProgress
                 now := metav1.Now()
                 node.Status.OperationProgress = &confv1beta1.NodeOperationProgress{
                     OperationType: confv1beta1.NodeOperationTypeDelete,
@@ -3853,29 +4088,19 @@ func (e *StateMachineEngine) initNodeTransitions() {
                     CurrentStage:  "DrainingNode",
                 }
                 
-                // 2. 驱逐节点上的 Pod（仅 Worker 节点）
-                // 对应实际代码：pkg/phaseframe/phases/ensure_worker_delete.go
+                // 1. 驱逐 Pod（仅 Worker）
                 if !node.IsMaster() {
                     if err := e.drainNode(ctx, node); err != nil {
                         return fmt.Errorf("drain node %s: %w", node.Name, err)
                     }
                 }
                 
-                // 3. 执行节点删除操作
-                // 对应实际代码：
-                //   - pkg/phaseframe/phases/ensure_master_delete.go
-                //   - pkg/phaseframe/phases/ensure_worker_delete.go
-                if node.IsMaster() {
-                    if err := e.executeNodePhase(ctx, node, "EnsureMasterDelete"); err != nil {
-                        return fmt.Errorf("master delete for %s: %w", node.Name, err)
-                    }
-                } else {
-                    if err := e.executeNodePhase(ctx, node, "EnsureWorkerDelete"); err != nil {
-                        return fmt.Errorf("worker delete for %s: %w", node.Name, err)
-                    }
+                // 2. 通过 DAG 调度器执行节点级删除组件
+                // 对应原 Legacy Phase：EnsureMasterDelete / EnsureWorkerDelete
+                if err := e.executeNodeDAGComponents(ctx, node, "deleting"); err != nil {
+                    return fmt.Errorf("delete node %s: %w", node.Name, err)
                 }
                 
-                // 4. 记录事件
                 e.recordNodeTransition(node, NodeLifecycleReady, NodeLifecycleDeleting)
                 e.recorder.Eventf(node, v1.EventTypeNormal, "NodeDeleting",
                     "Node %s deletion started", node.Name)
@@ -3886,37 +4111,30 @@ func (e *StateMachineEngine) initNodeTransitions() {
     )
     
     // ========== Deleting -> Deleted ==========
-    // 触发条件：所有组件删除完成
-    // 实际执行：清理节点资源、移除 Finalizer
     e.nodeTransitions[NodeLifecycleDeleting] = append(
         e.nodeTransitions[NodeLifecycleDeleting],
         NodeTransitionRule{
             From: NodeLifecycleDeleting,
             To:   NodeLifecycleDeleted,
             Condition: func(ctx context.Context, node *confv1beta1.BKENode) bool {
-                // 当所有组件删除完成时
                 return e.allNodeComponentsDeleted(node)
             },
             Action: func(ctx context.Context, node *confv1beta1.BKENode) error {
-                // 1. 更新 OperationProgress
                 now := metav1.Now()
                 node.Status.OperationProgress.FinishedAt = &now
-                node.Status.OperationProgress.CurrentStage = "Completed"
                 
-                // 2. 清理节点资源（移除 BKEAgent、清理配置文件等）
+                // 清理节点资源
                 if err := e.cleanupNodeResources(ctx, node); err != nil {
-                    return fmt.Errorf("cleanup node %s resources: %w", node.Name, err)
+                    return fmt.Errorf("cleanup node %s: %w", node.Name, err)
                 }
                 
-                // 3. 从 Kubernetes 中删除 Node 对象
+                // 删除 Kubernetes Node 对象
                 if err := e.deleteKubernetesNode(ctx, node); err != nil {
-                    // 忽略 NotFound 错误（节点可能已被删除）
                     if !apierrors.IsNotFound(err) {
-                        return fmt.Errorf("delete kubernetes node %s: %w", node.Name, err)
+                        return fmt.Errorf("delete k8s node %s: %w", node.Name, err)
                     }
                 }
                 
-                // 4. 记录事件
                 e.recordNodeTransition(node, NodeLifecycleDeleting, NodeLifecycleDeleted)
                 e.recorder.Eventf(node, v1.EventTypeNormal, "NodeDeleted",
                     "Node %s deleted successfully", node.Name)
@@ -3927,191 +4145,170 @@ func (e *StateMachineEngine) initNodeTransitions() {
     )
 }
 
-// ========== 节点操作执行方法 ==========
+// ========== 节点级 DAG 组件执行方法 ==========
 
-// executeNodePhase 执行节点级 Phase
-// 通过 SSH 连接节点，执行对应的 Phase 逻辑
-func (e *StateMachineEngine) executeNodePhase(
+// executeNodeDAGComponents 执行节点级 DAG 组件
+// 通过 DAG 调度器执行当前节点对应的节点级组件
+func (e *StateMachineEngine) executeNodeDAGComponents(
     ctx context.Context,
     node *confv1beta1.BKENode,
-    phaseName string,
+    stage string, // "provisioning" / "joining" / "upgrading" / "deleting"
 ) error {
-    log.Info("Executing node phase",
+    log.Info("Executing node DAG components",
         "node", node.Name,
-        "phase", phaseName)
+        "nodeIP", node.Spec.IP,
+        "stage", stage)
     
-    // 获取集群配置
+    // 1. 获取集群的 ClusterVersion
     cluster, err := e.getClusterForNode(ctx, node)
     if err != nil {
         return fmt.Errorf("get cluster for node: %w", err)
     }
     
-    // 创建 SSH 连接
-    sshClient, err := e.createSSHClient(ctx, node)
+    // 2. 解析 ReleaseImage Bundle
+    bundle, err := e.resolveNodeBundle(ctx, cluster, stage)
     if err != nil {
-        return fmt.Errorf("create SSH client: %w", err)
+        return fmt.Errorf("resolve node bundle: %w", err)
     }
-    defer sshClient.Close()
     
-    // 根据 phaseName 执行对应的逻辑
-    switch phaseName {
-    case "EnsureBKEAgent":
-        // 推送 BKEAgent 二进制和配置
-        return e.pushBKEAgent(ctx, sshClient, cluster, node)
-    
-    case "EnsureNodesEnv":
-        // 初始化节点环境
-        return e.initNodeEnvironment(ctx, sshClient, cluster, node)
-    
-    case "EnsureMasterJoin":
-        // Master 节点加入控制面
-        return e.joinMasterNode(ctx, sshClient, cluster, node)
-    
-    case "EnsureWorkerJoin":
-        // Worker 节点加入集群
-        return e.joinWorkerNode(ctx, sshClient, cluster, node)
-    
-    case "EnsureMasterDelete":
-        // 删除 Master 节点
-        return e.deleteMasterNode(ctx, sshClient, cluster, node)
-    
-    case "EnsureWorkerDelete":
-        // 删除 Worker 节点
-        return e.deleteWorkerNode(ctx, sshClient, cluster, node)
-    
-    default:
-        return fmt.Errorf("unknown phase: %s", phaseName)
+    // 3. 获取节点列表（用于 DAG 节点级组件展开）
+    nodes, err := e.getClusterNodes(ctx, cluster)
+    if err != nil {
+        return fmt.Errorf("get cluster nodes: %w", err)
     }
+    
+    // 4. 构建节点级 DAG（仅包含当前节点对应的组件）
+    nodeDAG, err := e.buildNodeDAG(bundle, node, nodes)
+    if err != nil {
+        return fmt.Errorf("build node DAG: %w", err)
+    }
+    
+    // 5. 创建 Scheduler 并执行
+    factory, err := componentfactory.NewFactoryFromBundle(bundle)
+    if err != nil {
+        return fmt.Errorf("build component factory: %w", err)
+    }
+    
+    sched := dagexec.NewScheduler(dagexec.Config{
+        InlineRunner: NewInlinePhaseRunnerAdapter(e.phaseCtx,
+            &componentfactory.PhaseRunner{Factory: factory}),
+        // ... 其他配置 ...
+    })
+    
+    execCtx := dagexec.NewExecutionContext(
+        e.buildVersionContext(cluster),
+        cluster,
+        e.getTargetClusterClient(ctx, cluster),
+    )
+    
+    // 6. 执行 DAG（仅执行当前节点对应的组件）
+    return sched.ExecuteDAG(ctx, execCtx, nodeDAG)
 }
 
-// executeNodeUpgrade 执行节点级组件升级
-// 对应实际代码：pkg/phaseframe/phases/ensure_*_upgrade.go
-func (e *StateMachineEngine) executeNodeUpgrade(
-    ctx context.Context,
-    node *confv1beta1.BKENode,
-) error {
-    log.Info("Executing node upgrade",
-        "node", node.Name,
-        "currentVersion", node.Status.CurrentVersion,
-        "desiredVersion", node.Spec.DesiredVersion)
-    
-    // 获取集群配置
-    cluster, err := e.getClusterForNode(ctx, node)
+// buildNodeDAG 为单个节点构建 DAG
+// 从完整 DAG 中过滤出当前节点对应的组件节点
+func (e *StateMachineEngine) buildNodeDAG(
+    bundle *releasemanifest.Bundle,
+    targetNode *confv1beta1.BKENode,
+    allNodes []NodeInfo,
+) (*topology.UpgradeDAG, error) {
+    // 构建完整 DAG（包含所有节点的组件）
+    fullDAG, err := upgrade.BuildDAGFromBundle(bundle,
+        upgrade.BundleDependencyResolver(bundle),
+        allNodes)
     if err != nil {
-        return fmt.Errorf("get cluster for node: %w", err)
+        return nil, err
     }
     
-    // 创建 SSH 连接
-    sshClient, err := e.createSSHClient(ctx, node)
-    if err != nil {
-        return fmt.Errorf("create SSH client: %w", err)
-    }
-    defer sshClient.Close()
+    // 过滤出当前节点对应的组件节点
+    // 节点级组件命名格式：{componentName}@{nodeIP}
+    nodePrefix := fmt.Sprintf("@%s", targetNode.Spec.IP)
+    nodeDAG := topology.NewUpgradeDAG()
     
-    // 按顺序升级节点级组件
-    // 1. 升级 containerd（如果版本变化）
-    if e.needsContainerdUpgrade(node) {
-        node.Status.OperationProgress.CurrentStage = "UpgradingContainerd"
-        if err := e.upgradeContainerd(ctx, sshClient, cluster, node); err != nil {
-            return fmt.Errorf("upgrade containerd: %w", err)
+    for _, name := range fullDAG.NodeNames() {
+        node := fullDAG.GetNode(name)
+        if node.Scope == topology.ComponentScopeNode && strings.HasSuffix(name, nodePrefix) {
+            nodeDAG.AddNode(node)
+        } else if node.Scope == topology.ComponentScopeCluster {
+            // 集群级组件也加入（如 certs）
+            nodeDAG.AddNode(node)
         }
     }
     
-    // 2. 升级 kubelet（如果版本变化）
-    if e.needsKubeletUpgrade(node) {
-        node.Status.OperationProgress.CurrentStage = "UpgradingKubelet"
-        if node.IsMaster() {
-            if err := e.upgradeMasterKubelet(ctx, sshClient, cluster, node); err != nil {
-                return fmt.Errorf("upgrade master kubelet: %w", err)
-            }
-        } else {
-            if err := e.upgradeWorkerKubelet(ctx, sshClient, cluster, node); err != nil {
-                return fmt.Errorf("upgrade worker kubelet: %w", err)
-            }
-        }
-    }
+    // 重建依赖关系
+    // ...
     
-    // 3. 升级 Static Pod 组件（etcd/apiserver/controller-manager/scheduler，仅 Master）
-    if node.IsMaster() && e.needsStaticPodUpgrade(node) {
-        node.Status.OperationProgress.CurrentStage = "UpgradingStaticPods"
-        if err := e.upgradeStaticPods(ctx, sshClient, cluster, node); err != nil {
-            return fmt.Errorf("upgrade static pods: %w", err)
-        }
-    }
-    
-    return nil
+    return nodeDAG, nil
 }
+```
 
-// drainNode 驱逐节点上的 Pod
-func (e *StateMachineEngine) drainNode(ctx context.Context, node *confv1beta1.BKENode) error {
-    log.Info("Draining node", "node", node.Name)
-    
-    // 获取目标集群客户端
-    targetClient, err := e.getTargetClusterClient(ctx, node)
-    if err != nil {
-        return fmt.Errorf("get target cluster client: %w", err)
-    }
-    
-    // 标记节点为不可调度
-    if err := e.cordonNode(ctx, targetClient, node); err != nil {
-        return fmt.Errorf("cordon node: %w", err)
-    }
-    
-    // 驱逐 Pod
-    if err := e.evictPods(ctx, targetClient, node); err != nil {
-        return fmt.Errorf("evict pods: %w", err)
-    }
-    
-    return nil
-}
+##### 8.3.3.5 BKECluster 重构清单
 
-// cleanupNodeResources 清理节点资源
-func (e *StateMachineEngine) cleanupNodeResources(ctx context.Context, node *confv1beta1.BKENode) error {
-    log.Info("Cleaning up node resources", "node", node.Name)
-    
-    sshClient, err := e.createSSHClient(ctx, node)
-    if err != nil {
-        return fmt.Errorf("create SSH client: %w", err)
-    }
-    defer sshClient.Close()
-    
-    // 1. 停止并删除 BKEAgent 服务
-    commands := []string{
-        "systemctl stop bkeagent || true",
-        "systemctl disable bkeagent || true",
-        "rm -f /etc/systemd/system/bkeagent.service",
-        "rm -f /usr/local/bin/bkeagent",
-        "rm -rf /etc/openFuyao/bkeagent",
-        "systemctl daemon-reload",
-    }
-    
-    for _, cmd := range commands {
-        if _, err := sshClient.Run(cmd); err != nil {
-            log.Error(err, "failed to execute cleanup command", "command", cmd)
-        }
-    }
-    
-    return nil
-}
+当前 BKECluster 完成了节点层组件的安装（通过 Legacy PhaseFlow），需要以下重构以适配新的 ClusterVersion/DAG 方案：
 
-// deleteKubernetesNode 从 Kubernetes 中删除 Node 对象
-func (e *StateMachineEngine) deleteKubernetesNode(ctx context.Context, node *confv1beta1.BKENode) error {
-    log.Info("Deleting Kubernetes node", "node", node.Name)
-    
-    targetClient, err := e.getTargetClusterClient(ctx, node)
-    if err != nil {
-        return fmt.Errorf("get target cluster client: %w", err)
+| 序号 | 重构项 | 当前实现 | 目标实现 | 涉及文件 | 优先级 |
+|------|--------|---------|---------|---------|--------|
+| 1 | **ComponentVersion 增加 Scope** | 无 scope 字段 | 增加 `scope: cluster/node` | `api/v1alpha1/componentversion_types.go` | P0 |
+| 2 | **ComponentNode 增加节点信息** | 无 NodeIP/NodeName | 增加节点级字段 | `pkg/topology/component.go` | P0 |
+| 3 | **BuildUpgradeDAG 节点展开** | 仅集群级组件 | 支持按节点展开 | `pkg/topology/build.go` | P0 |
+| 4 | **Scheduler 节点级执行** | `lifecycleMarkRef` 硬编码 Cluster | 根据 Scope 分发 | `pkg/dagexec/scheduler.go` | P0 |
+| 5 | **ExecutionContext 节点上下文** | 无节点级上下文 | 增加 `ForNode()` 方法 | `pkg/dagexec/execution_context.go` | P0 |
+| 6 | **ReleaseImage 节点级组件声明** | 无 scope 字段 | 增加 `scope` 字段 | `api/v1alpha1/releaseimage_types.go` | P0 |
+| 7 | **节点安装 Phase 迁移到 DAG** | EnsureBKEAgent/EnsureNodesEnv 在 PhaseFlow | 迁移为 DAG 节点级组件 | `pkg/phaseframe/phases/ensure_bke_agent.go` 等 | P1 |
+| 8 | **节点升级 Phase 迁移到 DAG** | EnsureMasterUpgrade/EnsureWorkerUpgrade 在 PhaseFlow | 迁移为 DAG 节点级组件 | `pkg/phaseframe/phases/ensure_*_upgrade.go` | P1 |
+| 9 | **节点删除 Phase 迁移到 DAG** | EnsureMasterDelete/EnsureWorkerDelete 在 PhaseFlow | 迁移为 DAG 节点级组件 | `pkg/phaseframe/phases/ensure_*_delete.go` | P1 |
+| 10 | **BKEClusterReconciler 集成** | `executePhaseFlow` 驱动安装 | `executeUpgradeDAG` 驱动安装 | `controllers/capbke/bkecluster_controller.go` | P1 |
+| 11 | **ComponentStatusUpdater 节点级** | 已有 `StatusComponentTypeNode` 预留 | 启用节点级状态更新 | `pkg/dagexec/component_status_updater.go` | P1 |
+| 12 | **bke-manifests 节点级组件定义** | 无节点级组件 YAML | 为 bkeagent/containerd/kubelet 等定义节点级 ComponentVersion | `bke-manifests/` | P2 |
+
+**重构优先级说明**：
+
+- **P0（基础设施）**：数据结构扩展，是后续迁移的前提
+- **P1（Phase 迁移）**：将 Legacy Phase 迁移到 DAG 框架
+- **P2（清单定义）**：在 bke-manifests 中定义节点级组件
+
+**重构路径**：
+
+```
+阶段 1: 数据结构扩展（P0）
+  ├─ ComponentVersionSpec.Scope
+  ├─ ComponentNode.NodeIP/NodeName/NodeRole
+  ├─ BuildUpgradeDAG 节点展开
+  ├─ Scheduler 节点级执行
+  └─ ExecutionContext.ForNode()
+
+阶段 2: Phase 迁移（P1）
+  ├─ EnsureBKEAgent → bkeagent@<nodeIP> DAG 组件
+  ├─ EnsureNodesEnv → nodesenv@<nodeIP> DAG 组件
+  ├─ EnsureMasterInit → masterinit@<nodeIP> DAG 组件
+  ├─ EnsureMasterJoin → masterjoin@<nodeIP> DAG 组件
+  ├─ EnsureWorkerJoin → workerjoin@<nodeIP> DAG 组件
+  ├─ EnsureContainerdUpgrade → containerd-upgrade@<nodeIP> DAG 组件
+  ├─ EnsureMasterUpgrade → master-upgrade@<nodeIP> DAG 组件
+  ├─ EnsureWorkerUpgrade → worker-upgrade@<nodeIP> DAG 组件
+  └─ EnsureMasterDelete/EnsureWorkerDelete → delete@<nodeIP> DAG 组件
+
+阶段 3: 清单定义（P2）
+  └─ bke-manifests 中为每个节点级组件定义 ComponentVersion YAML
+```
+
+**迁移策略**：
+
+采用 Feature Gate 渐进式迁移，与现有 Legacy PhaseFlow 并行运行：
+
+```go
+// 在 BKEClusterReconciler 中
+func (r *BKEClusterReconciler) executePhaseFlow(ctx context.Context, ...) {
+    if featuregate.DeclarativeNodeInstall.Enabled(bkeCluster) {
+        // 新路径：使用 DAG 驱动节点安装
+        return r.executeNodeInstallDAG(ctx, bkeCluster)
     }
     
-    // 删除 Node 对象
-    k8sNode := &corev1.Node{
-        ObjectMeta: metav1.ObjectMeta{
-            Name: node.Name,
-        },
-    }
-    
-    return targetClient.Delete(ctx, k8sNode)
+    // 旧路径：使用 Legacy PhaseFlow
+    flow := phases.NewPhaseFlow(phaseCtx)
+    return flow.Execute()
 }
+```
 ```
 
 #### 8.3.4 组件层状态转换
@@ -7515,5 +7712,5 @@ data:
 
 ---
 
-**文档版本**: v3.25 (混合模型 - 补充节点层状态转换实际操作调用)  
+**文档版本**: v3.26 (混合模型 - 节点层状态转换适配 ClusterVersion/DAG 方案)  
 **维护者**: openFuyao Team
