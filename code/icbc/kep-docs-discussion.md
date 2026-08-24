@@ -11,16 +11,464 @@
 
 ## 目录
 
-1. [文档清单](#1-文档清单)
-2. [A4-1: Binary 组件设计要点](#2-a4-1-binary-组件设计要点)
-3. [A4-2: 三层状态机设计要点](#3-a4-2-三层状态机设计要点)
-4. [A4-3: 可观测性设计要点](#4-a4-3-可观测性设计要点)
-5. [A4-4: 备份/回滚设计要点](#5-a4-4-备份回滚设计要点)
-6. [A4-5: 升级前预检设计要点](#6-a4-5-升级前预检设计要点)
+1. [声明式升级框架总览](#1-声明式升级框架总览)
+2. [文档清单](#2-文档清单)
+3. [A4-1: Binary 组件设计要点](#3-a4-1-binary-组件设计要点)
+4. [A4-2: 三层状态机设计要点](#4-a4-2-三层状态机设计要点)
+5. [A4-3: 可观测性设计要点](#5-a4-3-可观测性设计要点)
+6. [A4-4: 备份/回滚设计要点](#6-a4-4-备份回滚设计要点)
+7. [A4-5: 升级前预检设计要点](#7-a4-5-升级前预检设计要点)
 
 ---
 
-## 1. 文档清单
+## 1. 声明式升级框架总览
+
+### 1.1 整体架构
+
+openFuyao 声明式升级框架借鉴 OpenShift CVO 理念，通过 `ClusterVersion`、`ReleaseImage`、`UpgradePath`、`ComponentVersion` 四个核心 CRD，实现集群版本的声明式管理与 DAG 驱动升级。
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                          声明式升级框架整体架构                                   │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  用户层                                                                  │
+    │  ─────                                                                   │
+    │  kubectl patch bkecluster my-cluster --type merge                       │
+    │        -p '{"spec":{"desiredVersion":"v2.7.0"}}'                        │
+    └─────────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  声明层 (Declarative Layer)                                              │
+    │  ─────────────────────────────────────────────────────────────────────  │
+    │                                                                          │
+    │  ┌──────────────────┐  1:1   ┌──────────────────┐  引用  ┌───────────┐ │
+    │  │ ClusterVersion   │───────>│ ReleaseImage     │───────>│Component  │ │
+    │  │                  │        │                  │        │Version    │ │
+    │  │ desiredVersion:  │        │ version: v2.7.0  │        │           │ │
+    │  │   v2.7.0         │        │ clusterComponents│        │ type:     │ │
+    │  │ currentVersion:  │        │ nodeComponents   │        │  binary/  │ │
+    │  │   v2.6.0         │        │                  │        │  helm/    │ │
+    │  └──────────────────┘        └──────────────────┘        │  yaml/    │ │
+    │                                                           │  inline   │ │
+    │  ┌──────────────────┐                                    └───────────┘ │
+    │  │ UpgradePath      │                                                  │
+    │  │                  │                                                  │
+    │  │ from: v2.6.0     │                                                  │
+    │  │ to:   v2.7.0     │                                                  │
+    │  │ blocked: false   │                                                  │
+    │  └──────────────────┘                                                  │
+    └─────────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  调度层 (Scheduling Layer)                                               │
+    │  ─────────────────────────────────────────────────────────────────────  │
+    │                                                                          │
+    │  ┌──────────────────────────────────────────────────────────────────┐   │
+    │  │  BKECluster Controller (主调度器)                                 │   │
+    │  │  ┌────────────────────────────────────────────────────────────┐  │   │
+    │  │  │ 1. 解析 ReleaseImage                                       │  │   │
+    │  │  │ 2. 校验 UpgradePath (版本路径合法性)                        │  │   │
+    │  │  │ 3. 校验 Compatibility (组件版本兼容性)                      │  │   │
+    │  │  │ 4. 构建 DAG (依赖拓扑排序)                                 │  │   │
+    │  │  │ 5. 执行 DAG (按批次调度)                                   │  │   │
+    │  │  └────────────────────────────────────────────────────────────┘  │   │
+    │  └──────────────────────────────────────────────────────────────────┘   │
+    └─────────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  执行层 (Execution Layer)                                                │
+    │  ─────────────────────────────────────────────────────────────────────  │
+    │                                                                          │
+    │  ┌──────────────────────────────────────────────────────────────────┐   │
+    │  │  DAG 执行引擎                                                     │   │
+    │  │                                                                    │   │
+    │  │  ┌──────────┐   ┌──────────────┐   ┌──────────┐   ┌──────────┐  │   │
+    │  │  │  certs   │──>│  node-group  │──>│  coredns │──>│kube-proxy│  │   │
+    │  │  │ (binary) │   │ (BKEMachine) │   │  (helm)  │   │  (helm)  │  │   │
+    │  │  └──────────┘   └──────────────┘   └──────────┘   └──────────┘  │   │
+    │  │                                                                    │   │
+    │  │  执行模式: 按拓扑排序分批执行，同批次内并行                        │   │
+    │  └──────────────────────────────────────────────────────────────────┘   │
+    │                                                                          │
+    │  ┌──────────────────────────────────────────────────────────────────┐   │
+    │  │  Component Executor Factory                                       │   │
+    │  │                                                                    │   │
+    │  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐            │   │
+    │  │  │   Binary     │  │    Helm      │  │    YAML      │            │   │
+    │  │  │  Executor    │  │   Executor   │  │   Executor   │            │   │
+    │  │  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘            │   │
+    │  │         │                 │                 │                      │   │
+    │  │         ▼                 ▼                 ▼                      │   │
+    │  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐            │   │
+    │  │  │   Binary     │  │    Helm      │  │    K8s       │            │   │
+    │  │  │  Installer   │  │  Installer   │  │   Client     │            │   │
+    │  │  └──────────────┘  └──────────────┘  └──────────────┘            │   │
+    │  └──────────────────────────────────────────────────────────────────┘   │
+    └─────────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  状态层 (Status Layer)                                                   │
+    │  ─────────────────────────────────────────────────────────────────────  │
+    │                                                                          │
+    │  ┌──────────────────────────────────────────────────────────────────┐   │
+    │  │  三层状态机                                                        │   │
+    │  │                                                                    │   │
+    │  │  L1 集群层: Pending → Installing → Running → Upgrading → Failed   │   │
+    │  │       │                                                            │   │
+    │  │       ▼                                                            │   │
+    │  │  L2 节点层: Pending → Provisioning → Ready → Upgrading → Failed   │   │
+    │  │       │                                                            │   │
+    │  │       ▼                                                            │   │
+    │  │  L3 组件层: Pending → Installing → Installed → Upgrading → Failed │   │
+    │  └──────────────────────────────────────────────────────────────────┘   │
+    └─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 1.2 核心数据结构
+
+#### 1.2.1 CRD 关系图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                          CRD 关系与数据流                                         │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  BKECluster (集群实例)                                                   │
+    │  ─────────────────────────────────────────────────────────────────────  │
+    │  spec.desiredVersion: v2.7.0                                            │
+    │  status.currentVersion: v2.6.0                                          │
+    └─────────────────────────────────────────────────────────────────────────┘
+                                          │ 1:1 (OwnerReference)
+                                          ▼
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  ClusterVersion (版本声明)                                               │
+    │  ─────────────────────────────────────────────────────────────────────  │
+    │  spec.desiredVersion: v2.7.0                                            │
+    │  status.currentVersion: v2.6.0                                          │
+    │  status.currentReleaseImageRef: openfuyao-v2.6.0                        │
+    │  status.history:                                                        │
+    │    - version: v2.6.0                                                    │
+    │      state: Completed                                                   │
+    │      startedAt: 2026-08-01T10:00:00Z                                    │
+    │      completedAt: 2026-08-01T11:00:00Z                                  │
+    └─────────────────────────────────────────────────────────────────────────┘
+                                          │ 1:1 引用
+                                          ▼
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  ReleaseImage (版本清单)                                                 │
+    │  ─────────────────────────────────────────────────────────────────────  │
+    │  spec.version: v2.7.0                                                   │
+    │  spec.ociRef: registry/openfuyao-release:v2.7.0                         │
+    │  spec.clusterComponents:                                                │
+    │    - name: certs                                                        │
+    │      version: v2.7.0                                                    │
+    │      dependencies: []                                                   │
+    │    - name: coredns                                                      │
+    │      version: v1.11.1                                                   │
+    │      dependencies: [certs]                                              │
+    │  spec.nodeComponents:                                                   │
+    │    - name: bkeagent                                                     │
+    │      version: v2.7.0                                                    │
+    │      roles: [master, worker]                                            │
+    │    - name: kubelet                                                      │
+    │      version: v1.29.0                                                   │
+    │      dependencies: [bkeagent]                                           │
+    │      roles: [master, worker]                                            │
+    └─────────────────────────────────────────────────────────────────────────┘
+                                          │ 按 (name, version) 定位
+                                          ▼
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  ComponentVersion (组件版本定义)                                         │
+    │  ─────────────────────────────────────────────────────────────────────  │
+    │  bke-manifests/                                                         │
+    │  ├── kubernetes/v1.29.0/component.yaml  (type: composite)               │
+    │  ├── containerd/v1.7.18/component.yaml  (type: binary)                  │
+    │  ├── bkeagent/v2.7.0/component.yaml     (type: binary)                  │
+    │  ├── coredns/v1.11.1/component.yaml     (type: helm)                    │
+    │  └── kube-proxy/v1.29.0/component.yaml  (type: helm)                    │
+    └─────────────────────────────────────────────────────────────────────────┘
+
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  UpgradePath (升级路径)                                                  │
+    │  ─────────────────────────────────────────────────────────────────────  │
+    │  spec.versions:                                                         │
+    │    - version: v2.6.0                                                    │
+    │      installable: true                                                  │
+    │    - version: v2.7.0                                                    │
+    │      installable: true                                                  │
+    │  spec.paths:                                                            │
+    │    - from: v2.6.0                                                       │
+    │      to: v2.7.0                                                         │
+    │      blocked: false                                                     │
+    └─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 1.2.2 核心 Go 类型定义
+
+```go
+// ============================================================
+// ClusterVersion: 集群版本声明
+// ============================================================
+type ClusterVersion struct {
+    metav1.TypeMeta   `json:",inline"`
+    metav1.ObjectMeta `json:"metadata,omitempty"`
+    
+    Spec   ClusterVersionSpec   `json:"spec,omitempty"`
+    Status ClusterVersionStatus `json:"status,omitempty"`
+}
+
+type ClusterVersionSpec struct {
+    // 期望版本
+    DesiredVersion string `json:"desiredVersion"`
+    
+    // 集群名称
+    ClusterName string `json:"clusterName"`
+}
+
+type ClusterVersionStatus struct {
+    // 当前版本
+    CurrentVersion string `json:"currentVersion,omitempty"`
+    
+    // 当前 ReleaseImage 引用
+    CurrentReleaseImageRef string `json:"currentReleaseImageRef,omitempty"`
+    
+    // 版本历史
+    History []ReleaseHistory `json:"history,omitempty"`
+    
+    // 条件
+    Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// ============================================================
+// ReleaseImage: 版本清单
+// ============================================================
+type ReleaseImage struct {
+    metav1.TypeMeta   `json:",inline"`
+    metav1.ObjectMeta `json:"metadata,omitempty"`
+    
+    Spec ReleaseImageSpec `json:"spec"`
+}
+
+type ReleaseImageSpec struct {
+    // 版本号
+    Version string `json:"version"`
+    
+    // OCI 镜像引用
+    OCIRef string `json:"ociRef"`
+    
+    // 集群级组件列表
+    ClusterComponents []ReleaseComponent `json:"clusterComponents,omitempty"`
+    
+    // 节点级组件列表
+    NodeComponents []ReleaseNodeComponent `json:"nodeComponents,omitempty"`
+}
+
+type ReleaseComponent struct {
+    Name         string   `json:"name"`
+    Version      string   `json:"version"`
+    Dependencies []string `json:"dependencies,omitempty"`
+}
+
+type ReleaseNodeComponent struct {
+    Name         string   `json:"name"`
+    Version      string   `json:"version"`
+    Dependencies []string `json:"dependencies,omitempty"`
+    Roles        []string `json:"roles,omitempty"`
+}
+
+// ============================================================
+// ComponentVersion: 组件版本定义
+// ============================================================
+type ComponentVersion struct {
+    metav1.TypeMeta   `json:",inline"`
+    metav1.ObjectMeta `json:"metadata,omitempty"`
+    
+    Spec ComponentVersionSpec `json:"spec,omitempty"`
+}
+
+type ComponentVersionSpec struct {
+    Name          string        `json:"name"`
+    Type          ComponentType `json:"type"`
+    Version       string        `json:"version"`
+    
+    // 组件类型配置 (四选一)
+    Binary  *BinarySpec  `json:"binary,omitempty"`
+    Helm    *HelmSpec    `json:"helm,omitempty"`
+    YAML    *YAMLSpec    `json:"yaml,omitempty"`
+    Inline  *InlineSpec  `json:"inline,omitempty"`
+    
+    // 兼容性约束
+    Compatibility CompatibilitySpec `json:"compatibility,omitempty"`
+    
+    // 依赖关系
+    Dependencies []Dependency `json:"dependencies,omitempty"`
+    
+    // 升级策略
+    UpgradeStrategy UpgradeStrategySpec `json:"upgradeStrategy,omitempty"`
+}
+
+type ComponentType string
+
+const (
+    ComponentTypeBinary  ComponentType = "binary"
+    ComponentTypeHelm    ComponentType = "helm"
+    ComponentTypeYAML    ComponentType = "yaml"
+    ComponentTypeInline  ComponentType = "inline"
+    ComponentTypeComposite ComponentType = "composite"
+)
+
+// ============================================================
+// UpgradePath: 升级路径
+// ============================================================
+type UpgradePath struct {
+    metav1.TypeMeta   `json:",inline"`
+    metav1.ObjectMeta `json:"metadata,omitempty"`
+    
+    Spec UpgradePathSpec `json:"spec"`
+}
+
+type UpgradePathSpec struct {
+    OCIRef   string            `json:"ociRef"`
+    Versions []VersionEntry    `json:"versions,omitempty"`
+    Paths    []UpgradePathEdge `json:"paths"`
+}
+
+type UpgradePathEdge struct {
+    From       string `json:"from"`
+    To         string `json:"to"`
+    Blocked    bool   `json:"blocked,omitempty"`
+    Deprecated bool   `json:"deprecated,omitempty"`
+}
+```
+
+### 1.3 设计思路
+
+| 维度 | 设计要点 |
+|------|---------|
+| **声明式版本管理** | 用户只需声明期望版本 (`desiredVersion`)，系统自动完成升级编排 |
+| **版本清单不可变** | `ReleaseImage.Spec` 创建后不可修改，保证升级过程的一致性 |
+| **组件化架构** | 每个组件独立定义版本、依赖、兼容性约束，支持独立演进 |
+| **DAG 驱动执行** | 基于组件依赖关系构建 DAG，按拓扑顺序分批执行，同批次内并行 |
+| **多类型组件** | 统一支持 binary/helm/yaml/inline 四种组件类型 |
+| **升级路径管控** | `UpgradePath` 定义版本间升级路径，支持拦截、废弃等策略 |
+| **兼容性校验** | 基于 SAT/CSP 算法校验组件间版本兼容性 |
+| **离线环境支持** | 所有资源通过 OCI/本地缓存提供，支持断网降级 |
+
+### 1.4 执行流程
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                          声明式升级完整执行流程                                   │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+    ┌──────────────────────────────┐
+    │  1. 用户声明期望版本          │
+    │  kubectl patch bkecluster    │
+    │  desiredVersion: v2.7.0      │
+    └──────────────┬───────────────┘
+                   │
+                   ▼
+    ┌──────────────────────────────┐
+    │  2. BKECluster Controller    │
+    │  检测到版本变更               │
+    └──────────────┬───────────────┘
+                   │
+                   ▼
+    ┌──────────────────────────────┐
+    │  3. 加载 ReleaseImage v2.7.0 │
+    │  从 OCI 镜像拉取版本清单     │
+    └──────────────┬───────────────┘
+                   │
+                   ▼
+    ┌──────────────────────────────┐
+    │  4. 校验 UpgradePath         │
+    │  v2.6.0 → v2.7.0 路径合法?   │
+    └──────────────┬───────────────┘
+                   │
+                   ▼
+    ┌──────────────────────────────┐
+    │  5. 加载 ComponentVersion    │
+    │  从 bke-manifests 加载       │
+    │  所有组件版本定义             │
+    └──────────────┬───────────────┘
+                   │
+                   ▼
+    ┌──────────────────────────────┐
+    │  6. 兼容性校验               │
+    │  SAT/CSP 算法校验组件间      │
+    │  版本兼容性                   │
+    └──────────────┬───────────────┘
+                   │
+                   ▼
+    ┌──────────────────────────────┐
+    │  7. 执行 PreCheck            │
+    │  升级前预检 (集群健康/备份)   │
+    └──────────────┬───────────────┘
+                   │
+                   ▼
+    ┌──────────────────────────────┐
+    │  8. 构建 DAG                 │
+    │  按组件依赖关系构建          │
+    │  有向无环图                   │
+    └──────────────┬───────────────┘
+                   │
+                   ▼
+    ┌──────────────────────────────────────────────────────────────────────────┐
+    │  9. 执行 DAG (按拓扑排序分批执行)                                        │
+    │  ─────────────────────────────────────────────────────────────────────  │
+    │                                                                          │
+    │  Batch 1: [certs]                                                        │
+    │    └─ BinaryExecutor: 下载制品 → 渲染配置 → SSH 执行 → 健康检查          │
+    │                                                                          │
+    │  Batch 2: [node-group]                                                   │
+    │    └─ NodeGroupExecutor:                                                 │
+    │        ├─ 按角色过滤 nodeComponents                                      │
+    │        ├─ 创建/更新 BKEMachine (写入 Spec.NodeComponents)                │
+    │        ├─ 等待 BKEMachine Controller 完成 L2/L3 状态机                   │
+    │        └─ 聚合节点状态到集群状态                                         │
+    │                                                                          │
+    │  Batch 3: [coredns]                                                      │
+    │    └─ HelmExecutor: 拉取 Chart → 渲染 Values → helm install → 健康检查   │
+    │                                                                          │
+    │  Batch 4: [kube-proxy]                                                   │
+    │    └─ HelmExecutor: 拉取 Chart → 渲染 Values → helm install → 健康检查   │
+    └──────────────────────────────────────────────────────────────────────────┘
+                   │
+                   ▼
+    ┌──────────────────────────────┐
+    │  10. 执行 PostCheck          │
+    │  升级后检查 (版本验证/健康)   │
+    └──────────────┬───────────────┘
+                   │
+                   ▼
+    ┌──────────────────────────────┐
+    │  11. 更新状态                │
+    │  currentVersion: v2.7.0      │
+    │  history 追加版本记录        │
+    └──────────────────────────────┘
+```
+
+### 1.5 关键设计决策
+
+| 决策 | 选择 | 原因 |
+|------|------|------|
+| **版本管理模型** | OpenShift CVO 模式 | 成熟的声明式版本管理实践，支持版本回滚 |
+| **组件编排** | DAG 拓扑排序 | 支持并行执行，依赖关系清晰 |
+| **组件类型** | 多类型统一框架 | 覆盖二进制、Helm、YAML、内联代码等场景 |
+| **状态追踪** | 三层状态机 | 集群/节点/组件分层管理，职责清晰 |
+| **兼容性校验** | SAT/CSP 算法 | 自动检测版本冲突，保证升级安全 |
+| **制品分发** | OCI 镜像 | 复用容器镜像仓库，支持离线环境 |
+
+---
+
+## 2. 文档清单
 
 | 议题 | 对应文档 | 当前状态 |
 |------|---------|---------|
@@ -32,11 +480,11 @@
 
 ---
 
-## 2. A4-1: Binary 组件设计要点
+## 3. A4-1: Binary 组件设计要点
 
 **设计目标**：实现二进制组件的声明式安装/升级，支持制品下载、配置渲染、健康检查。
 
-### 2.1 整体架构
+### 3.1 整体架构
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -82,7 +530,7 @@
     └──────────────────────────────────────────────────────────────────┘
 ```
 
-### 2.2 核心设计思路
+### 3.2 核心设计思路
 
 | 维度 | 设计要点 |
 |------|---------|
@@ -92,7 +540,7 @@
 | **条件渲染** | 支持 Go template 条件块，按 OS/架构/离线模式动态生成配置 |
 | **健康检查** | 安装后通过 SSH 执行脚本验证服务可用性 |
 
-### 2.3 支持的组件类型
+### 3.3 支持的组件类型
 
 | 组件 | 制品 | 配置文件 | 说明 |
 |------|------|---------|------|
@@ -100,7 +548,7 @@
 | bkeagent | bkeagent | bkeagent.conf, kubeconfig | 节点 Agent |
 | kubelet/kubectl | kubelet, kubectl | kubelet.conf, service | K8s 核心组件 |
 
-### 2.4 讨论要点
+### 3.4 讨论要点
 
 1. 工行现有二进制安装方案如何迁移到 binary 类型 ComponentVersion？
 2. 模板变量系统是否满足工行场景需求？
@@ -108,11 +556,11 @@
 
 ---
 
-## 3. A4-2: 三层状态机设计要点
+## 4. A4-2: 三层状态机设计要点
 
 **设计目标**：实现集群/节点/组件三层状态管理，精确控制升级流程。
 
-### 3.1 三层状态机架构
+### 4.1 三层状态机架构
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -160,7 +608,7 @@
     └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 3.2 DAG 执行流程
+### 4.2 DAG 执行流程
 
 ```
 BKECluster Controller (L1 集群层状态机)
@@ -185,7 +633,7 @@ BKECluster Controller (L1 集群层状态机)
       └─ Batch 4: [kube-proxy]
 ```
 
-### 3.3 核心设计思路
+### 4.3 核心设计思路
 
 | 维度 | 设计要点 |
 |------|---------|
@@ -195,7 +643,7 @@ BKECluster Controller (L1 集群层状态机)
 | **依赖管理** | 组件间依赖通过 DAG 拓扑排序保证执行顺序 |
 | **状态聚合** | 组件状态 → 节点状态 → 集群状态，逐层聚合 |
 
-### 3.4 讨论要点
+### 4.4 讨论要点
 
 1. 三层状态机的状态转换条件如何定义？
 2. 节点层状态机与 CAPI Machine 的集成深度？
@@ -203,11 +651,11 @@ BKECluster Controller (L1 集群层状态机)
 
 ---
 
-## 4. A4-3: 可观测性设计要点
+## 5. A4-3: 可观测性设计要点
 
 **设计目标**：实现升级进度实时展示、状态查询、事件日志、指标监控四大能力。
 
-### 4.1 可观测性三层架构
+### 5.1 可观测性三层架构
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -254,7 +702,7 @@ BKECluster Controller (L1 集群层状态机)
     └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 4.2 状态查询 API 示例
+### 5.2 状态查询 API 示例
 
 ```bash
 # 查询集群状态
@@ -289,7 +737,7 @@ kubectl get bkemachine node-1 -o jsonpath='{.status.operationProgress}'
 # }
 ```
 
-### 4.3 核心设计思路
+### 5.3 核心设计思路
 
 | 维度 | 设计要点 |
 |------|---------|
@@ -298,7 +746,7 @@ kubectl get bkemachine node-1 -o jsonpath='{.status.operationProgress}'
 | **指标暴露** | Prometheus 格式指标，支持 Grafana 可视化 |
 | **进度追踪** | OperationProgress 实时显示当前阶段和完成比例 |
 
-### 4.4 讨论要点
+### 5.4 讨论要点
 
 1. 可观测性数据如何与工行现有监控系统集成？
 2. 升级进度的实时推送机制（WebSocket/SSE）？
@@ -306,11 +754,11 @@ kubectl get bkemachine node-1 -o jsonpath='{.status.operationProgress}'
 
 ---
 
-## 5. A4-4: 备份/回滚设计要点
+## 6. A4-4: 备份/回滚设计要点
 
 **设计目标**：实现分层回滚能力，支持组件级、节点级、集群级回滚。
 
-### 5.1 三层回滚架构
+### 6.1 三层回滚架构
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -335,7 +783,7 @@ kubectl get bkemachine node-1 -o jsonpath='{.status.operationProgress}'
   恢复时间: 秒级           恢复时间: 分钟级          恢复时间: 十分钟级
 ```
 
-### 5.2 回滚决策流程
+### 6.2 回滚决策流程
 
 ```
 升级后发现问题
@@ -350,7 +798,7 @@ kubectl get bkemachine node-1 -o jsonpath='{.status.operationProgress}'
       └─ 集群级回滚：回滚所有组件到上一版本
 ```
 
-### 5.3 各类型组件回滚策略
+### 6.3 各类型组件回滚策略
 
 | 组件类型 | 回滚方式 | 说明 |
 |---------|---------|------|
@@ -359,7 +807,7 @@ kubectl get bkemachine node-1 -o jsonpath='{.status.operationProgress}'
 | **YAML** | Apply(旧版本清单) | 加载旧版本清单，SSA Apply 覆盖，Prune 多余资源 |
 | **Inline** | 旧版本 Phase.Execute() | 调用旧版本的 Phase 执行器 |
 
-### 5.4 核心设计思路
+### 6.4 核心设计思路
 
 | 维度 | 设计要点 |
 |------|---------|
@@ -369,7 +817,7 @@ kubectl get bkemachine node-1 -o jsonpath='{.status.operationProgress}'
 | **独立超时控制** | 回滚操作有独立的超时时间，与升级超时解耦 |
 | **数据保全** | 回滚不删除用户数据（etcd 数据、PV 等）|
 
-### 5.5 讨论要点
+### 6.5 讨论要点
 
 1. 回滚前的 etcd 备份策略如何设计？
 2. Binary 组件的旧版本制品缓存策略？
@@ -377,11 +825,11 @@ kubectl get bkemachine node-1 -o jsonpath='{.status.operationProgress}'
 
 ---
 
-## 6. A4-5: 升级前预检设计要点
+## 7. A4-5: 升级前预检设计要点
 
 **设计目标**：实现升级前自动化检查，降低升级失败率。
 
-### 6.1 检查框架架构
+### 7.1 检查框架架构
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -445,7 +893,7 @@ kubectl get bkemachine node-1 -o jsonpath='{.status.operationProgress}'
     └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 6.2 预检项清单
+### 7.2 预检项清单
 
 | 检查项 | 检查内容 | 必须通过 | 说明 |
 |--------|---------|---------|------|
@@ -456,7 +904,7 @@ kubectl get bkemachine node-1 -o jsonpath='{.status.operationProgress}'
 | **crd-compatibility** | CRD 字段变更检查 | 是 | CRD 兼容性 |
 | **dependency-check** | 组件依赖版本检查 | 是 | 依赖关系验证 |
 
-### 6.3 后检项清单
+### 7.3 后检项清单
 
 | 检查项 | 检查内容 | 必须通过 | 说明 |
 |--------|---------|---------|------|
@@ -465,7 +913,7 @@ kubectl get bkemachine node-1 -o jsonpath='{.status.operationProgress}'
 | **node-ready** | 所有节点 Ready | 是 | 节点状态验证 |
 | **application-health** | 关键应用正常运行 | 否 | 应用健康检查 |
 
-### 6.4 核心设计思路
+### 7.4 核心设计思路
 
 | 维度 | 设计要点 |
 |------|---------|
@@ -475,7 +923,7 @@ kubectl get bkemachine node-1 -o jsonpath='{.status.operationProgress}'
 | **DAG 执行** | 检查项按依赖关系执行，支持并行 |
 | **结果报告** | 生成 CheckReport，持久化到 ClusterVersion.Status |
 
-### 6.5 讨论要点
+### 7.5 讨论要点
 
 1. 工行有哪些特定的预检需求？
 2. 检查项的超时时间和重试策略如何配置？
