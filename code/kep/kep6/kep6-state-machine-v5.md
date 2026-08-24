@@ -1283,6 +1283,411 @@ func (n *ClusterComponentNode) Execute(ctx context.Context, execCtx *ExecutionCo
 }
 ```
 
+**类型定义**：
+
+```go
+// ReleaseNodeComponent ReleaseImage 中的节点级组件定义
+type ReleaseNodeComponent struct {
+    // 组件名称（对应 ComponentVersion.Name）
+    Name string `json:"name"`
+    
+    // 组件版本（对应 ComponentVersion.Version）
+    Version string `json:"version"`
+    
+    // 依赖的组件名称列表（节点级组件之间的依赖）
+    Dependencies []string `json:"dependencies,omitempty"`
+    
+    // 适用角色：master / worker / etcd
+    // 空表示所有角色都需要
+    Roles []string `json:"roles,omitempty"`
+}
+
+// NodeComponentSpec BKEMachine.Spec.NodeComponents 中的组件规格
+// 这是 BKECluster Controller 按角色过滤后写入 BKEMachine 的格式
+type NodeComponentSpec struct {
+    // 组件名称
+    Name string `json:"name"`
+    
+    // 组件版本
+    Version string `json:"version"`
+    
+    // 依赖的组件名称列表
+    Dependencies []string `json:"dependencies,omitempty"`
+}
+
+// BKEMachineSpec BKEMachine 规格
+type BKEMachineSpec struct {
+    // 节点角色：master / worker
+    Role string `json:"role,omitempty"`
+    
+    // 节点级组件列表：由 BKECluster Controller 按角色过滤后写入
+    // BKEMachine Controller 读取此列表驱动 L2/L3 状态机
+    NodeComponents []NodeComponentSpec `json:"nodeComponents,omitempty"`
+}
+
+// BKEMachineStatus BKEMachine 状态
+type BKEMachineStatus struct {
+    // 节点生命周期阶段 (L2)
+    LifecyclePhase NodeLifecyclePhase `json:"lifecyclePhase,omitempty"`
+    
+    // 组件状态列表 (L3)：与 Spec.NodeComponents 一一对应
+    ComponentStatuses []ComponentLifecycleStatus `json:"componentStatuses,omitempty"`
+    
+    // 操作进度
+    OperationProgress *NodeOperationProgress `json:"operationProgress,omitempty"`
+    
+    // CAPI 标准字段
+    Ready bool `json:"ready"`
+    
+    // Conditions
+    Conditions []metav1.Condition `json:"conditions,omitempty"`
+}
+
+// ComponentLifecycleStatus 组件生命周期状态
+type ComponentLifecycleStatus struct {
+    // 组件名称
+    Name string `json:"name"`
+    
+    // 组件版本
+    Version string `json:"version"`
+    
+    // 组件状态
+    Phase ComponentLifecyclePhase `json:"phase"`
+    
+    // 操作进度
+    OperationProgress *ComponentOperationProgress `json:"operationProgress,omitempty"`
+    
+    // 错误信息
+    Message string `json:"message,omitempty"`
+    
+    // 最后更新时间
+    LastUpdateTime *metav1.Time `json:"lastUpdateTime,omitempty"`
+}
+```
+
+**数据流示例**：
+
+```
+ReleaseImage.Spec.NodeComponents (全量节点级组件):
+  - name: bkeagent
+    version: "v2.7.0"
+    dependencies: []
+    roles: [master, worker]        # 所有角色都需要
+  - name: containerd
+    version: "v1.7.18"
+    dependencies: [bkeagent]
+    roles: [master, worker]        # 所有角色都需要
+  - name: kubelet
+    version: "v1.29.0"
+    dependencies: [containerd]
+    roles: [master, worker]        # 所有角色都需要
+  - name: etcd
+    version: "v3.5.21-of.1"
+    dependencies: [kubelet]
+    roles: [master]                # 仅 Master 节点
+  - name: apiserver
+    version: "v1.29.0"
+    dependencies: [etcd]
+    roles: [master]                # 仅 Master 节点
+
+BKECluster Controller 执行 NodeGroupNode.Execute():
+  │
+  ├─ 遍历所有节点
+  │   │
+  │   ├─ Master 节点 (role="master"):
+  │   │   │
+  │   │   ├─ filterNodeComponentsByRole(components, "master")
+  │   │   │   └─ 返回: [bkeagent, containerd, kubelet, etcd, apiserver]
+  │   │   │
+  │   │   ├─ toNodeComponentSpecs(filtered)
+  │   │   │   └─ 转换为: [
+  │   │   │        {Name: "bkeagent", Version: "v2.7.0", Dependencies: []},
+  │   │   │        {Name: "containerd", Version: "v1.7.18", Dependencies: ["bkeagent"]},
+  │   │   │        {Name: "kubelet", Version: "v1.29.0", Dependencies: ["containerd"]},
+  │   │   │        {Name: "etcd", Version: "v3.5.21-of.1", Dependencies: ["kubelet"]},
+  │   │   │        {Name: "apiserver", Version: "v1.29.0", Dependencies: ["etcd"]},
+  │   │   │      ]
+  │   │   │
+  │   │   └─ 创建/更新 BKEMachine
+  │   │       └─ BKEMachine.Spec.NodeComponents = [上述列表]
+  │   │
+  │   └─ Worker 节点 (role="worker"):
+  │       │
+  │       ├─ filterNodeComponentsByRole(components, "worker")
+  │       │   └─ 返回: [bkeagent, containerd, kubelet]
+  │       │      (etcd 和 apiserver 被过滤掉，因为 roles=[master])
+  │       │
+  │       ├─ toNodeComponentSpecs(filtered)
+  │       │   └─ 转换为: [
+  │       │        {Name: "bkeagent", Version: "v2.7.0", Dependencies: []},
+  │       │        {Name: "containerd", Version: "v1.7.18", Dependencies: ["bkeagent"]},
+  │       │        {Name: "kubelet", Version: "v1.29.0", Dependencies: ["containerd"]},
+  │       │      ]
+  │       │
+  │       └─ 创建/更新 BKEMachine
+  │           └─ BKEMachine.Spec.NodeComponents = [上述列表]
+  │
+  └─ 等待 BKEMachine Controller 完成节点层状态机
+```
+
+**BKEMachine Controller 读取并驱动状态机**：
+
+```go
+// BKEMachineReconciler BKEMachine 控制器
+type BKEMachineReconciler struct {
+    client.Client
+    Scheme   *runtime.Scheme
+    Recorder record.EventRecorder
+    
+    // 节点层状态机
+    nodeSM *NodeStateMachine
+    
+    // 组件层状态机
+    componentSM *ComponentStateMachine
+}
+
+func (r *BKEMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+    log := log.FromContext(ctx)
+    
+    // 1. 获取 BKEMachine
+    machine := &bkev1beta1.BKEMachine{}
+    if err := r.Get(ctx, req.NamespacedName, machine); err != nil {
+        return ctrl.Result{}, client.IgnoreNotFound(err)
+    }
+    
+    // 2. 获取关联的 BKECluster
+    cluster, err := getClusterForMachine(ctx, r.Client, machine)
+    if err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    // 3. 创建 PatchHelper
+    patchHelper, err := patch.NewHelper(machine, r.Client)
+    if err != nil {
+        return ctrl.Result{}, err
+    }
+    defer func() {
+        if err := patchHelper.Patch(ctx, machine); err != nil {
+            log.Error(err, "failed to patch machine")
+        }
+    }()
+    
+    // 4. 从 BKEMachine.Spec.NodeComponents 获取组件列表
+    // 这些组件已经由 BKECluster Controller 按角色过滤后写入
+    nodeComponents := machine.Spec.NodeComponents
+    
+    // 5. 初始化组件状态（如果尚未初始化）
+    r.initComponentStatuses(machine, nodeComponents)
+    
+    // 6. 执行节点层状态机
+    // 节点层状态机根据 Spec.NodeComponents 驱动 L2/L3 状态转换
+    if err := r.nodeSM.Execute(ctx, machine, nodeComponents); err != nil {
+        log.Error(err, "node state machine execution failed")
+        r.Recorder.Eventf(machine, v1.EventTypeWarning, "NodeStateMachineFailed",
+            "Node state machine failed: %v", err)
+    }
+    
+    // 7. 设置 CAPI 标准条件
+    setCAPIConditions(machine)
+    
+    // 8. 决定 Requeue
+    return r.decideRequeue(machine), nil
+}
+
+// initComponentStatuses 初始化组件状态列表
+// 确保 Status.ComponentStatuses 与 Spec.NodeComponents 一一对应
+func (r *BKEMachineReconciler) initComponentStatuses(
+    machine *bkev1beta1.BKEMachine,
+    nodeComponents []bkev1beta1.NodeComponentSpec,
+) {
+    // 如果已初始化，跳过
+    if len(machine.Status.ComponentStatuses) == len(nodeComponents) {
+        return
+    }
+    
+    // 初始化组件状态
+    machine.Status.ComponentStatuses = make([]cvoapi.ComponentLifecycleStatus, len(nodeComponents))
+    for i, comp := range nodeComponents {
+        machine.Status.ComponentStatuses[i] = cvoapi.ComponentLifecycleStatus{
+            Name:    comp.Name,
+            Version: comp.Version,
+            Phase:   cvoapi.CompPhasePending,
+        }
+    }
+}
+```
+
+**NodeStateMachine 执行逻辑**：
+
+```go
+// NodeStateMachine 节点层状态机
+type NodeStateMachine struct {
+    componentSM *ComponentStateMachine
+}
+
+// Execute 执行节点层状态机
+func (sm *NodeStateMachine) Execute(
+    ctx context.Context,
+    machine *bkev1beta1.BKEMachine,
+    nodeComponents []bkev1beta1.NodeComponentSpec,
+) error {
+    // 1. 评估节点状态转换 (L2)
+    oldPhase := machine.Status.LifecyclePhase
+    newPhase := sm.evaluateNodePhase(machine, nodeComponents)
+    
+    if oldPhase != newPhase {
+        machine.Status.LifecyclePhase = newPhase
+    }
+    
+    // 2. 根据节点状态执行操作
+    switch newPhase {
+    case NodePhaseProvisioning, NodePhaseUpgrading:
+        // 按依赖顺序执行节点级组件 (L3)
+        return sm.executeNodeComponents(ctx, machine, nodeComponents)
+    
+    case NodePhaseDeleting:
+        // 按依赖逆序卸载组件
+        return sm.uninstallNodeComponents(ctx, machine, nodeComponents)
+    }
+    
+    return nil
+}
+
+// evaluateNodePhase 评估节点层状态
+func (sm *NodeStateMachine) evaluateNodePhase(
+    machine *bkev1beta1.BKEMachine,
+    nodeComponents []bkev1beta1.NodeComponentSpec,
+) NodeLifecyclePhase {
+    // 检查是否所有组件都已安装
+    allInstalled := true
+    hasUpgrading := false
+    hasFailed := false
+    
+    for _, compStatus := range machine.Status.ComponentStatuses {
+        switch compStatus.Phase {
+        case cvoapi.CompPhaseInstalled:
+            // 已安装
+        case cvoapi.CompPhaseUpgrading, cvoapi.CompPhaseInstalling:
+            hasUpgrading = true
+            allInstalled = false
+        case cvoapi.CompPhaseFailed:
+            hasFailed = true
+            allInstalled = false
+        case cvoapi.CompPhasePending:
+            allInstalled = false
+        }
+    }
+    
+    // 状态判断
+    if hasFailed {
+        return NodePhaseFailed
+    }
+    if hasUpgrading {
+        return NodePhaseUpgrading
+    }
+    if allInstalled && len(machine.Status.ComponentStatuses) > 0 {
+        return NodePhaseReady
+    }
+    if len(machine.Status.ComponentStatuses) > 0 {
+        return NodePhaseProvisioning
+    }
+    
+    return NodePhasePending
+}
+
+// executeNodeComponents 按依赖顺序执行节点级组件
+func (sm *NodeStateMachine) executeNodeComponents(
+    ctx context.Context,
+    machine *bkev1beta1.BKEMachine,
+    nodeComponents []bkev1beta1.NodeComponentSpec,
+) error {
+    // 1. 按依赖关系拓扑排序
+    sorted, err := topologicalSortComponents(nodeComponents)
+    if err != nil {
+        return fmt.Errorf("failed to sort components: %w", err)
+    }
+    
+    // 2. 按顺序执行每个组件
+    for _, comp := range sorted {
+        // 查找对应的组件状态
+        compStatus := sm.findComponentStatus(machine, comp.Name)
+        if compStatus == nil {
+            continue
+        }
+        
+        // 跳过已完成的组件
+        if compStatus.Phase == cvoapi.CompPhaseInstalled {
+            continue
+        }
+        
+        // 检查依赖是否满足
+        if !sm.dependenciesSatisfied(machine, comp.Dependencies) {
+            continue // 等待依赖完成
+        }
+        
+        // 获取 ComponentVersion
+        cv, err := sm.lookupComponentVersion(ctx, comp.Name, comp.Version)
+        if err != nil {
+            return fmt.Errorf("failed to lookup component %s: %w", comp.Name, err)
+        }
+        
+        // 执行组件层状态机 (L3)
+        if err := sm.componentSM.Execute(ctx, compStatus, cv); err != nil {
+            return fmt.Errorf("component %s failed: %w", comp.Name, err)
+        }
+    }
+    
+    return nil
+}
+
+// topologicalSortComponents 按依赖关系拓扑排序
+func topologicalSortComponents(components []bkev1beta1.NodeComponentSpec) ([]bkev1beta1.NodeComponentSpec, error) {
+    // 构建依赖图
+    graph := make(map[string][]string)
+    inDegree := make(map[string]int)
+    compMap := make(map[string]bkev1beta1.NodeComponentSpec)
+    
+    for _, comp := range components {
+        compMap[comp.Name] = comp
+        if _, ok := inDegree[comp.Name]; !ok {
+            inDegree[comp.Name] = 0
+        }
+        for _, dep := range comp.Dependencies {
+            graph[dep] = append(graph[dep], comp.Name)
+            inDegree[comp.Name]++
+        }
+    }
+    
+    // Kahn 算法
+    var queue []string
+    for name, degree := range inDegree {
+        if degree == 0 {
+            queue = append(queue, name)
+        }
+    }
+    
+    var sorted []bkev1beta1.NodeComponentSpec
+    for len(queue) > 0 {
+        name := queue[0]
+        queue = queue[1:]
+        sorted = append(sorted, compMap[name])
+        
+        for _, dependent := range graph[name] {
+            inDegree[dependent]--
+            if inDegree[dependent] == 0 {
+                queue = append(queue, dependent)
+            }
+        }
+    }
+    
+    if len(sorted) != len(components) {
+        return nil, fmt.Errorf("circular dependency detected")
+    }
+    
+    return sorted, nil
+}
+```
+
 **执行流程**：
 
 ```
