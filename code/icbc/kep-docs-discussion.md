@@ -878,15 +878,7 @@ type PhaseFlow struct {
 | **lxcfs** | `EnsureNodesEnv` (install-lxcfs.sh) | lxcfs 二进制 + service | master, worker | P2 | 容器文件系统隔离 |
 | **nfs-utils** | `EnsureNodesEnv` (install-nfsutils.sh) | nfs-utils 包 | master, worker | P2 | NFS 存储支持 |
 
-#### 3.3.2 集群级二进制组件（在整个集群中执行一次）
-
-| 组件名称 | 当前 Phase | 制品 | 改造优先级 | 说明 |
-|---------|-----------|------|-----------|------|
-| **certs** | `EnsureCerts` | 证书文件（CA、API Server、etcd 等） | P0 | 集群证书生成与分发 |
-| **haproxy** | `EnsureLoadBalance` | haproxy.yaml (Static Pod) + haproxy.cfg | P1 | 负载均衡器，Static Pod 方式部署 |
-| **keepalived** | `EnsureLoadBalance` | keepalived.yaml (Static Pod) + keepalived.conf | P1 | VIP 管理，Static Pod 方式部署 |
-
-#### 3.3.3 Static Pod 类型组件（需改造为 `staticpod` 类型 ComponentVersion）
+#### 3.3.2 Static Pod 类型组件（需改造为 `staticpod` 类型 ComponentVersion）
 
 以下组件通过 Static Pod 方式部署，需要改造为 `staticpod` 类型（详见 `staticpod-type-design.md`）：
 
@@ -900,15 +892,15 @@ type PhaseFlow struct {
 | **keepalived** | `EnsureLoadBalance` | keepalived 镜像 | master | P1 | VIP 管理 |
 | **pause** | `EnsureNodesEnv` | pause 镜像 | master, worker | P2 | Pod 基础设施容器 |
 
-#### 3.3.4 改造优先级说明
+#### 3.3.3 改造优先级说明
 
 | 优先级 | 说明 | 组件 |
 |-------|------|------|
-| **P0** | 核心组件，必须首先改造 | bkeagent, containerd, kubelet, kubectl, etcd, certs, kube-apiserver, kube-controller-manager, kube-scheduler |
+| **P0** | 核心组件，必须首先改造 | bkeagent, containerd, kubelet, kubectl, etcd, kube-apiserver, kube-controller-manager, kube-scheduler |
 | **P1** | 重要组件，第二批改造 | haproxy, keepalived, runc |
 | **P2** | 辅助组件，最后改造 | helm, etcdctl, calicoctl, lxcfs, nfs-utils, pause |
 
-#### 3.3.5 改造工作量评估
+#### 3.3.4 改造工作量评估
 
 | 组件类型 | 组件数量 | 改造复杂度 | 预估工作量 |
 |---------|---------|-----------|-----------|
