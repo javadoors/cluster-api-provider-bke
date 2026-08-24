@@ -534,6 +534,249 @@ type PhaseFlow struct {
 | **制品分发** | ManifestStore (本地优先 + OCI 降级) | 支持离线环境，多级缓存提升性能 |
 | **Feature Gate** | DeclarativeUpgradeEnabled + HelmComponentEnabled | 灰度发布，控制新能力启用范围 |
 
+### 1.6 目标架构
+
+当前架构已实现 DAG 驱动的声明式升级，但节点级组件（bkeagent、kubelet、etcd 等）仍通过 Inline Phase 硬编码在 BKECluster Controller 中执行，缺乏独立的节点生命周期管理。目标架构引入**三层状态机**和 **CAPI BKEMachine 深度集成**，实现集群层、节点层、组件层的分层管理。
+
+#### 1.6.1 目标架构图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                     目标架构：三层状态机 + CAPI BKEMachine 集成                    │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  API 层                                                                  │
+    │  ─────                                                                   │
+    │  config.openfuyao.com/v1alpha1          bke.bocloud.com/v1beta1          │
+    │  ┌──────────────────┐                 ┌──────────────────┐              │
+    │  │ ClusterVersion   │                 │ BKECluster       │              │
+    │  │ ReleaseImage     │                 │ BKEMachine       │◄─── 新增     │
+    │  │ ComponentVersion │                 │ BKENode          │     节点级    │
+    │  │ UpgradePath      │                 │ BKEClusterTemplate│    状态追踪  │
+    │  │ CheckPolicy      │                 └──────────────────┘              │
+    │  └──────────────────┘                                                   │
+    └─────────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  控制器层 (Controllers)                                                  │
+    │  ─────────────────────────────────────────────────────────────────────  │
+    │                                                                          │
+    │  ┌──────────────────────────────────────────────────────────────────┐   │
+    │  │  BKEClusterReconciler (L1 集群层状态机)                          │   │
+    │  │  ──────────────────────────────────────────────────────────────  │   │
+    │  │  职责:                                                           │   │
+    │  │  • 驱动 DAG 执行 (集群级组件 + node-group 节点)                  │   │
+    │  │  • 直接执行集群级组件 (certs, coredns, kube-proxy)               │   │
+    │  │  • node-group 节点: 创建/更新 BKEMachine + 等待节点状态机完成    │   │
+    │  │  • 聚合节点状态到集群状态                                        │   │
+    │  │                                                                    │   │
+    │  │  状态: Pending → Installing → Running → Upgrading → Failed       │   │
+    │  └──────────────────────────────────────────────────────────────────┘   │
+    │                          │ 创建/更新 BKEMachine                          │
+    │                          │ 等待 BKEMachine.Status.Ready                  │
+    │                          ▼                                               │
+    │  ┌──────────────────────────────────────────────────────────────────┐   │
+    │  │  BKEMachineReconciler (L2 节点层 + L3 组件层状态机)              │   │
+    │  │  ──────────────────────────────────────────────────────────────  │   │
+    │  │  职责:                                                           │   │
+    │  │  • 读取 BKEMachine.Spec.NodeComponents (由 BKECluster 写入)      │   │
+    │  │  • 驱动 L2 节点层状态机                                          │   │
+    │  │  • 按依赖顺序驱动 L3 组件层状态机                                │   │
+    │  │  • 更新 BKEMachine.Status.ComponentStatuses                      │   │
+    │  │                                                                    │   │
+    │  │  L2 状态: Pending → Provisioning → Ready → Upgrading → Failed    │   │
+    │  │  L3 状态: Pending → Installing → Installed → Upgrading → Failed  │   │
+    │  └──────────────────────────────────────────────────────────────────┘   │
+    └─────────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  执行层 (Execution Layer)                                                │
+    │  ─────────────────────────────────────────────────────────────────────  │
+    │                                                                          │
+    │  ┌──────────────────────────────────────────────────────────────────┐   │
+    │  │  DAG 执行引擎 (pkg/dagexec/)                                      │   │
+    │  │                                                                    │   │
+    │  │  DAG 结构:                                                         │   │
+    │  │  ┌──────────┐   ┌──────────────┐   ┌──────────┐   ┌──────────┐  │   │
+    │  │  │  certs   │──>│  node-group  │──>│  coredns │──>│kube-proxy│  │   │
+    │  │  │ (binary) │   │ (BKEMachine) │   │  (helm)  │   │  (helm)  │  │   │
+    │  │  └──────────┘   └──────────────┘   └──────────┘   └──────────┘  │   │
+    │  │                                                                    │   │
+    │  │  node-group 节点执行流程:                                          │   │
+    │  │  1. 按角色过滤 nodeComponents                                      │   │
+    │  │  2. 写入 BKEMachine.Spec.NodeComponents                            │   │
+    │  │  3. waitForNodesReady() → 轮询等待 BKEMachine Controller 完成      │   │
+    │  │  4. aggregateNodeStatuses() → 聚合节点状态到集群状态               │   │
+    │  └──────────────────────────────────────────────────────────────────┘   │
+    │                                                                          │
+    │  ┌──────────────────────────────────────────────────────────────────┐   │
+    │  │  Component Executor Factory                                       │   │
+    │  │                                                                    │   │
+    │  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐            │   │
+    │  │  │   Binary     │  │    Helm      │  │    YAML      │            │   │
+    │  │  │  Executor    │  │   Executor   │  │   Executor   │            │   │
+    │  │  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘            │   │
+    │  │         │                 │                 │                      │   │
+    │  │         ▼                 ▼                 ▼                      │   │
+    │  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐            │   │
+    │  │  │   Binary     │  │    Helm      │  │    K8s       │            │   │
+    │  │  │  Installer   │  │  Installer   │  │   Client     │            │   │
+    │  │  │  (SSH执行)   │  │  (helm SDK)  │  │  (SSA Apply) │            │   │
+    │  │  └──────────────┘  └──────────────┘  └──────────────┘            │   │
+    │  └──────────────────────────────────────────────────────────────────┘   │
+    └─────────────────────────────────────────────────────────────────────────┘
+                                          │
+                                          ▼
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  状态层 (Status Layer)                                                   │
+    │  ─────────────────────────────────────────────────────────────────────  │
+    │                                                                          │
+    │  ┌──────────────────────────────────────────────────────────────────┐   │
+    │  │  三层状态机                                                        │   │
+    │  │                                                                    │   │
+    │  │  L1 集群层 (BKECluster.Status):                                    │   │
+    │  │  Pending → Installing → Running → Upgrading → RollingBack → Failed│   │
+    │  │       │                                                            │   │
+    │  │       │ node-group 节点驱动                                        │
+    │  │       ▼                                                            │   │
+    │  │  L2 节点层 (BKEMachine.Status.LifecyclePhase):                     │   │
+    │  │  Pending → Provisioning → Ready → Upgrading → Deleting → Failed   │   │
+    │  │       │                                                            │   │
+    │  │       │ 按依赖顺序执行                                             │
+    │  │       ▼                                                            │   │
+    │  │  L3 组件层 (BKEMachine.Status.ComponentStatuses[]):                │   │
+    │  │  Pending → Installing → Installed → Upgrading → Deleting → Failed │   │
+    │  │                                                                    │   │
+    │  │  组件执行顺序 (Master 节点示例):                                   │   │
+    │  │  bkeagent → containerd → kubelet → kubectl                       │   │
+    │  │                                 └→ etcd → apiserver              │   │
+    │  │                                           └→ controller-manager  │   │
+    │  │                                           └→ scheduler           │   │
+    │  └──────────────────────────────────────────────────────────────────┘   │
+    └─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 1.6.2 当前架构 vs 目标架构
+
+| 维度 | 当前架构 | 目标架构 |
+|------|---------|---------|
+| **节点级组件执行** | Inline Phase 硬编码在 BKECluster Controller | BKEMachine Controller 独立驱动 |
+| **节点生命周期管理** | 无独立状态，通过 BKENode.State 追踪 | BKEMachine.Status.LifecyclePhase (L2) |
+| **组件状态追踪** | BKECluster.Status.ClusterComponentStatuses | BKEMachine.Status.ComponentStatuses (L3) |
+| **状态层级** | 单层（集群级） | 三层（集群/节点/组件） |
+| **CAPI 集成深度** | 浅层（BKEMachine 仅用于节点引导） | 深度（BKEMachine 作为节点状态协调资源） |
+| **节点并行执行** | Phase 内串行 | 所有节点并行执行各自的组件状态机 |
+| **依赖表达** | 集群级和节点级依赖分离 | 统一 DAG 表达（通过 composite 类型） |
+
+#### 1.6.3 目标架构设计思路
+
+| 维度 | 设计要点 |
+|------|---------|
+| **三层状态机** | L1 集群层由 BKECluster Controller 驱动，L2/L3 由 BKEMachine Controller 驱动，职责分离 |
+| **CAPI 兼容** | 完全遵循 Cluster API 的 Machine 模式，BKEMachine 作为节点状态协调资源 |
+| **节点并行** | 所有节点并行执行各自的组件状态机，提升升级效率 |
+| **状态聚合** | 组件状态 → 节点状态 → 集群状态，逐层聚合，清晰可观测 |
+| **集群层驱动节点层** | node-group 节点在 DAG 中创建/更新 BKEMachine，轮询等待节点状态机完成 |
+| **Composite 组件类型** | 新增 composite 类型，将节点级组件嵌入主流程 DAG，统一依赖表达 |
+| **可观测性** | 三层状态独立追踪，支持 kubectl 查询、Event 事件、Prometheus 指标 |
+| **备份/回滚** | 支持组件级、节点级、集群级三层回滚，复用安装器接口 |
+| **升级前预检** | CheckPolicy CRD 独立管理检查策略，支持按环境定制 |
+
+#### 1.6.4 目标架构执行流程
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    目标架构执行流程 (三层状态机)                                   │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+    ┌──────────────────────────────┐
+    │  用户声明期望版本            │
+    │  ClusterVersion.Spec.        │
+    │  DesiredVersion: v2.7.0      │
+    └──────────────┬───────────────┘
+                   │
+                   ▼
+    ┌──────────────────────────────────────────────────────────────────────┐
+    │  BKEClusterReconciler (L1 集群层状态机)                              │
+    │  ──────────────────────────────────────────────────────────────────  │
+    │  1. 解析 ReleaseImage                                                │
+    │     ├─ clusterComponents: [certs, coredns, kube-proxy]               │
+    │     └─ nodeComponents: [bkeagent, containerd, kubelet, etcd, ...]    │
+    │  2. 构建 DAG                                                         │
+    │     └─ [certs] → [node-group] → [coredns] → [kube-proxy]            │
+    │  3. 执行 DAG                                                         │
+    └──────────────┬───────────────────────────────────────────────────────┘
+                   │
+                   ▼
+    ┌──────────────────────────────────────────────────────────────────────┐
+    │  DAG Batch 1: [certs]                                                │
+    │  ──────────────────────────────────────────────────────────────────  │
+    │  BinaryExecutor: 下载制品 → 渲染配置 → SSH 执行 → 健康检查           │
+    │  L3: certs Installing → Installed                                    │
+    └──────────────┬───────────────────────────────────────────────────────┘
+                   │
+                   ▼
+    ┌──────────────────────────────────────────────────────────────────────┐
+    │  DAG Batch 2: [node-group]                                           │
+    │  ──────────────────────────────────────────────────────────────────  │
+    │  NodeGroupNode.Execute():                                            │
+    │  1. 按角色过滤 nodeComponents                                        │
+    │     ├─ Master: [bkeagent, containerd, kubelet, etcd, apiserver, ...] │
+    │     └─ Worker: [bkeagent, containerd, kubelet, kubectl]              │
+    │  2. 创建/更新 BKEMachine (写入 Spec.NodeComponents)                  │
+    │  3. waitForNodesReady() → 轮询等待 BKEMachine.Status.Ready           │
+    │     │                                                                │
+    │     │  BKEMachineReconciler (每个节点独立 Reconcile)                 │
+    │     │  ├─ 读取 Spec.NodeComponents                                   │
+    │     │  ├─ L2: Pending → Provisioning                                 │
+    │     │  ├─ 按依赖顺序执行 L3 组件层状态机                             │
+    │     │  │   ├─ bkeagent: Pending → Installing → Installed             │
+    │     │  │   ├─ containerd: Pending → Installing → Installed           │
+    │     │  │   ├─ kubelet: Pending → Installing → Installed              │
+    │     │  │   └─ etcd/apiserver/... (Master only)                       │
+    │     │  └─ L2: Provisioning → Ready                                   │
+    │     │                                                                │
+    │  4. aggregateNodeStatuses() → 聚合节点状态到集群状态                 │
+    └──────────────┬───────────────────────────────────────────────────────┘
+                   │
+                   ▼
+    ┌──────────────────────────────────────────────────────────────────────┐
+    │  DAG Batch 3: [coredns]                                              │
+    │  ──────────────────────────────────────────────────────────────────  │
+    │  HelmExecutor: 拉取 Chart → 渲染 Values → helm install → 健康检查    │
+    │  L3: coredns Installing → Installed                                  │
+    └──────────────┬───────────────────────────────────────────────────────┘
+                   │
+                   ▼
+    ┌──────────────────────────────────────────────────────────────────────┐
+    │  DAG Batch 4: [kube-proxy]                                           │
+    │  ──────────────────────────────────────────────────────────────────  │
+    │  HelmExecutor: 拉取 Chart → 渲染 Values → helm install → 健康检查    │
+    │  L3: kube-proxy Installing → Installed                               │
+    └──────────────┬───────────────────────────────────────────────────────┘
+                   │
+                   ▼
+    ┌──────────────────────────────────────────────────────────────────────┐
+    │  DAG 执行完成                                                        │
+    │  ──────────────────────────────────────────────────────────────────  │
+    │  BKECluster.Status.LifecyclePhase → Running                          │
+    │  BKECluster.Status.CurrentVersion → v2.7.0                           │
+    └──────────────────────────────────────────────────────────────────────┘
+```
+
+#### 1.6.5 迁移路径
+
+从当前架构到目标架构的迁移分为三个阶段：
+
+| 阶段 | 目标 | 关键任务 |
+|------|------|---------|
+| **Phase 1** | 基础能力 | 1. BKEMachine Spec/Status 扩展<br>2. BKEMachineReconciler 增加 L2/L3 状态机<br>3. node-group 节点实现 |
+| **Phase 2** | 状态迁移 | 1. 节点级组件从 Inline Phase 迁移到 BKEMachine Controller<br>2. 状态聚合机制实现<br>3. 可观测性集成 |
+| **Phase 3** | 完整能力 | 1. Composite 组件类型实现<br>2. 备份/回滚三层支持<br>3. CheckPolicy 预检集成 |
+
 ---
 
 ## 2. 文档清单
