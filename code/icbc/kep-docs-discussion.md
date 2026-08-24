@@ -851,7 +851,65 @@ type PhaseFlow struct {
 | **条件渲染** | 支持 Go template 条件块，按 OS/架构/离线模式动态生成配置 |
 | **健康检查** | 安装后通过 SSH 执行脚本验证服务可用性 |
 
-### 3.3 支持的组件类型
+### 3.3 待改造的二进制组件清单
+
+基于当前代码库中的 Phase 实现，以下组件需要从 Inline Phase 改造为 `binary` 类型 ComponentVersion：
+
+#### 3.3.1 节点级二进制组件（需在每个节点上执行）
+
+| 组件名称 | 当前 Phase | 制品 | 适用角色 | 改造优先级 | 说明 |
+|---------|-----------|------|---------|-----------|------|
+| **bkeagent** | `EnsureBKEAgent` / `EnsureAgentUpgrade` | bkeagent 二进制 + bkeagent.conf + kubeconfig | master, worker | P0 | 节点 Agent，负责节点管理和命令执行 |
+| **containerd** | `EnsureContainerdUpgrade` | containerd.tar.gz + config.toml + service | master, worker | P0 | 容器运行时，需支持 docker → containerd 迁移 |
+| **kubelet** | `EnsureMasterUpgrade` / `EnsureWorkerUpgrade` | kubelet + kubectl + kubelet.conf + service | master, worker | P0 | K8s 节点组件，需按角色分别处理 |
+| **kubectl** | `EnsureMasterUpgrade` / `EnsureWorkerUpgrade` | kubectl 二进制 | master, worker | P0 | K8s 命令行工具 |
+| **etcd** | `EnsureEtcdUpgrade` | etcd + etcdctl + etcd.yaml (Static Pod) | master | P0 | 分布式 KV 存储，Static Pod 方式部署 |
+| **runc** | `EnsureNodesEnv` (update-runc.sh) | runc 二进制 | master, worker | P1 | 容器运行时底层 |
+| **helm** | `EnsureNodesEnv` (install-helm.sh) | helm 二进制 | master | P2 | Helm 命令行工具 |
+| **etcdctl** | `EnsureNodesEnv` (install-etcdctl.sh) | etcdctl 二进制 | master | P2 | etcd 命令行工具 |
+| **calicoctl** | `EnsureNodesEnv` (install-calicoctl.sh) | calicoctl 二进制 | master, worker | P2 | Calico 命令行工具 |
+| **lxcfs** | `EnsureNodesEnv` (install-lxcfs.sh) | lxcfs 二进制 + service | master, worker | P2 | 容器文件系统隔离 |
+| **nfs-utils** | `EnsureNodesEnv` (install-nfsutils.sh) | nfs-utils 包 | master, worker | P2 | NFS 存储支持 |
+
+#### 3.3.2 集群级二进制组件（在整个集群中执行一次）
+
+| 组件名称 | 当前 Phase | 制品 | 改造优先级 | 说明 |
+|---------|-----------|------|-----------|------|
+| **certs** | `EnsureCerts` | 证书文件（CA、API Server、etcd 等） | P0 | 集群证书生成与分发 |
+| **haproxy** | `EnsureLoadBalance` | haproxy.yaml (Static Pod) + haproxy.cfg | P1 | 负载均衡器，Static Pod 方式部署 |
+| **keepalived** | `EnsureLoadBalance` | keepalived.yaml (Static Pod) + keepalived.conf | P1 | VIP 管理，Static Pod 方式部署 |
+
+#### 3.3.3 Static Pod 类型组件（需改造为 `staticpod` 类型 ComponentVersion）
+
+以下组件通过 Static Pod 方式部署，需要改造为 `staticpod` 类型（详见 `staticpod-type-design.md`）：
+
+| 组件名称 | 当前 Phase | 镜像 | 适用角色 | 改造优先级 | 说明 |
+|---------|-----------|------|---------|-----------|------|
+| **etcd** | `EnsureEtcdUpgrade` | etcd 镜像 | master | P0 | 分布式 KV 存储 |
+| **kube-apiserver** | `EnsureMasterUpgrade` | kube-apiserver 镜像 | master | P0 | K8s API Server |
+| **kube-controller-manager** | `EnsureMasterUpgrade` | kube-controller-manager 镜像 | master | P0 | K8s 控制器管理器 |
+| **kube-scheduler** | `EnsureMasterUpgrade` | kube-scheduler 镜像 | master | P0 | K8s 调度器 |
+| **haproxy** | `EnsureLoadBalance` | haproxy 镜像 | master | P1 | 负载均衡器 |
+| **keepalived** | `EnsureLoadBalance` | keepalived 镜像 | master | P1 | VIP 管理 |
+| **pause** | `EnsureNodesEnv` | pause 镜像 | master, worker | P2 | Pod 基础设施容器 |
+
+#### 3.3.4 改造优先级说明
+
+| 优先级 | 说明 | 组件 |
+|-------|------|------|
+| **P0** | 核心组件，必须首先改造 | bkeagent, containerd, kubelet, kubectl, etcd, certs, kube-apiserver, kube-controller-manager, kube-scheduler |
+| **P1** | 重要组件，第二批改造 | haproxy, keepalived, runc |
+| **P2** | 辅助组件，最后改造 | helm, etcdctl, calicoctl, lxcfs, nfs-utils, pause |
+
+#### 3.3.5 改造工作量评估
+
+| 组件类型 | 组件数量 | 改造复杂度 | 预估工作量 |
+|---------|---------|-----------|-----------|
+| **Binary 类型** | 11 个 | 中等（需编写 installScript + configTemplates） | 2-3 周 |
+| **Static Pod 类型** | 7 个 | 较高（需编写 manifestTemplate + 健康检查） | 2-3 周 |
+| **总计** | 18 个 | - | 4-6 周 |
+
+### 3.4 支持的组件类型
 
 | 组件 | 制品 | 配置文件 | 说明 |
 |------|------|---------|------|
@@ -859,7 +917,7 @@ type PhaseFlow struct {
 | bkeagent | bkeagent | bkeagent.conf, kubeconfig | 节点 Agent |
 | kubelet/kubectl | kubelet, kubectl | kubelet.conf, service | K8s 核心组件 |
 
-### 3.4 讨论要点
+### 3.5 讨论要点
 
 1. 工行现有二进制安装方案如何迁移到 binary 类型 ComponentVersion？
 2. 模板变量系统是否满足工行场景需求？
