@@ -21,7 +21,7 @@
 3. **节点级并行**：节点级组件在 DAG 中聚合为节点组节点，多节点并行执行
 4. **三层状态清晰**：集群层、节点层、组件层状态定义清晰，职责分明
 5. **可观测性**：状态转换、执行进度、健康状态全链路可观测
-6. **CAPI 深度集成**：节点级状态机迁移到 BKEMachine Controller 执行
+6. **集群层驱动节点层**：集群层状态机通过 DAG 驱动节点层状态机执行
 
 ### 1.2 设计约束
 
@@ -29,19 +29,20 @@
 |------|------|
 | **节点级组件相邻** | 在 DAG 中，节点级组件聚合为一个"节点组"节点，保持 DAG 拓扑简洁 |
 | **节点级并行** | 节点组节点执行时，所有节点并行执行各自的组件状态机 |
-| **BKEMachine 驱动** | 节点级和组件层状态机由 BKEMachine Controller 驱动执行 |
+| **集群层驱动** | 集群层状态机通过 DAG 的 node-group 节点驱动节点层状态机执行 |
 | **幂等性** | 所有状态转换和操作必须幂等，支持 Reconcile 重入 |
-| **CAPI 兼容** | 完全遵循 Cluster API 的 Controller 模式 |
+| **CAPI 兼容** | 完全遵循 Cluster API 的 Controller 模式
 
 ### 1.3 与 v4 的核心区别
 
 | 维度 | v4 设计 | v5 设计 |
 |------|--------|--------|
-| **节点级状态机执行位置** | BKECluster Controller | BKEMachine Controller |
-| **节点组节点职责** | 直接执行节点级状态机 | 创建/更新 BKEMachine 资源 |
-| **节点状态追踪** | BKECluster.Status.NodeStatuses | BKEMachine.Status |
+| **节点级状态机执行位置** | BKECluster Controller 直接执行 | 集群层通过 DAG 的 node-group 节点驱动 |
+| **节点组节点职责** | 直接执行节点级状态机 | 创建/更新 BKEMachine + 等待节点状态机完成 |
+| **节点状态追踪** | BKECluster.Status.NodeStatuses | BKEMachine.Status（由 BKEMachine Controller 更新） |
 | **组件状态追踪** | BKECluster.Status.ComponentStatuses | BKEMachine.Status.ComponentStatuses |
 | **CAPI 集成深度** | 浅层集成 | 深度集成，完全遵循 CAPI 模式 |
+| **驱动方式** | 直接调用 | 通过 BKEMachine 资源协调 |
 
 ---
 
@@ -74,20 +75,27 @@
 │  │  │ 职责:                            │  │ 职责:                        │  │   │
 │  │  │ • L1 集群层状态机                │  │ • L2 节点层状态机              │  │   │
 │  │  │ • DAG 构建与执行                 │  │ • L3 组件层状态机              │  │   │
-│  │  │ • 集群级组件执行                 │  │ • 节点级组件执行               │  │   │
-│  │  │ • 创建/更新 BKEMachine           │  │ • 组件状态追踪               │  │   │
+│  │  │ • 集群级组件直接执行             │  │ • 节点级组件执行               │  │   │
+│  │  │ • node-group 驱动节点状态机      │  │ • 组件状态追踪               │  │   │
 │  │  │                                  │  │                              │  │   │
 │  │  │ 输入: BKECluster                 │  │ 输入: BKEMachine             │  │   │
 │  │  │ 输出: BKECluster.Status          │  │ 输出: BKEMachine.Status      │  │   │
-│  │  │       + BKEMachine 创建          │  │       + 组件执行结果         │  │   │
+│  │  │       + BKEMachine 创建/更新     │  │       + 组件执行结果         │  │   │
+│  │  │       + 等待 BKEMachine 完成     │  │                              │  │   │
 │  │  └──────────────────────────────────┘  └──────────────────────────────┘  │   │
 │  │                    │                                │                     │   │
-│  │                    │ Watch BKEMachine               │                     │   │
+│  │                    │ 创建/更新 BKEMachine           │                     │   │
+│  │                    │ + 等待 Status 就绪             │                     │   │
 │  │                    └────────────────────────────────┘                     │   │
 │  └─────────────────────────────────────────────────────────────────────────┘   │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+**核心设计**：集群层状态机通过 DAG 的 node-group 节点驱动节点层状态机执行。node-group 节点负责：
+1. 创建/更新 BKEMachine 资源（写入 Spec.NodeComponents）
+2. 等待 BKEMachine Controller 完成节点层状态机执行
+3. 读取 BKEMachine.Status 获取节点状态，聚合到集群状态
 
 ### 2.2 ReleaseImage 结构设计
 
@@ -1072,7 +1080,7 @@ func (e *DAGExecutor) BuildDAG(releaseImage *ReleaseImage) (*ExecutionDAG, error
         })
     }
     
-    // 2. 添加节点组节点（负责将 nodeComponents 写入 BKEMachine）
+    // 2. 添加节点组节点（驱动节点层状态机执行）
     if len(releaseImage.Spec.NodeComponents) > 0 {
         dag.AddNode(&NodeGroupNode{
             name:           "node-group",
@@ -1088,16 +1096,18 @@ func (e *DAGExecutor) BuildDAG(releaseImage *ReleaseImage) (*ExecutionDAG, error
 }
 
 // NodeGroupNode 节点组节点
+// 职责：创建/更新 BKEMachine，并驱动节点层状态机执行
 type NodeGroupNode struct {
     name           string
     nodeComponents []ReleaseNodeComponent  // 全量节点级组件
     deps           []string
 }
 
-// Execute 创建/更新 BKEMachine，按角色过滤 nodeComponents
+// Execute 创建/更新 BKEMachine，并等待节点层状态机完成
 func (n *NodeGroupNode) Execute(ctx context.Context, execCtx *ExecutionContext) error {
     nodes := execCtx.GetAllNodes()
     
+    // 1. 为每个节点创建/更新 BKEMachine
     for _, node := range nodes {
         // 按节点角色过滤 nodeComponents
         filteredComponents := filterNodeComponentsByRole(n.nodeComponents, node.Role)
@@ -1137,7 +1147,94 @@ func (n *NodeGroupNode) Execute(ctx context.Context, execCtx *ExecutionContext) 
         }
     }
     
+    // 2. 等待所有 BKEMachine 的节点层状态机执行完成
+    // BKEMachine Controller 会驱动 L2/L3 状态机，更新 BKEMachine.Status
+    if err := n.waitForNodesReady(ctx, execCtx, nodes); err != nil {
+        return fmt.Errorf("node state machine execution failed: %w", err)
+    }
+    
+    // 3. 聚合节点状态到集群状态
+    n.aggregateNodeStatuses(ctx, execCtx, nodes)
+    
     return nil
+}
+
+// waitForNodesReady 等待所有节点的节点层状态机执行完成
+func (n *NodeGroupNode) waitForNodesReady(
+    ctx context.Context,
+    execCtx *ExecutionContext,
+    nodes []Node,
+) error {
+    // 轮询等待所有节点就绪
+    ticker := time.NewTicker(5 * time.Second)
+    defer ticker.Stop()
+    
+    timeout := time.After(30 * time.Minute)
+    
+    for {
+        select {
+        case <-ctx.Done():
+            return ctx.Err()
+        case <-timeout:
+            return fmt.Errorf("timeout waiting for nodes to be ready")
+        case <-ticker.C:
+            allReady := true
+            var failedNodes []string
+            
+            for _, node := range nodes {
+                machine := &bkev1beta1.BKEMachine{}
+                err := execCtx.Client.Get(ctx, client.ObjectKey{
+                    Namespace: execCtx.Cluster.Namespace,
+                    Name:      node.Name,
+                }, machine)
+                if err != nil {
+                    return err
+                }
+                
+                switch machine.Status.LifecyclePhase {
+                case NodePhaseReady:
+                    // 节点就绪
+                case NodePhaseFailed:
+                    failedNodes = append(failedNodes, node.Name)
+                default:
+                    // 还在执行中
+                    allReady = false
+                }
+            }
+            
+            if len(failedNodes) > 0 {
+                return fmt.Errorf("nodes failed: %v", failedNodes)
+            }
+            
+            if allReady {
+                return nil
+            }
+        }
+    }
+}
+
+// aggregateNodeStatuses 聚合节点状态到集群状态
+func (n *NodeGroupNode) aggregateNodeStatuses(
+    ctx context.Context,
+    execCtx *ExecutionContext,
+    nodes []Node,
+) {
+    for _, node := range nodes {
+        machine := &bkev1beta1.BKEMachine{}
+        err := execCtx.Client.Get(ctx, client.ObjectKey{
+            Namespace: execCtx.Cluster.Namespace,
+            Name:      node.Name,
+        }, machine)
+        if err != nil {
+            continue
+        }
+        
+        // 更新集群状态中的节点状态
+        execCtx.Cluster.Status.NodeStatuses[node.Name] = NodeStatus{
+            Phase:              machine.Status.LifecyclePhase,
+            ComponentStatuses:  machine.Status.ComponentStatuses,
+        }
+    }
 }
 
 // filterNodeComponentsByRole 按角色过滤节点级组件
@@ -1186,57 +1283,64 @@ func (n *ClusterComponentNode) Execute(ctx context.Context, execCtx *ExecutionCo
 }
 ```
 
-**数据流完整示例**：
+**执行流程**：
 
 ```
-ReleaseImage.Spec:
-  clusterComponents:
-    - certs, coredns, kube-proxy
-  nodeComponents:
-    - bkeagent (roles: [master, worker])
-    - containerd (roles: [master, worker])
-    - kubelet (roles: [master, worker])
-    - etcd (roles: [master])
-    - apiserver (roles: [master])
-
-DAG 构建:
-  ┌────────┐   ┌─────────┐   ┌────────────┐
-  │ certs  │──>│ coredns │   │ kube-proxy │
-  └──┬─────┘   └─────────┘   └────────────┘
-     │
-     └──> ┌──────────────┐
-          │  node-group  │
-          └──────┬───────┘
-                 │
-                 │ 按角色过滤 nodeComponents
-                 ▼
-    ┌────────────────────────────────────────────────────────┐
-    │                                                        │
-    │  Master BKEMachine.Spec.NodeComponents:                │
-    │    [bkeagent, containerd, kubelet, etcd, apiserver]    │
-    │                                                        │
-    │  Worker BKEMachine.Spec.NodeComponents:                │
-    │    [bkeagent, containerd, kubelet]                     │
-    │                                                        │
-    └────────────────────────────────────────────────────────┘
-                 │
-                 │ BKEMachine Controller 读取
-                 ▼
-    ┌────────────────────────────────────────────────────────┐
-    │  BKEMachine Controller (每个节点独立 Reconcile)         │
-    │                                                        │
-    │  1. 读取 Spec.NodeComponents                           │
-    │  2. 初始化 Status.ComponentStatuses                    │
-    │  3. 按依赖顺序执行组件层状态机                          │
-    │                                                        │
-    │  Master 节点执行顺序:                                   │
-    │    bkeagent → containerd → kubelet → etcd → apiserver  │
-    │                                                        │
-    │  Worker 节点执行顺序:                                   │
-    │    bkeagent → containerd → kubelet                     │
-    │                                                        │
-    └────────────────────────────────────────────────────────┘
+BKECluster Controller (L1 集群层状态机)
+  │
+  ├─ Build DAG
+  │   ├─ 集群级组件节点: certs, coredns, kube-proxy
+  │   └─ node-group 节点
+  │
+  ├─ Execute DAG
+  │   │
+  │   ├─ Batch 1: [certs]
+  │   │   └─ ClusterComponentNode.Execute()
+  │   │       └─ L3: certs Installing → Installed
+  │   │
+  │   ├─ Batch 2: [node-group]
+  │   │   └─ NodeGroupNode.Execute()
+  │   │       │
+  │   │       ├─ 1. 创建/更新 BKEMachine (写入 Spec.NodeComponents)
+  │   │       │   ├─ Master BKEMachine: [bkeagent, containerd, kubelet, etcd, apiserver]
+  │   │       │   └─ Worker BKEMachine: [bkeagent, containerd, kubelet]
+  │   │       │
+  │   │       ├─ 2. 等待 BKEMachine Controller 完成节点层状态机
+  │   │       │   │
+  │   │       │   │  BKEMachine Controller (每个节点独立 Reconcile)
+  │   │       │   │    ├─ 读取 Spec.NodeComponents
+  │   │       │   │    ├─ 驱动 L2 节点层状态机
+  │   │       │   │    ├─ 驱动 L3 组件层状态机
+  │   │       │   │    │   ├─ bkeagent: Pending → Installing → Installed
+  │   │       │   │    │   ├─ containerd: Pending → Installing → Installed
+  │   │       │   │    │   └─ kubelet: Pending → Installing → Installed
+  │   │       │   │    └─ 更新 BKEMachine.Status
+  │   │       │   │
+  │   │       │   └─ 轮询等待所有节点 Status.LifecyclePhase == Ready
+  │   │       │
+  │   │       └─ 3. 聚合节点状态到 BKECluster.Status.NodeStatuses
+  │   │
+  │   ├─ Batch 3: [coredns]
+  │   │   └─ ClusterComponentNode.Execute()
+  │   │       └─ L3: coredns Installing → Installed
+  │   │
+  │   └─ Batch 4: [kube-proxy]
+  │       └─ ClusterComponentNode.Execute()
+  │           └─ L3: kube-proxy Installing → Installed
+  │
+  └─ DAG 执行完成
+      └─ BKECluster.Status.LifecyclePhase → Running
 ```
+
+**关键设计**：
+
+1. **集群层驱动节点层**：node-group 节点在 DAG 中执行时，会等待 BKEMachine Controller 完成节点层状态机执行
+
+2. **轮询等待机制**：node-group 节点通过轮询 BKEMachine.Status 来等待节点层状态机完成
+
+3. **状态聚合**：node-group 节点将 BKEMachine.Status 聚合到 BKECluster.Status.NodeStatuses
+
+4. **BKEMachine Controller 独立执行**：BKEMachine Controller 独立驱动 L2/L3 状态机，与 BKECluster Controller 解耦
 
 ---
 
@@ -1267,8 +1371,26 @@ DAG 构建:
 │  │    ├─────────────────────────────────────────────────────────────────┤   │   │
 │  │    │ Batch 2: [node-group]                                           │   │   │
 │  │    │   └─ NodeGroupNode.Execute()                                    │   │   │
-│  │    │       └─ 创建 BKEMachine-1, BKEMachine-2, ...                   │   │   │
-│  │    │       └─ 设置 BKEMachine.Spec.NodeComponents                    │   │   │
+│  │    │       │                                                         │   │   │
+│  │    │       ├─ Step 1: 创建/更新 BKEMachine                           │   │   │
+│  │    │       │   ├─ Master BKEMachine: [bkeagent, containerd, ...]     │   │   │
+│  │    │       │   └─ Worker BKEMachine: [bkeagent, containerd, ...]     │   │   │
+│  │    │       │                                                         │   │   │
+│  │    │       ├─ Step 2: 等待 BKEMachine Controller 完成节点层状态机     │   │   │
+│  │    │       │   │                                                     │   │   │
+│  │    │       │   │  BKEMachine Controller (每个节点独立 Reconcile)      │   │   │
+│  │    │       │   │    ├─ 读取 Spec.NodeComponents                      │   │   │
+│  │    │       │   │    ├─ 驱动 L2 节点层状态机                          │   │   │
+│  │    │       │   │    ├─ 驱动 L3 组件层状态机                          │   │   │
+│  │    │       │   │    │   ├─ bkeagent: Pending → Installing → Installed│   │   │
+│  │    │       │   │    │   ├─ containerd: Pending → Installing → ...    │   │   │
+│  │    │       │   │    │   └─ kubelet: Pending → Installing → ...       │   │   │
+│  │    │       │   │    └─ 更新 BKEMachine.Status.LifecyclePhase=Ready   │   │   │
+│  │    │       │   │                                                     │   │   │
+│  │    │       │   └─ 轮询等待所有节点 Status.LifecyclePhase == Ready    │   │   │
+│  │    │       │                                                         │   │   │
+│  │    │       └─ Step 3: 聚合节点状态到 BKECluster.Status.NodeStatuses  │   │   │
+│  │    │                                                                 │   │   │
 │  │    ├─────────────────────────────────────────────────────────────────┤   │   │
 │  │    │ Batch 3: [coredns]                                              │   │   │
 │  │    │   └─ ClusterComponentNode.Execute()                             │   │   │
@@ -1280,44 +1402,21 @@ DAG 构建:
 │  │    └─────────────────────────────────────────────────────────────────┘   │   │
 │  │                                                                          │   │
 │  │ 4. DAG 执行完成                                                          │   │
-│  │    等待 BKEMachine Controller 处理节点级组件                              │   │
-│  └─────────────────────────────────────────────────────────────────────────┘   │
-│                                                                                 │
-│  BKEMachineReconciler.Reconcile (每个节点独立 Reconcile)                         │
-│  ┌─────────────────────────────────────────────────────────────────────────┐   │
-│  │ L2: NodeStateMachine.Execute(machine)                                   │   │
-│  │                                                                          │   │
-│  │ 1. EvaluateNodePhase: Pending → Provisioning                            │   │
-│  │                                                                          │   │
-│  │ 2. 按依赖顺序执行节点级组件:                                              │   │
-│  │    ┌─────────────────────────────────────────────────────────────────┐   │   │
-│  │    │ bkeagent:                                                        │   │   │
-│  │    │   L3: Pending → Installing → Installed                          │   │   │
-│  │    ├─────────────────────────────────────────────────────────────────┤   │   │
-│  │    │ containerd:                                                      │   │   │
-│  │    │   L3: Pending → Installing → Installed                          │   │   │
-│  │    ├─────────────────────────────────────────────────────────────────┤   │   │
-│  │    │ kubelet:                                                         │   │   │
-│  │    │   L3: Pending → Installing → Installed                          │   │   │
-│  │    └─────────────────────────────────────────────────────────────────┘   │   │
-│  │                                                                          │   │
-│  │ 3. EvaluateNodePhase: Provisioning → Ready                              │   │
-│  │    Condition: 所有节点级组件 Installed                                   │   │
-│  └─────────────────────────────────────────────────────────────────────────┘   │
-│                                                                                 │
-│  BKEClusterReconciler.Reconcile #N (Watch BKEMachine 触发)                       │
-│  ┌─────────────────────────────────────────────────────────────────────────┐   │
-│  │ L1: ClusterStateMachine.Execute(cluster)                                │   │
-│  │                                                                          │   │
-│  │ 1. 检查所有 BKEMachine 状态                                              │   │
-│  │    └─ 所有 BKEMachine.Status.LifecyclePhase == Ready                     │   │
-│  │                                                                          │   │
-│  │ 2. EvaluateClusterPhase: Installing → Running                           │   │
-│  │    Condition: 所有节点 Ready                                             │   │
+│  │    └─ EvaluateClusterPhase: Installing → Running                         │   │
 │  └─────────────────────────────────────────────────────────────────────────┘   │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+**关键设计**：
+
+1. **集群层驱动节点层**：node-group 节点在 DAG 中执行时，会等待 BKEMachine Controller 完成节点层状态机执行
+
+2. **轮询等待机制**：node-group 节点通过轮询 BKEMachine.Status 来等待节点层状态机完成
+
+3. **状态聚合**：node-group 节点将 BKEMachine.Status 聚合到 BKECluster.Status.NodeStatuses
+
+4. **BKEMachine Controller 独立执行**：BKEMachine Controller 独立驱动 L2/L3 状态机，与 BKECluster Controller 解耦
 
 ### 5.2 升级流程
 
@@ -1342,44 +1441,40 @@ DAG 构建:
 │  │ 3. ExecuteDAG(ctx, dag)                                                  │   │
 │  │    └─ Batch 2: [node-group]                                              │   │
 │  │       └─ NodeGroupNode.Execute()                                         │   │
-│  │           └─ 更新 BKEMachine.Spec.NodeComponents (新版本)                │   │
-│  └─────────────────────────────────────────────────────────────────────────┘   │
-│                                                                                 │
-│  BKEMachineReconciler.Reconcile (每个节点独立 Reconcile)                         │
-│  ┌─────────────────────────────────────────────────────────────────────────┐   │
-│  │ L2: NodeStateMachine.Execute(machine)                                   │   │
+│  │           │                                                              │   │
+│  │           ├─ Step 1: 更新 BKEMachine.Spec.NodeComponents (新版本)        │   │
+│  │           │                                                              │   │
+│  │           ├─ Step 2: 等待 BKEMachine Controller 完成节点层状态机          │   │
+│  │           │   │                                                          │   │
+│  │           │   │  BKEMachine Controller (每个节点独立 Reconcile)           │   │
+│  │           │   │    ├─ 检测 Spec.NodeComponents 版本变更                  │   │
+│  │           │   │    ├─ 驱动 L2 节点层状态机: Ready → Upgrading            │   │
+│  │           │   │    ├─ 驱动 L3 组件层状态机                               │   │
+│  │           │   │    │   ├─ containerd: Installed → Upgrading → Installed  │   │
+│  │           │   │    │   └─ kubelet: Installed → Upgrading → Installed     │   │
+│  │           │   │    └─ 更新 BKEMachine.Status.LifecyclePhase=Ready        │   │
+│  │           │   │                                                          │   │
+│  │           │   └─ 轮询等待所有节点 Status.LifecyclePhase == Ready         │   │
+│  │           │                                                              │   │
+│  │           └─ Step 3: 聚合节点状态到 BKECluster.Status.NodeStatuses       │   │
 │  │                                                                          │   │
-│  │ 1. EvaluateNodePhase: Ready → Upgrading                                 │   │
-│  │    Condition: Spec.NodeComponents 版本变更                               │   │
-│  │                                                                          │   │
-│  │ 2. 按依赖顺序升级节点级组件:                                              │   │
-│  │    ┌─────────────────────────────────────────────────────────────────┐   │   │
-│  │    │ containerd:                                                      │   │   │
-│  │    │   L3: Installed → Upgrading → Installed (新版本)                 │   │   │
-│  │    ├─────────────────────────────────────────────────────────────────┤   │   │
-│  │    │ kubelet:                                                         │   │   │
-│  │    │   L3: Installed → Upgrading → Installed (新版本)                 │   │   │
-│  │    └─────────────────────────────────────────────────────────────────┘   │   │
-│  │                                                                          │   │
-│  │ 3. EvaluateNodePhase: Upgrading → Ready                                 │   │
-│  │    Condition: 所有节点级组件升级完成                                      │   │
-│  └─────────────────────────────────────────────────────────────────────────┘   │
-│                                                                                 │
-│  BKEClusterReconciler.Reconcile #N (Watch BKEMachine 触发)                       │
-│  ┌─────────────────────────────────────────────────────────────────────────┐   │
-│  │ L1: ClusterStateMachine.Execute(cluster)                                │   │
-│  │                                                                          │   │
-│  │ 1. 检查所有 BKEMachine 状态                                              │   │
-│  │    └─ 所有 BKEMachine.Status.LifecyclePhase == Ready                     │   │
-│  │                                                                          │   │
-│  │ 2. EvaluateClusterPhase: Upgrading → Running                            │   │
-│  │    Condition: 所有节点 Ready                                             │   │
-│  │                                                                          │   │
-│  │ 3. 更新 currentVersion = "v2.7.0"                                        │   │
+│  │ 4. DAG 执行完成                                                          │   │
+│  │    └─ EvaluateClusterPhase: Upgrading → Running                          │   │
+│  │    └─ 更新 currentVersion = "v2.7.0"                                     │   │
 │  └─────────────────────────────────────────────────────────────────────────┘   │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+**关键设计**：
+
+1. **版本变更检测**：BKEMachine Controller 检测 Spec.NodeComponents 版本变更，触发节点层状态机
+
+2. **节点层驱动组件层**：BKEMachine Controller 按依赖顺序驱动 L3 组件层状态机
+
+3. **状态聚合**：node-group 节点将 BKEMachine.Status 聚合到 BKECluster.Status
+
+4. **集群层等待**：BKECluster Controller 等待所有节点就绪后，更新集群状态为 Running
 
 ---
 
@@ -1579,7 +1674,8 @@ func setBKEMachineCAPIConditions(machine *bkev1beta1.BKEMachine) {
 
 | 优势 | 说明 |
 |------|------|
-| **CAPI 深度集成** | 完全遵循 CAPI 的 Controller 模式，BKEMachine Controller 驱动节点级状态机 |
+| **集群层驱动节点层** | 集群层状态机通过 DAG 的 node-group 节点驱动节点层状态机执行 |
+| **CAPI 深度集成** | 完全遵循 CAPI 的 Controller 模式，BKEMachine Controller 独立驱动节点层状态机 |
 | **职责分离** | BKECluster Controller 负责集群层，BKEMachine Controller 负责节点层和组件层 |
 | **并行执行** | 每个节点独立 Reconcile，天然支持并行 |
 | **状态追踪** | 节点和组件状态存储在 BKEMachine.Status 中，符合 CAPI 规范 |
@@ -1589,14 +1685,24 @@ func setBKEMachineCAPIConditions(machine *bkev1beta1.BKEMachine) {
 
 | 维度 | v4 设计 | v5 设计 |
 |------|--------|--------|
-| **节点级状态机执行位置** | BKECluster Controller | BKEMachine Controller |
-| **节点组节点职责** | 直接执行节点级状态机 | 创建/更新 BKEMachine 资源 |
-| **节点状态追踪** | BKECluster.Status.NodeStatuses | BKEMachine.Status |
+| **节点级状态机执行位置** | BKECluster Controller 直接执行 | 集群层通过 DAG 的 node-group 节点驱动 |
+| **节点组节点职责** | 直接执行节点级状态机 | 创建/更新 BKEMachine + 等待节点状态机完成 |
+| **节点状态追踪** | BKECluster.Status.NodeStatuses | BKEMachine.Status（由 BKEMachine Controller 更新） |
 | **组件状态追踪** | BKECluster.Status.ComponentStatuses | BKEMachine.Status.ComponentStatuses |
 | **CAPI 集成深度** | 浅层集成 | 深度集成，完全遵循 CAPI 模式 |
-| **并行执行方式** | 在 BKECluster Controller 中并行 | 每个节点独立 Reconcile |
+| **驱动方式** | 直接调用 | 通过 BKEMachine 资源协调 |
+
+### 8.3 核心设计要点
+
+1. **集群层驱动节点层**：node-group 节点在 DAG 中执行时，会等待 BKEMachine Controller 完成节点层状态机执行
+
+2. **轮询等待机制**：node-group 节点通过轮询 BKEMachine.Status 来等待节点层状态机完成
+
+3. **状态聚合**：node-group 节点将 BKEMachine.Status 聚合到 BKECluster.Status.NodeStatuses
+
+4. **BKEMachine Controller 独立执行**：BKEMachine Controller 独立驱动 L2/L3 状态机，与 BKECluster Controller 解耦
 
 ---
 
-**文档版本**: v5.0  
+**文档版本**: v5.1  
 **维护者**: openFuyao Team
