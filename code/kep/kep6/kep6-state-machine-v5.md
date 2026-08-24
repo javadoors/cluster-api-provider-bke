@@ -89,37 +89,173 @@
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 2.2 DAG 结构设计
+### 2.2 ReleaseImage 结构设计
 
-**核心设计**：DAG 中的 node-group 节点只负责创建/更新 BKEMachine，实际执行由 BKEMachine Controller 驱动。
+**核心设计**：ReleaseImage 明确分离集群级组件和节点级组件，节点级组件携带依赖关系，传递给 BKEMachine 驱动 L2/L3 状态机。
+
+```yaml
+# ReleaseImage 结构设计
+apiVersion: cvo.openfuyao.cn/v1alpha1
+kind: ReleaseImage
+metadata:
+  name: openfuyao-v2.7.0
+spec:
+  version: "v2.7.0"
+  
+  # ============================================================
+  # 集群级组件：由 BKECluster Controller 通过 DAG 直接执行
+  # 这些组件在整个集群中只执行一次
+  # ============================================================
+  clusterComponents:
+    - name: certs
+      version: "v2.7.0"
+      dependencies: []                    # 无依赖，最先执行
+    
+    - name: coredns
+      version: "v1.11.1"
+      dependencies: [certs]               # 依赖证书
+    
+    - name: kube-proxy
+      version: "v2.7.0"
+      dependencies: [certs]               # 依赖证书
+    
+    - name: bocoperator
+      version: "v2.7.0"
+      dependencies: [certs]
+    
+    - name: cluster-api
+      version: "v1.5.0"
+      dependencies: [certs]
+  
+  # ============================================================
+  # 节点级组件：传递给 BKEMachine，由 BKEMachine Controller 驱动
+  # 这些组件在每个节点上独立执行，携带依赖关系
+  # ============================================================
+  nodeComponents:
+    - name: bkeagent
+      version: "v2.7.0"
+      dependencies: []                    # 无依赖，最先执行
+      roles: [master, worker]             # 适用角色
+    
+    - name: containerd
+      version: "v1.7.18"
+      dependencies: [bkeagent]            # 依赖 bkeagent
+      roles: [master, worker]
+    
+    - name: kubelet
+      version: "v1.29.0"
+      dependencies: [containerd]          # 依赖 containerd
+      roles: [master, worker]
+    
+    - name: kubectl
+      version: "v1.29.0"
+      dependencies: [kubelet]             # 依赖 kubelet
+      roles: [master, worker]
+    
+    # Master 特有组件
+    - name: etcd
+      version: "v3.5.21-of.1"
+      dependencies: [kubelet]             # 依赖 kubelet
+      roles: [master]                     # 仅 Master 节点
+    
+    - name: apiserver
+      version: "v1.29.0"
+      dependencies: [etcd]                # 依赖 etcd
+      roles: [master]
+    
+    - name: controller-manager
+      version: "v1.29.0"
+      dependencies: [apiserver]           # 依赖 apiserver
+      roles: [master]
+    
+    - name: scheduler
+      version: "v1.29.0"
+      dependencies: [apiserver]           # 依赖 apiserver
+      roles: [master]
+```
+
+**数据流向**：
 
 ```
-ReleaseImage 组件列表:
-  - certs (scope=cluster)
-  - bkeagent (scope=node)
-  - containerd (scope=node)
-  - kubelet (scope=node)
-  - coredns (scope=cluster)
-  - kube-proxy (scope=cluster)
+ReleaseImage
+  │
+  ├─ clusterComponents ──────────────────────────────────────────────────┐
+  │   (certs, coredns, kube-proxy, bocoperator, cluster-api)            │
+  │                                                                      │
+  │   直接传递给 BKECluster Controller                                   │
+  │                                                                      │
+  │   BKECluster Controller:                                             │
+  │   ┌────────┐   ┌─────────┐   ┌────────────┐   ┌────────────┐       │
+  │   │ certs  │──>│ coredns │   │ kube-proxy │   │ bocoperator│       │
+  │   │        │──>│         │   │            │   │            │       │
+  │   └────────┘   └─────────┘   └────────────┘   └────────────┘       │
+  │   (DAG 直接执行 L3 组件状态机)                                       │
+  │                                                                      │
+  ├─ nodeComponents ───────────────────────────────────────────────────┐ │
+  │   (bkeagent, containerd, kubelet, kubectl, etcd, apiserver, ...)  │ │
+  │                                                                    │ │
+  │   按 roles 过滤，写入 BKEMachine.Spec                              │ │
+  │                                                                    │ │
+  │   ┌─────────────────────────────────────────────────────────────┐ │ │
+  │   │ BKEMachine (master-1) Spec.NodeComponents:                  │ │ │
+  │   │   bkeagent → containerd → kubelet → kubectl                 │ │ │
+  │   │                            └→ etcd → apiserver              │ │ │
+  │   │                                      └→ controller-manager  │ │ │
+  │   │                                      └→ scheduler           │ │ │
+  │   └─────────────────────────────────────────────────────────────┘ │ │
+  │                                                                    │ │
+  │   ┌─────────────────────────────────────────────────────────────┐ │ │
+  │   │ BKEMachine (worker-1) Spec.NodeComponents:                  │ │ │
+  │   │   bkeagent → containerd → kubelet → kubectl                 │ │ │
+  │   │   (无 etcd/apiserver/controller-manager/scheduler)          │ │ │
+  │   └─────────────────────────────────────────────────────────────┘ │ │
+  │                                                                    │ │
+  │   BKEMachine Controller:                                           │ │
+  │   按依赖顺序驱动 L2 节点层 + L3 组件层状态机                         │ │
+  │                                                                    │ │
+  └────────────────────────────────────────────────────────────────────┘ │
+  └──────────────────────────────────────────────────────────────────────┘
+```
 
-构建后的 DAG:
+### 2.3 DAG 结构设计
 
-  ┌────────┐    ┌────────────────────────────────────┐    ┌─────────┐    ┌────────────┐
-  │ certs  │───>│         node-group                 │───>│ coredns │───>│ kube-proxy │
-  │(cluster)│    │  (创建/更新 BKEMachine)            │    │(cluster)│    │ (cluster)  │
-  └────────┘    └────────────────────────────────────┘    └─────────┘    └────────────┘
-                              │
-                              │ 创建/更新
-                              ▼
-                ┌─────────────────────────────────┐
-                │  BKEMachine Controller          │
-                │  ─────────────────────────      │
-                │  驱动 L2 节点层状态机             │
-                │  驱动 L3 组件层状态机             │
-                │                                  │
-                │  节点内组件执行顺序:              │
-                │  bkeagent → containerd → kubelet │
-                └─────────────────────────────────┘
+**核心设计**：DAG 中只包含集群级组件和 node-group 节点。node-group 节点负责将 nodeComponents 写入 BKEMachine.Spec，BKEMachine Controller 驱动节点级组件执行。
+
+```
+ReleaseImage.clusterComponents:
+  - certs, coredns, kube-proxy, bocoperator, cluster-api
+
+构建后的集群级 DAG:
+
+  ┌────────┐   ┌─────────┐   ┌────────────┐   ┌────────────┐
+  │ certs  │──>│ coredns │   │ kube-proxy │   │ bocoperator│
+  │        │──>│         │   │            │   │            │
+  └──┬─────┘   └─────────┘   └────────────┘   └────────────┘
+     │
+     ├──> ┌──────────────┐   ┌────────────┐
+     │    │ cluster-api  │   │ node-group │
+     │    │              │   │            │
+     └──> │              │   │ 创建/更新   │
+          └──────────────┘   │ BKEMachine │
+                             └─────┬──────┘
+                                   │
+                                   │ 写入 nodeComponents
+                                   ▼
+                     ┌─────────────────────────────────┐
+                     │  BKEMachine Controller           │
+                     │  ─────────────────────────       │
+                     │  读取 BKEMachine.Spec            │
+                     │  .NodeComponents                 │
+                     │                                  │
+                     │  驱动 L2 节点层状态机             │
+                     │  按依赖顺序驱动 L3 组件层状态机   │
+                     │                                  │
+                     │  master-1 组件执行顺序:           │
+                     │  bkeagent → containerd → kubelet │
+                     │                 └→ etcd          │
+                     │                       └→ apiserver
+                     │                             └→ cm, scheduler
+                     └─────────────────────────────────┘
 ```
 
 ### 2.3 三层状态机执行位置
@@ -302,16 +438,134 @@ const (
 
 ## 4. 核心数据结构
 
-### 4.1 BKEMachine Status 扩展
+### 4.1 ReleaseImage 类型定义
 
 ```go
+// ReleaseImage 发布镜像定义
+type ReleaseImage struct {
+    metav1.TypeMeta   `json:",inline"`
+    metav1.ObjectMeta `json:"metadata,omitempty"`
+    
+    Spec ReleaseImageSpec `json:"spec"`
+}
+
+type ReleaseImageSpec struct {
+    // 版本号
+    Version string `json:"version"`
+    
+    // 集群级组件列表：由 BKECluster Controller 通过 DAG 直接执行
+    // 这些组件在整个集群中只执行一次
+    ClusterComponents []ReleaseComponent `json:"clusterComponents,omitempty"`
+    
+    // 节点级组件列表：传递给 BKEMachine，由 BKEMachine Controller 驱动执行
+    // 这些组件在每个节点上独立执行，携带依赖关系
+    NodeComponents []ReleaseNodeComponent `json:"nodeComponents,omitempty"`
+}
+
+// ReleaseComponent 集群级组件引用
+type ReleaseComponent struct {
+    // 组件名称（对应 ComponentVersion.Name）
+    Name string `json:"name"`
+    
+    // 组件版本（对应 ComponentVersion.Version）
+    Version string `json:"version"`
+    
+    // 依赖的组件名称列表（仅集群级组件之间的依赖）
+    Dependencies []string `json:"dependencies,omitempty"`
+}
+
+// ReleaseNodeComponent 节点级组件引用
+type ReleaseNodeComponent struct {
+    // 组件名称（对应 ComponentVersion.Name）
+    Name string `json:"name"`
+    
+    // 组件版本（对应 ComponentVersion.Version）
+    Version string `json:"version"`
+    
+    // 依赖的组件名称列表（节点级组件之间的依赖）
+    Dependencies []string `json:"dependencies,omitempty"`
+    
+    // 适用角色：master / worker / etcd
+    // 空表示所有角色
+    Roles []string `json:"roles,omitempty"`
+}
+
+// ReleaseImage 完整 YAML 示例：
+// apiVersion: cvo.openfuyao.cn/v1alpha1
+// kind: ReleaseImage
+// metadata:
+//   name: openfuyao-v2.7.0
+// spec:
+//   version: "v2.7.0"
+//   clusterComponents:
+//     - name: certs
+//       version: "v2.7.0"
+//       dependencies: []
+//     - name: coredns
+//       version: "v1.11.1"
+//       dependencies: [certs]
+//     - name: kube-proxy
+//       version: "v2.7.0"
+//       dependencies: [certs]
+//   nodeComponents:
+//     - name: bkeagent
+//       version: "v2.7.0"
+//       dependencies: []
+//       roles: [master, worker]
+//     - name: containerd
+//       version: "v1.7.18"
+//       dependencies: [bkeagent]
+//       roles: [master, worker]
+//     - name: kubelet
+//       version: "v1.29.0"
+//       dependencies: [containerd]
+//       roles: [master, worker]
+//     - name: etcd
+//       version: "v3.5.21-of.1"
+//       dependencies: [kubelet]
+//       roles: [master]
+//     - name: apiserver
+//       version: "v1.29.0"
+//       dependencies: [etcd]
+//       roles: [master]
+```
+
+### 4.2 BKEMachine Spec 扩展
+
+```go
+// BKEMachineSpec 扩展：携带节点级组件列表
+type BKEMachineSpec struct {
+    // CAPI 标准字段
+    InfrastructureRef corev1.ObjectReference `json:"infrastructureRef"`
+    Bootstrap         clusterv1.Bootstrap    `json:"bootstrap"`
+    
+    // 节点角色：master / worker
+    Role string `json:"role,omitempty"`
+    
+    // 节点级组件列表：从 ReleaseImage.NodeComponents 按角色过滤后写入
+    // BKEMachine Controller 读取此列表驱动 L2/L3 状态机
+    NodeComponents []NodeComponentSpec `json:"nodeComponents,omitempty"`
+}
+
+// NodeComponentSpec 节点组件规格
+type NodeComponentSpec struct {
+    // 组件名称
+    Name string `json:"name"`
+    
+    // 组件版本
+    Version string `json:"version"`
+    
+    // 依赖的组件名称列表
+    Dependencies []string `json:"dependencies,omitempty"`
+}
+
 // BKEMachineStatus 扩展节点状态
 type BKEMachineStatus struct {
     // 节点生命周期阶段 (L2)
     LifecyclePhase NodeLifecyclePhase `json:"lifecyclePhase,omitempty"`
     
-    // 组件状态列表 (L3)
-    ComponentStatuses map[string]ComponentLifecycleStatus `json:"componentStatuses,omitempty"`
+    // 组件状态列表 (L3)：与 Spec.NodeComponents 一一对应
+    ComponentStatuses []ComponentLifecycleStatus `json:"componentStatuses,omitempty"`
     
     // 操作进度
     OperationProgress *NodeOperationProgress `json:"operationProgress,omitempty"`
@@ -367,6 +621,120 @@ type NodeOperationProgress struct {
     // 失败组件列表
     FailedComponents []string `json:"failedComponents,omitempty"`
 }
+```
+
+**数据流转关系**：
+
+```
+ReleaseImage.Spec.NodeComponents (全量节点级组件)
+    │
+    │ 按 node.Spec.Role 过滤
+    ▼
+BKEMachine.Spec.NodeComponents (该节点需要的组件)
+    │
+    │ BKEMachine Controller 读取
+    ▼
+BKEMachine.Status.ComponentStatuses (每个组件的执行状态)
+    │
+    │ 聚合
+    ▼
+BKEMachine.Status.LifecyclePhase (L2 节点层状态)
+```
+
+**示例**：
+
+```yaml
+# ReleaseImage 中的节点级组件（全量）
+spec:
+  nodeComponents:
+    - name: bkeagent
+      version: "v2.7.0"
+      dependencies: []
+      roles: [master, worker]
+    - name: containerd
+      version: "v1.7.18"
+      dependencies: [bkeagent]
+      roles: [master, worker]
+    - name: kubelet
+      version: "v1.29.0"
+      dependencies: [containerd]
+      roles: [master, worker]
+    - name: etcd
+      version: "v3.5.21-of.1"
+      dependencies: [kubelet]
+      roles: [master]
+    - name: apiserver
+      version: "v1.29.0"
+      dependencies: [etcd]
+      roles: [master]
+
+---
+# Master 节点的 BKEMachine（过滤后）
+spec:
+  role: master
+  nodeComponents:
+    - name: bkeagent
+      version: "v2.7.0"
+      dependencies: []
+    - name: containerd
+      version: "v1.7.18"
+      dependencies: [bkeagent]
+    - name: kubelet
+      version: "v1.29.0"
+      dependencies: [containerd]
+    - name: etcd
+      version: "v3.5.21-of.1"
+      dependencies: [kubelet]
+    - name: apiserver
+      version: "v1.29.0"
+      dependencies: [etcd]
+
+status:
+  lifecyclePhase: Ready
+  componentStatuses:
+    - name: bkeagent
+      version: "v2.7.0"
+      phase: Installed
+    - name: containerd
+      version: "v1.7.18"
+      phase: Installed
+    - name: kubelet
+      version: "v1.29.0"
+      phase: Installed
+    - name: etcd
+      version: "v3.5.21-of.1"
+      phase: Installed
+    - name: apiserver
+      version: "v1.29.0"
+      phase: Installed
+
+---
+# Worker 节点的 BKEMachine（过滤后，无 etcd/apiserver）
+spec:
+  role: worker
+  nodeComponents:
+    - name: bkeagent
+      version: "v2.7.0"
+      dependencies: []
+    - name: containerd
+      version: "v1.7.18"
+      dependencies: [bkeagent]
+    - name: kubelet
+      version: "v1.29.0"
+      dependencies: [containerd]
+
+status:
+  lifecyclePhase: Ready
+  componentStatuses:
+    - name: bkeagent
+      version: "v2.7.0"
+      phase: Installed
+    - name: containerd
+      version: "v1.7.18"
+      phase: Installed
+    - name: kubelet
+      version: "v1.29.0"
+      phase: Installed
 ```
 
 ### 4.2 BKECluster Controller
@@ -465,18 +833,219 @@ func (r *BKEMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
         }
     }()
     
-    // 4. 执行节点层状态机
-    if err := r.nodeSM.Execute(ctx, machine, cluster); err != nil {
+    // 4. 从 BKEMachine.Spec.NodeComponents 获取组件列表
+    // 这些组件已经由 BKECluster Controller 按角色过滤后写入
+    nodeComponents := machine.Spec.NodeComponents
+    
+    // 5. 初始化组件状态（如果尚未初始化）
+    r.initComponentStatuses(machine, nodeComponents)
+    
+    // 6. 执行节点层状态机
+    // 节点层状态机根据 Spec.NodeComponents 驱动 L2/L3 状态转换
+    if err := r.nodeSM.Execute(ctx, machine, nodeComponents); err != nil {
         log.Error(err, "node state machine execution failed")
         r.Recorder.Eventf(machine, v1.EventTypeWarning, "NodeStateMachineFailed",
             "Node state machine failed: %v", err)
     }
     
-    // 5. 设置 CAPI 标准条件
+    // 7. 设置 CAPI 标准条件
     setCAPIConditions(machine)
     
-    // 6. 决定 Requeue
+    // 8. 决定 Requeue
     return r.decideRequeue(machine), nil
+}
+
+// initComponentStatuses 初始化组件状态列表
+// 确保 Status.ComponentStatuses 与 Spec.NodeComponents 一一对应
+func (r *BKEMachineReconciler) initComponentStatuses(
+    machine *bkev1beta1.BKEMachine,
+    nodeComponents []bkev1beta1.NodeComponentSpec,
+) {
+    // 如果已初始化，跳过
+    if len(machine.Status.ComponentStatuses) == len(nodeComponents) {
+        return
+    }
+    
+    // 初始化组件状态
+    machine.Status.ComponentStatuses = make([]bkev1beta1.ComponentLifecycleStatus, len(nodeComponents))
+    for i, comp := range nodeComponents {
+        machine.Status.ComponentStatuses[i] = bkev1beta1.ComponentLifecycleStatus{
+            Name:    comp.Name,
+            Version: comp.Version,
+            Phase:   CompPhasePending,
+        }
+    }
+}
+```
+
+**NodeStateMachine 执行逻辑**：
+
+```go
+// NodeStateMachine 节点层状态机
+type NodeStateMachine struct {
+    componentSM *ComponentStateMachine
+}
+
+// Execute 执行节点层状态机
+func (sm *NodeStateMachine) Execute(
+    ctx context.Context,
+    machine *bkev1beta1.BKEMachine,
+    nodeComponents []bkev1beta1.NodeComponentSpec,
+) error {
+    // 1. 评估节点状态转换 (L2)
+    oldPhase := machine.Status.LifecyclePhase
+    newPhase := sm.evaluateNodePhase(machine, nodeComponents)
+    
+    if oldPhase != newPhase {
+        machine.Status.LifecyclePhase = newPhase
+    }
+    
+    // 2. 根据节点状态执行操作
+    switch newPhase {
+    case NodePhaseProvisioning, NodePhaseUpgrading:
+        // 按依赖顺序执行节点级组件 (L3)
+        return sm.executeNodeComponents(ctx, machine, nodeComponents)
+    
+    case NodePhaseDeleting:
+        // 按依赖逆序卸载组件
+        return sm.uninstallNodeComponents(ctx, machine, nodeComponents)
+    }
+    
+    return nil
+}
+
+// evaluateNodePhase 评估节点层状态
+func (sm *NodeStateMachine) evaluateNodePhase(
+    machine *bkev1beta1.BKEMachine,
+    nodeComponents []bkev1beta1.NodeComponentSpec,
+) NodeLifecyclePhase {
+    // 检查是否所有组件都已安装
+    allInstalled := true
+    hasUpgrading := false
+    hasFailed := false
+    
+    for _, compStatus := range machine.Status.ComponentStatuses {
+        switch compStatus.Phase {
+        case CompPhaseInstalled:
+            // 已安装
+        case CompPhaseUpgrading, CompPhaseInstalling:
+            hasUpgrading = true
+            allInstalled = false
+        case CompPhaseFailed:
+            hasFailed = true
+            allInstalled = false
+        case CompPhasePending:
+            allInstalled = false
+        }
+    }
+    
+    // 状态判断
+    if hasFailed {
+        return NodePhaseFailed
+    }
+    if hasUpgrading {
+        return NodePhaseUpgrading
+    }
+    if allInstalled && len(machine.Status.ComponentStatuses) > 0 {
+        return NodePhaseReady
+    }
+    if len(machine.Status.ComponentStatuses) > 0 {
+        return NodePhaseProvisioning
+    }
+    
+    return NodePhasePending
+}
+
+// executeNodeComponents 按依赖顺序执行节点级组件
+func (sm *NodeStateMachine) executeNodeComponents(
+    ctx context.Context,
+    machine *bkev1beta1.BKEMachine,
+    nodeComponents []bkev1beta1.NodeComponentSpec,
+) error {
+    // 1. 按依赖关系拓扑排序
+    sorted, err := topologicalSortComponents(nodeComponents)
+    if err != nil {
+        return fmt.Errorf("failed to sort components: %w", err)
+    }
+    
+    // 2. 按顺序执行每个组件
+    for _, comp := range sorted {
+        // 查找对应的组件状态
+        compStatus := sm.findComponentStatus(machine, comp.Name)
+        if compStatus == nil {
+            continue
+        }
+        
+        // 跳过已完成的组件
+        if compStatus.Phase == CompPhaseInstalled {
+            continue
+        }
+        
+        // 检查依赖是否满足
+        if !sm.dependenciesSatisfied(machine, comp.Dependencies) {
+            continue // 等待依赖完成
+        }
+        
+        // 获取 ComponentVersion
+        cv, err := sm.lookupComponentVersion(ctx, comp.Name, comp.Version)
+        if err != nil {
+            return fmt.Errorf("failed to lookup component %s: %w", comp.Name, err)
+        }
+        
+        // 执行组件层状态机 (L3)
+        if err := sm.componentSM.Execute(ctx, compStatus, cv); err != nil {
+            return fmt.Errorf("component %s failed: %w", comp.Name, err)
+        }
+    }
+    
+    return nil
+}
+
+// topologicalSortComponents 按依赖关系拓扑排序
+func topologicalSortComponents(components []bkev1beta1.NodeComponentSpec) ([]bkev1beta1.NodeComponentSpec, error) {
+    // 构建依赖图
+    graph := make(map[string][]string)
+    inDegree := make(map[string]int)
+    compMap := make(map[string]bkev1beta1.NodeComponentSpec)
+    
+    for _, comp := range components {
+        compMap[comp.Name] = comp
+        if _, ok := inDegree[comp.Name]; !ok {
+            inDegree[comp.Name] = 0
+        }
+        for _, dep := range comp.Dependencies {
+            graph[dep] = append(graph[dep], comp.Name)
+            inDegree[comp.Name]++
+        }
+    }
+    
+    // Kahn 算法
+    var queue []string
+    for name, degree := range inDegree {
+        if degree == 0 {
+            queue = append(queue, name)
+        }
+    }
+    
+    var sorted []bkev1beta1.NodeComponentSpec
+    for len(queue) > 0 {
+        name := queue[0]
+        queue = queue[1:]
+        sorted = append(sorted, compMap[name])
+        
+        for _, dependent := range graph[name] {
+            inDegree[dependent]--
+            if inDegree[dependent] == 0 {
+                queue = append(queue, dependent)
+            }
+        }
+    }
+    
+    if len(sorted) != len(components) {
+        return nil, fmt.Errorf("circular dependency detected")
+    }
+    
+    return sorted, nil
 }
 ```
 
@@ -493,32 +1062,26 @@ type DAGExecutor struct {
 func (e *DAGExecutor) BuildDAG(releaseImage *ReleaseImage) (*ExecutionDAG, error) {
     dag := NewExecutionDAG()
     
-    // 分离集群级组件和节点级组件
-    var clusterComponents []*ComponentVersion
-    var hasNodeComponents bool
-    
-    for _, comp := range releaseImage.Spec.Components {
+    // 1. 添加集群级组件节点
+    for _, comp := range releaseImage.Spec.ClusterComponents {
         cv := lookupComponentVersion(comp.Name, comp.Version)
-        if cv.Spec.Scope == ComponentScopeNode {
-            hasNodeComponents = true
-        } else {
-            dag.AddNode(&ClusterComponentNode{
-                name:      cv.Name,
-                component: cv,
-                deps:      cv.Spec.Dependencies,
-            })
-        }
-    }
-    
-    // 添加节点组节点（只负责创建/更新 BKEMachine）
-    if hasNodeComponents {
-        dag.AddNode(&NodeGroupNode{
-            name: "node-group",
-            deps: collectNodeGroupDeps(releaseImage),
+        dag.AddNode(&ClusterComponentNode{
+            name:      comp.Name,
+            component: cv,
+            deps:      comp.Dependencies,
         })
     }
     
-    // 构建依赖边
+    // 2. 添加节点组节点（负责将 nodeComponents 写入 BKEMachine）
+    if len(releaseImage.Spec.NodeComponents) > 0 {
+        dag.AddNode(&NodeGroupNode{
+            name:           "node-group",
+            nodeComponents: releaseImage.Spec.NodeComponents,
+            deps:           collectNodeGroupDeps(releaseImage),
+        })
+    }
+    
+    // 3. 构建依赖边
     dag.BuildEdges()
     
     return dag, nil
@@ -526,15 +1089,19 @@ func (e *DAGExecutor) BuildDAG(releaseImage *ReleaseImage) (*ExecutionDAG, error
 
 // NodeGroupNode 节点组节点
 type NodeGroupNode struct {
-    name string
-    deps []string
+    name           string
+    nodeComponents []ReleaseNodeComponent  // 全量节点级组件
+    deps           []string
 }
 
-// Execute 创建/更新 BKEMachine
+// Execute 创建/更新 BKEMachine，按角色过滤 nodeComponents
 func (n *NodeGroupNode) Execute(ctx context.Context, execCtx *ExecutionContext) error {
     nodes := execCtx.GetAllNodes()
     
     for _, node := range nodes {
+        // 按节点角色过滤 nodeComponents
+        filteredComponents := filterNodeComponentsByRole(n.nodeComponents, node.Role)
+        
         // 创建或更新 BKEMachine
         machine := &bkev1beta1.BKEMachine{
             ObjectMeta: metav1.ObjectMeta{
@@ -545,8 +1112,8 @@ func (n *NodeGroupNode) Execute(ctx context.Context, execCtx *ExecutionContext) 
                 },
             },
             Spec: bkev1beta1.BKEMachineSpec{
-                // 设置节点级组件列表
-                NodeComponents: execCtx.GetNodeComponents(),
+                Role:           node.Role,
+                NodeComponents: toNodeComponentSpecs(filteredComponents),
             },
         }
         
@@ -555,7 +1122,6 @@ func (n *NodeGroupNode) Execute(ctx context.Context, execCtx *ExecutionContext) 
         err := execCtx.Client.Get(ctx, client.ObjectKeyFromObject(machine), existing)
         if err != nil {
             if apierrors.IsNotFound(err) {
-                // 创建
                 if err := execCtx.Client.Create(ctx, machine); err != nil {
                     return err
                 }
@@ -563,8 +1129,8 @@ func (n *NodeGroupNode) Execute(ctx context.Context, execCtx *ExecutionContext) 
                 return err
             }
         } else {
-            // 更新
-            existing.Spec = machine.Spec
+            // 更新：只更新 NodeComponents（不覆盖其他字段）
+            existing.Spec.NodeComponents = machine.Spec.NodeComponents
             if err := execCtx.Client.Update(ctx, existing); err != nil {
                 return err
             }
@@ -572,6 +1138,38 @@ func (n *NodeGroupNode) Execute(ctx context.Context, execCtx *ExecutionContext) 
     }
     
     return nil
+}
+
+// filterNodeComponentsByRole 按角色过滤节点级组件
+func filterNodeComponentsByRole(components []ReleaseNodeComponent, role string) []ReleaseNodeComponent {
+    var filtered []ReleaseNodeComponent
+    for _, comp := range components {
+        if len(comp.Roles) == 0 {
+            // 无角色限制，所有节点都需要
+            filtered = append(filtered, comp)
+            continue
+        }
+        for _, r := range comp.Roles {
+            if r == role {
+                filtered = append(filtered, comp)
+                break
+            }
+        }
+    }
+    return filtered
+}
+
+// toNodeComponentSpecs 转换为 BKEMachine.Spec.NodeComponents 格式
+func toNodeComponentSpecs(components []ReleaseNodeComponent) []bkev1beta1.NodeComponentSpec {
+    specs := make([]bkev1beta1.NodeComponentSpec, len(components))
+    for i, comp := range components {
+        specs[i] = bkev1beta1.NodeComponentSpec{
+            Name:         comp.Name,
+            Version:      comp.Version,
+            Dependencies: comp.Dependencies,
+        }
+    }
+    return specs
 }
 
 // ClusterComponentNode 集群级组件节点
@@ -586,6 +1184,58 @@ func (n *ClusterComponentNode) Execute(ctx context.Context, execCtx *ExecutionCo
     comp := execCtx.GetClusterComponentStatus(n.name)
     return execCtx.ComponentSM.Execute(ctx, comp, n.component)
 }
+```
+
+**数据流完整示例**：
+
+```
+ReleaseImage.Spec:
+  clusterComponents:
+    - certs, coredns, kube-proxy
+  nodeComponents:
+    - bkeagent (roles: [master, worker])
+    - containerd (roles: [master, worker])
+    - kubelet (roles: [master, worker])
+    - etcd (roles: [master])
+    - apiserver (roles: [master])
+
+DAG 构建:
+  ┌────────┐   ┌─────────┐   ┌────────────┐
+  │ certs  │──>│ coredns │   │ kube-proxy │
+  └──┬─────┘   └─────────┘   └────────────┘
+     │
+     └──> ┌──────────────┐
+          │  node-group  │
+          └──────┬───────┘
+                 │
+                 │ 按角色过滤 nodeComponents
+                 ▼
+    ┌────────────────────────────────────────────────────────┐
+    │                                                        │
+    │  Master BKEMachine.Spec.NodeComponents:                │
+    │    [bkeagent, containerd, kubelet, etcd, apiserver]    │
+    │                                                        │
+    │  Worker BKEMachine.Spec.NodeComponents:                │
+    │    [bkeagent, containerd, kubelet]                     │
+    │                                                        │
+    └────────────────────────────────────────────────────────┘
+                 │
+                 │ BKEMachine Controller 读取
+                 ▼
+    ┌────────────────────────────────────────────────────────┐
+    │  BKEMachine Controller (每个节点独立 Reconcile)         │
+    │                                                        │
+    │  1. 读取 Spec.NodeComponents                           │
+    │  2. 初始化 Status.ComponentStatuses                    │
+    │  3. 按依赖顺序执行组件层状态机                          │
+    │                                                        │
+    │  Master 节点执行顺序:                                   │
+    │    bkeagent → containerd → kubelet → etcd → apiserver  │
+    │                                                        │
+    │  Worker 节点执行顺序:                                   │
+    │    bkeagent → containerd → kubelet                     │
+    │                                                        │
+    └────────────────────────────────────────────────────────┘
 ```
 
 ---
