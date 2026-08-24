@@ -922,6 +922,9 @@ type BKEMachineReconciler struct {
     
     // 状态机引擎
     engine *statemachine.ClusterStateMachine
+    
+    // ReleaseImage 解析器
+    releaseImageResolver *ReleaseImageResolver
 }
 
 func (r *BKEMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -950,19 +953,138 @@ func (r *BKEMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
         }
     }()
     
-    // 4. 执行节点层状态机
+    // 4. 获取节点级组件列表（从 ReleaseImage 中解析）
+    nodeComponents, err := r.getNodeComponents(ctx, cluster)
+    if err != nil {
+        log.Error(err, "failed to get node components")
+        return ctrl.Result{}, err
+    }
+    
+    // 5. 执行节点层状态机
     node := machine.ToBKENode()
-    if err := r.engine.NodeSM().Execute(ctx, node, nil); err != nil {
+    if err := r.engine.NodeSM().Execute(ctx, node, nodeComponents); err != nil {
         log.Error(err, "node state machine execution failed")
         r.Recorder.Eventf(machine, v1.EventTypeWarning, "NodeStateMachineFailed",
             "Node state machine failed: %v", err)
     }
     
-    // 5. 同步状态回 BKEMachine
+    // 6. 同步状态回 BKEMachine
     machine.UpdateFromBKENode(node)
     
-    // 6. 决定 Requeue
+    // 7. 决定 Requeue
     return r.decideRequeue(machine), nil
+}
+
+// getNodeComponents 从 ReleaseImage 中获取节点级组件列表
+func (r *BKEMachineReconciler) getNodeComponents(ctx context.Context, cluster *bkev1beta1.BKECluster) ([]*ComponentVersion, error) {
+    // 1. 获取当前操作的 ReleaseImage
+    releaseImage, err := r.releaseImageResolver.Resolve(ctx, cluster)
+    if err != nil {
+        return nil, fmt.Errorf("failed to resolve release image: %w", err)
+    }
+    
+    // 2. 过滤出节点级组件（scope=node）
+    var nodeComponents []*ComponentVersion
+    for _, comp := range releaseImage.Spec.Components {
+        cv, err := r.lookupComponentVersion(ctx, comp.Name, comp.Version)
+        if err != nil {
+            return nil, fmt.Errorf("failed to lookup component %s: %w", comp.Name, err)
+        }
+        
+        if cv.Spec.Scope == ComponentScopeNode {
+            nodeComponents = append(nodeComponents, cv)
+        }
+    }
+    
+    // 3. 按依赖关系排序
+    sorted, err := topologicalSort(nodeComponents)
+    if err != nil {
+        return nil, fmt.Errorf("failed to sort components: %w", err)
+    }
+    
+    return sorted, nil
+}
+
+// lookupComponentVersion 查找 ComponentVersion
+func (r *BKEMachineReconciler) lookupComponentVersion(ctx context.Context, name, version string) (*ComponentVersion, error) {
+    cv := &cvoapi.ComponentVersion{}
+    key := client.ObjectKey{
+        Namespace: "bke-system",  // ComponentVersion 存储在固定命名空间
+        Name:      fmt.Sprintf("%s-%s", name, version),
+    }
+    
+    if err := r.Get(ctx, key, cv); err != nil {
+        return nil, err
+    }
+    
+    return cv, nil
+}
+
+// topologicalSort 按依赖关系对组件进行拓扑排序
+func topologicalSort(components []*ComponentVersion) ([]*ComponentVersion, error) {
+    // 构建依赖图
+    graph := make(map[string][]string)
+    inDegree := make(map[string]int)
+    
+    for _, comp := range components {
+        if _, ok := inDegree[comp.Name]; !ok {
+            inDegree[comp.Name] = 0
+        }
+        
+        for _, dep := range comp.Spec.Dependencies {
+            // 只统计节点级组件的依赖
+            if isNodeComponent(components, dep.Name) {
+                graph[dep.Name] = append(graph[dep.Name], comp.Name)
+                inDegree[comp.Name]++
+            }
+        }
+    }
+    
+    // Kahn 算法拓扑排序
+    var queue []string
+    for name, degree := range inDegree {
+        if degree == 0 {
+            queue = append(queue, name)
+        }
+    }
+    
+    var sorted []*ComponentVersion
+    for len(queue) > 0 {
+        name := queue[0]
+        queue = queue[1:]
+        
+        // 找到对应的组件
+        for _, comp := range components {
+            if comp.Name == name {
+                sorted = append(sorted, comp)
+                break
+            }
+        }
+        
+        // 减少依赖该组件的组件的入度
+        for _, dependent := range graph[name] {
+            inDegree[dependent]--
+            if inDegree[dependent] == 0 {
+                queue = append(queue, dependent)
+            }
+        }
+    }
+    
+    if len(sorted) != len(components) {
+        return nil, fmt.Errorf("circular dependency detected")
+    }
+    
+    return sorted, nil
+}
+
+// isNodeComponent 检查组件是否为节点级组件
+func isNodeComponent(components []*ComponentVersion, name string) bool {
+    for _, comp := range components {
+        if comp.Name == name {
+            return comp.Spec.Scope == ComponentScopeNode
+        }
+    }
+    return false
 }
 ```
 
