@@ -1747,6 +1747,49 @@ BKECluster Controller (L1 集群层状态机)
 
 4. **BKEMachine Controller 独立执行**：BKEMachine Controller 独立驱动 L2/L3 状态机，与 BKECluster Controller 解耦
 
+**集群层状态机与节点层状态机的执行顺序**：
+
+```
+BKECluster Controller (L1 集群层状态机)
+  │
+  ├─ Build DAG (从 ReleaseImage 构建)
+  │   ├─ ClusterComponentNode: certs, coredns, kube-proxy
+  │   └─ NodeGroupNode: node-group
+  │
+  └─ Execute DAG (按拓扑排序分批执行)
+      │
+      ├─ Batch 1: [certs]              ← 集群层组件直接执行 L3
+      │   └─ ClusterComponentNode.Execute()
+      │
+      ├─ Batch 2: [node-group]         ← 触发节点层状态机
+      │   └─ NodeGroupNode.Execute()
+      │       ├─ 1. 按角色过滤 → 写入 BKEMachine.Spec.NodeComponents
+      │       ├─ 2. waitForNodesReady()  ← 轮询等待
+      │       │       └─ BKEMachine Controller 独立驱动 L2/L3
+      │       └─ 3. aggregateNodeStatuses()
+      │
+      ├─ Batch 3: [coredns]            ← 集群层组件直接执行 L3
+      └─ Batch 4: [kube-proxy]
+```
+
+**执行顺序说明**：
+
+| 阶段 | 控制器 | 状态机 | 说明 |
+|------|--------|--------|------|
+| 1 | BKECluster Controller | L1 集群层 | 驱动整个 DAG 执行 |
+| 2 | BKECluster Controller | L3 组件层 | 直接执行集群级组件（certs, coredns 等）|
+| 3 | BKECluster Controller | - | node-group 节点写入 BKEMachine.Spec |
+| 4 | BKEMachine Controller | L2 节点层 | 独立驱动节点状态机 |
+| 5 | BKEMachine Controller | L3 组件层 | 独立驱动组件状态机（bkeagent, kubelet 等）|
+| 6 | BKECluster Controller | - | 轮询等待 BKEMachine.Status.Ready |
+
+**核心设计要点**：
+
+- 集群层状态机 (L1) 通过 DAG 依赖关系控制执行顺序
+- node-group 节点是**同步阻塞点**：写入 BKEMachine 后轮询等待 BKEMachine Controller 完成
+- BKEMachine Controller 独立驱动 L2/L3，与 BKECluster Controller 解耦
+- 集群级组件和节点级组件的执行顺序由 DAG 依赖决定，而非固定顺序
+
 ---
 
 ## 5. 完整执行流程
