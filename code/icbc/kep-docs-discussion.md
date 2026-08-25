@@ -915,7 +915,6 @@ type PhaseFlow struct {
 
 1. 工行现有二进制安装方案如何迁移到 binary 类型 ComponentVersion？
 2. 模板变量系统是否满足工行场景需求？
-3. 离线环境制品缓存策略如何设计？
 
 ---
 
@@ -1112,8 +1111,7 @@ kubectl get bkemachine node-1 -o jsonpath='{.status.operationProgress}'
 ### 5.4 讨论要点
 
 1. 可观测性数据如何与工行现有监控系统集成？
-2. 升级进度的实时推送机制（WebSocket/SSE）？
-3. 告警规则如何配置？
+2. 告警规则如何配置？
 
 ---
 
@@ -1277,8 +1275,7 @@ kubectl get bkemachine node-1 -o jsonpath='{.status.operationProgress}'
 ### 6.6 讨论要点
 
 1. 回滚前的 etcd 备份策略如何设计？
-2. Binary 组件的旧版本制品缓存策略？
-3. 回滚失败后的兜底方案？
+2. 回滚失败后的兜底方案？
 
 ---
 
