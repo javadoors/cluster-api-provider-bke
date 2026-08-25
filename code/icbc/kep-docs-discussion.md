@@ -871,6 +871,7 @@ type PhaseFlow struct {
 | **kubelet** | `EnsureMasterUpgrade` / `EnsureWorkerUpgrade` | kubelet + kubectl + kubelet.conf + service | master, worker | P0 | K8s 节点组件，需按角色分别处理 |
 | **kubectl** | `EnsureMasterUpgrade` / `EnsureWorkerUpgrade` | kubectl 二进制 | master, worker | P0 | K8s 命令行工具 |
 | **runc** | `EnsureNodesEnv` (update-runc.sh) | runc 二进制 | master, worker | P0 | 容器运行时底层 |
+| **pause** | `EnsureNodesEnv` | pause 镜像 | master, worker | P2 | 镜像预拉取组件，由 containerd/docker 自动管理，无需 manifest |
 | **helm** | `EnsureNodesEnv` (install-helm.sh) | helm 二进制 | master | P2 | Helm 命令行工具 |
 | **etcdctl** | `EnsureNodesEnv` (install-etcdctl.sh) | etcdctl 二进制 | master | P2 | etcd 命令行工具 |
 | **calicoctl** | `EnsureNodesEnv` (install-calicoctl.sh) | calicoctl 二进制 | master, worker | P2 | Calico 命令行工具 |
@@ -889,7 +890,6 @@ type PhaseFlow struct {
 | **kube-scheduler** | `EnsureMasterUpgrade` | kube-scheduler 镜像 | master | P0 | K8s 调度器 |
 | **haproxy** | `EnsureLoadBalance` | haproxy 镜像 | master | P1 | 负载均衡器 |
 | **keepalived** | `EnsureLoadBalance` | keepalived 镜像 | master | P1 | VIP 管理 |
-| **pause** | `EnsureNodesEnv` | pause 镜像 | master, worker | P2 | Pod 基础设施容器 |
 
 #### 3.3.3 改造优先级说明
 
@@ -897,14 +897,14 @@ type PhaseFlow struct {
 |-------|------|------|
 | **P0** | 核心组件，必须首先改造 | bkeagent, containerd, kubelet, kubectl, runc, etcd, kube-apiserver, kube-controller-manager, kube-scheduler |
 | **P1** | 重要组件，第二批改造 | haproxy, keepalived |
-| **P2** | 辅助组件，最后改造 | helm, etcdctl, calicoctl, lxcfs, nfs-utils, pause |
+| **P2** | 辅助组件，最后改造 | pause, helm, etcdctl, calicoctl, lxcfs, nfs-utils |
 
 #### 3.3.4 改造工作量评估
 
 | 组件类型 | 组件数量 | 改造复杂度 | 预估工作量 |
 |---------|---------|-----------|-----------|
-| **Binary 类型** | 10 个 | 中等（需编写 installScript + configTemplates） | 2-3 周 |
-| **Static Pod 类型** | 7 个 | 较高（需编写 manifestTemplate + 健康检查） | 2-3 周 |
+| **Binary 类型** | 11 个 | 中等（需编写 installScript + configTemplates） | 2-3 周 |
+| **Static Pod 类型** | 6 个 | 较高（需编写 manifestTemplate + 健康检查） | 2-3 周 |
 | **总计** | 17 个 | - | 4-6 周 |
 
 ### 3.4 支持的组件类型
