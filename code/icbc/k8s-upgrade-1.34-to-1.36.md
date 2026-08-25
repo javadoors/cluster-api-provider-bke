@@ -1,31 +1,70 @@
-# K8s 1.34 → 1.36 升级方案详细设计
+# KEP-8: K8s 1.34 → 1.36 升级方案设计
 
 | 字段 | 值 |
 |------|-----|
-| **文档类型** | 升级方案设计 |
-| **升级范围** | Kubernetes v1.34 → v1.36 |
-| **配套组件** | containerd, etcd, kubelet, apiserver, controller-manager, scheduler |
-| **状态** | `draft` |
+| **KEP 编号** | KEP-8 |
+| **标题** | Kubernetes v1.34 → v1.36 声明式升级方案设计 |
+| **状态** | `provisional` |
+| **类型** | Feature |
+| **作者** | openFuyao Team |
 | **创建日期** | 2026-08-25 |
+| **依赖** | KEP-5 声明式升级框架、KEP-6 三层状态机设计、KEP-5-2 升级前预检 |
 
 ---
 
-## 目录
+## 1. 摘要
 
-1. [版本兼容性矩阵](#1-版本兼容性矩阵)
-2. [升级策略设计](#2-升级策略设计)
-3. [组件升级详细方案](#3-组件升级详细方案)
-4. [升级流程设计](#4-升级流程设计)
-5. [回滚策略](#5-回滚策略)
-6. [工作量详细评估](#6-工作量详细评估)
-7. [风险与缓解措施](#7-风险与缓解措施)
-8. [与工行协作计划](#8-与工行协作计划)
+本提案设计 Kubernetes v1.34 → v1.36 的声明式升级方案，基于 openFuyao 已有的 DAG 驱动升级框架（KEP-5），通过 ReleaseImage 定义版本清单、ComponentVersion 声明组件依赖、UpgradePath 管控升级路径，实现逐版本（v1.34→v1.35→v1.36）滚动升级。升级过程通过 BKEClusterReconciler 构建 DAG、Scheduler 按拓扑批次执行、BKEAgent 在节点上执行 kubeadm 升级命令，覆盖 containerd、etcd、控制面、kubelet、kube-proxy、coredns 等全部配套组件。
 
----
+## 2. 动机
 
-## 1. 版本兼容性矩阵
+### 2.1 版本迭代需求
 
-### 1.1 K8s 与配套组件版本对应关系
+K8s 1.34→1.36 跨越 2 个小版本，涉及：
+
+| 维度 | 变更 | 影响 |
+|------|------|------|
+| **API 废弃** | `flowcontrol.apiserver.k8s.io/v1beta3`（1.35）、`discovery.k8s.io/v1beta1`（1.36） | 需扫描集群中使用的废弃 API |
+| **etcd 版本** | v3.5.18 → v3.5.20 | 需同步升级 etcd |
+| **containerd 版本** | v1.7.20 → v1.7.24 | 需同步升级容器运行时 |
+| **kubelet 倾斜策略** | kubelet 最多比 apiserver 旧 2 个版本 | 必须先升级 master 再升级 worker |
+
+### 2.2 现有框架能力
+
+openFuyao 声明式升级框架已具备以下能力：
+
+- **ReleaseImage CRD**：定义版本清单（`spec.install.components` + `spec.upgrade.components`）
+- **ComponentVersion CRD**：声明组件类型（inline/yaml/helm）、依赖关系、升级策略
+- **UpgradePath CRD**：管控版本间升级路径合法性
+- **DAG 调度器**：从 ReleaseImage bundle 动态构建 DAG，按拓扑批次并行执行
+- **VersionContext**：通过 `current != target` 字符串比较判断是否需要升级
+- **BKEAgent 命令机制**：通过 `Command` CR 向节点发送 `Kubeadm Upgrade*` 内置命令
+
+## 3. 范围与约束
+
+### 3.1 范围
+
+| 范围 | 说明 |
+|------|------|
+| **K8s 版本** | v1.34 → v1.35 → v1.36（逐版本升级，2 跳） |
+| **配套组件** | containerd、etcd、kubelet、apiserver、controller-manager、scheduler、kube-proxy、coredns、bkeagent |
+| **升级路径** | 逐版本升级（v1.34→v1.35→v1.36），不支持跳版本 |
+| **回滚策略** | 仅支持集群级回滚 |
+| **PreCheck/PostCheck** | 引用 KEP-5-2 的 CheckPolicy CRD 设计 |
+
+### 3.2 约束
+
+| 约束 | 说明 |
+|------|------|
+| **逐版本升级** | kubeadm 官方建议逐版本升级，不支持跨多个版本 |
+| **版本一致性** | 运行态必须与 ReleaseImage 保持一致，不支持部分回滚 |
+| **先 master 后 worker** | kubelet 不能比 apiserver 新，必须先升级控制面 |
+| **BKEAgent 就绪** | 节点 BKEAgent 必须 Ready 才能执行升级命令 |
+| **幂等性** | 所有升级操作必须幂等，支持 Reconcile 重入 |
+
+## 4. 版本兼容性矩阵
+
+### 4.1 K8s 与配套组件版本对应关系
 
 | 目标版本 | K8s | containerd | etcd | kubelet | 说明 |
 |---------|-----|-----------|------|---------|------|
@@ -35,7 +74,7 @@
 
 > **注意**：截至 2026 年 8 月，K8s 最新稳定版本为 v1.36。v1.37 尚未发布。
 
-### 1.2 版本倾斜策略约束
+### 4.2 版本倾斜策略约束
 
 | 组件 | 约束规则 | 影响 |
 |------|---------|------|
@@ -45,18 +84,16 @@
 | **etcd** | 每个 K8s 版本有推荐的 etcd 版本 | 需要与 K8s 版本配套升级 |
 | **containerd** | 需要支持目标 K8s 版本的 CRI | 需要与 K8s 版本配套升级 |
 
-### 1.3 API 废弃清单（需 PreCheck 扫描）
+### 4.3 API 废弃清单（需 PreCheck 扫描）
 
 | 版本 | 废弃 API | 替代 API | 影响范围 |
 |------|---------|---------|---------|
 | **v1.35** | `flowcontrol.apiserver.k8s.io/v1beta3` | `v1` | FlowSchema, PriorityLevelConfiguration |
 | **v1.36** | `discovery.k8s.io/v1beta1` | `v1` | EndpointSlice |
 
----
+## 5. 升级策略设计
 
-## 2. 升级策略设计
-
-### 2.1 升级路径选择
+### 5.1 升级路径
 
 **推荐方案：逐版本升级**
 
@@ -65,625 +102,527 @@ v1.34 → v1.35 → v1.36
 ```
 
 **理由**：
-1. kubeadm 官方建议逐版本升级，不支持跨多个版本直接升级
+1. kubeadm 官方建议逐版本升级
 2. 每个中间版本的 API 变更需要逐步适配
 3. etcd 数据格式需要逐步迁移
 4. 降低升级风险，每跳都可以验证和回滚
 
-**备选方案：跳版本升级（不推荐）**
+### 5.2 ReleaseImage 结构设计
 
-```
-v1.34 → v1.36（直接跳版本）
-```
+每个版本对应一个 ReleaseImage CR，包含 `spec.install.components` 和 `spec.upgrade.components`：
 
-**风险**：
-- kubeadm 可能不支持
-- API 变更累积，兼容性风险高
-- etcd 数据格式可能不兼容
-- 回滚粒度粗，只能回滚到 v1.34
-
-### 2.2 升级顺序设计
-
-**核心原则**：
-1. **先控制面，后工作节点**：确保 kubelet 不会比 apiserver 新
-2. **先 etcd，后 K8s**：确保 etcd 版本与 K8s 版本兼容
-3. **先 containerd，后 kubelet**：确保容器运行时支持目标 K8s 版本
-4. **逐节点滚动**：每个节点升级完成后等待 Ready，再升级下一个
-
-**升级 DAG 设计（单跳示例：v1.34 → v1.35）**：
-
-```
-ReleaseImage v1.35.0 DAG:
-
-Batch 1: [pre-upgrade-resources]
-    └─ 创建升级所需的 CRD/RBAC 资源
-    └─ 执行 PreCheck（API 兼容性、etcd 版本、节点健康）
-
-Batch 2: [bkeagent]
-    └─ 升级所有节点的 bkeagent 到 v1.35 兼容版本
-
-Batch 3: [containerd]
-    └─ 升级所有节点的 containerd 到 v1.7.22
-    └─ 验证 CRI 接口兼容性
-
-Batch 4: [etcd]
-    └─ 滚动升级 etcd 到 v3.5.25
-    └─ 每个节点：备份 → 升级 → 健康检查
-    └─ 验证 etcd 集群健康
-
-Batch 5: [kubernetes-master]
-    └─ 滚动升级控制面组件
-    └─ apiserver: v1.34 → v1.35
-    └─ controller-manager: v1.34 → v1.35
-    └─ scheduler: v1.34 → v1.35
-    └─ 每个节点：drain → upgrade → uncordon → 健康检查
-
-Batch 6: [kubernetes-worker]
-    └─ 滚动升级 kubelet
-    └─ kubelet: v1.34 → v1.35
-    └─ 每个节点：drain → upgrade → uncordon → 健康检查
-
-Batch 7: [kube-proxy, coredns]
-    └─ kube-proxy DaemonSet 更新到 v1.35
-    └─ coredns Deployment 更新到兼容版本
-
-Batch 8: [post-upgrade-verification]
-    └─ 执行 PostCheck（版本验证、集群健康、应用健康）
+```yaml
+# ReleaseImage v1.35.0
+apiVersion: cvo.openfuyao.cn/v1alpha1
+kind: ReleaseImage
+metadata:
+  name: openfuyao-v1.35.0
+spec:
+  version: "v1.35.0"
+  digest: "sha256:..."
+  install:
+    components:
+      - name: bkeagent
+        version: v2.7.0
+      - name: containerd
+        version: v1.7.22
+      - name: etcd
+        version: v3.5.19
+      - name: kubernetes-master
+        version: v1.35.0
+      - name: kubernetes-worker
+        version: v1.35.0
+      - name: kube-proxy
+        version: v1.35.0
+      - name: coredns
+        version: v1.11.2
+  upgrade:
+    components:
+      - name: pre-upgrade-resources
+        version: v1.0.0
+      - name: bkeagent
+        version: v2.7.0
+      - name: containerd
+        version: v1.7.22
+      - name: etcd
+        version: v3.5.19
+        inline:
+          handler: EnsureEtcdUpgrade
+          version: v1.0.0
+      - name: kubernetes-master
+        version: v1.35.0
+        inline:
+          handler: EnsureMasterUpgrade
+          version: v1.0.0
+      - name: kubernetes-worker
+        version: v1.35.0
+        inline:
+          handler: EnsureWorkerUpgrade
+          version: v1.0.0
+      - name: kube-proxy
+        version: v1.35.0
+      - name: coredns
+        version: v1.11.2
 ```
 
-### 2.3 多跳升级编排
+### 5.3 DAG 构建
 
-**完整升级流程（v1.34 → v1.36）**：
+DAG 从 ReleaseImage bundle 动态构建，依赖关系来自 `ComponentVersion.spec.dependencies`：
+
+```
+DAG 构建流程 (pkg/topology/build.go + pkg/upgrade/bundle.go):
+
+1. 从 ReleaseImage.Spec.Upgrade.Components 提取升级组件列表
+2. 对每个组件，从 ComponentVersion.spec.dependencies 解析依赖关系
+3. 隐式规则：pre-upgrade-resources 作为所有组件的前置依赖
+4. 拓扑排序生成执行批次（Kahn 算法）
+5. 同批次内组件可并行执行（MaxParallel=8）
+```
+
+**典型 DAG 结构（v1.34 → v1.35 单跳）**：
+
+```
+Batch 1: [pre-upgrade-resources]     ← 隐式前置依赖，最先执行
+    └─ 创建升级所需的 CRD/RBAC/ConfigMap 资源
+
+Batch 2: [bkeagent, containerd]      ← 无相互依赖，并行执行
+    ├─ bkeagent: SSH 推送二进制
+    └─ containerd: ENV 命令（reset + redeploy）
+
+Batch 3: [etcd]                      ← 依赖 pre-upgrade-resources
+    └─ etcd: Upgrade CR → Kubeadm UpgradeEtcd
+
+Batch 4: [kubernetes-master]         ← 依赖 etcd
+    └─ master: Upgrade CR → Kubeadm UpgradeControlPlane
+
+Batch 5: [kubernetes-worker]         ← 依赖 kubernetes-master（倾斜策略）
+    └─ worker: Upgrade CR → Kubeadm UpgradeWorker
+
+Batch 6: [kube-proxy, coredns]       ← 依赖 kubernetes-master
+    ├─ kube-proxy: YAML Apply（SSA + Prune）
+    └─ coredns: YAML Apply（SSA + Prune）
+```
+
+> **注意**：实际 DAG 结构由 ReleaseImage bundle 中的 `ComponentVersion.spec.dependencies` 决定，而非硬编码。上图为典型配置。
+
+### 5.4 多跳升级编排
+
+多跳升级通过 `ClusterVersionReconciler` 逐跳触发，而非自动连续执行：
 
 ```
 用户操作：修改 ClusterVersion.Spec.DesiredVersion = v1.36.0
 
-系统自动编排：
+ClusterVersionReconciler 编排：
 ┌─────────────────────────────────────────────────────────────────────┐
 │  Hop 1: v1.34 → v1.35                                              │
-│  ├─ 加载 ReleaseImage v1.35.0                                      │
-│  ├─ 执行升级 DAG                                                    │
-│  ├─ 验证升级成功                                                    │
-│  └─ 更新 ClusterVersion.Status.CurrentVersion = v1.35.0            │
+│  1. ClusterVersionReconciler 设置 annotation:                      │
+│     cvo.openfuyao.cn/upgrade-ready = v1.35.0                       │
+│  2. BKEClusterReconciler 检测到 annotation:                       │
+│     └─ executeUpgradeDAG()                                          │
+│        ├─ 解析 ReleaseImage v1.35.0（Status.Phase 必须为 Valid）  │
+│        ├─ 构建 VersionContext（Target from bundle, Current from 状态）│
+│        ├─ 同步目标版本到 BKECluster.Spec                           │
+│        ├─ 构建 DAG + 执行 DAG                                      │
+│        └─ 成功后清除 annotation + CompleteUpgradeHop               │
+│  3. ClusterVersionReconciler 检测到 hop 完成:                      │
+│     └─ 更新 Status.CurrentVersion = v1.35.0                       │
 └─────────────────────────────────────────────────────────────────────┘
                                     ↓
 ┌─────────────────────────────────────────────────────────────────────┐
 │  Hop 2: v1.35 → v1.36                                              │
-│  ├─ 加载 ReleaseImage v1.36.0                                      │
-│  ├─ 执行升级 DAG                                                    │
-│  ├─ 验证升级成功                                                    │
-│  └─ 更新 ClusterVersion.Status.CurrentVersion = v1.36.0            │
+│  1. ClusterVersionReconciler 设置 annotation:                      │
+│     cvo.openfuyao.cn/upgrade-ready = v1.36.0                       │
+│  2. BKEClusterReconciler 检测到 annotation:                       │
+│     └─ executeUpgradeDAG()（同上流程）                             │
+│  3. ClusterVersionReconciler 更新:                                 │
+│     └─ Status.CurrentVersion = v1.36.0                             │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
 **关键设计**：
-- 每跳之间自动执行集群健康检查
-- 如果某一跳失败，自动停止并触发回滚到该跳的起始版本
-- 用户可以在任意跳之间暂停升级（通过设置 `ClusterVersion.Spec.Paused = true`）
+- 每跳由 `ClusterVersionReconciler` 通过 `cvo.openfuyao.cn/upgrade-ready` annotation 触发
+- BKEClusterReconciler 执行完一跳后清除 annotation，控制权交回 ClusterVersionReconciler
+- 用户可在任意跳之间暂停（设置 `BKECluster.Spec.Pause = true`）
+- 如果某一跳失败，`StatusManager` 提供 10 次重试，超过后设置终端 `*Failed` 状态
 
----
+## 6. 组件升级方案
 
-## 3. 组件升级详细方案
+### 6.1 bkeagent 升级
 
-### 3.1 containerd 升级方案
+**执行方式**：SSH 直接推送二进制（非 Command CR）
 
-**升级范围**：v1.7.20 → v1.7.22 → v1.7.24
+**原因**：BKEAgent 无法自升级（chicken-and-egg 问题），必须由 Controller 直接推送
 
-**升级策略**：
-- **滚动升级**：逐节点升级，不影响其他节点
-- **配置保留**：保留 containerd 配置文件，仅更新二进制
-- **CRI 兼容性**：验证 CRI 接口与目标 K8s 版本兼容
-
-**升级步骤**：
+**执行流程**（`EnsureAgentUpgrade` → `upgradeBKEAgentViaSSH`）：
 
 ```
-对每个节点：
-1. 标记节点为 ContainerdUpgrading
-2. 停止 kubelet（避免 Pod 重启）
-3. 停止 containerd
-4. 备份当前 containerd 二进制和配置
-5. 下载新版本 containerd 二进制
-6. 更新 containerd 配置文件（sandbox_image 等）
-7. 启动 containerd
-8. 验证 containerd 健康（crictl info）
-9. 启动 kubelet
-10. 验证节点 Ready
-11. 标记节点为 ContainerdUpgraded
+1. 获取所有节点（BKENodes）
+2. 解析目标版本（VersionContext.GetTarget("bkeagent")）
+3. SSH 发现每个节点的 CPU 架构（amd64/arm64）
+4. 从 HTTP 制品仓库下载对应架构的 bkeagent 二进制
+5. SSH 推送二进制到每个节点
+6. Ping 验证升级后的 Agent 响应
+7. Master 节点失败：立即返回错误（阻塞）
+   Worker 节点失败：记录失败数量，不阻塞
 ```
 
-**回滚步骤**：
+### 6.2 containerd 升级
+
+**执行方式**：ENV 命令（`NewConatinerdReset` + `NewConatinerdRedeploy`）
+
+**与 master/worker/etcd 的区别**：不使用 `Upgrade` CR 发送 `Kubeadm` 命令，而是使用 `ENV` 命令批量操作多节点
+
+**执行流程**（`EnsureContainerdUpgrade` → `rolloutContainerd`）：
 
 ```
-对每个节点：
-1. 停止 kubelet
-2. 停止 containerd
-3. 恢复备份的 containerd 二进制和配置
-4. 启动 containerd
-5. 启动 kubelet
-6. 验证节点 Ready
+1. 同步目标版本到 BKECluster.Spec（SyncUpgradeTargetsToClusterSpec）
+2. 解析目标版本（VersionContext.GetTarget("containerd")）
+3. 筛选需要升级的节点（GetNeedUpgradeContainerdNodesWithBKENodes）
+4. 第一阶段: NewConatinerdReset（ENV 命令）
+   └─ 批量重置 containerd（停止 + 清理 + 配置更新）
+   └─ 包含 sandbox_image 更新、镜像仓库证书等
+5. 第二阶段: NewConatinerdRedeploy（ENV 命令）
+   └─ 批量重新部署 containerd（安装新版本 + 启动）
+6. 等待命令完成（2s 轮询，5min 超时）
+7. 更新 BKECluster.Status.ContainerdVersion = targetVersion
 ```
 
-**工作量分解**：
+### 6.3 etcd 升级
 
-| 任务 | 说明 | 工作量 |
-|------|------|--------|
-| containerd 升级脚本开发 | 编写 containerd 升级/回滚脚本 | 2 天 |
-| 配置渲染适配 | 适配不同版本的 containerd 配置模板 | 1 天 |
-| CRI 兼容性测试 | 验证每个版本的 CRI 接口兼容性 | 2 天 |
-| 滚动升级逻辑 | 实现节点级滚动升级和失败处理 | 2 天 |
-| 集成测试 | containerd 升级与 K8s 升级的集成测试 | 2 天 |
-| **小计** | - | **9 天** |
+**执行方式**：`Upgrade` CR → BKEAgent 执行 `Kubeadm UpgradeEtcd` 内置命令
 
-### 3.2 etcd 升级方案
-
-**升级范围**：v3.5.18 → v3.5.19 → v3.5.20
-
-**升级策略**：
-- **滚动升级**：逐节点升级，保持 etcd 集群可用
-- **数据备份**：每个节点升级前备份 etcd 数据
-- **健康检查**：每个节点升级后验证 etcd 健康
-
-**升级步骤**：
+**执行流程**（`EnsureEtcdUpgrade` → `rolloutUpgrade`）：
 
 ```
-对每个 etcd 节点：
-1. 标记节点为 EtcdUpgrading
-2. 备份 etcd 数据（etcdctl snapshot save）
-3. 备份当前 etcd Static Pod manifest 文件
-4. 拉取新版本 etcd 镜像（crictl pull）
-5. 更新 etcd Static Pod manifest（镜像版本）
-6. 等待 Kubelet 检测文件变化，重建 etcd Pod
-7. 验证 etcd 健康（etcdctl endpoint health）
-8. 验证 etcd 版本（etcdctl --version）
-9. 标记节点为 EtcdUpgraded
-10. 等待 etcd 集群同步完成
+1. 筛选 etcd 节点（跳过 BKEAgent 未就绪的节点）
+2. 确定备份节点（etcdNodes[0]）
+3. 逐节点滚动升级（阻塞式，失败则停止）:
+   a. 标记节点状态为 EtcdUpgrading
+   b. 同步目标版本到 BKECluster.Spec
+   c. 创建 Upgrade Command CR:
+      ├─ Phase: UpgradeEtcd
+      ├─ EtcdVersion: v3.5.19（从 VersionContext 获取）
+      ├─ BackUpEtcd: true（仅备份节点）
+      └─ NodeSelector: 单节点 IP
+   d. BKEAgent 接收命令，执行 Kubeadm UpgradeEtcd
+   e. 等待命令完成（2s 轮询，5min 超时）
+   f. 等待 etcd 健康检查:
+      ├─ 轮询 etcd Static Pod 状态（Running + Ready）
+      ├─ 从容器镜像 tag 提取版本号
+      └─ 与目标版本比较（etcdVersionsMatch，去除 v 前缀后比较）
+   g. 失败: 标记 EtcdUpgradeFailed，阻塞
+   h. 成功: 标记 EtcdUpgrading（"Upgrading success"）
+4. 更新 BKECluster.Status.EtcdVersion = targetVersion
 ```
 
-**回滚步骤**：
+### 6.4 控制面组件升级
+
+**执行方式**：`Upgrade` CR → BKEAgent 执行 `Kubeadm UpgradeControlPlane` 内置命令
+
+**升级范围**：apiserver、controller-manager、scheduler（作为控制面单元统一升级）
+
+**执行流程**（`EnsureMasterUpgrade` → `rolloutUpgrade`）：
 
 ```
-对每个 etcd 节点：
-1. 恢复备份的 manifest 文件（旧版本镜像）
-2. 等待 Kubelet 重建 etcd Pod
-3. 恢复 etcd 数据（如果数据格式不兼容，从 snapshot 恢复）
-4. 验证 etcd 健康
+1. 设置 DeployAction annotation（DeployActionK8sUpgrade）
+2. 同步目标版本到 BKECluster.Spec（syncLegacyTargetKubernetesVersion）
+3. 筛选需要升级的 Master 节点:
+   ├─ 获取 BKENodes，过滤 Master 角色
+   ├─ 跳过 BKEAgent 未就绪的节点
+   └─ 跳过 kubelet 版本已匹配目标版本的节点（读取 Node.Status.NodeInfo.KubeletVersion）
+4. 确定 etcd 备份节点（第一个 etcd 节点）
+5. 为 etcd 节点设置 EtcdAdvertiseClientUrlsAnnotation
+6. 逐节点滚动升级（阻塞式，失败则停止）:
+   a. 获取远端 Node 资源
+   b. 跳过 kubelet 版本已匹配的节点
+   c. 标记节点状态为 NodeUpgrading
+   d. 创建 Upgrade Command CR:
+      ├─ Phase: UpgradeControlPlane
+      ├─ BackUpEtcd: true（仅备份节点）
+      └─ NodeSelector: 单节点 IP
+   e. BKEAgent 执行 Kubeadm UpgradeControlPlane:
+      ├─ 升级 kubelet 二进制
+      ├─ 更新 Static Pod manifest（apiserver/controller-manager/scheduler 镜像版本）
+      └─ Kubelet 自动重建 Static Pod
+   f. 等待命令完成（2s 轮询，5min 超时）
+   g. 等待节点健康检查:
+      ├─ 轮询 Node 状态（2s 间隔，5min 超时）
+      └─ 验证 Node Ready + KubeletVersion 匹配目标版本
+   h. 失败: 标记 NodeUpgradeFailed，阻塞
+   i. 成功: 标记 NodeNotReady（"Upgrading success"）
+7. 更新 BKECluster.Status.KubernetesVersion = targetVersion
+8. 更新 addon 版本（kubectl 版本对齐）
 ```
 
-**工作量分解**：
+### 6.5 kubelet（Worker）升级
 
-| 任务 | 说明 | 工作量 |
-|------|------|--------|
-| etcd 升级脚本开发 | 编写 etcd 升级/回滚/备份脚本 | 2 天 |
-| 数据格式兼容性验证 | 验证 etcd 数据格式跨版本兼容性 | 2 天 |
-| 滚动升级逻辑 | 实现 etcd 集群滚动升级和失败处理 | 2 天 |
-| 健康检查开发 | 实现 etcd 健康检查和版本验证 | 1 天 |
-| 集成测试 | etcd 升级与 K8s 升级的集成测试 | 2 天 |
-| **小计** | - | **9 天** |
+**执行方式**：`Upgrade` CR → BKEAgent 执行 `Kubeadm UpgradeWorker` 内置命令
 
-### 3.3 控制面组件升级方案
+**与 Master 升级的关键区别**：非阻塞（失败继续下一个节点），需要 drain 节点
 
-**升级范围**：
-- apiserver: v1.34 → v1.35 → v1.36
-- controller-manager: v1.34 → v1.35 → v1.36
-- scheduler: v1.34 → v1.35 → v1.36
-
-**升级策略**：
-- **滚动升级**：逐 master 节点升级，保持控制面可用
-- **Static Pod 方式**：通过替换 manifest 文件触发 Kubelet 重启 Pod
-- **API 兼容性**：升级前扫描废弃 API，升级后验证 API 可用
-
-**升级步骤**：
+**执行流程**（`EnsureWorkerUpgrade` → `rolloutUpgrade`）：
 
 ```
-对每个 master 节点：
-1. 标记节点为 MasterUpgrading
-2. 备份 etcd 数据（如果是 etcd 节点）
-3. 备份当前 Static Pod manifest 文件（apiserver, controller-manager, scheduler）
-4. 拉取新版本 K8s 镜像（kube-apiserver, kube-controller-manager, kube-scheduler）
-5. 更新 Static Pod manifest（镜像版本）
-6. 等待 Kubelet 检测文件变化，逐个重建 Static Pod
-7. 验证 apiserver 健康（kubectl get --raw=/healthz）
-8. 验证 controller-manager 健康
-9. 验证 scheduler 健康
-10. 验证节点 Ready
-11. 标记节点为 MasterUpgraded
+1. 设置 DeployAction annotation
+2. 同步目标版本到 BKECluster.Spec
+3. 筛选需要升级的 Worker 节点:
+   ├─ 获取 BKENodes，过滤 Worker 角色
+   ├─ 跳过 BKEAgent 未就绪的节点
+   └─ 跳过 kubelet 版本已匹配的节点
+4. 创建 drainer（force=true, ignore-daemonsets, delete-emptydir, 20s 超时）
+5. 逐节点滚动升级（非阻塞，失败继续）:
+   a. 获取远端 Node 资源
+   b. 跳过 kubelet 版本已匹配的节点
+   c. 标记节点状态为 NodeUpgrading
+   d. drain 节点（驱逐 Pod）
+   e. 创建 Upgrade Command CR:
+      ├─ Phase: UpgradeWorker
+      ├─ BackUpEtcd: false
+      └─ NodeSelector: 单节点 IP
+   f. BKEAgent 执行 Kubeadm UpgradeWorker:
+      └─ 升级 kubelet 二进制 + 配置
+   g. 等待命令完成（2s 轮询，5min 超时）
+   h. 等待节点健康检查（2s 间隔，5min 超时）
+   i. 失败: 标记 NodeUpgradeFailed，记录失败节点，继续下一个
+   j. 成功: 标记 NodeNotReady
+   k. uncordon 节点
+6. 如果有失败节点，返回错误（Reconcile 重试时跳过已升级节点）
 ```
 
-**API 废弃处理**：
+### 6.6 kube-proxy / coredns 升级
 
-```
-升级前（PreCheck）：
-1. 扫描集群中使用的废弃 API
-2. 生成废弃 API 使用报告
-3. 如果存在废弃 API，提示用户迁移
+**执行方式**：YAML 组件类型，通过 YamlInstaller SSA Apply 应用完整资源清单
 
-升级后（PostCheck）：
-1. 验证新 API 可用
-2. 验证旧 API 已移除（如果已废弃）
-3. 验证自定义资源正常
-```
-
-**工作量分解**：
-
-| 任务 | 说明 | 工作量 |
-|------|------|--------|
-| 控制面升级脚本开发 | 编写控制面升级/回滚脚本 | 2 天 |
-| API 废弃扫描工具 | 开发废弃 API 扫描和报告工具 | 3 天 |
-| 滚动升级逻辑 | 实现控制面滚动升级和失败处理 | 2 天 |
-| 健康检查开发 | 实现控制面组件健康检查 | 1 天 |
-| 集成测试 | 控制面升级与 API 兼容性测试 | 3 天 |
-| **小计** | - | **11 天** |
-
-### 3.4 kubelet 升级方案
-
-**升级范围**：v1.34 → v1.35 → v1.36
-
-**升级策略**：
-- **滚动升级**：逐 worker 节点升级，不影响业务
-- **drain 优先**：升级前 drain 节点，驱逐 Pod
-- **倾斜策略**：确保 kubelet 不比 apiserver 新
-
-**升级步骤**：
-
-```
-对每个 worker 节点：
-1. 标记节点为 WorkerUpgrading
-2. drain 节点（kubectl drain --ignore-daemonsets --delete-emptydir-data）
-3. 停止 kubelet
-4. 备份当前 kubelet 二进制和配置
-5. 下载新版本 kubelet 二进制
-6. 更新 kubelet 配置文件（如需要）
-7. 启动 kubelet
-8. 验证 kubelet 版本（kubelet --version）
-9. 验证节点 Ready（kubectl get node）
-10. uncordon 节点（kubectl uncordon）
-11. 验证 Pod 重新调度
-12. 标记节点为 WorkerUpgraded
-```
-
-**工作量分解**：
-
-| 任务 | 说明 | 工作量 |
-|------|------|--------|
-| kubelet 升级脚本开发 | 编写 kubelet 升级/回滚脚本 | 2 天 |
-| drain/uncordon 逻辑 | 实现节点 drain 和 uncordon 逻辑 | 1 天 |
-| 滚动升级逻辑 | 实现 worker 滚动升级和失败处理 | 2 天 |
-| 倾斜策略验证 | 验证 kubelet 与 apiserver 版本倾斜策略 | 1 天 |
-| 集成测试 | kubelet 升级与业务 Pod 兼容性测试 | 2 天 |
-| **小计** | - | **8 天** |
-
-### 3.5 kube-proxy / coredns 升级方案
-
-**升级范围**：
-- kube-proxy: v1.34 → v1.35 → v1.36
-- coredns: 根据 K8s 版本配套升级
-
-**升级策略**：
-- **声明式组件管理**：通过 ComponentVersion (type: yaml/helm) 定义完整资源清单，纳入 DAG 统一调度
-- **YamlInstaller 升级**：kube-proxy/coredns 通过 SSA Apply 应用新版本清单，自动处理字段变更和资源裁剪
-- **完整清单替换**：不仅更新镜像版本，还更新 ConfigMap、RBAC、Service 等关联资源
-
-**升级步骤**：
+**执行流程**（DAG Scheduler → `executeManifest`）：
 
 ```
 kube-proxy (type: yaml):
-1. 加载目标版本 ComponentVersion（bke-manifests/kube-proxy/v1.36.0/）
-2. 渲染完整资源清单（DaemonSet + ConfigMap + RBAC + Service）
+1. 从 ManifestStore 加载 ComponentVersion（bke-manifests/kube-proxy/v1.36.0/）
+2. 检查是否需要升级（manifestNeedsUpgrade: 比较当前 vs 目标镜像 tag）
 3. YamlInstaller.Apply:
-   a. 按依赖顺序应用资源（RBAC → ConfigMap → DaemonSet）
-   b. 使用 SSA Apply 更新 DaemonSet（镜像版本 + 配置变更）
-   c. Prune 不再需要的旧版本资源
-4. 等待 DaemonSet 滚动更新完成
-5. 健康检查:
-   a. 验证 kube-proxy Pod Ready
-   b. 验证 iptables/ipvs 规则正常
-   c. 验证 Service ClusterIP 转发正常
+   a. 加载完整资源清单（DaemonSet + ConfigMap + RBAC）
+   b. 按文件名排序应用（01-crd → 02-rbac → 03-configmap → 04-daemonset）
+   c. 使用 SSA Apply 更新资源（ServerSideApply 策略）
+   d. Prune 不再需要的旧版本资源（按 label selector）
+4. 健康检查（如果 ComponentVersion.spec.yaml.healthCheck.enabled）:
+   a. PodReady: 验证 kube-proxy Pod Ready
+   b. EndpointReady: 验证 Service Endpoint 就绪
 
-coredns (type: yaml/helm):
-1. 加载目标版本 ComponentVersion（bke-manifests/coredns/v1.11.x/）
-2. 渲染完整资源清单（Deployment + ConfigMap + Service + RBAC）
-3. YamlInstaller.Apply:
-   a. 按依赖顺序应用资源（RBAC → ConfigMap → Deployment → Service）
-   b. 使用 SSA Apply 更新 Deployment（镜像版本 + CoreDNS 配置变更）
-   c. Prune 不再需要的旧版本资源
-4. 等待 Deployment 滚动更新完成
-5. 健康检查:
-   a. 验证 coredns Pod Ready
-   b. 验证 DNS 解析正常（nslookup kubernetes.default）
-   c. 验证外部域名解析正常
+coredns (type: yaml):
+1. 从 ManifestStore 加载 ComponentVersion（bke-manifests/coredns/v1.11.x/）
+2. 同上流程，应用 Deployment + ConfigMap + Service + RBAC
+3. 健康检查: 验证 coredns Pod Ready + DNS 解析正常
 ```
 
-**与镜像替换方案的区别**：
+### 6.7 升级组件清单汇总
 
-| 维度 | 仅更新镜像版本（非通用） | 声明式完整清单替换（通用） |
-|------|----------------------|------------------------|
-| **升级粒度** | 仅镜像 tag | 镜像 + ConfigMap + RBAC + Service |
-| **配置变更** | 不处理 | SSA Apply 自动处理字段变更 |
-| **资源裁剪** | 不支持 | Prune 自动清理废弃资源 |
-| **版本追踪** | 无 | ComponentVersion 生命周期追踪 |
-| **回滚能力** | 仅回滚镜像 | 回滚完整清单 |
-| **DAG 集成** | 不集成 | 纳入 DAG 统一调度，支持依赖管理 |
+| 组件 | 执行模式 | 执行方式 | 滚动策略 | 失败处理 |
+|------|---------|---------|---------|---------|
+| **pre-upgrade-resources** | inline | PhaseHandler | 一次性 | 阻塞（FailFast） |
+| **bkeagent** | inline | SSH 推送二进制 | 全节点 | Master 阻塞，Worker 继续 |
+| **containerd** | inline | ENV 命令（reset + redeploy） | 批量节点 | 阻塞 |
+| **etcd** | inline | Upgrade CR → Kubeadm UpgradeEtcd | 逐节点阻塞 | 阻塞 |
+| **kubernetes-master** | inline | Upgrade CR → Kubeadm UpgradeControlPlane | 逐节点阻塞 | 阻塞 |
+| **kubernetes-worker** | inline | Upgrade CR → Kubeadm UpgradeWorker | 逐节点非阻塞 | 继续（记录失败） |
+| **kube-proxy** | manifest | YamlInstaller SSA Apply | DaemonSet 滚动 | 阻塞 |
+| **coredns** | manifest | YamlInstaller SSA Apply | Deployment 滚动 | 阻塞 |
 
-**工作量分解**：
+## 7. 升级执行流程
 
-| 任务 | 说明 | 工作量 |
-|------|------|--------|
-| ComponentVersion 清单编写 | 编写 kube-proxy/coredns 各版本的完整 YAML 清单 | 1.5 天 |
-| ConfigMap 渲染适配 | 适配不同 K8s 版本的 kube-proxy/coredns 配置模板 | 1 天 |
-| SSA Apply + Prune 逻辑 | 实现 YamlInstaller 的 SSA Apply 和 Prune 逻辑 | 1 天 |
-| 健康检查开发 | 实现 kube-proxy/coredns 健康检查（Pod Ready + 功能验证） | 1 天 |
-| 集成测试 | DNS 解析、网络连通性、资源裁剪测试 | 1.5 天 |
-| **小计** | - | **6 天** |
-
----
-
-## 4. 升级流程设计
-
-### 4.1 升级前准备（PreCheck）
-
-**检查项清单**：
-
-| 检查项 | 检查内容 | 阻断条件 |
-|--------|---------|---------|
-| **集群健康** | 所有节点 Ready，所有 Pod Running | 有 NotReady 节点或 Failed Pod |
-| **etcd 健康** | etcd 集群健康，无告警 | etcd 集群不健康 |
-| **API 兼容性** | 扫描废弃 API 使用 | 存在未迁移的废弃 API |
-| **资源充足** | CPU/内存/磁盘充足 | 资源不足 |
-| **备份验证** | etcd 备份存在且可恢复 | 备份不存在或不可恢复 |
-| **版本兼容性** | 验证升级路径合法 | 升级路径不存在或被阻断 |
-
-**PreCheck 执行流程**：
+### 7.1 触发机制
 
 ```
-1. 用户触发升级（修改 ClusterVersion.Spec.DesiredVersion）
-2. BKECluster Controller 检测到版本变更
-3. 加载目标 ReleaseImage
-4. 执行 PreCheck DAG
-   ├─ Batch 1: [cluster-health-check]
-   ├─ Batch 2: [etcd-health-check]
-   ├─ Batch 3: [api-deprecation-scan]
-   ├─ Batch 4: [resource-check]
-   ├─ Batch 5: [backup-verification]
-   └─ Batch 6: [upgrade-path-validation]
-5. 生成 PreCheck 报告
-6. 如果有阻断项，停止升级并报告
-7. 如果全部通过，继续升级流程
+1. 用户修改 ClusterVersion.Spec.DesiredVersion = v1.36.0
+2. ClusterVersionReconciler 检测到版本变更
+3. 校验 UpgradePath（v1.34 → v1.35 路径合法、未被阻断）
+4. 设置 annotation: cvo.openfuyao.cn/upgrade-ready = v1.35.0（第一跳）
+5. BKEClusterReconciler 检测到 annotation
 ```
 
-**工作量分解**：
-
-| 任务 | 说明 | 工作量 |
-|------|------|--------|
-| PreCheck 框架开发 | 实现 PreCheck 执行引擎和报告生成 | 2 天 |
-| 集群健康检查 | 实现节点和 Pod 健康检查 | 1 天 |
-| etcd 健康检查 | 实现 etcd 集群健康检查 | 1 天 |
-| API 废弃扫描 | 开发废弃 API 扫描工具 | 3 天 |
-| 资源检查 | 实现 CPU/内存/磁盘检查 | 1 天 |
-| 备份验证 | 实现 etcd 备份验证 | 1 天 |
-| 版本兼容性验证 | 实现升级路径验证 | 1 天 |
-| 集成测试 | PreCheck 流程端到端测试 | 2 天 |
-| **小计** | - | **12 天** |
-
-### 4.2 升级执行
-
-**单跳升级执行流程（v1.34 → v1.35 示例）**：
+### 7.2 DAG 执行流程（单跳）
 
 ```
-1. 加载 ReleaseImage v1.35.0
-2. 构建升级 DAG
-3. 执行升级 DAG
-   ├─ Batch 1: [pre-upgrade-resources]
-   │   └─ 创建升级所需的 CRD/RBAC 资源
-   │
-   ├─ Batch 2: [bkeagent]
-   │   └─ 升级所有节点的 bkeagent
-   │
-   ├─ Batch 3: [containerd]
-   │   └─ 滚动升级所有节点的 containerd
-   │   └─ 每个节点：停止 → 备份 → 升级 → 启动 → 验证
-   │
-   ├─ Batch 4: [etcd]
-   │   └─ 滚动升级 etcd 节点
-   │   └─ 每个节点：备份 → 停止 → 升级 → 启动 → 健康检查
-   │
-   ├─ Batch 5: [kubernetes-master]
-   │   └─ 滚动升级 master 节点
-   │   └─ 每个节点：drain → 停止 → 升级 → 启动 → 健康检查 → uncordon
-   │
-   ├─ Batch 6: [kubernetes-worker]
-   │   └─ 滚动升级 worker 节点
-   │   └─ 每个节点：drain → 停止 → 升级 → 启动 → 健康检查 → uncordon
-   │
-   ├─ Batch 7: [kube-proxy, coredns]
-   │   └─ 更新 kube-proxy DaemonSet
-   │   └─ 更新 coredns Deployment
-   │
-   └─ Batch 8: [post-upgrade-verification]
-       └─ 执行 PostCheck（版本验证、集群健康）
-4. 更新 ClusterVersion.Status.CurrentVersion = v1.35.0
-5. 记录升级历史
+BKEClusterReconciler.executeUpgradeDAG():
+
+1. 解析 hop 目标版本（从 annotation 读取）
+2. 解析 ReleaseImage CR:
+   ├─ 通过 clusterversion.ResolveReleaseImageForVersion 获取
+   └─ 验证 Status.Phase == Valid（否则 requeue 30s）
+3. 解析 OCI bundle（releaseStore.ResolveRelease）
+4. 解析当前版本 bundle（用于构建 VersionContext.Current）
+5. 构建 VersionContext:
+   ├─ Target: 从目标 bundle 的 ReleaseImage.Spec.Upgrade.Components
+   └─ Current: 从当前 bundle 或 BKECluster.Status
+6. 同步目标版本到 BKECluster.Spec（SyncUpgradeTargetsToClusterSpec）
+7. 构建 DAG（BuildDAGFromBundle + BundleDependencyResolver）
+8. 初始化 DeclarativeUpgradeStatus（重置完成列表）
+9. 构建 ComponentFactory（注册 inline handler）
+10. 构建 Scheduler:
+    ├─ InlineRunner: InlinePhaseRunnerAdapter（桥接 PhaseRunner）
+    ├─ ManifestStore: BundleStore
+    ├─ ManifestApplier: ClusterApplier
+    └─ MaxParallelPerBatch: 8
+11. Scheduler.ExecuteDAG():
+    for each batch in dag.TopologicalBatches():
+      executeBatchParallel (errgroup + semaphore):
+        for each component in batch:
+          ├─ shouldSkipComponent: 跳过已完成的（DeclarativeUpgradeStatus.IsCompleted）
+          ├─ componentNeedsUpgrade: VersionContext.NeedsUpgrade（current != target）
+          ├─ 分发到执行器:
+          │   ├─ inline: InlineComponentExecutor → PhaseRunner → Phase.Execute()
+          │   └─ manifest: YamlComponentExecutor → YamlInstaller.Apply()
+          └─ 更新组件状态（markCompleted / markFailed）
+      persistBatchResults: 更新 DeclarativeUpgradeStatus
+      如果 failFast: 停止执行
+12. 成功: completeDeclarativeUpgrade
+    ├─ 清除 upgrade-ready annotation
+    └─ clusterversion.CompleteUpgradeHop
+13. 失败: handleDeclarativeUpgradeDAGFailure
+    ├─ 设置 ClusterUpgradeFailed
+    ├─ 记录 LastError
+    └─ StatusManager 判断重试预算（10 次后 abort）
 ```
 
-**多跳升级编排**：
+### 7.3 版本比较机制
 
-```
-用户触发升级（DesiredVersion = v1.36.0）
-  │
-  ├─ Hop 1: v1.34 → v1.35
-  │   ├─ 执行 PreCheck
-  │   ├─ 执行升级 DAG
-  │   ├─ 执行 PostCheck
-  │   └─ 更新 CurrentVersion = v1.35.0
-  │
-  ├─ 自动等待（可配置间隔，默认 5 分钟）
-  │
-  └─ Hop 2: v1.35 → v1.36
-      ├─ 执行 PreCheck
-      ├─ 执行升级 DAG
-      ├─ 执行 PostCheck
-      └─ 更新 CurrentVersion = v1.36.0
-```
+```go
+// VersionContext 使用简单字符串比较，非语义化版本比较
+func (vc *VersionContext) NeedsUpgrade(name string) bool {
+    target := vc.Target[name]
+    if target == "" { return false }  // 空目标 = 不需要升级
+    return vc.Current[name] != target // 字符串不等 = 需要升级
+}
 
-### 4.3 升级后验证（PostCheck）
-
-**检查项清单**：
-
-| 检查项 | 检查内容 | 阻断条件 |
-|--------|---------|---------|
-| **版本验证** | 所有组件版本正确 | 版本不匹配 |
-| **集群健康** | 所有节点 Ready，所有 Pod Running | 有 NotReady 节点或 Failed Pod |
-| **etcd 健康** | etcd 集群健康 | etcd 集群不健康 |
-| **API 可用** | 核心 API 可用 | API 不可用 |
-| **DNS 正常** | DNS 解析正常 | DNS 解析失败 |
-| **应用健康** | 关键应用正常运行 | 关键应用异常 |
-
-**PostCheck 执行流程**：
-
-```
-1. 升级 DAG 执行完成
-2. 执行 PostCheck DAG
-   ├─ Batch 1: [component-version-check]
-   ├─ Batch 2: [cluster-health-check]
-   ├─ Batch 3: [etcd-health-check]
-   ├─ Batch 4: [api-availability-check]
-   ├─ Batch 5: [dns-resolution-check]
-   └─ Batch 6: [application-health-check]
-3. 生成 PostCheck 报告
-4. 如果有失败项，触发告警
-5. 更新 ClusterVersion.Status.Phase = Ready
+// 决策逻辑
+func Decide(vc *VersionContext, name string) Decision {
+    if vc == nil { return DecisionUpgrade }      // nil VC = 不阻塞
+    if vc.Current[name] == vc.Target[name] { return DecisionSkip }
+    if vc.Target[name] == "" { return DecisionSkip }
+    return DecisionUpgrade
+}
 ```
 
-**工作量分解**：
+### 7.4 PreCheck / PostCheck
 
-| 任务 | 说明 | 工作量 |
-|------|------|--------|
-| PostCheck 框架开发 | 实现 PostCheck 执行引擎和报告生成 | 2 天 |
-| 版本验证 | 实现组件版本验证 | 1 天 |
-| 集群健康检查 | 实现节点和 Pod 健康检查 | 1 天 |
-| etcd 健康检查 | 实现 etcd 集群健康检查 | 1 天 |
-| API 可用性检查 | 实现核心 API 可用性检查 | 1 天 |
-| DNS 解析检查 | 实现 DNS 解析检查 | 1 天 |
-| 应用健康检查 | 实现关键应用健康检查 | 1 天 |
-| 集成测试 | PostCheck 流程端到端测试 | 2 天 |
-| **小计** | - | **10 天** |
+引用 KEP-5-2 的 CheckPolicy CRD 设计：
 
----
+| 检查阶段 | 检查项 | 阻断条件 |
+|---------|--------|---------|
+| **PreCheck** | 集群健康、etcd 健康、API 兼容性、资源充足、备份验证、升级路径合法 | 有阻断项则停止升级 |
+| **PostCheck** | 版本验证、集群健康、etcd 健康、API 可用、DNS 正常、应用健康 | 有失败项则触发告警 |
 
-## 5. 回滚策略
+详见 `kep5-2-precheck-postcheck-design-v2.md`。
 
-### 5.1 回滚范围
+## 8. 回滚策略
+
+### 8.1 回滚范围
 
 **仅支持集群级回滚**：
-- 不支持组件级回滚（如仅回滚 containerd）
-- 不支持节点级回滚（如仅回滚单个节点）
+- 不支持组件级回滚
+- 不支持节点级回滚
 - 回滚时整个集群回退到该跳的起始版本
 
-### 5.2 回滚触发条件
+### 8.2 回滚触发
 
-| 场景 | 触发方式 | 回滚范围 |
-|------|---------|---------|
-| **升级过程中失败** | 自动触发（FailurePolicy=Rollback） | 回滚到该跳的起始版本 |
-| **升级完成后发现问题** | 用户手动触发（修改 DesiredVersion） | 回滚到指定版本 |
+| 场景 | 触发方式 | 说明 |
+|------|---------|------|
+| **升级过程中失败** | 自动（FailurePolicy） | StatusManager 10 次重试后设置终端 Failed 状态 |
+| **升级完成后发现问题** | 手动（修改 DesiredVersion 回退） | 回滚到指定版本 |
 
-### 5.3 回滚执行流程
+### 8.3 回滚执行
 
-**单跳回滚（v1.35 回滚到 v1.34）**：
-
-```
-1. 检测到升级失败或用户触发回滚
-2. 加载源版本 ReleaseImage v1.34.0
-3. 构建回滚 DAG（升级 DAG 逆序）
-4. 执行回滚 DAG
-   ├─ Batch 1: [kube-proxy, coredns]
-   │   └─ 回滚 kube-proxy/coredns 到 v1.34 版本
-   │
-   ├─ Batch 2: [kubernetes-worker]
-   │   └─ 滚动回滚 worker 节点 kubelet
-   │
-   ├─ Batch 3: [kubernetes-master]
-   │   └─ 滚动回滚 master 节点控制面组件
-   │
-   ├─ Batch 4: [etcd]
-   │   └─ 滚动回滚 etcd（从备份恢复数据）
-   │
-   ├─ Batch 5: [containerd]
-   │   └─ 滚动回滚 containerd
-   │
-   └─ Batch 6: [bkeagent]
-       └─ 回滚 bkeagent
-5. 更新 ClusterVersion.Status.CurrentVersion = v1.34.0
-6. 执行 PostCheck 验证回滚成功
-```
-
-**多跳回滚（v1.36 回滚到 v1.34）**：
+回滚通过修改 `ClusterVersion.Spec.DesiredVersion` 回退触发，复用升级 DAG（VersionContext 的 `target < current` 触发回滚语义）：
 
 ```
-用户触发回滚（DesiredVersion = v1.34.0）
-  │
-  ├─ Hop 2 回滚: v1.36 → v1.35
-  │   ├─ 执行回滚 DAG
-  │   └─ 更新 CurrentVersion = v1.35.0
-  │
-  └─ Hop 1 回滚: v1.35 → v1.34
-      ├─ 执行回滚 DAG
-      └─ 更新 CurrentVersion = v1.34.0
+单跳回滚（v1.35 → v1.34）:
+1. 用户修改 DesiredVersion = v1.34.0
+2. ClusterVersionReconciler 设置 upgrade-ready = v1.34.0
+3. BKEClusterReconciler 执行 executeUpgradeDAG:
+   ├─ 加载 ReleaseImage v1.34.0
+   ├─ VersionContext: Current=v1.35, Target=v1.34
+   ├─ DAG 执行（各组件 current != target，触发"升级"）
+   └─ 实际是降级操作（各执行器通过版本比较判断方向）
+4. etcd 数据从升级前备份恢复
+5. 更新 CurrentVersion = v1.34.0
+
+多跳回滚（v1.36 → v1.34）:
+  Hop 2 回滚: v1.36 → v1.35
+  Hop 1 回滚: v1.35 → v1.34
 ```
 
-### 5.4 etcd 数据回滚
+### 8.4 etcd 数据回滚
 
-**关键问题**：etcd 数据格式可能跨版本不兼容
+- **升级前备份**：每个 etcd 节点升级前通过 `etcdctl snapshot save` 备份
+- **回滚时恢复**：如果 etcd 数据格式不兼容，从 snapshot 恢复
+- **数据丢失风险**：升级后产生的数据在回滚时会丢失
 
-**回滚策略**：
-1. **升级前备份**：每个节点升级前备份 etcd 数据
-2. **回滚时恢复**：如果 etcd 数据格式不兼容，从备份恢复
-3. **数据丢失风险**：升级后产生的数据在回滚时会丢失
+## 9. 可观测性
 
-**工作量分解**：
+### 9.1 状态追踪
 
-| 任务 | 说明 | 工作量 |
-|------|------|--------|
-| 回滚框架开发 | 实现回滚执行引擎 | 2 天 |
-| 回滚脚本开发 | 编写各组件回滚脚本 | 3 天 |
-| etcd 数据恢复 | 实现 etcd 数据备份恢复逻辑 | 2 天 |
-| 多跳回滚编排 | 实现多跳回滚的自动编排 | 2 天 |
-| 回滚测试 | 回滚场景端到端测试 | 3 天 |
-| **小计** | - | **12 天** |
+```bash
+# 查询集群升级状态
+kubectl get bkecluster my-cluster -o jsonpath='{.status.declarativeUpgrade}'
+# 输出:
+# {
+#   "targetVersion": "v1.35.0",
+#   "completed": ["pre-upgrade-resources", "bkeagent", "containerd"],
+#   "lastError": ""
+# }
 
----
+# 查询组件状态
+kubectl get bkecluster my-cluster -o jsonpath='{.status.clusterComponentStatuses}'
+# 输出:
+# {
+#   "etcd": {"phase": "Pending", "version": "v3.5.18"},
+#   "containerd": {"phase": "Installed", "version": "v1.7.22"}
+# }
+```
 
-## 6. 工作量详细评估
+### 9.2 事件与指标
 
-### 6.1 开发工作量
+| 类型 | 来源 | 说明 |
+|------|------|------|
+| **StateTransition events** | BKECluster Controller | 状态转换事件 |
+| **OperationStarted/Completed/Failed** | DAG Scheduler | 操作事件 |
+| **ComponentInstalled/Upgraded/Failed** | ComponentStatusUpdater | 组件事件 |
+| **bke_cluster_phase** | Prometheus | 集群状态指标 |
+| **bke_component_phase** | Prometheus | 组件状态指标 |
+
+## 10. 工作量评估
+
+### 10.1 开发工作量
 
 | 模块 | 任务 | 工作量（人天） |
 |------|------|---------------|
-| **containerd 升级** | 升级脚本、配置适配、CRI 兼容性、滚动升级、集成测试 | 9 |
-| **etcd 升级** | 升级脚本、数据兼容性、滚动升级、健康检查、集成测试 | 9 |
-| **控制面升级** | 升级脚本、API 废弃扫描、滚动升级、健康检查、集成测试 | 11 |
-| **kubelet 升级** | 升级脚本、drain 逻辑、滚动升级、倾斜策略、集成测试 | 8 |
-| **kube-proxy/coredns** | ComponentVersion 清单、ConfigMap 适配、SSA Apply/Prune、健康检查、集成测试 | 6 |
-| **PreCheck** | 框架开发、各项检查实现、集成测试 | 12 |
-| **PostCheck** | 框架开发、各项检查实现、集成测试 | 10 |
-| **回滚** | 框架开发、回滚脚本、etcd 恢复、多跳编排、测试 | 12 |
-| **ReleaseImage 定义** | 定义 v1.35/v1.36 两个版本的 ReleaseImage | 1.5 |
-| **UpgradePath 配置** | 配置升级路径和兼容性规则 | 1 |
-| **多跳升级编排** | 实现多跳升级的自动编排和错误处理 | 5 |
-| **小计** | - | **84.5 人天** |
+| **ReleaseImage 定义** | 定义 v1.35/v1.36 两个版本的 ReleaseImage + ComponentVersion | 3 |
+| **UpgradePath 配置** | 配置 v1.34→v1.35→v1.36 升级路径 + 兼容性规则 | 1 |
+| **bkeagent 升级适配** | 适配 v1.35/v1.36 版本的 bkeagent SSH 推送 | 2 |
+| **containerd 升级适配** | 适配 v1.7.22/v1.7.24 的 ENV 命令（reset + redeploy） | 3 |
+| **etcd 升级适配** | 适配 v3.5.19/v3.5.20 的 Upgrade CR + 健康检查 | 3 |
+| **控制面升级适配** | 适配 v1.35/v1.36 的 Upgrade CR + kubeadm 验证 | 4 |
+| **kubelet 升级适配** | 适配 v1.35/v1.36 的 Upgrade CR + drain/uncordon | 3 |
+| **kube-proxy/coredns 清单** | 编写各版本的完整 YAML 清单 + ConfigMap 适配 | 4 |
+| **PreCheck 适配** | 适配 KEP-5-2 CheckPolicy，增加 API 废弃扫描 | 5 |
+| **PostCheck 适配** | 适配版本验证 + 健康 + DNS + 应用检查 | 3 |
+| **多跳升级编排** | 验证 ClusterVersionReconciler 逐跳触发逻辑 | 3 |
+| **回滚验证** | 验证 VersionContext 回滚语义 + etcd 数据恢复 | 4 |
+| **小计** | - | **38 人天** |
 
-### 6.2 测试工作量
+### 10.2 测试工作量
 
 | 测试类型 | 测试内容 | 工作量（人天） |
 |---------|---------|---------------|
-| **单元测试** | 各模块单元测试 | 5 |
-| **集成测试** | 单跳升级集成测试（v1.34→v1.35, v1.35→v1.36） | 8 |
-| **E2E 测试** | 完整升级流程端到端测试（v1.34→v1.36） | 8 |
-| **回滚测试** | 各跳回滚场景测试 | 5 |
-| **兼容性测试** | 业务应用兼容性测试 | 5 |
-| **性能测试** | 升级过程性能影响测试 | 3 |
-| **压力测试** | 大规模集群升级压力测试 | 3 |
+| **单元测试** | 各组件版本比较、DAG 构建、依赖解析 | 5 |
+| **集成测试** | 单跳升级（v1.34→v1.35, v1.35→v1.36） | 8 |
+| **E2E 测试** | 完整升级流程（v1.34→v1.36，2 跳连续） | 8 |
+| **回滚测试** | 各跳回滚场景 | 5 |
+| **兼容性测试** | API 兼容性、业务应用兼容性 | 5 |
+| **性能测试** | 升级过程性能影响 | 3 |
+| **压力测试** | 大规模集群升级 | 3 |
 | **小计** | - | **37 人天** |
 
-### 6.3 文档工作量
+### 10.3 文档工作量
 
 | 文档类型 | 文档内容 | 工作量（人天） |
 |---------|---------|---------------|
@@ -694,55 +633,54 @@ coredns (type: yaml/helm):
 | **Release Notes** | 各版本 Release Notes | 1 |
 | **小计** | - | **8 人天** |
 
-### 6.4 总工作量汇总
+### 10.4 总工作量汇总
 
 | 类别 | 工作量（人天） | 工作量（人周） |
 |------|---------------|---------------|
-| **开发** | 84.5 | 16.9 |
+| **开发** | 38 | 7.6 |
 | **测试** | 37 | 7.4 |
 | **文档** | 8 | 1.6 |
-| **总计** | **129.5** | **25.9** |
+| **总计** | **83** | **16.6** |
 
 **按人员配置估算**：
-- 如果 2 人全职投入：约 13 周（3 个月）
-- 如果 3 人全职投入：约 9 周（2 个月）
-- 如果 4 人全职投入：约 6.5 周（1.5 个月）
+- 如果 2 人全职投入：约 8.5 周（2 个月）
+- 如果 3 人全职投入：约 5.5 周（1.5 个月）
+- 如果 4 人全职投入：约 4 周（1 个月）
 
----
+> **注意**：工作量基于现有声明式升级框架已实现 DAG 调度、Command CR、ENV 命令、SSH 推送等核心能力，本次工作主要是版本适配和测试验证。若框架能力需新建，工作量需相应增加。
 
-## 7. 风险与缓解措施
+## 11. 风险与缓解措施
 
-### 7.1 技术风险
+### 11.1 技术风险
 
 | 风险 | 影响 | 概率 | 缓解措施 |
 |------|------|------|---------|
-| **kubeadm 不支持逐版本升级** | 必须跳版本升级，风险高 | 低 | 提前验证 kubeadm 行为，准备跳版本方案 |
-| **etcd 数据格式不兼容** | etcd 升级失败，集群不可用 | 中 | 升级前备份，验证 etcd 版本兼容性，准备数据迁移脚本 |
+| **kubeadm 不支持逐版本升级** | 必须跳版本升级 | 低 | 提前验证 kubeadm 行为 |
+| **etcd 数据格式不兼容** | etcd 升级失败 | 中 | 升级前 snapshot 备份，验证版本兼容性 |
 | **API 废弃导致资源失效** | 升级后部分资源无法创建 | 高 | PreCheck 扫描废弃 API，提供迁移工具 |
-| **containerd CRI 不兼容** | kubelet 无法启动 | 中 | 验证 CRI 接口兼容性，准备回滚方案 |
-| **kubelet 倾斜策略违反** | kubelet 无法注册到 apiserver | 中 | 确保先升级 master 再升级 worker |
+| **containerd CRI 不兼容** | kubelet 无法启动 | 中 | 验证 CRI 接口兼容性 |
+| **kubelet 倾斜策略违反** | kubelet 无法注册 | 中 | 确保先升级 master 再升级 worker |
+| **BKEAgent 不可用** | 无法执行升级命令 | 中 | 升级前检查所有节点 BKEAgent Ready |
 
-### 7.2 运维风险
+### 11.2 运维风险
 
 | 风险 | 影响 | 概率 | 缓解措施 |
 |------|------|------|---------|
-| **升级时间过长** | 业务中断时间长 | 高 | 优化升级脚本，支持并行升级（多节点同时） |
+| **升级时间过长** | 业务中断时间长 | 高 | 优化升级脚本，Worker 支持并行 |
 | **回滚失败** | 无法恢复到稳定状态 | 中 | 充分测试回滚流程，准备手动恢复方案 |
-| **数据丢失** | 升级后产生的数据在回滚时丢失 | 高 | 升级前通知用户，避免在升级窗口期写入重要数据 |
+| **数据丢失** | 升级后数据在回滚时丢失 | 高 | 升级前通知用户，避免在升级窗口期写入重要数据 |
 
-### 7.3 业务风险
+### 11.3 业务风险
 
 | 风险 | 影响 | 概率 | 缓解措施 |
 |------|------|------|---------|
-| **业务 Pod 重启** | 业务短暂中断 | 高 | 升级前通知用户，选择业务低峰期升级 |
-| **DNS 短暂不可用** | 业务解析失败 | 中 | coredns 升级采用滚动更新，保持至少一个副本可用 |
-| **网络中断** | kube-proxy 升级导致网络中断 | 中 | kube-proxy 升级采用滚动更新，保持至少一个副本可用 |
+| **业务 Pod 重启** | 业务短暂中断 | 高 | Worker drain 时选择业务低峰期 |
+| **DNS 短暂不可用** | 业务解析失败 | 中 | coredns 滚动更新，保持至少一个副本可用 |
+| **网络中断** | kube-proxy 升级导致 | 中 | kube-proxy 滚动更新，保持至少一个副本可用 |
 
----
+## 12. 与工行协作计划
 
-## 8. 与工行协作计划
-
-### 8.1 协作事项
+### 12.1 协作事项
 
 | 事项 | 责任方 | 时间 | 交付物 |
 |------|--------|------|--------|
@@ -754,7 +692,7 @@ coredns (type: yaml/helm):
 | **确认回滚策略和 SLA** | 双方 | 9 月底 | 回滚策略文档 |
 | **生产环境升级** | 双方 | 10 月 | 升级完成报告 |
 
-### 8.2 里程碑计划
+### 12.2 里程碑计划
 
 ```
 8 月底 ──── 9 月中旬 ──── 9 月底 ──── 10 月中旬 ──── 10 月底
@@ -773,7 +711,7 @@ coredns (type: yaml/helm):
    │            │            │              │           ├─ 生产环境升级
 ```
 
-### 8.3 风险共担
+### 12.3 风险共担
 
 | 风险 | openFuyao 社区责任 | 工行责任 |
 |------|-------------------|---------|
@@ -793,15 +731,37 @@ coredns (type: yaml/helm):
 3. [containerd 发布说明](https://github.com/containerd/containerd/releases)
 4. [KEP-5 声明式升级框架](../kep/kep5/kep5.md)
 5. [KEP-6 三层状态机设计](../kep/kep6/kep6-state-machine-v5.md)
+6. [KEP-5-2 升级前预检设计](../kep/kep5/kep5-2-precheck-postcheck-design-v2.md)
 
 ### B. 术语表
 
 | 术语 | 定义 |
 |------|------|
 | **Hop** | 一次版本跳转，如 v1.34 → v1.35 |
-| **PreCheck** | 升级前检查，验证升级条件 |
-| **PostCheck** | 升级后检查，验证升级结果 |
+| **ReleaseImage** | 版本清单 CRD，定义 install/upgrade 组件列表 |
+| **ComponentVersion** | 组件版本定义 CRD，声明类型/依赖/策略 |
+| **UpgradePath** | 升级路径 CRD，管控版本间升级合法性 |
+| **VersionContext** | 版本上下文，通过 current/target 字符串比较判断是否需要升级 |
+| **DAG** | 有向无环图，从 ReleaseImage bundle 动态构建，按拓扑批次执行 |
+| **Command CR** | BKEAgent 命令 CRD，向节点发送 Kubeadm 升级命令 |
+| **ENV 命令** | 环境命令，批量操作多节点（containerd reset/redeploy） |
 | **倾斜策略** | kubelet 版本不能比 apiserver 新，最多旧 2 个版本 |
-| **滚动升级** | 逐节点升级，保持集群可用 |
-| **drain** | 驱逐节点上的 Pod，使节点不可调度 |
-| **uncordon** | 使节点可调度，允许 Pod 调度到该节点 |
+| **DeclarativeUpgradeStatus** | DAG 升级状态追踪，记录已完成组件列表 |
+| **upgrade-ready annotation** | `cvo.openfuyao.cn/upgrade-ready`，触发单跳升级 |
+
+### C. 代码库参考
+
+| 代码路径 | 说明 |
+|---------|------|
+| `controllers/capbke/bkecluster_upgrade_dag.go` | DAG 执行入口 `executeUpgradeDAG` |
+| `pkg/dagexec/scheduler.go` | DAG 调度器 `Scheduler.ExecuteDAG` |
+| `pkg/topology/build.go` | DAG 构建 `BuildUpgradeDAG` |
+| `pkg/upgrade/bundle.go` | Bundle DAG 构建 + 依赖解析 |
+| `pkg/upgrade/catalog.go` | 升级组件目录（inline/manifest 映射） |
+| `pkg/upgrade/context.go` | VersionContext（版本比较） |
+| `pkg/phaseframe/phases/ensure_master_upgrade.go` | 控制面升级 |
+| `pkg/phaseframe/phases/ensure_worker_upgrade.go` | Worker 升级 |
+| `pkg/phaseframe/phases/ensure_etcd_upgrade.go` | etcd 升级 |
+| `pkg/phaseframe/phases/ensure_containerd_upgrade.go` | containerd 升级 |
+| `pkg/phaseframe/phases/ensure_agent_upgrade.go` | bkeagent 升级 |
+| `pkg/command/upgrade.go` | Upgrade Command CR 创建 |
