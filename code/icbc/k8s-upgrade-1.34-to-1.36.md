@@ -229,26 +229,24 @@ Batch 8: [post-upgrade-verification]
 对每个 etcd 节点：
 1. 标记节点为 EtcdUpgrading
 2. 备份 etcd 数据（etcdctl snapshot save）
-3. 停止 etcd Static Pod（删除 manifest 文件）
-4. 备份当前 etcd 二进制
-5. 下载新版本 etcd 二进制
-6. 更新 etcd Static Pod manifest（镜像版本）
-7. 等待 etcd Pod 启动
-8. 验证 etcd 健康（etcdctl endpoint health）
-9. 验证 etcd 版本（etcdctl --version）
-10. 标记节点为 EtcdUpgraded
-11. 等待 etcd 集群同步完成
+3. 备份当前 etcd Static Pod manifest 文件
+4. 拉取新版本 etcd 镜像（crictl pull）
+5. 更新 etcd Static Pod manifest（镜像版本）
+6. 等待 Kubelet 检测文件变化，重建 etcd Pod
+7. 验证 etcd 健康（etcdctl endpoint health）
+8. 验证 etcd 版本（etcdctl --version）
+9. 标记节点为 EtcdUpgraded
+10. 等待 etcd 集群同步完成
 ```
 
 **回滚步骤**：
 
 ```
 对每个 etcd 节点：
-1. 停止 etcd Pod
-2. 恢复备份的 etcd 二进制
-3. 恢复 etcd 数据（如果数据格式不兼容）
-4. 启动 etcd Pod
-5. 验证 etcd 健康
+1. 恢复备份的 manifest 文件（旧版本镜像）
+2. 等待 Kubelet 重建 etcd Pod
+3. 恢复 etcd 数据（如果数据格式不兼容，从 snapshot 恢复）
+4. 验证 etcd 健康
 ```
 
 **工作量分解**：
@@ -280,17 +278,15 @@ Batch 8: [post-upgrade-verification]
 对每个 master 节点：
 1. 标记节点为 MasterUpgrading
 2. 备份 etcd 数据（如果是 etcd 节点）
-3. 停止 kubelet（避免 Static Pod 重启干扰）
-4. 备份当前 K8s 二进制（apiserver, controller-manager, scheduler）
-5. 下载新版本 K8s 二进制
-6. 更新 Static Pod manifest（镜像版本）
-7. 启动 kubelet
-8. 等待 Static Pod 启动
-9. 验证 apiserver 健康（kubectl get --raw=/healthz）
-10. 验证 controller-manager 健康
-11. 验证 scheduler 健康
-12. 验证节点 Ready
-13. 标记节点为 MasterUpgraded
+3. 备份当前 Static Pod manifest 文件（apiserver, controller-manager, scheduler）
+4. 拉取新版本 K8s 镜像（kube-apiserver, kube-controller-manager, kube-scheduler）
+5. 更新 Static Pod manifest（镜像版本）
+6. 等待 Kubelet 检测文件变化，逐个重建 Static Pod
+7. 验证 apiserver 健康（kubectl get --raw=/healthz）
+8. 验证 controller-manager 健康
+9. 验证 scheduler 健康
+10. 验证节点 Ready
+11. 标记节点为 MasterUpgraded
 ```
 
 **API 废弃处理**：
