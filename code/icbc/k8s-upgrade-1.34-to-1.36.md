@@ -359,34 +359,61 @@ Batch 8: [post-upgrade-verification]
 - coredns: 根据 K8s 版本配套升级
 
 **升级策略**：
-- **DaemonSet 更新**：kube-proxy 通过 DaemonSet 滚动更新
-- **Deployment 更新**：coredns 通过 Deployment 滚动更新
-- **配置保留**：保留 ConfigMap 配置，仅更新镜像版本
+- **声明式组件管理**：通过 ComponentVersion (type: yaml/helm) 定义完整资源清单，纳入 DAG 统一调度
+- **YamlInstaller 升级**：kube-proxy/coredns 通过 SSA Apply 应用新版本清单，自动处理字段变更和资源裁剪
+- **完整清单替换**：不仅更新镜像版本，还更新 ConfigMap、RBAC、Service 等关联资源
 
 **升级步骤**：
 
 ```
-kube-proxy:
-1. 更新 kube-proxy DaemonSet 镜像版本
-2. 等待 DaemonSet 滚动更新完成
-3. 验证 kube-proxy Pod 健康
-4. 验证 iptables/ipvs 规则正常
+kube-proxy (type: yaml):
+1. 加载目标版本 ComponentVersion（bke-manifests/kube-proxy/v1.36.0/）
+2. 渲染完整资源清单（DaemonSet + ConfigMap + RBAC + Service）
+3. YamlInstaller.Apply:
+   a. 按依赖顺序应用资源（RBAC → ConfigMap → DaemonSet）
+   b. 使用 SSA Apply 更新 DaemonSet（镜像版本 + 配置变更）
+   c. Prune 不再需要的旧版本资源
+4. 等待 DaemonSet 滚动更新完成
+5. 健康检查:
+   a. 验证 kube-proxy Pod Ready
+   b. 验证 iptables/ipvs 规则正常
+   c. 验证 Service ClusterIP 转发正常
 
-coredns:
-1. 更新 coredns Deployment 镜像版本
-2. 等待 Deployment 滚动更新完成
-3. 验证 coredns Pod 健康
-4. 验证 DNS 解析正常（nslookup kubernetes.default）
+coredns (type: yaml/helm):
+1. 加载目标版本 ComponentVersion（bke-manifests/coredns/v1.11.x/）
+2. 渲染完整资源清单（Deployment + ConfigMap + Service + RBAC）
+3. YamlInstaller.Apply:
+   a. 按依赖顺序应用资源（RBAC → ConfigMap → Deployment → Service）
+   b. 使用 SSA Apply 更新 Deployment（镜像版本 + CoreDNS 配置变更）
+   c. Prune 不再需要的旧版本资源
+4. 等待 Deployment 滚动更新完成
+5. 健康检查:
+   a. 验证 coredns Pod Ready
+   b. 验证 DNS 解析正常（nslookup kubernetes.default）
+   c. 验证外部域名解析正常
 ```
+
+**与镜像替换方案的区别**：
+
+| 维度 | 仅更新镜像版本（非通用） | 声明式完整清单替换（通用） |
+|------|----------------------|------------------------|
+| **升级粒度** | 仅镜像 tag | 镜像 + ConfigMap + RBAC + Service |
+| **配置变更** | 不处理 | SSA Apply 自动处理字段变更 |
+| **资源裁剪** | 不支持 | Prune 自动清理废弃资源 |
+| **版本追踪** | 无 | ComponentVersion 生命周期追踪 |
+| **回滚能力** | 仅回滚镜像 | 回滚完整清单 |
+| **DAG 集成** | 不集成 | 纳入 DAG 统一调度，支持依赖管理 |
 
 **工作量分解**：
 
 | 任务 | 说明 | 工作量 |
 |------|------|--------|
-| DaemonSet/Deployment 更新逻辑 | 实现 kube-proxy/coredns 滚动更新 | 1 天 |
-| 健康检查开发 | 实现 kube-proxy/coredns 健康检查 | 1 天 |
-| 集成测试 | DNS 解析和网络连通性测试 | 1 天 |
-| **小计** | - | **3 天** |
+| ComponentVersion 清单编写 | 编写 kube-proxy/coredns 各版本的完整 YAML 清单 | 1.5 天 |
+| ConfigMap 渲染适配 | 适配不同 K8s 版本的 kube-proxy/coredns 配置模板 | 1 天 |
+| SSA Apply + Prune 逻辑 | 实现 YamlInstaller 的 SSA Apply 和 Prune 逻辑 | 1 天 |
+| 健康检查开发 | 实现 kube-proxy/coredns 健康检查（Pod Ready + 功能验证） | 1 天 |
+| 集成测试 | DNS 解析、网络连通性、资源裁剪测试 | 1.5 天 |
+| **小计** | - | **6 天** |
 
 ---
 
@@ -634,14 +661,14 @@ coredns:
 | **etcd 升级** | 升级脚本、数据兼容性、滚动升级、健康检查、集成测试 | 9 |
 | **控制面升级** | 升级脚本、API 废弃扫描、滚动升级、健康检查、集成测试 | 11 |
 | **kubelet 升级** | 升级脚本、drain 逻辑、滚动升级、倾斜策略、集成测试 | 8 |
-| **kube-proxy/coredns** | DaemonSet/Deployment 更新、健康检查、集成测试 | 3 |
+| **kube-proxy/coredns** | ComponentVersion 清单、ConfigMap 适配、SSA Apply/Prune、健康检查、集成测试 | 6 |
 | **PreCheck** | 框架开发、各项检查实现、集成测试 | 12 |
 | **PostCheck** | 框架开发、各项检查实现、集成测试 | 10 |
 | **回滚** | 框架开发、回滚脚本、etcd 恢复、多跳编排、测试 | 12 |
 | **ReleaseImage 定义** | 定义 v1.35/v1.36 两个版本的 ReleaseImage | 1.5 |
 | **UpgradePath 配置** | 配置升级路径和兼容性规则 | 1 |
 | **多跳升级编排** | 实现多跳升级的自动编排和错误处理 | 5 |
-| **小计** | - | **81.5 人天** |
+| **小计** | - | **84.5 人天** |
 
 ### 6.2 测试工作量
 
@@ -671,14 +698,14 @@ coredns:
 
 | 类别 | 工作量（人天） | 工作量（人周） |
 |------|---------------|---------------|
-| **开发** | 81.5 | 16.3 |
+| **开发** | 84.5 | 16.9 |
 | **测试** | 37 | 7.4 |
 | **文档** | 8 | 1.6 |
-| **总计** | **126.5** | **25.3** |
+| **总计** | **129.5** | **25.9** |
 
 **按人员配置估算**：
-- 如果 2 人全职投入：约 12.5 周（3 个月）
-- 如果 3 人全职投入：约 8.5 周（2 个月）
+- 如果 2 人全职投入：约 13 周（3 个月）
+- 如果 3 人全职投入：约 9 周（2 个月）
 - 如果 4 人全职投入：约 6.5 周（1.5 个月）
 
 ---
