@@ -870,7 +870,6 @@ type PhaseFlow struct {
 | **containerd** | `EnsureContainerdUpgrade` | containerd.tar.gz + config.toml + service | master, worker | P0 | 容器运行时，需支持 docker → containerd 迁移 |
 | **kubelet** | `EnsureMasterUpgrade` / `EnsureWorkerUpgrade` | kubelet + kubectl + kubelet.conf + service | master, worker | P0 | K8s 节点组件，需按角色分别处理 |
 | **kubectl** | `EnsureMasterUpgrade` / `EnsureWorkerUpgrade` | kubectl 二进制 | master, worker | P0 | K8s 命令行工具 |
-| **etcd** | `EnsureEtcdUpgrade` | etcd + etcdctl + etcd.yaml (Static Pod) | master | P0 | 分布式 KV 存储，Static Pod 方式部署 |
 | **runc** | `EnsureNodesEnv` (update-runc.sh) | runc 二进制 | master, worker | P1 | 容器运行时底层 |
 | **helm** | `EnsureNodesEnv` (install-helm.sh) | helm 二进制 | master | P2 | Helm 命令行工具 |
 | **etcdctl** | `EnsureNodesEnv` (install-etcdctl.sh) | etcdctl 二进制 | master | P2 | etcd 命令行工具 |
@@ -904,9 +903,9 @@ type PhaseFlow struct {
 
 | 组件类型 | 组件数量 | 改造复杂度 | 预估工作量 |
 |---------|---------|-----------|-----------|
-| **Binary 类型** | 11 个 | 中等（需编写 installScript + configTemplates） | 2-3 周 |
+| **Binary 类型** | 10 个 | 中等（需编写 installScript + configTemplates） | 2-3 周 |
 | **Static Pod 类型** | 7 个 | 较高（需编写 manifestTemplate + 健康检查） | 2-3 周 |
-| **总计** | 18 个 | - | 4-6 周 |
+| **总计** | 17 个 | - | 4-6 周 |
 
 ### 3.4 支持的组件类型
 
