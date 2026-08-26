@@ -507,6 +507,7 @@ func (r *BKEClusterReconciler) executePhaseFlow(ctx, phaseCtx, oldCluster, newCl
 
 > **注意**：扩容场景（新增 Master/Worker 节点）虽然不走 DAG 安装路径，但未来可考虑将扩容也纳入 DAG 驱动（如 `kubernetes-master` 组件的 `DecisionInstall` 触发 `EnsureMasterJoin` handler），作为后续优化方向。
 
+```go
 // shouldUseDeclarativeInstall 判断是否使用 DAG 安装路径 🆕新增
 func (r *BKEClusterReconciler) shouldUseDeclarativeInstall(bkeCluster *bkev1beta1.BKECluster) bool {
     // Feature Gate 控制
