@@ -4,7 +4,7 @@
 ## 升级框架完善
 
 - [框架支持二进制组件](../kep/kep6/声明式集群版本升级方案-支持二进制与Helm组件.md)
-  - 二进制改造
+  - [二进制改造](../kep/kep6/kep13-binary-component-migration-design.md)
 - [支持三层状态机（集群、节点、组件）](../kep/kep6/kep6-state-machine-v5.md)
 - [支持可观测性](../kep/kep6/kep6-state-machine-v5.md)
 - [支持静态Pod组件](../kep/kep6/kep9-staticpod-upgrade-framework.md)
