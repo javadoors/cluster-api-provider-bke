@@ -822,6 +822,8 @@ BKE 提供两种版本回滚方案，详见 [第 7 章](#7-降级-dag-设计)和
 
 ## 7. 降级 DAG 设计
 
+### 7.1 设计思路
+
 **设计思路**：
 - 参考升级 DAG 的设计，实现专门的降级 DAG
 - 复用现有 `topology.UpgradeDAG` 和 `dagexec.Scheduler` 框架
@@ -839,7 +841,7 @@ BKE 提供两种版本回滚方案，详见 [第 7 章](#7-降级-dag-设计)和
   Worker → Master → etcd → Containerd → Agent
 ```
 
-**降级 DAG 构建逻辑**：
+### 7.2 DAG 构建与图反转
 
 降级 DAG 复用升级 DAG 的依赖图，通过反转边方向实现逆序执行。`topology.Graph` 的 `Reverse()` 方法将所有边方向取反，`TopologicalBatches()` 在反转图上输出降级批次。降级不新增独立 Phase，而是在现有 Phase 中新增 `Rollback()` 接口，由 `PhaseRunner` 在回滚模式下调用。
 
@@ -902,7 +904,7 @@ func (g *Graph) Reverse() *Graph {
 }
 ```
 
-**Phase 接口扩展**：
+### 7.3 Phase 接口扩展
 
 在现有 `phaseframe.Phase` 接口中新增 `Rollback()` 方法，不新增独立 Phase 类型，复用现有 Phase 实现：
 
@@ -967,7 +969,7 @@ func (b *BasePhase) NeedRollback(old, new *bkev1beta1.BKECluster) bool {
 }
 ```
 
-**各现有 Phase 的 Rollback 实现**：
+### 7.4 各组件 Rollback 实现
 
 ```go
 // pkg/phaseframe/phases/ensure_worker_upgrade.go 扩展
@@ -1274,7 +1276,9 @@ func (e *EnsureContainerdUpgrade) Rollback() (ctrl.Result, error) {
 }
 ```
 
-**PhaseRunner 扩展：回滚模式下调用 Rollback 而非 Execute**：
+### 7.5 PhaseRunner 扩展
+
+**回滚模式下调用 Rollback 而非 Execute**：
 
 ```go
 // pkg/dagexec/inline_runner.go 扩展
@@ -1332,7 +1336,7 @@ func (r *PhaseRunner) Execute(
 }
 ```
 
-**VersionContext 扩展**：
+### 7.6 VersionContext 扩展
 
 ```go
 // pkg/upgrade/context.go 扩展
@@ -1379,7 +1383,7 @@ func Decide(vc *VersionContext, name string) Decision {
 }
 ```
 
-**降级 DAG 完整执行流程**：
+### 7.7 完整执行流程
 
 ```go
 // controllers/capbke/bkecluster_rollback_dag.go
@@ -1493,7 +1497,9 @@ func (r *BKEClusterReconciler) completeDeclarativeRollback(
 }
 ```
 
-**降级 DAG 结构（典型 v2.7.0 → v2.6.0 回滚）**：
+### 7.8 降级 DAG 结构
+
+**典型 v2.7.0 → v2.6.0 回滚 DAG**：
 
 ```
 降级 DAG（升级 DAG 边反转后，拓扑排序输出）:
@@ -1538,7 +1544,7 @@ Batch 6: [pre-upgrade-resources]     ← 最后清理（升级时最先执行）
 
 > **注意**：降级 DAG 中的节点 handler 与升级 DAG 完全一致（如 `EnsureWorkerUpgrade`、`EnsureMasterUpgrade`），不新增 Rollback Phase。`PhaseRunner` 在 `IsRollback` 模式下自动调用 `Phase.Rollback()` 而非 `Phase.Execute()`。各 Phase 的 `Rollback()` 方法复用 `Execute()` 的 kubeadm 命令机制，仅目标版本不同（旧版本）。
 
-**降级 DAG 执行流程图**：
+### 7.9 执行流程图
 
 ```mermaid
 flowchart TD
