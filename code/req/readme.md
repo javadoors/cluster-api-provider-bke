@@ -5,7 +5,7 @@
   - 二进制改造
 - [支持三层状态机（集群、节点、组件）](code/kep/kep6/kep6-state-machine-v5.md)
 - [支持可观测性](code/kep/kep6/kep6-state-machine-v5.md)
-- 支持静态Pod组件
+- [支持静态Pod组件](code/kep/kep6/kep9-staticpod-upgrade-framework.md)
 - [支持预检](code/kep/kep5/kep5-2-precheck-postcheck-design-v2.md)
 
 ## [安装流程与升级框架统一](code/kep/kep6/声明式集群安装 DAG 详细设计.md)
