@@ -10,8 +10,7 @@
 - [支持静态Pod组件](../kep/kep6/kep9-staticpod-upgrade-framework.md)
 - [支持预检](../kep/kep5/kep5-2-precheck-postcheck-design-v2.md)
 
-
-## [安装流程与升级框架统一](../kep/kep6/声明式集群安装DAG详细设计.md)
+## [安装流程与升级框架统一](../kep/kep6/kep10-install-components-declarative-design.md)
 
 ## 支持回滚
 
