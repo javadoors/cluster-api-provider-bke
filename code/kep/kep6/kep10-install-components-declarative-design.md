@@ -677,6 +677,263 @@ var (
 3. **混合模式**：ReleaseImage 可同时包含有 `inline` 和无 `inline` 的安装组件
 4. **ClusterVersionReconciler**：安装时设置 `cvo.openfuyao.cn/install-ready` annotation 触发 DAG 路径
 
+### 9.4 Legacy PhaseFlow 完全移除方案
+
+当迁移到 Phase 4 时，需要完全移除 Legacy PhaseFlow 路径。以下针对 7.1 节中列出的每个 Legacy 场景，给出 DAG 化的完整方案：
+
+#### 9.4.1 场景覆盖总览
+
+| Legacy 场景 | DAG 化方案 | 移除条件 |
+|------------|-----------|---------|
+| Feature Gate 未启用 | 移除 Feature Gate，DAG 成为唯一路径 | Phase 4 |
+| ReleaseImage 无 inline handler | 强制 ReleaseImage 包含 inline 字段 | Phase 4 |
+| 无 install-ready annotation | ClusterVersionReconciler 始终设置 annotation | Phase 2 |
+| 纳管已有集群 | 新增 `manage` 组件到安装 DAG | Phase 4 |
+| 集群扩容（新增节点） | 新增 `scale-master` / `scale-worker` 组件到 DAG | Phase 4 |
+| 集群删除/重置 | 新增 `delete` DAG（逆序卸载） | Phase 4 |
+| DryRun 模式 | DAG 执行器支持 DryRun 标记 | Phase 3 |
+| 集群暂停 | DAG 前置检查 `BKECluster.Spec.Pause` | Phase 3 |
+
+#### 9.4.2 纳管已有集群 DAG 化
+
+**当前实现**：`EnsureClusterManage` Phase 处理纳管逻辑（检测已有集群组件版本、写入 BKECluster.Status）。
+
+**DAG 化方案**：
+
+```yaml
+# ReleaseImage install.components 新增 manage 组件
+install:
+  components:
+    - name: manage
+      version: v1.0.0
+      inline:
+        handler: EnsureClusterManage
+        version: v1.0.0
+```
+
+```go
+// DeclarativeInstallCatalog 新增
+{ Name: "manage", Mode: InstallExecutionInline, InlineHandler: "EnsureClusterManage" }
+```
+
+**VersionContext 特殊处理**：纳管场景下 Current 不为空（从已有集群探测版本），Target 来自 ReleaseImage：
+
+```go
+// BuildVersionContextForManage 为纳管场景构建 VersionContext
+func BuildVersionContextForManage(
+    targetBundle *releasemanifest.Bundle,
+    detectedVersions map[string]string,  // 从已有集群探测的版本
+) *VersionContext {
+    vc := NewVersionContext()
+    // Current 来自探测结果
+    for name, ver := range detectedVersions {
+        vc.SetCurrent(name, ver)
+    }
+    // Target 来自 ReleaseImage
+    for _, comp := range targetBundle.Release.Spec.Install.Components {
+        vc.SetTarget(comp.Name, comp.Version)
+    }
+    return vc
+}
+```
+
+**触发机制**：`BKECluster.Spec.Manage = true` 时，ClusterVersionReconciler 设置 `install-ready` annotation 触发 DAG，DAG 中 `manage` 组件作为第一个 Batch 执行（探测版本 + 填充 Current），后续组件通过 `VersionContext.Decide()` 判断是否需要执行（已有正确版本的跳过）。
+
+#### 9.4.3 集群扩容 DAG 化
+
+**当前实现**：`EnsureMasterJoin` / `EnsureWorkerJoin` Phase 处理新增节点。
+
+**DAG 化方案**：将扩容纳入安装 DAG，通过 VersionContext 的 `DecisionInstall` 触发：
+
+```yaml
+# ReleaseImage install.components 已有 kubernetes-master / kubernetes-worker
+# 扩容时新增节点的 VersionContext.Current 为空 → DecisionInstall
+```
+
+**扩容 DAG 结构**：
+
+```
+扩容 DAG（新增 Master 节点）:
+
+Batch 1: [bkeagent]              ← 新节点需要先安装 Agent
+    └─ inline: EnsureBKEAgent → SSH 推送 bkeagent
+
+Batch 2: [nodes-env]            ← 新节点需要环境准备
+    └─ inline: EnsureNodesEnv
+
+Batch 3: [kubernetes-master]    ← 新节点 kubeadm join
+    └─ inline: EnsureMasterInit (幂等：已有 Master 跳过，新节点执行 join)
+
+Batch 4: [kube-proxy, coredns]   ← DaemonSet 自动调度到新节点
+    └─ manifest: YamlInstaller Apply
+```
+
+**关键设计**：
+- `EnsureMasterInit` handler 需区分"首个 Master（init）"和"后续 Master（join）"，通过检查已有 Master 数量判断
+- 已有节点的组件 VersionContext.Current 已有值且与 Target 一致 → `DecisionSkip`，跳过执行
+- 新增节点的组件 VersionContext.Current 为空 → `DecisionInstall`，执行安装
+- 扩容不再走独立的 Scale Phase，而是复用安装 DAG（VersionContext 自动过滤已完成的节点）
+
+#### 9.4.4 集群删除/重置 DAG 化
+
+**当前实现**：`EnsureDeleteOrReset` Phase 处理删除/重置。
+
+**DAG 化方案**：构建卸载 DAG（安装 DAG 逆序），逐组件卸载：
+
+```go
+// BuildUninstallDAGFromBundle 构建卸载 DAG（逆序）
+func BuildUninstallDAGFromBundle(
+    bundle *releasemanifest.Bundle,
+    resolve topology.DependencyResolver,
+) (*topology.UpgradeDAG, error) {
+    // 复用 BuildInstallDAGFromBundle，然后逆序
+    dag, err := BuildInstallDAGFromBundle(bundle, resolve)
+    if err != nil {
+        return nil, err
+    }
+    // 逆序 DAG（依赖关系反转）
+    return dag.Reverse(), nil
+}
+```
+
+**卸载 DAG 结构**：
+
+```
+卸载 DAG（安装 DAG 逆序）:
+
+Batch 1: [agent-switch, nodes-postprocess]   ← 先停止 Agent 监听 + 后置清理
+    ├─ inline: EnsureAgentSwitch → 切回原 Agent
+    └─ inline: EnsureNodesPostProcess → 清理
+
+Batch 2: [kube-proxy, coredns]               ← 卸载附加组件
+    ├─ manifest: YamlInstaller Delete
+    └─ manifest: YamlInstaller Delete
+
+Batch 3: [kubernetes-worker]                 ← 清理 Worker 节点
+    └─ inline: kubeadm reset (worker)
+
+Batch 4: [kubernetes-master]                 ← 清理 Master 节点
+    └─ inline: kubeadm reset (master)
+
+Batch 5: [load-balance]                      ← 清理 HA
+    └─ inline: 删除 haproxy/keepalived
+
+Batch 6: [certs]                            ← 清理证书
+    └─ inline: 删除证书
+
+Batch 7: [cluster-api-obj]                   ← 清理 CAPI 对象
+
+Batch 8: [bkeagent]                          ← 最后卸载 Agent
+    └─ inline: 停止并删除 bkeagent
+```
+
+**触发机制**：`BKECluster.Spec.Reset = true` 或 `DeletionTimestamp` 非空时，构建卸载 DAG 执行。
+
+#### 9.4.5 DryRun 模式 DAG 化
+
+**当前实现**：`EnsureDryRun` Phase 处理 DryRun。
+
+**DAG 化方案**：在 ExecutionContext 中传递 `DryRun` 标记，各执行器检查标记后仅打印不实际执行：
+
+```go
+// ExecutionContext 新增 DryRun 字段
+type ExecutionContext struct {
+    // ... 现有字段 ...
+    DryRun bool  // 🆕新增
+}
+
+// Scheduler 执行时检查 DryRun
+func (s *Scheduler) executeComponent(ctx, node, execCtx) error {
+    if execCtx.DryRun {
+        // 仅打印将要执行的操作，不实际执行
+        log.Info("DryRun: would execute component", "name", node.Name, "version", node.Version)
+        return nil
+    }
+    // 实际执行
+    ...
+}
+```
+
+**触发机制**：`BKECluster.Spec.DryRun = true` 时，`executeInstallDAG` 中设置 `execCtx.DryRun = true`，DAG 照常构建和遍历但各组件仅打印不执行。
+
+#### 9.4.6 集群暂停 DAG 化
+
+**当前实现**：`EnsurePaused` Phase 处理暂停。
+
+**DAG 化方案**：在 `shouldUseDeclarativeInstall` 中增加暂停检查，暂停时不构建 DAG：
+
+```go
+func (r *BKEClusterReconciler) shouldUseDeclarativeInstall(bkeCluster *bkev1beta1.BKECluster) bool {
+    // ... 现有检查 ...
+    
+    // 🆕新增：暂停检查
+    if bkeCluster.Spec.Pause {
+        return false  // 暂停时不执行任何操作
+    }
+    
+    return ok
+}
+```
+
+**说明**：暂停场景不需要 DAG 化——暂停的语义是"不执行任何操作"，DAG 路径和 PhaseFlow 路径都需要跳过执行。移除 PhaseFlow 后，暂停检查仍保留在 `shouldUseDeclarativeInstall` 中作为前置判断。
+
+#### 9.4.7 移除后的执行入口
+
+完全移除 Legacy PhaseFlow 后，执行入口简化为：
+
+```go
+func (r *BKEClusterReconciler) reconcileCluster(ctx, phaseCtx, oldCluster, newCluster) {
+    // 场景判断（无 Legacy 回退）
+    switch {
+    case isDeleteOrReset(newCluster):
+        // 卸载 DAG
+        r.executeUninstallDAG(ctx, phaseCtx, oldCluster, newCluster)
+    
+    case isPaused(newCluster):
+        // 暂停：不执行
+        return
+    
+    case isDryRun(newCluster):
+        // DryRun DAG
+        r.executeInstallDAG(ctx, phaseCtx, oldCluster, newCluster, WithDryRun())
+    
+    case isScale(newCluster):
+        // 扩容 DAG（复用安装 DAG，VersionContext 自动过滤）
+        r.executeInstallDAG(ctx, phaseCtx, oldCluster, newCluster)
+    
+    case isManage(newCluster):
+        // 纳管 DAG
+        r.executeInstallDAG(ctx, phaseCtx, oldCluster, newCluster, WithManage())
+    
+    case r.shouldUseDeclarativeUpgrade(newCluster):
+        // 升级 DAG
+        r.executeUpgradeDAG(...)
+    
+    default:
+        // 全新安装 DAG
+        r.executeInstallDAG(ctx, phaseCtx, oldCluster, newCluster)
+    }
+    
+    // 不再有 PhaseFlow 回退
+}
+```
+
+#### 9.4.8 移除工作量
+
+| 任务 | 说明 | 工作量（人天） |
+|------|------|---------------|
+| 纳管 DAG 化 | `manage` 组件 + `BuildVersionContextForManage` | 2 |
+| 扩容 DAG 化 | `EnsureMasterInit` 幂等改造 + VersionContext 过滤 | 2 |
+| 删除/重置 DAG 化 | `BuildUninstallDAGFromBundle` + 逆序执行 | 3 |
+| DryRun DAG 化 | `ExecutionContext.DryRun` + 各执行器适配 | 1 |
+| 暂停检查迁移 | `shouldUseDeclarativeInstall` 增加暂停检查 | 0.5 |
+| 执行入口重写 | `reconcileCluster` 场景分发 | 1 |
+| PhaseFlow 代码清理 | 移除 `DeployPhases` / `PhaseFlow` / `PhaseStatus` | 2 |
+| 回归测试 | 所有场景 E2E 测试 | 5 |
+| **小计** | - | **16.5 人天** |
+
+> **注意**：此工作量叠加在 Phase 1-3（27 人天）之上，Legacy 完全移除的总工作量为 27 + 16.5 = 43.5 人天。
+
 ## 10. 可观测性
 
 ### 10.1 安装状态追踪
@@ -738,13 +995,28 @@ kubectl get bkecluster my-cluster -o jsonpath='{.status.clusterComponentStatuses
 | **回归测试** | PhaseFlow 路径回归 | 2 |
 | **小计** | - | **14 人天** |
 
-### 11.3 总工作量汇总
+### 11.3 Legacy 完全移除工作量
+
+| 任务 | 说明 | 工作量（人天） |
+|------|------|---------------|
+| 纳管 DAG 化 | `manage` 组件 + `BuildVersionContextForManage` | 2 |
+| 扩容 DAG 化 | `EnsureMasterInit` 幂等改造 + VersionContext 过滤 | 2 |
+| 删除/重置 DAG 化 | `BuildUninstallDAGFromBundle` + 逆序执行 | 3 |
+| DryRun DAG 化 | `ExecutionContext.DryRun` + 执行器适配 | 1 |
+| 暂停检查迁移 | `shouldUseDeclarativeInstall` 增加暂停检查 | 0.5 |
+| 执行入口重写 | `reconcileCluster` 场景分发 | 1 |
+| PhaseFlow 代码清理 | 移除 `DeployPhases` / `PhaseFlow` / `PhaseStatus` | 2 |
+| 回归测试 | 所有场景 E2E 测试 | 5 |
+| **小计** | - | **16.5 人天** |
+
+### 11.4 总工作量汇总
 
 | 类别 | 工作量（人天） |
 |------|---------------|
-| **开发** | 13 |
-| **测试** | 14 |
-| **总计** | **27** |
+| **开发**（Phase 1-3） | 13 |
+| **测试**（Phase 1-3） | 14 |
+| **Legacy 移除**（Phase 4） | 16.5 |
+| **总计** | **43.5** |
 
 ## 12. 风险与缓解措施
 
