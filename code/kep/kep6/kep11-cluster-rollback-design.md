@@ -323,6 +323,192 @@ func cleanupFailedScaleResources(ctx context.Context, cluster *bkev1beta1.BKEClu
     return nil
 }
 
+// deleteUnreadyNodes 删除扩缩容过程中未就绪的 Worker 节点
+// 遍历 BKECluster 关联的所有 BKENode，删除状态为 NodeNotReady 或 NodeScaleFailed 的 Worker 节点
+func deleteUnreadyNodes(ctx context.Context, cluster *bkev1beta1.BKECluster) error {
+    client := ctrl.GetClientFromContext(ctx)
+
+    // 1. 获取集群关联的所有 BKENode
+    bkeNodes := &bkev1beta1.BKENodeList{}
+    if err := client.List(ctx, bkeNodes,
+        client.MatchingLabels{"cluster.x-k8s.io/cluster-name": cluster.Name},
+        client.InNamespace(cluster.Namespace),
+    ); err != nil {
+        return fmt.Errorf("list bke nodes: %w", err)
+    }
+
+    // 2. 筛选未就绪的 Worker 节点
+    var unreadyNodes []*bkev1beta1.BKENode
+    for i := range bkeNodes.Items {
+        node := &bkeNodes.Items[i]
+        // 仅处理 Worker 节点（Master 节点不在扩缩容范围内）
+        if !isWorkerNode(node) {
+            continue
+        }
+        // 判断节点是否未就绪（状态为 NotReady / ScaleFailed / Upgrading 超时）
+        if node.Status.State == bkev1beta1.NodeStateNotReady ||
+            node.Status.State == bkev1beta1.NodeStateScaleFailed ||
+            isNodeStuckInUpgrading(node) {
+            unreadyNodes = append(unreadyNodes, node)
+        }
+    }
+
+    if len(unreadyNodes) == 0 {
+        return nil
+    }
+
+    // 3. 逐个删除未就绪节点
+    for _, node := range unreadyNodes {
+        // 3a. 从目标集群 drain 节点（如果节点还能访问）
+        if err := drainNodeFromTargetCluster(ctx, cluster, node); err != nil {
+            // drain 失败不阻塞删除，记录 Warning 后继续
+            log.Info("drain node failed during rollback, proceeding with deletion",
+                "node", node.Name, "err", err.Error())
+        }
+
+        // 3b. 删除 BKENode CR
+        if err := client.Delete(ctx, node); err != nil && !apierrors.IsNotFound(err) {
+            return fmt.Errorf("delete bke node %s: %w", node.Name, err)
+        }
+
+        // 3c. 等待 BKENode 完全删除
+        if err := wait.PollUntilContextTimeout(ctx, 5*time.Second, 5*time.Minute, true,
+            func(ctx context.Context) (bool, error) {
+                err := client.Get(ctx, client.ObjectKeyFromObject(node), &bkev1beta1.BKENode{})
+                return apierrors.IsNotFound(err), nil
+            }); err != nil {
+            return fmt.Errorf("wait bke node %s deletion: %w", node.Name, err)
+        }
+
+        log.Info("deleted unready node during rollback", "node", node.Name)
+    }
+
+    return nil
+}
+
+// cleanupScaleResources 清理扩缩容过程中创建的临时资源（ConfigMap/Secret）
+func cleanupScaleResources(ctx context.Context, cluster *bkev1beta1.BKECluster) error {
+    client := ctrl.GetClientFromContext(ctx)
+
+    // 1. 清理扩缩容临时 ConfigMap（label: bke.bocloud.com/scale-temporary=true）
+    cmList := &corev1.ConfigMapList{}
+    if err := client.List(ctx, cmList,
+        client.InNamespace(cluster.Namespace),
+        client.MatchingLabels{
+            "bke.bocloud.com/cluster-name":        cluster.Name,
+            "bke.bocloud.com/scale-temporary":      "true",
+        },
+    ); err != nil {
+        return fmt.Errorf("list temporary configmaps: %w", err)
+    }
+
+    for i := range cmList.Items {
+        cm := &cmList.Items[i]
+        if err := client.Delete(ctx, cm); err != nil && !apierrors.IsNotFound(err) {
+            return fmt.Errorf("delete configmap %s: %w", cm.Name, err)
+        }
+        log.Info("deleted temporary configmap during rollback", "name", cm.Name)
+    }
+
+    // 2. 清理扩缩容临时 Secret（label: bke.bocloud.com/scale-temporary=true）
+    secretList := &corev1.SecretList{}
+    if err := client.List(ctx, secretList,
+        client.InNamespace(cluster.Namespace),
+        client.MatchingLabels{
+            "bke.bocloud.com/cluster-name":        cluster.Name,
+            "bke.bocloud.com/scale-temporary":      "true",
+        },
+    ); err != nil {
+        return fmt.Errorf("list temporary secrets: %w", err)
+    }
+
+    for i := range secretList.Items {
+        secret := &secretList.Items[i]
+        if err := client.Delete(ctx, secret); err != nil && !apierrors.IsNotFound(err) {
+            return fmt.Errorf("delete secret %s: %w", secret.Name, err)
+        }
+        log.Info("deleted temporary secret during rollback", "name", secret.Name)
+    }
+
+    // 3. 清理残留的 BKEAgent Command CR（扩缩容中未完成的命令）
+    cmdList := &agentv1beta1.CommandList{}
+    if err := client.List(ctx, cmdList,
+        client.InNamespace(cluster.Namespace),
+        client.MatchingLabels{
+            "bke.bocloud.com/cluster-name": cluster.Name,
+        },
+    ); err != nil {
+        return fmt.Errorf("list commands: %w", err)
+    }
+
+    for i := range cmdList.Items {
+        cmd := &cmdList.Items[i]
+        // 仅删除非终态命令（Running / Suspend）
+        if cmd.Status.Phase == agentv1beta1.CommandSuspend ||
+            cmd.Status.Phase == agentv1beta1.CommandRunning {
+            if err := client.Delete(ctx, cmd); err != nil && !apierrors.IsNotFound(err) {
+                return fmt.Errorf("delete command %s: %w", cmd.Name, err)
+            }
+            log.Info("deleted pending command during rollback", "name", cmd.Name)
+        }
+    }
+
+    return nil
+}
+
+// restoreMachineDeploymentReplicas 恢复 MachineDeployment 副本数到扩缩容前的值
+func restoreMachineDeploymentReplicas(ctx context.Context, cluster *bkev1beta1.BKECluster) error {
+    client := ctrl.GetClientFromContext(ctx)
+
+    // 1. 从 BKECluster annotation 读取扩缩容前的副本数
+    //    annotation 由 PhaseFlow 在执行扩缩容前写入
+    annotationKey := "bke.bocloud.com/previous-replicas"
+    previousReplicasStr, ok := cluster.Annotations[annotationKey]
+    if !ok {
+        // 无 annotation 说明扩缩容未修改副本数，直接返回
+        log.Info("no previous-replicas annotation, skip restoring MachineDeployment replicas")
+        return nil
+    }
+
+    previousReplicas, err := strconv.Atoi(previousReplicasStr)
+    if err != nil {
+        return fmt.Errorf("parse previous replicas annotation %q: %w", previousReplicasStr, err)
+    }
+
+    // 2. 获取集群关联的所有 MachineDeployment
+    mdList := &clusterv1.MachineDeploymentList{}
+    if err := client.List(ctx, mdList,
+        client.MatchingLabels{"cluster.x-k8s.io/cluster-name": cluster.Name},
+        client.InNamespace(cluster.Namespace),
+    ); err != nil {
+        return fmt.Errorf("list machine deployments: %w", err)
+    }
+
+    // 3. 逐个恢复副本数
+    for i := range mdList.Items {
+        md := &mdList.Items[i]
+        currentReplicas := int32(md.Spec.Replicas)
+        if currentReplicas == int32(previousReplicas) {
+            continue // 副本数已一致，跳过
+        }
+
+        oldReplicas := currentReplicas
+        md.Spec.Replicas = int32(previousReplicas)
+
+        if err := client.Update(ctx, md); err != nil {
+            return fmt.Errorf("update machine deployment %s replicas: %w", md.Name, err)
+        }
+
+        log.Info("restored machine deployment replicas during rollback",
+            "name", md.Name, "from", oldReplicas, "to", previousReplicas)
+    }
+
+    // 4. 清理 annotation
+    delete(cluster.Annotations, annotationKey)
+
+    return nil
+}
+
 // restorePreviousConfig 配置变更失败后恢复配置
 func restorePreviousConfig(ctx context.Context, cluster *bkev1beta1.BKECluster) error {
     // 1. 从备份恢复配置文件
@@ -340,6 +526,255 @@ func restorePreviousConfig(ctx context.Context, cluster *bkev1beta1.BKECluster) 
         return fmt.Errorf("restart affected components: %w", err)
     }
 
+    return nil
+}
+
+// restoreConfigFromBackup 从备份恢复配置文件
+// 配置备份存储在 BKECluster 关联的 ConfigMap 中（key: previous-config）
+func restoreConfigFromBackup(ctx context.Context, cluster *bkev1beta1.BKECluster) error {
+    client := ctrl.GetClientFromContext(ctx)
+
+    // 1. 获取配置备份 ConfigMap
+    backupCMName := fmt.Sprintf("%s-config-backup", cluster.Name)
+    backupCM := &corev1.ConfigMap{}
+    if err := client.Get(ctx, client.ObjectKey{
+        Namespace: cluster.Namespace,
+        Name:      backupCMName,
+    }, backupCM); err != nil {
+        if apierrors.IsNotFound(err) {
+            // 无配置备份，说明配置变更未修改 ConfigMap，跳过
+            log.Info("no config backup found, skip restoring config", "name", backupCMName)
+            return nil
+        }
+        return fmt.Errorf("get config backup configmap: %w", err)
+    }
+
+    // 2. 恢复 ClusterConfig（BKECluster.Spec.ClusterConfig）
+    previousConfigStr, ok := backupCM.Data["previous-cluster-config"]
+    if !ok {
+        return fmt.Errorf("config backup %s has no 'previous-cluster-config' key", backupCMName)
+    }
+
+    // 3. 解析旧配置
+    var previousConfig confv1beta1.BKEConfig
+    if err := json.Unmarshal([]byte(previousConfigStr), &previousConfig); err != nil {
+        return fmt.Errorf("unmarshal previous config: %w", err)
+    }
+
+    // 4. 恢复 BKECluster.Spec.ClusterConfig
+    cluster.Spec.ClusterConfig = &previousConfig
+
+    // 5. 删除配置备份 ConfigMap
+    if err := client.Delete(ctx, backupCM); err != nil && !apierrors.IsNotFound(err) {
+        return fmt.Errorf("delete config backup configmap: %w", err)
+    }
+
+    log.Info("restored cluster config from backup", "cluster", cluster.Name)
+    return nil
+}
+
+// deleteInvalidConfigs 删除配置变更过程中创建的错误 ConfigMap/Secret
+func deleteInvalidConfigs(ctx context.Context, cluster *bkev1beta1.BKECluster) error {
+    client := ctrl.GetClientFromContext(ctx)
+
+    // 1. 删除配置变更创建的 ConfigMap（label: bke.bocloud.com/config-change=true）
+    cmList := &corev1.ConfigMapList{}
+    if err := client.List(ctx, cmList,
+        client.InNamespace(cluster.Namespace),
+        client.MatchingLabels{
+            "bke.bocloud.com/cluster-name":    cluster.Name,
+            "bke.bocloud.com/config-change":   "true",
+        },
+    ); err != nil {
+        return fmt.Errorf("list config-change configmaps: %w", err)
+    }
+
+    for i := range cmList.Items {
+        cm := &cmList.Items[i]
+        if err := client.Delete(ctx, cm); err != nil && !apierrors.IsNotFound(err) {
+            return fmt.Errorf("delete configmap %s: %w", cm.Name, err)
+        }
+        log.Info("deleted invalid configmap during rollback", "name", cm.Name)
+    }
+
+    // 2. 删除配置变更创建的 Secret（label: bke.bocloud.com/config-change=true）
+    secretList := &corev1.SecretList{}
+    if err := client.List(ctx, secretList,
+        client.InNamespace(cluster.Namespace),
+        client.MatchingLabels{
+            "bke.bocloud.com/cluster-name":    cluster.Name,
+            "bke.bocloud.com/config-change":   "true",
+        },
+    ); err != nil {
+        return fmt.Errorf("list config-change secrets: %w", err)
+    }
+
+    for i := range secretList.Items {
+        secret := &secretList.Items[i]
+        if err := client.Delete(ctx, secret); err != nil && !apierrors.IsNotFound(err) {
+            return fmt.Errorf("delete secret %s: %w", secret.Name, err)
+        }
+        log.Info("deleted invalid secret during rollback", "name", secret.Name)
+    }
+
+    return nil
+}
+
+// restartAffectedComponents 重启受配置变更影响的组件
+// 通过向 BKEAgent 发送重启命令，重启 kubelet、kube-proxy 等组件
+func restartAffectedComponents(ctx context.Context, cluster *bkev1beta1.BKECluster) error {
+    client := ctrl.GetClientFromContext(ctx)
+
+    // 1. 获取集群关联的所有 BKENode
+    bkeNodes := &bkev1beta1.BKENodeList{}
+    if err := client.List(ctx, bkeNodes,
+        client.MatchingLabels{"cluster.x-k8s.io/cluster-name": cluster.Name},
+        client.InNamespace(cluster.Namespace),
+    ); err != nil {
+        return fmt.Errorf("list bke nodes: %w", err)
+    }
+
+    // 2. 筛选需要重启的节点（Agent Ready 的节点）
+    var readyNodes []confv1beta1.Node
+    for i := range bkeNodes.Items {
+        node := &bkeNodes.Items[i]
+        if node.Status.State == bkev1beta1.NodeStateReady ||
+            node.Status.State == bkev1beta1.NodeStateAgentReady {
+            readyNodes = append(readyNodes, node.Spec)
+        }
+    }
+
+    if len(readyNodes) == 0 {
+        return fmt.Errorf("no ready nodes to restart components")
+    }
+
+    // 3. 为每个节点创建重启 Command CR
+    for _, node := range readyNodes {
+        cmd := &agentv1beta1.Command{
+            ObjectMeta: metav1.ObjectMeta{
+                Name:      fmt.Sprintf("restart-config-rollback-%s-%d", node.IP, time.Now().Unix()),
+                Namespace: cluster.Namespace,
+                Labels: map[string]string{
+                    "bke.bocloud.com/cluster-name": cluster.Name,
+                    "bke.bocloud.com/node-ip":      node.IP,
+                },
+                OwnerReferences: []metav1.OwnerReference{
+                    {
+                        APIVersion: cluster.APIVersion,
+                        Kind:       cluster.Kind,
+                        Name:       cluster.Name,
+                        UID:        cluster.UID,
+                    },
+                },
+            },
+            Spec: agentv1beta1.CommandSpec{
+                NodeName: node.Hostname,
+                Commands: []agentv1beta1.ExecCommand{
+                    {
+                        ID:   "restart-kubelet",
+                        Command: []string{"systemctl", "restart", "kubelet"},
+                        Type: agentv1beta1.CommandShell,
+                    },
+                },
+                BackoffLimit: 3,
+            },
+        }
+
+        if err := client.Create(ctx, cmd); err != nil && !apierrors.IsAlreadyExists(err) {
+            return fmt.Errorf("create restart command for node %s: %w", node.IP, err)
+        }
+
+        log.Info("created restart command during config rollback", "node", node.IP)
+    }
+
+    // 4. 等待所有重启命令完成（2s 轮询，5min 超时）
+    return wait.PollUntilContextTimeout(ctx, 2*time.Second, 5*time.Minute, true,
+        func(ctx context.Context) (bool, error) {
+            cmdList := &agentv1beta1.CommandList{}
+            if err := client.List(ctx, cmdList,
+                client.InNamespace(cluster.Namespace),
+                client.MatchingLabels{
+                    "bke.bocloud.com/cluster-name": cluster.Name,
+                },
+            ); err != nil {
+                return false, err
+            }
+
+            for i := range cmdList.Items {
+                cmd := &cmdList.Items[i]
+                if cmd.Status.Phase != agentv1beta1.CommandSucceed &&
+                    cmd.Status.Phase != agentv1beta1.CommandFailed {
+                    return false, nil // 仍在执行中
+                }
+            }
+
+            // 检查是否有失败命令
+            for i := range cmdList.Items {
+                cmd := &cmdList.Items[i]
+                if cmd.Status.Phase == agentv1beta1.CommandFailed {
+                    return true, fmt.Errorf("restart command %s failed", cmd.Name)
+                }
+            }
+
+            return true, nil
+        })
+}
+
+// --- 辅助函数 ---
+
+// isWorkerNode 判断是否为 Worker 节点
+func isWorkerNode(node *bkev1beta1.BKENode) bool {
+    for _, role := range node.Spec.Role {
+        if role == "worker" {
+            return true
+        }
+    }
+    return false
+}
+
+// isNodeStuckInUpgrading 判断节点是否卡在 Upgrading 状态
+// 超过 30 分钟仍在 Upgrading 则视为卡住
+func isNodeStuckInUpgrading(node *bkev1beta1.BKENode) bool {
+    if node.Status.State != bkev1beta1.NodeStateUpgrading {
+        return false
+    }
+    if node.Status.LastUpdateTime == nil {
+        return false
+    }
+    return time.Since(node.Status.LastUpdateTime.Time) > 30*time.Minute
+}
+
+// drainNodeFromTargetCluster 从目标集群 drain 节点
+func drainNodeFromTargetCluster(ctx context.Context, cluster *bkev1beta1.BKECluster, node *bkev1beta1.BKENode) error {
+    // 1. 获取目标集群 clientset
+    targetClient, err := kube.GetTargetClusterClient(ctx, ctrl.GetClientFromContext(ctx), cluster)
+    if err != nil {
+        return fmt.Errorf("get target cluster client: %w", err)
+    }
+
+    // 2. 创建 drainer
+    drainer := &kubedrain.Helper{
+        Client:              targetClient,
+        Force:               true,
+        IgnoreAllDaemonSets: true,
+        DeleteEmptyDirData:  true,
+        Timeout:             30 * time.Second,
+        Out:                 os.Stdout,
+        ErrOut:              os.Stderr,
+    }
+
+    // 3. 执行 drain
+    nodeIP := node.Spec.IP
+    nodeName := node.Spec.Hostname
+    if nodeName == "" {
+        nodeName = nodeIP
+    }
+
+    if err := drainer.Drain(ctx, nodeName); err != nil {
+        return fmt.Errorf("drain node %s: %w", nodeName, err)
+    }
+
+    log.Info("drained node during rollback", "node", nodeName)
     return nil
 }
 ```
