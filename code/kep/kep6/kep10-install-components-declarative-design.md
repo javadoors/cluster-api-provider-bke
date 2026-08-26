@@ -488,6 +488,24 @@ func (r *BKEClusterReconciler) executePhaseFlow(ctx, phaseCtx, oldCluster, newCl
     flow := phases.NewPhaseFlow(phaseCtx)
     ...
 }
+```
+
+**PhaseFlow 路径（Legacy）的适用场景**：
+
+以下场景仍会走 Legacy PhaseFlow 路径，不走 DAG 安装路径：
+
+| 场景 | 原因 | 说明 |
+|------|------|------|
+| **Feature Gate 未启用** | `DeclarativeInstallEnabled = false`（默认） | 迁移期间默认关闭，确保生产稳定；正式启用后此场景消失 |
+| **ReleaseImage 无 inline handler** | `install.components[].inline` 字段为空 | 旧格式 ReleaseImage 仅有 `{name, version}`，DAG 无法分发执行器；需升级 ReleaseImage 格式后才能走 DAG |
+| **无 install-ready annotation** | ClusterVersionReconciler 未设置 `install-ready` | 仅当 ReleaseImage Status.Phase=Valid 且 ClusterVersion 判定安装就绪时才设置 annotation |
+| **纳管已有集群** | `BKECluster.Spec.Manage = true`（纳管模式） | 纳管现有集群不走标准安装流程，PhaseFlow 中的 `EnsureClusterManage` 处理纳管逻辑 |
+| **集群扩容（新增节点）** | `EnsureMasterJoin` / `EnsureWorkerJoin` | 扩容时只执行部分 Phase（Join），非完整安装；DAG 安装路径面向全新安装，扩容仍走 PhaseFlow 中的 Scale Phase |
+| **集群删除/重置** | `BKECluster.Spec.Reset = true` 或 `DeletionTimestamp` 非空 | 删除/重置走 `DeletePhases`，与安装 DAG 无关 |
+| **DryRun 模式** | `BKECluster.Spec.DryRun = true` | DryRun 走 PhaseFlow 中的 `EnsureDryRun`，不实际执行安装 |
+| **集群暂停** | `BKECluster.Spec.Pause = true` | 暂停状态下不执行任何操作，走 PhaseFlow 中的 `EnsurePaused` |
+
+> **注意**：扩容场景（新增 Master/Worker 节点）虽然不走 DAG 安装路径，但未来可考虑将扩容也纳入 DAG 驱动（如 `kubernetes-master` 组件的 `DecisionInstall` 触发 `EnsureMasterJoin` handler），作为后续优化方向。
 
 // shouldUseDeclarativeInstall 判断是否使用 DAG 安装路径 🆕新增
 func (r *BKEClusterReconciler) shouldUseDeclarativeInstall(bkeCluster *bkev1beta1.BKECluster) bool {
