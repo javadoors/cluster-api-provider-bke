@@ -14,7 +14,7 @@
 
 ## [支持回滚](../kep/kep6/kep11-cluster-rollback-design.md)
 
-## 备份与恢复
+## [备份与恢复](../kep/kep6/kep12-backup-restore-design.md)
 
 ## [k8s大版本升级(1.34->1.36)](../icbc/k8s-upgrade-1.34-to-1.36.md)
 
