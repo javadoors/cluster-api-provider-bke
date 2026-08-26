@@ -749,6 +749,373 @@ spec:
     failurePolicy: FailFast
 ```
 
+### 6.6 helm ComponentVersion
+
+```yaml
+# bke-manifests/helm/v3.14.0/component.yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: helm-v3.14.0
+spec:
+  name: helm
+  type: binary
+  version: v3.14.0
+
+  binary:
+    artifacts:
+      - name: helm
+        url: "{{imageRegistry}}/helm/{{version}}/helm-{{version}}-linux-{{arch}}.tar.gz"
+        checksum: "sha256:pqr456..."
+        installPath: "/usr/local/bin"
+
+    installScript: |
+      #!/bin/bash
+      set -e
+      tar -xzf {{artifact.helm.installPath}}/helm-{{version}}-linux-{{arch}}.tar.gz -C /tmp
+      install -m 0755 /tmp/linux-{{arch}}/helm /usr/local/bin/helm
+      rm -rf /tmp/linux-{{arch}}
+
+    uninstallScript: |
+      #!/bin/bash
+      rm -f /usr/local/bin/helm
+
+    healthCheck:
+      enabled: true
+      timeout: "30s"
+      interval: "5s"
+      script: |
+        helm version | grep -q "{{version}}"
+
+    supportedArchitectures: ["amd64", "arm64"]
+    supportedOS:
+      - name: centos
+        versions: ["7", "8"]
+      - name: ubuntu
+        versions: ["20.04", "22.04"]
+
+  nodeFilter:
+    roles: ["master"]
+    skipCompleted: true
+
+  dependencies:
+    - name: bkeagent
+      phase: Install
+
+  upgradeStrategy:
+    mode: Parallel
+    timeout: "5m"
+    failurePolicy: Continue
+```
+
+### 6.7 etcdctl ComponentVersion
+
+```yaml
+# bke-manifests/etcdctl/v3.5.20/component.yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: etcdctl-v3.5.20
+spec:
+  name: etcdctl
+  type: binary
+  version: v3.5.20
+
+  binary:
+    artifacts:
+      - name: etcdctl
+        url: "{{imageRegistry}}/etcd/{{version}}/etcd-{{version}}-linux-{{arch}}.tar.gz"
+        checksum: "sha256:stu789..."
+        installPath: "/usr/local/bin"
+
+    installScript: |
+      #!/bin/bash
+      set -e
+      tar -xzf {{artifact.etcdctl.installPath}}/etcd-{{version}}-linux-{{arch}}.tar.gz -C /tmp
+      install -m 0755 /tmp/etcd-{{version}}-linux-{{arch}}/etcdctl /usr/local/bin/etcdctl
+      rm -rf /tmp/etcd-{{version}}-linux-{{arch}}
+
+    uninstallScript: |
+      #!/bin/bash
+      rm -f /usr/local/bin/etcdctl
+
+    healthCheck:
+      enabled: true
+      timeout: "30s"
+      interval: "5s"
+      script: |
+        etcdctl version | grep -q "{{version}}"
+
+    supportedArchitectures: ["amd64", "arm64"]
+    supportedOS:
+      - name: centos
+        versions: ["7", "8"]
+      - name: ubuntu
+        versions: ["20.04", "22.04"]
+
+  nodeFilter:
+    roles: ["master"]
+    skipCompleted: true
+
+  dependencies:
+    - name: bkeagent
+      phase: Install
+
+  upgradeStrategy:
+    mode: Parallel
+    timeout: "5m"
+    failurePolicy: Continue
+```
+
+### 6.8 calicoctl ComponentVersion
+
+```yaml
+# bke-manifests/calicoctl/v3.27.0/component.yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: calicoctl-v3.27.0
+spec:
+  name: calicoctl
+  type: binary
+  version: v3.27.0
+
+  binary:
+    artifacts:
+      - name: calicoctl
+        url: "{{imageRegistry}}/calico/{{version}}/calicoctl-linux-{{arch}}"
+        checksum: "sha256:vwx012..."
+        installPath: "/usr/local/bin"
+
+    installScript: |
+      #!/bin/bash
+      set -e
+      install -m 0755 {{artifact.calicoctl.installPath}}/calicoctl-linux-{{arch}} /usr/local/bin/calicoctl
+
+    uninstallScript: |
+      #!/bin/bash
+      rm -f /usr/local/bin/calicoctl
+
+    healthCheck:
+      enabled: true
+      timeout: "30s"
+      interval: "5s"
+      script: |
+        calicoctl version | grep -q "{{version}}"
+
+    supportedArchitectures: ["amd64", "arm64"]
+    supportedOS:
+      - name: centos
+        versions: ["7", "8"]
+      - name: ubuntu
+        versions: ["20.04", "22.04"]
+
+  nodeFilter:
+    roles: ["master", "worker"]
+    skipCompleted: true
+
+  dependencies:
+    - name: bkeagent
+      phase: Install
+
+  upgradeStrategy:
+    mode: Parallel
+    timeout: "5m"
+    failurePolicy: Continue
+```
+
+### 6.9 lxcfs ComponentVersion
+
+```yaml
+# bke-manifests/lxcfs/v6.0.2/component.yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: lxcfs-v6.0.2
+spec:
+  name: lxcfs
+  type: binary
+  version: v6.0.2
+
+  binary:
+    variables:
+      configDir: "/etc/lxcfs"
+
+    artifacts:
+      - name: lxcfs
+        url: "{{imageRegistry}}/lxcfs/{{version}}/lxcfs-{{version}}-linux-{{arch}}.tar.gz"
+        checksum: "sha256:yza345..."
+        installPath: "/usr/local"
+
+    configTemplates:
+      - name: lxcfs.service
+        path: "/etc/systemd/system/lxcfs.service"
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=FUSE filesystem for LXC
+          After=network.target
+          
+          [Service]
+          ExecStartPre=/bin/mkdir -p /var/lib/lxcfs
+          ExecStart=/usr/local/bin/lxcfs /var/lib/lxcfs
+          Restart=always
+          RestartSec=5
+          
+          [Install]
+          WantedBy=multi-user.target
+
+    installScript: |
+      #!/bin/bash
+      set -e
+      
+      mkdir -p /var/lib/lxcfs
+      
+      tar -xzf {{artifact.lxcfs.installPath}}/lxcfs-{{version}}-linux-{{arch}}.tar.gz -C /usr/local
+      
+      {{if .isUpgrade}}
+      systemctl stop lxcfs
+      {{end}}
+      
+      systemctl daemon-reload
+      systemctl enable lxcfs
+      systemctl start lxcfs
+
+    uninstallScript: |
+      #!/bin/bash
+      systemctl stop lxcfs || true
+      systemctl disable lxcfs || true
+      rm -f /usr/local/bin/lxcfs
+      rm -f /etc/systemd/system/lxcfs.service
+      systemctl daemon-reload
+
+    healthCheck:
+      enabled: true
+      timeout: "1m"
+      interval: "5s"
+      script: |
+        systemctl is-active lxcfs
+
+    supportedArchitectures: ["amd64", "arm64"]
+    supportedOS:
+      - name: centos
+        versions: ["7", "8"]
+      - name: ubuntu
+        versions: ["20.04", "22.04"]
+
+  nodeFilter:
+    roles: ["master", "worker"]
+    skipCompleted: true
+
+  dependencies:
+    - name: bkeagent
+      phase: Install
+
+  upgradeStrategy:
+    mode: Rolling
+    batchSize: 1
+    timeout: "5m"
+    failurePolicy: Continue
+```
+
+### 6.10 nfs-utils ComponentVersion
+
+```yaml
+# bke-manifests/nfs-utils/v2.6.4/component.yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: nfs-utils-v2.6.4
+spec:
+  name: nfs-utils
+  type: binary
+  version: v2.6.4
+
+  binary:
+    variables:
+      # nfs-utils 通过包管理器安装，无二进制制品
+      # installScript 根据操作系统自动选择 yum/apt
+
+    # 无 artifacts（通过包管理器安装）
+
+    installScript: |
+      #!/bin/bash
+      set -e
+      
+      # 检测操作系统
+      if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS=$ID
+      else
+        OS="centos"
+      fi
+      
+      case "$OS" in
+        centos|rhel)
+          yum install -y nfs-utils
+          ;;
+        ubuntu|debian)
+          apt-get update
+          apt-get install -y nfs-common
+          ;;
+        *)
+          echo "Unsupported OS: $OS"
+          exit 1
+          ;;
+      esac
+      
+      systemctl enable nfs-server || true
+      systemctl start nfs-server || true
+
+    uninstallScript: |
+      #!/bin/bash
+      systemctl stop nfs-server || true
+      systemctl disable nfs-server || true
+      
+      if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        OS=$ID
+      fi
+      
+      case "$OS" in
+        centos|rhel)
+          yum remove -y nfs-utils
+          ;;
+        ubuntu|debian)
+          apt-get remove -y nfs-common
+          ;;
+      esac
+
+    healthCheck:
+      enabled: true
+      timeout: "1m"
+      interval: "5s"
+      script: |
+        rpcinfo -p localhost | grep -q nfs
+
+    supportedArchitectures: ["amd64", "arm64"]
+    supportedOS:
+      - name: centos
+        versions: ["7", "8"]
+      - name: ubuntu
+        versions: ["20.04", "22.04"]
+
+  nodeFilter:
+    roles: ["master", "worker"]
+    skipCompleted: true
+
+  dependencies:
+    - name: bkeagent
+      phase: Install
+
+  upgradeStrategy:
+    mode: Parallel
+    timeout: "5m"
+    failurePolicy: Continue
+```
+
+> **注意**：nfs-utils 是唯一一个不通过二进制制品下载安装的组件，它通过包管理器（yum/apt）安装。installScript 中的 OS 自检测逻辑（通过 `/etc/os-release`）使得同一份 ComponentVersion 可以适配不同操作系统。
+
 ## 7. 迁移策略
 
 ### 7.1 Feature Gate 设计
