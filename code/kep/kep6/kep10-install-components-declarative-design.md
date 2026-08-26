@@ -679,7 +679,7 @@ var (
 
 ### 9.4 Legacy PhaseFlow 完全移除方案
 
-当迁移到 Phase 4 时，需要完全移除 Legacy PhaseFlow 路径。以下针对 7.1 节中列出的每个 Legacy 场景，给出 DAG 化的完整方案：
+当迁移到 Phase 4 时，需要完全移除 Legacy PhaseFlow 路径。以下针对 7.1 节中列出的每个 Legacy 场景，给出 DAG 化的完整方案。
 
 #### 9.4.1 场景覆盖总览
 
@@ -918,21 +918,204 @@ func (r *BKEClusterReconciler) reconcileCluster(ctx, phaseCtx, oldCluster, newCl
 }
 ```
 
-#### 9.4.8 移除工作量
+### 9.5 平滑升级方案
 
-| 任务 | 说明 | 工作量（人天） |
-|------|------|---------------|
-| 纳管 DAG 化 | `manage` 组件 + `BuildVersionContextForManage` | 2 |
-| 扩容 DAG 化 | `EnsureMasterInit` 幂等改造 + VersionContext 过滤 | 2 |
-| 删除/重置 DAG 化 | `BuildUninstallDAGFromBundle` + 逆序执行 | 3 |
-| DryRun DAG 化 | `ExecutionContext.DryRun` + 各执行器适配 | 1 |
-| 暂停检查迁移 | `shouldUseDeclarativeInstall` 增加暂停检查 | 0.5 |
-| 执行入口重写 | `reconcileCluster` 场景分发 | 1 |
-| PhaseFlow 代码清理 | 移除 `DeployPhases` / `PhaseFlow` / `PhaseStatus` | 2 |
-| 回归测试 | 所有场景 E2E 测试 | 5 |
-| **小计** | - | **16.5 人天** |
+Legacy PhaseFlow 的完全移除不能一蹴而就，需要分阶段平滑过渡，确保生产环境零中断。
 
-> **注意**：此工作量叠加在 Phase 1-3（27 人天）之上，Legacy 完全移除的总工作量为 27 + 16.5 = 43.5 人天。
+#### 9.5.1 平滑升级核心原则
+
+| 原则 | 说明 |
+|------|------|
+| **双路径并存** | PhaseFlow 和 DAG 安装路径同时存在，通过 Feature Gate 切换 |
+| **逐组件迁移** | 不是一个 openFuyao 版本迁移所有组件，而是逐步将 DeployPhase 迁移到 DAG |
+| **灰度验证** | 先在测试环境验证，再灰度到生产环境 |
+| **回退能力** | DAG 路径出现问题时，可通过关闭 Feature Gate 回退到 PhaseFlow |
+| **版本对齐** | 每个迁移阶段对齐一个 openFuyao 版本，不在运行中切换 |
+
+#### 9.5.2 平滑升级分阶段计划
+
+```
+openFuyao v2.7.0  ──────  openFuyao v2.8.0  ──────  openFuyao v2.9.0  ──────  openFuyao v3.0.0
+     │                        │                        │                        │
+     ├─ Phase 1: 结构扩展     │                        │                        │
+     │  扩展 ReleaseImage     │                        │                        │
+     │  InstallComponent      │                        │                        │
+     │  新增 inline 字段      │                        │                        │
+     │  (不改变执行路径)       │                        │                        │
+     │                        │                        │                        │
+     │  Feature Gate: OFF     │                        │                        │
+     │                        │                        │                        │
+     │                        ├─ Phase 2: 部分 DAG     │                        │
+     │                        │  迁移低风险组件:        │                        │
+     │                        │  bkeagent/nodes-env/    │                        │
+     │                        │  certs/load-balance    │                        │
+     │                        │  PhaseFlow 处理剩余    │                        │
+     │                        │                        │                        │
+     │                        │  Feature Gate: 灰度    │                        │
+     │                        │                        │                        │
+     │                        │                        ├─ Phase 3: 全量 DAG     │
+     │                        │                        │  迁移高风险组件:        │
+     │                        │                        │  kubernetes-master/    │
+     │                        │                        │  kubernetes-worker/    │
+     │                        │                        │  agent-switch          │
+     │                        │                        │  DAG 处理所有安装       │
+     │                        │                        │                        │
+     │                        │                        │  Feature Gate: ON     │
+     │                        │                        │                        │
+     │                        │                        │                        ├─ Phase 4: 移除 Legacy
+     │                        │                        │                        │  纳管/扩容/删除 DAG化
+     │                        │                        │                        │  移除 PhaseFlow 代码
+     │                        │                        │                        │
+     │                        │                        │                        │  Feature Gate: 移除
+```
+
+#### 9.5.3 Phase 1: 结构扩展（v2.7.0）
+
+**目标**：扩展 CRD 结构，不改变任何执行路径。
+
+| 任务 | 说明 |
+|------|------|
+| 扩展 `ReleaseImageInstallComponent` | 新增 `inline` 字段（omitempty，向后兼容） |
+| 定义 `DeclarativeInstallCatalog` | 静态映射表，不被执行路径消费 |
+| 定义 `InstallComponentSpec` | 类型定义，不接入 Scheduler |
+| 编写安装组件 ComponentVersion | 为所有安装组件编写 `spec.dependencies` |
+| 补充 ReleaseImage | v2.7.0 ReleaseImage 的 install.components 补充 inline 字段 |
+
+**风险控制**：不改变任何执行逻辑，仅扩展数据结构，零风险。
+
+#### 9.5.4 Phase 2: 部分 DAG 灰度（v2.8.0）
+
+**目标**：将低风险安装组件迁移到 DAG 路径，高风险组件仍走 PhaseFlow。
+
+**迁移顺序**（按风险从低到高）：
+
+| 批次 | 组件 | 迁移理由 | PhaseFlow 是否保留 |
+|------|------|---------|-------------------|
+| 1 | bkeagent | 逻辑简单（SSH 推送），无集群依赖 | 保留（回退） |
+| 2 | nodes-env | 逻辑简单（环境准备），无集群依赖 | 保留（回退） |
+| 3 | certs | 逻辑独立（证书生成），无集群依赖 | 保留（回退） |
+| 4 | load-balance | HA 组件，依赖 certs | 保留（回退） |
+
+**混合执行模式**：
+
+```go
+func (r *BKEClusterReconciler) executePhaseFlow(ctx, phaseCtx, oldCluster, newCluster) {
+    if r.shouldUseDeclarativeInstall(newCluster) {
+        // Phase 2: 仅执行已迁移组件的 DAG
+        r.executePartialInstallDAG(ctx, phaseCtx, oldCluster, newCluster,
+            // 已迁移组件列表
+            []string{"bkeagent", "nodes-env", "certs", "load-balance"},
+        )
+        // 未迁移组件仍走 PhaseFlow
+        flow := phases.NewPhaseFlow(phaseCtx, 
+            phases.WithSkipPhases("EnsureBKEAgent", "EnsureNodesEnv", "EnsureCerts", "EnsureLoadBalance"),
+        )
+        flow.CalculatePhase(oldCluster, newCluster)
+        flow.Execute()
+        return
+    }
+    // Legacy: 全部走 PhaseFlow
+    flow := phases.NewPhaseFlow(phaseCtx)
+    ...
+}
+```
+
+**灰度策略**：
+- Feature Gate `DeclarativeInstallEnabled` 默认 OFF
+- 测试环境开启 Feature Gate，验证 DAG + PhaseFlow 混合模式
+- 生产环境灰度：先在非核心集群开启，观察 1-2 周后扩大范围
+- 回退方案：关闭 Feature Gate，立即回退到全 PhaseFlow
+
+#### 9.5.5 Phase 3: 全量 DAG（v2.9.0）
+
+**目标**：所有安装组件迁移到 DAG 路径，PhaseFlow 不再执行任何安装 Phase。
+
+**迁移高风险组件**：
+
+| 批次 | 组件 | 风险点 | 迁移措施 |
+|------|------|--------|---------|
+| 5 | kubernetes-master | kubeadm init 逻辑复杂 | 确保 `EnsureMasterInit` handler 完整覆盖 init + join |
+| 6 | kubernetes-worker | kubeadm join + drain 逻辑 | 确保 `EnsureWorkerJoin` handler 完整 |
+| 7 | kube-proxy/coredns | manifest 应用 | 复用升级路径的 YamlInstaller |
+| 8 | agent-switch | Agent 监听切换 | 确保 `EnsureAgentSwitch` handler 幂等 |
+| 9 | nodes-postprocess | 后置脚本 | 确保 `EnsureNodesPostProcess` handler 幂等 |
+
+**执行入口**：
+
+```go
+func (r *BKEClusterReconciler) executePhaseFlow(ctx, phaseCtx, oldCluster, newCluster) {
+    if r.shouldUseDeclarativeInstall(newCluster) {
+        // Phase 3: 全量 DAG 执行所有安装组件
+        r.executeInstallDAG(ctx, phaseCtx, oldCluster, newCluster)
+        // PhaseFlow 不再执行任何 DeployPhase
+        // 但 CommonPhases (Finalizer/Paused/...) 仍走 PhaseFlow
+        flow := phases.NewPhaseFlow(phaseCtx, phases.WithDeployPhasesSkipAll())
+        flow.CalculatePhase(oldCluster, newCluster)
+        flow.Execute()
+        return
+    }
+    // Legacy: 全部走 PhaseFlow
+    ...
+}
+```
+
+**Feature Gate 状态**：ON（正式启用），但保留关闭能力作为回退。
+
+#### 9.5.6 Phase 4: 移除 Legacy（v3.0.0）
+
+**目标**：完全移除 PhaseFlow 的 DeployPhases，将所有场景（纳管/扩容/删除/DryRun/暂停）DAG 化。
+
+**移除步骤**：
+
+| 步骤 | 任务 | 说明 |
+|------|------|------|
+| 1 | 纳管 DAG 化 | 新增 `manage` 组件，`BuildVersionContextForManage` |
+| 2 | 扩容 DAG 化 | `EnsureMasterInit` 幂等改造（区分 init/join） |
+| 3 | 删除/重置 DAG 化 | `BuildUninstallDAGFromBundle` + 逆序执行 |
+| 4 | DryRun DAG 化 | `ExecutionContext.DryRun` 标记 |
+| 5 | 暂停检查迁移 | `shouldUseDeclarativeInstall` 增加暂停检查 |
+| 6 | 执行入口重写 | `reconcileCluster` 场景分发，无 PhaseFlow 回退 |
+| 7 | 移除 PhaseFlow 代码 | 删除 `DeployPhases` / `PhaseFlow` / 相关 `PhaseStatus` |
+| 8 | 移除 Feature Gate | `DeclarativeInstallEnabled` 不再需要 |
+
+**回退方案**：此阶段无回退——PhaseFlow 代码已移除。必须在 Phase 3 充分验证后才执行。
+
+#### 9.5.7 平滑升级风险控制
+
+| 风险 | 缓解措施 |
+|------|---------|
+| **混合模式行为不一致** | Phase 2 中 DAG 和 PhaseFlow 混合执行，需确保组件间状态正确传递 |
+| **部分迁移后中断** | Phase 2 迁移到一半发现问题，可关闭 Feature Gate 回退 |
+| **v2.8.0 升级到 v2.9.0 时路径切换** | v2.9.0 安装走 DAG，但集群是从 v2.8.0（PhaseFlow）升级来的，需处理状态兼容 |
+| **PhaseFlow 移除后回归** | Phase 4 移除代码后发现问题，无法回退到 PhaseFlow；必须在 Phase 3 充分验证 |
+| **CommonPhases 仍依赖 PhaseFlow** | Finalizer/Paused/ClusterManage 等通用 Phase 仍走 PhaseFlow，需单独处理 |
+
+#### 9.5.8 状态追踪迁移
+
+PhaseFlow 使用 `PhaseStatus` 追踪进度，DAG 使用 `DeclarativeUpgradeStatus` 追踪进度。平滑升级期间需处理状态兼容：
+
+| 阶段 | 安装状态来源 | 升级状态来源 | 兼容性处理 |
+|------|------------|------------|-----------|
+| Phase 1 | PhaseStatus | DeclarativeUpgradeStatus | 无变化 |
+| Phase 2 | PhaseStatus（未迁移组件）+ DeclarativeUpgradeStatus（已迁移组件） | DeclarativeUpgradeStatus | DAG 执行前清理 PhaseStatus 中已迁移组件的状态 |
+| Phase 3 | DeclarativeUpgradeStatus | DeclarativeUpgradeStatus | PhaseStatus 不再写入安装组件 |
+| Phase 4 | DeclarativeUpgradeStatus | DeclarativeUpgradeStatus | 移除 PhaseStatus |
+
+```go
+// Phase 2: 混合模式状态清理
+func (r *BKEClusterReconciler) executePartialInstallDAG(...) {
+    // 执行 DAG 前，清理已迁移组件的 PhaseStatus
+    for _, migratedComp := range migratedComponents {
+        delete(bkeCluster.Status.PhaseStatus, migratedComp.PhaseName)
+    }
+    
+    // 执行 DAG（已迁移组件）
+    r.executeInstallDAG(ctx, phaseCtx, oldCluster, newCluster, migratedComponents)
+    
+    // 执行 PhaseFlow（未迁移组件）
+    // PhaseFlow 中 NeedExecute 会跳过已迁移组件（因为状态已在 DAG 中标记完成）
+}
+```
 
 ## 10. 可观测性
 
@@ -969,56 +1152,132 @@ kubectl get bkecluster my-cluster -o jsonpath='{.status.clusterComponentStatuses
 
 ## 11. 工作量评估
 
-### 11.1 开发工作量
+### 11.1 Phase 1: 结构扩展开发工作量
 
 | 模块 | 任务 | 工作量（人天） |
 |------|------|---------------|
-| **CRD 扩展** | `ReleaseImageInstallComponent` 新增 `inline` 字段 + deepcopy + webhook | 1 |
-| **安装组件目录** | `DeclarativeInstallCatalog` + `InstallComponentSpec` | 1 |
-| **ComponentFactory 注册** | 注册安装 handler 到 factory | 1 |
-| **VersionContext 扩展** | 新增 `DecisionInstall` + `BuildVersionContextForInstall` | 1.5 |
-| **安装 DAG 构建** | `BuildInstallDAGFromBundle` + `InstallComponentsFromBundle` | 2 |
-| **executeInstallDAG** | 安装 DAG 执行入口 + `shouldUseDeclarativeInstall` | 2 |
-| **安装 annotation 机制** | `install-ready` annotation + ClusterVersionReconciler 适配 | 1 |
-| **Feature Gate** | `DeclarativeInstallEnabled` 实现 | 0.5 |
-| **ComponentVersion 依赖定义** | 为安装组件编写 `spec.dependencies` | 2 |
-| **ReleaseImage 适配** | 为 v2.7.0 ReleaseImage 补充 install.components.inline | 1 |
-| **小计** | - | **13 人天** |
+| **CRD 扩展** | `ReleaseImageInstallComponent` 新增 `inline` 字段 + deepcopy + webhook | 2 |
+| **安装组件目录** | `DeclarativeInstallCatalog` + `InstallComponentSpec` | 2 |
+| **ComponentFactory 注册** | 注册安装 handler 到 factory + 验证幂等性 | 2 |
+| **VersionContext 扩展** | 新增 `DecisionInstall` + `BuildVersionContextForInstall` + 单元测试 | 3 |
+| **安装 DAG 构建** | `BuildInstallDAGFromBundle` + `InstallComponentsFromBundle` + 循环依赖检测 | 3 |
+| **executeInstallDAG** | 安装 DAG 执行入口 + `shouldUseDeclarativeInstall` + 状态追踪 | 3 |
+| **安装 annotation 机制** | `install-ready` annotation + ClusterVersionReconciler 适配 | 2 |
+| **Feature Gate** | `DeclarativeInstallEnabled` 实现 + 默认关闭验证 | 1 |
+| **ComponentVersion 依赖定义** | 为 11 个安装组件编写 `spec.dependencies` + 验证拓扑正确性 | 4 |
+| **ReleaseImage 适配** | 为 v2.7.0 ReleaseImage 补充 install.components.inline + 测试 | 2 |
+| **CommonPhases 兼容** | 确保 Finalizer/Paused/ClusterManage 等通用 Phase 与 DAG 共存 | 2 |
+| **小计** | - | **26 人天** |
 
-### 11.2 测试工作量
+### 11.2 Phase 1: 测试工作量
 
 | 测试类型 | 测试内容 | 工作量（人天） |
 |---------|---------|---------------|
-| **单元测试** | DAG 构建、VersionContext、Catalog | 2 |
-| **集成测试** | 全新安装流程 | 5 |
-| **E2E 测试** | 完整安装 → 升级流程 | 5 |
-| **回归测试** | PhaseFlow 路径回归 | 2 |
-| **小计** | - | **14 人天** |
+| **单元测试** | DAG 构建、VersionContext、Catalog、依赖解析 | 4 |
+| **集成测试** | 全新安装流程（DAG 路径） | 5 |
+| **回归测试** | PhaseFlow 路径回归（确保不受影响） | 3 |
+| **小计** | - | **12 人天** |
 
-### 11.3 Legacy 完全移除工作量
+### 11.3 Phase 2: 部分 DAG 灰度工作量
 
-| 任务 | 说明 | 工作量（人天） |
+| 模块 | 任务 | 工作量（人天） |
 |------|------|---------------|
-| 纳管 DAG 化 | `manage` 组件 + `BuildVersionContextForManage` | 2 |
-| 扩容 DAG 化 | `EnsureMasterInit` 幂等改造 + VersionContext 过滤 | 2 |
-| 删除/重置 DAG 化 | `BuildUninstallDAGFromBundle` + 逆序执行 | 3 |
-| DryRun DAG 化 | `ExecutionContext.DryRun` + 执行器适配 | 1 |
-| 暂停检查迁移 | `shouldUseDeclarativeInstall` 增加暂停检查 | 0.5 |
-| 执行入口重写 | `reconcileCluster` 场景分发 | 1 |
-| PhaseFlow 代码清理 | 移除 `DeployPhases` / `PhaseFlow` / `PhaseStatus` | 2 |
-| 回归测试 | 所有场景 E2E 测试 | 5 |
-| **小计** | - | **16.5 人天** |
+| **混合执行模式** | `executePartialInstallDAG` + `WithSkipPhases` PhaseFlow 扩展 | 4 |
+| **状态追踪兼容** | PhaseStatus ↔ DeclarativeUpgradeStatus 状态清理 + 互不冲突 | 3 |
+| **低风险组件迁移** | bkeagent/nodes-env/certs/load-balance 迁移 + NeedExecute 适配 | 3 |
+| **灰度验证框架** | Feature Gate 灰度策略 + 日志 + 监控 | 2 |
+| **小计** | - | **12 人天** |
 
-### 11.4 总工作量汇总
+### 11.4 Phase 2: 灰度测试工作量
 
-| 类别 | 工作量（人天） |
-|------|---------------|
-| **开发**（Phase 1-3） | 13 |
-| **测试**（Phase 1-3） | 14 |
-| **Legacy 移除**（Phase 4） | 16.5 |
-| **总计** | **43.5** |
+| 测试类型 | 测试内容 | 工作量（人天） |
+|---------|---------|---------------|
+| **混合模式测试** | DAG + PhaseFlow 混合执行 + 状态正确性 | 5 |
+| **回退测试** | Feature Gate ON→OFF 回退验证 | 3 |
+| **小计** | - | **8 人天** |
+
+### 11.5 Phase 3: 全量 DAG 工作量
+
+| 模块 | 任务 | 工作量（人天） |
+|------|------|---------------|
+| **高风险组件迁移** | kubernetes-master/worker/agent-switch/nodes-postprocess 迁移 | 5 |
+| **MasterInit 幂等改造** | 区分 init/join + 已有节点跳过逻辑 | 3 |
+| **DryRun DAG 化** | `ExecutionContext.DryRun` + 各执行器适配 | 2 |
+| **暂停检查迁移** | `shouldUseDeclarativeInstall` 增加暂停检查 | 1 |
+| **CommonPhases DAG 化** | Finalizer/Paused 等通用 Phase 迁移或保留决策 | 2 |
+| **小计** | - | **13 人天** |
+
+### 11.6 Phase 3: 全量测试工作量
+
+| 测试类型 | 测试内容 | 工作量（人天） |
+|---------|---------|---------------|
+| **集成测试** | 全量 DAG 安装 + 升级流程 | 5 |
+| **E2E 测试** | 安装 → 升级 → 扩容 → 删除全流程 | 5 |
+| **DryRun 测试** | DryRun DAG 验证 | 2 |
+| **小计** | - | **12 人天** |
+
+### 11.7 Phase 4: Legacy 移除工作量
+
+| 模块 | 任务 | 工作量（人天） |
+|------|------|---------------|
+| **纳管 DAG 化** | `manage` 组件 + `BuildVersionContextForManage` + 版本探测逻辑 | 4 |
+| **扩容 DAG 化** | `EnsureMasterInit` 幂等完善 + VersionContext 节点级过滤 | 3 |
+| **删除/重置 DAG 化** | `BuildUninstallDAGFromBundle` + 逆序执行 + 卸载脚本 | 5 |
+| **执行入口重写** | `reconcileCluster` 场景分发 + 无 PhaseFlow 回退 | 3 |
+| **PhaseFlow 代码清理** | 移除 `DeployPhases` / `PhaseFlow` / `PhaseStatus` + 依赖清理 | 4 |
+| **Feature Gate 移除** | 移除 `DeclarativeInstallEnabled` + 清理条件判断 | 1 |
+| **小计** | - | **20 人天** |
+
+### 11.8 Phase 4: 回归测试工作量
+
+| 测试类型 | 测试内容 | 工作量（人天） |
+|---------|---------|---------------|
+| **全场景 E2E** | 安装/升级/扩容/纳管/删除/DryRun/暂停 | 8 |
+| **回归测试** | 确保移除 PhaseFlow 后无遗漏 | 5 |
+| **性能测试** | DAG vs PhaseFlow 性能对比 | 2 |
+| **小计** | - | **15 人天** |
+
+### 11.9 文档工作量
+
+| 文档类型 | 文档内容 | 工作量（人天） |
+|---------|---------|---------------|
+| **设计文档** | 本 KEP 文档完善 | 2 |
+| **升级指南** | PhaseFlow → DAG 迁移指南 | 2 |
+| **运维手册** | DAG 安装路径运维手册 | 2 |
+| **故障排查** | DAG 安装故障排查指南 | 1 |
+| **小计** | - | **7 人天** |
+
+### 11.10 总工作量汇总
+
+| 阶段 | 开发（人天） | 测试（人天） | 小计 |
+|------|------------|------------|------|
+| **Phase 1: 结构扩展** | 26 | 12 | 38 |
+| **Phase 2: 灰度迁移** | 12 | 8 | 20 |
+| **Phase 3: 全量 DAG** | 13 | 12 | 25 |
+| **Phase 4: Legacy 移除** | 20 | 15 | 35 |
+| **文档** | - | - | 7 |
+| **总计** | **71** | **47** | **125** |
+
+**按 openFuyao 版本节奏估算**：
+
+| openFuyao 版本 | 阶段 | 工作量（人天） | 说明 |
+|---------------|------|---------------|------|
+| **v2.7.0** | Phase 1: 结构扩展 | 38 | CRD 扩展 + 目录定义 + DAG 构建器 |
+| **v2.8.0** | Phase 2: 灰度迁移 | 20 | 低风险组件 DAG 化 + 混合模式 |
+| **v2.9.0** | Phase 3: 全量 DAG | 25 | 高风险组件 DAG 化 + 全量验证 |
+| **v3.0.0** | Phase 4: Legacy 移除 | 35 | 纳管/扩容/删除 DAG 化 + 代码清理 |
+| **文档** | 全程 | 7 | 分阶段交付 |
+| **总计** | - | **125** | 4 个版本周期 |
+
+**按人员配置估算**（单阶段）：
+- Phase 1（38 人天）：2 人约 4 周，3 人约 2.5 周
+- Phase 2（20 人天）：2 人约 2 周，3 人约 1.5 周
+- Phase 3（25 人天）：2 人约 2.5 周，3 人约 1.5 周
+- Phase 4（35 人天）：2 人约 3.5 周，3 人约 2.5 周
 
 ## 12. 风险与缓解措施
+
+### 12.1 技术风险
 
 | 风险 | 影响 | 概率 | 缓解措施 |
 |------|------|------|---------|
@@ -1026,7 +1285,26 @@ kubectl get bkecluster my-cluster -o jsonpath='{.status.clusterComponentStatuses
 | **PhaseFlow 回归** | 新增 DAG 路径影响现有安装 | 低 | Feature Gate 控制，默认不启用 |
 | **ComponentVersion 缺失** | 安装组件无依赖定义 | 中 | 补充所有安装组件的 `spec.dependencies` |
 | **新旧路径行为不一致** | DAG 安装与 PhaseFlow 安装结果不同 | 中 | 对比测试，确保行为一致 |
-| **MasterJoin 复用 MasterInit handler** | Master 加入使用 MasterInit 逻辑可能不匹配 | 低 | 验证 MasterInit handler 对已有 Master 的幂等性 |
+| **MasterJoin 复用 MasterInit handler** | Master 加入使用 MasterInit 逻辑可能不匹配 | 中 | 验证 MasterInit handler 对已有 Master 的幂等性 |
+| **混合模式状态冲突** | PhaseStatus 与 DeclarativeUpgradeStatus 同时写入 | 中 | 状态清理逻辑，执行前清理对方状态 |
+| **CommonPhades 依赖 PhaseFlow** | Finalizer/Paused 等 Phase 嵌入 PhaseFlow | 中 | Phase 4 单独处理 CommonPhases 迁移 |
+
+### 12.2 平滑升级风险
+
+| 风险 | 影响 | 概率 | 缓解措施 |
+|------|------|------|---------|
+| **Phase 2 混合模式中断** | DAG + PhaseFlow 混合执行行为异常 | 高 | 逐组件迁移 + 充分测试 + Feature Gate 回退 |
+| **版本间路径切换** | v2.8.0 PhaseFlow 安装 → v2.9.0 DAG 安装 | 中 | VersionContext 从 PhaseStatus 推导 Current |
+| **Phase 4 无回退** | 移除 PhaseFlow 后发现问题无法回退 | 高 | Phase 3 充分验证 + 灰度周期足够长 |
+| **灰度范围扩大过快** | 生产环境问题未充分暴露 | 中 | 每个灰度阶段观察 1-2 周 |
+
+### 12.3 业务风险
+
+| 风险 | 影响 | 概率 | 缓解措施 |
+|------|------|------|---------|
+| **业务 Pod 重启** | 业务短暂中断 | 高 | 选择业务低峰期升级 |
+| **安装中断后重试** | 部分组件已安装，重试行为异常 | 中 | DeclarativeUpgradeStatus 追踪已完成组件，跳过重试 |
+| **升级期间集群不可用** | 控制面组件重启 | 中 | 逐节点滚动升级，保持多数派可用 |
 
 ---
 
