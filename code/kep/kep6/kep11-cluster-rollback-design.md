@@ -864,7 +864,7 @@ BKE 提供两种版本回滚方案，详见 [第 7 章](#7-降级-dag-设计)和
 
 在现有 phaseframe.Phase 接口中新增 Backup() 方法，与 Rollback() 对称。每个组件在升级执行前自动备份自己的状态，回滚时从备份恢复。
 
-`go
+```go
 // pkg/phaseframe/interface.go
 
 // Phase 接口扩展 Backup 和 Rollback 方法
@@ -891,9 +891,9 @@ type Phase interface {
     // 通过 VersionContext 判断 current > target（降级场景）
     NeedRollback(old, new *bkev1beta1.BKECluster) bool
 }
-`
+```
 
-`go
+```go
 // pkg/phaseframe/base.go
 
 // BasePhase 提供 Backup、Rollback 和 NeedRollback 的默认实现
@@ -932,11 +932,11 @@ func (b *BasePhase) NeedRollback(old, new *bkev1beta1.BKECluster) bool {
     
     return vc.NeedsUpgrade(component)
 }
-`
+```
 
 #### 7.2.3 PhaseRunner 扩展：升级前自动备份
 
-``go
+```go
 // pkg/dagexec/inline_runner.go 扩展
 
 // PhaseRunner.Execute 扩展：升级前自动备份，回滚时调用 Rollback
