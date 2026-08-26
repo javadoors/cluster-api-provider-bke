@@ -8,7 +8,7 @@
 - 支持静态Pod组件
 - [支持预检](code/kep/kep5/kep5-2-precheck-postcheck-design-v2.md)
 
-## 安装流程与升级框架统一
+## [安装流程与升级框架统一](code/kep/kep6/声明式集群安装 DAG 详细设计.md)
 
 ## 支持回滚
 
