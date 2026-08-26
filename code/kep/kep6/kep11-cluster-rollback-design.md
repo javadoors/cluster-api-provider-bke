@@ -999,11 +999,11 @@ func (r *PhaseRunner) Execute(
     
     return err
 }
-``
+```
 
 **备份执行时机**：
 
-`
+```
 正常升级模式 Phase 执行顺序：
 
 1. phase.NeedExecute()          → 判断是否需要升级
@@ -1018,13 +1018,13 @@ func (r *PhaseRunner) Execute(
 2. phase.ExecutePreHook()        → 前置钩子
 3. phase.Rollback()              → 执行降级（内部从备份恢复）
 4. phase.ExecutePostHook(err)    → 后置钩子
-`
+```
 
 #### 7.2.4 各组件 Backup 实现
 
 每个组件实现自己的 `Backup()` 方法，备份升级前需要保存的状态：
 
-`go
+```go
 // pkg/phaseframe/phases/ensure_etcd_upgrade.go 扩展
 
 // EnsureEtcdUpgrade 新增 Backup 方法
