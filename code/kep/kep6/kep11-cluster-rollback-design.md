@@ -22,20 +22,18 @@
 5. [PhaseFlow 操作回滚设计](#5-phaseflow-操作回滚设计)
 6. [ClusterVersion 版本回滚设计](#6-clusterversion-版本回滚设计)
 7. [降级 DAG 设计](#7-降级-dag-设计)
-8. [复用升级流程降级](#8-复用升级流程降级)
-9. [方案对比与建议](#9-方案对比与建议)
-10. [组件降级顺序与策略](#10-组件降级顺序与策略)
-11. [各组件降级方案](#11-各组件降级方案)
-12. [兼容性约束](#12-兼容性约束)
-13. [双机制协同设计](#13-双机制协同设计)
-14. [安装失败处理](#14-安装失败处理)
-15. [回滚触发机制](#15-回滚触发机制)
-16. [回滚状态转换规则](#16-回滚状态转换规则)
-17. [回滚场景详细说明](#17-回滚场景详细说明)
-18. [与备份恢复的协同](#18-与备份恢复的协同)
-19. [工作量评估](#19-工作量评估)
-20. [风险与缓解](#20-风险与缓解)
-21. [毕业标准](#21-毕业标准)
+8. [组件降级顺序与策略](#8-组件降级顺序与策略)
+9. [各组件降级方案](#9-各组件降级方案)
+10. [兼容性约束](#10-兼容性约束)
+11. [双机制协同设计](#11-双机制协同设计)
+12. [安装失败处理](#12-安装失败处理)
+13. [回滚触发机制](#13-回滚触发机制)
+14. [回滚状态转换规则](#14-回滚状态转换规则)
+15. [回滚场景详细说明](#15-回滚场景详细说明)
+16. [与备份恢复的协同](#16-与备份恢复的协同)
+17. [工作量评估](#17-工作量评估)
+18. [风险与缓解](#18-风险与缓解)
+19. [毕业标准](#19-毕业标准)
 
 ---
 
@@ -810,13 +808,13 @@ ClusterVersion **只负责验证和准备**，不直接执行降级：
 2. **拉取旧版本镜像**：拉取目标版本的 ReleaseImage（OCI 镜像）
 3. **触发降级 DAG**：由 BKECluster 控制器检测到 `desiredVersion` 变化后执行降级 DAG
 
-### 6.3 回滚方案选择
+### 6.3 回滚方案
 
-BKE 提供两种版本回滚方案，详见 [第 7 章](#7-降级-dag-设计)和[第 8 章](#8-复用升级流程降级)：
+BKE 采用降级 DAG 实现版本回滚，详见 [第 7 章](#7-降级-dag-设计)：
 
-- **方案一：降级 DAG**（推荐用于复杂场景）→ [第 7 章](#7-降级-dag-设计)
-- **方案二：复用升级流程降级**（推荐用于快速交付）→ [第 8 章](#8-复用升级流程降级)
-- **方案对比与建议** → [第 9 章](#9-方案对比与建议)
+- **降级 DAG**：通过反转升级 DAG 的边方向构建降级 DAG，复用现有 Phase 的 `Rollback()` 接口执行降级
+- **升级前备份**：升级时各组件通过 `Backup()` 接口自动备份，回滚时从备份恢复
+- **组件降级顺序与策略** → [第 8 章](#8-组件降级顺序与策略)
 
 ---
 
@@ -2296,110 +2294,7 @@ flowchart TD
     Complete --> End(["回滚完成"])
 ```
 
-## 8. 复用升级流程降级
-
-**设计思路**：
-- BKE 降级机制设计：回滚本质是"降级"，复用现有升级流程
-- 设置目标版本为旧版本，按正常升级流程执行
-- 不需要为每个组件编写专门的降级代码
-- 通过重新应用旧版本的 manifest 和配置来实现降级
-- **注意**：OpenShift 不支持版本回滚，这是 BKE 的差异化能力
-
-**核心代码**：
-
-```go
-// controllers/capbke/bkecluster_controller.go
-
-func (r *BKEClusterReconciler) executeRollback(
-    ctx context.Context,
-    bkeCluster *bkev1beta1.BKECluster,
-    targetVersion string,
-) (ctrl.Result, error) {
-    // 1. 解析旧版本 ReleaseImage
-    releaseBundle, err := r.resolveReleaseBundle(ctx, targetVersion)
-    if err != nil {
-        return ctrl.Result{}, err
-    }
-
-    // 2. 复用升级流程执行降级（复用部署逻辑）
-    if err := r.applyReleaseBundle(ctx, bkeCluster, releaseBundle); err != nil {
-        return ctrl.Result{}, err
-    }
-
-    // 3. 等待所有组件就绪
-    if err := r.waitForComponentsReady(ctx, bkeCluster); err != nil {
-        return ctrl.Result{}, err
-    }
-
-    // 4. 完成回滚
-    return r.completeRollback(ctx, bkeCluster, targetVersion)
-}
-
-// applyReleaseBundle 复用部署逻辑
-func (r *BKEClusterReconciler) applyReleaseBundle(
-    ctx context.Context,
-    bkeCluster *bkev1beta1.BKECluster,
-    releaseBundle *ReleaseBundle,
-) error {
-    // 1. 部署 Agent
-    if err := r.deployAgent(ctx, bkeCluster, releaseBundle.Agent); err != nil {
-        return err
-    }
-
-    // 2. 部署 Containerd
-    if err := r.deployContainerd(ctx, bkeCluster, releaseBundle.Containerd); err != nil {
-        return err
-    }
-
-    // 3. 部署 etcd
-    if err := r.deployEtcd(ctx, bkeCluster, releaseBundle.Etcd); err != nil {
-        return err
-    }
-
-    // 4. 部署 Master 组件
-    if err := r.deployMaster(ctx, bkeCluster, releaseBundle.Master); err != nil {
-        return err
-    }
-
-    // 5. 部署 Worker 组件
-    if err := r.deployWorker(ctx, bkeCluster, releaseBundle.Worker); err != nil {
-        return err
-    }
-
-    return nil
-}
-```
-
-**优点**：
-- ✅ 实现简单，复用现有部署逻辑
-- ✅ 不需要为每个组件编写降级代码
-- ✅ 与升级流程对称，易于理解和维护
-- ✅ 实现工作量小，测试工作量小
-
-**缺点**：
-- ❌ 可能需要更长时间（需要重新部署所有组件）
-- ❌ 某些状态可能无法完全回滚（如 etcd 数据格式变更不可逆）
-
-**适用场景**：组件版本间没有数据格式变更，希望快速实现回滚能力
-
-## 9. 方案对比与建议
-
-| 维度 | 方案一：降级 DAG | 方案二：重新部署 |
-|------|----------------|----------------|
-| **实现复杂度** | 高 | 低 |
-| **实现工作量** | 大（预计 2-3 周） | 小（预计 1 周） |
-| **回滚时间** | 快（只降级需要降级的组件） | 慢（需要重新部署所有组件） |
-| **精确度** | 高 | 中 |
-| **可靠性** | 中（降级逻辑需充分测试） | 高（复用已验证的部署逻辑） |
-| **适用场景** | 数据格式变更 | 无数据格式变更 |
-| **维护成本** | 高 | 低 |
-
-**推荐实施策略**：
-
-- **阶段一（P0）**：实现方案二（重新部署）— 快速交付回滚能力
-- **阶段二（P1）**：按需实现方案一 — 处理特殊场景
-
-## 10. 组件降级顺序与策略
+## 8. 组件降级顺序与策略
 
 ```
 升级顺序：
@@ -2415,7 +2310,7 @@ func (r *BKEClusterReconciler) applyReleaseBundle(
 - **降级时**：先降级依赖组件（Worker、Master），再降级基础组件（etcd、Containerd、Agent）
 - **原因**：确保降级过程中组件之间的兼容性
 
-## 11. 各组件降级方案
+## 9. 各组件降级方案
 
 | 组件 | 回滚方案 | 复杂度 | 工作量(人月) | 关键挑战 |
 |------|---------|--------|-------------|---------|
@@ -2428,7 +2323,7 @@ func (r *BKEClusterReconciler) applyReleaseBundle(
 | **配置** | 从备份恢复 ConfigMap/Secret + 重新应用本地配置 | 中等 | 0.3 | 配置漂移；Schema 兼容性 |
 | **DAG 编排器** | 反向拓扑排序执行 | **复杂** | 0.5 | 反向执行逻辑；错误处理 |
 
-## 12. 兼容性约束
+## 10. 兼容性约束
 
 | 约束 | 说明 |
 |------|------|
@@ -2440,9 +2335,9 @@ func (r *BKEClusterReconciler) applyReleaseBundle(
 
 ---
 
-## 13. 双机制协同设计
+## 11. 双机制协同设计
 
-### 13.1 职责划分
+### 11.1 职责划分
 
 | 场景 | PhaseFlow 职责 | ClusterVersion 职责 | DAG 职责 |
 |------|---------------|---------------------|---------|
@@ -2451,7 +2346,7 @@ func (r *BKEClusterReconciler) applyReleaseBundle(
 | **配置变更失败** | 执行回滚，恢复配置 | 不参与 | 不参与 |
 | **安装失败** | 清理重建 | 不参与 | 不参与 |
 
-### 13.2 协同回滚场景
+### 11.2 协同回滚场景
 
 **场景 1：升级后扩缩容失败**
 
@@ -2500,7 +2395,7 @@ func (r *BKEClusterReconciler) applyReleaseBundle(
    └─ ClusterStatus: Ready
 ```
 
-### 13.3 协同回滚流程图
+### 11.3 协同回滚流程图
 
 ```mermaid
 flowchart TD
@@ -2533,9 +2428,9 @@ flowchart TD
 
 ---
 
-## 14. 安装失败处理
+## 12. 安装失败处理
 
-### 14.1 设计原则
+### 12.1 设计原则
 
 **安装过程不支持自动回滚，与 OpenShift 一致**
 
@@ -2545,7 +2440,7 @@ flowchart TD
 | **基础设施耦合** | 云资源（VM、网络、存储）已创建 |
 | **时间窗口** | 安装失败通常在早期阶段，重建比回滚更快 |
 
-### 14.2 安装失败处理策略
+### 12.2 安装失败处理策略
 
 ```yaml
 installFailureHandling:
@@ -2572,7 +2467,7 @@ installFailureHandling:
     estimatedTime: "5-15 分钟"
 ```
 
-### 14.3 清理脚本设计
+### 12.3 清理脚本设计
 
 ```bash
 #!/bin/bash
@@ -2630,7 +2525,7 @@ fi
 echo "Cleanup completed successfully"
 ```
 
-### 14.4 清理范围
+### 12.4 清理范围
 
 | 资源类型 | 清理范围 | 清理方式 |
 |---------|---------|---------|
@@ -2649,9 +2544,9 @@ echo "Cleanup completed successfully"
 
 ---
 
-## 15. 回滚触发机制
+## 13. 回滚触发机制
 
-### 15.1 PhaseFlow 回滚触发
+### 13.1 PhaseFlow 回滚触发
 
 **方案一：手动触发（推荐）**
 
@@ -2673,7 +2568,7 @@ if sr.StatusCount >= maxRetryCount {
 }
 ```
 
-### 15.2 ClusterVersion 回滚触发
+### 13.2 ClusterVersion 回滚触发
 
 ```bash
 # 用户通过 kubectl 触发版本回滚
@@ -2684,7 +2579,7 @@ kubectl patch clusterversion --type merge \
 # 执行降级流程
 ```
 
-### 15.3 触发方式对比
+### 13.3 触发方式对比
 
 | 触发方式 | 适用场景 | 操作方式 | 说明 |
 |----------|----------|----------|------|
@@ -2695,9 +2590,9 @@ kubectl patch clusterversion --type merge \
 
 ---
 
-## 16. 回滚状态转换规则
+## 14. 回滚状态转换规则
 
-### 16.1 PhaseFlow 回滚状态转换
+### 14.1 PhaseFlow 回滚状态转换
 
 ```go
 // 需要新增的回滚转换规则
@@ -2716,7 +2611,7 @@ ManageFailed → Ready      // 配置变更回滚
 // 最终状态是 Deleted，而不是 Ready
 ```
 
-### 16.2 ClusterVersion 回滚状态转换
+### 14.2 ClusterVersion 回滚状态转换
 
 ```go
 // ClusterVersion 降级状态转换规则（BKE 差异化能力）
@@ -2735,9 +2630,9 @@ ClusterVersionPhaseUpgrading → ClusterVersionPhaseFailed   // 回滚失败
 
 ---
 
-## 17. 回滚场景详细说明
+## 15. 回滚场景详细说明
 
-### 17.1 扩缩容失败回滚
+### 15.1 扩缩容失败回滚
 
 **失败原因**：
 - 云资源创建失败（VM、网络、存储）
@@ -2766,7 +2661,7 @@ ClusterScaleFailed → ClusterReady
 
 **预计恢复时间**：5-15 分钟
 
-### 17.2 配置变更失败回滚
+### 15.2 配置变更失败回滚
 
 **失败原因**：
 - 配置验证失败（参数不合法、冲突的配置）
@@ -2796,7 +2691,7 @@ ClusterManageFailed → ClusterReady
 
 **预计恢复时间**：3-10 分钟
 
-### 17.3 删除失败处理
+### 15.3 删除失败处理
 
 **重要说明**：删除操作是**不可逆操作**，删除失败后**不支持回滚**。
 
@@ -2816,7 +2711,7 @@ DeleteFailed → (重试删除) → Deleting → (删除完成) → Deleted
 
 **预计处理时间**：5-30 分钟
 
-### 17.4 升级失败回滚
+### 15.4 升级失败回滚
 
 **回滚策略**：
 
@@ -2841,7 +2736,7 @@ ClusterVersionPhaseFailed → ClusterVersionPhaseUpgrading → ClusterVersionPha
 
 **预计恢复时间**：15-30 分钟
 
-### 17.5 跨版本回滚
+### 15.5 跨版本回滚
 
 **场景**：需要从 v26.07 回滚到 v26.05，但 UpgradePath 只支持逐跳回滚
 
@@ -2870,9 +2765,9 @@ ClusterVersionPhaseReady (v26.07)
 
 ---
 
-## 18. 与备份恢复的协同
+## 16. 与备份恢复的协同
 
-### 18.1 备份作为回滚兜底
+### 16.1 备份作为回滚兜底
 
 备份是回滚的**兜底方案**。当声明式回滚无法满足时（如 etcd 数据格式不兼容），通过恢复 etcd 快照实现回滚：
 
@@ -2886,7 +2781,7 @@ ClusterVersionPhaseReady (v26.07)
       └─ 恢复升级前 etcd 快照
 ```
 
-### 18.2 升级前强制备份
+### 16.2 升级前强制备份
 
 升级流程中强制执行 etcd 备份，作为回滚兜底：
 
@@ -2911,7 +2806,7 @@ func (r *ClusterVersionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 }
 ```
 
-### 18.3 回滚失败后的降级路径
+### 16.3 回滚失败后的降级路径
 
 ```
 声明式回滚失败
@@ -2926,9 +2821,9 @@ func (r *ClusterVersionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 ---
 
-## 19. 工作量评估
+## 17. 工作量评估
 
-### 19.1 PhaseFlow 操作回滚
+### 17.1 PhaseFlow 操作回滚
 
 | 任务 | 工作量(人月) | 优先级 | 说明 |
 |------|-------------|--------|------|
@@ -2939,7 +2834,7 @@ func (r *ClusterVersionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 | 回滚验证与测试 | 0.8 | P0 | 单元测试、集成测试、端到端测试 |
 | **小计** | **4.3** | | |
 
-### 19.2 ClusterVersion 版本回滚
+### 17.2 ClusterVersion 版本回滚
 
 | 任务 | 工作量(人月) | 优先级 | 说明 |
 |------|-------------|--------|------|
@@ -2952,14 +2847,14 @@ func (r *ClusterVersionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 | 回滚历史管理 | 0.5 | P1 | UpgradeHistory 扩展、查询接口 |
 | **小计** | **8.6** | | |
 
-### 19.3 安装失败处理
+### 17.3 安装失败处理
 
 | 任务 | 工作量(人月) | 优先级 | 说明 |
 |------|-------------|--------|------|
 | 安装失败清理脚本 | 0.8 | P0 | 脚本开发、多环境测试 |
 | **小计** | **0.8** | | |
 
-### 19.4 工作量汇总
+### 17.4 工作量汇总
 
 | 类别 | 工作量(人月) | 优先级 |
 |------|-------------|--------|
@@ -2968,7 +2863,7 @@ func (r *ClusterVersionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 | 安装失败处理 | 0.8 | P0 |
 | **总计** | **13.7** | |
 
-### 19.5 里程碑规划
+### 17.5 里程碑规划
 
 | 里程碑 | 季度 | 工作量 | 核心交付 |
 |--------|------|--------|---------|
@@ -2978,7 +2873,7 @@ func (r *ClusterVersionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 ---
 
-## 20. 风险与缓解
+## 18. 风险与缓解
 
 | 风险 | 影响 | 概率 | 缓解措施 |
 |------|------|------|---------|
@@ -2992,7 +2887,7 @@ func (r *ClusterVersionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 ---
 
-## 21. 毕业标准
+## 19. 毕业标准
 
 | 阶段 | 标准 |
 |------|------|
