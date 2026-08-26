@@ -830,6 +830,7 @@ BKE 提供两种版本回滚方案，详见 [第 7 章](#7-降级-dag-设计)和
 - 通过 `VersionContext` 的 `current > target` 语义触发降级
 - 为每个组件实现特定的降级逻辑（数据迁移、配置回滚等）
 - 按相反顺序执行降级（Worker → Master → etcd → Containerd → Agent）
+- **升级前备份**：升级 DAG 执行前自动创建备份，回滚时从备份恢复
 
 **降级 DAG 节点顺序**：
 
@@ -841,7 +842,787 @@ BKE 提供两种版本回滚方案，详见 [第 7 章](#7-降级-dag-设计)和
   Worker → Master → etcd → Containerd → Agent
 ```
 
-### 7.2 DAG 构建与图反转
+### 7.2 升级前备份设计
+
+降级 DAG 的数据恢复依赖升级前创建的备份。备份在升级 DAG 执行的第一个 Batch 中自动创建，存储在 BKECluster 关联的 BackupSnapshot CR 中，回滚时从中读取恢复。
+
+#### 7.2.1 备份内容
+
+| 备份项 | 备份方式 | 存储位置 | 恢复时机 | 说明 |
+|--------|---------|---------|---------|------|
+| **etcd 数据快照** | `etcdctl snapshot save` | 节点本地 `/var/lib/openFuyao/backup/etcd-snapshot-<ts>.db` | etcd 降级前 | 跨大版本数据格式不兼容时恢复 |
+| **etcd Static Pod manifest** | `cp` 文件备份 | `/etc/kubernetes/manifests/etcd.yaml.bak.<ts>` | etcd 降级前 | 恢复旧版本 manifest |
+| **kube-apiserver manifest** | `cp` 文件备份 | `/etc/kubernetes/manifests/kube-apiserver.yaml.bak.<ts>` | 控制面降级前 | 恢复旧版本 manifest |
+| **kube-controller-manager manifest** | `cp` 文件备份 | `/etc/kubernetes/manifests/kube-controller-manager.yaml.bak.<ts>` | 控制面降级前 | 恢复旧版本 manifest |
+| **kube-scheduler manifest** | `cp` 文件备份 | `/etc/kubernetes/manifests/kube-scheduler.yaml.bak.<ts>` | 控制面降级前 | 恢复旧版本 manifest |
+| **containerd 配置** | `cp` 文件备份 | `/etc/containerd/config.toml.bak.<ts>` | containerd 降级前 | 恢复旧版本配置 |
+| **kubelet 配置** | `cp` 文件备份 | `/etc/kubernetes/kubelet.conf.bak.<ts>` | kubelet 降级前 | 恢复旧版本配置 |
+| **BKECluster.Spec** | 序列化到 ConfigMap | `<cluster>-spec-backup` ConfigMap | 全局回滚时 | 恢复旧版本集群配置 |
+| **组件版本信息** | 写入 ConfigMap | `<cluster>-spec-backup` ConfigMap `component-versions` key | 全局回滚时 | 恢复旧版本号到 Status |
+
+#### 7.2.2 BackupSnapshot CRD 设计
+
+```go
+// api/v1alpha1/backsnapshot_types.go 🆕新增
+
+// BackupSnapshot 升级前备份快照
+type BackupSnapshot struct {
+    metav1.TypeMeta   `json:",inline"`
+    metav1.ObjectMeta `json:"metadata,omitempty"`
+    
+    Spec   BackupSnapshotSpec   `json:"spec,omitempty"`
+    Status BackupSnapshotStatus `json:"status,omitempty"`
+}
+
+type BackupSnapshotSpec struct {
+    // 关联的 BKECluster 名称
+    ClusterName string `json:"clusterName"`
+    
+    // 升级前版本（回滚目标版本）
+    SourceVersion string `json:"sourceVersion"`
+    
+    // 升级目标版本
+    TargetVersion string `json:"targetVersion"`
+    
+    // 备份时间
+    BackupTime metav1.Time `json:"backupTime"`
+    
+    // 备份的组件列表
+    Components []BackupComponent `json:"components"`
+}
+
+// BackupComponent 单个组件的备份信息
+type BackupComponent struct {
+    // 组件名称
+    Name string `json:"name"`
+    
+    // 升级前版本
+    Version string `json:"version"`
+    
+    // 备份类型: etcd-snapshot | manifest-file | config-file | spec-configmap
+    BackupType string `json:"backupType"`
+    
+    // 备份文件路径（节点本地路径）
+    FilePath string `json:"filePath,omitempty"`
+    
+    // 备份所在节点 IP（per-node 备份）
+    NodeIP string `json:"nodeIP,omitempty"`
+    
+    // ConfigMap 备份名称（spec-configmap 类型）
+    ConfigMapName string `json:"configMapName,omitempty"`
+}
+
+type BackupSnapshotStatus struct {
+    // 备份状态: Pending | Completed | Failed
+    Phase string `json:"phase,omitempty"`
+    
+    // 备份的组件数量
+    TotalComponents int `json:"totalComponents,omitempty"`
+    
+    // 已完成备份的组件数量
+    CompletedComponents int `json:"completedComponents,omitempty"`
+    
+    // 错误信息
+    Message string `json:"message,omitempty"`
+    
+    // 备份完成时间
+    CompletedAt *metav1.Time `json:"completedAt,omitempty"`
+}
+```
+
+#### 7.2.3 备份创建流程
+
+备份在升级 DAG 的第一个 Batch 中执行，作为 `pre-upgrade-resources` 组件的前置逻辑：
+
+```
+升级 DAG Batch 0: [backup-snapshot]    ← 最先执行，在 pre-upgrade-resources 之前
+    └─ 创建 BackupSnapshot CR
+    └─ 逐节点 SSH 执行备份命令:
+       ├─ etcd: etcdctl snapshot save
+       ├─ Static Pod manifest: cp manifest 文件
+       ├─ containerd 配置: cp config.toml
+       ├─ kubelet 配置: cp kubelet.conf
+       └─ BKECluster.Spec: 序列化到 ConfigMap
+    └─ 等待所有节点备份完成
+    └─ 更新 BackupSnapshot.Status.Phase = Completed
+    └─ BKECluster annotation 记录 BackupSnapshot 名称（回滚时读取）
+```
+
+```go
+// pkg/phaseframe/phases/ensure_backup_snapshot.go 🆕新增
+
+// EnsureBackupSnapshot 升级前创建备份快照
+type EnsureBackupSnapshot struct {
+    phaseframe.BasePhase
+}
+
+func NewEnsureBackupSnapshot(ctx *phaseframe.PhaseContext) phaseframe.Phase {
+    return &EnsureBackupSnapshot{BasePhase: phaseframe.NewBasePhase(ctx, "EnsureBackupSnapshot")}
+}
+
+func (e *EnsureBackupSnapshot) NeedExecute(old, new *bkev1beta1.BKECluster) bool {
+    if !e.BasePhase.DefaultNeedExecute(old, new) {
+        return false
+    }
+    // 仅在升级时执行（安装时不备份）
+    vc := e.GetVersionContext()
+    if vc == nil {
+        return false
+    }
+    // 至少有一个组件需要升级才创建备份
+    for _, name := range upgrade.AllComponentNames() {
+        if vc.NeedsUpgrade(name) {
+            return true
+        }
+    }
+    return false
+}
+
+func (e *EnsureBackupSnapshot) Execute() (ctrl.Result, error) {
+    ctx, c, bkeCluster, _, log := e.Ctx.Untie()
+    
+    vc := e.GetVersionContext()
+    sourceVersion := vc.CurrentVersion()
+    targetVersion := vc.TargetVersion()
+    
+    log.Info("creating backup snapshot before upgrade",
+        "sourceVersion", sourceVersion, "targetVersion", targetVersion)
+    
+    // 1. 创建 BackupSnapshot CR
+    timestamp := time.Now().Unix()
+    snapshot := &apiv1alpha1.BackupSnapshot{
+        ObjectMeta: metav1.ObjectMeta{
+            Name:      fmt.Sprintf("%s-backup-%d", bkeCluster.Name, timestamp),
+            Namespace: bkeCluster.Namespace,
+            Labels: map[string]string{
+                "bke.bocloud.com/cluster-name": bkeCluster.Name,
+            },
+            OwnerReferences: []metav1.OwnerReference{ownerRef(bkeCluster)},
+        },
+        Spec: apiv1alpha1.BackupSnapshotSpec{
+            ClusterName:   bkeCluster.Name,
+            SourceVersion: sourceVersion,
+            TargetVersion: targetVersion,
+            BackupTime:    metav1.Now(),
+        },
+    }
+    
+    // 2. 收集需要备份的组件
+    backupComponents := e.collectBackupComponents(bkeCluster, vc, timestamp)
+    snapshot.Spec.Components = backupComponents
+    snapshot.Status.TotalComponents = len(backupComponents)
+    snapshot.Status.Phase = "Pending"
+    
+    if err := c.Create(ctx, snapshot); err != nil {
+        return ctrl.Result{}, fmt.Errorf("create backup snapshot: %w", err)
+    }
+    
+    // 3. 逐节点执行备份
+    bkeNodes, err := e.Ctx.NodeFetcher().GetBKENodesWrapperForCluster(e.Ctx, bkeCluster)
+    if err != nil {
+        return ctrl.Result{}, fmt.Errorf("get bke nodes: %w", err)
+    }
+    
+    completedCount := 0
+    
+    for i := range bkeNodes {
+        node := bkeNodes[i]
+        
+        // 3a. etcd 数据快照（仅 etcd 节点）
+        if isEtcdNode(node) {
+            if err := e.backupEtcdSnapshot(ctx, c, bkeCluster, node, timestamp); err != nil {
+                log.Error(err, "backup etcd snapshot failed", "node", node.Spec.IP)
+                snapshot.Status.Message = fmt.Sprintf("etcd backup failed on %s: %v", node.Spec.IP, err)
+                snapshot.Status.Phase = "Failed"
+                _ = c.Status().Update(ctx, snapshot)
+                return ctrl.Result{}, err
+            }
+            completedCount++
+        }
+        
+        // 3b. Static Pod manifest 备份（仅 Master 节点）
+        if isMasterNode(node) {
+            if err := e.backupStaticPodManifests(ctx, c, bkeCluster, node, timestamp); err != nil {
+                log.Error(err, "backup static pod manifests failed", "node", node.Spec.IP)
+                snapshot.Status.Message = fmt.Sprintf("manifest backup failed on %s: %v", node.Spec.IP, err)
+                snapshot.Status.Phase = "Failed"
+                _ = c.Status().Update(ctx, snapshot)
+                return ctrl.Result{}, err
+            }
+            completedCount++
+        }
+        
+        // 3c. containerd 配置备份（所有节点，失败不阻塞）
+        if err := e.backupContainerdConfig(ctx, c, bkeCluster, node, timestamp); err != nil {
+            log.Info("containerd config backup failed, continuing", "node", node.Spec.IP, "err", err)
+        }
+        
+        // 3d. kubelet 配置备份（所有节点，失败不阻塞）
+        if err := e.backupKubeletConfig(ctx, c, bkeCluster, node, timestamp); err != nil {
+            log.Info("kubelet config backup failed, continuing", "node", node.Spec.IP, "err", err)
+        }
+    }
+    
+    // 4. BKECluster.Spec 备份到 ConfigMap
+    if err := e.backupClusterSpec(ctx, c, bkeCluster, sourceVersion, vc); err != nil {
+        log.Info("cluster spec backup failed, continuing", "err", err)
+    }
+    
+    // 5. 更新 BackupSnapshot Status
+    snapshot.Status.Phase = "Completed"
+    snapshot.Status.CompletedComponents = completedCount
+    snapshot.Status.CompletedAt = &metav1.Time{Time: time.Now()}
+    if err := c.Status().Update(ctx, snapshot); err != nil {
+        return ctrl.Result{}, fmt.Errorf("update backup snapshot status: %w", err)
+    }
+    
+    // 6. 在 BKECluster annotation 中记录 BackupSnapshot 名称（回滚时读取）
+    if bkeCluster.Annotations == nil {
+        bkeCluster.Annotations = make(map[string]string)
+    }
+    bkeCluster.Annotations["bke.bocloud.com/backup-snapshot"] = snapshot.Name
+    
+    log.Info("backup snapshot completed", "snapshot", snapshot.Name, "components", completedCount)
+    return ctrl.Result{}, nil
+}
+
+// collectBackupComponents 收集需要备份的组件列表
+func (e *EnsureBackupSnapshot) collectBackupComponents(
+    bkeCluster *bkev1beta1.BKECluster,
+    vc *upgrade.VersionContext,
+    timestamp int64,
+) []apiv1alpha1.BackupComponent {
+    var components []apiv1alpha1.BackupComponent
+    
+    bkeNodes, _ := e.Ctx.NodeFetcher().GetBKENodesWrapperForCluster(e.Ctx, bkeCluster)
+    
+    for i := range bkeNodes {
+        node := bkeNodes[i]
+        
+        // etcd 节点：etcd 数据快照
+        if isEtcdNode(node) {
+            components = append(components, apiv1alpha1.BackupComponent{
+                Name:       "etcd",
+                Version:    vc.GetCurrent("etcd"),
+                BackupType: "etcd-snapshot",
+                FilePath:   fmt.Sprintf("/var/lib/openFuyao/backup/etcd-snapshot-%d.db", timestamp),
+                NodeIP:     node.Spec.IP,
+            })
+        }
+        
+        // Master 节点：Static Pod manifest 备份
+        if isMasterNode(node) {
+            for _, comp := range []string{"etcd", "kube-apiserver", "kube-controller-manager", "kube-scheduler"} {
+                components = append(components, apiv1alpha1.BackupComponent{
+                    Name:       comp,
+                    Version:    vc.GetCurrent(comp),
+                    BackupType: "manifest-file",
+                    FilePath:   fmt.Sprintf("/etc/kubernetes/manifests/%s.yaml.bak.%d", comp, timestamp),
+                    NodeIP:     node.Spec.IP,
+                })
+            }
+        }
+        
+        // 所有节点：containerd 配置
+        components = append(components, apiv1alpha1.BackupComponent{
+            Name:       "containerd",
+            Version:    vc.GetCurrent("containerd"),
+            BackupType: "config-file",
+            FilePath:   fmt.Sprintf("/etc/containerd/config.toml.bak.%d", timestamp),
+            NodeIP:     node.Spec.IP,
+        })
+        
+        // 所有节点：kubelet 配置
+        components = append(components, apiv1alpha1.BackupComponent{
+            Name:       "kubelet",
+            Version:    vc.GetCurrent("kubernetes-master"),
+            BackupType: "config-file",
+            FilePath:   fmt.Sprintf("/etc/kubernetes/kubelet.conf.bak.%d", timestamp),
+            NodeIP:     node.Spec.IP,
+        })
+    }
+    
+    // BKECluster.Spec 备份
+    components = append(components, apiv1alpha1.BackupComponent{
+        Name:          "cluster-spec",
+        Version:       vc.CurrentVersion(),
+        BackupType:    "spec-configmap",
+        ConfigMapName: fmt.Sprintf("%s-spec-backup", bkeCluster.Name),
+    })
+    
+    return components
+}
+
+// backupEtcdSnapshot 在节点上创建 etcd 数据快照
+func (e *EnsureBackupSnapshot) backupEtcdSnapshot(
+    ctx context.Context,
+    c client.Client,
+    bkeCluster *bkev1beta1.BKECluster,
+    node confv1beta1.Node,
+    timestamp int64,
+) error {
+    snapshotPath := fmt.Sprintf("/var/lib/openFuyao/backup/etcd-snapshot-%d.db", timestamp)
+    
+    cmd := &agentv1beta1.Command{
+        ObjectMeta: metav1.ObjectMeta{
+            Name:      fmt.Sprintf("etcd-backup-%s-%d", node.IP, timestamp),
+            Namespace: bkeCluster.Namespace,
+            Labels: map[string]string{
+                "bke.bocloud.com/cluster-name": bkeCluster.Name,
+                "bke.bocloud.com/node-ip":      node.IP,
+            },
+            OwnerReferences: []metav1.OwnerReference{ownerRef(bkeCluster)},
+        },
+        Spec: agentv1beta1.CommandSpec{
+            NodeName: node.Hostname,
+            Commands: []agentv1beta1.ExecCommand{{
+                ID: "etcd-snapshot-save",
+                Command: []string{
+                    "EtcdSnapshotSave",
+                    fmt.Sprintf("snapshot=%s", snapshotPath),
+                    fmt.Sprintf("endpoints=https://%s:2379", node.IP),
+                    "cacert=/etc/kubernetes/pki/etcd/ca.crt",
+                    "cert=/etc/kubernetes/pki/etcd/peer.crt",
+                    "key=/etc/kubernetes/pki/etcd/peer.key",
+                },
+                Type: agentv1beta1.CommandBuiltIn,
+            }},
+            BackoffLimit: 1,
+        },
+    }
+    
+    if err := c.Create(ctx, cmd); err != nil {
+        return fmt.Errorf("create etcd backup command: %w", err)
+    }
+    
+    return wait.PollUntilContextTimeout(ctx, 5*time.Second, 5*time.Minute, true,
+        func(ctx context.Context) (bool, error) {
+            updated := &agentv1beta1.Command{}
+            if err := c.Get(ctx, client.ObjectKeyFromObject(cmd), updated); err != nil {
+                return false, err
+            }
+            switch updated.Status.Phase {
+            case agentv1beta1.CommandSucceed:
+                return true, nil
+            case agentv1beta1.CommandFailed:
+                return true, fmt.Errorf("etcd snapshot save failed on %s", node.IP)
+            default:
+                return false, nil
+            }
+        })
+}
+
+// backupStaticPodManifests 备份 Master 节点上的所有 Static Pod manifest 文件
+func (e *EnsureBackupSnapshot) backupStaticPodManifests(
+    ctx context.Context,
+    c client.Client,
+    bkeCluster *bkev1beta1.BKECluster,
+    node confv1beta1.Node,
+    timestamp int64,
+) error {
+    manifests := []string{"etcd", "kube-apiserver", "kube-controller-manager", "kube-scheduler"}
+    var commands []agentv1beta1.ExecCommand
+    
+    for _, name := range manifests {
+        commands = append(commands, agentv1beta1.ExecCommand{
+            ID: fmt.Sprintf("backup-manifest-%s", name),
+            Command: []string{
+                "cp",
+                fmt.Sprintf("/etc/kubernetes/manifests/%s.yaml", name),
+                fmt.Sprintf("/etc/kubernetes/manifests/%s.yaml.bak.%d", name, timestamp),
+            },
+            Type: agentv1beta1.CommandShell,
+        })
+    }
+    
+    cmd := &agentv1beta1.Command{
+        ObjectMeta: metav1.ObjectMeta{
+            Name:      fmt.Sprintf("manifest-backup-%s-%d", node.IP, timestamp),
+            Namespace: bkeCluster.Namespace,
+            Labels: map[string]string{
+                "bke.bocloud.com/cluster-name": bkeCluster.Name,
+                "bke.bocloud.com/node-ip":      node.IP,
+            },
+            OwnerReferences: []metav1.OwnerReference{ownerRef(bkeCluster)},
+        },
+        Spec: agentv1beta1.CommandSpec{
+            NodeName:     node.Hostname,
+            Commands:     commands,
+            BackoffLimit: 1,
+        },
+    }
+    
+    if err := c.Create(ctx, cmd); err != nil {
+        return fmt.Errorf("create manifest backup command: %w", err)
+    }
+    
+    return wait.PollUntilContextTimeout(ctx, 2*time.Second, 2*time.Minute, true,
+        func(ctx context.Context) (bool, error) {
+            updated := &agentv1beta1.Command{}
+            if err := c.Get(ctx, client.ObjectKeyFromObject(cmd), updated); err != nil {
+                return false, err
+            }
+            switch updated.Status.Phase {
+            case agentv1beta1.CommandSucceed:
+                return true, nil
+            case agentv1beta1.CommandFailed:
+                return true, fmt.Errorf("manifest backup failed on %s", node.IP)
+            default:
+                return false, nil
+            }
+        })
+}
+
+// backupContainerdConfig 备份 containerd 配置文件
+func (e *EnsureBackupSnapshot) backupContainerdConfig(
+    ctx context.Context,
+    c client.Client,
+    bkeCluster *bkev1beta1.BKECluster,
+    node confv1beta1.Node,
+    timestamp int64,
+) error {
+    cmd := &agentv1beta1.Command{
+        ObjectMeta: metav1.ObjectMeta{
+            Name:      fmt.Sprintf("containerd-backup-%s-%d", node.IP, timestamp),
+            Namespace: bkeCluster.Namespace,
+            Labels: map[string]string{
+                "bke.bocloud.com/cluster-name": bkeCluster.Name,
+                "bke.bocloud.com/node-ip":      node.IP,
+            },
+            OwnerReferences: []metav1.OwnerReference{ownerRef(bkeCluster)},
+        },
+        Spec: agentv1beta1.CommandSpec{
+            NodeName: node.Hostname,
+            Commands: []agentv1beta1.ExecCommand{{
+                ID: "backup-containerd-config",
+                Command: []string{
+                    "cp", "/etc/containerd/config.toml",
+                    fmt.Sprintf("/etc/containerd/config.toml.bak.%d", timestamp),
+                },
+                Type: agentv1beta1.CommandShell,
+            }},
+            BackoffLimit: 1,
+        },
+    }
+    
+    if err := c.Create(ctx, cmd); err != nil {
+        return fmt.Errorf("create containerd backup command: %w", err)
+    }
+    
+    return wait.PollUntilContextTimeout(ctx, 2*time.Second, 1*time.Minute, true,
+        func(ctx context.Context) (bool, error) {
+            updated := &agentv1beta1.Command{}
+            if err := c.Get(ctx, client.ObjectKeyFromObject(cmd), updated); err != nil {
+                return false, err
+            }
+            switch updated.Status.Phase {
+            case agentv1beta1.CommandSucceed:
+                return true, nil
+            case agentv1beta1.CommandFailed:
+                return true, fmt.Errorf("containerd config backup failed on %s", node.IP)
+            default:
+                return false, nil
+            }
+        })
+}
+
+// backupKubeletConfig 备份 kubelet 配置文件
+func (e *EnsureBackupSnapshot) backupKubeletConfig(
+    ctx context.Context,
+    c client.Client,
+    bkeCluster *bkev1beta1.BKECluster,
+    node confv1beta1.Node,
+    timestamp int64,
+) error {
+    cmd := &agentv1beta1.Command{
+        ObjectMeta: metav1.ObjectMeta{
+            Name:      fmt.Sprintf("kubelet-backup-%s-%d", node.IP, timestamp),
+            Namespace: bkeCluster.Namespace,
+            Labels: map[string]string{
+                "bke.bocloud.com/cluster-name": bkeCluster.Name,
+                "bke.bocloud.com/node-ip":      node.IP,
+            },
+            OwnerReferences: []metav1.OwnerReference{ownerRef(bkeCluster)},
+        },
+        Spec: agentv1beta1.CommandSpec{
+            NodeName: node.Hostname,
+            Commands: []agentv1beta1.ExecCommand{{
+                ID: "backup-kubelet-config",
+                Command: []string{
+                    "cp", "/etc/kubernetes/kubelet.conf",
+                    fmt.Sprintf("/etc/kubernetes/kubelet.conf.bak.%d", timestamp),
+                },
+                Type: agentv1beta1.CommandShell,
+            }},
+            BackoffLimit: 1,
+        },
+    }
+    
+    if err := c.Create(ctx, cmd); err != nil {
+        return fmt.Errorf("create kubelet backup command: %w", err)
+    }
+    
+    return wait.PollUntilContextTimeout(ctx, 2*time.Second, 1*time.Minute, true,
+        func(ctx context.Context) (bool, error) {
+            updated := &agentv1beta1.Command{}
+            if err := c.Get(ctx, client.ObjectKeyFromObject(cmd), updated); err != nil {
+                return false, err
+            }
+            switch updated.Status.Phase {
+            case agentv1beta1.CommandSucceed:
+                return true, nil
+            case agentv1beta1.CommandFailed:
+                return true, fmt.Errorf("kubelet config backup failed on %s", node.IP)
+            default:
+                return false, nil
+            }
+        })
+}
+
+// backupClusterSpec 将 BKECluster.Spec + 组件版本序列化到 ConfigMap
+func (e *EnsureBackupSnapshot) backupClusterSpec(
+    ctx context.Context,
+    c client.Client,
+    bkeCluster *bkev1beta1.BKECluster,
+    sourceVersion string,
+    vc *upgrade.VersionContext,
+) error {
+    specData, err := json.Marshal(bkeCluster.Spec)
+    if err != nil {
+        return fmt.Errorf("marshal bkecluster spec: %w", err)
+    }
+    
+    versionData, _ := json.Marshal(vc.Current)
+    
+    cm := &corev1.ConfigMap{
+        ObjectMeta: metav1.ObjectMeta{
+            Name:      fmt.Sprintf("%s-spec-backup", bkeCluster.Name),
+            Namespace: bkeCluster.Namespace,
+            Labels: map[string]string{
+                "bke.bocloud.com/cluster-name": bkeCluster.Name,
+                "bke.bocloud.com/backup":       "true",
+            },
+            OwnerReferences: []metav1.OwnerReference{ownerRef(bkeCluster)},
+        },
+        Data: map[string]string{
+            "bkecluster-spec":    string(specData),
+            "component-versions": string(versionData),
+            "source-version":     sourceVersion,
+            "backup-timestamp":   fmt.Sprintf("%d", time.Now().Unix()),
+        },
+    }
+    
+    existing := &corev1.ConfigMap{}
+    if err := c.Get(ctx, client.ObjectKeyFromObject(cm), existing); err == nil {
+        existing.Data = cm.Data
+        return c.Update(ctx, existing)
+    }
+    return c.Create(ctx, cm)
+}
+```
+
+#### 7.2.4 备份注册到升级 DAG
+
+备份作为升级 DAG 的隐式前置节点，在 `pre-upgrade-resources` 之前执行：
+
+```go
+// pkg/upgrade/catalog.go 扩展
+
+// 在 DeclarativeUpgradeCatalog 中新增 backup-snapshot 组件
+var DeclarativeUpgradeCatalog = []UpgradeComponentSpec{
+    // 🆕新增：升级前备份（最先执行）
+    {Name: "backup-snapshot", Mode: UpgradeExecutionInline, InlineHandler: "EnsureBackupSnapshot"},
+    
+    // 现有组件...
+    {Name: "pre-upgrade-resources", Mode: UpgradeExecutionInline, InlineHandler: "EnsurePreUpgradeResources"},
+    {Name: "bkeagent", Mode: UpgradeExecutionInline, InlineHandler: "EnsureAgentUpgrade"},
+    // ...
+}
+
+// pkg/upgrade/bundle.go 扩展
+
+// appendImplicitBackupDependency 使 backup-snapshot 成为 pre-upgrade-resources 的前置依赖
+// 其他组件通过 pre-upgrade-resources 间接依赖 backup-snapshot
+func appendImplicitBackupDependency(deps []string, allComponentNames []string) []string {
+    if !contains(allComponentNames, "backup-snapshot") {
+        return deps
+    }
+    if contains(deps, "pre-upgrade-resources") {
+        deps = append(deps, "backup-snapshot")
+    }
+    return deps
+}
+```
+
+```
+升级 DAG（含备份）:
+
+Batch 0: [backup-snapshot]              ← 🆕新增：最先执行备份
+    └─ inline: EnsureBackupSnapshot
+       ├─ 创建 BackupSnapshot CR
+       ├─ 逐节点 etcd snapshot save
+       ├─ 逐 Master 节点 cp manifest 文件
+       ├─ 逐节点 cp containerd/kubelet 配置
+       └─ BKECluster.Spec 序列化到 ConfigMap
+
+Batch 1: [pre-upgrade-resources]        ← 依赖 backup-snapshot
+    └─ 创建升级所需的 CRD/RBAC 资源
+
+Batch 2: [bkeagent, containerd]
+    ...
+
+Batch N: [kube-proxy, coredns]
+    ...
+```
+
+#### 7.2.5 回滚时从备份恢复
+
+降级 DAG 执行时，从 BackupSnapshot CR 读取备份信息，在各组件 Rollback 中恢复：
+
+```go
+// pkg/phaseframe/phases/ensure_etcd_upgrade.go Rollback 方法扩展
+
+func (e *EnsureEtcdUpgrade) Rollback() (ctrl.Result, error) {
+    ctx, c, bkeCluster, _, log := e.Ctx.Untie()
+    
+    targetVersion := e.GetVersionContext().GetTarget("etcd")
+    if targetVersion == "" {
+        return ctrl.Result{}, nil
+    }
+    
+    // 🆕从 BKECluster annotation 读取 BackupSnapshot 名称
+    snapshotName := bkeCluster.Annotations["bke.bocloud.com/backup-snapshot"]
+    backupSnapshot := &apiv1alpha1.BackupSnapshot{}
+    if err := c.Get(ctx, client.ObjectKey{
+        Namespace: bkeCluster.Namespace,
+        Name:      snapshotName,
+    }, backupSnapshot); err != nil {
+        return ctrl.Result{}, fmt.Errorf("get backup snapshot: %w", err)
+    }
+    
+    // 从备份信息中查找 etcd 快照
+    bkeNodes, _ := e.Ctx.NodeFetcher().GetBKENodesWrapperForCluster(e.Ctx, bkeCluster)
+    etcdNodes := bkeNodes.Etcd()
+    
+    for _, node := range etcdNodes {
+        // 🆕查找该节点的 etcd 快照备份
+        etcdBackup := findBackupComponent(backupSnapshot.Spec.Components, "etcd", node.Spec.IP)
+        if etcdBackup == nil {
+            log.Info("no etcd backup found for node, skipping data restore", "node", node.Spec.IP)
+            continue
+        }
+        
+        // 如果数据格式不兼容，从快照恢复
+        if checkEtcdDataFormatCompatibility(bkeCluster.Status.EtcdVersion, targetVersion) {
+            log.Info("restoring etcd from snapshot", "node", node.Spec.IP,
+                "snapshot", etcdBackup.FilePath)
+            
+            if err := restoreEtcdFromSnapshot(ctx, c, bkeCluster, node, etcdBackup.FilePath); err != nil {
+                markNodeState(ctx, c, bkeCluster, node, bkev1beta1.NodeStateUpgradeFailed)
+                return ctrl.Result{}, fmt.Errorf("restore etcd from snapshot for %s: %w", node.Spec.IP, err)
+            }
+        }
+        
+        // 执行 Kubeadm UpgradeEtcd（降级）
+        upgradeCmd := createUpgradeCommand(node, bkeCluster,
+            Phase: bkev1beta1.UpgradeEtcd,
+            EtcdVersion: targetVersion,
+            BackUpEtcd: false,
+        )
+        if err := upgradeCmd.New(); err != nil {
+            return ctrl.Result{}, fmt.Errorf("rollback etcd %s: %w", node.Spec.IP, err)
+        }
+        if err := upgradeCmd.Wait(); err != nil {
+            return ctrl.Result{}, fmt.Errorf("rollback etcd %s: %w", node.Spec.IP, err)
+        }
+        
+        if err := waitForEtcdHealthCheck(ctx, c, bkeCluster, node, targetVersion); err != nil {
+            return ctrl.Result{}, fmt.Errorf("etcd health check for %s: %w", node.Spec.IP, err)
+        }
+        
+        log.Info("etcd rolled back from backup", "node", node.Spec.IP, "version", targetVersion)
+    }
+    
+    bkeCluster.Status.EtcdVersion = targetVersion
+    return ctrl.Result{}, nil
+}
+
+// findBackupComponent 从 BackupSnapshot 中查找指定组件和节点的备份信息
+func findBackupComponent(
+    components []apiv1alpha1.BackupComponent,
+    name string,
+    nodeIP string,
+) *apiv1alpha1.BackupComponent {
+    for i := range components {
+        if components[i].Name == name && components[i].NodeIP == nodeIP {
+            return &components[i]
+        }
+    }
+    return nil
+}
+```
+
+#### 7.2.6 备份与回滚的关系图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                          升级前备份与回滚恢复关系                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+    升级 DAG                              降级 DAG（回滚）
+    ────────                              ────────
+    
+    Batch 0: [backup-snapshot]           Batch 1: [kube-proxy, coredns]
+    │  ├─ etcd snapshot save     ────────┼─→ Batch 4: [etcd]
+    │  ├─ manifest cp            ────────┼─→   ├─ 从 BackupSnapshot 读取 etcd 快照路径
+    │  ├─ containerd config cp   ────────┼─→   ├─ restoreEtcdFromSnapshot（数据恢复）
+    │  ├─ kubelet config cp      ────────┼─→   └─ Kubeadm UpgradeEtcd（降级）
+    │  └─ BKECluster.Spec → CM   ────────┼─→
+    │                                     │  Batch 3: [kubernetes-master]
+    ↓                                     │─→   └─ Kubeadm UpgradeControlPlane（降级）
+    Batch 1: [pre-upgrade-resources]      │
+    │                                     │  Batch 5: [bkeagent, containerd]
+    ↓                                     │─→   └─ ENV 命令（旧版本）
+    ...                                   │
+                                          │  Batch 6: [pre-upgrade-resources]
+                                          │─→ 清理临时资源 + 保留 BackupSnapshot（审计）
+```
+
+#### 7.2.7 备份生命周期管理
+
+| 阶段 | 操作 | 说明 |
+|------|------|------|
+| **升级前** | 创建 BackupSnapshot CR | 升级 DAG Batch 0 自动创建 |
+| **升级中** | 保持 BackupSnapshot | 升级过程中不删除备份 |
+| **升级成功** | 保留 BackupSnapshot | 默认保留 7 天，用于升级后发现问题回滚 |
+| **升级失败→回滚** | 从 BackupSnapshot 恢复 | 降级 DAG 各组件读取备份恢复 |
+| **回滚完成** | 保留 BackupSnapshot | 记录回滚历史，审计用途 |
+| **定期清理** | TTL 清理 | 7 天后自动删除过期的 BackupSnapshot |
+
+```go
+// BackupSnapshot TTL 清理（在 BKEClusterReconciler 中定期执行）
+func (r *BKEClusterReconciler) cleanupExpiredBackupSnapshots(ctx context.Context) error {
+    snapList := &apiv1alpha1.BackupSnapshotList{}
+    if err := r.List(ctx, snapList); err != nil {
+        return err
+    }
+    
+    ttl := 7 * 24 * time.Hour  // 7 天
+    for i := range snapList.Items {
+        snap := &snapList.Items[i]
+        if snap.Status.Phase == "Completed" && snap.Status.CompletedAt != nil {
+            if time.Since(snap.Status.CompletedAt.Time) > ttl {
+                if err := r.Delete(ctx, snap); err != nil {
+                    log.Error(err, "delete expired backup snapshot", "name", snap.Name)
+                }
+            }
+        }
+    }
+    return nil
+}
+```
+
+### 7.3 DAG 构建与图反转
 
 降级 DAG 复用升级 DAG 的依赖图，通过反转边方向实现逆序执行。`topology.Graph` 的 `Reverse()` 方法将所有边方向取反，`TopologicalBatches()` 在反转图上输出降级批次。降级不新增独立 Phase，而是在现有 Phase 中新增 `Rollback()` 接口，由 `PhaseRunner` 在回滚模式下调用。
 
