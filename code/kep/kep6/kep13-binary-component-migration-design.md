@@ -1116,9 +1116,518 @@ spec:
 
 > **注意**：nfs-utils 是唯一一个不通过二进制制品下载安装的组件，它通过包管理器（yum/apt）安装。installScript 中的 OS 自检测逻辑（通过 `/etc/os-release`）使得同一份 ComponentVersion 可以适配不同操作系统。
 
-## 7. 迁移策略
+## 7. kubernetes-master / kubernetes-worker 组件类型分析
 
-### 7.1 Feature Gate 设计
+### 7.1 现状与问题
+
+当前 `kubernetes-master` 和 `kubernetes-worker` 均为 `inline` 类型，通过 kubeadm 命令统一处理安装和升级：
+
+| 组件 | 当前类型 | 当前执行方式 | 实际包含子组件 |
+|------|---------|------------|-------------|
+| kubernetes-master | inline | `Kubeadm UpgradeControlPlane` | kubelet(binary) + kube-apiserver(staticpod) + kube-controller-manager(staticpod) + kube-scheduler(staticpod) |
+| kubernetes-worker | inline | `Kubeadm UpgradeWorker` | kubelet(binary) + kubectl(binary) |
+
+**问题**：
+1. kubeadm 是黑盒，无法对单个子组件进行独立的状态追踪和版本管理
+2. kubelet 本质是 binary 类型，但被封装在 inline 中，无法使用 BinaryInstaller 的制品校验、配置模板化能力
+3. apiserver/cm/scheduler 本质是 Static Pod，但被封装在 inline 中，无法使用 StaticPodInstaller 的 manifest 渲染能力
+4. 无法对 kubelet 和控制面组件分别管理升级节奏
+
+### 7.2 理论类型：composite
+
+`kubernetes-master` 和 `kubernetes-worker` 理论上应该是 **`composite` 类型**，将不同类型的子组件打包为一个 DAG 节点统一调度：
+
+```
+kubernetes-master (type: composite)
+  ├── kubelet              → type: binary（KEP-13 BinaryInstaller）
+  ├── kube-apiserver       → type: staticpod（KEP-9 StaticPodInstaller）
+  ├── kube-controller-manager → type: staticpod（KEP-9 StaticPodInstaller）
+  ├── kube-scheduler       → type: staticpod（KEP-9 StaticPodInstaller）
+  └── kubectl              → type: binary（KEP-13 BinaryInstaller）
+
+kubernetes-worker (type: composite)
+  ├── kubelet              → type: binary（KEP-13 BinaryInstaller）
+  └── kubectl              → type: binary（KEP-13 BinaryInstaller）
+```
+
+### 7.3 拆解后的组件类型映射
+
+| 子组件 | 归属 | 类型 | 安装方式 | 升级方式 | 说明 |
+|--------|------|------|---------|---------|------|
+| **kubelet** | master + worker | binary | BinaryInstaller 下载二进制 + 渲染 kubelet.conf + systemd service | BinaryInstaller 替换二进制 + 重启 | 替代 kubeadm 对 kubelet 的管理 |
+| **kube-apiserver** | master | staticpod | StaticPodInstaller 镜像拉取 + manifest 渲染 + 写入 manifests/ | StaticPodInstaller 替换 manifest + Kubelet 自动重建 | 替代 kubeadm 对 apiserver 的管理 |
+| **kube-controller-manager** | master | staticpod | 同上 | 同上 | 替代 kubeadm 对 CM 的管理 |
+| **kube-scheduler** | master | staticpod | 同上 | 同上 | 替代 kubeadm 对 scheduler 的管理 |
+| **kubectl** | master + worker | binary | BinaryInstaller 下载二进制 | BinaryInstaller 替换二进制 | 命令行工具，无服务管理 |
+
+### 7.4 拆解后的 DAG 结构
+
+#### 7.4.1 安装 DAG（composite 拆解后）
+
+```
+安装 DAG（kubernetes-master 拆解为独立子组件）:
+
+Batch 1: [pre-upgrade-resources]
+    └─ 创建升级所需的 CRD/RBAC 资源
+
+Batch 2: [bkeagent, runc, containerd]    ← type=binary，并行执行
+    ├─ bkeagent:   BinaryInstaller
+    ├─ runc:       BinaryInstaller
+    └─ containerd: BinaryInstaller
+
+Batch 3: [kubelet]                       ← type=binary（master + worker）
+    └─ BinaryInstaller: 下载 kubelet 二进制 + 渲染 kubelet.conf + systemd service
+       ├─ Master 节点: 安装 kubelet
+       └─ Worker 节点: 安装 kubelet
+
+Batch 4: [etcd]                          ← type=staticpod（仅 master）
+    └─ StaticPodInstaller: 镜像拉取 + manifest 渲染 + 写入 manifests/
+
+Batch 5: [kube-apiserver]                ← type=staticpod（仅 master）
+    └─ StaticPodInstaller: 镜像拉取 + manifest 渲染 + 写入 manifests/
+
+Batch 6: [kube-controller-manager, kube-scheduler]  ← type=staticpod（仅 master），并行
+    ├─ kube-controller-manager: StaticPodInstaller
+    └─ kube-scheduler: StaticPodInstaller
+
+Batch 7: [kubectl]                       ← type=binary（master + worker）
+    └─ BinaryInstaller: 下载 kubectl 二进制
+
+Batch 8: [kube-proxy, coredns]          ← type=yaml
+    ├─ kube-proxy: YamlInstaller Apply
+    └─ coredns: YamlInstaller Apply
+
+Batch 9: [nodes-postprocess, agent-switch]  ← type=inline
+    ├─ nodes-postprocess: Inline
+    └─ agent-switch: Inline
+```
+
+#### 7.4.2 升级 DAG（composite 拆解后）
+
+```
+升级 DAG（按依赖顺序执行）:
+
+Batch 1: [pre-upgrade-resources]
+    └─ 创建升级所需资源
+
+Batch 2: [bkeagent, containerd, runc]    ← type=binary，并行
+    ├─ bkeagent:   SSH 推送新版本
+    ├─ containerd: ENV 命令（reset + redeploy）
+    └─ runc:       BinaryInstaller 替换二进制
+
+Batch 3: [etcd]                          ← type=staticpod
+    └─ StaticPodInstaller: 备份 manifest + 拉取新镜像 + 替换 manifest + 健康检查
+
+Batch 4: [kube-apiserver]                ← type=staticpod
+    └─ StaticPodInstaller: 拉取新镜像 + 替换 manifest + 健康检查
+
+Batch 5: [kube-controller-manager, kube-scheduler]  ← type=staticpod，并行
+    ├─ kube-controller-manager: StaticPodInstaller
+    └─ kube-scheduler: StaticPodInstaller
+
+Batch 6: [kubelet, kubectl]             ← type=binary，并行
+    ├─ kubelet: BinaryInstaller
+    │   ├─ Master 节点: drain → 替换二进制 + 配置 → 重启 → uncordon
+    │   └─ Worker 节点: drain → 替换二进制 + 配置 → 重启 → uncordon
+    └─ kubectl: BinaryInstaller（替换二进制，无需重启服务）
+
+Batch 7: [kube-proxy, coredns]          ← type=yaml
+    ├─ kube-proxy: YamlInstaller SSA Apply
+    └─ coredns: YamlInstaller SSA Apply
+```
+
+### 7.5 拆解后的依赖关系
+
+```
+kubernetes-master 拆解后的依赖链:
+
+bkeagent ──> runc ──> containerd ──> kubelet ──> etcd ──> kube-apiserver
+                                                        ├──> kube-controller-manager
+                                                        └──> kube-scheduler
+                                                                  │
+                                                                  └──> kubectl
+
+kubernetes-worker 拆解后的依赖链:
+
+bkeagent ──> runc ──> containerd ──> kubelet ──> kubectl
+```
+
+**依赖设计原则**：
+1. **kubelet 依赖 containerd**：kubelet 需要 containerd 作为容器运行时
+2. **etcd 依赖 kubelet**：etcd 作为 Static Pod 需要 Kubelet 拉起
+3. **kube-apiserver 依赖 etcd**：apiserver 需要 etcd 作为数据存储
+4. **kube-controller-manager 依赖 kube-apiserver**：CM 需要连接 apiserver
+5. **kube-scheduler 依赖 kube-apiserver**：scheduler 需要连接 apiserver
+6. **kubectl 依赖 kube-scheduler**：kubectl 作为 CLI 工具最后安装（无强依赖，但逻辑上最后）
+
+### 7.6 kubelet 拆解为 binary 类型的方案
+
+#### 7.6.1 安装方案
+
+当前 kubeadm init/join 内部包含 kubelet 安装，拆解后由 BinaryInstaller 独立完成：
+
+| 步骤 | 当前（kubeadm） | 拆解后（BinaryInstaller） |
+|------|----------------|------------------------|
+| 1. 下载 kubelet 二进制 | kubeadm 内部处理 | BinaryInstaller 通过 ArtifactSpec.URL 下载 + checksum 校验 |
+| 2. 渲染 kubelet.conf | kubeadm 内部生成 | ConfigTemplateSpec.Content 渲染 Go template |
+| 3. 渲染 kubelet.service | kubeadm 内部生成 | ConfigTemplateSpec.Content 渲染 |
+| 4. 创建 kubelet-kubeconfig | kubeadm 内部生成 | ConfigTemplateSpec.KubeconfigTemplate 动态生成 |
+| 5. 安装二进制 | kubeadm 内部处理 | installScript: `install -m 0755 ...` |
+| 6. 启动 kubelet | kubeadm 内部处理 | installScript: `systemctl enable && systemctl start` |
+| 7. 健康检查 | 无 | BinaryHealthCheckSpec: `systemctl is-active kubelet` |
+
+**关键差异**：kubeadm 在 init 时还会生成 PKI 证书和 kubeconfig，这些由 `certs` 组件（独立 ComponentVersion）负责，kubelet 的 BinaryInstaller 仅消费已生成的证书文件。
+
+#### 7.6.2 升级方案
+
+当前 kubeadm upgrade 内部处理 kubelet 二进制替换和配置更新，拆解后由 BinaryInstaller 独立完成：
+
+| 步骤 | 当前（kubeadm upgrade） | 拆解后（BinaryInstaller） |
+|------|------------------------|------------------------|
+| 1. drain 节点 | kubeadm 不处理（Phase 中 drain） | installScript 中不 drain，由 DAG 调度器在执行前 drain |
+| 2. 停止 kubelet | kubeadm 内部处理 | installScript: `systemctl stop kubelet` |
+| 3. 替换二进制 | kubeadm 内部处理 | installScript: `install -m 0755 ...` |
+| 4. 更新配置 | kubeadm 内部处理 | ConfigTemplateSpec 重新渲染 kubelet.conf |
+| 5. 启动 kubelet | kubeadm 内部处理 | installScript: `systemctl start kubelet` |
+| 6. 健康检查 | kubeadm 不处理 | BinaryHealthCheckSpec: `systemctl is-active kubelet` + 版本验证 |
+| 7. uncordon 节点 | kubeadm 不处理（Phase 中 uncordon） | 由 DAG 调度器在执行后 uncordon |
+
+**kubelet 升级 installScript 示例**（区分安装和升级）：
+
+```bash
+#!/bin/bash
+set -e
+
+{{if .isUpgrade}}
+# 升级：先停止旧版本
+systemctl stop kubelet
+{{end}}
+
+# 安装新版本二进制
+install -m 0755 {{artifact.kubelet.installPath}}/kubelet /usr/local/bin/kubelet
+
+# 渲染并更新配置（由 ConfigRenderer 在 installScript 外完成，此处仅执行）
+# kubelet.conf 和 kubelet.service 已由 ConfigRenderer 上传到节点
+
+# 启动服务
+systemctl daemon-reload
+systemctl enable kubelet
+systemctl start kubelet
+```
+
+#### 7.6.3 与 kubeadm 的兼容性
+
+| 场景 | kubeadm 角色 | BinaryInstaller 角色 | 共存策略 |
+|------|------------|---------------------|---------|
+| **全新安装** | kubeadm init 生成 PKI + kubeconfig + 初始化控制面 | BinaryInstaller 安装 kubelet 二进制 + 配置 | Feature Gate 控制：启用 BinaryInstaller 时跳过 kubeadm 的 kubelet 安装步骤 |
+| **版本升级** | kubeadm upgrade 不再处理 kubelet | BinaryInstaller 替换 kubelet 二进制 + 配置 | Feature Gate 控制：启用 BinaryInstaller 时跳过 kubeadm 的 kubelet 升级步骤 |
+| **节点扩容** | kubeadm join 生成 kubeconfig + 加入集群 | BinaryInstaller 安装 kubelet 二进制 + 配置 | 同全新安装 |
+
+**共存设计**：kubeadm 命令保留，但通过 Feature Gate 控制 kubelet 的安装/升级由谁处理：
+- Feature Gate OFF：kubeadm 处理 kubelet（现有行为）
+- Feature Gate ON：BinaryInstaller 处理 kubelet，kubeadm 仅处理 PKI 和 kubeconfig
+
+### 7.7 控制面组件拆解为 staticpod 类型的方案
+
+#### 7.7.1 安装方案
+
+当前 kubeadm init 内部生成控制面 Static Pod manifest，拆解后由 StaticPodInstaller 独立完成：
+
+| 步骤 | 当前（kubeadm） | 拆解后（StaticPodInstaller） |
+|------|----------------|---------------------------|
+| 1. 拉取镜像 | kubeadm 内部处理 | ImagePullSpec: `crictl pull` |
+| 2. 渲染 manifest | kubeadm 内部生成 | ManifestTemplate: Go template 渲染 |
+| 3. 写入 manifests/ | kubeadm 内部处理 | SSH 原子写入 `/etc/kubernetes/manifests/` |
+| 4. 等待 Kubelet 拉起 | kubeadm 内部处理 | HealthCheck: `crictl ps --name <pod>` |
+| 5. 健康检查 | kubeadm 内部处理 | PodReady: 验证 Pod Ready |
+
+#### 7.7.2 升级方案
+
+当前 kubeadm upgrade 内部替换 Static Pod manifest，拆解后由 StaticPodInstaller 独立完成：
+
+| 步骤 | 当前（kubeadm upgrade） | 拆解后（StaticPodInstaller） |
+|------|------------------------|---------------------------|
+| 1. 备份旧 manifest | kubeadm 不处理 | BackupAndReplace: `cp manifest.yaml manifest.yaml.bak` |
+| 2. 拉取新镜像 | kubeadm 内部处理 | ImagePullSpec: `crictl pull <new-image>` |
+| 3. 渲染新 manifest | kubeadm 内部生成 | ManifestTemplate: 新版本 tag 渲染 |
+| 4. 替换 manifest | kubeadm 内部处理 | 原子写入（write tmp + mv） |
+| 5. 等待 Kubelet 重建 | kubeadm 内部处理 | HealthCheck: 等待新 Pod Running |
+| 6. 健康检查 | kubeadm 不处理 | PodReady: 验证新版本 Pod Ready |
+| 7. 失败回滚 | kubeadm 不处理 | 自动回滚到备份 manifest |
+
+#### 7.7.3 升级顺序约束
+
+控制面组件有严格的升级顺序约束：
+
+```
+etcd → kube-apiserver → kube-controller-manager → kube-scheduler
+                       → kube-scheduler（与 CM 并行）
+```
+
+| 顺序 | 组件 | 前置条件 | 说明 |
+|------|------|---------|------|
+| 1 | etcd | kubelet 已启动 | etcd 作为数据存储，必须先升级 |
+| 2 | kube-apiserver | etcd 健康 | apiserver 依赖 etcd，必须等 etcd 健康后升级 |
+| 3 | kube-controller-manager | apiserver 健康 | CM 连接 apiserver |
+| 4 | kube-scheduler | apiserver 健康 | scheduler 连接 apiserver，与 CM 并行 |
+
+这些顺序约束通过 ComponentVersion.spec.dependencies 在 DAG 中表达，不需要硬编码。
+
+### 7.8 composite 类型的 ComponentVersion YAML 定义
+
+#### 7.8.1 kubernetes-master（composite 类型）
+
+```yaml
+# bke-manifests/kubernetes-master/v1.36.0/component.yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: kubernetes-master-v1.36.0
+spec:
+  name: kubernetes-master
+  type: composite
+  version: v1.36.0
+
+  composite:
+    nodeFilter:
+      roles: ["master"]
+
+    subComponents:
+      # kubelet: binary 类型，安装/升级二进制 + 配置
+      - name: kubelet
+        version: v1.36.0
+        roles: ["master"]
+
+      # kubectl: binary 类型，命令行工具
+      - name: kubectl
+        version: v1.36.0
+        roles: ["master"]
+
+      # kube-apiserver: staticpod 类型
+      - name: kube-apiserver
+        version: v1.36.0
+        roles: ["master"]
+
+      # kube-controller-manager: staticpod 类型
+      - name: kube-controller-manager
+        version: v1.36.0
+        roles: ["master"]
+
+      # kube-scheduler: staticpod 类型
+      - name: kube-scheduler
+        version: v1.36.0
+        roles: ["master"]
+
+    executionMode: Sequential  # 子组件按依赖顺序执行
+
+  dependencies:
+    - name: etcd
+      phase: Install
+    - name: containerd
+      phase: Install
+
+  upgradeStrategy:
+    mode: Rolling
+    batchSize: 1
+    timeout: "30m"
+    failurePolicy: FailFast
+```
+
+#### 7.8.2 kubernetes-worker（composite 类型）
+
+```yaml
+# bke-manifests/kubernetes-worker/v1.36.0/component.yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: kubernetes-worker-v1.36.0
+spec:
+  name: kubernetes-worker
+  type: composite
+  version: v1.36.0
+
+  composite:
+    nodeFilter:
+      roles: ["worker"]
+
+    subComponents:
+      # kubelet: binary 类型
+      - name: kubelet
+        version: v1.36.0
+        roles: ["worker"]
+
+      # kubectl: binary 类型
+      - name: kubectl
+        version: v1.36.0
+        roles: ["worker"]
+
+    executionMode: Sequential
+
+  dependencies:
+    - name: containerd
+      phase: Install
+
+  upgradeStrategy:
+    mode: Rolling
+    batchSize: 1
+    timeout: "15m"
+    failurePolicy: Continue
+```
+
+### 7.9 演进路线
+
+```
+阶段 1（当前）: inline 类型
+  kubernetes-master = inline (kubeadm init/upgrade)
+  kubernetes-worker = inline (kubeadm join/upgrade)
+  kubelet 安装/升级完全由 kubeadm 处理
+
+阶段 2（KEP-13）: kubelet 拆分为 binary
+  kubernetes-master = inline (kubeadm 处理控制面 + PKI)
+  kubelet = binary (BinaryInstaller 安装/升级二进制)
+  kubectl = binary (BinaryInstaller 安装/升级)
+  控制面组件仍由 kubeadm 处理
+
+阶段 3（KEP-9）: 控制面组件拆分为 staticpod
+  kube-apiserver = staticpod (StaticPodInstaller)
+  kube-controller-manager = staticpod (StaticPodInstaller)
+  kube-scheduler = staticpod (StaticPodInstaller)
+  kubelet = binary
+  kubectl = binary
+  kubeadm 仅处理 PKI 生成和初始化引导
+
+阶段 4（最终）: composite 类型
+  kubernetes-master = composite (包含 kubelet + kubectl + apiserver + cm + scheduler)
+  kubernetes-worker = composite (包含 kubelet + kubectl)
+  kubeadm 的编排逻辑完全由 DAG 替代
+  kubeadm 仅作为节点引导工具（生成证书 + kubeconfig）
+```
+
+### 7.10 阶段 2 详细设计：kubelet 从 inline 拆分为 binary
+
+阶段 2 是当前最现实的改造目标，将 kubelet 从 kubeadm 的黑盒中拆出：
+
+#### 7.10.1 Feature Gate
+
+```go
+var (
+    // KubeletBinaryMigration 控制 kubelet 从 kubeadm 拆分为独立 binary 组件
+    // OFF: kubelet 由 kubeadm init/upgrade 处理（现有行为）
+    // ON:  kubelet 由 BinaryInstaller 独立安装/升级
+    KubeletBinaryMigration = featuregate.NewFeature()
+)
+```
+
+#### 7.10.2 安装流程变更
+
+**Feature Gate OFF（现有行为）**：
+
+```
+EnsureMasterInit.Execute()
+  └─ kubeadm init
+     ├─ 生成 PKI 证书
+     ├─ 生成 kubeconfig
+     ├─ 安装 kubelet 二进制 ← kubeadm 内部
+     ├─ 生成 kubelet.conf ← kubeadm 内部
+     ├─ 生成 apiserver manifest ← kubeadm 内部
+     └─ 启动控制面
+```
+
+**Feature Gate ON（拆解后）**：
+
+```
+DAG 执行:
+  Batch N: [kubelet] (type=binary)
+    └─ BinaryInstaller.Install()
+       ├─ 下载 kubelet 二进制（checksum 校验）
+       ├─ 渲染 kubelet.conf（ConfigTemplateSpec）
+       ├─ 渲染 kubelet.service（ConfigTemplateSpec）
+       ├─ SSH 执行 installScript（install + systemctl enable + start）
+       └─ 健康检查（systemctl is-active kubelet）
+
+  Batch N+1: [kubernetes-master] (type=inline)
+    └─ EnsureMasterInit.Execute()
+       ├─ kubeadm init --skip-kubelet  ← 跳过 kubelet 安装
+       ├─ 生成 PKI 证书
+       ├─ 生成 kubeconfig
+       ├─ 生成 apiserver manifest
+       └─ 启动控制面
+```
+
+**关键设计**：kubeadm init 增加 `--skip-kubelet` 标志（或通过 config 跳过），不再安装 kubelet。kubelet 已由 BinaryInstaller 在前面的 Batch 中安装完成。
+
+#### 7.10.3 升级流程变更
+
+**Feature Gate OFF（现有行为）**：
+
+```
+EnsureMasterUpgrade.Execute()
+  └─ Kubeadm UpgradeControlPlane
+     ├─ 替换 kubelet 二进制 ← kubeadm 内部
+     ├─ 更新 kubelet.conf ← kubeadm 内部
+     ├─ 替换 apiserver manifest ← kubeadm 内部
+     └─ 重启控制面
+```
+
+**Feature Gate ON（拆解后）**：
+
+```
+DAG 执行:
+  Batch N: [kubelet] (type=binary)
+    └─ BinaryInstaller.Install() (action=Upgrade)
+       ├─ drain 节点
+       ├─ 下载新版本 kubelet 二进制
+       ├─ 重新渲染 kubelet.conf
+       ├─ SSH 执行: stop → replace → start
+       ├─ 健康检查（版本验证 + Node Ready）
+       └─ uncordon 节点
+
+  Batch N+1: [kubernetes-master] (type=inline)
+    └─ EnsureMasterUpgrade.Execute()
+       └─ Kubeadm UpgradeControlPlane --skip-kubelet
+          ├─ 替换 apiserver manifest ← kubeadm 内部
+          └─ 重启控制面
+```
+
+#### 7.10.4 阶段 2 的 DAG 结构
+
+```
+升级 DAG（阶段 2：kubelet 已拆分为 binary）:
+
+Batch 1: [pre-upgrade-resources]
+Batch 2: [bkeagent, containerd, runc]    ← type=binary
+Batch 3: [etcd]                          ← type=inline（kubeadm UpgradeEtcd，待阶段 3 拆分）
+Batch 4: [kubelet]                       ← type=binary 🆕（从 kubernetes-master 拆出）
+    ├─ Master 节点: drain → 替换二进制 → 健康检查 → uncordon
+    └─ Worker 节点: drain → 替换二进制 → 健康检查 → uncordon
+Batch 5: [kubernetes-master]             ← type=inline（kubeadm --skip-kubelet）
+    └─ 仅升级控制面 Static Pod（apiserver/cm/scheduler）
+Batch 6: [kubernetes-worker]             ← type=inline（kubeadm --skip-kubelet）
+    └─ 仅验证 worker 节点（kubelet 已在 Batch 4 升级）
+Batch 7: [kubectl]                       ← type=binary 🆕
+Batch 8: [kube-proxy, coredns]            ← type=yaml
+```
+
+**注意**：阶段 2 中 etcd 仍由 kubeadm 处理（inline），待阶段 3 拆分为 staticpod。kubectl 从 kubernetes-master/worker 中拆出为独立 binary 组件。
+
+### 7.11 阶段 2 工作量评估
+
+| 模块 | 任务 | 工作量（人天） |
+|------|------|---------------|
+| **kubeadm --skip-kubelet 适配** | 验证 kubeadm 是否支持跳过 kubelet 安装，如不支持则通过 config 或 patch 实现 | 3 |
+| **kubelet ComponentVersion 完善** | 在 KEP-13 的 kubelet YAML 基础上完善 installScript（区分 install/upgrade） | 2 |
+| **kubelet drain/uncordon 集成** | BinaryInstaller 执行前 drain、执行后 uncordon 的集成逻辑 | 2 |
+| **kubectl ComponentVersion 完善** | 在 KEP-13 的 kubectl YAML 基础上完善 | 1 |
+| **EnsureMasterUpgrade 适配** | 增加 --skip-kubelet 逻辑，Feature Gate 控制 | 2 |
+| **EnsureWorkerUpgrade 适配** | 增加 --skip-kubelet 逻辑，Feature Gate 控制 | 2 |
+| **DAG 依赖调整** | kubelet 从 kubernetes-master 依赖中拆出，调整依赖关系 | 1 |
+| **Feature Gate** | KubeletBinaryMigration 实现 + 灰度验证 | 1 |
+| **集成测试** | kubelet 安装/升级/回滚 E2E 测试 | 5 |
+| **小计** | - | **19 人天** |
+
+## 8. 迁移策略
+
+### 8.1 Feature Gate 设计
 
 ```go
 // pkg/featuregate/features.go
@@ -1141,7 +1650,7 @@ var (
 )
 ```
 
-### 7.2 迁移阶段
+### 8.2 迁移阶段
 
 | 阶段 | 组件 | Feature Gate | 说明 |
 |------|------|-------------|------|
@@ -1150,14 +1659,14 @@ var (
 | **Phase 3** | containerd, kubelet, kubectl | 灰度启用 | 核心组件，需充分测试 |
 | **Phase 4** | helm, etcdctl, calicoctl, lxcfs, nfs-utils | 灰度启用 | 辅助组件，最后迁移 |
 
-### 7.3 迁移原则
+### 8.3 迁移原则
 
 1. **渐进式迁移**：通过 Feature Gate 控制，新旧路径可并存
 2. **向后兼容**：迁移期间 ReleaseImage 可同时包含 inline 和 binary 类型组件
 3. **版本对齐**：迁移在 openFuyao 版本升级时进行，不在运行中切换
 4. **验证清单**：每个组件迁移前需验证清单全部通过
 
-### 7.4 迁移验证清单
+### 8.4 迁移验证清单
 
 | 验证项 | 说明 | 验证方法 |
 |--------|------|---------|
@@ -1169,7 +1678,7 @@ var (
 | **升级兼容** | 从旧版本升级不中断服务 | 升级 E2E 测试 |
 | **回滚兼容** | 降级到旧版本正常 | 回滚 E2E 测试 |
 
-## 8. 与 Inline Phase 的对应关系
+## 9. 与 Inline Phase 的对应关系
 
 | 组件 | Inline Phase (安装) | Inline Phase (升级) | binary ComponentVersion | 迁移后执行方式 |
 |------|--------------------|--------------------|------------------------|---------------|
@@ -1186,9 +1695,9 @@ var (
 
 > **注意**：kubelet 的升级仍由 `EnsureMasterUpgrade`/`EnsureWorkerUpgrade` 通过 `Kubeadm UpgradeControlPlane`/`UpgradeWorker` 命令执行（kubeadm 内部处理 kubelet 二进制替换）。binary 类型的 kubelet ComponentVersion 仅用于全新安装时的二进制预下载和配置渲染，升级时 kubeadm 命令覆盖。
 
-## 9. 工作量评估
+## 10. 工作量评估
 
-### 9.1 开发工作量
+### 10.1 开发工作量
 
 | 模块 | 任务 | 工作量（人天） |
 |------|------|---------------|
@@ -1204,7 +1713,7 @@ var (
 | **模板变量扩展** | TemplateContext 扩展（节点/制品/路径变量） | 2 |
 | **小计** | - | **24 人天** |
 
-### 9.2 测试工作量
+### 10.2 测试工作量
 
 | 测试类型 | 测试内容 | 工作量（人天） |
 |---------|---------|---------------|
@@ -1215,7 +1724,7 @@ var (
 | **兼容性测试** | amd64/arm64 + CentOS/Ubuntu | 3 |
 | **小计** | - | **18 人天** |
 
-### 9.3 总工作量汇总
+### 10.3 总工作量汇总
 
 | 类别 | 工作量（人天） |
 |------|---------------|
@@ -1223,7 +1732,7 @@ var (
 | **测试** | 18 |
 | **总计** | **42** |
 
-## 10. 风险与缓解措施
+## 11. 风险与缓解措施
 
 | 风险 | 影响 | 概率 | 缓解措施 |
 |------|------|------|---------|
