@@ -812,6 +812,8 @@ BKE 提供两种版本回滚方案：
 
 **设计思路**：
 - 参考升级 DAG 的设计，实现专门的降级 DAG
+- 复用现有 `topology.UpgradeDAG` 和 `dagexec.Scheduler` 框架
+- 通过 `VersionContext` 的 `current > target` 语义触发降级
 - 为每个组件实现特定的降级逻辑（数据迁移、配置回滚等）
 - 按相反顺序执行降级（Worker → Master → etcd → Containerd → Agent）
 
@@ -825,7 +827,96 @@ BKE 提供两种版本回滚方案：
   Worker → Master → etcd → Containerd → Agent
 ```
 
-**核心代码**：
+**降级 DAG 构建逻辑**：
+
+降级 DAG 复用升级 DAG 的依赖图，通过反转边方向实现逆序执行。`topology.Graph` 的 `Reverse()` 方法将所有边方向取反，`TopologicalBatches()` 在反转图上输出降级批次。
+
+```go
+// pkg/topology/rollback.go
+
+// BuildRollbackDAG 从升级 DAG 构建降级 DAG
+// 复用升级 DAG 的节点和依赖关系，仅反转边方向
+func BuildRollbackDAG(upgradeDAG *UpgradeDAG) (*UpgradeDAG, error) {
+    rollbackDAG := NewUpgradeDAG()
+    
+    // 1. 复制所有节点
+    for name, node := range upgradeDAG.nodes {
+        // 降级节点：FailurePolicy 保持不变，Inline handler 可能不同
+        // 降级 handler 通过 RollbackHandler 字段指定
+        rollbackNode := &ComponentNode{
+            Name:          node.Name,
+            Version:       node.Version,
+            Inline:        node.Inline,
+            FailurePolicy: node.FailurePolicy,
+            Dependencies:  node.Dependencies,
+            // 🆕新增降级专用 handler
+            RollbackHandler: resolveRollbackHandler(node.Name),
+        }
+        rollbackDAG.AddNode(rollbackNode)
+    }
+    
+    // 2. 反转依赖边（升级: A→B 变为 降级: B→A）
+    rollbackGraph := upgradeDAG.graph.Reverse()
+    rollbackDAG.graph = rollbackGraph
+    
+    // 3. 验证降级 DAG 无环
+    if _, err := rollbackDAG.TopologicalBatches(); err != nil {
+        return nil, fmt.Errorf("rollback DAG has cycle: %w", err)
+    }
+    
+    return rollbackDAG, nil
+}
+
+// resolveRollbackHandler 为组件解析降级 handler
+// 降级 handler 与升级 handler 不同，需要专门实现
+func resolveRollbackHandler(componentName string) string {
+    switch componentName {
+    case "bkeagent":
+        return "EnsureAgentRollback"       // SSH 推送旧版本二进制
+    case "containerd":
+        return "EnsureContainerdRollback"  // ENV 命令重置到旧版本
+    case "etcd":
+        return "EnsureEtcdRollback"        // 恢复快照 + 降级二进制
+    case "kubernetes-master":
+        return "EnsureMasterRollback"      // 替换 Static Pod manifest 到旧版本
+    case "kubernetes-worker":
+        return "EnsureWorkerRollback"      // drain + 替换 kubelet 二进制
+    case "kube-proxy":
+        return ""  // manifest 类型，通过 YamlInstaller 回滚
+    case "coredns":
+        return ""  // manifest 类型，通过 YamlInstaller 回滚
+    default:
+        return ""
+    }
+}
+```
+
+**Graph.Reverse 实现**：
+
+```go
+// pkg/topology/graph.go
+
+// Reverse 返回边方向反转的新图
+func (g *Graph) Reverse() *Graph {
+    reversed := NewGraph()
+    
+    // 复制所有节点
+    for node := range g.nodes {
+        reversed.AddNode(node)
+    }
+    
+    // 反转所有边：原 A→B 变为 B→A
+    for prerequisite, dependents := range g.outEdges {
+        for dependent := range dependents {
+            reversed.AddEdge(dependent, prerequisite)
+        }
+    }
+    
+    return reversed
+}
+```
+
+**降级 DAG 完整执行流程**：
 
 ```go
 // controllers/capbke/bkecluster_rollback_dag.go
@@ -835,39 +926,687 @@ func (r *BKEClusterReconciler) executeRollbackDAG(
     bkeCluster *bkev1beta1.BKECluster,
     targetVersion string,
 ) (ctrl.Result, error) {
-    // 1. 解析 ReleaseImage
-    releaseBundle, err := r.resolveReleaseBundle(ctx, targetVersion)
+    log := log.FromContext(ctx)
+    
+    // 1. 解析目标版本（旧版本）的 ReleaseImage
+    targetBundle, err := r.resolveReleaseBundle(ctx, targetVersion)
     if err != nil {
+        return ctrl.Result{}, fmt.Errorf("resolve target release bundle: %w", err)
+    }
+    
+    // 2. 解析当前版本的 ReleaseImage（用于构建 VersionContext.Current）
+    currentBundle, err := r.resolveCurrentReleaseBundle(ctx, bkeCluster)
+    if err != nil {
+        return ctrl.Result{}, fmt.Errorf("resolve current release bundle: %w", err)
+    }
+    
+    // 3. 构建 VersionContext
+    //    降级场景：Current = 当前版本（高），Target = 目标版本（低）
+    vc := upgrade.BuildVersionContextForRollback(targetBundle, currentBundle, bkeCluster)
+    
+    // 4. 构建 RollbackVersionContext
+    //    设置 rollback 标记，使 Scheduler 执行降级 handler 而非升级 handler
+    vc.SetRollback(true)
+    
+    // 5. 同步目标版本到 BKECluster.Spec（让 BKEAgent 命令读取旧版本号）
+    upgrade.ApplyVersionContextTargetsToClusterSpec(vc, bkeCluster)
+    
+    // 6. 构建升级 DAG（从目标版本 bundle）
+    upgradeDAG, err := upgrade.BuildDAGFromBundle(targetBundle, upgrade.BundleDependencyResolver(targetBundle))
+    if err != nil {
+        return ctrl.Result{}, fmt.Errorf("build upgrade DAG: %w", err)
+    }
+    
+    // 7. 从升级 DAG 构建降级 DAG（反转边方向）
+    rollbackDAG, err := topology.BuildRollbackDAG(upgradeDAG)
+    if err != nil {
+        return ctrl.Result{}, fmt.Errorf("build rollback DAG: %w", err)
+    }
+    
+    // 8. 初始化回滚状态追踪
+    r.ensureRollbackProgress(bkeCluster, targetVersion)
+    
+    // 9. 构建 ComponentFactory（注册降级 handler）
+    factory := componentfactory.NewFactoryFromBundle(targetBundle)
+    factory.RegisterRollbackHandlers()  // 🆕注册降级 handler
+    
+    // 10. 构建 Scheduler（复用升级框架）
+    sched := dagexec.NewScheduler(dagexec.SchedulerConfig{
+        InlineRunner:    NewInlinePhaseRunnerAdapter(phaseCtx, &PhaseRunner{Factory: factory}),
+        ManifestStore:   manifest.NewBundleStore(targetBundle),
+        ManifestApplier: r.ManifestApplier,
+        CVStore:         manifest.NewBundleStore(targetBundle),
+        MaxParallelPerBatch: 4,  // 降级时降低并行度，更谨慎
+    })
+    
+    // 11. 构建 ExecutionContext
+    execCtx := buildExecutionContext(ctx, r.Client, bkeCluster, vc)
+    execCtx.IsRollback = true  // 🆕标记为降级模式
+    
+    // 12. 设置集群状态为回滚中
+    bkeCluster.Status.ClusterStatus = bkev1beta1.ClusterRollingBack
+    if err := r.Status().Patch(ctx, bkeCluster, client.Merge); err != nil {
         return ctrl.Result{}, err
     }
-
-    // 2. 构建降级 DAG（与升级 DAG 顺序相反）
-    dag := r.buildRollbackDAG(releaseBundle)
-    // DAG 节点顺序：Worker → Master → etcd → Containerd → Agent
-
-    // 3. 执行降级 DAG
-    if err := r.executeDAG(ctx, bkeCluster, dag); err != nil {
-        bkeCluster.Status.DeclarativeUpgrade.LastError = err.Error()
-        return ctrl.Result{}, err
+    
+    // 13. 执行降级 DAG
+    if err := sched.ExecuteDAG(ctx, execCtx, rollbackDAG); err != nil {
+        bkeCluster.Status.DeclarativeUpgrade.LastError = fmt.Sprintf("rollback failed: %v", err)
+        _ = r.Status().Patch(ctx, bkeCluster, client.Merge)
+        return ctrl.Result{}, fmt.Errorf("execute rollback DAG: %w", err)
     }
-
-    // 4. 完成降级
+    
+    // 14. 完成降级
     return r.completeDeclarativeRollback(ctx, bkeCluster, targetVersion)
+}
+
+// completeDeclarativeRollback 完成降级操作
+func (r *BKEClusterReconciler) completeDeclarativeRollback(
+    ctx context.Context,
+    bkeCluster *bkev1beta1.BKECluster,
+    targetVersion string,
+) (ctrl.Result, error) {
+    // 1. 更新集群状态为 Ready
+    bkeCluster.Status.ClusterStatus = bkev1beta1.ClusterReady
+    bkeCluster.Status.Phase = bkev1beta1.PhaseReady
+    
+    // 2. 更新版本信息
+    bkeCluster.Status.KubernetesVersion = resolveComponentVersion(bkeCluster, "kubernetes-master")
+    bkeCluster.Status.EtcdVersion = resolveComponentVersion(bkeCluster, "etcd")
+    bkeCluster.Status.ContainerdVersion = resolveComponentVersion(bkeCluster, "containerd")
+    
+    // 3. 清理回滚状态
+    if bkeCluster.Status.DeclarativeUpgrade != nil {
+        bkeCluster.Status.DeclarativeUpgrade.LastError = ""
+        bkeCluster.Status.DeclarativeUpgrade.Completed = nil
+    }
+    
+    // 4. 更新 ClusterVersion Status
+    cv := &cvv1alpha1.ClusterVersion{}
+    if err := r.Get(ctx, client.ObjectKey{
+        Namespace: bkeCluster.Namespace,
+        Name:      bkeCluster.Name,
+    }, cv); err == nil {
+        cv.Status.CurrentVersion = targetVersion
+        cv.Status.Phase = cvv1alpha1.ClusterVersionPhaseReady
+        _ = r.Status().Update(ctx, cv)
+    }
+    
+    // 5. 记录回滚历史
+    r.Recorder.Eventf(bkeCluster, corev1.EventTypeNormal,
+        "RollbackCompleted", "Cluster rolled back to %s", targetVersion)
+    
+    return ctrl.Result{}, nil
 }
 ```
 
-**优点**：
-- ✅ 精确控制每个组件的降级过程
-- ✅ 可以针对每个组件实现特定的降级逻辑
-- ✅ 可以处理组件间的依赖关系
-- ✅ 可以实现部分降级
+**降级 DAG 结构（典型 v2.7.0 → v2.6.0 回滚）**：
 
-**缺点**：
-- ❌ 实现复杂，需要为每个组件编写降级代码
-- ❌ 需要维护降级 DAG 的拓扑关系
-- ❌ 测试工作量大
+```
+降级 DAG（升级 DAG 边反转后，拓扑排序输出）:
 
-**适用场景**：组件版本间有数据格式变更，需要精确控制降级过程
+Batch 1: [kube-proxy, coredns]       ← 最先回滚（升级时最后执行）
+    ├─ manifest: YamlInstaller Apply（旧版本清单）
+    └─ manifest: YamlInstaller Apply（旧版本清单）
+
+Batch 2: [kubernetes-worker]         ← 降级 kubelet
+    └─ inline: EnsureWorkerRollback
+       ├─ 逐节点 drain
+       ├─ 创建 Upgrade CR: Phase=UpgradeWorker（目标版本=旧版本）
+       ├─ BKEAgent 执行 Kubeadm UpgradeWorker（降级 kubelet）
+       └─ uncordon + 健康检查
+
+Batch 3: [kubernetes-master]         ← 降级控制面
+    └─ inline: EnsureMasterRollback
+       ├─ 逐 Master 节点
+       ├─ 创建 Upgrade CR: Phase=UpgradeControlPlane（目标版本=旧版本）
+       ├─ BKEAgent 执行 Kubeadm UpgradeControlPlane（降级 apiserver/cm/scheduler）
+       └─ 健康检查
+
+Batch 4: [etcd]                      ← 降级 etcd（最复杂）
+    └─ inline: EnsureEtcdRollback
+       ├─ 逐 etcd 节点
+       ├─ 从升级前快照恢复 etcd 数据（etcdctl snapshot restore）
+       ├─ 创建 Upgrade CR: Phase=UpgradeEtcd（目标版本=旧版本）
+       ├─ BKEAgent 执行 Kubeadm UpgradeEtcd（降级 etcd Static Pod）
+       └─ etcd 集群健康检查
+
+Batch 5: [bkeagent, containerd]      ← 降级基础组件
+    ├─ inline: EnsureAgentRollback
+    │   ├─ SSH 推送旧版本 bkeagent 二进制
+    │   └─ Ping 验证
+    └─ inline: EnsureContainerdRollback
+        ├─ ENV 命令: NewConatinerdReset（旧版本）
+        └─ ENV 命令: NewConatinerdRedeploy（旧版本）
+
+Batch 6: [pre-upgrade-resources]     ← 最后清理（升级时最先执行）
+    └─ inline: 清理升级前创建的临时资源
+```
+
+**各组件降级 handler 详细实现**：
+
+```go
+// pkg/phaseframe/phases/ensure_worker_rollback.go 🆕新增
+
+// EnsureWorkerRollback 降级 Worker 节点 kubelet
+type EnsureWorkerRollback struct {
+    phaseframe.BasePhase
+}
+
+func NewEnsureWorkerRollback(ctx *phaseframe.PhaseContext) phaseframe.Phase {
+    return &EnsureWorkerRollback{BasePhase: phaseframe.NewBasePhase(ctx, "EnsureWorkerRollback")}
+}
+
+func (e *EnsureWorkerRollback) Execute() (ctrl.Result, error) {
+    _, c, bkeCluster, _, log := e.Ctx.Untie()
+    
+    targetVersion := e.GetVersionContext().GetTarget("kubernetes-worker")
+    if targetVersion == "" {
+        return ctrl.Result{}, nil
+    }
+    
+    // 1. 获取需要降级的 Worker 节点（kubelet 版本比目标版本高的节点）
+    bkeNodes, err := e.Ctx.NodeFetcher().GetBKENodesWrapperForCluster(e.Ctx, bkeCluster)
+    if err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    workerNodes := bkeNodes.Worker()
+    drainer := phaseutil.NewDrainer(force=true, ignoreDaemonsets=true, deleteEmptyDir=true, timeout=20*time.Second)
+    
+    var failedNodes []string
+    
+    for _, node := range workerNodes {
+        // 1a. 读取远端 Node 的 KubeletVersion
+        remoteNode, err := getRemoteNode(ctx, c, bkeCluster, node)
+        if err != nil {
+            log.Error(err, "get remote node", "node", node.IP)
+            failedNodes = append(failedNodes, node.IP)
+            continue
+        }
+        
+        // 1b. 跳过已经是目标版本的节点
+        if remoteNode.Status.NodeInfo.KubeletVersion == targetVersion {
+            continue
+        }
+        
+        // 1c. drain 节点
+        if err := drainer.Drain(ctx, remoteNode.Name); err != nil {
+            log.Error(err, "drain node", "node", node.IP)
+            failedNodes = append(failedNodes, node.IP)
+            continue
+        }
+        
+        // 1d. 创建 Upgrade CR（目标版本=旧版本，触发降级）
+        upgradeCmd := createUpgradeCommand(node, bkeCluster, 
+            Phase: bkev1beta1.UpgradeWorker,
+            BackUpEtcd: false,
+        )
+        if err := upgradeCmd.New(); err != nil {
+            failedNodes = append(failedNodes, node.IP)
+            continue
+        }
+        
+        // 1e. 等待命令完成
+        if err := upgradeCmd.Wait(); err != nil {
+            failedNodes = append(failedNodes, node.IP)
+            continue
+        }
+        
+        // 1f. 等待节点健康（验证 kubelet 版本已降级）
+        if err := waitForNodeHealthCheck(ctx, c, bkeCluster, node, targetVersion); err != nil {
+            failedNodes = append(failedNodes, node.IP)
+            continue
+        }
+        
+        // 1g. uncordon 节点
+        _ = uncordonNode(ctx, c, bkeCluster, remoteNode.Name)
+        
+        log.Info("worker rolled back", "node", node.IP, "version", targetVersion)
+    }
+    
+    if len(failedNodes) > 0 {
+        return ctrl.Result{}, fmt.Errorf("worker rollback failed for nodes: %v", failedNodes)
+    }
+    
+    return ctrl.Result{}, nil
+}
+```
+
+```go
+// pkg/phaseframe/phases/ensure_master_rollback.go 🆕新增
+
+// EnsureMasterRollback 降级 Master 节点控制面组件
+type EnsureMasterRollback struct {
+    phaseframe.BasePhase
+}
+
+func NewEnsureMasterRollback(ctx *phaseframe.PhaseContext) phaseframe.Phase {
+    return &EnsureMasterRollback{BasePhase: phaseframe.NewBasePhase(ctx, "EnsureMasterRollback")}
+}
+
+func (e *EnsureMasterRollback) Execute() (ctrl.Result, error) {
+    _, c, bkeCluster, _, log := e.Ctx.Untie()
+    
+    targetVersion := e.GetVersionContext().GetTarget("kubernetes-master")
+    if targetVersion == "" {
+        return ctrl.Result{}, nil
+    }
+    
+    // 1. 获取需要降级的 Master 节点
+    bkeNodes, err := e.Ctx.NodeFetcher().GetBKENodesWrapperForCluster(e.Ctx, bkeCluster)
+    if err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    masterNodes := bkeNodes.Master()
+    
+    // 2. 确定 etcd 备份节点
+    etcdNodes := bkeNodes.Etcd()
+    needBackupEtcd := len(etcdNodes) > 0
+    var backEtcdNode *confv1beta1.Node
+    if needBackupEtcd {
+        backEtcdNode = &etcdNodes[0]
+    }
+    
+    // 3. 逐节点降级（阻塞式，失败则停止）
+    for _, node := range masterNodes {
+        // 3a. 读取远端 Node 的 KubeletVersion
+        remoteNode, err := getRemoteNode(ctx, c, bkeCluster, node)
+        if err != nil {
+            return ctrl.Result{}, fmt.Errorf("get remote node %s: %w", node.IP, err)
+        }
+        
+        // 3b. 跳过已经是目标版本的节点
+        if remoteNode.Status.NodeInfo.KubeletVersion == targetVersion {
+            continue
+        }
+        
+        // 3c. 标记节点为 MasterRollingBack
+        markNodeState(ctx, c, bkeCluster, node, bkev1beta1.NodeStateUpgrading)
+        
+        // 3d. 创建 Upgrade CR（目标版本=旧版本，触发降级）
+        upgradeCmd := createUpgradeCommand(node, bkeCluster,
+            Phase: bkev1beta1.UpgradeControlPlane,
+            BackUpEtcd: needBackupEtcd && backEtcdNode != nil && backEtcdNode.IP == node.IP,
+        )
+        if err := upgradeCmd.New(); err != nil {
+            return ctrl.Result{}, fmt.Errorf("create upgrade command for %s: %w", node.IP, err)
+        }
+        
+        // 3e. 等待命令完成（2s 轮询，5min 超时）
+        if err := upgradeCmd.Wait(); err != nil {
+            markNodeState(ctx, c, bkeCluster, node, bkev1beta1.NodeStateUpgradeFailed)
+            return ctrl.Result{}, fmt.Errorf("rollback master %s: %w", node.IP, err)
+        }
+        
+        // 3f. 等待节点健康（验证 kubelet 版本已降级 + Node Ready）
+        if err := waitForNodeHealthCheck(ctx, c, bkeCluster, node, targetVersion); err != nil {
+            return ctrl.Result{}, fmt.Errorf("health check for %s: %w", node.IP, err)
+        }
+        
+        log.Info("master rolled back", "node", node.IP, "version", targetVersion)
+    }
+    
+    // 4. 更新集群版本状态
+    bkeCluster.Status.KubernetesVersion = targetVersion
+    
+    return ctrl.Result{}, nil
+}
+```
+
+```go
+// pkg/phaseframe/phases/ensure_etcd_rollback.go 🆕新增
+
+// EnsureEtcdRollback 降级 etcd（最复杂的组件）
+type EnsureEtcdRollback struct {
+    phaseframe.BasePhase
+}
+
+func NewEnsureEtcdRollback(ctx *phaseframe.PhaseContext) phaseframe.Phase {
+    return &EnsureEtcdRollback{BasePhase: phaseframe.NewBasePhase(ctx, "EnsureEtcdRollback")}
+}
+
+func (e *EnsureEtcdRollback) Execute() (ctrl.Result, error) {
+    _, c, bkeCluster, _, log := e.Ctx.Untie()
+    
+    targetVersion := e.GetVersionContext().GetTarget("etcd")
+    if targetVersion == "" {
+        return ctrl.Result{}, nil
+    }
+    
+    // 1. 获取 etcd 节点
+    bkeNodes, err := e.Ctx.NodeFetcher().GetBKENodesWrapperForCluster(e.Ctx, bkeCluster)
+    if err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    etcdNodes := bkeNodes.Etcd()
+    if len(etcdNodes) == 0 {
+        return ctrl.Result{}, nil  // 无 etcd 节点，跳过
+    }
+    
+    // 2. 获取升级前的 etcd 快照备份位置
+    //    快照在升级时由 EnsureEtcdUpgrade 通过 BackUpEtcd=true 创建
+    snapshotPath := getEtcdSnapshotPath(bkeCluster)  // 从 annotation 或 status 获取
+    
+    // 3. 逐节点降级 etcd（阻塞式，失败则停止）
+    for _, node := range etcdNodes {
+        log.Info("rolling back etcd node", "node", node.IP, "targetVersion", targetVersion)
+        
+        // 3a. 标记节点为 EtcdRollingBack
+        markNodeState(ctx, c, bkeCluster, node, bkev1beta1.NodeStateUpgrading)
+        
+        // 3b. 如果数据格式不兼容，从快照恢复 etcd 数据
+        if needsDataMigration := checkEtcdDataFormatCompatibility(ctx, c, bkeCluster, node, targetVersion); needsDataMigration {
+            if err := restoreEtcdFromSnapshot(ctx, c, bkeCluster, node, snapshotPath); err != nil {
+                markNodeState(ctx, c, bkeCluster, node, bkev1beta1.NodeStateUpgradeFailed)
+                return ctrl.Result{}, fmt.Errorf("restore etcd from snapshot for %s: %w", node.IP, err)
+            }
+        }
+        
+        // 3c. 创建 Upgrade CR（目标版本=旧版本，触发降级）
+        upgradeCmd := createUpgradeCommand(node, bkeCluster,
+            Phase: bkev1beta1.UpgradeEtcd,
+            EtcdVersion: targetVersion,
+            BackUpEtcd: false,  // 降级时不备份（已有快照）
+        )
+        if err := upgradeCmd.New(); err != nil {
+            markNodeState(ctx, c, bkeCluster, node, bkev1beta1.NodeStateUpgradeFailed)
+            return ctrl.Result{}, fmt.Errorf("create upgrade command for etcd %s: %w", node.IP, err)
+        }
+        
+        // 3d. 等待命令完成
+        if err := upgradeCmd.Wait(); err != nil {
+            markNodeState(ctx, c, bkeCluster, node, bkev1beta1.NodeStateUpgradeFailed)
+            return ctrl.Result{}, fmt.Errorf("rollback etcd %s: %w", node.IP, err)
+        }
+        
+        // 3e. 等待 etcd 健康检查（验证 Static Pod 版本 + 集群健康）
+        if err := waitForEtcdHealthCheck(ctx, c, bkeCluster, node, targetVersion); err != nil {
+            markNodeState(ctx, c, bkeCluster, node, bkev1beta1.NodeStateUpgradeFailed)
+            return ctrl.Result{}, fmt.Errorf("etcd health check for %s: %w", node.IP, err)
+        }
+        
+        log.Info("etcd rolled back", "node", node.IP, "version", targetVersion)
+    }
+    
+    // 4. 更新 etcd 版本状态
+    bkeCluster.Status.EtcdVersion = targetVersion
+    
+    return ctrl.Result{}, nil
+}
+
+// restoreEtcdFromSnapshot 从快照恢复 etcd 数据
+// 通过 SSH 在节点上执行 etcdctl snapshot restore
+func restoreEtcdFromSnapshot(
+    ctx context.Context,
+    c client.Client,
+    bkeCluster *bkev1beta1.BKECluster,
+    node confv1beta1.Node,
+    snapshotPath string,
+) error {
+    // 1. 创建恢复命令 Command CR
+    cmd := &agentv1beta1.Command{
+        ObjectMeta: metav1.ObjectMeta{
+            Name:      fmt.Sprintf("etcd-restore-%s-%d", node.IP, time.Now().Unix()),
+            Namespace: bkeCluster.Namespace,
+            Labels: map[string]string{
+                "bke.bocloud.com/cluster-name": bkeCluster.Name,
+                "bke.bocloud.com/node-ip":      node.IP,
+            },
+        },
+        Spec: agentv1beta1.CommandSpec{
+            NodeName: node.Hostname,
+            Commands: []agentv1beta1.ExecCommand{
+                {
+                    ID: "etcd-snapshot-restore",
+                    // 停止 etcd → 恢复数据 → 重启 etcd
+                    Command: []string{
+                        "EtcdSnapshotRestore",
+                        fmt.Sprintf("snapshot=%s", snapshotPath),
+                        fmt.Sprintf("dataDir=%s", "/var/lib/openFuyao/etcd"),
+                    },
+                    Type: agentv1beta1.CommandBuiltIn,
+                },
+            },
+            BackoffLimit: 1,  // 数据恢复不重试，失败即停止
+        },
+    }
+    
+    if err := c.Create(ctx, cmd); err != nil {
+        return fmt.Errorf("create etcd restore command: %w", err)
+    }
+    
+    // 2. 等待恢复完成（5s 轮询，10min 超时 — 数据恢复可能较慢）
+    return wait.PollUntilContextTimeout(ctx, 5*time.Second, 10*time.Minute, true,
+        func(ctx context.Context) (bool, error) {
+            updated := &agentv1beta1.Command{}
+            if err := c.Get(ctx, client.ObjectKeyFromObject(cmd), updated); err != nil {
+                return false, err
+            }
+            switch updated.Status.Phase {
+            case agentv1beta1.CommandSucceed:
+                return true, nil
+            case agentv1beta1.CommandFailed:
+                return true, fmt.Errorf("etcd snapshot restore failed")
+            default:
+                return false, nil
+            }
+        })
+}
+
+// checkEtcdDataFormatCompatibility 检查 etcd 数据格式是否兼容
+// 如果降级跨越了数据格式变更版本，需要从快照恢复
+func checkEtcdDataFormatCompatibility(
+    ctx context.Context,
+    c client.Client,
+    bkeCluster *bkev1beta1.BKECluster,
+    node confv1beta1.Node,
+    targetVersion string,
+) bool {
+    currentVersion := bkeCluster.Status.EtcdVersion
+    // etcd v3.5.x 内部数据格式兼容
+    // etcd v3.5 → v3.4 需要数据迁移
+    // etcd v3.6 → v3.5 需要数据迁移
+    // 简化判断：大版本不一致时需要恢复
+    currentMajor := parseEtcdMajorVersion(currentVersion)  // "3.5" / "3.6"
+    targetMajor := parseEtcdMajorVersion(targetVersion)
+    return currentMajor != targetMajor
+}
+```
+
+```go
+// pkg/phaseframe/phases/ensure_agent_rollback.go 🆕新增
+
+// EnsureAgentRollback 降级 BKEAgent（SSH 推送旧版本二进制）
+// 复用 EnsureAgentUpgrade 的 SSH 推送逻辑，仅目标版本不同
+type EnsureAgentRollback struct {
+    phaseframe.BasePhase
+}
+
+func NewEnsureAgentRollback(ctx *phaseframe.PhaseContext) phaseframe.Phase {
+    return &EnsureAgentRollback{BasePhase: phaseframe.NewBasePhase(ctx, "EnsureAgentRollback")}
+}
+
+func (e *EnsureAgentRollback) Execute() (ctrl.Result, error) {
+    // 复用 EnsureAgentUpgrade 的 SSH 推送逻辑
+    // VersionContext.GetTarget("bkeagent") 返回旧版本
+    // SSH 推送旧版本二进制到所有节点
+    // 与 EnsureAgentUpgrade 代码一致，仅 handler 名不同
+    // 实际可复用 EnsureAgentUpgrade 的 Execute 方法
+    return EnsureAgentUpgrade{BasePhase: e.BasePhase}.Execute()
+}
+```
+
+```go
+// pkg/phaseframe/phases/ensure_containerd_rollback.go 🆕新增
+
+// EnsureContainerdRollback 降级 containerd
+// 复用 EnsureContainerdUpgrade 的 ENV 命令逻辑（reset + redeploy）
+type EnsureContainerdRollback struct {
+    phaseframe.BasePhase
+}
+
+func NewEnsureContainerdRollback(ctx *phaseframe.PhaseContext) phaseframe.Phase {
+    return &EnsureContainerdRollback{BasePhase: phaseframe.NewBasePhase(ctx, "EnsureContainerdRollback")}
+}
+
+func (e *EnsureContainerdRollback) Execute() (ctrl.Result, error) {
+    // 复用 EnsureContainerdUpgrade 的 ENV 命令逻辑
+    // VersionContext.GetTarget("containerd") 返回旧版本
+    // NewConatinerdReset + NewConatinerdRedeploy（旧版本）
+    // 与 EnsureContainerdUpgrade 代码一致，仅目标版本不同
+    return EnsureContainerdUpgrade{BasePhase: e.BasePhase}.Execute()
+}
+```
+
+```go
+// pkg/componentfactory/registry.go 扩展
+
+func RegisterRollbackHandlers() {
+    // 🆕注册降级 handler（复用 ComponentFactory 注册机制）
+    RegisterInlineHandler("EnsureWorkerRollback",     v1alpha1.InlineHandlerVersion, phases.NewEnsureWorkerRollback)
+    RegisterInlineHandler("EnsureMasterRollback",     v1alpha1.InlineHandlerVersion, phases.NewEnsureMasterRollback)
+    RegisterInlineHandler("EnsureEtcdRollback",       v1alpha1.InlineHandlerVersion, phases.NewEnsureEtcdRollback)
+    RegisterInlineHandler("EnsureAgentRollback",      v1alpha1.InlineHandlerVersion, phases.NewEnsureAgentRollback)
+    RegisterInlineHandler("EnsureContainerdRollback", v1alpha1.InlineHandlerVersion, phases.NewEnsureContainerdRollback)
+}
+```
+
+```go
+// pkg/upgrade/context.go 扩展
+
+// VersionContext 扩展回滚支持
+type VersionContext struct {
+    mu       sync.RWMutex
+    Current  map[string]string
+    Target   map[string]string
+    rollback bool  // 🆕新增：是否为回滚模式
+}
+
+// SetRollback 设置回滚模式
+func (vc *VersionContext) SetRollback(rollback bool) {
+    vc.mu.Lock()
+    defer vc.mu.Unlock()
+    vc.rollback = rollback
+}
+
+// IsRollback 是否为回滚模式
+func (vc *VersionContext) IsRollback() bool {
+    vc.mu.RLock()
+    defer vc.mu.RUnlock()
+    return vc.rollback
+}
+
+// Decide 扩展：回滚模式下始终返回 DecisionUpgrade（降级视为"升级"到旧版本）
+func Decide(vc *VersionContext, name string) Decision {
+    if vc == nil {
+        return DecisionUpgrade
+    }
+    
+    // 回滚模式：current != target 即触发执行
+    if vc.IsRollback() {
+        if vc.Target[name] == "" {
+            return DecisionSkip
+        }
+        if vc.Current[name] == vc.Target[name] {
+            return DecisionSkip
+        }
+        return DecisionUpgrade  // 回滚模式下的"升级"实际是降级
+    }
+    
+    // 正常升级模式
+    if vc.Current[name] == vc.Target[name] || vc.Target[name] == "" {
+        return DecisionSkip
+    }
+    return DecisionUpgrade
+}
+```
+
+```go
+// pkg/dagexec/inline_runner.go 扩展
+
+// PhaseRunner.Execute 扩展：回滚模式下使用 RollbackHandler
+func (r *PhaseRunner) Execute(
+    phaseCtx *phaseframe.PhaseContext,
+    oldCluster, newCluster *bkev1beta1.BKECluster,
+    handler string,
+    version string,
+) error {
+    vc := phaseCtx.GetVersionContext()
+    
+    // 🆕回滚模式下，将 handler 替换为降级 handler
+    if vc != nil && vc.IsRollback() {
+        if rollbackHandler := resolveRollbackHandlerFromUpgradeHandler(handler); rollbackHandler != "" {
+            handler = rollbackHandler
+        }
+    }
+    
+    // 解析 Phase 并执行
+    phase, err := ResolveInlineUpgrade(r.Factory, handler, version, phaseCtx)
+    if err != nil {
+        return fmt.Errorf("resolve inline handler %s: %w", handler, err)
+    }
+    
+    if !phase.NeedExecute(oldCluster, newCluster) {
+        return nil
+    }
+    
+    if err := phase.ExecutePreHook(); err != nil {
+        return err
+    }
+    
+    _, err = phase.Execute()
+    
+    if postErr := phase.ExecutePostHook(err); postErr != nil {
+        log.Error(postErr, "post hook failed")
+    }
+    
+    return err
+}
+
+// resolveRollbackHandlerFromUpgradeHandler 从升级 handler 名推导降级 handler 名
+func resolveRollbackHandlerFromUpgradeHandler(upgradeHandler string) string {
+    mapping := map[string]string{
+        "EnsureAgentUpgrade":      "EnsureAgentRollback",
+        "EnsureContainerdUpgrade": "EnsureContainerdRollback",
+        "EnsureEtcdUpgrade":       "EnsureEtcdRollback",
+        "EnsureMasterUpgrade":     "EnsureMasterRollback",
+        "EnsureWorkerUpgrade":     "EnsureWorkerRollback",
+    }
+    if rollback, ok := mapping[upgradeHandler]; ok {
+        return rollback
+    }
+    return ""  // 无对应降级 handler，使用原 handler
+}
+```
+
+**降级 DAG 执行流程图**：
+
+```mermaid
+flowchart TD
+    Start(["用户设置 desiredVersion = 旧版本"]) --> CV["ClusterVersionReconciler<br/>验证回滚路径"]
+    CV --> Anno["设置 upgrade-ready annotation<br/>（值为旧版本号）"]
+    Anno --> Detect["BKEClusterReconciler<br/>检测 annotation"]
+    Detect --> Resolve["解析目标 ReleaseImage<br/>（旧版本 OCI bundle）"]
+    Resolve --> VC["构建 VersionContext<br/>Current=当前版本, Target=旧版本<br/>SetRollback(true)"]
+    VC --> Sync["同步目标版本到 BKECluster.Spec"]
+    Sync --> BuildUp["构建升级 DAG<br/>（从旧版本 bundle）"]
+    BuildUp --> BuildDown["构建降级 DAG<br/>（反转边方向）"]
+    BuildDown --> Status["集群状态 → ClusterRollingBack"]
+    Status --> Exec["Scheduler.ExecuteDAG<br/>（降级 DAG）"]
+    
+    Exec --> B1["Batch 1: kube-proxy + coredns<br/>YamlInstaller Apply（旧版本清单）"]
+    B1 --> B2["Batch 2: kubernetes-worker<br/>EnsureWorkerRollback: drain + Kubeadm UpgradeWorker"]
+    B2 --> B3["Batch 3: kubernetes-master<br/>EnsureMasterRollback: Kubeadm UpgradeControlPlane"]
+    B3 --> B4["Batch 4: etcd<br/>EnsureEtcdRollback: 快照恢复 + Kubeadm UpgradeEtcd"]
+    B4 --> B5["Batch 5: bkeagent + containerd<br/>SSH 推送旧版本 + ENV 重置"]
+    B5 --> B6["Batch 6: pre-upgrade-resources<br/>清理临时资源"]
+    
+    B6 --> Complete["completeDeclarativeRollback<br/>更新版本状态 → Ready"]
+    Complete --> End(["回滚完成"])
+```
 
 #### 方案二：复用升级流程执行降级（推荐用于快速交付）
 
