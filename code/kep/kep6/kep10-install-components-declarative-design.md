@@ -1152,92 +1152,53 @@ kubectl get bkecluster my-cluster -o jsonpath='{.status.clusterComponentStatuses
 
 ## 11. 工作量评估
 
-### 11.1 Phase 1: 结构扩展开发工作量
+### 11.1 开发工作量
 
-| 模块 | 任务 | 工作量（人天） |
-|------|------|---------------|
-| **CRD 扩展** | `ReleaseImageInstallComponent` 新增 `inline` 字段 + deepcopy + webhook | 2 |
-| **安装组件目录** | `DeclarativeInstallCatalog` + `InstallComponentSpec` | 2 |
-| **ComponentFactory 注册** | 注册安装 handler 到 factory + 验证幂等性 | 2 |
-| **VersionContext 扩展** | 新增 `DecisionInstall` + `BuildVersionContextForInstall` + 单元测试 | 3 |
-| **安装 DAG 构建** | `BuildInstallDAGFromBundle` + `InstallComponentsFromBundle` + 循环依赖检测 | 3 |
-| **executeInstallDAG** | 安装 DAG 执行入口 + `shouldUseDeclarativeInstall` + 状态追踪 | 3 |
-| **安装 annotation 机制** | `install-ready` annotation + ClusterVersionReconciler 适配 | 2 |
-| **Feature Gate** | `DeclarativeInstallEnabled` 实现 + 默认关闭验证 | 1 |
-| **ComponentVersion 依赖定义** | 为 11 个安装组件编写 `spec.dependencies` + 验证拓扑正确性 | 4 |
-| **ReleaseImage 适配** | 为 v2.7.0 ReleaseImage 补充 install.components.inline + 测试 | 2 |
-| **CommonPhases 兼容** | 确保 Finalizer/Paused/ClusterManage 等通用 Phase 与 DAG 共存 | 2 |
-| **小计** | - | **26 人天** |
+| 阶段 | 模块 | 任务 | 工作量（人天） |
+|------|------|------|---------------|
+| **Phase 1: 结构扩展** | CRD 扩展 | `ReleaseImageInstallComponent` 新增 `inline` 字段 + deepcopy + webhook | 2 |
+| | 安装组件目录 | `DeclarativeInstallCatalog` + `InstallComponentSpec` | 2 |
+| | ComponentFactory 注册 | 注册安装 handler 到 factory + 验证幂等性 | 2 |
+| | VersionContext 扩展 | 新增 `DecisionInstall` + `BuildVersionContextForInstall` + 单元测试 | 3 |
+| | 安装 DAG 构建 | `BuildInstallDAGFromBundle` + `InstallComponentsFromBundle` + 循环依赖检测 | 3 |
+| | executeInstallDAG | 安装 DAG 执行入口 + `shouldUseDeclarativeInstall` + 状态追踪 | 3 |
+| | 安装 annotation 机制 | `install-ready` annotation + ClusterVersionReconciler 适配 | 2 |
+| | Feature Gate | `DeclarativeInstallEnabled` 实现 + 默认关闭验证 | 1 |
+| | ComponentVersion 依赖定义 | 为 11 个安装组件编写 `spec.dependencies` + 验证拓扑正确性 | 4 |
+| | ReleaseImage 适配 | 为 v2.7.0 ReleaseImage 补充 install.components.inline + 测试 | 2 |
+| | CommonPhases 兼容 | 确保 Finalizer/Paused/ClusterManage 等通用 Phase 与 DAG 共存 | 2 |
+| **Phase 1 小计** | | | **26** |
+| **Phase 2: 灰度迁移** | 混合执行模式 | `executePartialInstallDAG` + `WithSkipPhases` PhaseFlow 扩展 | 4 |
+| | 状态追踪兼容 | PhaseStatus ↔ DeclarativeUpgradeStatus 状态清理 + 互不冲突 | 3 |
+| | 低风险组件迁移 | bkeagent/nodes-env/certs/load-balance 迁移 + NeedExecute 适配 | 3 |
+| | 灰度验证框架 | Feature Gate 灰度策略 + 日志 + 监控 | 2 |
+| **Phase 2 小计** | | | **12** |
+| **Phase 3: 全量 DAG** | 高风险组件迁移 | kubernetes-master/worker/agent-switch/nodes-postprocess 迁移 | 5 |
+| | MasterInit 幂等改造 | 区分 init/join + 已有节点跳过逻辑 | 3 |
+| | DryRun DAG 化 | `ExecutionContext.DryRun` + 各执行器适配 | 2 |
+| | 暂停检查迁移 | `shouldUseDeclarativeInstall` 增加暂停检查 | 1 |
+| | CommonPhases DAG 化 | Finalizer/Paused 等通用 Phase 迁移或保留决策 | 2 |
+| **Phase 3 小计** | | | **13** |
+| **Phase 4: Legacy 移除** | 纳管 DAG 化 | `manage` 组件 + `BuildVersionContextForManage` + 版本探测逻辑 | 4 |
+| | 扩容 DAG 化 | `EnsureMasterInit` 幂等完善 + VersionContext 节点级过滤 | 3 |
+| | 删除/重置 DAG 化 | `BuildUninstallDAGFromBundle` + 逆序执行 + 卸载脚本 | 5 |
+| | 执行入口重写 | `reconcileCluster` 场景分发 + 无 PhaseFlow 回退 | 3 |
+| | PhaseFlow 代码清理 | 移除 `DeployPhases` / `PhaseFlow` / `PhaseStatus` + 依赖清理 | 4 |
+| | Feature Gate 移除 | 移除 `DeclarativeInstallEnabled` + 清理条件判断 | 1 |
+| **Phase 4 小计** | | | **20** |
+| **开发总计** | | | **71** |
 
-### 11.2 Phase 1: 测试工作量
+### 11.2 测试工作量
 
-| 测试类型 | 测试内容 | 工作量（人天） |
-|---------|---------|---------------|
-| **单元测试** | DAG 构建、VersionContext、Catalog、依赖解析 | 4 |
-| **集成测试** | 全新安装流程（DAG 路径） | 5 |
-| **回归测试** | PhaseFlow 路径回归（确保不受影响） | 3 |
-| **小计** | - | **12 人天** |
+| 阶段 | 测试内容 | 工作量（人天） |
+|------|---------|---------------|
+| **Phase 1** | 单元测试（DAG 构建、VersionContext、Catalog、依赖解析）+ 集成测试（全新安装 DAG 路径）+ 回归测试（PhaseFlow 路径不受影响） | 12 |
+| **Phase 2** | 混合模式测试（DAG + PhaseFlow 混合执行 + 状态正确性）+ 回退测试（Feature Gate ON→OFF 回退验证） | 8 |
+| **Phase 3** | 集成测试（全量 DAG 安装 + 升级流程）+ E2E 测试（安装 → 升级 → 扩容 → 删除全流程）+ DryRun 测试 | 12 |
+| **Phase 4** | 全场景 E2E（安装/升级/扩容/纳管/删除/DryRun/暂停）+ 回归测试（移除 PhaseFlow 后无遗漏）+ 性能测试（DAG vs PhaseFlow 对比） | 15 |
+| **测试总计** | | **47** |
 
-### 11.3 Phase 2: 部分 DAG 灰度工作量
-
-| 模块 | 任务 | 工作量（人天） |
-|------|------|---------------|
-| **混合执行模式** | `executePartialInstallDAG` + `WithSkipPhases` PhaseFlow 扩展 | 4 |
-| **状态追踪兼容** | PhaseStatus ↔ DeclarativeUpgradeStatus 状态清理 + 互不冲突 | 3 |
-| **低风险组件迁移** | bkeagent/nodes-env/certs/load-balance 迁移 + NeedExecute 适配 | 3 |
-| **灰度验证框架** | Feature Gate 灰度策略 + 日志 + 监控 | 2 |
-| **小计** | - | **12 人天** |
-
-### 11.4 Phase 2: 灰度测试工作量
-
-| 测试类型 | 测试内容 | 工作量（人天） |
-|---------|---------|---------------|
-| **混合模式测试** | DAG + PhaseFlow 混合执行 + 状态正确性 | 5 |
-| **回退测试** | Feature Gate ON→OFF 回退验证 | 3 |
-| **小计** | - | **8 人天** |
-
-### 11.5 Phase 3: 全量 DAG 工作量
-
-| 模块 | 任务 | 工作量（人天） |
-|------|------|---------------|
-| **高风险组件迁移** | kubernetes-master/worker/agent-switch/nodes-postprocess 迁移 | 5 |
-| **MasterInit 幂等改造** | 区分 init/join + 已有节点跳过逻辑 | 3 |
-| **DryRun DAG 化** | `ExecutionContext.DryRun` + 各执行器适配 | 2 |
-| **暂停检查迁移** | `shouldUseDeclarativeInstall` 增加暂停检查 | 1 |
-| **CommonPhases DAG 化** | Finalizer/Paused 等通用 Phase 迁移或保留决策 | 2 |
-| **小计** | - | **13 人天** |
-
-### 11.6 Phase 3: 全量测试工作量
-
-| 测试类型 | 测试内容 | 工作量（人天） |
-|---------|---------|---------------|
-| **集成测试** | 全量 DAG 安装 + 升级流程 | 5 |
-| **E2E 测试** | 安装 → 升级 → 扩容 → 删除全流程 | 5 |
-| **DryRun 测试** | DryRun DAG 验证 | 2 |
-| **小计** | - | **12 人天** |
-
-### 11.7 Phase 4: Legacy 移除工作量
-
-| 模块 | 任务 | 工作量（人天） |
-|------|------|---------------|
-| **纳管 DAG 化** | `manage` 组件 + `BuildVersionContextForManage` + 版本探测逻辑 | 4 |
-| **扩容 DAG 化** | `EnsureMasterInit` 幂等完善 + VersionContext 节点级过滤 | 3 |
-| **删除/重置 DAG 化** | `BuildUninstallDAGFromBundle` + 逆序执行 + 卸载脚本 | 5 |
-| **执行入口重写** | `reconcileCluster` 场景分发 + 无 PhaseFlow 回退 | 3 |
-| **PhaseFlow 代码清理** | 移除 `DeployPhases` / `PhaseFlow` / `PhaseStatus` + 依赖清理 | 4 |
-| **Feature Gate 移除** | 移除 `DeclarativeInstallEnabled` + 清理条件判断 | 1 |
-| **小计** | - | **20 人天** |
-
-### 11.8 Phase 4: 回归测试工作量
-
-| 测试类型 | 测试内容 | 工作量（人天） |
-|---------|---------|---------------|
-| **全场景 E2E** | 安装/升级/扩容/纳管/删除/DryRun/暂停 | 8 |
-| **回归测试** | 确保移除 PhaseFlow 后无遗漏 | 5 |
-| **性能测试** | DAG vs PhaseFlow 性能对比 | 2 |
-| **小计** | - | **15 人天** |
-
-### 11.9 文档工作量
+### 11.3 文档工作量
 
 | 文档类型 | 文档内容 | 工作量（人天） |
 |---------|---------|---------------|
@@ -1247,7 +1208,7 @@ kubectl get bkecluster my-cluster -o jsonpath='{.status.clusterComponentStatuses
 | **故障排查** | DAG 安装故障排查指南 | 1 |
 | **小计** | - | **7 人天** |
 
-### 11.10 总工作量汇总
+### 11.4 总工作量汇总
 
 | 阶段 | 开发（人天） | 测试（人天） | 小计 |
 |------|------------|------------|------|
