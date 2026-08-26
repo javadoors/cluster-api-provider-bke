@@ -12,7 +12,7 @@
 
 ## [安装流程与升级框架统一](../kep/kep6/kep10-install-components-declarative-design.md)
 
-## 支持回滚
+## [支持回滚](../kep/kep6/kep11-cluster-rollback-design.md)
 
 ## 备份与恢复
 
