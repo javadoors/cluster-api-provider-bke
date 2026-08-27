@@ -35,7 +35,7 @@ K8s 核心组件（kube-apiserver、kube-controller-manager、kube-scheduler、k
 
 | 问题 | 说明 | 影响 |
 |------|------|------|
-| 跨 hop 偏差风险 | Hop 1 升级 apiserver 到 1.35，kubelet 还在 1.34；Hop 2 apiserver 到 1.36 时 kubelet 仍在 1.34，达到 2 版本偏差极限 | 可能导致 kubelet 无法正常工作 |
+| 跨 hop 偏差风险 | Hop 1 升级 apiserver 到 1.35，kubelet 还在 1.34；Hop 2 apiserver 到 1.36 时 kubelet 仍在 1.34，偏差为 2（K8s v1.25+ 允许最多 3） | 可能导致 kubelet 版本落后过多 |
 | 组件间无法独立编排 | apiserver 和 kubelet 被绑定在同一个 DAG 节点中 | 无法分别控制升级节奏 |
 | kubelet 升级阻塞控制面 | 大规模集群 kubelet 逐节点 drain 耗时 | 控制面升级被 kubelet 阻塞 |
 
@@ -435,7 +435,7 @@ Hop 2: K8s v1.35 → v1.36
 | **跨节点偏差** | 逐节点滚动升级，集群短暂存在两个版本 | HA 场景可接受 | ✅ 满足 |
 | **etcd 版本配套** | kubeadm 先升级 etcd 再升级 apiserver | 每 K8s 版本有推荐 etcd 版本 | ✅ 满足 |
 
-**总结**：kubeadm 的单节点升级**基本满足**偏差规则（短暂窗口违反在实际中可接受），但**无法利用 K8s 允许的 2 版本偏差窗口**来优化多 hop 升级的 kubelet drain 效率。这正是 KEP-14 要解决的核心问题：**拆解 kubeadm 黑盒，实现 kubelet 延迟升级**。
+**总结**：kubeadm 的单节点升级**基本满足**偏差规则（短暂窗口违反在实际中可接受），但**无法利用 K8s 允许的版本偏差窗口**（kubelet 可滞后 apiserver 最多 3 个小版本）来优化多 hop 升级的 kubelet drain 效率。这正是 KEP-14 要解决的核心问题：**拆解 kubeadm 黑盒，实现 kubelet 延迟升级**。
 
 | 追踪字段 | 位置 | 说明 |
 |---------|------|------|
@@ -450,13 +450,77 @@ Hop 2: K8s v1.35 → v1.36
 
 ### 3.1 K8s 官方偏差规则
 
-| 约束 | 规则 | 影响 |
-|------|------|------|
-| **kubelet vs apiserver** | kubelet 最多比 apiserver 旧 2 个小版本，不能比 apiserver 新 | kubelet 升级必须滞后于或同步于 apiserver |
-| **kube-proxy vs apiserver** | kube-proxy 版本必须与 apiserver 一致 | kube-proxy 必须随 apiserver 同步升级 |
-| **controller-manager vs apiserver** | 应与 apiserver 版本一致 | cm 必须紧随 apiserver |
-| **scheduler vs apiserver** | 应与 apiserver 版本一致 | scheduler 必须紧随 apiserver |
-| **etcd vs apiserver** | 每个 K8s 版本有推荐的 etcd 版本 | etcd 需要与 K8s 版本配套 |
+> 以下内容基于 K8s 官方 Version Skew Policy（https://kubernetes.io/releases/version-skew-policy/），截至 K8s v1.37。
+
+#### 3.1.1 kube-apiserver（HA 集群）
+
+在 HA 集群中，最新和最旧的 `kube-apiserver` 实例之间最多相差 **1 个小版本**。
+
+| 示例 | 说明 |
+|------|------|
+| 最新 kube-apiserver = v1.37 | 其他实例支持 v1.37 和 v1.36 |
+
+#### 3.1.2 kubelet
+
+- `kubelet` **不能比** `kube-apiserver` 新
+- `kubelet` 最多比 `kube-apiserver` 旧 **3 个小版本**（v1.25 以下最多旧 2 个小版本）
+
+| 示例 | 说明 |
+|------|------|
+| kube-apiserver = v1.37 | kubelet 支持 v1.37、v1.36、v1.35、v1.34 |
+
+> **注意**：如果 HA 集群中 kube-apiserver 实例之间存在版本偏差，则 kubelet 的允许范围会收窄。例如 apiserver 为 v1.37 和 v1.36 时，kubelet 支持 v1.36、v1.35、v1.34（不支持 v1.37，因为会比 v1.36 的 apiserver 新）。
+
+#### 3.1.3 kube-proxy
+
+- `kube-proxy` **不能比** `kube-apiserver` 新
+- `kube-proxy` 最多比 `kube-apiserver` 旧 **3 个小版本**（v1.25 以下最多旧 2 个小版本）
+- `kube-proxy` 可以比同节点的 `kubelet` 最多旧或新 **3 个小版本**（v1.25 以下最多 2 个小版本）
+
+| 示例 | 说明 |
+|------|------|
+| kube-apiserver = v1.37 | kube-proxy 支持 v1.37、v1.36、v1.35、v1.34 |
+
+#### 3.1.4 kube-controller-manager / kube-scheduler / cloud-controller-manager
+
+- **不能比** `kube-apiserver` 新
+- 应与 `kube-apiserver` **小版本一致**，但允许落后 **1 个小版本**（支持滚动升级）
+
+| 示例 | 说明 |
+|------|------|
+| kube-apiserver = v1.37 | cm/scheduler 支持v1.37 和 v1.36 |
+
+#### 3.1.5 kubectl
+
+- `kubectl` 支持与 `kube-apiserver` 相差 **1 个小版本**（旧或新均可）
+
+| 示例 | 说明 |
+|------|------|
+| kube-apiserver = v1.37 | kubectl 支持 v1.38、v1.37、v1.36 |
+
+#### 3.1.6 官方偏差规则汇总表
+
+| 组件 | 偏差方向 | 最大偏差 | 约束说明 |
+|------|---------|---------|---------|
+| **kube-apiserver（HA）** | 最新 vs 最旧 | 1 个小版本 | HA 集群中 apiserver 实例间最多相差 1 个小版本 |
+| **kubelet vs apiserver** | kubelet ≤ apiserver | 3 个小版本（v1.25 以下为 2） | kubelet 不能比 apiserver 新 |
+| **kube-proxy vs apiserver** | kube-proxy ≤ apiserver | 3 个小版本（v1.25 以下为 2） | kube-proxy 不能比 apiserver 新 |
+| **kube-proxy vs kubelet** | 双向 | 3 个小版本（v1.25 以下为 2） | kube-proxy 可以比 kubelet 旧或新 |
+| **cm/scheduler vs apiserver** | cm/scheduler ≤ apiserver | 1 个小版本 | 应与 apiserver 一致，允许落后 1 个小版本 |
+| **kubectl vs apiserver** | 双向 | 1 个小版本 | kubectl 可以比 apiserver 旧或新 1 个小版本 |
+
+#### 3.1.7 官方支持的组件升级顺序
+
+K8s 官方推荐的组件升级顺序（从 v1.36 升级到 v1.37 示例）：
+
+| 顺序 | 组件 | 前置条件 | 说明 |
+|------|------|---------|------|
+| 1 | **kube-apiserver** | HA 中所有 apiserver 在 v1.36 或 v1.37；cm/scheduler 在 v1.36；kubelet 在 v1.35+ | apiserver 不能跳小版本升级 |
+| 2 | **cm/scheduler** | apiserver 已升级到 v1.37 | 三个组件无固定顺序，可同时升级 |
+| 3 | **kubelet**（可选） | apiserver 已升级到 v1.37 | 可留在 v1.36/v1.35/v1.34；升级前需 drain 节点 |
+| 4 | **kube-proxy**（可选） | apiserver 已升级到 v1.37 | 可留在 v1.36/v1.35/v1.34 |
+
+> **关键设计依据**：kubelet 和 kube-proxy 是**可选升级**的，可以滞后 apiserver 最多 3 个小版本。这是 KEP-14 实现 kubelet 延迟升级策略的官方依据。
 
 ### 3.2 偏差约束声明
 
@@ -477,26 +541,32 @@ type SkewConstraint struct {
 }
 
 // K8sSkewConstraints K8s 标准版本偏差约束
+// 基于 K8s 官方 Version Skew Policy (v1.25+)
 var K8sSkewConstraints = []SkewConstraint{
     {
         Component:         "kubelet",
         ReferenceComponent: "kube-apiserver",
-        MaxSkewBehind:     2,
+        MaxSkewBehind:     3,  // kubelet 最多比 apiserver 旧 3 个小版本（v1.25+）
     },
     {
         Component:         "kube-proxy",
         ReferenceComponent: "kube-apiserver",
-        MustMatch:         true,
+        MaxSkewBehind:     3,  // kube-proxy 最多比 apiserver 旧 3 个小版本（v1.25+）
     },
     {
         Component:         "kube-controller-manager",
         ReferenceComponent: "kube-apiserver",
-        MustMatch:         true,
+        MaxSkewBehind:     1,  // cm 最多比 apiserver 旧 1 个小版本
     },
     {
         Component:         "kube-scheduler",
         ReferenceComponent: "kube-apiserver",
-        MustMatch:         true,
+        MaxSkewBehind:     1,  // scheduler 最多比 apiserver 旧 1 个小版本
+    },
+    {
+        Component:         "kubectl",
+        ReferenceComponent: "kube-apiserver",
+        MaxSkewBehind:     1,  // kubectl 最多比 apiserver 旧 1 个小版本
     },
 }
 ```
@@ -592,7 +662,7 @@ Hop 2: K8s v1.35 → v1.36
   ├─ apiserver: v1.35 → v1.36
   ├─ cm/scheduler: v1.35 → v1.36
   ├─ kube-proxy: v1.35 → v1.36
-  └─ kubelet: 保持 v1.34（2 版本偏差，极限，仍安全）
+  └─ kubelet: 保持 v1.34（2 版本偏差，安全，v1.25+ 允许最多 3）
 
   偏差门 2: kubelet(v1.34) vs apiserver(v1.36) → 2 偏差 → ⚠️ 极限
   强制动作: 触发 kubelet 补充升级 v1.34 → v1.35 → v1.36
@@ -641,7 +711,7 @@ Hop 2: K8s v1.35 → v1.36
 │  ┌─────────────────────────────────────────────────────────────────┐   │
 │  │  偏差门 2: Skew Gate                                            │   │
 │  │                                                                 │   │
-│  │  检查: kubelet(v1.34) vs apiserver(v1.36) → 2 版本偏差 → ⚠️ 极限 │   │
+│  │  检查: kubelet(v1.34) vs apiserver(v1.36) → 2 版本偏差 → ✅ 安全（允许 3）│   │
 │  │  决策: 必须先升级 kubelet，禁止继续下一个 hop（如有）              │   │
 │  │  强制动作: 触发 kubelet 补充升级                                  │   │
 │  └─────────────────────────────────────────────────────────────────┘   │
@@ -689,7 +759,7 @@ Hop 2: K8s v1.35 → v1.36
     kubelet 1.35         kubelet 保持 1.34（偏差 1）
   Hop 2:               Hop 2:
     apiserver 1.36       apiserver 1.36
-    kubelet 1.36         kubelet 保持 1.34（偏差 2，极限）
+    kubelet 1.36         kubelet 保持 1.34（偏差 2，安全）
                         补充:
                           kubelet 1.34→1.35
                           kubelet 1.35→1.36
@@ -815,8 +885,9 @@ func (c *VersionSkewChecker) NeedsKubeletCatchup(
     
     skew := computeMinorVersionSkew(apiserverVersion, kubeletVersion)
     
-    // 偏差即将达到极限，需要补充升级
-    if skew >= 2 {
+    // 偏差即将达到极限（K8s v1.25+ 允许最多 3 个小版本偏差）
+    // 当偏差达到 3 时必须补充升级（不能继续下一个 hop）
+    if skew >= 3 {
         return true, skew
     }
     
@@ -859,7 +930,7 @@ func (r *ClusterVersionReconciler) orchestrateMultiHopUpgrade(
             
             if needsCatchup {
                 log.Info("skew limit reached, must upgrade kubelet before next hop",
-                    "currentSkew", skew, "maxSkew", 2)
+                    "currentSkew", skew, "maxSkew", 3)
                 
                 // 触发 kubelet 补充升级
                 if err := r.upgradeKubeletCatchup(ctx, bkeCluster, vc, hopPath[:i+1]); err != nil {
@@ -1181,7 +1252,7 @@ type UpgradeOrchestrationConfig struct {
 |------|------|------|---------|
 | **偏差计算错误** | kubelet 无法注册到 apiserver | 低 | 单元测试覆盖版本解析 + 偏差计算 |
 | **kubelet 补充升级超时** | 节点长时间 NotReady | 中 | 滚动升级 + 批次大小控制 + 超时回滚 |
-| **控制面升级期间 kubelet 版本过低** | 部分 API 不兼容 | 中 | 偏差门控确保不超过 2 版本偏差 |
+| **控制面升级期间 kubelet 版本过低** | 部分 API 不兼容 | 中 | 偏差门控确保不超过 3 版本偏差（K8s v1.25+ 允许） |
 | **中间版本不存在** | kubelet 补充升级找不到制品 | 低 | 中间版本必须是已发布版本 |
 | **节点 drain 失败** | Pod 无法驱逐 | 中 | 强制 drain + 超时 + Continue 策略 |
 | **偏差门误判** | 允许继续或阻塞升级 | 低 | 前瞻性检查 + 实际状态双重验证 |
