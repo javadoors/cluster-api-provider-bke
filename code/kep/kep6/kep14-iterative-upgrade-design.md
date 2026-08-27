@@ -353,7 +353,89 @@ kubeadm 内部完成的操作:
 | **kube-proxy 升级耦合** | `updateAddonVersions()` 中同步 kube-proxy 版本 | kube-proxy 应与 apiserver 同步，但耦合在 Master 升级中 |
 | **etcd 备份耦合** | `BackUpEtcd=true` 在 kubeadm 命令内部处理 | 备份逻辑不可见，无法独立控制 |
 
-### 2.8 现有实现的版本追踪
+### 2.8 现有 kubeadm 升级与 K8s 偏差规则的符合性分析
+
+kubeadm `upgrade apply` 在单节点内一次性升级所有组件，以下分析其与 K8s 官方偏差规则的符合性：
+
+#### 2.8.1 单节点升级期间的偏差状态
+
+kubeadm 在**单个 Master 节点**上执行 `upgrade apply` 时，组件升级顺序为 etcd → apiserver → cm/scheduler → kubelet。在升级过程中的不同时刻，各组件版本如下：
+
+| 时刻 | etcd | apiserver | cm/scheduler | kubelet | kube-proxy | 偏差状态分析 |
+|------|------|-----------|-------------|---------|------------|-------------|
+| T0（升级前） | v3.5.18 | v1.34 | v1.34 | v1.34 | v1.34 | ✅ 全部一致，无偏差 |
+| T1（etcd 升级后） | **v3.5.19** | v1.34 | v1.34 | v1.34 | v1.34 | ✅ etcd 版本独立，不影响组件偏差 |
+| T2（apiserver 升级后） | v3.5.19 | **v1.35** | v1.34 | v1.34 | v1.34 | ⚠️ apiserver(1.35) vs cm(1.34) = 1 偏差；apiserver(1.35) vs kubelet(1.34) = 1 偏差 |
+| T3（cm/scheduler 升级后） | v3.5.19 | v1.35 | **v1.35** | v1.34 | v1.34 | ⚠️ apiserver(1.35) vs kubelet(1.34) = 1 偏差；kube-proxy(1.34) vs apiserver(1.35) = 1 偏差 |
+| T4（kubelet 升级后） | v3.5.19 | v1.35 | v1.35 | **v1.35** | v1.34 | ⚠️ kube-proxy(1.34) vs apiserver(1.35) = 1 偏差 |
+| T5（kube-proxy 升级后） | v3.5.19 | v1.35 | v1.35 | v1.35 | **v1.35** | ✅ 全部一致，无偏差 |
+
+**分析结论**：
+
+| 偏差规则 | 单节点升级期间是否满足 | 说明 |
+|---------|---------------------|------|
+| kubelet ≤ apiserver +2 | ✅ 满足 | kubelet 始终 ≤ apiserver（kubelet 在 apiserver 之后升级），最大偏差 1 |
+| kube-proxy == apiserver | ❌ **短暂违反**（T2-T4） | apiserver 升级后 kube-proxy 仍是旧版本，在 `updateAddonVersions()` 同步前存在偏差 |
+| cm/scheduler == apiserver | ❌ **短暂违反**（T2） | apiserver 升级后 cm/scheduler 仍是旧版本，kubeadm 很快升级 cm/scheduler，但存在短暂窗口 |
+| etcd 与 apiserver 配套 | ✅ 满足 | kubeadm 先升级 etcd 再升级 apiserver |
+
+#### 2.8.2 多节点 Master 集群的偏差状态
+
+对于多 Master 节点集群，`EnsureMasterUpgrade` 逐节点滚动升级（阻塞式），各节点版本如下：
+
+| 阶段 | node-1 apiserver | node-2 apiserver | node-1 kubelet | node-2 kubelet | 偏差状态分析 |
+|------|-----------------|-----------------|----------------|----------------|-------------|
+| 升级前 | v1.34 | v1.34 | v1.34 | v1.34 | ✅ 一致 |
+| node-1 升级完成 | **v1.35** | v1.34 | **v1.35** | v1.34 | ✅ kubelet(1.34) vs apiserver(1.35) 在 node-2 上 = 1 偏差（node-2 的 apiserver 仍是 1.34，kubelet 也是 1.34，自身无偏差） |
+| node-2 升级完成 | v1.35 | **v1.35** | v1.35 | **v1.35** | ✅ 一致 |
+
+**分析结论**：多节点滚动升级期间，**单个节点内的偏差**由 kubeadm 内部管理（见 2.8.1），**跨节点偏差**通过逐节点升级保证安全。但在 node-1 完成而 node-2 未完成时，**集群存在两个版本的 apiserver**（HA 场景下可接受，因为 apiserver 向后兼容 1 个小版本）。
+
+#### 2.8.3 多 hop 升级的偏差问题
+
+**关键问题：kubeadm 无法支持多 hop 延迟升级 kubelet 的策略。**
+
+kubeadm `upgrade apply` 在单节点上**强制升级 kubelet**，无法跳过。这意味着：
+
+```
+当前 kubeadm 行为（无法延迟 kubelet）:
+
+Hop 1: K8s v1.34 → v1.35
+  └─ kubeadm upgrade apply v1.35
+     ├─ apiserver: v1.34 → v1.35  ✓
+     ├─ cm/scheduler: v1.34 → v1.35  ✓
+     ├─ kubelet: v1.34 → v1.35  ← 强制升级，无法延迟
+     └─ kube-proxy: v1.34 → v1.35  ✓
+
+  偏差状态: kubelet(1.35) vs apiserver(1.35) = 0 偏差
+
+Hop 2: K8s v1.35 → v1.36
+  └─ kubeadm upgrade apply v1.36
+     ├─ apiserver: v1.35 → v1.36  ✓
+     ├─ cm/scheduler: v1.35 → v1.36  ✓
+     ├─ kubelet: v1.35 → v1.36  ← 强制升级，无法延迟
+     └─ kube-proxy: v1.35 → v1.36  ✓
+
+  偏差状态: kubelet(1.36) vs apiserver(1.36) = 0 偏差
+```
+
+| 对比维度 | kubeadm 当前行为 | K8s 偏差规则允许的 | 差距 |
+|---------|-----------------|------------------|------|
+| kubelet 升级时机 | 与 apiserver 同步升级 | 可滞后 apiserver 最多 2 个小版本 | kubeadm 无法利用偏差窗口延迟 kubelet |
+| kubelet drain 次数 | 每个 hop 都 drain 所有节点 | 理论上可 2 个 hop drain 一次（利用偏差窗口） | 大集群 drain 次数翻倍 |
+| 控制面升级速度 | 被 kubelet drain 阻塞 | 控制面可先升级，kubelet 后续批量 | 大集群控制面升级被延迟 |
+
+#### 2.8.4 结论
+
+| 维度 | kubeadm 现有实现 | K8s 偏差规则要求 | 符合性 |
+|------|-----------------|-----------------|--------|
+| **单节点升级期间偏差** | cm/scheduler 短暂落后 apiserver（秒级窗口） | 应与 apiserver 一致 | ⚠️ 短暂违反但可接受（kubeadm 内部快速完成） |
+| **kube-proxy 同步** | apiserver 升级后 kube-proxy 在 `updateAddonVersions()` 中同步 | 应与 apiserver 一致 | ⚠️ 短暂违反（同步前窗口） |
+| **多 hop kubelet 延迟** | 不支持，kubelet 每个 hop 强制升级 | 允许最多滞后 2 个小版本 | ❌ **无法利用偏差窗口优化大集群升级** |
+| **跨节点偏差** | 逐节点滚动升级，集群短暂存在两个版本 | HA 场景可接受 | ✅ 满足 |
+| **etcd 版本配套** | kubeadm 先升级 etcd 再升级 apiserver | 每 K8s 版本有推荐 etcd 版本 | ✅ 满足 |
+
+**总结**：kubeadm 的单节点升级**基本满足**偏差规则（短暂窗口违反在实际中可接受），但**无法利用 K8s 允许的 2 版本偏差窗口**来优化多 hop 升级的 kubelet drain 效率。这正是 KEP-14 要解决的核心问题：**拆解 kubeadm 黑盒，实现 kubelet 延迟升级**。
 
 | 追踪字段 | 位置 | 说明 |
 |---------|------|------|
