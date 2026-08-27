@@ -15,14 +15,15 @@
 ## 目录
 
 1. [概述](#1-概述)
-2. [版本偏差约束](#2-版本偏差约束)
-3. [设计方案](#3-设计方案)
-4. [偏差门控实现](#4-偏差门控实现)
-5. [ClusterVersionReconciler 集成](#5-clusterversionreconciler-集成)
-6. [升级顺序总结](#6-升级顺序总结)
-7. [优势与适用场景](#7-优势与适用场景)
-8. [工作量评估](#8-工作量评估)
-9. [风险与缓解](#9-风险与缓解)
+2. [kubernetes-master 现有实现分析](#2-kubernetes-master-现有实现分析)
+3. [版本偏差约束](#3-版本偏差约束)
+4. [设计方案](#4-设计方案)
+5. [偏差门控实现](#5-偏差门控实现)
+6. [ClusterVersionReconciler 集成](#6-clusterversionreconciler-集成)
+7. [升级顺序总结](#7-升级顺序总结)
+8. [优势与适用场景](#8-优势与适用场景)
+9. [工作量评估](#9-工作量评估)
+10. [风险与缓解](#10-风险与缓解)
 
 ---
 
@@ -45,9 +46,327 @@ K8s 核心组件（kube-apiserver、kube-controller-manager、kube-scheduler、k
 - 支持 kubelet 延迟升级策略（控制面先升级，kubelet 批量补充升级）
 - 偏差门控确保每个阶段都满足 K8s 版本偏差约束
 
-## 2. 版本偏差约束
+## 2. kubernetes-master 现有实现分析
 
-### 2.1 K8s 官方偏差规则
+### 2.1 组件注册与映射
+
+在升级组件目录（`pkg/upgrade/catalog.go`）中，`kubernetes-master` 注册为 inline 类型：
+
+```go
+var DeclarativeUpgradeCatalog = []UpgradeComponentSpec{
+    // ...
+    {Name: "kubernetes-master", Mode: UpgradeExecutionInline, InlineHandler: "EnsureMasterUpgrade"},
+    // ...
+}
+```
+
+ReleaseImage 的 `spec.upgrade.components` 中通过 `inline.handler: EnsureMasterUpgrade` 引用：
+
+```yaml
+upgrade:
+  components:
+    - name: kubernetes-master
+      version: v1.36.0
+      inline:
+        handler: EnsureMasterUpgrade
+        version: v1.0.0
+```
+
+### 2.2 Phase 结构定义
+
+```go
+// pkg/phaseframe/phases/ensure_master_upgrade.go
+
+type EnsureMasterUpgrade struct {
+    phaseframe.BasePhase
+    mockTargetClient kubernetes.Interface  // 测试注入，生产环境为 nil
+}
+
+const (
+    EnsureMasterUpgradeName confv1beta1.BKEClusterPhase = "EnsureMasterUpgrade"
+    MasterUpgradePollIntervalSeconds = 2  // 健康检查轮询间隔
+    MasterUpgradeTimeoutMinutes      = 5  // 健康检查超时
+)
+```
+
+### 2.3 版本解析
+
+`EnsureMasterUpgrade` 通过 `VersionContext` 解析当前版本和目标版本，解析优先级为：
+
+```go
+// 目标版本解析优先级
+func (e *EnsureMasterUpgrade) desiredKubernetesVersion() string {
+    vc := e.GetVersionContext()
+    if vc != nil {
+        // 1. VersionContext 中 kubernetes-master 的 Target
+        if target := vc.GetTarget(upgrade.ComponentKubernetesMaster); target != "" {
+            return target
+        }
+        // 2. VersionContext 中 kubernetes-worker 的 Target
+        if target := vc.GetTarget(upgrade.ComponentKubernetesWorker); target != "" {
+            return target
+        }
+        // 3. VersionContext 中 kubernetes 的 Target
+        if target := vc.GetTarget("kubernetes"); target != "" {
+            return target
+        }
+    }
+    // 4. 回退到 BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion（Legacy）
+    return e.deprecatedSpecKubernetesVersion()
+}
+
+// 当前版本解析优先级（与目标版本对称）
+func (e *EnsureMasterUpgrade) currentKubernetesVersion() string {
+    vc := e.GetVersionContext()
+    if vc != nil {
+        // 1. VersionContext 中 kubernetes-master 的 Current
+        // 2. VersionContext 中 kubernetes-worker 的 Current
+        // 3. VersionContext 中 kubernetes 的 Current
+    }
+    // 4. 回退到 BKECluster.Status.KubernetesVersion
+    return e.Ctx.BKECluster.Status.KubernetesVersion
+}
+```
+
+**关键设计**：`kubernetes-master` 和 `kubernetes-worker` 共享同一个 K8s 版本号（`KubernetesVersion`），在 VersionContext 中使用相同的版本值。
+
+### 2.4 NeedExecute 判断逻辑
+
+```go
+func (e *EnsureMasterUpgrade) NeedExecute(old, new *bkev1beta1.BKECluster) bool {
+    // 1. 通用检查（非删除、非暂停、非 DryRun、非终端 Failed）
+    if !e.BasePhase.DefaultNeedExecute(old, new) {
+        return false
+    }
+    
+    // 2. 集群健康检查（Unhealthy/Unknown 时跳过）
+    if new.Status.ClusterStatus == bkev1beta1.ClusterUnhealthy ||
+       new.Status.ClusterStatus == bkev1beta1.ClusterUnknown {
+        return false
+    }
+    
+    // 3. 版本比较（VersionContext 优先，回退到 Legacy 版本比较）
+    //    current != target 且都不为空时才需要升级
+    if !e.NeedExecuteWithVersionContext(
+        upgrade.ComponentKubernetesMaster, old, new,
+        e.isKubernetesMasterNeedUpgrade,  // Legacy 回调
+    ) {
+        return false
+    }
+    
+    // 4. 获取 BKENodes，筛选需要升级的 Master 节点
+    bkeNodes, ok := fetchBKENodesIfCPInitialized(e.Ctx, new)
+    if !ok {
+        return false
+    }
+    nodes := phaseutil.GetNeedUpgradeMasterNodesWithBKENodes(new, bkeNodes)
+    if nodes.Length() == 0 {
+        return false  // 没有需要升级的 Master 节点
+    }
+    
+    e.SetStatus(bkev1beta1.PhaseWaiting)
+    return true
+}
+```
+
+### 2.5 Execute 执行流程
+
+`Execute()` 是整个 Master 升级的入口，完整执行流程如下：
+
+```go
+func (e *EnsureMasterUpgrade) Execute() (ctrl.Result, error) {
+    // 1. 设置 DeployAction annotation（标记集群正在进行 K8s 升级）
+    annotation.SetAnnotation(bkeCluster, 
+        annotation.DeployActionAnnotationKey, 
+        annotation.DeployActionK8sUpgrade)
+    
+    // 2. 进入主升级逻辑
+    return e.reconcileMasterUpgrade()
+}
+```
+
+**`reconcileMasterUpgrade()` 详细流程**：
+
+```
+reconcileMasterUpgrade()
+│
+├─ 1. 解析版本
+│   ├─ targetVersion = desiredKubernetesVersion()  // 目标版本
+│   └─ currentVersion = currentKubernetesVersion()  // 当前版本
+│
+├─ 2. 版本不同才升级
+│   if targetVersion != currentVersion:
+│       ├─ syncLegacyTargetKubernetesVersion(target)  // 同步到 BKECluster.Spec
+│       └─ rolloutUpgrade()  // 执行滚动升级
+│   else:
+│       └─ log "k8s version same, not need to upgrade"
+│
+└─ 完成
+```
+
+**`rolloutUpgrade()` 详细流程**：
+
+```
+rolloutUpgrade()
+│
+├─ 1. 获取需要升级的 Master 节点
+│   ├─ 获取 BKENodes（所有节点）
+│   ├─ GetNeedUpgradeMasterNodesWithBKENodes() 筛选 Master 节点
+│   │   └─ 比较节点 kubelet 版本 vs 集群目标版本
+│   └─ 过滤 BKEAgent 未就绪的节点（跳过）
+│       └─ 检查 NodeAgentReadyFlag
+│
+├─ 2. 确定 etcd 备份节点
+│   ├─ 获取 specNodes 中的 etcd 节点
+│   ├─ needBackupEtcd = true（如果有 etcd 节点）
+│   └─ backEtcdNode = etcdNodes[0]（第一个 etcd 节点作为备份目标）
+│
+├─ 3. 设置 etcd advertise client URLs annotation
+│   └─ ensureEtcdAdvertiseClientUrlsAnnotation(etcdNodes)
+│       └─ 为每个 etcd Static Pod 添加 EtcdAdvertiseClientUrlsAnnotationKey
+│          （确保后续 etcd 操作能找到 advertise URLs）
+│
+├─ 4. 逐节点滚动升级（阻塞式，失败则停止）
+│   └─ upgradeMasterNodesWithParams():
+│       │
+│       for each master node:
+│       │
+│       ├─ 4a. 获取远端 Node 资源
+│       │   └─ GetRemoteNodeByBKENode() → remoteNode
+│       │
+│       ├─ 4b. 跳过已是目标版本的节点
+│       │   if remoteNode.Status.NodeInfo.KubeletVersion == targetVersion:
+│       │       continue
+│       │
+│       ├─ 4c. 标记节点为 Upgrading
+│       │   └─ SetNodeStateWithMessageForCluster(NodeUpgrading, "Upgrading")
+│       │
+│       ├─ 4d. 执行节点升级
+│       │   └─ upgradeNode():
+│       │       │
+│       │       ├─ 创建 Upgrade Command CR:
+│       │       │   ├─ Phase: UpgradeControlPlane
+│       │       │   ├─ NodeSelector: 单节点 IP
+│       │       │   ├─ BackUpEtcd: true（仅备份节点）
+│       │       │   └─ 命令: Kubeadm UpgradeControlPlane
+│       │       │
+│       │       ├─ upgrade.New()  → 创建 Command CR
+│       │       ├─ upgrade.Wait() → 等待命令完成（2s 轮询，5min 超时）
+│       │       │
+│       │       │   BKEAgent 接收命令后执行:
+│       │       │   ├─ kubeadm upgrade apply <targetVersion>
+│       │       │   │   ├─ 下载 kubelet 二进制
+│       │       │   │   ├─ 更新 kubelet 配置
+│       │       │   │   ├─ 替换 kube-apiserver Static Pod manifest
+│       │       │   │   ├─ 替换 kube-controller-manager Static Pod manifest
+│       │       │   │   ├─ 替换 kube-scheduler Static Pod manifest
+│       │       │   │   ├─ 重启 kubelet
+│       │       │   │   └─ 等待 Kubelet 拉起新版本 Static Pod
+│       │       │   └─ （如果有 etcd 节点）备份 etcd 数据
+│       │       │
+│       │       └─ 等待节点健康检查
+│       │           └─ waitForNodeHealthCheck():
+│       │               ├─ 轮询 Node 状态（2s 间隔，5min 超时）
+│       │               ├─ 验证 Node Ready
+│       │               └─ 验证 KubeletVersion 匹配目标版本
+│       │
+│       ├─ 4e. 失败处理（Master 升级是阻塞式的）
+│       │   if err:
+│       │       └─ 标记 NodeUpgradeFailed
+│       │       └─ 返回错误（停止整个升级流程）
+│       │
+│       └─ 4f. 成功标记
+│           └─ SetNodeStateWithMessageForCluster(NodeNotReady, "Upgrading success")
+│
+├─ 5. 更新集群版本
+│   └─ bkeCluster.Status.KubernetesVersion = desiredKubernetesVersion()
+│
+└─ 6. 更新 addon 版本
+    └─ updateAddonVersions():
+        ├─ 检查 kube-proxy addon 版本是否需要同步
+        ├─ 检查 kubectl addon 版本是否需要同步
+        └─ 通过 mergecluster.SyncStatusUntilComplete 更新
+```
+
+### 2.6 kubeadm 命令机制
+
+`EnsureMasterUpgrade` 通过 `command.Upgrade` CR 向 BKEAgent 发送升级命令：
+
+```go
+// executeNodeUpgradeWithParams() 核心逻辑
+
+masterParams := CreateUpgradeCommandParams{
+    Ctx:         params.Ctx,
+    Namespace:   params.BKECluster.Namespace,
+    Client:      params.Client,
+    Scheme:      params.Scheme,
+    OwnerObj:    params.BKECluster,
+    ClusterName: params.BKECluster.Name,
+    Node:        &params.Node,
+    BKEConfig:   params.BKECluster.Name,
+    Phase:       bkev1beta1.UpgradeControlPlane,  // ← 关键：指定 kubeadm 升级阶段
+}
+
+upgrade := createUpgradeCommand(masterParams)
+
+// 如果是 etcd 备份节点，设置备份标记
+if params.NeedBackupEtcd && params.Node.IP == params.BackEtcdNode.IP {
+    upgrade.BackUpEtcd = true
+}
+
+// 创建 Command CR
+upgrade.New()
+
+// 等待命令完成
+upgrade.Wait()
+```
+
+BKEAgent 接收 `Command` CR 后，解析 `Phase=UpgradeControlPlane`，执行内置的 `Kubeadm UpgradeControlPlane` 命令：
+
+```
+BKEAgent 执行的命令等价于:
+  kubeadm upgrade apply v1.36.0
+
+kubeadm 内部完成的操作:
+  1. 预检（检查节点健康、版本兼容性）
+  2. 下载新版 kubelet 二进制
+  3. 更新 kubelet 配置文件
+  4. 替换 etcd Static Pod manifest（如果版本变更）
+  5. 替换 kube-apiserver Static Pod manifest
+  6. 替换 kube-controller-manager Static Pod manifest
+  7. 替换 kube-scheduler Static Pod manifest
+  8. 重启 kubelet（加载新配置）
+  9. Kubelet 检测 manifest 变化，逐个重建 Static Pod
+  10. 等待所有控制面 Pod 就绪
+```
+
+### 2.7 kubernetes-master 的黑盒问题
+
+从 2.5 和 2.6 的分析可以看出，`kubernetes-master` 存在以下黑盒问题：
+
+| 问题 | 说明 | 影响 |
+|------|------|------|
+| **kubeadm 一次性处理所有组件** | apiserver + cm + scheduler + kubelet + etcd 在一个 kubeadm 命令中全部升级 | 无法对单个组件独立控制升级节奏 |
+| **kubelet 被绑定在控制面升级中** | kubeadm upgrade apply 内部会升级 kubelet 二进制 | 无法实现 kubelet 延迟升级策略 |
+| **无法控制组件升级顺序** | kubeadm 内部决定 apiserver/cm/scheduler 的升级顺序 | 无法按偏差约束精确控制 |
+| **无法追踪单组件状态** | 只有 `BKECluster.Status.KubernetesVersion` 一个版本号 | apiserver/cm/scheduler/kubelet 各自版本不可见 |
+| **kube-proxy 升级耦合** | `updateAddonVersions()` 中同步 kube-proxy 版本 | kube-proxy 应与 apiserver 同步，但耦合在 Master 升级中 |
+| **etcd 备份耦合** | `BackUpEtcd=true` 在 kubeadm 命令内部处理 | 备份逻辑不可见，无法独立控制 |
+
+### 2.8 现有实现的版本追踪
+
+| 追踪字段 | 位置 | 说明 |
+|---------|------|------|
+| `BKECluster.Status.KubernetesVersion` | 集群级 | K8s 版本（apiserver/cm/scheduler/kubelet 共用） |
+| `BKECluster.Status.EtcdVersion` | 集群级 | etcd 版本 |
+| `Node.Status.NodeInfo.KubeletVersion` | 节点级 | kubelet 版本（从目标集群 Node 资源读取） |
+| `BKECluster.Status.AddonStatus[].Version` | 集群级 | addon 版本（kube-proxy/kubectl） |
+
+**问题**：apiserver/cm/scheduler 没有独立版本追踪，全部归为 `KubernetesVersion`。拆解后需要为每个组件添加独立的版本追踪。
+
+## 3. 版本偏差约束
+
+### 3.1 K8s 官方偏差规则
 
 | 约束 | 规则 | 影响 |
 |------|------|------|
@@ -57,7 +376,7 @@ K8s 核心组件（kube-apiserver、kube-controller-manager、kube-scheduler、k
 | **scheduler vs apiserver** | 应与 apiserver 版本一致 | scheduler 必须紧随 apiserver |
 | **etcd vs apiserver** | 每个 K8s 版本有推荐的 etcd 版本 | etcd 需要与 K8s 版本配套 |
 
-### 2.2 偏差约束声明
+### 3.2 偏差约束声明
 
 ```go
 // pkg/upgrade/skew_constraints.go
@@ -100,7 +419,7 @@ var K8sSkewConstraints = []SkewConstraint{
 }
 ```
 
-### 2.3 偏差计算
+### 3.3 偏差计算
 
 ```go
 // computeMinorVersionSkew 计算两个版本的小版本偏差
@@ -127,9 +446,9 @@ func parseMinorVersion(version string) int {
 }
 ```
 
-## 3. 设计方案
+## 4. 设计方案
 
-### 3.1 核心思路
+### 4.1 核心思路
 
 **将控制面升级和 kubelet 升级拆分为独立的 DAG 节点，通过版本偏差约束动态控制执行顺序。**
 
@@ -147,7 +466,7 @@ func parseMinorVersion(version string) int {
   最终验证: 0 偏差 → ✅ 升级完成
 ```
 
-### 3.2 单 hop 内的升级顺序
+### 4.2 单 hop 内的升级顺序
 
 每个 hop 内严格执行以下顺序（通过 DAG dependencies 保证）：
 
@@ -174,7 +493,7 @@ Batch 5: [kubectl]                    ← 命令行工具
 ─── kubelet 不在此 hop 中升级（延迟到偏差门后） ───
 ```
 
-### 3.3 多 hop 间的偏差门控
+### 4.3 多 hop 间的偏差门控
 
 在 hop 之间增加**偏差验证门**，决定是否可以继续下一个 hop：
 
@@ -197,7 +516,7 @@ Hop 2: K8s v1.35 → v1.36
   强制动作: 触发 kubelet 补充升级 v1.34 → v1.35 → v1.36
 ```
 
-### 3.4 完整多 hop 升级流程
+### 4.4 完整多 hop 升级流程
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -267,7 +586,7 @@ Hop 2: K8s v1.35 → v1.36
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 3.5 kubelet 延迟升级策略
+### 4.5 kubelet 延迟升级策略
 
 对于大规模集群，kubelet 逐节点 drain 升级耗时较长。采用**延迟升级策略**：
 
@@ -297,9 +616,9 @@ Hop 2: K8s v1.35 → v1.36
 延迟升级 drain 次数: 2 轮 × N 节点（但集中在最后，减少中间窗口）
 ```
 
-## 4. 偏差门控实现
+## 5. 偏差门控实现
 
-### 4.1 VersionSkewChecker
+### 5.1 VersionSkewChecker
 
 ```go
 // pkg/upgrade/skew_checker.go
@@ -375,7 +694,7 @@ func (c *VersionSkewChecker) CheckSkew(
 }
 ```
 
-### 4.2 前瞻性偏差检查
+### 5.2 前瞻性偏差检查
 
 ```go
 // CheckSkewBeforeHop 检查执行下一个 hop 后是否仍满足偏差约束
@@ -423,9 +742,9 @@ func (c *VersionSkewChecker) NeedsKubeletCatchup(
 }
 ```
 
-## 5. ClusterVersionReconciler 集成
+## 6. ClusterVersionReconciler 集成
 
-### 5.1 多 hop 编排
+### 6.1 多 hop 编排
 
 ```go
 // controllers/clusterversion/clusterversion_controller.go
@@ -494,7 +813,7 @@ func (r *ClusterVersionReconciler) orchestrateMultiHopUpgrade(
 }
 ```
 
-### 5.2 控制面 hop 执行
+### 6.2 控制面 hop 执行
 
 ```go
 // executeControlPlaneHop 执行单个 hop 的控制面升级（不含 kubelet）
@@ -542,7 +861,7 @@ func (r *ClusterVersionReconciler) executeControlPlaneHop(
 }
 ```
 
-### 5.3 kubelet 补充升级
+### 6.3 kubelet 补充升级
 
 ```go
 // upgradeKubeletCatchup kubelet 补充升级（从当前版本逐版本升级到目标版本）
@@ -691,7 +1010,7 @@ func (r *ClusterVersionReconciler) executeKubeletUpgrade(
 }
 ```
 
-## 6. 升级顺序总结
+## 7. 升级顺序总结
 
 | 阶段 | 组件 | 升级方向 | 偏差状态 | 说明 |
 |------|------|---------|---------|------|
@@ -710,9 +1029,9 @@ func (r *ClusterVersionReconciler) executeKubeletUpgrade(
 | Kubelet 补充 | kubelet | v1.35→v1.36 | 1 偏差 → 0 偏差 | 逐节点 drain 升级 |
 | **最终验证** | - | - | 0 偏差，✅ 通过 | 升级完成 |
 
-## 7. 优势与适用场景
+## 8. 优势与适用场景
 
-### 7.1 优势
+### 8.1 优势
 
 | 优势 | 说明 |
 |------|------|
@@ -723,7 +1042,7 @@ func (r *ClusterVersionReconciler) executeKubeletUpgrade(
 | **灵活** | 小集群可选择每 hop 都升级 kubelet（0 偏差），大集群选择延迟升级 |
 | **幂等** | kubelet 补充升级跳过已升级节点，支持 Reconcile 重入 |
 
-### 7.2 适用场景
+### 8.2 适用场景
 
 | 场景 | 推荐策略 | 说明 |
 |------|---------|------|
@@ -732,7 +1051,7 @@ func (r *ClusterVersionReconciler) executeKubeletUpgrade(
 | **大集群（>50 节点）** | 延迟到极限 | kubelet 延迟到偏差达到 2（极限），然后批量补充升级 |
 | **跨 3+ hop 升级** | 必须延迟 | 无法一次升级 kubelet，必须逐版本补充 |
 
-### 7.3 策略配置
+### 8.3 策略配置
 
 ```go
 // KubeletUpgradeStrategy kubelet 升级策略
@@ -759,7 +1078,7 @@ type UpgradeOrchestrationConfig struct {
 }
 ```
 
-## 8. 工作量评估
+## 9. 工作量评估
 
 | 模块 | 任务 | 工作量（人天） |
 |------|------|---------------|
@@ -774,7 +1093,7 @@ type UpgradeOrchestrationConfig struct {
 | **集成测试** | 2-hop 升级 + 延迟 kubelet + 偏差门控 + 补充升级 E2E | 5 |
 | **小计** | - | **25 人天** |
 
-## 9. 风险与缓解
+## 10. 风险与缓解
 
 | 风险 | 影响 | 概率 | 缓解措施 |
 |------|------|------|---------|
