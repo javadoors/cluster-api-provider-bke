@@ -672,6 +672,86 @@ K8s 官方推荐的组件升级顺序（从 v1.36 升级到 v1.37 示例）：
 
 > **关键设计依据**：kubelet 和 kube-proxy 是**可选升级**的，可以滞后 apiserver 最多 3 个小版本。这是 KEP-14 实现 kubelet 延迟升级策略的官方依据。
 
+#### 3.1.8 containerd 不在 K8s Version Skew Policy 中的原因
+
+K8s 官方 Version Skew Policy **不包含 containerd**，因为 containerd 不是 K8s 核心组件：
+
+| 维度 | K8s 核心组件（apiserver/kubelet 等） | containerd |
+|------|--------------------------------------|------------|
+| **归属** | K8s 项目组件 | 独立项目（CNCF，非 K8s 核心） |
+| **版本管理** | K8s 统一版本号（x.y.z） | 独立版本号（如 v1.7.24） |
+| **偏差规则** | K8s 官方制定 | 无官方偏差规则 |
+| **兼容性机制** | 版本偏差约束 | CRI API 兼容性 + kubeadm 推荐版本 |
+
+containerd 的版本兼容性通过以下机制管理（非 Version Skew Policy）：
+
+| 约束 | 说明 |
+|------|------|
+| **CRI API 兼容** | kubelet 通过 CRI（Container Runtime Interface）与 containerd 通信，CRI API 版本兼容即可，不要求 containerd 版本与 K8s 版本一致 |
+| **kubeadm 推荐版本** | 每个 K8s 版本的 kubeadm 配置中有推荐的 containerd 版本，kubeadm upgrade 时会检查 |
+| **无版本偏差规则** | containerd 可以跨多个版本运行（如 containerd v1.7.x 可配合 K8s v1.28~v1.37），无官方偏差限制 |
+
+**对 KEP-14 的影响**：
+
+`K8sSkewConstraints` 中**不包含 containerd**，因为：
+
+1. containerd 没有与 apiserver 的偏差约束
+2. containerd 的版本兼容性由 CRI API 保证，不需要偏差门控
+3. containerd 升级可以独立于 K8s 版本升级（在 ReleaseImage 中定义为独立组件）
+
+但为确保 containerd 与 kubelet 的 CRI 兼容性，增加一个**软约束**（非 K8s Version Skew Policy，而是兼容性检查）：
+
+```go
+// pkg/upgrade/container_runtime_compatibility.go
+
+// ContainerRuntimeCompatibilityRule 容器运行时兼容性规则
+// 非 K8s Version Skew Policy，而是 kubeadm 推荐版本检查
+type ContainerRuntimeCompatibilityRule struct {
+    // K8s 版本范围（semver range）
+    K8sVersionRange string
+    // 推荐的最低 containerd 版本
+    MinContainerdVersion string
+    // 推荐的最高 containerd 版本（可选）
+    MaxContainerdVersion string
+}
+
+// ContainerRuntimeCompatibilityRules 容器运行时兼容性规则表
+// 基于 kubeadm 推荐配置，非 K8s 官方偏差规则
+var ContainerRuntimeCompatibilityRules = []ContainerRuntimeCompatibilityRule{
+    {K8sVersionRange: ">=v1.34", MinContainerdVersion: "v1.7.20"},
+    {K8sVersionRange: ">=v1.35", MinContainerdVersion: "v1.7.22"},
+    {K8sVersionRange: ">=v1.36", MinContainerdVersion: "v1.7.24"},
+    {K8sVersionRange: ">=v1.37", MinContainerdVersion: "v1.7.26"},
+}
+
+// CheckContainerRuntimeCompatibility 检查 containerd 版本与 K8s 版本的兼容性
+// 返回: 兼容=true, 不兼容=false + 建议版本
+func CheckContainerRuntimeCompatibility(
+    k8sVersion string,
+    containerdVersion string,
+) (bool, string) {
+    for _, rule := range ContainerRuntimeCompatibilityRules {
+        if matchVersionRange(k8sVersion, rule.K8sVersionRange) {
+            if compareVersions(containerdVersion, rule.MinContainerdVersion) < 0 {
+                return false, rule.MinContainerdVersion
+            }
+            return true, ""
+        }
+    }
+    return true, ""  // 无匹配规则，默认兼容
+}
+```
+
+**与偏差门控的区别**：
+
+| 维度 | Version Skew 偏差门控 | 容器运行时兼容性检查 |
+|------|----------------------|-------------------|
+| **适用组件** | kubelet/kube-proxy/cm/scheduler/kubectl vs apiserver | containerd vs kubelet |
+| **规则来源** | K8s 官方 Version Skew Policy | kubeadm 推荐配置（非官方偏差规则） |
+| **检查时机** | 每 hop 间（偏差门控） | 升级前预检（PreCheck） |
+| **违反后果** | 阻止继续升级 | 告警，不阻止升级（CRI API 兼容即可运行） |
+| **在 KEP-14 中的角色** | 核心机制（偏差门控） | 辅助检查（PreCheck 中的兼容性验证） |
+
 ### 3.2 偏差约束声明
 
 ```go
