@@ -365,18 +365,18 @@ kubeadm 在**单个 Master 节点**上执行 `upgrade apply` 时，组件升级�
 |------|------|-----------|-------------|---------|------------|-------------|
 | T0（升级前） | v3.5.18 | v1.34 | v1.34 | v1.34 | v1.34 | ✅ 全部一致，无偏差 |
 | T1（etcd 升级后） | **v3.5.19** | v1.34 | v1.34 | v1.34 | v1.34 | ✅ etcd 版本独立，不影响组件偏差 |
-| T2（apiserver 升级后） | v3.5.19 | **v1.35** | v1.34 | v1.34 | v1.34 | ⚠️ apiserver(1.35) vs cm(1.34) = 1 偏差；apiserver(1.35) vs kubelet(1.34) = 1 偏差 |
-| T3（cm/scheduler 升级后） | v3.5.19 | v1.35 | **v1.35** | v1.34 | v1.34 | ⚠️ apiserver(1.35) vs kubelet(1.34) = 1 偏差；kube-proxy(1.34) vs apiserver(1.35) = 1 偏差 |
-| T4（kubelet 升级后） | v3.5.19 | v1.35 | v1.35 | **v1.35** | v1.34 | ⚠️ kube-proxy(1.34) vs apiserver(1.35) = 1 偏差 |
+| T2（apiserver 升级后） | v3.5.19 | **v1.35** | v1.34 | v1.34 | v1.34 | ✅ cm(1.34) vs apiserver(1.35) = 1 偏差（允许滞后 1）；kubelet(1.34) vs apiserver(1.35) = 1 偏差（允许滞后 3）；kube-proxy(1.34) vs apiserver(1.35) = 1 偏差（允许滞后 3） |
+| T3（cm/scheduler 升级后） | v3.5.19 | v1.35 | **v1.35** | v1.34 | v1.34 | ✅ kubelet(1.34) vs apiserver(1.35) = 1 偏差（允许滞后 3）；kube-proxy(1.34) vs apiserver(1.35) = 1 偏差（允许滞后 3） |
+| T4（kubelet 升级后） | v3.5.19 | v1.35 | v1.35 | **v1.35** | v1.34 | ✅ kube-proxy(1.34) vs apiserver(1.35) = 1 偏差（允许滞后 3） |
 | T5（kube-proxy 升级后） | v3.5.19 | v1.35 | v1.35 | v1.35 | **v1.35** | ✅ 全部一致，无偏差 |
 
 **分析结论**：
 
 | 偏差规则 | 单节点升级期间是否满足 | 说明 |
 |---------|---------------------|------|
-| kubelet ≤ apiserver +2 | ✅ 满足 | kubelet 始终 ≤ apiserver（kubelet 在 apiserver 之后升级），最大偏差 1 |
-| kube-proxy == apiserver | ❌ **短暂违反**（T2-T4） | apiserver 升级后 kube-proxy 仍是旧版本，在 `updateAddonVersions()` 同步前存在偏差 |
-| cm/scheduler == apiserver | ❌ **短暂违反**（T2） | apiserver 升级后 cm/scheduler 仍是旧版本，kubeadm 很快升级 cm/scheduler，但存在短暂窗口 |
+| kubelet ≤ apiserver（允许滞后 3） | ✅ 满足 | kubelet 始终 ≤ apiserver（kubelet 在 apiserver 之后升级），最大偏差 1（远小于允许的 3） |
+| kube-proxy ≤ apiserver（允许滞后 3） | ✅ 满足 | kube-proxy 在 apiserver 之后由 `updateAddonVersions()` 同步升级，最大偏差 1（远小于允许的 3） |
+| cm/scheduler ≤ apiserver（允许滞后 1） | ✅ 满足 | kubeadm 在 apiserver 后立即升级 cm/scheduler，最大偏差 1（正好等于允许的 1） |
 | etcd 与 apiserver 配套 | ✅ 满足 | kubeadm 先升级 etcd 再升级 apiserver |
 
 #### 2.8.2 多节点 Master 集群的偏差状态
