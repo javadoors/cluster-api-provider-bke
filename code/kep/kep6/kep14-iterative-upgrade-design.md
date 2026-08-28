@@ -2719,6 +2719,292 @@ skew := computeMinorVersionSkew(
 | **可观测性** | 仅集群级版本状态 | 组件级版本状态（`ClusterComponentStatuses`） |
 | **偏差检查** | 需要外部 `VersionSkewChecker` + 规则表 | 直接从 `ComponentVersion.versionSkew` + `VersionContext` 计算 |
 
+### 9.8a 相邻 ReleaseImage 的 K8s 组件版本约束
+
+#### 9.8a.1 核心约束
+
+**相邻 openFuyao 版本的 ReleaseImage 中，K8s 核心组件的小版本号差值不能超过 1。**
+
+即：如果 ReleaseImage v2.6.0 包含 kube-apiserver v1.34.0，则相邻的 ReleaseImage v2.6.5 只能包含 kube-apiserver v1.35.0（不能直接跳到 v1.36.0），否则单 hop 升级会违反 K8s 偏差规则。
+
+**原因**：
+
+K8s 官方要求 kube-apiserver **不能跳小版本升级**（即使单实例也不行）。如果相邻 ReleaseImage 的 apiserver 版本跨了 2 个小版本（如 v1.34→v1.36），kubeadm upgrade apply 会拒绝执行。
+
+```
+正确（相邻 hop K8s 版本差 ≤ 1）:
+  ReleaseImage v2.6.0 → kube-apiserver v1.34.0
+  ReleaseImage v2.6.5 → kube-apiserver v1.35.0   ← +1 ✅
+  ReleaseImage v2.7.0 → kube-apiserver v1.36.0   ← +1 ✅
+
+错误（相邻 hop K8s 版本差 = 2）:
+  ReleaseImage v2.6.0 → kube-apiserver v1.34.0
+  ReleaseImage v2.7.0 → kube-apiserver v1.36.0   ← +2 ❌ kubeadm 拒绝
+```
+
+#### 9.8a.2 约束范围
+
+该约束适用于 **所有 K8s 核心组件**（apiserver/cm/scheduler/kubelet/kubectl/kube-proxy），不适用于 etcd/containerd（独立版本号，非 K8s 版本）：
+
+| 组件 | 相邻 hop 版本差 | 原因 |
+|------|----------------|------|
+| kube-apiserver | ≤ 1 | K8s 官方要求不能跳小版本升级 |
+| kube-controller-manager | ≤ 1 | 必须与 apiserver 同步，偏差 ≤ 1 |
+| kube-scheduler | ≤ 1 | 必须与 apiserver 同步，偏差 ≤ 1 |
+| kubelet | ≤ 1 | 单 hop 升级时偏差 ≤ 1（延迟升级场景另算） |
+| kubectl | ≤ 1 | 偏差 ≤ 1 |
+| kube-proxy | ≤ 1 | 虽允许滞后 3，但同步升级时 ≤ 1 |
+| etcd | 无约束 | 独立版本号，非 K8s Version Skew Policy |
+| containerd | 无约束 | CRI API 兼容性保证 |
+
+#### 9.8a.3 验证机制
+
+**发布时校验**：ReleaseImage 发布时校验相邻版本的 K8s 组件版本差值：
+
+```go
+// pkg/release/validation.go 🆕新增
+
+// ValidateAdjacentReleaseImages 校验相邻 ReleaseImage 的 K8s 组件版本差值
+// 在 ReleaseImageReconciler 中调用，发布时校验
+func ValidateAdjacentReleaseImages(
+    current *ReleaseImage,
+    next *ReleaseImage,
+) error {
+    // K8s 核心组件列表
+    k8sCoreComponents := []string{
+        "kube-apiserver", "kube-controller-manager", "kube-scheduler",
+        "kubelet", "kubectl", "kube-proxy",
+    }
+    
+    for _, comp := range k8sCoreComponents {
+        currentVersion := current.GetComponentVersion(comp)
+        nextVersion := next.GetComponentVersion(comp)
+        
+        if currentVersion == "" || nextVersion == "" {
+            continue // 组件不存在，跳过
+        }
+        
+        skew := computeMinorVersionSkew(nextVersion, currentVersion)
+        if skew > 1 {
+            return fmt.Errorf(
+                "component %s: adjacent ReleaseImage version skew %d exceeds max 1 (%s → %s)",
+                comp, skew, currentVersion, nextVersion,
+            )
+        }
+        if skew < 0 {
+            return fmt.Errorf(
+                "component %s: adjacent ReleaseImage version downgrade not allowed (%s → %s)",
+                comp, currentVersion, nextVersion,
+            )
+        }
+    }
+    
+    return nil
+}
+```
+
+**升级时校验**：`resolveUpgradePath` 解析 hopPath 时校验每个相邻 hop 的 K8s 组件版本差值：
+
+```go
+// resolveUpgradePath 扩展：校验相邻 hop 的 K8s 组件版本差值
+
+func (r *ClusterVersionReconciler) resolveUpgradePath(
+    ctx context.Context,
+    currentVersion string,
+    desiredVersion string,
+) ([]string, error) {
+    // ... 现有逻辑（查找路径、校验 ReleaseImage 有效性）...
+    
+    // 🆕新增：校验相邻 hop 的 K8s 组件版本差值
+    for i := 0; i < len(path)-1; i++ {
+        currentRI, _ := r.resolveReleaseImage(ctx, path[i])
+        nextRI, _ := r.resolveReleaseImage(ctx, path[i+1])
+        
+        if err := ValidateAdjacentReleaseImages(currentRI, nextRI); err != nil {
+            return nil, fmt.Errorf("adjacent hop validation failed (%s → %s): %w",
+                path[i], path[i+1], err)
+        }
+    }
+    
+    return path, nil
+}
+```
+
+#### 9.8a.4 ReleaseImage 中 K8s 组件版本的设计规范
+
+**规范 1：每个 openFuyao 版本的 ReleaseImage 必须声明全部 K8s 核心组件版本**
+
+```yaml
+# ReleaseImage v2.6.5
+apiVersion: cvo.openfuyao.cn/v1alpha1
+kind: ReleaseImage
+metadata:
+  name: openfuyao-v2.6.5
+spec:
+  version: "v2.6.5"
+  
+  install:
+    components:
+      # K8s 核心组件（全部声明，版本与上一版差 ≤ 1）
+      - name: kube-apiserver
+        version: v1.35.0          # ← v2.6.0 是 v1.34.0，差 1 ✅
+      - name: kube-controller-manager
+        version: v1.35.0          # ← 与 apiserver 一致
+      - name: kube-scheduler
+        version: v1.35.0          # ← 与 apiserver 一致
+      - name: kubelet
+        version: v1.35.0          # ← 与 apiserver 一致
+      - name: kubectl
+        version: v1.35.0          # ← 与 apiserver 一致
+      - name: kube-proxy
+        version: v1.35.0          # ← 与 apiserver 一致
+      # etcd（独立版本号，无版本差约束）
+      - name: etcd
+        version: v3.5.19
+      # 其它组件
+      - name: containerd
+        version: v1.7.22
+      - name: bkeagent
+        version: v2.6.5
+      - name: coredns
+        version: v1.11.2
+```
+
+**规范 2：同一 ReleaseImage 内 K8s 核心组件版本必须一致**
+
+同一 openFuyao 版本内，apiserver/cm/scheduler/kubelet/kubectl/kube-proxy 的版本号必须相同（或 cm/scheduler 允许落后 1，但实际发布时应一致）：
+
+```go
+// ValidateReleaseImageInternalConsistency 校验同一 ReleaseImage 内 K8s 组件版本一致性
+func ValidateReleaseImageInternalConsistency(ri *ReleaseImage) error {
+    k8sCoreComponents := []string{
+        "kube-apiserver", "kube-controller-manager", "kube-scheduler",
+        "kubelet", "kubectl", "kube-proxy",
+    }
+    
+    var versions []string
+    for _, comp := range k8sCoreComponents {
+        v := ri.GetComponentVersion(comp)
+        if v != "" {
+            versions = append(versions, v)
+        }
+    }
+    
+    // 所有 K8s 核心组件版本必须一致
+    for i := 1; i < len(versions); i++ {
+        if versions[i] != versions[0] {
+            return fmt.Errorf(
+                "K8s core component version mismatch: %s vs %s (must be identical within same ReleaseImage)",
+                versions[0], versions[i],
+            )
+        }
+    }
+    
+    return nil
+}
+```
+
+**规范 3：ReleaseImage 中 K8s 组件版本通过 kubernetesVersion 统一声明**
+
+为减少配置错误，ReleaseImage 支持通过 `kubernetesVersion` 字段统一设置所有 K8s 核心组件版本：
+
+```yaml
+spec:
+  version: "v2.6.5"
+  
+  # 🆕新增：统一 K8s 版本声明
+  # 设置后，所有 K8s 核心组件自动使用此版本
+  # 避免手动逐个声明导致不一致
+  kubernetesVersion: "v1.35.0"
+  
+  install:
+    components:
+      # K8s 核心组件（无需单独指定 version，自动使用 kubernetesVersion）
+      - name: kube-apiserver
+      - name: kube-controller-manager
+      - name: kube-scheduler
+      - name: kubelet
+      - name: kubectl
+      - name: kube-proxy
+      
+      # 非 K8s 组件（需单独指定 version）
+      - name: etcd
+        version: v3.5.19
+      - name: containerd
+        version: v1.7.22
+      - name: bkeagent
+        version: v2.6.5
+```
+
+```go
+// ReleaseImageSpec 扩展
+type ReleaseImageSpec struct {
+    Version string `json:"version"`
+    
+    // 🆕新增：统一 K8s 版本
+    // 设置后，K8s 核心组件（apiserver/cm/scheduler/kubelet/kubectl/kube-proxy）
+    // 自动使用此版本，无需在 components 中逐个指定
+    KubernetesVersion string `json:"kubernetesVersion,omitempty"`
+    
+    Install *ReleaseImageInstallSpec `json:"install,omitempty"`
+    Upgrade *ReleaseImageUpgradeSpec `json:"upgrade,omitempty"`
+}
+
+// GetComponentVersion 扩展：K8s 组件优先从 kubernetesVersion 读取
+func (s *ReleaseImageSpec) GetComponentVersion(name string) string {
+    // K8s 核心组件优先从 kubernetesVersion 读取
+    k8sCoreComponents := map[string]bool{
+        "kube-apiserver": true, "kube-controller-manager": true,
+        "kube-scheduler": true, "kubelet": true,
+        "kubectl": true, "kube-proxy": true,
+    }
+    
+    if k8sCoreComponents[name] && s.KubernetesVersion != "" {
+        return s.KubernetesVersion
+    }
+    
+    // 非 K8s 组件或 kubernetesVersion 未设置，从 components 列表查找
+    if s.Install != nil {
+        for _, c := range s.Install.Components {
+            if c.Name == name {
+                return c.Version
+            }
+        }
+    }
+    if s.Upgrade != nil {
+        for _, c := range s.Upgrade.Components {
+            if c.Name == name {
+                return c.Version
+            }
+        }
+    }
+    
+    return ""
+}
+```
+
+#### 9.8a.5 版本矩阵示例
+
+```
+openFuyao 版本矩阵（K8s 版本逐版本递增，相邻差 ≤ 1）:
+
+| openFuyao | kubernetesVersion | etcd    | containerd | bkeagent | coredns |
+|-----------|------------------|---------|------------|----------|---------|
+| v2.6.0    | v1.34.0          | v3.5.18 | v1.7.20    | v2.6.0   | v1.11.1 |
+| v2.6.5    | v1.35.0 (+1)     | v3.5.19 | v1.7.22    | v2.6.5   | v1.11.2 |
+| v2.7.0    | v1.36.0 (+1)     | v3.5.20 | v1.7.24    | v2.7.0   | v1.11.3 |
+
+❌ 不允许的版本矩阵:
+| v2.6.0    | v1.34.0          |
+| v2.6.5    | v1.36.0 (+2) ❌  |  ← 相邻 K8s 版本差 = 2，kubeadm 拒绝
+
+✅ 允许的跳过中间版本矩阵（用户直接从 v2.6.0 升级到 v2.7.0）:
+| v2.6.0    | v1.34.0          |
+| v2.7.0    | v1.36.0          |  ← 非相邻 hop，由编排器自动插入中间 hop v2.6.5
+```
+
+**编排器行为**：如果用户直接从 v2.6.0 升级到 v2.7.0（K8s v1.34→v1.36），`resolveUpgradePath` 会自动解析出中间路径 `["v2.6.5", "v2.7.0"]`，确保每个 hop 的 K8s 版本差 ≤ 1。
+
 ### 9.9 迁移策略
 
 | 阶段 | 目标 | 说明 | Feature Gate |
