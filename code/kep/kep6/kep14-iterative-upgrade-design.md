@@ -2736,7 +2736,7 @@ skew := computeMinorVersionSkew(
                + kubelet(binary) + kubectl(binary) 🆕
   偏差检查: 外部 K8sSkewConstraints
   Feature Gate: KubeletBinaryMigration ON → kubelet 由 BinaryInstaller 处理
-                kubernetes-master 的 installKubeletCommand 跳过
+                 kubernetes-master 的 installKubeletCommand 跳过
 
 阶段 3: apiserver/cm/scheduler 独立
   ReleaseImage: kubernetes-master(inline, 仅剩 kubeadm 引导逻辑)
@@ -2757,7 +2757,391 @@ skew := computeMinorVersionSkew(
   ReleaseImage: 同阶段 4
   偏差检查: ComponentVersion.spec.versionSkew（内化）🆕
   Feature Gate: VersionSkewInComponentVersion ON → 从 ComponentVersion 读取偏差约束
-                外部 K8sSkewConstraints 标记为 deprecated
+                 外部 K8sSkewConstraints 标记为 deprecated
+```
+
+### 9.10 控制器中多 Hop 升级的设计
+
+重构后 K8s 核心组件全部独立声明在 ReleaseImage 中，控制器需要相应调整多 Hop 升级编排逻辑。
+
+#### 9.10.1 ClusterVersionReconciler 多 Hop 编排重构
+
+原 `orchestrateMultiHopUpgrade`（4.2.2/4.2.3a）依赖 `kubernetes-master` 作为整体升级单元，重构后每个 K8s 核心组件独立升级，编排逻辑需适配：
+
+```go
+// controllers/clusterversion/clusterversion_controller.go
+
+// orchestrateK8sCoreMultiHop K8s 核心组件多 hop 升级（重构版）
+// 重构后每个 K8s 核心组件在 ReleaseImage 中独立声明，
+// executeControlPlaneHop 通过 deferredComponents 跳过 kubelet
+//
+// 与原 orchestrateMultiHopUpgrade 的区别:
+// 1. hopPath 解析：从 ReleaseImage 中提取每个 hop 的 K8s 核心组件版本
+// 2. deferredComponents 参数化：不再硬编码 kubelet，从 UpgradeOrchestrationConfig 读取
+// 3. 偏差检查：从 ComponentVersion.versionSkew 读取（阶段 5 后），替代外部 K8sSkewConstraints
+// 4. HopResult 统一管理：各组件版本在 HopResult 中独立追踪
+func (r *ClusterVersionReconciler) orchestrateK8sCoreMultiHop(
+    ctx context.Context,
+    bkeCluster *bkev1beta1.BKECluster,
+    hopPath []string,
+    config *UpgradeOrchestrationConfig,
+) error {
+    skewChecker := &upgrade.VersionSkewChecker{Client: r.Client}
+    
+    // 延迟升级的组件列表（从配置读取，不再硬编码）
+    deferredComponents := config.DeferredComponents
+    // 默认: ["kubelet"]
+    
+    // kubelet 当前版本（跨 hop 持续追踪）
+    kubeletCurrentVersion := r.getComponentVersion(bkeCluster, "kubelet")
+    
+    for i, hopTarget := range hopPath {
+        log.Info("starting K8s core hop",
+            "hop", i+1, "target", hopTarget,
+            "kubeletCurrent", kubeletCurrentVersion,
+            "deferredComponents", deferredComponents)
+        
+        // 1. 执行当前 hop（K8s 核心组件升级，延迟 deferredComponents）
+        hopResult, err := r.executeControlPlaneHop(
+            ctx, bkeCluster, hopTarget, deferredComponents,
+        )
+        if err != nil {
+            return fmt.Errorf("hop %d (%s) failed: %w", i+1, hopTarget, err)
+        }
+        
+        // 2. 更新各组件版本状态（从 HopResult 提取）
+        //    重构后每个组件独立更新 Status
+        r.updateComponentStatuses(bkeCluster, hopResult)
+        
+        // 3. 获取当前 apiserver 版本（偏差参照基准）
+        apiserverVersion := hopResult.GetUpgradedVersion("kube-apiserver")
+        if apiserverVersion == "" {
+            return fmt.Errorf("hop %d: kube-apiserver version not found in result", i+1)
+        }
+        
+        // 4. 计算当前偏差
+        currentSkew := computeMinorVersionSkew(apiserverVersion, kubeletCurrentVersion)
+        log.Info("hop completed, checking skew",
+            "hop", i+1,
+            "apiserver", apiserverVersion,
+            "kubelet", kubeletCurrentVersion,
+            "skew", currentSkew)
+        
+        // 5. 偏差门控：判断是否需要 kubelet 补充升级
+        needsCatchup := false
+        catchupTargetVersion := ""
+        
+        if i < len(hopPath)-1 {
+            // 前瞻性检查：下一个 hop 后偏差是否超限
+            nextHopBundle, err := r.resolveReleaseBundle(ctx, hopPath[i+1])
+            if err != nil {
+                return fmt.Errorf("resolve next hop bundle %s: %w", hopPath[i+1], err)
+            }
+            nextApiserverVersion := nextHopBundle.GetComponentVersion("kube-apiserver")
+            
+            if nextApiserverVersion != "" {
+                nextSkew := computeMinorVersionSkew(nextApiserverVersion, kubeletCurrentVersion)
+                
+                // 从 ComponentVersion.versionSkew 读取 maxSkewBehind（阶段 5 后）
+                // 阶段 5 前使用 config.MaxKubeletSkew（默认 3）
+                maxSkew := config.MaxKubeletSkew
+                if config.UseVersionSkewFromComponentVersion {
+                    // 从 ComponentVersion 读取偏差约束
+                    kubeletCV, err := r.CVStore.GetComponentVersion(ctx, "kubelet", kubeletCurrentVersion)
+                    if err == nil && kubeletCV.Spec.VersionSkew != nil {
+                        maxSkew = kubeletCV.Spec.VersionSkew.MaxSkewBehind
+                    }
+                }
+                
+                if nextSkew >= maxSkew {
+                    needsCatchup = true
+                    // kubelet 补充目标 = 当前 apiserver 版本（重置偏差为 0）
+                    catchupTargetVersion = apiserverVersion
+                    log.Info("skew will exceed limit after next hop, must upgrade kubelet",
+                        "currentSkew", currentSkew,
+                        "projectedNextSkew", nextSkew,
+                        "maxSkew", maxSkew,
+                        "catchupTarget", catchupTargetVersion)
+                }
+            }
+        } else {
+            // 最后一个 hop，kubelet 升级到最终目标版本
+            needsCatchup = true
+            catchupTargetVersion = apiserverVersion
+            log.Info("final hop completed, upgrading kubelet to final target",
+                "catchupTarget", catchupTargetVersion)
+        }
+        
+        // 6. 执行 kubelet 补充升级
+        if needsCatchup {
+            if err := r.upgradeKubeletCatchupToVersion(
+                ctx, bkeCluster, kubeletCurrentVersion, catchupTargetVersion,
+            ); err != nil {
+                return fmt.Errorf("kubelet catchup to %s failed: %w",
+                    catchupTargetVersion, err)
+            }
+            
+            kubeletCurrentVersion = catchupTargetVersion
+            r.setComponentVersion(bkeCluster, "kubelet", catchupTargetVersion)
+            
+            // 偏差验证
+            newSkew := computeMinorVersionSkew(apiserverVersion, kubeletCurrentVersion)
+            log.Info("kubelet catchup completed",
+                "kubelet", kubeletCurrentVersion,
+                "apiserver", apiserverVersion,
+                "newSkew", newSkew)
+        }
+        
+        log.Info("hop fully completed",
+            "hop", i+1, "target", hopTarget,
+            "apiserver", apiserverVersion,
+            "kubelet", kubeletCurrentVersion)
+    }
+    
+    return nil
+}
+
+// updateComponentStatuses 从 HopResult 更新各组件版本状态
+// 重构后每个 K8s 核心组件独立更新 Status（不再统一为 KubernetesVersion）
+func (r *ClusterVersionReconciler) updateComponentStatuses(
+    bkeCluster *bkev1beta1.BKECluster,
+    hopResult *HopResult,
+) {
+    // 更新已升级组件的版本
+    for name, version := range hopResult.UpgradedVersions {
+        bkeCluster.Status.ClusterComponentStatuses[name] = confv1beta1.ComponentLifecycleStatus{
+            Phase:   confv1beta1.ComponentPhaseInstalled,
+            Version: version,
+        }
+    }
+    
+    // 延迟组件保持原有版本（不更新）
+    for name, version := range hopResult.DeferredVersions {
+        bkeCluster.Status.ClusterComponentStatuses[name] = confv1beta1.ComponentLifecycleStatus{
+            Phase:   confv1beta1.ComponentLifecyclePhase(comp.Status.ClusterComponentStatuses[name].Phase),
+            Version: version,
+        }
+    }
+    
+    // 兼容旧字段（过渡期保留）
+    if v, ok := hopResult.UpgradedVersions["kube-apiserver"]; ok {
+        bkeCluster.Status.KubernetesVersion = v
+    }
+    if v, ok := hopResult.UpgradedVersions["etcd"]; ok {
+        bkeCluster.Status.EtcdVersion = v
+    }
+}
+
+// getComponentVersion 从 BKECluster.Status 获取组件版本
+// 重构后优先从 ClusterComponentStatuses 读取，回退到旧字段
+func (r *ClusterVersionReconciler) getComponentVersion(
+    bkeCluster *bkev1beta1.BKECluster,
+    componentName string,
+) string {
+    // 优先从 ClusterComponentStatuses 读取
+    if status, ok := bkeCluster.Status.ClusterComponentStatuses[componentName]; ok {
+        return status.Version
+    }
+    
+    // 回退到旧字段（兼容期）
+    switch componentName {
+    case "kube-apiserver", "kube-controller-manager", "kube-scheduler":
+        return bkeCluster.Status.KubernetesVersion
+    case "etcd":
+        return bkeCluster.Status.EtcdVersion
+    case "containerd":
+        return bkeCluster.Status.ContainerdVersion
+    }
+    
+    return ""
+}
+
+// setComponentVersion 设置 BKECluster.Status 中的组件版本
+func (r *ClusterVersionReconciler) setComponentVersion(
+    bkeCluster *bkev1beta1.BKECluster,
+    componentName string,
+    version string,
+) {
+    if bkeCluster.Status.ClusterComponentStatuses == nil {
+        bkeCluster.Status.ClusterComponentStatuses = make(map[string]confv1beta1.ComponentLifecycleStatus)
+    }
+    bkeCluster.Status.ClusterComponentStatuses[componentName] = confv1beta1.ComponentLifecycleStatus{
+        Phase:   confv1beta1.ComponentPhaseInstalled,
+        Version: version,
+    }
+    
+    // 兼容旧字段
+    switch componentName {
+    case "kubelet":
+        bkeCluster.Status.KubeletVersion = version
+    }
+}
+```
+
+#### 9.10.2 UpgradeOrchestrationConfig 扩展
+
+```go
+// UpgradeOrchestrationConfig 升级编排配置（扩展版）
+type UpgradeOrchestrationConfig struct {
+    // kubelet 升级策略
+    KubeletStrategy KubeletUpgradeStrategy
+    
+    // 延迟升级的组件列表（默认 ["kubelet"]）
+    // 重构后支持多组件延迟（未来可扩展）
+    DeferredComponents []string `json:"deferredComponents,omitempty"`
+    
+    // 最大允许偏差（默认 3，与 K8s v1.25+ 官方一致）
+    MaxKubeletSkew int `json:"maxKubeletSkew,omitempty"`
+    
+    // 是否从 ComponentVersion.versionSkew 读取偏差约束
+    // false: 使用 MaxKubeletSkew（外部配置）
+    // true: 从 ComponentVersion.spec.versionSkew 读取（内化约束）
+    UseVersionSkewFromComponentVersion bool `json:"useVersionSkewFromComponentVersion,omitempty"`
+    
+    // kubelet 补充升级的批次大小
+    KubeletBatchSize int `json:"kubeletBatchSize,omitempty"`
+}
+```
+
+#### 9.10.3 多 Hop 升级与 ReleaseImage 重构的关系
+
+```
+ReleaseImage 重构前 vs 后的控制器行为对比:
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│  重构前（kubernetes-master 黑盒）                                       │
+│                                                                         │
+│  orchestrateMultiHopUpgrade:                                            │
+│    for each hop:                                                        │
+│      └─ executeControlPlaneHop(hopTarget)                               │
+│           └─ DAG 包含 kubernetes-master(inline) + etcd(inline)         │
+│           └─ kubernetes-master 升级 apiserver+cm+scheduler+kubelet     │
+│      └─ 偏差门控: kubelet 已随 kubernetes-master 升级（无法延迟）        │
+│                                                                         │
+│  问题: kubelet 无法延迟，每 hop 强制 drain                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│  重构后（K8s 核心组件独立）                                             │
+│                                                                         │
+│  orchestrateK8sCoreMultiHop:                                            │
+│    for each hop:                                                        │
+│      └─ executeControlPlaneHop(hopTarget, deferredComponents=["kubelet"])│
+│           └─ DAG 包含:                                                  │
+│              etcd(staticpod) + apiserver(staticpod)                     │
+│              + cm(staticpod) + scheduler(staticpod)                     │
+│              + kube-proxy(yaml) + kubectl(binary)                       │
+│              + kubelet(binary) ← 被跳过（Target=Current）              │
+│      └─ 偏差门控: kubelet 未升级，检查偏差                               │
+│      └─ 偏差 >= 3 → upgradeKubeletCatchupToVersion(apiserverVersion)   │
+│           └─ executeKubeletUpgrade: 逐节点 drain → 替换 → uncordon      │
+│                                                                         │
+│  优势: kubelet 可延迟 3 个 hop，drain 次数减少 3 倍                     │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 9.10.4 完整升级编排（含两阶段）
+
+```go
+// orchestrateFullUpgrade 完整升级编排（重构版）
+// 阶段一: K8s 核心组件多 hop 升级（偏差门控 + kubelet 延迟）
+// 阶段二: 其它组件升级（独立 DAG，无偏差门控）
+func (r *ClusterVersionReconciler) orchestrateFullUpgrade(
+    ctx context.Context,
+    bkeCluster *bkev1beta1.BKECluster,
+    hopPath []string,
+    config *UpgradeOrchestrationConfig,
+) error {
+    // ─── 阶段一: K8s 核心组件多 Hop 升级 ───
+    log.Info("phase 1: K8s core components multi-hop upgrade")
+    if err := r.orchestrateK8sCoreMultiHop(ctx, bkeCluster, hopPath, config); err != nil {
+        return fmt.Errorf("phase 1 (K8s core) failed: %w", err)
+    }
+    
+    // 最终偏差验证
+    skewChecker := &upgrade.VersionSkewChecker{Client: r.Client}
+    vc := r.getCurrentVersionContext(bkeCluster)
+    
+    // 阶段 5 后从 ComponentVersion 读取偏差约束
+    var ok bool
+    var violations []upgrade.SkewViolation
+    if config.UseVersionSkewFromComponentVersion {
+        ok, violations = skewChecker.CheckSkewFromComponentVersions(ctx, vc, r.CVStore)
+    } else {
+        ok, violations = skewChecker.CheckSkew(vc, upgrade.K8sSkewConstraints)
+    }
+    if !ok {
+        return fmt.Errorf("phase 1 skew check failed: %v", violations)
+    }
+    log.Info("phase 1 completed: K8s core components upgraded, skew satisfied")
+    
+    // ─── 阶段二: 其它组件升级 ───
+    log.Info("phase 2: other components upgrade")
+    if err := r.executeOtherComponentsUpgrade(ctx, bkeCluster, hopPath[len(hopPath)-1]); err != nil {
+        return fmt.Errorf("phase 2 (other components) failed: %w", err)
+    }
+    
+    log.Info("full upgrade completed: all components upgraded")
+    return nil
+}
+```
+
+#### 9.10.5 状态追踪重构
+
+重构后每个 K8s 核心组件在 `BKECluster.Status.ClusterComponentStatuses` 中独立追踪版本：
+
+```go
+// 重构后 BKECluster.Status.ClusterComponentStatuses 结构:
+
+bkeCluster.Status.ClusterComponentStatuses = map[string]ComponentLifecycleStatus{
+    // K8s 核心组件（全部独立追踪）
+    "etcd":                    {Phase: "Installed", Version: "v3.5.20"},
+    "kube-apiserver":          {Phase: "Installed", Version: "v1.36.0"},
+    "kube-controller-manager": {Phase: "Installed", Version: "v1.36.0"},
+    "kube-scheduler":          {Phase: "Installed", Version: "v1.36.0"},
+    "kube-proxy":              {Phase: "Installed", Version: "v1.36.0"},
+    "kubectl":                 {Phase: "Installed", Version: "v1.36.0"},
+    "kubelet":                 {Phase: "Pending",   Version: "v1.34.0"},  // 延迟升级中
+    
+    // 其它组件
+    "bkeagent":                {Phase: "Installed", Version: "v2.7.0"},
+    "containerd":              {Phase: "Installed", Version: "v1.7.24"},
+}
+```
+
+**与旧字段的兼容**：
+
+| 旧字段 | 新字段（重构后） | 兼容策略 |
+|--------|----------------|---------|
+| `Status.KubernetesVersion` | `ClusterComponentStatuses["kube-apiserver"].Version` | 过渡期同时更新两个字段 |
+| `Status.EtcdVersion` | `ClusterComponentStatuses["etcd"].Version` | 过渡期同时更新 |
+| `Status.KubeletVersion` | `ClusterComponentStatuses["kubelet"].Version` | 过渡期同时更新 |
+| `Status.ContainerdVersion` | `ClusterComponentStatuses["containerd"].Version` | 过渡期同时更新 |
+| 无 | `ClusterComponentStatuses["kube-controller-manager"].Version` | 新增独立追踪 |
+| 无 | `ClusterComponentStatuses["kube-scheduler"].Version` | 新增独立追踪 |
+| 无 | `ClusterComponentStatuses["kubectl"].Version` | 新增独立追踪 |
+| 无 | `ClusterComponentStatuses["kube-proxy"].Version` | 新增独立追踪 |
+
+**kubectl 查询示例**：
+
+```bash
+# 重构后查询各组件版本（独立追踪）
+kubectl get bkecluster my-cluster -o jsonpath='{.status.clusterComponentStatuses}'
+# 输出:
+# {
+#   "etcd": {"phase": "Installed", "version": "v3.5.20"},
+#   "kube-apiserver": {"phase": "Installed", "version": "v1.36.0"},
+#   "kube-controller-manager": {"phase": "Installed", "version": "v1.36.0"},
+#   "kube-scheduler": {"phase": "Installed", "version": "v1.36.0"},
+#   "kubelet": {"phase": "Pending", "version": "v1.34.0"},  ← 延迟升级中
+#   ...
+# }
+
+# 查询 kubelet 延迟升级状态
+kubectl get bkecluster my-cluster -o jsonpath='{.status.clusterComponentStatuses.kubelet}'
+# 输出: {"phase": "Pending", "version": "v1.34.0"}
+
+# 查询 apiserver 版本（偏差基准）
+kubectl get bkecluster my-cluster -o jsonpath='{.status.clusterComponentStatuses.kube-apiserver.version}'
+# 输出: v1.36.0
 ```
 
 ## 10. 工作量评估
@@ -2773,8 +3157,9 @@ skew := computeMinorVersionSkew(
 | **偏差门控日志 + 事件** | 偏差状态事件 + Prometheus 指标 | 2 |
 | **策略配置** | UpgradeOrchestrationConfig + Feature Gate | 1 |
 | **ReleaseImage 重构** | K8s 核心组件拆分 + versionSkew 内化 | 5 |
+| **控制器多 Hop 重构** | orchestrateK8sCoreMultiHop + 状态追踪重构 | 4 |
 | **集成测试** | 3-hop 升级 + 延迟 kubelet + 偏差门控 + 补充升级 E2E | 6 |
-| **小计** | - | **31 人天** |
+| **小计** | - | **35 人天** |
 
 ## 11. 风险与缓解
 
@@ -2788,6 +3173,7 @@ skew := computeMinorVersionSkew(
 | **偏差门误判** | 允许继续或阻塞升级 | 低 | 前瞻性检查 + 实际状态双重验证 |
 | **ReleaseImage 重构兼容性** | 新旧 ReleaseImage 格式混用 | 中 | Feature Gate 控制 + 渐进迁移 |
 | **versionSkew 内化遗漏** | 部分组件缺少偏差约束声明 | 低 | 迁移验证清单 + 单元测试 |
+| **状态追踪兼容性** | 旧字段与新 ClusterComponentStatuses 不一致 | 中 | 过渡期同时更新两个字段 |
 
 ---
 
