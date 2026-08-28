@@ -918,7 +918,7 @@ kubectl 的偏差规则允许与 apiserver 相差 ±1 个小版本（比 kubelet
 
 kube-proxy 的偏差规则允许滞后 apiserver 3 个小版本（与 kubelet 相同），但 kube-proxy 通过 DaemonSet 滚动更新升级，无需逐节点 drain，不阻塞控制面升级流程。因此 kube-proxy 随控制面同步升级。
 
-### 4.1a 多阶段升级编排：K8s 组件优先 + 其它组件后续
+### 4.2 多阶段升级编排：K8s 组件优先 + 其它组件后续
 
 **核心设计**：升级编排分为两大阶段，K8s 核心组件（受偏差约束）优先完成所有 hop 升级，然后再升级其它组件（不受偏差约束，可独立升级）。
 
@@ -1112,7 +1112,7 @@ Batch 4: [helm, etcdctl, calicoctl]     ← 辅助工具，最后
 
 > **注意**：阶段二的组件不需要偏差门控，因为它们不受 K8s Version Skew Policy 约束。各组件按 ComponentVersion.spec.dependencies 中的依赖关系排序，由 DAG Scheduler 统一调度。
 
-#### 4.1a.1 kubelet 延迟升级的收益
+#### 4.2.1 kubelet 延迟升级的收益
 
 将 kubelet 升级从 `upgradeControlPlane()` 中分离，实现延迟升级，核心收益如下：
 
@@ -1158,9 +1158,9 @@ Batch 4: [helm, etcdctl, calicoctl]     ← 辅助工具，最后
 | 实际偏差 | 每 hop 强制 0 偏差 | 利用满 3 版本窗口 |
 | 资源利用率 | 浪费了 K8s 官方提供的灵活性 | 最大化利用 |
 
-#### 4.1a.2 阶段一实现：orchestrateMultiHopUpgrade
+#### 4.2.2 阶段一实现：orchestrateMultiHopUpgrade
 
-> 依赖函数：[`executeControlPlaneHop`](#41a3-executecontrolplanehop-实现)（4.1a.3）、[`upgradeKubeletCatchup`](#41a4-upgradeKubeletCatchup-实现)（4.1a.4）、[`executeKubeletUpgrade`](#41a5-executeKubeletUpgrade-实现)（4.1a.5）
+> 依赖函数：[`executeControlPlaneHop`](#42-executecontrolplanehop-实现重构版)（4.2.3）、[`upgradeKubeletCatchup`](#424-upgradekubeletcatchup-实现)（4.2.4）、[`executeKubeletUpgrade`](#425-executeKubeletUpgrade-实现)（4.2.5）
 
 ```go
 // controllers/clusterversion/clusterversion_controller.go
@@ -1171,10 +1171,10 @@ Batch 4: [helm, etcdctl, calicoctl]     ← 辅助工具，最后
 //
 // 调用链:
 //   orchestrateMultiHopUpgrade
-//     ├─ executeControlPlaneHop (4.1a.3)   ← 每个 hop 执行控制面升级（不含 kubelet）
+//     ├─ executeControlPlaneHop (4.2.3)   ← 每个 hop 执行控制面升级（不含 kubelet）
 //     ├─ NeedsKubeletCatchup                ← 偏差门控：检查是否需要 kubelet 补充升级
-//     └─ upgradeKubeletCatchup (4.1a.4)     ← kubelet 补充升级（逐版本）
-//          └─ executeKubeletUpgrade (4.1a.5) ← 逐节点 drain → 替换 → uncordon
+//     └─ upgradeKubeletCatchup (4.2.4)     ← kubelet 补充升级（逐版本）
+//          └─ executeKubeletUpgrade (4.2.5) ← 逐节点 drain → 替换 → uncordon
 func (r *ClusterVersionReconciler) orchestrateMultiHopUpgrade(
     ctx context.Context,
     bkeCluster *bkev1beta1.BKECluster,
@@ -1242,7 +1242,7 @@ func (r *ClusterVersionReconciler) orchestrateMultiHopUpgrade(
 }
 ```
 
-#### 4.1a.3 executeControlPlaneHop 实现（重构版）
+#### 4.2.3 executeControlPlaneHop 实现（重构版）
 
 > 重构目标：支持通用场景，如 K8s v1.30→v1.36（6-hop），kubelet 需多次中途补充升级
 
@@ -1272,7 +1272,7 @@ Hop 6: apiserver v1.36, kubelet v1.33 → skew 3 ⚠️ 极限，必须升级 ku
 // 2. 返回 HopResult，包含各组件升级后的版本，供 orchestrateMultiHopUpgrade 做偏差判断
 // 3. 不再在此函数内更新 BKECluster.Status（由 orchestrateMultiHopUpgrade 统一管理）
 //
-// 调用方: orchestrateMultiHopUpgrade (4.1a.2)
+// 调用方: orchestrateMultiHopUpgrade (4.2.2)
 func (r *ClusterVersionReconciler) executeControlPlaneHop(
     ctx context.Context,
     bkeCluster *bkev1beta1.BKECluster,
@@ -1358,7 +1358,7 @@ func (h *HopResult) GetDeferredVersion(name string) string {
 }
 ```
 
-#### 4.1a.3a orchestrateMultiHopUpgrade 重构（支持多轮 kubelet 补充）
+#### 4.2.3a orchestrateMultiHopUpgrade 重构（支持多轮 kubelet 补充）
 
 > 重构目标：支持 v1.30→v1.36 等大跨度升级，kubelet 需多次中途补充
 
@@ -1368,11 +1368,11 @@ func (h *HopResult) GetDeferredVersion(name string) string {
 //
 // 调用链:
 //   orchestrateMultiHopUpgrade
-//     ├─ executeControlPlaneHop (4.1a.3)      ← 每个 hop 执行控制面升级（延迟 kubelet）
+//     ├─ executeControlPlaneHop (4.2.3)      ← 每个 hop 执行控制面升级（延迟 kubelet）
 //     ├─ checkSkewAfterHop                     ← 偏差检查：当前偏差是否达到极限
 //     ├─ computeKubeletCatchupTarget           ← 计算 kubelet 需要补充升级到的目标版本
-//     └─ upgradeKubeletCatchup (4.1a.4)        ← kubelet 补充升级（逐版本）
-//          └─ executeKubeletUpgrade (4.1a.5)    ← 逐节点 drain → 替换 → uncordon
+//     └─ upgradeKubeletCatchup (4.2.4)        ← kubelet 补充升级（逐版本）
+//          └─ executeKubeletUpgrade (4.2.5)    ← 逐节点 drain → 替换 → uncordon
 //
 // v1.30→v1.36 示例（6 hops，2 轮 kubelet 补充）:
 //
@@ -1549,7 +1549,7 @@ Hop 6: apiserver 1.36, kubelet 1.33, skew=3 → 最后一个 hop
   → 补充后: kubelet 1.36, apiserver 1.36, skew=0 → ✅ 升级完成
 ```
 
-#### 4.1a.4 upgradeKubeletCatchup 实现
+#### 4.2.4 upgradeKubeletCatchup 实现
 
 ```go
 // upgradeKubeletCatchup kubelet 补充升级（从当前版本逐版本升级到目标版本）
@@ -1605,7 +1605,7 @@ func (r *ClusterVersionReconciler) upgradeKubeletCatchup(
 }
 ```
 
-#### 4.1a.5 executeKubeletUpgrade 实现
+#### 4.2.5 executeKubeletUpgrade 实现
 
 ```go
 // executeKubeletUpgrade 执行 kubelet 到指定版本的逐节点升级
@@ -1709,7 +1709,7 @@ func computeIntermediateVersions(currentVersion, targetVersion string) []string 
 }
 ```
 
-### 4.2 单 hop 内的升级顺序
+### 4.3 单 hop 内的升级顺序
 
 每个 hop 内严格执行以下顺序（通过 DAG dependencies 保证）：
 
@@ -1736,7 +1736,7 @@ Batch 5: [kubectl]                    ← 命令行工具
 ─── kubelet 不在此 hop 中升级（延迟到偏差门后） ───
 ```
 
-### 4.3 多 hop 间的偏差门控
+### 4.4 多 hop 间的偏差门控
 
 在 hop 之间增加**偏差验证门**，决定是否可以继续下一个 hop：
 
@@ -1771,7 +1771,7 @@ Hop 3（如有）: K8s v1.36 → v1.37
   强制动作: 触发 kubelet 补充升级 v1.34 → v1.35 → v1.36 → v1.37
 ```
 
-### 4.4 完整多 hop 升级流程
+### 4.5 完整多 hop 升级流程
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -1841,7 +1841,7 @@ Hop 3（如有）: K8s v1.36 → v1.37
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 4.5 kubelet 延迟升级策略
+### 4.6 kubelet 延迟升级策略
 
 对于大规模集群，kubelet 逐节点 drain 升级耗时较长。采用**延迟升级策略**：
 
