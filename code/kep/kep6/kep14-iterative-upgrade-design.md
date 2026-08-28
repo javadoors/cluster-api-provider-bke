@@ -1159,12 +1159,21 @@ Batch 4: [helm, etcdctl, calicoctl]     ← 辅助工具，最后
 
 #### 4.1a.2 阶段一实现：orchestrateMultiHopUpgrade
 
+> 依赖函数：[`executeControlPlaneHop`](#41a3-executecontrolplanehop-实现)（4.1a.3）、[`upgradeKubeletCatchup`](#41a4-upgradeKubeletCatchup-实现)（4.1a.4）、[`executeKubeletUpgrade`](#41a5-executeKubeletUpgrade-实现)（4.1a.5）
+
 ```go
 // controllers/clusterversion/clusterversion_controller.go
 
 // orchestrateMultiHopUpgrade 执行 K8s 核心组件的多 hop 升级
 // 每个 hop 升级控制面组件（etcd/apiserver/cm/scheduler/kube-proxy/kubectl），
 // kubelet 延迟到偏差达到极限时补充升级
+//
+// 调用链:
+//   orchestrateMultiHopUpgrade
+//     ├─ executeControlPlaneHop (4.1a.3)   ← 每个 hop 执行控制面升级（不含 kubelet）
+//     ├─ NeedsKubeletCatchup                ← 偏差门控：检查是否需要 kubelet 补充升级
+//     └─ upgradeKubeletCatchup (4.1a.4)     ← kubelet 补充升级（逐版本）
+//          └─ executeKubeletUpgrade (4.1a.5) ← 逐节点 drain → 替换 → uncordon
 func (r *ClusterVersionReconciler) orchestrateMultiHopUpgrade(
     ctx context.Context,
     bkeCluster *bkev1beta1.BKECluster,
