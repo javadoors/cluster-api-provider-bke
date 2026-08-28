@@ -3144,6 +3144,606 @@ kubectl get bkecluster my-cluster -o jsonpath='{.status.clusterComponentStatuses
 # 输出: v1.36.0
 ```
 
+#### 9.10.6 完整控制器集成设计
+
+##### 9.10.6.1 控制器协作架构
+
+重构后涉及三个控制器的协作：
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          控制器协作架构                                  │
+└─────────────────────────────────────────────────────────────────────────┘
+
+    用户操作: kubectl patch clusterversion --desiredVersion v2.7.0
+                              │
+                              ▼
+    ┌──────────────────────────────────────────────────────────────────┐
+    │  ClusterVersionReconciler                                         │
+    │  ─────────────────────────                                       │
+    │  职责: 多 Hop 编排 + 偏差门控 + 状态管理                           │
+    │                                                                   │
+    │  Reconcile():                                                     │
+    │    1. 检测 desiredVersion 变化                                     │
+    │    2. 校验 UpgradePath 合法性                                     │
+    │    3. 解析 hopPath（逐版本路径）                                    │
+    │    4. 调用 orchestrateFullUpgrade():                               │
+    │       ├─ 阶段一: orchestrateK8sCoreMultiHop()                     │
+    │       │    └─ 每个 hop 设置 upgrade-ready annotation              │
+    │       │       → 通知 BKEClusterReconciler 执行                    │
+    │       │       ← 等待 BKEClusterReconciler 完成                     │
+    │       │       → 偏差门控检查                                      │
+    │       │       → kubelet 补充升级（如需要）                         │
+    │       └─ 阶段二: executeOtherComponentsUpgrade()                   │
+    │            └─ 设置 upgrade-ready annotation（其它组件）             │
+    │            ← 等待 BKEClusterReconciler 完成                        │
+    │    5. 更新 ClusterVersion.Status.CurrentVersion                     │
+    └──────────────────────────────────────────────────────────────────┘
+                              │ annotation
+                              ▼
+    ┌──────────────────────────────────────────────────────────────────┐
+    │  BKEClusterReconciler                                             │
+    │  ───────────────────────────                                     │
+    │  职责: 执行单个 hop 的 DAG 升级                                    │
+    │                                                                   │
+    │  Reconcile():                                                     │
+    │    1. 检测 upgrade-ready annotation                                │
+    │    2. 解析 ReleaseImage bundle                                    │
+    │    3. 构建 VersionContext（kubelet Target=Current 跳过）            │
+    │    4. 构建 DAG（etcd→apiserver→cm/scheduler→kube-proxy→kubectl）   │
+    │    5. Scheduler.ExecuteDAG()                                     │
+    │    6. 返回 HopResult 给 ClusterVersionReconciler                   │
+    │    7. 清除 upgrade-ready annotation                              │
+    └──────────────────────────────────────────────────────────────────┘
+                              │ Command CR
+                              ▼
+    ┌──────────────────────────────────────────────────────────────────┐
+    │  BKEAgent (节点级)                                                │
+    │  ─────────────────────                                           │
+    │  职责: 在节点上执行实际操作                                         │
+    │                                                                   │
+    │  - StaticPodInstaller: manifest 替换 → Kubelet 自动重建 Pod        │
+    │  - BinaryInstaller: 下载二进制 → SSH 上传 → 执行脚本                │
+    │  - YamlInstaller: SSA Apply 到目标集群                             │
+    └──────────────────────────────────────────────────────────────────┘
+```
+
+##### 9.10.6.2 ClusterVersionReconciler Reconcile 入口
+
+```go
+// controllers/clusterversion/clusterversion_controller.go
+
+func (r *ClusterVersionReconciler) Reconcile(
+    ctx context.Context,
+    req ctrl.Request,
+) (ctrl.Result, error) {
+    log := log.FromContext(ctx)
+    
+    // 1. 获取 ClusterVersion
+    cv := &cvv1alpha1.ClusterVersion{}
+    if err := r.Get(ctx, req.NamespacedName, cv); err != nil {
+        return ctrl.Result{}, client.IgnoreNotFound(err)
+    }
+    
+    // 2. 检测版本变化
+    if cv.Status.CurrentVersion == cv.Spec.DesiredVersion {
+        return ctrl.Result{}, nil // 已是目标版本，无需升级
+    }
+    
+    // 3. 校验 UpgradePath
+    hopPath, err := r.resolveUpgradePath(ctx, cv.Status.CurrentVersion, cv.Spec.DesiredVersion)
+    if err != nil {
+        log.Error(err, "failed to resolve upgrade path")
+        r.Recorder.Eventf(cv, corev1.EventTypeWarning, "UpgradePathInvalid", "%v", err)
+        return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+    }
+    log.Info("upgrade path resolved", "hops", hopPath)
+    
+    // 4. 获取关联的 BKECluster
+    bkeCluster, err := r.getBKEClusterForClusterVersion(ctx, cv)
+    if err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    // 5. 解析升级编排配置
+    config := r.resolveOrchestrationConfig(bkeCluster)
+    
+    // 6. 更新 ClusterVersion.Status.Phase
+    cv.Status.Phase = cvv1alpha1.ClusterVersionPhaseUpgrading
+    if err := r.Status().Update(ctx, cv); err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    // 7. 执行完整升级编排
+    if err := r.orchestrateFullUpgrade(ctx, bkeCluster, hopPath, config); err != nil {
+        log.Error(err, "full upgrade failed")
+        cv.Status.Phase = cvv1alpha1.ClusterVersionPhaseFailed
+        cv.Status.LastError = err.Error()
+        _ = r.Status().Update(ctx, cv)
+        // StatusManager 处理重试
+        return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+    }
+    
+    // 8. 升级完成
+    cv.Status.Phase = cvv1alpha1.ClusterVersionPhaseReady
+    cv.Status.CurrentVersion = cv.Spec.DesiredVersion
+    if err := r.Status().Update(ctx, cv); err != nil {
+        return ctrl.Result{}, err
+    }
+    
+    r.Recorder.Eventf(cv, corev1.EventTypeNormal, "UpgradeCompleted",
+        "Cluster upgraded to %s", cv.Spec.DesiredVersion)
+    
+    return ctrl.Result{}, nil
+}
+
+// resolveUpgradePath 解析升级路径
+// 从 UpgradePath CRD 获取合法路径，返回逐版本 hop 列表
+// 例如: current=v2.6.0, desired=v2.7.0 → ["v2.6.5", "v2.7.0"]
+func (r *ClusterVersionReconciler) resolveUpgradePath(
+    ctx context.Context,
+    currentVersion string,
+    desiredVersion string,
+) ([]string, error) {
+    // 1. 获取 UpgradePath CR
+    up := &cvv1alpha1.UpgradePath{}
+    if err := r.Get(ctx, client.ObjectKey{Name: "openfuyao-upgrade-paths"}, up); err != nil {
+        return nil, fmt.Errorf("get upgrade path: %w", err)
+    }
+    
+    // 2. 查找从 current 到 desired 的路径
+    // 使用 DFS 查找合法路径（仅返回 Blocked=false 且 Deprecated=false 的边）
+    path, err := findPath(up.Spec.Paths, currentVersion, desiredVersion)
+    if err != nil {
+        return nil, fmt.Errorf("no valid upgrade path from %s to %s: %w",
+            currentVersion, desiredVersion, err)
+    }
+    
+    // 3. 检查路径中每个版本的 ReleaseImage 是否存在
+    for _, hop := range path {
+        ri, err := r.resolveReleaseImage(ctx, hop)
+        if err != nil {
+            return nil, fmt.Errorf("release image %s not found: %w", hop, err)
+        }
+        if ri.Status.Phase != cvv1alpha1.ReleaseImagePhaseValid {
+            return nil, fmt.Errorf("release image %s is not valid (phase=%s)",
+                hop, ri.Status.Phase)
+        }
+    }
+    
+    return path, nil
+}
+
+// resolveOrchestrationConfig 从 BKECluster annotation 或默认值解析编排配置
+func (r *ClusterVersionReconciler) resolveOrchestrationConfig(
+    bkeCluster *bkev1beta1.BKECluster,
+) *UpgradeOrchestrationConfig {
+    config := &UpgradeOrchestrationConfig{
+        KubeletStrategy:                    KubeletStrategyDeferred,
+        DeferredComponents:                 []string{"kubelet"},
+        MaxKubeletSkew:                     3,
+        UseVersionSkewFromComponentVersion: false,
+        KubeletBatchSize:                   1,
+    }
+    
+    // 从 annotation 读取覆盖配置
+    if v, ok := bkeCluster.Annotations["bke.bocloud.com/kubelet-upgrade-strategy"]; ok {
+        config.KubeletStrategy = KubeletUpgradeStrategy(v)
+    }
+    if v, ok := bkeCluster.Annotations["bke.bocloud.com/max-kubelet-skew"]; ok {
+        if n, err := strconv.Atoi(v); err == nil {
+            config.MaxKubeletSkew = n
+        }
+    }
+    if _, ok := bkeCluster.Annotations["bke.bocloud.com/use-version-skew-from-cv"]; ok {
+        config.UseVersionSkewFromComponentVersion = true
+    }
+    
+    return config
+}
+```
+
+##### 9.10.6.3 Hop 执行的 Reconcile 重入支持
+
+升级过程可能因节点 drain 超时、网络中断等原因失败。Reconcile 重入时需要支持断点续传：
+
+```go
+// orchestrateK8sCoreMultiHop 增加重入支持
+
+func (r *ClusterVersionReconciler) orchestrateK8sCoreMultiHop(
+    ctx context.Context,
+    bkeCluster *bkev1beta1.BKECluster,
+    hopPath []string,
+    config *UpgradeOrchestrationConfig,
+) error {
+    skewChecker := &upgrade.VersionSkewChecker{Client: r.Client}
+    deferredComponents := config.DeferredComponents
+    
+    // 重入恢复：从上次中断的 hop 继续
+    // 通过 BKECluster annotation 记录当前 hop 进度
+    currentHopIndex := r.getCurrentHopIndex(bkeCluster)
+    kubeletCurrentVersion := r.getComponentVersion(bkeCluster, "kubelet")
+    
+    for i := currentHopIndex; i < len(hopPath); i++ {
+        hopTarget := hopPath[i]
+        log.Info("starting K8s core hop",
+            "hop", i+1, "target", hopTarget,
+            "kubeletCurrent", kubeletCurrentVersion,
+            "resumed", i > currentHopIndex)
+        
+        // 记录当前 hop 进度（支持重入）
+        r.setCurrentHopIndex(bkeCluster, i)
+        
+        // 1. 检查当前 hop 是否已部分完成（重入场景）
+        hopPhase := r.getHopPhase(bkeCluster, hopTarget)
+        if hopPhase == HopPhaseControlPlaneCompleted {
+            // 控制面已完成（上次 Reconcile 已执行），检查是否需要 kubelet 补充
+            apiserverVersion := r.getComponentVersion(bkeCluster, "kube-apiserver")
+            currentSkew := computeMinorVersionSkew(apiserverVersion, kubeletCurrentVersion)
+            
+            if r.needsKubeletCatchup(ctx, config, kubeletCurrentVersion, apiserverVersion, i, hopPath) {
+                if err := r.upgradeKubeletCatchupToVersion(
+                    ctx, bkeCluster, kubeletCurrentVersion, apiserverVersion,
+                ); err != nil {
+                    return fmt.Errorf("kubelet catchup (resumed) failed: %w", err)
+                }
+                kubeletCurrentVersion = apiserverVersion
+                r.setComponentVersion(bkeCluster, "kubelet", kubeletCurrentVersion)
+            }
+            
+            r.setHopPhase(bkeCluster, hopTarget, HopPhaseCompleted)
+            continue
+        }
+        
+        // 2. 执行当前 hop
+        hopResult, err := r.executeControlPlaneHop(
+            ctx, bkeCluster, hopTarget, deferredComponents,
+        )
+        if err != nil {
+            // 记录失败状态（支持重入）
+            r.setHopPhase(bkeCluster, hopTarget, HopPhaseFailed)
+            return fmt.Errorf("hop %d (%s) failed: %w", i+1, hopTarget, err)
+        }
+        
+        r.updateComponentStatuses(bkeCluster, hopResult)
+        r.setHopPhase(bkeCluster, hopTarget, HopPhaseControlPlaneCompleted)
+        
+        // 3. 偏差门控
+        apiserverVersion := hopResult.GetUpgradedVersion("kube-apiserver")
+        kubeletCurrentVersion = r.getComponentVersion(bkeCluster, "kubelet")
+        currentSkew := computeMinorVersionSkew(apiserverVersion, kubeletCurrentVersion)
+        
+        // 4. 偏差门控判断 + kubelet 补充升级（同 9.10.1 逻辑）
+        needsCatchup, catchupTargetVersion := r.evaluateSkewGate(
+            ctx, config, kubeletCurrentVersion, apiserverVersion, i, hopPath,
+        )
+        
+        if needsCatchup {
+            if err := r.upgradeKubeletCatchupToVersion(
+                ctx, bkeCluster, kubeletCurrentVersion, catchupTargetVersion,
+            ); err != nil {
+                return fmt.Errorf("kubelet catchup to %s failed: %w",
+                    catchupTargetVersion, err)
+            }
+            kubeletCurrentVersion = catchupTargetVersion
+            r.setComponentVersion(bkeCluster, "kubelet", kubeletCurrentVersion)
+        }
+        
+        // 5. 持久化 BKECluster.Status（支持重入恢复）
+        if err := r.Status().Update(ctx, bkeCluster); err != nil {
+            log.Error(err, "failed to persist hop status")
+        }
+        
+        r.setHopPhase(bkeCluster, hopTarget, HopPhaseCompleted)
+        
+        log.Info("hop fully completed",
+            "hop", i+1, "target", hopTarget,
+            "apiserver", apiserverVersion,
+            "kubelet", kubeletCurrentVersion)
+    }
+    
+    // 清除 hop 进度 annotation
+    r.clearHopProgress(bkeCluster)
+    
+    return nil
+}
+
+// HopPhase hop 执行阶段（支持重入）
+type HopPhase string
+
+const (
+    HopPhasePending               HopPhase = "Pending"
+    HopPhaseControlPlaneInProgress HopPhase = "ControlPlaneInProgress"
+    HopPhaseControlPlaneCompleted  HopPhase = "ControlPlaneCompleted"
+    HopPhaseKubeletCatchupInProgress HopPhase = "KubeletCatchupInProgress"
+    HopPhaseCompleted              HopPhase = "Completed"
+    HopPhaseFailed                HopPhase = "Failed"
+)
+
+// Hop 进度 annotation key 前缀
+const (
+    hopIndexAnnotationKey = "bke.bocloud.com/current-hop-index"
+    hopPhaseAnnotationKeyFmt = "bke.bocloud.com/hop-phase-%s"
+)
+
+func (r *ClusterVersionReconciler) getCurrentHopIndex(bkeCluster *bkev1beta1.BKECluster) int {
+    if v, ok := bkeCluster.Annotations[hopIndexAnnotationKey]; ok {
+        if n, err := strconv.Atoi(v); err == nil {
+            return n
+        }
+    }
+    return 0
+}
+
+func (r *ClusterVersionReconciler) setCurrentHopIndex(bkeCluster *bkev1beta1.BKECluster, index int) {
+    if bkeCluster.Annotations == nil {
+        bkeCluster.Annotations = make(map[string]string)
+    }
+    bkeCluster.Annotations[hopIndexAnnotationKey] = strconv.Itoa(index)
+}
+
+func (r *ClusterVersionReconciler) getHopPhase(bkeCluster *bkev1beta1.BKECluster, hopTarget string) HopPhase {
+    key := fmt.Sprintf(hopPhaseAnnotationKeyFmt, hopTarget)
+    if v, ok := bkeCluster.Annotations[key]; ok {
+        return HopPhase(v)
+    }
+    return HopPhasePending
+}
+
+func (r *ClusterVersionReconciler) setHopPhase(bkeCluster *bkev1beta1.BKECluster, hopTarget string, phase HopPhase) {
+    if bkeCluster.Annotations == nil {
+        bkeCluster.Annotations = make(map[string]string)
+    }
+    key := fmt.Sprintf(hopPhaseAnnotationKeyFmt, hopTarget)
+    bkeCluster.Annotations[key] = string(phase)
+}
+
+func (r *ClusterVersionReconciler) clearHopProgress(bkeCluster *bkev1beta1.BKECluster) {
+    delete(bkeCluster.Annotations, hopIndexAnnotationKey)
+    // 清除所有 hop-phase annotation
+    for k := range bkeCluster.Annotations {
+        if strings.HasPrefix(k, "bke.bocloud.com/hop-phase-") {
+            delete(bkeCluster.Annotations, k)
+        }
+    }
+}
+
+// evaluateSkewGate 评估偏差门控
+func (r *ClusterVersionReconciler) evaluateSkewGate(
+    ctx context.Context,
+    config *UpgradeOrchestrationConfig,
+    kubeletCurrentVersion string,
+    apiserverVersion string,
+    hopIndex int,
+    hopPath []string,
+) (bool, string) {
+    currentSkew := computeMinorVersionSkew(apiserverVersion, kubeletCurrentVersion)
+    
+    if hopIndex < len(hopPath)-1 {
+        // 前瞻性检查
+        nextHopBundle, err := r.resolveReleaseBundle(ctx, hopPath[hopIndex+1])
+        if err != nil {
+            return false, ""
+        }
+        nextApiserverVersion := nextHopBundle.GetComponentVersion("kube-apiserver")
+        if nextApiserverVersion == "" {
+            return false, ""
+        }
+        
+        nextSkew := computeMinorVersionSkew(nextApiserverVersion, kubeletCurrentVersion)
+        maxSkew := config.MaxKubeletSkew
+        
+        if config.UseVersionSkewFromComponentVersion {
+            kubeletCV, err := r.CVStore.GetComponentVersion(ctx, "kubelet", kubeletCurrentVersion)
+            if err == nil && kubeletCV.Spec.VersionSkew != nil {
+                maxSkew = kubeletCV.Spec.VersionSkew.MaxSkewBehind
+            }
+        }
+        
+        if nextSkew >= maxSkew {
+            return true, apiserverVersion // 补充到当前 apiserver 版本
+        }
+    } else {
+        // 最后一个 hop
+        return true, apiserverVersion
+    }
+    
+    return false, ""
+}
+
+// needsKubeletCatchup 判断是否需要 kubelet 补充升级（重入场景）
+func (r *ClusterVersionReconciler) needsKubeletCatchup(
+    ctx context.Context,
+    config *UpgradeOrchestrationConfig,
+    kubeletCurrentVersion string,
+    apiserverVersion string,
+    hopIndex int,
+    hopPath []string,
+) bool {
+    needs, _ := r.evaluateSkewGate(ctx, config, kubeletCurrentVersion, apiserverVersion, hopIndex, hopPath)
+    return needs
+}
+```
+
+##### 9.10.6.4 BKEClusterReconciler 适配
+
+BKEClusterReconciler 通过 `upgrade-ready` annotation 接收 ClusterVersionReconciler 的指令，执行单个 hop 的 DAG：
+
+```go
+// controllers/capbke/bkecluster_controller.go
+
+func (r *BKEClusterReconciler) Reconcile(
+    ctx context.Context,
+    req ctrl.Request,
+) (ctrl.Result, error) {
+    // ... 现有逻辑（getAndValidateCluster 等）...
+    
+    // 检测 upgrade-ready annotation
+    hopTarget, ok := annotation.HasAnnotation(bkeCluster, annotation.UpgradeReadyAnnotationKey)
+    if ok {
+        // 执行单 hop 升级 DAG
+        result, err := r.executeUpgradeDAGForHop(ctx, bkeCluster, hopTarget)
+        if err != nil {
+            bkeCluster.Status.DeclarativeUpgrade.LastError = err.Error()
+            _ = r.Status().Patch(ctx, bkeCluster, client.Merge)
+            return ctrl.Result{}, err
+        }
+        
+        // 将结果写入 BKECluster.Status 供 ClusterVersionReconciler 读取
+        r.writeHopResult(ctx, bkeCluster, result)
+        
+        // 清除 annotation，通知 ClusterVersionReconciler 完成
+        annotation.RemoveAnnotation(bkeCluster, annotation.UpgradeReadyAnnotationKey)
+        _ = r.Update(ctx, bkeCluster)
+        
+        return ctrl.Result{}, nil
+    }
+    
+    // ... 其它逻辑（PhaseFlow 等）...
+}
+
+// executeUpgradeDAGForHop 执行单个 hop 的升级 DAG
+func (r *BKEClusterReconciler) executeUpgradeDAGForHop(
+    ctx context.Context,
+    bkeCluster *bkev1beta1.BKECluster,
+    hopTarget string,
+) (*HopResult, error) {
+    // 复用 executeControlPlaneHop 逻辑
+    // 但由 BKEClusterReconciler 通过 annotation 触发，而非 ClusterVersionReconciler 直接调用
+    return r.executeControlPlaneHop(ctx, bkeCluster, hopTarget, []string{"kubelet"})
+}
+
+// writeHopResult 将 hop 结果写入 BKECluster.Status
+func (r *BKEClusterReconciler) writeHopResult(
+    ctx context.Context,
+    bkeCluster *bkev1beta1.BKECluster,
+    result *HopResult,
+) {
+    // 更新 ClusterComponentStatuses
+    if bkeCluster.Status.ClusterComponentStatuses == nil {
+        bkeCluster.Status.ClusterComponentStatuses = make(map[string]confv1beta1.ComponentLifecycleStatus)
+    }
+    
+    for name, version := range result.UpgradedVersions {
+        bkeCluster.Status.ClusterComponentStatuses[name] = confv1beta1.ComponentLifecycleStatus{
+            Phase:   confv1beta1.ComponentPhaseInstalled,
+            Version: version,
+        }
+    }
+    
+    // 兼容旧字段
+    if v, ok := result.UpgradedVersions["kube-apiserver"]; ok {
+        bkeCluster.Status.KubernetesVersion = v
+    }
+    if v, ok := result.UpgradedVersions["etcd"]; ok {
+        bkeCluster.Status.EtcdVersion = v
+    }
+}
+```
+
+##### 9.10.6.5 完整多 Hop 升级时序
+
+```
+完整多 Hop 升级时序 (v1.34 → v1.36, 2 hops):
+
+用户: kubectl patch clusterversion --desired-version v2.7.0
+
+T0: ClusterVersionReconciler.Reconcile()
+    ├─ resolveUpgradePath("v2.6.0", "v2.7.0") → ["v2.6.5", "v2.7.0"]
+    ├─ resolveOrchestrationConfig() → DeferredComponents=["kubelet"], MaxSkew=3
+    └─ orchestrateFullUpgrade():
+       │
+       ├─ 阶段一: orchestrateK8sCoreMultiHop():
+       │  │
+       │  ├─ Hop 1 (v2.6.5):
+       │  │  ├─ setCurrentHopIndex(0)                          ← 记录进度
+       │  │  ├─ set upgrade-ready annotation = "v2.6.5"       ← 通知 BKEClusterReconciler
+       │  │  │
+       │  │  │   BKEClusterReconciler.Reconcile():
+       │  │  │   ├─ 检测 upgrade-ready annotation
+       │  │  │   ├─ executeUpgradeDAGForHop("v2.6.5"):
+       │  │  │   │   ├─ 构建 VersionContext（kubelet Target=Current 跳过）
+       │  │  │   │   ├─ 构建 DAG: etcd→apiserver→cm/scheduler→kube-proxy→kubectl
+       │  │  │   │   └─ Scheduler.ExecuteDAG()
+       │  │  │   │        ├─ etcd: StaticPodInstaller manifest 替换 → Kubelet 重建 Pod
+       │  │  │   │        ├─ kube-apiserver: StaticPodInstaller manifest 替换 → Kubelet 重建 Pod
+       │  │  │   │        ├─ kube-controller-manager: StaticPodInstaller
+       │  │  │   │        ├─ kube-scheduler: StaticPodInstaller
+       │  │  │   │        ├─ kube-proxy: YamlInstaller SSA Apply
+       │  │  │   │        └─ kubectl: BinaryInstaller 替换二进制
+       │  │  │   ├─ writeHopResult(): 更新 ClusterComponentStatuses
+       │  │  │   └─ 清除 upgrade-ready annotation               ← 通知完成
+       │  │  │
+       │  │  ├─ updateComponentStatuses(hopResult)              ← 更新各组件版本
+       │  │  ├─ apiserverVersion = "v1.35.0"
+       │  │  ├─ kubeletCurrentVersion = "v1.34.0"
+       │  │  ├─ currentSkew = 1                                ← 安全（允许 3）
+       │  │  ├─ evaluateSkewGate() → needsCatchup=false        ← 偏差未达极限
+       │  │  ├─ setHopPhase("v2.6.5", Completed)               ← 记录完成
+       │  └─ Status().Update()                                  ← 持久化状态
+       │  │
+       │  ├─ Hop 2 (v2.7.0):
+       │  │  ├─ setCurrentHopIndex(1)
+       │  │  ├─ set upgrade-ready annotation = "v2.7.0"
+       │  │  │   BKEClusterReconciler.Reconcile():
+       │  │  │   └─ executeUpgradeDAGForHop("v2.7.0") → DAG 执行
+       │  │  │
+       │  │  ├─ apiserverVersion = "v1.36.0"
+       │  │  ├─ kubeletCurrentVersion = "v1.34.0"
+       │  │  ├─ currentSkew = 2                                ← 安全（允许 3）
+       │  │  ├─ 最后一个 hop → needsCatchup=true
+       │  │  │   catchupTargetVersion = "v1.36.0"
+       │  │  │
+       │  │  ├─ upgradeKubeletCatchupToVersion("v1.34.0", "v1.36.0"):
+       │  │  │   ├─ computeIntermediateVersions("v1.34.0", "v1.36.0") → ["v1.35.0", "v1.36.0"]
+       │  │  │   ├─ executeKubeletUpgrade("v1.35.0"):
+       │  │  │   │   └─ 逐节点: drain → BinaryInstaller → 健康检查 → uncordon
+       │  │  │   └─ executeKubeletUpgrade("v1.36.0"):
+       │  │  │       └─ 逐节点: drain → BinaryInstaller → 健康检查 → uncordon
+       │  │  │
+       │  │  └─ setHopPhase("v2.7.0", Completed)
+       │  │
+       │  └─ clearHopProgress()                                ← 清除进度 annotation
+       │
+       ├─ 偏差最终验证: CheckSkew() → 0 偏差 ✅
+       │
+       └─ 阶段二: executeOtherComponentsUpgrade("v2.7.0"):
+          ├─ set upgrade-ready annotation = "v2.7.0" (其它组件)
+          │   BKEClusterReconciler.Reconcile():
+          │   └─ executeOtherComponentsDAG():
+          │        ├─ bkeagent: SSH 推送
+          │        ├─ containerd: ENV 命令
+          │        ├─ runc: BinaryInstaller
+          │        └─ ...
+          └─ 清除 annotation
+
+T1: ClusterVersionReconciler 更新:
+    ├─ ClusterVersion.Status.CurrentVersion = "v2.7.0"
+    ├─ ClusterVersion.Status.Phase = Ready
+    └─ Event: "UpgradeCompleted: Cluster upgraded to v2.7.0"
+```
+
+##### 9.10.6.6 错误恢复场景
+
+| 场景 | 恢复机制 | 说明 |
+|------|---------|------|
+| **控制面升级失败（Hop 2）** | Reconcile 重入，从 Hop 2 重新开始 | hopIndex annotation 记录进度，已完成的 Hop 1 跳过 |
+| **kubelet drain 失败** | Worker 节点 Continue，Master 阻塞 | 失败节点记录在 failedNodes，Reconcile 重试时跳过已升级节点 |
+| **kubelet 补充升级中断** | 从中断的中间版本继续 | computeIntermediateVersions 基于当前 kubelet 版本重新计算 |
+| **ClusterVersionReconciler 重启** | 从 annotation 恢复 hopIndex 和 hopPhase | BKECluster.Status 已持久化各组件版本 |
+| **BKEClusterReconciler 重启** | 从 upgrade-ready annotation 重新执行当前 hop | DAG 内部幂等（VersionContext.NeedsUpgrade 跳过已完成组件） |
+| **节点 BKEAgent 不可用** | 跳过该节点，继续其它节点 | BKEAgent 未就绪的节点在 getNeedUpgradeNodes 中被过滤 |
+
+##### 9.10.6.7 Feature Gate 矩阵
+
+| Feature Gate | 控制器行为 | ReleaseImage 结构 | 偏差检查 |
+|-------------|-----------|------------------|---------|
+| 全部 OFF | `orchestrateMultiHopUpgrade`（原版，kubernetes-master inline） | kubernetes-master + etcd + kube-proxy | 外部 K8sSkewConstraints |
+| `KubeletBinaryMigration` ON | kubelet 从 kubernetes-master 拆出，`executeControlPlaneHop` 跳过 kubelet | + kubelet(binary) + kubectl(binary) | 外部 K8sSkewConstraints |
+| + `StaticPodComponentEnabled` ON | apiserver/cm/scheduler 从 kubernetes-master 拆出 | + apiserver/cm/scheduler(staticpod) | 外部 K8sSkewConstraints |
+| + 删除 kubernetes-master | kubernetes-master 不再存在 | 全部独立 | 外部 K8sSkewConstraints |
+| + `VersionSkewInComponentVersion` ON | 偏差检查从 ComponentVersion 读取 | 同上 | ComponentVersion.versionSkew（内化） |
+
 ## 10. 工作量评估
 
 | 模块 | 任务 | 工作量（人天） |
