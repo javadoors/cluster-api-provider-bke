@@ -14,7 +14,7 @@
 
 ## 目录
 
-1. [概述](#1-概述)
+1. [总体设计思路与架构](#1-总体设计思路与架构)
 2. [kubernetes-master 现有实现分析](#2-kubernetes-master-现有实现分析)
 3. [版本偏差约束](#3-版本偏差约束)
 4. [设计方案](#4-设计方案)
@@ -28,24 +28,155 @@
 
 ---
 
-## 1. 概述
+## 1. 总体设计思路与架构
 
-### 1.1 设计背景
+### 1.1 设计目标
 
-K8s 核心组件（kube-apiserver、kube-controller-manager、kube-scheduler、kubelet、kube-proxy）在跨多个小版本升级时（如 v1.34→v1.36），需要满足严格的版本偏差约束。当前设计中 `kubernetes-master` 作为 inline/composite 节点，kubeadm 在一个节点上一次性升级所有控制面组件 + kubelet，带来以下问题：
+在 openFuyao 声明式升级框架（KEP-5）基础上，实现 K8s 核心组件的平滑跨版本升级能力，核心目标：
 
-| 问题 | 说明 | 影响 |
-|------|------|------|
-| 跨 hop 偏差风险 | Hop 1 升级 apiserver 到 1.35，kubelet 还在 1.34；Hop 2 apiserver 到 1.36 时 kubelet 仍在 1.34，偏差为 2（K8s v1.25+ 允许最多 3）；Hop 3 apiserver 到 1.37 时偏差达到 3（极限） | 可能导致 kubelet 版本落后过多 |
-| 组件间无法独立编排 | apiserver 和 kubelet 被绑定在同一个 DAG 节点中 | 无法分别控制升级节奏 |
-| kubelet 升级阻塞控制面 | 大规模集群 kubelet 逐节点 drain 耗时 | 控制面升级被 kubelet 阻塞 |
+1. **复用现有升级机制与框架**：不重新发明轮子，基于已有的 DAG 调度器、ReleaseImage/ComponentVersion CRD、ClusterVersionReconciler 逐 hop 触发机制
+2. **对 ReleaseImage 与 K8s 版本增加约束与校验**：确保相邻 ReleaseImage 的 K8s 组件版本差 ≤ 1，K8s 组件名称与官方一致，偏差约束内化到 ComponentVersion
+3. **通过 openFuyao 多 Hop 升级与 UpgradePath 设计实现 K8s 跨版本平滑升级**：编排器逐 openFuyao 版本推进，每个 hop 内 K8s 组件按偏差约束升级，kubelet 可延迟到偏差极限后批量补充升级
 
-### 1.2 设计目标
+### 1.2 总体架构
 
-- 将控制面升级（apiserver/cm/scheduler/kube-proxy）和 kubelet 升级拆分为独立的 DAG 节点
-- 通过版本偏差约束动态控制执行顺序
-- 支持 kubelet 延迟升级策略（控制面先升级，kubelet 延迟最多 3 个 hop 后批量补充升级）
-- 偏差门控确保每个阶段都满足 K8s 版本偏差约束（kubelet/kube-proxy 最多滞后 3，cm/scheduler 最多滞后 1）
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                          K8s 核心组件迭代式升级总体架构                         │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+    用户层:  kubectl patch clusterversion --desired-version v2.7.0
+                    │ (openFuyao 版本)
+                    ▼
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  ClusterVersionReconciler（编排器）                                      │
+    │  ────────────────────────────────────────                              │
+    │  1. 校验 UpgradePath（openFuyao 版本路径合法性）                           │
+    │  2. 解析 hopPath = ["v2.6.5", "v2.7.0"]（openFuyao 版本列表）          │
+    │  3. 校验相邻 hop 的 K8s 组件版本差 ≤ 1                                  │
+    │  4. orchestrateFullUpgrade():                                          │
+    │     │                                                                   │
+    │     ├─ 阶段一: orchestrateK8sCoreMultiHop()                            │
+    │     │   for each openFuyao hop:                                         │
+    │     │     ├─ executeControlPlaneHop(hopTarget, deferredComponents)     │
+    │     │     │   → BKEClusterReconciler 执行 DAG                           │
+    │     │     │   → 解析 ReleaseImage → K8s 组件版本                        │
+    │     │     │   → DAG: etcd→apiserver→cm/scheduler→kube-proxy→kubectl    │
+    │     │     │   → kubelet 被跳过（延迟升级）                              │
+    │     │     │                                                             │
+    │     │     ├─ 偏差门控: kubelet(K8s版本) vs apiserver(K8s版本)           │
+    │     │     │   → 偏差 < 3: 继续                                          │
+    │     │     │   → 偏差 = 3: kubelet 补充升级到 apiserver 的 K8s 版本      │
+    │     │     │                                                             │
+    │     │     └─ 最后一个 hop: kubelet 最终补充升级到目标 K8s 版本            │
+    │     │                                                                   │
+    │     └─ 阶段二: executeOtherComponentsUpgrade()                          │
+    │         → containerd / bkeagent / runc / ...（独立 DAG，无偏差门控）    │
+    └─────────────────────────────────────────────────────────────────────────┘
+                    │ upgrade-ready annotation (openFuyao 版本)
+                    ▼
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  BKEClusterReconciler（执行器）                                          │
+    │  ─────────────────────────────────                                      │
+    │  1. 读取 upgrade-ready annotation → openFuyao 版本                      │
+    │  2. 解析 ReleaseImage → K8s 组件版本                                     │
+    │  3. 构建 VersionContext（kubelet Target=Current 跳过）                  │
+    │  4. 构建 DAG → Scheduler.ExecuteDAG()                                   │
+    │  5. 返回 HopResult（含 K8s 组件版本）                                   │
+    └─────────────────────────────────────────────────────────────────────────┘
+                    │ Command CR
+                    ▼
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  BKEAgent（节点级执行）                                                  │
+    │  StaticPodInstaller / BinaryInstaller / YamlInstaller                   │
+    └─────────────────────────────────────────────────────────────────────────┘
+
+    ┌─────────────────────────────────────────────────────────────────────────┐
+    │  ReleaseImage 约束层（发布时校验）                                       │
+    │  ─────────────────────────────────────────────                          │
+    │  1. 相邻 ReleaseImage K8s 组件版本差 ≤ 1                                │
+    │  2. 同一 ReleaseImage 内 K8s 核心组件版本一致                            │
+    │  3. K8s 组件名称与官方一致                                               │
+    │  4. ComponentVersion.spec.versionSkew 声明偏差约束                       │
+    │  5. kubernetesVersion 统一声明字段                                       │
+    └─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 1.3 三大设计支柱
+
+#### 支柱一：复用现有升级机制与框架
+
+| 复用的现有能力 | 说明 | 本 KEP 中的角色 |
+|--------------|------|---------------|
+| **DAG 调度器**（`pkg/dagexec.Scheduler`） | 拓扑排序 + 批次并行执行 | 每个 hop 内执行 K8s 核心组件 DAG |
+| **ReleaseImage/ComponentVersion CRD** | 声明组件版本与依赖 | 重构为 K8s 组件独立声明 + versionSkew |
+| **ClusterVersionReconciler 逐 hop 触发** | 通过 `upgrade-ready` annotation 驱动 | 遍历 openFuyao 版本路径，逐 hop 触发 |
+| **UpgradePath CRD** | 版本路径合法性校验 | 定义 openFuyao 版本间的合法升级路径 |
+| **VersionContext** | 组件级版本比较 | 独立追踪 7 个 K8s 组件版本（含 kubelet） |
+| **ExecutorRegistry** | type → executor 分发 | 分发到 StaticPodInstaller/BinaryInstaller/YamlInstaller |
+| **Phase 接口** | NeedExecute/Execute/Backup/Rollback | K8s 组件复用现有 Phase 实现 |
+
+**不新增的基础设施**：不新建调度器、不新建 CRD 框架、不新建版本比较机制。全部基于 KEP-5 已有能力扩展。
+
+#### 支柱二：ReleaseImage 与 K8s 版本约束校验
+
+| 约束 | 校验时机 | 校验函数 | 说明 |
+|------|---------|---------|------|
+| **相邻 ReleaseImage K8s 版本差 ≤ 1** | 发布时 + 升级时 | `ValidateAdjacentReleaseImages` | 确保 kubeadm 不跳小版本 |
+| **同一 ReleaseImage 内 K8s 组件版本一致** | 发布时 | `ValidateReleaseImageInternalConsistency` | apiserver/cm/scheduler/kubelet/kubectl/kube-proxy 版本一致 |
+| **K8s 组件名称与官方一致** | 发布时 | `ValidateComponentNames` | 使用 `kube-apiserver` 而非 `apiserver` |
+| **偏差约束内化到 ComponentVersion** | 运行时偏差检查 | `CheckSkewFromComponentVersions` | 从 `versionSkew` 字段读取，替代外部规则表 |
+| **kubernetesVersion 统一声明** | 发布时 | `GetComponentVersion` 自动解析 | 避免手动配置不一致 |
+
+#### 支柱三：多 Hop 升级实现 K8s 跨版本平滑升级
+
+| 能力 | 实现机制 | 说明 |
+|------|---------|------|
+| **逐 hop 推进** | hopPath 遍历 openFuyao 版本 | 每个 hop 对应一个 ReleaseImage，K8s 版本从 ReleaseImage 解析 |
+| **偏差门控** | `evaluateSkewGate` 前瞻性检查 | 下一个 hop 后偏差是否超限，决定是否触发 kubelet 补充 |
+| **kubelet 延迟升级** | `deferredComponents=["kubelet"]` | 控制面先升级，kubelet 延迟到偏差极限（3）时批量补充 |
+| **kubelet 逐版本补充** | `computeIntermediateVersions` | 从当前 K8s 版本逐版本升级到目标 K8s 版本 |
+| **断点续传** | annotation 记录 hopIndex + hopPhase | Reconcile 重入时从断点恢复 |
+| **两阶段编排** | 阶段一 K8s 核心 + 阶段二其它组件 | K8s 核心组件受偏差约束，其它组件独立升级 |
+
+### 1.4 跨版本升级示例
+
+```
+场景: openFuyao v2.6.0 (K8s v1.34) → v2.7.0 (K8s v1.36)，跨 2 个 K8s 小版本
+
+步骤 1: UpgradePath 定义合法路径
+  v2.6.0 → v2.6.5 → v2.7.0（3 个 openFuyao 版本，相邻 K8s 版本差 ≤ 1）
+
+步骤 2: ClusterVersionReconciler 解析 hopPath
+  hopPath = ["v2.6.5", "v2.7.0"]（openFuyao 版本）
+  校验: ReleaseImage v2.6.5(K8s v1.35) vs v2.6.0(K8s v1.34) 差 1 ✅
+  校验: ReleaseImage v2.7.0(K8s v1.36) vs v2.6.5(K8s v1.35) 差 1 ✅
+
+步骤 3: 阶段一 - K8s 核心组件多 Hop 升级
+  Hop 1 (v2.6.5):
+    apiserver v1.34→v1.35, kubelet 保持 v1.34 → 偏差 1 ✅
+  Hop 2 (v2.7.0):
+    apiserver v1.35→v1.36, kubelet 保持 v1.34 → 偏差 2 ✅
+  kubelet 补充: v1.34→v1.35→v1.36（逐版本，最后批量 drain）
+
+步骤 4: 阶段二 - 其它组件升级
+  containerd v1.7.20→v1.7.24, bkeagent v2.6.0→v2.7.0, ...
+
+步骤 5: 升级完成
+  ClusterVersion.Status.CurrentVersion = v2.7.0
+```
+
+### 1.5 设计约束
+
+| 约束 | 说明 |
+|------|------|
+| **hopPath 是 openFuyao 版本** | 编排器遍历 openFuyao 版本路径，K8s 版本从 ReleaseImage 解析 |
+| **相邻 hop K8s 版本差 ≤ 1** | kubeadm 禁止跳小版本，ReleaseImage 发布时强制校验 |
+| **kubelet 最多滞后 apiserver 3 个小版本** | K8s v1.25+ 官方偏差规则 |
+| **cm/scheduler 最多滞后 apiserver 1 个小版本** | K8s 官方偏差规则 |
+| **K8s 组件名称与官方一致** | `kube-apiserver`、`kube-controller-manager` 等 |
+| **断点续传** | Reconcile 重入时从 annotation 恢复 hop 进度 |
+| **幂等性** | DAG 内部 VersionContext.NeedsUpgrade 跳过已完成组件 |
 
 ## 2. kubernetes-master 现有实现分析
 
