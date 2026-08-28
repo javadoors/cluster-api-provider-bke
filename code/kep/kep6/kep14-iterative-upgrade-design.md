@@ -844,22 +844,48 @@ func parseMinorVersion(version string) int {
 
 ### 4.1 核心思路
 
-**将控制面升级和 kubelet/kubectl 升级拆分为独立的 DAG 节点，通过版本偏差约束动态控制执行顺序。**
+**将 K8s 核心组件（etcd、apiserver、cm、scheduler、kubelet、kubectl、kube-proxy）拆分为独立的 DAG 节点，通过版本偏差约束动态控制执行顺序，实现 kubelet 延迟升级。**
 
 ```
 传统方式（BKE upgradeControlPlane 黑盒）:
-  Hop 1: EnsureMasterUpgrade → apiserver + cm + scheduler + kubelet + kubectl 全部升级
-  Hop 2: EnsureMasterUpgrade → apiserver + cm + scheduler + kubelet + kubectl 全部升级
+  Hop 1: EnsureEtcdUpgrade → etcd 升级
+          EnsureMasterUpgrade → apiserver + cm + scheduler + kubelet + kubectl 全部升级
+  Hop 2: EnsureEtcdUpgrade → etcd 升级
+          EnsureMasterUpgrade → apiserver + cm + scheduler + kubelet + kubectl 全部升级
 
 本方案（分离升级 + 偏差门控）:
-  Hop 1: 控制面升级 → apiserver + cm + scheduler + kube-proxy + kubectl（不含 kubelet）
+  Hop 1: K8s 核心组件升级（不含 kubelet）
+    ├─ etcd: v3.5.18 → v3.5.19（StaticPod，先升级数据存储）
+    ├─ kube-apiserver: v1.34 → v1.35（StaticPod，控制面入口）
+    ├─ kube-controller-manager: v1.34 → v1.35（StaticPod，跟随 apiserver）
+    ├─ kube-scheduler: v1.34 → v1.35（StaticPod，跟随 apiserver）
+    ├─ kube-proxy: v1.34 → v1.35（YAML Apply，匹配 apiserver）
+    ├─ kubectl: v1.34 → v1.35（Binary，命令行工具）
+    └─ kubelet: 保持 v1.34（延迟升级）
   偏差门 1: kubelet(v1.34) vs apiserver(v1.35) → 1 偏差 → ✅ 通过（允许 3）
-  Hop 2: 控制面升级 → apiserver + cm + scheduler + kube-proxy + kubectl（不含 kubelet）
+
+  Hop 2: K8s 核心组件升级（不含 kubelet）
+    ├─ etcd: v3.5.19 → v3.5.20（StaticPod）
+    ├─ kube-apiserver: v1.35 → v1.36（StaticPod）
+    ├─ kube-controller-manager: v1.35 → v1.36（StaticPod）
+    ├─ kube-scheduler: v1.35 → v1.36（StaticPod）
+    ├─ kube-proxy: v1.35 → v1.36（YAML Apply）
+    ├─ kubectl: v1.35 → v1.36（Binary）
+    └─ kubelet: 保持 v1.34（2 偏差，安全）
   偏差门 2: kubelet(v1.34) vs apiserver(v1.36) → 2 偏差 → ✅ 安全（允许 3）
-  Hop 3: 控制面升级 → apiserver + cm + scheduler + kube-proxy + kubectl（不含 kubelet）
+
+  Hop 3: K8s 核心组件升级（不含 kubelet）
+    ├─ etcd: v3.5.20 → v3.5.21（StaticPod）
+    ├─ kube-apiserver: v1.36 → v1.37（StaticPod）
+    ├─ kube-controller-manager: v1.36 → v1.37（StaticPod）
+    ├─ kube-scheduler: v1.36 → v1.37（StaticPod）
+    ├─ kube-proxy: v1.36 → v1.37（YAML Apply）
+    ├─ kubectl: v1.36 → v1.37（Binary）
+    └─ kubelet: 保持 v1.34（3 偏差，达到极限）
   偏差门 3: kubelet(v1.34) vs apiserver(v1.37) → 3 偏差 → ⚠️ 达到极限，必须升级 kubelet
+
   Kubelet 补充升级: v1.34→v1.35→v1.36→v1.37（逐节点 drain → replace → uncordon）
-  最终验证: 0 偏差 → ✅ 升级完成
+  最终偏差验证: 0 偏差 → ✅ K8s 核心组件全部升级完成
 
   ─── K8s 核心组件全部升级完成后，执行其它组件升级 ───
 
@@ -871,9 +897,25 @@ func parseMinorVersion(version string) int {
   最终验证: 所有组件版本与目标 ReleaseImage 一致 → ✅ 升级完成
 ```
 
+**K8s 核心组件清单及类型**：
+
+| 组件 | 类型 | 升级方式 | 偏差规则 | 是否延迟升级 | 原因 |
+|------|------|---------|---------|------------|------|
+| **etcd** | staticpod | StaticPodInstaller manifest 替换 | 与 K8s 版本配套 | ❌ 每 hop 同步 | 数据存储，需先于 apiserver 升级 |
+| **kube-apiserver** | staticpod | StaticPodInstaller manifest 替换 | 参照组件 | ❌ 每 hop 同步 | 控制面入口，偏差参照基准 |
+| **kube-controller-manager** | staticpod | StaticPodInstaller manifest 替换 | ≤ apiserver 1 | ❌ 每 hop 同步 | 偏差窗口仅 1，必须紧跟 apiserver |
+| **kube-scheduler** | staticpod | StaticPodInstaller manifest 替换 | ≤ apiserver 1 | ❌ 每 hop 同步 | 偏差窗口仅 1，必须紧跟 apiserver |
+| **kube-proxy** | yaml | YamlInstaller SSA Apply | ≤ apiserver 3 | ❌ 每 hop 同步 | DaemonSet 滚动更新，无需逐节点 drain，不阻塞 |
+| **kubectl** | binary | BinaryInstaller 替换二进制 | vs apiserver ±1 | ❌ 每 hop 同步 | 偏差窗口仅 1；仅替换二进制，无需 drain |
+| **kubelet** | binary | BinaryInstaller drain → 替换 → uncordon | ≤ apiserver 3 | ✅ **延迟升级** | drain 耗时长，利用 3 版本偏差窗口集中升级 |
+
 **为什么不延迟 kubectl？**
 
 kubectl 的偏差规则允许与 apiserver 相差 ±1 个小版本（比 kubelet 的 3 个小版本更严格），延迟 kubectl 会很快触及偏差极限。且 kubectl 是命令行工具，升级无需 drain 节点（仅替换二进制），不阻塞控制面升级，因此 kubectl 随控制面同步升级。
+
+**为什么不延迟 kube-proxy？**
+
+kube-proxy 的偏差规则允许滞后 apiserver 3 个小版本（与 kubelet 相同），但 kube-proxy 通过 DaemonSet 滚动更新升级，无需逐节点 drain，不阻塞控制面升级流程。因此 kube-proxy 随控制面同步升级。
 
 ### 4.1a 多阶段升级编排：K8s 组件优先 + 其它组件后续
 
