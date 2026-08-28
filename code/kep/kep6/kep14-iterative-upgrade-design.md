@@ -2358,6 +2358,25 @@ type UpgradeOrchestrationConfig struct {
 
 ## 9. ReleaseImage 中 K8s 核心组件重构方案
 
+### 9.0 与 4.2 多阶段升级编排的关系
+
+第 4.2 节定义了**多阶段升级编排的运行时行为**（编排器如何逐 hop 执行、偏差门控如何判断、kubelet 如何延迟补充升级），第 9 章定义了**数据结构和组件声明**（ReleaseImage 中如何声明 K8s 组件、ComponentVersion 如何声明偏差约束）。
+
+两者的关系：
+
+| 维度 | 第 4.2 节（运行时编排） | 第 9 章（数据结构重构） |
+|------|------------------------|----------------------|
+| **关注点** | 编排器如何执行多 hop | ReleaseImage/ComponentVersion 如何声明 |
+| **hopPath** | 编排器遍历 openFuyao 版本路径 | ReleaseImage 中声明每个版本的 K8s 组件版本 |
+| **偏差门控** | `evaluateSkewGate` 计算 K8s 版本偏差 | `ComponentVersion.spec.versionSkew` 声明偏差约束 |
+| **kubelet 延迟** | `deferredComponents=["kubelet"]` 跳过 + 补充升级 | ReleaseImage 中 kubelet 独立声明（可被跳过） |
+| **HopResult** | 编排器收集各组件 K8s 版本 | ReleaseImage 的 `kubernetesVersion` 字段提供版本来源 |
+| **两阶段** | 阶段一 K8s 核心 + 阶段二其它组件 | ReleaseImage 中 K8s 核心组件独立声明 + 其它组件独立声明 |
+
+**依赖关系**：第 4.2 节的编排逻辑依赖第 9 章定义的数据结构。只有在 ReleaseImage 中 K8s 核心组件独立声明后，编排器才能实现 kubelet 延迟升级、偏差门控、组件级版本追踪。
+
+**演进顺序**：第 9.9 节的迁移策略定义了从 `kubernetes-master` 黑盒到独立组件的 5 个阶段。第 4.2 节的完整多 hop 编排能力在**阶段 2**（kubelet 独立）即可部分启用，在**阶段 4**（删除 kubernetes-master）后完全启用。
+
 ### 9.1 当前结构的问题
 
 当前 ReleaseImage 中 K8s 核心组件以 `kubernetes-master`（inline 黑盒）和 `kubernetes-worker`（inline 黑盒）的形式存在：
