@@ -1111,6 +1111,341 @@ Batch 4: [helm, etcdctl, calicoctl]     ← 辅助工具，最后
 
 > **注意**：阶段二的组件不需要偏差门控，因为它们不受 K8s Version Skew Policy 约束。各组件按 ComponentVersion.spec.dependencies 中的依赖关系排序，由 DAG Scheduler 统一调度。
 
+#### 4.1a.1 kubelet 延迟升级的收益
+
+将 kubelet 升级从 `upgradeControlPlane()` 中分离，实现延迟升级，核心收益如下：
+
+**1. 减少 drain 次数（最大收益）**
+
+| 场景 | 当前（每 hop 强制升级 kubelet） | 延迟升级（最后批量补充） |
+|------|-------------------------------|------------------------|
+| 3-hop 升级（v1.34→v1.37） | 3 轮 × N 节点 drain | 1 轮 × N 节点 drain（集中在最后） |
+| 100 节点集群 | 300 次 drain | 100 次 drain |
+| 每次 drain 耗时 ~5min | ~25 小时 | ~8 小时 |
+
+**2. 控制面快速推进**
+
+| 维度 | 当前 | 延迟升级 |
+|------|------|---------|
+| apiserver 升级方式 | manifest 替换（秒级，无需 drain） | 同左 |
+| kubelet 升级方式 | 二进制替换 + systemctl restart（需 drain） | 延迟到所有 hop 完成后 |
+| 3-hop 控制面升级耗时 | 被 kubelet drain 阻塞：每 hop 等 N 节点 drain | 仅等 manifest 替换：3 hop 快速完成 |
+| 100 节点 3-hop | ~25 小时（3 轮 drain） | ~30 分钟（3 轮 manifest 替换）+ 8 小时（最后 1 轮 drain） |
+
+**3. 业务影响最小化**
+
+| 维度 | 当前 | 延迟升级 |
+|------|------|---------|
+| drain 窗口数 | 3 个分散窗口（每 hop 一个） | 1 个集中窗口（最后一次性） |
+| 业务中断次数 | 3 次 | 1 次 |
+| 可选择维护窗口 | 每个 hop 都需找维护窗口 | 只需在最后找 1 个维护窗口 |
+| Pod 重启次数 | 3 × N 节点 × M Pod | 1 × N 节点 × M Pod |
+
+**4. 独立失败处理**
+
+| 场景 | 当前 | 延迟升级 |
+|------|------|---------|
+| kubelet drain 失败 | 阻塞整个 hop（控制面也卡住） | 仅影响 kubelet 补充升级，控制面已完成 |
+| 控制面升级失败 | kubelet 已升级（可能不一致） | kubelet 未升级（仍可回滚到旧版本） |
+| 部分节点 kubelet 升级失败 | Worker 节点 Continue，Master 阻塞 | 同左，但控制面已就绪，不影响集群可用性 |
+
+**5. 充分利用 K8s 偏差窗口**
+
+| 维度 | 当前 | 延迟升级 |
+|------|------|---------|
+| K8s 允许偏差 | kubelet 最多滞后 apiserver 3 个小版本 | 未利用 |
+| 实际偏差 | 每 hop 强制 0 偏差 | 利用满 3 版本窗口 |
+| 资源利用率 | 浪费了 K8s 官方提供的灵活性 | 最大化利用 |
+
+#### 4.1a.2 阶段一实现：orchestrateMultiHopUpgrade
+
+```go
+// controllers/clusterversion/clusterversion_controller.go
+
+// orchestrateMultiHopUpgrade 执行 K8s 核心组件的多 hop 升级
+// 每个 hop 升级控制面组件（etcd/apiserver/cm/scheduler/kube-proxy/kubectl），
+// kubelet 延迟到偏差达到极限时补充升级
+func (r *ClusterVersionReconciler) orchestrateMultiHopUpgrade(
+    ctx context.Context,
+    bkeCluster *bkev1beta1.BKECluster,
+    hopPath []string, // ["v2.6.5", "v2.7.0"] (openFuyao 版本路径)
+) error {
+    skewChecker := &upgrade.VersionSkewChecker{Client: r.Client}
+    
+    for i, hopTarget := range hopPath {
+        log.Info("starting hop", "hop", i+1, "target", hopTarget)
+        
+        // 1. 执行当前 hop（控制面升级，kubelet 延迟）
+        //    executeControlPlaneHop 内部设置 kubelet Target=Current 跳过升级
+        if err := r.executeControlPlaneHop(ctx, bkeCluster, hopTarget); err != nil {
+            return fmt.Errorf("hop %d (%s) control plane upgrade failed: %w", i+1, hopTarget, err)
+        }
+        
+        // 2. 更新 VersionContext（控制面组件已升级，kubelet 未升级）
+        vc := r.getCurrentVersionContext(bkeCluster)
+        
+        // 3. 偏差门控
+        if i < len(hopPath)-1 {
+            // 还有下一个 hop，进行前瞻性检查
+            nextHopVersions := r.resolveHopTargetVersions(hopPath[i+1])
+            
+            // 检查执行下一个 hop 后是否仍满足偏差约束
+            needsCatchup, skew := skewChecker.NeedsKubeletCatchup(vc, nextHopVersions)
+            
+            if needsCatchup {
+                // 偏差即将达到极限（3），必须先升级 kubelet
+                log.Info("skew limit reached, must upgrade kubelet before next hop",
+                    "currentSkew", skew, "maxSkew", 3)
+                
+                // 触发 kubelet 补充升级（从当前版本逐版本升级到 hopPath[i] 的版本）
+                if err := r.upgradeKubeletCatchup(ctx, bkeCluster, vc, hopPath[:i+1]); err != nil {
+                    return fmt.Errorf("kubelet catchup upgrade failed: %w", err)
+                }
+            } else {
+                // 偏差在安全范围内，可以继续下一个 hop
+                ok, violations := skewChecker.CheckSkew(vc, upgrade.K8sSkewConstraints)
+                if !ok {
+                    return fmt.Errorf("skew violations after hop %d: %v", i+1, violations)
+                }
+                log.Info("skew gate passed, continuing to next hop",
+                    "hop", i+1, "currentSkew", skew)
+            }
+        } else {
+            // 最后一个 hop 完成，执行 kubelet 最终升级
+            log.Info("final hop completed, upgrading kubelet to target version")
+            if err := r.upgradeKubeletCatchup(ctx, bkeCluster, vc, hopPath); err != nil {
+                return fmt.Errorf("final kubelet upgrade failed: %w", err)
+            }
+        }
+        
+        // 4. 偏差验证
+        ok, violations := skewChecker.CheckSkew(vc, upgrade.K8sSkewConstraints)
+        if !ok {
+            return fmt.Errorf("skew violations after hop %d: %v", i+1, violations)
+        }
+        
+        log.Info("hop completed, skew constraints satisfied",
+            "hop", i+1, "version", hopTarget)
+    }
+    
+    return nil
+}
+```
+
+#### 4.1a.3 executeControlPlaneHop 实现
+
+```go
+// executeControlPlaneHop 执行单个 hop 的 K8s 核心组件升级（不含 kubelet）
+// kubelet 通过设置 Target=Current 实现跳过（VersionContext 判定 current==target → Skip）
+func (r *ClusterVersionReconciler) executeControlPlaneHop(
+    ctx context.Context,
+    bkeCluster *bkev1beta1.BKECluster,
+    hopTarget string,
+) error {
+    // 1. 解析目标版本 ReleaseImage
+    bundle, err := r.resolveReleaseBundle(ctx, hopTarget)
+    if err != nil {
+        return err
+    }
+    
+    // 2. 构建 VersionContext
+    vc := upgrade.BuildVersionContextForUpgrade(bundle, currentBundle, bkeCluster)
+    
+    // 3. 从升级列表中排除 kubelet（延迟升级）
+    //    通过设置 kubelet 的 Target = Current 实现（VersionContext 判定 Skip）
+    kubeletCurrent := vc.GetCurrent("kubelet")
+    if kubeletCurrent != "" {
+        vc.SetTarget("kubelet", kubeletCurrent) // 保持不变，跳过
+    }
+    
+    // 4. 构建 DAG（包含 etcd/apiserver/cm/scheduler/kube-proxy/kubectl，不含 kubelet）
+    //    依赖关系来自 ComponentVersion.spec.dependencies:
+    //    etcd → apiserver → cm/scheduler → kube-proxy → kubectl
+    dag, err := upgrade.BuildDAGFromBundle(bundle, upgrade.BundleDependencyResolver(bundle))
+    if err != nil {
+        return err
+    }
+    
+    // 5. 构建 Scheduler
+    sched := r.buildScheduler(bundle, vc)
+    execCtx := r.buildExecutionContext(ctx, bkeCluster, vc)
+    
+    // 6. 执行 DAG
+    //    PhaseRunner.Execute 会对每个组件调用:
+    //    PreHook → Backup() → Execute() → PostHook
+    if err := sched.ExecuteDAG(ctx, execCtx, dag); err != nil {
+        return fmt.Errorf("execute control plane DAG: %w", err)
+    }
+    
+    // 7. 更新控制面组件版本状态
+    //    注意: 不更新 kubelet 版本（延迟升级）
+    bkeCluster.Status.KubernetesVersion = vc.GetTarget("kube-apiserver")
+    bkeCluster.Status.EtcdVersion = vc.GetTarget("etcd")
+    
+    return nil
+}
+```
+
+#### 4.1a.4 upgradeKubeletCatchup 实现
+
+```go
+// upgradeKubeletCatchup kubelet 补充升级（从当前版本逐版本升级到目标版本）
+// 利用 K8s 允许 kubelet 滞后 apiserver 3 个小版本的偏差窗口
+func (r *ClusterVersionReconciler) upgradeKubeletCatchup(
+    ctx context.Context,
+    bkeCluster *bkev1beta1.BKECluster,
+    vc *upgrade.VersionContext,
+    completedHops []string,
+) error {
+    skewChecker := &upgrade.VersionSkewChecker{Client: r.Client}
+    
+    currentKubelet := vc.GetCurrent("kubelet")
+    targetKubelet := vc.GetTarget("kubelet")
+    
+    log.Info("starting kubelet catchup upgrade",
+        "from", currentKubelet, "to", targetKubelet)
+    
+    // 1. 计算需要经过的中间版本
+    // 例如: v1.34.0 → v1.36.0 → ["v1.35.0", "v1.36.0"]
+    intermediateVersions := computeIntermediateVersions(currentKubelet, targetKubelet)
+    
+    for _, version := range intermediateVersions {
+        log.Info("upgrading kubelet to intermediate version",
+            "from", currentKubelet, "to", version)
+        
+        // 2. 通过 BinaryInstaller 执行 kubelet 升级
+        //    逐节点: drain → 下载二进制 → 替换 → 重启 → 健康检查 → uncordon
+        if err := r.executeKubeletUpgrade(ctx, bkeCluster, version); err != nil {
+            return fmt.Errorf("kubelet upgrade to %s failed: %w", version, err)
+        }
+        
+        // 3. 更新 VersionContext
+        currentKubelet = version
+        vc.SetCurrent("kubelet", version)
+        
+        // 4. 每次中间版本升级后验证偏差
+        ok, violations := skewChecker.CheckSkew(vc, upgrade.K8sSkewConstraints)
+        if !ok {
+            return fmt.Errorf("skew violation during kubelet catchup at %s: %v",
+                version, violations)
+        }
+        
+        log.Info("kubelet upgraded to intermediate version, skew check passed",
+            "version", version)
+    }
+    
+    // 5. 更新 kubelet 版本状态
+    bkeCluster.Status.KubeletVersion = targetKubelet
+    
+    log.Info("kubelet catchup upgrade completed", "final", targetKubelet)
+    return nil
+}
+```
+
+#### 4.1a.5 executeKubeletUpgrade 实现
+
+```go
+// executeKubeletUpgrade 执行 kubelet 到指定版本的逐节点升级
+// Master 节点: 阻塞式（失败则停止）
+// Worker 节点: 非阻塞式（失败继续下一个节点，记录失败节点）
+func (r *ClusterVersionReconciler) executeKubeletUpgrade(
+    ctx context.Context,
+    bkeCluster *bkev1beta1.BKECluster,
+    targetVersion string,
+) error {
+    // 1. 加载 kubelet ComponentVersion（binary 类型）
+    cv, err := r.CVStore.GetComponentVersion(ctx, "kubelet", targetVersion)
+    if err != nil {
+        return fmt.Errorf("get kubelet component version %s: %w", targetVersion, err)
+    }
+    
+    // 2. 构建 BinaryInstaller 选项
+    opts := binaryinstaller.InstallOptions{
+        Component:   cv,
+        Action:      binaryinstaller.BinaryActionUpgrade,
+        TemplateCtx: r.buildTemplateContext(bkeCluster),
+    }
+    
+    // 3. 获取所有节点
+    bkeNodes, err := r.NodeFetcher().GetBKENodesWrapperForCluster(ctx, bkeCluster)
+    if err != nil {
+        return err
+    }
+    allNodes := bkeNodes.ToNodes()
+    
+    // 4. 创建 drainer
+    drainer := phaseutil.NewDrainer(true, true, true, 20*time.Second)
+    
+    var failedNodes []string
+    
+    // 5. 逐节点升级
+    for _, node := range allNodes {
+        // 5a. drain 节点（驱逐 Pod）
+        if err := drainer.Drain(ctx, node.Hostname); err != nil {
+            log.Error(err, "drain failed", "node", node.IP)
+            failedNodes = append(failedNodes, node.IP)
+            if isMasterNode(node) {
+                return fmt.Errorf("drain master node %s failed: %w", node.IP, err)
+            }
+            continue
+        }
+        
+        // 5b. 设置目标节点 IP
+        opts.TemplateCtx.NodeIP = node.IP
+        
+        // 5c. 执行 BinaryInstaller 安装（升级）
+        //    内部流程: 下载 kubelet 二进制 → 校验 checksum →
+        //              渲染 kubelet.conf + kubelet.service → SSH 上传+执行 →
+        //              systemctl stop → 替换二进制 → systemctl start
+        if err := r.BinaryInstaller.Install(ctx, opts); err != nil {
+            log.Error(err, "kubelet upgrade failed", "node", node.IP)
+            failedNodes = append(failedNodes, node.IP)
+            if isMasterNode(node) {
+                return fmt.Errorf("kubelet upgrade on master %s failed: %w", node.IP, err)
+            }
+            continue
+        }
+        
+        // 5d. 等待节点健康检查
+        //    轮询 Node 状态（2s 间隔，5min 超时）
+        //    验证 Node Ready + KubeletVersion 匹配目标版本
+        if err := waitForNodeHealthCheck(ctx, r.Client, bkeCluster, node, targetVersion); err != nil {
+            failedNodes = append(failedNodes, node.IP)
+            if isMasterNode(node) {
+                return fmt.Errorf("health check on master %s failed: %w", node.IP, err)
+            }
+            continue
+        }
+        
+        // 5e. uncordon 节点（恢复调度）
+        _ = uncordonNode(ctx, r.Client, bkeCluster, node.Hostname)
+        
+        log.Info("kubelet upgraded", "node", node.IP, "version", targetVersion)
+    }
+    
+    if len(failedNodes) > 0 {
+        log.Info("kubelet upgrade completed with failures", "failedNodes", failedNodes)
+        // Worker 节点失败不阻塞，Reconcile 重试时跳过已升级节点
+    }
+    
+    return nil
+}
+
+// computeIntermediateVersions 计算从 currentVersion 到 targetVersion 的中间版本列表
+// 例如: ("v1.34.0", "v1.36.0") → ["v1.35.0", "v1.36.0"]
+func computeIntermediateVersions(currentVersion, targetVersion string) []string {
+    currentMinor := parseMinorVersion(currentVersion)  // 34
+    targetMinor := parseMinorVersion(targetVersion)    // 36
+    
+    var versions []string
+    for minor := currentMinor + 1; minor <= targetMinor; minor++ {
+        versions = append(versions, fmt.Sprintf("v1.%d.0", minor))
+    }
+    
+    return versions
+}
+```
+
 ### 4.2 单 hop 内的升级顺序
 
 每个 hop 内严格执行以下顺序（通过 DAG dependencies 保证）：
