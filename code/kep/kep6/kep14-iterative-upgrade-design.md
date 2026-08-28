@@ -1241,58 +1241,311 @@ func (r *ClusterVersionReconciler) orchestrateMultiHopUpgrade(
 }
 ```
 
-#### 4.1a.3 executeControlPlaneHop 实现
+#### 4.1a.3 executeControlPlaneHop 实现（重构版）
+
+> 重构目标：支持通用场景，如 K8s v1.30→v1.36（6-hop），kubelet 需多次中途补充升级
+
+**问题分析**：K8s v1.30→v1.36 跨 6 个小版本，kubelet 最多滞后 apiserver 3 个小版本：
+
+```
+v1.30→v1.36 升级路径（6 hops）:
+
+Hop 1: apiserver v1.31, kubelet v1.30 → skew 1 ✅
+Hop 2: apiserver v1.32, kubelet v1.30 → skew 2 ✅
+Hop 3: apiserver v1.33, kubelet v1.30 → skew 3 ⚠️ 极限，必须升级 kubelet
+  → kubelet 补充: v1.30→v1.31→v1.32→v1.33（升级到当前 apiserver 版本）
+Hop 4: apiserver v1.34, kubelet v1.33 → skew 1 ✅
+Hop 5: apiserver v1.35, kubelet v1.33 → skew 2 ✅
+Hop 6: apiserver v1.36, kubelet v1.33 → skew 3 ⚠️ 极限，必须升级 kubelet
+  → kubelet 最终补充: v1.33→v1.34→v1.35→v1.36
+```
+
+原 `executeControlPlaneHop` 硬编码 kubelet 跳过，无法处理多次中途补充升级。重构为**通用版本**：
 
 ```go
-// executeControlPlaneHop 执行单个 hop 的 K8s 核心组件升级（不含 kubelet）
-// kubelet 通过设置 Target=Current 实现跳过（VersionContext 判定 current==target → Skip）
+// executeControlPlaneHop 执行单个 hop 的 K8s 核心组件升级
+// 支持延迟升级指定的组件（通过 deferredComponents 参数配置）
+//
+// 重构要点（vs 原版）:
+// 1. deferredComponents 从硬编码 kubelet 改为参数传入，支持多组件延迟
+// 2. 返回 HopResult，包含各组件升级后的版本，供 orchestrateMultiHopUpgrade 做偏差判断
+// 3. 不再在此函数内更新 BKECluster.Status（由 orchestrateMultiHopUpgrade 统一管理）
+//
+// 调用方: orchestrateMultiHopUpgrade (4.1a.2)
 func (r *ClusterVersionReconciler) executeControlPlaneHop(
     ctx context.Context,
     bkeCluster *bkev1beta1.BKECluster,
     hopTarget string,
-) error {
+    deferredComponents []string, // 延迟升级的组件名列表，如 ["kubelet"]
+) (*HopResult, error) {
     // 1. 解析目标版本 ReleaseImage
     bundle, err := r.resolveReleaseBundle(ctx, hopTarget)
     if err != nil {
-        return err
+        return nil, err
     }
     
     // 2. 构建 VersionContext
     vc := upgrade.BuildVersionContextForUpgrade(bundle, currentBundle, bkeCluster)
     
-    // 3. 从升级列表中排除 kubelet（延迟升级）
-    //    通过设置 kubelet 的 Target = Current 实现（VersionContext 判定 Skip）
-    kubeletCurrent := vc.GetCurrent("kubelet")
-    if kubeletCurrent != "" {
-        vc.SetTarget("kubelet", kubeletCurrent) // 保持不变，跳过
+    // 3. 延迟升级：将 deferredComponents 的 Target 设为 Current（跳过升级）
+    //    VersionContext 判定 current == target → Skip
+    deferredSet := make(map[string]bool)
+    for _, name := range deferredComponents {
+        current := vc.GetCurrent(name)
+        if current != "" {
+            vc.SetTarget(name, current) // 保持不变，跳过
+            deferredSet[name] = true
+        }
     }
     
-    // 4. 构建 DAG（包含 etcd/apiserver/cm/scheduler/kube-proxy/kubectl，不含 kubelet）
-    //    依赖关系来自 ComponentVersion.spec.dependencies:
-    //    etcd → apiserver → cm/scheduler → kube-proxy → kubectl
+    // 4. 构建 DAG
+    //    依赖关系来自 ComponentVersion.spec.dependencies
+    //    延迟组件在 DAG 中仍存在，但 VersionContext.NeedsUpgrade 返回 false → Skip
     dag, err := upgrade.BuildDAGFromBundle(bundle, upgrade.BundleDependencyResolver(bundle))
     if err != nil {
-        return err
+        return nil, err
     }
     
-    // 5. 构建 Scheduler
+    // 5. 构建 Scheduler 并执行 DAG
     sched := r.buildScheduler(bundle, vc)
     execCtx := r.buildExecutionContext(ctx, bkeCluster, vc)
     
-    // 6. 执行 DAG
-    //    PhaseRunner.Execute 会对每个组件调用:
-    //    PreHook → Backup() → Execute() → PostHook
     if err := sched.ExecuteDAG(ctx, execCtx, dag); err != nil {
-        return fmt.Errorf("execute control plane DAG: %w", err)
+        return nil, fmt.Errorf("execute control plane DAG: %w", err)
     }
     
-    // 7. 更新控制面组件版本状态
-    //    注意: 不更新 kubelet 版本（延迟升级）
-    bkeCluster.Status.KubernetesVersion = vc.GetTarget("kube-apiserver")
-    bkeCluster.Status.EtcdVersion = vc.GetTarget("etcd")
+    // 6. 收集 hop 结果（各组件升级后的版本）
+    result := &HopResult{
+        HopTarget:       hopTarget,
+        UpgradedVersions: make(map[string]string),  // 已升级组件的版本
+        DeferredVersions: make(map[string]string),  // 延迟组件的当前版本
+    }
+    
+    for name := range vc.Target {
+        if deferredSet[name] {
+            result.DeferredVersions[name] = vc.GetCurrent(name)
+        } else {
+            result.UpgradedVersions[name] = vc.GetTarget(name)
+        }
+    }
+    
+    return result, nil
+}
+
+// HopResult 单个 hop 的执行结果
+type HopResult struct {
+    // hop 目标版本（openFuyao 版本）
+    HopTarget string
+    
+    // 已升级组件的版本映射
+    // 如: {"kube-apiserver": "v1.35", "etcd": "v3.5.19", ...}
+    UpgradedVersions map[string]string
+    
+    // 延迟升级组件的当前版本映射
+    // 如: {"kubelet": "v1.34"}
+    DeferredVersions map[string]string
+}
+
+// GetUpgradedVersion 获取已升级组件的版本
+func (h *HopResult) GetUpgradedVersion(name string) string {
+    return h.UpgradedVersions[name]
+}
+
+// GetDeferredVersion 获取延迟组件的当前版本
+func (h *HopResult) GetDeferredVersion(name string) string {
+    return h.DeferredVersions[name]
+}
+```
+
+#### 4.1a.3a orchestrateMultiHopUpgrade 重构（支持多轮 kubelet 补充）
+
+> 重构目标：支持 v1.30→v1.36 等大跨度升级，kubelet 需多次中途补充
+
+```go
+// orchestrateMultiHopUpgrade 执行 K8s 核心组件的多 hop 升级
+// 支持大跨度升级（如 v1.30→v1.36），kubelet 可多次中途补充升级
+//
+// 调用链:
+//   orchestrateMultiHopUpgrade
+//     ├─ executeControlPlaneHop (4.1a.3)      ← 每个 hop 执行控制面升级（延迟 kubelet）
+//     ├─ checkSkewAfterHop                     ← 偏差检查：当前偏差是否达到极限
+//     ├─ computeKubeletCatchupTarget           ← 计算 kubelet 需要补充升级到的目标版本
+//     └─ upgradeKubeletCatchup (4.1a.4)        ← kubelet 补充升级（逐版本）
+//          └─ executeKubeletUpgrade (4.1a.5)    ← 逐节点 drain → 替换 → uncordon
+//
+// v1.30→v1.36 示例（6 hops，2 轮 kubelet 补充）:
+//
+//   Hop 1: apiserver 1.31, kubelet 1.30 → skew 1 → ✅ 继续
+//   Hop 2: apiserver 1.32, kubelet 1.30 → skew 2 → ✅ 继续
+//   Hop 3: apiserver 1.33, kubelet 1.30 → skew 3 → ⚠️ 极限
+//     → kubelet catchup: 1.30→1.31→1.32→1.33（升级到当前 apiserver 版本）
+//   Hop 4: apiserver 1.34, kubelet 1.33 → skew 1 → ✅ 继续
+//   Hop 5: apiserver 1.35, kubelet 1.33 → skew 2 → ✅ 继续
+//   Hop 6: apiserver 1.36, kubelet 1.33 → skew 3 → ⚠️ 极限
+//     → kubelet final catchup: 1.33→1.34→1.35→1.36
+func (r *ClusterVersionReconciler) orchestrateMultiHopUpgrade(
+    ctx context.Context,
+    bkeCluster *bkev1beta1.BKECluster,
+    hopPath []string, // ["v2.6.0", "v2.6.5", ..., "v2.9.0"] (openFuyao 版本路径)
+) error {
+    skewChecker := &upgrade.VersionSkewChecker{Client: r.Client}
+    maxKubeletSkew := 3 // K8s v1.25+ 允许 kubelet 最多滞后 apiserver 3 个小版本
+    
+    // kubelet 当前版本（跨 hop 持续追踪）
+    kubeletCurrentVersion := r.getKubeletVersion(bkeCluster)
+    
+    for i, hopTarget := range hopPath {
+        log.Info("starting hop", "hop", i+1, "target", hopTarget,
+            "kubeletCurrent", kubeletCurrentVersion)
+        
+        // 1. 执行当前 hop（控制面升级，kubelet 延迟）
+        hopResult, err := r.executeControlPlaneHop(
+            ctx, bkeCluster, hopTarget,
+            []string{"kubelet"}, // 延迟升级 kubelet
+        )
+        if err != nil {
+            return fmt.Errorf("hop %d (%s) control plane upgrade failed: %w", i+1, hopTarget, err)
+        }
+        
+        // 2. 更新 BKECluster.Status（控制面组件版本）
+        apiserverVersion := hopResult.GetUpgradedVersion("kube-apiserver")
+        etcdVersion := hopResult.GetUpgradedVersion("etcd")
+        bkeCluster.Status.KubernetesVersion = apiserverVersion
+        bkeCluster.Status.EtcdVersion = etcdVersion
+        
+        // 3. 计算当前偏差
+        currentSkew := computeMinorVersionSkew(apiserverVersion, kubeletCurrentVersion)
+        log.Info("hop completed, checking skew",
+            "hop", i+1, "apiserver", apiserverVersion,
+            "kubelet", kubeletCurrentVersion, "skew", currentSkew,
+            "maxSkew", maxKubeletSkew)
+        
+        // 4. 偏差门控：判断是否需要 kubelet 补充升级
+        needsCatchup := false
+        catchupTargetVersion := ""
+        
+        if i < len(hopPath)-1 {
+            // 还有下一个 hop，前瞻性检查
+            nextHopVersions := r.resolveHopTargetVersions(hopPath[i+1])
+            nextApiserverVersion := nextHopVersions["kube-apiserver"]
+            
+            if nextApiserverVersion != "" {
+                // 模拟下一个 hop 后的偏差
+                nextSkew := computeMinorVersionSkew(nextApiserverVersion, kubeletCurrentVersion)
+                
+                if nextSkew >= maxKubeletSkew {
+                    // 下一个 hop 后偏差将达到极限，必须先升级 kubelet
+                    // 目标版本：当前 apiserver 版本（不是下一个 hop 的版本）
+                    // 这样升级后偏差为 0，为下一个 hop 留出完整的 3 版本窗口
+                    needsCatchup = true
+                    catchupTargetVersion = apiserverVersion
+                    log.Info("skew will exceed limit after next hop, must upgrade kubelet now",
+                        "currentSkew", currentSkew,
+                        "projectedNextSkew", nextSkew,
+                        "maxSkew", maxKubeletSkew,
+                        "catchupTarget", catchupTargetVersion)
+                }
+            }
+        } else {
+            // 最后一个 hop，必须将 kubelet 升级到最终目标版本
+            needsCatchup = true
+            catchupTargetVersion = apiserverVersion
+            log.Info("final hop completed, upgrading kubelet to final target version",
+                "catchupTarget", catchupTargetVersion)
+        }
+        
+        // 5. 执行 kubelet 补充升级（如需要）
+        if needsCatchup {
+            if err := r.upgradeKubeletCatchupToVersion(
+                ctx, bkeCluster, kubeletCurrentVersion, catchupTargetVersion,
+            ); err != nil {
+                return fmt.Errorf("kubelet catchup to %s failed: %w",
+                    catchupTargetVersion, err)
+            }
+            
+            // 更新 kubelet 当前版本
+            kubeletCurrentVersion = catchupTargetVersion
+            bkeCluster.Status.KubeletVersion = catchupTargetVersion
+            
+            // 偏差验证
+            newSkew := computeMinorVersionSkew(apiserverVersion, kubeletCurrentVersion)
+            log.Info("kubelet catchup completed",
+                "kubelet", kubeletCurrentVersion,
+                "apiserver", apiserverVersion,
+                "newSkew", newSkew)
+            
+            if newSkew > maxKubeletSkew {
+                return fmt.Errorf("skew %d still exceeds max %d after kubelet catchup",
+                    newSkew, maxKubeletSkew)
+            }
+        }
+        
+        log.Info("hop fully completed",
+            "hop", i+1, "version", hopTarget,
+            "apiserver", apiserverVersion,
+            "kubelet", kubeletCurrentVersion)
+    }
     
     return nil
 }
+
+// upgradeKubeletCatchupToVersion kubelet 补充升级到指定目标版本
+// 从 currentVersion 逐版本升级到 targetVersion
+// 如 v1.30→v1.33: 经过 v1.31, v1.32, v1.33
+func (r *ClusterVersionReconciler) upgradeKubeletCatchupToVersion(
+    ctx context.Context,
+    bkeCluster *bkev1beta1.BKECluster,
+    currentVersion string,
+    targetVersion string,
+) error {
+    log.Info("starting kubelet catchup",
+        "from", currentVersion, "to", targetVersion)
+    
+    // 计算中间版本路径
+    intermediateVersions := computeIntermediateVersions(currentVersion, targetVersion)
+    // 如: v1.30→v1.33 → ["v1.31.0", "v1.32.0", "v1.33.0"]
+    
+    for _, version := range intermediateVersions {
+        log.Info("upgrading kubelet to intermediate version",
+            "target", version)
+        
+        // 逐节点 drain → 替换二进制 → 健康检查 → uncordon
+        if err := r.executeKubeletUpgrade(ctx, bkeCluster, version); err != nil {
+            return fmt.Errorf("kubelet upgrade to %s failed: %w", version, err)
+        }
+        
+        log.Info("kubelet upgraded to intermediate version", "version", version)
+    }
+    
+    return nil
+}
+```
+
+**重构要点总结**：
+
+| 维度 | 原版 | 重构版 |
+|------|------|--------|
+| **延迟组件** | 硬编码 kubelet | `deferredComponents` 参数传入 |
+| **返回值** | `error` | `*HopResult`（含各组件版本） |
+| **状态更新** | 函数内更新 BKECluster.Status | 由 `orchestrateMultiHopUpgrade` 统一管理 |
+| **kubelet 补充目标** | 升级到最终目标版本 | 升级到**当前 apiserver 版本**（为下一个 hop 留出完整 3 版本窗口） |
+| **多轮补充** | 不支持（仅最终一轮） | 支持（偏差达到极限即触发，可多次中途补充） |
+| **偏差计算** | 依赖 VersionContext | 直接使用 `computeMinorVersionSkew` 简化 |
+| **适用场景** | 2-3 hop（v1.34→v1.36） | 任意 hop 数（v1.30→v1.36 等 6-hop） |
+
+**v1.30→v1.36 完整升级时序**：
+
+```
+Hop 1: apiserver 1.31, kubelet 1.30, skew=1 → ✅ 继续
+Hop 2: apiserver 1.32, kubelet 1.30, skew=2 → ✅ 继续
+Hop 3: apiserver 1.33, kubelet 1.30, skew=3 → ⚠️ 下一个 hop skew 将达到 4
+  → kubelet catchup: 1.30→1.31→1.32→1.33（目标=当前 apiserver 1.33）
+  → 补充后: kubelet 1.33, apiserver 1.33, skew=0 → ✅
+Hop 4: apiserver 1.34, kubelet 1.33, skew=1 → ✅ 继续
+Hop 5: apiserver 1.35, kubelet 1.33, skew=2 → ✅ 继续
+Hop 6: apiserver 1.36, kubelet 1.33, skew=3 → 最后一个 hop
+  → kubelet final catchup: 1.33→1.34→1.35→1.36（目标=最终 apiserver 1.36）
+  → 补充后: kubelet 1.36, apiserver 1.36, skew=0 → ✅ 升级完成
 ```
 
 #### 4.1a.4 upgradeKubeletCatchup 实现
