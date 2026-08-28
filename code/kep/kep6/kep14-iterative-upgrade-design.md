@@ -22,8 +22,9 @@
 6. [ClusterVersionReconciler 集成](#6-clusterversionreconciler-集成)
 7. [升级顺序总结](#7-升级顺序总结)
 8. [优势与适用场景](#8-优势与适用场景)
-9. [工作量评估](#9-工作量评估)
-10. [风险与缓解](#10-风险与缓解)
+9. [ReleaseImage 中 K8s 核心组件重构方案](#9-releaseimage-中-k8s-核心组件重构方案)
+10. [工作量评估](#10-工作量评估)
+11. [风险与缓解](#11-风险与缓解)
 
 ---
 
@@ -2350,7 +2351,416 @@ type UpgradeOrchestrationConfig struct {
 }
 ```
 
-## 9. 工作量评估
+## 9. ReleaseImage 中 K8s 核心组件重构方案
+
+### 9.1 当前结构的问题
+
+当前 ReleaseImage 中 K8s 核心组件以 `kubernetes-master`（inline 黑盒）和 `kubernetes-worker`（inline 黑盒）的形式存在：
+
+```yaml
+# 当前结构
+upgrade:
+  components:
+    - name: kubernetes-master          # 黑盒：apiserver + cm + scheduler + kubelet + kubectl
+      version: v1.36.0
+      inline:
+        handler: EnsureMasterUpgrade
+    - name: kubernetes-worker          # 黑盒：kubelet + kubectl
+      version: v1.36.0
+      inline:
+        handler: EnsureWorkerUpgrade
+    - name: etcd                       # 独立组件
+      version: v3.5.20
+      inline:
+        handler: EnsureEtcdUpgrade
+    - name: kube-proxy                 # 独立组件
+      version: v1.36.0
+```
+
+| 问题 | 说明 | 影响 |
+|------|------|------|
+| **kubernetes-master 是黑盒** | 一个 inline handler 统一处理 apiserver + cm + scheduler + kubelet + kubectl | 无法对单个组件独立控制版本、升级顺序、偏差约束 |
+| **kubelet 版本被绑定** | kubelet 版本 = kubernetes-master 版本，无法独立管理 | 无法实现 kubelet 延迟升级策略 |
+| **kubectl 版本被绑定** | kubectl 版本 = kubernetes-master 版本 | 无法独立追踪 kubectl 版本 |
+| **cm/scheduler 不可见** | cm/scheduler 被 kubernetes-master 包裹，ReleaseImage 中无独立条目 | 无法独立升级 cm/scheduler |
+| **偏差约束外部化** | 偏差规则定义在 `K8sSkewConstraints` 外部代码中 | 偏差约束未内化到 ComponentVersion 声明 |
+
+### 9.2 重构目标
+
+1. **拆解 kubernetes-master 黑盒**：将 apiserver/cm/scheduler/kubelet/kubectl 拆为 ReleaseImage 中的独立组件
+2. **声明偏差约束**：在 ComponentVersion.spec 中新增 `versionSkew` 字段，内化偏差约束
+3. **内聚依赖关系**：etcd → apiserver → cm/scheduler 的依赖关系声明在 ComponentVersion.spec.dependencies
+4. **支持延迟升级**：kubelet 作为独立组件，可被 `executeControlPlaneHop` 通过 `deferredComponents` 跳过
+
+### 9.3 重构后的 ReleaseImage 结构
+
+```yaml
+# 重构后：K8s 核心组件全部独立声明
+apiVersion: cvo.openfuyao.cn/v1alpha1
+kind: ReleaseImage
+metadata:
+  name: openfuyao-v2.7.0
+spec:
+  version: "v2.7.0"
+
+  install:
+    components:
+      # ── K8s 核心组件（全部独立） ──
+      - name: etcd
+        version: v3.5.20
+      - name: kube-apiserver
+        version: v1.36.0
+      - name: kube-controller-manager
+        version: v1.36.0
+      - name: kube-scheduler
+        version: v1.36.0
+      - name: kubelet
+        version: v1.36.0
+      - name: kubectl
+        version: v1.36.0
+      - name: kube-proxy
+        version: v1.36.0
+      # ── 其它组件 ──
+      - name: bkeagent
+        version: v2.7.0
+      - name: containerd
+        version: v1.7.24
+      - name: coredns
+        version: v1.11.3
+
+  upgrade:
+    components:
+      # ── K8s 核心组件（全部独立，按依赖排序） ──
+      - name: etcd
+        version: v3.5.20
+      - name: kube-apiserver
+        version: v1.36.0
+      - name: kube-controller-manager
+        version: v1.36.0
+      - name: kube-scheduler
+        version: v1.36.0
+      - name: kube-proxy
+        version: v1.36.0
+      - name: kubectl
+        version: v1.36.0
+      - name: kubelet                       # 独立组件，可被 executeControlPlaneHop 跳过
+        version: v1.36.0
+      # ── 其它组件 ──
+      - name: bkeagent
+        version: v2.7.0
+      - name: containerd
+        version: v1.7.24
+      - name: coredns
+        version: v1.11.3
+```
+
+### 9.4 ComponentVersion 中声明偏差约束
+
+重构后偏差约束从外部 `K8sSkewConstraints` 规则表**内化**到每个组件的 `ComponentVersion.spec.versionSkew`：
+
+```go
+// api/v1alpha1/componentversion_types.go 扩展
+
+// ComponentVersionSpec 新增 versionSkew 字段
+type ComponentVersionSpec struct {
+    // ... 现有字段 ...
+    
+    // 🆕新增：版本偏差约束（内化 K8s Version Skew Policy）
+    VersionSkew *VersionSkewSpec `json:"versionSkew,omitempty"`
+}
+
+// VersionSkewSpec 定义组件与参照组件之间的版本偏差约束
+type VersionSkewSpec struct {
+    // 参照组件名称（通常是 kube-apiserver）
+    ReferenceComponent string `json:"referenceComponent"`
+    
+    // 最大版本偏差（被约束组件最多比参照组件旧几个小版本）
+    // kubelet/kube-proxy: 3（v1.25+）
+    // cm/scheduler/kubectl: 1
+    MaxSkewBehind int `json:"maxSkewBehind"`
+    
+    // 偏差方向: behind（仅允许滞后）/ bidirectional（允许双向，如 kubectl ±1）
+    Direction string `json:"direction,omitempty"`
+}
+```
+
+**各组件 ComponentVersion YAML 示例**：
+
+```yaml
+# kubelet（偏差约束：最多滞后 apiserver 3 个小版本）
+spec:
+  name: kubelet
+  type: binary
+  version: v1.36.0
+  versionSkew:
+    referenceComponent: kube-apiserver
+    maxSkewBehind: 3
+    direction: behind
+  dependencies:
+    - name: containerd
+      phase: Install
+    - name: kube-apiserver
+      phase: Install
+
+# kube-controller-manager（偏差约束：最多滞后 apiserver 1 个小版本）
+spec:
+  name: kube-controller-manager
+  type: staticpod
+  version: v1.36.0
+  versionSkew:
+    referenceComponent: kube-apiserver
+    maxSkewBehind: 1
+    direction: behind
+  dependencies:
+    - name: kube-apiserver
+      phase: Install
+
+# kube-scheduler（偏差约束：最多滞后 apiserver 1 个小版本）
+spec:
+  name: kube-scheduler
+  type: staticpod
+  version: v1.36.0
+  versionSkew:
+    referenceComponent: kube-apiserver
+    maxSkewBehind: 1
+    direction: behind
+  dependencies:
+    - name: kube-apiserver
+      phase: Install
+
+# kube-proxy（偏差约束：最多滞后 apiserver 3 个小版本）
+spec:
+  name: kube-proxy
+  type: yaml
+  version: v1.36.0
+  versionSkew:
+    referenceComponent: kube-apiserver
+    maxSkewBehind: 3
+    direction: behind
+  dependencies:
+    - name: kube-apiserver
+      phase: Install
+
+# kubectl（偏差约束：允许双向 ±1）
+spec:
+  name: kubectl
+  type: binary
+  version: v1.36.0
+  versionSkew:
+    referenceComponent: kube-apiserver
+    maxSkewBehind: 1
+    direction: bidirectional
+  dependencies:
+    - name: kubelet
+      phase: Install
+
+# etcd（无 versionSkew，但声明兼容性约束）
+spec:
+  name: etcd
+  type: staticpod
+  version: v3.5.20
+  # etcd 不在 K8s Version Skew Policy 中，无需 versionSkew
+  # 但通过 compatibility 声明与 K8s 版本的配套关系
+  compatibility:
+    - component: kube-apiserver
+      rule: ">=v1.34"
+  dependencies:
+    - name: kubelet
+      phase: Install
+```
+
+### 9.5 重构后的偏差检查
+
+偏差约束内化后，`VersionSkewChecker` 从外部规则表读取改为从 ComponentVersion 读取：
+
+```go
+// pkg/upgrade/skew_checker.go 重构
+
+// CheckSkewFromComponentVersions 从 ComponentVersion 的 versionSkew 字段读取约束
+// 替代原有的 K8sSkewConstraints 外部规则表
+func (c *VersionSkewChecker) CheckSkewFromComponentVersions(
+    ctx context.Context,
+    vc *VersionContext,
+    cvStore ComponentVersionStore,
+) (bool, []SkewViolation) {
+    var violations []SkewViolation
+    
+    // 遍历 VersionContext 中的所有组件
+    for name := range vc.Current {
+        // 从 ComponentVersion 获取 versionSkew 声明
+        cv, err := cvStore.GetComponentVersion(ctx, name, vc.GetCurrent(name))
+        if err != nil || cv.Spec.VersionSkew == nil {
+            continue // 无偏差约束声明，跳过
+        }
+        
+        skewSpec := cv.Spec.VersionSkew
+        componentVersion := vc.GetCurrent(name)
+        referenceVersion := vc.GetCurrent(skewSpec.ReferenceComponent)
+        
+        if componentVersion == "" || referenceVersion == "" {
+            continue
+        }
+        
+        skew := computeMinorVersionSkew(referenceVersion, componentVersion)
+        
+        if skew < 0 {
+            // 组件比参照新，违反约束
+            violations = append(violations, SkewViolation{
+                Component:    name,
+                Reference:    skewSpec.ReferenceComponent,
+                ComponentVer: componentVersion,
+                ReferenceVer: referenceVersion,
+                Skew:         skew,
+                Reason:       "component is newer than reference (not allowed)",
+            })
+        } else if skew > skewSpec.MaxSkewBehind {
+            // 偏差超过限制
+            violations = append(violations, SkewViolation{
+                Component:    name,
+                Reference:    skewSpec.ReferenceComponent,
+                ComponentVer: componentVersion,
+                ReferenceVer: referenceVersion,
+                Skew:         skew,
+                Reason:       fmt.Sprintf("skew %d exceeds max %d", skew, skewSpec.MaxSkewBehind),
+            })
+        }
+    }
+    
+    return len(violations) == 0, violations
+}
+```
+
+### 9.6 重构后的 DAG 依赖关系
+
+```
+重构后的 DAG（K8s 核心组件独立声明，依赖关系内化到 ComponentVersion）:
+
+安装 DAG:
+  Batch 1: [etcd]                    ← type: staticpod
+      └─ StaticPodInstaller           ← 依赖 kubelet（Static Pod 需 Kubelet 拉起）
+
+  Batch 2: [kube-apiserver]          ← type: staticpod
+      └─ StaticPodInstaller           ← 依赖 etcd（数据存储）
+
+  Batch 3: [kube-controller-manager,  ← type: staticpod, 并行
+            kube-scheduler]            ← 依赖 apiserver
+      ├─ StaticPodInstaller
+      └─ StaticPodInstaller
+
+  Batch 4: [kube-proxy]              ← type: yaml
+      └─ YamlInstaller Apply          ← 依赖 apiserver
+
+  Batch 5: [kubelet, kubectl]        ← type: binary, 并行
+      ├─ BinaryInstaller (kubelet)    ← 依赖 containerd + apiserver
+      └─ BinaryInstaller (kubectl)    ← 依赖 kubelet
+
+升级 DAG（延迟 kubelet）:
+  Batch 1: [etcd]                    ← 先升级数据存储
+  Batch 2: [kube-apiserver]          ← 控制面入口
+  Batch 3: [cm, scheduler]           ← 跟随 apiserver
+  Batch 4: [kube-proxy]              ← 匹配 apiserver
+  Batch 5: [kubectl]                 ← 命令行工具
+  ─── kubelet 延迟到偏差门控后 ───
+  Batch 6 (延迟): [kubelet]          ← 偏差达到极限时补充升级
+```
+
+### 9.7 重构后的 VersionContext
+
+```go
+// 重构后 VersionContext 可独立追踪每个 K8s 核心组件版本
+// Current 来自当前 ReleaseImage bundle
+// Target 来自目标 ReleaseImage bundle
+
+// 示例：v1.34 → v1.36 升级
+vc := &VersionContext{
+    Current: map[string]string{
+        "etcd":                    "v3.5.18",
+        "kube-apiserver":          "v1.34.0",
+        "kube-controller-manager": "v1.34.0",
+        "kube-scheduler":          "v1.34.0",
+        "kube-proxy":              "v1.34.0",
+        "kubectl":                 "v1.34.0",
+        "kubelet":                 "v1.34.0",    // 独立追踪
+    },
+    Target: map[string]string{
+        "etcd":                    "v3.5.20",
+        "kube-apiserver":          "v1.36.0",
+        "kube-controller-manager": "v1.36.0",
+        "kube-scheduler":          "v1.36.0",
+        "kube-proxy":              "v1.36.0",
+        "kubectl":                 "v1.36.0",
+        "kubelet":                 "v1.36.0",    // 独立追踪
+    },
+}
+
+// 偏差检查直接基于 VersionContext + ComponentVersion.versionSkew
+// 不再需要外部 K8sSkewConstraints 规则表
+skew := computeMinorVersionSkew(
+    vc.GetCurrent("kube-apiserver"),  // v1.36.0
+    vc.GetCurrent("kubelet"),         // v1.34.0（延迟升级）
+)
+// skew = 2，允许 3 → ✅ 安全
+```
+
+### 9.8 重构收益
+
+| 维度 | 重构前（kubernetes-master 黑盒） | 重构后（独立组件） |
+|------|-------------------------------|------------------|
+| **版本追踪** | 仅 `KubernetesVersion` 一个版本号 | 7 个独立版本号（apiserver/cm/scheduler/kubelet/kubectl/kube-proxy/etcd） |
+| **偏差约束** | 外部 `K8sSkewConstraints` 规则表 | 内化到 `ComponentVersion.spec.versionSkew` |
+| **依赖关系** | kubeadm 内部硬编码顺序 | `ComponentVersion.spec.dependencies` 声明式 |
+| **kubelet 延迟** | 不支持（kubeadm 强制升级） | 支持（独立组件，可被 `executeControlPlaneHop` 跳过） |
+| **升级粒度** | 粗粒度（整个 kubernetes-master） | 细粒度（每个组件独立升级/回滚） |
+| **可观测性** | 仅集群级版本状态 | 组件级版本状态（`ClusterComponentStatuses`） |
+| **偏差检查** | 需要外部 `VersionSkewChecker` + 规则表 | 直接从 `ComponentVersion.versionSkew` + `VersionContext` 计算 |
+
+### 9.9 迁移策略
+
+| 阶段 | 目标 | 说明 | Feature Gate |
+|------|------|------|-------------|
+| **阶段 1** | etcd 独立 | etcd 已独立（现状），保持不变 | - |
+| **阶段 2** | kubelet + kubectl 独立 | 从 kubernetes-master 拆出为 binary 类型（KEP-13） | `KubeletBinaryMigration` |
+| **阶段 3** | apiserver/cm/scheduler 独立 | 从 kubernetes-master 拆出为 staticpod 类型（KEP-9） | `StaticPodComponentEnabled` |
+| **阶段 4** | 删除 kubernetes-master | 所有子组件独立后，kubernetes-master 不再需要 | 移除 Feature Gate |
+| **阶段 5** | 偏差约束内化 | versionSkew 从外部规则表迁移到 ComponentVersion.spec | `VersionSkewInComponentVersion` |
+
+```
+迁移路径:
+
+阶段 1: 现状
+  ReleaseImage: kubernetes-master(inline) + etcd(inline) + kube-proxy(yaml)
+  偏差检查: 外部 K8sSkewConstraints
+
+阶段 2: kubelet + kubectl 独立
+  ReleaseImage: kubernetes-master(inline) + etcd(inline) + kube-proxy(yaml)
+               + kubelet(binary) + kubectl(binary) 🆕
+  偏差检查: 外部 K8sSkewConstraints
+  Feature Gate: KubeletBinaryMigration ON → kubelet 由 BinaryInstaller 处理
+                kubernetes-master 的 installKubeletCommand 跳过
+
+阶段 3: apiserver/cm/scheduler 独立
+  ReleaseImage: kubernetes-master(inline, 仅剩 kubeadm 引导逻辑)
+               + etcd(staticpod) + kube-apiserver(staticpod) 🆕
+               + kube-controller-manager(staticpod) 🆕 + kube-scheduler(staticpod) 🆕
+               + kubelet(binary) + kubectl(binary) + kube-proxy(yaml)
+  偏差检查: 外部 K8sSkewConstraints
+  Feature Gate: StaticPodComponentEnabled ON → apiserver/cm/scheduler 由 StaticPodInstaller 处理
+
+阶段 4: 删除 kubernetes-master
+  ReleaseImage: etcd(staticpod) + kube-apiserver(staticpod)
+               + kube-controller-manager(staticpod) + kube-scheduler(staticpod)
+               + kubelet(binary) + kubectl(binary) + kube-proxy(yaml)
+  偏差检查: 外部 K8sSkewConstraints
+  Feature Gate: 移除（kubernetes-master 不再存在）
+
+阶段 5: 偏差约束内化
+  ReleaseImage: 同阶段 4
+  偏差检查: ComponentVersion.spec.versionSkew（内化）🆕
+  Feature Gate: VersionSkewInComponentVersion ON → 从 ComponentVersion 读取偏差约束
+                外部 K8sSkewConstraints 标记为 deprecated
+```
+
+## 10. 工作量评估
 
 | 模块 | 任务 | 工作量（人天） |
 |------|------|---------------|
@@ -2362,10 +2772,11 @@ type UpgradeOrchestrationConfig struct {
 | **computeIntermediateVersions** | 中间版本计算 + 版本路径规划 | 1 |
 | **偏差门控日志 + 事件** | 偏差状态事件 + Prometheus 指标 | 2 |
 | **策略配置** | UpgradeOrchestrationConfig + Feature Gate | 1 |
+| **ReleaseImage 重构** | K8s 核心组件拆分 + versionSkew 内化 | 5 |
 | **集成测试** | 3-hop 升级 + 延迟 kubelet + 偏差门控 + 补充升级 E2E | 6 |
-| **小计** | - | **26 人天** |
+| **小计** | - | **31 人天** |
 
-## 10. 风险与缓解
+## 11. 风险与缓解
 
 | 风险 | 影响 | 概率 | 缓解措施 |
 |------|------|------|---------|
@@ -2375,6 +2786,8 @@ type UpgradeOrchestrationConfig struct {
 | **中间版本不存在** | kubelet 补充升级找不到制品 | 低 | 中间版本必须是已发布版本 |
 | **节点 drain 失败** | Pod 无法驱逐 | 中 | 强制 drain + 超时 + Continue 策略 |
 | **偏差门误判** | 允许继续或阻塞升级 | 低 | 前瞻性检查 + 实际状态双重验证 |
+| **ReleaseImage 重构兼容性** | 新旧 ReleaseImage 格式混用 | 中 | Feature Gate 控制 + 渐进迁移 |
+| **versionSkew 内化遗漏** | 部分组件缺少偏差约束声明 | 低 | 迁移验证清单 + 单元测试 |
 
 ---
 
