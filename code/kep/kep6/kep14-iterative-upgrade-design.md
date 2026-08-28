@@ -686,23 +686,27 @@ func parseMinorVersion(version string) int {
 
 ### 4.1 核心思路
 
-**将控制面升级和 kubelet 升级拆分为独立的 DAG 节点，通过版本偏差约束动态控制执行顺序。**
+**将控制面升级和 kubelet/kubectl 升级拆分为独立的 DAG 节点，通过版本偏差约束动态控制执行顺序。**
 
 ```
-传统方式（kubeadm 黑盒）:
-  Hop 1: kubeadm upgrade → apiserver + cm + scheduler + kubelet 全部升级
-  Hop 2: kubeadm upgrade → apiserver + cm + scheduler + kubelet 全部升级
+传统方式（BKE upgradeControlPlane 黑盒）:
+  Hop 1: EnsureMasterUpgrade → apiserver + cm + scheduler + kubelet + kubectl 全部升级
+  Hop 2: EnsureMasterUpgrade → apiserver + cm + scheduler + kubelet + kubectl 全部升级
 
 本方案（分离升级 + 偏差门控）:
-  Hop 1: 控制面升级 → apiserver + cm + scheduler + kube-proxy（不含 kubelet）
+  Hop 1: 控制面升级 → apiserver + cm + scheduler + kube-proxy + kubectl（不含 kubelet）
   偏差门 1: kubelet(v1.34) vs apiserver(v1.35) → 1 偏差 → ✅ 通过（允许 3）
-  Hop 2: 控制面升级 → apiserver + cm + scheduler + kube-proxy（不含 kubelet）
+  Hop 2: 控制面升级 → apiserver + cm + scheduler + kube-proxy + kubectl（不含 kubelet）
   偏差门 2: kubelet(v1.34) vs apiserver(v1.36) → 2 偏差 → ✅ 安全（允许 3）
-  Hop 3: 控制面升级 → apiserver + cm + scheduler + kube-proxy（不含 kubelet）
+  Hop 3: 控制面升级 → apiserver + cm + scheduler + kube-proxy + kubectl（不含 kubelet）
   偏差门 3: kubelet(v1.34) vs apiserver(v1.37) → 3 偏差 → ⚠️ 达到极限，必须升级 kubelet
   Kubelet 补充升级: v1.34→v1.35→v1.36→v1.37（逐节点 drain → replace → uncordon）
   最终验证: 0 偏差 → ✅ 升级完成
 ```
+
+**为什么不延迟 kubectl？**
+
+kubectl 的偏差规则允许与 apiserver 相差 ±1 个小版本（比 kubelet 的 3 个小版本更严格），延迟 kubectl 会很快触及偏差极限。且 kubectl 是命令行工具，升级无需 drain 节点（仅替换二进制），不阻塞控制面升级，因此 kubectl 随控制面同步升级。
 
 ### 4.2 单 hop 内的升级顺序
 
@@ -740,6 +744,7 @@ Hop 1: K8s v1.34 → v1.35
   ├─ apiserver: v1.34 → v1.35
   ├─ cm/scheduler: v1.34 → v1.35  ← 最多落后 apiserver 1 个小版本，本次同步升级
   ├─ kube-proxy: v1.34 → v1.35   ← 最多落后 apiserver 3 个小版本，本次同步升级
+  ├─ kubectl: v1.34 → v1.35      ← 最多落后 apiserver 1 个小版本，本次同步升级
   └─ kubelet: 保持 v1.34（1 版本偏差，安全，允许 3）
 
   偏差门 1: kubelet(v1.34) vs apiserver(v1.35) → 1 偏差 → ✅ 通过
@@ -748,6 +753,7 @@ Hop 2: K8s v1.35 → v1.36
   ├─ apiserver: v1.35 → v1.36
   ├─ cm/scheduler: v1.35 → v1.36
   ├─ kube-proxy: v1.35 → v1.36
+  ├─ kubectl: v1.35 → v1.36
   └─ kubelet: 保持 v1.34（2 版本偏差，安全，v1.25+ 允许最多 3）
 
   偏差门 2: kubelet(v1.34) vs apiserver(v1.36) → 2 偏差 → ✅ 安全
@@ -757,6 +763,7 @@ Hop 3（如有）: K8s v1.36 → v1.37
   ├─ apiserver: v1.36 → v1.37
   ├─ cm/scheduler: v1.36 → v1.37
   ├─ kube-proxy: v1.36 → v1.37
+  ├─ kubectl: v1.36 → v1.37
   └─ kubelet: 保持 v1.34（3 版本偏差，达到极限）
 
   偏差门 3: kubelet(v1.34) vs apiserver(v1.37) → 3 偏差 → ⚠️ 达到极限
@@ -837,11 +844,20 @@ Hop 3（如有）: K8s v1.36 → v1.37
 
 对于大规模集群，kubelet 逐节点 drain 升级耗时较长。采用**延迟升级策略**：
 
+| 组件 | 偏差规则 | 是否延迟 | 原因 |
+|------|---------|---------|------|
+| **kubelet** | 最多滞后 apiserver 3 个小版本 | ✅ **延迟** | drain 耗时长，利用 3 版本偏差窗口减少 drain 次数 |
+| **kubectl** | 最多滞后 apiserver 1 个小版本 | ❌ **不延迟** | 偏差窗口仅 1，延迟 2 个 hop 即超限；且升级仅替换二进制，无需 drain，不阻塞控制面 |
+| **kube-proxy** | 最多滞后 apiserver 3 个小版本 | ❌ **不延迟** | 通过 DaemonSet 滚动更新，无需逐节点 drain，不阻塞控制面 |
+| **cm/scheduler** | 最多滞后 apiserver 1 个小版本 | ❌ **不延迟** | 偏差窗口仅 1，必须随 apiserver 同步升级 |
+
 | 策略 | 说明 | 适用场景 |
 |------|------|---------|
 | **同步升级** | 每个 hop 内 kubelet 与 apiserver 同步升级 | 小集群（<10 节点），偏差始终为 0 |
 | **延迟升级** | 控制面先升级，kubelet 延迟到偏差达到极限（3）时批量升级 | 大集群（>10 节点），减少 drain 次数 |
 | **最终升级** | 所有 hop 完成后，kubelet 逐版本补充升级到目标版本 | 与延迟升级配合 |
+
+> **注意**：kubectl 和 kube-proxy 在每个 hop 中随控制面同步升级。kubectl 升级仅替换二进制（无需 drain），kube-proxy 通过 DaemonSet 滚动更新（无需逐节点 drain），两者都不阻塞控制面升级流程。
 
 **延迟升级的版本路径**：
 
@@ -851,17 +867,23 @@ Hop 3（如有）: K8s v1.36 → v1.37
 同步升级:                    延迟升级:
   Hop 1:                       Hop 1:
     apiserver v1.35              apiserver v1.35
+    kubectl v1.35                kubectl v1.35
+    kube-proxy v1.35            kube-proxy v1.35
     kubelet v1.35                kubelet 保持 v1.34（偏差 1，安全）
   Hop 2:                       Hop 2:
     apiserver v1.36              apiserver v1.36
+    kubectl v1.36                kubectl v1.36
+    kube-proxy v1.36            kube-proxy v1.36
     kubelet v1.36                kubelet 保持 v1.34（偏差 2，安全）
   Hop 3:                       Hop 3:
     apiserver v1.37              apiserver v1.37
+    kubectl v1.37                kubectl v1.37
+    kube-proxy v1.37            kube-proxy v1.37
     kubelet v1.37                kubelet 保持 v1.34（偏差 3，极限）
-                              补充:
-                                kubelet v1.34→v1.35
-                                kubelet v1.35→v1.36
-                                kubelet v1.36→v1.37
+                               补充:
+                                 kubelet v1.34→v1.35
+                                 kubelet v1.35→v1.36
+                                 kubelet v1.36→v1.37
 
 同步升级 drain 次数: 3 轮 × N 节点
 延迟升级 drain 次数: 3 轮 × N 节点（但集中在最后一次性完成，减少中间窗口）
@@ -1258,17 +1280,20 @@ func (r *ClusterVersionReconciler) executeKubeletUpgrade(
 | Hop 1 - 控制面 | etcd | v3.5.18→v3.5.19 | - | 先升级数据存储 |
 | Hop 1 - 控制面 | apiserver | v1.34→v1.35 | - | 控制面入口 |
 | Hop 1 - 控制面 | cm/scheduler | v1.34→v1.35 | cm/scheduler ≤ apiserver（允许滞后 1） | 紧随 apiserver |
-| Hop 1 - 控制面 | kube-proxy | v1.34→v1.35 | kube-proxy ≤ apiserver（允许滞后 3） | 可滞后 apiserver |
+| Hop 1 - 控制面 | kube-proxy | v1.34→v1.35 | kube-proxy ≤ apiserver（允许滞后 3） | 随 apiserver 同步升级 |
+| Hop 1 - 控制面 | kubectl | v1.34→v1.35 | kubectl ≤ apiserver（允许滞后 1） | 随 apiserver 同步升级（仅替换二进制） |
 | Hop 1 - 控制面 | kubelet | **保持 v1.34** | kubelet vs apiserver = 1 偏差 | **延迟升级**（允许滞后 3） |
 | **偏差门 1** | - | - | 1 偏差，✅ 安全 | 可继续 Hop 2 |
 | Hop 2 - 控制面 | apiserver | v1.35→v1.36 | - | 第二跳 |
 | Hop 2 - 控制面 | cm/scheduler | v1.35→v1.36 | cm/scheduler ≤ apiserver | 紧随 apiserver |
-| Hop 2 - 控制面 | kube-proxy | v1.35→v1.36 | kube-proxy ≤ apiserver | 可滞后 apiserver |
+| Hop 2 - 控制面 | kube-proxy | v1.35→v1.36 | kube-proxy ≤ apiserver | 随 apiserver 同步升级 |
+| Hop 2 - 控制面 | kubectl | v1.35→v1.36 | kubectl ≤ apiserver | 随 apiserver 同步升级 |
 | Hop 2 - 控制面 | kubelet | **仍保持 v1.34** | kubelet vs apiserver = 2 偏差 | **安全**（允许滞后 3） |
 | **偏差门 2** | - | - | 2 偏差，✅ 安全 | 可继续 Hop 3（如有） |
 | Hop 3（如有） | apiserver | v1.36→v1.37 | - | 第三跳 |
 | Hop 3（如有） | cm/scheduler | v1.36→v1.37 | cm/scheduler ≤ apiserver | 紧随 apiserver |
-| Hop 3（如有） | kube-proxy | v1.36→v1.37 | kube-proxy ≤ apiserver | 可滞后 apiserver |
+| Hop 3（如有） | kube-proxy | v1.36→v1.37 | kube-proxy ≤ apiserver | 随 apiserver 同步升级 |
+| Hop 3（如有） | kubectl | v1.36→v1.37 | kubectl ≤ apiserver | 随 apiserver 同步升级 |
 | Hop 3（如有） | kubelet | **仍保持 v1.34** | kubelet vs apiserver = 3 偏差 | **达到极限** |
 | **偏差门 3** | - | - | 3 偏差，⚠️ 极限 | **必须升级 kubelet** |
 | Kubelet 补充 | kubelet | v1.34→v1.35 | 2→1 偏差 | 逐节点 drain 升级 |
