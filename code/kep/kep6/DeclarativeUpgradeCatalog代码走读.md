@@ -153,6 +153,50 @@ Inline handler 名称与 `phaseframe.Phase.Name()` 和 `ComponentVersion.spec.in
 }
 ```
 
+### 包含的子组件
+
+`kubernetes-master` 是一个**复合组件**，通过 `kubeadm upgrade apply` 一次性升级 Master 节点上的所有控制面子组件。Phase 本身不逐个管理子组件，而是委托 BKEAgent 执行 kubeadm 命令，由 kubeadm 内部统一更新 Static Pod manifest 和 kubelet 配置。
+
+| 子组件 | 部署形态 | 升级方式 | manifest 路径 | 说明 |
+|--------|---------|---------|--------------|------|
+| **kube-apiserver** | Static Pod | kubeadm 更新 manifest YAML → Kubelet 重建 Pod | `/etc/kubernetes/manifests/kube-apiserver.yaml` | K8s API Server，控制面核心 |
+| **kube-controller-manager** | Static Pod | kubeadm 更新 manifest YAML → Kubelet 重建 Pod | `/etc/kubernetes/manifests/kube-controller-manager.yaml` | K8s 控制器管理器 |
+| **kube-scheduler** | Static Pod | kubeadm 更新 manifest YAML → Kubelet 重建 Pod | `/etc/kubernetes/manifests/kube-scheduler.yaml` | K8s 调度器 |
+| **kubelet** | systemd 二进制 | kubeadm 更新二进制 + 配置 + 重启服务 | `/usr/bin/kubelet` + `/etc/kubernetes/kubelet.conf` | 节点代理（master 侧） |
+| **kubectl** | 二进制 | Phase 内 `updateAddonVersions()` 同步 addon 版本 | `/usr/bin/kubectl` | 命令行工具，固定升级到 v1.25 |
+
+**升级执行链路**：
+
+```
+EnsureMasterUpgrade.Execute()
+    │
+    ├─ BKEAgent 执行: kubeadm upgrade apply
+    │   ├─ 更新 kube-apiserver manifest → Kubelet 重建 Pod
+    │   ├─ 更新 kube-controller-manager manifest → Kubelet 重建 Pod
+    │   ├─ 更新 kube-scheduler manifest → Kubelet 重建 Pod
+    │   ├─ 更新 kubelet 二进制 + kubelet.conf → 重启 kubelet
+    │   └─ （可选）备份 etcd 数据 (BackUpEtcd=true)
+    │
+    ├─ ensureEtcdAdvertiseClientUrlsAnnotation()
+    │   └─ 为 etcd static pod 补充 advertise-client-urls 注解
+    │
+    └─ updateAddonVersions()
+        └─ 同步 kubectl addon 版本到 v1.25
+```
+
+**与 DAG 中其他组件的关系**：
+
+```
+etcd (inline, 独立 DAG 节点)
+    ↓ 依赖
+kubernetes-master (inline, 本组件)
+    │   包含: kube-apiserver + kube-controller-manager + kube-scheduler + kubelet + kubectl
+    ↓ 依赖
+kubernetes-worker (inline)
+```
+
+> **注意**：`kube-apiserver`、`kube-controller-manager`、`kube-scheduler` 在 KEP-9 中被规划为独立的 `staticpod` 类型 ComponentVersion，未来将从 `kubernetes-master` 复合组件中拆分出来，各自成为 DAG 中的独立节点。当前阶段它们仍由 `EnsureMasterUpgrade` 通过 kubeadm 统一管理。
+
 ### 注册路径
 
 ```
@@ -345,6 +389,43 @@ if err := e.upgradeNode(...); err != nil {
     InlineHandler: InlineHandlerWorkerUpgrade,   // "EnsureWorkerUpgrade"
 }
 ```
+
+### 包含的子组件
+
+`kubernetes-worker` 同样是**复合组件**，通过 `kubeadm upgrade node` 一次性升级 Worker 节点上的所有节点级子组件。Worker 节点不运行控制面 Static Pod，因此子组件比 Master 少。
+
+| 子组件 | 部署形态 | 升级方式 | 路径 | 说明 |
+|--------|---------|---------|------|------|
+| **kubelet** | systemd 二进制 | kubeadm 更新二进制 + kubelet.conf + 重启服务 | `/usr/bin/kubelet` + `/etc/kubernetes/kubelet.conf` | 节点代理，核心组件 |
+| **kubectl** | 二进制 | 随 kubeadm upgrade node 一并更新（如集群配置了 addon） | `/usr/bin/kubectl` | 命令行工具 |
+| **kubelet 配置** | 配置文件 | kubeadm 更新 `/etc/kubernetes/kubelet.conf` | `/etc/kubernetes/kubelet.conf` | kubelet 连接 API Server 的配置 |
+| **kubelet 标志** | 配置文件 | kubeadm 更新 `/var/lib/kubelet/config.yaml` | `/var/lib/kubelet/config.yaml` | kubelet 运行时标志（KubeletConfiguration） |
+
+**升级执行链路**：
+
+```
+EnsureWorkerUpgrade.Execute()
+    │
+    └─ BKEAgent 执行: kubeadm upgrade node
+        ├─ 下载新版本 kubelet 二进制
+        ├─ 更新 /etc/kubernetes/kubelet.conf（API Server 连接配置）
+        ├─ 更新 /var/lib/kubelet/config.yaml（KubeletConfiguration）
+        ├─ 更新 /etc/kubernetes/pki 证书（如需要）
+        └─ 重启 kubelet 服务 (systemctl restart kubelet)
+```
+
+**与 Master 的子组件差异**：
+
+| 维度 | kubernetes-master | kubernetes-worker |
+|------|-------------------|-------------------|
+| **控制面 Static Pod** | ✅ kube-apiserver + kube-controller-manager + kube-scheduler | ❌ 无 |
+| **kubelet** | ✅ kubeadm upgrade apply 更新 | ✅ kubeadm upgrade node 更新 |
+| **kubectl** | ✅ Phase 内 `updateAddonVersions()` 同步到 v1.25 | ❌ 不单独处理（随 kubeadm 升级） |
+| **etcd 备份** | ✅ `BackUpEtcd=true` | ❌ `BackUpEtcd=false` |
+| **kubeadm 命令** | `kubeadm upgrade apply` | `kubeadm upgrade node` |
+| **证书更新** | kubeadm 内部处理 | kubeadm 内部处理（如需要） |
+
+> **注意**：`kubelet` 在 KEP-13 中被规划为独立的 `binary` 类型 ComponentVersion，未来将从 `kubernetes-worker` 复合组件中拆分出来，成为 DAG 中的独立节点。当前阶段它仍由 `EnsureWorkerUpgrade` 通过 kubeadm 统一管理。
 
 ### 注册路径
 
