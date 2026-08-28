@@ -521,15 +521,27 @@ kubelet 重启（systemctl restart kubelet）时:
 
 对于多 Master 节点集群，`EnsureEtcdUpgrade` 和 `EnsureMasterUpgrade` 分别逐节点滚动升级（阻塞式），各节点版本如下：
 
-| 阶段 | node-1 apiserver | node-2 apiserver | node-1 kubelet | node-2 kubelet | 偏差状态分析 |
-|------|-----------------|-----------------|----------------|----------------|-------------|
-| 升级前 | v1.34 | v1.34 | v1.34 | v1.34 | ✅ 一致 |
-| node-1 EnsureEtcdUpgrade 完成 | v1.34 | v1.34 | v1.34 | v1.34 | ✅ etcd 升级不影响 K8s 组件版本 |
-| node-1 EnsureMasterUpgrade 完成 | **v1.35** | v1.34 | **v1.35** | v1.34 | ✅ HA 中 apiserver 实例间偏差 1（允许 1）；node-2 的 kubelet(1.34) vs apiserver(1.34) = 0 偏差（自身无偏差） |
-| node-2 EnsureEtcdUpgrade 完成 | v1.35 | v1.34 | v1.35 | v1.34 | ✅ 同上 |
-| node-2 EnsureMasterUpgrade 完成 | v1.35 | **v1.35** | v1.35 | **v1.35** | ✅ 全部一致 |
+| 阶段 | node-1 apiserver | node-2 apiserver | node-1 kubelet | node-2 kubelet | node-1 kubectl | node-2 kubectl | node-1 kube-proxy | node-2 kube-proxy | 偏差状态分析 |
+|------|-----------------|-----------------|----------------|----------------|---------------|---------------|------------------|------------------|-------------|
+| 升级前 | v1.34 | v1.34 | v1.34 | v1.34 | v1.34 | v1.34 | v1.34 | v1.34 | ✅ 一致 |
+| node-1 EnsureEtcdUpgrade 完成 | v1.34 | v1.34 | v1.34 | v1.34 | v1.34 | v1.34 | v1.34 | v1.34 | ✅ etcd 升级不影响 K8s 组件版本 |
+| node-1 EnsureMasterUpgrade 完成 | **v1.35** | v1.34 | **v1.35** | v1.34 | **v1.35** | v1.34 | **v1.35** | v1.34 | ✅ HA 中 apiserver 实例间偏差 1（允许 1）；node-2 的 kubelet/kubectl/kube-proxy(1.34) vs apiserver(1.34) = 0 偏差（自身无偏差） |
+| node-2 EnsureEtcdUpgrade 完成 | v1.35 | v1.34 | v1.35 | v1.34 | v1.35 | v1.34 | v1.35 | v1.34 | ✅ 同上 |
+| node-2 EnsureMasterUpgrade 完成 | v1.35 | **v1.35** | v1.35 | **v1.35** | v1.35 | **v1.35** | v1.35 | **v1.35** | ✅ 全部一致 |
 
-**分析结论**：多节点滚动升级期间，**单个节点内的偏差**由 `upgradeControlPlane()` 内部逐组件升级管理（见 2.8.3），**跨节点偏差**通过逐节点升级保证安全。在 node-1 完成而 node-2 未完成时，集群存在两个版本的 apiserver（HA 场景下可接受，官方允许 apiserver 实例间最多偏差 1 个小版本）。
+**分析结论**：
+
+多节点滚动升级期间，**单个节点内的偏差**由 `upgradeControlPlane()` 内部逐组件升级管理（见 2.8.3），**跨节点偏差**通过逐节点升级保证安全。
+
+| 偏差规则 | 多节点升级期间是否满足 | 说明 |
+|---------|---------------------|------|
+| **HA apiserver 实例间偏差** | ✅ 满足 | node-1 完成(1.35) vs node-2 未完成(1.34) = 1 偏差（允许 1） |
+| **kubelet vs apiserver** | ✅ 满足 | node-2 的 kubelet(1.34) vs 最低 apiserver(1.34) = 0 偏差；node-2 的 kubelet(1.34) vs 最高 apiserver(1.35) = 1 偏差（允许 3） |
+| **kubectl vs apiserver** | ✅ 满足 | node-2 的 kubectl(1.34) vs 最低 apiserver(1.34) = 0 偏差；vs 最高 apiserver(1.35) = 1 偏差（允许 ±1） |
+| **kube-proxy vs apiserver** | ✅ 满足 | node-2 的 kube-proxy(1.34) vs 最低 apiserver(1.34) = 0 偏差；vs 最高 apiserver(1.35) = 1 偏差（允许 3） |
+| **cm/scheduler vs apiserver** | ✅ 满足 | `upgradeControlPlane()` 在每个节点内同步升级 cm/scheduler，不跨节点偏差 |
+
+> **注意**：在 node-1 完成而 node-2 未完成时，集群存在两个版本的 apiserver（HA 场景下可接受，官方允许 apiserver 实例间最多偏差 1 个小版本）。此时 node-2 上的 kubelet(1.34)/kubectl(1.34)/kube-proxy(1.34) 与 node-1 的 apiserver(1.35) 之间偏差为 1，均在允许范围内。
 
 #### 2.8.5 多 hop 升级的偏差问题
 
