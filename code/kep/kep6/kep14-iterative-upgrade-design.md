@@ -2983,6 +2983,96 @@ func (s *ReleaseImageSpec) GetComponentVersion(name string) string {
 }
 ```
 
+**规范 4：K8s 核心组件名称必须与 K8s 官方一致**
+
+ReleaseImage 中 K8s 核心组件的 `name` 字段必须使用 K8s 官方组件名称，不得使用自定义缩写或别名。这确保：
+
+1. 与 K8s 生态工具（kubectl、kubeadm、kube-apiserver 等）的兼容性
+2. 偏差门控、版本追踪、状态查询中使用一致的组件名称
+3. ComponentVersion 的 `versionSkew.referenceComponent` 引用正确
+
+| 组件 | ✅ 正确名称（K8s 官方） | ❌ 错误名称（不允许） | 说明 |
+|------|------------------------|---------------------|------|
+| API Server | `kube-apiserver` | `apiserver`、`k8s-apiserver`、`api-server` | K8s 官方二进制/镜像名 |
+| Controller Manager | `kube-controller-manager` | `controller-manager`、`kcm`、`controller` | K8s 官方二进制/镜像名 |
+| Scheduler | `kube-scheduler` | `scheduler`、`k8s-scheduler` | K8s 官方二进制/镜像名 |
+| Kubelet | `kubelet` | `kube-let`、`k8s-kubelet` | K8s 官方二进制名 |
+| Kubectl | `kubectl` | `kube-ctl`、`k8s-kubectl` | K8s 官方二进制名 |
+| Kube Proxy | `kube-proxy` | `kubeproxy`、`proxy` | K8s 官方镜像名 |
+| etcd | `etcd` | `k8s-etcd` | 独立项目官方名 |
+
+```go
+// pkg/release/validation.go
+
+// K8sOfficialComponentNames K8s 官方组件名称常量
+// ReleaseImage 中 K8s 核心组件的 name 必须使用这些名称
+const (
+    K8sComponentKubeAPIServer       = "kube-apiserver"
+    K8sComponentKubeControllerMgr   = "kube-controller-manager"
+    K8sComponentKubeScheduler       = "kube-scheduler"
+    K8sComponentKubelet              = "kubelet"
+    K8sComponentKubectl              = "kubectl"
+    K8sComponentKubeProxy            = "kube-proxy"
+)
+
+// K8sCoreComponentSet K8s 核心组件名称集合（用于校验）
+var K8sCoreComponentSet = map[string]bool{
+    K8sComponentKubeAPIServer:     true,
+    K8sComponentKubeControllerMgr:  true,
+    K8sComponentKubeScheduler:      true,
+    K8sComponentKubelet:            true,
+    K8sComponentKubectl:            true,
+    K8sComponentKubeProxy:          true,
+}
+
+// ValidateComponentNames 校验 ReleaseImage 中的 K8s 组件名称是否与官方一致
+func ValidateComponentNames(ri *ReleaseImage) error {
+    // K8s 官方组件名称与常见错误名称的映射
+    commonMistakes := map[string]string{
+        "apiserver":       K8sComponentKubeAPIServer,
+        "api-server":      K8sComponentKubeAPIServer,
+        "k8s-apiserver":   K8sComponentKubeAPIServer,
+        "controller-manager": K8sComponentKubeControllerMgr,
+        "kcm":             K8sComponentKubeControllerMgr,
+        "controller":      K8sComponentKubeControllerMgr,
+        "scheduler":       K8sComponentKubeScheduler,
+        "k8s-scheduler":   K8sComponentKubeScheduler,
+        "kube-let":        K8sComponentKubelet,
+        "k8s-kubelet":     K8sComponentKubelet,
+        "kube-ctl":        K8sComponentKubectl,
+        "k8s-kubectl":     K8sComponentKubectl,
+        "kubeproxy":       K8sComponentKubeProxy,
+        "proxy":           K8sComponentKubeProxy,
+        "k8s-etcd":        "etcd",
+    }
+    
+    checkComponents := func(components []ReleaseImageComponent) error {
+        for _, c := range components {
+            if correct, isMistake := commonMistakes[c.Name]; isMistake {
+                return fmt.Errorf(
+                    "component name %q is not an official K8s name, use %q instead",
+                    c.Name, correct,
+                )
+            }
+        }
+        return nil
+    }
+    
+    if ri.Spec.Install != nil {
+        if err := checkComponents(ri.Spec.Install.Components); err != nil {
+            return err
+        }
+    }
+    if ri.Spec.Upgrade != nil {
+        if err := checkComponents(ri.Spec.Upgrade.Components); err != nil {
+            return err
+        }
+    }
+    
+    return nil
+}
+```
+
 #### 9.8a.5 版本矩阵示例
 
 ```
