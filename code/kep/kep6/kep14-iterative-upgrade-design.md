@@ -485,35 +485,36 @@ kubelet 重启（systemctl restart kubelet）时:
 
 **阶段一：`EnsureEtcdUpgrade` 执行期间**
 
-| 时刻 | etcd | apiserver | cm/scheduler | kubelet | kube-proxy | 偏差状态分析 |
-|------|------|-----------|-------------|---------|------------|-------------|
-| T0（升级前） | v3.5.18 | v1.34 | v1.34 | v1.34 | v1.34 | ✅ 全部一致 |
-| T1（etcd manifest 替换后） | **v3.5.19** | v1.34 | v1.34 | v1.34 | v1.34 | ✅ etcd 版本独立，不影响 K8s 组件偏差 |
+| 时刻 | etcd | apiserver | cm/scheduler | kubelet | kubectl | kube-proxy | 偏差状态分析 |
+|------|------|-----------|-------------|---------|---------|------------|-------------|
+| T0（升级前） | v3.5.18 | v1.34 | v1.34 | v1.34 | v1.34 | v1.34 | ✅ 全部一致 |
+| T1（etcd manifest 替换后） | **v3.5.19** | v1.34 | v1.34 | v1.34 | v1.34 | v1.34 | ✅ etcd 版本独立，不影响 K8s 组件偏差 |
 
 **阶段二：`EnsureMasterUpgrade` / `upgradeControlPlane()` 执行期间**
 
-| 时刻 | etcd | apiserver | cm/scheduler | kubelet | kube-proxy | 偏差状态分析 |
-|------|------|-----------|-------------|---------|------------|-------------|
-| T2（prepareUpgrade 完成后） | v3.5.19 | v1.34 | v1.34 | v1.34 | v1.34 | ✅ 无偏差（仅备份和预拉镜像） |
-| T3（apiserver manifest 替换 + Ready 后） | v3.5.19 | **v1.35** | v1.34 | v1.34 | v1.34 | ✅ cm(1.34) vs apiserver(1.35) = 1 偏差（允许滞后 1）；kubelet(1.34) vs apiserver(1.35) = 1 偏差（允许滞后 3）；kube-proxy(1.34) vs apiserver(1.35) = 1 偏差（允许滞后 3） |
-| T4（cm manifest 替换 + Ready 后） | v3.5.19 | v1.35 | **v1.35** | v1.34 | v1.34 | ✅ kubelet(1.34) vs apiserver(1.35) = 1 偏差（允许滞后 3）；kube-proxy(1.34) vs apiserver(1.35) = 1 偏差（允许滞后 3） |
-| T5（scheduler manifest 替换 + Ready 后） | v3.5.19 | v1.35 | v1.35 | v1.34 | v1.34 | ✅ 同 T4（scheduler 已与 cm 一致） |
-| T6（kubelet 二进制替换后） | v3.5.19 | v1.35 | v1.35 | **v1.35** | v1.34 | ✅ kube-proxy(1.34) vs apiserver(1.35) = 1 偏差（允许滞后 3） |
-| T7（kubectl 二进制安装后） | v3.5.19 | v1.35 | v1.35 | v1.35 | v1.34 | ✅ 同 T6（kubectl 不影响偏差） |
+| 时刻 | etcd | apiserver | cm/scheduler | kubelet | kubectl | kube-proxy | 偏差状态分析 |
+|------|------|-----------|-------------|---------|---------|------------|-------------|
+| T2（prepareUpgrade 完成后） | v3.5.19 | v1.34 | v1.34 | v1.34 | v1.34 | v1.34 | ✅ 无偏差（仅备份和预拉镜像） |
+| T3（apiserver manifest 替换 + Ready 后） | v3.5.19 | **v1.35** | v1.34 | v1.34 | v1.34 | v1.34 | ✅ cm(1.34) vs apiserver(1.35) = 1 偏差（允许滞后 1）；kubelet(1.34) vs apiserver(1.35) = 1 偏差（允许滞后 3）；kubectl(1.34) vs apiserver(1.35) = 1 偏差（允许双向 ±1）；kube-proxy(1.34) vs apiserver(1.35) = 1 偏差（允许滞后 3） |
+| T4（cm manifest 替换 + Ready 后） | v3.5.19 | v1.35 | **v1.35** | v1.34 | v1.34 | v1.34 | ✅ kubelet(1.34) vs apiserver(1.35) = 1 偏差（允许滞后 3）；kubectl(1.34) vs apiserver(1.35) = 1 偏差（允许 ±1）；kube-proxy(1.34) vs apiserver(1.35) = 1 偏差（允许滞后 3） |
+| T5（scheduler manifest 替换 + Ready 后） | v3.5.19 | v1.35 | v1.35 | v1.34 | v1.34 | v1.34 | ✅ 同 T4（scheduler 已与 cm 一致） |
+| T6（kubelet 二进制替换后） | v3.5.19 | v1.35 | v1.35 | **v1.35** | v1.34 | v1.34 | ✅ kubectl(1.34) vs apiserver(1.35) = 1 偏差（允许 ±1）；kube-proxy(1.34) vs apiserver(1.35) = 1 偏差（允许滞后 3） |
+| T7（kubectl 二进制安装后） | v3.5.19 | v1.35 | v1.35 | v1.35 | **v1.35** | v1.34 | ✅ kube-proxy(1.34) vs apiserver(1.35) = 1 偏差（允许滞后 3） |
 
 **阶段三：`updateAddonVersions()` 执行期间**
 
-| 时刻 | etcd | apiserver | cm/scheduler | kubelet | kube-proxy | 偏差状态分析 |
-|------|------|-----------|-------------|---------|------------|-------------|
-| T8（kube-proxy 版本同步后） | v3.5.19 | v1.35 | v1.35 | v1.35 | **v1.35** | ✅ 全部一致，无偏差 |
+| 时刻 | etcd | apiserver | cm/scheduler | kubelet | kubectl | kube-proxy | 偏差状态分析 |
+|------|------|-----------|-------------|---------|---------|------------|-------------|
+| T8（kube-proxy 版本同步后） | v3.5.19 | v1.35 | v1.35 | v1.35 | v1.35 | **v1.35** | ✅ 全部一致，无偏差 |
 
 **分析结论**：
 
 | 偏差规则 | 单节点升级期间是否满足 | 说明 |
 |---------|---------------------|------|
 | kubelet ≤ apiserver（允许滞后 3） | ✅ 满足 | kubelet 在 apiserver 之后升级（T3→T6），最大偏差 1（远小于允许的 3） |
-| kube-proxy ≤ apiserver（允许滞后 3） | ✅ 满足 | kube-proxy 在 apiserver 之后由 `updateAddonVersions()` 同步升级，最大偏差 1（远小于允许的 3） |
+| kube-proxy ≤ apiserver（允许滞后 3） | ✅ 满足 | kube-proxy 在 apiserver 之后由 `updateAddonVersions()` 同步升级（T3→T8），最大偏差 1（远小于允许的 3） |
 | cm/scheduler ≤ apiserver（允许滞后 1） | ✅ 满足 | kubeadm 在 apiserver 后逐个升级 cm/scheduler（T3→T4→T5），最大偏差 1（正好等于允许的极限 1） |
+| kubectl vs apiserver（允许双向 ±1） | ✅ 满足 | kubectl 在 kubelet 之后升级（T6→T7），最大偏差 1（正好等于允许的极限 1） |
 | etcd 与 apiserver 配套 | ✅ 满足 | etcd 在独立的 `EnsureEtcdUpgrade` Phase 中先升级，`EnsureMasterUpgrade` 执行时 etcd 已就绪 |
 
 #### 2.8.4 多节点 Master 集群的偏差状态
