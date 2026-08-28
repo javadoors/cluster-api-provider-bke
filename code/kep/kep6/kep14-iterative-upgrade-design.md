@@ -355,87 +355,172 @@ kubeadm 内部完成的操作:
 
 ### 2.8 现有 kubeadm 升级与 K8s 偏差规则的符合性分析
 
-kubeadm `upgrade apply` 在单节点内一次性升级所有组件，以下分析其与 K8s 官方偏差规则的符合性：
+基于代码库 `pkg/job/builtin/kubeadm/kubeadm.go` 分析 BKEAgent 中 `Kubeadm UpgradeControlPlane` 命令的实际执行逻辑及其与 K8s 官方偏差规则的符合性。
 
-#### 2.8.1 单节点升级期间的偏差状态
+#### 2.8.1 BKE 实际升级架构
 
-kubeadm 在**单个 Master 节点**上执行 `upgrade apply` 时，组件升级顺序为 etcd → apiserver → cm/scheduler → kubelet。在升级过程中的不同时刻，各组件版本如下：
+BKE 并非使用标准 `kubeadm upgrade apply` 命令，而是 BKEAgent 内置了自定义的 `KubeadmPlugin`，分为独立的 Phase：
+
+| Phase | 执行命令 | 代码函数 | 升级内容 | 顺序 |
+|-------|---------|---------|---------|------|
+| `EnsureEtcdUpgrade` | `Kubeadm UpgradeEtcd` | `upgradeEtcd()` | etcd Static Pod manifest 替换 | **先执行**（独立 Phase） |
+| `EnsureMasterUpgrade` | `Kubeadm UpgradeControlPlane` | `upgradeControlPlane()` | apiserver → cm → scheduler → kubelet → kubectl | **后执行** |
+| `EnsureWorkerUpgrade` | `Kubeadm UpgradeWorker` | `upgradeWorker()` | kubelet → kubectl | **最后执行** |
+
+**关键发现**：etcd **不在** `upgradeControlPlane` 命令中，而是由独立的 `EnsureEtcdUpgrade` Phase 先执行。`upgradeControlPlane` 仅升级 apiserver/cm/scheduler/kubelet/kubectl。
+
+#### 2.8.2 `upgradeControlPlane()` 实际执行流程
+
+```go
+// pkg/job/builtin/kubeadm/kubeadm.go:284
+
+func (k *KubeadmPlugin) upgradeControlPlane(backUpEtcd bool, clusterType string) error {
+    // step 1: prepareUpgrade（备份 etcd + 备份集群配置 + 预拉镜像 + 获取 Pod Hash）
+    beforeHash, err := k.prepareUpgrade(backUpEtcd, clusterType)
+
+    // step 2: 逐个升级控制面组件（顺序由 GetControlPlaneComponents() 决定）
+    for _, component := range mfutil.GetControlPlaneComponents() {
+        // GetControlPlaneComponents() 返回: [kube-apiserver, kube-controller-manager, kube-scheduler]
+        // 注意: etcd 不在此列表中！
+        
+        k.upgradeControlPlaneManifestCommand(component)  // 生成新 Static Pod manifest
+        k.waitComponentReady(component, podHash)          // 等待新 Pod Running + Ready
+    }
+
+    // step 3: 升级 kubelet 二进制
+    k.installKubeletCommand(false)
+
+    // step 4: 安装 kubectl 二进制
+    k.installKubectlCommand()
+}
+```
+
+**实际组件升级顺序**：
+
+```
+EnsureEtcdUpgrade Phase (独立执行，在 EnsureMasterUpgrade 之前):
+  └─ upgradeEtcd():
+     ├─ prepareUpgrade: 备份 etcd + 预拉镜像
+     ├─ 替换 etcd Static Pod manifest
+     └─ 等待 etcd Pod Ready
+
+EnsureMasterUpgrade Phase:
+  └─ upgradeControlPlane():
+     ├─ prepareUpgrade: 备份 etcd（如果 backUpEtcd=true）+ 备份集群配置 + 预拉镜像
+     ├─ kube-apiserver: 替换 manifest → 等待 Ready
+     ├─ kube-controller-manager: 替换 manifest → 等待 Ready
+     ├─ kube-scheduler: 替换 manifest → 等待 Ready
+     ├─ kubelet: 下载二进制 + 安装（非 manifest 替换，而是二进制替换）
+     └─ kubectl: 下载二进制 + 安装
+```
+
+#### 2.8.3 单节点升级期间的偏差状态
+
+基于 2.8.2 的实际执行顺序，分析各时刻的偏差状态（以 v1.34 → v1.35 升级为例）：
+
+**阶段一：`EnsureEtcdUpgrade` 执行期间**
 
 | 时刻 | etcd | apiserver | cm/scheduler | kubelet | kube-proxy | 偏差状态分析 |
 |------|------|-----------|-------------|---------|------------|-------------|
-| T0（升级前） | v3.5.18 | v1.34 | v1.34 | v1.34 | v1.34 | ✅ 全部一致，无偏差 |
-| T1（etcd 升级后） | **v3.5.19** | v1.34 | v1.34 | v1.34 | v1.34 | ✅ etcd 版本独立，不影响组件偏差 |
-| T2（apiserver 升级后） | v3.5.19 | **v1.35** | v1.34 | v1.34 | v1.34 | ✅ cm(1.34) vs apiserver(1.35) = 1 偏差（允许滞后 1）；kubelet(1.34) vs apiserver(1.35) = 1 偏差（允许滞后 3）；kube-proxy(1.34) vs apiserver(1.35) = 1 偏差（允许滞后 3） |
-| T3（cm/scheduler 升级后） | v3.5.19 | v1.35 | **v1.35** | v1.34 | v1.34 | ✅ kubelet(1.34) vs apiserver(1.35) = 1 偏差（允许滞后 3）；kube-proxy(1.34) vs apiserver(1.35) = 1 偏差（允许滞后 3） |
-| T4（kubelet 升级后） | v3.5.19 | v1.35 | v1.35 | **v1.35** | v1.34 | ✅ kube-proxy(1.34) vs apiserver(1.35) = 1 偏差（允许滞后 3） |
-| T5（kube-proxy 升级后） | v3.5.19 | v1.35 | v1.35 | v1.35 | **v1.35** | ✅ 全部一致，无偏差 |
+| T0（升级前） | v3.5.18 | v1.34 | v1.34 | v1.34 | v1.34 | ✅ 全部一致 |
+| T1（etcd manifest 替换后） | **v3.5.19** | v1.34 | v1.34 | v1.34 | v1.34 | ✅ etcd 版本独立，不影响 K8s 组件偏差 |
+
+**阶段二：`EnsureMasterUpgrade` / `upgradeControlPlane()` 执行期间**
+
+| 时刻 | etcd | apiserver | cm/scheduler | kubelet | kube-proxy | 偏差状态分析 |
+|------|------|-----------|-------------|---------|------------|-------------|
+| T2（prepareUpgrade 完成后） | v3.5.19 | v1.34 | v1.34 | v1.34 | v1.34 | ✅ 无偏差（仅备份和预拉镜像） |
+| T3（apiserver manifest 替换 + Ready 后） | v3.5.19 | **v1.35** | v1.34 | v1.34 | v1.34 | ✅ cm(1.34) vs apiserver(1.35) = 1 偏差（允许滞后 1）；kubelet(1.34) vs apiserver(1.35) = 1 偏差（允许滞后 3）；kube-proxy(1.34) vs apiserver(1.35) = 1 偏差（允许滞后 3） |
+| T4（cm manifest 替换 + Ready 后） | v3.5.19 | v1.35 | **v1.35** | v1.34 | v1.34 | ✅ kubelet(1.34) vs apiserver(1.35) = 1 偏差（允许滞后 3）；kube-proxy(1.34) vs apiserver(1.35) = 1 偏差（允许滞后 3） |
+| T5（scheduler manifest 替换 + Ready 后） | v3.5.19 | v1.35 | v1.35 | v1.34 | v1.34 | ✅ 同 T4（scheduler 已与 cm 一致） |
+| T6（kubelet 二进制替换后） | v3.5.19 | v1.35 | v1.35 | **v1.35** | v1.34 | ✅ kube-proxy(1.34) vs apiserver(1.35) = 1 偏差（允许滞后 3） |
+| T7（kubectl 二进制安装后） | v3.5.19 | v1.35 | v1.35 | v1.35 | v1.34 | ✅ 同 T6（kubectl 不影响偏差） |
+
+**阶段三：`updateAddonVersions()` 执行期间**
+
+| 时刻 | etcd | apiserver | cm/scheduler | kubelet | kube-proxy | 偏差状态分析 |
+|------|------|-----------|-------------|---------|------------|-------------|
+| T8（kube-proxy 版本同步后） | v3.5.19 | v1.35 | v1.35 | v1.35 | **v1.35** | ✅ 全部一致，无偏差 |
 
 **分析结论**：
 
 | 偏差规则 | 单节点升级期间是否满足 | 说明 |
 |---------|---------------------|------|
-| kubelet ≤ apiserver（允许滞后 3） | ✅ 满足 | kubelet 始终 ≤ apiserver（kubelet 在 apiserver 之后升级），最大偏差 1（远小于允许的 3） |
+| kubelet ≤ apiserver（允许滞后 3） | ✅ 满足 | kubelet 在 apiserver 之后升级（T3→T6），最大偏差 1（远小于允许的 3） |
 | kube-proxy ≤ apiserver（允许滞后 3） | ✅ 满足 | kube-proxy 在 apiserver 之后由 `updateAddonVersions()` 同步升级，最大偏差 1（远小于允许的 3） |
-| cm/scheduler ≤ apiserver（允许滞后 1） | ✅ 满足 | kubeadm 在 apiserver 后立即升级 cm/scheduler，最大偏差 1（正好等于允许的 1） |
-| etcd 与 apiserver 配套 | ✅ 满足 | kubeadm 先升级 etcd 再升级 apiserver |
+| cm/scheduler ≤ apiserver（允许滞后 1） | ✅ 满足 | kubeadm 在 apiserver 后逐个升级 cm/scheduler（T3→T4→T5），最大偏差 1（正好等于允许的极限 1） |
+| etcd 与 apiserver 配套 | ✅ 满足 | etcd 在独立的 `EnsureEtcdUpgrade` Phase 中先升级，`EnsureMasterUpgrade` 执行时 etcd 已就绪 |
 
-#### 2.8.2 多节点 Master 集群的偏差状态
+#### 2.8.4 多节点 Master 集群的偏差状态
 
-对于多 Master 节点集群，`EnsureMasterUpgrade` 逐节点滚动升级（阻塞式），各节点版本如下：
+对于多 Master 节点集群，`EnsureEtcdUpgrade` 和 `EnsureMasterUpgrade` 分别逐节点滚动升级（阻塞式），各节点版本如下：
 
 | 阶段 | node-1 apiserver | node-2 apiserver | node-1 kubelet | node-2 kubelet | 偏差状态分析 |
 |------|-----------------|-----------------|----------------|----------------|-------------|
 | 升级前 | v1.34 | v1.34 | v1.34 | v1.34 | ✅ 一致 |
-| node-1 升级完成 | **v1.35** | v1.34 | **v1.35** | v1.34 | ✅ kubelet(1.34) vs apiserver(1.35) 在 node-2 上 = 1 偏差（node-2 的 apiserver 仍是 1.34，kubelet 也是 1.34，自身无偏差） |
-| node-2 升级完成 | v1.35 | **v1.35** | v1.35 | **v1.35** | ✅ 一致 |
+| node-1 EnsureEtcdUpgrade 完成 | v1.34 | v1.34 | v1.34 | v1.34 | ✅ etcd 升级不影响 K8s 组件版本 |
+| node-1 EnsureMasterUpgrade 完成 | **v1.35** | v1.34 | **v1.35** | v1.34 | ✅ HA 中 apiserver 实例间偏差 1（允许 1）；node-2 的 kubelet(1.34) vs apiserver(1.34) = 0 偏差（自身无偏差） |
+| node-2 EnsureEtcdUpgrade 完成 | v1.35 | v1.34 | v1.35 | v1.34 | ✅ 同上 |
+| node-2 EnsureMasterUpgrade 完成 | v1.35 | **v1.35** | v1.35 | **v1.35** | ✅ 全部一致 |
 
-**分析结论**：多节点滚动升级期间，**单个节点内的偏差**由 kubeadm 内部管理（见 2.8.1），**跨节点偏差**通过逐节点升级保证安全。但在 node-1 完成而 node-2 未完成时，**集群存在两个版本的 apiserver**（HA 场景下可接受，因为 apiserver 向后兼容 1 个小版本）。
+**分析结论**：多节点滚动升级期间，**单个节点内的偏差**由 `upgradeControlPlane()` 内部逐组件升级管理（见 2.8.3），**跨节点偏差**通过逐节点升级保证安全。在 node-1 完成而 node-2 未完成时，集群存在两个版本的 apiserver（HA 场景下可接受，官方允许 apiserver 实例间最多偏差 1 个小版本）。
 
-#### 2.8.3 多 hop 升级的偏差问题
+#### 2.8.5 多 hop 升级的偏差问题
 
-**关键问题：kubeadm 无法支持多 hop 延迟升级 kubelet 的策略。**
+**关键问题：`upgradeControlPlane()` 强制升级 kubelet，无法支持多 hop 延迟升级策略。**
 
-kubeadm `upgrade apply` 在单节点上**强制升级 kubelet**，无法跳过。这意味着：
+`upgradeControlPlane()` 的 step 3 固定执行 `installKubeletCommand(false)`，kubelet 二进制在每个 hop 中被强制替换，无法跳过：
+
+```go
+// step 5 upgrade kubelet  ← 固定步骤，无法跳过
+log.Infof("upgrade kubelet for cluster %s", k.clusterName)
+if err := k.installKubeletCommand(false); err != nil {
+    return err
+}
+```
+
+这意味着：
 
 ```
-当前 kubeadm 行为（无法延迟 kubelet）:
+当前 BKE 行为（无法延迟 kubelet）:
 
-Hop 1: K8s v1.34 → v1.35
-  └─ kubeadm upgrade apply v1.35
+Hop 1: EnsureEtcdUpgrade + EnsureMasterUpgrade
+  └─ upgradeControlPlane():
      ├─ apiserver: v1.34 → v1.35  ✓
      ├─ cm/scheduler: v1.34 → v1.35  ✓
      ├─ kubelet: v1.34 → v1.35  ← 强制升级，无法延迟
-     └─ kube-proxy: v1.34 → v1.35  ✓
+     └─ kubectl: v1.34 → v1.35  ✓
 
   偏差状态: kubelet(1.35) vs apiserver(1.35) = 0 偏差
 
-Hop 2: K8s v1.35 → v1.36
-  └─ kubeadm upgrade apply v1.36
+Hop 2: EnsureEtcdUpgrade + EnsureMasterUpgrade
+  └─ upgradeControlPlane():
      ├─ apiserver: v1.35 → v1.36  ✓
      ├─ cm/scheduler: v1.35 → v1.36  ✓
      ├─ kubelet: v1.35 → v1.36  ← 强制升级，无法延迟
-     └─ kube-proxy: v1.35 → v1.36  ✓
+     └─ kubectl: v1.35 → v1.36  ✓
 
   偏差状态: kubelet(1.36) vs apiserver(1.36) = 0 偏差
 ```
 
-| 对比维度 | kubeadm 当前行为 | K8s 偏差规则允许的 | 差距 |
-|---------|-----------------|------------------|------|
-| kubelet 升级时机 | 与 apiserver 同步升级 | 可滞后 apiserver 最多 3 个小版本（v1.25+） | kubeadm 无法利用偏差窗口延迟 kubelet |
-| kubelet drain 次数 | 每个 hop 都 drain 所有节点 | 理论上可 3 个 hop drain 一次（利用偏差窗口） | 大集群 drain 次数最多增加 3 倍 |
-| 控制面升级速度 | 被 kubelet drain 阻塞 | 控制面可先升级，kubelet 后续批量 | 大集群控制面升级被延迟 |
+| 对比维度 | BKE 当前行为 | K8s 偏差规则允许的 | 差距 |
+|---------|-------------|------------------|------|
+| kubelet 升级时机 | 与 apiserver 同步升级（`upgradeControlPlane` 内固定步骤） | 可滞后 apiserver 最多 3 个小版本（v1.25+） | 无法利用偏差窗口延迟 kubelet |
+| kubelet drain 次数 | 每个 hop 都 drain 所有节点（kubelet 在 control plane 升级中） | 理论上可 3 个 hop drain 一次（利用偏差窗口） | 大集群 drain 次数最多增加 3 倍 |
+| 控制面升级速度 | 被 kubelet 二进制替换阻塞（在 cm/scheduler 之后执行） | 控制面可先升级，kubelet 后续批量 | 大集群控制面升级被延迟 |
 
-#### 2.8.4 结论
+#### 2.8.6 结论
 
-| 维度 | kubeadm 现有实现 | K8s 偏差规则要求 | 符合性 |
-|------|-----------------|-----------------|--------|
-| **单节点升级期间偏差** | cm/scheduler 短暂落后 apiserver（秒级窗口） | cm/scheduler 最多落后 apiserver 1 个小版本 | ⚠️ 短暂违反但可接受（kubeadm 内部快速完成） |
-| **kube-proxy 同步** | apiserver 升级后 kube-proxy 在 `updateAddonVersions()` 中同步 | kube-proxy 最多落后 apiserver 3 个小版本 | ✅ 满足（且实际同步后无偏差） |
-| **多 hop kubelet 延迟** | 不支持，kubelet 每个 hop 强制升级 | 允许最多滞后 3 个小版本（v1.25+） | ❌ **无法利用 3 版本偏差窗口优化大集群升级** |
-| **跨节点偏差** | 逐节点滚动升级，集群短暂存在两个版本 | HA 中 apiserver 实例间最多 1 个小版本偏差 | ✅ 满足 |
-| **etcd 版本配套** | kubeadm 先升级 etcd 再升级 apiserver | 每 K8s 版本有推荐 etcd 版本 | ✅ 满足 |
+| 维度 | BKE 现有实现 | K8s 偏差规则要求 | 符合性 |
+|------|-------------|-----------------|--------|
+| **单节点升级期间偏差** | cm/scheduler 短暂落后 apiserver（T3→T4 窗口） | cm/scheduler 最多落后 apiserver 1 个小版本 | ✅ 满足（最大偏差 1，正好等于允许的极限） |
+| **kube-proxy 同步** | apiserver 升级后 kube-proxy 在 `updateAddonVersions()` 中同步 | kube-proxy 最多落后 apiserver 3 个小版本 | ✅ 满足（最大偏差 1，远小于允许的 3） |
+| **kubelet 同步** | kubelet 在 cm/scheduler 之后、在 `upgradeControlPlane` 内升级 | kubelet 最多落后 apiserver 3 个小版本 | ✅ 满足（最大偏差 1，远小于允许的 3） |
+| **etcd 升级** | etcd 由独立 `EnsureEtcdUpgrade` Phase 先升级 | 每 K8s 版本有推荐 etcd 版本 | ✅ 满足（etcd 先于 apiserver 升级） |
+| **多 hop kubelet 延迟** | 不支持，`upgradeControlPlane` 内 kubelet 固定升级 | 允许最多滞后 3 个小版本（v1.25+） | ❌ **无法利用 3 版本偏差窗口优化大集群升级** |
+| **跨节点偏差** | 逐节点滚动升级，集群短暂存在两个版本 apiserver | HA 中 apiserver 实例间最多 1 个小版本偏差 | ✅ 满足 |
 
-**总结**：kubeadm 的单节点升级**基本满足**偏差规则（短暂窗口违反在实际中可接受），但**无法利用 K8s 允许的版本偏差窗口**（kubelet 可滞后 apiserver 最多 3 个小版本）来优化多 hop 升级的 kubelet drain 效率。这正是 KEP-14 要解决的核心问题：**拆解 kubeadm 黑盒，实现 kubelet 延迟升级**。
+**总结**：BKE 的单节点升级**完全满足**偏差规则（所有组件偏差均在允许范围内），但 `upgradeControlPlane()` 内 kubelet 是固定步骤无法跳过，**无法利用 K8s 允许的 3 版本偏差窗口**来优化多 hop 升级的 kubelet drain 效率。这正是 KEP-14 要解决的核心问题：**拆解 `upgradeControlPlane` 黑盒，将 kubelet 升级从控制面升级中分离，实现延迟升级**。
 
 | 追踪字段 | 位置 | 说明 |
 |---------|------|------|
