@@ -402,17 +402,82 @@ EnsureEtcdUpgrade Phase (独立执行，在 EnsureMasterUpgrade 之前):
   └─ upgradeEtcd():
      ├─ prepareUpgrade: 备份 etcd + 预拉镜像
      ├─ 替换 etcd Static Pod manifest
-     └─ 等待 etcd Pod Ready
+     │   └─ Kubelet 检测文件变化 → 终止旧 Pod → 创建新 Pod
+     └─ 等待 etcd Pod Running + Ready
 
 EnsureMasterUpgrade Phase:
   └─ upgradeControlPlane():
      ├─ prepareUpgrade: 备份 etcd（如果 backUpEtcd=true）+ 备份集群配置 + 预拉镜像
-     ├─ kube-apiserver: 替换 manifest → 等待 Ready
-     ├─ kube-controller-manager: 替换 manifest → 等待 Ready
-     ├─ kube-scheduler: 替换 manifest → 等待 Ready
-     ├─ kubelet: 下载二进制 + 安装（非 manifest 替换，而是二进制替换）
+     │
+     ├─ kube-apiserver: 替换 manifest
+     │   ├─ 写入新 manifest YAML（新镜像版本 tag）到 /etc/kubernetes/manifests/
+     │   ├─ Kubelet 通过 inotify 检测到文件变化
+     │   ├─ Kubelet 计算 Pod Hash（新 manifest hash ≠ 旧 Pod hash）
+     │   ├─ Kubelet 终止旧 apiserver Pod（graceful shutdown）
+     │   ├─ Kubelet 创建新 apiserver Pod（新镜像版本）
+     │   └─ waitComponentReady: 等待新 Pod Running + Ready
+     │      ↑ apiserver 在此步骤完成升级，此时 kubelet 尚未重启
+     │
+     ├─ kube-controller-manager: 替换 manifest → 同上流程
+     ├─ kube-scheduler: 替换 manifest → 同上流程
+     │
+     ├─ kubelet: 下载二进制 + 安装
+     │   ├─ installKubeletCommand: 下载 kubelet 二进制 + 替换
+     │   └─ systemctl restart kubelet（重启 kubelet 进程）
+     │      ↑ kubelet 重启时：
+     │        - apiserver Pod 已在运行（新版本，Hash 匹配）→ 不重启
+     │        - cm Pod 已在运行（新版本，Hash 匹配）→ 不重启
+     │        - scheduler Pod 已在运行（新版本，Hash 匹配）→ 不重启
+     │        （kubelet 重启仅检查 manifest Hash 是否匹配，已匹配的 Pod 跳过）
+     │
      └─ kubectl: 下载二进制 + 安装
 ```
+
+#### 2.8.2a Static Pod manifest 替换的生效机制
+
+**问题：替换 manifest 后立即生效吗？kubelet 重启时 apiserver 会再重启一次吗？**
+
+**回答：替换 manifest 后立即生效，kubelet 重启时不会重复重启 apiserver。**
+
+Static Pod 由 Kubelet 直接管理，Kubelet 通过 inotify 监控 `/etc/kubernetes/manifests/` 目录，检测到文件变化后自动重建 Pod：
+
+```
+manifest 替换后的完整生效过程:
+
+1. upgradeControlPlaneManifestCommand(kube-apiserver)
+   └─ 写入新 manifest YAML（新镜像 tag）到 /etc/kubernetes/manifests/kube-apiserver.yaml
+
+2. Kubelet 检测到文件变化（inotify 监控 manifests 目录）
+   ├─ 计算新 Pod Hash（manifest 内容的 hash）
+   ├─ 发现 Hash 变化（旧 Pod hash ≠ 新 manifest hash）
+   ├─ 终止旧 Pod（graceful shutdown，等待 terminationGracePeriodSeconds）
+   └─ 创建新 Pod（使用新镜像版本）
+
+3. waitComponentReady(kube-apiserver, oldPodHash)
+   └─ 轮询等待：
+      ├─ Pod Hash 已变化（确认 Kubelet 重建了 Pod）
+      ├─ 新 Pod 状态 = Running
+      └─ 新 Pod Ready 条件 = True
+```
+
+**kubelet 重启时的 Static Pod 行为**：
+
+```
+kubelet 重启（systemctl restart kubelet）时:
+  1. 扫描 /etc/kubernetes/manifests/ 目录
+  2. 对每个 manifest 文件:
+     ├─ 如果对应 Pod 已在运行且 Hash 匹配 → 跳过（不重启）
+     └─ 如果 Pod 不存在或 Hash 不匹配 → 创建 Pod
+  3. 如果 manifest 文件已删除 → 终止对应 Pod
+```
+
+**结论**：
+
+| 问题 | 答案 | 说明 |
+|------|------|------|
+| 替换 manifest 后立即生效吗？ | **是** | Kubelet 通过 inotify 监控 manifests 目录，检测到变化后自动终止旧 Pod → 创建新 Pod |
+| kubelet 重启时 apiserver 会再重启一次吗？ | **不会** | kubelet 重启时检查 manifest Hash，已匹配的 Pod 跳过，不重复创建 |
+| apiserver 和 kubelet 谁先升级？ | **apiserver 先** | apiserver 在 manifest 替换步骤升级（Kubelet 自动重建 Pod），kubelet 在后续步骤升级（二进制替换 + systemctl restart） |
 
 #### 2.8.3 单节点升级期间的偏差状态
 
