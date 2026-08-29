@@ -1227,6 +1227,11 @@ func (r *ClusterVersionReconciler) orchestrateFullUpgrade(
     }
     
     // 最终偏差验证
+    // 作用：在所有 Hop 和 kubelet 补充升级完成后，确认所有 K8s 核心组件的版本偏差
+    //       都满足 K8s 官方约束。这是防御性兜底检查，确保：
+    //   1. 覆盖全部 6 个 K8s 核心组件（Hop 间门控仅检查 kubelet vs apiserver）
+    //   2. 确认中间步骤无遗漏或状态不一致
+    //   3. 成本极低（一次内存计算），收益是确保万无一失
     vc := r.getCurrentVersionContext(bkeCluster)
     ok, violations := skewChecker.CheckSkew(vc, upgrade.K8sSkewConstraints)
     if !ok {
