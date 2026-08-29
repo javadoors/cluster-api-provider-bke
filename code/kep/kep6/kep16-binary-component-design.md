@@ -14,10 +14,10 @@
    - 3.1 ComponentVersion 类型定义
    - 3.2 Binary 类型字段定义
    - 3.3 YAML 类型字段定义
-   - 3.5 Inline 类型字段定义
-   - 3.6 Selector 类型字段定义
-   - 3.7 CRD YAML 定义
-   - 3.8 CRD 版本迁移设计
+   - 3.4 Inline 类型字段定义
+   - 3.5 Selector 类型字段定义
+   - 3.6 CRD YAML 定义
+   - 3.7 CRD 版本迁移设计
 4. [BinaryInstaller 详细设计](#4-binaryinstaller-详细设计)
    - 4.1 核心组件架构
    - 4.2 BinaryInstaller 执行流程图
@@ -25,57 +25,57 @@
    - 4.4 Binary Uninstall 流程
    - 4.5 ConfigRenderer 详细设计 (含三种渲染模式)
    - 4.6 ConfigTemplateSpec forEach 动态多文件生成
-6. [YamlInstaller 详细设计](#6-yamlinstaller-详细设计)
-   - 6.1 核心组件架构
-   - 6.2 YamlInstaller 执行流程图
-   - 6.3 核心接口定义
-   - 6.4 清单下载与缓存
-   - 6.5 健康检查
-   - 6.6 YAML Uninstall 流程
-7. [HealthCheck 共享包设计](#7-healthcheck-共享包设计)
-   - 7.1 类型定义
-8. [模板变量系统与 TemplateContext 详细设计](#8-模板变量系统与-templatecontext-详细设计)
-   - 8.0 TemplateContext 扩展策略
-   - 8.1 模板变量系统
-   - 8.2 模板渲染流程图
-   - 8.3 TemplateContext 构建流程
-   - 8.4 自定义函数定义
-9. [DAG 集成详细设计](#9-dag-集成详细设计)
-   - 9.1 执行器注册
-   - 9.2 ComponentVersionStore
-   - 9.3 DAG 构建与执行流程
-   - 9.4 核心接口定义
-   - 9.5 状态模型、幂等性与兼容性设计
-10. [完整安装流程详细设计](#10-完整安装流程详细设计)
-    - 10.1 安装流程图
-11. [完整升级流程详细设计](#11-完整升级流程详细设计)
-    - 11.1 升级流程图
-12. [迁移策略详细设计](#12-迁移策略详细设计)
-    - 12.1 迁移流程图
-    - 12.2 Feature Gate 设计
-    - 12.3 容器运行时重构详细设计
-      - 12.3.1 概述
-      - 12.3.2 Selector 类型：容器运行时互斥选择
-      - 12.3.3 Selector 依赖处理
-      - 12.3.4 containerd 重构
-      - 12.3.5 Docker + cri-dockerd 重构
-      - 12.3.6 EnsureNodesEnv 重构设计
-    - 12.4 bkeagent 重构详细设计
-    - 12.5 BKEAgentSwitch 独立组件设计
-    - 12.6 迁移验证清单
-13. [错误处理与恢复](#13-错误处理与恢复)
-    - 13.1 错误处理流程图
-14. [测试设计](#14-测试设计)
-    - 14.1 单元测试
-    - 14.2 集成测试
-    - 14.3 E2E 测试
-15. [工作量与任务拆解](#15-工作量与任务拆解)
-    - 15.1 工作量评估
-    - 15.2 Sprint 计划
-    - 15.3 里程碑
-16. [附录](#16-附录)
-    - 16.1 参考文档
-    - 16.2 术语表
+5. [YamlInstaller 详细设计](#5-yamlinstaller-详细设计)
+   - 5.1 核心组件架构
+   - 5.2 YamlInstaller 执行流程图
+   - 5.3 核心接口定义
+   - 5.4 清单下载与缓存
+   - 5.5 健康检查
+   - 5.6 YAML Uninstall 流程
+6. [HealthCheck 共享包设计](#6-healthcheck-共享包设计)
+   - 6.1 类型定义
+7. [模板变量系统与 TemplateContext 详细设计](#7-模板变量系统与-templatecontext-详细设计)
+   - 7.0 TemplateContext 扩展策略
+   - 7.1 模板变量系统
+   - 7.2 模板渲染流程图
+   - 7.3 TemplateContext 构建流程
+   - 7.4 自定义函数定义
+8. [DAG 集成详细设计](#8-dag-集成详细设计)
+   - 8.1 执行器注册
+   - 8.2 ComponentVersionStore
+   - 8.3 DAG 构建与执行流程
+   - 8.4 核心接口定义
+   - 8.5 状态模型、幂等性与兼容性设计
+9. [完整安装流程详细设计](#9-完整安装流程详细设计)
+   - 9.1 安装流程图
+10. [完整升级流程详细设计](#10-完整升级流程详细设计)
+   - 10.1 升级流程图
+11. [迁移策略详细设计](#11-迁移策略详细设计)
+   - 11.1 迁移流程图
+   - 11.2 Feature Gate 设计
+   - 11.3 容器运行时重构详细设计
+      - 11.3.1 概述
+      - 11.3.2 Selector 类型：容器运行时互斥选择
+      - 11.3.3 Selector 依赖处理
+      - 11.3.4 containerd 重构
+      - 11.3.5 Docker + cri-dockerd 重构
+      - 11.3.6 EnsureNodesEnv 重构设计
+   - 11.4 bkeagent 重构详细设计
+   - 11.5 BKEAgentSwitch 独立组件设计
+   - 11.6 迁移验证清单
+12. [错误处理与恢复](#12-错误处理与恢复)
+   - 12.1 错误处理流程图
+13. [测试设计](#13-测试设计)
+   - 13.1 单元测试
+   - 13.2 集成测试
+   - 13.3 E2E 测试
+14. [工作量与任务拆解](#14-工作量与任务拆解)
+   - 14.1 工作量评估
+   - 14.2 Sprint 计划
+   - 14.3 里程碑
+15. [附录](#15-附录)
+   - 15.1 参考文档
+   - 15.2 术语表
 
 ## 1. 概述
 
@@ -141,6 +141,20 @@
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │                         bke-manifests (ComponentVersion)                        │
 │                                                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────────┐    │
+│  │ containerd/v1.7.18/component.yaml          ← type: binary               │    │
+│  │   ├── binary.artifacts: [containerd]                                    │    │
+│  │   ├── binary.configTemplates: [config.toml, service]                    │    │
+│  │   └── binary.installScript: (带 50+ 模板变量)                            │    │
+│  └─────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────────┐    │
+│  │ bkeagent/v2.6.0/component.yaml             ← type: binary               │    │
+│  │   ├── binary.artifacts: [bkeagent]                                      │    │
+│  │   ├── binary.configTemplates: [bkeagent.conf, kubeconfig]               │    │
+│  │   └── binary.installScript: (带完整模板变量)                             │    │
+│  └─────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                 │
 └────────────────────────────────┬────────────────────────────────────────────────┘
                                  │
                                  ▼
@@ -150,6 +164,2456 @@
 │  ┌─────────────────────────────────────────────────────────────────────────┐    │
 │  │                        Component Executor Factory                       │    │
 │  │                                                                         │    │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌────────────┐   │    │
+│  │  │   Binary     │   Inline     │  │   YAML     │   │    │
+│  │  │  Component   │  │   Component  │  │   Component  │  │  Component │   │    │
+│  │  │  Executor    │  │   Executor   │  │   Executor   │  │  Executor  │   │    │
+│  │  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └─────┬──────┘   │    │
+│  │         │                 │                 │                │          │    │
+│  └─────────┼─────────────────┼─────────────────┼────────────────┼──────────┘    │
+│            │                 │                 │                │               │
+│            ▼                 ▼                 ▼                ▼               │
+│  ┌─────────────────────────────────────────────────────────────────────────┐    │
+│  │                          Installer Layer                                │    │
+│  │                                                                         │    │
+│  │  ┌─────────────────────────────────────────────────────────────────┐    │    │
+│  │  │                      BinaryInstaller                            │    │    │
+│  │  │  ┌────────────────┐  ┌────────────────┐  ┌─────────────────┐    │    │    │
+│  │  │  │   Artifact     │  │   Script       │  │    Config       │    │    │    │
+│  │  │  │  Downloader    │  │   Renderer     │  │   Renderer      │    │    │    │
+│  │  │  └────────┬───────┘  └────────┬───────┘  └────────┬────────┘    │    │    │
+│  │  │           │                   │                   │             │    │    │
+│  │  │           └───────────────────┼───────────────────┘             │    │    │
+│  │  │                               ▼                                 │    │    │
+│  │  │                      ┌────────────────┐                         │    │    │
+│  │  │                      │  SSH Executor  │                         │    │    │
+│  │  │                      └────────────────┘                         │    │    │
+│  │  │  ┌─────────────────────────────────────────────────────────┐    │    │    │
+│  │  │  │              HealthChecker (SSH 脚本执行)                │    │    │    │
+│  │  │  └─────────────────────────────────────────────────────────┘    │    │    │
+│  │  └─────────────────────────────────────────────────────────────────┘    │    │
+│  │                                                                         │    │
+│  │  ┌─────────────────────────────────────────────────────────────────┐    │    │
+│  │  │                     YamlInstaller                               │    │    │
+│  │  │  ┌────────────────┐  ┌────────────────┐  ┌─────────────────┐    │    │    │
+│  │  │  │ManifestDownload│  │  YAML Parser   │  │  K8s Client     │    │    │    │
+│  │  │  │(清单获取/缓存)  │  │  (解析/分组)    │  │  (Apply/Delete) │    │    │    │
+│  │  │  └────────────────┘  └────────────────┘  └─────────────────┘    │    │    │
+│  │  │  ┌─────────────────────────────────────────────────────────┐    │    │    │
+│  │  │  │              HealthChecker (Pod/Endpoint/Custom)        │    │    │    │
+│  │  │  └─────────────────────────────────────────────────────────┘    │    │    │
+│  │  └─────────────────────────────────────────────────────────────────┘    │    │
+│  │                                                                         │    │
+│  └─────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 组件交互关系
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                              组件交互关系图                                      │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+                    ┌──────────────────┐
+                    │  BKECluster      │
+                    │  Reconciler      │
+                    └────────┬─────────┘
+                             │
+                             │ 1. 解析 ReleaseImage
+                             ▼
+                    ┌──────────────────┐
+                    │  ReleaseImage    │
+                    │  Parser          │
+                    └────────┬─────────┘
+                             │
+                             │ 2. 加载 ComponentVersion
+                             ▼
+                    ┌──────────────────┐
+                    │  ManifestStore   │
+                    └────────┬─────────┘
+                             │
+                             │ 3. 构建 DAG
+                             ▼
+                    ┌──────────────────┐
+                    │  DAG Builder     │
+                    └────────┬─────────┘
+                             │
+                             │ 4. 调度执行
+                             ▼
+                    ┌──────────────────┐
+                    │  DAG Scheduler   │
+                    └────────┬─────────┘
+                             │
+               ┌─────────────┼──────────────┌──────────────┐
+               │             │              │              │
+               ▼             ▼              ▼              ▼
+       ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+       │   Binary     │  │   Inline     │ │    YAML      │
+       │  Component   │ │   Component  │ │   Component  │ │   Component  │
+       │  Executor    │ │   Executor   │ │   Executor   │ │   Executor   │
+       └──────┬───────┘ └──────┬───────┘ └──────┬───────┘ └──────┬───────┘
+              │                │                │                │
+              ▼                ▼                ▼                ▼
+      ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+      │   Binary     │ │  Component   │ │    Yaml      │
+      │  Installer   │ │  Installer   │ │  Factory     │ │  Installer   │
+      └──────┬───────┘ └──────┬───────┘ └──────┬───────┘ └──────┬───────┘
+             │                │                │                │
+             ▼                ▼                ▼                ▼
+     ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+     │  SSH Client  │ │ Phase        │ │ K8s Client   │
+     │  (bkessh)    │ │ Execute()    │ │ (Apply)      │
+     └──────────────┘ └──────────────┘ └──────────────┘ └──────────────┘
+```
+
+## 3. ComponentVersion CRD 详细设计
+
+### 3.1 ComponentVersion 类型定义
+
+> **复用说明**：现有 `api/v1alpha1/componentversion_types.go` 已定义 `ComponentVersionSpec`/`ComponentType`/`InlineSpec`/`SubComponent`/`CompatibilitySpec`/`Constraint`/`Dependency`/`UpgradeStrategySpec`/`ResourceSpec` 等类型。本节中这些类型为**复用现有**（仅新增 `Binary`/`YAML` 三个字段及对应 `*Spec` 类型），下文以「✅复用」「🆕新增」标注。路径修正：原设计写 `pkg/api/v1alpha1/...` 有误，实际为 `api/v1alpha1/...`（无 `pkg/` 前缀）。
+
+```go
+// api/v1alpha1/componentversion_types.go
+
+// ComponentVersionSpec 定义组件版本规格 ✅复用现有，仅新增 Binary/YAML 字段
+type ComponentVersionSpec struct {
+    // 组件名称
+    Name string `json:"name"`
+    
+    // 组件类型: yaml, helm, inline, binary,selector
+    Type ComponentType `json:"type"`
+    
+    // 组件版本
+    Version string `json:"version"`
+    
+    // Binary 类型配置 (type=binary 时必填)
+    Binary *BinarySpec `json:"binary,omitempty"`
+    
+    
+    // YAML 类型配置 (type=yaml 时必填)
+    YAML *YAMLSpec `json:"yaml,omitempty"`
+    
+    // Inline 类型配置 (type=inline 时必填)
+    Inline *InlineSpec `json:"inline,omitempty"`
+    
+    // 兼容性约束
+    Compatibility CompatibilitySpec `json:"compatibility,omitempty"`
+    
+    // 依赖关系
+    Dependencies []Dependency `json:"dependencies,omitempty"`
+    
+    // 子组件列表
+    // type=yaml 时: 全包含语义, 所有子组件都会被安装
+    // type=selector 时: 互斥选择语义, DAG 构建期评估 condition 选择一个子组件
+    SubComponents []SubComponent `json:"subComponents,omitempty"`
+    
+    // 升级策略
+    UpgradeStrategy UpgradeStrategySpec `json:"upgradeStrategy,omitempty"`
+    
+    // 节点过滤策略 (仅 Binary 组件使用，安装和升级共用)
+    // YAML 组件通过 values/nodeSelector 自行处理节点调度
+    NodeFilter *NodeFilterSpec `json:"nodeFilter,omitempty"`
+    
+    // Kubernetes 资源定义列表
+    // 注意: 此字段位于顶层是历史原因——最初无独立 YAML 类型, Resources 用于所有类型
+    // 新增 YAML 类型后, 理论上应迁移至 YAMLSpec, 但为保持向后兼容暂不移动
+    // 后续版本可考虑: ① 迁移到 YAMLSpec; ② 或保持顶层但标注仅 YAML 类型生效
+    // 当前代码中 EnsurePreUpgradeResources Phase 和 YamlComponentExecutor 均使用此字段
+    Resources []ResourceSpec `json:"resources,omitempty"`
+}
+
+// ComponentType 定义组件类型 ✅复用现有 (含 binary/yaml/inline 四值) + 🆕新增 selector
+type ComponentType string
+
+const (
+    ComponentTypeYAML     ComponentType = "yaml"
+    ComponentTypeInline   ComponentType = "inline"
+    ComponentTypeBinary   ComponentType = "binary"
+    ComponentTypeSelector ComponentType = "selector" // 🆕互斥选择器: 从 subComponents 中按 condition 选择一个
+)
+
+// CompatibilitySpec 定义兼容性约束 ✅复用现有
+type CompatibilitySpec struct {
+    // 约束列表
+    Constraints []Constraint `json:"constraints,omitempty"`
+}
+
+// Constraint 定义单个兼容性约束 ✅复用现有
+type Constraint struct {
+    // 依赖组件名称
+    Component string `json:"component"`
+    
+    // 版本规则 (semver range, 如 ">=1.26.0")
+    Rule string `json:"rule"`
+}
+
+// Dependency 定义组件间依赖关系 ✅复用现有
+type Dependency struct {
+    // 依赖组件名称
+    Name string `json:"name"`
+    
+    // 依赖阶段 (Install / Upgrade)
+    Phase string `json:"phase,omitempty"`
+}
+
+// UpgradeStrategySpec 定义升级策略 ✅复用现有
+// 这是 DAG 调度层策略, 适用于所有组件类型 (binary/yaml/inline)
+// 与各类型的专属策略互补:
+// - Binary: 无专属策略, 仅使用 UpgradeStrategy
+// - YAML:  无专属策略, 仅使用 UpgradeStrategy
+// 两者的 Mode 字段含义不同:
+// - UpgradeStrategy.Mode = Rolling/Parallel/Batch (节点并发策略)
+type UpgradeStrategySpec struct {
+    // 升级模式: Rolling / Parallel / Batch (节点并发策略)
+    Mode string `json:"mode,omitempty"`
+    
+    // 批量大小 (Batch 模式下每批节点数)
+    BatchSize int `json:"batchSize,omitempty"`
+    
+    // 超时时间
+    Timeout string `json:"timeout,omitempty"`
+    
+    // 失败策略: FailFast / Continue / Rollback
+    // FailFast: 立即终止整个组件执行
+    // Continue: 记录警告, 继续执行下一个节点/批次
+    // Rollback: 回滚后继续 (Binary 执行 UninstallScript)
+    FailurePolicy string `json:"failurePolicy,omitempty"`
+}
+
+// NodeFilterSpec 定义 Binary 组件的节点过滤策略 🆕新增
+//
+// 设计思路 — 为什么放在 ComponentVersionSpec 顶层而非 UpgradeStrategySpec 内:
+// 安装和升级都需要节点过滤，不应绑定到"升级策略"语义中
+//
+// 设计思路 — 为什么仅用于 Binary 组件:
+// Binary 组件直接在节点上 SSH 执行，需要 Controller 选择目标节点
+type NodeFilterSpec struct {
+    // 目标节点角色列表
+    // 空或不填 = 所有角色
+    // 示例: ["master", "worker"], ["etcd"]
+    Roles []string `json:"roles,omitempty"`
+    
+    // 节点标签选择器
+    // 仅选择标签完全匹配的节点 (等值匹配)
+    // 示例: {"gpu": "true", "node-pool": "compute"}
+    MatchLabels map[string]string `json:"matchLabels,omitempty"`
+    
+    // 是否跳过已完成的节点 (per-node 幂等)
+    // true:  检查 NodeComponentStatuses[nodeIP].Version == target → 跳过
+    // false: 对所有节点执行，不检查 per-node 状态
+    // 默认: true (大多数场景需要幂等)
+    // 例外: bkeagent 升级设为 false (当前代码 EnsureAgentUpgrade 无过滤)
+    SkipCompleted *bool `json:"skipCompleted,omitempty"`
+    
+    // 是否排除预约添加的节点
+    // 默认: true (与当前 filterNodes 的 WithExcludeAppointmentNodes 一致)
+    ExcludeAppointment *bool `json:"excludeAppointment,omitempty"`
+}
+
+// SubComponent 定义子组件引用 ✅复用现有, 🆕新增 Condition 字段
+type SubComponent struct {
+    // 子组件名称
+    Name string `json:"name"`
+    
+    // 子组件版本
+    Version string `json:"version"`
+
+    // 🆕生成条件 (Go Template 表达式)
+    // 仅 type=selector 时使用: DAG 构建期评估, condition 为真的子组件纳入 DAG
+    // type=yaml 等其他类型时忽略此字段 (全包含语义不变)
+    // 示例: '{{.ContainerRuntimeCRI == "containerd"}}'
+    Condition string `json:"condition,omitempty"`
+}
+
+// ResourceSpec 定义 Kubernetes 资源 ✅复用现有
+//
+// 设计思路 — Data、StringData 与 Manifest 三种资源定义方式:
+//
+// ResourceSpec 支持三种方式定义 K8s 资源内容, 通过 Kind 字段分发:
+//
+// 1. Data (ConfigMap 专属): key-value 字符串, 直接作为 ConfigMap.data
+//    - 场景: 简单的配置文件, 如 bkeagent 的 logLevel/snapshotter 等参数
+//    - 优势: 结构化、可校验, 无需写完整 ConfigMap YAML
+//    - 代码: provisionConfigMap() 读取 Data 字段创建 ConfigMap 对象
+//
+// 2. StringData (Secret 专属): key-value 明文字符串, 自动转 base64 编码
+//    - 场景: Secret 中的证书、密钥等敏感数据
+//    - 优势: 用户写明文, 代码自动转 base64, 避免手动编码出错
+//    - 如果用 Manifest 方式, Secret.data 需要 base64 编码, 不友好且易错
+//    - 代码: provisionSecret() 读取 StringData, 自动转为 Secret.data (base64)
+//
+// 3. Manifest (通用): 原始 YAML 字符串, 解析为 unstructured.Unstructured 后创建
+//    - 场景: Deployment/Service/CRD 等复杂资源, 声明式字段无法表达完整定义
+//    - 优势: 支持任意 K8s 资源, 灵活性最高
+//    - 代码: provisionFromManifest() 解析 YAML 并创建资源
+//    - 额外用途: CollectComponentManifests() 收集 Manifest 作为 YAML 组件的清单
+//
+// 分发逻辑 (provisionResource):
+//   - Manifest 非空且 Kind 非 ConfigMap/Secret → 直接用 Manifest
+//   - Kind == ConfigMap → 用 Data 创建
+//   - Kind == Secret → 用 StringData 创建 (避免手动 base64)
+//   - 其他 Kind 且无 Manifest → 报错
+//
+// ConfigMap 用 Data 的原因: 与 Secret 对称设计, 且略简洁 (无需写完整 YAML)
+// Secret 用 StringData 的原因: 避免 base64 编码, 这是核心价值
+// 其他资源用 Manifest 的原因: 声明式字段无法表达完整 K8s 资源定义
+type ResourceSpec struct {
+    // 资源类型 (ConfigMap / Secret / Deployment / CRD 等)
+    Kind string `json:"kind"`
+    
+    // API 版本
+    APIVersion string `json:"apiVersion"`
+    
+    // 命名空间
+    Namespace string `json:"namespace,omitempty"`
+    
+    // 资源名称
+    Name string `json:"name"`
+    
+    // 标签 (自动注入到创建的资源中)
+    Labels map[string]string `json:"labels,omitempty"`
+    
+    // ConfigMap 数据 (Kind=ConfigMap 时使用, 直接作为 ConfigMap.data)
+    Data map[string]string `json:"data,omitempty"`
+    
+    // Secret 明文数据 (Kind=Secret 时使用, 自动转 base64 编码为 Secret.data)
+    // 核心价值: 用户写明文, 避免手动 base64 编码
+    StringData map[string]string `json:"stringData,omitempty"`
+    
+    // 原始 Manifest 内容 (通用, 任意 Kind 均可使用)
+    // ConfigMap/Secret 优先用 Data/StringData, 其他 Kind 用 Manifest
+    // 也用于 YAML 组件的清单收集 (CollectComponentManifests)
+    Manifest string `json:"manifest,omitempty"`
+}
+```
+
+### 3.2 Binary 类型字段定义
+
+```go
+// BinarySpec 定义二进制组件规格 🆕新增 (api/v1alpha1 扩展)
+type BinarySpec struct {
+    // 自定义变量 (可覆盖默认值)
+    Variables map[string]string `json:"variables,omitempty"`
+    
+    // 二进制制品列表
+    Artifacts []ArtifactSpec `json:"artifacts"`
+    
+    // 配置文件模板列表
+    ConfigTemplates []ConfigTemplateSpec `json:"configTemplates,omitempty"`
+    
+    // 安装脚本 (支持 Go template 语法)
+    InstallScript string `json:"installScript"`
+    
+    // 卸载脚本 (支持 Go template 语法)
+    UninstallScript string `json:"uninstallScript,omitempty"`
+    
+    // 支持的架构列表
+    SupportedArchitectures []string `json:"supportedArchitectures"`
+    
+    // 支持的操作系统列表
+    SupportedOS []OSSpec `json:"supportedOS"`
+    
+    // 默认配置路径 (组件级共享)
+    DefaultConfigPath string `json:"defaultConfigPath,omitempty"`
+    
+    // 默认日志路径 (组件级共享)
+    DefaultLogPath string `json:"defaultLogPath,omitempty"`
+    
+    // 默认数据路径 (组件级共享)
+    DefaultDataPath string `json:"defaultDataPath,omitempty"`
+    
+    // 健康检查配置 (安装/升级后通过 SSH 执行脚本验证服务可用性)
+    HealthCheck *BinaryHealthCheckSpec `json:"healthCheck,omitempty"`
+}
+
+// BinaryHealthCheckSpec 定义二进制组件健康检查规格
+// Binary 组件运行在远程节点上,
+// 健康检查通过 SSH 执行脚本完成, 退出码 0=健康, 非零=不健康
+type BinaryHealthCheckSpec struct {
+    // 是否启用健康检查
+    Enabled bool `json:"enabled"`
+    
+    // 等待超时时间 (默认 2m)
+    Timeout string `json:"timeout,omitempty"`
+    
+    // 重试间隔 (默认 5s)
+    Interval string `json:"interval,omitempty"`
+    
+    // 健康检查脚本 (Go template, 通过 SSH 在远程节点执行)
+    // 支持 installScript 的所有模板变量 ({{artifact.<name>.installPath}}, {{configPath}} 等)
+    // 退出码 0 = 健康, 非零 = 不健康
+    // 可组合多个检查命令, 任一失败则整体失败
+    Script string `json:"script"`
+}
+
+// ArtifactSpec 定义二进制制品规格
+type ArtifactSpec struct {
+    // 制品名称
+    Name string `json:"name"`
+    
+    // 制品 URL (支持模板变量)
+    URL string `json:"url"`
+    
+    // 制品校验和 (格式: sha256:xxx)
+    Checksum string `json:"checksum"`
+    
+    // 安装路径 (per-artifact, 不同 artifact 可安装到不同路径)
+    // 对于归档文件: 解压到此路径 (如 "/" 表示解压到根目录)
+    // 对于单文件: 复制到此路径
+    // installScript 负责所有安装细节 (chmod、移动文件、创建目录等)
+    InstallPath string `json:"installPath"`
+}
+
+// ConfigTemplateSpec 定义配置文件模板规格
+type ConfigTemplateSpec struct {
+    // 模板名称
+    Name string `json:"name"`
+    
+    // 静态目标路径 (与 PathTemplate 互斥)
+    // ForEach 为空时使用此字段指定固定路径
+    Path string `json:"path,omitempty"`
+    
+    // 动态路径模板 (Go template, 与 ForEach 配合使用)
+    // ForEach 不为空时使用此字段动态生成路径
+    // 渲染时可访问全部 TemplateContext 变量 + 迭代变量 (.Key, .Value)
+    // 示例: "{{cd "containerd" "registryConfigPath"}}/{{.Key}}/hosts.toml"
+    PathTemplate string `json:"pathTemplate,omitempty"`
+    
+    // 迭代源路径 (点分隔, 从 TemplateContext 中解析)
+    // 支持 map[string]interface{} (按 key/value 迭代) 和 []interface{} (按 index/value 迭代)
+    // 示例: "Config.Cluster.ContainerRuntime.Registry"
+    // 详见 4.5 节 forEach 机制
+    ForEach string `json:"forEach,omitempty"`
+    
+    // 文件权限 (如 "0644")
+    Mode string `json:"mode,omitempty"`
+    
+    // 文件所有者 (如 "root:root")
+    Owner string `json:"owner,omitempty"`
+    
+    // 模板内容 (Go template 语法)
+    Content string `json:"content,omitempty"`
+    
+    // Secret 引用
+    SecretRef *SecretRefSpec `json:"secretRef,omitempty"`
+    
+    // Kubeconfig 模板
+    KubeconfigTemplate *KubeconfigTemplateSpec `json:"kubeconfigTemplate,omitempty"`
+    
+    // 生成条件 (Go Template 表达式)
+    // 空 = 始终生成；渲染结果为 "false" 或空时跳过此模板（不生成文件）
+    // 示例: "{{.isOffline}}" → 离线时生成，在线时跳过
+    // 典型场景: hosts.toml 离线重定向文件——在线模式不需要公共仓库的重定向配置
+    Condition string `json:"condition,omitempty"`
+}
+
+**字段约束**：
+
+| 条件 | 说明 |
+| ------ | ------ |
+| `ForEach != ""` | `PathTemplate` 必填，`Path` 忽略，按迭代源展开为多个文件 |
+| `ForEach == ""` | `Path` 必填，`PathTemplate` 忽略（原有行为，单文件） |
+
+// SecretRefSpec 定义 Secret 引用规格
+type SecretRefSpec struct {
+    // Secret 名称
+    Name string `json:"name"`
+    
+    // Secret 命名空间 (支持模板变量)
+    Namespace string `json:"namespace"`
+    
+    // Secret 中的 key
+    Key string `json:"key"`
+}
+
+// KubeconfigTemplateSpec 定义 Kubeconfig 模板规格
+type KubeconfigTemplateSpec struct {
+    // 集群名称
+    ClusterName string `json:"clusterName"`
+    
+    // API Server 地址
+    APIServer string `json:"apiServer"`
+    
+    // CA 证书路径
+    CACertPath string `json:"caCertPath"`
+    
+    // 客户端证书路径
+    ClientCertPath string `json:"clientCertPath"`
+    
+    // 客户端密钥路径
+    ClientKeyPath string `json:"clientKeyPath"`
+    
+    // 命名空间
+    Namespace string `json:"namespace,omitempty"`
+    
+    // ServiceAccount
+    ServiceAccount string `json:"serviceAccount,omitempty"`
+}
+
+// OSSpec 定义操作系统规格
+type OSSpec struct {
+    // 操作系统名称 (centos, ubuntu)
+    Name string `json:"name"`
+    
+    // 支持的版本列表
+    Versions []string `json:"versions"`
+}
+```
+
+### 3.3 YAML 类型字段定义
+
+```go
+// YAMLSpec 定义 YAML 清单组件规格 🆕新增 (api/v1alpha1 扩展)
+type YAMLSpec struct {
+    // YAML 清单文件列表 (外部 URL 引用)
+    Manifests []ManifestRef `json:"manifests"`
+    
+    // 注意: 内联 K8s 资源定义通过 ComponentVersionSpec.Resources (顶层) 提供
+    // 后续版本可考虑将 Resources 迁移至此字段, 作为 YAML 类型的专属配置
+    // 当前为保持向后兼容, Resources 仍位于 ComponentVersionSpec 顶层
+    
+    // 部署目标命名空间
+    Namespace string `json:"namespace,omitempty"`
+    
+    // 应用策略: ServerSideApply, Replace, CreateOnly
+    ApplyStrategy string `json:"applyStrategy,omitempty"`
+    
+    // 是否启用裁剪 (按 label selector 删除不再需要的资源)
+    Prune bool `json:"prune,omitempty"`
+    
+    // 裁剪使用的标签选择器
+    PruneLabelSelector map[string]string `json:"pruneLabelSelector,omitempty"`
+    
+    // 健康检查配置 (应用清单后验证 Pod/Endpoint 就绪)
+    // 类型定义见第 6 章 HealthCheck 共享包设计 (6.1 节)
+    HealthCheck *HealthCheckSpec `json:"healthCheck,omitempty"`
+}
+
+// ManifestRef 定义 YAML 清单文件引用
+type ManifestRef struct {
+    // 清单文件 URL 或路径
+    URL string `json:"url"`
+    
+    // 校验和
+    Checksum string `json:"checksum,omitempty"`
+}
+```
+
+### 3.4 Inline 类型字段定义
+
+```go
+// InlineSpec 定义内联执行器配置 ✅复用现有 (api/v1alpha1 已定义)
+// Inline 组件通过 ComponentFactory 注册的 handler 执行, 无需制品下载/模板渲染
+// handler 名称对应 ComponentFactory.Register() 注册的 key
+type InlineSpec struct {
+    // Handler 名称 (对应 ComponentFactory 注册的 handler)
+    Handler string `json:"handler"`
+    
+    // Handler 版本
+    Version string `json:"version"`
+}
+```
+
+### 3.5 Selector 类型字段定义
+
+**设计思路 — 互斥选择器，按 type 区分 subComponents 语义**：
+
+`selector` 类型用于表达"从多个候选组件中选择一个"的场景。典型用例：容器运行时——一个集群只能安装一种容器运行时（containerd 或 docker），选择由 `BKECluster.Spec.Cluster.ContainerRuntime.CRI` 决定。
+
+`subComponents` 字段在不同 `type` 下有不同语义，由 `type` 字段天然消歧：
+
+| 维度 | type=yaml（组合） | type=selector（互斥选择） |
+| ------ | ------ | ------ |
+| subComponents 语义 | 全包含——所有子组件都安装 | 条件选一——评估 condition，为真的纳入 DAG |
+| Condition 字段 | 忽略（不评估） | 评估后选一 |
+| DAG 节点 | 父组件 + 所有子组件各自产生 DAG 节点 | 仅 condition 为真的子组件产生 DAG 节点 |
+| selector 自身 | 不适用 | 不产生 DAG 节点（纯选择器，无自身安装逻辑） |
+| 典型场景 | openfuyao-core 包含 kubernetes-master + kubernetes-worker | container-runtime 选 containerd 或 docker |
+
+selector 类型不定义专属 Spec 结构体（无 `SelectorSpec`），仅复用现有的 `SubComponent`（含 `Condition` 字段）和 `UpgradeStrategySpec`。
+
+**container-runtime ComponentVersion YAML（selector 类型）**：
+
+```yaml
+# bke-manifests/container-runtime/v1.0.0/component.yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: container-runtime-v1.0.0
+spec:
+  name: container-runtime
+  type: selector
+  version: v1.0.0
+  subComponents:
+    # containerd 运行时 (CRI=containerd 时选择)
+    - name: containerd
+      version: v1.7.18
+      condition: '{{.ContainerRuntimeCRI == "containerd"}}'
+
+    # docker 运行时 (CRI=docker 时选择)
+    - name: docker
+      version: v26.0.0
+      condition: '{{.ContainerRuntimeCRI == "docker"}}'
+
+    # cri-dockerd (CRI=docker 时选择, K8s >=1.24 必需)
+    - name: cri-dockerd
+      version: v0.3.9
+      condition: '{{.ContainerRuntimeCRI == "docker"}}'
+
+  upgradeStrategy:
+    mode: Rolling
+    batchSize: 1
+    timeout: "10m"
+    failurePolicy: FailFast
+```
+
+> **ReleaseImage 引用方式**：ReleaseImage 只引用 `container-runtime/v1.0.0`，DAG 构建期自动展开为 containerd 或 docker + cri-dockerd。无需在 ReleaseImage 中分别声明。
+
+**docker ComponentVersion YAML（binary 类型）**：
+
+> 完整的 Docker ComponentVersion YAML 定义见 **11.3.4.2 Docker ComponentVersion YAML 完整定义**。
+
+简化示例：
+
+```yaml
+# bke-manifests/docker/v26.0.0/component.yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: docker-v26.0.0
+spec:
+  name: docker
+  type: binary
+  version: v26.0.0
+
+  binary:
+    variables:
+      cgroupDriver: "systemd"
+      dataRoot: "/var/lib/docker"
+      lowLevelRuntime: "runc"
+
+    # Docker 通过包管理器安装 (非二进制下载), 无 artifacts
+    installScript: |
+      #!/bin/bash
+      # yum/apt 安装 docker-ce
+
+    configTemplates:
+      - name: daemon.json
+        path: "/etc/docker/daemon.json"
+        content: |
+          {
+            "exec-opts": ["native.cgroupdriver={{.Variables.cgroupDriver}}"],
+            "data-root": "{{.Variables.dataRoot}}"
+          }
+
+    healthCheck:
+      enabled: true
+      script: |
+        systemctl is-active docker
+
+  dependencies:
+    - name: bkeagent
+      phase: Install
+
+  upgradeStrategy:
+    mode: Rolling
+    batchSize: 1
+```
+
+> **Docker 与 containerd 的关键差异**：Docker 无 `hosts.toml`（镜像仓库配置在 `daemon.json` 的 `registry-mirrors` 中）；Docker 通过包管理器安装（无 `artifacts` 二进制下载）；Docker 需要 `cri-dockerd` 作为 CRI 适配层（K8s ≥1.24）。
+
+**cri-dockerd ComponentVersion YAML（binary 类型）**：
+
+> 完整的 cri-dockerd ComponentVersion YAML 定义见 **11.3.4.3 cri-dockerd ComponentVersion YAML 完整定义**。
+
+简化示例：
+
+```yaml
+# bke-manifests/cri-dockerd/v0.3.9/component.yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: cri-dockerd-v0.3.9
+spec:
+  name: cri-dockerd
+  type: binary
+  version: v0.3.9
+
+  binary:
+    variables:
+      sandboxImage: "{{imageRegistry}}/pause:3.9"
+
+    artifacts:
+      - name: cri-dockerd
+        url: "{{imageRegistry}}/cri-dockerd/{{version}}/cri-dockerd-{{version}}-{{arch}}"
+        installPath: "/usr/bin"
+
+    configTemplates:
+      - name: cri-dockerd.service
+        path: "/etc/systemd/system/cri-dockerd.service"
+        content: |
+          [Service]
+          ExecStart=/usr/bin/cri-dockerd --pod-infra-container-image {{.Variables.sandboxImage}}
+
+      - name: cri-dockerd.socket
+        path: "/etc/systemd/system/cri-dockerd.socket"
+        content: |
+          [Socket]
+          ListenStream=/var/run/cri-dockerd.sock
+
+    installScript: |
+      #!/bin/bash
+      install -m 0755 {{artifact.cri-dockerd.path}} /usr/bin/cri-dockerd
+
+    healthCheck:
+      enabled: true
+      script: |
+        systemctl is-active cri-dockerd
+
+  dependencies:
+    - name: docker
+      phase: Install
+
+  upgradeStrategy:
+    mode: Rolling
+    batchSize: 1
+```
+
+**Selector DAG 构建流程图**：
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                      Selector DAG 构建流程                                       │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+    ┌──────────────────────────────┐
+    │  BuildDAGFromBundle          │
+    │  遍历 ReleaseImage.components│
+    └──────────────┬───────────────┘
+                   │
+                   │ 遇到 container-runtime/v1.0.0
+                   ▼
+    ┌──────────────────────────────┐
+    │  加载 ComponentVersion       │
+    │  cv.Spec.Type == "selector"  │
+    └──────────────┬───────────────┘
+                   │
+                   ▼
+    ┌──────────────────────────────┐
+    │  读取 ContainerRuntimeCRI    │
+    │  从 ExecutionContext         │
+    │  .TemplateContext.Variables  │
+    │  ["ContainerRuntimeCRI"]     │
+    └──────────────┬───────────────┘
+                   │
+                   ▼
+    ┌──────────────────────────────┐
+    │  遍历 cv.Spec.SubComponents  │
+    │  评估每个 sub.Condition       │
+    └──────────────┬───────────────┘
+                   │
+       ┌───────────┼───────────┐
+       │           │           │
+       ▼           ▼           ▼
+  ┌──────────┐ ┌─────────┐ ┌──────────┐
+  │containerd│ │ docker  │ │cri-docker│
+  │condition │ │condition│ │condition │
+  │= true?   │ │= true?  │ │= true?   │
+  └────┬─────┘ └────┬────┘ └─────┬────┘
+       │           │             │
+  CRI=containerd CRI=docker   CRI=docker
+       │           │             │
+       ▼           ▼             ▼
+   纳入 DAG     纳入 DAG      纳入 DAG
+   (binary)    (binary)      (binary)
+      │           │             │
+      │           └──────┬──────┘
+      │                  │ 依赖关系
+      │                  ▼
+      │           docker → cri-dockerd
+      │           (DAG 依赖边)
+      │
+      ▼
+  selector 自身不产生 DAG 节点
+  (纯选择器, 无安装逻辑)
+```
+
+**与现有代码的对应关系**：
+
+| 现有代码 | selector 设计 |
+| --------- | ------------------- |
+| `init.go:789-797` `downloadContainerRuntime` switch CRI | DAG 构建器评估 subComponents.condition |
+| `CRIContainerd = "containerd"` | `condition: '{{.ContainerRuntimeCRI == "containerd"}}'` |
+| `CRIDocker = "docker"` + CRIDockerPlugin | docker + cri-dockerd 两个 ComponentVersion，condition 均匹配 docker |
+| `BKECluster.Spec.Cluster.ContainerRuntime.CRI` | `ExecutionContext.TemplateContext.Variables["ContainerRuntimeCRI"]` |
+| DockerPlugin: yum 安装 + daemon.json | docker ComponentVersion: installScript(yum) + configTemplates(daemon.json) |
+| CRIDockerPlugin: 下载二进制 + service + socket | cri-dockerd ComponentVersion: artifacts + configTemplates(service+socket) |
+
+### 3.6 CRD YAML 定义
+
+```yaml
+# config/crd/bases/config.openfuyao.cn_componentversions.yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: componentversions.config.openfuyao.cn
+spec:
+  group: config.openfuyao.cn
+  names:
+    kind: ComponentVersion
+    listKind: ComponentVersionList
+    plural: componentversions
+    singular: componentversion
+    shortNames:
+      - cv
+  scope: Namespaced
+  versions:
+    # v1alpha1: 唯一版本, 直接扩展 (storage=true)
+    # 包含 binary/yaml/selector 字段定义, 所有新字段均为 omitempty, 向后兼容
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              properties:
+                name:
+                  type: string
+                type:
+                  type: string
+                  enum: [yaml, inline, binary, selector]
+                version:
+                  type: string
+                binary:
+                  type: object
+                  properties:
+                    variables:
+                      type: object
+                      additionalProperties:
+                        type: string
+                    artifacts:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          name:
+                            type: string
+                          url:
+                            type: string
+                          checksum:
+                            type: string
+                          installPath:
+                            type: string
+                        required: [name, url, checksum, installPath]
+                    configTemplates:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          name:
+                            type: string
+                          path:
+                            type: string
+                          pathTemplate:
+                            type: string
+                          forEach:
+                            type: string
+                          mode:
+                            type: string
+                          owner:
+                            type: string
+                          content:
+                            type: string
+                          condition:
+                            type: string
+                          secretRef:
+                            type: object
+                            properties:
+                              name:
+                                type: string
+                              namespace:
+                                type: string
+                              key:
+                                type: string
+                            required: [name, namespace, key]
+                          kubeconfigTemplate:
+                            type: object
+                            properties:
+                              clusterName:
+                                type: string
+                              apiServer:
+                                type: string
+                              caCertPath:
+                                type: string
+                              clientCertPath:
+                                type: string
+                              clientKeyPath:
+                                type: string
+                              namespace:
+                                type: string
+                              serviceAccount:
+                                type: string
+                            required: [clusterName, apiServer, caCertPath, clientCertPath, clientKeyPath]
+                        required: [name]
+                    installScript:
+                      type: string
+                    uninstallScript:
+                      type: string
+                    supportedArchitectures:
+                      type: array
+                      items:
+                        type: string
+                    supportedOS:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          name:
+                            type: string
+                          versions:
+                            type: array
+                            items:
+                              type: string
+                        required: [name, versions]
+                    defaultConfigPath:
+                      type: string
+                    defaultLogPath:
+                      type: string
+                    defaultDataPath:
+                      type: string
+                    healthCheck:
+                      type: object
+                      properties:
+                        enabled:
+                          type: boolean
+                        timeout:
+                          type: string
+                        interval:
+                          type: string
+                        script:
+                          type: string
+                      required: [enabled, script]
+                  required: [artifacts, installScript, supportedArchitectures, supportedOS]
+                yaml:
+                  type: object
+                  properties:
+                    manifests:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          url:
+                            type: string
+                          checksum:
+                            type: string
+                        required: [url]
+                    namespace:
+                      type: string
+                    applyStrategy:
+                      type: string
+                      enum: [ServerSideApply, Replace, CreateOnly]
+                    prune:
+                      type: boolean
+                    pruneLabelSelector:
+                      type: object
+                      additionalProperties:
+                        type: string
+                    healthCheck:
+                      type: object
+                      properties:
+                        enabled:
+                          type: boolean
+                        timeout:
+                          type: string
+                        interval:
+                          type: string
+                        checks:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              type:
+                                type: string
+                              podReady:
+                                type: object
+                                properties:
+                                  namespace:
+                                    type: string
+                                  labelSelector:
+                                    type: string
+                                  minReady:
+                                    type: integer
+                                required: [namespace, labelSelector]
+                              endpointReady:
+                                type: object
+                                properties:
+                                  namespace:
+                                    type: string
+                                  serviceName:
+                                    type: string
+                                  port:
+                                    type: integer
+                                required: [namespace, serviceName]
+                              custom:
+                                type: object
+                                properties:
+                                  command:
+                                    type: string
+                                required: [command]
+                            required: [type]
+                      required: [enabled]
+                  required: [manifests]
+                inline:
+                  type: object
+                  properties:
+                    handler:
+                      type: string
+                    version:
+                      type: string
+                  required: [handler, version]
+                subComponents:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      name:
+                        type: string
+                      version:
+                        type: string
+                      condition:
+                        type: string
+                        description: "Go Template expression, evaluated at DAG build time (type=selector only)"
+                    required: [name, version]
+                compatibility:
+                  type: object
+                  properties:
+                    constraints:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          component:
+                            type: string
+                          rule:
+                            type: string
+                        required: [component, rule]
+                dependencies:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      name:
+                        type: string
+                      phase:
+                        type: string
+                    required: [name]
+                upgradeStrategy:
+                  type: object
+                  properties:
+                    mode:
+                      type: string
+                    batchSize:
+                      type: integer
+                    timeout:
+                      type: string
+                    failurePolicy:
+                      type: string
+                nodeFilter:
+                  type: object
+                  description: "Binary 组件的节点过滤策略 (安装和升级共用)"
+                  properties:
+                    roles:
+                      type: array
+                      description: "目标节点角色列表 (空或不填 = 所有角色)"
+                      items:
+                        type: string
+                    matchLabels:
+                      type: object
+                      description: "节点标签选择器 (等值匹配)"
+                      additionalProperties:
+                        type: string
+                    skipCompleted:
+                      type: boolean
+                      description: "是否跳过已完成的节点 (默认: true)"
+                    excludeAppointment:
+                      type: boolean
+                      description: "是否排除预约添加的节点 (默认: true)"
+                resources:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      kind:
+                        type: string
+                      apiVersion:
+                        type: string
+                      namespace:
+                        type: string
+                      name:
+                        type: string
+                      labels:
+                        type: object
+                        additionalProperties:
+                          type: string
+                      data:
+                        type: object
+                        additionalProperties:
+                          type: string
+                      stringData:
+                        type: object
+                        additionalProperties:
+                          type: string
+                      manifest:
+                        type: string
+                    required: [kind, apiVersion, name]
+              required: [name, type, version]
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type:
+                        type: string
+                      status:
+                        type: string
+                        enum: ["True", "False", Unknown]
+                      lastTransitionTime:
+                        type: string
+                        format: date-time
+                      reason:
+                        type: string
+                      message:
+                        type: string
+                    required: [type, status, lastTransitionTime, reason, message]
+      subresources:
+        status: {}
+```
+
+### 3.7 CRD 版本迁移设计
+
+**设计思路 - 直接扩展 v1alpha1，不引入 v1alpha2**：
+
+原设计拟新增 `api/v1alpha2/` + conversion 函数。但经审视，现有 `api/v1alpha1/componentversion_types.go` 的 `Type` 字段已支持 `yaml/inline/binary/selector` 四值（仅 enum，无 schema 定义），且所有新字段（`Binary`/`YAML`）均为 `omitempty` 指针类型，向旧数据完全兼容。引入 v1alpha2 会带来：① 双版本 conversion 维护成本；② `(*v1alpha2.InlineSpec)(src.Spec.Inline)` 等跨包指针强转的脆弱性；③ 现有引用 v1alpha1 的代码全部需评估迁移。
+
+因此**直接在 v1alpha1 上扩展**：新增 `Binary *BinarySpec`/`YAML *YAMLSpec` 两个 omitempty 字段及对应 CRD schema。旧 ComponentVersion（无这三个字段）反序列化后新字段为 nil，行为不变；新 ComponentVersion 带新字段，旧控制器忽略（omitempty）。无需 conversion，零迁移风险，最大化复用现有类型文件与 deepcopy 生成代码。
+
+**扩展内容**：
+
+| 改动位置 | 内容 |
+| --------- | ------ |
+| `api/v1alpha1/componentversion_types.go` | 新增 `BinarySpec`/`YAMLSpec`/`ArtifactSpec`/`ConfigTemplateSpec`/... 等类型；`ComponentVersionSpec` 增加 `Binary *BinarySpec`/`YAML *YAMLSpec` 字段 |
+| `api/v1alpha1/zz_generated.deepcopy.go` | 重新 `make` 生成 DeepCopy 方法 |
+| `config/crd/bases/...componentversions.yaml` | v1alpha1 schema 新增 binary/yaml/selector 字段定义（见 3.5 节） |
+
+**兼容性保证**：
+
+- 新字段全部 `omitempty` + 指针类型，旧 YAML 不填则为 nil
+- `Type` 字段 enum 已含 `binary`/`yaml`，无需改 enum
+- 旧控制器代码不读取新字段，不受影响
+- Feature Gate 关闭时即使新字段存在也不走新路径（见 11.2）
+
+**迁移步骤（简化）**：
+
+| 步骤 | 操作 | 风险 | 回滚方案 |
+| ------ | ------ | ------ | --------- |
+| 1 | 在 `api/v1alpha1/componentversion_types.go` 新增 BinarySpec/YAMLSpec 及子类型 | 无 | 删除新增类型 |
+| 2 | `ComponentVersionSpec` 增加 `Binary/YAML` 字段 + 重新生成 deepcopy | 低 | 删除字段 |
+| 3 | CRD schema 合并 binary/yaml 定义到 v1alpha1 版本 | 低 | 还原 schema |
+| 4 | 控制器按 Feature Gate 读取新字段 | 中 | 关闭 Feature Gate |
+
+**注意事项**：
+
+- 若未来字段规模膨胀确需 v1alpha2，再按标准 conversion 流程引入，此时 v1alpha1 已是稳定存储版本
+
+## 4. BinaryInstaller 详细设计
+
+### 4.1 核心组件架构
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                            BinaryInstaller                                      │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────────┐    │
+│  │                         核心组件                                         │    │
+│  │                                                                         │    │
+│  │  ┌─────────────────────────────────────────────────────────────────┐    │    │
+│  │  │                    ArtifactDownloader                           │    │    │
+│  │  │  ┌──────────────┐  ┌──────────────┐  ┌─────────────────────┐    │    │    │
+│  │  │  │  HTTP Client │  │ Cache Manager│  │ Checksum Verifier   │    │    │    │
+│  │  │  │  (下载制品)   │  │ (本地缓存)   │  │ (校验和验证)         │    │    │    │
+│  │  │  └──────────────┘  └──────────────┘  └─────────────────────┘    │    │    │
+│  │  └─────────────────────────────────────────────────────────────────┘    │    │
+│  │                                                                         │    │
+│  │  ┌─────────────────────────────────────────────────────────────────┐    │    │
+│  │  │                     TemplateRenderer                            │    │    │
+│  │  │  ┌──────────────┐  ┌──────────────┐  ┌─────────────────────┐    │    │    │
+│  │  │  │  Go Template │  │ FuncMap      │  │ Variable Resolver   │    │    │    │
+│  │  │  │  (模板解析)   │  │ (自定义函数)  │  │ (变量解析)          │    │    │    │
+│  │  │  └──────────────┘  └──────────────┘  └─────────────────────┘    │    │    │
+│  │  └─────────────────────────────────────────────────────────────────┘    │    │
+│  │                                                                         │    │
+│  │  ┌─────────────────────────────────────────────────────────────────┐    │    │
+│  │  │                      ConfigRenderer                             │    │    │
+│  │  │  ┌──────────────┐  ┌──────────────┐  ┌─────────────────────┐    │    │    │
+│  │  │  │ Content Mode │  │ Secret Mode  │  │ Kubeconfig Mode     │    │    │    │
+│  │  │  │ (模板渲染)    │  │ (Secret获取) │  │ (动态生成)           │    │    │    │
+│  │  │  └──────────────┘  └──────────────┘  └─────────────────────┘    │    │    │
+│  │  └─────────────────────────────────────────────────────────────────┘    │    │
+│  │                                                                         │    │
+│  │  ┌─────────────────────────────────────────────────────────────────┐    │    │
+│  │  │                       SSH Executor                              │    │    │
+│  │  │  ┌──────────────┐  ┌──────────────┐  ┌─────────────────────┐    │    │    │
+│  │  │  │ File Upload  │  │ Script Exec  │  │ Result Collector    │    │    │    │
+│  │  │  │ (文件上传)    │  │ (脚本执行)   │  │ (结果收集)           │    │    │    │
+│  │  │  └──────────────┘  └──────────────┘  └─────────────────────┘    │    │    │
+│  │  └─────────────────────────────────────────────────────────────────┘    │    │
+│  │                                                                         │    │
+│  │  ┌─────────────────────────────────────────────────────────────────┐    │    │
+│  │  │                     HealthChecker (SSH)                         │    │    │
+│  │  │  ┌─────────────────────────────────────────────────────┐        │    │    │
+│  │  │  │ SSH 执行健康检查脚本, 退出码 0=健康                   │        │    │    │
+│  │  │  │ (BinaryHealthCheckSpec.Script, 见 4.3)              │        │    │    │
+│  │  │  └─────────────────────────────────────────────────────┘        │    │    │
+│  │  └─────────────────────────────────────────────────────────────────┘    │    │
+│  │                                                                         │    │
+│  └─────────────────────────────────────────────────────────────────────────┘    │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 4.2 BinaryInstaller 执行流程图
+
+**设计思路**：BinaryInstaller 的执行流程分为 7 个主要步骤：解析架构、下载制品、校验 Checksum、渲染脚本、渲染配置、SSH 执行、收集结果。整个流程采用"下载-校验-渲染-执行"的管道模式，确保制品安全性和配置正确性。
+
+**关键设计点**：
+
+- **缓存机制**：制品下载后保存到本地缓存，避免重复下载
+- **Checksum 校验**：下载后立即校验，确保制品完整性
+- **模板渲染**：支持 installScript 和 configTemplates 两种模板
+- **SSH 执行**：复用现有 bkessh.MultiCli，上传制品和配置后执行脚本
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         BinaryInstaller 执行流程                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+                              ┌──────────────────┐
+                              │   Install()      │
+                              │   入口函数        │
+                              └────────┬─────────┘
+                                       │
+                                       ▼
+                     ┌──────────────────────────────────────┐
+                     │  1. 通过 SSH 发现节点架构             │
+                     │  arch = sshDiscoverArch(node.IP)     │
+                     │  (执行 uname -m, 返回 amd64/arm64)   │
+                     │                                      │
+                     │  注意: OS 不在此处获取,               │
+                     │  由 installScript 运行时自检测        │
+                     │  (通过 /etc/os-release)              │
+                     └────────────────────┬─────────────────┘
+                                          │
+                                          ▼
+                     ┌──────────────────────────────────────┐
+                     │  2. 下载二进制制品                    │
+                     │  downloadArtifacts(ctx, binary,      │
+                     │                    arch)             │
+                     └────────────────────┬─────────────────┘
+                                          │
+                     ┌────────────────────┼────────────────────┐
+                     │                    │                    │
+                     ▼                    ▼                    ▼
+           ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
+           │  检查缓存        │  │  解析 URL 模板  │  │  下载制品        │
+           │  cache.Get()    │  │  resolveTemplate│  │  downloadAnd    │
+           │                 │  │  ({{arch}}等)   │  │  Verify()       │
+           └────────┬────────┘  └────────┬────────┘  └────────┬────────┘
+                    │                    │                    │
+                    └────────────────────┼────────────────────┘
+                                         │
+                                         ▼
+                    ┌──────────────────────────────────────┐
+                    │  3. 校验 Checksum                    │
+                    │  verifyChecksum(data, expected)      │
+                    └────────────────────┬─────────────────┘
+                                         │
+                              ┌──────────┴──────────┐
+                              │                     │
+                         校验通过                校验失败
+                              │                     │
+                              ▼                     ▼
+                    ┌─────────────────┐   ┌─────────────────┐
+                    │  保存到缓存      │   │  返回错误        │
+                    │  cache.Save()   │   │  return err     │
+                    └────────┬────────┘   └─────────────────┘
+                             │
+                             ▼
+                    ┌──────────────────────────────────────┐
+                    │  4. 渲染安装脚本                      │
+                    │  renderInstallScript(script,         │
+                    │                      artifacts, opts)│
+                    └────────────────────┬─────────────────┘
+                                         │
+                                         ▼
+                    ┌──────────────────────────────────────┐
+                    │  5. 渲染配置文件模板                  │
+                    │  renderConfigTemplates(templates,    │
+                    │                       opts)          │
+                    └────────────────────┬─────────────────┘
+                                         │
+                    ┌────────────────────┼────────────────────┐
+                    │                    │                    │
+                    ▼                    ▼                    ▼
+          ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
+          │  Content 模式   │  │  Secret 模式    │  │  Kubeconfig      │
+          │  Go template    │  │  从 Secret 获取 │  │  动态生成        │
+          │  渲染           │  │  内容           │  │  kubeconfig      │
+          └────────┬────────┘  └────────┬────────┘  └────────┬────────┘
+                   │                    │                    │
+                   └────────────────────┼────────────────────┘
+                                        │
+                                        ▼
+                    ┌──────────────────────────────────────┐
+                    │  6. SSH 执行安装                      │
+                    │  executeInstall(ctx, node, script,   │
+                    │                 artifacts, configs)  │
+                    └────────────────────┬─────────────────┘
+                                         │
+                    ┌────────────────────┼────────────────────┐
+                    │                    │                    │
+                    ▼                    ▼                    ▼
+          ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
+          │  上传二进制      │  │  上传配置        │  │  执行脚本       │
+          │  ssh.Upload()   │  │  ssh.Upload()   │  │  ssh.Execute()  │
+          │  到节点         │  │  到节点          │  │                 │
+          └────────┬────────┘  └────────┬────────┘  └────────┬────────┘
+                   │                    │                    │
+                   └────────────────────┼────────────────────┘
+                                        │
+                                        ▼
+                     ┌──────────────────────────────────────┐
+                     │  7. 收集执行结果                      │
+                     │  collectResult(stdout, stderr, err)  │
+                     └────────────────────┬─────────────────┘
+                                          │
+                               ┌──────────┴──────────┐
+                               │                     │
+                          执行成功                执行失败
+                               │                     │
+                               ▼                     ▼
+                     ┌─────────────────┐   ┌─────────────────┐
+                     │  8. 健康检查     │   │  返回错误       │
+                     │  (HealthCheck   │   │  return err     │
+                     │   Enabled 时)   │   │  (含 stdout/    │
+                     │  SSH 执行脚本    │   │   stderr)       │
+                     │  退出码 0=健康   │   └─────────────────┘
+                     └────────┬────────┘
+                              │
+                     ┌────────┴────────┐
+                     │                 │
+                    检查通过        检查失败
+                     │                 │
+                     ▼                 ▼
+                     ┌─────────────────┐
+                     │  返回成功        │
+                     │  return nil     │
+                     └─────────────────┘
+```
+
+### 4.3 核心接口定义
+
+**设计思路**：BinaryInstaller 的接口设计复用现有的 `manifest.TemplateContext`，避免重复传递集群和节点信息。DAG 调度器构建的 TemplateContext 直接传递给 BinaryInstaller，BinaryInstaller 在此基础上填充制品信息。
+
+```go
+// pkg/binaryinstaller/installer.go
+
+// SSHExecutor SSH 执行抽象接口 (phaseframe-free)
+//
+// 设计思路 - 为什么不直接用 *bkessh.MultiCli:
+// 现有 bkessh.MultiCli 的 API 是面向"多主机并发"设计的:
+//   - Run(cmd Command) 在所有已注册主机上并发执行，返回聚合结果
+//   - 文件上传通过 Command.FileUp []File 携带，非独立 Upload 方法
+//   - 单主机执行在 HostRemoteClient (remotecli.go) 上，非 MultiCli
+//   - 架构发现通过 RegisterHostsInfo() + NodeArchByAddress()
+// BinaryInstaller 需要的是"单主机执行脚本 + 上传文件 + 发现架构"的简洁 API。
+// 直接依赖 *bkessh.MultiCli 会把多主机并发模型泄漏到 Installer，且无法 Mock。
+// 因此定义 SSHExecutor 接口，由 controllers 层提供 NewMultiCliSSHAdapter
+// 适配 bkessh.MultiCli/HostRemoteClient，使 BinaryInstaller 可独立测试。
+type SSHExecutor interface {
+    // Execute 在指定节点执行脚本，返回 stdout/stderr/exit code
+    Execute(ctx context.Context, nodeIP, script string) (*SSHResult, error)
+    // Upload 上传数据到指定节点的远程路径
+    Upload(ctx context.Context, nodeIP string, data []byte, remotePath string) error
+    // DiscoverArch 发现节点架构 (uname -m → amd64/arm64)
+    // 复用现有 agentssh.DiscoverArchs 逻辑 (从 phaseutil 抽取到 phaseframe-free 包)
+    DiscoverArch(ctx context.Context, nodeIP string) (string, error)
+}
+
+// SSHResult SSH 命令执行结果
+type SSHResult struct {
+    Stdout   string
+    Stderr   string
+    ExitCode int
+}
+
+// BinaryInstaller 二进制组件安装器
+type BinaryInstaller struct {
+    client         client.Client
+    sshExecutor    SSHExecutor          // 抽象接口，不再直接依赖 *bkessh.MultiCli
+    cacheDir       string
+    httpClient     *http.Client
+    cache          *ArtifactCache
+    renderer       *TemplateRenderer   // 模板渲染引擎 (含自定义函数, 无状态, 全局共享)
+    configRenderer *ConfigRenderer     // 配置文件渲染器 (需 K8s client 读取 Secret)
+    logger         *bkev1beta1.BKELogger
+}
+
+// BinaryInstallerConfig BinaryInstaller 构建配置
+type BinaryInstallerConfig struct {
+    Client         client.Client
+    SshExecutor    SSHExecutor          // 替代原 SshClient *bkessh.MultiCli
+    CacheDir       string
+    HttpClient     *http.Client
+    Renderer       *TemplateRenderer
+    ConfigRenderer *ConfigRenderer
+    Logger         *bkev1beta1.BKELogger
+}
+
+// NewBinaryInstaller 创建二进制组件安装器 (返回 error，不 panic)
+func NewBinaryInstaller(cfg BinaryInstallerConfig) (*BinaryInstaller, error) {
+    cache, err := NewArtifactCache(cfg.CacheDir)
+    if err != nil {
+        return nil, fmt.Errorf("failed to create artifact cache: %w", err)
+    }
+    return &BinaryInstaller{
+        client:         cfg.Client,
+        sshExecutor:    cfg.SshExecutor,
+        cacheDir:       cfg.CacheDir,
+        httpClient:     cfg.HttpClient,
+        cache:          cache,
+        renderer:       cfg.Renderer,
+        configRenderer: cfg.ConfigRenderer,
+        logger:         cfg.Logger,
+    }, nil
+}
+
+// ArtifactCache 管理二进制制品的本地文件缓存
+type ArtifactCache struct {
+    cacheDir string
+}
+
+// NewArtifactCache 创建缓存管理器
+func NewArtifactCache(cacheDir string) (*ArtifactCache, error) {
+    if err := os.MkdirAll(cacheDir, 0755); err != nil {
+        return nil, fmt.Errorf("failed to create cache directory %s: %w", cacheDir, err)
+    }
+    return &ArtifactCache{cacheDir: cacheDir}, nil
+}
+```
+
+**controllers 层 SSH 适配器示例** (适配 `bkessh.MultiCli`，phaseframe-free):
+
+```go
+// controllers/capbke/ssh_adapter.go
+package capbke
+
+// MultiCliSSHAdapter 把 bkessh.MultiCli 适配为 binaryinstaller.SSHExecutor
+// 复用现有 agentssh.DiscoverArchs 的架构发现逻辑 (从 pkg/phaseframe/phaseutil 抽取)
+type MultiCliSSHAdapter struct {
+    multiCli *bkessh.MultiCli
+}
+
+func NewMultiCliSSHAdapter(multiCli *bkessh.MultiCli) *MultiCliSSHAdapter {
+    return &MultiCliSSHAdapter{multiCli: multiCli}
+}
+
+// Execute 单主机执行: 注册单主机 → 构建 Command → Run → 返回结果
+func (a *MultiCliSSHAdapter) Execute(ctx context.Context, nodeIP, script string) (*binaryinstaller.SSHResult, error) {
+    // 复用 bkessh.MultiCli 的单主机执行能力 (通过 HostRemoteClient)
+    // 具体实现: multiCli.RegisterHosts([]bkessh.Host{...}) → multiCli.Run(bkessh.Command{Cmds: []string{script}})
+    // 返回 StdCombine 中对应主机的输出
+    ...
+}
+
+func (a *MultiCliSSHAdapter) Upload(ctx context.Context, nodeIP string, data []byte, remotePath string) error {
+    // 写入本地临时文件 → 构建 Command{FileUp: []bkessh.File{{Src: tmp, Dst: remotePath}}} → Run
+    ...
+}
+
+func (a *MultiCliSSHAdapter) DiscoverArch(ctx context.Context, nodeIP string) (string, error) {
+    // 复用 agentssh.DiscoverArchs (uname -m → amd64/arm64)，该函数需从
+    // pkg/phaseframe/phaseutil 抽取到 phaseframe-free 包 (如 pkg/remote/arch.go)
+    ...
+}
+```
+
+**设计思路 — TemplateRenderer vs TemplateContext**：
+
+`BinaryInstallerConfig.Renderer` 注入的是 **TemplateRenderer（引擎）**，不是 TemplateContext（数据）：
+
+| 概念 | 类型 | 作用 | 生命周期 |
+| ------ | ------ | ------ | --------- |
+| **TemplateRenderer** | 渲染引擎 | Go template 解析+执行引擎，含自定义函数（`upper`/`lower`/`eq`/`now`等） | 全局共享，无状态，通过 Config 注入 |
+| **TemplateContext** | 数据载体 | 模板变量数据（ClusterName/NodeIP/Artifacts/Action 等） | 每节点每组件运行时构建，通过 `InstallOptions.TemplateCtx` 传入 |
+
+TemplateRenderer 是"工具"（怎么渲染），TemplateContext 是"数据"（渲染什么）。`Install()` 中先从 `opts.TemplateCtx` 获取数据，再用 `i.renderer.RenderScript(script, tmplCtx)` 渲染。
+
+**设计思路 — Install 与 Upgrade 共用 InstallScript**：
+
+`BinaryAction` 有三个值（Install/Upgrade/Uninstall），但 `BinarySpec` 只有 `InstallScript` 和 `UninstallScript` 两个脚本，没有 `UpgradeScript`。这是有意的：
+
+1. **Install 和 Upgrade 本质是同一操作**——"让目标版本成为运行版本"，区别仅在于是否有旧版本存在。大部分步骤相同（下载→解压→配置→启动），仅少数步骤不同（备份旧版本、停止旧服务）。
+2. **通过 `{{if .isUpgrade}}` 条件渲染区分差异**，以 containerd 为例：备份步骤仅在升级时执行，其余步骤完全一致。避免 90% 代码重复。
+3. **不设 UpgradeScript 的原因**：① 避免用户编写维护两份高度重复的脚本；② 防止 Install 和 Upgrade 行为漂移（一份脚本改了另一份忘改）；③ 与 Helm Chart 模板惯例一致。
+4. **Uninstall 独立 UninstallScript 的原因**：卸载与安装是逆向操作（停止服务→删除二进制→清理配置→清理数据），逻辑完全不同，无法共用。
+
+**`isUpgrade` 的来源链路**：
+
+```txt
+VersionContext.HasCurrent("containerd")    // 版本事实: 组件是否已安装
+  → true: BinaryActionUpgrade              // Executor 自主决定: 已安装 → 升级
+  → false: BinaryActionInstall             // Executor 自主决定: 未安装 → 安装
+    → InstallOptions.Action 传递给 BinaryInstaller.Install()
+      → tmplCtx.IsUpgrade = (Action == Upgrade)   // 填入 TemplateContext
+        → 模板渲染: {{if .isUpgrade}}...{{end}}    // installScript 中条件渲染
+```
+
+`isUpgrade` 不是用户配置，而是由 `VersionContext` 在运行时推断：`HasCurrent` 返回 true（组件已安装）→ `BinaryActionUpgrade` → `tmplCtx.IsUpgrade = true` → 模板中 `{{if .isUpgrade}}` 生效。
+
+```go
+// InstallOptions 安装选项
+type InstallOptions struct {
+    Component   *ComponentVersion
+    TemplateCtx manifest.TemplateContext  // 复用现有 TemplateContext
+    Action      BinaryAction  // Install / Upgrade / Uninstall
+    Timeout     time.Duration
+    RetryCount  int
+}
+
+// BinaryAction 二进制操作类型
+type BinaryAction string
+
+const (
+    BinaryActionInstall   BinaryAction = "Install"
+    BinaryActionUpgrade   BinaryAction = "Upgrade"
+    BinaryActionUninstall BinaryAction = "Uninstall"
+)
+
+// Install 执行二进制组件安装/升级
+func (i *BinaryInstaller) Install(ctx context.Context, opts InstallOptions) error {
+    component := opts.Component
+    binary := component.Spec.Binary
+    // 注意: opts.TemplateCtx 是扩展后的 TemplateContext (见 7.3 节)
+    // 当前代码中的 manifest.TemplateContext 仅含 ClusterName/Namespace/KubernetesVersion/OpenFuyaoVersion
+    // 需扩展为包含 NodeIP/NodeArch/Artifacts/Variables/ConfigPath 等字段
+    tmplCtx := opts.TemplateCtx  // 复用 DAG 调度器传递的 TemplateContext (扩展后)
+    
+    // 1. 通过 SSH 发现节点架构 (必需: 制品 URL 包含 {{arch}} 模板变量, 下载前必须解析)
+    // 复用 SSHExecutor.DiscoverArch (内部对接 agentssh.DiscoverArchs 的 uname -m 逻辑)
+    arch, err := i.sshExecutor.DiscoverArch(ctx, tmplCtx.NodeIP)
+    if err != nil {
+        return fmt.Errorf("failed to discover arch for node %s: %w", tmplCtx.NodeIP, err)
+    }
+    tmplCtx.NodeArch = arch // 填入 TemplateContext, 供 URL 模板解析和脚本引用
+    
+    // 设计说明: OS 不在此处获取
+    // OS 信息由安装脚本在运行时自检测 (通过 /etc/os-release), 不影响制品下载
+    // 仅 installScript 中少数场景需要 OS (如包管理器选择 yum/apt), 脚本内 if-else 自检测即可
+    
+    // 2. 下载二进制制品 (带缓存, 使用 arch 解析 URL 中的 {{arch}} 占位符)
+    artifacts, err := i.downloadArtifacts(ctx, binary, arch)
+    if err != nil {
+        return fmt.Errorf("failed to download artifacts: %w", err)
+    }
+    
+    // 3. 填充 TemplateContext 的制品信息 (含 per-artifact InstallPath)
+    tmplCtx.Artifacts = make(map[string]*ArtifactInfo)
+    for name, art := range artifacts {
+        tmplCtx.Artifacts[name] = &ArtifactInfo{
+            Name:        art.Name,
+            Path:        art.Path,
+            URL:         art.URL,
+            Checksum:    art.Checksum,
+            Filename:    art.Filename,
+            InstallPath: art.InstallPath,  // per-artifact 安装路径, 供 {{artifact.<name>.installPath}} 引用
+        }
+    }
+    
+    // 4. 填充自定义变量
+    tmplCtx.Variables = binary.Variables
+    
+    // 5. 填充组件级路径变量 (从 BinarySpec.Default*Path → TemplateContext)
+    // 注意: installPath/binPath 已移至 per-artifact 级别 (ArtifactInfo.InstallPath)
+    // 因为不同 artifact 可能安装到不同路径
+    tmplCtx.ConfigPath = binary.DefaultConfigPath
+    tmplCtx.LogPath = binary.DefaultLogPath
+    tmplCtx.DataPath = binary.DefaultDataPath
+    
+    // 6. 填充操作类型 (从 InstallOptions.Action → TemplateContext, 供模板 {{isUpgrade}} 引用)
+    tmplCtx.Action = string(opts.Action)
+    tmplCtx.IsUpgrade = opts.Action == BinaryActionUpgrade
+    
+    // 7. 渲染安装脚本 (使用完整的 TemplateContext)
+    script, err := i.renderer.RenderScript(binary.InstallScript, tmplCtx)
+    if err != nil {
+        return fmt.Errorf("failed to render install script: %w", err)
+    }
+    
+    // 8. 渲染配置文件模板
+    configs, err := i.renderConfigTemplates(binary.ConfigTemplates, tmplCtx)
+    if err != nil {
+        return fmt.Errorf("failed to render config templates: %w", err)
+    }
+    
+    // 9. SSH 执行安装
+    switch opts.Action {
+    case BinaryActionInstall, BinaryActionUpgrade:
+        if err := i.executeInstall(ctx, tmplCtx.NodeIP, script, artifacts, configs); err != nil {
+            return err
+        }
+        // 10. 健康检查 (安装/升级后验证服务可用性)
+        if binary.HealthCheck != nil && binary.HealthCheck.Enabled {
+            if err := i.executeHealthCheck(ctx, tmplCtx.NodeIP, binary.HealthCheck, tmplCtx); err != nil {
+                return fmt.Errorf("health check failed on %s: %w", tmplCtx.NodeIP, err)
+            }
+        }
+        return nil
+    case BinaryActionUninstall:
+        return i.executeUninstall(ctx, tmplCtx.NodeIP, binary.UninstallScript, tmplCtx)
+    }
+    
+    return nil
+}
+
+// executeHealthCheck 通过 SSH 执行健康检查脚本, 重试直到超时或通过
+func (i *BinaryInstaller) executeHealthCheck(
+    ctx context.Context,
+    nodeIP string,
+    hc *BinaryHealthCheckSpec,
+    tmplCtx manifest.TemplateContext,
+) error {
+    // 渲染健康检查脚本
+    script, err := i.renderer.RenderScript(hc.Script, tmplCtx)
+    if err != nil {
+        return fmt.Errorf("failed to render health check script: %w", err)
+    }
+
+    timeout := parseDurationDefault(hc.Timeout, 2*time.Minute)
+    interval := parseDurationDefault(hc.Interval, 5*time.Second)
+    deadline := time.Now().Add(timeout)
+
+    for time.Now().Before(deadline) {
+        result, err := i.sshExecutor.Execute(ctx, nodeIP, script)
+        if err == nil && result.ExitCode == 0 {
+            return nil // 退出码 0 = 健康
+        }
+        i.logger.Warn("health check retry on %s: %v (stdout: %s, stderr: %s)",
+            nodeIP, err, result.Stdout, result.Stderr)
+        time.Sleep(interval)
+    }
+
+    return fmt.Errorf("health check timed out after %s on %s", timeout, nodeIP)
+}
+
+// downloadArtifacts 下载二进制制品 (使用 arch 解析 URL 中的 {{arch}} 占位符)
+func (i *BinaryInstaller) downloadArtifacts(ctx context.Context, binary *BinarySpec, arch string) (map[string]*Artifact, error) {
+    artifacts := make(map[string]*Artifact)
+    
+    for _, art := range binary.Artifacts {
+        // 解析 URL 模板变量 (arch 已通过 SSH 发现, version 从 BinarySpec 获取)
+        url, err := i.resolveTemplate(art.URL, map[string]string{
+            "{{componentVersion}}": binary.Version,
+            "{{version}}":          binary.Version,
+            "{{arch}}":             arch,
+        })
+        if err != nil {
+            return nil, fmt.Errorf("failed to resolve URL template: %w", err)
+        }
+        
+        // 检查缓存
+        cacheKey := i.computeCacheKey(url, art.Checksum)
+        if cached := i.cache.Get(cacheKey); cached != nil {
+            artifacts[art.Name] = cached
+            continue
+        }
+        
+        // 下载并校验 checksum
+        data, err := i.downloadAndVerify(ctx, url, art.Checksum)
+        if err != nil {
+            return nil, fmt.Errorf("failed to download artifact %s: %w", art.Name, err)
+        }
+        
+        artifact := &Artifact{
+            Name:     art.Name,
+            URL:      url,
+            Checksum: art.Checksum,
+            Data:     data,
+            Path:     i.cache.Save(cacheKey, data),
+        }
+        artifacts[art.Name] = artifact
+    }
+    
+    return artifacts, nil
+}
+
+// executeInstall 通过 SSH 执行安装
+func (i *BinaryInstaller) executeInstall(ctx context.Context, nodeIP string, script string, artifacts map[string]*Artifact, configs map[string][]byte) error {
+    // 1. 创建远程目录
+    if _, err := i.sshExecutor.Execute(ctx, nodeIP, "mkdir -p /tmp/bke-install"); err != nil {
+        return fmt.Errorf("failed to create remote directory: %w", err)
+    }
+    
+    // 2. 上传二进制文件
+    for name, art := range artifacts {
+        remotePath := fmt.Sprintf("/tmp/bke-install/%s", name)
+        if err := i.sshExecutor.Upload(ctx, nodeIP, art.Data, remotePath); err != nil {
+            return fmt.Errorf("failed to upload %s to %s: %w", name, nodeIP, err)
+        }
+    }
+    
+    // 3. 上传配置文件
+    for name, content := range configs {
+        remotePath := fmt.Sprintf("/tmp/bke-install/%s", name)
+        if err := i.sshExecutor.Upload(ctx, nodeIP, content, remotePath); err != nil {
+            return fmt.Errorf("failed to upload config %s to %s: %w", name, nodeIP, err)
+        }
+    }
+    
+    // 4. 执行安装脚本
+    result, err := i.sshExecutor.Execute(ctx, nodeIP, script)
+    if err != nil {
+        return fmt.Errorf("install script failed on %s: %w\nstdout: %s\nstderr: %s", 
+            nodeIP, err, result.Stdout, result.Stderr)
+    }
+    
+    return nil
+}
+```
+
+### 4.4 Binary Uninstall 流程
+
+**设计思路 — Uninstall 与 Install/Upgrade 的区别**：
+
+Binary 组件的卸载流程与安装/升级有本质区别：
+
+- **Install/Upgrade**：下载制品 → 渲染脚本 → SSH 执行 → 健康检查
+- **Uninstall**：渲染卸载脚本 → SSH 执行 → 验证服务已停止
+
+卸载不需要下载制品，因为目标节点上已有二进制文件。卸载脚本负责停止服务、删除二进制、清理配置文件。
+
+**卸载流程图**：
+
+```txt
+Binary Uninstall 流程:
+┌─────────────────────────────────────────────────────────────┐
+│ 1. 渲染卸载脚本                                              │
+│    - 支持模板变量 ({{binPath}}, {{configPath}} 等)           │
+├─────────────────────────────────────────────────────────────┤
+│ 2. 通过 SSH 执行卸载脚本                                     │
+│    - 停止服务: systemctl stop <service>                     │
+│    - 禁用服务: systemctl disable <service>                  │
+│    - 删除二进制: rm -f /usr/local/bin/<binary>              │
+│    - 删除服务文件: rm -f /etc/systemd/system/<service>      │
+│    - 重新加载 systemd: systemctl daemon-reload              │
+│    - 清理配置目录 (可选): rm -rf /etc/<component>/           │
+├─────────────────────────────────────────────────────────────┤
+│ 3. 验证服务已停止                                            │
+│    - systemctl is-active <service> 返回 "inactive"          │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**代码实现**：
+
+```go
+// executeUninstall 执行二进制组件卸载
+func (i *BinaryInstaller) executeUninstall(
+    ctx context.Context,
+    nodeIP string,
+    uninstallScript string,
+    tmplCtx manifest.TemplateContext,
+) error {
+    // 1. 渲染卸载脚本
+    script, err := i.renderer.RenderScript(uninstallScript, tmplCtx)
+    if err != nil {
+        return fmt.Errorf("render uninstall script: %w", err)
+    }
+
+    // 2. 通过 SSH 执行卸载脚本
+    result, err := i.sshExecutor.Execute(ctx, nodeIP, script)
+    if err != nil {
+        return fmt.Errorf("uninstall failed on %s: %w\nstdout: %s\nstderr: %s",
+            nodeIP, err, result.Stdout, result.Stderr)
+    }
+
+    // 3. 验证服务已停止
+    verifyCmd := fmt.Sprintf("systemctl is-active %s || true", tmplCtx.ServiceName)
+    verifyResult, _ := i.sshExecutor.Execute(ctx, nodeIP, verifyCmd)
+    if verifyResult.Stdout == "active" {
+        return fmt.Errorf("service %s still active after uninstall on %s", 
+            tmplCtx.ServiceName, nodeIP)
+    }
+
+    return nil
+}
+```
+
+**卸载脚本示例**：
+
+```yaml
+binary:
+  uninstallScript: |
+    #!/bin/bash
+    set -e
+    
+    # 停止服务
+    systemctl stop containerd || true
+    systemctl disable containerd || true
+    
+    # 删除二进制文件
+    rm -f /usr/bin/containerd
+    rm -f /usr/bin/containerd-shim-runc-v2
+    rm -f /usr/bin/containerd-shim-shimless-v2
+    rm -f /usr/bin/containerd-stress
+    rm -f /usr/bin/ctr
+    rm -f /usr/local/sbin/runc
+    rm -f /usr/bin/crictl
+    rm -f /usr/bin/nerdctl
+    
+    # 删除服务文件
+    rm -f /usr/lib/systemd/system/containerd.service
+    
+    # 删除配置文件
+    rm -f /etc/crictl.yaml
+    rm -rf /etc/containerd/
+    
+    # 重新加载 systemd
+    systemctl daemon-reload
+```
+
+### 4.5 ConfigRenderer 详细设计
+
+ConfigRenderer 是 BinaryInstaller 的配置文件渲染器，负责将 `configTemplates` 渲染为最终配置文件内容。支持三种渲染模式：Content（Go template）、SecretRef（从 K8s Secret 获取）、KubeconfigTemplate（动态生成 kubeconfig）。
+
+#### 4.5.1 三种渲染模式
+
+ConfigRenderer 支持三种渲染模式，根据不同的配置来源选择对应的渲染方式。
+
+#### 模式 1: Content 模式 (Go template 渲染)
+
+**设计思路**：直接在 ComponentVersion 中定义配置内容模板，通过 Go template 引擎渲染。适用于配置文件内容可以直接在 YAML 中定义的场景。
+
+**输入**：
+
+```yaml
+configTemplates:
+  - name: bkeagent.conf
+    path: "/etc/openFuyao/bkeagent/bkeagent.conf"
+    content: |
+      cluster_name: {{.clusterName}}
+      api_server: {{.apiServer}}
+      log_level: {{.Variables.logLevel | default "info"}}
+```
+
+**渲染过程**：
+
+1. 解析 content 模板
+2. 注入模板数据 (集群信息、节点信息、自定义变量等)
+3. 执行 Go template 渲染
+4. 返回渲染后的内容
+
+**输出**：
+
+```yaml
+cluster_name: my-cluster
+api_server: https://10.0.0.1:6443
+log_level: info
+```
+
+#### 模式 2: SecretRef 模式 (从 Secret 获取)
+
+**设计思路**：从 Kubernetes Secret 中获取配置内容，适用于敏感信息（如证书、密钥）的管理。
+
+**输入**：
+
+```yaml
+configTemplates:
+  - name: tls.crt
+    path: "/etc/openFuyao/bkeagent/tls.crt"
+    secretRef:
+      name: bkeagent-tls
+      namespace: "{{.clusterNamespace}}"
+      key: tls.crt
+```
+
+**渲染过程**：
+
+1. 解析 namespace 模板变量
+2. 从 Kubernetes API 获取 Secret
+3. 提取指定 key 的内容
+4. 返回 Secret 数据
+
+**输出**：
+
+```txt
+-----BEGIN CERTIFICATE-----
+MIIC...
+-----END CERTIFICATE-----
+```
+
+#### 模式 3: KubeconfigTemplate 模式 (动态生成)
+
+**设计思路**：根据集群信息动态生成 kubeconfig 文件，适用于需要为组件生成访问集群凭证的场景。
+
+**输入**：
+
+```yaml
+configTemplates:
+  - name: kubeconfig
+    path: "/etc/openFuyao/bkeagent/kubeconfig"
+    kubeconfigTemplate:
+      clusterName: "{{.clusterName}}"
+      apiServer: "{{.apiServer}}"
+      caCertPath: "/etc/openFuyao/bkeagent/ca.crt"
+      clientCertPath: "/etc/openFuyao/bkeagent/tls.crt"
+      clientKeyPath: "/etc/openFuyao/bkeagent/tls.key"
+      namespace: "{{.clusterNamespace}}"
+```
+
+**渲染过程**：
+
+1. 解析模板变量
+2. 构建 kubeconfig 结构
+3. 序列化为 YAML 格式
+4. 返回 kubeconfig 内容
+
+**输出**：
+
+```yaml
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: https://10.0.0.1:6443
+    certificate-authority: /etc/openFuyao/bkeagent/ca.crt
+  name: my-cluster
+users:
+- user:
+    client-certificate: /etc/openFuyao/bkeagent/tls.crt
+    client-key: /etc/openFuyao/bkeagent/tls.key
+  name: my-cluster
+contexts:
+- context:
+    cluster: my-cluster
+    user: my-cluster
+    namespace: default
+  name: my-cluster
+current-context: my-cluster
+```
+
+#### 4.5.2 ConfigRenderer 渲染流程图
+
+**设计思路**：ConfigRenderer 根据配置模板的类型选择不同的渲染模式：Content 模式使用 Go template 渲染、SecretRef 模式从 Kubernetes Secret 获取、KubeconfigTemplate 模式动态生成 kubeconfig。整个流程采用策略模式，根据模板类型分发到不同的渲染处理器。
+
+**关键设计点**：
+
+- **三种模式**：Content（模板渲染）、SecretRef（Secret 引用）、KubeconfigTemplate（动态生成）
+- **模板变量**：Content 模式支持完整的模板变量系统
+- **Secret 获取**：SecretRef 模式支持命名空间模板变量
+- **Kubeconfig 生成**：使用 client-go 的 clientcmd 库生成标准格式
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                         ConfigRenderer 渲染流程                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+                              ┌──────────────────┐
+                              │  RenderConfig()  │
+                              │  入口函数        │
+                              └────────┬─────────┘
+                                       │
+                                       ▼
+                    ┌──────────────────────────────────────┐
+                    │  判断渲染模式                         │
+                    │  switch {                            │
+                    │  case template.Content != "":        │
+                    │  case template.SecretRef != nil:     │
+                    │  case template.KubeconfigTemplate:   │
+                    │  }                                   │
+                    └────────────────────┬─────────────────┘
+                                         │
+              ┌──────────────────────────┼──────────────────────────┐
+              │                          │                          │
+              ▼                          ▼                          ▼
+    ┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
+    │  Content 模式   │      │  SecretRef 模式  │      │  Kubeconfig     │
+    │                 │      │                 │      │  模式            │
+    └────────┬────────┘      └────────┬────────┘      └────────┬────────┘
+             │                        │                        │
+             ▼                        ▼                        ▼
+    ┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
+    │ 1. 构建模板数据 │       │ 1. 解析命名空间  │      │ 1. 解析模板变量  │
+    │  buildTemplate  │      │  renderString   │      │  renderString   │
+    │  Data()         │      │  (namespace)    │      │                 │
+    └────────┬────────┘      └────────┬────────┘      └────────┬────────┘
+             │                        │                        │
+             ▼                        ▼                        ▼
+    ┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
+    │ 2. 解析模板     │      │ 2. 获取 Secret  │      │ 2. 构建结构     │
+    │  template.Parse │      │  client.Get()   │      │  clientcmdapi   │
+    │  (content)      │      │                 │      │  .Config{}      │
+    └────────┬────────┘      └────────┬────────┘      └────────┬────────┘
+             │                        │                        │
+             ▼                        ▼                        ▼
+    ┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
+    │ 3. 执行渲染      │      │ 3. 提取数据     │      │ 3. 序列化 YAML  │
+    │  tmpl.Execute() │      │  secret.Data[key]│     │  clientcmd.Write│
+    └────────┬────────┘      └────────┬────────┘      └────────┬────────┘
+             │                        │                        │
+             └────────────────────────┼────────────────────────┘
+                                      │
+                                      ▼
+                    ┌──────────────────────────────────────┐
+                    │  返回渲染结果                         │
+                    │  return content, nil                 │
+                    └──────────────────────────────────────┘
+```
+
+#### 4.5.3 核心接口定义
+
+```go
+// pkg/binaryinstaller/config_renderer.go
+
+// ConfigRenderer 配置文件渲染器
+type ConfigRenderer struct {
+    client      client.Client
+    funcMap     template.FuncMap
+}
+
+// NewConfigRenderer 创建配置文件渲染器
+// client 用于读取 Secret (SecretRef 模式) 和生成 kubeconfig (KubeconfigTemplate 模式)
+func NewConfigRenderer(client client.Client) *ConfigRenderer {
+    return &ConfigRenderer{
+        client: client,
+        funcMap: template.FuncMap{
+            "upper": strings.ToUpper,
+            "lower": strings.ToLower,
+            "trim":  strings.TrimSpace,
+        },
+    }
+}
+
+// RenderConfig 渲染单个配置文件模板 (统一入口，按 ConfigTemplateSpec 字段分发)
+// 所有 render* 子方法统一签名 (ctx, tmpl, tmplCtx)，消除原设计签名不一致问题
+func (r *ConfigRenderer) RenderConfig(ctx context.Context, tmpl ConfigTemplateSpec, tmplCtx manifest.TemplateContext) ([]byte, error) {
+    switch {
+    case tmpl.Content != "":
+        return r.renderContentTemplate(ctx, tmpl, tmplCtx)
+    case tmpl.SecretRef != nil:
+        return r.renderSecretTemplate(ctx, tmpl, tmplCtx)
+    case tmpl.KubeconfigTemplate != nil:
+        return r.renderKubeconfigTemplate(ctx, tmpl, tmplCtx)
+    }
+    return nil, errors.New("no template content specified")
+}
+
+// renderContentTemplate 渲染内容模板 (使用 TemplateContext)
+func (r *ConfigRenderer) renderContentTemplate(ctx context.Context, tmpl ConfigTemplateSpec, tmplCtx manifest.TemplateContext) ([]byte, error) {
+    t, err := template.New("content").Funcs(r.funcMap).Parse(tmpl.Content)
+    if err != nil {
+        return nil, fmt.Errorf("failed to parse template: %w", err)
+    }
+    var buf bytes.Buffer
+    if err := t.Execute(&buf, tmplCtx); err != nil {
+        return nil, fmt.Errorf("failed to render template: %w", err)
+    }
+    return buf.Bytes(), nil
+}
+
+// renderSecretTemplate 从 Secret 获取内容 (使用 TemplateContext 渲染 namespace)
+func (r *ConfigRenderer) renderSecretTemplate(ctx context.Context, tmpl ConfigTemplateSpec, tmplCtx manifest.TemplateContext) ([]byte, error) {
+    secretRef := tmpl.SecretRef
+    namespace, err := r.renderTemplateString(secretRef.Namespace, tmplCtx)
+    if err != nil {
+        return nil, fmt.Errorf("failed to render secret namespace: %w", err)
+    }
+    secret := &corev1.Secret{}
+    if err := r.client.Get(ctx, types.NamespacedName{
+        Name:      secretRef.Name,
+        Namespace: namespace,
+    }, secret); err != nil {
+        return nil, fmt.Errorf("failed to get secret %s/%s: %w", namespace, secretRef.Name, err)
+    }
+    data, ok := secret.Data[secretRef.Key]
+    if !ok {
+        return nil, fmt.Errorf("key %s not found in secret %s/%s", secretRef.Key, namespace, secretRef.Name)
+    }
+    return data, nil
+}
+
+// renderKubeconfigTemplate 动态生成 kubeconfig
+func (r *ConfigRenderer) renderKubeconfigTemplate(ctx context.Context, tmpl ConfigTemplateSpec, tmplCtx manifest.TemplateContext) ([]byte, error) {
+    kc := tmpl.KubeconfigTemplate
+    clusterName, err := r.renderTemplateString(kc.ClusterName, tmplCtx)
+    if err != nil {
+        return nil, err
+    }
+    apiServer, err := r.renderTemplateString(kc.APIServer, tmplCtx)
+    if err != nil {
+        return nil, err
+    }
+    namespace, err := r.renderTemplateString(kc.Namespace, tmplCtx)
+    if err != nil {
+        return nil, err
+    }
+    kubeconfig := clientcmdapi.Config{
+        Kind:       "Config",
+        APIVersion: "v1",
+        Clusters: map[string]*clientcmdapi.Cluster{
+            clusterName: {
+                Server:               apiServer,
+                CertificateAuthority: kc.CACertPath,
+            },
+        },
+        AuthInfos: map[string]*clientcmdapi.AuthInfo{
+            clusterName: {
+                ClientCertificate: kc.ClientCertPath,
+                ClientKey:         kc.ClientKeyPath,
+            },
+        },
+        Contexts: map[string]*clientcmdapi.Context{
+            clusterName: {
+                Cluster:   clusterName,
+                AuthInfo:  clusterName,
+                Namespace: namespace,
+            },
+        },
+        CurrentContext: clusterName,
+    }
+    return clientcmd.Write(kubeconfig)
+}
+
+// renderTemplateString 渲染字符串中的模板变量 (返回 string + error，原设计漏报 error)
+func (r *ConfigRenderer) renderTemplateString(s string, tmplCtx manifest.TemplateContext) (string, error) {
+    if !strings.Contains(s, "{{") {
+        return s, nil
+    }
+    t, err := template.New("str").Funcs(r.funcMap).Parse(s)
+    if err != nil {
+        return "", fmt.Errorf("failed to parse string template: %w", err)
+    }
+    var buf bytes.Buffer
+    if err := t.Execute(&buf, tmplCtx); err != nil {
+        return "", fmt.Errorf("failed to render string template: %w", err)
+    }
+    return buf.String(), nil
+}
+
+// renderConfigTemplates 渲染配置文件模板列表 (使用 TemplateContext)
+// 支持 condition 字段: 评估 Go Template 表达式，"false"/空时跳过该模板
+func (r *ConfigRenderer) renderConfigTemplates(ctx context.Context, templates []ConfigTemplateSpec, tmplCtx manifest.TemplateContext) (map[string][]byte, error) {
+    configs := make(map[string][]byte)
+    for _, tmpl := range templates {
+        // 评估 condition：空 = 始终生成；"false"/空 = 跳过
+        if tmpl.Condition != "" {
+            result, err := r.renderTemplateString(tmpl.Condition, tmplCtx)
+            if err != nil {
+                return nil, fmt.Errorf("failed to evaluate condition for %s: %w", tmpl.Name, err)
+            }
+            trimmed := strings.TrimSpace(result)
+            if trimmed == "false" || trimmed == "" {
+                continue // 跳过此模板，不生成文件
+            }
+        }
+        content, err := r.RenderConfig(ctx, tmpl, tmplCtx)
+        if err != nil {
+            return nil, fmt.Errorf("failed to render template %s: %w", tmpl.Name, err)
+        }
+        configs[tmpl.Name] = content
+    }
+    return configs, nil
+}
+```
+
+**设计说明**：ConfigRenderer 的所有渲染方法都接收 `manifest.TemplateContext` 作为参数，而不是单独传递集群、节点等信息。这样：
+
+1. 与 DAG 调度器传递的 TemplateContext 保持一致
+2. 避免重复构建模板数据
+3. BinaryInstaller 和 YamlInstaller 共享相同的模板上下文
+
+### 4.6 ConfigTemplateSpec forEach 动态多文件生成
+
+**设计思路**：某些组件需要按数据条目动态生成多个配置文件（如 containerd 的 `hosts.toml`，每个 registry 一个文件）。`forEach` 机制允许单个 `configTemplate` 按迭代源展开为多个文件，每个文件的路径由 `pathTemplate` 动态渲染。
+
+#### 4.6.1 ConfigTemplateSpec 扩展字段
+
+```go
+// ConfigTemplateSpec 扩展 (在现有字段基础上新增)
+type ConfigTemplateSpec struct {
+    // ... 现有字段保持不变 (Name, Path, Mode, Owner, Content, SecretRef, KubeconfigTemplate) ...
+
+    // 新增：动态路径模板 (Go template 语法, 与 ForEach 配合使用)
+    // 渲染时可访问全部 TemplateContext 变量 + 迭代变量 (.Key, .Value)
+    // 示例: "{{cd "containerd" "registryConfigPath"}}/{{.Key}}/hosts.toml"
+    PathTemplate string `json:"pathTemplate,omitempty"`
+
+    // 新增：迭代源路径 (点分隔, 从 TemplateContext 中解析)
+    // 支持 map[string]interface{} (按 key/value 迭代) 和 []interface{} (按 index/value 迭代)
+    // 示例: "Config.Cluster.ContainerRuntime.Registry"
+    ForEach string `json:"forEach,omitempty"`
+}
+```
+
+**字段约束**：
+
+| 条件 | 说明 |
+| ------ | ------ |
+| `ForEach != ""` 时 | `PathTemplate` 必填，`Path` 忽略 |
+| `ForEach == ""` 时 | `Path` 必填，`PathTemplate` 忽略（原有行为） |
+| `PathTemplate` 中 | 可访问全部 TemplateContext 变量 + `.Key` + `.Value` |
+| `Content` 中 | 同上，可访问全部变量 |
+
+#### 4.6.2 forEach 语义
+
+`forEach` 值为**点分隔路径**，从 `TemplateContext` 中解析：
+
+| forEach 值 | 解析路径 | 迭代类型 |
+| ------ | ------ | ------ |
+| `"Config.Cluster.ContainerRuntime.Registry"` | `tmplCtx.Config.Cluster.ContainerRuntime.Registry` | `map[string]RegistryConfig` → 按 key/value 迭代 |
+| `"Config.Cluster.ContainerRuntime.RegistryList"` | `tmplCtx.Config.Cluster.ContainerRuntime.RegistryList` | `[]RegistryConfig` → 按 index/value 迭代 |
+
+#### 4.6.3 ForEachContext 迭代上下文
+
+每次迭代创建一个包装上下文，**同时保留全部 TemplateContext 变量 + 迭代变量**：
+
+```go
+// ForEachContext 包装 TemplateContext + 迭代变量
+// Go template 通过反射访问字段, 嵌入的 TemplateContext 字段可直接用 .ClusterName 等访问
+type ForEachContext struct {
+    manifest.TemplateContext   // 嵌入: 保留所有现有变量
+    Key   string              // 当前迭代 key (map) 或 index (slice, 转 string)
+    Value interface{}          // 当前迭代值
+}
+```
+
+**模板变量访问规则**：
+
+| 变量 | 来源 | 示例 |
+| ------ | ------ | ------ |
+| `{{.ClusterName}}` | TemplateContext（嵌入） | `my-cluster` |
+| `{{.NodeIP}}` | TemplateContext（嵌入） | `192.168.1.10` |
+| `{{.imageRegistry}}` | TemplateContext（嵌入） | `registry.example.com` |
+| `{{.Key}}` | ForEachContext（迭代） | `harbor.example.com` |
+| `{{.Value}}` | ForEachContext（迭代） | `map[host:... capabilities:...]` |
+| `{{index .Value "host"}}` | 动态访问 Value 内部字段 | `harbor.example.com` |
+| `{{index .Value "capabilities"}}` | 动态访问 Value 内部字段 | `[pull resolve]` |
+| `{{cd "containerd" "root"}}` | 辅助函数访问 Config | `/var/lib/containerd` |
+
+#### 4.6.4 渲染引擎核心代码
+
+```go
+// renderConfigTemplates 扩展: 支持 forEach 多文件展开
+func (r *ConfigRenderer) renderConfigTemplates(
+    ctx context.Context,
+    templates []ConfigTemplateSpec,
+    tmplCtx manifest.TemplateContext,
+) (map[string][]byte, error) {
+    configs := make(map[string][]byte)
+
+    for _, tmpl := range templates {
+        if tmpl.ForEach != "" {
+            // 动态展开: forEach 迭代
+            items, err := resolveForEach(tmpl.ForEach, tmplCtx)
+            if err != nil {
+                return nil, fmt.Errorf("forEach %q: %w", tmpl.ForEach, err)
+            }
+            for _, item := range items {
+                // 构建迭代上下文: 保留全部 TemplateContext + 注入 Key/Value
+                iterCtx := manifest.ForEachContext{
+                    TemplateContext: tmplCtx,
+                    Key:             item.Key,
+                    Value:           item.Value,
+                }
+
+                // 渲染路径 (支持全部 TemplateContext 变量 + Key/Value)
+                path, err := r.renderTemplateString(tmpl.PathTemplate, iterCtx)
+                if err != nil {
+                    return nil, fmt.Errorf("pathTemplate for key=%s: %w", item.Key, err)
+                }
+
+                // 渲染内容 (同上)
+                content, err := r.renderContentTemplate(ctx, tmpl, iterCtx)
+                if err != nil {
+                    return nil, fmt.Errorf("content for key=%s: %w", item.Key, err)
+                }
+
+                configs[path] = content  // key 用渲染后的 path (而非 name)
+            }
+        } else {
+            // 原有逻辑: 静态单文件
+            content, err := r.RenderConfig(ctx, tmpl, tmplCtx)
+            if err != nil {
+                return nil, fmt.Errorf("template %s: %w", tmpl.Name, err)
+            }
+            configs[tmpl.Name] = content
+        }
+    }
+    return configs, nil
+}
+
+// resolveForEach 按点分隔路径从 TemplateContext 中解析迭代源
+func resolveForEach(path string, tmplCtx manifest.TemplateContext) ([]ForEachItem, error) {
+    parts := strings.SplitN(path, ".", 2)
+    if len(parts) != 2 {
+        return nil, fmt.Errorf("invalid forEach path: %s", path)
+    }
+
+    var source interface{}
+    switch parts[0] {
+    case "Config":
+        keys := strings.Split(parts[1], ".")
+        if len(keys) < 2 {
+            return nil, fmt.Errorf("Config path too short: %s", path)
+        }
+        // 通过反射访问 Config 的嵌套字段
+        source = resolveConfigPath(tmplCtx.Config, keys...)
+    default:
+        return nil, fmt.Errorf("unsupported forEach root: %s", parts[0])
+    }
+
+    // 迭代: 支持 map 和 slice
+    var items []ForEachItem
+    switch v := source.(type) {
+    case map[string]interface{}:
+        for k, val := range v {
+            items = append(items, ForEachItem{Key: k, Value: val})
+        }
+    case []interface{}:
+        for i, val := range v {
+            items = append(items, ForEachItem{Key: strconv.Itoa(i), Value: val})
+        }
+    default:
+        return nil, fmt.Errorf("forEach source is not iterable: %T", source)
+    }
+    return items, nil
+}
+
+type ForEachItem struct {
+    Key   string
+    Value interface{}
+}
+```
+
+#### 4.6.5 forEach 渲染流程图
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    renderConfigTemplates 扩展流程                                │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+                    ┌──────────────────────────┐
+                    │  遍历 configTemplates    │
+                    │  for _, tmpl := range    │
+                    │       templates          │
+                    └────────────┬─────────────┘
+                                 │
+                    ┌────────────┴────────────┐
+                    │  tmpl.ForEach != "" ?   │
+                    └─────┬─────────────┬─────┘
+                     Yes  │             │  No
+                          ▼             ▼
+          ┌───────────────────────┐  ┌──────────────────┐
+          │  resolveForEach()     │  │  原有逻辑:        │
+          │  解析点分隔路径        │  │  RenderConfig()   │
+          │  → 获取迭代源          │  │  单文件渲染       │
+          └───────────┬───────────┘  └──────────────────┘
+                      │
+                      ▼
+          ┌───────────────────────┐
+          │  迭代每个条目          │
+          │  for _, item := range │
+          │       items           │
+          └───────────┬───────────┘
+                      │
+                      ▼
+          ┌───────────────────────────────────┐
+          │  构建 ForEachContext              │
+          │  {                                │
+          │    TemplateContext: tmplCtx,      │
+          │    Key:   item.Key,               │
+          │    Value: item.Value,             │
+          │  }                                │
+          │                                   │
+          │  保留全部 TemplateContext 变量     │
+          │  + 注入迭代变量 .Key / .Value      │
+          └───────────┬───────────────────────┘
+                      │
+          ┌───────────┴───────────┐
+          │                       │
+          ▼                       ▼
+┌──────────────────┐   ┌──────────────────┐
+│ 渲染 pathTemplate│   │ 渲染 content     │
+│ (动态路径)        │   │ (模板内容)       │
+│                  │   │                  │
+│ 可访问:           │   │ 可访问:          │
+│ .ClusterName     │   │ .ClusterName     │
+│ .NodeIP          │   │ .NodeIP          │
+│ .Key             │   │ .Key             │
+│ .Value           │   │ .Value           │
+│ cd(...)          │   │ cd(...)          │
+└────────┬─────────┘   └────────┬─────────┘
+         │                      │
+         └───────────┬──────────┘
+                     │
+                     ▼
+          ┌───────────────────────────┐
+          │  configs[path] = content  │
+          │  (key 用渲染后的 path)     │
+          └───────────────────────────┘
+```
+
+## 5. YamlInstaller 详细设计
+
+### 5.1 核心组件架构
+
+```txt
+┌─────────────────────────────────────────────────────────────────┐
+│                    YamlInstaller                                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌──────────────────┐    ┌──────────────────┐                   │
+│  │ManifestDownloader│    │  YAML Parser     │                   │
+│  │                  │    │                  │                   │
+│  │ • ManifestStore  │    │ • 多文档解析      │                   │
+│  │ • bundle文件加载  │    │ • GVK 识别       │                   │
+│  │ • 内联Resources  │    │ • 资源分组        │                   │
+│  └────────┬─────────┘    └────────┬─────────┘                   │
+│           │                       │                             │
+│           ▼                       ▼                             │
+│  ┌──────────────────────────────────────────┐                   │
+│  │       ApplyStrategy Engine               │                   │
+│  │                                          │                   │
+│  │ • ServerSideApply (默认, 声明式字段管理)   │                  │
+│  │ • Replace (删除+重建)                    │                   │
+│  │ • CreateOnly (仅创建)                    │                   │
+│  └──────────────────┬───────────────────────┘                  │
+│                     │                                          │
 │                     ▼                                          │
 │  ┌──────────────────────────────────────────┐                  │
 │  │            K8s Applier                   │                  │
@@ -161,7 +2625,7 @@
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 6.2 YamlInstaller 执行流程图
+### 5.2 YamlInstaller 执行流程图
 
 **设计思路**：YamlInstaller 的执行流程分为 4 个主要步骤：加载清单、应用清单、健康检查、返回结果。与 BinaryInstaller（7 步）相比更简单——无制品下载/SSH 执行等复杂子层，仅 Store 加载 + Applier 应用 + healthcheck。
 
@@ -196,7 +2660,7 @@
                      ┌──────────────────────────────────────┐
                      │  3. 健康检查                          │
                      │  healthcheck.Run(ctx, clientset, hc) │
-                     │  (见第 7 章, hc.Enabled=true 时执行)  │
+                     │  (见第 6 章, hc.Enabled=true 时执行)  │
                      └────────────────────┬─────────────────┘
                                           │
                                ┌──────────┴──────────┐
@@ -210,22 +2674,22 @@
                      └─────────────────┘   └─────────────────┘
 ```
 
-### 6.3 核心接口定义
+### 5.3 核心接口定义
 
 **设计思路 — YAML 组件两层模型（与 Binary 对称）**：
 
-YAML 组件采用与 Binary 对称的两层结构：`YamlComponentExecutor`（dagexec 调度层，见 9.4.3.3）+ `YamlInstaller`（`pkg/yamlinstaller` 引擎层，本节）。`YamlInstaller` 持有 `manifest.Applier`，负责清单 Apply + 健康检查；与 `BinaryInstaller` 命名对称。区别仅在 `YamlInstaller` 内部更简单——无 SSH/下载/缓存等子层，仅 Apply + healthcheck。
+YAML 组件采用与 Binary 对称的两层结构：`YamlComponentExecutor`（dagexec 调度层，见 8.4.3.2）+ `YamlInstaller`（`pkg/yamlinstaller` 引擎层，本节）。`YamlInstaller` 持有 `manifest.Applier`，负责清单 Apply + 健康检查；与 `BinaryInstaller`/`HelmInstaller` 命名对称。区别仅在 `YamlInstaller` 内部更简单——无 SSH/下载/缓存等子层，仅 Apply + healthcheck。
 
 | 层 | Binary | YAML |
 | ---- | -------- | ------ |
-| dagexec 执行器 | `BinaryComponentExecutor` | `YamlComponentExecutor`（见 9.4.3.3） |
+| dagexec 执行器 | `BinaryComponentExecutor` | `YamlComponentExecutor`（见 8.4.3.2） |
 | 独立包引擎 | `binaryinstaller.BinaryInstaller` | `yamlinstaller.YamlInstaller`（本节） |
 
 **Installer（引擎层）完成的逻辑**（`YamlInstaller.Apply`）：
 
 - 构建 ComponentPackage → `applier.ApplyComponent()` → 健康检查（PodReady/EndpointReady/Custom）
 
-**Executor（调度层）完成的逻辑**（`YamlComponentExecutor`，见 9.4.3.3）：
+**Executor（调度层）完成的逻辑**（`YamlComponentExecutor`，见 8.4.3.2）：
 
 - 获取 ComponentVersion → VersionContext 判断是否需要执行 → 委托 `YamlInstaller.Apply()` → 处理失败策略
 - 无节点级调度（应用到集群而非单节点）
@@ -268,7 +2732,7 @@ func (i *YamlInstaller) Apply(ctx context.Context, cv *configv1alpha1.ComponentV
     }
 
     // 健康检查 (应用清单后验证 Pod/Endpoint 就绪)
-    // 复用共享 pkg/healthcheck 包 (见 7)，避免重复
+    // 复用共享 pkg/healthcheck 包 (见 6)，避免重复
     if cv.Spec.YAML != nil && cv.Spec.YAML.HealthCheck != nil && cv.Spec.YAML.HealthCheck.Enabled {
         if err := healthcheck.Run(ctx, execCtx.TargetClient, *cv.Spec.YAML.HealthCheck); err != nil {
             return fmt.Errorf("health check failed for %s: %w", cv.Spec.Name, err)
@@ -278,11 +2742,13 @@ func (i *YamlInstaller) Apply(ctx context.Context, cv *configv1alpha1.ComponentV
 }
 ```
 
-> 健康检查实现委托共享 `pkg/healthcheck` 包（`healthcheck.Run(ctx, execCtx.TargetClient, *cv.Spec.YAML.HealthCheck)`）。共享包的接口定义与 PodReady/EndpointReady/Custom 检查实现详见 **第 7 章 HealthCheck 共享包设计**。
+> 健康检查实现委托共享 `pkg/healthcheck` 包（`healthcheck.Run(ctx, execCtx.TargetClient, *cv.Spec.YAML.HealthCheck)`）。共享包的接口定义与 PodReady/EndpointReady/Custom 检查实现详见 **第 6 章 HealthCheck 共享包设计**。
 
 **设计思路 — YamlInstaller 健康检查 clientset 来源**：
 
-`YamlInstaller.Apply` 中调用 `healthcheck.Run(ctx, execCtx.TargetClient, ...)` 需要 `kubernetes.Interface` (typed clientset)。当前 `YamlInstallerConfig` 仅注入 `Store` + `Applier`，未注入 clientset。解决方案：通过 `ExecutionContext.TargetClient` 传递，无需修改 `YamlInstallerConfig`。`ExecutionContext.TargetClient` 由 controllers 层在 `buildExecutionContext` 中注入（见 9.1.3 节），是目标集群的 typed clientset。YamlInstaller 通过 `execCtx.TargetClient` 访问，无需在 `YamlInstallerConfig` 中重复注入。### 6.4 清单下载与缓存
+`YamlInstaller.Apply` 中调用 `healthcheck.Run(ctx, execCtx.TargetClient, ...)` 需要 `kubernetes.Interface` (typed clientset)。当前 `YamlInstallerConfig` 仅注入 `Store` + `Applier`，未注入 clientset。解决方案：通过 `ExecutionContext.TargetClient` 传递，无需修改 `YamlInstallerConfig`。`ExecutionContext.TargetClient` 由 controllers 层在 `buildExecutionContext` 中注入（见 8.1.3 节），是目标集群的 typed clientset。YamlInstaller 通过 `execCtx.TargetClient` 访问，无需在 `YamlInstallerConfig` 中重复注入。### 6.4 清单下载与缓存
+
+### 5.4 清单下载与缓存
 
 **设计思路**：`yaml.manifests[].url` 引用的外部 YAML 清单文件需要下载、缓存和校验。与 BinaryInstaller 的制品下载类似，但更简单——清单文件体积远小于二进制制品，且格式固定为 YAML。
 
@@ -523,11 +2989,11 @@ func (i *YamlInstaller) Apply(ctx context.Context, cv *configv1alpha1.ComponentV
 }
 ```
 
-### 6.5 健康检查
+### 5.5 健康检查
 
-YamlInstaller 的健康检查在 `Apply` 方法内部调用共享 `pkg/healthcheck` 包执行（`healthcheck.Run(ctx, execCtx.TargetClient, *cv.Spec.YAML.HealthCheck)`）。当 `cv.Spec.YAML.HealthCheck.Enabled` 为 true 时，清单 Apply 后执行 PodReady/EndpointReady/Custom 检查。接口定义与实现详见 **第 7 章 HealthCheck 共享包设计**。
+YamlInstaller 的健康检查在 `Apply` 方法内部调用共享 `pkg/healthcheck` 包执行（`healthcheck.Run(ctx, execCtx.TargetClient, *cv.Spec.YAML.HealthCheck)`）。当 `cv.Spec.YAML.HealthCheck.Enabled` 为 true 时，清单 Apply 后执行 PodReady/EndpointReady/Custom 检查。接口定义与实现详见 **第 6 章 HealthCheck 共享包设计**。
 
-### 6.6 YAML Uninstall 流程
+### 5.6 YAML Uninstall 流程
 
 **设计思路 — YAML 组件卸载与 Binary 的区别**：
 
@@ -920,17 +3386,18 @@ var PruneableGVKs = []schema.GroupVersionKind{
 | 组件类型 | 卸载机制 | 是否需要服务管理 | 是否支持 Prune |
 | --------- | --------- | ----------------- | --------------- |
 | Binary | SSH 执行卸载脚本 | ✅ 停止/禁用服务 | ❌ |
+| Helm | Helm SDK `helm uninstall` | ❌ Helm 管理 | ❌ |
 | YAML | K8s API 删除资源 | ❌ 无服务概念 | ✅ 按 label 裁剪 |
 
-## 7. HealthCheck 共享包设计
+## 6. HealthCheck 共享包设计
 
 **设计思路 — 横切关注点独立成包**：
 
-PodReady/EndpointReady/Custom 三种 K8s 资源就绪检查是 YamlInstaller（6.3）使用的横切关注点。抽取为独立共享包 `pkg/healthcheck`，委托调用，消除重复。
+PodReady/EndpointReady/Custom 三种 K8s 资源就绪检查是 YamlInstaller（5.3）使用的横切关注点。抽取为独立共享包 `pkg/healthcheck`，委托调用，消除重复。
 
 **作用范围**：
 
-- ✅ `YamlInstaller`（6.3）：清单 Apply 后执行健康检查
+- ✅ `YamlInstaller`（5.3）：清单 Apply 后执行健康检查
 - ❌ `BinaryInstaller`（4.x）：二进制组件运行在远程节点，健康检查通过 SSH 执行脚本（`BinaryHealthCheckSpec.Script`，退出码判定），机制不同，**不**使用本共享包
 
 **执行流程图**：
@@ -1103,9 +3570,9 @@ func checkCustom(ctx context.Context, spec *CustomCheckSpec) (bool, error) {
 
 **调用方**：
 
-- - `YamlInstaller.Apply`（6.3）：`healthcheck.Run(ctx, execCtx.TargetClient, *cv.Spec.YAML.HealthCheck)`
+- - `YamlInstaller.Apply`（5.3）：`healthcheck.Run(ctx, execCtx.TargetClient, *cv.Spec.YAML.HealthCheck)`
 
-### 7.1 类型定义
+### 6.1 类型定义
 
 **设计思路**：健康检查类型定义独立于具体 Installer，供 YAML 组件共用。CRD 字段类型引用此处的定义，避免在多处重复定义。
 
@@ -1175,9 +3642,9 @@ type CustomCheckSpec struct {
 }
 ```
 
-## 8. 模板变量系统与 TemplateContext 详细设计
+## 7. 模板变量系统与 TemplateContext 详细设计
 
-### 8.0 TemplateContext 扩展策略
+### 7.0 TemplateContext 扩展策略
 
 **设计思路**：为避免重复造轮子，本设计复用并扩展现有的 `pkg/manifest.TemplateContext` 结构体。现有 TemplateContext 用于 YAML/Manifest 组件的模板渲染，包含 4 个基础字段。在此基础上扩展，增加 Binary 组件所需的节点信息、制品信息、自定义变量等字段。
 
@@ -1305,7 +3772,7 @@ installScript: |
 condition: '{{.Config.Cluster.ContainerRuntime.CRI == "containerd"}}'
 ```
 
-#### 8.0.1 TemplateContext 实现规格
+#### 7.0.1 TemplateContext 实现规格
 
 **设计思路**：明确 `TemplateContext` 扩展字段的注入时机和边界条件，确保实现的一致性和可测试性。
 
@@ -1437,7 +3904,7 @@ type ArtifactInfo struct {
    - `TestNewExecutionContext_NilClusterConfig`
    - `TestNewExecutionContext_ComponentVariablesInit`
 
-### 8.1 模板变量系统
+### 7.1 模板变量系统
 
 模板变量系统支持 8 类 50+ 模板变量，覆盖集群、节点、版本、制品、镜像仓库、路径、操作类型和自定义变量。
 
@@ -1604,7 +4071,7 @@ installScript: |
   echo "Setting snapshotter to {{.Variables.snapshotter}}"
 ```
 
-### 8.2 模板渲染流程图
+### 7.2 模板渲染流程图
 
 **设计思路**：模板渲染的流程分为 5 个主要步骤：接收 TemplateContext、构建制品数据、创建模板解析器、执行模板渲染、返回结果。整个流程复用 DAG 调度器传递的 TemplateContext，避免重复构建模板数据。
 
@@ -1699,7 +4166,7 @@ installScript: |
                     └─────────────────┘   └─────────────────┘
 ```
 
-### 8.3 TemplateContext 构建流程
+### 7.3 TemplateContext 构建流程
 
 **设计思路**：DAG 调度器在执行组件前构建 TemplateContext，包含集群信息、节点基础信息、版本信息等。对于 Binary 组件，还需要在 TemplateContext 中填充制品信息。注意：TemplateContext 不包含 NodeOS/NodeOSVersion（由安装脚本自检测），NodeArch 由 BinaryInstaller.Install() 通过 SSH 发现后填入（制品 URL 中的 `{{arch}}` 需要在下载前解析）。
 
@@ -1738,25 +4205,25 @@ installScript: |
                     │  executeComponent(ctx, node, tmpl)   │
                     └────────────────────┬─────────────────┘
                                          │
-                      ┌───────────────────┼────────────────────┐
-                      │                   │                    │
-                      ▼                   ▼                    ▼
-            ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
-            │  YAML 组件      │  │  Binary 组件    │  │  Inline 组件     │
-            │                 │  │                 │  │                 │
-            │  使用基础字段    │  │  扩展节点信息    │  │  使用基础字段    │
-            │  - ClusterName  │  │  + NodeIP       │  │  - ClusterName  │
-            │  - Namespace    │  │  + NodeHostname │  │  - Namespace    │
-            │  - K8sVersion   │  │  + NodeRole     │  │  - K8sVersion   │
-            │                 │  │  + Artifacts    │  │                 │
-            │  渲染 Manifest  │  │  + Variables    │  │  Phase 执行     │
-            │  应用到集群      │  │                 │  │  (无需模板渲染)  │
-            │                 │  │  渲染脚本       │  │                 │
-            │                 │  │  SSH 执行      │  │                 │
-            └─────────────────┘  └─────────────────┘  └─────────────────┘
+                     ┌───────────────────┼────────────────────┬────────────────────┐
+                     │                   │                    │                    │
+                     ▼                   ▼                    ▼                    ▼
+           ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
+           │  YAML 组件      │  │  Binary 组件    │  │  Inline 组件     │
+           │                 │  │                 │  │                 │  │                 │
+           │  使用基础字段    │  │  使用基础字段    │  │  扩展节点信息    │  │  使用基础字段    │
+           │  - ClusterName  │  │  + APIServer    │  │  + NodeIP       │  │  - ClusterName  │
+           │  - Namespace    │  │  + ServiceCIDR  │  │  + NodeHostname │  │  - Namespace    │
+           │  - K8sVersion   │  │                 │  │  + NodeRole     │  │  - K8sVersion   │
+           │                 │  │                 │  │  + Artifacts    │  │                 │
+           │  渲染 Manifest  │  │  渲染 Values     │  │  + Variables    │  │  Phase 执行     │
+           │  应用到集群      │  │  helm install   │  │                 │  │  (无需模板渲染)  │
+           │                 │  │                 │  │  渲染脚本        │  │                 │
+           │                 │  │                 │  │  SSH 执行       │   │                 │
+           └─────────────────┘  └─────────────────┘  └─────────────────┘   └─────────────────┘
 ```
 
-### 8.4 自定义函数定义
+### 7.4 自定义函数定义
 
 **设计思路**：TemplateRenderer 提供一组自定义函数，用于在模板中进行字符串处理、条件判断、版本比较等操作。这些函数通过 Go text/template 的 FuncMap 机制注册。
 
@@ -1847,9 +4314,9 @@ func (r *TemplateRenderer) RenderScript(script string, tmplCtx manifest.Template
 }
 ```
 
-## 9. DAG 集成详细设计
+## 8. DAG 集成详细设计
 
-### 9.1 执行器注册
+### 8.1 执行器注册
 
 **设计思路**：DAG 调度器根据 ComponentVersion 的类型选择对应的执行器。系统支持三种组件类型：Binary（二进制）、Inline（内联代码）、YAML（清单文件）。每种类型对应一个专门的 Executor，负责该类型组件的完整生命周期管理。
 
@@ -1881,30 +4348,28 @@ func (r *TemplateRenderer) RenderScript(script string, tmplCtx manifest.Template
                     │  switch cv.Spec.Type                 │
                     └────────────────────┬─────────────────┘
                                          │
-               ┌──────────────┬───────────┼──────────────┐
-               │              │           │              │
-               ▼              ▼           ▼              │
-     ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ │
-     │ ComponentType│ │ ComponentType│ │ ComponentType│ │
-     │ Binary       │ │ Inline       │ │ YAML         │ │
-     └──────┬───────┘ └──────┬───────┘ └──────┬───────┘ │
-            │                │                │         │
-            ▼                ▼                ▼         │
-      ┌──────────────┐ ┌──────────────┐ ┌──────────────┐│
-      │ BinaryCompo- │ │ InlineCompo- │ │ YamlCompo-   ││
-      │ nentExecutor │ │ nentExecutor │ │ nentExecutor ││
-      └──────┬───────┘ └──────┬───────┘ └──────┬───────┘│
-             │                │                │        │
-             │                │                ▼        │
-             │                │         ┌──────────────┐│
-             │                │         │ Yaml         ││
-             │                │         │ Installer    ││
-             │                │         │ (Store+Apply)││
-             │                │         └──────┬───────┘│
-             │                │                │        │
-             └────────────────┼────────────────┘────────┘
-                             │                │
-                             └────────────────┘
+              ┌──────────────┬───────────┼───────────┬──────────────┐
+              │              │           │           │              │
+              ▼              ▼           ▼           ▼              │
+    ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+    │ ComponentType│ │ ComponentType│ │ ComponentType│ │ ComponentType│
+    │ Binary       │ │ Inline       │ │ YAML         │
+    └──────┬───────┘ └──────┬───────┘ └──────┬───────┘ └──────┬───────┘
+           │                │                │                │
+           ▼                ▼                ▼                ▼
+     ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+     │ BinaryCompo- │ │ InlineCompo- │ │ YamlCompo-   │
+     │ nentExecutor │ │ nentExecutor │ │ nentExecutor │ │ nentExecutor │
+     └──────┬───────┘ └──────┬───────┘ └──────┬───────┘ └──────┬───────┘
+            │                │                │                │
+            │                │                │                ▼
+            │                │                │         ┌──────────────┐
+            │                │                │         │ Yaml         │
+            │                │                │         │ Installer    │
+            │                │                │         │ (Store+Apply)│
+            │                │                │         └──────┬───────┘
+            │                │                │                │
+            └────────────────┼────────────────┼────────────────┘
                              │                │
                              └────────────────┘
                                      │
@@ -1916,7 +4381,7 @@ func (r *TemplateRenderer) RenderScript(script string, tmplCtx manifest.Template
               └──────────────────────────────────────┘
 ```
 
-#### 9.1.1 当前代码分析
+#### 8.1.1 当前代码分析
 
 当前 `pkg/dagexec/scheduler.go` 中的 `executeComponent()` 仅二路分发，无执行器注册机制：
 
@@ -1942,7 +4407,7 @@ func (s *Scheduler) executeComponent(
 - 分发逻辑硬编码在 if-else 中，新增类型需修改 Scheduler 代码
 - 无执行器注册机制，无法按需注入
 
-#### 9.1.2 执行器注册表设计
+#### 8.1.2 执行器注册表设计
 
 **设计思路 - 为什么用注册表而非 switch-case**：
 
@@ -1986,14 +4451,14 @@ func (r *ExecutorRegistry) Has(componentType string) bool {
 }
 ```
 
-#### 9.1.3 执行器分发实现
+#### 8.1.3 执行器分发实现
 
 **设计思路 - 彻底去除 phaseframe 依赖**：
 
 现有 `Scheduler.ExecuteDAG(ctx, phaseCtx *phaseframe.PhaseContext, ...)` 直接接收 phaseframe 类型，使 `pkg/dagexec` 被 phaseframe 绑定。重构后：
 
 1. `ExecuteDAG` 改为接收 phaseframe-free 的 `ExecutionContext`（由 controllers 层从 `phaseframe.PhaseContext` 构建适配，phaseframe 类型不进入 dagexec 包）。
-2. `InlinePhaseRunner`（签名含 `*phaseframe.PhaseContext`）替换为 phaseframe-free 的 `InlineRunner` 接口（见 9.4.3.4），由 controllers 层 `InlinePhaseRunnerAdapter` 桥接。
+2. `InlinePhaseRunner`（签名含 `*phaseframe.PhaseContext`）替换为 phaseframe-free 的 `InlineRunner` 接口（见 8.4.3.3），由 controllers 层 `InlinePhaseRunnerAdapter` 桥接。
 3. 这样 `pkg/dagexec` 不再 import `pkg/phaseframe`，可独立编译测试。
 
 **设计思路 - 组件类型分发顺序（解决先有鸡还是先有蛋问题）**：
@@ -2009,7 +4474,7 @@ func (r *ExecutorRegistry) Has(componentType string) bool {
 ```go
 // pkg/dagexec/scheduler.go 重构 (phaseframe-free)
 
-// ComponentVersionStore 接口定义见 9.2 节 (pkg/dagexec/component_version_store.go)
+// ComponentVersionStore 接口定义见 8.2 节 (pkg/dagexec/component_version_store.go)
 
 // ExecuteDAG 执行 DAG (phaseframe-free 入口)
 // execCtx 由 controllers 层从 phaseframe.PhaseContext 构建适配后传入
@@ -2159,7 +4624,7 @@ func (r *BKEClusterReconciler) buildExecutionContext(
 
 **说明**：`buildExecutionContext` 是 controllers 层唯一接触 phaseframe 类型的地方。通过此桥接函数，`pkg/dagexec` 包完全不依赖 `pkg/phaseframe`，可独立编译测试。`NewExecutionContext` 内部自动初始化 `TemplateContext`，包括 `Variables` 和 `ComponentVariables` 字段，并从 `newCluster.Spec.ClusterConfig.Cluster` 提取集群信息（如 `ContainerRuntimeCRI`）。
 
-#### 9.1.4 Scheduler 初始化与执行器注入
+#### 8.1.4 Scheduler 初始化与执行器注入
 
 ```go
 // pkg/dagexec/scheduler.go 扩展
@@ -2236,11 +4701,11 @@ func NewScheduler(cfg Config) *Scheduler {
 **依赖构建要点**：
 
 - **共享依赖**：`httpClient` 在 Binary 中使用；`ManifestStore`/`ManifestApplier` 在基础路径和 YamlInstaller 之间共享
-- **缓存目录约定**：Binary 制品缓存 `/var/cache/bke/artifacts`，
+- **缓存目录约定**：Binary 制品缓存 `/var/cache/bke/artifacts`，Helm Chart 缓存 `/var/cache/bke/charts`
 - **httpClient 超时**：5 分钟，覆盖大制品下载场景
 - **SSH client 来源**：从 `BKEClusterReconciler` 注入（已有 SSH 连接池），避免重复创建
 - **TemplateRenderer**：无状态（仅 funcMap），全局共享；**ConfigRenderer**：需 K8s client（读取 Secret），按需创建
-- **各 Config 类型定义**：`BinaryInstallerConfig`（第 4 章）、`NewConfigRenderer`（第 9 章）
+- **各 Config 类型定义**：`BinaryInstallerConfig`（第 4 章）、`NewConfigRenderer`（第 8 章）
 
 ```go
 // controllers/capbke/bkecluster_upgrade_dag.go 扩展
@@ -2255,7 +4720,7 @@ func (r *BKEClusterReconciler) buildSchedulerConfig(
     bkeLogger *bkev1beta1.BKELogger,
 ) dagexec.Config {
     // 基础依赖 (Feature Gate ON/OFF 均需要)
-    // bundleStore 一个对象同时实现 manifest.Store + dagexec.ComponentVersionStore (见 9.1.4)
+    // bundleStore 一个对象同时实现 manifest.Store + dagexec.ComponentVersionStore (见 8.1.4)
     bundleStore := manifest.NewBundleStore(bundle)
     cfg := dagexec.Config{
         // InlineRunner: 通过适配器把 componentfactory.PhaseRunner (phaseframe-bound)
@@ -2268,7 +4733,7 @@ func (r *BKEClusterReconciler) buildSchedulerConfig(
     }
 
     // Feature Gate ON: 构建 Binary/YAML 执行器依赖
-    // 使用现有 pkg/featuregate 的注解/flag 模式 (见 12.2)，而非 featuregate.Enabled(string)
+    // 使用现有 pkg/featuregate 的注解/flag 模式 (见 11.2)，而非 featuregate.Enabled(string)
     if featuregate.BinaryComponentEnabled(newCluster) {
         // 1. 共享依赖
         cfg.NodeProvider = dagexec.NewBKENodeProvider(r.Client)
@@ -2358,7 +4823,7 @@ func (r *BKEClusterReconciler) buildTargetClientset(
 | **忽略 dynamic client** | `KubeClient()` 返回 `(*kubernetes.Clientset, dynamic.Interface)`，健康检查仅需 typed clientset |
 | **错误处理** | 远端 client 创建失败或 clientset 为 nil 时返回错误，调用方 `buildSchedulerAndExecute` 需处理错误 |
 
-#### 9.1.5 当前代码 vs 目标设计对比
+#### 8.1.5 当前代码 vs 目标设计对比
 
 | 维度 | 当前代码 (scheduler.go) | 目标设计 |
 | ------ | ------------------------ | --------- |
@@ -2370,7 +4835,7 @@ func (r *BKEClusterReconciler) buildTargetClientset(
 | **扩展性** | 新增类型需修改 `executeComponent()` | 新增类型只需 `registry.Register()`，Scheduler 不变 |
 | **未注册类型处理** | 走 Manifest 路径 | 回退到 YAML/Manifest 路径（兼容未迁移组件） |
 
-### 9.2 ComponentVersionStore
+### 8.2 ComponentVersionStore
 
 **设计思路 — 跨执行器共享的 CV 加载抽象**：
 
@@ -2467,7 +4932,7 @@ func (s *BundleStore) GetComponentVersion(context.Context,name, version string,)
 
 > **错误信息约定**：与 `GetComponentManifests` 一致——未找到时返回 `"component %s not found in release bundle"`，其中 `%s` 为 `name@version` 键。
 
-### 9.3 DAG 调度执行流程
+### 8.3 DAG 调度执行流程
 
 **设计思路**：DAG 调度采用"批次间串行、批次内并行"的执行策略。首先通过拓扑排序将 DAG 分解为多个批次，然后按顺序执行每个批次，批次内的组件可以并行执行。这种策略既保证了依赖关系的正确性，又最大化了并行度。
 
@@ -2541,7 +5006,7 @@ func (s *BundleStore) GetComponentVersion(context.Context,name, version string,)
                               └─────────────┘ └─────────┘ └─────────┘
 ```
 
-### 9.4 核心接口定义
+### 8.4 核心接口定义
 
 **设计思路 - 接口分层与解耦**：
 
@@ -2600,11 +5065,11 @@ func (s *BundleStore) GetComponentVersion(context.Context,name, version string,)
             ┌────────────────┼────────────────┬──────────────┐
             │                │                │              │
             ▼                ▼                ▼              ▼
-    ┌──────────────┐  ┌────────────┐  ┌────────────┐
-    │   Binary     │  │    YAML    │  │   Inline   │
-    │ Component    │  │ Component  │  │ Component  │
-    │ Executor     │  │ Executor   │  │ Executor   │
-    └──────┬───────┘  └─────┬──────┘  └─────┬──────┘
+   ┌──────────────┐  ┌──────────────┐  ┌────────────┐  ┌────────────┐
+   │   Binary     │    YAML    │  │   Inline   │
+   │ Component    │  │ Component    │  │ Component  │  │ Component  │
+   │ Executor     │  │ Executor     │  │ Executor   │  │ Executor   │
+   └──────┬───────┘  └──────┬───────┘  └─────┬──────┘  └─────┬──────┘
           │                 │                │               │
           ▼                 ▼                ▼               ▼
   ┌──────────────┐  ┌──────────────┐  ┌────────────┐  ┌────────────┐
@@ -2617,7 +5082,7 @@ func (s *BundleStore) GetComponentVersion(context.Context,name, version string,)
   控制流: ComponentExecutor 根据 VersionContext 自主决定操作类型
 ```
 
-#### 9.4.1 ExecutionContext 定义
+#### 8.4.1 ExecutionContext 定义
 
 **设计思路 - 为什么用 VersionContext 而非 IsUpgrade bool 或 OperationType 枚举**：
 
@@ -2722,7 +5187,7 @@ func (vc *VersionContext) NeedsUpgrade(name string) bool {
 //
 // 设计说明:
 // - 不引用 phaseframe 任何类型；Inline 路径通过 InlineRunner 接口桥接
-//   (见 9.4.3.4)，由 controllers 层提供适配实现
+//   (见 8.4.3.3)，由 controllers 层提供适配实现
 // - OldCluster 供 InlineComponentExecutor 调用 InlineRunner.Execute 时传入
 // - TargetClient 供 YAML 健康检查访问目标集群 (Pod/Endpoint)
 type ExecutionContext struct {
@@ -2818,7 +5283,7 @@ func NewExecutionContext(
 }
 ```
 
-#### 9.4.2 NodeProvider 接口定义
+#### 8.4.2 NodeProvider 接口定义
 
 **设计思路**：NodeProvider 接口抽象节点获取逻辑，替代原来对 phaseframe.NodeFetcher 的依赖。Node 结构体仅包含基础信息（Name/IP/Hostname/Role），不包含 Arch/OS/OSVersion。Arch 由 BinaryInstaller 在 Install() 中通过 SSH 发现（`uname -m`），OS 由安装脚本运行时自检测（`/etc/os-release`），NodeProvider 不执行 SSH 预检测。
 
@@ -2911,7 +5376,7 @@ func (p *BKENodeProvider) GetNodesByRole(ctx context.Context, cluster *bkev1beta
 }
 ```
 
-#### 9.4.3 ComponentExecutor 接口 (解耦后)
+#### 8.4.3 ComponentExecutor 接口 (解耦后)
 
 ```go
 // pkg/dagexec/executor.go
@@ -2963,7 +5428,7 @@ type ComponentExecutor interface {
 
 **Binary 是唯一需要独立 Installer 的类型**，因为 Binary 组件的安装逻辑最复杂（SSH 发现架构→下载制品→缓存→校验→渲染脚本→渲染配置→SSH 上传→SSH 执行→健康检查），且需要逐节点执行（节点级并发控制）。
 
-##### 9.4.3.1 BinaryComponentExecutor
+##### 8.4.3.1 BinaryComponentExecutor
 
 ```go
 // BinaryComponentExecutor 二进制组件执行器
@@ -3324,11 +5789,11 @@ func (e *BinaryComponentExecutor) rollback(node Node, cv *ComponentVersion) erro
 }
 ```
 
-##### 9.4.3.3 YamlComponentExecutor
+##### 8.4.3.2 YamlComponentExecutor
 
 **设计思路 — YAML 组件两层模型（与 Binary 对称）**：
 
-YAML 组件采用两层结构：`YamlInstaller`（`pkg/yamlinstaller` 引擎层，负责清单 Apply + 健康检查，**详见第 6 章**）+ `YamlComponentExecutor`（dagexec 调度层，本节）。本节仅描述调度层 `YamlComponentExecutor`，引擎层接口定义见 **6.3 核心接口定义**。
+YAML 组件采用两层结构：`YamlInstaller`（`pkg/yamlinstaller` 引擎层，负责清单 Apply + 健康检查，**详见第 5 章**）+ `YamlComponentExecutor`（dagexec 调度层，本节）。本节仅描述调度层 `YamlComponentExecutor`，引擎层接口定义见 **6.3 核心接口定义**。
 
 ```go
 // pkg/dagexec/yaml_component_executor.go
@@ -3397,9 +5862,9 @@ func (e *YamlComponentExecutor) ExecuteComponent(ctx context.Context, node *Comp
 }
 ```
 
-> 健康检查由 `YamlInstaller.Apply` 内部委托共享 `pkg/healthcheck` 包完成（见 **第 7 章 HealthCheck 共享包设计**）。
+> 健康检查由 `YamlInstaller.Apply` 内部委托共享 `pkg/healthcheck` 包完成（见 **第 6 章 HealthCheck 共享包设计**）。
 
-##### 9.4.3.4 InlineComponentExecutor
+##### 8.4.3.3 InlineComponentExecutor
 
 **设计思路 — Inline 是最简执行器，无 Installer、无调度策略**：
 
@@ -3511,9 +5976,9 @@ func (a *InlinePhaseRunnerAdapter) Execute(ctx context.Context, oldCluster, newC
 - **TemplateContext**：复用 `manifest.TemplateContext`，所有组件类型共享使用
 - **解耦收益**：`pkg/dagexec` 包可独立编译和测试，不依赖 phaseframe
 
-### 9.5 状态模型、幂等性与兼容性设计
+### 8.5 状态模型、幂等性与兼容性设计
 
-#### 9.5.1 问题分析
+#### 8.5.1 问题分析
 
 当前设计存在三个状态相关缺口：
 
@@ -3533,7 +5998,7 @@ func (a *InlinePhaseRunnerAdapter) Execute(ctx context.Context, oldCluster, newC
 | kubernetes | `GetNeedUpgradeK8sNodes` + 角色过滤 | `KubernetesVersion` + master/worker |
 | etcd | `filterUpgradeableNodes` + `.Etcd()` | `EtcdVersion` + etcd 角色 |
 
-#### 9.5.2 分层架构
+#### 8.5.2 分层架构
 
 ```txt
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -3585,7 +6050,7 @@ func (a *InlinePhaseRunnerAdapter) Execute(ctx context.Context, oldCluster, newC
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### 9.5.3 状态数据模型
+#### 8.5.3 状态数据模型
 
 **新增 `ComponentPhase` 状态枚举**：
 
@@ -3726,7 +6191,7 @@ BKENode.Status
 | `BKECluster.Status.NodeComponentStatuses` | NodeStatusUpdater (BinaryComponentExecutor) | NodeFilter、BinaryComponentExecutor | per-node 幂等判断 |
 | `BKENode.Status.StateCode` | 兼容层 (Feature Gate OFF) | NodeFilter (兼容模式) | 向后兼容 |
 
-#### 9.5.4 NodeFilter 接口
+#### 8.5.4 NodeFilter 接口
 
 **接口定义**：
 
@@ -3902,7 +6367,7 @@ func (f *BKENodeFilter) isAlreadyAtTarget(
 // - Phase=Failed/Timeout → 不跳过，允许重试（安装到最新目标版本）
 // - Phase=Installed 但 Version != targetVersion → 不跳过，允许升级
 // - 防止安装失败后目标版本变更时，重试安装到旧版本
-// 完整实现见 9.5.11.3 节。
+// 完整实现见 8.5.11.2 节。
 ```
 
 **各组件配置样例**：
@@ -3954,7 +6419,7 @@ spec:
 | EnsureEtcdUpgrade | `.Etcd()` | `roles: ["etcd"]` | ✅ |
 | GPU 组件 (新增) | 无对应 Phase | `matchLabels: {"gpu": "true"}` | ✅ 新能力 |
 
-#### 9.5.5 NodeStatusUpdater 接口
+#### 8.5.5 NodeStatusUpdater 接口
 
 **接口定义**：
 
@@ -4024,7 +6489,7 @@ func (u *BKENodeStatusUpdater) MarkSuccess(
 // 🆕增强说明: MarkSuccess 在 componentName == "bkeagent" 时，需同步设置
 // BKENode.Status.StateCode 的 NodeAgentReadyFlag (bit 1)，确保后续
 // EnsureNodesEnv 能通过 StateCode 判断 bkeagent 就绪。
-// 完整实现见 9.5.11.1 节。
+// 完整实现见 8.5.11.1 节。
 
 func (u *BKENodeStatusUpdater) MarkFailed(
     ctx context.Context,
@@ -4200,7 +6665,7 @@ func (u *BKEComponentStatusUpdater) updateComponentStatus(
 }
 ```
 
-#### 9.5.6 各组件执行流程
+#### 8.5.6 各组件执行流程
 
 **BinaryComponentExecutor 完整流程**：
 
@@ -4305,6 +6770,7 @@ func (u *BKEComponentStatusUpdater) updateComponentStatus(
              ▼
   ┌──────────────────────────────────────┐
   │  4. 执行安装                          │
+  │  HelmInstaller.Install() 或          │
   │  YamlInstaller.Apply()               │
   └──────────┬───────────────────────────┘
              │
@@ -4325,7 +6791,7 @@ func (u *BKEComponentStatusUpdater) updateComponentStatus(
 
 与 Binary/YAML 不同，Inline 组件不记录状态（由 Phase 自身 `NeedExecute()` 判断幂等性），也不需要 NodeFilter、NodeStatusUpdater 或 ComponentStatusUpdater。
 
-#### 9.5.7 状态转换表
+#### 8.5.7 状态转换表
 
 **状态转换图 (节点级 - NodeComponentStatuses，仅 Binary 组件)**：
 
@@ -4475,7 +6941,7 @@ Binary 组件特有转换：
 | **YAML** | ❌ 不需要 | ✅ 安装开始/结束时更新 | 集群级部署，无 per-node 状态 |
 | **Inline** | ❌ 不需要 | ❌ 不需要 | 由 Phase 自身管理状态 |
 
-#### 9.5.8 幂等性设计
+#### 8.5.8 幂等性设计
 
 **各组件类型的幂等机制**：
 
@@ -4521,7 +6987,7 @@ Binary 组件特有转换：
   → 仅对 10.0.0.2 和 10.0.0.3 执行
 ```
 
-#### 9.5.9 兼容性设计
+#### 8.5.9 兼容性设计
 
 **Feature Gate OFF (旧路径)**：
 
@@ -4553,7 +7019,7 @@ BKEClusterReconciler → DAG Scheduler → BinaryComponentExecutor / ...
 
 **问题**：Feature Gate 首次开启时，`NodeComponentStatuses` 为空，但节点上已安装了组件（通过旧路径的 StateCode 位标记记录）。如果不处理，NodeFilter 会对所有节点重新安装。
 
-**方案**：NodeFilter 的双源读取（已在 9.5.4 节实现）
+**方案**：NodeFilter 的双源读取（已在 8.5.4 节实现）
 
 ```txt
 NodeFilter.isAlreadyAtTarget():
@@ -4592,7 +7058,7 @@ Feature Gate OFF → ON (再次开启):
 | 已有集群 + FG ON→OFF→ON | ON (再次) | StateCode (OFF 期间更新) → NodeComponentStatuses (重新初始化) | 不重复安装 |
 | 混合模式 (containerd ON, bkeagent OFF) | 部分 ON | 各组件独立判断 | containerd 走新路径，bkeagent 走旧路径 |
 
-#### 9.5.10 设计决策总结
+#### 8.5.10 设计决策总结
 
 | 决策 | 选择 | 理由 |
 | ------ | ------ | ------ |
@@ -4611,11 +7077,11 @@ Feature Gate OFF → ON (再次开启):
 | 部分成功状态 | `PartialSuccess` (仅 Binary) | 精确反映多节点部署的部分成功场景 |
 | 超时状态 | `Timeout` | 区分超时和其他失败，便于诊断和重试 |
 
-#### 9.5.11 扩容场景增强设计
+#### 8.5.11 扩容场景增强设计
 
-**设计思路**：节点扩容（Scale-Out）是集群生命周期中的高频操作。新节点加入时，需要依次完成 bkeagent 推送、containerd 安装、环境初始化、kubeadm join 四个阶段。上述 9.5.1-9.5.10 的设计已覆盖基本的幂等和过滤逻辑，但在以下两个边界场景存在增强空间：① bkeagent 安装完成后 HealthCheck 与 `NodeAgentReadyFlag` 的衔接；② 扩容与升级同时触发时的幂等保护。
+**设计思路**：节点扩容（Scale-Out）是集群生命周期中的高频操作。新节点加入时，需要依次完成 bkeagent 推送、containerd 安装、环境初始化、kubeadm join 四个阶段。上述 8.5.1-8.5.10 的设计已覆盖基本的幂等和过滤逻辑，但在以下两个边界场景存在增强空间：① bkeagent 安装完成后 HealthCheck 与 `NodeAgentReadyFlag` 的衔接；② 扩容与升级同时触发时的幂等保护。
 
-##### 9.5.11.1 增强 1：bkeagent 就绪状态同步
+##### 8.5.11.1 增强 1：bkeagent 就绪状态同步
 
 **问题**：containerd 的 DAG 依赖 bkeagent（拓扑排序保证批次顺序）。bkeagent 安装完成后，`BinaryInstaller.HealthCheck` 仅验证 `systemctl is-active bkeagent`（进程存活），`NodeStatusUpdater.MarkSuccess` 仅写入 `NodeComponentStatuses`。但后续 `EnsureNodesEnv`（Inline 组件）显式检查 `BKENode.Status.StateCode` 的 `NodeAgentReadyFlag`（bit 1）来判断 bkeagent 是否可与控制器通信。两条状态链路独立，可能导致 containerd 安装时 bkeagent 进程存活但尚未注册就绪。
 
@@ -4683,7 +7149,7 @@ DAG Batch 2: containerd (binary, 依赖 bkeagent)     │
   EnsureNodesEnv 检查通过 ←─────────────────────────┘
 ```
 
-##### 9.5.11.2 增强 3：扩容+升级并发幂等保护
+##### 8.5.11.2 增强 3：扩容+升级并发幂等保护
 
 **问题**：当新节点加入集群时，如果恰好触发了版本升级（`desiredVersion` 变更），可能出现以下竞态：
 
@@ -4741,9 +7207,9 @@ func (f *BKENodeFilter) isAlreadyAtTarget(
 | 扩容+升级同时 | `{Phase: Installed, Version: v2.6.0}` (安装 Phase 已写入) | target=v2.6.0 | true → 跳过 | 升级 Phase 幂等跳过 ✅ |
 | 二次升级中间态 | `{Phase: Installed, Version: v1.7.18}` | target=v1.7.20 | false → 不跳过 | 升级到 v1.7.20 ✅ |
 
-## 10. 完整安装流程详细设计
+## 9. 完整安装流程详细设计
 
-### 10.1 安装流程图
+### 9.1 安装流程图
 
 **设计思路**：完整安装流程从用户创建 BKECluster 开始，经过 ReleaseImage 解析、ComponentVersion 加载、DAG 构建、DAG 执行，最终完成所有组件的安装。流程中 Binary/YAML/Inline 四种类型的组件通过各自的 Executor 并行执行——Binary 组件通过 SSH 在远程节点安装二进制制品，YAML 组件通过 YamlComponentExecutor 将 Kubernetes 清单直接应用到目标集群，Inline 组件通过内联执行器完成 Kubernetes 集群初始化。所有组件安装完成后通过健康检查确认安装成功。
 
@@ -4751,7 +7217,7 @@ func (f *BKENodeFilter) isAlreadyAtTarget(
 
 - **声明式安装**：通过 ReleaseImage 声明需要安装的组件列表
 - **DAG 调度**：根据组件依赖关系构建 DAG，按拓扑顺序执行
-- **多类型支持**：Binary、YAML、Inline
+- **多类型支持**：Binary、Helm、YAML、Inline
 - **健康检查**：安装完成后执行 PodReady/EndpointReady 检查
 - **YAML 清单应用**：YAML 类型组件通过 YamlComponentExecutor 应用 Kubernetes 清单，支持 ServerSideApply/Replace/CreateOnly 三种策略
 
@@ -4784,7 +7250,7 @@ func (f *BKENodeFilter) isAlreadyAtTarget(
                       │  install.components:                 │
                       │  ├── containerd/v1.7.18 (binary)     │
                       │  ├── bkeagent/v2.6.0 (binary)        │
-                      │  ├── openfuyao-core/v26.03 (yaml)    │
+                                            │  ├── openfuyao-core/v26.03 (yaml)    │
                       │  ├── kubernetes-master/v1.29.0       │
                       │  │                   (inline)        │
                       │  └── kubernetes-worker/v1.29.0       │
@@ -4813,7 +7279,7 @@ func (f *BKENodeFilter) isAlreadyAtTarget(
                       │                     (inline)         │
                       │                   → kubernetes-worker│
                       │                     (inline)         │
-                      │                   → openfuyao-core   │
+                                            │                   → openfuyao-core   │
                       │                     (yaml)           │
                       │                   → addon            │
                       │                   → postprocess      │
@@ -4860,7 +7326,11 @@ func (f *BKENodeFilter) isAlreadyAtTarget(
                     └────────────────────┬─────────────────┘
                                          │
                                          ▼
-                    ┌──────────────────────────────────────┐
+                     ┌──────────────────────────────────────┐
+                     │  8. YamlComponentExecutor            │
+                     │  执行 YAML 类型组件安装               │
+                     └────────────────────┬─────────────────┘
+                                          │
                      ┌────────────────────┼────────────────────┐
                      │                    │                    │
                      ▼                    ▼                    ▼
@@ -4890,9 +7360,9 @@ func (f *BKENodeFilter) isAlreadyAtTarget(
                     └─────────────────┘   └─────────────────┘
 ```
 
-## 11. 完整升级流程详细设计
+## 10. 完整升级流程详细设计
 
-### 11.1 升级流程图
+### 10.1 升级流程图
 
 **设计思路**：完整升级流程从用户修改 ClusterVersion 的 desiredVersion 开始，经过版本对比、DAG 构建、DAG 执行，最终完成所有组件的升级。流程中通过对比当前 ReleaseImage 和目标 ReleaseImage 确定需要升级的组件，Binary 组件采用滚动升级策略，
 
@@ -4900,6 +7370,7 @@ func (f *BKENodeFilter) isAlreadyAtTarget(
 
 - **版本对比**：对比当前和目标 ReleaseImage 确定升级范围
 - **滚动升级**：Binary 组件逐节点升级，确保服务不中断
+- **原子升级**：Helm 组件使用 `--atomic` 标志，失败自动回滚
 - **失败策略**：支持 FailFast/Continue/Rollback 三种策略
 - **YAML 清单升级**：YAML 类型组件通过 ServerSideApply 增量更新，支持 Prune 裁剪不再需要的资源
 
@@ -4959,7 +7430,7 @@ func (f *BKENodeFilter) isAlreadyAtTarget(
                       │  DAG 结构:                           │
                       │  provider → agent (binary)           │
                       │            → containerd (binary)     │
-                      │            → openfuyao-core (yaml)   │
+                                            │            → openfuyao-core (yaml)   │
                       │            → etcd (inline)           │
                       │            → kubernetes-worker       │
                       │              (inline)                │
@@ -4986,8 +7457,6 @@ func (f *BKENodeFilter) isAlreadyAtTarget(
                    └────────────────────┼────────────────────┘
                                         │
                                         ▼
-                     ┌──────────────────────────────────────┐
-                                          ▼
                      ┌──────────────────────────────────────┐
                      │  Batch 5: openfuyao-core (yaml)      │
                      │  ServerSideApply 增量更新             │
@@ -5019,9 +7488,9 @@ func (f *BKENodeFilter) isAlreadyAtTarget(
                     └─────────────────┘   └─────────────────┘
 ```
 
-## 12. 迁移策略详细设计
+## 11. 迁移策略详细设计
 
-### 12.1 迁移流程图
+### 11.1 迁移流程图
 
 **设计思路**：迁移策略通过 Feature Gate 控制新旧两种执行路径。启用 Feature Gate 后，新集群使用 DAG + BinaryInstaller 的新路径，旧集群保持原有的硬编码 Phase 路径。兼容层在 reconcile 时根据 Feature Gate 状态选择执行路径，确保平滑迁移。
 
@@ -5072,7 +7541,7 @@ func (f *BKENodeFilter) isAlreadyAtTarget(
                      └──────────────────────────────────────┘
 ```
 
-### 12.2 Feature Gate 定义
+### 11.2 Feature Gate 定义
 
 **设计思路 - 复用现有 `pkg/featuregate` 注解/flag 模式**：
 
@@ -5091,7 +7560,6 @@ const (
     // 注解值为 "true" 时启用；未设置时回退到全局 flag
     BinaryComponentAnnotationKey = "cvo.openfuyao.cn/binary-component"
 
-)
 
 // BinaryComponentEnabled 判断是否启用 Binary 组件路径
 // 优先级: 对象注解 "true" > 全局 config.BinaryComponentSupport flag > false
@@ -5101,6 +7569,240 @@ func BinaryComponentEnabled(obj client.Object) bool {
         return annotations.Get(obj, BinaryComponentAnnotationKey) == "true"
     }
     return config.BinaryComponentSupport // 全局 flag (utils/capbke/config)
+}
+
+**调用方式对齐**：原设计中 `featuregate.Enabled(featuregate.BinaryComponentSupport)` 改为 `featuregate.BinaryComponentEnabled(cluster)`（见 8.1.4 `buildSchedulerConfig`、11.3.6 `getK8sEnvInitScope`）。
+
+**全局 flag 注册**：在 `utils/capbke/config` 中新增 `BinaryComponentSupport` bool 变量，与现有 `DeclarativeUpgrade` 一致，通过控制器启动参数注入。
+
+### 11.3 容器运行时重构详细设计
+
+**设计思路**：容器运行时是集群核心组件，当前代码中 containerd 和 Docker 的安装/升级逻辑均嵌入在 bkeagent 内置命令中，控制器无法控制安装路径、配置内容、制品来源。将容器运行时拆分为独立的 binary 组件，通过 BinaryInstaller SSH 推送安装，实现声明式管理。同时引入 `selector` 类型支持 containerd 和 Docker 的互斥选择。
+
+#### 11.3.1 概述
+
+**重构目标**：
+
+- 容器运行时安装/升级从 bkeagent 内置命令改为 BinaryInstaller SSH 推送
+- 配置文件（config.toml/daemon.json、systemd service）通过 `configTemplates` 声明式定义
+- 支持 containerd 和 Docker 互斥选择（通过 `selector` 类型）
+- 支持在线/离线场景统一处理
+
+**containerd 与 Docker 的关键差异**：
+
+| 维度 | containerd | Docker |
+| ------ | ----------- | -------- |
+| **制品方式** | 二进制下载（tar.gz 解压） | 包管理器安装（yum/apt） |
+| **配置文件** | `/etc/containerd/config.toml` + `hosts.toml`（多个） | `/etc/docker/daemon.json`（单个） |
+| **镜像仓库配置** | `hosts.toml` 按 registry 动态生成（forEach） | `daemon.json` 的 `registry-mirrors` 字段 |
+| **CRI 适配** | 原生支持 CRI | 需要 `cri-dockerd` 作为 CRI 适配层（K8s ≥ 1.24） |
+| **组件数量** | 1 个（containerd） | 2 个（docker + cri-dockerd，依赖关系：docker → cri-dockerd） |
+| **安装路径** | `/usr/local/bin/` | 系统包管理器默认路径（`/usr/bin/`） |
+
+**bke-manifests 新增文件**：
+
+```txt
+bke-manifests/
+├── container-runtime/v1.0.0/component.yaml   ← type: selector (新增)
+├── containerd/v1.7.18/component.yaml         ← type: binary (新增)
+├── docker/v26.0.0/component.yaml             ← type: binary (新增)
+├── cri-dockerd/v0.3.9/component.yaml         ← type: binary (新增)
+├── bkeagent/v2.6.0/component.yaml            ← type: binary (新增)
+└── ...
+```
+
+#### 11.3.2 Selector 类型：容器运行时互斥选择
+
+ReleaseImage 引用 `container-runtime/v1.0.0`（type=selector），DAG 构建期根据 `BKECluster.Spec.Cluster.ContainerRuntime.CRI` 自动展开为 containerd 或 docker + cri-dockerd。
+
+**ReleaseImage 定义**：
+
+```yaml
+spec:
+  install:
+    components:
+      - name: container-runtime   # ← selector 类型, DAG 展开为 containerd 或 docker
+        version: v1.0.0
+```
+
+**Selector 展开规则**：
+
+- `BKECluster.Spec.Cluster.ContainerRuntime.CRI == "containerd"` → 展开为 `containerd/v1.7.18`
+- `BKECluster.Spec.Cluster.ContainerRuntime.CRI == "docker"` → 展开为 `docker/v26.0.0` + `cri-dockerd/v0.3.9`（依赖关系：docker → cri-dockerd）
+
+**container-runtime ComponentVersion YAML（selector 类型）**：
+
+```yaml
+# bke-manifests/container-runtime/v1.0.0/component.yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: container-runtime-v1.0.0
+spec:
+  name: container-runtime
+  type: selector
+  version: v1.0.0
+  subComponents:
+    - name: containerd
+      version: v1.7.18
+      condition: '{{.ContainerRuntimeCRI == "containerd"}}'
+    - name: docker
+      version: v26.0.0
+      condition: '{{.ContainerRuntimeCRI == "docker"}}'
+    - name: cri-dockerd
+      version: v0.3.9
+      condition: '{{.ContainerRuntimeCRI == "docker"}}'
+   upgradeStrategy:
+    mode: Rolling
+    batchSize: 1
+    timeout: "10m"
+    failurePolicy: FailFast
+```
+
+#### 11.3.3 Selector 依赖处理
+
+当组件类型为 selector 时，依赖解析面临两个问题：
+
+**问题 1**：Selector 的依赖需要传递给子组件
+
+```yaml
+# container-runtime selector
+spec:
+  type: selector
+  dependencies:
+    - name: bkeagent  # selector 依赖 bkeagent
+  subComponents:
+    - name: containerd
+      condition: '{{.ContainerRuntimeCRI == "containerd"}}'
+    - name: docker
+      condition: '{{.ContainerRuntimeCRI == "docker"}}'
+```
+
+展开后，`containerd` 或 `docker` 应该继承 `bkeagent` 依赖，但当前实现不会传递。
+
+**问题 2**：其他组件对 selector 的依赖需要展开
+
+```yaml
+# kubernetes-master 依赖 container-runtime
+spec:
+  dependencies:
+    - name: container-runtime  # 这是 selector
+```
+
+展开后，`kubernetes-master` 应该依赖实际的子组件（`containerd` 或 `docker`），但当前实现无法自动转换。
+
+##### 11.3.3.1 设计原则
+
+**原则 1**：依赖定义在具体组件中
+
+不在 selector 的 `subComponents` 中定义依赖，而是在具体组件的 `spec.dependencies` 中定义：
+
+```yaml
+# containerd/v1.7.18/component.yaml
+spec:
+  name: containerd
+  type: binary
+  dependencies:
+    - name: bkeagent
+
+# docker/v26.0.0/component.yaml
+spec:
+  name: docker
+  type: binary
+  dependencies:
+    - name: bkeagent
+
+# cri-dockerd/v0.3.9/component.yaml
+spec:
+  name: cri-dockerd
+  type: binary
+  dependencies:
+    - name: docker      # cri-dockerd 依赖 docker
+    - name: bkeagent
+```
+
+**优势**：
+
+- ✅ 不需要扩展 `SubComponent` 结构体
+- ✅ 依赖关系在具体组件中定义，更清晰
+- ✅ 符合现有依赖解析机制
+- ✅ 每个组件独立维护自己的依赖
+
+**原则 2**：对 selector 的依赖展开为对所有子组件的依赖（AND 语义）
+
+当 selector 展开为多个子组件时，将对 selector 的依赖转换为对所有子组件的依赖，由 DAG 拓扑排序自动处理执行顺序。
+
+**示例**：
+
+```txt
+CRI=docker
+container-runtime → [docker, cri-dockerd]
+kubernetes-master 依赖 container-runtime → 转换为依赖 [docker, cri-dockerd]
+
+DAG 执行顺序：
+1. bkeagent
+2. docker
+3. cri-dockerd (等待 docker 完成)
+4. kubernetes-master (等待 docker + cri-dockerd 完成)
+```
+
+**实际效果**：虽然 `kubernetes-master` 同时依赖 `docker` 和 `cri-dockerd`，但由于 `cri-dockerd` 已经依赖 `docker`，所以 `docker` 的依赖是冗余的，最终效果等同于只依赖 `cri-dockerd`。
+
+##### 11.3.3.2 实现方案
+
+**数据结构**：
+
+```go
+// SelectorMapping 记录 selector 展开后的子组件映射
+type SelectorMapping struct {
+    SelectorName  string   // selector 名称
+    ExpandedNames []string // 展开后的子组件名称列表
+}
+```
+
+**修改 expandSelectorComponents**：
+
+```go
+// expandSelectorComponents 在 DAG 构建期展开 selector 类型的 ComponentVersion
+// selector 自身不产生 DAG 节点；遍历 subComponents，评估 condition，为真的子组件创建 DAG 节点
+// 同时合并 selector 的依赖和子组件自身的依赖
+func (s *Scheduler) expandSelectorComponents(
+    ctx context.Context,
+    execCtx *ExecutionContext,
+    cv *configv1alpha1.ComponentVersion,
+) ([]topology.ComponentNode, error) {
+    if cv.Spec.Type != configv1alpha1.ComponentTypeSelector {
+        return nil, nil // 非 selector 类型, 不展开
+    }
+
+    var nodes []topology.ComponentNode
+    for _, sub := range cv.Spec.SubComponents {
+        if sub.Condition == "" {
+            // 无 condition = 始终纳入 (兼容组合语义)
+            node, err := s.buildSubComponentNode(ctx, cv, sub)
+            if err != nil {
+                return nil, err
+            }
+            nodes = append(nodes, node)
+            continue
+        }
+        
+        // 评估 condition
+        matched, err := s.evaluateCondition(sub.Condition, execCtx.TemplateContext)
+        if err != nil {
+            return nil, fmt.Errorf("failed to evaluate condition for %s: %w", sub.Name, err)
+        }
+        
+        if matched {
+            node, err := s.buildSubComponentNode(ctx, cv, sub)
+            if err != nil {
+                return nil, err
+            }
+            nodes = append(nodes, node)
+        }
+    }
+    
+    return nodes, nil
 }
 
 // buildSubComponentNode 构建子组件节点，合并 selector 和子组件的依赖
@@ -5250,7 +7952,7 @@ func BuildUpgradeDAG(
 }
 ```
 
-##### 12.3.3.3 完整流程示例
+##### 11.3.3.3 完整流程示例
 
 **输入**：
 
@@ -5321,7 +8023,7 @@ spec:
    Batch 3: [kubernetes-master]
 ```
 
-##### 12.3.3.4 边界情况处理
+##### 11.3.3.4 边界情况处理
 
 **循环依赖检测**：
 
@@ -5366,16 +8068,16 @@ if len(expandedNames) == 0 {
 }
 ```
 
-##### 12.3.3.5 优势分析
+##### 11.3.3.5 优势分析
 
 1. **实现简单**：不需要额外逻辑判断依赖哪个子组件
 2. **正确性保证**：DAG 拓扑排序自动处理执行顺序
 3. **冗余依赖无害**：即使依赖了多个组件，DAG 也会正确执行
 4. **通用性强**：适用于任何 selector 展开场景
 
-#### 12.3.4 containerd 重构
+#### 11.3.4 containerd 重构
 
-##### 12.3.4.1 当前 Phase 逻辑分析
+##### 11.3.4.1 当前 Phase 逻辑分析
 
 containerd 的安装和升级分别由两个 Phase 负责，且都依赖 bkeagent 内置命令完成：
 
@@ -5405,7 +8107,7 @@ containerd 安装嵌入在节点环境初始化流程中，不是独立 Phase：
 - 升级路径 `EnsureContainerdUpgrade` 也委托给 bkeagent 内置命令，非 SSH 推送
 - config.toml、containerd.service 内容由 bkeagent 内部生成，不可声明式配置
 
-##### 12.3.4.2 ComponentVersion YAML 完整定义
+##### 11.3.4.2 ComponentVersion YAML 完整定义
 
 ```yaml
 # bke-manifests/containerd/v1.7.18/component.yaml
@@ -5636,7 +8338,7 @@ spec:
     excludeAppointment: true
 ```
 
-##### 12.3.4.3 containerd 配置模板 (含 forEach hosts.toml)
+##### 11.3.4.3 containerd 配置模板 (含 forEach hosts.toml)
 
 **设计思路**：containerd 组件的 `configTemplates` 包含两类配置文件：静态文件（config.toml、containerd.service，各一个）和动态文件（hosts.toml，按 registry 数量生成多个）。动态文件通过 `forEach` 机制展开，迭代源为 `Config.Cluster.ContainerRuntime.Registry`。在线场景（ContainerdConfig CR）和离线场景（Legacy repo + insecureRegistries）由 BinaryInstaller 统一转换为相同的 `map[string]interface{}` 结构，模板无感知。
 
@@ -5781,7 +8483,7 @@ configTemplates:
 | hosts.toml 内容 | `hosts_toml.go` 生成 | `configTemplates[*].content` 渲染 | `diff` 对比两份输出 |
 | 在线/离线一致性 | 两套独立代码路径 | 同一份 YAML，数据注入不同 | 相同 registry 输入，输出文件一致 |
 
-##### 12.3.4.4 containerd 字段映射表
+##### 11.3.4.4 containerd 字段映射表
 
 | 旧硬编码逻辑 | 新 ComponentVersion 字段 | 说明 |
 | ------------- | ------------------------ | ------ |
@@ -5802,7 +8504,7 @@ configTemplates:
 | 无超时控制 | `upgradeStrategy.timeout: "10m"` | 超时可配置 |
 | 不支持卸载 | `binary.uninstallScript` | 卸载脚本声明式化 |
 
-##### 12.3.4.5 containerd 行为等价性验证点
+##### 11.3.4.5 containerd 行为等价性验证点
 
 | 验证项 | 旧路径 | 新路径 (BinaryInstaller) | 验证方法 |
 | -------- | -------- | ------------------------ | --------- |
@@ -5818,9 +8520,9 @@ configTemplates:
 | Feature Gate OFF 回退 | `EnsureNodesEnv` 含 `runtime` | `EnsureNodesEnv` 含 `runtime` | 行为不变 |
 | containerd 版本传递 | `ENV.ContainerdVersion` 字段 | `VersionContext.TargetVersion` | 相同版本输入结果一致 |
 
-#### 12.3.5 Docker + cri-dockerd 重构
+#### 11.3.5 Docker + cri-dockerd 重构
 
-##### 12.3.5.1 当前 Phase 逻辑分析
+##### 11.3.5.1 当前 Phase 逻辑分析
 
 Docker 和 cri-dockerd 的安装嵌入在 `EnsureNodesEnv` 的 `K8sEnvInit(scope=runtime)` 中，由 bkeagent 内置命令完成：
 
@@ -5853,7 +8555,7 @@ Docker 目前没有独立的升级 Phase，升级通过重新执行 `EnsureNodes
 - cri-dockerd 安装硬编码版本（`0.3.9`），不可配置
 - Docker 和 cri-dockerd 是两个独立组件，但当前代码中耦合安装
 
-##### 12.3.5.2 Docker ComponentVersion YAML 完整定义
+##### 11.3.5.2 Docker ComponentVersion YAML 完整定义
 
 ```yaml
 # bke-manifests/docker/v26.0.0/component.yaml
@@ -5993,7 +8695,7 @@ spec:
 - **镜像仓库配置**：通过 `daemon.json` 的 `registry-mirrors` 和 `insecure-registries` 字段，不是 `hosts.toml`
 - **变量使用**：`registryMirrors` 和 `insecureRegistries` 通过 `split` 函数转换为 JSON 数组
 
-##### 12.3.5.3 cri-dockerd ComponentVersion YAML 完整定义
+##### 11.3.5.3 cri-dockerd ComponentVersion YAML 完整定义
 
 ```yaml
 # bke-manifests/cri-dockerd/v0.3.9/component.yaml
@@ -6156,7 +8858,7 @@ spec:
 - **条件安装**：仅 K8s ≥ 1.24 时需要（通过 selector condition 控制）
 - **变量使用**：`sandboxImage` 用于指定 pod-infra-container-image
 
-##### 12.3.5.4 Docker 字段映射表
+##### 11.3.5.4 Docker 字段映射表
 
 | 旧硬编码逻辑 | 新 ComponentVersion 字段 | 说明 |
 | ------------- | ------------------------ | ------ |
@@ -6170,7 +8872,7 @@ spec:
 | `cridocker` 内置命令安装 service/socket | `cri-dockerd.configTemplates`（service + socket） | systemd 文件声明式化 |
 | Docker + cri-dockerd 耦合安装 | 两个独立 ComponentVersion，通过 `dependencies` 关联 | 组件解耦 |
 
-##### 12.3.5.5 Docker 行为等价性验证点
+##### 11.3.5.5 Docker 行为等价性验证点
 
 | 验证项 | 旧路径 | 新路径 (BinaryInstaller) | 验证方法 |
 | -------- | -------- | ------------------------ | --------- |
@@ -6183,7 +8885,7 @@ spec:
 | K8s ≥ 1.24 条件 | `downloadCriDockerd()` 内部判断 | selector condition 评估 | DAG 构建期验证 |
 | Feature Gate OFF 回退 | `EnsureNodesEnv` 含 `runtime` | `EnsureNodesEnv` 含 `runtime` | 行为不变 |
 
-#### 12.3.6 EnsureNodesEnv 重构设计
+#### 11.3.6 EnsureNodesEnv 重构设计
 
 **设计思路**：当前容器运行时安装嵌入在 `EnsureNodesEnv` 的 `K8sEnvInit(scope=runtime)` 中，由 bkeagent 内置命令完成。重构后将 containerd/docker/cri-dockerd 拆出为独立 binary 组件，通过 BinaryInstaller SSH 推送安装，`EnsureNodesEnv` 的 scope 中移除 `runtime`。
 
@@ -6220,7 +8922,7 @@ spec:
 
 // getK8sEnvInitScope 动态构建 K8sEnvInit 的 scope
 // Feature Gate ON 时移除 runtime（容器运行时由 BinaryInstaller 安装）
-// 复用 pkg/featuregate.BinaryComponentEnabled(cluster) 注解/flag 模式 (见 12.2)
+// 复用 pkg/featuregate.BinaryComponentEnabled(cluster) 注解/flag 模式 (见 11.2)
 func (e *ENV) getK8sEnvInitScope() string {
     scopes := []string{"time", "hosts", "dns", "kernel", "firewall", "selinux", "swap", "httpRepo"}
     if !featuregate.BinaryComponentEnabled(e.bkeCluster) {
@@ -6264,9 +8966,9 @@ func (e *EnsureContainerdUpgrade) Execute() (ctrl.Result, error) {
 }
 ```
 
-### 12.4 bkeagent 重构详细设计
+### 11.4 bkeagent 重构详细设计
 
-#### 12.4.1 当前 Phase 逻辑分析
+#### 11.4.1 当前 Phase 逻辑分析
 
 bkeagent 的安装和升级分别由两个 Phase 负责，均通过 SSH 推送二进制文件完成：
 
@@ -6296,7 +8998,7 @@ bkeagent 的安装和升级分别由两个 Phase 负责，均通过 SSH 推送�
 - bkeagent.service 从 HTTP 仓库下载（`artifacts.go:80-97`），非动态生成
 - 安装和升级均为 SSH 推送模式，与 containerd（bkeagent 内置命令模式）不同
 
-#### 12.4.2 ComponentVersion YAML 完整定义
+#### 11.4.2 ComponentVersion YAML 完整定义
 
 ```yaml
 # bke-manifests/bkeagent/v2.6.0/component.yaml
@@ -6590,7 +9292,7 @@ spec:
     excludeAppointment: true
 ```
 
-#### 12.4.3 字段映射表
+#### 11.4.3 字段映射表
 
 | 旧硬编码逻辑 | 新 ComponentVersion 字段 | 说明 |
 | ------------- | ------------------------ | ------ |
@@ -6607,7 +9309,7 @@ spec:
 | 无失败策略 | `upgradeStrategy.failurePolicy: Continue` | 失败策略可配置 |
 | 不支持卸载 | `binary.uninstallScript` | 卸载脚本声明式化 |
 
-#### 12.4.4 行为等价性验证点
+#### 11.4.4 行为等价性验证点
 
 | 验证项 | 旧路径 (EnsureAgentUpgrade) | 新路径 (BinaryInstaller) | 验证方法 |
 | -------- | ---------------------------- | ------------------------ | --------- |
@@ -6621,7 +9323,7 @@ spec:
 
 > **设计思路 - bkeagent 升级策略从 Rolling 改为 Batch 的原因**：bkeagent 是节点上的代理进程，短暂中断不影响集群可用性（Agent 重启期间节点上已有 Pod 继续运行）。使用 Batch 模式（batchSize=2）比 Rolling 更快完成升级，且每批结束后可检查剩余节点 Agent 状态，兼顾效率与安全性。containerd 是容器运行时，中断会导致节点上所有 Pod 重启，必须使用 Rolling 逐节点升级确保服务连续性。
 
-### 12.5 BKEAgentSwitch 独立组件设计
+### 11.5 BKEAgentSwitch 独立组件设计
 
 **设计思路 — 为什么需要独立组件**：
 
@@ -6638,7 +9340,7 @@ bkeagent 的监听切换发生在集群安装完成后（cluster-api 部署后�
   监听管理集群                                            切换到目标集群
 ```
 
-#### 12.5.1 功能说明
+#### 11.5.1 功能说明
 
 bkeagent-switch 组件负责切换 bkeagent 的监听目标集群：
 
@@ -6664,7 +9366,7 @@ SSH 上传配置文件 + 重启 bkeagent
 标记 SwitchBKEAgentCondition = True
 ```
 
-#### 12.5.2 ComponentVersion YAML 定义
+#### 11.5.2 ComponentVersion YAML 定义
 
 ```yaml
 # bke-manifests/bkeagent-switch/v2.6.0/component.yaml
@@ -6761,7 +9463,7 @@ spec:
     skipCompleted: true  # 已切换的节点跳过
 ```
 
-#### 12.5.3 DAG 依赖关系
+#### 11.5.3 DAG 依赖关系
 
 ```yaml
 # releaseimage-v2.6.0.yaml
@@ -6794,7 +9496,7 @@ spec:
           - name: cluster-api
 ```
 
-#### 12.5.4 执行流程
+#### 11.5.4 执行流程
 
 ```txt
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -6881,7 +9583,7 @@ spec:
   └──────────────────────────────────────┘
 ```
 
-#### 12.5.5 关键设计点
+#### 11.5.5 关键设计点
 
 **nodeHostname 获取**：
 
@@ -6983,7 +9685,7 @@ func (e *BinaryComponentExecutor) ExecuteComponent(ctx context.Context, node *Co
 }
 ```
 
-#### 12.5.6 兼容性设计
+#### 11.5.6 兼容性设计
 
 **Feature Gate OFF（旧路径）**：
 
@@ -7018,7 +9720,7 @@ SSH 上传配置文件 + 重启 bkeagent
 | bkeagent-switch | OFF | EnsureAgentSwitch Phase |
 | bkeagent-switch | ON | Binary 组件 |
 
-#### 12.5.7 设计决策总结
+#### 11.5.7 设计决策总结
 
 | 决策 | 选择 | 理由 |
 | ------ | ------ | ------ |
@@ -7029,7 +9731,7 @@ SSH 上传配置文件 + 重启 bkeagent
 | 幂等检查 | Condition + NodeComponentStatuses | 双重检查，确保可靠性 |
 | 错误处理 | FailurePolicy = Continue | 切换失败不阻塞后续流程 |
 
-### 12.6 迁移验证清单
+### 11.6 迁移验证清单
 
 | 验证项 | 验证方法 | 通过标准 |
 | -------- | --------- | --------- |
@@ -7050,9 +9752,9 @@ SSH 上传配置文件 + 重启 bkeagent
 | **Feature Gate 关闭回退** | 关闭 Feature Gate，执行安装/升级 | EnsureNodesEnv scope 含 `runtime`，EnsureContainerdUpgrade 走旧路径，行为不变 |
 | **混合模式** | containerd 开启、bkeagent 关闭 | containerd 走新路径，bkeagent 走旧路径 |
 
-## 13. 错误处理与恢复
+## 12. 错误处理与恢复
 
-### 13.1 错误处理流程图
+### 12.1 错误处理流程图
 
 **设计思路**：错误处理流程首先对错误进行分类（可重试/不可重试/部分失败），然后根据错误类型和 FailurePolicy 决定后续行为。可重试错误在重试次数未耗尽时自动重试，不可重试错误立即返回，部分失败根据策略决定是继续、终止还是回滚。
 
@@ -7106,9 +9808,9 @@ SSH 上传配置文件 + 重启 bkeagent
              └─────────┘ └─────────┘  └─────────┘ └─────────┘  └─────────┘
 ```
 
-## 14. 测试设计
+## 13. 测试设计
 
-### 14.1 单元测试
+### 13.1 单元测试
 
 | 测试模块 | 测试场景 | 覆盖目标 |
 | --------- | --------- | --------- |
@@ -7119,7 +9821,7 @@ SSH 上传配置文件 + 重启 bkeagent
 | **BinaryComponentExecutor** | Rolling/Parallel/Batch 执行策略、FailurePolicy、ComponentVariables 注入 | >85% |
 | **ExecutionContext** | TemplateContext 初始化、Variables 注入（ContainerRuntimeCRI）、ComponentVariables 初始化、边界条件（nil ClusterConfig、空 CRI） | >90% |
 
-#### 14.1.1 ExecutionContext 测试用例
+#### 13.1.1 ExecutionContext 测试用例
 
 **测试文件**: `pkg/dagexec/execution_context_test.go`
 
@@ -7271,7 +9973,7 @@ func TestNewExecutionContext_ConfigAccess(t *testing.T) {
 }
 ```
 
-### 14.2 集成测试
+### 13.2 集成测试
 
 | 测试场景 | 验证内容 | 预期结果 |
 | --------- | --------- | --------- |
@@ -7281,7 +9983,7 @@ func TestNewExecutionContext_ConfigAccess(t *testing.T) {
 | **离线环境** | 无网络时使用本地缓存 | 安装/升级正常完成 |
 | **多架构** | amd64 + arm64 混合集群 | 各节点下载对应架构制品 |
 
-### 14.3 E2E 测试
+### 13.3 E2E 测试
 
 | 测试场景 | 集群规模 | 验证内容 |
 | --------- | --------- | --------- |
@@ -7290,9 +9992,9 @@ func TestNewExecutionContext_ConfigAccess(t *testing.T) {
 | **跨版本升级** | 3 Master + 5 Worker | v2.5.0 → v2.6.0 完整升级 |
 | **升级失败恢复** | 3 Master + 3 Worker | 模拟节点失败，验证 Continue/Rollback 策略 |
 
-## 15. 工作量与任务拆解
+## 14. 工作量与任务拆解
 
-### 15.1 工作量评估
+### 14.1 工作量评估
 
 | 任务 | 预估工时 | 风险等级 | 依赖 |
 | ------ | --------- | --------- | ------ |
@@ -7343,7 +10045,7 @@ func TestNewExecutionContext_ConfigAccess(t *testing.T) {
 | 多架构测试 | 混合 | amd64/arm64 混合集群安装+升级 | 1 人日 |
 | 回滚测试 | 1M+2W | Binary uninstallScript | 1 人日 |
 
-### 15.2 Sprint 计划
+### 14.2 Sprint 计划
 
 #### Sprint 1 (第1-2周): BinaryInstaller 核心实现
 
@@ -7398,7 +10100,7 @@ func TestNewExecutionContext_ConfigAccess(t *testing.T) {
 | 文档编写 | 开发B | 用户文档 + 开发文档 |
 | 代码审查与修复 | 开发A+B+C | 测试完成后的最终修复 |
 
-### 15.3 里程碑
+### 14.3 里程碑
 
 | 里程碑 | 时间 | 交付内容 | 验收标准 |
 | -------- | ------ | --------- | --------- |
@@ -7408,12 +10110,12 @@ func TestNewExecutionContext_ConfigAccess(t *testing.T) {
 | **M5: bkeagent 重构完成** | 第10周末 | bkeagent YAML + 兼容层 + 集成测试 | 集成测试通过 |
 | **M6: Beta 发布** | 第12周末 | E2E 测试 + 迁移验证 + 文档 | E2E 通过率 >95% |
 
-## 16. 附录
+## 15. 附录
 
-### 16.1 参考文档
+### 15.1 参考文档
 
 
-### 16.2 术语表
+### 15.2 术语表
 
 | 术语 | 定义 |
 | ------ | ------ |
