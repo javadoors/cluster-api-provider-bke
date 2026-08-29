@@ -2286,32 +2286,42 @@ upgrade:
 
 ### 5.3 重构后的 ReleaseImage 结构
 
+**设计思路**：使用 `composite` 类型组件将 K8s 核心组件组合为一个 `kubernetes-core` 组件，ReleaseImage 中只需声明一个条目而非 7 个独立条目。`composite` 组件引用子组件 ComponentVersion，子组件内部声明偏差约束和依赖关系。
+
 ```yaml
-# 重构后：K8s 核心组件全部独立声明
+# 重构后：K8s 核心组件通过 composite 类型组合管理
 apiVersion: cvo.openfuyao.cn/v1alpha1
 kind: ReleaseImage
 metadata:
   name: openfuyao-v2.7.0
 spec:
   version: "v2.7.0"
+  
+  # 🆕新增：统一 K8s 版本声明
+  # composite 组件及其所有子组件自动使用此版本
+  kubernetesVersion: "v1.36.0"
 
   install:
     components:
-      # ── K8s 核心组件（全部独立） ──
-      - name: etcd
-        version: v3.5.20
-      - name: kube-apiserver
+      # ── K8s 核心组件（composite 类型，一个条目管理 7 个子组件） ──
+      - name: kubernetes-core
         version: v1.36.0
-      - name: kube-controller-manager
-        version: v1.36.0
-      - name: kube-scheduler
-        version: v1.36.0
-      - name: kubelet
-        version: v1.36.0
-      - name: kubectl
-        version: v1.36.0
-      - name: kube-proxy
-        version: v1.36.0
+        type: composite
+        subComponents:
+          - name: etcd
+            version: v3.5.20          # etcd 独立版本，不用 kubernetesVersion
+          - name: kube-apiserver
+            # version 从 kubernetesVersion 自动解析为 v1.36.0
+          - name: kube-controller-manager
+            # version 从 kubernetesVersion 自动解析为 v1.36.0
+          - name: kube-scheduler
+            # version 从 kubernetesVersion 自动解析为 v1.36.0
+          - name: kubelet
+            # version 从 kubernetesVersion 自动解析为 v1.36.0
+          - name: kubectl
+            # version 从 kubernetesVersion 自动解析为 v1.36.0
+          - name: kube-proxy
+            # version 从 kubernetesVersion 自动解析为 v1.36.0
       # ── 其它组件 ──
       - name: bkeagent
         version: v2.7.0
@@ -2322,21 +2332,22 @@ spec:
 
   upgrade:
     components:
-      # ── K8s 核心组件（全部独立，按依赖排序） ──
-      - name: etcd
-        version: v3.5.20
-      - name: kube-apiserver
+      # ── K8s 核心组件（composite 类型，一个条目） ──
+      - name: kubernetes-core
         version: v1.36.0
-      - name: kube-controller-manager
-        version: v1.36.0
-      - name: kube-scheduler
-        version: v1.36.0
-      - name: kube-proxy
-        version: v1.36.0
-      - name: kubectl
-        version: v1.36.0
-      - name: kubelet                       # 独立组件，可被 executeControlPlaneHop 跳过
-        version: v1.36.0
+        type: composite
+        # 延迟升级的子组件列表（编排器读取此字段跳过 kubelet）
+        deferredSubComponents:
+          - kubelet
+        subComponents:
+          - name: etcd
+            version: v3.5.20
+          - name: kube-apiserver
+          - name: kube-controller-manager
+          - name: kube-scheduler
+          - name: kube-proxy
+          - name: kubectl
+          - name: kubelet             # 可被 executeControlPlaneHop 跳过
       # ── 其它组件 ──
       - name: bkeagent
         version: v2.7.0
@@ -2344,6 +2355,28 @@ spec:
         version: v1.7.24
       - name: coredns
         version: v1.11.3
+```
+
+**composite 类型的核心优势**：
+
+| 维度 | 7 个独立条目（旧方案） | composite 组合（新方案） |
+|------|----------------------|----------------------|
+| **ReleaseImage 简洁性** | 7 个独立条目，容易遗漏 | 1 个 composite 条目 + subComponents |
+| **版本一致性** | 需逐个声明版本，可能不一致 | kubernetesVersion 统一声明，自动解析 |
+| **偏差约束集中管理** | 每个子组件各自声明 versionSkew | composite 层面声明，子组件继承 |
+| **延迟升级声明** | 编排器硬编码 deferredComponents | composite 的 deferredSubComponents 声明式 |
+| **依赖关系** | 各组件独立声明 dependencies | composite 层面统一管理子组件间依赖 |
+
+**composite 组件的 DAG 展开**：composite 组件在 DAG 构建时自动展开为子组件节点，不产生自身的 DAG 节点（与 selector 类型类似）。子组件之间的依赖关系从各自的 ComponentVersion.spec.dependencies 解析。
+
+```
+ReleaseImage 中:
+  kubernetes-core (composite)
+    └─ subComponents: [etcd, apiserver, cm, scheduler, kubelet, kubectl, kube-proxy]
+
+DAG 构建时展开为:
+  etcd → apiserver → cm/scheduler → kube-proxy → kubectl → kubelet
+  （composite 自身不产生 DAG 节点）
 ```
 
 ### 5.4 ComponentVersion 中声明偏差约束
