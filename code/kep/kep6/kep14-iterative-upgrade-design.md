@@ -78,6 +78,13 @@
     │  1. 读取 upgrade-ready annotation → openFuyao 版本                      │
     │  2. 解析 ReleaseImage → K8s 组件版本                                     │
     │  3. 构建 VersionContext（kubelet Target=Current 跳过）                  │
+    │     VersionContext 决策逻辑:                                              │
+    │       Current["kubelet"] = "v1.34.0"  ← 节点上运行的版本                │
+    │       Target["kubelet"]  = "v1.34.0"  ← 主动设为当前版本                │
+    │       → Decide 返回 DecisionSkip → 跳过 kubelet 升级                      │
+    │     效果: kubelet 被伪装为已是目标版本，Scheduler 跳过其 DAG 节点        │
+    │     原因: 实现 kubelet 延迟升级——kubelet 不随控制面同步升级，             │
+    │           保留到偏差门控触发时再批量补充升级                              │
     │  4. 构建 DAG → Scheduler.ExecuteDAG()                                   │
     │  5. 返回 HopResult（含 K8s 组件版本）                                   │
     └─────────────────────────────────────────────────────────────────────────┘
@@ -154,7 +161,13 @@
     apiserver v1.34→v1.35, kubelet 保持 v1.34 → 偏差 1 ✅
   Hop 2 (v2.7.0):
     apiserver v1.35→v1.36, kubelet 保持 v1.34 → 偏差 2 ✅
-  kubelet 补充: v1.34→v1.35→v1.36（逐版本，最后批量 drain）
+  kubelet 补充升级（逐版本，集中在最后执行，不阻塞控制面升级）:
+    Round 1: v1.34 → v1.35
+      逐节点: drain → 停止 kubelet → 替换二进制 → 启动 kubelet → 健康检查 → uncordon
+      完成后: kubelet = v1.35, apiserver = v1.36, 偏差 = 1
+    Round 2: v1.35 → v1.36
+      逐节点: drain → 停止 kubelet → 替换二进制 → 启动 kubelet → 健康检查 → uncordon
+      完成后: kubelet = v1.36, apiserver = v1.36, 偏差 = 0
 
 步骤 4: 阶段二 - 其它组件升级
   containerd v1.7.20→v1.7.24, bkeagent v2.6.0→v2.7.0, ...
@@ -162,6 +175,34 @@
 步骤 5: 升级完成
   ClusterVersion.Status.CurrentVersion = v2.7.0
 ```
+
+**"逐版本，最后批量 drain" 的含义**：
+
+"逐版本"和"最后批量 drain"是两个独立的优势点，不是"先替换二进制不重启，最后统一重启"：
+
+| 优势点 | 说明 |
+|--------|------|
+| **逐版本** | kubelet 按 v1.34→v1.35→v1.36 逐个升级（kubeadm 禁止跳小版本），每步 drain+重启 |
+| **最后批量 drain** | 所有 hop 的控制面升级完成后，kubelet 补充升级集中在最后一次性执行（而非分散在每个 hop 中） |
+
+**与当前行为（kubeadm 每 hop 强制 drain kubelet）的对比**：
+
+```
+当前行为（2-hop，kubeadm 每 hop drain kubelet）:
+  Hop 1: apiserver v1.35 + kubelet drain→v1.35    ← drain N 节点
+  Hop 2: apiserver v1.36 + kubelet drain→v1.36    ← drain N 节点
+  总 drain: 2 × N（分散在每个 hop 中，阻塞控制面升级）
+
+KEP-14（kubelet 延迟到偏差极限后补充）:
+  Hop 1: apiserver v1.35, kubelet 保持 v1.34      ← 不 drain
+  Hop 2: apiserver v1.36, kubelet 保持 v1.34      ← 不 drain，偏差=2
+    → kubelet 补充: v1.34→v1.35→v1.36             ← 最后一次性 drain
+    Round 1: drain N 节点 → 替换 → 重启 → uncordon
+    Round 2: drain N 节点 → 替换 → 重启 → uncordon
+  总 drain: 2 × N（但集中在最后，不阻塞控制面升级）
+```
+
+**核心收益**：不是减少 drain 总次数（都是 2×N），而是**将 drain 时机集中到最后**——控制面升级不再被 kubelet drain 阻塞，可以快速完成所有 hop。
 
 ### 1.5 设计约束
 
