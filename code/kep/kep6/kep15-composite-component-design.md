@@ -390,10 +390,14 @@ DAG 构建时展开:
 
 ### 6.2 展开实现
 
+> **注意**：本节展示的是基本展开逻辑。完整的依赖处理实现（含 `CompositeMapping` 返回、依赖继承合并、依赖展开）见 **6.4 节**，其中 `expandCompositeComponents` 和 `BuildDAGFromBundle` 有增强版本。
+
 ```go
 // pkg/upgrade/bundle.go 扩展
 
 // expandCompositeComponents 展开 composite 组件为独立子组件
+// 基本版本：仅返回展开后的组件列表
+// 增强版本（见 6.4.5.1）：同时返回 CompositeMapping 用于依赖展开
 func expandCompositeComponents(
     components []ReleaseImageComponent,
     kubernetesVersion string,
@@ -455,7 +459,8 @@ func BuildDAGFromBundle(
         components = append(components, comp)
     }
     
-    // 3. 构建 DAG（复用现有逻辑）
+    // 3. 构建 DAG（基本版本）
+    // 增强版本（见 6.4.5.4）：传入 compositeMappings 展开对 composite 的依赖
     return topology.BuildUpgradeDAG(components, resolve)
 }
 ```
@@ -482,6 +487,579 @@ func BuildDAGFromBundle(
   ─── kubelet 延迟 ───
   Batch 6 (延迟): [kubelet]
 ```
+
+### 6.4 外部组件对 composite 的依赖处理
+
+composite 组件展开为子组件后，composite 自身不产生 DAG 节点。这引发两个依赖解析问题：composite 自身的依赖如何传递给子组件，以及其它组件对 composite 名称的依赖如何展开。本节设计统一的依赖处理机制，与 KEP-6 selector 依赖处理（§12.3.3）保持一致的架构模式。
+
+#### 6.4.1 问题分析
+
+**问题 1：composite 自身的依赖需要传递给子组件**
+
+composite 组件的 ComponentVersion 可能在 `spec.dependencies` 中声明依赖：
+
+```yaml
+# kubernetes-core/v1.36.0/component.yaml
+spec:
+  name: kubernetes-core
+  type: composite
+  version: v1.36.0
+  composite:
+    subComponents:
+      - name: etcd
+        version: v3.5.20
+      - name: kube-apiserver
+      - name: kubelet
+      # ...
+  dependencies:          # ← composite 级别的依赖
+    - name: bkeagent       # 所有子组件都应继承此依赖
+      phase: Install
+```
+
+展开后，`etcd`、`kube-apiserver`、`kubelet` 等子组件应继承 `bkeagent` 依赖。
+
+**问题 2：其它组件对 composite 的依赖需要展开**
+
+其它组件可能在 `spec.dependencies` 中声明对 composite 名称的依赖：
+
+```yaml
+# coredns/v1.11.3/component.yaml
+spec:
+  name: coredns
+  type: yaml
+  version: v1.11.3
+  dependencies:
+    - name: kubernetes-core   # ← 依赖 composite 名称
+      phase: Install
+```
+
+展开后，`kubernetes-core` 不存在于 DAG 中，需要将此依赖展开为对 composite 所有子组件的依赖。
+
+#### 6.4.2 依赖展开规则
+
+DAG 构建期的依赖解析涉及三类场景，处理规则如下：
+
+| 场景 | 示例 | 处理规则 | 展开后效果 |
+|------|------|---------|-----------|
+| **子组件依赖外部组件** | `kubelet → containerd` | 无需展开，containerd 是独立 DAG 节点 | 保持原样 |
+| **子组件依赖同 composite 的其它子组件** | `kube-apiserver → etcd` | 无需展开，两者展开后均为独立 DAG 节点 | 保持原样 |
+| **外部组件依赖 composite 名称** | `coredns → kubernetes-core` | 展开为对 composite 所有子组件的依赖（AND 语义） | `coredns → [etcd, kube-apiserver, kubelet, ...]` |
+
+**AND 语义说明**：对 composite 的依赖等价于依赖其全部子组件。DAG 拓扑排序自动处理执行顺序——只有所有被依赖的子组件都完成后，依赖方才会被调度。冗余依赖（如 `coredns → etcd` 和 `coredns → kube-apiserver`，而 `kube-apiserver` 已依赖 `etcd`）不影响正确性，拓扑排序会自动消除冗余路径。
+
+#### 6.4.3 设计原则
+
+**原则 1：依赖定义在具体子组件中**
+
+composite 的 `subComponents` 不定义依赖，而是由各子组件的 ComponentVersion `spec.dependencies` 各自声明：
+
+```yaml
+# etcd/v3.5.20/component.yaml
+spec:
+  name: etcd
+  type: staticpod
+  dependencies:
+    - name: kubelet          # etcd 依赖 kubelet (Static Pod 需 Kubelet 拉起)
+      phase: Install
+
+# kube-apiserver/v1.36.0/component.yaml
+spec:
+  name: kube-apiserver
+  type: staticpod
+  dependencies:
+    - name: etcd            # apiserver 依赖 etcd
+      phase: Install
+
+# kubelet/v1.36.0/component.yaml
+spec:
+  name: kubelet
+  type: binary
+  dependencies:
+    - name: containerd      # kubelet 依赖 containerd (外部组件)
+      phase: Install
+    - name: kube-apiserver  # kubelet 依赖 apiserver
+      phase: Install
+```
+
+**优势**：
+
+- ✅ 不需要扩展 `CompositeSubComponent` 结构体
+- ✅ 依赖关系在具体组件中定义，更清晰
+- ✅ 符合现有依赖解析机制
+- ✅ 每个子组件独立维护自己的依赖
+
+**原则 2：composite 级别的依赖被子组件继承**
+
+composite 的 ComponentVersion `spec.dependencies` 中声明的依赖被所有子组件继承（与子组件自身的依赖合并去重）：
+
+```txt
+composite (kubernetes-core) dependencies: [bkeagent]
+sub-component (kube-apiserver) dependencies: [etcd]
+→ 合并后: kube-apiserver dependencies: [etcd, bkeagent]
+
+sub-component (etcd) dependencies: [kubelet]
+→ 合并后: etcd dependencies: [kubelet, bkeagent]
+```
+
+**原则 3：对 composite 的依赖展开为对所有子组件的依赖（AND 语义）**
+
+与 KEP-6 selector 的依赖展开规则一致，对 composite 名称的依赖展开为对全部子组件的依赖。
+
+#### 6.4.4 数据结构
+
+```go
+// pkg/upgrade/bundle.go
+
+// CompositeMapping 记录 composite 展开后的子组件映射
+// 与 selector 的 SelectorMapping 结构对称（KEP-6 §12.3.3.2）
+type CompositeMapping struct {
+    // CompositeName composite 组件名称（如 "kubernetes-core"）
+    CompositeName string `json:"compositeName"`
+
+    // ExpandedNames 展开后的子组件名称列表
+    // 如 ["etcd", "kube-apiserver", "kube-controller-manager", ...]
+    ExpandedNames []string `json:"expandedNames"`
+}
+```
+
+#### 6.4.5 实现方案
+
+##### 6.4.5.1 expandCompositeComponents 增强：返回映射
+
+```go
+// expandCompositeComponents 展开 composite 组件为独立子组件
+// 增强：同时返回 CompositeMapping 列表，供依赖展开使用
+func expandCompositeComponents(
+    components []ReleaseImageComponent,
+    kubernetesVersion string,
+) ([]ReleaseImageComponent, []CompositeMapping) {
+    var expanded []ReleaseImageComponent
+    var mappings []CompositeMapping
+
+    for _, comp := range components {
+        if comp.Type == "composite" && comp.Composite != nil {
+            // composite 组件：展开为子组件
+            var subNames []string
+            for _, sub := range comp.Composite.SubComponents {
+                version := sub.Version
+                if version == "" && K8sCoreComponentSet[sub.Name] && kubernetesVersion != "" {
+                    version = kubernetesVersion // 从 kubernetesVersion 自动解析
+                }
+
+                expanded = append(expanded, ReleaseImageComponent{
+                    Name:    sub.Name,
+                    Version: version,
+                })
+                subNames = append(subNames, sub.Name)
+            }
+
+            // 记录映射：composite 名称 → 展开后的子组件名称列表
+            mappings = append(mappings, CompositeMapping{
+                CompositeName: comp.Name,
+                ExpandedNames: subNames,
+            })
+        } else {
+            // 非 composite 组件：保持不变
+            expanded = append(expanded, comp)
+        }
+    }
+
+    return expanded, mappings
+}
+```
+
+##### 6.4.5.2 buildCompositeSubComponentNode：合并依赖
+
+```go
+// buildCompositeSubComponentNode 构建子组件节点，合并 composite 和子组件的依赖
+//
+// 合并规则: composite 级别的 dependencies + 子组件自身的 dependencies（去重）
+// 与 selector 的 buildSubComponentNode 对称（KEP-6 §12.3.3.2）
+func buildCompositeSubComponentNode(
+    cvStore ComponentVersionStore,
+    compositeCV *configv1alpha1.ComponentVersion,
+    sub CompositeSubComponent,
+    kubernetesVersion string,
+) (topology.ComponentNode, error) {
+    // 解析子组件版本
+    version := sub.Version
+    if version == "" && K8sCoreComponentSet[sub.Name] && kubernetesVersion != "" {
+        version = kubernetesVersion
+    }
+
+    // 加载子组件的 ComponentVersion
+    subCV, err := cvStore.GetComponentVersion(context.Background(), sub.Name, version)
+    if err != nil {
+        return topology.ComponentNode{}, fmt.Errorf(
+            "failed to load sub-component %s: %w", sub.Name, err)
+    }
+
+    // 合并依赖：composite 的依赖 + 子组件自己的依赖
+    mergedDeps := mergeDependencies(compositeCV.Spec.Dependencies, subCV.Spec.Dependencies)
+
+    return topology.ComponentNode{
+        Name:         sub.Name,
+        Version:      version,
+        Dependencies: mergedDeps,
+    }, nil
+}
+
+// mergeDependencies 合并两组依赖（去重）
+// composite 级别依赖先写入，子组件自身依赖覆盖同名项
+func mergeDependencies(
+    compositeDeps, subDeps []configv1alpha1.Dependency,
+) []configv1alpha1.Dependency {
+    depMap := make(map[string]configv1alpha1.Dependency)
+
+    // 先添加 composite 级别的依赖
+    for _, dep := range compositeDeps {
+        depMap[dep.Name] = dep
+    }
+
+    // 再添加子组件自身的依赖（覆盖同名依赖）
+    for _, dep := range subDeps {
+        depMap[dep.Name] = dep
+    }
+
+    // 转换为切片
+    result := make([]configv1alpha1.Dependency, 0, len(depMap))
+    for _, dep := range depMap {
+        result = append(result, dep)
+    }
+    return result
+}
+```
+
+##### 6.4.5.3 expandCompositeDependencies：展开对 composite 的依赖
+
+```go
+// expandCompositeDependencies 将对 composite 名称的依赖展开为对子组件的依赖
+//
+// 遍历依赖列表，将对 composite 名称的依赖替换为其全部子组件名称（AND 语义）。
+// 非 composite 的依赖保持原样。结果去重。
+//
+// 与 selector 的 expandSelectorDependencies 对称（KEP-6 §12.3.3.2）
+func expandCompositeDependencies(
+    deps []string,
+    compositeMappings []CompositeMapping,
+) []string {
+    var result []string
+    seen := make(map[string]bool)
+
+    for _, dep := range deps {
+        // 查找是否为 composite
+        var expanded []string
+        for _, mapping := range compositeMappings {
+            if mapping.CompositeName == dep {
+                expanded = mapping.ExpandedNames
+                break
+            }
+        }
+
+        if len(expanded) > 0 {
+            // 是 composite，展开为所有子组件
+            for _, subName := range expanded {
+                if !seen[subName] {
+                    result = append(result, subName)
+                    seen[subName] = true
+                }
+            }
+        } else {
+            // 不是 composite，保持原样
+            if !seen[dep] {
+                result = append(result, dep)
+                seen[dep] = true
+            }
+        }
+    }
+
+    return result
+}
+```
+
+##### 6.4.5.4 BuildDAGFromBundle 增强：集成依赖展开
+
+```go
+// BuildDAGFromBundle 增强：先展开 composite，再用映射展开依赖，最后构建 DAG
+func BuildDAGFromBundle(
+    bundle *releasemanifest.Bundle,
+    resolve topology.DependencyResolver,
+    cvStore ComponentVersionStore,
+) (*topology.UpgradeDAG, error) {
+    kubernetesVersion := bundle.Release.Spec.KubernetesVersion
+
+    // 1. 展开 composite 组件，同时获取映射
+    upgradeComponents, compositeMappings := expandCompositeComponents(
+        bundle.Release.Spec.Upgrade.Components,
+        kubernetesVersion,
+    )
+
+    // 2. 转换为 ComponentNode
+    var components []topology.ReleaseImageUpgradeComponent
+    for _, c := range upgradeComponents {
+        comp := topology.ReleaseImageUpgradeComponent{
+            Name:    c.Name,
+            Version: c.Version,
+        }
+        // 从 ComponentVersion 获取 inline handler
+        if cv, err := cvStore.GetComponentVersion(context.Background(), c.Name, c.Version); err == nil {
+            if cv.Spec.Inline != nil {
+                comp.Inline = &topology.ReleaseImageUpgradeInline{
+                    Handler: cv.Spec.Inline.Handler,
+                    Version: cv.Spec.Inline.Version,
+                }
+            }
+        }
+        components = append(components, comp)
+    }
+
+    // 3. 构建 DAG，传入 compositeMappings 用于依赖展开
+    return topology.BuildUpgradeDAG(components, resolve, compositeMappings)
+}
+```
+
+```go
+// pkg/topology/dag.go 扩展
+
+// BuildUpgradeDAG 增强：接受 compositeMappings，构建时展开依赖
+func BuildUpgradeDAG(
+    components []ReleaseImageUpgradeComponent,
+    resolve DependencyResolver,
+    compositeMappings []CompositeMapping,
+) (*UpgradeDAG, error) {
+    dag := NewUpgradeDAG()
+
+    // 阶段 1：添加所有组件节点（已展开后的独立子组件）
+    for _, comp := range components {
+        node := &ComponentNode{
+            Name:    comp.Name,
+            Version: comp.Version,
+        }
+        if err := dag.AddNode(node); err != nil {
+            return nil, err
+        }
+    }
+
+    // 阶段 2：解析依赖并添加边
+    for _, comp := range components {
+        // 从 ComponentVersion 读取依赖
+        deps, err := resolve(comp.Name, comp.Version)
+        if err != nil {
+            return nil, err
+        }
+
+        // 提取依赖名称列表
+        depNames := make([]string, 0, len(deps))
+        for _, d := range deps {
+            depNames = append(depNames, d.Name)
+        }
+
+        // 展开 composite 依赖：将 "kubernetes-core" 展开为 [etcd, kube-apiserver, ...]
+        expandedDeps := expandCompositeDependencies(depNames, compositeMappings)
+
+        // 添加依赖边
+        for _, dep := range expandedDeps {
+            if dep == comp.Name {
+                continue // 跳过自依赖
+            }
+            if _, ok := dag.GetNode(dep); !ok {
+                return nil, fmt.Errorf(
+                    "component %q depends on %q which is not in the DAG",
+                    comp.Name, dep)
+            }
+            if err := dag.AddDependency(dep, comp.Name); err != nil {
+                return nil, err
+            }
+        }
+    }
+
+    // 阶段 3：验证 DAG（检测循环依赖）
+    if _, err := dag.TopologicalBatches(); err != nil {
+        return nil, fmt.Errorf("invalid DAG: %w", err)
+    }
+
+    return dag, nil
+}
+```
+
+#### 6.4.6 完整流程示例
+
+**输入**：
+
+```yaml
+# ReleaseImage
+spec:
+  upgrade:
+    components:
+      - name: kubernetes-core        # composite
+        version: v1.36.0
+        type: composite
+        subComponents:
+          - name: etcd
+            version: v3.5.20
+          - name: kube-apiserver
+          - name: kube-controller-manager
+          - name: kube-scheduler
+          - name: kubelet
+          - name: kubectl
+          - name: kube-proxy
+      - name: containerd
+        version: v1.7.24
+      - name: coredns
+        version: v1.11.3
+      - name: bkeagent
+        version: v2.7.0
+
+# kubernetes-core/v1.36.0/component.yaml
+spec:
+  name: kubernetes-core
+  type: composite
+  dependencies:
+    - name: bkeagent          # composite 级别依赖，所有子组件继承
+      phase: Install
+
+# kube-apiserver/v1.36.0/component.yaml
+spec:
+  dependencies:
+    - name: etcd
+
+# kubelet/v1.36.0/component.yaml
+spec:
+  dependencies:
+    - name: containerd
+    - name: kube-apiserver
+
+# coredns/v1.11.3/component.yaml
+spec:
+  dependencies:
+    - name: kubernetes-core   # 依赖 composite 名称
+```
+
+**执行流程**：
+
+```txt
+1. 展开 composite
+   kubernetes-core → [etcd, kube-apiserver, kube-controller-manager,
+                      kube-scheduler, kubelet, kubectl, kube-proxy]
+   CompositeMapping: {
+       CompositeName: "kubernetes-core",
+       ExpandedNames: ["etcd", "kube-apiserver", "kube-controller-manager",
+                       "kube-scheduler", "kubelet", "kubectl", "kube-proxy"]
+   }
+
+2. 构建组件列表 (composite 自身不在列表中)
+   [bkeagent, containerd, etcd, kube-apiserver, kube-controller-manager,
+    kube-scheduler, kubelet, kubectl, kube-proxy, coredns]
+
+3. 合并子组件依赖 (composite 级别依赖 bkeagent 被各子组件继承)
+   etcd:                  [kubelet, bkeagent]       ← 继承 bkeagent
+   kube-apiserver:        [etcd, bkeagent]          ← 继承 bkeagent
+   kubelet:               [containerd, kube-apiserver, bkeagent]  ← 继承 bkeagent
+   kube-controller-manager:[kube-apiserver, bkeagent]
+   kube-scheduler:        [kube-apiserver, bkeagent]
+   kubectl:               [bkeagent]
+   kube-proxy:            [bkeagent]
+
+4. 展开对 composite 的依赖
+   coredns: [kubernetes-core] → 展开为 [etcd, kube-apiserver, kube-controller-manager,
+                                        kube-scheduler, kubelet, kubectl, kube-proxy]
+
+5. 添加依赖边
+   bkeagent → etcd, kube-apiserver, kubelet, cm, scheduler, kubectl, kube-proxy
+   containerd → kubelet
+   kubelet → etcd
+   etcd → kube-apiserver
+   kube-apiserver → kubelet, cm, scheduler
+   kube-apiserver → coredns (经展开)
+   etcd → coredns (经展开)
+   kubelet → coredns (经展开)
+   ... (其它子组件 → coredns)
+
+6. 拓扑排序
+   Batch 0: [bkeagent]
+   Batch 1: [containerd]
+   Batch 2: [kubelet]              ← 依赖 containerd + bkeagent
+   Batch 3: [etcd]                 ← 依赖 kubelet + bkeagent
+   Batch 4: [kube-apiserver]        ← 依赖 etcd + bkeagent
+   Batch 5: [kube-controller-manager, kube-scheduler, kubectl, kube-proxy]
+   Batch 6: [coredns]              ← 依赖全部 K8s 核心组件
+```
+
+#### 6.4.7 边界情况处理
+
+**循环依赖检测**：
+
+```go
+// AddDependency 时检测循环（复用现有拓扑排序校验）
+func (dag *UpgradeDAG) AddDependency(from, to string) error {
+    if from == to {
+        return fmt.Errorf("self-dependency detected: %s", from)
+    }
+    if dag.hasPath(to, from) {
+        return fmt.Errorf("circular dependency detected: %s -> %s", from, to)
+    }
+    dag.edges[from] = append(dag.edges[from], to)
+    return nil
+}
+```
+
+**依赖指向不存在的 composite**：
+
+```go
+// 展开后检查：依赖指向的 composite 名称不存在于 mappings 中
+for _, dep := range expandedDeps {
+    if _, ok := dag.GetNode(dep); !ok {
+        return nil, fmt.Errorf(
+            "component %q depends on %q which is not in the DAG",
+            comp.Name, dep)
+    }
+}
+```
+
+**composite 的 subComponents 为空**：
+
+```go
+// 展开时检测：composite 无子组件
+if comp.Type == "composite" && comp.Composite != nil {
+    if len(comp.Composite.SubComponents) == 0 {
+        return nil, fmt.Errorf(
+            "composite %q has no subComponents", comp.Name)
+    }
+    // ...
+}
+```
+
+**对 composite 的依赖与对子组件的依赖共存**：
+
+```yaml
+# coredns 同时依赖 composite 名称和具体子组件
+spec:
+  dependencies:
+    - name: kubernetes-core      # composite 名称
+    - name: kube-apiserver      # 具体子组件
+```
+
+展开后 `kubernetes-core` → `[etcd, kube-apiserver, ...]`，与显式的 `kube-apiserver` 去重，结果仍为 `[etcd, kube-apiserver, ...]`。`expandCompositeDependencies` 的 `seen` map 保证去重。
+
+**deferredSubComponents 与依赖展开的交互**：
+
+`deferredSubComponents` 延迟升级的是子组件的执行时机（由 `executeControlPlaneHop` 跳过），不影响 DAG 结构。即使 `kubelet` 被延迟，`coredns → kubernetes-core` 仍展开为包含 `kubelet` 的依赖——DAG 中 `kubelet` 节点存在，但延迟阶段才执行。`coredns` 仍需等待 `kubelet` 完成才能执行（延迟阶段结束后）。
+
+#### 6.4.8 与 selector 依赖处理的统一
+
+composite 与 selector 的依赖处理机制完全对称，区别仅在于展开条件：
+
+| 维度 | selector (KEP-6 §12.3.3) | composite (本节) |
+|------|--------------------------|------------------|
+| **展开条件** | `subComponents[].condition` 评估为真 | 全部子组件（无 condition） |
+| **映射类型** | `SelectorMapping` | `CompositeMapping` |
+| **依赖继承** | selector 级别依赖 → 被选中子组件继承 | composite 级别依赖 → 全部子组件继承 |
+| **依赖展开** | 对 selector 名称的依赖 → 被选中子组件 | 对 composite 名称的依赖 → 全部子组件 |
+| **展开语义** | AND（依赖全部被选中的） | AND（依赖全部） |
+| **合并函数** | `mergeDependencies` | `mergeDependencies`（复用） |
+| **展开函数** | `expandSelectorDependencies` | `expandCompositeDependencies` |
+
+**后续可统一**：若后续需要统一，可定义通用的 `AggregateMapping` 和 `expandAggregateDependencies`，由 `SelectorMapping` 和 `CompositeMapping` 转换。当前保持分离以避免过度抽象。
 
 ## 7. kubernetesVersion 统一声明
 
@@ -752,18 +1330,21 @@ func (r *ClusterVersionReconciler) resolveUpgradePath(
 |------|------|---------------|
 | **CompositeSpec 类型定义** | 类型定义 + deepcopy + CRD schema | 2 |
 | **DAG 展开机制** | expandCompositeComponents + BuildDAGFromBundle 适配 | 3 |
+| **依赖处理机制** | CompositeMapping + expandCompositeDependencies + mergeDependencies + buildCompositeSubComponentNode | 2 |
 | **kubernetesVersion 解析** | GetComponentVersion 扩展 + 版本解析逻辑 | 2 |
 | **deferredSubComponents** | 从 ReleaseImage 解析 + 传入 executeControlPlaneHop | 1 |
 | **版本校验** | ValidateCompositeVersionConsistency + 名称校验 | 2 |
 | **控制器适配** | resolveDeferredComponents + 适配测试 | 2 |
-| **集成测试** | composite 展开 + 混合模式 + 延迟升级 E2E | 4 |
-| **小计** | - | **16 人天** |
+| **集成测试** | composite 展开 + 依赖展开 + 混合模式 + 延迟升级 E2E | 5 |
+| **小计** | - | **19 人天** |
 
 ## 14. 风险与缓解
 
 | 风险 | 影响 | 概率 | 缓解措施 |
 |------|------|------|---------|
 | **DAG 展开遗漏子组件** | 组件未升级 | 低 | 单元测试覆盖展开逻辑 |
+| **依赖展开遗漏** | 依赖不完整导致执行顺序错误 | 低 | expandCompositeDependencies 单元测试 + AND 语义去重 |
+| **循环依赖** | DAG 构建失败 | 低 | AddDependency 时 hasPath 检测 + TopologicalBatches 校验 |
 | **kubernetesVersion 解析错误** | 版本不一致 | 低 | ValidateCompositeVersionConsistency 校验 |
 | **混合模式兼容性** | composite + 独立条目冲突 | 中 | 校验逻辑覆盖混合模式 |
 | **deferredSubComponents 读取失败** | kubelet 未延迟 | 低 | 默认值 ["kubelet"] 兜底 |
