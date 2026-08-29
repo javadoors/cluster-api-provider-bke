@@ -1089,15 +1089,19 @@ kube-proxy 的偏差规则允许滞后 apiserver 3 个小版本（与 kubelet �
 
 ### 4.2 多阶段升级编排：K8s 组件优先 + 其它组件后续
 
-**核心设计**：升级编排分为两大阶段，K8s 核心组件（受偏差约束）优先完成所有 hop 升级，然后再升级其它组件（不受偏差约束，可独立升级）。
+**核心设计**：每个 Hop 是一次完整的 ReleaseImage 升级（包含所有组件），但按偏差约束分两个阶段执行：
+
+- **阶段一（每个 Hop 内）**：升级 K8s 核心组件（受偏差约束，kubelet 延迟）
+- **阶段二（每个 Hop 内）**：升级其它组件（不受偏差约束）
 
 ```
 完整升级编排流程 (openFuyao v2.6.0 → v2.7.0, K8s v1.34 → v1.36):
 
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  阶段一: K8s 核心组件多 Hop 升级（受偏差约束管控）                        │
+│  Hop 1 (openFuyao v2.6.5 → K8s v1.35)                              │
+│  每个 Hop 是完整的 ReleaseImage 升级，分两阶段执行                     │
 │                                                                         │
-│  Hop 1: 控制面升级 (K8s v1.34 → v1.35)                                  │
+│  阶段一: K8s 核心组件升级（偏差约束管控）                               │
 │    ├─ etcd → v3.5.19                                                    │
 │    ├─ kube-apiserver → v1.35                                            │
 │    ├─ cm/scheduler → v1.35                                              │
@@ -1106,59 +1110,65 @@ kube-proxy 的偏差规则允许滞后 apiserver 3 个小版本（与 kubelet �
 │    └─ kubelet: 保持 v1.34（延迟升级）                                    │
 │  偏差门 1: kubelet(1.34) vs apiserver(1.35) → 1 偏差 → ✅ 安全          │
 │                                                                         │
-│  Hop 2: 控制面升级 (K8s v1.35 → v1.36)                                  │
+│  阶段二: 其它组件升级（同一 Hop 的 ReleaseImage 中的其它组件）          │
+│    ├─ containerd → v1.7.22                                              │
+│    ├─ bkeagent → v2.6.5                                                │
+│    ├─ runc → v1.1.11                                                   │
+│    └─ ...                                                              │
+│  Hop 1 完成: 所有非延迟组件已升级到 v2.6.5 的 ReleaseImage 版本       │
+├─────────────────────────────────────────────────────────────────────────┤
+│  Hop 2 (openFuyao v2.7.0 → K8s v1.36)                              │
+│                                                                         │
+│  阶段一: K8s 核心组件升级（偏差约束管控）                               │
 │    ├─ etcd → v3.5.20                                                    │
 │    ├─ kube-apiserver → v1.36                                            │
 │    ├─ cm/scheduler → v1.36                                              │
 │    ├─ kube-proxy → v1.36                                               │
 │    ├─ kubectl → v1.36                                                  │
 │    └─ kubelet: 保持 v1.34（偏差 2，安全）                                │
-│  偏差门 2: kubelet(1.34) vs apiserver(1.36) → 2 偏差 → ✅ 安全          │
+│  偏差门 2: kubelet(1.34) vs apiserver(1.36) → 2 偏差 → ✅ 安全        │
 │                                                                         │
-│  Kubelet 补充升级: v1.34→v1.35→v1.36（逐节点 drain → replace → uncordon）│
-│  最终偏差验证: 0 偏差 → ✅ K8s 核心组件升级完成                          │
-│                                                                         │
-│  ─────────────────────────────────────────────────────────────────────  │
-│                                                                         │
-│  阶段二: 其它组件升级（不受偏差约束，独立升级）                           │
-│                                                                         │
-│  ├─ containerd: v1.7.20 → v1.7.24                                      │
-│  │   └─ CRI 兼容性检查（CheckContainerRuntimeCompatibility）→ ENV 命令   │
-│  │                                                                       │
-│  ├─ bkeagent: v2.6.0 → v2.7.0                                          │
-│  │   └─ SSH 推送新版本二进制                                             │
-│  │                                                                       │
-│  ├─ runc: v1.1.10 → v1.1.12                                            │
-│  │   └─ BinaryInstaller 替换二进制                                       │
-│  │                                                                       │
-│  ├─ lxcfs: v5.0.2 → v6.0.2                                             │
-│  │   └─ BinaryInstaller 替换二进制 + systemd service                     │
-│  │                                                                       │
-│  └─ ...（其它辅助组件）                                                  │
-│                                                                         │
-│  最终验证: 所有组件版本与目标 ReleaseImage 一致 → ✅ 升级完成             │
+│  阶段二: 其它组件升级                                                    │
+│    ├─ containerd → v1.7.24                                              │
+│    ├─ bkeagent → v2.7.0                                                │
+│    ├─ runc → v1.1.12                                                   │
+│    └─ ...                                                              │
+│  Hop 2 完成                                                            │
+├─────────────────────────────────────────────────────────────────────────┤
+│  Kubelet 补充升级（所有 Hop 完成后，偏差达到极限时触发）                │
+│    Round 1: v1.34 → v1.35                                              │
+│      逐节点: drain → 停止 kubelet → 替换二进制 → 启动 → 健康检查 → uncordon│
+│    Round 2: v1.35 → v1.36                                              │
+│      逐节点: drain → 停止 kubelet → 替换二进制 → 启动 → 健康检查 → uncordon│
+│  最终偏差验证: 0 偏差 → ✅ 全部升级完成                                │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-**为什么分两阶段？**
+**每个 Hop 升级哪些组件？**
+
+| Hop | 阶段一（K8s 核心） | 阶段二（其它组件） | kubelet |
+|-----|-------------------|-------------------|---------|
+| Hop 1 (v2.6.5) | etcd/apiserver/cm/scheduler/kube-proxy/kubectl → ReleaseImage v2.6.5 中的版本 | containerd/bkeagent/runc/... → ReleaseImage v2.6.5 中的版本 | 保持 v1.34（跳过） |
+| Hop 2 (v2.7.0) | etcd/apiserver/cm/scheduler/kube-proxy/kubectl → ReleaseImage v2.7.0 中的版本 | containerd/bkeagent/runc/... → ReleaseImage v2.7.0 中的版本 | 保持 v1.34（跳过） |
+| 补充 | — | — | v1.34→v1.35→v1.36 |
+
+**为什么分两阶段（在同一 Hop 内）？**
 
 | 维度 | 阶段一（K8s 核心组件） | 阶段二（其它组件） |
 |------|----------------------|-------------------|
 | **偏差约束** | 受 K8s Version Skew Policy 约束 | 不受偏差约束 |
-| **编排方式** | 多 hop + 偏差门控 + kubelet 延迟 | 独立 DAG，无偏差门控 |
-| **升级顺序** | 严格按 K8s 官方升级顺序（apiserver → cm/scheduler → kube-proxy/kubectl → kubelet） | 按 ComponentVersion.spec.dependencies 排序 |
+| **编排方式** | 偏差门控 + kubelet 延迟 | 独立 DAG，无偏差门控 |
 | **失败影响** | 可能导致集群不可用 | 不影响 K8s 控制面可用性 |
 | **幂等性** | kubelet 补充升级跳过已完成节点 | 各组件独立幂等 |
-| **执行方式** | ClusterVersionReconciler 逐 hop 编排 | DAG Scheduler 统一调度 |
 
 **containerd 在阶段二而非阶段一的原因**：
 
 1. containerd 不受 K8s Version Skew Policy 约束（见 3.1.8），无需参与偏差门控
 2. containerd 升级通过 CRI API 兼容性保证，不需要与 apiserver 同步
-3. containerd 可以在 K8s 组件升级完成后再独立升级（ENV 命令重置 + 重新部署）
+3. containerd 可以在 K8s 组件升级完成后在同一 Hop 内升级（ENV 命令重置 + 重新部署）
 4. 但需在阶段二执行前做 CRI 兼容性预检（`CheckContainerRuntimeCompatibility`）
 
-**阶段间的衔接**：
+**orchestrateFullUpgrade 实现**：
 
 ```go
 // controllers/clusterversion/clusterversion_controller.go
@@ -1167,41 +1177,75 @@ func (r *ClusterVersionReconciler) orchestrateFullUpgrade(
     ctx context.Context,
     bkeCluster *bkev1beta1.BKECluster,
     hopPath []string, // ["v2.6.5", "v2.7.0"] (openFuyao 版本)
+    config *UpgradeOrchestrationConfig,
 ) error {
-    // ─── 阶段一: K8s 核心组件多 Hop 升级 ───
-    log.Info("phase 1: K8s core components multi-hop upgrade")
-    if err := r.orchestrateMultiHopUpgrade(ctx, bkeCluster, hopPath); err != nil {
-        return fmt.Errorf("phase 1 (K8s core) failed: %w", err)
+    skewChecker := &upgrade.VersionSkewChecker{Client: r.Client}
+    kubeletCurrentVersion := r.getComponentVersion(bkeCluster, "kubelet")
+    
+    for i, hopTarget := range hopPath {
+        log.Info("starting hop", "hop", i+1, "openFuyaoVersion", hopTarget,
+            "kubeletCurrent(K8s)", kubeletCurrentVersion)
+        
+        // ─── 阶段一: K8s 核心组件升级（kubelet 延迟） ───
+        log.Info("phase 1: K8s core components upgrade")
+        hopResult, err := r.executeControlPlaneHop(
+            ctx, bkeCluster, hopTarget, config.DeferredComponents,
+        )
+        if err != nil {
+            return fmt.Errorf("hop %d (%s) phase 1 failed: %w", i+1, hopTarget, err)
+        }
+        
+        r.updateComponentStatuses(bkeCluster, hopResult)
+        
+        // 偏差门控
+        apiserverVersion := hopResult.GetUpgradedVersion("kube-apiserver")
+        needsCatchup, catchupTargetVersion := r.evaluateSkewGate(
+            ctx, config, kubeletCurrentVersion, apiserverVersion, i, hopPath,
+        )
+        
+        // ─── 阶段二: 其它组件升级（同一 Hop 的 ReleaseImage） ───
+        log.Info("phase 2: other components upgrade")
+        if err := r.executeOtherComponentsForHop(ctx, bkeCluster, hopTarget); err != nil {
+            return fmt.Errorf("hop %d (%s) phase 2 failed: %w", i+1, hopTarget, err)
+        }
+        
+        // kubelet 补充升级（如偏差门控触发）
+        if needsCatchup {
+            if err := r.upgradeKubeletCatchupToVersion(
+                ctx, bkeCluster, kubeletCurrentVersion, catchupTargetVersion,
+            ); err != nil {
+                return fmt.Errorf("kubelet catchup failed: %w", err)
+            }
+            kubeletCurrentVersion = catchupTargetVersion
+            r.setComponentVersion(bkeCluster, "kubelet", kubeletCurrentVersion)
+        }
+        
+        log.Info("hop fully completed",
+            "hop", i+1, "openFuyaoVersion", hopTarget,
+            "apiserver(K8s)", apiserverVersion,
+            "kubelet(K8s)", kubeletCurrentVersion)
     }
     
     // 最终偏差验证
     vc := r.getCurrentVersionContext(bkeCluster)
-    skewChecker := &upgrade.VersionSkewChecker{Client: r.Client}
     ok, violations := skewChecker.CheckSkew(vc, upgrade.K8sSkewConstraints)
     if !ok {
-        return fmt.Errorf("phase 1 skew check failed: %v", violations)
-    }
-    log.Info("phase 1 completed: K8s core components upgraded, skew constraints satisfied")
-    
-    // ─── 阶段二: 其它组件升级 ───
-    log.Info("phase 2: other components upgrade (containerd, bkeagent, runc, ...)")
-    if err := r.executeOtherComponentsUpgrade(ctx, bkeCluster, hopPath[len(hopPath)-1]); err != nil {
-        return fmt.Errorf("phase 2 (other components) failed: %w", err)
+        return fmt.Errorf("final skew check failed: %v", violations)
     }
     
-    log.Info("full upgrade completed: all components upgraded to target version")
+    log.Info("full upgrade completed: all components upgraded")
     return nil
 }
 
-// executeOtherComponentsUpgrade 执行非 K8s 核心组件的升级
-// 这些组件不受 K8s Version Skew Policy 约束，按 ComponentVersion 依赖排序
-func (r *ClusterVersionReconciler) executeOtherComponentsUpgrade(
+// executeOtherComponentsForHop 执行同一 Hop 中非 K8s 核心组件的升级
+// 每个 Hop 从对应 ReleaseImage 中解析所有组件版本
+func (r *ClusterVersionReconciler) executeOtherComponentsForHop(
     ctx context.Context,
     bkeCluster *bkev1beta1.BKECluster,
-    targetVersion string,
+    hopTarget string, // openFuyao 版本
 ) error {
-    // 1. 解析目标 ReleaseImage
-    bundle, err := r.resolveReleaseBundle(ctx, targetVersion)
+    // 1. 解析当前 Hop 的 ReleaseImage
+    bundle, err := r.resolveReleaseBundle(ctx, hopTarget)
     if err != nil {
         return err
     }
@@ -1210,22 +1254,18 @@ func (r *ClusterVersionReconciler) executeOtherComponentsUpgrade(
     vc := upgrade.BuildVersionContextForUpgrade(bundle, currentBundle, bkeCluster)
     
     // 3. 排除 K8s 核心组件（已在阶段一升级完成）
-    //    K8s 核心组件: etcd, kube-apiserver, kube-controller-manager, 
-    //                   kube-scheduler, kubelet, kubectl, kube-proxy
     k8sCoreComponents := map[string]bool{
         "etcd": true, "kube-apiserver": true, "kube-controller-manager": true,
         "kube-scheduler": true, "kubelet": true, "kubectl": true, "kube-proxy": true,
     }
     
-    // 4. 过滤出需要升级的非核心组件
     for name := range vc.Target {
         if k8sCoreComponents[name] {
-            // K8s 核心组件已在阶段一升级，设置 Current = Target 跳过
-            vc.SetCurrent(name, vc.GetTarget(name))
+            vc.SetCurrent(name, vc.GetTarget(name)) // 跳过已升级的 K8s 核心组件
         }
     }
     
-    // 5. containerd CRI 兼容性预检
+    // 4. containerd CRI 兼容性预检
     containerdTarget := vc.GetTarget("containerd")
     k8sVersion := vc.GetCurrent("kube-apiserver")
     if containerdTarget != "" && k8sVersion != "" {
@@ -1239,13 +1279,12 @@ func (r *ClusterVersionReconciler) executeOtherComponentsUpgrade(
         }
     }
     
-    // 6. 构建 DAG（仅包含非核心组件）
+    // 5. 构建 DAG（仅包含非核心组件）并执行
     dag, err := upgrade.BuildDAGFromBundle(bundle, upgrade.BundleDependencyResolver(bundle))
     if err != nil {
         return err
     }
     
-    // 7. 执行 DAG
     sched := r.buildScheduler(bundle, vc)
     execCtx := r.buildExecutionContext(ctx, bkeCluster, vc)
     
@@ -1257,10 +1296,10 @@ func (r *ClusterVersionReconciler) executeOtherComponentsUpgrade(
 }
 ```
 
-**阶段二 DAG 结构**：
+**阶段二 DAG 结构（每个 Hop 内）**：
 
 ```
-阶段二 DAG（非 K8s 核心组件，按依赖排序）:
+阶段二 DAG（每个 Hop 内的非 K8s 核心组件，按依赖排序）:
 
 Batch 1: [bkeagent]                     ← 无依赖，最先执行
     └─ SSH 推送新版本二进制
@@ -1279,7 +1318,7 @@ Batch 4: [helm, etcdctl, calicoctl]     ← 辅助工具，最后
     └─ calicoctl: BinaryInstaller
 ```
 
-> **注意**：阶段二的组件不需要偏差门控，因为它们不受 K8s Version Skew Policy 约束。各组件按 ComponentVersion.spec.dependencies 中的依赖关系排序，由 DAG Scheduler 统一调度。
+> **注意**：阶段二的组件不需要偏差门控，因为它们不受 K8s Version Skew Policy 约束。每个 Hop 内阶段二从对应 ReleaseImage 解析组件版本，如果当前版本已等于目标版本（VersionContext.NeedsUpgrade 返回 false），则自动跳过。
 
 #### 4.2.1 kubelet 延迟升级的收益
 
