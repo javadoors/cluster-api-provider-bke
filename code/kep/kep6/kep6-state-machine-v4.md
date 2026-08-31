@@ -1829,16 +1829,22 @@ groups:
 
 ### 6.2 集群层触发节点层状态机的协调机制
 
-**设计思路 — 通过 BKEMachine CR Status + Watch 机制实现跨层触发**：
+**设计思路 — 统一 DAG 内联执行，扩缩容也走 Scheduler.ExecuteDAG**：
 
-集群层状态机（L1）和节点层状态机（L2）运行在各自的 Controller Reconcile 中，不存在直接函数调用。L1 触发 L2 执行的核心机制是：L1 通过更新 BKEMachine CR 的 `NodeComponents` 和 `NodePhase` 字段下发操作意图，BKEMachine Controller Watch 到变化后在自身 Reconcile 中触发 L2 执行。这是 CAPI 的标准协调模式——控制器间通过 CR 状态变化间接通信，而非 RPC 调用。
+集群层状态机（L1）通过 `Scheduler.ExecuteDAG` 统一调度所有操作场景。安装/升级/扩缩容均走 DAG 内联路径——L1 构建 DAG、Scheduler 执行、`syncNodeStatus` 回写节点状态。不再使用 BKEMachine Watch 触发 L2 的路径，简化架构为单一执行路径。
 
-**两条触发路径**：
+**单一触发路径**：
 
-| 路径 | 触发场景 | 触发方式 | L2 执行内容 |
+| 路径 | 触发场景 | 触发方式 | L2 是否参与 |
 |------|---------|---------|------------|
-| **DAG 内联执行** | 集群安装/升级 | Scheduler 通过 `BinaryComponentExecutor` 在 DAG 执行中直接 SSH 操作节点 | L3 组件安装/升级（不经过 L2） |
-| **BKEMachine Watch 触发** | 节点扩容/缩容 | L1 更新 BKEMachine.Status.NodePhase → BKEMachine Controller Watch → L2 Execute | L2 评估节点状态 → L3 组件安装/卸载 |
+| **DAG 内联执行** | 集群安装、版本升级、节点扩缩容 | Scheduler 通过 `BinaryComponentExecutor` 在 DAG 执行中直接 SSH 操作节点 | 不参与（Scheduler 直接操作 L3，syncNodeStatus 回写节点状态） |
+
+**为什么扩缩容也走 DAG 内联（统一为单一路径）**：
+
+1. **架构统一性**：安装/升级/扩缩容走同一执行路径（`Scheduler.ExecuteDAG` + `syncNodeStatus`），减少分支逻辑和维护成本。`BinaryComponentExecutor` 已支持节点级并发策略（Rolling/Parallel/Batch），扩容场景使用 Parallel（新节点全并行安装）或 Batch 即可，无需独立的 Watch 触发机制。
+2. **节点状态一致性**：路径 1 的 `syncNodeStatus` 已解决节点状态回写问题。如果扩缩容走 Watch 触发（路径 2），安装/升级走 DAG 内联（路径 1），两种路径的状态回写逻辑不同（路径 1 由 `syncNodeStatus` 聚合，路径 2 由 `evaluateNodePhase` 实时聚合），增加维护负担和潜在不一致风险。统一为 DAG 内联后，所有场景的状态回写都由 `syncNodeStatus` 统一处理。
+3. **扩容的依赖顺序同样需要保证**：新节点安装时，组件间有依赖顺序（bkeagent → containerd → kubelet），DAG 拓扑排序保证顺序。虽然 Watch 触发下 `NodeStateMachine.executeNodeComponents` 也有 `topologicalSort`，但那是节点内排序，无法保证跨节点顺序（如 etcd 节点需先于 master 节点就绪）。DAG 内联可以统一处理跨节点和节点内的依赖。
+4. **缩容的安全性**：节点缩容时需要先 drain（驱逐 Pod）再卸载组件。drain 操作可封装为 DAG 节点（inline 类型），与组件卸载节点按依赖顺序执行。Watch 触发下各节点独立 Reconcile，无法协调 drain 与组件卸载的顺序。
 
 #### 6.2.1 路径 1：DAG 内联执行（集群安装/升级）
 
@@ -2054,95 +2060,194 @@ CAPI 上层 Controller:
 | **BKEMachine Controller 是否参与** | 不参与（空操作 Reconcile，状态已达成直接跳过） | 参与（执行 L2 NodeStateMachine.Execute） |
 | **中间状态可见性** | DAG 执行期间 NodeComponentStatuses 有值，NodePhase 待 DAG 完成后才聚合 | 每次组件执行后实时聚合，NodePhase 实时更新 |
 
-#### 6.2.2 路径 2：BKEMachine Watch 触发（节点扩缩容）
+#### 6.2.2 路径 2：DAG 内联执行（节点扩缩容）
 
-**设计思路 — 扩缩容时 L1 通过 CR Status 变化触发 L2 独立执行**：
+**设计思路 — 扩缩容也走 DAG 内联，与安装/升级统一执行路径**：
 
-节点扩缩容时，L1 不通过 DAG 调度 binary 组件，而是更新 BKEMachine CR 的状态字段触发 L2。BKEMachine Controller Watch 到 `NodePhase` 变化后，在自身 Reconcile 中调用 `NodeStateMachine.Execute` 驱动 L2/L3 执行。
+节点扩缩容时，L1 通过 `buildScalingDAG` 构建仅含节点级 binary 组件的 DAG，由 `Scheduler.ExecuteDAG` 直接执行。扩容场景使用 Parallel 策略（新节点全并行安装），缩容场景使用 Rolling 策略（逐节点 drain + 卸载）。与安装/升级路径相同，`syncNodeStatus` 在 DAG 执行后聚合节点状态并回写 BKEMachine CR。
 
-**为什么扩缩容不走 DAG 内联而走 Watch 触发**：
+**扩容与缩容的 DAG 差异**：
 
-1. **仅涉及节点级组件**：扩容只安装新节点的 binary 组件，不涉及集群级组件变更，无需全局 DAG 调度。
-2. **节点独立性好**：新节点的组件安装不影响已有节点的运行状态，各节点可独立 Reconcile 并行安装。
-3. **CAPI 原生支持**：CAPI MachineDeployment/MachineSet 创建新 BKEMachine 时自动触发 BKEMachine Controller Reconcile，无需 BKECluster Controller 额外调度。
+| 维度 | 扩容 DAG | 缩容 DAG |
+|------|---------|---------|
+| **组件来源** | 当前版本 ReleaseImage 的 binary 组件 | 同左 |
+| **组件操作** | Install（新节点首次安装） | Uninstall（卸载已有组件） |
+| **并发策略** | Parallel（新节点全并行） | Rolling（逐节点串行，确保安全驱逐） |
+| **前置节点** | 无（新节点无前置依赖） | drain 节点（inline 类型，驱逐 Pod 后再卸载） |
+| **VersionContext** | 新节点 Current 为空 → Install | 已有节点 Current 有值 → Uninstall |
 
-**执行流程**：
+**扩容执行流程**：
 
 ```
 BKECluster Reconcile
   └─ ClusterStateMachine.Execute
        └─ evaluateClusterPhase → Scaling
-       └─ 更新 BKEMachine CR:
-            - NodePhase = Provisioning (新节点) 或 Deleting (删除节点)
-            - NodeComponents = [bkeagent, containerd, kubelet] (展开 composite)
-       └─ Patch BKEMachine CR
-
-         ↓ BKEMachine Controller Watch 到 Status 变化 ↓
-
-BKEMachine Reconcile
-  └─ 获取 BKEMachine + 关联 BKECluster
-  └─ getNodeComponents (从 ReleaseImage 解析)
-  └─ NodeStateMachine.Execute (L2)
-       └─ evaluateNodePhase → Provisioning / Deleting
-       └─ executeNodeComponents
-            └─ ComponentStateMachine.Execute (L3)
-                 └─ ComponentExecutor.Install / Uninstall
+       └─ buildScalingDAG(ctx, cluster)                         ← 仅 binary 组件
+       └─ scheduler.ExecuteDAG
+            └─ Batch 1: [bkeagent, containerd, kubelet]          ← 新节点全并行
+                 └─ BinaryComponentExecutor.ExecuteComponent
+                      ├─ NodeStatusUpdater.MarkPending(newNodeIP, "bkeagent")
+                      ├─ SSH 执行 Install (Parallel 全节点同时)
+                      ├─ NodeStatusUpdater.MarkSuccess(newNodeIP, "bkeagent")
+                      └─ 新节点组件全部安装完成
+       └─ syncNodeStatus(ctx, cluster)                           ← 回写新节点状态
+            └─ 新节点: NodeComponentStatuses 全部 Installed
+            └─ evaluateNodePhase → Ready
+            └─ BKEMachine.Status.NodePhase = Ready
+            └─ setMachineCAPIConditions → ReadyCondition = True
 ```
 
-**触发机制实现**：
+**缩容执行流程**：
+
+```
+BKECluster Reconcile
+  └─ ClusterStateMachine.Execute
+       └─ evaluateClusterPhase → Scaling
+       └─ buildScalingDAG(ctx, cluster)                         ← 仅 binary 组件
+       └─ scheduler.ExecuteDAG
+            └─ Batch 1: [drain-node-1]                          ← inline 类型: drain 节点
+                 └─ InlineComponentExecutor.ExecuteComponent
+                      └─ kubectl drain node-1 (驱逐 Pod)
+            └─ Batch 2: [bkeagent, containerd, kubelet]         ← Rolling 逐节点卸载
+                 └─ BinaryComponentExecutor.ExecuteComponent
+                      ├─ SSH 执行 Uninstall (Rolling 逐节点)
+                      ├─ NodeStatusUpdater.MarkRemoved(nodeIP, "bkeagent")
+                      └─ 节点-1 组件全部卸载完成
+            └─ Batch 3: [drain-node-2, ...]                     ← 下一节点
+                 └─ ... (重复 drain + 卸载)
+       └─ syncNodeStatus(ctx, cluster)                           ← 回写删除节点状态
+            └─ 删除节点: NodeComponentStatuses 已清除
+            └─ evaluateNodePhase → (无组件状态) → 从 DAG 中移除
+```
+
+**扩缩容 DAG 构建实现**：
 
 ```go
-// ClusterStateMachine.Execute 中 Scaling 分支的触发逻辑
+// buildScalingDAG 构建扩缩容 DAG（仅节点级 binary 组件）
+// 扩容: 新节点 Install (Parallel 全并行)
+// 缩容: 删除节点 drain (inline) → Uninstall (Rolling 逐节点)
+func (sm *ClusterStateMachine) buildScalingDAG(
+    ctx context.Context,
+    cluster *bkev1beta1.BKECluster,
+) (*topology.UpgradeDAG, error) {
+    releaseImage, err := sm.releaseImageResolver.Resolve(ctx, cluster)
+    if err != nil {
+        return nil, fmt.Errorf("resolve release image: %w", err)
+    }
+
+    // 1. 获取组件列表（已安装集群用 upgrade，首次安装用 install）
+    components := releaseImage.Spec.Install.Components
+    if cluster.Status.CurrentVersion != "" {
+        components = releaseImage.Spec.Upgrade.Components
+    }
+
+    // 2. 展开 composite
+    expandedComponents := expandCompositeComponents(components)
+
+    // 3. 过滤出 binary 类型组件（扩缩容仅涉及节点级组件）
+    var nodeComponents []cvv1alpha1.ReleaseImageUpgradeComponent
+    for _, comp := range expandedComponents {
+        cv, err := sm.cvStore.GetComponentVersion(ctx, comp.Name, comp.Version)
+        if err != nil {
+            return nil, fmt.Errorf("lookup component %s: %w", comp.Name, err)
+        }
+        if cv.Spec.Type == ComponentTypeBinary {
+            // 扩容: upgradeStrategy.mode = Parallel (新节点全并行)
+            // 缩容: upgradeStrategy.mode = Rolling (逐节点串行)
+            nodeComponents = append(nodeComponents, comp)
+        }
+    }
+
+    // 4. 构建 DAG
+    resolve := sm.makeDependencyResolver(ctx)
+    dag, err := topology.BuildUpgradeDAG(nodeComponents, resolve)
+    if err != nil {
+        return nil, err
+    }
+
+    // 5. 缩容场景: 添加 drain 前置节点
+    nodes, _ := sm.nodeProvider.GetNodes(ctx, cluster)
+    for _, node := range nodes {
+        if node.Spec.Deleted {
+            // 为每个删除节点添加 drain inline 节点
+            drainNode := &topology.ComponentNode{
+                Name: fmt.Sprintf("drain-%s", node.Name),
+                Inline: &topology.InlineRef{
+                    Handler: "DrainNode",
+                    Version: "v1",
+                },
+                FailurePolicy: topology.FailurePolicyFailFast,
+            }
+            dag.AddNode(drainNode)
+            // drain 必须在组件卸载之前完成
+            for _, comp := range nodeComponents {
+                dag.AddDependency(drainNode.Name, comp.Name)
+            }
+        }
+    }
+
+    return dag, nil
+}
+```
+
+**Execute 中 Scaling 分支的实现**：
+
+```go
 case ClusterPhaseScaling:
-    // 1. 构建扩缩容 DAG（仅节点级组件）
+    // 与安装/升级相同: 构建 DAG → 执行 DAG → 同步节点状态
     dag, err := sm.buildScalingDAG(ctx, cluster)
     if err != nil {
         return fmt.Errorf("build scaling DAG failed: %w", err)
     }
-
-    // 2. 不通过 scheduler.ExecuteDAG 执行，而是更新 BKEMachine CR 触发 L2
-    nodes, err := sm.nodeProvider.GetNodes(ctx, cluster)
-    if err != nil {
-        return fmt.Errorf("get nodes failed: %w", err)
+    execCtx := sm.buildExecutionContext(ctx, cluster)
+    if err := sm.scheduler.ExecuteDAG(ctx, execCtx, dag); err != nil {
+        _ = sm.syncNodeStatus(ctx, cluster)
+        return fmt.Errorf("execute scaling DAG failed: %w", err)
     }
-
-    for _, node := range nodes {
-        machine := &bkev1beta1.BKEMachine{}
-        if err := sm.client.Get(ctx, types.NamespacedName{
-            Name: node.MachineName, Namespace: cluster.Namespace,
-        }, machine); err != nil {
-            continue
-        }
-
-        patchHelper, _ := patch.NewHelper(machine, sm.client)
-
-        // 新节点：设置 NodePhase = Provisioning 触发安装
-        if node.Status.LifecyclePhase == NodePhasePending {
-            machine.Status.NodePhase = NodePhaseProvisioning
-            machine.Status.NodeComponents = toNodeComponentRefs(dag)
-        }
-
-        // 删除节点：设置 NodePhase = Deleting 触发卸载
-        if node.Spec.Deleted {
-            machine.Status.NodePhase = NodePhaseDeleting
-        }
-
-        patchHelper.Patch(ctx, machine)
-        // BKEMachine Controller Watch 到变化后触发 L2 Execute
+    // DAG 执行后同步节点状态（与路径 1 完全一致）
+    if err := sm.syncNodeStatus(ctx, cluster); err != nil {
+        sm.recorder.Eventf(cluster, v1.EventTypeWarning,
+            "NodeStatusSyncFailed", "failed to sync node status: %v", err)
     }
 ```
 
-#### 6.2.3 两条路径的协作对比
+#### 6.2.3 场景对比
 
-| 维度 | DAG 内联执行 (路径 1) | Watch 触发 (路径 2) |
-|------|----------------------|-------------------|
-| **触发场景** | 集群安装、版本升级 | 节点扩容、节点缩容 |
-| **L1 操作** | `scheduler.ExecuteDAG` 直接执行 | 更新 BKEMachine CR Status |
-| **L2 是否参与** | 不参与（Scheduler 直接操作 L3） | 参与（L2 评估状态后驱动 L3） |
-| **组件来源** | DAG 中的 ComponentNode | BKEMachine.Status.NodeComponents |
-| **并发控制** | Scheduler 批次内并行 | 每个 BKEMachine 独立 Reconcile |
-| **幂等保证** | VersionContext.NeedsUpgrade | evaluateNodePhase + evaluateComponentPhase |
-| **状态回写** | BKECluster.Status.ComponentStatuses | BKEMachine.Status.ComponentStatuses |
+**统一 DAG 内联后各场景的差异**：
+
+| 维度 | 安装 (Installing) | 升级 (Upgrading) | 扩容 (Scaling) | 缩容 (Scaling) |
+|------|-------------------|-----------------|---------------|---------------|
+| **DAG 构建** | `buildInstallDAG` | `buildUpgradeDAG` | `buildScalingDAG` | `buildScalingDAG` |
+| **组件来源** | `install.components` | `upgrade.components` | 当前版本 binary 组件 | 当前版本 binary 组件 |
+| **组件操作** | Install | Upgrade | Install（新节点） | Uninstall（删除节点） |
+| **并发策略** | Rolling/Parallel | Rolling/Batch | Parallel（全并行） | Rolling（逐节点 drain+卸载） |
+| **前置节点** | 无 | 无 | 无 | drain inline 节点 |
+| **VersionContext** | Current 为空 | Current 有值 | 新节点 Current 为空 | 删除节点 Current 有值 |
+| **状态回写** | syncNodeStatus | syncNodeStatus | syncNodeStatus | syncNodeStatus |
+| **CAPI Conditions** | setMachineCAPIConditions | setMachineCAPIConditions | setMachineCAPIConditions | 清除后移除 |
+| **BKEMachine Controller** | 不参与 | 不参与 | 不参与 | 不参与 |
+
+**统一路径的优势**：
+
+| 优势 | 说明 |
+|------|------|
+| **单一执行路径** | 所有场景走 `Scheduler.ExecuteDAG` + `syncNodeStatus`，无需维护 Watch 触发分支 |
+| **状态回写统一** | 所有场景的节点状态由 `syncNodeStatus` 统一聚合和回写，避免两种路径的状态不一致 |
+| **依赖顺序保证** | 扩容也能保证跨节点、跨组件的依赖顺序（如 etcd 节点先于 master 节点就绪） |
+| **缩容安全性** | drain 操作作为 DAG inline 节点，与组件卸载按依赖顺序执行，保证 Pod 驱逐完成后才卸载 |
+| **并发控制统一** | `BinaryComponentExecutor` 的 upgradeStrategy.mode 统一控制所有场景的节点级并发 |
+
+#### 6.2.4 NodeStateMachine 的保留场景
+
+统一 DAG 内联后，`NodeStateMachine` 不再作为扩缩容的执行路径，但保留以下场景：
+
+| 场景 | 触发方式 | NodeStateMachine 职责 | 说明 |
+|------|---------|----------------------|------|
+| **单节点故障恢复** | BKEMachine Controller Reconcile | `evaluateNodePhase` 判断节点状态 | 节点重启后组件状态检查，判断是否需要重新安装 |
+| **手动重试失败节点** | 人工清除 Failed 状态 | `evaluateNodePhase` → Provisioning | 人工介入后重新触发组件安装 |
+| **状态查询** | BKEMachine Controller Reconcile | `evaluateNodePhase` 聚合只读 | 不执行操作，仅聚合组件状态供查询（DAG 内联已写入 NodeComponentStatuses） |
+
+> **设计说明**：NodeStateMachine 从"扩缩容执行路径"降级为"单节点状态查询与故障恢复"辅助角色。主执行路径统一为 DAG 内联，NodeStateMachine 仅在 BKEMachine Controller 独立 Reconcile 中用于状态聚合和异常恢复，不再驱动组件安装/升级/卸载。
 
 ### 6.3 BKECluster Controller 集成
 
@@ -2207,7 +2312,7 @@ func (r *BKEClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 **设计思路 — 节点层状态机独立 Reconcile，服务于扩缩容与单节点生命周期**：
 
-1. **BKEMachine Reconcile 与 DAG 调度的关系**：集群级安装/升级时，BKECluster Controller 通过 `Scheduler.ExecuteDAG` 统一调度所有组件（包括节点级 binary 组件），`syncNodeStatus` 在 DAG 执行后直接回写 BKEMachine CR 的 `NodePhase` 和 CAPI Conditions。BKEMachine Controller **不参与路径 1**——其 Reconcile 在路径 1 中是空操作（`evaluateNodePhase` 读取已更新的 `NodeComponentStatuses` 后返回 Ready，Execute 无匹配 case 直接返回 nil）。BKEMachine Reconcile 主要服务于路径 2：① 节点扩容——新 BKEMachine 创建后触发节点层状态机执行组件安装；② 节点缩容——BKEMachine 删除标记触发节点层状态机执行组件卸载。
+1. **BKEMachine Reconcile 与 DAG 调度的关系**：统一 DAG 内联后，所有场景（安装/升级/扩缩容）均由 BKECluster Controller 通过 `Scheduler.ExecuteDAG` + `syncNodeStatus` 统一执行和状态回写。BKEMachine Controller **不参与主执行路径**——其 Reconcile 中 `evaluateNodePhase` 读取 DAG 内联已写入的 `NodeComponentStatuses`，聚合后若状态已达成（Ready/Failed）则 Execute 无匹配 case 直接返回 nil。BKEMachine Controller 的保留职责为：① 单节点故障恢复——节点重启后检查组件状态，判断是否需要重新安装；② 手动重试——人工清除 Failed 状态后重新触发；③ 状态查询聚合——为 `kubectl get bkenode` 提供实时状态聚合。
 2. **nodeComponents 从 ReleaseImage 解析**：`getNodeComponents` 从当前 ReleaseImage 展开 composite 后过滤出 binary 类型组件。这与 §4.4.3 的设计一致——不再使用 `NodeGroupNode` 或 `ComponentScopeNode` 过滤，而是通过组件类型（binary）确定节点级组件。组件列表按依赖关系拓扑排序后传入 `NodeStateMachine.Execute`。
 3. **BKEMachine 与 BKENode 的双向转换**：`machine.ToBKENode()` 将 CAPI BKEMachine CR 转换为状态机引擎使用的 `BKENode` 内部结构，`machine.UpdateFromBKENode(node)` 将状态机执行后的 `BKENode` 状态同步回 BKEMachine CR。这种转换隔离了 CAPI CR 结构与状态机内部数据模型——状态机引擎不依赖 CAPI 类型，仅操作 `BKENode`，便于独立测试。
 4. **topologicalSort 复用已有实现**：节点内组件排序复用 `pkg/topology` 包的拓扑排序逻辑，不重新实现。排序仅考虑节点级组件间的依赖（如 bkeagent → containerd → kubelet），忽略对集群级组件的依赖（如 kubelet → kube-apiserver），因为集群级组件由 DAG 调度器保证在节点级组件之前完成。
