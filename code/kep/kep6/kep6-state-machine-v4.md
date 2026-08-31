@@ -2657,6 +2657,14 @@ func setCAPIConditions(cluster *bkev1beta1.BKECluster) {
 
 ### 7.1 安装流程
 
+**设计思路 — 首次安装是全量 DAG 执行，所有组件从零开始**：
+
+1. **全量组件 DAG**：安装 DAG 从 `ReleaseImage.spec.install.components` 构建，包含全部组件（集群级 + 节点级）。composite 在构建时展开为子组件，全部作为独立 ComponentNode 参与拓扑排序。
+2. **VersionContext Current 为空**：首次安装时所有组件的 `Current` 版本为空，`NeedsUpgrade` 对全部组件返回 true，所有组件执行 Install 操作。这与升级场景不同——升级时仅版本变更的组件执行 Upgrade。
+3. **依赖顺序保证**：安装需要严格的跨组件依赖顺序（etcd → apiserver → kubelet → coredns），DAG 拓扑排序保证依赖在前。binary 组件的节点级并发由 `upgradeStrategy.mode` 控制（安装场景通常使用 Parallel 加速）。
+4. **syncNodeStatus 回写**：DAG 执行完成后 `syncNodeStatus` 聚合所有节点的组件状态为 `NodePhase`，直接写入 BKEMachine CR 和 CAPI Conditions。BKEMachine Controller 不参与安装路径（默认 DAG 内联）。
+
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │                          集群安装完整流程                                         │
@@ -2736,6 +2744,14 @@ func setCAPIConditions(cluster *bkev1beta1.BKECluster) {
 
 ### 7.2 升级流程
 
+**设计思路 — 升级是增量 DAG 执行，仅版本变更的组件执行 Upgrade**：
+
+1. **增量组件过滤**：升级 DAG 从 `ReleaseImage.spec.upgrade.components` 构建，但 `VersionContext.NeedsUpgrade` 过滤掉版本未变更的组件——已完成升级的组件跳过，仅执行版本变更的组件。这保证 Reconcile 重入时不会重复升级。
+2. **deferredSubComponents 延迟升级**：composite 中声明的延迟组件（如 kubelet）由 `buildUpgradeDAG` 解析后传入 `executeControlPlaneHop`，跳过这些组件的 Target 版本更新，在后续偏差极限内补充升级。这避免了 kubelet 与 apiserver 版本差距过大导致集群不可用。
+3. **节点级并发策略**：binary 组件升级使用 Rolling/Batch 策略（逐节点/分批），确保升级过程中集群始终有节点在线提供服务。这与安装场景的 Parallel 策略不同——升级需要保证服务连续性。
+4. **syncNodeStatus 回写**：与安装流程完全一致，`syncNodeStatus` 在 DAG 执行后聚合节点状态。DAG 执行失败时也尝试同步已成功部分的状态（`_ = sm.syncNodeStatus(ctx, cluster)`），保证部分升级的进度可见。
+
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │                          集群升级完整流程                                         │
@@ -2783,6 +2799,14 @@ func setCAPIConditions(cluster *bkev1beta1.BKECluster) {
 ### 7.3 扩容流程
 
 **触发条件**：用户新增 BKENode（节点状态为 Pending），`desiredVersion == currentVersion` 且无其他操作触发。
+
+
+**设计思路 — 扩容是仅新节点的 binary 组件安装，全并行提升效率**：
+
+1. **仅 binary 组件**：`buildScalingDAG` 过滤出 `ComponentTypeBinary` 组件，集群级组件（yaml/helm/staticpod）不在扩容时重复执行——它们已在安装/升级时部署到集群，新节点通过 K8s 调度自动拉起 Pod。
+2. **Parallel 全并行**：扩容场景使用 `Parallel` 策略，新节点全并行安装组件。这与安装/升级的 Rolling/Batch 策略不同——新节点的组件安装不影响已有节点的运行状态，无需逐节点串行。
+3. **VersionContext 新节点 Current 为空**：新节点的组件状态为空（无 `ComponentLifecycleStatus` 记录），`evaluateNodePhase` 判定为 `Provisioning`，组件执行 Install 操作。已有节点的组件状态不受扩容影响。
+4. **syncNodeStatus 统一回写**：DAG 执行后 `syncNodeStatus` 聚合新节点状态为 Ready，写入 BKEMachine CR 和 CAPI Conditions。CAPI MachineDeployment Controller Watch 到 `ReadyCondition=True` 后判定新节点就绪。
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -2857,6 +2881,14 @@ func setCAPIConditions(cluster *bkev1beta1.BKECluster) {
 
 **触发条件**：用户对 BKENode 设置 `Spec.Deleted = true`，`desiredVersion == currentVersion`。
 
+
+**设计思路 — 缩容是 drain + 逐节点卸载，安全性优先于效率**：
+
+1. **drain 前置保证**：缩容时先执行 `kubectl drain`（驱逐 Pod），作为 inline 类型 DAG 节点。通过 DAG 依赖边保证 drain 在组件卸载之前完成——Pod 驱逐后节点上无运行的工作负载，卸载组件不会影响业务。
+2. **Rolling 逐节点串行**：缩容使用 Rolling 策略逐节点卸载（drain node-1 → 卸载 node-1 组件 → drain node-2 → 卸载 node-2 组件），而非 Parallel 全并行。这保证一次只删除一个节点，集群有足够的副本维持服务可用性。
+3. **VersionContext Uninstall 语义**：已有节点的 `Current` 有值，`evaluateComponentPhase` 根据 `action == ActionUninstall` 返回 `Deleting`，Executor 执行 UninstallScript 卸载组件。卸载完成后 `NodeStatusUpdater.MarkRemoved` 清除组件状态。
+4. **状态清除**：`syncNodeStatus` 对已删除节点清除 `NodeComponentStatuses`，节点从 DAG 中移除。BKEMachine CR 的 CAPI Conditions 被清除，CAPI MachineDeployment Controller 据此回收 Machine 资源。
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │                          集群缩容完整流程                                         │
@@ -2917,6 +2949,14 @@ func setCAPIConditions(cluster *bkev1beta1.BKECluster) {
 ### 7.5 回滚流程
 
 **触发条件**：升级失败后用户设置 `Spec.RollbackRequested = true`，回滚到 `Status.PreviousVersion`。
+
+
+**设计思路 — 回滚是版本回退的 DAG 执行，Current/Target 交换实现降级**：
+
+1. **RollbackRequested 优先级最高**：`evaluateClusterPhase` 中 `RollbackRequested=true` 的优先级高于 `Failed` 不自愈检查，允许从故障态直接触发回滚。这是唯一能从 `Failed` 状态退出的自动路径——其他场景需人工清除 Failed。
+2. **PreviousVersion 构建 DAG**：`buildRollbackDAG` 从 `Status.PreviousVersion` 解析上一个成功的 ReleaseImage，使用其 `upgrade.components` 构建组件列表。回滚 DAG 的结构与升级 DAG 相同，仅版本回退。
+3. **VersionContext.PrepareRollback()**：交换 `Current` 和 `Target`——原 Current（升级前版本 v2.6.0）变为 Target，原 Target（升级后版本 v2.7.0）变为 Current。这样 `NeedsUpgrade` 判断的是"从 v2.7.0 回退到 v2.6.0"，已完成回滚的组件跳过。
+4. **Rolling 逐节点降级**：回滚使用 Rolling 策略逐节点降级，确保降级过程中集群始终有节点在线。binary 组件执行 UninstallScript + InstallScript 回退到旧版本，helm 组件执行 `helm rollback`。
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -2991,6 +3031,14 @@ func setCAPIConditions(cluster *bkev1beta1.BKECluster) {
 
 **触发条件**：升级过程中部分组件执行失败，演示跨 Reconcile 的幂等性和中间态保持。
 
+
+**设计思路 — 跨 Reconcile 的幂等性和中间态保持是核心保证**：
+
+1. **中间态保持**：`Upgrading` 状态跨 Reconcile 保持，`evaluateClusterPhase` 返回 `Upgrading`（决策优先级 3：操作中间态保持），下次 Reconcile 继续执行 DAG 而非重新开始。这保证长时间的升级操作不被中断重置。
+2. **组件级幂等**：已完成升级的组件通过 `VersionContext.NeedsUpgrade=false` 跳过（`evaluateComponentPhase` 返回 `Installed`），未完成的组件继续执行。即使 Reconcile 因超时中断，下次重入时仅执行未完成部分。
+3. **Failed 不自愈**：node-2 的 containerd 进入 `Failed` 后，`evaluateComponentPhase` 返回 `Failed`（优先级 1：Failed 不自愈），Execute 无匹配 case 跳过执行。故障组件不会在未修复前被反复重试，避免故障扩散。
+4. **syncNodeStatus 容错**：DAG 执行失败时也调用 `syncNodeStatus`（`_ = sm.syncNodeStatus(ctx, cluster)`），同步已成功部分的状态。这保证部分升级的进度可见——用户和 CAPI 上层能观测到哪些节点已完成、哪些失败。
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │                  升级失败与中断重入完整流程 (幂等性演示)                              │
@@ -3063,6 +3111,14 @@ func setCAPIConditions(cluster *bkev1beta1.BKECluster) {
 
 **触发条件**：集群处于 `Failed` 状态，人工修复底层问题（如网络、磁盘）后清除 Failed 状态重新触发操作。
 
+
+**设计思路 — 人工介入清除 Failed 后重新评估，幂等恢复保证安全**：
+
+1. **Failed 不自愈的设计权衡**：集群和组件层均不自动恢复 `Failed` 状态，避免在未修复底层问题（如网络、磁盘故障）前反复重试导致故障扩散。人工介入修复底层问题后清除 Failed，重新评估版本关系。
+2. **双重清除**：需同时清除集群级 `Failed`（重置为 `Upgrading`）和组件级 `Failed`（重置为 `Pending`）。仅清除集群级而不清除组件级，组件仍返回 `Failed` 跳过执行。仅清除组件级而不清除集群级，集群仍在 `Failed` 不执行 DAG。
+3. **清除后幂等恢复**：人工清除后 `evaluateComponentPhase` 重新判断版本关系——已完成升级的组件（版本一致）返回 `Installed` 跳过，未完成的组件（版本不一致）返回 `Upgrading` 继续执行。这保证恢复不会重新升级已完成组件。
+4. **evaluateComponentPhase 版本比较驱动**：人工清除 Failed 后 `status.Phase = Pending`，`evaluateComponentPhase` 通过比较 `status.Version`（人工清除时也清除了版本记录）与 `cv.Spec.Version` 判定为 `Installing`（无版本记录）或 `Upgrading`（版本不一致），触发重新执行。
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │                  Failed 故障恢复完整流程 (人工介入)                                  │
@@ -3119,6 +3175,14 @@ func setCAPIConditions(cluster *bkev1beta1.BKECluster) {
 ### 7.8 Watch 触发扩容流程（可选路径）
 
 **触发条件**：启用 Feature Gate `ScalingWatchTriggerEnabled`，扩容走 BKEMachine Watch 触发路径（§6.2.3）。
+
+
+**设计思路 — 可选路径通过 Feature Gate 控制，L2 驱动 L3 各节点独立并行**：
+
+1. **Feature Gate 切换**：`ScalingWatchTriggerEnabled` 控制扩缩容走 DAG 内联（默认）还是 Watch 触发（可选）。两种路径不会同时执行——DAG 内联路径中 L1 直接操作 L3，Watch 触发路径中 L2 驱动 L3。Feature Gate 通过集群注解或全局 flag 控制。
+2. **L2 完整参与**：与 DAG 内联路径（L2 不参与）不同，Watch 触发路径中 `NodeStateMachine.Execute` 驱动 L2 评估节点状态 → L3 执行组件操作。三层状态机完整参与，与旧架构（Phase 框架）的行为接近，便于灰度迁移。
+3. **各节点独立并行**：每个 BKEMachine 独立 Reconcile，无全局批次协调。适用于大规模集群（数千节点时 L1 DAG 串行化成为瓶颈）和多可用区场景（各区域网络延迟不一致时独立 Reconcile 不受全局等待）。
+4. **状态实时聚合**：与 DAG 内联路径的 `syncNodeStatus`（DAG 完成后一次性聚合）不同，Watch 触发路径的 `evaluateNodePhase` 在每次组件执行后实时聚合节点状态。中间状态可见性更好，但聚合逻辑分散在各 BKEMachine Controller 中。
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -3185,6 +3249,11 @@ func setCAPIConditions(cluster *bkev1beta1.BKECluster) {
 - **CAPI Conditions 写入者差异**：路径 3 由 BKEMachine Controller 写入，路径 1/2 由 `syncNodeStatus` 写入（§6.2.4 对比表）
 
 ### 7.9 场景对比总结
+**设计思路 — 统一 DAG 内联为默认路径，所有场景共享核心设计原则**：
+
+8 个场景共享 4 条核心设计原则，差异仅在 DAG 构建方式、组件操作类型和并发策略：
+
+
 
 | 场景 | 触发条件 | L1 Phase | DAG 类型 | 执行路径 | L2 参与 | 关键策略 |
 |------|---------|----------|---------|---------|---------|---------|
