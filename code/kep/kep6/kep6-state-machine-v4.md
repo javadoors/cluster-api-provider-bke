@@ -28,7 +28,7 @@
 | 约束 | 说明 |
 |------|------|
 | **节点级组件相邻** | 在 DAG 中，节点级组件聚合为一个"节点组"节点，保持 DAG 拓扑简洁 |
-| **节点级并行** | 节点组节点执行时，所有节点并行执行各自的组件状态机 |
+| **节点级并行** | BinaryComponentExecutor 内部支持 Rolling/Parallel/Batch 节点级并发 |
 | **组件级状态机** | 每个节点的每个组件通过组件级状态机引擎驱动安装/升级/卸载 |
 | **幂等性** | 所有状态转换和操作必须幂等，支持 Reconcile 重入 |
 | **CAPI 兼容** | 状态机引擎与 CAPI Controller 的 Reconcile 模式兼容 |
@@ -72,51 +72,73 @@
 
 ### 2.2 DAG 结构设计
 
-**核心设计**：从 ReleaseImage 构建的 DAG 中，节点级组件聚合为一个"节点组"节点。
+**核心设计**：DAG 中所有组件均为统一的 `ComponentNode`，不再区分集群级/节点级节点类型。K8s 核心组件和节点二进制组件通过 `composite` 类型（KEP-15）封装，DAG 构建时自动展开为子组件节点。
+
+**设计思路 — 为什么移除 ClusterComponentNode 和 NodeGroupNode**：
+
+1. **yaml/helm 本身就是集群类型**：yaml/helm 组件通过 K8s API 或 Helm SDK 部署到目标集群，天然是集群级操作，无需额外的 `ClusterComponentNode` 包装。
+2. **二进制组件本身就是 Node 类型**：binary 组件通过 SSH 在节点上执行，`BinaryComponentExecutor` 内部已支持 Rolling/Parallel/Batch 节点级并发策略，无需 `NodeGroupNode` 包装。
+3. **composite 封装更自然**：K8s 核心组件（etcd/apiserver/cm/scheduler/kubelet/kubectl/kube-proxy）和节点二进制组件（bkeagent/containerd）通过 `composite` 类型组合管理，DAG 构建时展开为独立子组件节点，各自按依赖关系参与拓扑排序。
 
 ```
 ReleaseImage 组件列表:
-  - certs (scope=cluster)
-  - bkeagent (scope=node)
-  - containerd (scope=node)
-  - kubelet (scope=node)
-  - kubectl (scope=node)
-  - coredns (scope=cluster)
-  - kube-proxy (scope=cluster)
+  - kubernetes-core (type=composite, 含 K8s 核心组件)
+  - node-binaries (type=composite, 含节点二进制组件)
+  - coredns (type=helm)
+  - kube-proxy (type=yaml)
 
-构建后的 DAG:
+DAG 构建时展开 composite:
 
-  ┌────────┐    ┌────────────────────────────────────┐    ┌─────────┐    ┌────────────┐
-  │ certs  │───>│         node-group                 │───>│ coredns │───>│ kube-proxy │
-  │(cluster)│    │  ┌──────────────────────────────┐ │    │(cluster)│    │ (cluster)  │
-  └────────┘    │  │  NodeEngine (并行执行)         │ │    └─────────┘    └────────────┘
-                │  │  ┌────┐┌────┐┌────┐┌────┐     │ │
-                │  │  │N1  ││N2  ││N3  ││... │     │ │
-                │  │  │agent││agent││agent││agent │     │
-                │  │  │  ↓  ││  ↓  ││  ↓  ││  ↓  │     │
-                │  │  │ctrld││ctrld││ctrld││ctrld │     │
-                │  │  │  ↓  ││  ↓  ││  ↓  ││  ↓  │     │
-                │  │  │klet ││klet ││klet ││klet  │     │
-                │  │  │  ↓  ││  ↓  ││  ↓  ││  ↓  │     │
-                │  │  │kctl ││kctl ││kctl ││kctl  │     │
-                │  │  └────┘└────┘└────┘└────┘     │ │
-                │  └──────────────────────────────┘ │
-                └────────────────────────────────────┘
+  ┌────────┐   ┌──────────┐   ┌──────────────────┐   ┌──────────┐   ┌────────────┐
+  │ certs  │──>│ bkeagent │──>│    containerd    │──>│ kubelet  │──>│ kube-proxy │
+  │(staticpod)  │(binary)  │   │    (binary)      │   │(binary)  │   │ (yaml)     │
+  └────────┘   └──────────┘   └──────────────────┘   └──────────┘   └────────────┘
+                                  │                        │
+                                  ▼                        ▼
+                              ┌──────────┐           ┌──────────────────┐
+                              │ kube-    │           │ kube-controller- │
+                              │ apiserver│           │ manager          │
+                              │(staticpod)          │(staticpod)       │
+                              └──────────┘           └──────────────────┘
+                                  │                        │
+                                  ▼                        ▼
+                              ┌──────────┐           ┌──────────────────┐
+                              │ etcd     │           │ kube-scheduler   │
+                              │(staticpod)          │(staticpod)       │
+                              └──────────┘           └──────────────────┘
 
-每个节点内部组件执行顺序 (L2 节点层状态机驱动):
-  bkeagent → containerd → kubelet → kubectl
-  (通过 ComponentVersion.spec.dependencies 定义)
+  ┌──────────────────┐
+  │     coredns      │  (helm, 集群级部署)
+  │  依赖 kubelet    │
+  └──────────────────┘
+
+组件执行顺序由 ComponentVersion.spec.dependencies 定义:
+  - etcd → kube-apiserver → kube-controller-manager / kube-scheduler
+  - bkeagent → containerd → kubelet → kubectl
+  - kubelet → kube-proxy / coredns (集群级组件依赖节点级组件就绪)
+
+节点级并发由 BinaryComponentExecutor.upgradeStrategy.mode 控制:
+  - Rolling: 逐节点执行 (containerd 等高风险组件)
+  - Batch: 分批执行 (bkeagent 等中风险组件)
+  - Parallel: 全节点并行 (低风险配置更新)
 ```
 
 ### 2.3 DAG 节点类型
 
-| DAG 节点类型 | 说明 | 执行方式 |
-|-------------|------|---------|
-| **ClusterComponentNode** | 集群级组件（scope=cluster） | 直接执行组件级状态机 |
-| **NodeGroupNode** | 节点组（聚合所有节点级组件） | 并行执行所有节点的节点层状态机 |
+DAG 中只有一种节点类型 `ComponentNode`，每个组件（无论 binary/yaml/helm/staticpod）都是独立的 DAG 节点。`composite` 类型在 DAG 构建时展开为子组件节点，自身不产生 DAG 节点。
+
+| 组件类型 | 执行方式 | 节点级并发 | 说明 |
+|---------|---------|-----------|------|
+| **binary** | SSH 在节点上执行 | Rolling/Parallel/Batch | 由 BinaryComponentExecutor 控制逐节点/分批/全并行 |
+| **staticpod** | Static Pod 拉起/替换 | Rolling (etcd quorum) | 由 StaticPodComponentExecutor 控制 |
+| **yaml** | K8s API Apply 到集群 | 无 (集群级一次执行) | 由 YamlComponentExecutor 执行 |
+| **helm** | Helm SDK install/upgrade | 无 (集群级一次执行) | 由 HelmComponentExecutor 执行 |
+| **inline** | Phase handler 执行 | 无 | 复用现有 Phase 逻辑 |
+| **composite** | 不执行 (展开为子组件) | — | DAG 构建时展开，自身不产生节点 |
+| **selector** | 不执行 (按 condition 选择) | — | DAG 构建时评估 condition，选择子组件 |
 
 ```go
-// DAG 节点接口
+// DAG 节点接口 — 统一节点类型，不再区分 Cluster/NodeGroup
 type DAGNode interface {
     Name() string
     Type() DAGNodeType
@@ -127,24 +149,35 @@ type DAGNode interface {
 type DAGNodeType string
 
 const (
-    DAGNodeClusterComponent DAGNodeType = "cluster-component"
-    DAGNodeNodeGroup        DAGNodeType = "node-group"
+    DAGNodeComponent DAGNodeType = "component"  // 统一组件节点
 )
 
-// 集群级组件节点
-type ClusterComponentNode struct {
-    name     string
+// ComponentNode 统一组件节点
+// 所有组件类型（binary/yaml/helm/staticpod/inline）均为 ComponentNode
+// composite/selector 类型在 DAG 构建时展开，不产生 ComponentNode
+type ComponentNode struct {
+    name      string
     component *ComponentVersion
-    deps     []string
+    deps      []string
+    // executor 从 ComponentVersion.Spec.Type 选择对应的 Executor
+    // binary → BinaryComponentExecutor (SSH 逐节点执行)
+    // yaml   → YamlComponentExecutor (K8s API Apply)
+    // helm   → HelmComponentExecutor (Helm SDK)
+    // staticpod → StaticPodComponentExecutor (Static Pod 拉起)
+    // inline → InlineComponentExecutor (Phase handler)
 }
 
-// 节点组节点（聚合所有节点级组件）
-type NodeGroupNode struct {
-    name          string
-    nodeComponents []*ComponentVersion  // 所有 scope=node 的组件
-    deps          []string
+func (n *ComponentNode) Name() string           { return n.name }
+func (n *ComponentNode) Type() DAGNodeType      { return DAGNodeComponent }
+func (n *ComponentNode) Dependencies() []string  { return n.deps }
+
+// Execute 根据组件类型选择对应的 Executor 执行
+// 节点级并发由各 Executor 内部控制（如 BinaryComponentExecutor 的 Rolling/Batch 策略）
+func (n *ComponentNode) Execute(ctx context.Context, execCtx *ExecutionContext) error {
+    return execCtx.ComponentSM.Execute(ctx, n.component)
 }
 ```
+
 
 ### 2.4 三层状态机引擎架构
 
@@ -162,8 +195,8 @@ type NodeGroupNode struct {
 │  │                                                                          │   │
 │  │  DAG 执行:                                                               │   │
 │  │  ┌──────────┐   ┌──────────────┐   ┌──────────┐   ┌──────────┐        │   │
-│  │  │  certs   │──>│  node-group  │──>│  coredns │──>│kube-proxy│        │   │
-│  │  │(ClusterSM)│  │ (NodeSM×N)   │   │(ClusterSM)│  │(ClusterSM)│        │   │
+│  │  │  certs   │──>│  components  │──>│  coredns │──>│kube-proxy│        │   │
+│  │  │(ClusterSM)│  │ (CompSM)   │   │(ClusterSM)│  │(ClusterSM)│        │   │
 │  │  └──────────┘   └──────────────┘   └──────────┘   └──────────┘        │   │
 │  │                       │                                                 │   │
 │  │                       │ 并行执行 N 个节点                                 │   │
@@ -413,44 +446,29 @@ type DAGExecutor struct {
 }
 
 // BuildDAG 从 ReleaseImage 构建 DAG
+// BuildDAG 从 ReleaseImage 构建 DAG
+// composite/selector 类型在构建时展开为子组件节点，自身不产生 DAG 节点
+// 所有组件（binary/yaml/helm/staticpod/inline）均为统一的 ComponentNode
 func (e *DAGExecutor) BuildDAG(releaseImage *ReleaseImage) (*ExecutionDAG, error) {
     dag := NewExecutionDAG()
-    
-    // 分离集群级组件和节点级组件
-    var clusterComponents []*ComponentVersion
-    var nodeComponents []*ComponentVersion
-    
-    for _, comp := range releaseImage.Spec.Components {
+
+    // 1. 展开 composite 组件（KEP-15）
+    //    composite 自身不产生 DAG 节点，展开为子组件
+    expandedComponents := expandCompositeComponents(releaseImage.Spec.Components)
+
+    // 2. 添加所有组件为统一的 ComponentNode（不再区分 cluster/node scope）
+    for _, comp := range expandedComponents {
         cv := lookupComponentVersion(comp.Name, comp.Version)
-        if cv.Spec.Scope == ComponentScopeNode {
-            nodeComponents = append(nodeComponents, cv)
-        } else {
-            clusterComponents = append(clusterComponents, cv)
-        }
-    }
-    
-    // 添加集群级组件节点
-    for _, cv := range clusterComponents {
-        dag.AddNode(&ClusterComponentNode{
-            name:      cv.Name,
+        dag.AddNode(&ComponentNode{
+            name:      comp.Name,
             component: cv,
             deps:      cv.Spec.Dependencies,
         })
     }
-    
-    // 添加节点组节点（聚合所有节点级组件）
-    if len(nodeComponents) > 0 {
-        nodeGroup := &NodeGroupNode{
-            name:           "node-group",
-            nodeComponents: nodeComponents,
-            deps:           collectNodeGroupDeps(nodeComponents),
-        }
-        dag.AddNode(nodeGroup)
-    }
-    
-    // 构建依赖边
+
+    // 3. 构建依赖边（复用现有逻辑）
     dag.BuildEdges()
-    
+
     return dag, nil
 }
 
@@ -492,48 +510,23 @@ func (e *DAGExecutor) ExecuteDAG(ctx context.Context, dag *ExecutionDAG, execCtx
 ### 4.3 DAG 节点执行
 
 ```go
-// ClusterComponentNode.Execute 执行集群级组件
-func (n *ClusterComponentNode) Execute(ctx context.Context, execCtx *ExecutionContext) error {
-    // 直接执行组件级状态机
-    comp := execCtx.GetClusterComponentStatus(n.name)
+// ComponentNode.Execute 执行组件节点
+// 根据组件类型选择对应的 Executor：
+// - binary: BinaryComponentExecutor (SSH 逐节点执行，内部支持 Rolling/Batch/Parallel)
+// - yaml: YamlComponentExecutor (K8s API Apply 到集群)
+// - helm: HelmComponentExecutor (Helm SDK install/upgrade)
+// - staticpod: StaticPodComponentExecutor (Static Pod 拉起/替换)
+// - inline: InlineComponentExecutor (Phase handler)
+//
+// 节点级并发由 BinaryComponentExecutor.upgradeStrategy.mode 控制，
+// 不再需要 NodeGroupNode 包装层。
+func (n *ComponentNode) Execute(ctx context.Context, execCtx *ExecutionContext) error {
+    // 直接执行组件级状态机，由状态机选择对应的 Executor
+    comp := execCtx.GetComponentStatus(n.name)
     return execCtx.ComponentSM.Execute(ctx, comp, n.component)
 }
-
-// NodeGroupNode.Execute 执行节点组（并行执行所有节点）
-func (n *NodeGroupNode) Execute(ctx context.Context, execCtx *ExecutionContext) error {
-    nodes := execCtx.GetAllNodes()
-    
-    // 并行执行所有节点
-    var wg sync.WaitGroup
-    errChan := make(chan error, len(nodes))
-    
-    for _, node := range nodes {
-        wg.Add(1)
-        go func(n *BKENode) {
-            defer wg.Done()
-            // 每个节点独立执行节点层状态机
-            if err := execCtx.NodeSM.Execute(ctx, n, n.nodeComponents); err != nil {
-                errChan <- err
-            }
-        }(node)
-    }
-    
-    wg.Wait()
-    close(errChan)
-    
-    // 收集错误（部分失败不阻塞）
-    var errs []error
-    for err := range errChan {
-        errs = append(errs, err)
-    }
-    
-    if len(errs) == len(nodes) {
-        return fmt.Errorf("all nodes failed: %v", errs)
-    }
-    
-    return nil
-}
 ```
+
 
 ### 4.4 节点层状态机执行
 
@@ -983,7 +976,7 @@ func (r *BKEMachineReconciler) getNodeComponents(ctx context.Context, cluster *b
         return nil, fmt.Errorf("failed to resolve release image: %w", err)
     }
     
-    // 2. 过滤出节点级组件（scope=node）
+    // 2. 展开 composite 并获取节点级组件（binary 类型）
     var nodeComponents []*ComponentVersion
     for _, comp := range releaseImage.Spec.Components {
         cv, err := r.lookupComponentVersion(ctx, comp.Name, comp.Version)
@@ -991,7 +984,7 @@ func (r *BKEMachineReconciler) getNodeComponents(ctx context.Context, cluster *b
             return nil, fmt.Errorf("failed to lookup component %s: %w", comp.Name, err)
         }
         
-        if cv.Spec.Scope == ComponentScopeNode {
+        if cv.Spec.Type == ComponentTypeBinary {
             nodeComponents = append(nodeComponents, cv)
         }
     }
@@ -1129,15 +1122,15 @@ func setCAPIConditions(cluster *bkev1beta1.BKECluster) {
 │  │    Condition: desiredVersion != "" && currentVersion == ""               │   │
 │  │                                                                          │   │
 │  │ 2. BuildDAG(releaseImage)                                                │   │
-│  │    DAG: [certs] → [node-group] → [coredns] → [kube-proxy]               │   │
+│  │    DAG: [certs] → [bkeagent→containerd→kubelet] → [coredns] → [kube-proxy]               │   │
 │  │                                                                          │   │
 │  │ 3. ExecuteDAG(ctx, dag)                                                  │   │
 │  │    ┌─────────────────────────────────────────────────────────────────┐   │   │
 │  │    │ Batch 1: [certs]                                                │   │   │
-│  │    │   └─ ClusterComponentNode.Execute() → L3: Installing           │   │   │
+│  │    │   └─ ComponentNode.Execute() → L3: Installing           │   │   │
 │  │    ├─────────────────────────────────────────────────────────────────┤   │   │
-│  │    │ Batch 2: [node-group]                                           │   │   │
-│  │    │   └─ NodeGroupNode.Execute()                                    │   │   │
+│  │    │ Batch 2: [bkeagent, containerd, kubelet]                                           │   │   │
+│  │    │   └─ BinaryComponentExecutor.Execute() (逐节点)                                    │   │   │
 │  │    │       ┌─────────────────────────────────────────────────────┐   │   │   │
 │  │    │       │ 并行执行所有节点:                                     │   │   │   │
 │  │    │       │                                                       │   │   │   │
@@ -1153,10 +1146,10 @@ func setCAPIConditions(cluster *bkev1beta1.BKECluster) {
 │  │    │       └─────────────────────────────────────────────────────┘   │   │   │
 │  │    ├─────────────────────────────────────────────────────────────────┤   │   │
 │  │    │ Batch 3: [coredns]                                              │   │   │
-│  │    │   └─ ClusterComponentNode.Execute() → L3: Installing           │   │   │
+│  │    │   └─ ComponentNode.Execute() → L3: Installing           │   │   │
 │  │    ├─────────────────────────────────────────────────────────────────┤   │   │
 │  │    │ Batch 4: [kube-proxy]                                           │   │   │
-│  │    │   └─ ClusterComponentNode.Execute() → L3: Installing           │   │   │
+│  │    │   └─ ComponentNode.Execute() → L3: Installing           │   │   │
 │  │    └─────────────────────────────────────────────────────────────────┘   │   │
 │  │                                                                          │   │
 │  │ 4. DAG 执行完成，等待组件安装完成                                          │   │
@@ -1169,8 +1162,8 @@ func setCAPIConditions(cluster *bkev1beta1.BKECluster) {
 │  │ 1. EvaluateClusterPhase: Installing (无变化)                             │   │
 │  │                                                                          │   │
 │  │ 2. BuildDAG + ExecuteDAG                                                 │   │
-│  │    └─ Batch 2: [node-group]                                              │   │
-│  │       └─ NodeGroupNode.Execute()                                         │   │
+│  │    └─ Batch 2: [bkeagent, containerd, kubelet]                                              │   │
+│  │       └─ BinaryComponentExecutor.Execute() (逐节点)                                         │   │
 │  │           └─ 并行执行所有节点:                                            │   │
 │  │              Node-1: L2: Provisioning                                    │   │
 │  │                └─ L3: bkeagent Installed ✓                               │   │
@@ -1211,11 +1204,11 @@ func setCAPIConditions(cluster *bkev1beta1.BKECluster) {
 │  │    Condition: desiredVersion != currentVersion                           │   │
 │  │                                                                          │   │
 │  │ 2. BuildDAG(newReleaseImage)                                             │   │
-│  │    DAG: [certs] → [node-group] → [coredns] → [kube-proxy]               │   │
+│  │    DAG: [certs] → [bkeagent→containerd→kubelet] → [coredns] → [kube-proxy]               │   │
 │  │                                                                          │   │
 │  │ 3. ExecuteDAG(ctx, dag)                                                  │   │
-│  │    └─ Batch 2: [node-group]                                              │   │
-│  │       └─ NodeGroupNode.Execute()                                         │   │
+│  │    └─ Batch 2: [bkeagent, containerd, kubelet]                                              │   │
+│  │       └─ BinaryComponentExecutor.Execute() (逐节点)                                         │   │
 │  │           └─ 并行执行所有节点:                                            │   │
 │  │              Node-1: L2: Ready → Upgrading                               │   │
 │  │                └─ L3: containerd Installed → Upgrading                   │   │
@@ -1260,7 +1253,7 @@ func setCAPIConditions(cluster *bkev1beta1.BKECluster) {
 |------|--------|--------|
 | **执行入口** | L1 直接遍历节点 | BKECluster Reconcile 触发 |
 | **DAG 构建** | 无 DAG | 从 ReleaseImage 构建 DAG |
-| **节点级组件** | 分散在各处 | 聚合为 node-group 节点 |
+| **节点级组件** | 分散在各处 | 通过 composite 封装，展开为独立节点 |
 | **节点执行** | 串行遍历 | 并行执行 |
 | **状态驱动** | L1 驱动 L2 驱动 L3 | 每层独立状态机，通过 DAG 协调 |
 
