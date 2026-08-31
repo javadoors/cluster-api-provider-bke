@@ -904,13 +904,15 @@ func (sm *ComponentStateMachine) Execute(
     ctx context.Context,
     status *ComponentLifecycleStatus,
     cv *ComponentVersion,
+    action ComponentAction,
 ) error {
     // 1. 评估组件状态转换
     oldPhase := status.Phase
-    newPhase := sm.evaluateComponentPhase(status, cv)
+    newPhase := sm.evaluateComponentPhase(status, cv, action)
     
     if oldPhase != newPhase {
         status.Phase = newPhase
+        sm.recordComponentTransition(status, oldPhase, newPhase)
     }
     
     // 2. 根据状态执行操作
@@ -927,10 +929,168 @@ func (sm *ComponentStateMachine) Execute(
         executor := sm.executors[cv.Spec.Type]
         return executor.Uninstall(ctx, status, cv)
     }
-    
+
+    // Installed / Pending / Failed → 无操作，直接返回
     return nil
 }
 ```
+
+#### 4.5.1 evaluateComponentPhase 设计思路
+
+**设计思路 — 单组件级别的状态决策**：
+
+`evaluateComponentPhase` 是组件层状态机的核心决策函数，负责根据组件当前状态、目标版本和操作动作（Install/Upgrade/Uninstall）推断组件下一步状态。与 `evaluateNodePhase` 的自底向上聚合不同，`evaluateComponentPhase` 只关注单个组件的版本比较和操作类型，决策逻辑更简单、更确定。
+
+1. **版本比较驱动状态转换**：函数的核心逻辑是比较 `status.Version`（已安装版本）与 `cv.Spec.Version`（目标版本）。版本一致 → Installed（稳态）；版本不一致 → Upgrading（需升级）；无版本记录 → Installing（需安装）。版本比较是幂等性的基础——Reconcile 重入时，已安装到目标版本的组件直接返回 Installed，跳过执行。
+2. **操作动作覆盖版本判断**：当 `action == ActionUninstall` 时，无论版本是否一致，直接返回 Deleting。卸载是外部触发的强制操作（如节点删除），不受版本状态影响。这种优先级设计保证卸载操作不会被版本判断逻辑阻塞。
+3. **Failed 状态的保持与恢复**：当组件当前为 Failed 时，`evaluateComponentPhase` 不自动恢复——仍返回 Failed，Execute 不执行任何操作，等待人工介入。人工介入后清除 Failed 状态（重置为 Pending），下次 Reconcile 才会重新评估。这种"Failed 不自愈"设计避免故障组件在未修复前被反复重试。
+4. **Installing/Upgrading 的中间态保持**：如果组件当前正在 Installing 或 Upgrading（上次 Reconcile 未完成），函数返回原状态继续执行。这保证了跨 Reconcile 的操作连续性——上次未完成的安装/升级在下次 Reconcile 时继续，而非重新开始。
+5. **与 evaluateNodePhase 的协作**：`evaluateNodePhase` 聚合所有组件状态决定节点级操作（Install/Upgrade/Uninstall），然后将 `action` 传递给 `executeNodeComponents` → `ComponentStateMachine.Execute` → `evaluateComponentPhase`。节点层决定"做什么操作"，组件层决定"这个组件在这个操作下应该处于什么状态"。
+
+**状态决策规则矩阵**：
+
+| 当前 Phase | action | status.Version vs cv.Spec.Version | 返回 Phase | Execute 行为 |
+|-----------|--------|----------------------------------|-----------|-------------|
+| Pending | Install | 无版本记录 | `Installing` | 执行 Install |
+| Pending | Install | 有版本记录但不一致 | `Installing` | 执行 Install |
+| Pending | Upgrade | — | `Upgrading` | 执行 Upgrade |
+| Pending | Uninstall | — | `Deleting` | 执行 Uninstall |
+| Installing | Install | — | `Installing` | 继续执行 Install（中间态保持） |
+| Installed | Install | 版本一致 | `Installed` | 无操作（幂等跳过） |
+| Installed | Install | 版本不一致 | `Installing` | 执行 Install（版本回退场景） |
+| Installed | Upgrade | 版本一致 | `Installed` | 无操作（幂等跳过） |
+| Installed | Upgrade | 版本不一致 | `Upgrading` | 执行 Upgrade |
+| Installed | Uninstall | — | `Deleting` | 执行 Uninstall |
+| Upgrading | Upgrade | — | `Upgrading` | 继续执行 Upgrade（中间态保持） |
+| Upgrading | Install | — | `Installing` | 操作变更，切换为 Install |
+| Deleting | Uninstall | — | `Deleting` | 继续执行 Uninstall（中间态保持） |
+| Failed | * | — | `Failed` | 无操作（等待人工介入） |
+
+#### 4.5.2 evaluateComponentPhase 实现
+
+```go
+// evaluateComponentPhase 评估组件生命周期阶段
+// 根据当前状态、操作动作和版本比较推断组件下一步状态
+//
+// 决策优先级:
+//   1. Failed → 保持 Failed (不自愈，等待人工介入)
+//   2. action == Uninstall → Deleting (卸载是强制操作)
+//   3. 中间态保持 (Installing/Upgrading/Deleting 继续执行)
+//   4. 版本比较驱动 (版本一致→Installed, 不一致→Upgrading/Installing)
+//   5. Pending → 根据 action 决定 Installing/Upgrading/Deleting
+func (sm *ComponentStateMachine) evaluateComponentPhase(
+    status *ComponentLifecycleStatus,
+    cv *ComponentVersion,
+    action ComponentAction,
+) ComponentLifecyclePhase {
+    currentPhase := status.Phase
+
+    // 1. Failed 状态不自愈 — 等待人工介入清除
+    if currentPhase == CompPhaseFailed {
+        return CompPhaseFailed
+    }
+
+    // 2. 卸载操作优先 — 无论当前状态如何
+    if action == ActionUninstall {
+        // 已卸载完成则保持 Deleting（等待状态清理）
+        // 否则进入 Deleting
+        if currentPhase == CompPhaseDeleting {
+            return CompPhaseDeleting // 中间态保持
+        }
+        return CompPhaseDeleting
+    }
+
+    // 3. 中间态保持 — 上次未完成的操作继续执行
+    switch currentPhase {
+    case CompPhaseInstalling:
+        // 安装中：根据 action 决定是否切换操作
+        if action == ActionUpgrade {
+            return CompPhaseUpgrading // 操作变更：安装→升级
+        }
+        return CompPhaseInstalling // 继续安装
+
+    case CompPhaseUpgrading:
+        // 升级中：根据 action 决定是否切换操作
+        if action == ActionInstall {
+            return CompPhaseInstalling // 操作变更：升级→安装
+        }
+        return CompPhaseUpgrading // 继续升级
+
+    case CompPhaseDeleting:
+        // 卸载中：继续卸载（卸载不受 action 影响，已由步骤 2 处理）
+        return CompPhaseDeleting
+    }
+
+    // 4. 稳态判断 — 版本比较驱动
+    // 到达此处的当前状态: Pending 或 Installed
+    targetVersion := cv.Spec.Version
+    installedVersion := status.Version
+
+    if installedVersion == "" {
+        // 无版本记录 → 首次安装
+        switch action {
+        case ActionInstall:
+            return CompPhaseInstalling
+        case ActionUpgrade:
+            // 升级场景下无版本记录也视为安装
+            return CompPhaseInstalling
+        }
+    }
+
+    if installedVersion == targetVersion {
+        // 已安装版本与目标版本一致 → 稳态
+        // 幂等保证: Reconcile 重入时跳过已完成的安装/升级
+        return CompPhaseInstalled
+    }
+
+    // 版本不一致 → 需要安装或升级
+    switch action {
+    case ActionInstall:
+        // 版本不一致的安装（如版本回退场景）
+        return CompPhaseInstalling
+    case ActionUpgrade:
+        return CompPhaseUpgrading
+    }
+
+    // 5. 兜底: Pending + 未知 action
+    return CompPhasePending
+}
+```
+
+**evaluateComponentPhase 与 Execute 的协作**：
+
+```go
+// evaluateComponentPhase 返回值 → Execute switch 分支映射:
+//
+// Installing  → executor.Install(ctx, status, cv)    执行安装
+// Upgrading   → executor.Upgrade(ctx, status, cv)    执行升级
+// Deleting    → executor.Uninstall(ctx, status, cv)  执行卸载
+// Installed   → 无匹配 case，直接返回 nil             稳态，幂等跳过
+// Pending     → 无匹配 case，直接返回 nil             等待前置依赖
+// Failed      → 无匹配 case，直接返回 nil             等待人工介入
+//
+// 设计说明: Installed/Pending/Failed 是非操作态，Execute 中无对应 case，
+// 直接返回 nil。这保证了:
+// - 幂等性: 已安装到目标版本的组件 Reconcile 时跳过
+// - 依赖等待: Pending 组件等待前置依赖完成后才被触发
+// - 故障隔离: Failed 组件不自动重试，避免故障扩散
+```
+
+**边界情况处理**：
+
+| 场景 | 当前 Phase | action | 版本关系 | 返回 Phase | Execute 行为 | 说明 |
+|------|-----------|--------|---------|-----------|-------------|------|
+| 首次安装 | Pending | Install | 无版本记录 | `Installing` | 执行 Install | 新组件首次安装 |
+| 首次安装（升级路径） | Pending | Upgrade | 无版本记录 | `Installing` | 执行 Install | 升级场景下无版本也走安装 |
+| 幂等跳过 | Installed | Install | 版本一致 | `Installed` | 无操作 | Reconcile 重入跳过 |
+| 幂等跳过 | Installed | Upgrade | 版本一致 | `Installed` | 无操作 | 已升级到目标版本 |
+| 版本变更升级 | Installed | Upgrade | 版本不一致 | `Upgrading` | 执行 Upgrade | 正常升级流程 |
+| 版本回退安装 | Installed | Install | 版本不一致 | `Installing` | 执行 Install | 回退到旧版本 |
+| 中间态保持 | Installing | Install | — | `Installing` | 继续 Install | 跨 Reconcile 连续性 |
+| 操作切换 | Installing | Upgrade | — | `Upgrading` | 执行 Upgrade | 安装中切换为升级 |
+| 故障不自愈 | Failed | Install | — | `Failed` | 无操作 | 等待人工清除 Failed |
+| 强制卸载 | Installed | Uninstall | — | `Deleting` | 执行 Uninstall | 节点删除触发 |
+| 卸载中保持 | Deleting | Uninstall | — | `Deleting` | 继续 Uninstall | 跨 Reconcile 连续性 |
 
 ---
 
