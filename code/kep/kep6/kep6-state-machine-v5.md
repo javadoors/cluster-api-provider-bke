@@ -6,8 +6,6 @@
 | **标题** | 基于 CAPI BKEMachine 的三层状态机引擎设计 |
 | **状态** | `provisional` |
 | **类型** | Feature |
-| **作者** | openFuyao Team |
-| **创建日期** | 2026-08-24 |
 | **依赖** | KEP-5 声明式升级框架、Cluster API v1beta1 |
 
 ---
