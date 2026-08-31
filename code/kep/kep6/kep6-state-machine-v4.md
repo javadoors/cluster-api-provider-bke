@@ -501,13 +501,19 @@ const (
 
 ### 4.1 状态机引擎
 
+**设计思路 — 三层状态机为何共享引擎实例而非每节点独立创建**：
+
+1. **L1 集群层为唯一入口**：`ClusterStateMachine` 由 `BKEClusterReconciler` 持有，每次 Reconcile 调用 `engine.Execute()`。集群层负责构建 DAG 并按拓扑批次驱动执行，是整个状态机的调度核心。
+2. **L2/L3 共享实例、独立状态**：`NodeStateMachine` 和 `ComponentStateMachine` 作为共享实例注入 `ClusterStateMachine`，但每个节点/组件的状态数据存储在各自的 CR Status 中（`BKENode.Status` / `ComponentLifecycleStatus`），引擎实例无状态，仅提供执行逻辑。这避免了 N 个节点创建 N 个引擎实例的内存开销。
+3. **DAG 执行器委托给 Scheduler**：`dagExecutor` 字段在设计上指向 `dagexec.Scheduler`（§4.2 详述），集群层不直接操作 ComponentNode，而是委托给 Scheduler 的 `ExecuteDAG` 方法，复用代码库已有的拓扑排序和并行执行能力。
+
 ```go
 // ClusterStateMachine 集群层状态机引擎 (L1)
 type ClusterStateMachine struct {
     client    client.Client
     recorder  record.EventRecorder
     
-    // DAG 执行器
+    // DAG 执行器（复用 dagexec.Scheduler，见 §4.2）
     dagExecutor *DAGExecutor
     
     // 节点层状态机 (共享实例，每个节点独立执行)
@@ -528,12 +534,19 @@ type NodeStateMachine struct {
 
 // ComponentStateMachine 组件层状态机引擎 (L3)
 type ComponentStateMachine struct {
-    // 组件执行器注册表
+    // 组件执行器注册表（复用 dagexec.ExecutorRegistry）
     executors map[ComponentType]ComponentExecutor
 }
 ```
 
 ### 4.2 DAG 执行器
+
+**设计思路 — 复用代码库已有结构而非重新发明**：
+
+1. **`topology.UpgradeDAG` 已满足需求**：代码库中 `pkg/topology/component.go` 已定义 `UpgradeDAG`（含 `Graph` 底层图 + `nodes` 元数据映射）和 `ComponentNode`（含 Name/Version/Inline/FailurePolicy/Dependencies），无需新增 `DAGExecutor`/`DAGNode`/`DAGNodeType` 等类型。
+2. **`dagexec.Scheduler` 已实现拓扑执行**：`Scheduler.ExecuteDAG` 已实现"批次间串行、批次内并行"的调度策略，通过 `ExecutorRegistry` 按 `ComponentType` 分发到对应 `ComponentExecutor`，无需在状态机层重新实现。
+3. **composite 展开是 DAG 构建的前置步骤**：`expandCompositeComponents` 在 `BuildUpgradeDAG` 之前执行，将 composite 类型的 ReleaseImage 组件展开为子组件列表，展开后的子组件作为普通 `ReleaseImageUpgradeComponent` 传入 `BuildUpgradeDAG`，DAG 构建逻辑无需感知 composite 的存在。
+4. **类型分发延迟到执行期**：`ComponentNode` 不含 Type 字段，Scheduler 在执行时通过 `ComponentVersionStore` 加载 `ComponentVersion` 读取 `cv.Spec.Type`，再从 `ExecutorRegistry` 获取 Executor。这种延迟分发设计使得 DAG 结构与组件类型解耦——DAG 构建期不需要加载 ComponentVersion，仅需要组件名和版本号。
 
 > **复用说明**：以下结构直接复用代码库中已有的 `topology.UpgradeDAG`、`topology.ComponentNode`、`dagexec.Scheduler`、`dagexec.ExecutorRegistry`，无需新增 `DAGExecutor`/`DAGNode`/`DAGNodeType` 等类型。
 
@@ -599,6 +612,13 @@ func (s *Scheduler) ExecuteDAG(
 
 ### 4.3 DAG 节点执行
 
+**设计思路 — ComponentNode 无 Execute 方法，执行委托给 ComponentExecutor**：
+
+1. **数据与行为分离**：`topology.ComponentNode` 是纯数据结构（只有 Name/Version/Inline/FailurePolicy/Dependencies 字段），不携带执行逻辑。执行行为由 `dagexec.ComponentExecutor` 接口承担，各 Executor（BinaryComponentExecutor/YamlComponentExecutor/HelmComponentExecutor 等）实现该接口。这与代码库现有设计一致——`Scheduler` 直接操作 `*topology.ComponentNode`，不需要 `DAGNode` 接口。
+2. **类型分发由 Scheduler 承担**：`Scheduler.resolveComponentType` 通过 `ComponentVersionStore` 加载 `ComponentVersion`，读取 `cv.Spec.Type` 转换为 `dagexec.ComponentType`，再从 `ExecutorRegistry` 获取对应 Executor。这意味着 DAG 节点本身是类型无关的——同一套 DAG 构建和拓扑排序逻辑适用于所有组件类型。
+3. **节点级并发内化于 Executor**：binary 组件的逐节点/分批/全并行执行策略由 `BinaryComponentExecutor` 内部的 `upgradeStrategy.mode`（Rolling/Parallel/Batch）控制，不在 DAG 调度层处理。DAG 调度器只关心组件间的依赖顺序（批次间串行、批次内并行），节点内的并发策略是 Executor 的实现细节。
+4. **未注册类型的回退路径**：当 `ExecutorRegistry` 中找不到对应 `ComponentType` 时，Scheduler 回退到 Inline/Manifest 路径（复用现有 `executeComponentLegacy` 逻辑），保证向后兼容。
+
 > **复用说明**：`ComponentNode` 不含 `Execute()` 方法，执行逻辑由 `ComponentExecutor` 接口承担。Scheduler 通过 `ComponentVersionStore` 加载 `ComponentVersion` 确定组件类型，再从 `ExecutorRegistry` 获取对应 Executor。
 
 ```go
@@ -631,6 +651,13 @@ func (s *Scheduler) resolveComponentType(
 
 
 ### 4.4 节点层状态机执行
+
+**设计思路 — 节点层状态机的职责边界与组件来源**：
+
+1. **L2 评估状态、L3 执行操作**：`NodeStateMachine.Execute` 的核心职责是评估节点状态转换（`evaluateNodePhase`）并决定执行何种操作（Install/Upgrade/Uninstall），实际的组件安装/升级委托给 `ComponentStateMachine.Execute`。节点层不直接操作 Executor，通过组件层间接调用，保持三层职责分离。
+2. **节点组件从 DAG 获取而非硬编码**：`components` 参数由 BKEMachine Controller 从 ReleaseImage 解析后传入（§6.3 详述），不再从 `NodeGroupNode` 获取。节点组件列表按依赖关系拓扑排序后逐个执行，排序算法复用代码库已有的 `topologicalSort`。
+3. **节点状态聚合由组件状态决定**：`evaluateNodePhase` 根据该节点所有组件的 `ComponentLifecycleStatus` 聚合判断——全部 Installed 则节点 Ready，任一 Installing 则节点 Provisioning，任一 Failed 则节点 Failed。这种自底向上的状态聚合保证节点状态真实反映组件执行进度。
+4. **与 DAG 调度的协作关系**：在统一 ComponentNode 设计下，节点级 binary 组件是 DAG 中的独立节点，由 Scheduler 按拓扑批次调度。`NodeStateMachine` 主要服务于 BKEMachine Controller 的独立 Reconcile（如节点扩容场景），与 Scheduler 的 DAG 执行是两条并行路径——Scheduler 负责集群级升级的 DAG 调度，NodeStateMachine 负责单节点生命周期管理。
 
 ```go
 // NodeStateMachine.Execute 执行节点层状态机
@@ -687,6 +714,13 @@ func (sm *NodeStateMachine) executeNodeComponents(
 ```
 
 ### 4.5 组件层状态机执行
+
+**设计思路 — 组件层是三层状态机的执行终端**：
+
+1. **状态评估 + Executor 分发两步走**：`ComponentStateMachine.Execute` 首先评估组件状态转换（`evaluateComponentPhase` 根据当前版本与目标版本判断 Install/Upgrade/Skip），然后根据 `cv.Spec.Type` 从 `executors` map 中获取对应 Executor 执行具体操作。状态评估与执行分离使得幂等判断（目标版本已达成则跳过）在状态层完成，Executor 只负责执行，无需重复判断。
+2. **Executor 注册表与 dagexec.ExecutorRegistry 对齐**：`executors map[ComponentType]ComponentExecutor` 在设计上与 `dagexec.ExecutorRegistry` 等价，实际实现中可直接复用 `ExecutorRegistry` 而非维护独立的 map。`ComponentExecutor` 接口也与 `dagexec.ComponentExecutor` 对齐——`ExecuteComponent(ctx, node, execCtx)` 统一签名。
+3. **组件状态存储在 BKENode.Status 中**：`ComponentLifecycleStatus` 存储在 `BKENode.Status.ComponentStatuses` 中（而非 BKECluster.Status），因为组件安装是 per-node 的——同一个组件在不同节点上可能有不同状态（如 containerd 在 node-1 上 Installed 但在 node-2 上 Installing）。这与 §3.4 的三层状态关系一致。
+4. **幂等性保证**：`evaluateComponentPhase` 在目标版本等于当前版本时返回 `Installed`（跳过执行），保证 Reconcile 重入时不会重复安装。Executor 内部也通过 per-node per-component 状态（`NodeComponentStatuses`）实现幂等——已安装到目标版本的组件跳过执行。
 
 ```go
 // ComponentStateMachine.Execute 执行组件级状态机
