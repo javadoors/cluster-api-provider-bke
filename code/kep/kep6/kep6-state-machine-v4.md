@@ -16,7 +16,7 @@
 
 1. **统一执行入口**：BKECluster Reconcile 触发集群层状态机引擎执行
 2. **DAG 驱动执行**：集群层状态机从 ReleaseImage 构建执行 DAG
-3. **节点级并行**：节点级组件在 DAG 中聚合为节点组节点，多节点并行执行
+3. **节点级并行**：binary 组件由 BinaryComponentExecutor 内部支持 Rolling/Parallel/Batch 节点级并发，多节点并行执行
 4. **三层状态清晰**：集群层、节点层、组件层状态定义清晰，职责分明
 5. **可观测性**：状态转换、执行进度、健康状态全链路可观测
 6. **CAPI 集成**：架构设计与 Cluster API 天然兼容
@@ -25,7 +25,7 @@
 
 | 约束 | 说明 |
 |------|------|
-| **节点级组件相邻** | 在 DAG 中，节点级组件聚合为一个"节点组"节点，保持 DAG 拓扑简洁 |
+| **统一 DAG 节点** | DAG 中所有组件均为统一的 `ComponentNode`，不区分集群级/节点级节点类型 |
 | **节点级并行** | BinaryComponentExecutor 内部支持 Rolling/Parallel/Batch 节点级并发 |
 | **组件级状态机** | 每个节点的每个组件通过组件级状态机引擎驱动安装/升级/卸载 |
 | **幂等性** | 所有状态转换和操作必须幂等，支持 Reconcile 重入 |
@@ -70,12 +70,12 @@
 
 ### 2.2 DAG 结构设计
 
-**核心设计**：DAG 中所有组件均为统一的 `ComponentNode`，不再区分集群级/节点级节点类型。K8s 核心组件和节点二进制组件通过 `composite` 类型（KEP-15）封装，DAG 构建时自动展开为子组件节点。
+**核心设计**：DAG 中所有组件均为统一的 `ComponentNode`，不区分集群级/节点级节点类型。K8s 核心组件和节点二进制组件通过 `composite` 类型（KEP-15）封装，DAG 构建时自动展开为子组件节点。
 
-**设计思路 — 为什么移除 ClusterComponentNode 和 NodeGroupNode**：
+**设计思路 — 统一 ComponentNode，通过 composite 封装组件分组**：
 
-1. **yaml/helm 本身就是集群类型**：yaml/helm 组件通过 K8s API 或 Helm SDK 部署到目标集群，天然是集群级操作，无需额外的 `ClusterComponentNode` 包装。
-2. **二进制组件本身就是 Node 类型**：binary 组件通过 SSH 在节点上执行，`BinaryComponentExecutor` 内部已支持 Rolling/Parallel/Batch 节点级并发策略，无需 `NodeGroupNode` 包装。
+1. **yaml/helm 本身就是集群级操作**：yaml/helm 组件通过 K8s API 或 Helm SDK 部署到目标集群，天然是集群级操作。
+2. **binary 组件通过 Executor 内部策略实现节点级并发**：binary 组件通过 SSH 在节点上执行，`BinaryComponentExecutor` 内部支持 Rolling/Parallel/Batch 节点级并发策略。
 3. **composite 封装更自然**：K8s 核心组件（etcd/apiserver/cm/scheduler/kubelet/kubectl/kube-proxy）和节点二进制组件（bkeagent/containerd）通过 `composite` 类型组合管理，DAG 构建时展开为独立子组件节点，各自按依赖关系参与拓扑排序。
 
 ```
@@ -155,7 +155,7 @@ type InlineRef struct {
     Version string
 }
 
-// ComponentNode 是升级 DAG 中的一个顶点 (统一节点类型，不再区分 Cluster/NodeGroup)
+// ComponentNode 是升级 DAG 中的一个顶点 (统一节点类型)
 // 所有组件类型（binary/yaml/helm/staticpod/inline）均为 ComponentNode
 // composite/selector 类型在 DAG 构建时展开，不产生 ComponentNode
 type ComponentNode struct {
@@ -263,15 +263,14 @@ func (s *Scheduler) ExecuteDAG(ctx context.Context, execCtx *ExecutionContext, d
 }
 ```
 
-**与旧设计的区别**：
+**与 v3 设计的区别**：
 
-| 维度 | 旧设计 (v4 原版) | 新设计 (复用代码库) |
-|------|-----------------|-------------------|
-| **DAG 节点类型** | `ClusterComponentNode` + `NodeGroupNode` (两种) | `topology.ComponentNode` (统一一种) |
-| **DAGNode 接口** | 新增 `DAGNode` interface + `DAGNodeType` enum | 不需要，Scheduler 直接操作 `*ComponentNode` |
-| **节点执行** | 各节点类型各自实现 `Execute()` | `ComponentExecutor.ExecuteComponent()` 统一接口 |
-| **类型分发** | 节点类型固定 | `ExecutorRegistry` 按 `ComponentType` 动态分发 |
-| **节点级并发** | `NodeGroupNode` 包装层 | `BinaryComponentExecutor` 内部 `upgradeStrategy.mode` |
+| 维度 | v3 设计 | v4 设计 (复用代码库) |
+|------|---------|-------------------|
+| **DAG 节点类型** | 无 DAG，Phase 框架直接调度 | `topology.ComponentNode` (统一一种) |
+| **节点接口** | 无统一接口 | `ComponentExecutor.ExecuteComponent()` 统一接口 |
+| **类型分发** | 硬编码分发 | `ExecutorRegistry` 按 `ComponentType` 动态分发 |
+| **节点级并发** | 串行遍历节点 | `BinaryComponentExecutor` 内部 `upgradeStrategy.mode` |
 
 
 ### 2.4 三层状态机引擎架构
@@ -514,16 +513,28 @@ const (
 type ClusterStateMachine struct {
     client    client.Client
     recorder  record.EventRecorder
-    
+
     // DAG 执行器（复用 dagexec.Scheduler，见 §4.2）
-    dagExecutor *DAGExecutor
-    
+    scheduler *dagexec.Scheduler
+
+    // VersionContext 管理 (统一 DAG 操作语义的载体, 见 §4.4.4)
+    versionContext *VersionContext
+
+    // ReleaseImage 解析器
+    releaseImageResolver *ReleaseImageResolver
+
+    // ComponentVersion 存储
+    cvStore ComponentVersionStore
+
+    // 节点 Provider
+    nodeProvider NodeProvider
+
     // 节点层状态机 (共享实例，每个节点独立执行)
     nodeSM *NodeStateMachine
-    
+
     // 组件层状态机 (共享实例)
     componentSM *ComponentStateMachine
-    
+
     // 可观测性
     metrics   *StateMachineMetrics
 }
@@ -656,14 +667,16 @@ func (s *Scheduler) resolveComponentType(
 
 **设计思路 — 集群层是状态机引擎的调度核心**：
 
-1. **L1 评估状态、委托 DAG 执行**：`ClusterStateMachine.Execute` 的核心职责是评估集群状态转换（`evaluateClusterPhase`）并构建/执行 DAG。集群层不直接操作 Executor，而是委托给 `dagexec.Scheduler.ExecuteDAG`（§4.2），由 Scheduler 按拓扑批次分发到各 `ComponentExecutor`。这种分层委托保证集群层只关注"做什么操作"（Install/Upgrade/Rollback），不关心"怎么做"（SSH/Helm/K8s API）。
-2. **集群状态由 DAG 执行结果驱动**：与节点层 `evaluateNodePhase` 自底向上聚合组件状态不同，集群层状态主要由 DAG 执行的总体结果驱动——DAG 全部成功则集群进入 Running/稳态，DAG 失败则集群进入 Failed。集群层不需要逐组件聚合，因为 Scheduler 已在 DAG 执行过程中处理了组件级状态。
-3. **DAG 构建与执行分离**：每次 Reconcile 时，`Execute` 先从 ReleaseImage 构建 DAG（`buildDAG`），再执行 DAG（`scheduler.ExecuteDAG`）。DAG 构建是幂等的——相同的 ReleaseImage 产生相同的 DAG 结构。DAG 执行也是幂等的——已完成的组件通过 `VersionContext.NeedsUpgrade` 跳过，未完成的继续执行。
-4. **Reconcile 重入安全**：`Execute` 是幂等的。当 Reconcile 因组件执行中断而重入时，`evaluateClusterPhase` 根据当前集群状态（Installing/Upgrading 等）决定继续执行 DAG，而非重新开始。DAG 内部的组件级幂等（`evaluateComponentPhase` 返回 Installed 跳过）保证已完成的组件不会重复执行。
+1. **L1 评估状态、委托 DAG 执行**：`ClusterStateMachine.Execute` 的核心职责是评估集群状态转换（`evaluateClusterPhase`）并构建/执行统一 DAG。集群层不直接操作 Executor，而是委托给 `dagexec.Scheduler.ExecuteDAG`（§4.2），由 Scheduler 按拓扑批次分发到各 `ComponentExecutor`。这种分层委托保证集群层只关注"做什么操作"（Install/Upgrade/Rollback），不关心"怎么做"（SSH/Helm/K8s API）。
+2. **统一 DAG，操作语义由 VersionContext 承载**：install/upgrade/rollback 共用同一个 `buildDAG`——DAG 拓扑结构（组件依赖图）与操作类型解耦。操作语义（Install vs Upgrade vs Rollback）由 `prepareVersionContext` 设置到 VersionContext 中，Scheduler 执行时通过 `NeedsUpgrade` 逐组件判断 Install/Upgrade/Skip。这与 §4.3 的"类型分发延迟到执行期"哲学一致——DAG 构建期不感知操作类型，操作分发延迟到执行期。
+3. **集群状态由 DAG 执行结果驱动**：与节点层 `evaluateNodePhase` 自底向上聚合组件状态不同，集群层状态主要由 DAG 执行的总体结果驱动——DAG 全部成功则集群进入 Running/稳态，DAG 失败则集群进入 Failed。集群层不需要逐组件聚合，因为 Scheduler 已在 DAG 执行过程中处理了组件级状态。
+4. **DAG 构建与执行分离**：每次 Reconcile 时，`Execute` 先准备 VersionContext（`prepareVersionContext`）、构建统一 DAG（`buildDAG`），再执行 DAG（`scheduler.ExecuteDAG`）。DAG 构建是幂等的——相同的 ReleaseImage 产生相同的 DAG 结构，VersionContext 决定哪些组件需要执行。DAG 执行也是幂等的——已完成的组件通过 `VersionContext.NeedsUpgrade` 跳过，未完成的继续执行。
+5. **Reconcile 重入安全**：`Execute` 是幂等的。当 Reconcile 因组件执行中断而重入时，`evaluateClusterPhase` 根据当前集群状态（Installing/Upgrading 等）决定继续执行 DAG，而非重新开始。DAG 内部的组件级幂等（`evaluateComponentPhase` 返回 Installed 跳过）保证已完成的组件不会重复执行。
 
 ```go
 // ClusterStateMachine.Execute 执行集群层状态机
 // 由 BKEClusterReconciler.Reconcile() 调用，是整个状态机的唯一入口
+// 统一 DAG: install/upgrade/rollback 共用 buildDAG, 操作语义由 VersionContext 承载
 func (sm *ClusterStateMachine) Execute(ctx context.Context, cluster *bkev1beta1.BKECluster) error {
     // 1. 评估集群状态转换
     oldPhase := cluster.Status.LifecyclePhase
@@ -674,54 +687,48 @@ func (sm *ClusterStateMachine) Execute(ctx context.Context, cluster *bkev1beta1.
         sm.recordClusterTransition(cluster, oldPhase, newPhase)
     }
 
-    // 2. 根据集群状态执行操作
-    switch newPhase {
-    case ClusterPhaseInstalling:
-        // 首次安装：从 ReleaseImage.spec.install 构建 DAG
-        dag, err := sm.buildInstallDAG(ctx, cluster)
-        if err != nil {
-            return fmt.Errorf("build install DAG failed: %w", err)
-        }
-        execCtx := sm.buildExecutionContext(ctx, cluster)
-        if err := sm.scheduler.ExecuteDAG(ctx, execCtx, dag); err != nil {
-            return fmt.Errorf("execute install DAG failed: %w", err)
-        }
-        cluster.Status.CurrentVersion = cluster.Spec.DesiredVersion
+    // 2. 准备 VersionContext (统一设置操作语义, 见 §4.4.4)
+    //    VersionContext 承载操作类型 (Install/Upgrade/Rollback), DAG 结构不感知操作类型
+    if err := sm.prepareVersionContext(ctx, cluster, newPhase); err != nil {
+        return fmt.Errorf("prepare version context failed: %w", err)
+    }
 
-    case ClusterPhaseUpgrading:
-        // 版本升级：从 ReleaseImage.spec.upgrade 构建 DAG
-        dag, err := sm.buildUpgradeDAG(ctx, cluster)
+    // 3. 根据 L1 Phase 执行统一 DAG
+    switch newPhase {
+    case ClusterPhaseInstalling, ClusterPhaseUpgrading, ClusterPhaseRollingBack:
+        // 统一 DAG: 同一 buildDAG 构建, VersionContext 决定 per-component Install/Upgrade/Skip
+        dag, err := sm.buildDAG(ctx, cluster)
         if err != nil {
-            return fmt.Errorf("build upgrade DAG failed: %w", err)
+            return fmt.Errorf("build DAG failed: %w", err)
         }
         execCtx := sm.buildExecutionContext(ctx, cluster)
         if err := sm.scheduler.ExecuteDAG(ctx, execCtx, dag); err != nil {
-            return fmt.Errorf("execute upgrade DAG failed: %w", err)
+            // 即使 DAG 执行失败也尝试同步节点状态（部分组件可能已成功）
+            _ = sm.syncNodeStatus(ctx, cluster)
+            return fmt.Errorf("execute DAG failed: %w", err)
+        }
+        // DAG 执行成功后同步节点状态
+        if err := sm.syncNodeStatus(ctx, cluster); err != nil {
+            sm.recorder.Eventf(cluster, v1.EventTypeWarning,
+                "NodeStatusSyncFailed", "failed to sync node status: %v", err)
         }
         cluster.Status.CurrentVersion = cluster.Spec.DesiredVersion
 
     case ClusterPhaseScaling:
-        // 扩缩容：仅对新节点构建节点级组件 DAG
+        // 扩缩容: 统一 DAG 的结构变体 (binary 过滤 + drain 节点, 见 §4.4.4)
         dag, err := sm.buildScalingDAG(ctx, cluster)
         if err != nil {
             return fmt.Errorf("build scaling DAG failed: %w", err)
         }
         execCtx := sm.buildExecutionContext(ctx, cluster)
         if err := sm.scheduler.ExecuteDAG(ctx, execCtx, dag); err != nil {
+            _ = sm.syncNodeStatus(ctx, cluster)
             return fmt.Errorf("execute scaling DAG failed: %w", err)
         }
-
-    case ClusterPhaseRollingBack:
-        // 回滚：从上一个 ReleaseImage.spec.upgrade 构建降级 DAG
-        dag, err := sm.buildRollbackDAG(ctx, cluster)
-        if err != nil {
-            return fmt.Errorf("build rollback DAG failed: %w", err)
+        if err := sm.syncNodeStatus(ctx, cluster); err != nil {
+            sm.recorder.Eventf(cluster, v1.EventTypeWarning,
+                "NodeStatusSyncFailed", "failed to sync node status: %v", err)
         }
-        execCtx := sm.buildExecutionContext(ctx, cluster)
-        if err := sm.scheduler.ExecuteDAG(ctx, execCtx, dag); err != nil {
-            return fmt.Errorf("execute rollback DAG failed: %w", err)
-        }
-        cluster.Status.CurrentVersion = cluster.Spec.DesiredVersion
     }
 
     // Pending / Running / Failed → 无操作，直接返回
@@ -905,10 +912,14 @@ func (sm *ClusterStateMachine) isScalingCompleted(
 ```go
 // evaluateClusterPhase 返回值 → Execute switch 分支映射:
 //
-// Installing   → buildInstallDAG  + scheduler.ExecuteDAG   构建安装 DAG 并执行
-// Upgrading    → buildUpgradeDAG  + scheduler.ExecuteDAG   构建升级 DAG 并执行
-// Scaling      → buildScalingDAG  + scheduler.ExecuteDAG    构建扩缩容 DAG 并执行
-// RollingBack  → buildRollbackDAG + scheduler.ExecuteDAG   构建回滚 DAG 并执行
+// Installing   → prepareVersionContext + buildDAG + ExecuteDAG + syncNodeStatus
+// Upgrading    → prepareVersionContext + buildDAG + ExecuteDAG + syncNodeStatus
+// RollingBack  → prepareVersionContext + buildDAG + ExecuteDAG + syncNodeStatus
+//    ← 统一 DAG: 三个操作态共用 buildDAG, VersionContext 承载操作语义差异
+//
+// Scaling      → prepareVersionContext + buildScalingDAG + ExecuteDAG + syncNodeStatus
+//    ← 结构变体: binary 过滤 + drain inline 节点
+//
 // Running      → 无匹配 case，直接返回 nil                   稳态，无操作
 // Pending      → 无匹配 case，直接返回 nil                   等待 desiredVersion 设置
 // Failed       → 无匹配 case，直接返回 nil                   等待人工介入
@@ -918,6 +929,7 @@ func (sm *ClusterStateMachine) isScalingCompleted(
 // - 幂等性: 稳态集群 Reconcile 时跳过 DAG 构建
 // - 故障隔离: Failed 集群不自动重试
 // - 等待触发: Pending 集群等待用户设置 desiredVersion
+// - 统一 DAG: install/upgrade/rollback 共用同一 buildDAG, 消除 80% 重复代码
 ```
 
 **边界情况处理**：
@@ -938,117 +950,128 @@ func (sm *ClusterStateMachine) isScalingCompleted(
 
 #### 4.4.3 DAG 构建设计思路
 
-**设计思路 — 安装与升级 DAG 为何拆分**：
+**设计思路 — 统一 DAG 构建，操作语义由 VersionContext 承载**：
 
-ReleaseImage 中 `spec.install.components` 和 `spec.upgrade.components` 是两个独立的组件列表，分别对应首次安装和版本升级场景。拆分 `buildInstallDAG` 与 `buildUpgradeDAG` 有以下理由：
+ReleaseImage 中 `spec.install.components` 和 `spec.upgrade.components` 虽是两个独立列表，但二者构建的 DAG **拓扑结构一致**（组件依赖关系不变），区别仅在于 VersionContext 的 Current/Target 版本。采用统一 DAG 构建有以下理由：
 
-1. **组件列表不同**：安装 DAG 包含全部组件（从零开始的完整安装），升级 DAG 可能只包含变更的组件（增量升级）。合并构建会导致安装场景执行了仅升级需要的逻辑，或升级场景执行了仅安装需要的前置步骤。
-2. **composite 展开差异**：安装场景的 composite 展开 `subComponents` 全部子组件；升级场景的 composite 展开时还可能携带 `deferredSubComponents`（延迟升级声明），需要被 `executeControlPlaneHop` 读取。两个场景对 composite 的处理方式不同。
-3. **依赖解析差异**：安装 DAG 的 `DependencyResolver` 读取 `cv.Spec.Dependencies`（Install 阶段依赖）；升级 DAG 的 `DependencyResolver` 可能过滤 `phase != "Upgrade"` 的依赖（部分依赖仅在安装时生效，升级时不需要）。
-4. **VersionContext 初始化不同**：安装场景 `VersionContext.Current` 为空（无已安装版本），所有组件视为 Install；升级场景 `VersionContext.Current` 有值，Scheduler 通过 `NeedsUpgrade` 判断哪些组件需要升级、哪些跳过。DAG 结构相同但执行语义不同。
+1. **DAG 拓扑与操作类型解耦**：install/upgrade/rollback 的组件依赖关系相同（etcd→apiserver→kubelet 等顺序不变），DAG 拓扑结构一致。区别仅在于 VersionContext——Install 时 Current 为空（全部安装），Upgrade 时 Current 有值（`NeedsUpgrade` 过滤），Rollback 时 Current/Target 交换。构建 4 个结构相同的 DAG 是冗余的，统一 `buildDAG` 消除重复。
+2. **复用 §4.3 延迟分发哲学**：§4.3 确立了 ComponentNode 类型无关、类型分发延迟到执行期的原则。同理，操作类型（Install/Upgrade）也应延迟到执行期由 VersionContext 决定，而非在 DAG 构建期固化。`buildDAG` 只负责构建拓扑结构，不感知操作类型；`prepareVersionContext` 根据 L1 Phase 设置 VersionContext，Scheduler 执行时通过 `NeedsUpgrade` 逐组件判断 Install/Upgrade/Skip。
+3. **VersionContext 承载操作语义**：`prepareVersionContext` 根据 L1 Phase 设置 Current/Target：Installing→Current 为空，Upgrading→Current=currentVersion，RollingBack→PrepareRollback() 交换 Current/Target。VersionContext 是操作语义的唯一载体，DAG 构建与操作语义彻底解耦。
+4. **扩缩容为结构变体而非操作变体**：扩缩容 DAG 在统一 DAG 基础上**过滤出 binary 组件**并**追加 drain inline 节点**，这是 DAG 结构的变体（组件集合不同），而非操作语义的差异（仍然是 Install/Uninstall）。保留独立的 `buildScalingDAG` 处理结构差异，但 VersionContext 仍由 `prepareVersionContext` 统一设置。
 
-**四类 DAG 的职责对比**：
+**统一 DAG 与旧设计 (拆分 4 类) 的对比**：
 
-| DAG 类型 | 组件来源 | composite 处理 | VersionContext | 典型场景 |
-|---------|---------|---------------|----------------|---------|
-| **buildInstallDAG** | `releaseImage.Spec.Install.Components` | 展开 subComponents，无 deferred | Current 为空，全部 Install | 首次创建集群 |
-| **buildUpgradeDAG** | `releaseImage.Spec.Upgrade.Components` | 展开 subComponents + 解析 deferred | Current 有值，按 NeedsUpgrade 过滤 | 修改 desiredVersion |
-| **buildScalingDAG** | 当前 ReleaseImage 的节点级组件 | 仅 binary 类型组件 | Current 有值，新节点 Install | 新增/删除节点 |
-| **buildRollbackDAG** | 上一个 ReleaseImage 的 Upgrade.Components | 同 buildUpgradeDAG | 回退 Current 版本 | 升级失败回滚 |
+| 维度 | 旧设计 (拆分 4 类) | 新设计 (统一 DAG) |
+|------|-------------------|-------------------|
+| **DAG 构建方法** | buildInstallDAG / buildUpgradeDAG / buildScalingDAG / buildRollbackDAG (4 个) | buildDAG (1 个) + buildScalingDAG (1 个结构变体) |
+| **操作语义载体** | DAG 构建方法选择 (buildInstallDAG=Install, buildUpgradeDAG=Upgrade) | VersionContext (Current/Target) |
+| **DAG 拓扑** | 4 个结构相同 (除 Scaling 过滤) | 1 个统一拓扑 |
+| **代码复用** | 4 个方法 80% 逻辑重复 | 统一 buildDAG 消除重复 |
+| **回滚处理** | 独立 buildRollbackDAG + PrepareRollback | 统一 buildDAG + prepareVersionContext 中 PrepareRollback |
+| **扩缩容处理** | 独立 buildScalingDAG | buildScalingDAG (结构变体, 复用 buildDAG 逻辑) |
+| **操作分发时机** | DAG 构建期 (选哪个 builder) | 执行期 (VersionContext.NeedsUpgrade) |
 
 #### 4.4.4 DAG 构建实现
 
 ```go
 // ──────────────────────────────────────────────────────────────
-// buildInstallDAG 构建安装 DAG
-// 从 ReleaseImage.spec.install.components 构建，适用于首次安装
+// prepareVersionContext 根据 L1 Phase 设置 VersionContext 操作语义
+// 统一 DAG 的操作语义由此方法承载, buildDAG 不感知操作类型
 // ──────────────────────────────────────────────────────────────
-func (sm *ClusterStateMachine) buildInstallDAG(
+func (sm *ClusterStateMachine) prepareVersionContext(
+    ctx context.Context,
+    cluster *bkev1beta1.BKECluster,
+    phase ClusterLifecyclePhase,
+) error {
+    switch phase {
+    case ClusterPhaseInstalling:
+        // 首次安装: Current 为空, 全部组件视为 Install
+        // NeedsUpgrade 判断: Current 为空 → 所有组件需要安装
+        sm.versionContext.SetCurrent("")
+        sm.versionContext.SetTarget(cluster.Spec.DesiredVersion)
+
+    case ClusterPhaseUpgrading:
+        // 版本升级: Current=currentVersion, Target=desiredVersion
+        // NeedsUpgrade 判断: Current != Target 的组件需要升级
+        sm.versionContext.SetCurrent(cluster.Status.CurrentVersion)
+        sm.versionContext.SetTarget(cluster.Spec.DesiredVersion)
+
+    case ClusterPhaseRollingBack:
+        // 回滚: 交换 Current/Target
+        // Current = 升级后版本 (DesiredVersion), Target = 升级前版本 (PreviousVersion)
+        // PrepareRollback 后 NeedsUpgrade 判断 "从升级后版本回退到升级前版本"
+        sm.versionContext.SetCurrent(cluster.Spec.DesiredVersion)
+        sm.versionContext.SetTarget(cluster.Status.PreviousVersion)
+        sm.versionContext.PrepareRollback()
+
+    case ClusterPhaseScaling:
+        // 扩缩容: Current=currentVersion, Target=currentVersion (版本不变)
+        // 新节点 Current 为空 (per-node 判断) → Install 语义
+        // 删除节点 → Uninstall 语义 (由 buildScalingDAG 的 drain 节点触发)
+        sm.versionContext.SetCurrent(cluster.Status.CurrentVersion)
+        sm.versionContext.SetTarget(cluster.Status.CurrentVersion)
+    }
+    return nil
+}
+
+// ──────────────────────────────────────────────────────────────
+// buildDAG 统一构建 DAG (install/upgrade/rollback 共用)
+// DAG 拓扑与操作类型解耦, 操作语义由 VersionContext 承载 (见 prepareVersionContext)
+// ──────────────────────────────────────────────────────────────
+func (sm *ClusterStateMachine) buildDAG(
     ctx context.Context,
     cluster *bkev1beta1.BKECluster,
 ) (*topology.UpgradeDAG, error) {
-    releaseImage, err := sm.releaseImageResolver.Resolve(ctx, cluster)
+    // 1. 解析 ReleaseImage (rollback 时解析 PreviousVersion, 其他场景解析 DesiredVersion)
+    releaseImage, err := sm.resolveReleaseImage(ctx, cluster)
     if err != nil {
         return nil, fmt.Errorf("resolve release image: %w", err)
     }
 
-    // 1. 从 install.components 获取组件列表
-    installComponents := releaseImage.Spec.Install.Components
-    if installComponents == nil {
-        // install 为空时回退到 upgrade.components（兼容无 install 声明的 ReleaseImage）
-        installComponents = releaseImage.Spec.Upgrade.Components
+    // 2. 获取组件列表 (统一使用 upgrade.components, 无 upgrade 声明时回退 install)
+    //    install/upgrade/rollback 共用同一组件列表, DAG 拓扑一致
+    components := releaseImage.Spec.Upgrade.Components
+    if components == nil {
+        // 兼容无 upgrade 声明的 ReleaseImage (首次安装场景)
+        components = releaseImage.Spec.Install.Components
     }
 
-    // 2. 展开 composite 组件 (KEP-15)
-    expandedComponents := expandCompositeComponents(installComponents)
+    // 3. 展开 composite 组件 (KEP-15)
+    //    composite 自身不产生 DAG 节点, 展开为子组件
+    //    deferredSubComponents 通过 ExecutionContext 传递给编排器
+    expandedComponents := expandCompositeComponents(components)
 
-    // 3. 构建 DAG (复用 topology.BuildUpgradeDAG)
+    // 4. 构建 DAG (复用 topology.BuildUpgradeDAG)
+    //    DAG 结构不感知操作类型, 操作语义由 VersionContext 在执行期决定
     resolve := sm.makeDependencyResolver(ctx)
     return topology.BuildUpgradeDAG(expandedComponents, resolve)
 }
 
 // ──────────────────────────────────────────────────────────────
-// buildUpgradeDAG 构建升级 DAG
-// 从 ReleaseImage.spec.upgrade.components 构建，适用于版本升级
-// ──────────────────────────────────────────────────────────────
-func (sm *ClusterStateMachine) buildUpgradeDAG(
-    ctx context.Context,
-    cluster *bkev1beta1.BKECluster,
-) (*topology.UpgradeDAG, error) {
-    releaseImage, err := sm.releaseImageResolver.Resolve(ctx, cluster)
-    if err != nil {
-        return nil, fmt.Errorf("resolve release image: %w", err)
-    }
-
-    // 1. 从 upgrade.components 获取组件列表
-    upgradeComponents := releaseImage.Spec.Upgrade.Components
-
-    // 2. 展开 composite 组件 (KEP-15)
-    //    同时解析 deferredSubComponents，传入 executeControlPlaneHop
-    expandedComponents := expandCompositeComponents(upgradeComponents)
-
-    // 3. 解析延迟升级的子组件列表
-    //    由编排器在 executeControlPlaneHop 中跳过这些组件的 Target 版本更新
-    deferredComponents := resolveDeferredComponents(upgradeComponents)
-
-    // 4. 构建 DAG
-    resolve := sm.makeDependencyResolver(ctx)
-    dag, err := topology.BuildUpgradeDAG(expandedComponents, resolve)
-    if err != nil {
-        return nil, err
-    }
-
-    // 5. 将 deferredComponents 存入 ExecutionContext 供编排器使用
-    //    DAG 结构本身不变，deferred 仅影响 VersionContext 的 Target 设置
-    _ = deferredComponents // 通过 execCtx 传递，见 buildExecutionContext
-
-    return dag, nil
-}
-
-// ──────────────────────────────────────────────────────────────
-// buildScalingDAG 构建扩缩容 DAG
-// 仅包含节点级组件（binary 类型），对新节点执行安装、对删除节点执行卸载
+// buildScalingDAG 构建扩缩容 DAG (统一 DAG 的结构变体)
+// 在 buildDAG 基础上: 过滤 binary 组件 + 追加 drain inline 节点
 // ──────────────────────────────────────────────────────────────
 func (sm *ClusterStateMachine) buildScalingDAG(
     ctx context.Context,
     cluster *bkev1beta1.BKECluster,
 ) (*topology.UpgradeDAG, error) {
+    // 1. 解析 ReleaseImage (扩缩容使用当前版本, 非 DesiredVersion)
     releaseImage, err := sm.releaseImageResolver.Resolve(ctx, cluster)
     if err != nil {
         return nil, fmt.Errorf("resolve release image: %w", err)
     }
 
-    // 1. 获取当前版本的组件列表（使用 install 还是 upgrade 取决于集群状态）
+    // 2. 获取组件列表 (已安装集群用 upgrade, 首次安装用 install)
     components := releaseImage.Spec.Install.Components
     if cluster.Status.CurrentVersion != "" {
-        // 已安装集群扩容：使用 upgrade.components（版本已就绪，新节点安装到当前版本）
         components = releaseImage.Spec.Upgrade.Components
     }
 
-    // 2. 展开 composite 组件
+    // 3. 展开 composite
     expandedComponents := expandCompositeComponents(components)
 
-    // 3. 仅保留节点级组件（binary 类型），集群级组件不需要在扩缩容时重新执行
+    // 4. 仅保留 binary 类型组件 (扩缩容仅涉及节点级组件)
+    //    集群级组件 (yaml/helm/staticpod) 不在扩缩容时重新执行
     var nodeComponents []cvv1alpha1.ReleaseImageUpgradeComponent
     for _, comp := range expandedComponents {
         cv, err := sm.cvStore.GetComponentVersion(ctx, comp.Name, comp.Version)
@@ -1060,55 +1083,58 @@ func (sm *ClusterStateMachine) buildScalingDAG(
         }
     }
 
-    // 4. 构建 DAG（仅含节点级组件）
+    // 5. 构建 DAG (仅含 binary 组件)
     resolve := sm.makeDependencyResolver(ctx)
-    return topology.BuildUpgradeDAG(nodeComponents, resolve)
+    dag, err := topology.BuildUpgradeDAG(nodeComponents, resolve)
+    if err != nil {
+        return nil, err
+    }
+
+    // 6. 缩容场景: 追加 drain inline 节点
+    //    drain 必须在组件卸载之前完成 (通过依赖边保证)
+    nodes, _ := sm.nodeProvider.GetNodes(ctx, cluster)
+    for _, node := range nodes {
+        if node.Spec.Deleted {
+            drainNode := &topology.ComponentNode{
+                Name: fmt.Sprintf("drain-%s", node.Name),
+                Inline: &topology.InlineRef{
+                    Handler: "DrainNode",
+                    Version: "v1",
+                },
+                FailurePolicy: topology.FailurePolicyFailFast,
+            }
+            dag.AddNode(drainNode)
+            // drain → 组件卸载 (依赖边保证 drain 先完成)
+            for _, comp := range nodeComponents {
+                dag.AddDependency(drainNode.Name, comp.Name)
+            }
+        }
+    }
+
+    return dag, nil
 }
 
 // ──────────────────────────────────────────────────────────────
-// buildRollbackDAG 构建回滚 DAG
-// 从上一个 ReleaseImage 的 upgrade.components 构建，回退到旧版本
+// resolveReleaseImage 解析 ReleaseImage
+// rollback 时解析 PreviousVersion 的 ReleaseImage, 其他场景解析 DesiredVersion
 // ──────────────────────────────────────────────────────────────
-func (sm *ClusterStateMachine) buildRollbackDAG(
+func (sm *ClusterStateMachine) resolveReleaseImage(
     ctx context.Context,
     cluster *bkev1beta1.BKECluster,
-) (*topology.UpgradeDAG, error) {
-    // 1. 解析回滚目标版本（上一个成功安装的版本）
-    rollbackVersion := cluster.Status.PreviousVersion
-    if rollbackVersion == "" {
-        return nil, fmt.Errorf("no previous version to rollback to")
+) (*cvv1alpha1.ReleaseImage, error) {
+    if cluster.Status.LifecyclePhase == ClusterPhaseRollingBack {
+        // 回滚: 解析 PreviousVersion 的 ReleaseImage
+        return sm.releaseImageResolver.ResolveByVersion(ctx, cluster.Status.PreviousVersion)
     }
-
-    // 2. 获取回滚目标版本的 ReleaseImage
-    rollbackReleaseImage, err := sm.releaseImageResolver.ResolveByVersion(ctx, rollbackVersion)
-    if err != nil {
-        return nil, fmt.Errorf("resolve rollback release image %s: %w", rollbackVersion, err)
-    }
-
-    // 3. 从 upgrade.components 获取组件列表
-    rollbackComponents := rollbackReleaseImage.Spec.Upgrade.Components
-
-    // 4. 展开 composite 组件
-    expandedComponents := expandCompositeComponents(rollbackComponents)
-
-    // 5. 构建 DAG
-    //    回滚 DAG 的依赖解析与升级相同——组件依赖关系不变，仅版本回退
-    resolve := sm.makeDependencyResolver(ctx)
-
-    // 6. 将 VersionContext 的 Current/Target 交换
-    //    回滚场景下：原 Current（升级前版本）→ Target，原 Target（升级后版本）→ Current
-    //    这样 NeedsUpgrade 判断的是"从升级后版本回退到升级前版本"
-    sm.versionContext.PrepareRollback()
-
-    return topology.BuildUpgradeDAG(expandedComponents, resolve)
+    // 其他: 解析 DesiredVersion 的 ReleaseImage
+    return sm.releaseImageResolver.Resolve(ctx, cluster)
 }
 
 // ──────────────────────────────────────────────────────────────
 // 公共辅助函数
 // ──────────────────────────────────────────────────────────────
 
-// makeDependencyResolver 创建依赖解析器
-// 从 ComponentVersion.spec.dependencies 读取依赖关系
+// makeDependencyResolver 创建依赖解析器 (与原实现一致)
 func (sm *ClusterStateMachine) makeDependencyResolver(
     ctx context.Context,
 ) topology.DependencyResolver {
@@ -1121,7 +1147,7 @@ func (sm *ClusterStateMachine) makeDependencyResolver(
     }
 }
 
-// buildExecutionContext 构建执行上下文
+// buildExecutionContext 构建执行上下文 (与原实现一致)
 func (sm *ClusterStateMachine) buildExecutionContext(
     ctx context.Context,
     cluster *bkev1beta1.BKECluster,
@@ -1136,24 +1162,35 @@ func (sm *ClusterStateMachine) buildExecutionContext(
 }
 ```
 
-**DAG 构建对比总结**：
+**统一 DAG 构建对比总结**：
 
-| 维度 | buildInstallDAG | buildUpgradeDAG | buildScalingDAG | buildRollbackDAG |
-|------|----------------|----------------|----------------|-----------------|
-| **组件来源** | `install.components` | `upgrade.components` | 当前版本组件 | 旧版本 `upgrade.components` |
-| **composite 展开** | 全部子组件 | 全部 + deferred | 仅 binary 子组件 | 全部子组件 |
-| **VersionContext** | Current 为空 | Current 有值 | Current 有值 | Current/Target 交换 |
-| **组件过滤** | 无 | 无 | 仅 binary 类型 | 无 |
-| **依赖解析** | Install 阶段依赖 | Upgrade 阶段依赖 | Install 阶段依赖 | Upgrade 阶段依赖 |
-| **DAG 结构** | 完整（全部组件） | 完整或增量 | 子集（节点级） | 完整（旧版本） |
-| **幂等机制** | VersionContext 无 Current | `NeedsUpgrade` 过滤 | 新节点无状态→Install | `PrepareRollback` 后 `NeedsUpgrade` |
+| 维度 | buildDAG (统一) | buildScalingDAG (结构变体) |
+|------|----------------|--------------------------|
+| **适用操作** | Install / Upgrade / Rollback | 扩容 / 缩容 |
+| **组件来源** | `upgrade.components` (回退 `install`) | 当前版本 binary 组件 |
+| **composite 展开** | 全部子组件 | 仅 binary 子组件 |
+| **组件过滤** | 无 | 仅 binary 类型 |
+| **drain 节点** | 无 | 缩容时追加 drain inline 节点 |
+| **DAG 拓扑** | 完整 (全部组件) | 子集 (节点级) |
+| **操作语义** | VersionContext 承载 (prepareVersionContext) | VersionContext 承载 (prepareVersionContext) |
+| **回滚处理** | resolveReleaseImage 解析 PreviousVersion | 不适用 |
+| **幂等机制** | `NeedsUpgrade` 过滤 (VersionContext) | 新节点 Current 为空 → Install |
+
+**prepareVersionContext 操作语义映射**：
+
+| L1 Phase | Current | Target | NeedsUpgrade 语义 | 效果 |
+|----------|---------|--------|------------------|------|
+| Installing | `""` (空) | desiredVersion | Current 为空 → 所有组件 Install | 全量安装 |
+| Upgrading | currentVersion | desiredVersion | Current != Target → 变更组件 Upgrade | 增量升级 |
+| RollingBack | desiredVersion | previousVersion | PrepareRollback 交换后 → 降级 | 版本回退 |
+| Scaling | currentVersion | currentVersion | 版本一致 → 已有节点跳过, 新节点 Install | 扩容安装/缩容卸载 |
 
 ### 4.5 节点层状态机执行
 
 **设计思路 — 节点层状态机的职责边界与组件来源**：
 
 1. **L2 评估状态、L3 执行操作**：`NodeStateMachine.Execute` 的核心职责是评估节点状态转换（`evaluateNodePhase`）并决定执行何种操作（Install/Upgrade/Uninstall），实际的组件安装/升级委托给 `ComponentStateMachine.Execute`。节点层不直接操作 Executor，通过组件层间接调用，保持三层职责分离。
-2. **节点组件从 DAG 获取而非硬编码**：`components` 参数由 BKEMachine Controller 从 ReleaseImage 解析后传入（§6.3 详述），不再从 `NodeGroupNode` 获取。节点组件列表按依赖关系拓扑排序后逐个执行，排序算法复用代码库已有的 `topologicalSort`。
+2. **节点组件从 ReleaseImage 解析而非硬编码**：`components` 参数由 BKEMachine Controller 从 ReleaseImage 解析后传入（§6.4 详述），展开 composite 后过滤出 binary 类型组件。节点组件列表按依赖关系拓扑排序后逐个执行，排序算法复用代码库已有的 `topologicalSort`。
 3. **节点状态聚合由组件状态决定**：`evaluateNodePhase` 根据该节点所有组件的 `ComponentLifecycleStatus` 聚合判断——全部 Installed 则节点 Ready，任一 Installing 则节点 Provisioning，任一 Failed 则节点 Failed。这种自底向上的状态聚合保证节点状态真实反映组件执行进度。
 4. **与 DAG 调度的协作关系**：在统一 ComponentNode 设计下，节点级 binary 组件是 DAG 中的独立节点，由 Scheduler 按拓扑批次调度。`NodeStateMachine` 主要服务于 BKEMachine Controller 的独立 Reconcile（如节点扩容场景），与 Scheduler 的 DAG 执行是两条并行路径——Scheduler 负责集群级升级的 DAG 调度，NodeStateMachine 负责单节点生命周期管理。
 
@@ -1890,7 +1927,7 @@ groups:
 BKECluster Reconcile
   └─ ClusterStateMachine.Execute
        └─ evaluateClusterPhase → Installing/Upgrading
-       └─ buildInstallDAG / buildUpgradeDAG
+       └─ prepareVersionContext + buildDAG (统一 DAG)
        └─ scheduler.ExecuteDAG
             └─ Batch N: [bkeagent, containerd, kubelet]
                  └─ BinaryComponentExecutor.ExecuteComponent
@@ -1998,35 +2035,20 @@ func setMachineCAPIConditions(machine *bkev1beta1.BKEMachine, phase NodeLifecycl
 **ClusterStateMachine.Execute 中的调用点**：
 
 ```go
-// ClusterStateMachine.Execute 中 Installing/Upgrading 分支增加 syncNodeStatus
-case ClusterPhaseInstalling:
-    dag, err := sm.buildInstallDAG(ctx, cluster)
+// ClusterStateMachine.Execute 中统一 DAG 分支 (Installing/Upgrading/RollingBack 共用)
+// syncNodeStatus 已内嵌在 Execute 中, 见 §4.4
+case ClusterPhaseInstalling, ClusterPhaseUpgrading, ClusterPhaseRollingBack:
+    dag, err := sm.buildDAG(ctx, cluster)
     if err != nil {
-        return fmt.Errorf("build install DAG failed: %w", err)
+        return fmt.Errorf("build DAG failed: %w", err)
     }
     execCtx := sm.buildExecutionContext(ctx, cluster)
     if err := sm.scheduler.ExecuteDAG(ctx, execCtx, dag); err != nil {
         // 即使 DAG 执行失败也尝试同步节点状态（部分组件可能已成功）
         _ = sm.syncNodeStatus(ctx, cluster)
-        return fmt.Errorf("execute install DAG failed: %w", err)
+        return fmt.Errorf("execute DAG failed: %w", err)
     }
     // DAG 执行成功后同步节点状态
-    if err := sm.syncNodeStatus(ctx, cluster); err != nil {
-        sm.recorder.Eventf(cluster, v1.EventTypeWarning,
-            "NodeStatusSyncFailed", "failed to sync node status: %v", err)
-    }
-    cluster.Status.CurrentVersion = cluster.Spec.DesiredVersion
-
-case ClusterPhaseUpgrading:
-    dag, err := sm.buildUpgradeDAG(ctx, cluster)
-    if err != nil {
-        return fmt.Errorf("build upgrade DAG failed: %w", err)
-    }
-    execCtx := sm.buildExecutionContext(ctx, cluster)
-    if err := sm.scheduler.ExecuteDAG(ctx, execCtx, dag); err != nil {
-        _ = sm.syncNodeStatus(ctx, cluster)
-        return fmt.Errorf("execute upgrade DAG failed: %w", err)
-    }
     if err := sm.syncNodeStatus(ctx, cluster); err != nil {
         sm.recorder.Eventf(cluster, v1.EventTypeWarning,
             "NodeStatusSyncFailed", "failed to sync node status: %v", err)
@@ -2329,8 +2351,8 @@ func (sm *ClusterStateMachine) scalingWatchTriggerEnabled(
 
 | 维度 | 安装 (Installing) | 升级 (Upgrading) | 扩容 (Scaling) | 缩容 (Scaling) |
 |------|-------------------|-----------------|---------------|---------------|
-| **DAG 构建** | `buildInstallDAG` | `buildUpgradeDAG` | `buildScalingDAG` | `buildScalingDAG` |
-| **组件来源** | `install.components` | `upgrade.components` | 当前版本 binary 组件 | 当前版本 binary 组件 |
+| **DAG 构建** | `buildDAG` (统一) | `buildDAG` (统一) | `buildScalingDAG` (变体) | `buildScalingDAG` (变体) |
+| **组件来源** | `upgrade.components` (回退 `install`) | `upgrade.components` | 当前版本 binary 组件 | 当前版本 binary 组件 |
 | **组件操作** | Install | Upgrade | Install（新节点） | Uninstall（删除节点） |
 | **并发策略** | Rolling/Parallel | Rolling/Batch | Parallel（全并行） | Rolling（逐节点 drain+卸载） |
 | **前置节点** | 无 | 无 | 无 | drain inline 节点 |
@@ -2441,7 +2463,7 @@ func (r *BKEClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 **设计思路 — 节点层状态机独立 Reconcile，服务于扩缩容与单节点生命周期**：
 
 1. **BKEMachine Reconcile 与 DAG 调度的关系**：默认路径（DAG 内联）下，所有场景由 BKECluster Controller 通过 `Scheduler.ExecuteDAG` + `syncNodeStatus` 统一执行和状态回写，BKEMachine Controller 不参与主执行路径——其 Reconcile 中 `evaluateNodePhase` 读取已写入的 `NodeComponentStatuses`，聚合后若状态已达成则 Execute 无匹配 case 直接返回 nil。启用可选路径（Watch 触发，Feature Gate `ScalingWatchTriggerEnabled`）后，BKEMachine Controller 恢复扩缩容执行职责——Watch 到 `NodePhase` 变化后执行 `NodeStateMachine.Execute` 驱动 L2/L3。BKEMachine Controller 的保留职责为：① Watch 触发扩缩容（可选）；② 单节点故障恢复——节点重启后检查组件状态；③ 手动重试——人工清除 Failed 状态后重新触发；④ 状态查询聚合——为 `kubectl get bkenode` 提供实时状态。
-2. **nodeComponents 从 ReleaseImage 解析**：`getNodeComponents` 从当前 ReleaseImage 展开 composite 后过滤出 binary 类型组件。这与 §4.4.3 的设计一致——不再使用 `NodeGroupNode` 或 `ComponentScopeNode` 过滤，而是通过组件类型（binary）确定节点级组件。组件列表按依赖关系拓扑排序后传入 `NodeStateMachine.Execute`。
+2. **nodeComponents 从 ReleaseImage 解析**：`getNodeComponents` 从当前 ReleaseImage 展开 composite 后过滤出 binary 类型组件。这与 §4.4.3 的设计一致——通过组件类型（binary）确定节点级组件。组件列表按依赖关系拓扑排序后传入 `NodeStateMachine.Execute`。
 3. **BKEMachine 与 BKENode 的双向转换**：`machine.ToBKENode()` 将 CAPI BKEMachine CR 转换为状态机引擎使用的 `BKENode` 内部结构，`machine.UpdateFromBKENode(node)` 将状态机执行后的 `BKENode` 状态同步回 BKEMachine CR。这种转换隔离了 CAPI CR 结构与状态机内部数据模型——状态机引擎不依赖 CAPI 类型，仅操作 `BKENode`，便于独立测试。
 4. **topologicalSort 复用已有实现**：节点内组件排序复用 `pkg/topology` 包的拓扑排序逻辑，不重新实现。排序仅考虑节点级组件间的依赖（如 bkeagent → containerd → kubelet），忽略对集群级组件的依赖（如 kubelet → kube-apiserver），因为集群级组件由 DAG 调度器保证在节点级组件之前完成。
 
@@ -2657,8 +2679,8 @@ func setCAPIConditions(cluster *bkev1beta1.BKECluster) {
 
 **设计思路 — 首次安装是全量 DAG 执行，所有组件从零开始**：
 
-1. **全量组件 DAG**：安装 DAG 从 `ReleaseImage.spec.install.components` 构建，包含全部组件（集群级 + 节点级）。composite 在构建时展开为子组件，全部作为独立 ComponentNode 参与拓扑排序。
-2. **VersionContext Current 为空**：首次安装时所有组件的 `Current` 版本为空，`NeedsUpgrade` 对全部组件返回 true，所有组件执行 Install 操作。这与升级场景不同——升级时仅版本变更的组件执行 Upgrade。
+1. **全量组件 DAG**：安装 DAG 由统一 `buildDAG` 从 `ReleaseImage.spec.upgrade.components` 构建（无 upgrade 声明时回退 `install.components`），包含全部组件（集群级 + 节点级）。composite 在构建时展开为子组件，全部作为独立 ComponentNode 参与拓扑排序。
+2. **VersionContext Current 为空**：`prepareVersionContext` 在 Installing 阶段设置 Current 为空，`NeedsUpgrade` 对全部组件返回 true，所有组件执行 Install 操作。这与升级场景不同——升级时仅版本变更的组件执行 Upgrade。
 3. **依赖顺序保证**：安装需要严格的跨组件依赖顺序（etcd → apiserver → kubelet → coredns），DAG 拓扑排序保证依赖在前。binary 组件的节点级并发由 `upgradeStrategy.mode` 控制（安装场景通常使用 Parallel 加速）。
 4. **syncNodeStatus 回写**：DAG 执行完成后 `syncNodeStatus` 聚合所有节点的组件状态为 `NodePhase`，直接写入 BKEMachine CR 和 CAPI Conditions。BKEMachine Controller 不参与安装路径（默认 DAG 内联）。
 
@@ -2675,7 +2697,8 @@ func setCAPIConditions(cluster *bkev1beta1.BKECluster) {
 │  │ 1. EvaluateClusterPhase: Pending → Installing                           │   │
 │  │    Condition: desiredVersion != "" && currentVersion == ""               │   │
 │  │                                                                          │   │
-│  │ 2. BuildDAG(releaseImage)                                                │   │
+│  │ 2. prepareVersionContext (Current 为空 → 全部 Install)                    │   │
+│  │    buildDAG(releaseImage)  ← 统一 DAG 构建                                │   │
 │  │    DAG: [certs] → [bkeagent→containerd→kubelet] → [coredns] → [kube-proxy]               │   │
 │  │                                                                          │   │
 │  │ 3. ExecuteDAG(ctx, dag)                                                  │   │
@@ -2744,8 +2767,8 @@ func setCAPIConditions(cluster *bkev1beta1.BKECluster) {
 
 **设计思路 — 升级是增量 DAG 执行，仅版本变更的组件执行 Upgrade**：
 
-1. **增量组件过滤**：升级 DAG 从 `ReleaseImage.spec.upgrade.components` 构建，但 `VersionContext.NeedsUpgrade` 过滤掉版本未变更的组件——已完成升级的组件跳过，仅执行版本变更的组件。这保证 Reconcile 重入时不会重复升级。
-2. **deferredSubComponents 延迟升级**：composite 中声明的延迟组件（如 kubelet）由 `buildUpgradeDAG` 解析后传入 `executeControlPlaneHop`，跳过这些组件的 Target 版本更新，在后续偏差极限内补充升级。这避免了 kubelet 与 apiserver 版本差距过大导致集群不可用。
+1. **增量组件过滤**：升级 DAG 由统一 `buildDAG` 从 `ReleaseImage.spec.upgrade.components` 构建，`VersionContext.NeedsUpgrade` 过滤掉版本未变更的组件——已完成升级的组件跳过，仅执行版本变更的组件。这保证 Reconcile 重入时不会重复升级。
+2. **deferredSubComponents 延迟升级**：composite 中声明的延迟组件（如 kubelet）由 `expandCompositeComponents` 解析后通过 ExecutionContext 传入 `executeControlPlaneHop`，跳过这些组件的 Target 版本更新，在后续偏差极限内补充升级。这避免了 kubelet 与 apiserver 版本差距过大导致集群不可用。
 3. **节点级并发策略**：binary 组件升级使用 Rolling/Batch 策略（逐节点/分批），确保升级过程中集群始终有节点在线提供服务。这与安装场景的 Parallel 策略不同——升级需要保证服务连续性。
 4. **syncNodeStatus 回写**：与安装流程完全一致，`syncNodeStatus` 在 DAG 执行后聚合节点状态。DAG 执行失败时也尝试同步已成功部分的状态（`_ = sm.syncNodeStatus(ctx, cluster)`），保证部分升级的进度可见。
 
@@ -2765,7 +2788,8 @@ func setCAPIConditions(cluster *bkev1beta1.BKECluster) {
 │  │ 1. EvaluateClusterPhase: Running → Upgrading                            │   │
 │  │    Condition: desiredVersion != currentVersion                           │   │
 │  │                                                                          │   │
-│  │ 2. BuildDAG(newReleaseImage)                                             │   │
+│  │ 2. prepareVersionContext (Current=currentVersion → NeedsUpgrade 过滤)     │   │
+│  │    buildDAG(newReleaseImage)  ← 统一 DAG 构建 (与安装同一方法)              │   │
 │  │    DAG: [certs] → [bkeagent→containerd→kubelet] → [coredns] → [kube-proxy]               │   │
 │  │                                                                          │   │
 │  │ 3. ExecuteDAG(ctx, dag)                                                  │   │
@@ -2952,7 +2976,7 @@ func setCAPIConditions(cluster *bkev1beta1.BKECluster) {
 **设计思路 — 回滚是版本回退的 DAG 执行，Current/Target 交换实现降级**：
 
 1. **RollbackRequested 优先级最高**：`evaluateClusterPhase` 中 `RollbackRequested=true` 的优先级高于 `Failed` 不自愈检查，允许从故障态直接触发回滚。这是唯一能从 `Failed` 状态退出的自动路径——其他场景需人工清除 Failed。
-2. **PreviousVersion 构建 DAG**：`buildRollbackDAG` 从 `Status.PreviousVersion` 解析上一个成功的 ReleaseImage，使用其 `upgrade.components` 构建组件列表。回滚 DAG 的结构与升级 DAG 相同，仅版本回退。
+2. **统一 DAG + resolveReleaseImage**：`buildDAG` 通过 `resolveReleaseImage` 在 RollingBack 阶段解析 `Status.PreviousVersion` 的 ReleaseImage，使用其 `upgrade.components` 构建组件列表。回滚 DAG 的结构与升级 DAG 相同（统一 `buildDAG`），仅版本回退。
 3. **VersionContext.PrepareRollback()**：交换 `Current` 和 `Target`——原 Current（升级前版本 v2.6.0）变为 Target，原 Target（升级后版本 v2.7.0）变为 Current。这样 `NeedsUpgrade` 判断的是"从 v2.7.0 回退到 v2.6.0"，已完成回滚的组件跳过。
 4. **Rolling 逐节点降级**：回滚使用 Rolling 策略逐节点降级，确保降级过程中集群始终有节点在线。binary 组件执行 UninstallScript + InstallScript 回退到旧版本，helm 组件执行 `helm rollback`。
 
@@ -2976,14 +3000,13 @@ func setCAPIConditions(cluster *bkev1beta1.BKECluster) {
 │  │    └─ RollbackRequested=true (优先级最高, 跳过 Failed 不自愈检查)         │   │
 │  │    ← 注意: RollbackRequested 优先于 Failed, 允许从故障态触发回滚           │   │
 │  │                                                                          │   │
-│  │ 2. BuildRollbackDAG(ctx, cluster)                                        │   │
-│  │    └─ ResolveByVersion(Status.PreviousVersion = "v2.6.0")                │   │
+│  │ 2. prepareVersionContext (RollingBack → PrepareRollback 交换 Current/Target)│   │
+│  │       ← 交换: Current=v2.7.0 (升级后), Target=v2.6.0 (回滚目标)             │   │
+│  │       ← NeedsUpgrade 判断 "从 v2.7.0 回退到 v2.6.0"                       │   │
+│  │    buildDAG(ctx, cluster)  ← 统一 DAG 构建 (resolveReleaseImage 解析 v2.6.0) │   │
+│  │    └─ resolveReleaseImage: RollingBack → ResolveByVersion(PreviousVersion)│   │
 │  │    └─ 从 v2.6.0 ReleaseImage.spec.upgrade.components 构建组件列表          │   │
 │  │    └─ expandCompositeComponents 展开为子组件                              │   │
-│  │    └─ versionContext.PrepareRollback()                                   │   │
-│  │       ← 交换 Current/Target: 原 Current(v2.6.0) → Target,                │   │
-│  │         原 Target(v2.7.0) → Current                                      │   │
-│  │       ← NeedsUpgrade 判断 "从 v2.7.0 回退到 v2.6.0"                       │   │
 │  │    DAG: [bkeagent] → [containerd] → [kubelet] → [coredns]                │   │
 │  │                                                                          │   │
 │  │ 3. ExecuteDAG(ctx, dag)                                                  │   │
@@ -3021,8 +3044,8 @@ func setCAPIConditions(cluster *bkev1beta1.BKECluster) {
 
 **设计要点**：
 - `RollbackRequested` 优先级最高，允许从 `Failed` 状态触发回滚（§4.4.1 决策优先级 2）
-- 回滚 DAG 从 `PreviousVersion` 的 ReleaseImage 构建，复用 `upgrade.components`（§4.4.4）
-- `VersionContext.PrepareRollback()` 交换 Current/Target，使 `NeedsUpgrade` 判断 "从升级后版本回退到升级前版本"
+- 回滚使用统一 `buildDAG` 构建，`resolveReleaseImage` 解析 `PreviousVersion` 的 ReleaseImage（§4.4.4）
+- `prepareVersionContext` 中 `PrepareRollback()` 交换 Current/Target，使 `NeedsUpgrade` 判断 "从升级后版本回退到升级前版本"
 - 回滚使用 Rolling 策略逐节点降级，确保降级过程中的服务可用性
 
 ### 7.6 升级失败与中断重入流程
@@ -3047,7 +3070,14 @@ func setCAPIConditions(cluster *bkev1beta1.BKECluster) {
 │  Reconcile #1 (升级开始)                                                         │
 │  ┌─────────────────────────────────────────────────────────────────────────┐   │
 │  │ 1. EvaluateClusterPhase: Running → Upgrading                            │   │
-│  │ 2. BuildUpgradeDAG → ExecuteDAG                                          │   │
+│  │ 2. prepareVersionContext + buildDAG → ExecuteDAG                          │   │
+│  │    └─ Batch 2: [containerd]                                              │   │
+│  │       ├─ node-1: NeedsUpgrade=false (已 v2.7.0) → 跳过 ✓                  │   │
+│  │       ├─ node-2: containerd Pending → evaluateComponentPhase:            │   │
+│  │       │     installedVersion="" (人工清除) → Installing                   │   │
+│  │       │   └─ Execute: executor.Install(containerd v2.7.0) ✓               │   │
+│  │       │   └─ status.Version = "v2.7.0", Phase = Installed                │   │
+│  │       └─ node-3: NeedsUpgrade=false (已 v2.7.0) → 跳过 ✓                  │   │
 │  │    └─ Batch 1: [bkeagent] Rolling                                        │   │
 │  │       ├─ node-1: bkeagent v2.6.0 → v2.7.0 ✓                             │   │
 │  │       ├─ node-2: bkeagent v2.6.0 → v2.7.0 ✓                             │   │
@@ -3071,7 +3101,7 @@ func setCAPIConditions(cluster *bkev1beta1.BKECluster) {
 │  │    └─ currentPhase == Upgrading, isDAGCompleted = false                  │   │
 │  │    ← 决策优先级 3: 操作中间态保持, 跨 Reconcile 继续执行                    │   │
 │  │                                                                          │   │
-│  │ 2. BuildUpgradeDAG → ExecuteDAG                                          │   │
+│  │ 2. prepareVersionContext + buildDAG → ExecuteDAG                          │   │
 │  │    └─ Batch 1: [bkeagent]                                                │   │
 │  │       ├─ node-1: NeedsUpgrade=false (已 v2.7.0) → 跳过 ✓                  │   │
 │  │       ├─ node-2: NeedsUpgrade=false (已 v2.7.0) → 跳过 ✓                  │   │
@@ -3140,7 +3170,7 @@ func setCAPIConditions(cluster *bkev1beta1.BKECluster) {
 │  │ 1. EvaluateClusterPhase: Upgrading (用户已手动重置为 Upgrading)           │   │
 │  │    └─ currentPhase=Upgrading, isDAGCompleted=false → 保持 Upgrading      │   │
 │  │                                                                          │   │
-│  │ 2. BuildUpgradeDAG → ExecuteDAG                                          │   │
+│  │ 2. prepareVersionContext + buildDAG → ExecuteDAG                          │   │
 │  │    └─ Batch 2: [containerd]                                              │   │
 │  │       ├─ node-1: NeedsUpgrade=false (已 v2.7.0) → 跳过 ✓                  │   │
 │  │       ├─ node-2: containerd Pending → evaluateComponentPhase:            │   │
@@ -3255,13 +3285,13 @@ func setCAPIConditions(cluster *bkev1beta1.BKECluster) {
 
 | 场景 | 触发条件 | L1 Phase | DAG 类型 | 执行路径 | L2 参与 | 关键策略 |
 |------|---------|----------|---------|---------|---------|---------|
-| **安装** (§7.1) | desiredVersion 设置, 无 currentVersion | Installing | buildInstallDAG | DAG 内联 | 否 | 全组件, VersionContext 无 Current |
-| **升级** (§7.2) | desiredVersion != currentVersion | Upgrading | buildUpgradeDAG | DAG 内联 | 否 | NeedsUpgrade 过滤, Rolling/Batch |
-| **扩容** (§7.3) | 新增 BKENode (Pending) | Scaling | buildScalingDAG | DAG 内联 | 否 | 仅 binary, Parallel 全并行 |
-| **缩容** (§7.4) | BKENode.Spec.Deleted=true | Scaling | buildScalingDAG | DAG 内联 | 否 | drain inline + Rolling 逐节点 |
-| **回滚** (§7.5) | RollbackRequested=true | RollingBack | buildRollbackDAG | DAG 内联 | 否 | PreviousVersion, Current/Target 交换 |
-| **失败重入** (§7.6) | 升级中部分组件失败 | Upgrading→Failed | buildUpgradeDAG | DAG 内联 | 否 | 中间态保持, 组件级幂等跳过 |
-| **故障恢复** (§7.7) | 人工清除 Failed 后 | Upgrading | buildUpgradeDAG | DAG 内联 | 否 | 人工重置状态, 重新评估版本 |
+| **安装** (§7.1) | desiredVersion 设置, 无 currentVersion | Installing | `buildDAG` (统一) | DAG 内联 | 否 | 全组件, VersionContext 无 Current |
+| **升级** (§7.2) | desiredVersion != currentVersion | Upgrading | `buildDAG` (统一) | DAG 内联 | 否 | NeedsUpgrade 过滤, Rolling/Batch |
+| **扩容** (§7.3) | 新增 BKENode (Pending) | Scaling | `buildScalingDAG` (变体) | DAG 内联 | 否 | 仅 binary, Parallel 全并行 |
+| **缩容** (§7.4) | BKENode.Spec.Deleted=true | Scaling | `buildScalingDAG` (变体) | DAG 内联 | 否 | drain inline + Rolling 逐节点 |
+| **回滚** (§7.5) | RollbackRequested=true | RollingBack | `buildDAG` (统一) | DAG 内联 | 否 | PreviousVersion, Current/Target 交换 |
+| **失败重入** (§7.6) | 升级中部分组件失败 | Upgrading→Failed | `buildDAG` (统一) | DAG 内联 | 否 | 中间态保持, 组件级幂等跳过 |
+| **故障恢复** (§7.7) | 人工清除 Failed 后 | Upgrading | `buildDAG` (统一) | DAG 内联 | 否 | 人工重置状态, 重新评估版本 |
 | **Watch 扩容** (§7.8) | 新增 BKENode + Feature Gate | Scaling | 无 (L1 仅更新 CR) | Watch 触发 | 是 | 各节点独立 Reconcile, 实时聚合 |
 
 **核心设计原则贯穿所有场景**：
@@ -3280,7 +3310,7 @@ func setCAPIConditions(cluster *bkev1beta1.BKECluster) {
 |------|------|
 | **统一入口** | BKECluster Reconcile 统一触发，架构清晰 |
 | **DAG 驱动** | 从 ReleaseImage 构建 DAG，执行顺序由依赖关系决定 |
-| **节点级并行** | 节点组节点并行执行所有节点，提升大规模集群效率 |
+| **节点级并行** | BinaryComponentExecutor 支持 Rolling/Parallel/Batch，多节点并行执行，提升大规模集群效率 |
 | **三层清晰** | 集群层、节点层、组件层职责分明，状态转换清晰 |
 | **可观测** | 状态、事件、指标三层可观测，全链路可追踪 |
 | **CAPI 兼容** | 与 Cluster API Controller 模式天然兼容 |
