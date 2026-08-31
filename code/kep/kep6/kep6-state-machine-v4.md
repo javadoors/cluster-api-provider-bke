@@ -1848,13 +1848,19 @@ groups:
 
 但这引入一个问题：**L2 节点状态（`BKEMachine.Status.NodePhase`、`NodeComponentStatuses`）由谁更新？** 路径 2 中 L2 的 `evaluateNodePhase` 负责聚合组件状态并更新节点状态，路径 1 跳过了 L2，如果不回写节点状态，BKEMachine CR 将缺少节点级进度数据，导致 `kubectl get bkenode` 无法展示组件安装/升级进度，CAPI 上层 Controller 也无法通过 `BKEMachine.Status` 判断节点是否就绪。
 
-**解决方案 — BinaryComponentExecutor 在执行组件操作时同步回写节点状态**：
+**解决方案 — BinaryComponentExecutor 在执行组件操作时同步回写节点状态，syncNodeStatus 在 DAG 执行后聚合并直接写入 BKEMachine CR**：
 
 `BinaryComponentExecutor` 内部已有 `NodeStatusUpdater` 和 `ComponentStatusUpdater` 接口（§4.2 Scheduler 注入），在执行 binary 组件的每个节点操作前后更新 per-node per-component 状态。路径 1 复用此机制回写节点状态，无需 L2 参与：
 
 1. **组件级状态回写**：`BinaryComponentExecutor` 在每个节点上执行组件前调用 `NodeStatusUpdater.MarkPending`，执行成功后调用 `MarkSuccess`，失败时调用 `MarkFailed`。这些状态写入 `BKECluster.Status.NodeComponentStatuses[componentName][nodeIP]`。
 2. **节点级状态聚合**：DAG 执行完成后（或每个 binary 组件批次完成后），由 `ClusterStateMachine` 调用 `syncNodeStatus` 将 `NodeComponentStatuses` 聚合为 `BKEMachine.Status.NodePhase`，写入对应的 BKEMachine CR。聚合逻辑复用 `evaluateNodePhase` 的规则——全部 Installed → Ready，任一 Installing → Provisioning，任一 Failed → Failed。
-3. **BKEMachine CR Patch**：聚合后的 `NodePhase` 通过 Patch 写入 BKEMachine CR，BKEMachine Controller Watch 到变化后更新 CAPI Conditions（`ReadyCondition`）。虽然 BKEMachine Controller 不执行 L2 `NodeStateMachine.Execute`，但它仍然负责将 `NodePhase` 映射为 CAPI 标准 Conditions。
+3. **CAPI Conditions 由 syncNodeStatus 直接写入**：`syncNodeStatus` 在 Patch BKEMachine CR 时同步设置 CAPI 标准 Conditions（`ReadyCondition`）。路径 1 中 BKEMachine Controller **不参与**——不 Watch NodePhase、不执行 L2、不更新 Conditions。CAPI Conditions 的更新由 `syncNodeStatus` 直接完成，与 BKECluster Controller 的 `setCAPIConditions` 对称（集群级 Conditions 由 BKECluster Controller 写，节点级 Conditions 由 `syncNodeStatus` 写）。
+
+**为什么 BKEMachine Controller 在路径 1 中不需要 Watch NodePhase**：
+
+1. **Watch 是路径 2 的触发机制，不是路径 1 的**：路径 2（扩缩容）中 L1 通过更新 `NodePhase` 触发 BKEMachine Controller Reconcile 执行 L2。路径 1（安装/升级）中 L1 已经通过 DAG 直接完成了组件执行和状态回写，不需要再触发 BKEMachine Controller 做任何事。
+2. **CAPI Conditions 不需要 BKEMachine Controller 介入**：`syncNodeStatus` 在 Patch BKEMachine CR 时直接写入 `ReadyCondition`，CAPI Cluster Controller 和 MachineDeployment Controller Watch 到 Conditions 变化即可判断节点就绪状态。BKEMachine Controller 的 Reconcile 在路径 1 中是空操作——`evaluateNodePhase` 读取已更新的 `NodeComponentStatuses` 后返回 Ready，Execute 无匹配 case 直接返回 nil。
+3. **避免循环触发**：如果 BKEMachine Controller Watch 到 `NodePhase` 变化后执行 L2，L2 又会写 `NodePhase`（通过 `evaluateNodePhase` 聚合），可能触发新的 Reconcile。虽然幂等保证不会重复执行，但会产生不必要的 Reconcile 开销。路径 1 中 `syncNodeStatus` 直接写入最终状态，BKEMachine Controller Reconcile 时发现状态已达成，直接跳过。
 
 **为什么安装/升级不走 Watch 触发而走 DAG 内联**：
 
@@ -1882,9 +1888,9 @@ BKECluster Reconcile
             └─ 遍历所有 BKENode:
                  ├─ evaluateNodePhase(node, components)                       ← 复用 L2 聚合逻辑
                  ├─ BKEMachine.Status.NodePhase = 聚合结果                    ← 回写节点状态
+                 ├─ setCAPIConditions(machine, nodePhase)                     ← 直接写入 CAPI Conditions
                  └─ Patch BKEMachine CR
-                      ↓ BKEMachine Controller Watch 到 NodePhase 变化 ↓
-                      └─ setCAPIConditions(machine)                           ← 更新 CAPI ReadyCondition
+                      ← BKEMachine Controller 不参与路径 1
 ```
 
 **节点状态回写实现**：
@@ -1893,6 +1899,7 @@ BKECluster Reconcile
 // syncNodeStatus 在 DAG 执行完成后将组件状态聚合为节点状态并回写 BKEMachine CR
 // 此方法由 ClusterStateMachine.Execute 在 DAG 执行后调用
 // 解决路径 1 中 L2 不参与执行导致节点状态缺失的问题
+// 同时直接写入 CAPI Conditions，无需 BKEMachine Controller Watch
 func (sm *ClusterStateMachine) syncNodeStatus(
     ctx context.Context,
     cluster *bkev1beta1.BKECluster,
@@ -1926,7 +1933,7 @@ func (sm *ClusterStateMachine) syncNodeStatus(
         // evaluateNodePhase 从 NodeComponentStatuses 读取组件状态并聚合
         newPhase := nodeSM.evaluateNodePhase(node, nodeComponents)
 
-        // 4. 更新 BKEMachine CR
+        // 4. 更新 BKEMachine CR（含 NodePhase + ComponentStatuses + CAPI Conditions）
         machine := &bkev1beta1.BKEMachine{}
         if err := sm.client.Get(ctx, types.NamespacedName{
             Name: node.MachineName, Namespace: cluster.Namespace,
@@ -1939,6 +1946,8 @@ func (sm *ClusterStateMachine) syncNodeStatus(
             machine.Status.NodePhase = newPhase
             // 同步组件级状态到 BKEMachine（供 kubectl 查询）
             machine.Status.ComponentStatuses = node.Status.ComponentStatuses
+            // 直接写入 CAPI 标准 Conditions（无需 BKEMachine Controller 介入）
+            setMachineCAPIConditions(machine, newPhase)
             if err := patchHelper.Patch(ctx, machine); err != nil {
                 sm.recorder.Eventf(machine, v1.EventTypeWarning,
                     "NodeStatusSyncFailed", "failed to sync node phase: %v", err)
@@ -1947,6 +1956,26 @@ func (sm *ClusterStateMachine) syncNodeStatus(
     }
 
     return nil
+}
+
+// setMachineCAPIConditions 将节点状态映射为 CAPI 标准 Conditions
+// 与 §6.5 的 setCAPIConditions 对称——集群级 Conditions 由 BKECluster Controller 写，
+// 节点级 Conditions 由 syncNodeStatus 直接写
+func setMachineCAPIConditions(machine *bkev1beta1.BKEMachine, phase NodeLifecyclePhase) {
+    switch phase {
+    case NodePhaseReady:
+        conditions.MarkTrue(machine, clusterv1.ReadyCondition)
+
+    case NodePhaseProvisioning, NodePhaseUpgrading, NodePhaseDeleting:
+        conditions.MarkFalse(machine, clusterv1.ReadyCondition,
+            "OperationInProgress", clusterv1.ConditionSeverityInfo,
+            "Node %s in progress", phase)
+
+    case NodePhaseFailed:
+        conditions.MarkFalse(machine, clusterv1.ReadyCondition,
+            "NodeFailed", clusterv1.ConditionSeverityError,
+            "Node operation failed, manual intervention required")
+    }
 }
 ```
 
@@ -1999,16 +2028,18 @@ DAG 执行过程中:
     └─ NodeStatusUpdater.MarkSuccess  → BKECluster.Status.NodeComponentStatuses[comp][nodeIP]
 
 DAG 执行完成后:
-  syncNodeStatus
+  syncNodeStatus (BKECluster Controller 内)
     ├─ 读取 BKECluster.Status.NodeComponentStatuses
     ├─ evaluateNodePhase 聚合 → NodePhase (Ready/Provisioning/Failed)
+    ├─ BKEMachine.Status.NodePhase = 聚合结果
+    ├─ BKEMachine.Status.ComponentStatuses = per-component 状态
+    ├─ setMachineCAPIConditions(machine, nodePhase) → ReadyCondition
     └─ Patch BKEMachine CR
-         ├─ BKEMachine.Status.NodePhase = 聚合结果
-         └─ BKEMachine.Status.ComponentStatuses = per-component 状态
+         ← BKEMachine Controller 不参与路径 1
 
-BKEMachine Controller Watch:
-    └─ setCAPIConditions(machine)
-         └─ ReadyCondition = True (Ready) / False (Provisioning/Failed)
+CAPI 上层 Controller:
+    └─ Watch BKEMachine.Status.Conditions.ReadyCondition 变化
+         └─ MachineDeployment Controller 据此判断节点就绪状态
 ```
 
 **与路径 2 的状态更新对比**：
@@ -2016,10 +2047,11 @@ BKEMachine Controller Watch:
 | 维度 | 路径 1 (DAG 内联) | 路径 2 (Watch 触发) |
 |------|-------------------|-------------------|
 | **组件状态写入者** | BinaryComponentExecutor 内部的 NodeStatusUpdater | NodeStateMachine.executeNodeComponents → ComponentStateMachine |
-| **节点状态聚合者** | syncNodeStatus（DAG 执行后） | evaluateNodePhase（每次 Reconcile） |
+| **节点状态聚合者** | syncNodeStatus（DAG 执行后，BKECluster Controller 内） | evaluateNodePhase（BKEMachine Controller Reconcile 内） |
 | **聚合时机** | DAG 全部完成后一次性聚合 | 每次 BKEMachine Reconcile 实时聚合 |
-| **BKEMachine CR 更新** | syncNodeStatus Patch | NodeStateMachine.Execute 内部更新 |
-| **CAPI Conditions 更新** | BKEMachine Controller Watch NodePhase 变化 | 同左 |
+| **BKEMachine CR 更新者** | syncNodeStatus 直接 Patch | NodeStateMachine.Execute 内部更新后 BKEMachine Reconcile Patch |
+| **CAPI Conditions 更新者** | syncNodeStatus 内的 setMachineCAPIConditions 直接写入 | BKEMachine Reconcile 内的 setMachineCAPIConditions 写入 |
+| **BKEMachine Controller 是否参与** | 不参与（空操作 Reconcile，状态已达成直接跳过） | 参与（执行 L2 NodeStateMachine.Execute） |
 | **中间状态可见性** | DAG 执行期间 NodeComponentStatuses 有值，NodePhase 待 DAG 完成后才聚合 | 每次组件执行后实时聚合，NodePhase 实时更新 |
 
 #### 6.2.2 路径 2：BKEMachine Watch 触发（节点扩缩容）
@@ -2175,7 +2207,7 @@ func (r *BKEClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 **设计思路 — 节点层状态机独立 Reconcile，服务于扩缩容与单节点生命周期**：
 
-1. **BKEMachine Reconcile 与 DAG 调度的关系**：集群级升级时，BKECluster Controller 通过 `Scheduler.ExecuteDAG` 统一调度所有组件（包括节点级 binary 组件），BKEMachine Controller 不参与升级 DAG 执行。BKEMachine Reconcile 主要服务于两个场景：① 节点扩容——新 BKEMachine 创建后触发节点层状态机执行组件安装；② 节点缩容——BKEMachine 删除标记触发节点层状态机执行组件卸载。两条路径（DAG 调度 vs BKEMachine Reconcile）互补，不冲突。
+1. **BKEMachine Reconcile 与 DAG 调度的关系**：集群级安装/升级时，BKECluster Controller 通过 `Scheduler.ExecuteDAG` 统一调度所有组件（包括节点级 binary 组件），`syncNodeStatus` 在 DAG 执行后直接回写 BKEMachine CR 的 `NodePhase` 和 CAPI Conditions。BKEMachine Controller **不参与路径 1**——其 Reconcile 在路径 1 中是空操作（`evaluateNodePhase` 读取已更新的 `NodeComponentStatuses` 后返回 Ready，Execute 无匹配 case 直接返回 nil）。BKEMachine Reconcile 主要服务于路径 2：① 节点扩容——新 BKEMachine 创建后触发节点层状态机执行组件安装；② 节点缩容——BKEMachine 删除标记触发节点层状态机执行组件卸载。
 2. **nodeComponents 从 ReleaseImage 解析**：`getNodeComponents` 从当前 ReleaseImage 展开 composite 后过滤出 binary 类型组件。这与 §4.4.3 的设计一致——不再使用 `NodeGroupNode` 或 `ComponentScopeNode` 过滤，而是通过组件类型（binary）确定节点级组件。组件列表按依赖关系拓扑排序后传入 `NodeStateMachine.Execute`。
 3. **BKEMachine 与 BKENode 的双向转换**：`machine.ToBKENode()` 将 CAPI BKEMachine CR 转换为状态机引擎使用的 `BKENode` 内部结构，`machine.UpdateFromBKENode(node)` 将状态机执行后的 `BKENode` 状态同步回 BKEMachine CR。这种转换隔离了 CAPI CR 结构与状态机内部数据模型——状态机引擎不依赖 CAPI 类型，仅操作 `BKENode`，便于独立测试。
 4. **topologicalSort 复用已有实现**：节点内组件排序复用 `pkg/topology` 包的拓扑排序逻辑，不重新实现。排序仅考虑节点级组件间的依赖（如 bkeagent → containerd → kubelet），忽略对集群级组件的依赖（如 kubelet → kube-apiserver），因为集群级组件由 DAG 调度器保证在节点级组件之前完成。
