@@ -1842,9 +1842,19 @@ groups:
 
 #### 6.2.1 路径 1：DAG 内联执行（集群安装/升级）
 
-**设计思路 — 安装/升级时 L1 Scheduler 直接操作 L3，不经过 L2**：
+**设计思路 — 安装/升级时 L1 Scheduler 直接操作 L3，不经过 L2，但需回写节点状态**：
 
 集群安装和升级时，L1 通过 `Scheduler.ExecuteDAG` 统一调度所有组件。binary 组件作为 DAG 中的独立 `ComponentNode`，由 `BinaryComponentExecutor` 直接在节点上 SSH 执行。此路径不经过 L2 `NodeStateMachine`——L1 的 Scheduler 直接操作 L3 Executor。
+
+但这引入一个问题：**L2 节点状态（`BKEMachine.Status.NodePhase`、`NodeComponentStatuses`）由谁更新？** 路径 2 中 L2 的 `evaluateNodePhase` 负责聚合组件状态并更新节点状态，路径 1 跳过了 L2，如果不回写节点状态，BKEMachine CR 将缺少节点级进度数据，导致 `kubectl get bkenode` 无法展示组件安装/升级进度，CAPI 上层 Controller 也无法通过 `BKEMachine.Status` 判断节点是否就绪。
+
+**解决方案 — BinaryComponentExecutor 在执行组件操作时同步回写节点状态**：
+
+`BinaryComponentExecutor` 内部已有 `NodeStatusUpdater` 和 `ComponentStatusUpdater` 接口（§4.2 Scheduler 注入），在执行 binary 组件的每个节点操作前后更新 per-node per-component 状态。路径 1 复用此机制回写节点状态，无需 L2 参与：
+
+1. **组件级状态回写**：`BinaryComponentExecutor` 在每个节点上执行组件前调用 `NodeStatusUpdater.MarkPending`，执行成功后调用 `MarkSuccess`，失败时调用 `MarkFailed`。这些状态写入 `BKECluster.Status.NodeComponentStatuses[componentName][nodeIP]`。
+2. **节点级状态聚合**：DAG 执行完成后（或每个 binary 组件批次完成后），由 `ClusterStateMachine` 调用 `syncNodeStatus` 将 `NodeComponentStatuses` 聚合为 `BKEMachine.Status.NodePhase`，写入对应的 BKEMachine CR。聚合逻辑复用 `evaluateNodePhase` 的规则——全部 Installed → Ready，任一 Installing → Provisioning，任一 Failed → Failed。
+3. **BKEMachine CR Patch**：聚合后的 `NodePhase` 通过 Patch 写入 BKEMachine CR，BKEMachine Controller Watch 到变化后更新 CAPI Conditions（`ReadyCondition`）。虽然 BKEMachine Controller 不执行 L2 `NodeStateMachine.Execute`，但它仍然负责将 `NodePhase` 映射为 CAPI 标准 Conditions。
 
 **为什么安装/升级不走 Watch 触发而走 DAG 内联**：
 
@@ -1852,7 +1862,7 @@ groups:
 2. **节点级并发策略**：binary 组件升级需要 Rolling/Batch 策略（逐节点/分批），`BinaryComponentExecutor` 内部控制并发。Watch 触发下各 BKEMachine 独立 Reconcile，无法协调多节点间的并发节奏。
 3. **集群级组件与节点级组件的协调**：安装/升级时集群级组件（etcd/apiserver）和节点级组件（containerd/kubelet）需按统一 DAG 顺序执行。Watch 触发仅处理节点级组件，无法包含集群级组件。
 
-**执行流程**：
+**执行流程（含节点状态回写）**：
 
 ```
 BKECluster Reconcile
@@ -1862,10 +1872,155 @@ BKECluster Reconcile
        └─ scheduler.ExecuteDAG
             └─ Batch N: [bkeagent, containerd, kubelet]
                  └─ BinaryComponentExecutor.ExecuteComponent
-                      └─ SSH 逐节点执行 (Rolling/Batch)
-                           └─ 直接调用 ComponentExecutor (L3)
-                                ← 不经过 NodeStateMachine (L2)
+                      ├─ NodeStatusUpdater.MarkPending(nodeIP, "bkeagent")   ← 回写组件状态
+                      ├─ SSH 逐节点执行 (Rolling/Batch)
+                      │    └─ 直接调用 ComponentExecutor (L3)
+                      │         ← 不经过 NodeStateMachine (L2)
+                      ├─ NodeStatusUpdater.MarkSuccess(nodeIP, "bkeagent")    ← 回写组件状态
+                      └─ ComponentStatusUpdater.MarkSuccess("bkeagent")       ← 回写组件级状态
+       └─ syncNodeStatus(ctx, cluster)                                        ← DAG 执行后聚合节点状态
+            └─ 遍历所有 BKENode:
+                 ├─ evaluateNodePhase(node, components)                       ← 复用 L2 聚合逻辑
+                 ├─ BKEMachine.Status.NodePhase = 聚合结果                    ← 回写节点状态
+                 └─ Patch BKEMachine CR
+                      ↓ BKEMachine Controller Watch 到 NodePhase 变化 ↓
+                      └─ setCAPIConditions(machine)                           ← 更新 CAPI ReadyCondition
 ```
+
+**节点状态回写实现**：
+
+```go
+// syncNodeStatus 在 DAG 执行完成后将组件状态聚合为节点状态并回写 BKEMachine CR
+// 此方法由 ClusterStateMachine.Execute 在 DAG 执行后调用
+// 解决路径 1 中 L2 不参与执行导致节点状态缺失的问题
+func (sm *ClusterStateMachine) syncNodeStatus(
+    ctx context.Context,
+    cluster *bkev1beta1.BKECluster,
+) error {
+    // 1. 获取所有节点
+    nodes, err := sm.nodeProvider.GetNodes(ctx, cluster)
+    if err != nil {
+        return fmt.Errorf("get nodes for sync: %w", err)
+    }
+
+    // 2. 获取节点级组件列表（与 DAG 构建时一致）
+    releaseImage, err := sm.releaseImageResolver.Resolve(ctx, cluster)
+    if err != nil {
+        return fmt.Errorf("resolve release image for sync: %w", err)
+    }
+    expandedComponents := expandCompositeComponents(releaseImage.Spec.Upgrade.Components)
+    var nodeComponents []*ComponentVersion
+    for _, comp := range expandedComponents {
+        cv, err := sm.cvStore.GetComponentVersion(ctx, comp.Name, comp.Version)
+        if err != nil {
+            continue
+        }
+        if cv.Spec.Type == ComponentTypeBinary {
+            nodeComponents = append(nodeComponents, cv)
+        }
+    }
+
+    // 3. 逐节点聚合组件状态 → 节点状态
+    nodeSM := NewNodeStateMachine(nil) // 无需 componentSM，仅用 evaluateNodePhase
+    for _, node := range nodes {
+        // evaluateNodePhase 从 NodeComponentStatuses 读取组件状态并聚合
+        newPhase := nodeSM.evaluateNodePhase(node, nodeComponents)
+
+        // 4. 更新 BKEMachine CR
+        machine := &bkev1beta1.BKEMachine{}
+        if err := sm.client.Get(ctx, types.NamespacedName{
+            Name: node.MachineName, Namespace: cluster.Namespace,
+        }, machine); err != nil {
+            continue // BKEMachine 可能已被删除
+        }
+
+        if machine.Status.NodePhase != newPhase {
+            patchHelper, _ := patch.NewHelper(machine, sm.client)
+            machine.Status.NodePhase = newPhase
+            // 同步组件级状态到 BKEMachine（供 kubectl 查询）
+            machine.Status.ComponentStatuses = node.Status.ComponentStatuses
+            if err := patchHelper.Patch(ctx, machine); err != nil {
+                sm.recorder.Eventf(machine, v1.EventTypeWarning,
+                    "NodeStatusSyncFailed", "failed to sync node phase: %v", err)
+            }
+        }
+    }
+
+    return nil
+}
+```
+
+**ClusterStateMachine.Execute 中的调用点**：
+
+```go
+// ClusterStateMachine.Execute 中 Installing/Upgrading 分支增加 syncNodeStatus
+case ClusterPhaseInstalling:
+    dag, err := sm.buildInstallDAG(ctx, cluster)
+    if err != nil {
+        return fmt.Errorf("build install DAG failed: %w", err)
+    }
+    execCtx := sm.buildExecutionContext(ctx, cluster)
+    if err := sm.scheduler.ExecuteDAG(ctx, execCtx, dag); err != nil {
+        // 即使 DAG 执行失败也尝试同步节点状态（部分组件可能已成功）
+        _ = sm.syncNodeStatus(ctx, cluster)
+        return fmt.Errorf("execute install DAG failed: %w", err)
+    }
+    // DAG 执行成功后同步节点状态
+    if err := sm.syncNodeStatus(ctx, cluster); err != nil {
+        sm.recorder.Eventf(cluster, v1.EventTypeWarning,
+            "NodeStatusSyncFailed", "failed to sync node status: %v", err)
+    }
+    cluster.Status.CurrentVersion = cluster.Spec.DesiredVersion
+
+case ClusterPhaseUpgrading:
+    dag, err := sm.buildUpgradeDAG(ctx, cluster)
+    if err != nil {
+        return fmt.Errorf("build upgrade DAG failed: %w", err)
+    }
+    execCtx := sm.buildExecutionContext(ctx, cluster)
+    if err := sm.scheduler.ExecuteDAG(ctx, execCtx, dag); err != nil {
+        _ = sm.syncNodeStatus(ctx, cluster)
+        return fmt.Errorf("execute upgrade DAG failed: %w", err)
+    }
+    if err := sm.syncNodeStatus(ctx, cluster); err != nil {
+        sm.recorder.Eventf(cluster, v1.EventTypeWarning,
+            "NodeStatusSyncFailed", "failed to sync node status: %v", err)
+    }
+    cluster.Status.CurrentVersion = cluster.Spec.DesiredVersion
+```
+
+**节点状态回写的数据流**：
+
+```
+DAG 执行过程中:
+  BinaryComponentExecutor
+    ├─ NodeStatusUpdater.MarkPending  → BKECluster.Status.NodeComponentStatuses[comp][nodeIP]
+    ├─ SSH 执行组件操作 (L3)
+    └─ NodeStatusUpdater.MarkSuccess  → BKECluster.Status.NodeComponentStatuses[comp][nodeIP]
+
+DAG 执行完成后:
+  syncNodeStatus
+    ├─ 读取 BKECluster.Status.NodeComponentStatuses
+    ├─ evaluateNodePhase 聚合 → NodePhase (Ready/Provisioning/Failed)
+    └─ Patch BKEMachine CR
+         ├─ BKEMachine.Status.NodePhase = 聚合结果
+         └─ BKEMachine.Status.ComponentStatuses = per-component 状态
+
+BKEMachine Controller Watch:
+    └─ setCAPIConditions(machine)
+         └─ ReadyCondition = True (Ready) / False (Provisioning/Failed)
+```
+
+**与路径 2 的状态更新对比**：
+
+| 维度 | 路径 1 (DAG 内联) | 路径 2 (Watch 触发) |
+|------|-------------------|-------------------|
+| **组件状态写入者** | BinaryComponentExecutor 内部的 NodeStatusUpdater | NodeStateMachine.executeNodeComponents → ComponentStateMachine |
+| **节点状态聚合者** | syncNodeStatus（DAG 执行后） | evaluateNodePhase（每次 Reconcile） |
+| **聚合时机** | DAG 全部完成后一次性聚合 | 每次 BKEMachine Reconcile 实时聚合 |
+| **BKEMachine CR 更新** | syncNodeStatus Patch | NodeStateMachine.Execute 内部更新 |
+| **CAPI Conditions 更新** | BKEMachine Controller Watch NodePhase 变化 | 同左 |
+| **中间状态可见性** | DAG 执行期间 NodeComponentStatuses 有值，NodePhase 待 DAG 完成后才聚合 | 每次组件执行后实时聚合，NodePhase 实时更新 |
 
 #### 6.2.2 路径 2：BKEMachine Watch 触发（节点扩缩容）
 
