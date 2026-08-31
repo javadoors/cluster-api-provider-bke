@@ -1829,22 +1829,30 @@ groups:
 
 ### 6.2 集群层触发节点层状态机的协调机制
 
-**设计思路 — 统一 DAG 内联执行，扩缩容也走 Scheduler.ExecuteDAG**：
+**设计思路 — DAG 内联为默认路径，BKEMachine Watch 触发为可选路径**：
 
-集群层状态机（L1）通过 `Scheduler.ExecuteDAG` 统一调度所有操作场景。安装/升级/扩缩容均走 DAG 内联路径——L1 构建 DAG、Scheduler 执行、`syncNodeStatus` 回写节点状态。不再使用 BKEMachine Watch 触发 L2 的路径，简化架构为单一执行路径。
+集群层状态机（L1）默认通过 `Scheduler.ExecuteDAG` 统一调度所有操作场景（安装/升级/扩缩容），由 `syncNodeStatus` 回写节点状态。同时保留 BKEMachine Watch 触发路径作为可选方案——适用于需要节点独立 Reconcile 的场景（如节点分布在多可用区、网络分区容忍、大规模集群卸载 L1 调度压力）。
 
-**单一触发路径**：
+**两条触发路径**：
 
-| 路径 | 触发场景 | 触发方式 | L2 是否参与 |
-|------|---------|---------|------------|
-| **DAG 内联执行** | 集群安装、版本升级、节点扩缩容 | Scheduler 通过 `BinaryComponentExecutor` 在 DAG 执行中直接 SSH 操作节点 | 不参与（Scheduler 直接操作 L3，syncNodeStatus 回写节点状态） |
+| 路径 | 触发场景 | 触发方式 | L2 是否参与 | 适用条件 |
+|------|---------|---------|------------|---------|
+| **DAG 内联执行（默认）** | 集群安装、版本升级、节点扩缩容 | Scheduler 通过 `BinaryComponentExecutor` 在 DAG 执行中直接 SSH 操作节点 | 不参与 | 默认路径 |
+| **BKEMachine Watch 触发（可选）** | 节点扩容、节点缩容 | L1 更新 BKEMachine.Status.NodePhase → BKEMachine Controller Watch → L2 Execute | 参与 | 需要节点独立 Reconcile 的场景 |
 
-**为什么扩缩容也走 DAG 内联（统一为单一路径）**：
+**为什么扩缩容默认走 DAG 内联**：
 
-1. **架构统一性**：安装/升级/扩缩容走同一执行路径（`Scheduler.ExecuteDAG` + `syncNodeStatus`），减少分支逻辑和维护成本。`BinaryComponentExecutor` 已支持节点级并发策略（Rolling/Parallel/Batch），扩容场景使用 Parallel（新节点全并行安装）或 Batch 即可，无需独立的 Watch 触发机制。
-2. **节点状态一致性**：路径 1 的 `syncNodeStatus` 已解决节点状态回写问题。如果扩缩容走 Watch 触发（路径 2），安装/升级走 DAG 内联（路径 1），两种路径的状态回写逻辑不同（路径 1 由 `syncNodeStatus` 聚合，路径 2 由 `evaluateNodePhase` 实时聚合），增加维护负担和潜在不一致风险。统一为 DAG 内联后，所有场景的状态回写都由 `syncNodeStatus` 统一处理。
+1. **架构统一性**：安装/升级/扩缩容走同一执行路径（`Scheduler.ExecuteDAG` + `syncNodeStatus`），减少分支逻辑和维护成本。`BinaryComponentExecutor` 已支持节点级并发策略（Rolling/Parallel/Batch），扩容场景使用 Parallel（新节点全并行安装）或 Batch 即可。
+2. **节点状态一致性**：DAG 内联路径的 `syncNodeStatus` 统一聚合和回写节点状态。如果扩缩容走 Watch 触发，两种路径的状态回写逻辑不同（DAG 内联由 `syncNodeStatus` 聚合，Watch 触发由 `evaluateNodePhase` 实时聚合），增加维护负担和潜在不一致风险。
 3. **扩容的依赖顺序同样需要保证**：新节点安装时，组件间有依赖顺序（bkeagent → containerd → kubelet），DAG 拓扑排序保证顺序。虽然 Watch 触发下 `NodeStateMachine.executeNodeComponents` 也有 `topologicalSort`，但那是节点内排序，无法保证跨节点顺序（如 etcd 节点需先于 master 节点就绪）。DAG 内联可以统一处理跨节点和节点内的依赖。
 4. **缩容的安全性**：节点缩容时需要先 drain（驱逐 Pod）再卸载组件。drain 操作可封装为 DAG 节点（inline 类型），与组件卸载节点按依赖顺序执行。Watch 触发下各节点独立 Reconcile，无法协调 drain 与组件卸载的顺序。
+
+**Watch 触发路径的适用场景**：
+
+1. **大规模集群**：数千节点集群中，L1 的 DAG 执行串行化所有节点操作可能成为瓶颈。Watch 触发下各 BKEMachine 并行 Reconcile，卸载 L1 调度压力。
+2. **多可用区/多地域**：节点分布在不同可用区时，各区域的网络延迟不一致，Watch 触发允许各区域节点独立 Reconcile，不受 L1 调度的全局批次等待。
+3. **网络分区容忍**：L1 Controller 与部分节点网络分区时，Watch 触发下已连通的节点仍可独立完成组件安装（L2 不依赖 L1 的 DAG 执行）。
+4. **灰度迁移**：从旧架构（Phase 框架的 BKEMachine Controller 驱动）迁移到新架构时，可先启用 Watch 触发路径（行为接近旧架构），再切换到 DAG 内联。
 
 #### 6.2.1 路径 1：DAG 内联执行（集群安装/升级）
 
@@ -2211,9 +2219,111 @@ case ClusterPhaseScaling:
     }
 ```
 
-#### 6.2.3 场景对比
+#### 6.2.3 路径 3：BKEMachine Watch 触发（节点扩缩容，可选）
 
-**统一 DAG 内联后各场景的差异**：
+**设计思路 — 扩缩容的可选路径，L1 通过 CR Status 变化触发 L2 独立执行**：
+
+作为 DAG 内联路径的可选替代方案，节点扩缩容可走 BKEMachine Watch 触发路径。L1 更新 BKEMachine CR 的状态字段（`NodePhase`、`NodeComponents`），BKEMachine Controller Watch 到变化后在自身 Reconcile 中调用 `NodeStateMachine.Execute` 驱动 L2/L3 执行。各节点独立 Reconcile，并行安装/卸载。
+
+**适用场景**：
+
+1. **大规模集群**：数千节点集群中，L1 的 DAG 执行串行化所有节点操作可能成为瓶颈。Watch 触发下各 BKEMachine 并行 Reconcile，卸载 L1 调度压力。
+2. **多可用区/多地域**：节点分布在不同可用区时，各区域的网络延迟不一致，Watch 触发允许各区域节点独立 Reconcile，不受 L1 调度的全局批次等待。
+3. **网络分区容忍**：L1 Controller 与部分节点网络分区时，Watch 触发下已连通的节点仍可独立完成组件安装（L2 不依赖 L1 的 DAG 执行）。
+4. **灰度迁移**：从旧架构（Phase 框架的 BKEMachine Controller 驱动）迁移到新架构时，可先启用 Watch 触发路径（行为接近旧架构），再切换到 DAG 内联。
+
+**与 DAG 内联路径的权衡**：
+
+| 维度 | DAG 内联（默认） | Watch 触发（可选） |
+|------|-------------------|-------------------|
+| **跨组件依赖顺序** | DAG 拓扑排序保证 | 仅节点内 topologicalSort，无法保证跨节点 |
+| **节点级并发** | BinaryComponentExecutor 控制 | 各 BKEMachine 独立 Reconcile，无全局协调 |
+| **集群级+节点级协调** | 统一 DAG 包含全部组件 | 仅节点级组件，集群级组件需另外处理 |
+| **缩容 drain 安全性** | drain 作为 DAG inline 节点，按依赖执行 | 各节点独立 drain，无法保证顺序 |
+| **大规模集群性能** | L1 串行化可能成为瓶颈 | 各节点并行 Reconcile，性能更好 |
+| **网络分区容忍** | L1 与节点分区时 DAG 执行中断 | 已连通节点可独立完成 |
+| **状态回写** | syncNodeStatus 统一聚合 | evaluateNodePhase 实时聚合 |
+| **中间状态可见性** | DAG 完成后才聚合 NodePhase | 每次组件执行后实时更新 |
+
+**执行流程**：
+
+```
+BKECluster Reconcile
+  └─ ClusterStateMachine.Execute
+       └─ evaluateClusterPhase → Scaling
+       └─ 更新 BKEMachine CR:
+            - NodePhase = Provisioning (新节点) 或 Deleting (删除节点)
+            - NodeComponents = [bkeagent, containerd, kubelet] (展开 composite)
+       └─ Patch BKEMachine CR
+
+         ↓ BKEMachine Controller Watch 到 Status 变化 ↓
+
+BKEMachine Reconcile
+  └─ 获取 BKEMachine + 关联 BKECluster
+  └─ getNodeComponents (从 ReleaseImage 解析)
+  └─ NodeStateMachine.Execute (L2)
+       └─ evaluateNodePhase → Provisioning / Deleting
+       └─ executeNodeComponents
+            └─ ComponentStateMachine.Execute (L3)
+                 └─ ComponentExecutor.Install / Uninstall
+```
+
+**触发机制实现**：
+
+```go
+// ClusterStateMachine.Execute 中 Scaling 分支的 Watch 触发逻辑（可选路径）
+// 通过 Feature Gate 控制是否启用 Watch 触发路径
+case ClusterPhaseScaling:
+    if sm.scalingWatchTriggerEnabled(cluster) {
+        // 可选路径: Watch 触发
+        nodes, err := sm.nodeProvider.GetNodes(ctx, cluster)
+        if err != nil {
+            return fmt.Errorf("get nodes failed: %w", err)
+        }
+        for _, node := range nodes {
+            machine := &bkev1beta1.BKEMachine{}
+            if err := sm.client.Get(ctx, types.NamespacedName{
+                Name: node.MachineName, Namespace: cluster.Namespace,
+            }, machine); err != nil {
+                continue
+            }
+            patchHelper, _ := patch.NewHelper(machine, sm.client)
+            if node.Status.LifecyclePhase == NodePhasePending {
+                machine.Status.NodePhase = NodePhaseProvisioning
+                machine.Status.NodeComponents = toNodeComponentRefs(dag)
+            }
+            if node.Spec.Deleted {
+                machine.Status.NodePhase = NodePhaseDeleting
+            }
+            patchHelper.Patch(ctx, machine)
+        }
+    } else {
+        // 默认路径: DAG 内联执行（见 §6.2.2）
+        dag, err := sm.buildScalingDAG(ctx, cluster)
+        // ... scheduler.ExecuteDAG + syncNodeStatus ...
+    }
+```
+
+**Feature Gate 控制**：
+
+```go
+// scalingWatchTriggerEnabled 判断是否启用 Watch 触发路径
+// 通过集群注解或全局 Feature Gate 控制
+func (sm *ClusterStateMachine) scalingWatchTriggerEnabled(
+    cluster *bkev1beta1.BKECluster,
+) bool {
+    // 注解优先: 集群级开关
+    if annotations.Has(cluster, "cvo.openfuyao.cn/scaling-watch-trigger") {
+        return annotations.Get(cluster, "cvo.openfuyao.cn/scaling-watch-trigger") == "true"
+    }
+    // 全局 Feature Gate
+    return config.ScalingWatchTriggerEnabled
+}
+```
+
+#### 6.2.4 场景对比
+
+**DAG 内联路径各场景的差异**：
 
 | 维度 | 安装 (Installing) | 升级 (Upgrading) | 扩容 (Scaling) | 缩容 (Scaling) |
 |------|-------------------|-----------------|---------------|---------------|
@@ -2227,7 +2337,22 @@ case ClusterPhaseScaling:
 | **CAPI Conditions** | setMachineCAPIConditions | setMachineCAPIConditions | setMachineCAPIConditions | 清除后移除 |
 | **BKEMachine Controller** | 不参与 | 不参与 | 不参与 | 不参与 |
 
-**统一路径的优势**：
+**DAG 内联与 Watch 触发路径的对比**：
+
+| 维度 | DAG 内联（默认，路径 1/2） | Watch 触发（可选，路径 3） |
+|------|---------------------------|--------------------------|
+| **触发场景** | 安装/升级/扩缩容 | 仅扩缩容 |
+| **L1 操作** | `scheduler.ExecuteDAG` 直接执行 | 更新 BKEMachine CR Status |
+| **L2 是否参与** | 不参与 | 参与（L2 评估状态后驱动 L3） |
+| **组件来源** | DAG 中的 ComponentNode | BKEMachine.Status.NodeComponents |
+| **并发控制** | Scheduler 批次内并行 | 每个 BKEMachine 独立 Reconcile |
+| **幂等保证** | VersionContext.NeedsUpgrade | evaluateNodePhase + evaluateComponentPhase |
+| **状态回写** | syncNodeStatus 统一聚合 | evaluateNodePhase 实时聚合 |
+| **大规模集群** | L1 串行化可能瓶颈 | 各节点并行，性能更好 |
+| **网络分区容忍** | L1 与节点分区时中断 | 已连通节点可独立完成 |
+| **Feature Gate** | 默认启用 | `ScalingWatchTriggerEnabled` 控制 |
+
+**DAG 内联路径的优势**：
 
 | 优势 | 说明 |
 |------|------|
@@ -2237,17 +2362,18 @@ case ClusterPhaseScaling:
 | **缩容安全性** | drain 操作作为 DAG inline 节点，与组件卸载按依赖顺序执行，保证 Pod 驱逐完成后才卸载 |
 | **并发控制统一** | `BinaryComponentExecutor` 的 upgradeStrategy.mode 统一控制所有场景的节点级并发 |
 
-#### 6.2.4 NodeStateMachine 的保留场景
+#### 6.2.5 NodeStateMachine 的保留场景
 
-统一 DAG 内联后，`NodeStateMachine` 不再作为扩缩容的执行路径，但保留以下场景：
+`NodeStateMachine` 在 DAG 内联路径中不参与主执行，但在以下场景中保留：
 
 | 场景 | 触发方式 | NodeStateMachine 职责 | 说明 |
 |------|---------|----------------------|------|
+| **Watch 触发扩缩容** | BKEMachine Controller Watch NodePhase | L2 驱动 L3 执行组件安装/卸载 | 可选路径（§6.2.3），通过 Feature Gate 启用 |
 | **单节点故障恢复** | BKEMachine Controller Reconcile | `evaluateNodePhase` 判断节点状态 | 节点重启后组件状态检查，判断是否需要重新安装 |
 | **手动重试失败节点** | 人工清除 Failed 状态 | `evaluateNodePhase` → Provisioning | 人工介入后重新触发组件安装 |
 | **状态查询** | BKEMachine Controller Reconcile | `evaluateNodePhase` 聚合只读 | 不执行操作，仅聚合组件状态供查询（DAG 内联已写入 NodeComponentStatuses） |
 
-> **设计说明**：NodeStateMachine 从"扩缩容执行路径"降级为"单节点状态查询与故障恢复"辅助角色。主执行路径统一为 DAG 内联，NodeStateMachine 仅在 BKEMachine Controller 独立 Reconcile 中用于状态聚合和异常恢复，不再驱动组件安装/升级/卸载。
+> **设计说明**：DAG 内联为默认路径时，`NodeStateMachine` 降级为"单节点状态查询与故障恢复"辅助角色。启用 Watch 触发路径（Feature Gate `ScalingWatchTriggerEnabled`）后，`NodeStateMachine` 恢复为扩缩容的执行入口。两种路径通过 Feature Gate 切换，不会同时执行。
 
 ### 6.3 BKECluster Controller 集成
 
@@ -2312,7 +2438,7 @@ func (r *BKEClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 **设计思路 — 节点层状态机独立 Reconcile，服务于扩缩容与单节点生命周期**：
 
-1. **BKEMachine Reconcile 与 DAG 调度的关系**：统一 DAG 内联后，所有场景（安装/升级/扩缩容）均由 BKECluster Controller 通过 `Scheduler.ExecuteDAG` + `syncNodeStatus` 统一执行和状态回写。BKEMachine Controller **不参与主执行路径**——其 Reconcile 中 `evaluateNodePhase` 读取 DAG 内联已写入的 `NodeComponentStatuses`，聚合后若状态已达成（Ready/Failed）则 Execute 无匹配 case 直接返回 nil。BKEMachine Controller 的保留职责为：① 单节点故障恢复——节点重启后检查组件状态，判断是否需要重新安装；② 手动重试——人工清除 Failed 状态后重新触发；③ 状态查询聚合——为 `kubectl get bkenode` 提供实时状态聚合。
+1. **BKEMachine Reconcile 与 DAG 调度的关系**：默认路径（DAG 内联）下，所有场景由 BKECluster Controller 通过 `Scheduler.ExecuteDAG` + `syncNodeStatus` 统一执行和状态回写，BKEMachine Controller 不参与主执行路径——其 Reconcile 中 `evaluateNodePhase` 读取已写入的 `NodeComponentStatuses`，聚合后若状态已达成则 Execute 无匹配 case 直接返回 nil。启用可选路径（Watch 触发，Feature Gate `ScalingWatchTriggerEnabled`）后，BKEMachine Controller 恢复扩缩容执行职责——Watch 到 `NodePhase` 变化后执行 `NodeStateMachine.Execute` 驱动 L2/L3。BKEMachine Controller 的保留职责为：① Watch 触发扩缩容（可选）；② 单节点故障恢复——节点重启后检查组件状态；③ 手动重试——人工清除 Failed 状态后重新触发；④ 状态查询聚合——为 `kubectl get bkenode` 提供实时状态。
 2. **nodeComponents 从 ReleaseImage 解析**：`getNodeComponents` 从当前 ReleaseImage 展开 composite 后过滤出 binary 类型组件。这与 §4.4.3 的设计一致——不再使用 `NodeGroupNode` 或 `ComponentScopeNode` 过滤，而是通过组件类型（binary）确定节点级组件。组件列表按依赖关系拓扑排序后传入 `NodeStateMachine.Execute`。
 3. **BKEMachine 与 BKENode 的双向转换**：`machine.ToBKENode()` 将 CAPI BKEMachine CR 转换为状态机引擎使用的 `BKENode` 内部结构，`machine.UpdateFromBKENode(node)` 将状态机执行后的 `BKENode` 状态同步回 BKEMachine CR。这种转换隔离了 CAPI CR 结构与状态机内部数据模型——状态机引擎不依赖 CAPI 类型，仅操作 `BKENode`，便于独立测试。
 4. **topologicalSort 复用已有实现**：节点内组件排序复用 `pkg/topology` 包的拓扑排序逻辑，不重新实现。排序仅考虑节点级组件间的依赖（如 bkeagent → containerd → kubelet），忽略对集群级组件的依赖（如 kubelet → kube-apiserver），因为集群级组件由 DAG 调度器保证在节点级组件之前完成。
