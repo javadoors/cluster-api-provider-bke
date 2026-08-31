@@ -137,46 +137,143 @@ DAG 中只有一种节点类型 `ComponentNode`，每个组件（无论 binary/y
 | **composite** | 不执行 (展开为子组件) | — | DAG 构建时展开，自身不产生节点 |
 | **selector** | 不执行 (按 condition 选择) | — | DAG 构建时评估 condition，选择子组件 |
 
-```go
-// DAG 节点接口 — 统一节点类型，不再区分 Cluster/NodeGroup
-type DAGNode interface {
-    Name() string
-    Type() DAGNodeType
-    Execute(ctx context.Context, execCtx *ExecutionContext) error
-    Dependencies() []string
-}
+以下数据结构直接复用代码库中已有的定义，无需新增：
 
-type DAGNodeType string
+```go
+// pkg/topology/component.go (已有，直接复用)
+
+// FailurePolicy 控制调度器对组件失败的反应
+type FailurePolicy string
 
 const (
-    DAGNodeComponent DAGNodeType = "component"  // 统一组件节点
+    FailurePolicyFailFast FailurePolicy = "FailFast"
+    FailurePolicyContinue FailurePolicy = "Continue"
+    FailurePolicyRollback FailurePolicy = "Rollback"
 )
 
-// ComponentNode 统一组件节点
+// InlineRef 指向 ComponentFactory 注册的 handler
+type InlineRef struct {
+    Handler string
+    Version string
+}
+
+// ComponentNode 是升级 DAG 中的一个顶点 (统一节点类型，不再区分 Cluster/NodeGroup)
 // 所有组件类型（binary/yaml/helm/staticpod/inline）均为 ComponentNode
 // composite/selector 类型在 DAG 构建时展开，不产生 ComponentNode
 type ComponentNode struct {
-    name      string
-    component *ComponentVersion
-    deps      []string
-    // executor 从 ComponentVersion.Spec.Type 选择对应的 Executor
-    // binary → BinaryComponentExecutor (SSH 逐节点执行)
-    // yaml   → YamlComponentExecutor (K8s API Apply)
-    // helm   → HelmComponentExecutor (Helm SDK)
-    // staticpod → StaticPodComponentExecutor (Static Pod 拉起)
-    // inline → InlineComponentExecutor (Phase handler)
+    Name          string
+    Version       string
+    Inline        *InlineRef         // 仅 inline 类型使用
+    FailurePolicy FailurePolicy      // 失败策略: FailFast / Continue / Rollback
+    Dependencies  []string           // 依赖的组件名称列表
 }
 
-func (n *ComponentNode) Name() string           { return n.name }
-func (n *ComponentNode) Type() DAGNodeType      { return DAGNodeComponent }
-func (n *ComponentNode) Dependencies() []string  { return n.deps }
-
-// Execute 根据组件类型选择对应的 Executor 执行
-// 节点级并发由各 Executor 内部控制（如 BinaryComponentExecutor 的 Rolling/Batch 策略）
-func (n *ComponentNode) Execute(ctx context.Context, execCtx *ExecutionContext) error {
-    return execCtx.ComponentSM.Execute(ctx, n.component)
+// UpgradeDAG 是升级依赖图，包含组件元数据
+type UpgradeDAG struct {
+    graph *Graph                         // 底层有向无环图
+    nodes map[string]*ComponentNode      // 组件名 → 节点
 }
 ```
+
+```go
+// pkg/topology/graph.go (已有，直接复用)
+
+// Graph 是有向无环图，用于升级调度
+// 边 From -> To 表示 From 必须在 To 之前完成
+type Graph struct {
+    nodes    map[string]struct{}
+    outEdges map[string]map[string]struct{}
+    inDegree map[string]int
+}
+```
+
+```go
+// pkg/topology/build.go (已有，直接复用)
+
+// DependencyResolver 返回指定组件的前置依赖名称列表
+type DependencyResolver func(componentName, version string) ([]string, error)
+
+// BuildUpgradeDAG 从 ReleaseImage 升级组件列表构建升级 DAG
+func BuildUpgradeDAG(
+    components []cvv1alpha1.ReleaseImageUpgradeComponent,
+    resolve DependencyResolver,
+) (*UpgradeDAG, error)
+```
+
+```go
+// pkg/dagexec/executor.go (已有，直接复用)
+
+// ComponentExecutor 运行一种组件类型的升级操作
+// Scheduler 通过 ExecutorRegistry 按 ComponentType 分发到对应 Executor
+type ComponentExecutor interface {
+    ExecuteComponent(ctx context.Context, node *topology.ComponentNode, execCtx *ExecutionContext) error
+    GetComponentType() ComponentType
+}
+```
+
+```go
+// pkg/dagexec/registry.go (已有，直接复用)
+
+// ExecutorRegistry 将 ComponentType 映射到 ComponentExecutor
+type ExecutorRegistry struct {
+    mu        sync.RWMutex
+    executors map[ComponentType]ComponentExecutor
+}
+```
+
+**组件类型与 Executor 的映射**：
+
+```go
+// pkg/dagexec/scheduler.go — resolveComponentType 已有逻辑
+// ComponentNode 本身不含 Type 字段，Scheduler 通过 ComponentVersionStore
+// 加载 ComponentVersion 后读取 cv.Spec.Type 确定组件类型，
+// 再从 ExecutorRegistry 获取对应的 ComponentExecutor 执行。
+
+// api/v1alpha1/componentversion_types.go — CRD 层组件类型 (4 值)
+type ComponentType string
+const (
+    ComponentTypeYAML   ComponentType = "yaml"
+    ComponentTypeHelm   ComponentType = "helm"
+    ComponentTypeInline ComponentType = "inline"
+    ComponentTypeBinary ComponentType = "binary"
+)
+
+// 后续新增 (KEP-15/KEP-17):
+// ComponentTypeComposite ComponentType = "composite"  // DAG 构建时展开
+// ComponentTypeSelector  ComponentType = "selector"   // DAG 构建时按 condition 选择
+```
+
+**Scheduler 执行流程**（复用已有逻辑，无需新增 DAGNode 接口）：
+
+```go
+// pkg/dagexec/scheduler.go (已有)
+
+// Scheduler.ExecuteDAG 按拓扑批次执行 DAG
+// 同一批次内的 ComponentNode 并行执行，批次间串行
+func (s *Scheduler) ExecuteDAG(ctx context.Context, execCtx *ExecutionContext, dag *topology.UpgradeDAG) error {
+    batches, err := dag.TopologicalBatches()
+    // ... 逐批次并行执行 ComponentNode ...
+    for _, batch := range batches {
+        for _, name := range batch {
+            node, _ := dag.GetNode(name)
+            // resolveComponentType 通过 CVStore 加载 ComponentVersion
+            // 读取 cv.Spec.Type，从 Registry 获取 Executor
+            executor, _ := s.Registry.Get(s.resolveComponentType(ctx, node))
+            executor.ExecuteComponent(ctx, node, execCtx)
+        }
+    }
+}
+```
+
+**与旧设计的区别**：
+
+| 维度 | 旧设计 (v4 原版) | 新设计 (复用代码库) |
+|------|-----------------|-------------------|
+| **DAG 节点类型** | `ClusterComponentNode` + `NodeGroupNode` (两种) | `topology.ComponentNode` (统一一种) |
+| **DAGNode 接口** | 新增 `DAGNode` interface + `DAGNodeType` enum | 不需要，Scheduler 直接操作 `*ComponentNode` |
+| **节点执行** | 各节点类型各自实现 `Execute()` | `ComponentExecutor.ExecuteComponent()` 统一接口 |
+| **类型分发** | 节点类型固定 | `ExecutorRegistry` 按 `ComponentType` 动态分发 |
+| **节点级并发** | `NodeGroupNode` 包装层 | `BinaryComponentExecutor` 内部 `upgradeStrategy.mode` |
 
 
 ### 2.4 三层状态机引擎架构
@@ -438,92 +535,97 @@ type ComponentStateMachine struct {
 
 ### 4.2 DAG 执行器
 
-```go
-// DAGExecutor DAG 执行器
-type DAGExecutor struct {
-    client   client.Client
-    recorder record.EventRecorder
-}
+> **复用说明**：以下结构直接复用代码库中已有的 `topology.UpgradeDAG`、`topology.ComponentNode`、`dagexec.Scheduler`、`dagexec.ExecutorRegistry`，无需新增 `DAGExecutor`/`DAGNode`/`DAGNodeType` 等类型。
 
-// BuildDAG 从 ReleaseImage 构建 DAG
-// BuildDAG 从 ReleaseImage 构建 DAG
+```go
+// pkg/topology/build.go (已有)
+// DependencyResolver 返回指定组件的前置依赖名称列表
+type DependencyResolver func(componentName, version string) ([]string, error)
+
+// BuildUpgradeDAG 从 ReleaseImage 升级组件列表构建升级 DAG
 // composite/selector 类型在构建时展开为子组件节点，自身不产生 DAG 节点
 // 所有组件（binary/yaml/helm/staticpod/inline）均为统一的 ComponentNode
-func (e *DAGExecutor) BuildDAG(releaseImage *ReleaseImage) (*ExecutionDAG, error) {
-    dag := NewExecutionDAG()
+func BuildUpgradeDAG(
+    components []cvv1alpha1.ReleaseImageUpgradeComponent,
+    resolve DependencyResolver,
+) (*UpgradeDAG, error)
 
-    // 1. 展开 composite 组件（KEP-15）
-    //    composite 自身不产生 DAG 节点，展开为子组件
-    expandedComponents := expandCompositeComponents(releaseImage.Spec.Components)
+// DAG 构建增强（KEP-15 composite 展开）:
+// 1. 展开 composite 组件为子组件
+//    expandCompositeComponents(releaseImage.Spec.Components)
+//    composite 自身不产生 DAG 节点，展开为子组件
+// 2. 展开后的子组件作为 ReleaseImageUpgradeComponent 传入 BuildUpgradeDAG
+// 3. BuildUpgradeDAG 内部为每个组件创建 topology.ComponentNode 并构建依赖边
+```
 
-    // 2. 添加所有组件为统一的 ComponentNode（不再区分 cluster/node scope）
-    for _, comp := range expandedComponents {
-        cv := lookupComponentVersion(comp.Name, comp.Version)
-        dag.AddNode(&ComponentNode{
-            name:      comp.Name,
-            component: cv,
-            deps:      cv.Spec.Dependencies,
-        })
-    }
+```go
+// pkg/dagexec/scheduler.go (已有)
 
-    // 3. 构建依赖边（复用现有逻辑）
-    dag.BuildEdges()
-
-    return dag, nil
+// Scheduler 执行升级组件，按拓扑 DAG 调度
+type Scheduler struct {
+    InlineRunner        InlineRunner
+    ManifestStore       manifest.Store
+    ManifestApplier     manifest.Applier
+    MaxParallelPerBatch int
+    Registry            *ExecutorRegistry       // 按 ComponentType 分发到 ComponentExecutor
+    CVStore             ComponentVersionStore   // 加载 ComponentVersion 确定组件类型
 }
 
-// ExecuteDAG 执行 DAG
-func (e *DAGExecutor) ExecuteDAG(ctx context.Context, dag *ExecutionDAG, execCtx *ExecutionContext) error {
-    // 拓扑排序
-    batches := dag.TopologicalSort()
-    
+// ExecuteDAG 按拓扑批次执行 DAG (已有)
+// 同一批次内的 ComponentNode 并行执行，批次间串行
+// 不再需要 DAGNode 接口，Scheduler 直接操作 *topology.ComponentNode
+func (s *Scheduler) ExecuteDAG(
+    ctx context.Context,
+    execCtx *ExecutionContext,
+    dag *topology.UpgradeDAG,
+) error {
+    batches, err := dag.TopologicalBatches()
+    // 逐批次并行执行
     for _, batch := range batches {
-        // 同一批次内的节点并行执行
-        var wg sync.WaitGroup
-        errChan := make(chan error, len(batch))
-        
-        for _, node := range batch {
-            wg.Add(1)
-            go func(n DAGNode) {
-                defer wg.Done()
-                if err := n.Execute(ctx, execCtx); err != nil {
-                    errChan <- err
-                }
-            }(node)
-        }
-        
-        wg.Wait()
-        close(errChan)
-        
-        // 检查错误
-        for err := range errChan {
-            if err != nil {
-                return err
+        for _, name := range batch {
+            node, _ := dag.GetNode(name)
+            // resolveComponentType 通过 CVStore 加载 ComponentVersion
+            // 读取 cv.Spec.Type，从 Registry 获取对应 Executor
+            typ := s.resolveComponentType(ctx, node)
+            executor, ok := s.Registry.Get(typ)
+            if !ok {
+                // 回退到 Inline/Manifest 路径
             }
+            executor.ExecuteComponent(ctx, node, execCtx)
         }
     }
-    
-    return nil
 }
 ```
 
 ### 4.3 DAG 节点执行
 
+> **复用说明**：`ComponentNode` 不含 `Execute()` 方法，执行逻辑由 `ComponentExecutor` 接口承担。Scheduler 通过 `ComponentVersionStore` 加载 `ComponentVersion` 确定组件类型，再从 `ExecutorRegistry` 获取对应 Executor。
+
 ```go
-// ComponentNode.Execute 执行组件节点
-// 根据组件类型选择对应的 Executor：
-// - binary: BinaryComponentExecutor (SSH 逐节点执行，内部支持 Rolling/Batch/Parallel)
-// - yaml: YamlComponentExecutor (K8s API Apply 到集群)
-// - helm: HelmComponentExecutor (Helm SDK install/upgrade)
-// - staticpod: StaticPodComponentExecutor (Static Pod 拉起/替换)
-// - inline: InlineComponentExecutor (Phase handler)
-//
-// 节点级并发由 BinaryComponentExecutor.upgradeStrategy.mode 控制，
-// 不再需要 NodeGroupNode 包装层。
-func (n *ComponentNode) Execute(ctx context.Context, execCtx *ExecutionContext) error {
-    // 直接执行组件级状态机，由状态机选择对应的 Executor
-    comp := execCtx.GetComponentStatus(n.name)
-    return execCtx.ComponentSM.Execute(ctx, comp, n.component)
+// pkg/dagexec/executor.go (已有)
+
+// ComponentExecutor 运行一种组件类型的升级操作
+type ComponentExecutor interface {
+    ExecuteComponent(ctx context.Context, node *topology.ComponentNode, execCtx *ExecutionContext) error
+    GetComponentType() ComponentType
+}
+
+// 各 Executor 实现 (已有或按 KEP-16/KEP-9 新增):
+// - BinaryComponentExecutor:    SSH 逐节点执行，内部支持 Rolling/Batch/Parallel
+// - YamlComponentExecutor:      K8s API Apply 到集群
+// - HelmComponentExecutor:      Helm SDK install/upgrade
+// - StaticPodComponentExecutor: Static Pod 拉起/替换 (KEP-9)
+// - InlineComponentExecutor:    Phase handler 执行
+
+// pkg/dagexec/scheduler.go (已有)
+// resolveComponentType 通过 CVStore 加载 ComponentVersion，读取 cv.Spec.Type
+// 转换为 dagexec.ComponentType 后从 Registry 获取 Executor
+func (s *Scheduler) resolveComponentType(
+    ctx context.Context,
+    node *topology.ComponentNode,
+) ComponentType {
+    cv, _ := s.CVStore.GetComponentVersion(ctx, node.Name, node.Version)
+    return ComponentType(cv.Spec.Type)  // api ComponentType → dagexec ComponentType
 }
 ```
 
