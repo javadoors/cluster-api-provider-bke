@@ -2228,91 +2228,27 @@ func setBKEMachineCAPIConditions(machine *bkev1beta1.BKEMachine) {
 
 | 维度 | v4 设计 | v5 设计 |
 |------|--------|--------|
-| **节点级状态机执行位置** | BKECluster Controller 直接执行 | 集群层通过 DAG 的 node-group 节点驱动 |
-| **节点组节点职责** | 直接执行节点级状态机 | 创建/更新 BKEMachine + 等待节点状态机完成 |
-| **节点状态追踪** | BKECluster.Status.NodeStatuses | BKEMachine.Status（由 BKEMachine Controller 更新） |
-| **组件状态追踪** | BKECluster.Status.ComponentStatuses | BKEMachine.Status.ComponentStatuses |
-| **CAPI 集成深度** | 浅层集成 | 深度集成，完全遵循 CAPI 模式 |
-| **驱动方式** | 直接调用 | 通过 BKEMachine 资源协调 |
+| **节点级组件管理** | composite 封装（KEP-15），DAG 构建时展开 | 同 v4，复用 composite + 统一 ComponentNode |
+| **节点状态回写** | syncNodeStatus（DAG 执行后聚合） | 同 v4 |
+| **L2 角色** | 默认路径不参与，Watch 触发可选 | 同 v4，保留故障恢复和状态查询 |
+| **BKEMachine 集成** | syncNodeStatus 直接写 CR + CAPI Conditions | 同 v4 |
+| **DAG 构建拆分** | buildInstallDAG/buildUpgradeDAG/buildScalingDAG/buildRollbackDAG | 同 v4 |
+| **CAPI 集成深度** | 轻量集成，复用现有 Controller | 同 v4 |
+| **架构定位** | 三层状态机引擎（BKECluster/BKEMachine/Component） | 同 v4，以 KEP-15 composite 为节点组件管理标准 |
 
 ### 8.3 核心设计要点
 
-1. **集群层驱动节点层**：node-group 节点在 DAG 中执行时，会等待 BKEMachine Controller 完成节点层状态机执行
+1. **统一 DAG 调度**：所有组件（staticpod/binary/helm/yaml）作为统一的 `ComponentNode` 参与 DAG 拓扑排序，composite 在构建时展开为子组件
 
-2. **轮询等待机制**：node-group 节点通过轮询 BKEMachine.Status 来等待节点层状态机完成
+2. **L1 直接操作 L3**：Scheduler 通过 `BinaryComponentExecutor`/`StaticPodComponentExecutor`/`HelmComponentExecutor`/`YamlComponentExecutor` 直接执行组件操作，默认路径中 L2 NodeStateMachine 不参与
 
-3. **状态聚合**：node-group 节点将 BKEMachine.Status 聚合到 BKECluster.Status.NodeStatuses
+3. **节点状态回写**：`syncNodeStatus` 在 DAG 执行后聚合组件状态为节点状态，直接写入 BKEMachine CR 和 CAPI Conditions
 
-4. **BKEMachine Controller 独立执行**：BKEMachine Controller 独立驱动 L2/L3 状态机，与 BKECluster Controller 解耦
+4. **节点级并发**：binary 组件的逐节点/分批/全并行由 `BinaryComponentExecutor` 内部的 `upgradeStrategy.mode` 控制
 
-### 8.4 v4 后续设计演进（同步自 kep6-state-machine-v4.md）
-
-> 以下设计变更已在 v4 文档中完成，v5 文档需同步评估是否采纳。
-
-#### 8.4.1 移除 ClusterComponentNode/NodeGroupNode，统一为 ComponentNode
-
-v4 后续演进中移除了 `ClusterComponentNode` 和 `NodeGroupNode` 两种 DAG 节点类型，统一为代码库已有的 `topology.ComponentNode`：
-
-- **yaml/helm 本身就是集群类型**：通过 K8s API 或 Helm SDK 部署到集群，无需 `ClusterComponentNode` 包装
-- **binary 组件本身就是 Node 类型**：通过 SSH 在节点上执行，`BinaryComponentExecutor` 内部已支持 Rolling/Parallel/Batch 节点级并发，无需 `NodeGroupNode` 包装
-- **composite 封装**：K8s 核心组件和节点二进制组件通过 `composite` 类型（KEP-15）组合管理，DAG 构建时展开为子组件节点
-
-**对 v5 的影响**：v5 的 node-group 设计可被 composite + 统一 ComponentNode 替代，node-group 节点的"创建 BKEMachine + 等待完成"职责由 `syncNodeStatus` 承担。
-
-#### 8.4.2 syncNodeStatus 节点状态回写
-
-v4 引入 `syncNodeStatus` 机制解决 DAG 内联路径中跳过 L2 导致节点状态缺失的问题：
-
-1. **组件级状态**：`BinaryComponentExecutor` 内部的 `NodeStatusUpdater` 在每个节点执行前后写入 `NodeComponentStatuses`
-2. **节点级聚合**：DAG 执行完成后 `syncNodeStatus` 调用 `evaluateNodePhase` 聚合为 `NodePhase`
-3. **CAPI Conditions**：`syncNodeStatus` 在 Patch BKEMachine CR 时直接写入 `ReadyCondition`，不需要 BKEMachine Controller Watch
-
-**对 v5 的影响**：v5 的 node-group 轮询等待机制可被 `syncNodeStatus` 替代，避免轮询开销。
-
-#### 8.4.3 DAG 内联扩缩容（默认路径）+ Watch 触发（可选路径）
-
-v4 将扩缩容统一为 DAG 内联路径（默认），同时保留 BKEMachine Watch 触发作为可选路径：
-
-| 路径 | 触发场景 | 触发方式 | Feature Gate |
-|------|---------|---------|-------------|
-| **DAG 内联（默认）** | 安装/升级/扩缩容 | `Scheduler.ExecuteDAG` + `syncNodeStatus` | 默认启用 |
-| **Watch 触发（可选）** | 扩缩容 | 更新 BKEMachine CR Status → BKEMachine Controller L2 | `ScalingWatchTriggerEnabled` |
-
-**对 v5 的影响**：v5 的 node-group 驱动模式本质上是 Watch 触发路径的变体。v5 可将 node-group 作为可选路径，DAG 内联作为默认路径，通过 Feature Gate 切换。
-
-#### 8.4.4 buildInstallDAG/buildUpgradeDAG/buildScalingDAG/buildRollbackDAG 拆分
-
-v4 将单一 `buildDAG` 拆分为四个独立构建器：
-
-| 构建器 | 组件来源 | composite 处理 | VersionContext |
-|--------|---------|---------------|----------------|
-| `buildInstallDAG` | `install.components` | 全部子组件 | Current 为空 |
-| `buildUpgradeDAG` | `upgrade.components` | 全部 + deferred | Current 有值 |
-| `buildScalingDAG` | 当前版本 binary 组件 | 仅 binary 子组件 | 新节点 Current 为空 |
-| `buildRollbackDAG` | 旧版本 `upgrade.components` | 全部子组件 | Current/Target 交换 |
-
-#### 8.4.5 evaluateClusterPhase/evaluateNodePhase/evaluateComponentPhase 设计与实现
-
-v4 为三层状态机的 `evaluate*Phase` 函数补充了完整的设计思路和实现：
-
-- **evaluateClusterPhase**：外部触发 + DAG 执行结果两维驱动，5 级优先级（Failed → 回滚 → 中间态保持 → 版本比较 → 稳态）
-- **evaluateNodePhase**：自底向上聚合组件状态，8 条状态聚合规则
-- **evaluateComponentPhase**：版本比较 + 操作动作驱动，Failed 不自愈
-
-#### 8.4.6 复用代码库已有结构
-
-v4 后续演进中复用代码库已有结构，不重新发明：
-
-| 代码库结构 | 文件位置 | 用途 |
-|-----------|---------|------|
-| `topology.ComponentNode` | `pkg/topology/component.go:36` | DAG 顶点 |
-| `topology.UpgradeDAG` | `pkg/topology/component.go:45` | 升级依赖图 |
-| `topology.BuildUpgradeDAG` | `pkg/topology/build.go:25` | DAG 构建入口 |
-| `dagexec.ComponentExecutor` | `pkg/dagexec/executor.go:31` | 组件执行器接口 |
-| `dagexec.ExecutorRegistry` | `pkg/dagexec/registry.go:21` | 按类型分发 |
-| `dagexec.Scheduler.ExecuteDAG` | `pkg/dagexec/scheduler.go:99` | DAG 执行器 |
+5. **BKEMachine Controller 保留角色**：默认路径中为空操作（状态已达成直接跳过），可选路径（Watch 触发）中恢复 L2 执行职责，另保留单节点故障恢复和状态查询功能
 
 ---
 
-**文档版本**: v5.2  
+**文档版本**: v5.2
 **维护者**: openFuyao Team
