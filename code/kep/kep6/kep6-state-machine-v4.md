@@ -664,7 +664,7 @@ func (s *Scheduler) resolveComponentType(
 func (sm *NodeStateMachine) Execute(ctx context.Context, node *BKENode, components []*ComponentVersion) error {
     // 1. 评估节点状态转换
     oldPhase := node.Status.LifecyclePhase
-    newPhase := sm.evaluateNodePhase(node)
+    newPhase := sm.evaluateNodePhase(node, components)
     
     if oldPhase != newPhase {
         node.Status.LifecyclePhase = newPhase
@@ -712,6 +712,182 @@ func (sm *NodeStateMachine) executeNodeComponents(
     return nil
 }
 ```
+
+#### 4.4.1 evaluateNodePhase 设计思路
+
+**设计思路 — 自底向上的状态聚合**：
+
+`evaluateNodePhase` 是节点层状态机的核心决策函数，负责根据组件层（L3）状态和外部触发条件推断节点层（L2）状态。其设计遵循以下原则：
+
+1. **组件状态优先，外部触发其次**：函数首先扫描该节点所有组件的 `ComponentLifecyclePhase`，根据组件状态聚合判断节点状态。只有当组件状态不足以决定时（如全部 Installed 但有升级触发），才检查外部触发条件（如 `desiredVersion != currentVersion`）。
+2. **优先级从严到宽**：判断顺序为 Failed → Installing/Upgrading/Deleting → Pending → Ready。任一组件 Failed 则节点 Failed（最严），任一组件正在执行则节点处于对应操作中，全部 Installed 且无升级触发则 Ready（最宽）。这种顺序保证节点状态始终反映最严重的组件状态。
+3. **幂等性保证**：当所有组件已 Installed 且目标版本等于当前版本时，`evaluateNodePhase` 返回 `Ready`，`Execute` 的 switch 语句不匹配任何 case（Ready 不是操作态），直接返回 nil——不会重复执行安装/升级。
+4. **扩容场景的 Provisioning 判定**：新节点加入时，所有组件状态为空（无 ComponentLifecycleStatus 记录），`evaluateNodePhase` 将其判定为 `Provisioning`（环境准备中），触发组件安装流程。安装完成后组件状态变为 Installed，节点状态聚合为 Ready。
+
+**状态聚合规则矩阵**：
+
+| 组件状态组合 | 节点状态 | 判定逻辑 |
+|------------|---------|---------|
+| 任一组件 Failed | `Failed` | 最高优先级，立即终止 |
+| 任一组件 Installing 且无 Failed | `Provisioning` | 首次安装进行中 |
+| 任一组件 Upgrading 且无 Failed | `Upgrading` | 升级进行中 |
+| 任一组件 Deleting 且无 Failed | `Deleting` | 卸载进行中 |
+| 全部 Installed + desiredVersion != currentVersion | `Upgrading` | 版本变更触发升级 |
+| 全部 Installed + desiredVersion == currentVersion | `Ready` | 稳态，无操作 |
+| 全部 Pending（新节点） | `Provisioning` | 新节点首次安装 |
+| 节点删除标记为 true | `Deleting` | 外部删除触发 |
+
+#### 4.4.2 evaluateNodePhase 实现
+
+```go
+// evaluateNodePhase 评估节点生命周期阶段
+// 自底向上聚合组件状态，结合外部触发条件推断节点状态
+//
+// 判断优先级 (从严到宽):
+//   1. Deleting (外部删除触发)
+//   2. Failed (任一组件 Failed)
+//   3. Provisioning (任一组件 Installing)
+//   4. Upgrading (任一组件 Upgrading)
+//   5. Deleting (任一组件 Deleting — 组件级卸载)
+//   6. Upgrading (全部 Installed + 版本变更)
+//   7. Provisioning (全部 Pending — 新节点)
+//   8. Ready (全部 Installed + 版本一致)
+func (sm *NodeStateMachine) evaluateNodePhase(
+    node *BKENode,
+    components []*ComponentVersion,
+) NodeLifecyclePhase {
+    // 1. 外部删除触发优先
+    if node.Spec.Deleted {
+        return NodePhaseDeleting
+    }
+
+    // 2. 收集组件状态
+    componentStatuses := node.Status.ComponentStatuses
+    if len(componentStatuses) == 0 && len(components) > 0 {
+        // 新节点：无组件状态记录，首次安装
+        return NodePhaseProvisioning
+    }
+
+    hasFailed := false
+    hasInstalling := false
+    hasUpgrading := false
+    hasDeleting := false
+    allInstalled := true
+
+    for _, comp := range components {
+        status, exists := componentStatuses[comp.Name]
+        if !exists {
+            // 组件无状态记录 → 视为 Pending，未完成安装
+            allInstalled = false
+            hasInstalling = true // 待安装等同于 Installing 语义
+            continue
+        }
+
+        switch status.Phase {
+        case CompPhaseFailed:
+            hasFailed = true
+        case CompPhaseInstalling:
+            hasInstalling = true
+            allInstalled = false
+        case CompPhaseUpgrading:
+            hasUpgrading = true
+            allInstalled = false
+        case CompPhaseDeleting:
+            hasDeleting = true
+            allInstalled = false
+        case CompPhaseInstalled:
+            // 已安装，继续检查其他组件
+        case CompPhasePending:
+            allInstalled = false
+            hasInstalling = true
+        }
+    }
+
+    // 3. 按优先级返回节点状态
+
+    // 3a. 任一组件 Failed → 节点 Failed
+    if hasFailed {
+        return NodePhaseFailed
+    }
+
+    // 3b. 任一组件 Installing → 节点 Provisioning (首次安装进行中)
+    if hasInstalling {
+        return NodePhaseProvisioning
+    }
+
+    // 3c. 任一组件 Upgrading → 节点 Upgrading (升级进行中)
+    if hasUpgrading {
+        return NodePhaseUpgrading
+    }
+
+    // 3d. 任一组件 Deleting → 节点 Deleting (组件级卸载进行中)
+    if hasDeleting {
+        return NodePhaseDeleting
+    }
+
+    // 3e. 全部 Installed → 检查是否需要升级
+    if allInstalled {
+        // 检查版本变更触发升级
+        if sm.hasVersionChange(node, components) {
+            return NodePhaseUpgrading
+        }
+        // 稳态：所有组件已安装且版本一致
+        return NodePhaseReady
+    }
+
+    // 3f. 兜底：状态不明确时保持 Provisioning
+    return NodePhaseProvisioning
+}
+
+// hasVersionChange 检查是否有组件的目标版本与当前安装版本不一致
+func (sm *NodeStateMachine) hasVersionChange(
+    node *BKENode,
+    components []*ComponentVersion,
+) bool {
+    componentStatuses := node.Status.ComponentStatuses
+    for _, comp := range components {
+        status, exists := componentStatuses[comp.Name]
+        if !exists {
+            return true // 组件未安装，需要安装
+        }
+        // 已安装版本与目标版本不一致 → 需要升级
+        if status.Version != comp.Spec.Version {
+            return true
+        }
+    }
+    return false
+}
+```
+
+**evaluateNodePhase 与 Execute 的协作**：
+
+```go
+// evaluateNodePhase 返回值 → Execute switch 分支映射:
+//
+// Provisioning  → executeNodeComponents(ActionInstall)   首次安装
+// Upgrading     → executeNodeComponents(ActionUpgrade)   版本升级
+// Deleting      → executeNodeComponents(ActionUninstall) 卸载
+// Ready         → 无匹配 case，直接返回 nil               稳态，无操作
+// Failed        → 无匹配 case，直接返回 nil               等待人工介入
+// Pending       → 无匹配 case，直接返回 nil               等待 Agent 推送
+//
+// 设计说明: Ready/Failed/Pending 不是操作态，Execute 中无对应 case，
+// evaluateNodePhase 返回这些状态时 Execute 直接返回 nil，不执行任何操作。
+// 这保证了幂等性——稳态节点 Reconcile 不会触发误操作。
+```
+
+**边界情况处理**：
+
+| 场景 | 组件状态 | evaluateNodePhase 返回值 | Execute 行为 |
+|------|---------|------------------------|-------------|
+| 新节点首次安装 | 无状态记录 | `Provisioning` | 安装所有组件 |
+| 安装中部分失败 | bkeagent=Installed, containerd=Failed | `Failed` | 不执行（等待人工介入） |
+| 安装中部分进行中 | bkeagent=Installed, containerd=Installing | `Provisioning` | 继续安装未完成组件 |
+| 全部安装完成 | 全部 Installed, 版本一致 | `Ready` | 无操作（幂等跳过） |
+| 版本变更触发升级 | 全部 Installed, containerd 版本不一致 | `Upgrading` | 升级版本不一致的组件 |
+| 升级中部分失败 | bkeagent=Upgrading, containerd=Failed | `Failed` | 不执行（等待人工介入） |
+| 节点删除 | Deleted=true | `Deleting` | 卸载所有组件 |
+| 组件部分卸载 | bkeagent=Deleting, containerd=Installed | `Deleting` | 继续卸载未完成组件 |
 
 ### 4.5 组件层状态机执行
 
