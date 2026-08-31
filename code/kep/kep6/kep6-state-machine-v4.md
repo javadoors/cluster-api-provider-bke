@@ -1777,6 +1777,13 @@ groups:
 
 ### 6.1 与 CAPI 的集成架构
 
+**设计思路 — 双 Controller 分工协作，各驱动一层状态机**：
+
+1. **BKECluster Controller 驱动 L1，BKEMachine Controller 驱动 L2/L3**：集群级操作（安装/升级/回滚的 DAG 调度）由 BKECluster Reconciler 触发 `ClusterStateMachine.Execute`；节点级操作（单节点组件安装/升级/卸载）由 BKEMachine Reconciler 触发 `NodeStateMachine.Execute`。两个 Controller 各自独立 Reconcile，通过 Watch BKECluster/BKEMachine CR 变化协调，无需直接调用。
+2. **StateMachineEngine 共享实例**：两个 Controller 共享同一个 `StateMachineEngine` 实例（包含 `ClusterStateMachine`/`NodeStateMachine`/`ComponentStateMachine`），但调用不同的入口方法。引擎实例无状态（状态存储在 CR Status 中），共享实例不产生并发安全问题。
+3. **Watch 而非直接调用**：BKEMachine Controller 不通过 RPC 调用 BKECluster Controller，而是通过 Watch BKEMachine CR 的状态变化间接感知集群操作。BKECluster Controller 执行 DAG 时更新 BKEMachine 的 `NodeComponents` 字段，BKEMachine Controller Watch 到变化后触发节点层状态机执行。这种松耦合设计是 CAPI 的标准模式。
+4. **CAPI 标准兼容**：BKECluster/BKEMachine 作为 CAPI Infrastructure Provider 的自定义资源，遵循 CAPI 的 Reconcile + Conditions + Patch 模式。状态机引擎的输出通过 CAPI 标准字段（`ReadyCondition`/`InfrastructureReadyCondition`）暴露给上层 CAPI Controller。
+
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │                        Cluster API 集成架构                                      │
@@ -1821,6 +1828,13 @@ groups:
 ```
 
 ### 6.2 BKECluster Controller 集成
+
+**设计思路 — Reconcile 作为状态机的唯一触发入口**：
+
+1. **PatchHelper 保证 Status 一致性**：Reconcile 使用 `patch.NewHelper` 创建 PatchHelper，在函数退出时 defer Patch。状态机引擎执行过程中对 `cluster.Status` 的修改（如 `LifecyclePhase` 转换、`CurrentVersion` 更新）在 defer Patch 时一次性写入，避免多次 API 调用和中间状态可见性。如果 Reconcile 因 panic 退出，PatchHelper 不会执行，Status 保持上一次成功 Patch 的状态，保证一致性。
+2. **引擎执行错误不中断 Reconcile**：`engine.Execute` 返回错误时，Reconcile 不直接 `return err`（那样会导致 Requeue 间隔内 Status 未被 Patch），而是记录 Event 并继续执行后续步骤（同步旧字段、记录指标）。这样即使状态机执行失败，集群的当前状态（如 Installing/Failed）也会被 Patch 到 CR 中，用户和 CAPI 上层 Controller 能观测到。
+3. **SyncLegacyFields 向后兼容**：状态机引擎输出的 `LifecyclePhase` 等新字段需要同步到现有代码使用的旧字段（如 `Status.Phase`/`Status.Ready` 等），保证未迁移到状态机的代码路径不受影响。这是 Feature Gate 灰度迁移的关键——新旧字段共存，逐步移除旧字段。
+4. **decideRequeue 控制重试节奏**：Requeue 间隔由集群状态决定——Installing/Upgrading 状态快速 Requeue（如 10s），Running/Failed 状态慢速 Requeue（如 5min）或不 Requeue。这保证了操作进行中的集群能快速推进，稳态集群不浪费 Reconcile 资源。
 
 ```go
 // BKEClusterReconciler 集成状态机引擎
@@ -1873,6 +1887,13 @@ func (r *BKEClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 ```
 
 ### 6.3 BKEMachine Controller 集成
+
+**设计思路 — 节点层状态机独立 Reconcile，服务于扩缩容与单节点生命周期**：
+
+1. **BKEMachine Reconcile 与 DAG 调度的关系**：集群级升级时，BKECluster Controller 通过 `Scheduler.ExecuteDAG` 统一调度所有组件（包括节点级 binary 组件），BKEMachine Controller 不参与升级 DAG 执行。BKEMachine Reconcile 主要服务于两个场景：① 节点扩容——新 BKEMachine 创建后触发节点层状态机执行组件安装；② 节点缩容——BKEMachine 删除标记触发节点层状态机执行组件卸载。两条路径（DAG 调度 vs BKEMachine Reconcile）互补，不冲突。
+2. **nodeComponents 从 ReleaseImage 解析**：`getNodeComponents` 从当前 ReleaseImage 展开 composite 后过滤出 binary 类型组件。这与 §4.4.3 的设计一致——不再使用 `NodeGroupNode` 或 `ComponentScopeNode` 过滤，而是通过组件类型（binary）确定节点级组件。组件列表按依赖关系拓扑排序后传入 `NodeStateMachine.Execute`。
+3. **BKEMachine 与 BKENode 的双向转换**：`machine.ToBKENode()` 将 CAPI BKEMachine CR 转换为状态机引擎使用的 `BKENode` 内部结构，`machine.UpdateFromBKENode(node)` 将状态机执行后的 `BKENode` 状态同步回 BKEMachine CR。这种转换隔离了 CAPI CR 结构与状态机内部数据模型——状态机引擎不依赖 CAPI 类型，仅操作 `BKENode`，便于独立测试。
+4. **topologicalSort 复用已有实现**：节点内组件排序复用 `pkg/topology` 包的拓扑排序逻辑，不重新实现。排序仅考虑节点级组件间的依赖（如 bkeagent → containerd → kubelet），忽略对集群级组件的依赖（如 kubelet → kube-apiserver），因为集群级组件由 DAG 调度器保证在节点级组件之前完成。
 
 ```go
 // BKEMachineReconciler 集成节点层状态机
@@ -2050,6 +2071,13 @@ func isNodeComponent(components []*ComponentVersion, name string) bool {
 ```
 
 ### 6.4 CAPI 条件集成
+
+**设计思路 — 将三层状态映射为 CAPI 标准 Conditions**：
+
+1. **ReadyCondition 为唯一对外暴露条件**：CAPI Cluster Controller 和 Machine Controller 通过检查 `ReadyCondition` 判断集群/节点是否就绪。`setCAPIConditions` 将 `LifecyclePhase` 映射为 `ReadyCondition` 的 True/False + Reason，使 CAPI 上层无需感知 BKE 内部状态枚举。
+2. **操作中状态映射为 Info 级别**：Installing/Upgrading/Scaling 状态映射为 `ReadyCondition=False, Reason=OperationInProgress, Severity=Info`。CAPI 模式中 Info 级别表示"正在处理，非异常"，上层 Controller 不会将其视为故障，只是等待 ReadyCondition 变为 True。
+3. **Failed 状态映射为 Error 级别**：Failed 状态映射为 `ReadyCondition=False, Reason=OperationFailed, Severity=Error`。CAPI 上层 Controller 看到 Error 级别会触发告警或停止后续操作（如 MachineDeployment 不再扩容到故障集群）。
+4. **RollingBack 状态的特殊处理**：RollingBack 不在 `setCAPIConditions` 的 switch 中——它映射为 `ReadyCondition=False, Reason=RollingBack, Severity=Warning`（需新增 case）。Warning 级别表示"需要注意但非致命"，与 CAPI 对回滚操作的预期一致。
 
 ```go
 // 设置 CAPI 标准条件
