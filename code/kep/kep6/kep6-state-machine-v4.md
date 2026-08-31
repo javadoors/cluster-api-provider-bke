@@ -1840,9 +1840,19 @@ groups:
 | **DAG 内联执行** | 集群安装/升级 | Scheduler 通过 `BinaryComponentExecutor` 在 DAG 执行中直接 SSH 操作节点 | L3 组件安装/升级（不经过 L2） |
 | **BKEMachine Watch 触发** | 节点扩容/缩容 | L1 更新 BKEMachine.Status.NodePhase → BKEMachine Controller Watch → L2 Execute | L2 评估节点状态 → L3 组件安装/卸载 |
 
-**路径 1：DAG 内联执行（集群安装/升级）**
+#### 6.2.1 路径 1：DAG 内联执行（集群安装/升级）
+
+**设计思路 — 安装/升级时 L1 Scheduler 直接操作 L3，不经过 L2**：
 
 集群安装和升级时，L1 通过 `Scheduler.ExecuteDAG` 统一调度所有组件。binary 组件作为 DAG 中的独立 `ComponentNode`，由 `BinaryComponentExecutor` 直接在节点上 SSH 执行。此路径不经过 L2 `NodeStateMachine`——L1 的 Scheduler 直接操作 L3 Executor。
+
+**为什么安装/升级不走 Watch 触发而走 DAG 内联**：
+
+1. **依赖顺序保证**：安装/升级需要严格的跨组件依赖顺序（如 etcd → apiserver → kubelet），DAG 拓扑排序保证依赖在前。Watch 触发是各节点独立 Reconcile，无法保证跨节点、跨组件的依赖顺序。
+2. **节点级并发策略**：binary 组件升级需要 Rolling/Batch 策略（逐节点/分批），`BinaryComponentExecutor` 内部控制并发。Watch 触发下各 BKEMachine 独立 Reconcile，无法协调多节点间的并发节奏。
+3. **集群级组件与节点级组件的协调**：安装/升级时集群级组件（etcd/apiserver）和节点级组件（containerd/kubelet）需按统一 DAG 顺序执行。Watch 触发仅处理节点级组件，无法包含集群级组件。
+
+**执行流程**：
 
 ```
 BKECluster Reconcile
@@ -1857,9 +1867,19 @@ BKECluster Reconcile
                                 ← 不经过 NodeStateMachine (L2)
 ```
 
-**路径 2：BKEMachine Watch 触发（节点扩缩容）**
+#### 6.2.2 路径 2：BKEMachine Watch 触发（节点扩缩容）
 
-节点扩缩容时，L1 不通过 DAG 调度 binary 组件，而是更新 BKEMachine CR 的状态字段触发 L2：
+**设计思路 — 扩缩容时 L1 通过 CR Status 变化触发 L2 独立执行**：
+
+节点扩缩容时，L1 不通过 DAG 调度 binary 组件，而是更新 BKEMachine CR 的状态字段触发 L2。BKEMachine Controller Watch 到 `NodePhase` 变化后，在自身 Reconcile 中调用 `NodeStateMachine.Execute` 驱动 L2/L3 执行。
+
+**为什么扩缩容不走 DAG 内联而走 Watch 触发**：
+
+1. **仅涉及节点级组件**：扩容只安装新节点的 binary 组件，不涉及集群级组件变更，无需全局 DAG 调度。
+2. **节点独立性好**：新节点的组件安装不影响已有节点的运行状态，各节点可独立 Reconcile 并行安装。
+3. **CAPI 原生支持**：CAPI MachineDeployment/MachineSet 创建新 BKEMachine 时自动触发 BKEMachine Controller Reconcile，无需 BKECluster Controller 额外调度。
+
+**执行流程**：
 
 ```
 BKECluster Reconcile
@@ -1925,7 +1945,7 @@ case ClusterPhaseScaling:
     }
 ```
 
-**两条路径的协作关系**：
+#### 6.2.3 两条路径的协作对比
 
 | 维度 | DAG 内联执行 (路径 1) | Watch 触发 (路径 2) |
 |------|----------------------|-------------------|
@@ -1936,18 +1956,6 @@ case ClusterPhaseScaling:
 | **并发控制** | Scheduler 批次内并行 | 每个 BKEMachine 独立 Reconcile |
 | **幂等保证** | VersionContext.NeedsUpgrade | evaluateNodePhase + evaluateComponentPhase |
 | **状态回写** | BKECluster.Status.ComponentStatuses | BKEMachine.Status.ComponentStatuses |
-
-**为什么安装/升级不走 Watch 触发而走 DAG 内联**：
-
-1. **依赖顺序保证**：安装/升级需要严格的跨组件依赖顺序（如 etcd → apiserver → kubelet），DAG 拓扑排序保证依赖在前。Watch 触发是各节点独立 Reconcile，无法保证跨节点、跨组件的依赖顺序。
-2. **节点级并发策略**：binary 组件升级需要 Rolling/Batch 策略（逐节点/分批），`BinaryComponentExecutor` 内部控制并发。Watch 触发下各 BKEMachine 独立 Reconcile，无法协调多节点间的并发节奏。
-3. **集群级组件与节点级组件的协调**：安装/升级时集群级组件（etcd/apiserver）和节点级组件（containerd/kubelet）需按统一 DAG 顺序执行。Watch 触发仅处理节点级组件，无法包含集群级组件。
-
-**为什么扩缩容不走 DAG 内联而走 Watch 触发**：
-
-1. **仅涉及节点级组件**：扩容只安装新节点的 binary 组件，不涉及集群级组件变更，无需全局 DAG 调度。
-2. **节点独立性好**：新节点的组件安装不影响已有节点的运行状态，各节点可独立 Reconcile 并行安装。
-3. **CAPI 原生支持**：CAPI MachineDeployment/MachineSet 创建新 BKEMachine 时自动触发 BKEMachine Controller Reconcile，无需 BKECluster Controller 额外调度。
 
 ### 6.3 BKECluster Controller 集成
 
