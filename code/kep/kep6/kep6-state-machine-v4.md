@@ -2780,6 +2780,429 @@ func setCAPIConditions(cluster *bkev1beta1.BKECluster) {
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
+### 7.3 扩容流程
+
+**触发条件**：用户新增 BKENode（节点状态为 Pending），`desiredVersion == currentVersion` 且无其他操作触发。
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                          集群扩容完整流程                                         │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  用户: 新增 2 个 BKENode (node-3, node-4)                                        │
+│        节点 Agent 推送后 Status.LifecyclePhase = Pending                          │
+│                                                                                 │
+│  Reconcile #1                                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────────┐   │
+│  │ L1: ClusterStateMachine.Execute(cluster)                                │   │
+│  │                                                                          │   │
+│  │ 1. EvaluateClusterPhase: Running → Scaling                              │   │
+│  │    Condition: hasNodeCountChange = true (node-3/node-4 为 Pending)       │   │
+│  │    跳过: desiredVersion == currentVersion (版本未变)                      │   │
+│  │                                                                          │   │
+│  │ 2. BuildScalingDAG(ctx, cluster)                                         │   │
+│  │    └─ 仅 binary 组件 (cluster.Status.CurrentVersion != "" → 用 upgrade)  │   │
+│  │    └─ VersionContext: 新节点 Current 为空 → Install 语义                  │   │
+│  │    DAG: [bkeagent] → [containerd] → [kubelet]                            │   │
+│  │                                                                          │   │
+│  │ 3. ExecuteDAG(ctx, dag)                                                  │   │
+│  │    ┌─────────────────────────────────────────────────────────────────┐   │   │
+│  │    │ Batch 1: [bkeagent]   upgradeStrategy.mode = Parallel            │   │   │
+│  │    │   └─ BinaryComponentExecutor.ExecuteComponent()                   │   │   │
+│  │    │       ├─ NodeStatusUpdater.MarkPending(node-3, "bkeagent")        │   │   │
+│  │    │       ├─ NodeStatusUpdater.MarkPending(node-4, "bkeagent")        │   │   │
+│  │    │       ├─ SSH 并行执行 Install (node-3 + node-4 同时)               │   │   │
+│  │    │       ├─ NodeStatusUpdater.MarkSuccess(node-3, "bkeagent") ✓      │   │   │
+│  │    │       └─ NodeStatusUpdater.MarkSuccess(node-4, "bkeagent") ✓      │   │   │
+│  │    ├─────────────────────────────────────────────────────────────────┤   │   │
+│  │    │ Batch 2: [containerd]  Parallel                                    │   │   │
+│  │    │   └─ SSH 并行执行 Install (node-3 + node-4 同时)                   │   │   │
+│  │    ├─────────────────────────────────────────────────────────────────┤   │   │
+│  │    │ Batch 3: [kubelet]     Parallel                                    │   │   │
+│  │    │   └─ SSH 并行执行 Install (node-3 + node-4 同时)                   │   │   │
+│  │    └─────────────────────────────────────────────────────────────────┘   │   │
+│  │                                                                          │   │
+│  │ 4. syncNodeStatus(ctx, cluster)                                          │   │
+│  │    └─ node-3: 全部 Installed → evaluateNodePhase → Ready                │   │
+│  │    └─ node-4: 全部 Installed → evaluateNodePhase → Ready                │   │
+│  │    └─ Patch BKEMachine CR (NodePhase=Ready, ComponentStatuses)           │   │
+│  │    └─ setMachineCAPIConditions(machine, Ready) → ReadyCondition=True     │   │
+│  │    ← BKEMachine Controller 不参与 (路径 1 DAG 内联)                       │   │
+│  └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+│  Reconcile #2                                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────────┐   │
+│  │ L1: ClusterStateMachine.Execute(cluster)                                │   │
+│  │                                                                          │   │
+│  │ 1. EvaluateClusterPhase: Scaling → Running                              │   │
+│  │    Condition: isScalingCompleted = true (无 Pending/Provisioning/Deleting)│   │
+│  │                                                                          │   │
+│  │ 2. 无操作 (Running 为稳态，无匹配 Execute case)                           │   │
+│  └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+│  CAPI 上层:                                                                      │
+│    └─ MachineDeployment Controller Watch BKEMachine.ReadyCondition=True         │
+│       └─ 判定 node-3/node-4 就绪，继续后续编排                                    │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**设计要点**：
+- 扩容走 DAG 内联路径（默认），与安装/升级统一执行路径（§6.2.2）
+- `buildScalingDAG` 仅包含 binary 类型组件，集群级组件不重复执行
+- `upgradeStrategy.mode = Parallel`，新节点全并行安装，提升扩容效率
+- `syncNodeStatus` 统一聚合节点状态并直接写入 CAPI Conditions，BKEMachine Controller 不参与
+
+### 7.4 缩容流程
+
+**触发条件**：用户对 BKENode 设置 `Spec.Deleted = true`，`desiredVersion == currentVersion`。
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                          集群缩容完整流程                                         │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  用户: 标记 node-3, node-4 为删除 (Spec.Deleted = true)                          │
+│                                                                                 │
+│  Reconcile #1                                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────────┐   │
+│  │ L1: ClusterStateMachine.Execute(cluster)                                │   │
+│  │                                                                          │   │
+│  │ 1. EvaluateClusterPhase: Running → Scaling                              │   │
+│  │    Condition: hasNodeCountChange = true (node-3/node-4.Spec.Deleted)     │   │
+│  │                                                                          │   │
+│  │ 2. BuildScalingDAG(ctx, cluster)                                         │   │
+│  │    └─ 仅 binary 组件 + drain inline 节点                                  │   │
+│  │    └─ VersionContext: 已有节点 Current 有值 → Uninstall 语义              │   │
+│  │    DAG:                                                                 │   │
+│  │      [drain-node-3] → [bkeagent→containerd→kubelet] (node-3 卸载)        │   │
+│  │      [drain-node-4] → [bkeagent→containerd→kubelet] (node-4 卸载)        │   │
+│  │                                                                          │   │
+│  │ 3. ExecuteDAG(ctx, dag)                                                  │   │
+│  │    ┌─────────────────────────────────────────────────────────────────┐   │   │
+│  │    │ Batch 1: [drain-node-3, drain-node-4]  inline 类型                 │   │   │
+│  │    │   └─ InlineComponentExecutor.ExecuteComponent()                   │   │   │
+│  │    │       └─ kubectl drain node-3 (驱逐 Pod)                           │   │   │
+│  │    │       └─ kubectl drain node-4 (驱逐 Pod)                           │   │   │
+│  │    │       ← drain 完成后才允许组件卸载 (依赖边保证)                       │   │   │
+│  │    ├─────────────────────────────────────────────────────────────────┤   │   │
+│  │    │ Batch 2: [bkeagent, containerd, kubelet]  Rolling 逐节点           │   │   │
+│  │    │   └─ BinaryComponentExecutor.ExecuteComponent()                    │   │   │
+│  │    │       ├─ SSH 执行 Uninstall (Rolling: node-3 → node-4 串行)        │   │   │
+│  │    │       ├─ NodeStatusUpdater.MarkRemoved(node-3, comp)               │   │   │
+│  │    │       └─ NodeStatusUpdater.MarkRemoved(node-4, comp)               │   │   │
+│  │    └─────────────────────────────────────────────────────────────────┘   │   │
+│  │                                                                          │   │
+│  │ 4. syncNodeStatus(ctx, cluster)                                          │   │
+│  │    └─ node-3: NodeComponentStatuses 已清除 → 从 DAG 移除                  │   │
+│  │    └─ node-4: NodeComponentStatuses 已清除 → 从 DAG 移除                  │   │
+│  │    └─ 清除 BKEMachine CAPI Conditions (节点已删除)                        │   │
+│  └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+│  Reconcile #2                                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────────┐   │
+│  │ 1. EvaluateClusterPhase: Scaling → Running                              │   │
+│  │    Condition: isScalingCompleted = true (无 Deleting 节点)                │   │
+│  │ 2. 无操作 (稳态)                                                          │   │
+│  └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**设计要点**：
+- 缩容使用 Rolling 策略逐节点串行卸载，确保安全驱逐 Pod 后才卸载组件（§6.2.2）
+- drain 作为 inline 类型 DAG 节点，通过依赖边保证 drain 在组件卸载之前完成
+- drain 与组件卸载的顺序由 DAG 拓扑排序保证，避免各节点独立 Reconcile 导致的顺序问题
+
+### 7.5 回滚流程
+
+**触发条件**：升级失败后用户设置 `Spec.RollbackRequested = true`，回滚到 `Status.PreviousVersion`。
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                          集群回滚完整流程                                         │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  前置: 集群升级 v2.6.0 → v2.7.0 失败, Status.LifecyclePhase = Failed             │
+│        Status.PreviousVersion = "v2.6.0"                                         │
+│        Status.CurrentVersion = "v2.6.0" (未更新成功)                              │
+│                                                                                 │
+│  用户: kubectl patch bkecluster my-cluster --type merge                          │
+│        -p '{"spec":{"rollbackRequested":true}}'                                  │
+│                                                                                 │
+│  Reconcile #1                                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────────┐   │
+│  │ L1: ClusterStateMachine.Execute(cluster)                                │   │
+│  │                                                                          │   │
+│  │ 1. EvaluateClusterPhase: Failed → RollingBack                           │   │
+│  │    └─ RollbackRequested=true (优先级最高, 跳过 Failed 不自愈检查)         │   │
+│  │    ← 注意: RollbackRequested 优先于 Failed, 允许从故障态触发回滚           │   │
+│  │                                                                          │   │
+│  │ 2. BuildRollbackDAG(ctx, cluster)                                        │   │
+│  │    └─ ResolveByVersion(Status.PreviousVersion = "v2.6.0")                │   │
+│  │    └─ 从 v2.6.0 ReleaseImage.spec.upgrade.components 构建组件列表          │   │
+│  │    └─ expandCompositeComponents 展开为子组件                              │   │
+│  │    └─ versionContext.PrepareRollback()                                   │   │
+│  │       ← 交换 Current/Target: 原 Current(v2.6.0) → Target,                │   │
+│  │         原 Target(v2.7.0) → Current                                      │   │
+│  │       ← NeedsUpgrade 判断 "从 v2.7.0 回退到 v2.6.0"                       │   │
+│  │    DAG: [bkeagent] → [containerd] → [kubelet] → [coredns]                │   │
+│  │                                                                          │   │
+│  │ 3. ExecuteDAG(ctx, dag)                                                  │   │
+│  │    ┌─────────────────────────────────────────────────────────────────┐   │   │
+│  │    │ Batch 1: [bkeagent]  Rolling                                       │   │   │
+│  │    │   └─ BinaryComponentExecutor: SSH 逐节点降级 bkeagent              │   │   │
+│  │    │       v2.7.0 → v2.6.0                                              │   │   │
+│  │    ├─────────────────────────────────────────────────────────────────┤   │   │
+│  │    │ Batch 2: [containerd] Rolling                                      │   │   │
+│  │    │   └─ SSH 逐节点降级 containerd v2.7.0 → v2.6.0                     │   │   │
+│  │    ├─────────────────────────────────────────────────────────────────┤   │   │
+│  │    │ Batch 3: [kubelet]    Rolling                                      │   │   │
+│  │    │   └─ SSH 逐节点降级 kubelet v2.7.0 → v2.6.0                        │   │   │
+│  │    ├─────────────────────────────────────────────────────────────────┤   │   │
+│  │    │ Batch 4: [coredns]    helm                                         │   │   │
+│  │    │   └─ Helm SDK: helm rollback coredns v2.6.0                        │   │   │
+│  │    └─────────────────────────────────────────────────────────────────┘   │   │
+│  │                                                                          │   │
+│  │ 4. syncNodeStatus(ctx, cluster)                                          │   │
+│  │    └─ 所有节点组件回退到 v2.6.0 → evaluateNodePhase → Ready              │   │
+│  └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+│  Reconcile #2 (回滚 DAG 全部完成后)                                               │
+│  ┌─────────────────────────────────────────────────────────────────────────┐   │
+│  │ 1. EvaluateClusterPhase: RollingBack → Running                          │   │
+│  │    Condition: isDAGCompleted = true (所有组件已达目标版本 v2.6.0)         │   │
+│  │                                                                          │   │
+│  │ 2. 更新 currentVersion = "v2.6.0" (Status.DesiredVersion 已回退)         │   │
+│  │ 3. 清除 RollbackRequested = false                                       │   │
+│  │ 4. 记录回滚完成事件                                                       │   │
+│  └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**设计要点**：
+- `RollbackRequested` 优先级最高，允许从 `Failed` 状态触发回滚（§4.4.1 决策优先级 2）
+- 回滚 DAG 从 `PreviousVersion` 的 ReleaseImage 构建，复用 `upgrade.components`（§4.4.4）
+- `VersionContext.PrepareRollback()` 交换 Current/Target，使 `NeedsUpgrade` 判断 "从升级后版本回退到升级前版本"
+- 回滚使用 Rolling 策略逐节点降级，确保降级过程中的服务可用性
+
+### 7.6 升级失败与中断重入流程
+
+**触发条件**：升级过程中部分组件执行失败，演示跨 Reconcile 的幂等性和中间态保持。
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                  升级失败与中断重入完整流程 (幂等性演示)                              │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  前置: 集群 v2.6.0 → v2.7.0 升级中, Status.LifecyclePhase = Upgrading            │
+│                                                                                 │
+│  Reconcile #1 (升级开始)                                                         │
+│  ┌─────────────────────────────────────────────────────────────────────────┐   │
+│  │ 1. EvaluateClusterPhase: Running → Upgrading                            │   │
+│  │ 2. BuildUpgradeDAG → ExecuteDAG                                          │   │
+│  │    └─ Batch 1: [bkeagent] Rolling                                        │   │
+│  │       ├─ node-1: bkeagent v2.6.0 → v2.7.0 ✓                             │   │
+│  │       ├─ node-2: bkeagent v2.6.0 → v2.7.0 ✓                             │   │
+│  │       └─ node-3: bkeagent v2.6.0 → v2.7.0 ✓                             │   │
+│  │    └─ Batch 2: [containerd] Rolling                                      │   │
+│  │       ├─ node-1: containerd v2.6.0 → v2.7.0 ✓                           │   │
+│  │       ├─ node-2: containerd v2.6.0 → v2.7.0 ✗ (SSH 超时失败)             │   │
+│  │       │   └─ NodeStatusUpdater.MarkFailed(node-2, "containerd")          │   │
+│  │       └─ node-3: 未执行 (Rolling 串行, node-2 失败中断)                    │   │
+│  │    ← ExecuteDAG 返回 error                                               │   │
+│  │ 3. _ = sm.syncNodeStatus(ctx, cluster)                                   │   │
+│  │    └─ node-1: bkeagent=v2.7.0, containerd=v2.7.0 → Ready                │   │
+│  │    └─ node-2: bkeagent=v2.7.0, containerd=Failed → Failed               │   │
+│  │    └─ node-3: bkeagent=v2.7.0, containerd=v2.6.0 → Provisioning         │   │
+│  │ 4. 返回 error (Reconciler 记录 Event, defer Patch 保存当前状态)            │   │
+│  └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+│  Reconcile #2 (Requeue 后重入)                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────────┐   │
+│  │ 1. EvaluateClusterPhase: Upgrading (中间态保持)                          │   │
+│  │    └─ currentPhase == Upgrading, isDAGCompleted = false                  │   │
+│  │    ← 决策优先级 3: 操作中间态保持, 跨 Reconcile 继续执行                    │   │
+│  │                                                                          │   │
+│  │ 2. BuildUpgradeDAG → ExecuteDAG                                          │   │
+│  │    └─ Batch 1: [bkeagent]                                                │   │
+│  │       ├─ node-1: NeedsUpgrade=false (已 v2.7.0) → 跳过 ✓                  │   │
+│  │       ├─ node-2: NeedsUpgrade=false (已 v2.7.0) → 跳过 ✓                  │   │
+│  │       └─ node-3: NeedsUpgrade=false (已 v2.7.0) → 跳过 ✓                  │   │
+│  │       ← 幂等: 已完成组件通过 VersionContext.NeedsUpgrade 跳过              │   │
+│  │    └─ Batch 2: [containerd]                                              │   │
+│  │       ├─ node-1: NeedsUpgrade=false (已 v2.7.0) → 跳过 ✓                  │   │
+│  │       ├─ node-2: containerd Failed → 自愈?                                │   │
+│  │       │   ← ComponentStateMachine.evaluateComponentPhase:                │   │
+│  │       │     currentPhase=Failed → 返回 Failed (不自愈)                     │   │
+│  │       │   ← Execute 无匹配 case → 跳过执行                                 │   │
+│  │       └─ node-3: NeedsUpgrade=true (仍 v2.6.0) → 执行 Upgrade            │   │
+│  │           └─ containerd v2.6.0 → v2.7.0 ✓                                │   │
+│  │    ← ExecuteDAG 返回 error (node-2 containerd 仍 Failed)                  │   │
+│  └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+│  Reconcile #N (超过 maxRetries)                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────────┐   │
+│  │ 1. EvaluateClusterPhase: Upgrading → Failed                             │   │
+│  │    Condition: 重试次数超限, DAG 持续失败                                   │   │
+│  │ 2. 无操作 (Failed 不自愈, 等待人工介入)                                    │   │
+│  │ 3. 记录 Failed 事件, 触发告警 (BKEClusterOperationFailed)                 │   │
+│  └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**设计要点**：
+- **中间态保持**：`Upgrading` 状态跨 Reconcile 保持，不重新开始（§4.4.1 决策优先级 3）
+- **组件级幂等**：已完成组件通过 `VersionContext.NeedsUpgrade=false` 跳过（§4.2）
+- **Failed 不自愈**：node-2 的 containerd 进入 Failed 后不自动重试，等待人工介入（§4.6.1）
+- **syncNodeStatus 容错**：即使 DAG 执行失败也尝试同步已成功部分的状态（§6.2.1）
+
+### 7.7 Failed 故障恢复流程
+
+**触发条件**：集群处于 `Failed` 状态，人工修复底层问题（如网络、磁盘）后清除 Failed 状态重新触发操作。
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                  Failed 故障恢复完整流程 (人工介入)                                  │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  前置: Status.LifecyclePhase = Failed                                            │
+│        node-2 containerd 仍为 Failed (底层 SSH 不可达, 已修复网络)                 │
+│        desiredVersion = "v2.7.0", currentVersion = "v2.6.0" (升级未完成)         │
+│                                                                                 │
+│  用户操作 (人工介入):                                                              │
+│    1. 修复 node-2 网络问题 (SSH 恢复可达)                                         │
+│    2. 清除 node-2 containerd 的 Failed 状态:                                      │
+│       kubectl patch bkenode node-2 --type merge                                  │
+│         -p '{"status":{"componentStatuses":{"containerd":{"phase":"Pending"}}}}' │
+│    3. 清除集群 Failed 状态:                                                       │
+│       kubectl patch bkecluster my-cluster --type merge                           │
+│         -p '{"status":{"lifecyclePhase":"Upgrading"}}'                           │
+│                                                                                 │
+│  Reconcile #1 (人工介入后)                                                        │
+│  ┌─────────────────────────────────────────────────────────────────────────┐   │
+│  │ 1. EvaluateClusterPhase: Upgrading (用户已手动重置为 Upgrading)           │   │
+│  │    └─ currentPhase=Upgrading, isDAGCompleted=false → 保持 Upgrading      │   │
+│  │                                                                          │   │
+│  │ 2. BuildUpgradeDAG → ExecuteDAG                                          │   │
+│  │    └─ Batch 2: [containerd]                                              │   │
+│  │       ├─ node-1: NeedsUpgrade=false (已 v2.7.0) → 跳过 ✓                  │   │
+│  │       ├─ node-2: containerd Pending → evaluateComponentPhase:            │   │
+│  │       │     installedVersion="" (人工清除) → Installing                   │   │
+│  │       │   └─ Execute: executor.Install(containerd v2.7.0) ✓               │   │
+│  │       │   └─ status.Version = "v2.7.0", Phase = Installed                │   │
+│  │       └─ node-3: NeedsUpgrade=false (已 v2.7.0) → 跳过 ✓                  │   │
+│  │    ← ExecuteDAG 成功 (所有组件达 v2.7.0)                                  │   │
+│  │                                                                          │   │
+│  │ 3. syncNodeStatus(ctx, cluster)                                          │   │
+│  │    └─ node-2: 全部 Installed → Ready                                     │   │
+│  │ 4. isDAGCompleted = true → 更新 currentVersion = "v2.7.0"                │   │
+│  └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+│  Reconcile #2                                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────────┐   │
+│  │ 1. EvaluateClusterPhase: Upgrading → Running                            │   │
+│  │    Condition: isDAGCompleted = true                                      │   │
+│  │ 2. 记录升级完成事件                                                       │   │
+│  └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**设计要点**：
+- **Failed 不自愈**：集群和组件层均不自动恢复 Failed 状态，需人工清除后重新评估（§4.4.1/§4.6.1）
+- **人工清除粒度**：需同时清除集群级 Failed（重置为 Upgrading）和组件级 Failed（重置为 Pending）
+- **清除后幂等恢复**：人工清除 Failed 后，`evaluateComponentPhase` 重新判断版本关系，已完成组件跳过，未完成组件重新执行
+
+### 7.8 Watch 触发扩容流程（可选路径）
+
+**触发条件**：启用 Feature Gate `ScalingWatchTriggerEnabled`，扩容走 BKEMachine Watch 触发路径（§6.2.3）。
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                  Watch 触发扩容完整流程 (可选路径, Feature Gate 控制)                 │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  前置: Feature Gate ScalingWatchTriggerEnabled = true                            │
+│        新增 node-3, node-4 (Status.LifecyclePhase = Pending)                      │
+│                                                                                 │
+│  Reconcile #1 (BKECluster Controller)                                            │
+│  ┌─────────────────────────────────────────────────────────────────────────┐   │
+│  │ L1: ClusterStateMachine.Execute(cluster)                                │   │
+│  │                                                                          │   │
+│  │ 1. EvaluateClusterPhase: Running → Scaling                              │   │
+│  │ 2. scalingWatchTriggerEnabled(cluster) = true → 走 Watch 触发路径        │   │
+│  │ 3. 不构建/执行 DAG, 仅更新 BKEMachine CR Status:                         │   │
+│  │    └─ node-3: NodePhase = Provisioning, NodeComponents = [bkeagent,      │   │
+│  │               containerd, kubelet] (展开 composite 后的 binary 组件)      │   │
+│  │    └─ node-4: NodePhase = Provisioning, NodeComponents = [...]           │   │
+│  │    └─ Patch BKEMachine CR                                                │   │
+│  │    ← L1 不执行 DAG, 仅触发 L2                                            │   │
+│  └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+│          ↓ BKEMachine Controller Watch 到 Status 变化 ↓                          │
+│                                                                                 │
+│  Reconcile #1 (BKEMachine Controller, node-3)  ← 各节点独立 Reconcile, 并行      │
+│  ┌─────────────────────────────────────────────────────────────────────────┐   │
+│  │ 1. 获取 BKEMachine + 关联 BKECluster                                    │   │
+│  │ 2. getNodeComponents (从 ReleaseImage 解析 binary 组件)                  │   │
+│  │ 3. NodeStateMachine.Execute(node-3, components)  (L2)                    │   │
+│  │    └─ evaluateNodePhase: Provisioning (无组件状态 → 新节点首次安装)       │   │
+│  │    └─ executeNodeComponents(ActionInstall)                               │   │
+│  │       └─ topologicalSort: [bkeagent, containerd, kubelet]                │   │
+│  │       └─ ComponentStateMachine.Execute(comp, ActionInstall)  (L3)        │   │
+│  │          ├─ bkeagent:   Pending → Installing → Installed ✓               │   │
+│  │          ├─ containerd: Pending → Installing → Installed ✓               │   │
+│  │          └─ kubelet:    Pending → Installing → Installed ✓               │   │
+│  │ 4. evaluateNodePhase: 全部 Installed → Ready                             │   │
+│  │ 5. UpdateFromBKENode + Patch BKEMachine (NodePhase=Ready)                │   │
+│  │ 6. setMachineCAPIConditions(machine, Ready) → ReadyCondition=True        │   │
+│  │    ← 路径 3 中 CAPI Conditions 由 BKEMachine Controller 写入              │   │
+│  └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+│  Reconcile #1 (BKEMachine Controller, node-4)  ← 与 node-3 并行                  │
+│  ┌─────────────────────────────────────────────────────────────────────────┐   │
+│  │ ... (与 node-3 相同流程, 并行执行) ...                                    │   │
+│  └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+│  Reconcile #2 (BKECluster Controller)                                            │
+│  ┌─────────────────────────────────────────────────────────────────────────┐   │
+│  │ 1. EvaluateClusterPhase: Scaling → Running                              │   │
+│  │    Condition: isScalingCompleted = true (所有 BKEMachine Ready)           │   │
+│  │ 2. 无操作 (稳态)                                                          │   │
+│  └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**设计要点**：
+- **Feature Gate 控制**：通过 `ScalingWatchTriggerEnabled` 切换 DAG 内联与 Watch 触发路径（§6.2.3）
+- **L2 驱动 L3**：Watch 触发路径中 `NodeStateMachine.Execute` 驱动 `ComponentStateMachine.Execute`，三层完整参与
+- **各节点独立并行**：每个 BKEMachine 独立 Reconcile，无全局批次协调，适用于大规模集群
+- **状态实时聚合**：`evaluateNodePhase` 在每次组件执行后实时聚合节点状态（对比 DAG 内联路径的 DAG 完成后一次性聚合）
+- **CAPI Conditions 写入者差异**：路径 3 由 BKEMachine Controller 写入，路径 1/2 由 `syncNodeStatus` 写入（§6.2.4 对比表）
+
+### 7.9 场景对比总结
+
+| 场景 | 触发条件 | L1 Phase | DAG 类型 | 执行路径 | L2 参与 | 关键策略 |
+|------|---------|----------|---------|---------|---------|---------|
+| **安装** (§7.1) | desiredVersion 设置, 无 currentVersion | Installing | buildInstallDAG | DAG 内联 | 否 | 全组件, VersionContext 无 Current |
+| **升级** (§7.2) | desiredVersion != currentVersion | Upgrading | buildUpgradeDAG | DAG 内联 | 否 | NeedsUpgrade 过滤, Rolling/Batch |
+| **扩容** (§7.3) | 新增 BKENode (Pending) | Scaling | buildScalingDAG | DAG 内联 | 否 | 仅 binary, Parallel 全并行 |
+| **缩容** (§7.4) | BKENode.Spec.Deleted=true | Scaling | buildScalingDAG | DAG 内联 | 否 | drain inline + Rolling 逐节点 |
+| **回滚** (§7.5) | RollbackRequested=true | RollingBack | buildRollbackDAG | DAG 内联 | 否 | PreviousVersion, Current/Target 交换 |
+| **失败重入** (§7.6) | 升级中部分组件失败 | Upgrading→Failed | buildUpgradeDAG | DAG 内联 | 否 | 中间态保持, 组件级幂等跳过 |
+| **故障恢复** (§7.7) | 人工清除 Failed 后 | Upgrading | buildUpgradeDAG | DAG 内联 | 否 | 人工重置状态, 重新评估版本 |
+| **Watch 扩容** (§7.8) | 新增 BKENode + Feature Gate | Scaling | 无 (L1 仅更新 CR) | Watch 触发 | 是 | 各节点独立 Reconcile, 实时聚合 |
+
+**核心设计原则贯穿所有场景**：
+1. **幂等性**：所有场景支持 Reconcile 重入，已完成组件通过 `VersionContext.NeedsUpgrade` 跳过
+2. **中间态保持**：操作态（Installing/Upgrading/Scaling/RollingBack）跨 Reconcile 保持，不重新开始
+3. **Failed 不自愈**：故障状态不自动恢复，等待人工介入清除后重新评估
+4. **状态回写统一**：DAG 内联路径由 `syncNodeStatus` 统一聚合，Watch 触发路径由 `evaluateNodePhase` 实时聚合
+
 ---
 
 ## 8. 总结
