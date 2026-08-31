@@ -1908,49 +1908,45 @@ Composite 节点不产生 DAG 节点:
 │  │ 1. EvaluateClusterPhase: Pending → Installing                           │   │
 │  │    Condition: desiredVersion != "" && currentVersion == ""               │   │
 │  │                                                                          │   │
-│  │ 2. BuildDAG(releaseImage)                                                │   │
-│  │    DAG: [certs] → [node-group] → [coredns] → [kube-proxy]               │   │
+│  │ 2. buildInstallDAG(releaseImage)                                        │   │
+│  │    展开 composite: kubernetes-core → [etcd, apiserver, cm, scheduler]    │   │
+│  │                    node-components → [bkeagent, containerd, kubelet]    │   │
+│  │    DAG: [etcd] → [apiserver] → [bkeagent] → [containerd] → [kubelet]   │   │
+│  │         → [coredns] → [kube-proxy]                                      │   │
 │  │                                                                          │   │
-│  │ 3. ExecuteDAG(ctx, dag)                                                  │   │
+│  │ 3. scheduler.ExecuteDAG(ctx, execCtx, dag)                               │   │
 │  │    ┌─────────────────────────────────────────────────────────────────┐   │   │
-│  │    │ Batch 1: [certs]                                                │   │   │
-│  │    │   └─ ClusterComponentNode.Execute()                             │   │   │
-│  │    │       └─ L3: certs Installing → Installed                       │   │   │
+│  │    │ Batch 1: [etcd]                                                 │   │   │
+│  │    │   └─ BinaryComponentExecutor / StaticPodComponentExecutor       │   │   │
+│  │    │       ├─ NodeStatusUpdater.MarkPending(nodeIP, "etcd")          │   │   │
+│  │    │       ├─ SSH / Static Pod 拉起 (L3 直接执行)                     │   │   │
+│  │    │       └─ NodeStatusUpdater.MarkSuccess(nodeIP, "etcd")          │   │   │
 │  │    ├─────────────────────────────────────────────────────────────────┤   │   │
-│  │    │ Batch 2: [node-group]                                           │   │   │
-│  │    │   └─ NodeGroupNode.Execute()                                    │   │   │
-│  │    │       │                                                         │   │   │
-│  │    │       ├─ Step 1: 创建/更新 BKEMachine                           │   │   │
-│  │    │       │   ├─ Master BKEMachine: [bkeagent, containerd, ...]     │   │   │
-│  │    │       │   └─ Worker BKEMachine: [bkeagent, containerd, ...]     │   │   │
-│  │    │       │                                                         │   │   │
-│  │    │       ├─ Step 2: 等待 BKEMachine Controller 完成节点层状态机     │   │   │
-│  │    │       │   │                                                     │   │   │
-│  │    │       │   │  BKEMachine Controller (每个节点独立 Reconcile)      │   │   │
-│  │    │       │   │    ├─ 读取 Spec.NodeComponents                      │   │   │
-│  │    │       │   │    ├─ 驱动 L2 节点层状态机                          │   │   │
-│  │    │       │   │    ├─ 驱动 L3 组件层状态机                          │   │   │
-│  │    │       │   │    │   ├─ bkeagent: Pending → Installing → Installed│   │   │
-│  │    │       │   │    │   ├─ containerd: Pending → Installing → ...    │   │   │
-│  │    │       │   │    │   └─ kubelet: Pending → Installing → ...       │   │   │
-│  │    │       │   │    └─ 更新 BKEMachine.Status.LifecyclePhase=Ready   │   │   │
-│  │    │       │   │                                                     │   │   │
-│  │    │       │   └─ 轮询等待所有节点 Status.LifecyclePhase == Ready    │   │   │
-│  │    │       │                                                         │   │   │
-│  │    │       └─ Step 3: 聚合节点状态到 BKECluster.Status.NodeStatuses  │   │   │
-│  │    │                                                                 │   │   │
+│  │    │ Batch 2: [apiserver]                                             │   │   │
+│  │    │   └─ StaticPodComponentExecutor (L3 直接执行)                    │   │   │
 │  │    ├─────────────────────────────────────────────────────────────────┤   │   │
-│  │    │ Batch 3: [coredns]                                              │   │   │
-│  │    │   └─ ClusterComponentNode.Execute()                             │   │   │
-│  │    │       └─ L3: coredns Installing → Installed                     │   │   │
+│  │    │ Batch 3: [bkeagent, containerd, kubelet] (binary, Rolling)       │   │   │
+│  │    │   └─ BinaryComponentExecutor.ExecuteComponent                   │   │   │
+│  │    │       ├─ NodeStatusUpdater.MarkPending(nodeIP, "bkeagent")       │   │   │
+│  │    │       ├─ SSH 逐节点执行 (Rolling)                                │   │   │
+│  │    │       ├─ NodeStatusUpdater.MarkSuccess(nodeIP, "bkeagent")      │   │   │
+│  │    │       └─ ... containerd, kubelet 同理                            │   │   │
 │  │    ├─────────────────────────────────────────────────────────────────┤   │   │
-│  │    │ Batch 4: [kube-proxy]                                           │   │   │
-│  │    │   └─ ClusterComponentNode.Execute()                             │   │   │
-│  │    │       └─ L3: kube-proxy Installing → Installed                  │   │   │
+│  │    │ Batch 4: [coredns]                                               │   │   │
+│  │    │   └─ HelmComponentExecutor (L3 直接执行, 集群级)                 │   │   │
+│  │    ├─────────────────────────────────────────────────────────────────┤   │   │
+│  │    │ Batch 5: [kube-proxy]                                            │   │   │
+│  │    │   └─ YamlComponentExecutor (L3 直接执行, 集群级)                 │   │   │
 │  │    └─────────────────────────────────────────────────────────────────┘   │   │
 │  │                                                                          │   │
-│  │ 4. DAG 执行完成                                                          │   │
-│  │    └─ EvaluateClusterPhase: Installing → Running                         │   │
+│  │ 4. syncNodeStatus(ctx, cluster)                                          │   │
+│  │    └─ 遍历所有节点:                                                       │   │
+│  │       ├─ evaluateNodePhase(node, components) → Ready                     │   │
+│  │       ├─ BKEMachine.Status.NodePhase = Ready                            │   │
+│  │       ├─ setMachineCAPIConditions(machine, Ready)                        │   │
+│  │       └─ Patch BKEMachine CR                                             │   │
+│  │                                                                          │   │
+│  │ 5. EvaluateClusterPhase: Installing → Running                             │   │
 │  └─────────────────────────────────────────────────────────────────────────┘   │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
@@ -1958,13 +1954,13 @@ Composite 节点不产生 DAG 节点:
 
 **关键设计**：
 
-1. **集群层驱动节点层**：node-group 节点在 DAG 中执行时，会等待 BKEMachine Controller 完成节点层状态机执行
+1. **统一 DAG 调度**：所有组件（staticpod/binary/helm/yaml）作为统一的 `ComponentNode` 参与 DAG 拓扑排序，composite 在构建时展开为子组件，无需 NodeGroupNode 包装
 
-2. **轮询等待机制**：node-group 节点通过轮询 BKEMachine.Status 来等待节点层状态机完成
+2. **L1 直接操作 L3**：Scheduler 通过 `BinaryComponentExecutor`/`StaticPodComponentExecutor`/`HelmComponentExecutor` 直接执行组件操作，不经过 L2 NodeStateMachine
 
-3. **状态聚合**：node-group 节点将 BKEMachine.Status 聚合到 BKECluster.Status.NodeStatuses
+3. **节点状态回写**：`syncNodeStatus` 在 DAG 执行后聚合组件状态为节点状态，直接写入 BKEMachine CR 和 CAPI Conditions，无需 BKEMachine Controller 介入
 
-4. **BKEMachine Controller 独立执行**：BKEMachine Controller 独立驱动 L2/L3 状态机，与 BKECluster Controller 解耦
+4. **节点级并发**：binary 组件的逐节点/分批/全并行由 `BinaryComponentExecutor` 内部的 `upgradeStrategy.mode` 控制
 
 ### 5.2 升级流程
 
@@ -1983,31 +1979,29 @@ Composite 节点不产生 DAG 节点:
 │  │ 1. EvaluateClusterPhase: Running → Upgrading                            │   │
 │  │    Condition: desiredVersion != currentVersion                           │   │
 │  │                                                                          │   │
-│  │ 2. BuildDAG(newReleaseImage)                                             │   │
-│  │    DAG: [certs] → [node-group] → [coredns] → [kube-proxy]               │   │
+│  │ 2. buildUpgradeDAG(newReleaseImage)                                     │   │
+│  │    展开 composite + 解析 deferredSubComponents                          │   │
+│  │    DAG: [etcd] → [apiserver] → [bkeagent] → [containerd] → [kubelet]   │   │
+│  │         → [coredns] → [kube-proxy]                                      │   │
+│  │    VersionContext: Current 有值, 按 NeedsUpgrade 过滤需要升级的组件       │   │
 │  │                                                                          │   │
-│  │ 3. ExecuteDAG(ctx, dag)                                                  │   │
-│  │    └─ Batch 2: [node-group]                                              │   │
-│  │       └─ NodeGroupNode.Execute()                                         │   │
-│  │           │                                                              │   │
-│  │           ├─ Step 1: 更新 BKEMachine.Spec.NodeComponents (新版本)        │   │
-│  │           │                                                              │   │
-│  │           ├─ Step 2: 等待 BKEMachine Controller 完成节点层状态机          │   │
-│  │           │   │                                                          │   │
-│  │           │   │  BKEMachine Controller (每个节点独立 Reconcile)           │   │
-│  │           │   │    ├─ 检测 Spec.NodeComponents 版本变更                  │   │
-│  │           │   │    ├─ 驱动 L2 节点层状态机: Ready → Upgrading            │   │
-│  │           │   │    ├─ 驱动 L3 组件层状态机                               │   │
-│  │           │   │    │   ├─ containerd: Installed → Upgrading → Installed  │   │
-│  │           │   │    │   └─ kubelet: Installed → Upgrading → Installed     │   │
-│  │           │   │    └─ 更新 BKEMachine.Status.LifecyclePhase=Ready        │   │
-│  │           │   │                                                          │   │
-│  │           │   └─ 轮询等待所有节点 Status.LifecyclePhase == Ready         │   │
-│  │           │                                                              │   │
-│  │           └─ Step 3: 聚合节点状态到 BKECluster.Status.NodeStatuses       │   │
+│  │ 3. scheduler.ExecuteDAG(ctx, execCtx, dag)                               │   │
+│  │    └─ Batch 3: [bkeagent, containerd, kubelet] (binary, Rolling)       │   │
+│  │         └─ BinaryComponentExecutor.ExecuteComponent                     │   │
+│  │             ├─ VersionContext.NeedsUpgrade("containerd") = true         │   │
+│  │             ├─ NodeStatusUpdater.MarkPending(nodeIP, "containerd")     │   │
+│  │             ├─ SSH 逐节点执行 Upgrade (Rolling)                        │   │
+│  │             ├─ NodeStatusUpdater.MarkSuccess(nodeIP, "containerd")     │   │
+│  │             └─ VersionContext.NeedsUpgrade("kubelet") = true → 继续     │   │
 │  │                                                                          │   │
-│  │ 4. DAG 执行完成                                                          │   │
-│  │    └─ EvaluateClusterPhase: Upgrading → Running                          │   │
+│  │ 4. syncNodeStatus(ctx, cluster)                                          │   │
+│  │    └─ 遍历所有节点:                                                       │   │
+│  │       ├─ evaluateNodePhase(node, components) → Ready                    │   │
+│  │       ├─ BKEMachine.Status.NodePhase = Ready                            │   │
+│  │       ├─ setMachineCAPIConditions(machine, Ready)                        │   │
+│  │       └─ Patch BKEMachine CR                                             │   │
+│  │                                                                          │   │
+│  │ 5. EvaluateClusterPhase: Upgrading → Running                            │   │
 │  │    └─ 更新 currentVersion = "v2.7.0"                                     │   │
 │  └─────────────────────────────────────────────────────────────────────────┘   │
 │                                                                                 │
@@ -2016,15 +2010,16 @@ Composite 节点不产生 DAG 节点:
 
 **关键设计**：
 
-1. **版本变更检测**：BKEMachine Controller 检测 Spec.NodeComponents 版本变更，触发节点层状态机
+1. **增量升级**：`VersionContext.NeedsUpgrade` 判断哪些组件版本变更需要升级，未变更的组件跳过（幂等）
 
-2. **节点层驱动组件层**：BKEMachine Controller 按依赖顺序驱动 L3 组件层状态机
+2. **deferredSubComponents**：composite 中的延迟升级声明由 `buildUpgradeDAG` 解析，`executeControlPlaneHop` 跳过延迟组件的 Target 版本更新
 
-3. **状态聚合**：node-group 节点将 BKEMachine.Status 聚合到 BKECluster.Status
+3. **节点状态回写**：与安装流程完全一致，`syncNodeStatus` 统一聚合和回写节点状态
 
-4. **集群层等待**：BKECluster Controller 等待所有节点就绪后，更新集群状态为 Running
+4. **集群层等待**：DAG 全部完成后 `syncNodeStatus` 确认所有节点 Ready，更新集群状态为 Running
 
 ---
+
 
 ## 6. 可观测性设计
 
