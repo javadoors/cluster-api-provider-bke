@@ -1790,7 +1790,9 @@ BKECluster Controller (L1 集群层状态机)
 - BKEMachine Controller 独立驱动 L2/L3，与 BKECluster Controller 解耦
 - 集群级组件和节点级组件的执行顺序由 DAG 依赖决定，而非固定顺序
 
-### 4.5 Composite 组件类型设计
+### 4.5 Composite 组件类型与状态机集成
+
+> **说明**：Composite 组件类型的完整设计（CompositeSpec 类型定义、ReleaseImage 结构、DAG 展开机制、依赖处理、kubernetesVersion 统一声明、deferredSubComponents 延迟升级等）见 **[KEP-15: Composite 组件类型设计](kep15-composite-component-design.md)**。本节仅描述 Composite 与状态机引擎的集成要点。
 
 #### 4.5.1 设计动机
 
@@ -1803,455 +1805,24 @@ BKECluster Controller (L1 集群层状态机)
 2. **执行顺序不灵活**：无法实现"certs → bkeagent → coredns → kubelet"这样的交叉依赖
 3. **状态聚合复杂**：需要轮询等待 BKEMachine 状态，增加系统复杂度
 
-**Composite 组件类型**提供了一种替代方案：将节点级组件封装为 composite 类型，嵌入主流程 DAG 中，由 DAG 调度器统一执行。
+**Composite 组件类型**（KEP-15）提供了一种替代方案：将节点级组件封装为 composite 类型，DAG 构建时展开为独立子组件节点，由 DAG 调度器统一执行。composite 自身不产生 DAG 节点，展开后的子组件作为统一的 `topology.ComponentNode` 参与拓扑排序。
 
-#### 4.5.2 CompositeSpec 类型定义
+#### 4.5.2 与状态机的集成要点
 
-```go
-// api/v1alpha1/componentversion_types.go
+Composite 类型在状态机架构中的集成方式：
 
-// CompositeSpec 定义 Composite 组件规格 🆕新增
-//
-// 设计思路 — 与 YAML 类型的区别:
-// YAML 类型通过 K8s API apply 集群级资源；
-// Composite 类型包含多个子组件，子组件可以是任意类型（binary/helm/staticpod 等），
-// 支持按节点角色过滤，在每个节点上独立执行。
-//
-// 设计思路 — 与 Selector 类型的区别:
-// Selector 类型从 subComponents 中按 condition 选择一个子组件；
-// Composite 类型包含所有 subComponents，按角色过滤后全部执行。
-type CompositeSpec struct {
-    // 子组件列表
-    // 每个子组件可以是任意类型（binary/helm/staticpod/yaml/inline）
-    // DAG 构建时按角色过滤，展开为多个 DAG 节点
-    SubComponents []CompositeSubComponent `json:"subComponents"`
-    
-    // 节点过滤策略
-    // 控制 composite 组件在哪些节点上执行
-    NodeFilter *CompositeNodeFilter `json:"nodeFilter,omitempty"`
-    
-    // 执行模式
-    // Sequential: 子组件按依赖顺序串行执行
-    // Parallel: 子组件按依赖关系并行执行
-    ExecutionMode CompositeExecutionMode `json:"executionMode,omitempty"`
-}
+| 集成维度 | 设计 | 说明 |
+|---------|------|------|
+| **DAG 构建** | `expandCompositeComponents` 在 `BuildUpgradeDAG` 前展开 | composite 自身不产生 DAG 节点，展开为子组件（见 KEP-15 §6.2） |
+| **组件类型** | 展开后的子组件保持原类型（binary/staticpod/yaml/helm） | DAG 中全部为统一的 `ComponentNode`，类型延迟到执行期解析 |
+| **L1 执行** | 子组件由 `Scheduler.ExecuteDAG` 统一调度 | binary 子组件由 `BinaryComponentExecutor` SSH 逐节点执行 |
+| **L2 角色** | DAG 内联路径中 L2 不参与 | 由 `syncNodeStatus` 回写节点状态（见 §6.2.1） |
+| **L3 执行** | 各子组件由对应 `ComponentExecutor` 执行 | 类型分发通过 `ExecutorRegistry` 按 `ComponentType` 动态匹配 |
+| **节点过滤** | `CompositeSpec.NodeFilter`（见 KEP-15 §3） | 控制 composite 展开后哪些子组件在哪些节点上执行 |
+| **依赖处理** | composite 级别依赖被子组件继承 + 外部依赖展开（见 KEP-15 §6.4） | 与 selector 依赖处理对称 |
+| **状态回写** | `syncNodeStatus` 聚合所有子组件状态 | 与安装/升级路径完全一致 |
 
-// CompositeSubComponent 定义 Composite 子组件引用
-type CompositeSubComponent struct {
-    // 子组件名称（对应 ComponentVersion.Name）
-    Name string `json:"name"`
-    
-    // 子组件版本（对应 ComponentVersion.Version）
-    Version string `json:"version"`
-    
-    // 依赖的子组件名称列表
-    Dependencies []string `json:"dependencies,omitempty"`
-    
-    // 适用角色：master / worker / etcd
-    // 空表示所有角色都需要此子组件
-    Roles []string `json:"roles,omitempty"`
-}
-
-// CompositeNodeFilter 定义 Composite 组件的节点过滤策略
-type CompositeNodeFilter struct {
-    // 目标节点角色列表
-    // 空或不填 = 所有角色
-    // 示例: ["master", "worker"], ["etcd"]
-    Roles []string `json:"roles,omitempty"`
-    
-    // 节点标签选择器
-    // 仅选择标签完全匹配的节点
-    MatchLabels map[string]string `json:"matchLabels,omitempty"`
-}
-
-// CompositeExecutionMode 定义 Composite 组件的执行模式
-type CompositeExecutionMode string
-
-const (
-    // CompositeExecutionSequential 串行执行：子组件按依赖顺序串行执行
-    CompositeExecutionSequential CompositeExecutionMode = "Sequential"
-    
-    // CompositeExecutionParallel 并行执行：子组件按依赖关系并行执行
-    CompositeExecutionParallel CompositeExecutionMode = "Parallel"
-)
-
-// ComponentVersionSpec 扩展
-type ComponentVersionSpec struct {
-    // ... 现有字段 ...
-    
-    // Composite 类型配置 (type=composite 时必填) 🆕新增
-    Composite *CompositeSpec `json:"composite,omitempty"`
-}
-
-const (
-    // ... 现有类型 ...
-    ComponentTypeComposite ComponentType = "composite" // 🆕新增：组合组件
-)
-```
-
-#### 4.5.3 Composite ComponentVersion YAML 示例
-
-```yaml
-# bke-manifests/node-components/v2.7.0/component.yaml
-apiVersion: config.openfuyao.cn/v1alpha1
-kind: ComponentVersion
-metadata:
-  name: node-components-v2.7.0
-spec:
-  name: node-components
-  type: composite
-  version: v2.7.0
-  
-  composite:
-    # 节点过滤：此 composite 在所有节点上执行
-    nodeFilter:
-      roles: ["master", "worker"]
-    
-    # 执行模式：按依赖关系并行执行
-    executionMode: Parallel
-    
-    # 子组件列表
-    subComponents:
-      # 所有节点都需要的组件
-      - name: bkeagent
-        version: v2.7.0
-        dependencies: []
-        roles: [master, worker]
-      
-      - name: containerd
-        version: v1.7.18
-        dependencies: [bkeagent]
-        roles: [master, worker]
-      
-      - name: kubelet
-        version: v1.29.0
-        dependencies: [containerd]
-        roles: [master, worker]
-      
-      - name: kubectl
-        version: v1.29.0
-        dependencies: [kubelet]
-        roles: [master, worker]
-      
-      # Master 特有组件
-      - name: etcd
-        version: v3.5.21-of.1
-        dependencies: [kubelet]
-        roles: [master]
-      
-      - name: apiserver
-        version: v1.29.0
-        dependencies: [etcd]
-        roles: [master]
-      
-      - name: controller-manager
-        version: v1.29.0
-        dependencies: [apiserver]
-        roles: [master]
-      
-      - name: scheduler
-        version: v1.29.0
-        dependencies: [apiserver]
-        roles: [master]
-  
-  # Composite 组件的依赖关系
-  dependencies:
-    - name: certs
-      phase: Install
-  
-  upgradeStrategy:
-    mode: Rolling
-    batchSize: 1
-    timeout: "30m"
-    failurePolicy: FailFast
-```
-
-#### 4.5.4 ReleaseImage 中使用 Composite 组件
-
-```yaml
-# ReleaseImage 使用 Composite 组件
-apiVersion: cvo.openfuyao.cn/v1alpha1
-kind: ReleaseImage
-metadata:
-  name: openfuyao-v2.7.0
-spec:
-  version: "v2.7.0"
-  
-  # 所有组件统一在 components 列表中
-  # Composite 组件会展开为多个子组件
-  components:
-    - name: certs
-      version: "v2.7.0"
-      dependencies: []
-    
-    # Composite 组件：包含所有节点级组件
-    - name: node-components
-      version: "v2.7.0"
-      dependencies: [certs]
-    
-    - name: coredns
-      version: "v1.11.1"
-      dependencies: [node-components]  # 依赖节点组件完成
-    
-    - name: kube-proxy
-      version: "v2.7.0"
-      dependencies: [node-components]
-```
-
-#### 4.5.5 CompositeComponentExecutor 实现
-
-```go
-// pkg/dagexec/executor/composite.go
-
-// CompositeComponentExecutor Composite 组件执行器
-type CompositeComponentExecutor struct {
-    client   client.Client
-    recorder record.EventRecorder
-    
-    // 子组件执行器工厂
-    executorFactory *ComponentExecutorFactory
-}
-
-// Execute 执行 Composite 组件
-func (e *CompositeComponentExecutor) Execute(ctx context.Context, execCtx *ExecutionContext) error {
-    spec := execCtx.ComponentVersion.Spec.Composite
-    
-    // 1. 获取目标节点列表
-    nodes, err := e.filterNodes(ctx, execCtx, spec.NodeFilter)
-    if err != nil {
-        return fmt.Errorf("filter nodes: %w", err)
-    }
-    
-    // 2. 按角色过滤子组件
-    filteredSubComponents := e.filterSubComponentsByRole(spec.SubComponents, nodes)
-    
-    // 3. 构建子组件 DAG
-    subDAG, err := e.buildSubDAG(filteredSubComponents)
-    if err != nil {
-        return fmt.Errorf("build sub DAG: %w", err)
-    }
-    
-    // 4. 在每个节点上执行子组件 DAG
-    return e.executeOnNodes(ctx, execCtx, nodes, subDAG)
-}
-
-// filterNodes 按节点过滤策略获取目标节点
-func (e *CompositeComponentExecutor) filterNodes(
-    ctx context.Context,
-    execCtx *ExecutionContext,
-    filter *CompositeNodeFilter,
-) ([]Node, error) {
-    if filter == nil {
-        return execCtx.GetAllNodes(), nil
-    }
-    
-    var filtered []Node
-    for _, node := range execCtx.GetAllNodes() {
-        // 按角色过滤
-        if len(filter.Roles) > 0 {
-            matched := false
-            for _, role := range filter.Roles {
-                if role == node.Role {
-                    matched = true
-                    break
-                }
-            }
-            if !matched {
-                continue
-            }
-        }
-        
-        // 按标签过滤
-        if len(filter.MatchLabels) > 0 {
-            matched := true
-            for k, v := range filter.MatchLabels {
-                if node.Labels[k] != v {
-                    matched = false
-                    break
-                }
-            }
-            if !matched {
-                continue
-            }
-        }
-        
-        filtered = append(filtered, node)
-    }
-    
-    return filtered, nil
-}
-
-// filterSubComponentsByRole 按角色过滤子组件
-func (e *CompositeComponentExecutor) filterSubComponentsByRole(
-    subComponents []CompositeSubComponent,
-    nodes []Node,
-) map[string][]CompositeSubComponent {
-    result := make(map[string][]CompositeSubComponent)
-    
-    for _, node := range nodes {
-        var filtered []CompositeSubComponent
-        for _, comp := range subComponents {
-            if len(comp.Roles) == 0 {
-                // 无角色限制，所有节点都需要
-                filtered = append(filtered, comp)
-                continue
-            }
-            for _, r := range comp.Roles {
-                if r == node.Role {
-                    filtered = append(filtered, comp)
-                    break
-                }
-            }
-        }
-        result[node.Name] = filtered
-    }
-    
-    return result
-}
-
-// buildSubDAG 构建子组件 DAG
-func (e *CompositeComponentExecutor) buildSubDAG(
-    filteredSubComponents map[string][]CompositeSubComponent,
-) (*ExecutionDAG, error) {
-    dag := NewExecutionDAG()
-    
-    // 收集所有唯一的子组件
-    allComponents := make(map[string]CompositeSubComponent)
-    for _, components := range filteredSubComponents {
-        for _, comp := range components {
-            allComponents[comp.Name] = comp
-        }
-    }
-    
-    // 添加子组件节点
-    for name, comp := range allComponents {
-        cv := lookupComponentVersion(comp.Name, comp.Version)
-        dag.AddNode(&SubComponentNode{
-            name:      name,
-            component: cv,
-            deps:      comp.Dependencies,
-        })
-    }
-    
-    // 构建依赖边
-    dag.BuildEdges()
-    
-    return dag, nil
-}
-
-// executeOnNodes 在节点上执行子组件 DAG
-func (e *CompositeComponentExecutor) executeOnNodes(
-    ctx context.Context,
-    execCtx *ExecutionContext,
-    nodes []Node,
-    subDAG *ExecutionDAG,
-) error {
-    // 按执行模式执行
-    mode := execCtx.ComponentVersion.Spec.Composite.ExecutionMode
-    if mode == "" {
-        mode = CompositeExecutionParallel
-    }
-    
-    switch mode {
-    case CompositeExecutionSequential:
-        return e.executeSequential(ctx, execCtx, nodes, subDAG)
-    case CompositeExecutionParallel:
-        return e.executeParallel(ctx, execCtx, nodes, subDAG)
-    default:
-        return fmt.Errorf("unknown execution mode: %s", mode)
-    }
-}
-
-// executeSequential 串行执行：逐节点执行
-func (e *CompositeComponentExecutor) executeSequential(
-    ctx context.Context,
-    execCtx *ExecutionContext,
-    nodes []Node,
-    subDAG *ExecutionDAG,
-) error {
-    for _, node := range nodes {
-        if err := e.executeOnNode(ctx, execCtx, node, subDAG); err != nil {
-            return fmt.Errorf("node %s failed: %w", node.Name, err)
-        }
-    }
-    return nil
-}
-
-// executeParallel 并行执行：所有节点并行执行
-func (e *CompositeComponentExecutor) executeParallel(
-    ctx context.Context,
-    execCtx *ExecutionContext,
-    nodes []Node,
-    subDAG *ExecutionDAG,
-) error {
-    g, ctx := errgroup.WithContext(ctx)
-    
-    for _, node := range nodes {
-        node := node
-        g.Go(func() error {
-            return e.executeOnNode(ctx, execCtx, node, subDAG)
-        })
-    }
-    
-    return g.Wait()
-}
-
-// executeOnNode 在单个节点上执行子组件 DAG
-func (e *CompositeComponentExecutor) executeOnNode(
-    ctx context.Context,
-    execCtx *ExecutionContext,
-    node Node,
-    subDAG *ExecutionDAG,
-) error {
-    // 创建节点级执行上下文
-    nodeExecCtx := execCtx.ForNode(node)
-    
-    // 按拓扑顺序执行子组件
-    batches := subDAG.TopologicalBatches()
-    
-    for _, batch := range batches {
-        g, batchCtx := errgroup.WithContext(ctx)
-        
-        for _, nodeName := range batch {
-            nodeName := nodeName
-            g.Go(func() error {
-                node := subDAG.GetNode(nodeName)
-                return node.Execute(batchCtx, nodeExecCtx)
-            })
-        }
-        
-        if err := g.Wait(); err != nil {
-            return err
-        }
-    }
-    
-    return nil
-}
-
-// SubComponentNode 子组件节点
-type SubComponentNode struct {
-    name      string
-    component *ComponentVersion
-    deps      []string
-}
-
-// Execute 执行子组件
-func (n *SubComponentNode) Execute(ctx context.Context, execCtx *ExecutionContext) error {
-    // 根据组件类型选择执行器
-    executor, err := execCtx.ExecutorFactory.GetExecutor(n.component.Spec.Type)
-    if err != nil {
-        return fmt.Errorf("get executor for %s: %w", n.name, err)
-    }
-    
-    // 创建组件执行上下文
-    compExecCtx := execCtx.ForComponent(n.component)
-    
-    // 执行组件
-    return executor.Execute(ctx, compExecCtx)
-}
-```
-
-#### 4.5.6 DAG 构建流程对比
+#### 4.5.3 DAG 构建流程对比
 
 **原设计（node-group 节点）**：
 
@@ -2273,51 +1844,45 @@ node-group 节点内部：
   - 聚合节点状态
 ```
 
-**Composite 设计**：
+**Composite 设计**（详见 KEP-15）：
 
 ```
 ReleaseImage:
   components: [certs, node-components(composite), coredns, kube-proxy]
 
-构建后的 DAG:
-  ┌────────┐   ┌──────────────────────────────────────────────┐   ┌─────────┐
-  │ certs  │──>│           node-components (composite)        │──>│ coredns │
-  └────────┘   │  ┌──────────┐   ┌──────────┐   ┌──────────┐ │   └─────────┘
-               │  │ bkeagent │──>│containerd│──>│ kubelet  │ │
-               │  └──────────┘   └──────────┘   └────┬─────┘ │
-               │                                      │       │
-               │                               ┌──────┴──────┐│
-               │                               │             ││
-               │                          ┌────▼───┐   ┌─────▼──┐
-               │                          │ etcd   │   │ (worker│
-               │                          │(master)│   │  无)   │
-               │                          └────┬───┘   └────────┘
-               │                               │
-               │                          ┌────▼────┐
-               │                          │apiserver│
-               │                          └─────────┘
-               └──────────────────────────────────────────────┘
-               
-Composite 节点内部：
-  - 按角色过滤子组件
-  - 构建子组件 DAG
-  - 在每个节点上执行子组件 DAG
-  - 直接更新组件状态（无需等待 BKEMachine）
+构建后的 DAG (composite 展开后):
+  ┌────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌─────────┐
+  │ certs  │──>│ bkeagent │──>│containerd│──>│ kubelet  │──>│ coredns │
+  │(staticpod)  │(binary)  │   │(binary)  │   │(binary)  │   │ (helm)  │
+  └────────┘   └──────────┘   └──────────┘   └──────────┘   └─────────┘
+                                  │
+                                  ▼
+                              ┌──────────┐
+                              │ etcd     │──> kube-apiserver ──> cm / scheduler
+                              │(staticpod)
+                              └──────────┘
+
+Composite 节点不产生 DAG 节点:
+  - DAG 构建时 expandCompositeComponents 展开为子组件
+  - 子组件作为统一 ComponentNode 参与拓扑排序
+  - 依赖关系统一在 DAG 中表达 (见 KEP-15 §6.4 依赖处理)
+  - 由 Scheduler.ExecuteDAG 统一调度执行
 ```
 
-#### 4.5.7 两种设计对比
+#### 4.5.4 两种设计对比
 
-| 维度 | node-group 设计 | Composite 设计 |
-|------|----------------|----------------|
+| 维度 | node-group 设计 | Composite 设计 (KEP-15) |
+|------|----------------|------------------------|
 | **DAG 结构** | 集群组件 + node-group 节点 | 所有组件统一在 DAG 中 |
-| **依赖表达** | 集群组件和节点组件依赖分离 | 所有组件依赖关系统一表达 |
+| **依赖表达** | 集群组件和节点组件依赖分离 | 所有组件依赖关系统一表达（KEP-15 §6.4） |
 | **执行控制** | BKEMachine Controller 独立驱动 | DAG 调度器统一驱动 |
-| **状态追踪** | BKEMachine.Status | BKECluster.Status.ComponentStatuses |
+| **状态追踪** | BKEMachine.Status | BKECluster.Status.NodeComponentStatuses + syncNodeStatus |
 | **执行顺序** | 集群组件 → 节点组件 → 集群组件 | 按 DAG 拓扑顺序灵活执行 |
 | **复杂度** | 需要轮询等待，状态聚合复杂 | 统一调度，状态追踪简单 |
 | **CAPI 集成** | 深度集成 BKEMachine | 轻量集成，复用现有 Controller |
+| **节点扩缩容** | node-group 原生支持 | DAG 内联 (默认) 或 Watch 触发 (可选，见 §6.2.3) |
 
-#### 4.5.8 选择建议
+#### 4.5.5 选择建议
 
 | 场景 | 推荐设计 | 原因 |
 |------|---------|------|
@@ -2325,9 +1890,9 @@ Composite 节点内部：
 | 需要灵活的依赖关系 | Composite | 所有组件依赖关系统一表达 |
 | 需要独立的节点生命周期管理 | node-group | BKEMachine 独立管理节点状态 |
 | 需要简单的状态追踪 | Composite | 统一状态模型，无需聚合 |
-| 需要支持节点扩缩容 | node-group | BKEMachine 原生支持 |
+| 需要支持节点扩缩容 | 两者均可 | Composite: DAG 内联 (默认) / Watch 触发 (可选) |
 
----
+
 
 ## 5. 完整执行流程
 
