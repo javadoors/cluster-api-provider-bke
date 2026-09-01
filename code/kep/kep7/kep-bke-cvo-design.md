@@ -2258,81 +2258,792 @@ func (w *SyncWorker) apply(ctx context.Context, work *SyncWork, maxWorkers int) 
 
 ## 8. ClusterVersion 状态机设计
 
-### 8.1 正式 State 接口
+### 8.1 设计思路
+
+ClusterVersion 状态机是 BKE CVO 的核心协调驱动器。借鉴 OpenShift CVO 的 sync() 循环 + SyncWorker 状态机，将当前散落在 Reconciler 中的 if-else 分支重构为**正式的有限状态机 (FSM)**：每个状态实现 `Enter/Execute/Exit` 事务性方法，`Execute()` 返回下一状态，形成自驱动的状态转换链。
+
+设计目标：
+- **消除 panic/recover**：Goal 3 要求移除 PhaseFlow 的 `handlePanic`，改用错误分类 (Transient/Permanent/Dependency/Conflict)
+- **状态持久化**：Phase 写入 ClusterVersion.status.phase，跨重启恢复
+- **事务性转换**：Enter → Execute → Exit，中间可回滚
+- **可观测**：每个状态转换记录到 status.conditions，便于诊断
+
+### 8.2 State 接口定义
 
 ```go
 // pkg/cvo/state.go
 
+package cvo
+
+import (
+    "context"
+    "fmt"
+    "time"
+
+    metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+    "k8s.io/client-go/util/retry"
+
+    cvov1alpha1 "github.com/bke/api/v1alpha1"
+)
+
+// ClusterVersionPhase 是 ClusterVersion 的生命周期阶段
+type ClusterVersionPhase string
+
+const (
+    PhasePending        ClusterVersionPhase = "Pending"
+    PhasePreChecking    ClusterVersionPhase = "PreChecking"
+    PhaseInstalling     ClusterVersionPhase = "Installing"
+    PhaseInstalled      ClusterVersionPhase = "Installed"
+    PhaseUpgrading      ClusterVersionPhase = "Upgrading"
+    PhaseUpgraded       ClusterVersionPhase = "Upgraded"
+    PhaseReady          ClusterVersionPhase = "Ready"
+    PhasePreCheckFailed ClusterVersionPhase = "PreCheckFailed"
+    PhaseFailed         ClusterVersionPhase = "Failed"
+    PhaseBlocked        ClusterVersionPhase = "Blocked"
+)
+
+// State 是状态机的状态接口
+// 每个状态实现 Enter → Execute → Exit 事务性方法
 type State interface {
+    // Name 返回状态名称
     Name() ClusterVersionPhase
-    Enter(ctx context.Context, cv *ClusterVersion) error
-    Execute(ctx context.Context, cv *ClusterVersion) (State, error)
-    Exit(ctx context.Context, cv *ClusterVersion) error
+
+    // Enter 进入状态时的初始化操作 (如设置 conditions, 记录开始时间)
+    // 返回 error 表示初始化失败，状态机不进入此状态
+    Enter(ctx context.Context, cv *cvov1alpha1.ClusterVersion) error
+
+    // Execute 执行状态的核心逻辑
+    // 返回 (nextState, error): nextState 为 nil 表示留在当前状态
+    Execute(ctx context.Context, cv *cvov1alpha1.ClusterVersion) (State, error)
+
+    // Exit 退出状态时的清理操作 (如记录结束时间, 清理临时资源)
+    Exit(ctx context.Context, cv *cvov1alpha1.ClusterVersion) error
+
+    // CanTransitionTo 判断是否可以转换到目标状态
     CanTransitionTo(target State) bool
+}
+
+// StateMachine 驱动状态转换
+type StateMachine struct {
+    current    State
+    cv         *cvov1alpha1.ClusterVersion
+    client     client.Client
+    logger     logr.Logger
+    maxRetries int
+    retryCount int
+}
+
+// NewStateMachine 创建状态机
+func NewStateMachine(initial State, cv *cvov1alpha1.ClusterVersion, client client.Client, logger logr.Logger) *StateMachine {
+    return &StateMachine{
+        current:    initial,
+        cv:         cv,
+        client:     client,
+        logger:     logger,
+        maxRetries: 3,
+    }
+}
+
+// Run 驱动状态机循环执行
+func (sm *StateMachine) Run(ctx context.Context) error {
+    for {
+        select {
+        case <-ctx.Done():
+            return ctx.Err()
+        default:
+        }
+
+        cv := sm.cv
+
+        // 1. Enter
+        if err := sm.current.Enter(ctx, cv); err != nil {
+            return fmt.Errorf("enter %s: %w", sm.current.Name(), err)
+        }
+
+        // 2. Execute
+        nextState, err := sm.current.Execute(ctx, cv)
+        if err != nil {
+            sm.logger.Error(err, "execute failed", "state", sm.current.Name())
+            // 错误分类处理
+            if isTransient(err) && sm.retryCount < sm.maxRetries {
+                sm.retryCount++
+                sm.logger.Info("retrying", "attempt", sm.retryCount, "state", sm.current.Name())
+                time.Sleep(backoffDuration(sm.retryCount))
+                continue // 留在当前状态重试
+            }
+            // 永久错误或重试耗尽 → 转入 Failed 状态
+            failedState := &FailedState{Reason: err.Error()}
+            if sm.current.CanTransitionTo(failedState) {
+                sm.transition(ctx, failedState)
+                continue
+            }
+            return err
+        }
+
+        sm.retryCount = 0 // 成功则重置重试计数
+
+        // 3. Exit
+        if err := sm.current.Exit(ctx, cv); err != nil {
+            sm.logger.Error(err, "exit failed", "state", sm.current.Name())
+        }
+
+        // 4. 转换状态
+        if nextState == nil {
+            // 留在当前状态，等待外部事件 (requeue)
+            return nil
+        }
+        if !sm.current.CanTransitionTo(nextState) {
+            return fmt.Errorf("invalid transition: %s → %s", sm.current.Name(), nextState.Name())
+        }
+        sm.transition(ctx, nextState)
+    }
+}
+
+// transition 执行状态转换
+func (sm *StateMachine) transition(ctx context.Context, next State) {
+    sm.logger.Info("state transition",
+        "from", sm.current.Name(),
+        "to", next.Name())
+    sm.current = next
+    // 持久化 Phase 到 status
+    retry.OnError(retry.DefaultBackoff, func(err error) bool { return true }, func() error {
+        return sm.patchPhase(ctx, next.Name())
+    })
+}
+
+// patchPhase 将 Phase 写入 ClusterVersion.status
+func (sm *StateMachine) patchPhase(ctx context.Context, phase ClusterVersionPhase) error {
+    base := sm.cv.DeepCopy()
+    sm.cv.Status.Phase = phase
+    return sm.client.Status().Patch(ctx, sm.cv, client.MergeFrom(base))
 }
 ```
 
-### 8.2 状态机
+### 8.3 状态转换图
 
 ```txt
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │                    ClusterVersion 状态机                                         │
 ├─────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                 │
-│   ┌──────────┐                                                                  │
-│   │ Pending  │  (等待 desiredVersion 设置)                                      │
-│   └────┬─────┘                                                                  │
-│        │ desiredVersion 设置 + ReleaseImage Valid                               │
-│        ▼                                                                        │
-│   ┌──────────┐    前置检查失败    ┌──────────────┐                              │
-│   │PreChecking│──────────────→│ PreCheckFailed│                              │
-│   └────┬─────┘                  └──────┬───────┘                              │
-│        │ 前置检查通过                     │ 用户重新触发                          │
-│        ▼                                  ▼                                      │
-│   ┌──────────┐                                                               │
-│   │Installing│  (首次安装，全并行 DAG)                                       │
-│   └────┬─────┘                                                               │
-│        │ 全部组件 Installed                                                  │
-│        ▼                                                                        │
-│   ┌──────────┐                                                               │
-│   │ Installed│  (安装完成)                                                    │
-│   └────┬─────┘                                                               │
-│        │ desiredVersion 变更                                                 │
-│        ▼                                                                        │
-│   ┌──────────┐                                                               │
-│   │Upgrading │  (版本升级，有序 DAG)                                          │
-│   └────┬─────┘                                                               │
-│        │                              ┌──────────┐                           │
-│        ├── 全部组件升级成功 ────────→│ Upgraded │                           │
-│        │                              └────┬─────┘                           │
-│        │                                   │ (多 hop 时继续升级)             │
-│        │                                   ▼                                    │
-│        │                              ┌──────────┐                           │
-│        │                              │ Upgrading│ (下一 hop)                │
-│        │                              └──────────┘                           │
-│        │                              ┌──────────┐                           │
-│        └── 组件升级失败 ──────────────→│  Failed  │                           │
-│                                       └────┬─────┘                           │
-│                                            │ 重试次数未耗尽                     │
-│                                            ▼                                    │
-│                                       ┌──────────┐                           │
-│                                       │Upgrading │ (重试)                    │
-│                                       └──────────┘                           │
+│                        ┌──────────┐                                            │
+│                 创建    │ Pending  │  等待 desiredVersion 设置                   │
+│               ───────→ └────┬─────┘                                            │
+│                            │ desiredVersion 设置 + ReleaseImage Valid           │
+│                            ▼                                                    │
+│                     ┌──────────────┐  前置检查失败  ┌──────────────┐            │
+│                     │ PreChecking  │──────────────→│ PreCheckFailed│            │
+│                     └──────┬───────┘               └──────┬───────┘            │
+│                            │ 前置检查通过                   │ 用户重新触发     │
+│                            │ (force=true 也跳过)            │ (或 force)       │
+│                            ▼                                ▼                   │
+│  首次安装 (无 history) ─→ ┌────────────┐                                     │
+│                           │ Installing │  全并行 DAG (InitializingPayload)    │
+│                           └─────┬──────┘                                     │
+│                                 │ 全部组件 Installed + Available              │
+│                                 ▼                                              │
+│                           ┌────────────┐                                     │
+│                           │ Installed  │  安装完成                             │
+│                           └─────┬──────┘                                     │
+│                                 │ desiredVersion == currentVersion            │
+│                                 ▼                                              │
+│                           ┌────────────┐                                     │
+│                           │   Ready    │  稳态 (当前版本 == 期望版本)          │
+│                           └─────┬──────┘                                     │
+│                                 │ desiredVersion 变更 (≠ currentVersion)      │
+│                                 ▼                                              │
+│  版本升级 (有 history) ──→ ┌────────────┐  组件升级失败  ┌──────────┐          │
+│                            │ Upgrading  │──────────────→│  Failed  │          │
+│                            └─────┬──────┘               └────┬─────┘          │
+│                                  │                           │ 重试 < maxRetries│
+│                                  │ 单 hop 成功               ▼                 │
+│                                  ▼                    ┌────────────┐          │
+│                            ┌────────────┐            │ Upgrading  │ (重试)    │
+│                            │  Upgraded  │            └────────────┘          │
+│                            └─────┬──────┘                                    │
+│                                  │                                            │
+│                         ┌────────┴────────┐                                   │
+│                         │                 │                                    │
+│                    hop==desired    hop≠desired (多 hop)                      │
+│                         │                 │                                    │
+│                         ▼                 ▼                                    │
+│                   ┌──────────┐     ┌────────────┐                            │
+│                   │  Ready   │     │ Upgrading  │ (下一 hop)                 │
+│                   └──────────┘     └────────────┘                            │
 │                                                                                 │
 │  ┌──────────┐                                                                   │
-│  │ Blocked  │  (Upgradeable=False 或前置条件阻止)                              │
-│  └──────────┘                                                                   │
-│                                                                                 │
-│  ┌──────────┐                                                                   │
-│  │  Ready   │  (当前版本 == desiredVersion，无进行中操作)                       │
-│  └──────────┘                                                                   │
+│  │ Blocked  │  ←── Upgradeable=False 或 Precondition 阻止                     │
+│  └────┬─────┘                                                                   │
+│       │ Upgradeable=True 或 force=true                                         │
+│       ▼                                                                          │
+│  (回到 PreChecking 或 Upgrading)                                                │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 8.3 与现有 ClusterVersionPhase 的关系
+### 8.4 状态定义与转换矩阵
 
-现有 Phase 枚举 (`Pending`, `Installing`, `Installed`, `Ready`, `PreChecking`, `Upgrading`, `Upgraded`, `Blocked`, `PreCheckFailed`, `Failed`) 保持不变。新增 State 接口封装 Phase 转换逻辑，`Execute()` 方法替代当前散落在 Reconciler 中的 if-else 分支。
+| 当前状态 \ 可转换到 | Pending | PreChecking | PreCheckFailed | Installing | Installed | Upgrading | Upgraded | Ready | Failed | Blocked |
+|---------------------|---------|-------------|----------------|------------|-----------|-----------|----------|-------|--------|---------|
+| **Pending** | - | ✓ | - | - | - | - | - | - | - | - |
+| **PreChecking** | - | - | ✓ | ✓ | - | ✓ | - | - | - | ✓ |
+| **PreCheckFailed** | - | ✓ | - | - | - | - | - | - | - | - |
+| **Installing** | - | - | - | - | ✓ | - | - | - | ✓ | - |
+| **Installed** | - | - | - | - | - | - | - | ✓ | - | - |
+| **Upgrading** | - | - | - | - | - | - | ✓ | - | ✓ | - |
+| **Upgraded** | - | - | - | - | - | ✓ | - | ✓ | - | - |
+| **Ready** | - | ✓ | - | - | - | ✓ | - | - | - | - |
+| **Failed** | - | ✓ | - | - | - | ✓ | - | - | - | - |
+| **Blocked** | - | ✓ | - | - | - | ✓ | - | - | - | - |
+
+### 8.5 各状态实现
+
+```go
+// ─── PendingState ──────────────────────────────────────────────────────────────
+
+// PendingState: 等待 desiredVersion 设置
+type PendingState struct{}
+
+func (s *PendingState) Name() ClusterVersionPhase { return PhasePending }
+
+func (s *PendingState) Enter(ctx context.Context, cv *cvov1alpha1.ClusterVersion) error {
+    // 设置初始 conditions
+    setCondition(cv, "Available", metav1.ConditionFalse, "Pending",
+        "ClusterVersion is pending, waiting for desiredVersion to be set")
+    setCondition(cv, "Progressing", metav1.ConditionFalse, "Pending", "No operation in progress")
+    return nil
+}
+
+func (s *PendingState) Execute(ctx context.Context, cv *cvov1alpha1.ClusterVersion) (State, error) {
+    if cv.Spec.DesiredVersion == "" {
+        return nil, nil // 留在 Pending，等待用户设置 desiredVersion
+    }
+    // desiredVersion 已设置 → 进入 PreChecking
+    return &PreCheckingState{}, nil
+}
+
+func (s *PendingState) Exit(ctx context.Context, cv *cvov1alpha1.ClusterVersion) error { return nil }
+func (s *PendingState) CanTransitionTo(target State) bool {
+    _, ok := target.(*PreCheckingState)
+    return ok
+}
+
+// ─── PreCheckingState ─────────────────────────────────────────────────────────
+
+// PreCheckingState: 前置条件检查 (Rollback/GiantHop/Upgradeable/RecommendedUpdate/SignatureVerified)
+type PreCheckingState struct {
+    preconditions PreconditionList
+}
+
+func (s *PreCheckingState) Name() ClusterVersionPhase { return PhasePreChecking }
+
+func (s *PreCheckingState) Enter(ctx context.Context, cv *cvov1alpha1.ClusterVersion) error {
+    setCondition(cv, "Progressing", metav1.ConditionTrue, "PreChecking",
+        fmt.Sprintf("Running preconditions for %s", cv.Spec.DesiredVersion))
+    return nil
+}
+
+func (s *PreCheckingState) Execute(ctx context.Context, cv *cvov1alpha1.ClusterVersion) (State, error) {
+    releaseCtx := ReleaseContext{
+        DesiredVersion: cv.Spec.DesiredVersion,
+        CurrentVersion: cv.Status.CurrentVersion,
+        ClusterVersion:  cv,
+    }
+
+    // 运行前置条件检查
+    errs := precondition.RunAll(ctx, s.preconditions, releaseCtx)
+    blocking, err := precondition.Summarize(errs, cv.Spec.Force)
+    if blocking && !cv.Spec.Force {
+        // 前置检查失败 (非 force) → PreCheckFailed
+        return &PreCheckFailedState{Reason: err.Error()}, nil
+    }
+    if err != nil && !blocking {
+        // 非阻塞警告 (force 跳过) → 记录到 conditions，继续
+        setCondition(cv, "ReleaseAccepted", metav1.ConditionTrue, "Forced",
+            fmt.Sprintf("Forced through blocking failures: %v", err))
+    }
+
+    // 判断是安装还是升级
+    if len(cv.Status.UpgradeHistory) == 0 || cv.Status.CurrentVersion == "" {
+        // 首次安装
+        return &InstallingState{}, nil
+    }
+
+    // 版本升级
+    return &UpgradingState{}, nil
+}
+
+func (s *PreCheckingState) Exit(ctx context.Context, cv *cvov1alpha1.ClusterVersion) error { return nil }
+func (s *PreCheckingState) CanTransitionTo(target State) bool {
+    switch target.(type) {
+    case *PreCheckFailedState, *InstallingState, *UpgradingState, *BlockedState:
+        return true
+    }
+    return false
+}
+
+// ─── InstallingState ──────────────────────────────────────────────────────────
+
+// InstallingState: 首次安装，全并行 DAG (InitializingPayload)
+type InstallingState struct {
+    syncWorker SyncWorker
+}
+
+func (s *InstallingState) Name() ClusterVersionPhase { return PhaseInstalling }
+
+func (s *InstallingState) Enter(ctx context.Context, cv *cvov1alpha1.ClusterVersion) error {
+    setCondition(cv, "Progressing", metav1.ConditionTrue, "Installing",
+        fmt.Sprintf("Installing cluster version %s", cv.Spec.DesiredVersion))
+    cv.Status.UpgradeHistory = prependHistory(cv.Status.UpgradeHistory, cv.Status.CurrentVersion,
+        cv.Spec.DesiredVersion, "Installing")
+    return nil
+}
+
+func (s *InstallingState) Execute(ctx context.Context, cv *cvov1alpha1.ClusterVersion) (State, error) {
+    desired := Update{Version: cv.Spec.DesiredVersion, Image: cv.Status.Desired.Image}
+    status := s.syncWorker.Update(ctx, cv.Generation, desired, cv, InitializingPayload, nil)
+
+    if status.Failure != nil {
+        // 安装失败
+        return nil, status.Failure // 触发 Failed 转换
+    }
+
+    if status.Done < status.Total {
+        // 仍在安装中
+        setCondition(cv, "Progressing", metav1.ConditionTrue, "Installing",
+            fmt.Sprintf("Installing %s: %d of %d done (%.0f%% complete)",
+                cv.Spec.DesiredVersion, status.Done, status.Total,
+                float64(status.Done)/float64(status.Total)*100))
+        return nil, nil // 留在当前状态 (requeue)
+    }
+
+    // 安装完成
+    return &InstalledState{}, nil
+}
+
+func (s *InstallingState) Exit(ctx context.Context, cv *cvov1alpha1.ClusterVersion) error { return nil }
+func (s *InstallingState) CanTransitionTo(target State) bool {
+    switch target.(type) {
+    case *InstalledState, *FailedState:
+        return true
+    }
+    return false
+}
+
+// ─── InstalledState ───────────────────────────────────────────────────────────
+
+// InstalledState: 安装完成
+type InstalledState struct{}
+
+func (s *InstalledState) Name() ClusterVersionPhase { return PhaseInstalled }
+
+func (s *InstalledState) Enter(ctx context.Context, cv *cvov1alpha1.ClusterVersion) error {
+    cv.Status.CurrentVersion = cv.Spec.DesiredVersion
+    // 更新 history 为 Completed
+    if len(cv.Status.UpgradeHistory) > 0 {
+        cv.Status.UpgradeHistory[0].Status = "Succeeded"
+        now := metav1.Now()
+        cv.Status.UpgradeHistory[0].CompletionTime = &now
+    }
+    setCondition(cv, "Available", metav1.ConditionTrue, "AsExpected",
+        fmt.Sprintf("Cluster has deployed %s", cv.Spec.DesiredVersion))
+    setCondition(cv, "Progressing", metav1.ConditionFalse, "AsExpected",
+        fmt.Sprintf("Cluster version is %s", cv.Spec.DesiredVersion))
+    setCondition(cv, "Degraded", metav1.ConditionFalse, "AsExpected", "All is well")
+    return nil
+}
+
+func (s *InstalledState) Execute(ctx context.Context, cv *cvov1alpha1.ClusterVersion) (State, error) {
+    // 检查是否需要升级
+    if cv.Spec.DesiredVersion != cv.Status.CurrentVersion {
+        return &PreCheckingState{}, nil // → 重新检查前置条件 → Upgrading
+    }
+    // 稳态
+    return &ReadyState{}, nil
+}
+
+func (s *InstalledState) Exit(ctx context.Context, cv *cvov1alpha1.ClusterVersion) error { return nil }
+func (s *InstalledState) CanTransitionTo(target State) bool {
+    switch target.(type) {
+    case *ReadyState, *PreCheckingState:
+        return true
+    }
+    return false
+}
+
+// ─── UpgradingState ───────────────────────────────────────────────────────────
+
+// UpgradingState: 版本升级，有序 DAG (UpdatingPayload)
+type UpgradingState struct {
+    syncWorker   SyncWorker
+    hopTarget    string // 当前 hop 目标版本 (可能 ≠ desiredVersion，多 hop 升级)
+    maxRetries   int
+    retryCount   int
+}
+
+func (s *UpgradingState) Name() ClusterVersionPhase { return PhaseUpgrading }
+
+func (s *UpgradingState) Enter(ctx context.Context, cv *cvov1alpha1.ClusterVersion) error {
+    setCondition(cv, "Progressing", metav1.ConditionTrue, "Upgrading",
+        fmt.Sprintf("Working towards %s", s.hopTarget))
+    cv.Status.UpgradeHistory = prependHistory(cv.Status.UpgradeHistory,
+        cv.Status.CurrentVersion, s.hopTarget, "Upgrading")
+    s.retryCount = 0
+    return nil
+}
+
+func (s *UpgradingState) Execute(ctx context.Context, cv *cvov1alpha1.ClusterVersion) (State, error) {
+    desired := Update{Version: s.hopTarget, Image: cv.Status.Desired.Image}
+    status := s.syncWorker.Update(ctx, cv.Generation, desired, cv, UpdatingPayload, nil)
+
+    if status.Failure != nil {
+        // 升级失败
+        if s.retryCount < s.maxRetries && isTransient(status.Failure) {
+            s.retryCount++
+            return nil, nil // 留在 Upgrading 重试 (SyncWorker 内部 backoff)
+        }
+        return nil, status.Failure // 触发 Failed 转换
+    }
+
+    if status.Done < status.Total {
+        // 仍在升级中
+        setCondition(cv, "Progressing", metav1.ConditionTrue, "Upgrading",
+            fmt.Sprintf("Working towards %s: %d of %d done (%.0f%% complete)",
+                s.hopTarget, status.Done, status.Total,
+                float64(status.Done)/float64(status.Total)*100))
+        return nil, nil // 留在当前状态 (requeue)
+    }
+
+    // 升级完成
+    return &UpgradedState{hopTarget: s.hopTarget}, nil
+}
+
+func (s *UpgradingState) Exit(ctx context.Context, cv *cvov1alpha1.ClusterVersion) error { return nil }
+func (s *UpgradingState) CanTransitionTo(target State) bool {
+    switch target.(type) {
+    case *UpgradedState, *FailedState:
+        return true
+    }
+    return false
+}
+
+// ─── UpgradedState ────────────────────────────────────────────────────────────
+
+// UpgradedState: 单 hop 升级完成，判断是否需要继续多 hop
+type UpgradedState struct {
+    hopTarget string
+}
+
+func (s *UpgradedState) Name() ClusterVersionPhase { return PhaseUpgraded }
+
+func (s *UpgradedState) Enter(ctx context.Context, cv *cvov1alpha1.ClusterVersion) error {
+    // 推进 CurrentVersion 到 hopTarget
+    cv.Status.CurrentVersion = s.hopTarget
+    // 更新 history 为 Completed
+    if len(cv.Status.UpgradeHistory) > 0 {
+        cv.Status.UpgradeHistory[0].Status = "Succeeded"
+        now := metav1.Now()
+        cv.Status.UpgradeHistory[0].CompletionTime = &now
+    }
+    setCondition(cv, "Available", metav1.ConditionTrue, "AsExpected",
+        fmt.Sprintf("Cluster has deployed %s", s.hopTarget))
+    return nil
+}
+
+func (s *UpgradedState) Execute(ctx context.Context, cv *cvov1alpha1.ClusterVersion) (State, error) {
+    // 判断是否达到最终目标
+    if s.hopTarget == cv.Spec.DesiredVersion {
+        // 单 hop 或最终 hop 完成 → Ready
+        setCondition(cv, "Progressing", metav1.ConditionFalse, "AsExpected",
+            fmt.Sprintf("Cluster version is %s", cv.Spec.DesiredVersion))
+        return &ReadyState{}, nil
+    }
+    // 多 hop: 还有下一 hop
+    nextHop, err := resolveNextHop(cv.Status.CurrentVersion, cv.Spec.DesiredVersion, cv)
+    if err != nil {
+        return nil, fmt.Errorf("resolve next hop: %w", err)
+    }
+    return &UpgradingState{hopTarget: nextHop}, nil
+}
+
+func (s *UpgradedState) Exit(ctx context.Context, cv *cvov1alpha1.ClusterVersion) error { return nil }
+func (s *UpgradedState) CanTransitionTo(target State) bool {
+    switch target.(type) {
+    case *ReadyState, *UpgradingState:
+        return true
+    }
+    return false
+}
+
+// ─── ReadyState ───────────────────────────────────────────────────────────────
+
+// ReadyState: 稳态，当前版本 == desiredVersion
+type ReadyState struct{}
+
+func (s *ReadyState) Name() ClusterVersionPhase { return PhaseReady }
+
+func (s *ReadyState) Enter(ctx context.Context, cv *cvov1alpha1.ClusterVersion) error {
+    setCondition(cv, "Available", metav1.ConditionTrue, "AsExpected",
+        fmt.Sprintf("Cluster has deployed %s", cv.Status.CurrentVersion))
+    setCondition(cv, "Progressing", metav1.ConditionFalse, "AsExpected",
+        fmt.Sprintf("Cluster version is %s", cv.Status.CurrentVersion))
+    setCondition(cv, "Degraded", metav1.ConditionFalse, "AsExpected", "All is well")
+    setCondition(cv, "Upgradeable", metav1.ConditionTrue, "AsExpected", "Cluster is upgradeable")
+    return nil
+}
+
+func (s *ReadyState) Execute(ctx context.Context, cv *cvov1alpha1.ClusterVersion) (State, error) {
+    // 检查 desiredVersion 是否变更
+    if cv.Spec.DesiredVersion != cv.Status.CurrentVersion {
+        // 用户请求升级 → 进入 PreChecking
+        return &PreCheckingState{preconditions: defaultPreconditions()}, nil
+    }
+    // 稳态，等待外部事件 (requeue)
+    return nil, nil
+}
+
+func (s *ReadyState) Exit(ctx context.Context, cv *cvov1alpha1.ClusterVersion) error { return nil }
+func (s *ReadyState) CanTransitionTo(target State) bool {
+    switch target.(type) {
+    case *PreCheckingState, *UpgradingState:
+        return true
+    }
+    return false
+}
+
+// ─── FailedState ──────────────────────────────────────────────────────────────
+
+// FailedState: 安装/升级失败
+type FailedState struct {
+    Reason string
+}
+
+func (s *FailedState) Name() ClusterVersionPhase { return PhaseFailed }
+
+func (s *FailedState) Enter(ctx context.Context, cv *cvov1alpha1.ClusterVersion) error {
+    setCondition(cv, "Degraded", metav1.ConditionTrue, "ClusterVersionFailed",
+        fmt.Sprintf("Unable to apply %s: %s", cv.Spec.DesiredVersion, s.Reason))
+    setCondition(cv, "Progressing", metav1.ConditionTrue, "ClusterVersionFailed",
+        fmt.Sprintf("Unable to apply %s: %s", cv.Spec.DesiredVersion, s.Reason))
+    // 更新 history 为 Failed
+    if len(cv.Status.UpgradeHistory) > 0 {
+        cv.Status.UpgradeHistory[0].Status = "Failed"
+    }
+    return nil
+}
+
+func (s *FailedState) Execute(ctx context.Context, cv *cvov1alpha1.ClusterVersion) (State, error) {
+    // 等待用户干预 (修改 desiredVersion 或 force)
+    // Forward-only: 不自动回滚
+    if cv.Spec.DesiredVersion != cv.Status.CurrentVersion {
+        // 用户重新触发 → 重新检查前置条件
+        return &PreCheckingState{preconditions: defaultPreconditions()}, nil
+    }
+    return nil, nil // 留在 Failed
+}
+
+func (s *FailedState) Exit(ctx context.Context, cv *cvov1alpha1.ClusterVersion) error { return nil }
+func (s *FailedState) CanTransitionTo(target State) bool {
+    switch target.(type) {
+    case *PreCheckingState, *UpgradingState:
+        return true
+    }
+    return false
+}
+
+// ─── PreCheckFailedState ──────────────────────────────────────────────────────
+
+// PreCheckFailedState: 前置条件检查失败
+type PreCheckFailedState struct {
+    Reason string
+}
+
+func (s *PreCheckFailedState) Name() ClusterVersionPhase { return PhasePreCheckFailed }
+
+func (s *PreCheckFailedState) Enter(ctx context.Context, cv *cvov1alpha1.ClusterVersion) error {
+    setCondition(cv, "Degraded", metav1.ConditionTrue, "PreCheckFailed",
+        fmt.Sprintf("Precondition check failed for %s: %s", cv.Spec.DesiredVersion, s.Reason))
+    setCondition(cv, "Upgradeable", metav1.ConditionFalse, "PreCheckFailed",
+        fmt.Sprintf("Blocked by precondition: %s", s.Reason))
+    return nil
+}
+
+func (s *PreCheckFailedState) Execute(ctx context.Context, cv *cvov1alpha1.ClusterVersion) (State, error) {
+    // 等待用户修复 (如 Upgradeable 恢复) 或 force=true
+    if cv.Spec.Force {
+        return &PreCheckingState{preconditions: defaultPreconditions()}, nil
+    }
+    return nil, nil // 留在 PreCheckFailed
+}
+
+func (s *PreCheckFailedState) Exit(ctx context.Context, cv *cvov1alpha1.ClusterVersion) error { return nil }
+func (s *PreCheckFailedState) CanTransitionTo(target State) bool {
+    _, ok := target.(*PreCheckingState)
+    return ok
+}
+
+// ─── BlockedState ─────────────────────────────────────────────────────────────
+
+// BlockedState: Upgradeable=False 或风险阻止
+type BlockedState struct {
+    Reason string
+}
+
+func (s *BlockedState) Name() ClusterVersionPhase { return PhaseBlocked }
+
+func (s *BlockedState) Enter(ctx context.Context, cv *cvov1alpha1.ClusterVersion) error {
+    setCondition(cv, "Upgradeable", metav1.ConditionFalse, "Blocked",
+        fmt.Sprintf("Upgrade blocked: %s", s.Reason))
+    return nil
+}
+
+func (s *BlockedState) Execute(ctx context.Context, cv *cvov1alpha1.ClusterVersion) (State, error) {
+    // 等待 Upgradeable 恢复 或 force=true
+    if cv.Spec.Force {
+        return &PreCheckingState{preconditions: defaultPreconditions()}, nil
+    }
+    return nil, nil // 留在 Blocked
+}
+
+func (s *BlockedState) Exit(ctx context.Context, cv *cvov1alpha1.ClusterVersion) error { return nil }
+func (s *BlockedState) CanTransitionTo(target State) bool {
+    switch target.(type) {
+    case *PreCheckingState, *UpgradingState:
+        return true
+    }
+    return false
+}
+```
+
+### 8.6 错误分类与重试
+
+```go
+// pkg/cvo/errors.go
+
+// ReconcileError 是状态机中的错误分类
+type ReconcileError struct {
+    Type    ErrorType
+    Message string
+    Cause   error
+}
+
+type ErrorType string
+
+const (
+    ErrorTransient  ErrorType = "Transient"   // 瞬态错误 (如网络超时)，可重试
+    ErrorPermanent  ErrorType = "Permanent"   // 永久错误 (如配置无效)，不可重试
+    ErrorDependency ErrorType = "Dependency"   // 依赖缺失 (如 CRD 未安装)，等依赖恢复可重试
+    ErrorConflict   ErrorType = "Conflict"     // 冲突 (如 status 版本冲突)，重试可能成功
+)
+
+func (e *ReconcileError) Error() string { return e.Message + ": " + e.Cause.Error() }
+func (e *ReconcileError) Unwrap() error { return e.Cause }
+
+func isTransient(err error) bool {
+    var reconcileErr *ReconcileError
+    if errors.As(err, &reconcileErr) {
+        return reconcileErr.Type == ErrorTransient ||
+               reconcileErr.Type == ErrorDependency ||
+               reconcileErr.Type == ErrorConflict
+    }
+    return true // 未知错误默认可重试
+}
+
+// backoffDuration 返回指数退避时间
+func backoffDuration(attempt int) time.Duration {
+    switch attempt {
+    case 1:
+        return 10 * time.Second
+    case 2:
+        return 30 * time.Second
+    case 3:
+        return 90 * time.Second
+    default:
+        return 90 * time.Second
+    }
+}
+```
+
+### 8.7 条件合成
+
+```go
+// pkg/cvo/conditions.go
+
+// setCondition 设置或更新 ClusterVersion.status.conditions 中的条件
+func setCondition(cv *cvov1alpha1.ClusterVersion, condType string,
+    status metav1.ConditionStatus, reason, message string) {
+
+    now := metav1.Now()
+    for i, cond := range cv.Status.Conditions {
+        if string(cond.Type) == condType {
+            if cond.Status == status && cond.Reason == reason {
+                return // 无变化，不更新 LastTransitionTime
+            }
+            cv.Status.Conditions[i].Status = status
+            cv.Status.Conditions[i].Reason = reason
+            cv.Status.Conditions[i].Message = message
+            cv.Status.Conditions[i].LastTransitionTime = now
+            return
+        }
+    }
+    // 新增条件
+    cv.Status.Conditions = append(cv.Status.Conditions, metav1.Condition{
+        Type:               metav1.ConditionType(condType),
+        Status:             status,
+        Reason:             reason,
+        Message:            message,
+        LastTransitionTime: now,
+    })
+}
+
+// prependHistory 在 history 前面添加新记录 (newest first)
+func prependHistory(history []cvov1alpha1.ClusterUpgradeRecord,
+    from, to, status string) []cvov1alpha1.ClusterUpgradeRecord {
+
+    record := cvov1alpha1.ClusterUpgradeRecord{
+        From:       from,
+        To:         to,
+        StartedAt:  metav1.Now(),
+        Status:     status,
+    }
+    // 保持最多 100 条
+    history = append([]cvov1alpha1.ClusterUpgradeRecord{record}, history...)
+    if len(history) > 100 {
+        history = history[:100]
+    }
+    return history
+}
+
+// resolveNextHop 解析多 hop 升级的下一个目标
+func resolveNextHop(currentVersion, desiredVersion string,
+    cv *cvov1alpha1.ClusterVersion) (string, error) {
+
+    // 查找 UpgradePath 中的路径
+    // BFS 搜索: currentVersion → desiredVersion
+    // 返回路径中的第一个 hop
+    path := findUpgradePath(currentVersion, desiredVersion, cv)
+    if len(path) == 0 {
+        return desiredVersion, nil // 无中间路径，直接升级
+    }
+    return path[0], nil // 第一个 hop
+}
+```
+
+### 8.8 与现有 ClusterVersionPhase 的关系
+
+现有 Phase 枚举 (`Pending`, `Installing`, `Installed`, `Ready`, `PreChecking`, `Upgrading`, `Upgraded`, `Blocked`, `PreCheckFailed`, `Failed`) 保持不变。新增 State 接口封装 Phase 转换逻辑：
+
+| 现有实现 | CVO 设计后 | 变化 |
+|---------|-----------|------|
+| Phase 是字符串字段 | Phase 仍是字符串字段 (兼容) | 不变 |
+| if-else 分支散落在 Reconciler | State.Execute() 封装逻辑 | 结构化 |
+| panic/recover (PhaseFlow) | ReconcileError 错误分类 | 移除 panic |
+| 无正式转换矩阵 | CanTransitionTo() 转换矩阵 | 新增 |
+| status.conditions 手动写 | setCondition() 自动管理 | 自动化 |
+| history 手动追加 | prependHistory() 自动管理 | 自动化 |
+| 重试逻辑在 Reconciler | StateMachine 内部 backoff | 内聚 |
+
+> **迁移策略**：Feature Gate `CVOEnabled` 控制。启用后 ClusterVersionReconciler 委托给 StateMachine.Run()；未启用时保持现有 Reconciler 逻辑。
 
 ---
 
