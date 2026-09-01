@@ -1898,7 +1898,7 @@ spec:
 
 1. [Static Pod 官方文档](https://kubernetes.io/docs/tasks/configure-pod-container/static-pod/)
 2. [KEP-5 声明式升级框架](kep5/kep5.md)
-3. [KEP-6 三层状态机设计](kep6-state-machine-v5.md)
+3. [KEP-6 三层状态机设计](kep6-state-machine-v4.md)
 4. [StaticPod 组件类型设计（原始）](staticpod-type-design.md)
 
 ### B. 术语表

@@ -2905,7 +2905,7 @@ func (r *ClusterVersionReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 2. [声明式集群版本回滚方案设计](声明式集群版本回滚方案设计.md) — DAG 级声明式回滚
 3. [声明式集群备份与恢复方案设计](声明式集群备份与恢复方案设计.md) — 备份恢复兜底
 4. [KEP-5 声明式升级框架](../kep5/kep5.md)
-5. [KEP-6 三层状态机设计](kep6-state-machine-v5.md)
+5. [KEP-6 三层状态机设计](kep6-state-machine-v4.md)
 6. [OpenShift 集群安装与扩容回滚能力洞察报告](../../rollback/OpenShift集群安装与扩容回滚能力洞察报告.md)
 
 ### B. 术语表

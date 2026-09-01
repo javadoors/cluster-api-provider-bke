@@ -161,7 +161,7 @@ openFuyao 社区承诺提供**可直接使用的验证环境**，支持工行团
 
 **需要 openFuyao 社区支持**：
 - 提供 binary 类型 ComponentVersion 设计文档参考
-- 提供三层状态机设计文档（KEP-6 v5）
+- 提供三层状态机设计文档（KEP-6 v4）
 - 提供 DAG 执行器接口说明
 
 #### A3: 声明式升级框架方案讨论会
@@ -183,8 +183,8 @@ openFuyao 社区承诺提供**可直接使用的验证环境**，支持工行团
 | 议题 | 对应文档 | 当前状态 |
 |------|---------|---------|
 | binary 组件 | `声明式集群版本升级方案-支持二进制与 Helm 组件.md` | 已完成 |
-| 三层状态机 | `kep6-state-machine-v5.md` | 已完成 |
-| 可观测性 | `kep6-state-machine-v5.md` 第 6 章 | 已完成 |
+| 三层状态机 | `kep6-state-machine-v4.md` | 已完成 |
+| 可观测性 | `kep6-state-machine-v4.md` 第 5 章 | 已完成 |
 | 备份/回滚 | `声明式集群版本回滚方案设计.md` | 已完成 |
 | 升级前预检 | `kep5-2-precheck-postcheck-design-v2.md` | 已完成 |
 

@@ -1281,7 +1281,7 @@ kubectl get bkecluster my-cluster -o jsonpath='{.status.clusterComponentStatuses
 ### A. 参考文档
 
 1. [KEP-5 声明式升级框架](kep5/kep5.md)
-2. [KEP-6 三层状态机设计](kep6-state-machine-v5.md)
+2. [KEP-6 三层状态机设计](kep6-state-machine-v4.md)
 3. [KEP-9 Static Pod 类型设计](kep9-staticpod-upgrade-framework.md)
 4. [声明式集群版本升级方案-支持二进制与 Helm 组件](声明式集群版本升级方案-支持二进制与 Helm 组件.md)
 

@@ -855,7 +855,7 @@ kubectl get bkecluster my-cluster -o jsonpath='{.status.kubernetesVersion}'
 2. [etcd 升级指南](https://etcd.io/docs/v3.5/upgrades/)
 3. [containerd 发布说明](https://github.com/containerd/containerd/releases)
 4. [KEP-5 声明式升级框架](../kep/kep5/kep5.md)
-5. [KEP-6 三层状态机设计](../kep/kep6/kep6-state-machine-v5.md)
+5. [KEP-6 三层状态机设计](../kep/kep6/kep6-state-machine-v4.md)
 6. [KEP-5-2 升级前预检设计](../kep/kep5/kep5-2-precheck-postcheck-design-v2.md)
 
 ### B. 术语表
