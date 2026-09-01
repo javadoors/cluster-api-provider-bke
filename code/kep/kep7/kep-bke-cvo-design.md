@@ -3049,89 +3049,781 @@ func resolveNextHop(currentVersion, desiredVersion string,
 
 ## 9. SyncWorker 状态机设计
 
-### 9.1 设计思路
+### 9.1 要解决的问题
 
-借鉴 OpenShift CVO SyncWorker，管理 Payload 加载/验证/应用的状态机，支持边沿触发 (Update) + 水平触发 (定期协调)。
+#### 9.1.1 现有架构的痛点
 
-### 9.2 接口定义
+BKE 当前的版本协调逻辑直接嵌入在 BKEClusterReconciler 的 `executeUpgradeDAG()` 方法中，存在以下架构问题：
+
+| 问题 | 现状描述 | 影响 |
+|------|---------|------|
+| **payload 加载与应用耦合** | `resolveUpgradeBundle()` (加载) 和 `scheduler.ExecuteDAG()` (应用) 在同一方法内串行调用，无法独立重试 | 加载失败时整个方法失败，应用进度丢失 |
+| **无正式状态机** | upgrade 过程通过 `DeclarativeUpgradeStatus` + 注解 (`upgrade-ready`) 隐式驱动，无显式状态转换 | 难以推理"当前在哪个阶段"、"为什么卡住" |
+| **边沿触发缺失** | 当前 Reconciler 每次都重新执行整个 DAG 构建→执行流程，无法区分"目标变更"和"继续之前的工作" | 重复构建 DAG、重复加载 payload，性能浪费 |
+| **backoff 不统一** | 重试逻辑分散在 `statusmanage.BKEClusterStatusManager` 和 DAG 执行器中，策略不一致 | 某些组件重试过快 (API 限流)，某些过慢 (卡死) |
+| **状态报告滞后** | SyncWorker 的执行进度仅在 DAG 批次完成后通过 `patchDeclarativeUpgrade` 写入 status，执行中无实时进度 | 长时间升级期间管理员无法看到进度 |
+| **payload 重载不可控** | ReleaseImage bundle 的加载结果缓存在内存中 (`releaseStore`)，feature gate 变更时无法自动触发重载 | feature gate 变更后组件清单未更新 |
+| **安装与升级路径不一致** | 安装走 PhaseFlow (硬编码)，升级走 DAG，两条路径的 payload 加载、执行策略、状态报告完全不同 | 代码重复，行为不一致 |
+
+#### 9.1.2 SyncWorker 要解决的核心问题
+
+SyncWorker 是 CVO 与 ManifestGraph 之间的**中间层**，将"加载 payload"和"应用 payload"封装为独立的状态机：
+
+```
+ClusterVersionState.Execute()
+    ↓ 调用
+SyncWorker.Update()        ← 边沿触发: 传入新的 desired
+    ↓ 内部驱动
+SyncWorker.apply()         ← 执行 TaskGraph
+    ↓ 调用
+manifestgraph.RunGraph()   ← 并行执行组件
+```
+
+| 核心问题 | SyncWorker 的解决方式 |
+|---------|----------------------|
+| payload 加载与应用解耦 | `syncPayload()` (加载+验证) 和 `apply()` (执行) 独立方法，独立重试 |
+| 正式状态机 | Sync → Reconciling → Error 三态，带 backoff 转换 |
+| 边沿触发 | `Update()` 检测 SyncWork 变更 (version/overrides/featureGates)，变更时通过 `startApply` channel 唤醒执行循环 |
+| 水平触发 | 成功后按 `minimumReconcileInterval` 定期协调 (ReconcilingPayload) |
+| 统一 backoff | `wait.Backoff{Duration: 10s, Factor: 1.3, Steps: 3, Cap: 15s}`，4 次错误后上限 |
+| 实时状态报告 | `consistentReporter` 在执行过程中通过 `report` channel (500 buffered) 实时推送 `SyncWorkerStatus` |
+| payload 自动重载 | 检测 feature gate 变更 → `loadUpdatedPayload()` 重新加载 bundle |
+| 安装与升级统一 | 通过 `PayloadState` (Initializing/Updating/Reconciling) 参数区分执行策略，路径统一 |
+
+### 9.2 设计思路
+
+#### 9.2.1 边沿触发 + 水平触发
+
+借鉴 OpenShift CVO SyncWorker 的双触发模型：
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              边沿触发 + 水平触发 模型                                             │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  边沿触发 (Update):                                                              │
+│  ├── ClusterVersionState.Execute() 调用 SyncWorker.Update(generation, desired)│
+│  ├── Update() 比较 SyncWork (version/overrides/featureGates 是否变更)           │
+│  │   ├── 变更 → loadUpdatedPayload → syncPayload → 信号 startApply channel     │
+│  │   └── 未变更 → 检查 payload status 是否需重置                                 │
+│  └── 执行循环通过 select 收到 startApply 信号 → 立即执行 apply()               │
+│                                                                                 │
+│  水平触发 (定期协调):                                                            │
+│  ├── apply() 成功后 → State 转为 Reconciling                                    │
+│  ├── 等待 minimumReconcileInterval (如 30s)                                    │
+│  └── 再次执行 apply() (ReconcilingPayload, 随机排列, 2 workers)              │
+│                                                                                 │
+│  对比现有实现:                                                                   │
+│  ├── 现有: Reconciler 每次都重新构建 DAG + 执行 (无差异检测)                    │
+│  └── SyncWorker: 仅在目标变更时触发执行 (边沿)，稳定后定期协调 (水平)          │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+| 触发方式 | 触发条件 | 执行模式 | 并发度 | 排序策略 |
+|---------|---------|---------|--------|---------|
+| 边沿触发 | desiredVersion/overrides/featureGates 变更 | UpdatingPayload | 16 | ByNumberAndComponent (有序) |
+| 水平触发 (安装) | 首次 Update() | InitializingPayload | 全部 | FlattenByNumberAndComponent (全并行) |
+| 水平触发 (协调) | apply 成功后定期 | ReconcilingPayload | 2 | PermuteOrder (随机) |
+| 水平触发 (重试) | apply 失败后 backoff | 当前 PayloadState | 当前 | 当前策略 |
+
+#### 9.2.2 payload 缓存与重载
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              Payload 缓存与重载机制                                              │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  SyncWorker.payload (缓存):                                                     │
+│  ├── 类型: *payload.Update (内存中)                                             │
+│  ├── 内容: Release + Manifests + ManifestHash + Architecture                   │
+│  └── 生命周期: 从 syncPayload() 加载 → apply() 使用 → 失效时重载                │
+│                                                                                 │
+│  重载触发条件:                                                                   │
+│  1. payload == nil (首次加载)                                                   │
+│  2. desired.Image 变更 (版本切换)                                               │
+│  3. enabledFeatureGates 变更 (feature gate 开关 → 清单过滤结果变化)            │
+│  4. payload status 需重置 (执行失败后强制重新加载)                              │
+│                                                                                 │
+│  重载流程 (syncPayload):                                                        │
+│  ├── retriever.RetrievePayload(ctx, desired)                                    │
+│  │   ├── 本地 payload (update.Image == releaseImage) → 返回本地目录            │
+│  │   └── 远程 payload → ReleaseStore.ResolveRelease (内存/磁盘/OCI 缓存)      │
+│  ├── payload.LoadUpdate(dir, image, exclude, featureSet, profile, ...)         │
+│  │   ├── 解析 release-metadata (版本、previous 版本列表)                        │
+│  │   ├── 解析 image-references (ImageStream)                                    │
+│  │   ├── 解析 components/ 目录 (ComponentVersion CRs)                          │
+│  │   └── manifest.Include(...) 过滤 (capabilities/featureGates/profile)        │
+│  ├── 版本校验: payload 版本必须匹配 desired 版本                                 │
+│  ├── 前置条件检查 (本地 payload 跳过):                                          │
+│  │   └── precondition.Summarize(RunAll(ctx, ReleaseContext), force)           │
+│  └── GetImplicitlyEnabledCapabilities (新 payload 禁用但现有资源需要的 caps)   │
+│                                                                                 │
+│  对比现有实现:                                                                   │
+│  ├── 现有: resolveUpgradeBundle() 每次 reconcile 都调用 (可能命中缓存)          │
+│  └── SyncWorker: payload 缓存在 SyncWorker 结构体中，仅在变更时重载           │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 9.2.3 状态报告通道
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              状态报告通道机制                                                    │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  SyncWorker                                                                     │
+│  ├── report chan SyncWorkerStatus (buffered=500)  ← 执行器写入进度             │
+│  └── StatusCh() <-chan SyncWorkerStatus           ← Operator 读取进度          │
+│                                                                                 │
+│  consistentReporter (线程安全):                                                  │
+│  ├── Inc()          → Done++, 推送 SyncWorkerStatus{Done: n}                   │
+│  ├── Update(n)      → Done=n, 推送 SyncWorkerStatus{Done: n}                   │
+│  ├── Errors(err)    → Failure=err, 推送 SyncWorkerStatus{Failure: err}        │
+│  ├── Complete()     → Done=Total, 推送 SyncWorkerStatus{Done: Total}          │
+│  └── ContextError() → Failure=ctx.Err(), 推送                                   │
+│                                                                                 │
+│  Operator (cvo.go) 消费:                                                        │
+│  ├── status notifier goroutine:                                                 │
+│  │   ├── 监听 StatusCh()                                                        │
+│  │   ├── 每 statusInterval (15s) 重排 queue (节流，避免频繁写 status)         │
+│  │   └── sync() 从 SyncWorkerStatus 合成 ClusterVersion.status                 │
+│  └── sync() 是 ClusterVersion.status 的唯一写者                                 │
+│                                                                                 │
+│  对比现有实现:                                                                   │
+│  ├── 现有: patchDeclarativeUpgrade 仅在批次完成后写 status (执行中无进度)      │
+│  └── SyncWorker: consistentReporter 在每个组件完成后实时推送 (执行中可见进度)  │
+│                                                                                 │
+│  通道溢出处理:                                                                   │
+│  └── report channel 满时丢弃 (非阻塞写入)，不阻塞执行循环                      │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 9.2.4 backoff 策略
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              Backoff 策略                                                       │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  apply 失败后:                                                                  │
+│  ├── 基础间隔: minimumReconcileInterval / 16 (如 30s/16 ≈ 2s)                 │
+│  ├── 因子: 2 (每次翻倍)                                                         │
+│  ├── 步数: 4 (4 次错误后上限)                                                   │
+│  ├── 上限: minimumReconcileInterval (如 30s)                                   │
+│  ├── 抖动: 0.2 (±20% 随机抖动，避免惊群)                                        │
+│  └── 4 次错误后: 间隔固定为 minimumReconcileInterval                             │
+│                                                                                 │
+│  状态转换:                                                                       │
+│  Sync ──apply err──→ Error ──backoff(minInterval/16)──→ Sync (重试)           │
+│  Error ──apply err──→ Error ──backoff(minInterval/8)──→ Sync                  │
+│  Error ──apply err──→ Error ──backoff(minInterval/4)──→ Sync                  │
+│  Error ──apply err──→ Error ──backoff(minInterval)──→ Sync (上限)           │
+│                                                                                 │
+│  对比现有实现:                                                                   │
+│  ├── 现有: statusmanage.BKEClusterStatusManager.ALLOWED_FAILED_COUNT (固定 3 次)│
+│  │   间隔: 10s/30s/90s (硬编码)                                                 │
+│  └── SyncWorker: 指数退避 + 抖动 + 4 步上限 (更平滑)                           │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 9.2.5 PayloadState 驱动的执行策略
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              PayloadState 驱动的执行策略差异                                     │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  │ PayloadState    │ 并行化策略          │ maxWorkers │ Degraded 容忍 │ 排序    │
+│  ├─────────────────┼─────────────────────┼────────────┼──────────────┼─────────┤
+│  │ Initializing    │ FlattenByNumberAnd  │ 全部       │ 容忍 (Report)│ 不保序  │
+│  │                 │ Component           │            │              │         │
+│  │ Updating        │ ByNumberAndComponent│ 16         │ 40min 超时   │ 保序    │
+│  │ Reconciling     │ PermuteOrder        │ 2          │ 40min 超时   │ 随机    │
+│  │ Precreating     │ 仅创建 CR           │ 1          │ 不检查       │ N/A     │
+│                                                                                 │
+│  设计原因:                                                                       │
+│  ├── Initializing (首次安装):                                                    │
+│  │   • 无用户数据 → 可最大并行，快速达到稳态                                     │
+│  │   • 容忍 Degraded (如 Pod 未 Ready 是正常的) → UpdateEffectReport            │
+│  │   • 不保序 (同层全并行) → 不需要等待同层其他组件                               │
+│  │                                                                               │
+│  ├── Updating (版本升级):                                                       │
+│  │   • 有用户数据在运行 → 必须严格有序，避免服务中断                             │
+│  │   • Degraded 40 分钟后超时 → 给组件足够时间                                   │
+│  │   • 保序 (同层同组件串行) → 如 Deployment 滚动更新                            │
+│  │                                                                               │
+│  ├── Reconciling (常规协调):                                                    │
+│  │   • 集群已稳态 → 仅检查是否有 drift                                          │
+│  │   • 2 workers + 随机排列 → 避免排序 Bug 导致永久卡死                         │
+│  │   • 低优先级 → 不影响正常工作负载                                            │
+│  │                                                                               │
+│  └── Precreating (预创建):                                                       │
+│      • 仅创建 ClusterComponent CR → 提供 must-gather 可见性                     │
+│      • 不执行组件 → 不做 health check                                            │
+│      • 在 apply() 的第一遍执行                                                   │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 9.3 接口定义
 
 ```go
 // pkg/cvo/syncworker.go
 
+package cvo
+
+import (
+    "context"
+    "time"
+
+    "k8s.io/apimachinery/pkg/util/wait"
+    "k8s.io/utils/sets"
+    ctrl "sigs.k8s.io/controller-runtime"
+
+    cvov1alpha1 "github.com/bke/api/v1alpha1"
+    "github.com/bke/pkg/payload"
+    "github.com/bke/pkg/payload/precondition"
+)
+
+// SyncWorker 管理 payload 加载/验证/应用的状态机
 type SyncWorker interface {
+    // Start 启动 worker 循环
     Start(ctx context.Context, maxWorkers int)
+
+    // Update 边沿触发: 传入新的期望状态
+    // 检测 SyncWork 变更 (version/overrides/featureGates)，变更时触发 apply
     Update(ctx context.Context, generation int64, desired Update,
-           cv *ClusterVersion, state PayloadState,
-           enabledFeatureGates sets.Set[string]) *SyncWorkerStatus
+        cv *cvov1alpha1.ClusterVersion, state PayloadState,
+        enabledFeatureGates sets.Set[string]) *SyncWorkerStatus
+
+    // StatusCh 返回状态报告通道
     StatusCh() <-chan SyncWorkerStatus
+
+    // Initialized 返回是否已初始化
     Initialized() bool
+
+    // NotifyAboutManagedResourceActivity 通知资源活动 (如 RBAC 变更触发重试)
+    NotifyAboutManagedResourceActivity(msg string)
 }
 
+// Update 是期望升级目标
+type Update struct {
+    Version      string
+    Image        string
+    Force        bool
+    AcceptRisks  []string
+}
+
+// SyncWork 是 SyncWorker 内部的在途期望状态
 type SyncWork struct {
-    Generation int64
-    Desired    Update
-    State      PayloadState
-    Completed  int     // 连续成功次数
-    Attempt    int     // 失败重试次数
+    Generation         int64               // ClusterVersion generation
+    Desired            Update               // 期望版本/镜像
+    Overrides          []ComponentOverride // 资源覆盖
+    State              PayloadState         // 执行模式
+    Completed          int                  // 连续成功次数 (成功后递增)
+    Attempt            int                  // 失败重试次数 (失败后递增，成功或目标变更时重置)
+    Capabilities       ClusterCapabilities // 集群能力
+    EnabledFeatureGates sets.Set[string]    // 启用的 feature gates
 }
 
+// SyncWorkerStatus 是 SyncWorker 回报给 Operator 的状态
 type SyncWorkerStatus struct {
-    Generation  int64
-    Failure     error
-    Done, Total int
-    Reconciling  bool
-    Initial      bool
-    VersionHash  string
-    Actual       Release
+    Generation       int64
+    Failure          error
+    Done, Total      int      // 已完成/总数
+    Reconciling      bool     // 是否在常规协调模式
+    Initial          bool     // 是否在首次安装模式
+    VersionHash      string   // 清单内容哈希 (FNV-64)
+    Actual           Release  // 当前实际 release
+    Verified         bool     // 签名是否验证通过
+    CapabilitiesStatus CapabilityStatus
+    EnabledFeatureGates sets.Set[string]
+}
+
+// Release 是当前 release 信息
+type Release struct {
+    Version, Image string
+    Channels       []string
+}
+
+// CapabilityStatus 是集群能力状态
+type CapabilityStatus struct {
+    Enabled    []string
+    Disabled   []string
+    ImplicitlyEnabled []string // 无法禁用的 caps
+}
+
+// ComponentOverride 是资源覆盖 (将资源标记为非管理)
+type ComponentOverride struct {
+    Kind, Group, Namespace, Name string
+    Unmanaged bool
+}
+
+// ClusterCapabilities 是集群能力集
+type ClusterCapabilities struct {
+    Enabled  []string
+    Known    []string
 }
 ```
 
-### 9.3 Payload State
+### 9.4 SyncWorker 实现结构体
 
 ```go
+// pkg/cvo/syncworker_impl.go
+
+type syncWorker struct {
+    // 依赖注入
+    retriever        PayloadRetriever       // payload 获取 (本地/远程)
+    builder          payload.ResourceBuilder // 资源构建器
+    preconditions    precondition.List      // 前置条件检查
+    eventRecorder    record.EventRecorder
+    minimumReconcileInterval time.Duration   // 最小协调间隔 (如 30s)
+    exclude          string                  // 排除的组件 identifier
+    requiredFeatureSet configv1.FeatureSet   // 必需的 feature set
+    clusterProfile   string                  // 集群 profile
+    alwaysEnableCapabilities []configv1.ClusterVersionCapability
+
+    // 内部状态
+    backoff   wait.Backoff                 // 重试退避
+    notify    chan string                  // 资源活动通知 channel
+    report    chan SyncWorkerStatus         // 状态报告 channel (buffered=500)
+    startApply chan string                  // 边沿触发信号 channel
+    lock      sync.Mutex                   // 保护 work/status/payload
+    work      *SyncWork                    // 当前在途工作
+    cancelFn  func()                       // 取消当前 apply 的函数
+    status    SyncWorkerStatus             // 最新状态
+    payload   *payload.Update              // 缓存的 payload
+    initializedFunc func() bool            // 初始化检查函数
+}
+
+// NewSyncWorkerWithPreconditions 创建 SyncWorker
+func NewSyncWorkerWithPreconditions(
+    retriever PayloadRetriever,
+    builder payload.ResourceBuilder,
+    preconditions precondition.List,
+    minimumReconcileInterval time.Duration,
+    backoff wait.Backoff,
+    exclude string,
+    requiredFeatureSet configv1.FeatureSet,
+    eventRecorder record.EventRecorder,
+    clusterProfile string,
+    alwaysEnableCapabilities []configv1.ClusterVersionCapability,
+) SyncWorker {
+    return &syncWorker{
+        retriever:                retriever,
+        builder:                  builder,
+        preconditions:            preconditions,
+        eventRecorder:            eventRecorder,
+        minimumReconcileInterval: minimumReconcileInterval,
+        backoff:                  backoff,
+        exclude:                  exclude,
+        requiredFeatureSet:       requiredFeatureSet,
+        clusterProfile:           clusterProfile,
+        alwaysEnableCapabilities: alwaysEnableCapabilities,
+        notify:    make(chan string, 100),
+        report:    make(chan SyncWorkerStatus, 500),
+        startApply: make(chan string, 1), // 非阻塞: buffer=1
+        initializedFunc: func() bool { return false },
+    }
+}
+```
+
+### 9.5 Payload State
+
+```go
+// PayloadState 表示当前 payload 的工作模式
 type PayloadState int
+
 const (
-    UpdatingPayload PayloadState = iota    // 有序升级
-    ReconcilingPayload                     // 常规协调
-    InitializingPayload                    // 首次安装
-    PrecreatingPayload                     // 预创建 (ClusterComponent 可见性)
+    UpdatingPayload PayloadState = iota    // 有序升级 (保守排序，错误阻塞依赖)
+    ReconcilingPayload                     // 常规协调 (随机排列，低并发)
+    InitializingPayload                    // 首次安装 (全并行，容忍瞬态错误)
+    PrecreatingPayload                     // 预创建 (仅创建 ClusterComponent CR)
 )
+
+func (s PayloadState) String() string {
+    switch s {
+    case UpdatingPayload:
+        return "Updating"
+    case ReconcilingPayload:
+        return "Reconciling"
+    case InitializingPayload:
+        return "Initializing"
+    case PrecreatingPayload:
+        return "Precreating"
+    default:
+        return "Unknown"
+    }
+}
+
+// stateToMode 将 PayloadState 转换为 ResourceBuilder Mode
+func stateToMode(state PayloadState) resourcebuilder.Mode {
+    switch state {
+    case InitializingPayload:
+        return resourcebuilder.InitializingMode
+    case UpdatingPayload:
+        return resourcebuilder.UpdatingMode
+    case ReconcilingPayload:
+        return resourcebuilder.ReconcilingMode
+    case PrecreatingPayload:
+        return resourcebuilder.PrecreatingMode
+    default:
+        return resourcebuilder.UpdatingMode
+    }
+}
 ```
 
-### 9.4 状态机
+### 9.6 状态机
 
 ```txt
-Initial ──Update()──→ Sync ──apply err──→ Error ──backoff──→ Sync
-                      │                   │
-                      │ apply ok          │ apply err
-                      ▼                   ▼
-                  Reconciling ←──Update(diff)── Sync
-                      │
-                      │ apply err
-                      ▼
-                    Error
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    SyncWorker 状态机                                             │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│                          ┌─────────┐                                            │
+│                   创建    │ Initial │  (等待首次 Update() 调用)                  │
+│                 ───────→ └────┬────┘                                            │
+│                              │ Update() 调用                                    │
+│                              │ loadUpdatedPayload() + syncPayload()             │
+│                              │ 信号 startApply channel                           │
+│                              ▼                                                  │
+│                    ┌───────────────┐    apply 出错    ┌───────────┐            │
+│             ┌─────→│    Sync       │──────────────→  │   Error    │            │
+│             │      └───────┬───────┘                 └─────┬─────┘            │
+│             │              │ apply 成功                     │ backoff          │
+│             │              │ (全部组件完成)                  │ (指数退避)        │
+│             │              ▼                                ▼                   │
+│             │      ┌───────────────┐               ┌───────────┐               │
+│             │      │  Reconciling  │←── Update(diff)──│   Sync    │           │
+│             │      │ (每 minInterval)│              └───────────┘               │
+│             │      └───────┬───────┘                                            │
+│             │              │ apply 出错                                         │
+│             │              ▼                                                     │
+│             │         ┌───────────┐                                             │
+│             └─────────│   Error    │                                             │
+│                       └───────────┘                                             │
+│                                                                                 │
+│  状态转换规则:                                                                   │
+│  Initial → Sync:    首次 Update() 调用                                           │
+│  Sync → Reconciling: apply() 成功 (Completed++，Attempt=0)                      │
+│  Sync → Error:      apply() 失败 (Completed=0，Attempt++)                       │
+│  Reconciling → Sync: Update() 检测到目标变更 (version/overrides/featureGates)   │
+│  Reconciling → Error: apply() 失败                                              │
+│  Error → Sync:      backoff 超时后重试                                          │
+│  Error → Sync:      Update() 检测到目标变更 (立即重试，不等 backoff)            │
+│                                                                                 │
+│  syncPayload (加载+验证):                                                       │
+│  ├── 仅在 payload 变更时执行 (nil/image/featureGates 变更)                      │
+│  ├── 包含: RetrievePayload + LoadUpdate + Precondition                          │
+│  └── 失败 → 返回错误，不进入 apply                                              │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 9.5 apply() 流程
+### 9.7 Update() — 边沿触发
 
-```txt
-apply(ctx, work *SyncWork, maxWorkers int):
-  1. 构建 Task 列表 (从 ReleaseImage bundle)
-  2. 构建 TaskGraph (NewTaskGraph → Split(SplitOnJobs) → Parallelize(strategy))
-     ├── Initializing: FlattenByNumberAndComponent, maxWorkers=all
-     ├── Updating: ByNumberAndComponent, maxWorkers=16
-     └── Reconciling: PermuteOrder, maxWorkers=2
-  3. RunGraph(ctx, graph, maxWorkers, func(ctx, tasks) error {
-       第一遍 (PrecreatingMode): 预创建 ClusterComponent CR
-       第二遍 (实际应用): 
-         ├── manifest.Include(...) 过滤 (capabilities, feature gates)
-         ├── task.Run(ctx, version, builder, state)
-         │   └── wait.ExponentialBackoff 重试 builder.Apply
-         │       └── UpdateError 快速失败 (不重试)
-         └── 更新 ClusterComponent.status
-     })
-  4. 错误汇总 (summarizeTaskGraphErrors)
+```go
+// Update 是 SyncWorker 的入口点，由 ClusterVersionState.Execute() 调用
+// 边沿触发: 仅在 SyncWork 变更时唤醒执行循环
+func (w *syncWorker) Update(ctx context.Context, generation int64, desired Update,
+    cv *cvov1alpha1.ClusterVersion, state PayloadState,
+    enabledFeatureGates sets.Set[string]) *SyncWorkerStatus {
+
+    w.lock.Lock()
+    defer w.lock.Unlock()
+
+    // 1. 构建 SyncWork
+    newWork := &SyncWork{
+        Generation:         generation,
+        Desired:            desired,
+        State:              state,
+        EnabledFeatureGates: enabledFeatureGates,
+    }
+
+    // 2. 计算能力 (从 CV status 或默认)
+    priorCaps := capability.ClusterCapabilities{}
+    if w.work != nil {
+        priorCaps = w.work.Capabilities
+    }
+    newWork.Capabilities = capability.SetCapabilities(priorCaps, cv)
+
+    // 3. 比较是否变更
+    if w.work != nil && equalSyncWork(w.work, newWork) {
+        // 未变更: 检查 payload status 是否需重置
+        if w.needResetPayloadStatus() {
+            w.loadUpdatedPayload(ctx, newWork)
+        }
+        // 返回当前状态 (不触发新执行)
+        return &w.status
+    }
+
+    // 4. 变更: 加载新 payload
+    w.loadUpdatedPayload(ctx, newWork)
+    w.syncPayload(ctx, newWork)
+
+    // 5. 更新能力 (隐式启用的 caps)
+    implicitlyEnabled := payload.GetImplicitlyEnabledCapabilities(w.payload, newWork.Capabilities)
+    newWork.Capabilities = capability.ApplyImplicitlyEnabled(newWork.Capabilities, implicitlyEnabled)
+
+    // 6. 设置新 work
+    w.work = newWork
+
+    // 7. 信号 startApply channel (非阻塞: buffer=1，满了就跳过)
+    select {
+    case w.startApply <- "update":
+    default:
+    }
+
+    return &w.status
+}
+
+// equalSyncWork 比较两个 SyncWork 是否等价
+func equalSyncWork(a, b *SyncWork) bool {
+    return a.Generation == b.Generation &&
+        a.Desired.Version == b.Desired.Version &&
+        a.Desired.Image == b.Desired.Image &&
+        a.State == b.State &&
+        equalOverrides(a.Overrides, b.Overrides) &&
+        a.EnabledFeatureGates.Equal(b.EnabledFeatureGates) &&
+        equalCapabilities(a.Capabilities, b.Capabilities)
+}
 ```
+
+### 9.8 Start() — 执行循环
+
+```go
+// Start 启动 SyncWorker 的执行循环
+func (w *syncWorker) Start(ctx context.Context, maxWorkers int) {
+    // 1. 等待首次 Update() 调用 (阻塞直到 startApply 信号)
+    select {
+    case <-ctx.Done():
+        return
+    case <-w.startApply:
+    }
+
+    // 2. 主循环 (wait.Until + 内部 for{})
+    next := time.Duration(0) // 初始立即执行
+    for {
+        select {
+        case <-ctx.Done():
+            return
+
+        case <-time.After(next):
+            // 正常执行或 backoff 后重试
+
+        case msg := <-w.notify:
+            // 资源活动通知 (如 RBAC 变更)
+            w.logger.Info("managed resource activity", "message", msg)
+            // 立即触发重试 (不等 backoff)
+            next = 0
+            continue
+
+        case <-w.startApply:
+            // 边沿触发: 目标变更
+            // 立即执行 (跳过 backoff)
+            next = 0
+        }
+
+        // 获取当前 work
+        w.lock.Lock()
+        work := w.work
+        w.lock.Unlock()
+        if work == nil {
+            next = w.minimumReconcileInterval
+            continue
+        }
+
+        // 计算 PayloadState (目标变更时转为 UpdatingPayload)
+        effectiveState := w.calculateNextState(work)
+
+        // 同步超时 (按 State)
+        var syncTimeout time.Duration
+        if effectiveState == InitializingPayload {
+            syncTimeout = w.minimumReconcileInterval
+        } else {
+            syncTimeout = w.minimumReconcileInterval * 2
+        }
+
+        // 执行 apply
+        previousStatus := w.status
+        err := w.apply(ctx, work, maxWorkers, &previousStatus)
+
+        if err != nil {
+            // 失败: backoff
+            w.lock.Lock()
+            w.status.Failure = err
+            w.status.Done = 0
+            w.work.Completed = 0
+            w.work.Attempt++
+            w.lock.Unlock()
+
+            // 计算下一次 backoff
+            next = w.calculateBackoff(w.work.Attempt)
+            w.pushStatus()
+            continue
+        }
+
+        // 成功
+        w.lock.Lock()
+        w.status.Failure = nil
+        w.status.Done = w.status.Total
+        w.status.Reconciling = true
+        w.status.Initial = false
+        w.work.Completed++
+        w.work.Attempt = 0
+        // 转为 ReconcilingPayload
+        w.work.State = ReconcilingPayload
+        w.lock.Unlock()
+
+        w.pushStatus()
+
+        // 成功后等待 minimumReconcileInterval
+        next = w.minimumReconcileInterval
+    }
+}
+
+// calculateBackoff 计算下一次重试的 backoff 时间
+func (w *syncWorker) calculateBackoff(attempt int) time.Duration {
+    base := w.minimumReconcileInterval / 16
+    if base < 1*time.Second {
+        base = 1 * time.Second
+    }
+    d := base
+    for i := 1; i < attempt && i < 4; i++ {
+        d *= 2
+    }
+    if d > w.minimumReconcileInterval {
+        d = w.minimumReconcileInterval
+    }
+    // 添加抖动 (±20%)
+    jitter := time.Duration(float64(d) * 0.2 * (rand.Float64()*2 - 1))
+    return d + jitter
+}
+
+// calculateNextState 根据 work 变更计算实际 PayloadState
+func (w *syncWorker) calculateNextState(work *SyncWork) PayloadState {
+    if work.State == InitializingPayload {
+        return InitializingPayload
+    }
+    // 如果目标变更 (Attempt=0 且 Completed>0 说明之前成功过 → 变更)
+    if work.Attempt == 0 && work.Completed > 0 {
+        return UpdatingPayload // 新的版本变更
+    }
+    if work.Attempt > 0 {
+        return work.State // 重试，保持原 State
+    }
+    return ReconcilingPayload // 稳态协调
+}
+
+// pushStatus 非阻塞推送状态到 report channel
+func (w *syncWorker) pushStatus() {
+    select {
+    case w.report <- w.status:
+    default: // channel 满时丢弃
+    }
+}
+```
+
+### 9.9 apply() 流程
+
+```go
+// apply 执行 TaskGraph
+func (w *syncWorker) apply(ctx context.Context, work *SyncWork, maxWorkers int,
+    previousStatus *SyncWorkerStatus) error {
+
+    // 1. 初始化 CO 更新时间追踪
+    payload.InitCOUpdateStartTimes()
+
+    // 2. 构建 consistentReporter (线程安全状态更新器)
+    reporter := newConsistentReporter(previousStatus, w.report)
+
+    // 3. 从 payload 构建 Task 列表
+    tasks := w.buildTasks(work)
+    if len(tasks) == 0 {
+        reporter.Complete()
+        return nil
+    }
+
+    // 4. 构建 TaskGraph
+    graph := w.buildTaskGraph(tasks, work.State)
+    if graph == nil {
+        return fmt.Errorf("failed to build task graph")
+    }
+
+    // 5. 确定并发度
+    effectiveMaxWorkers := maxWorkers
+    if work.State == InitializingPayload {
+        effectiveMaxWorkers = len(graph.Nodes) // 全并行
+    } else if work.State == ReconcilingPayload {
+        effectiveMaxWorkers = 2
+    }
+
+    // 6. 执行图
+    reporter.SetTotal(graph.TotalTasks())
+    errs := manifestgraph.RunGraph(ctx, graph, effectiveMaxWorkers,
+        func(ctx context.Context, tasks []*manifestgraph.Task) error {
+            // 第一遍 (PrecreatingMode): 预创建 ClusterComponent CR
+            for _, task := range tasks {
+                if err := w.precreateClusterComponent(ctx, task); err != nil {
+                    // 预创建失败不阻塞 (best-effort)
+                    w.logger.V(1).Info("precreate failed (non-blocking)",
+                        "component", task.Component, "err", err)
+                }
+            }
+
+            // 第二遍 (实际应用)
+            for _, task := range tasks {
+                // 断点续传: 跳过已完成的组件
+                if w.shouldSkipComponent(task.Component, task.Version) {
+                    reporter.Inc()
+                    continue
+                }
+
+                // manifest 过滤 (capabilities, feature gates, overrides)
+                if !task.Manifest.Include(work.Capabilities, work.EnabledFeatureGates, ...) {
+                    continue // 被过滤掉
+                }
+
+                // 执行组件
+                err := w.executeTask(ctx, task, work.State)
+                if err != nil {
+                    return err // UpdateError 快速失败
+                }
+
+                // 标记完成
+                w.markComponentCompleted(task.Component, task.Version)
+                reporter.Inc()
+            }
+            return nil
+        })
+
+    // 7. 错误汇总
+    if len(errs) > 0 {
+        return w.summarizeTaskGraphErrors(errs)
+    }
+
+    reporter.Complete()
+    return nil
+}
+```
+
+### 9.10 与现有 Scheduler 的关系
+
+| 维度 | 现有 Scheduler (pkg/dagexec) | 新增 SyncWorker | 变化 |
+|------|-----------------------------|----------------|------|
+| 调用者 | BKEClusterReconciler 直接调用 | ClusterVersionState.Execute() → SyncWorker.Update() → apply() | 多一层封装 |
+| payload 缓存 | 无 (每次 reconcile 重新 resolve) | SyncWorker.payload (缓存，变更时重载) | 性能提升 |
+| 触发方式 | 每次 reconcile 都执行 | 边沿触发 (变更时) + 水平触发 (定期) | 避免重复执行 |
+| 并发度 | 固定 8 (MaxParallelPerBatch) | 按 PayloadState 动态 (全部/16/2) | 更灵活 |
+| 状态报告 | 批次完成后 patch | consistentReporter 实时推送 | 实时性提升 |
+| backoff | statusmanage 固定 3 次 (10s/30s/90s) | 指数退避 4 步 + 抖动 | 更平滑 |
+| payload 加载 | resolveUpgradeBundle (每次) | syncPayload (仅变更时) | 性能提升 |
+
+> **迁移策略**：SyncWorker 内部仍调用 `Scheduler.ExecuteDAG`，但增加了 payload 缓存、边沿触发、实时状态报告、统一 backoff。Feature Gate `CVOEnabled` 控制。
 
 ---
 
