@@ -4430,9 +4430,561 @@ func (r *BKEClusterReconciler) executeInstall(ctx context.Context, ...) error {
 
 ---
 
-## 20. 附录
+## 20. Operator 开发规范
 
-### 20.1 参考文档
+本规范定义 BKE 平台上接入 CVO 管理的组件 (Operator) 开发者必须遵循的规则和最佳实践，借鉴 OpenShift ClusterOperator 开发规范，适配 BKE 的 ComponentVersion + ClusterComponent + ExecutorRegistry 架构。
+
+### 20.1 规范总览
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                  BKE CVO Operator 开发规范总览                                   │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  组件开发者职责 (3 项核心交付物):                                                 │
+│                                                                                 │
+│  ① ComponentVersion YAML — 组件元数据声明                                       │
+│     • name, type, version, runLevel                                            │
+│     • dependencies, compatibility, upgradeStrategy                             │
+│     • healthCheck                                                              │
+│                                                                                 │
+│  ② 组件制品 — 实际安装内容                                                     │
+│     • yaml: manifest YAML 清单                                                  │
+│     • helm: Helm Chart + Values                                                │
+│     • binary: 二进制制品 + installScript + configTemplates                    │
+│     • inline: Go Phase Handler (编译到 BKE 二进制)                             │
+│                                                                                 │
+│  ③ ComponentExecutor — 执行器逻辑 (如非内置类型)                                │
+│     • 实现 ComponentExecutor 接口                                              │
+│     • 注册到 ExecutorRegistry                                                  │
+│     • 执行安装/升级/健康检查                                                    │
+│     • 写入 ClusterComponent.status                                             │
+│                                                                                 │
+│  CVO 职责 (开发者不需要关心):                                                   │
+│  • 预创建 ClusterComponent CR                                                  │
+│  • 调用 ComponentExecutor 执行组件                                              │
+│  • 监听 ClusterComponent.status 作为门控                                        │
+│  • 管理断点续传 (DeclarativeUpgradeStatus)                                     │
+│  • 管理 Run Level 分层阻塞                                                     │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 20.2 ComponentVersion 声明规范
+
+#### 20.2.1 必需字段
+
+| 字段 | 类型 | 必需 | 说明 | 规则 |
+|------|------|------|------|------|
+| `spec.name` | string | 是 | 组件名称 | 全局唯一，小写，连字符分隔 (如 `coredns`) |
+| `spec.type` | string | 是 | 组件类型 | `inline` / `yaml` / `helm` / `binary` |
+| `spec.version` | string | 是 | 组件版本 | SemVer 格式 (如 `v1.11.1`) |
+| `spec.runLevel` | int | 是 | 执行层级 | 见 §7.3 Run Level 分配表；默认 50 |
+| `spec.dependencies` | []Dependency | 是 | 依赖列表 | 可为空数组；不可跨层引用 |
+| `spec.compatibility.constraints` | []Constraint | 是 | 兼容性约束 | 至少声明 `kubernetes` 约束 |
+| `spec.upgradeStrategy.failurePolicy` | string | 是 | 失败策略 | `FailFast` (默认) / `Continue` / `Rollback` |
+
+#### 20.2.2 类型特定必需字段
+
+| 组件类型 | 必需字段 | 说明 |
+|---------|---------|------|
+| `yaml` | `spec.yaml.applyStrategy` | `ServerSideApply` / `Replace` / `CreateOnly` |
+| `yaml` | `spec.yaml.healthCheck` | 健康检查配置 (PodReady/EndpointReady/Custom) |
+| `helm` | `spec.helm.chart` | Chart 来源 (OCI/HTTP/本地) |
+| `helm` | `spec.helm.namespace` | 部署命名空间 |
+| `helm` | `spec.helm.healthCheck` | 健康检查配置 |
+| `binary` | `spec.binary.artifacts` | 制品列表 (url/checksum/installPath/executable) |
+| `binary` | `spec.binary.healthCheck` | 健康检查配置 |
+| `inline` | `spec.inline.handler` | Handler 名称 (如 `EnsureMasterInit`) |
+| `inline` | `spec.inline.version` | Handler 版本 (如 `v1.0.0`) |
+
+#### 20.2.3 禁止事项
+
+| 禁止 | 原因 |
+|------|------|
+| 跨层引用 dependencies | 跨层依赖由 Run Level 阻塞保证，dependencies 仅在同层内有效 |
+| 省略 compatibility.constraints | 无法校验组件与 Kubernetes 版本兼容性 |
+| 使用非 SemVer 版本号 | VersionContext 依赖 semver 比较决策 |
+| runLevel 与依赖关系矛盾 | 如依赖 etcd (Level 10) 但自身 runLevel=5 (低于 etcd) |
+| 省略 healthCheck | CVO 无法判断组件是否真正可用 |
+
+### 20.3 ClusterComponent 状态报告规范
+
+#### 20.3.1 状态报告职责
+
+组件执行器 (ComponentExecutor) **必须**在执行过程中更新 ClusterComponent.status。CVO 不写 status，仅消费 (watch)。
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              状态报告职责划分                                                    │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  执行器 (ComponentExecutor) 写入:                                               │
+│  ├── status.phase                  (生命周期阶段)                               │
+│  ├── status.currentVersion         (当前版本)                                   │
+│  ├── status.versions               (版本列表，★ 混合版本报告旧版本)            │
+│  ├── status.conditions[Available]  (是否可用)                                   │
+│  ├── status.conditions[Progressing] (是否进行中)                                │
+│  ├── status.conditions[Degraded]   (是否降级)                                   │
+│  ├── status.conditions[Upgradeable] (是否可升级)                                │
+│  └── status.relatedObjects         (相关对象列表)                               │
+│                                                                                 │
+│  CVO 消费 (只读):                                                              │
+│  ├── watch ClusterComponent.status 变更                                        │
+│  ├── 检查 Available == True?                                                   │
+│  ├── 检查 versions 匹配期望版本?                                               │
+│  ├── 检查 Degraded == False?                                                   │
+│  └── 检查 Progressing == False?                                                │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 20.3.2 条件设置规则
+
+| 条件 | 何时设 True | 何时设 False | reason (正常态) | message 格式 |
+|------|------------|-------------|----------------|-------------|
+| `Available` | 组件功能可用 | 组件不可用 (需立即干预) | `AsExpected` | 单句无标点 (如 `CoreDNS is available`) |
+| `Progressing` | 从一态转向另一态 (版本变更/配置传播) | 稳态 (包括常规协调) | `AsExpected` | 5-10 词简洁 (如 `Working towards v1.11.1`) |
+| `Degraded` | 持续不匹配期望状态 (非瞬态) | 正常运行 | `AsExpected` | 数句含诊断信息 |
+| `Upgradeable` | 可安全升级 | 升级会破坏组件 | `AsExpected` | 描述管理员应做什么 |
+
+#### 20.3.3 状态报告调用序列
+
+```go
+// 执行器实现中必须遵循的调用序列
+
+func (e *MyExecutor) ExecuteComponent(ctx context.Context,
+    node *topology.ComponentNode, execCtx *ExecutionContext) error {
+
+    // 1. 执行前: 标记开始
+    execCtx.ComponentStatusUpdater.MarkPending(node.Name)
+    // → phase=Pending, Progressing=True, Available=Unknown
+
+    // 2. 执行安装/升级
+    err := e.doInstall(ctx, node, execCtx)
+    if err != nil {
+        // 3a. 执行失败: 标记失败
+        execCtx.ComponentStatusUpdater.MarkFailed(node.Name, err)
+        // → phase=Failed, Degraded=True, Upgradeable=False
+        return err
+    }
+
+    // 3b. 执行成功: 标记完成
+    execCtx.ComponentStatusUpdater.MarkInstalled(node.Version)
+    // → phase=Installed, Available=True, Progressing=False, Degraded=False, Upgradeable=True
+    // → versions=[{component, node.Version}]
+
+    return nil
+}
+```
+
+#### 20.3.4 版本报告规则 (★ 最关键)
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              版本报告规则                                                        │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  规则: 混合版本状态 (新旧版本共存) 时必须报告旧版本                              │
+│                                                                                 │
+│  场景: coredns 从 v1.10.1 升级到 v1.11.1，Deployment 滚动更新 (3 副本)          │
+│                                                                                 │
+│  t0: 升级开始                                                                   │
+│      3 副本全是 v1.10.1                                                         │
+│      → status.versions = [{component, "v1.10.1"}]  ★ 旧版本                   │
+│      → status.phase = Upgrading                                                 │
+│      → status.conditions[Progressing] = True                                    │
+│                                                                                 │
+│  t1: 1 副本更新到 v1.11.1                                                       │
+│      2 副本 v1.10.1 + 1 副本 v1.11.1                                           │
+│      → status.versions = [{component, "v1.10.1"}]  ★ 仍报告旧版本             │
+│                                                                                 │
+│  t2: 2 副本更新到 v1.11.1                                                       │
+│      1 副本 v1.10.1 + 2 副本 v1.11.1                                           │
+│      → status.versions = [{component, "v1.10.1"}]  ★ 仍报告旧版本             │
+│                                                                                 │
+│  t3: 全部 3 副本更新到 v1.11.1                                                  │
+│      → status.versions = [{component, "v1.11.1"}]  ★ 现在报告新版本           │
+│      → status.phase = Installed                                                 │
+│      → status.conditions[Progressing] = False                                   │
+│      → status.conditions[Available] = True                                      │
+│                                                                                 │
+│  原因: CVO 通过 versions 判断升级是否完成。                                      │
+│        过早报告新版本 → CVO 误认为升级完成 → 提前进入下一 Run Level             │
+│        → 混合版本不兼容问题                                                      │
+│                                                                                 │
+│  规则总结:                                                                       │
+│  "只要有任何 Operand 仍在运行旧版本软件，就继续报告旧版本。"                     │
+│  "只有确认不再运行旧版本时，才更新版本号。"                                      │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 20.3.5 条件设置禁止事项
+
+| 禁止 | 原因 |
+|------|------|
+| 正常升级期间设 Available=False | Available=False 触发 CVO 立即判定失败 |
+| 正常升级期间设 Degraded=True | Degraded=True 触发 CVO 40 分钟超时失败 |
+| 瞬态错误设 Degraded=True | Degraded 表示持续降级，Pod 重启不应设置 |
+| 每次 reconcile 更新 LastTransitionTime | 仅在 status True↔False 变化时更新 |
+| 省略正常态的 reason 和 message | 管理员无法区分 "正常" 和 "未报告" |
+| Progressing=True 用于常规协调 | Progressing 仅表示状态转换，非常规 reconcile |
+| Upgradeable=False 阻止 patch 升级 | False 仅阻止 minor 升级，不阻止 patch |
+
+### 20.4 健康检查规范
+
+#### 20.4.1 健康检查类型
+
+| 类型 | 适用场景 | 检查内容 | 示例 |
+|------|---------|---------|------|
+| `PodReady` | Deployment/DaemonSet 类组件 | Pod Ready + 最小就绪数 | coredns: `k8s-app=kube-dns`, minReady=1 |
+| `EndpointReady` | Service 类组件 | Service 有 Ready Endpoint | kube-apiserver: port 443 |
+| `Custom` | 特殊组件 | 自定义脚本/命令 | containerd: `systemctl is-active containerd` |
+
+#### 20.4.2 健康检查配置规范
+
+```yaml
+# ComponentVersion 中的健康检查配置
+spec:
+  yaml:
+    healthCheck:
+      enabled: true              # ★ 必须启用 (禁止省略)
+      timeout: "3m"              # 超时时间 (默认 3m)
+      interval: "5s"             # 检查间隔 (默认 5s)
+      checks:
+        - type: PodReady
+          podReady:
+            namespace: kube-system
+            labelSelector: "k8s-app=kube-dns"
+            minReady: 1          # ★ 最小就绪数 (不可为 0)
+        - type: EndpointReady
+          endpointReady:
+            namespace: kube-system
+            serviceName: kube-dns
+            port: 53
+```
+
+| 规则 | 说明 |
+|------|------|
+| 必须启用 healthCheck | CVO 依赖健康检查判断组件是否可用 |
+| minReady 不可为 0 | minReady=0 等于不检查 |
+| timeout 不超过 upgradeStrategy.timeout | 健康检查超时应小于升级超时 |
+| 多检查项全部通过才算健康 | checks 列表中的所有检查必须全部通过 |
+
+### 20.5 兼容性声明规范
+
+#### 20.5.1 兼容性约束格式
+
+```yaml
+spec:
+  compatibility:
+    constraints:
+      # ★ 必须声明 Kubernetes 兼容性
+      - component: kubernetes
+        rule: ">=1.24.0"
+      # 声明其他组件兼容性
+      - component: etcd
+        rule: ">=3.5.0"
+      - component: containerd
+        rule: ">=1.7.0"
+```
+
+#### 20.5.2 兼容性规则
+
+| 规则 | 说明 |
+|------|------|
+| 必须声明 `kubernetes` 约束 | CVO 校验组件与集群 K8s 版本兼容 |
+| 使用 SemVer 范围表达式 | 支持 `>=`, `<=`, `>`, `<`, `=`, `!=`, 范围 (如 `>=1.24.0 <1.30.0`) |
+| N-1 兼容性必须测试 | 组件必须能与上一 minor 版本的依赖共存 |
+| 不要设置过窄的版本范围 | 集群级资源窄范围会不必要地约束其他组件升级 |
+
+### 20.6 升级策略规范
+
+```yaml
+spec:
+  upgradeStrategy:
+    mode: Rolling              # Rolling (滚动) / Parallel (并行)
+    batchSize: 1               # 滚动批次大小 (Rolling 模式)
+    timeout: "10m"             # 升级超时
+    failurePolicy: FailFast    # FailFast / Continue / Rollback
+```
+
+| FailurePolicy | 适用场景 | 行为 |
+|---------------|---------|------|
+| `FailFast` (默认) | 核心组件 (etcd/kube-apiserver) | 失败立即停止整个 DAG |
+| `Continue` | 非关键组件 (监控/日志) | 记录错误，继续后续组件 |
+| `Rollback` | 可回滚组件 (Helm Chart) | 执行回滚逻辑后继续 |
+
+| 规则 | 说明 |
+|------|------|
+| 核心组件必须 FailFast | etcd/kube-apiserver 失败不应继续 |
+| timeout 不超过 30m | 单组件升级超时不应过长 |
+| batchSize 仅 Rolling 模式有效 | Parallel 模式忽略 batchSize |
+| Rollback 仅回滚组件自身 | 不回滚集群版本 (forward-only) |
+
+### 20.7 RelatedObjects 声明规范
+
+```yaml
+# 执行器在 ClusterComponent.status 中设置 relatedObjects
+status:
+  relatedObjects:
+    # 命名空间 (集群级资源，无 namespace 字段)
+    - group: ""
+      resource: "namespaces"
+      name: "kube-system"
+    # Deployment
+    - group: "apps"
+      resource: "deployments"
+      namespace: "kube-system"
+      name: "coredns"
+    # Service
+    - group: ""
+      resource: "services"
+      namespace: "kube-system"
+      name: "kube-dns"
+    # ConfigMap
+    - group: ""
+      resource: "configmaps"
+      namespace: "kube-system"
+      name: "coredns-config"
+    # 通配符: 命名空间内所有某类型资源
+    - group: ""
+      resource: "configmaps"
+      namespace: "kube-system"
+      name: ""           # ★ 空名 = 命名空间内全部
+```
+
+| 规则 | 说明 |
+|------|------|
+| 必须声明 namespace | 至少声明组件所在 namespace |
+| 必须声明至少一个非 namespace 对象 | 如 Deployment/Service/ConfigMap |
+| 执行器应在运行时动态更新 | 确保反映实际管理的对象 |
+| 通配符谨慎使用 | 仅在确实需要收集全部同类资源时使用 |
+
+### 20.8 制品打包规范
+
+#### 20.8.1 OCI Bundle 目录结构
+
+```
+release-image/
+├── release.yaml                     # ReleaseImage CR + 版本元数据
+├── components/
+│   ├── coredns/
+│   │   └── v1.11.1/
+│   │       └── component.yaml      # ComponentVersion CR
+│   ├── containerd/
+│   │   └── v1.7.18/
+│   │       └── component.yaml
+│   └── kubernetes-master/
+│       └── v1.29.0/
+│           └── component.yaml
+├── manifests/
+│   ├── coredns/
+│   │   └── v1.11.1/
+│   │       └── coredns.yaml        # YAML 清单 (yaml 类型)
+│   └── ...
+├── charts/
+│   ├── cert-manager/
+│   │   └── v1.14.0/
+│   │       ├── Chart.yaml          # Helm Chart (helm 类型)
+│   │       ├── values.yaml
+│   │       └── templates/
+│   └── ...
+├── binaries/
+│   ├── containerd/
+│   │   └── v1.7.18/
+│   │       ├── containerd-v1.7.18-linux-amd64.tar.gz
+│   │       └── checksums.txt
+│   └── ...
+└── image-references                 # 镜像引用列表
+```
+
+#### 20.8.2 打包规则
+
+| 规则 | 说明 |
+|------|------|
+| 目录名 = 组件名 | `components/<name>/<version>/component.yaml` |
+| 版本目录 = SemVer 版本 | 不含 `v` 前缀或包含均可，但需与 `spec.version` 一致 |
+| YAML 清单支持 Go template | 变量通过 `manifest.TemplateContext` 注入 |
+| 二进制制品必须包含 checksum | SHA256 校验和 |
+| Helm Chart 必须是有效 Chart | `helm lint` 通过 |
+| `image-references` 必须列出所有镜像 | 用于离线镜像同步 |
+
+### 20.9 ComponentExecutor 实现规范
+
+#### 20.9.1 接口实现要求
+
+```go
+// 开发者必须实现此接口 (对于非内置类型)
+type ComponentExecutor interface {
+    ExecuteComponent(ctx context.Context, node *topology.ComponentNode,
+        execCtx *ExecutionContext) error
+    GetComponentType() ComponentType
+}
+```
+
+| 要求 | 说明 |
+|------|------|
+| ExecuteComponent 必须幂等 | 重复执行不产生副作用 (CVO 可能重试) |
+| ExecuteComponent 必须更新 ClusterComponent.status | 调用 ComponentStatusUpdater |
+| ExecuteComponent 失败必须返回 error | 不要 panic (CVO 不 recover) |
+| ExecuteComponent 必须尊重 ctx | 检查 `ctx.Err()` 支持取消 |
+| GetComponentType 必须返回正确类型 | 与 ComponentVersion.spec.type 一致 |
+
+#### 20.9.2 执行器注册
+
+```go
+// 执行器在 Scheduler 初始化时注册
+func NewScheduler(...) *Scheduler {
+    sched := &Scheduler{
+        Registry: NewExecutorRegistry(),
+        // ...
+    }
+    // 注册内置执行器
+    sched.Registry.Register(ComponentType("inline"), &InlineComponentExecutor{...})
+    sched.Registry.Register(ComponentType("yaml"), &YamlComponentExecutor{...})
+    // ★ 开发者注册自定义执行器
+    if helmExecutor != nil {
+        sched.Registry.Register(ComponentType("helm"), helmExecutor)
+    }
+    if binaryExecutor != nil {
+        sched.Registry.Register(ComponentType("binary"), binaryExecutor)
+    }
+    return sched
+}
+```
+
+#### 20.9.3 执行器实现模板
+
+```go
+// pkg/dagexec/my_executor.go
+
+type MyExecutor struct {
+    store         manifest.Store
+    applier       manifest.Applier
+    healthChecker HealthChecker
+    logger        *bkev1beta1.BKELogger
+}
+
+func (e *MyExecutor) GetComponentType() ComponentType {
+    return ComponentType("yaml")
+}
+
+func (e *MyExecutor) ExecuteComponent(ctx context.Context,
+    node *topology.ComponentNode, execCtx *ExecutionContext) error {
+
+    // 1. 获取 ComponentVersion
+    cv := execCtx.CVStore.GetComponentVersion(node.Name, node.Version)
+    if cv == nil {
+        return fmt.Errorf("ComponentVersion %s/%s not found", node.Name, node.Version)
+    }
+
+    // 2. 版本决策
+    decision := upgrade.Decide(execCtx.VersionContext, node.Name)
+    if decision == upgrade.DecisionSkip {
+        return nil // 跳过
+    }
+
+    // 3. ★ 标记开始 (必须)
+    execCtx.ComponentStatusUpdater.MarkPending(node.Name)
+
+    // 4. 执行安装/升级
+    pkg, err := e.store.GetComponentManifests(ctx, node.Name, node.Version, execCtx.TemplateContext)
+    if err != nil {
+        execCtx.ComponentStatusUpdater.MarkFailed(node.Name, err)
+        return err
+    }
+
+    err = e.applier.ApplyComponent(ctx, pkg)
+    if err != nil {
+        execCtx.ComponentStatusUpdater.MarkFailed(node.Name, err)
+        return err
+    }
+
+    // 5. 健康检查 (如果配置)
+    if cv.Spec.YAML.HealthCheck != nil && cv.Spec.YAML.HealthCheck.Enabled {
+        spec := healthcheck.FromCRD(cv.Spec.YAML.HealthCheck)
+        if err := e.healthChecker.Check(ctx, execCtx.TargetClient, spec); err != nil {
+            // ★ 健康检查失败: 标记 Degraded (但可能仍 Available)
+            execCtx.ComponentStatusUpdater.MarkFailed(node.Name, err)
+            return err
+        }
+    }
+
+    // 6. ★ 标记完成 (必须)
+    execCtx.ComponentStatusUpdater.MarkInstalled(node.Version)
+
+    return nil
+}
+```
+
+### 20.10 测试规范
+
+#### 20.10.1 单元测试要求
+
+| 测试项 | 覆盖目标 | 说明 |
+|--------|---------|------|
+| ExecuteComponent 成功路径 | >85% | 正常安装/升级流程 |
+| ExecuteComponent 失败路径 | >80% | 各种错误场景 |
+| 幂等性 | 必须 | 重复执行不产生副作用 |
+| ctx 取消 | 必须 | 支持 context 取消 |
+| 状态报告序列 | 必须 | MarkPending → MarkInstalled/MarkFailed |
+| 版本报告规则 | 必须 | 混合版本报告旧版本 |
+
+#### 20.10.2 集成测试要求
+
+| 测试场景 | 验证内容 |
+|---------|---------|
+| 全新安装 | ClusterComponent 创建，phase=Installed，Available=True |
+| 版本升级 | 滚动更新，混合版本报告旧版本，最终报告新版本 |
+| 断点续传 | 中断后恢复，已完成组件跳过 |
+| 健康检查失败 | Degraded=True，CVO 阻塞 |
+| N-1 兼容 | 新 Operator + 旧 Operand 共存 |
+
+#### 20.10.3 E2E 测试要求
+
+| 场景 | 规模 | 验证 |
+|------|------|------|
+| 小规模安装 | 1M+2W | 完整安装流程 |
+| 升级 | 3M+5W | 版本升级 + 状态门控 |
+| 断点续传 | 3M+3W | 中断恢复 |
+| 大规模 | 3M+97W | 100 节点性能 |
+
+### 20.11 开发检查清单
+
+| # | 检查项 | 类别 | 完成 |
+|---|--------|------|------|
+| 1 | ComponentVersion YAML 已编写 (name/type/version/runLevel) | 声明 | ☐ |
+| 2 | dependencies 已声明 (不跨层引用) | 声明 | ☐ |
+| 3 | compatibility.constraints 已声明 (含 kubernetes) | 声明 | ☐ |
+| 4 | upgradeStrategy 已配置 (failurePolicy/timeout) | 声明 | ☐ |
+| 5 | healthCheck 已配置 (enabled/timeout/checks) | 声明 | ☐ |
+| 6 | 组件制品已编写 (manifest/Chart/binary) | 制品 | ☐ |
+| 7 | 制品已打包到 OCI Bundle (正确目录结构) | 制品 | ☐ |
+| 8 | ComponentExecutor 已实现 (如非内置类型) | 执行器 | ☐ |
+| 9 | ExecuteComponent 幂等 | 执行器 | ☐ |
+| 10 | ExecuteComponent 支持 ctx 取消 | 执行器 | ☐ |
+| 11 | ExecuteComponent 不 panic (返回 error) | 执行器 | ☐ |
+| 12 | MarkPending → MarkInstalled/MarkFailed 调用序列正确 | 状态报告 | ☐ |
+| 13 | 混合版本状态报告旧版本 | 状态报告 | ☐ |
+| 14 | 正常升级期间 Available 不为 False | 状态报告 | ☐ |
+| 15 | 正常升级期间 Degraded 不为 True | 状态报告 | ☐ |
+| 16 | 正常态设置 reason=AsExpected + message | 状态报告 | ☐ |
+| 17 | LastTransitionTime 仅状态变更时更新 | 状态报告 | ☐ |
+| 18 | relatedObjects 已声明 (namespace + 至少一个非 namespace 对象) | 状态报告 | ☐ |
+| 19 | 执行器已注册到 ExecutorRegistry | 注册 | ☐ |
+| 20 | 已注册到 ReleaseImage CR (install + upgrade components) | 注册 | ☐ |
+| 21 | 单元测试覆盖率 >85% | 测试 | ☐ |
+| 22 | 集成测试通过 (安装/升级/断点续传) | 测试 | ☐ |
+| 23 | E2E 测试通过 | 测试 | ☐ |
+| 24 | N-1 兼容性已测试 | 测试 | ☐ |
+
+---
+
+## 21. 附录
+
+### 21.1 参考文档
 
 | 文档 | 说明 |
 |------|------|
@@ -4443,7 +4995,7 @@ func (r *BKEClusterReconciler) executeInstall(ctx context.Context, ...) error {
 | OpenShift CVO 代码库 | github.com/openshift/cluster-version-operator |
 | OpenShift Enhancements | CVO 协调/更新工作流/ClusterOperator 设计文档 |
 
-### 20.2 术语表
+### 21.2 术语表
 
 | 术语 | 定义 |
 |------|------|
