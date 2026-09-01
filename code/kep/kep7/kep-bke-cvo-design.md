@@ -1312,17 +1312,218 @@ spec:
   # ... 其余字段不变
 ```
 
-### 7.3 Run Level 分配
+### 7.3 Run Level 设计
 
-| Run Level | 组件 | 说明 |
-|-----------|------|------|
-| 00-04 | bke-cvo 自身 | CVO 先更新自己 (类似 OpenShift CVO) |
-| 05 | bkeagent, provider | 基础设施 (Agent 先就绪) |
-| 10-29 | etcd, kubernetes-master, kubernetes-worker | Kubernetes 核心控制平面 |
-| 30 | containerd | 容器运行时 |
-| 50 | coredns, kube-proxy | 集群网络/DNS 插件 |
-| 60 | openfuyao-core, calico, cert-manager | 平台组件 |
-| 70 | 节点级组件 | 节点级 daemonset |
+#### 7.3.1 什么是 Run Level
+
+Run Level 是 `ComponentVersion.spec.runLevel` 字段 (整数)，定义组件在 Manifest Graph 中的**执行层级**。核心规则：
+
+| 规则 | 说明 |
+|------|------|
+| **跨层阻塞** | 低 Run Level 的所有组件门控满足后，高 Run Level 的组件才开始执行 |
+| **同层并行** | 同一 Run Level 内不同组件并行执行 (互不阻塞) |
+| **同层同组件串行** | 同一 Run Level 内同一组件的多个清单按文件名排序串行执行 |
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    Run Level 分层阻塞执行模型                                    │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  Run Level 05: [bkeagent, provider]                                             │
+│  ┌─────────────┐  ┌─────────────┐                                              │
+│  │  bkeagent   │  │  provider   │  ← 并行执行                                   │
+│  └──────┬──────┘  └──────┬──────┘                                              │
+│         │                 │                                                     │
+│         ▼                 ▼                                                     │
+│  ★ 门控阻塞: CVO 等待 bkeagent 和 provider 的 ClusterComponent.status           │
+│    全部满足 (Available + versions + 非 Degraded + 非 Progressing)              │
+│         │                                                                       │
+│         ▼                                                                       │
+│  Run Level 10-29: [etcd, kubernetes-master, kubernetes-worker]                 │
+│  ┌────────┐  ┌──────────────────┐  ┌───────────────────┐                       │
+│  │  etcd  │  │ kubernetes-master│  │ kubernetes-worker │  ← 并行执行          │
+│  └───┬────┘  └────────┬─────────┘  └─────────┬─────────┘                       │
+│      │                │                      │                                   │
+│      ▼                ▼                      ▼                                   │
+│  ★ 门控阻塞: 等待 Run Level 10-29 全部满足                                     │
+│      │                                                                       │
+│      ▼                                                                       │
+│  Run Level 30: [containerd]                                                   │
+│  ┌──────────────┐                                                            │
+│  │  containerd  │                                                            │
+│  └──────┬───────┘                                                            │
+│         │                                                                     │
+│         ▼                                                                     │
+│  ★ 门控阻塞 → Run Level 50: [coredns, kube-proxy] → 门控 → Run Level 60: ... │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 7.3.2 Run Level 分配
+
+| Run Level | 组件 | 说明 | 分配理由 |
+|-----------|------|------|---------|
+| 00-04 | bke-cvo 自身 | CVO 先更新自己 | CVO 必须先就绪才能管理其他组件 (类似 OpenShift CVO) |
+| 05 | bkeagent, provider | 基础设施 | Agent 必须先就绪才能执行节点级操作 (SSH/文件传输) |
+| 10-29 | etcd, kubernetes-master, kubernetes-worker | Kubernetes 核心控制平面 | etcd 先于 kube-apiserver (10)，kube-apiserver 先于 scheduler/controller-manager (20) |
+| 30 | containerd | 容器运行时 | 依赖 kube-apiserver 就绪 (注册 CRI) |
+| 50 | coredns, kube-proxy | 集群网络/DNS 插件 | 依赖 Kubernetes 核心可用，但不阻塞应用 |
+| 60 | openfuyao-core, calico, cert-manager | 平台组件 | 依赖网络/DNS 就绪，但不阻塞核心控制平面 |
+| 70 | 节点级组件 | 节点级 daemonset | 破坏性最大 (可能重启节点)，放在最后执行 |
+
+#### 7.3.3 分配原则
+
+| 原则 | 说明 | 示例 |
+|------|------|------|
+| **依赖决定层级** | 依赖其他组件的组件 Run Level 更高 | coredns 依赖 kube-apiserver → Run Level 50 > 10 |
+| **破坏性越后** | 越破坏性的组件 Run Level 越高 | MCO 重启节点 → Run Level 70；containerd 停止容器 → Run Level 30 |
+| **N-1 兼容** | 所有组件必须能与上一 minor 版本的依赖共存 | v2.7 的 coredns 能与 v2.6 的 kube-apiserver 共存 |
+| **核心优先** | 核心控制平面组件 (etcd/kube-apiserver) 优先级最高 | etcd Run Level 10，先于其他所有依赖它的组件 |
+| **可观测优先** | 基础设施和 Agent 优先就绪，确保后续可观测 | bkeagent Run Level 05，先于所有其他组件 |
+
+#### 7.3.4 Run Level 与 dependencies 的关系
+
+BKE 有两种依赖表达机制，它们是**互补关系**，不是替代关系：
+
+| 机制 | 来源 | 粒度 | 作用 |
+|------|------|------|------|
+| `runLevel` | ComponentVersion.spec.runLevel | 粗粒度 (层级) | 定义分层阻塞 (跨层阻塞，同层并行) |
+| `dependencies` | ComponentVersion.spec.dependencies | 细粒度 (组件) | 定义同层内的依赖顺序 |
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              Run Level (粗粒度) 与 dependencies (细粒度) 的协作                   │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  Run Level 10-29 (Kubernetes 核心层):                                          │
+│                                                                                 │
+│  ┌─────────┐     dependencies      ┌──────────────────┐                        │
+│  │  etcd   │ ───────────────────→ │ kubernetes-master │  ← 同层内依赖排序      │
+│  │ Level 10│                      │ Level 10           │    (dependencies)     │
+│  └─────────┘                      └─────────┬──────────┘                        │
+│                                              │ dependencies                   │
+│                                              ▼                                  │
+│                                    ┌───────────────────┐                       │
+│                                    │ kubernetes-worker  │                      │
+│                                    │ Level 20           │                      │
+│                                    └───────────────────┘                       │
+│                                                                                 │
+│  Run Level 之间: 跨层阻塞 (runLevel)                                            │
+│  Run Level 内: 同层依赖排序 (dependencies)                                      │
+│                                                                                 │
+│  协作规则:                                                                      │
+│  1. CVO 先按 runLevel 分层，低层全部完成才进入高层                               │
+│  2. 同一层内按 dependencies 做拓扑排序                                          │
+│  3. 同一层内无依赖关系的组件并行执行                                              │
+│  4. dependencies 跨层引用无效 (高层组件不能依赖低层还没执行的组件)               │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 7.3.5 升级时的分层执行顺序
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    升级时的分层执行顺序                                           │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  用户修改 BKECluster.Spec.OpenFuyaoVersion: v2.6.0 → v2.7.0                     │
+│                                                                                 │
+│  CVO 从 ReleaseImage OCI Bundle 解析组件清单                                    │
+│  构建 ManifestGraph (ByNumberAndComponent 有序模式)                             │
+│                                                                                 │
+│  执行顺序 (严格分层阻塞):                                                       │
+│                                                                                 │
+│  Layer 1: Run Level 05 — 基础设施                                               │
+│    ├── bkeagent v2.7.0 (inline, EnsureAgentUpgrade)                            │
+│    └── provider v2.7.0 (inline, EnsureProviderSelfUpgrade)                     │
+│    → 门控: 等待 bkeagent + provider 的 ClusterComponent Available+版本匹配      │
+│                                                                                 │
+│  Layer 2: Run Level 10 — etcd                                                   │
+│    └── etcd v3.5.12 (inline, EnsureEtcdUpgrade)                                │
+│    → 门控: 等待 etcd Available + 版本匹配                                      │
+│                                                                                 │
+│  Layer 3: Run Level 10-20 — Kubernetes 核心                                    │
+│    ├── kubernetes-master v1.29.0 (inline, EnsureMasterUpgrade)                 │
+│    └── kubernetes-worker v1.29.0 (inline, EnsureWorkerUpgrade)                 │
+│    → 门控: 等待 kubernetes-master + kubernetes-worker Available                 │
+│                                                                                 │
+│  Layer 4: Run Level 30 — 容器运行时                                             │
+│    └── containerd v1.7.18 (binary, BinaryInstaller)                            │
+│    → 门控: 等待 containerd Available + 版本匹配                                 │
+│                                                                                 │
+│  Layer 5: Run Level 50 — 网络/DNS 插件                                          │
+│    ├── coredns v1.11.1 (yaml, YamlInstaller)                                   │
+│    └── kube-proxy v1.29.0 (yaml, YamlInstaller)                                │
+│    → 门控: 等待 coredns + kube-proxy Available                                 │
+│                                                                                 │
+│  Layer 6: Run Level 60 — 平台组件                                               │
+│    ├── openfuyao-core v26.03 (yaml, YamlInstaller)                             │
+│    ├── calico v3.27.0 (yaml, YamlInstaller)                                    │
+│    └── cert-manager v1.14.0 (helm, HelmInstaller)                              │
+│    → 门控: 等待全部平台组件 Available                                           │
+│                                                                                 │
+│  Layer 7: Run Level 70 — 节点级组件                                             │
+│    └── 节点级 daemonset (如 network, dns daemonset)                             │
+│    → 门控: 等待全部节点级组件 Available                                         │
+│                                                                                 │
+│  全部完成 → ClusterVersion Phase = Upgraded/Ready                               │
+│                                                                                 │
+│  ★ 断点续传: 如果 Layer 4 失败，Layer 1-3 已完成的组件会被跳过 (DeclarativeUpgradeStatus.Completed)│
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 7.3.6 安装与升级的 Run Level 行为差异
+
+| 维度 | 安装 (InitializingPayload) | 升级 (UpdatingPayload) |
+|------|---------------------------|----------------------|
+| 分层策略 | FlattenByNumberAndComponent (同层全并行) | ByNumberAndComponent (同层同组件串行，同层不同组件并行) |
+| 跨层阻塞 | 是 (仍分层) | 是 (仍分层) |
+| maxWorkers | 全部 (= 组件数) | 16 |
+| Degraded 容忍 | 容忍 (UpdateEffectReport，不阻塞) | 40 分钟后失败 (UpdateEffectFailAfterInterval) |
+| 错误处理 | 容忍瞬态错误 (快速达到稳态) | 错误阻塞依赖节点 |
+| 排序严格度 | 宽松 (同层不保序) | 严格 (同层同组件保序) |
+| 上下文 | 无用户数据，无数据丢失风险 | 有用户数据，需保护 |
+
+> **设计原因**：安装时无用户数据，可最大并行快速达到稳态；升级时有用户数据在运行，必须严格有序避免服务中断。这借鉴了 OpenShift CVO 的三种 Payload State 设计。
+
+#### 7.3.7 新增组件时的 Run Level 选择指南
+
+开发新组件时，按以下决策树选择 Run Level：
+
+```txt
+新增组件需要 Run Level?
+
+  1. 该组件是基础设施/Agent?
+     ├── 是 → Run Level 05 (如 bkeagent, provider)
+     │
+  2. 该组件是 Kubernetes 核心 (etcd/apiserver/scheduler/controller-manager)?
+     ├── 是 → Run Level 10-20 (etcd=10, master=10-15, worker=20)
+     │
+  3. 该组件依赖 kube-apiserver 才能工作?
+     ├── 是 → Run Level >= 30 (如 containerd=30)
+     │
+  4. 该组件是集群插件 (DNS/网络/proxy)?
+     ├── 是 → Run Level 50 (如 coredns, kube-proxy)
+     │
+  5. 该组件是平台级应用 (监控/证书/SDN)?
+     ├── 是 → Run Level 60 (如 openfuyao-core, calico, cert-manager)
+     │
+  6. 该组件是节点级 daemonset (可能重启节点)?
+     ├── 是 → Run Level 70
+     │
+  7. 不确定?
+     └── 默认 → Run Level 50 (最安全的默认值)
+```
+
+| 注意事项 | 说明 |
+|---------|------|
+| **不要跨层引用 dependencies** | dependencies 仅在同层内有效，跨层依赖由 Run Level 阻塞保证 |
+| **破坏性组件必须高 Level** | 可能导致节点不可用的组件必须 Run Level >= 70 |
+| **核心组件必须低 Level** | 被其他组件依赖的基础组件必须 Run Level 低 (05-30) |
+| **默认值 50** | 不确定时使用 50，与 coredns/kube-proxy 同层，适用于大多数插件 |
+| **N-1 兼容测试** | 新组件必须测试与上一 minor 版本依赖共存的场景 |
 
 ### 7.4 三种并行化模式
 
