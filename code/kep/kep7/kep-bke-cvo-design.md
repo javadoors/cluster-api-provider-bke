@@ -443,45 +443,185 @@ spec:
 
 ### 6.3 ClusterComponent 生命周期
 
+#### 6.3.1 Phase 状态机设计
+
+ClusterComponent 的 `status.phase` 字段表示组件的当前生命周期阶段，是一个有限状态机：
+
 ```txt
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│                    ClusterComponent 生命周期                                     │
+│                    ClusterComponent Phase 状态机                                │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│                    ┌──────────┐                                                │
+│       CVO 预创建   │  Pending  │  (CVO 创建 CR, 等待执行器接管)                 │
+│  ──────────────→  └────┬─────┘                                                │
+│                          │ 执行器开始执行                                       │
+│                          ▼                                                      │
+│                    ┌──────────────┐    安装成功    ┌───────────┐               │
+│                    │  Installing  │─────────────→ │ Installed │               │
+│                    └──────┬───────┘               └─────┬─────┘               │
+│                           │ 安装失败                     │ desiredVersion 变更 │
+│                           ▼                              ▼                      │
+│                    ┌──────────┐               ┌──────────────┐                  │
+│                    │  Failed  │←──升级失败── │  Upgrading   │                  │
+│                    └────┬─────┘               └──────┬───────┘                  │
+│                         │ 重试                        │ 升级成功                 │
+│                         ▼                             ▼                          │
+│                    ┌──────────────┐           ┌───────────┐                    │
+│                    │  Installing  │           │ Installed │                    │
+│                    │  /Upgrading  │           └───────────┘                    │
+│                    └──────────────┘                                              │
+│                                                                                 │
+│                    ┌──────────────┐                                              │
+│           ┌───────│ RollingBack  │  (FailurePolicy=Rollback 时)                │
+│           │       └──────┬───────┘                                              │
+│           │ 回滚成功      │ 回滚失败                                               │
+│           ▼              ▼                                                      │
+│     ┌───────────┐   ┌──────────┐                                              │
+│     │ Installed  │   │  Failed  │                                              │
+│     └───────────┘   └──────────┘                                              │
+│                                                                                 │
+│                    ┌──────────┐                                                 │
+│                    │  Removed │  (组件被移除, 不再管理)                         │
+│                    └──────────┘                                                 │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+| Phase | 含义 | 进入条件 | 退出条件 |
+|-------|------|---------|---------|
+| `Pending` | CVO 已创建 CR，等待执行器接管 | CVO 预创建 (PrecreatingMode) | 执行器开始执行 → Installing/Upgrading |
+| `Installing` | 首次安装中 | 执行器开始安装 (VersionContext 无 current) | 安装成功 → Installed / 安装失败 → Failed |
+| `Upgrading` | 版本升级中 | 执行器开始升级 (VersionContext 有 current + target 且不同) | 升级成功 → Installed / 升级失败 → Failed |
+| `Installed` | 安装/升级完成，组件运行中 | 执行成功 | desiredVersion 变更 → Upgrading / 卸载 → Removed |
+| `Failed` | 安装/升级/回滚失败 | 执行失败 | 重试 → Installing/Upgrading / 超时耗尽 → 阻塞升级 |
+| `RollingBack` | 回滚中 (仅 FailurePolicy=Rollback) | 升级失败触发回滚 | 回滚成功 → Installed / 回滚失败 → Failed |
+| `Removed` | 组件被移除 | 卸载完成 | 终态 |
+
+#### 6.3.2 Phase 与 Conditions 的关系
+
+Phase 和 Conditions 是**两个正交维度**，Phase 表示"走到哪一步"，Conditions 表示"当前是否健康"。两者由不同主体写入：
+
+| 维度 | phase | conditions |
+|------|-------|------------|
+| 语义 | 生命周期阶段 (走到哪一步) | 健康状态 (当前是否可用) |
+| 写入者 | 组件执行器 | 组件执行器 |
+| CVO 消费方式 | 不直接消费 (仅日志/展示) | **门控消费 (阻塞/放行)** |
+| 变更频率 | 低 (每次安装/升级变更) | 中 (健康状态变化时变更) |
+
+Phase × Conditions 的组合矩阵：
+
+| Phase \ Condition | Available | Progressing | Degraded | Upgradeable | 含义 |
+|-------------------|-----------|-------------|----------|-------------|------|
+| `Pending` | Unknown | False | False | True | CR 已创建，等待执行器 |
+| `Installing` | True/Unknown | **True** | False | True | 首次安装中 |
+| `Upgrading` | True | **True** | False | True | 滚动升级中 (保持可用) |
+| `Upgrading` | True | True | False | **False** | 升级中且不允许再次升级 |
+| `Installed` | **True** | **False** | **False** | **True** | 正常态 (CVO 放行) |
+| `Installed` | True | False | **True** | True | 可用但降级 (如 1 副本 crash-loop) |
+| `Failed` | True/False | False | **True** | **False** | 失败 (CVO 阻塞) |
+| `RollingBack` | True/False | **True** | **True** | False | 回滚中 |
+| `Removed` | False | False | False | True | 已移除 (终态) |
+
+> **CVO 门控只看 Conditions，不看 Phase**。Phase 供人类/工具观测，Conditions 供 CVO 自动化决策。
+
+#### 6.3.3 条件设计原则
+
+| 原则 | 说明 | 违反后果 |
+|------|------|---------|
+| **Available 优先于 Progressing** | Available=False 表示组件不可用，需立即干预，优先级高于 Progressing。升级中若组件仍可用，Available 应保持 True | 误报不可用 → CVO 错误阻塞升级 |
+| **Degraded 表示持续降级，非瞬态** | Degraded 表示组件在持续一段时间内不匹配期望状态。Pod 重启等瞬态错误不应设置 Degraded，且不应频繁振荡 | 振荡 → CVO 反复阻塞/放行，升级卡死 |
+| **Available 和 Degraded 可共存** | 组件可能同时 Available=True 且 Degraded=True (如 3 副本 1 个 crash-loop → 可用但降级) | 互斥设计 → 无法表达中间状态 |
+| **正常升级期间不可 Degraded** | 正常升级过程中不应 Degraded=True。如果升级导致 Degraded，说明升级本身有问题 | 升级期间 Degraded → CVO 40 分钟后超时失败 |
+| **正常升级期间 Available 不可为 False** | 升级期间必须保持 Available=True (如滚动升级保持最小可用副本) | Available=False → CVO 立即判定失败 |
+| **混合版本状态必须报告旧版本** | 新旧版本共存时 status.versions 必须报告旧版本，全部更新完成后才报告新版本 | 误报新版本 → CVO 误认为升级完成，提前进入下一层 |
+| **Upgradeable=False 仅阻止 minor 升级** | False 阻止 minor 升级，不阻止 patch 升级。缺失/True/Unknown 均允许升级 | 过度阻塞 → patch 升级被误阻 |
+| **Progressing 仅表示状态转换** | 仅在从一态转向另一态时设置 Progressing=True，常规协调 (reconcile 已知状态) 不应设置 | 误报 → CVO 误判为仍在升级，阻塞后续组件 |
+| **正常态也需设置 reason 和 message** | 正常态推荐 reason=AsExpected，message 用简洁描述 | 缺失 → 管理员无法诊断问题原因 |
+| **LastTransitionTime 仅在状态变更时更新** | 条件 status 从 True→False 或 False→True 时才更新，不应每次 reconcile 都更新 | 误更新 → 监控指标虚高，时间统计失真 |
+| **Forward-Only 无自动回滚** | 升级仅向前，失败不自动回滚。FailurePolicy=Rollback 仅回滚组件自身，不回滚集群版本 | 期望自动回滚 → 与 forward-only 哲学冲突 |
+
+#### 6.3.4 条件语义速查表
+
+| 场景 | Available | Progressing | Degraded | Upgradeable | versions |
+|------|-----------|-------------|----------|-------------|----------|
+| 正常态 | True | False | False | True | 当前版本 |
+| 首次安装中 | True/Unknown | **True** | False | True | 空/目标版本 |
+| 滚动升级中 (组件可用) | True | **True** | False | True | **旧版本** |
+| 滚动升级中 (不允许再升级) | True | True | False | **False** | 旧版本 |
+| 升级完成 | True | **False** | False | True | **新版本** |
+| 可用但降级 | True | False | **True** | True | 当前版本 |
+| 不可用 | **False** | False | **True** | False | 旧版本 |
+| 升级失败 | True/False | False | **True** | **False** | 旧版本 |
+| 回滚中 | True/False | **True** | **True** | False | 旧版本 |
+| 升级受阻 | True | False | False | **False** | 当前版本 |
+
+#### 6.3.5 生命周期执行流程
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    ClusterComponent 生命周期执行流程                              │
 ├─────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                 │
 │  CVO 视角:                                                                      │
 │                                                                                 │
 │  1. Manifest Graph 预创建阶段 (PrecreatingMode)                                  │
 │     CVO 创建 ClusterComponent CR (spec.targetVersion, spec.componentType)      │
-│     设置 status.phase = Pending, status.conditions[Available] = Unknown         │
+│     设置:                                                                       │
+│     ├── status.phase = Pending                                                  │
+│     ├── status.conditions[Available] = Unknown, reason=Pending                  │
+│     ├── status.conditions[Progressing] = False                                  │
+│     ├── status.conditions[Degraded] = False                                     │
+│     └── status.conditions[Upgradeable] = True                                   │
 │     → 提供 must-gather 可见性                                                    │
 │                                                                                 │
 │  2. 执行阶段 (UpdatingMode / InitializingMode)                                   │
 │     CVO 调用 ExecutorRegistry 执行组件                                           │
 │     执行器负责更新 ClusterComponent.status:                                     │
-│     ├── status.phase = Installing / Upgrading                                   │
-│     ├── status.conditions[Progressing] = True                                   │
+│     ├── 执行前:                                                                  │
+│     │   ├── status.phase = Installing (首次) / Upgrading (升级)                  │
+│     │   ├── status.conditions[Progressing] = True                                │
+│     │   └── status.conditions[Available] = Unknown (安装) / True (升级)         │
+│     │                                                                            │
+│     ├── 执行中 (可选):                                                           │
+│     │   └── 更新 status.message (进度描述)                                       │
+│     │       → "Working towards v1.11.1: 2 of 3 replicas ready"                   │
+│     │                                                                            │
 │     └── 执行成功后:                                                              │
 │         ├── status.phase = Installed                                             │
 │         ├── status.currentVersion = targetVersion                                │
 │         ├── status.versions = [{component, targetVersion}]                       │
-│         ├── status.conditions[Available] = True                                 │
-│         ├── status.conditions[Progressing] = False                              │
-│         └── status.conditions[Degraded] = False                                 │
+│         ├── status.conditions[Available] = True, reason=AsExpected             │
+│         ├── status.conditions[Progressing] = False, reason=AsExpected          │
+│         ├── status.conditions[Degraded] = False, reason=AsExpected            │
+│         └── status.conditions[Upgradeable] = True, reason=AsExpected           │
 │                                                                                 │
-│  3. 健康检查阻塞阶段 (HealthCheck)                                                │
-│     CVO 检查 ClusterComponent status:                                           │
-│     ├── Available == True?                                                      │
-│     ├── versions 包含 Release Image 声明的版本?                                   │
-│     ├── Degraded == False?                                                      │
-│     └── Progressing == False?                                                   │
-│     阻塞直到全部满足 (或超时)                                                     │
+│  3. 健康检查阻塞阶段 (HealthCheck) ★ CVO 门控                                   │
+│     CVO 检查 ClusterComponent status (仅看 conditions, 不看 phase):             │
+│     ├── Available == True?   (否则阻塞 → 30min 抑制 → 40min 失败)              │
+│     ├── versions 包含 Release Image 声明的版本? (否则阻塞)                       │
+│     ├── Degraded == False?  (否则: Initializing 忽略, 其他 40min 超时失败)     │
+│     └── Progressing == False? (否则阻塞)                                        │
+│     全部满足 → 放行，进入下一 Run Level                                         │
+│     任一不满足 → 阻塞 (30min 内抑制 "waiting on X", 40min 后 Failing=True)    │
 │                                                                                 │
 │  4. 失败处理                                                                     │
 │     执行器设置:                                                                  │
 │     ├── status.phase = Failed                                                   │
-│     ├── status.conditions[Degraded] = True                                     │
-│     └── status.conditions[Available] = False (如果组件不可用)                   │
-│     CVO 按 FailurePolicy 处理 (FailFast/Continue/Rollback)                      │
+│     ├── status.conditions[Degraded] = True, reason=ComponentFailed            │
+│     ├── status.conditions[Degraded].message = err.Error()                       │
+│     ├── status.conditions[Available] = True/False (取决于组件是否仍可用)        │
+│     └── status.conditions[Upgradeable] = False (阻止后续升级)                   │
+│     CVO 按 FailurePolicy 处理:                                                   │
+│     ├── FailFast: 停止整个 DAG，标记升级失败                                     │
+│     ├── Continue: 记录错误，继续执行后续组件                                     │
+│     └── Rollback: 执行回滚逻辑 → phase=RollingBack → Installed/Failed           │
+│                                                                                 │
+│  5. 版本报告规则 (★ 关键)                                                        │
+│     混合版本状态 (新旧版本共存) 时必须报告旧版本:                                │
+│     ├── 3 副本中 1 个仍是旧版本 → versions = [{component, "旧版本"}]           │
+│     └── 全部更新完成 → versions = [{component, "新版本"}]                       │
+│     这确保 CVO 不会误认为升级已完成                                              │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
