@@ -1433,9 +1433,320 @@ type OperatorReconciler struct {
 
 ---
 
-## 12. 设计思路总结与启示
+## 12. OpenShift CVO 整体架构
 
-### 12.1 OLM 管理 Operator 的核心设计思路
+### 12.1 CVO 在 OpenShift 控制平面中的定位
+
+Cluster Version Operator (CVO) 是 OpenShift 集群中所有 Cluster Operator 的顶层管理者，运行于每个 OpenShift 集群的 `openshift-cluster-version` 命名空间。CVO 消费 "Release Payload Image" (代表特定版本的 OpenShift)，该镜像包含集群运行所需的全部资源清单 (manifests)。CVO 通过协调集群资源使其与 Release Image 中的清单一致，从而实现集群安装与升级。
+
+CVO 与 OLM 的关系：CVO 管理集群内置的 **Cluster Operators** (如 apiserver、etcd、ingress、networking 等核心组件)，而 OLM 管理 **Add-on Operators** (用户通过 OperatorHub 安装的第三方/社区 Operator)。CVO 升级时会自动更新 OLM 管理的默认 CatalogSource 索引镜像 tag。
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                        OpenShift 控制平面架构 (CVO 视角)                              │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │                          Release Payload Image                                │   │
+│  │  (如 quay.io/openshift-release-dev/ocp-release:4.15.0-x86_64)                 │   │
+│  │                                                                               │   │
+│  │  内含:                                                                        │   │
+│  │  ├── release-manifests/  (所有 Cluster Operator 的资源清单)                   │   │
+│  │  │   ├── 0000_03_authorization-openshift_01_rolebindingrestriction.crd.yaml  │   │
+│  │  │   ├── 0000_03_config-operator_01_operatorhub.crd.yaml                     │   │
+│  │  │   ├── 0000_05_config-operator_02_apiserver.cr.yaml                        │   │
+│  │  │   ├── 0000_50_cluster-version-operator_00_version.cr.yaml                 │   │
+│  │  │   ├── 0000_70_etcd_*.yaml                                                 │   │
+│  │  │   ├── 0000_80_olm_*.yaml  (OLM 自身的部署清单)                             │   │
+│  │  │   └── ... (数百个清单文件，按序号排序)                                      │   │
+│  │  ├── release-metadata       (版本元数据: previous 版本列表, errata 链接)      │   │
+│  │  └── image-references       (ImageStream: 所有核心组件的镜像引用)             │   │
+│  └────────────────────────────────────┬─────────────────────────────────────────┘   │
+│                                       │ 下载/解包                                 │
+│                                       ▼                                           │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │                        Cluster Version Operator (CVO)                         │   │
+│  │                    namespace: openshift-cluster-version                      │   │
+│  │                     Deployment: cluster-version-operator (1 replica)         │   │
+│  │                                                                               │   │
+│  │  核心职责:                                                                    │   │
+│  │  1. 持续从 OpenShift Update Service (OSUS) 获取升级路径                       │   │
+│  │     → 填充 status.availableUpdates (推荐更新选项)                             │   │
+│  │  2. 用户通过 spec.desiredUpdate 声明目标版本                                   │   │
+│  │  3. 下载目标 Release Payload Image，验证签名                                   │   │
+│  │  4. 解包清单，构建清单图 (Manifest Graph)                                      │   │
+│  │  5. 启动 Worker goroutines 遍历清单图，逐个协调资源                            │   │
+│  │  6. 监听 ClusterOperator 状态，阻塞直到 Available + 版本匹配 + 未 Degraded    │   │
+│  │                                                                               │   │
+│  │  ClusterVersion CR (集群级，名为 "version"):                                   │   │
+│  │  ┌──────────────────────────────────────────────────────────────────────┐    │   │
+│  │  │ apiVersion: config.openshift.io/v1                                  │    │   │
+│  │  │ kind: ClusterVersion                                                │    │   │
+│  │  │ metadata:                                                           │    │   │
+│  │  │   name: version                                                     │    │   │
+│  │  │ spec:                                                               │    │   │
+│  │  │   channel: stable-4.15          # 更新频道                          │    │   │
+│  │  │   desiredUpdate:               # 期望升级目标                       │    │   │
+│  │  │     version: "4.15.0"                                               │    │   │
+│  │  │     image: quay.io/openshift-release-dev/ocp-release:4.15.0...     │    │   │
+│  │  │   upstream: <OSUS URL>          # 更新服务地址                      │    │   │
+│  │  │   clusterID: <uuid>                                                 │    │   │
+│  │  │ status:                                                              │    │   │
+│  │  │   version: "4.15.0"             # 当前版本                          │    │   │
+│  │  │   available: true               # 集群是否可用                      │    │   │
+│  │  │   progressing: false            # 是否正在升级                      │    │   │
+│  │  │   availableUpdates: [...]       # 可用的更新选项                    │    │   │
+│  │  │   conditions: [Available, Progressing, Degraded, ...]                │    │   │
+│  │  └──────────────────────────────────────────────────────────────────────┘    │   │
+│  └──────────────────────────────────┬──────────────────────────────────────────┘   │
+│                                     │ 协调 (reconcile)                              │
+│                                     ▼                                               │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │                     Cluster Operators (由 CVO 管理)                          │   │
+│  │                                                                               │   │
+│  │  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐        │   │
+│  │  │ kube-        │ │ openshift-   │ │ etcd         │ │ ingress      │        │   │
+│  │  │ apiserver    │ │ apiserver    │ │ operator     │ │ operator     │        │   │
+│  │  └──────────────┘ └──────────────┘ └──────────────┘ └──────────────┘        │   │
+│  │  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐        │   │
+│  │  │ network      │ │ node-tuning  │ │ monitoring   │ │ dns          │        │   │
+│  │  │ operator     │ │ operator     │ │ operator     │ │ operator     │        │   │
+│  │  └──────────────┘ └──────────────┘ └──────────────┘ └──────────────┘        │   │
+│  │  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐        │   │
+│  │  │ machine-    │ │ cluster-     │ │ service-ca   │ │ operator-    │        │   │
+│  │  │ config      │ │ version (CVO │ │ operator     │ │ lifecycle    │        │   │
+│  │  │ operator     │ │ 自身)        │ │              │ │ (OLM) ★      │        │   │
+│  │  └──────────────┘ └──────────────┘ └──────────────┘ └──────────────┘        │   │
+│  │                                                                               │   │
+│  │  每个 Cluster Operator 通过 ClusterOperator CR 报告状态:                       │   │
+│  │  ┌──────────────────────────────────────────────────────────────────────┐    │   │
+│  │  │ apiVersion: config.openshift.io/v1                                  │    │   │
+│  │  │ kind: ClusterOperator                                                │    │   │
+│  │  │ metadata:                                                           │    │   │
+│  │  │   name: operator-lifecycle-manager     # OLM 自身的 ClusterOperator │    │   │
+│  │  │ status:                                                              │    │   │
+│  │  │   conditions:                                                        │    │   │
+│  │  │     - type: Available,    status: "True"                            │    │   │
+│  │  │     - type: Progressing,  status: "False"                           │    │   │
+│  │  │     - type: Degraded,      status: "False"                           │    │   │
+│  │  │   versions:                                                          │    │   │
+│  │  │     - name: operator, version: "4.15.0"                              │    │   │
+│  │  └──────────────────────────────────────────────────────────────────────┘    │   │
+│  └──────────────────────────────────┬──────────────────────────────────────────┘   │
+│                                     │ OLM Available 后                              │
+│                                     ▼                                               │
+│  ┌──────────────────────────────────────────────────────────────────────────────┐   │
+│  │                Add-on Operators (由 OLM 管理)                                 │   │
+│  │                                                                               │   │
+│  │  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐        │   │
+│  │  │  OLM         │ │  Catalog     │ │ CatalogSource│ │  User        │        │   │
+│  │  │  Operator     │ │  Operator    │ │  (redhat-    │ │  Installed   │        │   │
+│  │  │              │ │              │ │   operators  │ │  Operators    │        │   │
+│  │  │  (管理 CSV)  │ │  (解析依赖)  │ │  community-  │ │  (如 etcd,   │        │   │
+│  │  │              │ │              │ │   operators  │ │   prometheus) │        │   │
+│  │  └──────────────┘ └──────────────┘ └──────────────┘ └──────────────┘        │   │
+│  │                                                                               │   │
+│  │  CVO 升级时自动更新默认 CatalogSource 索引镜像 tag:                            │   │
+│  │  registry.redhat.io/redhat/redhat-operator-index:v4.14 → :v4.15              │   │
+│  └──────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 12.2 CVO 协调流程 (Reconciliation)
+
+CVO 的核心协调逻辑是将 Release Image 中的清单应用到集群：
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                        CVO 协调流程 (Reconciliation)                            │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  1. 下载 Release Payload Image                                                  │
+│     └── oc image extract <release-image> --path /:/tmp/release                   │
+│                                                                                 │
+│  2. 解包并加载清单                                                               │
+│     ├── 解析 release-manifests/ 目录下的所有 YAML 文件                           │
+│     ├── 解析 image-references (ImageStream，所有镜像引用)                        │
+│     ├── 解析 release-metadata (版本元数据: previous 版本列表)                     │
+│     └── 将清单加载到清单图 (Manifest Graph)                                      │
+│                                                                                 │
+│  3. 构建清单图 (Manifest Graph)                                                  │
+│     ┌─────────────────────────────────────────────────────────────────┐         │
+│     │  按文件名序号和组件排序:                                          │         │
+│     │                                                                   │         │
+│     │  0000_03_authorization-openshift_01_*.yaml ──┐                   │         │
+│     │  0000_03_quota-openshift_01_*.yaml         ──┤                   │         │
+│     │  0000_03_security-openshift_01_*.yaml     ──┘                   │         │
+│     │           │ (序号 03 组完成后阻塞)                               │         │
+│     │           ▼                                                     │         │
+│     │  0000_05_config-operator_02_*.yaml ──┐                         │         │
+│     │  0000_05_config-operator_03_*.yaml ──┘                         │         │
+│     │           │ (序号 05 组完成后阻塞)                               │         │
+│     │           ▼                                                     │         │
+│     │  0000_50_cluster-version-operator_00_*.yaml                     │         │
+│     │           │                                                     │         │
+│     │           ▼                                                     │         │
+│     │  0000_70_etcd_*.yaml ── 0000_80_olm_*.yaml ── ...               │         │
+│     │                                                                   │         │
+│     │  规则:                                                            │         │
+│     │  • 升级时: 按序号严格分层阻塞 (保护用户数据)                     │         │
+│     │  • 初始安装: 扁平化序号，最大化并行                              │         │
+│     │  • 常规协调: 扁平化 + 随机排列 (避免依赖排序 Bug)                │         │
+│     └─────────────────────────────────────────────────────────────────┘         │
+│                                                                                 │
+│  4. Worker goroutines 遍历清单图                                                │
+│     ├── 每个 Worker 从队列取出清单，使用 Resource Builder 协调                  │
+│     ├── 成功 → 继续下一个清单                                                     │
+│     └── 失败/超时 → 放弃该清单 + 依赖该节点的所有下游节点                         │
+│                                                                                 │
+│  5. Resource Builder 协调逻辑 (按资源类型)                                       │
+│     ┌────────────────────┬─────────────────────────────────────────────┐        │
+│     │ 资源类型           │ 协调行为                                     │        │
+│     ├────────────────────┼─────────────────────────────────────────────┤        │
+│     │ ClusterOperator    │ ★ CVO 不创建！由 Operator 自身创建           │        │
+│     │                    │   CVO 仅监听，阻塞直到:                      │        │
+│     │                    │   • Available = True                       │        │
+│     │                    │   • versions 包含 Release Image 声明的版本  │        │
+│     │                    │   • Degraded = False (初始化期间除外)       │        │
+│     ├────────────────────┼─────────────────────────────────────────────┤        │
+│     │ CRD                │ 推送合并后的 CRD，阻塞直到 Established       │        │
+│     ├────────────────────┼─────────────────────────────────────────────┤        │
+│     │ Deployment         │ 初始推送不阻塞 (generation=1)               │        │
+│     │                    │ 后续更新阻塞直到:                            │        │
+│     │                    │   • observedGeneration 追上 generation      │        │
+│     │                    │   • 足够 Pod 调度满足 replicas              │        │
+│     │                    │   • 无 unavailable replicas                │        │
+│     ├────────────────────┼─────────────────────────────────────────────┤        │
+│     │ DaemonSet          │ 初始推送不阻塞                               │        │
+│     │                    │ 后续更新阻塞直到每节点有 Ready Pod            │        │
+│     ├────────────────────┼─────────────────────────────────────────────┤        │
+│     │ Job                │ 阻塞直到 Job 成功                            │        │
+│     └────────────────────┴─────────────────────────────────────────────┘        │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 12.3 CVO 升级流程
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                        CVO 集群升级流程                                          │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  1. CVO 持续轮询 OSUS (OpenShift Update Service)                                │
+│     └── 按配置的 channel (如 stable-4.15) 查询推荐升级路径                        │
+│     └── 结果写入 ClusterVersion.status.availableUpdates                           │
+│                                                                                 │
+│  2. 用户触发升级                                                                 │
+│     ├── oc adm upgrade --to 4.15.0  (CLI)                                        │
+│     └── 或 Web Console 操作                                                      │
+│     └── 写入 ClusterVersion.spec.desiredUpdate = {version: "4.15.0", image: ...}  │
+│                                                                                 │
+│  3. CVO 检测 desiredUpdate ≠ 当前版本                                            │
+│     ├── 下载目标 Release Payload Image                                           │
+│     ├── 验证镜像签名                                                             │
+│     └── 解包清单到临时目录                                                       │
+│                                                                                 │
+│  4. CVO 构建清单图 (按序号分层阻塞)                                              │
+│     └── Worker goroutines 逐层协调 Cluster Operator 资源                         │
+│                                                                                 │
+│  5. 每个 Cluster Operator 升级                                                   │
+│     ├── CVO 推送新版本 Operator 清单 (Deployment/CRD/ConfigMap 等)                │
+│     ├── Cluster Operator 自身更新其 Operand (如 kube-apiserver、etcd 等)          │
+│     ├── Cluster Operator 报告 ClusterOperator.status:                             │
+│     │   ├── Available = True (新版本运行正常)                                    │
+│     │   ├── versions = [{operator, "4.15.0"}]                                    │
+│     │   └── Degraded = False                                                     │
+│     └── CVO 监听到状态满足后，继续下一层                                          │
+│                                                                                 │
+│  6. OLM (operator-lifecycle-manager ClusterOperator) 升级完成后                  │
+│     ├── CVO 更新默认 CatalogSource 索引镜像 tag:                                 │
+│     │   registry.redhat.io/redhat/redhat-operator-index:v4.14                    │
+│     │     → registry.redhat.io/redhat/redhat-operator-index:v4.15                │
+│     └── Catalog Operator 轮询检测到 Catalog 更新                                  │
+│     └── 用户安装的 Add-on Operator 可按新 Catalog 升级                            │
+│                                                                                 │
+│  7. 全部 Cluster Operator Available → ClusterVersion.status:                     │
+│     ├── version = "4.15.0"                                                      │
+│     ├── available = true                                                         │
+│     ├── progressing = false                                                      │
+│     └── 升级完成                                                                 │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 12.4 三类 Operator 的分层关系
+
+OpenShift 集群中存在三类 Operator，由不同机制管理：
+
+| 类型 | 管理者 | 示例 | 管理方式 |
+|------|--------|------|---------|
+| **Cluster Operators** | CVO (Release Image) | kube-apiserver、etcd、ingress、OLM 自身 | CVO 从 Release Image 协调清单，阻塞等待 ClusterOperator 状态 |
+| **Add-on Operators** | OLM (用户安装) | etcd-operator、prometheus-operator、cert-manager | 用户通过 Subscription 安装，OLM 管理生命周期 |
+| **Platform Operators** | Platform Operator (Technology Preview) | 第三方平台组件 | 介于 CVO 和 OLM 之间的实验机制 |
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    三类 Operator 的分层管理关系                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌──────────────────────────────────────────────────────────────────┐       │
+│  │  CVO (Cluster Version Operator)                                   │       │
+│  │  • 管理 Release Image → Cluster Operators                       │       │
+│  │  • 集群级版本协调 (安装/升级/回滚)                                │       │
+│  │  • 阻塞等待 ClusterOperator.status                               │       │
+│  └──────────────────────────┬───────────────────────────────────────┘       │
+│                             │                                                │
+│              ┌──────────────┼──────────────────┐                             │
+│              ▼              ▼                  ▼                             │
+│  ┌──────────────┐ ┌──────────────┐  ┌──────────────────┐                    │
+│  │ 核心 Cluster │ │ OLM 自身的   │  │ 其他 Cluster     │                    │
+│  │ Operators    │ │ ClusterOp    │  │ Operators        │                    │
+│  │ (apiserver,  │ │ (operator-   │  │ (network, dns,   │                    │
+│  │  etcd, ...)  │ │  lifecycle-  │  │  ingress, ...)  │                    │
+│  │              │ │  manager)     │  │                  │                    │
+│  └──────────────┘ └──────┬───────┘  └──────────────────┘                    │
+│                            │                                                │
+│                            ▼                                                │
+│                   ┌────────────────┐                                       │
+│                   │      OLM       │                                       │
+│                   │  (双 Operator)  │                                       │
+│                   └───────┬────────┘                                       │
+│                           │                                                │
+│                           ▼                                                │
+│                   ┌────────────────┐                                       │
+│                   │ Add-on Operators│                                       │
+│                   │ (用户通过       │                                       │
+│                   │  OperatorHub    │                                       │
+│                   │  安装)          │                                       │
+│                   └────────────────┘                                       │
+│                                                                             │
+│  升级顺序:                                                                   │
+│  CVO 升级 Release → 核心 Cluster Operators → OLM 自身升级                    │
+│  → OLM 更新默认 Catalog 索引 → Add-on Operators 可选升级                     │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 12.5 CVO 关键设计要点
+
+| 设计要点 | 说明 |
+|---------|------|
+| **Release Image 作为唯一真相源** | 集群期望状态完全由 Release Payload Image 中的清单定义，CVO 协调集群使其一致 |
+| **清单图按序号分层** | 文件名前缀序号 (如 `0000_03_`、`0000_05_`) 定义协调顺序，同序号并行，跨序号阻塞 |
+| **ClusterOperator 状态门控** | CVO 不创建 ClusterOperator CR，仅监听其状态 (Available/版本/Degraded) 作为升级阻塞门 |
+| **Resource Builder 合并策略** | 合并 Release Image 清单与集群现有对象的关键 spec 字段，差异时推送 |
+| **三阶段图策略** | 升级严格分层 (保护数据)、初始安装扁平并行、常规协调扁平+随机排列 |
+| **Worker 错误传播** | Worker 失败时放弃该清单节点及其所有下游依赖，保证升级安全性 |
+| **OSUS 升级路径推荐** | Cincinnati 算法基于频道和版本历史推荐安全升级路径，防止跳版本 |
+| **不可变 Release Image** | Release Image 不可变，版本变更只能通过切换到新 Release Image 实现 |
+
+---
+
+## 13. 设计思路总结与启示
+
+### 13.1 OLM 管理 Operator 的核心设计思路
 
 ```txt
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -1487,7 +1798,7 @@ type OperatorReconciler struct {
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 12.2 对 BKE 平台的启示
+### 13.2 对 BKE 平台的启示
 
 | OLM 设计 | BKE 对应思考 |
 |----------|-------------|
@@ -1503,9 +1814,9 @@ type OperatorReconciler struct {
 
 ---
 
-## 13. 附录
+## 14. 附录
 
-### 13.1 参考来源
+### 14.1 参考来源
 
 | 来源 | URL |
 |------|-----|
@@ -1522,8 +1833,11 @@ type OperatorReconciler struct {
 | 依赖解析文档 | https://olm.operatorframework.io/docs/concepts/olm-architecture/dependency-resolution/ |
 | 更新图文档 | https://olm.operatorframework.io/docs/concepts/olm-architecture/operator-catalog/creating-an-update-graph/ |
 | File-Based Catalog 文档 | https://olm.operatorframework.io/docs/reference/file-based-catalogs/ |
+| CVO 代码库 | https://github.com/openshift/cluster-version-operator |
+| CVO 协调设计文档 | https://github.com/openshift/enhancements/blob/master/dev-guide/cluster-version-operator/user/reconciliation.md |
+| OpenShift 更新文档 | https://docs.openshift.com/container-platform/4.15/updating_clusters/understanding-openshift-updates-1.html |
 
-### 13.2 术语表
+### 14.2 术语表
 
 | 术语 | 定义 |
 |------|------|
@@ -1545,6 +1859,11 @@ type OperatorReconciler struct {
 | **QueueInformer** | OLM 自定义控制器框架，informer + workqueue + syncer |
 | **Copied CSV** | OLM 将源 CSV 复制到目标命名空间的副本，告知用户有 Operator 在监听 |
 | **RukPak** | OLM 的新一代打包技术 (Technology Preview) |
+| **CVO** | Cluster Version Operator，OpenShift 集群级版本协调器，管理 Release Image 到 Cluster Operators 的安装/升级 |
+| **Release Payload Image** | 代表特定 OpenShift 版本的容器镜像，包含所有 Cluster Operator 的资源清单 |
+| **ClusterOperator** | OpenShift 核心 Operator 的状态报告 CR (Available/Progressing/Degraded)，CVO 监听其状态作为升级门控 |
+| **OSUS** | OpenShift Update Service，基于 Cincinnati 算法推荐安全升级路径 |
+| **Manifest Graph** | CVO 将 Release Image 清单构建的协调图，按文件名序号分层阻塞 |
 | **InstallMode** | CSV 声明的安装模式 (OwnNamespace/SingleNamespace/MultiNamespace/AllNamespaces) |
 
 ---
