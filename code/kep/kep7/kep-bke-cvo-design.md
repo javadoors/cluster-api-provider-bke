@@ -213,6 +213,57 @@
 
 借鉴 OpenShift ClusterOperator CRD，为 BKE 每个受管组件创建独立的 `ClusterComponent` CR。CVO 监听其状态作为升级门控，实现"不创建组件、仅监听状态"的阻塞模式。
 
+#### 6.1.0 "CVO 监听其状态作为升级门控"详解
+
+这句话的含义是：**CVO 不亲自安装/升级组件，也不判断组件是否健康 — 这些都是 ComponentExecutor 的职责。CVO 在执行器完成后，仅"看" ClusterComponent.status 上的四个条件 (Available/Progressing/Degraded/versions)，全部满足才放行进入下一 Run Level，否则阻塞等待。**
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              "CVO 监听状态作为升级门控"的含义                                     │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  组件执行器完成工作:                                                             │
+│  执行器 (inline/yaml/helm/binary) 安装/升级组件后                                │
+│  → 写入 ClusterComponent.status:                                                │
+│      Available=True, versions=新版本, Degraded=False, Progressing=False         │
+│                                                                                 │
+│                          ↓ CVO 监听到 status 变更                                │
+│                                                                                 │
+│  CVO 门控检查 (四个条件全部满足才放行):                                          │
+│  ┌──────────────────────────────────────────────────────────────────┐          │
+│  │ ✓ Available == True?       组件可用                               │          │
+│  │ ✓ versions 匹配期望版本?    版本已更新完成                        │          │
+│  │ ✓ Degraded == False?       未降级                                │          │
+│  │ ✓ Progressing == False?     不在进行中                            │          │
+│  └──────────────────────────────────────────────────────────────────┘          │
+│                          ↓                                                     │
+│                                                                                 │
+│  全部满足 → 放行，进入下一 Run Level                                            │
+│  任一不满足 → 阻塞当前 Run Level                                                │
+│    ├── 30 分钟内: 抑制失败 (报告 "waiting on X")                                │
+│    └── 40 分钟后: 超时失败 (Failing=True)                                      │
+│                                                                                 │
+│  为什么这样设计 (解耦):                                                         │
+│  CVO 不需要知道每个组件"怎么算健康":                                            │
+│    • coredns: 看 Pod Ready (执行器判断)                                        │
+│    • containerd: 看 systemd active (执行器判断)                                │
+│    • kubernetes: 看 API 可用 (执行器判断)                                      │
+│  这些判断逻辑由组件执行器自行实现并写入 status                                  │
+│  CVO 只需要读标准化的 status 条件 → CVO 与组件完全解耦                          │
+│  新增组件时 CVO 零代码改动 (只需新的 ComponentVersion + 执行器)                │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+| 维度 | CVO 的职责 | 组件执行器的职责 |
+|------|-----------|----------------|
+| 安装/升级组件 | **不做** — 调用 ComponentExecutor | **做** — 执行实际安装/升级逻辑 |
+| 判断组件健康 | **不做** — 仅读 status 条件 | **做** — 自行实现健康检查逻辑 |
+| 创建 ClusterComponent CR | **做** — 预创建 (PrecreatingMode) | 不做 (CVO 预创建后执行器接管) |
+| 更新 ClusterComponent.status | **不做** — 仅消费 (watch) | **做** — 写入 Available/Progressing/Degraded/versions |
+| 阻塞等待 | **做** — 监听 status 直到满足门控条件 | 不做 (写完 status 即完成) |
+| 超时判定 | **做** — 30min 抑制 / 40min 失败 | 不做 |
+
 ### 6.1.1 ClusterComponent 不是 Operator — 概念澄清
 
 **ClusterComponent 不是组件 (Operator) 本身，它只是一个状态报告 CR** (类似 OpenShift 的 ClusterOperator CR)。开发者不会"编写一个 ClusterComponent"，而是编写组件本体，ClusterComponent CR 由 CVO 自动创建、由组件执行器自动更新状态。
