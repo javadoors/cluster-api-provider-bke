@@ -719,17 +719,97 @@ func init() {
 
 #### 6.5.6 Step 5: ClusterComponent 状态报告开发规范
 
+##### 6.5.6.1 设计思路
+
+ClusterComponent 状态报告的设计借鉴 OpenShift ClusterOperator 的状态模型，核心思路是**将组件状态从"管理者观测"转变为"组件自报告"**，实现去中心化的状态上报与门控阻塞：
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              ClusterComponent 状态报告设计思路                                   │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  传统模式 (现状):                                                               │
+│  ┌────────────┐    写入 Status    ┌──────────────────────────┐                  │
+│  │ CVO        │ ───────────────→ │ BKECluster.Status.       │                  │
+│  │ Scheduler  │                   │   ClusterComponentStatuses│                 │
+│  │            │                   │   (集中式，管理者观测)    │                  │
+│  └────────────┘                   └──────────────────────────┘                  │
+│  问题:                                                                          │
+│  • 状态由管理者写入，组件本身无法主动报告                                       │
+│  • 组件状态内嵌在 BKECluster.Status 中，非一等公民                              │
+│  • 管理者需知道每个组件如何判断健康，逻辑集中且膨胀                             │
+│  • 无法被标准工具独立发现和消费                                                 │
+│                                                                                 │
+│  CVO 设计模式:                                                                  │
+│  ┌────────────┐  预创建 (Precreate)  ┌────────────────────┐                    │
+│  │ BKE CVO    │ ───────────────────→ │ ClusterComponent CR │                   │
+│  │            │                       │ (独立一等公民)      │                   │
+│  │            │ ←── 阻塞门控 ──────── │                     │                   │
+│  │            │     (监听状态)         │                     │                   │
+│  └────────────┘                       └─────────┬──────────┘                   │
+│                                                  │ 自报告                      │
+│                                                  ▼                             │
+│                                       ┌────────────────────┐                   │
+│                                       │ Component Executor  │                   │
+│                                       │ (inline/yaml/helm/  │                   │
+│                                       │  binary)            │                   │
+│                                       │                     │                   │
+│                                       │ 执行前: MarkPending  │                   │
+│                                       │ 执行后: MarkInstalled│                   │
+│                                       │ 失败时: MarkFailed   │                   │
+│                                       └────────────────────┘                   │
+│                                                                                 │
+│  优势:                                                                          │
+│  • 组件执行器自行报告状态，逻辑去中心化                                         │
+│  • 独立 CR 是 Kubernetes 一等公民，可被标准工具独立发现                          │
+│  • CVO 仅监听状态作为门控，不关心组件如何判断健康                               │
+│  • 组件可独立 must-gather/监控/Prometheus 消费                                  │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+##### 6.5.6.2 状态原则
+
+ClusterComponent 状态报告遵循以下核心原则，每条原则对应 OpenShift CVO 经过大规模生产验证的设计决策：
+
+| 原则 | 说明 | 违反后果 |
+|------|------|---------|
+| **1. Available 优先于 Progressing** | `Available=False` 表示组件不可用，需立即管理员干预，**优先级高于 Progressing**。即使 Progressing=True (正在升级)，如果组件仍能服务，Available 应为 True | 误报不可用 → CVO 错误阻塞升级，或管理员误判为紧急故障 |
+| **2. Degraded 表示持续降级，非瞬态** | Degraded 表示组件在**持续一段时间**内不匹配期望状态，导致服务质量下降。瞬态错误 (如 Pod 重启) 不应设置 Degraded。Degraded 不应频繁振荡 | Degraded 振荡 → CVO 反复阻塞/放行升级，升级卡死或误放行 |
+| **3. Available 和 Degraded 可共存** | 组件可能同时 Available=True 且 Degraded=True。例: Deployment 期望 3 副本，1 个 crash-looping → 服务可用但降级 | 互斥设计 → 无法表达 "可用但需修复" 的中间状态 |
+| **4. 正常升级期间不可 Degraded** | 正常升级过程中组件不应 Degraded=True。如果升级导致 Degraded，说明升级本身有问题 | 升级期间 Degraded → CVO 40 分钟后超时失败，升级被阻塞 |
+| **5. 正常升级期间 Available 不可为 False** | 升级期间组件必须保持 Available=True (如滚动升级保持最小可用副本) | Available=False → CVO 立即判定升级失败 |
+| **6. 混合版本状态必须报告旧版本** | 当新旧版本共存时 (如滚动升级中 3 副本 2 新 1 旧)，`status.versions` 必须报告**旧版本**。只有确认不再运行旧版本时才更新为新版本 | 误报新版本 → CVO 认为升级已完成，提前进入下一 Run Level，导致混合版本不兼容 |
+| **7. Upgradeable=False 仅阻止 minor 升级** | `Upgradeable=False` 阻止 **minor** 版本升级 (如 v2.6→v2.7)，**不阻止** patch 升级 (如 v2.7.0→v2.7.1)。缺失/True/Unknown 均允许升级 | 过度阻塞 → patch 升级被误阻，集群无法获取安全补丁 |
+| **8. Progressing 仅表示状态转换，非常规协调** | Progressing=True 仅在组件从一态转向另一态时设置 (如版本变更、配置传播)。常规协调 (reconcile 已知状态) **不应**设置 Progressing。不应因 DaemonSet/Deployment 适应节点扩容或重启而设置 | 误报 Progressing → CVO 误判为仍在升级，阻塞后续组件 |
+| **9. 条件需设置 reason 和 message (含正常态)** | 正常态也需设置 `reason` 和 `message`，不能仅设 `status=True/False`。推荐正常态 reason 用 `AsExpected`，message 用简洁描述 | 缺失 reason/message → 管理员无法诊断 "为什么 Available=False" |
+| **10. 条件消息遵循格式规范** | `Progressing.message` 最重要 (CLI 默认显示)，应 5-10 词简洁描述。`Available.message` 单句无标点。`Degraded.message` 数句含足够诊断信息 | 消息不规范 → CLI/Web Console 展示混乱，运维效率低 |
+| **11. LastTransitionTime 仅在状态变更时更新** | `LastTransitionTime` 仅在条件 `status` 从 True→False 或 False→True 时更新，**不应在每次 reconcile 时更新** | 误更新 → 监控指标条件转换计数虚高，时间统计失真 |
+| **12. Forward-Only — 无自动回滚** | 升级是 forward-only，失败不自动回滚。组件必须能处理 N-1 兼容性 (新 Operator + 旧 Operand 共存)。FailurePolicy=Rollback 仅回滚组件自身，不回滚集群版本 | 期望自动回滚 → 设计与 CVO 哲学冲突，可能引入更大风险 |
+
+##### 6.5.6.3 条件语义速查表
+
+| 条件 | 正常态 | 升级中 | 降级 | 不可用 | 升级受阻 |
+|------|--------|--------|------|--------|---------|
+| `Available` | True | True | True | **False** | True |
+| `Progressing` | False | **True** | False | False | False |
+| `Degraded` | False | False | **True** | True | False |
+| `Upgradeable` | True | True | True | True | **False** |
+| `versions` | 当前版本 | **旧版本** (混合态) | 当前版本 | 旧版本 | 当前版本 |
+
+##### 6.5.6.4 状态报告执行规范
+
 组件执行器必须遵循以下状态报告规范:
 
 ```txt
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│              ClusterComponent 状态报告开发规范                                   │
+│              ClusterComponent 状态报告执行规范                                   │
 ├─────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                 │
 │  执行前:                                                                        │
 │  ├── MarkPending(name)                                                          │
 │  │   → status.phase = Pending                                                   │
-│  │   → status.conditions[Progressing] = True                                    │
+│  │   → status.conditions[Progressing] = True, reason=ComponentInstalling       │
 │  │   → status.conditions[Available] = Unknown                                   │
 │  │                                                                              │
 │  执行中 (可选):                                                                 │
@@ -741,15 +821,15 @@ func init() {
 │  │   → status.phase = Installed                                                 │
 │  │   → status.currentVersion = version                                          │
 │  │   → status.versions = [{component, version}]                                  │
-│  │   → status.conditions[Available] = True                                      │
-│  │   → status.conditions[Progressing] = False                                   │
-│  │   → status.conditions[Degraded] = False                                      │
-│  │   → status.conditions[Upgradeable] = True                                    │
+│  │   → status.conditions[Available] = True, reason=AsExpected                  │
+│  │   → status.conditions[Progressing] = False, reason=AsExpected               │
+│  │   → status.conditions[Degraded] = False, reason=AsExpected                  │
+│  │   → status.conditions[Upgradeable] = True, reason=AsExpected                │
 │  │                                                                              │
 │  执行失败:                                                                      │
 │  ├── MarkFailed(name, err)                                                      │
 │  │   → status.phase = Failed                                                   │
-│  │   → status.conditions[Degraded] = True                                      │
+│  │   → status.conditions[Degraded] = True, reason=ComponentFailed              │
 │  │   → status.conditions[Degraded].message = err.Error()                        │
 │  │   → status.conditions[Available] = True/False (取决于组件是否仍可用)          │
 │  │   → status.conditions[Upgradeable] = False (阻止后续升级)                    │
