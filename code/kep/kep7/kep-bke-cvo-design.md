@@ -354,6 +354,549 @@ spec:
 
 > **迁移策略**：ClusterComponent CR 为主数据源，BKECluster.Status.ClusterComponentStatuses 作为镜像保持向后兼容 (CVO 在写入 ClusterComponent 后同步镜像到 BKECluster.Status)。
 
+### 6.5 ClusterComponent 开发流程
+
+本节描述组件开发者如何将一个新组件接入 BKE CVO 体系，涵盖从声明定义到发布到 ReleaseImage OCI Bundle 的完整开发流程。
+
+#### 6.5.1 开发流程总览
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                  ClusterComponent 开发流程                                       │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  Step 1: 确定组件元数据                                                         │
+│  ├── 确定组件名称 (如 coredns)                                                 │
+│  ├── 确定组件版本 (如 v1.11.1)                                                 │
+│  ├── 确定组件类型 (inline / yaml / helm / binary)                              │
+│  ├── 确定 Run Level (如 50)                                                    │
+│  └── 确定依赖关系 (如依赖 containerd)                                          │
+│                                                                                 │
+│  Step 2: 编写 ComponentVersion YAML                                             │
+│  ├── 定义 spec (type, version, runLevel, dependencies)                         │
+│  ├── 定义 install/upgrade 策略                                                  │
+│  ├── 定义 healthCheck (健康检查)                                                │
+│  └── 定义 compatibility (兼容性约束)                                           │
+│                                                                                 │
+│  Step 3: 编写组件制品                                                           │
+│  ├── yaml 类型: 编写 manifest YAML 清单                                         │
+│  ├── helm 类型: 编写 Helm Chart + Values                                       │
+│  ├── binary 类型: 编写制品 + installScript + configTemplates                  │
+│  └── inline 类型: 实现 Phase Handler (Go 代码)                                  │
+│                                                                                 │
+│  Step 4: 实现组件执行器 (如需自定义类型)                                        │
+│  ├── 实现 ComponentExecutor 接口                                               │
+│  └── 注册到 ExecutorRegistry                                                    │
+│                                                                                 │
+│  Step 5: 更新 ClusterComponent 状态报告逻辑                                     │
+│  ├── 执行器在执行前设置 phase=Installing/Upgrading                             │
+│  ├── 执行器在执行后设置 phase=Installed, Available=True, versions 匹配         │
+│  └── 执行器在失败时设置 phase=Failed, Degraded=True                            │
+│                                                                                 │
+│  Step 6: 本地测试                                                               │
+│  ├── 单元测试 (执行器逻辑)                                                     │
+│  ├── 集成测试 (DAG 执行 + 状态门控)                                            │
+│  └── E2E 测试 (安装/升级/断点续传)                                              │
+│                                                                                 │
+│  Step 7: 打包到 ReleaseImage OCI Bundle                                         │
+│  ├── 将 component.yaml 放入 components/<name>/<version>/                        │
+│  ├── 将 manifest YAML 放入 manifests/<name>/<version>/                          │
+│  └── 构建并推送 OCI Bundle                                                      │
+│                                                                                 │
+│  Step 8: 注册到 ReleaseImage CR                                                 │
+│  ├── 在 ReleaseImage.spec.install.components 中添加 {name, version}            │
+│  └── 在 ReleaseImage.spec.upgrade.components 中添加 {name, version, inline?}   │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 6.5.2 Step 1: 确定组件元数据
+
+| 决策项 | 说明 | 示例 |
+|--------|------|------|
+| 组件名称 | 全局唯一，小写，连字符分隔 | `coredns`, `kubernetes-master`, `containerd` |
+| 组件版本 | SemVer 格式 | `v1.11.1`, `v1.29.0` |
+| 组件类型 | `inline` / `yaml` / `helm` / `binary` | 见 §6.5.3 |
+| Run Level | 定义执行顺序 (00-90) | 见 §7.3 Run Level 分配表 |
+| 依赖关系 | 依赖的其他组件 | `[containerd]`, `[kubernetes-master]` |
+| 安装模式 | `OwnNamespace` / `AllNamespaces` | 取决于组件作用范围 |
+| 升级策略 | `FailFast` / `Continue` / `Rollback` | 默认 `FailFast` |
+
+#### 6.5.3 Step 2: 编写 ComponentVersion YAML
+
+**YAML 类型组件示例 (coredns)**:
+
+```yaml
+# components/coredns/v1.11.1/component.yaml
+apiVersion: cvo.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: coredns-v1.11.1
+spec:
+  name: coredns
+  type: yaml                              # 组件类型
+  version: v1.11.1
+  runLevel: 50                            # ★ Run Level (DNS 插件层)
+
+  yaml:
+    namespace: kube-system
+    applyStrategy: ServerSideApply        # 应用策略
+    prune: true                           # 裁剪废弃资源
+    pruneLabelSelector:
+      app.kubernetes.io/managed-by: bke-cvo
+    healthCheck:
+      enabled: true
+      timeout: "3m"
+      checks:
+        - type: PodReady
+          podReady:
+            namespace: kube-system
+            labelSelector: "k8s-app=kube-dns"
+            minReady: 1
+
+  compatibility:
+    constraints:
+      - component: kubernetes
+        rule: ">=1.24.0"
+
+  dependencies:                           # 依赖关系
+    - name: containerd
+      phase: Install
+
+  upgradeStrategy:
+    mode: Parallel                        # 升级模式
+    batchSize: 1
+    failurePolicy: FailFast               # 失败策略
+    timeout: "10m"
+```
+
+**Inline 类型组件示例 (kubernetes-master)**:
+
+```yaml
+# components/kubernetes-master/v1.29.0/component.yaml
+apiVersion: cvo.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: kubernetes-master-v1.29.0
+spec:
+  name: kubernetes-master
+  type: inline                             # Inline 类型 (Go 代码执行)
+  version: v1.29.0
+  runLevel: 10                             # Kubernetes 核心层
+
+  inline:
+    handler: EnsureMasterInit             # Handler 名称
+    version: v1.0.0                       # Handler 版本
+
+  compatibility:
+    constraints:
+      - component: etcd
+        rule: ">=3.5.0"
+      - component: containerd
+        rule: ">=1.7.0"
+
+  dependencies:
+    - name: etcd
+      phase: Install
+
+  upgradeStrategy:
+    mode: Rolling
+    batchSize: 1
+    failurePolicy: FailFast
+    timeout: "30m"
+```
+
+**Binary 类型组件示例 (containerd)**:
+
+```yaml
+# components/containerd/v1.7.18/component.yaml
+apiVersion: cvo.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: containerd-v1.7.18
+spec:
+  name: containerd
+  type: binary                             # Binary 类型 (SSH 安装)
+  version: v1.7.18
+  runLevel: 30                             # 容器运行时层
+
+  binary:
+    artifacts:
+      - name: containerd
+        url: "registry.openfuyao.cn/binaries/containerd/{{componentVersion}}/containerd-{{componentVersion}}-linux-{{nodeArch}}.tar.gz"
+        checksum: "sha256:abc123..."
+        installPath: "/usr/local"
+        executable: containerd
+
+    configTemplates:
+      - name: config.toml
+        path: "/etc/containerd/config.toml"
+        content: |
+          version = 2
+          [plugins."io.containerd.grpc.v1.cri"]
+            sandbox_image = "{{imageRegistry}}/pause:3.9"
+
+    installScript: |
+      #!/bin/bash
+      set -e
+      systemctl stop containerd || true
+      tar -xzf "{{artifact.containerd.path}}" -C {{artifact.containerd.installPath}}
+      systemctl daemon-reload && systemctl enable containerd && systemctl start containerd
+
+    healthCheck:
+      enabled: true
+      timeout: "2m"
+      script: |
+        systemctl is-active containerd
+
+  compatibility:
+    constraints:
+      - component: kubernetes
+        rule: ">=1.26.0"
+
+  upgradeStrategy:
+    mode: Rolling
+    batchSize: 2
+    failurePolicy: Continue
+    timeout: "10m"
+```
+
+#### 6.5.4 Step 3: 编写组件制品
+
+| 类型 | 制品目录 | 制品内容 |
+|------|---------|---------|
+| `yaml` | `manifests/<name>/<version>/<name>.yaml` | 多文档 YAML 清单 (支持 Go template 变量) |
+| `helm` | `charts/<name>/<version>/` | Helm Chart (Chart.yaml + templates/ + values.yaml) |
+| `binary` | `binaries/<name>/<version>/` | 二进制制品 (tar.gz) + 校验和 |
+| `inline` | 无独立制品 | Go 代码 (Phase Handler)，打包到 BKE 二进制 |
+
+**YAML 清单示例 (coredns.yaml)**:
+
+```yaml
+# manifests/coredns/v1.11.1/coredns.yaml
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: coredns
+  namespace: kube-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coredns
+  namespace: kube-system
+  labels:
+    k8s-app: kube-dns
+    app.kubernetes.io/managed-by: bke-cvo    # ★ Prune label
+spec:
+  replicas: {{ .ReplicaCount | default 2 }}
+  selector:
+    matchLabels:
+      k8s-app: kube-dns
+  template:
+    metadata:
+      labels:
+        k8s-app: kube-dns
+    spec:
+      containers:
+        - name: coredns
+          image: {{ .ImageRegistry }}/coredns/coredns:{{ .ComponentVersion }}
+          ports:
+            - containerPort: 53
+              name: dns
+              protocol: UDP
+```
+
+> 模板变量通过 `manifest.TemplateContext` 注入: `.ClusterName`, `.Namespace`, `.KubernetesVersion`, `.OpenFuyaoVersion`, `.ImageRegistry`, `.ComponentVersion`, `.ReplicaCount` 等。
+
+#### 6.5.5 Step 4: 实现组件执行器 (自定义类型)
+
+对于 `yaml` 和 `inline` 类型，BKE 已有内置执行器。如需自定义类型 (如 `helm`、`binary`)，需实现 `ComponentExecutor` 接口:
+
+```go
+// pkg/dagexec/executor.go (现有接口)
+
+type ComponentExecutor interface {
+    ExecuteComponent(ctx context.Context, node *topology.ComponentNode,
+        execCtx *ExecutionContext) error
+    GetComponentType() ComponentType
+}
+```
+
+**Helm 执行器实现示例**:
+
+```go
+// pkg/dagexec/helm_executor.go
+
+type HelmExecutor struct {
+    chartFetcher  ChartFetcher
+    valuesRenderer ValuesRenderer
+    helmAction    HelmActionExecutor
+    healthChecker HealthChecker
+}
+
+func (e *HelmExecutor) GetComponentType() ComponentType {
+    return ComponentType("helm")
+}
+
+func (e *HelmExecutor) ExecuteComponent(ctx context.Context,
+    node *topology.ComponentNode, execCtx *ExecutionContext) error {
+
+    // 1. 从 ComponentVersion 获取 Helm 配置
+    cv := execCtx.CVStore.GetComponentVersion(node.Name, node.Version)
+
+    // 2. 更新 ClusterComponent 状态 → Installing/Upgrading
+    execCtx.ComponentStatusUpdater.MarkPending(node.Name)
+
+    // 3. 拉取 Chart
+    chart, err := e.chartFetcher.Fetch(ctx, cv.Spec.Helm.Chart)
+    if err != nil {
+        execCtx.ComponentStatusUpdater.MarkFailed(node.Name, err)
+        return err
+    }
+
+    // 4. 渲染 Values (模板变量替换)
+    values, err := e.valuesRenderer.Render(cv.Spec.Helm.Values, execCtx.TemplateContext)
+    if err != nil {
+        execCtx.ComponentStatusUpdater.MarkFailed(node.Name, err)
+        return err
+    }
+
+    // 5. 执行 Helm Install/Upgrade
+    err = e.helmAction.Execute(ctx, cv.Spec.Helm, chart, values)
+    if err != nil {
+        execCtx.ComponentStatusUpdater.MarkFailed(node.Name, err)
+        return err
+    }
+
+    // 6. 健康检查
+    if cv.Spec.Helm.HealthCheck != nil && cv.Spec.Helm.HealthCheck.Enabled {
+        if err := e.healthChecker.Check(ctx, execCtx.TargetClient, cv.Spec.Helm.HealthCheck); err != nil {
+            execCtx.ComponentStatusUpdater.MarkFailed(node.Name, err)
+            return err
+        }
+    }
+
+    // 7. 更新 ClusterComponent 状态 → Installed, Available=True
+    execCtx.ComponentStatusUpdater.MarkInstalled(node.Version)
+
+    return nil
+}
+
+// 注册到 ExecutorRegistry
+func init() {
+    // 在 Scheduler 初始化时注册
+    // sched.Registry.Register(ComponentType("helm"), &HelmExecutor{...})
+}
+```
+
+#### 6.5.6 Step 5: ClusterComponent 状态报告开发规范
+
+组件执行器必须遵循以下状态报告规范:
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              ClusterComponent 状态报告开发规范                                   │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  执行前:                                                                        │
+│  ├── MarkPending(name)                                                          │
+│  │   → status.phase = Pending                                                   │
+│  │   → status.conditions[Progressing] = True                                    │
+│  │   → status.conditions[Available] = Unknown                                   │
+│  │                                                                              │
+│  执行中 (可选):                                                                 │
+│  ├── 更新 status.message (进度描述)                                             │
+│  │   → "Working towards v1.11.1: 2 of 3 replicas ready"                         │
+│  │                                                                              │
+│  执行成功:                                                                      │
+│  ├── MarkInstalled(version)                                                     │
+│  │   → status.phase = Installed                                                 │
+│  │   → status.currentVersion = version                                          │
+│  │   → status.versions = [{component, version}]                                  │
+│  │   → status.conditions[Available] = True                                      │
+│  │   → status.conditions[Progressing] = False                                   │
+│  │   → status.conditions[Degraded] = False                                      │
+│  │   → status.conditions[Upgradeable] = True                                    │
+│  │                                                                              │
+│  执行失败:                                                                      │
+│  ├── MarkFailed(name, err)                                                      │
+│  │   → status.phase = Failed                                                   │
+│  │   → status.conditions[Degraded] = True                                      │
+│  │   → status.conditions[Degraded].message = err.Error()                        │
+│  │   → status.conditions[Available] = True/False (取决于组件是否仍可用)          │
+│  │   → status.conditions[Upgradeable] = False (阻止后续升级)                    │
+│  │                                                                              │
+│  回滚中 (如果 FailurePolicy=Rollback):                                          │
+│  ├── MarkRollingBack()                                                          │
+│  │   → status.phase = RollingBack                                              │
+│  │   → status.conditions[Progressing] = True                                   │
+│  │   → status.conditions[Degraded] = True                                       │
+│  │                                                                              │
+│  状态门控阻塞 (CVO 视角):                                                       │
+│  │   CVO 在 ManifestGraph 执行后检查 ClusterComponent:                          │
+│  │   ├── Available == True?  (否则阻塞 30min → 40min 超时失败)                 │
+│  │   ├── versions 包含 ReleaseImage 声明版本? (否则阻塞)                       │
+│  │   ├── Degraded == False? (否则: Initializing 忽略, 其他 40min 超时失败)    │
+│  │   └── Progressing == False? (否则阻塞)                                      │
+│  │                                                                              │
+│  版本报告规则 (★ 关键):                                                          │
+│  │   混合版本状态 (新旧版本共存) 时必须报告旧版本:                              │
+│  │   ├── 3 副本中 1 个仍是旧版本 → status.versions = [{operator, "旧版本"}]   │
+│  │   └── 全部更新完成 → status.versions = [{operator, "新版本"}]              │
+│  │   这确保 CVO 不会误认为升级已完成                                            │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 6.5.7 Step 6: 本地测试
+
+**单元测试**:
+
+```go
+// pkg/dagexec/helm_executor_test.go
+
+func TestHelmExecutor_ExecuteComponent_Success(t *testing.T) {
+    // 准备 mock
+    mockChartFetcher := &mocks.ChartFetcher{...}
+    mockValuesRenderer := &mocks.ValuesRenderer{...}
+    mockHelmAction := &mocks.HelmActionExecutor{...}
+    mockHealthChecker := &mocks.HealthChecker{...}
+    mockStatusUpdater := &mocks.ComponentStatusUpdater{...}
+
+    executor := &HelmExecutor{
+        chartFetcher:  mockChartFetcher,
+        valuesRenderer: mockValuesRenderer,
+        helmAction:    mockHelmAction,
+        healthChecker: mockHealthChecker,
+    }
+
+    node := &topology.ComponentNode{Name: "coredns", Version: "v1.11.1"}
+    execCtx := &ExecutionContext{
+        ComponentStatusUpdater: mockStatusUpdater,
+        // ...
+    }
+
+    err := executor.ExecuteComponent(ctx, node, execCtx)
+
+    assert.NoError(t, err)
+    // 验证状态更新序列
+    mockStatusUpdater.AssertCalled(t, "MarkPending", "coredns")
+    mockStatusUpdater.AssertCalled(t, "MarkInstalled", "v1.11.1")
+}
+```
+
+**集成测试**:
+
+```go
+// test/integration/cvo_component_test.go
+
+func TestCVO_ComponentInstall_DAGExecution(t *testing.T) {
+    // 1. 创建 BKECluster + ClusterVersion
+    // 2. 创建 ReleaseImage (含 coredns ComponentVersion)
+    // 3. 等待 CVO 执行 DAG
+    // 4. 验证:
+    //    - ClusterComponent CR 被创建
+    //    - status.phase == Installed
+    //    - status.conditions[Available] == True
+    //    - status.versions 匹配
+    //    - Deployment 在目标集群存在
+}
+```
+
+#### 6.5.8 Step 7: 打包到 ReleaseImage OCI Bundle
+
+```txt
+release-image/
+├── release.yaml                           # ReleaseImage CR + 版本元数据
+├── components/
+│   ├── coredns/
+│   │   └── v1.11.1/
+│   │       └── component.yaml            # ComponentVersion CR
+│   ├── containerd/
+│   │   └── v1.7.18/
+│   │       └── component.yaml
+│   └── kubernetes-master/
+│       └── v1.29.0/
+│           └── component.yaml
+├── manifests/
+│   ├── coredns/
+│   │   └── v1.11.1/
+│   │       └── coredns.yaml              # YAML 清单
+│   └── ...
+└── image-references                       # 镜像引用列表
+```
+
+**构建脚本**:
+
+```bash
+# 构建 ReleaseImage OCI Bundle
+docker build -t registry.openfuyao.cn/bke/release:v2.7.0 .
+docker push registry.openfuyao.cn/bke/release:v2.7.0
+```
+
+#### 6.5.9 Step 8: 注册到 ReleaseImage CR
+
+```yaml
+# release.yaml 中的 ReleaseImage CR
+apiVersion: cvo.openfuyao.cn/v1alpha1
+kind: ReleaseImage
+metadata:
+  name: release-v2.7.0
+spec:
+  version: "v2.7.0"
+  digest: "sha256:abc123..."
+  verifySignature: true
+  signatureKey: "cosign-public-key"
+
+  install:
+    components:
+      - name: bkeagent
+        version: v2.7.0
+      - name: containerd
+        version: v1.7.18
+      - name: kubernetes-master
+        version: v1.29.0
+        inline:
+          handler: EnsureMasterInit
+          version: v1.0.0
+      - name: coredns                      # ★ 新组件
+        version: v1.11.1
+
+  upgrade:
+    components:
+      - name: bkeagent
+        version: v2.7.0
+      - name: containerd
+        version: v1.7.18
+      - name: kubernetes-master
+        version: v1.29.0
+        inline:
+          handler: EnsureMasterUpgrade
+          version: v1.0.0
+      - name: coredns                      # ★ 新组件
+        version: v1.11.1
+```
+
+#### 6.5.10 开发流程检查清单
+
+| 检查项 | 说明 | 完成 |
+|--------|------|------|
+| ComponentVersion YAML 已编写 | spec 包含 name, type, version, runLevel | ☐ |
+| 组件制品已编写 | manifest YAML / Helm Chart / 二进制制品 | ☐ |
+| 依赖关系已声明 | ComponentVersion.spec.dependencies | ☐ |
+| 兼容性约束已声明 | ComponentVersion.spec.compatibility | ☐ |
+| 升级策略已配置 | upgradeStrategy (mode, batchSize, failurePolicy) | ☐ |
+| 健康检查已配置 | healthCheck (PodReady / EndpointReady / Custom) | ☐ |
+| 执行器已实现 (如需) | ComponentExecutor 接口 + 注册 | ☐ |
+| ClusterComponent 状态报告已实现 | MarkPending → MarkInstalled/MarkFailed | ☐ |
+| 版本报告规则已遵循 | 混合版本报告旧版本 | ☐ |
+| 单元测试已编写 | 覆盖率 >85% | ☐ |
+| 集成测试已编写 | DAG 执行 + 状态门控 | ☐ |
+| 已打包到 ReleaseImage OCI Bundle | components/ + manifests/ | ☐ |
+| 已注册到 ReleaseImage CR | install.components + upgrade.components | ☐ |
+
 ---
 
 ## 7. Manifest Graph 分层 DAG 设计
