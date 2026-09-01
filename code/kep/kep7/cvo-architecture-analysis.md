@@ -1585,9 +1585,57 @@ OpenShift 4 **不支持自动回滚**。升级是 forward-only：
 
 ---
 
-## 19. 附录
+## 19. 开源状态与框架复用性分析
 
-### 19.1 参考来源
+### 19.1 开源状态
+
+CVO 代码完全开源，托管于 `github.com/openshift/cluster-version-operator`，采用 **Apache 2.0** 许可证。任何人都可以查看、 fork 和修改代码。
+
+但 **开源 ≠ 可复用框架**。CVO 并非设计为一个通用框架，而是 OpenShift 平台的**专有组件**，与 OpenShift 生态系统深度耦合。
+
+### 19.2 复用障碍分析
+
+| 耦合点 | 说明 | 复用难度 |
+|--------|------|---------|
+| `ClusterVersion` / `ClusterOperator` CRD | 属于 `config.openshift.io/v1`，是 OpenShift API 组，非上游 Kubernetes | 高 — 需替换为自有 CRD |
+| Release Payload Image 格式 | 清单按 `0000_NN_component_filename` 命名，`image-references` 是 OpenShift ImageStream，`release-metadata` 是 Cincinnati 格式 | 高 — 需重新定义 payload 格式 |
+| OSUS / Cincinnati | 升级图推荐服务是 OpenShift 专有基础设施，默认连接 `api.openshift.com` | 高 — 需自建或替换升级推荐服务 |
+| `openshift/api` + `openshift/client-go` | 依赖链贯穿 OpenShift 全套类型库 | 高 — 需剥离所有 OpenShift API 依赖 |
+| Cluster Profile / Capability / FeatureGate | OpenShift 特有的清单过滤机制 | 中 — 可选功能，可裁剪 |
+| 自定义 QueueInformer 框架 | 非标准 controller-runtime，自定义 workqueue + informer 封装 | 中 — 可替换为 controller-runtime |
+| MCO 联动 | CVO 自身升级依赖 MCO drain 节点 | 不适用 — 非框架级耦合 |
+
+### 19.3 其他社区的复用路径
+
+| 路径 | 可行性 | 说明 |
+|------|--------|------|
+| **fork + 大改** | 低 | 剥离 OpenShift API 依赖、替换 CRD、重定义 payload 格式、替换升级服务 — 改动量巨大，不如重写 |
+| **借鉴设计思路** | ★ 推荐 | CVO 的核心设计思路 (Release Image 驱动、清单图分层、状态门控、forward-only、风险聚合) 可直接借鉴，不依赖具体实现 |
+| **借鉴代码片段** | 中 | Resource Builder 模式、Task Graph DAG、Precondition 链等独立模块可参考实现，但需适配自有类型 |
+| **关注上游演进** | 前瞻 | 社区正在 `operator-framework/operator-controller` 开发 **OLM v1**，设计上更通用 (基于 RukPak 通用 bundle + CAR 模式)，目标是脱离 OpenShift 特定绑定。但 v1 仍在开发中，尚未 GA |
+
+### 19.4 结论
+
+CVO 代码开源但**不建议直接复用其框架**。推荐方式是**借鉴 CVO 的设计思路**构建自有版本协调器：
+
+| 借鉴维度 | CVO 设计思路 | 自有实现方式 |
+|---------|-------------|-------------|
+| 版本真相源 | Release Payload Image | 自定义 Release Image (如 BKE 的 OCI Bundle) |
+| 状态门控 | ClusterOperator CR | 自定义组件状态 CR (如 BKE 的 ClusterComponent) |
+| 分层 DAG | Manifest Graph (Run Level) | 自定义分层 DAG (如 BKE 的 ComponentVersion.runLevel) |
+| 升级哲学 | Forward-only + N-1 兼容 | 直接采纳 |
+| 前置检查 | Precondition 链 | 自定义前置条件接口 |
+| 风险聚合 | Risk Source 聚合树 | 自定义风险源接口 |
+| 状态机 | SyncWorker 状态机 | 自定义 State 接口 |
+| 断点续传 | DeclarativeUpgradeStatus | 自定义完成记录 |
+
+> BKE 平台的 `kep-bke-cvo-design.md` 正是按此思路设计的 BKE CVO 方案。
+
+---
+
+## 20. 附录
+
+### 20.1 参考来源
 
 | 来源 | URL |
 |------|-----|
@@ -1602,7 +1650,7 @@ OpenShift 4 **不支持自动回滚**。升级是 forward-only：
 | ClusterVersion API | https://docs.openshift.com/container-platform/4.15/rest_api/config_apis/clusterversion-config-openshift-io-v1.html |
 | OpenShift API 类型库 | https://github.com/openshift/api/tree/master/config/v1 |
 
-### 19.2 术语表
+### 20.2 术语表
 
 | 术语 | 定义 |
 |------|------|
