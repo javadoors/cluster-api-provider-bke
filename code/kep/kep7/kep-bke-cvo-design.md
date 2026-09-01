@@ -354,6 +354,32 @@ spec:
 
 > **迁移策略**：ClusterComponent CR 为主数据源，BKECluster.Status.ClusterComponentStatuses 作为镜像保持向后兼容 (CVO 在写入 ClusterComponent 后同步镜像到 BKECluster.Status)。
 
+#### 6.4.1 "可被独立消费"详解
+
+该差异源于**独立 CR vs 内嵌字段**在可观测性上的本质区别：
+
+| 维度 | 现有 ClusterComponentStatuses (内嵌字段) | 新增 ClusterComponent (独立 CR) |
+|------|----------------------------------------|-------------------------------|
+| 资源类型 | 不是独立资源，是 BKECluster 的子字段 | 独立 Kubernetes 对象，有自己的 `apiVersion/kind/metadata` |
+| 选取粒度 | 必须先 get BKECluster 再从 status map 中翻找 | 可直接 `kubectl get clustercomponent coredns` |
+| 工具发现 | 非一等公民，标准工具无法按类型发现 | Kubernetes 一等公民，可被任何标准工具按资源类型独立发现 |
+
+三个场景的具体含义：
+
+**1. must-gather 独立消费**
+
+must-gather 是诊断工具，按资源类型批量收集集群对象。`ClusterComponentStatuses` 是 BKECluster 的内嵌字段，must-gather 只能收集整个 BKECluster 对象，无法单独按组件筛选。而 `ClusterComponent` 是独立 CR，可以 `kubectl get clustercomponent -A` 单独列出、单独导出，诊断时可以只收集有问题的组件，无需导出完整的 BKECluster 对象。
+
+**2. 监控独立消费**
+
+运维人员想查看某个组件状态时，如果是内嵌字段，需要先 get BKECluster 再从 status map 里翻找。如果是独立 CR，可以直接 `kubectl describe clustercomponent coredns` 查看该组件的全部状态，不需要解析 BKECluster 的完整 status。CLI 操作和 Web Console 展示均可按组件独立操作。
+
+**3. Prometheus 独立消费**
+
+Prometheus 通过 kube-state-metrics 或自定义 exporter 采集指标。独立 CR 可以被直接配置为 informer watch 对象，暴露 `clustercomponent_up`、`clustercomponent_conditions` 等指标。而内嵌字段需要先 informer watch BKECluster，再从 status map 中提取组件状态，增加了采集复杂度和耦合度。
+
+> **一句话总结**：独立 CR 是 Kubernetes 一等公民，可以被任何标准工具按资源类型独立发现、收集、告警，而内嵌字段只能随 BKECluster 整体被消费，无法独立选取。
+
 ### 6.5 ClusterComponent 开发流程
 
 本节描述组件开发者如何将一个新组件接入 BKE CVO 体系，涵盖从声明定义到发布到 ReleaseImage OCI Bundle 的完整开发流程。
