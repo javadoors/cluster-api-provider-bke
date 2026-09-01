@@ -1585,15 +1585,540 @@ OpenShift 4 **不支持自动回滚**。升级是 forward-only：
 
 ---
 
-## 19. 开源状态与框架复用性分析
+## 19. ClusterOperator 开发流程
 
-### 19.1 开源状态
+### 19.1 概念澄清：ClusterOperator CR ≠ Operator 本体
+
+开发者**不是**"编写一个 ClusterOperator"，而是编写 **Operator 本体** (控制器逻辑 + Operand 管理)，然后让 Operator 在运行时创建/更新 ClusterOperator CR 来报告自身状态。CVO **不创建 Operator，不执行 Operator 逻辑，不判断 Operator 健康** — CVO 仅从 Release Image 应用 Operator 的清单 (Deployment/RBAC/CRD)，并监听 ClusterOperator.status 作为阻塞门控。
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              Operator 与 ClusterOperator CR 的关系                               │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  ┌──────────────────────────────┐         ┌──────────────────────────────┐     │
+│  │     Operator 本体              │         │   ClusterOperator CR         │     │
+│  │     (控制器 + Operand 管理)   │  报告状态 │   (状态报告载体)             │     │
+│  │                               │ ────────→│                              │     │
+│  │  • 由 CVO 从 Release Image    │          │  status:                     │     │
+│  │    部署 (Deployment/RBAC)     │          │    conditions:               │     │
+│  │  • 管理自己的 Operand          │  ←─监听──│      Available: True         │     │
+│  │  • 运行时创建/更新             │   门控    │      Progressing: False     │     │
+│  │    ClusterOperator CR          │          │      Degraded: False        │     │
+│  │                               │          │    versions:                 │     │
+│  │  开发者编写的核心:             │          │      [{operator, "4.15.0"}] │     │
+│  │  ① Operator 控制器代码 (Go)    │          │    relatedObjects: [...]     │     │
+│  │  ② /manifests 清单 (部署定义) │          │                              │     │
+│  │  ③ image-references (镜像引用)│          │  CVO 预创建 (Precreating)    │     │
+│  │  ④ ClusterOperator CR 模板   │          │  Operator 运行时写 status     │     │
+│  └──────────────────────────────┘          └──────────────────────────────┘     │
+│                                                                                 │
+│  职责划分:                                                                      │
+│  ├── CVO:      应用清单 → 预创建 ClusterOperator CR → 监听状态门控              │
+│  ├── Operator: 管理 Operand → 运行时更新 ClusterOperator.status                │
+│  └── 开发者:   编写控制器代码 + 清单 + image-references (不手动操作 CR)        │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 19.2 开发流程总览
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                  ClusterOperator 开发流程                                        │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  Step 1: 编写 Operator 控制器代码                                                │
+│  ├── 使用 openshift/library-go 框架或 Operator SDK                               │
+│  ├── 实现 Operand 管理逻辑 (部署/升级/健康检查)                                  │
+│  ├── 实现状态报告逻辑 (创建/更新 ClusterOperator CR)                             │
+│  └── 暴露 Prometheus 指标端点                                                   │
+│                                                                                 │
+│  Step 2: 编写 /manifests 清单文件                                                │
+│  ├── namespace.yaml                  — Operator 命名空间                        │
+│  ├── 01_roles.yaml                   — RBAC (Role/ClusterRole)                  │
+│  ├── 02_serviceaccount.yaml          — ServiceAccount + RoleBinding             │
+│  ├── 03_deployment.yaml              — Operator Deployment                       │
+│  ├── 04_clusteroperator.yaml         — ClusterOperator CR 模板 (含期望版本)     │
+│  ├── 05_config.crd.yaml              — 配置 CRD (如果需要 config.openshift.io)  │
+│  └── image-references                — 镜像引用 ImageStream                     │
+│                                                                                 │
+│  Step 3: 编写 Dockerfile                                                        │
+│  ├── ADD manifests/ /manifests                                                  │
+│  └── LABEL io.openshift.release.operator=true                                   │
+│                                                                                 │
+│  Step 4: 确定 Run Level                                                         │
+│  ├── 根据 Operand 依赖关系选择 Run Level                                        │
+│  └── 文件命名前缀: 0000_<runlevel>_<component>_<filename>                       │
+│                                                                                 │
+│  Step 5: 实现状态报告 (Go 代码)                                                  │
+│  ├── 运行时创建/更新 ClusterOperator CR                                          │
+│  ├── 报告 versions (operator + operand 版本)                                    │
+│  ├── 报告 conditions (Available/Progressing/Degraded/Upgradeable)              │
+│  ├── 报告 relatedObjects (诊断相关对象)                                          │
+│  └── 遵循版本报告规则 (混合版本报告旧版本)                                       │
+│                                                                                 │
+│  Step 6: 测试                                                                   │
+│  ├── make test-unit (单元测试)                                                  │
+│  ├── make verify (格式/代码生成检查)                                             │
+│  ├── make test-e2e (端到端测试)                                                 │
+│  └── 集群测试 (Option A: 覆盖 Deployment / Option B: 自定义 Release Image)     │
+│                                                                                 │
+│  Step 7: 构建并发布                                                             │
+│  ├── make images (构建镜像)                                                     │
+│  ├── 推送到 CI registry                                                         │
+│  └── 等待 CI 构建新 Release Image                                                │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 19.3 Step 1: 编写 Operator 控制器代码
+
+#### 19.3.1 框架选择
+
+| 框架 | 适用场景 | 说明 |
+|------|---------|------|
+| `openshift/library-go` | OpenShift 核心 Operator | OpenShift 官方框架，提供 Operator 基类、状态报告工具 |
+| Operator SDK | 通用 Operator / Add-on Operator | 基于 controller-runtime，适合 OLM 管理的 Operator |
+
+#### 19.3.2 状态报告代码模式 (library-go)
+
+```go
+// 使用 openshift/library-go 的 Operator 状态报告模式
+
+import (
+    configv1 "github.com/openshift/api/config/v1"
+    configclient "github.com/openshift/client-go/config/clientset/versioned/typed/config/v1"
+    "github.com/openshift/library-go/pkg/operator/v1helpers"
+)
+
+// Operator 在运行时更新 ClusterOperator.status
+func (r *MyReconciler) syncClusterOperatorStatus(ctx context.Context) error {
+    // 1. 获取或创建 ClusterOperator CR
+    co, err := r.configClient.ClusterOperators().Get(ctx, "my-operator", metav1.GetOptions{})
+    if apierrors.IsNotFound(err) {
+        co, err = r.configClient.ClusterOperators().Create(ctx, &configv1.ClusterOperator{
+            ObjectMeta: metav1.ObjectMeta{Name: "my-operator"},
+        }, metav1.CreateOptions{})
+        if err != nil {
+            return err
+        }
+    }
+
+    // 2. 更新 versions (★ 混合版本状态报告旧版本)
+    var operatorVersion string
+    if r.allOperandsOnNewVersion() {
+        operatorVersion = r.targetVersion  // 全部 Operand 已更新 → 报告新版本
+    } else {
+        operatorVersion = r.previousVersion  // 仍有旧版本 Operand → 报告旧版本
+    }
+
+    // 3. 使用 v1helpers 更新条件 (原子性)
+    updated := false
+    co, updated, err = v1helpers.UpdateStatus(ctx, r.configClient.ClusterOperators(),
+        "my-operator", func(co *configv1.ClusterOperator) {
+            // 设置版本
+            co.Status.Versions = []configv1.OperandVersion{
+                {Name: "operator", Version: operatorVersion},
+                {Name: "operator-image", Version: r.operatorImage},
+                {Name: "my-operand", Version: r.operandVersion},
+                {Name: "my-operand-image", Version: r.operandImage},
+            }
+
+            // 设置条件 (含正常态 reason + message)
+            v1helpers.SetOperatorStatusCondition(&co.Status.Conditions,
+                configv1.OperatorStatusCondition{
+                    Type:    configv1.OperatorAvailable,
+                    Status:  configv1.ConditionTrue,
+                    Reason:  "AsExpected",
+                    Message: "My operator is available",
+                })
+            v1helpers.SetOperatorStatusCondition(&co.Status.Conditions,
+                configv1.OperatorStatusCondition{
+                    Type:    configv1.OperatorProgressing,
+                    Status:  configv1.ConditionFalse,
+                    Reason:  "AsExpected",
+                    Message: "Cluster version is " + operatorVersion,
+                })
+            v1helpers.SetOperatorStatusCondition(&co.Status.Conditions,
+                configv1.OperatorStatusCondition{
+                    Type:    configv1.OperatorDegraded,
+                    Status:  configv1.ConditionFalse,
+                    Reason:  "AsExpected",
+                    Message: "All is well",
+                })
+
+            // 设置 relatedObjects
+            co.Status.RelatedObjects = []configv1.ObjectReference{
+                {Group: "", Resource: "namespaces", Name: "openshift-my-operator"},
+                {Group: "apps", Resource: "deployments", Namespace: "openshift-my-operator", Name: "my-operator"},
+                {Group: "", Resource: "configmaps", Namespace: "openshift-my-operator", Name: "my-config"},
+            }
+        })
+
+    if err != nil {
+        return err
+    }
+    if updated {
+        r.logger.Info("updated ClusterOperator status")
+    }
+    return nil
+}
+```
+
+### 19.4 Step 2: 编写 /manifests 清单文件
+
+#### 19.4.1 目录结构
+
+```
+my-operator/
+├── manifests/
+│   ├── 00_namespace.yaml
+│   ├── 01_roles.yaml
+│   ├── 02_serviceaccount.yaml
+│   ├── 03_deployment.yaml
+│   ├── 04_clusteroperator.yaml       # ★ ClusterOperator CR 模板
+│   ├── 05_config.crd.yaml            # 配置 CRD (可选)
+│   └── image-references              # ★ 镜像引用
+├── Dockerfile
+└── main.go
+```
+
+#### 19.4.2 ClusterOperator CR 模板 (04_clusteroperator.yaml)
+
+```yaml
+apiVersion: config.openshift.io/v1
+kind: ClusterOperator
+metadata:
+  name: my-operator
+spec: {}
+status:
+  versions:
+    - name: operator
+      version: "0.0.1-snapshot"     # 构建时替换为实际版本
+    - name: operator-image
+      version: "placeholder.url.oc.will.replace.this.org/placeholdernamespace:my-operator"
+    # 可选: Operand 版本
+    - name: my-operand
+      version: "0.0.1-snapshot"
+    - name: my-operand-image
+      version: "placeholder.url.oc.will.replace.this.org/placeholdernamespace:my-operand"
+```
+
+> **注意**：CVO 在预创建阶段 (PrecreatingMode) 会创建此 CR (含 `status.versions`)，Operator 运行时需接管并更新完整的 `status` (conditions + versions + relatedObjects)。
+
+#### 19.4.3 image-references 文件
+
+```yaml
+kind: ImageStream
+apiVersion: image.openshift.io/v1
+metadata:
+  name: "4.15.0"
+spec:
+  tags:
+    - name: my-operator           # Operator 镜像标签名
+      from:
+        kind: DockerImage
+        name: quay.io/openshift/my-operator
+    - name: my-operand            # Operand 镜像标签名
+      from:
+        kind: DockerImage
+        name: quay.io/openshift/my-operand
+```
+
+> Release 工具读取 `image-references`，将 manifest 中的镜像 URL 替换为带 digest 的完整引用 (如 `quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:...`)。
+
+### 19.5 Step 3: 编写 Dockerfile
+
+```dockerfile
+FROM registry.access.redhat.com/ubi8/ubi-minimal:latest
+
+# 编译 Operator 二进制
+COPY . /workspace
+WORKDIR /workspace
+RUN microdnf install go && \
+    go build -o /usr/bin/my-operator .
+
+# ★ 关键: 将 manifests 目录添加到镜像
+ADD manifests/ /manifests
+
+# ★ 关键: 标记为 Release Operator
+LABEL io.openshift.release.operator=true
+
+ENTRYPOINT ["/usr/bin/my-operator"]
+```
+
+> `oc adm release new` 命令会从所有标记 `io.openshift.release.operator=true` 的镜像中收集 `/manifests` 目录，组装到 `/release-manifests` 目录。
+
+### 19.6 Step 4: 确定 Run Level
+
+#### 19.6.1 Run Level 分配指南
+
+| Run Level | 组件类型 | 示例 |
+|-----------|---------|------|
+| 00-04 | CVO 自身 | cluster-version-operator |
+| 05 | 集群配置 | cluster-config-operator |
+| 07-09 | 基础设施 | network-operator, dns-operator, service-ca, machine-approver |
+| 10-29 | Kubernetes 核心 | kube-apiserver, kube-scheduler, kube-controller-manager |
+| 30-39 | 机器 API | machine-api-operator |
+| 50-59 | OLM | operator-lifecycle-manager |
+| 60-69 | OpenShift 核心 | openshift-apiserver, console, monitoring |
+| 70 | 节点级组件 | network, dns, multus (disruptive daemonsets) |
+| 80 | 机器操作 | machine-config-operator, cloud-operators |
+| 90 | 后置更新 | post-machine-update 组件 |
+
+#### 19.6.2 分配原则
+
+1. **依赖决定层级**：依赖其他组件的组件 Run Level 更高 (如 coredns 依赖 kube-apiserver → Run Level 50 > 10)
+2. **破坏性越后**：越破坏性的组件 Run Level 越高 (如 MCO 重启节点 → Run Level 80)
+3. **N-1 兼容**：所有组件必须能与上一 minor 版本的依赖共存
+
+### 19.7 Step 5: 状态报告规则
+
+#### 19.7.1 条件报告规则
+
+| 条件 | 正常态 | 升级中 | 降级 | 不可用 | 升级受阻 |
+|------|--------|--------|------|--------|---------|
+| `Available` | True | True | True | **False** | True |
+| `Progressing` | False | **True** | False | False | False |
+| `Degraded` | False | False | **True** | True | False |
+| `Upgradeable` | True | True | True | True | **False** |
+| `versions` | 当前版本 | **旧版本** (混合态) | 当前版本 | 旧版本 | 当前版本 |
+
+#### 19.7.2 版本报告规则 (★ 最关键)
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              版本报告规则                                                         │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  场景: Operator 从 v4.14.0 升级到 v4.15.0，Operand 滚动更新 (3 副本)              │
+│                                                                                 │
+│  时间线:                                                                        │
+│  t0: 升级开始，Operator 自身已更新到 v4.15.0                                     │
+│      Operand: 3 副本全是 v4.14.0                                                │
+│      → status.versions = [{operator, "v4.14.0"}]  ★ 报告旧版本                  │
+│                                                                                 │
+│  t1: 1 个 Operand 副本更新到 v4.15.0                                             │
+│      Operand: 2 副本 v4.14.0 + 1 副本 v4.15.0                                   │
+│      → status.versions = [{operator, "v4.14.0"}]  ★ 仍报告旧版本               │
+│                                                                                 │
+│  t2: 2 个 Operand 副本更新到 v4.15.0                                             │
+│      Operand: 1 副本 v4.14.0 + 2 副本 v4.15.0                                   │
+│      → status.versions = [{operator, "v4.14.0"}]  ★ 仍报告旧版本               │
+│                                                                                 │
+│  t3: 全部 3 个 Operand 副本更新到 v4.15.0                                        │
+│      Operand: 3 副本全是 v4.15.0                                                │
+│      → status.versions = [{operator, "v4.15.0"}]  ★ 现在报告新版本              │
+│                                                                                 │
+│  原因: CVO 通过 versions 判断升级是否完成。如果过早报告新版本，                  │
+│        CVO 会误认为升级已完成，提前进入下一 Run Level，                          │
+│        导致混合版本不兼容问题。                                                   │
+│                                                                                 │
+│  规则总结:                                                                       │
+│  "只要有任何 Operand 仍在运行旧版本软件，就继续报告旧版本。"                     │
+│  "只有确认不再运行旧版本时，才更新版本号。"                                      │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 19.7.3 消息格式规范
+
+| 条件 | 格式 | 示例 |
+|------|------|------|
+| `Progressing.message` | 5-10 词，简洁 (CLI 默认显示) | `Working towards 4.15.0: 105 of 312 done (34% complete)` |
+| `Available.message` | 单句，无标点 | `Cluster has deployed 4.15.0` |
+| `Degraded.message` | 数句，含诊断信息 | `Unable to apply 4.15.0: could not update 0000_70_network_deployment.yaml because...` |
+| reason (正常态) | `AsExpected` | — |
+
+#### 19.7.4 RelatedObjects 报告
+
+```yaml
+status:
+  relatedObjects:
+    # 命名空间 (集群级资源，无 namespace)
+    - group: ""
+      resource: "namespaces"
+      name: "openshift-my-operator"
+
+    # Operator Deployment (命名空间级)
+    - group: "apps"
+      resource: "deployments"
+      namespace: "openshift-my-operator"
+      name: "my-operator"
+
+    # 配置 ConfigMap
+    - group: ""
+      resource: "configmaps"
+      namespace: "openshift-my-operator"
+      name: "my-config"
+
+    # 通配符: 命名空间内所有某类型资源
+    - group: "my.example.com"
+      resource: "myresources"
+      namespace: "openshift-my-operator"
+      name: ""         # ★ 空名 = 命名空间内全部
+
+    # 通配符: 集群级所有某类型资源
+    - group: ""
+      resource: "namespaces"
+      name: ""          # ★ 空名 = 集群级全部
+```
+
+> **用途**：insights-operator 和 must-gather 依赖 relatedObjects 收集诊断信息。Operator 应在运行时动态更新以反映实际管理的对象。
+
+### 19.8 Step 6: 测试
+
+#### 19.8.1 测试命令
+
+```bash
+# 单元测试
+make test-unit
+
+# 代码检查
+make verify          # gofmt, govet, bindata, codegen
+
+# 端到端测试
+make test-e2e        # 需要 KUBECONFIG
+```
+
+#### 19.8.2 集群测试 — Option A: 覆盖 Deployment
+
+```bash
+# 1. 构建并推送测试镜像
+docker build -t quay.io/yourname/my-operator:test .
+docker push quay.io/yourname/my-operator:test
+
+# 2. 缩容 CVO (停止 CVO 管理)
+oc scale --replicas 0 -n openshift-cluster-version deployments/cluster-version-operator
+
+# 3. 编辑 Operator Deployment 使用测试镜像
+oc edit deployment my-operator -n openshift-my-operator
+# 修改 env OPERATOR_IMAGE 和 IMAGE，修改 spec.containers.image
+
+# 4. 测试完成后恢复 CVO
+oc scale --replicas 1 -n openshift-cluster-version deployments/cluster-version-operator
+```
+
+#### 19.8.3 集群测试 — Option B: 自定义 Release Image
+
+```bash
+# 1. 构建并推送测试镜像
+docker build -t quay.io/yourname/my-operator:test .
+docker push quay.io/yourname/my-operator:test
+
+# 2. 组装自定义 Release Image
+oc adm release new --from-release registry.ci.openshift.org/ocp/release:4.15 \
+  my-operator=quay.io/yourname/my-operator:test \
+  --to-image quay.io/yourname/release:test
+
+# 3. 提取 installer
+oc adm release extract --command openshift-install quay.io/yourname/release:test
+
+# 4. 安装集群
+./openshift-install create cluster --dir /path/to/installdir
+```
+
+### 19.9 Step 7: 对象删除 (从 Release Image 移除资源)
+
+当需要删除之前创建的资源时，在清单中添加删除注解：
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: old-component
+  namespace: openshift-old-component
+  annotations:
+    release.openshift.io/delete: "true"    # ★ CVO 将删除此对象
+```
+
+**删除规则**：
+
+| 规则 | 说明 |
+|------|------|
+| 仅升级时删除 | 初始安装不执行删除 (delete 注解阻止清单处理) |
+| 非阻塞 | CVO 发起删除请求后继续，不等待 finalization |
+| 反序删除 | 按创建顺序的反序删除 (先删 Deployment，后删 Namespace) |
+| 删除失败 → Upgradeable=False | 如果无法删除，CVO 设置 Upgradeable=False 阻止 minor 升级 |
+| z-stream 保留 | 后续 z-stream 更新可保留 delete 清单；minor 更新不应包含 delete 清单 |
+
+### 19.10 开发检查清单
+
+| 检查项 | 说明 |
+|--------|------|
+| `/manifests` 目录已创建 | 含 namespace, roles, SA, deployment, ClusterOperator CR |
+| `image-references` 文件已创建 | ImageStream 含 operator + operand 镜像标签 |
+| Dockerfile 含 `LABEL io.openshift.release.operator=true` | Release 工具识别标记 |
+| Run Level 已确定 | 文件命名前缀 `0000_<runlevel>_<component>_<filename>` |
+| ClusterOperator CR 模板已编写 | 含 `.metadata.name` + `.status.versions[operator]` |
+| Operator 运行时更新 ClusterOperator.status | 创建/更新 CR (CVO 预创建，Operator 接管) |
+| versions 报告 `operator` 版本 | 混合版本状态报告旧版本 |
+| conditions 报告 Available/Progressing/Degraded | 含 reason + message (正常态用 AsExpected) |
+| Upgradeable 条件按需设置 | False 阻止 minor 升级 |
+| relatedObjects 已声明 | namespace + 至少一个非 namespace 对象 |
+| 状态更新是原子性 | 所有 status 字段同时有效 |
+| N-1 兼容性已测试 | 新 Operator + 旧 Operand 共存场景 |
+| Prometheus 指标端点已暴露 | metrics service 配置 |
+| 单元测试已编写 | `make test-unit` |
+| 集群测试已完成 | Option A (覆盖 Deployment) 或 Option B (自定义 Release) |
+| 对象删除注解已添加 (如需) | `release.openshift.io/delete: "true"` |
+
+### 19.11 CVO 与 Operator 的交互时序
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              CVO 与 Operator 的交互时序                                           │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  安装阶段:                                                                      │
+│                                                                                 │
+│  1. CVO 从 Release Image 解析清单                                                │
+│  2. CVO 预创建 ClusterOperator CR (PrecreatingMode)                             │
+│     └── 含 status.versions[operator] = "期望版本"                                │
+│  3. CVO 应用 Operator 清单 (Namespace → RBAC → Deployment)                      │
+│  4. Operator Pod 启动                                                           │
+│  5. Operator 初始化，接管 ClusterOperator CR                                     │
+│     └── 更新 status.conditions[Available] = True                                 │
+│  6. CVO 监听 ClusterOperator.status ★ 门控阶段                                 │
+│     ├── Available == True?                                                      │
+│     ├── versions 包含期望版本?                                                  │
+│     └── 满足 → 放行，进入下一 Run Level                                         │
+│                                                                                 │
+│  升级阶段:                                                                      │
+│                                                                                 │
+│  1. CVO 从新 Release Image 解析清单                                              │
+│  2. CVO 预更新 ClusterOperator CR (更新期望版本)                                 │
+│  3. CVO 应用新 Operator 清单 (更新 Deployment → 新 Pod 启动)                     │
+│  4. 新 Operator Pod 启动，开始滚动更新 Operand                                   │
+│  5. Operator 报告: versions = [{operator, "旧版本"}]  ★ 混合版本                │
+│     conditions[Progressing] = True, "Working towards v4.15.0"                   │
+│  6. CVO 监听: versions 不匹配 → 继续阻塞                                        │
+│  7. Operator 完成 Operand 滚动更新                                               │
+│     报告: versions = [{operator, "v4.15.0"}]  ★ 新版本                         │
+│     conditions[Progressing] = False, "Cluster version is v4.15.0"               │
+│  8. CVO 监听: versions 匹配 + Available + 非 Degraded → 放行                    │
+│                                                                                 │
+│  CVO 门控行为:                                                                  │
+│  ├── versions 不匹配 → 阻塞 (UpdateEffectNone, "waiting on X")                  │
+│  ├── Available = False → 立即失败 (UpdateEffectFail)                            │
+│  ├── Degraded = True → 40 分钟后失败 (UpdateEffectFailAfterInterval)            │
+│  └── 30 分钟内 versions 不匹配 → 抑制 (报告 "waiting on X over 30 minutes")    │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 20. 开源状态与框架复用性分析
+
+### 20.1 开源状态
 
 CVO 代码完全开源，托管于 `github.com/openshift/cluster-version-operator`，采用 **Apache 2.0** 许可证。任何人都可以查看、 fork 和修改代码。
 
 但 **开源 ≠ 可复用框架**。CVO 并非设计为一个通用框架，而是 OpenShift 平台的**专有组件**，与 OpenShift 生态系统深度耦合。
 
-### 19.2 复用障碍分析
+### 20.2 复用障碍分析
 
 | 耦合点 | 说明 | 复用难度 |
 |--------|------|---------|
@@ -1605,7 +2130,7 @@ CVO 代码完全开源，托管于 `github.com/openshift/cluster-version-operato
 | 自定义 QueueInformer 框架 | 非标准 controller-runtime，自定义 workqueue + informer 封装 | 中 — 可替换为 controller-runtime |
 | MCO 联动 | CVO 自身升级依赖 MCO drain 节点 | 不适用 — 非框架级耦合 |
 
-### 19.3 其他社区的复用路径
+### 20.3 其他社区的复用路径
 
 | 路径 | 可行性 | 说明 |
 |------|--------|------|
@@ -1614,7 +2139,7 @@ CVO 代码完全开源，托管于 `github.com/openshift/cluster-version-operato
 | **借鉴代码片段** | 中 | Resource Builder 模式、Task Graph DAG、Precondition 链等独立模块可参考实现，但需适配自有类型 |
 | **关注上游演进** | 前瞻 | 社区正在 `operator-framework/operator-controller` 开发 **OLM v1**，设计上更通用 (基于 RukPak 通用 bundle + CAR 模式)，目标是脱离 OpenShift 特定绑定。但 v1 仍在开发中，尚未 GA |
 
-### 19.4 结论
+### 20.4 结论
 
 CVO 代码开源但**不建议直接复用其框架**。推荐方式是**借鉴 CVO 的设计思路**构建自有版本协调器：
 
@@ -1633,9 +2158,9 @@ CVO 代码开源但**不建议直接复用其框架**。推荐方式是**借鉴 
 
 ---
 
-## 20. 附录
+## 21. 附录
 
-### 20.1 参考来源
+### 21.1 参考来源
 
 | 来源 | URL |
 |------|-----|
@@ -1650,7 +2175,7 @@ CVO 代码开源但**不建议直接复用其框架**。推荐方式是**借鉴 
 | ClusterVersion API | https://docs.openshift.com/container-platform/4.15/rest_api/config_apis/clusterversion-config-openshift-io-v1.html |
 | OpenShift API 类型库 | https://github.com/openshift/api/tree/master/config/v1 |
 
-### 20.2 术语表
+### 21.2 术语表
 
 | 术语 | 定义 |
 |------|------|
