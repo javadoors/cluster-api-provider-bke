@@ -1553,43 +1553,693 @@ BKE 有两种依赖表达机制，它们是**互补关系**，不是替代关系
 
 ### 7.5 Task Graph 数据结构
 
+#### 7.5.1 核心类型定义
+
 ```go
 // pkg/cvo/manifestgraph/graph.go
 
-type TaskNode struct {
-    RunLevel int          // ComponentVersion.spec.runLevel
-    Component string      // 组件名
-    Tasks    []*Task      // 该节点的任务列表
-    In       []int        // 前置节点索引
-    Out      []int        // 依赖节点索引
+package manifestgraph
+
+import (
+    "context"
+    "fmt"
+    "sync"
+    "sync/atomic"
+
+    "k8s.io/apimachinery/pkg/util/wait"
+    "k8s.io/client-go/util/workqueue"
+    "sigs.k8s.io/controller-runtime/pkg/client"
+
+    cvov1alpha1 "github.com/bke/api/v1alpha1"
+    "github.com/bke/pkg/dagexec"
+    "github.com/bke/pkg/manifest"
+    "github.com/bke/pkg/upgrade"
+)
+
+// RunLevel 表示组件在 Manifest Graph 中的执行层级
+type RunLevel int
+
+const (
+    RunLevelCVO       RunLevel = 0   // 00-04: CVO 自身
+    RunLevelInfra     RunLevel = 5   // 05:    基础设施 (bkeagent, provider)
+    RunLevelCore      RunLevel = 10  // 10-29: Kubernetes 核心 (etcd, kube-apiserver)
+    RunLevelRuntime   RunLevel = 30  // 30:    容器运行时 (containerd)
+    RunLevelPlugin    RunLevel = 50  // 50:    集群插件 (coredns, kube-proxy)
+    RunLevelPlatform  RunLevel = 60  // 60:    平台组件 (openfuyao-core, calico)
+    RunLevelNode      RunLevel = 70  // 70:    节点级组件
+    RunLevelDefault   RunLevel = 50  // 默认 Run Level
+)
+
+// PayloadState 表示当前 payload 的工作模式
+type PayloadState int
+
+const (
+    UpdatingPayload PayloadState = iota   // 有序升级
+    ReconcilingPayload                     // 常规协调
+    InitializingPayload                    // 首次安装
+    PrecreatingPayload                     // 预创建 (ClusterComponent 可见性)
+)
+
+// Task 表示一个组件的执行任务
+type Task struct {
+    Index          int                    // 任务索引 (在原始列表中的位置)
+    Component      string                 // 组件名称 (如 "coredns")
+    Version        string                 // 组件版本 (如 "v1.11.1")
+    RunLevel       RunLevel               // 执行层级
+    ComponentType  string                 // inline|yaml|helm|binary
+    ComponentNode  *ComponentNode         // 组件 DAG 节点 (含依赖、FailurePolicy)
+    Manifest       manifest.Manifest      // 关联的清单 (yaml 类型有值)
+    Backoff        wait.Backoff           // 重试退避策略
 }
 
+// ComponentNode 是对 topology.ComponentNode 的引用 (复用现有类型)
+type ComponentNode struct {
+    Name          string
+    Version       string
+    Inline        *InlineRef
+    FailurePolicy FailurePolicy
+    Dependencies  []string
+}
+
+// TaskNode 是 TaskGraph 中的节点，包含一组同层同组件的 Task
+type TaskNode struct {
+    RunLevel  RunLevel    // 执行层级
+    Component string      // 组件名 (同节点内 Task 的 Component 相同)
+    Tasks     []*Task     // 该节点的任务列表 (按 Index 排序)
+    In        []int       // 前置节点索引 (跨层或同层依赖)
+    Out       []int       // 依赖节点索引
+    result    *nodeResult // 执行结果 (内部写入)
+}
+
+// nodeResult 记录节点的执行结果
+type nodeResult struct {
+    done  bool
+    err   error
+}
+
+// TaskGraph 是有向无环图
 type TaskGraph struct {
     Nodes []*TaskNode
 }
 
-type Task struct {
-    Index       int
-    Component   string
-    Version     string
-    ComponentType string    // inline|yaml|helm|binary
-    Manifest    manifest.Manifest
-    Backoff     wait.Backoff
+// GraphFunc 是 RunGraph 执行每个节点时调用的回调函数
+type GraphFunc func(ctx context.Context, tasks []*Task) error
+
+// SplitFunc 定义在哪些 Task 处分裂节点
+type SplitFunc func(task *Task) bool
+
+// BreakFunc 定义如何将一个节点的 Task 拆分为并行组
+type BreakFunc func(tasks []*Task) [][]*TaskNode
+```
+
+#### 7.5.2 图构建方法
+
+```go
+// NewTaskGraph 创建单节点图 (所有 Task 在一个节点中)
+func NewTaskGraph(tasks []*Task) *TaskGraph {
+    return &TaskGraph{
+        Nodes: []*TaskNode{
+            {
+                RunLevel:  tasks[0].RunLevel,
+                Component: tasks[0].Component,
+                Tasks:     tasks,
+            },
+        },
+    }
 }
 
-// 图构建方法
-func NewTaskGraph(tasks []*Task) *TaskGraph        // 单节点图
-func (g *TaskGraph) Split(onFn SplitFunc)          // 在匹配点分裂
-func (g *TaskGraph) Parallelize(breakFn BreakFunc) // 并行化
-func (g *TaskGraph) Roots() []*TaskNode             // 根节点
+// Split 在匹配 onFn 的 Task 处将节点分裂为 [before] → [match] → [after]
+// 用于在特殊 Task (如 Job) 处断开并行性
+func (g *TaskGraph) Split(onFn SplitFunc) *TaskGraph {
+    var newNodes []*TaskNode
+    for _, node := range g.Nodes {
+        var before, match, after []*Task
+        splitOccurred := false
+        for _, t := range node.Tasks {
+            if onFn(t) {
+                splitOccurred = true
+                match = append(match, t)
+            } else if splitOccurred {
+                after = append(after, t)
+            } else {
+                before = append(before, t)
+            }
+        }
+        if !splitOccurred {
+            newNodes = append(newNodes, node)
+            continue
+        }
+        // 创建分裂后的节点链: before → match → after
+        if len(before) > 0 {
+            newNodes = append(newNodes, &TaskNode{RunLevel: node.RunLevel, Component: node.Component, Tasks: before})
+        }
+        if len(match) > 0 {
+            newNodes = append(newNodes, &TaskNode{RunLevel: node.RunLevel, Component: node.Component, Tasks: match})
+        }
+        if len(after) > 0 {
+            newNodes = append(newNodes, &TaskNode{RunLevel: node.RunLevel, Component: node.Component, Tasks: after})
+        }
+    }
+    g.Nodes = newNodes
+    g.rebuildEdges()
+    return g
+}
 
-// 排序策略
-func ByNumberAndComponent(tasks []*Task) [][]*TaskNode      // 有序 (升级)
-func FlattenByNumberAndComponent(tasks []*Task) [][]*TaskNode // 扁平 (安装)
-func PermuteOrder(breakFn, r *rand.Rand) BreakFunc           // 随机 (协调)
+// SplitOnJobs 在 batch/v1 Job 类型处分裂 (Job 需要独立等待完成)
+func SplitOnJobs(task *Task) bool {
+    return task.ComponentType == "yaml" &&
+        task.Manifest.GVK.Group == "batch" &&
+        task.Manifest.GVK.Version == "v1" &&
+        task.Manifest.GVK.Kind == "Job"
+}
 
-// 执行器
-func RunGraph(ctx, graph *TaskGraph, maxWorkers int, fn GraphFunc) []error
+// Parallelize 按 breakFn 将节点拆分为并行组
+// 每个 breakFn 返回的组成为独立节点，同组内 Task 串行
+func (g *TaskGraph) Parallelize(breakFn BreakFunc) *TaskGraph {
+    var newNodes []*TaskNode
+    for _, node := range g.Nodes {
+        groups := breakFn(node.Tasks)
+        // 插入间隔节点避免 M×N 边
+        prevIdx := -1
+        for i, group := range groups {
+            newNode := &TaskNode{
+                RunLevel:  node.RunLevel,
+                Component: group[0].Component,
+                Tasks:     group,
+            }
+            newNodes = append(newNodes, newNode)
+            if prevIdx >= 0 {
+                // 前一个组 → 当前组 (依赖边)
+                newNodes[prevIdx].Out = append(newNodes[prevIdx].Out, len(newNodes)-1)
+                newNode.In = append(newNode.In, prevIdx)
+            }
+            prevIdx = len(newNodes) - 1
+        }
+    }
+    g.Nodes = newNodes
+    return g
+}
+
+// rebuildEdges 根据 RunLevel 和 dependencies 重建边
+func (g *TaskGraph) rebuildEdges() {
+    // 跨 RunLevel 边: 低 Level 的所有节点 → 高 Level 的所有节点
+    for i, lowNode := range g.Nodes {
+        for j, highNode := range g.Nodes {
+            if i == j {
+                continue
+            }
+            if lowNode.RunLevel < highNode.RunLevel {
+                lowNode.Out = append(lowNode.Out, j)
+                highNode.In = append(highNode.In, i)
+            }
+        }
+    }
+    // 同 Run Level 内的 dependencies 边
+    // (由调用方通过 ComponentNode.Dependencies 补充)
+}
+
+// Roots 返回无前置的根节点
+func (g *TaskGraph) Roots() []*TaskNode {
+    var roots []*TaskNode
+    for _, node := range g.Nodes {
+        if len(node.In) == 0 {
+            roots = append(roots, node)
+        }
+    }
+    return roots
+}
+
+// NodeNames 返回所有节点名 (按 RunLevel 排序)
+func (g *TaskGraph) NodeNames() []string {
+    var names []string
+    for _, node := range g.Nodes {
+        names = append(names, fmt.Sprintf("L%d:%s", node.RunLevel, node.Component))
+    }
+    return names
+}
+
+// TotalTasks 返回所有节点的 Task 总数
+func (g *TaskGraph) TotalTasks() int {
+    total := 0
+    for _, node := range g.Nodes {
+        total += len(node.Tasks)
+    }
+    return total
+}
+```
+
+#### 7.5.3 排序策略
+
+```go
+// ByNumberAndComponent 有序模式 (升级)
+// 同 RunLevel 同组件串行，同 RunLevel 不同组件并行
+func ByNumberAndComponent(tasks []*Task) [][]*TaskNode {
+    // 按 RunLevel 分组
+    levelGroups := groupByRunLevel(tasks)
+    var result [][]*TaskNode
+    // 按 RunLevel 排序
+    for _, level := range sortedRunLevels(levelGroups) {
+        levelTasks := levelGroups[level]
+        // 同 RunLevel 内按 Component 分组 (同组件串行)
+        componentGroups := groupByComponent(levelTasks)
+        // 同 RunLevel 不同组件 → 并行 (每组一个 TaskNode)
+        for _, comp := range sortedComponents(componentGroups) {
+            compTasks := componentGroups[comp]
+            // 同组件内按 Index 排序
+            sortTasksByIndex(compTasks)
+            result = append(result, []*TaskNode{
+                {RunLevel: level, Component: comp, Tasks: compTasks},
+            })
+        }
+    }
+    return result
+}
+
+// FlattenByNumberAndComponent 扁平模式 (安装)
+// 同 RunLevel 全部并行 (不保持组件内顺序)
+func FlattenByNumberAndComponent(tasks []*Task) [][]*TaskNode {
+    levelGroups := groupByRunLevel(tasks)
+    var result [][]*TaskNode
+    for _, level := range sortedRunLevels(levelGroups) {
+        levelTasks := levelGroups[level]
+        // 同 RunLevel 内每个 Task 独立为一个节点 → 全并行
+        for _, t := range levelTasks {
+            result = append(result, []*TaskNode{
+                {RunLevel: level, Component: t.Component, Tasks: []*Task{t}},
+            })
+        }
+    }
+    return result
+}
+
+// PermuteOrder 随机排列模式 (协调)
+// 在排序函数基础上对同层节点随机打乱
+func PermuteOrder(breakFn BreakFunc, r *rand.Rand) BreakFunc {
+    return func(tasks []*Task) [][]*TaskNode {
+        groups := breakFn(tasks)
+        r.Shuffle(len(groups), func(i, j int) {
+            groups[i], groups[j] = groups[j], groups[i]
+        })
+        return groups
+    }
+}
+
+// ShiftOrder 旋转排列模式 (协调)
+// 每次 reconcile 旋转同层顺序，增加多样性
+func ShiftOrder(breakFn BreakFunc, iteration, stride int) BreakFunc {
+    return func(tasks []*Task) [][]*TaskNode {
+        groups := breakFn(tasks)
+        if len(groups) <= 1 {
+            return groups
+        }
+        offset := (iteration * stride) % len(groups)
+        shifted := make([][]*TaskNode, len(groups))
+        for i, g := range groups {
+            shifted[(i+offset)%len(groups)] = g
+        }
+        return shifted
+    }
+}
+
+// 辅助函数
+func groupByRunLevel(tasks []*Task) map[RunLevel][]*Task {
+    m := make(map[RunLevel][]*Task)
+    for _, t := range tasks {
+        m[t.RunLevel] = append(m[t.RunLevel], t)
+    }
+    return m
+}
+
+func groupByComponent(tasks []*Task) map[string][]*Task {
+    m := make(map[string][]*Task)
+    for _, t := range tasks {
+        m[t.Component] = append(m[t.Component], t)
+    }
+    return m
+}
+
+func sortedRunLevels(m map[RunLevel][]*Task) []RunLevel {
+    var levels []RunLevel
+    for k := range m {
+        levels = append(levels, k)
+    }
+    sort.Slice(levels, func(i, j int) bool { return levels[i] < levels[j] })
+    return levels
+}
+
+func sortedComponents(m map[string][]*Task) []string {
+    var comps []string
+    for k := range m {
+        comps = append(comps, k)
+    }
+    sort.Strings(comps)
+    return comps
+}
+
+func sortTasksByIndex(tasks []*Task) {
+    sort.Slice(tasks, func(i, j int) bool { return tasks[i].Index < tasks[j].Index })
+}
+```
+
+#### 7.5.4 RunGraph 执行器
+
+```go
+// RunGraph 并发执行 TaskGraph 中的所有节点
+// 遵循 DAG 依赖: 前置节点全部成功后才能执行当前节点
+// 独立边在节点失败时继续执行 (错误不跨独立边传播)
+func RunGraph(ctx context.Context, graph *TaskGraph, maxWorkers int, fn GraphFunc) []error {
+    if maxWorkers <= 0 {
+        maxWorkers = 1
+    }
+
+    // 工作队列: 可执行的节点索引
+    workCh := make(chan int, len(graph.Nodes))
+    defer close(workCh)
+
+    // 结果队列
+    resultCh := make(chan nodeResult, len(graph.Nodes))
+    defer close(resultCh)
+
+    // 可取消的 context
+    nestedCtx, cancel := context.WithCancel(ctx)
+    defer cancel()
+
+    // 统计完成/失败数
+    var completed int32
+    var failed int32
+    totalNodes := int32(len(graph.Nodes))
+
+    // 启动 worker pool
+    var wg sync.WaitGroup
+    for i := 0; i < maxWorkers; i++ {
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            for nodeIdx := range workCh {
+                if nestedCtx.Err() != nil {
+                    return
+                }
+                node := graph.Nodes[nodeIdx]
+
+                // 执行节点中的所有 Task
+                err := fn(nestedCtx, node.Tasks)
+
+                // 记录结果
+                node.result = &nodeResult{done: true, err: err}
+
+                if err != nil {
+                    atomic.AddInt32(&failed, 1)
+                    // 取消依赖此节点的下游节点
+                    // (独立边继续执行, 不取消整个 ctx)
+                    propagateSkip(graph, nodeIdx)
+                } else {
+                    atomic.AddInt32(&completed, 1)
+                }
+
+                resultCh <- nodeResult{done: true, err: err}
+            }
+        }()
+    }
+
+    // 主循环: 调度可执行的节点
+    go func() {
+        defer wg.Wait()
+        visited := make(map[int]bool)
+        for {
+            if nestedCtx.Err() != nil {
+                return
+            }
+
+            // 找到所有可执行的节点 (前置全部成功)
+            visitable := findVisitable(graph, visited)
+            if len(visitable) == 0 {
+                // 检查是否全部完成
+                if int(atomic.LoadInt32(&completed)+atomic.LoadInt32(&failed)) >= int(totalNodes) {
+                    return
+                }
+                // 等待结果
+                select {
+                case <-nestedCtx.Done():
+                    return
+                case <-resultCh:
+                    continue
+                }
+            }
+
+            for _, idx := range visitable {
+                visited[idx] = true
+                workCh <- idx
+            }
+        }
+    }()
+
+    // 收集错误
+    var errs []error
+    errCh := make(chan error, len(graph.Nodes))
+    go func() {
+        for result := range resultCh {
+            if result.err != nil {
+                errCh <- result.err
+            }
+        }
+        close(errCh)
+    }()
+
+    for err := range errCh {
+        errs = append(errs, err)
+    }
+
+    // 如果仅有未完成节点 (无错误), 报告 ctx 错误
+    if len(errs) == 0 && int(atomic.LoadInt32(&completed)) < int(totalNodes) {
+        incomplete := totalNodes - atomic.LoadInt32(&completed) - atomic.LoadInt32(&failed)
+        errs = append(errs, fmt.Errorf("context cancelled with %d nodes incomplete", incomplete))
+    }
+
+    return errs
+}
+
+// findVisitable 返回所有前置节点已成功且未访问的节点索引
+func findVisitable(graph *TaskGraph, visited map[int]bool) []int {
+    var visitable []int
+    for i, node := range graph.Nodes {
+        if visited[i] {
+            continue
+        }
+        if node.result != nil {
+            continue // 已执行
+        }
+        // 检查所有前置节点是否已成功
+        canVisit := true
+        for _, inIdx := range node.In {
+            inNode := graph.Nodes[inIdx]
+            if inNode.result == nil || inNode.result.err != nil {
+                canVisit = false
+                break
+            }
+        }
+        if canVisit {
+            visitable = append(visitable, i)
+        }
+    }
+    return visitable
+}
+
+// propagateSkip 标记依赖失败节点的下游节点为跳过
+func propagateSkip(graph *TaskGraph, failedIdx int) {
+    for _, outIdx := range graph.Nodes[failedIdx].Out {
+        node := graph.Nodes[outIdx]
+        if node.result == nil {
+            node.result = &nodeResult{
+                done: false,
+                err:  fmt.Errorf("skipped: dependency node %d failed", failedIdx),
+            }
+        }
+    }
+}
+```
+
+#### 7.5.5 构建流程
+
+```go
+// BuildTaskGraph 从 ReleaseImage bundle 构建 TaskGraph
+func BuildTaskGraph(bundle *release.Bundle, state PayloadState) (*TaskGraph, error) {
+    // 1. 从 bundle 解析所有组件的 ComponentVersion
+    var tasks []*Task
+    for name, cv := range bundle.Components {
+        runLevel := RunLevel(cv.Spec.RunLevel)
+        if runLevel == 0 {
+            runLevel = RunLevelDefault // 默认 50
+        }
+
+        // 解析组件类型
+        compType := string(cv.Spec.Type) // inline|yaml|helm|binary
+
+        // 获取清单 (yaml 类型)
+        var manifests []manifest.Manifest
+        if compType == "yaml" {
+            pkg, err := bundleStore.GetComponentManifests(ctx, cv.Spec.Name, cv.Spec.Version, tmplCtx)
+            if err != nil {
+                return nil, err
+            }
+            manifests = pkg.Manifests
+        }
+
+        // 创建 Task
+        for i, m := range manifests {
+            tasks = append(tasks, &Task{
+                Index:         i,
+                Component:     name,
+                Version:       cv.Spec.Version,
+                RunLevel:      runLevel,
+                ComponentType: compType,
+                Manifest:      m,
+                Backoff:       defaultBackoff(state),
+            })
+        }
+        // inline/helm/binary 类型: 每个 ComponentVersion 一个 Task
+        if len(manifests) == 0 {
+            tasks = append(tasks, &Task{
+                Index:         0,
+                Component:     name,
+                Version:       cv.Spec.Version,
+                RunLevel:      runLevel,
+                ComponentType: compType,
+                Backoff:       defaultBackoff(state),
+            })
+        }
+    }
+
+    // 2. 创建初始图
+    graph := NewTaskGraph(tasks)
+
+    // 3. 在 Job 处分裂 (Job 需要独立等待)
+    graph.Split(SplitOnJobs)
+
+    // 4. 按 PayloadState 选择并行化策略
+    var breakFn BreakFunc
+    switch state {
+    case InitializingPayload:
+        breakFn = FlattenByNumberAndComponent // 全并行
+    case UpdatingPayload:
+        breakFn = ByNumberAndComponent         // 有序
+    case ReconcilingPayload:
+        r := rand.New(rand.NewSource(time.Now().UnixNano()))
+        breakFn = PermuteOrder(FlattenByNumberAndComponent, r) // 随机
+    default:
+        breakFn = ByNumberAndComponent // 默认有序
+    }
+
+    // 5. 并行化
+    graph.Parallelize(breakFn)
+
+    // 6. 补充同层 dependencies 边
+    addDependencyEdges(graph, bundle)
+
+    return graph, nil
+}
+
+// defaultBackoff 根据 PayloadState 返回默认退避策略
+func defaultBackoff(state PayloadState) wait.Backoff {
+    if state == InitializingPayload {
+        return wait.Backoff{
+            Steps:    4,
+            Factor:   2,
+            Duration: 1 * time.Second,
+            Cap:      15 * time.Second,
+        }
+    }
+    return wait.Backoff{
+        Steps:    5,
+        Factor:   1.5,
+        Duration: 5 * time.Second,
+        Cap:      60 * time.Second,
+    }
+}
+
+// addDependencyEdges 根据 ComponentVersion.spec.dependencies 补充同层依赖边
+func addDependencyEdges(graph *TaskGraph, bundle *release.Bundle) {
+    for i, node := range graph.Nodes {
+        cv, ok := bundle.Components[node.Component]
+        if !ok {
+            continue
+        }
+        for _, dep := range cv.Spec.Dependencies {
+            // 找到同 RunLevel 内的依赖组件节点
+            for j, depNode := range graph.Nodes {
+                if i == j {
+                    continue
+                }
+                if depNode.RunLevel == node.RunLevel && depNode.Component == dep.Name {
+                    // 依赖边: dep → node
+                    depNode.Out = append(depNode.Out, i)
+                    node.In = append(node.In, j)
+                }
+            }
+        }
+    }
+}
+```
+
+#### 7.5.6 调用示例
+
+```go
+// 在 SyncWorker.apply() 中调用
+func (w *SyncWorker) apply(ctx context.Context, work *SyncWork, maxWorkers int) error {
+    // 1. 构建 TaskGraph
+    graph, err := BuildTaskGraph(w.payload, work.State)
+    if err != nil {
+        return err
+    }
+
+    // 2. 确定并发度
+    if work.State == InitializingPayload {
+        maxWorkers = len(graph.Nodes) // 全并行
+    } else if work.State == ReconcilingPayload {
+        maxWorkers = 2
+    }
+
+    // 3. 执行图
+    errs := RunGraph(ctx, graph, maxWorkers, func(ctx context.Context, tasks []*Task) error {
+        // 第一遍 (PrecreatingMode): 预创建 ClusterComponent CR
+        for _, task := range tasks {
+            w.precreateClusterComponent(ctx, task)
+        }
+
+        // 第二遍: 实际执行组件
+        for _, task := range tasks {
+            // 检查断点续传
+            if w.shouldSkipComponent(task.Component, task.Version) {
+                continue
+            }
+
+            // 通过 ExecutorRegistry 分发执行
+            executor := w.registry.Get(task.ComponentType)
+            if executor == nil {
+                return fmt.Errorf("no executor for component type %s", task.ComponentType)
+            }
+
+            err := executor.ExecuteComponent(ctx, &topology.ComponentNode{
+                Name:          task.Component,
+                Version:       task.Version,
+                FailurePolicy: task.ComponentNode.FailurePolicy,
+            }, w.executionContext)
+
+            if err != nil {
+                return err
+            }
+
+            // 更新 DeclarativeUpgradeStatus
+            w.markComponentCompleted(task.Component, task.Version)
+        }
+        return nil
+    })
+
+    // 4. 汇总错误
+    if len(errs) > 0 {
+        return summarizeTaskGraphErrors(errs)
+    }
+    return nil
+}
 ```
 
 ### 7.6 与现有 DAG 调度器的关系
