@@ -485,20 +485,115 @@ func (e *EnsureMasterUpgrade) upgradeMasterNodesWithParams(skipKubelet bool) (ct
 
 ### 5.3 BKEAgent 层：kubeadm 命令微调
 
+#### 5.3.1 版本传递问题
+
+基于 §7.7 的代码分析，BKEAgent 渲染 Static Pod manifest 时的镜像 tag 和 kubelet/kubectl 二进制版本**全部来自 `BkeConfig.Cluster.KubernetesVersion` 和 `BkeConfig.Cluster.EtcdVersion`** (即 `BKECluster.Spec.ClusterConfig.Cluster` 的字段)。BKEAgent 通过 `getBKEConfig()` 从管理集群读取 BKECluster CR 获取这些值。
+
+因此，最小化方案中每个 hop 需要确保：**在 BKEClusterReconciler 执行 DAG 之前，`BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion` 和 `EtcdVersion` 已被正确设置为当前 hop 对应 ReleaseImage 中的版本值**。
+
+现有代码已通过 `SyncUpgradeTargetsToClusterSpec()` 实现了这一同步 (见 §7.3.4)，但需要验证该同步在多 hop 场景下是否正确工作，并补充 etcd 版本的同步路径。
+
+#### 5.3.2 每 hop 版本设置完整链路
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              每 hop 版本设置链路 (etcd + K8s 核心组件)                            │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  ClusterVersionReconciler.orchestrateMinimalMultiHop():                         │
+│                                                                                 │
+│  for each hopTarget (openFuyao 版本, 如 "v2.6.5"):                              │
+│                                                                                 │
+│    ① 设置 upgrade-ready = hopTarget 注解                                        │
+│    ② 设置 skip-kubelet = "true" 注解                                             │
+│                                                                                 │
+│    ③ BKEClusterReconciler.executeUpgradeDAG() 被触发:                            │
+│       │                                                                         │
+│       ├── resolveUpgradeBundle(hopTarget)                                        │
+│       │   → 通过 openFuyao 版本查找 ReleaseImage CR (Spec.Version == hopTarget)  │
+│       │   → 解析 OCI Bundle                                                      │
+│       │   → bundle.Components["kubernetes-master"].Spec.Version = "v1.35.0-of.1"│
+│       │   → bundle.Components["etcd"].Spec.Version = "v3.6.7-of.1"            │
+│       │                                                                         │
+│       ├── BuildVersionContextForUpgrade(bundle, currentBundle, bc):             │
+│       │   VC.Target["kubernetes-master"] = "v1.35.0-of.1"  (K8s 版本)          │
+│       │   VC.Target["etcd"] = "v3.6.7-of.1"                (etcd 版本)        │
+│       │   VC.Target["kubernetes-worker"] = "v1.35.0-of.1"  (K8s 版本)          │
+│       │                                                                         │
+│       ├── SyncUpgradeTargetsToClusterSpec()  ★ 关键: 将 VC Target 同步到 Spec   │
+│       │   ApplyVersionContextTargetsToClusterSpec(bc, vc):                      │
+│       │     cluster.EtcdVersion = vc.GetTarget("etcd")     = "v3.6.7-of.1"   │
+│       │     cluster.KubernetesVersion = KubernetesTargetFromVersionContext(vc)  │
+│       │                                = "v1.35.0-of.1"                        │
+│       │   → 通过 mergecluster.SyncStatusUntilComplete API patch 持久化          │
+│       │                                                                         │
+│       ├── patchClusterOpenFuyaoVersionSpecBeforeDAG(hopTarget)                   │
+│       │   cluster.OpenFuyaoVersion = "v2.6.5" (openFuyao 版本)               │
+│       │                                                                         │
+│       ├── ★ skipKubelet=true 时:                                                 │
+│       │   VC.SetTarget("kubernetes-worker", VC.GetCurrent("kubernetes-worker"))  │
+│       │   → kubernetes-worker Target = Current (跳过 worker 升级)              │
+│       │   注意: KubernetesVersion 已在 Spec 中 (步骤 SyncUpgradeTargets)        │
+│       │   但 VC 中 kubernetes-worker Target 被设为 Current → NeedsUpgrade=false │
+│       │   → EnsureWorkerUpgrade 跳过 → kubelet 不升级                            │
+│       │   ★ 但 BKECluster.Spec.KubernetesVersion 仍是 "v1.35.0-of.1"          │
+│       │   → 如果 EnsureMasterUpgrade 不跳过 installKubeletCommand,             │
+│       │     kubelet 会被升级到 v1.35.0-of.1 (因为 BkeConfig 读取 Spec)          │
+│       │   → 所以 skipKubelet 必须在 EnsureMasterUpgrade 中单独控制 (见 §5.3.3) │
+│       │                                                                         │
+│       └── ExecuteDAG → EnsureMasterUpgrade.Execute():                            │
+│           EnsureMasterUpgrade 通过 Command CR 触发 BKEAgent                      │
+│           BKEAgent getBKEConfig() → 读取 BKECluster.Spec.ClusterConfig           │
+│           → BkeConfig.Cluster.KubernetesVersion = "v1.35.0-of.1"              │
+│           → BkeConfig.Cluster.EtcdVersion = "v3.6.7-of.1"                    │
+│                                                                                 │
+│    ④ BKEAgent 执行:                                                              │
+│       EnsureEtcdUpgrade (独立 Phase, 在 EnsureMasterUpgrade 之前):              │
+│       → etcd manifest 渲染: image tag = EtcdVersion 去 v = "3.6.7-of.1"        │
+│       → 镜像: cr.openfuyao.cn/openfuyao/etcd:3.6.7-of.1                        │
+│                                                                                 │
+│       EnsureMasterUpgrade → upgradeControlPlane(skipKubelet=true):              │
+│       → apiserver manifest: image tag = KubernetesVersion 去 v = "1.35.0-of.1" │
+│       → 镜像: cr.openfuyao.cn/openfuyao/kube-apiserver:1.35.0-of.1             │
+│       → cm manifest: cr.openfuyao.cn/openfuyao/kube-controller-manager:1.35.0-of.1│
+│       → scheduler manifest: cr.openfuyao.cn/openfuyao/kube-scheduler:1.35.0-of.1│
+│       → 跳过 installKubeletCommand (skipKubelet=true)                           │
+│       → installKubectlCommand: kubectl-v1.35.0-of.1-amd64 (从 HTTPRepo 下载)   │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 5.3.3 skipKubelet 的双重控制
+
+基于 §7.7.4 的分析，kubelet 二进制升级有**两个执行路径**，都需要控制：
+
+| 执行路径 | 触发条件 | 版本来源 | 控制方式 |
+|---------|---------|---------|---------|
+| `EnsureMasterUpgrade` → `installKubeletCommand()` | 控制面升级时 (UpgradeControlPlane Phase) | `BkeConfig.Cluster.KubernetesVersion` | ★ `skipKubelet` 参数跳过 (§5.3.4) |
+| `EnsureWorkerUpgrade` → `installKubeletCommand()` | Worker 升级时 (UpgradeWorker Phase) | `BkeConfig.Cluster.KubernetesVersion` | ★ VC 设 `kubernetes-worker` Target=Current 跳过 (已有机制) |
+
+**问题**：即使 VC 将 `kubernetes-worker` Target 设为 Current 跳过了 `EnsureWorkerUpgrade`，`EnsureMasterUpgrade` 内部的 `installKubeletCommand()` 仍会执行 (因为它读取的是 `BkeConfig.Cluster.KubernetesVersion`，而非 VC)。
+
+**解决**：`skipKubelet` 参数仅在 `EnsureMasterUpgrade` → `upgradeControlPlane()` 中控制 `installKubeletCommand()` 的跳过，确保 kubelet 二进制不被替换。
+
 ```go
 // pkg/job/builtin/kubeadm/kubeadm.go
 
 func (k *KubeadmPlugin) upgradeControlPlane(backUpEtcd bool, clusterType string, skipKubelet bool) error {
     // step 1: prepareUpgrade (不变)
+    // 备份 etcd + 备份 /etc/kubernetes + 预拉镜像 + 获取 Pod Hash
     beforeHash, err := k.prepareUpgrade(backUpEtcd, clusterType)
 
     // step 2: 逐个升级控制面组件 (不变: apiserver → cm → scheduler)
+    // 渲染 manifest: image tag 来自 BkeConfig.Cluster.KubernetesVersion (已由 SyncUpgradeTargets 同步)
     for _, component := range mfutil.GetControlPlaneComponents() {
-        k.upgradeControlPlaneManifestCommand(component)
-        k.waitComponentReady(component, podHash)
+        k.upgradeControlPlaneManifestCommand(component)  // 渲染 Go 模板写入 manifest
+        k.waitComponentReady(component, podHash)          // 等待 Pod Running
     }
 
     // step 3: ★ 条件跳过 kubelet 二进制升级
+    // installKubeletCommand 从 BkeConfig.Cluster.KubernetesVersion 读取版本
+    // skipKubelet=true → 跳过，kubelet 保持旧版本
     if !skipKubelet {
         log.Infof("upgrade kubelet for cluster %s", k.clusterName)
         if err := k.installKubeletCommand(false); err != nil {
@@ -506,14 +601,81 @@ func (k *KubeadmPlugin) upgradeControlPlane(backUpEtcd bool, clusterType string,
         }
     } else {
         log.Infof("skip kubelet upgrade (deferred) for cluster %s", k.clusterName)
+        // kubelet 二进制不替换，保持旧版本
+        // apiserver/cm/scheduler manifest 已替换为新版本 (step 2)
+        // Kubelet (旧版本) 仍能管理新版本 apiserver/cm/scheduler Pod
     }
 
     // step 4: 安装 kubectl (不变)
+    // installKubectlCommand 从 BkeConfig.Cluster.KubernetesVersion 读取版本
+    // kubectl 偏差窗口仅 ±1，必须随控制面同步升级
     k.installKubectlCommand()
 
     return nil
 }
 ```
+
+#### 5.3.4 etcd 版本的传递
+
+etcd 版本通过 `EnsureEtcdUpgrade` Phase 独立升级 (在 `EnsureMasterUpgrade` 之前)。etcd 的 image tag 解析有独立优先级链 (见 §7.7.5)，但最终来源仍是 `BkeConfig.Cluster.EtcdVersion`，由 `SyncUpgradeTargetsToClusterSpec()` 从 VC 同步。
+
+```go
+// SyncUpgradeTargetsToClusterSpec 中的 etcd 版本同步 (已有代码，无需修改)
+
+func ApplyVersionContextTargetsToClusterSpec(bc *bkev1beta1.BKECluster, vc *upgrade.VersionContext) {
+    cluster := &bc.Spec.ClusterConfig.Cluster
+    if v := vc.GetTarget(ComponentEtcd); v != "" {
+        cluster.EtcdVersion = v  // ← etcd 版本从 VC 写入 Spec
+    }
+    if v := vc.GetTarget(ComponentContainerd); v != "" {
+        cluster.ContainerdVersion = v
+    }
+    if v := KubernetesTargetFromVersionContext(vc); v != "" {
+        cluster.KubernetesVersion = v  // ← K8s 版本从 VC 写入 Spec
+    }
+}
+```
+
+BKEAgent 端 etcd manifest 渲染：
+
+```go
+// etcd 的 imageInfo 模板函数
+"imageInfo": func(cfg *BootScope) string {
+    etcdVersion := etcdImageTagFromBootScope(cfg)
+    return fmt.Sprintf("%s:%s", bkeinit.DefaultEtcdImageName, etcdVersion)
+    // → "etcd:3.6.7-of.1"
+},
+
+// etcdImageTagFromBootScope 优先级:
+// 1. cfg.Extra["etcdVersion"] (声明式升级路径, 由 applyCommandEtcdVersion 设置)
+// 2. cfg.BkeConfig.Cluster.EtcdVersion (从 BKECluster.Spec 读取)
+// 3. versions.EtcdImageTag() (内嵌默认)
+```
+
+> etcd 版本传递**不需要额外修改** — `SyncUpgradeTargetsToClusterSpec` 已将 `VC.Target["etcd"]` (来源于 ReleaseImage `etcd.version`) 同步到 `BKECluster.Spec.EtcdVersion`，BKEAgent 读取后渲染 manifest。
+
+#### 5.3.5 每 hop 版本设置汇总
+
+| 组件 | 版本来源 (管理集群) | 同步路径 | BKEAgent 读取位置 | 渲染产物 |
+|------|-------------------|---------|------------------|---------|
+| kube-apiserver | ReleaseImage `kubernetes-master.version` | VC → `SyncUpgradeTargets` → `Spec.KubernetesVersion` | `BkeConfig.Cluster.KubernetesVersion` | manifest image tag |
+| kube-controller-manager | ReleaseImage `kubernetes-master.version` | 同上 | 同上 | manifest image tag |
+| kube-scheduler | ReleaseImage `kubernetes-master.version` | 同上 | 同上 | manifest image tag |
+| etcd | ReleaseImage `etcd.version` | VC → `SyncUpgradeTargets` → `Spec.EtcdVersion` | `BkeConfig.Cluster.EtcdVersion` (或 `Extra["etcdVersion"]`) | manifest image tag |
+| kubelet | ReleaseImage `kubernetes-worker.version` | VC → `SyncUpgradeTargets` → `Spec.KubernetesVersion` | `BkeConfig.Cluster.KubernetesVersion` | 二进制下载 URL |
+| kubectl | ReleaseImage `kubernetes-master.version` | 同 kubelet | 同上 | 二进制下载 URL |
+
+> **关键**：所有 K8s 核心组件 (apiserver/cm/scheduler/kubelet/kubectl) 的版本**都来自同一个字段** `BkeConfig.Cluster.KubernetesVersion`。etcd 来自独立字段 `BkeConfig.Cluster.EtcdVersion`。两个字段在 DAG 执行前由 `SyncUpgradeTargetsToClusterSpec()` 从 VersionContext (来源于 ReleaseImage) 同步。
+
+#### 5.3.6 skipKubelet 时 Spec.KubernetesVersion 的影响分析
+
+| 场景 | `Spec.KubernetesVersion` | `skipKubelet` | 影响 |
+|------|--------------------------|--------------|------|
+| 正常升级 (不跳过) | v1.35.0-of.1 (SyncUpgradeTargets 写入) | false | apiserver/cm/scheduler manifest → v1.35 + kubelet 二进制 → v1.35 |
+| 延迟升级 (跳过 kubelet) | v1.35.0-of.1 (SyncUpgradeTargets 写入) | true | apiserver/cm/scheduler manifest → v1.35 + **kubelet 不升级** (保持 v1.34) |
+| kubelet 补充升级 | v1.35.0-of.1 (catchup-target 注解覆盖) | false | kubelet 二进制 → v1.35 (仅 worker 升级) |
+
+> **注意**：延迟升级时 `Spec.KubernetesVersion` 仍被设为 v1.35.0-of.1 (由 `SyncUpgradeTargets` 写入)。这意味着 BKEAgent 读取到的 `BkeConfig.Cluster.KubernetesVersion` 是 v1.35.0-of.1。如果不跳过 `installKubeletCommand()`，kubelet 会被升级到 v1.35.0-of.1。`skipKubelet=true` 仅控制 `installKubeletCommand()` 的跳过，不影响 manifest 渲染 (apiserver/cm/scheduler 仍按 v1.35.0-of.1 渲染)。
 
 ### 5.4 新增注解常量
 
