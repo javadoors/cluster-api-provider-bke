@@ -632,370 +632,528 @@ func parseMinorVersion(version string) int {
 
 ## 7. kubernetes-master 版本信息来源与每 hop 设置分析
 
-本节分析在最小化方案中，`kubernetes-master` 组件的版本信息从哪里获取，以及每个 hop 升级时版本信息如何设置和流转。
+本节基于 `EnsureMasterUpgrade` 的实际代码实现，分析升级时 K8s 核心组件的版本信息从哪里获取、如何流转、每 hop 如何设置。
 
-### 7.1 版本信息的来源
+> **关键澄清**：ReleaseImage 中的 `kubernetes-master` 组件的 `version` 字段与 K8s 核心组件 (apiserver/cm/scheduler/kubelet) 的实际安装版本是**两个独立的概念**。ReleaseImage 中的 `version` 只是一个声明性目标值，实际安装到节点上的 K8s 组件版本由 kubeadm 根据下载的二进制/镜像决定。代码中的版本流转链路远比"直接读取 ReleaseImage 字段"复杂。
 
-在最小化方案中，`kubernetes-master` 仍是 inline 组件，**不拆分为独立组件**，因此没有独立的 ComponentVersion YAML 声明 `kube-apiserver` / `kube-controller-manager` / `kube-scheduler` 的版本。版本信息来源于以下三个层级：
+### 7.1 版本信息的完整流转链路
+
+从用户触发升级到 kubeadm 执行升级命令，版本信息经过以下完整链路：
 
 ```txt
 ┌─────────────────────────────────────────────────────────────────────────────────┐
-│              kubernetes-master 版本信息来源                                       │
+│              K8s 版本信息完整流转链路 (基于代码分析)                                │
 ├─────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                 │
-│  层级 1: ReleaseImage CR (声明层)                                                │
-│  ┌──────────────────────────────────────────────────────────────────────┐      │
-│  │ apiVersion: cvo.openfuyao.cn/v1alpha1                               │      │
-│  │ kind: ReleaseImage                                                   │      │
-│  │ spec:                                                                │      │
-│  │   version: "v2.6.5"              ← openFuyao 版本                   │      │
-│  │   upgrade:                                                           │      │
-│  │     components:                                                      │      │
-│  │       - name: kubernetes-master                                      │      │
-│  │         version: v1.35.0         ← ★ K8s 版本 (apiserver/cm/scheduler/kubelet 共用)│
-│  │         inline:                                                      │      │
-│  │           handler: EnsureMasterUpgrade                               │      │
-│  │           version: v1.0.0        ← handler 代码版本                  │      │
-│  │       - name: kubernetes-worker                                      │      │
-│  │         version: v1.35.0         ← ★ K8s 版本 (kubelet/kubectl 共用)│      │
-│  │         inline:                                                      │      │
-│  │           handler: EnsureWorkerUpgrade                               │      │
-│  │       - name: etcd                                                   │      │
-│  │         version: v3.5.19         ← etcd 独立版本                    │      │
-│  │       - name: kube-proxy                                            │      │
-│  │         version: v1.35.0         ← K8s 版本                         │      │
-│  └──────────────────────────────────────────────────────────────────────┘      │
+│  ① 用户触发升级                                                                 │
+│  ClusterVersion.Spec.DesiredVersion = "v2.7.0" (openFuyao 版本)                │
+│     │                                                                           │
+│     ▼                                                                           │
+│  ② ClusterVersionReconciler 计算升级路径                                         │
+│  resolveUpgradePath → hopPath = ["v2.6.5", "v2.7.0"] (openFuyao 版本)        │
+│  设置 BKECluster 注解: cvo.openfuyao.cn/upgrade-ready = "v2.6.5"              │
+│     │  (注解值是 openFuyao 版本，不是 K8s 版本)                                │
+│     │                                                                           │
+│     ▼                                                                           │
+│  ③ BKEClusterReconciler.executeUpgradeDAG() 读取注解                             │
+│  hopTarget = annotation["upgrade-ready"] = "v2.6.5" (openFuyao 版本)          │
+│     │                                                                           │
+│     ▼                                                                           │
+│  ④ resolveUpgradeBundle(hopTarget) — 通过 openFuyao 版本解析 ReleaseImage      │
+│  ResolveReleaseImageForVersion("v2.6.5")                                       │
+│    → 查找 ReleaseImage CR where Spec.Version == "v2.6.5"                       │
+│    → releaseStore().ResolveRelease(releaseRef) → OCI Bundle                     │
+│     │                                                                           │
+│     │  ReleaseImage CR 结构:                                                    │
+│     │  spec.version = "v2.6.5"              ← openFuyao 版本                  │
+│     │  spec.upgrade.components:                                               │
+│     │    - name: kubernetes-master                                           │
+│     │      version: "v1.35.0-of.1"       ← ★ K8s 版本 (独立于 openFuyao 版本) │
+│     │      inline:                                                           │
+│     │        handler: EnsureMasterUpgrade                                     │
+│     │        version: "v1.0.0"          ← handler 代码版本 (独立于 K8s 版本)  │
+│     │    - name: etcd                                                        │
+│     │      version: "v3.5.19"           ← etcd 独立版本                       │
+│     │    - name: kubernetes-worker                                           │
+│     │      version: "v1.35.0-of.1"       ← K8s 版本                          │
+│     │      inline:                                                           │
+│     │        handler: EnsureWorkerUpgrade                                    │
+│     │                                                                        │
+│     ▼                                                                           │
+│  ⑤ BuildVersionContextForUpgrade(targetBundle, currentBundle, bc)              │
+│  applyReleaseComponents(SetTarget, targetBundle):                              │
+│    遍历 ReleaseImage.upgrade.components + install.components                   │
+│    vc.SetTarget("kubernetes-master", "v1.35.0-of.1")  ← 从组件 version 字段    │
+│    vc.SetTarget("etcd", "v3.5.19")                                             │
+│    vc.SetTarget("kubernetes-worker", "v1.35.0-of.1")                           │
+│  applyReleaseComponents(SetCurrent, currentBundle) 或 fillCurrentFromBKECluster:│
+│    vc.SetCurrent("kubernetes-master", bc.Status.KubernetesVersion)            │
+│     │                                                                           │
+│     ▼                                                                           │
+│  ⑥ SyncUpgradeTargetsToClusterSpec() — 将 VC Target 同步到 BKECluster.Spec    │
+│  ApplyVersionContextTargetsToClusterSpec(bc, vc):                              │
+│    KubernetesTargetFromVersionContext(vc):                                     │
+│      优先级: vc.GetTarget("kubernetes-master") → "v1.35.0-of.1"              │
+│               → vc.GetTarget("kubernetes-worker")                             │
+│               → vc.GetTarget("kubernetes")                                     │
+│    → BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion = "v1.35.0-of.1" │
+│    → BKECluster.Spec.ClusterConfig.Cluster.EtcdVersion = "v3.5.19"           │
+│     │  (通过 mergecluster.SyncStatusUntilComplete API patch 持久化)            │
+│     │                                                                           │
+│     ▼                                                                           │
+│  ⑦ patchClusterOpenFuyaoVersionSpecBeforeDAG(hopTarget) — 同步 openFuyao 版本  │
+│  ApplyUpgradeHopToClusterSpec(bc, "v2.6.5"):                                   │
+│    → BKECluster.Spec.ClusterConfig.Cluster.OpenFuyaoVersion = "v2.6.5"       │
+│     │  (仅写 openFuyao 版本，不写 K8s 版本 — K8s 版本已由步骤⑥写入)           │
+│     │                                                                           │
+│     ▼                                                                           │
+│  ⑧ DAG 执行 → InlineComponentExecutor → EnsureMasterUpgrade.Execute()          │
+│  desiredKubernetesVersion() 解析 (优先级):                                      │
+│    1. vc.GetTarget("kubernetes-master") → "v1.35.0-of.1"  ← ★ 主来源          │
+│    2. vc.GetTarget("kubernetes-worker") → "v1.35.0-of.1"                       │
+│    3. vc.GetTarget("kubernetes") → (如有)                                       │
+│    4. BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion (deprecated 回退)│
+│     │                                                                           │
+│     │  ★ 此时 Spec 和 VC 中的 K8s 版本一致 (步骤⑥已同步)                      │
+│     │     但 VC 是权威来源，Spec 仅为 legacy 代码路径的兼容                    │
+│     │                                                                           │
+│     ▼                                                                           │
+│  ⑨ syncLegacyTargetKubernetesVersion(targetVersion) — 防御性 Spec 再同步       │
+│  确保 BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion == targetVersion │
+│     │  (供 upgradeMasterNodesWithParams / waitForNodeHealthCheck 等 legacy 读取)│
+│     │                                                                           │
+│     ▼                                                                           │
+│  ⑩ kubeadm upgrade apply v1.35.0-of.1                                          │
+│  BKEAgent 接收 Command CR → KubeadmPlugin.upgradeControlPlane()                │
+│    → 实际下载 K8s 二进制/镜像 (版本由 ReleaseImage 中的镜像引用决定)           │
+│    → 替换 apiserver/cm/scheduler manifest (镜像 tag 来自下载的制品)             │
+│    → 实际安装的组件版本 = kubeadm 下载的制品版本 (可能与声明版本格式不同)       │
 │                                                                                 │
-│  层级 2: VersionContext (运行时层)                                               │
-│  ┌──────────────────────────────────────────────────────────────────────┐      │
-│  │ BuildVersionContextForUpgrade(targetBundle, currentBundle, bc):      │      │
-│  │                                                                      │      │
-│  │   Target["kubernetes-master"]  = targetBundle 中 kubernetes-master   │      │
-│  │                                   的 version 字段                     │      │
-│  │                                   → "v1.35.0" (从层级 1 解析)        │      │
-│  │                                                                      │      │
-│  │   Current["kubernetes-master"] = currentBundle 中 kubernetes-master  │      │
-│  │                                   的 version 字段                     │      │
-│  │                                   → "v1.34.0" (从层级 1 解析)        │      │
-│  │                                   或 BKECluster.Status.KubernetesVersion│   │
-│  │                                                                      │      │
-│  │   Target["kubernetes-worker"]  = targetBundle 中 kubernetes-worker   │      │
-│  │                                   的 version 字段                     │      │
-│  │                                   → "v1.35.0"                        │      │
-│  │                                                                      │      │
-│  │   Current["kubernetes-worker"] = BKECluster.Status.KubernetesVersion │      │
-│  │                                   或 Node.NodeInfo.KubeletVersion    │      │
-│  └──────────────────────────────────────────────────────────────────────┘      │
-│                                                                                 │
-│  层级 3: EnsureMasterUpgrade Phase (执行层)                                      │
-│  ┌──────────────────────────────────────────────────────────────────────┐      │
-│  │ desiredKubernetesVersion():                                          │      │
-│  │   1. VersionContext.GetTarget("kubernetes-master") → "v1.35.0"      │      │
-│  │   2. VersionContext.GetTarget("kubernetes-worker") → "v1.35.0"      │      │
-│  │   3. VersionContext.GetTarget("kubernetes") → "v1.35.0" (如有)      │      │
-│  │   4. 回退: BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion   │      │
-│  │                                                                      │      │
-│  │ currentKubernetesVersion():                                          │      │
-│  │   1. VersionContext.GetCurrent("kubernetes-master") → "v1.34.0"     │      │
-│  │   2. 回退: BKECluster.Status.KubernetesVersion → "v1.34.0"          │      │
-│  │                                                                      │      │
-│  │ → kubeadm upgrade apply v1.35.0                                      │      │
-│  └──────────────────────────────────────────────────────────────────────┘      │
+│  ⑪ 升级完成后                                                                    │
+│  bkeCluster.Status.KubernetesVersion = desiredKubernetesVersion()             │
+│  completeDeclarativeUpgrade → ApplyUpgradeHopToClusterStatus:                 │
+│    bc.Status.OpenFuyaoVersion = hopTarget (openFuyao 版本)                    │
+│    bc.Status.KubernetesVersion = spec.KubernetesVersion (K8s 版本, 已同步)   │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 7.2 版本信息流转链路
+### 7.2 openFuyao 版本与 K8s 版本的独立性
 
-版本信息从 ReleaseImage 到 kubeadm 命令的完整流转链路：
+ReleaseImage 中存在**两个独立的版本轴**：
 
-```txt
-ReleaseImage CR (声明层)
-  spec.upgrade.components[].version = "v1.35.0"
-       │
-       ▼ ReleaseImageReconciler 解析 OCI Bundle
-ReleaseImage Bundle (内存中)
-  Components["kubernetes-master"].Spec.Version = "v1.35.0"
-       │
-       ▼ BuildVersionContextForUpgrade(targetBundle, currentBundle, bc)
-VersionContext (运行时层)
-  Target["kubernetes-master"] = "v1.35.0"
-  Current["kubernetes-master"] = "v1.34.0"
-       │
-       ▼ BKEClusterReconciler.executeUpgradeDAG()
-DAG 调度器
-  ComponentNode{Name: "kubernetes-master", Version: "v1.35.0"}
-       │
-       ▼ InlineComponentExecutor.ExecuteComponent()
-EnsureMasterUpgrade.Execute()
-       │
-       ▼ desiredKubernetesVersion()
-targetVersion = "v1.35.0"  (从 VersionContext.GetTarget 解析)
-       │
-       ▼ syncLegacyTargetKubernetesVersion(target)
-BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion = "v1.35.0"
-  (同步到 Spec，供 kubeadm 命令和 BKEAgent 读取)
-       │
-       ▼ createUpgradeCommand(masterParams)
-Command CR
-  Phase: UpgradeControlPlane
-  BKEConfig 中包含 KubernetesVersion = "v1.35.0"
-       │
-       ▼ BKEAgent 接收 Command
-KubeadmPlugin.upgradeControlPlane()
-  kubeadm upgrade apply v1.35.0  ← ★ 最终版本来源
-```
+| 版本轴 | 示例 | 存储位置 | 用途 |
+|--------|------|---------|------|
+| **openFuyao 版本** (产品版本) | `v2.6.0`, `v2.7.0` | `ReleaseImage.Spec.Version`、`Cluster.OpenFuyaoVersion`、`ClusterVersion.Spec.DesiredVersion`、`upgrade-ready` 注解 | 标识产品发布版本，用于查找 ReleaseImage CR、驱动多 hop 升级路径 |
+| **K8s 版本** (Kubernetes 版本) | `v1.35.0-of.1`, `v1.36.0` | `ReleaseImage.upgrade.components[kubernetes-master].version`、`Cluster.KubernetesVersion`、`Cluster.Status.KubernetesVersion` | 标识 Kubernetes 组件版本，用于 kubeadm 命令、偏差门控 |
 
-### 7.3 每个 hop 的版本设置
+**独立性说明**：
 
-在最小化多 hop 编排中，每个 hop 的 `kubernetes-master` 版本从**对应 hop 的 ReleaseImage** 中解析：
-
-```txt
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│              每个 hop 的 kubernetes-master 版本设置                              │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                 │
-│  当前状态: BKECluster.Status.KubernetesVersion = "v1.34.0"                      │
-│            (来自 ReleaseImage v2.6.0)                                           │
-│                                                                                 │
-│  hopPath = ["v2.6.5", "v2.7.0"]                                                │
-│                                                                                 │
-│  ┌──────────────────────────────────────────────────────────────────────────┐   │
-│  │ Hop 1 (hopTarget = "v2.6.5")                                            │   │
-│  │                                                                          │   │
-│  │ ClusterVersionReconciler:                                                │   │
-│  │   1. 设置 upgrade-ready = "v2.6.5" 注解                                  │   │
-│  │   2. 设置 skip-kubelet = "true" 注解                                     │   │
-│  │                                                                          │   │
-│  │ BKEClusterReconciler:                                                    │   │
-│  │   1. 读取 upgrade-ready = "v2.6.5"                                      │   │
-│  │   2. resolveUpgradeBundle("v2.6.5")                                     │   │
-│  │      → 从 ReleaseImage v2.6.5 的 OCI Bundle 解析                        │   │
-│  │      → bundle.Components["kubernetes-master"].Spec.Version = "v1.35.0"  │   │
-│  │      → bundle.Components["kubernetes-worker"].Spec.Version = "v1.35.0"  │   │
-│  │      → bundle.Components["etcd"].Spec.Version = "v3.5.19"              │   │
-│  │   3. BuildVersionContextForUpgrade(bundle, currentBundle, bc):          │   │
-│  │      Target["kubernetes-master"] = "v1.35.0"  ← 从 v2.6.5 bundle       │   │
-│  │      Current["kubernetes-master"] = "v1.34.0" ← 从 v2.6.0 bundle 或 Status│
-│  │   4. ★ skipKubelet = true:                                              │   │
-│  │      vc.SetTarget("kubernetes-worker", vc.GetCurrent("kubernetes-worker"))│  │
-│  │      → Target["kubernetes-worker"] = "v1.34.0" (保持不变，跳过)        │   │
-│  │   5. 构建 DAG + ExecuteDAG:                                              │   │
-│  │      → kubernetes-master inline handler 执行                             │   │
-│  │        → EnsureMasterUpgrade.desiredKubernetesVersion() = "v1.35.0"     │   │
-│  │        → kubeadm upgrade apply v1.35.0 (apiserver/cm/scheduler → v1.35)│   │
-│  │        → 跳过 installKubeletCommand (kubelet 保持 v1.34)                │   │
-│  │   6. 完成后:                                                             │   │
-│  │      BKECluster.Status.KubernetesVersion = "v1.35.0" (apiserver 版本)  │   │
-│  │      BKECluster.Status.EtcdVersion = "v3.5.19"                          │   │
-│  │      kubelet 仍为 v1.34 (从 Node.NodeInfo.KubeletVersion 读取)         │   │
-│  └──────────────────────────────────────────────────────────────────────────┘   │
-│                                                                                 │
-│  ┌──────────────────────────────────────────────────────────────────────────┐   │
-│  │ Hop 2 (hopTarget = "v2.7.0")                                            │   │
-│  │                                                                          │   │
-│  │ ClusterVersionReconciler:                                                │   │
-│  │   1. 设置 upgrade-ready = "v2.7.0" 注解                                  │   │
-│  │   2. 设置 skip-kubelet = "true" 注解                                     │   │
-│  │                                                                          │   │
-│  │ BKEClusterReconciler:                                                    │   │
-│  │   1. 读取 upgrade-ready = "v2.7.0"                                      │   │
-│  │   2. resolveUpgradeBundle("v2.7.0")                                     │   │
-│  │      → bundle.Components["kubernetes-master"].Spec.Version = "v1.36.0"  │   │
-│  │   3. BuildVersionContextForUpgrade(bundle, currentBundle, bc):          │   │
-│  │      Current["kubernetes-master"] = "v1.35.0" ← 从 v2.6.5 bundle 或 Status│
-│  │      Target["kubernetes-master"] = "v1.36.0"  ← 从 v2.7.0 bundle       │   │
-│  │   4. ★ skipKubelet = true:                                              │   │
-│  │      Target["kubernetes-worker"] = Current["kubernetes-worker"]          │   │
-│  │      → 保持 v1.34 (跳过)                                                │   │
-│  │   5. ExecuteDAG:                                                         │   │
-│  │      → kubeadm upgrade apply v1.36.0 (apiserver/cm/scheduler → v1.36)  │   │
-│  │      → 跳过 installKubeletCommand (kubelet 保持 v1.34)                  │   │
-│  │   6. 完成后:                                                             │   │
-│  │      BKECluster.Status.KubernetesVersion = "v1.36.0"                    │   │
-│  │      kubelet 仍为 v1.34                                                 │   │
-│  └──────────────────────────────────────────────────────────────────────────┘   │
-│                                                                                 │
-│  ┌──────────────────────────────────────────────────────────────────────────┐   │
-│  │ Kubelet 补充升级                                                          │   │
-│  │                                                                          │   │
-│  │ ClusterVersionReconciler:                                                │   │
-│  │   1. 设置 skip-kubelet = "false" 注解                                    │   │
-│  │   2. 设置 kubelet-catchup-target = "v1.35.0" 注解 (Round 1)             │   │
-│  │                                                                          │   │
-│  │ BKEClusterReconciler:                                                    │   │
-│  │   1. 读取 kubelet-catchup-target = "v1.35.0"                            │   │
-│  │   2. ★ VersionContext 设置:                                              │   │
-│  │      Target["kubernetes-worker"] = "v1.35.0"  ← 从 catchup-target 注解  │   │
-│  │      (而非从 ReleaseImage bundle 的 kubernetes-worker version)           │   │
-│  │   3. ExecuteDAG:                                                         │   │
-│  │      → kubernetes-worker inline handler 执行                             │   │
-│  │        → EnsureWorkerUpgrade.desiredKubernetesVersion() = "v1.35.0"     │   │
-│  │        → kubeadm upgrade node (kubelet → v1.35)                         │   │
-│  │   4. 完成后: kubelet = v1.35                                             │   │
-│  │                                                                          │   │
-│  │ Round 2: kubelet-catchup-target = "v1.36.0"                             │   │
-│  │   → kubeadm upgrade node (kubelet → v1.36)                              │   │
-│  │   → 完成后: kubelet = v1.36, apiserver = v1.36, 偏差 = 0 ✅             │   │
-│  └──────────────────────────────────────────────────────────────────────────┘   │
-│                                                                                 │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
-
-### 7.4 版本信息的关键问题与解决
-
-#### 7.4.1 问题：kubernetes-master 的 version 字段代表什么？
-
-在最小化方案中，`kubernetes-master` 是 inline 黑盒组件，其 `version` 字段代表的是**整个 K8s 版本** (apiserver + cm + scheduler + kubelet + kubectl 共用)，而非单个组件版本：
+1. 一个 openFuyao 版本对应一个 K8s 版本，但两者数值不同 (如 `v2.6.5` → `v1.35.0-of.1`)
+2. openFuyao 版本用于**查找 ReleaseImage** (通过 `Spec.Version` 匹配)
+3. K8s 版本从 ReleaseImage 的**组件条目**中读取 (通过 `components[kubernetes-master].version`)
+4. `kubernetes-master.version` 与 `kubernetes-master.inline.version` 也是独立的：前者是 K8s 版本，后者是 handler 代码版本
 
 ```yaml
-# ReleaseImage v2.6.5
-upgrade:
-  components:
-    - name: kubernetes-master
-      version: v1.35.0     # ← 这是 K8s 版本 (apiserver/cm/scheduler/kubelet/kubectl 都是 v1.35.0)
-      inline:
-        handler: EnsureMasterUpgrade
+# ReleaseImage v2.6.5 示例
+apiVersion: cvo.openfuyao.cn/v1alpha1
+kind: ReleaseImage
+spec:
+  version: "v2.6.5"                    # ← openFuyao 版本 (产品版本)
+  upgrade:
+    components:
+      - name: kubernetes-master
+        version: "v1.35.0-of.1"        # ← K8s 版本 (组件版本，独立于 openFuyao 版本)
+        inline:
+          handler: EnsureMasterUpgrade
+          version: "v1.0.0"            # ← handler 代码版本 (独立于 K8s 版本)
+      - name: kubernetes-worker
+        version: "v1.35.0-of.1"        # ← K8s 版本 (与 kubernetes-master 一致)
+        inline:
+          handler: EnsureWorkerUpgrade
+          version: "v1.0.0"
+      - name: etcd
+        version: "v3.5.19"             # ← etcd 独立版本 (非 K8s 版本)
 ```
 
-这与 KEP-14 的区别：
+### 7.3 EnsureMasterUpgrade 版本解析代码分析
 
-| 维度 | KEP-14 (拆分后) | 最小化方案 (不拆分) |
-|------|----------------|-------------------|
-| `kube-apiserver` version | 独立字段 | 归入 `kubernetes-master.version` |
-| `kube-controller-manager` version | 独立字段 | 归入 `kubernetes-master.version` |
-| `kube-scheduler` version | 独立字段 | 归入 `kubernetes-master.version` |
-| `kubelet` version | 独立字段 | 归入 `kubernetes-worker.version` |
-| `kubectl` version | 独立字段 | 归入 `kubernetes-master.version` / `kubernetes-worker.version` |
-
-#### 7.4.2 问题：偏差门控时 apiserver 版本从哪里获取？
-
-偏差门控需要知道 apiserver 版本。由于 `kubernetes-master` 是黑盒，apiserver 没有独立版本字段，因此通过以下方式间接获取：
+#### 7.3.1 `desiredKubernetesVersion()` — 目标版本解析
 
 ```go
-// resolveApiserverVersion 从 ReleaseImage 解析 apiserver 版本
-// 由于 kubernetes-master 仍是 inline，K8s 版本从 kubernetes-master.version 读取
-// (apiserver/cm/scheduler 共用同一版本)
-func (r *ClusterVersionReconciler) resolveApiserverVersion(
-    ctx context.Context,
-    hopTarget string,
-) string {
-    bundle, err := r.resolveReleaseBundle(ctx, hopTarget)
-    if err != nil {
-        return ""
+// pkg/phaseframe/phases/ensure_master_upgrade.go
+
+func (e *EnsureMasterUpgrade) desiredKubernetesVersion() string {
+    vc := e.GetVersionContext()
+    if vc != nil {
+        // 优先级 1: VersionContext 中 kubernetes-master 的 Target
+        if target := strings.TrimSpace(vc.GetTarget(upgrade.ComponentKubernetesMaster)); target != "" {
+            return target  // ← 来自 ReleaseImage kubernetes-master.version
+        }
+        // 优先级 2: VersionContext 中 kubernetes-worker 的 Target
+        if target := strings.TrimSpace(vc.GetTarget(upgrade.ComponentKubernetesWorker)); target != "" {
+            return target
+        }
+        // 优先级 3: VersionContext 中 kubernetes 的 Target
+        if target := strings.TrimSpace(vc.GetTarget("kubernetes")); target != "" {
+            return target
+        }
+    }
+    // 优先级 4 (deprecated 回退): BKECluster.Spec
+    return e.deprecatedSpecKubernetesVersion()
+}
+```
+
+**版本来源链**：`VC.Target["kubernetes-master"]` ← `BuildVersionContextForUpgrade` ← `ReleaseImage.upgrade.components[kubernetes-master].version`
+
+> **注意**：VC 是权威来源。`BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion` 仅作为 deprecated 回退，但实际在 DAG 执行前 `SyncUpgradeTargetsToClusterSpec()` 已将 VC Target 同步到 Spec，所以两者值一致。
+
+#### 7.3.2 `currentKubernetesVersion()` — 当前版本解析
+
+```go
+func (e *EnsureMasterUpgrade) currentKubernetesVersion() string {
+    vc := e.GetVersionContext()
+    if vc != nil {
+        // 优先级 1-3: VersionContext.Current (来自当前 ReleaseImage bundle 或 BKECluster.Status)
+        if current := vc.GetCurrent(upgrade.ComponentKubernetesMaster); current != "" {
+            return current
+        }
+        // ... kubernetes-worker, kubernetes 回退
+    }
+    // 优先级 4 (deprecated 回退): BKECluster.Status.KubernetesVersion
+    return e.Ctx.BKECluster.Status.KubernetesVersion
+}
+```
+
+**当前版本来源**：
+- 如果有 `currentBundle` (当前版本的 ReleaseImage bundle)：从 bundle 中 `kubernetes-master.version` 解析
+- 如果无 `currentBundle`：从 `BKECluster.Status.KubernetesVersion` 读取 (由 `clusterCurrentForReleaseComponent` 映射)
+
+#### 7.3.3 `BuildVersionContextForUpgrade()` — VC 构建
+
+```go
+// pkg/upgrade/build_release.go
+
+func BuildVersionContextForUpgrade(targetBundle, currentBundle *releasemanifest.Bundle,
+    bc *bkev1beta1.BKECluster) *VersionContext {
+    vc := NewVersionContext()
+
+    // 填充 Target (从目标 ReleaseImage bundle)
+    if targetBundle != nil {
+        FillTargetFromBundle(vc, targetBundle)
+    } else if bc != nil {
+        // legacy 路径: 从 BKECluster.Spec 构建 (无 ReleaseImage 时)
+        BuildVersionContextFromBKECluster(bc)
     }
 
-    // kubernetes-master 的 version 即为 K8s 版本 (= apiserver 版本)
-    for _, comp := range bundle.Release.Spec.Upgrade.Components {
-        if comp.Name == "kubernetes-master" {
-            return comp.Version // 如 "v1.35.0" = apiserver 版本
+    // 填充 Current (从当前 ReleaseImage bundle 或 BKECluster.Status)
+    if currentBundle != nil {
+        FillCurrentFromBundle(vc, currentBundle)
+    } else {
+        fillCurrentFromBKECluster(vc, bc)  // 从 Status 回退
+    }
+}
+
+// FillTargetFromBundle 遍历 ReleaseImage 组件列表填充 VC.Target
+func FillTargetFromBundle(vc *VersionContext, bundle *releasemanifest.Bundle) {
+    applyReleaseComponents(vc.SetTarget, bundle)
+}
+
+// applyReleaseComponents 遍历 Install + Upgrade 组件
+func applyReleaseComponents(set func(name, version string), bundle *releasemanifest.Bundle) {
+    ri := bundle.Release
+    // 先遍历 Install.Components
+    if ri.Spec.Install != nil {
+        for _, c := range ri.Spec.Install.Components {
+            if c.Name != "" && c.Version != "" {
+                set(c.Name, c.Version)  // ← vc.SetTarget("kubernetes-master", "v1.35.0-of.1")
+            }
+        }
+    }
+    // 再遍历 Upgrade.Components (覆盖 Install 中的同名组件)
+    if ri.Spec.Upgrade != nil {
+        for _, c := range ri.Spec.Upgrade.Components {
+            if c.Name != "" && c.Version != "" {
+                set(c.Name, c.Version)
+            }
+        }
+    }
+}
+```
+
+**关键点**：VC.Target 中 `kubernetes-master` 的值 = ReleaseImage 中 `kubernetes-master` 组件条目的 `version` 字段。这个值**不是** openFuyao 版本，**不是** handler 版本，而是 **K8s 版本** (如 `v1.35.0-of.1`)。
+
+#### 7.3.4 `SyncUpgradeTargetsToClusterSpec()` — Spec 同步
+
+```go
+// pkg/phaseframe/spec_sync.go
+
+func (pc *PhaseContext) SyncUpgradeTargetsToClusterSpec() error {
+    vc := pc.VersionContext
+    // 检查 Spec 是否已有 VC Target 值
+    if !upgrade.ClusterSpecHasUpgradeTargets(pc.BKECluster.Spec.ClusterConfig.Cluster, vc) {
+        // 无差异: 仅内存同步
+        upgrade.ApplyVersionContextTargetsToClusterSpec(pc.BKECluster, vc)
+        return nil
+    }
+    // 有差异: API patch 持久化
+    return mergecluster.SyncStatusUntilComplete(pc.Client, pc.BKECluster, func(bc *bkev1beta1.BKECluster) {
+        upgrade.ApplyVersionContextTargetsToClusterSpec(bc, vc)
+    })
+}
+
+// pkg/upgrade/spec_sync.go
+
+func ApplyVersionContextTargetsToClusterSpec(bc *bkev1beta1.BKECluster, vc *upgrade.VersionContext) {
+    cluster := &bc.Spec.ClusterConfig.Cluster
+    if v := vc.GetTarget(ComponentEtcd); v != "" {
+        cluster.EtcdVersion = v
+    }
+    if v := vc.GetTarget(ComponentContainerd); v != "" {
+        cluster.ContainerdVersion = v
+    }
+    // ★ K8s 版本从 VC 写入 Spec
+    if v := KubernetesTargetFromVersionContext(vc); v != "" {
+        cluster.KubernetesVersion = v  // ← "v1.35.0-of.1"
+    }
+}
+
+func KubernetesTargetFromVersionContext(vc *upgrade.VersionContext) string {
+    // 优先级: kubernetes-master → kubernetes-worker → kubernetes
+    for _, name := range []string{
+        ComponentKubernetesMaster,
+        ComponentKubernetesWorker,
+        releaseComponentKubernetes,
+    } {
+        if v := strings.TrimSpace(vc.GetTarget(name)); v != "" {
+            return v
         }
     }
     return ""
 }
 ```
 
-| 版本来源 | 用途 | 说明 |
-|---------|------|------|
-| `ReleaseImage.upgrade.components[kubernetes-master].version` | apiserver 版本 (偏差门控) | kubernetes-master 升级后的 K8s 版本 = apiserver 版本 |
-| `BKECluster.Status.KubernetesVersion` | apiserver 当前版本 (偏差门控) | kubernetes-master 升级完成后写入 |
-| `Node.NodeInfo.KubeletVersion` | kubelet 当前版本 (偏差门控) | 从目标集群 Node 资源读取 |
-| `BKECluster.Status.KubernetesVersion` (升级前) | kubelet 当前版本 (回退) | 升级前 kubelet = apiserver = KubernetesVersion |
+**执行时机**：在 DAG 执行**之前** (步骤⑥)，确保 `EnsureMasterUpgrade.Execute()` 运行时 Spec 和 VC 中的 K8s 版本一致。
 
-#### 7.4.3 问题：kubelet 版本在 VersionContext 中如何设置？
-
-在最小化方案中，kubelet 版本通过 `kubernetes-worker` 组件间接追踪。`skipKubelet` 的实现方式是将 `kubernetes-worker` 的 Target 设为 Current：
+#### 7.3.5 `syncLegacyTargetKubernetesVersion()` — 防御性 Spec 再同步
 
 ```go
-// BKEClusterReconciler.executeUpgradeDAG() 中的 skipKubelet 逻辑
+// pkg/phaseframe/phases/ensure_master_upgrade.go
 
-if skipKubelet {
-    // 将 kubernetes-worker 的 Target 设为 Current → VersionContext.NeedsUpgrade 返回 false
-    // → DAG 中 kubernetes-worker 节点被跳过
-    // → EnsureWorkerUpgrade 不执行 → kubelet 保持不变
-    kubeletCurrent := vc.GetCurrent("kubernetes-worker")
-    if kubeletCurrent != "" {
-        vc.SetTarget("kubernetes-worker", kubeletCurrent)
+func (e *EnsureMasterUpgrade) reconcileMasterUpgrade() (ctrl.Result, error) {
+    targetVersion := e.desiredKubernetesVersion()    // 从 VC 读取
+    currentVersion := e.currentKubernetesVersion()   // 从 VC 读取
+
+    if targetVersion != "" && targetVersion != currentVersion {
+        // ★ 防御性: 确保 Spec.KubernetesVersion == targetVersion
+        if err := e.syncLegacyTargetKubernetesVersion(targetVersion); err != nil {
+            return ctrl.Result{}, err
+        }
+        ret, err := e.rolloutUpgrade()
+        // ...
     }
+}
+
+// syncLegacyTargetKubernetesVersion 确保 Spec 与 VC 一致
+// 供 upgradeMasterNodesWithParams / waitForNodeHealthCheck 等 legacy 代码读取
+func (e *EnsureMasterUpgrade) syncLegacyTargetKubernetesVersion(target string) error {
+    if e.Ctx.BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion != target {
+        // patch Spec
+        return mergecluster.SyncStatusUntilComplete(...)
+    }
+    return nil
 }
 ```
 
-| 场景 | `kubernetes-worker` Target | `kubernetes-worker` Current | VersionContext.NeedsUpgrade | 行为 |
-|------|---------------------------|----------------------------|----------------------------|------|
-| 正常升级 (skipKubelet=false) | v1.36.0 (从 ReleaseImage) | v1.34.0 | true | EnsureWorkerUpgrade 执行 |
-| 延迟升级 (skipKubelet=true) | v1.34.0 (= Current) | v1.34.0 | false | EnsureWorkerUpgrade 跳过 |
-| 补充升级 (catchup-target) | v1.35.0 (从注解) | v1.34.0 | true | EnsureWorkerUpgrade 执行到 v1.35 |
+**为什么需要防御性同步**：`upgradeMasterNodesWithParams()` (line 333)、`updateAddonVersions()` (line 495)、`waitForNodeHealthCheckWithParams()` (line 641) 等 legacy 代码直接读取 `BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion`，而非读取 VC。防御性同步确保这些路径也能获得正确的 K8s 版本。
 
-#### 7.4.4 问题：kubelet 补充升级时版本从哪里获取？
+### 7.4 每 hop 升级时的版本设置
 
-kubelet 补充升级时，目标版本不是从 ReleaseImage bundle 读取 (那会是最终版本 v1.36)，而是从 `kubelet-catchup-target` 注解读取 (中间版本 v1.35)：
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              每 hop 的 K8s 版本设置 (基于代码分析)                                │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  当前状态: BKECluster.Status.KubernetesVersion = "v1.34.0-of.1"                │
+│            BKECluster.Status.OpenFuyaoVersion = "v2.6.0"                       │
+│            upgrade-ready 注解 = (未设置)                                        │
+│                                                                                 │
+│  hopPath = ["v2.6.5", "v2.7.0"] (openFuyao 版本)                              │
+│                                                                                 │
+│  ┌──────────────────────────────────────────────────────────────────────────┐   │
+│  │ Hop 1 (hopTarget = "v2.6.5", openFuyao 版本)                             │   │
+│  │                                                                          │   │
+│  │ ClusterVersionReconciler:                                                │   │
+│  │   设置注解: upgrade-ready = "v2.6.5" (openFuyao 版本)                    │   │
+│  │   设置注解: skip-kubelet = "true"                                        │   │
+│  │                                                                          │   │
+│  │ BKEClusterReconciler.executeUpgradeDAG():                                │   │
+│  │   ① hopTarget = "v2.6.5" (从注解读取 openFuyao 版本)                     │   │
+│  │   ② resolveUpgradeBundle("v2.6.5"):                                      │   │
+│  │      → 查找 ReleaseImage CR where Spec.Version == "v2.6.5"              │   │
+│  │      → 解析 OCI Bundle                                                   │   │
+│  │      → bundle.Components["kubernetes-master"].Spec.Version = "v1.35.0-of.1"│  │
+│  │   ③ BuildVersionContextForUpgrade(bundle, currentBundle, bc):           │   │
+│  │      VC.Target["kubernetes-master"] = "v1.35.0-of.1" (K8s 版本)         │   │
+│  │      VC.Current["kubernetes-master"] = "v1.34.0-of.1" (当前 K8s 版本)   │   │
+│  │   ④ SyncUpgradeTargetsToClusterSpec():                                   │   │
+│  │      BKECluster.Spec.KubernetesVersion = "v1.35.0-of.1"                │   │
+│  │   ⑤ patchClusterOpenFuyaoVersionSpecBeforeDAG("v2.6.5"):                │   │
+│  │      BKECluster.Spec.OpenFuyaoVersion = "v2.6.5"                        │   │
+│  │   ⑥ ★ skipKubelet=true:                                                 │   │
+│  │      VC.SetTarget("kubernetes-worker", VC.GetCurrent("kubernetes-worker"))│  │
+│  │      → Target["kubernetes-worker"] = "v1.34.0-of.1" (保持不变, 跳过)   │   │
+│  │   ⑦ ExecuteDAG → EnsureMasterUpgrade.Execute():                          │   │
+│  │      desiredKubernetesVersion() = VC.Target["kubernetes-master"]        │   │
+│  │                                   = "v1.35.0-of.1" ← K8s 版本           │   │
+│  │      currentKubernetesVersion() = VC.Current["kubernetes-master"]        │   │
+│  │                                    = "v1.34.0-of.1"                      │   │
+│  │      targetVersion != currentVersion → 执行升级                          │   │
+│  │      kubeadm upgrade apply v1.35.0-of.1                                  │   │
+│  │      (apiserver/cm/scheduler manifest → v1.35, kubelet 跳过)            │   │
+│  │   ⑧ 升级完成后:                                                          │   │
+│  │      BKECluster.Status.KubernetesVersion = "v1.35.0-of.1" (apiserver)   │   │
+│  │      BKECluster.Status.OpenFuyaoVersion = "v2.6.5"                      │   │
+│  │      kubelet = v1.34 (保持不变)                                         │   │
+│  └──────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+│  ┌──────────────────────────────────────────────────────────────────────────┐   │
+│  │ Hop 2 (hopTarget = "v2.7.0", openFuyao 版本)                             │   │
+│  │                                                                          │   │
+│  │ ClusterVersionReconciler:                                                │   │
+│  │   设置注解: upgrade-ready = "v2.7.0"                                     │   │
+│  │   设置注解: skip-kubelet = "true"                                        │   │
+│  │                                                                          │   │
+│  │ BKEClusterReconciler.executeUpgradeDAG():                                │   │
+│  │   ① hopTarget = "v2.7.0"                                                │   │
+│  │   ② resolveUpgradeBundle("v2.7.0"):                                      │   │
+│  │      → bundle.Components["kubernetes-master"].Spec.Version = "v1.36.0-of.1"│  │
+│  │   ③ BuildVersionContextForUpgrade:                                       │   │
+│  │      VC.Target["kubernetes-master"] = "v1.36.0-of.1"                    │   │
+│  │      VC.Current["kubernetes-master"] = "v1.35.0-of.1" ← 从 Status 或 v2.6.5 bundle│
+│  │   ④ SyncUpgradeTargetsToClusterSpec:                                     │   │
+│  │      BKECluster.Spec.KubernetesVersion = "v1.36.0-of.1"                │   │
+│  │   ⑤ patchClusterOpenFuyaoVersionSpecBeforeDAG("v2.7.0"):                 │   │
+│  │      BKECluster.Spec.OpenFuyaoVersion = "v2.7.0"                        │   │
+│  │   ⑥ ★ skipKubelet=true:                                                 │   │
+│  │      VC.Target["kubernetes-worker"] = VC.Current["kubernetes-worker"]    │   │
+│  │      → "v1.34.0-of.1" (保持不变)                                        │   │
+│  │   ⑦ ExecuteDAG → EnsureMasterUpgrade:                                    │   │
+│  │      kubeadm upgrade apply v1.36.0-of.1                                  │   │
+│  │      (apiserver/cm/scheduler → v1.36, kubelet 跳过)                     │   │
+│  │   ⑧ 升级完成后:                                                          │   │
+│  │      BKECluster.Status.KubernetesVersion = "v1.36.0-of.1"              │   │
+│  │      kubelet = v1.34 (仍保持不变, 偏差=2)                               │   │
+│  └──────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+│  ┌──────────────────────────────────────────────────────────────────────────┐   │
+│  │ Kubelet 补充升级                                                           │   │
+│  │                                                                          │   │
+│  │ ClusterVersionReconciler:                                                │   │
+│  │   设置注解: skip-kubelet = "false"                                        │   │
+│  │   设置注解: kubelet-catchup-target = "v1.35.0-of.1" (Round 1)            │   │
+│  │                                                                          │   │
+│  │ BKEClusterReconciler.executeUpgradeDAG():                                │   │
+│  │   ① hopTarget = 当前 openFuyao 版本 (从 Status 读取)                      │   │
+│  │   ② resolveUpgradeBundle(hopTarget) → 当前 ReleaseImage bundle           │   │
+│  │   ③ BuildVersionContextForUpgrade:                                       │   │
+│  │      VC.Target["kubernetes-master"] = "v1.36.0-of.1" (当前 ReleaseImage)│   │
+│  │      VC.Target["kubernetes-worker"] = "v1.36.0-of.1" (当前 ReleaseImage)│   │
+│  │   ⑥ ★ skipKubelet=false, 但有 catchup-target 注解:                       │   │
+│  │      VC.SetTarget("kubernetes-worker", "v1.35.0-of.1")                   │   │
+│  │      ← 从 kubelet-catchup-target 注解读取 (覆盖 ReleaseImage 中的版本)    │   │
+│  │      VC.Target["kubernetes-master"] = "v1.34.0-of.1" (设为 Current, 跳过)│   │
+│  │      ← kubernetes-master 不在补充升级范围                                │   │
+│  │   ⑦ ExecuteDAG → EnsureWorkerUpgrade:                                    │   │
+│  │      desiredKubernetesVersion() = kubelet-catchup-target = "v1.35.0-of.1"│   │
+│  │      kubeadm upgrade node (kubelet → v1.35)                             │   │
+│  │   ⑧ Round 2: kubelet-catchup-target = "v1.36.0-of.1"                     │   │
+│  │      kubeadm upgrade node (kubelet → v1.36)                              │   │
+│  └──────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 7.5 偏差门控时的版本来源
+
+偏差门控需要获取 apiserver 版本和 kubelet 版本。由于 `kubernetes-master` 是 inline 黑盒，没有独立的 apiserver 字段，版本来源如下：
+
+| 版本 | 来源 | 代码路径 | 说明 |
+|------|------|---------|------|
+| apiserver 版本 (升级后) | `BKECluster.Status.KubernetesVersion` | `EnsureMasterUpgrade` 执行完成后写入 | kubernetes-master 升级后 Status.KubernetesVersion = apiserver 版本 (因为 apiserver/cm/scheduler 共用 K8s 版本) |
+| apiserver 版本 (hop 前) | `ReleaseImage.upgrade.components[kubernetes-master].version` | `resolveApiserverVersion()` 从 ReleaseImage 解析 | kubernetes-master 组件的 version 字段 = K8s 版本 |
+| kubelet 版本 | `Node.NodeInfo.KubeletVersion` | 从目标集群 Node 资源读取 | 逐节点读取实际 kubelet 版本 |
+| kubelet 版本 (回退) | `BKECluster.Status.KubernetesVersion` (升级前值) | `clusterCurrentForReleaseComponent` 映射 | 升级前 kubelet = apiserver = KubernetesVersion |
 
 ```go
-// EnsureWorkerUpgrade 中读取 catchup-target 注解
-
-func (e *EnsureWorkerUpgrade) desiredKubernetesVersion() string {
-    // ★ 新增: 优先从 kubelet-catchup-target 注解读取
-    if catchupTarget := annotation.GetAnnotation(bkeCluster,
-        annotation.KubeletCatchupTargetAnnotationKey); catchupTarget != "" {
-        return catchupTarget // 如 "v1.35.0" (中间版本)
+// resolveApiserverVersion 从 ReleaseImage 解析 apiserver (K8s) 版本
+// 注意: 不是直接读取 "apiserver 版本"，而是读取 kubernetes-master 组件的 version 字段
+// (因为 kubernetes-master 是 inline 黑盒，apiserver/cm/scheduler 共用 K8s 版本)
+func (r *ClusterVersionReconciler) resolveApiserverVersion(
+    ctx context.Context,
+    hopTarget string, // openFuyao 版本 (如 "v2.6.5")
+) string {
+    // ① 通过 openFuyao 版本查找 ReleaseImage
+    bundle, err := r.resolveReleaseBundle(ctx, hopTarget)
+    if err != nil {
+        return ""
     }
 
-    // 现有逻辑: 从 VersionContext 读取 (最终版本)
-    vc := e.GetVersionContext()
-    if vc != nil {
-        if target := vc.GetTarget(upgrade.ComponentKubernetesWorker); target != "" {
-            return target
-        }
-        if target := vc.GetTarget(upgrade.ComponentKubernetesMaster); target != "" {
-            return target
+    // ② 从 ReleaseImage 组件列表中查找 kubernetes-master 的 version
+    //    这个 version 是 K8s 版本 (如 "v1.35.0-of.1")，不是 openFuyao 版本
+    for _, comp := range bundle.Release.Spec.Upgrade.Components {
+        if comp.Name == "kubernetes-master" {
+            return comp.Version // = K8s 版本 = apiserver 版本
         }
     }
-    return e.deprecatedSpecKubernetesVersion()
+    // 回退: 从 Install.Components 查找
+    for _, comp := range bundle.Release.Spec.Install.Components {
+        if comp.Name == "kubernetes-master" {
+            return comp.Version
+        }
+    }
+    return ""
 }
 ```
 
-### 7.5 版本信息流转总结
+> **注意**：`resolveApiserverVersion()` 返回的是 ReleaseImage 中 `kubernetes-master` 组件的 `version` 字段值。这个值**声明**的是 K8s 版本 (如 `v1.35.0-of.1`)，但实际安装到节点上的组件版本由 kubeadm 下载的制品决定。在 ReleaseImage 构建正确的前提下，声明版本与实际安装版本一致。
+
+### 7.6 版本信息流转总结
 
 ```txt
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │              版本信息流转总结                                                     │
 ├─────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                 │
-│  版本来源:                                                                       │
-│  ├── ReleaseImage CR (声明层)                                                   │
-│  │   ├── kubernetes-master.version = K8s 版本 (apiserver/cm/scheduler/kubelet/kubectl)│
-│  │   ├── kubernetes-worker.version = K8s 版本 (kubelet/kubectl)               │
-│  │   └── etcd.version = etcd 独立版本                                          │
-│  │                                                                              │
-│  ├── VersionContext (运行时层)                                                  │
-│  │   ├── Target["kubernetes-master"] = 从目标 ReleaseImage bundle 解析        │
-│  │   ├── Current["kubernetes-master"] = 从当前 ReleaseImage bundle 或 Status 解析│
-│  │   ├── Target["kubernetes-worker"] = 从目标 ReleaseImage bundle 或注解解析  │
-│  │   └── Current["kubernetes-worker"] = BKECluster.Status.KubernetesVersion   │
-│  │                                                                              │
-│  └── 注解 (控制层) ★ 新增                                                       │
-│      ├── upgrade-ready = hopTarget (openFuyao 版本)                            │
-│      ├── skip-kubelet = "true"/"false" (控制 kubelet 跳过)                    │
-│      └── kubelet-catchup-target = 中间版本 (补充升级目标)                      │
+│  两个独立版本轴:                                                                 │
+│  ├── openFuyao 版本 (产品版本): v2.6.0, v2.6.5, v2.7.0                         │
+│  │   用途: 查找 ReleaseImage CR, 驱动多 hop 路径, 写入 upgrade-ready 注解      │
+│  │   来源: ClusterVersion.Spec.DesiredVersion → UpgradePath → hopPath          │
+│  │                                                                             │
+│  └── K8s 版本 (组件版本): v1.34.0-of.1, v1.35.0-of.1, v1.36.0-of.1           │
+│      用途: kubeadm 命令参数, 偏差门控, 版本比较                                 │
+│      来源: ReleaseImage.upgrade.components[kubernetes-master].version           │
+│      → BuildVersionContextForUpgrade → VC.Target["kubernetes-master"]          │
+│      → SyncUpgradeTargetsToClusterSpec → BKECluster.Spec.KubernetesVersion     │
+│      → EnsureMasterUpgrade.desiredKubernetesVersion() → kubeadm upgrade apply │
 │                                                                                 │
-│  每 hop 版本设置:                                                                │
-│  ├── Hop 1: Target["kubernetes-master"] = ReleaseImage v2.6.5 的 v1.35.0      │
-│  │          Target["kubernetes-worker"] = Current (跳过)                       │
-│  │          → kubeadm upgrade apply v1.35.0 (apiserver→v1.35, kubelet 保持)  │
-│  │                                                                              │
-│  ├── Hop 2: Target["kubernetes-master"] = ReleaseImage v2.7.0 的 v1.36.0      │
-│  │          Target["kubernetes-worker"] = Current (跳过)                       │
-│  │          → kubeadm upgrade apply v1.36.0 (apiserver→v1.36, kubelet 保持)  │
-│  │                                                                              │
-│  └── 补充:  Target["kubernetes-worker"] = catchup-target 注解的 v1.35.0       │
-│            → kubeadm upgrade node v1.35.0 (kubelet→v1.35)                    │
-│            → 再: catchup-target = v1.36.0 → kubeadm upgrade node v1.36.0    │
+│  独立的 handler 版本:                                                             │
+│  └── inline handler 版本: v1.0.0                                               │
+│      用途: 标识 EnsureMasterUpgrade 代码版本 (与 K8s 版本无关)                 │
+│      来源: ReleaseImage.upgrade.components[kubernetes-master].inline.version   │
 │                                                                                 │
-│  偏差门控版本来源:                                                               │
-│  ├── apiserver 版本 = ReleaseImage.upgrade.components[kubernetes-master].version│
-│  │   (或 BKECluster.Status.KubernetesVersion 升级后的值)                       │
-│  └── kubelet 版本 = Node.NodeInfo.KubeletVersion                               │
-│      (或 BKECluster.Status.KubernetesVersion 升级前的值)                       │
+│  实际安装版本:                                                                    │
+│  └── kubeadm 下载的制品版本 (由 ReleaseImage 中的镜像引用决定)                   │
+│      用途: 节点上实际运行的组件版本 (apiserver/cm/scheduler/kubelet)            │
+│      来源: ReleaseImage 中的 image-references → OCI 镜像 tag → 实际二进制版本  │
+│      验证: Node.Status.NodeInfo.KubeletVersion (kubelet)                      │
+│           BKECluster.Status.KubernetesVersion (apiserver, 升级后写入)          │
+│                                                                                 │
+│  声明版本 vs 实际版本:                                                            │
+│  ├── ReleaseImage 声明 kubernetes-master.version = "v1.35.0-of.1" (声明)     │
+│  ├── kubeadm 下载制品并安装 (实际)                                              │
+│  └── BKECluster.Status.KubernetesVersion = "v1.35.0-of.1" (升级后写入)        │
+│      → 在 ReleaseImage 构建正确的前提下，声明版本 = 实际版本                     │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
