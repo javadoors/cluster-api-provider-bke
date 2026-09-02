@@ -1158,6 +1158,275 @@ func (r *ClusterVersionReconciler) resolveApiserverVersion(
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
+### 7.7 Static Pod manifest 镜像 tag 来源分析
+
+#### 7.7.1 BKE 不调用 kubeadm 生成 manifest — 直接渲染 Go 模板
+
+基于 `KubeadmPlugin.upgradeControlPlane()` 的实际代码分析，**BKE 不调用 `kubeadm` 命令来生成 Static Pod manifest，而是 BKE 自己渲染内嵌的 Go 模板直接写入 manifest YAML 文件**。
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              Static Pod manifest 生成机制 (基于代码分析)                          │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  upgradeControlPlane() 内部流程:                                                 │
+│                                                                                 │
+│  for _, component := range GetControlPlaneComponents() {                        │
+│      // ["kube-apiserver", "kube-controller-manager", "kube-scheduler"]        │
+│                                                                                 │
+│      needUpgradeComponent(component):                                           │
+│        ├── 读取当前运行 Pod 的 image (从 mirror Pod spec.containers[0].image)   │
+│        ├── 提取当前 image tag                                                    │
+│        ├── 比较: 当前 tag == BkeConfig.Cluster.KubernetesVersion?               │
+│        └── 不匹配 → 需要升级                                                    │
+│                                                                                 │
+│      upgradeControlPlaneManifestCommand(component):                             │
+│        ├── 委托给 manifestsPlugin.Execute(scope=component)                      │
+│        │   └── GenerateManifestYaml(components, bootScope):                    │
+│        │       ├── 读取内嵌 Go 模板:                                             │
+│        │       │   tmpl/k8s/kube-apiserver.yaml.tmpl                            │
+│        │       │   tmpl/k8s/kube-controller-manager.yaml.tmpl                   │
+│        │       │   tmpl/k8s/kube-scheduler.yaml.tmpl                            │
+│        │       ├── 渲染模板 (text/template):                                     │
+│        │       │   image: {{ . | imageRepo }}{{ . | imageInfo }}                │
+│        │       │        │                │                                       │
+│        │       │        │                └──→ imageName:tag                     │
+│        │       │        └──→ registry/repository/                               │
+│        │       ├── 写入 /etc/kubernetes/manifests/<component>.yaml              │
+│        │       └── systemctl restart kubelet (触发 Kubelet 重建 Pod)           │
+│        │                                                                        │
+│      waitComponentReady(component, beforeHash):                                 │
+│        ├── 轮询 mirror Pod 的 kubernetes.io/config.hash 注解                    │
+│        ├── Hash 变化 → Kubelet 已检测到 manifest 变更并重建 Pod                 │
+│        └── 等待 Pod Running + Ready                                             │
+│  }                                                                              │
+│                                                                                 │
+│  ★ kubeadm 二进制未参与 manifest 生成                                            │
+│  ★ manifest 中的 image tag 来自 Go 模板渲染，来源是 BkeConfig                   │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 7.7.2 镜像 tag 的精确来源
+
+manifest 模板中的 image 行为 `image: {{ . | imageRepo }}{{ . | imageInfo }}`，由两个模板函数拼接而成：
+
+**`imageRepo` — 镜像仓库前缀 (含尾部 `/`)**
+
+```go
+// utils/bkeagent/mfutil/render.go — GlobalFuncMap()
+
+"imageRepo": func(cfg *BootScope) string {
+    bkeCfg := bkeinit.BkeConfig(*cfg.BkeConfig)
+    return bkeCfg.ImageFuyaoRepo()  // ← 从 BKECluster.Spec.ClusterConfig.Cluster.ImageRepo 解析
+},
+```
+
+```go
+// common/cluster/initialize/config.go
+
+func (bc *BkeConfig) ImageFuyaoRepo() string {
+    if bc.Cluster.ImageRepo.Prefix == "" {
+        return fmt.Sprintf("%s/", DefaultFuyaoImageRepo)  // "cr.openfuyao.cn/openfuyao/"
+    }
+    address := validation.GetImageRepoAddress(bc.Cluster.ImageRepo)
+    return fmt.Sprintf("%s/%s/", address, bc.Cluster.ImageRepo.Prefix)
+}
+```
+
+**`imageInfo` — 镜像名:tag (每个组件独立实现)**
+
+```go
+// kube-apiserver 的 imageInfo
+"imageInfo": func(cfg *BootScope) string {
+    k8sVersion := strings.TrimPrefix(cfg.BkeConfig.Cluster.KubernetesVersion, "v")
+    return fmt.Sprintf("%s:%s", bkeinit.DefaultAPIServerImageName, k8sVersion)
+    // → "kube-apiserver:1.35.0-of.1"
+},
+
+// kube-controller-manager 的 imageInfo
+"imageInfo": func(cfg *BootScope) string {
+    k8sVersion := strings.TrimPrefix(cfg.BkeConfig.Cluster.KubernetesVersion, "v")
+    return fmt.Sprintf("%s:%s", bkeinit.DefaultControllerManagerImageName, k8sVersion)
+    // → "kube-controller-manager:1.35.0-of.1"
+},
+
+// kube-scheduler 的 imageInfo
+"imageInfo": func(cfg *BootScope) string {
+    k8sVersion := strings.TrimPrefix(cfg.BkeConfig.Cluster.KubernetesVersion, "v")
+    return fmt.Sprintf("%s:%s", bkeinit.DefaultSchedulerImageName, k8sVersion)
+    // → "kube-scheduler:1.35.0-of.1"
+},
+```
+
+**最终镜像格式**：
+
+```
+{ImageFuyaoRepo()}/{DefaultImageName}:{KubernetesVersion 去除 "v" 前缀}
+
+示例 (KubernetesVersion = "v1.35.0-of.1"):
+  cr.openfuyao.cn/openfuyao/kube-apiserver:1.35.0-of.1
+  cr.openfuyao.cn/openfuyao/kube-controller-manager:1.35.0-of.1
+  cr.openfuyao.cn/openfuyao/kube-scheduler:1.35.0-of.1
+```
+
+**镜像名常量**：
+
+```go
+// common/cluster/initialize/defaults.go
+
+DefaultAPIServerImageName         = "kube-apiserver"
+DefaultControllerManagerImageName = "kube-controller-manager"
+DefaultSchedulerImageName         = "kube-scheduler"
+DefaultEtcdImageName              = "etcd"
+```
+
+#### 7.7.3 BkeConfig 在 BKEAgent 端的获取
+
+BKEAgent 执行升级命令时，通过 API 读取管理集群上的 BKECluster CR 获取 BkeConfig：
+
+```go
+// pkg/job/builtin/kubeadm/kubeadm.go — getBKEConfig()
+
+func (k *KubeadmPlugin) getBKEConfig(bkeConfigNS string) error {
+    bkeCluster, err := plugin.GetBKECluster(bkeConfigNS)          // 读取 BKECluster CR
+    config, err := plugin.GetBkeConfigFromBkeCluster(bkeCluster)  // = bkeCluster.Spec.ClusterConfig
+    k.boot.BkeConfig = config                                     // 存入 BootScope
+    return nil
+}
+
+// pkg/job/builtin/plugin/interface.go
+
+func GetBkeConfigFromBkeCluster(bkeCluster *bkev1beta1.BKECluster) (*bkev1beta1.BKEConfig, error) {
+    bkeConfig := bkeCluster.Spec.ClusterConfig  // ← 直接取 Spec.ClusterConfig
+    return bkeConfig, nil
+}
+```
+
+**因此**：`BkeConfig.Cluster.KubernetesVersion` = `BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion` (管理集群侧已由 `SyncUpgradeTargetsToClusterSpec()` 从 VersionContext 同步)。
+
+#### 7.7.4 kubelet/kubectl 二进制版本来源
+
+kubelet 和 kubectl 的二进制下载也使用**同一个** `BkeConfig.Cluster.KubernetesVersion` 字段：
+
+```go
+// pkg/job/builtin/kubeadm/command.go — installKubeletCommand()
+
+func (k *KubeadmPlugin) installKubeletCommand(immutable bool) error {
+    cfg := bkeinit.BkeConfig(*k.boot.BkeConfig)
+    k8sVersion := cfg.Cluster.KubernetesVersion           // ← 同一个字段
+    kubeletUrl := clusterutil.BuildYumRepoDownloadBaseURL(cfg)
+    kubelet := fmt.Sprintf("kubelet-%s-%s", k8sVersion, hostArch)
+    // → "kubelet-v1.35.0-of.1-amd64"
+    kubeletUrl = fmt.Sprintf("%s/%s", kubeletUrl, kubelet)
+    // 下载 URL: http://<HTTPRepo>/kubelet-v1.35.0-of.1-amd64
+}
+
+// installKubectlCommand() 同理:
+func (k *KubeadmPlugin) installKubectlCommand() error {
+    cfg := bkeinit.BkeConfig(*k.boot.BkeConfig)
+    k8sVersion := cfg.Cluster.KubernetesVersion           // ← 同一个字段
+    kubectl := fmt.Sprintf("kubectl-%s-%s", k8sVersion, hostArch)
+    // → "kubectl-v1.35.0-of.1-amd64"
+}
+```
+
+**下载源**：`BkeConfig.Cluster.HTTPRepo` (HTTP 仓库地址)，通过 `BuildYumRepoDownloadBaseURL(cfg)` 构建基础 URL。
+
+#### 7.7.5 etcd manifest 的镜像 tag 来源 (对比)
+
+etcd 的 image tag 解析有独立的优先级链 (与 K8s 组件不同)：
+
+```go
+// utils/bkeagent/mfutil/render.go — etcdImageTagFromBootScope()
+
+func etcdImageTagFromBootScope(cfg *BootScope) string {
+    // 优先级 1: 命令参数传入的 etcdVersion (声明式升级路径)
+    if v, ok := cfg.Extra["etcdVersion"]; ok {
+        return strings.TrimPrefix(v, "v")
+    }
+    // 优先级 2: BkeConfig.Cluster.EtcdVersion
+    if v := strings.TrimSpace(cfg.BkeConfig.Cluster.EtcdVersion); v != "" {
+        return strings.TrimPrefix(v, "v")
+    }
+    // 优先级 3: 内嵌 versions.yaml 中的默认值
+    return versions.EtcdImageTag()
+}
+```
+
+> etcd 版本与 K8s 版本独立 (如 K8s v1.35.0-of.1 对应 etcd v3.6.7-of.1)，不共用 `KubernetesVersion` 字段。
+
+#### 7.7.6 完整镜像 tag 来源链路
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              Static Pod manifest 镜像 tag 完整来源链路                            │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  管理集群:                                                                       │
+│  ReleaseImage.upgrade.components[kubernetes-master].version = "v1.35.0-of.1"   │
+│     │                                                                           │
+│     ▼ BuildVersionContextForUpgrade                                            │
+│  VersionContext.Target["kubernetes-master"] = "v1.35.0-of.1"                  │
+│     │                                                                           │
+│     ▼ SyncUpgradeTargetsToClusterSpec                                          │
+│  BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion = "v1.35.0-of.1"    │
+│     │                                                                           │
+│     ▼ syncLegacyTargetKubernetesVersion (防御性)                               │
+│  (确保 Spec 与 VC 一致，供 legacy 代码读取)                                     │
+│     │                                                                           │
+│     ▼ Command CR 创建 (携带 BKECluster namespace/name)                          │
+│                                                                                 │
+│  BKEAgent:                                                                      │
+│  getBKEConfig() → 读取 BKECluster CR → bkeCluster.Spec.ClusterConfig           │
+│     │                                                                           │
+│     ▼ k.boot.BkeConfig.Cluster.KubernetesVersion = "v1.35.0-of.1"             │
+│     │                                                                           │
+│     ▼ GenerateManifestYaml → 渲染 Go 模板                                      │
+│  image: {{ . | imageRepo }}{{ . | imageInfo }}                                 │
+│     │                          │                                                │
+│     │                          └── strings.TrimPrefix(KubernetesVersion, "v")  │
+│     │                              → "1.35.0-of.1"                             │
+│     │                              + DefaultAPIServerImageName                  │
+│     │                              → "kube-apiserver:1.35.0-of.1"              │
+│     │                                                                           │
+│     └── ImageFuyaoRepo()                                                       │
+│         = BKECluster.Spec.ClusterConfig.Cluster.ImageRepo                      │
+│         → "cr.openfuyao.cn/openfuyao/"                                         │
+│                                                                                 │
+│     ▼ 拼接                                                                      │
+│  最终 image: cr.openfuyao.cn/openfuyao/kube-apiserver:1.35.0-of.1             │
+│                                                                                 │
+│     ▼ 写入 /etc/kubernetes/manifests/kube-apiserver.yaml                       │
+│     ▼ systemctl restart kubelet                                                │
+│     ▼ Kubelet 检测 manifest 变化 → 重建 Pod (新镜像)                            │
+│     ▼ waitComponentReady → 等待 Pod Running                                    │
+│                                                                                 │
+│  同理:                                                                          │
+│  kube-controller-manager → cr.openfuyao.cn/openfuyao/kube-controller-manager:1.35.0-of.1│
+│  kube-scheduler         → cr.openfuyao.cn/openfuyao/kube-scheduler:1.35.0-of.1│
+│  etcd                   → cr.openfuyao.cn/openfuyao/etcd:3.6.7-of.1 (独立版本)│
+│  kubelet 二进制          → kubelet-v1.35.0-of.1-amd64 (从 HTTPRepo 下载)      │
+│  kubectl 二进制          → kubectl-v1.35.0-of.1-amd64 (从 HTTPRepo 下载)      │
+│                                                                                 │
+│  ★ 所有 K8s 组件的版本 (manifest image tag + 二进制) 都来自同一个字段:          │
+│    BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion                     │
+│    该字段在 DAG 执行前已由 SyncUpgradeTargetsToClusterSpec 从 VersionContext   │
+│    (来源于 ReleaseImage kubernetes-master.version) 同步。                      │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 7.7.7 对最小化方案的影响
+
+| 影响项 | 说明 |
+|--------|------|
+| **skipKubelet 的实现可行性** | ✅ `installKubeletCommand()` 使用 `KubernetesVersion` 下载 kubelet 二进制，跳过此函数即可阻止 kubelet 升级。manifest 中的 image tag 不受影响 (apiserver/cm/scheduler manifest 独立渲染) |
+| **偏差门控的 apiserver 版本来源** | ✅ apiserver 的实际 image tag = `BkeConfig.Cluster.KubernetesVersion` (去除 v 前缀)，与 `BKECluster.Status.KubernetesVersion` 一致 (升级后写入) |
+| **kubelet 版本来源** | ✅ kubelet 二进制版本 = `BkeConfig.Cluster.KubernetesVersion`，跳过后保持旧版本。实际运行版本可从 `Node.NodeInfo.KubeletVersion` 读取 |
+| **不需要修改 manifest 生成逻辑** | ✅ manifest 渲染逻辑不需要修改 — 只需跳过 `installKubeletCommand()` 即可。apiserver/cm/scheduler 的 manifest 仍按 `KubernetesVersion` 正常渲染 |
+| **catchup-target 注解的影响** | ✅ kubelet 补充升级时，`kubelet-catchup-target` 注解覆盖 `BKECluster.Spec.KubernetesVersion`，使 `installKubeletCommand()` 下载正确中间版本的 kubelet 二进制 |
+
 ---
 
 ## 8. kubeadm upgrade apply 跳过 kubelet 的安全性分析
