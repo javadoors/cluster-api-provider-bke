@@ -79,6 +79,46 @@
 
 ## 4. ReleaseImageInstallComponent 结构扩展
 
+### 4.0 设计思路
+
+当前 ReleaseImage 的安装组件和升级组件结构**不对称**：升级组件有 `inline.handler` 声明执行方式，安装组件仅有 `{name, version}`。这导致安装流程无法从 ReleaseImage 获取执行元数据，只能依赖硬编码的 `DeployPhases` 列表。
+
+**核心设计思路**：将安装组件结构向升级组件对齐，使安装也能从 ReleaseImage 声明执行方式 (inline handler 或 manifest 路径)，从而让安装流程可以像升级一样由 DAG 驱动。
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              结构扩展设计思路                                                     │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  现状 (不对称):                                                                  │
+│  ReleaseImage:                                                                  │
+│    install.components:  [{name, version}]              ← 无执行元数据           │
+│    upgrade.components:  [{name, version, inline}]      ← 有执行元数据           │
+│                                                                                 │
+│  安装流程:                                                                       │
+│    DeployPhases (硬编码 Phase 列表) → 逐个执行                                    │
+│    不消费 ReleaseImage.install.components                                         │
+│    版本从 BKECluster.Spec 读取                                                    │
+│                                                                                 │
+│  目标 (对称):                                                                    │
+│  ReleaseImage:                                                                  │
+│    install.components:  [{name, version, inline}]      ← 有执行元数据 ★         │
+│    upgrade.components:  [{name, version, inline}]      ← 有执行元数据           │
+│                                                                                 │
+│  安装流程:                                                                       │
+│    ReleaseImage.install.components → BuildInstallDAG → DAG 执行                 │
+│    从 ReleaseImage 读取版本 + 执行方式                                            │
+│    复用升级的 Scheduler/ExecutorRegistry/VersionContext                           │
+│                                                                                 │
+│  设计原则:                                                                       │
+│  1. 结构对称 — install 和 upgrade components 使用相同的结构                      │
+│  2. 向后兼容 — 旧格式 {name, version} (无 inline) 仍支持，走 Legacy PhaseFlow   │
+│  3. 复用升级框架 — 不新建调度器/执行器，安装 DAG 复用 Scheduler                   │
+│  4. 声明式驱动 — 安装流程由 ReleaseImage 声明驱动，而非硬编码 Phase 列表         │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
 ### 4.1 当前结构（不对称）
 
 ```go
@@ -566,6 +606,49 @@ func registerInstallHandlers() {
 
 ## 6. 安装 DAG 构建设计
 
+### 6.0 设计思路
+
+安装 DAG 构建的核心思路是**复用升级 DAG 的构建逻辑**，通过 `DecisionInstall` 区分安装与升级场景。与升级的关键差异在于 VersionContext：安装时 Current 全部为空 (无已安装组件)，Target 来自 ReleaseImage；升级时 Current 来自当前 ReleaseImage bundle，Target 来自目标 ReleaseImage bundle。
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              安装 DAG 构建设计思路                                                │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  升级 DAG 构建 (现有):                                                          │
+│    BuildVersionContextForUpgrade(targetBundle, currentBundle, bc)               │
+│      → Current 有值 (来自 currentBundle 或 Status)                              │
+│      → Target 有值 (来自 targetBundle)                                           │
+│      → Decide: current != target → DecisionUpgrade                              │
+│    BuildUpgradeDAGFromBundle(bundle, resolver)                                  │
+│      → 遍历 upgrade.components 构建 DAG                                          │
+│                                                                                 │
+│  安装 DAG构建 (新增):                                                           │
+│    BuildVersionContextForInstall(targetBundle)                                   │
+│      → Current 全空 (全新安装，无已安装组件)                                    │
+│      → Target 有值 (来自 install.components + upgrade.components)              │
+│      → Decide: current="" + target!="" → DecisionInstall ★                      │
+│    BuildInstallDAGFromBundle(bundle, resolver)                                   │
+│      → 遍历 install.components 构建 DAG (复用 BuildUpgradeDAG 逻辑)             │
+│      → InstallComponent 转 UpgradeComponent 结构 (适配现有拓扑构建器)           │
+│                                                                                 │
+│  复用点:                                                                         │
+│  ① BuildUpgradeDAG — 拓扑排序 + 依赖解析逻辑完全复用                            │
+│  ② Scheduler.ExecuteDAG — 并行执行 + 状态更新逻辑完全复用                        │
+│  ③ ExecutorRegistry — inline/yaml 执行器分发逻辑完全复用                        │
+│  ④ ComponentFactory — handler 注册和解析逻辑完全复用                            │
+│  ⑤ DeclarativeUpgradeStatus — 断点续传状态追踪完全复用                          │
+│                                                                                 │
+│  新增点:                                                                         │
+│  ① DecisionInstall — 版本决策新增安装场景 (current 空 + target 有值)            │
+│  ② BuildVersionContextForInstall — 安装专用 VC 构建 (Current 全空)             │
+│  ③ BuildInstallDAGFromBundle — 从 install.components 构建 DAG                  │
+│  ④ DeclarativeInstallCatalog — 安装组件目录 (handler 与升级不同)               │
+│  ⑤ install-ready annotation — 安装前置门控                                      │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
 ### 6.1 VersionContext 扩展
 
 ```go
@@ -685,6 +768,63 @@ func BuildVersionContextForInstall(
 ```
 
 ## 7. 安装 DAG 执行设计
+
+### 7.0 设计思路
+
+安装 DAG 执行的核心思路是**在现有 PhaseFlow 的执行入口中增加 DAG 安装分支**，通过三重门控 (Feature Gate + 全新安装判定 + install-ready annotation) 决定是否走 DAG 路径。未满足门控条件时回退到 Legacy PhaseFlow，保证向后兼容。
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              安装 DAG 执行设计思路                                                │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  执行入口 (executePhaseFlow) 三路分发:                                           │
+│                                                                                 │
+│  ① shouldUseDeclarativeUpgrade? → executeUpgradeDAG (现有升级路径)             │
+│     门控: upgrade-ready annotation + Feature Gate                               │
+│                                                                                 │
+│  ② shouldUseDeclarativeInstall? → executeInstallDAG (新增安装路径) ★           │
+│     门控: Feature Gate + 全新安装 + install-ready annotation                    │
+│                                                                                 │
+│  ③ 默认 → PhaseFlow (Legacy 路径)                                               │
+│     适用: Feature Gate 未启用 / ReleaseImage 未就绪 / 扩容/纳管/删除等场景      │
+│                                                                                 │
+│  三重门控设计原因:                                                               │
+│                                                                                 │
+│  门控 1 — Feature Gate (DeclarativeInstallEnabled):                              │
+│    原因: 渐进迁移，默认关闭确保生产稳定                                          │
+│    效果: 关闭时所有安装走 Legacy PhaseFlow                                       │
+│                                                                                 │
+│  门控 2 — 全新安装判定 (Status.Phase 为空或 Init):                               │
+│    原因: DAG 安装路径仅面向全新安装，扩容/纳管/删除等场景不适用                  │
+│    效果: 仅全新安装可走 DAG，扩容仍走 PhaseFlow Scale Phase                      │
+│                                                                                 │
+│  门控 3 — install-ready annotation:                                              │
+│    原因: ReleaseImage 可能尚未创建或未通过验证，需前置门控确保就绪              │
+│    效果: ReleaseImage Phase=Valid 后 ClusterVersionReconciler 设置 annotation   │
+│          → BKEClusterReconciler 检测到 annotation 后才走 DAG 路径              │
+│          → 无 annotation 时回退 Legacy PhaseFlow (从 Spec 读取版本，不依赖 RI) │
+│                                                                                 │
+│  executeInstallDAG 执行流程:                                                     │
+│    1. resolveInstallBundle → 从 ReleaseImage 解析 OCI Bundle                    │
+│    2. BuildVersionContextForInstall → 构建 VC (Current 空, Target 来自 RI)     │
+│    3. ApplyVersionContextTargetsToClusterSpec → 同步版本到 BKECluster.Spec      │
+│       (供 BKEAgent 读取 BkeConfig.Cluster.KubernetesVersion 等)                │
+│    4. BuildInstallDAGFromBundle → 构建安装 DAG (拓扑排序)                       │
+│    5. ComponentFactory + 注册安装 handler                                        │
+│    6. NewScheduler (复用升级框架)                                                │
+│    7. ExecuteDAG → 并行执行安装组件                                              │
+│    8. 安装完成 → 更新 Status                                                     │
+│                                                                                 │
+│  与升级执行的关键差异:                                                           │
+│  ① VersionContext: 安装 Current 全空 vs 升级 Current 有值                       │
+│  ② Decision: 安装 DecisionInstall vs 升级 DecisionUpgrade                       │
+│  ③ Catalog: 安装 DeclarativeInstallCatalog vs 升级 DeclarativeUpgradeCatalog   │
+│  ④ Annotation: 安装 install-ready vs 升级 upgrade-ready                         │
+│  ⑤ Handler: 安装 EnsureMasterInit vs 升级 EnsureMasterUpgrade                  │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
 
 ### 7.1 执行入口
 
@@ -920,6 +1060,75 @@ Batch 8: [nodes-postprocess, agent-switch]  ← 依赖 kubernetes-worker，并�
 > **注意**：实际 DAG 结构由 `ComponentVersion.spec.dependencies` 决定。上图为典型配置。
 
 ## 8. 部署 Phase 与安装组件映射
+
+### 8.0 设计思路
+
+Legacy `DeployPhases` 列表定义了 11 个串行 Phase，每个 Phase 有固定的执行顺序。DAG 安装路径需要将这些 Phase 映射为 `ComponentSpec` (组件名 + handler)，使 DAG 拓扑排序替代硬编码顺序。
+
+**核心设计思路**：将 Legacy PhaseFlow 的 Phase 名映射为 ReleaseImage 中的组件名，每个组件在 `DeclarativeInstallCatalog` 中声明 inline handler。Phase 间的执行顺序由 `ComponentVersion.spec.dependencies` 声明式定义，替代 DeployPhases 的硬编码列表。
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              部署 Phase 与安装组件映射设计思路                                    │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  Legacy PhaseFlow (硬编码顺序):                                                  │
+│    DeployPhases = [                                                              │
+│      EnsureBKEAgent,          // 0                                              │
+│      EnsureNodesEnv,          // 1                                              │
+│      EnsureClusterAPIObj,    // 2                                              │
+│      EnsureCerts,            // 3                                              │
+│      EnsureLoadBalance,      // 4                                              │
+│      EnsureMasterInit,       // 5                                              │
+│      EnsureMasterJoin,       // 6 (扩容时)                                     │
+│      EnsureWorkerJoin,       // 7                                              │
+│      EnsureAddonDeploy,      // 8                                              │
+│      EnsureNodesPostProcess, // 9                                              │
+│      EnsureAgentSwitch,      // 10                                             │
+│    ]                                                                             │
+│    顺序: 硬编码在 list.go 的切片索引                                             │
+│                                                                                 │
+│  DAG 安装路径 (声明式依赖):                                                      │
+│    ReleaseImage.install.components → BuildInstallDAG                              │
+│    ComponentVersion.spec.dependencies → 拓扑排序                                 │
+│                                                                                 │
+│    bkeagent (无依赖)                                                             │
+│      → nodes-env (依赖 bkeagent)                                                │
+│        → certs (依赖 nodes-env)                                                  │
+│          → cluster-api-obj (依赖 certs)  ┐                                      │
+│          → load-balance (依赖 certs)     ┘ 并行                                  │
+│            → kubernetes-master (依赖 certs + load-balance)                      │
+│              → kubernetes-worker (依赖 kubernetes-master)                       │
+│                → kube-proxy (依赖 kubernetes-master) ┐ 并行                     │
+│                → coredns (依赖 kubernetes-master)    ┘                          │
+│                  → nodes-postprocess (依赖 kubernetes-worker) ┐ 并行            │
+│                  → agent-switch (依赖 kubernetes-worker)      ┘                 │
+│                                                                                 │
+│  映射原则:                                                                       │
+│  1. Phase 名 → 组件名 — EnsureBKEAgent → "bkeagent"                             │
+│  2. Phase 构造函数 → InlineHandler — phases.NewEnsureBKEAgent → "EnsureBKEAgent"│
+│  3. Phase 顺序 → dependencies — 硬编码索引 → ComponentVersion.spec.dependencies │
+│  4. 无对应组件的 Phase — LegacyPhase 字段标记，用于双轨共存时跳过                │
+│                                                                                 │
+│  安装与升级 handler 差异:                                                       │
+│  同一组件在安装和升级时使用不同的 handler:                                       │
+│    kubernetes-master: 安装=EnsureMasterInit (kubeadm init)                     │
+│                       升级=EnsureMasterUpgrade (kubeadm upgrade apply)          │
+│    kubernetes-worker: 安装=EnsureWorkerJoin (kubeadm join)                      │
+│                      升级=EnsureWorkerUpgrade (kubeadm upgrade node)            │
+│    bkeagent:          安装=EnsureBKEAgent (首次推送)                            │
+│                       升级=EnsureAgentUpgrade (推送新版本)                      │
+│  原因: 安装和升级的操作语义不同 (init vs upgrade, join vs upgrade node)        │
+│        但组件名相同 (都是 "kubernetes-master")，通过不同 Catalog 区分            │
+│                                                                                 │
+│  嵌入式组件 (无独立 handler):                                                   │
+│    containerd: 安装嵌入在 EnsureNodesEnv 的 runtime scope 中 (无独立 handler)  │
+│    etcd: 安装由 kubeadm init 隐式创建 (在 EnsureMasterInit 中，无独立 handler)  │
+│    两者在 DeclarativeInstallCatalog 中无独立条目                                 │
+│    升级时有独立 handler (EnsureContainerdUpgrade / EnsureEtcdUpgrade)          │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
 
 ### 8.1 DeployPhases → 安装组件映射
 
