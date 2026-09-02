@@ -247,6 +247,127 @@ spec:
 
 ## 5. 安装组件目录设计
 
+### 5.0 DeclarativeUpgradeCatalog 的作用 (现有升级组件目录)
+
+在说明安装组件目录 `DeclarativeInstallCatalog` 之前，先理解现有升级组件目录 `DeclarativeUpgradeCatalog` 的作用，因为安装目录是它的对称设计。
+
+#### 5.0.1 是什么
+
+`DeclarativeUpgradeCatalog` 是一个**静态映射表** (Go `var` 切片)，定义在 `pkg/upgrade/catalog.go` 中。它将 ReleaseImage 中的升级组件名称映射到具体的执行模式 (inline/manifest)、inline handler 名称、manifest 路径和 legacy Phase 名称。
+
+```go
+// pkg/upgrade/catalog.go (现有代码)
+
+// DeclarativeUpgradeCatalog is the canonical upgrade component table for ReleaseImage DAG.
+var DeclarativeUpgradeCatalog = []UpgradeComponentSpec{
+    {Name: "pre-upgrade-resources", Mode: UpgradeExecutionInline,
+     InlineHandler: "EnsurePreUpgradeResources", LegacyPhase: "EnsurePreUpgradeResources"},
+    {Name: "provider", Mode: UpgradeExecutionManifest,
+     ManifestPath: "provider/v1.0.0/component.yaml", LegacyPhase: "EnsureProviderSelfUpgrade"},
+    {Name: "bkeagent", Mode: UpgradeExecutionInline,
+     InlineHandler: "EnsureAgentUpgrade", LegacyPhase: "EnsureAgentUpgrade"},
+    {Name: "kube-proxy", Mode: UpgradeExecutionManifest,
+     ManifestPath: "kube-proxy/v1.0.0/component.yaml"},
+    {Name: "coredns", Mode: UpgradeExecutionManifest,
+     ManifestPath: "coredns/v1.0.0/component.yaml", LegacyPhase: "EnsureComponentUpgrade"},
+    {Name: "etcd", Mode: UpgradeExecutionInline,
+     InlineHandler: "EnsureEtcdUpgrade", LegacyPhase: "EnsureEtcdUpgrade"},
+    {Name: "kubernetes-master", Mode: UpgradeExecutionInline,
+     InlineHandler: "EnsureMasterUpgrade", LegacyPhase: "EnsureMasterUpgrade"},
+    {Name: "kubernetes-worker", Mode: UpgradeExecutionInline,
+     InlineHandler: "EnsureWorkerUpgrade", LegacyPhase: "EnsureWorkerUpgrade"},
+    {Name: "containerd", Mode: UpgradeExecutionInline,
+     InlineHandler: "EnsureContainerdUpgrade", LegacyPhase: "EnsureContainerdUpgrade"},
+}
+```
+
+#### 5.0.2 解决什么问题
+
+| 问题 | 没有 Catalog 时 | 有 Catalog 后 |
+|------|----------------|--------------|
+| **组件名 → 执行模式映射** | DAG 调度器收到 `ComponentNode{Name: "kubernetes-master"}` 后，不知道该用 inline 还是 manifest 执行 | 从 Catalog 查表：`Mode=UpgradeExecutionInline`，使用 inline 执行器 |
+| **组件名 → inline handler 映射** | inline 类型组件需要知道调用哪个 Phase Handler (如 `EnsureMasterUpgrade`) | 从 Catalog 查表：`InlineHandler="EnsureMasterUpgrade"` |
+| **组件名 → manifest 路径映射** | manifest 类型组件需要知道 YAML 清单路径 | 从 Catalog 查表：`ManifestPath="coredns/v1.0.0/component.yaml"` |
+| **组件名 → legacy Phase 映射** | 声明式升级与 legacy PhaseFlow 共存时需互相转换 | 从 Catalog 查表：`LegacyPhase="EnsureMasterUpgrade"` |
+| **新增组件的注册点** | 新增组件需修改 DAG 构建代码、Phase 注册代码等多处 | 只需在 Catalog 中添加一条记录 + 注册 handler |
+
+#### 5.0.3 在升级流程中的角色
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              DeclarativeUpgradeCatalog 在升级流程中的角色                         │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  ReleaseImage.upgrade.components:                                               │
+│    - name: kubernetes-master    (声明: 组件名 + 版本)                            │
+│      version: v1.36.0                                                           │
+│      inline:                                                                    │
+│        handler: EnsureMasterUpgrade                                             │
+│        version: v1.0.0                                                          │
+│    - name: coredns                                                              │
+│      version: v1.11.3                                                           │
+│      (无 inline → manifest 模式)                                                │
+│                                                                                 │
+│           │                                                                     │
+│           ▼ BuildUpgradeDAGFromBundle(bundle, resolver)                         │
+│                                                                                 │
+│  遍历 ReleaseImage.upgrade.components:                                          │
+│    for _, comp := range bundle.Release.Spec.Upgrade.Components {               │
+│        // 从 Catalog 查找组件的执行模式                                          │
+│        catalogEntry := findInCatalog(DeclarativeUpgradeCatalog, comp.Name)      │
+│        // catalogEntry = {Name: "kubernetes-master",                             │
+│        //                 Mode: UpgradeExecutionInline,                         │
+│        //                 InlineHandler: "EnsureMasterUpgrade"}                 │
+│                                                                                 │
+│        // 构建 DAG 节点 (含执行模式信息)                                         │
+│        dag.AddNode(ComponentNode{                                               │
+│            Name:          comp.Name,           // "kubernetes-master"          │
+│            Version:       comp.Version,         // "v1.36.0"                   │
+│            Inline:        comp.Inline,          // {Handler: "EnsureMasterUpgrade"}│
+│            FailurePolicy: catalogEntry.FailurePolicy,                          │
+│            Dependencies:  resolveDependencies(comp.Name, bundle),             │
+│        })                                                                       │
+│    }                                                                            │
+│                                                                                 │
+│           │                                                                     │
+│           ▼ Scheduler.ExecuteDAG(ctx, execCtx, dag)                             │
+│                                                                                 │
+│  DAG 执行时, 对每个节点:                                                        │
+│    if node.Inline != nil {                                                      │
+│        // inline 模式 → InlineComponentExecutor                                  │
+│        handler := ComponentFactory.Resolve(node.Inline.Handler)                │
+│        // handler = EnsureMasterUpgrade Phase                                    │
+│        handler.Execute(ctx, oldCluster, newCluster, version)                   │
+│    } else {                                                                     │
+│        // manifest 模式 → YamlComponentExecutor                                  │
+│        pkg, _ := manifestStore.GetComponentManifests(ctx, node.Name, node.Version)│
+│        applier.ApplyComponent(ctx, pkg)                                         │
+│    }                                                                            │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 5.0.4 Catalog 与 ReleaseImage 的分工
+
+| 维度 | ReleaseImage (声明层) | DeclarativeUpgradeCatalog (映射层) |
+|------|----------------------|-----------------------------------|
+| **定义位置** | OCI Bundle 中的 `release.yaml` | `pkg/upgrade/catalog.go` 中的 Go `var` |
+| **变更频率** | 每次发布变更 (版本号、组件列表) | 很少变更 (仅新增组件时添加条目) |
+| **内容** | 组件名 + 版本号 + inline handler (如声明) | 组件名 → 执行模式 + handler + manifest 路径 + legacy Phase |
+| **作用** | 声明"升级到什么版本" | 映射"用什么方式执行升级" |
+| **关系** | ReleaseImage 组件名是 Catalog 的查找键 | Catalog 提供执行所需的元数据 |
+
+> **分工原则**：ReleaseImage 声明**什么版本** (What)，Catalog 映射**怎么执行** (How)。
+
+#### 5.0.5 Catalog 的消费者
+
+| 消费者 | 用途 | 代码位置 |
+|--------|------|---------|
+| `BuildUpgradeDAGFromBundle()` | 构建 DAG 时查找组件的执行模式和 inline handler | `pkg/topology/build.go` |
+| `InlineUpgradeHandlers()` | 返回所有 inline handler 名称列表，供 ComponentFactory 注册 | `pkg/upgrade/catalog.go:125` |
+| `Scheduler.executeComponent()` | 根据 Catalog 的 Mode 选择 inline/manifest 执行器 | `pkg/dagexec/scheduler.go` |
+| `PhaseFlow.CalculatePhase()` | 旧路径中用 `LegacyPhase` 字段判断是否跳过 legacy Phase | `pkg/phaseframe/phases/phase_flow.go` |
+
 ### 5.1 DeclarativeInstallCatalog
 
 ```go
