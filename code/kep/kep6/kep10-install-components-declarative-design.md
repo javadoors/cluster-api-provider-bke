@@ -745,6 +745,90 @@ func (r *BKEClusterReconciler) shouldUseDeclarativeInstall(bkeCluster *bkev1beta
 }
 ```
 
+#### 7.1.1 install-ready annotation 的作用
+
+`shouldUseDeclarativeInstall()` 的最后一个检查项是 `install-ready` annotation。该 annotation 由 `ClusterVersionReconciler` 在安装前置条件满足后设置，是 BKEClusterReconciler 决定是否走 DAG 安装路径的**最终门控**。
+
+**为什么需要这个 annotation**：
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              install-ready annotation 的作用                                     │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  没有 install-ready annotation 时的问题:                                        │
+│                                                                                 │
+│  用户创建 BKECluster CR (Spec.OpenFuyaoVersion = "v2.7.0")                     │
+│    │                                                                            │
+│    ▼ BKEClusterReconciler 被触发                                                 │
+│  shouldUseDeclarativeInstall 检查:                                              │
+│    ✓ Feature Gate 启用                                                          │
+│    ✓ Status.Phase 为空 (全新安装)                                                │
+│    ✗ 没有 install-ready annotation → 返回 false                                 │
+│    → 走 Legacy PhaseFlow? 但此时 ReleaseImage 可能还没就绪!                    │
+│                                                                                 │
+│  问题:                                                                          │
+│  BKECluster 创建后，ReleaseImage CR 可能尚未创建或尚未通过验证。                │
+│  如果 BKEClusterReconciler 立即开始安装，会因 ReleaseImage 不存在而失败。       │
+│  需要一个前置门控：确保 ReleaseImage 已就绪后，才允许开始安装。                 │
+│                                                                                 │
+│  有 install-ready annotation 时:                                               │
+│                                                                                 │
+│  用户创建 BKECluster CR                                                         │
+│    │                                                                            │
+│    ▼ BKEClusterReconciler: ensureClusterVersionOnInstall()                     │
+│    │  创建 ClusterVersion CR (desiredVersion = Spec.OpenFuyaoVersion)            │
+│    │                                                                            │
+│    ▼ ClusterVersionReconciler 被触发                                           │
+│    │  1. 解析 desiredVersion → 查找 ReleaseImage CR                             │
+│    │  2. ReleaseImageEnsurer.Ensure() → 拉取 OCI Bundle                          │
+│    │  3. 等待 ReleaseImage Status.Phase = Valid (签名验证+组件解析+兼容性校验) │
+│    │  4. ReleaseImage Valid → 设置 install-ready annotation                      │
+│    │     bc.Annotations[InstallReadyAnnotationKey] = desiredVersion             │
+│    │                                                                            │
+│    ▼ BKEClusterReconciler 再次被触发 (annotation 变更)                         │
+│    shouldUseDeclarativeInstall 检查:                                            │
+│    ✓ Feature Gate 启用                                                          │
+│    ✓ Status.Phase 为空 (全新安装)                                                │
+│    ✓ install-ready annotation 存在 → 返回 true                                  │
+│    → 走 DAG 安装路径                                                            │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**install-ready annotation 的完整设置流程**：
+
+| 步骤 | 执行者 | 操作 | 说明 |
+|------|--------|------|------|
+| 1 | BKEClusterReconciler | `ensureClusterVersionOnInstall()` 创建 ClusterVersion CR | 用户创建 BKECluster 后，自动创建对应的 ClusterVersion |
+| 2 | ClusterVersionReconciler | 解析 `desiredVersion`，查找 ReleaseImage CR | 通过 `Spec.Version == desiredVersion` 匹配 |
+| 3 | ClusterVersionReconciler | `ReleaseImageEnsurer.Ensure()` 拉取 OCI Bundle | 从 OCI Registry 拉取 ReleaseImage payload |
+| 4 | ReleaseImageReconciler | 验证签名 + 解析组件 + 兼容性校验 | 设置 `Status.Phase = Valid` (或 Invalid/ManifestMissing/CompatibilityFailed) |
+| 5 | ClusterVersionReconciler | ReleaseImage Phase == Valid → 设置 `install-ready` annotation | `bc.Annotations[InstallReadyAnnotationKey] = desiredVersion` |
+| 6 | BKEClusterReconciler | 检测到 annotation 变更 → `shouldUseDeclarativeInstall()` 返回 true | 进入 DAG 安装路径 |
+
+**与 upgrade-ready annotation 的对称性**：
+
+| 维度 | install-ready (安装) | upgrade-ready (升级) |
+|------|---------------------|---------------------|
+| **设置者** | ClusterVersionReconciler | ClusterVersionReconciler |
+| **设置条件** | ReleaseImage Phase=Valid + 全新安装 (无 history) | ReleaseImage Phase=Valid + UpgradePath 校验通过 |
+| **annotation 值** | desiredVersion (openFuyao 版本) | hopTarget (openFuyao 版本，可能是中间 hop) |
+| **消费者** | `shouldUseDeclarativeInstall()` | `shouldUseDeclarativeUpgrade()` |
+| **触发路径** | BKECluster 创建 → CV 创建 → RI 验证 → 设置 annotation → DAG 安装 | CV desiredVersion 变更 → RI 验证 → UP 校验 → 设置 annotation → DAG 升级 |
+| **清除时机** | 安装完成后 (DeclarativeUpgradeStatus 完成) | 升级 hop 完成后 (CompleteUpgradeHop) |
+
+**install-ready 不存在时走 Legacy 路径的原因**：
+
+| 场景 | 原因 | Legacy 行为 |
+|------|------|------------|
+| Feature Gate 未启用 | `DeclarativeInstallEnabled=false` | PhaseFlow 正常执行 (DeployPhases) |
+| ReleaseImage 未创建 | 用户创建 BKECluster 但未创建 ReleaseImage CR | PhaseFlow 从 `BKECluster.Spec` 读取版本 (Legacy 模式不依赖 ReleaseImage) |
+| ReleaseImage 未通过验证 | ReleaseImage Status.Phase != Valid | PhaseFlow 从 `BKECluster.Spec` 读取版本，不阻塞安装 |
+| 旧格式 ReleaseImage | `install.components[].inline` 为空 | PhaseFlow 正常执行 (不消费 ReleaseImage install 列表) |
+
+> **关键设计**：install-ready annotation 是 DAG 安装路径的**前置门控**，确保 ReleaseImage 已验证通过后才走 DAG 路径。没有该 annotation 时回退到 Legacy PhaseFlow (从 `BKECluster.Spec` 直接读取版本，不依赖 ReleaseImage)，保证向后兼容。
+
 ### 7.2 executeInstallDAG 实现
 
 ```go
