@@ -477,7 +477,68 @@ var DeclarativeInstallCatalog = []ComponentSpec{
 | coredns | (manifest) | (manifest) | manifest |
 | pre-upgrade-resources | - | `EnsurePreUpgradeResources` | inline |
 | containerd | - | `EnsureContainerdUpgrade` | inline |
-| etcd | - | `EnsureEtcdUpgrade` | inline |
+| etcd | (包含在 MasterInit) | `EnsureEtcdUpgrade` | inline |
+
+#### 5.2.1 containerd 和 etcd 的安装路径分析
+
+上表中 containerd 和 etcd 的安装列为"-"或"包含在 MasterInit"，因为安装时它们**没有独立的 Phase**，而是嵌入在其他 Phase 的执行流程中。以下是基于代码的分析：
+
+**containerd — 在 `EnsureNodesEnv` Phase 中安装 (非独立 Phase)**
+
+`EnsureNodesEnv` (DeployPhases #1) 负责节点环境初始化，containerd 的安装嵌入在其命令链中：
+
+```txt
+EnsureNodesEnv.Execute()
+  → CheckOrInitNodesEnv()
+    → buildEnvCommand() → BuildCommonEnvCommand()
+      → 创建 BKEAgent Command CR (类型: CommandBuiltIn)
+        → BKEAgent 执行 K8sEnvInit 插件 (scope 含 "runtime"):
+          → initRuntime() → downloadContainerd()
+            → 下载 containerd-{version}-linux-{arch}.tar.gz
+            → 解压 + 安装 + 启动 systemd 服务
+```
+
+| 维度 | 说明 |
+|------|------|
+| 安装 Phase | `EnsureNodesEnv` (DeployPhases #1) |
+| 安装机制 | BKEAgent `K8sEnvInit` 插件 `runtime` scope → `downloadContainerd()` |
+| 代码位置 | `pkg/phaseframe/phases/ensure_nodes_env.go` → `pkg/command/env.go` → `pkg/job/builtin/kubeadm/env/init.go` |
+| 是否独立 Phase | **否** — containerd 安装嵌入在 `EnsureNodesEnv` 的环境初始化命令中 |
+| 升级 Phase | `EnsureContainerdUpgrade` (独立 Phase，仅升级路径) |
+
+**etcd — 在 `EnsureMasterInit` Phase 中通过 kubeadm init 创建 (非独立 Phase)**
+
+`EnsureMasterInit` (DeployPhases #5) 负责首个 Master 节点初始化，etcd 的 Static Pod 由 kubeadm init 自动创建：
+
+```txt
+EnsureMasterInit.Execute()
+  → 创建 Bootstrap Command CR (Phase: InitControlPlane)
+    → BKEAgent 执行 Kubeadm 插件 (phase=InitControlPlane):
+      → kubeadm init
+        → 生成 etcd Static Pod manifest → /etc/kubernetes/manifests/etcd.yaml
+        → Kubelet 检测 manifest → 拉起 etcd Pod (stacked etcd)
+        → 同时创建 apiserver/cm/scheduler Static Pod
+  → 轮询等待 ControlPlaneInitializedCondition=True (含 etcd 就绪)
+```
+
+| 维度 | 说明 |
+|------|------|
+| 安装 Phase | `EnsureMasterInit` (DeployPhases #5) |
+| 安装机制 | `kubeadm init` 自动创建 etcd Static Pod manifest (stacked etcd) |
+| 代码位置 | `pkg/phaseframe/phases/ensure_master_init.go` → `pkg/command/bootstrap.go` → BKEAgent `Kubeadm` 插件 |
+| 是否独立 Phase | **否** — etcd 由 `kubeadm init` 隐式创建，无独立 `EnsureEtcdInstall` Phase |
+| 升级 Phase | `EnsureEtcdUpgrade` (独立 Phase，仅升级路径) |
+
+**对 DeclarativeInstallCatalog 的影响**：
+
+由于 containerd 和 etcd 在安装时没有独立 Phase (嵌入在 `EnsureNodesEnv` 和 `EnsureMasterInit` 中)，它们在 `DeclarativeInstallCatalog` 中**没有独立的 Catalog 条目**：
+
+| 组件 | Catalog 中是否有独立安装条目 | 原因 |
+|------|---------------------------|------|
+| containerd | **否** | 安装嵌入在 `EnsureNodesEnv` 的 `runtime` scope 中，无独立 handler |
+| etcd | **否** | 安装由 `kubeadm init` 隐式完成 (在 `EnsureMasterInit` 中)，无独立 handler |
+
+> 这与升级目录 `DeclarativeUpgradeCatalog` 不同 — 升级时 containerd 和 etcd 有独立 Phase (`EnsureContainerdUpgrade` / `EnsureEtcdUpgrade`)，因此升级目录中有独立条目。安装时它们是嵌入式的，不需要独立条目。
 
 ### 5.3 ComponentFactory 注册扩展
 
