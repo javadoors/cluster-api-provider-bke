@@ -370,54 +370,95 @@ var DeclarativeUpgradeCatalog = []UpgradeComponentSpec{
 
 ### 5.1 DeclarativeInstallCatalog
 
+#### 5.1.1 复用 UpgradeComponentSpec — 不新增类型
+
+分析 `InstallComponentSpec` 与现有 `UpgradeComponentSpec` 的字段：
+
+| 字段 | `UpgradeComponentSpec` | `InstallComponentSpec` (原提议) | 差异 |
+|------|----------------------|-------------------------------|------|
+| `Name` | string | string | 无 |
+| `Version` | string | string | 无 |
+| `Mode` | `UpgradeExecutionMode` ("manifest"/"inline") | `InstallExecutionMode` ("manifest"/"inline") | **值相同，仅类型名不同** |
+| `ManifestPath` | string | string | 无 |
+| `InlineHandler` | string | string | 无 |
+| `LegacyPhase` | string | 缺失 | 安装也需要 (映射到 DeployPhases) |
+
+**结论**：两个结构体字段语义完全一致，`Mode` 的值 ("manifest"/"inline") 描述的是执行机制而非操作类型 (安装/升级)。**应直接复用 `UpgradeComponentSpec`，不新增 `InstallComponentSpec` 和 `InstallExecutionMode`**。
+
+**方案**：将 `UpgradeComponentSpec` 重命名为中性的 `ComponentSpec`，`UpgradeExecutionMode` 重命名为 `ExecutionMode`，同时用于安装和升级目录：
+
 ```go
 // pkg/upgrade/catalog.go
 
-// InstallComponentSpec 定义安装组件规格 🆕新增
-// 结构与 UpgradeComponentSpec 对称
-type InstallComponentSpec struct {
-    // 组件名称（ReleaseImage install.components[].name）
-    Name string
-    
-    // 组件版本
-    Version string
-    
-    // 执行模式: manifest | inline
-    Mode InstallExecutionMode
-    
-    // Manifest 路径 (mode=manifest 时)
-    ManifestPath string
-    
-    // Inline handler 名称 (mode=inline 时)
-    InlineHandler string
-}
-
-type InstallExecutionMode string
+// ExecutionMode 描述组件的执行方式 (安装和升级通用)
+type ExecutionMode string
 
 const (
-    InstallExecutionManifest InstallExecutionMode = "manifest"
-    InstallExecutionInline   InstallExecutionMode = "inline"
+    ExecutionManifest ExecutionMode = "manifest"
+    ExecutionInline   ExecutionMode = "inline"
 )
 
-// DeclarativeInstallCatalog 安装组件目录 🆕新增
-// 映射 ReleaseImage install.components 到执行模式
-var DeclarativeInstallCatalog = []InstallComponentSpec{
-    // inline 模式：复用现有 Phase 实现
-    {Name: "bkeagent",          Mode: InstallExecutionInline, InlineHandler: "EnsureBKEAgent"},
-    {Name: "nodes-env",         Mode: InstallExecutionInline, InlineHandler: "EnsureNodesEnv"},
-    {Name: "cluster-api-obj",   Mode: InstallExecutionInline, InlineHandler: "EnsureClusterAPIObj"},
-    {Name: "certs",             Mode: InstallExecutionInline, InlineHandler: "EnsureCerts"},
-    {Name: "load-balance",      Mode: InstallExecutionInline, InlineHandler: "EnsureLoadBalance"},
-    {Name: "kubernetes-master",  Mode: InstallExecutionInline, InlineHandler: "EnsureMasterInit"},
-    {Name: "kubernetes-worker",  Mode: InstallExecutionInline, InlineHandler: "EnsureWorkerJoin"},
-    {Name: "nodes-postprocess", Mode: InstallExecutionInline, InlineHandler: "EnsureNodesPostProcess"},
-    {Name: "agent-switch",      Mode: InstallExecutionInline, InlineHandler: "EnsureAgentSwitch"},
-    
-    // manifest 模式：YAML 清单应用
-    {Name: "kube-proxy", Mode: InstallExecutionManifest, ManifestPath: "kube-proxy/{version}/component.yaml"},
-    {Name: "coredns",    Mode: InstallExecutionManifest, ManifestPath: "coredns/{version}/component.yaml"},
+// ComponentSpec 映射 ReleaseImage 组件名到执行模式 (安装和升级通用)
+type ComponentSpec struct {
+    // 组件名称 (ReleaseImage install/upgrade components[].name)
+    Name string
+
+    // 组件版本
+    Version string
+
+    // 执行模式: manifest | inline
+    Mode ExecutionMode
+
+    // Manifest 路径 (mode=manifest 时)
+    ManifestPath string
+
+    // Legacy Phase 名称 (映射到 PhaseFlow 的 Phase，用于双轨共存时跳过)
+    LegacyPhase string
+
+    // Inline handler 名称 (mode=inline 时，ComponentFactory 注册键)
+    InlineHandler string
 }
 ```
+
+> **重命名影响**：`UpgradeComponentSpec` → `ComponentSpec`，`UpgradeExecutionMode` → `ExecutionMode`。现有引用处 (catalog.go、build.go、scheduler.go 等) 需批量替换类型名，但**字段和方法不变**，属于机械替换。
+
+#### 5.1.2 DeclarativeInstallCatalog 定义
+
+```go
+// pkg/upgrade/catalog.go
+
+// DeclarativeInstallCatalog 安装组件目录 🆕新增
+// 复用 ComponentSpec (与 DeclarativeUpgradeCatalog 同一类型)
+var DeclarativeInstallCatalog = []ComponentSpec{
+    // inline 模式：复用现有 Phase 实现
+    {Name: "bkeagent",          Mode: ExecutionInline, InlineHandler: "EnsureBKEAgent",       LegacyPhase: "EnsureBKEAgent"},
+    {Name: "nodes-env",         Mode: ExecutionInline, InlineHandler: "EnsureNodesEnv",       LegacyPhase: "EnsureNodesEnv"},
+    {Name: "cluster-api-obj",   Mode: ExecutionInline, InlineHandler: "EnsureClusterAPIObj",  LegacyPhase: "EnsureClusterAPIObj"},
+    {Name: "certs",             Mode: ExecutionInline, InlineHandler: "EnsureCerts",          LegacyPhase: "EnsureCerts"},
+    {Name: "load-balance",      Mode: ExecutionInline, InlineHandler: "EnsureLoadBalance",    LegacyPhase: "EnsureLoadBalance"},
+    {Name: "kubernetes-master",  Mode: ExecutionInline, InlineHandler: "EnsureMasterInit",     LegacyPhase: "EnsureMasterInit"},
+    {Name: "kubernetes-worker",  Mode: ExecutionInline, InlineHandler: "EnsureWorkerJoin",     LegacyPhase: "EnsureWorkerJoin"},
+    {Name: "nodes-postprocess", Mode: ExecutionInline, InlineHandler: "EnsureNodesPostProcess",LegacyPhase: "EnsureNodesPostProcess"},
+    {Name: "agent-switch",      Mode: ExecutionInline, InlineHandler: "EnsureAgentSwitch",    LegacyPhase: "EnsureAgentSwitch"},
+
+    // manifest 模式：YAML 清单应用
+    {Name: "kube-proxy", Mode: ExecutionManifest, ManifestPath: "kube-proxy/{version}/component.yaml"},
+    {Name: "coredns",    Mode: ExecutionManifest, ManifestPath: "coredns/{version}/component.yaml"},
+}
+```
+
+#### 5.1.3 复用的收益
+
+| 维度 | 新增 `InstallComponentSpec` (原方案) | 复用 `ComponentSpec` (改进方案) |
+|------|-------------------------------------|--------------------------------|
+| 类型定义 | 新增 `InstallComponentSpec` + `InstallExecutionMode` | **零新增** (复用现有类型) |
+| 常量定义 | 新增 `InstallExecutionManifest` + `InstallExecutionInline` | **零新增** (复用 `ExecutionManifest` + `ExecutionInline`) |
+| Catalog 查找函数 | 需为 Install 写一套 `findInInstallCatalog()` | **复用** `findInCatalog()` (泛型于 install/upgrade) |
+| `InlineHandlers()` 函数 | 需新增 `InlineInstallHandlers()` | **复用** `InlineUpgradeHandlers()` 逻辑 (改为 `InlineHandlers(catalog)`) |
+| 新增组件 | 需在两个 Catalog 中各加一条 | 按需在对应 Catalog 中添加 (install/upgrade handler 不同是正常的) |
+| 代码维护 | 两套类型定义需保持同步 | **一套类型**，无需同步 |
+
+> **注意**：同一组件在安装和升级 Catalog 中的 `InlineHandler` 可能不同 (如 `kubernetes-master`: 安装=`EnsureMasterInit`，升级=`EnsureMasterUpgrade`)。复用 `ComponentSpec` 类型不影响这一点 — 两个 Catalog 是独立的 `[]ComponentSpec` 切片，只是元素类型相同。
 
 ### 5.2 安装组件与升级组件目录对比
 
