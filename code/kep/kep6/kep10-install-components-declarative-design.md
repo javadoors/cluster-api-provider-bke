@@ -6,8 +6,6 @@
 | **标题** | ReleaseImage 安装组件声明式定义与 DAG 驱动安装流程设计 |
 | **状态** | `provisional` |
 | **类型** | Feature |
-| **作者** | openFuyao Team |
-| **创建日期** | 2026-08-26 |
 | **依赖** | KEP-5 声明式升级框架、KEP-6 三层状态机设计、KEP-9 Static Pod 类型设计 |
 
 ---
