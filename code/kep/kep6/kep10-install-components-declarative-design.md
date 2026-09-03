@@ -1953,6 +1953,80 @@ func BuildVersionContextForManage(
 }
 ```
 
+##### 场景判断
+
+纳管场景需要先判断 BKECluster 是否处于纳管模式，再走纳管 DAG 路径：
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              纳管场景判断逻辑                                                     │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  reconcileCluster 入口:                                                         │
+│                                                                                 │
+│    BKECluster.Spec.Manage == true?                                              │
+│    ├── true → 纳管场景 ★                                                        │
+│    │     → executeManageDAG()                                                    │
+│    │     → manage 组件探测版本 → 填充 VC.Current                                 │
+│    │     → 后续组件 Decide: Skip(版本一致) / Upgrade(版本不同) / Install(缺失)  │
+│    │                                                                            │
+│    └── false → 非纳管 → 继续判断其他场景 (安装/升级/扩容/删除/...)             │
+│                                                                                 │
+│  纳管与全新安装的区别:                                                           │
+│    全新安装: 集群不存在，Current 全空 → 全部 DecisionInstall                   │
+│    纳管:     集群已运行，Current 从探测获取 → 部分组件可能 DecisionSkip        │
+│                                                                                 │
+│  纳管的特殊情况:                                                                 │
+│    1. 已有集群版本 == 目标版本 → 全部 Skip (无需安装/升级)                       │
+│    2. 已有集群版本 < 目标版本 → 部分组件 DecisionUpgrade (纳管 + 升级)        │
+│    3. 已有集群缺少某些组件 → 部分组件 DecisionInstall (纳管 + 补装)           │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```go
+// controllers/capbke/bkecluster_controller.go — 纳管场景判断
+
+// isManage 判断是否为纳管场景
+func (r *BKEClusterReconciler) isManage(bkeCluster *bkev1beta1.BKECluster) bool {
+    // BKECluster.Spec.Manage = true 表示纳管模式
+    return bkeCluster.Spec.Manage
+}
+
+// reconcileCluster 中纳管场景的分发 (§9.4.7 移除后的执行入口中)
+func (r *BKEClusterReconciler) reconcileCluster(ctx, phaseCtx, oldCluster, newCluster) {
+    // 暂停检查 (最优先)
+    if newCluster.Spec.Pause {
+        newCluster.Status.ClusterStatus = bkev1beta1.ClusterPaused
+        return
+    }
+
+    // 场景判断 (无 Legacy 回退)
+    switch {
+    case isDeleteOrReset(newCluster):
+        r.executeUninstallDAG(ctx, phaseCtx, oldCluster, newCluster)
+
+    case isManage(newCluster):   // ★ 纳管场景判断
+        r.executeManageDAG(ctx, phaseCtx, oldCluster, newCluster)
+
+    case isDryRun(newCluster):
+        r.executeInstallDAG(ctx, phaseCtx, oldCluster, newCluster, WithDryRun())
+
+    case isScale(oldCluster, newCluster):
+        r.executeScaleDAG(ctx, phaseCtx, oldCluster, newCluster)
+
+    case r.shouldUseDeclarativeUpgrade(newCluster):
+        r.executeUpgradeDAG(ctx, phaseCtx, oldCluster, newCluster)
+
+    default:
+        // 全新安装
+        r.executeInstallDAG(ctx, phaseCtx, oldCluster, newCluster)
+    }
+}
+```
+
+> **注意**：纳管场景判断 (`isManage`) 在扩容 (`isScale`) 和升级 (`shouldUseDeclarativeUpgrade`) 之前，因为纳管模式优先于其他操作 — 纳管时先探测版本，再根据 VersionContext 决定后续操作 (安装/升级/跳过)。
+
 ```go
 // controllers/capbke/bkecluster_controller.go — 纳管场景入口
 
@@ -2412,44 +2486,64 @@ func (r *BKEClusterReconciler) reconcileCluster(
 
 #### 9.4.7 移除后的执行入口
 
-完全移除 Legacy PhaseFlow 后，执行入口简化为：
+完全移除 Legacy PhaseFlow 后，执行入口简化为场景分发 (无 PhaseFlow 回退)：
 
 ```go
-func (r *BKEClusterReconciler) reconcileCluster(ctx, phaseCtx, oldCluster, newCluster) {
-    // 场景判断（无 Legacy 回退）
-    switch {
-    case isDeleteOrReset(newCluster):
-        // 卸载 DAG
-        r.executeUninstallDAG(ctx, phaseCtx, oldCluster, newCluster)
-    
-    case isPaused(newCluster):
-        // 暂停：不执行
-        return
-    
-    case isDryRun(newCluster):
-        // DryRun DAG
-        r.executeInstallDAG(ctx, phaseCtx, oldCluster, newCluster, WithDryRun())
-    
-    case isScale(newCluster):
-        // 扩容 DAG（复用安装 DAG，VersionContext 自动过滤）
-        r.executeInstallDAG(ctx, phaseCtx, oldCluster, newCluster)
-    
-    case isManage(newCluster):
-        // 纳管 DAG
-        r.executeInstallDAG(ctx, phaseCtx, oldCluster, newCluster, WithManage())
-    
-    case r.shouldUseDeclarativeUpgrade(newCluster):
-        // 升级 DAG
-        r.executeUpgradeDAG(...)
-    
-    default:
-        // 全新安装 DAG
-        r.executeInstallDAG(ctx, phaseCtx, oldCluster, newCluster)
+func (r *BKEClusterReconciler) reconcileCluster(
+    ctx context.Context,
+    phaseCtx *phaseframe.PhaseContext,
+    oldCluster, newCluster *bkev1beta1.BKECluster,
+) (ctrl.Result, error) {
+    // ─── 前置检查 (最优先) ───
+    // 暂停: 不执行任何操作
+    if newCluster.Spec.Pause {
+        newCluster.Status.ClusterStatus = bkev1beta1.ClusterPaused
+        return ctrl.Result{}, nil
     }
-    
+
+    // ─── 场景判断 (无 Legacy 回退) ───
+    switch {
+    // 1. 删除/重置 → 卸载 DAG (逆序)
+    case isDeleteOrReset(newCluster):
+        return ctrl.Result{}, r.executeUninstallDAG(ctx, phaseCtx, oldCluster, newCluster)
+
+    // 2. 纳管 → 纳管 DAG (manage 组件探测版本，后续组件 Decide 判断)
+    //    ★ 纳管优先于扩容和升级，因为纳管时先探测版本再决定后续操作
+    case isManage(newCluster):
+        return ctrl.Result{}, r.executeManageDAG(ctx, phaseCtx, oldCluster, newCluster)
+
+    // 3. DryRun → 安装 DAG (仅打印不执行)
+    case isDryRun(newCluster):
+        return ctrl.Result{}, r.executeInstallDAG(ctx, phaseCtx, oldCluster, newCluster, WithDryRun())
+
+    // 4. 扩容 → 安装 DAG (VersionContext 自动过滤已有节点)
+    case isScale(oldCluster, newCluster):
+        return ctrl.Result{}, r.executeScaleDAG(ctx, phaseCtx, oldCluster, newCluster)
+
+    // 5. 升级 → 升级 DAG
+    case r.shouldUseDeclarativeUpgrade(newCluster):
+        return ctrl.Result{}, r.executeUpgradeDAG(ctx, phaseCtx, oldCluster, newCluster)
+
+    // 6. 默认 → 全新安装 DAG
+    default:
+        return ctrl.Result{}, r.executeInstallDAG(ctx, phaseCtx, oldCluster, newCluster)
+    }
+
     // 不再有 PhaseFlow 回退
 }
 ```
+
+**场景判断优先级**：
+
+| 优先级 | 场景 | 判断条件 | 执行路径 | 说明 |
+|--------|------|---------|---------|------|
+| 0 | 暂停 | `Spec.Pause` | 不执行 | 最优先，任何操作都不执行 |
+| 1 | 删除/重置 | `Spec.Reset` 或 `DeletionTimestamp` | 卸载 DAG (逆序) | 优先于其他操作 |
+| 2 | 纳管 | `Spec.Manage` | 纳管 DAG (manage 探测版本) | 优先于扩容/升级，纳管时先探测再决定 |
+| 3 | DryRun | `Spec.DryRun` | 安装 DAG (DryRun) | 优先于扩容/升级 |
+| 4 | 扩容 | 新增节点 | 安装 DAG (过滤已有节点) | 优先于升级 |
+| 5 | 升级 | `upgrade-ready` annotation | 升级 DAG | — |
+| 6 | 安装 | 默认 | 安装 DAG | 兜底 |
 
 ### 9.5 平滑升级方案
 
