@@ -987,6 +987,8 @@ func (r *BKEClusterReconciler) executeInstallDAG(
     phaseCtx.SetVersionContext(vc)
     
     // 3. 同步目标版本到 BKECluster.Spec
+    //    ★ 仅用于 Legacy 代码路径兼容 (如 upgradeMasterNodesWithParams / waitForNodeHealthCheck 直接读 Spec)
+    //    ★ 不作为 BKEAgent 渲染 manifest 的版本来源 — BKEAgent 应从 ReleaseImage 获取版本
     upgrade.ApplyVersionContextTargetsToClusterSpec(vc, newCluster)
     
     // 4. 构建安装 DAG
@@ -1007,7 +1009,9 @@ func (r *BKEClusterReconciler) executeInstallDAG(
     })
     
     // 7. 构建 ExecutionContext
+    //    ★ 将 bundle 注入 ExecutionContext，供 BKEAgent 获取 ReleaseImage 中的组件版本
     execCtx := buildExecutionContext(ctx, r.Client, newCluster, vc)
+    execCtx.ReleaseBundle = bundle  // ★ 新增: BKEAgent 从 bundle 读取版本
     
     // 8. 执行 DAG
     if err := sched.ExecuteDAG(ctx, execCtx, dag); err != nil {
@@ -1021,6 +1025,158 @@ func (r *BKEClusterReconciler) executeInstallDAG(
     return nil
 }
 ```
+
+#### 7.2.1 Spec 同步仅为 Legacy 兼容
+
+`ApplyVersionContextTargetsToClusterSpec()` 将 VC Target (来源于 ReleaseImage) 同步到 `BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion` / `EtcdVersion` / `ContainerdVersion`。此同步**仅用于 Legacy 代码路径兼容**，不作为 BKEAgent 渲染 manifest 的版本来源。
+
+| 维度 | Legacy 路径 (现有) | 声明式 DAG 路径 (目标) |
+|------|-------------------|----------------------|
+| **BKEAgent 版本来源** | `BkeConfig.Cluster.KubernetesVersion` (从 `BKECluster.Spec` 读取) | **`ReleaseImage` bundle 中的组件版本** ★ |
+| **manifest image tag** | `BkeConfig.Cluster.KubernetesVersion` 去 v 前缀 | **`bundle.Components[kubernetes-master].Spec.Version` 去 v 前缀** ★ |
+| **etcd image tag** | `BkeConfig.Cluster.EtcdVersion` 或 `Extra["etcdVersion"]` | **`bundle.Components[etcd].Spec.Version` 去 v 前缀** ★ |
+| **kubelet 二进制版本** | `BkeConfig.Cluster.KubernetesVersion` | **`bundle.Components[kubernetes-worker].Spec.Version`** ★ |
+| **Spec 同步的作用** | 唯一来源 (BKEAgent 直接读取) | **仅 Legacy 兼容** (供未改造的 Phase 代码直接读取 Spec) |
+
+#### 7.2.2 BKEAgent 从 ReleaseImage 获取版本的设计
+
+基于 §7.7 (KEP-7 minimal-k8s-upgrade) 的分析，当前 BKEAgent 通过 `getBKEConfig()` 读取 `BKECluster.Spec.ClusterConfig` 获取版本。声明式 DAG 路径应修正为从 ReleaseImage 获取版本，消除对 Spec 同步的依赖。
+
+**当前路径 (依赖 Spec 同步)**：
+
+```txt
+ReleaseImage → VC → SyncUpgradeTargets → BKECluster.Spec → BKEAgent getBKEConfig()
+  → BkeConfig.Cluster.KubernetesVersion → manifest image tag
+```
+
+**目标路径 (直接从 ReleaseImage)**：
+
+```txt
+ReleaseImage → bundle → Command CR 携带版本参数 → BKEAgent 直接使用
+  → 不依赖 BKECluster.Spec 同步
+```
+
+**实现方式：Command CR 携带 ReleaseImage 版本参数**
+
+```go
+// EnsureMasterInit 创建 Command CR 时，从 ReleaseImage bundle 读取版本并注入参数
+
+func (e *EnsureMasterInit) Execute() (ctrl.Result, error) {
+    // 从 ExecutionContext 获取 ReleaseImage bundle
+    bundle := e.Ctx.ReleaseBundle  // ★ 新增: bundle 注入 PhaseContext
+
+    // 从 bundle 解析版本 (不再依赖 BKECluster.Spec)
+    k8sVersion := releaseVersionFromBundle(bundle, "kubernetes-master")
+    etcdVersion := releaseVersionFromBundle(bundle, "etcd")
+
+    // 创建 Bootstrap Command CR，携带版本参数
+    params := CreateInitCommandParams{
+        // ... 现有参数 ...
+        KubernetesVersion: k8sVersion,  // ★ 从 ReleaseImage 获取
+        EtcdVersion:       etcdVersion, // ★ 从 ReleaseImage 获取
+    }
+    bootstrap := createBootstrapCommand(params)
+    bootstrap.New()
+    // ...
+}
+
+// releaseVersionFromBundle 从 ReleaseImage bundle 中查找组件版本
+func releaseVersionFromBundle(bundle *releasemanifest.Bundle, componentName string) string {
+    // 优先从 upgrade.components 查找 (升级条目覆盖安装条目)
+    if bundle.Release.Spec.Upgrade != nil {
+        for _, c := range bundle.Release.Spec.Upgrade.Components {
+            if c.Name == componentName {
+                return c.Version
+            }
+        }
+    }
+    // 回退到 install.components
+    if bundle.Release.Spec.Install != nil {
+        for _, c := range bundle.Release.Spec.Install.Components {
+            if c.Name == componentName {
+                return c.Version
+            }
+        }
+    }
+    return ""
+}
+```
+
+**BKEAgent 端修正：优先使用 Command 参数中的版本**
+
+```go
+// pkg/job/builtin/kubeadm/kubeadm.go — getBKEConfig() 修正
+
+func (k *KubeadmPlugin) getBKEConfig(bkeConfigNS string) error {
+    bkeCluster, err := plugin.GetBKECluster(bkeConfigNS)
+    config, err := plugin.GetBkeConfigFromBkeCluster(bkeCluster)
+    k.boot.BkeConfig = config
+
+    // ★ 新增: 从 Command 参数覆盖版本 (优先于 Spec)
+    if k8sVer, ok := k.parseCommands["kubernetesVersion"]; ok && k8sVer != "" {
+        k.boot.BkeConfig.Cluster.KubernetesVersion = k8sVer
+    }
+    if etcdVer, ok := k.parseCommands["etcdVersion"]; ok && etcdVer != "" {
+        k.boot.BkeConfig.Cluster.EtcdVersion = etcdVer
+        if k.boot.Extra == nil {
+            k.boot.Extra = map[string]interface{}{}
+        }
+        k.boot.Extra["etcdVersion"] = etcdVer  // etcd 优先级最高
+    }
+
+    return nil
+}
+```
+
+**manifest 渲染的版本来源修正**：
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              manifest image tag 版本来源修正                                      │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  当前 (依赖 Spec 同步):                                                          │
+│    ReleaseImage → VC → SyncTargets → BKECluster.Spec                            │
+│    → BKEAgent getBKEConfig() → BkeConfig.Cluster.KubernetesVersion              │
+│    → Go 模板 imageInfo() → manifest image tag                                  │
+│                                                                                 │
+│  修正后 (从 ReleaseImage 直接获取):                                              │
+│    ReleaseImage → bundle → Command CR 携带 kubernetesVersion/etcdVersion 参数  │
+│    → BKEAgent getBKEConfig() 读取参数覆盖 BkeConfig                              │
+│    → Go 模板 imageInfo() → manifest image tag (来源为 ReleaseImage，非 Spec)   │
+│                                                                                 │
+│  修正的原因:                                                                     │
+│  1. Spec 同步依赖 mergecluster.SyncStatusUntilComplete API patch，有竞态风险   │
+│     (patch 未完成时 BKEAgent 可能读到旧值)                                       │
+│  2. Spec 是用户可编辑字段，用户可能修改了 Spec 中的版本导致不一致               │
+│  3. ReleaseImage 是声明式真相源，版本应直接从 ReleaseImage 获取                  │
+│  4. Command CR 携带版本参数是同步操作，无竞态风险                                │
+│                                                                                 │
+│  对 kubelet 延迟升级的影响:                                                      │
+│  skipKubelet 仍然有效 — installKubeletCommand 从 BkeConfig.Cluster.             │
+│  KubernetesVersion 读取版本 (已被 Command 参数覆盖为 ReleaseImage 版本)         │
+│  skipKubelet=true 跳过此函数即可                                                 │
+│                                                                                 │
+│  对 etcd 版本的影响:                                                             │
+│  etcd 版本通过 Command 参数 etcdVersion 传入 → Extra["etcdVersion"]             │
+│  → etcdImageTagFromBootScope() 优先级 1 (Extra["etcdVersion"]) 命中             │
+│  → 不再依赖 BKECluster.Spec.EtcdVersion                                         │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 7.2.3 版本来源对比汇总
+
+| 组件 | 当前来源 (Legacy) | 修正后来源 (声明式 DAG) | 传递方式 |
+|------|------------------|----------------------|---------|
+| kube-apiserver manifest tag | `BkeConfig.Cluster.KubernetesVersion` (Spec 同步) | `bundle.Components[kubernetes-master].Version` | Command CR `kubernetesVersion` 参数 |
+| kube-controller-manager manifest tag | 同上 | 同上 | 同上 |
+| kube-scheduler manifest tag | 同上 | 同上 | 同上 |
+| etcd manifest tag | `BkeConfig.Cluster.EtcdVersion` 或 `Extra["etcdVersion"]` | `bundle.Components[etcd].Version` | Command CR `etcdVersion` 参数 → `Extra["etcdVersion"]` |
+| kubelet 二进制 | `BkeConfig.Cluster.KubernetesVersion` | `bundle.Components[kubernetes-worker].Version` | Command CR `kubernetesVersion` 参数 |
+| kubectl 二进制 | `BkeConfig.Cluster.KubernetesVersion` | `bundle.Components[kubernetes-master].Version` | Command CR `kubernetesVersion` 参数 |
+
+> **Spec 同步保留但仅用于兼容**：`ApplyVersionContextTargetsToClusterSpec()` 仍执行，确保 Legacy 代码路径 (如 `upgradeMasterNodesWithParams` / `waitForNodeHealthCheck` 直接读 Spec) 能获取正确版本。但 BKEAgent 的版本来源修正为 Command CR 参数 (从 ReleaseImage)，不再依赖 Spec 同步时序。
 
 ### 7.3 安装 DAG 结构
 
