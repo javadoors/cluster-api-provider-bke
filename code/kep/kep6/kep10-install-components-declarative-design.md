@@ -708,6 +708,7 @@ func InstallComponentsFromBundle(bundle *releasemanifest.Bundle) ([]apiv1.Releas
 func BuildInstallDAGFromBundle(
     bundle *releasemanifest.Bundle,
     resolve topology.DependencyResolver,
+    excludeComponents ...string,  // ★ 新增: 条件排除组件列表
 ) (*topology.UpgradeDAG, error) {
     // 1. 提取安装组件
     installComponents, err := InstallComponentsFromBundle(bundle)
@@ -715,9 +716,21 @@ func BuildInstallDAGFromBundle(
         return nil, err
     }
     
-    // 2. 转换为 ComponentNode（复用 UpgradeComponent 结构）
-    var components []topology.ReleaseImageUpgradeComponent
+    // 2. ★ 条件过滤: 排除指定组件 (如 manage 在全新安装时排除)
+    excludeSet := make(map[string]bool)
+    for _, name := range excludeComponents {
+        excludeSet[name] = true
+    }
+    var filteredComponents []apiv1.ReleaseImageInstallComponent
     for _, ic := range installComponents {
+        if !excludeSet[ic.Name] {
+            filteredComponents = append(filteredComponents, ic)
+        }
+    }
+    
+    // 3. 转换为 ComponentNode（复用 UpgradeComponent 结构）
+    var components []topology.ReleaseImageUpgradeComponent
+    for _, ic := range filteredComponents {
         comp := topology.ReleaseImageUpgradeComponent{
             Name:    ic.Name,
             Version: ic.Version,
@@ -731,7 +744,7 @@ func BuildInstallDAGFromBundle(
         components = append(components, comp)
     }
     
-    // 3. 复用 BuildUpgradeDAG（同一构建逻辑）
+    // 4. 复用 BuildUpgradeDAG（同一构建逻辑）
     return topology.BuildUpgradeDAG(components, resolve)
 }
 ```
@@ -1204,7 +1217,8 @@ func (r *BKEClusterReconciler) executeInstallDAG(
     upgrade.ApplyVersionContextTargetsToClusterSpec(vc, newCluster)
     
     // 4. 构建安装 DAG
-    dag, err := upgrade.BuildInstallDAGFromBundle(bundle, upgrade.BundleDependencyResolver(bundle))
+    //    ★ 排除 manage 组件: 全新安装不需要纳管探测，manage 仅在纳管场景 (Spec.Manage=true) 执行
+    dag, err := upgrade.BuildInstallDAGFromBundle(bundle, upgrade.BundleDependencyResolver(bundle), "manage")
     
     // 5. 构建 ComponentFactory（注册安装 handler）
     factory := componentfactory.NewFactoryFromBundle(bundle)
@@ -1815,6 +1829,25 @@ var (
 │  3. 并行执行 — 纳管后的安装/升级走 DAG 并行批次，而非 PhaseFlow 串行            │
 │  4. 统一路径 — 纳管 + 安装 + 升级统一走 DAG，消除 PhaseFlow 特殊路径            │
 │                                                                                 │
+│  manage 组件的条件包含:                                                          │
+│  ┌─────────────────────────────────────────────────────────────────────────┐   │
+│  │ 问题: manage 组件放在 install.components 中，对全新安装有没有影响？      │   │
+│  │                                                                         │   │
+│  │ 影响:                                                                   │   │
+│  │ • 全新安装: manage 探测不存在的集群 → 探测失败/空版本 → 干扰后续 Decide │   │
+│  │ • 纳管场景: manage 探测已有集群 → 填充 VC.Current → 后续组件正确 Decide │   │
+│  │                                                                         │   │
+│  │ 解决方案: 条件包含 (方式 B)                                              │   │
+│  │ • manage 在 ReleaseImage install.components 中 (声明式定义)             │   │
+│  │ • BuildInstallDAGFromBundle 按场景条件过滤:                             │   │
+│  │   - 全新安装: 排除 manage 组件 (excludeComponents=["manage"])           │   │
+│  │   - 纳管场景: 不排除 manage 组件 (保留在 DAG 中)                        │   │
+│  │                                                                         │   │
+│  │ 为什么用方式 B 而非方式 A (不放 install.components):                    │   │
+│  │ • 方式 A: manage 不在声明式定义中，需硬编码注入，违反声明式原则         │   │
+│  │ • 方式 B: manage 在声明式定义中，按场景条件过滤，保持声明式一致性       │   │
+│  └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -2045,7 +2078,10 @@ func (r *BKEClusterReconciler) executeManageDAG(
     phaseCtx.SetVersionContext(vc)
 
     // 3. 构建 DAG (manage 组件在第一个 Batch)
+    //    ★ 纳管场景不排除 manage 组件 (与 executeInstallDAG 的区别)
+    //    manage 组件探测版本 → 填充 VC.Current → 后续组件 Decide (Skip/Upgrade/Install)
     dag, err := upgrade.BuildInstallDAGFromBundle(bundle, upgrade.BundleDependencyResolver(bundle))
+    // 注意: 不传 excludeComponents 参数，manage 组件保留在 DAG 中
 
     // 4. 构建 Scheduler (manage handler 需优先注册)
     factory := componentfactory.NewFactoryFromBundle(bundle)
