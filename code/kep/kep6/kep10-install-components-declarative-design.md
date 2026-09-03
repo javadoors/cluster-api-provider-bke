@@ -1178,6 +1178,212 @@ func (k *KubeadmPlugin) getBKEConfig(bkeConfigNS string) error {
 
 > **Spec 同步保留但仅用于兼容**：`ApplyVersionContextTargetsToClusterSpec()` 仍执行，确保 Legacy 代码路径 (如 `upgradeMasterNodesWithParams` / `waitForNodeHealthCheck` 直接读 Spec) 能获取正确版本。但 BKEAgent 的版本来源修正为 Command CR 参数 (从 ReleaseImage)，不再依赖 Spec 同步时序。
 
+#### 7.2.4 kubernetesVersion 命令参数设计 (对标 etcdVersion)
+
+##### 现状分析
+
+当前代码中 etcd 已有命令参数覆盖机制，但 K8s 版本没有：
+
+| 组件 | 命令参数 | 覆盖函数 | 覆盖目标 | 状态 |
+|------|---------|---------|---------|------|
+| etcd | `etcdVersion` | `applyCommandEtcdVersion()` (kubeadm.go:436) | `BkeConfig.Cluster.EtcdVersion` + `Extra["etcdVersion"]` | **已实现** |
+| K8s (apiserver/cm/scheduler/kubelet/kubectl) | **无** | **无** | 依赖 `SyncUpgradeTargetsToClusterSpec` → `BKECluster.Spec` → `getBKEConfig()` 读取 | **未实现** ★ |
+
+```go
+// pkg/job/builtin/kubeadm/kubeadm.go — Execute() 现有代码 (line 122-133)
+
+func (k *KubeadmPlugin) Execute(commands []string) ([]string, error) {
+    parseCommands, err := plugin.ParseCommands(k, commands)
+    // ...
+    if v, ok := parseCommands["bkeConfig"]; ok {
+        if err = k.getBKEConfig(v); err != nil {  // 从 BKECluster.Spec 读取 BkeConfig
+            return nil, err
+        }
+        k.applyCommandEtcdVersion(parseCommands)  // ★ etcd 有命令参数覆盖
+        // ✗ 没有 applyCommandKubernetesVersion — K8s 版本无命令参数覆盖
+    }
+
+    switch parseCommands["phase"] {
+    case utils.UpgradeControlPlane:
+        // ...
+        return nil, k.upgradeControlPlane(backupEtcd, parseCommands["clusterType"])
+        // upgradeControlPlane 内部读取 BkeConfig.Cluster.KubernetesVersion (来自 Spec，非命令参数)
+    }
+}
+
+// applyCommandEtcdVersion — etcd 的命令参数覆盖 (现有，line 436)
+func (k *KubeadmPlugin) applyCommandEtcdVersion(parseCommands map[string]string) {
+    v, ok := parseCommands["etcdVersion"]
+    if !ok || v == "" || k.boot == nil || k.boot.BkeConfig == nil {
+        return
+    }
+    k.boot.BkeConfig.Cluster.EtcdVersion = v           // 覆盖 Spec 中的版本
+    if k.boot.Extra == nil {
+        k.boot.Extra = map[string]interface{}{}
+    }
+    k.boot.Extra["etcdVersion"] = v                     // 模板优先级 1: Extra["etcdVersion"]
+}
+```
+
+**问题**：K8s 版本完全依赖 `getBKEConfig()` 从 `BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion` 读取。该字段由 `SyncUpgradeTargetsToClusterSpec()` 从 VersionContext 同步，存在以下风险：
+
+| 风险 | 说明 |
+|------|------|
+| **Spec 同步时序** | `SyncUpgradeTargetsToClusterSpec` 通过 `mergecluster.SyncStatusUntilComplete` API patch，patch 未完成时 BKEAgent 可能读到旧值 |
+| **用户可编辑 Spec** | `BKECluster.Spec` 是用户可编辑字段，用户可能修改版本导致不一致 |
+| **ReleaseImage 非直接来源** | 版本经 ReleaseImage → VC → Spec → BkeConfig 多跳传递，非直接从 ReleaseImage 获取 |
+
+##### 设计方案：新增 applyCommandKubernetesVersion
+
+**对标 `applyCommandEtcdVersion`，新增 `applyCommandKubernetesVersion`**：
+
+```go
+// pkg/job/builtin/kubeadm/kubeadm.go — 新增
+
+// applyCommandKubernetesVersion overrides spec kubernetes version when the provider passes a
+// declarative upgrade/install target (VersionContext / release bundle).
+// Symmetric to applyCommandEtcdVersion.
+func (k *KubeadmPlugin) applyCommandKubernetesVersion(parseCommands map[string]string) {
+    v, ok := parseCommands["kubernetesVersion"]
+    if !ok || v == "" || k.boot == nil || k.boot.BkeConfig == nil {
+        return
+    }
+    // 覆盖 BkeConfig.Cluster.KubernetesVersion (来自 BKECluster.Spec 的值)
+    // 供以下消费者使用:
+    //   - manifest 渲染: imageInfo() → kube-apiserver:{version} / kube-controller-manager:{version} / kube-scheduler:{version}
+    //   - kubelet 二进制: installKubeletCommand() → kubelet-{version}-{arch}
+    //   - kubectl 二进制: installKubectlCommand() → kubectl-{version}-{arch}
+    //   - needUpgradeComponent(): 比较运行中 Pod image tag vs KubernetesVersion
+    k.boot.BkeConfig.Cluster.KubernetesVersion = v
+}
+```
+
+**Execute() 中调用 (与 applyCommandEtcdVersion 对称)**：
+
+```go
+// pkg/job/builtin/kubeadm/kubeadm.go — Execute() 修改 (line 127-133)
+
+func (k *KubeadmPlugin) Execute(commands []string) ([]string, error) {
+    parseCommands, err := plugin.ParseCommands(k, commands)
+    // ...
+    if v, ok := parseCommands["bkeConfig"]; ok {
+        if err = k.getBKEConfig(v); err != nil {
+            return nil, err
+        }
+        k.applyCommandEtcdVersion(parseCommands)            // 现有: etcd 版本覆盖
+        k.applyCommandKubernetesVersion(parseCommands)       // ★ 新增: K8s 版本覆盖
+    }
+
+    switch parseCommands["phase"] {
+    // ... 不变
+    }
+}
+```
+
+##### Command CR 传递版本参数
+
+**管理集群侧 (EnsureMasterUpgrade / EnsureMasterInit)**：
+
+```go
+// pkg/phaseframe/phases/ensure_master_upgrade.go — 创建 Command CR 时注入版本参数
+
+func (e *EnsureMasterUpgrade) upgradeMasterNodesWithParams(skipKubelet bool) (ctrl.Result, error) {
+    // ... 获取 Master 节点 ...
+
+    // 从 ExecutionContext 获取 ReleaseImage bundle
+    bundle := e.Ctx.ReleaseBundle  // ★ bundle 注入 PhaseContext
+
+    // 从 bundle 解析版本 (对标 etcdVersion 的传递方式)
+    k8sVersion := releaseVersionFromBundle(bundle, "kubernetes-master")
+    etcdVersion := releaseVersionFromBundle(bundle, "etcd")
+
+    for _, node := range masterNodes {
+        masterParams := CreateUpgradeCommandParams{
+            // ... 现有参数不变 ...
+            Phase:           bkev1beta1.UpgradeControlPlane,
+            SkipKubelet:     skipKubelet,
+            KubernetesVersion: k8sVersion,   // ★ 新增: 从 ReleaseImage 获取
+            EtcdVersion:     etcdVersion,    // 现有: 从 ReleaseImage 获取
+        }
+        // createUpgradeCommand 将参数注入 Command CR 的 command 列表
+        upgrade := createUpgradeCommand(masterParams)
+        // ...
+    }
+}
+
+// releaseVersionFromBundle 从 ReleaseImage bundle 中查找组件版本
+// (与 §7.2.2 中的实现一致)
+func releaseVersionFromBundle(bundle *releasemanifest.Bundle, componentName string) string {
+    // 优先 upgrade.components，回退 install.components
+    if bundle.Release.Spec.Upgrade != nil {
+        for _, c := range bundle.Release.Spec.Upgrade.Components {
+            if c.Name == componentName {
+                return c.Version
+            }
+        }
+    }
+    if bundle.Release.Spec.Install != nil {
+        for _, c := range bundle.Release.Spec.Install.Components {
+            if c.Name == componentName {
+                return c.Version
+            }
+        }
+    }
+    return ""
+}
+```
+
+**Command CR 中的参数格式**：
+
+```txt
+Command CR command 列表:
+  Kubeadm
+  phase=UpgradeControlPlane
+  bkeConfig=<ns>:<name>
+  backUpEtcd=true
+  clusterType=openfuyao
+  etcdVersion=v3.6.7-of.1          ← 现有: etcd 版本从 ReleaseImage
+  kubernetesVersion=v1.35.0-of.1   ← ★ 新增: K8s 版本从 ReleaseImage
+```
+
+**BKEAgent 端解析 (ParseCommands 自动解析键值对)**：
+
+```go
+// parseCommands["kubernetesVersion"] = "v1.35.0-of.1"
+// → applyCommandKubernetesVersion 覆盖 BkeConfig.Cluster.KubernetesVersion
+// → 所有依赖 KubernetesVersion 的代码路径获得正确版本:
+//   - manifest imageInfo(): kube-apiserver:1.35.0-of.1
+//   - installKubeletCommand(): kubelet-v1.35.0-of.1-amd64
+//   - installKubectlCommand(): kubectl-v1.35.0-of.1-amd64
+//   - needUpgradeComponent(): 比较运行中 Pod tag vs "v1.35.0-of.1"
+```
+
+##### etcdVersion 与 kubernetesVersion 的对称性
+
+| 维度 | etcdVersion (现有) | kubernetesVersion (新增) | 对称性 |
+|------|-------------------|------------------------|--------|
+| **命令参数** | `etcdVersion` | `kubernetesVersion` | 对称 |
+| **覆盖函数** | `applyCommandEtcdVersion()` | `applyCommandKubernetesVersion()` | 对称 |
+| **覆盖目标** | `BkeConfig.Cluster.EtcdVersion` + `Extra["etcdVersion"]` | `BkeConfig.Cluster.KubernetesVersion` | 基本对称 (K8s 不需要 Extra，因模板直接读 BkeConfig) |
+| **模板优先级** | `Extra["etcdVersion"]` > `BkeConfig.Cluster.EtcdVersion` > 默认 | `BkeConfig.Cluster.KubernetesVersion` (唯一来源) | K8s 无多级优先级需求 |
+| **来源** | `bundle.Components[etcd].Version` | `bundle.Components[kubernetes-master].Version` | 对称 (均从 ReleaseImage bundle) |
+| **传递方式** | Command CR 参数 | Command CR 参数 | 对称 |
+| **作用** | etcd manifest image tag | apiserver/cm/scheduler manifest tag + kubelet/kubectl 二进制 | K8s 影响范围更广 |
+
+##### 修改清单
+
+| 文件 | 修改内容 | 工作量 |
+|------|---------|--------|
+| `pkg/job/builtin/kubeadm/kubeadm.go` | 新增 `applyCommandKubernetesVersion()` + Execute() 调用 | 0.5 人日 |
+| `pkg/phaseframe/phases/ensure_master_upgrade.go` | Command CR 注入 `kubernetesVersion` 参数 | 0.5 人日 |
+| `pkg/phaseframe/phases/ensure_master_init.go` | Command CR 注入 `kubernetesVersion` 参数 (安装路径) | 0.5 人日 |
+| `pkg/phaseframe/phases/ensure_worker_upgrade.go` | Command CR 注入 `kubernetesVersion` 参数 (worker 升级) | 0.5 人日 |
+| `pkg/phaseframe/phases/ensure_worker_join.go` | Command CR 注入 `kubernetesVersion` 参数 (安装路径) | 0.5 人日 |
+| 单元测试 | `applyCommandKubernetesVersion` 测试 + 参数传递测试 | 1 人日 |
+| **合计** | | **3.5 人日** |
+
+> **与 KEP-7 minimal-k8s-upgrade 的关系**：本设计在 KEP-10 (安装 DAG) 和 KEP-7 (最小化升级方案) 中共享。`applyCommandKubernetesVersion` 修改的是 BKEAgent 代码，安装和升级路径共同受益。`skipKubelet` 仍然有效 — `installKubeletCommand()` 读取的 `BkeConfig.Cluster.KubernetesVersion` 已被命令参数覆盖为 ReleaseImage 版本，`skipKubelet=true` 仅跳过该函数的执行，不影响版本来源。
+
 ### 7.3 安装 DAG 结构
 
 ```
