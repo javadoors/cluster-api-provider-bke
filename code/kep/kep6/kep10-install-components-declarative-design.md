@@ -828,45 +828,257 @@ func BuildVersionContextForInstall(
 
 ### 7.1 执行入口
 
+#### 7.1.0 三路分发统一设计
+
+`executePhaseFlow()` 是 BKEClusterReconciler 的核心分发入口，统一管理 DAG 升级、DAG 安装、Legacy PhaseFlow 三条路径。设计原则是**优先匹配 DAG 路径，未命中则回退 Legacy**，确保 Feature Gate 关闭时行为完全不变。
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              executePhaseFlow 三路分发统一设计                                     │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  executePhaseFlow(ctx, phaseCtx, oldCluster, newCluster)                        │
+│     │                                                                           │
+│     │  1. 预处理: 清理过期状态                                                   │
+│     │     cleanupStaleDeclarativeUpgradeStatus(newCluster)                       │
+│     │     (如果上次 DAG 执行中断且集群已重置，清理残留的 DeclarativeUpgradeStatus) │
+│     │                                                                           │
+│     │  2. 判断集群操作类型                                                       │
+│     │     ├─ Delete? → DeletePhases 路径                                       │
+│     │     ├─ Pause? → EnsurePaused Phase                                      │
+│     │     ├─ DryRun? → EnsureDryRun Phase                                     │
+│     │     ├─ Manage? → EnsureClusterManage Phase                               │
+│     │     ├─ Reset? → ResetPhases 路径                                         │
+│     │     └─ Install/Upgrade? → 继续判断 DAG vs Legacy ↓                       │
+│     │                                                                           │
+│     │  3. DAG 升级路径 (优先匹配)                                               │
+│     │     shouldUseDeclarativeUpgrade(newCluster)?                              │
+│     │     ├─ true → executeUpgradeDAG(...) → return                            │
+│     │     └─ false → 继续                                                      │
+│     │                                                                           │
+│     │  4. DAG 安装路径 (次优先匹配)                                              │
+│     │     shouldUseDeclarativeInstall(newCluster)?                               │
+│     │     ├─ true → executeInstallDAG(...) → return                            │
+│     │     └─ false → 继续                                                      │
+│     │                                                                           │
+│     │  5. Legacy PhaseFlow 路径 (兜底)                                          │
+│     │     ├─ 集群操作类 (Delete/Pause/DryRun/Manage/Reset):                     │
+│     │     │   走 CommonPhases + 对应专用 Phase                                   │
+│     │     ├─ 全新安装 (无 install-ready):                                        │
+│     │     │   走 CommonPhases + DeployPhases (从 BKECluster.Spec 读取版本)      │
+│     │     ├─ 集群扩容 (新增 Master/Worker):                                    │
+│     │     │   走 CommonPhases + ScalePhases (部分 Phase，非完整安装)             │
+│     │     └─ 升级 (无 upgrade-ready):                                           │
+│     │         走 CommonPhases + UpgradePhases (从 BKECluster.Spec 读取版本)     │
+│     │                                                                           │
+│     ▼                                                                           │
+│  执行完成                                                                       │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 7.1.1 完整代码实现
+
 ```go
 // controllers/capbke/bkecluster_controller.go
 
-func (r *BKEClusterReconciler) executePhaseFlow(ctx, phaseCtx, oldCluster, newCluster) {
-    // 现有：DAG 升级路径
+func (r *BKEClusterReconciler) executePhaseFlow(
+    ctx context.Context,
+    phaseCtx *phaseframe.PhaseContext,
+    oldCluster, newCluster *bkev1beta1.BKECluster,
+) (ctrl.Result, error) {
+    // ─── 预处理: 清理过期状态 ───
+    // 如果集群被重置或重新创建，清理上次 DAG 执行的残留状态
+    if shouldCleanupDeclarativeStatus(newCluster) {
+        cleanupStaleDeclarativeUpgradeStatus(newCluster)
+    }
+
+    // ─── DAG 升级路径 (优先匹配) ───
     if r.shouldUseDeclarativeUpgrade(newCluster) {
-        r.executeUpgradeDAG(...)
-        ...
+        return r.executeUpgradeDAG(ctx, phaseCtx, oldCluster, newCluster)
     }
-    
-    // 🆕新增：DAG 安装路径
+
+    // ─── DAG 安装路径 (次优先匹配) ───
     if r.shouldUseDeclarativeInstall(newCluster) {
-        r.executeInstallDAG(ctx, phaseCtx, oldCluster, newCluster)
-        // 安装 DAG 完成后跳过 DeployPhases
-        return
+        return r.executeInstallDAG(ctx, phaseCtx, oldCluster, newCluster)
     }
-    
-    // 现有：PhaseFlow 路径（Legacy）
+
+    // ─── Legacy PhaseFlow 路径 (兜底) ───
+    // 以下场景走 Legacy PhaseFlow:
+    //   1. 集群操作类 (Delete/Pause/DryRun/Manage/Reset) — 非 Install/Upgrade 操作
+    //   2. 全新安装但 Feature Gate 未启用或 ReleaseImage 未就绪
+    //   3. 集群扩容 (新增 Master/Worker 节点)
+    //   4. 升级但 Feature Gate 未启用或 ReleaseImage 未就绪
     flow := phases.NewPhaseFlow(phaseCtx)
-    ...
+    return flow.Execute()
+}
+
+// shouldCleanupDeclarativeStatus 判断是否需要清理残留的 DAG 状态
+// 场景: 集群重置后重新安装、DAG 执行中断后用户手动重置
+func (r *BKEClusterReconciler) shouldCleanupDeclarativeStatus(bkeCluster *bkev1beta1.BKECluster) bool {
+    // 集群被重置
+    if bkeCluster.Spec.Reset {
+        return true
+    }
+    // DeclarativeUpgradeStatus 有记录但集群状态为 Init (可能被重置)
+    if bkeCluster.Status.DeclarativeUpgrade != nil &&
+        bkeCluster.Status.DeclarativeUpgrade.TargetVersion != "" &&
+        bkeCluster.Status.ClusterStatus == bkev1beta1.ClusterInitializing {
+        return true
+    }
+    return false
+}
+
+// cleanupStaleDeclarativeUpgradeStatus 清理残留的 DAG 执行状态
+func (r *BKEClusterReconciler) cleanupStaleDeclarativeUpgradeStatus(bkeCluster *bkev1beta1.BKECluster) {
+    bkeCluster.Status.DeclarativeUpgrade = nil
+    bkeCluster.Status.ClusterComponentStatuses = nil
+    // 清理可能残留的注解
+    delete(bkeCluster.Annotations, annotation.UpgradeReadyAnnotationKey)
+    delete(bkeCluster.Annotations, annotation.InstallReadyAnnotationKey)
+    delete(bkeCluster.Annotations, annotation.SkipKubeletUpgradeAnnotationKey)
+    delete(bkeCluster.Annotations, annotation.KubeletCatchupTargetAnnotationKey)
 }
 ```
 
-**PhaseFlow 路径（Legacy）的适用场景**：
+#### 7.1.2 Legacy PhaseFlow 路径设计
 
-以下场景仍会走 Legacy PhaseFlow 路径，不走 DAG 安装路径：
+Legacy PhaseFlow 是 DAG 路径的兜底方案，覆盖所有 DAG 路径不适用的场景。PhaseFlow 通过 `CalculatePhase()` 动态计算需要执行的 Phase 列表：
 
-| 场景 | 原因 | 说明 |
-|------|------|------|
-| **Feature Gate 未启用** | `DeclarativeInstallEnabled = false`（默认） | 迁移期间默认关闭，确保生产稳定；正式启用后此场景消失 |
-| **ReleaseImage 无 inline handler** | `install.components[].inline` 字段为空 | 旧格式 ReleaseImage 仅有 `{name, version}`，DAG 无法分发执行器；需升级 ReleaseImage 格式后才能走 DAG |
-| **无 install-ready annotation** | ClusterVersionReconciler 未设置 `install-ready` | 仅当 ReleaseImage Status.Phase=Valid 且 ClusterVersion 判定安装就绪时才设置 annotation |
-| **纳管已有集群** | `BKECluster.Spec.Manage = true`（纳管模式） | 纳管现有集群不走标准安装流程，PhaseFlow 中的 `EnsureClusterManage` 处理纳管逻辑 |
-| **集群扩容（新增节点）** | `EnsureMasterJoin` / `EnsureWorkerJoin` | 扩容时只执行部分 Phase（Join），非完整安装；DAG 安装路径面向全新安装，扩容仍走 PhaseFlow 中的 Scale Phase |
-| **集群删除/重置** | `BKECluster.Spec.Reset = true` 或 `DeletionTimestamp` 非空 | 删除/重置走 `DeletePhases`，与安装 DAG 无关 |
-| **DryRun 模式** | `BKECluster.Spec.DryRun = true` | DryRun 走 PhaseFlow 中的 `EnsureDryRun`，不实际执行安装 |
-| **集群暂停** | `BKECluster.Spec.Pause = true` | 暂停状态下不执行任何操作，走 PhaseFlow 中的 `EnsurePaused` |
+```go
+// pkg/phaseframe/phases/phase_flow.go — CalculatePhase 扩展
 
-> **注意**：扩容场景（新增 Master/Worker 节点）虽然不走 DAG 安装路径，但未来可考虑将扩容也纳入 DAG 驱动（如 `kubernetes-master` 组件的 `DecisionInstall` 触发 `EnsureMasterJoin` handler），作为后续优化方向。
+func (f *PhaseFlow) CalculatePhase(old, new *bkev1beta1.BKECluster) []Phase {
+    var phases []Phase
+
+    // ─── Phase 1: CommonPhases (所有操作通用) ───
+    // 这些 Phase 在所有场景下都执行，处理集群级操作
+    for _, phaseFunc := range CommonPhases {
+        phase := phaseFunc(f.ctx)
+        if phase.NeedExecute(old, new) {
+            phases = append(phases, phase)
+        }
+    }
+
+    // ─── Phase 2: 按操作类型选择专用 Phase ───
+    switch {
+    // 集群删除
+    case new.DeletionTimestamp != nil || new.Spec.Reset:
+        phases = append(phases, f.buildDeletePhases(old, new)...)
+
+    // 集群暂停
+    case new.Spec.Pause:
+        phases = append(phases, f.buildPausePhases(old, new)...)
+
+    // DryRun 模式
+    case new.Spec.DryRun:
+        phases = append(phases, f.buildDryRunPhases(old, new)...)
+
+    // 纳管已有集群
+    case new.Spec.Manage:
+        phases = append(phases, f.buildManagePhases(old, new)...)
+
+    // 全新安装
+    case f.isNewInstall(old, new):
+        // ★ 如果 DAG 路径未启用或 ReleaseImage 未就绪，走 Legacy 安装
+        // 版本来源: BKECluster.Spec.ClusterConfig.Cluster (用户直接设置或 ClusterVersion 同步)
+        phases = append(phases, f.buildDeployPhases(old, new)...)
+
+    // 集群扩容 (新增 Master/Worker 节点)
+    case f.isScale(old, new):
+        // ★ 扩容不走 DAG 安装路径，仅执行 Scale Phase
+        // Scale Phase 复用 DeployPhases 中的部分 Phase (Join/PostProcess)
+        phases = append(phases, f.buildScalePhases(old, new)...)
+
+    // 集群升级
+    case f.isUpgrade(old, new):
+        // ★ 如果 DAG 升级路径未启用或 ReleaseImage 未就绪，走 Legacy 升级
+        // 版本来源: BKECluster.Spec.ClusterConfig.Cluster (用户直接设置或 ClusterVersion 同步)
+        phases = append(phases, f.buildUpgradePhases(old, new)...)
+    }
+
+    return phases
+}
+```
+
+#### 7.1.3 Legacy 路径的版本来源
+
+Legacy PhaseFlow 的版本来源与 DAG 路径不同：
+
+| 维度 | DAG 路径 (安装/升级) | Legacy PhaseFlow 路径 |
+|------|---------------------|----------------------|
+| **K8s 版本来源** | `ReleaseImage bundle.Components[kubernetes-master].Version` → Command CR 参数 | `BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion` (用户设置或 ClusterVersion 同步) |
+| **etcd 版本来源** | `ReleaseImage bundle.Components[etcd].Version` → Command CR 参数 | `BKECluster.Spec.ClusterConfig.Cluster.EtcdVersion` (用户设置或 ClusterVersion 同步) |
+| **是否依赖 ReleaseImage** | 是 (必须 Phase=Valid) | 否 (从 Spec 直接读取) |
+| **BKEAgent 版本来源** | Command CR `kubernetesVersion`/`etcdVersion` 参数 (§7.2.4) | `BkeConfig.Cluster.KubernetesVersion` (getBKEConfig 从 Spec 读取) |
+| **适用场景** | Feature Gate 启用 + ReleaseImage Valid | Feature Gate 关闭 / ReleaseImage 未就绪 / 扩容 / 纳管等 |
+
+> **关键**：Legacy 路径**不依赖 ReleaseImage**，从 `BKECluster.Spec` 直接读取版本。这确保即使没有 ReleaseImage CR 也能完成安装/升级 (向后兼容)。
+
+#### 7.1.4 Legacy 路径与 DAG 路径的共存设计
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              Legacy 与 DAG 路径共存设计                                           │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  场景 1: Feature Gate 全关闭 (v2.7.0 默认)                                      │
+│    所有操作走 Legacy PhaseFlow                                                   │
+│    版本从 BKECluster.Spec 读取                                                   │
+│    ReleaseImage CR 可有可无                                                      │
+│                                                                                 │
+│  场景 2: Feature Gate 部分开启 (v2.8.0 灰度)                                     │
+│    DAG 升级路径开启 → 升级走 DAG                                                 │
+│    DAG 安装路径关闭 → 安装走 Legacy PhaseFlow                                    │
+│    版本: 升级从 ReleaseImage, 安装从 Spec                                         │
+│                                                                                 │
+│  场景 3: Feature Gate 全开启 (v2.9.0+)                                           │
+│    全新安装走 DAG 安装路径                                                       │
+│    版本升级走 DAG 升级路径                                                       │
+│    扩容/纳管/删除/暂停/DryRun 仍走 Legacy PhaseFlow                              │
+│    版本均从 ReleaseImage                                                         │
+│                                                                                 │
+│  场景 4: ReleaseImage 未就绪 (Feature Gate 开启但 RI 未验证)                     │
+│    install-ready/upgrade-ready annotation 未设置                                 │
+│    → shouldUseDeclarativeInstall/Upgrade 返回 false                              │
+│    → 回退 Legacy PhaseFlow                                                       │
+│    → 版本从 BKECluster.Spec 读取 (不依赖 RI)                                     │
+│                                                                                 │
+│  场景 5: 混合模式 (部分组件 DAG, 部分组件 Legacy)                                │
+│    Phase 2 灰度: 低风险组件 (coredns/kube-proxy) 走 DAG                         │
+│    高风险组件 (kubernetes-master/etcd) 仍走 Legacy                              │
+│    DeclarativeUpgradeStatus 追踪已完成组件                                       │
+│    Legacy Phase 跳过已由 DAG 完成的组件 (DeclarativeDAGCompleted)              │
+│                                                                                 │
+│  共存保障:                                                                       │
+│    1. shouldUseDeclarativeInstall/Upgrade 互斥 — 不会同时走两条 DAG 路径       │
+│    2. Legacy PhaseFlow 的 CalculatePhase 检查 DeclarativeDAGCompleted          │
+│       → 如果 DAG 已完成部分组件，Legacy Phase 跳过这些组件                       │
+│    3. 版本来源统一: 两种路径都通过 ApplyVersionContextTargetsToClusterSpec      │
+│       将版本同步到 BKECluster.Spec (Legacy 直接读取，DAG 通过 Command CR 覆盖)  │
+│    4. 状态隔离: DeclarativeUpgradeStatus (DAG) vs PhaseStatus (Legacy)          │
+│       各自追踪，互不干扰                                                          │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 7.1.5 PhaseFlow 路径（Legacy）的适用场景
+
+以下场景仍会走 Legacy PhaseFlow 路径，不走 DAG 路径：
+
+| 场景 | 原因 | 说明 | 走哪个 Phase 列表 |
+|------|------|------|------------------|
+| **Feature Gate 未启用** | `DeclarativeInstallEnabled = false` / `DeclarativeUpgradeEnabled = false` | 迁移期间默认关闭，确保生产稳定；正式启用后此场景消失 | CommonPhases + DeployPhases / UpgradePhases |
+| **ReleaseImage 未就绪** | `install-ready` / `upgrade-ready` annotation 未设置 | RI 未创建或 Status.Phase != Valid | CommonPhases + DeployPhases / UpgradePhases |
+| **ReleaseImage 无 inline handler** | `install.components[].inline` 字段为空 | 旧格式 RI 仅有 `{name, version}`，DAG 无法分发执行器 | CommonPhases + DeployPhases |
+| **纳管已有集群** | `BKECluster.Spec.Manage = true` | 纳管现有集群不走标准安装流程 | CommonPhases + ManagePhases |
+| **集群扩容** | 新增 Master/Worker 节点 | 扩容仅执行部分 Phase (Join)，非完整安装 | CommonPhases + ScalePhases |
+| **集群删除/重置** | `Spec.Reset = true` 或 `DeletionTimestamp` 非空 | 删除/重置走专用 Phase | CommonPhases + DeletePhases |
+| **DryRun 模式** | `Spec.DryRun = true` | DryRun 不实际执行安装 | CommonPhases + DryRunPhases |
+| **集群暂停** | `Spec.Pause = true` | 暂停状态下不执行任何操作 | CommonPhases + PausePhases |
+| **混合模式** | Phase 2 灰度: 部分组件 DAG，部分 Legacy | 高风险组件仍走 Legacy | CommonPhases + 部分 DeployPhases/UpgradePhases (跳过 DAG 已完成的) |
+
+> **注意**：扩容场景 (新增 Master/Worker 节点) 虽然不走 DAG 安装路径，但未来可考虑将扩容也纳入 DAG 驱动 (如 `kubernetes-master` 组件的 `DecisionInstall` 触发 `EnsureMasterJoin` handler)，作为后续优化方向。
 
 ```go
 // shouldUseDeclarativeInstall 判断是否使用 DAG 安装路径 🆕新增
