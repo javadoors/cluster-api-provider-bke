@@ -1946,6 +1946,301 @@ kubectl get bkecluster my-cluster -o jsonpath='{.status.clusterComponentStatuses
 
 ---
 
+## 13. releasemanifest.Bundle 的作用
+
+### 13.1 是什么
+
+`releasemanifest.Bundle` 是 ReleaseImage OCI 制品的**内存解析表示**，是连接声明层 (ReleaseImage CR) 与执行层 (DAG/Scheduler/Phase) 的核心桥梁。
+
+```go
+// pkg/release/manifest/types.go
+
+type Bundle struct {
+    // Release: 解析后的 release.yaml (ReleaseImage CR 内容，非 CR 实例)
+    // 含 Spec.Version, Spec.Install.Components, Spec.Upgrade.Components
+    Release    apiv1.ReleaseImage
+
+    // Components: 解析后的所有 component.yaml，key = "name@version"
+    // 含 Spec.Type, Spec.Inline, Spec.Dependencies, Spec.Compatibility, Spec.Resources
+    Components map[string]apiv1.ComponentVersion
+
+    // Files: OCI 制品中所有 YAML 文件的原始字节，key = 相对路径
+    // 如 "components/coredns/v1.11.1/coredns.yaml"
+    Files map[string][]byte
+
+    // Digest: 文件集 SHA256 (sha256:<hex>)
+    Digest string
+
+    // Source: 来源标识 "Memory" / "Disk" / "OCI"
+    Source string
+
+    // CacheFallback: 是否从磁盘缓存回退加载 (OCI 拉取失败时)
+    CacheFallback bool
+}
+```
+
+### 13.2 作用
+
+Bundle 是声明式安装/升级流程中**所有执行决策的数据来源**：
+
+| 作用 | Bundle 字段 | 消费者 | 说明 |
+|------|------------|--------|------|
+| **版本来源** | `Release.Spec.Install/Upgrade.Components[].Version` | `BuildVersionContextForUpgrade` | 提供 K8s/etcd 等组件版本，填充 VersionContext.Target/Current |
+| **依赖解析** | `Components[key].Spec.Dependencies` | `BundleDependencyResolver` | 提供 DAG 拓扑排序的依赖边 |
+| **执行器分发** | `Components[key].Spec.Type` (inline/yaml/helm/binary) | `Scheduler.executeComponent` | 决定用哪个 Executor 执行组件 |
+| **inline handler 解析** | `Components[key].Spec.Inline.Handler` | `componentfactory.RegisterInlinePhasesFromBundle` | 提供 Phase Handler 名称 (如 `EnsureMasterUpgrade`) |
+| **YAML 清单获取** | `Files["components/coredns/v1.11.1/coredns.yaml"]` | `BundleStore.GetComponentManifests` → `YamlInstaller` | 提供 manifest 原始字节供 Apply |
+| **兼容性校验** | `Components[key].Spec.Compatibility.Constraints` | `compatibility.Engine.Check` | 提供版本约束 (如 kubernetes >=1.24.0) |
+| **ReleaseImage Status 回填** | `Components` (数量和版本) | `ReleaseImageReconciler.componentStatuses` | 回写 ReleaseImage.Status.Components |
+| **镜像 tag 来源** | `Release.Spec.Upgrade.Components[kubernetes-master].Version` | `EnsureMasterUpgrade` → Command CR → BKEAgent | 提供 manifest image tag 版本 (去 v 前缀) |
+
+### 13.3 与 ReleaseImage CR 的关系
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              ReleaseImage CR ↔ Bundle 关系                                       │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  ReleaseImage CR (声明层 — 意图)                                                │
+│  ┌──────────────────────────────────────────────────────────────────────┐      │
+│  │ spec.version: "v2.7.0"                                               │      │
+│  │ spec.digest: "sha256:abc123..."                                      │      │
+│  │ spec.verifySignature: true                                           │      │
+│  │ spec.install.components: [{name, version, inline}]                   │      │
+│  │ spec.upgrade.components: [{name, version, inline}]                   │      │
+│  │ status.phase: Valid / Invalid / ManifestMissing / CompatibilityFailed│     │
+│  │ status.componentCount, status.components[], status.digest            │      │
+│  └────────────────────────────────────┬─────────────────────────────────┘      │
+│                                       │                                         │
+│                  ReleaseImageReconciler:                                         │
+│                  RefreshRelease → OCI Pull → ParseBundle → Check → Commit       │
+│                                       │                                         │
+│                                       ▼                                         │
+│  Bundle (内存解析层 — 物化) ★                                                    │
+│  ┌──────────────────────────────────────────────────────────────────────┐      │
+│  │ Release:     release.yaml 解析结果 (含 Spec.Install/Upgrade)          │      │
+│  │ Components:  所有 component.yaml 解析结果 (key="name@version")        │      │
+│  │ Files:       所有 YAML 原始字节 (key=相对路径)                        │      │
+│  │ Digest:      sha256:<hex>                                            │      │
+│  │ Source:      Memory / Disk / OCI                                     │      │
+│  └────────────────────────────────────┬─────────────────────────────────┘      │
+│                                       │                                         │
+│                  BKEClusterReconciler:                                           │
+│                  ResolveRelease (只读，从不拉 OCI)                               │
+│                                       │                                         │
+│                                       ▼                                         │
+│  执行层 (消费 Bundle):                                                           │
+│    BuildVersionContextForUpgrade  ← Release (版本)                              │
+│    BuildDAGFromBundle             ← Release + Components (依赖)                 │
+│    BundleStore.GetComponentManifests ← Files (YAML 清单)                        │
+│    BundleStore.GetComponentVersion  ← Components (类型/handler)                 │
+│    Scheduler.ExecuteDAG            ← 以上全部                                   │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**核心关系**：
+
+| 维度 | ReleaseImage CR | Bundle |
+|------|----------------|--------|
+| **角色** | 声明层 (意图) — 声明版本和镜像位置 | 物化层 (制品) — 已拉取、解析、验证的实际内容 |
+| **存储** | etcd (Kubernetes CR) | 进程内存 (sync.Map) + 磁盘缓存 |
+| **创建者** | 用户/ClusterVersionReconciler | ReleaseImageReconciler (OCI Pull + ParseBundle) |
+| **生命周期** | 持久化 (直到用户删除) | 进程级 (重启后从磁盘恢复) |
+| **验证状态** | `Status.Phase` (Valid=已验证) | `Digest` + `Source` 标识 |
+| **契约** | `Status.Phase=Valid` → 保证 Bundle 已缓存可用 | `ResolveRelease` 成功 → Bundle 可消费 |
+
+> **关键设计**：`ResolveRelease` **从不拉取 OCI** — BKEClusterReconciler 只从内存/磁盘缓存读取，避免 reconcile 时网络阻塞。OCI 拉取仅由 ReleaseImageReconciler 在验证时执行。
+
+### 13.4 三级缓存生命周期
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              Bundle 三级缓存生命周期                                              │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  ReleaseImageReconciler.Reconcile (写入方):                                     │
+│                                                                                 │
+│  1. buildReleaseRefs (从 RI.Spec + imageref)                                    │
+│     → ReleaseRef{Version, OCIRef, Digest, VerifySignature}                      │
+│                                                                                 │
+│  2. store.RefreshRelease(ctx, ref) — 总是拉取 OCI                               │
+│     ├─ Puller.Pull → OCIPuller → ORAS 拉取 OCI 制品                             │
+│     │  → BundleFiles{Files: map[string][]byte} (所有 YAML 原始字节)             │
+│     ├─ verifier.Verify (签名验证)                                                │
+│     ├─ ParseBundle(files) → *Bundle{Source=OCI}                                 │
+│     │  ├─ 解析 release.yaml → bundle.Release (ReleaseImage CR 内容)             │
+│     │  ├─ 解析 component.yaml → bundle.Components["name@version"]               │
+│     │  └─ 保留所有 Files                                                         │
+│     └─ (拉取失败 + AllowCacheFallback) → loadDiskCache → *Bundle{Source=Disk}   │
+│                                                                                 │
+│  3. compatibility.Engine.Check(bundle) — 兼容性校验                              │
+│     → 读取 Components[key].Spec.Compatibility.Constraints                        │
+│                                                                                 │
+│  4. store.CommitRelease(ref, bundle, files) — 持久化                             │
+│     ├─ memory.Store(key, bundle.DeepCopy()) — 写入内存缓存                       │
+│     └─ writeDiskCache(ref, files, digest) — 写入磁盘缓存                         │
+│        → <diskRoot>/<cacheKey>/  (YAML 树 + metadata.json)                       │
+│                                                                                 │
+│  5. updateStatus(ri, bundle) — 回填 ReleaseImage.Status                          │
+│     → Status.Phase = Valid, Status.ComponentCount, Status.Components            │
+│                                                                                 │
+│  ─────────────────────────────────────────────────────────────                  │
+│                                                                                 │
+│  BKEClusterReconciler.executeUpgradeDAG (读取方):                               │
+│                                                                                 │
+│  1. resolveUpgradeBundle(ctx, cluster, hopTarget)                                │
+│     ├─ ResolveReleaseImageForVersion → 查找 ReleaseImage CR (Phase=Valid)       │
+│     └─ store.ResolveRelease(ctx, releaseRefFromCR(ri)) — 只读，从不拉 OCI       │
+│        ├─ 优先: memory.Load(key) → *Bundle{Source=Memory} (热路径)              │
+│        ├─ 回退: loadDiskCache(ref) → *Bundle{Source=Disk} (重启后)              │
+│        └─ 失败: error "release bundle not cached" (RI 未验证)                    │
+│                                                                                 │
+│  2. 消费 Bundle:                                                                │
+│     ├─ BuildVersionContextForUpgrade(bundle, currentBundle, bc)                 │
+│     │  → FillTargetFromBundle: 遍历 bundle.Release.Spec.Install/Upgrade          │
+│     │    .Components → vc.SetTarget(name, version)                              │
+│     ├─ BuildDAGFromBundle(bundle, BundleDependencyResolver(bundle))             │
+│     │  → 遍历 bundle.Release.Spec.Upgrade.Components                            │
+│     │  → enrichUpgradeComponent: bundle.Components[key].Spec.Inline              │
+│     │  → BundleDependencyResolver: bundle.Components[key].Spec.Dependencies      │
+│     ├─ manifest.NewBundleStore(bundle)                                          │
+│     │  → 实现 manifest.Store (GetComponentManifests → bundle.Files)             │
+│     │  → 实现 dagexec.ComponentVersionStore (GetComponentVersion → bundle.Components)│
+│     └─ componentfactory.NewFactoryFromBundle(bundle)                            │
+│        → RegisterInlinePhasesFromBundle: bundle.Components[key].Spec.Inline      │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+| 缓存级别 | 存储位置 | 写入者 | 读取者 | 特点 |
+|---------|---------|--------|--------|------|
+| **Memory** | 进程内 `sync.Map` | `CommitRelease` | `ResolveRelease` (热路径) | 最快；进程重启丢失 |
+| **Disk** | `/var/lib/bke/release-cache/<cacheKey>/` | `writeDiskCache` | `loadDiskCache` | 重启后可用；含 `metadata.json` |
+| **OCI** | 远程 Registry | `RefreshRelease` (仅 ReleaseImageReconciler) | 不直接被 BKEClusterReconciler 读取 | 网络拉取；验证后缓存 |
+
+**缓存键** (`CacheKey()`)：优先 `sanitizeKey(Digest)` → `sanitizeKey(Version)` → `sha256(OCIRef)`。Digest 变更时旧缓存被孤立 (ReleaseImage 删除时 EvictRelease 清理)。
+
+### 13.5 BundleStore 适配器 — Bundle 到执行层的桥梁
+
+Bundle 不直接被 Scheduler 消费，而是通过 `manifest.BundleStore` 适配器转换为执行层所需接口：
+
+```go
+// pkg/manifest/bundle_store.go
+
+// BundleStore 包装 Bundle，同时实现两个接口
+type BundleStore struct {
+    bundle *releasemanifest.Bundle
+}
+
+// NewBundleStore 创建 BundleStore
+func NewBundleStore(bundle *releasemanifest.Bundle) *BundleStore {
+    return &BundleStore{bundle: bundle}
+}
+
+// 实现 manifest.Store 接口 (供 YamlInstaller 使用)
+func (s *BundleStore) GetComponentManifests(ctx, name, version string, tmpl) (*ComponentPackage, error) {
+    // 1. 验证 ComponentVersion 存在
+    cv, ok := s.bundle.Components[releasemanifest.ComponentKey(name, version)]
+    if !ok {
+        return nil, fmt.Errorf("component %s@%s not found", name, version)
+    }
+    // 2. 从 bundle.Files 收集 YAML 清单字节
+    manifests := releasemanifest.CollectComponentManifests(s.bundle, name, version)
+    // 3. 返回 ComponentPackage (含 Manifests + ApplyStrategy)
+    return &ComponentPackage{
+        Name:          name,
+        Version:       version,
+        Manifests:     manifests,
+        ApplyStrategy: cv.Spec.YAML.ApplyStrategy,
+    }, nil
+}
+
+// 实现 dagexec.ComponentVersionStore 接口 (供 Scheduler 使用)
+func (s *BundleStore) GetComponentVersion(ctx, name, version string) (*apiv1.ComponentVersion, error) {
+    cv, ok := s.bundle.Components[releasemanifest.ComponentKey(name, version)]
+    if !ok {
+        return nil, fmt.Errorf("component %s@%s not found", name, version)
+    }
+    return &cv, nil  // 返回 ComponentVersion (含 Spec.Type, Spec.Inline 等)
+}
+```
+
+```txt
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              BundleStore 适配器 — Bundle 到执行层的桥梁                          │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  *releasemanifest.Bundle                                                        │
+│    ├── Release (版本)                                                           │
+│    ├── Components (ComponentVersion: Type/Inline/Dependencies)                  │
+│    └── Files (YAML 清单字节)                                                    │
+│                                                                                 │
+│           │                                                                     │
+│           │ manifest.NewBundleStore(bundle)                                     │
+│           ▼                                                                     │
+│                                                                                 │
+│  *manifest.BundleStore (适配器)                                                 │
+│    │                                                                            │
+│    ├── 实现 manifest.Store 接口:                                                 │
+│    │   GetComponentManifests(ctx, name, version, tmpl)                          │
+│    │   → 从 bundle.Components 验证存在                                          │
+│    │   → 从 bundle.Files 收集 YAML 清单                                         │
+│    │   → 返回 ComponentPackage{Manifests, ApplyStrategy}                        │
+│    │   消费者: YamlInstaller / YamlComponentExecutor                            │
+│    │                                                                            │
+│    └── 实现 dagexec.ComponentVersionStore 接口:                                 │
+│        GetComponentVersion(ctx, name, version)                                  │
+│        → 从 bundle.Components[key] 返回 *ComponentVersion                       │
+│        → Scheduler 读取 cv.Spec.Type 决定执行器                                 │
+│        → Scheduler 读取 cv.Spec.Inline.Handler 解析 Phase                       │
+│        消费者: Scheduler.executeComponent                                        │
+│                                                                                 │
+│           │                                                                     │
+│           │ dagexec.NewScheduler(Config{                                         │
+│           │   ManifestStore: bundleStore,  // → bundle.Files                    │
+│           │   CVStore:        bundleStore,  // → bundle.Components              │
+│           │   InlineRunner:   ...,         // → bundle.Components (handler)    │
+│           │})                                                                  │
+│           ▼                                                                     │
+│                                                                                 │
+│  Scheduler.ExecuteDAG                                                           │
+│    对每个组件:                                                                   │
+│    1. CVStore.GetComponentVersion → cv.Spec.Type → 选择执行器                   │
+│    2. inline → InlineRunner.Execute(handler)                                    │
+│       manifest → ManifestStore.GetComponentManifests → Applier.ApplyComponent   │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 13.6 Bundle 的消费者汇总
+
+| 消费者 | 读取字段 | 用途 | 代码位置 |
+|--------|---------|------|---------|
+| `BuildVersionContextForUpgrade` | `Release.Spec.Install/Upgrade.Components` | 填充 VersionContext.Target/Current | `pkg/upgrade/build_release.go` |
+| `BuildDAGFromBundle` | `Release.Spec.Upgrade.Components` | 构建 DAG 组件列表 | `pkg/upgrade/bundle.go` |
+| `BundleDependencyResolver` | `Components[key].Spec.Dependencies` | 解析 DAG 依赖边 | `pkg/upgrade/bundle.go` |
+| `enrichUpgradeComponent` | `Components[key].Spec.Inline` | 补充 inline handler 信息 | `pkg/upgrade/bundle.go` |
+| `BundleStore.GetComponentManifests` | `Components` + `Files` | 获取 YAML 清单字节 | `pkg/manifest/bundle_store.go` |
+| `BundleStore.GetComponentVersion` | `Components` | 获取组件类型和 handler | `pkg/manifest/bundle_store.go` |
+| `componentfactory.NewFactoryFromBundle` | `Components` + `Release` | 注册 inline Phase 构造函数 | `pkg/componentfactory/bundle_registry.go` |
+| `compatibility.Engine.Check` | `Components[key].Spec.Compatibility` | 版本兼容性校验 | `pkg/release/compatibility/engine.go` |
+| `ReleaseImageReconciler.componentStatuses` | `Components` | 回填 ReleaseImage.Status | `controllers/releaseimage/releaseimage_controller.go` |
+| `CollectComponentManifests` | `Files` + `Components` | 收集组件 manifest 清单 | `pkg/release/manifest/component_files.go` |
+
+### 13.7 命名注意事项
+
+代码库中存在**两个不同的 "Store" 类型**，容易混淆：
+
+| 类型 | 包 | 作用 | 说明 |
+|------|-----|------|------|
+| `releasemanifest.Store` | `pkg/release/manifest` | Release Bundle 缓存 (三级: 内存/磁盘/OCI) | 持有 `*Bundle`，被 ReleaseImageReconciler (写) 和 BKEClusterReconciler (读) 共享 |
+| `manifest.Store` | `pkg/manifest` | 组件清单加载接口 (抽象) | 接口: `GetComponentManifests(ctx, name, version)`，由 `manifest.BundleStore` 实现 (包装 Bundle) |
+
+> `manifest.BundleStore` 是适配器：将 `*releasemanifest.Bundle` 包装为 `manifest.Store` + `dagexec.ComponentVersionStore` 两个接口，供 Scheduler 消费。
+
+---
+
 ## 附录
 
 ### A. 参考文档
