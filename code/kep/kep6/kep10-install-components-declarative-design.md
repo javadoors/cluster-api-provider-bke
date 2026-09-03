@@ -2123,13 +2123,113 @@ func (e *EnsureMasterInit) Execute() (ctrl.Result, error) {
 func (e *EnsureMasterInit) executeMasterInit() (ctrl.Result, error) {
     // 现有 kubeadm init 逻辑 (不变)
     // 创建 Bootstrap Command CR (Phase: InitControlPlane)
+    // 从 ReleaseImage bundle 读取版本参数, 见 §8 releaseVersionFromBundle
     // ...
 }
 
+// getExistingMasterNodes 从 BKENodes 中筛选已就绪的 Master 节点
+func getExistingMasterNodes(bkeNodes bkev1beta1.BKENodes) []confv1beta1.BKENode {
+    var masters []confv1beta1.BKENode
+    for _, n := range bkeNodes {
+        // Spec.Role 包含 "master" 或 "master-worker"
+        if !slices.Contains(n.Spec.Role, node.MasterNodeRole) &&
+           !slices.Contains(n.Spec.Role, node.MasterWorkerNodeRole) {
+            continue
+        }
+        // 节点状态为 Provisioned/Ready 表示已加入集群
+        if n.Status.State == confv1beta1.NodeProvisioned ||
+           n.Status.State == confv1beta1.NodeReady {
+            masters = append(masters, n)
+        }
+    }
+    return masters
+}
+
+// executeMasterJoin 后续 Master 加入逻辑 (从 EnsureMasterJoin 迁移)
+// 版本信息从 ReleaseImage bundle 获取, 不再依赖 BKECluster.Spec
 func (e *EnsureMasterInit) executeMasterJoin() (ctrl.Result, error) {
-    // 现有 kubeadm join 逻辑 (从 EnsureMasterJoin 迁移)
-    // 创建 Join Command CR (Phase: JoinControlPlane)
-    // ...
+    ctx, c, bkeCluster, _, log := e.Ctx.Untie()
+
+    // 1. 从 ReleaseImage bundle 获取版本信息
+    bundle := e.Ctx.ReleaseBundle // bundle 注入 PhaseContext, 见 §8
+    k8sVersion := releaseVersionFromBundle(bundle, upgrade.ComponentKubernetesMaster)
+    etcdVersion := releaseVersionFromBundle(bundle, upgrade.ComponentEtcd)
+    log.Info("master join from ReleaseImage",
+        "k8sVersion=%s etcdVersion=%s", k8sVersion, etcdVersion)
+
+    // 2. 获取需要 join 的 Master 节点 (尚未关联 Machine 的节点)
+    bkeNodes, ok := fetchBKENodesIfCPInitialized(e.Ctx, bkeCluster)
+    if !ok {
+        return ctrl.Result{Requeue: true}, nil
+    }
+    needJoinNodes := phaseutil.GetNeedJoinMasterNodesWithBKENodes(bkeCluster, bkeNodes)
+    if len(needJoinNodes) == 0 {
+        log.Info("no master nodes need to join, skip")
+        return ctrl.Result{}, nil
+    }
+
+    // 3. 调整 KubeadmControlPlane 副本数 (触发 CAPI 创建新 Machine)
+    scope, err := phaseutil.GetClusterAPIAssociateObjs(ctx, c, e.Ctx.Cluster)
+    if err != nil || scope.KubeadmControlPlane == nil {
+        return ctrl.Result{}, fmt.Errorf("get cluster-api associate objs failed: %w", err)
+    }
+    specCopy := scope.KubeadmControlPlane.Spec.DeepCopy()
+    currentReplicas := *specCopy.Replicas
+    exceptReplicas := currentReplicas + int32(len(needJoinNodes))
+    masterNodes := bkeNodes.ToNodes().Master()
+    if exceptReplicas > int32(masterNodes.Length()) {
+        exceptReplicas = int32(masterNodes.Length())
+    }
+
+    log.Info("scale up KubeadmControlPlane", "from=%d to=%d", currentReplicas, exceptReplicas)
+    if err := phaseutil.UpdateKubeadmControlPlaneReplicas(ctx, c, scope.KubeadmControlPlane, exceptReplicas); err != nil {
+        return ctrl.Result{}, fmt.Errorf("scale up KCP failed: %w", err)
+    }
+    if err := phaseutil.ResumeClusterAPIObj(ctx, c, scope.KubeadmControlPlane); err != nil {
+        return ctrl.Result{}, fmt.Errorf("resume KCP failed: %w", err)
+    }
+
+    // 4. 等待节点加入 (轮询 Machine.Status.NodeRef)
+    if err := e.waitMasterJoin(len(needJoinNodes), needJoinNodes); err != nil {
+        // 回滚副本数
+        _ = phaseutil.UpdateKubeadmControlPlaneReplicas(ctx, c, scope.KubeadmControlPlane, currentReplicas)
+        return ctrl.Result{}, fmt.Errorf("wait master join failed: %w", err)
+    }
+
+    // 5. 同步节点状态到 BKECluster
+    if err := mergecluster.SyncStatusUntilComplete(c, bkeCluster); err != nil {
+        return ctrl.Result{}, fmt.Errorf("sync cluster status failed: %w", err)
+    }
+
+    return ctrl.Result{}, nil
+}
+
+// waitMasterJoin 轮询等待所有新 Master 节点加入完成
+func (e *EnsureMasterInit) waitMasterJoin(nodesCount int, nodesToJoin bkenode.Nodes) error {
+    ctx, c, bkeCluster, _, log := e.Ctx.Untie()
+
+    timeOut, err := phaseutil.GetBootTimeOut(bkeCluster)
+    if err != nil {
+        log.Warn("get boot timeout failed: %v", err)
+    }
+    waitTime := time.Duration(nodesCount) * timeOut
+    ctxTimeout, cancel := context.WithTimeout(ctx, waitTime)
+    defer cancel()
+
+    successJoinNode := make(map[int]confv1beta1.Node)
+    err = waitForNodesJoin(WaitForNodesJoinParams{
+        Ctx:             ctx,
+        Client:          c,
+        BKECluster:      bkeCluster,
+        NodesToJoin:     nodesToJoin,
+        Log:             log,
+        Timeout:         ctxTimeout,
+        SuccessJoinNode: successJoinNode,
+    })
+    if errors.Is(err, wait.ErrWaitTimeout) {
+        return errors.Errorf("wait master join timeout")
+    }
+    return err
 }
 ```
 
@@ -2144,9 +2244,9 @@ func (r *BKEClusterReconciler) executeScaleDAG(
     // 1. 解析 ReleaseImage bundle (使用当前集群版本对应的 ReleaseImage)
     bundle, err := r.resolveInstallBundle(ctx, newCluster)
 
-    // 2. 构建安装 VersionContext (Current 从已有节点状态填充)
+    // 2. 构建安装 VersionContext (Current 从当前版本 ReleaseImage 填充)
     vc := upgrade.BuildVersionContextForInstall(bundle)
-    // ★ 从已有节点的 BKENode.Status 填充 Current
+    // ★ 从已有节点的 ReleaseImage bundle 填充集群级组件 Current (节点级组件保持为空)
     r.fillCurrentFromExistingNodes(ctx, newCluster, vc)
     phaseCtx.SetVersionContext(vc)
 
@@ -2164,25 +2264,66 @@ func (r *BKEClusterReconciler) executeScaleDAG(
     execCtx := buildExecutionContext(ctx, r.Client, newCluster, vc)
 
     // 5. 执行 DAG
-    //    已有节点: VersionContext.Current == Target → DecisionSkip (跳过)
-    //    新增节点: VersionContext.Current == "" → DecisionInstall (执行安装)
+    //    集群级组件: Current==Target → DecisionSkip (跳过, 已安装)
+    //    节点级组件: Current=="" → DecisionInstall (Executor 逐节点检查, 已有节点跳过, 新增节点执行)
     //    EnsureMasterInit handler 幂等: 已有 Master 执行 join，新增 Master 执行 init
     return sched.ExecuteDAG(ctx, execCtx, dag)
 }
 
 // fillCurrentFromExistingNodes 从已有节点的状态填充 VersionContext.Current
+// 版本信息从 ReleaseImage bundle 获取 (当前集群版本对应的 ReleaseImage)
+// 仅填充集群级组件的 Current → DecisionSkip (跳过已安装的集群级组件)
+// 节点级组件 Current 保持为空 → DecisionInstall → Executor 执行 (逐节点检查跳过已有节点)
 func (r *BKEClusterReconciler) fillCurrentFromExistingNodes(
     ctx context.Context,
     bkeCluster *bkev1beta1.BKECluster,
     vc *upgrade.VersionContext,
 ) {
-    // 已有节点的组件版本 (从 BKENode.Status 或 BKECluster.Status 读取)
-    vc.SetCurrent("kubernetes-master", bkeCluster.Status.KubernetesVersion)
-    vc.SetCurrent("kubernetes-worker", bkeCluster.Status.KubernetesVersion)
-    vc.SetCurrent("etcd", bkeCluster.Status.EtcdVersion)
-    vc.SetCurrent("containerd", bkeCluster.Status.ContainerdVersion)
-    // 已有节点的组件 Current == Target → DecisionSkip → Scheduler 跳过
-    // 新增节点的组件 Current == "" → DecisionInstall → Scheduler 执行安装
+    // 1. 解析当前集群版本对应的 ReleaseImage bundle
+    //    版本信息从 ReleaseImage 获取, 而非 BKECluster.Status 的扁平字段
+    currentVersion, err := r.clusterCurrentOpenFuyaoVersion(ctx, bkeCluster)
+    if err != nil || currentVersion == "" {
+        // 无法解析当前版本, Current 全空 → 所有组件 DecisionInstall (等同全新安装)
+        return
+    }
+    currentBundle, err := r.resolveCurrentReleaseBundle(ctx, bkeCluster, currentVersion)
+    if err != nil || currentBundle == nil {
+        // 当前版本 ReleaseImage 不可用, Current 全空 → 所有组件 DecisionInstall
+        return
+    }
+
+    // 2. 从 ReleaseImage bundle 填充 Current
+    //    FillCurrentFromBundle 将 install.components + upgrade.components 的版本写入 Current
+    upgrade.FillCurrentFromBundle(vc, currentBundle)
+
+    // 3. 清除节点级组件的 Current (保持为空, 使 Executor 执行)
+    //    节点级组件需要在新节点上执行安装, 不能因为 Current==Target 而 Skip
+    //    Executor 内部逐节点检查 BKENode.Status / ClusterComponentStatuses, 跳过已有节点
+    for _, name := range vc.TargetNames() {
+        if isNodeScopedComponent(name) {
+            vc.SetCurrent(name, "") // 清空 → DecisionInstall → Executor 逐节点执行
+        }
+    }
+
+    // 结果:
+    //   集群级组件 (certs, coredns, kube-proxy, ...): Current==Target → DecisionSkip → 跳过
+    //   节点级组件 (bkeagent, containerd, kubelet, kubernetes-master, ...): Current=="" → DecisionInstall
+    //     → EnsureMasterInit handler 幂等: 已有 Master 执行 join, 新增 Master 执行 init
+    //     → BinaryComponentExecutor 逐节点: 已有节点跳过, 新增节点执行 Install
+}
+
+// isNodeScopedComponent 判断组件是否为节点级 (需要在每个节点上独立执行)
+func isNodeScopedComponent(name string) bool {
+    switch name {
+    case upgrade.ComponentBKEAgent,
+        upgrade.ComponentContainerd,
+        upgrade.ComponentKubernetesMaster,
+        upgrade.ComponentKubernetesWorker,
+        upgrade.ComponentEtcd:
+        return true
+    default:
+        return false
+    }
 }
 
 // isScale 判断是否为扩容场景
