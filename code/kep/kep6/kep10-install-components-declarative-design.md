@@ -941,7 +941,6 @@ func InstallComponentsFromBundle(bundle *releasemanifest.Bundle) ([]apiv1.Releas
 func BuildInstallDAGFromBundle(
     bundle *releasemanifest.Bundle,
     resolve topology.DependencyResolver,
-    excludeComponents ...string,  // ★ 新增: 条件排除组件列表
 ) (*topology.UpgradeDAG, error) {
     // 1. 提取安装组件
     installComponents, err := InstallComponentsFromBundle(bundle)
@@ -949,23 +948,18 @@ func BuildInstallDAGFromBundle(
         return nil, err
     }
     
-    // 3. ★ 条件过滤: 排除指定组件 (如 manage 在全新安装时排除)
-    excludeSet := make(map[string]bool)
-    for _, name := range excludeComponents {
-        excludeSet[name] = true
-    }
-    var filteredComponents []apiv1.ReleaseImageComponent
-    for _, ic := range installComponents {
-        if !excludeSet[ic.Name] {
-            filteredComponents = append(filteredComponents, ic)
-        }
-    }
-    
-    // 4. 直接使用统一的 ReleaseImageComponent 类型构建 DAG (无需转换)
+    // 2. 直接使用统一的 ReleaseImageComponent 类型构建 DAG
     //    topology.BuildUpgradeDAG 已重构为接受 []apiv1.ReleaseImageComponent
-    return topology.BuildUpgradeDAG(filteredComponents, resolve)
+    //    ★ 不需要条件过滤: 组件跳过由 DAG 执行时的 VersionContext.Decide() 决定
+    //      (current=="" && target!="" → DecisionInstall, current==target → DecisionSkip)
+    return topology.BuildUpgradeDAG(installComponents, resolve)
 }
 ```
+
+> **组件过滤职责分离**：DAG 构建器负责构建完整的组件拓扑图，不关心哪些组件需要执行。组件的跳过/执行决策由 DAG 执行器 (`Scheduler.ExecuteDAG`) 在运行时通过 `VersionContext.Decide()` 和 `NodeFilter` 完成。例如：
+> - 全新安装：所有组件 `DecisionInstall` → 全部执行
+> - 纳管场景：`manage` 组件先探测版本填充 Current，后续组件 `DecisionSkip`/`DecisionUpgrade`
+> - 扩容场景：已有节点组件 `DecisionSkip`，新增节点组件 `DecisionInstall`
 
 ### 6.3 安装 VersionContext 构建
 
@@ -975,14 +969,31 @@ func BuildInstallDAGFromBundle(
 // BuildVersionContextForInstall 为安装场景构建 VersionContext 🆕新增
 func BuildVersionContextForInstall(
     targetBundle *releasemanifest.Bundle,
+    excludeComponents ...string,  // ★ 可选: 排除的组件 (如 manage 在全新安装时排除)
 ) *VersionContext {
     vc := NewVersionContext()
     
     // 安装场景：Current 全部为空（全新安装），Target 来自 ReleaseImage
     // ★ 仅 install.components 填充 Target (安装场景不使用 upgrade.components)
+    excludeSet := make(map[string]bool)
+    for _, name := range excludeComponents {
+        excludeSet[name] = true
+    }
+    
     if targetBundle.Release.Spec.Install != nil {
         for _, comp := range targetBundle.Release.Spec.Install.Components {
-            vc.SetTarget(comp.Name, comp.Version)
+            if !excludeSet[comp.Name] {
+                vc.SetTarget(comp.Name, comp.Version)
+            }
+        }
+    }
+    
+    // Current 全部为空 → Decide 返回 DecisionInstall
+    return vc
+}
+```
+
+> **VersionContext 过滤**：与 DAG 构建不同，VersionContext 构建支持排除组件。全新安装时排除 `manage` 组件 (target="")，使其 `Decide()` 返回 `DecisionSkip`。纳管场景使用 `FillTargetFromBundle` 包含所有组件 (包括 manage)。
         }
     }
     
@@ -1419,7 +1430,8 @@ func (r *BKEClusterReconciler) executeInstallDAG(
     releaseImage, bundle, err := r.resolveInstallBundle(ctx, newCluster)
     
     // 2. 构建安装 VersionContext（Current 为空，Target 来自 bundle）
-    vc := upgrade.BuildVersionContextForInstall(bundle)
+    //    ★ 排除 manage 组件: 全新安装时 manage 的 target="" → DecisionSkip (跳过)
+    vc := upgrade.BuildVersionContextForInstall(bundle, "manage")
     phaseCtx.SetVersionContext(vc)
     
     // 3. 同步目标版本到 BKECluster.Spec
@@ -1427,9 +1439,10 @@ func (r *BKEClusterReconciler) executeInstallDAG(
     //    ★ 不作为 BKEAgent 渲染 manifest 的版本来源 — BKEAgent 应从 ReleaseImage 获取版本
     upgrade.ApplyVersionContextTargetsToClusterSpec(vc, newCluster)
     
-    // 4. 构建安装 DAG
-    //    ★ 排除 manage 组件: 全新安装不需要纳管探测，manage 仅在纳管场景 (Spec.Manage=true) 执行
-    dag, err := upgrade.BuildInstallDAGFromBundle(bundle, upgrade.BundleDependencyResolver(bundle), "manage")
+    // 4. 构建安装 DAG (包含所有 install.components)
+    //    ★ DAG 包含 manage 组件，但 VersionContext 中 manage 的 target="" 
+    //      → 执行时 Decide() 返回 DecisionSkip → 跳过 manage 组件
+    dag, err := upgrade.BuildInstallDAGFromBundle(bundle, upgrade.BundleDependencyResolver(bundle))
     
     // 5. 构建 ComponentFactory（注册安装 handler）
     factory := componentfactory.NewFactoryFromBundle(bundle)
@@ -2048,15 +2061,18 @@ var (
 │  │ • 全新安装: manage 探测不存在的集群 → 探测失败/空版本 → 干扰后续 Decide │   │
 │  │ • 纳管场景: manage 探测已有集群 → 填充 VC.Current → 后续组件正确 Decide │   │
 │  │                                                                         │   │
-│  │ 解决方案: 条件包含 (方式 B)                                              │   │
+│  │ 解决方案: VersionContext 过滤 (执行时过滤)                               │   │
 │  │ • manage 在 ReleaseImage install.components 中 (声明式定义)             │   │
-│  │ • BuildInstallDAGFromBundle 按场景条件过滤:                             │   │
-│  │   - 全新安装: 排除 manage 组件 (excludeComponents=["manage"])           │   │
-│  │   - 纳管场景: 不排除 manage 组件 (保留在 DAG 中)                        │   │
+│  │ • DAG 构建时包含所有 install.components (不过滤)                        │   │
+│  │ • VersionContext 构建时过滤:                                            │   │
+│  │   - 全新安装: BuildVersionContextForInstall(bundle, "manage")          │   │
+│  │     → manage 的 target="" → Decide() 返回 DecisionSkip (跳过)         │   │
+│  │   - 纳管场景: FillTargetFromBundle(vc, bundle)                        │   │
+│  │     → manage 的 target!="" → Decide() 返回 DecisionInstall (执行)     │   │
 │  │                                                                         │   │
-│  │ 为什么用方式 B 而非方式 A (不放 install.components):                    │   │
-│  │ • 方式 A: manage 不在声明式定义中，需硬编码注入，违反声明式原则         │   │
-│  │ • 方式 B: manage 在声明式定义中，按场景条件过滤，保持声明式一致性       │   │
+│  │ 为什么用 VersionContext 过滤而非 DAG 构建时过滤:                        │   │
+│  │ • DAG 构建时过滤: 需传递 excludeComponents 参数，增加 API 复杂度      │   │
+│  │ • VersionContext 过滤: 统一由 Decide() 控制，职责清晰，API 简洁        │   │
 │  └─────────────────────────────────────────────────────────────────────────┘   │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
@@ -2284,15 +2300,15 @@ func (r *BKEClusterReconciler) executeManageDAG(
 
     // 2. 构建纳管 VersionContext (Current 初始为空，由 manage 组件填充)
     vc := upgrade.NewVersionContext()
-    // Target 来自 ReleaseImage
+    // Target 来自 ReleaseImage (包含 manage 组件)
     upgrade.FillTargetFromBundle(vc, bundle)
     phaseCtx.SetVersionContext(vc)
 
-    // 3. 构建 DAG (manage 组件在第一个 Batch)
-    //    ★ 纳管场景不排除 manage 组件 (与 executeInstallDAG 的区别)
-    //    manage 组件探测版本 → 填充 VC.Current → 后续组件 Decide (Skip/Upgrade/Install)
+    // 3. 构建 DAG (包含所有 install.components，包括 manage)
+    //    ★ 与 executeInstallDAG 使用相同的构建函数 (无 excludeComponents 参数)
+    //    区别在于 VersionContext: 纳管场景 manage 的 target!="" → DecisionInstall
     dag, err := upgrade.BuildInstallDAGFromBundle(bundle, upgrade.BundleDependencyResolver(bundle))
-    // 注意: 不传 excludeComponents 参数，manage 组件保留在 DAG 中
+    // manage 组件在第一个 Batch 执行: 探测版本 → 填充 VC.Current → 后续组件 Decide
 
     // 4. 构建 Scheduler (manage handler 需优先注册)
     factory := componentfactory.NewFactoryFromBundle(bundle)
