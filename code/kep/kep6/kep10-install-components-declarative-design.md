@@ -3793,7 +3793,7 @@ func (s *BundleStore) GetComponentVersion(ctx, name, version string) (*apiv1.Com
 
 > **已抽离为独立 KEP 文档**：[KEP-18: ComponentVersion 执行时条件过滤](kep18-component-condition-filter-design.md)
 
-ComponentVersion 新增 `Condition` 字段（Go Template 表达式），在 DAG 执行时根据集群运行时状态（Operation/ScaleType/NodeCount 等）决定组件是否执行。该机制作为 Scheduler 跳过链的第三层检查（位于版本检查之后、执行器分发之前），与 KEP-17 Selector 互补——Selector 在构建时选择子组件，Condition 在执行时过滤组件。
+ComponentVersion 新增 `Condition` 字段（Go Template 表达式），在 DAG 执行时根据集群运行时状态（Operation/ScaleType/NodeCount 等）决定组件是否执行。该机制复用已有 `TemplateContext` 作为模板数据（扩展新增 Operation/ScaleType 等字段），作为 Scheduler 跳过链的第三层检查（位于版本检查之后、执行器分发之前），与 KEP-17 Selector 互补——Selector 在构建时选择子组件，Condition 在执行时过滤组件。
 
 完整设计见 [KEP-18](kep18-component-condition-filter-design.md)。
 

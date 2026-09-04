@@ -15,7 +15,7 @@
 
 1. [设计动机](#1-设计动机)
 2. [数据结构设计](#2-数据结构设计)
-3. [ConditionContext 设计](#3-conditioncontext-设计)
+3. [扩展 TemplateContext — 复用已有模板数据结构](#3-扩展-templatecontext--复用已有模板数据结构)
 4. [Scheduler 集成设计](#4-scheduler-集成设计)
 5. [跳过链总览](#5-跳过链总览)
 6. [Condition 表达式语法](#6-condition-表达式语法)
@@ -66,7 +66,7 @@ type ComponentVersionSpec struct {
 
     // Condition is a Go Template expression evaluated at execution time.
     // Empty means always execute (no filtering).
-    // The template receives ConditionContext with cluster state variables.
+    // The template receives TemplateContext with cluster state variables.
     // Evaluation result "true" (string) → execute; anything else → skip.
     // +optional
     Condition string `json:"condition,omitempty"`
@@ -111,7 +111,7 @@ ComponentVersion.Spec { Type, Condition, Dependencies, ... }  ← 组件定义 (
       │
       │ shouldExecuteByCondition 读取 cv.Spec.Condition
       ▼
-EvaluateCondition(condition, ConditionContext)  ← 求值
+EvaluateCondition(condition, execCtx.TemplateContext)  ← 求值 (复用 TemplateContext)
 ```
 
 **不在 ReleaseImageUpgradeComponent 上加 Condition 的原因**：
@@ -127,109 +127,168 @@ EvaluateCondition(condition, ConditionContext)  ← 求值
 
 ---
 
-## 3. ConditionContext 设计
+## 3. 扩展 TemplateContext — 复用已有模板数据结构
 
-Condition 表达式在 Scheduler 执行时求值，求值上下文 `ConditionContext` 从 `ExecutionContext` + `BKECluster` 构建：
+### 3.1 设计思路 — 为什么扩展 TemplateContext 而非新建 ConditionContext
+
+代码库中已有 `manifest.TemplateContext`（`pkg/manifest/types.go:27`），是集群状态的**安全投影**，用于 Go Template 渲染（manifest 渲染）。它已存在于 `ExecutionContext.TemplateContext` 中，由 `buildTemplateContext()` 从 `BKECluster` 构建。
+
+| 方案 | 优点 | 缺点 |
+|------|------|------|
+| **新建 ConditionContext** | 职责隔离 | 新增类型 + 转换函数 `BuildConditionContext`；与 TemplateContext 字段重叠（ClusterName/Namespace/K8sVersion 等）；两个结构维护同步 |
+| **直接用 ExecutionContext** | 无新增 | 暴露 Client/ComponentStatusUpdater/Log 等敏感字段给模板（安全风险）；模板表达式冗长 `{{ .Cluster.Name }}` |
+| **扩展 ExecutionContext** | 无新增类型 | ExecutionContext 膨胀为 god object；执行容器与模板数据职责混淆 |
+| **扩展 TemplateContext ★** | 无新增类型/转换函数；已有安全投影；manifest 渲染也能用到 Operation/ScaleType；`shouldExecuteByCondition` 直接读 `execCtx.TemplateContext` | TemplateContext 字段增多（可接受，均为集群状态投影） |
+
+**选择扩展 TemplateContext**：Condition 表达式和 manifest 渲染都是 Go Template 求值，共用同一数据结构天然合理。Operation/ScaleType/NodeCount 等字段对 manifest 渲染同样有用（如按操作类型渲染不同 manifest）。
+
+### 3.2 TemplateContext 扩展
+
+```go
+// pkg/manifest/types.go — 扩展现有结构
+
+// TemplateContext carries cluster fields used to render component templates
+// and evaluate condition expressions.
+type TemplateContext struct {
+    // --- 现有字段 (manifest 渲染) ---
+    ClusterName       string
+    Namespace         string
+    KubernetesVersion string
+    OpenFuyaoVersion  string
+
+    // --- 新增字段 (Condition 求值 + manifest 渲染) ---
+
+    // Operation is the current operation type: install / upgrade / scale / rollback / manage
+    // +optional
+    Operation string
+
+    // ScaleType is the scale sub-type when Operation=scale: master / worker / "" (not scale)
+    // +optional
+    ScaleType string
+
+    // NodeCount is the total number of nodes in the cluster
+    // +optional
+    NodeCount int
+
+    // MasterCount is the number of master nodes
+    // +optional
+    MasterCount int
+
+    // WorkerCount is the number of worker nodes
+    // +optional
+    WorkerCount int
+
+    // DeployMode is the deployment mode: offline / online
+    // +optional
+    DeployMode string
+
+    // DryRun indicates whether this is a dry-run operation
+    // +optional
+    DryRun bool
+
+    // Variables holds arbitrary key-value pairs for extensibility
+    // +optional
+    Variables map[string]string
+}
+```
+
+### 3.3 buildTemplateContext 扩展
+
+现有 `buildTemplateContext()`（`execution_context.go:66`）已从 `BKECluster` 填充 ClusterName/Namespace/K8sVersion/OpenFuyaoVersion。扩展其填充新增字段：
+
+```go
+// pkg/dagexec/execution_context.go — 扩展现有函数
+
+func buildTemplateContext(cluster *bkev1beta1.BKECluster) manifest.TemplateContext {
+    var tmpl manifest.TemplateContext
+    if cluster == nil {
+        return tmpl
+    }
+
+    // --- 现有逻辑 (不变) ---
+    tmpl.ClusterName = cluster.GetName()
+    tmpl.Namespace = cluster.GetNamespace()
+    tmpl.DryRun = cluster.Spec.DryRun
+    if cluster.Spec.ClusterConfig != nil {
+        spec := cluster.Spec.ClusterConfig.Cluster
+        tmpl.KubernetesVersion = spec.KubernetesVersion
+        tmpl.OpenFuyaoVersion = spec.OpenFuyaoVersion
+    }
+
+    // --- 新增逻辑 (Condition 求值字段) ---
+
+    // Node counts from BKENode status
+    nodes := cluster.Status.Nodes
+    tmpl.NodeCount = len(nodes)
+    for _, n := range nodes {
+        if isMasterRole(n) {
+            tmpl.MasterCount++
+        } else {
+            tmpl.WorkerCount++
+        }
+    }
+
+    // Operation and ScaleType from cluster status
+    tmpl.Operation = inferOperation(cluster)
+    tmpl.ScaleType = inferScaleType(cluster)
+
+    // DeployMode from cluster config
+    tmpl.DeployMode = inferDeployMode(cluster)
+
+    return tmpl
+}
+```
+
+### 3.4 EvaluateCondition 使用 TemplateContext
 
 ```go
 // pkg/dagexec/condition.go
 
-// ConditionContext is the template data passed to condition expressions.
-type ConditionContext struct {
-    // Operation is the current operation type: install / upgrade / scale / rollback / manage
-    Operation string
-
-    // ScaleType is the scale sub-type when Operation=scale: master / worker / "" (not scale)
-    ScaleType string
-
-    // NodeCount is the total number of nodes in the cluster
-    NodeCount int
-
-    // MasterCount is the number of master nodes
-    MasterCount int
-
-    // WorkerCount is the number of worker nodes
-    WorkerCount int
-
-    // DeployMode is the deployment mode: offline / online
-    DeployMode string
-
-    // KubernetesVersion is the cluster's Kubernetes version
-    KubernetesVersion string
-
-    // OpenFuyaoVersion is the cluster's openFuyao version
-    OpenFuyaoVersion string
-
-    // ClusterName is the BKECluster name
-    ClusterName string
-
-    // Namespace is the BKECluster namespace
-    Namespace string
-
-    // DryRun indicates whether this is a dry-run operation
-    DryRun bool
-
-    // Variables holds arbitrary key-value pairs for extensibility
-    Variables map[string]string
-}
-
-// BuildConditionContext builds a ConditionContext from ExecutionContext and BKECluster.
-func BuildConditionContext(execCtx *ExecutionContext) ConditionContext {
-    var ctx ConditionContext
-    if execCtx == nil || execCtx.Cluster == nil {
-        return ctx
-    }
-    cluster := execCtx.Cluster
-
-    ctx.ClusterName = cluster.Name
-    ctx.Namespace = cluster.Namespace
-    ctx.DryRun = cluster.Spec.DryRun
-
-    if cluster.Spec.ClusterConfig != nil {
-        spec := cluster.Spec.ClusterConfig.Cluster
-        ctx.KubernetesVersion = spec.KubernetesVersion
-        ctx.OpenFuyaoVersion = spec.OpenFuyaoVersion
-    }
-
-    // Node counts from BKENode status
-    nodes := cluster.Status.Nodes
-    ctx.NodeCount = len(nodes)
-    for _, n := range nodes {
-        if isMasterRole(n) {
-            ctx.MasterCount++
-        } else {
-            ctx.WorkerCount++
-        }
-    }
-
-    // Operation and ScaleType from cluster annotations/status
-    ctx.Operation = inferOperation(cluster)
-    ctx.ScaleType = inferScaleType(cluster)
-
-    // DeployMode from cluster config
-    ctx.DeployMode = inferDeployMode(cluster)
-
-    return ctx
-}
-
 // EvaluateCondition evaluates a Go Template condition expression.
+// Uses the same TemplateContext as manifest rendering — no separate type needed.
 // Returns true if the expression evaluates to "true" (case-insensitive, trimmed).
 // Empty expression returns true (no filtering).
-func EvaluateCondition(condition string, ctx ConditionContext) (bool, error) {
+func EvaluateCondition(condition string, tmpl manifest.TemplateContext) (bool, error) {
     if strings.TrimSpace(condition) == "" {
         return true, nil
     }
-    tmpl, err := template.New("condition").Parse(condition)
+    t, err := template.New("condition").Parse(condition)
     if err != nil {
         return false, fmt.Errorf("parse condition %q: %w", condition, err)
     }
     var buf bytes.Buffer
-    if err := tmpl.Execute(&buf, ctx); err != nil {
+    if err := t.Execute(&buf, tmpl); err != nil {
         return false, fmt.Errorf("evaluate condition %q: %w", condition, err)
     }
     result := strings.TrimSpace(buf.String())
     return strings.EqualFold(result, "true"), nil
 }
+```
+
+### 3.5 数据流
+
+```
+BKECluster (CR)
+  │
+  │ buildTemplateContext() 扩展
+  ▼
+TemplateContext {                          ← 单一模板数据结构 (manifest 渲染 + Condition 求值)
+  ClusterName, Namespace, K8sVersion,     ← 现有 (manifest 渲染)
+  OpenFuyaoVersion, DryRun
+  Operation, ScaleType,                   ← 新增 (Condition 求值 + manifest 渲染)
+  NodeCount, MasterCount, WorkerCount,
+  DeployMode, Variables
+}
+  │
+  │ 存入 ExecutionContext.TemplateContext
+  ▼
+ExecutionContext.TemplateContext
+  │
+  ├─ manifest 渲染: Store.GetComponentManifests(ctx, name, ver, tmpl)
+  │  → 模板可引用 {{ .Operation }}, {{ .NodeCount }} 等
+  │
+  └─ Condition 求值: EvaluateCondition(cv.Spec.Condition, tmpl)
+     → 表达式引用 {{ eq .ScaleType "master" }} 等
 ```
 
 ---
@@ -265,7 +324,8 @@ for _, compName := range batch {
 // pkg/dagexec/scheduler.go — shouldExecuteByCondition 新增方法
 
 // shouldExecuteByCondition evaluates the Condition field from ComponentVersion.
-// Returns true if the component should execute, false if the condition filters it out.
+// Uses execCtx.TemplateContext (already built by buildTemplateContext) as
+// template data — no separate ConditionContext needed.
 func (s *Scheduler) shouldExecuteByCondition(
     ctx context.Context,
     execCtx *ExecutionContext,
@@ -289,9 +349,8 @@ func (s *Scheduler) shouldExecuteByCondition(
         return true // 无 Condition, 不过滤
     }
 
-    // 3. 构建 ConditionContext 并求值
-    condCtx := BuildConditionContext(execCtx)
-    shouldExecute, err := EvaluateCondition(condition, condCtx)
+    // 3. 求值 — 直接使用 execCtx.TemplateContext (已由 buildTemplateContext 填充)
+    shouldExecute, err := EvaluateCondition(condition, execCtx.TemplateContext)
     if err != nil {
         // 求值失败: 记录日志, 不阻塞执行 (安全默认)
         loggerFrom(execCtx).Warn("condition evaluation failed for %s: %v", node.Name, err)
@@ -323,7 +382,7 @@ DAG 执行时，每个组件按以下顺序检查，任一检查失败即跳过�
   │     → Current == Target → Skip
   │
   ├─ (C) shouldExecuteByCondition ★ 新增
-  │     EvaluateCondition(cv.Spec.Condition, ConditionContext)
+  │     EvaluateCondition(cv.Spec.Condition, execCtx.TemplateContext)
   │     → 表达式求值为 false → Skip
   │
   └─ (D) 执行器分发
@@ -335,14 +394,14 @@ DAG 执行时，每个组件按以下顺序检查，任一检查失败即跳过�
 |------|------|------|---------|
 | (A) 已完成 | `DeclarativeUpgradeStatus` | 执行批次内 | 组件不执行，状态保持 Completed |
 | (B) 版本 | `VersionContext` Current vs Target | 执行批次内 | 组件不执行，无状态变更 |
-| (C) 条件 ★ | `ComponentVersion.Spec.Condition` 表达式 | 执行批次内 | 组件不执行，无状态变更 |
+| (C) 条件 ★ | `ComponentVersion.Spec.Condition` 表达式 + `TemplateContext` | 执行批次内 | 组件不执行，无状态变更 |
 | (D) 执行器 | `ComponentVersion.Spec.Type` | 执行器内 | 分发到 Inline/YAML/Helm/Binary Executor |
 
 ---
 
 ## 6. Condition 表达式语法
 
-使用 Go Template (`text/template`) 语法，ConditionContext 作为模板数据：
+使用 Go Template (`text/template`) 语法，`TemplateContext` 作为模板数据：
 
 | 表达式 | 含义 | 示例场景 |
 |--------|------|---------|
@@ -445,7 +504,7 @@ spec:
 以 3 节点集群（master-1, worker-1, worker-2）扩容新增 worker-3 为例：
 
 ```
-ConditionContext (BuildConditionContext):
+TemplateContext (buildTemplateContext 填充):
   Operation = "scale"
   ScaleType = "worker"     ← Worker 扩容
   NodeCount = 4
@@ -502,7 +561,7 @@ Scheduler 跳过检查链:
 | **求值时机** | DAG 构建时 (build time) | DAG 执行时 (execution time) |
 | **求值位置** | `expandSelectorComponents` → 子组件选择 | `shouldExecuteByCondition` → 组件跳过 |
 | **影响范围** | 子组件是否进入 DAG | DAG 中的组件是否执行 |
-| **数据来源** | TemplateContext (静态) | ConditionContext (动态, 含运行时状态) |
+| **数据来源** | TemplateContext (静态) | TemplateContext (动态, 含运行时状态) |
 | **适用场景** | composite 子组件按条件选择 | 任何组件按运行时条件跳过 |
 | **表达式语言** | Go Template | Go Template (相同) |
 | **互补关系** | Selector 决定 DAG 结构 | Condition 决定 DAG 执行 |
@@ -516,7 +575,8 @@ Scheduler 跳过检查链:
 | 类别 | 模块 | 估算（人天） |
 |------|------|------------|
 | 开发 | `ComponentVersionSpec` / `SubComponent` 新增 Condition 字段 | 0.5 |
-| 开发 | `ConditionContext` + `BuildConditionContext` + `EvaluateCondition` 实现 | 1.5 |
+| 开发 | `TemplateContext` 扩展 + `buildTemplateContext` 扩展 | 1 |
+| 开发 | `EvaluateCondition` 实现 | 0.5 |
 | 开发 | `Scheduler.shouldExecuteByCondition` 集成 | 1 |
 | 开发 | `inferOperation` / `inferScaleType` / `inferDeployMode` 辅助函数 | 1 |
 | 测试 | Condition 求值单元测试 + Scheduler 集成测试 | 2 |
@@ -528,10 +588,9 @@ Scheduler 跳过检查链:
 
 | 风险 | 影响 | 概率 | 缓解措施 |
 |------|------|------|---------|
-| Go Template 表达式注入 | 安全风险 | 低 | Condition 来自 ComponentVersion CRD（管理员可控），非用户输入；表达式仅访问 ConditionContext 字段，无系统调用 |
-| 表达式求值性能 | DAG 执行延迟 | 低 | 每批次仅求值一次，模板编译结果可缓存；ConditionContext 构建开销可忽略 |
-| 求值失败导致组件误执行 | 非预期行为 | 中 | 安全默认为执行（非阻塞），记录警告日志；可通过 DeclarativeUpgradeStatus 追踪实际执行结果 |
-| ConditionContext 字段缺失 | 表达式无法引用 | 中 | 首版覆盖核心字段（Operation/ScaleType/NodeCount），Variables 字段预留扩展 |
+| Go Template 表达式注入 | 安全风险 | 低 | Condition 来自 ComponentVersion CRD（管理员可控），非用户输入；表达式仅访问 TemplateContext 字段，无系统调用 |
+| 表达式求值性能 | DAG 执行延迟 | 低 | 每批次仅求值一次，模板编译结果可缓存；TemplateContext 构建开销可忽略 |
+| TemplateContext 字段缺失 | 表达式无法引用 | 中 | 首版覆盖核心字段（Operation/ScaleType/NodeCount），Variables 字段预留扩展 |
 
 ---
 
@@ -549,8 +608,8 @@ Scheduler 跳过检查链:
 | 术语 | 定义 |
 |------|------|
 | **Condition** | ComponentVersion.Spec.Condition，Go Template 表达式，执行时求值决定组件是否执行 |
-| **ConditionContext** | 执行时条件求值上下文，包含 Operation/ScaleType/NodeCount 等运行时状态 |
-| **shouldExecuteByCondition** | Scheduler 中 Condition 检查方法，位于版本检查之后、执行器分发之前 |
+| **TemplateContext** | 集群状态安全投影，用于 manifest 渲染和 Condition 求值；扩展新增 Operation/ScaleType/NodeCount 等字段 |
+| **shouldExecuteByCondition** | Scheduler 中 Condition 检查方法，使用 execCtx.TemplateContext 求值 |
 | **EvaluateCondition** | Go Template 表达式求值函数，空表达式返回 true，求值结果 "true" 表示执行 |
 
 ---
