@@ -136,12 +136,21 @@ type ReleaseImageUpgradeComponent struct {
 }
 ```
 
-### 4.2 目标结构（统一抽象）
+### 4.2 目标结构（两层统一抽象）
 
-经过分析，`ReleaseImageInstallComponent` 和 `ReleaseImageUpgradeComponent` 在扩展后字段完全相同，可以抽象为统一的 `ReleaseImageComponent` 类型：
+经过分析，ReleaseImage 的类型定义存在两层重复：
+
+**第一层重复**：`ReleaseImageInstallComponent` 和 `ReleaseImageUpgradeComponent` 字段完全相同
+**第二层重复**：`ReleaseImageInstallSpec` 和 `ReleaseImageUpgradeSpec` 字段完全相同
+
+可以通过**两层统一抽象**消除所有重复：
 
 ```go
 // api/v1alpha1/releaseimage_types.go
+
+// ============================================================
+// 第一层抽象：统一组件类型
+// ============================================================
 
 // ReleaseImageComponent 定义组件引用（安装和升级共用）🔄重构
 // 统一替代 ReleaseImageInstallComponent 和 ReleaseImageUpgradeComponent
@@ -170,30 +179,65 @@ type ReleaseImageInline struct {
     Version string `json:"version,omitempty"`
 }
 
-// ReleaseImageInstallSpec 定义安装组件列表
-type ReleaseImageInstallSpec struct {
-    Components []ReleaseImageComponent `json:"components,omitempty"` // 🔄重构: 使用统一类型
+// ============================================================
+// 第二层抽象：统一组件列表类型
+// ============================================================
+
+// ReleaseImageComponentList 定义组件列表（安装和升级共用）🔄重构
+// 统一替代 ReleaseImageInstallSpec 和 ReleaseImageUpgradeSpec
+type ReleaseImageComponentList struct {
+    Components []ReleaseImageComponent `json:"components,omitempty"`
 }
 
-// ReleaseImageUpgradeSpec 定义升级组件列表
-type ReleaseImageUpgradeSpec struct {
-    Components []ReleaseImageComponent `json:"components,omitempty"` // 🔄重构: 使用统一类型
+// ReleaseImageInstallSpec 定义安装组件列表（类型别名，向后兼容）
+type ReleaseImageInstallSpec = ReleaseImageComponentList
+
+// ReleaseImageUpgradeSpec 定义升级组件列表（类型别名，向后兼容）
+type ReleaseImageUpgradeSpec = ReleaseImageComponentList
+
+// ============================================================
+// ReleaseImageSpec 使用统一类型
+// ============================================================
+
+type ReleaseImageSpec struct {
+    Version            string                     `json:"version,omitempty"`
+    Digest             string                     `json:"digest,omitempty"`
+    VerifySignature    bool                       `json:"verifySignature,omitempty"`
+    SignatureKey       string                     `json:"signatureKey,omitempty"`
+    AllowCacheFallback bool                       `json:"allowCacheFallback,omitempty"`
+    Install            *ReleaseImageComponentList `json:"install,omitempty"`  // 🔄重构: 使用统一类型
+    Upgrade            *ReleaseImageComponentList `json:"upgrade,omitempty"`  // 🔄重构: 使用统一类型
 }
 ```
 
-**重构收益**：
+**两层抽象的收益**：
 
 | 维度 | 重构前 | 重构后 |
 |------|--------|--------|
-| **类型数量** | 4 个类型 (InstallComponent, UpgradeComponent, InstallInline, UpgradeInline) | 2 个类型 (Component, Inline) |
-| **代码重复** | Install 和 Upgrade 结构完全相同，重复定义 | 统一抽象，消除重复 |
+| **组件类型数量** | 2 个 (InstallComponent, UpgradeComponent) | 1 个 (Component) |
+| **Inline 类型数量** | 2 个 (InstallInline, UpgradeInline) | 1 个 (Inline) |
+| **Spec 类型数量** | 2 个 (InstallSpec, UpgradeSpec) | 1 个 (ComponentList) + 2 个别名 |
+| **总类型数量** | 6 个 | 3 个 + 2 个别名 |
+| **代码重复** | 3 处重复 (Component×2, Inline×2, Spec×2) | 0 处重复 |
 | **API 复杂度** | 安装和升级使用不同类型，需要转换逻辑 | 统一类型，无需转换 |
-| **维护成本** | 修改字段需同时更新 2 个类型 | 修改字段只需更新 1 个类型 |
-| **YAML 结构** | 安装和升级 YAML 结构相同，但类型不同 | 安装和升级 YAML 结构相同，类型也相同 |
+| **维护成本** | 修改字段需同时更新多个类型 | 修改字段只需更新 1 个类型 |
+| **向后兼容** | — | 类型别名保持现有代码无需修改 |
 
 **向后兼容性**：
 
-重构后的 YAML 结构与重构前完全一致，无需修改现有 ReleaseImage CR：
+类型别名 (`type ReleaseImageInstallSpec = ReleaseImageComponentList`) 确保现有代码无需修改：
+
+```go
+// 现有代码无需修改
+var installSpec *ReleaseImageInstallSpec  // 类型别名，等价于 ReleaseImageComponentList
+var upgradeSpec *ReleaseImageUpgradeSpec  // 类型别名，等价于 ReleaseImageComponentList
+
+// 可以直接赋值和转换
+installSpec = &ReleaseImageComponentList{Components: components}
+upgradeSpec = installSpec  // 类型相同，可以直接赋值
+```
+
+YAML 结构与重构前完全一致：
 
 ```yaml
 # 重构前后 YAML 结构不变
@@ -217,15 +261,20 @@ spec:
 **代码迁移**：
 
 ```go
-// 重构前
+// 重构前（6 个类型）
 type ReleaseImageInstallComponent struct { Name, Version string; Inline *ReleaseImageInstallInline }
 type ReleaseImageUpgradeComponent struct { Name, Version string; Inline *ReleaseImageUpgradeInline }
 type ReleaseImageInstallInline struct { Handler, Version string }
 type ReleaseImageUpgradeInline struct { Handler, Version string }
+type ReleaseImageInstallSpec struct { Components []ReleaseImageInstallComponent }
+type ReleaseImageUpgradeSpec struct { Components []ReleaseImageUpgradeComponent }
 
-// 重构后
+// 重构后（3 个类型 + 2 个别名）
 type ReleaseImageComponent struct { Name, Version string; Inline *ReleaseImageInline }
 type ReleaseImageInline struct { Handler, Version string }
+type ReleaseImageComponentList struct { Components []ReleaseImageComponent }
+type ReleaseImageInstallSpec = ReleaseImageComponentList   // 类型别名
+type ReleaseImageUpgradeSpec = ReleaseImageComponentList  // 类型别名
 
 // 使用方式
 installSpec.Components  // []ReleaseImageComponent
