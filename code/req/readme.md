@@ -16,6 +16,8 @@
 
 ## [备份与恢复](../kep/kep6/kep12-backup-restore-design.md)
 
+## [组件条件过滤](../kep/kep6/kep18-component-condition-filter-design.md)
+
 ## [k8s大版本升级(1.34->1.36)](../icbc/k8s-upgrade-1.34-to-1.36.md)
 
 ## 组件Operator化
