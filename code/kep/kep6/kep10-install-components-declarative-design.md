@@ -951,14 +951,14 @@ func BuildInstallDAGFromBundle(
     // 2. 直接使用统一的 ReleaseImageComponent 类型构建 DAG
     //    topology.BuildUpgradeDAG 已重构为接受 []apiv1.ReleaseImageComponent
     //    ★ 直接构建所有 install.components 的 DAG，不需要排除任何组件
-    //    ★ 组件的跳过逻辑由执行时的 VersionContext.Decide() 决定
+    //    ★ 组件的跳过逻辑由执行时的 VersionContext.Decide() 与组件的 condition/NodeFilter 决定
     return topology.BuildUpgradeDAG(installComponents, resolve)
 }
 ```
 
-> **组件过滤职责分离**：DAG 构建器负责构建完整的组件拓扑图，不关心哪些组件需要执行。组件的跳过/执行决策由 DAG 执行器 (`Scheduler.ExecuteDAG`) 在运行时通过 `VersionContext.Decide()` 完成。
+> **组件过滤职责分离**：DAG 构建器负责构建完整的组件拓扑图，不关心哪些组件需要执行。组件的跳过/执行决策由 DAG 执行器 (`Scheduler.ExecuteDAG`) 在运行时通过两层判断完成：
 >
-> **VersionContext.Decide() 的决策逻辑**：
+> **第一层：VersionContext.Decide() — 版本决策**
 > ```go
 > func Decide(vc *VersionContext, name string) Decision {
 >     // 安装场景：current 为空，target 有值 → DecisionInstall
@@ -972,6 +972,27 @@ func BuildInstallDAGFromBundle(
 >     // 升级场景：current != target → DecisionUpgrade
 >     return DecisionUpgrade
 > }
+> ```
+>
+> **第二层：组件的 condition / NodeFilter — 运行时条件判断**
+>
+> 即使 `Decide()` 返回 `DecisionInstall`/`DecisionUpgrade`，组件仍可能被跳过，取决于：
+>
+> | 判断机制 | 说明 | 示例 |
+> |---------|------|------|
+> | **Condition** | 组件声明的前置条件，不满足时跳过 | `kubernetes-master` 的 `Condition: HasMasterNodes` — 无 Master 节点时跳过 |
+> | **NodeFilter** | 节点级过滤器，决定组件在哪些节点上执行 | `EnsureNodesEnv` 的 `NodeFilter: AllNodes` — 所有节点执行 |
+> | | | `EnsureMasterInit` 的 `NodeFilter: MasterNodesOnly` — 仅 Master 节点执行 |
+> | | | `EnsureWorkerJoin` 的 `NodeFilter: NewWorkerNodes` — 仅新增 Worker 节点执行 |
+>
+> **执行流程**：
+> ```text
+> Scheduler.ExecuteDAG():
+>   for each component in DAG:
+>     1. Decide(vc, name) → DecisionSkip? → 跳过该组件
+>     2. 检查 component.Condition → 不满足? → 跳过该组件
+>     3. 检查 component.NodeFilter → 当前节点不在过滤范围? → 跳过该节点
+>     4. 执行组件
 > ```
 >
 > **不同场景下的 Decide() 结果**：
