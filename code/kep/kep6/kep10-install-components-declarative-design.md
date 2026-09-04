@@ -956,10 +956,29 @@ func BuildInstallDAGFromBundle(
 }
 ```
 
-> **组件过滤职责分离**：DAG 构建器负责构建完整的组件拓扑图，不关心哪些组件需要执行。组件的跳过/执行决策由 DAG 执行器 (`Scheduler.ExecuteDAG`) 在运行时通过 `VersionContext.Decide()` 和 `NodeFilter` 完成。例如：
-> - 全新安装：所有组件 `DecisionInstall` → 全部执行
-> - 纳管场景：`manage` 组件先探测版本填充 Current，后续组件 `DecisionSkip`/`DecisionUpgrade`
-> - 扩容场景：已有节点组件 `DecisionSkip`，新增节点组件 `DecisionInstall`
+> **组件过滤职责分离**：DAG 构建器负责构建完整的组件拓扑图，不关心哪些组件需要执行。组件的跳过/执行决策由 DAG 执行器 (`Scheduler.ExecuteDAG`) 在运行时通过 `VersionContext.Decide()` 完成。
+>
+> **VersionContext.Decide() 的决策逻辑**：
+> ```go
+> func Decide(vc *VersionContext, name string) Decision {
+>     // 安装场景：current 为空，target 有值 → DecisionInstall
+>     if vc.Current[name] == "" && vc.Target[name] != "" {
+>         return DecisionInstall
+>     }
+>     // 跳过场景：current == target 或 target 为空 → DecisionSkip
+>     if vc.Current[name] == vc.Target[name] || vc.Target[name] == "" {
+>         return DecisionSkip
+>     }
+>     // 升级场景：current != target → DecisionUpgrade
+>     return DecisionUpgrade
+> }
+> ```
+>
+> **不同场景下的 Decide() 结果**：
+> - **全新安装 (无过滤)**：`Current` 全空，`Target` 有值 → 所有组件 `DecisionInstall` → 全部执行
+> - **全新安装 (排除 manage)**：`BuildVersionContextForInstall(bundle, "manage")` 使 `manage` 的 `Target=""` → `manage` 组件 `DecisionSkip`，其他组件 `DecisionInstall`
+> - **纳管场景**：`manage` 组件先探测版本填充 `Current`，后续组件根据 `Current` 与 `Target` 的比较结果决定 `DecisionSkip`/`DecisionUpgrade`/`DecisionInstall`
+> - **扩容场景**：已有节点组件 `Current == Target` → `DecisionSkip`，新增节点组件 `Current="" && Target!=""` → `DecisionInstall`
 
 ### 6.3 安装 VersionContext 构建
 
