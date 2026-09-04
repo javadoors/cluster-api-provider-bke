@@ -541,12 +541,13 @@ var DeclarativeUpgradeCatalog = []UpgradeComponentSpec{
 
 **结论**：两个结构体字段语义完全一致，`Mode` 的值 ("manifest"/"inline") 描述的是执行机制而非操作类型 (安装/升级)。**应直接复用 `UpgradeComponentSpec`，不新增 `InstallComponentSpec` 和 `InstallExecutionMode`**。
 
-**方案**：将 `UpgradeComponentSpec` 重命名为中性的 `ComponentSpec`，`UpgradeExecutionMode` 重命名为 `ExecutionMode`，同时用于安装和升级目录：
+**方案**：将 `UpgradeComponentSpec` 重命名为中性的 `ComponentSpec`，`UpgradeExecutionMode` 重命名为 `ExecutionMode`，同时保留 `UpgradeComponentSpec` 作为类型别名以保证向后兼容：
 
 ```go
 // pkg/upgrade/catalog.go
 
-// ExecutionMode 描述组件的执行方式 (安装和升级通用)
+// ExecutionMode 描述组件的执行方式 (安装和升级通用) 🔄重构
+// 统一替代 UpgradeExecutionMode
 type ExecutionMode string
 
 const (
@@ -554,7 +555,8 @@ const (
     ExecutionInline   ExecutionMode = "inline"
 )
 
-// ComponentSpec 映射 ReleaseImage 组件名到执行模式 (安装和升级通用)
+// ComponentSpec 映射 ReleaseImage 组件名到执行模式 (安装和升级通用) 🔄重构
+// 统一替代 UpgradeComponentSpec
 type ComponentSpec struct {
     // 组件名称 (ReleaseImage install/upgrade components[].name)
     Name string
@@ -574,9 +576,46 @@ type ComponentSpec struct {
     // Inline handler 名称 (mode=inline 时，ComponentFactory 注册键)
     InlineHandler string
 }
+
+// UpgradeComponentSpec 升级组件规格 (类型别名，向后兼容)
+type UpgradeComponentSpec = ComponentSpec
+
+// UpgradeExecutionMode 升级执行模式 (类型别名，向后兼容)
+type UpgradeExecutionMode = ExecutionMode
 ```
 
-> **重命名影响**：`UpgradeComponentSpec` → `ComponentSpec`，`UpgradeExecutionMode` → `ExecutionMode`。现有引用处 (catalog.go、build.go、scheduler.go 等) 需批量替换类型名，但**字段和方法不变**，属于机械替换。
+**向后兼容性**：
+
+类型别名 (`type UpgradeComponentSpec = ComponentSpec`) 确保现有代码无需修改：
+
+```go
+// 现有代码无需修改
+var specs []UpgradeComponentSpec  // 类型别名，等价于 ComponentSpec
+
+// 可以直接赋值和转换
+specs = []ComponentSpec{
+    {Name: "etcd", Mode: ExecutionInline, InlineHandler: "EnsureEtcdUpgrade"},
+}
+
+// 常量也可互换使用
+var mode ExecutionMode = ExecutionInline
+var legacyMode UpgradeExecutionMode = mode  // 类型相同，可以直接赋值
+```
+
+**DeclarativeUpgradeCatalog 保持不变**：
+
+```go
+// pkg/upgrade/catalog.go — 现有代码无需修改
+
+var DeclarativeUpgradeCatalog = []ComponentSpec{  // 类型名从 UpgradeComponentSpec 改为 ComponentSpec
+    {Name: "pre-upgrade-resources", Mode: ExecutionInline, InlineHandler: "EnsurePreUpgradeResources", LegacyPhase: "EnsurePreUpgradeResources"},
+    {Name: "provider", Mode: ExecutionManifest, ManifestPath: "provider/v1.0.0/component.yaml", LegacyPhase: "EnsureProviderSelfUpgrade"},
+    {Name: "bkeagent", Mode: ExecutionInline, InlineHandler: "EnsureAgentUpgrade", LegacyPhase: "EnsureAgentUpgrade"},
+    // ... 其余组件
+}
+```
+
+> **重命名影响**：`UpgradeComponentSpec` → `ComponentSpec`，`UpgradeExecutionMode` → `ExecutionMode`。现有引用处 (catalog.go、build.go、scheduler.go 等) 可选择性替换类型名，但**字段和方法不变**。通过类型别名，现有代码无需修改即可编译通过。
 
 #### 5.1.2 DeclarativeInstallCatalog 定义
 
