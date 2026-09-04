@@ -950,8 +950,8 @@ func BuildInstallDAGFromBundle(
     
     // 2. 直接使用统一的 ReleaseImageComponent 类型构建 DAG
     //    topology.BuildUpgradeDAG 已重构为接受 []apiv1.ReleaseImageComponent
-    //    ★ 不需要条件过滤: 组件跳过由 DAG 执行时的 VersionContext.Decide() 决定
-    //      (current=="" && target!="" → DecisionInstall, current==target → DecisionSkip)
+    //    ★ 直接构建所有 install.components 的 DAG，不需要排除任何组件
+    //    ★ 组件的跳过逻辑由执行时的 VersionContext.Decide() 决定
     return topology.BuildUpgradeDAG(installComponents, resolve)
 }
 ```
@@ -975,8 +975,7 @@ func BuildInstallDAGFromBundle(
 > ```
 >
 > **不同场景下的 Decide() 结果**：
-> - **全新安装 (无过滤)**：`Current` 全空，`Target` 有值 → 所有组件 `DecisionInstall` → 全部执行
-> - **全新安装 (排除 manage)**：`BuildVersionContextForInstall(bundle, "manage")` 使 `manage` 的 `Target=""` → `manage` 组件 `DecisionSkip`，其他组件 `DecisionInstall`
+> - **全新安装**：`Current` 全空，`Target` 有值 → 所有组件 `DecisionInstall` → 全部执行
 > - **纳管场景**：`manage` 组件先探测版本填充 `Current`，后续组件根据 `Current` 与 `Target` 的比较结果决定 `DecisionSkip`/`DecisionUpgrade`/`DecisionInstall`
 > - **扩容场景**：已有节点组件 `Current == Target` → `DecisionSkip`，新增节点组件 `Current="" && Target!=""` → `DecisionInstall`
 
@@ -988,22 +987,15 @@ func BuildInstallDAGFromBundle(
 // BuildVersionContextForInstall 为安装场景构建 VersionContext 🆕新增
 func BuildVersionContextForInstall(
     targetBundle *releasemanifest.Bundle,
-    excludeComponents ...string,  // ★ 可选: 排除的组件 (如 manage 在全新安装时排除)
 ) *VersionContext {
     vc := NewVersionContext()
     
     // 安装场景：Current 全部为空（全新安装），Target 来自 ReleaseImage
-    // ★ 仅 install.components 填充 Target (安装场景不使用 upgrade.components)
-    excludeSet := make(map[string]bool)
-    for _, name := range excludeComponents {
-        excludeSet[name] = true
-    }
-    
+    // ★ 直接构建所有 install.components 的 Target，不需要排除任何组件
+    // ★ 组件的跳过逻辑由执行时的 Decide() 决定
     if targetBundle.Release.Spec.Install != nil {
         for _, comp := range targetBundle.Release.Spec.Install.Components {
-            if !excludeSet[comp.Name] {
-                vc.SetTarget(comp.Name, comp.Version)
-            }
+            vc.SetTarget(comp.Name, comp.Version)
         }
     }
     
@@ -1011,6 +1003,11 @@ func BuildVersionContextForInstall(
     return vc
 }
 ```
+
+> **简化设计**：VersionContext 构建时直接包含所有 install.components，不在构建时进行过滤。组件的跳过逻辑完全由执行时的 `Decide()` 决定：
+> - 全新安装：所有组件 `Current="" && Target!=""` → `DecisionInstall` → 全部执行
+> - 纳管场景：`manage` 组件先探测版本填充 `Current`，后续组件根据 `Current` 与 `Target` 的比较结果决定
+> - 如果某个组件在全新安装时不需要执行，应该在 ReleaseImage 的 install.components 中就不包含它
 
 > **VersionContext 过滤**：与 DAG 构建不同，VersionContext 构建支持排除组件。全新安装时排除 `manage` 组件 (target="")，使其 `Decide()` 返回 `DecisionSkip`。纳管场景使用 `FillTargetFromBundle` 包含所有组件 (包括 manage)。
         }
@@ -1449,8 +1446,8 @@ func (r *BKEClusterReconciler) executeInstallDAG(
     releaseImage, bundle, err := r.resolveInstallBundle(ctx, newCluster)
     
     // 2. 构建安装 VersionContext（Current 为空，Target 来自 bundle）
-    //    ★ 排除 manage 组件: 全新安装时 manage 的 target="" → DecisionSkip (跳过)
-    vc := upgrade.BuildVersionContextForInstall(bundle, "manage")
+    //    ★ 直接构建所有 install.components 的 Target
+    vc := upgrade.BuildVersionContextForInstall(bundle)
     phaseCtx.SetVersionContext(vc)
     
     // 3. 同步目标版本到 BKECluster.Spec
@@ -1459,8 +1456,8 @@ func (r *BKEClusterReconciler) executeInstallDAG(
     upgrade.ApplyVersionContextTargetsToClusterSpec(vc, newCluster)
     
     // 4. 构建安装 DAG (包含所有 install.components)
-    //    ★ DAG 包含 manage 组件，但 VersionContext 中 manage 的 target="" 
-    //      → 执行时 Decide() 返回 DecisionSkip → 跳过 manage 组件
+    //    ★ 直接构建所有组件的 DAG，不需要排除任何组件
+    //    ★ 组件的跳过逻辑由执行时的 VersionContext.Decide() 决定
     dag, err := upgrade.BuildInstallDAGFromBundle(bundle, upgrade.BundleDependencyResolver(bundle))
     
     // 5. 构建 ComponentFactory（注册安装 handler）
