@@ -2117,10 +2117,21 @@ func (r *BKEClusterReconciler) executeManageDAG(
 ├─────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                 │
 │  Legacy PhaseFlow:                                                              │
-│    ScalePhases (独立的扩容 Phase 列表)                                           │
-│      → EnsureMasterJoin / EnsureWorkerJoin (仅执行 Join 相关 Phase)             │
-│    问题: 扩容使用独立的 Phase 列表，与安装 PhaseFlow 代码重复                    │
-│          无法复用 DAG 的版本决策和断点续传                                       │
+│    PhaseFlow.CalculatePhase() 遍历完整 DeployPhases (11 个 Phase):              │
+│      EnsureBKEAgent → EnsureNodesEnv → EnsureCerts → EnsureLoadBalance          │
+│      → EnsureMasterInit → EnsureMasterJoin → EnsureWorkerJoin → ...            │
+│                                                                                 │
+│    每个 Phase 的 NeedExecute() 检查 BKENode.Status.StateCode 位标记:             │
+│      新增节点 (StateCode=0): 位标记未设置 → NeedExecute=true → 执行             │
+│      已有节点 (位标记已设置): NeedExecute=false → 跳过                           │
+│                                                                                 │
+│    ★ 不存在独立的 ScalePhases 列表用于执行                                       │
+│    ★ ClusterScaleMasterUpPhaseNames 等仅用于状态上报 (设置 ClusterStatus)       │
+│    ★ 节点安装 (bkeagent/containerd) 和节点加入 (kubeadm join) 由同一个          │
+│       PhaseFlow 驱动, 按 DeployPhases 拓扑顺序依次执行                           │
+│                                                                                 │
+│    问题: 扩容复用 DeployPhases, 但无法复用 DAG 的版本决策和断点续传              │
+│          PhaseFlow 串行执行, 无法实现组件间并行                                  │
 │                                                                                 │
 │  DAG 化方案 (两层机制):                                                          │
 │                                                                                 │
@@ -2148,6 +2159,120 @@ func (r *BKEClusterReconciler) executeManageDAG(
 │  3. 复用安装 DAG — 无需独立的扩容 DAG，安装 DAG + 组件级 Current 过滤集群级组件  │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+##### Legacy PhaseFlow 扩容执行机制（当前代码）
+
+**核心代码路径**: `pkg/phaseframe/phases/phase_flow.go` + `pkg/phaseframe/phases/list.go`
+
+**1. 不存在独立的 ScalePhases 执行列表**
+
+代码中 `ClusterScaleMasterUpPhaseNames` 等列表**仅用于状态上报**（`calculateClusterStatusByPhase` 设置 `ClusterMasterScalingUp` 等 `ClusterStatus`），不用于决定执行哪些 Phase：
+
+```go
+// pkg/phaseframe/phases/list.go — 仅用于状态上报, 不用于执行
+ClusterScaleMasterUpPhaseNames = []confv1beta1.BKEClusterPhase{
+    EnsureMasterJoinName,  // 仅 Master 扩容状态上报
+}
+ClusterScaleWorkerUpPhaseNames = []confv1beta1.BKEClusterPhase{
+    EnsureWorkerJoinName,  // 仅 Worker 扩容状态上报
+}
+
+// pkg/phaseframe/phases/phase_flow.go:380 — 仅在 calculateClusterStatusByPhase 中使用
+case phaseName.In(ClusterScaleMasterUpPhaseNames):
+    handleClusterScaleMasterUpPhase(ctx, err)  // 设置 ClusterStatus = ClusterMasterScalingUp
+```
+
+**2. PhaseFlow 遍历完整 DeployPhases**
+
+扩容时 `PhaseFlow.CalculatePhase()` 遍历 `FullPhasesRegisFunc`（`CommonPhases + DeployPhases + PostDeployPhases`），每个 Phase 的 `NeedExecute()` 自行判断是否需要执行：
+
+```go
+// pkg/phaseframe/phases/phase_flow.go:78 — 遍历全部 Phase, 非仅 Scale 相关
+func (p *PhaseFlow) calculateAndAddPhases(old, new *bkev1beta1.BKECluster, phasesFuncs ...) {
+    for _, f := range phasesFuncs {
+        phase := f(p.ctx)
+        if phase.NeedExecute(old, new) {  // ★ 每个 Phase 自行判断
+            p.BKEPhases = append(p.BKEPhases, phase)
+        }
+    }
+}
+```
+
+`DeployPhases` 包含全部 11 个安装 Phase（`list.go:32-44`）：
+
+```go
+DeployPhases = []func(ctx *phaseframe.PhaseContext) phaseframe.Phase{
+    NewEnsureBKEAgent,        // bkeagent 推送
+    NewEnsureNodesEnv,         // containerd + 系统配置
+    NewEnsureClusterAPIObj,    // ClusterAPI 对象
+    NewEnsureCerts,            // 证书
+    NewEnsureLoadBalance,      // 负载均衡
+    NewEnsureMasterInit,       // Master 初始化
+    NewEnsureMasterJoin,       // Master 加入
+    NewEnsureWorkerJoin,       // Worker 加入
+    NewEnsureAddonDeploy,      // 组件部署
+    NewEnsureNodesPostProcess, // 后置处理
+    NewEnsureAgentSwitch,      // Agent 切换
+}
+```
+
+**3. 每个 Phase 的 NeedExecute 判断**
+
+每个 Phase 通过 `phaseutil.HasNodesNeedingPhase()` 或 `phaseutil.filterNodes()` 检查 `BKENode.Status.StateCode` 位标记，判断是否有节点需要操作：
+
+| Phase | NeedExecute 判断逻辑 | 新节点 (StateCode=0) | 已有节点 (位标记已设置) |
+|-------|---------------------|---------------------|----------------------|
+| `EnsureBKEAgent` | `HasNodesNeedingPhase(bkeNodes, NodeAgentPushedFlag)` | **true** → 推送 bkeagent | false → 跳过 |
+| `EnsureNodesEnv` | `HasNodesNeedingPhase(bkeNodes, NodeEnvFlag)` | **true** → 安装 containerd/系统配置 | false → 跳过 |
+| `EnsureCerts` | 证书已存在 → false | false → 跳过 | false → 跳过 |
+| `EnsureClusterAPIObj` | CAPI 对象已存在 → false | false → 跳过 | false → 跳过 |
+| `EnsureLoadBalance` | LB 已配置 → false | false → 跳过 | false → 跳过 |
+| `EnsureMasterInit` | 已有 Master 且无新 Master → false | **true** → init/join | false → 跳过 |
+| `EnsureMasterJoin` | `GetNeedJoinMasterNodesWithBKENodes()` | **true** → kubeadm join | false → 跳过 |
+| `EnsureWorkerJoin` | `GetNeedJoinWorkerNodesWithBKENodes()` | **true** → kubeadm join | false → 跳过 |
+| `EnsureAddonDeploy` | Addon 已部署 → false | false → 跳过 | false → 跳过 |
+| `EnsureNodesPostProcess` | `HasNodesNeedingPhase(NodePostProcessFlag)` | **true** → 后置处理 | false → 跳过 |
+| `EnsureAgentSwitch` | 已切换 → false | false → 跳过 | false → 跳过 |
+
+`HasNodesNeedingPhase` 实现（`phaseutil/util.go:1273`）：
+
+```go
+func HasNodesNeedingPhase(bkeNodes bkev1beta1.BKENodes, flag int) bool {
+    for _, bn := range bkeNodes {
+        if bn.Status.StateCode&flag == 0 {  // 位标记未设置
+            // 排除 Failed/Deleting/NeedSkip 节点
+            if bn.Status.StateCode&bkev1beta1.NodeFailedFlag == 0 &&
+                bn.Status.StateCode&bkev1beta1.NodeDeletingFlag == 0 &&
+                !bn.Status.NeedSkip {
+                return true  // 有节点需要执行此 Phase
+            }
+        }
+    }
+    return false
+}
+```
+
+**4. Phase 内部节点过滤**
+
+Phase 执行时通过 `phaseutil.filterNodes()` + `NodePredicate` 精确过滤目标节点：
+
+```go
+// pkg/phaseframe/phases/ensure_nodes_env.go:101 — EnsureNodesEnv 内部过滤
+func (e *EnsureNodesEnv) getNodesToInitEnv() bkenode.Nodes {
+    for _, bn := range bkeNodes {
+        // 硬排除: Failed/Deleting/NeedSkip
+        if bn.Status.StateCode&bkev1beta1.NodeFailedFlag != 0 ||
+           bn.Status.StateCode&bkev1beta1.NodeDeletingFlag != 0 ||
+           bn.Status.NeedSkip { continue }
+        // 已完成: NodeEnvFlag 已设置 → 跳过
+        if bn.Status.StateCode&bkev1beta1.NodeEnvFlag != 0 { continue }
+        // 前置未就绪: agent 未就绪 → 跳过
+        if bn.Status.StateCode&bkev1beta1.NodeAgentReadyFlag == 0 { continue }
+        exceptEnvNodes = append(exceptEnvNodes, bn.ToNode())  // ★ 需要操作的节点
+    }
+    return exceptEnvNodes
+}
 ```
 
 **节点级 StateCode 位标记说明**：
@@ -2408,6 +2533,8 @@ func (r *BKEClusterReconciler) isScale(old, new *bkev1beta1.BKECluster) bool {
 
 以 3 节点集群（master-1, worker-1, worker-2）扩容新增 master-2 为例：
 
+**Legacy PhaseFlow 路径（当前代码）**:
+
 ```
 前置状态:
   master-1: StateCode = NodeAgentPushedFlag|NodeAgentReadyFlag|NodeEnvFlag|NodeBootFlag|MasterInitFlag
@@ -2415,14 +2542,55 @@ func (r *BKEClusterReconciler) isScale(old, new *bkev1beta1.BKECluster) bool {
   worker-2: StateCode = NodeAgentPushedFlag|NodeAgentReadyFlag|NodeEnvFlag|NodeBootFlag
   master-2: StateCode = 0 (新增节点, 无任何位标记)
 
-  VersionContext (fillCurrentFromExistingNodes 后):
-    certs:           Current="v2.7.0" Target="v2.7.0" → Skip  (集群级, 已安装)
-    coredns:         Current="v1.11.1" Target="v1.11.1" → Skip  (集群级, 已安装)
-    bkeagent:        Current=""         Target="v2.7.0" → Install (节点级, 清空)
-    containerd:      Current=""         Target="v1.7.18" → Install (节点级, 清空)
-    kubernetes-master: Current=""       Target="v2.7.0" → Install (节点级, 清空)
+PhaseFlow.CalculatePhase() 遍历 DeployPhases (11 个 Phase):
+  → EnsureBKEAgent.NeedExecute()
+    → HasNodesNeedingPhase(NodeAgentPushedFlag)
+    → master-2: NodeAgentPushedFlag 未设置 → true ★ 加入执行列表
+  → EnsureNodesEnv.NeedExecute()
+    → HasNodesNeedingPhase(NodeEnvFlag)
+    → master-2: NodeEnvFlag 未设置 → true ★ 加入执行列表
+  → EnsureCerts.NeedExecute()
+    → 证书已存在 → false → 跳过
+  → EnsureClusterAPIObj.NeedExecute()
+    → CAPI 对象已存在 → false → 跳过
+  → EnsureLoadBalance.NeedExecute()
+    → LB 已配置 → false → 跳过
+  → EnsureMasterInit.NeedExecute()
+    → 有新 Master → true ★ 加入执行列表
+  → EnsureMasterJoin.NeedExecute()
+    → GetNeedJoinMasterNodesWithBKENodes() → master-2 未加入 → true ★ 加入执行列表
+  → EnsureWorkerJoin.NeedExecute()
+    → 无新 Worker → false → 跳过
+  → EnsureAddonDeploy.NeedExecute()
+    → Addon 已部署 → false → 跳过
+  → EnsureNodesPostProcess.NeedExecute()
+    → HasNodesNeedingPhase(NodePostProcessFlag) → master-2 未处理 → true ★ 加入执行列表
+  → EnsureAgentSwitch.NeedExecute()
+    → 已切换 → false → 跳过
 
-DAG 执行:
+PhaseFlow.Execute() 按顺序执行:
+  1. EnsureBKEAgent → filterNodes(!NodeAgentPushedFlag) → 只操作 master-2
+     → 推送 bkeagent → 设置 master-2 的 NodeAgentPushedFlag|NodeAgentReadyFlag
+  2. EnsureNodesEnv → getNodesToInitEnv() → 只操作 master-2 (NodeEnvFlag 未设置)
+     → 安装 containerd/系统配置 → 设置 master-2 的 NodeEnvFlag
+  3. EnsureMasterInit → getExistingMasterNodes() → master-1 已就绪 → 执行 join
+     → GetNeedJoinMasterNodesWithBKENodes() → master-2 未加入 → 执行 kubeadm join
+     → 设置 master-2 的 NodeBootFlag
+  4. EnsureNodesPostProcess → 只操作 master-2
+     → 执行后置脚本 → 设置 master-2 的 NodePostProcessFlag
+```
+
+**DAG 化路径（目标设计）**:
+
+```
+前置状态: (同上)
+
+executeScaleDAG:
+  1. fillCurrentFromExistingNodes 填充 VersionContext:
+     集群级组件 (certs, coredns, ...): Current==Target → Skip
+     节点级组件 (bkeagent, containerd, ...): Current=="" → Install
+
+  2. Scheduler.ExecuteDAG:
 
   第一层: Scheduler 组件级 Decision
     Batch 1: [certs]          → Skip  (Current==Target)
