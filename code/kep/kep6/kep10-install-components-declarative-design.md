@@ -814,11 +814,11 @@ func registerInstallHandlers() {
 │  安装 DAG构建 (新增):                                                           │
 │    BuildVersionContextForInstall(targetBundle)                                   │
 │      → Current 全空 (全新安装，无已安装组件)                                    │
-│      → Target 有值 (来自 install.components + upgrade.components)              │
+│      → Target 有值 (来自 install.components)                                    │
 │      → Decide: current="" + target!="" → DecisionInstall ★                      │
 │    BuildInstallDAGFromBundle(bundle, resolver)                                   │
 │      → 遍历 install.components 构建 DAG (复用 BuildUpgradeDAG 逻辑)             │
-│      → InstallComponent 转 UpgradeComponent 结构 (适配现有拓扑构建器)           │
+│      → 使用统一的 ReleaseImageComponent 类型 (无需转换)                          │
 │                                                                                 │
 │  复用点:                                                                         │
 │  ① BuildUpgradeDAG — 拓扑排序 + 依赖解析逻辑完全复用                            │
@@ -904,7 +904,7 @@ func BuildInstallDAGFromBundle(
         return nil, err
     }
     
-    // 2. ★ 条件过滤: 排除指定组件 (如 manage 在全新安装时排除)
+    // 3. ★ 条件过滤: 排除指定组件 (如 manage 在全新安装时排除)
     excludeSet := make(map[string]bool)
     for _, name := range excludeComponents {
         excludeSet[name] = true
@@ -916,24 +916,9 @@ func BuildInstallDAGFromBundle(
         }
     }
     
-    // 3. 转换为 ComponentNode（复用 UpgradeComponent 结构）
-    var components []topology.ReleaseImageComponent
-    for _, ic := range filteredComponents {
-        comp := topology.ReleaseImageComponent{
-            Name:    ic.Name,
-            Version: ic.Version,
-        }
-        if ic.Inline != nil {
-            comp.Inline = &topology.ReleaseImageInline{
-                Handler: ic.Inline.Handler,
-                Version: ic.Inline.Version,
-            }
-        }
-        components = append(components, comp)
-    }
-    
-    // 4. 复用 BuildUpgradeDAG（同一构建逻辑）
-    return topology.BuildUpgradeDAG(components, resolve)
+    // 4. 直接使用统一的 ReleaseImageComponent 类型构建 DAG (无需转换)
+    //    topology.BuildUpgradeDAG 已重构为接受 []apiv1.ReleaseImageComponent
+    return topology.BuildUpgradeDAG(filteredComponents, resolve)
 }
 ```
 
@@ -949,16 +934,9 @@ func BuildVersionContextForInstall(
     vc := NewVersionContext()
     
     // 安装场景：Current 全部为空（全新安装），Target 来自 ReleaseImage
-    // install.components 填充 Target
+    // ★ 仅 install.components 填充 Target (安装场景不使用 upgrade.components)
     if targetBundle.Release.Spec.Install != nil {
         for _, comp := range targetBundle.Release.Spec.Install.Components {
-            vc.SetTarget(comp.Name, comp.Version)
-        }
-    }
-    
-    // upgrade.components 也填充 Target（覆盖同名 install 条目）
-    if targetBundle.Release.Spec.Upgrade != nil {
-        for _, comp := range targetBundle.Release.Spec.Upgrade.Components {
             vc.SetTarget(comp.Name, comp.Version)
         }
     }
