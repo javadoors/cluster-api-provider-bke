@@ -3789,6 +3789,461 @@ func (s *BundleStore) GetComponentVersion(ctx, name, version string) (*apiv1.Com
 
 ---
 
+## 14. ComponentVersion 执行时条件过滤
+
+### 14.1 设计动机
+
+当前 DAG 执行的跳过逻辑仅基于版本比较（`VersionContext.NeedsExecution`）和完成状态（`DeclarativeUpgradeStatus.IsCompleted`），无法表达"当集群满足某条件时才执行此组件"的语义。
+
+**典型场景**：
+
+| 场景 | 条件表达式 | 说明 |
+|------|-----------|------|
+| 仅 Master 扩容时执行 | `{{ eq .ScaleType "master" }}` | 扩容 DAG 中 Worker 组件跳过 |
+| 仅 Worker 扩容时执行 | `{{ eq .ScaleType "worker" }}` | 扩容 DAG 中 Master 组件跳过 |
+| 仅升级场景执行 | `{{ eq .Operation "upgrade" }}` | 安装场景跳过仅升级需要的组件 |
+| 仅首次安装执行 | `{{ eq .Operation "install" }}` | 升级场景跳过仅安装需要的组件 |
+| 集群规模大于 3 节点时执行 | `{{ gt .NodeCount 3 }}` | 小集群跳过非必要组件 |
+| 离线部署时执行 | `{{ eq .DeployMode "offline" }}` | 在线部署跳过离线专用组件 |
+
+### 14.2 数据结构设计
+
+#### 14.2.1 ComponentVersionSpec 新增 Condition 字段
+
+```go
+// api/v1alpha1/componentversion_types.go
+
+type ComponentVersionSpec struct {
+    Name    string        `json:"name"`
+    Type    ComponentType `json:"type"`
+    Version string        `json:"version"`
+    Inline  *InlineSpec   `json:"inline,omitempty"`
+    YAML    *YAMLSpec     `json:"yaml,omitempty"`
+    SubComponents  []SubComponent      `json:"subComponents,omitempty"`
+    Compatibility CompatibilitySpec   `json:"compatibility,omitempty"`
+    Dependencies  []Dependency        `json:"dependencies,omitempty"`
+    UpgradeStrategy UpgradeStrategySpec `json:"upgradeStrategy,omitempty"`
+    Resources     []ResourceSpec      `json:"resources,omitempty"`
+
+    // Condition is a Go Template expression evaluated at execution time.
+    // Empty means always execute (no filtering).
+    // The template receives ConditionContext with cluster state variables.
+    // Evaluation result "true" (string) → execute; anything else → skip.
+    // +optional
+    Condition string `json:"condition,omitempty"`
+}
+```
+
+#### 14.2.2 SubComponent 新增 Condition 字段
+
+```go
+// api/v1alpha1/componentversion_types.go
+
+type SubComponent struct {
+    Name    string `json:"name"`
+    Version string `json:"version"`
+
+    // Condition is a Go Template expression for sub-component inclusion.
+    // Evaluated during composite expansion (DAG build time) for selector-style
+    // sub-component selection, AND at execution time for runtime filtering.
+    // Empty means always include.
+    // +optional
+    Condition string `json:"condition,omitempty"`
+}
+```
+
+#### 14.2.3 ReleaseImageUpgradeComponent 新增 Condition 字段
+
+```go
+// api/v1alpha1/releaseimage_types.go
+
+type ReleaseImageUpgradeComponent struct {
+    Name    string                     `json:"name,omitempty"`
+    Version string                     `json:"version,omitempty"`
+    Inline  *ReleaseImageUpgradeInline `json:"inline,omitempty"`
+
+    // Condition is a Go Template expression evaluated at execution time.
+    // Overrides ComponentVersion.Spec.Condition when set on both.
+    // Empty means defer to ComponentVersion.Spec.Condition.
+    // +optional
+    Condition string `json:"condition,omitempty"`
+}
+```
+
+### 14.3 ConditionContext 设计
+
+Condition 表达式在 Scheduler 执行时求值，求值上下文 `ConditionContext` 从 `ExecutionContext` + `BKECluster` 构建：
+
+```go
+// pkg/dagexec/condition.go
+
+// ConditionContext is the template data passed to condition expressions.
+type ConditionContext struct {
+    // Operation is the current operation type: install / upgrade / scale / rollback / manage
+    Operation string
+
+    // ScaleType is the scale sub-type when Operation=scale: master / worker / "" (not scale)
+    ScaleType string
+
+    // NodeCount is the total number of nodes in the cluster
+    NodeCount int
+
+    // MasterCount is the number of master nodes
+    MasterCount int
+
+    // WorkerCount is the number of worker nodes
+    WorkerCount int
+
+    // DeployMode is the deployment mode: offline / online
+    DeployMode string
+
+    // KubernetesVersion is the cluster's Kubernetes version
+    KubernetesVersion string
+
+    // OpenFuyaoVersion is the cluster's openFuyao version
+    OpenFuyaoVersion string
+
+    // ClusterName is the BKECluster name
+    ClusterName string
+
+    // Namespace is the BKECluster namespace
+    Namespace string
+
+    // DryRun indicates whether this is a dry-run operation
+    DryRun bool
+
+    // Variables holds arbitrary key-value pairs for extensibility
+    Variables map[string]string
+}
+
+// BuildConditionContext builds a ConditionContext from ExecutionContext and BKECluster.
+func BuildConditionContext(execCtx *ExecutionContext) ConditionContext {
+    var ctx ConditionContext
+    if execCtx == nil || execCtx.Cluster == nil {
+        return ctx
+    }
+    cluster := execCtx.Cluster
+
+    ctx.ClusterName = cluster.Name
+    ctx.Namespace = cluster.Namespace
+    ctx.DryRun = cluster.Spec.DryRun
+
+    if cluster.Spec.ClusterConfig != nil {
+        spec := cluster.Spec.ClusterConfig.Cluster
+        ctx.KubernetesVersion = spec.KubernetesVersion
+        ctx.OpenFuyaoVersion = spec.OpenFuyaoVersion
+    }
+
+    // Node counts from BKENode status
+    nodes := cluster.Status.Nodes
+    ctx.NodeCount = len(nodes)
+    for _, n := range nodes {
+        if isMasterRole(n) {
+            ctx.MasterCount++
+        } else {
+            ctx.WorkerCount++
+        }
+    }
+
+    // Operation and ScaleType from cluster annotations/status
+    ctx.Operation = inferOperation(cluster)
+    ctx.ScaleType = inferScaleType(cluster)
+
+    // DeployMode from cluster config
+    ctx.DeployMode = inferDeployMode(cluster)
+
+    return ctx
+}
+
+// EvaluateCondition evaluates a Go Template condition expression.
+// Returns true if the expression evaluates to "true" (case-insensitive, trimmed).
+// Empty expression returns true (no filtering).
+func EvaluateCondition(condition string, ctx ConditionContext) (bool, error) {
+    if strings.TrimSpace(condition) == "" {
+        return true, nil
+    }
+    tmpl, err := template.New("condition").Parse(condition)
+    if err != nil {
+        return false, fmt.Errorf("parse condition %q: %w", condition, err)
+    }
+    var buf bytes.Buffer
+    if err := tmpl.Execute(&buf, ctx); err != nil {
+        return false, fmt.Errorf("evaluate condition %q: %w", condition, err)
+    }
+    result := strings.TrimSpace(buf.String())
+    return strings.EqualFold(result, "true"), nil
+}
+```
+
+### 14.4 Scheduler 集成设计
+
+在 `Scheduler.executeBatchParallel` 的现有跳过检查链中增加 Condition 检查，位于版本检查之后、执行器分发之前：
+
+```go
+// pkg/dagexec/scheduler.go — executeBatchParallel 现有跳过检查链
+
+for _, compName := range batch {
+    node, ok := dag.GetNode(compName)
+    if !ok { continue }
+
+    // (A) 已完成检查 (现有)
+    if s.shouldSkipComponent(execCtx, node) { continue }
+
+    // (B) 版本检查 (现有)
+    if !s.componentNeedsUpgrade(execCtx, node) { continue }
+
+    // (C) ★ Condition 检查 (新增)
+    if !s.shouldExecuteByCondition(ctx, execCtx, node) { continue }
+
+    // (D) 执行器分发 (现有)
+    viaRegistry := s.usesRegistryExecutor(ctx, node)
+    // ...
+    items = append(items, workItem{...})
+}
+```
+
+```go
+// pkg/dagexec/scheduler.go — shouldExecuteByCondition 新增方法
+
+// shouldExecuteByCondition evaluates the Condition field from ComponentVersion
+// (and optionally ReleaseImage component). Returns true if the component should
+// execute, false if the condition filters it out.
+func (s *Scheduler) shouldExecuteByCondition(
+    ctx context.Context,
+    execCtx *ExecutionContext,
+    node *topology.ComponentNode,
+) bool {
+    if node == nil {
+        return true
+    }
+
+    // 1. 从 CVStore 加载 ComponentVersion
+    version := s.nodeVersionKey(node)
+    cv, err := s.CVStore.GetComponentVersion(ctx, node.Name, version)
+    if err != nil || cv == nil {
+        // 无法加载 CV, 不阻塞执行 (向后兼容)
+        return true
+    }
+
+    // 2. 获取 Condition 表达式
+    //    优先 ReleaseImage 组件 Condition (如果 DAG 构建时传入了)
+    //    回退 ComponentVersion.Spec.Condition
+    condition := cv.Spec.Condition
+    if condition == "" {
+        return true // 无 Condition, 不过滤
+    }
+
+    // 3. 构建 ConditionContext 并求值
+    condCtx := BuildConditionContext(execCtx)
+    shouldExecute, err := EvaluateCondition(condition, condCtx)
+    if err != nil {
+        // 求值失败: 记录日志, 不阻塞执行 (安全默认)
+        loggerFrom(execCtx).Warn("condition evaluation failed for %s: %v", node.Name, err)
+        return true
+    }
+
+    if !shouldExecute {
+        loggerFrom(execCtx).Info("component %s skipped by condition: %q", node.Name, condition)
+    }
+    return shouldExecute
+}
+```
+
+### 14.5 跳过链总览
+
+DAG 执行时，每个组件按以下顺序检查，任一检查失败即跳过：
+
+```
+组件执行检查链 (executeBatchParallel)
+  │
+  ├─ (A) shouldSkipComponent
+  │     DeclarativeUpgradeStatus.IsCompleted(name, version)
+  │     → 组件已标记完成 → Skip
+  │
+  ├─ (B) componentNeedsUpgrade
+  │     VersionContext.NeedsExecution(current, target)
+  │     → Current == Target → Skip
+  │
+  ├─ (C) shouldExecuteByCondition ★ 新增
+  │     EvaluateCondition(cv.Spec.Condition, ConditionContext)
+  │     → 表达式求值为 false → Skip
+  │
+  └─ (D) 执行器分发
+        resolveComponentType → Registry / Legacy
+        → ExecuteComponent
+```
+
+| 检查 | 依据 | 时机 | 跳过效果 |
+|------|------|------|---------|
+| (A) 已完成 | `DeclarativeUpgradeStatus` | 执行批次内 | 组件不执行，状态保持 Completed |
+| (B) 版本 | `VersionContext` Current vs Target | 执行批次内 | 组件不执行，无状态变更 |
+| (C) 条件 ★ | `ComponentVersion.Spec.Condition` 表达式 | 执行批次内 | 组件不执行，无状态变更 |
+| (D) 执行器 | `ComponentVersion.Spec.Type` | 执行器内 | 分发到 Inline/YAML/Helm/Binary Executor |
+
+### 14.6 Condition 表达式语法
+
+使用 Go Template (`text/template`) 语法，ConditionContext 作为模板数据：
+
+| 表达式 | 含义 | 示例场景 |
+|--------|------|---------|
+| `{{ eq .Operation "scale" }}` | 仅扩容时执行 | 扩容专用组件 |
+| `{{ eq .ScaleType "master" }}` | 仅 Master 扩容时执行 | Master 专用组件 |
+| `{{ eq .Operation "install" }}` | 仅安装时执行 | 安装专用组件 |
+| `{{ eq .Operation "upgrade" }}` | 仅升级时执行 | 升级专用组件 |
+| `{{ gt .NodeCount 3 }}` | 节点数 > 3 时执行 | 大集群专用组件 |
+| `{{ eq .DeployMode "offline" }}` | 离线部署时执行 | 离线专用组件 |
+| `{{ and (eq .Operation "scale") (eq .ScaleType "worker") }}` | Worker 扩容时执行 | Worker 扩容专用 |
+| `{{ or (eq .Operation "install") (eq .Operation "scale") }}` | 安装或扩容时执行 | 非升级场景 |
+| (空) | 始终执行 | 默认行为 (向后兼容) |
+
+**求值规则**：
+- 表达式求值结果为字符串，`"true"`（不区分大小写）表示执行，其他值表示跳过
+- 空表达式等同于不设置 Condition，始终执行
+- 求值失败（模板解析/执行错误）时安全默认为执行，记录警告日志
+
+### 14.7 ComponentVersion YAML 示例
+
+```yaml
+# ComponentVersion: bkeagent — 无 Condition (始终执行)
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: bkeagent-v2.7.0
+spec:
+  name: bkeagent
+  type: inline
+  version: "v2.7.0"
+  inline:
+    handler: EnsureBKEAgent
+    version: "v1.0.0"
+  dependencies: []
+
+---
+# ComponentVersion: kubernetes-master — 仅 Master 扩容时执行
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: kubernetes-master-v2.7.0
+spec:
+  name: kubernetes-master
+  type: inline
+  version: "v2.7.0"
+  inline:
+    handler: EnsureMasterInit
+    version: "v1.0.0"
+  dependencies: [bkeagent]
+  # ★ 仅 Master 扩容时执行, Worker 扩容时跳过
+  condition: '{{ eq .ScaleType "master" }}'
+
+---
+# ComponentVersion: kubernetes-worker — 仅 Worker 扩容时执行
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: kubernetes-worker-v2.7.0
+spec:
+  name: kubernetes-worker
+  type: inline
+  version: "v2.7.0"
+  inline:
+    handler: EnsureWorkerJoin
+    version: "v1.0.0"
+  dependencies: [bkeagent]
+  # ★ 仅 Worker 扩容时执行, Master 扩容时跳过
+  condition: '{{ eq .ScaleType "worker" }}'
+
+---
+# ComponentVersion: coredns — 仅安装/扩容时执行, 升级时由独立升级组件处理
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: coredns-v1.11.1
+spec:
+  name: coredns
+  type: yaml
+  version: "v1.11.1"
+  yaml:
+    applyStrategy: ServerSideApply
+    healthCheck:
+      enabled: true
+      checks:
+        - type: PodReady
+          podReady:
+            namespace: kube-system
+            labelSelector: "k8s-app=kube-dns"
+  dependencies: [kubernetes-master]
+  # ★ 仅安装或扩容时执行, 升级时跳过 (升级由 coredns-upgrade 组件处理)
+  condition: '{{ or (eq .Operation "install") (eq .Operation "scale") }}'
+```
+
+### 14.8 扩容场景 Condition 过滤示例
+
+以 3 节点集群（master-1, worker-1, worker-2）扩容新增 worker-3 为例：
+
+```
+ConditionContext (BuildConditionContext):
+  Operation = "scale"
+  ScaleType = "worker"     ← Worker 扩容
+  NodeCount = 4
+  MasterCount = 1
+  WorkerCount = 3
+
+Scheduler 跳过检查链:
+  bkeagent:
+    (A) IsCompleted → false (未完成)
+    (B) NeedsExecution → true (Current=="")
+    (C) Condition: "" (空) → true ★ 执行
+    → EnsureBKEAgent: 推送 bkeagent 到 worker-3
+
+  kubernetes-master:
+    (A) IsCompleted → false
+    (B) NeedsExecution → true
+    (C) Condition: '{{ eq .ScaleType "master" }}' → "false" (ScaleType=worker) → Skip ★
+    → 跳过 (Worker 扩容不需要 Master 组件)
+
+  kubernetes-worker:
+    (A) IsCompleted → false
+    (B) NeedsExecution → true
+    (C) Condition: '{{ eq .ScaleType "worker" }}' → "true" → Execute ★
+    → EnsureWorkerJoin: worker-3 加入集群
+
+  coredns:
+    (A) IsCompleted → false
+    (B) NeedsExecution → true (Current=="" for node-scoped)
+    (C) Condition: '{{ or (eq .Operation "install") (eq .Operation "scale") }}'
+        → "true" (Operation=scale) → Execute ★
+    → 部署 coredns (如果集群级组件未跳过)
+    → 实际由 (A)/(B) 层过滤: Current==Target → Skip (集群级组件已安装)
+```
+
+### 14.9 向后兼容性
+
+| 场景 | Condition 字段 | 行为 | 说明 |
+|------|---------------|------|------|
+| 现有 ComponentVersion | 未设置 (空) | 始终执行 | 与当前行为完全一致 |
+| 新增 Condition 字段 | 设置表达式 | 按表达式过滤 | 新增能力，不影响现有组件 |
+| 表达式求值失败 | 解析/执行错误 | 安全默认执行 | 记录警告日志，不阻塞 |
+| CVStore 不可用 | 无法加载 CV | 不阻塞执行 | 与当前 resolveComponentType 行为一致 |
+| ReleaseImage 无 Condition | 组件引用无 Condition | 回退 CV.Spec.Condition | 双层回退 |
+
+**关键原则**：Condition 是**可选的**过滤层，不设置时行为与当前完全一致。仅在 ComponentVersion.Spec.Condition 非空时才进行求值，确保向后兼容。
+
+### 14.10 与 KEP-17 Selector 的区别
+
+| 维度 | KEP-17 Selector | 本设计 Condition |
+|------|----------------|-----------------|
+| **求值时机** | DAG 构建时 (build time) | DAG 执行时 (execution time) |
+| **求值位置** | `expandSelectorComponents` → 子组件选择 | `shouldExecuteByCondition` → 组件跳过 |
+| **影响范围** | 子组件是否进入 DAG | DAG 中的组件是否执行 |
+| **数据来源** | TemplateContext (静态) | ConditionContext (动态, 含运行时状态) |
+| **适用场景** | composite 子组件按条件选择 | 任何组件按运行时条件跳过 |
+| **表达式语言** | Go Template | Go Template (相同) |
+| **互补关系** | Selector 决定 DAG 结构 | Condition 决定 DAG 执行 |
+
+两者**互补**：Selector 在构建时选择子组件进入 DAG，Condition 在执行时过滤 DAG 中的组件。同一组件可以同时使用两者。
+
+---
+
 ## 附录
 
 ### A. 参考文档
@@ -3796,7 +4251,8 @@ func (s *BundleStore) GetComponentVersion(ctx, name, version string) (*apiv1.Com
 1. [KEP-5 声明式升级框架](kep5/kep5.md)
 2. [KEP-6 三层状态机设计](kep6-state-machine-v4.md)
 3. [KEP-9 Static Pod 类型设计](kep9-staticpod-upgrade-framework.md)
-4. [声明式集群版本升级方案-支持二进制与 Helm 组件](声明式集群版本升级方案-支持二进制与 Helm 组件.md)
+4. [KEP-17 Selector 组件类型设计](kep17-selector-component-design.md)
+5. [声明式集群版本升级方案-支持二进制与 Helm 组件](声明式集群版本升级方案-支持二进制与 Helm 组件.md)
 
 ### B. 术语表
 
@@ -3808,3 +4264,6 @@ func (s *BundleStore) GetComponentVersion(ctx, name, version string) (*apiv1.Com
 | **DecisionInstall** | VersionContext 决策：current 为空且 target 有值时触发安装 |
 | **DeclarativeInstallEnabled** | Feature Gate，控制 DAG 安装路径是否启用 |
 | **install-ready annotation** | `cvo.openfuyao.cn/install-ready`，触发 DAG 安装路径 |
+| **Condition** | ComponentVersion.Spec.Condition，Go Template 表达式，执行时求值决定组件是否执行 |
+| **ConditionContext** | 执行时条件求值上下文，包含 Operation/ScaleType/NodeCount 等运行时状态 |
+| **shouldExecuteByCondition** | Scheduler 中 Condition 检查方法，位于版本检查之后、执行器分发之前 |
