@@ -6,8 +6,6 @@
 | **标题** | Selector 组件类型：基于 Condition 的互斥选择器设计 |
 | **状态** | `provisional` |
 | **类型** | Feature |
-| **作者** | openFuyao Team |
-| **创建日期** | 2026-08-29 |
 | **依赖** | KEP-5 声明式升级框架、KEP-6 声明式集群版本升级方案、KEP-13 二进制组件改造 |
 | **来源** | 从 `kep6-detailed-design.md` 抽离 selector 组件相关内容 |
 
