@@ -657,83 +657,116 @@ var DeclarativeInstallCatalog = []ComponentSpec{
 
 ### 5.2 安装组件与升级组件目录对比
 
-| 组件名称 | 安装 handler | 升级 handler | 执行模式 |
-|---------|-------------|-------------|---------|
-| bkeagent | `EnsureBKEAgent` | `EnsureAgentUpgrade` | inline |
-| nodes-env | `EnsureNodesEnv` | - | inline |
-| cluster-api-obj | `EnsureClusterAPIObj` | - | inline |
-| certs | `EnsureCerts` | - | inline |
-| load-balance | `EnsureLoadBalance` | - | inline |
-| kubernetes-master | `EnsureMasterInit` | `EnsureMasterUpgrade` | inline |
-| kubernetes-worker | `EnsureWorkerJoin` | `EnsureWorkerUpgrade` | inline |
-| nodes-postprocess | `EnsureNodesPostProcess` | - | inline |
-| agent-switch | `EnsureAgentSwitch` | - | inline |
-| kube-proxy | (manifest) | (manifest) | manifest |
-| coredns | (manifest) | (manifest) | manifest |
-| pre-upgrade-resources | - | `EnsurePreUpgradeResources` | inline |
-| containerd | - | `EnsureContainerdUpgrade` | inline |
-| etcd | (包含在 MasterInit) | `EnsureEtcdUpgrade` | inline |
+基于代码库实际实现核对的完整组件列表：
 
-#### 5.2.1 containerd 和 etcd 的安装路径分析
+| 组件名称 | ReleaseImage install | ReleaseImage upgrade | 安装 handler (DeployPhases) | 升级 handler | 执行模式 | 说明 |
+|---------|---------------------|---------------------|----------------------------|-------------|---------|------|
+| **bkeagent** | ✅ | ✅ inline: EnsureAgentUpgrade | `EnsureBKEAgent` | `EnsureAgentUpgrade` | inline | Agent 推送/升级 |
+| **kubernetes-master** | ✅ | ✅ inline: EnsureMasterUpgrade | `EnsureMasterInit` | `EnsureMasterUpgrade` | inline | Master 初始化/升级 |
+| **kubernetes-worker** | ✅ | ✅ inline: EnsureWorkerUpgrade | `EnsureWorkerJoin` | `EnsureWorkerUpgrade` | inline | Worker 加入/升级 |
+| **etcd** | ✅ | ✅ inline: EnsureEtcdUpgrade | (嵌入 MasterInit) | `EnsureEtcdUpgrade` | inline | etcd 由 kubeadm init 创建 |
+| **containerd** | ✅ | ✅ inline: EnsureContainerdUpgrade | (嵌入 NodesEnv) | `EnsureContainerdUpgrade` | inline | containerd 由 K8sEnvInit runtime scope 安装 |
+| **provider** | ✅ | ✅ (无 inline) | (嵌入 MasterInit) | `EnsureProviderSelfUpgrade` | manifest | provider 由 kubeadm init 部署 |
+| **calico** | ✅ | ✅ (无 inline) | (嵌入 AddonDeploy) | (manifest) | manifest | CNI 插件，安装走 EnsureAddonDeploy |
+| **kubeproxy** | ✅ | ✅ (无 inline) | (嵌入 AddonDeploy) | (manifest) | manifest | kube-proxy，安装走 EnsureAddonDeploy |
+| **coredns** | ✅ | ✅ (无 inline) | (嵌入 AddonDeploy) | (manifest) | manifest | CoreDNS，安装走 EnsureAddonDeploy |
+| **nodes-env** | ❌ | ❌ | `EnsureNodesEnv` | - | inline | 节点环境准备 (含 containerd) |
+| **cluster-api-obj** | ❌ | ❌ | `EnsureClusterAPIObj` | - | inline | Cluster API 对象创建 |
+| **certs** | ❌ | ❌ | `EnsureCerts` | - | inline | 证书生成 |
+| **load-balance** | ❌ | ❌ | `EnsureLoadBalance` | - | inline | HA 负载均衡 (haproxy/keepalived) |
+| **nodes-postprocess** | ❌ | ❌ | `EnsureNodesPostProcess` | - | inline | 后置脚本处理 |
+| **agent-switch** | ❌ | ❌ | `EnsureAgentSwitch` | - | inline | Agent 监听切换 |
+| **pre-upgrade-resources** | ❌ | ✅ inline: (无) | - | `EnsurePreUpgradeResources` | inline | 升级前资源预创建 |
 
-上表中 containerd 和 etcd 的安装列为"-"或"包含在 MasterInit"，因为安装时它们**没有独立的 Phase**，而是嵌入在其他 Phase 的执行流程中。以下是基于代码的分析：
+**图例说明**：
+- ✅ = ReleaseImage 中声明的组件
+- ❌ = ReleaseImage 中未声明 (仅在 PhaseFlow 中存在)
+- (嵌入 XXX) = 安装时嵌入在其他 Phase 中，无独立 handler
+- (manifest) = 通过 bke-manifests YAML 清单部署，无 inline handler
 
-**containerd — 在 `EnsureNodesEnv` Phase 中安装 (非独立 Phase)**
+#### 5.2.1 containerd 的安装路径详细说明
 
-`EnsureNodesEnv` (DeployPhases #1) 负责节点环境初始化，containerd 的安装嵌入在其命令链中：
+containerd 在安装和升级中采用不同的路径：
+
+**安装路径** (嵌入 `EnsureNodesEnv` Phase)：
 
 ```txt
 EnsureNodesEnv.Execute()
   → CheckOrInitNodesEnv()
     → buildEnvCommand() → BuildCommonEnvCommand()
       → 创建 BKEAgent Command CR (类型: CommandBuiltIn)
-        → BKEAgent 执行 K8sEnvInit 插件 (scope 含 "runtime"):
-          → initRuntime() → downloadContainerd()
-            → 下载 containerd-{version}-linux-{arch}.tar.gz
-            → 解压 + 安装 + 启动 systemd 服务
+        → BKEAgent 执行 K8sEnvInit 插件:
+          → scope 包含 "runtime":
+            → initRuntime() → downloadContainerd()
+              → 下载 containerd-{version}-linux-{arch}.tar.gz
+              → 解压 + 安装 + 启动 systemd 服务
 ```
 
 | 维度 | 说明 |
 |------|------|
-| 安装 Phase | `EnsureNodesEnv` (DeployPhases #1) |
-| 安装机制 | BKEAgent `K8sEnvInit` 插件 `runtime` scope → `downloadContainerd()` |
-| 代码位置 | `pkg/phaseframe/phases/ensure_nodes_env.go` → `pkg/command/env.go` → `pkg/job/builtin/kubeadm/env/init.go` |
-| 是否独立 Phase | **否** — containerd 安装嵌入在 `EnsureNodesEnv` 的环境初始化命令中 |
-| 升级 Phase | `EnsureContainerdUpgrade` (独立 Phase，仅升级路径) |
+| **安装 Phase** | `EnsureNodesEnv` (DeployPhases #1) |
+| **安装机制** | BKEAgent `K8sEnvInit` 插件 `runtime` scope → `downloadContainerd()` |
+| **代码位置** | `pkg/phaseframe/phases/ensure_nodes_env.go` → `pkg/command/env.go` → `pkg/job/builtin/kubeadm/env/init.go` |
+| **是否独立 Phase** | **否** — containerd 安装嵌入在 `EnsureNodesEnv` 的环境初始化命令中 |
+| **版本来源** | `BKECluster.Spec.ClusterConfig.Cluster.ContainerdVersion` (从 Spec 读取) |
 
-**etcd — 在 `EnsureMasterInit` Phase 中通过 kubeadm init 创建 (非独立 Phase)**
-
-`EnsureMasterInit` (DeployPhases #5) 负责首个 Master 节点初始化，etcd 的 Static Pod 由 kubeadm init 自动创建：
+**升级路径** (独立 `EnsureContainerdUpgrade` Phase)：
 
 ```txt
-EnsureMasterInit.Execute()
-  → 创建 Bootstrap Command CR (Phase: InitControlPlane)
-    → BKEAgent 执行 Kubeadm 插件 (phase=InitControlPlane):
-      → kubeadm init
-        → 生成 etcd Static Pod manifest → /etc/kubernetes/manifests/etcd.yaml
-        → Kubelet 检测 manifest → 拉起 etcd Pod (stacked etcd)
-        → 同时创建 apiserver/cm/scheduler Static Pod
-  → 轮询等待 ControlPlaneInitializedCondition=True (含 etcd 就绪)
+EnsureContainerdUpgrade.Execute()
+  → 创建 BKEAgent Command CR (类型: CommandBuiltIn)
+    → BKEAgent 执行 Kubeadm 插件:
+      → phase=UpgradeContainerd
+        → upgradeContainerd()
+          → 下载新版 containerd 二进制
+          → 停止 containerd 服务
+          → 替换二进制文件
+          → 启动 containerd 服务
+          → 等待服务就绪
 ```
 
 | 维度 | 说明 |
 |------|------|
-| 安装 Phase | `EnsureMasterInit` (DeployPhases #5) |
-| 安装机制 | `kubeadm init` 自动创建 etcd Static Pod manifest (stacked etcd) |
-| 代码位置 | `pkg/phaseframe/phases/ensure_master_init.go` → `pkg/command/bootstrap.go` → BKEAgent `Kubeadm` 插件 |
-| 是否独立 Phase | **否** — etcd 由 `kubeadm init` 隐式创建，无独立 `EnsureEtcdInstall` Phase |
-| 升级 Phase | `EnsureEtcdUpgrade` (独立 Phase，仅升级路径) |
+| **升级 Phase** | `EnsureContainerdUpgrade` (DeclarativeInlineUpgradePhases) |
+| **升级机制** | BKEAgent `Kubeadm` 插件 `UpgradeContainerd` phase |
+| **代码位置** | `pkg/phaseframe/phases/ensure_containerd_upgrade.go` → `pkg/job/builtin/kubeadm/kubeadm.go` |
+| **是否独立 Phase** | **是** — 独立的升级 Phase |
+| **版本来源** | `ReleaseImage.upgrade.components[containerd].version` (从 ReleaseImage 读取) |
 
-**对 DeclarativeInstallCatalog 的影响**：
+**安装与升级路径不一致的原因**：
 
-由于 containerd 和 etcd 在安装时没有独立 Phase (嵌入在 `EnsureNodesEnv` 和 `EnsureMasterInit` 中)，它们在 `DeclarativeInstallCatalog` 中**没有独立的 Catalog 条目**：
+| 维度 | 安装 | 升级 |
+|------|------|------|
+| **执行时机** | 节点环境准备阶段 (首次安装) | 集群已运行，需要滚动升级 |
+| **执行方式** | 通过 K8sEnvInit 插件批量初始化节点环境 | 通过 Kubeadm 插件单独升级 containerd |
+| **是否需要 drain** | 否 (节点尚未加入集群) | 是 (需要驱逐 Pod) |
+| **是否重启服务** | 是 (首次启动) | 是 (停止 → 替换 → 启动) |
 
-| 组件 | Catalog 中是否有独立安装条目 | 原因 |
-|------|---------------------------|------|
-| containerd | **否** | 安装嵌入在 `EnsureNodesEnv` 的 `runtime` scope 中，无独立 handler |
-| etcd | **否** | 安装由 `kubeadm init` 隐式完成 (在 `EnsureMasterInit` 中)，无独立 handler |
+**DAG 化影响**：
 
-> 这与升级目录 `DeclarativeUpgradeCatalog` 不同 — 升级时 containerd 和 etcd 有独立 Phase (`EnsureContainerdUpgrade` / `EnsureEtcdUpgrade`)，因此升级目录中有独立条目。安装时它们是嵌入式的，不需要独立条目。
+在 DAG 化安装路径中，containerd 需要作为独立组件声明：
+
+```yaml
+# ReleaseImage install.components 新增 containerd
+install:
+  components:
+    - name: containerd
+      version: v2.1.1
+      inline:
+        handler: EnsureContainerdInstall  # 🆕新增: 独立的安装 handler
+        version: v1.0.0
+```
+
+或者保持嵌入方式，但需要确保 `EnsureNodesEnv` 在 DAG 中正确执行：
+
+```go
+// DeclarativeInstallCatalog 中 containerd 的处理方式
+// 方案 A: 独立组件 (推荐)
+{Name: "containerd", Mode: ExecutionInline, InlineHandler: "EnsureContainerdInstall"}
+
+// 方案 B: 保持嵌入 (不推荐，违反声明式原则)
+// containerd 不在 DeclarativeInstallCatalog 中，由 EnsureNodesEnv 内部处理
+```
 
 ### 5.3 ComponentFactory 注册扩展
 
