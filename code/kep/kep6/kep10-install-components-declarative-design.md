@@ -637,10 +637,29 @@ var DeclarativeInstallCatalog = []ComponentSpec{
     {Name: "agent-switch",      Mode: ExecutionInline, InlineHandler: "EnsureAgentSwitch",    LegacyPhase: "EnsureAgentSwitch"},
 
     // manifest 模式：YAML 清单应用
+    // 对应 ReleaseImage install.components 中无 inline handler 的组件
     {Name: "kube-proxy", Mode: ExecutionManifest, ManifestPath: "kube-proxy/{version}/component.yaml"},
     {Name: "coredns",    Mode: ExecutionManifest, ManifestPath: "coredns/{version}/component.yaml"},
+    {Name: "calico",     Mode: ExecutionManifest, ManifestPath: "calico/{version}/component.yaml"},
+    {Name: "provider",   Mode: ExecutionManifest, ManifestPath: "provider/{version}/component.yaml"},
 }
 ```
+
+**ReleaseImage install.components 与 DeclarativeInstallCatalog 的对应关系**：
+
+| ReleaseImage 组件 | Catalog 模式 | Handler / ManifestPath |
+|------------------|-------------|----------------------|
+| bkeagent | inline | `EnsureBKEAgent` |
+| kubernetes-master | inline | `EnsureMasterInit` |
+| kubernetes-worker | inline | `EnsureWorkerJoin` |
+| etcd | (嵌入 MasterInit) | 由 kubeadm init 创建 |
+| containerd | (嵌入 NodesEnv) | 由 K8sEnvInit runtime scope 安装 |
+| calico | manifest | `calico/{version}/component.yaml` |
+| kubeproxy | manifest | `kube-proxy/{version}/component.yaml` |
+| coredns | manifest | `coredns/{version}/component.yaml` |
+| provider | manifest | `provider/{version}/component.yaml` |
+
+> **注意**：etcd 和 containerd 不在 Catalog 中，因为它们在安装时嵌入在其他组件中（etcd 由 `EnsureMasterInit` 通过 kubeadm init 创建，containerd 由 `EnsureNodesEnv` 通过 K8sEnvInit 安装）。详见 §5.2.1。
 
 #### 5.1.3 复用的收益
 
@@ -775,15 +794,16 @@ install:
 
 func registerInstallHandlers() {
     // 安装 handler 注册（复用现有 Phase 构造函数）
-    RegisterInlineHandler("EnsureBKEAgent",       v1alpha1.InlineHandlerVersion, phases.NewEnsureBKEAgent)
-    RegisterInlineHandler("EnsureNodesEnv",       v1alpha1.InlineHandlerVersion, phases.NewEnsureNodesEnv)
-    RegisterInlineHandler("EnsureClusterAPIObj",  v1alpha1.InlineHandlerVersion, phases.NewEnsureClusterAPIObj)
-    RegisterInlineHandler("EnsureCerts",          v1alpha1.InlineHandlerVersion, phases.NewEnsureCerts)
-    RegisterInlineHandler("EnsureLoadBalance",    v1alpha1.InlineHandlerVersion, phases.NewEnsureLoadBalance)
-    RegisterInlineHandler("EnsureMasterInit",     v1alpha1.InlineHandlerVersion, phases.NewEnsureMasterInit)
-    RegisterInlineHandler("EnsureWorkerJoin",     v1alpha1.InlineHandlerVersion, phases.NewEnsureWorkerJoin)
+    // 对应 DeclarativeInstallCatalog 中的 inline 模式组件
+    RegisterInlineHandler("EnsureBKEAgent",         v1alpha1.InlineHandlerVersion, phases.NewEnsureBKEAgent)
+    RegisterInlineHandler("EnsureNodesEnv",         v1alpha1.InlineHandlerVersion, phases.NewEnsureNodesEnv)
+    RegisterInlineHandler("EnsureClusterAPIObj",    v1alpha1.InlineHandlerVersion, phases.NewEnsureClusterAPIObj)
+    RegisterInlineHandler("EnsureCerts",            v1alpha1.InlineHandlerVersion, phases.NewEnsureCerts)
+    RegisterInlineHandler("EnsureLoadBalance",      v1alpha1.InlineHandlerVersion, phases.NewEnsureLoadBalance)
+    RegisterInlineHandler("EnsureMasterInit",       v1alpha1.InlineHandlerVersion, phases.NewEnsureMasterInit)
+    RegisterInlineHandler("EnsureWorkerJoin",       v1alpha1.InlineHandlerVersion, phases.NewEnsureWorkerJoin)
     RegisterInlineHandler("EnsureNodesPostProcess", v1alpha1.InlineHandlerVersion, phases.NewEnsureNodesPostProcess)
-    RegisterInlineHandler("EnsureAgentSwitch",    v1alpha1.InlineHandlerVersion, phases.NewEnsureAgentSwitch)
+    RegisterInlineHandler("EnsureAgentSwitch",      v1alpha1.InlineHandlerVersion, phases.NewEnsureAgentSwitch)
     
     // 升级 handler 已注册（现有）
     // RegisterInlineHandler("EnsureEtcdUpgrade", ...)
@@ -791,6 +811,31 @@ func registerInstallHandlers() {
     // ...
 }
 ```
+
+**DeployPhases 中未注册的 Handler 说明**：
+
+| Handler | 是否注册 | 原因 |
+|---------|---------|------|
+| **EnsureMasterJoin** | ❌ 不注册 | Master 扩容场景由 `EnsureMasterInit` 幂等处理（检查已有 Master 数量，决定执行 init 还是 join）。DAG 化后 `kubernetes-master` 组件统一使用 `EnsureMasterInit`，无需单独的 join handler。 |
+| **EnsureAddonDeploy** | ❌ 不注册 | Addon 组件（calico、kubeproxy、coredns）在 DAG 化中使用 **manifest 模式**（YAML 清单应用），由 `YamlInstaller` 处理，不需要 inline handler。`DeclarativeInstallCatalog` 中这些组件声明为 `Mode: ExecutionManifest`。 |
+
+**Handler 与组件的完整对应关系**：
+
+| 组件 | DeclarativeInstallCatalog 模式 | Handler / Manifest |
+|------|-------------------------------|-------------------|
+| bkeagent | inline | `EnsureBKEAgent` |
+| nodes-env | inline | `EnsureNodesEnv` |
+| cluster-api-obj | inline | `EnsureClusterAPIObj` |
+| certs | inline | `EnsureCerts` |
+| load-balance | inline | `EnsureLoadBalance` |
+| kubernetes-master | inline | `EnsureMasterInit` (init/join 统一) |
+| kubernetes-worker | inline | `EnsureWorkerJoin` |
+| nodes-postprocess | inline | `EnsureNodesPostProcess` |
+| agent-switch | inline | `EnsureAgentSwitch` |
+| kube-proxy | manifest | `kube-proxy/{version}/component.yaml` |
+| coredns | manifest | `coredns/{version}/component.yaml` |
+| calico | manifest | `calico/{version}/component.yaml` |
+| provider | manifest | `provider/{version}/component.yaml` |
 
 ## 6. 安装 DAG 构建设计
 
