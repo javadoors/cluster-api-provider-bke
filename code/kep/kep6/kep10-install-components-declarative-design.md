@@ -2109,6 +2109,8 @@ func (r *BKEClusterReconciler) executeManageDAG(
 
 扩容是指向已有集群新增 Master 或 Worker 节点。与全新安装的核心区别在于：已有节点不需要重新安装，仅新节点需要执行安装操作。
 
+扩容的节点安装触发采用**两层机制**：第一层是 DAG Scheduler 的组件级 Decision（VersionContext），决定组件是否执行；第二层是 inline handler 内部的节点级过滤（`BKENode.Status.StateCode` 位标记），决定哪些节点需要操作。
+
 ```txt
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │              扩容 DAG 化设计思路                                                   │
@@ -2120,20 +2122,45 @@ func (r *BKEClusterReconciler) executeManageDAG(
 │    问题: 扩容使用独立的 Phase 列表，与安装 PhaseFlow 代码重复                    │
 │          无法复用 DAG 的版本决策和断点续传                                       │
 │                                                                                 │
-│  DAG 化方案:                                                                     │
-│    扩容复用安装 DAG，通过节点级 VersionContext 区分已有/新增节点:                 │
-│    已有节点: Current == Target → DecisionSkip (跳过)                             │
-│    新增节点: Current == "" → DecisionInstall (执行安装)                         │
+│  DAG 化方案 (两层机制):                                                          │
+│                                                                                 │
+│  第一层: Scheduler 组件级 Decision (VersionContext)                              │
+│    fillCurrentFromExistingNodes 填充 Current:                                    │
+│      集群级组件 (certs, coredns, ...): Current==Target → Skip (已安装, 跳过)     │
+│      节点级组件 (bkeagent, containerd, ...): Current=="" → Install (执行)       │
+│    ★ VersionContext 是组件级的, 不是节点级的                                     │
+│    ★ 这一层只决定"组件是否执行", 不决定"哪些节点执行"                              │
+│                                                                                 │
+│  第二层: inline handler 节点级过滤 (BKENode.Status.StateCode 位标记)             │
+│    当节点级组件执行时, inline handler 内部通过 phaseutil.filterNodes() 过滤:    │
+│      已有节点: 对应位标记已设置 (NodeEnvFlag/NodeBootFlag/MasterInitFlag)       │
+│                → 跳过                                                            │
+│      新增节点: 对应位标记未设置                                                   │
+│                → 执行安装                                                        │
+│    ★ 这一层决定"哪些节点执行"                                                    │
 │                                                                                 │
 │  核心设计:                                                                       │
 │  1. EnsureMasterInit handler 幂等改造 — 区分 init (首个 Master) / join (后续)  │
-│     通过检查已有 Master 数量判断执行 init 还是 join                             │
-│  2. 节点级版本追踪 — BKENode.Status 记录每节点的组件版本                        │
-│     Scheduler 按 BKENode 逐节点判断 DecisionInstall/Skip                        │
-│  3. 复用安装 DAG — 无需独立的扩容 DAG，安装 DAG 自动过滤已完成节点              │
+│     通过 getExistingMasterNodes 检查已有 Master 数量判断执行 init 还是 join      │
+│  2. 节点级过滤 — inline handler 通过 phaseutil.filterNodes() + StateCode 过滤  │
+│     已有节点: 位标记已设置 → 跳过                                                │
+│     新增节点: 位标记未设置 → 执行安装                                            │
+│  3. 复用安装 DAG — 无需独立的扩容 DAG，安装 DAG + 组件级 Current 过滤集群级组件  │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+**节点级 StateCode 位标记说明**：
+
+| 位标记 | 含义 | 设置时机 | 过滤用途 |
+|--------|------|---------|---------|
+| `NodeAgentPushedFlag` | bkeagent 已推送 | bkeagent 安装完成 | `GetNeedPushAgentNodes`: 未设置 → 需推送 |
+| `NodeAgentReadyFlag` | bkeagent 已就绪 | bkeagent 注册完成 | `ensure_nodes_env`: 未设置 → 等待 agent 就绪 |
+| `NodeEnvFlag` | 节点环境已初始化 | containerd/系统配置安装完成 | `GetNeedInitEnvNodes`: 未设置 → 需初始化环境 |
+| `NodeBootFlag` | 节点已加入集群 | kubeadm join/init 完成 | `GetNeedJoinNodes`: 未设置 → 需加入 |
+| `MasterInitFlag` | Master 已初始化 | kubeadm init 完成 | `GetNeedJoinNodes`: 未设置 → 需初始化 |
+| `NodeFailedFlag` | 节点失败 | 安装失败 | `filterNodes`: 已设置 → 硬排除 |
+| `NodeDeletingFlag` | 节点删除中 | 缩容触发 | `filterNodes`: 已设置 → 硬排除 |
 
 ##### 代码实现
 
@@ -2282,7 +2309,7 @@ func (r *BKEClusterReconciler) executeScaleDAG(
 
     // 2. 构建安装 VersionContext (Current 从当前版本 ReleaseImage 填充)
     vc := upgrade.BuildVersionContextForInstall(bundle)
-    // ★ 从已有节点的 ReleaseImage bundle 填充集群级组件 Current (节点级组件保持为空)
+    // ★ 从当前版本 ReleaseImage bundle 填充集群级组件 Current (节点级组件保持为空)
     r.fillCurrentFromExistingNodes(ctx, newCluster, vc)
     phaseCtx.SetVersionContext(vc)
 
@@ -2300,8 +2327,13 @@ func (r *BKEClusterReconciler) executeScaleDAG(
     execCtx := buildExecutionContext(ctx, r.Client, newCluster, vc)
 
     // 5. 执行 DAG
-    //    集群级组件: Current==Target → DecisionSkip (跳过, 已安装)
-    //    节点级组件: Current=="" → DecisionInstall (Executor 逐节点检查, 已有节点跳过, 新增节点执行)
+    //    第一层 (Scheduler 组件级 Decision):
+    //      集群级组件: Current==Target → DecisionSkip (跳过, 已安装)
+    //      节点级组件: Current=="" → DecisionInstall (inline handler 执行)
+    //    第二层 (inline handler 节点级过滤):
+    //      inline handler 通过 phaseutil.filterNodes() + StateCode 位标记过滤
+    //      已有节点: NodeEnvFlag/NodeBootFlag 已设置 → 跳过
+    //      新增节点: 位标记未设置 → 执行安装
     //    EnsureMasterInit handler 幂等: 已有 Master 执行 join，新增 Master 执行 init
     return sched.ExecuteDAG(ctx, execCtx, dag)
 }
@@ -2309,7 +2341,7 @@ func (r *BKEClusterReconciler) executeScaleDAG(
 // fillCurrentFromExistingNodes 从已有节点的状态填充 VersionContext.Current
 // 版本信息从 ReleaseImage bundle 获取 (当前集群版本对应的 ReleaseImage)
 // 仅填充集群级组件的 Current → DecisionSkip (跳过已安装的集群级组件)
-// 节点级组件 Current 保持为空 → DecisionInstall → Executor 执行 (逐节点检查跳过已有节点)
+// 节点级组件 Current 保持为空 → DecisionInstall → inline handler 执行 (通过 StateCode 过滤已有/新增节点)
 func (r *BKEClusterReconciler) fillCurrentFromExistingNodes(
     ctx context.Context,
     bkeCluster *bkev1beta1.BKECluster,
@@ -2332,12 +2364,14 @@ func (r *BKEClusterReconciler) fillCurrentFromExistingNodes(
     //    FillCurrentFromBundle 将 install.components + upgrade.components 的版本写入 Current
     upgrade.FillCurrentFromBundle(vc, currentBundle)
 
-    // 3. 清除节点级组件的 Current (保持为空, 使 Executor 执行)
+    // 3. 清除节点级组件的 Current (保持为空, 使 inline handler 执行)
     //    节点级组件需要在新节点上执行安装, 不能因为 Current==Target 而 Skip
-    //    Executor 内部逐节点检查 BKENode.Status / ClusterComponentStatuses, 跳过已有节点
+    //    inline handler 内部通过 phaseutil.filterNodes() + StateCode 位标记过滤:
+    //      已有节点: NodeEnvFlag/NodeBootFlag 已设置 → 跳过
+    //      新增节点: 位标记未设置 → 执行安装
     for _, name := range vc.TargetNames() {
         if isNodeScopedComponent(name) {
-            vc.SetCurrent(name, "") // 清空 → DecisionInstall → Executor 逐节点执行
+            vc.SetCurrent(name, "") // 清空 → DecisionInstall → inline handler 执行
         }
     }
 
@@ -2345,7 +2379,7 @@ func (r *BKEClusterReconciler) fillCurrentFromExistingNodes(
     //   集群级组件 (certs, coredns, kube-proxy, ...): Current==Target → DecisionSkip → 跳过
     //   节点级组件 (bkeagent, containerd, kubelet, kubernetes-master, ...): Current=="" → DecisionInstall
     //     → EnsureMasterInit handler 幂等: 已有 Master 执行 join, 新增 Master 执行 init
-    //     → BinaryComponentExecutor 逐节点: 已有节点跳过, 新增节点执行 Install
+    //     → EnsureNodesEnv handler: phaseutil.filterNodes(StateCode) 过滤, 已有节点跳过, 新增节点执行
 }
 
 // isNodeScopedComponent 判断组件是否为节点级 (需要在每个节点上独立执行)
@@ -2368,6 +2402,62 @@ func (r *BKEClusterReconciler) isScale(old, new *bkev1beta1.BKECluster) bool {
     newNodeCount := len(new.Spec.Nodes)
     return newNodeCount > oldNodeCount
 }
+```
+
+##### 扩容触发流程示例
+
+以 3 节点集群（master-1, worker-1, worker-2）扩容新增 master-2 为例：
+
+```
+前置状态:
+  master-1: StateCode = NodeAgentPushedFlag|NodeAgentReadyFlag|NodeEnvFlag|NodeBootFlag|MasterInitFlag
+  worker-1: StateCode = NodeAgentPushedFlag|NodeAgentReadyFlag|NodeEnvFlag|NodeBootFlag
+  worker-2: StateCode = NodeAgentPushedFlag|NodeAgentReadyFlag|NodeEnvFlag|NodeBootFlag
+  master-2: StateCode = 0 (新增节点, 无任何位标记)
+
+  VersionContext (fillCurrentFromExistingNodes 后):
+    certs:           Current="v2.7.0" Target="v2.7.0" → Skip  (集群级, 已安装)
+    coredns:         Current="v1.11.1" Target="v1.11.1" → Skip  (集群级, 已安装)
+    bkeagent:        Current=""         Target="v2.7.0" → Install (节点级, 清空)
+    containerd:      Current=""         Target="v1.7.18" → Install (节点级, 清空)
+    kubernetes-master: Current=""       Target="v2.7.0" → Install (节点级, 清空)
+
+DAG 执行:
+
+  第一层: Scheduler 组件级 Decision
+    Batch 1: [certs]          → Skip  (Current==Target)
+    Batch 2: [bkeagent]       → Install (Current=="")
+    Batch 3: [containerd]     → Install (Current=="")
+    Batch 4: [kubernetes-master] → Install (Current=="")
+    Batch 5: [coredns]        → Skip  (Current==Target)
+
+  第二层: inline handler 节点级过滤 (StateCode)
+    Batch 2: EnsureNodesEnv handler (bkeagent)
+      → phaseutil.GetNeedPushAgentNodesWithBKENodes():
+        predicate = !NodeAgentPushedFlag
+        master-1: NodeAgentPushedFlag 已设置 → 跳过
+        worker-1: NodeAgentPushedFlag 已设置 → 跳过
+        worker-2: NodeAgentPushedFlag 已设置 → 跳过
+        master-2: NodeAgentPushedFlag 未设置 → 执行推送 ★
+      → 推送完成后设置 master-2 的 NodeAgentPushedFlag|NodeAgentReadyFlag
+
+    Batch 3: EnsureNodesEnv handler (containerd/系统配置)
+      → phaseutil.GetNeedInitEnvNodesWithBKENodes():
+        predicate = !NodeEnvFlag && NodeAgentReadyFlag
+        master-1: NodeEnvFlag 已设置 → 跳过
+        worker-1: NodeEnvFlag 已设置 → 跳过
+        worker-2: NodeEnvFlag 已设置 → 跳过
+        master-2: NodeEnvFlag 未设置, NodeAgentReadyFlag 已设置 → 执行初始化 ★
+      → 初始化完成后设置 master-2 的 NodeEnvFlag
+
+    Batch 4: EnsureMasterInit handler (kubernetes-master)
+      → getExistingMasterNodes(): master-1 已就绪 → 执行 join (非 init)
+      → phaseutil.GetNeedJoinMasterNodesWithBKENodes():
+        predicate = !NodeBootFlag && !MasterInitFlag
+        master-1: NodeBootFlag 已设置 → 跳过
+        master-2: NodeBootFlag 未设置, MasterInitFlag 未设置 → 执行 join ★
+      → 调整 KCP 副本数 → 等待 master-2 加入
+      → join 完成后设置 master-2 的 NodeBootFlag
 ```
 
 #### 9.4.4 集群删除/重置 DAG 化
