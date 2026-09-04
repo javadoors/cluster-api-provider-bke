@@ -91,23 +91,39 @@ type SubComponent struct {
 }
 ```
 
-### 2.3 ReleaseImageUpgradeComponent 新增 Condition 字段
+### 2.3 ReleaseImageUpgradeComponent 不新增 Condition 字段
 
-```go
-// api/v1alpha1/releaseimage_types.go
+`ReleaseImageUpgradeComponent` 是 ReleaseImage 中的**轻量引用结构**（Name + Version + 可选 Inline handler），不是组件定义本身。Condition 属于组件定义，应存储在 `ComponentVersion.Spec` 中，不应放在引用上。
 
-type ReleaseImageUpgradeComponent struct {
-    Name    string                     `json:"name,omitempty"`
-    Version string                     `json:"version,omitempty"`
-    Inline  *ReleaseImageUpgradeInline `json:"inline,omitempty"`
+**数据流**：
 
-    // Condition is a Go Template expression evaluated at execution time.
-    // Overrides ComponentVersion.Spec.Condition when set on both.
-    // Empty means defer to ComponentVersion.Spec.Condition.
-    // +optional
-    Condition string `json:"condition,omitempty"`
-}
 ```
+ReleaseImage.Spec.Upgrade.Components[]
+  → ReleaseImageUpgradeComponent { Name, Version, Inline }  ← 引用 (轻量)
+      │
+      │ DAG 构建时按 Name+Version 创建 ComponentNode
+      ▼
+ComponentNode { Name, Version, Inline, FailurePolicy, Dependencies }  ← DAG 节点
+      │
+      │ 执行时 Scheduler 通过 CVStore 加载
+      ▼
+ComponentVersion.Spec { Type, Condition, Dependencies, ... }  ← 组件定义 (完整)
+      │
+      │ shouldExecuteByCondition 读取 cv.Spec.Condition
+      ▼
+EvaluateCondition(condition, ConditionContext)  ← 求值
+```
+
+**不在 ReleaseImageUpgradeComponent 上加 Condition 的原因**：
+
+| 维度 | 说明 |
+|------|------|
+| **职责分离** | `ReleaseImageUpgradeComponent` 是引用（指向 ComponentVersion），`ComponentVersion` 是定义；Condition 属于定义 |
+| **传递性问题** | DAG 节点 `ComponentNode` 无 Condition 字段，`shouldExecuteByCondition` 通过 CVStore 加载 `ComponentVersion`，无法访问 `ReleaseImageUpgradeComponent`；在引用上加 Condition 也无法传递到执行时 |
+| **单一数据源** | Condition 只从 `ComponentVersion.Spec.Condition` 读取，避免多来源覆盖导致的歧义 |
+| **与现有字段一致** | `Type`、`Dependencies`、`UpgradeStrategy` 等字段也只在 `ComponentVersion.Spec` 上，`ReleaseImageUpgradeComponent` 不携带这些定义性字段 |
+
+> **设计原则**：`ReleaseImageUpgradeComponent` 保持轻量引用角色（Name + Version + Inline handler override），组件定义性字段（Type/Condition/Dependencies 等）统一存储在 `ComponentVersion.Spec`。
 
 ---
 
@@ -248,9 +264,8 @@ for _, compName := range batch {
 ```go
 // pkg/dagexec/scheduler.go — shouldExecuteByCondition 新增方法
 
-// shouldExecuteByCondition evaluates the Condition field from ComponentVersion
-// (and optionally ReleaseImage component). Returns true if the component should
-// execute, false if the condition filters it out.
+// shouldExecuteByCondition evaluates the Condition field from ComponentVersion.
+// Returns true if the component should execute, false if the condition filters it out.
 func (s *Scheduler) shouldExecuteByCondition(
     ctx context.Context,
     execCtx *ExecutionContext,
@@ -268,9 +283,7 @@ func (s *Scheduler) shouldExecuteByCondition(
         return true
     }
 
-    // 2. 获取 Condition 表达式
-    //    优先 ReleaseImage 组件 Condition (如果 DAG 构建时传入了)
-    //    回退 ComponentVersion.Spec.Condition
+    // 2. 获取 Condition 表达式 (单一数据源: ComponentVersion.Spec.Condition)
     condition := cv.Spec.Condition
     if condition == "" {
         return true // 无 Condition, 不过滤
@@ -477,9 +490,8 @@ Scheduler 跳过检查链:
 | 新增 Condition 字段 | 设置表达式 | 按表达式过滤 | 新增能力，不影响现有组件 |
 | 表达式求值失败 | 解析/执行错误 | 安全默认执行 | 记录警告日志，不阻塞 |
 | CVStore 不可用 | 无法加载 CV | 不阻塞执行 | 与当前 resolveComponentType 行为一致 |
-| ReleaseImage 无 Condition | 组件引用无 Condition | 回退 CV.Spec.Condition | 双层回退 |
 
-**关键原则**：Condition 是**可选的**过滤层，不设置时行为与当前完全一致。仅在 ComponentVersion.Spec.Condition 非空时才进行求值，确保向后兼容。
+**关键原则**：Condition 是**可选的**过滤层，不设置时行为与当前完全一致。Condition 的**唯一数据源**是 `ComponentVersion.Spec.Condition`，`ReleaseImageUpgradeComponent` 不携带 Condition（保持轻量引用角色）。
 
 ---
 
@@ -503,7 +515,7 @@ Scheduler 跳过检查链:
 
 | 类别 | 模块 | 估算（人天） |
 |------|------|------------|
-| 开发 | `ComponentVersionSpec` / `SubComponent` / `ReleaseImageUpgradeComponent` 新增 Condition 字段 | 0.5 |
+| 开发 | `ComponentVersionSpec` / `SubComponent` 新增 Condition 字段 | 0.5 |
 | 开发 | `ConditionContext` + `BuildConditionContext` + `EvaluateCondition` 实现 | 1.5 |
 | 开发 | `Scheduler.shouldExecuteByCondition` 集成 | 1 |
 | 开发 | `inferOperation` / `inferScaleType` / `inferDeployMode` 辅助函数 | 1 |
