@@ -12,7 +12,7 @@
 
 ## 1. 摘要
 
-本提案设计 ReleaseImage 安装组件的声明式定义，使安装流程与升级流程统一为 DAG 驱动。当前 ReleaseImage 的 `spec.install.components` 仅包含 `{name, version}` 两个字段，缺少执行模式（inline/manifest/staticpod）、inline handler、依赖关系等声明式元数据；且安装流程完全由硬编码的 `DeployPhases` PhaseFlow 驱动，未消费 ReleaseImage 的安装组件列表。本提案扩展 `ReleaseImageInstallComponent` 结构，新增安装组件目录（`DeclarativeInstallCatalog`）和安装 DAG 构建器，使安装流程也能享受声明式组件管理的优势：依赖管理、并行执行、版本追踪、可观测性。
+本提案设计 ReleaseImage 安装组件的声明式定义，使安装流程与升级流程统一为 DAG 驱动。当前 ReleaseImage 的 `spec.install.components` 仅包含 `{name, version}` 两个字段，缺少执行模式（inline/manifest/staticpod）、inline handler、依赖关系等声明式元数据；且安装流程完全由硬编码的 `DeployPhases` PhaseFlow 驱动，未消费 ReleaseImage 的安装组件列表。本提案将 `ReleaseImageInstallComponent` 和 `ReleaseImageUpgradeComponent` 统一抽象为 `ReleaseImageComponent`，新增 `inline` 字段，新增安装组件目录（`DeclarativeInstallCatalog`）和安装 DAG 构建器，使安装流程也能享受声明式组件管理的优势：依赖管理、并行执行、版本追踪、可观测性。
 
 ## 2. 动机
 
@@ -43,7 +43,7 @@
 
 ### 2.3 设计目标
 
-1. **结构对称**：`ReleaseImageInstallComponent` 与 `ReleaseImageUpgradeComponent` 结构对齐
+1. **结构对称**：`ReleaseImageInstallComponent` 与 `ReleaseImageUpgradeComponent` 统一抽象为 `ReleaseImageComponent`
 2. **统一 DAG**：安装流程也通过 DAG 驱动，复用 Scheduler/ExecutorRegistry/VersionContext
 3. **统一目录**：`DeclarativeInstallCatalog` 与 `DeclarativeUpgradeCatalog` 结构一致
 4. **渐进迁移**：通过 Feature Gate 控制，PhaseFlow 和 DAG 安装路径可并存
@@ -55,7 +55,7 @@
 
 | 范围 | 说明 |
 |------|------|
-| **CRD 扩展** | `ReleaseImageInstallComponent` 新增 `inline` 字段 |
+| **CRD 扩展** | `ReleaseImageComponent` 新增 `inline` 字段（统一安装和升级） |
 | **安装组件目录** | `DeclarativeInstallCatalog` 定义安装组件映射 |
 | **安装 DAG 构建** | `BuildInstallDAG` 从 ReleaseImage bundle 构建安装 DAG |
 | **安装 DAG 执行** | 复用 `Scheduler.ExecuteDAG`，新增 `DecisionInstall` |
@@ -65,7 +65,7 @@
 
 | 约束 | 说明 |
 |------|------|
-| **向后兼容** | 旧格式 `{name, version}` 的 `ReleaseImageInstallComponent` 必须继续支持 |
+| **向后兼容** | 旧格式 `{name, version}` 的 `ReleaseImageComponent` 必须继续支持 |
 | **PhaseFlow 共存** | 迁移期间 PhaseFlow 和 DAG 安装路径可并存，通过 Feature Gate 切换 |
 | **复用升级框架** | 安装 DAG 复用 Scheduler、ExecutorRegistry、InlineRunner 等已有组件 |
 | **幂等性** | 安装操作必须幂等，支持 Reconcile 重入 |
@@ -77,7 +77,7 @@
 - 不在本文档定义回滚策略（安装失败不回滚，直接重试）
 - 不重写现有 DeployPhases 的 Phase 实现（复用已有代码）
 
-## 4. ReleaseImageInstallComponent 结构扩展
+## 4. ReleaseImageComponent 结构统一抽象
 
 ### 4.0 设计思路
 
@@ -136,13 +136,16 @@ type ReleaseImageUpgradeComponent struct {
 }
 ```
 
-### 4.2 目标结构（对称）
+### 4.2 目标结构（统一抽象）
+
+经过分析，`ReleaseImageInstallComponent` 和 `ReleaseImageUpgradeComponent` 在扩展后字段完全相同，可以抽象为统一的 `ReleaseImageComponent` 类型：
 
 ```go
 // api/v1alpha1/releaseimage_types.go
 
-// ReleaseImageInstallComponent 定义安装组件引用 🔄扩展
-type ReleaseImageInstallComponent struct {
+// ReleaseImageComponent 定义组件引用（安装和升级共用）🔄重构
+// 统一替代 ReleaseImageInstallComponent 和 ReleaseImageUpgradeComponent
+type ReleaseImageComponent struct {
     // 组件名称（对应 ComponentVersion.Name）
     Name string `json:"name,omitempty"`
     
@@ -150,20 +153,84 @@ type ReleaseImageInstallComponent struct {
     Version string `json:"version,omitempty"`
     
     // Inline handler 配置（type=inline 时指定）🆕新增
-    // 与 ReleaseImageUpgradeInline 结构一致
-    Inline *ReleaseImageInstallInline `json:"inline,omitempty"`
+    // 用于安装和升级场景，指定 ComponentFactory 注册的 handler
+    // 示例: "EnsureBKEAgent", "EnsureCerts", "EnsureMasterInit", "EnsureMasterUpgrade"
+    Inline *ReleaseImageInline `json:"inline,omitempty"`
 }
 
-// ReleaseImageInstallInline 定义安装组件的 inline handler 🆕新增
-// 结构与 ReleaseImageUpgradeInline 对称
-type ReleaseImageInstallInline struct {
+// ReleaseImageInline 定义 inline handler 引用 🔄重构
+// 统一替代 ReleaseImageInstallInline 和 ReleaseImageUpgradeInline
+type ReleaseImageInline struct {
     // Handler 名称（对应 ComponentFactory 注册的 handler）
-    // 示例: "EnsureBKEAgent", "EnsureCerts", "EnsureMasterInit"
+    // 安装示例: "EnsureBKEAgent", "EnsureNodesEnv", "EnsureMasterInit"
+    // 升级示例: "EnsureAgentUpgrade", "EnsureMasterUpgrade", "EnsureEtcdUpgrade"
     Handler string `json:"handler,omitempty"`
     
     // Handler 版本
     Version string `json:"version,omitempty"`
 }
+
+// ReleaseImageInstallSpec 定义安装组件列表
+type ReleaseImageInstallSpec struct {
+    Components []ReleaseImageComponent `json:"components,omitempty"` // 🔄重构: 使用统一类型
+}
+
+// ReleaseImageUpgradeSpec 定义升级组件列表
+type ReleaseImageUpgradeSpec struct {
+    Components []ReleaseImageComponent `json:"components,omitempty"` // 🔄重构: 使用统一类型
+}
+```
+
+**重构收益**：
+
+| 维度 | 重构前 | 重构后 |
+|------|--------|--------|
+| **类型数量** | 4 个类型 (InstallComponent, UpgradeComponent, InstallInline, UpgradeInline) | 2 个类型 (Component, Inline) |
+| **代码重复** | Install 和 Upgrade 结构完全相同，重复定义 | 统一抽象，消除重复 |
+| **API 复杂度** | 安装和升级使用不同类型，需要转换逻辑 | 统一类型，无需转换 |
+| **维护成本** | 修改字段需同时更新 2 个类型 | 修改字段只需更新 1 个类型 |
+| **YAML 结构** | 安装和升级 YAML 结构相同，但类型不同 | 安装和升级 YAML 结构相同，类型也相同 |
+
+**向后兼容性**：
+
+重构后的 YAML 结构与重构前完全一致，无需修改现有 ReleaseImage CR：
+
+```yaml
+# 重构前后 YAML 结构不变
+spec:
+  install:
+    components:
+      - name: bkeagent
+        version: v2.7.0
+        inline:
+          handler: EnsureBKEAgent
+          version: v1.0.0
+  upgrade:
+    components:
+      - name: bkeagent
+        version: v2.7.0
+        inline:
+          handler: EnsureAgentUpgrade
+          version: v1.0.0
+```
+
+**代码迁移**：
+
+```go
+// 重构前
+type ReleaseImageInstallComponent struct { Name, Version string; Inline *ReleaseImageInstallInline }
+type ReleaseImageUpgradeComponent struct { Name, Version string; Inline *ReleaseImageUpgradeInline }
+type ReleaseImageInstallInline struct { Handler, Version string }
+type ReleaseImageUpgradeInline struct { Handler, Version string }
+
+// 重构后
+type ReleaseImageComponent struct { Name, Version string; Inline *ReleaseImageInline }
+type ReleaseImageInline struct { Handler, Version string }
+
+// 使用方式
+installSpec.Components  // []ReleaseImageComponent
+upgradeSpec.Components  // []ReleaseImageComponent
+// 无需类型转换，直接共用
 ```
 
 ### 4.3 ReleaseImage YAML 示例（完整安装 + 升级）
@@ -693,7 +760,7 @@ func NeedsExecution(vc *VersionContext, name string) bool {
 // pkg/upgrade/bundle.go
 
 // InstallComponentsFromBundle 从 ReleaseImage bundle 提取安装组件
-func InstallComponentsFromBundle(bundle *releasemanifest.Bundle) ([]apiv1.ReleaseImageInstallComponent, error) {
+func InstallComponentsFromBundle(bundle *releasemanifest.Bundle) ([]apiv1.ReleaseImageComponent, error) {
     if bundle.Release.Spec.Install == nil {
         return nil, fmt.Errorf("release image has no install components")
     }
@@ -721,7 +788,7 @@ func BuildInstallDAGFromBundle(
     for _, name := range excludeComponents {
         excludeSet[name] = true
     }
-    var filteredComponents []apiv1.ReleaseImageInstallComponent
+    var filteredComponents []apiv1.ReleaseImageComponent
     for _, ic := range installComponents {
         if !excludeSet[ic.Name] {
             filteredComponents = append(filteredComponents, ic)
@@ -729,14 +796,14 @@ func BuildInstallDAGFromBundle(
     }
     
     // 3. 转换为 ComponentNode（复用 UpgradeComponent 结构）
-    var components []topology.ReleaseImageUpgradeComponent
+    var components []topology.ReleaseImageComponent
     for _, ic := range filteredComponents {
-        comp := topology.ReleaseImageUpgradeComponent{
+        comp := topology.ReleaseImageComponent{
             Name:    ic.Name,
             Version: ic.Version,
         }
         if ic.Inline != nil {
-            comp.Inline = &topology.ReleaseImageUpgradeInline{
+            comp.Inline = &topology.ReleaseImageInline{
                 Handler: ic.Inline.Handler,
                 Version: ic.Inline.Version,
             }
@@ -1767,14 +1834,14 @@ var (
 
 | 阶段 | 目标 | 说明 | Feature Gate |
 |------|------|------|-------------|
-| **Phase 1** | 结构扩展 | 扩展 `ReleaseImageInstallComponent`，新增 `inline` 字段 | 不启用 |
+| **Phase 1** | 结构扩展 | 统一抽象 `ReleaseImageComponent`，新增 `inline` 字段 | 不启用 |
 | **Phase 2** | 安装 DAG 实现 | 实现 `BuildInstallDAG`、`executeInstallDAG`、`DeclarativeInstallCatalog` | 灰度启用 |
 | **Phase 3** | 验证与切换 | 测试环境验证，逐步切换到 DAG 安装路径 | 正式启用 |
 | **Phase 4** | 移除 PhaseFlow | 移除 DeployPhases 硬编码列表，安装完全 DAG 驱动 | 移除 Feature Gate |
 
 ### 9.3 向后兼容
 
-1. **旧格式兼容**：`ReleaseImageInstallComponent` 的 `inline` 字段是 `omitempty`，旧格式 `{name, version}` 仍然有效
+1. **旧格式兼容**：`ReleaseImageComponent` 的 `inline` 字段是 `omitempty`，旧格式 `{name, version}` 仍然有效
 2. **PhaseFlow 共存**：`DeclarativeInstallEnabled` 未启用时，继续使用 PhaseFlow
 3. **混合模式**：ReleaseImage 可同时包含有 `inline` 和无 `inline` 的安装组件
 4. **ClusterVersionReconciler**：安装时设置 `cvo.openfuyao.cn/install-ready` annotation 触发 DAG 路径
@@ -3193,7 +3260,7 @@ openFuyao v2.7.0  ──────  openFuyao v2.8.0  ──────  open
 
 | 任务 | 说明 |
 |------|------|
-| 扩展 `ReleaseImageInstallComponent` | 新增 `inline` 字段（omitempty，向后兼容） |
+| 扩展 `ReleaseImageComponent` | 新增 `inline` 字段（omitempty，向后兼容） |
 | 定义 `DeclarativeInstallCatalog` | 静态映射表，不被执行路径消费 |
 | 定义 `InstallComponentSpec` | 类型定义，不接入 Scheduler |
 | 编写安装组件 ComponentVersion | 为所有安装组件编写 `spec.dependencies` |
@@ -3374,7 +3441,7 @@ kubectl get bkecluster my-cluster -o jsonpath='{.status.clusterComponentStatuses
 
 | 阶段 | 模块 | 任务 | 工作量（人天） |
 |------|------|------|---------------|
-| **Phase 1: 结构扩展** | CRD 扩展 | `ReleaseImageInstallComponent` 新增 `inline` 字段 + deepcopy + webhook | 2 |
+| **Phase 1: 结构扩展** | CRD 扩展 | `ReleaseImageComponent` 新增 `inline` 字段 + deepcopy + webhook | 2 |
 | | 安装组件目录 | `DeclarativeInstallCatalog` + `InstallComponentSpec` | 2 |
 | | ComponentFactory 注册 | 注册安装 handler 到 factory + 验证幂等性 | 2 |
 | | VersionContext 扩展 | 新增 `DecisionInstall` + `BuildVersionContextForInstall` | 3 |
@@ -3814,7 +3881,7 @@ ComponentVersion 新增 `Condition` 字段（Go Template 表达式），在 DAG 
 
 | 术语 | 定义 |
 |------|------|
-| **ReleaseImageInstallComponent** | ReleaseImage 中安装组件引用，扩展后包含 `inline` handler |
+| **ReleaseImageComponent** | ReleaseImage 中组件引用（安装和升级共用），包含 `inline` handler |
 | **DeclarativeInstallCatalog** | 安装组件目录，映射组件名到执行模式（inline/manifest） |
 | **BuildInstallDAGFromBundle** | 从 ReleaseImage bundle 构建安装 DAG |
 | **DecisionInstall** | VersionContext 决策：current 为空且 target 有值时触发安装 |
