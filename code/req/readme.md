@@ -18,6 +18,8 @@
 
 ## [组件条件过滤](../kep/kep6/kep18-component-condition-filter-design.md)
 
+## [节点过滤](../kep/kep6/kep19-component-node-filter-design.md)
+
 ## [k8s大版本升级(1.34->1.36)](../icbc/k8s-upgrade-1.34-to-1.36.md)
 
 ## 组件Operator化

@@ -585,6 +585,8 @@ Scheduler 跳过检查链:
 
 两者**互补**：Selector 在构建时选择子组件进入 DAG，Condition 在执行时过滤 DAG 中的组件。同一组件可以同时使用两者。
 
+> **节点级过滤**：Condition 是**组件级**（集群）过滤，决定组件是否执行。节点级过滤（决定组件在哪些节点上执行）由 [KEP-19: ComponentVersion 节点过滤设计](kep19-component-node-filter-design.md) 处理，通过 `ComponentVersion.Spec.NodeFilter` 声明角色/标签/幂等等过滤策略。
+
 ---
 
 ## 11. 工作量评估
@@ -618,7 +620,8 @@ Scheduler 跳过检查链:
 1. [KEP-5 声明式升级框架](kep5/kep5.md)
 2. [KEP-10 安装流程声明式设计](kep10-install-components-declarative-design.md)
 3. [KEP-17 Selector 组件类型设计](kep17-selector-component-design.md)
-4. [Go text/template 文档](https://pkg.go.dev/text/template)
+4. [KEP-19 ComponentVersion 节点过滤设计](kep19-component-node-filter-design.md) — 节点级过滤，与本 KEP 互补
+5. [Go text/template 文档](https://pkg.go.dev/text/template)
 
 ### B. 术语表
 

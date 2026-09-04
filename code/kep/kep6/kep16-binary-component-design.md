@@ -6193,6 +6193,10 @@ BKENode.Status
 
 #### 8.5.4 NodeFilter 接口
 
+> **已抽离为独立 KEP 文档**：[KEP-19: ComponentVersion 节点过滤设计](kep19-component-node-filter-design.md)
+>
+> 以下内容保留为本 KEP 的 Binary 组件集成上下文，完整设计（含状态模型、兼容性、各组件类型集成方式）见 KEP-19。
+
 **接口定义**：
 
 ```go
