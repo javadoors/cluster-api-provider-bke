@@ -95,35 +95,52 @@ type SubComponent struct {
 
 `ReleaseImageUpgradeComponent` 是 ReleaseImage 中的**轻量引用结构**（Name + Version + 可选 Inline handler），不是组件定义本身。Condition 属于组件定义，应存储在 `ComponentVersion.Spec` 中，不应放在引用上。
 
-**数据流**：
+#### 2.3.1 ReleaseImageUpgradeComponent 的使用场景
+
+`ReleaseImageUpgradeComponent` 在代码库中有以下使用场景，均基于 Name+Version 引用 + 可选 Inline handler override，不涉及组件定义性字段：
+
+| 使用场景 | 代码位置 | 说明 |
+|---------|---------|------|
+| **DAG 构建** | `pkg/topology/build.go:25` `BuildUpgradeDAG` | 遍历 `[]ReleaseImageUpgradeComponent`，按 Name+Version 创建 `ComponentNode`，按 Inline 创建 `InlineRef`；依赖关系从 `ComponentVersion.Spec.Dependencies` 解析（非引用结构） |
+| **Inline handler 补全** | `pkg/upgrade/bundle.go:93` `enrichUpgradeComponent` | 当 `ReleaseImageUpgradeComponent.Inline` 为空时，从 Bundle 的 `ComponentVersion.Spec.Inline` 回填 handler；引用结构仅做 **override 传递**，不存储定义 |
+| **VersionContext 填充** | `pkg/upgrade/build_release.go:22` `applyReleaseComponents` | 遍历 `ReleaseImageUpgradeComponent`，按 Name+Version 填充 `VersionContext.Target`；Condition 不参与版本决策 |
+| **兼容性校验** | `pkg/release/compatibility/flatten.go:72` `releaseComponents` | 将 `ReleaseImageUpgradeComponent` 的 Name+Version 转为 `componentRef`，递归解析 `ComponentVersion.Spec.SubComponents` 扁平化；校验逻辑读取 `ComponentVersion.Spec.Compatibility`，非引用结构 |
+| **ComponentFactory 注册** | `pkg/upgrade/catalog.go` `InlineHandlers` | 从 `ReleaseImageUpgradeComponent.Inline.Handler` 提取 handler 名称，注册到 ComponentFactory；仅传递 handler 名称，不传递定义 |
+| **安装组件目录** | `pkg/upgrade/catalog.go` `DeclarativeInstallCatalog` | KEP-10 设计中安装组件复用 `ComponentSpec`（与升级同类型），handler 名称映射安装/升级 Phase；引用结构仅携带 handler override |
+
+**核心观察**：所有场景中 `ReleaseImageUpgradeComponent` 的角色都是 **Name+Version 引用 + 可选 Inline handler override**。组件定义性字段（Type/Dependencies/Condition/Compatibility/UpgradeStrategy 等）一律从 `ComponentVersion.Spec` 读取，引用结构不携带也不需要携带这些字段。
+
+#### 2.3.2 数据流
 
 ```
 ReleaseImage.Spec.Upgrade.Components[]
   → ReleaseImageUpgradeComponent { Name, Version, Inline }  ← 引用 (轻量)
       │
-      │ DAG 构建时按 Name+Version 创建 ComponentNode
+      │ 场景 1: DAG 构建 (BuildUpgradeDAG)
+      │   按 Name+Version 创建 ComponentNode, 按 Inline 创建 InlineRef
+      │   依赖从 ComponentVersion.Spec.Dependencies 解析 (非引用结构)
       ▼
 ComponentNode { Name, Version, Inline, FailurePolicy, Dependencies }  ← DAG 节点
       │
-      │ 执行时 Scheduler 通过 CVStore 加载
+      │ 场景 2: 执行时 Scheduler 通过 CVStore 加载
       ▼
-ComponentVersion.Spec { Type, Condition, Dependencies, ... }  ← 组件定义 (完整)
+ComponentVersion.Spec { Type, Condition, Dependencies, Compatibility, ... }  ← 组件定义 (完整)
       │
       │ shouldExecuteByCondition 读取 cv.Spec.Condition
       ▼
 EvaluateCondition(condition, execCtx.TemplateContext)  ← 求值 (复用 TemplateContext)
 ```
 
-**不在 ReleaseImageUpgradeComponent 上加 Condition 的原因**：
+#### 2.3.3 不在 ReleaseImageUpgradeComponent 上加 Condition 的原因
 
 | 维度 | 说明 |
 |------|------|
 | **职责分离** | `ReleaseImageUpgradeComponent` 是引用（指向 ComponentVersion），`ComponentVersion` 是定义；Condition 属于定义 |
 | **传递性问题** | DAG 节点 `ComponentNode` 无 Condition 字段，`shouldExecuteByCondition` 通过 CVStore 加载 `ComponentVersion`，无法访问 `ReleaseImageUpgradeComponent`；在引用上加 Condition 也无法传递到执行时 |
 | **单一数据源** | Condition 只从 `ComponentVersion.Spec.Condition` 读取，避免多来源覆盖导致的歧义 |
-| **与现有字段一致** | `Type`、`Dependencies`、`UpgradeStrategy` 等字段也只在 `ComponentVersion.Spec` 上，`ReleaseImageUpgradeComponent` 不携带这些定义性字段 |
+| **与现有字段一致** | `Type`、`Dependencies`、`UpgradeStrategy`、`Compatibility` 等字段也只在 `ComponentVersion.Spec` 上，`ReleaseImageUpgradeComponent` 不携带这些定义性字段；所有使用场景（DAG 构建/兼容性校验/VersionContext 填充）均通过 Name+Version 回查 `ComponentVersion.Spec` 获取定义 |
 
-> **设计原则**：`ReleaseImageUpgradeComponent` 保持轻量引用角色（Name + Version + Inline handler override），组件定义性字段（Type/Condition/Dependencies 等）统一存储在 `ComponentVersion.Spec`。
+> **设计原则**：`ReleaseImageUpgradeComponent` 保持轻量引用角色（Name + Version + Inline handler override），组件定义性字段（Type/Condition/Dependencies/Compatibility/UpgradeStrategy 等）统一存储在 `ComponentVersion.Spec`。
 
 ---
 
