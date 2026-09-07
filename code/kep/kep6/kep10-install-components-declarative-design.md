@@ -2485,11 +2485,14 @@ func (r *BKEClusterReconciler) executePartialInstallDAG(...) {
 │  DAG 化方案:                                                                     │
 │    将纳管拆解为 DAG 的第一个组件:                                                │
 │      manage 组件 (inline: EnsureClusterManage)                                   │
+│        → 仅纳管场景执行 (Condition: '{{ eq .Operation "manage" }}')             │
 │        → 探测版本 → 填充 VersionContext.Current                                 │
 │        → 后续组件通过 VersionContext.Decide() 判断:                             │
 │          Current == Target → DecisionSkip (已有正确版本，跳过)                   │
 │          Current != Target → DecisionUpgrade (需要升级到目标版本)               │
 │          Current == "" → DecisionInstall (缺失组件，需要安装)                    │
+│        → 全新安装场景: Condition 求值 false → 跳过 manage → Current 保持空     │
+│          → 后续组件全部 DecisionInstall (全新安装)                               │
 │                                                                                 │
 │  核心优势:                                                                       │
 │  1. 版本感知 — 纳管后仅安装/升级缺失或版本不符的组件，不重复安装已有组件        │
