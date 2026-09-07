@@ -3189,8 +3189,9 @@ func (r *BKEClusterReconciler) executePhaseFlow(...) (ctrl.Result, error) {
         if dagResult.Requeue || dagResult.RequeueAfter > 0 { return dagResult, nil }
         if !dagCompleted { return ctrl.Result{}, nil }
         // 扩容 DAG 完成后不再走 PhaseFlow
-        // ★ 与升级 DAG 不同: 升级 DAG 仅处理 inline 组件, yaml/helm 组件仍走 PhaseFlow
-        //   扩容 DAG 复用安装 DAG (包含全部组件: inline + yaml/helm), 无需 PhaseFlow 补充
+        // ★ 扩容 DAG 复用安装 DAG, 处理全部组件 (inline + yaml/helm), 无需 PhaseFlow 补充
+        //   升级 DAG 同样处理全部组件 (inline + yaml/helm), DAG 完成后 PhaseFlow 中
+        //   升级相关 Phase 的 NeedExecute=false 自动跳过 (skipPhaseAfterDeclarativeDAG)
         return ctrl.Result{}, nil
     }
 
