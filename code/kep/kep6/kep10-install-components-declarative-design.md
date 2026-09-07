@@ -2901,23 +2901,100 @@ func (r *BKEClusterReconciler) executeManageDAG(
 
 **核心代码路径**: `pkg/phaseframe/phases/phase_flow.go` + `pkg/phaseframe/phases/list.go`
 
-**1. 不存在独立的 ScalePhases 执行列表**
+**1. ClusterScaleXxxPhaseNames 仅用于状态上报，不用于执行决策**
 
-代码中 `ClusterScaleMasterUpPhaseNames` 等列表**仅用于状态上报**（`calculateClusterStatusByPhase` 设置 `ClusterMasterScalingUp` 等 `ClusterStatus`），不用于决定执行哪些 Phase：
+代码中存在 4 个扩缩容相关的 Phase 名称列表（`list.go:116-128`），它们**仅用于状态上报**（`calculateClusterStatusByPhase` 根据当前执行的 Phase 名称设置对应的 `ClusterStatus`），**不用于决定执行哪些 Phase**：
 
 ```go
-// pkg/phaseframe/phases/list.go — 仅用于状态上报, 不用于执行
+// pkg/phaseframe/phases/list.go:116-128 — 仅用于状态上报, 不用于执行
+
 ClusterScaleMasterUpPhaseNames = []confv1beta1.BKEClusterPhase{
-    EnsureMasterJoinName,  // 仅 Master 扩容状态上报
+    EnsureMasterJoinName,       // Master 扩容
 }
 ClusterScaleWorkerUpPhaseNames = []confv1beta1.BKEClusterPhase{
-    EnsureWorkerJoinName,  // 仅 Worker 扩容状态上报
+    EnsureWorkerJoinName,       // Worker 扩容
+}
+ClusterScaleMasterDownPhaseNames = []confv1beta1.BKEClusterPhase{
+    EnsureMasterDeleteName,     // Master 缩容
+}
+ClusterScaleWorkerDownPhaseNames = []confv1beta1.BKEClusterPhase{
+    EnsureWorkerDeleteName,     // Worker 缩容
+}
+```
+
+**状态上报的使用方式**（`phase_flow.go:371-405`）：
+
+```go
+// calculateClusterStatusByPhase 在 Phase 执行后/后置 Hook 中被调用
+// 根据当前 Phase 名称匹配上述列表，设置对应的 ClusterStatus
+
+func calculateClusterStatusByPhase(phase phaseframe.Phase, err error) error {
+    phaseName := phase.Name()
+    switch {
+    // ...
+    case phaseName.In(ClusterScaleMasterUpPhaseNames):
+        handleClusterScaleMasterUpPhase(ctx, err)   // → ClusterMasterScalingUp / ClusterScaleFailed
+    case phaseName.In(ClusterScaleWorkerUpPhaseNames):
+        handleClusterScaleWorkerUpPhase(ctx, err)   // → ClusterWorkerScalingUp / ClusterScaleFailed
+    case phaseName.In(ClusterScaleMasterDownPhaseNames):
+        handleClusterScaleMasterDownPhase(ctx, err) // → ClusterMasterScalingDown / ClusterScaleFailed
+    case phaseName.In(ClusterScaleWorkerDownPhaseNames):
+        handleClusterScaleWorkerDownPhase(ctx, err) // → ClusterWorkerScalingDown / ClusterScaleFailed
+    // ...
+    }
 }
 
-// pkg/phaseframe/phases/phase_flow.go:380 — 仅在 calculateClusterStatusByPhase 中使用
-case phaseName.In(ClusterScaleMasterUpPhaseNames):
-    handleClusterScaleMasterUpPhase(ctx, err)  // 设置 ClusterStatus = ClusterMasterScalingUp
+// handleClusterScaleMasterUpPhase — 设置 ClusterStatus
+func handleClusterScaleMasterUpPhase(ctx *phaseframe.PhaseContext, err error) {
+    if err != nil {
+        ctx.BKECluster.Status.ClusterStatus = bkev1beta1.ClusterScaleFailed
+    } else {
+        ctx.BKECluster.Status.ClusterStatus = bkev1beta1.ClusterMasterScalingUp
+    }
+}
 ```
+
+**执行决策与状态上报的分离**：
+
+| 职责 | 机制 | 代码位置 | 说明 |
+|------|------|---------|------|
+| **执行哪些 Phase** | `DeployPhases` + `NeedExecute()` | `phase_flow.go:78` `calculateAndAddPhases` | 遍历全部 11 个 DeployPhases，每个 Phase 自行判断是否需要执行 |
+| **设置什么 ClusterStatus** | `ClusterScaleXxxPhaseNames` | `phase_flow.go:380` `calculateClusterStatusByPhase` | 根据当前 Phase 名称匹配列表，设置扩缩容状态 |
+
+**为什么不用独立 ScalePhases 列表驱动执行**：
+
+1. **节点安装需要复用 DeployPhases**：扩容时新节点需要 bkeagent 推送、containerd 安装、环境初始化等，这些与全新安装完全相同，复用 DeployPhases 避免代码重复
+2. **已有节点自动跳过**：DeployPhases 中每个 Phase 的 `NeedExecute()` 基于 `StateCode` 位标记判断，已有节点位标记已设置 → 跳过，新节点位标记未设置 → 执行
+3. **状态上报仅需要 Phase 名称**：`ClusterScaleMasterUpPhaseNames` 只需包含 `EnsureMasterJoinName`，因为只有执行到 Master 加入时才需要上报 `ClusterMasterScalingUp` 状态；bkeagent/containerd 等安装阶段不需要特殊状态上报（默认 `ClusterInitializing` 或 `ClusterUnknown`）
+
+**状态上报的完整链路**：
+
+```
+扩容执行流程:
+
+  PhaseFlow.Execute()
+    → 遍历 BKEPhases (由 NeedExecute 筛选)
+      → EnsureBKEAgent.Execute()
+        → ExecutePostHook → calculateClusterStatusByPhase
+          → phaseName 不在 ScaleXxx 列表中
+          → ClusterStatus = ClusterInitializing (默认)
+      → EnsureNodesEnv.Execute()
+        → ExecutePostHook → calculateClusterStatusByPhase
+          → phaseName 不在 ScaleXxx 列表中
+          → ClusterStatus = ClusterInitializing (默认)
+      → EnsureMasterJoin.Execute()      ← Master 扩容时
+        → ExecutePostHook → calculateClusterStatusByPhase
+          → phaseName.In(ClusterScaleMasterUpPhaseNames) ✓
+          → handleClusterScaleMasterUpPhase(ctx, err)
+          → ClusterStatus = ClusterMasterScalingUp ★ (扩容专属状态)
+      → EnsureWorkerJoin.Execute()      ← Worker 扩容时
+        → ExecutePostHook → calculateClusterStatusByPhase
+          → phaseName.In(ClusterScaleWorkerUpPhaseNames) ✓
+          → handleClusterScaleWorkerUpPhase(ctx, err)
+          → ClusterStatus = ClusterWorkerScalingUp ★ (扩容专属状态)
+```
+
+**结论**：`ClusterScaleXxxPhaseNames` 是状态上报的"标签"——当 PhaseFlow 执行到特定 Phase（如 `EnsureMasterJoin`）时，通过名称匹配设置对应的扩缩容 `ClusterStatus`。它不参与执行决策，执行决策由 `DeployPhases` + `NeedExecute()` 完成。
 
 **2. PhaseFlow 遍历完整 DeployPhases**
 
