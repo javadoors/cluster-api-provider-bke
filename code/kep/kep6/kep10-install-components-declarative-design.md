@@ -2838,7 +2838,7 @@ func (r *BKEClusterReconciler) executeManageDAG(
 
 扩容是指向已有集群新增 Master 或 Worker 节点。与全新安装的核心区别在于：已有节点不需要重新安装，仅新节点需要执行安装操作。
 
-扩容的节点安装触发采用**三层机制**：第一层是 DAG Scheduler 的组件级 Decision（VersionContext），决定组件是否执行；第二层是 PhaseRunner 的 `NeedExecute()` 检查（StateCode），决定是否有节点需要操作；第三层是 inline handler 内部的节点级过滤（`filterNodes()`），决定哪些节点需要操作。
+扩容的节点安装触发采用**两层机制**：第一层是 DAG Scheduler 的组件级 Decision（VersionContext），决定组件是否执行；第二层是 inline handler 内部的节点级过滤（StateCode 位标记），决定哪些节点需要操作。
 
 ```txt
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -2862,7 +2862,7 @@ func (r *BKEClusterReconciler) executeManageDAG(
 │    问题: 扩容复用 DeployPhases, 但无法复用 DAG 的版本决策和断点续传              │
 │          PhaseFlow 串行执行, 无法实现组件间并行                                  │
 │                                                                                 │
-│  DAG 化方案 (三层机制):                                                          │
+│  DAG 化方案 (两层机制):                                                          │
 │                                                                                 │
 │  第一层: Scheduler 组件级 Decision (VersionContext)                              │
 │    fillCurrentFromExistingNodes 填充 Current:                                    │
@@ -2871,27 +2871,29 @@ func (r *BKEClusterReconciler) executeManageDAG(
 │    ★ VersionContext 是组件级的, 不是节点级的                                     │
 │    ★ 这一层只决定"组件是否执行", 不决定"哪些节点执行"                              │
 │                                                                                 │
-│  第二层: PhaseRunner.NeedExecute() (StateCode)                                   │
-│    PhaseRunner.Execute() 内部调用 phase.NeedExecute():                           │
-│      HasNodesNeedingPhase(StateCode) → 有节点位标记未设置 → true → 继续          │
-│      所有节点位标记已设置 → false → return nil (跳过 Execute)                     │
-│    ★ 这一层决定"是否有节点需要操作", 避免不必要的 Execute 调用                     │
-│                                                                                 │
-│  第三层: inline handler 节点级过滤 (filterNodes + StateCode)                     │
-│    handler 的 Execute() 内部通过 phaseutil.filterNodes() 精确过滤:              │
+│  第二层: inline handler 节点级过滤 (StateCode 位标记)                             │
+│    handler 的 Execute() 内部通过 StateCode 位标记精确过滤目标节点:              │
 │      已有节点: 对应位标记已设置 (NodeEnvFlag/NodeBootFlag/MasterInitFlag)       │
 │                → 跳过                                                            │
 │      新增节点: 对应位标记未设置                                                   │
 │                → 执行安装                                                        │
+│    ★ 过滤方式因 Phase 而异 (见下方 "节点过滤方式对比" 表)                        │
 │    ★ 这一层决定"哪些节点执行"                                                    │
+│                                                                                 │
+│  PhaseRunner.NeedExecute() 的角色:                                              │
+│    PhaseRunner.Execute() 在调用 phase.Execute() 前先调用 phase.NeedExecute():   │
+│      NeedExecute=true  → 有节点位标记未设置 → 继续 Execute()                     │
+│      NeedExecute=false → 所有节点位标记已设置 → return nil (跳过 Execute)         │
+│    ★ 这是 Execute() 的前置守卫, 与第二层检查相同的 StateCode, 但目的不同:       │
+│      NeedExecute: 布尔值判断 (是否有节点需要操作), 避免不必要的 Execute 调用     │
+│      Execute 内部: 精确节点列表 (哪些节点需要操作), 返回具体节点执行操作          │
 │                                                                                 │
 │  核心设计:                                                                       │
 │  1. EnsureMasterInit handler 幂等改造 — 区分 init (首个 Master) / join (后续)  │
 │     通过 getExistingMasterNodes 检查已有 Master 数量判断执行 init 还是 join      │
-│  2. 三层节点过滤 — VersionContext + NeedExecute + filterNodes 逐层收窄:         │
+│  2. 两层节点过滤 — VersionContext + StateCode 逐层收窄:                          │
 │     第一层: VersionContext Current=="" → 组件执行 (跳过集群级组件)              │
-│     第二层: NeedExecute(StateCode) → 有节点需要操作 (避免空执行)                  │
-│     第三层: filterNodes(StateCode) → 精确定位目标节点                              │
+│     第二层: StateCode 位标记 → 精确定位目标节点 (NeedExecute + Execute 内部)     │
 │  3. 复用安装 DAG — 无需独立的扩容 DAG，安装 DAG + 组件级 Current 过滤集群级组件  │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
@@ -3066,12 +3068,36 @@ func HasNodesNeedingPhase(bkeNodes bkev1beta1.BKENodes, flag int) bool {
 }
 ```
 
-**4. Phase 内部节点过滤**
+**4. Phase 内部节点过滤（两种模式）**
 
-Phase 执行时通过 `phaseutil.filterNodes()` + `NodePredicate` 精确过滤目标节点：
+Phase 执行时通过 StateCode 位标记精确过滤目标节点。代码中存在两种过滤模式：
+
+| 模式 | 使用 Phase | 过滤方式 | 代码位置 |
+|------|-----------|---------|---------|
+| **`filterNodes()` 模式** | EnsureBKEAgent, EnsureMasterJoin, EnsureWorkerJoin, EnsureNodesPostProcess | 调用 `phaseutil.GetNeedXxxNodesWithBKENodes()` → 内部调用 `filterNodes()` + `NodePredicate` | `phaseutil/util.go:181` |
+| **内联循环模式** | EnsureNodesEnv | `Execute()` 内部直接遍历 BKENodes，逐个检查 StateCode 位标记 | `ensure_nodes_env.go:101` `getNodesToInitEnv()` |
+
+**`filterNodes()` 模式示例**（`ensure_bke_agent.go:165`）：
 
 ```go
-// pkg/phaseframe/phases/ensure_nodes_env.go:101 — EnsureNodesEnv 内部过滤
+// EnsureBKEAgent.Execute() → getNeedPushNodes()
+func (e *EnsureBKEAgent) getNeedPushNodes() error {
+    bkeNodes, err := e.Ctx.NodeFetcher().GetBKENodesWrapperForCluster(e.Ctx, e.Ctx.BKECluster)
+    // ...
+    // ★ 调用 phaseutil.GetNeedPushAgentNodesWithBKENodes()
+    //   → 内部调用 filterNodes(cluster, predicate, WithExcludeAppointmentNodes(), WithBKENodes(bkeNodes))
+    //   → predicate = !NodeAgentPushedFlag
+    nodes := phaseutil.GetNeedPushAgentNodesWithBKENodes(e.Ctx.BKECluster, bkeNodes)
+    e.needPushNodes = nodes
+    return nil
+}
+```
+
+**内联循环模式示例**（`ensure_nodes_env.go:101`）：
+
+```go
+// EnsureNodesEnv.Execute() → getNodesToInitEnv()
+// ★ 不调用 filterNodes(), 直接遍历 BKENodes 检查 StateCode
 func (e *EnsureNodesEnv) getNodesToInitEnv() bkenode.Nodes {
     for _, bn := range bkeNodes {
         // 硬排除: Failed/Deleting/NeedSkip
@@ -3087,6 +3113,8 @@ func (e *EnsureNodesEnv) getNodesToInitEnv() bkenode.Nodes {
     return exceptEnvNodes
 }
 ```
+
+> **两种模式的差异**：`filterNodes()` 模式通过 `NodePredicate` 函数封装过滤逻辑，可复用 `WithExcludeAppointmentNodes` 等 option；内联循环模式直接在 Phase 内遍历，可检查多个前置条件（如 `NodeAgentReadyFlag` + `NodeEnvFlag` 组合判断）。两种模式最终效果一致——基于 StateCode 位标记过滤目标节点。
 
 **节点级 StateCode 位标记说明**：
 
@@ -3197,8 +3225,8 @@ executeScaleDAG
       → NeedsExecution(vc, node.Name)   ← 第一层 (再次检查, inline_executor.go:55)
       → Runner.Execute(handler, version)
         → PhaseRunner.Execute           ← runner.go:28
-          → phase.NeedExecute(old, new) ← 第二层: StateCode HasNodesNeedingPhase → false 则 return nil
-          → phase.Execute()             ← 第三层: filterNodes(StateCode) 精确过滤
+          → phase.NeedExecute(old, new) ← 第二层 (前置守卫): StateCode 检查, 无节点需要则 return nil
+          → phase.Execute()             ← 第二层 (精确过滤): StateCode 位标记过滤目标节点
 ```
 
 **PhaseRunner.Execute 的关键逻辑**（现有代码 `runner.go:28-57`，无需修改）：
@@ -3342,10 +3370,9 @@ func (r *BKEClusterReconciler) fillCurrentFromExistingNodes(
     // 2. 从 ReleaseImage bundle 填充 Current (install.components + upgrade.components)
     upgrade.FillCurrentFromBundle(vc, currentBundle)
 
-    // 3. 清除节点级组件的 Current (保持为空, 使三层机制生效)
+    // 3. 清除节点级组件的 Current (保持为空, 使两层机制生效)
     //    第一层: Current=="" → NeedsExecution=true → 组件执行
-    //    第二层: NeedExecute(StateCode) → 有新节点位标记未设置 → true
-    //    第三层: filterNodes(StateCode) → 已有节点跳过, 新增节点执行
+    //    第二层: StateCode 位标记 → NeedExecute 前置守卫 + Execute 内部精确过滤
     for _, name := range vc.TargetNames() {
         if isNodeScopedComponent(name) {
             vc.SetCurrent(name, "")
@@ -3524,15 +3551,15 @@ PhaseFlow.CalculatePhase() 遍历 DeployPhases (11 个 Phase):
     → 已切换 → false → 跳过
 
 PhaseFlow.Execute() 按顺序执行:
-  1. EnsureBKEAgent → filterNodes(!NodeAgentPushedFlag) → 只操作 master-2
-     → 推送 bkeagent → 设置 master-2 的 NodeAgentPushedFlag|NodeAgentReadyFlag
-  2. EnsureNodesEnv → getNodesToInitEnv() → 只操作 master-2 (NodeEnvFlag 未设置)
-     → 安装 containerd/系统配置 → 设置 master-2 的 NodeEnvFlag
+  1. EnsureBKEAgent → GetNeedPushAgentNodesWithBKENodes() (filterNodes 模式) → 只操作 master-2
+      → 推送 bkeagent → 设置 master-2 的 NodeAgentPushedFlag|NodeAgentReadyFlag
+  2. EnsureNodesEnv → getNodesToInitEnv() (内联循环模式) → 只操作 master-2 (NodeEnvFlag 未设置)
+      → 安装 containerd/系统配置 → 设置 master-2 的 NodeEnvFlag
   3. EnsureMasterInit → getExistingMasterNodes() → master-1 已就绪 → 执行 join
-     → GetNeedJoinMasterNodesWithBKENodes() → master-2 未加入 → 执行 kubeadm join
-     → 设置 master-2 的 NodeBootFlag
+      → GetNeedJoinMasterNodesWithBKENodes() (filterNodes 模式) → master-2 未加入 → 执行 kubeadm join
+      → 设置 master-2 的 NodeBootFlag
   4. EnsureNodesPostProcess → 只操作 master-2
-     → 执行后置脚本 → 设置 master-2 的 NodePostProcessFlag
+      → 执行后置脚本 → 设置 master-2 的 NodePostProcessFlag
 ```
 
 **DAG 化路径（目标设计）**:
@@ -3551,43 +3578,44 @@ executeScaleDAG:
     → shouldSkipComponent: 集群级 Current==Target → Skip (certs, coredns, kube-proxy)
     → componentNeedsUpgrade: 节点级 Current=="" → NeedsExecution=true (bkeagent, containerd, ...)
 
-  第二层: PhaseRunner.NeedExecute (StateCode) — runner.go:40
-    → EnsureBKEAgent.NeedExecute()
-      → HasNodesNeedingPhase(NodeAgentPushedFlag)
-      → master-2: NodeAgentPushedFlag 未设置 → true → 继续 Execute ★
-    → EnsureNodesEnv.NeedExecute()
-      → HasNodesNeedingPhase(NodeEnvFlag)
-      → master-2: NodeEnvFlag 未设置 → true → 继续 Execute ★
-    → EnsureCerts.NeedExecute()
-      → 证书已存在 → false → return nil (跳过)
-    → EnsureMasterInit.NeedExecute()
-      → 有新 Master → true → 继续 Execute ★
+  第二层: inline handler 节点级过滤 (StateCode) — runner.go:40 + Execute 内部
+    → PhaseRunner.Execute 调用 phase.NeedExecute() (前置守卫):
+      EnsureBKEAgent.NeedExecute()
+        → HasNodesNeedingPhase(NodeAgentPushedFlag)
+        → master-2: 未设置 → true → 继续 Execute
+      EnsureNodesEnv.NeedExecute()
+        → HasNodesNeedingPhase(NodeEnvFlag)
+        → master-2: 未设置 → true → 继续 Execute
+      EnsureCerts.NeedExecute()
+        → 证书已存在 → false → return nil (跳过 Execute)
+      EnsureMasterInit.NeedExecute()
+        → 有新 Master → true → 继续 Execute
 
-  第三层: inline handler Execute 内部 filterNodes (StateCode)
-    Batch: EnsureBKEAgent.Execute()
-      → phaseutil.GetNeedPushAgentNodesWithBKENodes():
-        predicate = !NodeAgentPushedFlag
-        master-1: NodeAgentPushedFlag 已设置 → 跳过
-        worker-1/2: NodeAgentPushedFlag 已设置 → 跳过
-        master-2: NodeAgentPushedFlag 未设置 → 执行推送 ★
-      → 推送完成后设置 master-2 的 NodeAgentPushedFlag|NodeAgentReadyFlag
+    → phase.Execute() 内部精确过滤目标节点:
+      EnsureBKEAgent.Execute()
+        → GetNeedPushAgentNodesWithBKENodes() (filterNodes 模式)
+          predicate = !NodeAgentPushedFlag
+          master-1: 已设置 → 跳过
+          worker-1/2: 已设置 → 跳过
+          master-2: 未设置 → 执行推送 ★
+        → 推送完成后设置 master-2 的 NodeAgentPushedFlag|NodeAgentReadyFlag
 
-    Batch: EnsureNodesEnv.Execute()
-      → getNodesToInitEnv():
-        predicate = !NodeEnvFlag && NodeAgentReadyFlag
-        master-1: NodeEnvFlag 已设置 → 跳过
-        worker-1/2: NodeEnvFlag 已设置 → 跳过
-        master-2: NodeEnvFlag 未设置, NodeAgentReadyFlag 已设置 → 执行初始化 ★
-      → 初始化完成后设置 master-2 的 NodeEnvFlag
+      EnsureNodesEnv.Execute()
+        → getNodesToInitEnv() (内联循环模式)
+          检查: !NodeEnvFlag && NodeAgentReadyFlag
+          master-1: NodeEnvFlag 已设置 → 跳过
+          worker-1/2: NodeEnvFlag 已设置 → 跳过
+          master-2: NodeEnvFlag 未设置, NodeAgentReadyFlag 已设置 → 执行初始化 ★
+        → 初始化完成后设置 master-2 的 NodeEnvFlag
 
-    Batch: EnsureMasterInit.Execute()
-      → getExistingMasterNodes(): master-1 已就绪 → 执行 join (非 init)
-      → phaseutil.GetNeedJoinMasterNodesWithBKENodes():
-        predicate = !NodeBootFlag && !MasterInitFlag
-        master-1: NodeBootFlag 已设置 → 跳过
-        master-2: NodeBootFlag 未设置 → 执行 join ★
-      → 调整 KCP 副本数 → 等待 master-2 加入
-      → join 完成后设置 master-2 的 NodeBootFlag
+      EnsureMasterInit.Execute()
+        → getExistingMasterNodes(): master-1 已就绪 → 执行 join (非 init)
+        → GetNeedJoinMasterNodesWithBKENodes() (filterNodes 模式)
+          predicate = !NodeBootFlag && !MasterInitFlag
+          master-1: NodeBootFlag 已设置 → 跳过
+          master-2: NodeBootFlag 未设置 → 执行 join ★
+        → 调整 KCP 副本数 → 等待 master-2 加入
+        → join 完成后设置 master-2 的 NodeBootFlag
 ```
 
 ### 10.4 集群删除/重置 DAG 化
