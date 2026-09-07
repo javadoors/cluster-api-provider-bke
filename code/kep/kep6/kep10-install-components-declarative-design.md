@@ -79,7 +79,7 @@
 
 ## 4. ReleaseImageComponent 结构统一抽象
 
-### 4.0 设计思路
+### 4.1 设计思路
 
 当前 ReleaseImage 的安装组件和升级组件结构**不对称**：升级组件有 `inline.handler` 声明执行方式，安装组件仅有 `{name, version}`。这导致安装流程无法从 ReleaseImage 获取执行元数据，只能依赖硬编码的 `DeployPhases` 列表。
 
@@ -119,7 +119,7 @@
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 4.1 当前结构（不对称）
+### 4.2 当前结构（不对称）
 
 ```go
 // 当前：安装组件仅 {name, version}
@@ -136,7 +136,7 @@ type ReleaseImageUpgradeComponent struct {
 }
 ```
 
-### 4.2 目标结构（两层统一抽象）
+### 4.3 目标结构（两层统一抽象）
 
 经过分析，ReleaseImage 的类型定义存在两层重复：
 
@@ -282,7 +282,7 @@ upgradeSpec.Components  // []ReleaseImageComponent
 // 无需类型转换，直接共用
 ```
 
-### 4.3 ReleaseImage YAML 示例（完整安装 + 升级）
+### 4.4 ReleaseImage YAML 示例（完整安装 + 升级）
 
 ```yaml
 apiVersion: cvo.openfuyao.cn/v1alpha1
@@ -403,11 +403,11 @@ spec:
 
 ## 5. 安装组件目录设计
 
-### 5.0 DeclarativeUpgradeCatalog 的作用 (现有升级组件目录)
+### 5.1 DeclarativeUpgradeCatalog 的作用 (现有升级组件目录)
 
 在说明安装组件目录 `DeclarativeInstallCatalog` 之前，先理解现有升级组件目录 `DeclarativeUpgradeCatalog` 的作用，因为安装目录是它的对称设计。
 
-#### 5.0.1 是什么
+#### 5.1.1 是什么
 
 `DeclarativeUpgradeCatalog` 是一个**静态映射表** (Go `var` 切片)，定义在 `pkg/upgrade/catalog.go` 中。它将 ReleaseImage 中的升级组件名称映射到具体的执行模式 (inline/manifest)、inline handler 名称、manifest 路径和 legacy Phase 名称。
 
@@ -437,7 +437,7 @@ var DeclarativeUpgradeCatalog = []UpgradeComponentSpec{
 }
 ```
 
-#### 5.0.2 解决什么问题
+#### 5.1.2 解决什么问题
 
 | 问题 | 没有 Catalog 时 | 有 Catalog 后 |
 |------|----------------|--------------|
@@ -447,7 +447,7 @@ var DeclarativeUpgradeCatalog = []UpgradeComponentSpec{
 | **组件名 → legacy Phase 映射** | 声明式升级与 legacy PhaseFlow 共存时需互相转换 | 从 Catalog 查表：`LegacyPhase="EnsureMasterUpgrade"` |
 | **新增组件的注册点** | 新增组件需修改 DAG 构建代码、Phase 注册代码等多处 | 只需在 Catalog 中添加一条记录 + 注册 handler |
 
-#### 5.0.3 在升级流程中的角色
+#### 5.1.3 在升级流程中的角色
 
 ```txt
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -503,7 +503,7 @@ var DeclarativeUpgradeCatalog = []UpgradeComponentSpec{
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### 5.0.4 Catalog 与 ReleaseImage 的分工
+#### 5.1.4 Catalog 与 ReleaseImage 的分工
 
 | 维度 | ReleaseImage (声明层) | DeclarativeUpgradeCatalog (映射层) |
 |------|----------------------|-----------------------------------|
@@ -515,7 +515,7 @@ var DeclarativeUpgradeCatalog = []UpgradeComponentSpec{
 
 > **分工原则**：ReleaseImage 声明**什么版本** (What)，Catalog 映射**怎么执行** (How)。
 
-#### 5.0.5 Catalog 的消费者
+#### 5.1.5 Catalog 的消费者
 
 | 消费者 | 用途 | 代码位置 |
 |--------|------|---------|
@@ -524,9 +524,9 @@ var DeclarativeUpgradeCatalog = []UpgradeComponentSpec{
 | `Scheduler.executeComponent()` | 根据 Catalog 的 Mode 选择 inline/manifest 执行器 | `pkg/dagexec/scheduler.go` |
 | `PhaseFlow.CalculatePhase()` | 旧路径中用 `LegacyPhase` 字段判断是否跳过 legacy Phase | `pkg/phaseframe/phases/phase_flow.go` |
 
-### 5.1 DeclarativeInstallCatalog
+### 5.2 DeclarativeInstallCatalog
 
-#### 5.1.1 复用 UpgradeComponentSpec — 不新增类型
+#### 5.2.1 复用 UpgradeComponentSpec — 不新增类型
 
 分析 `InstallComponentSpec` 与现有 `UpgradeComponentSpec` 的字段：
 
@@ -617,7 +617,7 @@ var DeclarativeUpgradeCatalog = []ComponentSpec{  // 类型名从 UpgradeCompone
 
 > **重命名影响**：`UpgradeComponentSpec` → `ComponentSpec`，`UpgradeExecutionMode` → `ExecutionMode`。现有引用处 (catalog.go、build.go、scheduler.go 等) 可选择性替换类型名，但**字段和方法不变**。通过类型别名，现有代码无需修改即可编译通过。
 
-#### 5.1.2 DeclarativeInstallCatalog 定义
+#### 5.2.2 DeclarativeInstallCatalog 定义
 
 ```go
 // pkg/upgrade/catalog.go
@@ -661,7 +661,7 @@ var DeclarativeInstallCatalog = []ComponentSpec{
 
 > **注意**：etcd 和 containerd 不在 Catalog 中，因为它们在安装时嵌入在其他组件中（etcd 由 `EnsureMasterInit` 通过 kubeadm init 创建，containerd 由 `EnsureNodesEnv` 通过 K8sEnvInit 安装）。详见 §5.2.1。
 
-#### 5.1.3 复用的收益
+#### 5.2.3 复用的收益
 
 | 维度 | 新增 `InstallComponentSpec` (原方案) | 复用 `ComponentSpec` (改进方案) |
 |------|-------------------------------------|--------------------------------|
@@ -674,7 +674,7 @@ var DeclarativeInstallCatalog = []ComponentSpec{
 
 > **注意**：同一组件在安装和升级 Catalog 中的 `InlineHandler` 可能不同 (如 `kubernetes-master`: 安装=`EnsureMasterInit`，升级=`EnsureMasterUpgrade`)。复用 `ComponentSpec` 类型不影响这一点 — 两个 Catalog 是独立的 `[]ComponentSpec` 切片，只是元素类型相同。
 
-### 5.2 安装组件与升级组件目录对比
+### 5.3 安装组件与升级组件目录对比
 
 基于代码库实际实现核对的完整组件列表：
 
@@ -703,7 +703,7 @@ var DeclarativeInstallCatalog = []ComponentSpec{
 - (嵌入 XXX) = 安装时嵌入在其他 Phase 中，无独立 handler
 - (manifest) = 通过 bke-manifests YAML 清单部署，无 inline handler
 
-#### 5.2.1 containerd 的安装路径详细说明
+#### 5.3.1 containerd 的安装路径详细说明
 
 containerd 在安装和升级中采用不同的路径：
 
@@ -787,7 +787,7 @@ install:
 // containerd 不在 DeclarativeInstallCatalog 中，由 EnsureNodesEnv 内部处理
 ```
 
-### 5.3 ComponentFactory 注册扩展
+### 5.4 ComponentFactory 注册扩展
 
 ```go
 // pkg/componentfactory/registry.go
@@ -839,7 +839,7 @@ func registerInstallHandlers() {
 
 ## 6. 安装 DAG 构建设计
 
-### 6.0 设计思路
+### 6.1 设计思路
 
 安装 DAG 构建的核心思路是**复用升级 DAG 的构建逻辑**，通过 `DecisionInstall` 区分安装与升级场景。与升级的关键差异在于 VersionContext：安装时 Current 全部为空 (无已安装组件)，Target 来自 ReleaseImage；升级时 Current 来自当前 ReleaseImage bundle，Target 来自目标 ReleaseImage bundle。
 
@@ -882,7 +882,7 @@ func registerInstallHandlers() {
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 6.1 VersionContext 扩展
+### 6.2 VersionContext 扩展
 
 ```go
 // pkg/upgrade/context.go
@@ -920,7 +920,7 @@ func NeedsExecution(vc *VersionContext, name string) bool {
 }
 ```
 
-### 6.2 安装 DAG 构建器
+### 6.3 安装 DAG 构建器
 
 ```go
 // pkg/upgrade/bundle.go
@@ -1000,7 +1000,7 @@ func BuildInstallDAGFromBundle(
 > - **纳管场景**：`manage` 组件先探测版本填充 `Current`，后续组件根据 `Current` 与 `Target` 的比较结果决定 `DecisionSkip`/`DecisionUpgrade`/`DecisionInstall`
 > - **扩容场景**：已有节点组件 `Current == Target` → `DecisionSkip`，新增节点组件 `Current="" && Target!=""` → `DecisionInstall`
 
-### 6.3 安装 VersionContext 构建
+### 6.4 安装 VersionContext 构建
 
 ```go
 // pkg/upgrade/build_release.go
@@ -1032,7 +1032,7 @@ func BuildVersionContextForInstall(
 
 ## 7. 安装 DAG 执行设计
 
-### 7.0 设计思路
+### 7.1 设计思路
 
 安装 DAG 执行的核心思路是**在现有 PhaseFlow 的执行入口中增加 DAG 安装分支**，通过三重门控 (Feature Gate + 全新安装判定 + install-ready annotation) 决定是否走 DAG 路径。未满足门控条件时回退到 Legacy PhaseFlow，保证向后兼容。
 
@@ -1089,9 +1089,9 @@ func BuildVersionContextForInstall(
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 7.1 执行入口
+### 7.2 执行入口
 
-#### 7.1.0 三路分发统一设计
+#### 7.2.1 三路分发统一设计
 
 `executePhaseFlow()` 是 BKEClusterReconciler 的核心分发入口，统一管理 DAG 升级、DAG 安装、Legacy PhaseFlow 三条路径。设计原则是**优先匹配 DAG 路径，未命中则回退 Legacy**，确保 Feature Gate 关闭时行为完全不变。
 
@@ -1140,7 +1140,7 @@ func BuildVersionContextForInstall(
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### 7.1.1 完整代码实现
+#### 7.2.2 完整代码实现
 
 ```go
 // controllers/capbke/bkecluster_controller.go
@@ -1204,7 +1204,7 @@ func (r *BKEClusterReconciler) cleanupStaleDeclarativeUpgradeStatus(bkeCluster *
 }
 ```
 
-#### 7.1.2 Legacy PhaseFlow 路径设计
+#### 7.2.3 Legacy PhaseFlow 路径设计
 
 Legacy PhaseFlow 是 DAG 路径的兜底方案，覆盖所有 DAG 路径不适用的场景。PhaseFlow 通过 `CalculatePhase()` 动态计算需要执行的 Phase 列表。
 
@@ -1458,7 +1458,7 @@ FullPhasesRegisFunc = CommonPhases + DeployPhases + PostDeployPhases
 | ClusterScaleWorkerDownPhaseNames | `ClusterWorkerScalingDown` | `ClusterScaleFailed` |
 | ClusterManagePhaseNames | `ClusterManaging` | `ClusterManageFailed` |
 
-#### 7.1.3 Legacy 路径的版本来源
+#### 7.2.4 Legacy 路径的版本来源
 
 Legacy PhaseFlow 的版本来源与 DAG 路径不同：
 
@@ -1472,7 +1472,7 @@ Legacy PhaseFlow 的版本来源与 DAG 路径不同：
 
 > **关键**：Legacy 路径**不依赖 ReleaseImage**，从 `BKECluster.Spec` 直接读取版本。这确保即使没有 ReleaseImage CR 也能完成安装/升级 (向后兼容)。
 
-#### 7.1.4 Legacy 路径与 DAG 路径的共存设计
+#### 7.2.5 Legacy 路径与 DAG 路径的共存设计
 
 ```txt
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -1519,7 +1519,7 @@ Legacy PhaseFlow 的版本来源与 DAG 路径不同：
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### 7.1.5 PhaseFlow 路径（Legacy）的适用场景
+#### 7.2.6 PhaseFlow 路径（Legacy）的适用场景
 
 以下场景仍会走 Legacy PhaseFlow 路径，不走 DAG 路径：
 
@@ -1554,7 +1554,7 @@ func (r *BKEClusterReconciler) shouldUseDeclarativeInstall(bkeCluster *bkev1beta
 }
 ```
 
-#### 7.1.1 install-ready annotation 的作用
+#### 7.2.7 install-ready annotation 的作用
 
 `shouldUseDeclarativeInstall()` 的最后一个检查项是 `install-ready` annotation。该 annotation 由 `ClusterVersionReconciler` 在安装前置条件满足后设置，是 BKEClusterReconciler 决定是否走 DAG 安装路径的**最终门控**。
 
@@ -1638,7 +1638,7 @@ func (r *BKEClusterReconciler) shouldUseDeclarativeInstall(bkeCluster *bkev1beta
 
 > **关键设计**：install-ready annotation 是 DAG 安装路径的**前置门控**，确保 ReleaseImage 已验证通过后才走 DAG 路径。没有该 annotation 时回退到 Legacy PhaseFlow (从 `BKECluster.Spec` 直接读取版本，不依赖 ReleaseImage)，保证向后兼容。
 
-### 7.2 executeInstallDAG 实现
+### 7.3 executeInstallDAG 实现
 
 ```go
 // controllers/capbke/bkecluster_install_dag.go 🆕新增
@@ -1698,7 +1698,7 @@ func (r *BKEClusterReconciler) executeInstallDAG(
 }
 ```
 
-#### 7.2.1 Spec 同步仅为 Legacy 兼容
+#### 7.3.1 Spec 同步仅为 Legacy 兼容
 
 `ApplyVersionContextTargetsToClusterSpec()` 将 VC Target (来源于 ReleaseImage) 同步到 `BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion` / `EtcdVersion` / `ContainerdVersion`。此同步**仅用于 Legacy 代码路径兼容**，不作为 BKEAgent 渲染 manifest 的版本来源。
 
@@ -1710,7 +1710,7 @@ func (r *BKEClusterReconciler) executeInstallDAG(
 | **kubelet 二进制版本** | `BkeConfig.Cluster.KubernetesVersion` | **`bundle.Components[kubernetes-worker].Spec.Version`** ★ |
 | **Spec 同步的作用** | 唯一来源 (BKEAgent 直接读取) | **仅 Legacy 兼容** (供未改造的 Phase 代码直接读取 Spec) |
 
-#### 7.2.2 BKEAgent 从 ReleaseImage 获取版本的设计
+#### 7.3.2 BKEAgent 从 ReleaseImage 获取版本的设计
 
 基于 §7.7 (KEP-7 minimal-k8s-upgrade) 的分析，当前 BKEAgent 通过 `getBKEConfig()` 读取 `BKECluster.Spec.ClusterConfig` 获取版本。声明式 DAG 路径应修正为从 ReleaseImage 获取版本，消除对 Spec 同步的依赖。
 
@@ -1837,7 +1837,7 @@ func (k *KubeadmPlugin) getBKEConfig(bkeConfigNS string) error {
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### 7.2.3 版本来源对比汇总
+#### 7.3.3 版本来源对比汇总
 
 | 组件 | 当前来源 (Legacy) | 修正后来源 (声明式 DAG) | 传递方式 |
 |------|------------------|----------------------|---------|
@@ -1857,7 +1857,7 @@ func (k *KubeadmPlugin) getBKEConfig(bkeConfigNS string) error {
 
 > **Spec 同步保留但仅用于兼容**：`ApplyVersionContextTargetsToClusterSpec()` 仍执行，确保 Legacy 代码路径 (如 `upgradeMasterNodesWithParams` / `waitForNodeHealthCheck` 直接读 Spec) 能获取正确版本。但 BKEAgent 的版本来源修正为 Command CR 参数 (从 ReleaseImage)，不再依赖 Spec 同步时序。
 
-#### 7.2.4 kubernetesVersion 命令参数设计 (对标 etcdVersion)
+#### 7.3.4 kubernetesVersion 命令参数设计 (对标 etcdVersion)
 
 ##### 现状分析
 
@@ -2063,7 +2063,7 @@ Command CR command 列表:
 
 > **与 KEP-7 minimal-k8s-upgrade 的关系**：本设计在 KEP-10 (安装 DAG) 和 KEP-7 (最小化升级方案) 中共享。`applyCommandKubernetesVersion` 修改的是 BKEAgent 代码，安装和升级路径共同受益。`skipKubelet` 仍然有效 — `installKubeletCommand()` 读取的 `BkeConfig.Cluster.KubernetesVersion` 已被命令参数覆盖为 ReleaseImage 版本，`skipKubelet=true` 仅跳过该函数的执行，不影响版本来源。
 
-### 7.3 安装 DAG 结构
+### 7.4 安装 DAG 结构
 
 ```
 安装 DAG（基于 ReleaseImage v2.7.0 install.components 构建）:
@@ -2102,7 +2102,7 @@ Batch 8: [nodes-postprocess, agent-switch]  ← 依赖 kubernetes-worker，并�
 
 ## 8. 部署 Phase 与安装组件映射
 
-### 8.0 设计思路
+### 8.1 设计思路
 
 Legacy `DeployPhases` 列表定义了 11 个串行 Phase，每个 Phase 有固定的执行顺序。DAG 安装路径需要将这些 Phase 映射为 `ComponentSpec` (组件名 + handler)，使 DAG 拓扑排序替代硬编码顺序。
 
@@ -2171,7 +2171,7 @@ Legacy `DeployPhases` 列表定义了 11 个串行 Phase，每个 Phase 有固�
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 8.1 DeployPhases → 安装组件映射
+### 8.2 DeployPhases → 安装组件映射
 
 | DeployPhase | 安装组件名 | 执行模式 | Inline Handler | 说明 |
 |-------------|-----------|---------|---------------|------|
@@ -2187,7 +2187,7 @@ Legacy `DeployPhases` 列表定义了 11 个串行 Phase，每个 Phase 有固�
 | `EnsureNodesPostProcess` | nodes-postprocess | inline | `EnsureNodesPostProcess` | 后置脚本 |
 | `EnsureAgentSwitch` | agent-switch | inline | `EnsureAgentSwitch` | Agent 切换 |
 
-### 8.2 安装 vs 升级组件差异
+### 8.3 安装 vs 升级组件差异
 
 | 组件 | 安装 handler | 升级 handler | 差异说明 |
 |------|-------------|-------------|---------|
@@ -2232,11 +2232,11 @@ var (
 3. **混合模式**：ReleaseImage 可同时包含有 `inline` 和无 `inline` 的安装组件
 4. **ClusterVersionReconciler**：安装时设置 `cvo.openfuyao.cn/install-ready` annotation 触发 DAG 路径
 
-### 9.5 平滑升级方案
+### 9.4 平滑升级方案
 
 Legacy PhaseFlow 的完全移除不能一蹴而就，需要分阶段平滑过渡，确保生产环境零中断。
 
-#### 9.5.1 平滑升级核心原则
+#### 9.4.1 平滑升级核心原则
 
 | 原则 | 说明 |
 |------|------|
@@ -2246,7 +2246,7 @@ Legacy PhaseFlow 的完全移除不能一蹴而就，需要分阶段平滑过渡
 | **回退能力** | DAG 路径出现问题时，可通过关闭 Feature Gate 回退到 PhaseFlow |
 | **版本对齐** | 每个迁移阶段对齐一个 openFuyao 版本，不在运行中切换 |
 
-#### 9.5.2 平滑升级分阶段计划
+#### 9.4.2 平滑升级分阶段计划
 
 ```
 openFuyao v2.7.0  ──────  openFuyao v2.8.0  ──────  openFuyao v2.9.0  ──────  openFuyao v3.0.0
@@ -2283,7 +2283,7 @@ openFuyao v2.7.0  ──────  openFuyao v2.8.0  ──────  open
      │                        │                        │                        │  Feature Gate: 移除
 ```
 
-#### 9.5.3 Phase 1: 结构扩展（v2.7.0）
+#### 9.4.3 Phase 1: 结构扩展（v2.7.0）
 
 **目标**：扩展 CRD 结构，不改变任何执行路径。
 
@@ -2297,7 +2297,7 @@ openFuyao v2.7.0  ──────  openFuyao v2.8.0  ──────  open
 
 **风险控制**：不改变任何执行逻辑，仅扩展数据结构，零风险。
 
-#### 9.5.4 Phase 2: 部分 DAG 灰度（v2.8.0）
+#### 9.4.4 Phase 2: 部分 DAG 灰度（v2.8.0）
 
 **目标**：将低风险安装组件迁移到 DAG 路径，高风险组件仍走 PhaseFlow。
 
@@ -2340,7 +2340,7 @@ func (r *BKEClusterReconciler) executePhaseFlow(ctx, phaseCtx, oldCluster, newCl
 - 生产环境灰度：先在非核心集群开启，观察 1-2 周后扩大范围
 - 回退方案：关闭 Feature Gate，立即回退到全 PhaseFlow
 
-#### 9.5.5 Phase 3: 全量 DAG（v2.9.0）
+#### 9.4.5 Phase 3: 全量 DAG（v2.9.0）
 
 **目标**：所有安装组件迁移到 DAG 路径，PhaseFlow 不再执行任何安装 Phase。
 
@@ -2375,7 +2375,7 @@ func (r *BKEClusterReconciler) executePhaseFlow(ctx, phaseCtx, oldCluster, newCl
 
 **Feature Gate 状态**：ON（正式启用），但保留关闭能力作为回退。
 
-#### 9.5.6 Phase 4: 移除 Legacy（v3.0.0）
+#### 9.4.6 Phase 4: 移除 Legacy（v3.0.0）
 
 **目标**：完全移除 PhaseFlow 的 DeployPhases，将所有场景（纳管/扩容/删除/DryRun/暂停）DAG 化。
 
@@ -2394,7 +2394,7 @@ func (r *BKEClusterReconciler) executePhaseFlow(ctx, phaseCtx, oldCluster, newCl
 
 **回退方案**：此阶段无回退——PhaseFlow 代码已移除。必须在 Phase 3 充分验证后才执行。
 
-#### 9.5.7 平滑升级风险控制
+#### 9.4.7 平滑升级风险控制
 
 | 风险 | 缓解措施 |
 |------|---------|
@@ -2404,7 +2404,7 @@ func (r *BKEClusterReconciler) executePhaseFlow(ctx, phaseCtx, oldCluster, newCl
 | **PhaseFlow 移除后回归** | Phase 4 移除代码后发现问题，无法回退到 PhaseFlow；必须在 Phase 3 充分验证 |
 | **CommonPhases 仍依赖 PhaseFlow** | Finalizer/Paused/ClusterManage 等通用 Phase 仍走 PhaseFlow，需单独处理 |
 
-#### 9.5.8 状态追踪迁移
+#### 9.4.8 状态追踪迁移
 
 PhaseFlow 使用 `PhaseStatus` 追踪进度，DAG 使用 `DeclarativeUpgradeStatus` 追踪进度。平滑升级期间需处理状态兼容：
 
