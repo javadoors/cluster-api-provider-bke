@@ -1845,8 +1845,15 @@ func (k *KubeadmPlugin) getBKEConfig(bkeConfigNS string) error {
 | kube-controller-manager manifest tag | 同上 | 同上 | 同上 |
 | kube-scheduler manifest tag | 同上 | 同上 | 同上 |
 | etcd manifest tag | `BkeConfig.Cluster.EtcdVersion` 或 `Extra["etcdVersion"]` | `bundle.Components[etcd].Version` | Command CR `etcdVersion` 参数 → `Extra["etcdVersion"]` |
-| kubelet 二进制 | `BkeConfig.Cluster.KubernetesVersion` | `bundle.Components[kubernetes-worker].Version` | Command CR `kubernetesVersion` 参数 |
-| kubectl 二进制 | `BkeConfig.Cluster.KubernetesVersion` | `bundle.Components[kubernetes-master].Version` | Command CR `kubernetesVersion` 参数 |
+| kubelet 二进制 (Master 节点) | `BkeConfig.Cluster.KubernetesVersion` | `bundle.Components[kubernetes-master].Version` | Command CR `kubernetesVersion` 参数 |
+| kubelet 二进制 (Worker 节点) | `BkeConfig.Cluster.KubernetesVersion` | `bundle.Components[kubernetes-worker].Version` | Command CR `kubernetesVersion` 参数 |
+| kubectl 二进制 (Master 节点) | `BkeConfig.Cluster.KubernetesVersion` | `bundle.Components[kubernetes-master].Version` | Command CR `kubernetesVersion` 参数 |
+| kubectl 二进制 (Worker 节点) | `BkeConfig.Cluster.KubernetesVersion` | `bundle.Components[kubernetes-worker].Version` | Command CR `kubernetesVersion` 参数 |
+
+> **版本来源优先级**：
+> - Master 节点：`EnsureMasterUpgrade` 优先使用 `kubernetes-master` 组件版本，回退到 `kubernetes-worker`，再回退到 `kubernetes`
+> - Worker 节点：`EnsureWorkerUpgrade` 优先使用 `kubernetes-worker` 组件版本，回退到 `kubernetes-master`，再回退到 `kubernetes`
+> - 这种设计允许 Master 和 Worker 在不同时间升级（滚动升级场景），但实际使用中版本应该相同
 
 > **Spec 同步保留但仅用于兼容**：`ApplyVersionContextTargetsToClusterSpec()` 仍执行，确保 Legacy 代码路径 (如 `upgradeMasterNodesWithParams` / `waitForNodeHealthCheck` 直接读 Spec) 能获取正确版本。但 BKEAgent 的版本来源修正为 Command CR 参数 (从 ReleaseImage)，不再依赖 Spec 同步时序。
 
