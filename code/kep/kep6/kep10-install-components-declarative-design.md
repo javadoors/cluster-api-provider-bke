@@ -2867,7 +2867,7 @@ func (r *BKEClusterReconciler) executeManageDAG(
 
 扩容是指向已有集群新增 Master 或 Worker 节点。与全新安装的核心区别在于：已有节点不需要重新安装，仅新节点需要执行安装操作。
 
-扩容的节点安装触发采用**两层机制**：第一层是 DAG Scheduler 的组件级 Decision（VersionContext），决定组件是否执行；第二层是 inline handler 内部的节点级过滤（StateCode 位标记），决定哪些节点需要操作。
+扩容的节点安装触发采用**三层机制**：第一层是 DAG Scheduler 的组件级 Decision（VersionContext + Condition），决定组件是否执行；第二层是 PhaseRunner 的 `NeedExecute()` 前置守卫（StateCode），避免不必要的 Execute 调用；第三层是 inline handler 内部的节点级过滤（StateCode 位标记），决定哪些节点需要操作。
 
 ```txt
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -2891,16 +2891,35 @@ func (r *BKEClusterReconciler) executeManageDAG(
 │    问题: 扩容复用 DeployPhases, 但无法复用 DAG 的版本决策和断点续传              │
 │          PhaseFlow 串行执行, 无法实现组件间并行                                  │
 │                                                                                 │
-│  DAG 化方案 (两层机制):                                                          │
+│  DAG 化方案 (三层机制):                                                          │
 │                                                                                 │
-│  第一层: Scheduler 组件级 Decision (VersionContext)                              │
-│    fillCurrentFromExistingNodes 填充 Current:                                    │
-│      集群级组件 (certs, coredns, ...): Current==Target → Skip (已安装, 跳过)     │
-│      节点级组件 (bkeagent, containerd, ...): Current=="" → Install (执行)       │
-│    ★ VersionContext 是组件级的, 不是节点级的                                     │
-│    ★ 这一层只决定"组件是否执行", 不决定"哪些节点执行"                              │
+│  第一层: Scheduler 组件级 Decision (VersionContext + Condition)                  │
+│    Scheduler 跳过链 (executeBatchParallel):                                      │
+│      (A) shouldSkipComponent → DeclarativeUpgradeStatus.IsCompleted → Skip      │
+│      (B) componentNeedsUpgrade → VersionContext.NeedsExecution:                 │
+│          集群级组件 (certs, coredns, ...): Current==Target → Skip (已安装)       │
+│          节点级组件 (bkeagent, containerd, ...): Current=="" → Install (执行)   │
+│      (C) shouldExecuteByCondition → EvaluateCondition(cv.Spec.Condition, tmpl): │
+│          kubernetes-master: condition '{{ eq .ScaleType "master" }}'            │
+│            Master 扩容 → ScaleType="master" → 求值 "true" → 执行 ★              │
+│            Worker 扩容 → ScaleType="worker" → 求值 "false" → Skip ★             │
+│          kubernetes-worker: condition '{{ eq .ScaleType "worker" }}'            │
+│            Worker 扩容 → ScaleType="worker" → 求值 "true" → 执行 ★              │
+│            Master 扩容 → ScaleType="master" → 求值 "false" → Skip ★             │
+│          无 Condition 的组件 (bkeagent, containerd, ...): 跳过此层, 执行        │
+│      (D) executeComponent → 分发到 Inline/YAML/Helm Executor                    │
+│    ★ VersionContext 是组件级的, Condition 也是组件级的                          │
+│    ★ 这一层决定"组件是否执行", 不决定"哪些节点执行"                               │
 │                                                                                 │
-│  第二层: inline handler 节点级过滤 (StateCode 位标记)                             │
+│  第二层: PhaseRunner.NeedExecute() 前置守卫 (StateCode)                          │
+│    PhaseRunner.Execute() 在调用 phase.Execute() 前先调用 phase.NeedExecute():   │
+│      NeedExecute=true  → 有节点位标记未设置 → 继续 Execute()                     │
+│      NeedExecute=false → 所有节点位标记已设置 → return nil (跳过 Execute)         │
+│    ★ 这是 Execute() 的前置守卫, 与第三层检查相同的 StateCode, 但目的不同:       │
+│      NeedExecute: 布尔值判断 (是否有节点需要操作), 避免不必要的 Execute 调用     │
+│      Execute 内部: 精确节点列表 (哪些节点需要操作), 返回具体节点执行操作          │
+│                                                                                 │
+│  第三层: inline handler 节点级过滤 (StateCode 位标记)                             │
 │    handler 的 Execute() 内部通过 StateCode 位标记精确过滤目标节点:              │
 │      已有节点: 对应位标记已设置 (NodeEnvFlag/NodeBootFlag/MasterInitFlag)       │
 │                → 跳过                                                            │
@@ -2909,21 +2928,14 @@ func (r *BKEClusterReconciler) executeManageDAG(
 │    ★ 过滤方式因 Phase 而异 (见下方 "节点过滤方式对比" 表)                        │
 │    ★ 这一层决定"哪些节点执行"                                                    │
 │                                                                                 │
-│  PhaseRunner.NeedExecute() 的角色:                                              │
-│    PhaseRunner.Execute() 在调用 phase.Execute() 前先调用 phase.NeedExecute():   │
-│      NeedExecute=true  → 有节点位标记未设置 → 继续 Execute()                     │
-│      NeedExecute=false → 所有节点位标记已设置 → return nil (跳过 Execute)         │
-│    ★ 这是 Execute() 的前置守卫, 与第二层检查相同的 StateCode, 但目的不同:       │
-│      NeedExecute: 布尔值判断 (是否有节点需要操作), 避免不必要的 Execute 调用     │
-│      Execute 内部: 精确节点列表 (哪些节点需要操作), 返回具体节点执行操作          │
-│                                                                                 │
 │  核心设计:                                                                       │
 │  1. EnsureMasterInit handler 幂等改造 — 区分 init (首个 Master) / join (后续)  │
 │     通过 getExistingMasterNodes 检查已有 Master 数量判断执行 init 还是 join      │
-│  2. 两层节点过滤 — VersionContext + StateCode 逐层收窄:                          │
-│     第一层: VersionContext Current=="" → 组件执行 (跳过集群级组件)              │
-│     第二层: StateCode 位标记 → 精确定位目标节点 (NeedExecute + Execute 内部)     │
-│  3. 复用安装 DAG — 无需独立的扩容 DAG，安装 DAG + 组件级 Current 过滤集群级组件  │
+│  2. 三层过滤 — VersionContext+Condition + NeedExecute + filterNodes 逐层收窄:   │
+│     第一层: VersionContext Current=="" + Condition ScaleType → 组件执行/跳过     │
+│     第二层: NeedExecute(StateCode) → 有节点需要操作 (避免空执行)                  │
+│     第三层: filterNodes(StateCode) → 精确定位目标节点                              │
+│  3. 复用安装 DAG — 无需独立的扩容 DAG，安装 DAG + 组件级 Current/Condition 过滤   │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -3248,14 +3260,22 @@ func registerInlineHandler(f *ComponentFactory, handler, version string) error {
 ```
 executeScaleDAG
   → Scheduler.ExecuteDAG
-    → shouldSkipComponent(node)         ← 第一层: VersionContext Current==Target → Skip
-    → componentNeedsUpgrade(node)       ← 第一层: VersionContext Current=="" → NeedsExecution=true
-    → InlineComponentExecutor.ExecuteComponent
-      → NeedsExecution(vc, node.Name)   ← 第一层 (再次检查, inline_executor.go:55)
-      → Runner.Execute(handler, version)
-        → PhaseRunner.Execute           ← runner.go:28
-          → phase.NeedExecute(old, new) ← 第二层 (前置守卫): StateCode 检查, 无节点需要则 return nil
-          → phase.Execute()             ← 第二层 (精确过滤): StateCode 位标记过滤目标节点
+    → shouldSkipComponent(node)         ← (A) DeclarativeUpgradeStatus.IsCompleted → Skip
+    → componentNeedsUpgrade(node)       ← (B) VersionContext.NeedsExecution:
+                                            集群级 Current==Target → Skip
+                                            节点级 Current=="" → NeedsExecution=true
+    → shouldExecuteByCondition(node)    ← (C) EvaluateCondition(cv.Spec.Condition, tmpl) ★ KEP-18
+                                            kubernetes-master: '{{ eq .ScaleType "master" }}'
+                                              Master 扩容 → "true" → 执行
+                                              Worker 扩容 → "false" → Skip
+                                            无 Condition 的组件 → 跳过此层, 执行
+    → executeComponent(node)            ← (D) 分发到 Inline/YAML/Helm Executor
+      → InlineComponentExecutor.ExecuteComponent
+        → NeedsExecution(vc, node.Name) ← (B) 再次检查 (inline_executor.go:55)
+        → Runner.Execute(handler, version)
+          → PhaseRunner.Execute           ← runner.go:28
+            → phase.NeedExecute(old, new) ← 第二层 (前置守卫): StateCode 检查, 无节点需要则 return nil
+            → phase.Execute()             ← 第三层 (精确过滤): StateCode 位标记过滤目标节点
 ```
 
 **PhaseRunner.Execute 的关键逻辑**（现有代码 `runner.go:28-57`，无需修改）：
@@ -3365,10 +3385,29 @@ func (r *BKEClusterReconciler) executeScaleDAG(
     // 7. 构建 ExecutionContext
     execCtx := buildExecutionContext(phaseCtx, oldCluster, newCluster, bkeLogger, nil)
 
-    // 8. 执行 DAG
-    //    第一层 (Scheduler): 集群级组件 Current==Target → Skip; 节点级组件 Current=="" → Install
-    //    第二层 (PhaseRunner): NeedExecute(StateCode) → 无节点需要则 return nil
-    //    第三层 (handler Execute): filterNodes(StateCode) → 精确定位新节点
+    // ★ 设置 Operation 和 ScaleType 到 TemplateContext (供 Condition 求值)
+    // buildTemplateContext 从 BKECluster 提取静态字段, 不含操作类型
+    // Operation/ScaleType 是调用上下文信息, 由调用方显式设置 (KEP-18 §3.3)
+    execCtx.TemplateContext.Operation = "scale"
+    execCtx.TemplateContext.ScaleType = inferScaleType(oldCluster, newCluster) // "master" / "worker"
+
+    // 8. 执行 DAG — shouldExecuteByCondition 在 Scheduler 跳过链 (C) 层生效
+    //    Scheduler 跳过链 (executeBatchParallel, scheduler.go:160-183):
+    //      (A) shouldSkipComponent(node)         → DeclarativeUpgradeStatus.IsCompleted → Skip
+    //      (B) componentNeedsUpgrade(node)       → VersionContext.NeedsExecution:
+    //                                                集群级 Current==Target → Skip (certs, coredns 已安装)
+    //                                                节点级 Current=="" → NeedsExecution=true (bkeagent, containerd)
+    //      (C) shouldExecuteByCondition(node)    → EvaluateCondition(cv.Spec.Condition, tmpl) ★ KEP-18:
+    //                                                kubernetes-master: '{{ eq .ScaleType "master" }}'
+    //                                                  Master 扩容 → ScaleType="master" → "true" → 执行 ★
+    //                                                  Worker 扩容 → ScaleType="worker" → "false" → Skip ★
+    //                                                kubernetes-worker: '{{ eq .ScaleType "worker" }}'
+    //                                                  Worker 扩容 → ScaleType="worker" → "true" → 执行 ★
+    //                                                  Master 扩容 → ScaleType="master" → "false" → Skip ★
+    //                                                无 Condition 的组件 (bkeagent, containerd): 跳过此层, 执行
+    //      (D) executeComponent(node)            → 分发到 Inline/YAML/Helm Executor
+    //    第二层 (PhaseRunner.NeedExecute): StateCode 前置守卫, 无节点需要则 return nil
+    //    第三层 (handler Execute): StateCode 位标记过滤目标节点 (已有节点跳过, 新增节点执行)
     if err := sched.ExecuteDAG(ctx, execCtx, dag); err != nil {
         return false, ctrl.Result{}, fmt.Errorf("execute scale DAG: %w", err)
     }
@@ -3399,9 +3438,11 @@ func (r *BKEClusterReconciler) fillCurrentFromExistingNodes(
     // 2. 从 ReleaseImage bundle 填充 Current (install.components + upgrade.components)
     upgrade.FillCurrentFromBundle(vc, currentBundle)
 
-    // 3. 清除节点级组件的 Current (保持为空, 使两层机制生效)
-    //    第一层: Current=="" → NeedsExecution=true → 组件执行
-    //    第二层: StateCode 位标记 → NeedExecute 前置守卫 + Execute 内部精确过滤
+    // 3. 清除节点级组件的 Current (保持为空, 使三层机制生效)
+    //    第一层 (B): Current=="" → NeedsExecution=true → 组件执行
+    //    第一层 (C): Condition 求值 (ScaleType="master"/"worker") → Master/Worker 组件选择性执行
+    //    第二层: NeedExecute(StateCode) → 前置守卫, 有节点需要则继续
+    //    第三层: Execute 内部 StateCode 位标记 → 精确过滤目标节点
     for _, name := range vc.TargetNames() {
         if isNodeScopedComponent(name) {
             vc.SetCurrent(name, "")
@@ -3600,51 +3641,61 @@ executeScaleDAG:
   1. fillCurrentFromExistingNodes 填充 VersionContext:
      集群级组件 (certs, coredns, ...): Current==Target → Skip
      节点级组件 (bkeagent, containerd, ...): Current=="" → Install
+  1a. 设置 Operation="scale", ScaleType="master" (Master 扩容) 到 TemplateContext
 
   2. Scheduler.ExecuteDAG:
 
-  第一层: Scheduler 组件级 Decision (VersionContext)
-    → shouldSkipComponent: 集群级 Current==Target → Skip (certs, coredns, kube-proxy)
-    → componentNeedsUpgrade: 节点级 Current=="" → NeedsExecution=true (bkeagent, containerd, ...)
+  第一层: Scheduler 组件级 Decision (VersionContext + Condition)
+    (A) shouldSkipComponent → 集群级 IsCompleted → false (扩容首次)
+    (B) componentNeedsUpgrade (VersionContext):
+        → 集群级 Current==Target → Skip (certs, coredns, kube-proxy)
+        → 节点级 Current=="" → NeedsExecution=true (bkeagent, containerd, kubernetes-master)
+    (C) shouldExecuteByCondition (KEP-18):
+        → bkeagent: 无 Condition → 跳过此层, 执行
+        → containerd: 无 Condition → 跳过此层, 执行
+        → kubernetes-master: Condition '{{ eq .ScaleType "master" }}'
+            ScaleType="master" → 求值 "true" → 执行 ★
+        → kubernetes-worker: Condition '{{ eq .ScaleType "worker" }}'
+            ScaleType="master" → 求值 "false" → Skip ★ (Worker 扩容时才执行)
+    (D) executeComponent → 分发到 Executor
 
-  第二层: inline handler 节点级过滤 (StateCode) — runner.go:40 + Execute 内部
-    → PhaseRunner.Execute 调用 phase.NeedExecute() (前置守卫):
-      EnsureBKEAgent.NeedExecute()
-        → HasNodesNeedingPhase(NodeAgentPushedFlag)
-        → master-2: 未设置 → true → 继续 Execute
-      EnsureNodesEnv.NeedExecute()
-        → HasNodesNeedingPhase(NodeEnvFlag)
-        → master-2: 未设置 → true → 继续 Execute
-      EnsureCerts.NeedExecute()
-        → 证书已存在 → false → return nil (跳过 Execute)
-      EnsureMasterInit.NeedExecute()
-        → 有新 Master → true → 继续 Execute
+  第二层: PhaseRunner.NeedExecute 前置守卫 (StateCode) — runner.go:40
+    → EnsureBKEAgent.NeedExecute()
+      → HasNodesNeedingPhase(NodeAgentPushedFlag)
+      → master-2: 未设置 → true → 继续 Execute
+    → EnsureNodesEnv.NeedExecute()
+      → HasNodesNeedingPhase(NodeEnvFlag)
+      → master-2: 未设置 → true → 继续 Execute
+    → EnsureCerts.NeedExecute()
+      → 证书已存在 → false → return nil (跳过 Execute)
+    → EnsureMasterInit.NeedExecute()
+      → 有新 Master → true → 继续 Execute
 
-    → phase.Execute() 内部精确过滤目标节点:
-      EnsureBKEAgent.Execute()
-        → GetNeedPushAgentNodesWithBKENodes() (filterNodes 模式)
-          predicate = !NodeAgentPushedFlag
-          master-1: 已设置 → 跳过
-          worker-1/2: 已设置 → 跳过
-          master-2: 未设置 → 执行推送 ★
-        → 推送完成后设置 master-2 的 NodeAgentPushedFlag|NodeAgentReadyFlag
+  第三层: inline handler Execute 内部精确过滤 (StateCode)
+    EnsureBKEAgent.Execute()
+      → GetNeedPushAgentNodesWithBKENodes() (filterNodes 模式)
+        predicate = !NodeAgentPushedFlag
+        master-1: 已设置 → 跳过
+        worker-1/2: 已设置 → 跳过
+        master-2: 未设置 → 执行推送 ★
+      → 推送完成后设置 master-2 的 NodeAgentPushedFlag|NodeAgentReadyFlag
 
-      EnsureNodesEnv.Execute()
-        → getNodesToInitEnv() (内联循环模式)
-          检查: !NodeEnvFlag && NodeAgentReadyFlag
-          master-1: NodeEnvFlag 已设置 → 跳过
-          worker-1/2: NodeEnvFlag 已设置 → 跳过
-          master-2: NodeEnvFlag 未设置, NodeAgentReadyFlag 已设置 → 执行初始化 ★
-        → 初始化完成后设置 master-2 的 NodeEnvFlag
+    EnsureNodesEnv.Execute()
+      → getNodesToInitEnv() (内联循环模式)
+        检查: !NodeEnvFlag && NodeAgentReadyFlag
+        master-1: NodeEnvFlag 已设置 → 跳过
+        worker-1/2: NodeEnvFlag 已设置 → 跳过
+        master-2: NodeEnvFlag 未设置, NodeAgentReadyFlag 已设置 → 执行初始化 ★
+      → 初始化完成后设置 master-2 的 NodeEnvFlag
 
-      EnsureMasterInit.Execute()
-        → getExistingMasterNodes(): master-1 已就绪 → 执行 join (非 init)
-        → GetNeedJoinMasterNodesWithBKENodes() (filterNodes 模式)
-          predicate = !NodeBootFlag && !MasterInitFlag
-          master-1: NodeBootFlag 已设置 → 跳过
-          master-2: NodeBootFlag 未设置 → 执行 join ★
-        → 调整 KCP 副本数 → 等待 master-2 加入
-        → join 完成后设置 master-2 的 NodeBootFlag
+    EnsureMasterInit.Execute()
+      → getExistingMasterNodes(): master-1 已就绪 → 执行 join (非 init)
+      → GetNeedJoinMasterNodesWithBKENodes() (filterNodes 模式)
+        predicate = !NodeBootFlag && !MasterInitFlag
+        master-1: NodeBootFlag 已设置 → 跳过
+        master-2: NodeBootFlag 未设置 → 执行 join ★
+      → 调整 KCP 副本数 → 等待 master-2 加入
+      → join 完成后设置 master-2 的 NodeBootFlag
 ```
 
 ### 10.4 集群删除/重置 DAG 化
