@@ -2526,6 +2526,31 @@ func (r *BKEClusterReconciler) executePartialInstallDAG(...) {
 │  │ • 与 §6.4 简化设计一致: VC 构建时直接包含所有组件，不过滤               │   │
 │  └─────────────────────────────────────────────────────────────────────────┘   │
 │                                                                                 │
+│  Operation 填充到 TemplateContext (KEP-18 §3):                                   │
+│  ┌─────────────────────────────────────────────────────────────────────────┐   │
+│  │ 问题: Condition '{{ eq .Operation "manage" }}' 需要从 TemplateContext   │   │
+│  │       读取 .Operation 字段, 但 BKECluster CR 本身不携带操作类型信息      │   │
+│  │       (操作类型由调用方决定: executeManageDAG vs executeInstallDAG)      │   │
+│  │                                                                         │   │
+│  │ 方案: 调用方在构建 ExecutionContext 时传入 Operation                      │   │
+│  │ • buildTemplateContext 从 BKECluster 提取静态字段 (不变)               │   │
+│  │ • 调用方 (executeManageDAG/executeInstallDAG/executeScaleDAG/...)       │   │
+│  │   在构建 ExecutionContext 后设置 execCtx.TemplateContext.Operation      │   │
+│  │ • shouldExecuteByCondition 读取 execCtx.TemplateContext.Operation       │   │
+│  │                                                                         │   │
+│  │ 各场景 Operation 值:                                                    │   │
+│  │   executeInstallDAG  → Operation = "install"                           │   │
+│  │   executeManageDAG   → Operation = "manage"                             │   │
+│  │   executeScaleDAG    → Operation = "scale"                              │   │
+│  │   executeUpgradeDAG  → Operation = "upgrade"                            │   │
+│  │   executeUninstallDAG → Operation = "rollback"                          │   │
+│  │                                                                         │   │
+│  │ 设计原则:                                                               │   │
+│  │ • Operation 是调用上下文信息, 不存储在 BKECluster CR 中               │   │
+│  │ • buildTemplateContext 保持只从 BKECluster 提取 (不引入推断逻辑)        │   │
+│  │ • 调用方负责设置 Operation (显式传递, 非隐式推断)                       │   │
+│  └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -2795,8 +2820,13 @@ func (r *BKEClusterReconciler) executeManageDAG(
 
     execCtx := buildExecutionContext(ctx, r.Client, newCluster, vc)
 
+    // ★ 设置 Operation 到 TemplateContext (供 Condition 求值)
+    // buildTemplateContext 从 BKECluster 提取静态字段, 不含操作类型
+    // Operation 是调用上下文信息, 由调用方显式设置
+    execCtx.TemplateContext.Operation = "manage"
+
     // 5. 执行 DAG
-    //    Batch 1: manage → 探测版本 → 填充 VC.Current
+    //    Batch 1: manage (Condition 求值 true) → 探测版本 → 填充 VC.Current
     //    Batch 2+: 后续组件 Decide: Current==Target→Skip, Current!=Target→Upgrade, Current==""→Install
     return sched.ExecuteDAG(ctx, execCtx, dag)
 }

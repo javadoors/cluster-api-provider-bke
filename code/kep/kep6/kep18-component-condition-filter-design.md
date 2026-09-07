@@ -211,7 +211,9 @@ type TemplateContext struct {
 
 ### 3.3 buildTemplateContext 扩展
 
-现有 `buildTemplateContext()`（`execution_context.go:66`）已从 `BKECluster` 填充 ClusterName/Namespace/K8sVersion/OpenFuyaoVersion。扩展其填充新增字段：
+现有 `buildTemplateContext()`（`execution_context.go:66`）已从 `BKECluster` 填充 ClusterName/Namespace/K8sVersion/OpenFuyaoVersion。扩展其填充新增字段。
+
+**设计原则**：`buildTemplateContext` 只从 `BKECluster` CR 提取**静态字段**（集群配置、节点数量等）。`Operation` 和 `ScaleType` 是**调用上下文信息**（由调用方决定：`executeManageDAG` → `"manage"`，`executeInstallDAG` → `"install"`），不存储在 BKECluster CR 中，因此不由 `buildTemplateContext` 推断，而由调用方在构建 `ExecutionContext` 后显式设置。
 
 ```go
 // pkg/dagexec/execution_context.go — 扩展现有函数
@@ -232,7 +234,7 @@ func buildTemplateContext(cluster *bkev1beta1.BKECluster) manifest.TemplateConte
         tmpl.OpenFuyaoVersion = spec.OpenFuyaoVersion
     }
 
-    // --- 新增逻辑 (Condition 求值字段) ---
+    // --- 新增逻辑: 从 BKECluster 提取的静态字段 ---
 
     // Node counts from BKENode status
     nodes := cluster.Status.Nodes
@@ -245,16 +247,49 @@ func buildTemplateContext(cluster *bkev1beta1.BKECluster) manifest.TemplateConte
         }
     }
 
-    // Operation and ScaleType from cluster status
-    tmpl.Operation = inferOperation(cluster)
-    tmpl.ScaleType = inferScaleType(cluster)
-
     // DeployMode from cluster config
     tmpl.DeployMode = inferDeployMode(cluster)
+
+    // --- 注意: Operation 和 ScaleType 不在此设置 ---
+    // 这两个字段是调用上下文信息, 不存储在 BKECluster CR 中
+    // 由调用方在构建 ExecutionContext 后显式设置:
+    //   execCtx.TemplateContext.Operation = "manage"
+    //   execCtx.TemplateContext.ScaleType = "master"
 
     return tmpl
 }
 ```
+
+**调用方设置 Operation/ScaleType**：
+
+```go
+// 各场景入口函数在 buildExecutionContext 后设置 Operation
+
+// executeManageDAG (§10.2)
+execCtx := buildExecutionContext(phaseCtx, oldCluster, newCluster, bkeLogger, nil)
+execCtx.TemplateContext.Operation = "manage"
+
+// executeInstallDAG (§7.2)
+execCtx := buildExecutionContext(phaseCtx, oldCluster, newCluster, bkeLogger, targetClient)
+execCtx.TemplateContext.Operation = "install"
+
+// executeScaleDAG (§10.3)
+execCtx := buildExecutionContext(phaseCtx, oldCluster, newCluster, bkeLogger, nil)
+execCtx.TemplateContext.Operation = "scale"
+execCtx.TemplateContext.ScaleType = inferScaleType(oldCluster, newCluster) // "master" / "worker"
+
+// executeUpgradeDAG (现有)
+execCtx := buildExecutionContext(phaseCtx, oldCluster, newCluster, bkeLogger, targetClient)
+execCtx.TemplateContext.Operation = "upgrade"
+```
+
+| 调用方 | Operation | ScaleType | 说明 |
+|--------|-----------|-----------|------|
+| `executeInstallDAG` | `"install"` | `""` | 全新安装 |
+| `executeManageDAG` | `"manage"` | `""` | 纳管已有集群 |
+| `executeScaleDAG` | `"scale"` | `"master"` / `"worker"` | 扩容 (按新增节点角色) |
+| `executeUpgradeDAG` | `"upgrade"` | `""` | 版本升级 |
+| `executeUninstallDAG` | `"rollback"` | `""` | 删除/重置 (逆序卸载) |
 
 ### 3.4 EvaluateCondition 使用 TemplateContext
 
@@ -287,19 +322,30 @@ func EvaluateCondition(condition string, tmpl manifest.TemplateContext) (bool, e
 ```
 BKECluster (CR)
   │
-  │ buildTemplateContext() 扩展
+  │ buildTemplateContext() 提取静态字段
   ▼
-TemplateContext {                          ← 单一模板数据结构 (manifest 渲染 + Condition 求值)
-  ClusterName, Namespace, K8sVersion,     ← 现有 (manifest 渲染)
-  OpenFuyaoVersion, DryRun
-  Operation, ScaleType,                   ← 新增 (Condition 求值 + manifest 渲染)
-  NodeCount, MasterCount, WorkerCount,
-  DeployMode, Variables
+TemplateContext (部分填充) {
+  ClusterName, Namespace, K8sVersion,     ← 从 BKECluster 提取 (buildTemplateContext)
+  OpenFuyaoVersion, DryRun,
+  NodeCount, MasterCount, WorkerCount,    ← 从 BKECluster.Status 提取
+  DeployMode
 }
   │
   │ 存入 ExecutionContext.TemplateContext
   ▼
 ExecutionContext.TemplateContext
+  │
+  │ 调用方设置 Operation/ScaleType (调用上下文信息)
+  │ execCtx.TemplateContext.Operation = "manage"
+  │ execCtx.TemplateContext.ScaleType = "master"
+  ▼
+TemplateContext (完整填充) {
+  ClusterName, Namespace, K8sVersion,     ← 从 BKECluster 提取
+  OpenFuyaoVersion, DryRun,
+  Operation, ScaleType,                   ← 调用方设置 ★
+  NodeCount, MasterCount, WorkerCount,   ← 从 BKECluster 提取
+  DeployMode, Variables
+}
   │
   ├─ manifest 渲染: Store.GetComponentManifests(ctx, name, ver, tmpl)
   │  → 模板可引用 {{ .Operation }}, {{ .NodeCount }} 等
@@ -597,7 +643,7 @@ Scheduler 跳过检查链:
 | 开发 | `TemplateContext` 扩展 + `buildTemplateContext` 扩展 | 1 |
 | 开发 | `EvaluateCondition` 实现 | 0.5 |
 | 开发 | `Scheduler.shouldExecuteByCondition` 集成 | 1 |
-| 开发 | `inferOperation` / `inferScaleType` / `inferDeployMode` 辅助函数 | 1 |
+| 开发 | `inferDeployMode` 辅助函数 + 各调用方设置 Operation/ScaleType | 1 |
 | 测试 | Condition 求值单元测试 + Scheduler 集成测试 | 2 |
 | **合计** | | **~6 人天** |
 
@@ -609,7 +655,7 @@ Scheduler 跳过检查链:
 |------|------|------|---------|
 | Go Template 表达式注入 | 安全风险 | 低 | Condition 来自 ComponentVersion CRD（管理员可控），非用户输入；表达式仅访问 TemplateContext 字段，无系统调用 |
 | 表达式求值性能 | DAG 执行延迟 | 低 | 每批次仅求值一次，模板编译结果可缓存；TemplateContext 构建开销可忽略 |
-| TemplateContext 字段缺失 | 表达式无法引用 | 中 | 首版覆盖核心字段（Operation/ScaleType/NodeCount），Variables 字段预留扩展 |
+| TemplateContext 字段缺失 | 表达式无法引用 | 中 | Operation/ScaleType 由调用方设置（非 CR 推断），首版覆盖核心场景；Variables 字段预留扩展 |
 
 ---
 
