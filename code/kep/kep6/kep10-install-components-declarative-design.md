@@ -3714,27 +3714,117 @@ executeScaleDAG:
 ├─────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                 │
 │  Legacy PhaseFlow:                                                              │
-│    DeletePhases (独立的删除 Phase 列表)                                          │
-│      → 逆序执行删除操作                                                          │
-│    问题: 删除 Phase 列表硬编码，与安装 Phase 列表不对称                          │
-│          新增组件需同时维护安装和删除两套 Phase 列表                             │
+│    DeletePhases (仅 2 个 Phase):                                                 │
+│      1. EnsurePaused — 暂停集群操作                                              │
+│      2. EnsureDeleteOrReset — 单体删除逻辑 (含全部清理操作)                      │
+│                                                                                 │
+│    EnsureDeleteOrReset.Execute() 内部执行:                                       │
+│      handleClusterDeletion → 删除 CAPI Cluster (级联删除 Machine)                │
+│      handleBKEMachineDeletion → 等待 BKEMachine 删除完成                        │
+│      deleteRelatedResources → 删除 Secret/Command                               │
+│      ShutDownAgent → SSH 关闭节点上的 bkeagent                                  │
+│      cleanupClusterResources → 删除 BKENode/Event/finalizer                    │
+│      handleNamespaceDeletion → 删除命名空间                                      │
+│                                                                                 │
+│    问题: 全部清理逻辑耦合在一个 Phase 中, 无组件级卸载:                          │
+│    1. 无逆序卸载: 不区分组件类型 (inline/yaml/helm/binary), 不按依赖逆序卸载    │
+│    2. 无组件级清理: CAPI 级联删除 Machine, 但节点上的组件 (containerd/etcd)    │
+│       不被显式卸载 — 靠 Machine 销毁后 OS 上的组件残留                           │
+│    3. 无 helm 卸载: helm 组件 (如 coredns) 通过 CAPI Machine 删除间接清理,       │
+│       不执行 helm uninstall                                                      │
+│    4. 无 binary 卸载: binary 组件 (如 containerd/bkeagent) 不执行 UninstallScript │
+│       仅通过 ShutDownAgent 关闭 bkeagent 进程, containerd/etcd 等不清理          │
 │                                                                                 │
 │  DAG 化方案:                                                                     │
 │    构建卸载 DAG (安装 DAG 的逆序)，复用同一组件声明:                             │
 │    安装: bkeagent → nodes-env → certs → ... → agent-switch (正序)               │
 │    卸载: agent-switch → ... → certs → nodes-env → bkeagent (逆序)              │
 │                                                                                 │
+│  各组件类型的卸载方式:                                                           │
+│    inline: 调用 handler 的 Uninstall/Reset 逻辑 (如 kubeadm reset)             │
+│    yaml: YamlInstaller.DeleteComponent (kubectl delete 清单中所有资源)         │
+│    helm: HelmInstaller.Uninstall (helm uninstall 释放 Helm Release)            │
+│    binary: BinaryInstaller.Uninstall (SSH 执行 UninstallScript, 停止服务)      │
+│                                                                                 │
 │  核心设计:                                                                       │
 │  1. 逆序 DAG — 安装 DAG 反转依赖边，先卸载依赖组件，再卸载被依赖组件            │
 │  2. UninstallExecutor — 每种类型的执行器新增 Uninstall 方法                      │
-│     inline: 调用 handler 的 Uninstall/Reset 逻辑                                 │
-│     manifest: YamlInstaller.DeleteComponent (kubectl delete)                    │
 │  3. 非阻塞 — 卸载不阻塞 (某组件卸载失败不阻止后续组件卸载)                      │
+│  4. Legacy 共存 — DeletePhases 在 Phase 4 前仍可用, DAG 路径通过 Feature Gate 切换 │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### 代码实现
+#### Legacy DeletePhases 详细说明（当前代码）
+
+**DeletePhases 定义**（`list.go:81-84`）：
+
+```go
+DeletePhases = []func(ctx *phaseframe.PhaseContext) phaseframe.Phase{
+    NewEnsurePaused,           // 1. 集群管理暂停
+    NewEnsureDeleteOrReset,    // 2. 集群删除/重置
+}
+```
+
+**EnsureDeleteOrReset.Execute() 内部逻辑**（`ensure_delete_or_reset.go:73`）：
+
+```go
+func (e *EnsureDeleteOrReset) Execute() (ctrl.Result, error) {
+    // 1. 如果集群暂停, 先恢复并清除所有 Command
+    if e.Ctx.BKECluster.Spec.Pause { ... }
+
+    // 2. 轮询执行 reconcileDelete (超时 60 分钟)
+    err := wait.PollImmediateUntil(..., func() (bool, error) {
+        return e.reconcileDelete(ctx) == nil, nil
+    }, ctx.Done())
+}
+
+func (e *EnsureDeleteOrReset) reconcileDelete(ctx context.Context) error {
+    // 2a. 设置 ClusterStatus = ClusterDeleting
+    e.ensureClusterStatusDeleting(...)
+
+    // 2b. 删除 CAPI Cluster 对象 (级联删除所有 Machine)
+    //     → Machine 删除触发节点上的 kubeadm reset (CAPI Machine controller)
+    e.handleClusterDeletion(...)
+
+    // 2c. 等待所有 BKEMachine 删除完成
+    //     手动删除未 bootstrap 的 Machine, 移除 finalizer
+    e.handleBKEMachineDeletion(...)
+
+    // 2d. 删除关联资源: Secret, Command
+    e.deleteRelatedResources(...)
+
+    // 2e. SSH 关闭所有节点上的 bkeagent
+    //     发送 Shutdown 命令到 bkeagent (仅关闭进程, 不卸载)
+    e.ShutDownAgent(ctx)
+
+    // 2f. 清理集群资源: BKENode, Event, finalizer
+    e.cleanupClusterResources(...)
+
+    // 2g. 删除命名空间 (可选, 根据 annotation)
+    e.handleNamespaceDeletion(...)
+}
+```
+
+**Legacy DeletePhases 的卸载覆盖范围**：
+
+| 组件类型 | 卸载方式 | 覆盖情况 | 说明 |
+|---------|---------|---------|------|
+| **inline (kubeadm)** | CAPI Machine 删除触发 kubeadm reset | ✅ 间接 | Machine controller 在节点上执行 kubeadm reset |
+| **yaml (kube-proxy, coredns)** | CAPI Machine 删除 → 节点移除 → 资源孤立 | ❌ 不显式 | 不执行 kubectl delete, 依赖 Machine 销毁 |
+| **helm** | 不卸载 | ❌ 缺失 | 不执行 helm uninstall, Helm Release 残留 |
+| **binary (containerd, bkeagent)** | bkeagent 关闭进程 | ❌ 不完整 | 仅 ShutdownAgent 关闭 bkeagent; containerd/etcd 不卸载 |
+
+**Legacy 删除/重置的缺陷**：
+
+1. **无组件级卸载**：全部清理逻辑在 `reconcileDelete` 中，不按组件依赖逆序卸载
+2. **helm 组件不卸载**：coredns 等通过 helm 部署的组件不执行 `helm uninstall`
+3. **binary 组件不卸载**：containerd/bkeagent 等不执行 `UninstallScript`，仅关闭 bkeagent 进程
+4. **yaml 组件不显式删除**：不执行 `kubectl delete`，依赖 CAPI Machine 销毁后资源自然孤立
+
+#### DAG 化方案设计
+
+**1. 卸载 DAG 构建 — 安装 DAG 逆序**
 
 ```go
 // pkg/upgrade/bundle.go — 卸载 DAG 构建
@@ -3753,6 +3843,8 @@ func BuildUninstallDAGFromBundle(
     return dag.Reverse(), nil
 }
 ```
+
+**2. DAG 逆序实现**
 
 ```go
 // pkg/topology/component.go — DAG 逆序
@@ -3787,8 +3879,10 @@ func (d *UpgradeDAG) Reverse() *UpgradeDAG {
 }
 ```
 
+**3. 各组件类型的 Uninstall 方法**
+
 ```go
-// pkg/dagexec/executor.go — 新增 UninstallComponent 方法
+// pkg/dagexec/executor.go — ComponentExecutor 新增 UninstallComponent
 
 type ComponentExecutor interface {
     ExecuteComponent(ctx context.Context, node *topology.ComponentNode,
@@ -3798,21 +3892,62 @@ type ComponentExecutor interface {
     GetComponentType() ComponentType
 }
 
-// InlineComponentExecutor 新增 Uninstall
+// InlineComponentExecutor — inline 组件卸载 (kubeadm reset 等)
 func (e *InlineComponentExecutor) UninstallComponent(ctx context.Context,
     node *topology.ComponentNode, execCtx *ExecutionContext) error {
     // 调用 handler 的 Uninstall 逻辑 (如 kubeadm reset)
     return e.Runner.Uninstall(ctx, execCtx.Cluster, node.Inline.Handler, node.Inline.Version)
 }
 
-// YamlComponentExecutor 新增 Uninstall
+// YamlComponentExecutor — yaml 组件卸载 (kubectl delete)
 func (e *YamlComponentExecutor) UninstallComponent(ctx context.Context,
     node *topology.ComponentNode, execCtx *ExecutionContext) error {
-    // 删除 YAML 资源 (kubectl delete)
+    // 加载 manifest → 删除清单中所有资源
     pkg, _ := e.store.GetComponentManifests(ctx, node.Name, node.Version, execCtx.TemplateContext)
     return e.applier.DeleteComponent(ctx, pkg)
 }
+
+// HelmComponentExecutor — helm 组件卸载 (helm uninstall) ★ 新增
+func (e *HelmComponentExecutor) UninstallComponent(ctx context.Context,
+    node *topology.ComponentNode, execCtx *ExecutionContext) error {
+    // 加载 Helm Release 信息 → helm uninstall
+    releaseName := fmt.Sprintf("%s-%s", execCtx.TemplateContext.ClusterName, node.Name)
+    return e.helmClient.Uninstall(ctx, releaseName)
+}
+
+// BinaryComponentExecutor — binary 组件卸载 (SSH UninstallScript) ★ 新增
+func (e *BinaryComponentExecutor) UninstallComponent(ctx context.Context,
+    node *topology.ComponentNode, execCtx *ExecutionContext) error {
+    // 1. 获取 ComponentVersion
+    cv, err := e.cvStore.GetComponentVersion(ctx, node.Name, node.Version)
+
+    // 2. 获取全部节点 (binary 是 per-node 的)
+    allNodes, err := execCtx.NodeProvider.GetNodes(ctx, execCtx.Cluster)
+
+    // 3. 逐节点 SSH 执行 UninstallScript (停止服务 + 清理二进制/配置)
+    for _, targetNode := range allNodes {
+        if e.statusUpdater != nil {
+            e.statusUpdater.MarkPending(ctx, execCtx.Cluster, targetNode.IP, cv.Spec.Name)
+        }
+        opts := binaryinstaller.InstallOptions{
+            Component:   cv,
+            TemplateCtx: execCtx.TemplateContext,
+            Action:      binaryinstaller.BinaryActionUninstall, // ★ 卸载动作
+        }
+        if err := e.installer.Uninstall(ctx, opts); err != nil {
+            // 非阻塞: 记录失败, 继续卸载下一个节点
+            execCtx.Log.Warn("uninstall %s on %s failed: %v", node.Name, targetNode.IP, err)
+            continue
+        }
+        if e.statusUpdater != nil {
+            e.statusUpdater.MarkRemoved(ctx, execCtx.Cluster, targetNode.IP, cv.Spec.Name)
+        }
+    }
+    return nil
+}
 ```
+
+**4. 卸载 DAG 执行入口**
 
 ```go
 // controllers/capbke/bkecluster_controller.go — 删除/重置场景入口
@@ -3822,36 +3957,76 @@ func (r *BKEClusterReconciler) executeUninstallDAG(
     phaseCtx *phaseframe.PhaseContext,
     oldCluster, newCluster *bkev1beta1.BKECluster,
 ) error {
-    // 1. 解析当前 ReleaseImage bundle (卸载当前版本，不是目标版本)
+    // 1. 解析当前版本 ReleaseImage bundle (卸载当前安装的版本)
     bundle, err := r.resolveCurrentReleaseBundle(ctx, newCluster)
 
-    // 2. 构建卸载 DAG (逆序)
+    // 2. 构建卸载 DAG (安装 DAG 逆序)
     dag, err := upgrade.BuildUninstallDAGFromBundle(bundle, upgrade.BundleDependencyResolver(bundle))
 
-    // 3. 构建 Scheduler (非阻塞模式: 卸载失败不阻止后续)
+    // 3. 构建 ComponentFactory (注册卸载 handler)
+    factory := componentfactory.NewFactoryFromBundle(bundle)
+    factory.RegisterUninstallHandlers() // ★ 注册卸载 handler
+
+    // 4. 构建 Scheduler (非阻塞模式: 卸载失败不阻止后续)
     sched := dagexec.NewScheduler(dagexec.SchedulerConfig{
-        InlineRunner:       NewInlinePhaseRunnerAdapter(phaseCtx, &PhaseRunner{Factory: factory}),
-        ManifestStore:      manifest.NewBundleStore(bundle),
-        CVStore:            manifest.NewBundleStore(bundle),
-        MaxParallelPerBatch: 2, // 低并行度，避免同时清理过多节点
+        InlineRunner:    NewInlinePhaseRunnerAdapter(phaseCtx, &PhaseRunner{Factory: factory}),
+        ManifestStore:   manifest.NewBundleStore(bundle),
+        CVStore:         manifest.NewBundleStore(bundle),
+        MaxParallelPerBatch: 2,    // 低并行度
         DefaultFailurePolicy: "Continue", // ★ 卸载失败不阻塞 (与安装的 FailFast 不同)
     })
 
-    // 4. 标记为卸载模式
-    execCtx := buildExecutionContext(ctx, r.Client, newCluster, vc)
-    execCtx.UninstallMode = true  // ★ 执行器检查此标记，调用 Uninstall 而非 Execute
+    // 5. 构建 ExecutionContext
+    execCtx := buildExecutionContext(phaseCtx, oldCluster, newCluster, bkeLogger, nil)
+    execCtx.TemplateContext.Operation = "rollback" // ★ 供 Condition 求值
+    execCtx.UninstallMode = true                   // ★ 执行器检查此标记, 调用 Uninstall 而非 Execute
 
-    // 5. 执行卸载 DAG
+    // 6. 执行卸载 DAG (逆序)
     //    Batch 1: agent-switch → 停止 Agent 监听
-    //    Batch 2: kube-proxy/coredns → 删除 addon
+    //    Batch 2: kube-proxy/coredns → kubectl delete / helm uninstall
     //    Batch 3: kubernetes-worker → kubeadm reset (worker)
     //    Batch 4: kubernetes-master → kubeadm reset (master)
     //    Batch 5: load-balance → 删除 HA
     //    Batch 6: certs → 删除证书
-    //    Batch 7: bkeagent → 停止并删除 Agent
-    return sched.ExecuteDAG(ctx, execCtx, dag)
+    //    Batch 7: containerd → SSH UninstallScript (停止服务 + 清理二进制)
+    //    Batch 8: bkeagent → SSH Shutdown (关闭进程)
+    if err := sched.ExecuteDAG(ctx, execCtx, dag); err != nil {
+        // 非阻塞: 记录错误但不返回 (继续清理管理集群资源)
+        bkeLogger.Warn("uninstall DAG completed with errors: %v", err)
+    }
+
+    // 7. 清理管理集群资源 (复用 Legacy DeletePhases 的管理集群清理逻辑)
+    r.cleanupManagementClusterResources(ctx, newCluster, bkeLogger)
+    // → 删除 BKENode / Secret / Command / Event / finalizer / namespace
+    //   (这些是管理集群上的 CR, 不在卸载 DAG 范围内)
+
+    return nil
 }
 ```
+
+**5. 卸载 DAG 各组件类型的卸载覆盖范围**
+
+| 组件类型 | DAG 化卸载方式 | Legacy 覆盖 | 改进 |
+|---------|---------------|------------|------|
+| **inline** | handler Uninstall (kubeadm reset) | ✅ CAPI 间接 | ★ 显式 kubeadm reset, 不依赖 CAPI |
+| **yaml** | kubectl delete 清单资源 | ❌ 缺失 | ★ 新增: 显式删除 YAML 资源 |
+| **helm** | helm uninstall 释放 Release | ❌ 缺失 | ★ 新增: 显式卸载 Helm Release |
+| **binary** | SSH UninstallScript | ❌ 不完整 | ★ 新增: 停止服务 + 清理二进制/配置 |
+
+**6. 卸载 DAG 与 Legacy DeletePhases 的共存设计**
+
+| 维度 | Legacy DeletePhases | DAG 化卸载 |
+|------|--------------------|-----------| 
+| Feature Gate | OFF (默认) | ON |
+| 执行入口 | `determinePhasesFuncs()` → `DeletePhases` | `executeUninstallDAG()` |
+| 组件级卸载 | ❌ 单体 `reconcileDelete` | ✅ 逆序 DAG 逐组件卸载 |
+| helm 卸载 | ❌ | ✅ `helm uninstall` |
+| binary 卸载 | ❌ 仅 ShutdownAgent | ✅ SSH `UninstallScript` |
+| yaml 删除 | ❌ 依赖 CAPI 级联 | ✅ `kubectl delete` |
+| 管理集群清理 | ✅ 在 `reconcileDelete` 中 | ✅ 在 `cleanupManagementClusterResources` 中 (复用) |
+| 失败策略 | 阻塞 (轮询重试) | 非阻塞 (`Continue`) |
+
+> **设计原则**：卸载 DAG 处理**目标集群上的组件卸载**（inline/yaml/helm/binary），管理集群资源的清理（BKENode/Secret/Command/Event/finalizer/namespace）复用 Legacy `reconcileDelete` 中的逻辑，通过 `cleanupManagementClusterResources` 单独调用。两者分离，职责清晰。
 
 ### 10.5 DryRun 模式 DAG 化
 
