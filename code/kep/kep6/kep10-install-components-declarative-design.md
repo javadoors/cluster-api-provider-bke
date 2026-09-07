@@ -1350,11 +1350,24 @@ FullPhasesRegisFunc = CommonPhases + DeployPhases + PostDeployPhases
     1-5. CommonPhases         → NeedExecute=false → 跳过
 
   DeployPhases (NeedExecute 检查):
-    6-16. DeployPhases        → NeedExecute=false (已安装) → 全部跳过
+    6. EnsureBKEAgent         → NeedExecute=true (新节点 NodeAgentPushedFlag 未设置) → 执行 ★
+    7. EnsureNodesEnv         → NeedExecute=true (新节点 NodeEnvFlag 未设置) → 执行 ★
+    8. EnsureClusterAPIObj    → NeedExecute=false (CAPI 对象已存在) → 跳过
+    9. EnsureCerts            → NeedExecute=false (证书已存在) → 跳过
+   10. EnsureLoadBalance      → NeedExecute=false (LB 已配置) → 跳过
+   11. EnsureMasterInit       → NeedExecute=true (有新 Master 待加入) → 执行 ★ (Master 扩容时)
+                                NeedExecute=false (无新 Master) → 跳过 (Worker 扩容时)
+   12. EnsureMasterJoin       → NeedExecute=true (有新 Master 未关联 Machine) → 执行 ★ (Master 扩容时)
+                                NeedExecute=false (无新 Master) → 跳过 (Worker 扩容时)
+   13. EnsureWorkerJoin       → NeedExecute=true (有新 Worker 未关联 Machine) → 执行 ★ (Worker 扩容时)
+                                NeedExecute=false (无新 Worker) → 跳过 (Master 扩容时)
+   14. EnsureAddonDeploy      → NeedExecute=false (Addon 已部署) → 跳过
+   15. EnsureNodesPostProcess → NeedExecute=true (新节点 NodePostProcessFlag 未设置) → 执行 ★
+   16. EnsureAgentSwitch      → NeedExecute=false (已切换) → 跳过
 
   PostDeployPhases (NeedExecute 检查):
-   17-20. 升级 Phase          → NeedExecute=false → 跳过
-   21. EnsureWorkerUpgrade    → NeedExecute=false → 跳过 (扩容不是升级)
+   17-20. 升级 Phase          → NeedExecute=false → 跳过 (扩容不是升级)
+   21. EnsureWorkerUpgrade    → NeedExecute=false → 跳过
    22. EnsureMasterUpgrade    → NeedExecute=false → 跳过
    23. EnsureWorkerDelete     → NeedExecute=false → 跳过
    24. EnsureMasterDelete     → NeedExecute=false → 跳过
@@ -1362,9 +1375,11 @@ FullPhasesRegisFunc = CommonPhases + DeployPhases + PostDeployPhases
    26. EnsureClusterAPIManagerManifest → NeedExecute=false → 跳过
    27. EnsureCluster          → NeedExecute=false → 跳过
 
-注意: 扩容场景下，EnsureMasterJoin/EnsureWorkerJoin 的 NeedExecute 检查
-      是否有新节点需要加入 (通过 BKENode.Status.StateCode 位标记判断)
-      如果有新节点，则执行 Join Phase
+注意: 扩容场景下，DeployPhases 遍历全部 Phase，每个 Phase 的 NeedExecute()
+      通过 BKENode.Status.StateCode 位标记判断是否有节点需要操作:
+      - 新节点 (StateCode=0): 位标记未设置 → NeedExecute=true → 执行
+      - 已有节点 (位标记已设置): 不影响该 Phase 的 NeedExecute (HasNodesNeedingPhase 只要有 1 个节点需要即返回 true)
+      Phase 内部 filterNodes() 精确过滤: 已有节点跳过，仅操作新节点
 ```
 
 **场景 4: 集群删除/重置 (Delete/Reset)**
