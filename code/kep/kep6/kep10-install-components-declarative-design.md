@@ -1030,15 +1030,6 @@ func BuildVersionContextForInstall(
 > - 纳管场景：`manage` 组件先探测版本填充 `Current`，后续组件根据 `Current` 与 `Target` 的比较结果决定
 > - 如果某个组件在全新安装时不需要执行，应该在 ReleaseImage 的 install.components 中就不包含它
 
-> **VersionContext 过滤**：与 DAG 构建不同，VersionContext 构建支持排除组件。全新安装时排除 `manage` 组件 (target="")，使其 `Decide()` 返回 `DecisionSkip`。纳管场景使用 `FillTargetFromBundle` 包含所有组件 (包括 manage)。
-        }
-    }
-    
-    // Current 全部为空 → Decide 返回 DecisionInstall
-    return vc
-}
-```
-
 ## 7. 安装 DAG 执行设计
 
 ### 7.0 设计思路
