@@ -2825,9 +2825,38 @@ func (r *BKEClusterReconciler) executeManageDAG(
     // Operation 是调用上下文信息, 由调用方显式设置
     execCtx.TemplateContext.Operation = "manage"
 
-    // 5. 执行 DAG
-    //    Batch 1: manage (Condition 求值 true) → 探测版本 → 填充 VC.Current
-    //    Batch 2+: 后续组件 Decide: Current==Target→Skip, Current!=Target→Upgrade, Current==""→Install
+    // 5. 执行 DAG — shouldExecuteByCondition 在 Scheduler 跳过链中生效
+    //    Scheduler 跳过链 (executeBatchParallel, scheduler.go:160-183):
+    //      (A) shouldSkipComponent(node)         → DeclarativeUpgradeStatus.IsCompleted → Skip
+    //      (B) componentNeedsUpgrade(node)       → VersionContext.NeedsExecution → Current==Target → Skip
+    //      (C) shouldExecuteByCondition(node)    → EvaluateCondition(cv.Spec.Condition, tmpl) ★ KEP-18
+    //      (D) executeComponent(node)            → 分发到 Inline/YAML/Helm Executor
+    //
+    //    纳管场景执行流程:
+    //    Batch 1: [manage]
+    //      (A) IsCompleted → false (首次执行)
+    //      (B) NeedsExecution → true (Current=="", Target!="")
+    //      (C) Condition: '{{ eq .Operation "manage" }}'
+    //          → Operation="manage" (由 executeManageDAG 设置)
+    //          → 求值 "true" → 执行 ★
+    //      (D) InlineComponentExecutor → EnsureClusterManage.Execute()
+    //          → 探测版本 → 填充 VC.Current
+    //          → 后续组件 Current 有值, 可正确 Decide
+    //
+    //    Batch 2+: [bkeagent, containerd, kubernetes-master, ...]
+    //      (A) IsCompleted → false
+    //      (B) NeedsExecution → Current==Target→Skip / Current!=Target→Upgrade / Current==""→Install
+    //      (C) Condition: 各组件的 Condition (通常为空, 不过滤)
+    //      (D) InlineComponentExecutor → 各 handler Execute()
+    //
+    //    全新安装场景 (executeInstallDAG, Operation="install"):
+    //    Batch 1: [manage]
+    //      (C) Condition: '{{ eq .Operation "manage" }}'
+    //          → Operation="install" → 求值 "false" → Skip ★ (manage 跳过)
+    //          → Current 保持空 → 后续组件全部 DecisionInstall
+    //
+    //    ★ MaxParallelPerBatch=1 确保 Batch 1 串行: manage 先执行填充 Current,
+    //      后续组件才能正确 Decide (Current 有值)
     return sched.ExecuteDAG(ctx, execCtx, dag)
 }
 ```
