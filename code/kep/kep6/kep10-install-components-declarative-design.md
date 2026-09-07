@@ -1206,63 +1206,257 @@ func (r *BKEClusterReconciler) cleanupStaleDeclarativeUpgradeStatus(bkeCluster *
 
 #### 7.1.2 Legacy PhaseFlow 路径设计
 
-Legacy PhaseFlow 是 DAG 路径的兜底方案，覆盖所有 DAG 路径不适用的场景。PhaseFlow 通过 `CalculatePhase()` 动态计算需要执行的 Phase 列表：
+Legacy PhaseFlow 是 DAG 路径的兜底方案，覆盖所有 DAG 路径不适用的场景。PhaseFlow 通过 `CalculatePhase()` 动态计算需要执行的 Phase 列表。
+
+##### Phase 列表定义
 
 ```go
-// pkg/phaseframe/phases/phase_flow.go — CalculatePhase 扩展
+// pkg/phaseframe/phases/list.go
 
-func (f *PhaseFlow) CalculatePhase(old, new *bkev1beta1.BKECluster) []Phase {
-    var phases []Phase
-
-    // ─── Phase 1: CommonPhases (所有操作通用) ───
-    // 这些 Phase 在所有场景下都执行，处理集群级操作
-    for _, phaseFunc := range CommonPhases {
-        phase := phaseFunc(f.ctx)
-        if phase.NeedExecute(old, new) {
-            phases = append(phases, phase)
-        }
-    }
-
-    // ─── Phase 2: 按操作类型选择专用 Phase ───
-    switch {
-    // 集群删除
-    case new.DeletionTimestamp != nil || new.Spec.Reset:
-        phases = append(phases, f.buildDeletePhases(old, new)...)
-
-    // 集群暂停
-    case new.Spec.Pause:
-        phases = append(phases, f.buildPausePhases(old, new)...)
-
-    // DryRun 模式
-    case new.Spec.DryRun:
-        phases = append(phases, f.buildDryRunPhases(old, new)...)
-
-    // 纳管已有集群
-    case new.Spec.Manage:
-        phases = append(phases, f.buildManagePhases(old, new)...)
-
-    // 全新安装
-    case f.isNewInstall(old, new):
-        // ★ 如果 DAG 路径未启用或 ReleaseImage 未就绪，走 Legacy 安装
-        // 版本来源: BKECluster.Spec.ClusterConfig.Cluster (用户直接设置或 ClusterVersion 同步)
-        phases = append(phases, f.buildDeployPhases(old, new)...)
-
-    // 集群扩容 (新增 Master/Worker 节点)
-    case f.isScale(old, new):
-        // ★ 扩容不走 DAG 安装路径，仅执行 Scale Phase
-        // Scale Phase 复用 DeployPhases 中的部分 Phase (Join/PostProcess)
-        phases = append(phases, f.buildScalePhases(old, new)...)
-
-    // 集群升级
-    case f.isUpgrade(old, new):
-        // ★ 如果 DAG 升级路径未启用或 ReleaseImage 未就绪，走 Legacy 升级
-        // 版本来源: BKECluster.Spec.ClusterConfig.Cluster (用户直接设置或 ClusterVersion 同步)
-        phases = append(phases, f.buildUpgradePhases(old, new)...)
-    }
-
-    return phases
+// CommonPhases 通用 Phase (所有场景首先检查)
+CommonPhases = []func(ctx *phaseframe.PhaseContext) phaseframe.Phase{
+    NewEnsureFinalizer,        // 部署任务创建
+    NewEnsurePaused,           // 集群管理暂停
+    NewEnsureClusterManage,    // 纳管现有集群
+    NewEnsureDeleteOrReset,    // 集群删除/重置
+    NewEnsureDryRun,           // DryRun 部署
 }
+
+// DeployPhases 安装 Phase (全新安装时执行)
+DeployPhases = []func(ctx *phaseframe.PhaseContext) phaseframe.Phase{
+    NewEnsureBKEAgent,         // 推送 Agent
+    NewEnsureNodesEnv,         // 节点环境准备 (containerd/系统配置)
+    NewEnsureClusterAPIObj,    // ClusterAPI 对象创建
+    NewEnsureCerts,            // 集群证书创建
+    NewEnsureLoadBalance,      // 集群入口配置 (haproxy/keepalived)
+    NewEnsureMasterInit,       // Master 初始化 (kubeadm init)
+    NewEnsureMasterJoin,       // Master 加入 (kubeadm join)
+    NewEnsureWorkerJoin,       // Worker 加入 (kubeadm join)
+    NewEnsureAddonDeploy,      // 集群组件部署 (coredns/kube-proxy)
+    NewEnsureNodesPostProcess, // 后置脚本处理
+    NewEnsureAgentSwitch,      // Agent 监听切换
+}
+
+// PostDeployPhases 安装后 Phase (升级/扩容/删除时执行)
+PostDeployPhases = []func(ctx *phaseframe.PhaseContext) phaseframe.Phase{
+    NewEnsureProviderSelfUpgrade,       // provider 自升级
+    NewEnsureAgentUpgrade,              // Agent 升级
+    NewEnsureContainerdUpgrade,         // Containerd 升级
+    NewEnsureEtcdUpgrade,               // etcd 升级
+    NewEnsureWorkerUpgrade,             // Worker 升级
+    NewEnsureMasterUpgrade,             // Master 升级
+    NewEnsureWorkerDelete,              // Worker 删除 (缩容)
+    NewEnsureMasterDelete,              // Master 删除 (缩容)
+    NewEnsureComponentUpgrade,          // openFuyao 核心组件升级
+    NewEnsureClusterAPIManagerManifest, // Cluster-API Manager 部署
+    NewEnsureCluster,                   // 集群健康检查
+}
+
+// DeletePhases 删除 Phase (删除/重置时执行)
+DeletePhases = []func(ctx *phaseframe.PhaseContext) phaseframe.Phase{
+    NewEnsurePaused,           // 集群管理暂停
+    NewEnsureDeleteOrReset,    // 集群删除/重置
+}
+
+// FullPhasesRegisFunc 完整 Phase 列表 (非删除场景)
+FullPhasesRegisFunc = CommonPhases + DeployPhases + PostDeployPhases
 ```
+
+##### 各场景的 Phase 执行列表
+
+| 场景 | 使用的 Phase 列表 | 实际执行的 Phase | 跳过的 Phase | ClusterStatus |
+|------|------------------|-----------------|-------------|---------------|
+| **全新安装** | `FullPhasesRegisFunc` | CommonPhases (NeedExecute 检查) + DeployPhases (全部执行) + PostDeployPhases (NeedExecute 检查) | PostDeployPhases 中的升级/删除 Phase | `ClusterInitializing` |
+| **集群升级** | `FullPhasesRegisFunc` | CommonPhases (NeedExecute 检查) + PostDeployPhases 中的升级 Phase | DeployPhases (已安装) + PostDeployPhases 中的删除 Phase | `ClusterUpgrading` |
+| **集群扩容** | `FullPhasesRegisFunc` | CommonPhases (NeedExecute 检查) + PostDeployPhases 中的 Join Phase | DeployPhases (已安装) + PostDeployPhases 中的升级/删除 Phase | `ClusterMasterScalingUp` / `ClusterWorkerScalingUp` |
+| **集群删除/重置** | `DeletePhases` | EnsurePaused + EnsureDeleteOrReset | 所有其他 Phase | `ClusterDeleting` |
+| **集群暂停** | `FullPhasesRegisFunc` | CommonPhases 中的 EnsurePaused | 所有其他 Phase | `ClusterPaused` |
+| **DryRun 模式** | `FullPhasesRegisFunc` | CommonPhases 中的 EnsureDryRun | 所有其他 Phase | `ClusterDryRun` |
+| **纳管已有集群** | `FullPhasesRegisFunc` | CommonPhases 中的 EnsureClusterManage | 所有其他 Phase | `ClusterManaging` |
+
+##### 各场景详细 Phase 执行列表
+
+**场景 1: 全新安装 (New Install)**
+
+```
+执行 Phase 列表:
+  CommonPhases (NeedExecute 检查):
+    1. EnsureFinalizer        → 创建 finalizer
+    2. EnsurePaused           → NeedExecute=false → 跳过
+    3. EnsureClusterManage    → NeedExecute=false → 跳过
+    4. EnsureDeleteOrReset    → NeedExecute=false → 跳过
+    5. EnsureDryRun           → NeedExecute=false → 跳过
+
+  DeployPhases (全部执行):
+    6. EnsureBKEAgent         → 推送 bkeagent 到所有节点
+    7. EnsureNodesEnv         → 安装 containerd + 系统配置
+    8. EnsureClusterAPIObj    → 创建 Cluster/Machine 对象
+    9. EnsureCerts            → 生成集群证书
+   10. EnsureLoadBalance      → 配置 haproxy/keepalived
+   11. EnsureMasterInit       → kubeadm init (首个 Master)
+   12. EnsureMasterJoin       → kubeadm join (后续 Master，无新 Master 时跳过)
+   13. EnsureWorkerJoin       → kubeadm join (所有 Worker)
+   14. EnsureAddonDeploy      → 部署 coredns/kube-proxy
+   15. EnsureNodesPostProcess → 执行后置脚本
+   16. EnsureAgentSwitch      → 切换 Agent 监听
+
+  PostDeployPhases (NeedExecute 检查):
+   17. EnsureProviderSelfUpgrade       → NeedExecute=false → 跳过
+   18. EnsureAgentUpgrade              → NeedExecute=false → 跳过
+   19. EnsureContainerdUpgrade         → NeedExecute=false → 跳过
+   20. EnsureEtcdUpgrade               → NeedExecute=false → 跳过
+   21. EnsureWorkerUpgrade             → NeedExecute=false → 跳过
+   22. EnsureMasterUpgrade             → NeedExecute=false → 跳过
+   23. EnsureWorkerDelete              → NeedExecute=false → 跳过
+   24. EnsureMasterDelete              → NeedExecute=false → 跳过
+   25. EnsureComponentUpgrade          → NeedExecute=false → 跳过
+   26. EnsureClusterAPIManagerManifest → NeedExecute=false → 跳过
+   27. EnsureCluster                   → NeedExecute=false → 跳过
+```
+
+**场景 2: 集群升级 (Upgrade)**
+
+```
+执行 Phase 列表:
+  CommonPhases (NeedExecute 检查):
+    1. EnsureFinalizer        → 已存在 → 跳过
+    2-5. 其他 CommonPhases    → NeedExecute=false → 跳过
+
+  DeployPhases (NeedExecute 检查):
+    6-16. DeployPhases        → NeedExecute=false (已安装) → 全部跳过
+
+  PostDeployPhases (NeedExecute 检查):
+   17. EnsureProviderSelfUpgrade       → NeedExecute=true → 执行 provider 升级
+   18. EnsureAgentUpgrade              → NeedExecute=true → 执行 Agent 升级
+   19. EnsureContainerdUpgrade         → NeedExecute=true → 执行 containerd 升级
+   20. EnsureEtcdUpgrade               → NeedExecute=true → 执行 etcd 升级
+   21. EnsureWorkerUpgrade             → NeedExecute=true → 执行 Worker 升级
+   22. EnsureMasterUpgrade             → NeedExecute=true → 执行 Master 升级
+   23. EnsureWorkerDelete              → NeedExecute=false → 跳过
+   24. EnsureMasterDelete              → NeedExecute=false → 跳过
+   25. EnsureComponentUpgrade          → NeedExecute=true → 执行核心组件升级
+   26. EnsureClusterAPIManagerManifest → NeedExecute=false → 跳过
+   27. EnsureCluster                   → NeedExecute=false → 跳过
+
+注意: 如果 DAG 升级路径已完成 (DeclarativeDAGCompleted=true)，
+      则跳过 DeclarativeInlineUpgradePhases 中的 Phase (避免重复执行)
+```
+
+**场景 3: 集群扩容 (Scale Up)**
+
+```
+执行 Phase 列表:
+  CommonPhases (NeedExecute 检查):
+    1-5. CommonPhases         → NeedExecute=false → 跳过
+
+  DeployPhases (NeedExecute 检查):
+    6-16. DeployPhases        → NeedExecute=false (已安装) → 全部跳过
+
+  PostDeployPhases (NeedExecute 检查):
+   17-20. 升级 Phase          → NeedExecute=false → 跳过
+   21. EnsureWorkerUpgrade    → NeedExecute=false → 跳过 (扩容不是升级)
+   22. EnsureMasterUpgrade    → NeedExecute=false → 跳过
+   23. EnsureWorkerDelete     → NeedExecute=false → 跳过
+   24. EnsureMasterDelete     → NeedExecute=false → 跳过
+   25. EnsureComponentUpgrade → NeedExecute=false → 跳过
+   26. EnsureClusterAPIManagerManifest → NeedExecute=false → 跳过
+   27. EnsureCluster          → NeedExecute=false → 跳过
+
+注意: 扩容场景下，EnsureMasterJoin/EnsureWorkerJoin 的 NeedExecute 检查
+      是否有新节点需要加入 (通过 BKENode.Status.StateCode 位标记判断)
+      如果有新节点，则执行 Join Phase
+```
+
+**场景 4: 集群删除/重置 (Delete/Reset)**
+
+```
+执行 Phase 列表:
+  DeletePhases (仅 2 个 Phase):
+    1. EnsurePaused        → 暂停集群操作
+    2. EnsureDeleteOrReset → 执行删除/重置操作
+```
+
+**场景 5: 集群暂停 (Pause)**
+
+```
+执行 Phase 列表:
+  CommonPhases (NeedExecute 检查):
+    1. EnsureFinalizer     → 已存在 → 跳过
+    2. EnsurePaused        → NeedExecute=true (Spec.Pause=true) → 执行
+    3-5. 其他 CommonPhases → NeedExecute=false → 跳过
+
+  DeployPhases + PostDeployPhases:
+    全部 NeedExecute=false → 全部跳过
+```
+
+**场景 6: DryRun 模式**
+
+```
+执行 Phase 列表:
+  CommonPhases (NeedExecute 检查):
+    1. EnsureFinalizer     → 已存在 → 跳过
+    2-4. 其他 CommonPhases → NeedExecute=false → 跳过
+    5. EnsureDryRun        → NeedExecute=true (Spec.DryRun=true) → 执行
+
+  DeployPhases + PostDeployPhases:
+    全部 NeedExecute=false → 全部跳过
+```
+
+**场景 7: 纳管已有集群 (Manage)**
+
+```
+执行 Phase 列表:
+  CommonPhases (NeedExecute 检查):
+    1. EnsureFinalizer     → 已存在 → 跳过
+    2-4. 其他 CommonPhases → NeedExecute=false → 跳过
+    5. EnsureClusterManage → NeedExecute=true (Spec.Manage=true) → 执行
+
+  DeployPhases + PostDeployPhases:
+    全部 NeedExecute=false → 全部跳过
+```
+
+##### Phase 执行判断逻辑
+
+每个 Phase 通过 `NeedExecute(old, new *BKECluster)` 方法判断是否需要执行：
+
+| Phase | NeedExecute 判断逻辑 |
+|-------|---------------------|
+| `EnsureFinalizer` | `!util.Contains(finalizer)` → 需要添加 finalizer |
+| `EnsurePaused` | `new.Spec.Pause == true` → 需要暂停 |
+| `EnsureClusterManage` | `new.Spec.Manage == true && !Status.Managed` → 需要纳管 |
+| `EnsureDeleteOrReset` | `IsDeleteOrReset(new)` → 需要删除/重置 |
+| `EnsureDryRun` | `new.Spec.DryRun == true` → 需要 DryRun |
+| `EnsureBKEAgent` | `HasNodesNeedingPhase(NodeAgentPushedFlag)` → 有节点未推送 Agent |
+| `EnsureNodesEnv` | `HasNodesNeedingPhase(NodeEnvFlag)` → 有节点未初始化环境 |
+| `EnsureClusterAPIObj` | `!CAPI 对象已存在` → 需要创建 |
+| `EnsureCerts` | `!证书已存在` → 需要生成 |
+| `EnsureLoadBalance` | `!LB 已配置` → 需要配置 |
+| `EnsureMasterInit` | `首个 Master 且未初始化` → 需要 init |
+| `EnsureMasterJoin` | `GetNeedJoinMasterNodesWithBKENodes()` → 有新 Master 需要 join |
+| `EnsureWorkerJoin` | `GetNeedJoinWorkerNodesWithBKENodes()` → 有 Worker 需要 join |
+| `EnsureAddonDeploy` | `!Addon 已部署` → 需要部署 |
+| `EnsureNodesPostProcess` | `HasNodesNeedingPhase(NodePostProcessFlag)` → 有节点未处理后置脚本 |
+| `EnsureAgentSwitch` | `!已切换` → 需要切换 |
+| `Ensure*Upgrade` | `版本不一致 && 需要升级` → 需要升级 |
+| `Ensure*Delete` | `缩容场景 && 节点需要删除` → 需要删除 |
+
+##### 状态上报逻辑
+
+每个 Phase 执行后通过 `calculateClusterStatusByPhase()` 设置 `ClusterStatus`：
+
+| Phase 类别 | ClusterStatus (成功) | ClusterStatus (失败) |
+|-----------|---------------------|---------------------|
+| ClusterInitPhaseNames | `ClusterInitializing` | `ClusterInitializationFailed` |
+| ClusterScaleMasterUpPhaseNames | `ClusterMasterScalingUp` | `ClusterScaleFailed` |
+| ClusterScaleWorkerUpPhaseNames | `ClusterWorkerScalingUp` | `ClusterScaleFailed` |
+| ClusterDeletePhaseNames | `ClusterDeleting` | `ClusterDeleteFailed` |
+| ClusterPausedPhaseNames | `ClusterPaused` | `ClusterPauseFailed` |
+| ClusterDryRunPhaseNames | `ClusterDryRun` | `ClusterDryRunFailed` |
+| ClusterAddonsPhaseNames | `ClusterDeployingAddon` | `ClusterDeployAddonFailed` |
+| ClusterUpgradePhaseNames | `ClusterUpgrading` | `ClusterUpgradeFailed` |
+| ClusterScaleMasterDownPhaseNames | `ClusterMasterScalingDown` | `ClusterScaleFailed` |
+| ClusterScaleWorkerDownPhaseNames | `ClusterWorkerScalingDown` | `ClusterScaleFailed` |
+| ClusterManagePhaseNames | `ClusterManaging` | `ClusterManageFailed` |
 
 #### 7.1.3 Legacy 路径的版本来源
 
@@ -1413,14 +1607,14 @@ func (r *BKEClusterReconciler) shouldUseDeclarativeInstall(bkeCluster *bkev1beta
 
 **install-ready annotation 的完整设置流程**：
 
-| 步骤 | 执行者 | 操作 | 说明 |
-|------|--------|------|------|
-| 1 | BKEClusterReconciler | `ensureClusterVersionOnInstall()` 创建 ClusterVersion CR | 用户创建 BKECluster 后，自动创建对应的 ClusterVersion |
-| 2 | ClusterVersionReconciler | 解析 `desiredVersion`，查找 ReleaseImage CR | 通过 `Spec.Version == desiredVersion` 匹配 |
-| 3 | ClusterVersionReconciler | `ReleaseImageEnsurer.Ensure()` 拉取 OCI Bundle | 从 OCI Registry 拉取 ReleaseImage payload |
-| 4 | ReleaseImageReconciler | 验证签名 + 解析组件 + 兼容性校验 | 设置 `Status.Phase = Valid` (或 Invalid/ManifestMissing/CompatibilityFailed) |
-| 5 | ClusterVersionReconciler | ReleaseImage Phase == Valid → 设置 `install-ready` annotation | `bc.Annotations[InstallReadyAnnotationKey] = desiredVersion` |
-| 6 | BKEClusterReconciler | 检测到 annotation 变更 → `shouldUseDeclarativeInstall()` 返回 true | 进入 DAG 安装路径 |
+| 步骤 | 执行者 | 操作 | 说明 | 是否新增 |
+|------|--------|------|------|----------|
+| 1 | BKEClusterReconciler | `ensureClusterVersionOnInstall()` 创建 ClusterVersion CR | 用户创建 BKECluster 后，自动创建对应的 ClusterVersion | 否 (复用升级流程) |
+| 2 | ClusterVersionReconciler | 解析 `desiredVersion`，查找 ReleaseImage CR | 通过 `Spec.Version == desiredVersion` 匹配 | 否 (复用升级流程) |
+| 3 | ClusterVersionReconciler | `ReleaseImageEnsurer.Ensure()` 拉取 OCI Bundle | 从 OCI Registry 拉取 ReleaseImage payload | 否 (复用升级流程) |
+| 4 | ReleaseImageReconciler | 验证签名 + 解析组件 + 兼容性校验 | 设置 `Status.Phase = Valid` (或 Invalid/ManifestMissing/CompatibilityFailed) | 否 (复用升级流程) |
+| 5 | ClusterVersionReconciler | ReleaseImage Phase == Valid → 设置 `install-ready` annotation | `bc.Annotations[InstallReadyAnnotationKey] = desiredVersion` | **是** (新增 install-ready) |
+| 6 | BKEClusterReconciler | 检测到 annotation 变更 → `shouldUseDeclarativeInstall()` 返回 true | 进入 DAG 安装路径 | **是** (新增 shouldUseDeclarativeInstall) |
 
 **与 upgrade-ready annotation 的对称性**：
 
