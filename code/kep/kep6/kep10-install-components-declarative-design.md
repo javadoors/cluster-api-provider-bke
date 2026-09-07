@@ -2505,18 +2505,22 @@ func (r *BKEClusterReconciler) executePartialInstallDAG(...) {
 │  │ • 全新安装: manage 探测不存在的集群 → 探测失败/空版本 → 干扰后续 Decide │   │
 │  │ • 纳管场景: manage 探测已有集群 → 填充 VC.Current → 后续组件正确 Decide │   │
 │  │                                                                         │   │
-│  │ 解决方案: VersionContext 过滤 (执行时过滤)                               │   │
+│  │ 解决方案: Condition 执行时过滤 (KEP-18)                                 │   │
 │  │ • manage 在 ReleaseImage install.components 中 (声明式定义)             │   │
 │  │ • DAG 构建时包含所有 install.components (不过滤)                        │   │
-│  │ • VersionContext 构建时过滤:                                            │   │
-│  │   - 全新安装: BuildVersionContextForInstall(bundle, "manage")          │   │
-│  │     → manage 的 target="" → Decide() 返回 DecisionSkip (跳过)         │   │
-│  │   - 纳管场景: FillTargetFromBundle(vc, bundle)                        │   │
-│  │     → manage 的 target!="" → Decide() 返回 DecisionInstall (执行)     │   │
+│  │ • VersionContext 构建时不过滤 (Current 全空, Target 全填充):           │   │
+│  │   - 全新安装和纳管均用 FillTargetFromBundle(vc, bundle)               │   │
+│  │     → manage 的 target!="" → Decide() 返回 DecisionInstall            │   │
+│  │ • 执行时 Condition 过滤 (shouldExecuteByCondition):                    │   │
+│  │   - manage 的 ComponentVersion.Spec.Condition:                         │   │
+│  │     '{{ eq .Operation "manage" }}'                                      │   │
+│  │   - 全新安装: Operation="install" → 求值 "false" → Skip (跳过 manage) │   │
+│  │   - 纳管场景: Operation="manage" → 求值 "true" → 执行 manage 探测     │   │
 │  │                                                                         │   │
-│  │ 为什么用 VersionContext 过滤而非 DAG 构建时过滤:                        │   │
-│  │ • DAG 构建时过滤: 需传递 excludeComponents 参数，增加 API 复杂度      │   │
-│  │ • VersionContext 过滤: 统一由 Decide() 控制，职责清晰，API 简洁        │   │
+│  │ 为什么用 Condition 过滤而非 VersionContext 构建时过滤:                  │   │
+│  │ • VersionContext 构建时过滤: 需传递 excludeComponents 参数，增加 API 复杂度 │   │
+│  │ • Condition 过滤: 统一由 shouldExecuteByCondition 控制，职责清晰       │   │
+│  │ • 与 §6.4 简化设计一致: VC 构建时直接包含所有组件，不过滤               │   │
 │  └─────────────────────────────────────────────────────────────────────────┘   │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
@@ -2533,6 +2537,23 @@ install:
       inline:
         handler: EnsureClusterManage
         version: v1.0.0
+```
+
+```yaml
+# ComponentVersion: manage — 仅纳管场景执行 (KEP-18 Condition)
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: manage-v1.0.0
+spec:
+  name: manage
+  type: inline
+  version: "v1.0.0"
+  inline:
+    handler: EnsureClusterManage
+    version: "v1.0.0"
+  # ★ 仅纳管场景执行, 全新安装时跳过 (KEP-18 Condition 过滤)
+  condition: '{{ eq .Operation "manage" }}'
 ```
 
 ```go
@@ -2744,13 +2765,17 @@ func (r *BKEClusterReconciler) executeManageDAG(
 
     // 2. 构建纳管 VersionContext (Current 初始为空，由 manage 组件填充)
     vc := upgrade.NewVersionContext()
-    // Target 来自 ReleaseImage (包含 manage 组件)
+    // Target 来自 ReleaseImage (包含 manage 组件, 与全新安装相同)
+    // ★ manage 组件的执行/跳过由 ComponentVersion.Spec.Condition 控制 (KEP-18):
+    //   Condition: '{{ eq .Operation "manage" }}'
+    //   纳管场景 Operation="manage" → 求值 true → 执行 manage 探测
+    //   全新安装 Operation="install" → 求值 false → 跳过 manage
     upgrade.FillTargetFromBundle(vc, bundle)
     phaseCtx.SetVersionContext(vc)
 
     // 3. 构建 DAG (包含所有 install.components，包括 manage)
     //    ★ 与 executeInstallDAG 使用相同的构建函数 (无 excludeComponents 参数)
-    //    区别在于 VersionContext: 纳管场景 manage 的 target!="" → DecisionInstall
+    //    ★ manage 的执行/跳过由 Condition 在 shouldExecuteByCondition 中判断 (非 VersionContext 构建 时过滤)
     dag, err := upgrade.BuildInstallDAGFromBundle(bundle, upgrade.BundleDependencyResolver(bundle))
     // manage 组件在第一个 Batch 执行: 探测版本 → 填充 VC.Current → 后续组件 Decide
 
