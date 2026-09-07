@@ -1025,10 +1025,10 @@ func BuildVersionContextForInstall(
 }
 ```
 
-> **简化设计**：VersionContext 构建时直接包含所有 install.components，不在构建时进行过滤。组件的跳过逻辑完全由执行时的 `Decide()` 决定：
+> **简化设计**：VersionContext 构建时直接包含所有 install.components，不在构建时进行过滤。组件的跳过逻辑完全由执行时的 `Decide()` 与 `condition`/`NodeFilter` 决定：
 > - 全新安装：所有组件 `Current="" && Target!=""` → `DecisionInstall` → 全部执行
 > - 纳管场景：`manage` 组件先探测版本填充 `Current`，后续组件根据 `Current` 与 `Target` 的比较结果决定
-> - 如果某个组件在全新安装时不需要执行，应该在 ReleaseImage 的 install.components 中就不包含它
+> - 组件可以包含在 ReleaseImage 的 install.components 中，但在执行时通过 `condition`（Go Template 表达式，根据集群运行时状态判断）或 `NodeFilter`（节点级过滤器）进行过滤跳过
 
 ## 7. 安装 DAG 执行设计
 
