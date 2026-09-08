@@ -4177,6 +4177,191 @@ func (e *EnsureDeleteOrReset) NeedExecute(_ *bkev1beta1.BKECluster, new *bkev1be
 
 > **设计优势**：将 Legacy `EnsureDeleteOrReset` 从单体 Phase 拆解为卸载 DAG 的 inline 组件，管理集群清理逻辑作为 DAG 的依赖终点执行，确保目标集群组件先卸载、管理集群资源后清理，执行顺序由 DAG 拓扑保证而非硬编码。
 
+#### EnsureDeleteOrReset 原样注册为 inline 组件（最小迁移方案）
+
+上述"完整逆序 DAG"方案和"EnsureDeleteOrReset 注册为 inline 组件"方案都对 `EnsureDeleteOrReset` 进行了拆解改造。本方案是**最小改动迁移方案**——`EnsureDeleteOrReset` 的 `reconcileDelete` 全部逻辑保持不变，直接注册为 inline 组件，DAG 仅含一个节点。
+
+**设计思路**：
+
+```txt
+最小迁移方案 DAG 拓扑 (单节点):
+
+  Batch 1: [delete-cluster-resources]  ← 唯一节点, 复用 EnsureDeleteOrReset 全部逻辑
+             → handleClusterDeletion (删除 CAPI Cluster, 级联删除 Machine)
+             → handleBKEMachineDeletion (等待 BKEMachine 删除)
+             → deleteRelatedResources (删除 Secret/Command)
+             → ShutDownAgent (SSH 关闭 bkeagent)
+             → cleanupClusterResources (删除 BKENode/Event/finalizer)
+             → handleNamespaceDeletion (删除命名空间)
+
+  ★ 与 Legacy DeletePhases 行为完全一致
+  ★ 仅执行入口从 PhaseFlow 切换到 DAG (executeUninstallDAG)
+  ★ EnsureDeleteOrReset.Execute() / reconcileDelete() 代码零改动
+```
+
+**与现有两个方案的区别**：
+
+| 维度 | 方案 A: 完整逆序 DAG | 方案 B: 拆解为 inline 组件 | 方案 C: 原样注册 ★ |
+|------|---------------------|--------------------------|-------------------|
+| DAG 节点数 | 全部组件 (8+ 节点) | 全部组件 + delete-cluster-resources (9 节点) | 仅 1 个节点 |
+| EnsureDeleteOrReset 改造 | 裁剪为仅管理集群清理 | 裁剪为仅管理集群清理 | **零改动** |
+| 目标集群组件卸载 | 逐组件 Uninstall (yaml/helm/binary/inline) | 逐组件 Uninstall + 管理集群清理 | 不卸载 (依赖 CAPI 级联, 同 Legacy) |
+| helm 卸载 | ✅ helm uninstall | ✅ helm uninstall | ❌ (同 Legacy, 不卸载) |
+| binary 卸载 | ✅ SSH UninstallScript | ✅ SSH UninstallScript | ❌ (同 Legacy, 仅 ShutdownAgent) |
+| 与 Legacy 行为一致性 | ❌ 增强 (新增卸载) | ❌ 增强 (新增卸载) | ✅ **完全一致** |
+| 迁移风险 | 高 (新增 Uninstall 逻辑) | 高 (拆解 + 新增 Uninstall) | **低** (零代码改动) |
+| 适用阶段 | Phase 4 (全量 DAG) | Phase 4 (全量 DAG) | **Phase 2-3 (灰度迁移)** |
+
+**适用场景**：Phase 2-3 灰度阶段，删除场景最先迁移到 DAG 路径（风险最低），通过 Feature Gate 切换执行入口。Phase 4 再升级为完整逆序 DAG（方案 A/B），实现组件级卸载。
+
+**ReleaseImage 声明**：
+
+```yaml
+# ReleaseImage install.components 新增 delete-cluster-resources 组件
+install:
+  components:
+    - name: delete-cluster-resources
+      version: v1.0.0
+      inline:
+        handler: EnsureDeleteOrReset
+        version: v1.0.0
+```
+
+**ComponentVersion 定义**：
+
+```yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: delete-cluster-resources-v1.0.0
+spec:
+  name: delete-cluster-resources
+  type: inline
+  version: "v1.0.0"
+  inline:
+    handler: EnsureDeleteOrReset
+    version: "v1.0.0"
+  # ★ 仅删除/重置场景执行 (KEP-18 Condition 过滤)
+  condition: '{{ eq .Operation "rollback" }}'
+  dependencies: []  # 无依赖, DAG 唯一节点
+```
+
+**DeclarativeInstallCatalog 注册**：
+
+```go
+// DeclarativeInstallCatalog 新增
+{ Name: "delete-cluster-resources", Mode: ExecutionInline,
+  InlineHandler: "EnsureDeleteOrReset", LegacyPhase: "EnsureDeleteOrReset" },
+```
+
+**handler 注册**：
+
+```go
+// pkg/componentfactory/registry.go — registerInlineHandler 新增
+case "EnsureDeleteOrReset":
+    f.Register(handler, version, phases.NewEnsureDeleteOrReset)
+```
+
+**EnsureDeleteOrReset 零改动**：
+
+```go
+// pkg/phaseframe/phases/ensure_delete_or_reset.go — 现有代码, 不修改
+
+func (e *EnsureDeleteOrReset) Execute() (ctrl.Result, error) {
+    baseCtx := context.Background()
+    _, c, bkeCluster, _, log := e.Ctx.Untie()
+
+    // 1. 如果集群暂停, 先恢复并清除所有 Command (现有逻辑, 不变)
+    if e.Ctx.BKECluster.Spec.Pause { ... }
+
+    // 2. 轮询执行 reconcileDelete (超时 60 分钟) (现有逻辑, 不变)
+    err := wait.PollImmediateUntil(..., func() (bool, error) {
+        return e.reconcileDelete(ctx) == nil, nil
+    }, ctx.Done())
+}
+
+func (e *EnsureDeleteOrReset) reconcileDelete(ctx context.Context) error {
+    // ★ 全部逻辑保持不变:
+    e.ensureClusterStatusDeleting(...)   // 设置 ClusterStatus = ClusterDeleting
+    e.handleClusterDeletion(...)         // 删除 CAPI Cluster (级联删除 Machine)
+    e.handleBKEMachineDeletion(...)      // 等待 BKEMachine 删除完成
+    e.deleteRelatedResources(...)        // 删除 Secret/Command
+    e.ShutDownAgent(ctx)                 // SSH 关闭 bkeagent
+    e.cleanupClusterResources(...)       // 删除 BKENode/Event/finalizer
+    e.handleNamespaceDeletion(...)       // 删除命名空间
+}
+
+// NeedExecute — 现有代码, 不修改
+// (Condition '{{ eq .Operation "rollback" }}' 已在 Scheduler 层过滤,
+//  此处 NeedExecute 作为第二层守卫, 检查 DeletionTimestamp / Spec.Reset)
+func (e *EnsureDeleteOrReset) NeedExecute(_ *bkev1beta1.BKECluster, new *bkev1beta1.BKECluster) bool {
+    if !new.DeletionTimestamp.IsZero() || new.Spec.Reset {
+        e.SetStatus(bkev1beta1.PhaseWaiting)
+        return true
+    }
+    return false
+}
+```
+
+**executeUninstallDAG 实现（单节点 DAG）**：
+
+```go
+// controllers/capbke/bkecluster_controller.go — 删除/重置场景入口 (最小迁移方案)
+
+func (r *BKEClusterReconciler) executeUninstallDAG(
+    ctx context.Context,
+    phaseCtx *phaseframe.PhaseContext,
+    oldCluster, newCluster *bkev1beta1.BKECluster,
+) error {
+    // 1. 解析当前版本 ReleaseImage bundle
+    bundle, err := r.resolveCurrentReleaseBundle(ctx, newCluster)
+
+    // 2. 构建卸载 DAG (仅 delete-cluster-resources 一个节点)
+    //    ★ 与方案 A/B 不同: 不构建逆序 DAG, 不含目标集群组件卸载节点
+    //    ★ DAG 仅含 delete-cluster-resources, EnsureDeleteOrReset 内部复用 reconcileDelete 全部逻辑
+    dag, err := upgrade.BuildInstallDAGFromBundle(bundle, upgrade.BundleDependencyResolver(bundle))
+
+    // 3. 构建 ComponentFactory (注册 EnsureDeleteOrReset handler)
+    factory := componentfactory.NewFactoryFromBundle(bundle)
+    factory.RegisterInstallHandlers() // 含 EnsureDeleteOrReset
+
+    // 4. 构建 Scheduler
+    sched := dagexec.NewScheduler(dagexec.SchedulerConfig{
+        InlineRunner:    NewInlinePhaseRunnerAdapter(phaseCtx, &PhaseRunner{Factory: factory}),
+        ManifestStore:   manifest.NewBundleStore(bundle),
+        CVStore:         manifest.NewBundleStore(bundle),
+        MaxParallelPerBatch: 1, // 单节点, 无需并行
+    })
+
+    // 5. 构建 ExecutionContext
+    execCtx := buildExecutionContext(phaseCtx, oldCluster, newCluster, bkeLogger, nil)
+    execCtx.TemplateContext.Operation = "rollback" // ★ 供 Condition 求值
+
+    // 6. 执行 DAG (单节点)
+    //    Batch 1: delete-cluster-resources (Condition 求值 true)
+    //      → EnsureDeleteOrReset.Execute()
+    //      → reconcileDelete() 全部逻辑 (与 Legacy 完全一致)
+    return sched.ExecuteDAG(ctx, execCtx, dag)
+}
+```
+
+**与 Legacy DeletePhases 的能力一致性验证**：
+
+| `reconcileDelete` 步骤 | Legacy DeletePhases | 方案 C: DAG inline 组件 | 一致性 |
+|------------------------|--------------------|-----------------------|--------|
+| `ensureClusterStatusDeleting` | ✅ 在 `reconcileDelete` 中 | ✅ 在 `reconcileDelete` 中 (零改动) | ✅ 一致 |
+| `handleClusterDeletion` | ✅ 删除 CAPI Cluster | ✅ 同上 | ✅ 一致 |
+| `handleBKEMachineDeletion` | ✅ 等待 BKEMachine 删除 | ✅ 同上 | ✅ 一致 |
+| `deleteRelatedResources` | ✅ 删除 Secret/Command | ✅ 同上 | ✅ 一致 |
+| `ShutDownAgent` | ✅ SSH 关闭 bkeagent | ✅ 同上 | ✅ 一致 |
+| `cleanupClusterResources` | ✅ 删除 BKENode/Event/finalizer | ✅ 同上 | ✅ 一致 |
+| `handleNamespaceDeletion` | ✅ 删除命名空间 | ✅ 同上 | ✅ 一致 |
+| 暂停恢复 (Spec.Pause) | ✅ Execute() 入口检查 | ✅ 同上 (零改动) | ✅ 一致 |
+| 超时重试 (60 分钟轮询) | ✅ `wait.PollImmediateUntil` | ✅ 同上 | ✅ 一致 |
+| 触发条件 | `DeletionTimestamp` / `Spec.Reset` | `Condition` + `NeedExecute(DeletionTimestamp)` | ✅ 一致 (双守卫) |
+
+> **设计优势**：零代码改动，`EnsureDeleteOrReset` 的 `reconcileDelete` 全部逻辑原样复用。迁移仅涉及执行入口切换（PhaseFlow → DAG），行为与 Legacy 完全一致，风险最低。适合 Phase 2-3 灰度阶段先行迁移删除场景，Phase 4 再升级为完整逆序 DAG（方案 A/B）。
+
 ### 10.5 DryRun 模式 DAG 化
 
 #### 设计思路
