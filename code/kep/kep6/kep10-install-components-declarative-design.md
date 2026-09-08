@@ -6,7 +6,51 @@
 | **标题** | ReleaseImage 安装组件声明式定义与 DAG 驱动安装流程设计 |
 | **状态** | `provisional` |
 | **类型** | Feature |
-| **依赖** | KEP-5 声明式升级框架、KEP-6 三层状态机设计、KEP-9 Static Pod 类型设计 |
+| **依赖** | KEP-5 声明式升级框架、KEP-6 三层状态机设计、KEP-9 Static Pod 类型设计、KEP-16 二进制组件设计 |
+| **关联 KEP** | KEP-17 (Selector 组件)、KEP-18 (Condition 过滤)、KEP-19 (节点过滤) |
+
+---
+
+## 目录
+
+1. [摘要](#1-摘要)
+2. [动机](#2-动机)
+3. [范围与约束](#3-范围与约束)
+4. [ReleaseImageComponent 结构统一抽象](#4-releaseimagecomponent-结构统一抽象)
+5. [安装组件目录设计](#5-安装组件目录设计)
+6. [安装 DAG 构建设计](#6-安装-dag-构建设计)
+7. [安装 DAG 执行设计](#7-安装-dag-执行设计)
+   - 7.1 设计思路
+   - 7.2 执行入口（三路分发 + Legacy PhaseFlow 路径设计）
+   - 7.3 executeInstallDAG 实现
+   - 7.4 安装 DAG 结构
+8. [部署 Phase 与安装组件映射](#8-部署-phase-与安装组件映射)
+9. [Feature Gate 与迁移策略](#9-feature-gate-与迁移策略)
+   - 9.1 Feature Gate 设计
+   - 9.2 迁移阶段
+   - 9.3 向后兼容
+   - 9.4 平滑升级方案
+10. [Legacy PhaseFlow 完全移除方案](#10-legacy-phaseflow-完全移除方案)
+    - 10.1 场景覆盖总览
+    - 10.2 纳管已有集群 DAG 化
+    - 10.3 集群扩容 DAG 化
+    - 10.4 集群删除/重置 DAG 化
+    - 10.5 DryRun 模式 DAG 化
+    - 10.6 集群暂停 DAG 化
+    - 10.7 移除后的执行入口
+11. [可观测性](#11-可观测性)
+12. [工作量评估](#12-工作量评估)
+13. [风险与缓解措施](#13-风险与缓解措施)
+14. [releasemanifest.Bundle 的作用](#14-releasemanifestbundle-的作用)
+15. [ComponentVersion 执行时条件过滤](#15-componentversion-执行时条件过滤)
+- [附录](#附录)
+
+> **文档结构说明**：
+> - §1-6: 设计基础（动机、范围、结构定义、目录设计、DAG 构建）
+> - §7-8: 执行设计（DAG 执行入口、安装实现、Phase 映射）
+> - §9: 迁移策略（Feature Gate、向后兼容、平滑升级）— 包含 Legacy PhaseFlow 路径设计（§7.2.3-7.2.7 引用此处）
+> - §10: Legacy PhaseFlow 完全移除方案（纳管/扩容/删除/DryRun/暂停 DAG 化）
+> - §11-15: 辅助内容（可观测性、工作量、风险、Bundle、条件过滤引用）
 
 ---
 
@@ -1206,6 +1250,8 @@ func (r *BKEClusterReconciler) cleanupStaleDeclarativeUpgradeStatus(bkeCluster *
 
 #### 7.2.3 Legacy PhaseFlow 路径设计
 
+> **位置说明**：以下内容描述 Legacy PhaseFlow 作为 DAG 路径的兜底方案。Legacy PhaseFlow 的完全移除方案见 [§10](#10-legacy-phaseflow-完全移除方案)，Feature Gate 与迁移策略见 [§9](#9-feature-gate-与迁移策略)。
+
 Legacy PhaseFlow 是 DAG 路径的兜底方案，覆盖所有 DAG 路径不适用的场景。PhaseFlow 通过 `CalculatePhase()` 动态计算需要执行的 Phase 列表。
 
 ##### Phase 列表定义
@@ -2247,7 +2293,11 @@ var (
 3. **混合模式**：ReleaseImage 可同时包含有 `inline` 和无 `inline` 的安装组件
 4. **ClusterVersionReconciler**：安装时设置 `cvo.openfuyao.cn/install-ready` annotation 触发 DAG 路径
 
+> **Legacy PhaseFlow 路径设计**：Legacy PhaseFlow 的详细路径设计（Phase 列表定义、各场景的 Phase 执行列表、执行判断逻辑、状态上报逻辑、版本来源、共存设计、适用场景）见 [§7.2.3-7.2.7](#723-legacy-phaseflow-路径设计)。
+
 ### 9.4 平滑升级方案
+
+> **关联章节**：以下平滑升级方案描述迁移阶段和风险控制。Legacy PhaseFlow 各场景的完整 DAG 化设计方案见 [§10](#10-legacy-phaseflow-完全移除方案)。
 
 Legacy PhaseFlow 的完全移除不能一蹴而就，需要分阶段平滑过渡，确保生产环境零中断。
 
@@ -2448,6 +2498,8 @@ func (r *BKEClusterReconciler) executePartialInstallDAG(...) {
 
 
 ## 10. Legacy PhaseFlow 完全移除方案
+
+> **关联章节**：平滑升级的迁移阶段和风险控制见 [§9.4](#94-平滑升级方案)。Legacy PhaseFlow 路径设计（Phase 列表、场景执行列表）见 [§7.2.3-7.2.7](#723-legacy-phaseflow-路径设计)。
 
 当迁移到 Phase 4 时，需要完全移除 Legacy PhaseFlow 路径。以下针对 7.1 节中列出的每个 Legacy 场景，给出 DAG 化的完整方案。
 
@@ -5001,7 +5053,9 @@ func (s *BundleStore) GetComponentVersion(ctx, name, version string) (*apiv1.Com
 
 ComponentVersion 新增 `Condition` 字段（Go Template 表达式），在 DAG 执行时根据集群运行时状态（Operation/ScaleType/NodeCount 等）决定组件是否执行。该机制复用已有 `TemplateContext` 作为模板数据（扩展新增 Operation/ScaleType 等字段），作为 Scheduler 跳过链的第三层检查（位于版本检查之后、执行器分发之前），与 KEP-17 Selector 互补——Selector 在构建时选择子组件，Condition 在执行时过滤组件。
 
-完整设计见 [KEP-18](kep18-component-condition-filter-design.md)。
+节点级过滤（`ComponentVersion.Spec.NodeFilter`，按角色/标签/幂等过滤目标节点）见 [KEP-19: ComponentVersion 节点过滤设计](kep19-component-node-filter-design.md)。
+
+完整设计见 [KEP-18](kep18-component-condition-filter-design.md) 和 [KEP-19](kep19-component-node-filter-design.md)。
 
 ---
 
@@ -5012,9 +5066,11 @@ ComponentVersion 新增 `Condition` 字段（Go Template 表达式），在 DAG 
 1. [KEP-5 声明式升级框架](kep5/kep5.md)
 2. [KEP-6 三层状态机设计](kep6-state-machine-v4.md)
 3. [KEP-9 Static Pod 类型设计](kep9-staticpod-upgrade-framework.md)
-4. [KEP-17 Selector 组件类型设计](kep17-selector-component-design.md)
-5. [KEP-18 ComponentVersion 执行时条件过滤](kep18-component-condition-filter-design.md)
-6. [声明式集群版本升级方案-支持二进制与 Helm 组件](声明式集群版本升级方案-支持二进制与 Helm 组件.md)
+4. [KEP-16 二进制组件设计](kep16-binary-component-design.md)
+5. [KEP-17 Selector 组件类型设计](kep17-selector-component-design.md)
+6. [KEP-18 ComponentVersion 执行时条件过滤](kep18-component-condition-filter-design.md)
+7. [KEP-19 ComponentVersion 节点过滤设计](kep19-component-node-filter-design.md)
+8. [声明式集群版本升级方案-支持二进制与 Helm 组件](声明式集群版本升级方案-支持二进制与 Helm 组件.md)
 
 ### B. 术语表
 
