@@ -934,8 +934,8 @@ func registerInstallHandlers() {
 │      → Current 有值 (来自 currentBundle 或 Status)                              │
 │      → Target 有值 (来自 targetBundle)                                           │
 │      → Decide: current != target → DecisionUpgrade                              │
-│    BuildUpgradeDAGFromBundle(bundle, resolver)                                  │
-│      → 遍历 upgrade.components 构建 DAG                                          │
+│    BuildDAGFromBundle(bundle, resolver)                                          │
+│      → 遍历 upgrade.components 构建 DAG (调用 topology.BuildDAG)                │
 │                                                                                 │
 │  安装 DAG构建 (新增):                                                           │
 │    BuildVersionContextForInstall(targetBundle)                                   │
@@ -943,11 +943,11 @@ func registerInstallHandlers() {
 │      → Target 有值 (来自 install.components)                                    │
 │      → Decide: current="" + target!="" → DecisionInstall ★                      │
 │    BuildInstallDAGFromBundle(bundle, resolver)                                   │
-│      → 遍历 install.components 构建 DAG (复用 BuildUpgradeDAG 逻辑)             │
+│      → 遍历 install.components 构建 DAG (复用 topology.BuildDAG 逻辑)          │
 │      → 使用统一的 ReleaseImageComponent 类型 (无需转换)                          │
 │                                                                                 │
 │  复用点:                                                                         │
-│  ① BuildUpgradeDAG — 拓扑排序 + 依赖解析逻辑完全复用                            │
+│  ① topology.BuildDAG — 拓扑排序 + 依赖解析逻辑完全复用 (原 BuildUpgradeDAG)   │
 │  ② Scheduler.ExecuteDAG — 并行执行 + 状态更新逻辑完全复用                        │
 │  ③ ExecutorRegistry — inline/yaml 执行器分发逻辑完全复用                        │
 │  ④ ComponentFactory — handler 注册和解析逻辑完全复用                            │
@@ -1029,13 +1029,61 @@ func BuildInstallDAGFromBundle(
         return nil, err
     }
     
-    // 2. 直接使用统一的 ReleaseImageComponent 类型构建 DAG
-    //    topology.BuildUpgradeDAG 已重构为接受 []apiv1.ReleaseImageComponent
+    // 2. 复用 topology.BuildDAG 构建组件 DAG
+    //    ★ topology.BuildUpgradeDAG 重命名为 topology.BuildDAG (通用名称)
+    //    ★ 不再区分 "Upgrade DAG" 和 "Install DAG" — 同一构建逻辑, 不同组件来源
     //    ★ 直接构建所有 install.components 的 DAG，不需要排除任何组件
     //    ★ 组件的跳过逻辑由执行时的 VersionContext.Decide() 与组件的 condition/NodeFilter 决定
-    return topology.BuildUpgradeDAG(installComponents, resolve)
+    return topology.BuildDAG(installComponents, resolve)
 }
 ```
+
+**`topology.BuildUpgradeDAG` 重命名为 `topology.BuildDAG`**：
+
+现有代码中 `topology.BuildUpgradeDAG`（`pkg/topology/build.go:25`）名为 "Upgrade"，但实际上是一个通用的 DAG 构建器——只接收组件列表和依赖解析器，不感知操作类型（安装/升级）。安装 DAG 和升级 DAG 使用相同的构建逻辑，仅组件来源不同（`install.components` vs `upgrade.components`）。重命名为通用名称消除歧义：
+
+```go
+// pkg/topology/build.go — 重命名
+
+// BuildDAG builds a component DAG from ReleaseImage components.
+// Used by both install and upgrade paths — the DAG topology is the same,
+// only the component source differs (install.components vs upgrade.components).
+//
+// 重命名自 BuildUpgradeDAG: 原名称暗示仅用于升级, 实际是通用 DAG 构建器
+func BuildDAG(components []cvv1alpha1.ReleaseImageUpgradeComponent, resolve DependencyResolver) (*UpgradeDAG, error) {
+    // ... 现有逻辑不变 ...
+}
+```
+
+**重命名影响范围**：
+
+| 调用方 | 原调用 | 重命名后 | 文件 |
+|--------|--------|---------|------|
+| `upgrade.BuildDAGFromBundle` | `topology.BuildUpgradeDAG(...)` | `topology.BuildDAG(...)` | `pkg/upgrade/bundle.go:29` |
+| `upgrade.BuildInstallDAGFromBundle` (新增) | `topology.BuildUpgradeDAG(...)` | `topology.BuildDAG(...)` | `pkg/upgrade/bundle.go` (新增) |
+| `upgrade.BuildDAGFromReleaseImage` | `topology.BuildUpgradeDAG(...)` | `topology.BuildDAG(...)` | `pkg/upgrade/releaseimage.go:30` |
+| `dagexec.SchedulerSkipTest` | `topology.BuildUpgradeDAG(...)` | `topology.BuildDAG(...)` | `pkg/dagexec/scheduler_skip_test.go:68` |
+| `topology.BuildUpgradeDAGTest` | `BuildUpgradeDAG(...)` | `BuildDAG(...)` | `pkg/topology/build_test.go:21,49` |
+
+**`UpgradeDAG` 类型保持不变**：
+
+```go
+// pkg/topology/component.go — 类型名不变
+// UpgradeDAG 是组件依赖图, 名称中的 "Upgrade" 保留:
+// - 类型名是数据结构标识, 不是操作类型标识
+// - 重命名类型影响面过大 (DeepCopy/接口/所有引用)
+// - DAG 数据结构与操作类型正交: 同一 DAG 结构可用于安装/升级/卸载
+type UpgradeDAG struct {
+    graph *Graph
+    nodes map[string]*ComponentNode
+}
+```
+
+**设计原则**：
+1. **函数名通用化**：`BuildUpgradeDAG` → `BuildDAG`，消除"仅用于升级"的歧义
+2. **类型名保留**：`UpgradeDAG` 类型名不变，避免大规模重命名
+3. **组件来源区分**：`BuildDAGFromBundle`（upgrade.components）和 `BuildInstallDAGFromBundle`（install.components）各自提取不同组件列表，复用同一 `BuildDAG` 构建
+4. **DAG 结构与操作类型正交**：DAG 拓扑结构（节点+依赖边）不区分安装/升级，操作语义由 `VersionContext`（Current/Target）和 `Operation`（TemplateContext）在执行时决定
 
 > **组件过滤职责分离**：DAG 构建器负责构建完整的组件拓扑图，不关心哪些组件需要执行。组件的跳过/执行决策由 DAG 执行器 (`Scheduler.ExecuteDAG`) 在运行时通过两层判断完成：
 >
@@ -5118,7 +5166,9 @@ ComponentVersion 新增 `Condition` 字段（Go Template 表达式），在 DAG 
 |------|------|
 | **ReleaseImageComponent** | ReleaseImage 中组件引用（安装和升级共用），包含 `inline` handler |
 | **DeclarativeInstallCatalog** | 安装组件目录，映射组件名到执行模式（inline/manifest） |
-| **BuildInstallDAGFromBundle** | 从 ReleaseImage bundle 构建安装 DAG |
+| **topology.BuildDAG** | 通用 DAG 构建器（原 `BuildUpgradeDAG`），安装和升级共用，仅组件来源不同 |
+| **BuildDAGFromBundle** | 从 upgrade.components 提取组件并调用 `topology.BuildDAG` 构建 DAG |
+| **BuildInstallDAGFromBundle** | 从 install.components 提取组件并调用 `topology.BuildDAG` 构建 DAG |
 | **DecisionInstall** | VersionContext 决策：current 为空且 target 有值时触发安装 |
 | **DeclarativeInstallEnabled** | Feature Gate，控制 DAG 安装路径是否启用 |
 | **install-ready annotation** | `cvo.openfuyao.cn/install-ready`，触发 DAG 安装路径 |
