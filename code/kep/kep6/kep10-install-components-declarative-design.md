@@ -4316,10 +4316,10 @@ func (r *BKEClusterReconciler) executeUninstallDAG(
     // 1. 解析当前版本 ReleaseImage bundle
     bundle, err := r.resolveCurrentReleaseBundle(ctx, newCluster)
 
-    // 2. 构建卸载 DAG (仅 delete-cluster-resources 一个节点)
-    //    ★ 与方案 A/B 不同: 不构建逆序 DAG, 不含目标集群组件卸载节点
-    //    ★ DAG 仅含 delete-cluster-resources, EnsureDeleteOrReset 内部复用 reconcileDelete 全部逻辑
-    dag, err := upgrade.BuildInstallDAGFromBundle(bundle, upgrade.BundleDependencyResolver(bundle))
+    // 2. 构建单节点 DAG (仅 delete-cluster-resources)
+    //    ★ 不使用 BuildInstallDAGFromBundle (会包含全部安装组件)
+    //    ★ 仅构建 delete-cluster-resources 一个节点, EnsureDeleteOrReset 内部复用 reconcileDelete 全部逻辑
+    dag, err := upgrade.BuildSingleComponentDAG(bundle, "delete-cluster-resources")
 
     // 3. 构建 ComponentFactory (注册 EnsureDeleteOrReset handler)
     factory := componentfactory.NewFactoryFromBundle(bundle)
@@ -4344,6 +4344,59 @@ func (r *BKEClusterReconciler) executeUninstallDAG(
     return sched.ExecuteDAG(ctx, execCtx, dag)
 }
 ```
+
+**`BuildSingleComponentDAG` 实现**：
+
+```go
+// pkg/upgrade/bundle.go — 构建仅含指定组件的单节点 DAG
+
+// BuildSingleComponentDAG 从 bundle 中提取指定组件, 构建仅含该组件的单节点 DAG
+// 用于最小迁移方案: 删除/重置场景仅需 delete-cluster-resources 一个节点
+func BuildSingleComponentDAG(
+    bundle *releasemanifest.Bundle,
+    componentName string,
+) (*topology.UpgradeDAG, error) {
+    if bundle == nil {
+        return nil, fmt.Errorf("release bundle is nil")
+    }
+
+    // 1. 从 install.components 中查找指定组件
+    var target *cvv1alpha1.ReleaseImageInstallComponent
+    if bundle.Release.Spec.Install != nil {
+        for _, comp := range bundle.Release.Spec.Install.Components {
+            if comp.Name == componentName {
+                c := comp
+                target = &c
+                break
+            }
+        }
+    }
+    if target == nil {
+        return nil, fmt.Errorf("component %q not found in install.components", componentName)
+    }
+
+    // 2. 构建单节点 DAG (无依赖边)
+    dag := topology.NewUpgradeDAG()
+    node := &topology.ComponentNode{
+        Name:          target.Name,
+        Version:       target.Version,
+        FailurePolicy: topology.FailurePolicyFailFast,
+    }
+    if target.Inline != nil {
+        node.Inline = &topology.InlineRef{
+            Handler: target.Inline.Handler,
+            Version: target.Inline.Version,
+        }
+    }
+    if err := dag.AddNode(node); err != nil {
+        return nil, err
+    }
+
+    return dag, nil
+}
+```
+
+> **为什么不复用 `BuildInstallDAGFromBundle`**：`BuildInstallDAGFromBundle` 会构建包含全部 install.components 的 DAG（bkeagent → nodes-env → certs → ... → agent-switch）。方案 C 的 DAG 只需要 `delete-cluster-resources` 一个节点，其他安装组件在删除场景不应执行。通过 `BuildSingleComponentDAG` 精确构建单节点 DAG，避免其他组件被 Scheduler 调度执行。
 
 **与 Legacy DeletePhases 的能力一致性验证**：
 
