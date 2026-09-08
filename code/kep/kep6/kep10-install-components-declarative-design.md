@@ -546,7 +546,7 @@ var DeclarativeUpgradeCatalog = []UpgradeComponentSpec{
 │      (无 inline → manifest 模式)                                                │
 │                                                                                 │
 │           │                                                                     │
-│           ▼ BuildUpgradeDAGFromBundle(bundle, resolver)                         │
+│           ▼ BuildDAGFromBundle(bundle, resolver) (调用 topology.BuildDAG)        │
 │                                                                                 │
 │  遍历 ReleaseImage.upgrade.components:                                          │
 │    for _, comp := range bundle.Release.Spec.Upgrade.Components {               │
@@ -600,7 +600,7 @@ var DeclarativeUpgradeCatalog = []UpgradeComponentSpec{
 
 | 消费者 | 用途 | 代码位置 |
 |--------|------|---------|
-| `BuildUpgradeDAGFromBundle()` | 构建 DAG 时查找组件的执行模式和 inline handler | `pkg/topology/build.go` |
+| `BuildDAGFromBundle()` / `BuildInstallDAGFromBundle()` | 构建 DAG 时查找组件的执行模式和 inline handler | `pkg/upgrade/bundle.go` / `pkg/topology/build.go` |
 | `InlineUpgradeHandlers()` | 返回所有 inline handler 名称列表，供 ComponentFactory 注册 | `pkg/upgrade/catalog.go:125` |
 | `Scheduler.executeComponent()` | 根据 Catalog 的 Mode 选择 inline/manifest 执行器 | `pkg/dagexec/scheduler.go` |
 | `PhaseFlow.CalculatePhase()` | 旧路径中用 `LegacyPhase` 字段判断是否跳过 legacy Phase | `pkg/phaseframe/phases/phase_flow.go` |
@@ -947,7 +947,7 @@ func registerInstallHandlers() {
 │      → 使用统一的 ReleaseImageComponent 类型 (无需转换)                          │
 │                                                                                 │
 │  复用点:                                                                         │
-│  ① topology.BuildDAG — 拓扑排序 + 依赖解析逻辑完全复用 (原 BuildUpgradeDAG)   │
+│  ① topology.BuildDAG — 拓扑排序 + 依赖解析逻辑完全复用 (原 BuildUpgradeDAG, type alias) │
 │  ② Scheduler.ExecuteDAG — 并行执行 + 状态更新逻辑完全复用                        │
 │  ③ ExecutorRegistry — inline/yaml 执行器分发逻辑完全复用                        │
 │  ④ ComponentFactory — handler 注册和解析逻辑完全复用                            │
@@ -1030,7 +1030,8 @@ func BuildInstallDAGFromBundle(
     }
     
     // 2. 复用 topology.BuildDAG 构建组件 DAG
-    //    ★ topology.BuildUpgradeDAG 重命名为 topology.BuildDAG (通用名称)
+    //    ★ topology.BuildUpgradeDAG 通过 type alias 重命名为 topology.BuildDAG (通用名称)
+    //    ★ topology.UpgradeDAG 通过 type alias 重命名为 topology.ComponentDAG (通用名称)
     //    ★ 不再区分 "Upgrade DAG" 和 "Install DAG" — 同一构建逻辑, 不同组件来源
     //    ★ 直接构建所有 install.components 的 DAG，不需要排除任何组件
     //    ★ 组件的跳过逻辑由执行时的 VersionContext.Decide() 与组件的 condition/NodeFilter 决定
@@ -1038,9 +1039,9 @@ func BuildInstallDAGFromBundle(
 }
 ```
 
-**`topology.BuildUpgradeDAG` 重命名为 `topology.BuildDAG`（type alias 兼容）**：
+**`UpgradeDAG` → `ComponentDAG` 和 `BuildUpgradeDAG` → `BuildDAG`（type alias 兼容）**：
 
-现有代码中 `topology.BuildUpgradeDAG`（`pkg/topology/build.go:25`）名为 "Upgrade"，但实际上是一个通用的 DAG 构建器——只接收组件列表和依赖解析器，不感知操作类型（安装/升级）。安装 DAG 和升级 DAG 使用相同的构建逻辑，仅组件来源不同（`install.components` vs `upgrade.components`）。
+现有代码中 `topology.UpgradeDAG`（`pkg/topology/component.go:45`）和 `topology.BuildUpgradeDAG`（`pkg/topology/build.go:25`）名为 "Upgrade"，但实际上是通用的 DAG 类型和构建器——只接收组件列表和依赖解析器，不感知操作类型（安装/升级）。安装 DAG 和升级 DAG 使用相同的构建逻辑，仅组件来源不同（`install.components` vs `upgrade.components`）。
 
 通过 **Go type alias** 实现零破坏重命名——新代码使用通用名称，现有代码无需修改：
 
@@ -5127,7 +5128,7 @@ func (s *BundleStore) GetComponentVersion(ctx, name, version string) (*apiv1.Com
 | 消费者 | 读取字段 | 用途 | 代码位置 |
 |--------|---------|------|---------|
 | `BuildVersionContextForUpgrade` | `Release.Spec.Install/Upgrade.Components` | 填充 VersionContext.Target/Current | `pkg/upgrade/build_release.go` |
-| `BuildDAGFromBundle` | `Release.Spec.Upgrade.Components` | 构建 DAG 组件列表 | `pkg/upgrade/bundle.go` |
+| `BuildDAGFromBundle` / `BuildInstallDAGFromBundle` | `Release.Spec.Upgrade/Install.Components` | 构建 DAG 组件列表 (均调用 `topology.BuildDAG`) | `pkg/upgrade/bundle.go` |
 | `BundleDependencyResolver` | `Components[key].Spec.Dependencies` | 解析 DAG 依赖边 | `pkg/upgrade/bundle.go` |
 | `enrichUpgradeComponent` | `Components[key].Spec.Inline` | 补充 inline handler 信息 | `pkg/upgrade/bundle.go` |
 | `BundleStore.GetComponentManifests` | `Components` + `Files` | 获取 YAML 清单字节 | `pkg/manifest/bundle_store.go` |
@@ -5181,7 +5182,8 @@ ComponentVersion 新增 `Condition` 字段（Go Template 表达式），在 DAG 
 |------|------|
 | **ReleaseImageComponent** | ReleaseImage 中组件引用（安装和升级共用），包含 `inline` handler |
 | **DeclarativeInstallCatalog** | 安装组件目录，映射组件名到执行模式（inline/manifest） |
-| **topology.BuildDAG** | 通用 DAG 构建器（原 `BuildUpgradeDAG`），安装和升级共用，仅组件来源不同 |
+| **topology.BuildDAG** | 通用 DAG 构建器（原 `BuildUpgradeDAG`，type alias 兼容），安装和升级共用，仅组件来源不同 |
+| **topology.ComponentDAG** | 通用 DAG 类型（原 `UpgradeDAG`，type alias 兼容），安装和升级共用 |
 | **BuildDAGFromBundle** | 从 upgrade.components 提取组件并调用 `topology.BuildDAG` 构建 DAG |
 | **BuildInstallDAGFromBundle** | 从 install.components 提取组件并调用 `topology.BuildDAG` 构建 DAG |
 | **DecisionInstall** | VersionContext 决策：current 为空且 target 有值时触发安装 |
