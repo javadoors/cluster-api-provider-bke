@@ -41,18 +41,34 @@ type ComponentNode struct {
 	Dependencies  []string
 }
 
-// UpgradeDAG is the upgrade dependency graph with component metadata.
+// UpgradeDAG is the component dependency graph with component metadata.
+// Used by install, upgrade, and uninstall paths — the DAG topology is the same,
+// only the component source differs.
+//
+// ComponentDAG is a type alias for backward compatibility.
+// New code should use ComponentDAG; existing code using UpgradeDAG continues to work.
 type UpgradeDAG struct {
 	graph *Graph
 	nodes map[string]*ComponentNode
 }
 
-// NewUpgradeDAG creates an empty upgrade DAG.
+// ComponentDAG is the preferred name for UpgradeDAG.
+// It is a type alias — identical type, not a new type.
+// All methods on UpgradeDAG are available on ComponentDAG.
+type ComponentDAG = UpgradeDAG
+
+// NewUpgradeDAG creates an empty component DAG.
 func NewUpgradeDAG() *UpgradeDAG {
 	return &UpgradeDAG{
 		graph: NewGraph(),
 		nodes: make(map[string]*ComponentNode),
 	}
+}
+
+// NewComponentDAG creates an empty component DAG.
+// Alias of NewUpgradeDAG for new code; existing code can continue using NewUpgradeDAG.
+func NewComponentDAG() *ComponentDAG {
+	return NewUpgradeDAG()
 }
 
 // AddNode registers a component node.

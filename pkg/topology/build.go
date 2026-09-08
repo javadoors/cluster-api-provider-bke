@@ -21,16 +21,18 @@ import (
 // DependencyResolver returns prerequisite component names for a dependent.
 type DependencyResolver func(componentName, version string) ([]string, error)
 
-// BuildUpgradeDAG builds an upgrade DAG from ReleaseImage upgrade components.
+// BuildUpgradeDAG builds a component DAG from ReleaseImage components.
+// Used by both upgrade and install paths — the DAG topology is the same,
+// only the component source differs (upgrade.components vs install.components).
 func BuildUpgradeDAG(components []cvv1alpha1.ReleaseImageUpgradeComponent, resolve DependencyResolver) (*UpgradeDAG, error) {
 	if len(components) == 0 {
-		return nil, fmt.Errorf("no upgrade components in release image")
+		return nil, fmt.Errorf("no components in release image")
 	}
 
 	dag := NewUpgradeDAG()
 	for _, comp := range components {
 		if comp.Name == "" {
-			return nil, fmt.Errorf("upgrade component with empty name")
+			return nil, fmt.Errorf("component with empty name")
 		}
 		node := &ComponentNode{
 			Name:          comp.Name,
@@ -58,7 +60,7 @@ func BuildUpgradeDAG(components []cvv1alpha1.ReleaseImageUpgradeComponent, resol
 				continue
 			}
 			if _, ok := dag.GetNode(dep); !ok {
-				return nil, fmt.Errorf("component %q depends on %q which is not in the upgrade list", comp.Name, dep)
+				return nil, fmt.Errorf("component %q depends on %q which is not in the component list", comp.Name, dep)
 			}
 			if err := dag.AddDependency(dep, comp.Name); err != nil {
 				return nil, err
@@ -67,9 +69,16 @@ func BuildUpgradeDAG(components []cvv1alpha1.ReleaseImageUpgradeComponent, resol
 	}
 
 	if _, err := dag.TopologicalBatches(); err != nil {
-		return nil, fmt.Errorf("invalid upgrade DAG: %w", err)
+		return nil, fmt.Errorf("invalid DAG: %w", err)
 	}
 	return dag, nil
+}
+
+// BuildDAG builds a component DAG from ReleaseImage components.
+// Alias of BuildUpgradeDAG — preferred name for new code.
+// Existing code can continue using BuildUpgradeDAG.
+func BuildDAG(components []cvv1alpha1.ReleaseImageUpgradeComponent, resolve DependencyResolver) (*UpgradeDAG, error) {
+	return BuildUpgradeDAG(components, resolve)
 }
 
 func resolveDependencies(name, version string, resolve DependencyResolver) ([]string, error) {
