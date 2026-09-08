@@ -39,9 +39,25 @@
     - 10.6 集群暂停 DAG 化
     - 10.7 移除后的执行入口
 11. [可观测性](#11-可观测性)
+    - 11.1 安装状态追踪
+    - 11.2 事件与指标
 12. [工作量评估](#12-工作量评估)
+    - 12.1 开发工作量
+    - 12.2 测试工作量
+    - 12.3 文档工作量
+    - 12.4 总工作量汇总
 13. [风险与缓解措施](#13-风险与缓解措施)
+    - 13.1 技术风险
+    - 13.2 平滑升级风险
+    - 13.3 业务风险
 14. [releasemanifest.Bundle 的作用](#14-releasemanifestbundle-的作用)
+    - 14.1 是什么
+    - 14.2 作用
+    - 14.3 与 ReleaseImage CR 的关系
+    - 14.4 三级缓存生命周期
+    - 14.5 BundleStore 适配器 — Bundle 到执行层的桥梁
+    - 14.6 Bundle 的消费者汇总
+    - 14.7 命名注意事项
 15. [ComponentVersion 执行时条件过滤](#15-componentversion-执行时条件过滤)
 - [附录](#附录)
 
@@ -4595,7 +4611,7 @@ func (r *BKEClusterReconciler) reconcileCluster(
 
 ## 11. 可观测性
 
-### 11.1
+### 11.1 安装状态追踪
 
 ```bash
 # 查询安装 DAG 执行进度
@@ -4617,7 +4633,7 @@ kubectl get bkecluster my-cluster -o jsonpath='{.status.clusterComponentStatuses
 # }
 ```
 
-### 11.2
+### 11.2 事件与指标
 
 | 类型 | 来源 | 说明 |
 |------|------|------|
@@ -4628,7 +4644,7 @@ kubectl get bkecluster my-cluster -o jsonpath='{.status.clusterComponentStatuses
 
 ## 12. 工作量评估
 
-### 12.1
+### 12.1 开发工作量
 
 | 阶段 | 模块 | 任务 | 工作量（人天） |
 |------|------|------|---------------|
@@ -4669,7 +4685,7 @@ kubectl get bkecluster my-cluster -o jsonpath='{.status.clusterComponentStatuses
 | **Phase 4 小计** | | | **25** |
 | **开发总计** | | | **88** |
 
-### 12.2
+### 12.2 测试工作量
 
 | 阶段 | 测试内容 | 工作量（人天） |
 |------|---------|---------------|
@@ -4679,7 +4695,7 @@ kubectl get bkecluster my-cluster -o jsonpath='{.status.clusterComponentStatuses
 | **Phase 4** | 全场景 E2E（安装/升级/扩容/纳管/删除/DryRun/暂停）+ 回归 + 性能对比 | 9 |
 | **测试总计** | | **29** |
 
-### 12.3
+### 12.3 文档工作量
 
 | 文档类型 | 文档内容 | 工作量（人天） |
 |---------|---------|---------------|
@@ -4689,7 +4705,7 @@ kubectl get bkecluster my-cluster -o jsonpath='{.status.clusterComponentStatuses
 | **故障排查** | DAG 安装故障排查指南 | 1 |
 | **小计** | - | **7 人天** |
 
-### 12.4
+### 12.4 总工作量汇总
 
 | 阶段 | 开发（人天） | 测试（人天） | 小计 |
 |------|------------|------------|------|
@@ -4721,7 +4737,7 @@ kubectl get bkecluster my-cluster -o jsonpath='{.status.clusterComponentStatuses
 
 ## 13. 风险与缓解措施
 
-### 13.1
+### 13.1 技术风险
 
 | 风险 | 影响 | 概率 | 缓解措施 |
 |------|------|------|---------|
@@ -4733,7 +4749,7 @@ kubectl get bkecluster my-cluster -o jsonpath='{.status.clusterComponentStatuses
 | **混合模式状态冲突** | PhaseStatus 与 DeclarativeUpgradeStatus 同时写入 | 中 | 状态清理逻辑，执行前清理对方状态 |
 | **CommonPhades 依赖 PhaseFlow** | Finalizer/Paused 等 Phase 嵌入 PhaseFlow | 中 | Phase 4 单独处理 CommonPhases 迁移 |
 
-### 13.2
+### 13.2 平滑升级风险
 
 | 风险 | 影响 | 概率 | 缓解措施 |
 |------|------|------|---------|
@@ -4742,7 +4758,7 @@ kubectl get bkecluster my-cluster -o jsonpath='{.status.clusterComponentStatuses
 | **Phase 4 无回退** | 移除 PhaseFlow 后发现问题无法回退 | 高 | Phase 3 充分验证 + 灰度周期足够长 |
 | **灰度范围扩大过快** | 生产环境问题未充分暴露 | 中 | 每个灰度阶段观察 1-2 周 |
 
-### 13.3
+### 13.3 业务风险
 
 | 风险 | 影响 | 概率 | 缓解措施 |
 |------|------|------|---------|
@@ -4754,7 +4770,7 @@ kubectl get bkecluster my-cluster -o jsonpath='{.status.clusterComponentStatuses
 
 ## 14. releasemanifest.Bundle 的作用
 
-### 14.1
+### 14.1 是什么
 
 `releasemanifest.Bundle` 是 ReleaseImage OCI 制品的**内存解析表示**，是连接声明层 (ReleaseImage CR) 与执行层 (DAG/Scheduler/Phase) 的核心桥梁。
 
@@ -4785,7 +4801,7 @@ type Bundle struct {
 }
 ```
 
-### 14.2
+### 14.2 作用
 
 Bundle 是声明式安装/升级流程中**所有执行决策的数据来源**：
 
@@ -4800,7 +4816,7 @@ Bundle 是声明式安装/升级流程中**所有执行决策的数据来源**�
 | **ReleaseImage Status 回填** | `Components` (数量和版本) | `ReleaseImageReconciler.componentStatuses` | 回写 ReleaseImage.Status.Components |
 | **镜像 tag 来源** | `Release.Spec.Upgrade.Components[kubernetes-master].Version` | `EnsureMasterUpgrade` → Command CR → BKEAgent | 提供 manifest image tag 版本 (去 v 前缀) |
 
-### 14.3
+### 14.3 与 ReleaseImage CR 的关系
 
 ```txt
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -4858,7 +4874,7 @@ Bundle 是声明式安装/升级流程中**所有执行决策的数据来源**�
 
 > **关键设计**：`ResolveRelease` **从不拉取 OCI** — BKEClusterReconciler 只从内存/磁盘缓存读取，避免 reconcile 时网络阻塞。OCI 拉取仅由 ReleaseImageReconciler 在验证时执行。
 
-### 14.4
+### 14.4 三级缓存生命周期
 
 ```txt
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -4927,7 +4943,7 @@ Bundle 是声明式安装/升级流程中**所有执行决策的数据来源**�
 
 **缓存键** (`CacheKey()`)：优先 `sanitizeKey(Digest)` → `sanitizeKey(Version)` → `sha256(OCIRef)`。Digest 变更时旧缓存被孤立 (ReleaseImage 删除时 EvictRelease 清理)。
 
-### 14.5
+### 14.5 BundleStore 适配器 — Bundle 到执行层的桥梁
 
 Bundle 不直接被 Scheduler 消费，而是通过 `manifest.BundleStore` 适配器转换为执行层所需接口：
 
@@ -5019,7 +5035,7 @@ func (s *BundleStore) GetComponentVersion(ctx, name, version string) (*apiv1.Com
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 14.6
+### 14.6 Bundle 的消费者汇总
 
 | 消费者 | 读取字段 | 用途 | 代码位置 |
 |--------|---------|------|---------|
@@ -5034,7 +5050,7 @@ func (s *BundleStore) GetComponentVersion(ctx, name, version string) (*apiv1.Com
 | `ReleaseImageReconciler.componentStatuses` | `Components` | 回填 ReleaseImage.Status | `controllers/releaseimage/releaseimage_controller.go` |
 | `CollectComponentManifests` | `Files` + `Components` | 收集组件 manifest 清单 | `pkg/release/manifest/component_files.go` |
 
-### 14.7
+### 14.7 命名注意事项
 
 代码库中存在**两个不同的 "Store" 类型**，容易混淆：
 
