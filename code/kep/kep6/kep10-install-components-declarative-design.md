@@ -4214,14 +4214,7 @@ DryRun 是指仅模拟执行，不实际修改集群。DAG 化后 DryRun 照常�
 type ExecutionContext struct {
     // ... 现有字段 ...
     DryRun       bool   // 🆕新增: DryRun 模式标记
-    UninstallMode bool  // 🆕新增: 卸载模式标记 (§9.4.4)
-}
-
-// DryRunOption 函数式选项
-func WithDryRun() func(*ExecutionContext) {
-    return func(ec *ExecutionContext) {
-        ec.DryRun = true
-    }
+    UninstallMode bool  // 🆕新增: 卸载模式标记 (§10.4)
 }
 ```
 
@@ -4255,15 +4248,25 @@ func (s *Scheduler) executeComponent(
 ```go
 // controllers/capbke/bkecluster_controller.go — DryRun 场景入口
 
+// executeDryRunDAG 与 executeInstallDAG 逻辑相同，仅设置 DryRun 标记
+// ★ executeInstallDAG 不需要新增 DryRun 参数，DryRun 标记在 ExecutionContext 上设置
 func (r *BKEClusterReconciler) executeDryRunDAG(
     ctx context.Context,
     phaseCtx *phaseframe.PhaseContext,
     oldCluster, newCluster *bkev1beta1.BKECluster,
 ) error {
-    // 与正常安装 DAG 相同，仅设置 DryRun 标记
-    return r.executeInstallDAG(ctx, phaseCtx, oldCluster, newCluster,
-        dagexec.WithDryRun(),
-    )
+    // 1-6. 与 executeInstallDAG 完全相同 (解析 bundle / 构建 VC / 构建 DAG / 注册 handler / 构建 Scheduler)
+    // ...
+
+    // 7. 构建 ExecutionContext
+    execCtx := buildExecutionContext(phaseCtx, oldCluster, newCluster, bkeLogger, targetClient)
+    execCtx.TemplateContext.Operation = "install"
+
+    // ★ 唯一区别: 设置 DryRun 标记
+    execCtx.DryRun = true
+
+    // 8. 执行 DAG — 各执行器检查 DryRun 标记后仅打印不执行
+    return sched.ExecuteDAG(ctx, execCtx, dag)
 }
 ```
 
@@ -4347,7 +4350,7 @@ func (r *BKEClusterReconciler) reconcileCluster(
 
     // 3. DryRun → 安装 DAG (仅打印不执行)
     case isDryRun(newCluster):
-        return ctrl.Result{}, r.executeInstallDAG(ctx, phaseCtx, oldCluster, newCluster, WithDryRun())
+        return ctrl.Result{}, r.executeDryRunDAG(ctx, phaseCtx, oldCluster, newCluster)
 
     // 4. 扩容 → 安装 DAG (VersionContext 自动过滤已有节点)
     case isScale(oldCluster, newCluster):
