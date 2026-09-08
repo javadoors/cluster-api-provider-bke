@@ -15,16 +15,37 @@
 
 1. [摘要](#1-摘要)
 2. [动机](#2-动机)
+   - 2.1 现状问题
+   - 2.2 安装 vs 升级能力对比
+   - 2.3 设计目标
 3. [范围与约束](#3-范围与约束)
+   - 3.1 范围
+   - 3.2 约束
+   - 3.3 非目标
 4. [ReleaseImageComponent 结构统一抽象](#4-releaseimagecomponent-结构统一抽象)
+   - 4.1 设计思路
+   - 4.2 当前结构（不对称）
+   - 4.3 目标结构（两层统一抽象）
+   - 4.4 ReleaseImage YAML 示例（完整安装 + 升级）
 5. [安装组件目录设计](#5-安装组件目录设计)
+   - 5.1 DeclarativeUpgradeCatalog 的作用（现有升级组件目录）
+   - 5.2 DeclarativeInstallCatalog
+   - 5.3 安装组件与升级组件目录对比
+   - 5.4 ComponentFactory 注册扩展
 6. [安装 DAG 构建设计](#6-安装-dag-构建设计)
+   - 6.1 设计思路
+   - 6.2 VersionContext 扩展
+   - 6.3 安装 DAG 构建器
+   - 6.4 安装 VersionContext 构建
 7. [安装 DAG 执行设计](#7-安装-dag-执行设计)
    - 7.1 设计思路
    - 7.2 执行入口（三路分发 + Legacy PhaseFlow 路径设计）
    - 7.3 executeInstallDAG 实现
    - 7.4 安装 DAG 结构
 8. [部署 Phase 与安装组件映射](#8-部署-phase-与安装组件映射)
+   - 8.1 设计思路
+   - 8.2 DeployPhases → 安装组件映射
+   - 8.3 安装 vs 升级组件差异
 9. [Feature Gate 与迁移策略](#9-feature-gate-与迁移策略)
    - 9.1 Feature Gate 设计
    - 9.2 迁移阶段
@@ -4661,7 +4682,9 @@ kubectl get bkecluster my-cluster -o jsonpath='{.status.clusterComponentStatuses
 | | CommonPhases 兼容 | 确保 Finalizer/Paused/ClusterManage 等通用 Phase 与 DAG 共存 | 2 |
 | | 安装中断恢复 | 部分组件安装失败后的断点续传 + DeclarativeUpgradeStatus 状态恢复 | 2 |
 | | BKEAgent 命令适配 | 安装 handler 与现有 BKEAgent Command/ENV 命令机制集成验证 | 2 |
-| **Phase 1 小计** | | | **30** |
+| | TemplateContext 扩展 (KEP-18) | 新增 Operation/ScaleType/NodeCount 等字段 + `buildTemplateContext` 扩展 | 2 |
+| | EvaluateCondition 实现 (KEP-18) | Go Template 求值 + `shouldExecuteByCondition` Scheduler 集成 | 2 |
+| **Phase 1 小计** | | | **36** |
 | **Phase 2: 灰度迁移** | 混合执行模式 | `executePartialInstallDAG` + `WithSkipPhases` PhaseFlow 扩展 | 4 |
 | | 状态追踪兼容 | PhaseStatus ↔ DeclarativeUpgradeStatus 状态清理 + 互不冲突 | 3 |
 | | 低风险组件迁移 | bkeagent/nodes-env/certs/load-balance 迁移 + NeedExecute 适配 | 3 |
@@ -4675,33 +4698,34 @@ kubectl get bkecluster my-cluster -o jsonpath='{.status.clusterComponentStatuses
 | | 暂停检查迁移 | `shouldUseDeclarativeInstall` 增加暂停检查 | 1 |
 | | CommonPhases DAG 化 | Finalizer/Paused 等通用 Phase 迁移或保留决策 + 实现 | 3 |
 | **Phase 3 小计** | | | **18** |
-| **Phase 4: Legacy 移除** | 纳管 DAG 化 | `manage` 组件 + `BuildVersionContextForManage` + 从运行集群探测版本 | 5 |
-| | 扩容 DAG 化 | `EnsureMasterInit` 幂等完善 + VersionContext 节点级过滤 | 3 |
-| | 删除/重置 DAG 化 | `BuildUninstallDAGFromBundle` + 逆序依赖解析 + 卸载脚本 | 6 |
+| **Phase 4: Legacy 移除** | 纳管 DAG 化 (§10.2) | `manage` 组件 + Condition 过滤 + 从运行集群探测版本 | 5 |
+| | 扩容 DAG 化 (§10.3) | `executeScaleDAG` + `fillCurrentFromExistingNodes` + 三层机制 (VersionContext+Condition+StateCode) | 4 |
+| | 删除/重置 DAG 化 (§10.4) | `executeUninstallDAG` + 逆序依赖解析 + helm/binary Uninstall + EnsureDeleteOrReset inline 组件 | 8 |
+| | NodeFilterSpec (KEP-19) | `NodeFilter` 接口 + `BKENodeFilter` 实现 + `NodeComponentStatuses` 状态模型 | 6 |
 | | 执行入口重写 | `reconcileCluster` 场景分发 + 无 PhaseFlow 回退 | 3 |
 | | PhaseFlow 代码清理 | 移除 `DeployPhases` / `PhaseFlow` / `PhaseStatus` + 依赖分析 + 安全删除 | 5 |
 | | Feature Gate 移除 | 移除 `DeclarativeInstallEnabled` + 清理条件判断 | 1 |
 | | 回退预案 | Phase 3 充分验证清单 + 无法回退的风险评估 + 手动恢复方案 | 2 |
-| **Phase 4 小计** | | | **25** |
-| **开发总计** | | | **88** |
+| **Phase 4 小计** | | | **34** |
+| **开发总计** | | | **103** |
 
 ### 12.2 测试工作量
 
 | 阶段 | 测试内容 | 工作量（人天） |
 |------|---------|---------------|
-| **Phase 1** | DAG 构建 + VersionContext 单元测试 + 全新安装集成测试 + PhaseFlow 回归 | 8 |
+| **Phase 1** | DAG 构建 + VersionContext 单元测试 + 全新安装集成测试 + PhaseFlow 回归 + Condition 求值单元测试 | 9 |
 | **Phase 2** | 混合模式执行 + 状态正确性 + Feature Gate 回退验证 | 5 |
 | **Phase 3** | 全量 DAG 安装 + 升级流程 + DryRun 验证 | 7 |
-| **Phase 4** | 全场景 E2E（安装/升级/扩容/纳管/删除/DryRun/暂停）+ 回归 + 性能对比 | 9 |
-| **测试总计** | | **29** |
+| **Phase 4** | 全场景 E2E（安装/升级/扩容/纳管/删除/DryRun/暂停）+ 回归 + 性能对比 + NodeFilter 集成测试 | 11 |
+| **测试总计** | | **32** |
 
 ### 12.3 文档工作量
 
 | 文档类型 | 文档内容 | 工作量（人天） |
 |---------|---------|---------------|
-| **设计文档** | 本 KEP 文档完善 | 2 |
+| **设计文档** | 本 KEP 文档完善 + KEP-18 (Condition) + KEP-19 (NodeFilter) | 3 |
 | **升级指南** | PhaseFlow → DAG 迁移指南 | 2 |
-| **运维手册** | DAG 安装路径运维手册 | 2 |
+| **运维手册** | DAG 安装路径运维手册 | 1 |
 | **故障排查** | DAG 安装故障排查指南 | 1 |
 | **小计** | - | **7 人天** |
 
@@ -4709,25 +4733,25 @@ kubectl get bkecluster my-cluster -o jsonpath='{.status.clusterComponentStatuses
 
 | 阶段 | 开发（人天） | 测试（人天） | 小计 |
 |------|------------|------------|------|
-| **Phase 1: 结构扩展** | 30 | 8 | 38 |
+| **Phase 1: 结构扩展** | 36 | 9 | 45 |
 | **Phase 2: 灰度迁移** | 15 | 5 | 20 |
 | **Phase 3: 全量 DAG** | 18 | 7 | 25 |
-| **Phase 4: Legacy 移除** | 25 | 9 | 34 |
+| **Phase 4: Legacy 移除** | 34 | 11 | 45 |
 | **文档** | - | - | 7 |
-| **总计** | **88** | **29** | **124** |
+| **总计** | **103** | **32** | **142** |
 
-> 开发占比 71%，测试占比 23%，文档占比 6%。
+> 开发占比 73%，测试占比 23%，文档占比 5%。
 
 **按 openFuyao 版本节奏估算**：
 
 | openFuyao 版本 | 阶段 | 工作量（人天） | 说明 |
 |---------------|------|---------------|------|
-| **v2.7.0** | Phase 1: 结构扩展 | 38 | CRD 扩展 + 目录定义 + DAG 构建器 |
+| **v2.7.0** | Phase 1: 结构扩展 | 45 | CRD 扩展 + 目录定义 + DAG 构建器 + Condition 过滤 |
 | **v2.8.0** | Phase 2: 灰度迁移 | 20 | 低风险组件 DAG 化 + 混合模式 |
 | **v2.9.0** | Phase 3: 全量 DAG | 25 | 高风险组件 DAG 化 + 全量验证 |
-| **v3.0.0** | Phase 4: Legacy 移除 | 34 | 纳管/扩容/删除 DAG 化 + 代码清理 |
+| **v3.0.0** | Phase 4: Legacy 移除 | 45 | 纳管/扩容/删除 DAG 化 + NodeFilter + 代码清理 |
 | **文档** | 全程 | 7 | 分阶段交付 |
-| **总计** | - | **124** | 4 个版本周期 |
+| **总计** | - | **142** | 4 个版本周期 |
 
 **按人员配置估算**（单阶段）：
 - Phase 1（38 人天）：2 人约 4 周，3 人约 2.5 周
