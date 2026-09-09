@@ -1123,21 +1123,26 @@ func BuildDAG(components []cvv1alpha1.ReleaseImageUpgradeComponent, resolve Depe
 >
 > 即使 `Decide()` 返回 `DecisionInstall`/`DecisionUpgrade`，组件仍可能被跳过，取决于：
 >
-> | 判断机制 | 说明 | 示例 |
-> |---------|------|------|
-> | **Condition** | 组件声明的前置条件，不满足时跳过 | `kubernetes-master` 的 `Condition: HasMasterNodes` — 无 Master 节点时跳过 |
-> | **NodeFilter** | 节点级过滤器，决定组件在哪些节点上执行 | `EnsureNodesEnv` 的 `NodeFilter: AllNodes` — 所有节点执行 |
-> | | | `EnsureMasterInit` 的 `NodeFilter: MasterNodesOnly` — 仅 Master 节点执行 |
-> | | | `EnsureWorkerJoin` 的 `NodeFilter: NewWorkerNodes` — 仅新增 Worker 节点执行 |
+> | 判断机制 | 数据来源 | 说明 | 示例 |
+> |---------|---------|------|------|
+> | **Condition** | `ComponentVersion.Spec.Condition` (Go Template 表达式) | 组件级条件，不满足时整个组件跳过 | `kubernetes-master` 的 `Condition: '{{ eq .ScaleType "master" }}'` — Worker 扩容时跳过 |
+> | **NodeFilter** | `ComponentVersion.Spec.NodeFilter` (声明式: Roles/MatchLabels/SkipCompleted) | 节点级过滤，决定组件在哪些节点上执行 | `etcd` 的 `NodeFilter.Roles: ["etcd"]` — 仅 etcd 节点执行 |
+> | | | | `kubernetes-master` 的 `NodeFilter.Roles: ["master"]` — 仅 Master 节点执行 |
+> | | | | `nvidia-driver` 的 `NodeFilter.MatchLabels: {"gpu":"true"}` — 仅 GPU 节点执行 |
+>
+> > **NodeFilter 是 `ComponentVersion.Spec.NodeFilter`（KEP-19），不是 Phase 内部的 `filterNodes()` 实现**。NodeFilter 是声明式字段（Roles/MatchLabels/SkipCompleted），由 `BKENodeFilter` 在 Executor 层消费；Phase 内部的 `filterNodes()` + StateCode 是 Legacy 路径的节点过滤机制，两者不同：
+> > - **NodeFilter (KEP-19)**：`ComponentVersion.Spec.NodeFilter` 声明式字段 → `BKENodeFilter.Filter()` 消费 → Executor 层过滤
+> > - **filterNodes (Legacy)**：`phaseutil.filterNodes()` + `NodePredicate` → Phase `Execute()` 内部过滤
+> > - DAG 路径中 NodeFilter 生效；Legacy PhaseFlow 路径中 filterNodes 生效
 >
 > **执行流程**：
 > ```text
 > Scheduler.ExecuteDAG():
 >   for each component in DAG:
->     1. Decide(vc, name) → DecisionSkip? → 跳过该组件
->     2. 检查 component.Condition → 不满足? → 跳过该组件
->     3. 检查 component.NodeFilter → 当前节点不在过滤范围? → 跳过该节点
->     4. 执行组件
+>     1. Decide(vc, name) → DecisionSkip? → 跳过该组件 (第一层)
+>     2. shouldExecuteByCondition(cv.Spec.Condition, tmpl) → false? → 跳过该组件 (第二层: Condition)
+>     3. executeComponent → Executor 内部 NodeFilter.Filter(cv.Spec.NodeFilter) → 过滤目标节点 (第二层: NodeFilter)
+>     4. 执行组件 (仅对过滤后的节点)
 > ```
 >
 > **不同场景下的 Decide() 结果**：
