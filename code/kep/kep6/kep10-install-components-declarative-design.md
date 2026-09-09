@@ -1208,8 +1208,12 @@ func BuildVersionContextForInstall(
 │    原因: 渐进迁移，默认关闭确保生产稳定                                          │
 │    效果: 关闭时所有安装走 Legacy PhaseFlow                                       │
 │                                                                                 │
-│  门控 2 — 全新安装判定 (Status.Phase 为空或 Init):                               │
+│  门控 2 — 全新安装判定 (BKECluster.Status.Phase 为空或 Init):                     │
 │    原因: DAG 安装路径仅面向全新安装，扩容/纳管/删除等场景不适用                  │
+│    Status.Phase 是 BKECluster CR 的 Status 子资源字段:                           │
+│      空 = 未初始化 (全新创建)                                                    │
+│      PhaseInit = 初始化中                                                       │
+│      其他值 = 已部署/升级中/删除中等 (不走安装 DAG)                              │
 │    效果: 仅全新安装可走 DAG，扩容仍走 PhaseFlow Scale Phase                      │
 │                                                                                 │
 │  门控 3 — install-ready annotation:                                              │
@@ -1713,7 +1717,9 @@ func (r *BKEClusterReconciler) shouldUseDeclarativeInstall(bkeCluster *bkev1beta
     if !featuregate.DeclarativeInstallEnabled.Enabled() {
         return false
     }
-    // 仅在全新安装时启用（Status.Phase 为空或 Init）
+    // 仅在全新安装时启用（BKECluster.Status.Phase 为空或 Init）
+    // BKECluster.Status.Phase: 空=未初始化(全新创建), PhaseInit=初始化中,
+    //   其他值=已部署/升级中/删除中等 (非全新安装，不走安装 DAG)
     if bkeCluster.Status.Phase != "" && bkeCluster.Status.Phase != bkev1beta1.PhaseInit {
         return false
     }
