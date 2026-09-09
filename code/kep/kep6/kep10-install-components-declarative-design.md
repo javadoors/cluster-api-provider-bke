@@ -80,6 +80,13 @@
     - 14.6 Bundle 的消费者汇总
     - 14.7 命名注意事项
 15. [ComponentVersion 执行时条件过滤](#15-componentversion-执行时条件过滤)
+16. [ReleaseImageUpgradeComponent.Inline 字段移除设计](#16-releaseimageupgradecomponentinline-字段移除设计)
+    - 16.1 设计动机
+    - 16.2 现状分析
+    - 16.3 移除方案
+    - 16.4 影响范围
+    - 16.5 向后兼容性
+    - 16.6 与设计原则的一致性
 - [附录](#附录)
 
 > **文档结构说明**：
@@ -87,7 +94,7 @@
 > - §7-8: 执行设计（DAG 执行入口、安装实现、Phase 映射）
 > - §9: 迁移策略（Feature Gate、向后兼容、平滑升级）— 包含 Legacy PhaseFlow 路径设计（§7.2.3-7.2.6 引用此处）
 > - §10: Legacy PhaseFlow 完全移除方案（纳管/扩容/删除/DryRun/暂停 DAG 化）
-> - §11-15: 辅助内容（可观测性、工作量、风险、Bundle、条件过滤引用）
+> - §11-16: 辅助内容（可观测性、工作量、风险、Bundle、条件过滤引用、Inline 字段移除）
 
 ---
 
@@ -221,7 +228,7 @@ type ReleaseImageUpgradeComponent struct {
 
 经过分析，ReleaseImage 的类型定义存在两层重复：
 
-**第一层重复**：`ReleaseImageInstallComponent` 和 `ReleaseImageUpgradeComponent` 字段完全相同
+**第一层重复**：`ReleaseImageInstallComponent` 和 `ReleaseImageUpgradeComponent` 字段完全相同（移除 `ReleaseImageUpgradeComponent.Inline` 后，见 [§16](#16-releaseimageupgradecomponentinline-字段移除设计)）
 **第二层重复**：`ReleaseImageInstallSpec` 和 `ReleaseImageUpgradeSpec` 字段完全相同
 
 可以通过**两层统一抽象**消除所有重复：
@@ -4800,7 +4807,8 @@ kubectl get bkecluster my-cluster -o jsonpath='{.status.clusterComponentStatuses
 | | BKEAgent 命令适配 | 安装 handler 与现有 BKEAgent Command/ENV 命令机制集成验证 | 2 |
 | | TemplateContext 扩展 (KEP-18) | 新增 Operation/ScaleType/NodeCount 等字段 + `buildTemplateContext` 扩展 | 2 |
 | | EvaluateCondition 实现 (KEP-18) | Go Template 求值 + `shouldExecuteByCondition` Scheduler 集成 | 2 |
-| **Phase 1 小计** | | | **34** |
+| | Inline 字段移除 (§16) | `BuildDAG` 签名重构 + `ComponentVersionLookup` + 删除 `enrichUpgradeComponent` + 删除 `ReleaseImageUpgradeInline` | 3 |
+| **Phase 1 小计** | | | **37** |
 | **Phase 2: 灰度迁移** | 混合执行模式 | `executePartialInstallDAG` + `WithSkipPhases` PhaseFlow 扩展 | 4 |
 | | 状态追踪兼容 | PhaseStatus ↔ DeclarativeUpgradeStatus 状态清理 + 互不冲突 | 3 |
 | | 低风险组件迁移 | bkeagent/nodes-env/certs/load-balance 迁移 + NeedExecute 适配 | 3 |
@@ -4823,7 +4831,7 @@ kubectl get bkecluster my-cluster -o jsonpath='{.status.clusterComponentStatuses
 | | Feature Gate 移除 | 移除 `DeclarativeInstallEnabled` + 清理条件判断 | 1 |
 | | 回退预案 | Phase 3 充分验证清单 + 无法回退的风险评估 + 手动恢复方案 | 2 |
 | **Phase 4 小计** | | | **34** |
-| **开发总计** | | | **103** |
+| **开发总计** | | | **106** |
 
 ### 12.2 测试工作量
 
@@ -4849,25 +4857,25 @@ kubectl get bkecluster my-cluster -o jsonpath='{.status.clusterComponentStatuses
 
 | 阶段 | 开发（人天） | 测试（人天） | 小计 |
 |------|------------|------------|------|
-| **Phase 1: 结构扩展** | 36 | 9 | 45 |
+| **Phase 1: 结构扩展** | 37 | 9 | 46 |
 | **Phase 2: 灰度迁移** | 15 | 5 | 20 |
 | **Phase 3: 全量 DAG** | 18 | 7 | 25 |
 | **Phase 4: Legacy 移除** | 34 | 11 | 45 |
 | **文档** | - | - | 7 |
-| **总计** | **103** | **32** | **142** |
+| **总计** | **106** | **32** | **145** |
 
-> 开发占比 73%，测试占比 23%，文档占比 5%。
+> 开发占比 73%，测试占比 22%，文档占比 5%。
 
 **按 openFuyao 版本节奏估算**：
 
 | openFuyao 版本 | 阶段 | 工作量（人天） | 说明 |
 |---------------|------|---------------|------|
-| **v2.7.0** | Phase 1: 结构扩展 | 45 | CRD 扩展 + 目录定义 + DAG 构建器 + Condition 过滤 |
+| **v2.7.0** | Phase 1: 结构扩展 | 46 | CRD 扩展 + 目录定义 + DAG 构建器 + Condition 过滤 + Inline 移除 |
 | **v2.8.0** | Phase 2: 灰度迁移 | 20 | 低风险组件 DAG 化 + 混合模式 |
 | **v2.9.0** | Phase 3: 全量 DAG | 25 | 高风险组件 DAG 化 + 全量验证 |
 | **v3.0.0** | Phase 4: Legacy 移除 | 45 | 纳管/扩容/删除 DAG 化 + NodeFilter + 代码清理 |
 | **文档** | 全程 | 7 | 分阶段交付 |
-| **总计** | - | **142** | 4 个版本周期 |
+| **总计** | - | **145** | 4 个版本周期 |
 
 **按人员配置估算**（单阶段）：
 - Phase 1（38 人天）：2 人约 4 周，3 人约 2.5 周
@@ -5155,8 +5163,8 @@ func (s *BundleStore) GetComponentVersion(ctx, name, version string) (*apiv1.Com
 │        GetComponentVersion(ctx, name, version)                                  │
 │        → 从 bundle.Components[key] 返回 *ComponentVersion                       │
 │        → Scheduler 读取 cv.Spec.Type 决定执行器                                 │
-│        → Scheduler 读取 cv.Spec.Inline.Handler 解析 Phase                       │
-│        消费者: Scheduler.executeComponent                                        │
+│        → BuildDAG 通过 ComponentVersionLookup 读取 cv.Spec.Inline (§16)         │
+│        消费者: Scheduler.executeComponent / topology.BuildDAG                   │                                        │
 │                                                                                 │
 │           │                                                                     │
 │           │ dagexec.NewScheduler(Config{                                         │
@@ -5169,7 +5177,7 @@ func (s *BundleStore) GetComponentVersion(ctx, name, version string) (*apiv1.Com
 │  Scheduler.ExecuteDAG                                                           │
 │    对每个组件:                                                                   │
 │    1. CVStore.GetComponentVersion → cv.Spec.Type → 选择执行器                   │
-│    2. inline → InlineRunner.Execute(handler)                                    │
+│    2. inline → cv.Spec.Inline → InlineRunner.Execute(handler) (§16 重构)       │
 │       manifest → ManifestStore.GetComponentManifests → Applier.ApplyComponent   │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
@@ -5182,7 +5190,8 @@ func (s *BundleStore) GetComponentVersion(ctx, name, version string) (*apiv1.Com
 | `BuildVersionContextForUpgrade` | `Release.Spec.Install/Upgrade.Components` | 填充 VersionContext.Target/Current | `pkg/upgrade/build_release.go` |
 | `BuildDAGFromBundle` / `BuildInstallDAGFromBundle` | `Release.Spec.Upgrade/Install.Components` | 构建 DAG 组件列表 (均调用 `topology.BuildDAG`) | `pkg/upgrade/bundle.go` |
 | `BundleDependencyResolver` | `Components[key].Spec.Dependencies` | 解析 DAG 依赖边 | `pkg/upgrade/bundle.go` |
-| `enrichUpgradeComponent` | `Components[key].Spec.Inline` | 补充 inline handler 信息 | `pkg/upgrade/bundle.go` |
+| `enrichUpgradeComponent` | ~~`Components[key].Spec.Inline`~~ | ~~补充 inline handler 信息~~ (§16 移除) | `pkg/upgrade/bundle.go` |
+| `topology.BuildDAG` | `Components[key].Spec.Inline` (通过 `ComponentVersionLookup`) | 读取 inline handler 构建 `ComponentNode.Inline` (§16 重构) | `pkg/topology/build.go` |
 | `BundleStore.GetComponentManifests` | `Components` + `Files` | 获取 YAML 清单字节 | `pkg/manifest/bundle_store.go` |
 | `BundleStore.GetComponentVersion` | `Components` | 获取组件类型和 handler | `pkg/manifest/bundle_store.go` |
 | `componentfactory.NewFactoryFromBundle` | `Components` + `Release` | 注册 inline Phase 构造函数 | `pkg/componentfactory/bundle_registry.go` |
@@ -5215,6 +5224,314 @@ ComponentVersion 新增 `Condition` 字段（Go Template 表达式），在 DAG 
 
 ---
 
+## 16. ReleaseImageUpgradeComponent.Inline 字段移除设计
+
+### 16.1 设计动机
+
+`ReleaseImageUpgradeComponent.Inline`（`api/v1alpha1/releaseimage_types.go:65`）与 `ComponentVersion.Spec.Inline`（`api/v1alpha1/componentversion_types.go:36`）数据完全冗余——两者形状相同（`{Handler, Version}`），且 `enrichUpgradeComponent`（`pkg/upgrade/bundle.go:93`）只是将 `ComponentVersion.Spec.Inline` 复制到 `ReleaseImageUpgradeComponent.Inline`。
+
+**违背设计原则**：§2.3（KEP-18）已确立"组件定义性字段统一存储在 `ComponentVersion.Spec`，`ReleaseImageUpgradeComponent` 保持轻量引用角色"。Inline handler 属于组件定义性字段，应存储在 `ComponentVersion.Spec.Inline`，不应在 `ReleaseImageUpgradeComponent` 上冗余。
+
+### 16.2 现状分析
+
+**数据流**：
+
+```
+component.yaml → ComponentVersion.Spec.Inline (权威来源)
+                      │
+                      │ enrichUpgradeComponent (bundle.go:93) 复制
+                      ▼
+release.yaml → ReleaseImageUpgradeComponent.Inline (冗余副本)
+                      │
+                      │ BuildUpgradeDAG (build.go:42) 复制
+                      ▼
+                ComponentNode.Inline (InlineRef, DAG 节点)
+                      │
+                      │ Scheduler / InlineComponentExecutor 消费
+                      ▼
+                InlineRunner.Execute(handler, version)
+```
+
+**Inline 字段的 2 个消费者**：
+
+| 消费者 | 代码位置 | 读取内容 | 能否访问 ComponentVersion？ |
+|--------|---------|---------|-------------------------|
+| `topology.BuildUpgradeDAG` | `build.go:42` | `comp.Inline` → 复制到 `ComponentNode.Inline` | ❌ 不能（签名只有 `[]ReleaseImageUpgradeComponent`，无 Bundle） |
+| `RegisterInlinePhasesFromBundle` | `bundle_registry.go:45` | `comp.Inline.Handler/Version` | ✅ 能（有 Bundle），但当前读的是 `comp.Inline` |
+
+**`enrichUpgradeComponent` 的复制逻辑**（`bundle.go:93`）：
+
+```go
+func enrichUpgradeComponent(comp, bundle) {
+    if comp.Inline != nil || bundle == nil {
+        return comp  // release.yaml 的 inline 优先 (override)
+    }
+    cv := bundle.Components[key]
+    enriched.Inline = &ReleaseImageUpgradeInline{
+        Handler: cv.Spec.Inline.Handler,  // 从 ComponentVersion 复制
+        Version: cv.Spec.Inline.Version,
+    }
+}
+```
+
+**override 语义**：`comp.Inline != nil` 时 early return，允许 `release.yaml` 的 `upgrade.components[].inline` 覆盖 `component.yaml` 的 `spec.inline`。此 override 能力将被移除——inline handler 是组件实现细节，应在 `component.yaml` 中定义，不应在 `release.yaml` 中覆盖。
+
+**`ComponentVersion.Spec.Inline` 的唯一非测试读者就是 `enrichUpgradeComponent`**——Scheduler 执行时通过 `CVStore.GetComponentVersion` 读取的是 `cv.Spec.Type`（决定执行器类型），不读 `cv.Spec.Inline`。
+
+### 16.3 移除方案
+
+#### 16.3.1 `BuildUpgradeDAG` 签名重构
+
+`BuildUpgradeDAG` 当前只接收 `[]ReleaseImageUpgradeComponent`，无 Bundle/ComponentVersion 访问权限，inline 信息必须在调用前"扁平化"到组件引用上。重构为接收 `ComponentVersion` 查找函数：
+
+```go
+// pkg/topology/build.go — 重构前
+
+func BuildDAG(
+    components []cvv1alpha1.ReleaseImageUpgradeComponent,
+    resolve DependencyResolver,
+) (*ComponentDAG, error) {
+    for _, comp := range components {
+        node := &ComponentNode{
+            Name:    comp.Name,
+            Version: comp.Version,
+        }
+        if comp.Inline != nil {  // ★ 从 ReleaseImageUpgradeComponent.Inline 读取
+            node.Inline = &InlineRef{
+                Handler: comp.Inline.Handler,
+                Version: comp.Inline.Version,
+            }
+        }
+        dag.AddNode(node)
+    }
+    // ...
+}
+```
+
+```go
+// pkg/topology/build.go — 重构后
+
+// ComponentVersionLookup returns the ComponentVersion for a given name+version.
+// Implemented by BundleStore / manifest.BundleStore.
+type ComponentVersionLookup func(name, version string) (*cvv1alpha1.ComponentVersion, bool)
+
+// BuildDAG builds a component DAG from ReleaseImage components.
+// Inline handler info is read from ComponentVersion.Spec.Inline via the lookup,
+// not from ReleaseImageUpgradeComponent.Inline (which is removed).
+func BuildDAG(
+    components []cvv1alpha1.ReleaseImageUpgradeComponent,
+    resolve DependencyResolver,
+    cvLookup ComponentVersionLookup,  // ★ 新增参数
+) (*ComponentDAG, error) {
+    for _, comp := range components {
+        node := &ComponentNode{
+            Name:    comp.Name,
+            Version: comp.Version,
+        }
+        // ★ 从 ComponentVersion.Spec.Inline 读取 (而非 comp.Inline)
+        if cvLookup != nil {
+            if cv, ok := cvLookup(comp.Name, comp.Version); ok && cv.Spec.Inline != nil {
+                node.Inline = &InlineRef{
+                    Handler: cv.Spec.Inline.Handler,
+                    Version: cv.Spec.Inline.Version,
+                }
+            }
+        }
+        dag.AddNode(node)
+    }
+    // ...
+}
+```
+
+**`ComponentVersionLookup` 的实现**（复用 Bundle.Components）：
+
+```go
+// pkg/upgrade/bundle.go — 提供 ComponentVersionLookup 适配器
+
+// BundleComponentVersionLookup creates a ComponentVersionLookup from a Bundle.
+func BundleComponentVersionLookup(bundle *releasemanifest.Bundle) topology.ComponentVersionLookup {
+    if bundle == nil {
+        return nil
+    }
+    return func(name, version string) (*cvv1alpha1.ComponentVersion, bool) {
+        cv, ok := bundle.Components[releasemanifest.ComponentKey(name, version)]
+        return &cv, ok
+    }
+}
+```
+
+**调用方更新**：
+
+```go
+// pkg/upgrade/bundle.go — BuildDAGFromBundle 更新
+
+func BuildDAGFromBundle(bundle *releasemanifest.Bundle, resolve topology.DependencyResolver) (*topology.UpgradeDAG, error) {
+    components, err := UpgradeComponentsFromBundle(bundle)
+    if err != nil {
+        return nil, err
+    }
+    return topology.BuildDAG(
+        components,
+        topology.MergeDependencyResolver(resolve, topology.DefaultDependencyResolver()),
+        BundleComponentVersionLookup(bundle),  // ★ 新增: 传入 CV 查找函数
+    )
+}
+```
+
+```go
+// pkg/upgrade/bundle.go — BuildInstallDAGFromBundle 更新
+
+func BuildInstallDAGFromBundle(bundle *releasemanifest.Bundle, resolve topology.DependencyResolver) (*topology.UpgradeDAG, error) {
+    installComponents, err := InstallComponentsFromBundle(bundle)
+    if err != nil {
+        return nil, err
+    }
+    return topology.BuildDAG(
+        installComponents,
+        resolve,
+        BundleComponentVersionLookup(bundle),  // ★ 新增: 传入 CV 查找函数
+    )
+}
+```
+
+```go
+// pkg/upgrade/releaseimage.go — BuildDAGFromReleaseImage 更新
+
+func BuildDAGFromReleaseImage(ri *cvv1alpha1.ReleaseImage, resolve topology.DependencyResolver) (*topology.UpgradeDAG, error) {
+    // ... 现有逻辑 ...
+    return topology.BuildDAG(
+        ri.Spec.Upgrade.Components,
+        topology.MergeDependencyResolver(resolve, topology.DefaultDependencyResolver()),
+        nil,  // ★ 无 Bundle, inline 信息不可用 (此函数用于无 Bundle 场景)
+    )
+}
+```
+
+#### 16.3.2 `RegisterInlinePhasesFromBundle` 重构
+
+当前从 `comp.Inline` 读取 handler，改为从 `cv.Spec.Inline` 读取（已有 Bundle 访问权限）：
+
+```go
+// pkg/componentfactory/bundle_registry.go — 重构后
+
+func RegisterInlinePhasesFromBundle(f *ComponentFactory, bundle *releasemanifest.Bundle) error {
+    if bundle == nil || bundle.Release.Spec.Upgrade == nil {
+        return nil
+    }
+
+    for _, comp := range bundle.Release.Spec.Upgrade.Components {
+        // ★ 从 ComponentVersion.Spec.Inline 读取 (而非 comp.Inline)
+        cv, ok := bundle.Components[releasemanifest.ComponentKey(comp.Name, comp.Version)]
+        if !ok || cv.Spec.Inline == nil || cv.Spec.Inline.Handler == "" {
+            continue
+        }
+        handler := cv.Spec.Inline.Handler
+        version := cv.Spec.Inline.Version
+        if err := registerInlineComponent(f, handler, version, cv.DeepCopy()); err != nil {
+            return fmt.Errorf("register inline handler %q: %w", handler, err)
+        }
+    }
+    return nil
+}
+```
+
+#### 16.3.3 删除 `enrichUpgradeComponent`
+
+`enrichUpgradeComponent`（`bundle.go:93`）的唯一作用是将 `ComponentVersion.Spec.Inline` 复制到 `ReleaseImageUpgradeComponent.Inline`。移除 inline 字段后此函数无存在意义，直接删除。
+
+```go
+// pkg/upgrade/bundle.go — 删除 enrichUpgradeComponent
+
+// UpgradeComponentsFromBundle 简化: 不再调用 enrichUpgradeComponent
+func UpgradeComponentsFromBundle(bundle *releasemanifest.Bundle) ([]cvv1alpha1.ReleaseImageUpgradeComponent, error) {
+    if bundle == nil {
+        return nil, fmt.Errorf("release bundle is nil")
+    }
+    if bundle.Release.Spec.Upgrade == nil || len(bundle.Release.Spec.Upgrade.Components) == 0 {
+        return nil, fmt.Errorf("release bundle has no upgrade components")
+    }
+    // ★ 直接返回, 不再 enrich (inline 信息从 ComponentVersion 读取)
+    return bundle.Release.Spec.Upgrade.Components, nil
+}
+```
+
+#### 16.3.4 删除 `ReleaseImageUpgradeComponent.Inline` 字段
+
+```go
+// api/v1alpha1/releaseimage_types.go — 重构后
+
+// ReleaseImageUpgradeComponent is one upgradable component.
+// Inline handler info is read from ComponentVersion.Spec.Inline at execution time,
+// not stored on this reference type.
+type ReleaseImageUpgradeComponent struct {
+    Name    string `json:"name,omitempty"`
+    Version string `json:"version,omitempty"`
+    // ★ Inline 字段移除 — 从 ComponentVersion.Spec.Inline 读取
+}
+
+// ReleaseImageUpgradeInline 类型删除 (不再使用)
+```
+
+### 16.4 影响范围
+
+| 文件 | 变更类型 | 说明 |
+|------|---------|------|
+| `api/v1alpha1/releaseimage_types.go` | 删除字段+类型 | 移除 `ReleaseImageUpgradeComponent.Inline` 字段 + `ReleaseImageUpgradeInline` 类型 |
+| `api/v1alpha1/zz_generated.deepcopy.go` | 重新生成 | `make generate` 自动处理（移除 `ReleaseImageUpgradeInline` 的 DeepCopy） |
+| `config/crd/bases/...releaseimages.yaml` | 重新生成 | `make manifests` 自动处理（CRD schema 移除 `upgrade.components[].inline`） |
+| `pkg/topology/build.go` | 签名重构 | `BuildDAG` 新增 `ComponentVersionLookup` 参数，内部读 `cv.Spec.Inline` |
+| `pkg/topology/build_test.go` | 测试适配 | 传入 mock `ComponentVersionLookup` |
+| `pkg/upgrade/bundle.go` | 删除+新增 | 删除 `enrichUpgradeComponent`，新增 `BundleComponentVersionLookup`，更新 `BuildDAGFromBundle`/`BuildInstallDAGFromBundle` 调用 |
+| `pkg/upgrade/bundle_test.go` | 测试适配 | 移除 `enrichUpgradeComponent` 相关测试，更新 `BuildDAGFromBundle` 测试 |
+| `pkg/upgrade/releaseimage.go` | 调用更新 | `BuildDAGFromReleaseImage` 传入 `nil`（无 Bundle） |
+| `pkg/componentfactory/bundle_registry.go` | 重构 | 从 `cv.Spec.Inline` 读取（而非 `comp.Inline`） |
+| `pkg/componentfactory/bundle_registry_test.go` | 测试适配 | 更新测试用例 |
+| `pkg/dagexec/scheduler_skip_test.go` | 测试适配 | `BuildDAG` 调用新增 `cvLookup` 参数 |
+
+### 16.5 向后兼容性
+
+| 场景 | 影响 | 说明 |
+|------|------|------|
+| 现有 `release.yaml` 含 `upgrade.components[].inline` | 字段被忽略 | `Inline` 字段移除后，JSON 解析时 `inline` 字段被忽略（Go json 反序列化忽略未知字段） |
+| 现有 `component.yaml` 含 `spec.inline` | ✅ 正常工作 | `ComponentVersion.Spec.Inline` 不变，是权威来源 |
+| `release.yaml` 用 `inline` 覆盖 `component.yaml` | ❌ override 能力移除 | 移除 `enrichUpgradeComponent` 后，`release.yaml` 的 `inline` 不再生效 |
+| CRD YAML | 重新生成 | `make manifests` 后 CRD schema 移除 `upgrade.components[].inline` 属性 |
+| DeepCopy 代码 | 重新生成 | `make generate` 后自动移除 `ReleaseImageUpgradeInline` 的 DeepCopy 方法 |
+
+> **override 能力移除说明**：当前 `enrichUpgradeComponent` 中 `comp.Inline != nil` 时 early return，允许 `release.yaml` 覆盖 `component.yaml` 的 inline handler。移除 inline 字段后此能力消失。设计决策：inline handler 是组件实现细节，应在 `component.yaml` 中定义，不应在 `release.yaml` 中覆盖。`release.yaml` 的职责是声明"哪些组件参与本次发布"（Name + Version），不是定义"组件如何执行"。
+
+### 16.6 与设计原则的一致性
+
+此重构与以下设计原则保持一致：
+
+| 原则 | 来源 | 一致性 |
+|------|------|--------|
+| `ReleaseImageUpgradeComponent` 保持轻量引用角色 | §2.3 (KEP-18) | ✅ 进一步轻量化，仅保留 Name + Version |
+| 组件定义性字段统一存储在 `ComponentVersion.Spec` | §2.3 (KEP-18) | ✅ Inline handler 回归 `ComponentVersion.Spec.Inline` |
+| `ReleaseImageUpgradeComponent` 不携带 Condition | §2.3 (KEP-18) | ✅ 同理不携带 Inline |
+| `ReleaseImageUpgradeComponent` 不携带 NodeFilter | §2.3 (KEP-19) | ✅ 同理不携带 NodeFilter |
+| DAG 构建与组件定义解耦 | §4.3 | ✅ DAG 构建通过 `ComponentVersionLookup` 读取定义，不依赖引用类型携带定义 |
+
+**重构后 `ReleaseImageUpgradeComponent` 的字段**：
+
+```go
+// 重构后: 仅 Name + Version, 与 ReleaseImageInstallComponent 完全一致
+type ReleaseImageUpgradeComponent struct {
+    Name    string `json:"name,omitempty"`
+    Version string `json:"version,omitempty"`
+}
+
+// ReleaseImageInstallComponent 也是 Name + Version (现有, 不变)
+type ReleaseImageInstallComponent struct {
+    Name    string `json:"name,omitempty"`
+    Version string `json:"version,omitempty"`
+}
+```
+
+两个类型字段完全一致，为 §4.3 的统一抽象（`type ReleaseImageComponent = ReleaseImageUpgradeComponent`）创造了条件——移除 Inline 后统一抽象不再有字段差异。
+
+---
+
 ## 附录
 
 ### A. 参考文档
@@ -5240,3 +5557,4 @@ ComponentVersion 新增 `Condition` 字段（Go Template 表达式），在 DAG 
 | **BuildInstallDAGFromBundle** | 从 install.components 提取组件并调用 `topology.BuildDAG` 构建 DAG |
 | **DecisionInstall** | VersionContext 决策：current 为空且 target 有值时触发安装 |
 | **DeclarativeInstallEnabled** | Feature Gate，控制 DAG 安装路径是否启用。开启后强制要求 ReleaseImage 就绪 |
+| **ComponentVersionLookup** | DAG 构建时查找 ComponentVersion 的函数类型，用于从 `ComponentVersion.Spec.Inline` 读取 inline handler (§16) |
