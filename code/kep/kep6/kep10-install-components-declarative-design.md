@@ -85,7 +85,7 @@
 > **文档结构说明**：
 > - §1-6: 设计基础（动机、范围、结构定义、目录设计、DAG 构建）
 > - §7-8: 执行设计（DAG 执行入口、安装实现、Phase 映射）
-> - §9: 迁移策略（Feature Gate、向后兼容、平滑升级）— 包含 Legacy PhaseFlow 路径设计（§7.2.3-7.2.7 引用此处）
+> - §9: 迁移策略（Feature Gate、向后兼容、平滑升级）— 包含 Legacy PhaseFlow 路径设计（§7.2.3-7.2.6 引用此处）
 > - §10: Legacy PhaseFlow 完全移除方案（纳管/扩容/删除/DryRun/暂停 DAG 化）
 > - §11-15: 辅助内容（可观测性、工作量、风险、Bundle、条件过滤引用）
 
@@ -958,7 +958,7 @@ func registerInstallHandlers() {
 │  ② BuildVersionContextForInstall — 安装专用 VC 构建 (Current 全空)             │
 │  ③ BuildInstallDAGFromBundle — 从 install.components 构建 DAG                  │
 │  ④ DeclarativeInstallCatalog — 安装组件目录 (handler 与升级不同)               │
-│  ⑤ install-ready annotation — 安装前置门控                                      │
+│  ⑤ 不再需要 install-ready annotation — Feature Gate 开启即代表 ReleaseImage 就绪 ★    │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -1184,7 +1184,9 @@ func BuildVersionContextForInstall(
 
 ### 7.1 设计思路
 
-安装 DAG 执行的核心思路是**在现有 PhaseFlow 的执行入口中增加 DAG 安装分支**，通过三重门控 (Feature Gate + 全新安装判定 + install-ready annotation) 决定是否走 DAG 路径。未满足门控条件时回退到 Legacy PhaseFlow，保证向后兼容。
+安装 DAG 执行的核心思路是**在现有 PhaseFlow 的执行入口中增加 DAG 安装分支**，通过两重门控 (Feature Gate + 全新安装判定) 决定是否走 DAG 路径。未满足门控条件时回退到 Legacy PhaseFlow，保证向后兼容。
+
+> **设计变更**：原设计包含三重门控（Feature Gate + 全新安装判定 + install-ready annotation），现简化为两重门控。Feature Gate 开启后强制要求 ReleaseImage 必须就绪——`executeInstallDAG` 中 `resolveInstallBundle` 失败时 Requeue 等待，不回退 Legacy PhaseFlow。与升级路径 `shouldUseDeclarativeUpgrade` 行为一致。
 
 ```txt
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -1197,16 +1199,18 @@ func BuildVersionContextForInstall(
 │     门控: upgrade-ready annotation + Feature Gate                               │
 │                                                                                 │
 │  ② shouldUseDeclarativeInstall? → executeInstallDAG (新增安装路径) ★           │
-│     门控: Feature Gate + 全新安装 + install-ready annotation                    │
+│     门控: Feature Gate + 全新安装                                                │
+│     ReleaseImage 未就绪时 Requeue 等待 (不回退 Legacy)                          │
 │                                                                                 │
 │  ③ 默认 → PhaseFlow (Legacy 路径)                                               │
-│     适用: Feature Gate 未启用 / ReleaseImage 未就绪 / 扩容/纳管/删除等场景      │
+│     适用: Feature Gate 未启用 / 非全新安装 (扩容/纳管/删除等场景)               │
 │                                                                                 │
-│  三重门控设计原因:                                                               │
+│  两重门控设计原因:                                                               │
 │                                                                                 │
 │  门控 1 — Feature Gate (DeclarativeInstallEnabled):                              │
 │    原因: 渐进迁移，默认关闭确保生产稳定                                          │
 │    效果: 关闭时所有安装走 Legacy PhaseFlow                                       │
+│    前提: Feature Gate 开启 = ReleaseImage 必须就绪 (用户已准备好 ReleaseImage)  │
 │                                                                                 │
 │  门控 2 — 全新安装判定 (BKECluster.Status.Phase 为空或 Init):                     │
 │    原因: DAG 安装路径仅面向全新安装，扩容/纳管/删除等场景不适用                  │
@@ -1216,14 +1220,9 @@ func BuildVersionContextForInstall(
 │      其他值 = 已部署/升级中/删除中等 (不走安装 DAG)                              │
 │    效果: 仅全新安装可走 DAG，扩容仍走 PhaseFlow Scale Phase                      │
 │                                                                                 │
-│  门控 3 — install-ready annotation:                                              │
-│    原因: ReleaseImage 可能尚未创建或未通过验证，需前置门控确保就绪              │
-│    效果: ReleaseImage Phase=Valid 后 ClusterVersionReconciler 设置 annotation   │
-│          → BKEClusterReconciler 检测到 annotation 后才走 DAG 路径              │
-│          → 无 annotation 时回退 Legacy PhaseFlow (从 Spec 读取版本，不依赖 RI) │
-│                                                                                 │
 │  executeInstallDAG 执行流程:                                                     │
 │    1. resolveInstallBundle → 从 ReleaseImage 解析 OCI Bundle                    │
+│       未就绪 → RequeueAfter 30s 等待 (不回退 Legacy)                            │
 │    2. BuildVersionContextForInstall → 构建 VC (Current 空, Target 来自 RI)     │
 │    3. ApplyVersionContextTargetsToClusterSpec → 同步版本到 BKECluster.Spec      │
 │       (供 BKEAgent 读取 BkeConfig.Cluster.KubernetesVersion 等)                │
@@ -1237,8 +1236,7 @@ func BuildVersionContextForInstall(
 │  ① VersionContext: 安装 Current 全空 vs 升级 Current 有值                       │
 │  ② Decision: 安装 DecisionInstall vs 升级 DecisionUpgrade                       │
 │  ③ Catalog: 安装 DeclarativeInstallCatalog vs 升级 DeclarativeUpgradeCatalog   │
-│  ④ Annotation: 安装 install-ready vs 升级 upgrade-ready                         │
-│  ⑤ Handler: 安装 EnsureMasterInit vs 升级 EnsureMasterUpgrade                  │
+│  ④ Handler: 安装 EnsureMasterInit vs 升级 EnsureMasterUpgrade                  │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -1281,7 +1279,7 @@ func BuildVersionContextForInstall(
 │     │  5. Legacy PhaseFlow 路径 (兜底)                                          │
 │     │     ├─ 集群操作类 (Delete/Pause/DryRun/Manage/Reset):                     │
 │     │     │   走 CommonPhases + 对应专用 Phase                                   │
-│     │     ├─ 全新安装 (无 install-ready):                                        │
+│     │     ├─ 全新安装 (Feature Gate 未启用):                                     │
 │     │     │   走 CommonPhases + DeployPhases (从 BKECluster.Spec 读取版本)      │
 │     │     ├─ 集群扩容 (新增 Master/Worker):                                    │
 │     │     │   走 CommonPhases + ScalePhases (部分 Phase，非完整安装)             │
@@ -1325,9 +1323,9 @@ func (r *BKEClusterReconciler) executePhaseFlow(
     // ─── Legacy PhaseFlow 路径 (兜底) ───
     // 以下场景走 Legacy PhaseFlow:
     //   1. 集群操作类 (Delete/Pause/DryRun/Manage/Reset) — 非 Install/Upgrade 操作
-    //   2. 全新安装但 Feature Gate 未启用或 ReleaseImage 未就绪
+    //   2. 全新安装但 Feature Gate 未启用 (Feature Gate 开启后 ReleaseImage 必须就绪, 不回退)
     //   3. 集群扩容 (新增 Master/Worker 节点)
-    //   4. 升级但 Feature Gate 未启用或 ReleaseImage 未就绪
+    //   4. 升级但 Feature Gate 未启用 (Feature Gate 开启后 ReleaseImage 必须就绪, 不回退)
     flow := phases.NewPhaseFlow(phaseCtx)
     return flow.Execute()
 }
@@ -1352,9 +1350,8 @@ func (r *BKEClusterReconciler) shouldCleanupDeclarativeStatus(bkeCluster *bkev1b
 func (r *BKEClusterReconciler) cleanupStaleDeclarativeUpgradeStatus(bkeCluster *bkev1beta1.BKECluster) {
     bkeCluster.Status.DeclarativeUpgrade = nil
     bkeCluster.Status.ClusterComponentStatuses = nil
-    // 清理可能残留的注解
+    // 清理可能残留的注解 (install-ready annotation 已移除, 不再清理)
     delete(bkeCluster.Annotations, annotation.UpgradeReadyAnnotationKey)
-    delete(bkeCluster.Annotations, annotation.InstallReadyAnnotationKey)
     delete(bkeCluster.Annotations, annotation.SkipKubeletUpgradeAnnotationKey)
     delete(bkeCluster.Annotations, annotation.KubeletCatchupTargetAnnotationKey)
 }
@@ -1669,10 +1666,10 @@ Legacy PhaseFlow 的版本来源与 DAG 路径不同：
 │    版本均从 ReleaseImage                                                         │
 │                                                                                 │
 │  场景 4: ReleaseImage 未就绪 (Feature Gate 开启但 RI 未验证)                     │
-│    install-ready/upgrade-ready annotation 未设置                                 │
-│    → shouldUseDeclarativeInstall/Upgrade 返回 false                              │
-│    → 回退 Legacy PhaseFlow                                                       │
-│    → 版本从 BKECluster.Spec 读取 (不依赖 RI)                                     │
+│    shouldUseDeclarativeInstall/Upgrade 返回 true                                  │
+│    → executeInstallDAG/executeUpgradeDAG                                          │
+│    → resolveInstallBundle 失败 → RequeueAfter 30s 等待                            │
+│    → 不回退 Legacy PhaseFlow (Feature Gate 开启 = RI 必须就绪)                   │
 │                                                                                 │
 │  场景 5: 混合模式 (部分组件 DAG, 部分组件 Legacy)                                │
 │    Phase 2 灰度: 低风险组件 (coredns/kube-proxy) 走 DAG                         │
@@ -1699,7 +1696,8 @@ Legacy PhaseFlow 的版本来源与 DAG 路径不同：
 | 场景 | 原因 | 说明 | 走哪个 Phase 列表 |
 |------|------|------|------------------|
 | **Feature Gate 未启用** | `DeclarativeInstallEnabled = false` / `DeclarativeUpgradeEnabled = false` | 迁移期间默认关闭，确保生产稳定；正式启用后此场景消失 | CommonPhases + DeployPhases / UpgradePhases |
-| **ReleaseImage 未就绪** | `install-ready` / `upgrade-ready` annotation 未设置 | RI 未创建或 Status.Phase != Valid | CommonPhases + DeployPhases / UpgradePhases |
+| **ReleaseImage 未就绪 (Feature Gate 关闭)** | RI 未创建或 Status.Phase != Valid | Feature Gate 关闭时走 Legacy，从 Spec 读取版本 | CommonPhases + DeployPhases / UpgradePhases |
+| **ReleaseImage 未就绪 (Feature Gate 开启)** | RI 未创建或 Status.Phase != Valid | Feature Gate 开启 → shouldUseDeclarativeInstall 返回 true → resolveInstallBundle 失败 → Requeue 等待 (不回退 Legacy) | Requeue 等待 |
 | **ReleaseImage 无 inline handler** | `install.components[].inline` 字段为空 | 旧格式 RI 仅有 `{name, version}`，DAG 无法分发执行器 | CommonPhases + DeployPhases |
 | **纳管已有集群** | `BKECluster.Spec.Manage = true` | 纳管现有集群不走标准安装流程 | CommonPhases + ManagePhases |
 | **集群扩容** | 新增 Master/Worker 节点 | 扩容仅执行部分 Phase (Join)，非完整安装 | CommonPhases + ScalePhases |
@@ -1712,106 +1710,64 @@ Legacy PhaseFlow 的版本来源与 DAG 路径不同：
 
 ```go
 // shouldUseDeclarativeInstall 判断是否使用 DAG 安装路径 🆕新增
+// 两重门控: Feature Gate + 全新安装判定
+// ★ 不检查 install-ready annotation (已移除)
+// ★ Feature Gate 开启后强制要求 ReleaseImage 必须就绪:
+//   shouldUseDeclarativeInstall 返回 true → executeInstallDAG → resolveInstallBundle
+//   ReleaseImage 未就绪 → RequeueAfter 30s 等待 (不回退 Legacy)
 func (r *BKEClusterReconciler) shouldUseDeclarativeInstall(bkeCluster *bkev1beta1.BKECluster) bool {
-    // Feature Gate 控制
+    // 门控 1: Feature Gate 控制
     if !featuregate.DeclarativeInstallEnabled.Enabled() {
         return false
     }
-    // 仅在全新安装时启用（BKECluster.Status.Phase 为空或 Init）
+    // 门控 2: 仅在全新安装时启用（BKECluster.Status.Phase 为空或 Init）
     // BKECluster.Status.Phase: 空=未初始化(全新创建), PhaseInit=初始化中,
     //   其他值=已部署/升级中/删除中等 (非全新安装，不走安装 DAG)
     if bkeCluster.Status.Phase != "" && bkeCluster.Status.Phase != bkev1beta1.PhaseInit {
         return false
     }
-    // 检查是否有安装 annotation（由 ClusterVersionReconciler 设置）
-    _, ok := annotation.HasAnnotation(bkeCluster, annotation.InstallReadyAnnotationKey)
-    return ok
+    // ★ 不检查 install-ready annotation
+    // Feature Gate 开启 = ReleaseImage 必须就绪, resolveInstallBundle 失败时 Requeue 等待
+    return true
 }
 ```
 
-#### 7.2.7 install-ready annotation 的作用
+#### 7.2.7 ReleaseImage 就绪保障（原 install-ready annotation，已移除）
 
-`shouldUseDeclarativeInstall()` 的最后一个检查项是 `install-ready` annotation。该 annotation 由 `ClusterVersionReconciler` 在安装前置条件满足后设置，是 BKEClusterReconciler 决定是否走 DAG 安装路径的**最终门控**。
+> **设计变更**：原设计通过 `install-ready` annotation 作为第三重门控，确保 ReleaseImage 就绪后才走 DAG 路径。现简化为两重门控——Feature Gate 开启后强制要求 ReleaseImage 必须就绪，`executeInstallDAG` 中 `resolveInstallBundle` 失败时 Requeue 等待，不回退 Legacy PhaseFlow。
 
-**为什么需要这个 annotation**：
+**原设计（三重门控 + install-ready annotation）**：
 
 ```txt
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│              install-ready annotation 的作用                                     │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                 │
-│  没有 install-ready annotation 时的问题:                                        │
-│                                                                                 │
-│  用户创建 BKECluster CR (Spec.OpenFuyaoVersion = "v2.7.0")                     │
-│    │                                                                            │
-│    ▼ BKEClusterReconciler 被触发                                                 │
-│  shouldUseDeclarativeInstall 检查:                                              │
-│    ✓ Feature Gate 启用                                                          │
-│    ✓ Status.Phase 为空 (全新安装)                                                │
-│    ✗ 没有 install-ready annotation → 返回 false                                 │
-│    → 走 Legacy PhaseFlow? 但此时 ReleaseImage 可能还没就绪!                    │
-│                                                                                 │
-│  问题:                                                                          │
-│  BKECluster 创建后，ReleaseImage CR 可能尚未创建或尚未通过验证。                │
-│  如果 BKEClusterReconciler 立即开始安装，会因 ReleaseImage 不存在而失败。       │
-│  需要一个前置门控：确保 ReleaseImage 已就绪后，才允许开始安装。                 │
-│                                                                                 │
-│  有 install-ready annotation 时:                                               │
-│                                                                                 │
-│  用户创建 BKECluster CR                                                         │
-│    │                                                                            │
-│    ▼ BKEClusterReconciler: ensureClusterVersionOnInstall()                     │
-│    │  创建 ClusterVersion CR (desiredVersion = Spec.OpenFuyaoVersion)            │
-│    │                                                                            │
-│    ▼ ClusterVersionReconciler 被触发                                           │
-│    │  1. 解析 desiredVersion → 查找 ReleaseImage CR                             │
-│    │  2. ReleaseImageEnsurer.Ensure() → 拉取 OCI Bundle                          │
-│    │  3. 等待 ReleaseImage Status.Phase = Valid (签名验证+组件解析+兼容性校验) │
-│    │  4. ReleaseImage Valid → 设置 install-ready annotation                      │
-│    │     bc.Annotations[InstallReadyAnnotationKey] = desiredVersion             │
-│    │                                                                            │
-│    ▼ BKEClusterReconciler 再次被触发 (annotation 变更)                         │
-│    shouldUseDeclarativeInstall 检查:                                            │
-│    ✓ Feature Gate 启用                                                          │
-│    ✓ Status.Phase 为空 (全新安装)                                                │
-│    ✓ install-ready annotation 存在 → 返回 true                                  │
-│    → 走 DAG 安装路径                                                            │
-│                                                                                 │
-└─────────────────────────────────────────────────────────────────────────────────┘
+用户创建 BKECluster → ClusterVersionReconciler → ReleaseImage 验证 → 设置 install-ready annotation
+→ BKEClusterReconciler 检测 annotation → shouldUseDeclarativeInstall 返回 true → DAG 安装
+
+问题: 三重门控复杂, annotation 设置/清除需额外维护
 ```
 
-**install-ready annotation 的完整设置流程**：
+**新设计（两重门控, Feature Gate 开启 = ReleaseImage 必须就绪）**：
 
-| 步骤 | 执行者 | 操作 | 说明 | 是否新增 |
-|------|--------|------|------|----------|
-| 1 | BKEClusterReconciler | `ensureClusterVersionOnInstall()` 创建 ClusterVersion CR | 用户创建 BKECluster 后，自动创建对应的 ClusterVersion | 否 (复用升级流程) |
-| 2 | ClusterVersionReconciler | 解析 `desiredVersion`，查找 ReleaseImage CR | 通过 `Spec.Version == desiredVersion` 匹配 | 否 (复用升级流程) |
-| 3 | ClusterVersionReconciler | `ReleaseImageEnsurer.Ensure()` 拉取 OCI Bundle | 从 OCI Registry 拉取 ReleaseImage payload | 否 (复用升级流程) |
-| 4 | ReleaseImageReconciler | 验证签名 + 解析组件 + 兼容性校验 | 设置 `Status.Phase = Valid` (或 Invalid/ManifestMissing/CompatibilityFailed) | 否 (复用升级流程) |
-| 5 | ClusterVersionReconciler | ReleaseImage Phase == Valid → 设置 `install-ready` annotation | `bc.Annotations[InstallReadyAnnotationKey] = desiredVersion` | **是** (新增 install-ready) |
-| 6 | BKEClusterReconciler | 检测到 annotation 变更 → `shouldUseDeclarativeInstall()` 返回 true | 进入 DAG 安装路径 | **是** (新增 shouldUseDeclarativeInstall) |
+```txt
+用户创建 BKECluster → shouldUseDeclarativeInstall:
+  门控 1: Feature Gate ON? ✓
+  门控 2: 全新安装? ✓
+  → 返回 true → executeInstallDAG
+  → resolveInstallBundle:
+    ReleaseImage 已就绪 → 继续 DAG 执行
+    ReleaseImage 未就绪 → RequeueAfter 30s 等待 (不回退 Legacy)
+```
 
-**与 upgrade-ready annotation 的对称性**：
+**为什么可以去掉 install-ready annotation**：
 
-| 维度 | install-ready (安装) | upgrade-ready (升级) |
-|------|---------------------|---------------------|
-| **设置者** | ClusterVersionReconciler | ClusterVersionReconciler |
-| **设置条件** | ReleaseImage Phase=Valid + 全新安装 (无 history) | ReleaseImage Phase=Valid + UpgradePath 校验通过 |
-| **annotation 值** | desiredVersion (openFuyao 版本) | hopTarget (openFuyao 版本，可能是中间 hop) |
-| **消费者** | `shouldUseDeclarativeInstall()` | `shouldUseDeclarativeUpgrade()` |
-| **触发路径** | BKECluster 创建 → CV 创建 → RI 验证 → 设置 annotation → DAG 安装 | CV desiredVersion 变更 → RI 验证 → UP 校验 → 设置 annotation → DAG 升级 |
-| **清除时机** | 安装完成后 (DeclarativeUpgradeStatus 完成) | 升级 hop 完成后 (CompleteUpgradeHop) |
+| 维度 | 原设计（有 annotation） | 新设计（无 annotation） |
+|------|------------------------|------------------------|
+| **ReleaseImage 未就绪时** | annotation 不存在 → `shouldUseDeclarativeInstall` 返回 false → 回退 Legacy PhaseFlow | `shouldUseDeclarativeInstall` 返回 true → `executeInstallDAG` → `resolveInstallBundle` 失败 → Requeue 等待 |
+| **ReleaseImage 就绪后** | annotation 设置 → `shouldUseDeclarativeInstall` 返回 true → DAG 安装 | `resolveInstallBundle` 成功 → DAG 安装 |
+| **回退 Legacy 能力** | ✅ ReleaseImage 未就绪可回退 | ❌ Feature Gate 开启后不回退 (Requeue 等待) |
+| **复杂度** | 三重门控 + annotation 设置/清除 | 两重门控, 无 annotation 维护 |
+| **与升级路径一致性** | 不一致 (升级有 upgrade-ready annotation) | 一致 (升级同样 Requeue 等待) |
 
-**install-ready 不存在时走 Legacy 路径的原因**：
-
-| 场景 | 原因 | Legacy 行为 |
-|------|------|------------|
-| Feature Gate 未启用 | `DeclarativeInstallEnabled=false` | PhaseFlow 正常执行 (DeployPhases) |
-| ReleaseImage 未创建 | 用户创建 BKECluster 但未创建 ReleaseImage CR | PhaseFlow 从 `BKECluster.Spec` 读取版本 (Legacy 模式不依赖 ReleaseImage) |
-| ReleaseImage 未通过验证 | ReleaseImage Status.Phase != Valid | PhaseFlow 从 `BKECluster.Spec` 读取版本，不阻塞安装 |
-| 旧格式 ReleaseImage | `install.components[].inline` 为空 | PhaseFlow 正常执行 (不消费 ReleaseImage install 列表) |
-
-> **关键设计**：install-ready annotation 是 DAG 安装路径的**前置门控**，确保 ReleaseImage 已验证通过后才走 DAG 路径。没有该 annotation 时回退到 Legacy PhaseFlow (从 `BKECluster.Spec` 直接读取版本，不依赖 ReleaseImage)，保证向后兼容。
+> **设计原则**：Feature Gate 开启 = 用户已准备好 ReleaseImage。生产环境中 Feature Gate 开启意味着 ReleaseImage 已创建并通过验证。如果 ReleaseImage 尚未就绪，Requeue 等待是正确行为——不应回退到 Legacy PhaseFlow（从 `BKECluster.Spec` 读取版本），因为 Feature Gate 开启表示用户已选择 DAG 路径。
 
 ### 7.3 executeInstallDAG 实现
 
@@ -2405,9 +2361,9 @@ var (
 1. **旧格式兼容**：`ReleaseImageComponent` 的 `inline` 字段是 `omitempty`，旧格式 `{name, version}` 仍然有效
 2. **PhaseFlow 共存**：`DeclarativeInstallEnabled` 未启用时，继续使用 PhaseFlow
 3. **混合模式**：ReleaseImage 可同时包含有 `inline` 和无 `inline` 的安装组件
-4. **ClusterVersionReconciler**：安装时设置 `cvo.openfuyao.cn/install-ready` annotation 触发 DAG 路径
+4. **Feature Gate 开启 = ReleaseImage 必须就绪**：不再需要 `install-ready` annotation 作为前置门控。Feature Gate 开启后，`shouldUseDeclarativeInstall` 返回 true → `executeInstallDAG` → `resolveInstallBundle`，ReleaseImage 未就绪时 Requeue 等待（不回退 Legacy）
 
-> **Legacy PhaseFlow 路径设计**：Legacy PhaseFlow 的详细路径设计（Phase 列表定义、各场景的 Phase 执行列表、执行判断逻辑、状态上报逻辑、版本来源、共存设计、适用场景）见 [§7.2.3-7.2.7](#723-legacy-phaseflow-路径设计)。
+> **Legacy PhaseFlow 路径设计**：Legacy PhaseFlow 的详细路径设计（Phase 列表定义、各场景的 Phase 执行列表、执行判断逻辑、状态上报逻辑、版本来源、共存设计、适用场景）见 [§7.2.3-7.2.6](#723-legacy-phaseflow-路径设计)。
 
 ### 9.4 平滑升级方案
 
@@ -2613,7 +2569,7 @@ func (r *BKEClusterReconciler) executePartialInstallDAG(...) {
 
 ## 10. Legacy PhaseFlow 完全移除方案
 
-> **关联章节**：平滑升级的迁移阶段和风险控制见 [§9.4](#94-平滑升级方案)。Legacy PhaseFlow 路径设计（Phase 列表、场景执行列表）见 [§7.2.3-7.2.7](#723-legacy-phaseflow-路径设计)。
+> **关联章节**：平滑升级的迁移阶段和风险控制见 [§9.4](#94-平滑升级方案)。Legacy PhaseFlow 路径设计（Phase 列表、场景执行列表）见 [§7.2.3-7.2.6](#723-legacy-phaseflow-路径设计)。
 
 当迁移到 Phase 4 时，需要完全移除 Legacy PhaseFlow 路径。以下针对 7.1 节中列出的每个 Legacy 场景，给出 DAG 化的完整方案。
 
@@ -2623,7 +2579,7 @@ func (r *BKEClusterReconciler) executePartialInstallDAG(...) {
 |------------|-----------|---------|
 | Feature Gate 未启用 | 移除 Feature Gate，DAG 成为唯一路径 | Phase 4 |
 | ReleaseImage 无 inline handler | 强制 ReleaseImage 包含 inline 字段 | Phase 4 |
-| 无 install-ready annotation | ClusterVersionReconciler 始终设置 annotation | Phase 2 |
+| 无 install-ready annotation | 已移除: Feature Gate 开启即代表 ReleaseImage 就绪 | 已移除 |
 | 纳管已有集群 | 新增 `manage` 组件到安装 DAG | Phase 4 |
 | 集群扩容（新增节点） | 新增 `scale-master` / `scale-worker` 组件到 DAG | Phase 4 |
 | 集群删除/重置 | 新增 `delete` DAG（逆序卸载） | Phase 4 |
@@ -4751,8 +4707,7 @@ kubectl get bkecluster my-cluster -o jsonpath='{.status.clusterComponentStatuses
 | | ComponentFactory 注册 | 注册安装 handler 到 factory + 验证幂等性 | 2 |
 | | VersionContext 扩展 | 新增 `DecisionInstall` + `BuildVersionContextForInstall` | 3 |
 | | 安装 DAG 构建 | `BuildInstallDAGFromBundle` + `InstallComponentsFromBundle` + 循环依赖检测 | 3 |
-| | executeInstallDAG | 安装 DAG 执行入口 + `shouldUseDeclarativeInstall` + 状态追踪 | 3 |
-| | 安装 annotation 机制 | `install-ready` annotation + ClusterVersionReconciler 适配 | 2 |
+| | executeInstallDAG | 安装 DAG 执行入口 + `shouldUseDeclarativeInstall` (两重门控) + 状态追踪 | 2 |
 | | Feature Gate | `DeclarativeInstallEnabled` 实现 + 默认关闭验证 | 1 |
 | | ComponentVersion 依赖定义 | 为 11 个安装组件编写 `spec.dependencies` + 验证拓扑正确性 | 4 |
 | | ReleaseImage 适配 | 为 v2.7.0 ReleaseImage 补充 install.components.inline | 2 |
@@ -4761,7 +4716,7 @@ kubectl get bkecluster my-cluster -o jsonpath='{.status.clusterComponentStatuses
 | | BKEAgent 命令适配 | 安装 handler 与现有 BKEAgent Command/ENV 命令机制集成验证 | 2 |
 | | TemplateContext 扩展 (KEP-18) | 新增 Operation/ScaleType/NodeCount 等字段 + `buildTemplateContext` 扩展 | 2 |
 | | EvaluateCondition 实现 (KEP-18) | Go Template 求值 + `shouldExecuteByCondition` Scheduler 集成 | 2 |
-| **Phase 1 小计** | | | **36** |
+| **Phase 1 小计** | | | **34** |
 | **Phase 2: 灰度迁移** | 混合执行模式 | `executePartialInstallDAG` + `WithSkipPhases` PhaseFlow 扩展 | 4 |
 | | 状态追踪兼容 | PhaseStatus ↔ DeclarativeUpgradeStatus 状态清理 + 互不冲突 | 3 |
 | | 低风险组件迁移 | bkeagent/nodes-env/certs/load-balance 迁移 + NeedExecute 适配 | 3 |
@@ -5200,5 +5155,4 @@ ComponentVersion 新增 `Condition` 字段（Go Template 表达式），在 DAG 
 | **BuildDAGFromBundle** | 从 upgrade.components 提取组件并调用 `topology.BuildDAG` 构建 DAG |
 | **BuildInstallDAGFromBundle** | 从 install.components 提取组件并调用 `topology.BuildDAG` 构建 DAG |
 | **DecisionInstall** | VersionContext 决策：current 为空且 target 有值时触发安装 |
-| **DeclarativeInstallEnabled** | Feature Gate，控制 DAG 安装路径是否启用 |
-| **install-ready annotation** | `cvo.openfuyao.cn/install-ready`，触发 DAG 安装路径 |
+| **DeclarativeInstallEnabled** | Feature Gate，控制 DAG 安装路径是否启用。开启后强制要求 ReleaseImage 就绪 |
