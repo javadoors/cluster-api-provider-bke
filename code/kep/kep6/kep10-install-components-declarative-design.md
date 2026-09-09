@@ -1732,42 +1732,126 @@ func (r *BKEClusterReconciler) shouldUseDeclarativeInstall(bkeCluster *bkev1beta
 }
 ```
 
-#### 7.2.7 ReleaseImage 就绪保障（原 install-ready annotation，已移除）
+#### 7.2.7 ReleaseImage 就绪保障与 ClusterVersion 协调设计
 
 > **设计变更**：原设计通过 `install-ready` annotation 作为第三重门控，确保 ReleaseImage 就绪后才走 DAG 路径。现简化为两重门控——Feature Gate 开启后强制要求 ReleaseImage 必须就绪，`executeInstallDAG` 中 `resolveInstallBundle` 失败时 Requeue 等待，不回退 Legacy PhaseFlow。
 
-**原设计（三重门控 + install-ready annotation）**：
+**设计思路 — 安装场景为什么不需要 annotation 通知机制**：
+
+升级场景使用 `upgrade-ready` annotation 是因为**多 Hop 协调**——ClusterVersionReconciler 需要通过 annotation 值（hopTarget）告知 BKEClusterReconciler "当前应该升级到哪个中间版本"。安装场景**没有多 Hop**——`desiredVersion` 就是最终目标版本，BKEClusterReconciler 直接从 Spec 获取目标版本，不需要 ClusterVersionReconciler 通过 annotation 告知。
+
+| 维度 | 升级场景 (多 Hop) | 安装场景 (无 Hop) |
+|------|------------------|-----------------|
+| **目标版本** | ClusterVersionReconciler 解析 UpgradePath 确定 hopTarget | BKECluster.Spec 直接指定 desiredVersion |
+| **是否需要告知目标** | ✅ 需要 (annotation 值=hopTarget) | ❌ 不需要 (BKECluster 自己知道) |
+| **多步协调** | ✅ 每个 Hop 完成后清除 annotation, 进入下一个 Hop | ❌ 一次性操作, 无中间步骤 |
+| **通知机制** | `upgrade-ready` annotation (Watch 触发) | Requeue 轮询 (30s) |
+| **效率** | 高 (annotation 变更触发 Watch) | 低 (轮询), 但安装是低频操作, 可接受 |
+
+**安装场景完整流程**：
 
 ```txt
-用户创建 BKECluster → ClusterVersionReconciler → ReleaseImage 验证 → 设置 install-ready annotation
-→ BKEClusterReconciler 检测 annotation → shouldUseDeclarativeInstall 返回 true → DAG 安装
-
-问题: 三重门控复杂, annotation 设置/清除需额外维护
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              安装场景: ClusterVersion 与 BKECluster 协调流程                       │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  步骤 1: 用户创建 BKECluster CR (Spec.OpenFuyaoVersion = "v2.7.0")              │
+│     │                                                                           │
+│     ▼ BKEClusterReconciler.Reconcile()                                          │
+│     │  ensureClusterVersionOnInstall() → 创建 ClusterVersion CR                 │
+│     │    (ClusterVersion.Spec.DesiredVersion = "v2.7.0")                        │
+│     │                                                                           │
+│     ▼ BKEClusterReconciler: executePhaseFlow()                                  │
+│     │  shouldUseDeclarativeInstall(newCluster)?                                 │
+│     │    门控 1: Feature Gate ON? ✓                                             │
+│     │    门控 2: BKECluster.Status.Phase 为空 (全新安装)? ✓                     │
+│     │    → 返回 true → executeInstallDAG()                                      │
+│     │                                                                           │
+│     ▼ executeInstallDAG()                                                       │
+│     │  resolveInstallBundle(ctx, newCluster)                                    │
+│     │    → 查找 ReleaseImage CR (Spec.Version == desiredVersion)                │
+│     │    → ReleaseImage 尚未创建/未验证 → 失败                                   │
+│     │    → RequeueAfter: 30s (等待 ReleaseImage 就绪, 不回退 Legacy)            │
+│     │                                                                           │
+│  步骤 2: ClusterVersionReconciler.Reconcile() (被 CV 创建触发)                   │
+│     │                                                                           │
+│     ▼ isInstallPhase(ctx, bc, cv)?                                              │
+│     │  current == "" (无已安装版本) → true (安装场景) ★                          │
+│     │                                                                           │
+│     ▼ 安装场景分支:                                                              │
+│     │  setStatus(cv, Phase=Installing)                                          │
+│     │  ensurer.Ensure(ctx, bc, cv, desired)                                     │
+│     │    → 查找/创建 ReleaseImage CR                                            │
+│     │    → 拉取 OCI Bundle (ORAS)                                               │
+│     │    → ReleaseImageReconciler 验证 (签名/组件/兼容性)                        │
+│     │    → 等待 ReleaseImage.Status.Phase = Valid                               │
+│     │    → 未就绪: 返回 RequeueResult (等待)                                     │
+│     │    → 已就绪: 返回 nil (ReleaseImage Valid)                                │
+│     │  ★ 不设置任何 annotation (不通知 BKECluster)                              │
+│     │  ★ ClusterVersionReconciler 职责到此结束                                  │
+│     │                                                                           │
+│  步骤 3: BKEClusterReconciler.Reconcile() (30s Requeue 后再次触发)              │
+│     │                                                                           │
+│     ▼ executePhaseFlow() → shouldUseDeclarativeInstall → true                   │
+│     ▼ executeInstallDAG()                                                       │
+│     │  resolveInstallBundle(ctx, newCluster)                                    │
+│     │    → ReleaseImage CR 已存在, Status.Phase = Valid ✓                       │
+│     │    → 解析 OCI Bundle 成功                                                 │
+│     │  → BuildVersionContextForInstall → 构建 VC                                │
+│     │  → BuildInstallDAGFromBundle → 构建 DAG                                   │
+│     │  → Scheduler.ExecuteDAG → 并行执行安装组件                                │
+│     │  → 安装完成 → 更新 BKECluster.Status                                      │
+│     │                                                                           │
+│  步骤 4: BKEClusterReconciler: completeClusterVersionInstall()                  │
+│     │  BKECluster.Status.ClusterStatus = ClusterReady                           │
+│     │  → Patch ClusterVersion.Status (CurrentVersion = installed, Phase = Ready) │
+│     │                                                                           │
+│  步骤 5: ClusterVersionReconciler.Reconcile() (CV Status 变更触发)              │
+│     │  isInstallPhase? → false (current == desired, ClusterReady)               │
+│     │  → 进入稳态, 不再操作                                                     │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**新设计（两重门控, Feature Gate 开启 = ReleaseImage 必须就绪）**：
+**两个 Controller 的职责分工**：
+
+| Controller | 安装场景职责 | 与升级场景对比 |
+|------------|------------|--------------|
+| **ClusterVersionReconciler** | `isInstallPhase` → `ensurer.Ensure()` 拉取/验证 ReleaseImage → 等待 Valid → 返回 | 升级: 额外解析 UpgradePath + 设置 `upgrade-ready` annotation |
+| **BKEClusterReconciler** | `shouldUseDeclarativeInstall` → `executeInstallDAG` → `resolveInstallBundle` (Requeue 等待 RI) → DAG 执行 | 升级: 检测 `upgrade-ready` annotation → `executeUpgradeDAG` |
+
+**协调机制**：
+
+两个 Controller 通过 **ReleaseImage CR 的 `Status.Phase`** 间接协调，不需要直接的 annotation 通知：
 
 ```txt
-用户创建 BKECluster → shouldUseDeclarativeInstall:
-  门控 1: Feature Gate ON? ✓
-  门控 2: 全新安装? ✓
-  → 返回 true → executeInstallDAG
-  → resolveInstallBundle:
-    ReleaseImage 已就绪 → 继续 DAG 执行
-    ReleaseImage 未就绪 → RequeueAfter 30s 等待 (不回退 Legacy)
+ClusterVersionReconciler                    BKEClusterReconciler
+       │                                          │
+       │  ensurer.Ensure()                        │  resolveInstallBundle()
+       │  → 拉取 OCI Bundle                        │  → 读取 ReleaseImage CR
+       │  → 验证 (签名/组件/兼容性)                 │  → 检查 Status.Phase
+       │  → 设置 ReleaseImage.Status.Phase         │
+       │                                         │
+       │         ReleaseImage CR (共享状态)         │
+       │    ┌──────────────────────────┐          │
+       │    │ Status.Phase:             │          │
+       │    │   "" → Pending → Valid    │←─────────│
+       │    │                ↑          │          │
+       │    │    CV Reconciler 写入     │   BC Reconciler 读取
+       │    └──────────────────────────┘          │
+       │                                         │
+       │  (不设置 annotation)                     │  (Requeue 30s 轮询)
+       │  (不通知 BKECluster)                     │  (直到 Status.Phase=Valid)
 ```
 
-**为什么可以去掉 install-ready annotation**：
+**为什么 Requeue 轮询可接受**：
 
-| 维度 | 原设计（有 annotation） | 新设计（无 annotation） |
-|------|------------------------|------------------------|
-| **ReleaseImage 未就绪时** | annotation 不存在 → `shouldUseDeclarativeInstall` 返回 false → 回退 Legacy PhaseFlow | `shouldUseDeclarativeInstall` 返回 true → `executeInstallDAG` → `resolveInstallBundle` 失败 → Requeue 等待 |
-| **ReleaseImage 就绪后** | annotation 设置 → `shouldUseDeclarativeInstall` 返回 true → DAG 安装 | `resolveInstallBundle` 成功 → DAG 安装 |
-| **回退 Legacy 能力** | ✅ ReleaseImage 未就绪可回退 | ❌ Feature Gate 开启后不回退 (Requeue 等待) |
-| **复杂度** | 三重门控 + annotation 设置/清除 | 两重门控, 无 annotation 维护 |
-| **与升级路径一致性** | 不一致 (升级有 upgrade-ready annotation) | 一致 (升级同样 Requeue 等待) |
+1. **安装是低频操作**：集群安装一生一次，30s 轮询开销可忽略（对比升级可能多 Hop，每 Hop 都需要协调）
+2. **ReleaseImage 验证通常 < 1 分钟**：OCI 拉取 + 签名验证 + 组件解析 + 兼容性校验，通常在 30-60s 内完成，1-2 次 Requeue 即可
+3. **避免 annotation 维护**：不需要 ClusterVersionReconciler 设置/清除 annotation，减少状态管理复杂度和潜在的状态不一致风险
+4. **与升级路径的差异是合理的**：升级需要 annotation 是因为多 Hop 协调（ClusterVersionReconciler 需要告知 hopTarget），安装不需要是因为无 Hop（BKECluster 自己知道 desiredVersion）
 
-> **设计原则**：Feature Gate 开启 = 用户已准备好 ReleaseImage。生产环境中 Feature Gate 开启意味着 ReleaseImage 已创建并通过验证。如果 ReleaseImage 尚未就绪，Requeue 等待是正确行为——不应回退到 Legacy PhaseFlow（从 `BKECluster.Spec` 读取版本），因为 Feature Gate 开启表示用户已选择 DAG 路径。
+> **设计原则**：安装场景无多 Hop，BKEClusterReconciler 直接从 Spec 获取目标版本，不需要 ClusterVersionReconciler 通过 annotation 告知。两个 Controller 通过 ReleaseImage CR 的 `Status.Phase=Valid` 间接协调——ClusterVersionReconciler 负责拉取/验证（写入 Status），BKEClusterReconciler 负责消费（读取 Status），Requeue 轮询作为协调机制。
 
 ### 7.3 executeInstallDAG 实现
 
