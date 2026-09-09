@@ -1072,7 +1072,7 @@ func NewComponentDAG() *ComponentDAG {
 // BuildDAG builds a component DAG from ReleaseImage components.
 // Alias of BuildUpgradeDAG — preferred name for new code.
 // Used by both install and upgrade paths.
-func BuildDAG(components []cvv1alpha1.ReleaseImageUpgradeComponent, resolve DependencyResolver) (*UpgradeDAG, error) {
+func BuildDAG(components []cvv1alpha1.ReleaseImageUpgradeComponent, resolve DependencyResolver) (*ComponentDAG, error) {
     return BuildUpgradeDAG(components, resolve)
 }
 ```
