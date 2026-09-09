@@ -1287,6 +1287,8 @@ func BuildVersionContextForInstall(
 
 #### 7.2.2 完整代码实现
 
+> **新增设计**：以下代码中 `shouldCleanupDeclarativeStatus` 和 `cleanupStaleDeclarativeUpgradeStatus` 为本 KEP 新增设计，当前代码库中尚未实现。现有 `executePhaseFlow()` 直接进入 `shouldUseDeclarativeUpgrade` 判断，无预处理步骤。
+
 ```go
 // controllers/capbke/bkecluster_controller.go
 
