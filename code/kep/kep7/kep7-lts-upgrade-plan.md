@@ -14,7 +14,7 @@
 
 ## 1. 摘要
 
-本提案设计从 25.12(LTS) 升级到 26.12(LTS) 的完整方案。由于 25.12 和 26.03 版本不支持声明式升级，需要通过预处理和 ReleaseImage 构建来实现多 Hop 升级。升级路径为：25.12(LTS) -> 26.03 -> 26.06 -> 26.09 -> 26.12(LTS)，其中 26.06 及之后版本支持声明式升级。
+本提案设计从 25.12(LTS) 升级到 26.12(LTS) 的完整方案。由于 25.12 和 26.03 版本不支持声明式升级，需要通过预处理来实现多 Hop 升级。升级路径为：25.12(LTS) -> 26.03 -> 26.06 -> 26.09 -> 26.12(LTS)，其中 26.06 及之后版本支持声明式升级。
 
 ---
 
@@ -35,7 +35,7 @@
 1. **25.12(LTS)->26.03**: 管理集群存在不兼容变更，需要预处理
 2. **26.03->26.06**: 管理集群存在不兼容变更，需要预处理
 3. **26.06 及之后**: 支持声明式升级方案
-4. **ReleaseImage 构建**: 25.12 和 26.03 需要基于声明式升级方案构建 ReleaseImage
+4. **ReleaseImage 构建**: 26.03 需要基于声明式升级方案构建 ReleaseImage
 5. **管理集群升级**: 25.12(LTS) 管理集群需要先升级以支持 26.06 的声明式升级方案
 6. **26.06->26.12(LTS)**: 支持通过多 Hop 声明式升级方案直接升级（26.06 -> 26.09 -> 26.12）
 7. **bkeadm 一键升级**: 在 bkeadm 中增加命令支持一键式从 25.12(LTS) 升级到 26.12(LTS)
@@ -98,69 +98,7 @@ PhaseFlow            PhaseFlow              声明式升级    声明式升级  
 
 ### 3.3 ReleaseImage 构建方案
 
-#### 3.3.1 25.12(LTS) ReleaseImage 构建
-
-```yaml
-# ReleaseImage for 25.12(LTS)
-apiVersion: config.openfuyao.cn/v1alpha1
-kind: ReleaseImage
-metadata:
-  name: openfuyao-v25.12
-spec:
-  version: "25.12"
-  
-  install:
-    components:
-      # 基础组件 (PhaseFlow 方式)
-      - name: bkeagent
-        version: v25.12.0
-      - name: nodes-env
-        version: v1.0.0
-      - name: cluster-api-obj
-        version: v1.0.0
-      - name: certs
-        version: v1.0.0
-      - name: load-balance
-        version: v1.0.0
-      - name: kubernetes-master
-        version: v1.25.0
-      - name: kubernetes-worker
-        version: v1.25.0
-      - name: kube-proxy
-        version: v1.25.0
-      - name: coredns
-        version: v1.9.0
-      - name: nodes-postprocess
-        version: v1.0.0
-      - name: agent-switch
-        version: v1.0.0
-  
-  upgrade:
-    components:
-      # 升级组件 (PhaseFlow 方式)
-      - name: pre-upgrade-resources
-        version: v1.0.0
-        inline:
-          handler: EnsurePreUpgradeResources
-          version: v1.0.0
-      - name: bkeagent
-        version: v25.12.0
-        inline:
-          handler: EnsureAgentUpgrade
-          version: v1.0.0
-      - name: kubernetes-master
-        version: v1.25.0
-        inline:
-          handler: EnsureMasterUpgrade
-          version: v1.0.0
-      - name: kubernetes-worker
-        version: v1.25.0
-        inline:
-          handler: EnsureWorkerUpgrade
-          version: v1.0.0
-```
-
-#### 3.3.2 26.03 ReleaseImage 构建
+#### 3.3.1 26.03 ReleaseImage 构建
 
 ```yaml
 # ReleaseImage for 26.03
@@ -222,7 +160,7 @@ spec:
           version: v1.0.0
 ```
 
-#### 3.3.3 26.06 及之后版本 ReleaseImage (声明式升级)
+#### 3.3.2 26.06 及之后版本 ReleaseImage (声明式升级)
 
 ```yaml
 # ReleaseImage for 26.06
@@ -835,7 +773,7 @@ kubectl get executorregistry -n bke-system
 | 任务 | 工作量 | 说明 |
 |------|--------|------|
 | **预处理开发** | 4 周 | 开发预处理脚本和工具 |
-| **ReleaseImage 构建** | 2 周 | 构建 25.12 和 26.03 ReleaseImage |
+| **ReleaseImage 构建** | 2 周 | 构建 26.03 ReleaseImage |
 | **多 Hop 声明式升级** | 3 周 | 实现 26.06 -> 26.12 多 Hop 升级 |
 | **bkeadm 一键升级命令** | 2 周 | 实现 bkeadm upgrade lts 命令 |
 | **测试** | 4 周 | 测试环境和预生产环境测试 |
