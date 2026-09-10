@@ -96,160 +96,7 @@ PhaseFlow            PhaseFlow              声明式升级    声明式升级  
 
 **升级方式**: 声明式升级 (DAG)
 
-### 3.3 ReleaseImage 构建方案
-
-#### 3.3.1 26.03 ReleaseImage 构建
-
-```yaml
-# ReleaseImage for 26.03
-apiVersion: config.openfuyao.cn/v1alpha1
-kind: ReleaseImage
-metadata:
-  name: openfuyao-v26.03
-spec:
-  version: "26.03"
-  
-  install:
-    components:
-      # 基础组件 (PhaseFlow 方式)
-      - name: bkeagent
-        version: v26.03.0
-      - name: nodes-env
-        version: v1.0.0
-      - name: cluster-api-obj
-        version: v1.0.0
-      - name: certs
-        version: v1.0.0
-      - name: load-balance
-        version: v1.0.0
-      - name: kubernetes-master
-        version: v1.26.0
-      - name: kubernetes-worker
-        version: v1.26.0
-      - name: kube-proxy
-        version: v1.26.0
-      - name: coredns
-        version: v1.10.0
-      - name: nodes-postprocess
-        version: v1.0.0
-      - name: agent-switch
-        version: v1.0.0
-  
-  upgrade:
-    components:
-      # 升级组件 (PhaseFlow 方式)
-      - name: pre-upgrade-resources
-        version: v1.0.0
-        inline:
-          handler: EnsurePreUpgradeResources
-          version: v1.0.0
-      - name: bkeagent
-        version: v26.03.0
-        inline:
-          handler: EnsureAgentUpgrade
-          version: v1.0.0
-      - name: kubernetes-master
-        version: v1.26.0
-        inline:
-          handler: EnsureMasterUpgrade
-          version: v1.0.0
-      - name: kubernetes-worker
-        version: v1.26.0
-        inline:
-          handler: EnsureWorkerUpgrade
-          version: v1.0.0
-```
-
-#### 3.3.2 26.06 及之后版本 ReleaseImage (声明式升级)
-
-```yaml
-# ReleaseImage for 26.06
-apiVersion: config.openfuyao.cn/v1alpha1
-kind: ReleaseImage
-metadata:
-  name: openfuyao-v26.06
-spec:
-  version: "26.06"
-  
-  install:
-    components:
-      # 基础组件 (声明式升级方式)
-      - name: bkeagent
-        version: v26.06.0
-        inline:
-          handler: EnsureBKEAgent
-          version: v1.0.0
-      - name: nodes-env
-        version: v1.0.0
-        inline:
-          handler: EnsureNodesEnv
-          version: v1.0.0
-      - name: cluster-api-obj
-        version: v1.0.0
-        inline:
-          handler: EnsureClusterAPIObj
-          version: v1.0.0
-      - name: certs
-        version: v1.0.0
-        inline:
-          handler: EnsureCerts
-          version: v1.0.0
-      - name: load-balance
-        version: v1.0.0
-        inline:
-          handler: EnsureLoadBalance
-          version: v1.0.0
-      - name: kubernetes-master
-        version: v1.26.0
-        inline:
-          handler: EnsureMasterInit
-          version: v1.0.0
-      - name: kubernetes-worker
-        version: v1.26.0
-        inline:
-          handler: EnsureWorkerJoin
-          version: v1.0.0
-      - name: kube-proxy
-        version: v1.26.0
-      - name: coredns
-        version: v1.11.0
-      - name: nodes-postprocess
-        version: v1.0.0
-        inline:
-          handler: EnsureNodesPostProcess
-          version: v1.0.0
-      - name: agent-switch
-        version: v1.0.0
-        inline:
-          handler: EnsureAgentSwitch
-          version: v1.0.0
-  
-  upgrade:
-    components:
-      # 升级组件 (声明式升级方式)
-      - name: pre-upgrade-resources
-        version: v1.0.0
-        inline:
-          handler: EnsurePreUpgradeResources
-          version: v1.0.0
-      - name: bkeagent
-        version: v26.06.0
-        inline:
-          handler: EnsureAgentUpgrade
-          version: v1.0.0
-      - name: kubernetes-master
-        version: v1.26.0
-        inline:
-          handler: EnsureMasterUpgrade
-          version: v1.0.0
-      - name: kubernetes-worker
-        version: v1.26.0
-        inline:
-          handler: EnsureWorkerUpgrade
-          version: v1.0.0
-```
-
-### 3.4 多 Hop 升级流程
+### 3.3 多 Hop 升级流程
 
 #### 3.4.1 升级路径定义
 
@@ -320,7 +167,7 @@ Step 3: 26.06 -> 26.12(LTS) (多 Hop 声明式升级)
   4. 验证升级结果
 ```
 
-### 3.5 多 Hop 声明式升级方案 (26.06 -> 26.12)
+### 3.4 多 Hop 声明式升级方案 (26.06 -> 26.12)
 
 #### 3.5.1 升级路径
 
@@ -353,7 +200,7 @@ Step 2: 26.09 -> 26.12(LTS) (声明式升级)
 - **并行执行**: 支持并行执行升级任务
 - **回滚支持**: 支持升级失败时回滚到上一个版本
 
-### 3.6 bkeadm 一键升级命令
+### 3.5 bkeadm 一键升级命令
 
 #### 3.6.1 命令设计
 
@@ -543,7 +390,7 @@ func (u *LTSUpgrader) verifyUpgrade(version string) error {
 }
 ```
 
-### 3.7 管理集群升级策略
+### 3.6 管理集群升级策略
 
 #### 3.7.1 问题描述
 
@@ -574,9 +421,9 @@ func (u *LTSUpgrader) verifyUpgrade(version string) error {
    - 26.06 -> 26.09 (声明式升级)
    - 26.09 -> 26.12(LTS) (声明式升级)
 
-### 3.8 预处理步骤详解
+### 3.7 预处理步骤详解
 
-#### 3.8.1 25.12(LTS) -> 26.03 预处理
+#### 3.7.1 25.12(LTS) -> 26.03 预处理
 
 **CRD 迁移**:
 ```bash
@@ -623,7 +470,7 @@ kubectl apply -f config-migration-26.03.yaml
 kubectl get configmap -n bke-system -o yaml > config-verify-26.03.yaml
 ```
 
-#### 3.8.2 26.03 -> 26.06 预处理
+#### 3.7.2 26.03 -> 26.06 预处理
 
 **声明式升级框架引入**:
 ```bash
@@ -773,14 +620,13 @@ kubectl get executorregistry -n bke-system
 | 任务 | 工作量 | 说明 |
 |------|--------|------|
 | **预处理开发** | 4 周 | 开发预处理脚本和工具 |
-| **ReleaseImage 构建** | 2 周 | 构建 26.03 ReleaseImage |
 | **多 Hop 声明式升级** | 3 周 | 实现 26.06 -> 26.12 多 Hop 升级 |
 | **bkeadm 一键升级命令** | 2 周 | 实现 bkeadm upgrade lts 命令 |
 | **测试** | 4 周 | 测试环境和预生产环境测试 |
 | **升级执行** | 4 周 | 生产环境升级执行 |
 | **回滚准备** | 2 周 | 准备回滚方案和工具 |
 | **文档** | 2 周 | 编写升级文档和操作手册 |
-| **总计** | 23 周 | 约 5.5 个月 |
+| **总计** | 21 周 | 约 5 个月 |
 
 ### 7.2 人力资源
 
