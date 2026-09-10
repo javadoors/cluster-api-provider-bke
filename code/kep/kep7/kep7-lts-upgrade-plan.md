@@ -37,6 +37,8 @@
 3. **26.06 及之后**: 支持声明式升级方案
 4. **ReleaseImage 构建**: 25.12 和 26.03 需要基于声明式升级方案构建 ReleaseImage
 5. **管理集群升级**: 25.12(LTS) 管理集群需要先升级以支持 26.06 的声明式升级方案
+6. **26.06->26.12(LTS)**: 支持通过多 Hop 声明式升级方案直接升级（26.06 -> 26.09 -> 26.12）
+7. **bkeadm 一键升级**: 在 bkeadm 中增加命令支持一键式从 25.12(LTS) 升级到 26.12(LTS)
 
 ---
 
@@ -373,29 +375,246 @@ Step 2: 26.03 -> 26.06 (预处理)
   2. 使用 PhaseFlow 升级到 26.06
   3. 验证升级结果
 
-Step 3: 26.06 -> 26.09 (声明式升级)
+Step 3: 26.06 -> 26.12(LTS) (多 Hop 声明式升级)
   1. 使用声明式升级方案
-  2. 支持多 Hop 升级
-  3. 支持断点续传
-  4. 验证升级结果
-
-Step 4: 26.09 -> 26.12(LTS) (声明式升级)
-  1. 使用声明式升级方案
-  2. 支持多 Hop 升级
+  2. 自动执行多 Hop 升级: 26.06 -> 26.09 -> 26.12(LTS)
   3. 支持断点续传
   4. 验证升级结果
 ```
 
-### 3.5 管理集群升级策略
+### 3.5 多 Hop 声明式升级方案 (26.06 -> 26.12)
 
-#### 3.5.1 问题描述
+#### 3.5.1 升级路径
+
+```
+26.06 --> 26.09 --> 26.12(LTS)
+  |          |          |
+  |          |          |
+声明式升级  声明式升级  声明式升级
+(多Hop)    (多Hop)    (多Hop)
+```
+
+#### 3.5.2 升级流程
+
+```
+Step 1: 26.06 -> 26.09 (声明式升级)
+  1. 使用声明式升级方案
+  2. 支持断点续传
+  3. 验证升级结果
+
+Step 2: 26.09 -> 26.12(LTS) (声明式升级)
+  1. 使用声明式升级方案
+  2. 支持断点续传
+  3. 验证升级结果
+```
+
+#### 3.5.3 升级特点
+
+- **自动化**: 自动执行多个 Hop 升级，无需手动干预
+- **断点续传**: 支持从断点继续升级
+- **并行执行**: 支持并行执行升级任务
+- **回滚支持**: 支持升级失败时回滚到上一个版本
+
+### 3.6 bkeadm 一键升级命令
+
+#### 3.6.1 命令设计
+
+```bash
+# 一键升级命令
+bkeadm upgrade lts --from 25.12 --to 26.12
+
+# 参数说明:
+# --from: 源版本 (默认: 当前版本)
+# --to: 目标版本 (默认: 最新 LTS 版本)
+# --skip-preprocessing: 跳过预处理步骤 (默认: false)
+# --dry-run: 模拟升级，不实际执行 (默认: false)
+```
+
+#### 3.6.2 命令执行流程
+
+```
+bkeadm upgrade lts --from 25.12 --to 26.12
+  |
+  +-> Step 1: 检查当前版本
+  |     - 验证当前版本为 25.12(LTS)
+  |     - 验证目标版本为 26.12(LTS)
+  |
+  +-> Step 2: 执行预处理 (25.12 -> 26.03)
+  |     - CRD 迁移
+  |     - API 兼容性处理
+  |     - 数据迁移
+  |     - 配置迁移
+  |     - 使用 PhaseFlow 升级到 26.03
+  |
+  +-> Step 3: 执行预处理 (26.03 -> 26.06)
+  |     - 声明式升级框架引入
+  |     - ReleaseImage 构建
+  |     - ExecutorRegistry 扩展
+  |     - 使用 PhaseFlow 升级到 26.06
+  |
+  +-> Step 4: 执行多 Hop 声明式升级 (26.06 -> 26.12)
+  |     - 26.06 -> 26.09 (声明式升级)
+  |     - 26.09 -> 26.12(LTS) (声明式升级)
+  |
+  +-> Step 5: 验证升级结果
+        - 验证版本为 26.12(LTS)
+        - 验证集群状态正常
+```
+
+#### 3.6.3 命令实现
+
+```go
+// cmd/bkeadm/cmd/upgrade/lts.go
+
+package upgrade
+
+import (
+    "fmt"
+    "github.com/spf13/cobra"
+)
+
+var ltsCmd = &cobra.Command{
+    Use:   "lts",
+    Short: "一键升级到 LTS 版本",
+    Long: `一键升级到 LTS 版本，支持从 25.12(LTS) 升级到 26.12(LTS)。
+支持多 Hop 升级和断点续传。`,
+    RunE: runLTSUpgrade,
+}
+
+var (
+    fromVersion string
+    toVersion   string
+    skipPreprocessing bool
+    dryRun      bool
+)
+
+func init() {
+    ltsCmd.Flags().StringVar(&fromVersion, "from", "", "源版本 (默认: 当前版本)")
+    ltsCmd.Flags().StringVar(&toVersion, "to", "26.12", "目标版本 (默认: 最新 LTS 版本)")
+    ltsCmd.Flags().BoolVar(&skipPreprocessing, "skip-preprocessing", false, "跳过预处理步骤")
+    ltsCmd.Flags().BoolVar(&dryRun, "dry-run", false, "模拟升级，不实际执行")
+}
+
+func runLTSUpgrade(cmd *cobra.Command, args []string) error {
+    // 1. 检查当前版本
+    currentVersion, err := getCurrentVersion()
+    if err != nil {
+        return fmt.Errorf("获取当前版本失败: %w", err)
+    }
+    
+    if fromVersion == "" {
+        fromVersion = currentVersion
+    }
+    
+    fmt.Printf("开始升级: %s -> %s\n", fromVersion, toVersion)
+    
+    // 2. 验证版本
+    if err := validateVersions(fromVersion, toVersion); err != nil {
+        return fmt.Errorf("版本验证失败: %w", err)
+    }
+    
+    // 3. 执行升级
+    upgrader := NewLTSUpgrader(fromVersion, toVersion, skipPreprocessing, dryRun)
+    if err := upgrader.Upgrade(); err != nil {
+        return fmt.Errorf("升级失败: %w", err)
+    }
+    
+    fmt.Printf("升级成功: %s -> %s\n", fromVersion, toVersion)
+    return nil
+}
+
+// LTSUpgrader LTS 升级器
+type LTSUpgrader struct {
+    fromVersion string
+    toVersion   string
+    skipPreprocessing bool
+    dryRun      bool
+}
+
+func NewLTSUpgrader(from, to string, skipPreprocessing, dryRun bool) *LTSUpgrader {
+    return &LTSUpgrader{
+        fromVersion: from,
+        toVersion:   to,
+        skipPreprocessing: skipPreprocessing,
+        dryRun:      dryRun,
+    }
+}
+
+func (u *LTSUpgrader) Upgrade() error {
+    // 升级路径
+    upgradePath := []struct {
+        from string
+        to   string
+        preprocessing bool
+    }{
+        {"25.12", "26.03", true},
+        {"26.03", "26.06", true},
+        {"26.06", "26.09", false},
+        {"26.09", "26.12", false},
+    }
+    
+    for _, step := range upgradePath {
+        if u.fromVersion >= step.to {
+            continue
+        }
+        
+        fmt.Printf("升级: %s -> %s\n", step.from, step.to)
+        
+        if u.dryRun {
+            fmt.Printf("[DRY-RUN] 跳过升级: %s -> %s\n", step.from, step.to)
+            continue
+        }
+        
+        // 执行预处理
+        if step.preprocessing && !u.skipPreprocessing {
+            if err := u.executePreprocessing(step.from, step.to); err != nil {
+                return fmt.Errorf("预处理失败 (%s -> %s): %w", step.from, step.to, err)
+            }
+        }
+        
+        // 执行升级
+        if err := u.executeUpgrade(step.from, step.to); err != nil {
+            return fmt.Errorf("升级失败 (%s -> %s): %w", step.from, step.to, err)
+        }
+        
+        // 验证升级
+        if err := u.verifyUpgrade(step.to); err != nil {
+            return fmt.Errorf("验证升级失败 (%s): %w", step.to, err)
+        }
+    }
+    
+    return nil
+}
+
+func (u *LTSUpgrader) executePreprocessing(from, to string) error {
+    // 执行预处理步骤
+    // ...
+    return nil
+}
+
+func (u *LTSUpgrader) executeUpgrade(from, to string) error {
+    // 执行升级
+    // ...
+    return nil
+}
+
+func (u *LTSUpgrader) verifyUpgrade(version string) error {
+    // 验证升级
+    // ...
+    return nil
+}
+```
+
+### 3.7 管理集群升级策略
+
+#### 3.7.1 问题描述
 
 25.12(LTS) 管理集群需要先升级以支持 26.06 的声明式升级方案。这意味着：
 1. 管理集群需要先升级到 26.03
 2. 然后升级到 26.06（支持声明式升级）
 3. 最后才能使用声明式升级方案升级工作负载集群
 
-#### 3.5.2 升级顺序
+#### 3.7.2 升级顺序
 
 ```
 管理集群升级:
@@ -405,7 +624,7 @@ Step 4: 26.09 -> 26.12(LTS) (声明式升级)
   25.12(LTS) --[预处理]--> 26.03 --[预处理]--> 26.06 --> 26.09 --> 26.12(LTS)
 ```
 
-#### 3.5.3 升级策略
+#### 3.7.3 升级策略
 
 1. **阶段 1**: 升级管理集群到 26.06
    - 25.12(LTS) -> 26.03 (预处理)
@@ -417,9 +636,9 @@ Step 4: 26.09 -> 26.12(LTS) (声明式升级)
    - 26.06 -> 26.09 (声明式升级)
    - 26.09 -> 26.12(LTS) (声明式升级)
 
-### 3.6 预处理步骤详解
+### 3.8 预处理步骤详解
 
-#### 3.6.1 25.12(LTS) -> 26.03 预处理
+#### 3.8.1 25.12(LTS) -> 26.03 预处理
 
 **CRD 迁移**:
 ```bash
@@ -466,7 +685,7 @@ kubectl apply -f config-migration-26.03.yaml
 kubectl get configmap -n bke-system -o yaml > config-verify-26.03.yaml
 ```
 
-#### 3.6.2 26.03 -> 26.06 预处理
+#### 3.8.2 26.03 -> 26.06 预处理
 
 **声明式升级框架引入**:
 ```bash
@@ -509,8 +728,7 @@ kubectl get executorregistry -n bke-system
 |------|------|---------|--------|---------|
 | 1 | 25.12(LTS) -> 26.03 | PhaseFlow | 是 | 2 周 |
 | 2 | 26.03 -> 26.06 | PhaseFlow | 是 | 2 周 |
-| 3 | 26.06 -> 26.09 | 声明式升级 | 否 | 1 周 |
-| 4 | 26.09 -> 26.12(LTS) | 声明式升级 | 否 | 1 周 |
+| 3 | 26.06 -> 26.12(LTS) | 多 Hop 声明式升级 | 否 | 2 周 |
 
 ### 4.2 升级检查清单
 
@@ -537,18 +755,11 @@ kubectl get executorregistry -n bke-system
 - [ ] 升级工作负载集群到 26.06
 - [ ] 验证工作负载集群升级
 
-#### 4.2.3 阶段 3: 26.06 -> 26.09
+#### 4.2.3 阶段 3: 26.06 -> 26.12(LTS)
 
-- [ ] 使用声明式升级方案升级管理集群
+- [ ] 使用多 Hop 声明式升级方案升级管理集群 (26.06 -> 26.09 -> 26.12)
 - [ ] 验证管理集群升级
-- [ ] 使用声明式升级方案升级工作负载集群
-- [ ] 验证工作负载集群升级
-
-#### 4.2.4 阶段 4: 26.09 -> 26.12(LTS)
-
-- [ ] 使用声明式升级方案升级管理集群
-- [ ] 验证管理集群升级
-- [ ] 使用声明式升级方案升级工作负载集群
+- [ ] 使用多 Hop 声明式升级方案升级工作负载集群
 - [ ] 验证工作负载集群升级
 
 ---
@@ -603,8 +814,8 @@ kubectl get executorregistry -n bke-system
 |---------|------|---------|
 | 25.12 -> 26.03 升级 | 测试 PhaseFlow 升级 | 升级成功 |
 | 26.03 -> 26.06 升级 | 测试 PhaseFlow 升级 | 升级成功 |
-| 26.06 -> 26.09 升级 | 测试声明式升级 | 升级成功 |
-| 26.09 -> 26.12 升级 | 测试声明式升级 | 升级成功 |
+| 26.06 -> 26.12 多 Hop 升级 | 测试多 Hop 声明式升级 | 升级成功 |
+| bkeadm 一键升级 | 测试 bkeadm upgrade lts 命令 | 一键升级成功 |
 
 #### 6.2.3 回滚测试
 
@@ -612,8 +823,8 @@ kubectl get executorregistry -n bke-system
 |---------|------|---------|
 | 25.12 -> 26.03 回滚 | 测试回滚流程 | 回滚成功 |
 | 26.03 -> 26.06 回滚 | 测试回滚流程 | 回滚成功 |
-| 26.06 -> 26.09 回滚 | 测试回滚流程 | 回滚成功 |
-| 26.09 -> 26.12 回滚 | 测试回滚流程 | 回滚成功 |
+| 26.06 -> 26.12 多 Hop 回滚 | 测试多 Hop 回滚流程 | 回滚成功 |
+| bkeadm 一键升级回滚 | 测试一键升级回滚 | 回滚成功 |
 
 ---
 
@@ -625,11 +836,13 @@ kubectl get executorregistry -n bke-system
 |------|--------|------|
 | **预处理开发** | 4 周 | 开发预处理脚本和工具 |
 | **ReleaseImage 构建** | 2 周 | 构建 25.12 和 26.03 ReleaseImage |
+| **多 Hop 声明式升级** | 3 周 | 实现 26.06 -> 26.12 多 Hop 升级 |
+| **bkeadm 一键升级命令** | 2 周 | 实现 bkeadm upgrade lts 命令 |
 | **测试** | 4 周 | 测试环境和预生产环境测试 |
 | **升级执行** | 4 周 | 生产环境升级执行 |
 | **回滚准备** | 2 周 | 准备回滚方案和工具 |
 | **文档** | 2 周 | 编写升级文档和操作手册 |
-| **总计** | 18 周 | 约 4.5 个月 |
+| **总计** | 23 周 | 约 5.5 个月 |
 
 ### 7.2 人力资源
 
@@ -651,6 +864,8 @@ kubectl get executorregistry -n bke-system
 - KEP-10: ReleaseImage 安装组件声明式定义
 - OpenShift CVO 架构分析
 - BKE CVO 架构分析
+- 多 Hop 声明式升级方案
+- bkeadm 一键升级命令设计
 
 ### 8.2 术语表
 
@@ -663,6 +878,7 @@ kubectl get executorregistry -n bke-system
 | **ReleaseImage** | 发布镜像，包含组件版本和升级信息 |
 | **多 Hop 升级** | 通过多个中间版本进行升级 |
 | **断点续传** | 升级中断后可以从断点继续升级 |
+| **bkeadm 一键升级** | 通过 bkeadm upgrade lts 命令实现一键式 LTS 版本升级 |
 
 ---
 
