@@ -1195,7 +1195,7 @@ func BuildVersionContextForInstall(
 
 #### 7.2.1 三路分发统一设计
 
-`executePhaseFlow()` 是 BKEClusterReconciler 的核心分发入口，统一管理 DAG 升级、DAG 安装、Legacy PhaseFlow 三条路径。设计原则是**优先匹配 DAG 路径，未命中则回退 Legacy**，确保 Feature Gate 关闭时行为完全不变。
+`executePhaseFlow()` 是 BKEClusterReconciler 的核心分发入口，统一管理 DAG 升级、DAG 安装、PhaseFlow 兜底三条路径。设计原则是**优先匹配 DAG 路径，未命中则走 PhaseFlow 兜底**，确保 Feature Gate 关闭时行为完全不变。
 
 ```txt
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -1204,37 +1204,26 @@ func BuildVersionContextForInstall(
 │                                                                                 │
 │  executePhaseFlow(ctx, phaseCtx, oldCluster, newCluster)                        │
 │     │                                                                           │
-│     │  1. 预处理: 清理过期状态                                                   │
-│     │     cleanupStaleDeclarativeUpgradeStatus(newCluster)                       │
-│     │     (如果上次 DAG 执行中断且集群已重置，清理残留的 DeclarativeUpgradeStatus) │
-│     │                                                                           │
-│     │  2. 判断集群操作类型                                                       │
-│     │     ├─ Delete? → DeletePhases 路径                                       │
-│     │     ├─ Pause? → EnsurePaused Phase                                      │
-│     │     ├─ DryRun? → EnsureDryRun Phase                                     │
-│     │     ├─ Manage? → EnsureClusterManage Phase                               │
-│     │     ├─ Reset? → ResetPhases 路径                                         │
-│     │     └─ Install/Upgrade? → 继续判断 DAG vs Legacy ↓                       │
-│     │                                                                           │
-│     │  3. DAG 升级路径 (优先匹配)                                               │
+│     │  1. DAG 升级路径 (优先匹配)                                                │
 │     │     shouldUseDeclarativeUpgrade(newCluster)?                              │
 │     │     ├─ true → executeUpgradeDAG(...) → return                            │
 │     │     └─ false → 继续                                                      │
 │     │                                                                           │
-│     │  4. DAG 安装路径 (次优先匹配)                                              │
+│     │  2. DAG 安装路径 (次优先匹配)                                              │
 │     │     shouldUseDeclarativeInstall(newCluster)?                               │
 │     │     ├─ true → executeInstallDAG(...) → return                            │
+│     │     │           (内部清理上次 DAG 残留状态后执行)                          │
 │     │     └─ false → 继续                                                      │
 │     │                                                                           │
-│     │  5. Legacy PhaseFlow 路径 (兜底)                                          │
+│     │  3. PhaseFlow 兜底路径                                                    │
 │     │     ├─ 集群操作类 (Delete/Pause/DryRun/Manage/Reset):                     │
 │     │     │   走 CommonPhases + 对应专用 Phase                                   │
 │     │     ├─ 全新安装 (Feature Gate 未启用):                                     │
 │     │     │   走 CommonPhases + DeployPhases (从 BKECluster.Spec 读取版本)      │
 │     │     ├─ 集群扩容 (新增 Master/Worker):                                    │
 │     │     │   走 CommonPhases + ScalePhases (部分 Phase，非完整安装)             │
-│     │     └─ 升级 (无 upgrade-ready):                                           │
-│     │         走 CommonPhases + UpgradePhases (从 BKECluster.Spec 读取版本)     │
+│     │     └─ 升级 (Feature Gate 未启用):                                        │
+│     │         走 CommonPhases + UpgradePhases (从 BKECluster.Spec 读取版本)    │
 │     │                                                                           │
 │     ▼                                                                           │
 │  执行完成                                                                       │
@@ -1244,8 +1233,6 @@ func BuildVersionContextForInstall(
 
 #### 7.2.2 完整代码实现
 
-> **新增设计**：以下代码中 `shouldCleanupDeclarativeStatus` 和 `cleanupStaleDeclarativeUpgradeStatus` 为本 KEP 新增设计，当前代码库中尚未实现。现有 `executePhaseFlow()` 直接进入 `shouldUseDeclarativeUpgrade` 判断，无预处理步骤。
-
 ```go
 // controllers/capbke/bkecluster_controller.go
 
@@ -1254,12 +1241,6 @@ func (r *BKEClusterReconciler) executePhaseFlow(
     phaseCtx *phaseframe.PhaseContext,
     oldCluster, newCluster *bkev1beta1.BKECluster,
 ) (ctrl.Result, error) {
-    // ─── 预处理: 清理过期状态 ───
-    // 如果集群被重置或重新创建，清理上次 DAG 执行的残留状态
-    if shouldCleanupDeclarativeStatus(newCluster) {
-        cleanupStaleDeclarativeUpgradeStatus(newCluster)
-    }
-
     // ─── DAG 升级路径 (优先匹配) ───
     if r.shouldUseDeclarativeUpgrade(newCluster) {
         return r.executeUpgradeDAG(ctx, phaseCtx, oldCluster, newCluster)
@@ -1270,40 +1251,14 @@ func (r *BKEClusterReconciler) executePhaseFlow(
         return r.executeInstallDAG(ctx, phaseCtx, oldCluster, newCluster)
     }
 
-    // ─── Legacy PhaseFlow 路径 (兜底) ───
-    // 以下场景走 Legacy PhaseFlow:
+    // ─── PhaseFlow 兜底路径 ───
+    // 以下场景走 PhaseFlow:
     //   1. 集群操作类 (Delete/Pause/DryRun/Manage/Reset) — 非 Install/Upgrade 操作
-    //   2. 全新安装但 Feature Gate 未启用 (Feature Gate 开启后 ReleaseImage 必须就绪, 不回退)
+    //   2. 全新安装但 Feature Gate 未启用
     //   3. 集群扩容 (新增 Master/Worker 节点)
-    //   4. 升级但 Feature Gate 未启用 (Feature Gate 开启后 ReleaseImage 必须就绪, 不回退)
+    //   4. 升级但 Feature Gate 未启用
     flow := phases.NewPhaseFlow(phaseCtx)
     return flow.Execute()
-}
-
-// shouldCleanupDeclarativeStatus 判断是否需要清理残留的 DAG 状态
-// 场景: 集群重置后重新安装、DAG 执行中断后用户手动重置
-func (r *BKEClusterReconciler) shouldCleanupDeclarativeStatus(bkeCluster *bkev1beta1.BKECluster) bool {
-    // 集群被重置
-    if bkeCluster.Spec.Reset {
-        return true
-    }
-    // DeclarativeUpgradeStatus 有记录但集群状态为 Init (可能被重置)
-    if bkeCluster.Status.DeclarativeUpgrade != nil &&
-        bkeCluster.Status.DeclarativeUpgrade.TargetVersion != "" &&
-        bkeCluster.Status.ClusterStatus == bkev1beta1.ClusterInitializing {
-        return true
-    }
-    return false
-}
-
-// cleanupStaleDeclarativeUpgradeStatus 清理残留的 DAG 执行状态
-func (r *BKEClusterReconciler) cleanupStaleDeclarativeUpgradeStatus(bkeCluster *bkev1beta1.BKECluster) {
-    bkeCluster.Status.DeclarativeUpgrade = nil
-    bkeCluster.Status.ClusterComponentStatuses = nil
-    // 清理可能残留的注解 (install-ready annotation 已移除, 不再清理)
-    delete(bkeCluster.Annotations, annotation.UpgradeReadyAnnotationKey)
-    delete(bkeCluster.Annotations, annotation.SkipKubeletUpgradeAnnotationKey)
-    delete(bkeCluster.Annotations, annotation.KubeletCatchupTargetAnnotationKey)
 }
 ```
 
@@ -1813,6 +1768,12 @@ func (r *BKEClusterReconciler) executeInstallDAG(
     phaseCtx *phaseframe.PhaseContext,
     oldCluster, newCluster *bkev1beta1.BKECluster,
 ) error {
+    // 0. 清理上次 DAG 执行的残留状态 (重置后重新安装场景)
+    //    Scheduler 跳过链中 shouldSkipComponent 检查 DeclarativeUpgradeStatus.IsCompleted,
+    //    如果不清理, 上次安装的 "completed" 记录会导致组件被错误跳过
+    newCluster.Status.DeclarativeUpgrade = nil
+    newCluster.Status.ClusterComponentStatuses = nil
+
     // 1. 解析目标 ReleaseImage
     releaseImage, bundle, err := r.resolveInstallBundle(ctx, newCluster)
     
