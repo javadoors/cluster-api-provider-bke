@@ -87,7 +87,6 @@ PhaseFlow            PhaseFlow              声明式升级    声明式升级  
 
 **特点**:
 - 支持多 Hop 升级
-- 支持断点续传
 - 支持并行执行
 
 #### 阶段 4: 26.09 -> 26.12(LTS) (声明式升级)
@@ -98,7 +97,7 @@ PhaseFlow            PhaseFlow              声明式升级    声明式升级  
 
 ### 3.3 多 Hop 升级流程
 
-#### 3.4.1 升级路径定义
+#### 3.3.1 升级路径定义
 
 ```yaml
 # UpgradePath for LTS upgrade
@@ -130,7 +129,6 @@ spec:
       preprocessing: true
       preprocessingSteps:
         - name: 声明式升级框架引入
-        - name: ReleaseImage 构建
         - name: ExecutorRegistry 扩展
     - from: "26.06"
       to: "26.09"
@@ -140,7 +138,7 @@ spec:
       preprocessing: false
 ```
 
-#### 3.4.2 升级流程
+#### 3.3.2 升级流程
 
 ```
 Step 1: 25.12(LTS) -> 26.03 (预处理)
@@ -150,59 +148,53 @@ Step 1: 25.12(LTS) -> 26.03 (预处理)
      - 数据迁移
      - 配置迁移
   2. 使用 PhaseFlow 升级到 26.03
-  3. 验证升级结果
+  3. 后处理: 验证升级结果
 
 Step 2: 26.03 -> 26.06 (预处理)
   1. 执行预处理步骤:
      - 声明式升级框架引入
-     - ReleaseImage 构建
      - ExecutorRegistry 扩展
   2. 使用 PhaseFlow 升级到 26.06
-  3. 验证升级结果
+  3. 后处理: 验证升级结果
 
 Step 3: 26.06 -> 26.12(LTS) (多 Hop 声明式升级)
   1. 使用声明式升级方案
   2. 自动执行多 Hop 升级: 26.06 -> 26.09 -> 26.12(LTS)
-  3. 支持断点续传
-  4. 验证升级结果
+  3. 后处理: 验证升级结果
 ```
 
 ### 3.4 多 Hop 声明式升级方案 (26.06 -> 26.12)
 
-#### 3.5.1 升级路径
+#### 3.4.1 升级路径
 
 ```
 26.06 --> 26.09 --> 26.12(LTS)
   |          |          |
   |          |          |
 声明式升级  声明式升级  声明式升级
-(多Hop)    (多Hop)    (多Hop)
 ```
 
-#### 3.5.2 升级流程
+#### 3.4.2 升级流程
 
 ```
 Step 1: 26.06 -> 26.09 (声明式升级)
   1. 使用声明式升级方案
-  2. 支持断点续传
-  3. 验证升级结果
+  2. 后处理: 验证升级结果
 
 Step 2: 26.09 -> 26.12(LTS) (声明式升级)
   1. 使用声明式升级方案
-  2. 支持断点续传
-  3. 验证升级结果
+  2. 后处理: 验证升级结果
 ```
 
-#### 3.5.3 升级特点
+#### 3.4.3 升级特点
 
 - **自动化**: 自动执行多个 Hop 升级，无需手动干预
-- **断点续传**: 支持从断点继续升级
 - **并行执行**: 支持并行执行升级任务
 - **回滚支持**: 支持升级失败时回滚到上一个版本
 
 ### 3.5 bkeadm 一键升级命令
 
-#### 3.6.1 命令设计
+#### 3.5.1 命令设计
 
 ```bash
 # 一键升级命令
@@ -215,7 +207,7 @@ bkeadm upgrade lts --from 25.12 --to 26.12
 # --dry-run: 模拟升级，不实际执行 (默认: false)
 ```
 
-#### 3.6.2 命令执行流程
+#### 3.5.2 命令执行流程
 
 ```
 bkeadm upgrade lts --from 25.12 --to 26.12
@@ -224,29 +216,312 @@ bkeadm upgrade lts --from 25.12 --to 26.12
   |     - 验证当前版本为 25.12(LTS)
   |     - 验证目标版本为 26.12(LTS)
   |
-  +-> Step 2: 执行预处理 (25.12 -> 26.03)
-  |     - CRD 迁移
-  |     - API 兼容性处理
-  |     - 数据迁移
-  |     - 配置迁移
-  |     - 使用 PhaseFlow 升级到 26.03
+  +-> Step 2: 加载升级路径，注册各 Hop 处理器
   |
-  +-> Step 3: 执行预处理 (26.03 -> 26.06)
-  |     - 声明式升级框架引入
-  |     - ReleaseImage 构建
-  |     - ExecutorRegistry 扩展
-  |     - 使用 PhaseFlow 升级到 26.06
+  +-> Step 3: 逐 Hop 执行升级
+  |     |
+  |     +-> Hop 1: 25.12 -> 26.03
+  |     |     ├── PreProcess: CRD 迁移, API 兼容性, 数据迁移, 配置迁移
+  |     |     ├── Upgrade:    PhaseFlow 升级
+  |     |     └── PostProcess: 验证集群状态, 验证 CRD, 验证 API
+  |     |
+  |     +-> Hop 2: 26.03 -> 26.06
+  |     |     ├── PreProcess: 声明式升级框架引入, ExecutorRegistry 扩展
+  |     |     ├── Upgrade:    PhaseFlow 升级
+  |     |     └── PostProcess: 验证集群状态, 验证声明式框架就绪
+  |     |
+  |     +-> Hop 3: 26.06 -> 26.09
+  |     |     ├── PreProcess: (无)
+  |     |     ├── Upgrade:    声明式升级
+  |     |     └── PostProcess: 验证集群状态
+  |     |
+  |     +-> Hop 4: 26.09 -> 26.12
+  |           ├── PreProcess: (无)
+  |           ├── Upgrade:    声明式升级
+  |           └── PostProcess: 验证集群状态, 验证 LTS 版本
   |
-  +-> Step 4: 执行多 Hop 声明式升级 (26.06 -> 26.12)
-  |     - 26.06 -> 26.09 (声明式升级)
-  |     - 26.09 -> 26.12(LTS) (声明式升级)
-  |
-  +-> Step 5: 验证升级结果
+  +-> Step 4: 最终验证
         - 验证版本为 26.12(LTS)
         - 验证集群状态正常
+        - 验证所有组件健康
 ```
 
-#### 3.6.3 命令实现
+#### 3.5.3 升级版本处理器框架
+
+```go
+// pkg/upgrade/hop/handler.go
+
+package hop
+
+// Handler 定义单个 Hop 升级的处理器接口
+// 每个版本跳转 (如 25.12 -> 26.03) 注册一个 Handler
+type Handler interface {
+    // FromVersion 源版本
+    FromVersion() string
+    // ToVersion 目标版本
+    ToVersion() string
+    // PreProcess 升级前预处理 (CRD 迁移, API 兼容性处理等)
+    PreProcess(ctx context.Context) error
+    // Upgrade 执行升级
+    Upgrade(ctx context.Context) error
+    // PostProcess 升级后处理 (验证集群状态, 验证组件健康等)
+    PostProcess(ctx context.Context) error
+}
+
+// Registry 升级处理器注册表
+type Registry struct {
+    handlers map[string]Handler // key: "fromVersion->toVersion"
+}
+
+func NewRegistry() *Registry {
+    return &Registry{
+        handlers: make(map[string]Handler),
+    }
+}
+
+// Register 注册一个 Hop 处理器
+func (r *Registry) Register(h Handler) {
+    key := fmt.Sprintf("%s->%s", h.FromVersion(), h.ToVersion())
+    r.handlers[key] = h
+}
+
+// GetHandler 获取指定版本跳转的处理器
+func (r *Registry) GetHandler(from, to string) (Handler, bool) {
+    key := fmt.Sprintf("%s->%s", from, to)
+    h, ok := r.handlers[key]
+    return h, ok
+}
+
+// GetUpgradePath 获取从 from 到 to 的完整升级路径
+func (r *Registry) GetUpgradePath(from, to string) ([]Handler, error) {
+    var path []Handler
+    current := from
+    for current != to {
+        // 查找从 current 出发的下一个 hop
+        next, err := r.findNextHop(current, to)
+        if err != nil {
+            return nil, fmt.Errorf("无法找到从 %s 到 %s 的升级路径: %w", current, to, err)
+        }
+        handler, ok := r.GetHandler(current, next)
+        if !ok {
+            return nil, fmt.Errorf("未注册处理器: %s -> %s", current, next)
+        }
+        path = append(path, handler)
+        current = next
+    }
+    return path, nil
+}
+
+// findNextHop 查找从 current 到 target 的下一个 hop
+func (r *Registry) findNextHop(current, target string) (string, error) {
+    for key := range r.handlers {
+        parts := strings.Split(key, "->")
+        if parts[0] == current {
+            return parts[1], nil
+        }
+    }
+    return "", fmt.Errorf("no next hop from %s", current)
+}
+```
+
+#### 3.5.4 具体 Hop 处理器实现示例
+
+```go
+// pkg/upgrade/hop/handlers/v25_12_to_v26_03.go
+
+package handlers
+
+// Hop2512To2603 25.12(LTS) -> 26.03 升级处理器
+type Hop2512To2603 struct{}
+
+func (h *Hop2512To2603) FromVersion() string { return "25.12" }
+func (h *Hop2512To2603) ToVersion() string   { return "26.03" }
+
+func (h *Hop2512To2603) PreProcess(ctx context.Context) error {
+    // 1. CRD 迁移
+    if err := migrateCRDs(ctx); err != nil {
+        return fmt.Errorf("CRD 迁移失败: %w", err)
+    }
+    // 2. API 兼容性处理
+    if err := migrateAPICompatibility(ctx); err != nil {
+        return fmt.Errorf("API 兼容性处理失败: %w", err)
+    }
+    // 3. 数据迁移
+    if err := migrateData(ctx); err != nil {
+        return fmt.Errorf("数据迁移失败: %w", err)
+    }
+    // 4. 配置迁移
+    if err := migrateConfig(ctx); err != nil {
+        return fmt.Errorf("配置迁移失败: %w", err)
+    }
+    return nil
+}
+
+func (h *Hop2512To2603) Upgrade(ctx context.Context) error {
+    // 使用 PhaseFlow 升级到 26.03
+    return executePhaseFlowUpgrade(ctx, "26.03")
+}
+
+func (h *Hop2512To2603) PostProcess(ctx context.Context) error {
+    // 1. 验证集群状态
+    if err := verifyClusterStatus(ctx, "26.03"); err != nil {
+        return fmt.Errorf("集群状态验证失败: %w", err)
+    }
+    // 2. 验证 CRD 迁移结果
+    if err := verifyCRDMigration(ctx); err != nil {
+        return fmt.Errorf("CRD 迁移验证失败: %w", err)
+    }
+    // 3. 验证 API 兼容性
+    if err := verifyAPICompatibility(ctx); err != nil {
+        return fmt.Errorf("API 兼容性验证失败: %w", err)
+    }
+    return nil
+}
+```
+
+```go
+// pkg/upgrade/hop/handlers/v26_03_to_v26_06.go
+
+// Hop2603To2606 26.03 -> 26.06 升级处理器
+type Hop2603To2606 struct{}
+
+func (h *Hop2603To2606) FromVersion() string { return "26.03" }
+func (h *Hop2603To2606) ToVersion() string   { return "26.06" }
+
+func (h *Hop2603To2606) PreProcess(ctx context.Context) error {
+    // 1. 部署声明式升级框架
+    if err := deployDeclarativeFramework(ctx); err != nil {
+        return fmt.Errorf("声明式升级框架部署失败: %w", err)
+    }
+    // 2. 扩展 ExecutorRegistry
+    if err := extendExecutorRegistry(ctx); err != nil {
+        return fmt.Errorf("ExecutorRegistry 扩展失败: %w", err)
+    }
+    return nil
+}
+
+func (h *Hop2603To2606) Upgrade(ctx context.Context) error {
+    // 使用 PhaseFlow 升级到 26.06
+    return executePhaseFlowUpgrade(ctx, "26.06")
+}
+
+func (h *Hop2603To2606) PostProcess(ctx context.Context) error {
+    // 1. 验证集群状态
+    if err := verifyClusterStatus(ctx, "26.06"); err != nil {
+        return fmt.Errorf("集群状态验证失败: %w", err)
+    }
+    // 2. 验证声明式升级框架就绪
+    if err := verifyDeclarativeFrameworkReady(ctx); err != nil {
+        return fmt.Errorf("声明式升级框架验证失败: %w", err)
+    }
+    return nil
+}
+```
+
+```go
+// pkg/upgrade/hop/handlers/v26_06_to_v26_09.go
+
+// Hop2606To2609 26.06 -> 26.09 升级处理器 (声明式升级)
+type Hop2606To2609 struct{}
+
+func (h *Hop2606To2609) FromVersion() string { return "26.06" }
+func (h *Hop2606To2609) ToVersion() string   { return "26.09" }
+
+func (h *Hop2606To2609) PreProcess(ctx context.Context) error {
+    // 无需预处理
+    return nil
+}
+
+func (h *Hop2606To2609) Upgrade(ctx context.Context) error {
+    // 使用声明式升级方案
+    return executeDeclarativeUpgrade(ctx, "26.09")
+}
+
+func (h *Hop2606To2609) PostProcess(ctx context.Context) error {
+    // 验证集群状态
+    return verifyClusterStatus(ctx, "26.09")
+}
+```
+
+#### 3.5.5 升级编排器
+
+```go
+// pkg/upgrade/orchestrator.go
+
+package upgrade
+
+// Orchestrator 升级编排器
+type Orchestrator struct {
+    registry *hop.Registry
+    dryRun   bool
+}
+
+func NewOrchestrator(registry *hop.Registry, dryRun bool) *Orchestrator {
+    return &Orchestrator{
+        registry: registry,
+        dryRun:   dryRun,
+    }
+}
+
+// Execute 执行从 from 到 to 的完整升级
+func (o *Orchestrator) Execute(ctx context.Context, from, to string) error {
+    // 1. 获取升级路径
+    path, err := o.registry.GetUpgradePath(from, to)
+    if err != nil {
+        return fmt.Errorf("获取升级路径失败: %w", err)
+    }
+
+    fmt.Printf("升级路径: ")
+    for i, h := range path {
+        if i > 0 {
+            fmt.Printf(" -> ")
+        }
+        fmt.Printf("%s", h.ToVersion())
+    }
+    fmt.Println()
+
+    // 2. 逐 Hop 执行升级
+    for i, handler := range path {
+        fmt.Printf("\n=== Hop %d/%d: %s -> %s ===\n",
+            i+1, len(path), handler.FromVersion(), handler.ToVersion())
+
+        if o.dryRun {
+            fmt.Printf("[DRY-RUN] 跳过 Hop: %s -> %s\n",
+                handler.FromVersion(), handler.ToVersion())
+            continue
+        }
+
+        // 2a. 预处理
+        fmt.Printf("[PreProcess] 执行预处理...\n")
+        if err := handler.PreProcess(ctx); err != nil {
+            return fmt.Errorf("预处理失败 (%s -> %s): %w",
+                handler.FromVersion(), handler.ToVersion(), err)
+        }
+        fmt.Printf("[PreProcess] 预处理完成\n")
+
+        // 2b. 升级
+        fmt.Printf("[Upgrade] 执行升级...\n")
+        if err := handler.Upgrade(ctx); err != nil {
+            return fmt.Errorf("升级失败 (%s -> %s): %w",
+                handler.FromVersion(), handler.ToVersion(), err)
+        }
+        fmt.Printf("[Upgrade] 升级完成\n")
+
+        // 2c. 后处理 (验证)
+        fmt.Printf("[PostProcess] 执行后处理验证...\n")
+        if err := handler.PostProcess(ctx); err != nil {
+            return fmt.Errorf("后处理验证失败 (%s): %w",
+                handler.ToVersion(), err)
+        }
+        fmt.Printf("[PostProcess] 后处理验证通过\n")
+    }
+
+    fmt.Printf("\n升级完成: %s -> %s\n", from, to)
+    return nil
+}
+```
+
+#### 3.5.6 bkeadm 命令入口
 
 ```go
 // cmd/bkeadm/cmd/upgrade/lts.go
@@ -254,23 +529,26 @@ bkeadm upgrade lts --from 25.12 --to 26.12
 package upgrade
 
 import (
+    "context"
     "fmt"
     "github.com/spf13/cobra"
+    "bkeadm/pkg/upgrade"
+    "bkeadm/pkg/upgrade/hop"
+    "bkeadm/pkg/upgrade/hop/handlers"
 )
 
 var ltsCmd = &cobra.Command{
     Use:   "lts",
     Short: "一键升级到 LTS 版本",
-    Long: `一键升级到 LTS 版本，支持从 25.12(LTS) 升级到 26.12(LTS)。
-支持多 Hop 升级和断点续传。`,
-    RunE: runLTSUpgrade,
+    Long:  `一键升级到 LTS 版本，支持从 25.12(LTS) 升级到 26.12(LTS)。`,
+    RunE:  runLTSUpgrade,
 }
 
 var (
-    fromVersion string
-    toVersion   string
+    fromVersion       string
+    toVersion         string
     skipPreprocessing bool
-    dryRun      bool
+    dryRun            bool
 )
 
 func init() {
@@ -281,125 +559,47 @@ func init() {
 }
 
 func runLTSUpgrade(cmd *cobra.Command, args []string) error {
+    ctx := context.Background()
+
     // 1. 检查当前版本
     currentVersion, err := getCurrentVersion()
     if err != nil {
         return fmt.Errorf("获取当前版本失败: %w", err)
     }
-    
     if fromVersion == "" {
         fromVersion = currentVersion
     }
-    
+
     fmt.Printf("开始升级: %s -> %s\n", fromVersion, toVersion)
-    
-    // 2. 验证版本
-    if err := validateVersions(fromVersion, toVersion); err != nil {
-        return fmt.Errorf("版本验证失败: %w", err)
-    }
-    
-    // 3. 执行升级
-    upgrader := NewLTSUpgrader(fromVersion, toVersion, skipPreprocessing, dryRun)
-    if err := upgrader.Upgrade(); err != nil {
+
+    // 2. 注册所有 Hop 处理器
+    registry := hop.NewRegistry()
+    registry.Register(&handlers.Hop2512To2603{})
+    registry.Register(&handlers.Hop2603To2606{})
+    registry.Register(&handlers.Hop2606To2609{})
+    registry.Register(&handlers.Hop2609To2612{})
+
+    // 3. 创建编排器并执行升级
+    orchestrator := upgrade.NewOrchestrator(registry, dryRun)
+    if err := orchestrator.Execute(ctx, fromVersion, toVersion); err != nil {
         return fmt.Errorf("升级失败: %w", err)
     }
-    
+
     fmt.Printf("升级成功: %s -> %s\n", fromVersion, toVersion)
-    return nil
-}
-
-// LTSUpgrader LTS 升级器
-type LTSUpgrader struct {
-    fromVersion string
-    toVersion   string
-    skipPreprocessing bool
-    dryRun      bool
-}
-
-func NewLTSUpgrader(from, to string, skipPreprocessing, dryRun bool) *LTSUpgrader {
-    return &LTSUpgrader{
-        fromVersion: from,
-        toVersion:   to,
-        skipPreprocessing: skipPreprocessing,
-        dryRun:      dryRun,
-    }
-}
-
-func (u *LTSUpgrader) Upgrade() error {
-    // 升级路径
-    upgradePath := []struct {
-        from string
-        to   string
-        preprocessing bool
-    }{
-        {"25.12", "26.03", true},
-        {"26.03", "26.06", true},
-        {"26.06", "26.09", false},
-        {"26.09", "26.12", false},
-    }
-    
-    for _, step := range upgradePath {
-        if u.fromVersion >= step.to {
-            continue
-        }
-        
-        fmt.Printf("升级: %s -> %s\n", step.from, step.to)
-        
-        if u.dryRun {
-            fmt.Printf("[DRY-RUN] 跳过升级: %s -> %s\n", step.from, step.to)
-            continue
-        }
-        
-        // 执行预处理
-        if step.preprocessing && !u.skipPreprocessing {
-            if err := u.executePreprocessing(step.from, step.to); err != nil {
-                return fmt.Errorf("预处理失败 (%s -> %s): %w", step.from, step.to, err)
-            }
-        }
-        
-        // 执行升级
-        if err := u.executeUpgrade(step.from, step.to); err != nil {
-            return fmt.Errorf("升级失败 (%s -> %s): %w", step.from, step.to, err)
-        }
-        
-        // 验证升级
-        if err := u.verifyUpgrade(step.to); err != nil {
-            return fmt.Errorf("验证升级失败 (%s): %w", step.to, err)
-        }
-    }
-    
-    return nil
-}
-
-func (u *LTSUpgrader) executePreprocessing(from, to string) error {
-    // 执行预处理步骤
-    // ...
-    return nil
-}
-
-func (u *LTSUpgrader) executeUpgrade(from, to string) error {
-    // 执行升级
-    // ...
-    return nil
-}
-
-func (u *LTSUpgrader) verifyUpgrade(version string) error {
-    // 验证升级
-    // ...
     return nil
 }
 ```
 
 ### 3.6 管理集群升级策略
 
-#### 3.7.1 问题描述
+#### 3.6.1 问题描述
 
 25.12(LTS) 管理集群需要先升级以支持 26.06 的声明式升级方案。这意味着：
 1. 管理集群需要先升级到 26.03
 2. 然后升级到 26.06（支持声明式升级）
 3. 最后才能使用声明式升级方案升级工作负载集群
 
-#### 3.7.2 升级顺序
+#### 3.6.2 升级顺序
 
 ```
 管理集群升级:
@@ -409,7 +609,7 @@ func (u *LTSUpgrader) verifyUpgrade(version string) error {
   25.12(LTS) --[预处理]--> 26.03 --[预处理]--> 26.06 --> 26.09 --> 26.12(LTS)
 ```
 
-#### 3.7.3 升级策略
+#### 3.6.3 升级策略
 
 1. **阶段 1**: 升级管理集群到 26.06
    - 25.12(LTS) -> 26.03 (预处理)
@@ -657,11 +857,10 @@ kubectl get executorregistry -n bke-system
 |------|------|
 | **LTS** | Long Term Support，长期支持版本 |
 | **PhaseFlow** | 传统升级方式，基于硬编码的 Phase 列表 |
-| **声明式升级** | 基于 DAG 的升级方式，支持多 Hop 和断点续传 |
+| **声明式升级** | 基于 DAG 的升级方式，支持多 Hop 升级 |
 | **预处理** | 升级前的准备工作，包括 CRD 迁移、API 兼容性处理等 |
 | **ReleaseImage** | 发布镜像，包含组件版本和升级信息 |
 | **多 Hop 升级** | 通过多个中间版本进行升级 |
-| **断点续传** | 升级中断后可以从断点继续升级 |
 | **bkeadm 一键升级** | 通过 bkeadm upgrade lts 命令实现一键式 LTS 版本升级 |
 
 ---
