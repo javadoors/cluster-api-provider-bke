@@ -97,9 +97,60 @@ PhaseFlow            PhaseFlow              声明式升级    声明式升级  
 
 ### 3.3 多 Hop 升级流程
 
-#### 3.3.1 升级流程
+#### 3.3.1 升级路径定义 (UpgradePath CR)
 
+```yaml
+# UpgradePath CR 定义升级路径
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: UpgradePath
+metadata:
+  name: lts-upgrade-path
+spec:
+  versions:
+    - version: "25.12"
+      lts: true
+    - version: "26.03"
+    - version: "26.06"
+    - version: "26.09"
+    - version: "26.12"
+      lts: true
+  
+  paths:
+    - from: "25.12"
+      to: "26.03"
+      handler: "Hop2512To2603"          # 处理器名称
+      preprocessing: true
+      preprocessingSteps:
+        - name: CRD 迁移
+        - name: API 兼容性处理
+        - name: 数据迁移
+        - name: 配置迁移
+    - from: "26.03"
+      to: "26.06"
+      handler: "Hop2603To2606"          # 处理器名称
+      preprocessing: true
+      preprocessingSteps:
+        - name: 声明式升级框架引入
+        - name: ExecutorRegistry 扩展
+    - from: "26.06"
+      to: "26.09"
+      handler: "Hop2606To2609"          # 处理器名称
+      preprocessing: false
+    - from: "26.09"
+      to: "26.12"
+      handler: "Hop2609To2612"          # 处理器名称
+      preprocessing: false
 ```
+
+**设计要点**:
+- 每个 path 定义一个 Hop (从 from 到 to)
+- handler 字段指定该 Hop 使用的处理器名称
+- 处理器在代码中注册，通过 handler 名称动态加载
+- preprocessing 和 preprocessingSteps 定义预处理步骤
+
+#### 3.3.2 升级流程
+
+```txt
 Step 1: 25.12(LTS) -> 26.03 (预处理)
   1. 执行预处理步骤:
      - CRD 迁移
@@ -167,14 +218,27 @@ bkeadm upgrade lts --from 25.12 --to 26.12
 
 #### 3.5.2 命令执行流程
 
+**设计思路**
+
+BKE CVO 采用声明式升级路径管理，核心设计原则：
+
+1. **升级路径动态获取**: Hop 信息从 UpgradePath CR 中动态获取，而非硬编码在代码中
+2. **处理器注册机制**: 每个版本跳转 (如 25.12 -> 26.03) 对应一个处理器，通过注册表动态加载
+3. **三阶段执行模型**: 每个 Hop 执行分为三个阶段：预处理 (PreProcess) -> 升级 (Upgrade) -> 后处理 (PostProcess)
+
+**执行流程**
+
 ```
 bkeadm upgrade lts --from 25.12 --to 26.12
   |
   +-> Step 1: 检查当前版本
-  |     - 验证当前版本为 25.12(LTS)
+  |     - 从集群中获取当前版本 (从 ClusterVersion CR 获取)
   |     - 验证目标版本为 26.12(LTS)
   |
-  +-> Step 2: 加载升级路径，注册各 Hop 处理器
+  +-> Step 2: 获取升级路径
+  |     - 从 UpgradePath CR 中获取升级路径定义
+  |     - 解析路径中的每个 Hop (from -> to)
+  |     - 为每个 Hop 加载对应的处理器 (Handler)
   |
   +-> Step 3: 逐 Hop 执行升级
   |     |
@@ -408,14 +472,24 @@ func (h *Hop2606To2609) PostProcess(ctx context.Context) error {
 
 package upgrade
 
+import (
+    "context"
+    "fmt"
+    "bkeadm/pkg/upgrade/hop"
+    upgradev1alpha1 "bkeadm/api/upgrade/v1alpha1"
+    "sigs.k8s.io/controller-runtime/pkg/client"
+)
+
 // Orchestrator 升级编排器
 type Orchestrator struct {
+    client   client.Client
     registry *hop.Registry
     dryRun   bool
 }
 
-func NewOrchestrator(registry *hop.Registry, dryRun bool) *Orchestrator {
+func NewOrchestrator(client client.Client, registry *hop.Registry, dryRun bool) *Orchestrator {
     return &Orchestrator{
+        client:   client,
         registry: registry,
         dryRun:   dryRun,
     }
@@ -423,59 +497,114 @@ func NewOrchestrator(registry *hop.Registry, dryRun bool) *Orchestrator {
 
 // Execute 执行从 from 到 to 的完整升级
 func (o *Orchestrator) Execute(ctx context.Context, from, to string) error {
-    // 1. 获取升级路径
-    path, err := o.registry.GetUpgradePath(from, to)
+    // 1. 从 UpgradePath CR 中获取升级路径
+    upgradePath, err := o.getUpgradePath(ctx)
     if err != nil {
         return fmt.Errorf("获取升级路径失败: %w", err)
     }
 
+    // 2. 解析升级路径，获取从 from 到 to 的所有 Hop
+    hops, err := o.parseUpgradePath(upgradePath, from, to)
+    if err != nil {
+        return fmt.Errorf("解析升级路径失败: %w", err)
+    }
+
     fmt.Printf("升级路径: ")
-    for i, h := range path {
+    for i, hop := range hops {
         if i > 0 {
             fmt.Printf(" -> ")
         }
-        fmt.Printf("%s", h.ToVersion())
+        fmt.Printf("%s", hop.To)
     }
     fmt.Println()
 
-    // 2. 逐 Hop 执行升级
-    for i, handler := range path {
+    // 3. 逐 Hop 执行升级
+    for i, hop := range hops {
         fmt.Printf("\n=== Hop %d/%d: %s -> %s ===\n",
-            i+1, len(path), handler.FromVersion(), handler.ToVersion())
+            i+1, len(hops), hop.From, hop.To)
 
         if o.dryRun {
-            fmt.Printf("[DRY-RUN] 跳过 Hop: %s -> %s\n",
-                handler.FromVersion(), handler.ToVersion())
+            fmt.Printf("[DRY-RUN] 跳过 Hop: %s -> %s\n", hop.From, hop.To)
             continue
         }
 
-        // 2a. 预处理
+        // 3a. 获取该 Hop 的处理器
+        handler, err := o.registry.GetHandler(hop.From, hop.To)
+        if err != nil {
+            return fmt.Errorf("获取处理器失败 (%s -> %s): %w", hop.From, hop.To, err)
+        }
+
+        // 3b. 预处理
         fmt.Printf("[PreProcess] 执行预处理...\n")
         if err := handler.PreProcess(ctx); err != nil {
-            return fmt.Errorf("预处理失败 (%s -> %s): %w",
-                handler.FromVersion(), handler.ToVersion(), err)
+            return fmt.Errorf("预处理失败 (%s -> %s): %w", hop.From, hop.To, err)
         }
         fmt.Printf("[PreProcess] 预处理完成\n")
 
-        // 2b. 升级
+        // 3c. 升级
         fmt.Printf("[Upgrade] 执行升级...\n")
         if err := handler.Upgrade(ctx); err != nil {
-            return fmt.Errorf("升级失败 (%s -> %s): %w",
-                handler.FromVersion(), handler.ToVersion(), err)
+            return fmt.Errorf("升级失败 (%s -> %s): %w", hop.From, hop.To, err)
         }
         fmt.Printf("[Upgrade] 升级完成\n")
 
-        // 2c. 后处理 (验证)
+        // 3d. 后处理 (验证)
         fmt.Printf("[PostProcess] 执行后处理验证...\n")
         if err := handler.PostProcess(ctx); err != nil {
-            return fmt.Errorf("后处理验证失败 (%s): %w",
-                handler.ToVersion(), err)
+            return fmt.Errorf("后处理验证失败 (%s): %w", hop.To, err)
         }
         fmt.Printf("[PostProcess] 后处理验证通过\n")
     }
 
     fmt.Printf("\n升级完成: %s -> %s\n", from, to)
     return nil
+}
+
+// getUpgradePath 从集群中获取 UpgradePath CR
+func (o *Orchestrator) getUpgradePath(ctx context.Context) (*upgradev1alpha1.UpgradePath, error) {
+    upgradePathList := &upgradev1alpha1.UpgradePathList{}
+    if err := o.client.List(ctx, upgradePathList); err != nil {
+        return nil, fmt.Errorf("列出 UpgradePath 失败: %w", err)
+    }
+    if len(upgradePathList.Items) == 0 {
+        return nil, fmt.Errorf("未找到 UpgradePath CR")
+    }
+    // 返回第一个 UpgradePath (通常只有一个)
+    return &upgradePathList.Items[0], nil
+}
+
+// parseUpgradePath 解析升级路径，获取从 from 到 to 的所有 Hop
+func (o *Orchestrator) parseUpgradePath(upgradePath *upgradev1alpha1.UpgradePath, from, to string) ([]Hop, error) {
+    var hops []Hop
+    current := from
+    
+    for current != to {
+        // 在 UpgradePath 中查找从 current 出发的下一个 hop
+        next, found := o.findNextHop(upgradePath, current)
+        if !found {
+            return nil, fmt.Errorf("未找到从 %s 到 %s 的升级路径", current, to)
+        }
+        hops = append(hops, Hop{From: current, To: next})
+        current = next
+    }
+    
+    return hops, nil
+}
+
+// findNextHop 在 UpgradePath 中查找从 current 出发的下一个 hop
+func (o *Orchestrator) findNextHop(upgradePath *upgradev1alpha1.UpgradePath, current string) (string, bool) {
+    for _, path := range upgradePath.Spec.Paths {
+        if path.From == current {
+            return path.To, true
+        }
+    }
+    return "", false
+}
+
+// Hop 表示一个版本跳转
+type Hop struct {
+    From string
+    To   string
 }
 ```
 
@@ -493,6 +622,7 @@ import (
     "bkeadm/pkg/upgrade"
     "bkeadm/pkg/upgrade/hop"
     "bkeadm/pkg/upgrade/hop/handlers"
+    "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 var ltsCmd = &cobra.Command{
@@ -518,9 +648,15 @@ func init() {
 
 func runLTSUpgrade(cmd *cobra.Command, args []string) error {
     ctx := context.Background()
+    
+    // 1. 获取 Kubernetes 客户端
+    client, err := getClient()
+    if err != nil {
+        return fmt.Errorf("获取客户端失败: %w", err)
+    }
 
-    // 1. 检查当前版本
-    currentVersion, err := getCurrentVersion()
+    // 2. 检查当前版本
+    currentVersion, err := getCurrentVersion(client)
     if err != nil {
         return fmt.Errorf("获取当前版本失败: %w", err)
     }
@@ -530,21 +666,39 @@ func runLTSUpgrade(cmd *cobra.Command, args []string) error {
 
     fmt.Printf("开始升级: %s -> %s\n", fromVersion, toVersion)
 
-    // 2. 注册所有 Hop 处理器
+    // 3. 创建处理器注册表
     registry := hop.NewRegistry()
+    
+    // 4. 注册所有 Hop 处理器
+    // 这些处理器可以在运行时从 UpgradePath CR 中动态加载
+    // 或者在代码中静态注册
     registry.Register(&handlers.Hop2512To2603{})
     registry.Register(&handlers.Hop2603To2606{})
     registry.Register(&handlers.Hop2606To2609{})
     registry.Register(&handlers.Hop2609To2612{})
 
-    // 3. 创建编排器并执行升级
-    orchestrator := upgrade.NewOrchestrator(registry, dryRun)
+    // 5. 创建编排器并执行升级
+    orchestrator := upgrade.NewOrchestrator(client, registry, dryRun)
     if err := orchestrator.Execute(ctx, fromVersion, toVersion); err != nil {
         return fmt.Errorf("升级失败: %w", err)
     }
 
     fmt.Printf("升级成功: %s -> %s\n", fromVersion, toVersion)
     return nil
+}
+
+// getClient 获取 Kubernetes 客户端
+func getClient() (client.Client, error) {
+    // 实现获取 Kubernetes 客户端的逻辑
+    // ...
+    return nil, nil
+}
+
+// getCurrentVersion 从集群中获取当前版本
+func getCurrentVersion(client client.Client) (string, error) {
+    // 从 ClusterVersion CR 中获取当前版本
+    // ...
+    return "", nil
 }
 ```
 
