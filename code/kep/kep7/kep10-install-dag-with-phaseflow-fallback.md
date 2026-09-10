@@ -1100,55 +1100,6 @@ func BuildDAG(components []cvv1alpha1.ReleaseImageUpgradeComponent, resolve Depe
 
 > **设计原则**：渐进迁移——新代码使用 `ComponentDAG`/`BuildDAG`，旧代码可在后续版本逐步迁移到新名称，不需要一次性全量替换。type alias 保证两个名称完全等价。
 
-> **组件过滤职责分离**：DAG 构建器负责构建完整的组件拓扑图，不关心哪些组件需要执行。组件的跳过/执行决策由 DAG 执行器 (`Scheduler.ExecuteDAG`) 在运行时通过两层判断完成：
->
-> **第一层：VersionContext.Decide() — 版本决策**
-> ```go
-> func Decide(vc *VersionContext, name string) Decision {
->     // 安装场景：current 为空，target 有值 → DecisionInstall
->     if vc.Current[name] == "" && vc.Target[name] != "" {
->         return DecisionInstall
->     }
->     // 跳过场景：current == target 或 target 为空 → DecisionSkip
->     if vc.Current[name] == vc.Target[name] || vc.Target[name] == "" {
->         return DecisionSkip
->     }
->     // 升级场景：current != target → DecisionUpgrade
->     return DecisionUpgrade
-> }
-> ```
->
-> **第二层：组件的 condition / NodeFilter — 运行时条件判断**
->
-> 即使 `Decide()` 返回 `DecisionInstall`/`DecisionUpgrade`，组件仍可能被跳过，取决于：
->
-> | 判断机制 | 数据来源 | 说明 | 示例 |
-> |---------|---------|------|------|
-> | **Condition** | `ComponentVersion.Spec.Condition` (Go Template 表达式) | 组件级条件，不满足时整个组件跳过 | `kubernetes-master` 的 `Condition: '{{ eq .ScaleType "master" }}'` — Worker 扩容时跳过 |
-> | **NodeFilter** | `ComponentVersion.Spec.NodeFilter` (声明式: Roles/MatchLabels/SkipCompleted) | 节点级过滤，决定组件在哪些节点上执行 | `etcd` 的 `NodeFilter.Roles: ["etcd"]` — 仅 etcd 节点执行 |
-> | | | | `kubernetes-master` 的 `NodeFilter.Roles: ["master"]` — 仅 Master 节点执行 |
-> | | | | `nvidia-driver` 的 `NodeFilter.MatchLabels: {"gpu":"true"}` — 仅 GPU 节点执行 |
->
-> > **NodeFilter 是 `ComponentVersion.Spec.NodeFilter`，不是 Phase 内部的 `filterNodes()` 实现**。NodeFilter 是声明式字段（Roles/MatchLabels/SkipCompleted），由 `BKENodeFilter` 在 Executor 层消费；Phase 内部的 `filterNodes()` + StateCode 是 Legacy 路径的节点过滤机制，两者不同：
-> > - **NodeFilter**：`ComponentVersion.Spec.NodeFilter` 声明式字段 → `BKENodeFilter.Filter()` 消费 → Executor 层过滤
-> > - **filterNodes (Legacy)**：`phaseutil.filterNodes()` + `NodePredicate` → Phase `Execute()` 内部过滤
-> > - DAG 路径中 NodeFilter 生效；Legacy PhaseFlow 路径中 filterNodes 生效
->
-> **执行流程**：
-> ```text
-> Scheduler.ExecuteDAG():
->   for each component in DAG:
->     1. Decide(vc, name) → DecisionSkip? → 跳过该组件 (第一层)
->     2. shouldExecuteByCondition(cv.Spec.Condition, tmpl) → false? → 跳过该组件 (第二层: Condition)
->     3. executeComponent → Executor 内部 NodeFilter.Filter(cv.Spec.NodeFilter) → 过滤目标节点 (第二层: NodeFilter)
->     4. 执行组件 (仅对过滤后的节点)
-> ```
->
-> **不同场景下的 Decide() 结果**：
-> - **全新安装**：`Current` 全空，`Target` 有值 → 所有组件 `DecisionInstall` → 全部执行
-> - **纳管场景**：`manage` 组件先探测版本填充 `Current`，后续组件根据 `Current` 与 `Target` 的比较结果决定 `DecisionSkip`/`DecisionUpgrade`/`DecisionInstall`
-> - **扩容场景**：已有节点组件 `Current == Target` → `DecisionSkip`，新增节点组件 `Current="" && Target!=""` → `DecisionInstall`
-
 ### 6.4 安装 VersionContext 构建
 
 ```go
