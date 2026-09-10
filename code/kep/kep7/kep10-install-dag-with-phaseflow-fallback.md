@@ -2,13 +2,11 @@
 
 | 字段 | 值 |
 |------|-----|
-| **KEP 编号** | KEP-10 (PhaseFlow 兜底方案) |
-| **标题** | ReleaseImage 安装组件声明式定义与 DAG 驱动安装流程设计（保留 PhaseFlow 兜底） |
+| **KEP 编号** | KEP-10 |
+| **标题** | 安装 DAG 化设计（PhaseFlow 兜底） |
 | **状态** | `provisional` |
 | **类型** | Feature |
-| **依赖** | KEP-5 声明式升级框架、KEP-6 三层状态机设计、KEP-9 Static Pod 类型设计、KEP-16 二进制组件设计 |
-| **关联 KEP** | KEP-17 (Selector 组件)、KEP-18 (Condition 过滤)、KEP-19 (节点过滤) |
-| **来源** | 从 `kep6/kep10-install-components-declarative-design.md` 抽离，定位为仅安装场景 DAG 化，PhaseFlow 作为非安装/非升级场景的兜底方案 |
+| **依赖** | KEP-5 声明式升级框架、Cluster API v1beta1 |
 
 ---
 
@@ -86,9 +84,7 @@
 > - §1-6: 设计基础（动机、范围、结构定义、目录设计、DAG 构建）
 > - §7-8: 执行设计（DAG 执行入口、安装实现、Phase 映射）
 > - §9: 迁移策略（Feature Gate、向后兼容、平滑升级）— 包含 PhaseFlow 兜底路径设计（§7.2.3-7.2.6 引用此处）
-> - §10-15: 辅助内容（可观测性、工作量、风险、Bundle、条件过滤引用、Inline 字段移除）
->
-> **与 kep6/ 主文档的区别**：本提案仅对安装场景进行 DAG 化，PhaseFlow 作为非安装/非升级场景的兜底方案保留，后续再优化。不包含 Legacy PhaseFlow 完全移除方案。
+> - §10-15: 辅助内容（可观测性、工作量、风险、Bundle、条件过滤、Inline 字段移除）
 
 ---
 
@@ -224,7 +220,7 @@ type ReleaseImageUpgradeComponent struct {
 
 经过分析，ReleaseImage 的类型定义存在两层重复：
 
-**第一层重复**：`ReleaseImageInstallComponent` 和 `ReleaseImageUpgradeComponent` 字段完全相同（移除 `ReleaseImageUpgradeComponent.Inline` 后，见 [§16](#16-releaseimageupgradecomponentinline-字段移除设计)）
+**第一层重复**：`ReleaseImageInstallComponent` 和 `ReleaseImageUpgradeComponent` 字段完全相同（移除 `ReleaseImageUpgradeComponent.Inline` 后，见 [§15](#15-releaseimageupgradecomponentinline-字段移除设计)）
 **第二层重复**：`ReleaseImageInstallSpec` 和 `ReleaseImageUpgradeSpec` 字段完全相同
 
 可以通过**两层统一抽象**消除所有重复：
@@ -1133,8 +1129,8 @@ func BuildDAG(components []cvv1alpha1.ReleaseImageUpgradeComponent, resolve Depe
 > | | | | `kubernetes-master` 的 `NodeFilter.Roles: ["master"]` — 仅 Master 节点执行 |
 > | | | | `nvidia-driver` 的 `NodeFilter.MatchLabels: {"gpu":"true"}` — 仅 GPU 节点执行 |
 >
-> > **NodeFilter 是 `ComponentVersion.Spec.NodeFilter`（KEP-19），不是 Phase 内部的 `filterNodes()` 实现**。NodeFilter 是声明式字段（Roles/MatchLabels/SkipCompleted），由 `BKENodeFilter` 在 Executor 层消费；Phase 内部的 `filterNodes()` + StateCode 是 Legacy 路径的节点过滤机制，两者不同：
-> > - **NodeFilter (KEP-19)**：`ComponentVersion.Spec.NodeFilter` 声明式字段 → `BKENodeFilter.Filter()` 消费 → Executor 层过滤
+> > **NodeFilter 是 `ComponentVersion.Spec.NodeFilter`，不是 Phase 内部的 `filterNodes()` 实现**。NodeFilter 是声明式字段（Roles/MatchLabels/SkipCompleted），由 `BKENodeFilter` 在 Executor 层消费；Phase 内部的 `filterNodes()` + StateCode 是 Legacy 路径的节点过滤机制，两者不同：
+> > - **NodeFilter**：`ComponentVersion.Spec.NodeFilter` 声明式字段 → `BKENodeFilter.Filter()` 消费 → Executor 层过滤
 > > - **filterNodes (Legacy)**：`phaseutil.filterNodes()` + `NodePredicate` → Phase `Execute()` 内部过滤
 > > - DAG 路径中 NodeFilter 生效；Legacy PhaseFlow 路径中 filterNodes 生效
 >
@@ -2684,8 +2680,8 @@ kubectl get bkecluster my-cluster -o jsonpath='{.status.clusterComponentStatuses
 | | CommonPhases 兼容 | 确保 Finalizer/Paused/ClusterManage 等通用 Phase 与 DAG 共存 | 2 |
 | | 安装中断恢复 | 部分组件安装失败后的断点续传 + DeclarativeUpgradeStatus 状态恢复 | 2 |
 | | BKEAgent 命令适配 | 安装 handler 与现有 BKEAgent Command/ENV 命令机制集成验证 | 2 |
-| | TemplateContext 扩展 (KEP-18) | 新增 Operation/ScaleType/NodeCount 等字段 + `buildTemplateContext` 扩展 | 2 |
-| | EvaluateCondition 实现 (KEP-18) | Go Template 求值 + `shouldExecuteByCondition` Scheduler 集成 | 2 |
+| | TemplateContext 扩展 | 新增 Operation/ScaleType/NodeCount 等字段 + `buildTemplateContext` 扩展 | 2 |
+| | EvaluateCondition 实现 | Go Template 求值 + `shouldExecuteByCondition` Scheduler 集成 | 2 |
 | | Inline 字段移除 (§15) | `BuildDAG` 签名重构 + `ComponentVersionLookup` + 删除 `enrichUpgradeComponent` + 删除 `ReleaseImageUpgradeInline` | 3 |
 | **Phase 1 小计** | | | **37** |
 | **Phase 2: 灰度迁移** | 混合执行模式 | `executePartialInstallDAG` + `WithSkipPhases` PhaseFlow 扩展 | 4 |
@@ -2718,7 +2714,7 @@ kubectl get bkecluster my-cluster -o jsonpath='{.status.clusterComponentStatuses
 
 | 文档类型 | 文档内容 | 工作量（人天） |
 |---------|---------|---------------|
-| **设计文档** | 本 KEP 文档完善 + KEP-18 (Condition) + KEP-19 (NodeFilter) | 3 |
+| **设计文档** | 本 KEP 文档完善 | 3 |
 | **升级指南** | PhaseFlow → DAG 迁移指南 | 2 |
 | **运维手册** | DAG 安装路径运维手册 | 1 |
 | **故障排查** | DAG 安装故障排查指南 | 1 |
@@ -3032,7 +3028,7 @@ func (s *BundleStore) GetComponentVersion(ctx, name, version string) (*apiv1.Com
 │        GetComponentVersion(ctx, name, version)                                  │
 │        → 从 bundle.Components[key] 返回 *ComponentVersion                       │
 │        → Scheduler 读取 cv.Spec.Type 决定执行器                                 │
-│        → BuildDAG 通过 ComponentVersionLookup 读取 cv.Spec.Inline (§16)         │
+│        → BuildDAG 通过 ComponentVersionLookup 读取 cv.Spec.Inline (§15)         │
 │        消费者: Scheduler.executeComponent / topology.BuildDAG                   │                                        │
 │                                                                                 │
 │           │                                                                     │
@@ -3046,7 +3042,7 @@ func (s *BundleStore) GetComponentVersion(ctx, name, version string) (*apiv1.Com
 │  Scheduler.ExecuteDAG                                                           │
 │    对每个组件:                                                                   │
 │    1. CVStore.GetComponentVersion → cv.Spec.Type → 选择执行器                   │
-│    2. inline → cv.Spec.Inline → InlineRunner.Execute(handler) (§16 重构)       │
+│    2. inline → cv.Spec.Inline → InlineRunner.Execute(handler) (§15 重构)       │
 │       manifest → ManifestStore.GetComponentManifests → Applier.ApplyComponent   │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
@@ -3059,8 +3055,8 @@ func (s *BundleStore) GetComponentVersion(ctx, name, version string) (*apiv1.Com
 | `BuildVersionContextForUpgrade` | `Release.Spec.Install/Upgrade.Components` | 填充 VersionContext.Target/Current | `pkg/upgrade/build_release.go` |
 | `BuildDAGFromBundle` / `BuildInstallDAGFromBundle` | `Release.Spec.Upgrade/Install.Components` | 构建 DAG 组件列表 (均调用 `topology.BuildDAG`) | `pkg/upgrade/bundle.go` |
 | `BundleDependencyResolver` | `Components[key].Spec.Dependencies` | 解析 DAG 依赖边 | `pkg/upgrade/bundle.go` |
-| `enrichUpgradeComponent` | ~~`Components[key].Spec.Inline`~~ | ~~补充 inline handler 信息~~ (§16 移除) | `pkg/upgrade/bundle.go` |
-| `topology.BuildDAG` | `Components[key].Spec.Inline` (通过 `ComponentVersionLookup`) | 读取 inline handler 构建 `ComponentNode.Inline` (§16 重构) | `pkg/topology/build.go` |
+| `enrichUpgradeComponent` | ~~`Components[key].Spec.Inline`~~ | ~~补充 inline handler 信息~~ (§15 移除) | `pkg/upgrade/bundle.go` |
+| `topology.BuildDAG` | `Components[key].Spec.Inline` (通过 `ComponentVersionLookup`) | 读取 inline handler 构建 `ComponentNode.Inline` (§15 重构) | `pkg/topology/build.go` |
 | `BundleStore.GetComponentManifests` | `Components` + `Files` | 获取 YAML 清单字节 | `pkg/manifest/bundle_store.go` |
 | `BundleStore.GetComponentVersion` | `Components` | 获取组件类型和 handler | `pkg/manifest/bundle_store.go` |
 | `componentfactory.NewFactoryFromBundle` | `Components` + `Release` | 注册 inline Phase 构造函数 | `pkg/componentfactory/bundle_registry.go` |
@@ -3083,13 +3079,62 @@ func (s *BundleStore) GetComponentVersion(ctx, name, version string) (*apiv1.Com
 
 ## 14. ComponentVersion 执行时条件过滤
 
-> **已抽离为独立 KEP 文档**：[KEP-18: ComponentVersion 执行时条件过滤](kep18-component-condition-filter-design.md)
+ComponentVersion 新增 `Condition` 字段（Go Template 表达式），在 DAG 执行时根据集群运行时状态（Operation/ScaleType/NodeCount 等）决定组件是否执行。该机制复用已有 `TemplateContext` 作为模板数据（扩展新增 Operation/ScaleType 等字段），作为 Scheduler 跳过链的第三层检查（位于版本检查之后、执行器分发之前）。
 
-ComponentVersion 新增 `Condition` 字段（Go Template 表达式），在 DAG 执行时根据集群运行时状态（Operation/ScaleType/NodeCount 等）决定组件是否执行。该机制复用已有 `TemplateContext` 作为模板数据（扩展新增 Operation/ScaleType 等字段），作为 Scheduler 跳过链的第三层检查（位于版本检查之后、执行器分发之前），与 KEP-17 Selector 互补——Selector 在构建时选择子组件，Condition 在执行时过滤组件。
+**Condition 表达式语法**（Go Template）：
 
-节点级过滤（`ComponentVersion.Spec.NodeFilter`，按角色/标签/幂等过滤目标节点）见 [KEP-19: ComponentVersion 节点过滤设计](kep19-component-node-filter-design.md)。
+| 表达式 | 含义 | 示例场景 |
+|--------|------|---------|
+| `{{ eq .Operation "scale" }}` | 仅扩容时执行 | 扩容专用组件 |
+| `{{ eq .ScaleType "master" }}` | 仅 Master 扩容时执行 | Master 专用组件 |
+| `{{ eq .Operation "install" }}` | 仅安装时执行 | 安装专用组件 |
+| `{{ eq .Operation "upgrade" }}` | 仅升级时执行 | 升级专用组件 |
+| `{{ gt .NodeCount 3 }}` | 节点数 > 3 时执行 | 大集群专用组件 |
+| (空) | 始终执行 | 默认行为 (向后兼容) |
 
-完整设计见 [KEP-18](kep18-component-condition-filter-design.md) 和 [KEP-19](kep19-component-node-filter-design.md)。
+**TemplateContext 扩展**（`manifest.TemplateContext`，集群状态安全投影）：
+
+```go
+type TemplateContext struct {
+    // --- 现有字段 (manifest 渲染) ---
+    ClusterName       string
+    Namespace         string
+    KubernetesVersion string
+    OpenFuyaoVersion  string
+
+    // --- 新增字段 (Condition 求值 + manifest 渲染) ---
+    Operation   string  // install / upgrade / scale / rollback / manage
+    ScaleType   string  // master / worker / "" (非扩容)
+    NodeCount   int
+    MasterCount int
+    WorkerCount int
+    DeployMode  string  // offline / online
+    DryRun      bool
+    Variables   map[string]string
+}
+```
+
+**Operation 由调用方设置**（非从 BKECluster CR 推断）：
+
+| 调用方 | Operation | ScaleType |
+|--------|-----------|-----------|
+| `executeInstallDAG` | `"install"` | `""` |
+| `executeUpgradeDAG` | `"upgrade"` | `""` |
+| `executeScaleDAG` | `"scale"` | `"master"` / `"worker"` |
+| `executeManageDAG` | `"manage"` | `""` |
+| `executeUninstallDAG` | `"rollback"` | `""` |
+
+节点级过滤（`ComponentVersion.Spec.NodeFilter`，按角色/标签/幂等过滤目标节点）作为 Executor 层的节点选择机制，与 Condition 互补——Condition 是组件级过滤（决定组件是否执行），NodeFilter 是节点级过滤（决定组件在哪些节点上执行）。
+
+**Scheduler 跳过链**：
+
+```
+组件执行检查链 (executeBatchParallel):
+  (A) shouldSkipComponent         → DeclarativeUpgradeStatus.IsCompleted → Skip
+  (B) componentNeedsUpgrade       → VersionContext.NeedsExecution → Current==Target → Skip
+  (C) shouldExecuteByCondition    → EvaluateCondition(cv.Spec.Condition, tmpl) → false → Skip
+  (D) executeComponent            → 分发到 Inline/YAML/Helm/Binary Executor
+```
 
 ---
 
@@ -3099,7 +3144,7 @@ ComponentVersion 新增 `Condition` 字段（Go Template 表达式），在 DAG 
 
 `ReleaseImageUpgradeComponent.Inline`（`api/v1alpha1/releaseimage_types.go:65`）与 `ComponentVersion.Spec.Inline`（`api/v1alpha1/componentversion_types.go:36`）数据完全冗余——两者形状相同（`{Handler, Version}`），且 `enrichUpgradeComponent`（`pkg/upgrade/bundle.go:93`）只是将 `ComponentVersion.Spec.Inline` 复制到 `ReleaseImageUpgradeComponent.Inline`。
 
-**违背设计原则**：§2.3（KEP-18）已确立"组件定义性字段统一存储在 `ComponentVersion.Spec`，`ReleaseImageUpgradeComponent` 保持轻量引用角色"。Inline handler 属于组件定义性字段，应存储在 `ComponentVersion.Spec.Inline`，不应在 `ReleaseImageUpgradeComponent` 上冗余。
+**违背设计原则**：本提案已确立"组件定义性字段统一存储在 `ComponentVersion.Spec`，`ReleaseImageUpgradeComponent` 保持轻量引用角色"。Inline handler 属于组件定义性字段，应存储在 `ComponentVersion.Spec.Inline`，不应在 `ReleaseImageUpgradeComponent` 上冗余。
 
 ### 15.2 现状分析
 
@@ -3375,10 +3420,10 @@ type ReleaseImageUpgradeComponent struct {
 
 | 原则 | 来源 | 一致性 |
 |------|------|--------|
-| `ReleaseImageUpgradeComponent` 保持轻量引用角色 | §2.3 (KEP-18) | ✅ 进一步轻量化，仅保留 Name + Version |
-| 组件定义性字段统一存储在 `ComponentVersion.Spec` | §2.3 (KEP-18) | ✅ Inline handler 回归 `ComponentVersion.Spec.Inline` |
-| `ReleaseImageUpgradeComponent` 不携带 Condition | §2.3 (KEP-18) | ✅ 同理不携带 Inline |
-| `ReleaseImageUpgradeComponent` 不携带 NodeFilter | §2.3 (KEP-19) | ✅ 同理不携带 NodeFilter |
+| `ReleaseImageUpgradeComponent` 保持轻量引用角色 | 本提案 §2.3 | ✅ 进一步轻量化，仅保留 Name + Version |
+| 组件定义性字段统一存储在 `ComponentVersion.Spec` | 本提案 §2.3 | ✅ Inline handler 回归 `ComponentVersion.Spec.Inline` |
+| `ReleaseImageUpgradeComponent` 不携带 Condition | 本提案 §14 | ✅ 同理不携带 Inline |
+| `ReleaseImageUpgradeComponent` 不携带 NodeFilter | 本提案 §14 | ✅ 同理不携带 NodeFilter |
 | DAG 构建与组件定义解耦 | §4.3 | ✅ DAG 构建通过 `ComponentVersionLookup` 读取定义，不依赖引用类型携带定义 |
 
 **重构后 `ReleaseImageUpgradeComponent` 的字段**：
@@ -3405,14 +3450,9 @@ type ReleaseImageInstallComponent struct {
 
 ### A. 参考文档
 
-1. [KEP-5 声明式升级框架](kep5/kep5.md)
-2. [KEP-6 三层状态机设计](kep6-state-machine-v4.md)
-3. [KEP-9 Static Pod 类型设计](kep9-staticpod-upgrade-framework.md)
-4. [KEP-16 二进制组件设计](kep16-binary-component-design.md)
-5. [KEP-17 Selector 组件类型设计](kep17-selector-component-design.md)
-6. [KEP-18 ComponentVersion 执行时条件过滤](kep18-component-condition-filter-design.md)
-7. [KEP-19 ComponentVersion 节点过滤设计](kep19-component-node-filter-design.md)
-8. [声明式集群版本升级方案-支持二进制与 Helm 组件](声明式集群版本升级方案-支持二进制与 Helm 组件.md)
+1. [KEP-5 声明式升级框架](../kep5/kep5.md)
+2. Cluster API v1beta1 文档
+3. Go text/template 文档: https://pkg.go.dev/text/template
 
 ### B. 术语表
 
@@ -3426,4 +3466,4 @@ type ReleaseImageInstallComponent struct {
 | **BuildInstallDAGFromBundle** | 从 install.components 提取组件并调用 `topology.BuildDAG` 构建 DAG |
 | **DecisionInstall** | VersionContext 决策：current 为空且 target 有值时触发安装 |
 | **DeclarativeInstallEnabled** | Feature Gate，控制 DAG 安装路径是否启用。开启后强制要求 ReleaseImage 就绪 |
-| **ComponentVersionLookup** | DAG 构建时查找 ComponentVersion 的函数类型，用于从 `ComponentVersion.Spec.Inline` 读取 inline handler (§16) |
+| **ComponentVersionLookup** | DAG 构建时查找 ComponentVersion 的函数类型，用于从 `ComponentVersion.Spec.Inline` 读取 inline handler (§15) |
