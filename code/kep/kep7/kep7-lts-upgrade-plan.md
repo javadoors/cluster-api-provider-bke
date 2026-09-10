@@ -97,48 +97,7 @@ PhaseFlow            PhaseFlow              声明式升级    声明式升级  
 
 ### 3.3 多 Hop 升级流程
 
-#### 3.3.1 升级路径定义
-
-```yaml
-# UpgradePath for LTS upgrade
-apiVersion: config.openfuyao.cn/v1alpha1
-kind: UpgradePath
-metadata:
-  name: lts-upgrade-path
-spec:
-  versions:
-    - version: "25.12"
-      lts: true
-    - version: "26.03"
-    - version: "26.06"
-    - version: "26.09"
-    - version: "26.12"
-      lts: true
-  
-  paths:
-    - from: "25.12"
-      to: "26.03"
-      preprocessing: true
-      preprocessingSteps:
-        - name: CRD 迁移
-        - name: API 兼容性处理
-        - name: 数据迁移
-        - name: 配置迁移
-    - from: "26.03"
-      to: "26.06"
-      preprocessing: true
-      preprocessingSteps:
-        - name: 声明式升级框架引入
-        - name: ExecutorRegistry 扩展
-    - from: "26.06"
-      to: "26.09"
-      preprocessing: false
-    - from: "26.09"
-      to: "26.12"
-      preprocessing: false
-```
-
-#### 3.3.2 升级流程
+#### 3.3.1 升级流程
 
 ```
 Step 1: 25.12(LTS) -> 26.03 (预处理)
