@@ -232,7 +232,9 @@ BKE CVO 采用声明式升级路径管理，核心设计原则：
 bkeadm upgrade lts --from 25.12 --to 26.12
   |
   +-> Step 1: 检查当前版本
-  |     - 从集群中获取当前版本 (从 ClusterVersion CR 获取)
+  |     - 获取当前版本 (根据版本采用不同逻辑)
+  |       * 25.12 版本: 从集群中获取当前版本 (非 ClusterVersion CR)
+  |       * 26.03+ 版本: 从 ClusterVersion CR 获取
   |     - 验证目标版本为 26.12(LTS)
   |
   +-> Step 2: 获取升级路径
@@ -267,6 +269,15 @@ bkeadm upgrade lts --from 25.12 --to 26.12
         - 验证集群状态正常
         - 验证所有组件健康
 ```
+
+**版本获取逻辑说明**:
+
+不同版本的当前版本获取方式不同：
+
+| 版本 | 获取方式 | 说明 |
+|------|---------|------|
+| 25.12 | 从集群中获取 | 25.12 版本没有 ClusterVersion CR，需要从集群中获取当前版本 |
+| 26.03+ | 从 ClusterVersion CR 获取 | 26.03 及之后版本支持 ClusterVersion CR |
 
 #### 3.5.3 升级版本处理器框架
 
@@ -655,7 +666,12 @@ func runLTSUpgrade(cmd *cobra.Command, args []string) error {
         return fmt.Errorf("获取客户端失败: %w", err)
     }
 
-    // 2. 检查当前版本
+    // 2. 获取当前版本
+    // 注意: 不同版本的当前版本获取方式不同
+    // - 25.12 版本: 从集群中获取当前版本 (非 ClusterVersion CR)
+    //   25.12 版本没有 ClusterVersion CR，需要从集群中获取当前版本
+    //   可以通过查询集群中的版本信息来获取，例如从 BKECluster CR 的 status 中获取
+    // - 26.03+ 版本: 从 ClusterVersion CR 获取
     currentVersion, err := getCurrentVersion(client)
     if err != nil {
         return fmt.Errorf("获取当前版本失败: %w", err)
@@ -695,8 +711,23 @@ func getClient() (client.Client, error) {
 }
 
 // getCurrentVersion 从集群中获取当前版本
+// 注意: 不同版本的当前版本获取方式不同
+// - 25.12 版本: 从集群中获取当前版本 (非 ClusterVersion CR)
+//   25.12 版本没有 ClusterVersion CR，需要从集群中获取当前版本
+//   可以通过查询集群中的版本信息来获取，例如从 BKECluster CR 的 status 中获取
+// - 26.03+ 版本: 从 ClusterVersion CR 获取
 func getCurrentVersion(client client.Client) (string, error) {
-    // 从 ClusterVersion CR 中获取当前版本
+    // 1. 尝试从 ClusterVersion CR 获取 (26.03+ 版本)
+    clusterVersion := &upgradev1alpha1.ClusterVersion{}
+    err := client.Get(ctx, client.ObjectKey{Name: "version"}, clusterVersion)
+    if err == nil && clusterVersion.Status.CurrentVersion != "" {
+        return clusterVersion.Status.CurrentVersion, nil
+    }
+    
+    // 2. 如果 ClusterVersion CR 不存在或版本为空，说明是 25.12 版本
+    // 25.12 版本没有 ClusterVersion CR，需要从集群中获取当前版本
+    // 可以通过查询集群中的版本信息来获取
+    // 例如: 从 BKECluster CR 的 status 中获取，或者从集群的 API Server 版本获取
     // ...
     return "", nil
 }
