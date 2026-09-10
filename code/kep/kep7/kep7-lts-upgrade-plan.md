@@ -243,6 +243,7 @@ bkeadm upgrade lts --from 25.12 --to 26.12
   |       * 验证 from 版本和 to 版本都是 LTS 版本 (lts: true)
   |       * 验证 from 版本和 to 版本在 UpgradePath 中存在
   |       * 验证 from 版本到 to 版本存在有效的升级路径
+  |       * 特殊处理: 25.12 -> 26.03 需要特殊处理 (25.12 没有 ClusterVersion CR)
   |     - 如果校验失败，返回错误
   |
   +-> Step 2: 获取升级路径
@@ -252,7 +253,7 @@ bkeadm upgrade lts --from 25.12 --to 26.12
   |
   +-> Step 3: 逐 Hop 执行升级
   |     |
-  |     +-> Hop 1: 25.12 -> 26.03
+  |     +-> Hop 1: 25.12 -> 26.03 (特殊处理)
   |     |     ├── PreProcess: CRD 迁移, API 兼容性, 数据迁移, 配置迁移
   |     |     ├── Upgrade:    PhaseFlow 升级
   |     |     └── PostProcess: 验证集群状态, 验证 CRD, 验证 API
@@ -262,15 +263,10 @@ bkeadm upgrade lts --from 25.12 --to 26.12
   |     |     ├── Upgrade:    PhaseFlow 升级
   |     |     └── PostProcess: 验证集群状态, 验证声明式框架就绪
   |     |
-  |     +-> Hop 3: 26.06 -> 26.09
-  |     |     ├── PreProcess: (无)
-  |     |     ├── Upgrade:    声明式升级
-  |     |     └── PostProcess: 验证集群状态
-  |     |
-  |     +-> Hop 4: 26.09 -> 26.12
-  |           ├── PreProcess: (无)
-  |           ├── Upgrade:    声明式升级
-  |           └── PostProcess: 验证集群状态, 验证 LTS 版本
+  |     +-> Hop 3: 26.06 -> 26.12 (多Hop声明式升级)
+  |           ├── 自动执行多 Hop 升级: 26.06 -> 26.09 -> 26.12(LTS)
+  |           ├── 每个中间 Hop 执行: PreProcess -> Upgrade -> PostProcess
+  |           └── 最终验证: 验证版本为 26.12(LTS), 验证集群状态
   |
   +-> Step 4: 最终验证
         - 验证版本为 26.12(LTS)
@@ -284,6 +280,7 @@ Step 1 的版本校验确保：
 1. **LTS 版本验证**: from 和 to 版本都必须是 LTS 版本 (lts: true)
 2. **版本存在性验证**: from 和 to 版本都必须在 UpgradePath CR 的 versions 列表中存在
 3. **路径有效性验证**: 从 from 版本到 to 版本必须存在有效的升级路径 (通过 paths 可以遍历)
+4. **特殊处理**: 25.12 -> 26.03 需要特殊处理，因为 25.12 版本没有 ClusterVersion CR，需要从集群中获取当前版本
 
 如果任一验证失败，命令将返回错误并终止执行。
 
