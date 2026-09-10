@@ -231,11 +231,13 @@ BKE CVO 采用声明式升级路径管理，核心设计原则：
 ```
 bkeadm upgrade lts --from 25.12 --to 26.12
   |
-  +-> Step 1: 检查当前版本
-  |     - 获取当前版本 (根据版本采用不同逻辑)
-  |       * 25.12 版本: 从集群中获取当前版本 (非 ClusterVersion CR)
-  |       * 26.03+ 版本: 从 ClusterVersion CR 获取
-  |     - 验证目标版本为 26.12(LTS)
+  +-> Step 1: 校验输入版本
+  |     - 从 UpgradePath CR 中获取升级路径定义
+  |     - 校验输入版本:
+  |       * 验证 from 版本和 to 版本都是 LTS 版本 (lts: true)
+  |       * 验证 from 版本和 to 版本在 UpgradePath 中存在
+  |       * 验证 from 版本到 to 版本存在有效的升级路径
+  |     - 如果校验失败，返回错误
   |
   +-> Step 2: 获取升级路径
   |     - 从 UpgradePath CR 中获取升级路径定义
@@ -270,14 +272,14 @@ bkeadm upgrade lts --from 25.12 --to 26.12
         - 验证所有组件健康
 ```
 
-**版本获取逻辑说明**:
+**版本校验逻辑说明**:
 
-不同版本的当前版本获取方式不同：
+Step 1 的版本校验确保：
+1. **LTS 版本验证**: from 和 to 版本都必须是 LTS 版本 (lts: true)
+2. **版本存在性验证**: from 和 to 版本都必须在 UpgradePath CR 的 versions 列表中存在
+3. **路径有效性验证**: 从 from 版本到 to 版本必须存在有效的升级路径 (通过 paths 可以遍历)
 
-| 版本 | 获取方式 | 说明 |
-|------|---------|------|
-| 25.12 | 从集群中获取 | 25.12 版本没有 ClusterVersion CR，需要从集群中获取当前版本 |
-| 26.03+ | 从 ClusterVersion CR 获取 | 26.03 及之后版本支持 ClusterVersion CR |
+如果任一验证失败，命令将返回错误并终止执行。
 
 #### 3.5.3 升级版本处理器框架
 
@@ -514,7 +516,12 @@ func (o *Orchestrator) Execute(ctx context.Context, from, to string) error {
         return fmt.Errorf("获取升级路径失败: %w", err)
     }
 
-    // 2. 解析升级路径，获取从 from 到 to 的所有 Hop
+    // 2. 校验输入版本
+    if err := validateVersions(upgradePath, from, to); err != nil {
+        return fmt.Errorf("版本校验失败: %w", err)
+    }
+
+    // 3. 解析升级路径，获取从 from 到 to 的所有 Hop
     hops, err := o.parseUpgradePath(upgradePath, from, to)
     if err != nil {
         return fmt.Errorf("解析升级路径失败: %w", err)
@@ -612,6 +619,82 @@ func (o *Orchestrator) findNextHop(upgradePath *upgradev1alpha1.UpgradePath, cur
     return "", false
 }
 
+// validateVersions 校验输入版本
+// 1. 验证 from 版本和 to 版本都是 LTS 版本
+// 2. 验证 from 版本和 to 版本在 UpgradePath 中存在
+// 3. 验证 from 版本到 to 版本存在有效的升级路径
+func validateVersions(upgradePath *upgradev1alpha1.UpgradePath, from, to string) error {
+    // 1. 验证版本在 UpgradePath 中存在
+    fromFound := false
+    toFound := false
+    fromIsLTS := false
+    toIsLTS := false
+    
+    for _, v := range upgradePath.Spec.Versions {
+        if v.Version == from {
+            fromFound = true
+            fromIsLTS = v.LTS
+        }
+        if v.Version == to {
+            toFound = true
+            toIsLTS = v.LTS
+        }
+    }
+    
+    if !fromFound {
+        return fmt.Errorf("from 版本 %s 在 UpgradePath 中不存在", from)
+    }
+    if !toFound {
+        return fmt.Errorf("to 版本 %s 在 UpgradePath 中不存在", to)
+    }
+    
+    // 2. 验证都是 LTS 版本
+    if !fromIsLTS {
+        return fmt.Errorf("from 版本 %s 不是 LTS 版本", from)
+    }
+    if !toIsLTS {
+        return fmt.Errorf("to 版本 %s 不是 LTS 版本", to)
+    }
+    
+    // 3. 验证存在有效的升级路径
+    if !hasValidPath(upgradePath, from, to) {
+        return fmt.Errorf("从 %s 到 %s 不存在有效的升级路径", from, to)
+    }
+    
+    return nil
+}
+
+// hasValidPath 验证从 from 到 to 是否存在有效的升级路径
+func hasValidPath(upgradePath *upgradev1alpha1.UpgradePath, from, to string) bool {
+    current := from
+    visited := make(map[string]bool)
+    
+    for current != to {
+        if visited[current] {
+            // 检测到循环，路径无效
+            return false
+        }
+        visited[current] = true
+        
+        // 在 paths 中查找从 current 出发的下一个 hop
+        found := false
+        for _, path := range upgradePath.Spec.Paths {
+            if path.From == current {
+                current = path.To
+                found = true
+                break
+            }
+        }
+        
+        if !found {
+            // 找不到从 current 出发的路径
+            return false
+        }
+    }
+    
+    return true
+}
+
 // Hop 表示一个版本跳转
 type Hop struct {
     From string
@@ -666,18 +749,16 @@ func runLTSUpgrade(cmd *cobra.Command, args []string) error {
         return fmt.Errorf("获取客户端失败: %w", err)
     }
 
-    // 2. 获取当前版本
-    // 注意: 不同版本的当前版本获取方式不同
-    // - 25.12 版本: 从集群中获取当前版本 (非 ClusterVersion CR)
-    //   25.12 版本没有 ClusterVersion CR，需要从集群中获取当前版本
-    //   可以通过查询集群中的版本信息来获取，例如从 BKECluster CR 的 status 中获取
-    // - 26.03+ 版本: 从 ClusterVersion CR 获取
-    currentVersion, err := getCurrentVersion(client)
+    // 2. 校验输入版本
+    // 从 UpgradePath CR 中获取升级路径定义
+    upgradePath, err := getUpgradePath(client)
     if err != nil {
-        return fmt.Errorf("获取当前版本失败: %w", err)
+        return fmt.Errorf("获取升级路径失败: %w", err)
     }
-    if fromVersion == "" {
-        fromVersion = currentVersion
+    
+    // 校验 from 版本和 to 版本
+    if err := validateVersions(upgradePath, fromVersion, toVersion); err != nil {
+        return fmt.Errorf("版本校验失败: %w", err)
     }
 
     fmt.Printf("开始升级: %s -> %s\n", fromVersion, toVersion)
@@ -703,33 +784,100 @@ func runLTSUpgrade(cmd *cobra.Command, args []string) error {
     return nil
 }
 
+// getUpgradePath 从集群中获取 UpgradePath CR
+func getUpgradePath(client client.Client) (*upgradev1alpha1.UpgradePath, error) {
+    upgradePathList := &upgradev1alpha1.UpgradePathList{}
+    if err := client.List(ctx, upgradePathList); err != nil {
+        return nil, fmt.Errorf("列出 UpgradePath 失败: %w", err)
+    }
+    if len(upgradePathList.Items) == 0 {
+        return nil, fmt.Errorf("未找到 UpgradePath CR")
+    }
+    // 返回第一个 UpgradePath (通常只有一个)
+    return &upgradePathList.Items[0], nil
+}
+
+// validateVersions 校验输入版本
+// 1. 验证 from 版本和 to 版本都是 LTS 版本
+// 2. 验证 from 版本和 to 版本在 UpgradePath 中存在
+// 3. 验证 from 版本到 to 版本存在有效的升级路径
+func validateVersions(upgradePath *upgradev1alpha1.UpgradePath, from, to string) error {
+    // 1. 验证版本在 UpgradePath 中存在
+    fromFound := false
+    toFound := false
+    fromIsLTS := false
+    toIsLTS := false
+    
+    for _, v := range upgradePath.Spec.Versions {
+        if v.Version == from {
+            fromFound = true
+            fromIsLTS = v.LTS
+        }
+        if v.Version == to {
+            toFound = true
+            toIsLTS = v.LTS
+        }
+    }
+    
+    if !fromFound {
+        return fmt.Errorf("from 版本 %s 在 UpgradePath 中不存在", from)
+    }
+    if !toFound {
+        return fmt.Errorf("to 版本 %s 在 UpgradePath 中不存在", to)
+    }
+    
+    // 2. 验证都是 LTS 版本
+    if !fromIsLTS {
+        return fmt.Errorf("from 版本 %s 不是 LTS 版本", from)
+    }
+    if !toIsLTS {
+        return fmt.Errorf("to 版本 %s 不是 LTS 版本", to)
+    }
+    
+    // 3. 验证存在有效的升级路径
+    if !hasValidPath(upgradePath, from, to) {
+        return fmt.Errorf("从 %s 到 %s 不存在有效的升级路径", from, to)
+    }
+    
+    return nil
+}
+
+// hasValidPath 验证从 from 到 to 是否存在有效的升级路径
+func hasValidPath(upgradePath *upgradev1alpha1.UpgradePath, from, to string) bool {
+    current := from
+    visited := make(map[string]bool)
+    
+    for current != to {
+        if visited[current] {
+            // 检测到循环，路径无效
+            return false
+        }
+        visited[current] = true
+        
+        // 在 paths 中查找从 current 出发的下一个 hop
+        found := false
+        for _, path := range upgradePath.Spec.Paths {
+            if path.From == current {
+                current = path.To
+                found = true
+                break
+            }
+        }
+        
+        if !found {
+            // 找不到从 current 出发的路径
+            return false
+        }
+    }
+    
+    return true
+}
+
 // getClient 获取 Kubernetes 客户端
 func getClient() (client.Client, error) {
     // 实现获取 Kubernetes 客户端的逻辑
     // ...
     return nil, nil
-}
-
-// getCurrentVersion 从集群中获取当前版本
-// 注意: 不同版本的当前版本获取方式不同
-// - 25.12 版本: 从集群中获取当前版本 (非 ClusterVersion CR)
-//   25.12 版本没有 ClusterVersion CR，需要从集群中获取当前版本
-//   可以通过查询集群中的版本信息来获取，例如从 BKECluster CR 的 status 中获取
-// - 26.03+ 版本: 从 ClusterVersion CR 获取
-func getCurrentVersion(client client.Client) (string, error) {
-    // 1. 尝试从 ClusterVersion CR 获取 (26.03+ 版本)
-    clusterVersion := &upgradev1alpha1.ClusterVersion{}
-    err := client.Get(ctx, client.ObjectKey{Name: "version"}, clusterVersion)
-    if err == nil && clusterVersion.Status.CurrentVersion != "" {
-        return clusterVersion.Status.CurrentVersion, nil
-    }
-    
-    // 2. 如果 ClusterVersion CR 不存在或版本为空，说明是 25.12 版本
-    // 25.12 版本没有 ClusterVersion CR，需要从集群中获取当前版本
-    // 可以通过查询集群中的版本信息来获取
-    // 例如: 从 BKECluster CR 的 status 中获取，或者从集群的 API Server 版本获取
-    // ...
-    return "", nil
 }
 ```
 
