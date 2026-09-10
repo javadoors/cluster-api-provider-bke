@@ -163,6 +163,7 @@ Step 1: 25.12(LTS) -> 26.03 (预处理)
 Step 2: 26.03 -> 26.06 (预处理)
   1. 检查 26.03 ReleaseImage
      - 检查是否存在 26.03 的 ReleaseImage
+     - 现有代码库中已存在 v26.03 的 ReleaseImage (release-image/v26.03/release.yaml)
      - 如果存在，可以使用声明式升级
      - 如果不存在，使用 PhaseFlow 升级
   2. 执行预处理步骤:
@@ -661,8 +662,36 @@ func (h *Hop2512To2603) PreProcess(ctx context.Context) error {
 }
 
 func (h *Hop2512To2603) Upgrade(ctx context.Context) error {
-    // 使用 PhaseFlow 升级到 26.03
-    return executePhaseFlowUpgrade(ctx, "26.03")
+    // ★ 25.12 特殊处理:
+    // 25.12 版本没有 ClusterVersion CR，且 26.03 版本开始引入 ClusterVersion CR。
+    // 因此升级到 26.03 时需要特殊处理:
+    //   1. 从集群中获取当前版本 (25.12 没有 ClusterVersion CR，需从其他来源获取)
+    //      - 例如: 从 BKECluster CR 的 status 中获取
+    //      - 或从集群的 API Server 版本获取
+    //   2. 使用 PhaseFlow 升级到 26.03
+    //   3. 升级完成后，创建 ClusterVersion CR (26.03 开始支持 ClusterVersion CR)
+    //      - 为后续 26.03 -> 26.06 的声明式升级做准备
+
+    // 1. 获取当前版本 (25.12 特殊处理: 非 ClusterVersion CR)
+    currentVersion, err := getVersionFor25_12(ctx)
+    if err != nil {
+        return fmt.Errorf("获取 25.12 当前版本失败: %w", err)
+    }
+    if currentVersion != "25.12" {
+        return fmt.Errorf("当前版本 %s 不是 25.12，无法执行 25.12 -> 26.03 升级", currentVersion)
+    }
+
+    // 2. 使用 PhaseFlow 升级到 26.03
+    if err := executePhaseFlowUpgrade(ctx, "26.03"); err != nil {
+        return fmt.Errorf("PhaseFlow 升级到 26.03 失败: %w", err)
+    }
+
+    // 3. 创建 ClusterVersion CR (26.03 开始支持)
+    if err := createClusterVersionCR(ctx, "26.03"); err != nil {
+        return fmt.Errorf("创建 ClusterVersion CR 失败: %w", err)
+    }
+
+    return nil
 }
 
 func (h *Hop2512To2603) PostProcess(ctx context.Context) error {
@@ -704,7 +733,19 @@ func (h *Hop2603To2606) PreProcess(ctx context.Context) error {
 }
 
 func (h *Hop2603To2606) Upgrade(ctx context.Context) error {
-    // 使用 PhaseFlow 升级到 26.06
+    // ★ 检查 26.03 的 ReleaseImage 是否存在
+    // 如果存在，则可以使用声明式升级；否则使用 PhaseFlow 升级
+    hasReleaseImage, err := checkReleaseImageExists(ctx, "26.03")
+    if err != nil {
+        return fmt.Errorf("检查 26.03 ReleaseImage 失败: %w", err)
+    }
+
+    if hasReleaseImage {
+        // 26.03 的 ReleaseImage 已存在，使用声明式升级
+        return executeDeclarativeUpgrade(ctx, "26.06")
+    }
+
+    // 26.03 的 ReleaseImage 不存在，使用 PhaseFlow 升级
     return executePhaseFlowUpgrade(ctx, "26.06")
 }
 
