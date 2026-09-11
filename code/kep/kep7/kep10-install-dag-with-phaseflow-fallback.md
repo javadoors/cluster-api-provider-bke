@@ -39,7 +39,18 @@
 7. [安装 DAG 执行设计](#7-安装-dag-执行设计)
    - 7.1 设计思路
    - 7.2 执行入口（三路分发 + PhaseFlow 兜底路径设计）
+     - 7.2.1 三路分发统一设计
+     - 7.2.2 完整代码实现
+     - 7.2.3 PhaseFlow 兜底路径设计
+     - 7.2.4 Legacy 路径的版本来源
+     - 7.2.5 Legacy 路径与 DAG 路径的共存设计
+     - 7.2.6 PhaseFlow 路径（Legacy）的适用场景
+     - 7.2.7 ReleaseImage 就绪保障与 ClusterVersion 协调设计
    - 7.3 executeInstallDAG 实现
+     - 7.3.1 Spec 同步仅为 Legacy 兼容
+     - 7.3.2 BKEAgent 从 ReleaseImage 获取版本的设计
+     - 7.3.3 版本来源对比汇总
+     - 7.3.4 kubernetesVersion 命令参数设计 (对标 etcdVersion)
    - 7.4 安装 DAG 结构
 8. [部署 Phase 与安装组件映射](#8-部署-phase-与安装组件映射)
    - 8.1 设计思路
