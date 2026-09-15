@@ -134,11 +134,11 @@ spec:
         - name: ExecutorRegistry 扩展
     - from: "26.06"
       to: "26.09"
-      handler: "Hop2606To2609"          # 处理器名称
+      handler: "declarative"            # 通用声明式升级处理器 (见 §3.5.4)
       preprocessing: false
     - from: "26.09"
       to: "26.12"
-      handler: "Hop2609To2612"          # 处理器名称
+      handler: "declarative"            # 通用声明式升级处理器 (见 §3.5.4)
       preprocessing: false
 ```
 
@@ -147,6 +147,7 @@ spec:
 - handler 字段指定该 Hop 使用的处理器名称
 - 处理器在代码中注册，通过 handler 名称动态加载
 - preprocessing 和 preprocessingSteps 定义预处理步骤
+- `handler: "declarative"` 表示复用通用声明式升级处理器 `DeclarativeUpgradeHandler`（§3.5.4），而非为每个版本跳转单独编写处理器；任意支持声明式升级的跳转均可复用该值
 
 #### 3.3.2 升级流程
 
@@ -319,7 +320,8 @@ BKE CVO 采用声明式升级路径管理，核心设计原则：
 │  │  │        26.06→26.09, 26.09→26.12]               │   │   │
 │  │  │  ② 从 Registry 查找每个 Hop 的处理器            │   │   │
 │  │  │     → [Hop2512To2603, Hop2603To2606,            │   │   │
-│  │  │        Hop2606To2609, Hop2609To2612]            │   │   │
+│  │  │        DeclarativeUpgradeHandler(26.06→26.09),   │   │   │
+│  │  │        DeclarativeUpgradeHandler(26.09→26.12)]   │   │   │
 │  │  └─────────────────────────────────────────────────┘   │   │
 │  └─────────────────────────────────────────────────────────┘   │
 │                          │                                      │
@@ -443,9 +445,10 @@ Step 1 的版本校验确保：
 │          ┌───────────────┼───────────────┬───────────────┐     │
 │          │               │               │               │     │
 │          ▼               ▼               ▼               ▼     │
-│  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────┐ │
-│  │Hop2512To2603 │ │Hop2603To2606 │ │Hop2606To2609 │ │...   │ │
-│  └──────────────┘ └──────────────┘ └──────────────┘ └──────┘ │
+│  ┌──────────────┐ ┌──────────────┐ ┌──────────────────┐ ┌────┐│
+│  │Hop2512To2603 │ │Hop2603To2606 │ │DeclarativeUpgrade│ │... ││
+│  │              │ │              │ │Handler (通用)    │ │    ││
+│  └──────────────┘ └──────────────┘ └──────────────────┘ └────┘│
 │          │               │               │               │     │
 │          └───────────────┼───────────────┬───────────────┘     │
 │                          │                                     │
@@ -456,8 +459,8 @@ Step 1 的版本校验确保：
 │  │  │  handlers: map[string]Handler                   │   │   │
 │  │  │  - "25.12->26.03": Hop2512To2603                │   │   │
 │  │  │  - "26.03->26.06": Hop2603To2606                │   │   │
-│  │  │  - "26.06->26.09": Hop2606To2609                │   │   │
-│  │  │  - "26.09->26.12": Hop2609To2612                │   │   │
+│  │  │  - "26.06->26.09": DeclarativeUpgradeHandler    │   │   │
+│  │  │  - "26.09->26.12": DeclarativeUpgradeHandler    │   │   │
 │  │  └─────────────────────────────────────────────────┘   │   │
 │  │                                                         │   │
 │  │  ┌─────────────────────────────────────────────────┐   │   │
@@ -548,7 +551,100 @@ func (r *Registry) findNextHop(current, target string) (string, error) {
 }
 ```
 
-#### 3.5.4 具体 Hop 处理器实现示例
+#### 3.5.4 通用声明式升级 Handler（DeclarativeUpgradeHandler）
+
+**设计思路**
+
+从 26.06 开始，所有版本跳转均支持声明式升级（多 Hop 支持）。这些跳转的处理器逻辑完全一致：
+
+1. **PreProcess**：无需预处理（声明式升级无需 CRD/数据迁移等前置动作）
+2. **Upgrade**：调用统一的声明式升级执行器 `executeDeclarativeUpgrade(ctx, to)`，仅目标版本不同
+3. **PostProcess**：统一验证集群状态与组件健康
+
+因此，无需为 `26.06 -> 26.09`、`26.09 -> 26.12`（以及未来任意支持声明式升级的跳转）分别编写具体 Handler 类型，而是预定义一个**通用声明式升级处理器** `DeclarativeUpgradeHandler`，通过 `from` / `to` 参数化。新增一个声明式升级跳转只需用 `NewDeclarativeUpgradeHandler(from, to)` 创建实例并注册，无需新增类型。
+
+**代码实现**
+
+```go
+// pkg/upgrade/hop/declarative.go
+
+package hop
+
+import (
+    "context"
+    "fmt"
+)
+
+// DeclarativeUpgradeHandler 通用声明式升级处理器。
+// 任意支持声明式升级的版本跳转均可复用该处理器，仅通过 from/to 参数化。
+type DeclarativeUpgradeHandler struct {
+    from string
+    to   string
+}
+
+// NewDeclarativeUpgradeHandler 创建通用声明式升级处理器实例。
+func NewDeclarativeUpgradeHandler(from, to string) *DeclarativeUpgradeHandler {
+    return &DeclarativeUpgradeHandler{from: from, to: to}
+}
+
+func (h *DeclarativeUpgradeHandler) FromVersion() string { return h.from }
+func (h *DeclarativeUpgradeHandler) ToVersion() string   { return h.to }
+
+// PreProcess 声明式升级无需预处理，直接返回 nil。
+func (h *DeclarativeUpgradeHandler) PreProcess(ctx context.Context) error {
+    return nil
+}
+
+// Upgrade 调用声明式升级执行器，升级到目标版本。
+func (h *DeclarativeUpgradeHandler) Upgrade(ctx context.Context) error {
+    return executeDeclarativeUpgrade(ctx, h.to)
+}
+
+// PostProcess 升级后统一验证集群状态与组件健康。
+func (h *DeclarativeUpgradeHandler) PostProcess(ctx context.Context) error {
+    if err := verifyClusterStatus(ctx, h.to); err != nil {
+        return fmt.Errorf("集群状态验证失败 (%s): %w", h.to, err)
+    }
+    if err := verifyComponentsHealthy(ctx); err != nil {
+        return fmt.Errorf("组件健康验证失败 (%s): %w", h.to, err)
+    }
+    return nil
+}
+```
+
+**预定义实例**
+
+在 handlers 包中预定义声明式升级跳转对应的处理器实例：
+
+```go
+// pkg/upgrade/hop/handlers/declarative.go
+
+package handlers
+
+import "bkeadm/pkg/upgrade/hop"
+
+// 预定义的通用声明式升级处理器实例。
+// 支持声明式升级的每个版本跳转，只需在此处新增一行，
+// 无需再编写新的 Handler 类型。
+var (
+    // Hop2606To2609 26.06 -> 26.09 声明式升级
+    Hop2606To2609 = hop.NewDeclarativeUpgradeHandler("26.06", "26.09")
+    // Hop2609To2612 26.09 -> 26.12 声明式升级
+    Hop2609To2612 = hop.NewDeclarativeUpgradeHandler("26.09", "26.12")
+)
+```
+
+**扩展方式**
+
+未来新增声明式升级跳转（如 `26.12 -> 27.03`），只需：
+
+1. 在 `UpgradePath CR` 中新增一条 `handler: "declarative"` 的 path；
+2. 在 handlers 包中新增一行 `Hop2612To2703 = hop.NewDeclarativeUpgradeHandler("26.12", "27.03")`；
+3. 在命令入口注册该实例（见 §3.5.7）。
+
+无需修改 `DeclarativeUpgradeHandler` 或任何框架代码。
+
+#### 3.5.5 具体 Hop 处理器实现示例
 
 **设计思路**
 
@@ -612,16 +708,15 @@ func (r *Registry) findNextHop(current, target string) (string, error) {
 │  └─────────────────────────────────────────────────────────┘   │
 │                                                                 │
 │  ┌─────────────────────────────────────────────────────────┐   │
-│  │  Hop2606To2612 (26.06 -> 26.12, 多Hop声明式升级)        │   │
+│  │  Hop2606To2609 / Hop2609To2612 (声明式升级)             │   │
 │  │  ┌─────────────────────────────────────────────────┐   │   │
-│  │  │  自动执行多 Hop 升级                            │   │   │
-│  │  │  ├── 26.06 -> 26.09: PreProcess→Upgrade→Post   │   │   │
-│  │  │  └── 26.09 -> 26.12: PreProcess→Upgrade→Post   │   │   │
+│  │  │  DeclarativeUpgradeHandler (通用处理器)          │   │   │
+│  │  │  ├── PreProcess: 无操作                          │   │   │
+│  │  │  ├── Upgrade: executeDeclarativeUpgrade(to)     │   │   │
+│  │  │  └── PostProcess: 验证集群状态 + 组件健康         │   │   │
 │  │  └─────────────────────────────────────────────────┘   │   │
 │  │  ┌─────────────────────────────────────────────────┐   │   │
-│  │  │  最终验证                                       │   │   │
-│  │  │  ├── 验证版本为 26.12(LTS)                      │   │   │
-│  │  │  └── 验证集群状态                               │   │   │
+│  │  │  编排器逐 Hop 执行，最终验证版本 26.12(LTS)       │   │   │
 │  │  └─────────────────────────────────────────────────┘   │   │
 │  └─────────────────────────────────────────────────────────┘   │
 │                                                                 │
@@ -762,32 +857,9 @@ func (h *Hop2603To2606) PostProcess(ctx context.Context) error {
 }
 ```
 
-```go
-// pkg/upgrade/hop/handlers/v26_06_to_v26_09.go
+> **说明**：`26.06 -> 26.09`、`26.09 -> 26.12` 等声明式升级跳转**不再编写独立的具体 Handler**，统一复用 §3.5.4 的通用处理器 `DeclarativeUpgradeHandler`。`Hop2606To2609`、`Hop2609To2612` 现已退化为 `handlers` 包中预定义的 `DeclarativeUpgradeHandler` 实例（见 §3.5.4），其 `Upgrade` 逻辑一致为调用 `executeDeclarativeUpgrade(ctx, to)`。
 
-// Hop2606To2609 26.06 -> 26.09 升级处理器 (声明式升级)
-type Hop2606To2609 struct{}
-
-func (h *Hop2606To2609) FromVersion() string { return "26.06" }
-func (h *Hop2606To2609) ToVersion() string   { return "26.09" }
-
-func (h *Hop2606To2609) PreProcess(ctx context.Context) error {
-    // 无需预处理
-    return nil
-}
-
-func (h *Hop2606To2609) Upgrade(ctx context.Context) error {
-    // 使用声明式升级方案
-    return executeDeclarativeUpgrade(ctx, "26.09")
-}
-
-func (h *Hop2606To2609) PostProcess(ctx context.Context) error {
-    // 验证集群状态
-    return verifyClusterStatus(ctx, "26.09")
-}
-```
-
-#### 3.5.5 升级编排器
+#### 3.5.6 升级编排器
 
 **设计思路**
 
@@ -1086,7 +1158,7 @@ type Hop struct {
 }
 ```
 
-#### 3.5.6 bkeadm 命令入口
+#### 3.5.7 bkeadm 命令入口
 
 **设计思路**
 
@@ -1172,8 +1244,10 @@ func runLTSUpgrade(cmd *cobra.Command, args []string) error {
     // 或者在代码中静态注册
     registry.Register(&handlers.Hop2512To2603{})
     registry.Register(&handlers.Hop2603To2606{})
-    registry.Register(&handlers.Hop2606To2609{})
-    registry.Register(&handlers.Hop2609To2612{})
+    // 声明式升级跳转统一复用通用处理器 DeclarativeUpgradeHandler，
+    // 此处注册的是 §3.5.4 中预定义的实例，而非独立 Handler 类型
+    registry.Register(handlers.Hop2606To2609)
+    registry.Register(handlers.Hop2609To2612)
 
     // 5. 创建编排器并执行升级
     orchestrator := upgrade.NewOrchestrator(client, registry, dryRun)
