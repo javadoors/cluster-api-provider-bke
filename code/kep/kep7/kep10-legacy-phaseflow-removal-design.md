@@ -1,2257 +1,47 @@
-# KEP-10: ReleaseImage 安装组件声明式定义设计
+﻿# KEP-10: Legacy PhaseFlow 完全移除方案
 
 | 字段 | 值 |
 |------|-----|
-| **KEP 编号** | KEP-10 |
-| **标题** | ReleaseImage 安装组件声明式定义与 DAG 驱动安装流程设计 |
-| **状态** | `provisional` |
+| **KEP 编号** | KEP-10 (Legacy PhaseFlow 移除方案) |
+| **标题** | Legacy PhaseFlow 完全移除方案 |
+| **状态** | provisional |
 | **类型** | Feature |
-| **依赖** | KEP-5 声明式升级框架、KEP-6 三层状态机设计、KEP-9 Static Pod 类型设计 |
+| **来源** | 从 kep6/kep10-install-components-declarative-design.md §10 抽离 |
 
 ---
 
-## 1. 摘要
-
-本提案设计 ReleaseImage 安装组件的声明式定义，使安装流程与升级流程统一为 DAG 驱动。当前 ReleaseImage 的 `spec.install.components` 仅包含 `{name, version}` 两个字段，缺少执行模式（inline/manifest/staticpod）、inline handler、依赖关系等声明式元数据；且安装流程完全由硬编码的 `DeployPhases` PhaseFlow 驱动，未消费 ReleaseImage 的安装组件列表。本提案将 `ReleaseImageInstallComponent` 和 `ReleaseImageUpgradeComponent` 统一抽象为 `ReleaseImageComponent`，新增 `inline` 字段，新增安装组件目录（`DeclarativeInstallCatalog`）和安装 DAG 构建器，使安装流程也能享受声明式组件管理的优势：依赖管理、并行执行、版本追踪、可观测性。
-
-## 2. 动机
-
-### 2.1 现状问题
-
-| 问题 | 说明 | 影响 |
-|------|------|------|
-| **安装/升级结构不对称** | `ReleaseImageInstallComponent` 仅 `{name, version}`，`ReleaseImageUpgradeComponent` 有 `inline.handler` | 安装无法声明执行模式 |
-| **安装无 DAG** | 安装完全由硬编码 `DeployPhases` 列表驱动 | 无依赖管理、无并行、无断点续传 |
-| **安装组件不消费 ReleaseImage** | DeployPhases 从 `BKECluster.Spec` 读取版本，不从 `ReleaseImage.Spec.Install` 读取 | 版本管理脱节 |
-| **无安装组件目录** | `DeclarativeUpgradeCatalog` 仅定义升级组件映射，无安装等价物 | 新增安装组件需修改 PhaseFlow 代码 |
-| **安装与升级逻辑割裂** | 安装走 PhaseFlow，升级走 DAG，两套机制维护成本高 | 代码重复、行为不一致 |
-
-### 2.2 安装 vs 升级能力对比
-
-| 维度 | 安装（PhaseFlow） | 升级（DAG） |
-|------|-------------------|------------|
-| **编排方式** | 硬编码 Phase 列表 | ReleaseImage bundle 动态构建 DAG |
-| **组件来源** | DeployPhases 构造函数 | `ReleaseImage.Spec.Upgrade.Components` |
-| **执行元数据** | 无 | `UpgradeComponentSpec.{Mode, ManifestPath, InlineHandler}` |
-| **ReleaseImage 字段** | `Spec.Install` 未被消费 | `Spec.Upgrade.Components` 驱动 DAG |
-| **依赖管理** | 隐式 Phase 顺序 | `ComponentVersion.spec.dependencies` + 拓扑排序 |
-| **版本决策** | 无（总是执行） | `VersionContext.Decide()` → Skip/Upgrade |
-| **组件目录** | 无 | `DeclarativeUpgradeCatalog` |
-| **并行执行** | 无（串行 Phase） | 同批次并行（MaxParallel=8） |
-| **断点续传** | 无 | `DeclarativeUpgradeStatus` 追踪已完成 |
-| **可观测性** | PhaseStatus | `ClusterComponentStatuses` + Events |
-
-### 2.3 设计目标
-
-1. **结构对称**：`ReleaseImageInstallComponent` 与 `ReleaseImageUpgradeComponent` 统一抽象为 `ReleaseImageComponent`
-2. **统一 DAG**：安装流程也通过 DAG 驱动，复用 Scheduler/ExecutorRegistry/VersionContext
-3. **统一目录**：`DeclarativeInstallCatalog` 与 `DeclarativeUpgradeCatalog` 结构一致
-4. **渐进迁移**：通过 Feature Gate 控制，PhaseFlow 和 DAG 安装路径可并存
-5. **向后兼容**：迁移期间 ReleaseImage 可同时包含旧格式和声明式格式的安装组件
-
-## 3. 范围与约束
-
-### 3.1 范围
-
-| 范围 | 说明 |
-|------|------|
-| **CRD 扩展** | `ReleaseImageComponent` 新增 `inline` 字段（统一安装和升级） |
-| **安装组件目录** | `DeclarativeInstallCatalog` 定义安装组件映射 |
-| **安装 DAG 构建** | `BuildInstallDAG` 从 ReleaseImage bundle 构建安装 DAG |
-| **安装 DAG 执行** | 复用 `Scheduler.ExecuteDAG`，新增 `DecisionInstall` |
-| **Feature Gate** | `DeclarativeInstallEnabled` 控制新旧路径切换 |
-
-### 3.2 约束
-
-| 约束 | 说明 |
-|------|------|
-| **向后兼容** | 旧格式 `{name, version}` 的 `ReleaseImageComponent` 必须继续支持 |
-| **PhaseFlow 共存** | 迁移期间 PhaseFlow 和 DAG 安装路径可并存，通过 Feature Gate 切换 |
-| **复用升级框架** | 安装 DAG 复用 Scheduler、ExecutorRegistry、InlineRunner 等已有组件 |
-| **幂等性** | 安装操作必须幂等，支持 Reconcile 重入 |
-| **依赖正确性** | 安装 DAG 的依赖关系必须反映实际安装顺序约束 |
-
-### 3.3 非目标
-
-- 不在本文档定义 PreCheck/PostCheck（引用 KEP-5-2）
-- 不在本文档定义回滚策略（安装失败不回滚，直接重试）
-- 不重写现有 DeployPhases 的 Phase 实现（复用已有代码）
-
-## 4. ReleaseImageComponent 结构统一抽象
-
-### 4.0 设计思路
-
-当前 ReleaseImage 的安装组件和升级组件结构**不对称**：升级组件有 `inline.handler` 声明执行方式，安装组件仅有 `{name, version}`。这导致安装流程无法从 ReleaseImage 获取执行元数据，只能依赖硬编码的 `DeployPhases` 列表。
-
-**核心设计思路**：将安装组件结构向升级组件对齐，使安装也能从 ReleaseImage 声明执行方式 (inline handler 或 manifest 路径)，从而让安装流程可以像升级一样由 DAG 驱动。
-
-```txt
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│              结构扩展设计思路                                                     │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                 │
-│  现状 (不对称):                                                                  │
-│  ReleaseImage:                                                                  │
-│    install.components:  [{name, version}]              ← 无执行元数据           │
-│    upgrade.components:  [{name, version, inline}]      ← 有执行元数据           │
-│                                                                                 │
-│  安装流程:                                                                       │
-│    DeployPhases (硬编码 Phase 列表) → 逐个执行                                    │
-│    不消费 ReleaseImage.install.components                                         │
-│    版本从 BKECluster.Spec 读取                                                    │
-│                                                                                 │
-│  目标 (对称):                                                                    │
-│  ReleaseImage:                                                                  │
-│    install.components:  [{name, version, inline}]      ← 有执行元数据 ★         │
-│    upgrade.components:  [{name, version, inline}]      ← 有执行元数据           │
-│                                                                                 │
-│  安装流程:                                                                       │
-│    ReleaseImage.install.components → BuildInstallDAG → DAG 执行                 │
-│    从 ReleaseImage 读取版本 + 执行方式                                            │
-│    复用升级的 Scheduler/ExecutorRegistry/VersionContext                           │
-│                                                                                 │
-│  设计原则:                                                                       │
-│  1. 结构对称 — install 和 upgrade components 使用相同的结构                      │
-│  2. 向后兼容 — 旧格式 {name, version} (无 inline) 仍支持，走 Legacy PhaseFlow   │
-│  3. 复用升级框架 — 不新建调度器/执行器，安装 DAG 复用 Scheduler                   │
-│  4. 声明式驱动 — 安装流程由 ReleaseImage 声明驱动，而非硬编码 Phase 列表         │
-│                                                                                 │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
-
-### 4.1 当前结构（不对称）
-
-```go
-// 当前：安装组件仅 {name, version}
-type ReleaseImageInstallComponent struct {
-    Name    string `json:"name,omitempty"`
-    Version string `json:"version,omitempty"`
-}
-
-// 当前：升级组件有 inline handler
-type ReleaseImageUpgradeComponent struct {
-    Name    string                     `json:"name,omitempty"`
-    Version string                     `json:"version,omitempty"`
-    Inline  *ReleaseImageUpgradeInline `json:"inline,omitempty"`
-}
-```
-
-### 4.2 目标结构（两层统一抽象）
-
-经过分析，ReleaseImage 的类型定义存在两层重复：
-
-**第一层重复**：`ReleaseImageInstallComponent` 和 `ReleaseImageUpgradeComponent` 字段完全相同
-**第二层重复**：`ReleaseImageInstallSpec` 和 `ReleaseImageUpgradeSpec` 字段完全相同
-
-可以通过**两层统一抽象**消除所有重复：
-
-```go
-// api/v1alpha1/releaseimage_types.go
-
-// ============================================================
-// 第一层抽象：统一组件类型
-// ============================================================
-
-// ReleaseImageComponent 定义组件引用（安装和升级共用）🔄重构
-// 统一替代 ReleaseImageInstallComponent 和 ReleaseImageUpgradeComponent
-type ReleaseImageComponent struct {
-    // 组件名称（对应 ComponentVersion.Name）
-    Name string `json:"name,omitempty"`
-    
-    // 组件版本（对应 ComponentVersion.Version）
-    Version string `json:"version,omitempty"`
-    
-    // Inline handler 配置（type=inline 时指定）🆕新增
-    // 用于安装和升级场景，指定 ComponentFactory 注册的 handler
-    // 示例: "EnsureBKEAgent", "EnsureCerts", "EnsureMasterInit", "EnsureMasterUpgrade"
-    Inline *ReleaseImageInline `json:"inline,omitempty"`
-}
-
-// ReleaseImageInline 定义 inline handler 引用 🔄重构
-// 统一替代 ReleaseImageInstallInline 和 ReleaseImageUpgradeInline
-type ReleaseImageInline struct {
-    // Handler 名称（对应 ComponentFactory 注册的 handler）
-    // 安装示例: "EnsureBKEAgent", "EnsureNodesEnv", "EnsureMasterInit"
-    // 升级示例: "EnsureAgentUpgrade", "EnsureMasterUpgrade", "EnsureEtcdUpgrade"
-    Handler string `json:"handler,omitempty"`
-    
-    // Handler 版本
-    Version string `json:"version,omitempty"`
-}
-
-// ============================================================
-// 第二层抽象：统一组件列表类型
-// ============================================================
-
-// ReleaseImageComponentList 定义组件列表（安装和升级共用）🔄重构
-// 统一替代 ReleaseImageInstallSpec 和 ReleaseImageUpgradeSpec
-type ReleaseImageComponentList struct {
-    Components []ReleaseImageComponent `json:"components,omitempty"`
-}
-
-// ReleaseImageInstallSpec 定义安装组件列表（类型别名，向后兼容）
-type ReleaseImageInstallSpec = ReleaseImageComponentList
-
-// ReleaseImageUpgradeSpec 定义升级组件列表（类型别名，向后兼容）
-type ReleaseImageUpgradeSpec = ReleaseImageComponentList
-
-// ============================================================
-// ReleaseImageSpec 使用统一类型
-// ============================================================
-
-type ReleaseImageSpec struct {
-    Version            string                     `json:"version,omitempty"`
-    Digest             string                     `json:"digest,omitempty"`
-    VerifySignature    bool                       `json:"verifySignature,omitempty"`
-    SignatureKey       string                     `json:"signatureKey,omitempty"`
-    AllowCacheFallback bool                       `json:"allowCacheFallback,omitempty"`
-    Install            *ReleaseImageComponentList `json:"install,omitempty"`  // 🔄重构: 使用统一类型
-    Upgrade            *ReleaseImageComponentList `json:"upgrade,omitempty"`  // 🔄重构: 使用统一类型
-}
-```
-
-**两层抽象的收益**：
-
-| 维度 | 重构前 | 重构后 |
-|------|--------|--------|
-| **组件类型数量** | 2 个 (InstallComponent, UpgradeComponent) | 1 个 (Component) |
-| **Inline 类型数量** | 2 个 (InstallInline, UpgradeInline) | 1 个 (Inline) |
-| **Spec 类型数量** | 2 个 (InstallSpec, UpgradeSpec) | 1 个 (ComponentList) + 2 个别名 |
-| **总类型数量** | 6 个 | 3 个 + 2 个别名 |
-| **代码重复** | 3 处重复 (Component×2, Inline×2, Spec×2) | 0 处重复 |
-| **API 复杂度** | 安装和升级使用不同类型，需要转换逻辑 | 统一类型，无需转换 |
-| **维护成本** | 修改字段需同时更新多个类型 | 修改字段只需更新 1 个类型 |
-| **向后兼容** | — | 类型别名保持现有代码无需修改 |
-
-**向后兼容性**：
-
-类型别名 (`type ReleaseImageInstallSpec = ReleaseImageComponentList`) 确保现有代码无需修改：
-
-```go
-// 现有代码无需修改
-var installSpec *ReleaseImageInstallSpec  // 类型别名，等价于 ReleaseImageComponentList
-var upgradeSpec *ReleaseImageUpgradeSpec  // 类型别名，等价于 ReleaseImageComponentList
-
-// 可以直接赋值和转换
-installSpec = &ReleaseImageComponentList{Components: components}
-upgradeSpec = installSpec  // 类型相同，可以直接赋值
-```
-
-YAML 结构与重构前完全一致：
-
-```yaml
-# 重构前后 YAML 结构不变
-spec:
-  install:
-    components:
-      - name: bkeagent
-        version: v2.7.0
-        inline:
-          handler: EnsureBKEAgent
-          version: v1.0.0
-  upgrade:
-    components:
-      - name: bkeagent
-        version: v2.7.0
-        inline:
-          handler: EnsureAgentUpgrade
-          version: v1.0.0
-```
-
-**代码迁移**：
-
-```go
-// 重构前（6 个类型）
-type ReleaseImageInstallComponent struct { Name, Version string; Inline *ReleaseImageInstallInline }
-type ReleaseImageUpgradeComponent struct { Name, Version string; Inline *ReleaseImageUpgradeInline }
-type ReleaseImageInstallInline struct { Handler, Version string }
-type ReleaseImageUpgradeInline struct { Handler, Version string }
-type ReleaseImageInstallSpec struct { Components []ReleaseImageInstallComponent }
-type ReleaseImageUpgradeSpec struct { Components []ReleaseImageUpgradeComponent }
-
-// 重构后（3 个类型 + 2 个别名）
-type ReleaseImageComponent struct { Name, Version string; Inline *ReleaseImageInline }
-type ReleaseImageInline struct { Handler, Version string }
-type ReleaseImageComponentList struct { Components []ReleaseImageComponent }
-type ReleaseImageInstallSpec = ReleaseImageComponentList   // 类型别名
-type ReleaseImageUpgradeSpec = ReleaseImageComponentList  // 类型别名
-
-// 使用方式
-installSpec.Components  // []ReleaseImageComponent
-upgradeSpec.Components  // []ReleaseImageComponent
-// 无需类型转换，直接共用
-```
-
-### 4.3 ReleaseImage YAML 示例（完整安装 + 升级）
-
-```yaml
-apiVersion: cvo.openfuyao.cn/v1alpha1
-kind: ReleaseImage
-metadata:
-  name: openfuyao-v2.7.0
-spec:
-  version: "v2.7.0"
-  digest: "sha256:..."
-  
-  # ============================================================
-  # 安装组件：定义全新安装时执行的组件列表
-  # ============================================================
-  install:
-    components:
-      - name: bkeagent
-        version: v2.7.0
-        inline:
-          handler: EnsureBKEAgent
-          version: v1.0.0
-      
-      - name: nodes-env
-        version: v1.0.0
-        inline:
-          handler: EnsureNodesEnv
-          version: v1.0.0
-      
-      - name: cluster-api-obj
-        version: v1.0.0
-        inline:
-          handler: EnsureClusterAPIObj
-          version: v1.0.0
-      
-      - name: certs
-        version: v2.7.0
-        inline:
-          handler: EnsureCerts
-          version: v1.0.0
-      
-      - name: load-balance
-        version: v2.1.4
-        inline:
-          handler: EnsureLoadBalance
-          version: v1.0.0
-      
-      - name: kubernetes-master
-        version: v1.36.0
-        inline:
-          handler: EnsureMasterInit
-          version: v1.0.0
-      
-      - name: kubernetes-worker
-        version: v1.36.0
-        inline:
-          handler: EnsureWorkerJoin
-          version: v1.0.0
-      
-      - name: kube-proxy
-        version: v1.36.0
-        # type=yaml, 无需 inline handler
-      
-      - name: coredns
-        version: v1.11.3
-        # type=yaml, 无需 inline handler
-      
-      - name: nodes-postprocess
-        version: v1.0.0
-        inline:
-          handler: EnsureNodesPostProcess
-          version: v1.0.0
-      
-      - name: agent-switch
-        version: v1.0.0
-        inline:
-          handler: EnsureAgentSwitch
-          version: v1.0.0
-  
-  # ============================================================
-  # 升级组件：定义版本升级时执行的组件列表
-  # ============================================================
-  upgrade:
-    components:
-      - name: pre-upgrade-resources
-        version: v1.0.0
-        inline:
-          handler: EnsurePreUpgradeResources
-          version: v1.0.0
-      - name: bkeagent
-        version: v2.7.0
-        inline:
-          handler: EnsureAgentUpgrade
-          version: v1.0.0
-      - name: containerd
-        version: v1.7.24
-        inline:
-          handler: EnsureContainerdUpgrade
-          version: v1.0.0
-      - name: etcd
-        version: v3.5.20
-        inline:
-          handler: EnsureEtcdUpgrade
-          version: v1.0.0
-      - name: kubernetes-master
-        version: v1.36.0
-        inline:
-          handler: EnsureMasterUpgrade
-          version: v1.0.0
-      - name: kubernetes-worker
-        version: v1.36.0
-        inline:
-          handler: EnsureWorkerUpgrade
-          version: v1.0.0
-      - name: kube-proxy
-        version: v1.36.0
-      - name: coredns
-        version: v1.11.3
-```
-
-## 5. 安装组件目录设计
-
-### 5.0 DeclarativeUpgradeCatalog 的作用 (现有升级组件目录)
-
-在说明安装组件目录 `DeclarativeInstallCatalog` 之前，先理解现有升级组件目录 `DeclarativeUpgradeCatalog` 的作用，因为安装目录是它的对称设计。
-
-#### 5.0.1 是什么
-
-`DeclarativeUpgradeCatalog` 是一个**静态映射表** (Go `var` 切片)，定义在 `pkg/upgrade/catalog.go` 中。它将 ReleaseImage 中的升级组件名称映射到具体的执行模式 (inline/manifest)、inline handler 名称、manifest 路径和 legacy Phase 名称。
-
-```go
-// pkg/upgrade/catalog.go (现有代码)
-
-// DeclarativeUpgradeCatalog is the canonical upgrade component table for ReleaseImage DAG.
-var DeclarativeUpgradeCatalog = []UpgradeComponentSpec{
-    {Name: "pre-upgrade-resources", Mode: UpgradeExecutionInline,
-     InlineHandler: "EnsurePreUpgradeResources", LegacyPhase: "EnsurePreUpgradeResources"},
-    {Name: "provider", Mode: UpgradeExecutionManifest,
-     ManifestPath: "provider/v1.0.0/component.yaml", LegacyPhase: "EnsureProviderSelfUpgrade"},
-    {Name: "bkeagent", Mode: UpgradeExecutionInline,
-     InlineHandler: "EnsureAgentUpgrade", LegacyPhase: "EnsureAgentUpgrade"},
-    {Name: "kube-proxy", Mode: UpgradeExecutionManifest,
-     ManifestPath: "kube-proxy/v1.0.0/component.yaml"},
-    {Name: "coredns", Mode: UpgradeExecutionManifest,
-     ManifestPath: "coredns/v1.0.0/component.yaml", LegacyPhase: "EnsureComponentUpgrade"},
-    {Name: "etcd", Mode: UpgradeExecutionInline,
-     InlineHandler: "EnsureEtcdUpgrade", LegacyPhase: "EnsureEtcdUpgrade"},
-    {Name: "kubernetes-master", Mode: UpgradeExecutionInline,
-     InlineHandler: "EnsureMasterUpgrade", LegacyPhase: "EnsureMasterUpgrade"},
-    {Name: "kubernetes-worker", Mode: UpgradeExecutionInline,
-     InlineHandler: "EnsureWorkerUpgrade", LegacyPhase: "EnsureWorkerUpgrade"},
-    {Name: "containerd", Mode: UpgradeExecutionInline,
-     InlineHandler: "EnsureContainerdUpgrade", LegacyPhase: "EnsureContainerdUpgrade"},
-}
-```
-
-#### 5.0.2 解决什么问题
-
-| 问题 | 没有 Catalog 时 | 有 Catalog 后 |
-|------|----------------|--------------|
-| **组件名 → 执行模式映射** | DAG 调度器收到 `ComponentNode{Name: "kubernetes-master"}` 后，不知道该用 inline 还是 manifest 执行 | 从 Catalog 查表：`Mode=UpgradeExecutionInline`，使用 inline 执行器 |
-| **组件名 → inline handler 映射** | inline 类型组件需要知道调用哪个 Phase Handler (如 `EnsureMasterUpgrade`) | 从 Catalog 查表：`InlineHandler="EnsureMasterUpgrade"` |
-| **组件名 → manifest 路径映射** | manifest 类型组件需要知道 YAML 清单路径 | 从 Catalog 查表：`ManifestPath="coredns/v1.0.0/component.yaml"` |
-| **组件名 → legacy Phase 映射** | 声明式升级与 legacy PhaseFlow 共存时需互相转换 | 从 Catalog 查表：`LegacyPhase="EnsureMasterUpgrade"` |
-| **新增组件的注册点** | 新增组件需修改 DAG 构建代码、Phase 注册代码等多处 | 只需在 Catalog 中添加一条记录 + 注册 handler |
-
-#### 5.0.3 在升级流程中的角色
-
-```txt
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│              DeclarativeUpgradeCatalog 在升级流程中的角色                         │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                 │
-│  ReleaseImage.upgrade.components:                                               │
-│    - name: kubernetes-master    (声明: 组件名 + 版本)                            │
-│      version: v1.36.0                                                           │
-│      inline:                                                                    │
-│        handler: EnsureMasterUpgrade                                             │
-│        version: v1.0.0                                                          │
-│    - name: coredns                                                              │
-│      version: v1.11.3                                                           │
-│      (无 inline → manifest 模式)                                                │
-│                                                                                 │
-│           │                                                                     │
-│           ▼ BuildUpgradeDAGFromBundle(bundle, resolver)                         │
-│                                                                                 │
-│  遍历 ReleaseImage.upgrade.components:                                          │
-│    for _, comp := range bundle.Release.Spec.Upgrade.Components {               │
-│        // 从 Catalog 查找组件的执行模式                                          │
-│        catalogEntry := findInCatalog(DeclarativeUpgradeCatalog, comp.Name)      │
-│        // catalogEntry = {Name: "kubernetes-master",                             │
-│        //                 Mode: UpgradeExecutionInline,                         │
-│        //                 InlineHandler: "EnsureMasterUpgrade"}                 │
-│                                                                                 │
-│        // 构建 DAG 节点 (含执行模式信息)                                         │
-│        dag.AddNode(ComponentNode{                                               │
-│            Name:          comp.Name,           // "kubernetes-master"          │
-│            Version:       comp.Version,         // "v1.36.0"                   │
-│            Inline:        comp.Inline,          // {Handler: "EnsureMasterUpgrade"}│
-│            FailurePolicy: catalogEntry.FailurePolicy,                          │
-│            Dependencies:  resolveDependencies(comp.Name, bundle),             │
-│        })                                                                       │
-│    }                                                                            │
-│                                                                                 │
-│           │                                                                     │
-│           ▼ Scheduler.ExecuteDAG(ctx, execCtx, dag)                             │
-│                                                                                 │
-│  DAG 执行时, 对每个节点:                                                        │
-│    if node.Inline != nil {                                                      │
-│        // inline 模式 → InlineComponentExecutor                                  │
-│        handler := ComponentFactory.Resolve(node.Inline.Handler)                │
-│        // handler = EnsureMasterUpgrade Phase                                    │
-│        handler.Execute(ctx, oldCluster, newCluster, version)                   │
-│    } else {                                                                     │
-│        // manifest 模式 → YamlComponentExecutor                                  │
-│        pkg, _ := manifestStore.GetComponentManifests(ctx, node.Name, node.Version)│
-│        applier.ApplyComponent(ctx, pkg)                                         │
-│    }                                                                            │
-│                                                                                 │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
-
-#### 5.0.4 Catalog 与 ReleaseImage 的分工
-
-| 维度 | ReleaseImage (声明层) | DeclarativeUpgradeCatalog (映射层) |
-|------|----------------------|-----------------------------------|
-| **定义位置** | OCI Bundle 中的 `release.yaml` | `pkg/upgrade/catalog.go` 中的 Go `var` |
-| **变更频率** | 每次发布变更 (版本号、组件列表) | 很少变更 (仅新增组件时添加条目) |
-| **内容** | 组件名 + 版本号 + inline handler (如声明) | 组件名 → 执行模式 + handler + manifest 路径 + legacy Phase |
-| **作用** | 声明"升级到什么版本" | 映射"用什么方式执行升级" |
-| **关系** | ReleaseImage 组件名是 Catalog 的查找键 | Catalog 提供执行所需的元数据 |
-
-> **分工原则**：ReleaseImage 声明**什么版本** (What)，Catalog 映射**怎么执行** (How)。
-
-#### 5.0.5 Catalog 的消费者
-
-| 消费者 | 用途 | 代码位置 |
-|--------|------|---------|
-| `BuildUpgradeDAGFromBundle()` | 构建 DAG 时查找组件的执行模式和 inline handler | `pkg/topology/build.go` |
-| `InlineUpgradeHandlers()` | 返回所有 inline handler 名称列表，供 ComponentFactory 注册 | `pkg/upgrade/catalog.go:125` |
-| `Scheduler.executeComponent()` | 根据 Catalog 的 Mode 选择 inline/manifest 执行器 | `pkg/dagexec/scheduler.go` |
-| `PhaseFlow.CalculatePhase()` | 旧路径中用 `LegacyPhase` 字段判断是否跳过 legacy Phase | `pkg/phaseframe/phases/phase_flow.go` |
-
-### 5.1 DeclarativeInstallCatalog
-
-#### 5.1.1 复用 UpgradeComponentSpec — 不新增类型
-
-分析 `InstallComponentSpec` 与现有 `UpgradeComponentSpec` 的字段：
-
-| 字段 | `UpgradeComponentSpec` | `InstallComponentSpec` (原提议) | 差异 |
-|------|----------------------|-------------------------------|------|
-| `Name` | string | string | 无 |
-| `Version` | string | string | 无 |
-| `Mode` | `UpgradeExecutionMode` ("manifest"/"inline") | `InstallExecutionMode` ("manifest"/"inline") | **值相同，仅类型名不同** |
-| `ManifestPath` | string | string | 无 |
-| `InlineHandler` | string | string | 无 |
-| `LegacyPhase` | string | 缺失 | 安装也需要 (映射到 DeployPhases) |
-
-**结论**：两个结构体字段语义完全一致，`Mode` 的值 ("manifest"/"inline") 描述的是执行机制而非操作类型 (安装/升级)。**应直接复用 `UpgradeComponentSpec`，不新增 `InstallComponentSpec` 和 `InstallExecutionMode`**。
-
-**方案**：将 `UpgradeComponentSpec` 重命名为中性的 `ComponentSpec`，`UpgradeExecutionMode` 重命名为 `ExecutionMode`，同时保留 `UpgradeComponentSpec` 作为类型别名以保证向后兼容：
-
-```go
-// pkg/upgrade/catalog.go
-
-// ExecutionMode 描述组件的执行方式 (安装和升级通用) 🔄重构
-// 统一替代 UpgradeExecutionMode
-type ExecutionMode string
-
-const (
-    ExecutionManifest ExecutionMode = "manifest"
-    ExecutionInline   ExecutionMode = "inline"
-)
-
-// ComponentSpec 映射 ReleaseImage 组件名到执行模式 (安装和升级通用) 🔄重构
-// 统一替代 UpgradeComponentSpec
-type ComponentSpec struct {
-    // 组件名称 (ReleaseImage install/upgrade components[].name)
-    Name string
-
-    // 组件版本
-    Version string
-
-    // 执行模式: manifest | inline
-    Mode ExecutionMode
-
-    // Manifest 路径 (mode=manifest 时)
-    ManifestPath string
-
-    // Legacy Phase 名称 (映射到 PhaseFlow 的 Phase，用于双轨共存时跳过)
-    LegacyPhase string
-
-    // Inline handler 名称 (mode=inline 时，ComponentFactory 注册键)
-    InlineHandler string
-}
-
-// UpgradeComponentSpec 升级组件规格 (类型别名，向后兼容)
-type UpgradeComponentSpec = ComponentSpec
-
-// UpgradeExecutionMode 升级执行模式 (类型别名，向后兼容)
-type UpgradeExecutionMode = ExecutionMode
-```
-
-**向后兼容性**：
-
-类型别名 (`type UpgradeComponentSpec = ComponentSpec`) 确保现有代码无需修改：
-
-```go
-// 现有代码无需修改
-var specs []UpgradeComponentSpec  // 类型别名，等价于 ComponentSpec
-
-// 可以直接赋值和转换
-specs = []ComponentSpec{
-    {Name: "etcd", Mode: ExecutionInline, InlineHandler: "EnsureEtcdUpgrade"},
-}
-
-// 常量也可互换使用
-var mode ExecutionMode = ExecutionInline
-var legacyMode UpgradeExecutionMode = mode  // 类型相同，可以直接赋值
-```
-
-**DeclarativeUpgradeCatalog 保持不变**：
-
-```go
-// pkg/upgrade/catalog.go — 现有代码无需修改
-
-var DeclarativeUpgradeCatalog = []ComponentSpec{  // 类型名从 UpgradeComponentSpec 改为 ComponentSpec
-    {Name: "pre-upgrade-resources", Mode: ExecutionInline, InlineHandler: "EnsurePreUpgradeResources", LegacyPhase: "EnsurePreUpgradeResources"},
-    {Name: "provider", Mode: ExecutionManifest, ManifestPath: "provider/v1.0.0/component.yaml", LegacyPhase: "EnsureProviderSelfUpgrade"},
-    {Name: "bkeagent", Mode: ExecutionInline, InlineHandler: "EnsureAgentUpgrade", LegacyPhase: "EnsureAgentUpgrade"},
-    // ... 其余组件
-}
-```
-
-> **重命名影响**：`UpgradeComponentSpec` → `ComponentSpec`，`UpgradeExecutionMode` → `ExecutionMode`。现有引用处 (catalog.go、build.go、scheduler.go 等) 可选择性替换类型名，但**字段和方法不变**。通过类型别名，现有代码无需修改即可编译通过。
-
-#### 5.1.2 DeclarativeInstallCatalog 定义
-
-```go
-// pkg/upgrade/catalog.go
-
-// DeclarativeInstallCatalog 安装组件目录 🆕新增
-// 复用 ComponentSpec (与 DeclarativeUpgradeCatalog 同一类型)
-var DeclarativeInstallCatalog = []ComponentSpec{
-    // inline 模式：复用现有 Phase 实现
-    {Name: "bkeagent",          Mode: ExecutionInline, InlineHandler: "EnsureBKEAgent",       LegacyPhase: "EnsureBKEAgent"},
-    {Name: "nodes-env",         Mode: ExecutionInline, InlineHandler: "EnsureNodesEnv",       LegacyPhase: "EnsureNodesEnv"},
-    {Name: "cluster-api-obj",   Mode: ExecutionInline, InlineHandler: "EnsureClusterAPIObj",  LegacyPhase: "EnsureClusterAPIObj"},
-    {Name: "certs",             Mode: ExecutionInline, InlineHandler: "EnsureCerts",          LegacyPhase: "EnsureCerts"},
-    {Name: "load-balance",      Mode: ExecutionInline, InlineHandler: "EnsureLoadBalance",    LegacyPhase: "EnsureLoadBalance"},
-    {Name: "kubernetes-master",  Mode: ExecutionInline, InlineHandler: "EnsureMasterInit",     LegacyPhase: "EnsureMasterInit"},
-    {Name: "kubernetes-worker",  Mode: ExecutionInline, InlineHandler: "EnsureWorkerJoin",     LegacyPhase: "EnsureWorkerJoin"},
-    {Name: "nodes-postprocess", Mode: ExecutionInline, InlineHandler: "EnsureNodesPostProcess",LegacyPhase: "EnsureNodesPostProcess"},
-    {Name: "agent-switch",      Mode: ExecutionInline, InlineHandler: "EnsureAgentSwitch",    LegacyPhase: "EnsureAgentSwitch"},
-
-    // manifest 模式：YAML 清单应用
-    // 对应 ReleaseImage install.components 中无 inline handler 的组件
-    {Name: "kube-proxy", Mode: ExecutionManifest, ManifestPath: "kube-proxy/{version}/component.yaml"},
-    {Name: "coredns",    Mode: ExecutionManifest, ManifestPath: "coredns/{version}/component.yaml"},
-    {Name: "calico",     Mode: ExecutionManifest, ManifestPath: "calico/{version}/component.yaml"},
-    {Name: "provider",   Mode: ExecutionManifest, ManifestPath: "provider/{version}/component.yaml"},
-}
-```
-
-**ReleaseImage install.components 与 DeclarativeInstallCatalog 的对应关系**：
-
-| ReleaseImage 组件 | Catalog 模式 | Handler / ManifestPath |
-|------------------|-------------|----------------------|
-| bkeagent | inline | `EnsureBKEAgent` |
-| kubernetes-master | inline | `EnsureMasterInit` |
-| kubernetes-worker | inline | `EnsureWorkerJoin` |
-| etcd | (嵌入 MasterInit) | 由 kubeadm init 创建 |
-| containerd | (嵌入 NodesEnv) | 由 K8sEnvInit runtime scope 安装 |
-| calico | manifest | `calico/{version}/component.yaml` |
-| kubeproxy | manifest | `kube-proxy/{version}/component.yaml` |
-| coredns | manifest | `coredns/{version}/component.yaml` |
-| provider | manifest | `provider/{version}/component.yaml` |
-
-> **注意**：etcd 和 containerd 不在 Catalog 中，因为它们在安装时嵌入在其他组件中（etcd 由 `EnsureMasterInit` 通过 kubeadm init 创建，containerd 由 `EnsureNodesEnv` 通过 K8sEnvInit 安装）。详见 §5.2.1。
-
-#### 5.1.3 复用的收益
-
-| 维度 | 新增 `InstallComponentSpec` (原方案) | 复用 `ComponentSpec` (改进方案) |
-|------|-------------------------------------|--------------------------------|
-| 类型定义 | 新增 `InstallComponentSpec` + `InstallExecutionMode` | **零新增** (复用现有类型) |
-| 常量定义 | 新增 `InstallExecutionManifest` + `InstallExecutionInline` | **零新增** (复用 `ExecutionManifest` + `ExecutionInline`) |
-| Catalog 查找函数 | 需为 Install 写一套 `findInInstallCatalog()` | **复用** `findInCatalog()` (泛型于 install/upgrade) |
-| `InlineHandlers()` 函数 | 需新增 `InlineInstallHandlers()` | **复用** `InlineUpgradeHandlers()` 逻辑 (改为 `InlineHandlers(catalog)`) |
-| 新增组件 | 需在两个 Catalog 中各加一条 | 按需在对应 Catalog 中添加 (install/upgrade handler 不同是正常的) |
-| 代码维护 | 两套类型定义需保持同步 | **一套类型**，无需同步 |
-
-> **注意**：同一组件在安装和升级 Catalog 中的 `InlineHandler` 可能不同 (如 `kubernetes-master`: 安装=`EnsureMasterInit`，升级=`EnsureMasterUpgrade`)。复用 `ComponentSpec` 类型不影响这一点 — 两个 Catalog 是独立的 `[]ComponentSpec` 切片，只是元素类型相同。
-
-### 5.2 安装组件与升级组件目录对比
-
-基于代码库实际实现核对的完整组件列表：
-
-| 组件名称 | ReleaseImage install | ReleaseImage upgrade | 安装 handler (DeployPhases) | 升级 handler | 执行模式 | 说明 |
-|---------|---------------------|---------------------|----------------------------|-------------|---------|------|
-| **bkeagent** | ✅ | ✅ inline: EnsureAgentUpgrade | `EnsureBKEAgent` | `EnsureAgentUpgrade` | inline | Agent 推送/升级 |
-| **kubernetes-master** | ✅ | ✅ inline: EnsureMasterUpgrade | `EnsureMasterInit` | `EnsureMasterUpgrade` | inline | Master 初始化/升级 |
-| **kubernetes-worker** | ✅ | ✅ inline: EnsureWorkerUpgrade | `EnsureWorkerJoin` | `EnsureWorkerUpgrade` | inline | Worker 加入/升级 |
-| **etcd** | ✅ | ✅ inline: EnsureEtcdUpgrade | (嵌入 MasterInit) | `EnsureEtcdUpgrade` | inline | etcd 由 kubeadm init 创建 |
-| **containerd** | ✅ | ✅ inline: EnsureContainerdUpgrade | (嵌入 NodesEnv) | `EnsureContainerdUpgrade` | inline | containerd 由 K8sEnvInit runtime scope 安装 |
-| **provider** | ✅ | ✅ (无 inline) | (嵌入 MasterInit) | `EnsureProviderSelfUpgrade` | manifest | provider 由 kubeadm init 部署 |
-| **calico** | ✅ | ✅ (无 inline) | (嵌入 AddonDeploy) | (manifest) | manifest | CNI 插件，安装走 EnsureAddonDeploy |
-| **kubeproxy** | ✅ | ✅ (无 inline) | (嵌入 AddonDeploy) | (manifest) | manifest | kube-proxy，安装走 EnsureAddonDeploy |
-| **coredns** | ✅ | ✅ (无 inline) | (嵌入 AddonDeploy) | (manifest) | manifest | CoreDNS，安装走 EnsureAddonDeploy |
-| **nodes-env** | ❌ | ❌ | `EnsureNodesEnv` | - | inline | 节点环境准备 (含 containerd) |
-| **cluster-api-obj** | ❌ | ❌ | `EnsureClusterAPIObj` | - | inline | Cluster API 对象创建 |
-| **certs** | ❌ | ❌ | `EnsureCerts` | - | inline | 证书生成 |
-| **load-balance** | ❌ | ❌ | `EnsureLoadBalance` | - | inline | HA 负载均衡 (haproxy/keepalived) |
-| **nodes-postprocess** | ❌ | ❌ | `EnsureNodesPostProcess` | - | inline | 后置脚本处理 |
-| **agent-switch** | ❌ | ❌ | `EnsureAgentSwitch` | - | inline | Agent 监听切换 |
-| **pre-upgrade-resources** | ❌ | ✅ inline: (无) | - | `EnsurePreUpgradeResources` | inline | 升级前资源预创建 |
-
-**图例说明**：
-- ✅ = ReleaseImage 中声明的组件
-- ❌ = ReleaseImage 中未声明 (仅在 PhaseFlow 中存在)
-- (嵌入 XXX) = 安装时嵌入在其他 Phase 中，无独立 handler
-- (manifest) = 通过 bke-manifests YAML 清单部署，无 inline handler
-
-#### 5.2.1 containerd 的安装路径详细说明
-
-containerd 在安装和升级中采用不同的路径：
-
-**安装路径** (嵌入 `EnsureNodesEnv` Phase)：
-
-```txt
-EnsureNodesEnv.Execute()
-  → CheckOrInitNodesEnv()
-    → buildEnvCommand() → BuildCommonEnvCommand()
-      → 创建 BKEAgent Command CR (类型: CommandBuiltIn)
-        → BKEAgent 执行 K8sEnvInit 插件:
-          → scope 包含 "runtime":
-            → initRuntime() → downloadContainerd()
-              → 下载 containerd-{version}-linux-{arch}.tar.gz
-              → 解压 + 安装 + 启动 systemd 服务
-```
-
-| 维度 | 说明 |
-|------|------|
-| **安装 Phase** | `EnsureNodesEnv` (DeployPhases #1) |
-| **安装机制** | BKEAgent `K8sEnvInit` 插件 `runtime` scope → `downloadContainerd()` |
-| **代码位置** | `pkg/phaseframe/phases/ensure_nodes_env.go` → `pkg/command/env.go` → `pkg/job/builtin/kubeadm/env/init.go` |
-| **是否独立 Phase** | **否** — containerd 安装嵌入在 `EnsureNodesEnv` 的环境初始化命令中 |
-| **版本来源** | `BKECluster.Spec.ClusterConfig.Cluster.ContainerdVersion` (从 Spec 读取) |
-
-**升级路径** (独立 `EnsureContainerdUpgrade` Phase)：
-
-```txt
-EnsureContainerdUpgrade.Execute()
-  → 创建 BKEAgent Command CR (类型: CommandBuiltIn)
-    → BKEAgent 执行 Kubeadm 插件:
-      → phase=UpgradeContainerd
-        → upgradeContainerd()
-          → 下载新版 containerd 二进制
-          → 停止 containerd 服务
-          → 替换二进制文件
-          → 启动 containerd 服务
-          → 等待服务就绪
-```
-
-| 维度 | 说明 |
-|------|------|
-| **升级 Phase** | `EnsureContainerdUpgrade` (DeclarativeInlineUpgradePhases) |
-| **升级机制** | BKEAgent `Kubeadm` 插件 `UpgradeContainerd` phase |
-| **代码位置** | `pkg/phaseframe/phases/ensure_containerd_upgrade.go` → `pkg/job/builtin/kubeadm/kubeadm.go` |
-| **是否独立 Phase** | **是** — 独立的升级 Phase |
-| **版本来源** | `ReleaseImage.upgrade.components[containerd].version` (从 ReleaseImage 读取) |
-
-**安装与升级路径不一致的原因**：
-
-| 维度 | 安装 | 升级 |
-|------|------|------|
-| **执行时机** | 节点环境准备阶段 (首次安装) | 集群已运行，需要滚动升级 |
-| **执行方式** | 通过 K8sEnvInit 插件批量初始化节点环境 | 通过 Kubeadm 插件单独升级 containerd |
-| **是否需要 drain** | 否 (节点尚未加入集群) | 是 (需要驱逐 Pod) |
-| **是否重启服务** | 是 (首次启动) | 是 (停止 → 替换 → 启动) |
-
-**DAG 化影响**：
-
-在 DAG 化安装路径中，containerd 需要作为独立组件声明：
-
-```yaml
-# ReleaseImage install.components 新增 containerd
-install:
-  components:
-    - name: containerd
-      version: v2.1.1
-      inline:
-        handler: EnsureContainerdInstall  # 🆕新增: 独立的安装 handler
-        version: v1.0.0
-```
-
-或者保持嵌入方式，但需要确保 `EnsureNodesEnv` 在 DAG 中正确执行：
-
-```go
-// DeclarativeInstallCatalog 中 containerd 的处理方式
-// 方案 A: 独立组件 (推荐)
-{Name: "containerd", Mode: ExecutionInline, InlineHandler: "EnsureContainerdInstall"}
-
-// 方案 B: 保持嵌入 (不推荐，违反声明式原则)
-// containerd 不在 DeclarativeInstallCatalog 中，由 EnsureNodesEnv 内部处理
-```
-
-### 5.3 ComponentFactory 注册扩展
-
-```go
-// pkg/componentfactory/registry.go
-
-func registerInstallHandlers() {
-    // 安装 handler 注册（复用现有 Phase 构造函数）
-    // 对应 DeclarativeInstallCatalog 中的 inline 模式组件
-    RegisterInlineHandler("EnsureBKEAgent",         v1alpha1.InlineHandlerVersion, phases.NewEnsureBKEAgent)
-    RegisterInlineHandler("EnsureNodesEnv",         v1alpha1.InlineHandlerVersion, phases.NewEnsureNodesEnv)
-    RegisterInlineHandler("EnsureClusterAPIObj",    v1alpha1.InlineHandlerVersion, phases.NewEnsureClusterAPIObj)
-    RegisterInlineHandler("EnsureCerts",            v1alpha1.InlineHandlerVersion, phases.NewEnsureCerts)
-    RegisterInlineHandler("EnsureLoadBalance",      v1alpha1.InlineHandlerVersion, phases.NewEnsureLoadBalance)
-    RegisterInlineHandler("EnsureMasterInit",       v1alpha1.InlineHandlerVersion, phases.NewEnsureMasterInit)
-    RegisterInlineHandler("EnsureWorkerJoin",       v1alpha1.InlineHandlerVersion, phases.NewEnsureWorkerJoin)
-    RegisterInlineHandler("EnsureNodesPostProcess", v1alpha1.InlineHandlerVersion, phases.NewEnsureNodesPostProcess)
-    RegisterInlineHandler("EnsureAgentSwitch",      v1alpha1.InlineHandlerVersion, phases.NewEnsureAgentSwitch)
-    
-    // 升级 handler 已注册（现有）
-    // RegisterInlineHandler("EnsureEtcdUpgrade", ...)
-    // RegisterInlineHandler("EnsureMasterUpgrade", ...)
-    // ...
-}
-```
-
-**DeployPhases 中未注册的 Handler 说明**：
-
-| Handler | 是否注册 | 原因 |
-|---------|---------|------|
-| **EnsureMasterJoin** | ❌ 不注册 | Master 扩容场景由 `EnsureMasterInit` 幂等处理（检查已有 Master 数量，决定执行 init 还是 join）。DAG 化后 `kubernetes-master` 组件统一使用 `EnsureMasterInit`，无需单独的 join handler。 |
-| **EnsureAddonDeploy** | ❌ 不注册 | Addon 组件（calico、kubeproxy、coredns）在 DAG 化中使用 **manifest 模式**（YAML 清单应用），由 `YamlInstaller` 处理，不需要 inline handler。`DeclarativeInstallCatalog` 中这些组件声明为 `Mode: ExecutionManifest`。 |
-
-**Handler 与组件的完整对应关系**：
-
-| 组件 | DeclarativeInstallCatalog 模式 | Handler / Manifest |
-|------|-------------------------------|-------------------|
-| bkeagent | inline | `EnsureBKEAgent` |
-| nodes-env | inline | `EnsureNodesEnv` |
-| cluster-api-obj | inline | `EnsureClusterAPIObj` |
-| certs | inline | `EnsureCerts` |
-| load-balance | inline | `EnsureLoadBalance` |
-| kubernetes-master | inline | `EnsureMasterInit` (init/join 统一) |
-| kubernetes-worker | inline | `EnsureWorkerJoin` |
-| nodes-postprocess | inline | `EnsureNodesPostProcess` |
-| agent-switch | inline | `EnsureAgentSwitch` |
-| kube-proxy | manifest | `kube-proxy/{version}/component.yaml` |
-| coredns | manifest | `coredns/{version}/component.yaml` |
-| calico | manifest | `calico/{version}/component.yaml` |
-| provider | manifest | `provider/{version}/component.yaml` |
-
-## 6. 安装 DAG 构建设计
-
-### 6.0 设计思路
-
-安装 DAG 构建的核心思路是**复用升级 DAG 的构建逻辑**，通过 `DecisionInstall` 区分安装与升级场景。与升级的关键差异在于 VersionContext：安装时 Current 全部为空 (无已安装组件)，Target 来自 ReleaseImage；升级时 Current 来自当前 ReleaseImage bundle，Target 来自目标 ReleaseImage bundle。
-
-```txt
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│              安装 DAG 构建设计思路                                                │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                 │
-│  升级 DAG 构建 (现有):                                                          │
-│    BuildVersionContextForUpgrade(targetBundle, currentBundle, bc)               │
-│      → Current 有值 (来自 currentBundle 或 Status)                              │
-│      → Target 有值 (来自 targetBundle)                                           │
-│      → Decide: current != target → DecisionUpgrade                              │
-│    BuildUpgradeDAGFromBundle(bundle, resolver)                                  │
-│      → 遍历 upgrade.components 构建 DAG                                          │
-│                                                                                 │
-│  安装 DAG构建 (新增):                                                           │
-│    BuildVersionContextForInstall(targetBundle)                                   │
-│      → Current 全空 (全新安装，无已安装组件)                                    │
-│      → Target 有值 (来自 install.components)                                    │
-│      → Decide: current="" + target!="" → DecisionInstall ★                      │
-│    BuildInstallDAGFromBundle(bundle, resolver)                                   │
-│      → 遍历 install.components 构建 DAG (复用 BuildUpgradeDAG 逻辑)             │
-│      → 使用统一的 ReleaseImageComponent 类型 (无需转换)                          │
-│                                                                                 │
-│  复用点:                                                                         │
-│  ① BuildUpgradeDAG — 拓扑排序 + 依赖解析逻辑完全复用                            │
-│  ② Scheduler.ExecuteDAG — 并行执行 + 状态更新逻辑完全复用                        │
-│  ③ ExecutorRegistry — inline/yaml 执行器分发逻辑完全复用                        │
-│  ④ ComponentFactory — handler 注册和解析逻辑完全复用                            │
-│  ⑤ DeclarativeUpgradeStatus — 断点续传状态追踪完全复用                          │
-│                                                                                 │
-│  新增点:                                                                         │
-│  ① DecisionInstall — 版本决策新增安装场景 (current 空 + target 有值)            │
-│  ② BuildVersionContextForInstall — 安装专用 VC 构建 (Current 全空)             │
-│  ③ BuildInstallDAGFromBundle — 从 install.components 构建 DAG                  │
-│  ④ DeclarativeInstallCatalog — 安装组件目录 (handler 与升级不同)               │
-│  ⑤ install-ready annotation — 安装前置门控                                      │
-│                                                                                 │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
-
-### 6.1 VersionContext 扩展
-
-```go
-// pkg/upgrade/context.go
-
-// Decision 扩展 🆕新增 DecisionInstall
-type Decision string
-
-const (
-    DecisionSkip    Decision = "Skip"
-    DecisionUpgrade Decision = "Upgrade"
-    DecisionInstall Decision = "Install"  // 🆕新增
-)
-
-// Decide 扩展：安装场景判断
-func Decide(vc *VersionContext, name string) Decision {
-    if vc == nil {
-        return DecisionUpgrade  // nil VC = 不阻塞
-    }
-    
-    // 安装场景：current 为空，target 有值
-    if vc.Current[name] == "" && vc.Target[name] != "" {
-        return DecisionInstall
-    }
-    
-    // 升级场景：current != target
-    if vc.Current[name] == vc.Target[name] || vc.Target[name] == "" {
-        return DecisionSkip
-    }
-    return DecisionUpgrade
-}
-
-// NeedsExecution 扩展
-func NeedsExecution(vc *VersionContext, name string) bool {
-    return Decide(vc, name) != DecisionSkip
-}
-```
-
-### 6.2 安装 DAG 构建器
-
-```go
-// pkg/upgrade/bundle.go
-
-// InstallComponentsFromBundle 从 ReleaseImage bundle 提取安装组件
-func InstallComponentsFromBundle(bundle *releasemanifest.Bundle) ([]apiv1.ReleaseImageComponent, error) {
-    if bundle.Release.Spec.Install == nil {
-        return nil, fmt.Errorf("release image has no install components")
-    }
-    components := bundle.Release.Spec.Install.Components
-    if len(components) == 0 {
-        return nil, fmt.Errorf("release image install components is empty")
-    }
-    return components, nil
-}
-
-// BuildInstallDAGFromBundle 从 bundle 构建安装 DAG 🆕新增
-func BuildInstallDAGFromBundle(
-    bundle *releasemanifest.Bundle,
-    resolve topology.DependencyResolver,
-) (*topology.UpgradeDAG, error) {
-    // 1. 提取安装组件
-    installComponents, err := InstallComponentsFromBundle(bundle)
-    if err != nil {
-        return nil, err
-    }
-    
-    // 2. 直接使用统一的 ReleaseImageComponent 类型构建 DAG
-    //    topology.BuildUpgradeDAG 已重构为接受 []apiv1.ReleaseImageComponent
-    //    ★ 直接构建所有 install.components 的 DAG，不需要排除任何组件
-    //    ★ 组件的跳过逻辑由执行时的 VersionContext.Decide() 与组件的 condition/NodeFilter 决定
-    return topology.BuildUpgradeDAG(installComponents, resolve)
-}
-```
-
-> **组件过滤职责分离**：DAG 构建器负责构建完整的组件拓扑图，不关心哪些组件需要执行。组件的跳过/执行决策由 DAG 执行器 (`Scheduler.ExecuteDAG`) 在运行时通过两层判断完成：
->
-> **第一层：VersionContext.Decide() — 版本决策**
-> ```go
-> func Decide(vc *VersionContext, name string) Decision {
->     // 安装场景：current 为空，target 有值 → DecisionInstall
->     if vc.Current[name] == "" && vc.Target[name] != "" {
->         return DecisionInstall
->     }
->     // 跳过场景：current == target 或 target 为空 → DecisionSkip
->     if vc.Current[name] == vc.Target[name] || vc.Target[name] == "" {
->         return DecisionSkip
->     }
->     // 升级场景：current != target → DecisionUpgrade
->     return DecisionUpgrade
-> }
-> ```
->
-> **第二层：组件的 condition / NodeFilter — 运行时条件判断**
->
-> 即使 `Decide()` 返回 `DecisionInstall`/`DecisionUpgrade`，组件仍可能被跳过，取决于：
->
-> | 判断机制 | 说明 | 示例 |
-> |---------|------|------|
-> | **Condition** | 组件声明的前置条件，不满足时跳过 | `kubernetes-master` 的 `Condition: HasMasterNodes` — 无 Master 节点时跳过 |
-> | **NodeFilter** | 节点级过滤器，决定组件在哪些节点上执行 | `EnsureNodesEnv` 的 `NodeFilter: AllNodes` — 所有节点执行 |
-> | | | `EnsureMasterInit` 的 `NodeFilter: MasterNodesOnly` — 仅 Master 节点执行 |
-> | | | `EnsureWorkerJoin` 的 `NodeFilter: NewWorkerNodes` — 仅新增 Worker 节点执行 |
->
-> **执行流程**：
-> ```text
-> Scheduler.ExecuteDAG():
->   for each component in DAG:
->     1. Decide(vc, name) → DecisionSkip? → 跳过该组件
->     2. 检查 component.Condition → 不满足? → 跳过该组件
->     3. 检查 component.NodeFilter → 当前节点不在过滤范围? → 跳过该节点
->     4. 执行组件
-> ```
->
-> **不同场景下的 Decide() 结果**：
-> - **全新安装**：`Current` 全空，`Target` 有值 → 所有组件 `DecisionInstall` → 全部执行
-> - **纳管场景**：`manage` 组件先探测版本填充 `Current`，后续组件根据 `Current` 与 `Target` 的比较结果决定 `DecisionSkip`/`DecisionUpgrade`/`DecisionInstall`
-> - **扩容场景**：已有节点组件 `Current == Target` → `DecisionSkip`，新增节点组件 `Current="" && Target!=""` → `DecisionInstall`
-
-### 6.3 安装 VersionContext 构建
-
-```go
-// pkg/upgrade/build_release.go
-
-// BuildVersionContextForInstall 为安装场景构建 VersionContext 🆕新增
-func BuildVersionContextForInstall(
-    targetBundle *releasemanifest.Bundle,
-) *VersionContext {
-    vc := NewVersionContext()
-    
-    // 安装场景：Current 全部为空（全新安装），Target 来自 ReleaseImage
-    // ★ 直接构建所有 install.components 的 Target，不需要排除任何组件
-    // ★ 组件的跳过逻辑由执行时的 Decide() 决定
-    if targetBundle.Release.Spec.Install != nil {
-        for _, comp := range targetBundle.Release.Spec.Install.Components {
-            vc.SetTarget(comp.Name, comp.Version)
-        }
-    }
-    
-    // Current 全部为空 → Decide 返回 DecisionInstall
-    return vc
-}
-```
-
-> **简化设计**：VersionContext 构建时直接包含所有 install.components，不在构建时进行过滤。组件的跳过逻辑完全由执行时的 `Decide()` 与 `condition`/`NodeFilter` 决定：
-> - 全新安装：所有组件 `Current="" && Target!=""` → `DecisionInstall` → 全部执行
-> - 纳管场景：`manage` 组件先探测版本填充 `Current`，后续组件根据 `Current` 与 `Target` 的比较结果决定
-> - 组件可以包含在 ReleaseImage 的 install.components 中，但在执行时通过 `condition`（Go Template 表达式，根据集群运行时状态判断）或 `NodeFilter`（节点级过滤器）进行过滤跳过
-
-## 7. 安装 DAG 执行设计
-
-### 7.0 设计思路
-
-安装 DAG 执行的核心思路是**在现有 PhaseFlow 的执行入口中增加 DAG 安装分支**，通过三重门控 (Feature Gate + 全新安装判定 + install-ready annotation) 决定是否走 DAG 路径。未满足门控条件时回退到 Legacy PhaseFlow，保证向后兼容。
-
-```txt
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│              安装 DAG 执行设计思路                                                │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                 │
-│  执行入口 (executePhaseFlow) 三路分发:                                           │
-│                                                                                 │
-│  ① shouldUseDeclarativeUpgrade? → executeUpgradeDAG (现有升级路径)             │
-│     门控: upgrade-ready annotation + Feature Gate                               │
-│                                                                                 │
-│  ② shouldUseDeclarativeInstall? → executeInstallDAG (新增安装路径) ★           │
-│     门控: Feature Gate + 全新安装 + install-ready annotation                    │
-│                                                                                 │
-│  ③ 默认 → PhaseFlow (Legacy 路径)                                               │
-│     适用: Feature Gate 未启用 / ReleaseImage 未就绪 / 扩容/纳管/删除等场景      │
-│                                                                                 │
-│  三重门控设计原因:                                                               │
-│                                                                                 │
-│  门控 1 — Feature Gate (DeclarativeInstallEnabled):                              │
-│    原因: 渐进迁移，默认关闭确保生产稳定                                          │
-│    效果: 关闭时所有安装走 Legacy PhaseFlow                                       │
-│                                                                                 │
-│  门控 2 — 全新安装判定 (Status.Phase 为空或 Init):                               │
-│    原因: DAG 安装路径仅面向全新安装，扩容/纳管/删除等场景不适用                  │
-│    效果: 仅全新安装可走 DAG，扩容仍走 PhaseFlow Scale Phase                      │
-│                                                                                 │
-│  门控 3 — install-ready annotation:                                              │
-│    原因: ReleaseImage 可能尚未创建或未通过验证，需前置门控确保就绪              │
-│    效果: ReleaseImage Phase=Valid 后 ClusterVersionReconciler 设置 annotation   │
-│          → BKEClusterReconciler 检测到 annotation 后才走 DAG 路径              │
-│          → 无 annotation 时回退 Legacy PhaseFlow (从 Spec 读取版本，不依赖 RI) │
-│                                                                                 │
-│  executeInstallDAG 执行流程:                                                     │
-│    1. resolveInstallBundle → 从 ReleaseImage 解析 OCI Bundle                    │
-│    2. BuildVersionContextForInstall → 构建 VC (Current 空, Target 来自 RI)     │
-│    3. ApplyVersionContextTargetsToClusterSpec → 同步版本到 BKECluster.Spec      │
-│       (供 BKEAgent 读取 BkeConfig.Cluster.KubernetesVersion 等)                │
-│    4. BuildInstallDAGFromBundle → 构建安装 DAG (拓扑排序)                       │
-│    5. ComponentFactory + 注册安装 handler                                        │
-│    6. NewScheduler (复用升级框架)                                                │
-│    7. ExecuteDAG → 并行执行安装组件                                              │
-│    8. 安装完成 → 更新 Status                                                     │
-│                                                                                 │
-│  与升级执行的关键差异:                                                           │
-│  ① VersionContext: 安装 Current 全空 vs 升级 Current 有值                       │
-│  ② Decision: 安装 DecisionInstall vs 升级 DecisionUpgrade                       │
-│  ③ Catalog: 安装 DeclarativeInstallCatalog vs 升级 DeclarativeUpgradeCatalog   │
-│  ④ Annotation: 安装 install-ready vs 升级 upgrade-ready                         │
-│  ⑤ Handler: 安装 EnsureMasterInit vs 升级 EnsureMasterUpgrade                  │
-│                                                                                 │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
-
-### 7.1 执行入口
-
-#### 7.1.0 三路分发统一设计
-
-`executePhaseFlow()` 是 BKEClusterReconciler 的核心分发入口，统一管理 DAG 升级、DAG 安装、Legacy PhaseFlow 三条路径。设计原则是**优先匹配 DAG 路径，未命中则回退 Legacy**，确保 Feature Gate 关闭时行为完全不变。
-
-```txt
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│              executePhaseFlow 三路分发统一设计                                     │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                 │
-│  executePhaseFlow(ctx, phaseCtx, oldCluster, newCluster)                        │
-│     │                                                                           │
-│     │  1. 预处理: 清理过期状态                                                   │
-│     │     cleanupStaleDeclarativeUpgradeStatus(newCluster)                       │
-│     │     (如果上次 DAG 执行中断且集群已重置，清理残留的 DeclarativeUpgradeStatus) │
-│     │                                                                           │
-│     │  2. 判断集群操作类型                                                       │
-│     │     ├─ Delete? → DeletePhases 路径                                       │
-│     │     ├─ Pause? → EnsurePaused Phase                                      │
-│     │     ├─ DryRun? → EnsureDryRun Phase                                     │
-│     │     ├─ Manage? → EnsureClusterManage Phase                               │
-│     │     ├─ Reset? → ResetPhases 路径                                         │
-│     │     └─ Install/Upgrade? → 继续判断 DAG vs Legacy ↓                       │
-│     │                                                                           │
-│     │  3. DAG 升级路径 (优先匹配)                                               │
-│     │     shouldUseDeclarativeUpgrade(newCluster)?                              │
-│     │     ├─ true → executeUpgradeDAG(...) → return                            │
-│     │     └─ false → 继续                                                      │
-│     │                                                                           │
-│     │  4. DAG 安装路径 (次优先匹配)                                              │
-│     │     shouldUseDeclarativeInstall(newCluster)?                               │
-│     │     ├─ true → executeInstallDAG(...) → return                            │
-│     │     └─ false → 继续                                                      │
-│     │                                                                           │
-│     │  5. Legacy PhaseFlow 路径 (兜底)                                          │
-│     │     ├─ 集群操作类 (Delete/Pause/DryRun/Manage/Reset):                     │
-│     │     │   走 CommonPhases + 对应专用 Phase                                   │
-│     │     ├─ 全新安装 (无 install-ready):                                        │
-│     │     │   走 CommonPhases + DeployPhases (从 BKECluster.Spec 读取版本)      │
-│     │     ├─ 集群扩容 (新增 Master/Worker):                                    │
-│     │     │   走 CommonPhases + ScalePhases (部分 Phase，非完整安装)             │
-│     │     └─ 升级 (无 upgrade-ready):                                           │
-│     │         走 CommonPhases + UpgradePhases (从 BKECluster.Spec 读取版本)     │
-│     │                                                                           │
-│     ▼                                                                           │
-│  执行完成                                                                       │
-│                                                                                 │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
-
-#### 7.1.1 完整代码实现
-
-```go
-// controllers/capbke/bkecluster_controller.go
-
-func (r *BKEClusterReconciler) executePhaseFlow(
-    ctx context.Context,
-    phaseCtx *phaseframe.PhaseContext,
-    oldCluster, newCluster *bkev1beta1.BKECluster,
-) (ctrl.Result, error) {
-    // ─── 预处理: 清理过期状态 ───
-    // 如果集群被重置或重新创建，清理上次 DAG 执行的残留状态
-    if shouldCleanupDeclarativeStatus(newCluster) {
-        cleanupStaleDeclarativeUpgradeStatus(newCluster)
-    }
-
-    // ─── DAG 升级路径 (优先匹配) ───
-    if r.shouldUseDeclarativeUpgrade(newCluster) {
-        return r.executeUpgradeDAG(ctx, phaseCtx, oldCluster, newCluster)
-    }
-
-    // ─── DAG 安装路径 (次优先匹配) ───
-    if r.shouldUseDeclarativeInstall(newCluster) {
-        return r.executeInstallDAG(ctx, phaseCtx, oldCluster, newCluster)
-    }
-
-    // ─── Legacy PhaseFlow 路径 (兜底) ───
-    // 以下场景走 Legacy PhaseFlow:
-    //   1. 集群操作类 (Delete/Pause/DryRun/Manage/Reset) — 非 Install/Upgrade 操作
-    //   2. 全新安装但 Feature Gate 未启用或 ReleaseImage 未就绪
-    //   3. 集群扩容 (新增 Master/Worker 节点)
-    //   4. 升级但 Feature Gate 未启用或 ReleaseImage 未就绪
-    flow := phases.NewPhaseFlow(phaseCtx)
-    return flow.Execute()
-}
-
-// shouldCleanupDeclarativeStatus 判断是否需要清理残留的 DAG 状态
-// 场景: 集群重置后重新安装、DAG 执行中断后用户手动重置
-func (r *BKEClusterReconciler) shouldCleanupDeclarativeStatus(bkeCluster *bkev1beta1.BKECluster) bool {
-    // 集群被重置
-    if bkeCluster.Spec.Reset {
-        return true
-    }
-    // DeclarativeUpgradeStatus 有记录但集群状态为 Init (可能被重置)
-    if bkeCluster.Status.DeclarativeUpgrade != nil &&
-        bkeCluster.Status.DeclarativeUpgrade.TargetVersion != "" &&
-        bkeCluster.Status.ClusterStatus == bkev1beta1.ClusterInitializing {
-        return true
-    }
-    return false
-}
-
-// cleanupStaleDeclarativeUpgradeStatus 清理残留的 DAG 执行状态
-func (r *BKEClusterReconciler) cleanupStaleDeclarativeUpgradeStatus(bkeCluster *bkev1beta1.BKECluster) {
-    bkeCluster.Status.DeclarativeUpgrade = nil
-    bkeCluster.Status.ClusterComponentStatuses = nil
-    // 清理可能残留的注解
-    delete(bkeCluster.Annotations, annotation.UpgradeReadyAnnotationKey)
-    delete(bkeCluster.Annotations, annotation.InstallReadyAnnotationKey)
-    delete(bkeCluster.Annotations, annotation.SkipKubeletUpgradeAnnotationKey)
-    delete(bkeCluster.Annotations, annotation.KubeletCatchupTargetAnnotationKey)
-}
-```
-
-#### 7.1.2 Legacy PhaseFlow 路径设计
-
-Legacy PhaseFlow 是 DAG 路径的兜底方案，覆盖所有 DAG 路径不适用的场景。PhaseFlow 通过 `CalculatePhase()` 动态计算需要执行的 Phase 列表。
-
-##### Phase 列表定义
-
-```go
-// pkg/phaseframe/phases/list.go
-
-// CommonPhases 通用 Phase (所有场景首先检查)
-CommonPhases = []func(ctx *phaseframe.PhaseContext) phaseframe.Phase{
-    NewEnsureFinalizer,        // 部署任务创建
-    NewEnsurePaused,           // 集群管理暂停
-    NewEnsureClusterManage,    // 纳管现有集群
-    NewEnsureDeleteOrReset,    // 集群删除/重置
-    NewEnsureDryRun,           // DryRun 部署
-}
-
-// DeployPhases 安装 Phase (全新安装时执行)
-DeployPhases = []func(ctx *phaseframe.PhaseContext) phaseframe.Phase{
-    NewEnsureBKEAgent,         // 推送 Agent
-    NewEnsureNodesEnv,         // 节点环境准备 (containerd/系统配置)
-    NewEnsureClusterAPIObj,    // ClusterAPI 对象创建
-    NewEnsureCerts,            // 集群证书创建
-    NewEnsureLoadBalance,      // 集群入口配置 (haproxy/keepalived)
-    NewEnsureMasterInit,       // Master 初始化 (kubeadm init)
-    NewEnsureMasterJoin,       // Master 加入 (kubeadm join)
-    NewEnsureWorkerJoin,       // Worker 加入 (kubeadm join)
-    NewEnsureAddonDeploy,      // 集群组件部署 (coredns/kube-proxy)
-    NewEnsureNodesPostProcess, // 后置脚本处理
-    NewEnsureAgentSwitch,      // Agent 监听切换
-}
-
-// PostDeployPhases 安装后 Phase (升级/扩容/删除时执行)
-PostDeployPhases = []func(ctx *phaseframe.PhaseContext) phaseframe.Phase{
-    NewEnsureProviderSelfUpgrade,       // provider 自升级
-    NewEnsureAgentUpgrade,              // Agent 升级
-    NewEnsureContainerdUpgrade,         // Containerd 升级
-    NewEnsureEtcdUpgrade,               // etcd 升级
-    NewEnsureWorkerUpgrade,             // Worker 升级
-    NewEnsureMasterUpgrade,             // Master 升级
-    NewEnsureWorkerDelete,              // Worker 删除 (缩容)
-    NewEnsureMasterDelete,              // Master 删除 (缩容)
-    NewEnsureComponentUpgrade,          // openFuyao 核心组件升级
-    NewEnsureClusterAPIManagerManifest, // Cluster-API Manager 部署
-    NewEnsureCluster,                   // 集群健康检查
-}
-
-// DeletePhases 删除 Phase (删除/重置时执行)
-DeletePhases = []func(ctx *phaseframe.PhaseContext) phaseframe.Phase{
-    NewEnsurePaused,           // 集群管理暂停
-    NewEnsureDeleteOrReset,    // 集群删除/重置
-}
-
-// FullPhasesRegisFunc 完整 Phase 列表 (非删除场景)
-FullPhasesRegisFunc = CommonPhases + DeployPhases + PostDeployPhases
-```
-
-##### 各场景的 Phase 执行列表
-
-| 场景 | 使用的 Phase 列表 | 实际执行的 Phase | 跳过的 Phase | ClusterStatus |
-|------|------------------|-----------------|-------------|---------------|
-| **全新安装** | `FullPhasesRegisFunc` | CommonPhases (NeedExecute 检查) + DeployPhases (全部执行) + PostDeployPhases (NeedExecute 检查) | PostDeployPhases 中的升级/删除 Phase | `ClusterInitializing` |
-| **集群升级** | `FullPhasesRegisFunc` | CommonPhases (NeedExecute 检查) + PostDeployPhases 中的升级 Phase | DeployPhases (已安装) + PostDeployPhases 中的删除 Phase | `ClusterUpgrading` |
-| **集群扩容** | `FullPhasesRegisFunc` | CommonPhases (NeedExecute 检查) + PostDeployPhases 中的 Join Phase | DeployPhases (已安装) + PostDeployPhases 中的升级/删除 Phase | `ClusterMasterScalingUp` / `ClusterWorkerScalingUp` |
-| **集群删除/重置** | `DeletePhases` | EnsurePaused + EnsureDeleteOrReset | 所有其他 Phase | `ClusterDeleting` |
-| **集群暂停** | `FullPhasesRegisFunc` | CommonPhases 中的 EnsurePaused | 所有其他 Phase | `ClusterPaused` |
-| **DryRun 模式** | `FullPhasesRegisFunc` | CommonPhases 中的 EnsureDryRun | 所有其他 Phase | `ClusterDryRun` |
-| **纳管已有集群** | `FullPhasesRegisFunc` | CommonPhases 中的 EnsureClusterManage | 所有其他 Phase | `ClusterManaging` |
-
-##### 各场景详细 Phase 执行列表
-
-**场景 1: 全新安装 (New Install)**
-
-```
-执行 Phase 列表:
-  CommonPhases (NeedExecute 检查):
-    1. EnsureFinalizer        → 创建 finalizer
-    2. EnsurePaused           → NeedExecute=false → 跳过
-    3. EnsureClusterManage    → NeedExecute=false → 跳过
-    4. EnsureDeleteOrReset    → NeedExecute=false → 跳过
-    5. EnsureDryRun           → NeedExecute=false → 跳过
-
-  DeployPhases (全部执行):
-    6. EnsureBKEAgent         → 推送 bkeagent 到所有节点
-    7. EnsureNodesEnv         → 安装 containerd + 系统配置
-    8. EnsureClusterAPIObj    → 创建 Cluster/Machine 对象
-    9. EnsureCerts            → 生成集群证书
-   10. EnsureLoadBalance      → 配置 haproxy/keepalived
-   11. EnsureMasterInit       → kubeadm init (首个 Master)
-   12. EnsureMasterJoin       → kubeadm join (后续 Master，无新 Master 时跳过)
-   13. EnsureWorkerJoin       → kubeadm join (所有 Worker)
-   14. EnsureAddonDeploy      → 部署 coredns/kube-proxy
-   15. EnsureNodesPostProcess → 执行后置脚本
-   16. EnsureAgentSwitch      → 切换 Agent 监听
-
-  PostDeployPhases (NeedExecute 检查):
-   17. EnsureProviderSelfUpgrade       → NeedExecute=false → 跳过
-   18. EnsureAgentUpgrade              → NeedExecute=false → 跳过
-   19. EnsureContainerdUpgrade         → NeedExecute=false → 跳过
-   20. EnsureEtcdUpgrade               → NeedExecute=false → 跳过
-   21. EnsureWorkerUpgrade             → NeedExecute=false → 跳过
-   22. EnsureMasterUpgrade             → NeedExecute=false → 跳过
-   23. EnsureWorkerDelete              → NeedExecute=false → 跳过
-   24. EnsureMasterDelete              → NeedExecute=false → 跳过
-   25. EnsureComponentUpgrade          → NeedExecute=false → 跳过
-   26. EnsureClusterAPIManagerManifest → NeedExecute=false → 跳过
-   27. EnsureCluster                   → NeedExecute=false → 跳过
-```
-
-**场景 2: 集群升级 (Upgrade)**
-
-```
-执行 Phase 列表:
-  CommonPhases (NeedExecute 检查):
-    1. EnsureFinalizer        → 已存在 → 跳过
-    2-5. 其他 CommonPhases    → NeedExecute=false → 跳过
-
-  DeployPhases (NeedExecute 检查):
-    6-16. DeployPhases        → NeedExecute=false (已安装) → 全部跳过
-
-  PostDeployPhases (NeedExecute 检查):
-   17. EnsureProviderSelfUpgrade       → NeedExecute=true → 执行 provider 升级
-   18. EnsureAgentUpgrade              → NeedExecute=true → 执行 Agent 升级
-   19. EnsureContainerdUpgrade         → NeedExecute=true → 执行 containerd 升级
-   20. EnsureEtcdUpgrade               → NeedExecute=true → 执行 etcd 升级
-   21. EnsureWorkerUpgrade             → NeedExecute=true → 执行 Worker 升级
-   22. EnsureMasterUpgrade             → NeedExecute=true → 执行 Master 升级
-   23. EnsureWorkerDelete              → NeedExecute=false → 跳过
-   24. EnsureMasterDelete              → NeedExecute=false → 跳过
-   25. EnsureComponentUpgrade          → NeedExecute=true → 执行核心组件升级
-   26. EnsureClusterAPIManagerManifest → NeedExecute=false → 跳过
-   27. EnsureCluster                   → NeedExecute=false → 跳过
-
-注意: 如果 DAG 升级路径已完成 (DeclarativeDAGCompleted=true)，
-      则跳过 DeclarativeInlineUpgradePhases 中的 Phase (避免重复执行)
-```
-
-**场景 3: 集群扩容 (Scale Up)**
-
-```
-执行 Phase 列表:
-  CommonPhases (NeedExecute 检查):
-    1-5. CommonPhases         → NeedExecute=false → 跳过
-
-  DeployPhases (NeedExecute 检查):
-    6-16. DeployPhases        → NeedExecute=false (已安装) → 全部跳过
-
-  PostDeployPhases (NeedExecute 检查):
-   17-20. 升级 Phase          → NeedExecute=false → 跳过
-   21. EnsureWorkerUpgrade    → NeedExecute=false → 跳过 (扩容不是升级)
-   22. EnsureMasterUpgrade    → NeedExecute=false → 跳过
-   23. EnsureWorkerDelete     → NeedExecute=false → 跳过
-   24. EnsureMasterDelete     → NeedExecute=false → 跳过
-   25. EnsureComponentUpgrade → NeedExecute=false → 跳过
-   26. EnsureClusterAPIManagerManifest → NeedExecute=false → 跳过
-   27. EnsureCluster          → NeedExecute=false → 跳过
-
-注意: 扩容场景下，EnsureMasterJoin/EnsureWorkerJoin 的 NeedExecute 检查
-      是否有新节点需要加入 (通过 BKENode.Status.StateCode 位标记判断)
-      如果有新节点，则执行 Join Phase
-```
-
-**场景 4: 集群删除/重置 (Delete/Reset)**
-
-```
-执行 Phase 列表:
-  DeletePhases (仅 2 个 Phase):
-    1. EnsurePaused        → 暂停集群操作
-    2. EnsureDeleteOrReset → 执行删除/重置操作
-```
-
-**场景 5: 集群暂停 (Pause)**
-
-```
-执行 Phase 列表:
-  CommonPhases (NeedExecute 检查):
-    1. EnsureFinalizer     → 已存在 → 跳过
-    2. EnsurePaused        → NeedExecute=true (Spec.Pause=true) → 执行
-    3-5. 其他 CommonPhases → NeedExecute=false → 跳过
-
-  DeployPhases + PostDeployPhases:
-    全部 NeedExecute=false → 全部跳过
-```
-
-**场景 6: DryRun 模式**
-
-```
-执行 Phase 列表:
-  CommonPhases (NeedExecute 检查):
-    1. EnsureFinalizer     → 已存在 → 跳过
-    2-4. 其他 CommonPhases → NeedExecute=false → 跳过
-    5. EnsureDryRun        → NeedExecute=true (Spec.DryRun=true) → 执行
-
-  DeployPhases + PostDeployPhases:
-    全部 NeedExecute=false → 全部跳过
-```
-
-**场景 7: 纳管已有集群 (Manage)**
-
-```
-执行 Phase 列表:
-  CommonPhases (NeedExecute 检查):
-    1. EnsureFinalizer     → 已存在 → 跳过
-    2-4. 其他 CommonPhases → NeedExecute=false → 跳过
-    5. EnsureClusterManage → NeedExecute=true (Spec.Manage=true) → 执行
-
-  DeployPhases + PostDeployPhases:
-    全部 NeedExecute=false → 全部跳过
-```
-
-##### Phase 执行判断逻辑
-
-每个 Phase 通过 `NeedExecute(old, new *BKECluster)` 方法判断是否需要执行：
-
-| Phase | NeedExecute 判断逻辑 |
-|-------|---------------------|
-| `EnsureFinalizer` | `!util.Contains(finalizer)` → 需要添加 finalizer |
-| `EnsurePaused` | `new.Spec.Pause == true` → 需要暂停 |
-| `EnsureClusterManage` | `new.Spec.Manage == true && !Status.Managed` → 需要纳管 |
-| `EnsureDeleteOrReset` | `IsDeleteOrReset(new)` → 需要删除/重置 |
-| `EnsureDryRun` | `new.Spec.DryRun == true` → 需要 DryRun |
-| `EnsureBKEAgent` | `HasNodesNeedingPhase(NodeAgentPushedFlag)` → 有节点未推送 Agent |
-| `EnsureNodesEnv` | `HasNodesNeedingPhase(NodeEnvFlag)` → 有节点未初始化环境 |
-| `EnsureClusterAPIObj` | `!CAPI 对象已存在` → 需要创建 |
-| `EnsureCerts` | `!证书已存在` → 需要生成 |
-| `EnsureLoadBalance` | `!LB 已配置` → 需要配置 |
-| `EnsureMasterInit` | `首个 Master 且未初始化` → 需要 init |
-| `EnsureMasterJoin` | `GetNeedJoinMasterNodesWithBKENodes()` → 有新 Master 需要 join |
-| `EnsureWorkerJoin` | `GetNeedJoinWorkerNodesWithBKENodes()` → 有 Worker 需要 join |
-| `EnsureAddonDeploy` | `!Addon 已部署` → 需要部署 |
-| `EnsureNodesPostProcess` | `HasNodesNeedingPhase(NodePostProcessFlag)` → 有节点未处理后置脚本 |
-| `EnsureAgentSwitch` | `!已切换` → 需要切换 |
-| `Ensure*Upgrade` | `版本不一致 && 需要升级` → 需要升级 |
-| `Ensure*Delete` | `缩容场景 && 节点需要删除` → 需要删除 |
-
-##### 状态上报逻辑
-
-每个 Phase 执行后通过 `calculateClusterStatusByPhase()` 设置 `ClusterStatus`：
-
-| Phase 类别 | ClusterStatus (成功) | ClusterStatus (失败) |
-|-----------|---------------------|---------------------|
-| ClusterInitPhaseNames | `ClusterInitializing` | `ClusterInitializationFailed` |
-| ClusterScaleMasterUpPhaseNames | `ClusterMasterScalingUp` | `ClusterScaleFailed` |
-| ClusterScaleWorkerUpPhaseNames | `ClusterWorkerScalingUp` | `ClusterScaleFailed` |
-| ClusterDeletePhaseNames | `ClusterDeleting` | `ClusterDeleteFailed` |
-| ClusterPausedPhaseNames | `ClusterPaused` | `ClusterPauseFailed` |
-| ClusterDryRunPhaseNames | `ClusterDryRun` | `ClusterDryRunFailed` |
-| ClusterAddonsPhaseNames | `ClusterDeployingAddon` | `ClusterDeployAddonFailed` |
-| ClusterUpgradePhaseNames | `ClusterUpgrading` | `ClusterUpgradeFailed` |
-| ClusterScaleMasterDownPhaseNames | `ClusterMasterScalingDown` | `ClusterScaleFailed` |
-| ClusterScaleWorkerDownPhaseNames | `ClusterWorkerScalingDown` | `ClusterScaleFailed` |
-| ClusterManagePhaseNames | `ClusterManaging` | `ClusterManageFailed` |
-
-#### 7.1.3 Legacy 路径的版本来源
-
-Legacy PhaseFlow 的版本来源与 DAG 路径不同：
-
-| 维度 | DAG 路径 (安装/升级) | Legacy PhaseFlow 路径 |
-|------|---------------------|----------------------|
-| **K8s 版本来源** | `ReleaseImage bundle.Components[kubernetes-master].Version` → Command CR 参数 | `BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion` (用户设置或 ClusterVersion 同步) |
-| **etcd 版本来源** | `ReleaseImage bundle.Components[etcd].Version` → Command CR 参数 | `BKECluster.Spec.ClusterConfig.Cluster.EtcdVersion` (用户设置或 ClusterVersion 同步) |
-| **是否依赖 ReleaseImage** | 是 (必须 Phase=Valid) | 否 (从 Spec 直接读取) |
-| **BKEAgent 版本来源** | Command CR `kubernetesVersion`/`etcdVersion` 参数 (§7.2.4) | `BkeConfig.Cluster.KubernetesVersion` (getBKEConfig 从 Spec 读取) |
-| **适用场景** | Feature Gate 启用 + ReleaseImage Valid | Feature Gate 关闭 / ReleaseImage 未就绪 / 扩容 / 纳管等 |
-
-> **关键**：Legacy 路径**不依赖 ReleaseImage**，从 `BKECluster.Spec` 直接读取版本。这确保即使没有 ReleaseImage CR 也能完成安装/升级 (向后兼容)。
-
-#### 7.1.4 Legacy 路径与 DAG 路径的共存设计
-
-```txt
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│              Legacy 与 DAG 路径共存设计                                           │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                 │
-│  场景 1: Feature Gate 全关闭 (v2.7.0 默认)                                      │
-│    所有操作走 Legacy PhaseFlow                                                   │
-│    版本从 BKECluster.Spec 读取                                                   │
-│    ReleaseImage CR 可有可无                                                      │
-│                                                                                 │
-│  场景 2: Feature Gate 部分开启 (v2.8.0 灰度)                                     │
-│    DAG 升级路径开启 → 升级走 DAG                                                 │
-│    DAG 安装路径关闭 → 安装走 Legacy PhaseFlow                                    │
-│    版本: 升级从 ReleaseImage, 安装从 Spec                                         │
-│                                                                                 │
-│  场景 3: Feature Gate 全开启 (v2.9.0+)                                           │
-│    全新安装走 DAG 安装路径                                                       │
-│    版本升级走 DAG 升级路径                                                       │
-│    扩容/纳管/删除/暂停/DryRun 仍走 Legacy PhaseFlow                              │
-│    版本均从 ReleaseImage                                                         │
-│                                                                                 │
-│  场景 4: ReleaseImage 未就绪 (Feature Gate 开启但 RI 未验证)                     │
-│    install-ready/upgrade-ready annotation 未设置                                 │
-│    → shouldUseDeclarativeInstall/Upgrade 返回 false                              │
-│    → 回退 Legacy PhaseFlow                                                       │
-│    → 版本从 BKECluster.Spec 读取 (不依赖 RI)                                     │
-│                                                                                 │
-│  场景 5: 混合模式 (部分组件 DAG, 部分组件 Legacy)                                │
-│    Phase 2 灰度: 低风险组件 (coredns/kube-proxy) 走 DAG                         │
-│    高风险组件 (kubernetes-master/etcd) 仍走 Legacy                              │
-│    DeclarativeUpgradeStatus 追踪已完成组件                                       │
-│    Legacy Phase 跳过已由 DAG 完成的组件 (DeclarativeDAGCompleted)              │
-│                                                                                 │
-│  共存保障:                                                                       │
-│    1. shouldUseDeclarativeInstall/Upgrade 互斥 — 不会同时走两条 DAG 路径       │
-│    2. Legacy PhaseFlow 的 CalculatePhase 检查 DeclarativeDAGCompleted          │
-│       → 如果 DAG 已完成部分组件，Legacy Phase 跳过这些组件                       │
-│    3. 版本来源统一: 两种路径都通过 ApplyVersionContextTargetsToClusterSpec      │
-│       将版本同步到 BKECluster.Spec (Legacy 直接读取，DAG 通过 Command CR 覆盖)  │
-│    4. 状态隔离: DeclarativeUpgradeStatus (DAG) vs PhaseStatus (Legacy)          │
-│       各自追踪，互不干扰                                                          │
-│                                                                                 │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
-
-#### 7.1.5 PhaseFlow 路径（Legacy）的适用场景
-
-以下场景仍会走 Legacy PhaseFlow 路径，不走 DAG 路径：
-
-| 场景 | 原因 | 说明 | 走哪个 Phase 列表 |
-|------|------|------|------------------|
-| **Feature Gate 未启用** | `DeclarativeInstallEnabled = false` / `DeclarativeUpgradeEnabled = false` | 迁移期间默认关闭，确保生产稳定；正式启用后此场景消失 | CommonPhases + DeployPhases / UpgradePhases |
-| **ReleaseImage 未就绪** | `install-ready` / `upgrade-ready` annotation 未设置 | RI 未创建或 Status.Phase != Valid | CommonPhases + DeployPhases / UpgradePhases |
-| **ReleaseImage 无 inline handler** | `install.components[].inline` 字段为空 | 旧格式 RI 仅有 `{name, version}`，DAG 无法分发执行器 | CommonPhases + DeployPhases |
-| **纳管已有集群** | `BKECluster.Spec.Manage = true` | 纳管现有集群不走标准安装流程 | CommonPhases + ManagePhases |
-| **集群扩容** | 新增 Master/Worker 节点 | 扩容仅执行部分 Phase (Join)，非完整安装 | CommonPhases + ScalePhases |
-| **集群删除/重置** | `Spec.Reset = true` 或 `DeletionTimestamp` 非空 | 删除/重置走专用 Phase | CommonPhases + DeletePhases |
-| **DryRun 模式** | `Spec.DryRun = true` | DryRun 不实际执行安装 | CommonPhases + DryRunPhases |
-| **集群暂停** | `Spec.Pause = true` | 暂停状态下不执行任何操作 | CommonPhases + PausePhases |
-| **混合模式** | Phase 2 灰度: 部分组件 DAG，部分 Legacy | 高风险组件仍走 Legacy | CommonPhases + 部分 DeployPhases/UpgradePhases (跳过 DAG 已完成的) |
-
-> **注意**：扩容场景 (新增 Master/Worker 节点) 虽然不走 DAG 安装路径，但未来可考虑将扩容也纳入 DAG 驱动 (如 `kubernetes-master` 组件的 `DecisionInstall` 触发 `EnsureMasterJoin` handler)，作为后续优化方向。
-
-```go
-// shouldUseDeclarativeInstall 判断是否使用 DAG 安装路径 🆕新增
-func (r *BKEClusterReconciler) shouldUseDeclarativeInstall(bkeCluster *bkev1beta1.BKECluster) bool {
-    // Feature Gate 控制
-    if !featuregate.DeclarativeInstallEnabled.Enabled() {
-        return false
-    }
-    // 仅在全新安装时启用（Status.Phase 为空或 Init）
-    if bkeCluster.Status.Phase != "" && bkeCluster.Status.Phase != bkev1beta1.PhaseInit {
-        return false
-    }
-    // 检查是否有安装 annotation（由 ClusterVersionReconciler 设置）
-    _, ok := annotation.HasAnnotation(bkeCluster, annotation.InstallReadyAnnotationKey)
-    return ok
-}
-```
-
-#### 7.1.1 install-ready annotation 的作用
-
-`shouldUseDeclarativeInstall()` 的最后一个检查项是 `install-ready` annotation。该 annotation 由 `ClusterVersionReconciler` 在安装前置条件满足后设置，是 BKEClusterReconciler 决定是否走 DAG 安装路径的**最终门控**。
-
-**为什么需要这个 annotation**：
-
-```txt
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│              install-ready annotation 的作用                                     │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                 │
-│  没有 install-ready annotation 时的问题:                                        │
-│                                                                                 │
-│  用户创建 BKECluster CR (Spec.OpenFuyaoVersion = "v2.7.0")                     │
-│    │                                                                            │
-│    ▼ BKEClusterReconciler 被触发                                                 │
-│  shouldUseDeclarativeInstall 检查:                                              │
-│    ✓ Feature Gate 启用                                                          │
-│    ✓ Status.Phase 为空 (全新安装)                                                │
-│    ✗ 没有 install-ready annotation → 返回 false                                 │
-│    → 走 Legacy PhaseFlow? 但此时 ReleaseImage 可能还没就绪!                    │
-│                                                                                 │
-│  问题:                                                                          │
-│  BKECluster 创建后，ReleaseImage CR 可能尚未创建或尚未通过验证。                │
-│  如果 BKEClusterReconciler 立即开始安装，会因 ReleaseImage 不存在而失败。       │
-│  需要一个前置门控：确保 ReleaseImage 已就绪后，才允许开始安装。                 │
-│                                                                                 │
-│  有 install-ready annotation 时:                                               │
-│                                                                                 │
-│  用户创建 BKECluster CR                                                         │
-│    │                                                                            │
-│    ▼ BKEClusterReconciler: ensureClusterVersionOnInstall()                     │
-│    │  创建 ClusterVersion CR (desiredVersion = Spec.OpenFuyaoVersion)            │
-│    │                                                                            │
-│    ▼ ClusterVersionReconciler 被触发                                           │
-│    │  1. 解析 desiredVersion → 查找 ReleaseImage CR                             │
-│    │  2. ReleaseImageEnsurer.Ensure() → 拉取 OCI Bundle                          │
-│    │  3. 等待 ReleaseImage Status.Phase = Valid (签名验证+组件解析+兼容性校验) │
-│    │  4. ReleaseImage Valid → 设置 install-ready annotation                      │
-│    │     bc.Annotations[InstallReadyAnnotationKey] = desiredVersion             │
-│    │                                                                            │
-│    ▼ BKEClusterReconciler 再次被触发 (annotation 变更)                         │
-│    shouldUseDeclarativeInstall 检查:                                            │
-│    ✓ Feature Gate 启用                                                          │
-│    ✓ Status.Phase 为空 (全新安装)                                                │
-│    ✓ install-ready annotation 存在 → 返回 true                                  │
-│    → 走 DAG 安装路径                                                            │
-│                                                                                 │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
-
-**install-ready annotation 的完整设置流程**：
-
-| 步骤 | 执行者 | 操作 | 说明 | 是否新增 |
-|------|--------|------|------|----------|
-| 1 | BKEClusterReconciler | `ensureClusterVersionOnInstall()` 创建 ClusterVersion CR | 用户创建 BKECluster 后，自动创建对应的 ClusterVersion | 否 (复用升级流程) |
-| 2 | ClusterVersionReconciler | 解析 `desiredVersion`，查找 ReleaseImage CR | 通过 `Spec.Version == desiredVersion` 匹配 | 否 (复用升级流程) |
-| 3 | ClusterVersionReconciler | `ReleaseImageEnsurer.Ensure()` 拉取 OCI Bundle | 从 OCI Registry 拉取 ReleaseImage payload | 否 (复用升级流程) |
-| 4 | ReleaseImageReconciler | 验证签名 + 解析组件 + 兼容性校验 | 设置 `Status.Phase = Valid` (或 Invalid/ManifestMissing/CompatibilityFailed) | 否 (复用升级流程) |
-| 5 | ClusterVersionReconciler | ReleaseImage Phase == Valid → 设置 `install-ready` annotation | `bc.Annotations[InstallReadyAnnotationKey] = desiredVersion` | **是** (新增 install-ready) |
-| 6 | BKEClusterReconciler | 检测到 annotation 变更 → `shouldUseDeclarativeInstall()` 返回 true | 进入 DAG 安装路径 | **是** (新增 shouldUseDeclarativeInstall) |
-
-**与 upgrade-ready annotation 的对称性**：
-
-| 维度 | install-ready (安装) | upgrade-ready (升级) |
-|------|---------------------|---------------------|
-| **设置者** | ClusterVersionReconciler | ClusterVersionReconciler |
-| **设置条件** | ReleaseImage Phase=Valid + 全新安装 (无 history) | ReleaseImage Phase=Valid + UpgradePath 校验通过 |
-| **annotation 值** | desiredVersion (openFuyao 版本) | hopTarget (openFuyao 版本，可能是中间 hop) |
-| **消费者** | `shouldUseDeclarativeInstall()` | `shouldUseDeclarativeUpgrade()` |
-| **触发路径** | BKECluster 创建 → CV 创建 → RI 验证 → 设置 annotation → DAG 安装 | CV desiredVersion 变更 → RI 验证 → UP 校验 → 设置 annotation → DAG 升级 |
-| **清除时机** | 安装完成后 (DeclarativeUpgradeStatus 完成) | 升级 hop 完成后 (CompleteUpgradeHop) |
-
-**install-ready 不存在时走 Legacy 路径的原因**：
-
-| 场景 | 原因 | Legacy 行为 |
-|------|------|------------|
-| Feature Gate 未启用 | `DeclarativeInstallEnabled=false` | PhaseFlow 正常执行 (DeployPhases) |
-| ReleaseImage 未创建 | 用户创建 BKECluster 但未创建 ReleaseImage CR | PhaseFlow 从 `BKECluster.Spec` 读取版本 (Legacy 模式不依赖 ReleaseImage) |
-| ReleaseImage 未通过验证 | ReleaseImage Status.Phase != Valid | PhaseFlow 从 `BKECluster.Spec` 读取版本，不阻塞安装 |
-| 旧格式 ReleaseImage | `install.components[].inline` 为空 | PhaseFlow 正常执行 (不消费 ReleaseImage install 列表) |
-
-> **关键设计**：install-ready annotation 是 DAG 安装路径的**前置门控**，确保 ReleaseImage 已验证通过后才走 DAG 路径。没有该 annotation 时回退到 Legacy PhaseFlow (从 `BKECluster.Spec` 直接读取版本，不依赖 ReleaseImage)，保证向后兼容。
-
-### 7.2 executeInstallDAG 实现
-
-```go
-// controllers/capbke/bkecluster_install_dag.go 🆕新增
-
-func (r *BKEClusterReconciler) executeInstallDAG(
-    ctx context.Context,
-    phaseCtx *phaseframe.PhaseContext,
-    oldCluster, newCluster *bkev1beta1.BKECluster,
-) error {
-    // 1. 解析目标 ReleaseImage
-    releaseImage, bundle, err := r.resolveInstallBundle(ctx, newCluster)
-    
-    // 2. 构建安装 VersionContext（Current 为空，Target 来自 bundle）
-    //    ★ 直接构建所有 install.components 的 Target
-    vc := upgrade.BuildVersionContextForInstall(bundle)
-    phaseCtx.SetVersionContext(vc)
-    
-    // 3. 同步目标版本到 BKECluster.Spec
-    //    ★ 仅用于 Legacy 代码路径兼容 (如 upgradeMasterNodesWithParams / waitForNodeHealthCheck 直接读 Spec)
-    //    ★ 不作为 BKEAgent 渲染 manifest 的版本来源 — BKEAgent 应从 ReleaseImage 获取版本
-    upgrade.ApplyVersionContextTargetsToClusterSpec(vc, newCluster)
-    
-    // 4. 构建安装 DAG (包含所有 install.components)
-    //    ★ 直接构建所有组件的 DAG，不需要排除任何组件
-    //    ★ 组件的跳过逻辑由执行时的 VersionContext.Decide() 决定
-    dag, err := upgrade.BuildInstallDAGFromBundle(bundle, upgrade.BundleDependencyResolver(bundle))
-    
-    // 5. 构建 ComponentFactory（注册安装 handler）
-    factory := componentfactory.NewFactoryFromBundle(bundle)
-    // 额外注册安装 handler
-    factory.RegisterInstallHandlers()
-    
-    // 6. 构建 Scheduler（复用升级框架）
-    sched := dagexec.NewScheduler(dagexec.SchedulerConfig{
-        InlineRunner:    NewInlinePhaseRunnerAdapter(phaseCtx, &PhaseRunner{Factory: factory}),
-        ManifestStore:   manifest.NewBundleStore(bundle),
-        ManifestApplier: r.ManifestApplier,
-        CVStore:         manifest.NewBundleStore(bundle),
-        MaxParallelPerBatch: 8,
-    })
-    
-    // 7. 构建 ExecutionContext
-    //    ★ 将 bundle 注入 ExecutionContext，供 BKEAgent 获取 ReleaseImage 中的组件版本
-    execCtx := buildExecutionContext(ctx, r.Client, newCluster, vc)
-    execCtx.ReleaseBundle = bundle  // ★ 新增: BKEAgent 从 bundle 读取版本
-    
-    // 8. 执行 DAG
-    if err := sched.ExecuteDAG(ctx, execCtx, dag); err != nil {
-        return err
-    }
-    
-    // 9. 安装完成：更新状态
-    newCluster.Status.Phase = bkev1beta1.PhaseReady
-    newCluster.Status.ClusterStatus = bkev1beta1.ClusterStatusReady
-    
-    return nil
-}
-```
-
-#### 7.2.1 Spec 同步仅为 Legacy 兼容
-
-`ApplyVersionContextTargetsToClusterSpec()` 将 VC Target (来源于 ReleaseImage) 同步到 `BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion` / `EtcdVersion` / `ContainerdVersion`。此同步**仅用于 Legacy 代码路径兼容**，不作为 BKEAgent 渲染 manifest 的版本来源。
-
-| 维度 | Legacy 路径 (现有) | 声明式 DAG 路径 (目标) |
-|------|-------------------|----------------------|
-| **BKEAgent 版本来源** | `BkeConfig.Cluster.KubernetesVersion` (从 `BKECluster.Spec` 读取) | **`ReleaseImage` bundle 中的组件版本** ★ |
-| **manifest image tag** | `BkeConfig.Cluster.KubernetesVersion` 去 v 前缀 | **`bundle.Components[kubernetes-master].Spec.Version` 去 v 前缀** ★ |
-| **etcd image tag** | `BkeConfig.Cluster.EtcdVersion` 或 `Extra["etcdVersion"]` | **`bundle.Components[etcd].Spec.Version` 去 v 前缀** ★ |
-| **kubelet 二进制版本** | `BkeConfig.Cluster.KubernetesVersion` | **`bundle.Components[kubernetes-worker].Spec.Version`** ★ |
-| **Spec 同步的作用** | 唯一来源 (BKEAgent 直接读取) | **仅 Legacy 兼容** (供未改造的 Phase 代码直接读取 Spec) |
-
-#### 7.2.2 BKEAgent 从 ReleaseImage 获取版本的设计
-
-基于 §7.7 (KEP-7 minimal-k8s-upgrade) 的分析，当前 BKEAgent 通过 `getBKEConfig()` 读取 `BKECluster.Spec.ClusterConfig` 获取版本。声明式 DAG 路径应修正为从 ReleaseImage 获取版本，消除对 Spec 同步的依赖。
-
-**当前路径 (依赖 Spec 同步)**：
-
-```txt
-ReleaseImage → VC → SyncUpgradeTargets → BKECluster.Spec → BKEAgent getBKEConfig()
-  → BkeConfig.Cluster.KubernetesVersion → manifest image tag
-```
-
-**目标路径 (直接从 ReleaseImage)**：
-
-```txt
-ReleaseImage → bundle → Command CR 携带版本参数 → BKEAgent 直接使用
-  → 不依赖 BKECluster.Spec 同步
-```
-
-**实现方式：Command CR 携带 ReleaseImage 版本参数**
-
-```go
-// EnsureMasterInit 创建 Command CR 时，从 ReleaseImage bundle 读取版本并注入参数
-
-func (e *EnsureMasterInit) Execute() (ctrl.Result, error) {
-    // 从 ExecutionContext 获取 ReleaseImage bundle
-    bundle := e.Ctx.ReleaseBundle  // ★ 新增: bundle 注入 PhaseContext
-
-    // 从 bundle 解析版本 (不再依赖 BKECluster.Spec)
-    k8sVersion := releaseVersionFromBundle(bundle, "kubernetes-master")
-    etcdVersion := releaseVersionFromBundle(bundle, "etcd")
-
-    // 创建 Bootstrap Command CR，携带版本参数
-    params := CreateInitCommandParams{
-        // ... 现有参数 ...
-        KubernetesVersion: k8sVersion,  // ★ 从 ReleaseImage 获取
-        EtcdVersion:       etcdVersion, // ★ 从 ReleaseImage 获取
-    }
-    bootstrap := createBootstrapCommand(params)
-    bootstrap.New()
-    // ...
-}
-
-// releaseVersionFromBundle 从 ReleaseImage bundle 中查找组件版本
-func releaseVersionFromBundle(bundle *releasemanifest.Bundle, componentName string) string {
-    // 优先从 upgrade.components 查找 (升级条目覆盖安装条目)
-    if bundle.Release.Spec.Upgrade != nil {
-        for _, c := range bundle.Release.Spec.Upgrade.Components {
-            if c.Name == componentName {
-                return c.Version
-            }
-        }
-    }
-    // 回退到 install.components
-    if bundle.Release.Spec.Install != nil {
-        for _, c := range bundle.Release.Spec.Install.Components {
-            if c.Name == componentName {
-                return c.Version
-            }
-        }
-    }
-    return ""
-}
-```
-
-**BKEAgent 端修正：优先使用 Command 参数中的版本**
-
-```go
-// pkg/job/builtin/kubeadm/kubeadm.go — getBKEConfig() 修正
-
-func (k *KubeadmPlugin) getBKEConfig(bkeConfigNS string) error {
-    bkeCluster, err := plugin.GetBKECluster(bkeConfigNS)
-    config, err := plugin.GetBkeConfigFromBkeCluster(bkeCluster)
-    k.boot.BkeConfig = config
-
-    // ★ 新增: 从 Command 参数覆盖版本 (优先于 Spec)
-    if k8sVer, ok := k.parseCommands["kubernetesVersion"]; ok && k8sVer != "" {
-        k.boot.BkeConfig.Cluster.KubernetesVersion = k8sVer
-    }
-    if etcdVer, ok := k.parseCommands["etcdVersion"]; ok && etcdVer != "" {
-        k.boot.BkeConfig.Cluster.EtcdVersion = etcdVer
-        if k.boot.Extra == nil {
-            k.boot.Extra = map[string]interface{}{}
-        }
-        k.boot.Extra["etcdVersion"] = etcdVer  // etcd 优先级最高
-    }
-
-    return nil
-}
-```
-
-**manifest 渲染的版本来源修正**：
-
-```txt
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│              manifest image tag 版本来源修正                                      │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                 │
-│  当前 (依赖 Spec 同步):                                                          │
-│    ReleaseImage → VC → SyncTargets → BKECluster.Spec                            │
-│    → BKEAgent getBKEConfig() → BkeConfig.Cluster.KubernetesVersion              │
-│    → Go 模板 imageInfo() → manifest image tag                                  │
-│                                                                                 │
-│  修正后 (从 ReleaseImage 直接获取):                                              │
-│    ReleaseImage → bundle → Command CR 携带 kubernetesVersion/etcdVersion 参数  │
-│    → BKEAgent getBKEConfig() 读取参数覆盖 BkeConfig                              │
-│    → Go 模板 imageInfo() → manifest image tag (来源为 ReleaseImage，非 Spec)   │
-│                                                                                 │
-│  修正的原因:                                                                     │
-│  1. Spec 同步依赖 mergecluster.SyncStatusUntilComplete API patch，有竞态风险   │
-│     (patch 未完成时 BKEAgent 可能读到旧值)                                       │
-│  2. Spec 是用户可编辑字段，用户可能修改了 Spec 中的版本导致不一致               │
-│  3. ReleaseImage 是声明式真相源，版本应直接从 ReleaseImage 获取                  │
-│  4. Command CR 携带版本参数是同步操作，无竞态风险                                │
-│                                                                                 │
-│  对 kubelet 延迟升级的影响:                                                      │
-│  skipKubelet 仍然有效 — installKubeletCommand 从 BkeConfig.Cluster.             │
-│  KubernetesVersion 读取版本 (已被 Command 参数覆盖为 ReleaseImage 版本)         │
-│  skipKubelet=true 跳过此函数即可                                                 │
-│                                                                                 │
-│  对 etcd 版本的影响:                                                             │
-│  etcd 版本通过 Command 参数 etcdVersion 传入 → Extra["etcdVersion"]             │
-│  → etcdImageTagFromBootScope() 优先级 1 (Extra["etcdVersion"]) 命中             │
-│  → 不再依赖 BKECluster.Spec.EtcdVersion                                         │
-│                                                                                 │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
-
-#### 7.2.3 版本来源对比汇总
-
-| 组件 | 当前来源 (Legacy) | 修正后来源 (声明式 DAG) | 传递方式 |
-|------|------------------|----------------------|---------|
-| kube-apiserver manifest tag | `BkeConfig.Cluster.KubernetesVersion` (Spec 同步) | `bundle.Components[kubernetes-master].Version` | Command CR `kubernetesVersion` 参数 |
-| kube-controller-manager manifest tag | 同上 | 同上 | 同上 |
-| kube-scheduler manifest tag | 同上 | 同上 | 同上 |
-| etcd manifest tag | `BkeConfig.Cluster.EtcdVersion` 或 `Extra["etcdVersion"]` | `bundle.Components[etcd].Version` | Command CR `etcdVersion` 参数 → `Extra["etcdVersion"]` |
-| kubelet 二进制 (Master 节点) | `BkeConfig.Cluster.KubernetesVersion` | `bundle.Components[kubernetes-master].Version` | Command CR `kubernetesVersion` 参数 |
-| kubelet 二进制 (Worker 节点) | `BkeConfig.Cluster.KubernetesVersion` | `bundle.Components[kubernetes-worker].Version` | Command CR `kubernetesVersion` 参数 |
-| kubectl 二进制 (Master 节点) | `BkeConfig.Cluster.KubernetesVersion` | `bundle.Components[kubernetes-master].Version` | Command CR `kubernetesVersion` 参数 |
-| kubectl 二进制 (Worker 节点) | `BkeConfig.Cluster.KubernetesVersion` | `bundle.Components[kubernetes-worker].Version` | Command CR `kubernetesVersion` 参数 |
-
-> **版本来源优先级**：
-> - Master 节点：`EnsureMasterUpgrade` 优先使用 `kubernetes-master` 组件版本，回退到 `kubernetes-worker`，再回退到 `kubernetes`
-> - Worker 节点：`EnsureWorkerUpgrade` 优先使用 `kubernetes-worker` 组件版本，回退到 `kubernetes-master`，再回退到 `kubernetes`
-> - 这种设计允许 Master 和 Worker 在不同时间升级（滚动升级场景），但实际使用中版本应该相同
-
-> **Spec 同步保留但仅用于兼容**：`ApplyVersionContextTargetsToClusterSpec()` 仍执行，确保 Legacy 代码路径 (如 `upgradeMasterNodesWithParams` / `waitForNodeHealthCheck` 直接读 Spec) 能获取正确版本。但 BKEAgent 的版本来源修正为 Command CR 参数 (从 ReleaseImage)，不再依赖 Spec 同步时序。
-
-#### 7.2.4 kubernetesVersion 命令参数设计 (对标 etcdVersion)
-
-##### 现状分析
-
-当前代码中 etcd 已有命令参数覆盖机制，但 K8s 版本没有：
-
-| 组件 | 命令参数 | 覆盖函数 | 覆盖目标 | 状态 |
-|------|---------|---------|---------|------|
-| etcd | `etcdVersion` | `applyCommandEtcdVersion()` (kubeadm.go:436) | `BkeConfig.Cluster.EtcdVersion` + `Extra["etcdVersion"]` | **已实现** |
-| K8s (apiserver/cm/scheduler/kubelet/kubectl) | **无** | **无** | 依赖 `SyncUpgradeTargetsToClusterSpec` → `BKECluster.Spec` → `getBKEConfig()` 读取 | **未实现** ★ |
-
-```go
-// pkg/job/builtin/kubeadm/kubeadm.go — Execute() 现有代码 (line 122-133)
-
-func (k *KubeadmPlugin) Execute(commands []string) ([]string, error) {
-    parseCommands, err := plugin.ParseCommands(k, commands)
-    // ...
-    if v, ok := parseCommands["bkeConfig"]; ok {
-        if err = k.getBKEConfig(v); err != nil {  // 从 BKECluster.Spec 读取 BkeConfig
-            return nil, err
-        }
-        k.applyCommandEtcdVersion(parseCommands)  // ★ etcd 有命令参数覆盖
-        // ✗ 没有 applyCommandKubernetesVersion — K8s 版本无命令参数覆盖
-    }
-
-    switch parseCommands["phase"] {
-    case utils.UpgradeControlPlane:
-        // ...
-        return nil, k.upgradeControlPlane(backupEtcd, parseCommands["clusterType"])
-        // upgradeControlPlane 内部读取 BkeConfig.Cluster.KubernetesVersion (来自 Spec，非命令参数)
-    }
-}
-
-// applyCommandEtcdVersion — etcd 的命令参数覆盖 (现有，line 436)
-func (k *KubeadmPlugin) applyCommandEtcdVersion(parseCommands map[string]string) {
-    v, ok := parseCommands["etcdVersion"]
-    if !ok || v == "" || k.boot == nil || k.boot.BkeConfig == nil {
-        return
-    }
-    k.boot.BkeConfig.Cluster.EtcdVersion = v           // 覆盖 Spec 中的版本
-    if k.boot.Extra == nil {
-        k.boot.Extra = map[string]interface{}{}
-    }
-    k.boot.Extra["etcdVersion"] = v                     // 模板优先级 1: Extra["etcdVersion"]
-}
-```
-
-**问题**：K8s 版本完全依赖 `getBKEConfig()` 从 `BKECluster.Spec.ClusterConfig.Cluster.KubernetesVersion` 读取。该字段由 `SyncUpgradeTargetsToClusterSpec()` 从 VersionContext 同步，存在以下风险：
-
-| 风险 | 说明 |
-|------|------|
-| **Spec 同步时序** | `SyncUpgradeTargetsToClusterSpec` 通过 `mergecluster.SyncStatusUntilComplete` API patch，patch 未完成时 BKEAgent 可能读到旧值 |
-| **用户可编辑 Spec** | `BKECluster.Spec` 是用户可编辑字段，用户可能修改版本导致不一致 |
-| **ReleaseImage 非直接来源** | 版本经 ReleaseImage → VC → Spec → BkeConfig 多跳传递，非直接从 ReleaseImage 获取 |
-
-##### 设计方案：新增 applyCommandKubernetesVersion
-
-**对标 `applyCommandEtcdVersion`，新增 `applyCommandKubernetesVersion`**：
-
-```go
-// pkg/job/builtin/kubeadm/kubeadm.go — 新增
-
-// applyCommandKubernetesVersion overrides spec kubernetes version when the provider passes a
-// declarative upgrade/install target (VersionContext / release bundle).
-// Symmetric to applyCommandEtcdVersion.
-func (k *KubeadmPlugin) applyCommandKubernetesVersion(parseCommands map[string]string) {
-    v, ok := parseCommands["kubernetesVersion"]
-    if !ok || v == "" || k.boot == nil || k.boot.BkeConfig == nil {
-        return
-    }
-    // 覆盖 BkeConfig.Cluster.KubernetesVersion (来自 BKECluster.Spec 的值)
-    // 供以下消费者使用:
-    //   - manifest 渲染: imageInfo() → kube-apiserver:{version} / kube-controller-manager:{version} / kube-scheduler:{version}
-    //   - kubelet 二进制: installKubeletCommand() → kubelet-{version}-{arch}
-    //   - kubectl 二进制: installKubectlCommand() → kubectl-{version}-{arch}
-    //   - needUpgradeComponent(): 比较运行中 Pod image tag vs KubernetesVersion
-    k.boot.BkeConfig.Cluster.KubernetesVersion = v
-}
-```
-
-**Execute() 中调用 (与 applyCommandEtcdVersion 对称)**：
-
-```go
-// pkg/job/builtin/kubeadm/kubeadm.go — Execute() 修改 (line 127-133)
-
-func (k *KubeadmPlugin) Execute(commands []string) ([]string, error) {
-    parseCommands, err := plugin.ParseCommands(k, commands)
-    // ...
-    if v, ok := parseCommands["bkeConfig"]; ok {
-        if err = k.getBKEConfig(v); err != nil {
-            return nil, err
-        }
-        k.applyCommandEtcdVersion(parseCommands)            // 现有: etcd 版本覆盖
-        k.applyCommandKubernetesVersion(parseCommands)       // ★ 新增: K8s 版本覆盖
-    }
-
-    switch parseCommands["phase"] {
-    // ... 不变
-    }
-}
-```
-
-##### Command CR 传递版本参数
-
-**管理集群侧 (EnsureMasterUpgrade / EnsureMasterInit)**：
-
-```go
-// pkg/phaseframe/phases/ensure_master_upgrade.go — 创建 Command CR 时注入版本参数
-
-func (e *EnsureMasterUpgrade) upgradeMasterNodesWithParams(skipKubelet bool) (ctrl.Result, error) {
-    // ... 获取 Master 节点 ...
-
-    // 从 ExecutionContext 获取 ReleaseImage bundle
-    bundle := e.Ctx.ReleaseBundle  // ★ bundle 注入 PhaseContext
-
-    // 从 bundle 解析版本 (对标 etcdVersion 的传递方式)
-    k8sVersion := releaseVersionFromBundle(bundle, "kubernetes-master")
-    etcdVersion := releaseVersionFromBundle(bundle, "etcd")
-
-    for _, node := range masterNodes {
-        masterParams := CreateUpgradeCommandParams{
-            // ... 现有参数不变 ...
-            Phase:           bkev1beta1.UpgradeControlPlane,
-            SkipKubelet:     skipKubelet,
-            KubernetesVersion: k8sVersion,   // ★ 新增: 从 ReleaseImage 获取
-            EtcdVersion:     etcdVersion,    // 现有: 从 ReleaseImage 获取
-        }
-        // createUpgradeCommand 将参数注入 Command CR 的 command 列表
-        upgrade := createUpgradeCommand(masterParams)
-        // ...
-    }
-}
-
-// releaseVersionFromBundle 从 ReleaseImage bundle 中查找组件版本
-// (与 §7.2.2 中的实现一致)
-func releaseVersionFromBundle(bundle *releasemanifest.Bundle, componentName string) string {
-    // 优先 upgrade.components，回退 install.components
-    if bundle.Release.Spec.Upgrade != nil {
-        for _, c := range bundle.Release.Spec.Upgrade.Components {
-            if c.Name == componentName {
-                return c.Version
-            }
-        }
-    }
-    if bundle.Release.Spec.Install != nil {
-        for _, c := range bundle.Release.Spec.Install.Components {
-            if c.Name == componentName {
-                return c.Version
-            }
-        }
-    }
-    return ""
-}
-```
-
-**Command CR 中的参数格式**：
-
-```txt
-Command CR command 列表:
-  Kubeadm
-  phase=UpgradeControlPlane
-  bkeConfig=<ns>:<name>
-  backUpEtcd=true
-  clusterType=openfuyao
-  etcdVersion=v3.6.7-of.1          ← 现有: etcd 版本从 ReleaseImage
-  kubernetesVersion=v1.35.0-of.1   ← ★ 新增: K8s 版本从 ReleaseImage
-```
-
-**BKEAgent 端解析 (ParseCommands 自动解析键值对)**：
-
-```go
-// parseCommands["kubernetesVersion"] = "v1.35.0-of.1"
-// → applyCommandKubernetesVersion 覆盖 BkeConfig.Cluster.KubernetesVersion
-// → 所有依赖 KubernetesVersion 的代码路径获得正确版本:
-//   - manifest imageInfo(): kube-apiserver:1.35.0-of.1
-//   - installKubeletCommand(): kubelet-v1.35.0-of.1-amd64
-//   - installKubectlCommand(): kubectl-v1.35.0-of.1-amd64
-//   - needUpgradeComponent(): 比较运行中 Pod tag vs "v1.35.0-of.1"
-```
-
-##### etcdVersion 与 kubernetesVersion 的对称性
-
-| 维度 | etcdVersion (现有) | kubernetesVersion (新增) | 对称性 |
-|------|-------------------|------------------------|--------|
-| **命令参数** | `etcdVersion` | `kubernetesVersion` | 对称 |
-| **覆盖函数** | `applyCommandEtcdVersion()` | `applyCommandKubernetesVersion()` | 对称 |
-| **覆盖目标** | `BkeConfig.Cluster.EtcdVersion` + `Extra["etcdVersion"]` | `BkeConfig.Cluster.KubernetesVersion` | 基本对称 (K8s 不需要 Extra，因模板直接读 BkeConfig) |
-| **模板优先级** | `Extra["etcdVersion"]` > `BkeConfig.Cluster.EtcdVersion` > 默认 | `BkeConfig.Cluster.KubernetesVersion` (唯一来源) | K8s 无多级优先级需求 |
-| **来源** | `bundle.Components[etcd].Version` | `bundle.Components[kubernetes-master].Version` | 对称 (均从 ReleaseImage bundle) |
-| **传递方式** | Command CR 参数 | Command CR 参数 | 对称 |
-| **作用** | etcd manifest image tag | apiserver/cm/scheduler manifest tag + kubelet/kubectl 二进制 | K8s 影响范围更广 |
-
-##### 修改清单
-
-| 文件 | 修改内容 | 工作量 |
-|------|---------|--------|
-| `pkg/job/builtin/kubeadm/kubeadm.go` | 新增 `applyCommandKubernetesVersion()` + Execute() 调用 | 0.5 人日 |
-| `pkg/phaseframe/phases/ensure_master_upgrade.go` | Command CR 注入 `kubernetesVersion` 参数 | 0.5 人日 |
-| `pkg/phaseframe/phases/ensure_master_init.go` | Command CR 注入 `kubernetesVersion` 参数 (安装路径) | 0.5 人日 |
-| `pkg/phaseframe/phases/ensure_worker_upgrade.go` | Command CR 注入 `kubernetesVersion` 参数 (worker 升级) | 0.5 人日 |
-| `pkg/phaseframe/phases/ensure_worker_join.go` | Command CR 注入 `kubernetesVersion` 参数 (安装路径) | 0.5 人日 |
-| 单元测试 | `applyCommandKubernetesVersion` 测试 + 参数传递测试 | 1 人日 |
-| **合计** | | **3.5 人日** |
-
-> **与 KEP-7 minimal-k8s-upgrade 的关系**：本设计在 KEP-10 (安装 DAG) 和 KEP-7 (最小化升级方案) 中共享。`applyCommandKubernetesVersion` 修改的是 BKEAgent 代码，安装和升级路径共同受益。`skipKubelet` 仍然有效 — `installKubeletCommand()` 读取的 `BkeConfig.Cluster.KubernetesVersion` 已被命令参数覆盖为 ReleaseImage 版本，`skipKubelet=true` 仅跳过该函数的执行，不影响版本来源。
-
-### 7.3 安装 DAG 结构
-
-```
-安装 DAG（基于 ReleaseImage v2.7.0 install.components 构建）:
-
-依赖关系来自 ComponentVersion.spec.dependencies:
-
-Batch 1: [bkeagent]                  ← 无依赖，最先执行
-    └─ inline: EnsureBKEAgent → SSH 推送 bkeagent 二进制
-
-Batch 2: [nodes-env]                 ← 依赖 bkeagent
-    └─ inline: EnsureNodesEnv → 节点环境准备（runc/lxcfs/nfs-utils 等）
-
-Batch 3: [certs]                     ← 依赖 nodes-env
-    └─ inline: EnsureCerts → 证书生成
-
-Batch 4: [cluster-api-obj, load-balance]  ← 依赖 certs，并行执行
-    ├─ inline: EnsureClusterAPIObj → CAPI 对象创建
-    └─ inline: EnsureLoadBalance → haproxy/keepalived 部署
-
-Batch 5: [kubernetes-master]         ← 依赖 certs + load-balance
-    └─ inline: EnsureMasterInit → kubeadm init + 控制面启动
-
-Batch 6: [kubernetes-worker]         ← 依赖 kubernetes-master（倾斜策略）
-    └─ inline: EnsureWorkerJoin → kubeadm join
-
-Batch 7: [kube-proxy, coredns]       ← 依赖 kubernetes-master，并行执行
-    ├─ manifest: YamlInstaller Apply → kube-proxy DaemonSet
-    └─ manifest: YamlInstaller Apply → coredns Deployment
-
-Batch 8: [nodes-postprocess, agent-switch]  ← 依赖 kubernetes-worker，并行执行
-    ├─ inline: EnsureNodesPostProcess → 后置脚本
-    └─ inline: EnsureAgentSwitch → Agent 监听切换
-```
-
-> **注意**：实际 DAG 结构由 `ComponentVersion.spec.dependencies` 决定。上图为典型配置。
-
-## 8. 部署 Phase 与安装组件映射
-
-### 8.0 设计思路
-
-Legacy `DeployPhases` 列表定义了 11 个串行 Phase，每个 Phase 有固定的执行顺序。DAG 安装路径需要将这些 Phase 映射为 `ComponentSpec` (组件名 + handler)，使 DAG 拓扑排序替代硬编码顺序。
-
-**核心设计思路**：将 Legacy PhaseFlow 的 Phase 名映射为 ReleaseImage 中的组件名，每个组件在 `DeclarativeInstallCatalog` 中声明 inline handler。Phase 间的执行顺序由 `ComponentVersion.spec.dependencies` 声明式定义，替代 DeployPhases 的硬编码列表。
-
-```txt
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│              部署 Phase 与安装组件映射设计思路                                    │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                 │
-│  Legacy PhaseFlow (硬编码顺序):                                                  │
-│    DeployPhases = [                                                              │
-│      EnsureBKEAgent,          // 0                                              │
-│      EnsureNodesEnv,          // 1                                              │
-│      EnsureClusterAPIObj,    // 2                                              │
-│      EnsureCerts,            // 3                                              │
-│      EnsureLoadBalance,      // 4                                              │
-│      EnsureMasterInit,       // 5                                              │
-│      EnsureMasterJoin,       // 6 (扩容时)                                     │
-│      EnsureWorkerJoin,       // 7                                              │
-│      EnsureAddonDeploy,      // 8                                              │
-│      EnsureNodesPostProcess, // 9                                              │
-│      EnsureAgentSwitch,      // 10                                             │
-│    ]                                                                             │
-│    顺序: 硬编码在 list.go 的切片索引                                             │
-│                                                                                 │
-│  DAG 安装路径 (声明式依赖):                                                      │
-│    ReleaseImage.install.components → BuildInstallDAG                              │
-│    ComponentVersion.spec.dependencies → 拓扑排序                                 │
-│                                                                                 │
-│    bkeagent (无依赖)                                                             │
-│      → nodes-env (依赖 bkeagent)                                                │
-│        → certs (依赖 nodes-env)                                                  │
-│          → cluster-api-obj (依赖 certs)  ┐                                      │
-│          → load-balance (依赖 certs)     ┘ 并行                                  │
-│            → kubernetes-master (依赖 certs + load-balance)                      │
-│              → kubernetes-worker (依赖 kubernetes-master)                       │
-│                → kube-proxy (依赖 kubernetes-master) ┐ 并行                     │
-│                → coredns (依赖 kubernetes-master)    ┘                          │
-│                  → nodes-postprocess (依赖 kubernetes-worker) ┐ 并行            │
-│                  → agent-switch (依赖 kubernetes-worker)      ┘                 │
-│                                                                                 │
-│  映射原则:                                                                       │
-│  1. Phase 名 → 组件名 — EnsureBKEAgent → "bkeagent"                             │
-│  2. Phase 构造函数 → InlineHandler — phases.NewEnsureBKEAgent → "EnsureBKEAgent"│
-│  3. Phase 顺序 → dependencies — 硬编码索引 → ComponentVersion.spec.dependencies │
-│  4. 无对应组件的 Phase — LegacyPhase 字段标记，用于双轨共存时跳过                │
-│                                                                                 │
-│  安装与升级 handler 差异:                                                       │
-│  同一组件在安装和升级时使用不同的 handler:                                       │
-│    kubernetes-master: 安装=EnsureMasterInit (kubeadm init)                     │
-│                       升级=EnsureMasterUpgrade (kubeadm upgrade apply)          │
-│    kubernetes-worker: 安装=EnsureWorkerJoin (kubeadm join)                      │
-│                      升级=EnsureWorkerUpgrade (kubeadm upgrade node)            │
-│    bkeagent:          安装=EnsureBKEAgent (首次推送)                            │
-│                       升级=EnsureAgentUpgrade (推送新版本)                      │
-│  原因: 安装和升级的操作语义不同 (init vs upgrade, join vs upgrade node)        │
-│        但组件名相同 (都是 "kubernetes-master")，通过不同 Catalog 区分            │
-│                                                                                 │
-│  嵌入式组件 (无独立 handler):                                                   │
-│    containerd: 安装嵌入在 EnsureNodesEnv 的 runtime scope 中 (无独立 handler)  │
-│    etcd: 安装由 kubeadm init 隐式创建 (在 EnsureMasterInit 中，无独立 handler)  │
-│    两者在 DeclarativeInstallCatalog 中无独立条目                                 │
-│    升级时有独立 handler (EnsureContainerdUpgrade / EnsureEtcdUpgrade)          │
-│                                                                                 │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
-
-### 8.1 DeployPhases → 安装组件映射
-
-| DeployPhase | 安装组件名 | 执行模式 | Inline Handler | 说明 |
-|-------------|-----------|---------|---------------|------|
-| `EnsureBKEAgent` | bkeagent | inline | `EnsureBKEAgent` | SSH 推送 Agent |
-| `EnsureNodesEnv` | nodes-env | inline | `EnsureNodesEnv` | 节点环境准备 |
-| `EnsureClusterAPIObj` | cluster-api-obj | inline | `EnsureClusterAPIObj` | CAPI 对象 |
-| `EnsureCerts` | certs | inline | `EnsureCerts` | 证书生成 |
-| `EnsureLoadBalance` | load-balance | inline | `EnsureLoadBalance` | HA 负载均衡 |
-| `EnsureMasterInit` | kubernetes-master | inline | `EnsureMasterInit` | Master 初始化 |
-| `EnsureMasterJoin` | kubernetes-master | inline | `EnsureMasterInit` | Master 加入（复用） |
-| `EnsureWorkerJoin` | kubernetes-worker | inline | `EnsureWorkerJoin` | Worker 加入 |
-| `EnsureAddonDeploy` | (coredns) | manifest | - | 附加组件部署 |
-| `EnsureNodesPostProcess` | nodes-postprocess | inline | `EnsureNodesPostProcess` | 后置脚本 |
-| `EnsureAgentSwitch` | agent-switch | inline | `EnsureAgentSwitch` | Agent 切换 |
-
-### 8.2 安装 vs 升级组件差异
-
-| 组件 | 安装 handler | 升级 handler | 差异说明 |
-|------|-------------|-------------|---------|
-| **bkeagent** | `EnsureBKEAgent` | `EnsureAgentUpgrade` | 安装=首次推送；升级=SSH 推送新版本 |
-| **kubernetes-master** | `EnsureMasterInit` | `EnsureMasterUpgrade` | 安装=kubeadm init；升级=kubeadm upgrade |
-| **kubernetes-worker** | `EnsureWorkerJoin` | `EnsureWorkerUpgrade` | 安装=kubeadm join；升级=kubeadm upgrade |
-| **containerd** | (包含在 nodes-env) | `EnsureContainerdUpgrade` | 安装=环境准备含 containerd；升级=独立 ENV 命令 |
-| **etcd** | (包含在 MasterInit) | `EnsureEtcdUpgrade` | 安装=kubeadm init 含 etcd；升级=独立 etcd 升级 |
-| **certs** | `EnsureCerts` | - | 仅安装时生成证书 |
-| **load-balance** | `EnsureLoadBalance` | - | 仅安装时配置 HA |
-| **nodes-env** | `EnsureNodesEnv` | - | 仅安装时准备环境 |
-| **pre-upgrade-resources** | - | `EnsurePreUpgradeResources` | 仅升级时预创建资源 |
-
-## 9. Feature Gate 与迁移策略
-
-### 9.1 Feature Gate 设计
-
-```go
-// pkg/featuregate/features.go
-
-var (
-    // DeclarativeInstallEnabled 控制 DAG 安装路径是否启用
-    // false: 使用 PhaseFlow 安装（默认）
-    // true: 使用 DAG 安装
-    DeclarativeInstallEnabled = featuregate.NewFeature()
-)
-```
-
-### 9.2 迁移阶段
-
-| 阶段 | 目标 | 说明 | Feature Gate |
-|------|------|------|-------------|
-| **Phase 1** | 结构扩展 | 统一抽象 `ReleaseImageComponent`，新增 `inline` 字段 | 不启用 |
-| **Phase 2** | 安装 DAG 实现 | 实现 `BuildInstallDAG`、`executeInstallDAG`、`DeclarativeInstallCatalog` | 灰度启用 |
-| **Phase 3** | 验证与切换 | 测试环境验证，逐步切换到 DAG 安装路径 | 正式启用 |
-| **Phase 4** | 移除 PhaseFlow | 移除 DeployPhases 硬编码列表，安装完全 DAG 驱动 | 移除 Feature Gate |
-
-### 9.3 向后兼容
-
-1. **旧格式兼容**：`ReleaseImageComponent` 的 `inline` 字段是 `omitempty`，旧格式 `{name, version}` 仍然有效
-2. **PhaseFlow 共存**：`DeclarativeInstallEnabled` 未启用时，继续使用 PhaseFlow
-3. **混合模式**：ReleaseImage 可同时包含有 `inline` 和无 `inline` 的安装组件
-4. **ClusterVersionReconciler**：安装时设置 `cvo.openfuyao.cn/install-ready` annotation 触发 DAG 路径
-
-### 9.4 Legacy PhaseFlow 完全移除方案
+## 目录
+
+10.1 场景覆盖总览
+10.2 纳管已有集群 DAG 化
+10.3 集群扩容 DAG 化
+10.4 集群删除/重置 DAG 化
+10.5 DryRun 模式 DAG 化
+10.6 集群暂停 DAG 化
+10.7 移除后的执行入口
+
+---
+
+## 10. Legacy PhaseFlow 完全移除方案
 
 当迁移到 Phase 4 时，需要完全移除 Legacy PhaseFlow 路径。以下针对 7.1 节中列出的每个 Legacy 场景，给出 DAG 化的完整方案。
 
-#### 9.4.1 场景覆盖总览
+### 10.1 场景覆盖总览
 
 | Legacy 场景 | DAG 化方案 | 移除条件 |
 |------------|-----------|---------|
 | Feature Gate 未启用 | 移除 Feature Gate，DAG 成为唯一路径 | Phase 4 |
 | ReleaseImage 无 inline handler | 强制 ReleaseImage 包含 inline 字段 | Phase 4 |
-| 无 install-ready annotation | ClusterVersionReconciler 始终设置 annotation | Phase 2 |
+| 无 install-ready annotation | 已移除: Feature Gate 开启即代表 ReleaseImage 就绪 | 已移除 |
 | 纳管已有集群 | 新增 `manage` 组件到安装 DAG | Phase 4 |
 | 集群扩容（新增节点） | 新增 `scale-master` / `scale-worker` 组件到 DAG | Phase 4 |
 | 集群删除/重置 | 新增 `delete` DAG（逆序卸载） | Phase 4 |
 | DryRun 模式 | DAG 执行器支持 DryRun 标记 | Phase 3 |
 | 集群暂停 | DAG 前置检查 `BKECluster.Spec.Pause` | Phase 3 |
 
-#### 9.4.2 纳管已有集群 DAG 化
+### 10.2 纳管已有集群 DAG 化
 
-##### 设计思路
+#### 设计思路
 
 纳管是指将一个已有的 Kubernetes 集群纳入 BKE 管理。与全新安装的核心区别在于：集群已运行，组件已有版本，不能假设 Current 为空。
 
@@ -2270,11 +60,14 @@ var (
 │  DAG 化方案:                                                                     │
 │    将纳管拆解为 DAG 的第一个组件:                                                │
 │      manage 组件 (inline: EnsureClusterManage)                                   │
+│        → 仅纳管场景执行 (Condition: '{{ eq .Operation "manage" }}')             │
 │        → 探测版本 → 填充 VersionContext.Current                                 │
 │        → 后续组件通过 VersionContext.Decide() 判断:                             │
 │          Current == Target → DecisionSkip (已有正确版本，跳过)                   │
 │          Current != Target → DecisionUpgrade (需要升级到目标版本)               │
 │          Current == "" → DecisionInstall (缺失组件，需要安装)                    │
+│        → 全新安装场景: Condition 求值 false → 跳过 manage → Current 保持空     │
+│          → 后续组件全部 DecisionInstall (全新安装)                               │
 │                                                                                 │
 │  核心优势:                                                                       │
 │  1. 版本感知 — 纳管后仅安装/升级缺失或版本不符的组件，不重复安装已有组件        │
@@ -2290,24 +83,53 @@ var (
 │  │ • 全新安装: manage 探测不存在的集群 → 探测失败/空版本 → 干扰后续 Decide │   │
 │  │ • 纳管场景: manage 探测已有集群 → 填充 VC.Current → 后续组件正确 Decide │   │
 │  │                                                                         │   │
-│  │ 解决方案: VersionContext 过滤 (执行时过滤)                               │   │
+│  │ 解决方案: Condition 执行时过滤 (KEP-18)                                 │   │
 │  │ • manage 在 ReleaseImage install.components 中 (声明式定义)             │   │
 │  │ • DAG 构建时包含所有 install.components (不过滤)                        │   │
-│  │ • VersionContext 构建时过滤:                                            │   │
-│  │   - 全新安装: BuildVersionContextForInstall(bundle, "manage")          │   │
-│  │     → manage 的 target="" → Decide() 返回 DecisionSkip (跳过)         │   │
-│  │   - 纳管场景: FillTargetFromBundle(vc, bundle)                        │   │
-│  │     → manage 的 target!="" → Decide() 返回 DecisionInstall (执行)     │   │
+│  │ • VersionContext 构建时不过滤 (Current 全空, Target 全填充):           │   │
+│  │   - 全新安装和纳管均用 FillTargetFromBundle(vc, bundle)               │   │
+│  │     → manage 的 target!="" → Decide() 返回 DecisionInstall            │   │
+│  │ • 执行时 Condition 过滤 (shouldExecuteByCondition):                    │   │
+│  │   - manage 的 ComponentVersion.Spec.Condition:                         │   │
+│  │     '{{ eq .Operation "manage" }}'                                      │   │
+│  │   - 全新安装: Operation="install" → 求值 "false" → Skip (跳过 manage) │   │
+│  │   - 纳管场景: Operation="manage" → 求值 "true" → 执行 manage 探测     │   │
 │  │                                                                         │   │
-│  │ 为什么用 VersionContext 过滤而非 DAG 构建时过滤:                        │   │
-│  │ • DAG 构建时过滤: 需传递 excludeComponents 参数，增加 API 复杂度      │   │
-│  │ • VersionContext 过滤: 统一由 Decide() 控制，职责清晰，API 简洁        │   │
+│  │ 为什么用 Condition 过滤而非 VersionContext 构建时过滤:                  │   │
+│  │ • VersionContext 构建时过滤: 需传递 excludeComponents 参数，增加 API 复杂度 │   │
+│  │ • Condition 过滤: 统一由 shouldExecuteByCondition 控制，职责清晰       │   │
+│  │ • 与 §6.4 简化设计一致: VC 构建时直接包含所有组件，不过滤               │   │
+│  └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+│  Operation 填充到 TemplateContext (KEP-18 §3):                                   │
+│  ┌─────────────────────────────────────────────────────────────────────────┐   │
+│  │ 问题: Condition '{{ eq .Operation "manage" }}' 需要从 TemplateContext   │   │
+│  │       读取 .Operation 字段, 但 BKECluster CR 本身不携带操作类型信息      │   │
+│  │       (操作类型由调用方决定: executeManageDAG vs executeInstallDAG)      │   │
+│  │                                                                         │   │
+│  │ 方案: 调用方在构建 ExecutionContext 时传入 Operation                      │   │
+│  │ • buildTemplateContext 从 BKECluster 提取静态字段 (不变)               │   │
+│  │ • 调用方 (executeManageDAG/executeInstallDAG/executeScaleDAG/...)       │   │
+│  │   在构建 ExecutionContext 后设置 execCtx.TemplateContext.Operation      │   │
+│  │ • shouldExecuteByCondition 读取 execCtx.TemplateContext.Operation       │   │
+│  │                                                                         │   │
+│  │ 各场景 Operation 值:                                                    │   │
+│  │   executeInstallDAG  → Operation = "install"                           │   │
+│  │   executeManageDAG   → Operation = "manage"                             │   │
+│  │   executeScaleDAG    → Operation = "scale"                              │   │
+│  │   executeUpgradeDAG  → Operation = "upgrade"                            │   │
+│  │   executeUninstallDAG → Operation = "rollback"                          │   │
+│  │                                                                         │   │
+│  │ 设计原则:                                                               │   │
+│  │ • Operation 是调用上下文信息, 不存储在 BKECluster CR 中               │   │
+│  │ • buildTemplateContext 保持只从 BKECluster 提取 (不引入推断逻辑)        │   │
+│  │ • 调用方负责设置 Operation (显式传递, 非隐式推断)                       │   │
 │  └─────────────────────────────────────────────────────────────────────────┘   │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-##### 代码实现
+#### 代码实现
 
 ```yaml
 # ReleaseImage install.components 新增 manage 组件
@@ -2318,6 +140,23 @@ install:
       inline:
         handler: EnsureClusterManage
         version: v1.0.0
+```
+
+```yaml
+# ComponentVersion: manage — 仅纳管场景执行 (KEP-18 Condition)
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: manage-v1.0.0
+spec:
+  name: manage
+  type: inline
+  version: "v1.0.0"
+  inline:
+    handler: EnsureClusterManage
+    version: "v1.0.0"
+  # ★ 仅纳管场景执行, 全新安装时跳过 (KEP-18 Condition 过滤)
+  condition: '{{ eq .Operation "manage" }}'
 ```
 
 ```go
@@ -2442,7 +281,7 @@ func BuildVersionContextForManage(
 }
 ```
 
-##### 场景判断
+#### 场景判断
 
 纳管场景需要先判断 BKECluster 是否处于纳管模式，再走纳管 DAG 路径：
 
@@ -2529,13 +368,17 @@ func (r *BKEClusterReconciler) executeManageDAG(
 
     // 2. 构建纳管 VersionContext (Current 初始为空，由 manage 组件填充)
     vc := upgrade.NewVersionContext()
-    // Target 来自 ReleaseImage (包含 manage 组件)
+    // Target 来自 ReleaseImage (包含 manage 组件, 与全新安装相同)
+    // ★ manage 组件的执行/跳过由 ComponentVersion.Spec.Condition 控制 (KEP-18):
+    //   Condition: '{{ eq .Operation "manage" }}'
+    //   纳管场景 Operation="manage" → 求值 true → 执行 manage 探测
+    //   全新安装 Operation="install" → 求值 false → 跳过 manage
     upgrade.FillTargetFromBundle(vc, bundle)
     phaseCtx.SetVersionContext(vc)
 
     // 3. 构建 DAG (包含所有 install.components，包括 manage)
     //    ★ 与 executeInstallDAG 使用相同的构建函数 (无 excludeComponents 参数)
-    //    区别在于 VersionContext: 纳管场景 manage 的 target!="" → DecisionInstall
+    //    ★ manage 的执行/跳过由 Condition 在 shouldExecuteByCondition 中判断 (非 VersionContext 构建 时过滤)
     dag, err := upgrade.BuildInstallDAGFromBundle(bundle, upgrade.BundleDependencyResolver(bundle))
     // manage 组件在第一个 Batch 执行: 探测版本 → 填充 VC.Current → 后续组件 Decide
 
@@ -2552,20 +395,54 @@ func (r *BKEClusterReconciler) executeManageDAG(
 
     execCtx := buildExecutionContext(ctx, r.Client, newCluster, vc)
 
-    // 5. 执行 DAG
-    //    Batch 1: manage → 探测版本 → 填充 VC.Current
-    //    Batch 2+: 后续组件 Decide: Current==Target→Skip, Current!=Target→Upgrade, Current==""→Install
+    // ★ 设置 Operation 到 TemplateContext (供 Condition 求值)
+    // buildTemplateContext 从 BKECluster 提取静态字段, 不含操作类型
+    // Operation 是调用上下文信息, 由调用方显式设置
+    execCtx.TemplateContext.Operation = "manage"
+
+    // 5. 执行 DAG — shouldExecuteByCondition 在 Scheduler 跳过链中生效
+    //    Scheduler 跳过链 (executeBatchParallel, scheduler.go:160-183):
+    //      (A) shouldSkipComponent(node)         → DeclarativeUpgradeStatus.IsCompleted → Skip
+    //      (B) componentNeedsUpgrade(node)       → VersionContext.NeedsExecution → Current==Target → Skip
+    //      (C) shouldExecuteByCondition(node)    → EvaluateCondition(cv.Spec.Condition, tmpl) ★ KEP-18
+    //      (D) executeComponent(node)            → 分发到 Inline/YAML/Helm Executor
+    //
+    //    纳管场景执行流程:
+    //    Batch 1: [manage]
+    //      (A) IsCompleted → false (首次执行)
+    //      (B) NeedsExecution → true (Current=="", Target!="")
+    //      (C) Condition: '{{ eq .Operation "manage" }}'
+    //          → Operation="manage" (由 executeManageDAG 设置)
+    //          → 求值 "true" → 执行 ★
+    //      (D) InlineComponentExecutor → EnsureClusterManage.Execute()
+    //          → 探测版本 → 填充 VC.Current
+    //          → 后续组件 Current 有值, 可正确 Decide
+    //
+    //    Batch 2+: [bkeagent, containerd, kubernetes-master, ...]
+    //      (A) IsCompleted → false
+    //      (B) NeedsExecution → Current==Target→Skip / Current!=Target→Upgrade / Current==""→Install
+    //      (C) Condition: 各组件的 Condition (通常为空, 不过滤)
+    //      (D) InlineComponentExecutor → 各 handler Execute()
+    //
+    //    全新安装场景 (executeInstallDAG, Operation="install"):
+    //    Batch 1: [manage]
+    //      (C) Condition: '{{ eq .Operation "manage" }}'
+    //          → Operation="install" → 求值 "false" → Skip ★ (manage 跳过)
+    //          → Current 保持空 → 后续组件全部 DecisionInstall
+    //
+    //    ★ MaxParallelPerBatch=1 确保 Batch 1 串行: manage 先执行填充 Current,
+    //      后续组件才能正确 Decide (Current 有值)
     return sched.ExecuteDAG(ctx, execCtx, dag)
 }
 ```
 
-#### 9.4.3 集群扩容 DAG 化
+### 10.3 集群扩容 DAG 化
 
-##### 设计思路
+#### 设计思路
 
 扩容是指向已有集群新增 Master 或 Worker 节点。与全新安装的核心区别在于：已有节点不需要重新安装，仅新节点需要执行安装操作。
 
-扩容的节点安装触发采用**三层机制**：第一层是 DAG Scheduler 的组件级 Decision（VersionContext），决定组件是否执行；第二层是 PhaseRunner 的 `NeedExecute()` 检查（StateCode），决定是否有节点需要操作；第三层是 inline handler 内部的节点级过滤（`filterNodes()`），决定哪些节点需要操作。
+扩容的节点安装触发采用**三层机制**：第一层是 DAG Scheduler 的组件级 Decision（VersionContext + Condition），决定组件是否执行；第二层是 PhaseRunner 的 `NeedExecute()` 前置守卫（StateCode），避免不必要的 Execute 调用；第三层是 inline handler 内部的节点级过滤（StateCode 位标记），决定哪些节点需要操作。
 
 ```txt
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -2591,60 +468,151 @@ func (r *BKEClusterReconciler) executeManageDAG(
 │                                                                                 │
 │  DAG 化方案 (三层机制):                                                          │
 │                                                                                 │
-│  第一层: Scheduler 组件级 Decision (VersionContext)                              │
-│    fillCurrentFromExistingNodes 填充 Current:                                    │
-│      集群级组件 (certs, coredns, ...): Current==Target → Skip (已安装, 跳过)     │
-│      节点级组件 (bkeagent, containerd, ...): Current=="" → Install (执行)       │
-│    ★ VersionContext 是组件级的, 不是节点级的                                     │
-│    ★ 这一层只决定"组件是否执行", 不决定"哪些节点执行"                              │
+│  第一层: Scheduler 组件级 Decision (VersionContext + Condition)                  │
+│    Scheduler 跳过链 (executeBatchParallel):                                      │
+│      (A) shouldSkipComponent → DeclarativeUpgradeStatus.IsCompleted → Skip      │
+│      (B) componentNeedsUpgrade → VersionContext.NeedsExecution:                 │
+│          集群级组件 (certs, coredns, ...): Current==Target → Skip (已安装)       │
+│          节点级组件 (bkeagent, containerd, ...): Current=="" → Install (执行)   │
+│      (C) shouldExecuteByCondition → EvaluateCondition(cv.Spec.Condition, tmpl): │
+│          kubernetes-master: condition '{{ eq .ScaleType "master" }}'            │
+│            Master 扩容 → ScaleType="master" → 求值 "true" → 执行 ★              │
+│            Worker 扩容 → ScaleType="worker" → 求值 "false" → Skip ★             │
+│          kubernetes-worker: condition '{{ eq .ScaleType "worker" }}'            │
+│            Worker 扩容 → ScaleType="worker" → 求值 "true" → 执行 ★              │
+│            Master 扩容 → ScaleType="master" → 求值 "false" → Skip ★             │
+│          无 Condition 的组件 (bkeagent, containerd, ...): 跳过此层, 执行        │
+│      (D) executeComponent → 分发到 Inline/YAML/Helm Executor                    │
+│    ★ VersionContext 是组件级的, Condition 也是组件级的                          │
+│    ★ 这一层决定"组件是否执行", 不决定"哪些节点执行"                               │
 │                                                                                 │
-│  第二层: PhaseRunner.NeedExecute() (StateCode)                                   │
-│    PhaseRunner.Execute() 内部调用 phase.NeedExecute():                           │
-│      HasNodesNeedingPhase(StateCode) → 有节点位标记未设置 → true → 继续          │
-│      所有节点位标记已设置 → false → return nil (跳过 Execute)                     │
-│    ★ 这一层决定"是否有节点需要操作", 避免不必要的 Execute 调用                     │
+│  第二层: PhaseRunner.NeedExecute() 前置守卫 (StateCode)                          │
+│    PhaseRunner.Execute() 在调用 phase.Execute() 前先调用 phase.NeedExecute():   │
+│      NeedExecute=true  → 有节点位标记未设置 → 继续 Execute()                     │
+│      NeedExecute=false → 所有节点位标记已设置 → return nil (跳过 Execute)         │
+│    ★ 这是 Execute() 的前置守卫, 与第三层检查相同的 StateCode, 但目的不同:       │
+│      NeedExecute: 布尔值判断 (是否有节点需要操作), 避免不必要的 Execute 调用     │
+│      Execute 内部: 精确节点列表 (哪些节点需要操作), 返回具体节点执行操作          │
 │                                                                                 │
-│  第三层: inline handler 节点级过滤 (filterNodes + StateCode)                     │
-│    handler 的 Execute() 内部通过 phaseutil.filterNodes() 精确过滤:              │
+│  第三层: inline handler 节点级过滤 (StateCode 位标记)                             │
+│    handler 的 Execute() 内部通过 StateCode 位标记精确过滤目标节点:              │
 │      已有节点: 对应位标记已设置 (NodeEnvFlag/NodeBootFlag/MasterInitFlag)       │
 │                → 跳过                                                            │
 │      新增节点: 对应位标记未设置                                                   │
 │                → 执行安装                                                        │
+│    ★ 过滤方式因 Phase 而异 (见下方 "节点过滤方式对比" 表)                        │
 │    ★ 这一层决定"哪些节点执行"                                                    │
 │                                                                                 │
 │  核心设计:                                                                       │
 │  1. EnsureMasterInit handler 幂等改造 — 区分 init (首个 Master) / join (后续)  │
 │     通过 getExistingMasterNodes 检查已有 Master 数量判断执行 init 还是 join      │
-│  2. 三层节点过滤 — VersionContext + NeedExecute + filterNodes 逐层收窄:         │
-│     第一层: VersionContext Current=="" → 组件执行 (跳过集群级组件)              │
+│  2. 三层过滤 — VersionContext+Condition + NeedExecute + filterNodes 逐层收窄:   │
+│     第一层: VersionContext Current=="" + Condition ScaleType → 组件执行/跳过     │
 │     第二层: NeedExecute(StateCode) → 有节点需要操作 (避免空执行)                  │
 │     第三层: filterNodes(StateCode) → 精确定位目标节点                              │
-│  3. 复用安装 DAG — 无需独立的扩容 DAG，安装 DAG + 组件级 Current 过滤集群级组件  │
+│  3. 复用安装 DAG — 无需独立的扩容 DAG，安装 DAG + 组件级 Current/Condition 过滤   │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-##### Legacy PhaseFlow 扩容执行机制（当前代码）
+#### Legacy PhaseFlow 扩容执行机制（当前代码）
 
 **核心代码路径**: `pkg/phaseframe/phases/phase_flow.go` + `pkg/phaseframe/phases/list.go`
 
-**1. 不存在独立的 ScalePhases 执行列表**
+**1. ClusterScaleXxxPhaseNames 仅用于状态上报，不用于执行决策**
 
-代码中 `ClusterScaleMasterUpPhaseNames` 等列表**仅用于状态上报**（`calculateClusterStatusByPhase` 设置 `ClusterMasterScalingUp` 等 `ClusterStatus`），不用于决定执行哪些 Phase：
+代码中存在 4 个扩缩容相关的 Phase 名称列表（`list.go:116-128`），它们**仅用于状态上报**（`calculateClusterStatusByPhase` 根据当前执行的 Phase 名称设置对应的 `ClusterStatus`），**不用于决定执行哪些 Phase**：
 
 ```go
-// pkg/phaseframe/phases/list.go — 仅用于状态上报, 不用于执行
+// pkg/phaseframe/phases/list.go:116-128 — 仅用于状态上报, 不用于执行
+
 ClusterScaleMasterUpPhaseNames = []confv1beta1.BKEClusterPhase{
-    EnsureMasterJoinName,  // 仅 Master 扩容状态上报
+    EnsureMasterJoinName,       // Master 扩容
 }
 ClusterScaleWorkerUpPhaseNames = []confv1beta1.BKEClusterPhase{
-    EnsureWorkerJoinName,  // 仅 Worker 扩容状态上报
+    EnsureWorkerJoinName,       // Worker 扩容
+}
+ClusterScaleMasterDownPhaseNames = []confv1beta1.BKEClusterPhase{
+    EnsureMasterDeleteName,     // Master 缩容
+}
+ClusterScaleWorkerDownPhaseNames = []confv1beta1.BKEClusterPhase{
+    EnsureWorkerDeleteName,     // Worker 缩容
+}
+```
+
+**状态上报的使用方式**（`phase_flow.go:371-405`）：
+
+```go
+// calculateClusterStatusByPhase 在 Phase 执行后/后置 Hook 中被调用
+// 根据当前 Phase 名称匹配上述列表，设置对应的 ClusterStatus
+
+func calculateClusterStatusByPhase(phase phaseframe.Phase, err error) error {
+    phaseName := phase.Name()
+    switch {
+    // ...
+    case phaseName.In(ClusterScaleMasterUpPhaseNames):
+        handleClusterScaleMasterUpPhase(ctx, err)   // → ClusterMasterScalingUp / ClusterScaleFailed
+    case phaseName.In(ClusterScaleWorkerUpPhaseNames):
+        handleClusterScaleWorkerUpPhase(ctx, err)   // → ClusterWorkerScalingUp / ClusterScaleFailed
+    case phaseName.In(ClusterScaleMasterDownPhaseNames):
+        handleClusterScaleMasterDownPhase(ctx, err) // → ClusterMasterScalingDown / ClusterScaleFailed
+    case phaseName.In(ClusterScaleWorkerDownPhaseNames):
+        handleClusterScaleWorkerDownPhase(ctx, err) // → ClusterWorkerScalingDown / ClusterScaleFailed
+    // ...
+    }
 }
 
-// pkg/phaseframe/phases/phase_flow.go:380 — 仅在 calculateClusterStatusByPhase 中使用
-case phaseName.In(ClusterScaleMasterUpPhaseNames):
-    handleClusterScaleMasterUpPhase(ctx, err)  // 设置 ClusterStatus = ClusterMasterScalingUp
+// handleClusterScaleMasterUpPhase — 设置 ClusterStatus
+func handleClusterScaleMasterUpPhase(ctx *phaseframe.PhaseContext, err error) {
+    if err != nil {
+        ctx.BKECluster.Status.ClusterStatus = bkev1beta1.ClusterScaleFailed
+    } else {
+        ctx.BKECluster.Status.ClusterStatus = bkev1beta1.ClusterMasterScalingUp
+    }
+}
 ```
+
+**执行决策与状态上报的分离**：
+
+| 职责 | 机制 | 代码位置 | 说明 |
+|------|------|---------|------|
+| **执行哪些 Phase** | `DeployPhases` + `NeedExecute()` | `phase_flow.go:78` `calculateAndAddPhases` | 遍历全部 11 个 DeployPhases，每个 Phase 自行判断是否需要执行 |
+| **设置什么 ClusterStatus** | `ClusterScaleXxxPhaseNames` | `phase_flow.go:380` `calculateClusterStatusByPhase` | 根据当前 Phase 名称匹配列表，设置扩缩容状态 |
+
+**为什么不用独立 ScalePhases 列表驱动执行**：
+
+1. **节点安装需要复用 DeployPhases**：扩容时新节点需要 bkeagent 推送、containerd 安装、环境初始化等，这些与全新安装完全相同，复用 DeployPhases 避免代码重复
+2. **已有节点自动跳过**：DeployPhases 中每个 Phase 的 `NeedExecute()` 基于 `StateCode` 位标记判断，已有节点位标记已设置 → 跳过，新节点位标记未设置 → 执行
+3. **状态上报仅需要 Phase 名称**：`ClusterScaleMasterUpPhaseNames` 只需包含 `EnsureMasterJoinName`，因为只有执行到 Master 加入时才需要上报 `ClusterMasterScalingUp` 状态；bkeagent/containerd 等安装阶段不需要特殊状态上报（默认 `ClusterInitializing` 或 `ClusterUnknown`）
+
+**状态上报的完整链路**：
+
+```
+扩容执行流程:
+
+  PhaseFlow.Execute()
+    → 遍历 BKEPhases (由 NeedExecute 筛选)
+      → EnsureBKEAgent.Execute()
+        → ExecutePostHook → calculateClusterStatusByPhase
+          → phaseName 不在 ScaleXxx 列表中
+          → ClusterStatus = ClusterInitializing (默认)
+      → EnsureNodesEnv.Execute()
+        → ExecutePostHook → calculateClusterStatusByPhase
+          → phaseName 不在 ScaleXxx 列表中
+          → ClusterStatus = ClusterInitializing (默认)
+      → EnsureMasterJoin.Execute()      ← Master 扩容时
+        → ExecutePostHook → calculateClusterStatusByPhase
+          → phaseName.In(ClusterScaleMasterUpPhaseNames) ✓
+          → handleClusterScaleMasterUpPhase(ctx, err)
+          → ClusterStatus = ClusterMasterScalingUp ★ (扩容专属状态)
+      → EnsureWorkerJoin.Execute()      ← Worker 扩容时
+        → ExecutePostHook → calculateClusterStatusByPhase
+          → phaseName.In(ClusterScaleWorkerUpPhaseNames) ✓
+          → handleClusterScaleWorkerUpPhase(ctx, err)
+          → ClusterStatus = ClusterWorkerScalingUp ★ (扩容专属状态)
+```
+
+**结论**：`ClusterScaleXxxPhaseNames` 是状态上报的"标签"——当 PhaseFlow 执行到特定 Phase（如 `EnsureMasterJoin`）时，通过名称匹配设置对应的扩缩容 `ClusterStatus`。它不参与执行决策，执行决策由 `DeployPhases` + `NeedExecute()` 完成。
 
 **2. PhaseFlow 遍历完整 DeployPhases**
 
@@ -2716,12 +684,36 @@ func HasNodesNeedingPhase(bkeNodes bkev1beta1.BKENodes, flag int) bool {
 }
 ```
 
-**4. Phase 内部节点过滤**
+**4. Phase 内部节点过滤（两种模式）**
 
-Phase 执行时通过 `phaseutil.filterNodes()` + `NodePredicate` 精确过滤目标节点：
+Phase 执行时通过 StateCode 位标记精确过滤目标节点。代码中存在两种过滤模式：
+
+| 模式 | 使用 Phase | 过滤方式 | 代码位置 |
+|------|-----------|---------|---------|
+| **`filterNodes()` 模式** | EnsureBKEAgent, EnsureMasterJoin, EnsureWorkerJoin, EnsureNodesPostProcess | 调用 `phaseutil.GetNeedXxxNodesWithBKENodes()` → 内部调用 `filterNodes()` + `NodePredicate` | `phaseutil/util.go:181` |
+| **内联循环模式** | EnsureNodesEnv | `Execute()` 内部直接遍历 BKENodes，逐个检查 StateCode 位标记 | `ensure_nodes_env.go:101` `getNodesToInitEnv()` |
+
+**`filterNodes()` 模式示例**（`ensure_bke_agent.go:165`）：
 
 ```go
-// pkg/phaseframe/phases/ensure_nodes_env.go:101 — EnsureNodesEnv 内部过滤
+// EnsureBKEAgent.Execute() → getNeedPushNodes()
+func (e *EnsureBKEAgent) getNeedPushNodes() error {
+    bkeNodes, err := e.Ctx.NodeFetcher().GetBKENodesWrapperForCluster(e.Ctx, e.Ctx.BKECluster)
+    // ...
+    // ★ 调用 phaseutil.GetNeedPushAgentNodesWithBKENodes()
+    //   → 内部调用 filterNodes(cluster, predicate, WithExcludeAppointmentNodes(), WithBKENodes(bkeNodes))
+    //   → predicate = !NodeAgentPushedFlag
+    nodes := phaseutil.GetNeedPushAgentNodesWithBKENodes(e.Ctx.BKECluster, bkeNodes)
+    e.needPushNodes = nodes
+    return nil
+}
+```
+
+**内联循环模式示例**（`ensure_nodes_env.go:101`）：
+
+```go
+// EnsureNodesEnv.Execute() → getNodesToInitEnv()
+// ★ 不调用 filterNodes(), 直接遍历 BKENodes 检查 StateCode
 func (e *EnsureNodesEnv) getNodesToInitEnv() bkenode.Nodes {
     for _, bn := range bkeNodes {
         // 硬排除: Failed/Deleting/NeedSkip
@@ -2738,6 +730,8 @@ func (e *EnsureNodesEnv) getNodesToInitEnv() bkenode.Nodes {
 }
 ```
 
+> **两种模式的差异**：`filterNodes()` 模式通过 `NodePredicate` 函数封装过滤逻辑，可复用 `WithExcludeAppointmentNodes` 等 option；内联循环模式直接在 Phase 内遍历，可检查多个前置条件（如 `NodeAgentReadyFlag` + `NodeEnvFlag` 组合判断）。两种模式最终效果一致——基于 StateCode 位标记过滤目标节点。
+
 **节点级 StateCode 位标记说明**：
 
 | 位标记 | 含义 | 设置时机 | 过滤用途 |
@@ -2750,7 +744,7 @@ func (e *EnsureNodesEnv) getNodesToInitEnv() bkenode.Nodes {
 | `NodeFailedFlag` | 节点失败 | 安装失败 | `filterNodes`: 已设置 → 硬排除 |
 | `NodeDeletingFlag` | 节点删除中 | 缩容触发 | `filterNodes`: 已设置 → 硬排除 |
 
-##### DAG 化方案设计
+#### DAG 化方案设计
 
 **1. 入口集成 — 复用 executePhaseFlow 模式**
 
@@ -2769,7 +763,11 @@ func (r *BKEClusterReconciler) executePhaseFlow(...) (ctrl.Result, error) {
         if dagErr != nil { return dagResult, dagErr }
         if dagResult.Requeue || dagResult.RequeueAfter > 0 { return dagResult, nil }
         if !dagCompleted { return ctrl.Result{}, nil }
-        // 扩容 DAG 完成后继续执行 PhaseFlow (处理 AddonDeploy/AgentSwitch 等非 DAG 组件)
+        // 扩容 DAG 完成后不再走 PhaseFlow
+        // ★ 扩容 DAG 复用安装 DAG, 处理全部组件 (inline + yaml/helm), 无需 PhaseFlow 补充
+        //   升级 DAG 同样处理全部组件 (inline + yaml/helm), DAG 完成后 PhaseFlow 中
+        //   升级相关 Phase 的 NeedExecute=false 自动跳过 (skipPhaseAfterDeclarativeDAG)
+        return ctrl.Result{}, nil
     }
 
     // 升级 DAG 路径 (现有)
@@ -2841,14 +839,22 @@ func registerInlineHandler(f *ComponentFactory, handler, version string) error {
 ```
 executeScaleDAG
   → Scheduler.ExecuteDAG
-    → shouldSkipComponent(node)         ← 第一层: VersionContext Current==Target → Skip
-    → componentNeedsUpgrade(node)       ← 第一层: VersionContext Current=="" → NeedsExecution=true
-    → InlineComponentExecutor.ExecuteComponent
-      → NeedsExecution(vc, node.Name)   ← 第一层 (再次检查, inline_executor.go:55)
-      → Runner.Execute(handler, version)
-        → PhaseRunner.Execute           ← runner.go:28
-          → phase.NeedExecute(old, new) ← 第二层: StateCode HasNodesNeedingPhase → false 则 return nil
-          → phase.Execute()             ← 第三层: filterNodes(StateCode) 精确过滤
+    → shouldSkipComponent(node)         ← (A) DeclarativeUpgradeStatus.IsCompleted → Skip
+    → componentNeedsUpgrade(node)       ← (B) VersionContext.NeedsExecution:
+                                            集群级 Current==Target → Skip
+                                            节点级 Current=="" → NeedsExecution=true
+    → shouldExecuteByCondition(node)    ← (C) EvaluateCondition(cv.Spec.Condition, tmpl) ★ KEP-18
+                                            kubernetes-master: '{{ eq .ScaleType "master" }}'
+                                              Master 扩容 → "true" → 执行
+                                              Worker 扩容 → "false" → Skip
+                                            无 Condition 的组件 → 跳过此层, 执行
+    → executeComponent(node)            ← (D) 分发到 Inline/YAML/Helm Executor
+      → InlineComponentExecutor.ExecuteComponent
+        → NeedsExecution(vc, node.Name) ← (B) 再次检查 (inline_executor.go:55)
+        → Runner.Execute(handler, version)
+          → PhaseRunner.Execute           ← runner.go:28
+            → phase.NeedExecute(old, new) ← 第二层 (前置守卫): StateCode 检查, 无节点需要则 return nil
+            → phase.Execute()             ← 第三层 (精确过滤): StateCode 位标记过滤目标节点
 ```
 
 **PhaseRunner.Execute 的关键逻辑**（现有代码 `runner.go:28-57`，无需修改）：
@@ -2890,7 +896,7 @@ if err := r.patchClusterStatus(newCluster, bkev1beta1.ClusterMasterScalingUp); e
 newCluster.Status.ClusterStatus = bkev1beta1.ClusterStatusReady
 ```
 
-##### 代码实现
+#### 代码实现
 
 ```go
 // controllers/capbke/bkecluster_scale_dag.go 🆕新增
@@ -2958,10 +964,29 @@ func (r *BKEClusterReconciler) executeScaleDAG(
     // 7. 构建 ExecutionContext
     execCtx := buildExecutionContext(phaseCtx, oldCluster, newCluster, bkeLogger, nil)
 
-    // 8. 执行 DAG
-    //    第一层 (Scheduler): 集群级组件 Current==Target → Skip; 节点级组件 Current=="" → Install
-    //    第二层 (PhaseRunner): NeedExecute(StateCode) → 无节点需要则 return nil
-    //    第三层 (handler Execute): filterNodes(StateCode) → 精确定位新节点
+    // ★ 设置 Operation 和 ScaleType 到 TemplateContext (供 Condition 求值)
+    // buildTemplateContext 从 BKECluster 提取静态字段, 不含操作类型
+    // Operation/ScaleType 是调用上下文信息, 由调用方显式设置 (KEP-18 §3.3)
+    execCtx.TemplateContext.Operation = "scale"
+    execCtx.TemplateContext.ScaleType = inferScaleType(oldCluster, newCluster) // "master" / "worker"
+
+    // 8. 执行 DAG — shouldExecuteByCondition 在 Scheduler 跳过链 (C) 层生效
+    //    Scheduler 跳过链 (executeBatchParallel, scheduler.go:160-183):
+    //      (A) shouldSkipComponent(node)         → DeclarativeUpgradeStatus.IsCompleted → Skip
+    //      (B) componentNeedsUpgrade(node)       → VersionContext.NeedsExecution:
+    //                                                集群级 Current==Target → Skip (certs, coredns 已安装)
+    //                                                节点级 Current=="" → NeedsExecution=true (bkeagent, containerd)
+    //      (C) shouldExecuteByCondition(node)    → EvaluateCondition(cv.Spec.Condition, tmpl) ★ KEP-18:
+    //                                                kubernetes-master: '{{ eq .ScaleType "master" }}'
+    //                                                  Master 扩容 → ScaleType="master" → "true" → 执行 ★
+    //                                                  Worker 扩容 → ScaleType="worker" → "false" → Skip ★
+    //                                                kubernetes-worker: '{{ eq .ScaleType "worker" }}'
+    //                                                  Worker 扩容 → ScaleType="worker" → "true" → 执行 ★
+    //                                                  Master 扩容 → ScaleType="master" → "false" → Skip ★
+    //                                                无 Condition 的组件 (bkeagent, containerd): 跳过此层, 执行
+    //      (D) executeComponent(node)            → 分发到 Inline/YAML/Helm Executor
+    //    第二层 (PhaseRunner.NeedExecute): StateCode 前置守卫, 无节点需要则 return nil
+    //    第三层 (handler Execute): StateCode 位标记过滤目标节点 (已有节点跳过, 新增节点执行)
     if err := sched.ExecuteDAG(ctx, execCtx, dag); err != nil {
         return false, ctrl.Result{}, fmt.Errorf("execute scale DAG: %w", err)
     }
@@ -2993,9 +1018,10 @@ func (r *BKEClusterReconciler) fillCurrentFromExistingNodes(
     upgrade.FillCurrentFromBundle(vc, currentBundle)
 
     // 3. 清除节点级组件的 Current (保持为空, 使三层机制生效)
-    //    第一层: Current=="" → NeedsExecution=true → 组件执行
-    //    第二层: NeedExecute(StateCode) → 有新节点位标记未设置 → true
-    //    第三层: filterNodes(StateCode) → 已有节点跳过, 新增节点执行
+    //    第一层 (B): Current=="" → NeedsExecution=true → 组件执行
+    //    第一层 (C): Condition 求值 (ScaleType="master"/"worker") → Master/Worker 组件选择性执行
+    //    第二层: NeedExecute(StateCode) → 前置守卫, 有节点需要则继续
+    //    第三层: Execute 内部 StateCode 位标记 → 精确过滤目标节点
     for _, name := range vc.TargetNames() {
         if isNodeScopedComponent(name) {
             vc.SetCurrent(name, "")
@@ -3134,7 +1160,7 @@ func (e *EnsureMasterInit) waitMasterJoin(nodesCount int, nodesToJoin bkenode.No
 }
 ```
 
-##### 扩容触发流程示例
+#### 扩容触发流程示例
 
 以 3 节点集群（master-1, worker-1, worker-2）扩容新增 master-2 为例：
 
@@ -3174,15 +1200,15 @@ PhaseFlow.CalculatePhase() 遍历 DeployPhases (11 个 Phase):
     → 已切换 → false → 跳过
 
 PhaseFlow.Execute() 按顺序执行:
-  1. EnsureBKEAgent → filterNodes(!NodeAgentPushedFlag) → 只操作 master-2
-     → 推送 bkeagent → 设置 master-2 的 NodeAgentPushedFlag|NodeAgentReadyFlag
-  2. EnsureNodesEnv → getNodesToInitEnv() → 只操作 master-2 (NodeEnvFlag 未设置)
-     → 安装 containerd/系统配置 → 设置 master-2 的 NodeEnvFlag
+  1. EnsureBKEAgent → GetNeedPushAgentNodesWithBKENodes() (filterNodes 模式) → 只操作 master-2
+      → 推送 bkeagent → 设置 master-2 的 NodeAgentPushedFlag|NodeAgentReadyFlag
+  2. EnsureNodesEnv → getNodesToInitEnv() (内联循环模式) → 只操作 master-2 (NodeEnvFlag 未设置)
+      → 安装 containerd/系统配置 → 设置 master-2 的 NodeEnvFlag
   3. EnsureMasterInit → getExistingMasterNodes() → master-1 已就绪 → 执行 join
-     → GetNeedJoinMasterNodesWithBKENodes() → master-2 未加入 → 执行 kubeadm join
-     → 设置 master-2 的 NodeBootFlag
+      → GetNeedJoinMasterNodesWithBKENodes() (filterNodes 模式) → master-2 未加入 → 执行 kubeadm join
+      → 设置 master-2 的 NodeBootFlag
   4. EnsureNodesPostProcess → 只操作 master-2
-     → 执行后置脚本 → 设置 master-2 的 NodePostProcessFlag
+      → 执行后置脚本 → 设置 master-2 的 NodePostProcessFlag
 ```
 
 **DAG 化路径（目标设计）**:
@@ -3194,45 +1220,56 @@ executeScaleDAG:
   1. fillCurrentFromExistingNodes 填充 VersionContext:
      集群级组件 (certs, coredns, ...): Current==Target → Skip
      节点级组件 (bkeagent, containerd, ...): Current=="" → Install
+  1a. 设置 Operation="scale", ScaleType="master" (Master 扩容) 到 TemplateContext
 
   2. Scheduler.ExecuteDAG:
 
-  第一层: Scheduler 组件级 Decision (VersionContext)
-    → shouldSkipComponent: 集群级 Current==Target → Skip (certs, coredns, kube-proxy)
-    → componentNeedsUpgrade: 节点级 Current=="" → NeedsExecution=true (bkeagent, containerd, ...)
+  第一层: Scheduler 组件级 Decision (VersionContext + Condition)
+    (A) shouldSkipComponent → 集群级 IsCompleted → false (扩容首次)
+    (B) componentNeedsUpgrade (VersionContext):
+        → 集群级 Current==Target → Skip (certs, coredns, kube-proxy)
+        → 节点级 Current=="" → NeedsExecution=true (bkeagent, containerd, kubernetes-master)
+    (C) shouldExecuteByCondition (KEP-18):
+        → bkeagent: 无 Condition → 跳过此层, 执行
+        → containerd: 无 Condition → 跳过此层, 执行
+        → kubernetes-master: Condition '{{ eq .ScaleType "master" }}'
+            ScaleType="master" → 求值 "true" → 执行 ★
+        → kubernetes-worker: Condition '{{ eq .ScaleType "worker" }}'
+            ScaleType="master" → 求值 "false" → Skip ★ (Worker 扩容时才执行)
+    (D) executeComponent → 分发到 Executor
 
-  第二层: PhaseRunner.NeedExecute (StateCode) — runner.go:40
+  第二层: PhaseRunner.NeedExecute 前置守卫 (StateCode) — runner.go:40
     → EnsureBKEAgent.NeedExecute()
       → HasNodesNeedingPhase(NodeAgentPushedFlag)
-      → master-2: NodeAgentPushedFlag 未设置 → true → 继续 Execute ★
+      → master-2: 未设置 → true → 继续 Execute
     → EnsureNodesEnv.NeedExecute()
       → HasNodesNeedingPhase(NodeEnvFlag)
-      → master-2: NodeEnvFlag 未设置 → true → 继续 Execute ★
+      → master-2: 未设置 → true → 继续 Execute
     → EnsureCerts.NeedExecute()
-      → 证书已存在 → false → return nil (跳过)
+      → 证书已存在 → false → return nil (跳过 Execute)
     → EnsureMasterInit.NeedExecute()
-      → 有新 Master → true → 继续 Execute ★
+      → 有新 Master → true → 继续 Execute
 
-  第三层: inline handler Execute 内部 filterNodes (StateCode)
-    Batch: EnsureBKEAgent.Execute()
-      → phaseutil.GetNeedPushAgentNodesWithBKENodes():
+  第三层: inline handler Execute 内部精确过滤 (StateCode)
+    EnsureBKEAgent.Execute()
+      → GetNeedPushAgentNodesWithBKENodes() (filterNodes 模式)
         predicate = !NodeAgentPushedFlag
-        master-1: NodeAgentPushedFlag 已设置 → 跳过
-        worker-1/2: NodeAgentPushedFlag 已设置 → 跳过
-        master-2: NodeAgentPushedFlag 未设置 → 执行推送 ★
+        master-1: 已设置 → 跳过
+        worker-1/2: 已设置 → 跳过
+        master-2: 未设置 → 执行推送 ★
       → 推送完成后设置 master-2 的 NodeAgentPushedFlag|NodeAgentReadyFlag
 
-    Batch: EnsureNodesEnv.Execute()
-      → getNodesToInitEnv():
-        predicate = !NodeEnvFlag && NodeAgentReadyFlag
+    EnsureNodesEnv.Execute()
+      → getNodesToInitEnv() (内联循环模式)
+        检查: !NodeEnvFlag && NodeAgentReadyFlag
         master-1: NodeEnvFlag 已设置 → 跳过
         worker-1/2: NodeEnvFlag 已设置 → 跳过
         master-2: NodeEnvFlag 未设置, NodeAgentReadyFlag 已设置 → 执行初始化 ★
       → 初始化完成后设置 master-2 的 NodeEnvFlag
 
-    Batch: EnsureMasterInit.Execute()
+    EnsureMasterInit.Execute()
       → getExistingMasterNodes(): master-1 已就绪 → 执行 join (非 init)
-      → phaseutil.GetNeedJoinMasterNodesWithBKENodes():
+      → GetNeedJoinMasterNodesWithBKENodes() (filterNodes 模式)
         predicate = !NodeBootFlag && !MasterInitFlag
         master-1: NodeBootFlag 已设置 → 跳过
         master-2: NodeBootFlag 未设置 → 执行 join ★
@@ -3240,9 +1277,9 @@ executeScaleDAG:
       → join 完成后设置 master-2 的 NodeBootFlag
 ```
 
-#### 9.4.4 集群删除/重置 DAG 化
+### 10.4 集群删除/重置 DAG 化
 
-##### 设计思路
+#### 设计思路
 
 删除/重置是指清理集群的所有组件。与安装的核心区别在于：安装是创建组件，删除是逆序卸载组件。
 
@@ -3252,27 +1289,117 @@ executeScaleDAG:
 ├─────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                 │
 │  Legacy PhaseFlow:                                                              │
-│    DeletePhases (独立的删除 Phase 列表)                                          │
-│      → 逆序执行删除操作                                                          │
-│    问题: 删除 Phase 列表硬编码，与安装 Phase 列表不对称                          │
-│          新增组件需同时维护安装和删除两套 Phase 列表                             │
+│    DeletePhases (仅 2 个 Phase):                                                 │
+│      1. EnsurePaused — 暂停集群操作                                              │
+│      2. EnsureDeleteOrReset — 单体删除逻辑 (含全部清理操作)                      │
+│                                                                                 │
+│    EnsureDeleteOrReset.Execute() 内部执行:                                       │
+│      handleClusterDeletion → 删除 CAPI Cluster (级联删除 Machine)                │
+│      handleBKEMachineDeletion → 等待 BKEMachine 删除完成                        │
+│      deleteRelatedResources → 删除 Secret/Command                               │
+│      ShutDownAgent → SSH 关闭节点上的 bkeagent                                  │
+│      cleanupClusterResources → 删除 BKENode/Event/finalizer                    │
+│      handleNamespaceDeletion → 删除命名空间                                      │
+│                                                                                 │
+│    问题: 全部清理逻辑耦合在一个 Phase 中, 无组件级卸载:                          │
+│    1. 无逆序卸载: 不区分组件类型 (inline/yaml/helm/binary), 不按依赖逆序卸载    │
+│    2. 无组件级清理: CAPI 级联删除 Machine, 但节点上的组件 (containerd/etcd)    │
+│       不被显式卸载 — 靠 Machine 销毁后 OS 上的组件残留                           │
+│    3. 无 helm 卸载: helm 组件 (如 coredns) 通过 CAPI Machine 删除间接清理,       │
+│       不执行 helm uninstall                                                      │
+│    4. 无 binary 卸载: binary 组件 (如 containerd/bkeagent) 不执行 UninstallScript │
+│       仅通过 ShutDownAgent 关闭 bkeagent 进程, containerd/etcd 等不清理          │
 │                                                                                 │
 │  DAG 化方案:                                                                     │
 │    构建卸载 DAG (安装 DAG 的逆序)，复用同一组件声明:                             │
 │    安装: bkeagent → nodes-env → certs → ... → agent-switch (正序)               │
 │    卸载: agent-switch → ... → certs → nodes-env → bkeagent (逆序)              │
 │                                                                                 │
+│  各组件类型的卸载方式:                                                           │
+│    inline: 调用 handler 的 Uninstall/Reset 逻辑 (如 kubeadm reset)             │
+│    yaml: YamlInstaller.DeleteComponent (kubectl delete 清单中所有资源)         │
+│    helm: HelmInstaller.Uninstall (helm uninstall 释放 Helm Release)            │
+│    binary: BinaryInstaller.Uninstall (SSH 执行 UninstallScript, 停止服务)      │
+│                                                                                 │
 │  核心设计:                                                                       │
 │  1. 逆序 DAG — 安装 DAG 反转依赖边，先卸载依赖组件，再卸载被依赖组件            │
 │  2. UninstallExecutor — 每种类型的执行器新增 Uninstall 方法                      │
-│     inline: 调用 handler 的 Uninstall/Reset 逻辑                                 │
-│     manifest: YamlInstaller.DeleteComponent (kubectl delete)                    │
 │  3. 非阻塞 — 卸载不阻塞 (某组件卸载失败不阻止后续组件卸载)                      │
+│  4. Legacy 共存 — DeletePhases 在 Phase 4 前仍可用, DAG 路径通过 Feature Gate 切换 │
 │                                                                                 │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-##### 代码实现
+#### Legacy DeletePhases 详细说明（当前代码）
+
+**DeletePhases 定义**（`list.go:81-84`）：
+
+```go
+DeletePhases = []func(ctx *phaseframe.PhaseContext) phaseframe.Phase{
+    NewEnsurePaused,           // 1. 集群管理暂停
+    NewEnsureDeleteOrReset,    // 2. 集群删除/重置
+}
+```
+
+**EnsureDeleteOrReset.Execute() 内部逻辑**（`ensure_delete_or_reset.go:73`）：
+
+```go
+func (e *EnsureDeleteOrReset) Execute() (ctrl.Result, error) {
+    // 1. 如果集群暂停, 先恢复并清除所有 Command
+    if e.Ctx.BKECluster.Spec.Pause { ... }
+
+    // 2. 轮询执行 reconcileDelete (超时 60 分钟)
+    err := wait.PollImmediateUntil(..., func() (bool, error) {
+        return e.reconcileDelete(ctx) == nil, nil
+    }, ctx.Done())
+}
+
+func (e *EnsureDeleteOrReset) reconcileDelete(ctx context.Context) error {
+    // 2a. 设置 ClusterStatus = ClusterDeleting
+    e.ensureClusterStatusDeleting(...)
+
+    // 2b. 删除 CAPI Cluster 对象 (级联删除所有 Machine)
+    //     → Machine 删除触发节点上的 kubeadm reset (CAPI Machine controller)
+    e.handleClusterDeletion(...)
+
+    // 2c. 等待所有 BKEMachine 删除完成
+    //     手动删除未 bootstrap 的 Machine, 移除 finalizer
+    e.handleBKEMachineDeletion(...)
+
+    // 2d. 删除关联资源: Secret, Command
+    e.deleteRelatedResources(...)
+
+    // 2e. SSH 关闭所有节点上的 bkeagent
+    //     发送 Shutdown 命令到 bkeagent (仅关闭进程, 不卸载)
+    e.ShutDownAgent(ctx)
+
+    // 2f. 清理集群资源: BKENode, Event, finalizer
+    e.cleanupClusterResources(...)
+
+    // 2g. 删除命名空间 (可选, 根据 annotation)
+    e.handleNamespaceDeletion(...)
+}
+```
+
+**Legacy DeletePhases 的卸载覆盖范围**：
+
+| 组件类型 | 卸载方式 | 覆盖情况 | 说明 |
+|---------|---------|---------|------|
+| **inline (kubeadm)** | CAPI Machine 删除触发 kubeadm reset | ✅ 间接 | Machine controller 在节点上执行 kubeadm reset |
+| **yaml (kube-proxy, coredns)** | CAPI Machine 删除 → 节点移除 → 资源孤立 | ❌ 不显式 | 不执行 kubectl delete, 依赖 Machine 销毁 |
+| **helm** | 不卸载 | ❌ 缺失 | 不执行 helm uninstall, Helm Release 残留 |
+| **binary (containerd, bkeagent)** | bkeagent 关闭进程 | ❌ 不完整 | 仅 ShutdownAgent 关闭 bkeagent; containerd/etcd 不卸载 |
+
+**Legacy 删除/重置的缺陷**：
+
+1. **无组件级卸载**：全部清理逻辑在 `reconcileDelete` 中，不按组件依赖逆序卸载
+2. **helm 组件不卸载**：coredns 等通过 helm 部署的组件不执行 `helm uninstall`
+3. **binary 组件不卸载**：containerd/bkeagent 等不执行 `UninstallScript`，仅关闭 bkeagent 进程
+4. **yaml 组件不显式删除**：不执行 `kubectl delete`，依赖 CAPI Machine 销毁后资源自然孤立
+
+#### DAG 化方案设计
+
+**1. 卸载 DAG 构建 — 安装 DAG 逆序**
 
 ```go
 // pkg/upgrade/bundle.go — 卸载 DAG 构建
@@ -3291,6 +1418,8 @@ func BuildUninstallDAGFromBundle(
     return dag.Reverse(), nil
 }
 ```
+
+**2. DAG 逆序实现**
 
 ```go
 // pkg/topology/component.go — DAG 逆序
@@ -3325,8 +1454,10 @@ func (d *UpgradeDAG) Reverse() *UpgradeDAG {
 }
 ```
 
+**3. 各组件类型的 Uninstall 方法**
+
 ```go
-// pkg/dagexec/executor.go — 新增 UninstallComponent 方法
+// pkg/dagexec/executor.go — ComponentExecutor 新增 UninstallComponent
 
 type ComponentExecutor interface {
     ExecuteComponent(ctx context.Context, node *topology.ComponentNode,
@@ -3336,21 +1467,62 @@ type ComponentExecutor interface {
     GetComponentType() ComponentType
 }
 
-// InlineComponentExecutor 新增 Uninstall
+// InlineComponentExecutor — inline 组件卸载 (kubeadm reset 等)
 func (e *InlineComponentExecutor) UninstallComponent(ctx context.Context,
     node *topology.ComponentNode, execCtx *ExecutionContext) error {
     // 调用 handler 的 Uninstall 逻辑 (如 kubeadm reset)
     return e.Runner.Uninstall(ctx, execCtx.Cluster, node.Inline.Handler, node.Inline.Version)
 }
 
-// YamlComponentExecutor 新增 Uninstall
+// YamlComponentExecutor — yaml 组件卸载 (kubectl delete)
 func (e *YamlComponentExecutor) UninstallComponent(ctx context.Context,
     node *topology.ComponentNode, execCtx *ExecutionContext) error {
-    // 删除 YAML 资源 (kubectl delete)
+    // 加载 manifest → 删除清单中所有资源
     pkg, _ := e.store.GetComponentManifests(ctx, node.Name, node.Version, execCtx.TemplateContext)
     return e.applier.DeleteComponent(ctx, pkg)
 }
+
+// HelmComponentExecutor — helm 组件卸载 (helm uninstall) ★ 新增
+func (e *HelmComponentExecutor) UninstallComponent(ctx context.Context,
+    node *topology.ComponentNode, execCtx *ExecutionContext) error {
+    // 加载 Helm Release 信息 → helm uninstall
+    releaseName := fmt.Sprintf("%s-%s", execCtx.TemplateContext.ClusterName, node.Name)
+    return e.helmClient.Uninstall(ctx, releaseName)
+}
+
+// BinaryComponentExecutor — binary 组件卸载 (SSH UninstallScript) ★ 新增
+func (e *BinaryComponentExecutor) UninstallComponent(ctx context.Context,
+    node *topology.ComponentNode, execCtx *ExecutionContext) error {
+    // 1. 获取 ComponentVersion
+    cv, err := e.cvStore.GetComponentVersion(ctx, node.Name, node.Version)
+
+    // 2. 获取全部节点 (binary 是 per-node 的)
+    allNodes, err := execCtx.NodeProvider.GetNodes(ctx, execCtx.Cluster)
+
+    // 3. 逐节点 SSH 执行 UninstallScript (停止服务 + 清理二进制/配置)
+    for _, targetNode := range allNodes {
+        if e.statusUpdater != nil {
+            e.statusUpdater.MarkPending(ctx, execCtx.Cluster, targetNode.IP, cv.Spec.Name)
+        }
+        opts := binaryinstaller.InstallOptions{
+            Component:   cv,
+            TemplateCtx: execCtx.TemplateContext,
+            Action:      binaryinstaller.BinaryActionUninstall, // ★ 卸载动作
+        }
+        if err := e.installer.Uninstall(ctx, opts); err != nil {
+            // 非阻塞: 记录失败, 继续卸载下一个节点
+            execCtx.Log.Warn("uninstall %s on %s failed: %v", node.Name, targetNode.IP, err)
+            continue
+        }
+        if e.statusUpdater != nil {
+            e.statusUpdater.MarkRemoved(ctx, execCtx.Cluster, targetNode.IP, cv.Spec.Name)
+        }
+    }
+    return nil
+}
 ```
+
+**4. 卸载 DAG 执行入口**
 
 ```go
 // controllers/capbke/bkecluster_controller.go — 删除/重置场景入口
@@ -3360,40 +1532,387 @@ func (r *BKEClusterReconciler) executeUninstallDAG(
     phaseCtx *phaseframe.PhaseContext,
     oldCluster, newCluster *bkev1beta1.BKECluster,
 ) error {
-    // 1. 解析当前 ReleaseImage bundle (卸载当前版本，不是目标版本)
+    // 1. 解析当前版本 ReleaseImage bundle (卸载当前安装的版本)
     bundle, err := r.resolveCurrentReleaseBundle(ctx, newCluster)
 
-    // 2. 构建卸载 DAG (逆序)
+    // 2. 构建卸载 DAG (安装 DAG 逆序)
     dag, err := upgrade.BuildUninstallDAGFromBundle(bundle, upgrade.BundleDependencyResolver(bundle))
 
-    // 3. 构建 Scheduler (非阻塞模式: 卸载失败不阻止后续)
+    // 3. 构建 ComponentFactory (注册卸载 handler)
+    factory := componentfactory.NewFactoryFromBundle(bundle)
+    factory.RegisterUninstallHandlers() // ★ 注册卸载 handler
+
+    // 4. 构建 Scheduler (非阻塞模式: 卸载失败不阻止后续)
     sched := dagexec.NewScheduler(dagexec.SchedulerConfig{
-        InlineRunner:       NewInlinePhaseRunnerAdapter(phaseCtx, &PhaseRunner{Factory: factory}),
-        ManifestStore:      manifest.NewBundleStore(bundle),
-        CVStore:            manifest.NewBundleStore(bundle),
-        MaxParallelPerBatch: 2, // 低并行度，避免同时清理过多节点
+        InlineRunner:    NewInlinePhaseRunnerAdapter(phaseCtx, &PhaseRunner{Factory: factory}),
+        ManifestStore:   manifest.NewBundleStore(bundle),
+        CVStore:         manifest.NewBundleStore(bundle),
+        MaxParallelPerBatch: 2,    // 低并行度
         DefaultFailurePolicy: "Continue", // ★ 卸载失败不阻塞 (与安装的 FailFast 不同)
     })
 
-    // 4. 标记为卸载模式
-    execCtx := buildExecutionContext(ctx, r.Client, newCluster, vc)
-    execCtx.UninstallMode = true  // ★ 执行器检查此标记，调用 Uninstall 而非 Execute
+    // 5. 构建 ExecutionContext
+    execCtx := buildExecutionContext(phaseCtx, oldCluster, newCluster, bkeLogger, nil)
+    execCtx.TemplateContext.Operation = "rollback" // ★ 供 Condition 求值
+    execCtx.UninstallMode = true                   // ★ 执行器检查此标记, 调用 Uninstall 而非 Execute
 
-    // 5. 执行卸载 DAG
+    // 6. 执行卸载 DAG (逆序)
     //    Batch 1: agent-switch → 停止 Agent 监听
-    //    Batch 2: kube-proxy/coredns → 删除 addon
+    //    Batch 2: kube-proxy/coredns → kubectl delete / helm uninstall
     //    Batch 3: kubernetes-worker → kubeadm reset (worker)
     //    Batch 4: kubernetes-master → kubeadm reset (master)
     //    Batch 5: load-balance → 删除 HA
     //    Batch 6: certs → 删除证书
-    //    Batch 7: bkeagent → 停止并删除 Agent
+    //    Batch 7: containerd → SSH UninstallScript (停止服务 + 清理二进制)
+    //    Batch 8: bkeagent → SSH Shutdown (关闭进程)
+    if err := sched.ExecuteDAG(ctx, execCtx, dag); err != nil {
+        // 非阻塞: 记录错误但不返回 (继续清理管理集群资源)
+        bkeLogger.Warn("uninstall DAG completed with errors: %v", err)
+    }
+
+    // 7. 清理管理集群资源 (复用 Legacy DeletePhases 的管理集群清理逻辑)
+    r.cleanupManagementClusterResources(ctx, newCluster, bkeLogger)
+    // → 删除 BKENode / Secret / Command / Event / finalizer / namespace
+    //   (这些是管理集群上的 CR, 不在卸载 DAG 范围内)
+
+    return nil
+}
+```
+
+**5. 卸载 DAG 各组件类型的卸载覆盖范围**
+
+| 组件类型 | DAG 化卸载方式 | Legacy 覆盖 | 改进 |
+|---------|---------------|------------|------|
+| **inline** | handler Uninstall (kubeadm reset) | ✅ CAPI 间接 | ★ 显式 kubeadm reset, 不依赖 CAPI |
+| **yaml** | kubectl delete 清单资源 | ❌ 缺失 | ★ 新增: 显式删除 YAML 资源 |
+| **helm** | helm uninstall 释放 Release | ❌ 缺失 | ★ 新增: 显式卸载 Helm Release |
+| **binary** | SSH UninstallScript | ❌ 不完整 | ★ 新增: 停止服务 + 清理二进制/配置 |
+
+**6. 卸载 DAG 与 Legacy DeletePhases 的共存设计**
+
+| 维度 | Legacy DeletePhases | DAG 化卸载 |
+|------|--------------------|-----------| 
+| Feature Gate | OFF (默认) | ON |
+| 执行入口 | `determinePhasesFuncs()` → `DeletePhases` | `executeUninstallDAG()` |
+| 组件级卸载 | ❌ 单体 `reconcileDelete` | ✅ 逆序 DAG 逐组件卸载 |
+| helm 卸载 | ❌ | ✅ `helm uninstall` |
+| binary 卸载 | ❌ 仅 ShutdownAgent | ✅ SSH `UninstallScript` |
+| yaml 删除 | ❌ 依赖 CAPI 级联 | ✅ `kubectl delete` |
+| 管理集群清理 | ✅ 在 `reconcileDelete` 中 | ✅ 在 `cleanupManagementClusterResources` 中 (复用) |
+| 失败策略 | 阻塞 (轮询重试) | 非阻塞 (`Continue`) |
+
+> **设计原则**：卸载 DAG 处理**目标集群上的组件卸载**（inline/yaml/helm/binary），管理集群资源的清理（BKENode/Secret/Command/Event/finalizer/namespace）复用 Legacy `reconcileDelete` 中的逻辑，通过 `cleanupManagementClusterResources` 单独调用。两者分离，职责清晰。
+
+#### EnsureDeleteOrReset 注册为 inline 组件
+
+Legacy `EnsureDeleteOrReset` 的 `reconcileDelete` 逻辑中，除了目标集群组件卸载外，还包含**管理集群资源清理**（删除 CAPI Cluster、BKEMachine、Secret、Command、BKENode、Event、finalizer、namespace）。将这部分管理集群清理逻辑封装为 inline 组件 `delete-cluster-resources`，作为卸载 DAG 的**最后一个组件**执行。
+
+**设计思路**：
+
+```txt
+卸载 DAG 拓扑 (逆序 + 管理集群清理):
+
+  Batch 1: [agent-switch]           → 停止 Agent 监听
+  Batch 2: [kube-proxy, coredns]    → helm uninstall / kubectl delete
+  Batch 3: [kubernetes-worker]      → kubeadm reset (worker)
+  Batch 4: [kubernetes-master]      → kubeadm reset (master)
+  Batch 5: [load-balance]           → 删除 HA
+  Batch 6: [certs]                 → 删除证书
+  Batch 7: [containerd]            → SSH UninstallScript
+  Batch 8: [bkeagent]              → SSH Shutdown
+  Batch 9: [delete-cluster-resources] ★ 新增 inline 组件
+           → 管理集群资源清理 (复用 Legacy reconcileDelete 逻辑)
+           → 删除 CAPI Cluster / BKEMachine / Secret / Command
+           → 删除 BKENode / Event / finalizer / namespace
+```
+
+`delete-cluster-resources` 作为卸载 DAG 的依赖终点——所有目标集群组件卸载完成后，最后执行管理集群资源清理。
+
+**ReleaseImage 声明**：
+
+```yaml
+# ReleaseImage install.components 新增 delete-cluster-resources 组件
+install:
+  components:
+    - name: delete-cluster-resources
+      version: v1.0.0
+      inline:
+        handler: EnsureDeleteOrReset
+        version: v1.0.0
+```
+
+**ComponentVersion 定义**：
+
+```yaml
+apiVersion: config.openfuyao.cn/v1alpha1
+kind: ComponentVersion
+metadata:
+  name: delete-cluster-resources-v1.0.0
+spec:
+  name: delete-cluster-resources
+  type: inline
+  version: "v1.0.0"
+  inline:
+    handler: EnsureDeleteOrReset
+    version: "v1.0.0"
+  # ★ 仅删除/重置场景执行 (KEP-18 Condition 过滤)
+  condition: '{{ eq .Operation "rollback" }}'
+  # 依赖所有其他组件 (作为 DAG 的依赖终点)
+  dependencies:
+    - name: bkeagent
+    - name: containerd
+    - name: kubernetes-master
+    - name: kubernetes-worker
+    - name: certs
+    - name: agent-switch
+```
+
+**DeclarativeInstallCatalog 注册**：
+
+```go
+// DeclarativeInstallCatalog 新增
+{ Name: "delete-cluster-resources", Mode: ExecutionInline,
+  InlineHandler: "EnsureDeleteOrReset", LegacyPhase: "EnsureDeleteOrReset" },
+```
+
+**handler 注册**：
+
+```go
+// pkg/componentfactory/registry.go — registerInlineHandler 新增
+case "EnsureDeleteOrReset":
+    f.Register(handler, version, phases.NewEnsureDeleteOrReset)
+```
+
+**EnsureDeleteOrReset 改造为 inline handler**：
+
+```go
+// pkg/phaseframe/phases/ensure_delete_or_reset.go — 改造为 inline handler
+
+type EnsureDeleteOrReset struct {
+    phaseframe.BasePhase
+}
+
+func (e *EnsureDeleteOrReset) Execute() (ctrl.Result, error) {
+    baseCtx := context.Background()
+    _, c, bkeCluster, _, log := e.Ctx.Untie()
+
+    // 复用现有 reconcileDelete 中的管理集群清理逻辑
+    // ★ 删除目标集群组件的逻辑已由卸载 DAG 的前序组件完成 (yaml/helm/binary/inline uninstall)
+    // ★ 此 handler 仅处理管理集群资源清理
+
+    // 1. 删除 CAPI Cluster (级联删除 Machine)
+    if err := e.handleClusterDeletion(baseCtx, c, log); err != nil {
+        return ctrl.Result{}, err
+    }
+
+    // 2. 等待 BKEMachine 删除完成
+    if err := e.handleBKEMachineDeletion(baseCtx, c, bkeCluster, log); err != nil {
+        return ctrl.Result{}, err
+    }
+
+    // 3. 删除关联资源: Secret, Command
+    e.deleteRelatedResources(baseCtx, c, bkeCluster, log)
+
+    // 4. 删除 BKENode / Event / finalizer
+    if err := e.cleanupClusterResources(baseCtx, c, bkeCluster, log); err != nil {
+        return ctrl.Result{}, err
+    }
+
+    // 5. 删除命名空间 (可选)
+    if err := e.handleNamespaceDeletion(baseCtx, c, bkeCluster, log); err != nil {
+        return ctrl.Result{}, err
+    }
+
+    log.Info("cluster resources cleanup completed")
+    return ctrl.Result{}, nil
+}
+
+// NeedExecute — 仅删除/重置场景执行
+// (Condition '{{ eq .Operation "rollback" }}' 已在 Scheduler 层过滤,
+//  此处 NeedExecute 作为第二层守卫, 检查 DeletionTimestamp / Spec.Reset)
+func (e *EnsureDeleteOrReset) NeedExecute(_ *bkev1beta1.BKECluster, new *bkev1beta1.BKECluster) bool {
+    if !new.DeletionTimestamp.IsZero() || new.Spec.Reset {
+        e.SetStatus(bkev1beta1.PhaseWaiting)
+        return true
+    }
+    return false
+}
+```
+
+**改造前后对比**：
+
+| 维度 | Legacy EnsureDeleteOrReset | inline 组件 delete-cluster-resources |
+|------|---------------------------|--------------------------------------|
+| 执行位置 | DeletePhases (PhaseFlow) | 卸载 DAG 最后一个 Batch |
+| 目标集群组件卸载 | ❌ 不卸载 (依赖 CAPI 级联) | ✅ 由前序 DAG 组件完成 (yaml/helm/binary/inline) |
+| 管理集群资源清理 | ✅ 在 `reconcileDelete` 中 | ✅ 复用相同逻辑 (`handleClusterDeletion` / `handleBKEMachineDeletion` / ...) |
+| 触发条件 | `DeletionTimestamp` / `Spec.Reset` | `Condition: '{{ eq .Operation "rollback" }}'` + `NeedExecute(DeletionTimestamp)` |
+| 执行顺序 | 独立 PhaseFlow (无依赖) | DAG 依赖终点 (所有组件卸载后执行) |
+| 失败策略 | 阻塞 (轮询重试 60 分钟) | 非阻塞 (`Continue`) + PhaseRunner NeedExecute 重入 |
+
+> **设计优势**：将 Legacy `EnsureDeleteOrReset` 从单体 Phase 拆解为卸载 DAG 的 inline 组件，管理集群清理逻辑作为 DAG 的依赖终点执行，确保目标集群组件先卸载、管理集群资源后清理，执行顺序由 DAG 拓扑保证而非硬编码。
+
+#### EnsureDeleteOrReset 原样注册为 inline 组件（最小迁移方案）
+
+上述"完整逆序 DAG"方案和"EnsureDeleteOrReset 注册为 inline 组件"方案都对 `EnsureDeleteOrReset` 进行了拆解改造。本方案是**最小改动迁移方案**——`EnsureDeleteOrReset` 的 `reconcileDelete` 全部逻辑保持不变，直接注册为 inline 组件，DAG 仅含一个节点。
+
+**设计思路**：
+
+```txt
+最小迁移方案 DAG 拓扑 (单节点):
+
+  Batch 1: [delete-cluster-resources]  ← 唯一节点, 复用 EnsureDeleteOrReset 全部逻辑
+             → handleClusterDeletion (删除 CAPI Cluster, 级联删除 Machine)
+             → handleBKEMachineDeletion (等待 BKEMachine 删除)
+             → deleteRelatedResources (删除 Secret/Command)
+             → ShutDownAgent (SSH 关闭 bkeagent)
+             → cleanupClusterResources (删除 BKENode/Event/finalizer)
+             → handleNamespaceDeletion (删除命名空间)
+
+  ★ 与 Legacy DeletePhases 行为完全一致
+  ★ 仅执行入口从 PhaseFlow 切换到 DAG (executeUninstallDAG)
+  ★ EnsureDeleteOrReset.Execute() / reconcileDelete() 代码零改动
+```
+
+**与现有两个方案的区别**：
+
+| 维度 | 方案 A: 完整逆序 DAG | 方案 B: 拆解为 inline 组件 | 方案 C: 原样注册 ★ |
+|------|---------------------|--------------------------|-------------------|
+| DAG 节点数 | 全部组件 (8+ 节点) | 全部组件 + delete-cluster-resources (9 节点) | 仅 1 个节点 (代码硬编码) |
+| EnsureDeleteOrReset 改造 | 裁剪为仅管理集群清理 | 裁剪为仅管理集群清理 | **零改动** |
+| 依赖 ReleaseImage | ✅ 需要 (构建逆序 DAG) | ✅ 需要 (构建逆序 DAG) | **❌ 不依赖** (代码硬编码 DAG) |
+| 目标集群组件卸载 | 逐组件 Uninstall (yaml/helm/binary/inline) | 逐组件 Uninstall + 管理集群清理 | 不卸载 (依赖 CAPI 级联, 同 Legacy) |
+| helm 卸载 | ✅ helm uninstall | ✅ helm uninstall | ❌ (同 Legacy, 不卸载) |
+| binary 卸载 | ✅ SSH UninstallScript | ✅ SSH UninstallScript | ❌ (同 Legacy, 仅 ShutdownAgent) |
+| 与 Legacy 行为一致性 | ❌ 增强 (新增卸载) | ❌ 增强 (新增卸载) | ✅ **完全一致** |
+| 迁移风险 | 高 (新增 Uninstall 逻辑) | 高 (拆解 + 新增 Uninstall) | **低** (零代码改动) |
+| 适用阶段 | Phase 4 (全量 DAG) | Phase 4 (全量 DAG) | **Phase 2-3 (灰度迁移)** |
+
+**适用场景**：Phase 2-3 灰度阶段，删除场景最先迁移到 DAG 路径（风险最低），通过 Feature Gate 切换执行入口。Phase 4 再升级为完整逆序 DAG（方案 A/B），实现组件级卸载。
+
+> **设计原则**：`delete-cluster-resources` 不注册到 ReleaseImage `install.components` 中，直接在代码中硬编码构建单节点 DAG。原因：删除/重置是基础设施操作，不属于 ReleaseImage 声明的安装组件；`EnsureDeleteOrReset` 的 `reconcileDelete` 逻辑与集群版本无关，不需要随 ReleaseImage 版本变化。
+
+**handler 注册**：
+
+```go
+// pkg/componentfactory/registry.go — registerInlineHandler 新增
+case "EnsureDeleteOrReset":
+    f.Register(handler, version, phases.NewEnsureDeleteOrReset)
+```
+
+**EnsureDeleteOrReset 零改动**：
+
+```go
+// pkg/phaseframe/phases/ensure_delete_or_reset.go — 现有代码, 不修改
+
+func (e *EnsureDeleteOrReset) Execute() (ctrl.Result, error) {
+    baseCtx := context.Background()
+    _, c, bkeCluster, _, log := e.Ctx.Untie()
+
+    // 1. 如果集群暂停, 先恢复并清除所有 Command (现有逻辑, 不变)
+    if e.Ctx.BKECluster.Spec.Pause { ... }
+
+    // 2. 轮询执行 reconcileDelete (超时 60 分钟) (现有逻辑, 不变)
+    err := wait.PollImmediateUntil(..., func() (bool, error) {
+        return e.reconcileDelete(ctx) == nil, nil
+    }, ctx.Done())
+}
+
+func (e *EnsureDeleteOrReset) reconcileDelete(ctx context.Context) error {
+    // ★ 全部逻辑保持不变:
+    e.ensureClusterStatusDeleting(...)   // 设置 ClusterStatus = ClusterDeleting
+    e.handleClusterDeletion(...)         // 删除 CAPI Cluster (级联删除 Machine)
+    e.handleBKEMachineDeletion(...)      // 等待 BKEMachine 删除完成
+    e.deleteRelatedResources(...)        // 删除 Secret/Command
+    e.ShutDownAgent(ctx)                 // SSH 关闭 bkeagent
+    e.cleanupClusterResources(...)       // 删除 BKENode/Event/finalizer
+    e.handleNamespaceDeletion(...)       // 删除命名空间
+}
+
+// NeedExecute — 现有代码, 不修改
+// (Condition '{{ eq .Operation "rollback" }}' 已在 Scheduler 层过滤,
+//  此处 NeedExecute 作为第二层守卫, 检查 DeletionTimestamp / Spec.Reset)
+func (e *EnsureDeleteOrReset) NeedExecute(_ *bkev1beta1.BKECluster, new *bkev1beta1.BKECluster) bool {
+    if !new.DeletionTimestamp.IsZero() || new.Spec.Reset {
+        e.SetStatus(bkev1beta1.PhaseWaiting)
+        return true
+    }
+    return false
+}
+```
+
+**executeUninstallDAG 实现（代码中硬编码单节点 DAG）**：
+
+```go
+// controllers/capbke/bkecluster_controller.go — 删除/重置场景入口 (最小迁移方案)
+
+func (r *BKEClusterReconciler) executeUninstallDAG(
+    ctx context.Context,
+    phaseCtx *phaseframe.PhaseContext,
+    oldCluster, newCluster *bkev1beta1.BKECluster,
+) error {
+    // 1. 直接在代码中构建单节点 DAG (不依赖 ReleaseImage)
+    //    ★ delete-cluster-resources 不注册到 install.components
+    //    ★ EnsureDeleteOrReset 的 reconcileDelete 逻辑与集群版本无关
+    dag := topology.NewUpgradeDAG()
+    dag.AddNode(&topology.ComponentNode{
+        Name:          "delete-cluster-resources",
+        Version:       "v1.0.0",
+        FailurePolicy: topology.FailurePolicyFailFast,
+        Inline: &topology.InlineRef{
+            Handler: "EnsureDeleteOrReset",
+            Version: "v1.0.0",
+        },
+    })
+
+    // 2. 构建 ComponentFactory (注册 EnsureDeleteOrReset handler)
+    factory := componentfactory.NewComponentFactory()
+    factory.Register("EnsureDeleteOrReset", "v1.0.0", phases.NewEnsureDeleteOrReset)
+
+    // 3. 构建 Scheduler
+    sched := dagexec.NewScheduler(dagexec.SchedulerConfig{
+        InlineRunner:    NewInlinePhaseRunnerAdapter(phaseCtx, &PhaseRunner{Factory: factory}),
+        CVStore:         factory, // handler 从 ComponentFactory 解析
+        MaxParallelPerBatch: 1, // 单节点, 无需并行
+    })
+
+    // 4. 构建 ExecutionContext
+    execCtx := buildExecutionContext(phaseCtx, oldCluster, newCluster, bkeLogger, nil)
+    execCtx.TemplateContext.Operation = "rollback" // ★ 供 Condition 求值
+
+    // 5. 执行 DAG (单节点)
+    //    Batch 1: delete-cluster-resources
+    //      → EnsureDeleteOrReset.Execute()
+    //      → reconcileDelete() 全部逻辑 (与 Legacy 完全一致)
     return sched.ExecuteDAG(ctx, execCtx, dag)
 }
 ```
 
-#### 9.4.5 DryRun 模式 DAG 化
+> **为什么不依赖 ReleaseImage**：
+> 1. **与集群版本无关**：`EnsureDeleteOrReset` 的 `reconcileDelete` 逻辑是基础设施操作（删除 CAPI 对象、清理 CR、关闭 Agent），不随集群版本变化，不需要随 ReleaseImage 版本演进
+> 2. **避免 ReleaseImage 污染**：`install.components` 语义是"安装到目标集群的组件"，`delete-cluster-resources` 是管理集群清理操作，不属于安装语义
+> 3. **减少外部依赖**：不依赖 ReleaseImage bundle 解析，删除场景不需要 ReleaseImage 就绪即可执行（与 Legacy DeletePhases 行为一致——DeletePhases 不消费 ReleaseImage）
 
-##### 设计思路
+**与 Legacy DeletePhases 的能力一致性验证**：
+
+| `reconcileDelete` 步骤 | Legacy DeletePhases | 方案 C: DAG inline 组件 | 一致性 |
+|------------------------|--------------------|-----------------------|--------|
+| `ensureClusterStatusDeleting` | ✅ 在 `reconcileDelete` 中 | ✅ 在 `reconcileDelete` 中 (零改动) | ✅ 一致 |
+| `handleClusterDeletion` | ✅ 删除 CAPI Cluster | ✅ 同上 | ✅ 一致 |
+| `handleBKEMachineDeletion` | ✅ 等待 BKEMachine 删除 | ✅ 同上 | ✅ 一致 |
+| `deleteRelatedResources` | ✅ 删除 Secret/Command | ✅ 同上 | ✅ 一致 |
+| `ShutDownAgent` | ✅ SSH 关闭 bkeagent | ✅ 同上 | ✅ 一致 |
+| `cleanupClusterResources` | ✅ 删除 BKENode/Event/finalizer | ✅ 同上 | ✅ 一致 |
+| `handleNamespaceDeletion` | ✅ 删除命名空间 | ✅ 同上 | ✅ 一致 |
+| 暂停恢复 (Spec.Pause) | ✅ Execute() 入口检查 | ✅ 同上 (零改动) | ✅ 一致 |
+| 超时重试 (60 分钟轮询) | ✅ `wait.PollImmediateUntil` | ✅ 同上 | ✅ 一致 |
+| 触发条件 | `DeletionTimestamp` / `Spec.Reset` | `Condition` + `NeedExecute(DeletionTimestamp)` | ✅ 一致 (双守卫) |
+
+> **设计优势**：零代码改动，`EnsureDeleteOrReset` 的 `reconcileDelete` 全部逻辑原样复用。迁移仅涉及执行入口切换（PhaseFlow → DAG），行为与 Legacy 完全一致，风险最低。适合 Phase 2-3 灰度阶段先行迁移删除场景，Phase 4 再升级为完整逆序 DAG（方案 A/B）。
+
+### 10.5 DryRun 模式 DAG 化
+
+#### 设计思路
 
 DryRun 是指仅模拟执行，不实际修改集群。DAG 化后 DryRun 照常构建和遍历 DAG，但各执行器检查 `DryRun` 标记后仅打印不执行。
 
@@ -3420,7 +1939,7 @@ DryRun 是指仅模拟执行，不实际修改集群。DAG 化后 DryRun 照常�
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-##### 代码实现
+#### 代码实现
 
 ```go
 // pkg/dagexec/execution_context.go — 新增 DryRun 字段
@@ -3428,14 +1947,7 @@ DryRun 是指仅模拟执行，不实际修改集群。DAG 化后 DryRun 照常�
 type ExecutionContext struct {
     // ... 现有字段 ...
     DryRun       bool   // 🆕新增: DryRun 模式标记
-    UninstallMode bool  // 🆕新增: 卸载模式标记 (§9.4.4)
-}
-
-// DryRunOption 函数式选项
-func WithDryRun() func(*ExecutionContext) {
-    return func(ec *ExecutionContext) {
-        ec.DryRun = true
-    }
+    UninstallMode bool  // 🆕新增: 卸载模式标记 (§10.4)
 }
 ```
 
@@ -3469,21 +1981,31 @@ func (s *Scheduler) executeComponent(
 ```go
 // controllers/capbke/bkecluster_controller.go — DryRun 场景入口
 
+// executeDryRunDAG 与 executeInstallDAG 逻辑相同，仅设置 DryRun 标记
+// ★ executeInstallDAG 不需要新增 DryRun 参数，DryRun 标记在 ExecutionContext 上设置
 func (r *BKEClusterReconciler) executeDryRunDAG(
     ctx context.Context,
     phaseCtx *phaseframe.PhaseContext,
     oldCluster, newCluster *bkev1beta1.BKECluster,
 ) error {
-    // 与正常安装 DAG 相同，仅设置 DryRun 标记
-    return r.executeInstallDAG(ctx, phaseCtx, oldCluster, newCluster,
-        dagexec.WithDryRun(),
-    )
+    // 1-6. 与 executeInstallDAG 完全相同 (解析 bundle / 构建 VC / 构建 DAG / 注册 handler / 构建 Scheduler)
+    // ...
+
+    // 7. 构建 ExecutionContext
+    execCtx := buildExecutionContext(phaseCtx, oldCluster, newCluster, bkeLogger, targetClient)
+    execCtx.TemplateContext.Operation = "install"
+
+    // ★ 唯一区别: 设置 DryRun 标记
+    execCtx.DryRun = true
+
+    // 8. 执行 DAG — 各执行器检查 DryRun 标记后仅打印不执行
+    return sched.ExecuteDAG(ctx, execCtx, dag)
 }
 ```
 
-#### 9.4.6 集群暂停 DAG 化
+### 10.6 集群暂停 DAG 化
 
-##### 设计思路
+#### 设计思路
 
 暂停是指临时停止对集群的所有操作。暂停不需要 DAG 化 — 它的语义是"不执行任何操作"，DAG 和 PhaseFlow 都需要跳过。
 
@@ -3506,7 +2028,7 @@ func (r *BKEClusterReconciler) executeDryRunDAG(
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-##### 代码实现
+#### 代码实现
 
 ```go
 // controllers/capbke/bkecluster_controller.go — 暂停前置检查
@@ -3531,7 +2053,7 @@ func (r *BKEClusterReconciler) reconcileCluster(
 }
 ```
 
-#### 9.4.7 移除后的执行入口
+### 10.7 移除后的执行入口
 
 完全移除 Legacy PhaseFlow 后，执行入口简化为场景分发 (无 PhaseFlow 回退)：
 
@@ -3561,7 +2083,7 @@ func (r *BKEClusterReconciler) reconcileCluster(
 
     // 3. DryRun → 安装 DAG (仅打印不执行)
     case isDryRun(newCluster):
-        return ctrl.Result{}, r.executeInstallDAG(ctx, phaseCtx, oldCluster, newCluster, WithDryRun())
+        return ctrl.Result{}, r.executeDryRunDAG(ctx, phaseCtx, oldCluster, newCluster)
 
     // 4. 扩容 → 安装 DAG (VersionContext 自动过滤已有节点)
     case isScale(oldCluster, newCluster):
@@ -3592,687 +2114,5 @@ func (r *BKEClusterReconciler) reconcileCluster(
 | 5 | 升级 | `upgrade-ready` annotation | 升级 DAG | — |
 | 6 | 安装 | 默认 | 安装 DAG | 兜底 |
 
-### 9.5 平滑升级方案
 
-Legacy PhaseFlow 的完全移除不能一蹴而就，需要分阶段平滑过渡，确保生产环境零中断。
 
-#### 9.5.1 平滑升级核心原则
-
-| 原则 | 说明 |
-|------|------|
-| **双路径并存** | PhaseFlow 和 DAG 安装路径同时存在，通过 Feature Gate 切换 |
-| **逐组件迁移** | 不是一个 openFuyao 版本迁移所有组件，而是逐步将 DeployPhase 迁移到 DAG |
-| **灰度验证** | 先在测试环境验证，再灰度到生产环境 |
-| **回退能力** | DAG 路径出现问题时，可通过关闭 Feature Gate 回退到 PhaseFlow |
-| **版本对齐** | 每个迁移阶段对齐一个 openFuyao 版本，不在运行中切换 |
-
-#### 9.5.2 平滑升级分阶段计划
-
-```
-openFuyao v2.7.0  ──────  openFuyao v2.8.0  ──────  openFuyao v2.9.0  ──────  openFuyao v3.0.0
-     │                        │                        │                        │
-     ├─ Phase 1: 结构扩展     │                        │                        │
-     │  扩展 ReleaseImage     │                        │                        │
-     │  InstallComponent      │                        │                        │
-     │  新增 inline 字段      │                        │                        │
-     │  (不改变执行路径)       │                        │                        │
-     │                        │                        │                        │
-     │  Feature Gate: OFF     │                        │                        │
-     │                        │                        │                        │
-     │                        ├─ Phase 2: 部分 DAG     │                        │
-     │                        │  迁移低风险组件:        │                        │
-     │                        │  bkeagent/nodes-env/    │                        │
-     │                        │  certs/load-balance    │                        │
-     │                        │  PhaseFlow 处理剩余    │                        │
-     │                        │                        │                        │
-     │                        │  Feature Gate: 灰度    │                        │
-     │                        │                        │                        │
-     │                        │                        ├─ Phase 3: 全量 DAG     │
-     │                        │                        │  迁移高风险组件:        │
-     │                        │                        │  kubernetes-master/    │
-     │                        │                        │  kubernetes-worker/    │
-     │                        │                        │  agent-switch          │
-     │                        │                        │  DAG 处理所有安装       │
-     │                        │                        │                        │
-     │                        │                        │  Feature Gate: ON     │
-     │                        │                        │                        │
-     │                        │                        │                        ├─ Phase 4: 移除 Legacy
-     │                        │                        │                        │  纳管/扩容/删除 DAG化
-     │                        │                        │                        │  移除 PhaseFlow 代码
-     │                        │                        │                        │
-     │                        │                        │                        │  Feature Gate: 移除
-```
-
-#### 9.5.3 Phase 1: 结构扩展（v2.7.0）
-
-**目标**：扩展 CRD 结构，不改变任何执行路径。
-
-| 任务 | 说明 |
-|------|------|
-| 扩展 `ReleaseImageComponent` | 新增 `inline` 字段（omitempty，向后兼容） |
-| 定义 `DeclarativeInstallCatalog` | 静态映射表，不被执行路径消费 |
-| 定义 `InstallComponentSpec` | 类型定义，不接入 Scheduler |
-| 编写安装组件 ComponentVersion | 为所有安装组件编写 `spec.dependencies` |
-| 补充 ReleaseImage | v2.7.0 ReleaseImage 的 install.components 补充 inline 字段 |
-
-**风险控制**：不改变任何执行逻辑，仅扩展数据结构，零风险。
-
-#### 9.5.4 Phase 2: 部分 DAG 灰度（v2.8.0）
-
-**目标**：将低风险安装组件迁移到 DAG 路径，高风险组件仍走 PhaseFlow。
-
-**迁移顺序**（按风险从低到高）：
-
-| 批次 | 组件 | 迁移理由 | PhaseFlow 是否保留 |
-|------|------|---------|-------------------|
-| 1 | bkeagent | 逻辑简单（SSH 推送），无集群依赖 | 保留（回退） |
-| 2 | nodes-env | 逻辑简单（环境准备），无集群依赖 | 保留（回退） |
-| 3 | certs | 逻辑独立（证书生成），无集群依赖 | 保留（回退） |
-| 4 | load-balance | HA 组件，依赖 certs | 保留（回退） |
-
-**混合执行模式**：
-
-```go
-func (r *BKEClusterReconciler) executePhaseFlow(ctx, phaseCtx, oldCluster, newCluster) {
-    if r.shouldUseDeclarativeInstall(newCluster) {
-        // Phase 2: 仅执行已迁移组件的 DAG
-        r.executePartialInstallDAG(ctx, phaseCtx, oldCluster, newCluster,
-            // 已迁移组件列表
-            []string{"bkeagent", "nodes-env", "certs", "load-balance"},
-        )
-        // 未迁移组件仍走 PhaseFlow
-        flow := phases.NewPhaseFlow(phaseCtx, 
-            phases.WithSkipPhases("EnsureBKEAgent", "EnsureNodesEnv", "EnsureCerts", "EnsureLoadBalance"),
-        )
-        flow.CalculatePhase(oldCluster, newCluster)
-        flow.Execute()
-        return
-    }
-    // Legacy: 全部走 PhaseFlow
-    flow := phases.NewPhaseFlow(phaseCtx)
-    ...
-}
-```
-
-**灰度策略**：
-- Feature Gate `DeclarativeInstallEnabled` 默认 OFF
-- 测试环境开启 Feature Gate，验证 DAG + PhaseFlow 混合模式
-- 生产环境灰度：先在非核心集群开启，观察 1-2 周后扩大范围
-- 回退方案：关闭 Feature Gate，立即回退到全 PhaseFlow
-
-#### 9.5.5 Phase 3: 全量 DAG（v2.9.0）
-
-**目标**：所有安装组件迁移到 DAG 路径，PhaseFlow 不再执行任何安装 Phase。
-
-**迁移高风险组件**：
-
-| 批次 | 组件 | 风险点 | 迁移措施 |
-|------|------|--------|---------|
-| 5 | kubernetes-master | kubeadm init 逻辑复杂 | 确保 `EnsureMasterInit` handler 完整覆盖 init + join |
-| 6 | kubernetes-worker | kubeadm join + drain 逻辑 | 确保 `EnsureWorkerJoin` handler 完整 |
-| 7 | kube-proxy/coredns | manifest 应用 | 复用升级路径的 YamlInstaller |
-| 8 | agent-switch | Agent 监听切换 | 确保 `EnsureAgentSwitch` handler 幂等 |
-| 9 | nodes-postprocess | 后置脚本 | 确保 `EnsureNodesPostProcess` handler 幂等 |
-
-**执行入口**：
-
-```go
-func (r *BKEClusterReconciler) executePhaseFlow(ctx, phaseCtx, oldCluster, newCluster) {
-    if r.shouldUseDeclarativeInstall(newCluster) {
-        // Phase 3: 全量 DAG 执行所有安装组件
-        r.executeInstallDAG(ctx, phaseCtx, oldCluster, newCluster)
-        // PhaseFlow 不再执行任何 DeployPhase
-        // 但 CommonPhases (Finalizer/Paused/...) 仍走 PhaseFlow
-        flow := phases.NewPhaseFlow(phaseCtx, phases.WithDeployPhasesSkipAll())
-        flow.CalculatePhase(oldCluster, newCluster)
-        flow.Execute()
-        return
-    }
-    // Legacy: 全部走 PhaseFlow
-    ...
-}
-```
-
-**Feature Gate 状态**：ON（正式启用），但保留关闭能力作为回退。
-
-#### 9.5.6 Phase 4: 移除 Legacy（v3.0.0）
-
-**目标**：完全移除 PhaseFlow 的 DeployPhases，将所有场景（纳管/扩容/删除/DryRun/暂停）DAG 化。
-
-**移除步骤**：
-
-| 步骤 | 任务 | 说明 |
-|------|------|------|
-| 1 | 纳管 DAG 化 | 新增 `manage` 组件，`BuildVersionContextForManage` |
-| 2 | 扩容 DAG 化 | `EnsureMasterInit` 幂等改造（区分 init/join） |
-| 3 | 删除/重置 DAG 化 | `BuildUninstallDAGFromBundle` + 逆序执行 |
-| 4 | DryRun DAG 化 | `ExecutionContext.DryRun` 标记 |
-| 5 | 暂停检查迁移 | `shouldUseDeclarativeInstall` 增加暂停检查 |
-| 6 | 执行入口重写 | `reconcileCluster` 场景分发，无 PhaseFlow 回退 |
-| 7 | 移除 PhaseFlow 代码 | 删除 `DeployPhases` / `PhaseFlow` / 相关 `PhaseStatus` |
-| 8 | 移除 Feature Gate | `DeclarativeInstallEnabled` 不再需要 |
-
-**回退方案**：此阶段无回退——PhaseFlow 代码已移除。必须在 Phase 3 充分验证后才执行。
-
-#### 9.5.7 平滑升级风险控制
-
-| 风险 | 缓解措施 |
-|------|---------|
-| **混合模式行为不一致** | Phase 2 中 DAG 和 PhaseFlow 混合执行，需确保组件间状态正确传递 |
-| **部分迁移后中断** | Phase 2 迁移到一半发现问题，可关闭 Feature Gate 回退 |
-| **v2.8.0 升级到 v2.9.0 时路径切换** | v2.9.0 安装走 DAG，但集群是从 v2.8.0（PhaseFlow）升级来的，需处理状态兼容 |
-| **PhaseFlow 移除后回归** | Phase 4 移除代码后发现问题，无法回退到 PhaseFlow；必须在 Phase 3 充分验证 |
-| **CommonPhases 仍依赖 PhaseFlow** | Finalizer/Paused/ClusterManage 等通用 Phase 仍走 PhaseFlow，需单独处理 |
-
-#### 9.5.8 状态追踪迁移
-
-PhaseFlow 使用 `PhaseStatus` 追踪进度，DAG 使用 `DeclarativeUpgradeStatus` 追踪进度。平滑升级期间需处理状态兼容：
-
-| 阶段 | 安装状态来源 | 升级状态来源 | 兼容性处理 |
-|------|------------|------------|-----------|
-| Phase 1 | PhaseStatus | DeclarativeUpgradeStatus | 无变化 |
-| Phase 2 | PhaseStatus（未迁移组件）+ DeclarativeUpgradeStatus（已迁移组件） | DeclarativeUpgradeStatus | DAG 执行前清理 PhaseStatus 中已迁移组件的状态 |
-| Phase 3 | DeclarativeUpgradeStatus | DeclarativeUpgradeStatus | PhaseStatus 不再写入安装组件 |
-| Phase 4 | DeclarativeUpgradeStatus | DeclarativeUpgradeStatus | 移除 PhaseStatus |
-
-```go
-// Phase 2: 混合模式状态清理
-func (r *BKEClusterReconciler) executePartialInstallDAG(...) {
-    // 执行 DAG 前，清理已迁移组件的 PhaseStatus
-    for _, migratedComp := range migratedComponents {
-        delete(bkeCluster.Status.PhaseStatus, migratedComp.PhaseName)
-    }
-    
-    // 执行 DAG（已迁移组件）
-    r.executeInstallDAG(ctx, phaseCtx, oldCluster, newCluster, migratedComponents)
-    
-    // 执行 PhaseFlow（未迁移组件）
-    // PhaseFlow 中 NeedExecute 会跳过已迁移组件（因为状态已在 DAG 中标记完成）
-}
-```
-
-## 10. 可观测性
-
-### 10.1 安装状态追踪
-
-```bash
-# 查询安装 DAG 执行进度
-kubectl get bkecluster my-cluster -o jsonpath='{.status.declarativeUpgrade}'
-# 输出:
-# {
-#   "targetVersion": "v2.7.0",
-#   "completed": ["bkeagent", "nodes-env", "certs", "cluster-api-obj"],
-#   "lastError": ""
-# }
-
-# 查询组件安装状态
-kubectl get bkecluster my-cluster -o jsonpath='{.status.clusterComponentStatuses}'
-# 输出:
-# {
-#   "bkeagent": {"phase": "Installed", "version": "v2.7.0"},
-#   "certs": {"phase": "Installed", "version": "v2.7.0"},
-#   "kubernetes-master": {"phase": "Pending", "version": "v1.36.0"}
-# }
-```
-
-### 10.2 事件与指标
-
-| 类型 | 来源 | 说明 |
-|------|------|------|
-| **InstallStarted/Completed/Failed** | BKECluster Controller | 安装操作事件 |
-| **ComponentInstalled/Failed** | ComponentStatusUpdater | 组件安装事件 |
-| **bke_cluster_phase** | Prometheus | 集群状态指标 |
-| **bke_component_phase** | Prometheus | 组件状态指标 |
-
-## 11. 工作量评估
-
-### 11.1 开发工作量
-
-| 阶段 | 模块 | 任务 | 工作量（人天） |
-|------|------|------|---------------|
-| **Phase 1: 结构扩展** | CRD 扩展 | `ReleaseImageComponent` 新增 `inline` 字段 + deepcopy + webhook | 2 |
-| | 安装组件目录 | `DeclarativeInstallCatalog` + `InstallComponentSpec` | 2 |
-| | ComponentFactory 注册 | 注册安装 handler 到 factory + 验证幂等性 | 2 |
-| | VersionContext 扩展 | 新增 `DecisionInstall` + `BuildVersionContextForInstall` | 3 |
-| | 安装 DAG 构建 | `BuildInstallDAGFromBundle` + `InstallComponentsFromBundle` + 循环依赖检测 | 3 |
-| | executeInstallDAG | 安装 DAG 执行入口 + `shouldUseDeclarativeInstall` + 状态追踪 | 3 |
-| | 安装 annotation 机制 | `install-ready` annotation + ClusterVersionReconciler 适配 | 2 |
-| | Feature Gate | `DeclarativeInstallEnabled` 实现 + 默认关闭验证 | 1 |
-| | ComponentVersion 依赖定义 | 为 11 个安装组件编写 `spec.dependencies` + 验证拓扑正确性 | 4 |
-| | ReleaseImage 适配 | 为 v2.7.0 ReleaseImage 补充 install.components.inline | 2 |
-| | CommonPhases 兼容 | 确保 Finalizer/Paused/ClusterManage 等通用 Phase 与 DAG 共存 | 2 |
-| | 安装中断恢复 | 部分组件安装失败后的断点续传 + DeclarativeUpgradeStatus 状态恢复 | 2 |
-| | BKEAgent 命令适配 | 安装 handler 与现有 BKEAgent Command/ENV 命令机制集成验证 | 2 |
-| **Phase 1 小计** | | | **30** |
-| **Phase 2: 灰度迁移** | 混合执行模式 | `executePartialInstallDAG` + `WithSkipPhases` PhaseFlow 扩展 | 4 |
-| | 状态追踪兼容 | PhaseStatus ↔ DeclarativeUpgradeStatus 状态清理 + 互不冲突 | 3 |
-| | 低风险组件迁移 | bkeagent/nodes-env/certs/load-balance 迁移 + NeedExecute 适配 | 3 |
-| | 灰度验证框架 | Feature Gate 灰度策略 + 日志 + 监控 | 2 |
-| | 版本间状态迁移 | v2.7.0 PhaseStatus → v2.8.0 混合状态 → v2.9.0 DeclarativeUpgradeStatus 迁移逻辑 | 3 |
-| **Phase 2 小计** | | | **15** |
-| **Phase 3: 全量 DAG** | 高风险组件迁移 | kubernetes-master/worker/agent-switch/nodes-postprocess 迁移 | 5 |
-| | MasterInit 幂等改造 | 区分 init/join + 已有节点跳过逻辑 + kubeadm init/join 命令适配 | 4 |
-| | WorkerJoin drain 集成 | drain/uncordon 逻辑与 DAG 执行器集成 + 失败重试 | 3 |
-| | DryRun DAG 化 | `ExecutionContext.DryRun` + 各执行器适配 | 2 |
-| | 暂停检查迁移 | `shouldUseDeclarativeInstall` 增加暂停检查 | 1 |
-| | CommonPhases DAG 化 | Finalizer/Paused 等通用 Phase 迁移或保留决策 + 实现 | 3 |
-| **Phase 3 小计** | | | **18** |
-| **Phase 4: Legacy 移除** | 纳管 DAG 化 | `manage` 组件 + `BuildVersionContextForManage` + 从运行集群探测版本 | 5 |
-| | 扩容 DAG 化 | `EnsureMasterInit` 幂等完善 + VersionContext 节点级过滤 | 3 |
-| | 删除/重置 DAG 化 | `BuildUninstallDAGFromBundle` + 逆序依赖解析 + 卸载脚本 | 6 |
-| | 执行入口重写 | `reconcileCluster` 场景分发 + 无 PhaseFlow 回退 | 3 |
-| | PhaseFlow 代码清理 | 移除 `DeployPhases` / `PhaseFlow` / `PhaseStatus` + 依赖分析 + 安全删除 | 5 |
-| | Feature Gate 移除 | 移除 `DeclarativeInstallEnabled` + 清理条件判断 | 1 |
-| | 回退预案 | Phase 3 充分验证清单 + 无法回退的风险评估 + 手动恢复方案 | 2 |
-| **Phase 4 小计** | | | **25** |
-| **开发总计** | | | **88** |
-
-### 11.2 测试工作量
-
-| 阶段 | 测试内容 | 工作量（人天） |
-|------|---------|---------------|
-| **Phase 1** | DAG 构建 + VersionContext 单元测试 + 全新安装集成测试 + PhaseFlow 回归 | 8 |
-| **Phase 2** | 混合模式执行 + 状态正确性 + Feature Gate 回退验证 | 5 |
-| **Phase 3** | 全量 DAG 安装 + 升级流程 + DryRun 验证 | 7 |
-| **Phase 4** | 全场景 E2E（安装/升级/扩容/纳管/删除/DryRun/暂停）+ 回归 + 性能对比 | 9 |
-| **测试总计** | | **29** |
-
-### 11.3 文档工作量
-
-| 文档类型 | 文档内容 | 工作量（人天） |
-|---------|---------|---------------|
-| **设计文档** | 本 KEP 文档完善 | 2 |
-| **升级指南** | PhaseFlow → DAG 迁移指南 | 2 |
-| **运维手册** | DAG 安装路径运维手册 | 2 |
-| **故障排查** | DAG 安装故障排查指南 | 1 |
-| **小计** | - | **7 人天** |
-
-### 11.4 总工作量汇总
-
-| 阶段 | 开发（人天） | 测试（人天） | 小计 |
-|------|------------|------------|------|
-| **Phase 1: 结构扩展** | 30 | 8 | 38 |
-| **Phase 2: 灰度迁移** | 15 | 5 | 20 |
-| **Phase 3: 全量 DAG** | 18 | 7 | 25 |
-| **Phase 4: Legacy 移除** | 25 | 9 | 34 |
-| **文档** | - | - | 7 |
-| **总计** | **88** | **29** | **124** |
-
-> 开发占比 71%，测试占比 23%，文档占比 6%。
-
-**按 openFuyao 版本节奏估算**：
-
-| openFuyao 版本 | 阶段 | 工作量（人天） | 说明 |
-|---------------|------|---------------|------|
-| **v2.7.0** | Phase 1: 结构扩展 | 38 | CRD 扩展 + 目录定义 + DAG 构建器 |
-| **v2.8.0** | Phase 2: 灰度迁移 | 20 | 低风险组件 DAG 化 + 混合模式 |
-| **v2.9.0** | Phase 3: 全量 DAG | 25 | 高风险组件 DAG 化 + 全量验证 |
-| **v3.0.0** | Phase 4: Legacy 移除 | 34 | 纳管/扩容/删除 DAG 化 + 代码清理 |
-| **文档** | 全程 | 7 | 分阶段交付 |
-| **总计** | - | **124** | 4 个版本周期 |
-
-**按人员配置估算**（单阶段）：
-- Phase 1（38 人天）：2 人约 4 周，3 人约 2.5 周
-- Phase 2（20 人天）：2 人约 2 周，3 人约 1.5 周
-- Phase 3（25 人天）：2 人约 2.5 周，3 人约 1.5 周
-- Phase 4（34 人天）：2 人约 3.5 周，3 人约 2.5 周
-
-## 12. 风险与缓解措施
-
-### 12.1 技术风险
-
-| 风险 | 影响 | 概率 | 缓解措施 |
-|------|------|------|---------|
-| **安装 DAG 依赖不正确** | 组件安装顺序错误 | 中 | 充分测试依赖关系，与 PhaseFlow 顺序对齐 |
-| **PhaseFlow 回归** | 新增 DAG 路径影响现有安装 | 低 | Feature Gate 控制，默认不启用 |
-| **ComponentVersion 缺失** | 安装组件无依赖定义 | 中 | 补充所有安装组件的 `spec.dependencies` |
-| **新旧路径行为不一致** | DAG 安装与 PhaseFlow 安装结果不同 | 中 | 对比测试，确保行为一致 |
-| **MasterJoin 复用 MasterInit handler** | Master 加入使用 MasterInit 逻辑可能不匹配 | 中 | 验证 MasterInit handler 对已有 Master 的幂等性 |
-| **混合模式状态冲突** | PhaseStatus 与 DeclarativeUpgradeStatus 同时写入 | 中 | 状态清理逻辑，执行前清理对方状态 |
-| **CommonPhades 依赖 PhaseFlow** | Finalizer/Paused 等 Phase 嵌入 PhaseFlow | 中 | Phase 4 单独处理 CommonPhases 迁移 |
-
-### 12.2 平滑升级风险
-
-| 风险 | 影响 | 概率 | 缓解措施 |
-|------|------|------|---------|
-| **Phase 2 混合模式中断** | DAG + PhaseFlow 混合执行行为异常 | 高 | 逐组件迁移 + 充分测试 + Feature Gate 回退 |
-| **版本间路径切换** | v2.8.0 PhaseFlow 安装 → v2.9.0 DAG 安装 | 中 | VersionContext 从 PhaseStatus 推导 Current |
-| **Phase 4 无回退** | 移除 PhaseFlow 后发现问题无法回退 | 高 | Phase 3 充分验证 + 灰度周期足够长 |
-| **灰度范围扩大过快** | 生产环境问题未充分暴露 | 中 | 每个灰度阶段观察 1-2 周 |
-
-### 12.3 业务风险
-
-| 风险 | 影响 | 概率 | 缓解措施 |
-|------|------|------|---------|
-| **业务 Pod 重启** | 业务短暂中断 | 高 | 选择业务低峰期升级 |
-| **安装中断后重试** | 部分组件已安装，重试行为异常 | 中 | DeclarativeUpgradeStatus 追踪已完成组件，跳过重试 |
-| **升级期间集群不可用** | 控制面组件重启 | 中 | 逐节点滚动升级，保持多数派可用 |
-
----
-
-## 13. releasemanifest.Bundle 的作用
-
-### 13.1 是什么
-
-`releasemanifest.Bundle` 是 ReleaseImage OCI 制品的**内存解析表示**，是连接声明层 (ReleaseImage CR) 与执行层 (DAG/Scheduler/Phase) 的核心桥梁。
-
-```go
-// pkg/release/manifest/types.go
-
-type Bundle struct {
-    // Release: 解析后的 release.yaml (ReleaseImage CR 内容，非 CR 实例)
-    // 含 Spec.Version, Spec.Install.Components, Spec.Upgrade.Components
-    Release    apiv1.ReleaseImage
-
-    // Components: 解析后的所有 component.yaml，key = "name@version"
-    // 含 Spec.Type, Spec.Inline, Spec.Dependencies, Spec.Compatibility, Spec.Resources
-    Components map[string]apiv1.ComponentVersion
-
-    // Files: OCI 制品中所有 YAML 文件的原始字节，key = 相对路径
-    // 如 "components/coredns/v1.11.1/coredns.yaml"
-    Files map[string][]byte
-
-    // Digest: 文件集 SHA256 (sha256:<hex>)
-    Digest string
-
-    // Source: 来源标识 "Memory" / "Disk" / "OCI"
-    Source string
-
-    // CacheFallback: 是否从磁盘缓存回退加载 (OCI 拉取失败时)
-    CacheFallback bool
-}
-```
-
-### 13.2 作用
-
-Bundle 是声明式安装/升级流程中**所有执行决策的数据来源**：
-
-| 作用 | Bundle 字段 | 消费者 | 说明 |
-|------|------------|--------|------|
-| **版本来源** | `Release.Spec.Install/Upgrade.Components[].Version` | `BuildVersionContextForUpgrade` | 提供 K8s/etcd 等组件版本，填充 VersionContext.Target/Current |
-| **依赖解析** | `Components[key].Spec.Dependencies` | `BundleDependencyResolver` | 提供 DAG 拓扑排序的依赖边 |
-| **执行器分发** | `Components[key].Spec.Type` (inline/yaml/helm/binary) | `Scheduler.executeComponent` | 决定用哪个 Executor 执行组件 |
-| **inline handler 解析** | `Components[key].Spec.Inline.Handler` | `componentfactory.RegisterInlinePhasesFromBundle` | 提供 Phase Handler 名称 (如 `EnsureMasterUpgrade`) |
-| **YAML 清单获取** | `Files["components/coredns/v1.11.1/coredns.yaml"]` | `BundleStore.GetComponentManifests` → `YamlInstaller` | 提供 manifest 原始字节供 Apply |
-| **兼容性校验** | `Components[key].Spec.Compatibility.Constraints` | `compatibility.Engine.Check` | 提供版本约束 (如 kubernetes >=1.24.0) |
-| **ReleaseImage Status 回填** | `Components` (数量和版本) | `ReleaseImageReconciler.componentStatuses` | 回写 ReleaseImage.Status.Components |
-| **镜像 tag 来源** | `Release.Spec.Upgrade.Components[kubernetes-master].Version` | `EnsureMasterUpgrade` → Command CR → BKEAgent | 提供 manifest image tag 版本 (去 v 前缀) |
-
-### 13.3 与 ReleaseImage CR 的关系
-
-```txt
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│              ReleaseImage CR ↔ Bundle 关系                                       │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                 │
-│  ReleaseImage CR (声明层 — 意图)                                                │
-│  ┌──────────────────────────────────────────────────────────────────────┐      │
-│  │ spec.version: "v2.7.0"                                               │      │
-│  │ spec.digest: "sha256:abc123..."                                      │      │
-│  │ spec.verifySignature: true                                           │      │
-│  │ spec.install.components: [{name, version, inline}]                   │      │
-│  │ spec.upgrade.components: [{name, version, inline}]                   │      │
-│  │ status.phase: Valid / Invalid / ManifestMissing / CompatibilityFailed│     │
-│  │ status.componentCount, status.components[], status.digest            │      │
-│  └────────────────────────────────────┬─────────────────────────────────┘      │
-│                                       │                                         │
-│                  ReleaseImageReconciler:                                         │
-│                  RefreshRelease → OCI Pull → ParseBundle → Check → Commit       │
-│                                       │                                         │
-│                                       ▼                                         │
-│  Bundle (内存解析层 — 物化) ★                                                    │
-│  ┌──────────────────────────────────────────────────────────────────────┐      │
-│  │ Release:     release.yaml 解析结果 (含 Spec.Install/Upgrade)          │      │
-│  │ Components:  所有 component.yaml 解析结果 (key="name@version")        │      │
-│  │ Files:       所有 YAML 原始字节 (key=相对路径)                        │      │
-│  │ Digest:      sha256:<hex>                                            │      │
-│  │ Source:      Memory / Disk / OCI                                     │      │
-│  └────────────────────────────────────┬─────────────────────────────────┘      │
-│                                       │                                         │
-│                  BKEClusterReconciler:                                           │
-│                  ResolveRelease (只读，从不拉 OCI)                               │
-│                                       │                                         │
-│                                       ▼                                         │
-│  执行层 (消费 Bundle):                                                           │
-│    BuildVersionContextForUpgrade  ← Release (版本)                              │
-│    BuildDAGFromBundle             ← Release + Components (依赖)                 │
-│    BundleStore.GetComponentManifests ← Files (YAML 清单)                        │
-│    BundleStore.GetComponentVersion  ← Components (类型/handler)                 │
-│    Scheduler.ExecuteDAG            ← 以上全部                                   │
-│                                                                                 │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
-
-**核心关系**：
-
-| 维度 | ReleaseImage CR | Bundle |
-|------|----------------|--------|
-| **角色** | 声明层 (意图) — 声明版本和镜像位置 | 物化层 (制品) — 已拉取、解析、验证的实际内容 |
-| **存储** | etcd (Kubernetes CR) | 进程内存 (sync.Map) + 磁盘缓存 |
-| **创建者** | 用户/ClusterVersionReconciler | ReleaseImageReconciler (OCI Pull + ParseBundle) |
-| **生命周期** | 持久化 (直到用户删除) | 进程级 (重启后从磁盘恢复) |
-| **验证状态** | `Status.Phase` (Valid=已验证) | `Digest` + `Source` 标识 |
-| **契约** | `Status.Phase=Valid` → 保证 Bundle 已缓存可用 | `ResolveRelease` 成功 → Bundle 可消费 |
-
-> **关键设计**：`ResolveRelease` **从不拉取 OCI** — BKEClusterReconciler 只从内存/磁盘缓存读取，避免 reconcile 时网络阻塞。OCI 拉取仅由 ReleaseImageReconciler 在验证时执行。
-
-### 13.4 三级缓存生命周期
-
-```txt
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│              Bundle 三级缓存生命周期                                              │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                 │
-│  ReleaseImageReconciler.Reconcile (写入方):                                     │
-│                                                                                 │
-│  1. buildReleaseRefs (从 RI.Spec + imageref)                                    │
-│     → ReleaseRef{Version, OCIRef, Digest, VerifySignature}                      │
-│                                                                                 │
-│  2. store.RefreshRelease(ctx, ref) — 总是拉取 OCI                               │
-│     ├─ Puller.Pull → OCIPuller → ORAS 拉取 OCI 制品                             │
-│     │  → BundleFiles{Files: map[string][]byte} (所有 YAML 原始字节)             │
-│     ├─ verifier.Verify (签名验证)                                                │
-│     ├─ ParseBundle(files) → *Bundle{Source=OCI}                                 │
-│     │  ├─ 解析 release.yaml → bundle.Release (ReleaseImage CR 内容)             │
-│     │  ├─ 解析 component.yaml → bundle.Components["name@version"]               │
-│     │  └─ 保留所有 Files                                                         │
-│     └─ (拉取失败 + AllowCacheFallback) → loadDiskCache → *Bundle{Source=Disk}   │
-│                                                                                 │
-│  3. compatibility.Engine.Check(bundle) — 兼容性校验                              │
-│     → 读取 Components[key].Spec.Compatibility.Constraints                        │
-│                                                                                 │
-│  4. store.CommitRelease(ref, bundle, files) — 持久化                             │
-│     ├─ memory.Store(key, bundle.DeepCopy()) — 写入内存缓存                       │
-│     └─ writeDiskCache(ref, files, digest) — 写入磁盘缓存                         │
-│        → <diskRoot>/<cacheKey>/  (YAML 树 + metadata.json)                       │
-│                                                                                 │
-│  5. updateStatus(ri, bundle) — 回填 ReleaseImage.Status                          │
-│     → Status.Phase = Valid, Status.ComponentCount, Status.Components            │
-│                                                                                 │
-│  ─────────────────────────────────────────────────────────────                  │
-│                                                                                 │
-│  BKEClusterReconciler.executeUpgradeDAG (读取方):                               │
-│                                                                                 │
-│  1. resolveUpgradeBundle(ctx, cluster, hopTarget)                                │
-│     ├─ ResolveReleaseImageForVersion → 查找 ReleaseImage CR (Phase=Valid)       │
-│     └─ store.ResolveRelease(ctx, releaseRefFromCR(ri)) — 只读，从不拉 OCI       │
-│        ├─ 优先: memory.Load(key) → *Bundle{Source=Memory} (热路径)              │
-│        ├─ 回退: loadDiskCache(ref) → *Bundle{Source=Disk} (重启后)              │
-│        └─ 失败: error "release bundle not cached" (RI 未验证)                    │
-│                                                                                 │
-│  2. 消费 Bundle:                                                                │
-│     ├─ BuildVersionContextForUpgrade(bundle, currentBundle, bc)                 │
-│     │  → FillTargetFromBundle: 遍历 bundle.Release.Spec.Install/Upgrade          │
-│     │    .Components → vc.SetTarget(name, version)                              │
-│     ├─ BuildDAGFromBundle(bundle, BundleDependencyResolver(bundle))             │
-│     │  → 遍历 bundle.Release.Spec.Upgrade.Components                            │
-│     │  → enrichUpgradeComponent: bundle.Components[key].Spec.Inline              │
-│     │  → BundleDependencyResolver: bundle.Components[key].Spec.Dependencies      │
-│     ├─ manifest.NewBundleStore(bundle)                                          │
-│     │  → 实现 manifest.Store (GetComponentManifests → bundle.Files)             │
-│     │  → 实现 dagexec.ComponentVersionStore (GetComponentVersion → bundle.Components)│
-│     └─ componentfactory.NewFactoryFromBundle(bundle)                            │
-│        → RegisterInlinePhasesFromBundle: bundle.Components[key].Spec.Inline      │
-│                                                                                 │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
-
-| 缓存级别 | 存储位置 | 写入者 | 读取者 | 特点 |
-|---------|---------|--------|--------|------|
-| **Memory** | 进程内 `sync.Map` | `CommitRelease` | `ResolveRelease` (热路径) | 最快；进程重启丢失 |
-| **Disk** | `/var/lib/bke/release-cache/<cacheKey>/` | `writeDiskCache` | `loadDiskCache` | 重启后可用；含 `metadata.json` |
-| **OCI** | 远程 Registry | `RefreshRelease` (仅 ReleaseImageReconciler) | 不直接被 BKEClusterReconciler 读取 | 网络拉取；验证后缓存 |
-
-**缓存键** (`CacheKey()`)：优先 `sanitizeKey(Digest)` → `sanitizeKey(Version)` → `sha256(OCIRef)`。Digest 变更时旧缓存被孤立 (ReleaseImage 删除时 EvictRelease 清理)。
-
-### 13.5 BundleStore 适配器 — Bundle 到执行层的桥梁
-
-Bundle 不直接被 Scheduler 消费，而是通过 `manifest.BundleStore` 适配器转换为执行层所需接口：
-
-```go
-// pkg/manifest/bundle_store.go
-
-// BundleStore 包装 Bundle，同时实现两个接口
-type BundleStore struct {
-    bundle *releasemanifest.Bundle
-}
-
-// NewBundleStore 创建 BundleStore
-func NewBundleStore(bundle *releasemanifest.Bundle) *BundleStore {
-    return &BundleStore{bundle: bundle}
-}
-
-// 实现 manifest.Store 接口 (供 YamlInstaller 使用)
-func (s *BundleStore) GetComponentManifests(ctx, name, version string, tmpl) (*ComponentPackage, error) {
-    // 1. 验证 ComponentVersion 存在
-    cv, ok := s.bundle.Components[releasemanifest.ComponentKey(name, version)]
-    if !ok {
-        return nil, fmt.Errorf("component %s@%s not found", name, version)
-    }
-    // 2. 从 bundle.Files 收集 YAML 清单字节
-    manifests := releasemanifest.CollectComponentManifests(s.bundle, name, version)
-    // 3. 返回 ComponentPackage (含 Manifests + ApplyStrategy)
-    return &ComponentPackage{
-        Name:          name,
-        Version:       version,
-        Manifests:     manifests,
-        ApplyStrategy: cv.Spec.YAML.ApplyStrategy,
-    }, nil
-}
-
-// 实现 dagexec.ComponentVersionStore 接口 (供 Scheduler 使用)
-func (s *BundleStore) GetComponentVersion(ctx, name, version string) (*apiv1.ComponentVersion, error) {
-    cv, ok := s.bundle.Components[releasemanifest.ComponentKey(name, version)]
-    if !ok {
-        return nil, fmt.Errorf("component %s@%s not found", name, version)
-    }
-    return &cv, nil  // 返回 ComponentVersion (含 Spec.Type, Spec.Inline 等)
-}
-```
-
-```txt
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│              BundleStore 适配器 — Bundle 到执行层的桥梁                          │
-├─────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                 │
-│  *releasemanifest.Bundle                                                        │
-│    ├── Release (版本)                                                           │
-│    ├── Components (ComponentVersion: Type/Inline/Dependencies)                  │
-│    └── Files (YAML 清单字节)                                                    │
-│                                                                                 │
-│           │                                                                     │
-│           │ manifest.NewBundleStore(bundle)                                     │
-│           ▼                                                                     │
-│                                                                                 │
-│  *manifest.BundleStore (适配器)                                                 │
-│    │                                                                            │
-│    ├── 实现 manifest.Store 接口:                                                 │
-│    │   GetComponentManifests(ctx, name, version, tmpl)                          │
-│    │   → 从 bundle.Components 验证存在                                          │
-│    │   → 从 bundle.Files 收集 YAML 清单                                         │
-│    │   → 返回 ComponentPackage{Manifests, ApplyStrategy}                        │
-│    │   消费者: YamlInstaller / YamlComponentExecutor                            │
-│    │                                                                            │
-│    └── 实现 dagexec.ComponentVersionStore 接口:                                 │
-│        GetComponentVersion(ctx, name, version)                                  │
-│        → 从 bundle.Components[key] 返回 *ComponentVersion                       │
-│        → Scheduler 读取 cv.Spec.Type 决定执行器                                 │
-│        → Scheduler 读取 cv.Spec.Inline.Handler 解析 Phase                       │
-│        消费者: Scheduler.executeComponent                                        │
-│                                                                                 │
-│           │                                                                     │
-│           │ dagexec.NewScheduler(Config{                                         │
-│           │   ManifestStore: bundleStore,  // → bundle.Files                    │
-│           │   CVStore:        bundleStore,  // → bundle.Components              │
-│           │   InlineRunner:   ...,         // → bundle.Components (handler)    │
-│           │})                                                                  │
-│           ▼                                                                     │
-│                                                                                 │
-│  Scheduler.ExecuteDAG                                                           │
-│    对每个组件:                                                                   │
-│    1. CVStore.GetComponentVersion → cv.Spec.Type → 选择执行器                   │
-│    2. inline → InlineRunner.Execute(handler)                                    │
-│       manifest → ManifestStore.GetComponentManifests → Applier.ApplyComponent   │
-│                                                                                 │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
-
-### 13.6 Bundle 的消费者汇总
-
-| 消费者 | 读取字段 | 用途 | 代码位置 |
-|--------|---------|------|---------|
-| `BuildVersionContextForUpgrade` | `Release.Spec.Install/Upgrade.Components` | 填充 VersionContext.Target/Current | `pkg/upgrade/build_release.go` |
-| `BuildDAGFromBundle` | `Release.Spec.Upgrade.Components` | 构建 DAG 组件列表 | `pkg/upgrade/bundle.go` |
-| `BundleDependencyResolver` | `Components[key].Spec.Dependencies` | 解析 DAG 依赖边 | `pkg/upgrade/bundle.go` |
-| `enrichUpgradeComponent` | `Components[key].Spec.Inline` | 补充 inline handler 信息 | `pkg/upgrade/bundle.go` |
-| `BundleStore.GetComponentManifests` | `Components` + `Files` | 获取 YAML 清单字节 | `pkg/manifest/bundle_store.go` |
-| `BundleStore.GetComponentVersion` | `Components` | 获取组件类型和 handler | `pkg/manifest/bundle_store.go` |
-| `componentfactory.NewFactoryFromBundle` | `Components` + `Release` | 注册 inline Phase 构造函数 | `pkg/componentfactory/bundle_registry.go` |
-| `compatibility.Engine.Check` | `Components[key].Spec.Compatibility` | 版本兼容性校验 | `pkg/release/compatibility/engine.go` |
-| `ReleaseImageReconciler.componentStatuses` | `Components` | 回填 ReleaseImage.Status | `controllers/releaseimage/releaseimage_controller.go` |
-| `CollectComponentManifests` | `Files` + `Components` | 收集组件 manifest 清单 | `pkg/release/manifest/component_files.go` |
-
-### 13.7 命名注意事项
-
-代码库中存在**两个不同的 "Store" 类型**，容易混淆：
-
-| 类型 | 包 | 作用 | 说明 |
-|------|-----|------|------|
-| `releasemanifest.Store` | `pkg/release/manifest` | Release Bundle 缓存 (三级: 内存/磁盘/OCI) | 持有 `*Bundle`，被 ReleaseImageReconciler (写) 和 BKEClusterReconciler (读) 共享 |
-| `manifest.Store` | `pkg/manifest` | 组件清单加载接口 (抽象) | 接口: `GetComponentManifests(ctx, name, version)`，由 `manifest.BundleStore` 实现 (包装 Bundle) |
-
-> `manifest.BundleStore` 是适配器：将 `*releasemanifest.Bundle` 包装为 `manifest.Store` + `dagexec.ComponentVersionStore` 两个接口，供 Scheduler 消费。
-
----
-
-## 14. ComponentVersion 执行时条件过滤
-
-> **已抽离为独立 KEP 文档**：[KEP-18: ComponentVersion 执行时条件过滤](kep18-component-condition-filter-design.md)
-
-ComponentVersion 新增 `Condition` 字段（Go Template 表达式），在 DAG 执行时根据集群运行时状态（Operation/ScaleType/NodeCount 等）决定组件是否执行。该机制复用已有 `TemplateContext` 作为模板数据（扩展新增 Operation/ScaleType 等字段），作为 Scheduler 跳过链的第三层检查（位于版本检查之后、执行器分发之前），与 KEP-17 Selector 互补——Selector 在构建时选择子组件，Condition 在执行时过滤组件。
-
-完整设计见 [KEP-18](kep18-component-condition-filter-design.md)。
-
----
-
-## 附录
-
-### A. 参考文档
-
-1. [KEP-5 声明式升级框架](kep5/kep5.md)
-2. [KEP-6 三层状态机设计](kep6-state-machine-v4.md)
-3. [KEP-9 Static Pod 类型设计](kep9-staticpod-upgrade-framework.md)
-4. [KEP-17 Selector 组件类型设计](kep17-selector-component-design.md)
-5. [KEP-18 ComponentVersion 执行时条件过滤](kep18-component-condition-filter-design.md)
-6. [声明式集群版本升级方案-支持二进制与 Helm 组件](声明式集群版本升级方案-支持二进制与 Helm 组件.md)
-
-### B. 术语表
-
-| 术语 | 定义 |
-|------|------|
-| **ReleaseImageComponent** | ReleaseImage 中组件引用（安装和升级共用），包含 `inline` handler |
-| **DeclarativeInstallCatalog** | 安装组件目录，映射组件名到执行模式（inline/manifest） |
-| **BuildInstallDAGFromBundle** | 从 ReleaseImage bundle 构建安装 DAG |
-| **DecisionInstall** | VersionContext 决策：current 为空且 target 有值时触发安装 |
-| **DeclarativeInstallEnabled** | Feature Gate，控制 DAG 安装路径是否启用 |
-| **install-ready annotation** | `cvo.openfuyao.cn/install-ready`，触发 DAG 安装路径 |
