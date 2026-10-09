@@ -24,7 +24,7 @@
 7. [集群删除/重置 DAG 化](#7-集群删除重置-dag-化)
 8. [DryRun 模式 DAG 化](#8-dryrun-模式-dag-化)
 9. [集群暂停 DAG 化](#9-集群暂停-dag-化)
-10. [移除后的执行入口](#10-集群暂停-dag-化)
+10. [移除后的执行入口](#11-移除后的执行入口)
 11. [工作量评估](#12-工作量评估)
 12. [风险与缓解措施](#13-风险与缓解措施)
 - [附录](#附录)
@@ -85,34 +85,19 @@
 
 ## 4. 场景覆盖总览
 
-| Legacy 场景 | DAG 化方案 | 移除条件 |
-|------------|-----------|---------|
-| Feature Gate 未启用 | 移除 Feature Gate，DAG 成为唯一路径 | Phase 4 |
-| ReleaseImage 无 inline handler | 强制 ReleaseImage 包含 inline 字段 | Phase 4 |
-| 纳管已有集群 | 新增 `manage` 组件到安装 DAG + Condition 过滤 | Phase 4 |
-| 集群扩容（新增节点） | 复用安装 DAG + `fillCurrentFromExistingNodes` + Condition 过滤 | Phase 4 |
-| 集群删除/重置 | 逆序卸载 DAG + `EnsureDeleteOrReset` inline 组件 | Phase 4 |
-| DryRun 模式 | `ExecutionContext.DryRun` 标记，DAG 照常遍历但仅打印 | Phase 3 |
-| 集群暂停 | 前置检查 `BKECluster.Spec.Pause`，不构建 DAG | Phase 3 |
+| Legacy 场景 | DAG 化方案 |
+|------------|-----------|
+| Feature Gate 未启用 | 移除 Feature Gate，DAG 成为唯一路径 |
+| ReleaseImage 无 inline handler | 强制 ReleaseImage 包含 inline 字段 |
+| 纳管已有集群 | 新增 `manage` 组件到安装 DAG + Condition 过滤 |
+| 集群扩容（新增节点） | 复用安装 DAG + `fillCurrentFromExistingNodes` + Condition 过滤 |
+| 集群删除/重置 | 逆序卸载 DAG + `EnsureDeleteOrReset` inline 组件 |
+| DryRun 模式 | `ExecutionContext.DryRun` 标记，DAG 照常遍历但仅打印 |
+| 集群暂停 | 前置检查 `BKECluster.Spec.Pause`，不构建 DAG |
 
 ---
 
-
-
-## 5. 场景覆盖总览
-
-| Legacy 场景 | DAG 化方案 | 移除条件 |
-|------------|-----------|---------|
-| Feature Gate 未启用 | 移除 Feature Gate，DAG 成为唯一路径 | Phase 4 |
-| ReleaseImage 无 inline handler | 强制 ReleaseImage 包含 inline 字段 | Phase 4 |
-| 无 install-ready annotation | 已移除: Feature Gate 开启即代表 ReleaseImage 就绪 | 已移除 |
-| 纳管已有集群 | 新增 `manage` 组件到安装 DAG | Phase 4 |
-| 集群扩容（新增节点） | 新增 `scale-master` / `scale-worker` 组件到 DAG | Phase 4 |
-| 集群删除/重置 | 新增 `delete` DAG（逆序卸载） | Phase 4 |
-| DryRun 模式 | DAG 执行器支持 DryRun 标记 | Phase 3 |
-| 集群暂停 | DAG 前置检查 `BKECluster.Spec.Pause` | Phase 3 |
-
-## 6. 纳管已有集群 DAG 化
+## 5. 纳管已有集群 DAG 化
 
 ### 设计思路
 
