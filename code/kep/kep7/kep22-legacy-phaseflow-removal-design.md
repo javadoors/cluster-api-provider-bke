@@ -1,4 +1,4 @@
-# KEP-22: Legacy PhaseFlow 完全移除方案
+﻿# KEP-22: Legacy PhaseFlow 完全移除方案
 
 | 字段 | 值 |
 |------|-----|
@@ -24,9 +24,9 @@
 7. [集群删除/重置 DAG 化](#7-集群删除重置-dag-化)
 8. [DryRun 模式 DAG 化](#8-dryrun-模式-dag-化)
 9. [集群暂停 DAG 化](#9-集群暂停-dag-化)
-10. [移除后的执行入口](#10-移除后的执行入口)
-11. [工作量评估](#11-工作量评估)
-12. [风险与缓解措施](#12-风险与缓解措施)
+10. [移除后的执行入口](#10-集群暂停-dag-化)
+11. [工作量评估](#12-工作量评估)
+12. [风险与缓解措施](#13-风险与缓解措施)
 - [附录](#附录)
 
 ---
@@ -96,13 +96,10 @@
 | 集群暂停 | 前置检查 `BKECluster.Spec.Pause`，不构建 DAG | Phase 3 |
 
 ---
-## 10. Legacy PhaseFlow 完全移除方案
 
-> **关联章节**：平滑升级的迁移阶段和风险控制见 [§9.4](#94-平滑升级方案)。Legacy PhaseFlow 路径设计（Phase 列表、场景执行列表）见 [§7.2.3-7.2.6](#723-legacy-phaseflow-路径设计)。
 
-当迁移到 Phase 4 时，需要完全移除 Legacy PhaseFlow 路径。以下针对 7.1 节中列出的每个 Legacy 场景，给出 DAG 化的完整方案。
 
-### 10.1 场景覆盖总览
+## 5. 场景覆盖总览
 
 | Legacy 场景 | DAG 化方案 | 移除条件 |
 |------------|-----------|---------|
@@ -115,9 +112,9 @@
 | DryRun 模式 | DAG 执行器支持 DryRun 标记 | Phase 3 |
 | 集群暂停 | DAG 前置检查 `BKECluster.Spec.Pause` | Phase 3 |
 
-### 10.2 纳管已有集群 DAG 化
+## 6. 纳管已有集群 DAG 化
 
-#### 设计思路
+### 设计思路
 
 纳管是指将一个已有的 Kubernetes 集群纳入 BKE 管理。与全新安装的核心区别在于：集群已运行，组件已有版本，不能假设 Current 为空。
 
@@ -205,7 +202,7 @@
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### 代码实现
+### 代码实现
 
 ```yaml
 # ReleaseImage install.components 新增 manage 组件
@@ -357,7 +354,7 @@ func BuildVersionContextForManage(
 }
 ```
 
-#### 场景判断
+### 场景判断
 
 纳管场景需要先判断 BKECluster 是否处于纳管模式，再走纳管 DAG 路径：
 
@@ -512,9 +509,9 @@ func (r *BKEClusterReconciler) executeManageDAG(
 }
 ```
 
-### 10.3 集群扩容 DAG 化
+## 7. 集群扩容 DAG 化
 
-#### 设计思路
+### 设计思路
 
 扩容是指向已有集群新增 Master 或 Worker 节点。与全新安装的核心区别在于：已有节点不需要重新安装，仅新节点需要执行安装操作。
 
@@ -591,7 +588,7 @@ func (r *BKEClusterReconciler) executeManageDAG(
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### Legacy PhaseFlow 扩容执行机制（当前代码）
+### Legacy PhaseFlow 扩容执行机制（当前代码）
 
 **核心代码路径**: `pkg/phaseframe/phases/phase_flow.go` + `pkg/phaseframe/phases/list.go`
 
@@ -820,7 +817,7 @@ func (e *EnsureNodesEnv) getNodesToInitEnv() bkenode.Nodes {
 | `NodeFailedFlag` | 节点失败 | 安装失败 | `filterNodes`: 已设置 → 硬排除 |
 | `NodeDeletingFlag` | 节点删除中 | 缩容触发 | `filterNodes`: 已设置 → 硬排除 |
 
-#### DAG 化方案设计
+### DAG 化方案设计
 
 **1. 入口集成 — 复用 executePhaseFlow 模式**
 
@@ -972,7 +969,7 @@ if err := r.patchClusterStatus(newCluster, bkev1beta1.ClusterMasterScalingUp); e
 newCluster.Status.ClusterStatus = bkev1beta1.ClusterStatusReady
 ```
 
-#### 代码实现
+### 代码实现
 
 ```go
 // controllers/capbke/bkecluster_scale_dag.go 🆕新增
@@ -1236,7 +1233,7 @@ func (e *EnsureMasterInit) waitMasterJoin(nodesCount int, nodesToJoin bkenode.No
 }
 ```
 
-#### 扩容触发流程示例
+### 扩容触发流程示例
 
 以 3 节点集群（master-1, worker-1, worker-2）扩容新增 master-2 为例：
 
@@ -1353,9 +1350,9 @@ executeScaleDAG:
       → join 完成后设置 master-2 的 NodeBootFlag
 ```
 
-### 10.4 集群删除/重置 DAG 化
+## 8. 集群删除/重置 DAG 化
 
-#### 设计思路
+### 设计思路
 
 删除/重置是指清理集群的所有组件。与安装的核心区别在于：安装是创建组件，删除是逆序卸载组件。
 
@@ -1406,7 +1403,7 @@ executeScaleDAG:
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### Legacy DeletePhases 详细说明（当前代码）
+### Legacy DeletePhases 详细说明（当前代码）
 
 **DeletePhases 定义**（`list.go:81-84`）：
 
@@ -1473,7 +1470,7 @@ func (e *EnsureDeleteOrReset) reconcileDelete(ctx context.Context) error {
 3. **binary 组件不卸载**：containerd/bkeagent 等不执行 `UninstallScript`，仅关闭 bkeagent 进程
 4. **yaml 组件不显式删除**：不执行 `kubectl delete`，依赖 CAPI Machine 销毁后资源自然孤立
 
-#### DAG 化方案设计
+### DAG 化方案设计
 
 **1. 卸载 DAG 构建 — 安装 DAG 逆序**
 
@@ -1679,7 +1676,7 @@ func (r *BKEClusterReconciler) executeUninstallDAG(
 
 > **设计原则**：卸载 DAG 处理**目标集群上的组件卸载**（inline/yaml/helm/binary），管理集群资源的清理（BKENode/Secret/Command/Event/finalizer/namespace）复用 Legacy `reconcileDelete` 中的逻辑，通过 `cleanupManagementClusterResources` 单独调用。两者分离，职责清晰。
 
-#### EnsureDeleteOrReset 注册为 inline 组件
+### EnsureDeleteOrReset 注册为 inline 组件
 
 Legacy `EnsureDeleteOrReset` 的 `reconcileDelete` 逻辑中，除了目标集群组件卸载外，还包含**管理集群资源清理**（删除 CAPI Cluster、BKEMachine、Secret、Command、BKENode、Event、finalizer、namespace）。将这部分管理集群清理逻辑封装为 inline 组件 `delete-cluster-resources`，作为卸载 DAG 的**最后一个组件**执行。
 
@@ -1828,7 +1825,7 @@ func (e *EnsureDeleteOrReset) NeedExecute(_ *bkev1beta1.BKECluster, new *bkev1be
 
 > **设计优势**：将 Legacy `EnsureDeleteOrReset` 从单体 Phase 拆解为卸载 DAG 的 inline 组件，管理集群清理逻辑作为 DAG 的依赖终点执行，确保目标集群组件先卸载、管理集群资源后清理，执行顺序由 DAG 拓扑保证而非硬编码。
 
-#### EnsureDeleteOrReset 原样注册为 inline 组件（最小迁移方案）
+### EnsureDeleteOrReset 原样注册为 inline 组件（最小迁移方案）
 
 上述"完整逆序 DAG"方案和"EnsureDeleteOrReset 注册为 inline 组件"方案都对 `EnsureDeleteOrReset` 进行了拆解改造。本方案是**最小改动迁移方案**——`EnsureDeleteOrReset` 的 `reconcileDelete` 全部逻辑保持不变，直接注册为 inline 组件，DAG 仅含一个节点。
 
@@ -1986,9 +1983,9 @@ func (r *BKEClusterReconciler) executeUninstallDAG(
 
 > **设计优势**：零代码改动，`EnsureDeleteOrReset` 的 `reconcileDelete` 全部逻辑原样复用。迁移仅涉及执行入口切换（PhaseFlow → DAG），行为与 Legacy 完全一致，风险最低。适合 Phase 2-3 灰度阶段先行迁移删除场景，Phase 4 再升级为完整逆序 DAG（方案 A/B）。
 
-### 10.5 DryRun 模式 DAG 化
+## 9. DryRun 模式 DAG 化
 
-#### 设计思路
+### 设计思路
 
 DryRun 是指仅模拟执行，不实际修改集群。DAG 化后 DryRun 照常构建和遍历 DAG，但各执行器检查 `DryRun` 标记后仅打印不执行。
 
@@ -2015,7 +2012,7 @@ DryRun 是指仅模拟执行，不实际修改集群。DAG 化后 DryRun 照常�
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### 代码实现
+### 代码实现
 
 ```go
 // pkg/dagexec/execution_context.go — 新增 DryRun 字段
@@ -2079,9 +2076,9 @@ func (r *BKEClusterReconciler) executeDryRunDAG(
 }
 ```
 
-### 10.6 集群暂停 DAG 化
+## 10. 集群暂停 DAG 化
 
-#### 设计思路
+### 设计思路
 
 暂停是指临时停止对集群的所有操作。暂停不需要 DAG 化 — 它的语义是"不执行任何操作"，DAG 和 PhaseFlow 都需要跳过。
 
@@ -2104,7 +2101,7 @@ func (r *BKEClusterReconciler) executeDryRunDAG(
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### 代码实现
+### 代码实现
 
 ```go
 // controllers/capbke/bkecluster_controller.go — 暂停前置检查
@@ -2129,7 +2126,7 @@ func (r *BKEClusterReconciler) reconcileCluster(
 }
 ```
 
-### 10.7 移除后的执行入口
+## 11. 移除后的执行入口
 
 完全移除 Legacy PhaseFlow 后，执行入口简化为场景分发 (无 PhaseFlow 回退)：
 
@@ -2179,7 +2176,6 @@ func (r *BKEClusterReconciler) reconcileCluster(
 ```
 
 **场景判断优先级**：
-## 10. Legacy PhaseFlow 完全移除方案
 
 | 优先级 | 场景 | 判断条件 | 执行路径 | 说明 |
 |--------|------|---------|---------|------|
@@ -2191,7 +2187,7 @@ func (r *BKEClusterReconciler) reconcileCluster(
 | 5 | 升级 | `upgrade-ready` annotation | 升级 DAG | — |
 | 6 | 安装 | 默认 | 安装 DAG | 兜底 |
 
-## 11. 工作量评估
+## 12. 工作量评估
 
 | 类别 | 模块 | 估算（人天） |
 |------|------|------------|
@@ -2209,7 +2205,7 @@ func (r *BKEClusterReconciler) reconcileCluster(
 
 ---
 
-## 12. 风险与缓解措施
+## 13. 风险与缓解措施
 
 | 风险 | 影响 | 概率 | 缓解措施 |
 |------|------|------|---------|
