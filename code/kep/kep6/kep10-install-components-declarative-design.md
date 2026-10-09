@@ -2658,12 +2658,14 @@ func (r *BKEClusterReconciler) executePartialInstallDAG(...) {
 
 Legacy PhaseFlow 的完全移除方案（纳管/扩容/删除/DryRun/暂停 DAG 化、移除后的执行入口）已抽离为独立 KEP-22 文档，包含：
 - §4 场景覆盖总览
-- §5 纳管已有集群 DAG 化（Condition 过滤 + manage 组件 + ClusterVersion 协调）
-- §6 集群扩容 DAG 化（三层机制 + StateCode 过滤 + executeScaleDAG）
-- §7 集群删除/重置 DAG 化（代码硬编码 DAG + EnsureDeleteOrReset inline 组件）
-- §8 DryRun 模式 DAG 化
-- §9 集群暂停 DAG 化
+- §5 纳管已有集群 DAG 化（Condition 过滤 + manage 组件 + ClusterVersion 协调 + Operation 填充）
+- §6 集群扩容 DAG 化（三层机制 + StateCode 过滤 + executeScaleDAG + fillCurrentFromExistingNodes）
+- §7 集群删除/重置 DAG 化（三种移除方案对比 + 方案 C 最小迁移 + EnsureDeleteOrReset 零改动 + 能力一致性验证 + 后续升级路径）
+- §8 DryRun 模式 DAG 化（ExecutionContext.DryRun + Scheduler 检查）
+- §9 集群暂停 DAG 化（前置检查）
 - §10 移除后的执行入口（场景分发 + 优先级表）
+- §11 工作量评估（~38 人天）
+- §12 风险与缓解措施
 
 完整设计见 [KEP-22](../kep7/kep22-legacy-phaseflow-removal-design.md)。
 

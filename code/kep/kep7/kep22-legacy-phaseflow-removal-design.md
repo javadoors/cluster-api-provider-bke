@@ -340,35 +340,87 @@ executeScaleDAG:
 
 ### 7.1 设计思路
 
-删除/重置是指清理集群的所有组件。安装是创建组件，删除是逆序卸载组件。
+删除/重置是指清理集群的所有组件。与安装的核心区别在于：安装是创建组件，删除是逆序卸载组件。
 
 ```txt
-DAG 化方案:
-  构建卸载 DAG (安装 DAG 的逆序)，复用同一组件声明:
-  安装: bkeagent → nodes-env → certs → ... → agent-switch (正序)
-  卸载: agent-switch → ... → certs → nodes-env → bkeagent (逆序)
-
-各组件类型的卸载方式:
-  inline: 调用 handler 的 Uninstall/Reset 逻辑 (如 kubeadm reset)
-  yaml: YamlInstaller.DeleteComponent (kubectl delete)
-  helm: HelmInstaller.Uninstall (helm uninstall)
-  binary: BinaryInstaller.Uninstall (SSH UninstallScript)
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              删除/重置 DAG 化设计思路                                              │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  Legacy PhaseFlow:                                                              │
+│    DeletePhases (仅 2 个 Phase):                                                 │
+│      1. EnsurePaused — 暂停集群操作                                              │
+│      2. EnsureDeleteOrReset — 单体删除逻辑 (含全部清理操作)                      │
+│                                                                                 │
+│    EnsureDeleteOrReset.Execute() 内部执行:                                       │
+│      handleClusterDeletion → 删除 CAPI Cluster (级联删除 Machine)                │
+│      handleBKEMachineDeletion → 等待 BKEMachine 删除完成                        │
+│      deleteRelatedResources → 删除 Secret/Command                               │
+│      ShutDownAgent → SSH 关闭节点上的 bkeagent                                  │
+│      cleanupClusterResources → 删除 BKENode/Event/finalizer                    │
+│      handleNamespaceDeletion → 删除命名空间                                      │
+│                                                                                 │
+│    问题: 全部清理逻辑耦合在一个 Phase 中, 无组件级卸载:                          │
+│    1. 无逆序卸载: 不区分组件类型, 不按依赖逆序卸载                               │
+│    2. 无组件级清理: CAPI 级联删除 Machine, 但节点上组件不被显式卸载               │
+│    3. 无 helm 卸载: 不执行 helm uninstall                                       │
+│    4. 无 binary 卸载: 不执行 UninstallScript, 仅关闭 bkeagent 进程               │
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 7.2 Legacy DeletePhases 详细说明
+### 7.2 三种移除方案
 
-DeletePhases 仅含 2 个 Phase：`EnsurePaused` + `EnsureDeleteOrReset`。`EnsureDeleteOrReset.Execute()` 是单体 `reconcileDelete`，不按组件依赖逆序卸载。
+**方案 A: 完整逆序 DAG**
 
-Legacy 卸载覆盖范围：
+构建卸载 DAG（安装 DAG 的逆序），按组件依赖逆序卸载每个组件：
 
-| 组件类型 | Legacy 覆盖 | DAG 化改进 |
-|---------|------------|-----------|
-| inline (kubeadm) | ✅ CAPI 间接 | ★ 显式 kubeadm reset |
-| yaml | ❌ 缺失 | ★ 新增: kubectl delete |
-| helm | ❌ 缺失 | ★ 新增: helm uninstall |
-| binary | ❌ 不完整 | ★ 新增: SSH UninstallScript |
+```txt
+卸载 DAG 拓扑 (逆序):
 
-### 7.3 代码实现
+  Batch 1: [agent-switch]           → 停止 Agent 监听
+  Batch 2: [kube-proxy, coredns]    → helm uninstall / kubectl delete
+  Batch 3: [kubernetes-worker]      → kubeadm reset (worker)
+  Batch 4: [kubernetes-master]      → kubeadm reset (master)
+  Batch 5: [load-balance]           → 删除 HA
+  Batch 6: [certs]                 → 删除证书
+  Batch 7: [containerd]            → SSH UninstallScript (停止服务 + 清理二进制)
+  Batch 8: [bkeagent]              → SSH Shutdown (关闭进程)
+  Batch 9: [delete-cluster-resources] ★ 管理集群资源清理
+```
+
+各组件类型的卸载方式：
+
+| 组件类型 | 卸载方式 |
+|---------|---------|
+| inline | 调用 handler 的 Uninstall/Reset 逻辑 (如 kubeadm reset) |
+| yaml | YamlInstaller.DeleteComponent (kubectl delete) |
+| helm | HelmInstaller.Uninstall (helm uninstall) |
+| binary | BinaryInstaller.Uninstall (SSH UninstallScript, 停止服务 + 清理二进制) |
+
+**方案 B: EnsureDeleteOrReset 注册为 inline 组件（拆解为 DAG 依赖终点）**
+
+将 Legacy `EnsureDeleteOrReset` 的管理集群清理逻辑封装为 inline 组件 `delete-cluster-resources`，作为卸载 DAG 的**最后一个组件**（依赖终点）。目标集群组件卸载由前序 DAG 组件完成。
+
+**方案 C: EnsureDeleteOrReset 原样注册为 inline 组件（最小迁移）**
+
+`EnsureDeleteOrReset` 的 `reconcileDelete` 全部逻辑**零改动**，直接注册为 inline 组件。DAG 仅含 `delete-cluster-resources` 一个节点，不构建逆序卸载 DAG，不执行组件级卸载。行为与 Legacy 完全一致。
+
+### 7.3 三方案对比
+
+| 维度 | 方案 A: 完整逆序 DAG | 方案 B: 拆解为 inline 组件 | 方案 C: 原样注册 ★ |
+|------|---------------------|------------------------|-------------------|
+| DAG 节点数 | 全部组件 (8+ 节点) | 全部组件 + delete-cluster-resources (9 节点) | 仅 1 个节点 (代码硬编码) |
+| EnsureDeleteOrReset 改造 | 裁剪为仅管理集群清理 | 裁剪为仅管理集群清理 | **零改动** |
+| 依赖 ReleaseImage | ✅ 需要 (构建逆序 DAG) | ✅ 需要 (构建逆序 DAG) | **❌ 不依赖** (代码硬编码 DAG) |
+| 目标集群组件卸载 | 逐组件 Uninstall (yaml/helm/binary/inline) | 逐组件 Uninstall + 管理集群清理 | 不卸载 (依赖 CAPI 级联, 同 Legacy) |
+| helm 卸载 | ✅ helm uninstall | ✅ helm uninstall | ❌ (同 Legacy, 不卸载) |
+| binary 卸载 | ✅ SSH UninstallScript | ✅ SSH UninstallScript | ❌ (同 Legacy, 仅 ShutdownAgent) |
+| 与 Legacy 行为一致性 | ❌ 增强 (新增卸载) | ❌ 增强 (新增卸载) | ✅ **完全一致** |
+| 迁移风险 | 高 (新增 Uninstall 逻辑) | 高 (拆解 + 新增 Uninstall) | **低** (零代码改动) |
+| 适用阶段 | Phase 4 (全量 DAG) | Phase 4 (全量 DAG) | **Phase 2-3 (灰度迁移)** |
+
+### 7.4 方案 C 代码实现（最小迁移，当前采用）
 
 ```go
 func (r *BKEClusterReconciler) executeUninstallDAG(
@@ -410,11 +462,73 @@ func (r *BKEClusterReconciler) executeUninstallDAG(
 }
 ```
 
-**设计原则**：`delete-cluster-resources` 不注册到 ReleaseImage `install.components` 中，直接在代码中硬编码。原因：删除/重置是基础设施操作，与集群版本无关，不随 ReleaseImage 版本变化。
+**设计原则**：`delete-cluster-resources` 不注册到 ReleaseImage `install.components` 中，直接在代码中硬编码。原因：
+1. **与集群版本无关**：`EnsureDeleteOrReset` 的 `reconcileDelete` 逻辑是基础设施操作，不随 ReleaseImage 版本变化
+2. **避免 ReleaseImage 污染**：`install.components` 语义是"安装到目标集群的组件"，`delete-cluster-resources` 是管理集群清理操作
+3. **减少外部依赖**：不依赖 ReleaseImage bundle 解析，删除场景不需要 ReleaseImage 就绪即可执行（与 Legacy DeletePhases 行为一致）
 
-### 7.4 与 Legacy DeletePhases 的能力一致性
+### 7.5 EnsureDeleteOrReset 零改动
 
-`EnsureDeleteOrReset` 的 `reconcileDelete` 全部逻辑零改动复用，DAG 仅含一个节点，行为与 Legacy 完全一致。
+```go
+// pkg/phaseframe/phases/ensure_delete_or_reset.go — 现有代码, 不修改
+
+func (e *EnsureDeleteOrReset) Execute() (ctrl.Result, error) {
+    baseCtx := context.Background()
+    _, c, bkeCluster, _, log := e.Ctx.Untie()
+
+    // 1. 如果集群暂停, 先恢复并清除所有 Command (现有逻辑, 不变)
+    if e.Ctx.BKECluster.Spec.Pause { ... }
+
+    // 2. 轮询执行 reconcileDelete (超时 60 分钟) (现有逻辑, 不变)
+    err := wait.PollImmediateUntil(..., func() (bool, error) {
+        return e.reconcileDelete(ctx) == nil, nil
+    }, ctx.Done())
+}
+
+func (e *EnsureDeleteOrReset) reconcileDelete(ctx context.Context) error {
+    // ★ 全部逻辑保持不变:
+    e.ensureClusterStatusDeleting(...)   // 设置 ClusterStatus = ClusterDeleting
+    e.handleClusterDeletion(...)         // 删除 CAPI Cluster (级联删除 Machine)
+    e.handleBKEMachineDeletion(...)      // 等待 BKEMachine 删除完成
+    e.deleteRelatedResources(...)        // 删除 Secret/Command
+    e.ShutDownAgent(ctx)                 // SSH 关闭 bkeagent
+    e.cleanupClusterResources(...)       // 删除 BKENode/Event/finalizer
+    e.handleNamespaceDeletion(...)       // 删除命名空间
+}
+
+// NeedExecute — 现有代码, 不修改
+func (e *EnsureDeleteOrReset) NeedExecute(_ *bkev1beta1.BKECluster, new *bkev1beta1.BKECluster) bool {
+    if !new.DeletionTimestamp.IsZero() || new.Spec.Reset {
+        e.SetStatus(bkev1beta1.PhaseWaiting)
+        return true
+    }
+    return false
+}
+```
+
+### 7.6 与 Legacy DeletePhases 的能力一致性
+
+| `reconcileDelete` 步骤 | Legacy DeletePhases | 方案 C: DAG inline 组件 | 一致性 |
+|------------------------|--------------------|-----------------------|--------|
+| `ensureClusterStatusDeleting` | ✅ 在 `reconcileDelete` 中 | ✅ 在 `reconcileDelete` 中 (零改动) | ✅ 一致 |
+| `handleClusterDeletion` | ✅ 删除 CAPI Cluster | ✅ 同上 | ✅ 一致 |
+| `handleBKEMachineDeletion` | ✅ 等待 BKEMachine 删除 | ✅ 同上 | ✅ 一致 |
+| `deleteRelatedResources` | ✅ 删除 Secret/Command | ✅ 同上 | ✅ 一致 |
+| `ShutDownAgent` | ✅ SSH 关闭 bkeagent | ✅ 同上 | ✅ 一致 |
+| `cleanupClusterResources` | ✅ 删除 BKENode/Event/finalizer | ✅ 同上 | ✅ 一致 |
+| `handleNamespaceDeletion` | ✅ 删除命名空间 | ✅ 同上 | ✅ 一致 |
+| 暂停恢复 (Spec.Pause) | ✅ Execute() 入口检查 | ✅ 同上 (零改动) | ✅ 一致 |
+| 超时重试 (60 分钟轮询) | ✅ `wait.PollImmediateUntil` | ✅ 同上 | ✅ 一致 |
+| 触发条件 | `DeletionTimestamp` / `Spec.Reset` | `Condition` + `NeedExecute(DeletionTimestamp)` | ✅ 一致 (双守卫) |
+
+### 7.7 后续升级路径（方案 C → 方案 A/B）
+
+方案 C 是最小迁移方案，后续可在 Phase 4 升级为方案 A/B：
+
+1. **Phase 2-3**：方案 C（原样注册，单节点 DAG，零代码改动，与 Legacy 完全一致）
+2. **Phase 4**：升级为方案 A（完整逆序 DAG，逐组件 Uninstall，新增 helm/binary 卸载）或方案 B（拆解 EnsureDeleteOrReset，管理集群清理作为 DAG 依赖终点）
+
+> **设计优势**：方案 C 零代码改动，`EnsureDeleteOrReset` 的 `reconcileDelete` 全部逻辑原样复用。迁移仅涉及执行入口切换（PhaseFlow → DAG），行为与 Legacy 完全一致，风险最低。
 
 ---
 
