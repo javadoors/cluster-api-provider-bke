@@ -51,7 +51,7 @@
    - 9.2 迁移阶段
    - 9.3 向后兼容
    - 9.4 平滑升级方案
-10. [Legacy PhaseFlow 完全移除方案](../kep7/kep10-legacy-phaseflow-removal-design.md) (独立文档)
+10. [Legacy PhaseFlow 完全移除方案](../kep7/kep22-legacy-phaseflow-removal-design.md) (KEP-22 独立文档)
 11. [可观测性](#11-可观测性)
     - 11.1 安装状态追踪
     - 11.2 事件与指标
@@ -2654,18 +2654,18 @@ func (r *BKEClusterReconciler) executePartialInstallDAG(...) {
 
 ## 10. Legacy PhaseFlow 完全移除方案
 
-> **已抽离为独立文档**：[Legacy PhaseFlow 完全移除方案](../kep7/kep10-legacy-phaseflow-removal-design.md)
+> **已抽离为独立 KEP 文档**：[KEP-22: Legacy PhaseFlow 完全移除方案](../kep7/kep22-legacy-phaseflow-removal-design.md)
 
-Legacy PhaseFlow 的完全移除方案（纳管/扩容/删除/DryRun/暂停 DAG 化、移除后的执行入口）已抽离为独立 KEP 文档，包含：
-- 10.1 场景覆盖总览
-- 10.2 纳管已有集群 DAG 化（Condition 过滤 + manage 组件 + ClusterVersion 协调）
-- 10.3 集群扩容 DAG 化（三层机制 + StateCode 过滤 + executeScaleDAG）
-- 10.4 集群删除/重置 DAG 化（逆序 DAG + helm/binary Uninstall + EnsureDeleteOrReset inline 组件）
-- 10.5 DryRun 模式 DAG 化
-- 10.6 集群暂停 DAG 化
-- 10.7 移除后的执行入口
+Legacy PhaseFlow 的完全移除方案（纳管/扩容/删除/DryRun/暂停 DAG 化、移除后的执行入口）已抽离为独立 KEP-22 文档，包含：
+- §4 场景覆盖总览
+- §5 纳管已有集群 DAG 化（Condition 过滤 + manage 组件 + ClusterVersion 协调）
+- §6 集群扩容 DAG 化（三层机制 + StateCode 过滤 + executeScaleDAG）
+- §7 集群删除/重置 DAG 化（代码硬编码 DAG + EnsureDeleteOrReset inline 组件）
+- §8 DryRun 模式 DAG 化
+- §9 集群暂停 DAG 化
+- §10 移除后的执行入口（场景分发 + 优先级表）
 
-完整设计见 [独立文档](../kep7/kep10-legacy-phaseflow-removal-design.md)。
+完整设计见 [KEP-22](../kep7/kep22-legacy-phaseflow-removal-design.md)。
 
 ## 11. 可观测性
 
