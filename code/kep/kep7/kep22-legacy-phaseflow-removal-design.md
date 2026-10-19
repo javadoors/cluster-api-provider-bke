@@ -1,18 +1,5 @@
 ﻿# KEP-22: Legacy PhaseFlow 完全移除方案
 
-| 字段 | 值 |
-|------|-----|
-| **KEP 编号** | KEP-22 |
-| **标题** | Legacy PhaseFlow 完全移除方案 — 全场景 DAG 化 |
-| **状态** | `provisional` |
-| **类型** | Feature |
-| **作者** | openFuyao Team |
-| **创建日期** | 2026-09-21 |
-| **依赖** | KEP-10 安装 DAG 化设计、KEP-5 声明式升级框架、KEP-18 Condition 条件过滤 |
-| **关联** | `kep6/kep10-install-components-declarative-design.md`（安装 DAG 化主文档）、`kep7/kep10-install-dag-with-phaseflow-fallback.md`（PhaseFlow 兜底方案） |
-
----
-
 ## 目录
 
 1. [摘要](#1-摘要)
